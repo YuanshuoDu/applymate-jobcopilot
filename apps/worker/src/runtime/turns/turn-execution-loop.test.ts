@@ -10,6 +10,7 @@ import { PLAN_PROPOSAL_SCHEMA_VERSION, type GoalContract, type GoalContractRef, 
 import { createGoalUpdateTool } from "../planning/goal-update-tool.js"
 import { createPlanProposalTool } from "../planning/plan-proposal-tool.js"
 import { createCanonicalPlanExecutionFactory } from "../planning/canonical-plan-execution.js"
+import { createPlanRevisionRecoveryDispatcher, planRevisionObservation } from "../planning/plan-revision-receipt.js"
 import type { ToolExecutionContext } from "../tools/types.js"
 import type { TurnEngineItem, TurnEngineStore, TurnEngineToolResult } from "./turn-engine-types.js"
 import type { TurnExecutionIdentity, TurnExecutionOptions, TurnExecutionStore } from "./turn-execution-types.js"
@@ -308,13 +309,109 @@ describe("owner-agnostic turn execution loop", () => {
 
   it("does not repeat the plan hook for a replayed proposal call", async () => {
     const hook = vi.fn(async () => ({ observations: [{ id: "should-not-appear", content: "replayed" }] }))
-    const persisted = [{ id: "tool-result:call:root-1", content: { toolCallId: "call:root-1", toolName: "agent.plan.propose", input: { proposal: { schemaVersion: "agent-harness.plan.v1", basedOnGoalRevision: 1, basedOnPlanRevision: null, nodes: [], completionCriteria: [], briefRationale: "fixture" } }, status: "completed", output: { job: "job-1" }, errorCode: null } }]
+    const proposal: PlanProposal = { schemaVersion: PLAN_PROPOSAL_SCHEMA_VERSION, basedOnGoalRevision: 1, basedOnPlanRevision: null, nodes: [], completionCriteria: [], briefRationale: "fixture" }
+    const output = { status: "accepted" as const, goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposal, intents: [], proposalHash: fingerprintPlanProposal(proposal) }
+    const persisted = [{ id: "tool-result:call:root-1", content: { toolCallId: "call:root-1", toolName: "agent.plan.propose", input: { proposal }, status: "completed", output, errorCode: null } }]
+    const dispatcher = createPlanRevisionRecoveryDispatcher()
+    const recovered = vi.fn()
+    dispatcher.register(recovered)
     const root = fixture(identity("turn", "root-1"), undefined, hook, persisted)
-    const result = await runTurnExecutionLoop(root.options)
+    const result = await runTurnExecutionLoop({ ...root.options, recoveryDispatcher: dispatcher })
     expect(result.status).toBe("completed")
     expect(root.requests).toHaveLength(2)
     expect(hook).not.toHaveBeenCalled()
-    expect(root.events.some(event => event.type === "plan.revision")).toBe(false)
+    expect(root.events.filter(event => event.type === "plan.revision" && event.payload)).toHaveLength(1)
+    expect(recovered).toHaveBeenCalledWith({ goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposalHash: output.proposalHash })
+  })
+
+  it("repairs a replayed plan receipt before the next proposal without replay side effects", async () => {
+    const initialGoal: GoalContract = { revision: 1, objective: "Find jobs", constraints: [], successCriteria: [], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" }
+    const current = { value: initialGoal }
+    const goalRef: GoalContractRef = { get: () => current.value, update: next => { current.value = next } }
+    const dispatcher = createPlanRevisionRecoveryDispatcher()
+    const replayProposal: PlanProposal = { schemaVersion: PLAN_PROPOSAL_SCHEMA_VERSION, basedOnGoalRevision: 1, basedOnPlanRevision: null, nodes: [], completionCriteria: [], briefRationale: "replayed" }
+    const nextProposal: PlanProposal = {
+      schemaVersion: PLAN_PROPOSAL_SCHEMA_VERSION, basedOnGoalRevision: 1, basedOnPlanRevision: 1,
+      nodes: [{ localId: "read", kind: "use_tool", objective: "Read jobs", inputRefs: [], dependsOn: [], successCriteria: ["done"], outputSchemaRef: null, toolName: "jobs.search" }],
+      completionCriteria: [], briefRationale: "continue",
+    }
+    const replayOutput = { status: "accepted" as const, goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposal: replayProposal, intents: [], proposalHash: fingerprintPlanProposal(replayProposal) }
+    const persisted = { id: "tool-result:replay-plan", content: { toolCallId: "replay-plan", toolName: "agent.plan.propose", input: { proposal: replayProposal }, status: "completed", output: replayOutput, errorCode: null } }
+    const planTool = createPlanProposalTool({ goal: initialGoal, goalRef, allowedTools: ["jobs.search"], allowedTemplates: [], allowedRoles: ["scout"], maxNodes: 8, recoveryDispatcher: dispatcher })
+    const routed = vi.fn(async (_context: unknown, request: { readonly id: string; readonly toolName: string; readonly toolVersion: string; readonly input: unknown }) => ({ ...request, status: "completed" as const, output: { ok: true }, errorCode: null }))
+    const bridge = createCanonicalPlanExecutionFactory({
+      goal: initialGoal, goalRef, allowedTools: ["jobs.search"], allowedTemplates: [], allowedRoles: ["scout"], maxNodes: 8,
+      capabilities: ["read", "canPlan"], actorRole: "orchestrator", scope: { userId: "user-1" }, lease: { sessionId: "session-1", turnId: "turn-1" },
+      rootTaskId: "root-1", taskId: "root-1", router: { execute: routed }, registry: { list: () => [{ name: "jobs.search", version: "1", risk: "read", capabilities: ["read"] }] }, policy: {} as PolicyEngine, recoveryDispatcher: dispatcher,
+    })
+    const nextOutput: { value?: unknown } = {}
+    const root = fixture(
+      identity("turn", "root-1"), undefined, bridge, [persisted], false, undefined, undefined, false, goalRef,
+      async input => {
+        const context: ToolExecutionContext = { scope: input.scope, sessionId: input.sessionId, turnId: input.turnId, stepId: input.stepId, signal: input.signal, capabilities: ["canPlan"], reportProgress: async () => undefined }
+        if (input.call.id === "replay-plan") return { ...persisted.content, id: input.call.id, toolName: input.call.toolName, toolVersion: "1" } as TurnEngineToolResult
+        const result = await planTool.execute(context, input.call.input as { proposal: PlanProposal })
+        nextOutput.value = result
+        return { id: input.call.id, toolName: input.call.toolName, toolVersion: "1", status: "completed" as const, output: result, errorCode: null }
+      },
+      [{ id: "replay-plan", name: "agent.plan.propose", arguments: { proposal: replayProposal } }, { id: "next-plan", name: "agent.plan.propose", arguments: { proposal: nextProposal } }],
+    )
+    const result = await runTurnExecutionLoop({ ...root.options, recoveryDispatcher: dispatcher })
+    expect(result).toMatchObject({ status: "completed", stepCount: 2, toolCallCount: 2 })
+    expect(nextOutput.value).toMatchObject({ planRevision: 2, basedOnPlanRevision: 1 })
+    expect(root.events.filter(event => event.type === "plan.revision" && event.payload)).toHaveLength(2)
+    expect(root.events.filter(event => event.type === "plan.revision" && event.payload)[0]?.payload).toMatchObject({ planRevision: 1 })
+    expect(root.events.filter(event => event.type === "plan.revision" && event.payload)[1]?.payload).toMatchObject({ planRevision: 2 })
+    expect(routed).toHaveBeenCalledTimes(1)
+  })
+
+  it("does not duplicate an existing plan revision projection during replay", async () => {
+    const proposal: PlanProposal = { schemaVersion: PLAN_PROPOSAL_SCHEMA_VERSION, basedOnGoalRevision: 1, basedOnPlanRevision: null, nodes: [], completionCriteria: [], briefRationale: "fixture" }
+    const output = { status: "accepted" as const, goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposal, intents: [], proposalHash: fingerprintPlanProposal(proposal) }
+    const persisted = [{ id: "tool-result:call:root-1", content: { toolCallId: "call:root-1", toolName: "agent.plan.propose", input: { proposal }, status: "completed", output, errorCode: null } }]
+    const dispatcher = createPlanRevisionRecoveryDispatcher()
+    const recovered = vi.fn()
+    dispatcher.register(recovered)
+    const hook = vi.fn(async () => ({ observations: [{ id: "unexpected", content: "replayed" }] }))
+    const root = fixture(identity("turn", "root-1"), undefined, hook, [...persisted, planRevisionObservation({ planCallId: "call:root-1", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposalHash: output.proposalHash })])
+    const result = await runTurnExecutionLoop({ ...root.options, recoveryDispatcher: dispatcher })
+    expect(result.status).toBe("completed")
+    expect(root.events.filter(event => event.type === "plan.revision" && event.payload)).toHaveLength(0)
+    expect(hook).not.toHaveBeenCalled()
+    expect(recovered).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
+    { label: "malformed receipt", output: { status: "accepted", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposal: {}, intents: [] } },
+    { label: "unknown status", output: { status: "running" } },
+  ])("fails closed for a replayed plan $label", async ({ output }) => {
+    const proposal: PlanProposal = { schemaVersion: PLAN_PROPOSAL_SCHEMA_VERSION, basedOnGoalRevision: 1, basedOnPlanRevision: null, nodes: [], completionCriteria: [], briefRationale: "fixture" }
+    const persisted = [{ id: "tool-result:call:root-1", content: { toolCallId: "call:root-1", toolName: "agent.plan.propose", input: { proposal }, status: "completed", output, errorCode: null } }]
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, persisted)
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "failed", errorCode: "invalid_output" })
+    expect(root.events.filter(event => event.type === "plan.revision" && event.payload)).toHaveLength(0)
+  })
+
+  it("fails closed when a replayed plan receipt belongs to another goal revision", async () => {
+    const proposal: PlanProposal = { schemaVersion: PLAN_PROPOSAL_SCHEMA_VERSION, basedOnGoalRevision: 2, basedOnPlanRevision: null, nodes: [], completionCriteria: [], briefRationale: "foreign goal" }
+    const output = { status: "accepted" as const, goalRevision: 2, planRevision: 1, basedOnPlanRevision: null, proposal, intents: [], proposalHash: fingerprintPlanProposal(proposal) }
+    const persisted = [{ id: "tool-result:call:root-1", content: { toolCallId: "call:root-1", toolName: "agent.plan.propose", input: { proposal }, status: "completed", output, errorCode: null } }]
+    const current: { value: GoalContract } = { value: { revision: 1, objective: "Find jobs", constraints: [], successCriteria: [], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" } }
+    const goalRef: GoalContractRef = { get: () => current.value, update: next => { current.value = next } }
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, persisted, false, undefined, { name: "agent.plan.propose", arguments: { proposal }, output }, false, goalRef)
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "failed", errorCode: "invalid_output" })
+    expect(root.events.filter(event => event.type === "plan.revision" && event.payload)).toHaveLength(0)
+  })
+
+  it.each(["failed", "cancelled"] as const)("continues replay for an already %s plan result", async status => {
+    const proposal: PlanProposal = { schemaVersion: PLAN_PROPOSAL_SCHEMA_VERSION, basedOnGoalRevision: 1, basedOnPlanRevision: null, nodes: [], completionCriteria: [], briefRationale: "failed" }
+    const persisted = [{ id: "tool-result:call:root-1", content: { toolCallId: "call:root-1", toolName: "agent.plan.propose", input: { proposal }, status, output: null, errorCode: "plan_invalid" } }]
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, persisted, false, undefined, { name: "agent.plan.propose", arguments: { proposal } })
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "failed", errorCode: "evidence_conflict" })
+    expect(root.events.filter(event => event.type === "plan.revision" && event.payload)).toHaveLength(0)
   })
 
   it.each([

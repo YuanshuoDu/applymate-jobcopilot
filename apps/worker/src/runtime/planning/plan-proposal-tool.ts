@@ -6,6 +6,7 @@ import { copyAllowedPlanActions, PLAN_MAX_NODES, PLAN_MAX_REVISIONS, type GoalCo
 import { copyPlanFingerprints, fingerprintPlanProposal } from "./plan-fingerprint.js"
 import { toRuntimeActionIntents, type RuntimeActionIntent } from "./goal-plan-actions.js"
 import { PlanValidationError, validatePlanProposal } from "./goal-plan-validator.js"
+import { PlanRevisionRecoveryError, type PlanRevisionRecoveryDispatcher } from "./plan-revision-receipt.js"
 
 const PlanProposalEnvelopeSchema = Type.Object({ proposal: Type.Unknown() }, { additionalProperties: false })
 const PlanProposalOutputSchema = Type.Object({
@@ -40,6 +41,8 @@ export type PlanProposalToolOptions = {
   readonly maxPlanRevisions?: number
   /** Server-owned hashes recovered from prior accepted proposals. */
   readonly initialPlanHashes?: readonly string[]
+  /** Runtime-owned dispatcher used only to repair a persisted replay receipt. */
+  readonly recoveryDispatcher?: PlanRevisionRecoveryDispatcher
 }
 
 function copyAllowlist(name: string, value: readonly string[]): readonly string[] {
@@ -60,6 +63,22 @@ export function createPlanProposalTool(options: PlanProposalToolOptions): Runtim
   const seenPlanHashes = new Set(copyPlanFingerprints(options.initialPlanHashes))
   let planRevision: number | null = options.initialPlanRevision ?? null
   let goalRevision = options.goal.revision
+  options.recoveryDispatcher?.register(receipt => {
+    const goal = options.goalRef?.get() ?? options.goal
+    if (goal.revision !== goalRevision) {
+      planRevision = null
+      seenPlanHashes.clear()
+      goalRevision = goal.revision
+    }
+    if (receipt.goalRevision !== goalRevision) return
+    if (receipt.planRevision > (planRevision ?? 0)) {
+      if (receipt.basedOnPlanRevision !== planRevision) throw new PlanRevisionRecoveryError()
+      planRevision = receipt.planRevision
+    } else if (receipt.planRevision === (planRevision ?? 0) && receipt.basedOnPlanRevision !== (planRevision === null ? null : planRevision - 1)) {
+      throw new PlanRevisionRecoveryError()
+    }
+    if (receipt.proposalHash && !seenPlanHashes.has(receipt.proposalHash) && seenPlanHashes.size < maxPlanRevisions) seenPlanHashes.add(receipt.proposalHash)
+  })
   return {
     schemaVersion, name: "agent.plan.propose", version: "1", description: "Propose a bounded read-only plan for the current goal",
     capabilities: ["coordination"], inputSchema: PlanProposalEnvelopeSchema, outputSchema: PlanProposalOutputSchema,

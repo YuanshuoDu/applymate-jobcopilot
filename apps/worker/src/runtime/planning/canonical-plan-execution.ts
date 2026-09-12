@@ -9,6 +9,7 @@ import { copyPlanFingerprints, fingerprintPlanProposal, isPlanFingerprint } from
 import { PlanValidationError, validatePlanProposal } from "./goal-plan-validator.js"
 import { PlanCommandExecutionError, executePlanCommands, type PlanCommandExecutionRecord, type PlanCommandExecutionRuntime, type PlanControlRecord } from "./plan-command-executor.js"
 import { createPlanCommandReceipt, type PlanCommandReceipt } from "./plan-command-receipt.js"
+import { PlanRevisionRecoveryError, type PlanRevisionRecoveryDispatcher } from "./plan-revision-receipt.js"
 import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
 import type { TurnEnginePlanExecutionHook, TurnEnginePlanExecutionHookResult } from "../turns/turn-engine-types.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
@@ -44,6 +45,8 @@ export type CanonicalPlanExecutionOptions = {
   readonly maxPlanRevisions?: number
   /** Server-owned hashes recovered from prior accepted proposals. */
   readonly initialPlanHashes?: readonly string[]
+  /** Runtime-owned dispatcher used only to repair a persisted replay receipt. */
+  readonly recoveryDispatcher?: PlanRevisionRecoveryDispatcher
 }
 
 class CanonicalPlanError extends Error {
@@ -182,6 +185,22 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
   const seenPlanHashes = new Set(copyPlanFingerprints(options.initialPlanHashes))
   let currentPlanRevision: number | null = options.initialPlanRevision ?? null
   let goalRevision = options.goal.revision
+  options.recoveryDispatcher?.register(receipt => {
+    const goal = options.goalRef?.get() ?? options.goal
+    if (goal.revision !== goalRevision) {
+      currentPlanRevision = null
+      seenPlanHashes.clear()
+      goalRevision = goal.revision
+    }
+    if (receipt.goalRevision !== goalRevision) return
+    if (receipt.planRevision > (currentPlanRevision ?? 0)) {
+      if (receipt.basedOnPlanRevision !== currentPlanRevision) throw new PlanRevisionRecoveryError()
+      currentPlanRevision = receipt.planRevision
+    } else if (receipt.planRevision === (currentPlanRevision ?? 0) && receipt.basedOnPlanRevision !== (currentPlanRevision === null ? null : currentPlanRevision - 1)) {
+      throw new PlanRevisionRecoveryError()
+    }
+    if (receipt.proposalHash && !seenPlanHashes.has(receipt.proposalHash) && seenPlanHashes.size < maxPlanRevisions) seenPlanHashes.add(receipt.proposalHash)
+  })
   return async input => {
     const baseError = (code: string): TurnEnginePlanExecutionHookResult => ({ observations: [failureObservation(input.call.id, code)] })
     try {
