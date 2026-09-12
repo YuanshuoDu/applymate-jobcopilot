@@ -1494,3 +1494,17 @@ git diff --check
 **独立验证：** child-executor 与 root-orchestration focused tests 合计 **21/21 passed**；shared build、Worker `tsc --noEmit --skipLibCheck` 与 `git diff --check` 均通过。
 
 **候选边界：** live DB/RLS、Redis/queue、provider、真实进程重启、browser 和 child-parent E2E 均未验证；本切片不能据此宣称完整 Harness、P4/Phase 完成或生产恢复证据。
+
+---
+
+## 33. P4-03 — Replay validation for structured child evidence
+
+**状态与进度口径（2026-09-12）：** P4-03 记录为 structured child evidence replay validation 的候选切片；整体状态仍为 **P0 accepted 1/8 (12.5%)**，本切片不改变该口径。
+
+**实现记录：** 提交为 `c8cbbf8e`。canonical `validReplayWaitTasks` 对没有 `structuredResult` 的 generic legacy result 保持兼容；如果结果带有该字段，则要求 task 外层 status 为 `completed`，并复用既有 `validateRoleResult` 校验结构化 Scout/Analyst result，同时保留 plain JSON、递归 identity、evidence、role、score 和不超过 **8 KiB** 的 structured JSON 边界。Malformed、伪造、缺失或重复 evidence、cross-role、oversized，或 waiting/failed task 携带 `structuredResult` 的结果，均 fail closed 为 `invalid_plan_output`。
+
+- 既有 waitId、target/matched task IDs 和 no-reroute 语义保持不变；没有新增 migration、provider、queue 或 external write。
+
+**独立验证：** 根侧 canonical-plan-execution focused suite **40/40 passed**；shared build、Worker `tsc --noEmit --skipLibCheck` 与 `git diff --check` 均通过。
+
+**候选边界：** live DB/RLS、Redis/queue、provider、真实进程重启、browser 和 child-parent E2E 均未验证；本切片不能据此宣称完整 Harness、P4/Phase 完成或生产恢复证据。
