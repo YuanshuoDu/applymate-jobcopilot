@@ -17,14 +17,14 @@ function outputOf(content: unknown): OutcomeOutput {
   return output as OutcomeOutput
 }
 
-function fixture(input: { waitStatus?: string; consumed?: boolean; targetStatus?: string; foreign?: boolean; failUpdate?: boolean; large?: boolean; targetCount?: number; malformed?: boolean } = {}) {
+function fixture(input: { waitStatus?: string; consumed?: boolean; targetStatus?: string; targetRole?: string; foreign?: boolean; failUpdate?: boolean; large?: boolean; targetCount?: number; malformed?: boolean } = {}) {
   const targetIds = Array.from({ length: input.targetCount ?? 1 }, (_, index) => `child-${index + 1}`)
   const wait = { id: "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "root-1", stepId: "step-1", targetTaskIds: targetIds, mode: "all", status: input.waitStatus ?? "ready", matchedTaskIds: targetIds, result: input.consumed ? { request: { mode: "all" }, outcome: { waitId: "wait-1", status: "ready", targetTaskIds: targetIds, matchedTaskIds: targetIds, tasks: targetIds.map(taskId => ({ taskId, status: "completed", result: null, failureReason: null })) } } : { request: { mode: "all" } }, suspendedAt: now, consumedAt: input.consumed ? now : null }
   const state: { wait: typeof wait; consumedAt: Date | null; result: Record<string, unknown>; updates: number } = { wait, consumedAt: wait.consumedAt, result: wait.result, updates: 0 }
   const client = {
     query: async (sql: string) => {
       if (sql.includes('FROM "agent_wait_conditions"')) return { rows: [state.wait], rowCount: 1 }
-      if (sql.includes('FROM "sub_agent_tasks"') && sql.includes("ANY($1::text[])")) return { rows: input.foreign ? [] : targetIds.map((id) => ({ id, rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1", userId: "user-1", status: input.targetStatus ?? "completed", result: input.malformed ? (() => { const value: Record<string, unknown> = { bigint: BigInt(1) }; value.circular = value; return value })() : { safe: input.large ? "x".repeat(10_000) : true, secret: "hide-me" }, failureReason: input.targetStatus === "failed" ? "provider failed" : null })), rowCount: input.foreign ? 0 : targetIds.length }
+      if (sql.includes('FROM "sub_agent_tasks"') && sql.includes("ANY($1::text[])")) return { rows: input.foreign ? [] : targetIds.map((id) => ({ id, rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1", userId: "user-1", role: input.targetRole ?? "scout", status: input.targetStatus ?? "completed", result: input.malformed ? (() => { const value: Record<string, unknown> = { bigint: BigInt(1) }; value.circular = value; return value })() : { safe: input.large ? "x".repeat(10_000) : true, secret: "hide-me" }, failureReason: input.targetStatus === "failed" ? "provider failed" : null })), rowCount: input.foreign ? 0 : targetIds.length }
       if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ id: "root-1", rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1", userId: "user-1" }], rowCount: 1 }
       if (sql.includes('FROM "agent_steps"')) return { rows: [{ id: "step-1", taskId: "root-1", attempt: 1, status: "waiting_for_tool" }], rowCount: 1 }
       if (sql.includes('UPDATE "agent_wait_conditions"')) {
@@ -46,6 +46,12 @@ describe("durable wait outcome consumer", () => {
     expect(fake.state.consumedAt).toBe(now)
     expect(fake.state.result).toMatchObject({ request: { mode: "all" }, outcome: { waitId: "wait-1" } })
     expect(fake.state.updates).toBe(1)
+  })
+
+  it("projects the server-owned target role", async () => {
+    const fake = fixture({ targetRole: "analyst" })
+    const projections = await consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now })
+    expect(projections[0]?.content).toMatchObject({ output: { tasks: [{ taskId: "child-1", role: "analyst" }] } })
   })
 
   it("keeps timeout and failed child status explicit in the outcome", async () => {

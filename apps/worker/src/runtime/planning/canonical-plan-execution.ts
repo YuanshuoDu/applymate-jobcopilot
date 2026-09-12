@@ -281,14 +281,17 @@ function boundedJson(value: unknown): boolean {
   }
 }
 
-function validStructuredReplayResult(task: Record<string, unknown>): boolean {
+function boundedRole(value: unknown): value is string { return typeof value === "string" && value.trim().length > 0 && value.length <= 256 }
+
+function validStructuredReplayResult(task: Record<string, unknown>, expectedRole: string | undefined): boolean {
   const result = row(task.result)
   if (!result || !Object.prototype.hasOwnProperty.call(result, "structuredResult")) return true
+  if (!expectedRole || !boundedRole(task.role)) return false
   if (task.status !== "completed") return false
   try {
     const structuredResult = validateRoleResult(result.structuredResult)
     const encoded = JSON.stringify(structuredResult)
-    return validateBoundStructuredEvidence(structuredResult) && encoded !== undefined && Buffer.byteLength(encoded, "utf8") <= MAX_RESULT_BYTES
+    return task.role === expectedRole && structuredResult.role === expectedRole && validateBoundStructuredEvidence(structuredResult) && encoded !== undefined && Buffer.byteLength(encoded, "utf8") <= MAX_RESULT_BYTES
   } catch {
     return false
   }
@@ -302,35 +305,43 @@ function sameIds(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && [...left].sort().every((id, index) => id === [...right].sort()[index])
 }
 
-function validReplayWaitTasks(value: unknown, taskIds: readonly string[]): boolean {
+function validReplayWaitTasks(value: unknown, taskIds: readonly string[], expectedRoles: ReadonlyMap<string, string>): boolean {
   if (!Array.isArray(value) || value.length !== taskIds.length) return false
   const seen = new Set<string>()
   for (const candidate of value) {
     const task = row(candidate)
-    if (!task || Object.keys(task).length !== 4 || !keysOnly(task, ["taskId", "status", "result", "failureReason"]) || hasForeignIdentity(task, WAIT_ALLOWED_IDENTITY_KEYS)) return false
+    if (!task || (Object.keys(task).length !== 4 && Object.keys(task).length !== 5) || !keysOnly(task, ["taskId", "status", "role", "result", "failureReason"]) || hasForeignIdentity(task, WAIT_ALLOWED_IDENTITY_KEYS)) return false
     if (typeof task.taskId !== "string" || !task.taskId.trim() || task.taskId.length > 256 || !taskIds.includes(task.taskId) || seen.has(task.taskId)) return false
-    if (typeof task.status !== "string" || !task.status.trim() || task.status.length > 256 || !Object.prototype.hasOwnProperty.call(task, "result") || !plainJson(task.result) || !boundedJson(task.result) || hasForeignIdentity(task.result) || !validStructuredReplayResult(task)) return false
+    const hasRole = Object.prototype.hasOwnProperty.call(task, "role")
+    if ((hasRole && !boundedRole(task.role)) || typeof task.status !== "string" || !task.status.trim() || task.status.length > 256 || !Object.prototype.hasOwnProperty.call(task, "result") || !plainJson(task.result) || !boundedJson(task.result) || hasForeignIdentity(task.result) || !validStructuredReplayResult(task, expectedRoles.get(task.taskId))) return false
     if (task.failureReason !== null && (typeof task.failureReason !== "string" || Buffer.byteLength(task.failureReason, "utf8") > MAX_RESULT_BYTES)) return false
     seen.add(task.taskId)
   }
   return seen.size === taskIds.length
 }
 
-function replayJoinTaskIds(options: CanonicalPlanExecutionOptions, command: PlanJoinCommand, receipts: ReadonlyMap<string, ReplayCommandReceipt>): readonly string[] {
+function replayJoinTaskIds(options: CanonicalPlanExecutionOptions, command: PlanJoinCommand, receipts: ReadonlyMap<string, ReplayCommandReceipt>, commands: readonly PlanDispatchCommand[], expectedRoles = new Map<string, string>()): readonly string[] {
   const taskIds: string[] = []
   for (const ref of command.inputRefs) {
+    const delegateMatches = commands.filter(candidate => candidate.kind === "delegate" && candidate.localId === ref)
+    if (delegateMatches.length !== 1) throw new CanonicalPlanError("invalid_plan_output")
+    const delegate = delegateMatches[0]!
+    const expectedRole = delegate.kind === "delegate" && boundedRole(delegate.call.input.role) ? delegate.call.input.role : undefined
+    if (!expectedRole) throw new CanonicalPlanError("invalid_plan_output")
     const receipt = receipts.get(ref)
     const output = receipt?.status === "completed" ? row(receipt.output) : null
-    if (!output || !plainJson(output) || !boundedJson(output) || hasForeignIdentity(output, JOIN_ALLOWED_IDENTITY_KEYS) || typeof output.taskId !== "string" || !output.taskId.trim()) throw new CanonicalPlanError("invalid_plan_output")
+    if (!output || !plainJson(output) || !boundedJson(output) || hasForeignIdentity(output, JOIN_ALLOWED_IDENTITY_KEYS) || typeof output.taskId !== "string" || !output.taskId.trim() || output.taskId.length > 256) throw new CanonicalPlanError("invalid_plan_output")
     if (options.rootTaskId && (typeof output.rootTaskId !== "string" || !output.rootTaskId.trim() || output.rootTaskId.length > 256 || output.rootTaskId !== options.rootTaskId || typeof output.parentTaskId !== "string" || !output.parentTaskId.trim() || output.parentTaskId.length > 256 || output.parentTaskId !== options.rootTaskId)) throw new CanonicalPlanError("invalid_plan_output")
     if (taskIds.includes(output.taskId)) throw new CanonicalPlanError("invalid_plan_output")
+    if (expectedRoles.has(output.taskId)) throw new CanonicalPlanError("invalid_plan_output")
+    expectedRoles.set(output.taskId, expectedRole)
     taskIds.push(output.taskId)
   }
   if (taskIds.length === 0 || taskIds.length > 8) throw new CanonicalPlanError("invalid_plan_output")
   return taskIds
 }
 
-function replayWaitOutcome(input: Parameters<TurnEnginePlanExecutionHook>[0], options: CanonicalPlanExecutionOptions, command: PlanJoinCommand, receipts: ReadonlyMap<string, ReplayCommandReceipt>, waitId: string): Record<string, unknown> | undefined {
+function replayWaitOutcome(input: Parameters<TurnEnginePlanExecutionHook>[0], options: CanonicalPlanExecutionOptions, command: PlanJoinCommand, receipts: ReadonlyMap<string, ReplayCommandReceipt>, commands: readonly PlanDispatchCommand[], waitId: string): Record<string, unknown> | undefined {
   const matches = input.snapshot.toolObservations.filter(observation => observation.id === `wait-result:${waitId}`)
   if (matches.length > 1) throw new CanonicalPlanError("invalid_plan_output")
   const observation = matches[0]
@@ -340,8 +351,9 @@ function replayWaitOutcome(input: Parameters<TurnEnginePlanExecutionHook>[0], op
   const waitInput = row(content.input)
   const output = row(content.output)
   if (!waitInput || !keysOnly(waitInput, ["taskIds", "mode"]) || hasForeignIdentity(waitInput) || !output || !plainJson(output) || !boundedJson(output) || hasForeignIdentity(output, WAIT_ALLOWED_IDENTITY_KEYS)) throw new CanonicalPlanError("invalid_plan_output")
-  const taskIds = replayJoinTaskIds(options, command, receipts)
-  if (!uniqueIds(waitInput.taskIds) || !sameIds(waitInput.taskIds, taskIds) || waitInput.mode !== command.call.input.mode || !uniqueIds(output.targetTaskIds) || !sameIds(output.targetTaskIds, taskIds) || !uniqueIds(output.matchedTaskIds, output.status === "timed_out") || output.matchedTaskIds.some(id => !taskIds.includes(id)) || !validReplayWaitTasks(output.tasks, taskIds)) throw new CanonicalPlanError("invalid_plan_output")
+  const expectedRoles = new Map<string, string>()
+  const taskIds = replayJoinTaskIds(options, command, receipts, commands, expectedRoles)
+  if (!uniqueIds(waitInput.taskIds) || !sameIds(waitInput.taskIds, taskIds) || waitInput.mode !== command.call.input.mode || !uniqueIds(output.targetTaskIds) || !sameIds(output.targetTaskIds, taskIds) || !uniqueIds(output.matchedTaskIds, output.status === "timed_out") || output.matchedTaskIds.some(id => !taskIds.includes(id)) || !validReplayWaitTasks(output.tasks, taskIds, expectedRoles)) throw new CanonicalPlanError("invalid_plan_output")
   if (output.waitId !== waitId || (output.status !== "ready" && output.status !== "timed_out")) throw new CanonicalPlanError("invalid_plan_output")
   return output
 }
@@ -359,7 +371,7 @@ function replayRuntime(
   }
   for (const command of dispatched.commands) {
     const receipt = receipts.get(command.localId)
-    if (command.kind === "join" && receipt?.status === "completed" && row(receipt.output)?.status === "waiting") replayJoinTaskIds(options, command, receipts)
+    if (command.kind === "join" && receipt?.status === "completed" && row(receipt.output)?.status === "waiting") replayJoinTaskIds(options, command, receipts, dispatched.commands)
   }
   const observations: Array<{ readonly id: string; readonly content: Record<string, unknown> }> = []
   const observe = async (recordValue: PlanCommandExecutionRecord | PlanControlRecord): Promise<void> => {
@@ -376,7 +388,7 @@ function replayRuntime(
           const receipt = command ? receipts.get(command.localId) : undefined
           if (!receipt) return options.router.execute(context, request)
           if (command?.kind === "join" && receipt.status === "completed" && row(receipt.output)?.status === "waiting" && typeof row(receipt.output)?.waitId === "string") {
-            const resumed = replayWaitOutcome(input, options, command, receipts, String(row(receipt.output)?.waitId))
+            const resumed = replayWaitOutcome(input, options, command, receipts, dispatched.commands, String(row(receipt.output)?.waitId))
             if (resumed) return { ...request, status: "completed" as const, output: resumed, errorCode: null }
           }
           return { ...request, status: receipt.status, ...(Object.prototype.hasOwnProperty.call(receipt, "output") ? { output: receipt.output } : {}), errorCode: receipt.errorCode }

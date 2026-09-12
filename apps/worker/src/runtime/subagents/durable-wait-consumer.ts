@@ -17,8 +17,8 @@ const FORBIDDEN_RESULT_KEYS = new Set([
   "leaseownerid", "leaseversion", "idempotencykey", "capabilities", "permissions", "allowedcapabilities", "budgetlimit", "maxbudget",
 ])
 type ResultInfo = { readonly value: RepositoryJsonValue; readonly bytes: number | null; readonly summary: string; readonly hasValue: boolean }
-type TaskState = { readonly taskId: string; readonly status: string; readonly result: ResultInfo; readonly failureReason: string | null }
-type OutcomeTask = { taskId: string; status: string; result: RepositoryJsonValue; failureReason: string | null }
+type TaskState = { readonly taskId: string; readonly status: string; readonly role: string | null; readonly result: ResultInfo; readonly failureReason: string | null }
+type OutcomeTask = { taskId: string; status: string; role?: string; result: RepositoryJsonValue; failureReason: string | null }
 type Outcome = { waitId: string; status: string; matchedTaskIds: string[]; targetTaskIds: string[]; tasks: OutcomeTask[] }
 type PreparedOutcome = { readonly value: Outcome; readonly taskIds: string[]; readonly mode: "any" | "all" }
 type Detail = { readonly kind: "result"; readonly index: number; readonly info: ResultInfo } | { readonly kind: "failure"; readonly index: number; readonly value: string }
@@ -86,6 +86,7 @@ function failure(value: unknown): string | null { if (value === null || value ==
 function waitMode(value: unknown): "any" | "all" | null { return value === "any" || value === "all" ? value : null }
 function waitStatus(value: unknown): "ready" | "timed_out" | null { return value === "ready" || value === "timed_out" ? value : null }
 function taskStatus(value: unknown): string | null { const result = safeText(value); return result.length > 0 && result.length <= MAX_ID_LENGTH ? result : null }
+function taskRole(value: unknown): string | null { return typeof value === "string" && value.trim().length > 0 && value.length <= MAX_ID_LENGTH ? value : null }
 function boundedIds(value: unknown, allowEmpty = false): string[] | null {
   const values = ids(value)
   if ((!allowEmpty && values.length === 0) || values.length > MAX_TARGETS || new Set(values).size !== values.length
@@ -137,7 +138,7 @@ function makeOutcome(waitId: string, status: string, targetIds: string[], matche
   const seen = new Set<string>(); const tasks: OutcomeTask[] = []
   for (const state of states) {
     if (!targetIds.includes(state.taskId) || seen.has(state.taskId) || !taskStatus(state.status)) return null
-    seen.add(state.taskId); tasks.push({ taskId: state.taskId, status: state.status, result: minimalResult(state.result), failureReason: null })
+    seen.add(state.taskId); tasks.push({ taskId: state.taskId, status: state.status, ...(state.role ? { role: state.role } : {}), result: minimalResult(state.result), failureReason: null })
   }
   let outcome: Outcome = { waitId, status, matchedTaskIds: matchedIds, targetTaskIds: targetIds, tasks }
   let size = outcomeBytes(outcome)
@@ -172,9 +173,9 @@ function generatedOutcome(wait: Row, targets: readonly Row[]): PreparedOutcome |
   const byId = new Map(targets.map(target => [safeText(target.id), target]))
   const states: TaskState[] = targetIds.map(taskId => {
     const target = byId.get(taskId)
-    return { taskId, status: taskStatus(target?.status ?? "unknown") ?? "unknown", result: resultInfo(target?.result ?? null), failureReason: failure(target?.failureReason) }
+    return { taskId, status: taskStatus(target?.status ?? "unknown") ?? "unknown", role: taskRole(target?.role), result: resultInfo(target?.result ?? null), failureReason: failure(target?.failureReason) }
   })
-  return makeOutcome(waitId, status, targetIds, matchedIds, states, currentMode)
+  return states.every(state => state.role !== null) ? makeOutcome(waitId, status, targetIds, matchedIds, states, currentMode) : null
 }
 function storedOutcome(wait: Row): PreparedOutcome | null {
   const raw = record(object(wait.result).outcome); const waitId = safeText(wait.id); const status = raw ? waitStatus(raw.status) : null; const currentMode = waitMode(wait.mode)
@@ -187,7 +188,9 @@ function storedOutcome(wait: Row): PreparedOutcome | null {
     const task = record(value); if (!task || typeof task.taskId !== "string" || !targetIds.includes(task.taskId) || seen.has(task.taskId)) return null
     const childStatus = taskStatus(task.status); if (!childStatus) return null
     seen.add(task.taskId)
-    states.push({ taskId: task.taskId, status: childStatus, result: resultInfo(Object.prototype.hasOwnProperty.call(task, "result") ? task.result : null), failureReason: failure(task.failureReason) })
+    const role = Object.prototype.hasOwnProperty.call(task, "role") ? taskRole(task.role) : null
+    if (Object.prototype.hasOwnProperty.call(task, "role") && !role) return null
+    states.push({ taskId: task.taskId, status: childStatus, role, result: resultInfo(Object.prototype.hasOwnProperty.call(task, "result") ? task.result : null), failureReason: failure(task.failureReason) })
   }
   return seen.size === targetIds.length ? makeOutcome(waitId, status, targetIds, matchedIds, states, currentMode) : null
 }
@@ -224,7 +227,7 @@ export async function consumeDurableWaitOutcomes(input: DurableWaitConsumerInput
     const targetIds = ids(wait.targetTaskIds)
     if (targetIds.length === 0 || targetIds.length > MAX_TARGETS) continue
     const targets = await input.client.query<Row>(
-      `SELECT task."id", task."rootTaskId", task."turnId", task."sessionId", task."status", task."result", task."failureReason", session."userId" AS "userId"
+      `SELECT task."id", task."rootTaskId", task."turnId", task."sessionId", task."role", task."status", task."result", task."failureReason", session."userId" AS "userId"
        FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
        WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3 AND session."userId" = $4`,
       [targetIds, input.lease.sessionId, input.lease.turnId, input.lease.userId],

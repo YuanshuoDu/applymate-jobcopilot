@@ -53,6 +53,14 @@ function validAnalystStructuredResult() {
   }
 }
 
+function replayWait(role: "scout" | "analyst", task: Record<string, unknown>) {
+  const plan = proposal([delegate("child", { role }), join(), use("after", { dependsOn: ["join"] })])
+  const delegateObservation = { id: "plan-result:proposal-1:child", content: { kind: "plan_command", localId: "child", commandKind: "delegate", dependsOn: [], status: "completed", errorCode: null, output: { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" } } }
+  const joinObservation = { id: "plan-result:proposal-1:join", content: { kind: "plan_command", localId: "join", commandKind: "join", dependsOn: ["child"], status: "completed", errorCode: null, output: { waitId: "wait-1", status: "waiting", taskIds: ["child-1"], matchedTaskIds: [] } } }
+  const waitObservation = { id: "wait-result:wait-1", content: { toolCallId: "wait:wait-1", toolName: "wait_subagents", input: { taskIds: ["child-1"], mode: "all" }, status: "completed", output: { waitId: "wait-1", status: "ready", targetTaskIds: ["child-1"], matchedTaskIds: ["child-1"], tasks: [{ taskId: "child-1", status: "completed", result: null, failureReason: null, ...task }] }, errorCode: null } }
+  return { plan, observations: [delegateObservation, joinObservation, waitObservation] as StepContextSnapshot["toolObservations"] }
+}
+
 type FixtureOverrides = {
   readonly allowedTools?: readonly string[]
   readonly allowedRoles?: readonly string[]
@@ -264,6 +272,58 @@ describe("createCanonicalPlanExecutionFactory", () => {
       expect(observationCode(rejected)).toBe("invalid_plan_output")
     }
     expect(router.execute).toHaveBeenCalledTimes(2)
+  })
+
+  it("binds structured replay evidence to the canonical delegate role", async () => {
+    const run = async (role: "scout" | "analyst", task: Record<string, unknown>) => {
+      const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { ok: true }, errorCode: null })) }
+      const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["use_tool", "delegate", "join"], undefined, {
+        allowedTools: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"], allowedRoles: ["scout", "analyst"],
+      })
+      const replay = replayWait(role, task)
+      const result = await hook(input(output(replay.plan), "step-1", replay.observations, true))
+      return { result, router }
+    }
+
+    const validScout = await run("scout", { role: "scout", result: { structuredResult: validScoutStructuredResult() } })
+    expect(observationCode(validScout.result)).toBeUndefined()
+    expect(validScout.router.execute).toHaveBeenCalledTimes(1)
+    const validAnalyst = await run("analyst", { role: "analyst", result: { structuredResult: validAnalystStructuredResult() } })
+    expect(observationCode(validAnalyst.result)).toBeUndefined()
+    for (const task of [
+      { result: { structuredResult: validScoutStructuredResult() } },
+      { role: "analyst", result: { structuredResult: validScoutStructuredResult() } },
+      { result: { legacy: true } },
+      { role: "" }, { role: "x".repeat(257) }, { role: 42 },
+    ]) {
+      const { result, router } = await run("scout", task)
+      if (task.result && typeof task.result === "object" && "structuredResult" in task.result || "role" in task && task.role !== undefined && task.role !== "scout") expect(observationCode(result)).toBe("invalid_plan_output")
+      else expect(observationCode(result)).toBeUndefined()
+      if (task.role !== undefined) expect(router.execute).not.toHaveBeenCalled()
+    }
+  })
+
+  it("fails closed for missing or ambiguous delegate role mappings", async () => {
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { ok: true }, errorCode: null })) }
+    const options = { allowedTools: ["jobs.search", "jobs.get"], allowedRoles: ["scout", "analyst"] }
+    const duplicatePlan = proposal([delegate("first"), delegate("second"), join("join", { inputRefs: ["first", "second"], dependsOn: ["first", "second"] })])
+    const duplicateObservations = [
+      { id: "plan-result:proposal-1:first", content: { kind: "plan_command", localId: "first", commandKind: "delegate", dependsOn: [], status: "completed", errorCode: null, output: { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" } } },
+      { id: "plan-result:proposal-1:second", content: { kind: "plan_command", localId: "second", commandKind: "delegate", dependsOn: [], status: "completed", errorCode: null, output: { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" } } },
+      { id: "plan-result:proposal-1:join", content: { kind: "plan_command", localId: "join", commandKind: "join", dependsOn: ["first", "second"], status: "completed", errorCode: null, output: { waitId: "wait-1", status: "waiting", taskIds: ["child-1"], matchedTaskIds: [] } } },
+    ] as StepContextSnapshot["toolObservations"]
+    const duplicate = await fixture(router, undefined, undefined, undefined, undefined, undefined, ["delegate", "join"], undefined, options)(input(output(duplicatePlan), "step-1", duplicateObservations, true))
+    expect(observationCode(duplicate)).toBe("invalid_plan_output")
+    expect(router.execute).not.toHaveBeenCalled()
+
+    const missingPlan = proposal([use("read"), join("join", { inputRefs: ["read"], dependsOn: ["read"] })])
+    const missingObservations = [
+      { id: "plan-result:proposal-1:read", content: { kind: "plan_command", localId: "read", commandKind: "tool_call", dependsOn: [], status: "completed", errorCode: null, output: { ok: true } } },
+      { id: "plan-result:proposal-1:join", content: { kind: "plan_command", localId: "join", commandKind: "join", dependsOn: ["read"], status: "completed", errorCode: null, output: { waitId: "wait-1", status: "waiting", taskIds: ["read"], matchedTaskIds: [] } } },
+    ] as StepContextSnapshot["toolObservations"]
+    const missing = await fixture(router, undefined, undefined, undefined, undefined, undefined, ["use_tool", "join"], undefined, options)(input(output(missingPlan), "step-1", missingObservations, true))
+    expect(observationCode(missing)).toBe("invalid_plan_output")
+    expect(router.execute).not.toHaveBeenCalled()
   })
 
   it("revalidates accepted output against the server action capability gate", async () => {
