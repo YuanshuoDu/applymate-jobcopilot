@@ -116,6 +116,25 @@ describe("OrchestratorAgent evaluation", () => {
     expect(result.decision).toBe("abort")
   })
 
+  it.each([
+    ["missing thinking", '{"decision":"proceed"}'],
+    ["blank thinking", '{"decision":"proceed","thinking":"  "}'],
+    ["overlong thinking", JSON.stringify({ decision: "proceed", thinking: "x".repeat(121) })],
+    ["missing ask question", '{"decision":"ask_user","thinking":"A user choice is required"}'],
+    ["blank ask question", '{"decision":"ask_user","thinking":"A user choice is required","ask_question":"  "}'],
+    ["missing retry fix", '{"decision":"retry","thinking":"Retry with a safe adjustment"}'],
+    ["empty retry fix", '{"decision":"retry","thinking":"Retry with a safe adjustment","retry_fix":{}}'],
+    ["non-object retry fix", '{"decision":"retry","thinking":"Retry with a safe adjustment","retry_fix":[]}'],
+  ])("fails closed for %s", async (_caseName, text) => {
+    mocks.modelChat.mockResolvedValue({ text })
+    const { agent } = await makeAgent()
+
+    const result = await agent.evaluate("scout", "Found one job", { jobCount: 1 })
+
+    expect(result.decision).not.toBe("proceed")
+    expect(result.decision).toBe("abort")
+  })
+
   it("fails closed when modelChat throws without exposing the provider error", async () => {
     mocks.modelChat.mockRejectedValue(new Error("provider secret token"))
     const { agent, emit } = await makeAgent()
