@@ -655,3 +655,11 @@ Commits `331edc78`, `e48c596f`, and `704c1750` align `agent.turn.dispatch` aggre
 Root independently verified the Web command-service and transaction suites at **30/30** and the Worker recovery-scanner, turn-queue, durable-wait-handoff, and durable-wait-resolver suites at **44/44**. Web and Worker `tsc --noEmit --skipLibCheck`, the shared package build, and `git diff --check` also passed.
 
 Live PostgreSQL/RLS, Redis/BullMQ delivery, real concurrent transactions, process restart, provider/browser behavior, and full child-parent E2E remain unverified. The cognitive gate remains disabled; P4-39 remains a candidate and does not establish complete Harness, P4/Phase or production acceptance. Overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-40 update
+
+Commit `97b04bd7` adds atomic root Scout/Analyst orchestration. When `AgentTreeManager.supportsAtomicSpawn()` is true, root orchestration concurrently uses role-specific `${waitId}:scout` and `${waitId}:analyst` spawn idempotency keys. `spawnAtomic` commits the child task, spawn operation, and dispatch outbox in one transaction; the atomic path does not invoke the external dispatch callback. Duplicate tasks still enter durable wait. Non-atomic stores retain the `manager.spawn` plus dispatch fallback.
+
+Root independently verified the five focused Worker suites at **57/57** (root-orchestration 5, manager 5, Pg store 32, coordination-executors 9, production-bootstrap 6). The shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+Live PostgreSQL/RLS, Redis/BullMQ delivery, cross-process concurrency, process restart, provider/browser behavior, and full child-parent E2E remain unverified. The cognitive gate remains disabled; P4-40 remains a candidate and does not establish complete Harness, P4/Phase or production acceptance. Overall progress remains **P0 accepted 1/8 (12.5%)**.
