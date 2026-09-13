@@ -61,6 +61,16 @@ export async function lockOwnedSession(tx: CommandTransaction, sessionId: string
   if (!rows[0]) throw sessionNotFound(sessionId)
 }
 
+export async function lockOpenSession(tx: CommandTransaction, sessionId: string, userId: string): Promise<void> {
+  const rows = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+    SELECT "id" FROM "agent_sessions"
+    WHERE "id" = ${sessionId} AND "userId" = ${userId}
+      AND "status" NOT IN ('aborted', 'archived')
+    FOR UPDATE
+  `)
+  if (!rows[0]) throw sessionNotFound(sessionId)
+}
+
 export async function findActiveTurn(
   tx: CommandTransaction,
   sessionId: string,

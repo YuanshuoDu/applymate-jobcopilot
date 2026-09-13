@@ -10,7 +10,7 @@ import {
   findActiveTurn,
   findExistingCommand,
   fallbackDisposition,
-  lockOwnedSession,
+  lockOpenSession,
   type CommandTransaction,
 } from "./transaction"
 import type {
@@ -116,7 +116,7 @@ export class AgentCommandService {
 
   private startOnce(command: StartCommand): Promise<CommandResult> {
     return this.db.$transaction(async (tx) => {
-      await lockOwnedSession(tx, command.sessionId, command.userId)
+      await lockOpenSession(tx, command.sessionId, command.userId)
       const existing = await findExistingCommand(tx, command.sessionId, command.clientMessageId)
       if (existing) return duplicateCommandResult(tx, command, existing, "follow_up")
 
@@ -131,7 +131,7 @@ export class AgentCommandService {
 
   private messageOnce(command: MessageCommand): Promise<CommandResult> {
     return this.db.$transaction(async (tx) => {
-      await lockOwnedSession(tx, command.sessionId, command.userId)
+      await lockOpenSession(tx, command.sessionId, command.userId)
       const existing = await findExistingCommand(tx, command.sessionId, command.clientMessageId)
       if (existing) return duplicateCommandResult(tx, command, existing, command.delivery)
 
@@ -156,7 +156,7 @@ export class AgentCommandService {
 
   private interruptOnce(command: InterruptCommand): Promise<InterruptResult> {
     return this.db.$transaction(async (tx) => {
-      await lockOwnedSession(tx, command.sessionId, command.userId)
+      await lockOpenSession(tx, command.sessionId, command.userId)
       const existing = await findExistingCommand(tx, command.sessionId, command.clientMessageId)
       if (existing) return duplicateInterruptResult(tx, command, existing)
 

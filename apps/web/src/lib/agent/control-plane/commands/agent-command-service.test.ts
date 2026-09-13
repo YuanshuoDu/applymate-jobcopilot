@@ -12,6 +12,9 @@ function whereOf(args: unknown): Row {
 
 function makeDb(options: {
   ownerId?: string
+  sessionExists?: boolean
+  sessionStatus?: string
+  sessionOwnerId?: string
   failOutbox?: boolean
   executionStatus?: string
   sessionSource?: string
@@ -19,13 +22,17 @@ function makeDb(options: {
   activeTurnId?: string
 } = {}) {
   const ownerId = options.ownerId ?? "user_1"
+  const sessionExists = options.sessionExists ?? true
+  const sessionOwnerId = options.sessionOwnerId ?? ownerId
   let active: (Row & { revision: number }) | null = options.activeSource
     ? { id: options.activeTurnId ?? "turn_1", source: options.activeSource, status: "in_progress", revision: 0 }
     : null
   let execution: { id: string; sessionId: string; status: string } | null = options.executionStatus
     ? { id: "execution_1", sessionId: "session_1", status: options.executionStatus }
     : null
-  let sessionStatus = "active"
+  let sessionStatus = options.sessionStatus ?? "active"
+  const rawQueries: unknown[] = []
+  let rollbacks = 0
   let sequence = BigInt(0)
   let inputs: Row[] = []
   let items: Row[] = []
@@ -35,8 +42,14 @@ function makeDb(options: {
 
   const tx = {
     $queryRaw: vi.fn(async (query: unknown) => {
+      rawQueries.push(query)
       const strings = (query as { strings?: readonly string[] }).strings ?? []
-      if (strings.join(" ").includes("SELECT")) return [{ id: "session_1" }]
+      const sql = strings.join(" ")
+      if (sql.includes("SELECT")) {
+        const openFence = sql.includes('"status" NOT IN')
+        const available = sessionExists && sessionOwnerId === ownerId && (!openFence || !["aborted", "archived"].includes(sessionStatus))
+        return available ? [{ id: "session_1" }] : []
+      }
       sequence += BigInt(1)
       return [{ eventSequence: sequence }]
     }),
@@ -135,6 +148,7 @@ function makeDb(options: {
       try {
         return await work(tx)
       } catch (error: unknown) {
+        rollbacks += 1
         active = before.active
         execution = before.execution
         sessionStatus = before.sessionStatus
@@ -155,6 +169,8 @@ function makeDb(options: {
     db,
     tx,
     state: {
+      rawQueries,
+      get rollbacks() { return rollbacks },
       get active() { return active },
       setActive(value: (Row & { revision: number }) | null) { active = value },
       get execution() { return execution },
@@ -299,6 +315,61 @@ describe("AgentCommandService", () => {
 
     expect(result).toMatchObject({ disposition: "interrupted", turnId: started.turnId })
     expect(fake.state.active).toMatchObject({ status: "interrupted", revision: 1 })
+  })
+
+  it("uses the open session fence before command admission", async () => {
+    const fake = makeDb()
+    await new AgentCommandService(fake.db).start(startCommand("client_open_fence"))
+
+    const sessionLock = fake.state.rawQueries
+      .map((query) => ((query as { strings?: readonly string[] }).strings ?? []).join(" "))
+      .find((sql) => sql.includes('FROM "agent_sessions"') && sql.includes('"status" NOT IN') && sql.includes("FOR UPDATE"))
+    expect(sessionLock).toContain('"userId" =')
+    expect(sessionLock).toContain('"status" NOT IN (\'aborted\', \'archived\')')
+  })
+
+  it.each([
+    ["start", "aborted", { sessionStatus: "aborted" }],
+    ["message", "archived", { sessionStatus: "archived" }],
+    ["interrupt", "missing", { sessionExists: false }],
+    ["start", "cross-user", { sessionOwnerId: "user_2" }],
+    ["message", "aborted", { sessionStatus: "aborted" }],
+    ["interrupt", "archived", { sessionStatus: "archived" }],
+    ["start", "missing", { sessionExists: false }],
+    ["message", "cross-user", { sessionOwnerId: "user_2" }],
+    ["interrupt", "aborted", { sessionStatus: "aborted" }],
+    ["start", "archived", { sessionStatus: "archived" }],
+    ["message", "missing", { sessionExists: false }],
+    ["interrupt", "cross-user", { sessionOwnerId: "user_2" }],
+  ])("rejects %s on a %s session before durable mutations", async (action, _label, options) => {
+    const fake = makeDb(options)
+    const service = new AgentCommandService(fake.db)
+    const clientMessageId = `client_closed_${action}_${_label}`
+    const result: Promise<unknown> = action === "interrupt"
+      ? service.interrupt({ ...startCommand(clientMessageId), expectedTurnId: "turn_1" })
+      : action === "message"
+        ? service.message({ ...startCommand(clientMessageId), delivery: "follow_up" as const })
+        : service.start(startCommand(clientMessageId))
+
+    await expect(result).rejects.toMatchObject({ code: "agent_session_not_found", status: 404 })
+    expect(fake.state.rollbacks).toBe(1)
+    expect(fake.tx.agentInput.findFirst).not.toHaveBeenCalled()
+    expect(fake.tx.agentTurn.findFirst).not.toHaveBeenCalled()
+    expect(fake.tx.agentTurn.create).not.toHaveBeenCalled()
+    expect(fake.tx.agentTurn.updateMany).not.toHaveBeenCalled()
+    expect(fake.tx.agentItem.create).not.toHaveBeenCalled()
+    expect(fake.tx.agentEvent.findFirst).not.toHaveBeenCalled()
+    expect(fake.tx.agentEvent.create).not.toHaveBeenCalled()
+    expect(fake.tx.agentOutbox.create).not.toHaveBeenCalled()
+    expect(fake.state.inputs).toHaveLength(0)
+    expect(fake.state.items).toHaveLength(0)
+    expect(fake.state.events).toHaveLength(0)
+    expect(fake.state.outbox).toHaveLength(0)
+    expect(fake.state.rawQueries.length).toBe(1)
+    const sql = ((fake.state.rawQueries[0] as { strings?: readonly string[] }).strings ?? []).join(" ")
+    expect(sql).toContain('"status" NOT IN (\'aborted\', \'archived\')')
+    expect(sql).toContain("FOR UPDATE")
+    expect(sql).toContain('"userId" =')
   })
 
   it("cancels an automation execution and interrupts its active Turn in one transaction", async () => {
