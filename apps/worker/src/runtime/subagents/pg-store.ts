@@ -205,7 +205,8 @@ export class PgSubagentTaskStore implements SubagentStore {
       [input.taskId, input.sessionId, input.ownerId, input.attemptCount, input.now])
       if (updated.rowCount !== 1) return false
       await client.query(`UPDATE "agent_outbox" SET "publishedAt" = NULL, "attemptCount" = "attemptCount" + 1, "lastError" = NULL
-        WHERE "topic" = 'agent.subagent.dispatch' AND "aggregateId" = $1`, [input.taskId])
+        WHERE "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $1 AND "aggregateId" = $2`,
+      [`subagent-dispatch:${input.taskId}`, input.sessionId])
       return true
     })
   }

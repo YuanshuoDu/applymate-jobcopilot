@@ -264,7 +264,10 @@ describe("PgSubagentTaskStore", () => {
     expect(updates[0]?.[0]).toContain('"interruptRequestedAt" IS NULL')
     expect(updates[0]?.[0]).toContain('session."status" NOT IN (\'aborted\', \'archived\')')
     expect(updates[1]?.[0]).toContain("publishedAt")
-    expect(updates[1]?.[1]).toEqual(["task-1"])
+    expect(updates[1]?.[0]).toContain('"topic" = \'agent.subagent.dispatch\'')
+    expect(updates[1]?.[0]).toContain('"idempotencyKey" = $1')
+    expect(updates[1]?.[0]).toContain('"aggregateId" = $2')
+    expect(updates[1]?.[1]).toEqual(["subagent-dispatch:task-1", "session-1"])
   })
 
   it.each(["aborted", "archived"] as const)("does not release a child in a %s session", async status => {
