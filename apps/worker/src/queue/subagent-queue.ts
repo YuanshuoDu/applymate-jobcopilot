@@ -240,18 +240,11 @@ export function startSubagentRecoveryScanner(
   }
 }
 
-export function createSubagentQueue(options: {
-  manager: AgentTreeManager
-  execute: SubagentExecutor
-  queue?: SubagentQueueLike
-}): { queue: SubagentQueueLike; worker: Worker<SubagentJobPayload>; close: () => Promise<void> } {
+export function createSubagentQueue(options: { manager: AgentTreeManager; execute: SubagentExecutor; queue?: SubagentQueueLike }): { queue: SubagentQueueLike; worker: Worker<SubagentJobPayload>; close: () => Promise<void> } {
   const queue = options.queue ?? new Queue<SubagentJobPayload>(SUBAGENT_QUEUE_NAME, { connection: redisConnection, skipVersionCheck: true })
   const worker = new Worker<SubagentJobPayload>(SUBAGENT_QUEUE_NAME, async (job: Pick<Job<SubagentJobPayload>, "data">) => {
-    const payload = parseSubagentJobPayload(job.data)
-    if (!payload) throw new TypeError("Invalid Subagent queue payload")
-    const outcome = await options.manager.run(payload, options.execute)
-    if (outcome.status === "retrying" || outcome.status === "lease_lost") throw new Error(outcome.reason ?? "Subagent should be retried")
-    return outcome
+    const payload = parseSubagentJobPayload(job.data); if (!payload) throw new TypeError("Invalid Subagent queue payload")
+    const outcome = await options.manager.run(payload, options.execute); if (outcome.status === "retrying" || outcome.status === "lease_lost") throw new Error(outcome.reason ?? "Subagent should be retried"); return outcome
   }, { connection: redisConnection, skipVersionCheck: true, ...workerPollingOptions(), concurrency: 8 })
   return { queue, worker, async close() { await worker.close(); await queue.close?.() } }
 }
