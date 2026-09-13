@@ -1602,3 +1602,15 @@ Canonical runtime execution now starts the projection before the engine, finishe
 **Independent verification:** Focused Worker validation passed **48/48** across canonical execution projection, canonical runtime, and root-task-store tests; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
 
 **Candidate boundary:** The projection is opt-in through existing Worker runtime wiring and only affects sessions selected by its automation-session SQL scope. Live PostgreSQL/RLS, Redis/queue delivery, real Worker startup or restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance.
+
+## 40. P4-10 — Execution cancellation interrupt bridge
+
+**Candidate status/date (2026-09-13):** P4-10 is recorded as a candidate bridge from Web Execution cancellation to canonical Turn interruption; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `b39ddd29` moves Execution DELETE cancellation through the server-owned command service. A single transaction scopes the user/session Execution update, the automation-owned active Turn, pending waits, interrupt facts and events/outbox, and the Session `aborted` projection. The interrupt idempotency key combines `executionId` and the current `turnId`, so a restarted execution with a new Turn receives a new cancellation command while repeated delivery of the same Turn is deduplicated.
+
+Ownership mismatches fail closed, ordinary user Turns are not interrupted, and no active Turn remains a safe cancellation path. Completed or failed executions are preserved; an already-cancelled execution is idempotent and can repair a missing durable interrupt. Revision and Execution status races roll back the transaction with typed conflicts, so a cancelled Execution is never resurrected and unknown database or permission errors remain surfaced.
+
+**Independent verification:** Focused Web route and command suites passed **23/23**; shared package build, Worker `tsc --noEmit --skipLibCheck`, Web `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, real Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness or P4/Phase completion; overall progress remains **P0 accepted 1/8 (12.5%)**.

@@ -447,3 +447,11 @@ Commit `67397416` adds the opt-in canonical execution projection for automation 
 The canonical runtime finalizes the durable root before projecting its terminal result. If that projection fails, the optional lease-fenced terminal-root reconciliation seam validates the stored result and retries only the projection on the next delivery, avoiding a second model/engine run or duplicate root finish. Focused Worker validation passed **48/48**, with the shared build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passing.
 
 This remains a candidate: no live PostgreSQL/RLS or Redis/queue delivery, real startup/restart, provider, browser, or child-parent E2E was run. Projection is opt-in and limited by the existing automation-session SQL scope; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-10 update
+
+Commit `b39ddd29` bridges Web Execution DELETE cancellation to the canonical Turn interrupt through one server-owned transaction. The transaction scopes the authenticated user and session Execution, the automation-owned active Turn, pending waits, interrupt facts/events/outbox, and Session `aborted` state. A deterministic `executionId` plus current `turnId` key prevents duplicate interrupts while allowing a restarted execution's new Turn to be cancelled independently.
+
+Ownership mismatches fail closed; ordinary user Turns are untouched; no active Turn is safe; completed or failed executions remain terminal; and an already-cancelled execution can be retried idempotently. Execution status and Turn revision races roll back with typed conflicts, while real database or permission errors remain surfaced. Focused Web validation passed **23/23**, with shared build, Worker tsc, Web tsc, and `git diff --check` passing.
+
+Live PostgreSQL/RLS, Redis/queue delivery, real Worker restart, provider, browser, and child-parent E2E remain unverified. This candidate does not complete Harness or P4/Phase, and overall progress remains **P0 accepted 1/8 (12.5%)**.
