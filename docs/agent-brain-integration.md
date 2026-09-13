@@ -491,3 +491,9 @@ Root independently verified the lease and Turn queue suites at **20/20**, with s
 Commit `4a248447` adds a server-owned recursive serialization fence to context compaction input and snapshot-loader replay. BigInt, cycles, Symbol/function values, NaN/Infinity, non-plain objects, accessors, symbol properties, and sparse arrays fail closed as `TurnEngineError(code = 'invalid_output')` before `stableJson`, protected invariant comparison, or observation append can leak raw exceptions or pollute a snapshot. Valid replay preserves the user/session/turn scope fence and does not invoke the model hook again.
 
 Root independently verified the focused context-compaction runtime and context snapshot adapter suites at **18/18 + 6/6**, with the shared build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passing. Live PostgreSQL/RLS, Redis/queue delivery, provider, process restart, browser, and child-parent E2E remain unverified; P4-15 does not establish complete Harness, P4/Phase, or production acceptance, and overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-16 update
+
+Commit `236180a6` adds a session-state fence to `PgSubagentTaskStore.claim`. The locked session row and conditional child-task UPDATE reject queued claims for `aborted` or `archived` sessions. `running`, `paused`, and `waiting_for_user` sessions remain claimable, as do ordinary user/system sessions, while existing root/Turn/lease/attempt/concurrency semantics remain unchanged.
+
+Root independently verified the pg-store focused suite at **16/16**, with shared build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passing. Live PostgreSQL/RLS, real concurrent transactions, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E remain unverified; P4-16 does not establish complete Harness, P4/Phase, or production acceptance, and overall progress remains **P0 accepted 1/8 (12.5%)**.

@@ -1672,3 +1672,13 @@ A blocked or raced claim continues to surface only the recoverable `TurnLeaseErr
 **Independent verification:** Focused context-compaction runtime tests passed **18/18**; the existing context snapshot adapter regression passed **6/6**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed. The changed runtime source remains within the 250-line project limit.
 
 **Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, provider behavior, process restart, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 46. P4-16 — Subagent claim session-state fence
+
+**Candidate status/date (2026-09-13):** P4-16 is recorded as a candidate queued child-task session-state safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `236180a6` extends `PgSubagentTaskStore.claim` with a server-owned session-state fence. The locked `agent_sessions` row is checked before a queued child claim, and the conditional task UPDATE also requires the session status not to be `aborted` or `archived`. Running, paused, and waiting-for-user sessions remain claimable, as do ordinary user/system sessions; existing root-task, Turn, lease, attempt, and concurrency fences remain unchanged.
+
+**Independent verification:** The focused pg-store suite passed **16/16**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrent transactions, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
