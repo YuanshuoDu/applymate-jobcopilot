@@ -1682,3 +1682,13 @@ A blocked or raced claim continues to surface only the recoverable `TurnLeaseErr
 **Independent verification:** The focused pg-store suite passed **16/16**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, real concurrent transactions, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 47. P4-17 — Subagent creation session-state fence
+
+**Candidate status/date (2026-09-13):** P4-17 is recorded as a candidate queued child-task creation safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `cc7c66c4` extends `PgSubagentTaskStore.create` to read the locked session status and fail closed with the existing `Session is unavailable` error for `aborted` or `archived` sessions. Running, paused, and waiting-for-user sessions remain creatable, as do ordinary user/system sessions; parent-task depth, fan-out, action, model, budget, and other creation semantics remain unchanged.
+
+**Independent verification:** The focused pg-store suite passed **21/21**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrent transactions, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.

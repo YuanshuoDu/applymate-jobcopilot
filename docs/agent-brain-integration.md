@@ -497,3 +497,9 @@ Root independently verified the focused context-compaction runtime and context s
 Commit `236180a6` adds a session-state fence to `PgSubagentTaskStore.claim`. The locked session row and conditional child-task UPDATE reject queued claims for `aborted` or `archived` sessions. `running`, `paused`, and `waiting_for_user` sessions remain claimable, as do ordinary user/system sessions, while existing root/Turn/lease/attempt/concurrency semantics remain unchanged.
 
 Root independently verified the pg-store focused suite at **16/16**, with shared build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passing. Live PostgreSQL/RLS, real concurrent transactions, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E remain unverified; P4-16 does not establish complete Harness, P4/Phase, or production acceptance, and overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-17 update
+
+Commit `cc7c66c4` adds a session-state fence to `PgSubagentTaskStore.create`. The locked session row is checked before insertion, so `aborted` and `archived` sessions fail closed with the existing `Session is unavailable` error. `running`, `paused`, and `waiting_for_user` sessions remain creatable, as do ordinary user/system sessions, while parent-task depth, fan-out, action, model, and budget semantics remain unchanged.
+
+Root independently verified the pg-store focused suite at **21/21**, with shared build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passing. Live PostgreSQL/RLS, real concurrent transactions, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E remain unverified; P4-17 does not establish complete Harness, P4/Phase, or production acceptance, and overall progress remains **P0 accepted 1/8 (12.5%)**.
