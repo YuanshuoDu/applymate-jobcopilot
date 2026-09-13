@@ -1874,3 +1874,13 @@ Conditional wait/Turn/outbox mutations fail closed when a session closes during 
 **Independent verification:** Root independently verified the focused Worker suites at **53/53**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, real concurrent transactions, Worker restart, Redis/BullMQ delivery, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 66. P4-36 — Deterministic child-wait-resume composition fixture
+
+**Candidate status/date (2026-09-13):** P4-36 is recorded as a candidate deterministic child-to-parent composition fixture; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `76227d96` adds a focused fixture that drives the actual Worker coordination seams through root spawn, child queueing via the queue helper, child claim/retry/finish, durable wait resolution and wake, parent Turn outbox dispatch, parent re-claim under a new lease, once-only wait outcome consumption, and the server-owned completion gate. It observes the child result and retry/wait boundary, proves duplicate resolver and consumer calls do not repeat wake or durable outcome writes, and records completion feedback only after the child reaches terminal state. Child dispatch in this fixture is a direct queue-helper invocation; parent wake uses the Turn outbox. The fixture uses an in-memory store, fake PostgreSQL, and an `ioredis` test disconnect stub; it does not enable the cognitive gate.
+
+**Independent verification:** Root independently verified the focused Worker composition and directly related suites at **77/77** across 8 files; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
+
+**Candidate boundary:** Live Redis/BullMQ, PostgreSQL/RLS, real concurrent transactions, Worker restart, provider, browser, and full production child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
