@@ -141,7 +141,7 @@ type QueryResponse = { rows: Array<Record<string, unknown>>; rowCount: number }
 
 class IntegrationPg {
   readonly calls: string[] = []
-  readonly outbox: Array<{ id: string; payload: Record<string, unknown>; publishedAt: Date | null }> = []
+  readonly outbox: Array<{ id: string; aggregateId: string; topic: string; payload: Record<string, unknown>; attemptCount: number; publishedAt: Date | null }> = []
   readonly state: { sessionStatus: string; turn: TurnState; wait: WaitState; stepStatus: string; consumeWrites: number }
   readonly client: { query: (sql: string, values?: readonly unknown[]) => Promise<QueryResponse>; release: () => void }
   readonly pool: pg.Pool
@@ -169,7 +169,18 @@ class IntegrationPg {
     if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(trimmed) || sql.includes("set_config")) return { rows: [], rowCount: 0 }
     if (sql.includes("SELECT session.\"userId\"") && sql.includes("FROM \"agent_sessions\" AS session") && sql.includes("FOR UPDATE")) return this.sessionRow()
     if (sql.includes("WHERE turn.\"status\" IN ('waiting_for_dependency', 'in_progress')")) return this.state.turn.status === "waiting_for_dependency" || this.state.turn.status === "in_progress" ? { rows: [this.turnRow()], rowCount: 1 } : { rows: [], rowCount: 0 }
-    if (sql.includes('SELECT "id", "payload", "attemptCount"') && sql.includes('FROM "agent_outbox"')) return { rows: this.outbox.filter(row => row.publishedAt === null).map(row => ({ id: row.id, payload: row.payload, attemptCount: 0 })), rowCount: this.outbox.filter(row => row.publishedAt === null).length }
+    if (sql.includes('SELECT dispatch."id", dispatch."aggregateId", dispatch."payload", dispatch."attemptCount"') && sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes('JOIN "agent_sessions" AS session') && sql.includes('session."id" = dispatch."aggregateId"')) {
+      const rows = this.state.sessionStatus === "running" ? this.outbox.filter(row => row.aggregateId === SESSION_ID && row.topic === "agent.turn.dispatch" && row.publishedAt === null).map(row => ({ id: row.id, aggregateId: SESSION_ID, payload: row.payload, attemptCount: row.attemptCount })) : []
+      return { rows, rowCount: rows.length }
+    }
+    if (sql.includes('SELECT "id", "payload", "attemptCount"') && sql.includes('FROM "agent_outbox"')) {
+      const rows = this.outbox.filter(row => row.publishedAt === null).map(row => ({ id: row.id, payload: row.payload, attemptCount: row.attemptCount }))
+      return { rows, rowCount: rows.length }
+    }
+    if (sql.includes('SELECT dispatch."id" FROM "agent_outbox" AS dispatch') && sql.includes('dispatch."aggregateId" = $2') && sql.includes('dispatch."topic" = $3') && sql.includes('dispatch."publishedAt" IS NULL') && sql.includes("FOR UPDATE")) {
+      const row = this.outbox.find(candidate => candidate.id === String(values[0]) && candidate.aggregateId === String(values[1]) && candidate.topic === String(values[2]) && candidate.publishedAt === null)
+      return row ? { rows: [{ id: row.id }], rowCount: 1 } : { rows: [], rowCount: 0 }
+    }
     if (sql.includes('SELECT task."id", task."status", task."sessionId"') && sql.includes('task."id" <> $3')) {
       const children = [...this.store.records.values()].filter(task => task.rootTaskId === this.state.turn.rootTaskId && task.id !== this.state.turn.rootTaskId && !["completed", "failed", "interrupted", "cancelled", "closed"].includes(task.status))
       return { rows: children.map(task => this.taskRow(task)), rowCount: children.length }
@@ -185,6 +196,7 @@ class IntegrationPg {
     }
     if (sql.startsWith('SELECT "id", "rootTaskId" FROM "agent_turns"')) return { rows: [{ id: TURN_ID, rootTaskId: this.state.turn.rootTaskId }], rowCount: 1 }
     if (sql.includes('FROM "agent_turns" AS turn') && sql.includes('FOR UPDATE')) return { rows: [this.turnRow()], rowCount: 1 }
+    if (sql.includes('SELECT session."id" FROM "agent_sessions" AS session') && sql.includes("FOR UPDATE")) return this.state.sessionStatus === "running" ? { rows: [{ id: SESSION_ID }], rowCount: 1 } : { rows: [], rowCount: 0 }
     if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return this.sessionRow()
     if (sql.includes('SET "result" = jsonb_set')) {
       if (this.state.wait.consumedAt !== null) return { rows: [], rowCount: 0 }
@@ -202,7 +214,7 @@ class IntegrationPg {
     if (sql.includes('SET "status" = \'waiting_for_dependency\'')) { this.state.turn.status = "waiting_for_dependency"; this.state.turn.leaseOwnerId = null; this.state.turn.leaseExpiresAt = null; this.state.turn.leaseStartedAt = null; this.state.turn.revision += 1; return { rows: [], rowCount: 1 } }
     if (sql.includes('SET "status" = \'queued\'')) { this.state.turn.status = "queued"; this.state.turn.leaseOwnerId = null; this.state.turn.leaseExpiresAt = null; this.state.turn.leaseStartedAt = null; this.state.turn.revision += 1; return { rows: [], rowCount: 1 } }
     if (sql.includes('SET "status" = $5')) { this.state.turn.status = String(values[4]); this.state.turn.leaseOwnerId = null; this.state.turn.leaseExpiresAt = null; this.state.turn.leaseStartedAt = null; this.state.turn.revision += 1; return { rows: [], rowCount: 1 } }
-    if (sql.startsWith('INSERT INTO "agent_outbox"')) { this.outbox.push({ id: String(values[0]), payload: JSON.parse(String(values[4])) as Record<string, unknown>, publishedAt: null }); return { rows: [], rowCount: 1 } }
+    if (sql.startsWith('INSERT INTO "agent_outbox"')) { this.outbox.push({ id: String(values[0]), aggregateId: String(values[2]), topic: String(values[1]), payload: JSON.parse(String(values[4])) as Record<string, unknown>, attemptCount: 0, publishedAt: null }); return { rows: [], rowCount: 1 } }
     if (sql.startsWith('UPDATE "agent_outbox"')) {
       const row = this.outbox.find(candidate => candidate.id === String(values[0]))
       if (row) row.publishedAt = NOW
@@ -286,6 +298,7 @@ describe("canonical child wait resume composition", () => {
     await expect(reconcileDurableWaits(db.pool, { now: NOW, ownerId: "resolver-1" })).resolves.toEqual({ scanned: 0, resolved: 0, woken: 0 })
     expect(db.outbox).toHaveLength(1)
     expect(await dispatchPendingTurnOutbox(db.pool, queue as never)).toBe(1)
+    expect(db.calls.find(sql => sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes('SELECT dispatch."id"'))).toContain('session."id" = dispatch."aggregateId"')
     expect(queue.jobs).toHaveLength(1)
 
     const parentJob = queue.jobs.shift()!
