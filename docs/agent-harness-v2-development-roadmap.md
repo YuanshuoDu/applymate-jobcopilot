@@ -1864,3 +1864,13 @@ Conditional wait/Turn/outbox mutations fail closed when a session closes during 
 **Independent verification:** Root independently verified the focused wakeup suite at **9/9**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, real cross-process concurrency, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 65. P4-35 — Atomic subagent spawn transaction
+
+**Candidate status/date (2026-09-13):** P4-35 is recorded as a candidate Worker atomic child-spawn durability slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `549636d6` adds `PgSubagentTaskStore.createWithSpawn`, which performs the open user/session fence, existing spawn idempotency replay before parent fan-out and depth checks, child task insertion, spawn operation outbox insertion, and dispatch outbox insertion in one PostgreSQL transaction. A failure rolls back the queued child and both outbox rows together. `AgentTreeManager` and `executeSpawn` select this atomic seam only when the store capability exists; memory and custom stores explicitly retain the prior two-phase fallback. Duplicate calls replay the winner and preserve replay activity. Existing parent/child scope, policy, depth, fan-out, and idempotency rules remain enforced.
+
+**Independent verification:** Root independently verified the focused Worker suites at **53/53**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrent transactions, Worker restart, Redis/BullMQ delivery, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
