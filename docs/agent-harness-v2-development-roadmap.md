@@ -1775,6 +1775,16 @@ Conditional wait/Turn/outbox mutations fail closed when a session closes during 
 
 **Candidate boundary:** Live PostgreSQL/RLS, real concurrency and lock races, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
 
+## 57. P4-27 — Context snapshot write session-state fence
+
+**Candidate status/date (2026-09-13):** P4-27 is recorded as a candidate context snapshot persistence safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `2705047a` makes both snapshot `save` paths lock the linked open session first with `FOR UPDATE`, then perform step/turn scope checks and snapshot writes. `aborted`, `archived`, missing, or cross-user sessions fail closed before `INSERT` or memory-summary `UPDATE`; historical reads remain unchanged, including completed, failed, or aborted session records.
+
+**Independent verification:** Root independently verified the two focused snapshot suites at **17/17**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrency, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
 ## 52. P4-22 — Wakeup resume session-state fence
 
 **Candidate status/date (2026-09-13):** P4-22 is recorded as a candidate wakeup resume safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
