@@ -1626,3 +1626,15 @@ The same Turn fence is passed from canonical runtime start, normal terminal fini
 **Independent verification:** Root independently verified **3 focused suites / 50 tests** across projection, canonical runtime, and root-task-store regression; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, real Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness or P4/Phase completion; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 42. P4-12 — Automation Turn source isolation
+
+**Candidate status/date (2026-09-13):** P4-12 is recorded as a candidate automation-session Turn source-isolation slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `01dc8edd` makes both active and concurrent-race `ensureAutomationTurn` lookups require `source = 'automation'`. After a `P2002`, only a raced Turn with the same `userId`, `sessionId`, and automation source is reusable. If no such Turn is visible, the helper fails closed with `AutomationTurnOccupiedError` and `code = 'automation_turn_occupied'`, so a user or system Turn cannot be returned to an automation run.
+
+Manual automation POST maps this typed conflict to HTTP `409`. The due scheduler treats it as an unstartable round, performs no execution or queue dispatch, and restores `nextRunAt` to the current time for a safe retry. Other database and permission errors remain surfaced.
+
+**Independent verification:** Root independently verified the focused Web suites at **23/23**; Web `tsc --noEmit --skipLibCheck` and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrent database behavior, Redis/queue delivery, real Worker restart, production scheduler timing, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness, P4/Phase completion; overall progress remains **P0 accepted 1/8 (12.5%)**.

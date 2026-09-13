@@ -463,3 +463,11 @@ Commit `2bade48d` repairs the automation restart stale-Turn projection race. `Ca
 Canonical runtime passes `lease.turnId` to start, normal finish, and terminal-root reconciliation finish. A late old-Turn queue delivery or reconciliation therefore cannot mark a restarted session's newer `AgentExecution` completed or failed. Existing cancelled/terminal guards and stable `startedAt` behavior remain in force. Root independently verified **3 suites / 50 tests**, plus shared build, Worker tsc, and `git diff --check`.
 
 Live PostgreSQL/RLS, Redis/queue delivery, real Worker restart, provider, browser, and child-parent E2E remain unverified. This candidate does not complete Harness or P4/Phase, and overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-12 update
+
+Commit `01dc8edd` closes the automation Turn source-isolation gap. Both active and `P2002` race lookups now require `source = 'automation'`; after a race, only a Turn with the same `userId`, `sessionId`, and automation source can be reused. If no matching Turn is visible, `AutomationTurnOccupiedError` with `code = 'automation_turn_occupied'` fails closed instead of returning a user or system Turn.
+
+The manual automation POST maps this conflict to HTTP `409`. The due scheduler skips the unsafe round without execution or queue dispatch and restores `nextRunAt` to the current time for retry. Focused Web validation passed **23/23**, Web `tsc --noEmit --skipLibCheck`, and `git diff --check` passed as well.
+
+Live PostgreSQL/RLS, real concurrent database behavior, Redis/queue delivery, real Worker restart, production scheduler timing, provider, browser, and child-parent E2E remain unverified. This candidate does not complete Harness or P4/Phase, and overall progress remains **P0 accepted 1/8 (12.5%)**.
