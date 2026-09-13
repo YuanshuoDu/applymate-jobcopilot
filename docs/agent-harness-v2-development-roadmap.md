@@ -1815,6 +1815,16 @@ Conditional wait/Turn/outbox mutations fail closed when a session closes during 
 
 **Candidate boundary:** Live PostgreSQL/RLS, real concurrent lock races, Redis/queue delivery, Worker restart, OAuth provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
 
+## 61. P4-31 — Web command admission open-session fence
+
+**Candidate status/date (2026-09-13):** P4-31 is recorded as a candidate Web command-admission safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `4f704402` adds `lockOpenSession`, which locks the user-owned session with `status NOT IN ('aborted', 'archived')` and `FOR UPDATE` before command admission. `start`, `message`, `steer`, and `interrupt` fail closed with rollback before any Turn, Item, Event, Input, or Outbox mutation for closed, missing, or cross-user sessions. `lockOwnedSession` remains unchanged so fork can read historical closed source sessions and cancellation retains its existing idempotency and repair behavior.
+
+**Independent verification:** Root independently verified the command and cancellation suites at **36/36**, the fork route suite at **2/2**, Web `tsc --noEmit --skipLibCheck`, and `git diff --check`.
+
+**Candidate boundary:** Live database/RLS, real concurrency, Worker restart, and full route E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
 ## 52. P4-22 — Wakeup resume session-state fence
 
 **Candidate status/date (2026-09-13):** P4-22 is recorded as a candidate wakeup resume safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.

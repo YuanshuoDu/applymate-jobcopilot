@@ -587,3 +587,11 @@ Commit `a29fcc0e` adds a session-first open-status fence to the durable Gmail OA
 Root independently verified `gmail-store.test.ts` at **8/8**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
 
 Live PostgreSQL/RLS, real concurrent lock races, Redis/queue delivery, Worker restart, OAuth provider, browser, and child-parent E2E remain unverified. P4-30 remains a candidate and does not establish complete Harness, P4/Phase or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-31 update
+
+Commit `4f704402` adds `lockOpenSession` to Web command admission. It locks the user-owned `agent_sessions` row with `status NOT IN ('aborted', 'archived')` and `FOR UPDATE` before `start`, `message`, `steer`, or `interrupt` can read or write Turn, Item, Event, Input, or Outbox state. Closed, missing, and cross-user sessions fail closed and roll back without durable mutations. `lockOwnedSession` remains unchanged so fork can read historical closed source sessions and cancellation retains its existing idempotency and repair behavior.
+
+Root independently verified the command and cancellation suites at **36/36**, the fork route suite at **2/2**, Web `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
+
+Live database/RLS, real concurrency, Worker restart, and full route E2E behavior remain unverified. P4-31 remains a candidate and does not establish complete Harness, P4/Phase or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
