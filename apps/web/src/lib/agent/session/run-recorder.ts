@@ -39,6 +39,30 @@ interface TranscriptMapping {
 }
 
 type PipelineSubAgentRole = Exclude<SubAgentRole, "orchestrator">
+const CLOSED_SESSION_STATUSES = ["aborted", "archived"] as const
+
+type SessionLifecycleDb = AgentSessionDb & {
+  agentSession: AgentSessionDb["agentSession"] & {
+    findFirst(args: { where: { id: string; userId: string }; select: { id: true; status: true } }): Promise<{ id: string; status: string } | null>
+    updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<{ count: number }>
+  }
+}
+
+async function reopenExistingSession(db: AgentSessionDb, input: { sessionId: string; userId: string }): Promise<void> {
+  const sessionDb = db as SessionLifecycleDb
+  const session = await sessionDb.agentSession.findFirst({
+    where: { id: input.sessionId, userId: input.userId },
+    select: { id: true, status: true },
+  })
+  if (!session || CLOSED_SESSION_STATUSES.includes(session.status as (typeof CLOSED_SESSION_STATUSES)[number])) {
+    throw new Error(`Agent session ${input.sessionId} does not exist for this user`)
+  }
+  const updated = await sessionDb.agentSession.updateMany({
+    where: { id: input.sessionId, userId: input.userId, status: { notIn: [...CLOSED_SESSION_STATUSES] } },
+    data: { status: "running", completedAt: null },
+  })
+  if (updated.count !== 1) throw new Error(`Agent session ${input.sessionId} does not exist for this user`)
+}
 
 function textField(data: unknown, key: string) {
   if (!data || typeof data !== "object") return null
@@ -251,11 +275,7 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
       source: "manual_run",
     }) as { id: string }
   if (input.sessionId) {
-    await updateAgentSession(db, {
-      sessionId: input.sessionId,
-      status: "running",
-      completedAt: null,
-    })
+    await reopenExistingSession(db, { sessionId: session.id, userId: input.userId })
   }
   const dualWrite: DualWriteSession | null = input.dualWrite
     ? await createDualWriteSession(db as unknown as PrismaClient, {
@@ -333,13 +353,6 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
         : appendTranscriptEvent(db, transcript)
     },
     async finalize(finalizeInput: FinalizeInput) {
-      const result = await updateAgentSession(db, {
-        sessionId: session.id,
-        status: finalizeInput.status,
-        completedAt: new Date(),
-        qualityScore: qualityScore(finalizeInput.report, finalizeInput.status),
-        memorySummary: summarizeReport(finalizeInput.report),
-      })
       if (dualWrite && input.manageV2Lifecycle !== false) {
         await dualWrite.finalize({
           status: finalizeInput.status,
@@ -347,6 +360,13 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
           error: finalizeInput.status === "failed" ? summarizeReport(finalizeInput.report) : null,
         })
       }
+      const result = await updateAgentSession(db, {
+        sessionId: session.id,
+        status: finalizeInput.status,
+        completedAt: new Date(),
+        qualityScore: qualityScore(finalizeInput.report, finalizeInput.status),
+        memorySummary: summarizeReport(finalizeInput.report),
+      })
       return result
     },
     async pause(message: string, role?: PipelineSubAgentRole) {
@@ -358,6 +378,7 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
           failureReason: message,
         })
       }
+      if (dualWrite && input.manageV2Lifecycle !== false) await dualWrite.finalize({ status: "waiting_for_user", finalResponse: message })
       const result = await updateAgentSession(db, {
         sessionId: session.id,
         status: "waiting_for_user",
@@ -365,7 +386,6 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
         completedAt: null,
         memorySummary: message,
       })
-      if (dualWrite && input.manageV2Lifecycle !== false) await dualWrite.finalize({ status: "waiting_for_user", finalResponse: message })
       return result
     },
   }
