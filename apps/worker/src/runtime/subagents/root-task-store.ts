@@ -1,5 +1,4 @@
 import type pg from "pg"
-
 import type { TurnEngineResult } from "../turns/turn-engine-types.js"
 import type { TurnEngineCompletionGateResult } from "../turns/turn-execution-types.js"
 import type { TurnExecutionResult } from "../turns/turn-queue.js"
@@ -8,14 +7,12 @@ import type { PgSubagentPool, SubagentTaskRecord, SubagentTaskStatus } from "./t
 
 type ReconciledTurnStatus = Exclude<TurnExecutionResult["status"], "queued">
 export type RootTaskReconciliation = { readonly rootTaskId: string; readonly result: Omit<TurnExecutionResult, "status"> & { readonly status: ReconciledTurnStatus } }
-
 export type RootTaskStore = {
   ensure(input: { lease: TurnLease; goal: string; modelProfileSnapshot?: unknown; toolPolicySnapshot?: unknown; budgetSnapshot?: unknown; allowedActions?: readonly string[]; now?: Date }): Promise<SubagentTaskRecord>
   reconcileTerminal?(input: { lease: TurnLease; now?: Date }): Promise<RootTaskReconciliation | null>
   checkCompletion?(input: { lease: TurnLease; rootTaskId: string; now?: Date }): Promise<TurnEngineCompletionGateResult>
   finish(input: { lease: TurnLease; rootTaskId: string; result: TurnEngineResult; now?: Date }): Promise<void>
 }
-
 type Row = Record<string, unknown>
 
 function json(value: unknown, fallback: unknown, field = "snapshot"): string {
@@ -26,23 +23,19 @@ function json(value: unknown, fallback: unknown, field = "snapshot"): string {
   if (!encoded) throw new Error(`${field}_invalid`)
   return encoded
 }
-
 function containsSecret(value: unknown): boolean {
   if (Array.isArray(value)) return value.some(containsSecret)
   if (!value || typeof value !== "object") return false
   return Object.entries(value).some(([key, child]) => /api.?key|secret|password|(?:access|refresh).?token|authorization/i.test(key) || containsSecret(child))
 }
-
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
 }
-
 function date(value: unknown): Date | null {
   if (!value) return null
   const result = value instanceof Date ? new Date(value) : new Date(String(value))
   return Number.isNaN(result.getTime()) ? null : result
 }
-
 function task(row: Row): SubagentTaskRecord {
   return {
     id: String(row.id), userId: String(row.userId), sessionId: String(row.sessionId), turnId: row.turnId ? String(row.turnId) : null,
@@ -54,7 +47,6 @@ function task(row: Row): SubagentTaskRecord {
     leaseExpiresAt: date(row.leaseExpiresAt), interruptRequestedAt: date(row.interruptRequestedAt), budgetSnapshot: row.budgetSnapshot, toolPolicySnapshot: row.toolPolicySnapshot,
   }
 }
-
 async function transaction<T>(pool: PgSubagentPool, userId: string, work: (client: pg.PoolClient) => Promise<T>): Promise<T> {
   const client = await pool.connect()
   let committed = false
@@ -70,7 +62,15 @@ async function transaction<T>(pool: PgSubagentPool, userId: string, work: (clien
     throw error
   } finally { client.release() }
 }
-
+async function lockOpenSession(client: pg.PoolClient, lease: TurnLease): Promise<void> {
+  const result = await client.query(
+    `SELECT "id" FROM "agent_sessions"
+     WHERE "id" = $1 AND "userId" = $2 AND "status" NOT IN ('aborted', 'archived')
+     FOR UPDATE`,
+    [lease.sessionId, lease.userId],
+  )
+  if (!result.rows[0] && result.rowCount !== 1) throw new Error("root_session_fenced")
+}
 const SELECT_ROOT = `SELECT task.*, session."userId" AS "userId"
   FROM "sub_agent_tasks" task JOIN "agent_sessions" session ON session."id" = task."sessionId"
   WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3`
@@ -78,7 +78,6 @@ const SELECT_ROOT = `SELECT task.*, session."userId" AS "userId"
 const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "interrupted", "cancelled", "closed"])
 const TERMINAL_ROOT_STATUSES = new Set(["completed", "failed", "interrupted", "waiting", "waiting_for_user"])
 const TURN_RESULT_STATUSES = new Set(["completed", "failed", "interrupted", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"])
-
 type TerminalRootRow = { id: unknown; status: unknown; result: unknown; failureReason: unknown }
 
 function boundedText(value: unknown, name: string): string | undefined {
@@ -129,6 +128,7 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
       const { lease } = input
       return transaction(pool, lease.userId, async (client) => {
         const now = input.now ?? new Date()
+        await lockOpenSession(client, lease)
         const turn = await client.query<{ rootTaskId: string | null }>(
           `SELECT "rootTaskId" FROM "agent_turns"
            WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3
@@ -179,6 +179,7 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
     async checkCompletion(input): Promise<TurnEngineCompletionGateResult> {
       const now = input.now ?? new Date()
       return transaction(pool, input.lease.userId, async (client) => {
+        await lockOpenSession(client, input.lease)
         const turn = await client.query<Row>(
           `SELECT "id", "rootTaskId" FROM "agent_turns"
            WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "rootTaskId" = $6
@@ -207,6 +208,7 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
       const waitState = input.result.status === "waiting_for_user"
       const result = JSON.stringify({ status: input.result.status, stepCount: input.result.stepCount, toolCallCount: input.result.toolCallCount, finalItemId: input.result.finalItemId ?? null, waitId: input.result.waitId ?? null })
       await transaction(pool, input.lease.userId, async (client) => {
+        await lockOpenSession(client, input.lease)
         const ownedTurn = await client.query(
            `SELECT "id" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3
              AND "leaseOwnerId" = $4 AND "leaseVersion" = $5 AND "leaseExpiresAt" > CURRENT_TIMESTAMP

@@ -5,12 +5,16 @@ import { createCanonicalExecutionProjection } from "./canonical-execution-projec
 
 type Call = { readonly sql: string; readonly params?: readonly unknown[] }
 
-function fakePool(options: { rowCount?: number | null; failOnUpdate?: boolean } = {}) {
+function fakePool(options: { rowCount?: number | null; failOnUpdate?: boolean; sessionStatus?: string; sessionUserId?: string } = {}) {
   const calls: Call[] = []
   const client = {
     query: vi.fn(async (sql: string, params?: readonly unknown[]) => {
       calls.push({ sql, params })
       if (options.failOnUpdate && sql.startsWith("UPDATE")) throw new Error("projection database unavailable")
+      if (sql.includes('SELECT "id" FROM "agent_sessions"')) {
+        const open = !["missing", "aborted", "archived"].includes(options.sessionStatus ?? "running") && (options.sessionUserId ?? "user-1") === "user-1"
+        return open ? { rows: [{ id: "session-1" }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      }
       return { rows: [], rowCount: options.rowCount ?? 1 }
     }),
     release: vi.fn(),
@@ -42,6 +46,7 @@ describe("canonical automation execution projection", () => {
       expect(call.sql).toContain('execution."sessionId" = $2')
       expect(call.sql).toContain('session."id" = $2')
       expect(call.sql).toContain('session."userId" = $1')
+      expect(call.sql).toContain('session."status" NOT IN (\'aborted\', \'archived\')')
       expect(call.sql).toContain('session."source" = \'automation\'')
       expect(call.sql).toContain('turn."id" = $3')
       expect(call.sql).toContain('turn."sessionId" = $2')
@@ -134,5 +139,27 @@ describe("canonical automation execution projection", () => {
     const fake = fakePool()
     await createCanonicalExecutionProjection(fake.pool).finish({ ...identity, result: { status: "queued" as never } })
     expect(fake.pool.connect).not.toHaveBeenCalled()
+  })
+
+  it("locks the open session before the projection update", async () => {
+    const fake = fakePool()
+    await createCanonicalExecutionProjection(fake.pool).start(identity)
+    expect(fake.calls.findIndex(call => call.sql.includes('SELECT "id" FROM "agent_sessions"'))).toBeLessThan(fake.calls.findIndex(call => call.sql.startsWith("UPDATE")))
+    expect(fake.calls.find(call => call.sql.includes('SELECT "id" FROM "agent_sessions"'))?.sql).toContain("FOR UPDATE")
+  })
+
+  it.each(["missing", "aborted", "archived"])("fails closed for a %s session before mutation", async (sessionStatus) => {
+    const fake = fakePool({ sessionStatus })
+    await expect(createCanonicalExecutionProjection(fake.pool).start(identity)).rejects.toThrow("execution_projection_session_fenced")
+    await expect(createCanonicalExecutionProjection(fake.pool).finish({ ...identity, result: { status: "completed" } })).rejects.toThrow("execution_projection_session_fenced")
+    expect(fake.calls.some(call => call.sql.startsWith("UPDATE"))).toBe(false)
+    expect(fake.calls.some(call => call.sql === "ROLLBACK")).toBe(true)
+  })
+
+  it("fails closed for a cross-user session before mutation", async () => {
+    const fake = fakePool({ sessionUserId: "user-2" })
+    await expect(createCanonicalExecutionProjection(fake.pool).finish({ ...identity, result: { status: "completed" } })).rejects.toThrow("execution_projection_session_fenced")
+    expect(fake.calls.some(call => call.sql.startsWith("UPDATE"))).toBe(false)
+    expect(fake.calls.some(call => call.sql === "ROLLBACK")).toBe(true)
   })
 })

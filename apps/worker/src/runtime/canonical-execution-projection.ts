@@ -42,11 +42,22 @@ async function transaction<T>(pool: ProjectionPool, userId: string, work: (clien
   }
 }
 
+async function lockOpenSession(client: ProjectionClient, input: CanonicalExecutionIdentity): Promise<void> {
+  const result = await client.query(
+    `SELECT "id" FROM "agent_sessions"
+     WHERE "id" = $1 AND "userId" = $2 AND "status" NOT IN ('aborted', 'archived')
+     FOR UPDATE`,
+    [input.sessionId, input.userId],
+  )
+  if (!result.rows[0]) throw new Error("execution_projection_session_fenced")
+}
+
 const AUTOMATION_SESSION = `EXISTS (
   SELECT 1 FROM "agent_sessions" AS session
   WHERE session."id" = execution."sessionId"
     AND session."id" = $2
     AND session."userId" = $1
+    AND session."status" NOT IN ('aborted', 'archived')
     AND session."source" = 'automation'
 )`
 
@@ -68,6 +79,7 @@ const CURRENT_AUTOMATION_TURN = `EXISTS (
 const ACTIVE_EXECUTION_STATUSES = "'queued', 'running', 'paused', 'waiting_for_user'"
 
 async function startExecution(client: ProjectionClient, input: CanonicalExecutionIdentity): Promise<void> {
+  await lockOpenSession(client, input)
   await client.query(
     `UPDATE "agent_executions" AS execution
      SET "status" = 'running', "startedAt" = COALESCE("startedAt", CURRENT_TIMESTAMP), "completedAt" = NULL, "error" = NULL, "updatedAt" = CURRENT_TIMESTAMP
@@ -95,6 +107,7 @@ function failureCode(value: string | null | undefined): string {
 async function finishExecution(client: ProjectionClient, input: CanonicalExecutionIdentity & { readonly result: { readonly status: TurnEngineResult["status"]; readonly errorCode?: string | null } }): Promise<void> {
   const status = executionStatus(input.result.status)
   if (!status) return
+  await lockOpenSession(client, input)
   const error = status === "failed" ? failureCode(input.result.errorCode) : null
   await client.query(
     `UPDATE "agent_executions" AS execution

@@ -41,11 +41,22 @@ async function transaction<T>(pool: ProjectionPool, userId: string, work: (clien
   }
 }
 
+async function lockOpenSession(client: ProjectionClient, input: CanonicalSessionIdentity): Promise<void> {
+  const result = await client.query(
+    `SELECT "id" FROM "agent_sessions"
+     WHERE "id" = $1 AND "userId" = $2 AND "status" NOT IN ('aborted', 'archived')
+     FOR UPDATE`,
+    [input.sessionId, input.userId],
+  )
+  if (!result.rows[0]) throw new Error("session_projection_session_fenced")
+}
+
 const AUTOMATION_SESSION = `EXISTS (
   SELECT 1 FROM "agent_sessions" AS automation_session
   WHERE automation_session."id" = session."id"
     AND automation_session."id" = $2
     AND automation_session."userId" = $1
+    AND automation_session."status" NOT IN ('aborted', 'archived')
     AND automation_session."source" = 'automation'
 )`
 
@@ -67,11 +78,12 @@ const CURRENT_AUTOMATION_TURN = `EXISTS (
 const PROJECTABLE_SESSION_STATUSES = "'queued', 'running', 'paused', 'waiting_for_dependency', 'waiting_for_approval', 'waiting_for_user'"
 
 async function startSession(client: ProjectionClient, input: CanonicalSessionIdentity): Promise<void> {
+  await lockOpenSession(client, input)
   await client.query(
     `UPDATE "agent_sessions" AS session
      SET "status" = 'running', "completedAt" = NULL, "updatedAt" = CURRENT_TIMESTAMP
      WHERE session."id" = $2 AND session."userId" = $1
-       AND session."status" <> 'aborted'
+       AND session."status" NOT IN ('aborted', 'archived')
        AND ${AUTOMATION_SESSION}
        AND ${CURRENT_AUTOMATION_TURN}`,
     [input.userId, input.sessionId, input.turnId],
@@ -97,6 +109,7 @@ async function finishSession(
 ): Promise<void> {
   const status = sessionStatus(input.result.status)
   if (!status) return
+  await lockOpenSession(client, input)
   const memorySummary = status === "failed" ? failureCode(input.result.errorCode) : null
   await client.query(
     `UPDATE "agent_sessions" AS session

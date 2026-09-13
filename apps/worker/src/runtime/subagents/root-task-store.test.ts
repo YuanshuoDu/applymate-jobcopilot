@@ -17,12 +17,13 @@ function row(overrides: Record<string, unknown> = {}) {
   }
 }
 
-function fakePool(existing: Record<string, unknown> | null = null, updateCount = 1) {
+function fakePool(existing: Record<string, unknown> | null = null, updateCount = 1, sessionStatus = "running", sessionUserId = "user-1") {
   const calls: string[] = []
   const client = {
     query: vi.fn(async (sql: string, values?: unknown[]) => {
       calls.push(sql)
       if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "agent_sessions"')) return sessionStatus === "missing" || ["aborted", "archived"].includes(sessionStatus) || sessionUserId !== "user-1" ? { rows: [], rowCount: 0 } : { rows: [{ id: "session-1" }], rowCount: 1 }
       if (sql.includes('FROM "agent_turns"') && sql.includes('"rootTaskId"')) return { rows: [{ rootTaskId: existing?.id ? "root-turn-1" : null }], rowCount: 1 }
       if (sql.includes("INSERT INTO \"sub_agent_tasks\"")) return { rows: [], rowCount: 1 }
       if (sql.includes('UPDATE "agent_turns"')) return { rows: [], rowCount: 1 }
@@ -42,6 +43,7 @@ function completionPool(descendants: Array<Record<string, unknown>>, owned = tru
     query: vi.fn(async (sql: string) => {
       calls.push(sql)
       if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1" }], rowCount: 1 }
       if (sql.includes('SELECT "id", "rootTaskId" FROM "agent_turns"')) return owned ? { rows: [{ id: "turn-1", rootTaskId: "root-turn-1" }], rowCount: 1 } : { rows: [], rowCount: 0 }
       if (sql.includes('SELECT task."id", task."status"')) return { rows: descendants, rowCount: descendants.length }
       return { rows: [], rowCount: 1 }
@@ -76,6 +78,11 @@ describe("createPgRootTaskStore", () => {
     const insert = fake.client.query.mock.calls.find(([sql]) => sql.includes("INSERT INTO \"sub_agent_tasks\""))
     expect(insert?.[1]).not.toContain(expect.objectContaining({ apiKey: expect.anything() }))
     expect(insert?.[1]).toContain(JSON.stringify(["jobs.search"]))
+    expect(fake.calls.findIndex(sql => sql.includes('FROM "agent_sessions"'))).toBeLessThan(fake.calls.findIndex(sql => sql.includes('FROM "agent_turns"')))
+  })
+
+  it.each(["running", "paused", "waiting_for_user"])("keeps %s sessions compatible with root admission", async (sessionStatus) => {
+    await expect(createPgRootTaskStore(fakePool(null, 1, sessionStatus).pool).ensure({ lease, goal: "Find jobs" })).resolves.toBeDefined()
   })
 
   it("rebinds a stale waiting root before resume", async () => {
@@ -114,6 +121,7 @@ describe("createPgRootTaskStore", () => {
       query: vi.fn(async (sql: string) => {
         calls.push(sql)
         if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+        if (sql.includes('SELECT "id" FROM "agent_sessions"')) return { rows: [{ id: "session-1" }], rowCount: 1 }
         if (sql.includes('SELECT "id" FROM "agent_turns"')) return { rows: [], rowCount: 0 }
         return { rows: [], rowCount: 1 }
       }),
@@ -144,10 +152,11 @@ describe("createPgRootTaskStore", () => {
     const result = await createPgRootTaskStore(fake.pool).reconcileTerminal!({ lease, now: new Date("2026-09-07T00:00:10.000Z") })
 
     expect(result).toEqual({ rootTaskId: "root-turn-1", result: { status: turnStatus, ...(waitId ? { waitId } : {}) } })
-    expect(fake.calls[2]?.sql).toContain('session."userId" = $3')
-    expect(fake.calls[2]?.sql).toContain('turn."leaseOwnerId" = $4')
-    expect(fake.calls[2]?.sql).toContain('turn."leaseVersion" = $5')
-    expect(fake.calls[2]?.sql).toContain('turn."status" = \'in_progress\'')
+    const query = fake.calls.find(call => call.sql.includes('FROM "sub_agent_tasks" AS task'))?.sql ?? ""
+    expect(query).toContain('session."userId" = $3')
+    expect(query).toContain('turn."leaseOwnerId" = $4')
+    expect(query).toContain('turn."leaseVersion" = $5')
+    expect(query).toContain('turn."status" = \'in_progress\'')
   })
 
   it("reconciles a persisted failed result with its bounded failure code", async () => {
@@ -181,5 +190,21 @@ describe("createPgRootTaskStore", () => {
     await expect(createPgRootTaskStore(stale.pool).checkCompletion!({ lease, rootTaskId: "root-turn-1" })).rejects.toThrow("root_turn_fenced")
     const foreign = completionPool([{ id: "child-1", sessionId: "other-session", turnId: lease.turnId, rootTaskId: "root-turn-1", userId: lease.userId, status: "running" }])
     await expect(createPgRootTaskStore(foreign.pool).checkCompletion!({ lease, rootTaskId: "root-turn-1" })).rejects.toThrow("root_task_fenced")
+  })
+
+  it.each(["missing", "aborted", "archived"])("rejects %s sessions before root writes", async (sessionStatus) => {
+    const fake = fakePool(null, 1, sessionStatus)
+    await expect(createPgRootTaskStore(fake.pool).ensure({ lease, goal: "Find jobs" })).rejects.toThrow("root_session_fenced")
+    expect(fake.calls.some(sql => sql.includes("INSERT INTO"))).toBe(false)
+    expect(fake.calls.some(sql => sql.includes('UPDATE "agent_turns"'))).toBe(false)
+    expect(fake.calls.some(sql => sql === "ROLLBACK")).toBe(true)
+  })
+
+  it("rejects a cross-user session before the Turn lock", async () => {
+    const fake = fakePool(null, 1, "running", "user-2")
+    await expect(createPgRootTaskStore(fake.pool).ensure({ lease, goal: "Find jobs" })).rejects.toThrow("root_session_fenced")
+    expect(fake.calls.some(sql => sql.includes('FROM "agent_turns"'))).toBe(false)
+    expect(fake.calls.some(sql => sql.includes("INSERT INTO"))).toBe(false)
+    expect(fake.calls.some(sql => sql === "ROLLBACK")).toBe(true)
   })
 })
