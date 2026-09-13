@@ -41,9 +41,30 @@ describe("PgSubagentTaskStore", () => {
     const store = new PgSubagentTaskStore(fake.pool)
     const result = await store.create({ userId: "user-1", sessionId: "session-1", role: "scout", taskType: "test", goal: "inspect", policy })
     expect(result).toMatchObject({ id: "task-1", rootTaskId: "task-1", depth: 0, status: "queued" })
-    expect(fake.calls.some(([sql]) => sql.includes('FOR UPDATE'))).toBe(true)
+    const sessionQuery = fake.calls.find(([sql]) => sql.includes('FROM "agent_sessions"'))?.[0] ?? ""
+    expect(sessionQuery).toContain('"status"')
+    expect(sessionQuery).toContain("FOR UPDATE")
     const insert = fake.calls.find(([sql]) => sql.startsWith("INSERT INTO"))
     expect(insert?.[1]).toContain(JSON.stringify({ subagentPolicy: policy }))
+  })
+
+  it.each(["aborted", "archived"] as const)("rejects child creation for a %s session", async status => {
+    const fake = fakePool(sql => sql.includes('FROM "agent_sessions"') ? { rows: [{ id: "session-1", status }], rowCount: 1 } : {})
+    const store = new PgSubagentTaskStore(fake.pool)
+    await expect(store.create({ userId: "user-1", sessionId: "session-1", role: "scout", taskType: "test", goal: "inspect", policy })).rejects.toThrow("Session is unavailable")
+    expect(fake.calls.some(([sql]) => sql.startsWith("INSERT INTO"))).toBe(false)
+  })
+
+  it.each(["running", "paused", "waiting_for_user"] as const)("keeps child creation compatible with a %s session", async status => {
+    const fake = fakePool(sql => {
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1", status }], rowCount: 1 }
+      if (sql.includes('FROM "sub_agent_tasks" task')) return { rows: [taskRow()], rowCount: 1 }
+      if (sql.startsWith("INSERT INTO")) return { rows: [{ id: "task-1" }], rowCount: 1 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+    await expect(store.create({ userId: "user-1", sessionId: "session-1", role: "scout", taskType: "test", goal: "inspect", policy })).resolves.toMatchObject({ status: "queued" })
+    expect(fake.calls.some(([sql]) => sql.startsWith("INSERT INTO"))).toBe(true)
   })
 
   it("claims with a session lock and a conditional lease update", async () => {
