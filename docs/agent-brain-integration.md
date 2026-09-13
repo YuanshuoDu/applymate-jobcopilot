@@ -631,3 +631,11 @@ Commit `76227d96` adds a deterministic child-to-parent composition fixture using
 The test uses an in-memory subagent store, stateful fake PostgreSQL client, and an `ioredis` disconnect stub, so it drives real state transitions without live external services. Root independently verified the focused Worker composition and directly related suites at **90/90** across 8 files; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed. The cognitive-loop gate remains disabled.
 
 Live Redis/BullMQ, PostgreSQL/RLS, real concurrent transactions, Worker restart, provider, browser, and full production child-parent E2E behavior remain unverified. P4-36 remains a candidate and does not establish complete Harness, P4/Phase or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-37 update
+
+Commits `e56b0b06` (missing dispatch repair), `a602d8bd` (session-first lock and placeholder repair), and `1591b9d2` (shutdown release key and session scope) add durable recovery for runnable subagent tasks that lack a dispatch intent. Recovery locks eligible open `agent_sessions` rows first, then locks queued or retrying tasks with a missing deterministic `subagent-dispatch:${taskId}` key, inserts a session-scoped unpublished dispatch outbox row idempotently, and lets the normal dispatcher publish it. Queue delivery failures leave the repaired row unpublished for retry; expired running-task recovery remains in place. The implementation also corrects PostgreSQL `LIMIT`-before-`FOR UPDATE` clause ordering in the affected recovery queries.
+
+Root independently verified the P4-37 queue, Pg store, and manager focused suites at **56/56**; an additional integration fixture in the same command brought the evidence to **57/57**. The shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+Live PostgreSQL/RLS, real concurrent lock races, Redis/BullMQ delivery, process restart, provider, browser, and full production child-parent E2E remain unverified. The cognitive gate remains disabled; P4-37 remains a candidate and overall progress remains **P0 accepted 1/8 (12.5%)**.

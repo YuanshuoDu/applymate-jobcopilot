@@ -1884,3 +1884,13 @@ Conditional wait/Turn/outbox mutations fail closed when a session closes during 
 **Independent verification:** Root independently verified the focused Worker composition and directly related suites at **90/90** across 8 files; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
 
 **Candidate boundary:** Live Redis/BullMQ, PostgreSQL/RLS, real concurrent transactions, Worker restart, provider, browser, and full production child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 67. P4-37 — Durable subagent dispatch repair and RLS aggregate scope
+
+**Candidate status/date (2026-09-13):** P4-37 is recorded as a candidate durable subagent dispatch recovery and aggregate-scoping slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commits `e56b0b06` (missing dispatch repair), `a602d8bd` (session-first lock and placeholder repair), and `1591b9d2` (shutdown release key and session scope) make recovery lock eligible open `agent_sessions` rows first, then lock queued or retrying runnable tasks with no deterministic `subagent-dispatch:${taskId}` intent. The repair inserts a session-scoped unpublished `agent_outbox` row with idempotent conflict handling, after which the normal dispatcher publishes it; queue failure leaves the row unpublished. Expired running-task recovery remains unchanged. The affected recovery queries also use valid PostgreSQL `LIMIT`-before-`FOR UPDATE` ordering. Session, root, Turn, interrupt, attempt, user scope, and terminal-state predicates remain enforced.
+
+**Independent verification:** Root independently verified the P4-37 queue, Pg store, and manager focused suites at **56/56**; an additional integration fixture in the same command brought the evidence to **57/57**. The shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrent lock races, Redis/BullMQ delivery, process restart, provider, browser, and full production child-parent E2E behavior remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance, and overall progress remains **P0 accepted 1/8 (12.5%)**.
