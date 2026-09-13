@@ -1735,6 +1735,16 @@ Conditional wait/Turn/outbox mutations fail closed when a session closes during 
 
 **Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, real cross-process concurrency, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
 
+## 64. P4-34 — Cognitive loop composite startup gate
+
+**Candidate status/date (2026-09-13):** P4-34 is recorded as a candidate server-owned cognitive-loop startup safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `60da99e8` adds the exact-value `ENABLE_AGENT_COGNITIVE_LOOP=1` gate, disabled by default. When enabled, it derives canonical automation, planning, and plan execution together; Worker startup also derives the child executor plus wait resolver, coordination, and wait-outcome consumption as one composite loop gate. Context compaction remains independently controlled. Existing canonical automation, planning, plan-execution, child-execution, and wait-resolver flags retain their independent semantics when the composite gate is off, including the rule that plan execution cannot bypass planning. The agent-run queue continues to route through the production flag resolver, with no model or policy input able to enable the loop.
+
+**Independent verification:** Root independently verified the production flag and agent-run queue focused suites at **14/14**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/Redis behavior, real concurrent startup, Worker restart, provider, browser, and complete child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
 ## 63. P4-33 — Canonical root/task/execution session-first fence
 
 **Candidate status/date (2026-09-13):** P4-33 is recorded as a candidate Worker canonical root/task/execution admission safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
