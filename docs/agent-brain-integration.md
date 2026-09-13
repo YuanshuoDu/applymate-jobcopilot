@@ -595,3 +595,11 @@ Commit `4f704402` adds `lockOpenSession` to Web command admission. It locks the 
 Root independently verified the command and cancellation suites at **36/36**, the fork route suite at **2/2**, Web `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
 
 Live database/RLS, real concurrency, Worker restart, and full route E2E behavior remain unverified. P4-31 remains a candidate and does not establish complete Harness, P4/Phase or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-32 update
+
+Commit `12769a3b` adds the Web V2/legacy session-first durable admission fence. `ensureV2Turn` locks the user-owned open `agent_sessions` row first with `status NOT IN ('aborted', 'archived')` and `FOR UPDATE`, then reads or creates the scoped Turn; P2002 recovery re-confirms the open session before reusing a raced Turn. Dual-write `record` and `finalize` repeat the open session fence before Turn, Item, Event, Input, or Outbox work, and closed, missing, or cross-user sessions fail closed with rollback. Run-session recorder admission advances only open or resumable existing sessions to `running` and never reopens `aborted` or `archived` sessions; fork historical closed-source reads, FIFO, idempotency, legacy, and in-memory semantics remain unchanged.
+
+Root independently verified the focused V2-turn, dual-write, and run-recorder suites at **34/34**, with Web `tsc --noEmit --skipLibCheck` and `git diff --check` passing.
+
+Live PostgreSQL/RLS, real concurrent lock races, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E remain unverified. P4-32 remains a candidate and does not establish complete Harness, P4/Phase or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.

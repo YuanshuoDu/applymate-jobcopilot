@@ -1735,6 +1735,16 @@ Conditional wait/Turn/outbox mutations fail closed when a session closes during 
 
 **Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, real cross-process concurrency, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
 
+## 62. P4-32 — V2/legacy session-first durable admission fence
+
+**Candidate status/date (2026-09-13):** P4-32 is recorded as a candidate Web V2/legacy session admission safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `12769a3b` makes `ensureV2Turn` lock the user-owned open `agent_sessions` row first with `status NOT IN ('aborted', 'archived')` and `FOR UPDATE`, then read or create the scoped Turn; P2002 recovery re-confirms the open session before reusing a raced Turn. Dual-write `record` and `finalize` repeat the session-first open fence before Turn, Item, Event, Input, or Outbox work, failing closed with rollback for closed, missing, or cross-user sessions. Run-session recorder admission only advances an existing open or resumable session to `running`; it never reopens `aborted` or `archived` sessions. Fork historical closed-source reads remain unchanged, as do FIFO, idempotency, legacy, and in-memory semantics.
+
+**Independent verification:** Root independently verified the focused V2-turn, dual-write, and run-recorder suites at **34/34**; Web `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrent lock races, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
 ## 53. P4-23 — Mailbox coordination session-state fence
 
 **Candidate status/date (2026-09-13):** P4-23 is recorded as a candidate mailbox coordination safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
