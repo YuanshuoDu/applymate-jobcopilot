@@ -1662,3 +1662,13 @@ A blocked or raced claim continues to surface only the recoverable `TurnLeaseErr
 **Independent verification:** Root independently verified lease and Turn queue focused suites at **20/20**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, real cross-process concurrency, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 45. P4-15 — Context snapshot loader serialization fence
+
+**Candidate status/date (2026-09-13):** P4-15 is recorded as a candidate server-owned context snapshot replay hardening slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `4a248447` adds a strict recursive serialization fence around context compaction input, loader envelopes, protected invariants, and appended observations. BigInt, cyclic references, Symbol/function values, non-finite numbers, non-plain objects, accessors, symbol properties, and sparse arrays fail closed as `TurnEngineError` with `code = 'invalid_output'` instead of reaching `stableJson` or contaminating a replayed snapshot. Loader replay keeps the existing user/session/turn scope fence, protected invariant comparison, bounded snapshot estimate, and no-hook/no-extra-model-call behavior for valid persisted projections.
+
+**Independent verification:** Focused context-compaction runtime tests passed **18/18**; the existing context snapshot adapter regression passed **6/6**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed. The changed runtime source remains within the 250-line project limit.
+
+**Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, provider behavior, process restart, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
