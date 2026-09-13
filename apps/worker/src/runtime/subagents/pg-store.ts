@@ -236,7 +236,7 @@ export class PgSubagentTaskStore implements SubagentStore {
   async recoverExpired(input: { now: Date; limit: number }): Promise<SubagentTaskRecord[]> {
     if (!Number.isInteger(input.limit) || input.limit < 1) throw new RangeError("Recovery limit must be positive")
     return transaction(this.pool, async (client) => {
-      const rows = await client.query(`${SELECT_RECOVERABLE} FOR UPDATE SKIP LOCKED LIMIT $2`, [input.now, input.limit])
+      const rows = await client.query(`${SELECT_RECOVERABLE} LIMIT $2 FOR UPDATE SKIP LOCKED`, [input.now, input.limit])
       const recovered: SubagentTaskRecord[] = []
       for (const row of rows.rows as Array<Record<string, unknown>>) {
         const sessionClosed = row.sessionStatus === "aborted" || row.sessionStatus === "archived"

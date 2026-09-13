@@ -19,6 +19,7 @@ export type SubagentQueueLike = {
 }
 
 export type SubagentExecutor = (input: { lease: SubagentLease }) => Promise<{ status: "completed" | "waiting" | "waiting_for_user" | "failed"; result?: unknown; failureReason?: string }>
+type MissingDispatchRow = { id: string; sessionId: string; rootTaskId: string }
 
 /** BullMQ custom IDs reject colon characters; encode user controlled IDs. */
 export function subagentJobId(taskId: string, generation = 0): string {
@@ -52,7 +53,50 @@ export async function persistSubagentDispatch(pool: PgSubagentPool, payload: Sub
       : `ON CONFLICT ("idempotencyKey") DO NOTHING`
     await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
       VALUES ($1, $2, $3, $4, $5::jsonb) ${conflict}`,
-    [randomUUID(), SUBAGENT_DISPATCH_TOPIC, payload.taskId, subagentDispatchKey(payload.taskId), JSON.stringify(payload)])
+    [randomUUID(), SUBAGENT_DISPATCH_TOPIC, payload.sessionId, subagentDispatchKey(payload.taskId), JSON.stringify(payload)])
+  })
+}
+
+/** Repairs runnable task rows that lost their durable dispatch intent. */
+export async function repairMissingSubagentDispatches(pool: PgSubagentPool, ownerId: string, limit = SUBAGENT_MAX_BATCH): Promise<number> {
+  if (!Number.isInteger(limit) || limit < 1) throw new RangeError("Subagent dispatch limit must be positive")
+  return transaction(pool, async client => {
+    const candidates = await client.query<MissingDispatchRow>(`SELECT task."id", task."sessionId", task."rootTaskId"
+      FROM "sub_agent_tasks" AS task
+      JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+      JOIN "sub_agent_tasks" AS root ON root."id" = task."rootTaskId" AND root."sessionId" = task."sessionId"
+      JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+        AND turn."userId" = session."userId"
+      LEFT JOIN "agent_outbox" AS dispatch
+        ON dispatch."topic" = $1 AND dispatch."idempotencyKey" = 'subagent-dispatch:' || task."id"
+      WHERE task."status" IN ('queued', 'retrying')
+        AND task."interruptRequestedAt" IS NULL AND task."attemptCount" < task."maxAttempts"
+        AND session."status" NOT IN ('aborted', 'archived')
+        AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
+        AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled')
+        AND dispatch."id" IS NULL
+      ORDER BY task."updatedAt" ASC, task."id" ASC
+      LIMIT $2 FOR UPDATE OF task SKIP LOCKED`, [SUBAGENT_DISPATCH_TOPIC, limit])
+    let repaired = 0
+    for (const row of candidates.rows) {
+      const payload: SubagentJobPayload = { taskId: row.id, sessionId: row.sessionId, rootTaskId: row.rootTaskId, ownerId }
+      const inserted = await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
+        SELECT $1, $2, $3, $4, $5::jsonb
+        WHERE EXISTS (SELECT 1 FROM "agent_sessions" AS session
+          JOIN "sub_agent_tasks" AS task ON task."sessionId" = session."id"
+          JOIN "sub_agent_tasks" AS root ON root."id" = task."rootTaskId" AND root."sessionId" = task."sessionId"
+          JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+            AND turn."userId" = session."userId"
+          WHERE task."id" = $6 AND task."sessionId" = $3 AND task."status" IN ('queued', 'retrying')
+            AND task."interruptRequestedAt" IS NULL AND task."attemptCount" < task."maxAttempts"
+            AND session."status" NOT IN ('aborted', 'archived')
+            AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
+            AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled'))
+        ON CONFLICT ("idempotencyKey") DO NOTHING`,
+      [randomUUID(), SUBAGENT_DISPATCH_TOPIC, row.sessionId, subagentDispatchKey(row.id), JSON.stringify(payload), row.id])
+      repaired += inserted.rowCount ?? 0
+    }
+    return repaired
   })
 }
 
@@ -60,7 +104,7 @@ export async function dispatchPendingSubagentOutbox(pool: PgSubagentPool, queue:
   if (!Number.isInteger(limit) || limit < 1) throw new RangeError("Subagent dispatch limit must be positive")
   const rows = await transaction(pool, async client => {
     const result = await client.query<{ id: string; payload: unknown; attemptCount?: number }>(`SELECT "id", "payload", "attemptCount" FROM "agent_outbox"
-      WHERE "topic" = $1 AND "publishedAt" IS NULL ORDER BY "createdAt" ASC, "id" ASC FOR UPDATE SKIP LOCKED LIMIT $2`, [SUBAGENT_DISPATCH_TOPIC, limit])
+      WHERE "topic" = $1 AND "publishedAt" IS NULL ORDER BY "createdAt" ASC, "id" ASC LIMIT $2 FOR UPDATE SKIP LOCKED`, [SUBAGENT_DISPATCH_TOPIC, limit])
     return result.rows
   })
   let dispatched = 0
@@ -104,14 +148,15 @@ async function markDispatchError(pool: PgSubagentPool, id: string, error: string
   } finally { client.release() }
 }
 
-export async function recoverSubagentQueue(pool: PgSubagentPool, queue: SubagentQueueLike, manager: AgentTreeManager, limit = SUBAGENT_MAX_BATCH): Promise<{ reclaimed: number; terminal: number; dispatched: number }> {
+export async function recoverSubagentQueue(pool: PgSubagentPool, queue: SubagentQueueLike, manager: AgentTreeManager, limit = SUBAGENT_MAX_BATCH): Promise<{ reclaimed: number; terminal: number; repaired: number; dispatched: number }> {
   const report = await manager.recover(limit)
   for (const task of report.rows) {
     if (task.status !== "queued") continue
     await persistSubagentDispatch(pool, { taskId: task.id, sessionId: task.sessionId, rootTaskId: task.rootTaskId, ownerId: `recovery-${randomUUID()}` }, true)
   }
+  const repaired = await repairMissingSubagentDispatches(pool, `recovery-${randomUUID()}`, limit)
   const dispatched = await dispatchPendingSubagentOutbox(pool, queue, limit)
-  return { reclaimed: report.reclaimed, terminal: report.terminal, dispatched }
+  return { reclaimed: report.reclaimed, terminal: report.terminal, repaired, dispatched }
 }
 
 export function startSubagentRecoveryScanner(
