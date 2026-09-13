@@ -1964,3 +1964,13 @@ Conditional wait/Turn/outbox mutations fail closed when a session closes during 
 **Independent verification:** Root independently verified the coordination integration, recovery scanner, and subagent queue suites at **52/52**. Worker `tsc --noEmit --skipLibCheck`, the shared package build, and `git diff --check` also passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, restart behavior, and complete Worker E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance, and overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 75. P4-46 — Recovered child dispatch session fence
+
+**Candidate status/date (2026-09-13):** P4-46 is recorded as a candidate recovered child dispatch admission safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commits `c408e2a4` and `7cb3b169` harden recovered child dispatch writes. Recovery reset now admits work through an open-session `FOR UPDATE` fence, every child dispatch insert path applies the same open guard, and conflict updates remain aggregate scoped. Closed, archived, and missing sessions are no-ops. `7cb3b169` only satisfies the 250-line source-file rule.
+
+**Independent verification:** Root independently verified the subagent, manager, coordination, and composition suites at **41/41**. Worker `tsc --noEmit --skipLibCheck`, the shared package build, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, restart behavior, and complete Worker E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance, and overall progress remains **P0 accepted 1/8 (12.5%)**.

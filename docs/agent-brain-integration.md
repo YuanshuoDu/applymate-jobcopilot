@@ -695,3 +695,11 @@ Commits `305ce8f3` and fixture repair `56db3eda` harden child `agent.subagent.di
 Root independently verified the coordination integration, recovery scanner, and subagent queue suites at **52/52**. Worker `tsc --noEmit --skipLibCheck`, the shared package build, and `git diff --check` also passed.
 
 Live PostgreSQL/RLS, Redis/queue delivery, restart behavior, and complete Worker E2E remain unverified. The cognitive gate remains disabled; P4-44 remains a candidate and overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-46 update
+
+Commits `c408e2a4` and `7cb3b169` harden recovered child dispatch writes. Recovery reset now admits work through an open-session `FOR UPDATE` fence, every child dispatch insert path applies the same open guard, and conflict updates remain aggregate scoped. Closed, archived, and missing sessions are no-ops. `7cb3b169` only satisfies the 250-line source-file rule.
+
+Root independently verified the subagent, manager, coordination, and composition suites at **41/41**. Worker `tsc --noEmit --skipLibCheck`, the shared package build, and `git diff --check` also passed.
+
+Live PostgreSQL/RLS, Redis/queue delivery, restart behavior, and complete Worker E2E remain unverified. The cognitive gate remains disabled; P4-46 remains a candidate and overall progress remains **P0 accepted 1/8 (12.5%)**.
