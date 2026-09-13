@@ -12,7 +12,7 @@ function fixture(input: { turnStatus?: string; waitStatus?: string; suspended?: 
   const secondWait = { ...wait, id: "wait-2", turnId: "turn-2", parentTaskId: "root-2", stepId: "step-2", userId: "user-2", sessionId: "session-2", targetTaskIds: ["child-2"] }
   const turns = input.turnCount === 2 ? [turn, secondTurn] : [turn]
   const waits = input.turnCount === 2 ? [wait, secondWait] : [wait]
-  const state = { turns, waits, targetUser: input.targetUser ?? "user-1", targetStatus: input.targetStatus ?? "completed", sessionStatus: input.sessionStatus ?? "running", sessionSource: input.sessionSource ?? "automation", waitUpdates: 0, turnUpdates: 0, outboxWrites: 0, outboxPublished: false, conflictResets: 0 }
+  const state = { turns, waits, targetUser: input.targetUser ?? "user-1", targetStatus: input.targetStatus ?? "completed", sessionStatus: input.sessionStatus ?? "running", sessionSource: input.sessionSource ?? "automation", waitUpdates: 0, turnUpdates: 0, outboxWrites: 0, outboxPublished: false, conflictResets: 0, outboxParams: null as unknown[] | null }
   const calls: string[] = []
   const client = {
     query: async (sql: string, params?: unknown[]) => {
@@ -48,6 +48,7 @@ function fixture(input: { turnStatus?: string; waitStatus?: string; suspended?: 
       }
       if (sql.includes('INSERT INTO "agent_outbox"')) {
         if (input.closeBeforeOutbox) { state.sessionStatus = "aborted"; if (!sql.includes(SESSION_FENCE)) throw new Error("missing session-state fence"); return { rows: [], rowCount: 0 } }
+        state.outboxParams = params ?? null
         if (state.outboxPublished && sql.includes("DO UPDATE")) state.conflictResets += 1; state.outboxWrites += 1; state.outboxPublished = false; return { rows: [], rowCount: 1 }
       }
       return { rows: [], rowCount: 1 }
@@ -77,6 +78,10 @@ describe("durable wait resolver", () => {
     expect(fake.state.turns[0].status).toBe("queued")
     expect(fake.state.outboxWrites).toBe(1)
     expect(fake.state.conflictResets).toBe(1)
+    expect(fake.state.outboxParams?.[2]).toBe("session-1")
+    expect(fake.state.outboxParams?.[2]).not.toBe("turn-1")
+    expect(fake.state.outboxParams?.[3]).toBe("turn-dispatch:turn-1")
+    expect(fake.calls.some(sql => sql.includes('WHERE "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"'))).toBe(true)
     expect(fake.state.waitUpdates).toBe(1)
     expect(fake.state.turnUpdates).toBe(1)
     expect(fake.calls.some(sql => sql.includes('session."status" NOT IN (\'aborted\', \'archived\')'))).toBe(true)

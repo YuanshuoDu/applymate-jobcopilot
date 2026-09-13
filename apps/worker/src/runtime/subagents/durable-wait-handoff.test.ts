@@ -19,6 +19,8 @@ function fixture(waitStatus: string, turnStatus = "in_progress", suspendedAt: Da
     published: false,
     outboxWrites: 0,
     conflictResets: 0,
+    outboxParams: null as unknown[] | null,
+    outboxLookupParams: null as unknown[] | null,
     updates: [] as string[],
     sessionStatus,
     sessionSource,
@@ -38,7 +40,10 @@ function fixture(waitStatus: string, turnStatus = "in_progress", suspendedAt: Da
       }
       if (sql.includes('FROM "agent_wait_conditions"')) return { rows: [state.wait], rowCount: 1 }
       if (sql.includes('FROM "agent_steps"')) return { rows: [state.step], rowCount: 1 }
-      if (sql.includes('FROM "agent_outbox"')) return { rows: state.outbox ? [{ id: "outbox-1" }] : [], rowCount: state.outbox ? 1 : 0 }
+      if (sql.includes('FROM "agent_outbox"')) {
+        state.outboxLookupParams = params ?? null
+        return { rows: state.outbox ? [{ id: "outbox-1" }] : [], rowCount: state.outbox ? 1 : 0 }
+      }
       if (sql.includes('UPDATE "agent_wait_conditions"')) {
         state.wait.suspendedAt = params?.[1] as Date
         state.updates.push("wait")
@@ -59,6 +64,7 @@ function fixture(waitStatus: string, turnStatus = "in_progress", suspendedAt: Da
       }
       if (sql.includes('INSERT INTO "agent_outbox"')) {
         if (state.outbox && state.published && sql.includes('DO UPDATE')) state.conflictResets += 1
+        state.outboxParams = params ?? null
         state.outbox = true; state.published = false; state.outboxWrites += 1
         return { rows: [], rowCount: 1 }
       }
@@ -87,6 +93,8 @@ describe("durable dependency wait handoff", () => {
     expect(fake.state.outboxWrites).toBe(1)
     expect(fake.calls.filter(sql => sql.includes('UPDATE "agent_wait_conditions"') || sql.includes('UPDATE "agent_turns"') || sql.includes('INSERT INTO "agent_outbox"')).every(sql => sql.includes(SESSION_FENCE))).toBe(true)
     expect(fake.calls.some(sql => sql.includes('INSERT INTO "agent_outbox"') && sql.includes("WHERE EXISTS"))).toBe(true)
+    expect(fake.calls.some(sql => sql.includes('SELECT "id" FROM "agent_outbox"') && sql.includes('"aggregateId" = $3'))).toBe(true)
+    expect(fake.state.outboxLookupParams).toEqual(["agent.turn.dispatch", "turn-dispatch:turn-1", "session-1"])
   })
 
   it("resets a previously published dispatch when the wait becomes ready", async () => {
@@ -96,6 +104,10 @@ describe("durable dependency wait handoff", () => {
     await suspendAndReleaseWait(fake.pool as never, { lease, waitId: "wait-1", now })
     expect(fake.state.published).toBe(false)
     expect(fake.state.conflictResets).toBe(1)
+    expect(fake.state.outboxParams?.[2]).toBe(lease.sessionId)
+    expect(fake.state.outboxParams?.[2]).not.toBe(lease.turnId)
+    expect(fake.state.outboxParams?.[3]).toBe("turn-dispatch:turn-1")
+    expect(fake.calls.some(sql => sql.includes('WHERE "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"'))).toBe(true)
   })
 
   it("rejects an expired or mismatched lease before writing wait, turn, or outbox state", async () => {

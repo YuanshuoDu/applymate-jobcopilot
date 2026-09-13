@@ -78,8 +78,9 @@ export async function markTurnDispatchClaimed(pool: LeasePool, payload: TurnJobP
     await client.query(
       `UPDATE "agent_outbox"
        SET "publishedAt" = CURRENT_TIMESTAMP, "attemptCount" = "attemptCount" + 1, "lastError" = NULL
-       WHERE "topic" = 'agent.turn.dispatch' AND "idempotencyKey" = $1 AND "publishedAt" IS NULL`,
-      [`turn-dispatch:${payload.turnId}`],
+       WHERE "topic" = 'agent.turn.dispatch' AND "idempotencyKey" = $1
+         AND "aggregateId" = $2 AND "publishedAt" IS NULL`,
+      [`turn-dispatch:${payload.turnId}`, payload.sessionId],
     )
   } finally {
     client.release()

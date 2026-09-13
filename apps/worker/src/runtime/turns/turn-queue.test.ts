@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest"
 
 vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnect: vi.fn() })) }))
 
-import { runTurnJob, TurnExecutionRegistry } from "./turn-queue.js"
+import { markTurnDispatchClaimed, runTurnJob, TurnExecutionRegistry } from "./turn-queue.js"
 import type { TurnLease } from "./lease.js"
 import { RootAbortControllerRegistry } from "../interrupt/registry.js"
 
@@ -49,6 +49,19 @@ function waitingPool() {
 }
 
 describe("Turn queue processor", () => {
+  it("scopes dispatch claim bookkeeping by session and turn key", async () => {
+    const query = vi.fn().mockResolvedValue({ rows: [], rowCount: 1 })
+    const fakePool = { connect: vi.fn().mockResolvedValue({ query, release: vi.fn() }) }
+
+    await markTurnDispatchClaimed(fakePool as never, { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" })
+
+    const [sql, params] = query.mock.calls[0] as [string, unknown[]]
+    expect(sql).toContain('"topic" = \'agent.turn.dispatch\'')
+    expect(sql).toContain('"idempotencyKey" = $1')
+    expect(sql).toContain('"aggregateId" = $2')
+    expect(params).toEqual(["turn-dispatch:turn_1", "session_1"])
+  })
+
   it("does not execute a duplicate when the conditional lease claim loses", async () => {
     const fake = pool()
     const execute = vi.fn()

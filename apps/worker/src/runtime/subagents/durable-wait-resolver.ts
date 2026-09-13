@@ -59,8 +59,9 @@ async function writeDispatch(client: Queryable, row: Row, ownerId: string): Prom
      WHERE EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = $6 AND ${OPEN_SESSION})
      ON CONFLICT ("idempotencyKey") DO UPDATE
        SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL,
-           "attemptCount" = "agent_outbox"."attemptCount" + 1`,
-    [randomUUID(), DISPATCH_TOPIC, turnId, dispatchKey(turnId), json({ turnId, sessionId, ownerId }), sessionId],
+           "attemptCount" = "agent_outbox"."attemptCount" + 1
+       WHERE "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"`,
+    [randomUUID(), DISPATCH_TOPIC, sessionId, dispatchKey(turnId), json({ turnId, sessionId, ownerId }), sessionId],
   )
   if (written.rowCount !== 1) throw new Error("wait_session_closed")
 }

@@ -41,6 +41,14 @@ describe("Turn recovery scanner", () => {
     await persistTurnDispatch(fake.pool, { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" })
     expect(fake.calls.some(([sql]) => sql.includes("ON CONFLICT (\"idempotencyKey\") DO NOTHING"))).toBe(true)
     expect(fake.calls.some(([, params]) => params?.includes("agent.turn.dispatch"))).toBe(true)
+    const insert = fake.calls.find(([sql]) => sql.includes('INSERT INTO "agent_outbox"'))
+    expect(insert?.[1]).toEqual(expect.arrayContaining(["session_1", "turn-dispatch:turn_1"]))
+    expect(insert?.[1]?.[2]).toBe("session_1")
+    expect(insert?.[1]?.[2]).not.toBe("turn_1")
+
+    const resetFake = pool()
+    await persistTurnDispatch(resetFake.pool, { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, true)
+    expect(resetFake.calls.some(([sql]) => sql.includes('WHERE "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"'))).toBe(true)
   })
 
   it("uses a colon-free generation id so a resumed Turn is not hidden by a completed job", async () => {
@@ -145,5 +153,11 @@ describe("Turn recovery scanner", () => {
     expect(fake.calls.some(([sql]) => sql.includes('INSERT INTO "agent_outbox"'))).toBe(true)
     const queuedDispatchScan = fake.calls.find(([sql]) => sql.includes('FROM "agent_turns" AS turn') && sql.includes("FOR UPDATE OF turn"))?.[0] ?? ""
     expect(queuedDispatchScan).toMatch(/ORDER BY turn\."createdAt" ASC, turn\."id" ASC\s+LIMIT \$2 FOR UPDATE OF turn SKIP LOCKED/)
+    expect(queuedDispatchScan).toContain('dispatch."aggregateId" = turn."sessionId"')
+    expect(queuedDispatchScan).toContain('dispatch."idempotencyKey" = \'turn-dispatch:\' || turn."id"')
+    expect(queuedDispatchScan).not.toContain('dispatch."aggregateId" = turn."id"')
+    const dispatchInserts = fake.calls.filter(([sql, params]) => sql.includes('INSERT INTO "agent_outbox"') && params?.[1] === "agent.turn.dispatch")
+    expect(dispatchInserts.length).toBeGreaterThan(0)
+    expect(dispatchInserts.every(([, params]) => params?.[2] === "session_1")).toBe(true)
   })
 })

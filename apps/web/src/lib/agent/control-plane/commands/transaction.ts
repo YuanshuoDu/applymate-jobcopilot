@@ -137,7 +137,7 @@ export async function createRootTurn(
     data: {
       id: randomUUID(),
       topic: TURN_DISPATCH_TOPIC,
-      aggregateId: turn.id,
+      aggregateId: command.sessionId,
       idempotencyKey: turnDispatchKey(turn.id),
       payload: json({
         turnId: turn.id,

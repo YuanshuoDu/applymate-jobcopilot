@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 
-import { assertExpectedTurn, commandEventKey, fallbackDisposition, lockOpenSession, type CommandTransaction } from "./transaction"
+import { assertExpectedTurn, commandEventKey, createRootTurn, fallbackDisposition, lockOpenSession, type CommandTransaction } from "./transaction"
 import { activeTurnChanged } from "./errors"
 
 describe("Agent command transaction helpers", () => {
@@ -23,5 +23,24 @@ describe("Agent command transaction helpers", () => {
     expect(sql).toContain('"userId" =')
     expect(sql).toContain('"status" NOT IN (\'aborted\', \'archived\')')
     expect(sql).toContain("FOR UPDATE")
+  })
+
+  it("scopes the root Turn dispatch outbox row to its session", async () => {
+    const agentTurn = { create: vi.fn().mockResolvedValue({ id: "turn_1" }) }
+    const agentOutbox = { create: vi.fn().mockResolvedValue({}) }
+    const command = { sessionId: "session_1", userId: "user_1", clientMessageId: "client_1", source: "user" as const }
+
+    await createRootTurn(
+      { agentTurn, agentOutbox } as unknown as CommandTransaction,
+      command,
+      [{ type: "text", text: "Start" }],
+    )
+
+    const outboxData = agentOutbox.create.mock.calls[0]?.[0]?.data
+    expect(outboxData).toEqual(expect.objectContaining({
+      aggregateId: command.sessionId,
+      idempotencyKey: "turn-dispatch:turn_1",
+    }))
+    expect(outboxData.aggregateId).not.toBe("turn_1")
   })
 })

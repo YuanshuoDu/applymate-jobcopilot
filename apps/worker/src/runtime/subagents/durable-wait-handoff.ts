@@ -74,6 +74,7 @@ async function enqueueDispatch(client: Queryable, input: DurableWaitHandoffInput
   if (!resetPublished) {
     const existing = await client.query<Row>(
       `SELECT "id" FROM "agent_outbox" WHERE "topic" = $1 AND "idempotencyKey" = $2
+       AND "aggregateId" = $3
        AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = $3 AND ${OPEN_SESSION}) FOR UPDATE`,
       [DISPATCH_TOPIC, dispatchKey(turnId), sessionId],
     )
@@ -86,8 +87,9 @@ async function enqueueDispatch(client: Queryable, input: DurableWaitHandoffInput
      WHERE EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = $6 AND ${OPEN_SESSION})
      ON CONFLICT ("idempotencyKey") DO UPDATE
        SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL,
-           "attemptCount" = "agent_outbox"."attemptCount" + 1`,
-    [randomUUID(), DISPATCH_TOPIC, turnId, dispatchKey(turnId), payload, sessionId],
+           "attemptCount" = "agent_outbox"."attemptCount" + 1
+       WHERE "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"`,
+     [randomUUID(), DISPATCH_TOPIC, sessionId, dispatchKey(turnId), payload, sessionId],
   )
   if (written.rowCount !== 1) failLease("Session was closed during wait dispatch")
 }

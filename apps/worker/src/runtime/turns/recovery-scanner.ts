@@ -84,13 +84,14 @@ export async function persistTurnDispatch(
 ): Promise<void> {
   await withTransaction(pool, async (client) => {
     const conflictClause = resetPublished
-      ? `ON CONFLICT ("idempotencyKey") DO UPDATE SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL, "attemptCount" = "agent_outbox"."attemptCount" + 1`
+      ? `ON CONFLICT ("idempotencyKey") DO UPDATE SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL, "attemptCount" = "agent_outbox"."attemptCount" + 1
+         WHERE "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"`
       : `ON CONFLICT ("idempotencyKey") DO NOTHING`
     await client.query(
       `INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
        VALUES ($1, $2, $3, $4, $5::jsonb)
        ${conflictClause}`,
-      [randomUUID(), TURN_DISPATCH_TOPIC, payload.turnId, turnDispatchKey(payload.turnId), payloadJson(payload)],
+      [randomUUID(), TURN_DISPATCH_TOPIC, payload.sessionId, turnDispatchKey(payload.turnId), payloadJson(payload)],
     )
   })
 }
@@ -108,7 +109,9 @@ async function ensureQueuedTurnDispatches(
       `SELECT turn."id", turn."sessionId"
        FROM "agent_turns" AS turn
        LEFT JOIN "agent_outbox" AS dispatch
-         ON dispatch."topic" = $1 AND dispatch."aggregateId" = turn."id"
+         ON dispatch."topic" = $1
+        AND dispatch."aggregateId" = turn."sessionId"
+        AND dispatch."idempotencyKey" = 'turn-dispatch:' || turn."id"
        WHERE turn."status" = 'queued'
          AND EXISTS (
            SELECT 1 FROM "agent_events" AS event
@@ -128,8 +131,9 @@ async function ensureQueuedTurnDispatches(
          VALUES ($1, $2, $3, $4, $5::jsonb)
          ON CONFLICT ("idempotencyKey") DO UPDATE
          SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL,
-             "attemptCount" = "agent_outbox"."attemptCount" + 1`,
-        [randomUUID(), TURN_DISPATCH_TOPIC, row.id, turnDispatchKey(row.id), payloadJson(payload)],
+             "attemptCount" = "agent_outbox"."attemptCount" + 1
+         WHERE "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"`,
+         [randomUUID(), TURN_DISPATCH_TOPIC, row.sessionId, turnDispatchKey(row.id), payloadJson(payload)],
       )
     }
     return rows.rows.length
