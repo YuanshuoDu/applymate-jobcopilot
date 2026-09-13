@@ -134,7 +134,7 @@ export async function reconcileDurableWaits(pool: LeasePool, options: DurableWai
        FROM "agent_turns" AS turn
        WHERE turn."status" IN ('waiting_for_dependency', 'in_progress') AND turn."rootTaskId" IS NOT NULL
          AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = turn."sessionId" AND ${OPEN_SESSION})
-       ORDER BY turn."updatedAt" ASC, turn."id" ASC FOR UPDATE SKIP LOCKED LIMIT $1`,
+       ORDER BY turn."updatedAt" ASC, turn."id" ASC LIMIT $1 FOR UPDATE SKIP LOCKED`,
       [batchSize],
     )
     let scanned = 0; let resolved = 0; let woken = 0
@@ -145,7 +145,7 @@ export async function reconcileDurableWaits(pool: LeasePool, options: DurableWai
          FROM "agent_wait_conditions" WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3
            AND "status" IN ('waiting', 'ready', 'timed_out') AND "consumedAt" IS NULL
            AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_wait_conditions"."sessionId" AND ${OPEN_SESSION})
-         ORDER BY "createdAt" ASC, "id" ASC FOR UPDATE SKIP LOCKED LIMIT $4`,
+         ORDER BY "createdAt" ASC, "id" ASC LIMIT $4 FOR UPDATE SKIP LOCKED`,
         [turn.userId, turn.sessionId, turn.id, Math.max(0, batchSize - scanned)],
       )
       for (const wait of waits.rows) {

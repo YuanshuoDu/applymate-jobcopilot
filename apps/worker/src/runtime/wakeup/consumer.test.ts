@@ -103,6 +103,8 @@ describe("Agent wakeup consumer", () => {
   it("claims and marks durable wakeups after the same-lineage resume", async () => {
     const fake = fakePool()
     await expect(drainAgentWakeups(fake.pool, 1)).resolves.toBe(1)
+    const outboxScan = fake.calls.find(([sql]) => sql.includes('SELECT "id", "payload"'))?.[0] ?? ""
+    expect(outboxScan).toContain('ORDER BY "createdAt" ASC, "id" ASC LIMIT $2 FOR UPDATE SKIP LOCKED')
     expect(hasCall(fake.calls, 'UPDATE "agent_outbox" SET "publishedAt"')).toBe(true)
     expect(hasCall(fake.calls, "'turn.resumed'")).toBe(true)
     expect(hasCall(fake.calls, "COMMIT")).toBe(true)

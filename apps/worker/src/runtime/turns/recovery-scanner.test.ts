@@ -33,7 +33,7 @@ describe("Turn recovery scanner", () => {
     expect(result).toEqual([{ turnId: "turn_1", sessionId: "session_1", previousLeaseVersion: 8 }])
     const sql = fake.calls.find(([text]) => text.includes("WITH stale"))?.[0] ?? ""
     expect(sql).toContain("status\" = 'in_progress'")
-    expect(sql).toContain("SKIP LOCKED")
+    expect(sql).toContain('ORDER BY "updatedAt" ASC, "id" ASC LIMIT $2 FOR UPDATE SKIP LOCKED')
   })
 
   it("persists a deduplicated dispatch intent before queueing", async () => {
@@ -96,6 +96,8 @@ describe("Turn recovery scanner", () => {
     const fake = pool([{ id: "outbox_1", payload: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptCount: 4 }])
     const queue = { add: vi.fn().mockResolvedValue({ id: turnJobId("turn_1") }) }
     await dispatchPendingTurnOutbox(fake.pool, queue)
+    const outboxScan = fake.calls.find(([sql]) => sql.includes('FROM "agent_outbox"') && sql.includes('SELECT "id", "payload"'))?.[0] ?? ""
+    expect(outboxScan).toMatch(/ORDER BY "createdAt" ASC, "id" ASC\s+LIMIT \$2 FOR UPDATE SKIP LOCKED/)
     expect(queue.add).toHaveBeenCalledWith("turn", { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, { jobId: turnJobId("turn_1", 4), attempts: 5 })
   })
 
@@ -141,5 +143,7 @@ describe("Turn recovery scanner", () => {
     const queue = { add: vi.fn().mockRejectedValue(new Error("redis unavailable")) }
     await expect(recoverTurnQueue(fake.pool, queue, "owner_2", new Date("2026-09-01T00:00:00.000Z"))).rejects.toThrow("redis unavailable")
     expect(fake.calls.some(([sql]) => sql.includes('INSERT INTO "agent_outbox"'))).toBe(true)
+    const queuedDispatchScan = fake.calls.find(([sql]) => sql.includes('FROM "agent_turns" AS turn') && sql.includes("FOR UPDATE OF turn"))?.[0] ?? ""
+    expect(queuedDispatchScan).toMatch(/ORDER BY turn\."createdAt" ASC, turn\."id" ASC\s+LIMIT \$2 FOR UPDATE OF turn SKIP LOCKED/)
   })
 })

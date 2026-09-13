@@ -63,7 +63,7 @@ export async function reclaimExpiredTurns(pool: LeasePool, now: Date, limit: num
       `WITH stale AS (
          SELECT "id" FROM "agent_turns"
          WHERE "status" = 'in_progress' AND ("leaseExpiresAt" IS NULL OR "leaseExpiresAt" <= $1)
-         ORDER BY "updatedAt" ASC, "id" ASC FOR UPDATE SKIP LOCKED LIMIT $2
+         ORDER BY "updatedAt" ASC, "id" ASC LIMIT $2 FOR UPDATE SKIP LOCKED
        )
        UPDATE "agent_turns" AS turn
        SET "status" = 'queued', "leaseOwnerId" = NULL, "leaseExpiresAt" = NULL,
@@ -118,8 +118,7 @@ async function ensureQueuedTurnDispatches(
            dispatch."id" IS NULL OR dispatch."publishedAt" IS NOT NULL
          )
        ORDER BY turn."createdAt" ASC, turn."id" ASC
-       FOR UPDATE OF turn SKIP LOCKED
-       LIMIT $2`,
+       LIMIT $2 FOR UPDATE OF turn SKIP LOCKED`,
       [TURN_DISPATCH_TOPIC, limit],
     )
     for (const row of rows.rows) {
@@ -149,7 +148,7 @@ export async function dispatchPendingTurnOutbox(
        FROM "agent_outbox"
        WHERE "topic" = $1 AND "publishedAt" IS NULL
        ORDER BY "createdAt" ASC, "id" ASC
-       FOR UPDATE SKIP LOCKED LIMIT $2`,
+       LIMIT $2 FOR UPDATE SKIP LOCKED`,
       [TURN_DISPATCH_TOPIC, limit],
     )
     return result.rows

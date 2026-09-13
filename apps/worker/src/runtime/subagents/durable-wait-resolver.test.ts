@@ -61,6 +61,10 @@ describe("durable wait resolver", () => {
   it("marks an early terminal match ready without waking an unsuspended parent", async () => {
     const fake = fixture({})
     await expect(reconcileDurableWaits(fake.pool as never, { now })).resolves.toEqual({ scanned: 1, resolved: 1, woken: 0 })
+    const turnScan = fake.calls.find(sql => sql.includes('FROM "agent_turns"') && sql.includes('ORDER BY turn."updatedAt"')) ?? ""
+    const waitScan = fake.calls.find(sql => sql.includes('FROM "agent_wait_conditions"') && sql.includes('ORDER BY "createdAt"')) ?? ""
+    expect(turnScan).toContain('ORDER BY turn."updatedAt" ASC, turn."id" ASC LIMIT $1 FOR UPDATE SKIP LOCKED')
+    expect(waitScan).toContain('ORDER BY "createdAt" ASC, "id" ASC LIMIT $4 FOR UPDATE SKIP LOCKED')
     expect(fake.state.waits[0].status).toBe("ready")
     expect(fake.state.turns[0].status).toBe("in_progress")
     expect(fake.state.outboxWrites).toBe(0)

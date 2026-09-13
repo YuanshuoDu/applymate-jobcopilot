@@ -131,7 +131,7 @@ export async function drainAgentWakeups(pool: PoolLike, batchSize = DEFAULT_BATC
     try {
       await client.query("BEGIN")
       const rows = await client.query<OutboxRow>(
-        `SELECT "id", "payload" FROM "agent_outbox" WHERE "topic" = $1 AND "publishedAt" IS NULL ORDER BY "createdAt" ASC, "id" ASC FOR UPDATE SKIP LOCKED LIMIT $2`,
+        `SELECT "id", "payload" FROM "agent_outbox" WHERE "topic" = $1 AND "publishedAt" IS NULL ORDER BY "createdAt" ASC, "id" ASC LIMIT $2 FOR UPDATE SKIP LOCKED`,
         [AGENT_TURN_WAKEUP_TOPIC, batchSize],
       )
       if (rows.rows.length === 0) {
