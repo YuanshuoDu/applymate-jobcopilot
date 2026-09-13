@@ -1924,3 +1924,13 @@ Conditional wait/Turn/outbox mutations fail closed when a session closes during 
 **Independent verification:** Root independently verified the five focused Worker suites at **57/57** (root-orchestration 5, manager 5, Pg store 32, coordination-executors 9, production-bootstrap 6). The shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, Redis/BullMQ delivery, cross-process concurrency, process restart, provider/browser behavior, and full child-parent E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance, and overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 71. P4-41 — Turn reclaim, repair, and dispatch close-race fence
+
+**Candidate status/date (2026-09-13):** P4-41 is recorded as a candidate Turn dispatch close-race safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commits `ce679075` and `87c03b2d` fence all three Turn reclaim, repair, and dispatch paths with `session.status NOT IN ('aborted', 'archived')`. Before `queue.add`, dispatch re-locks the owning session and pending outbox row, then marks the outbox row published in the same transaction to control the close race.
+
+**Independent verification:** Root independently verified the focused Worker suites at **15/15**. Worker `tsc --noEmit --skipLibCheck`, the shared package build, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, Redis/BullMQ delivery, crash/restart behavior, cross-process close races, and complete Worker/child-parent E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance, and overall progress remains **P0 accepted 1/8 (12.5%)**.
