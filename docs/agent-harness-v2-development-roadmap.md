@@ -1805,6 +1805,16 @@ Conditional wait/Turn/outbox mutations fail closed when a session closes during 
 
 **Candidate boundary:** Live PostgreSQL/RLS, real concurrent lock races, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
 
+## 60. P4-30 — Gmail OAuth wait session-first fence
+
+**Candidate status/date (2026-09-13):** P4-30 is recorded as a candidate Gmail OAuth durable-wait persistence safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `a29fcc0e` makes `createPgGmailOAuthWaitPort().suspend` lock the user-owned open `agent_sessions` row first with `status NOT IN ('aborted', 'archived')` and `FOR UPDATE`, then lock the origin `in_progress` Turn with `FOR UPDATE`. Closed, missing, or cross-user sessions fail closed before `agent_items`, session event-sequence, or `agent_events` writes and roll back. The open path preserves session → Turn → item → sequence → event order plus privacy and reconnect URL/wait ID semantics. `persistSendEvidence` is intentionally unchanged so an already-sent external email retains recoverable durable audit evidence even if the session closes.
+
+**Independent verification:** Root independently verified `gmail-store.test.ts` at **8/8**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrent lock races, Redis/queue delivery, Worker restart, OAuth provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
 ## 52. P4-22 — Wakeup resume session-state fence
 
 **Candidate status/date (2026-09-13):** P4-22 is recorded as a candidate wakeup resume safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.

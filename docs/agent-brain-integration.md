@@ -579,3 +579,11 @@ Commit `c936b441` adds a session-first open-session fence to the PostgreSQL inpu
 Root independently verified `input-claim-store.test.ts` at **9/9**; `@jobcopilot/shared` build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
 
 Live PostgreSQL/RLS, real concurrent lock races, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E remain unverified. P4-29 remains a candidate and does not establish complete Harness/P4/Phase or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-30 update
+
+Commit `a29fcc0e` adds a session-first open-status fence to the durable Gmail OAuth wait path. `createPgGmailOAuthWaitPort().suspend` locks the user-owned `agent_sessions` row with `status NOT IN ('aborted', 'archived')` and `FOR UPDATE`, then locks the origin `in_progress` Turn before writing the wait Item, session event sequence, or event. Closed, missing, and cross-user sessions fail closed and roll back with no Item/sequence/Event writes. The open path preserves session → Turn → item → sequence → event order, privacy, and reconnect URL/wait ID semantics. `persistSendEvidence` remains intentionally unchanged so an external email that was already sent can still recoverably persist its audit evidence after session closure.
+
+Root independently verified `gmail-store.test.ts` at **8/8**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
+
+Live PostgreSQL/RLS, real concurrent lock races, Redis/queue delivery, Worker restart, OAuth provider, browser, and child-parent E2E remain unverified. P4-30 remains a candidate and does not establish complete Harness, P4/Phase or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
