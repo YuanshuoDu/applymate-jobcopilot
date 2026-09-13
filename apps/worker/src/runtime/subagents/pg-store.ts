@@ -205,7 +205,10 @@ export class PgSubagentTaskStore implements SubagentStore {
       const updated = await client.query(`UPDATE "sub_agent_tasks"
         SET "status" = 'queued', "leaseOwner" = NULL, "leaseExpiresAt" = NULL, "updatedAt" = $5
         WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $3 AND "attemptCount" = $4
-          AND "interruptRequestedAt" IS NULL AND "status" = 'running'`,
+          AND "interruptRequestedAt" IS NULL AND "status" = 'running'
+          AND EXISTS (SELECT 1 FROM "agent_sessions" AS session
+            WHERE session."id" = "sub_agent_tasks"."sessionId"
+              AND session."status" NOT IN ('aborted', 'archived'))`,
       [input.taskId, input.sessionId, input.ownerId, input.attemptCount, input.now])
       if (updated.rowCount !== 1) return false
       await client.query(`UPDATE "agent_outbox" SET "publishedAt" = NULL, "attemptCount" = "attemptCount" + 1, "lastError" = NULL

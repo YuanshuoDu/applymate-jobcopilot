@@ -207,8 +207,19 @@ describe("PgSubagentTaskStore", () => {
     expect(updates[0]?.[0]).toContain('"attemptCount" = $4')
     expect(updates[0]?.[0]).toContain('"updatedAt" = $5')
     expect(updates[0]?.[0]).toContain('"interruptRequestedAt" IS NULL')
+    expect(updates[0]?.[0]).toContain('session."status" NOT IN (\'aborted\', \'archived\')')
     expect(updates[1]?.[0]).toContain("publishedAt")
     expect(updates[1]?.[1]).toEqual(["task-1"])
+  })
+
+  it.each(["aborted", "archived"] as const)("does not release a child in a %s session", async status => {
+    const fake = fakePool(sql => sql.startsWith("UPDATE") ? { rowCount: 0 } : {})
+    const store = new PgSubagentTaskStore(fake.pool)
+    await expect(store.release({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, now })).resolves.toBe(false)
+    const updates = fake.calls.filter(([sql]) => sql.startsWith("UPDATE"))
+    expect(updates).toHaveLength(1)
+    expect(updates[0]?.[0]).toContain('session."status" NOT IN (\'aborted\', \'archived\')')
+    expect(updates.some(([sql]) => sql.includes('"agent_outbox"'))).toBe(false)
   })
 
   it("surfaces a durable interrupt during heartbeat instead of renewing", async () => {
