@@ -1985,6 +1985,16 @@ Conditional wait/Turn/outbox mutations fail closed when a session closes during 
 
 **Candidate boundary:** Live PostgreSQL/RLS, real concurrent execution, Redis/BullMQ, Worker restart, provider/browser behavior, and child-parent E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance. Overall phase acceptance remains **P0 accepted 1/8 (12.5%)**.
 
+## 79. P4-50 — Durable mailbox pending read and idempotent consume seam
+
+**Candidate status/date (2026-09-14):** P4-50 is recorded as a candidate durable mailbox acknowledgement slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `af525085` adds an optional `CoordinationStore` `listPendingMessages`/`consumeMessages` seam. Pending reads use stable `createdAt,id` ordering, and both operations enforce the open-session plus tenant/task fences. Consumption updates only rows where `consumedAt IS NULL`, making retries idempotent while leaving `deliveredAt` unchanged. This slice adds no child context, outbox consumer, or migration; its semantics are limited to at-least-once inbox acknowledgement.
+
+**Independent verification:** Root independently verified the mailbox suite at **15/15**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrency, Redis/BullMQ delivery, process restart, provider, browser, and child-parent E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance. Overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
 ## 78. P4-49 — Child lifecycle lineage authorization
 
 **Candidate status/date (2026-09-14):** P4-49 is recorded as a candidate child lifecycle lineage authorization slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.

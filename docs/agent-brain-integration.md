@@ -731,3 +731,10 @@ Commit `0941a812` fences root/child lifecycle controls by lineage. A root task m
 Root independently verified the focused Worker suites at **13/13**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 
 Live PostgreSQL/RLS, real concurrent execution, Redis/BullMQ delivery, Worker restart, provider/browser behavior, and complete E2E remain unverified. The cognitive gate remains disabled; P4-49 is a candidate increment only and overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-50 integration / verification
+
+- Integrated code commit: `af525085`.
+- The durable mailbox exposes an optional `CoordinationStore` `listPendingMessages`/`consumeMessages` seam. Pending reads use stable `createdAt,id` ordering, and both operations enforce the open-session plus tenant/task fences. Consumption updates only rows where `consumedAt IS NULL`, making retries idempotent while leaving `deliveredAt` unchanged. This slice adds no child context, outbox consumer, or migration; its semantics are limited to at-least-once inbox acknowledgement.
+- Root independently verified the mailbox suite at **15/15**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+- Live PostgreSQL/RLS, real concurrency, Redis/BullMQ delivery, process restart, provider, browser, and child-parent E2E remain unverified. The cognitive gate remains disabled; P4-50 remains a candidate and overall acceptance stays **P0 accepted 1/8 (12.5%)**.
