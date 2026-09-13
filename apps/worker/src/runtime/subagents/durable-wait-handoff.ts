@@ -89,7 +89,7 @@ async function enqueueDispatch(client: Queryable, input: DurableWaitHandoffInput
        SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL,
            "attemptCount" = "agent_outbox"."attemptCount" + 1
        WHERE "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"`,
-     [randomUUID(), DISPATCH_TOPIC, sessionId, dispatchKey(turnId), payload, sessionId],
+    [randomUUID(), DISPATCH_TOPIC, sessionId, dispatchKey(turnId), payload, sessionId],
   )
   if (written.rowCount !== 1) failLease("Session was closed during wait dispatch")
 }

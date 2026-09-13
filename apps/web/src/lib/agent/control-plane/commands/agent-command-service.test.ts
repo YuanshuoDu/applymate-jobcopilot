@@ -243,10 +243,11 @@ describe("AgentCommandService", () => {
     const dispatches = fake.state.outbox.filter((outbox) => outbox.topic === "agent.turn.dispatch")
     expect(dispatches).toHaveLength(1)
     expect(dispatches[0]).toMatchObject({
-      aggregateId: first.turnId,
+      aggregateId: "session_1",
       idempotencyKey: `turn-dispatch:${first.turnId}`,
       payload: { turnId: first.turnId, sessionId: "session_1", ownerId: `web:${first.turnId}` },
     })
+    expect(dispatches[0]?.aggregateId).not.toBe(first.turnId)
   })
 
   it("rejects stale expected Turn before writing a steer", async () => {
