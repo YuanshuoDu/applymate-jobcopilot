@@ -687,3 +687,11 @@ Commit `03cdd550` adds runtime legacy repair for Turn dispatch aggregates. The r
 Root independently verified the Recovery and Turn queue suites at **32/32**. Worker `tsc --noEmit --skipLibCheck`, the shared package build, and `git diff --check` also passed.
 
 Live PostgreSQL/RLS, Redis/queue delivery, restart behavior, and complete Worker E2E remain unverified. The cognitive gate remains disabled; P4-43 remains a candidate and overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-44 update
+
+Commits `305ce8f3` and fixture repair `56db3eda` harden child `agent.subagent.dispatch` recovery and enqueue. The scan uses a canonical session JOIN with the open-session fence `session.status NOT IN ('aborted', 'archived')`. Before enqueue, dispatch re-locks the session and outbox, performs `queue.add`, and marks the outbox row published in the same transaction; payload aggregate mismatches fail closed. At-least-once delivery and the idempotent job ID remain intact. `56db3eda` only updates the combination fake adapter to match the P4-41 canonical Turn outbox SQL.
+
+Root independently verified the coordination integration, recovery scanner, and subagent queue suites at **52/52**. Worker `tsc --noEmit --skipLibCheck`, the shared package build, and `git diff --check` also passed.
+
+Live PostgreSQL/RLS, Redis/queue delivery, restart behavior, and complete Worker E2E remain unverified. The cognitive gate remains disabled; P4-44 remains a candidate and overall progress remains **P0 accepted 1/8 (12.5%)**.
