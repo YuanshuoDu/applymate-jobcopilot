@@ -10,9 +10,22 @@ function whereOf(args: unknown): Row {
   return ((args as { where?: Row }).where ?? {})
 }
 
-function makeDb(options: { ownerId?: string; failOutbox?: boolean } = {}) {
+function makeDb(options: {
+  ownerId?: string
+  failOutbox?: boolean
+  executionStatus?: string
+  sessionSource?: string
+  activeSource?: string
+  activeTurnId?: string
+} = {}) {
   const ownerId = options.ownerId ?? "user_1"
-  let active: (Row & { revision: number }) | null = null
+  let active: (Row & { revision: number }) | null = options.activeSource
+    ? { id: options.activeTurnId ?? "turn_1", source: options.activeSource, status: "in_progress", revision: 0 }
+    : null
+  let execution: { id: string; sessionId: string; status: string } | null = options.executionStatus
+    ? { id: "execution_1", sessionId: "session_1", status: options.executionStatus }
+    : null
+  let sessionStatus = "active"
   let sequence = BigInt(0)
   let inputs: Row[] = []
   let items: Row[] = []
@@ -27,7 +40,29 @@ function makeDb(options: { ownerId?: string; failOutbox?: boolean } = {}) {
       sequence += BigInt(1)
       return [{ eventSequence: sequence }]
     }),
-    agentSession: { findFirst: vi.fn() },
+    agentSession: {
+      findFirst: vi.fn(async () => (options.sessionSource ? { source: options.sessionSource } : null)),
+      updateMany: vi.fn(async (args: unknown) => {
+        const where = whereOf(args)
+        if (!options.sessionSource || where.id !== "session_1" || where.userId !== ownerId) return { count: 0 }
+        sessionStatus = "aborted"
+        return { count: 1 }
+      }),
+    },
+    agentExecution: {
+      findFirst: vi.fn(async (args: unknown) => {
+        const where = whereOf(args)
+        if (!execution || where.id !== execution.id || where.userId !== ownerId || (where.sessionId && where.sessionId !== execution.sessionId)) return null
+        return { ...execution }
+      }),
+      updateMany: vi.fn(async (args: unknown) => {
+        const where = whereOf(args)
+        const statuses = (where.status as { in?: unknown[] } | undefined)?.in ?? []
+        if (!execution || where.id !== execution.id || where.userId !== ownerId || where.sessionId !== execution.sessionId || !statuses.includes(execution.status)) return { count: 0 }
+        execution = { ...execution, status: "cancelled" }
+        return { count: 1 }
+      }),
+    },
     agentTurn: {
       findFirst: vi.fn(async () => active),
       create: vi.fn(async (args: unknown) => {
@@ -87,11 +122,22 @@ function makeDb(options: { ownerId?: string; failOutbox?: boolean } = {}) {
 
   const transaction = vi.fn(<T>(work: (transaction: typeof tx) => Promise<T>) => {
     const run = transactionQueue.then(async () => {
-      const before = { active, sequence, inputs: [...inputs], items: [...items], events: [...events], outbox: [...outbox] }
+      const before = {
+        active,
+        execution,
+        sessionStatus,
+        sequence,
+        inputs: [...inputs],
+        items: [...items],
+        events: [...events],
+        outbox: [...outbox],
+      }
       try {
         return await work(tx)
       } catch (error: unknown) {
         active = before.active
+        execution = before.execution
+        sessionStatus = before.sessionStatus
         sequence = before.sequence
         inputs = before.inputs
         items = before.items
@@ -110,6 +156,9 @@ function makeDb(options: { ownerId?: string; failOutbox?: boolean } = {}) {
     tx,
     state: {
       get active() { return active },
+      setActive(value: (Row & { revision: number }) | null) { active = value },
+      get execution() { return execution },
+      get sessionStatus() { return sessionStatus },
       get inputs() { return inputs },
       get items() { return items },
       get events() { return events },
@@ -250,5 +299,58 @@ describe("AgentCommandService", () => {
 
     expect(result).toMatchObject({ disposition: "interrupted", turnId: started.turnId })
     expect(fake.state.active).toMatchObject({ status: "interrupted", revision: 1 })
+  })
+
+  it("cancels an automation execution and interrupts its active Turn in one transaction", async () => {
+    const fake = makeDb({ executionStatus: "running", sessionSource: "automation", activeSource: "automation", activeTurnId: "turn_automation_1" })
+    const service = new AgentCommandService(fake.db)
+
+    await expect(service.cancelExecution({ executionId: "execution_1", userId: "user_1", sessionId: "session_1" })).resolves.toBe(true)
+
+    expect(fake.state.execution).toMatchObject({ status: "cancelled" })
+    expect(fake.state.active).toMatchObject({ status: "interrupted", revision: 1 })
+    expect(fake.state.sessionStatus).toBe("aborted")
+    expect(fake.state.inputs).toHaveLength(1)
+    expect(fake.state.events.filter((event) => event.type === "turn.interrupted")).toHaveLength(1)
+    expect(fake.state.inputs[0]).toMatchObject({ clientMessageId: "agent-execution-cancel:execution_1:turn_automation_1" })
+  })
+
+  it("cancels safely without an active Turn and does not interrupt a user-owned Turn", async () => {
+    const noTurn = makeDb({ executionStatus: "running", sessionSource: "automation" })
+    await expect(new AgentCommandService(noTurn.db).cancelExecution({ executionId: "execution_1", userId: "user_1" })).resolves.toBe(true)
+    expect(noTurn.state.execution).toMatchObject({ status: "cancelled" })
+    expect(noTurn.state.inputs).toHaveLength(0)
+
+    const userTurn = makeDb({ executionStatus: "running", sessionSource: "automation", activeSource: "user" })
+    await expect(new AgentCommandService(userTurn.db).cancelExecution({ executionId: "execution_1", userId: "user_1" })).resolves.toBe(true)
+    expect(userTurn.state.active).toMatchObject({ status: "in_progress", revision: 0 })
+    expect(userTurn.state.inputs).toHaveLength(0)
+  })
+
+  it("keeps cancellation idempotent while a restarted execution gets a new Turn key", async () => {
+    const fake = makeDb({ executionStatus: "running", sessionSource: "automation", activeSource: "automation", activeTurnId: "turn_1" })
+    const service = new AgentCommandService(fake.db)
+
+    await service.cancelExecution({ executionId: "execution_1", userId: "user_1" })
+    fake.tx.agentExecution.findFirst.mockImplementation(async () => ({ id: "execution_1", sessionId: "session_1", status: "running" }))
+    fake.tx.agentExecution.updateMany.mockImplementation(async () => ({ count: 1 }))
+    fake.state.setActive({ id: "turn_2", source: "automation", status: "in_progress", revision: 0 })
+    await service.cancelExecution({ executionId: "execution_1", userId: "user_1" })
+
+    expect(fake.state.inputs.map((input) => input.clientMessageId)).toEqual([
+      "agent-execution-cancel:execution_1:turn_1",
+      "agent-execution-cancel:execution_1:turn_2",
+    ])
+  })
+
+  it("returns false for terminal executions and propagates cancellation write failures", async () => {
+    const terminal = makeDb({ executionStatus: "completed", sessionSource: "automation", activeSource: "automation" })
+    await expect(new AgentCommandService(terminal.db).cancelExecution({ executionId: "execution_1", userId: "user_1" })).resolves.toBe(false)
+    expect(terminal.state.inputs).toHaveLength(0)
+
+    const failed = makeDb({ executionStatus: "running", sessionSource: "automation" })
+    failed.tx.agentExecution.updateMany.mockRejectedValue(new Error("database unavailable"))
+    await expect(new AgentCommandService(failed.db).cancelExecution({ executionId: "execution_1", userId: "user_1" })).rejects.toThrow("database unavailable")
+    expect(failed.state.execution).toMatchObject({ status: "running" })
   })
 })

@@ -2,7 +2,7 @@ import type { PrismaClient } from "@prisma/client"
 import type { InputContentPart } from "@jobcopilot/agent-protocol"
 
 import { AgentCommandError, activeTurnChanged, automationCannotSteerUserTurn, invalidCommand, isUniqueViolation } from "./errors"
-import { cancelPendingWaitsInTransaction } from "../../broker/interrupt"
+import { cancelExecutionInTransaction, interruptActiveTurn, type CancelExecutionCommand } from "./execution-cancellation"
 import {
   acceptInputFacts,
   assertExpectedTurn,
@@ -101,6 +101,10 @@ export class AgentCommandService {
     return this.retryUnique(() => this.interruptOnce(command))
   }
 
+  async cancelExecution(command: CancelExecutionCommand): Promise<boolean> {
+    return this.retryUnique(() => this.db.$transaction((tx) => cancelExecutionInTransaction(tx, command)))
+  }
+
   private async retryUnique<T>(work: () => Promise<T>): Promise<T> {
     try {
       return await work()
@@ -159,22 +163,7 @@ export class AgentCommandService {
       const active = await findActiveTurn(tx, command.sessionId, command.userId)
       await assertExpectedTurn(command.expectedTurnId, command.expectedRevision, active)
       if (!active) throw activeTurnChanged(command.expectedTurnId, null)
-      const interrupted = await tx.agentTurn.updateMany({
-        where: { id: active.id, sessionId: command.sessionId, userId: command.userId, status: { in: ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] }, revision: active.revision },
-        data: { status: "interrupted", revision: { increment: 1 }, completedAt: new Date() },
-      })
-      if (interrupted.count !== 1) throw activeTurnChanged(command.expectedTurnId, active.id)
-
-      await cancelPendingWaitsInTransaction(tx, {
-        sessionId: command.sessionId,
-        userId: command.userId,
-        turnId: active.id,
-        clientMessageId: command.clientMessageId,
-      })
-
-      const content: InputContentPart[] = [{ type: "text", text: "Interrupt requested" }]
-      return acceptInputFacts(tx, command, content, active, "steer", "interrupted", false)
-        .then((facts) => ({ ...facts, disposition: "interrupted" as const }))
+      return interruptActiveTurn(tx, command, active)
     })
   }
 }

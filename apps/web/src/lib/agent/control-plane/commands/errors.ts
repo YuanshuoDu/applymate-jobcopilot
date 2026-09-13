@@ -1,6 +1,7 @@
 export type AgentCommandErrorCode =
   | "agent_session_not_found"
   | "active_turn_changed"
+  | "execution_changed"
   | "automation_cannot_steer_user_turn"
   | "invalid_command"
   | "turn_not_active"
@@ -42,6 +43,15 @@ export function activeTurnChanged(expectedTurnId: string | null, actualTurnId: s
     "The active Agent Turn changed before this command was accepted",
     409,
     { expectedTurnId, actualTurnId },
+  )
+}
+
+export function executionChanged(executionId: string): AgentCommandError {
+  return new AgentCommandError(
+    "execution_changed",
+    "The Agent execution changed before cancellation was accepted",
+    409,
+    { executionId },
   )
 }
 
