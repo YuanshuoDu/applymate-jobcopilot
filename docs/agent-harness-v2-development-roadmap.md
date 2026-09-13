@@ -1934,3 +1934,13 @@ Conditional wait/Turn/outbox mutations fail closed when a session closes during 
 **Independent verification:** Root independently verified the focused Worker suites at **15/15**. Worker `tsc --noEmit --skipLibCheck`, the shared package build, and `git diff --check` also passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, Redis/BullMQ delivery, crash/restart behavior, cross-process close races, and complete Worker/child-parent E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance, and overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 72. P4-42 — Durable-wait handoff and resolver lock order
+
+**Candidate status/date (2026-09-13):** P4-42 is recorded as a candidate durable-wait lock-order safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `0cd75cb4` aligns durable-wait handoff and resolver locking. Handoff first locks the user-owned session and verifies the open-session fence, then locks the origin Turn. Resolver joins the user-owned session to the Turn and uses `LIMIT ... FOR UPDATE OF session, turn SKIP LOCKED`, preserving the session-before-Turn lock order.
+
+**Independent verification:** Root independently verified the focused Worker suites at **30/30**. Worker `tsc --noEmit --skipLibCheck`, the shared package build, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real cross-process lock ordering and close races, Redis/queue delivery, process restart, and complete Worker/child-parent E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance, and overall progress remains **P0 accepted 1/8 (12.5%)**.

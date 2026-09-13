@@ -671,3 +671,11 @@ Commits `ce679075` and `87c03b2d` fence all three Turn reclaim, repair, and disp
 Root independently verified the focused Worker suites at **15/15**. Worker `tsc --noEmit --skipLibCheck`, the shared package build, and `git diff --check` also passed.
 
 Live PostgreSQL/RLS, Redis/BullMQ delivery, crash/restart behavior, cross-process close races, and complete Worker/child-parent E2E remain unverified. The cognitive gate remains disabled; P4-41 remains a candidate and overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-42 update
+
+Commit `0cd75cb4` aligns durable-wait handoff and resolver locking. Handoff first locks the user-owned session and verifies the open-session fence, then locks the origin Turn. Resolver joins the user-owned session to the Turn and uses `LIMIT ... FOR UPDATE OF session, turn SKIP LOCKED`, preserving the session-before-Turn lock order.
+
+Root independently verified the focused Worker suites at **30/30**. Worker `tsc --noEmit --skipLibCheck`, the shared package build, and `git diff --check` also passed.
+
+Live PostgreSQL/RLS, real cross-process lock ordering and close races, Redis/queue delivery, process restart, and complete Worker/child-parent E2E remain unverified. The cognitive gate remains disabled; P4-42 remains a candidate and overall progress remains **P0 accepted 1/8 (12.5%)**.
