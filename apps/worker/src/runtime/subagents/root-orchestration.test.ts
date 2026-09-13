@@ -31,6 +31,44 @@ describe("Scout/Analyst root orchestration", () => {
     expect(result.wait.status).toBe("waiting")
   })
 
+  it("atomically spawns both roles without calling the external dispatcher", async () => {
+    const tasks = [task("task-scout", "scout"), task("task-analyst", "analyst")] as const
+    const spawnAtomic = vi.fn()
+      .mockResolvedValueOnce({ task: tasks[0], duplicate: false, atomic: true })
+      .mockResolvedValueOnce({ task: tasks[1], duplicate: true, atomic: true })
+    const manager = { supportsAtomicSpawn: vi.fn(() => true), spawnAtomic } as unknown as AgentTreeManager
+    const dispatch = vi.fn(async () => undefined)
+    const wait = vi.fn(async (input: { targetTaskIds: readonly string[] }) => ({ waitId: "wait-atomic", status: "ready" as const, deadlineAt: "2026-09-03T00:10:00.000Z", matchedTaskIds: [...input.targetTaskIds] }))
+
+    const result = await spawnScoutAnalystAndWait(manager, { wait }, { userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "root-1", scoutGoal: "find jobs", analystGoal: "score jobs" }, dispatch, { stepId: "step-1", timeoutMs: 10_000, idempotencyKey: "root-run" })
+
+    expect(spawnAtomic.mock.calls.map(([, key]) => key)).toEqual(["root-run:scout", "root-run:analyst"])
+    expect(dispatch).not.toHaveBeenCalled()
+    expect(result.tasks.map(item => item.id)).toEqual(["task-scout", "task-analyst"])
+    expect(wait).toHaveBeenCalledWith(expect.objectContaining({ targetTaskIds: ["task-scout", "task-analyst"], mode: "all" }))
+    expect(result.wait.status).toBe("ready")
+  })
+
+  it("fails explicitly when an atomic spawn does not return its task", async () => {
+    const spawnAtomic = vi.fn()
+      .mockResolvedValueOnce({ task: null, duplicate: true, atomic: true })
+      .mockResolvedValueOnce({ task: task("task-analyst", "analyst"), duplicate: false, atomic: true })
+    const manager = { supportsAtomicSpawn: vi.fn(() => true), spawnAtomic } as unknown as AgentTreeManager
+    const dispatch = vi.fn(async () => undefined)
+
+    await expect(spawnScoutAnalystAndWait(manager, {} as never, { userId: "u", sessionId: "s", turnId: "t", parentTaskId: "root-1", scoutGoal: "s", analystGoal: "a" }, dispatch, { stepId: "step", timeoutMs: 1, idempotencyKey: "key" })).rejects.toThrow("Atomic scout spawn did not return a task")
+    expect(dispatch).not.toHaveBeenCalled()
+  })
+
+  it("rejects children that do not share one root task", async () => {
+    const scout = task("task-scout", "scout")
+    const analyst = { ...task("task-analyst", "analyst"), rootTaskId: "other-root" }
+    const spawn = vi.fn().mockResolvedValueOnce(scout).mockResolvedValueOnce(analyst)
+    const manager = { spawn } as unknown as AgentTreeManager
+
+    await expect(spawnScoutAnalystAndWait(manager, {} as never, { userId: "u", sessionId: "s", turnId: "t", parentTaskId: "root-1", scoutGoal: "s", analystGoal: "a" }, async () => undefined, { stepId: "step", timeoutMs: 1, idempotencyKey: "key" })).rejects.toThrow("share one root")
+  })
+
   it("requires a runtime-owned parent so both children share one root", async () => {
     const manager = {} as AgentTreeManager
     await expect(spawnScoutAnalystAndWait(manager, {} as never, { userId: "u", sessionId: "s", turnId: "t", parentTaskId: "", scoutGoal: "s", analystGoal: "a" }, async () => undefined, { stepId: "step", timeoutMs: 1, idempotencyKey: "key" })).rejects.toThrow(/parent task/)

@@ -27,7 +27,7 @@ export type ScoutAnalystSpawnResult = {
   }
 }
 
-/** Spawns and dispatches both read-only roles concurrently before durable wait. */
+/** Spawns both read-only roles concurrently and waits for their durable results. */
 export async function spawnScoutAnalystAndWait(
   manager: AgentTreeManager,
   waitPort: DurableWaitPort,
@@ -36,18 +36,34 @@ export async function spawnScoutAnalystAndWait(
   options: { readonly stepId: string; readonly timeoutMs: number; readonly idempotencyKey: string },
 ): Promise<ScoutAnalystSpawnResult> {
   if (!input.parentTaskId.trim()) throw new Error("Root orchestration requires the runtime-owned parent task")
+  const atomic = typeof manager.supportsAtomicSpawn === "function" && manager.supportsAtomicSpawn()
   const [scout, analyst] = await Promise.all([
-    manager.spawn(roleSpec(input, "scout", input.scoutGoal)),
-    manager.spawn(roleSpec(input, "analyst", input.analystGoal)),
+    spawnRole(manager, input, "scout", input.scoutGoal, atomic, options.idempotencyKey),
+    spawnRole(manager, input, "analyst", input.analystGoal, atomic, options.idempotencyKey),
   ])
   if (scout.rootTaskId !== analyst.rootTaskId) throw new Error("Scout and Analyst must share one root task")
-  await Promise.all([dispatch(scout), dispatch(analyst)])
+  if (!atomic) await Promise.all([dispatch(scout), dispatch(analyst)])
   const wait = await waitPort.wait({
     userId: input.userId, sessionId: input.sessionId, turnId: input.turnId, stepId: options.stepId,
     taskId: input.parentTaskId, rootTaskId: scout.rootTaskId,
     targetTaskIds: [scout.id, analyst.id], mode: "all", timeoutMs: options.timeoutMs, idempotencyKey: options.idempotencyKey,
   })
   return { tasks: [scout, analyst], wait }
+}
+
+async function spawnRole(
+  manager: AgentTreeManager,
+  input: RootRoleSpawnInput,
+  role: MigratedRole,
+  goal: string,
+  atomic: boolean,
+  idempotencyKey: string,
+): Promise<SubagentTaskRecord> {
+  const spec = roleSpec(input, role, goal)
+  if (!atomic) return manager.spawn(spec)
+  const result = await manager.spawnAtomic(spec, `${idempotencyKey}:${role}`)
+  if (!result.task) throw new Error(`Atomic ${role} spawn did not return a task`)
+  return result.task
 }
 
 function roleSpec(input: RootRoleSpawnInput, role: MigratedRole, goal: string): SubagentTaskSpec {
