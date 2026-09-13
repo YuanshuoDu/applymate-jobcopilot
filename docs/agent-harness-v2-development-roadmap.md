@@ -1735,6 +1735,16 @@ Conditional wait/Turn/outbox mutations fail closed when a session closes during 
 
 **Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, real cross-process concurrency, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
 
+## 53. P4-23 — Mailbox coordination session-state fence
+
+**Candidate status/date (2026-09-13):** P4-23 is recorded as a candidate mailbox coordination safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `82bc4506` changes `requireSession` to use a session-first `FOR UPDATE` lock with `status NOT IN ('aborted', 'archived')`. `sendMessage`, `recordSpawn`, and `appendActivity` all run this guard before idempotency reads or any message, replay/dispatch outbox, activity item, event, or session-sequence write. Closed sessions return the typed `coordination_scope_error`; the transaction rolls back with no side effects. Read-only task/list/spawn-replay behavior is preserved, as are open `running`, `paused`, `waiting_for_user`, and ordinary `user`/`system` session behaviors and existing idempotency semantics.
+
+**Independent verification:** Root independently verified the focused mailbox suite at **10/10**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, real cross-process concurrency, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
 ## 52. P4-22 — Wakeup resume session-state fence
 
 **Candidate status/date (2026-09-13):** P4-22 is recorded as a candidate wakeup resume safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
