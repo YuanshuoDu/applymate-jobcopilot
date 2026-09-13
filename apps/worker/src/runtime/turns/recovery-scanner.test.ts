@@ -5,13 +5,16 @@ vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnec
 import { dispatchPendingTurnOutbox, persistTurnDispatch, reclaimExpiredTurns, recoverTurnQueue, turnJobId } from "./recovery-scanner.js"
 import { markTurnDispatchClaimed } from "./turn-queue.js"
 
-function pool(rows: unknown[] = []) {
+function pool(rows: unknown[] = [], sessionStatus: string | null = "running", queuedRows: unknown[] = []) {
   const calls: Array<[string, unknown[]?]> = []
+  const open = sessionStatus !== null && !["aborted", "archived"].includes(sessionStatus)
   const client = {
     query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push([sql, params])
-      if (sql.includes("WITH stale")) return { rows: [{ id: "turn_1", sessionId: "session_1", leaseVersion: 9 }], rowCount: 1 }
-      if (sql.includes('FROM "agent_outbox"') && sql.includes('SELECT')) return { rows, rowCount: rows.length }
+      if (sql.includes("WITH stale")) return open ? { rows: [{ id: "turn_1", sessionId: "session_1", leaseVersion: 9 }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "agent_turns" AS turn')) return open ? { rows: queuedRows, rowCount: queuedRows.length } : { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "agent_outbox"') && sql.includes('SELECT')) return open ? { rows, rowCount: rows.length } : { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "agent_sessions"')) return open ? { rows: [{ id: "session_1" }], rowCount: 1 } : { rows: [], rowCount: 0 }
       if (sql.includes('FROM "agent_turns"')) return { rows: [], rowCount: 0 }
       return { rows: [], rowCount: 1 }
     }),
@@ -33,7 +36,9 @@ describe("Turn recovery scanner", () => {
     expect(result).toEqual([{ turnId: "turn_1", sessionId: "session_1", previousLeaseVersion: 8 }])
     const sql = fake.calls.find(([text]) => text.includes("WITH stale"))?.[0] ?? ""
     expect(sql).toContain("status\" = 'in_progress'")
-    expect(sql).toContain('ORDER BY "updatedAt" ASC, "id" ASC LIMIT $2 FOR UPDATE SKIP LOCKED')
+    expect(sql).toMatch(/ORDER BY turn\."updatedAt" ASC, turn\."id" ASC\s+LIMIT \$2 FOR UPDATE OF turn, session SKIP LOCKED/)
+    expect(sql).toContain('session."status" NOT IN (\'aborted\', \'archived\')')
+    expect(sql.match(/session\."status" NOT IN/g)?.length).toBeGreaterThanOrEqual(2)
   })
 
   it("persists a deduplicated dispatch intent before queueing", async () => {
@@ -49,6 +54,10 @@ describe("Turn recovery scanner", () => {
     const resetFake = pool()
     await persistTurnDispatch(resetFake.pool, { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, true)
     expect(resetFake.calls.some(([sql]) => sql.includes('WHERE "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"'))).toBe(true)
+
+    const closedFake = pool([], "archived")
+    await persistTurnDispatch(closedFake.pool, { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, true)
+    expect(closedFake.calls.some(([sql]) => sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
   })
 
   it("uses a colon-free generation id so a resumed Turn is not hidden by a completed job", async () => {
@@ -69,6 +78,7 @@ describe("Turn recovery scanner", () => {
           }
           return { rows: [], rowCount: 1 }
         }
+        if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session_1" }], rowCount: 1 }
         if (sql.includes('ON CONFLICT ("idempotencyKey") DO UPDATE')) {
           state.published = false
           state.attemptCount += 1
@@ -104,8 +114,10 @@ describe("Turn recovery scanner", () => {
     const fake = pool([{ id: "outbox_1", payload: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptCount: 4 }])
     const queue = { add: vi.fn().mockResolvedValue({ id: turnJobId("turn_1") }) }
     await dispatchPendingTurnOutbox(fake.pool, queue)
-    const outboxScan = fake.calls.find(([sql]) => sql.includes('FROM "agent_outbox"') && sql.includes('SELECT "id", "payload"'))?.[0] ?? ""
-    expect(outboxScan).toMatch(/ORDER BY "createdAt" ASC, "id" ASC\s+LIMIT \$2 FOR UPDATE SKIP LOCKED/)
+    const outboxScan = fake.calls.find(([sql]) => sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes('SELECT dispatch."id"'))?.[0] ?? ""
+    expect(outboxScan).toMatch(/ORDER BY dispatch\."createdAt" ASC, dispatch\."id" ASC\s+LIMIT \$2 FOR UPDATE OF dispatch, session SKIP LOCKED/)
+    expect(outboxScan).toContain('session."id" = dispatch."aggregateId"')
+    expect(outboxScan).toContain('session."status" NOT IN (\'aborted\', \'archived\')')
     expect(queue.add).toHaveBeenCalledWith("turn", { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, { jobId: turnJobId("turn_1", 4), attempts: 5 })
   })
 
@@ -142,6 +154,7 @@ describe("Turn recovery scanner", () => {
       query: vi.fn(async (sql: string, params?: unknown[]) => {
         calls.push([sql, params])
         if (sql.includes("WITH stale")) return { rows: [{ id: "turn_1", sessionId: "session_1", leaseVersion: 2 }], rowCount: 1 }
+        if (sql.includes('FROM "agent_turns" AS turn') && sql.includes('LEFT JOIN "agent_outbox" AS dispatch')) return { rows: [{ id: "turn_1", sessionId: "session_1" }], rowCount: 1 }
         if (sql.includes('FROM "agent_outbox"') && sql.includes("SELECT")) return { rows: [{ id: "dispatch_1", payload: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_2" } }], rowCount: 1 }
         return { rows: [], rowCount: 1 }
       }),
@@ -151,13 +164,37 @@ describe("Turn recovery scanner", () => {
     const queue = { add: vi.fn().mockRejectedValue(new Error("redis unavailable")) }
     await expect(recoverTurnQueue(fake.pool, queue, "owner_2", new Date("2026-09-01T00:00:00.000Z"))).rejects.toThrow("redis unavailable")
     expect(fake.calls.some(([sql]) => sql.includes('INSERT INTO "agent_outbox"'))).toBe(true)
-    const queuedDispatchScan = fake.calls.find(([sql]) => sql.includes('FROM "agent_turns" AS turn') && sql.includes("FOR UPDATE OF turn"))?.[0] ?? ""
-    expect(queuedDispatchScan).toMatch(/ORDER BY turn\."createdAt" ASC, turn\."id" ASC\s+LIMIT \$2 FOR UPDATE OF turn SKIP LOCKED/)
+    const queuedDispatchScan = fake.calls.find(([sql]) => sql.includes('FROM "agent_turns" AS turn') && sql.includes('LEFT JOIN "agent_outbox" AS dispatch'))?.[0] ?? ""
+    expect(queuedDispatchScan).toMatch(/ORDER BY turn\."createdAt" ASC, turn\."id" ASC\s+LIMIT \$2 FOR UPDATE OF turn, session SKIP LOCKED/)
+    expect(queuedDispatchScan).toContain('session."status" NOT IN (\'aborted\', \'archived\')')
     expect(queuedDispatchScan).toContain('dispatch."aggregateId" = turn."sessionId"')
     expect(queuedDispatchScan).toContain('dispatch."idempotencyKey" = \'turn-dispatch:\' || turn."id"')
     expect(queuedDispatchScan).not.toContain('dispatch."aggregateId" = turn."id"')
     const dispatchInserts = fake.calls.filter(([sql, params]) => sql.includes('INSERT INTO "agent_outbox"') && params?.[1] === "agent.turn.dispatch")
     expect(dispatchInserts.length).toBeGreaterThan(0)
     expect(dispatchInserts.every(([, params]) => params?.[2] === "session_1")).toBe(true)
+    const guardedDispatchInserts = dispatchInserts.filter(([sql]) => sql.includes("SELECT $1, $2, $3, $4, $5::jsonb"))
+    expect(guardedDispatchInserts.length).toBeGreaterThan(0)
+    expect(guardedDispatchInserts.every(([sql]) => sql.includes('session."id" = $3') && sql.includes('session."status" NOT IN'))).toBe(true)
+  })
+
+  it.each(["aborted", "archived", null] as const)("does not reclaim, repair, or queue a %s session", async (sessionStatus) => {
+    const fake = pool([{ id: "outbox_1", payload: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" } }], sessionStatus)
+    const queue = { add: vi.fn() }
+    const report = await recoverTurnQueue(fake.pool, queue, "owner_1", new Date("2026-09-01T00:00:00.000Z"))
+
+    expect(report).toEqual({ reclaimed: 0, repaired: 0, dispatched: 0 })
+    expect(queue.add).not.toHaveBeenCalled()
+    expect(fake.calls.some(([sql]) => sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
+  })
+
+  it.each(["running", "paused", "waiting_for_user"] as const)("keeps recovery compatible with an open %s session", async (sessionStatus) => {
+    const fake = pool([{ id: "dispatch_1", payload: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" } }], sessionStatus, [{ id: "turn_1", sessionId: "session_1" }])
+    const queue = { add: vi.fn().mockResolvedValue(undefined) }
+    const report = await recoverTurnQueue(fake.pool, queue, "owner_1", new Date("2026-09-01T00:00:00.000Z"))
+
+    expect(report.repaired).toBe(1)
+    expect(report.dispatched).toBe(1)
+    expect(queue.add).toHaveBeenCalledWith("turn", { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, expect.objectContaining({ attempts: 5 }))
   })
 })

@@ -61,15 +61,27 @@ export async function reclaimExpiredTurns(pool: LeasePool, now: Date, limit: num
   return withTransaction(pool, async (client) => {
     const result = await client.query<{ id: string; sessionId: string; leaseVersion: number }>(
       `WITH stale AS (
-         SELECT "id" FROM "agent_turns"
-         WHERE "status" = 'in_progress' AND ("leaseExpiresAt" IS NULL OR "leaseExpiresAt" <= $1)
-         ORDER BY "updatedAt" ASC, "id" ASC LIMIT $2 FOR UPDATE SKIP LOCKED
+         SELECT turn."id"
+         FROM "agent_turns" AS turn
+         JOIN "agent_sessions" AS session
+           ON session."id" = turn."sessionId"
+          AND session."status" NOT IN ('aborted', 'archived')
+         WHERE turn."status" = 'in_progress'
+           AND (turn."leaseExpiresAt" IS NULL OR turn."leaseExpiresAt" <= $1)
+         ORDER BY turn."updatedAt" ASC, turn."id" ASC
+         LIMIT $2 FOR UPDATE OF turn, session SKIP LOCKED
        )
        UPDATE "agent_turns" AS turn
        SET "status" = 'queued', "leaseOwnerId" = NULL, "leaseExpiresAt" = NULL,
            "leaseStartedAt" = NULL, "leaseVersion" = "leaseVersion" + 1,
            "revision" = "revision" + 1, "completedAt" = NULL, "updatedAt" = $1
-       FROM stale WHERE turn."id" = stale."id"
+       FROM stale
+       WHERE turn."id" = stale."id"
+         AND EXISTS (
+           SELECT 1 FROM "agent_sessions" AS session
+           WHERE session."id" = turn."sessionId"
+             AND session."status" NOT IN ('aborted', 'archived')
+         )
        RETURNING turn."id", turn."sessionId", turn."leaseVersion"`,
       [now, limit],
     )
@@ -83,6 +95,16 @@ export async function persistTurnDispatch(
   resetPublished = false,
 ): Promise<void> {
   await withTransaction(pool, async (client) => {
+    if (resetPublished) {
+      const session = await client.query<{ id: string }>(
+        `SELECT session."id" FROM "agent_sessions" AS session
+         WHERE session."id" = $1
+           AND session."status" NOT IN ('aborted', 'archived')
+         FOR UPDATE`,
+        [payload.sessionId],
+      )
+      if (!session.rows[0]) return
+    }
     const conflictClause = resetPublished
       ? `ON CONFLICT ("idempotencyKey") DO UPDATE SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL, "attemptCount" = "agent_outbox"."attemptCount" + 1
          WHERE "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"`
@@ -108,6 +130,9 @@ async function ensureQueuedTurnDispatches(
     const rows = await client.query<StartedTurnRow>(
       `SELECT turn."id", turn."sessionId"
        FROM "agent_turns" AS turn
+       JOIN "agent_sessions" AS session
+         ON session."id" = turn."sessionId"
+        AND session."status" NOT IN ('aborted', 'archived')
        LEFT JOIN "agent_outbox" AS dispatch
          ON dispatch."topic" = $1
         AND dispatch."aggregateId" = turn."sessionId"
@@ -121,22 +146,29 @@ async function ensureQueuedTurnDispatches(
            dispatch."id" IS NULL OR dispatch."publishedAt" IS NOT NULL
          )
        ORDER BY turn."createdAt" ASC, turn."id" ASC
-       LIMIT $2 FOR UPDATE OF turn SKIP LOCKED`,
+       LIMIT $2 FOR UPDATE OF turn, session SKIP LOCKED`,
       [TURN_DISPATCH_TOPIC, limit],
     )
+    let repaired = 0
     for (const row of rows.rows) {
       const payload: TurnJobPayload = { turnId: row.id, sessionId: row.sessionId, ownerId }
-      await client.query(
+      const inserted = await client.query(
         `INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
-         VALUES ($1, $2, $3, $4, $5::jsonb)
+         SELECT $1, $2, $3, $4, $5::jsonb
+         WHERE EXISTS (
+           SELECT 1 FROM "agent_sessions" AS session
+           WHERE session."id" = $3
+             AND session."status" NOT IN ('aborted', 'archived')
+         )
          ON CONFLICT ("idempotencyKey") DO UPDATE
          SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL,
              "attemptCount" = "agent_outbox"."attemptCount" + 1
          WHERE "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"`,
          [randomUUID(), TURN_DISPATCH_TOPIC, row.sessionId, turnDispatchKey(row.id), payloadJson(payload)],
-      )
+       )
+      repaired += inserted.rowCount ?? 0
     }
-    return rows.rows.length
+    return repaired
   })
 }
 
@@ -148,11 +180,14 @@ export async function dispatchPendingTurnOutbox(
   if (!Number.isInteger(limit) || limit < 1) throw new RangeError("Turn dispatch limit must be positive")
   const rows = await withTransaction(pool, async (client) => {
     const result = await client.query<OutboxRow>(
-      `SELECT "id", "payload", "attemptCount"
-       FROM "agent_outbox"
-       WHERE "topic" = $1 AND "publishedAt" IS NULL
-       ORDER BY "createdAt" ASC, "id" ASC
-       LIMIT $2 FOR UPDATE SKIP LOCKED`,
+      `SELECT dispatch."id", dispatch."payload", dispatch."attemptCount"
+       FROM "agent_outbox" AS dispatch
+       JOIN "agent_sessions" AS session
+         ON session."id" = dispatch."aggregateId"
+        AND session."status" NOT IN ('aborted', 'archived')
+       WHERE dispatch."topic" = $1 AND dispatch."publishedAt" IS NULL
+       ORDER BY dispatch."createdAt" ASC, dispatch."id" ASC
+       LIMIT $2 FOR UPDATE OF dispatch, session SKIP LOCKED`,
       [TURN_DISPATCH_TOPIC, limit],
     )
     return result.rows
