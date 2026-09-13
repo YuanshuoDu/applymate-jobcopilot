@@ -3,6 +3,8 @@ import type pg from "pg"
 
 import type {
   CoordinationActivity,
+  CoordinationMailboxConsumeResult,
+  CoordinationMailboxMessage,
   CoordinationMessage,
   CoordinationStore,
   CoordinationTaskView,
@@ -16,6 +18,8 @@ const TASK_COLUMNS = `task."id", session."userId" AS "userId", task."sessionId",
   task."parentTaskId", task."path", task."depth", task."role", task."taskType", task."status", task."goal",
   task."attemptCount", task."maxAttempts", task."leaseOwner", task."leaseExpiresAt", task."interruptRequestedAt"`
 const TERMINAL = ["completed", "failed", "interrupted", "cancelled", "closed"]
+const DEFAULT_MAILBOX_READ_LIMIT = 50
+const MAX_MAILBOX_READ_LIMIT = 100
 
 export class PgCoordinationStore implements CoordinationStore {
   constructor(private readonly pool: PoolLike) {}
@@ -44,6 +48,45 @@ export class PgCoordinationStore implements CoordinationStore {
         ORDER BY task."path" ASC, task."createdAt" ASC, task."id" ASC LIMIT 50`, params)
       return result.rows.map(row => taskRow(row as Record<string, unknown>))
     } finally { client.release() }
+  }
+
+  async listPendingMessages(input: { userId: string; sessionId: string; toTaskId: string; limit?: number }): Promise<CoordinationMailboxMessage[]> {
+    const limit = mailboxReadLimit(input.limit)
+    return transaction(this.pool, input.userId, async client => {
+      await requireSession(client, input)
+      await requireTask(client, input.userId, input.sessionId, input.toTaskId, "Target task is unavailable")
+      const result = await client.query(`SELECT message."id", message."sessionId", message."turnId", message."fromTaskId", message."toTaskId",
+        message."kind", message."payload", message."idempotencyKey", message."createdAt", message."deliveredAt", message."consumedAt"
+        FROM "agent_mailbox_messages" AS message
+        JOIN "agent_sessions" AS session ON session."id" = message."sessionId"
+        JOIN "sub_agent_tasks" AS target ON target."id" = message."toTaskId" AND target."sessionId" = message."sessionId"
+        WHERE message."sessionId" = $1 AND session."userId" = $2 AND message."toTaskId" = $3
+          AND target."id" = $3 AND target."sessionId" = $1 AND message."consumedAt" IS NULL
+        ORDER BY message."createdAt" ASC, message."id" ASC LIMIT $4`,
+      [input.sessionId, input.userId, input.toTaskId, limit])
+      return result.rows.map(row => mailboxMessageRow(row as Record<string, unknown>))
+    })
+  }
+
+  async consumeMessages(input: { userId: string; sessionId: string; toTaskId: string; messageIds: readonly string[] }): Promise<CoordinationMailboxConsumeResult> {
+    const messageIds = uniqueMessageIds(input.messageIds)
+    return transaction(this.pool, input.userId, async client => {
+      await requireSession(client, input)
+      await requireTask(client, input.userId, input.sessionId, input.toTaskId, "Target task is unavailable")
+      if (messageIds.length === 0) return { messageIds: [], count: 0 }
+      const result = await client.query(`UPDATE "agent_mailbox_messages" AS message
+        SET "consumedAt" = CURRENT_TIMESTAMP
+        WHERE message."sessionId" = $1 AND message."toTaskId" = $3 AND message."id" = ANY($4::text[])
+          AND message."consumedAt" IS NULL
+          AND EXISTS (SELECT 1 FROM "agent_sessions" AS session
+            WHERE session."id" = message."sessionId" AND session."userId" = $2
+              AND session."status" NOT IN ('aborted', 'archived'))
+          AND EXISTS (SELECT 1 FROM "sub_agent_tasks" AS target
+            WHERE target."id" = message."toTaskId" AND target."sessionId" = message."sessionId")
+        RETURNING message."id"`, [input.sessionId, input.userId, input.toTaskId, messageIds])
+      const consumedIds = result.rows.map(row => String(row.id))
+      return { messageIds: orderMessageIds(messageIds, consumedIds), count: consumedIds.length }
+    })
   }
 
   async sendMessage(input: {
@@ -155,6 +198,19 @@ function taskRow(row: Record<string, unknown>): CoordinationTaskView {
   return { id: String(row.id), userId: String(row.userId), sessionId: String(row.sessionId), turnId: row.turnId ? String(row.turnId) : null, rootTaskId: String(row.rootTaskId ?? row.id), parentTaskId: row.parentTaskId ? String(row.parentTaskId) : null, path: String(row.path), depth: Number(row.depth), role: String(row.role), taskType: String(row.taskType), status: String(row.status) as CoordinationTaskView["status"], goal: String(row.goal), attemptCount: Number(row.attemptCount), maxAttempts: Number(row.maxAttempts), leaseOwner: row.leaseOwner ? String(row.leaseOwner) : null, leaseExpiresAt: row.leaseExpiresAt instanceof Date ? row.leaseExpiresAt : row.leaseExpiresAt ? new Date(String(row.leaseExpiresAt)) : null, interruptRequestedAt: row.interruptRequestedAt instanceof Date ? row.interruptRequestedAt : row.interruptRequestedAt ? new Date(String(row.interruptRequestedAt)) : null }
 }
 function messageRow(row: Record<string, unknown>): CoordinationMessage { return { id: String(row.id), sessionId: String(row.sessionId), turnId: String(row.turnId), fromTaskId: row.fromTaskId ? String(row.fromTaskId) : null, toTaskId: String(row.toTaskId), kind: String(row.kind), idempotencyKey: String(row.idempotencyKey), createdAt: row.createdAt instanceof Date ? row.createdAt : new Date(String(row.createdAt)) } }
+function mailboxMessageRow(row: Record<string, unknown>): CoordinationMailboxMessage {
+  return { ...messageRow(row), payload: row.payload, deliveredAt: nullableDate(row.deliveredAt), consumedAt: nullableDate(row.consumedAt) }
+}
+function nullableDate(value: unknown): Date | null { return value == null ? null : value instanceof Date ? value : new Date(String(value)) }
+function mailboxReadLimit(value: number | undefined): number {
+  if (value === undefined || Number.isNaN(value)) return DEFAULT_MAILBOX_READ_LIMIT
+  return Math.min(MAX_MAILBOX_READ_LIMIT, Math.max(0, Math.floor(value)))
+}
+function uniqueMessageIds(ids: readonly string[]): string[] { return [...new Set(ids.filter(id => typeof id === "string" && id.length > 0))] }
+function orderMessageIds(requested: readonly string[], confirmed: readonly string[]): string[] {
+  const confirmedSet = new Set(confirmed)
+  return requested.filter(id => confirmedSet.has(id))
+}
 function json(value: unknown): string { return JSON.stringify(value ?? null) }
 function stableJson(value: unknown): string { if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`; if (value && typeof value === "object") return `{${Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, child]) => `${JSON.stringify(key)}:${stableJson(child)}`).join(",")}}`; return JSON.stringify(value) ?? "null" }
 function spawnKey(sessionId: string, key: string): string { return `coordination-spawn:${sessionId}:${key}` }

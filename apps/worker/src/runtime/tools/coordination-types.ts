@@ -19,6 +19,18 @@ export type CoordinationMessage = {
   readonly createdAt: Date
 }
 
+/** Durable mailbox state returned by the server-owned pending-read seam. */
+export type CoordinationMailboxMessage = CoordinationMessage & {
+  readonly payload: unknown
+  readonly deliveredAt: Date | null
+  readonly consumedAt: Date | null
+}
+
+export type CoordinationMailboxConsumeResult = {
+  readonly messageIds: readonly string[]
+  readonly count: number
+}
+
 export interface CoordinationStore {
   getTask(input: { userId: string; sessionId: string; taskId: string }): Promise<CoordinationTaskView | null>
   listTasks(input: { userId: string; sessionId: string; rootTaskId?: string; includeTerminal: boolean }): Promise<CoordinationTaskView[]>
@@ -32,6 +44,19 @@ export interface CoordinationStore {
     payload: unknown
     idempotencyKey: string
   }): Promise<{ message: CoordinationMessage; duplicate: boolean }>
+  /** Optional server-owned mailbox read/consume seam for durable child-context wiring. */
+  listPendingMessages?(input: {
+    userId: string
+    sessionId: string
+    toTaskId: string
+    limit?: number
+  }): Promise<CoordinationMailboxMessage[]>
+  consumeMessages?(input: {
+    userId: string
+    sessionId: string
+    toTaskId: string
+    messageIds: readonly string[]
+  }): Promise<CoordinationMailboxConsumeResult>
   getSpawnReplay(input: { userId: string; sessionId: string; idempotencyKey: string }): Promise<CoordinationTaskView | null>
   /** Records the operation and dispatches the task atomically. */
   recordSpawn(input: { userId: string; sessionId: string; idempotencyKey: string; task: CoordinationTaskView }): Promise<boolean>
