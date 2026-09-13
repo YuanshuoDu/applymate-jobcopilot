@@ -1702,3 +1702,13 @@ A blocked or raced claim continues to surface only the recoverable `TurnLeaseErr
 **Independent verification:** Root independently verified the focused pg-store suite at **27/27**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, real cross-process concurrency, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 49. P4-19 — Subagent shutdown release session fence
+
+**Candidate status/date (2026-09-13):** P4-19 is recorded as a candidate shutdown lease-release safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, and candidate slices do not count as accepted progress.
+
+**Implementation:** Commit `b5a57db9` adds an `agent_sessions` state fence to the conditional `release` UPDATE used during Worker shutdown. The task is returned to `queued` only when the existing task, session, owner, attempt, and interrupt conditions still match and the linked session status is not `aborted` or `archived`. A closed-session release returns `false`, so it does not reset the durable outbox row for republish; normal running, paused, waiting-for-user, and ordinary user/system session behavior remains compatible.
+
+**Independent verification:** Root independently verified the focused pg-store suite at **29/29**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real cross-process concurrency and shutdown races, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
