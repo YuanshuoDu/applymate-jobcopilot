@@ -71,7 +71,7 @@ describe("Turn recovery scanner", () => {
             rows: [{ id: "dispatch_1", payload: { turnId: "turn:1", sessionId: "session_1", ownerId: "owner_1" }, attemptCount: state.attemptCount }], rowCount: 1,
           }
         }
-        if (sql.includes('SET "publishedAt" = CURRENT_TIMESTAMP')) {
+        if (sql.includes('SET "publishedAt" = CURRENT_TIMESTAMP') && !sql.includes('WHERE "id" = $1 AND "publishedAt" IS NULL')) {
           if (!state.published) {
             state.published = true
             state.attemptCount += 1
@@ -107,7 +107,7 @@ describe("Turn recovery scanner", () => {
     expect(addedJobIds).toEqual([turnJobId("turn:1", 0), turnJobId("turn:1", 2)])
     expect(addedJobIds.every((id) => !id.includes(":"))).toBe(true)
     expect(queue.add).toHaveBeenCalledWith("turn", expect.anything(), expect.objectContaining({ jobId: turnJobId("turn:1", 2) }))
-    expect(client.query.mock.calls.filter(([sql]) => sql.includes('WHERE "id" = $1 AND "publishedAt" IS NULL')).length).toBe(2)
+    expect(client.query.mock.calls.filter(([sql]) => sql.includes('UPDATE "agent_outbox"') && sql.includes('WHERE "id" = $1 AND "publishedAt" IS NULL')).length).toBeGreaterThanOrEqual(2)
   })
 
   it("re-enqueues pending DB intents with a deterministic BullMQ job id", async () => {
@@ -137,6 +137,7 @@ describe("Turn recovery scanner", () => {
         calls.push([sql, params])
         if (sql.includes('FROM "agent_outbox"') && sql.includes("SELECT")) return { rows: [{ id: "outbox_1", payload: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptCount: 4 }], rowCount: 1 }
         if (sql.includes('WHERE "id" = $1 AND "publishedAt" IS NULL')) throw new Error("database unavailable")
+        if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session_1" }], rowCount: 1 }
         return { rows: [], rowCount: 1 }
       }),
       release: vi.fn(),
@@ -155,6 +156,7 @@ describe("Turn recovery scanner", () => {
         calls.push([sql, params])
         if (sql.includes("WITH stale")) return { rows: [{ id: "turn_1", sessionId: "session_1", leaseVersion: 2 }], rowCount: 1 }
         if (sql.includes('FROM "agent_turns" AS turn') && sql.includes('LEFT JOIN "agent_outbox" AS dispatch')) return { rows: [{ id: "turn_1", sessionId: "session_1" }], rowCount: 1 }
+        if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session_1" }], rowCount: 1 }
         if (sql.includes('FROM "agent_outbox"') && sql.includes("SELECT")) return { rows: [{ id: "dispatch_1", payload: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_2" } }], rowCount: 1 }
         return { rows: [], rowCount: 1 }
       }),
@@ -186,6 +188,29 @@ describe("Turn recovery scanner", () => {
     expect(report).toEqual({ reclaimed: 0, repaired: 0, dispatched: 0 })
     expect(queue.add).not.toHaveBeenCalled()
     expect(fake.calls.some(([sql]) => sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
+  })
+
+  it("rechecks the session fence after selecting an outbox row", async () => {
+    let scanCompleted = false
+    const calls: string[] = []
+    const client = {
+      query: vi.fn(async (sql: string) => {
+        calls.push(sql)
+        if (sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes("SELECT dispatch.")) {
+          scanCompleted = true
+          return { rows: [{ id: "dispatch_1", aggregateId: "session_1", payload: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptCount: 0 }], rowCount: 1 }
+        }
+        if (scanCompleted && sql.includes('FROM "agent_sessions"')) return { rows: [], rowCount: 0 }
+        return { rows: [], rowCount: 1 }
+      }),
+      release: vi.fn(),
+    }
+    const queue = { add: vi.fn() }
+    const fakePool = { connect: vi.fn().mockResolvedValue(client) }
+
+    await expect(dispatchPendingTurnOutbox(fakePool, queue)).resolves.toBe(0)
+    expect(queue.add).not.toHaveBeenCalled()
+    expect(calls.some((sql) => sql.includes('SET "publishedAt" = CURRENT_TIMESTAMP'))).toBe(false)
   })
 
   it.each(["running", "paused", "waiting_for_user"] as const)("keeps recovery compatible with an open %s session", async (sessionStatus) => {

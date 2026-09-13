@@ -18,7 +18,7 @@ export type TurnDispatchQueue = {
   add(name: string, payload: TurnJobPayload, options?: { jobId?: string; attempts?: number }): Promise<unknown>
 }
 
-type OutboxRow = { id: string; payload: unknown; attemptCount?: number }
+type OutboxRow = { id: string; aggregateId?: string; payload: unknown; attemptCount?: number }
 type StartedTurnRow = { id: string; sessionId: string }
 type ReclaimedTurn = { turnId: string; sessionId: string; previousLeaseVersion: number }
 
@@ -180,7 +180,7 @@ export async function dispatchPendingTurnOutbox(
   if (!Number.isInteger(limit) || limit < 1) throw new RangeError("Turn dispatch limit must be positive")
   const rows = await withTransaction(pool, async (client) => {
     const result = await client.query<OutboxRow>(
-      `SELECT dispatch."id", dispatch."payload", dispatch."attemptCount"
+      `SELECT dispatch."id", dispatch."aggregateId", dispatch."payload", dispatch."attemptCount"
        FROM "agent_outbox" AS dispatch
        JOIN "agent_sessions" AS session
          ON session."id" = dispatch."aggregateId"
@@ -200,37 +200,62 @@ export async function dispatchPendingTurnOutbox(
       await markDispatchError(pool, row.id, "schema_invalid_payload", true)
       continue
     }
+    const sessionId = row.aggregateId ?? payload.sessionId
+    let queueAddStarted = false
+    let queueAddFailed = false
+    let queueAddFailure: unknown
     try {
-      await queue.add("turn", payload, { jobId: turnJobId(payload.turnId, row.attemptCount ?? 0), attempts: 5 })
+      const published = await withTransaction(pool, async (client) => {
+        // Keep the session fence held across queue.add and the publish mark. A
+        // close racing this transaction either waits for delivery to commit
+        // or wins first and makes the row ineligible without queueing.
+        const session = await client.query<{ id: string }>(
+          `SELECT session."id" FROM "agent_sessions" AS session
+           WHERE session."id" = $1
+             AND session."status" NOT IN ('aborted', 'archived')
+           FOR UPDATE`,
+          [sessionId],
+        )
+        if (!session.rows[0]) return false
+        const pending = await client.query<{ id: string }>(
+          `SELECT dispatch."id" FROM "agent_outbox" AS dispatch
+           WHERE dispatch."id" = $1 AND dispatch."aggregateId" = $2
+             AND dispatch."topic" = $3 AND dispatch."publishedAt" IS NULL
+           FOR UPDATE`,
+          [row.id, sessionId, TURN_DISPATCH_TOPIC],
+        )
+        if (!pending.rows[0]) return false
+        queueAddStarted = true
+        try {
+          await queue.add("turn", payload, { jobId: turnJobId(payload.turnId, row.attemptCount ?? 0), attempts: 5 })
+        } catch (error: unknown) {
+          queueAddFailed = true
+          queueAddFailure = error
+          throw error
+        }
+        await client.query(
+          `UPDATE "agent_outbox"
+           SET "publishedAt" = CURRENT_TIMESTAMP, "attemptCount" = "attemptCount" + 1, "lastError" = NULL
+           WHERE "id" = $1 AND "publishedAt" IS NULL`,
+          [row.id],
+        )
+        return true
+      })
+      if (!published) continue
     } catch (error: unknown) {
-      await markDispatchError(pool, row.id, "queue_add_failed")
-      throw error
-    }
-    try {
-      await markDispatchPublished(pool, row.id)
-    } catch (error: unknown) {
+      if (queueAddFailed) {
+        await markDispatchError(pool, row.id, "queue_add_failed")
+        throw queueAddFailure ?? error
+      }
       // The BullMQ job may already exist. Keep the row unpublished and reuse
       // the same generation/job ID on the next scan instead of inventing a new
       // delivery attempt for an uncertain enqueue.
-      throw new Error("turn_dispatch_delivery_uncertain", { cause: error })
+      if (queueAddStarted) throw new Error("turn_dispatch_delivery_uncertain", { cause: error })
+      throw error
     }
     dispatched += 1
   }
   return dispatched
-}
-
-async function markDispatchPublished(pool: LeasePool, outboxId: string): Promise<void> {
-  const client = await pool.connect()
-  try {
-    await client.query(
-      `UPDATE "agent_outbox"
-       SET "publishedAt" = CURRENT_TIMESTAMP, "attemptCount" = "attemptCount" + 1, "lastError" = NULL
-       WHERE "id" = $1 AND "publishedAt" IS NULL`,
-      [outboxId],
-    )
-  } finally {
-    client.release()
-  }
 }
 
 async function markDispatchError(pool: LeasePool, outboxId: string, code: string, terminal = false): Promise<void> {
