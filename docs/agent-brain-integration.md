@@ -563,3 +563,11 @@ Root independently verified `turn-engine-store.test.ts` at **11/11**, with the s
 Commit `2705047a` adds a session-first open-state fence to both context snapshot save paths. Each save locks the linked `agent_sessions` row with `FOR UPDATE` before step/turn scope checks or snapshot `INSERT` and memory-summary `UPDATE`. Aborted, archived, missing, or cross-user sessions fail closed before writes, while historical root and descendant reads, including completed, failed, or aborted session records, remain unchanged.
 
 Root independently verified the two focused snapshot suites at **17/17**, with the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passing. Live PostgreSQL/RLS, real concurrency, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E remain unverified. P4-27 remains a candidate and does not establish complete Harness/P4/Phase or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-28 update
+
+Commit `142360dc` adds a session-first fence to durable interrupt persistence and terminal-event append. Each transaction locks the user-owned `agent_sessions` row with `FOR UPDATE`, reads its status, then locks the scoped Turn with `FOR UPDATE` before reading interrupt facts or writing Turn state, session event sequence, events, or outbox rows. Aborted and archived sessions reject new interrupt and terminal writes with rollback and no side effects; existing interrupt facts, interrupted Turns, and interrupted terminal events remain duplicate-idempotent after closure. In-memory persistence and terminal-event behavior remain unchanged.
+
+Root independently verified the focused interrupt persistence and terminal-event suites at **26/26**; `@jobcopilot/shared` build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
+
+Live PostgreSQL/RLS, real concurrent lock races, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E remain unverified. P4-28 remains a candidate and does not establish complete Harness/P4/Phase or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.

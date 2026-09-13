@@ -1785,6 +1785,16 @@ Conditional wait/Turn/outbox mutations fail closed when a session closes during 
 
 **Candidate boundary:** Live PostgreSQL/RLS, real concurrency, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
 
+## 58. P4-28 — Interrupt/terminal session-first fence
+
+**Candidate status/date (2026-09-13):** P4-28 is recorded as a candidate interrupt and terminal-event persistence safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `142360dc` makes durable interrupt persistence and terminal-event append lock the user-owned `agent_sessions` row first with `FOR UPDATE`, read its status, and then lock the scoped Turn with `FOR UPDATE`. Aborted or archived sessions fail closed for new interrupt and terminal writes before Turn updates, event-sequence increments, event inserts, or outbox inserts. Existing interrupt facts, interrupted Turns, and interrupted terminal events remain duplicate-idempotent after session closure. In-memory persistence and terminal-event behavior remain unchanged.
+
+**Independent verification:** Root independently verified the focused interrupt persistence and terminal-event suites at **26/26**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrent lock races, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
 ## 52. P4-22 — Wakeup resume session-state fence
 
 **Candidate status/date (2026-09-13):** P4-22 is recorded as a candidate wakeup resume safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
