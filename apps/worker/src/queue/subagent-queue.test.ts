@@ -9,18 +9,34 @@ import type { SubagentJobPayload } from "../runtime/subagents/types.js"
 
 const payload: SubagentJobPayload = { taskId: "task-1", sessionId: "session-1", rootTaskId: "root-1", ownerId: "worker-1" }
 
-function fakePool(markError?: Error) {
+type DispatchOptions = { sessionStatus?: string | null; aggregateId?: string; payload?: unknown; sessionMissingAfterScan?: boolean; outboxMissingAfterScan?: boolean; attemptCount?: number }
+
+function fakePool(markError?: Error, options: DispatchOptions = {}) {
   const calls: Array<[string, unknown[]?]> = []
+  const outbox = { id: "outbox-1", aggregateId: options.aggregateId ?? "session-1", payload: options.payload ?? payload, publishedAt: null as Date | null, attemptCount: options.attemptCount ?? 0 }
+  let scanCompleted = false
   const client = {
     query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push([sql, params])
-      if (sql.includes('SELECT "id", "payload", "attemptCount"') && sql.includes('FROM "agent_outbox"')) return { rows: [{ id: "outbox-1", payload, attemptCount: 0 }], rowCount: 1 }
-      if (markError && sql.startsWith('UPDATE "agent_outbox"')) throw markError
+      if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") return { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes("ORDER BY dispatch.")) {
+        scanCompleted = true
+        const status = options.sessionStatus === undefined ? "running" : options.sessionStatus
+        return status && status !== "aborted" && status !== "archived" ? { rows: [outbox], rowCount: 1 } : { rows: [], rowCount: 0 }
+      }
+      if (sql.includes('SELECT session."id"') && sql.includes('FROM "agent_sessions" AS session')) {
+        const status = options.sessionStatus === undefined ? "running" : options.sessionStatus
+        return scanCompleted && (options.sessionMissingAfterScan || status === "aborted" || status === "archived") ? { rows: [], rowCount: 0 } : { rows: [{ id: outbox.aggregateId }], rowCount: 1 }
+      }
+      if (sql.includes('SELECT dispatch."id"') && sql.includes('FROM "agent_outbox" AS dispatch')) {
+        return options.outboxMissingAfterScan ? { rows: [], rowCount: 0 } : { rows: [{ id: outbox.id }], rowCount: 1 }
+      }
+      if (markError && sql.includes('SET "publishedAt" = CURRENT_TIMESTAMP')) throw markError
       return { rows: [], rowCount: 1 }
     }),
     release: vi.fn(),
   }
-  return { pool: { connect: vi.fn().mockResolvedValue(client) } as unknown as pg.Pool, calls }
+  return { pool: { connect: vi.fn().mockResolvedValue(client) } as unknown as pg.Pool, calls, outbox }
 }
 
 type RepairOutbox = { id: string; sessionId: string; key: string; payload: SubagentJobPayload; publishedAt: Date | null; lastError: string | null }
@@ -56,16 +72,27 @@ function repairPool(options: RepairOptions = {}) {
         const rows = candidate && eligibleCandidate(candidate) && (options.respectExisting === false || !exists) ? [candidate] : []
         return { rows, rowCount: rows.length }
       }
+      if (sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes("ORDER BY dispatch.")) {
+        const sessionStatus = candidate?.sessionStatus ?? "running"
+        const row = outbox.find(item => item.publishedAt === null)
+        return row && sessionStatus !== "aborted" && sessionStatus !== "archived" ? {
+          rows: [{ id: row.id, aggregateId: row.sessionId, payload: row.payload, attemptCount: 0 }], rowCount: 1,
+        } : { rows: [], rowCount: 0 }
+      }
+      if (sql.includes('SELECT session."id"') && sql.includes('FROM "agent_sessions" AS session')) {
+        const sessionStatus = candidate?.sessionStatus ?? "running"
+        return sessionStatus !== "aborted" && sessionStatus !== "archived" ? { rows: [{ id: outbox[0]?.sessionId ?? "session-1" }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      }
+      if (sql.includes('SELECT dispatch."id"') && sql.includes('FROM "agent_outbox" AS dispatch')) {
+        const row = outbox.find(item => item.publishedAt === null)
+        return row ? { rows: [{ id: row.id }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      }
       if (sql.startsWith('INSERT INTO "agent_outbox"')) {
         if (options.failInsert) throw options.failInsert
         const key = String(params?.[3])
         if (outbox.some(row => row.key === key)) return { rows: [], rowCount: 0 }
         outbox.push({ id: String(params?.[0]), sessionId: String(params?.[2]), key, payload: JSON.parse(String(params?.[4])) as SubagentJobPayload, publishedAt: null, lastError: null })
         return { rows: [], rowCount: 1 }
-      }
-      if (sql.includes('SELECT "id", "payload", "attemptCount"') && sql.includes('FROM "agent_outbox"')) {
-        const pending = outbox.filter(row => row.publishedAt === null)
-        return { rows: pending.map(row => ({ id: row.id, payload: row.payload, attemptCount: 0 })), rowCount: pending.length }
       }
       if (sql.includes('SET "publishedAt" = CURRENT_TIMESTAMP')) {
         const row = outbox.find(item => item.id === String(params?.[0])); if (row) row.publishedAt = new Date()
@@ -104,16 +131,59 @@ describe("Subagent queue", () => {
     const queue = { add: vi.fn().mockResolvedValue(undefined) }
     await expect(dispatchPendingSubagentOutbox(fake.pool, queue)).resolves.toBe(1)
     expect(queue.add).toHaveBeenCalledWith("subagent", payload, { jobId: subagentJobId("task-1", 0), attempts: 3 })
-    expect(fake.calls.find(([sql]) => sql.includes('SELECT "id", "payload", "attemptCount"'))?.[0]).toContain("LIMIT $2 FOR UPDATE SKIP LOCKED")
-    const mark = fake.calls.find(([sql]) => sql.startsWith("UPDATE"))
+    const scan = fake.calls.find(([sql]) => sql.includes('SELECT dispatch."id"') && sql.includes("ORDER BY dispatch."))
+    expect(scan?.[0]).toMatch(/ORDER BY dispatch\."createdAt" ASC, dispatch\."id" ASC\s+LIMIT \$2 FOR UPDATE OF dispatch, session SKIP LOCKED/)
+    expect(scan?.[0]).toContain('session."id" = dispatch."aggregateId"')
+    const sessionLock = fake.calls.findIndex(([sql]) => sql.includes('SELECT session."id"') && sql.includes("FOR UPDATE"))
+    const outboxLock = fake.calls.findIndex(([sql]) => sql.includes('SELECT dispatch."id"') && sql.includes('WHERE dispatch."id"'))
+    expect(sessionLock).toBeGreaterThan(-1)
+    expect(sessionLock).toBeLessThan(outboxLock)
+    const mark = fake.calls.find(([sql]) => sql.includes('SET "publishedAt" = CURRENT_TIMESTAMP'))
     expect(mark?.[0]).toContain('"publishedAt"')
+  })
+
+  it.each(["aborted", "archived", null] as const)("does not queue a %s session", async sessionStatus => {
+    const fake = fakePool(undefined, { sessionStatus })
+    const queue = { add: vi.fn() }
+    await expect(dispatchPendingSubagentOutbox(fake.pool, queue)).resolves.toBe(0)
+    expect(queue.add).not.toHaveBeenCalled()
+  })
+
+  it.each(["running", "paused", "waiting_for_user"] as const)("queues an open %s session", async sessionStatus => {
+    const fake = fakePool(undefined, { sessionStatus })
+    const queue = { add: vi.fn().mockResolvedValue(undefined) }
+    await expect(dispatchPendingSubagentOutbox(fake.pool, queue)).resolves.toBe(1)
+    expect(queue.add).toHaveBeenCalledTimes(1)
+  })
+
+  it("rechecks the session fence after selecting an outbox row", async () => {
+    const fake = fakePool(undefined, { sessionMissingAfterScan: true })
+    const queue = { add: vi.fn() }
+    await expect(dispatchPendingSubagentOutbox(fake.pool, queue)).resolves.toBe(0)
+    expect(queue.add).not.toHaveBeenCalled()
+    expect(fake.calls.some(([sql]) => sql.includes('SET "publishedAt" = CURRENT_TIMESTAMP'))).toBe(false)
+  })
+
+  it("skips an outbox row already handled after the scan", async () => {
+    const fake = fakePool(undefined, { outboxMissingAfterScan: true })
+    const queue = { add: vi.fn() }
+    await expect(dispatchPendingSubagentOutbox(fake.pool, queue)).resolves.toBe(0)
+    expect(queue.add).not.toHaveBeenCalled()
+  })
+
+  it("fails closed when payload session does not match the outbox aggregate", async () => {
+    const fake = fakePool(undefined, { payload: { ...payload, sessionId: "other-session" } })
+    const queue = { add: vi.fn() }
+    await expect(dispatchPendingSubagentOutbox(fake.pool, queue)).resolves.toBe(0)
+    expect(queue.add).not.toHaveBeenCalled()
+    expect(fake.calls.some(([sql, params]) => sql.includes('SET "attemptCount" = "attemptCount" + 1') && params?.[1] === "schema_invalid_payload")).toBe(true)
   })
 
   it("records queue_add_failed and preserves an unpublished row when Redis enqueue fails", async () => {
     const fake = fakePool()
     const queue = { add: vi.fn().mockRejectedValue(new Error("redis unavailable")) }
     await expect(dispatchPendingSubagentOutbox(fake.pool, queue)).rejects.toThrow("redis unavailable")
-    const mark = fake.calls.find(([sql]) => sql.startsWith("UPDATE"))
+    const mark = fake.calls.find(([sql]) => sql.includes('SET "attemptCount" = "attemptCount" + 1'))
     expect(mark?.[0]).toContain('"publishedAt" = CASE WHEN $3 THEN CURRENT_TIMESTAMP ELSE "publishedAt" END')
     expect(mark?.[1]).toEqual(["outbox-1", "queue_add_failed", false])
   })
@@ -128,13 +198,8 @@ describe("Subagent queue", () => {
   it("encodes task IDs and advances the generation after a recovered delivery", async () => {
     expect(subagentJobId("task:with spaces", 4)).toBe("agent-subagent-dGFzazp3aXRoIHNwYWNlcw-4")
     expect(subagentJobId("task:with spaces", 4)).not.toContain(":")
-    const fake = fakePool()
+    const fake = fakePool(undefined, { attemptCount: 2 })
     const queue = { add: vi.fn().mockResolvedValue(undefined) }
-    const client = fake.pool.connect as ReturnType<typeof vi.fn>
-    client.mockImplementation(async () => ({
-      query: vi.fn(async (sql: string) => sql.includes('FROM "agent_outbox"') ? { rows: [{ id: "outbox-1", payload, attemptCount: 2 }], rowCount: 1 } : { rows: [], rowCount: 1 }),
-      release: vi.fn(),
-    }))
     await dispatchPendingSubagentOutbox(fake.pool, queue)
     expect(queue.add).toHaveBeenCalledWith("subagent", payload, { jobId: subagentJobId("task-1", 2), attempts: 3 })
   })
@@ -195,7 +260,7 @@ describe("Subagent queue", () => {
     const manager = { recover: vi.fn().mockResolvedValue({ rows: [], reclaimed: 0, terminal: 0 }) } as unknown as AgentTreeManager
     await expect(recoverSubagentQueue(fake.pool, queue, manager, 1)).resolves.toMatchObject({ reclaimed: 0, terminal: 0, repaired: 1, dispatched: 1 })
     const repairIndex = fake.calls.findIndex(([sql]) => sql.includes('FROM "sub_agent_tasks" AS task'))
-    const dispatchIndex = fake.calls.findIndex(([sql]) => sql.includes('SELECT "id", "payload", "attemptCount"'))
+    const dispatchIndex = fake.calls.findIndex(([sql]) => sql.includes('SELECT dispatch."id"') && sql.includes("ORDER BY dispatch."))
     expect(repairIndex).toBeGreaterThan(-1)
     expect(repairIndex).toBeLessThan(dispatchIndex)
     expect(queue.add).toHaveBeenCalledTimes(1)

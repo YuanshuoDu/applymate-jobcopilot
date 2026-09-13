@@ -122,40 +122,65 @@ export async function repairMissingSubagentDispatches(pool: PgSubagentPool, owne
 export async function dispatchPendingSubagentOutbox(pool: PgSubagentPool, queue: SubagentQueueLike, limit = SUBAGENT_MAX_BATCH): Promise<number> {
   if (!Number.isInteger(limit) || limit < 1) throw new RangeError("Subagent dispatch limit must be positive")
   const rows = await transaction(pool, async client => {
-    const result = await client.query<{ id: string; payload: unknown; attemptCount?: number }>(`SELECT "id", "payload", "attemptCount" FROM "agent_outbox"
-      WHERE "topic" = $1 AND "publishedAt" IS NULL ORDER BY "createdAt" ASC, "id" ASC LIMIT $2 FOR UPDATE SKIP LOCKED`, [SUBAGENT_DISPATCH_TOPIC, limit])
+    const result = await client.query<{ id: string; aggregateId: string; payload: unknown; attemptCount?: number }>(`SELECT dispatch."id", dispatch."aggregateId", dispatch."payload", dispatch."attemptCount"
+      FROM "agent_outbox" AS dispatch
+      JOIN "agent_sessions" AS session
+        ON session."id" = dispatch."aggregateId"
+       AND session."status" NOT IN ('aborted', 'archived')
+      WHERE dispatch."topic" = $1 AND dispatch."publishedAt" IS NULL
+      ORDER BY dispatch."createdAt" ASC, dispatch."id" ASC
+      LIMIT $2 FOR UPDATE OF dispatch, session SKIP LOCKED`, [SUBAGENT_DISPATCH_TOPIC, limit])
     return result.rows
   })
   let dispatched = 0
   for (const row of rows) {
     const payload = parseSubagentJobPayload(row.payload)
-    if (!payload) {
+    if (!payload || payload.sessionId !== row.aggregateId) {
       await markDispatchError(pool, row.id, "schema_invalid_payload", true)
       continue
     }
+    let queueAddStarted = false
+    let queueAddFailed = false
+    let queueAddFailure: unknown
     try {
-      await enqueueSubagentTask(queue, payload, 3, row.attemptCount ?? 0)
+      const published = await transaction(pool, async client => {
+        // Hold the owning session fence across enqueue and publish marking. A
+        // close racing this transaction either waits for delivery or wins first.
+        const session = await client.query<{ id: string }>(`SELECT session."id" FROM "agent_sessions" AS session
+          WHERE session."id" = $1 AND session."status" NOT IN ('aborted', 'archived') FOR UPDATE`, [row.aggregateId])
+        if (!session.rows[0]) return false
+        const pending = await client.query<{ id: string }>(`SELECT dispatch."id" FROM "agent_outbox" AS dispatch
+          WHERE dispatch."id" = $1 AND dispatch."aggregateId" = $2
+            AND dispatch."topic" = $3 AND dispatch."publishedAt" IS NULL FOR UPDATE`,
+        [row.id, row.aggregateId, SUBAGENT_DISPATCH_TOPIC])
+        if (!pending.rows[0]) return false
+        queueAddStarted = true
+        try {
+          await enqueueSubagentTask(queue, payload, 3, row.attemptCount ?? 0)
+        } catch (error: unknown) {
+          queueAddFailed = true
+          queueAddFailure = error
+          throw error
+        }
+        await client.query(`UPDATE "agent_outbox" SET "publishedAt" = CURRENT_TIMESTAMP,
+          "attemptCount" = "attemptCount" + 1, "lastError" = NULL
+          WHERE "id" = $1 AND "aggregateId" = $2 AND "topic" = $3 AND "publishedAt" IS NULL`,
+        [row.id, row.aggregateId, SUBAGENT_DISPATCH_TOPIC])
+        return true
+      })
+      if (!published) continue
     } catch (error: unknown) {
-      await markDispatchError(pool, row.id, "queue_add_failed").catch(() => undefined)
+      if (queueAddFailed) {
+        await markDispatchError(pool, row.id, "queue_add_failed").catch(() => undefined)
+        throw queueAddFailure ?? error
+      }
+      // Delivery is at-least-once; reuse generation/job ID for idempotent retry.
+      if (queueAddStarted) throw Object.assign(new Error("subagent_dispatch_delivery_uncertain", { cause: error }), { code: "subagent_dispatch_delivery_uncertain" })
       throw error
-    }
-    try {
-      await markDispatchPublished(pool, row.id)
-    } catch (error: unknown) {
-      throw Object.assign(new Error("subagent_dispatch_delivery_uncertain", { cause: error }), { code: "subagent_dispatch_delivery_uncertain" })
     }
     dispatched += 1
   }
   return dispatched
-}
-
-async function markDispatchPublished(pool: PgSubagentPool, id: string): Promise<void> {
-  const client = await pool.connect()
-  try {
-    await client.query(`UPDATE "agent_outbox" SET "publishedAt" = CURRENT_TIMESTAMP,
-      "attemptCount" = "attemptCount" + 1, "lastError" = NULL
-      WHERE "id" = $1 AND "publishedAt" IS NULL`, [id])
-  } finally { client.release() }
 }
 
 async function markDispatchError(pool: PgSubagentPool, id: string, error: string, terminal = false): Promise<void> {
