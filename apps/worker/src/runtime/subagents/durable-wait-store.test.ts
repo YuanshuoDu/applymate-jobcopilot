@@ -10,6 +10,7 @@ const base: Parameters<DurableWaitPort["wait"]>[0] = {
   userId: "user-a", sessionId: "session-a", turnId: "turn-a", stepId: "step-a", taskId: "parent-a", rootTaskId: "root-a",
   targetTaskIds: ["child-a", "child-b"], mode: "all", timeoutMs: 10_000, idempotencyKey: "wait-key",
 }
+const SESSION_FENCE = 'session."status" NOT IN (\'aborted\', \'archived\')'
 
 function parent(status = "running"): Row { return { id: "parent-a", rootTaskId: "root-a", turnId: "turn-a", sessionId: "session-a", status, userId: "user-a" } }
 function turn(status = "in_progress"): Row { return { id: "turn-a", sessionId: "session-a", userId: "user-a", rootTaskId: "root-a", status } }
@@ -23,12 +24,17 @@ function waitRow(status: string, matchedTaskIds: readonly string[] = [], options
     targetTaskIds: [...targetTaskIds], mode, status, deadlineAt, matchedTaskIds: [...matchedTaskIds], createdAt,
     result: { request: { targetTaskIds: [...targetTaskIds], mode, timeoutMs: base.timeoutMs } } }
 }
-function fixture(responses: Response[]) {
+function fixture(responses: Response[], options: { sessionStatus?: string } = {}) {
   const calls: Array<{ sql: string; params: readonly unknown[] }> = []
   const client = {
     query: vi.fn(async (sql: string, params: readonly unknown[] = []): Promise<Response> => {
       calls.push({ sql, params })
       if (/^(BEGIN|COMMIT|ROLLBACK)/.test(sql.trim()) || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+      const sessionScopedRead = sql.includes('JOIN "agent_sessions"') || sql.includes('FROM "agent_sessions"') || sql.includes('FROM "agent_wait_conditions"') || sql.includes('FROM "agent_turns"')
+      if ((options.sessionStatus === "aborted" || options.sessionStatus === "archived") && sessionScopedRead) {
+        if (!sql.includes(SESSION_FENCE)) throw new Error("missing session-state fence")
+        return { rows: [], rowCount: 0 }
+      }
       const response = responses.shift()
       if (!response) throw new Error(`Unexpected query: ${sql}`)
       return response
@@ -52,6 +58,7 @@ describe("durable PostgreSQL wait port", () => {
     expect(result).toMatchObject({ waitId: "wait-a", status: "waiting", matchedTaskIds: [] })
     expect(test.calls.some(call => call.sql.includes("set_config('app.user_id'"))).toBe(true)
     expect(test.calls.some(call => call.sql.includes("ON CONFLICT"))).toBe(true)
+    expect(test.calls.some(call => call.sql.includes('session."status" NOT IN (\'aborted\', \'archived\')'))).toBe(true)
     vi.useRealTimers()
   })
 
@@ -75,6 +82,7 @@ describe("durable PostgreSQL wait port", () => {
     const input: DurableWaitResolveInput = { userId: base.userId, sessionId: base.sessionId, waitId: "wait-a", now: new Date(now.getTime() + base.timeoutMs + 1) }
     await expect(createPgDurableWaitPort(test.pool as never).resolve(input)).resolves.toMatchObject({ status: "timed_out", matchedTaskIds: [] })
     expect(test.calls.some(call => call.sql.includes("FOR UPDATE SKIP LOCKED"))).toBe(true)
+    expect(test.calls.find(call => call.sql.includes('UPDATE "agent_wait_conditions"'))?.sql).toContain(SESSION_FENCE)
   })
 
   it("replays the same payload and rejects an idempotency conflict", async () => {
@@ -107,12 +115,49 @@ describe("durable PostgreSQL wait port", () => {
     expect(foreignTest.calls.every(call => !call.sql.includes("UPDATE \"agent_wait_conditions\""))).toBe(true)
   })
 
+  it.each(["aborted", "archived"])("rejects wait creation for a %s session before inserting", async sessionStatus => {
+    const test = fixture([{ rows: [parent()] }], { sessionStatus })
+    await expect(createPgDurableWaitPort(test.pool as never).wait(base)).rejects.toMatchObject({ code: "wait_scope_error" })
+    expect(test.calls.some(call => call.sql.includes('INSERT INTO "agent_wait_conditions"'))).toBe(false)
+    expect(test.calls.find(call => call.sql.includes('JOIN "agent_sessions"'))?.sql).toContain(SESSION_FENCE)
+  })
+
+  it.each(["aborted", "archived"])("returns no resolution for a %s session", async sessionStatus => {
+    const test = fixture([{ rows: [waitRow("waiting")] }, { rows: [waitRow("waiting")] }], { sessionStatus })
+    await expect(createPgDurableWaitPort(test.pool as never).resolve({ userId: base.userId, sessionId: base.sessionId, waitId: "wait-a" })).resolves.toBeNull()
+    expect(test.calls.every(call => !call.sql.includes("UPDATE \"agent_wait_conditions\""))).toBe(true)
+    expect(test.calls.find(call => call.sql.includes('FROM "agent_wait_conditions"'))?.sql).toContain(`'${sessionStatus}'`)
+  })
+
+  it.each(["aborted", "archived"])("rejects cancellation for a %s session without updating waits", async sessionStatus => {
+    const test = fixture([{ rows: [{ id: "parent-a", rootTaskId: "root-a" }] }], { sessionStatus })
+    await expect(createPgDurableWaitPort(test.pool as never).cancel?.({ userId: base.userId, sessionId: base.sessionId, taskId: "parent-a", reason: "interrupted" })).rejects.toMatchObject({ code: "wait_scope_error" })
+    expect(test.calls.every(call => !call.sql.includes("UPDATE \"agent_wait_conditions\""))).toBe(true)
+    expect(test.calls.find(call => call.sql.includes('JOIN "agent_sessions"'))?.sql).toContain(SESSION_FENCE)
+  })
+
+  it.each(["running", "paused", "waiting_for_user"])("keeps %s sessions compatible with wait creation", async sessionStatus => {
+    vi.setSystemTime(now)
+    const row = waitRow("waiting")
+    const test = fixture([...validation(targets(["running", "queued"])), { rows: [] }, inserted(row)], { sessionStatus })
+    await expect(createPgDurableWaitPort(test.pool as never).wait(base)).resolves.toMatchObject({ status: "waiting" })
+    expect(test.calls.some(call => call.sql.includes("INSERT INTO \"agent_wait_conditions\""))).toBe(true)
+    vi.useRealTimers()
+  })
+
+  it("rolls back when the wait insert is fenced and produces no row", async () => {
+    const test = fixture([...validation(targets(["running", "queued"])), { rows: [] }, { rows: [] }, { rows: [] }])
+    await expect(createPgDurableWaitPort(test.pool as never).wait(base)).rejects.toMatchObject({ code: "wait_conflict" })
+    expect(test.calls.some(call => call.sql.includes("ROLLBACK"))).toBe(true)
+  })
+
   it("cancels only waits in the scoped task or its root tree", async () => {
     const test = fixture([{ rows: [{ id: "parent-a", rootTaskId: "root-a" }] }, { rows: [], rowCount: 1 }])
     await expect(createPgDurableWaitPort(test.pool as never).cancel?.({ userId: base.userId, sessionId: base.sessionId, taskId: "parent-a", reason: "interrupted" })).resolves.toBeUndefined()
     const update = test.calls.find(call => call.sql.includes("UPDATE \"agent_wait_conditions\""))
     expect(update?.sql).toContain('"status" IN (\'waiting\', \'ready\')')
     expect(update?.params).toContain("interrupted")
+    expect(update?.sql).toContain(SESSION_FENCE)
 
     const foreign = fixture([{ rows: [] }])
     await expect(createPgDurableWaitPort(foreign.pool as never).cancel?.({ userId: base.userId, sessionId: base.sessionId, taskId: "foreign", reason: "closed" })).rejects.toMatchObject({ code: "wait_scope_error" })

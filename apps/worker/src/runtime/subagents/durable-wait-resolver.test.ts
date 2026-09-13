@@ -3,19 +3,28 @@ import { describe, expect, it, vi } from "vitest"
 import { reconcileDurableWaits, startDurableWaitResolver } from "./durable-wait-resolver.js"
 
 const now = new Date("2026-09-09T12:00:00.000Z")
+const SESSION_FENCE = 'session."status" NOT IN (\'aborted\', \'archived\')'
 
-function fixture(input: { turnStatus?: string; waitStatus?: string; suspended?: boolean; deadline?: Date; targetStatus?: string; targetUser?: string; consumed?: boolean; turnCount?: number }) {
+function fixture(input: { turnStatus?: string; waitStatus?: string; suspended?: boolean; deadline?: Date; targetStatus?: string; targetUser?: string; consumed?: boolean; turnCount?: number; sessionStatus?: string; sessionSource?: string; closeBeforeWake?: boolean; closeBeforeOutbox?: boolean }) {
   const turn = { id: "turn-1", userId: "user-1", sessionId: "session-1", rootTaskId: "root-1", status: input.turnStatus ?? "in_progress", leaseOwnerId: null }
   const wait = { id: "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "root-1", stepId: "step-1", targetTaskIds: ["child-1"], mode: "any", status: input.waitStatus ?? "waiting", deadlineAt: input.deadline ?? new Date("2026-09-09T13:00:00.000Z"), suspendedAt: input.suspended ? now : null, consumedAt: input.consumed ? now : null, matchedTaskIds: [] }
   const secondTurn = { ...turn, id: "turn-2", rootTaskId: "root-2", sessionId: "session-2", userId: "user-2" }
   const secondWait = { ...wait, id: "wait-2", turnId: "turn-2", parentTaskId: "root-2", stepId: "step-2", userId: "user-2", sessionId: "session-2", targetTaskIds: ["child-2"] }
   const turns = input.turnCount === 2 ? [turn, secondTurn] : [turn]
   const waits = input.turnCount === 2 ? [wait, secondWait] : [wait]
-  const state = { turns, waits, targetUser: input.targetUser ?? "user-1", targetStatus: input.targetStatus ?? "completed", waitUpdates: 0, turnUpdates: 0, outboxWrites: 0, outboxPublished: false, conflictResets: 0 }
+  const state = { turns, waits, targetUser: input.targetUser ?? "user-1", targetStatus: input.targetStatus ?? "completed", sessionStatus: input.sessionStatus ?? "running", sessionSource: input.sessionSource ?? "automation", waitUpdates: 0, turnUpdates: 0, outboxWrites: 0, outboxPublished: false, conflictResets: 0 }
+  const calls: string[] = []
   const client = {
     query: async (sql: string, params?: unknown[]) => {
+      calls.push(sql)
       if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 1 }
-      if (sql.includes('FROM "agent_turns"')) return { rows: state.turns.filter(candidate => candidate.status === "in_progress" || candidate.status === "waiting_for_dependency"), rowCount: state.turns.length }
+      if (sql.includes('FROM "agent_turns"')) {
+        if (state.sessionStatus === "aborted" || state.sessionStatus === "archived") {
+          if (!sql.includes(SESSION_FENCE)) throw new Error("missing session-state fence")
+          return { rows: [], rowCount: 0 }
+        }
+        return { rows: state.turns.filter(candidate => candidate.status === "in_progress" || candidate.status === "waiting_for_dependency"), rowCount: state.turns.length }
+      }
       if (sql.includes('FROM "agent_wait_conditions"')) {
         const turnId = String(params?.[2]); const limit = Number(params?.[3])
         return { rows: state.waits.filter(candidate => candidate.turnId === turnId && !candidate.consumedAt && ["waiting", "ready", "timed_out"].includes(candidate.status)).slice(0, limit), rowCount: 1 }
@@ -28,20 +37,24 @@ function fixture(input: { turnStatus?: string; waitStatus?: string; suspended?: 
       if (sql.includes('FROM "agent_steps"')) return { rows: [{ id: "step-1", taskId: "root-1", attempt: 1, status: "waiting_for_tool" }], rowCount: 1 }
       if (sql.includes('UPDATE "agent_wait_conditions"')) {
         const found = state.waits.find(candidate => candidate.id === String(params?.[3]))
-        if (found) { found.status = String(params?.[0]); found.matchedTaskIds = JSON.parse(String(params?.[1])); state.waitUpdates += 1 }
+        if (found) { found.status = String(params?.[0]); found.matchedTaskIds = JSON.parse(String(params?.[1])); state.waitUpdates += 1; if (input.closeBeforeWake) state.sessionStatus = "aborted" }
         return { rows: [], rowCount: found ? 1 : 0 }
       }
       if (sql.includes('UPDATE "agent_turns"')) {
+        if (state.sessionStatus === "aborted" || state.sessionStatus === "archived") { if (!sql.includes(SESSION_FENCE)) throw new Error("missing session-state fence"); return { rows: [], rowCount: 0 } }
         const found = state.turns.find(candidate => candidate.id === String(params?.[0]))
         if (found) { found.status = "queued"; state.turnUpdates += 1 }
         return { rows: [], rowCount: found ? 1 : 0 }
       }
-      if (sql.includes('INSERT INTO "agent_outbox"')) { if (state.outboxPublished && sql.includes("DO UPDATE")) state.conflictResets += 1; state.outboxWrites += 1; state.outboxPublished = false; return { rows: [], rowCount: 1 } }
+      if (sql.includes('INSERT INTO "agent_outbox"')) {
+        if (input.closeBeforeOutbox) { state.sessionStatus = "aborted"; if (!sql.includes(SESSION_FENCE)) throw new Error("missing session-state fence"); return { rows: [], rowCount: 0 } }
+        if (state.outboxPublished && sql.includes("DO UPDATE")) state.conflictResets += 1; state.outboxWrites += 1; state.outboxPublished = false; return { rows: [], rowCount: 1 }
+      }
       return { rows: [], rowCount: 1 }
     },
     release() {},
   }
-  return { pool: { connect: async () => client }, state }
+  return { pool: { connect: async () => client }, state, calls }
 }
 
 describe("durable wait resolver", () => {
@@ -60,6 +73,11 @@ describe("durable wait resolver", () => {
     expect(fake.state.turns[0].status).toBe("queued")
     expect(fake.state.outboxWrites).toBe(1)
     expect(fake.state.conflictResets).toBe(1)
+    expect(fake.state.waitUpdates).toBe(1)
+    expect(fake.state.turnUpdates).toBe(1)
+    expect(fake.calls.some(sql => sql.includes('session."status" NOT IN (\'aborted\', \'archived\')'))).toBe(true)
+    expect(fake.calls.some(sql => sql.includes('INSERT INTO "agent_outbox"') && sql.includes("WHERE EXISTS"))).toBe(true)
+    expect(fake.calls.filter(sql => sql.includes('UPDATE "agent_wait_conditions"') || sql.includes('UPDATE "agent_turns"') || sql.includes('INSERT INTO "agent_outbox"')).every(sql => sql.includes(SESSION_FENCE))).toBe(true)
     await expect(reconcileDurableWaits(fake.pool as never, { now, ownerId: "resolver-1" })).resolves.toEqual({ scanned: 0, resolved: 0, woken: 0 })
     expect(fake.state.outboxWrites).toBe(1)
   })
@@ -79,6 +97,40 @@ describe("durable wait resolver", () => {
     await expect(reconcileDurableWaits(consumed.pool as never, { now })).resolves.toEqual({ scanned: 0, resolved: 0, woken: 0 })
     const queued = fixture({ turnStatus: "queued" })
     await expect(reconcileDurableWaits(queued.pool as never, { now })).resolves.toEqual({ scanned: 0, resolved: 0, woken: 0 })
+  })
+
+  it.each(["aborted", "archived"])("does not scan or wake a %s session", async sessionStatus => {
+    const fake = fixture({ sessionStatus })
+    await expect(reconcileDurableWaits(fake.pool as never, { now })).resolves.toEqual({ scanned: 0, resolved: 0, woken: 0 })
+    expect(fake.state.waitUpdates).toBe(0)
+    expect(fake.state.turnUpdates).toBe(0)
+    expect(fake.state.outboxWrites).toBe(0)
+  })
+
+  it("rolls back a wake when the session closes between wait and Turn updates", async () => {
+    const fake = fixture({ suspended: true, turnStatus: "waiting_for_dependency", closeBeforeWake: true })
+    await expect(reconcileDurableWaits(fake.pool as never, { now })).rejects.toThrow("wait_turn_wake_fenced")
+    expect(fake.state.outboxWrites).toBe(0)
+    expect(fake.calls.some(sql => sql === "ROLLBACK")).toBe(true)
+  })
+
+  it("rolls back the Turn wake when the session closes before outbox dispatch", async () => {
+    const fake = fixture({ suspended: true, turnStatus: "waiting_for_dependency", closeBeforeOutbox: true })
+    await expect(reconcileDurableWaits(fake.pool as never, { now })).rejects.toThrow("wait_session_closed")
+    expect(fake.state.outboxWrites).toBe(0)
+    expect(fake.calls.some(sql => sql === "ROLLBACK")).toBe(true)
+  })
+
+  it.each(["running", "paused", "waiting_for_user"])("keeps %s session resolution compatible", async sessionStatus => {
+    const fake = fixture({ sessionStatus })
+    await expect(reconcileDurableWaits(fake.pool as never, { now })).resolves.toMatchObject({ scanned: 1, resolved: 1 })
+    expect(fake.state.waits[0].status).toBe("ready")
+  })
+
+  it.each(["user", "system"])("keeps ordinary %s session resolution compatible", async sessionSource => {
+    const fake = fixture({ sessionSource })
+    await expect(reconcileDurableWaits(fake.pool as never, { now })).resolves.toMatchObject({ scanned: 1, resolved: 1 })
+    expect(fake.state.waits[0].status).toBe("ready")
   })
 
   it("honors the finite batch and closes an opt-in scanner", async () => {

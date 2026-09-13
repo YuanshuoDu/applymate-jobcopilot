@@ -8,6 +8,7 @@ type Queryable = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
 
 const DISPATCH_TOPIC = "agent.turn.dispatch"
+const OPEN_SESSION = `session."status" NOT IN ('aborted', 'archived')`
 
 export type DurableWaitHandoffInput = {
   readonly lease: TurnLease
@@ -72,19 +73,23 @@ function dispatchKey(turnId: string): string { return `turn-dispatch:${turnId}` 
 async function enqueueDispatch(client: Queryable, input: DurableWaitHandoffInput, turnId: string, sessionId: string, resetPublished = true): Promise<void> {
   if (!resetPublished) {
     const existing = await client.query<Row>(
-      `SELECT "id" FROM "agent_outbox" WHERE "topic" = $1 AND "idempotencyKey" = $2 FOR UPDATE`,
-      [DISPATCH_TOPIC, dispatchKey(turnId)],
+      `SELECT "id" FROM "agent_outbox" WHERE "topic" = $1 AND "idempotencyKey" = $2
+       AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = $3 AND ${OPEN_SESSION}) FOR UPDATE`,
+      [DISPATCH_TOPIC, dispatchKey(turnId), sessionId],
     )
     if (existing.rows[0]) return
   }
   const payload = JSON.stringify({ turnId, sessionId, ownerId: input.lease.ownerId })
-  await client.query(
+  const written = await client.query(
     `INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
-     VALUES ($1, $2, $3, $4, $5::jsonb) ON CONFLICT ("idempotencyKey") DO UPDATE
+     SELECT $1, $2, $3, $4, $5::jsonb
+     WHERE EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = $6 AND ${OPEN_SESSION})
+     ON CONFLICT ("idempotencyKey") DO UPDATE
        SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL,
            "attemptCount" = "agent_outbox"."attemptCount" + 1`,
-    [randomUUID(), DISPATCH_TOPIC, turnId, dispatchKey(turnId), payload],
+    [randomUUID(), DISPATCH_TOPIC, turnId, dispatchKey(turnId), payload, sessionId],
   )
+  if (written.rowCount !== 1) failLease("Session was closed during wait dispatch")
 }
 
 function dateValue(row: Row, key: string): Date | null {
@@ -101,14 +106,16 @@ export async function suspendAndReleaseWait(pool: LeasePool, input: DurableWaitH
       `SELECT turn."id", turn."userId", turn."sessionId", turn."rootTaskId", turn."status",
               turn."leaseOwnerId", turn."leaseVersion", turn."leaseExpiresAt", turn."leaseStartedAt"
        FROM "agent_turns" AS turn
-       WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 FOR UPDATE`,
+       WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3
+         AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = turn."sessionId" AND ${OPEN_SESSION}) FOR UPDATE`,
       [lease.turnId, lease.sessionId, lease.userId],
     )).rows[0], "Turn is unavailable")
     const wait = scope((await client.query<Row>(
       `SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "status",
               "deadlineAt", "matchedTaskIds", "suspendedAt"
        FROM "agent_wait_conditions"
-       WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "turnId" = $4 FOR UPDATE`,
+       WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "turnId" = $4
+         AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_wait_conditions"."sessionId" AND ${OPEN_SESSION}) FOR UPDATE`,
       [input.waitId, lease.userId, lease.sessionId, lease.turnId],
     )).rows[0], "Wait condition is unavailable")
     if (String(turn.id) !== lease.turnId || String(turn.userId) !== lease.userId || String(turn.sessionId) !== lease.sessionId) {
@@ -150,7 +157,8 @@ export async function suspendAndReleaseWait(pool: LeasePool, input: DurableWaitH
     if (waitStatus === "waiting") {
       const suspended = await client.query(
         `UPDATE "agent_wait_conditions" SET "suspendedAt" = COALESCE("suspendedAt", $2), "updatedAt" = $2
-         WHERE "id" = $1 AND "userId" = $3 AND "sessionId" = $4 AND "status" = 'waiting'`,
+         WHERE "id" = $1 AND "userId" = $3 AND "sessionId" = $4 AND "status" = 'waiting'
+           AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_wait_conditions"."sessionId" AND ${OPEN_SESSION})`,
         [input.waitId, now, lease.userId, lease.sessionId],
       )
       if (suspended.rowCount !== 1) throw new DurableWaitHandoffError("wait_scope_error", "Wait changed during handoff")
@@ -159,7 +167,8 @@ export async function suspendAndReleaseWait(pool: LeasePool, input: DurableWaitH
            "leaseExpiresAt" = NULL, "leaseStartedAt" = NULL, "revision" = "revision" + 1,
            "completedAt" = NULL, "updatedAt" = $5
          WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $6 AND "leaseOwnerId" = $3
-           AND "leaseVersion" = $4 AND "status" = 'in_progress' AND "leaseExpiresAt" > $5`,
+           AND "leaseVersion" = $4 AND "status" = 'in_progress' AND "leaseExpiresAt" > $5
+           AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_turns"."sessionId" AND ${OPEN_SESSION})`,
         [lease.turnId, lease.sessionId, lease.ownerId, lease.leaseVersion, now, lease.userId],
       )
       if (released.rowCount !== 1) failLease("Turn lease was fenced during wait handoff")
@@ -167,7 +176,8 @@ export async function suspendAndReleaseWait(pool: LeasePool, input: DurableWaitH
     }
     await client.query(
       `UPDATE "agent_wait_conditions" SET "suspendedAt" = COALESCE("suspendedAt", $2), "updatedAt" = $2
-       WHERE "id" = $1 AND "userId" = $3 AND "sessionId" = $4 AND "status" IN ('ready', 'timed_out') AND "consumedAt" IS NULL`,
+       WHERE "id" = $1 AND "userId" = $3 AND "sessionId" = $4 AND "status" IN ('ready', 'timed_out') AND "consumedAt" IS NULL
+         AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_wait_conditions"."sessionId" AND ${OPEN_SESSION})`,
       [input.waitId, now, lease.userId, lease.sessionId],
     )
     const queued = await client.query(
@@ -175,7 +185,8 @@ export async function suspendAndReleaseWait(pool: LeasePool, input: DurableWaitH
          "leaseExpiresAt" = NULL, "leaseStartedAt" = NULL, "revision" = "revision" + 1,
          "completedAt" = NULL, "updatedAt" = $5
        WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $6 AND "leaseOwnerId" = $3
-         AND "leaseVersion" = $4 AND "status" = 'in_progress' AND "leaseExpiresAt" > $5`,
+         AND "leaseVersion" = $4 AND "status" = 'in_progress' AND "leaseExpiresAt" > $5
+         AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_turns"."sessionId" AND ${OPEN_SESSION})`,
       [lease.turnId, lease.sessionId, lease.ownerId, lease.leaseVersion, now, lease.userId],
     )
     if (queued.rowCount !== 1) failLease("Turn lease was fenced during wait requeue")

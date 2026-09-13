@@ -8,8 +8,9 @@ const lease: TurnLease = {
   leaseStartedAt: new Date("2026-09-09T10:00:00.000Z"), leaseExpiresAt: new Date("2026-09-09T10:01:00.000Z"),
 }
 const now = new Date("2026-09-09T10:00:30.000Z")
+const SESSION_FENCE = 'session."status" NOT IN (\'aborted\', \'archived\')'
 
-function fixture(waitStatus: string, turnStatus = "in_progress", suspendedAt: Date | null = null) {
+function fixture(waitStatus: string, turnStatus = "in_progress", suspendedAt: Date | null = null, sessionStatus = "running", sessionSource = "automation", closeBeforeTurnUpdate = false) {
   const state = {
     wait: { id: "wait-1", userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, parentTaskId: "root-1", stepId: "step-1", status: waitStatus, suspendedAt },
     turn: { id: lease.turnId, userId: lease.userId, sessionId: lease.sessionId, rootTaskId: "root-1", status: turnStatus, leaseOwnerId: turnStatus === "in_progress" ? lease.ownerId : null, leaseVersion: lease.leaseVersion, leaseExpiresAt: turnStatus === "in_progress" ? lease.leaseExpiresAt : null, leaseStartedAt: turnStatus === "in_progress" ? lease.leaseStartedAt : null },
@@ -19,25 +20,39 @@ function fixture(waitStatus: string, turnStatus = "in_progress", suspendedAt: Da
     outboxWrites: 0,
     conflictResets: 0,
     updates: [] as string[],
+    sessionStatus,
+    sessionSource,
+    closeBeforeTurnUpdate,
   }
+  const calls: string[] = []
   const client = {
     query: async (sql: string, params?: unknown[]) => {
+      calls.push(sql)
       if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 1 }
-      if (sql.includes('FROM "agent_turns"')) return { rows: [state.turn], rowCount: 1 }
+      if (sql.includes('FROM "agent_turns"')) {
+        if (state.sessionStatus === "aborted" || state.sessionStatus === "archived") {
+          if (!sql.includes(SESSION_FENCE)) throw new Error("missing session-state fence")
+          return { rows: [], rowCount: 0 }
+        }
+        return { rows: [state.turn], rowCount: 1 }
+      }
       if (sql.includes('FROM "agent_wait_conditions"')) return { rows: [state.wait], rowCount: 1 }
       if (sql.includes('FROM "agent_steps"')) return { rows: [state.step], rowCount: 1 }
       if (sql.includes('FROM "agent_outbox"')) return { rows: state.outbox ? [{ id: "outbox-1" }] : [], rowCount: state.outbox ? 1 : 0 }
       if (sql.includes('UPDATE "agent_wait_conditions"')) {
         state.wait.suspendedAt = params?.[1] as Date
         state.updates.push("wait")
+        if (state.closeBeforeTurnUpdate) state.sessionStatus = "aborted"
         return { rows: [], rowCount: 1 }
       }
       if (sql.includes("SET \"status\" = 'waiting_for_dependency'")) {
+        if (state.sessionStatus === "aborted" || state.sessionStatus === "archived") { if (!sql.includes(SESSION_FENCE)) throw new Error("missing session-state fence"); return { rows: [], rowCount: 0 } }
         state.turn.status = "waiting_for_dependency"; state.turn.leaseOwnerId = null; state.turn.leaseExpiresAt = null
         state.updates.push("suspend")
         return { rows: [], rowCount: 1 }
       }
       if (sql.includes("SET \"status\" = 'queued'")) {
+        if (state.sessionStatus === "aborted" || state.sessionStatus === "archived") { if (!sql.includes(SESSION_FENCE)) throw new Error("missing session-state fence"); return { rows: [], rowCount: 0 } }
         state.turn.status = "queued"; state.turn.leaseOwnerId = null; state.turn.leaseExpiresAt = null
         state.updates.push("queue")
         return { rows: [], rowCount: 1 }
@@ -51,7 +66,7 @@ function fixture(waitStatus: string, turnStatus = "in_progress", suspendedAt: Da
     },
     release() {},
   }
-  return { pool: { connect: async () => client }, state }
+  return { pool: { connect: async () => client }, state, calls }
 }
 
 describe("durable dependency wait handoff", () => {
@@ -70,6 +85,8 @@ describe("durable dependency wait handoff", () => {
     expect(fake.state.updates).toEqual(["wait", "queue"])
     expect(fake.state.outbox).toBe(true)
     expect(fake.state.outboxWrites).toBe(1)
+    expect(fake.calls.filter(sql => sql.includes('UPDATE "agent_wait_conditions"') || sql.includes('UPDATE "agent_turns"') || sql.includes('INSERT INTO "agent_outbox"')).every(sql => sql.includes(SESSION_FENCE))).toBe(true)
+    expect(fake.calls.some(sql => sql.includes('INSERT INTO "agent_outbox"') && sql.includes("WHERE EXISTS"))).toBe(true)
   })
 
   it("resets a previously published dispatch when the wait becomes ready", async () => {
@@ -93,5 +110,30 @@ describe("durable dependency wait handoff", () => {
     const fake = fixture("waiting", "waiting_for_dependency", now)
     await expect(suspendAndReleaseWait(fake.pool as never, { lease, waitId: "wait-1", now })).resolves.toMatchObject({ handoff: "suspended", idempotent: true })
     expect(fake.state.updates).toEqual([])
+  })
+
+  it.each(["aborted", "archived"])("does not suspend, requeue, or dispatch a %s session", async sessionStatus => {
+    const fake = fixture("ready", "in_progress", null, sessionStatus)
+    await expect(suspendAndReleaseWait(fake.pool as never, { lease, waitId: "wait-1", now })).rejects.toThrow("Turn is unavailable")
+    expect(fake.state.updates).toEqual([])
+    expect(fake.state.outbox).toBe(false)
+  })
+
+  it.each(["running", "paused", "waiting_for_user"])("keeps %s sessions compatible", async sessionStatus => {
+    const fake = fixture("waiting", "in_progress", null, sessionStatus)
+    await expect(suspendAndReleaseWait(fake.pool as never, { lease, waitId: "wait-1", now })).resolves.toMatchObject({ handoff: "suspended" })
+  })
+
+  it.each(["user", "system"])("keeps ordinary %s sessions compatible", async sessionSource => {
+    const fake = fixture("waiting", "in_progress", null, "running", sessionSource)
+    await expect(suspendAndReleaseWait(fake.pool as never, { lease, waitId: "wait-1", now })).resolves.toMatchObject({ handoff: "suspended" })
+  })
+
+  it("rolls back wait suspension when the session closes before the Turn update", async () => {
+    const fake = fixture("waiting", "in_progress", null, "running", "automation", true)
+    await expect(suspendAndReleaseWait(fake.pool as never, { lease, waitId: "wait-1", now })).rejects.toBeInstanceOf(TurnLeaseError)
+    expect(fake.state.outbox).toBe(false)
+    expect(fake.state.updates).toEqual(["wait"])
+    expect(fake.calls.some(sql => sql === "ROLLBACK")).toBe(true)
   })
 })

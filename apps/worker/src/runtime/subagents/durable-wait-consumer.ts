@@ -203,7 +203,7 @@ export async function consumeDurableWaitOutcomes(input: DurableWaitConsumerInput
      FROM "agent_wait_conditions"
      WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3
        AND "parentTaskId" = $4 AND "status" IN ('ready', 'timed_out') AND "suspendedAt" IS NOT NULL
-       AND ("consumedAt" IS NULL OR ("result" ? 'outcome'))
+       AND ("consumedAt" IS NULL OR ("result" ? 'outcome')) AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_wait_conditions"."sessionId" AND session."status" NOT IN ('aborted', 'archived'))
      ORDER BY "resolvedAt" ASC NULLS LAST, "id" ASC FOR UPDATE`,
     [input.lease.userId, input.lease.sessionId, input.lease.turnId, input.turn.rootTaskId],
   )
@@ -214,7 +214,7 @@ export async function consumeDurableWaitOutcomes(input: DurableWaitConsumerInput
     const parent = (await input.client.query<Row>(
       `SELECT task."id", task."rootTaskId", task."turnId", task."sessionId", session."userId" AS "userId"
        FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
-       WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND session."userId" = $4 FOR SHARE`,
+       WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND session."userId" = $4 AND session."status" NOT IN ('aborted', 'archived') FOR SHARE`,
       [wait.parentTaskId, input.lease.sessionId, input.lease.turnId, input.lease.userId],
     )).rows[0]
     if (!parent || String(parent.id) !== input.turn.rootTaskId || String(parent.rootTaskId ?? parent.id) !== input.turn.rootTaskId) continue
@@ -229,7 +229,7 @@ export async function consumeDurableWaitOutcomes(input: DurableWaitConsumerInput
     const targets = await input.client.query<Row>(
       `SELECT task."id", task."rootTaskId", task."turnId", task."sessionId", task."role", task."status", task."result", task."failureReason", session."userId" AS "userId"
        FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
-       WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3 AND session."userId" = $4`,
+       WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3 AND session."userId" = $4 AND session."status" NOT IN ('aborted', 'archived')`,
       [targetIds, input.lease.sessionId, input.lease.turnId, input.lease.userId],
     )
     if (targets.rows.length !== targetIds.length || targets.rows.some(target => String(target.rootTaskId ?? target.id) !== input.turn.rootTaskId || String(target.id) === input.turn.rootTaskId)) continue
@@ -240,7 +240,7 @@ export async function consumeDurableWaitOutcomes(input: DurableWaitConsumerInput
     const updated = await input.client.query(
       `UPDATE "agent_wait_conditions" SET "result" = jsonb_set(COALESCE("result", '{}'::jsonb), '{outcome}', $1::jsonb, true),
          "consumedAt" = $2, "updatedAt" = $2
-       WHERE "id" = $3 AND "userId" = $4 AND "sessionId" = $5 AND "turnId" = $6 AND "consumedAt" IS NULL
+       WHERE "id" = $3 AND "userId" = $4 AND "sessionId" = $5 AND "turnId" = $6 AND "consumedAt" IS NULL AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_wait_conditions"."sessionId" AND session."status" NOT IN ('aborted', 'archived'))
        RETURNING "id"`,
       [persisted.text, input.now, wait.id, input.lease.userId, input.lease.sessionId, input.lease.turnId],
     )

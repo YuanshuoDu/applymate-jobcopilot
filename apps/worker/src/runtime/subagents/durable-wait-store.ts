@@ -10,6 +10,7 @@ const MAX_TARGETS = 8
 const ACTIVE_TASK_STATUSES = ["queued", "running", "retrying", "waiting", "waiting_for_user"] as const
 const ACTIVE_TURN_STATUSES = ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] as const
 const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "interrupted", "cancelled", "closed", "passed", "skipped"])
+const OPEN_SESSION = `session."status" NOT IN ('aborted', 'archived')`
 type Pool = Pick<pg.Pool, "connect">
 type Queryable = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
@@ -102,21 +103,23 @@ export function createPgDurableWaitPort(pool: Pool): DurableWaitStore {
     return transaction(pool, input.userId, async client => {
       const parent = ensureScope((await client.query<Row>(`SELECT task."id", task."rootTaskId", task."turnId", task."sessionId", task."status", session."userId" AS "userId"
         FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
-        WHERE task."id" = $1 AND task."sessionId" = $2 AND session."userId" = $3 FOR UPDATE`, [normalized.parentTaskId, input.sessionId, input.userId])).rows[0], "Parent task is unavailable")
+        WHERE task."id" = $1 AND task."sessionId" = $2 AND session."userId" = $3 AND ${OPEN_SESSION} FOR UPDATE`, [normalized.parentTaskId, input.sessionId, input.userId])).rows[0], "Parent task is unavailable")
       if (String(parent.rootTaskId ?? parent.id) !== normalized.rootTaskId || String(parent.turnId ?? "") !== input.turnId) throw new DurableWaitStoreError("wait_scope_error", "Parent task is outside the wait scope")
       const turn = ensureScope((await client.query<Row>(`SELECT turn."id", turn."sessionId", turn."userId", turn."status", turn."rootTaskId"
-        FROM "agent_turns" AS turn WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 FOR SHARE`, [input.turnId, input.sessionId, input.userId])).rows[0], "Turn is unavailable")
+        FROM "agent_turns" AS turn WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3
+          AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = turn."sessionId" AND ${OPEN_SESSION}) FOR SHARE`, [input.turnId, input.sessionId, input.userId])).rows[0], "Turn is unavailable")
       if (turn.rootTaskId !== null && turn.rootTaskId !== undefined && String(turn.rootTaskId) !== normalized.rootTaskId) throw new DurableWaitStoreError("wait_scope_error", "Turn root is outside the wait scope")
       const step = await client.query<Row>(`SELECT "id", "taskId" FROM "agent_steps"
         WHERE "id" = $1 AND "turnId" = $2 AND "sessionId" = $3 AND ("taskId" = $4 OR ($4 = $5 AND "taskId" IS NULL)) FOR SHARE`, [input.stepId, input.turnId, input.sessionId, normalized.parentTaskId, normalized.rootTaskId])
       if (!step.rows[0]) throw new DurableWaitStoreError("wait_scope_error", "Step is outside the parent task scope")
       const targets = await client.query<Row>(`SELECT task."id", task."rootTaskId", task."turnId", task."sessionId", task."status", session."userId" AS "userId"
         FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
-        WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND session."userId" = $3`, [normalized.targetTaskIds, input.sessionId, input.userId])
+        WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND session."userId" = $3 AND ${OPEN_SESSION}`, [normalized.targetTaskIds, input.sessionId, input.userId])
       if (targets.rows.length !== normalized.targetTaskIds.length) throw new DurableWaitStoreError("wait_scope_error", "A wait target is unavailable")
       for (const target of targets.rows) if (String(target.rootTaskId ?? target.id) !== normalized.rootTaskId || String(target.turnId ?? "") !== input.turnId || String(target.id) === normalized.parentTaskId) throw new DurableWaitStoreError("wait_scope_error", "Wait target is outside the task tree")
       const existing = await client.query<Row>(`SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "idempotencyKey", "targetTaskIds", "mode", "status", "deadlineAt", "matchedTaskIds", "result", "createdAt"
-        FROM "agent_wait_conditions" WHERE "parentTaskId" = $1 AND "idempotencyKey" = $2 FOR UPDATE`, [normalized.parentTaskId, input.idempotencyKey])
+        FROM "agent_wait_conditions" WHERE "parentTaskId" = $1 AND "idempotencyKey" = $2
+          AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_wait_conditions"."sessionId" AND ${OPEN_SESSION}) FOR UPDATE`, [normalized.parentTaskId, input.idempotencyKey])
       if (existing.rows[0]) return waitReplay(existing.rows[0], input, normalized)
       if (!active(parent.status, ACTIVE_TASK_STATUSES)) throw new DurableWaitStoreError("wait_scope_error", "Parent task is not active")
       if (!active(turn.status, ACTIVE_TURN_STATUSES)) throw new DurableWaitStoreError("wait_scope_error", "Turn is not active")
@@ -125,13 +128,15 @@ export function createPgDurableWaitPort(pool: Pool): DurableWaitStore {
       const status = normalized.now >= deadlineAt ? "timed_out" : (input.mode === "any" ? matchedTaskIds.length > 0 : matchedTaskIds.length === targets.rows.length) ? "ready" : "waiting"
       const inserted = await client.query<Row>(`INSERT INTO "agent_wait_conditions"
         ("id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "idempotencyKey", "targetTaskIds", "mode", "status", "deadlineAt", "matchedTaskIds", "createdAt", "updatedAt")
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12::jsonb, $13::jsonb, $14, $14)
+        SELECT $1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12::jsonb, $13::jsonb, $14, $14
+        WHERE EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = $3 AND session."userId" = $2 AND ${OPEN_SESSION})
         ON CONFLICT ("parentTaskId", "idempotencyKey") DO NOTHING
         RETURNING "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "idempotencyKey", "targetTaskIds", "mode", "status", "deadlineAt", "matchedTaskIds", "result", "createdAt"`,
       [`wait-${randomUUID()}`, input.userId, input.sessionId, input.turnId, normalized.parentTaskId, input.stepId, input.idempotencyKey, json(normalized.targetTaskIds), input.mode, status, deadlineAt, json(matchedTaskIds), json({ request: { targetTaskIds: normalized.targetTaskIds, mode: input.mode, timeoutMs: input.timeoutMs } }), normalized.now])
       if (inserted.rows[0]) return result(inserted.rows[0])
       const replay = await client.query<Row>(`SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "idempotencyKey", "targetTaskIds", "mode", "status", "deadlineAt", "matchedTaskIds", "result", "createdAt"
-        FROM "agent_wait_conditions" WHERE "parentTaskId" = $1 AND "idempotencyKey" = $2 FOR UPDATE`, [normalized.parentTaskId, input.idempotencyKey])
+        FROM "agent_wait_conditions" WHERE "parentTaskId" = $1 AND "idempotencyKey" = $2
+          AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_wait_conditions"."sessionId" AND ${OPEN_SESSION}) FOR UPDATE`, [normalized.parentTaskId, input.idempotencyKey])
       if (!replay.rows[0]) throw new DurableWaitStoreError("wait_conflict", "Wait idempotency record was lost")
       return waitReplay(replay.rows[0], input, normalized)
     })
@@ -142,25 +147,28 @@ export function createPgDurableWaitPort(pool: Pool): DurableWaitStore {
     const now = input.now ?? new Date()
     return transaction(pool, input.userId, async client => {
       const locked = await client.query<Row>(`SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "targetTaskIds", "mode", "status", "deadlineAt", "matchedTaskIds", "result", "createdAt"
-        FROM "agent_wait_conditions" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "status" = 'waiting' FOR UPDATE SKIP LOCKED`, [input.waitId, input.sessionId, input.userId])
+        FROM "agent_wait_conditions" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "status" = 'waiting'
+          AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_wait_conditions"."sessionId" AND ${OPEN_SESSION}) FOR UPDATE SKIP LOCKED`, [input.waitId, input.sessionId, input.userId])
       if (!locked.rows[0]) {
         const current = await client.query<Row>(`SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "targetTaskIds", "mode", "status", "deadlineAt", "matchedTaskIds", "result", "createdAt"
-          FROM "agent_wait_conditions" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`, [input.waitId, input.sessionId, input.userId])
+          FROM "agent_wait_conditions" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3
+            AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_wait_conditions"."sessionId" AND ${OPEN_SESSION})`, [input.waitId, input.sessionId, input.userId])
         return current.rows[0] ? result(current.rows[0]) : null
       }
       const row = locked.rows[0]; const targetIds = ids(row.targetTaskIds)
       const targets = await client.query<Row>(`SELECT task."id", task."status" FROM "sub_agent_tasks" AS task
         JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
-        WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND session."userId" = $3 FOR SHARE`, [targetIds, input.sessionId, input.userId])
+        WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND session."userId" = $3 AND ${OPEN_SESSION} FOR SHARE`, [targetIds, input.sessionId, input.userId])
       if (targets.rows.length !== targetIds.length) throw new DurableWaitStoreError("wait_scope_error", "A wait target is unavailable")
       const matchedTaskIds = targets.rows.filter(target => TERMINAL_TASK_STATUSES.has(String(target.status))).map(target => String(target.id)).sort()
       const deadlineAt = date(row.deadlineAt, "deadlineAt")
       const status = now >= deadlineAt ? "timed_out" : (String(row.mode) === "any" ? matchedTaskIds.length > 0 : matchedTaskIds.length === targetIds.length) ? "ready" : "waiting"
       const updated = await client.query<Row>(`UPDATE "agent_wait_conditions" SET "status" = $1, "matchedTaskIds" = $2::jsonb,
         "resolvedAt" = CASE WHEN $1 IN ('ready', 'timed_out') THEN COALESCE("resolvedAt", $3) ELSE "resolvedAt" END, "updatedAt" = $3
-        WHERE "id" = $4 AND "sessionId" = $5 AND "userId" = $6 AND "status" = 'waiting' RETURNING "id", "status", "deadlineAt", "matchedTaskIds"`,
+        WHERE "id" = $4 AND "sessionId" = $5 AND "userId" = $6 AND "status" = 'waiting'
+          AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_wait_conditions"."sessionId" AND ${OPEN_SESSION}) RETURNING "id", "status", "deadlineAt", "matchedTaskIds"`,
       [status, json(matchedTaskIds), now, input.waitId, input.sessionId, input.userId])
-      return updated.rows[0] ? result(updated.rows[0]) : result({ ...row, status, matchedTaskIds })
+      return updated.rows[0] ? result(updated.rows[0]) : null
     })
   }
 
@@ -170,13 +178,14 @@ export function createPgDurableWaitPort(pool: Pool): DurableWaitStore {
     await transaction(pool, input.userId, async client => {
       const task = ensureScope((await client.query<Row>(`SELECT task."id", task."rootTaskId" FROM "sub_agent_tasks" AS task
         JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
-        WHERE task."id" = $1 AND task."sessionId" = $2 AND session."userId" = $3 FOR SHARE`, [input.taskId, input.sessionId, input.userId])).rows[0], "Cancel task is unavailable")
+        WHERE task."id" = $1 AND task."sessionId" = $2 AND session."userId" = $3 AND ${OPEN_SESSION} FOR SHARE`, [input.taskId, input.sessionId, input.userId])).rows[0], "Cancel task is unavailable")
       const root = String(task.rootTaskId ?? task.id) === input.taskId
       const predicate = root
         ? `"parentTaskId" IN (SELECT "id" FROM "sub_agent_tasks" WHERE "sessionId" = $3 AND "rootTaskId" = $4)`
         : `"parentTaskId" = $4`
       await client.query(`UPDATE "agent_wait_conditions" SET "status" = $1, "resolvedAt" = COALESCE("resolvedAt", $2), "updatedAt" = $2
-        WHERE "userId" = $5 AND "sessionId" = $3 AND "status" IN ('waiting', 'ready') AND ${predicate}`, [status, new Date(), input.sessionId, root ? input.taskId : input.taskId, input.userId])
+        WHERE "userId" = $5 AND "sessionId" = $3 AND "status" IN ('waiting', 'ready') AND ${predicate}
+          AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_wait_conditions"."sessionId" AND ${OPEN_SESSION})`, [status, new Date(), input.sessionId, root ? input.taskId : input.taskId, input.userId])
     })
   }
 

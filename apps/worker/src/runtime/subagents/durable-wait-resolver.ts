@@ -11,6 +11,7 @@ const DEFAULT_BATCH_SIZE = 25
 const DEFAULT_POLL_MS = 5_000
 const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "interrupted", "cancelled", "closed", "passed", "skipped"])
 const DISPATCH_TOPIC = "agent.turn.dispatch"
+const OPEN_SESSION = `session."status" NOT IN ('aborted', 'archived')`
 
 export type DurableWaitReconcileOptions = {
   readonly batchSize?: number
@@ -52,13 +53,16 @@ async function transaction<T>(pool: LeasePool, work: (client: Queryable) => Prom
 
 async function writeDispatch(client: Queryable, row: Row, ownerId: string): Promise<void> {
   const turnId = String(row.id); const sessionId = String(row.sessionId)
-  await client.query(
+  const written = await client.query(
     `INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
-     VALUES ($1, $2, $3, $4, $5::jsonb) ON CONFLICT ("idempotencyKey") DO UPDATE
+     SELECT $1, $2, $3, $4, $5::jsonb
+     WHERE EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = $6 AND ${OPEN_SESSION})
+     ON CONFLICT ("idempotencyKey") DO UPDATE
        SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL,
            "attemptCount" = "agent_outbox"."attemptCount" + 1`,
-    [randomUUID(), DISPATCH_TOPIC, turnId, dispatchKey(turnId), json({ turnId, sessionId, ownerId })],
+    [randomUUID(), DISPATCH_TOPIC, turnId, dispatchKey(turnId), json({ turnId, sessionId, ownerId }), sessionId],
   )
+  if (written.rowCount !== 1) throw new Error("wait_session_closed")
 }
 
 async function reconcileWait(client: Queryable, wait: Row, turn: Row, now: Date, ownerId: string): Promise<"resolved" | "woken" | "ignored"> {
@@ -67,7 +71,7 @@ async function reconcileWait(client: Queryable, wait: Row, turn: Row, now: Date,
     `SELECT task."id", task."rootTaskId", task."turnId", task."sessionId", session."userId" AS "userId"
      FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
      WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3
-       AND session."userId" = $4 FOR SHARE`,
+       AND session."userId" = $4 AND ${OPEN_SESSION} FOR SHARE`,
     [wait.parentTaskId, turn.sessionId, turn.id, turn.userId],
   )).rows[0]
   if (!parent || String(parent.rootTaskId ?? parent.id) !== rootTaskId || String(parent.id) !== rootTaskId) return "ignored"
@@ -84,7 +88,7 @@ async function reconcileWait(client: Queryable, wait: Row, turn: Row, now: Date,
     `SELECT task."id", task."rootTaskId", task."turnId", task."sessionId", task."status", session."userId" AS "userId"
      FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
      WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3
-       AND session."userId" = $4`,
+       AND session."userId" = $4 AND ${OPEN_SESSION}`,
     [targetIds, turn.sessionId, turn.id, turn.userId],
   )
   if (targets.rows.length !== targetIds.length || targets.rows.some(target => String(target.rootTaskId ?? target.id) !== rootTaskId || String(target.id) === rootTaskId)) return "ignored"
@@ -96,8 +100,9 @@ async function reconcileWait(client: Queryable, wait: Row, turn: Row, now: Date,
   if (waitStatus === "waiting" && resolvedStatus !== "waiting") {
     const updated = await client.query(
       `UPDATE "agent_wait_conditions" SET "status" = $1, "matchedTaskIds" = $2::jsonb,
-         "resolvedAt" = COALESCE("resolvedAt", $3), "updatedAt" = $3
-       WHERE "id" = $4 AND "userId" = $5 AND "sessionId" = $6 AND "status" = 'waiting' AND "consumedAt" IS NULL`,
+       "resolvedAt" = COALESCE("resolvedAt", $3), "updatedAt" = $3
+       WHERE "id" = $4 AND "userId" = $5 AND "sessionId" = $6 AND "status" = 'waiting' AND "consumedAt" IS NULL
+         AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_wait_conditions"."sessionId" AND ${OPEN_SESSION})`,
       [resolvedStatus, json(matched), now, wait.id, turn.userId, turn.sessionId],
     )
     changed = updated.rowCount === 1
@@ -110,11 +115,12 @@ async function reconcileWait(client: Queryable, wait: Row, turn: Row, now: Date,
     `UPDATE "agent_turns" SET "status" = 'queued', "leaseOwnerId" = NULL,
        "leaseExpiresAt" = NULL, "leaseStartedAt" = NULL, "revision" = "revision" + 1,
        "completedAt" = NULL, "updatedAt" = $3
-     WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'waiting_for_dependency'
-       AND "rootTaskId" = $4 AND "leaseOwnerId" IS NULL`,
+      WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'waiting_for_dependency'
+        AND "rootTaskId" = $4 AND "leaseOwnerId" IS NULL
+        AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_turns"."sessionId" AND ${OPEN_SESSION})`,
     [turn.id, turn.sessionId, now, rootTaskId],
   )
-  if (queued.rowCount !== 1) return changed ? "resolved" : "ignored"
+  if (queued.rowCount !== 1) throw new Error("wait_turn_wake_fenced")
   await writeDispatch(client, turn, ownerId)
   return "woken"
 }
@@ -127,6 +133,7 @@ export async function reconcileDurableWaits(pool: LeasePool, options: DurableWai
       `SELECT turn."id", turn."userId", turn."sessionId", turn."rootTaskId", turn."status", turn."leaseOwnerId"
        FROM "agent_turns" AS turn
        WHERE turn."status" IN ('waiting_for_dependency', 'in_progress') AND turn."rootTaskId" IS NOT NULL
+         AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = turn."sessionId" AND ${OPEN_SESSION})
        ORDER BY turn."updatedAt" ASC, turn."id" ASC FOR UPDATE SKIP LOCKED LIMIT $1`,
       [batchSize],
     )
@@ -137,6 +144,7 @@ export async function reconcileDurableWaits(pool: LeasePool, options: DurableWai
         `SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "targetTaskIds", "mode", "status", "deadlineAt", "suspendedAt", "consumedAt"
          FROM "agent_wait_conditions" WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3
            AND "status" IN ('waiting', 'ready', 'timed_out') AND "consumedAt" IS NULL
+           AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_wait_conditions"."sessionId" AND ${OPEN_SESSION})
          ORDER BY "createdAt" ASC, "id" ASC FOR UPDATE SKIP LOCKED LIMIT $4`,
         [turn.userId, turn.sessionId, turn.id, Math.max(0, batchSize - scanned)],
       )
