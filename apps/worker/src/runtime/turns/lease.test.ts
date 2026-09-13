@@ -18,10 +18,14 @@ const row = {
   leaseStartedAt: now, leaseExpiresAt: new Date(now.getTime() + 60_000),
 }
 
-function fakePool(rows: unknown[] = [row]) {
+function fakePool(rows: unknown[] = [row], sessionStatus = "running") {
   const calls: Array<[string, unknown[]?]> = []
   const client = {
-    query: vi.fn(async (sql: string, params?: unknown[]) => { calls.push([sql, params]); return { rows, rowCount: rows.length } }),
+    query: vi.fn(async (sql: string, params?: unknown[]) => {
+      calls.push([sql, params])
+      if (sql.includes('UPDATE "agent_turns"') && ["aborted", "archived"].includes(sessionStatus)) return { rows: [], rowCount: 0 }
+      return { rows, rowCount: rows.length }
+    }),
     release: vi.fn(),
   }
   return { pool: { connect: vi.fn().mockResolvedValue(client) }, client, calls }
@@ -36,7 +40,24 @@ describe("database Turn lease", () => {
     expect(result).toMatchObject({ ...payload, userId: "user_1", leaseVersion: 8 })
     expect(fake.calls.filter(([sql]) => sql.includes('UPDATE "agent_turns"')).length).toBe(1)
     expect(fake.calls.find(([sql]) => sql.includes('UPDATE "agent_turns"'))?.[0]).toContain("status\" = 'queued'")
+    expect(fake.calls.find(([sql]) => sql.includes('UPDATE "agent_turns"'))?.[0]).toContain('session."status" NOT IN (\'aborted\', \'archived\')')
+    expect(fake.calls.find(([sql]) => sql.includes('UPDATE "agent_turns"'))?.[0]).toContain('session."id" = $2')
+    expect(fake.calls.find(([sql]) => sql.includes('UPDATE "agent_turns"'))?.[0]).toContain('session."userId" = "agent_turns"."userId"')
     expect(fake.calls[0][0]).toBe("BEGIN")
+  })
+
+  it.each(["aborted", "archived"])("does not claim a Turn whose session is %s", async (sessionStatus) => {
+    const fake = fakePool([row], sessionStatus)
+
+    await expect(claimTurnLease(fake.pool, payload, now)).rejects.toMatchObject({ code: "lease_not_available", recoverable: true })
+  })
+
+  it.each(["running", "paused", "waiting_for_user"])("claims a Turn when its ordinary session is %s", async (sessionStatus) => {
+    const fake = fakePool([row], sessionStatus)
+
+    await expect(claimTurnLease(fake.pool, payload, now)).resolves.toMatchObject({ turnId: payload.turnId, sessionId: payload.sessionId, userId: row.userId })
+    const sql = fake.calls.find(([text]) => text.includes('UPDATE "agent_turns"'))?.[0] ?? ""
+    expect(sql).not.toContain('session."source"')
   })
 
   it("returns a typed recoverable error to a duplicate claimant", async () => {

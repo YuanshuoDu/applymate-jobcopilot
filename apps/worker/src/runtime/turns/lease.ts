@@ -110,7 +110,14 @@ export async function claimTurnLease(
            "updatedAt" = $4
        WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'queued'
          AND ("leaseOwnerId" IS NULL OR "leaseExpiresAt" <= $4)
-       RETURNING "id", "sessionId", "userId", "leaseOwnerId", "leaseVersion",
+         AND EXISTS (
+           SELECT 1 FROM "agent_sessions" AS session
+           WHERE session."id" = "agent_turns"."sessionId"
+             AND session."id" = $2
+             AND session."userId" = "agent_turns"."userId"
+             AND session."status" NOT IN ('aborted', 'archived')
+         )
+        RETURNING "id", "sessionId", "userId", "leaseOwnerId", "leaseVersion",
                  "leaseStartedAt", "leaseExpiresAt"`,
       [payload.turnId, payload.sessionId, payload.ownerId, now, leaseMs],
     )
