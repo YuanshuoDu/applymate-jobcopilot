@@ -639,3 +639,11 @@ Commits `e56b0b06` (missing dispatch repair), `a602d8bd` (session-first lock and
 Root independently verified the P4-37 queue, Pg store, and manager focused suites at **56/56**; an additional integration fixture in the same command brought the evidence to **57/57**. The shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
 
 Live PostgreSQL/RLS, real concurrent lock races, Redis/BullMQ delivery, process restart, provider, browser, and full production child-parent E2E remain unverified. The cognitive gate remains disabled; P4-37 remains a candidate and overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-38 update
+
+Commit `32368bb4` corrects the locking-clause order in exactly six active Worker recovery queries: the wakeup outbox, Turn reclaim CTE, queued Turn dispatch repair, pending Turn outbox, durable-wait Turn scan, and durable-wait condition scan. Only the clause order changed to `LIMIT ... FOR UPDATE [OF ...] SKIP LOCKED`; predicates, lock targets, and parameters remain unchanged, with no behavior, model, or feature-gate change.
+
+Root independently verified 11 Worker suites at **151/151**, covering the affected three suites plus queue, Pg store, manager, coordination integration, durable waits, Turn queue, and root-task coverage. The shared package build, Worker `tsc --noEmit --skipLibCheck`, `git diff --check`, and a repository scan confirming no old-order pattern remains in `apps/worker/src` also passed.
+
+Live PostgreSQL/RLS, real concurrent lock races, Redis/BullMQ delivery, process restart, provider, browser, and full production child-parent E2E remain unverified. The cognitive gate remains disabled; P4-38 remains a candidate and overall progress remains **P0 accepted 1/8 (12.5%)**.
