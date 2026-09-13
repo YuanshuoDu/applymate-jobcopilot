@@ -48,11 +48,20 @@ async function transaction<T>(pool: PgSubagentPool, work: (client: pg.PoolClient
 
 export async function persistSubagentDispatch(pool: PgSubagentPool, payload: SubagentJobPayload, resetPublished = false): Promise<void> {
   await transaction(pool, async client => {
+    if (resetPublished) {
+      const session = await client.query<{ id: string }>(`SELECT session."id" FROM "agent_sessions" AS session
+        WHERE session."id" = $1 AND session."status" NOT IN ('aborted', 'archived') FOR UPDATE`, [payload.sessionId])
+      if (!session.rows[0]) return
+    }
     const conflict = resetPublished
-      ? `ON CONFLICT ("idempotencyKey") DO UPDATE SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL, "attemptCount" = "agent_outbox"."attemptCount" + 1`
+      ? `ON CONFLICT ("idempotencyKey") DO UPDATE SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL, "attemptCount" = "agent_outbox"."attemptCount" + 1
+         WHERE "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"`
       : `ON CONFLICT ("idempotencyKey") DO NOTHING`
     await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
-      VALUES ($1, $2, $3, $4, $5::jsonb) ${conflict}`,
+      SELECT $1, $2, $3, $4, $5::jsonb
+      WHERE EXISTS (SELECT 1 FROM "agent_sessions" AS session
+        WHERE session."id" = $3 AND session."status" NOT IN ('aborted', 'archived'))
+      ${conflict}`,
     [randomUUID(), SUBAGENT_DISPATCH_TOPIC, payload.sessionId, subagentDispatchKey(payload.taskId), JSON.stringify(payload)])
   })
 }

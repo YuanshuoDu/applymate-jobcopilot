@@ -9,7 +9,7 @@ import type { SubagentJobPayload } from "../runtime/subagents/types.js"
 
 const payload: SubagentJobPayload = { taskId: "task-1", sessionId: "session-1", rootTaskId: "root-1", ownerId: "worker-1" }
 
-type DispatchOptions = { sessionStatus?: string | null; aggregateId?: string; payload?: unknown; sessionMissingAfterScan?: boolean; outboxMissingAfterScan?: boolean; attemptCount?: number }
+type DispatchOptions = { sessionStatus?: string | null; aggregateId?: string; payload?: unknown; sessionMissing?: boolean; sessionMissingAfterScan?: boolean; outboxMissingAfterScan?: boolean; attemptCount?: number }
 
 function fakePool(markError?: Error, options: DispatchOptions = {}) {
   const calls: Array<[string, unknown[]?]> = []
@@ -26,7 +26,7 @@ function fakePool(markError?: Error, options: DispatchOptions = {}) {
       }
       if (sql.includes('SELECT session."id"') && sql.includes('FROM "agent_sessions" AS session')) {
         const status = options.sessionStatus === undefined ? "running" : options.sessionStatus
-        return scanCompleted && (options.sessionMissingAfterScan || status === "aborted" || status === "archived") ? { rows: [], rowCount: 0 } : { rows: [{ id: outbox.aggregateId }], rowCount: 1 }
+        return options.sessionMissing || status === null || status === "aborted" || status === "archived" || (scanCompleted && options.sessionMissingAfterScan) ? { rows: [], rowCount: 0 } : { rows: [{ id: outbox.aggregateId }], rowCount: 1 }
       }
       if (sql.includes('SELECT dispatch."id"') && sql.includes('FROM "agent_outbox" AS dispatch')) {
         return options.outboxMissingAfterScan ? { rows: [], rowCount: 0 } : { rows: [{ id: outbox.id }], rowCount: 1 }
@@ -124,6 +124,32 @@ describe("Subagent queue", () => {
     expect(fake.calls.some(([, params]) => params?.includes(subagentDispatchKey("task-1")))).toBe(true)
     const insert = fake.calls.find(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"'))
     expect(insert?.[1]?.[2]).toBe("session-1")
+  })
+
+  it.each(["aborted", "archived", null] as const)("does not reset a %s session dispatch", async sessionStatus => {
+    const fake = fakePool(undefined, { sessionStatus })
+    await expect(persistSubagentDispatch(fake.pool, payload, true)).resolves.toBeUndefined()
+    expect(fake.calls.some(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"'))).toBe(false)
+    expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "agent_outbox"'))).toBe(false)
+  })
+
+  it("does not reset a missing session dispatch", async () => {
+    const fake = fakePool(undefined, { sessionMissing: true })
+    await expect(persistSubagentDispatch(fake.pool, payload, true)).resolves.toBeUndefined()
+    expect(fake.calls.some(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"'))).toBe(false)
+    expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "agent_outbox"'))).toBe(false)
+  })
+
+  it.each(["running", "paused", "waiting_for_user"] as const)("resets an open %s session dispatch", async sessionStatus => {
+    const fake = fakePool(undefined, { sessionStatus })
+    await persistSubagentDispatch(fake.pool, payload, true)
+    const lockIndex = fake.calls.findIndex(([sql]) => sql.includes('SELECT session."id"') && sql.includes("FOR UPDATE"))
+    const insertIndex = fake.calls.findIndex(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"'))
+    expect(lockIndex).toBeGreaterThan(-1)
+    expect(lockIndex).toBeLessThan(insertIndex)
+    expect(fake.calls[lockIndex]?.[0]).toContain('session."status" NOT IN (\'aborted\', \'archived\')')
+    expect(fake.calls[insertIndex]?.[0]).toContain("WHERE EXISTS")
+    expect(fake.calls[insertIndex]?.[0]).toContain('WHERE "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"')
   })
 
   it("dispatches pending intents and marks them published only after queue add", async () => {
