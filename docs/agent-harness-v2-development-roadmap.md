@@ -1734,3 +1734,13 @@ Conditional wait/Turn/outbox mutations fail closed when a session closes during 
 **Independent verification:** Root independently verified the focused wait suites at **62/62**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, real cross-process concurrency, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 52. P4-22 — Wakeup resume session-state fence
+
+**Candidate status/date (2026-09-13):** P4-22 is recorded as a candidate wakeup resume safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `54a93b0c` makes wakeup resume acquire the linked `agent_sessions` row with `FOR UPDATE` before reading or changing the Turn. `aborted` and `archived` wakeups return `ignored` before any Turn, item, event, session-sequence, or dispatch-outbox write. The conditional Turn update and session event-sequence update both require an open session fence. If a session closes at the resume-event boundary, the transaction rolls back with no partial writes. `drainAgentWakeups` marks the source wakeup published for ignored/already-resumed outcomes without creating resume side effects; open and duplicate delivery behavior remains compatible.
+
+**Independent verification:** Root independently verified the focused wakeup suite at **9/9**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, real cross-process concurrency, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
