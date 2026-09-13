@@ -27,6 +27,7 @@ export class TreeBudgetStoreError extends Error {
 
 const ACTIVE_ROOT = "'queued', 'running', 'retrying', 'waiting', 'waiting_for_user'"
 const ACTIVE_TURN = "'queued', 'in_progress', 'waiting_for_dependency', 'waiting_for_approval', 'waiting_for_user'"
+const OPEN_SESSION = `"status" NOT IN ('aborted', 'archived')`
 
 function text(value: unknown, name: string): string {
   if (typeof value !== "string" || value.trim().length === 0 || Buffer.byteLength(value, "utf8") > 256) throw new TreeBudgetStoreError("invalid_input", `${name} is invalid`)
@@ -97,6 +98,15 @@ async function lockRoot(client: Client, input: TreeBudgetReserveInput): Promise<
   return result.rows[0]
 }
 
+async function lockSession(client: Client, input: TreeBudgetReserveInput): Promise<void> {
+  const result = await client.query<{ id: string; userId: string; status: string }>(
+    `SELECT "id", "userId", "status" FROM "agent_sessions"
+     WHERE "id" = $1 AND "userId" = $2 AND ${OPEN_SESSION} FOR UPDATE`,
+    [input.sessionId, input.userId],
+  ) as QueryResult<{ id: string; userId: string; status: string }>
+  if (!result.rows[0]) throw new TreeBudgetStoreError("root_not_found")
+}
+
 async function findExisting(client: Client, input: TreeBudgetReserveInput): Promise<TreeBudgetReservation | null> {
   const result = await client.query<Row>(`SELECT * FROM "agent_tree_budget_reservations"
     WHERE ("rootTaskId" = $1 AND "taskId" = $2 AND "stepId" = $3 AND "attempt" = $4)
@@ -145,6 +155,7 @@ export function createPgTreeBudgetReservationStore(pool: Pool): TreeBudgetReserv
       const input = { ...raw, userId: text(raw.userId, "userId"), sessionId: text(raw.sessionId, "sessionId"), turnId: text(raw.turnId, "turnId"), rootTaskId: text(raw.rootTaskId, "rootTaskId"), taskId: text(raw.taskId, "taskId"), stepId: text(raw.stepId, "stepId"), attempt: positiveInt(raw.attempt, "attempt"), idempotencyKey: text(raw.idempotencyKey, "idempotencyKey") }
       const timestamp = now(input.now)
       return transaction(pool, input.userId, async client => {
+        await lockSession(client, input)
         const root = await lockRoot(client, input)
         const existing = await findExisting(client, input)
         if (existing) return existing
