@@ -1650,3 +1650,15 @@ Session start moves only a non-`aborted` automation session to `running` and cle
 **Independent verification:** Root independently verified the canonical session projection, canonical runtime, and root-task-store regression at **51/51**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, real concurrent database behavior, Redis/queue delivery, real Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 44. P4-14 — Session-state fence for Turn leasing
+
+**Candidate status/date (2026-09-13):** P4-14 is recorded as a candidate queued-Turn lease safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `eadbaa26` extends the single conditional `claimTurnLease` UPDATE with an `agent_sessions` existence fence. The payload `sessionId` must resolve to the Turn's session and the session `userId` must match the Turn `userId`; sessions with `status = 'aborted'` or `status = 'archived'` cannot be claimed. The fence does not filter by session source, so ordinary user/system sessions and resumable `running`, `paused`, and `waiting_for_user` sessions retain existing behavior. Cross-user and missing-session claims remain unavailable.
+
+A blocked or raced claim continues to surface only the recoverable `TurnLeaseError` with `code = 'lease_not_available'`; no session-state details are exposed to the queue.
+
+**Independent verification:** Root independently verified lease and Turn queue focused suites at **20/20**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real cross-process concurrency, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
