@@ -10,6 +10,7 @@ import { startAgentWakeupConsumer } from "./runtime/wakeup/consumer.js";
 import { resolveProductionAgentFlags } from "./runtime/production-agent-flags.js";
 import { createProductionContextCompactionOptions } from "./runtime/context/production-context-compaction.js";
 import { createCanonicalExecutionProjection } from "./runtime/canonical-execution-projection.js";
+import { createCanonicalSessionProjection } from "./runtime/canonical-session-projection.js";
 
 async function main() {
   const adminHost = resolveWorkerAdminHost();
@@ -90,6 +91,7 @@ async function main() {
     planningEnabled: productionFlags.planningEnabled,
     planningExecutionEnabled: productionFlags.planningExecutionEnabled,
     executionProjection: createCanonicalExecutionProjection(pool),
+    sessionProjection: createCanonicalSessionProjection(pool),
     ...contextCompactionOptions,
   });
   // Child execution is opt-in. Keep tree-budget and child queue construction

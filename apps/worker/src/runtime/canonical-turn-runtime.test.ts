@@ -497,6 +497,34 @@ describe("createCanonicalTurnRuntime", () => {
     expect(failedFinish.roots.finish).toHaveBeenCalledTimes(1)
   })
 
+  it("projects the automation session lifecycle with the leased Turn identity", async () => {
+    const executionProjection = { start: vi.fn(async () => undefined), finish: vi.fn(async () => undefined) }
+    const sessionProjection = { start: vi.fn(async () => undefined), finish: vi.fn(async () => undefined) }
+    const fixture = setup({ executionProjection, sessionProjection })
+    const runtime = await fixture.runtime
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "completed" })
+    expect(sessionProjection.start).toHaveBeenCalledWith({ userId: "user-1", sessionId: "session-1", turnId: "turn-1" })
+    expect(sessionProjection.finish).toHaveBeenCalledWith(expect.objectContaining({ userId: "user-1", sessionId: "session-1", turnId: "turn-1", result: expect.objectContaining({ status: "completed" }) }))
+    expect(fixture.roots.finish.mock.invocationCallOrder[0]).toBeLessThan(executionProjection.finish.mock.invocationCallOrder[0] ?? Number.MAX_SAFE_INTEGER)
+    expect(executionProjection.finish.mock.invocationCallOrder[0]).toBeLessThan(sessionProjection.finish.mock.invocationCallOrder[0] ?? Number.MAX_SAFE_INTEGER)
+  })
+
+  it("reconciles a terminal root through the session projection without rerunning the engine", async () => {
+    const roots = { ...rootStore(), reconcileTerminal: vi.fn().mockResolvedValue({ rootTaskId: "root-1", result: { status: "waiting_for_user" as const, summary: "needs_input" } }) }
+    const sessionProjection = { start: vi.fn(async () => undefined), finish: vi.fn(async () => undefined) }
+    const fixture = setup({ rootTaskStore: roots, sessionProjection })
+    const runtime = await fixture.runtime
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toEqual({ status: "waiting_for_user", summary: "needs_input" })
+    expect(sessionProjection.finish).toHaveBeenCalledWith({
+      userId: "user-1", sessionId: "session-1", turnId: "turn-1", result: { status: "waiting_for_user", errorCode: "needs_input" },
+    })
+    expect(sessionProjection.start).not.toHaveBeenCalled()
+    expect(fixture.getModelCalls()).toBe(0)
+    expect(roots.ensure).not.toHaveBeenCalled()
+  })
+
   it("reconciles a terminal root on projection retry without rerunning the engine", async () => {
     const roots = { ...rootStore(), reconcileTerminal: vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce({ rootTaskId: "root-1", result: { status: "failed" as const, summary: "provider_error" } }) }
     const projection = { start: vi.fn(async () => undefined), finish: vi.fn().mockRejectedValueOnce(new Error("projection unavailable")).mockResolvedValueOnce(undefined) }

@@ -31,6 +31,7 @@ import type { PlanCommandReceipt } from "./planning/plan-command-receipt.js"
 import { createPlanRevisionRecoveryDispatcher } from "./planning/plan-revision-receipt.js"
 import type { ContextSnapshotAdapter } from "./context/context-snapshot-adapter.js"
 import { noopCanonicalExecutionProjection, type CanonicalExecutionProjection } from "./canonical-execution-projection.js"
+import { noopCanonicalSessionProjection, type CanonicalSessionProjection } from "./canonical-session-projection.js"
 
 export type UsageAuthorization = {
   settle(input: { status: "success" | "error"; inputTokens: number; outputTokens: number; estimatedCostUsd: number; errorCode?: string }): Promise<void> | void
@@ -68,6 +69,8 @@ export type CanonicalTurnRuntimeOptions = {
   readonly lifecycleSinkFactory?: (input: { lease: TurnLease; store: TurnEngineStore; owner: ExecutionOwnerFence }) => ToolLifecycleSink
   /** Optional server-owned automation control projection; ordinary sessions are ignored by its SQL scope. */
   readonly executionProjection?: CanonicalExecutionProjection
+  /** Optional server-owned automation session projection; ordinary sessions are ignored by its SQL scope. */
+  readonly sessionProjection?: CanonicalSessionProjection
   readonly now?: () => Date
 }
 
@@ -187,13 +190,20 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
   const manager = options.manager ?? new AgentTreeManager(new PgSubagentTaskStore(pool), { now })
   const rootTasks = options.rootTaskStore ?? createPgRootTaskStore(pool)
   const executionProjection = options.executionProjection ?? noopCanonicalExecutionProjection
-  const reconcileTerminal = options.executionProjection ? rootTasks.reconcileTerminal : undefined
+  const sessionProjection = options.sessionProjection ?? noopCanonicalSessionProjection
+  const reconcileTerminal = options.executionProjection || options.sessionProjection ? rootTasks.reconcileTerminal : undefined
   let closed = false
   const execute: TurnExecutor = async ({ lease, signal }): Promise<TurnExecutionResult> => {
     if (closed) throw new Error("canonical_runtime_closed")
     const terminal = await reconcileTerminal?.({ lease, now: now() })
     if (terminal) {
       await executionProjection.finish({
+        userId: lease.userId,
+        sessionId: lease.sessionId,
+        turnId: lease.turnId,
+        result: { status: terminal.result.status, errorCode: terminal.result.summary },
+      })
+      await sessionProjection.finish({
         userId: lease.userId,
         sessionId: lease.sessionId,
         turnId: lease.turnId,
@@ -271,10 +281,12 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       ...(rootTasks.checkCompletion ? { completionGate: async () => rootTasks.checkCompletion!({ lease, rootTaskId: root.id, now: now() }) } : {}),
     })
     await executionProjection.start({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId })
+    await sessionProjection.start({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId })
     const result = await engine.run()
     await rootTasks.finish({ lease, rootTaskId: root.id, result, now: now() })
     // The durable root is finalized first; a projection failure remains surfaced so queue retry can reconcile it.
     await executionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, result })
+    await sessionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, result })
     return { status: result.status, summary: result.errorCode }
   }
   return {
