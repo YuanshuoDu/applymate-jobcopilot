@@ -32,6 +32,7 @@ describe("PostgreSQL TurnEngine store", () => {
     const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
       calls.push({ sql, values })
       if (sql === "BEGIN" || sql === "COMMIT" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1" }], rowCount: 1 }
       if (sql.includes('SELECT turn."id"')) return { rows: [{ id: "turn-1" }], rowCount: 1 }
       if (sql.includes('SELECT "id", "ordinal", "taskId"')) return { rows: [], rowCount: 0 }
       if (sql.includes('SELECT "id" FROM "agent_steps"')) return { rows: [{ id: "step-1" }], rowCount: 1 }
@@ -43,6 +44,11 @@ describe("PostgreSQL TurnEngine store", () => {
     const store = createPgTurnEngineStore({ connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">)
     await expect(store.startStep({ owner, stepId: "step-1", ordinal: 0, attempt: 1, inputThroughSequence: 0n, consumedInputIds: [], modelProfileSnapshot: {}, now })).resolves.toEqual({ id: "step-1", ordinal: 0 })
     await expect(store.createItem({ owner, itemId: "item-1", stepId: "step-1", type: "agent_message", status: "started", phase: "commentary", content: { text: "" }, now })).resolves.toEqual({ id: "item-1", revision: 0 })
+    const sessionLocks = calls.filter(({ sql }) => sql.includes('FROM "agent_sessions"'))
+    expect(sessionLocks).toHaveLength(2)
+    expect(sessionLocks.every(({ sql }) => sql.includes('"status" NOT IN (\'aborted\', \'archived\')') && sql.includes("FOR UPDATE"))).toBe(true)
+    const firstTurnLock = calls.findIndex(({ sql }) => sql.includes('SELECT turn."id"'))
+    expect(calls.findIndex(({ sql }) => sql.includes('FROM "agent_sessions"'))).toBeLessThan(firstTurnLock)
     expect(calls.some(({ sql }) => sql.includes("owner_task") && sql.includes("leaseVersion"))).toBe(true)
     expect(calls.some(({ values }) => values?.includes(owner.taskId))).toBe(true)
     assertDenseBindings(calls)
@@ -52,6 +58,7 @@ describe("PostgreSQL TurnEngine store", () => {
     const calls: string[] = []
     const client = { query: vi.fn(async (sql: string) => {
       calls.push(sql)
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1" }] }
       if (sql.includes("FROM \"agent_events\"")) return { rows: [] }
       if (sql.includes('SELECT turn."id"')) return { rows: [{ id: "turn-1" }] }
       if (sql.includes("UPDATE \"agent_sessions\"")) return { rows: [{ eventSequence: 1n }] }
@@ -60,6 +67,7 @@ describe("PostgreSQL TurnEngine store", () => {
     const store = createPgTurnEngineStore({ connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">)
     await expect(store.appendEvent({ owner, id: "event-1", itemId: null, type: "turn.started", correlationId: "turn-1", causationId: null, idempotencyKey: "key-1", payload: { ok: true } })).resolves.toEqual({ id: "event-1" })
     expect(calls[0]).toBe("BEGIN")
+    expect(calls.findIndex(sql => sql.includes('FROM "agent_sessions"'))).toBeLessThan(calls.findIndex(sql => sql.includes('SELECT turn."id"')))
     expect(calls).toContain("COMMIT")
     expect(calls.some((sql) => sql.includes("INSERT INTO \"agent_events\""))).toBe(true)
     expect(calls.some((sql) => sql.includes("INSERT INTO \"agent_outbox\""))).toBe(true)
@@ -70,6 +78,7 @@ describe("PostgreSQL TurnEngine store", () => {
     let eventLookups = 0
     const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
       calls.push({ sql, values })
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1" }] }
       if (sql.includes('FROM "agent_events"')) {
         eventLookups += 1
         return eventLookups === 1
@@ -103,6 +112,7 @@ describe("PostgreSQL TurnEngine store", () => {
     let eventInserts = 0
     const client = { query: vi.fn(async (sql: string) => {
       calls.push(sql)
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1" }] }
       if (sql.includes('INSERT INTO "agent_events"')) { eventInserts += 1; if (eventInserts === 2) throw new Error("batch insert failed") }
       if (sql.includes('SELECT turn."id"')) return { rows: [{ id: owner.turnId }] }
       if (sql.includes('UPDATE "agent_sessions"')) return { rows: [{ eventSequence: 1n }] }
@@ -118,7 +128,10 @@ describe("PostgreSQL TurnEngine store", () => {
   })
 
   it("transitions only the leased in-progress Turn to waiting_for_user", async () => {
-    const client = { query: vi.fn(async () => ({ rows: [], rowCount: 1 })), release: vi.fn() }
+    const client = { query: vi.fn(async (sql: string) => {
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1" }], rowCount: 1 }
+      return { rows: [], rowCount: 1 }
+    }), release: vi.fn() }
     const store = createPgTurnEngineStore({ connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">)
     await store.waitForUser?.({ owner, now })
     expect(client.query).toHaveBeenCalledWith(expect.stringContaining('"status" = \'in_progress\''), [now, owner.turnId, owner.sessionId, owner.userId, owner.ownerId, owner.leaseVersion, owner.taskId])
@@ -128,6 +141,7 @@ describe("PostgreSQL TurnEngine store", () => {
     const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
     const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
       calls.push({ sql, values })
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1" }] }
       if (sql.includes("FROM \"agent_events\"")) return { rows: [] }
       if (sql.includes('SELECT turn."id"')) return { rows: [{ id: "turn-1" }] }
       if (sql.includes("UPDATE \"agent_sessions\"")) return { rows: [{ eventSequence: 1n }] }
@@ -148,6 +162,7 @@ describe("PostgreSQL TurnEngine store", () => {
     const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
     const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
       calls.push({ sql, values })
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1" }], rowCount: 1 }
       if (sql === "BEGIN" || sql === "COMMIT" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
       if (sql.includes('SELECT turn."id"')) return { rows: [{ id: "turn-1" }], rowCount: 1 }
       if (sql.includes('SELECT "id", "ordinal", "taskId"')) return { rows: [], rowCount: 0 }
@@ -167,6 +182,7 @@ describe("PostgreSQL TurnEngine store", () => {
     const calls: string[] = []
     const client = { query: vi.fn(async (sql: string) => {
       calls.push(sql)
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1" }], rowCount: 1 }
       if (sql.includes('SELECT turn."id"')) return { rows: [{ id: "turn-1" }], rowCount: 1 }
       if (sql.includes('SELECT item."id"')) return { rows: [{ id: "item-1" }], rowCount: 1 }
       if (sql.includes('UPDATE "agent_items"')) return { rows: [{ id: "item-1", revision: 1 }], rowCount: 1 }
@@ -186,6 +202,7 @@ describe("PostgreSQL TurnEngine store", () => {
     const calls: string[] = []
     const client = { query: vi.fn(async (sql: string) => {
       calls.push(sql)
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1" }], rowCount: 1 }
       if (sql.includes('SELECT turn."id"')) return { rows: [{ id: "turn-1" }], rowCount: 1 }
       if (sql.includes('SELECT "id" FROM "agent_steps"') || sql.includes('SELECT item."id"')) return { rows: [], rowCount: 0 }
       return { rows: [], rowCount: 1 }
@@ -195,5 +212,42 @@ describe("PostgreSQL TurnEngine store", () => {
     await expect(store.appendEvent({ owner: childOwner, id: "event-old", itemId: "item-old", type: "tool.result", correlationId: "turn-1", causationId: null, idempotencyKey: "event-old", payload: {} })).rejects.toThrow(/item item-old lineage/)
     expect(calls.some(sql => sql.includes('INSERT INTO "agent_items"'))).toBe(false)
     expect(calls.some(sql => sql.includes('INSERT INTO "agent_events"'))).toBe(false)
+  })
+
+  it.each(["aborted", "archived"])("rejects every mutating path for a %s session before any write", async status => {
+    const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
+    const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+      calls.push({ sql, values })
+      if (sql === "BEGIN" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "agent_sessions"')) {
+        const sessionRows = ["aborted", "archived"].includes(status) ? [] : [{ id: "session-1" }]
+        return { rows: sessionRows, rowCount: sessionRows.length }
+      }
+      return { rows: [{ id: "unexpected" }], rowCount: 1 }
+    }), release: vi.fn() }
+    const store = createPgTurnEngineStore({ connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">)
+    const operations: Array<() => Promise<unknown>> = [
+      () => store.appendEvent({ owner, id: `closed-event-${status}`, itemId: null, type: "turn.started", correlationId: "closed", causationId: null, idempotencyKey: `closed:${status}:event`, payload: {} }),
+      () => store.startStep({ owner, stepId: `closed-step-${status}`, ordinal: 0, attempt: 1, inputThroughSequence: 0n, consumedInputIds: [], modelProfileSnapshot: {}, now }),
+      () => store.updateStep({ owner, stepId: "closed-step", status: "completed", finishReason: "done", errorCode: null, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, now }),
+      () => store.waitForUser!({ owner, now }),
+      () => store.createItem({ owner, itemId: `closed-item-${status}`, stepId: null, type: "agent_message", status: "started", phase: "commentary", content: {}, now }),
+      () => store.updateItem({ owner, itemId: "closed-item", expectedRevision: 0, status: "completed", phase: "commentary", content: {}, startedAt: now, completedAt: now, now }),
+      () => store.recordFinalResponse!({ owner, response: "closed", now }),
+    ]
+    for (const operation of operations) await expect(operation()).rejects.toMatchObject({ name: "TurnEnginePersistenceConflict" })
+
+    const sessionLocks = calls.filter(({ sql }) => sql.includes('FROM "agent_sessions"'))
+    expect(sessionLocks).toHaveLength(operations.length)
+    expect(sessionLocks.every(({ sql, values }) => sql.includes('"status" NOT IN (\'aborted\', \'archived\')')
+      && sql.includes("FOR UPDATE") && values?.[0] === owner.sessionId && values?.[1] === owner.userId)).toBe(true)
+    const workQueries = calls.filter(({ sql }) => sql !== "BEGIN" && sql !== "ROLLBACK" && !sql.includes("set_config"))
+    expect(workQueries.every(({ sql }) => sql.includes('FROM "agent_sessions"'))).toBe(true)
+    expect(calls.some(({ sql }) => sql.includes('SELECT turn."id"'))).toBe(false)
+    expect(calls.some(({ sql }) => sql.includes('INSERT INTO "agent_steps"') || sql.includes('UPDATE "agent_steps"'))).toBe(false)
+    expect(calls.some(({ sql }) => sql.includes('INSERT INTO "agent_items"') || sql.includes('UPDATE "agent_items"'))).toBe(false)
+    expect(calls.some(({ sql }) => sql.includes('INSERT INTO "agent_events"') || sql.includes('UPDATE "agent_events"'))).toBe(false)
+    expect(calls.some(({ sql }) => sql.includes('INSERT INTO "agent_outbox"') || sql.includes('UPDATE "agent_sessions"') || sql.includes('UPDATE "agent_turns"'))).toBe(false)
+    expect(calls.filter(({ sql }) => sql === "ROLLBACK")).toHaveLength(operations.length)
   })
 })

@@ -8,6 +8,7 @@ import { toRepositoryJson, type TurnEngineEventInput, type TurnEngineItem, type 
 type TurnEnginePool = Pick<pg.Pool, "connect">
 type QueryClient = Pick<pg.PoolClient, "query" | "release">
 type Row = Record<string, unknown>
+const OPEN_SESSION = `"status" NOT IN ('aborted', 'archived')`
 
 function json(value: RepositoryJsonValue): string { return JSON.stringify(value) }
 function conflict(resource: string): Error {
@@ -48,6 +49,12 @@ async function lockOwnedTurn(client: QueryClient, owner: ExecutionOwnerFence, al
   return Boolean(result.rows[0])
 }
 
+async function lockOpenSession(client: QueryClient, owner: ExecutionOwnerFence): Promise<boolean> {
+  const result = await client.query<Row>(`SELECT "id" FROM "agent_sessions"
+    WHERE "id" = $1 AND "userId" = $2 AND ${OPEN_SESSION} FOR UPDATE`, [owner.sessionId, owner.userId])
+  return Boolean(result.rows[0])
+}
+
 async function assertCurrentStepLineage(client: QueryClient, owner: ExecutionOwnerFence, stepId: string | null): Promise<void> {
   if (!stepId) return
   const attempt = owner.kind === "task" ? owner.attemptCount : 1
@@ -77,6 +84,7 @@ async function appendEventBatch(pool: TurnEnginePool, inputs: readonly TurnEngin
     || (owner.kind === "task" ? input.owner.attemptCount !== owner.attemptCount : input.owner.leaseVersion !== owner.leaseVersion))) throw conflict("event batch owner")
   for (const input of inputs) if (input.owner.kind === "task" && ["turn.completed", "turn.failed", "turn.interrupted"].includes(input.type)) throw conflict(`child root lifecycle ${input.type}`)
   return tenantTransaction(pool, owner.userId, async client => {
+    if (!await lockOpenSession(client, owner)) throw conflict(`session ${owner.sessionId}`)
     if (!await lockOwnedTurn(client, owner, true)) throw conflict(`turn ${owner.turnId}`)
     const result: { id: string }[] = []; let previousId: string | null = null
     for (const input of inputs) {
@@ -117,6 +125,7 @@ export function createPgTurnEngineStore(pool: TurnEnginePool): TurnEngineStore {
       try {
         await client.query("BEGIN")
         await client.query("SELECT set_config($1, $2, true)", ["app.user_id", input.owner.userId])
+        if (!await lockOpenSession(client, input.owner)) throw conflict(`step ${input.stepId}`)
         const fence = ownerFenceSql(input.owner, 1)
         const owned = input.owner.kind === "turn"
           ? await client.query<Row>(`SELECT turn."id" FROM "agent_turns" AS turn ${fence.joins} WHERE turn."id" = $5 AND turn."sessionId" = $6 AND ${fence.where} FOR UPDATE`, [...fence.values, input.owner.turnId, input.owner.sessionId])
@@ -144,6 +153,7 @@ export function createPgTurnEngineStore(pool: TurnEnginePool): TurnEngineStore {
     },
     async updateStep(input): Promise<void> {
       return tenantTransaction(pool, input.owner.userId, async client => {
+        if (!await lockOpenSession(client, input.owner)) throw conflict(`step ${input.stepId}`)
         if (!await lockOwnedTurn(client, input.owner, true)) throw conflict(`step ${input.stepId}`)
         const attempt = input.owner.kind === "task" ? input.owner.attemptCount : 1
         const guard = ownedTurn(input.owner, 13, 10, 9, true)
@@ -158,6 +168,7 @@ export function createPgTurnEngineStore(pool: TurnEnginePool): TurnEngineStore {
     async waitForUser(input): Promise<void> {
       if (input.owner.kind !== "turn") throw conflict(`child wait ${input.owner.taskId}`)
       return tenantTransaction(pool, input.owner.userId, async client => {
+        if (!await lockOpenSession(client, input.owner)) throw conflict(`session ${input.owner.sessionId}`)
         const guard = ownerFenceSql(input.owner, 4)
         const result = await client.query(`UPDATE "agent_turns" AS turn SET "status" = 'waiting_for_user', "revision" = "revision" + 1, "completedAt" = NULL, "updatedAt" = $1 ${guard.joins} WHERE turn."id" = $2 AND turn."sessionId" = $3 AND ${guard.where}`, [input.now, input.owner.turnId, input.owner.sessionId, ...guard.values])
         if (result.rowCount !== 1) throw conflict(`turn ${input.owner.turnId} wait state`)
@@ -165,6 +176,7 @@ export function createPgTurnEngineStore(pool: TurnEnginePool): TurnEngineStore {
     },
     async createItem(input): Promise<TurnEngineItem> {
       return tenantTransaction(pool, input.owner.userId, async client => {
+        if (!await lockOpenSession(client, input.owner)) throw conflict(`item ${input.itemId}`)
         const guard = ownedTurn(input.owner, 11, 3, 2, true)
         const stepAttempt = input.owner.kind === "task" ? 'owner_task."attemptCount"' : "1"
         if (!await lockOwnedTurn(client, input.owner, true)) throw conflict(`item ${input.itemId}`)
@@ -189,6 +201,7 @@ export function createPgTurnEngineStore(pool: TurnEnginePool): TurnEngineStore {
     },
     async updateItem(input): Promise<TurnEngineItem> {
       return tenantTransaction(pool, input.owner.userId, async client => {
+        if (!await lockOpenSession(client, input.owner)) throw conflict(`item ${input.itemId}`)
         if (!await lockOwnedTurn(client, input.owner, true)) throw conflict(`item ${input.itemId}`)
         await assertCurrentItemLineage(client, input.owner, input.itemId)
         const guard = ownedTurn(input.owner, 12, 9, 8, true)
@@ -210,6 +223,7 @@ export function createPgTurnEngineStore(pool: TurnEnginePool): TurnEngineStore {
     async recordFinalResponse(input): Promise<void> {
       if (input.owner.kind !== "turn") throw conflict(`child final response ${input.owner.taskId}`)
       return tenantTransaction(pool, input.owner.userId, async (client: QueryClient) => {
+        if (!await lockOpenSession(client, input.owner)) throw conflict(`turn ${input.owner.turnId}`)
         const guard = ownerFenceSql(input.owner, 5, true)
         const result = await client.query(`UPDATE "agent_turns" AS turn SET "finalResponse" = $1, "updatedAt" = $2 ${guard.joins} WHERE turn."id" = $3 AND turn."sessionId" = $4 AND ${guard.where}`, [input.response, input.now, input.owner.turnId, input.owner.sessionId, ...guard.values])
         if (result.rowCount !== 1) throw conflict(`final response for turn ${input.owner.turnId}`)
