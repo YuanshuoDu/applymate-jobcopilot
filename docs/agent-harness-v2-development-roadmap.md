@@ -1722,3 +1722,15 @@ A blocked or raced claim continues to surface only the recoverable `TurnLeaseErr
 **Independent verification:** Root independently verified the focused approval-store suite at **13/13**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, real concurrency and transaction races, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 51. P4-21 — Durable wait session-state fence
+
+**Candidate status/date (2026-09-13):** P4-21 is recorded as a candidate durable dependency-wait session-state safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `6fbb6a64` updates the durable wait store, resolver, handoff, and outcome consumer plus their sibling tests (8 wait modules total). Every wait create, resolve, cancel, scan/wake, suspend/requeue, dispatch-outbox, and consumed-outcome path is fenced by the linked `agent_sessions` status. `aborted` and `archived` sessions cannot create or resolve/cancel waits, be scanned or woken, suspend or requeue a Turn, dispatch an outbox row, or consume an outcome. Open `running`, `paused`, and `waiting_for_user` sessions, together with ordinary `user` and `system` sessions, remain compatible.
+
+Conditional wait/Turn/outbox mutations fail closed when a session closes during a wake or dispatch race; the surrounding transaction rolls back, so no partial wait or Turn wake is committed. A closed-session resolve race returns `null`. The existing lease, user/session scope, idempotency, replay, and deterministic dispatch behavior remain in force.
+
+**Independent verification:** Root independently verified the focused wait suites at **62/62**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, real cross-process concurrency, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
