@@ -104,6 +104,15 @@ export async function suspendAndReleaseWait(pool: LeasePool, input: DurableWaitH
   required(input.waitId, "waitId")
   const now = input.now ?? new Date()
   return transaction(pool, lease.userId, async client => {
+    const session = scope((await client.query<Row>(
+      `SELECT session."id", session."userId", session."status"
+       FROM "agent_sessions" AS session
+       WHERE session."id" = $1 AND session."userId" = $2 AND ${OPEN_SESSION} FOR UPDATE`,
+      [lease.sessionId, lease.userId],
+    )).rows[0], "Session is unavailable")
+    if (String(session.id) !== lease.sessionId || String(session.userId) !== lease.userId) {
+      throw new DurableWaitHandoffError("wait_scope_error", "Session is outside the wait scope")
+    }
     const turn = scope((await client.query<Row>(
       `SELECT turn."id", turn."userId", turn."sessionId", turn."rootTaskId", turn."status",
               turn."leaseOwnerId", turn."leaseVersion", turn."leaseExpiresAt", turn."leaseStartedAt"

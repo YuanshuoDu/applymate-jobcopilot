@@ -31,6 +31,13 @@ function fixture(waitStatus: string, turnStatus = "in_progress", suspendedAt: Da
     query: async (sql: string, params?: unknown[]) => {
       calls.push(sql)
       if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 1 }
+      if (sql.includes('SELECT session."id", session."userId", session."status"') && sql.includes("FOR UPDATE")) {
+        if (["aborted", "archived", "missing"].includes(state.sessionStatus)) {
+          if (!sql.includes(SESSION_FENCE)) throw new Error("missing session-state fence")
+          return { rows: [], rowCount: 0 }
+        }
+        return { rows: [{ id: lease.sessionId, userId: lease.userId, status: state.sessionStatus }], rowCount: 1 }
+      }
       if (sql.includes('FROM "agent_turns"')) {
         if (state.sessionStatus === "aborted" || state.sessionStatus === "archived") {
           if (!sql.includes(SESSION_FENCE)) throw new Error("missing session-state fence")
@@ -124,11 +131,22 @@ describe("durable dependency wait handoff", () => {
     expect(fake.state.updates).toEqual([])
   })
 
-  it.each(["aborted", "archived"])("does not suspend, requeue, or dispatch a %s session", async sessionStatus => {
+  it.each(["aborted", "archived", "missing"])("does not suspend, requeue, or dispatch a %s session", async sessionStatus => {
     const fake = fixture("ready", "in_progress", null, sessionStatus)
-    await expect(suspendAndReleaseWait(fake.pool as never, { lease, waitId: "wait-1", now })).rejects.toThrow("Turn is unavailable")
+    await expect(suspendAndReleaseWait(fake.pool as never, { lease, waitId: "wait-1", now })).rejects.toThrow("Session is unavailable")
     expect(fake.state.updates).toEqual([])
     expect(fake.state.outbox).toBe(false)
+  })
+
+  it("locks the scoped open session before locking the Turn", async () => {
+    const fake = fixture("waiting")
+    await suspendAndReleaseWait(fake.pool as never, { lease, waitId: "wait-1", now })
+    const sessionLock = fake.calls.findIndex(sql => sql.includes('SELECT session."id", session."userId", session."status"') && sql.includes("FOR UPDATE"))
+    const turnLock = fake.calls.findIndex(sql => sql.includes('SELECT turn."id"') && sql.includes("FOR UPDATE"))
+    expect(sessionLock).toBeGreaterThan(-1)
+    expect(fake.calls[sessionLock]).toContain('session."id" = $1 AND session."userId" = $2')
+    expect(fake.calls[sessionLock]).toContain(SESSION_FENCE)
+    expect(turnLock).toBeGreaterThan(sessionLock)
   })
 
   it.each(["running", "paused", "waiting_for_user"])("keeps %s sessions compatible", async sessionStatus => {

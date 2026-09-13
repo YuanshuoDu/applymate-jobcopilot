@@ -132,10 +132,11 @@ export async function reconcileDurableWaits(pool: LeasePool, options: DurableWai
   return transaction(pool, async client => {
     const turns = await client.query<Row>(
       `SELECT turn."id", turn."userId", turn."sessionId", turn."rootTaskId", turn."status", turn."leaseOwnerId"
-       FROM "agent_turns" AS turn
+       FROM "agent_sessions" AS session
+       JOIN "agent_turns" AS turn ON turn."sessionId" = session."id" AND turn."userId" = session."userId"
        WHERE turn."status" IN ('waiting_for_dependency', 'in_progress') AND turn."rootTaskId" IS NOT NULL
-         AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = turn."sessionId" AND ${OPEN_SESSION})
-       ORDER BY turn."updatedAt" ASC, turn."id" ASC LIMIT $1 FOR UPDATE SKIP LOCKED`,
+         AND ${OPEN_SESSION}
+       ORDER BY turn."updatedAt" ASC, turn."id" ASC LIMIT $1 FOR UPDATE OF session, turn SKIP LOCKED`,
       [batchSize],
     )
     let scanned = 0; let resolved = 0; let woken = 0

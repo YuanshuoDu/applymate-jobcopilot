@@ -18,8 +18,8 @@ function fixture(input: { turnStatus?: string; waitStatus?: string; suspended?: 
     query: async (sql: string, params?: unknown[]) => {
       calls.push(sql)
       if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 1 }
-      if (sql.includes('FROM "agent_turns"')) {
-        if (state.sessionStatus === "aborted" || state.sessionStatus === "archived") {
+      if (sql.includes('SELECT turn."id"') && sql.includes('JOIN "agent_turns" AS turn')) {
+        if (["aborted", "archived", "missing"].includes(state.sessionStatus)) {
           if (!sql.includes(SESSION_FENCE)) throw new Error("missing session-state fence")
           return { rows: [], rowCount: 0 }
         }
@@ -62,9 +62,10 @@ describe("durable wait resolver", () => {
   it("marks an early terminal match ready without waking an unsuspended parent", async () => {
     const fake = fixture({})
     await expect(reconcileDurableWaits(fake.pool as never, { now })).resolves.toEqual({ scanned: 1, resolved: 1, woken: 0 })
-    const turnScan = fake.calls.find(sql => sql.includes('FROM "agent_turns"') && sql.includes('ORDER BY turn."updatedAt"')) ?? ""
+    const turnScan = fake.calls.find(sql => sql.includes('JOIN "agent_turns" AS turn') && sql.includes('ORDER BY turn."updatedAt"')) ?? ""
     const waitScan = fake.calls.find(sql => sql.includes('FROM "agent_wait_conditions"') && sql.includes('ORDER BY "createdAt"')) ?? ""
-    expect(turnScan).toContain('ORDER BY turn."updatedAt" ASC, turn."id" ASC LIMIT $1 FOR UPDATE SKIP LOCKED')
+    expect(turnScan).toContain('ORDER BY turn."updatedAt" ASC, turn."id" ASC LIMIT $1 FOR UPDATE OF session, turn SKIP LOCKED')
+    expect(turnScan).toContain('JOIN "agent_turns" AS turn ON turn."sessionId" = session."id" AND turn."userId" = session."userId"')
     expect(waitScan).toContain('ORDER BY "createdAt" ASC, "id" ASC LIMIT $4 FOR UPDATE SKIP LOCKED')
     expect(fake.state.waits[0].status).toBe("ready")
     expect(fake.state.turns[0].status).toBe("in_progress")
@@ -108,7 +109,7 @@ describe("durable wait resolver", () => {
     await expect(reconcileDurableWaits(queued.pool as never, { now })).resolves.toEqual({ scanned: 0, resolved: 0, woken: 0 })
   })
 
-  it.each(["aborted", "archived"])("does not scan or wake a %s session", async sessionStatus => {
+  it.each(["aborted", "archived", "missing"])("does not scan or wake a %s session", async sessionStatus => {
     const fake = fixture({ sessionStatus })
     await expect(reconcileDurableWaits(fake.pool as never, { now })).resolves.toEqual({ scanned: 0, resolved: 0, woken: 0 })
     expect(fake.state.waitUpdates).toBe(0)
