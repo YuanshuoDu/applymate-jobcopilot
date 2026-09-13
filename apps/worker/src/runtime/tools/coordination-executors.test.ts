@@ -221,6 +221,77 @@ describe("coordination executors", () => {
     expect(runtime.wait.cancel).toHaveBeenCalledWith(expect.objectContaining({ taskId: "queued", reason: "interrupted" }))
   })
 
+  it("allows a root caller to interrupt a descendant and a child caller to close its own descendant", async () => {
+    const runtime = makeRuntime()
+    const child = makeTask({ id: "child", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/child", depth: 1, status: "queued" })
+    const grandchild = makeTask({ id: "grandchild", rootTaskId: "root-1", parentTaskId: "child", path: "/root-1/child/grandchild", depth: 2, status: "queued" })
+    runtime.store.tasks.set(child.id, child)
+    runtime.store.tasks.set(grandchild.id, grandchild)
+
+    await expect(executeInterruptSubagent(context({ taskId: "root-1", rootTaskId: "root-1" }), { taskId: child.id } satisfies InterruptSubagentInput, runtime.options))
+      .resolves.toMatchObject({ taskId: child.id, rootTaskId: "root-1", status: "interrupt_requested" })
+    expect(runtime.manager.interruptSubtree).toHaveBeenCalledWith("session-a", "root-1", child.path)
+
+    await expect(executeCloseSubagent(context({ taskId: child.id, rootTaskId: "root-1" }), { taskId: grandchild.id } satisfies CloseSubagentInput, runtime.options))
+      .resolves.toMatchObject({ taskId: grandchild.id, status: "closed", closed: true })
+    expect(runtime.manager.close).toHaveBeenCalledWith(grandchild.id, "session-a")
+  })
+
+  it("allows a child to manage itself but hides siblings and ancestors from lifecycle controls", async () => {
+    const runtime = makeRuntime()
+    const child = makeTask({ id: "child", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/child", depth: 1, status: "queued" })
+    const sibling = makeTask({ id: "sibling", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/sibling", depth: 1, status: "queued" })
+    runtime.store.tasks.set(child.id, child)
+    runtime.store.tasks.set(sibling.id, sibling)
+
+    await expect(executeCloseSubagent(context({ taskId: child.id, rootTaskId: "root-1" }), { taskId: child.id } satisfies CloseSubagentInput, runtime.options))
+      .resolves.toMatchObject({ taskId: child.id, status: "closed", closed: true })
+
+    const activityCount = runtime.store.activities.length
+    await expect(executeInterruptSubagent(context({ taskId: child.id, rootTaskId: "root-1" }), { taskId: sibling.id } satisfies InterruptSubagentInput, runtime.options))
+      .rejects.toMatchObject({ code: "coordination_task_not_found" })
+    await expect(executeCloseSubagent(context({ taskId: child.id, rootTaskId: "root-1" }), { taskId: "root-1" } satisfies CloseSubagentInput, runtime.options))
+      .rejects.toMatchObject({ code: "coordination_task_not_found" })
+    expect(runtime.store.activities).toHaveLength(activityCount)
+    expect(runtime.manager.interruptSubtree).not.toHaveBeenCalled()
+    expect(runtime.manager.close).toHaveBeenCalledOnce()
+    expect(runtime.wait.cancel).toHaveBeenCalledOnce()
+  })
+
+  it("does not reveal foreign user, session, or root tasks to lifecycle controls", async () => {
+    const runtime = makeRuntime()
+    runtime.store.tasks.set("foreign-user", makeTask({ id: "foreign-user", userId: "user-b", sessionId: "session-a", rootTaskId: "foreign-root", path: "/foreign-root/target", status: "queued" }))
+    runtime.store.tasks.set("foreign-root", makeTask({ id: "foreign-root", rootTaskId: "foreign-root", path: "/foreign-root", status: "queued" }))
+    runtime.store.tasks.set("foreign-session", makeTask({ id: "foreign-session", sessionId: "session-b", rootTaskId: "foreign-session", path: "/foreign-session", status: "queued" }))
+
+    for (const taskId of ["foreign-user", "foreign-session", "foreign-root"]) {
+      await expect(executeInterruptSubagent(context({ taskId: "root-1", rootTaskId: "root-1" }), { taskId } satisfies InterruptSubagentInput, runtime.options))
+        .rejects.toMatchObject({ code: "coordination_task_not_found" })
+    }
+    expect(runtime.manager.interruptSubtree).not.toHaveBeenCalled()
+    expect(runtime.wait.cancel).not.toHaveBeenCalled()
+    expect(runtime.store.activities).toHaveLength(0)
+  })
+
+  it("keeps child-to-parent messages available and repeated terminal controls idempotent", async () => {
+    const runtime = makeRuntime()
+    const child = makeTask({ id: "child", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/child", depth: 1, status: "interrupted" })
+    runtime.store.tasks.set(child.id, child)
+
+    await expect(executeSendMessage(context({ taskId: child.id, rootTaskId: "root-1" }), { idempotencyKey: "child-result", taskId: "root-1", kind: "result", payload: { ok: true } }, runtime.options))
+      .resolves.toMatchObject({ taskId: "root-1", status: "queued" })
+    await expect(executeInterruptSubagent(context({ taskId: "root-1", rootTaskId: "root-1" }), { taskId: child.id } satisfies InterruptSubagentInput, runtime.options))
+      .resolves.toMatchObject({ taskId: child.id, status: "interrupt_requested" })
+    await expect(executeInterruptSubagent(context({ taskId: "root-1", rootTaskId: "root-1" }), { taskId: child.id } satisfies InterruptSubagentInput, runtime.options))
+      .resolves.toMatchObject({ taskId: child.id, status: "interrupt_requested" })
+    await expect(executeCloseSubagent(context({ taskId: "root-1", rootTaskId: "root-1" }), { taskId: child.id } satisfies CloseSubagentInput, runtime.options))
+      .resolves.toMatchObject({ taskId: child.id, status: "interrupted", closed: false })
+    await expect(executeCloseSubagent(context({ taskId: "root-1", rootTaskId: "root-1" }), { taskId: child.id } satisfies CloseSubagentInput, runtime.options))
+      .resolves.toMatchObject({ taskId: child.id, status: "interrupted", closed: false })
+    expect(runtime.manager.interruptSubtree).toHaveBeenCalledTimes(2)
+    expect(runtime.manager.close).not.toHaveBeenCalled()
+  })
+
   it("fails visibly when durable wait is not integrated", async () => {
     const runtime = makeRuntime()
     const noWait = { ...runtime.options, wait: undefined }

@@ -93,7 +93,7 @@ export async function executeListSubagents(context: ToolExecutionContext, input:
 }
 
 export async function executeInterruptSubagent(context: ToolExecutionContext, input: InterruptSubagentInput, options: CoordinationExecutorOptions) {
-  const target = await visibleTask(context, input.taskId, options)
+  const target = await lifecycleTarget(context, input.taskId, options)
   let affected: number
   try { affected = await options.manager.interruptSubtree(context.sessionId, target.rootTaskId, target.path) } catch (error: unknown) { throw managerError(error) }
   await options.wait?.cancel?.({ userId: context.scope.userId, sessionId: context.sessionId, taskId: target.id, reason: "interrupted" })
@@ -102,7 +102,7 @@ export async function executeInterruptSubagent(context: ToolExecutionContext, in
 }
 
 export async function executeCloseSubagent(context: ToolExecutionContext, input: CloseSubagentInput, options: CoordinationExecutorOptions) {
-  const target = await visibleTask(context, input.taskId, options)
+  const target = await lifecycleTarget(context, input.taskId, options)
   if (["running"].includes(target.status)) throw new CoordinationError("coordination_close_not_allowed", "Running subagents must be interrupted before close")
   if (["completed", "failed", "interrupted", "cancelled", "closed"].includes(target.status)) {
     await activity(context, options, "close_subagent", target.id, { status: target.status, closed: false }, target.id)
@@ -126,6 +126,17 @@ async function visibleTask(context: ToolExecutionContext, taskId: string, option
   return task
 }
 
+async function lifecycleTarget(context: ToolExecutionContext, taskId: string, options: CoordinationExecutorOptions): Promise<CoordinationTaskView> {
+  const target = await visibleTask(context, taskId, options)
+  if (!context.taskId) return target
+
+  const caller = await visibleTask(context, context.taskId, options)
+  const isRootCaller = caller.id === caller.rootTaskId
+  const isSelfOrDescendant = target.id === caller.id || isTaskPathWithin(target.path, caller.path)
+  if (isRootCaller || isSelfOrDescendant) return target
+  throw new CoordinationError("coordination_task_not_found", "Subagent task is unavailable")
+}
+
 async function resolveSpawnParent(context: ToolExecutionContext, requested: string | undefined, options: CoordinationExecutorOptions): Promise<string | null> {
   if (requested && (!context.taskId || requested !== context.taskId)) throw new CoordinationError("coordination_scope_error", "Spawn parent must be the runtime-owned current task")
   if (!requested) return context.taskId ?? null
@@ -141,6 +152,7 @@ async function uniqueTasks(context: ToolExecutionContext, ids: readonly string[]
 
 function spawnOutput(task: CoordinationTaskView, replay: boolean) { return { taskId: task.id, rootTaskId: task.rootTaskId, parentTaskId: task.parentTaskId, path: task.path, depth: task.depth, status: task.status, replay } }
 function taskOutput(task: CoordinationTaskView) { return { taskId: task.id, rootTaskId: task.rootTaskId, parentTaskId: task.parentTaskId, path: task.path, depth: task.depth, role: task.role, taskType: task.taskType, status: task.status, attemptCount: task.attemptCount, maxAttempts: task.maxAttempts, leaseExpiresAt: task.leaseExpiresAt?.toISOString() ?? null, interruptRequestedAt: task.interruptRequestedAt?.toISOString() ?? null } }
+function isTaskPathWithin(path: string, ancestorPath: string): boolean { return path.startsWith(`${ancestorPath}/`) }
 function managerError(error: unknown): CoordinationError { const code = error && typeof error === "object" && "code" in error && typeof error.code === "string" ? error.code : "manager_failed"; return new CoordinationError(`coordination_${code}`, error instanceof Error ? error.message : "Subagent manager operation failed") }
 async function activity(context: ToolExecutionContext, options: CoordinationExecutorOptions, operation: string, taskId: string | null, data: Record<string, unknown>, operationKey?: string): Promise<void> {
   const key = `${operationKey ?? context.toolCallId ?? `${context.sessionId}:${context.turnId}:${context.stepId}`}:${operation}`
