@@ -1,6 +1,5 @@
 import type pg from "pg"
 import type { InputContentPart, TenantScope } from "@jobcopilot/agent-protocol"
-
 export type StepCheckpoint = {
   readonly inputThroughSequence: bigint
   readonly consumedInputIds: readonly string[]
@@ -45,7 +44,6 @@ export interface InputClaimStore {
 }
 export class InputClaimStoreError extends Error {
   readonly recoverable = false
-
   constructor(readonly code: "owner_conflict" | "checkpoint_conflict" | "store_conflict", message: string) {
     super(message)
     this.name = "InputClaimStoreError"
@@ -126,6 +124,15 @@ function checkpoint(row: CheckpointRow): StepCheckpoint {
   return { inputThroughSequence, consumedInputIds: ids }
 }
 async function assertOwner(client: QueryClient, scope: TenantScope, input: { sessionId: string; turnId: string }, lease?: TurnExecutionFence): Promise<void> {
+  const session = await client.query(
+    `SELECT "id"
+     FROM "agent_sessions"
+     WHERE "id" = $1 AND "userId" = $2
+       AND "status" NOT IN ('aborted', 'archived')
+     FOR UPDATE`,
+    [input.sessionId, scope.userId],
+  )
+  if (!session.rows[0]) throw new InputClaimStoreError("owner_conflict", `Session ${input.sessionId} is outside the tenant scope`)
   const result = await client.query(
     `SELECT turn."id"
      FROM "agent_turns" AS turn
@@ -139,7 +146,6 @@ async function assertOwner(client: QueryClient, scope: TenantScope, input: { ses
   )
   if (!result.rows[0]) throw new InputClaimStoreError("owner_conflict", `Turn ${input.turnId} is outside the tenant scope`)
 }
-
 function inputSql(): string {
   return `SELECT "id", "sessionId", "targetTurnId", "userId", "clientMessageId",
                  "delivery", "status", "content", "acceptedSequence", "consumedByStepId",
@@ -151,11 +157,9 @@ function inputSql(): string {
           ORDER BY "acceptedSequence" ASC, "id" ASC
           FOR UPDATE`
 }
-
 function sortInputs(inputs: StoredAgentInput[]): StoredAgentInput[] {
   return inputs.sort((left, right) => left.acceptedSequence < right.acceptedSequence ? -1 : left.acceptedSequence > right.acceptedSequence ? 1 : left.id.localeCompare(right.id))
 }
-
 function createTransaction(client: QueryClient, scope: TenantScope): InputClaimTransaction {
   return {
     async getCheckpoint(input) {
@@ -169,7 +173,6 @@ function createTransaction(client: QueryClient, scope: TenantScope): InputClaimT
       if (!result.rows[0]) throw new InputClaimStoreError("checkpoint_conflict", `Step ${input.stepId} is not owned by the Turn`)
       return checkpoint(result.rows[0])
     },
-
     async claimInputs(input) {
       await assertOwner(client, scope, input, input.lease)
       const existing = await client.query<InputRow>(inputSql(), [input.sessionId, input.turnId, scope.userId, input.stepId, [...input.checkpoint.consumedInputIds]])
@@ -183,7 +186,6 @@ function createTransaction(client: QueryClient, scope: TenantScope): InputClaimT
       if ((input.mode ?? (input.rebuild ? "rebuild" : "new")) !== "new") {
         return { inputs: existingInputs, newlyClaimedInputIds: [] }
       }
-
       const claimed = await client.query<InputRow>(
         `WITH candidates AS (
            SELECT "id"
@@ -211,7 +213,6 @@ function createTransaction(client: QueryClient, scope: TenantScope): InputClaimT
         newlyClaimedInputIds: newlyClaimed.map((item) => item.id),
       }
     },
-
     async persistCheckpoint(input) {
       await assertOwner(client, scope, input, input.lease)
       const result = await client.query(
@@ -224,7 +225,6 @@ function createTransaction(client: QueryClient, scope: TenantScope): InputClaimT
     },
   }
 }
-
 export function createPgInputClaimStore(pool: Pick<pg.Pool, "connect">, scope: TenantScope): InputClaimStore {
   const boundScope = Object.freeze({ userId: scope.userId })
   return {
