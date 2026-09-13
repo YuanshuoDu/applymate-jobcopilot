@@ -1755,6 +1755,16 @@ Conditional wait/Turn/outbox mutations fail closed when a session closes during 
 
 **Candidate boundary:** Live PostgreSQL/RLS, real concurrency, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
 
+## 55. P4-25 — Tool-result reference write session-state fence
+
+**Candidate status/date (2026-09-13):** P4-25 is recorded as a candidate private tool-result reference admission safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `a5198e2c` makes `put` lock the linked `agent_sessions` row first by user and session with an open-state `FOR UPDATE` fence, before task, step, identity, or reference writes. `aborted`, `archived`, missing, or cross-user sessions fail closed with `tool_result_fence_rejected`, roll back, and issue no reference `INSERT`. Historical reads for root and descendant scopes, including completed, failed, or aborted session records, remain unchanged; open running, paused, waiting-for-user, and ordinary user/system sessions remain compatible.
+
+**Independent verification:** Root independently verified the focused tool-result repository suite at **13/13**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrency, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
 ## 52. P4-22 — Wakeup resume session-state fence
 
 **Candidate status/date (2026-09-13):** P4-22 is recorded as a candidate wakeup resume safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
