@@ -703,3 +703,13 @@ Commits `c408e2a4` and `7cb3b169` harden recovered child dispatch writes. Recove
 Root independently verified the subagent, manager, coordination, and composition suites at **41/41**. Worker `tsc --noEmit --skipLibCheck`, the shared package build, and `git diff --check` also passed.
 
 Live PostgreSQL/RLS, Redis/queue delivery, restart behavior, and complete Worker E2E remain unverified. The cognitive gate remains disabled; P4-46 remains a candidate and overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-47 integration / verification
+
+Commit `5a6398e6` adds scoped child-subtree interruption. The coordination path carries the selected task path into `AgentTreeManager`, whose optional `interruptSubtree` store seam updates only the requested session/root/path subtree and filters active executions by the same scope before aborting and disposing matching controllers. When the seam is unavailable, the manager uses the root legacy fallback only for a root target; unsupported non-root scoped interruption fails visibly.
+
+The PostgreSQL path applies a session-first open `FOR UPDATE` fence before the path-subtree update. Durable wait cancellation uses the selected task and subtree scope, while closed, archived, and missing sessions are no-ops.
+
+Root independently verified the five focused Worker files at **71/71**; Worker `tsc --noEmit --skipLibCheck`, the `@jobcopilot/shared` build, and `git diff --check` passed.
+
+Live PostgreSQL/RLS, real concurrent execution, Redis/BullMQ, Worker restart, provider/browser behavior, and child-parent E2E remain unverified. The cognitive gate remains disabled. P4-47 is a candidate increment only; overall phase acceptance remains **P0 accepted 1/8 (12.5%)**.

@@ -1974,3 +1974,13 @@ Conditional wait/Turn/outbox mutations fail closed when a session closes during 
 **Independent verification:** Root independently verified the subagent, manager, coordination, and composition suites at **41/41**. Worker `tsc --noEmit --skipLibCheck`, the shared package build, and `git diff --check` also passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, restart behavior, and complete Worker E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance, and overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 76. P4-47 — Scoped child-subtree interruption
+
+**Candidate status/date (2026-09-13):** P4-47 is recorded as a candidate scoped child-subtree interruption increment only; overall phase acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `5a6398e6` carries the selected task path through the coordination executor and `AgentTreeManager`. The manager exposes an optional `interruptSubtree` store seam, filters active executions by session/root/path subtree, aborts and disposes matching controllers, and uses the root legacy fallback only for a root target when the seam is unavailable. Unsupported non-root scoped interruption fails visibly. The PostgreSQL implementation applies a session-first open `FOR UPDATE` fence before updating the requested path subtree. Durable wait cancellation follows the selected task and subtree scope; closed, archived, and missing sessions are no-ops.
+
+**Independent verification:** Root independently verified the five focused Worker files at **71/71**; Worker `tsc --noEmit --skipLibCheck`, the `@jobcopilot/shared` build, and `git diff --check` passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrent execution, Redis/BullMQ, Worker restart, provider/browser behavior, and child-parent E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance. Overall phase acceptance remains **P0 accepted 1/8 (12.5%)**.
