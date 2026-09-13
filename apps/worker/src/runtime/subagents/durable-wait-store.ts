@@ -176,16 +176,23 @@ export function createPgDurableWaitPort(pool: Pool): DurableWaitStore {
     required(input.userId, "userId"); required(input.sessionId, "sessionId"); required(input.taskId, "taskId")
     const status = input.reason
     await transaction(pool, input.userId, async client => {
-      const task = ensureScope((await client.query<Row>(`SELECT task."id", task."rootTaskId" FROM "sub_agent_tasks" AS task
+      const task = ensureScope((await client.query<Row>(`SELECT task."id", task."rootTaskId", task."path" FROM "sub_agent_tasks" AS task
         JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
         WHERE task."id" = $1 AND task."sessionId" = $2 AND session."userId" = $3 AND ${OPEN_SESSION} FOR SHARE`, [input.taskId, input.sessionId, input.userId])).rows[0], "Cancel task is unavailable")
-      const root = String(task.rootTaskId ?? task.id) === input.taskId
+      const rootTaskId = String(task.rootTaskId ?? task.id)
+      const root = rootTaskId === input.taskId
+      const targetPath = root ? null : scopedTaskPath(task.path)
       const predicate = root
         ? `"parentTaskId" IN (SELECT "id" FROM "sub_agent_tasks" WHERE "sessionId" = $3 AND "rootTaskId" = $4)`
-        : `"parentTaskId" = $4`
+        : `"parentTaskId" IN (SELECT scope_task."id" FROM "sub_agent_tasks" AS scope_task
+            WHERE scope_task."sessionId" = $3 AND scope_task."rootTaskId" = $4
+              AND (scope_task."path" = $6 OR scope_task."path" LIKE $6 || '/%'))`
+      const params = root
+        ? [status, new Date(), input.sessionId, rootTaskId, input.userId]
+        : [status, new Date(), input.sessionId, rootTaskId, input.userId, targetPath]
       await client.query(`UPDATE "agent_wait_conditions" SET "status" = $1, "resolvedAt" = COALESCE("resolvedAt", $2), "updatedAt" = $2
         WHERE "userId" = $5 AND "sessionId" = $3 AND "status" IN ('waiting', 'ready') AND ${predicate}
-          AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_wait_conditions"."sessionId" AND ${OPEN_SESSION})`, [status, new Date(), input.sessionId, root ? input.taskId : input.taskId, input.userId])
+          AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_wait_conditions"."sessionId" AND ${OPEN_SESSION})`, params)
     })
   }
 
@@ -194,6 +201,11 @@ export function createPgDurableWaitPort(pool: Pool): DurableWaitStore {
     suspendAndRelease: input => suspendAndReleaseWait(pool, input),
     reconcile: input => reconcileDurableWaits(pool, input),
   }
+}
+
+function scopedTaskPath(value: unknown): string {
+  if (typeof value !== "string" || !/^\/[^/%_\\]+(?:\/[^/%_\\]+)*$/.test(value)) throw new DurableWaitStoreError("wait_scope_error", "Cancel task path is unavailable")
+  return value
 }
 
 /** Compatibility name for callers that prefer the repository terminology. */

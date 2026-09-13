@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 
 import { AgentTreeManager, type SubagentClock } from "./manager.js"
 import {
@@ -92,6 +92,19 @@ class MemoryStore implements SubagentStore {
     return count
   }
 
+  async interruptSubtree(input: { sessionId: string; rootTaskId: string; targetPath: string; now: Date }): Promise<number> {
+    let count = 0
+    for (const task of this.records.values()) {
+      if (task.sessionId !== input.sessionId || task.rootTaskId !== input.rootTaskId
+        || !(task.path === input.targetPath || task.path.startsWith(`${input.targetPath}/`))
+        || ["completed", "failed", "interrupted", "cancelled", "closed"].includes(task.status)) continue
+      count += 1
+      const interrupted = task.status === "queued" || task.status === "retrying" || task.status === "waiting" || task.status === "waiting_for_user"
+      this.records.set(task.id, { ...task, interruptRequestedAt: input.now, status: interrupted ? "interrupted" : task.status })
+    }
+    return count
+  }
+
   async recoverExpired(): Promise<SubagentTaskRecord[]> { return [] }
 }
 
@@ -161,5 +174,47 @@ describe("AgentTreeManager", () => {
     await expect(running).resolves.toMatchObject({ status: "lease_lost" })
     expect(store.records.get(task.id)).toMatchObject({ status: "queued", leaseOwner: null, leaseExpiresAt: null })
     expect(manager.activeCount(task.sessionId)).toBe(0)
+  })
+
+  it("interrupts only a target subtree, releases its slots, and keeps siblings running", async () => {
+    const store = new MemoryStore()
+    const manager = new AgentTreeManager(store, { clock: new FakeClock() })
+    const root = await manager.spawn(spec())
+    const target = await manager.spawn(spec({ parentTaskId: root.id }))
+    const descendant = await manager.spawn(spec({ parentTaskId: target.id }))
+    const sibling = await manager.spawn(spec({ parentTaskId: root.id }))
+    let finishSibling!: (result: SubagentExecutionResult) => void
+    const targetRun = manager.run(payload(target, "target-worker"), async ({ lease }) => new Promise<SubagentExecutionResult>(resolve => {
+      lease.signal.addEventListener("abort", () => resolve({ status: "failed" }), { once: true })
+    }))
+    const siblingRun = manager.run(payload(sibling, "sibling-worker"), async () => new Promise<SubagentExecutionResult>(resolve => {
+      finishSibling = resolve
+    }))
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    await expect(manager.interruptSubtree(target.sessionId, root.id, target.path)).resolves.toBe(2)
+    await expect(targetRun).resolves.toMatchObject({ status: "interrupted" })
+    expect(store.records.get(target.id)).toMatchObject({ status: "interrupted", interruptRequestedAt: expect.any(Date) })
+    expect(store.records.get(descendant.id)).toMatchObject({ status: "interrupted" })
+    expect(store.records.get(sibling.id)).toMatchObject({ status: "running", interruptRequestedAt: null })
+    expect(manager.activeCount(target.sessionId)).toBe(1)
+
+    finishSibling({ status: "completed" })
+    await expect(siblingRun).resolves.toMatchObject({ status: "completed" })
+    expect(manager.activeCount(target.sessionId)).toBe(0)
+    await expect(manager.interruptSubtree(root.sessionId, root.id, root.path)).resolves.toBe(1)
+  })
+
+  it("uses whole-root interruption only for an exact root path on legacy stores", async () => {
+    const store = new MemoryStore()
+    Object.defineProperty(store, "interruptSubtree", { value: undefined })
+    const interruptTree = vi.spyOn(store, "interruptTree")
+    const manager = new AgentTreeManager(store, { clock: new FakeClock() })
+    const root = await manager.spawn(spec())
+
+    await expect(manager.interruptSubtree(root.sessionId, root.rootTaskId, root.path)).resolves.toBe(1)
+    expect(interruptTree).toHaveBeenCalledOnce()
+    await expect(manager.interruptSubtree(root.sessionId, root.rootTaskId, `${root.path}/child`)).rejects.toMatchObject({ code: "not_available" })
+    expect(interruptTree).toHaveBeenCalledOnce()
   })
 })

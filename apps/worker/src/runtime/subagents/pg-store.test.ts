@@ -313,6 +313,42 @@ describe("PgSubagentTaskStore", () => {
     expect(update).toContain("'waiting_for_user'")
   })
 
+  it("interrupts only the requested path subtree in a transaction", async () => {
+    const fake = fakePool(sql => {
+      if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "session-1", status: "running" }], rowCount: 1 }
+      if (sql.startsWith("UPDATE")) return { rowCount: 3 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+    await expect(store.interruptSubtree({ sessionId: "session-1", rootTaskId: "root-1", targetPath: "/root-1/child-a", now })).resolves.toBe(3)
+    const sessionIndex = fake.calls.findIndex(([sql]) => sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE"))
+    const updateIndex = fake.calls.findIndex(([sql]) => sql.startsWith("UPDATE"))
+    const update = fake.calls[updateIndex]?.[0] ?? ""
+    expect(sessionIndex).toBeGreaterThan(-1)
+    expect(sessionIndex).toBeLessThan(updateIndex)
+    expect(update).toContain('"rootTaskId" = $2')
+    expect(update).toContain('("path" = $3 OR "path" LIKE $3 || \'/%\')')
+    expect(update).toContain('"status" IN (\'queued\', \'running\', \'retrying\', \'waiting\', \'waiting_for_user\')')
+    expect(fake.calls.map(([sql]) => sql)).toContain("BEGIN")
+    expect(fake.calls.map(([sql]) => sql)).toContain("COMMIT")
+  })
+
+  it.each(["aborted", "archived"] as const)("does not update tasks for a %s session", async status => {
+    const fake = fakePool(sql => sql.includes('FROM "agent_sessions"') ? { rows: [{ id: "session-1", status }], rowCount: 1 } : {})
+    const store = new PgSubagentTaskStore(fake.pool)
+    await expect(store.interruptSubtree({ sessionId: "session-1", rootTaskId: "root-1", targetPath: "/root-1/child-a", now })).resolves.toBe(0)
+    expect(fake.calls.some(([sql]) => sql.startsWith("UPDATE"))).toBe(false)
+    expect(fake.calls.find(([sql]) => sql.includes('FROM "agent_sessions"'))?.[0]).toContain('"status" NOT IN (\'aborted\', \'archived\')')
+    expect(fake.calls.map(([sql]) => sql)).toContain("COMMIT")
+  })
+
+  it("does not update tasks when the scoped session is missing", async () => {
+    const fake = fakePool(sql => sql.includes('FROM "agent_sessions"') ? { rows: [] } : {})
+    const store = new PgSubagentTaskStore(fake.pool)
+    await expect(store.interruptSubtree({ sessionId: "missing-session", rootTaskId: "root-1", targetPath: "/root-1/child-a", now })).resolves.toBe(0)
+    expect(fake.calls.some(([sql]) => sql.startsWith("UPDATE"))).toBe(false)
+  })
+
   it("reclaims stale leases into queued or terminal states", async () => {
     const fake = fakePool(sql => {
       if (sql.includes("leaseExpiresAt") && sql.includes("FOR UPDATE")) return { rows: [taskRow({ status: "running", sessionStatus: "running", leaseOwner: "dead-worker", leaseExpiresAt: new Date(now.getTime() - 1), attemptCount: 1 })], rowCount: 1 }

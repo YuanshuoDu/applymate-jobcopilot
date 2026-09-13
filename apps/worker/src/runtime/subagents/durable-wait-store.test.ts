@@ -152,14 +152,22 @@ describe("durable PostgreSQL wait port", () => {
   })
 
   it("cancels only waits in the scoped task or its root tree", async () => {
-    const test = fixture([{ rows: [{ id: "parent-a", rootTaskId: "root-a" }] }, { rows: [], rowCount: 1 }])
+    const test = fixture([{ rows: [{ id: "parent-a", rootTaskId: "root-a", path: "/root-a/parent-a" }] }, { rows: [], rowCount: 1 }])
     await expect(createPgDurableWaitPort(test.pool as never).cancel?.({ userId: base.userId, sessionId: base.sessionId, taskId: "parent-a", reason: "interrupted" })).resolves.toBeUndefined()
     const update = test.calls.find(call => call.sql.includes("UPDATE \"agent_wait_conditions\""))
     expect(update?.sql).toContain('"status" IN (\'waiting\', \'ready\')')
     expect(update?.params).toContain("interrupted")
     expect(update?.sql).toContain(SESSION_FENCE)
+    expect(update?.sql).toContain('scope_task."path" = $6 OR scope_task."path" LIKE $6 || \'/%\'')
 
     const foreign = fixture([{ rows: [] }])
     await expect(createPgDurableWaitPort(foreign.pool as never).cancel?.({ userId: base.userId, sessionId: base.sessionId, taskId: "foreign", reason: "closed" })).rejects.toMatchObject({ code: "wait_scope_error" })
+  })
+
+  it("keeps root cancellation covering every wait owner in the root tree", async () => {
+    const test = fixture([{ rows: [{ id: "root-a", rootTaskId: "root-a", path: "/root-a" }] }, { rows: [], rowCount: 2 }])
+    await expect(createPgDurableWaitPort(test.pool as never).cancel?.({ userId: base.userId, sessionId: base.sessionId, taskId: "root-a", reason: "interrupted" })).resolves.toBeUndefined()
+    const update = test.calls.find(call => call.sql.includes("UPDATE \"agent_wait_conditions\""))
+    expect(update?.sql).toContain('"parentTaskId" IN (SELECT "id" FROM "sub_agent_tasks" WHERE "sessionId" = $3 AND "rootTaskId" = $4)')
   })
 })

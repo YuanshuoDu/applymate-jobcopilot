@@ -95,8 +95,8 @@ export async function executeListSubagents(context: ToolExecutionContext, input:
 export async function executeInterruptSubagent(context: ToolExecutionContext, input: InterruptSubagentInput, options: CoordinationExecutorOptions) {
   const target = await visibleTask(context, input.taskId, options)
   let affected: number
-  try { affected = await options.manager.interrupt(context.sessionId, target.rootTaskId) } catch (error: unknown) { throw managerError(error) }
-  await options.wait?.cancel?.({ userId: context.scope.userId, sessionId: context.sessionId, taskId: target.rootTaskId, reason: "interrupted" })
+  try { affected = await options.manager.interruptSubtree(context.sessionId, target.rootTaskId, target.path) } catch (error: unknown) { throw managerError(error) }
+  await options.wait?.cancel?.({ userId: context.scope.userId, sessionId: context.sessionId, taskId: target.id, reason: "interrupted" })
   await activity(context, options, "interrupt_subagent", target.id, { rootTaskId: target.rootTaskId, affected }, target.id)
   return { taskId: target.id, rootTaskId: target.rootTaskId, status: "interrupt_requested" as const, affectedCount: affected, reason: input.reason ?? null }
 }

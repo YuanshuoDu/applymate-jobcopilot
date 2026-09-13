@@ -170,6 +170,25 @@ export class AgentTreeManager {
     return count
   }
 
+  async interruptSubtree(sessionId: string, rootTaskId: string, targetPath: string): Promise<number> {
+    const normalizedTargetPath = normalizeTaskPath(targetPath)
+    if (!normalizedTargetPath) throw new SubagentLeaseError("not_available", "Scoped subagent interruption target is invalid")
+    const interruptSubtree = this.store.interruptSubtree
+    if (!interruptSubtree) {
+      if (normalizedTargetPath === `/${rootTaskId}`) return this.interrupt(sessionId, rootTaskId)
+      throw new SubagentLeaseError("not_available", "Scoped subagent interruption is unavailable")
+    }
+    const count = await interruptSubtree.call(this.store, { sessionId, rootTaskId, targetPath: normalizedTargetPath, now: this.now() })
+    for (const active of this.active.values()) {
+      if (active.lease.sessionId !== sessionId || active.lease.rootTaskId !== rootTaskId || !isTaskPathWithin(active.lease.path, normalizedTargetPath)) continue
+      const error = new SubagentLeaseError("lost", "Subagent subtree was interrupted")
+      active.controller.abort(error)
+      active.resolveLost(error)
+      this.dispose(active.lease.id)
+    }
+    return count
+  }
+
   /** Stop active children and release their leases before Worker resources close. */
   async shutdown(): Promise<void> {
     const active = [...this.active.values()]
@@ -222,4 +241,12 @@ function policyFromTask(task: SubagentTaskRecord): SubagentPolicy {
     ? (budget as Record<string, unknown>).subagentPolicy : undefined
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return normalizeSubagentPolicy()
   return normalizeSubagentPolicy(raw as Partial<SubagentPolicy>)
+}
+
+function normalizeTaskPath(path: string): string | null {
+  return /^\/[^/%_\\]+(?:\/[^/%_\\]+)*$/.test(path) ? path : null
+}
+
+function isTaskPathWithin(path: string, targetPath: string): boolean {
+  return path === targetPath || path.startsWith(`${targetPath}/`)
 }

@@ -234,6 +234,24 @@ export class PgSubagentTaskStore implements SubagentStore {
     } finally { client.release() }
   }
 
+  async interruptSubtree(input: { sessionId: string; rootTaskId: string; targetPath: string; now: Date }): Promise<number> {
+    return transaction(this.pool, async client => {
+      const session = await client.query(`SELECT "id", "status" FROM "agent_sessions"
+        WHERE "id" = $1 AND "status" NOT IN ('aborted', 'archived') FOR UPDATE`, [input.sessionId])
+      const sessionStatus = String(session.rows[0]?.status ?? "")
+      if (!session.rows[0] || sessionStatus === "aborted" || sessionStatus === "archived") return 0
+      const result = await client.query(`UPDATE "sub_agent_tasks" SET
+        "interruptRequestedAt" = COALESCE("interruptRequestedAt", $4),
+        "status" = CASE WHEN "status" IN ('queued', 'retrying', 'waiting', 'waiting_for_user') THEN 'interrupted' ELSE "status" END,
+        "completedAt" = CASE WHEN "status" IN ('queued', 'retrying', 'waiting', 'waiting_for_user') THEN $4 ELSE "completedAt" END,
+        "updatedAt" = $4 WHERE "sessionId" = $1 AND "rootTaskId" = $2
+          AND ("path" = $3 OR "path" LIKE $3 || '/%')
+          AND "status" IN ('queued', 'running', 'retrying', 'waiting', 'waiting_for_user')`,
+      [input.sessionId, input.rootTaskId, input.targetPath, input.now])
+      return result.rowCount ?? 0
+    })
+  }
+
   async recoverExpired(input: { now: Date; limit: number }): Promise<SubagentTaskRecord[]> {
     if (!Number.isInteger(input.limit) || input.limit < 1) throw new RangeError("Recovery limit must be positive")
     return transaction(this.pool, async (client) => {

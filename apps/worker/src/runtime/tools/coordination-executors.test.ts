@@ -101,6 +101,12 @@ function makeRuntime() {
       for (const task of store.tasks.values()) if (task.sessionId === sessionId && task.rootTaskId === rootTaskId && task.status !== "completed") count += 1
       return count
     }),
+    interruptSubtree: vi.fn(async (sessionId: string, rootTaskId: string, targetPath: string) => {
+      let count = 0
+      for (const task of store.tasks.values()) if (task.sessionId === sessionId && task.rootTaskId === rootTaskId
+        && (task.path === targetPath || task.path.startsWith(`${targetPath}/`)) && !["completed", "failed", "interrupted", "cancelled", "closed"].includes(task.status)) count += 1
+      return count
+    }),
   } as unknown as AgentTreeManager
   const wait = {
     wait: vi.fn(async (input: { targetTaskIds: readonly string[] }) => ({ waitId: "wait-1", status: "ready" as const, deadlineAt: "2026-09-03T00:01:00.000Z", matchedTaskIds: [...input.targetTaskIds] })),
@@ -211,7 +217,8 @@ describe("coordination executors", () => {
       .resolves.toMatchObject({ status: "closed", closed: true })
     await expect(executeInterruptSubagent(context({ taskId: "root-1", rootTaskId: "root-1" }), { taskId: "queued", reason: "stop" } satisfies InterruptSubagentInput, runtime.options))
       .resolves.toMatchObject({ rootTaskId: "root-1", status: "interrupt_requested" })
-    expect(runtime.wait.cancel).toHaveBeenCalledWith(expect.objectContaining({ taskId: "root-1", reason: "interrupted" }))
+    expect(runtime.manager.interruptSubtree).toHaveBeenCalledWith("session-a", "root-1", "/root-1/queued")
+    expect(runtime.wait.cancel).toHaveBeenCalledWith(expect.objectContaining({ taskId: "queued", reason: "interrupted" }))
   })
 
   it("fails visibly when durable wait is not integrated", async () => {
