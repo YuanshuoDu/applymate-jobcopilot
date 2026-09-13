@@ -1712,3 +1712,13 @@ A blocked or raced claim continues to surface only the recoverable `TurnLeaseErr
 **Independent verification:** Root independently verified the focused pg-store suite at **29/29**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, real cross-process concurrency and shutdown races, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 50. P4-20 — Approval session-state fence
+
+**Candidate status/date (2026-09-13):** P4-20 is recorded as a candidate approval lifecycle session-state safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, and candidate slices do not count as accepted progress.
+
+**Implementation:** Commit `9cf15f19` adds an `agent_sessions` open-state fence across approval issue/projectWait, resolve, validate, inspect, consume, and consumeAndReserve paths. Approval reads use an open-session `EXISTS` condition, approval mutations repeat the condition, and `appendAudit` retains an open-session lock fence. Aborted or archived sessions fail closed; `consumeAndReserve` cannot create an external-action reservation or audit/outbox event, while running, paused, waiting-for-user, and ordinary user/system sessions remain compatible with the existing nonce, scope, revision, and tenant semantics. A project-wait closure rolls back the transaction before its wait/item/event side effects are committed.
+
+**Independent verification:** Root independently verified the focused approval-store suite at **13/13**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrency and transaction races, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
