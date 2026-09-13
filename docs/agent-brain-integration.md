@@ -723,3 +723,11 @@ One-time disposal, slot release, and timer cleanup are protected, while late wri
 Root independently verified the five focused Worker files at **75/75**; Worker `tsc --noEmit --skipLibCheck`, the `@jobcopilot/shared` build (pretest), and `git diff --check` passed.
 
 Live PostgreSQL/RLS, real concurrent execution, Redis/BullMQ, Worker restart, provider/browser behavior, and child-parent E2E remain unverified. The cognitive gate remains disabled; P4-48 is a candidate increment only and overall phase acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-49 integration / verification
+
+Commit `0941a812` fences root/child lifecycle controls by lineage. A root task may control the root and same-tree descendants; a non-root task may control itself and its descendants. Sibling, ancestor, and foreign tasks remain hidden. `send_message` behavior remains unchanged.
+
+Root independently verified the focused Worker suites at **13/13**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+Live PostgreSQL/RLS, real concurrent execution, Redis/BullMQ delivery, Worker restart, provider/browser behavior, and complete E2E remain unverified. The cognitive gate remains disabled; P4-49 is a candidate increment only and overall acceptance remains **P0 accepted 1/8 (12.5%)**.
