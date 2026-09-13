@@ -184,6 +184,18 @@ describe("PgSubagentTaskStore", () => {
     await expect(store.finish({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, status: "completed", now })).resolves.toBeNull()
   })
 
+  it.each(["aborted", "archived"] as const)("does not finish a child in a %s session", async status => {
+    const fake = fakePool(sql => {
+      if (sql.includes('FROM "sub_agent_tasks" task')) return { rows: [taskRow({ status: "running", sessionStatus: status, leaseOwner: "worker-1", attemptCount: 1, leaseExpiresAt: new Date(now.getTime() + 60_000) })], rowCount: 1 }
+      if (sql.startsWith("UPDATE")) return { rowCount: 0 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+    await expect(store.finish({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, status: "completed", now })).resolves.toBeNull()
+    const update = fake.calls.find(([sql]) => sql.startsWith("UPDATE"))?.[0] ?? ""
+    expect(update).toContain('session."status" NOT IN (\'aborted\', \'archived\')')
+  })
+
   it("releases only the fenced running lease and republishes its outbox row", async () => {
     const fake = fakePool(sql => sql.startsWith("UPDATE") ? { rowCount: 1 } : {})
     const store = new PgSubagentTaskStore(fake.pool)
@@ -202,12 +214,25 @@ describe("PgSubagentTaskStore", () => {
   it("surfaces a durable interrupt during heartbeat instead of renewing", async () => {
     const fake = fakePool(sql => {
       if (sql.startsWith("UPDATE")) return { rows: [{ interruptRequestedAt: now }], rowCount: 1 }
+      if (sql.startsWith("SELECT") && sql.includes('FROM "agent_sessions"')) return { rows: [{ status: "running" }], rowCount: 1 }
       return {}
     })
     const store = new PgSubagentTaskStore(fake.pool)
     await expect(store.heartbeat({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, now })).resolves.toBe("interrupted")
     const update = fake.calls.find(([sql]) => sql.startsWith("UPDATE"))?.[0] ?? ""
     expect(update).toContain('"attemptCount" = $5')
+    expect(update).toContain('session."status" NOT IN (\'aborted\', \'archived\')')
+  })
+
+  it.each(["aborted", "archived"] as const)("does not renew a child in a %s session", async status => {
+    const fake = fakePool(sql => {
+      if (sql.startsWith("UPDATE")) return { rowCount: 0 }
+      if (sql.startsWith("SELECT") && sql.includes('FROM "agent_sessions"')) return { rows: [{ status }], rowCount: 1 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+    await expect(store.heartbeat({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, now })).resolves.toBe("interrupted")
+    expect(fake.calls.some(([sql]) => sql.startsWith("UPDATE"))).toBe(false)
   })
 
   it("marks the whole root tree for interruption without cancelling terminal tasks", async () => {
@@ -221,7 +246,7 @@ describe("PgSubagentTaskStore", () => {
 
   it("reclaims stale leases into queued or terminal states", async () => {
     const fake = fakePool(sql => {
-      if (sql.includes("leaseExpiresAt") && sql.includes("FOR UPDATE")) return { rows: [taskRow({ status: "running", leaseOwner: "dead-worker", leaseExpiresAt: new Date(now.getTime() - 1), attemptCount: 1 })], rowCount: 1 }
+      if (sql.includes("leaseExpiresAt") && sql.includes("FOR UPDATE")) return { rows: [taskRow({ status: "running", sessionStatus: "running", leaseOwner: "dead-worker", leaseExpiresAt: new Date(now.getTime() - 1), attemptCount: 1 })], rowCount: 1 }
       if (sql.startsWith("UPDATE")) return { rowCount: 1 }
       return {}
     })
@@ -230,5 +255,18 @@ describe("PgSubagentTaskStore", () => {
     expect(result).toHaveLength(1)
     expect(result[0].status).toBe("queued")
     expect(fake.calls.some(([sql]) => sql.includes("SKIP LOCKED"))).toBe(true)
+  })
+
+  it.each(["aborted", "archived"] as const)("reclaims a stale child from a %s session as interrupted", async status => {
+    const fake = fakePool(sql => {
+      if (sql.includes("leaseExpiresAt") && sql.includes("FOR UPDATE")) return { rows: [taskRow({ status: "running", sessionStatus: status, leaseOwner: "dead-worker", leaseExpiresAt: new Date(now.getTime() - 1), attemptCount: 1 })], rowCount: 1 }
+      if (sql.startsWith("UPDATE")) return { rowCount: 1 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+    const result = await store.recoverExpired({ now, limit: 10 })
+    expect(result[0]?.status).toBe("interrupted")
+    const select = fake.calls.find(([sql]) => sql.includes("leaseExpiresAt") && sql.includes("FOR UPDATE"))?.[0] ?? ""
+    expect(select).toContain('session."status"')
   })
 })
