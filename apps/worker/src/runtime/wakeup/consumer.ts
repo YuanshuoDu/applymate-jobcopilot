@@ -14,15 +14,20 @@ interface OutboxRow {
 
 const DEFAULT_BATCH_SIZE = 10
 const DEFAULT_POLL_MS = 1_000
+const CLOSED_SESSION_STATUSES = new Set(["aborted", "archived"])
 
 function json(value: unknown): string {
   return JSON.stringify(value)
 }
 
-async function appendResumeEvent(client: Client, payload: AgentTurnWakeupPayload): Promise<void> {
+async function appendResumeEvent(client: Client, payload: AgentTurnWakeupPayload, userId: string): Promise<void> {
   const sequenceResult = await client.query<{ eventSequence: string | bigint }>(
-    `UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1 WHERE "id" = $1 RETURNING "eventSequence"`,
-    [payload.sessionId],
+    `UPDATE "agent_sessions" AS session
+     SET "eventSequence" = "eventSequence" + 1
+     WHERE session."id" = $1 AND session."userId" = $2
+       AND session."status" NOT IN ('aborted', 'archived')
+     RETURNING "eventSequence"`,
+    [payload.sessionId, userId],
   )
   const sequence = sequenceResult.rows[0]?.eventSequence
   if (sequence === undefined) throw new Error("Agent session sequence is unavailable for wakeup")
@@ -51,13 +56,23 @@ async function appendResumeEvent(client: Client, payload: AgentTurnWakeupPayload
 }
 
 async function resumeInTransaction(client: Client, payload: AgentTurnWakeupPayload): Promise<WakeupResult> {
+  const sessionResult = await client.query<{ userId: string; status: string }>(
+    `SELECT "userId", "status" FROM "agent_sessions" WHERE "id" = $1 FOR UPDATE`,
+    [payload.sessionId],
+  )
+  const session = sessionResult.rows[0]
+  if (!session || CLOSED_SESSION_STATUSES.has(session.status)) {
+    return { status: "ignored", sessionId: payload.sessionId, turnId: payload.turnId, itemId: payload.itemId, toolCallId: payload.toolCallId }
+  }
+  await client.query(`SELECT set_config($1, $2, true)`, ["app.user_id", session.userId])
+
   const turnResult = await client.query<{ userId: string; status: string; revision: number }>(
-    `SELECT turn."userId", turn."status", turn."revision" FROM "agent_turns" AS turn WHERE turn."id" = $1 AND turn."sessionId" = $2 FOR UPDATE`,
-    [payload.turnId, payload.sessionId],
+    `SELECT turn."userId", turn."status", turn."revision" FROM "agent_turns" AS turn
+     WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 FOR UPDATE`,
+    [payload.turnId, payload.sessionId, session.userId],
   )
   const turn = turnResult.rows[0]
   if (!turn) return { status: "ignored", sessionId: payload.sessionId, turnId: payload.turnId, itemId: payload.itemId, toolCallId: payload.toolCallId }
-  await client.query(`SELECT set_config($1, $2, true)`, ["app.user_id", turn.userId])
 
   if (turn.status === "queued" || turn.status === "in_progress") {
     return { status: "already_resumed", sessionId: payload.sessionId, turnId: payload.turnId, itemId: payload.itemId, toolCallId: payload.toolCallId }
@@ -78,11 +93,19 @@ async function resumeInTransaction(client: Client, payload: AgentTurnWakeupPaylo
   if (itemToolCallId !== payload.toolCallId) throw new Error("Agent wait tool lineage does not match wakeup")
 
   const updated = await client.query(
-    `UPDATE "agent_turns" SET "status" = 'queued', "revision" = "revision" + 1, "completedAt" = NULL, "updatedAt" = CURRENT_TIMESTAMP WHERE "id" = $1 AND "sessionId" = $2 AND "status" IN ('waiting_for_approval', 'waiting_for_user') AND "revision" = $3`,
-    [payload.turnId, payload.sessionId, payload.nextTurnRevision],
+    `UPDATE "agent_turns" AS turn
+     SET "status" = 'queued', "revision" = "revision" + 1, "completedAt" = NULL, "updatedAt" = CURRENT_TIMESTAMP
+     WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3
+       AND turn."status" IN ('waiting_for_approval', 'waiting_for_user') AND turn."revision" = $4
+       AND EXISTS (
+         SELECT 1 FROM "agent_sessions" AS session
+         WHERE session."id" = turn."sessionId" AND session."userId" = turn."userId"
+           AND session."status" NOT IN ('aborted', 'archived')
+       )`,
+    [payload.turnId, payload.sessionId, session.userId, payload.nextTurnRevision],
   )
   if (updated.rowCount !== 1) return { status: "already_resumed", sessionId: payload.sessionId, turnId: payload.turnId, itemId: payload.itemId, toolCallId: payload.toolCallId }
-  await appendResumeEvent(client, payload)
+  await appendResumeEvent(client, payload, session.userId)
   return { status: "resumed", sessionId: payload.sessionId, turnId: payload.turnId, itemId: payload.itemId, toolCallId: payload.toolCallId }
 }
 
