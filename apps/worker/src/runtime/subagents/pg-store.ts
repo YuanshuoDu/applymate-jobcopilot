@@ -4,6 +4,8 @@ import type pg from "pg"
 import {
   isTerminalSubagentStatus,
   SubagentLimitError,
+  type AtomicSubagentSpawnInput,
+  type AtomicSubagentSpawnResult,
   type PgSubagentPool,
   type SubagentExecutionResult,
   type SubagentStore,
@@ -72,46 +74,37 @@ export class PgSubagentTaskStore implements SubagentStore {
   }
 
   async create(input: SubagentTaskSpec & { policy: SubagentPolicy }): Promise<SubagentTaskRecord> {
-    return transaction(this.pool, async (client) => {
-      const session = await client.query(`SELECT "id", "status" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 FOR UPDATE`, [input.sessionId, input.userId])
-      const sessionStatus = String(session.rows[0]?.status ?? "")
-      if (!session.rows[0] || sessionStatus === "aborted" || sessionStatus === "archived") throw new Error("Session is unavailable")
-      const parent = input.parentTaskId
-        ? await client.query(`SELECT "id", "rootTaskId", "path", "depth", "status", "allowedActions", "modelProfileSnapshot", "budgetSnapshot", "toolPolicySnapshot"
-             FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 FOR UPDATE`, [input.parentTaskId, input.sessionId])
-        : { rows: [] }
-      if (input.parentTaskId && !parent.rows[0]) throw new Error("Parent task is unavailable")
-      const parentRow = parent.rows[0] as Record<string, unknown> | undefined
-      if (parentRow && isTerminalSubagentStatus(String(parentRow.status))) throw new Error("Parent task is terminal")
-      const depth = parentRow ? Number(parentRow.depth) + 1 : 0
-      if (depth > input.policy.maxDepth) throw new SubagentLimitError("depth", "Subagent depth limit reached")
-      if (input.parentTaskId) {
-        const children = await client.query(`SELECT COUNT(*)::int AS "count" FROM "sub_agent_tasks"
-          WHERE "sessionId" = $1 AND "parentTaskId" = $2
-            AND "status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')`, [input.sessionId, input.parentTaskId])
-        if (Number(children.rows[0]?.count ?? 0) >= input.policy.maxFanOut) throw new SubagentLimitError("fan_out", "Subagent fan-out limit reached")
-      }
-      const id = `subagent-${randomUUID()}`
-      const rootTaskId = parentRow ? String(parentRow.rootTaskId ?? input.parentTaskId) : id
-      const path = parentRow ? `${String(parentRow.path).replace(/\/$/, "")}/${id}` : `/${id}`
-      // Tree step limits are shared through AgentTreeBudgetReservation; copying
-      // the parent snapshot here would create a second spendable allowance.
-      const budget = { subagentPolicy: input.policy }
-      const toolPolicy = parentRow ? asObject(parentRow.toolPolicySnapshot) : asObject(input.toolPolicySnapshot)
-      const inheritedModel = parentRow?.modelProfileSnapshot
-      const modelProfile = parentRow ? (inheritedModel ?? input.modelProfileSnapshot ?? {}) : (input.modelProfileSnapshot ?? {})
-      const parentActions = parentRow ? actionList(parentRow.allowedActions) : []
-      const requestedActions = actionList(input.allowedActions)
-      if (parentRow && requestedActions.some(action => !parentActions.includes(action))) throw new Error("Child allowed actions exceed parent policy")
-      const allowedActions = parentRow && requestedActions.length === 0 ? parentActions : requestedActions
-      const result = await client.query(`${INSERT_TASK} RETURNING "id"`, [
-        id, input.sessionId, input.turnId ?? null, rootTaskId, input.parentTaskId ?? null, path, depth,
-        input.role, input.taskType, input.goal, json(input.constraints, []), json(input.successCriteria, []),
-        json(allowedActions, []), json(input.context, {}), json(input.expectedOutputSchema, {}),
-        json(modelProfile, {}, "model_profile"), json(toolPolicy, {}, "tool_policy"), json(budget, {}, "budget"), input.policy.maxAttempts,
-      ])
-      return this.read(client, result.rows[0].id, input.sessionId)
-    })
+    return transaction(this.pool, client => this.createTask(client, input))
+  }
+
+  async createWithSpawn(input: AtomicSubagentSpawnInput): Promise<AtomicSubagentSpawnResult> {
+    try {
+      return await transaction(this.pool, async client => {
+        await client.query(`SELECT set_config('app.user_id', $1, true)`, [input.userId])
+        await this.lockSession(client, input)
+        const existing = await client.query(`SELECT "payload" FROM "agent_outbox"
+          WHERE "topic" = 'agent.subagent.spawn' AND "aggregateId" = $1 AND "idempotencyKey" = $2 FOR UPDATE`,
+        [input.sessionId, spawnKey(input.sessionId, input.spawnIdempotencyKey)])
+        if (existing.rows[0]) {
+          const payload = existing.rows[0].payload as Record<string, unknown> | undefined
+          const taskId = payload && typeof payload.taskId === "string" ? payload.taskId : null
+          if (!taskId) throw new Error("Spawn idempotency record is invalid")
+          return { task: await this.read(client, taskId, input.sessionId), duplicate: true }
+        }
+        const task = await this.createTask(client, input, true)
+        const operation = await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
+          VALUES ($1, 'agent.subagent.spawn', $2, $3, $4::jsonb) ON CONFLICT ("idempotencyKey") DO NOTHING`,
+        [`spawn-operation-${randomUUID()}`, input.sessionId, spawnKey(input.sessionId, input.spawnIdempotencyKey), JSON.stringify({ taskId: task.id })])
+        if (operation.rowCount !== 1) throw new DuplicateSpawnSignal()
+        await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
+          VALUES ($1, 'agent.subagent.dispatch', $2, $3, $4::jsonb) ON CONFLICT ("idempotencyKey") DO NOTHING`,
+        [`subagent-dispatch-${randomUUID()}`, input.sessionId, `subagent-dispatch:${task.id}`, JSON.stringify({ taskId: task.id, sessionId: task.sessionId, rootTaskId: task.rootTaskId, ownerId: `coordination-${randomUUID()}` })])
+        return { task, duplicate: false }
+      })
+    } catch (error: unknown) {
+      if (error instanceof DuplicateSpawnSignal) return { task: null, duplicate: true }
+      throw error
+    }
   }
 
   async claim(input: { taskId: string; sessionId: string; ownerId: string; policy: SubagentPolicy; now: Date }): Promise<SubagentTaskRecord | null> {
@@ -263,7 +256,55 @@ export class PgSubagentTaskStore implements SubagentStore {
     if (!result.rows[0]) throw new Error("Subagent task disappeared")
     return rowToTask(result.rows[0] as Record<string, unknown>)
   }
+
+  private async createTask(client: Queryable, input: SubagentTaskSpec & { policy: SubagentPolicy }, sessionLocked = false): Promise<SubagentTaskRecord> {
+    if (!sessionLocked) await this.lockSession(client, input)
+    const parent = input.parentTaskId
+      ? await client.query(`SELECT "id", "rootTaskId", "path", "depth", "status", "allowedActions", "modelProfileSnapshot", "budgetSnapshot", "toolPolicySnapshot"
+           FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 FOR UPDATE`, [input.parentTaskId, input.sessionId])
+      : { rows: [] }
+    if (input.parentTaskId && !parent.rows[0]) throw new Error("Parent task is unavailable")
+    const parentRow = parent.rows[0] as Record<string, unknown> | undefined
+    if (parentRow && isTerminalSubagentStatus(String(parentRow.status))) throw new Error("Parent task is terminal")
+    const depth = parentRow ? Number(parentRow.depth) + 1 : 0
+    if (depth > input.policy.maxDepth) throw new SubagentLimitError("depth", "Subagent depth limit reached")
+    if (input.parentTaskId) {
+      const children = await client.query(`SELECT COUNT(*)::int AS "count" FROM "sub_agent_tasks"
+        WHERE "sessionId" = $1 AND "parentTaskId" = $2
+          AND "status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')`, [input.sessionId, input.parentTaskId])
+      if (Number(children.rows[0]?.count ?? 0) >= input.policy.maxFanOut) throw new SubagentLimitError("fan_out", "Subagent fan-out limit reached")
+    }
+    const id = `subagent-${randomUUID()}`
+    const rootTaskId = parentRow ? String(parentRow.rootTaskId ?? input.parentTaskId) : id
+    const path = parentRow ? `${String(parentRow.path).replace(/\/$/, "")}/${id}` : `/${id}`
+    // Tree step limits are shared through AgentTreeBudgetReservation; copying
+    // the parent snapshot here would create a second spendable allowance.
+    const budget = { subagentPolicy: input.policy }
+    const toolPolicy = parentRow ? asObject(parentRow.toolPolicySnapshot) : asObject(input.toolPolicySnapshot)
+    const inheritedModel = parentRow?.modelProfileSnapshot
+    const modelProfile = parentRow ? (inheritedModel ?? input.modelProfileSnapshot ?? {}) : (input.modelProfileSnapshot ?? {})
+    const parentActions = parentRow ? actionList(parentRow.allowedActions) : []
+    const requestedActions = actionList(input.allowedActions)
+    if (parentRow && requestedActions.some(action => !parentActions.includes(action))) throw new Error("Child allowed actions exceed parent policy")
+    const allowedActions = parentRow && requestedActions.length === 0 ? parentActions : requestedActions
+    const result = await client.query(`${INSERT_TASK} RETURNING "id"`, [
+      id, input.sessionId, input.turnId ?? null, rootTaskId, input.parentTaskId ?? null, path, depth,
+      input.role, input.taskType, input.goal, json(input.constraints, []), json(input.successCriteria, []),
+      json(allowedActions, []), json(input.context, {}), json(input.expectedOutputSchema, {}),
+      json(modelProfile, {}, "model_profile"), json(toolPolicy, {}, "tool_policy"), json(budget, {}, "budget"), input.policy.maxAttempts,
+    ])
+    if (!result.rows[0]?.id) throw new Error("Subagent task insert failed")
+    return this.read(client, String(result.rows[0].id), input.sessionId)
+  }
+
+  private async lockSession(client: Queryable, input: { sessionId: string; userId: string }): Promise<void> {
+    const session = await client.query(`SELECT "id", "status" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 FOR UPDATE`, [input.sessionId, input.userId])
+    const sessionStatus = String(session.rows[0]?.status ?? "")
+    if (!session.rows[0] || sessionStatus === "aborted" || sessionStatus === "archived") throw new Error("Session is unavailable")
+  }
 }
+
+class DuplicateSpawnSignal extends Error {}
 
 function asObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
@@ -276,6 +317,8 @@ function actionList(value: unknown): string[] {
 function dateValue(value: unknown): Date | null {
   return value instanceof Date || typeof value === "string" ? date(value) : null
 }
+
+function spawnKey(sessionId: string, key: string): string { return `coordination-spawn:${sessionId}:${key}` }
 
 const INSERT_TASK = `INSERT INTO "sub_agent_tasks" (
   "id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status",

@@ -19,24 +19,42 @@ export async function executeSpawn(context: ToolExecutionContext, input: SpawnSu
     return spawnOutput(replay, true)
   }
   let task: CoordinationTaskView
-  try {
-    task = await options.manager.spawn({
-      userId: context.scope.userId, sessionId: context.sessionId, turnId: context.turnId, parentTaskId,
-      role: input.role, taskType: input.taskType, goal: input.goal, constraints: input.constraints,
-      successCriteria: input.successCriteria, allowedActions: input.allowedActions, context: input.context,
-    })
-  } catch (error: unknown) { throw managerError(error) }
-  try {
-    const recorded = await options.store.recordSpawn({ userId: context.scope.userId, sessionId: context.sessionId, idempotencyKey: input.idempotencyKey, task })
-    if (!recorded) {
+  const spec = {
+    userId: context.scope.userId, sessionId: context.sessionId, turnId: context.turnId, parentTaskId,
+    role: input.role, taskType: input.taskType, goal: input.goal, constraints: input.constraints,
+    successCriteria: input.successCriteria, allowedActions: input.allowedActions, context: input.context,
+  }
+  const atomic = typeof options.manager.supportsAtomicSpawn === "function" && options.manager.supportsAtomicSpawn()
+  if (atomic) {
+    let result: Awaited<ReturnType<typeof options.manager.spawnAtomic>>
+    try {
+      result = await options.manager.spawnAtomic(spec, input.idempotencyKey)
+    } catch (error: unknown) { throw managerError(error) }
+    if (result.duplicate || !result.task) {
       const winner = await options.store.getSpawnReplay({ userId: context.scope.userId, sessionId: context.sessionId, idempotencyKey: input.idempotencyKey })
-      await options.manager.close(task.id, context.sessionId)
-      if (winner) return spawnOutput(winner, true)
+      if (winner) {
+        await activity(context, options, "spawn_subagent", winner.id, { path: winner.path, status: winner.status, replay: true }, input.idempotencyKey)
+        return spawnOutput(winner, true)
+      }
       throw new CoordinationError("coordination_idempotency_conflict", "Spawn idempotency record was lost")
     }
-  } catch (error: unknown) {
-    await options.manager.close(task.id, context.sessionId).catch(() => false)
-    throw error
+    task = result.task
+  } else {
+    try {
+      task = await options.manager.spawn(spec)
+    } catch (error: unknown) { throw managerError(error) }
+    try {
+      const recorded = await options.store.recordSpawn({ userId: context.scope.userId, sessionId: context.sessionId, idempotencyKey: input.idempotencyKey, task })
+      if (!recorded) {
+        const winner = await options.store.getSpawnReplay({ userId: context.scope.userId, sessionId: context.sessionId, idempotencyKey: input.idempotencyKey })
+        await options.manager.close(task.id, context.sessionId)
+        if (winner) return spawnOutput(winner, true)
+        throw new CoordinationError("coordination_idempotency_conflict", "Spawn idempotency record was lost")
+      }
+    } catch (error: unknown) {
+      await options.manager.close(task.id, context.sessionId).catch(() => false)
+      throw error
+    }
   }
   await activity(context, options, "spawn_subagent", task.id, { path: task.path, status: task.status }, input.idempotencyKey)
   return spawnOutput(task, false)

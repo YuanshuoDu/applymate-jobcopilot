@@ -130,6 +130,31 @@ describe("coordination executors", () => {
     expect(runtime.store.activities).toContain("spawn_subagent")
   })
 
+  it("uses the production atomic spawn seam without a second spawn transaction", async () => {
+    const runtime = makeRuntime()
+    const task = makeTask({ id: "child-atomic", status: "queued", path: "/child-atomic" })
+    runtime.manager.supportsAtomicSpawn = vi.fn(() => true)
+    runtime.manager.spawnAtomic = vi.fn(async () => ({ task: task as never, duplicate: false, atomic: true }))
+    runtime.store.recordSpawn = vi.fn(async () => { throw new Error("recordSpawn must not run") })
+    const result = await executeSpawn(context(), { idempotencyKey: "spawn-atomic", role: "scout", taskType: "inspect", goal: "Inspect" }, runtime.options)
+    expect(result).toMatchObject({ taskId: "child-atomic", replay: false })
+    expect(runtime.manager.spawnAtomic).toHaveBeenCalledOnce()
+    expect(runtime.manager.spawn).not.toHaveBeenCalled()
+  })
+
+  it("replays an atomic duplicate without closing the winner", async () => {
+    const runtime = makeRuntime()
+    const task = makeTask({ id: "child-winner", status: "queued", path: "/child-winner" })
+    runtime.store.tasks.set(task.id, task)
+    runtime.store.spawnOperations.set("session-a:spawn-atomic", task.id)
+    runtime.manager.supportsAtomicSpawn = vi.fn(() => true)
+    runtime.manager.spawnAtomic = vi.fn(async () => ({ task: null, duplicate: true, atomic: true }))
+    const result = await executeSpawn(context(), { idempotencyKey: "spawn-atomic", role: "scout", taskType: "inspect", goal: "Inspect" }, runtime.options)
+    expect(result).toMatchObject({ taskId: "child-winner", replay: true })
+    expect(runtime.manager.close).not.toHaveBeenCalled()
+    expect(runtime.store.activities).toContain("spawn_subagent")
+  })
+
   it("does not pass an injected expected output schema to the manager", async () => {
     const runtime = makeRuntime()
     const input = {

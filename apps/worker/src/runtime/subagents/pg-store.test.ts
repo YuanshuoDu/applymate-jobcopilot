@@ -48,6 +48,61 @@ describe("PgSubagentTaskStore", () => {
     expect(insert?.[1]).toContain(JSON.stringify({ subagentPolicy: policy }))
   })
 
+  it("atomically creates a child with its spawn operation and dispatch outbox", async () => {
+    const fake = fakePool(sql => {
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1", status: "running" }], rowCount: 1 }
+      if (sql.includes('FROM "agent_outbox"')) return { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "sub_agent_tasks" task')) return { rows: [taskRow()], rowCount: 1 }
+      if (sql.startsWith("INSERT INTO \"sub_agent_tasks\"")) return { rows: [{ id: "task-1" }], rowCount: 1 }
+      if (sql.startsWith("INSERT INTO \"agent_outbox\"")) return { rows: [], rowCount: 1 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+    const result = await store.createWithSpawn({ userId: "user-1", sessionId: "session-1", role: "scout", taskType: "test", goal: "inspect", policy, spawnIdempotencyKey: "spawn-1" })
+    expect(result).toMatchObject({ duplicate: false, task: { id: "task-1", status: "queued" } })
+    const writes = fake.calls.filter(([sql]) => sql.startsWith("INSERT INTO \"agent_outbox\""))
+    expect(writes).toHaveLength(2)
+    const sessionIndex = fake.calls.findIndex(([sql]) => sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE"))
+    const taskIndex = fake.calls.findIndex(([sql]) => sql.startsWith("INSERT INTO \"sub_agent_tasks\""))
+    const operationIndex = fake.calls.findIndex(([sql]) => sql.startsWith("INSERT INTO \"agent_outbox\"") && sql.includes("'agent.subagent.spawn'"))
+    expect(sessionIndex).toBeGreaterThan(-1)
+    expect(sessionIndex).toBeLessThan(taskIndex)
+    expect(operationIndex).toBeGreaterThan(taskIndex)
+    expect(fake.calls.map(([sql]) => sql)).toContain("COMMIT")
+  })
+
+  it("replays an existing spawn key before parent fan-out validation", async () => {
+    const fake = fakePool(sql => {
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1", status: "running" }], rowCount: 1 }
+      if (sql.includes('FROM "agent_outbox"')) return { rows: [{ payload: { taskId: "task-1" } }], rowCount: 1 }
+      if (sql.includes('FROM "sub_agent_tasks" task')) return { rows: [taskRow({ id: "task-1" })], rowCount: 1 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+    const result = await store.createWithSpawn({ userId: "user-1", sessionId: "session-1", parentTaskId: "parent-1", role: "scout", taskType: "test", goal: "inspect", policy: normalizeSubagentPolicy({ maxFanOut: 1 }), spawnIdempotencyKey: "spawn-1" })
+    expect(result).toMatchObject({ duplicate: true, task: { id: "task-1" } })
+    expect(fake.calls.some(([sql]) => sql.startsWith("INSERT INTO \"sub_agent_tasks\""))).toBe(false)
+    expect(fake.calls.some(([sql]) => sql.startsWith("INSERT INTO \"agent_outbox\""))).toBe(false)
+    expect(fake.calls.map(([sql]) => sql)).toContain("COMMIT")
+  })
+
+  it("rolls back the task when the atomic dispatch outbox write fails", async () => {
+    let taskInserted = false
+    const fake = fakePool(sql => {
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1", status: "running" }], rowCount: 1 }
+      if (sql.includes('FROM "agent_outbox"')) return { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "sub_agent_tasks" task')) return { rows: [taskRow()], rowCount: 1 }
+      if (sql.startsWith("INSERT INTO \"sub_agent_tasks\"")) { taskInserted = true; return { rows: [{ id: "task-1" }], rowCount: 1 } }
+      if (sql === "ROLLBACK") { taskInserted = false; return {} }
+      if (sql.startsWith("INSERT INTO \"agent_outbox\"")) throw new Error("outbox unavailable")
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+    await expect(store.createWithSpawn({ userId: "user-1", sessionId: "session-1", role: "scout", taskType: "test", goal: "inspect", policy, spawnIdempotencyKey: "spawn-fail" })).rejects.toThrow("outbox unavailable")
+    expect(fake.calls.map(([sql]) => sql)).toContain("ROLLBACK")
+    expect(taskInserted).toBe(false)
+  })
+
   it.each(["aborted", "archived"] as const)("rejects child creation for a %s session", async status => {
     const fake = fakePool(sql => sql.includes('FROM "agent_sessions"') ? { rows: [{ id: "session-1", status }], rowCount: 1 } : {})
     const store = new PgSubagentTaskStore(fake.pool)

@@ -59,6 +59,16 @@ export type SubagentTaskSpec = {
   policy?: Partial<SubagentPolicy>
 }
 
+export type AtomicSubagentSpawnInput = SubagentTaskSpec & {
+  policy: SubagentPolicy
+  spawnIdempotencyKey: string
+}
+
+export type AtomicSubagentSpawnResult = {
+  task: SubagentTaskRecord | null
+  duplicate: boolean
+}
+
 export type SubagentTaskRecord = {
   id: string
   userId: string
@@ -104,6 +114,7 @@ export type SubagentExecutionResult = {
 
 export type SubagentStore = {
   create(input: SubagentTaskSpec & { policy: SubagentPolicy }): Promise<SubagentTaskRecord>
+  createWithSpawn?(input: AtomicSubagentSpawnInput): Promise<AtomicSubagentSpawnResult>
   get(taskId: string, sessionId: string): Promise<SubagentTaskRecord | null>
   claim(input: { taskId: string; sessionId: string; ownerId: string; policy: SubagentPolicy; now: Date }): Promise<SubagentTaskRecord | null>
   heartbeat(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; now: Date }): Promise<"renewed" | "interrupted" | "lost">

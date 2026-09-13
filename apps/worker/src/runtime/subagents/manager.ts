@@ -5,6 +5,7 @@ import {
   SubagentLimitError,
   SubagentLeaseError,
   type SubagentExecutionResult,
+  type AtomicSubagentSpawnResult,
   type SubagentJobPayload,
   type SubagentLease,
   type SubagentPolicy,
@@ -64,6 +65,17 @@ export class AgentTreeManager {
     if (spec.parentTaskId && !parent) throw new Error("Parent task is unavailable")
     const policy = inheritSubagentPolicy(parent ? policyFromTask(parent) : null, spec.policy)
     return this.store.create({ ...spec, policy })
+  }
+
+  supportsAtomicSpawn(): boolean { return typeof this.store.createWithSpawn === "function" }
+
+  async spawnAtomic(spec: SubagentTaskSpec, spawnIdempotencyKey: string): Promise<AtomicSubagentSpawnResult & { atomic: boolean }> {
+    const parent = spec.parentTaskId ? await this.store.get(spec.parentTaskId, spec.sessionId) : null
+    if (spec.parentTaskId && !parent) throw new Error("Parent task is unavailable")
+    const policy = inheritSubagentPolicy(parent ? policyFromTask(parent) : null, spec.policy)
+    const createWithSpawn = this.store.createWithSpawn
+    if (!createWithSpawn) return { task: await this.store.create({ ...spec, policy }), duplicate: false, atomic: false }
+    return { ...(await createWithSpawn.call(this.store, { ...spec, policy, spawnIdempotencyKey })), atomic: true }
   }
 
   async claim(payload: SubagentJobPayload, now = this.now()): Promise<SubagentLease | null> {
