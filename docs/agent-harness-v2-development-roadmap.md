@@ -1795,6 +1795,16 @@ Conditional wait/Turn/outbox mutations fail closed when a session closes during 
 
 **Candidate boundary:** Live PostgreSQL/RLS, real concurrent lock races, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
 
+## 59. P4-29 — Input claim/checkpoint session-first fence
+
+**Candidate status/date (2026-09-13):** P4-29 is recorded as a candidate input claim and checkpoint persistence safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `c936b441` makes `assertOwner` lock the user-owned open `agent_sessions` row first with `status NOT IN ('aborted', 'archived')` and `FOR UPDATE`, then acquire the existing Turn ownership, status, and lease `FOR UPDATE` check. The fence covers `getCheckpoint`, `claimInputs`, and `persistCheckpoint`; closed, missing, or cross-user sessions return `owner_conflict` and roll back before subsequent Turn, Input, or Step reads or writes. FIFO, lease, rebuild, idempotency, in-memory, and historical read semantics remain unchanged.
+
+**Independent verification:** Root independently verified `input-claim-store.test.ts` at **9/9**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrent lock races, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
 ## 52. P4-22 — Wakeup resume session-state fence
 
 **Candidate status/date (2026-09-13):** P4-22 is recorded as a candidate wakeup resume safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.

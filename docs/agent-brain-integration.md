@@ -571,3 +571,11 @@ Commit `142360dc` adds a session-first fence to durable interrupt persistence an
 Root independently verified the focused interrupt persistence and terminal-event suites at **26/26**; `@jobcopilot/shared` build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
 
 Live PostgreSQL/RLS, real concurrent lock races, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E remain unverified. P4-28 remains a candidate and does not establish complete Harness/P4/Phase or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-29 update
+
+Commit `c936b441` adds a session-first open-session fence to the PostgreSQL input claim and checkpoint chain. `assertOwner` locks the user-owned `agent_sessions` row with `status NOT IN ('aborted', 'archived')` and `FOR UPDATE`, then locks the existing Turn ownership, status, and lease fence. `getCheckpoint`, `claimInputs`, and `persistCheckpoint` all use this order; closed, missing, and cross-user sessions return `owner_conflict` and roll back before subsequent Turn, Input, or Step reads or writes. FIFO, lease, rebuild, idempotency, in-memory, and historical read semantics remain unchanged.
+
+Root independently verified `input-claim-store.test.ts` at **9/9**; `@jobcopilot/shared` build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
+
+Live PostgreSQL/RLS, real concurrent lock races, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E remain unverified. P4-29 remains a candidate and does not establish complete Harness/P4/Phase or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
