@@ -471,3 +471,11 @@ Commit `01dc8edd` closes the automation Turn source-isolation gap. Both active a
 The manual automation POST maps this conflict to HTTP `409`. The due scheduler skips the unsafe round without execution or queue dispatch and restores `nextRunAt` to the current time for retry. Focused Web validation passed **23/23**, Web `tsc --noEmit --skipLibCheck`, and `git diff --check` passed as well.
 
 Live PostgreSQL/RLS, real concurrent database behavior, Redis/queue delivery, real Worker restart, production scheduler timing, provider, browser, and child-parent E2E remain unverified. This candidate does not complete Harness or P4/Phase, and overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-13 update
+
+Commit `7fe3fd7f` adds the canonical automation session projection for Workbench state. Its strictly bounded identity is `userId/sessionId/turnId`; every mutation uses transaction-local `app.user_id`, an automation-session source fence, and an exact/latest Turn fence that rejects any newer Turn from any source, leaving ordinary user sessions unchanged.
+
+Session start sets only a non-`aborted` automation session to `running` and clears completion. Finish maps completed and failed Turns to their terminal session states with `completedAt`, dependency waits to `paused`, user/approval waits to `waiting_for_user`, and interrupted Turns to `paused`; terminal, cancelled, and aborted guards prevent resurrection. Runtime reconciliation and normal execution preserve the order root durable finish, execution projection, session projection. Root independently verified **51/51** across session projection, canonical runtime, and root-task-store regression; shared build, Worker tsc, and `git diff --check` passed.
+
+Live PostgreSQL/RLS, real concurrent database behavior, Redis/queue delivery, real Worker restart, provider, browser, and child-parent E2E remain unverified. This candidate does not complete Harness or P4/Phase, and overall progress remains **P0 accepted 1/8 (12.5%)**.

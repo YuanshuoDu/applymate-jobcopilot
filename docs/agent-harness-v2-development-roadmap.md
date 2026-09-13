@@ -1638,3 +1638,15 @@ Manual automation POST maps this typed conflict to HTTP `409`. The due scheduler
 **Independent verification:** Root independently verified the focused Web suites at **23/23**; Web `tsc --noEmit --skipLibCheck` and `git diff --check` also passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, real concurrent database behavior, Redis/queue delivery, real Worker restart, production scheduler timing, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness, P4/Phase completion; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 43. P4-13 — Canonical automation session projection
+
+**Candidate status/date (2026-09-13):** P4-13 is recorded as a candidate Workbench session-state projection slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `7fe3fd7f` adds a server-owned canonical session projection whose identity is strictly bounded by `userId`, `sessionId`, and `turnId`. Every start and finish mutation uses transaction-local `app.user_id`, an automation-session source fence, and an exact/latest Turn fence that rejects any newer Turn from any source. Ordinary user sessions therefore remain no-ops.
+
+Session start moves only a non-`aborted` automation session to `running` and clears completion. Finish maps `completed` to `completed` with `completedAt`, `failed` to `failed` with `completedAt`, dependency waits to `paused`, user/approval waits to `waiting_for_user`, and interrupted Turns to `paused`. Conditional status guards preserve terminal, cancelled, and aborted sessions. Canonical runtime reconciliation and normal execution call the projections in the order root durable finish, execution projection, then session projection; production wiring supplies the session projection alongside the existing execution projection.
+
+**Independent verification:** Root independently verified the canonical session projection, canonical runtime, and root-task-store regression at **51/51**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrent database behavior, Redis/queue delivery, real Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
