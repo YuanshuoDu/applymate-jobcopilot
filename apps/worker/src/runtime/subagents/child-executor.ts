@@ -8,7 +8,7 @@ import { executionOwnerFence } from "../execution-owner.js"
 import type { ContextSnapshotAdapter } from "../context/context-snapshot-adapter.js"
 import { createHarnessModelRuntime } from "../harness-model.js"
 import { visibleToolPolicy, getSubagentRolePolicy } from "./role-policy.js"
-import { childContextSnapshot, createChildContextBuilder } from "./child-context.js"
+import { childContextSnapshot, createChildContextBuilder, type ChildMailboxReader } from "./child-context.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { createObservedEvidenceIndex, parseAndBindStructuredResult, recordReadToolOutput } from "./child-evidence.js"
 import { SubagentLeaseError, type SubagentExecutionResult, type SubagentLease, type SubagentTaskRecord } from "./types.js"
@@ -72,6 +72,8 @@ export type ChildExecutorOptions = {
   readonly toolRuntimeFactory: (input: { task: SubagentTaskRecord; lease: SubagentLease; owner: ReturnType<typeof executionOwnerFence> }) => ChildToolRuntime
   /** Reuses the server-owned context compaction adapter when production enables it. */
   readonly contextSnapshotAdapter?: ContextSnapshotAdapter
+  /** Reads pending child mailbox messages without acknowledging or consuming them. */
+  readonly mailboxReader?: ChildMailboxReader
   readonly now?: () => Date
 }
 
@@ -138,7 +140,7 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
     }
     const result = await runTurnExecutionLoop({
       identity: owner, scope: { userId: lease.userId }, goal: lease.goal, snapshot: childContextSnapshot(lease),
-      contextBuilder: createChildContextBuilder(lease), store: options.store, model, tools: definitions,
+      contextBuilder: createChildContextBuilder(lease, undefined, options.mailboxReader), store: options.store, model, tools: definitions,
       executeTool, actorRole: policy.actorRole, capabilities: policy.capabilities,
       validateToolArguments: runtime.validateArguments, signal: lease.signal, now: options.now, publishReasoningSummary: false,
       contextCompaction: options.contextSnapshotAdapter?.hook,

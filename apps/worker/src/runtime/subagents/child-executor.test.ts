@@ -5,7 +5,7 @@ import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobco
 import { Buffer } from "node:buffer"
 
 import { createChildExecutor } from "./child-executor.js"
-import { childContextSnapshot, createChildContextBuilder } from "./child-context.js"
+import { childContextSnapshot, createChildContextBuilder, type ChildMailboxReader } from "./child-context.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import type { SubagentLease } from "./types.js"
 import type { TreeBudgetReservation, TreeBudgetReservationStore } from "./tree-budget-types.js"
@@ -14,6 +14,7 @@ import type { RuntimeToolDefinition } from "../tools/types.js"
 import type { ContextSnapshotAdapter } from "../context/context-snapshot-adapter.js"
 import { executionOwnerFence } from "../execution-owner.js"
 import { runTurnExecutionLoop } from "../turns/turn-execution-loop.js"
+import type { CoordinationMailboxMessage } from "../tools/coordination-types.js"
 
 const profile = {
   provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false,
@@ -34,6 +35,14 @@ function lease(): SubagentLease {
     role: "scout", taskType: "research", status: "running", goal: "Find jobs", constraints: [], successCriteria: [], allowedActions: ["jobs.search"], context: {}, expectedOutputSchema: {},
     modelProfileSnapshot: { provider: "fixture", model: "fixture-model" }, result: null, failureReason: null, attemptCount: 2, maxAttempts: 3, leaseOwner: "worker-1",
     leaseExpiresAt: new Date("2026-09-09T12:00:00.000Z"), interruptRequestedAt: null, budgetSnapshot: { subagentPolicy: { maxAttempts: 3 } }, toolPolicySnapshot: {}, ownerId: "worker-1", signal: new AbortController().signal,
+  }
+}
+
+function mailboxMessage(child: SubagentLease): CoordinationMailboxMessage {
+  return {
+    id: "mailbox-child-1", sessionId: child.sessionId, turnId: child.turnId!, fromTaskId: "parent-1", toTaskId: child.id,
+    kind: "parent.note", payload: { note: "read-only context" }, idempotencyKey: "mailbox-key-child-1",
+    createdAt: new Date("2026-09-09T11:00:00.000Z"), deliveredAt: null, consumedAt: null,
   }
 }
 
@@ -146,6 +155,38 @@ function budgetStore(failConsumed = false): { store: TreeBudgetReservationStore;
 }
 
 describe("child executor composition", () => {
+  it("passes the mailbox reader into child context construction", async () => {
+    const child = lease(); const requests: HarnessModelRequest[] = []; let modelCalls = 0
+    const listPendingMessages = vi.fn<ChildMailboxReader["listPendingMessages"]>(async input => {
+      expect(input).toEqual({ userId: child.userId, sessionId: child.sessionId, toTaskId: child.id, limit: 20 })
+      return [mailboxMessage(child)]
+    })
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) {
+        requests.push(request); modelCalls += 1
+        if (modelCalls === 1) {
+          yield { type: "tool_call_completed", callId: "mailbox-context-call", name: "jobs.search", arguments: {} }
+          yield { type: "completed", finishReason: "tool_calls" }
+        } else {
+          yield { type: "text_delta", text: "done" }
+          yield { type: "completed", finishReason: "stop" }
+        }
+      },
+    }
+    const executor = createChildExecutor({
+      store: executionStore([], requests), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => model,
+      toolRuntimeFactory: () => ({ definitions: [tool("jobs.search", "jobs")], router: { execute: async (_context, request) => ({ ...request, status: "completed", output: { jobs: [{ id: "job-1", source: "greenhouse" }] }, errorCode: null }) } }),
+      mailboxReader: { listPendingMessages },
+    })
+
+    await expect(executor({ lease: child })).resolves.toMatchObject({ status: "completed" })
+    expect(listPendingMessages).toHaveBeenCalledTimes(2)
+    expect(JSON.stringify(requests[0]?.messages)).toContain("mailbox-child-1")
+    expect(JSON.stringify(requests[0]?.messages)).toContain("UNTRUSTED_DATA")
+  })
+
   it("runs a server-owned context adapter hook before the child model", async () => {
     const child = lease(); const order: string[] = []; const requests: HarnessModelRequest[] = []; let modelCalls = 0
     const hook = vi.fn<ContextSnapshotAdapter["hook"]>(async input => {

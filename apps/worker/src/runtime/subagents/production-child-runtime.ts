@@ -13,6 +13,7 @@ import type { ContextSnapshotAdapter } from "../context/context-snapshot-adapter
 import { createPgTreeBudgetReservationStore } from "./tree-budget-store.js"
 import type { TreeBudgetReservationStore } from "./tree-budget-types.js"
 import { createChildExecutor, type ChildExecutorOptions, type ChildToolRuntime } from "./child-executor.js"
+import { PgCoordinationStore } from "../mailbox/store.js"
 import type { ExecutionOwner, ExecutionOwnerFence } from "../execution-owner.js"
 import type { SubagentLease, SubagentTaskRecord } from "./types.js"
 
@@ -24,6 +25,7 @@ export type ProductionChildRuntimeOptions = {
   readonly modelRuntimeFactory?: ChildExecutorOptions["modelRuntimeFactory"]
   readonly toolRuntimeFactory?: ChildExecutorOptions["toolRuntimeFactory"]
   readonly contextSnapshotAdapter?: ContextSnapshotAdapter
+  readonly mailboxReader?: ChildExecutorOptions["mailboxReader"]
 }
 
 function record(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {} }
@@ -62,16 +64,26 @@ export function childExecutionEnabled(value = process.env.ENABLE_AGENT_CHILD_EXE
   return value === "1"
 }
 
+function defaultMailboxReader(pool: pg.Pool): ChildExecutorOptions["mailboxReader"] | undefined {
+  // Keep lightweight construction fixtures usable; a real pg.Pool exposes
+  // both methods and therefore gets the server-owned reader.
+  const candidate = pool as unknown as { readonly connect?: unknown; readonly query?: unknown }
+  if (typeof candidate.connect !== "function" || typeof candidate.query !== "function") return undefined
+  return new PgCoordinationStore(pool)
+}
+
 /** Build the production child seam only when the explicit feature flag is on. */
 export function createProductionChildExecutor(options: ProductionChildRuntimeOptions): SubagentExecutor {
   const engineStore = options.turnStore ?? createPgTurnEngineStore(options.pool)
   const treeBudget = options.treeBudget ?? createPgTreeBudgetReservationStore(options.pool)
   const authorizeUsage = options.authorizeUsage ?? createWorkerUsageAuthorizer()
+  const mailboxReader = options.mailboxReader ?? defaultMailboxReader(options.pool)
   return createChildExecutor({
     store: bindStore(engineStore), treeBudget, authorizeUsage,
     modelRuntimeFactory: options.modelRuntimeFactory,
     toolRuntimeFactory: options.toolRuntimeFactory ?? (({ task, lease, owner }) => defaultTools(options.pool, engineStore, task, lease, owner)),
     contextSnapshotAdapter: options.contextSnapshotAdapter,
+    mailboxReader,
   })
 }
 
