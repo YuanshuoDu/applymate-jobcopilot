@@ -61,6 +61,24 @@ export async function persistSubagentDispatch(pool: PgSubagentPool, payload: Sub
 export async function repairMissingSubagentDispatches(pool: PgSubagentPool, ownerId: string, limit = SUBAGENT_MAX_BATCH): Promise<number> {
   if (!Number.isInteger(limit) || limit < 1) throw new RangeError("Subagent dispatch limit must be positive")
   return transaction(pool, async client => {
+    const openSessions = await client.query<{ id: string }>(`SELECT session."id"
+      FROM "agent_sessions" AS session
+      WHERE session."status" NOT IN ('aborted', 'archived')
+        AND EXISTS (SELECT 1 FROM "sub_agent_tasks" AS task
+          JOIN "sub_agent_tasks" AS root ON root."id" = task."rootTaskId" AND root."sessionId" = task."sessionId"
+          JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+            AND turn."userId" = session."userId"
+          LEFT JOIN "agent_outbox" AS dispatch
+            ON dispatch."topic" = $1 AND dispatch."idempotencyKey" = 'subagent-dispatch:' || task."id"
+          WHERE task."sessionId" = session."id" AND task."status" IN ('queued', 'retrying')
+            AND task."interruptRequestedAt" IS NULL AND task."attemptCount" < task."maxAttempts"
+            AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
+            AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled')
+            AND dispatch."id" IS NULL)
+      ORDER BY session."updatedAt" ASC, session."id" ASC
+      LIMIT $2 FOR UPDATE SKIP LOCKED`, [SUBAGENT_DISPATCH_TOPIC, limit])
+    const sessionIds = openSessions.rows.map(row => row.id)
+    if (sessionIds.length === 0) return 0
     const candidates = await client.query<MissingDispatchRow>(`SELECT task."id", task."sessionId", task."rootTaskId"
       FROM "sub_agent_tasks" AS task
       JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
@@ -68,15 +86,16 @@ export async function repairMissingSubagentDispatches(pool: PgSubagentPool, owne
       JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
         AND turn."userId" = session."userId"
       LEFT JOIN "agent_outbox" AS dispatch
-        ON dispatch."topic" = $1 AND dispatch."idempotencyKey" = 'subagent-dispatch:' || task."id"
+        ON dispatch."topic" = $2 AND dispatch."idempotencyKey" = 'subagent-dispatch:' || task."id"
       WHERE task."status" IN ('queued', 'retrying')
         AND task."interruptRequestedAt" IS NULL AND task."attemptCount" < task."maxAttempts"
+        AND session."id" = ANY($1::text[])
         AND session."status" NOT IN ('aborted', 'archived')
         AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
         AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled')
         AND dispatch."id" IS NULL
       ORDER BY task."updatedAt" ASC, task."id" ASC
-      LIMIT $2 FOR UPDATE OF task SKIP LOCKED`, [SUBAGENT_DISPATCH_TOPIC, limit])
+      LIMIT $3 FOR UPDATE OF task SKIP LOCKED`, [sessionIds, SUBAGENT_DISPATCH_TOPIC, limit])
     let repaired = 0
     for (const row of candidates.rows) {
       const payload: SubagentJobPayload = { taskId: row.id, sessionId: row.sessionId, rootTaskId: row.rootTaskId, ownerId }

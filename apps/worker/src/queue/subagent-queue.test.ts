@@ -47,6 +47,9 @@ function repairPool(options: RepairOptions = {}) {
     query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push([sql, params])
       if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") return { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "agent_sessions" AS session') && sql.includes("LIMIT $2 FOR UPDATE SKIP LOCKED")) {
+        return candidate ? { rows: [{ id: candidate.sessionId }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      }
       if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("FOR UPDATE OF task")) {
         const key = candidate ? subagentDispatchKey(candidate.id) : ""
         const exists = outbox.some(row => row.key === key)
@@ -141,7 +144,7 @@ describe("Subagent queue", () => {
     await expect(repairMissingSubagentDispatches(fake.pool, "repair-worker", 1)).resolves.toBe(1)
     expect(fake.outbox).toHaveLength(1)
     expect(fake.outbox[0]).toMatchObject({ sessionId: "session-1", key: subagentDispatchKey("task-1"), publishedAt: null, payload: { taskId: "task-1", sessionId: "session-1", rootTaskId: "root-1", ownerId: "repair-worker" } })
-    const scan = fake.calls.find(([sql]) => sql.includes('FROM "sub_agent_tasks" AS task'))
+    const scan = fake.calls.find(([sql]) => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("FOR UPDATE OF task"))
     expect(scan?.[0]).toContain("IN ('queued', 'retrying')")
     expect(scan?.[0]).toContain('task."interruptRequestedAt" IS NULL')
     expect(scan?.[0]).toContain('task."attemptCount" < task."maxAttempts"')
@@ -149,7 +152,13 @@ describe("Subagent queue", () => {
     expect(scan?.[0]).toContain('root."status" NOT IN')
     expect(scan?.[0]).toContain('turn."status" NOT IN')
     expect(scan?.[0]).toContain("'subagent-dispatch:' || task.\"id\"")
-    expect(scan?.[0]).toContain("LIMIT $2 FOR UPDATE OF task SKIP LOCKED")
+    expect(scan?.[0]).toContain("LIMIT $3 FOR UPDATE OF task SKIP LOCKED")
+    expect(scan?.[1]).toEqual([["session-1"], "agent.subagent.dispatch", 1])
+    const sessionLockIndex = fake.calls.findIndex(([sql]) => sql.includes('FROM "agent_sessions" AS session') && sql.includes("LIMIT $2 FOR UPDATE SKIP LOCKED"))
+    const taskLockIndex = fake.calls.findIndex(([sql]) => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("FOR UPDATE OF task"))
+    expect(sessionLockIndex).toBeGreaterThan(-1)
+    expect(sessionLockIndex).toBeLessThan(taskLockIndex)
+    expect(fake.calls[sessionLockIndex]?.[0]).toContain('session."status" NOT IN (\'aborted\', \'archived\')')
     const insert = fake.calls.find(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"'))
     expect(insert?.[0]).toContain('ON CONFLICT ("idempotencyKey") DO NOTHING')
     expect(insert?.[1]?.[2]).toBe("session-1")
