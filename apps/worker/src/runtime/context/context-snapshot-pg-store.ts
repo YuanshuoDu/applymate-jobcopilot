@@ -10,6 +10,7 @@ import type { StepContextSnapshot } from "./step-context-builder.js"
 const MAX_SNAPSHOT_BYTES = 256 * 1024
 const MAX_TEXT_BYTES = 256
 const SNAPSHOT_REF = /^[0-9a-f]{64}$/
+const OPEN_SESSION = `"status" NOT IN ('aborted', 'archived')`
 type Pool = Pick<pg.Pool, "connect">
 type Client = Pick<pg.PoolClient, "query" | "release">
 type QueryResult<T> = { readonly rows: T[]; readonly rowCount: number | null }
@@ -114,6 +115,12 @@ async function transaction<T>(pool: Pool, userId: string, work: (client: Client)
   } finally { client.release() }
 }
 
+async function assertOpenSession(client: Client, identity: Pick<Identity, "userId" | "sessionId">): Promise<void> {
+  const result = await client.query<{ id: string }>(`SELECT "id" FROM "agent_sessions"
+    WHERE "id" = $1 AND "userId" = $2 AND ${OPEN_SESSION} FOR UPDATE`, [identity.sessionId, identity.userId]) as QueryResult<{ id: string }>
+  if (!result.rows[0]) throw new ContextSnapshotAdapterStoreError("snapshot_scope_error", "session is closed or outside the tenant scope")
+}
+
 async function assertTurn(client: Client, identity: Pick<Identity, "userId" | "sessionId" | "turnId">): Promise<void> {
   const result = await client.query<{ id: string }>(`SELECT turn."id"
     FROM "agent_turns" AS turn
@@ -154,6 +161,7 @@ export function createPgContextSnapshotAdapterStore(pool: Pool): ContextSnapshot
       const expectedRef = snapshotRef(input.snapshotRef)
       if (expectedRef !== ref(identity, data.snapshot)) throw new ContextSnapshotAdapterStoreError("snapshot_reference_mismatch", "snapshotRef does not match snapshot identity")
       return transaction(pool, identity.userId, async client => {
+        await assertOpenSession(client, identity)
         await assertStep(client, identity)
         const inserted = await client.query<SnapshotRow>(`INSERT INTO "agent_context_compaction_snapshots"
           (${COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10)

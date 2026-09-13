@@ -32,6 +32,7 @@ type SnapshotRow = {
 }
 
 const SNAPSHOT_COLUMNS = `"id", "sessionId", "throughSequence", "version", "schemaVersion", "content", "summary", "checksum", "inputTokens", "outputTokens", "estimatedCostUsd", "tokenAccounting", "createdAt"`
+const OPEN_SESSION = `"status" NOT IN ('aborted', 'archived')`
 
 function nonEmpty(value: unknown, field: string): string {
   if (typeof value !== "string" || value.trim().length === 0) throw new ContextSnapshotError("store_conflict", `Invalid ${field}`)
@@ -122,7 +123,8 @@ async function withTransaction<T>(pool: Pick<pg.Pool, "connect">, userId: string
 
 async function sessionOwner(client: pg.PoolClient, snapshot: AgentContextSnapshot, userId: string): Promise<void> {
   const result = await client.query(
-    `SELECT "id" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 FOR UPDATE`,
+    `SELECT "id" FROM "agent_sessions"
+     WHERE "id" = $1 AND "userId" = $2 AND ${OPEN_SESSION} FOR UPDATE`,
     [snapshot.sessionId, userId],
   )
   if (!result.rows[0]) throw new ContextSnapshotError("session_not_found", `Session ${snapshot.sessionId} is not owned by the tenant`)

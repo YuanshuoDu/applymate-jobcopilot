@@ -36,13 +36,19 @@ class FakeClient {
   readonly client: pg.PoolClient
   row: Row | null
   readonly owner: Identity
+  readonly sessionStatus: string
+  readonly sessionUserId: string
+  readonly sessionVisible: boolean
   failOn: string | null = null
   insertAttempts = 0
   released = false
 
-  constructor(row: Row | null = null, owner: Identity = identity) {
+  constructor(row: Row | null = null, owner: Identity = identity, options: { sessionStatus?: string; sessionUserId?: string; sessionVisible?: boolean } = {}) {
     this.row = row
     this.owner = owner
+    this.sessionStatus = options.sessionStatus ?? "running"
+    this.sessionUserId = options.sessionUserId ?? owner.userId
+    this.sessionVisible = options.sessionVisible ?? true
     this.client = this as unknown as pg.PoolClient
   }
 
@@ -50,6 +56,11 @@ class FakeClient {
     this.calls.push({ sql, values })
     if (this.failOn && sql.includes(this.failOn)) throw new Error("query failure")
     if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 } as QueryResult<T>
+    if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) {
+      const allowed = this.sessionVisible && values?.[0] === this.owner.sessionId && values?.[1] === this.sessionUserId
+        && !["aborted", "archived"].includes(this.sessionStatus)
+      return { rows: allowed ? [{ id: this.owner.sessionId } as T] : [], rowCount: allowed ? 1 : 0 }
+    }
     if (sql.includes('FROM "agent_steps"')) {
       const matches = values?.[0] === this.owner.stepId && values?.[1] === this.owner.turnId && values?.[2] === this.owner.sessionId && values?.[3] === this.owner.userId
       return { rows: matches ? [{ id: this.owner.stepId } as T] : [], rowCount: matches ? 1 : 0 }
@@ -96,6 +107,11 @@ describe("PostgreSQL context snapshot adapter store", () => {
     const store = createPgContextSnapshotAdapterStore(poolFor(client))
     const input = request()
     await expect(store.save(input)).resolves.toEqual({ snapshotRef: input.snapshotRef, scope, sessionId: identity.sessionId, turnId: identity.turnId })
+    const sessionLock = client.calls.findIndex(call => call.sql.includes('FROM "agent_sessions"') && call.sql.includes("FOR UPDATE"))
+    const stepScope = client.calls.findIndex(call => call.sql.includes('FROM "agent_steps"'))
+    expect(sessionLock).toBeGreaterThan(-1)
+    expect(sessionLock).toBeLessThan(stepScope)
+    expect(client.calls[sessionLock]?.sql).toContain('"status" NOT IN (\'aborted\', \'archived\')')
     await expect(store.load({ snapshotRef: input.snapshotRef, scope, sessionId: identity.sessionId, turnId: identity.turnId })).resolves.toEqual({ snapshot, scope, sessionId: identity.sessionId, turnId: identity.turnId })
     await expect(store.loadByIdempotencyKey({ scope, sessionId: identity.sessionId, turnId: identity.turnId, stepId: identity.stepId, idempotencyKey: identity.idempotencyKey })).resolves.toMatchObject({ snapshotRef: input.snapshotRef, snapshot, scope })
     expect(client.calls.filter(call => call.sql === "BEGIN")).toHaveLength(3)
@@ -139,6 +155,32 @@ describe("PostgreSQL context snapshot adapter store", () => {
     await expect(store.load({ snapshotRef: input.snapshotRef, scope, sessionId: "session-b", turnId: identity.turnId })).rejects.toMatchObject({ code: "snapshot_scope_error" })
     await expect(store.load({ snapshotRef: input.snapshotRef, scope, sessionId: identity.sessionId, turnId: "turn-b" })).rejects.toMatchObject({ code: "snapshot_scope_error" })
     await expect(store.loadByIdempotencyKey({ scope, sessionId: identity.sessionId, turnId: identity.turnId, stepId: "step-b", idempotencyKey: identity.idempotencyKey })).rejects.toMatchObject({ code: "snapshot_scope_error" })
+  })
+
+  it.each(["aborted", "archived"])("rejects save for a %s session before step or snapshot writes", async sessionStatus => {
+    const client = new FakeClient(null, identity, { sessionStatus })
+    const store = createPgContextSnapshotAdapterStore(poolFor(client))
+
+    await expect(store.save(request())).rejects.toMatchObject({ code: "snapshot_scope_error" })
+    const sessionLock = client.calls.find(call => call.sql.includes('FROM "agent_sessions"') && call.sql.includes("FOR UPDATE"))
+    expect(sessionLock?.sql).toContain('"status" NOT IN (\'aborted\', \'archived\')')
+    expect(sessionLock?.sql).toContain("FOR UPDATE")
+    expect(client.calls.some(call => call.sql.includes('FROM "agent_steps"'))).toBe(false)
+    expect(client.calls.some(call => call.sql.startsWith('INSERT INTO "agent_context_compaction_snapshots"'))).toBe(false)
+    expect(client.calls).toContainEqual(expect.objectContaining({ sql: "ROLLBACK" }))
+  })
+
+  it.each([
+    ["missing", { sessionVisible: false }],
+    ["cross-user", { sessionUserId: "user-b" }],
+  ] as const)("rejects %s session save before snapshot writes", async (_label, options) => {
+    const client = new FakeClient(null, identity, options)
+    const store = createPgContextSnapshotAdapterStore(poolFor(client))
+
+    await expect(store.save(request())).rejects.toMatchObject({ code: "snapshot_scope_error" })
+    expect(client.calls.some(call => call.sql.includes('FROM "agent_steps"'))).toBe(false)
+    expect(client.calls.some(call => call.sql.startsWith('INSERT INTO "agent_context_compaction_snapshots"'))).toBe(false)
+    expect(client.calls).toContainEqual(expect.objectContaining({ sql: "ROLLBACK" }))
   })
 
   it("rejects malformed rows, oversized snapshots, and reference mismatches", async () => {
