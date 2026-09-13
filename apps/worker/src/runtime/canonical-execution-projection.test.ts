@@ -19,7 +19,7 @@ function fakePool(options: { rowCount?: number | null; failOnUpdate?: boolean } 
   return { pool, client, calls }
 }
 
-const identity = { userId: "user-1", sessionId: "session-1" }
+const identity = { userId: "user-1", sessionId: "session-1", turnId: "turn-1" }
 
 function update(fake: ReturnType<typeof fakePool>): Call {
   const call = fake.calls.find(item => item.sql.startsWith("UPDATE"))
@@ -43,7 +43,11 @@ describe("canonical automation execution projection", () => {
       expect(call.sql).toContain('session."id" = $2')
       expect(call.sql).toContain('session."userId" = $1')
       expect(call.sql).toContain('session."source" = \'automation\'')
-      expect(call.params?.slice(0, 2)).toEqual(["user-1", "session-1"])
+      expect(call.sql).toContain('turn."id" = $3')
+      expect(call.sql).toContain('turn."sessionId" = $2')
+      expect(call.sql).toContain('turn."userId" = $1')
+      expect(call.sql).toContain('turn."source" = \'automation\'')
+      expect(call.params?.slice(0, 3)).toEqual(["user-1", "session-1", "turn-1"])
     }
     expect(fake.calls.filter(call => call.sql.includes("set_config('app.user_id'"))).toHaveLength(2)
   })
@@ -56,6 +60,7 @@ describe("canonical automation execution projection", () => {
     expect(call.sql).toContain('SET "status" = \'running\'')
     expect(call.sql).toContain('SET "status" = \'running\', "startedAt" = COALESCE("startedAt", CURRENT_TIMESTAMP)')
     expect(call.sql).toContain("IN ('queued', 'paused', 'waiting_for_user')")
+    expect(call.params).toEqual(["user-1", "session-1", "turn-1"])
   })
 
   it.each([
@@ -70,9 +75,9 @@ describe("canonical automation execution projection", () => {
     await createCanonicalExecutionProjection(fake.pool).finish({ ...identity, result: { status: turnStatus, errorCode: "turn_error" } })
 
     const call = update(fake)
-    expect(call.params?.slice(0, 3)).toEqual(["user-1", "session-1", expectedStatus])
-    if (expectedStatus === "failed") expect(call.params?.[3]).toBe("turn_error")
-    else expect(call.params?.[3]).toBeNull()
+    expect(call.params?.slice(0, 4)).toEqual(["user-1", "session-1", "turn-1", expectedStatus])
+    if (expectedStatus === "failed") expect(call.params?.[4]).toBe("turn_error")
+    else expect(call.params?.[4]).toBeNull()
   })
 
   it("preserves cancelled and terminal rows through conditional SQL", async () => {
@@ -86,7 +91,31 @@ describe("canonical automation execution projection", () => {
     expect(updates[0]?.sql).toContain("IN ('queued', 'paused', 'waiting_for_user')")
     expect(updates[1]?.sql).toContain("IN ('queued', 'running', 'paused', 'waiting_for_user')")
     expect(updates[1]?.sql).not.toContain("'cancelled'")
+    expect(updates[0]?.params).toEqual(["user-1", "session-1", "turn-1"])
+    expect(updates[1]?.params?.slice(0, 3)).toEqual(["user-1", "session-1", "turn-1"])
     expect(fake.client.release).toHaveBeenCalledTimes(2)
+  })
+
+  it("rejects missing and oversized Turn identities before opening a transaction", async () => {
+    const projection = createCanonicalExecutionProjection(fakePool().pool)
+
+    await expect(projection.start({ ...identity, turnId: "" })).rejects.toThrow("turnId is invalid")
+    await expect(projection.finish({ ...identity, turnId: "💩".repeat(65), result: { status: "completed" } })).rejects.toThrow("turnId is invalid")
+  })
+
+  it("fences both updates to the current automation Turn and excludes newer Turns", async () => {
+    const fake = fakePool()
+    await createCanonicalExecutionProjection(fake.pool).finish({ ...identity, result: { status: "completed" } })
+
+    const call = update(fake)
+    expect(call.sql).toContain('turn."id" = $3')
+    expect(call.sql).toContain('turn."sessionId" = $2')
+    expect(call.sql).toContain('turn."userId" = $1')
+    expect(call.sql).toContain('turn."source" = \'automation\'')
+    expect(call.sql).toContain('newer_turn."createdAt" > turn."createdAt"')
+    expect(call.sql).toContain('newer_turn."createdAt" = turn."createdAt"')
+    expect(call.sql).toContain('newer_turn."id" > turn."id"')
+    expect(call.params?.slice(0, 3)).toEqual(["user-1", "session-1", "turn-1"])
   })
 
   it("leaves a missing execution as a successful no-op", async () => {

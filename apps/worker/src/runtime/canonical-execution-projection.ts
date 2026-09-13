@@ -9,6 +9,7 @@ type QueryResult = { readonly rowCount: number | null }
 export type CanonicalExecutionIdentity = {
   readonly userId: string
   readonly sessionId: string
+  readonly turnId: string
 }
 
 export type CanonicalExecutionProjection = {
@@ -49,6 +50,21 @@ const AUTOMATION_SESSION = `EXISTS (
     AND session."source" = 'automation'
 )`
 
+const CURRENT_AUTOMATION_TURN = `EXISTS (
+  SELECT 1 FROM "agent_turns" AS turn
+  WHERE turn."id" = $3
+    AND turn."sessionId" = $2
+    AND turn."userId" = $1
+    AND turn."source" = 'automation'
+    AND NOT EXISTS (
+      SELECT 1 FROM "agent_turns" AS newer_turn
+      WHERE newer_turn."sessionId" = turn."sessionId"
+        AND newer_turn."userId" = turn."userId"
+        AND (newer_turn."createdAt" > turn."createdAt"
+          OR (newer_turn."createdAt" = turn."createdAt" AND newer_turn."id" > turn."id"))
+    )
+)`
+
 const ACTIVE_EXECUTION_STATUSES = "'queued', 'running', 'paused', 'waiting_for_user'"
 
 async function startExecution(client: ProjectionClient, input: CanonicalExecutionIdentity): Promise<void> {
@@ -57,8 +73,9 @@ async function startExecution(client: ProjectionClient, input: CanonicalExecutio
      SET "status" = 'running', "startedAt" = COALESCE("startedAt", CURRENT_TIMESTAMP), "completedAt" = NULL, "error" = NULL, "updatedAt" = CURRENT_TIMESTAMP
      WHERE execution."userId" = $1 AND execution."sessionId" = $2
        AND execution."status" IN ('queued', 'paused', 'waiting_for_user')
-       AND ${AUTOMATION_SESSION}`,
-    [input.userId, input.sessionId],
+       AND ${AUTOMATION_SESSION}
+       AND ${CURRENT_AUTOMATION_TURN}`,
+    [input.userId, input.sessionId, input.turnId],
   ) as QueryResult
 }
 
@@ -81,14 +98,15 @@ async function finishExecution(client: ProjectionClient, input: CanonicalExecuti
   const error = status === "failed" ? failureCode(input.result.errorCode) : null
   await client.query(
     `UPDATE "agent_executions" AS execution
-     SET "status" = $3,
-         "error" = $4,
-         "completedAt" = CASE WHEN $3 IN ('completed', 'failed') THEN CURRENT_TIMESTAMP ELSE NULL END,
+     SET "status" = $4,
+         "error" = $5,
+         "completedAt" = CASE WHEN $4 IN ('completed', 'failed') THEN CURRENT_TIMESTAMP ELSE NULL END,
          "updatedAt" = CURRENT_TIMESTAMP
      WHERE execution."userId" = $1 AND execution."sessionId" = $2
        AND execution."status" IN (${ACTIVE_EXECUTION_STATUSES})
-       AND ${AUTOMATION_SESSION}`,
-    [input.userId, input.sessionId, status, error],
+       AND ${AUTOMATION_SESSION}
+       AND ${CURRENT_AUTOMATION_TURN}`,
+    [input.userId, input.sessionId, input.turnId, status, error],
   ) as QueryResult
 }
 
@@ -102,11 +120,11 @@ async function finishExecution(client: ProjectionClient, input: CanonicalExecuti
 export function createCanonicalExecutionProjection(pool: ProjectionPool): CanonicalExecutionProjection {
   return {
     async start(raw) {
-      const input = { userId: identity(raw.userId, "userId"), sessionId: identity(raw.sessionId, "sessionId") }
+      const input = { userId: identity(raw.userId, "userId"), sessionId: identity(raw.sessionId, "sessionId"), turnId: identity(raw.turnId, "turnId") }
       await transaction(pool, input.userId, client => startExecution(client, input))
     },
     async finish(raw) {
-      const input = { userId: identity(raw.userId, "userId"), sessionId: identity(raw.sessionId, "sessionId"), result: raw.result }
+      const input = { userId: identity(raw.userId, "userId"), sessionId: identity(raw.sessionId, "sessionId"), turnId: identity(raw.turnId, "turnId"), result: raw.result }
       if (!executionStatus(input.result.status)) return
       await transaction(pool, input.userId, client => finishExecution(client, input))
     },

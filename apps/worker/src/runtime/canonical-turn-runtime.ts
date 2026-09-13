@@ -196,6 +196,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       await executionProjection.finish({
         userId: lease.userId,
         sessionId: lease.sessionId,
+        turnId: lease.turnId,
         result: { status: terminal.result.status, errorCode: terminal.result.summary },
       })
       return terminal.result
@@ -269,11 +270,11 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       ...(planCompletionRequired ? { planCompletionRecoveryLimit: options.planCompletionRecoveryLimit ?? 1 } : {}),
       ...(rootTasks.checkCompletion ? { completionGate: async () => rootTasks.checkCompletion!({ lease, rootTaskId: root.id, now: now() }) } : {}),
     })
-    await executionProjection.start({ userId: lease.userId, sessionId: lease.sessionId })
+    await executionProjection.start({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId })
     const result = await engine.run()
     await rootTasks.finish({ lease, rootTaskId: root.id, result, now: now() })
     // The durable root is finalized first; a projection failure remains surfaced so queue retry can reconcile it.
-    await executionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, result })
+    await executionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, result })
     return { status: result.status, summary: result.errorCode }
   }
   return {

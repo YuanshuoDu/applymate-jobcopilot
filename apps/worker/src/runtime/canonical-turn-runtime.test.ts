@@ -479,8 +479,8 @@ describe("createCanonicalTurnRuntime", () => {
     const runtime = await fixture.runtime
 
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "completed" })
-    expect(projection.start).toHaveBeenCalledWith({ userId: "user-1", sessionId: "session-1" })
-    expect(projection.finish).toHaveBeenCalledWith(expect.objectContaining({ userId: "user-1", sessionId: "session-1", result: expect.objectContaining({ status: "completed" }) }))
+    expect(projection.start).toHaveBeenCalledWith({ userId: "user-1", sessionId: "session-1", turnId: "turn-1" })
+    expect(projection.finish).toHaveBeenCalledWith(expect.objectContaining({ userId: "user-1", sessionId: "session-1", turnId: "turn-1", result: expect.objectContaining({ status: "completed" }) }))
     expect(fixture.roots.finish.mock.invocationCallOrder[0]).toBeLessThan(projection.finish.mock.invocationCallOrder[0] ?? Number.MAX_SAFE_INTEGER)
 
     const failedProjection = { start: vi.fn(async () => { throw new Error("control projection unavailable") }), finish: vi.fn(async () => undefined) }
@@ -510,7 +510,7 @@ describe("createCanonicalTurnRuntime", () => {
     expect(fixture.getModelCalls()).toBe(2)
     expect(roots.finish).toHaveBeenCalledTimes(1)
     expect(projection.finish).toHaveBeenCalledTimes(2)
-    expect(projection.finish).toHaveBeenLastCalledWith(expect.objectContaining({ result: { status: "failed", errorCode: "provider_error" } }))
+    expect(projection.finish).toHaveBeenLastCalledWith(expect.objectContaining({ userId: "user-1", sessionId: "session-1", turnId: "turn-1", result: { status: "failed", errorCode: "provider_error" } }))
   })
 
   it("passes the server-owned completion gate for the canonical root", async () => {
