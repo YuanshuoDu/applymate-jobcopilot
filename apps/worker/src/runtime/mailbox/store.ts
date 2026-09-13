@@ -109,6 +109,7 @@ export class PgCoordinationStore implements CoordinationStore {
 
   async appendActivity(input: CoordinationActivity): Promise<void> {
     await transaction(this.pool, input.userId, async client => {
+      await requireSession(client, input)
       const key = `coordination-activity:${input.sessionId}:${input.idempotencyKey}`
       const existing = await client.query(`SELECT 1 FROM "agent_events" WHERE "sessionId" = $1 AND "idempotencyKey" = $2`, [input.sessionId, key])
       if (existing.rows[0]) return
@@ -137,7 +138,8 @@ async function transaction<T>(pool: PoolLike, userId: string, work: (client: pg.
 
 async function setUser(client: Queryable, userId: string): Promise<void> { await client.query(`SELECT set_config('app.user_id', $1, true)`, [userId]) }
 async function requireSession(client: Queryable, input: { userId: string; sessionId: string }): Promise<void> {
-  const result = await client.query(`SELECT 1 FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 FOR SHARE`, [input.sessionId, input.userId])
+  const result = await client.query(`SELECT 1 FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2
+    AND "status" NOT IN ('aborted', 'archived') FOR UPDATE`, [input.sessionId, input.userId])
   if (!result.rows[0]) throw new CoordinationError("coordination_scope_error", "Session is unavailable")
 }
 async function requireTurn(client: Queryable, input: { userId: string; sessionId: string; turnId: string }): Promise<void> {

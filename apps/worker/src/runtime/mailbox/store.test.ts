@@ -16,7 +16,10 @@ class FakeClient {
   readonly queries: QueryRecord[] = []
   private readonly rows: Record<string, unknown>
 
-  constructor(private readonly mode: "task" | "empty" = "task") {
+  constructor(
+    private readonly mode: "task" | "empty" = "task",
+    private readonly sessionStatus = "running",
+  ) {
     this.rows = { ...task, createdAt: new Date("2026-09-03T00:00:00.000Z") }
   }
 
@@ -24,6 +27,9 @@ class FakeClient {
     const text = String(sql)
     this.queries.push({ sql: text, values })
     if (text.includes("FROM \"sub_agent_tasks\" task") && text.includes("SELECT")) return { rows: this.mode === "task" ? [this.rows] : [], rowCount: this.mode === "task" ? 1 : 0 }
+    if (text.includes('FROM "agent_sessions"') && text.includes("FOR UPDATE") && text.includes('"status" NOT IN')) {
+      return ["aborted", "archived"].includes(this.sessionStatus) ? { rows: [], rowCount: 0 } : { rows: [{ id: "ok" }], rowCount: 1 }
+    }
     if (text.includes("FROM \"agent_sessions\"") || text.includes("FROM \"agent_turns\"") || text.includes("FROM \"sub_agent_tasks\"")) return { rows: [{ id: "ok" }], rowCount: 1 }
     if (text.includes("FROM \"agent_mailbox_messages\"")) return { rows: [], rowCount: 0 }
     if (text.includes("INSERT INTO \"agent_mailbox_messages\"")) return { rows: [{ id: "mailbox-1", sessionId: "session-a", turnId: "turn-a", fromTaskId: null, toTaskId: "task-1", kind: "result", idempotencyKey: "message-1", createdAt: new Date("2026-09-03T00:00:00.000Z") }], rowCount: 1 }
@@ -60,6 +66,18 @@ describe("PgCoordinationStore", () => {
     const sql = client.queries.map(query => query.sql).join("\n")
     expect(sql).toMatch(/BEGIN[\s\S]*INSERT INTO "agent_mailbox_messages"[\s\S]*agent\.subagent\.mailbox[\s\S]*COMMIT/)
     expect(client.queries.find(query => query.sql.includes("set_config('app.user_id'"))?.values).toContain("user-a")
+    const sessionGuard = client.queries.find(query => query.sql.includes('FROM "agent_sessions"') && query.sql.includes("FOR UPDATE"))?.sql ?? ""
+    expect(sessionGuard).toContain('"status" NOT IN (\'aborted\', \'archived\')')
+  })
+
+  it.each(["aborted", "archived"] as const)("rejects sendMessage for a %s session before any write", async sessionStatus => {
+    const client = new FakeClient("task", sessionStatus)
+    const store = new PgCoordinationStore(pool(client))
+
+    await expect(store.sendMessage({ userId: "user-a", sessionId: "session-a", turnId: "turn-a", fromTaskId: null, toTaskId: "task-1", kind: "result", payload: { ok: true }, idempotencyKey: "message-closed" }))
+      .rejects.toMatchObject({ code: "coordination_scope_error" })
+    expect(client.queries.some(query => query.sql.includes("INSERT INTO") || query.sql.includes("UPDATE "))).toBe(false)
+    expect(client.queries.map(query => query.sql)).toContain("ROLLBACK")
   })
 
   it("atomically records spawn replay and deterministic dispatch outbox entries", async () => {
@@ -73,6 +91,16 @@ describe("PgCoordinationStore", () => {
     expect(client.queries.map(query => query.sql)).toEqual(expect.arrayContaining(["BEGIN", "COMMIT"]))
   })
 
+  it.each(["aborted", "archived"] as const)("rejects recordSpawn for a %s session before any write", async sessionStatus => {
+    const client = new FakeClient("task", sessionStatus)
+    const store = new PgCoordinationStore(pool(client))
+
+    await expect(store.recordSpawn({ userId: "user-a", sessionId: "session-a", idempotencyKey: "spawn-closed", task }))
+      .rejects.toMatchObject({ code: "coordination_scope_error" })
+    expect(client.queries.some(query => query.sql.includes("INSERT INTO") || query.sql.includes("UPDATE "))).toBe(false)
+    expect(client.queries.map(query => query.sql)).toContain("ROLLBACK")
+  })
+
   it("projects coordination activity as an item, event, and session outbox notification", async () => {
     const client = new FakeClient()
     const store = new PgCoordinationStore(pool(client))
@@ -80,5 +108,15 @@ describe("PgCoordinationStore", () => {
     const sql = client.queries.map(query => query.sql).join("\n")
     expect(sql).toMatch(/INSERT INTO "agent_items"[\s\S]*INSERT INTO "agent_events"[\s\S]*agent\.session\.event/)
     expect(client.queries.some(query => query.sql.includes("UPDATE \"agent_sessions\" SET \"eventSequence\""))).toBe(true)
+  })
+
+  it.each(["aborted", "archived"] as const)("rejects appendActivity for a %s session before any write", async sessionStatus => {
+    const client = new FakeClient("task", sessionStatus)
+    const store = new PgCoordinationStore(pool(client))
+
+    await expect(store.appendActivity({ userId: "user-a", sessionId: "session-a", turnId: "turn-a", stepId: "step-a", taskId: "task-1", operation: "list_subagents", status: "completed", idempotencyKey: "activity-closed", data: { count: 1 } }))
+      .rejects.toMatchObject({ code: "coordination_scope_error" })
+    expect(client.queries.some(query => query.sql.includes("INSERT INTO") || query.sql.includes("UPDATE "))).toBe(false)
+    expect(client.queries.map(query => query.sql)).toContain("ROLLBACK")
   })
 })
