@@ -27,37 +27,98 @@ type RuntimeInput = {
 type RuntimeResult = { readonly snapshot: StepContextSnapshot }
 type LoadedSnapshot = { readonly snapshot: StepContextSnapshot; readonly scope: TenantScope; readonly sessionId: string; readonly turnId: string }
 
+function assertJsonValue(value: unknown, ancestors = new WeakSet<object>()): void {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new TypeError("non-finite number")
+    return
+  }
+  if (typeof value !== "object") throw new TypeError("non-JSON value")
+  if (ancestors.has(value)) throw new TypeError("cyclic value")
+  ancestors.add(value)
+  try {
+    const keys = Reflect.ownKeys(value)
+    if (keys.length > MAX_INPUT_BYTES) throw new TypeError("oversized object")
+    if (Array.isArray(value)) {
+      if (Object.getPrototypeOf(value) !== Array.prototype || value.length > MAX_INPUT_BYTES) throw new TypeError("non-plain array")
+      for (const key of keys) {
+        if (key === "length") continue
+        if (typeof key !== "string" || !/^(0|[1-9]\d*)$/.test(key) || Number(key) >= value.length) throw new TypeError("invalid array member")
+        const descriptor = Object.getOwnPropertyDescriptor(value, key)
+        if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) throw new TypeError("array accessor")
+      }
+      for (let index = 0; index < value.length; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, String(index))
+        if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) throw new TypeError("sparse array")
+        assertJsonValue(descriptor.value, ancestors)
+      }
+      return
+    }
+    if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) throw new TypeError("non-plain object")
+    for (const key of keys) {
+      if (typeof key !== "string") throw new TypeError("symbol property")
+      const descriptor = Object.getOwnPropertyDescriptor(value, key)
+      if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) throw new TypeError("object accessor")
+      assertJsonValue(descriptor.value, ancestors)
+    }
+  } finally {
+    ancestors.delete(value)
+  }
+}
+
+function safeStableJson(value: unknown, message: string): string {
+  try {
+    assertJsonValue(value)
+    return stableJson(value)
+  } catch {
+    throw new TurnEngineError("invalid_output", message)
+  }
+}
+
 function estimate(snapshot: StepContextSnapshot): { readonly tokens: number; readonly bytes: number } {
-  const encoded = stableJson(snapshot)
+  const encoded = safeStableJson(snapshot, "Context compaction snapshot is not JSON-safe")
   const bytes = Buffer.byteLength(encoded, "utf8")
   if (bytes > MAX_INPUT_BYTES) throw new TurnEngineError("invalid_output", "Context compaction input exceeds the bounded runtime limit")
   return { tokens: Math.ceil(Array.from(encoded).length / 4), bytes }
 }
 
 function snapshotShape(value: unknown): value is StepContextSnapshot {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false
-  const row = value as Record<string, unknown>
-  if (Object.keys(row).some(key => !["system", "profile", "goal", "steerHistory", "businessRefs", "toolObservations"].includes(key))) return false
-  return ["system", "profile", "steerHistory", "businessRefs", "toolObservations"].every(key => Array.isArray(row[key]))
-    && (row.goal === undefined || (!!row.goal && typeof row.goal === "object" && !Array.isArray(row.goal)))
+  try {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false
+    const row = value as Record<string, unknown>
+    if (Object.keys(row).some(key => !["system", "profile", "goal", "steerHistory", "businessRefs", "toolObservations"].includes(key))) return false
+    if (!["system", "profile", "steerHistory", "businessRefs", "toolObservations"].every(key => Array.isArray(row[key]))) return false
+    if (row.goal !== undefined && (!row.goal || typeof row.goal !== "object" || Array.isArray(row.goal))) return false
+    safeStableJson(value, "Context compaction snapshot is not JSON-safe")
+    return true
+  } catch {
+    return false
+  }
 }
 
 function loadedSnapshotShape(value: unknown): value is LoadedSnapshot {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false
-  const row = value as Record<string, unknown>
-  const scope = row.scope
-  return !!scope && typeof scope === "object" && !Array.isArray(scope) && typeof (scope as Record<string, unknown>).userId === "string"
-    && typeof row.sessionId === "string" && typeof row.turnId === "string" && snapshotShape(row.snapshot)
+  try {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false
+    const row = value as Record<string, unknown>
+    const scope = row.scope
+    if (!scope || typeof scope !== "object" || Array.isArray(scope) || typeof (scope as Record<string, unknown>).userId !== "string") return false
+    if (typeof row.sessionId !== "string" || typeof row.turnId !== "string" || !snapshotShape(row.snapshot)) return false
+    safeStableJson(value, "Compacted snapshot replay is not JSON-safe")
+    return true
+  } catch {
+    return false
+  }
 }
 
 function invariantSnapshot(value: StepContextSnapshot): string {
-  return stableJson({ system: value.system, profile: value.profile, goal: value.goal, steerHistory: value.steerHistory, businessRefs: value.businessRefs })
+  return safeStableJson({ system: value.system, profile: value.profile, ...(value.goal === undefined ? {} : { goal: value.goal }), steerHistory: value.steerHistory, businessRefs: value.businessRefs }, "Context compaction protected invariants are not JSON-safe")
 }
 
 function appendObservation(snapshot: StepContextSnapshot, observation: ContextCompactionObservation): StepContextSnapshot {
   const existing = snapshot.toolObservations.find(item => item.id === observation.id)
+  const observationJson = safeStableJson(observation.content, "Context compaction observation is not JSON-safe")
   if (existing) {
-    if (stableJson(existing.content) !== stableJson(observation.content)) throw new TurnEngineError("invalid_output", "Context compaction replay has a conflicting projection")
+    if (safeStableJson(existing.content, "Context compaction replay observation is not JSON-safe") !== observationJson) throw new TurnEngineError("invalid_output", "Context compaction replay has a conflicting projection")
     return snapshot
   }
   return { ...snapshot, toolObservations: [...snapshot.toolObservations, { id: observation.id, content: observation.content }] }
@@ -72,9 +133,15 @@ async function failClosed(input: RuntimeInput, observationId: string, idempotenc
 export async function runContextCompaction(input: RuntimeInput): Promise<RuntimeResult> {
   const observationId = `context-compacted:${input.stepId}`
   const idempotencyKey = `context-compaction:${input.stepId}`
+  if (!snapshotShape(input.snapshot)) throw new TurnEngineError("invalid_output", "Context compaction input snapshot is not JSON-safe")
   const existing = input.snapshot.toolObservations.find(item => item.id === observationId)
   if (existing) {
-    const replay = parseContextCompactionObservation({ ...((existing.content && typeof existing.content === "object" && !Array.isArray(existing.content)) ? existing.content : {}), observationId })
+    let replay: ContextCompactionObservation | null
+    try {
+      replay = parseContextCompactionObservation({ ...((existing.content && typeof existing.content === "object" && !Array.isArray(existing.content)) ? existing.content : {}), observationId })
+    } catch {
+      throw new TurnEngineError("invalid_output", "Context compaction replay projection is invalid")
+    }
     if (!replay) throw new TurnEngineError("invalid_output", "Context compaction replay projection is invalid")
     if (replay.content.idempotencyKey !== idempotencyKey || replay.content.stepId !== input.stepId) throw new TurnEngineError("invalid_output", "Context compaction replay identity mismatch")
     if (replay.content.status === "failed") throw new TurnEngineError("invalid_output", "Context compaction replay failed closed")
@@ -87,6 +154,7 @@ export async function runContextCompaction(input: RuntimeInput): Promise<Runtime
       throw new TurnEngineError("invalid_output", "Compacted snapshot replay failed closed")
     }
     if (!loadedSnapshotShape(loaded) || loaded.sessionId !== input.sessionId || loaded.turnId !== input.turnId || loaded.scope.userId !== input.scope.userId) throw new TurnEngineError("invalid_output", "Compacted snapshot replay could not load a scoped snapshot")
+    estimate(loaded.snapshot)
     if (invariantSnapshot(loaded.snapshot) !== invariantSnapshot(input.snapshot)) throw new TurnEngineError("invalid_output", "Compacted snapshot replay changed protected invariants")
     return { snapshot: appendObservation(loaded.snapshot, replay) }
   }
@@ -105,7 +173,12 @@ export async function runContextCompaction(input: RuntimeInput): Promise<Runtime
     await input.append(failed, idempotencyKey).catch(() => undefined)
     throw new TurnEngineError("invalid_output", "Context compaction failed closed")
   }
-  if (!result || typeof result !== "object" || !["unchanged", "compacted"].includes(result.status) || !snapshotShape(result.snapshot)) {
+  let validResult = false
+  try {
+    validResult = !!result && typeof result === "object" && !Array.isArray(result) && ["unchanged", "compacted"].includes(result.status)
+      && snapshotShape(result.snapshot)
+  } catch { validResult = false }
+  if (!validResult) {
     return failClosed(input, observationId, idempotencyKey, before)
   }
   try {
@@ -116,7 +189,7 @@ export async function runContextCompaction(input: RuntimeInput): Promise<Runtime
   try { after = estimate(result.snapshot) } catch { return failClosed(input, observationId, idempotencyKey, before) }
   if (result.status === "compacted" && (after.tokens >= before.tokens || after.bytes > before.bytes)) return failClosed(input, observationId, idempotencyKey, before)
   const observation = { kind: "context_compacted", observationId, status: result.status, stepId: input.stepId, idempotencyKey, beforeInputTokens: before.tokens, afterInputTokens: after.tokens, beforeBytes: before.bytes, afterBytes: after.bytes, ...(result.status === "compacted" ? { snapshotRef: result.snapshotRef } : {}) } as const
-  if (Buffer.byteLength(JSON.stringify(observation), "utf8") > MAX_OBSERVATION_BYTES) return failClosed(input, observationId, idempotencyKey, before)
+  if (Buffer.byteLength(safeStableJson(observation, "Context compaction observation is not JSON-safe"), "utf8") > MAX_OBSERVATION_BYTES) return failClosed(input, observationId, idempotencyKey, before)
   try { await input.append(observation, idempotencyKey) } catch { throw new TurnEngineError("invalid_output", "Context compaction projection could not be persisted") }
   return { snapshot: appendObservation(result.snapshot, { id: observationId, content: observation }) }
 }

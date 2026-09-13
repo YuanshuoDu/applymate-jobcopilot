@@ -16,6 +16,24 @@ function input(hook?: ContextCompactionHook, current = snapshot, loadSnapshot?: 
   return { events, value: { hook, loadSnapshot, identity: owner, scope: { userId: owner.userId }, sessionId: owner.sessionId, turnId: owner.turnId, stepId: "step:0", signal: new AbortController().signal, now: new Date("2026-09-12T00:00:00Z"), snapshot: current, append: async (payload: unknown) => { events.push(payload) } } }
 }
 
+function compactedReplaySnapshot(): StepContextSnapshot {
+  return { ...snapshot, toolObservations: [{ id: "context-compacted:step:0", content: {
+    kind: "context_compacted", status: "compacted", stepId: "step:0", idempotencyKey: "context-compaction:step:0",
+    beforeInputTokens: 1, afterInputTokens: 1, beforeBytes: 1, afterBytes: 1, snapshotRef: "snapshot-compact-1",
+  } }] }
+}
+
+const malformedNestedValues: readonly [string, () => unknown][] = [
+  ["BigInt", () => BigInt(1)],
+  ["cycle", () => { const value: Record<string, unknown> = {}; value.self = value; return value }],
+  ["Symbol", () => Symbol("malformed")],
+  ["function", () => () => "malformed"],
+  ["NaN", () => Number.NaN],
+  ["Infinity", () => Number.POSITIVE_INFINITY],
+  ["Date", () => new Date(0)],
+  ["Map", () => new Map([["key", "value"]])],
+]
+
 describe("context compaction runtime seam", () => {
   it("keeps the legacy snapshot unchanged when no hook is configured", async () => {
     const value = input()
@@ -50,10 +68,7 @@ describe("context compaction runtime seam", () => {
   })
 
   it("replays a persisted projection without invoking the hook again", async () => {
-    const current: StepContextSnapshot = { ...snapshot, toolObservations: [{ id: "context-compacted:step:0", content: {
-      kind: "context_compacted", status: "compacted", stepId: "step:0", idempotencyKey: "context-compaction:step:0",
-      beforeInputTokens: 1, afterInputTokens: 1, beforeBytes: 1, afterBytes: 1, snapshotRef: "snapshot-compact-1",
-    } }] }
+    const current = compactedReplaySnapshot()
     const hook = vi.fn()
     const value = input(hook, current, async request => {
       expect(request).toMatchObject({ snapshotRef: "snapshot-compact-1", scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1" })
@@ -63,6 +78,14 @@ describe("context compaction runtime seam", () => {
     expect(result.snapshot.toolObservations.map(item => item.id)).toEqual(expect.arrayContaining(["new", "context-compacted:step:0"]))
     expect(hook).not.toHaveBeenCalled()
     expect(value.events).toEqual([])
+  })
+
+  it.each(malformedNestedValues)("fails closed for a loader snapshot containing nested %s", async (_label, makeValue) => {
+    const value = input(undefined, compactedReplaySnapshot(), async request => ({
+      snapshot: { ...snapshot, toolObservations: [{ id: "loaded", content: { malformed: makeValue() } }] },
+      scope: request.scope, sessionId: request.sessionId, turnId: request.turnId,
+    }))
+    await expect(runContextCompaction(value.value)).rejects.toMatchObject({ code: "invalid_output" })
   })
 
   it("replays an unchanged projection without requiring a snapshot loader", async () => {
