@@ -115,8 +115,9 @@ export class PgSubagentTaskStore implements SubagentStore {
 
   async claim(input: { taskId: string; sessionId: string; ownerId: string; policy: SubagentPolicy; now: Date }): Promise<SubagentTaskRecord | null> {
     return transaction(this.pool, async (client) => {
-      const session = await client.query(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 FOR UPDATE`, [input.sessionId])
-      if (!session.rows[0]) return null
+      const session = await client.query(`SELECT "id", "status" FROM "agent_sessions" WHERE "id" = $1 FOR UPDATE`, [input.sessionId])
+      const sessionStatus = String(session.rows[0]?.status ?? "")
+      if (!session.rows[0] || sessionStatus === "aborted" || sessionStatus === "archived") return null
       const running = await client.query(`SELECT COUNT(*)::int AS "count" FROM "sub_agent_tasks"
         WHERE "sessionId" = $1 AND "status" = 'running' AND "leaseExpiresAt" > CURRENT_TIMESTAMP`, [input.sessionId])
       if (Number(running.rows[0]?.count ?? 0) >= input.policy.maxConcurrency) return null
@@ -125,6 +126,9 @@ export class PgSubagentTaskStore implements SubagentStore {
             "attemptCount" = "attemptCount" + 1, "startedAt" = COALESCE("startedAt", CURRENT_TIMESTAMP), "updatedAt" = CURRENT_TIMESTAMP
         WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'queued' AND "interruptRequestedAt" IS NULL
           AND "attemptCount" < "maxAttempts" AND ("leaseOwner" IS NULL OR "leaseExpiresAt" <= CURRENT_TIMESTAMP)
+          AND EXISTS (SELECT 1 FROM "agent_sessions" AS session
+            WHERE session."id" = "sub_agent_tasks"."sessionId"
+              AND session."status" NOT IN ('aborted', 'archived'))
           AND EXISTS (SELECT 1 FROM "sub_agent_tasks" AS root JOIN "agent_turns" AS turn ON turn."id" = root."turnId"
             WHERE root."id" = "sub_agent_tasks"."rootTaskId" AND root."sessionId" = "sub_agent_tasks"."sessionId"
               AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
