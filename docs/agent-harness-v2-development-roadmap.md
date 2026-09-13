@@ -1984,3 +1984,13 @@ Conditional wait/Turn/outbox mutations fail closed when a session closes during 
 **Independent verification:** Root independently verified the five focused Worker files at **71/71**; Worker `tsc --noEmit --skipLibCheck`, the `@jobcopilot/shared` build, and `git diff --check` passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, real concurrent execution, Redis/BullMQ, Worker restart, provider/browser behavior, and child-parent E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance. Overall phase acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## 77. P4-48 — Server-owned ActiveExecution interruption durability
+
+**Candidate status/date (2026-09-14):** P4-48 is recorded as a candidate server-owned interruption and durable terminalization slice; overall phase acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `4aacbda2` adds a server-owned `interrupted` marker to `ActiveExecution`. The `interrupt`, `interruptSubtree`, and `heartbeat(interrupted)` paths set the marker and trigger abort. A proactive interruption from `run()` follows the existing fenced `store.finish` path and immediately persists durable `interrupted`; genuine `lease_lost`, close/recovery, and shutdown retain their original semantics and do not finish. One-time disposal, slot release, and timer cleanup are protected, while late writes remain fenced by owner, session, attempt, and lease identity.
+
+**Independent verification:** Root independently verified the five focused Worker files at **75/75**; Worker `tsc --noEmit --skipLibCheck`, the `@jobcopilot/shared` build (pretest), and `git diff --check` passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrent execution, Redis/BullMQ, Worker restart, provider/browser behavior, and child-parent E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance. Overall phase acceptance remains **P0 accepted 1/8 (12.5%)**.
