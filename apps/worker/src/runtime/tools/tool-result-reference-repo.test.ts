@@ -33,6 +33,8 @@ function fakePool(options: {
   childRootTurnStatus?: string
   stepTaskId?: string
   stepAttempt?: number
+  sessionStatus?: string
+  sessionUserId?: string
 } = {}) {
   let stored: StoredRow | undefined = options.historical
   const queries: Array<{ text: string; values: readonly unknown[] }> = []
@@ -41,6 +43,11 @@ function fakePool(options: {
     async query<T = unknown>(text: string, values: readonly unknown[] = []) {
       queries.push({ text, values })
       if (text === "BEGIN" || text === "COMMIT" || text === "ROLLBACK" || text.includes("set_config")) return { rows: [], rowCount: 0 } as { rows: T[]; rowCount: number }
+      if (text.includes('FROM "agent_sessions"')) {
+        const allowed = values[0] === "session-1" && values[1] === (options.sessionUserId ?? "user-1")
+          && !["aborted", "archived"].includes(options.sessionStatus ?? "running")
+        return { rows: allowed ? [{ id: "session-1" }] : [], rowCount: allowed ? 1 : 0 } as { rows: T[]; rowCount: number }
+      }
       if (text.includes('FROM "agent_steps"')) {
         const matches = values[1] === "session-1" && values[2] === "turn-current"
           && values[3] === (options.stepTaskId ?? "root-current") && values[4] === (options.stepAttempt ?? 1)
@@ -87,6 +94,33 @@ describe("tool result reference repository", () => {
     expect(fake.queries.some(query => query.text.includes("set_config('app.user_id'"))).toBe(true)
     await expect(repository.put(rootOwner, { stepId: "step-1", toolCallId: "call-1", value: "x".repeat(MAX_TOOL_RESULT_BYTES + 1), now }))
       .rejects.toMatchObject({ code: "tool_result_too_large" })
+  })
+
+  it.each(["aborted", "archived"])("rejects a %s session before any tool result write", async sessionStatus => {
+    const fake = fakePool({ sessionStatus })
+    const repository = createToolResultReferenceRepository(fake.pool as never)
+
+    await expect(repository.put(rootOwner, { stepId: "step-1", toolCallId: "closed-call", value: { safe: true }, now }))
+      .rejects.toMatchObject({ code: "tool_result_fence_rejected" })
+
+    const sessionQuery = fake.queries.find(query => query.text.includes('FROM "agent_sessions"'))
+    expect(sessionQuery?.text).toContain('"status" NOT IN (\'aborted\', \'archived\')')
+    expect(sessionQuery?.text).toContain("FOR UPDATE")
+    expect(sessionQuery?.values).toEqual(["session-1", "user-1"])
+    expect(fake.queries.some(query => query.text.includes('FROM "sub_agent_tasks"'))).toBe(false)
+    expect(fake.queries.some(query => query.text.includes('FROM "agent_steps"'))).toBe(false)
+    expect(fake.queries.some(query => query.text.includes('INSERT INTO "agent_tool_result_references"'))).toBe(false)
+    expect(fake.queries.some(query => query.text === "ROLLBACK")).toBe(true)
+  })
+
+  it("rejects a cross-user session before the write fence", async () => {
+    const fake = fakePool({ sessionUserId: "user-2" })
+    const repository = createToolResultReferenceRepository(fake.pool as never)
+
+    await expect(repository.put(rootOwner, { stepId: "step-1", toolCallId: "foreign-session", value: { safe: true }, now }))
+      .rejects.toMatchObject({ code: "tool_result_fence_rejected" })
+    expect(fake.queries.some(query => query.text.includes('INSERT INTO "agent_tool_result_references"'))).toBe(false)
+    expect(fake.queries.some(query => query.text.includes('FROM "sub_agent_tasks"'))).toBe(false)
   })
 
   it("rejects a changed payload for an already claimed identity", async () => {

@@ -15,6 +15,7 @@ type QueryResult<T> = { rows: T[]; rowCount: number | null }
 type ResultRow = Omit<ToolResultReferenceRecord, "sanitizedJson" | "createdAt" | "updatedAt"> & {
   sanitizedJson: unknown; createdAt: Date | string; updatedAt: Date | string
 }
+const OPEN_SESSION = `"status" NOT IN ('aborted', 'archived')`
 
 export class ToolResultRepositoryError extends Error {
   constructor(readonly code: "invalid_owner" | "tool_result_too_large" | "tool_result_invalid_json" | "tool_result_conflict" | "tool_result_corrupt" | "tool_result_cursor_invalid" | "tool_result_fence_rejected", message: string = code) {
@@ -48,6 +49,12 @@ async function transaction<T>(pool: Pool, userId: string, work: (client: Client)
 
 function assertNow(now: Date): void {
   if (!Number.isFinite(now.getTime())) throw new ToolResultRepositoryError("tool_result_fence_rejected")
+}
+
+async function assertOpenSession(client: Client, fence: ExecutionOwnerFence): Promise<void> {
+  const result = await client.query<{ id: string }>(`SELECT "id", "userId", "status" FROM "agent_sessions"
+    WHERE "id" = $1 AND "userId" = $2 AND ${OPEN_SESSION} FOR UPDATE`, [fence.sessionId, fence.userId]) as QueryResult<{ id: string }>
+  if (!result.rows[0]) throw new ToolResultRepositoryError("tool_result_fence_rejected")
 }
 
 async function assertWriteFence(client: Client, fence: ExecutionOwnerFence, stepId: string, now: Date): Promise<void> {
@@ -158,6 +165,7 @@ export function createToolResultReferenceRepository(pool: Pool): ToolResultRefer
       const safe = safeJson(input.value)
       const now = input.now ?? new Date()
       return transaction(pool, fence.userId, async client => {
+        await assertOpenSession(client, fence)
         await assertWriteFence(client, fence, stepId, now)
         const id = `tool-result-${randomUUID()}`
         await client.query(`INSERT INTO "agent_tool_result_references"
