@@ -1985,6 +1985,18 @@ Conditional wait/Turn/outbox mutations fail closed when a session closes during 
 
 **Candidate boundary:** Live PostgreSQL/RLS, real concurrent execution, Redis/BullMQ, Worker restart, provider/browser behavior, and child-parent E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance. Overall phase acceptance remains **P0 accepted 1/8 (12.5%)**.
 
+## 80. P4-51 — Pending mailbox context injection
+
+**Candidate status/date (2026-09-14):** P4-51 is recorded as a candidate pending mailbox context injection slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `fc06ade3` adds `ChildMailboxReader` to every child context build. It reads at most 20 pending messages with user/session/task scope and maps each payload into `pending_input` data and `external_untrusted` blocks. Production defaults to `PgCoordinationStore`.
+
+This slice does not consume messages, mutate a checkpoint or cursor, add a migration, or add an outbox consumer; semantics remain at-least-once only. A known risk is repeated pending-message injection; future work should add claim/lease/checkpoint handling.
+
+**Independent verification:** Root independently verified the combined focused suite at **49/49**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrency, Redis/BullMQ delivery, Worker restart, provider/browser behavior, and complete E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance. Overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
 ## 79. P4-50 — Durable mailbox pending read and idempotent consume seam
 
 **Candidate status/date (2026-09-14):** P4-50 is recorded as a candidate durable mailbox acknowledgement slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
