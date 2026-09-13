@@ -2,16 +2,39 @@ import { describe, expect, it, vi } from "vitest"
 
 vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnect: vi.fn() })) }))
 
-import { dispatchPendingTurnOutbox, persistTurnDispatch, reclaimExpiredTurns, recoverTurnQueue, turnJobId } from "./recovery-scanner.js"
+import { dispatchPendingTurnOutbox, persistTurnDispatch, reclaimExpiredTurns, repairLegacyTurnDispatchAggregates, recoverTurnQueue, turnJobId } from "./recovery-scanner.js"
 import { markTurnDispatchClaimed } from "./turn-queue.js"
 
-function pool(rows: unknown[] = [], sessionStatus: string | null = "running", queuedRows: unknown[] = []) {
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null
+}
+
+function matchingLegacyRows(rows: unknown[]): unknown[] {
+  return rows.flatMap((value) => {
+    const row = record(value)
+    const payload = record(row?.payload)
+    const id = row?.id
+    const aggregateId = row?.aggregateId
+    const topic = row?.topic
+    const idempotencyKey = row?.idempotencyKey
+    const turnId = payload?.turnId
+    const sessionId = payload?.sessionId
+    if (typeof id !== "string" || aggregateId !== turnId || topic !== "agent.turn.dispatch" || idempotencyKey !== `turn-dispatch:${String(turnId)}` || row?.publishedAt !== null || turnId !== "turn_1" || sessionId !== "session_1") return []
+    return [{ id, turnId, sessionId }]
+  })
+}
+
+function pool(rows: unknown[] = [], sessionStatus: string | null = "running", queuedRows: unknown[] = [], legacyRows: unknown[] = []) {
   const calls: Array<[string, unknown[]?]> = []
   const open = sessionStatus !== null && !["aborted", "archived"].includes(sessionStatus)
   const client = {
     query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push([sql, params])
       if (sql.includes("WITH stale")) return open ? { rows: [{ id: "turn_1", sessionId: "session_1", leaseVersion: 9 }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      if (sql.includes("WITH candidates AS")) {
+        const candidates = matchingLegacyRows(legacyRows)
+        return open ? { rows: candidates, rowCount: candidates.length } : { rows: [], rowCount: 0 }
+      }
       if (sql.includes('FROM "agent_turns" AS turn')) return open ? { rows: queuedRows, rowCount: queuedRows.length } : { rows: [], rowCount: 0 }
       if (sql.includes('FROM "agent_outbox"') && sql.includes('SELECT')) return open ? { rows, rowCount: rows.length } : { rows: [], rowCount: 0 }
       if (sql.includes('FROM "agent_sessions"')) return open ? { rows: [{ id: "session_1" }], rowCount: 1 } : { rows: [], rowCount: 0 }
@@ -58,6 +81,85 @@ describe("Turn recovery scanner", () => {
     const closedFake = pool([], "archived")
     await persistTurnDispatch(closedFake.pool, { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, true)
     expect(closedFake.calls.some(([sql]) => sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
+  })
+
+  it("repairs an open legacy aggregate from canonical session and turn rows", async () => {
+    const fake = pool([], "running", [], [{ id: "dispatch_legacy", aggregateId: "turn_1", topic: "agent.turn.dispatch", idempotencyKey: "turn-dispatch:turn_1", payload: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, publishedAt: null }])
+    const repaired = await repairLegacyTurnDispatchAggregates(fake.pool, 50)
+
+    expect(repaired).toBe(1)
+    const repair = fake.calls.find(([sql]) => sql.includes("WITH candidates AS"))?.[0] ?? ""
+    expect(repair).toContain('FROM "agent_sessions" AS session')
+    expect(repair).toContain('JOIN "agent_turns" AS turn')
+    expect(repair).toContain('JOIN "agent_outbox" AS dispatch')
+    expect(repair).toContain('turn."userId" = session."userId"')
+    expect(repair).toContain('dispatch."aggregateId" = turn."id"')
+    expect(repair).toContain('dispatch."aggregateId" <> session."id"')
+    expect(repair).toContain('dispatch."payload"->>\'turnId\' = turn."id"')
+    expect(repair).toContain('dispatch."payload"->>\'sessionId\' = session."id"')
+    expect(repair).toMatch(/LIMIT \$2 FOR UPDATE OF session, turn, dispatch SKIP LOCKED/)
+    expect(repair).toContain('UPDATE "agent_outbox" AS dispatch')
+    expect(repair).toContain('dispatch."topic" = $1')
+    expect(repair).toContain('dispatch."aggregateId" = candidates."turnId"')
+    expect(repair).toContain('dispatch."publishedAt" IS NULL')
+  })
+
+  it("is reentrant and does not update a repaired legacy row twice", async () => {
+    let aggregateId = "turn_1"
+    let updateCount = 0
+    const calls: Array<[string, unknown[]?]> = []
+    const client = {
+      query: vi.fn(async (sql: string, params?: unknown[]) => {
+        calls.push([sql, params])
+        if (sql.includes("WITH candidates AS")) {
+          if (aggregateId !== "turn_1") return { rows: [], rowCount: 0 }
+          aggregateId = "session_1"
+          updateCount += 1
+          return { rows: [{ id: "dispatch_legacy", turnId: "turn_1", sessionId: "session_1" }], rowCount: 1 }
+        }
+        return { rows: [], rowCount: 1 }
+      }),
+      release: vi.fn(),
+    }
+    const fakePool = { connect: vi.fn().mockResolvedValue(client) }
+
+    await expect(repairLegacyTurnDispatchAggregates(fakePool, 50)).resolves.toBe(1)
+    await expect(repairLegacyTurnDispatchAggregates(fakePool, 50)).resolves.toBe(0)
+    expect(updateCount).toBe(1)
+  })
+
+  it("leaves a canonical session aggregate unchanged", async () => {
+    const fake = pool([], "running", [], [{ id: "dispatch_canonical", aggregateId: "session_1", topic: "agent.turn.dispatch", idempotencyKey: "turn-dispatch:turn_1", payload: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, publishedAt: null }])
+
+    await expect(repairLegacyTurnDispatchAggregates(fake.pool, 50)).resolves.toBe(0)
+  })
+
+  it("includes legacy aggregate repairs in recovery before reclaim and queue repair", async () => {
+    const fake = pool([], "running", [{ id: "turn_1", sessionId: "session_1" }], [{ id: "dispatch_legacy", aggregateId: "turn_1", topic: "agent.turn.dispatch", idempotencyKey: "turn-dispatch:turn_1", payload: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, publishedAt: null }])
+    const report = await recoverTurnQueue(fake.pool, { add: vi.fn().mockResolvedValue(undefined) }, "owner_1", new Date("2026-09-01T00:00:00.000Z"))
+
+    expect(report.repaired).toBe(2)
+    const legacyIndex = fake.calls.findIndex(([sql]) => sql.includes("WITH candidates AS"))
+    const reclaimIndex = fake.calls.findIndex(([sql]) => sql.includes("WITH stale"))
+    const queuedIndex = fake.calls.findIndex(([sql]) => sql.includes('LEFT JOIN "agent_outbox" AS dispatch'))
+    expect(legacyIndex).toBeGreaterThanOrEqual(0)
+    expect(legacyIndex).toBeLessThan(reclaimIndex)
+    expect(legacyIndex).toBeLessThan(queuedIndex)
+  })
+
+  it.each([
+    ["aborted", "archived", { turnId: "turn_1", sessionId: "session_1" }],
+    ["archived", "archived", { turnId: "turn_1", sessionId: "session_1" }],
+    ["missing", "running", { turnId: "missing-turn", sessionId: "missing-session" }],
+    ["corrupt", "running", { turnId: "wrong-turn", sessionId: "session_1" }],
+  ] as const)("does not queue a %s legacy row", async (_kind, sessionStatus, payload) => {
+    const fake = pool([], sessionStatus, [], [{ id: "dispatch_legacy", aggregateId: payload.turnId, topic: "agent.turn.dispatch", idempotencyKey: `turn-dispatch:${payload.turnId}`, payload: { ...payload, ownerId: "owner_1" }, publishedAt: null }])
+    const queue = { add: vi.fn() }
+    const report = await recoverTurnQueue(fake.pool, queue, "owner_1", new Date("2026-09-01T00:00:00.000Z"))
+
+    expect(report.repaired).toBe(0)
+    expect(report.dispatched).toBe(0)
+    expect(queue.add).not.toHaveBeenCalled()
   })
 
   it("uses a colon-free generation id so a resumed Turn is not hidden by a completed job", async () => {

@@ -118,6 +118,47 @@ export async function persistTurnDispatch(
   })
 }
 
+/** Rewrites pre-P4-39 pending dispatch rows to their canonical session aggregate. */
+export async function repairLegacyTurnDispatchAggregates(pool: LeasePool, limit = TURN_DISPATCH_MAX_BATCH): Promise<number> {
+  if (!Number.isInteger(limit) || limit < 1) throw new RangeError("Turn dispatch repair limit must be positive")
+  return withTransaction(pool, async (client) => {
+    const result = await client.query(
+      `WITH candidates AS (
+         SELECT dispatch."id" AS "dispatchId", turn."id" AS "turnId", session."id" AS "sessionId"
+         FROM "agent_sessions" AS session
+         JOIN "agent_turns" AS turn
+           ON turn."sessionId" = session."id"
+          AND turn."userId" = session."userId"
+         JOIN "agent_outbox" AS dispatch
+           ON dispatch."aggregateId" = turn."id"
+          AND dispatch."aggregateId" <> session."id"
+          AND dispatch."topic" = $1
+          AND dispatch."idempotencyKey" = 'turn-dispatch:' || turn."id"
+          AND dispatch."publishedAt" IS NULL
+          AND dispatch."payload"->>'turnId' = turn."id"
+          AND dispatch."payload"->>'sessionId' = session."id"
+         WHERE session."status" NOT IN ('aborted', 'archived')
+         ORDER BY dispatch."createdAt" ASC, dispatch."id" ASC
+         LIMIT $2 FOR UPDATE OF session, turn, dispatch SKIP LOCKED
+       )
+       UPDATE "agent_outbox" AS dispatch
+       SET "aggregateId" = candidates."sessionId"
+       FROM candidates
+       WHERE dispatch."id" = candidates."dispatchId"
+         AND dispatch."topic" = $1
+         AND dispatch."aggregateId" = candidates."turnId"
+         AND dispatch."aggregateId" <> candidates."sessionId"
+         AND dispatch."idempotencyKey" = 'turn-dispatch:' || candidates."turnId"
+         AND dispatch."publishedAt" IS NULL
+         AND dispatch."payload"->>'turnId' = candidates."turnId"
+         AND dispatch."payload"->>'sessionId' = candidates."sessionId"
+       RETURNING dispatch."id"`,
+      [TURN_DISPATCH_TOPIC, limit],
+    )
+    return result.rowCount ?? result.rows.length
+  })
+}
+
 async function ensureQueuedTurnDispatches(
   pool: LeasePool,
   ownerId: string,
@@ -285,11 +326,12 @@ export async function recoverTurnQueue(
   ownerId = `recovery-${randomUUID()}`,
   now = new Date(),
 ): Promise<RecoveryReport> {
+  const legacyRepaired = await repairLegacyTurnDispatchAggregates(pool, TURN_DISPATCH_MAX_BATCH)
   const reclaimed = await reclaimExpiredTurns(pool, now, TURN_DISPATCH_MAX_BATCH)
   for (const turn of reclaimed) {
     await persistTurnDispatch(pool, { turnId: turn.turnId, sessionId: turn.sessionId, ownerId }, true)
   }
-  const repaired = await ensureQueuedTurnDispatches(pool, ownerId, TURN_DISPATCH_MAX_BATCH)
+  const repaired = legacyRepaired + await ensureQueuedTurnDispatches(pool, ownerId, TURN_DISPATCH_MAX_BATCH)
   const dispatched = await dispatchPendingTurnOutbox(pool, queue)
   return { reclaimed: reclaimed.length, repaired, dispatched }
 }
