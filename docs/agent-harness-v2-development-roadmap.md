@@ -1745,6 +1745,16 @@ Conditional wait/Turn/outbox mutations fail closed when a session closes during 
 
 **Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, real cross-process concurrency, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
 
+## 54. P4-24 — Tree-budget admission session-state fence
+
+**Candidate status/date (2026-09-13):** P4-24 is recorded as a candidate tree-budget admission safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `bd4f765b` makes reserve lock the linked session first with an open status fence before root/lineage/reservation writes. `aborted`, `archived`, missing, or cross-user sessions fail closed as `root_not_found` with rollback and no writes. Existing reservation settlement remains tenant/session identity scoped and idempotent; `consumed` or `released` cleanup remains allowed after session closure without reopening or creating reservations. Open `running`, `paused`, and `waiting_for_user` sessions, together with ordinary user/system sessions, remain compatible.
+
+**Independent verification:** Root independently verified the focused tree-budget suite at **15/15**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrency, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
 ## 52. P4-22 — Wakeup resume session-state fence
 
 **Candidate status/date (2026-09-13):** P4-22 is recorded as a candidate wakeup resume safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
