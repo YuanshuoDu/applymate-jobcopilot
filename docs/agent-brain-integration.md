@@ -455,3 +455,11 @@ Commit `b39ddd29` bridges Web Execution DELETE cancellation to the canonical Tur
 Ownership mismatches fail closed; ordinary user Turns are untouched; no active Turn is safe; completed or failed executions remain terminal; and an already-cancelled execution can be retried idempotently. Execution status and Turn revision races roll back with typed conflicts, while real database or permission errors remain surfaced. Focused Web validation passed **23/23**, with shared build, Worker tsc, Web tsc, and `git diff --check` passing.
 
 Live PostgreSQL/RLS, Redis/queue delivery, real Worker restart, provider, browser, and child-parent E2E remain unverified. This candidate does not complete Harness or P4/Phase, and overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-11 update
+
+Commit `2bade48d` repairs the automation restart stale-Turn projection race. `CanonicalExecutionIdentity` now requires strictly validated `userId`, `sessionId`, and `turnId`. Projection start and finish SQL require the target Turn to match those identities with `source = 'automation'` and to be the latest Turn for the session and user. Any newer Turn, regardless of source, wins by `createdAt` plus an `id` tie-break and makes the old projection update inapplicable.
+
+Canonical runtime passes `lease.turnId` to start, normal finish, and terminal-root reconciliation finish. A late old-Turn queue delivery or reconciliation therefore cannot mark a restarted session's newer `AgentExecution` completed or failed. Existing cancelled/terminal guards and stable `startedAt` behavior remain in force. Root independently verified **3 suites / 50 tests**, plus shared build, Worker tsc, and `git diff --check`.
+
+Live PostgreSQL/RLS, Redis/queue delivery, real Worker restart, provider, browser, and child-parent E2E remain unverified. This candidate does not complete Harness or P4/Phase, and overall progress remains **P0 accepted 1/8 (12.5%)**.

@@ -1614,3 +1614,15 @@ Ownership mismatches fail closed, ordinary user Turns are not interrupted, and n
 **Independent verification:** Focused Web route and command suites passed **23/23**; shared package build, Worker `tsc --noEmit --skipLibCheck`, Web `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, real Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness or P4/Phase completion; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 41. P4-11 — Turn-fenced canonical execution projection
+
+**Candidate status/date (2026-09-13):** P4-11 is recorded as a candidate stale-Turn projection race repair; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `2bade48d` extends the server-owned `CanonicalExecutionIdentity` with a strictly validated `userId`, `sessionId`, and `turnId`. Projection start and finish SQL require the target Turn to match all three identities and `source = 'automation'`, and require that no newer Turn exists for the same session and user. Newer Turns from any source, including a newly created user Turn, are ordered by `createdAt` with `id` as the deterministic tie-break and prevent the stale projection from updating the Execution row.
+
+The same Turn fence is passed from canonical runtime start, normal terminal finish, and terminal-root reconciliation finish. This closes the automation restart race where a late old-Turn queue delivery or reconciliation could otherwise mark the new generation's `AgentExecution` completed or failed; cancelled/terminal conditional guards and stable `startedAt` behavior remain unchanged.
+
+**Independent verification:** Root independently verified **3 focused suites / 50 tests** across projection, canonical runtime, and root-task-store regression; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, real Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness or P4/Phase completion; overall progress remains **P0 accepted 1/8 (12.5%)**.
