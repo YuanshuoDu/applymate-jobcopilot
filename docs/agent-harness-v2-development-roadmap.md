@@ -1692,3 +1692,13 @@ A blocked or raced claim continues to surface only the recoverable `TurnLeaseErr
 **Independent verification:** The focused pg-store suite passed **21/21**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, real concurrent transactions, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 48. P4-18 — Subagent lease lifecycle session fence
+
+**Candidate status/date (2026-09-13):** P4-18 is recorded as a candidate child-task lease lifecycle safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `d02ab9e0` extends child-task heartbeat, finish, and expired-lease recovery with a server-owned `agent_sessions` state fence. Heartbeat locks and reads the session before renewal and treats `aborted` or `archived` sessions as lost/interrupted without extending the lease. Finish uses the same session-state condition so late child success or failure cannot be written after cancellation or archival. `recoverExpired` reads the session state while reclaiming stale running children and converges closed-session children to `interrupted` instead of re-queueing them. Running, paused, waiting-for-user, and ordinary user/system sessions preserve existing reclaim and retry behavior, including root/Turn/lease/attempt semantics.
+
+**Independent verification:** Root independently verified the focused pg-store suite at **27/27**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real cross-process concurrency, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
