@@ -647,3 +647,11 @@ Commit `32368bb4` corrects the locking-clause order in exactly six active Worker
 Root independently verified 11 Worker suites at **151/151**, covering the affected three suites plus queue, Pg store, manager, coordination integration, durable waits, Turn queue, and root-task coverage. The shared package build, Worker `tsc --noEmit --skipLibCheck`, `git diff --check`, and a repository scan confirming no old-order pattern remains in `apps/worker/src` also passed.
 
 Live PostgreSQL/RLS, real concurrent lock races, Redis/BullMQ delivery, process restart, provider, browser, and full production child-parent E2E remain unverified. The cognitive gate remains disabled; P4-38 remains a candidate and overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-39 update
+
+Commits `331edc78`, `e48c596f`, and `704c1750` align `agent.turn.dispatch` aggregate scope across the Web root command, Turn recovery/repair, durable-wait handoff/resolver, and claim bookkeeping paths. Every dispatch intent uses the owning `sessionId` as `aggregateId`; the idempotency key remains `turn-dispatch:<turnId>`. Recovery joins on both session identity and the deterministic key to prevent cross-Turn reuse, and the `ON CONFLICT` handling preserves the session aggregate fence.
+
+Root independently verified the Web command-service and transaction suites at **30/30** and the Worker recovery-scanner, turn-queue, durable-wait-handoff, and durable-wait-resolver suites at **44/44**. Web and Worker `tsc --noEmit --skipLibCheck`, the shared package build, and `git diff --check` also passed.
+
+Live PostgreSQL/RLS, Redis/BullMQ delivery, real concurrent transactions, process restart, provider/browser behavior, and full child-parent E2E remain unverified. The cognitive gate remains disabled; P4-39 remains a candidate and does not establish complete Harness, P4/Phase or production acceptance. Overall progress remains **P0 accepted 1/8 (12.5%)**.

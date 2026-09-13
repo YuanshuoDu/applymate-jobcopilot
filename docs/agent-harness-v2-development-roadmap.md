@@ -1904,3 +1904,13 @@ Conditional wait/Turn/outbox mutations fail closed when a session closes during 
 **Independent verification:** Root independently verified 11 Worker suites at **151/151**, covering the affected three suites plus queue, Pg store, manager, coordination integration, durable waits, Turn queue, and root-task coverage. The shared package build, Worker `tsc --noEmit --skipLibCheck`, `git diff --check`, and a repository scan confirming no old-order pattern remains in `apps/worker/src` also passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, real concurrent lock races, Redis/BullMQ delivery, process restart, provider, browser, and full production child-parent E2E behavior remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance, and overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 69. P4-39 — Turn dispatch aggregate scope and recovery bookkeeping
+
+**Candidate status/date (2026-09-13):** P4-39 is recorded as a candidate session-scoped Turn dispatch consistency slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commits `331edc78`, `e48c596f`, and `704c1750` align `agent.turn.dispatch` aggregate scope across the Web root command, Turn recovery/repair, durable-wait handoff/resolver, and claim bookkeeping paths. Each dispatch intent uses the owning `sessionId` as `aggregateId`, while the idempotency key remains `turn-dispatch:<turnId>`. Recovery joins on both session identity and the deterministic key to prevent cross-Turn reuse, and `ON CONFLICT` handling preserves the session aggregate fence.
+
+**Independent verification:** Root independently verified the Web command-service and transaction suites at **30/30** and the Worker recovery-scanner, turn-queue, durable-wait-handoff, and durable-wait-resolver suites at **44/44**. Web and Worker `tsc --noEmit --skipLibCheck`, the shared package build, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, Redis/BullMQ delivery, real concurrent transactions, process restart, provider/browser behavior, and full child-parent E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance, and overall progress remains **P0 accepted 1/8 (12.5%)**.
