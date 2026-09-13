@@ -4,7 +4,7 @@ import { err, ok } from "@/lib/api-helpers"
 import { nextRunAfterCurrent } from "@/lib/agent/automation-schedule"
 import { enqueueAgentRun } from "@/lib/agent-run-queue-client"
 import { ensureAgentExecution } from "@/lib/agent/execution-control"
-import { ensureAutomationTurn, isActiveAutomationExecution, resolveAutomationSession } from "@/lib/agent/automation-session"
+import { AutomationTurnOccupiedError, ensureAutomationTurn, isActiveAutomationExecution, resolveAutomationSession } from "@/lib/agent/automation-session"
 import { hasEffectiveEntitlement } from '@/lib/entitlements'
 import { isRuntimeAgentHarnessFeatureEnabled } from '@/lib/runtime-feature-flags'
 import { createDualWriteSession } from '@/lib/agent/session/dual-write'
@@ -91,11 +91,20 @@ async function startAutomation(automation: AutomationForRun, now: Date) {
     })
   }
 
-  const canonicalTurn = await ensureAutomationTurn(db, {
-    sessionId: session.id,
-    userId: automation.userId,
-    name: automation.name,
-  })
+  let canonicalTurn: Awaited<ReturnType<typeof ensureAutomationTurn>>
+  try {
+    canonicalTurn = await ensureAutomationTurn(db, {
+      sessionId: session.id,
+      userId: automation.userId,
+      name: automation.name,
+    })
+  } catch (error: unknown) {
+    if (error instanceof AutomationTurnOccupiedError) {
+      await db.agentAutomation.update({ where: { id: automation.id, userId: automation.userId }, data: { nextRunAt: now } })
+      return null
+    }
+    throw error
+  }
 
   const dualWriteEnabled = await isRuntimeAgentHarnessFeatureEnabled(
     'AGENT_PROTOCOL_V2_DUAL_WRITE',

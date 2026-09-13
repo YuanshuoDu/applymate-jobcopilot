@@ -224,4 +224,24 @@ describe("agent automation due scheduler API", () => {
     await expect(res.json()).resolves.toMatchObject({ started: [] })
     expect(mocks.sessionCreate).not.toHaveBeenCalled()
   })
+
+  it("skips a raced non-automation Turn and makes the automation due again", async () => {
+    mocks.turnFindFirst.mockResolvedValueOnce(null).mockResolvedValueOnce(null)
+    mocks.turnCreate.mockRejectedValueOnce({ code: "P2002" })
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest() as never)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({ started: [] })
+    expect(mocks.ensureExecution).not.toHaveBeenCalled()
+    expect(mocks.enqueueAgentRun).not.toHaveBeenCalled()
+    expect(mocks.automationUpdate).toHaveBeenCalledWith({
+      where: { id: "automation_1", userId: "user_1" },
+      data: { nextRunAt: expect.any(Date) },
+    })
+    expect(mocks.turnFindFirst).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      where: expect.objectContaining({ userId: "user_1", sessionId: "session_1", source: "automation" }),
+    }))
+  })
 })

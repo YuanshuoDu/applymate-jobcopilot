@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest"
-import { ensureAutomationTurn, resolveAutomationSession } from "./automation-session"
+import { AutomationTurnOccupiedError, ensureAutomationTurn, resolveAutomationSession } from "./automation-session"
 
 function session(id: string) {
   return {
@@ -63,6 +63,9 @@ describe("ensureAutomationTurn", () => {
 
     await expect(ensureAutomationTurn(db, { sessionId: "session_1", userId: "user_1", name: "Weekday Scout" }))
       .resolves.toEqual({ turnId: "turn_active", created: false })
+    expect(db.agentTurn.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ sessionId: "session_1", userId: "user_1", source: "automation" }),
+    }))
     expect(db.agentTurn.create).not.toHaveBeenCalled()
   })
 
@@ -76,5 +79,38 @@ describe("ensureAutomationTurn", () => {
 
     await expect(ensureAutomationTurn(db, { sessionId: "session_1", userId: "user_1", name: "Weekday Scout" }))
       .resolves.toEqual({ turnId: "turn_raced", created: false })
+    expect(db.agentTurn.findFirst).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      where: expect.objectContaining({ sessionId: "session_1", userId: "user_1", source: "automation" }),
+    }))
+  })
+
+  it("fails closed when the create race belongs to a non-automation Turn", async () => {
+    const db = {
+      agentTurn: {
+        findFirst: vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce(null),
+        create: vi.fn().mockRejectedValue({ code: "P2002" }),
+      },
+    }
+
+    await expect(ensureAutomationTurn(db, { sessionId: "session_1", userId: "user_1", name: "Weekday Scout" }))
+      .rejects.toMatchObject({
+        name: "AutomationTurnOccupiedError",
+        code: "automation_turn_occupied",
+        sessionId: "session_1",
+      })
+  })
+
+  it("propagates non-unique database errors", async () => {
+    const databaseError = new Error("database unavailable")
+    const db = {
+      agentTurn: {
+        findFirst: vi.fn().mockResolvedValue(null),
+        create: vi.fn().mockRejectedValue(databaseError),
+      },
+    }
+
+    await expect(ensureAutomationTurn(db, { sessionId: "session_1", userId: "user_1", name: "Weekday Scout" }))
+      .rejects.toBe(databaseError)
+    expect(databaseError).not.toBeInstanceOf(AutomationTurnOccupiedError)
   })
 })

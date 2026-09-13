@@ -6,7 +6,7 @@ import { err, isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { nextRunAfterCurrent } from "@/lib/agent/automation-schedule"
 import { enqueueAgentRun } from "@/lib/agent-run-queue-client"
 import { ensureAgentExecution } from "@/lib/agent/execution-control"
-import { ensureAutomationTurn, isActiveAutomationExecution, resolveAutomationSession } from "@/lib/agent/automation-session"
+import { AutomationTurnOccupiedError, ensureAutomationTurn, isActiveAutomationExecution, resolveAutomationSession } from "@/lib/agent/automation-session"
 import { hasEffectiveEntitlement } from '@/lib/entitlements'
 import { isRuntimeAgentHarnessFeatureEnabled } from '@/lib/runtime-feature-flags'
 import { createDualWriteSession } from '@/lib/agent/session/dual-write'
@@ -133,11 +133,17 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
     })
   }
 
-  const canonicalTurn = await ensureAutomationTurn(db, {
-    sessionId: session.id,
-    userId: auth.userId,
-    name: automation.name,
-  })
+  let canonicalTurn: Awaited<ReturnType<typeof ensureAutomationTurn>>
+  try {
+    canonicalTurn = await ensureAutomationTurn(db, {
+      sessionId: session.id,
+      userId: auth.userId,
+      name: automation.name,
+    })
+  } catch (error: unknown) {
+    if (error instanceof AutomationTurnOccupiedError) return err(error.message, 409)
+    throw error
+  }
 
   const dualWriteEnabled = await isRuntimeAgentHarnessFeatureEnabled(
     'AGENT_PROTOCOL_V2_DUAL_WRITE',

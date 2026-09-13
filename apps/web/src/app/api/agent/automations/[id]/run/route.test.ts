@@ -273,4 +273,20 @@ describe("agent automation run API", () => {
     expect(mocks.sessionCreate).not.toHaveBeenCalled()
     expect(mocks.transcriptCreate).not.toHaveBeenCalled()
   })
+
+  it("returns 409 and does not queue when a raced Turn is not automation-owned", async () => {
+    mocks.turnFindFirst.mockResolvedValueOnce(null).mockResolvedValueOnce(null)
+    mocks.turnCreate.mockRejectedValueOnce({ code: "P2002" })
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest() as never, ctx())
+
+    expect(res.status).toBe(409)
+    await expect(res.json()).resolves.toMatchObject({ error: expect.stringContaining("active non-automation Turn") })
+    expect(mocks.ensureExecution).not.toHaveBeenCalled()
+    expect(mocks.enqueueAgentRun).not.toHaveBeenCalled()
+    expect(mocks.turnFindFirst).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      where: expect.objectContaining({ userId: "user_1", sessionId: "session_1", source: "automation" }),
+    }))
+  })
 })
