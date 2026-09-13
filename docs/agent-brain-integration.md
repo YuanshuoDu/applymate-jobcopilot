@@ -679,3 +679,11 @@ Commit `0cd75cb4` aligns durable-wait handoff and resolver locking. Handoff firs
 Root independently verified the focused Worker suites at **30/30**. Worker `tsc --noEmit --skipLibCheck`, the shared package build, and `git diff --check` also passed.
 
 Live PostgreSQL/RLS, real cross-process lock ordering and close races, Redis/queue delivery, process restart, and complete Worker/child-parent E2E remain unverified. The cognitive gate remains disabled; P4-42 remains a candidate and overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-43 update
+
+Commit `03cdd550` adds runtime legacy repair for Turn dispatch aggregates. The repair derives the session aggregate from the canonical session → Turn → outbox relationship and updates only rows that are open, unpublished, and have consistent topic, idempotency, and payload values. Stale predicates guard each `UPDATE`; `recoverTurnQueue` merges repaired rows into normal recovery. Canonical, closed, missing, and corrupt rows remain unchanged.
+
+Root independently verified the Recovery and Turn queue suites at **32/32**. Worker `tsc --noEmit --skipLibCheck`, the shared package build, and `git diff --check` also passed.
+
+Live PostgreSQL/RLS, Redis/queue delivery, restart behavior, and complete Worker E2E remain unverified. The cognitive gate remains disabled; P4-43 remains a candidate and overall progress remains **P0 accepted 1/8 (12.5%)**.
