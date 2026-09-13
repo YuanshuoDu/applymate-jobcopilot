@@ -75,14 +75,21 @@ async function main() {
     process.exit(1);
   }
 
-  const childExecutionEnabled = productionChildRuntimeModule.childExecutionEnabled();
-  const consumeWaitOutcomes = process.env.ENABLE_AGENT_WAIT_RESOLVER === "1" && childExecutionEnabled;
   const productionFlags = resolveProductionAgentFlags();
+  const childExecutionEnabled = productionFlags.cognitiveLoopEnabled || productionChildRuntimeModule.childExecutionEnabled();
   const pool = getPool();
   const contextCompactionOptions = createProductionContextCompactionOptions({
     enabled: productionFlags.contextCompactionEnabled,
     pool,
   });
+  const childExecutor = productionChildRuntimeModule.createOptionalProductionChildExecutor({
+    enabled: childExecutionEnabled,
+    pool,
+    ...(childExecutionEnabled && contextCompactionOptions.contextSnapshotAdapter
+      ? { contextSnapshotAdapter: contextCompactionOptions.contextSnapshotAdapter }
+      : {}),
+  });
+  const consumeWaitOutcomes = (productionFlags.cognitiveLoopEnabled || process.env.ENABLE_AGENT_WAIT_RESOLVER === "1") && childExecutor !== undefined;
   const canonicalRuntime = await canonicalRuntimeModule.createCanonicalTurnRuntime(pool, {
     workerId: process.env.WORKER_ID ?? `worker-${process.pid}`,
     authorizeUsage: aiUsageBridgeModule.createWorkerUsageAuthorizer(),
@@ -94,16 +101,7 @@ async function main() {
     sessionProjection: createCanonicalSessionProjection(pool),
     ...contextCompactionOptions,
   });
-  // Child execution is opt-in. Keep tree-budget and child queue construction
-  // out of the default startup path until the explicit feature flag is set.
-  const childExecutor = productionChildRuntimeModule.createOptionalProductionChildExecutor({
-    enabled: childExecutionEnabled,
-    pool,
-    ...(childExecutionEnabled && contextCompactionOptions.contextSnapshotAdapter
-      ? { contextSnapshotAdapter: contextCompactionOptions.contextSnapshotAdapter }
-      : {}),
-  });
-  const waitResolver = consumeWaitOutcomes && childExecutor ? {} : undefined;
+  const waitResolver = consumeWaitOutcomes ? {} : undefined;
   const canonicalBootstrap = await productionBootstrapModule.createProductionWorkerBootstrap({
     pool,
     runtime: canonicalRuntime,

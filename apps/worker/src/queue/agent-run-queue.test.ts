@@ -42,6 +42,7 @@ describe("agent-run queue", () => {
     mocks.queueCloses.length = 0;
     vi.stubEnv("AGENT_WEB_URL", "https://app.applymate.test/");
     vi.stubEnv("AGENT_WORKER_SECRET", "worker-secret");
+    vi.stubEnv("ENABLE_AGENT_COGNITIVE_LOOP", "0");
     vi.stubEnv("ENABLE_AGENT_CANONICAL_AUTOMATION", "0");
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ status: "completed" }))));
   });
@@ -91,6 +92,17 @@ describe("agent-run queue", () => {
     expect(mocks.producer.enqueue).toHaveBeenCalledTimes(1);
     expect(mocks.producer.enqueue).toHaveBeenCalledWith({ sessionId: "session_1", turnId: "turn_1" });
     expect(mocks.producer.enqueue.mock.calls[0]?.[0]).not.toHaveProperty("executionId");
+    expect(mocks.canonical).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("routes a Turn-bound task when the complete cognitive loop gate is enabled", async () => {
+    vi.stubEnv("ENABLE_AGENT_COGNITIVE_LOOP", "1");
+    await import("./agent-run-queue.js");
+
+    await expect(mocks.handler?.({ data: { userId: "user_1", sessionId: "session_1", turnId: "turn_1" } }))
+      .resolves.toEqual({ status: "routed", queue: "agent-turns", turnId: "turn_1" });
+    expect(mocks.producer.enqueue).toHaveBeenCalledWith({ sessionId: "session_1", turnId: "turn_1" });
     expect(mocks.canonical).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
   });
