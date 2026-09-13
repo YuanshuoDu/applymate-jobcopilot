@@ -1735,6 +1735,16 @@ Conditional wait/Turn/outbox mutations fail closed when a session closes during 
 
 **Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, real cross-process concurrency, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
 
+## 63. P4-33 — Canonical root/task/execution session-first fence
+
+**Candidate status/date (2026-09-13):** P4-33 is recorded as a candidate Worker canonical root/task/execution admission safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `72ef8fc9` adds an open-session `FOR UPDATE` fence before every root Turn lease mutation (`claim`, `renew`, `expire`, `release`, and `interrupt`), then preserves the existing owner, version, expiry, status, and idempotency conditions. Root-task `ensure`, `checkCompletion`, and `finish` now lock the user-owned open `agent_sessions` row before the Turn/task path, so missing, cross-user, aborted, or archived sessions fail closed with rollback and no root task or Turn writes. Terminal reconciliation remains a read-only historical lookup so closed-session history and reservation cleanup are not disturbed; subsequent terminal mutations remain fenced. Canonical session and execution projections now lock the same user-owned open session before mutation and cannot reopen archived or aborted sessions. Existing running, paused, and waiting-for-user behavior remains compatible.
+
+**Independent verification:** Root independently verified the four affected focused suites at **80/80** (lease 18, root-task 25, session projection 18, execution projection 19); the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
+
+**Candidate boundary:** `canonical-turn-runtime.test.ts` remains **19/20** in the real-registry/context-builder case because the fake environment reaches a real registry/Redis dependency and returns a failed result; that test does not execute the new lease, root-task, or projection paths, so this remains an unresolved boundary outside P4-33 rather than an attributed regression. Live PostgreSQL/RLS, real concurrent lock races, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
 ## 62. P4-32 — V2/legacy session-first durable admission fence
 
 **Candidate status/date (2026-09-13):** P4-32 is recorded as a candidate Web V2/legacy session admission safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.

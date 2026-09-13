@@ -603,3 +603,11 @@ Commits `12769a3b` and review repair `3bd1f253` add the Web V2/legacy session-fi
 Root independently verified the focused V2-turn, dual-write, and run-recorder suites at **39/39** after the repair, with Web `tsc --noEmit --skipLibCheck` and `git diff --check` passing.
 
 Live PostgreSQL/RLS, real concurrent lock races, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E remain unverified. P4-32 remains a candidate and does not establish complete Harness, P4/Phase or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-33 update
+
+Commit `72ef8fc9` adds an open-session `FOR UPDATE` fence before every root Turn lease mutation (`claim`, `renew`, `expire`, `release`, and `interrupt`), then preserves the existing owner, version, expiry, status, and idempotency conditions. Root-task `ensure`, `checkCompletion`, and `finish` lock the user-owned open `agent_sessions` row before the Turn/task path; missing, cross-user, aborted, or archived sessions fail closed with rollback and no root task or Turn writes. Terminal reconciliation remains a read-only historical lookup, while subsequent terminal mutations remain fenced. Canonical session and execution projections lock the same user-owned open session before mutation and cannot reopen archived or aborted sessions. Running, paused, and waiting-for-user behavior remains compatible.
+
+Root independently verified the four affected focused suites at **80/80** (lease 18, root-task 25, session projection 18, execution projection 19); the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed. `canonical-turn-runtime.test.ts` remains **19/20** in the real-registry/context-builder case because the fake environment reaches a real registry/Redis dependency and returns a failed result; that test does not execute the new lease, root-task, or projection paths, so this remains an unresolved boundary outside P4-33 rather than an attributed regression.
+
+Live PostgreSQL/RLS, real concurrent lock races, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E remain unverified. P4-33 remains a candidate and does not establish complete Harness, P4/Phase or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
