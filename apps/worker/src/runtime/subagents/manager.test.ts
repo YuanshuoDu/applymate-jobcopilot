@@ -11,12 +11,16 @@ import {
 } from "./types.js"
 
 class FakeClock implements SubagentClock {
+  clearCount = 0
+
   setInterval(): ReturnType<typeof setInterval> { return {} as ReturnType<typeof setInterval> }
-  clearInterval(): void {}
+  clearInterval(): void { this.clearCount += 1 }
 }
 
 class MemoryStore implements SubagentStore {
   readonly records = new Map<string, SubagentTaskRecord>()
+  readonly finishCalls: Array<{ taskId: string; status: SubagentExecutionResult["status"]; attemptCount: number }> = []
+  heartbeatResult: "renewed" | "interrupted" | "lost" | null = null
   private nextId = 1
 
   async create(input: SubagentTaskSpec & { policy: SubagentPolicy }): Promise<SubagentTaskRecord> {
@@ -52,11 +56,18 @@ class MemoryStore implements SubagentStore {
     const task = this.records.get(input.taskId)
     if (!task || task.sessionId !== input.sessionId || task.leaseOwner !== input.ownerId || task.status !== "running") return "lost"
     if (task.interruptRequestedAt) return "interrupted"
+    if (this.heartbeatResult) {
+      const result = this.heartbeatResult
+      this.heartbeatResult = null
+      if (result === "interrupted") this.records.set(task.id, { ...task, interruptRequestedAt: input.now })
+      return result
+    }
     this.records.set(task.id, { ...task, leaseExpiresAt: new Date(input.now.getTime() + 60_000) })
     return "renewed"
   }
 
-  async finish(input: { taskId: string; sessionId: string; ownerId: string; status: SubagentExecutionResult["status"]; result?: unknown; failureReason?: string; now: Date }): Promise<"completed" | "retrying" | "failed" | "waiting" | "waiting_for_user" | "interrupted" | null> {
+  async finish(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; status: SubagentExecutionResult["status"]; result?: unknown; failureReason?: string; now: Date }): Promise<"completed" | "retrying" | "failed" | "waiting" | "waiting_for_user" | "interrupted" | null> {
+    this.finishCalls.push({ taskId: input.taskId, status: input.status, attemptCount: input.attemptCount })
     const task = this.records.get(input.taskId)
     if (!task || task.sessionId !== input.sessionId || task.leaseOwner !== input.ownerId || task.status !== "running") return null
     const interrupted = task.interruptRequestedAt !== null
@@ -151,6 +162,61 @@ describe("AgentTreeManager", () => {
     await expect(manager.interrupt(task.sessionId, task.rootTaskId)).resolves.toBe(1)
     await expect(running).resolves.toMatchObject({ status: "interrupted" })
     expect(manager.activeCount(task.sessionId)).toBe(0)
+  })
+
+  it("finishes a non-cooperative active interruption before releasing its lease", async () => {
+    const store = new MemoryStore()
+    const clock = new FakeClock()
+    const manager = new AgentTreeManager(store, { clock })
+    const task = await manager.spawn(spec())
+    const running = manager.run(payload(task), async () => new Promise<SubagentExecutionResult>(() => undefined))
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    await manager.interrupt(task.sessionId, task.rootTaskId)
+    await expect(running).resolves.toMatchObject({ status: "interrupted" })
+    expect(store.finishCalls).toEqual([{ taskId: task.id, status: "failed", attemptCount: 1 }])
+    expect(store.records.get(task.id)).toMatchObject({ status: "interrupted", leaseOwner: null, leaseExpiresAt: null })
+    expect(manager.activeCount(task.sessionId)).toBe(0)
+    expect(clock.clearCount).toBe(1)
+  })
+
+  it("terminalizes a durable heartbeat interruption and does not finish a genuine lease loss", async () => {
+    const store = new MemoryStore()
+    const manager = new AgentTreeManager(store, { clock: new FakeClock() })
+    const interruptedTask = await manager.spawn(spec())
+    store.heartbeatResult = "interrupted"
+    const interruptedRun = manager.run(payload(interruptedTask), async () => new Promise<SubagentExecutionResult>(() => undefined))
+    await new Promise(resolve => setTimeout(resolve, 0))
+    await expect(manager.heartbeat(interruptedTask.id)).resolves.toBe(false)
+    await expect(interruptedRun).resolves.toMatchObject({ status: "interrupted" })
+    expect(store.finishCalls).toHaveLength(1)
+    expect(store.records.get(interruptedTask.id)).toMatchObject({ status: "interrupted", leaseOwner: null, leaseExpiresAt: null })
+
+    const lostTask = await manager.spawn(spec())
+    store.heartbeatResult = "lost"
+    const lostRun = manager.run(payload(lostTask, "worker-2"), async () => new Promise<SubagentExecutionResult>(() => undefined))
+    await new Promise(resolve => setTimeout(resolve, 0))
+    await expect(manager.heartbeat(lostTask.id)).resolves.toBe(false)
+    await expect(lostRun).resolves.toMatchObject({ status: "lease_lost" })
+    expect(store.finishCalls).toHaveLength(1)
+    expect(store.records.get(lostTask.id)).toMatchObject({ status: "running", leaseOwner: "worker-2" })
+  })
+
+  it("keeps duplicate interruption terminalization and disposal idempotent", async () => {
+    const store = new MemoryStore()
+    const clock = new FakeClock()
+    const manager = new AgentTreeManager(store, { clock })
+    const task = await manager.spawn(spec())
+    const running = manager.run(payload(task), async () => new Promise<SubagentExecutionResult>(() => undefined))
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    await manager.interrupt(task.sessionId, task.rootTaskId)
+    await manager.interrupt(task.sessionId, task.rootTaskId)
+    await expect(running).resolves.toMatchObject({ status: "interrupted" })
+    await manager.interrupt(task.sessionId, task.rootTaskId)
+    expect(store.finishCalls).toHaveLength(1)
+    expect(manager.activeCount(task.sessionId)).toBe(0)
+    expect(clock.clearCount).toBe(1)
   })
 
   it("closes queued work without executing it", async () => {

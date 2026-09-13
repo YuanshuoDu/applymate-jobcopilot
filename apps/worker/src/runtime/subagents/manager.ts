@@ -23,7 +23,6 @@ const realClock: SubagentClock = {
   setInterval: (handler, timeout) => setInterval(handler, timeout),
   clearInterval: timer => clearInterval(timer),
 }
-
 type ActiveExecution = {
   lease: SubagentLease
   controller: AbortController
@@ -32,14 +31,13 @@ type ActiveExecution = {
   lost: Promise<SubagentLeaseError>
   resolveLost: (error: SubagentLeaseError) => void
   failed: boolean
+  interrupted: boolean
 }
-
 export type SubagentRunOutcome = {
   taskId: string
   status: "completed" | "retrying" | "failed" | "waiting" | "waiting_for_user" | "interrupted" | "skipped" | "lease_lost"
   reason?: string
 }
-
 export class AgentTreeManager {
   private readonly active = new Map<string, ActiveExecution>()
   private readonly limiter: SessionConcurrencyLimiter
@@ -59,14 +57,12 @@ export class AgentTreeManager {
     this.heartbeatMs = options.heartbeatMs ?? 20_000
     if (!Number.isInteger(this.heartbeatMs) || this.heartbeatMs < 1) throw new RangeError("Subagent heartbeat must be positive")
   }
-
   async spawn(spec: SubagentTaskSpec): Promise<SubagentTaskRecord> {
     const parent = spec.parentTaskId ? await this.store.get(spec.parentTaskId, spec.sessionId) : null
     if (spec.parentTaskId && !parent) throw new Error("Parent task is unavailable")
     const policy = inheritSubagentPolicy(parent ? policyFromTask(parent) : null, spec.policy)
     return this.store.create({ ...spec, policy })
   }
-
   supportsAtomicSpawn(): boolean { return typeof this.store.createWithSpawn === "function" }
 
   async spawnAtomic(spec: SubagentTaskSpec, spawnIdempotencyKey: string): Promise<AtomicSubagentSpawnResult & { atomic: boolean }> {
@@ -100,12 +96,11 @@ export class AgentTreeManager {
     const timer = this.clock.setInterval(() => { void this.heartbeat(payload.taskId) }, this.heartbeatMs)
     const execution: ActiveExecution = {
       lease: { ...claimed, ownerId: payload.ownerId, leaseExpiresAt: claimed.leaseExpiresAt!, signal: controller.signal },
-      controller, slot, timer, lost, resolveLost, failed: false,
+      controller, slot, timer, lost, resolveLost, failed: false, interrupted: false,
     }
     this.active.set(payload.taskId, execution)
     return execution.lease
   }
-
   async run(payload: SubagentJobPayload, execute: (input: { lease: SubagentLease }) => Promise<SubagentExecutionResult>): Promise<SubagentRunOutcome> {
     let lease: SubagentLease | null
     try { lease = await this.claim(payload) } catch (error: unknown) {
@@ -119,7 +114,10 @@ export class AgentTreeManager {
       try {
         result = await Promise.race([execute({ lease }), active.lost.then(error => { throw error })])
       } catch (error: unknown) {
-        if (error instanceof SubagentLeaseError) return { taskId: payload.taskId, status: "lease_lost", reason: error.message }
+        if (error instanceof SubagentLeaseError) {
+          if (!active.interrupted) return { taskId: payload.taskId, status: "lease_lost", reason: error.message }
+          return await this.finishInterrupted(payload, lease, error)
+        }
         result = { status: "failed", failureReason: error instanceof Error ? error.message : "Subagent execution failed" }
       }
       const status = await this.store.finish({
@@ -130,7 +128,7 @@ export class AgentTreeManager {
       if (!status) return { taskId: payload.taskId, status: "lease_lost", reason: "Subagent lease was fenced" }
       return { taskId: payload.taskId, status }
     } finally {
-      this.dispose(payload.taskId)
+      this.dispose(payload.taskId, active)
     }
   }
 
@@ -139,10 +137,7 @@ export class AgentTreeManager {
     if (!active || active.failed) return false
     const result = await this.store.heartbeat({ taskId, sessionId: active.lease.sessionId, ownerId: active.lease.ownerId, attemptCount: active.lease.attemptCount, now }).catch(() => "lost" as const)
     if (result === "renewed") return true
-    active.failed = true
-    const error = new SubagentLeaseError("lost", result === "interrupted" ? "Subagent tree was interrupted" : "Subagent lease renewal was rejected")
-    active.controller.abort(error)
-    active.resolveLost(error)
+    this.signalLoss(active, result === "interrupted", new SubagentLeaseError("lost", result === "interrupted" ? "Subagent tree was interrupted" : "Subagent lease renewal was rejected"))
     return false
   }
 
@@ -150,10 +145,8 @@ export class AgentTreeManager {
     const closed = await this.store.close({ taskId, sessionId, now: this.now() })
     const active = this.active.get(taskId)
     if (active) {
-      const error = new SubagentLeaseError("lost", "Subagent task was closed")
-      active.controller.abort(error)
-      active.resolveLost(error)
-      this.dispose(taskId)
+      this.signalLoss(active, false, new SubagentLeaseError("lost", "Subagent task was closed"))
+      this.dispose(taskId, active)
     }
     return closed
   }
@@ -162,10 +155,7 @@ export class AgentTreeManager {
     const count = await this.store.interruptTree({ sessionId, rootTaskId, now: this.now() })
     for (const active of this.active.values()) {
       if (active.lease.sessionId !== sessionId || active.lease.rootTaskId !== rootTaskId) continue
-      const error = new SubagentLeaseError("lost", "Subagent tree was interrupted")
-      active.controller.abort(error)
-      active.resolveLost(error)
-      this.dispose(active.lease.id)
+      this.signalLoss(active, true, new SubagentLeaseError("lost", "Subagent tree was interrupted"))
     }
     return count
   }
@@ -181,10 +171,7 @@ export class AgentTreeManager {
     const count = await interruptSubtree.call(this.store, { sessionId, rootTaskId, targetPath: normalizedTargetPath, now: this.now() })
     for (const active of this.active.values()) {
       if (active.lease.sessionId !== sessionId || active.lease.rootTaskId !== rootTaskId || !isTaskPathWithin(active.lease.path, normalizedTargetPath)) continue
-      const error = new SubagentLeaseError("lost", "Subagent subtree was interrupted")
-      active.controller.abort(error)
-      active.resolveLost(error)
-      this.dispose(active.lease.id)
+      this.signalLoss(active, true, new SubagentLeaseError("lost", "Subagent subtree was interrupted"))
     }
     return count
   }
@@ -194,14 +181,12 @@ export class AgentTreeManager {
     const active = [...this.active.values()]
     let firstError: unknown
     await Promise.all(active.map(async execution => {
-      const error = new SubagentLeaseError("lost", "Worker shutdown")
-      execution.controller.abort(error)
-      execution.resolveLost(error)
+      this.signalLoss(execution, false, new SubagentLeaseError("lost", "Worker shutdown"))
       await this.store.release?.({
         taskId: execution.lease.id, sessionId: execution.lease.sessionId, ownerId: execution.lease.ownerId,
         attemptCount: execution.lease.attemptCount, now: this.now(),
       }).catch(error => { if (firstError === undefined) firstError = error })
-      this.dispose(execution.lease.id)
+      this.dispose(execution.lease.id, execution)
     }))
     if (firstError !== undefined) throw firstError
   }
@@ -211,10 +196,8 @@ export class AgentTreeManager {
     for (const row of rows) {
       const active = this.active.get(row.id)
       if (!active) continue
-      const error = new SubagentLeaseError("lost", "Subagent lease recovered by scanner")
-      active.controller.abort(error)
-      active.resolveLost(error)
-      this.dispose(row.id)
+      this.signalLoss(active, false, new SubagentLeaseError("lost", "Subagent lease recovered by scanner"))
+      this.dispose(row.id, active)
     }
     return {
       rows,
@@ -225,16 +208,31 @@ export class AgentTreeManager {
 
   activeCount(sessionId: string): number { return this.limiter.activeCount(sessionId) }
 
-  dispose(taskId: string): void {
+  dispose(taskId: string, expected?: ActiveExecution): void {
     const active = this.active.get(taskId)
-    if (!active) return
+    if (!active || (expected && active !== expected)) return
     this.clock.clearInterval(active.timer)
     active.slot.release()
     this.active.delete(taskId)
   }
 
-}
+  private signalLoss(active: ActiveExecution, interrupted: boolean, error: SubagentLeaseError): void {
+    if (active.failed) return
+    active.interrupted = interrupted
+    active.failed = true
+    active.controller.abort(error)
+    active.resolveLost(error)
+  }
 
+  private async finishInterrupted(payload: SubagentJobPayload, lease: SubagentLease, error: SubagentLeaseError): Promise<SubagentRunOutcome> {
+    const status = await this.store.finish({
+      taskId: payload.taskId, sessionId: payload.sessionId, ownerId: payload.ownerId,
+      attemptCount: lease.attemptCount, status: "failed", failureReason: error.message, now: this.now(),
+    })
+    if (status !== "interrupted") return { taskId: payload.taskId, status: "lease_lost", reason: status ? "Subagent interruption was fenced" : "Subagent lease was fenced" }
+    return { taskId: payload.taskId, status: "interrupted", reason: error.message }
+  }
+}
 function policyFromTask(task: SubagentTaskRecord): SubagentPolicy {
   const budget = task.budgetSnapshot
   const raw = budget && typeof budget === "object" && !Array.isArray(budget)
@@ -242,7 +240,6 @@ function policyFromTask(task: SubagentTaskRecord): SubagentPolicy {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return normalizeSubagentPolicy()
   return normalizeSubagentPolicy(raw as Partial<SubagentPolicy>)
 }
-
 function normalizeTaskPath(path: string): string | null {
   return /^\/[^/%_\\]+(?:\/[^/%_\\]+)*$/.test(path) ? path : null
 }
