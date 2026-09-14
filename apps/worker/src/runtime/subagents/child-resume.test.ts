@@ -127,4 +127,28 @@ describe("child attempt durable resume", () => {
     expect(JSON.stringify(observation.output)).not.toContain("apiKey")
     expect(new TextEncoder().encode(JSON.stringify(observation.output)).length).toBeLessThanOrEqual(6 * 1024)
   })
+
+  it.each([
+    ["failed", 1], ["streaming", 1], ["interrupted", 1], ["completed", 2], ["waiting_for_tool", 2], ["waiting_for_approval", 2], ["waiting_for_user", 2],
+  ] as const)("%s final prior step %s its logical ordinal", async (status, expectedNextOrdinal) => {
+    const child = lease()
+    const db = fakePool(child, [step(child, { status, ordinal: 1 })])
+    await expect(loadChildAttemptResume(db.pool as never, child)).resolves.toMatchObject({ resume: { nextOrdinal: expectedNextOrdinal } })
+  })
+
+  it("fails closed when bounded prior history exceeds the step or item limit", async () => {
+    const child = lease()
+    const tooManySteps = fakePool(child, Array.from({ length: 257 }, (_, index) => step(child, { id: `step-${index}`, ordinal: index, consumedInputIds: [] })))
+    await expect(loadChildAttemptResume(tooManySteps.pool as never, child)).rejects.toThrow("child_resume_step_limit")
+    const tooManyItems = fakePool(child, [step(child)], Array.from({ length: 1_025 }, (_, index) => item(child, { id: `item-${index}`, content: { toolCallId: `call-${index}`, toolName: "jobs.search" } })))
+    await expect(loadChildAttemptResume(tooManyItems.pool as never, child)).rejects.toThrow("child_resume_item_limit")
+  })
+
+  it("fails closed when a tool call id crosses steps", async () => {
+    const child = lease()
+    const db = fakePool(child, [step(child), step(child, { id: "step-2", ordinal: 1 })], [
+      item(child), item(child, { id: "item-call-2", stepId: "step-2" }),
+    ])
+    await expect(loadChildAttemptResume(db.pool as never, child)).rejects.toThrow("child_resume_tool_call_conflict")
+  })
 })

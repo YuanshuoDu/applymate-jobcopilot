@@ -1,34 +1,29 @@
 import type pg from "pg"
 import { Buffer } from "node:buffer"
-import { redactSensitiveText } from "@jobcopilot/shared"
+import { canonicalJson, redactSensitiveText } from "@jobcopilot/shared"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
-
 import type { ContextSeedBlock } from "../context/step-context-builder.js"
 import type { TurnResumeState } from "../turns/turn-engine-types.js"
 import type { SubagentLease } from "./types.js"
-
 type QueryClient = Pick<pg.PoolClient, "query" | "release">
 type ResumePool = Pick<pg.Pool, "connect">
 type Row = Record<string, unknown>
-
 export type ChildAttemptResume = {
   readonly resume: TurnResumeState
   readonly observations: readonly ContextSeedBlock[]
 }
-
 export type ChildResumeLoader = (lease: SubagentLease) => Promise<ChildAttemptResume | undefined>
 
 const TERMINAL_TURN_STATUSES = "('completed', 'failed', 'interrupted', 'cancelled')"
 const TERMINAL_ROOT_STATUSES = "('completed', 'failed', 'interrupted', 'cancelled', 'closed')"
-const MAX_TOOL_OUTPUT_BYTES = 6 * 1024
-const MAX_TOOL_INPUT_BYTES = 1024
-
+const MAX_TOOL_OUTPUT_BYTES = 6 * 1024; const MAX_TOOL_INPUT_BYTES = 1024
+const MAX_PRIOR_STEPS = 256; const MAX_PRIOR_ITEMS = 1024; const MAX_RESTORED_OBSERVATIONS = 256
+const MAX_RESTORED_OBSERVATION_BYTES = 256 * 1024
 function text(row: Row, key: string): string {
   const value = row[key]
   if (typeof value !== "string" || value.trim().length === 0) throw new Error(`child_resume_invalid_${key}`)
   return value
 }
-
 function integer(row: Row, key: string, minimum = 0): number {
   const value = typeof row[key] === "number" ? row[key] : Number(row[key])
   if (!Number.isSafeInteger(value) || value < minimum) throw new Error(`child_resume_invalid_${key}`)
@@ -117,17 +112,16 @@ function currentTaskSql(): string {
     FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId" JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId" JOIN "sub_agent_tasks" AS root ON root."id" = task."rootTaskId" AND root."sessionId" = task."sessionId" AND root."turnId" = task."turnId"
     WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4 AND session."userId" = $5 AND task."status" = 'running' AND task."leaseOwner" = $6 AND task."attemptCount" = $7 AND task."leaseExpiresAt" > CURRENT_TIMESTAMP AND task."interruptRequestedAt" IS NULL AND session."status" NOT IN ('aborted', 'archived') AND turn."status" NOT IN ${TERMINAL_TURN_STATUSES} AND root."status" NOT IN ${TERMINAL_ROOT_STATUSES} FOR SHARE`
 }
-
 function stepsSql(): string {
   return `SELECT step."id", step."sessionId", step."turnId", step."taskId", step."ordinal", step."attempt", step."status", step."inputThroughSequence", step."consumedInputIds", step."inputTokens", step."outputTokens", step."estimatedCostUsd", task."rootTaskId" AS "rootTaskId"
     FROM "agent_steps" AS step JOIN "sub_agent_tasks" AS task ON task."id" = step."taskId" AND task."sessionId" = step."sessionId" AND task."turnId" = step."turnId" JOIN "agent_sessions" AS session ON session."id" = step."sessionId" JOIN "agent_turns" AS turn ON turn."id" = step."turnId" AND turn."sessionId" = step."sessionId" JOIN "sub_agent_tasks" AS root ON root."id" = task."rootTaskId" AND root."sessionId" = task."sessionId" AND root."turnId" = task."turnId"
-    WHERE step."taskId" = $1 AND step."sessionId" = $2 AND step."turnId" = $3 AND session."userId" = $4 AND task."rootTaskId" = $5 AND step."attempt" >= 1 AND step."attempt" < $6 ORDER BY step."attempt" ASC, step."ordinal" ASC, step."id" ASC`
+    WHERE step."taskId" = $1 AND step."sessionId" = $2 AND step."turnId" = $3 AND session."userId" = $4 AND task."rootTaskId" = $5 AND step."attempt" >= 1 AND step."attempt" < $6 ORDER BY step."attempt" ASC, step."ordinal" ASC, step."id" ASC LIMIT ${MAX_PRIOR_STEPS + 1}`
 }
 
 function itemsSql(): string {
   return `SELECT item."id", item."sessionId", item."turnId", item."taskId", item."stepId", item."type", item."status", item."content", step."attempt", step."ordinal", task."rootTaskId" AS "rootTaskId"
     FROM "agent_items" AS item JOIN "agent_steps" AS step ON step."id" = item."stepId" AND step."sessionId" = item."sessionId" AND step."turnId" = item."turnId" AND step."taskId" = item."taskId" JOIN "sub_agent_tasks" AS task ON task."id" = item."taskId" AND task."sessionId" = item."sessionId" AND task."turnId" = item."turnId" JOIN "agent_sessions" AS session ON session."id" = item."sessionId" JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
-    WHERE item."taskId" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND session."userId" = $4 AND task."rootTaskId" = $5 AND step."attempt" >= 1 AND step."attempt" < $6 ORDER BY step."attempt" ASC, step."ordinal" ASC, item."createdAt" ASC, item."id" ASC`
+    WHERE item."taskId" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND session."userId" = $4 AND task."rootTaskId" = $5 AND step."attempt" >= 1 AND step."attempt" < $6 ORDER BY step."attempt" ASC, step."ordinal" ASC, item."createdAt" ASC, item."id" ASC LIMIT ${MAX_PRIOR_ITEMS + 1}`
 }
 
 function assertTask(row: Row, lease: SubagentLease, now: Date): void {
@@ -146,6 +140,7 @@ type ToolCall = { readonly stepId: string; readonly toolName: string; readonly i
 
 function observations(rows: readonly Row[], lease: SubagentLease): readonly ContextSeedBlock[] {
   const calls = new Map<string, ToolCall>()
+  const results = new Set<string>()
   const pending: Array<{ readonly id: string; readonly stepId: string; readonly callId: string; readonly output: unknown; readonly status: string }> = []
   for (const row of rows) {
     if (text(row, "sessionId") !== lease.sessionId || text(row, "turnId") !== lease.turnId || text(row, "taskId") !== lease.id
@@ -162,18 +157,23 @@ function observations(rows: readonly Row[], lease: SubagentLease): readonly Cont
       if (!toolName) throw new Error("child_resume_invalid_tool_call")
       const previous = calls.get(callId)
       if (!previous) calls.set(callId, { stepId, toolName, input: content.input ?? {} })
-      else if (previous.stepId === stepId && (previous.toolName !== toolName || JSON.stringify(previous.input) !== JSON.stringify(content.input ?? {}))) throw new Error("child_resume_tool_call_conflict")
+      else if (previous.stepId !== stepId || previous.toolName !== toolName || canonicalJson(previous.input) !== canonicalJson(content.input ?? {})) throw new Error("child_resume_tool_call_conflict")
     } else if (row.status === "completed") {
+      if (results.has(callId)) throw new Error("child_resume_tool_result_conflict")
+      results.add(callId)
       pending.push({ id: text(row, "id"), stepId, callId, output: content.output ?? null, status: errorCode(content.errorCode) === null ? "completed" : "failed" })
     }
   }
   const seen = new Set<string>()
-  return pending.flatMap(item => {
+  if (pending.length > MAX_RESTORED_OBSERVATIONS) throw new Error("child_resume_observation_limit")
+  const restored = pending.flatMap(item => {
     const call = calls.get(item.callId)
     if (!call || call.stepId !== item.stepId || seen.has(item.callId)) return []
     seen.add(item.callId)
     return [{ id: `child-resume:${item.id}`, content: { toolCallId: item.callId, toolName: call.toolName, input: boundedJson(call.input, MAX_TOOL_INPUT_BYTES), status: item.status, output: boundedJson(item.output, MAX_TOOL_OUTPUT_BYTES), errorCode: item.status === "completed" ? null : "tool_execution_failed" } }]
   })
+  if (Buffer.byteLength(JSON.stringify(restored), "utf8") > MAX_RESTORED_OBSERVATION_BYTES) throw new Error("child_resume_observation_limit")
+  return restored
 }
 
 function countToolCalls(rows: readonly Row[], lease: SubagentLease): number {
@@ -201,11 +201,14 @@ export async function loadChildAttemptResume(pool: ResumePool, lease: SubagentLe
     if (!current.rows[0]) throw new Error("child_resume_owner_mismatch")
     assertTask(current.rows[0], lease, now)
     const prior = await client.query<Row>(stepsSql(), [lease.id, lease.sessionId, lease.turnId, lease.userId, lease.rootTaskId, lease.attemptCount])
+    if (prior.rows.length > MAX_PRIOR_STEPS) throw new Error("child_resume_step_limit")
     if (prior.rows.length === 0) {
       await client.query("COMMIT"); committed = true
       return undefined
     }
-    let nextOrdinal = 0
+    let lastOrdinal = 0
+    let lastAttempt = 0
+    let lastStatus = ""
     let stepCount = 0
     let toolCallCount = 0
     let inputThroughSequence = 0n
@@ -220,7 +223,7 @@ export async function loadChildAttemptResume(pool: ResumePool, lease: SubagentLe
       if (text(row, "id") === "" || text(row, "sessionId") !== lease.sessionId || text(row, "turnId") !== lease.turnId || text(row, "taskId") !== lease.id
         || text(row, "rootTaskId") !== lease.rootTaskId || attempt >= lease.attemptCount
         || typeof row.status !== "string" || !["queued", "streaming", "completed", "failed", "interrupted", "waiting_for_tool", "waiting_for_approval", "waiting_for_user"].includes(row.status)) throw new Error("child_resume_step_lineage")
-      nextOrdinal = Math.max(nextOrdinal, ordinal + 1)
+      if (attempt > lastAttempt || attempt === lastAttempt && ordinal >= lastOrdinal) { lastAttempt = attempt; lastOrdinal = ordinal; lastStatus = row.status }
       stepCount += 1
       const cursor = sequence(row, "inputThroughSequence")
       if (cursor > inputThroughSequence) inputThroughSequence = cursor
@@ -230,7 +233,9 @@ export async function loadChildAttemptResume(pool: ResumePool, lease: SubagentLe
       estimatedCostUsd += amount(row, "estimatedCostUsd")
       if (!Number.isSafeInteger(inputTokens) || !Number.isSafeInteger(outputTokens) || !Number.isFinite(estimatedCostUsd)) throw new Error("child_resume_usage_overflow")
     }
+    const nextOrdinal = ["completed", "waiting_for_tool", "waiting_for_approval", "waiting_for_user"].includes(lastStatus) ? lastOrdinal + 1 : lastOrdinal
     const itemResult = await client.query<Row>(itemsSql(), [lease.id, lease.sessionId, lease.turnId, lease.userId, lease.rootTaskId, lease.attemptCount])
+    if (itemResult.rows.length > MAX_PRIOR_ITEMS) throw new Error("child_resume_item_limit")
     const restoredObservations = observations(itemResult.rows, lease)
     toolCallCount = countToolCalls(itemResult.rows, lease)
     await client.query("COMMIT"); committed = true
