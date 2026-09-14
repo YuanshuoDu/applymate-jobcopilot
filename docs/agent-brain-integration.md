@@ -803,3 +803,12 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Coordination `send_message` now requires the target task and optional runtime sender to belong to the server-owned current turn before any activity, mailbox, or outbox write. The PostgreSQL send path repeats the exact task-turn predicate as defense in depth; cross-turn sends fail closed while same-turn child-to-parent sends and idempotent retries remain unchanged.
 - Astra independently verified the coordination-executor and mailbox-store suites at **40/40** (15 + 25), Worker `tsc --noEmit --skipLibCheck`, the shared build through test preflight, and `git diff --check`.
 - This remains a candidate increment: no live PostgreSQL/RLS transaction, Redis/BullMQ wakeup, process restart, cross-process concurrency, provider/browser behavior, or complete child-parent E2E was run. The cognitive gate remains disabled and overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+
+## P4-60 integration / verification
+
+- Integrated code commit: 92e77e38.
+- wait_subagents now requires every target task to match the server-owned current turn before invoking DurableWaitPort or recording activity. Same-turn waits, lineage checks, and duplicate-id validation remain unchanged.
+- Astra independently verified the coordination-executor suite at **16/16**, Worker 	sc --noEmit --skipLibCheck, the shared build through test preflight, and git diff --check.
+- This remains a candidate increment: no live PostgreSQL/RLS wait transaction, Redis/BullMQ wakeup, process restart, cross-process concurrency, provider/browser behavior, or complete child-parent E2E was run. The cognitive gate remains disabled and overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
