@@ -218,6 +218,17 @@ describe("coordination executors", () => {
     expect(runtime.wait.wait).toHaveBeenCalledWith(expect.objectContaining({ userId: "user-a", taskId: "root-1", rootTaskId: "root-1", targetTaskIds: ["child"], timeoutMs: 5000 }))
   })
 
+  it("rejects a wait target from another turn before waiting or recording activity", async () => {
+    const runtime = makeRuntime()
+    const stale = makeTask({ id: "stale", turnId: "turn-old", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/stale", depth: 1, status: "queued" })
+    runtime.store.tasks.set(stale.id, stale)
+
+    await expect(executeWaitSubagents(context({ taskId: "root-1", rootTaskId: "root-1" }), { idempotencyKey: "wait-cross-turn", taskIds: [stale.id], mode: "any", timeoutMs: 5000 }, runtime.options))
+      .rejects.toMatchObject({ code: "coordination_task_not_found" })
+    expect(runtime.wait.wait).not.toHaveBeenCalled()
+    expect(runtime.store.activities).toHaveLength(0)
+  })
+
   it("lists only the current tree and protects close/interrupt transitions", async () => {
     const runtime = makeRuntime()
     runtime.store.tasks.set("queued", makeTask({ id: "queued", rootTaskId: "root-1", path: "/root-1/queued", status: "queued" }))

@@ -152,7 +152,7 @@ async function resolveSpawnParent(context: ToolExecutionContext, requested: stri
 async function uniqueTasks(context: ToolExecutionContext, ids: readonly string[], options: CoordinationExecutorOptions): Promise<CoordinationTaskView[]> {
   const unique = [...new Set(ids)]
   if (unique.length !== ids.length) throw new CoordinationError("coordination_invalid_input", "Wait taskIds must be unique")
-  return Promise.all(unique.map(id => visibleTask(context, id, options)))
+  return Promise.all(unique.map(async id => currentTurnTask(context, await visibleTask(context, id, options))))
 }
 
 function spawnOutput(task: CoordinationTaskView, replay: boolean) { return { taskId: task.id, rootTaskId: task.rootTaskId, parentTaskId: task.parentTaskId, path: task.path, depth: task.depth, status: task.status, replay } }
