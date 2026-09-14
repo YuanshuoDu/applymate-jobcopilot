@@ -3,6 +3,7 @@ import { Buffer } from "node:buffer"
 
 import type { TenantScope } from "@jobcopilot/agent-protocol"
 import { estimateCompactionTokens } from "./context-compaction-collector.js"
+import { buildContextMemoryProjection, isContextMemoryAnchorObservation } from "./context-memory-projection.js"
 import { canonicalJson } from "./context-snapshot-json.js"
 import type { StepContextSnapshot } from "./step-context-builder.js"
 import type { ContextCompactionHook, ContextCompactionHookInput, ContextCompactionHookResult, ContextCompactionSnapshotLoader } from "./context-snapshot-compaction-seam.js"
@@ -88,6 +89,12 @@ function protectedSnapshot(snapshot: StepContextSnapshot): string {
   return canonicalJson({ system: snapshot.system, profile: snapshot.profile, goal: snapshot.goal, steerHistory: snapshot.steerHistory, businessRefs: snapshot.businessRefs })
 }
 
+function memoryObservations(snapshot: StepContextSnapshot): StepContextSnapshot["toolObservations"] {
+  const retained = snapshot.toolObservations.filter(isContextMemoryAnchorObservation)
+  if (retained.length > 64) throw new TypeError("Context memory contains too many protected observations")
+  return retained
+}
+
 function restoredSnapshot(input: AdapterInput, stored: StoredSnapshot, maxSnapshotBytes: number): ContextCompactionHookResult {
   operationIdentity(input)
   if (!stored || typeof stored !== "object" || typeof stored.snapshotRef !== "string" || stored.snapshotRef.length !== 64 || !stored.scope || stored.scope.userId !== input.scope.userId || stored.sessionId !== input.sessionId || stored.turnId !== input.turnId || stored.stepId !== input.stepId || stored.idempotencyKey !== input.idempotencyKey || !snapshotShape(stored.snapshot) || stored.snapshot.toolObservations[0]?.id !== `context-summary:${input.stepId}`) throw new TypeError("Context snapshot store returned an invalid idempotent snapshot")
@@ -143,8 +150,18 @@ async function compact(options: ContextSnapshotAdapterOptions, input: AdapterInp
   const summaryValue = options.summarizer
     ? await options.summarizer({ scope: input.scope, sessionId: input.sessionId, turnId: input.turnId, stepId: input.stepId, removed: structuredClone(removed) })
     : { removedCount: removed.length, removedObservationIds: removed.map(item => item.id) }
-  const summary = safeSummary({ kind: "context_summary", value: summaryValue }, maxSummaryBytes)
-  const compacted: StepContextSnapshot = { ...input.snapshot, toolObservations: [{ id: `context-summary:${input.stepId}`, content: summary }, ...input.snapshot.toolObservations.slice(-keepRecent)] }
+  const memory = buildContextMemoryProjection(input.snapshot, { maxBytes: Math.max(256, maxSummaryBytes - 128) })
+  if (!memory) throw new TypeError("Context memory projection failed closed")
+  const summary = safeSummary({ kind: "context_summary", value: summaryValue, memory }, maxSummaryBytes)
+  const protectedObservations = memoryObservations(input.snapshot)
+  const recent = input.snapshot.toolObservations.slice(-keepRecent)
+  const seen = new Set<string>()
+  const retained = [
+    { id: `context-summary:${input.stepId}`, content: summary },
+    ...protectedObservations,
+    ...recent,
+  ].filter(item => !seen.has(item.id) && (seen.add(item.id), true))
+  const compacted: StepContextSnapshot = { ...input.snapshot, toolObservations: retained }
   const after = measure(compacted, maxSnapshotBytes)
   if (after.tokens >= before.tokens || after.bytes > before.bytes) throw new TypeError("Context compaction did not reduce the snapshot")
   const snapshotRef = calculateSnapshotRef(input, compacted)

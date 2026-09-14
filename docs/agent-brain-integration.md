@@ -937,3 +937,9 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 
 - A valid replan signal attached to a plan from an older goal revision is retained as history and ignored after the server-owned goal revision advances. The helper still validates that historical plan, join and signal evidence is well formed; a signal for the current goal remains enforced, while a future-goal or unmatched signal fails closed. A newer goal with no plan projection therefore has no stale obligation and can propose its first plan.
 - This is a Worker planning candidate only: live PostgreSQL/RLS goal-update ordering, restart recovery, Redis/BullMQ delivery, provider/browser behavior, cross-worker races and complete child-parent E2E remain unverified.
+
+## P5-1 - bounded cognitive memory projection
+
+- The context snapshot adapter now emits a deterministic, server-shaped `agent-harness.cognitive-memory.v1` projection in its bounded summary. It retains goal and constraint anchors, user steering, current revisions, unresolved/wait/approval/evidence/artifact/task/event references, omitted observation ranges, and the covered sequence without copying raw tool payloads. Stable sorting, deduplication, redacted summaries, and an 8 KiB maximum keep the projection replayable and bounded.
+- Compaction retains server-shaped plan, join, replan, wait, approval, task, artifact, and event observations alongside the projection so the existing plan/replan evidence guard remains visible after snapshot replacement. This is a narrow adapter hook; the standalone `AgentContextSnapshot` compactor is unchanged because it uses a different durable schema and transaction seam.
+- This remains a candidate increment: no live PostgreSQL/RLS transaction, restart/replay process, Redis/BullMQ delivery, cross-worker race, provider/browser behavior, or complete E2E was run. The cognitive gate remains disabled.

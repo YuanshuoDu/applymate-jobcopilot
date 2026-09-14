@@ -61,6 +61,22 @@ describe("StepContextSnapshot adapter", () => {
     expect(backing.saved).toHaveLength(1)
   })
 
+  it("retains durable plan and wait anchors in the compacted snapshot memory", async () => {
+    const durable = [
+      { id: "plan-revision:plan-1", content: { kind: "plan_revision", goalRevision: 1, planRevision: 1 } },
+      { id: "plan-result:plan-1:join", content: { kind: "plan_command", localId: "join", commandKind: "join", status: "completed" } },
+      { id: "wait-result:wait-1", content: { toolCallId: "wait:wait-1", toolName: "wait_subagents", status: "completed" } },
+      { id: "plan-control:plan-1:join:replan", content: { kind: "plan_control", localId: "join:replan", status: "replan_required" } },
+    ]
+    const input = { ...observations(10), toolObservations: [...durable, ...observations(10).toolObservations] }
+    const adapter = createContextSnapshotAdapter({ store: store(), observationCountThreshold: 4, keepRecentObservations: 1 })
+    const result = await adapter.hook(request(input))
+    expect(result).toMatchObject({ status: "compacted" })
+    if (result.status !== "compacted") return
+    expect(result.snapshot.toolObservations.map(item => item.id)).toEqual(expect.arrayContaining(durable.map(item => item.id)))
+    expect(result.snapshot.toolObservations[0]?.content).toMatchObject({ kind: "context_summary", memory: { revisions: { goalRevision: 1, planRevision: 1 } } })
+  })
+
   it("keeps the runtime snapshot ceiling at 256 KiB", async () => {
     expect(() => createContextSnapshotAdapter({ store: store(), observationCountThreshold: 2, keepRecentObservations: 1, maxSnapshotBytes: 256 * 1024 + 1 })).toThrow("bound")
     const oversized = { ...base, toolObservations: Array.from({ length: 600 }, (_, index) => ({ id: `large-${index}`, content: { text: "x".repeat(600) } })) }
