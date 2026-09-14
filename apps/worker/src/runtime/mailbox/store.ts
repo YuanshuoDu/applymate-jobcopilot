@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto"
 import type pg from "pg"
 
+import { hydrateChildMailbox, type ChildMailboxHydrationInput } from "./hydration.js"
 import type {
   CoordinationActivity,
   CoordinationMailboxConsumeResult,
@@ -69,6 +70,8 @@ export class PgCoordinationStore implements CoordinationStore {
       return result.rows.map(row => mailboxMessageRow(row as Record<string, unknown>))
     })
   }
+
+  async hydrateMessages(input: ChildMailboxHydrationInput): Promise<CoordinationMailboxMessage[]> { return hydrateChildMailbox(this.pool, input) }
 
   async consumeMessages(input: { userId: string; sessionId: string; toTaskId: string; messageIds: readonly string[]; owner: CoordinationMailboxOwnerFence }): Promise<CoordinationMailboxConsumeResult> {
     const owner = mailboxOwnerFence(input.owner)

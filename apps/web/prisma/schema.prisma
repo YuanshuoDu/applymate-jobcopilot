@@ -133,6 +133,7 @@ model User {
   agentWaitConditions         AgentWaitCondition[]
   agentTreeBudgetReservations AgentTreeBudgetReservation[]
   agentContextCompactionSnapshots AgentContextCompactionSnapshot[]
+  agentMailboxHydrationCheckpoints AgentMailboxHydrationCheckpoint[]
   planChanges                 UserPlanChange[]
   planSubscription            UserPlanSubscription?
   featureOverrides            UserFeatureOverride[]
@@ -1876,6 +1877,7 @@ model AgentSession {
   toolResultReferences AgentToolResultReference[]
   waitConditions     AgentWaitCondition[]
   treeBudgetReservations AgentTreeBudgetReservation[]
+  mailboxHydrationCheckpoints AgentMailboxHydrationCheckpoint[]
   execution          AgentExecution?
   automation         AgentAutomation?
 
@@ -1930,6 +1932,7 @@ model AgentTurn {
   waitConditions AgentWaitCondition[] @relation("AgentWaitConditionTurn")
   treeBudgetReservations AgentTreeBudgetReservation[] @relation("AgentTreeBudgetReservationTurn")
   contextCompactionSnapshots AgentContextCompactionSnapshot[]
+  mailboxHydrationCheckpoints AgentMailboxHydrationCheckpoint[]
 
   @@index([sessionId, createdAt])
   @@index([userId, status, updatedAt(sort: Desc)])
@@ -1974,6 +1977,7 @@ model AgentStep {
   waitConditions AgentWaitCondition[] @relation("AgentWaitConditionStep")
   treeBudgetReservations AgentTreeBudgetReservation[]
   contextCompactionSnapshots AgentContextCompactionSnapshot[]
+  mailboxHydrationCheckpoints AgentMailboxHydrationCheckpoint[]
 
   @@unique([turnId, ordinal, attempt])
   @@index([turnId, status, createdAt])
@@ -2173,6 +2177,8 @@ model SubAgentTask {
   rootDescendants         SubAgentTask[]        @relation("SubAgentTaskRoot")
   mailboxMessagesSent     AgentMailboxMessage[] @relation("AgentMailboxFromTask")
   mailboxMessagesReceived AgentMailboxMessage[] @relation("AgentMailboxToTask")
+  mailboxHydrationCheckpointsAsRoot AgentMailboxHydrationCheckpoint[] @relation("AgentMailboxHydrationRootTask")
+  mailboxHydrationCheckpointsAsTask AgentMailboxHydrationCheckpoint[] @relation("AgentMailboxHydrationTask")
   toolResultReferences     AgentToolResultReference[] @relation("AgentToolResultReferenceTask")
   waitConditions           AgentWaitCondition[] @relation("AgentWaitConditionParentTask")
   treeBudgetReservationsAsRoot AgentTreeBudgetReservation[] @relation("AgentTreeBudgetReservationRootTask")
@@ -2235,11 +2241,41 @@ model AgentMailboxMessage {
   turn     AgentTurn     @relation(fields: [turnId, sessionId], references: [id, sessionId], onDelete: Cascade)
   fromTask SubAgentTask? @relation("AgentMailboxFromTask", fields: [fromTaskId, sessionId], references: [id, sessionId], onDelete: Cascade)
   toTask   SubAgentTask? @relation("AgentMailboxToTask", fields: [toTaskId, sessionId], references: [id, sessionId], onDelete: Cascade)
+  hydrationCheckpoints AgentMailboxHydrationCheckpoint[]
 
   @@unique([sessionId, idempotencyKey])
+  @@unique([id, sessionId])
   @@index([toTaskId, consumedAt, createdAt])
   @@index([sessionId, turnId, consumedAt, createdAt])
   @@map("agent_mailbox_messages")
+}
+
+model AgentMailboxHydrationCheckpoint {
+  id         String   @id
+  userId     String
+  sessionId  String
+  turnId     String
+  rootTaskId String
+  taskId     String
+  attempt    Int
+  stepId     String
+  messageId  String
+  createdAt  DateTime @default(now())
+
+  user     User               @relation(fields: [userId], references: [id], onDelete: Cascade, map: "agent_mailbox_hydration_checkpoints_userId_fkey")
+  session  AgentSession        @relation(fields: [sessionId, userId], references: [id, userId], onDelete: Cascade, map: "agent_mb_hydration_session_user_fkey")
+  turn     AgentTurn           @relation(fields: [turnId, sessionId, userId], references: [id, sessionId, userId], onDelete: Cascade, map: "agent_mb_hydration_turn_session_user_fkey")
+  rootTask SubAgentTask        @relation("AgentMailboxHydrationRootTask", fields: [rootTaskId, sessionId], references: [id, sessionId], onDelete: Cascade, map: "agent_mb_hydration_root_task_fkey")
+  task     SubAgentTask        @relation("AgentMailboxHydrationTask", fields: [taskId, sessionId], references: [id, sessionId], onDelete: Cascade, map: "agent_mb_hydration_task_fkey")
+  step     AgentStep           @relation(fields: [stepId, turnId, sessionId], references: [id, turnId, sessionId], onDelete: Cascade, map: "agent_mb_hydration_step_turn_session_fkey")
+  message  AgentMailboxMessage @relation(fields: [messageId, sessionId], references: [id, sessionId], onDelete: Cascade, map: "agent_mb_hydration_message_session_fkey")
+
+  @@unique([sessionId, taskId, attempt, messageId], map: "agent_mb_hydration_scope_key")
+  @@index([userId, createdAt], map: "agent_mailbox_hydration_checkpoints_userId_createdAt_idx")
+  @@index([sessionId, turnId, createdAt], map: "agent_mb_hydration_session_turn_created_idx")
+  @@index([sessionId, taskId, attempt, createdAt], map: "agent_mb_hydration_session_task_attempt_created_idx")
+  @@index([sessionId, rootTaskId, taskId, attempt, stepId, createdAt], map: "agent_mb_hydration_lineage_created_idx")
+  @@map("agent_mailbox_hydration_checkpoints")
 }
 
 // Private, redacted tool output retained across worker restarts. The Worker

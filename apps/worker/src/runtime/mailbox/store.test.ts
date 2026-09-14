@@ -2,6 +2,7 @@ import type pg from "pg"
 import { describe, expect, it } from "vitest"
 
 import { PgCoordinationStore } from "./store.js"
+import type { ChildMailboxHydrationInput } from "./hydration.js"
 import type { CoordinationMailboxMessage, CoordinationMailboxOwnerFence, CoordinationTaskView } from "../tools/coordination-types.js"
 
 type QueryRecord = { sql: string; values: readonly unknown[] }
@@ -116,6 +117,21 @@ class FakeClient {
 
 function pool(client: FakeClient): Pick<pg.Pool, "connect"> {
   return { connect: async () => client as unknown as pg.PoolClient }
+}
+
+class HydrationDelegateClient {
+  readonly queries: QueryRecord[] = []
+
+  async query(sql: unknown, values: readonly unknown[] = []): Promise<{ rows: Record<string, unknown>[]; rowCount: number }> {
+    const text = String(sql)
+    this.queries.push({ sql: text, values })
+    if (text === "BEGIN" || text === "COMMIT" || text === "ROLLBACK" || text.includes("set_config('app.user_id'")) return { rows: [], rowCount: 0 }
+    if (text.includes('FROM "agent_sessions" AS session') || text.includes('FROM "sub_agent_tasks" AS target')
+      || text.includes('FROM "sub_agent_tasks" AS root') || text.includes('FROM "agent_turns" AS turn') || text.includes('FROM "agent_steps" AS step')) return { rows: [{ id: "ok" }], rowCount: 1 }
+    return { rows: [], rowCount: 0 }
+  }
+
+  release(): void {}
 }
 
 describe("PgCoordinationStore", () => {
@@ -339,5 +355,17 @@ describe("PgCoordinationStore", () => {
       .rejects.toMatchObject({ code: "coordination_scope_error" })
     expect(client.queries.some(query => query.sql.includes("INSERT INTO") || query.sql.includes("UPDATE "))).toBe(false)
     expect(client.queries.map(query => query.sql)).toContain("ROLLBACK")
+  })
+
+  it("delegates hydrateMessages with the durable hydration contract", async () => {
+    const client = new HydrationDelegateClient()
+    const input: ChildMailboxHydrationInput = {
+      userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "root-a", toTaskId: "task-a",
+      ownerId: "worker-a", attemptCount: 1, stepId: "step-a", limit: 20,
+    }
+    const store = new PgCoordinationStore(pool(client as unknown as FakeClient))
+    await expect(store.hydrateMessages(input)).resolves.toEqual([])
+    expect(client.queries.some(query => query.sql.includes("agent_mailbox_hydration_checkpoints"))).toBe(true)
+    expect(client.queries.some(query => query.sql.includes("set_config('app.user_id'") && query.values[0] === input.userId)).toBe(true)
   })
 })
