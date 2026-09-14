@@ -2026,3 +2026,11 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Root independently verified the five focused Worker files at **75/75**; Worker `tsc --noEmit --skipLibCheck`, the `@jobcopilot/shared` build (pretest), and `git diff --check` passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, real concurrent execution, Redis/BullMQ, Worker restart, provider/browser behavior, and child-parent E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance. Overall phase acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## 81. P4-52 — Owner-fenced mailbox consumption
+
+**Candidate status/date (2026-09-14):** P4-52 records the server-owned lease fence required before mailbox acknowledgments can be connected to child terminal success; overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+**Implementation:** Commit `ee197502` requires `consumeMessages` to carry ownerId, attemptCount, and now. PostgreSQL locks the target task and requires the same owner and attempt, running status, no interrupt request, an unexpired lease, and an open tenant session before updating only unconsumed rows. Repeated and unknown IDs remain idempotent and deliveredAt is unchanged.
+
+**Boundary:** This slice does not wire acknowledgment into the child executor, add a migration or outbox consumer, or claim exactly-once recovery. A later design must reconcile terminal success with the manager finish transaction and lease races. Root verified the mailbox suite at **23/23**, shared build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check`; live PostgreSQL/RLS, concurrency, Redis/BullMQ, restart, provider/browser, and child-parent E2E remain unverified. The cognitive gate remains disabled.

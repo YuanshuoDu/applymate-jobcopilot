@@ -747,3 +747,9 @@ Live PostgreSQL/RLS, real concurrent execution, Redis/BullMQ delivery, Worker re
 - Root independently verified the combined focused suite at **49/49**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
 - Live PostgreSQL/RLS, real concurrency, Redis/BullMQ delivery, Worker restart, provider/browser behavior, and complete E2E remain unverified. The cognitive gate remains disabled; overall acceptance remains **P0 accepted 1/8 (12.5%)**.
 - Known risk: repeated pending messages can be re-injected; future work should add claim/lease/checkpoint handling.
+
+## P4-52 integration / verification
+
+Commit `ee197502` hardens the mailbox consume primitive with a server-owned owner fence. The transaction locks the target task and requires the same owner and attempt, `running` status, no interrupt request, an unexpired lease, and an open tenant session before updating only `consumedAt IS NULL` rows. Repeated and unknown IDs remain idempotent; `deliveredAt` is unchanged.
+
+This is infrastructure only: child executor acknowledgment, schema migration, outbox consumer, and exactly-once crash recovery remain unimplemented. Root independently verified the mailbox suite at **23/23**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Live PostgreSQL/RLS, real concurrency, Redis/BullMQ, Worker restart, provider/browser behavior, and child-parent E2E remain unverified. The cognitive gate remains disabled; overall phase acceptance remains **P0 accepted 1/8 (12.5%)**.
