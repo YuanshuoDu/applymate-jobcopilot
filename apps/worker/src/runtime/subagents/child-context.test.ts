@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 
-import { childContextSnapshot, createChildContextBuilder, CHILD_MAILBOX_PAYLOAD_BYTE_LIMIT, type ChildMailboxReader } from "./child-context.js"
+import { childContextSnapshot, createChildContextBuilder, CHILD_MAILBOX_PAYLOAD_BYTE_LIMIT, type ChildMailboxHydrationInput, type ChildMailboxReader } from "./child-context.js"
 import type { SubagentTaskRecord } from "./types.js"
 import type { ExecutionOwnerFence } from "../execution-owner.js"
 import type { CoordinationMailboxMessage } from "../tools/coordination-types.js"
@@ -74,6 +74,35 @@ describe("child context", () => {
     expect(builder.getMailboxMessageIds()).toEqual(["mailbox-1"])
   })
 
+  it("prefers durable hydration with the exact child fence and still filters returned rows", async () => {
+    const hydrateMessages = vi.fn<(input: ChildMailboxHydrationInput) => Promise<readonly CoordinationMailboxMessage[]>>(async input => {
+      expect(input).toEqual({
+        userId: task.userId, sessionId: task.sessionId, turnId: task.turnId, rootTaskId: task.rootTaskId, toTaskId: task.id,
+        ownerId: identity.ownerId, attemptCount: identity.attemptCount, stepId: "step-durable", limit: 20,
+      })
+      return [
+        mailboxMessage({ result: "stale" }, { id: "mailbox-stale", turnId: "turn-old" }),
+        mailboxMessage({ result: "current" }),
+        mailboxMessage({ result: "foreign" }, { id: "mailbox-foreign", toTaskId: "task-other" }),
+      ]
+    })
+    const listPendingMessages = vi.fn<ChildMailboxReader["listPendingMessages"]>(async () => [mailboxMessage({ result: "legacy" })])
+    const consumeMessages = vi.fn()
+    const builder = createChildContextBuilder(task, childContextSnapshot(task), { listPendingMessages, hydrateMessages })
+
+    const context = await builder.build({ scope: { userId: task.userId }, identity, stepId: "step-durable", snapshot: childContextSnapshot(task) })
+    const pendingBlocks = context.blocks.filter(block => block.layer === "pending_input")
+
+    expect(hydrateMessages).toHaveBeenCalledOnce()
+    expect(listPendingMessages).not.toHaveBeenCalled()
+    expect(pendingBlocks.map(block => block.id)).toEqual(["mailbox:mailbox-1"])
+    expect(context.canonicalJson).toContain('"result":"current"')
+    expect(context.canonicalJson).not.toContain("mailbox-stale")
+    expect(context.canonicalJson).not.toContain("mailbox-foreign")
+    expect(builder.getMailboxMessageIds()).toEqual(["mailbox-1"])
+    expect(consumeMessages).not.toHaveBeenCalled()
+  })
+
   it("excludes cross-turn mailbox rows before caching or projecting them", async () => {
     const consumeMessages = vi.fn()
     const listPendingMessages = vi.fn<ChildMailboxReader["listPendingMessages"]>(async () => [
@@ -144,6 +173,17 @@ describe("child context", () => {
     await expect(createChildContextBuilder(task, childContextSnapshot(task), reader).build({
       scope: { userId: task.userId }, identity, stepId: "step-1", snapshot: childContextSnapshot(task),
     })).rejects.toBe(error)
+  })
+
+  it("does not silently fall back when durable hydration fails", async () => {
+    const error = new Error("durable mailbox read failed")
+    const hydrateMessages = vi.fn<NonNullable<ChildMailboxReader["hydrateMessages"]>>(async () => { throw error })
+    const listPendingMessages = vi.fn<ChildMailboxReader["listPendingMessages"]>(async () => [mailboxMessage({ result: "legacy" })])
+    const builder = createChildContextBuilder(task, childContextSnapshot(task), { listPendingMessages, hydrateMessages })
+
+    await expect(builder.build({ scope: { userId: task.userId }, identity, stepId: "step-1", snapshot: childContextSnapshot(task) })).rejects.toBe(error)
+    expect(hydrateMessages).toHaveBeenCalledOnce()
+    expect(listPendingMessages).not.toHaveBeenCalled()
   })
 
   it("re-reads without consuming pending messages on every build", async () => {

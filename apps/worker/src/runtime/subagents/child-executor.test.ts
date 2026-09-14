@@ -5,7 +5,7 @@ import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobco
 import { Buffer } from "node:buffer"
 
 import { createChildExecutor } from "./child-executor.js"
-import { childContextSnapshot, createChildContextBuilder, type ChildMailboxReader } from "./child-context.js"
+import { childContextSnapshot, createChildContextBuilder, type ChildMailboxHydrationInput, type ChildMailboxReader } from "./child-context.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import type { SubagentLease } from "./types.js"
 import type { TreeBudgetReservation, TreeBudgetReservationStore } from "./tree-budget-types.js"
@@ -155,12 +155,16 @@ function budgetStore(failConsumed = false): { store: TreeBudgetReservationStore;
 }
 
 describe("child executor composition", () => {
-  it("passes the mailbox reader into child context construction", async () => {
+  it("passes durable mailbox hydration into child context construction", async () => {
     const child = lease(); const requests: HarnessModelRequest[] = []; let modelCalls = 0
-    const listPendingMessages = vi.fn<ChildMailboxReader["listPendingMessages"]>(async input => {
-      expect(input).toEqual({ userId: child.userId, sessionId: child.sessionId, toTaskId: child.id, limit: 20 })
+    const hydrateMessages = vi.fn<(input: ChildMailboxHydrationInput) => Promise<readonly CoordinationMailboxMessage[]>>(async input => {
+      expect(input).toEqual({
+        userId: child.userId, sessionId: child.sessionId, turnId: child.turnId, rootTaskId: child.rootTaskId, toTaskId: child.id,
+        ownerId: child.ownerId, attemptCount: child.attemptCount, stepId: expect.any(String), limit: 20,
+      })
       return [mailboxMessage(child)]
     })
+    const listPendingMessages = vi.fn<ChildMailboxReader["listPendingMessages"]>(async () => [mailboxMessage(child)])
     const model: ModelAdapter = {
       id: "fixture-model", profile,
       async *stream(request) {
@@ -178,11 +182,12 @@ describe("child executor composition", () => {
       store: executionStore([], requests), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
       modelRuntimeFactory: () => model,
       toolRuntimeFactory: () => ({ definitions: [tool("jobs.search", "jobs")], router: { execute: async (_context, request) => ({ ...request, status: "completed", output: { jobs: [{ id: "job-1", source: "greenhouse" }] }, errorCode: null }) } }),
-      mailboxReader: { listPendingMessages },
+      mailboxReader: { listPendingMessages, hydrateMessages },
     })
 
     await expect(executor({ lease: child })).resolves.toMatchObject({ status: "completed", mailboxMessageIds: ["mailbox-child-1"] })
-    expect(listPendingMessages).toHaveBeenCalledTimes(2)
+    expect(hydrateMessages).toHaveBeenCalledTimes(2)
+    expect(listPendingMessages).not.toHaveBeenCalled()
     expect(JSON.stringify(requests[0]?.messages)).toContain("mailbox-child-1")
     expect(JSON.stringify(requests[0]?.messages)).toContain("UNTRUSTED_DATA")
   })

@@ -11,6 +11,18 @@ const CHILD_MAILBOX_READ_LIMIT = 20
 export const CHILD_MAILBOX_PAYLOAD_BYTE_LIMIT = 8 * 1024
 
 /** The child context only needs the server-owned pending-read capability. */
+export type ChildMailboxHydrationInput = {
+  readonly userId: string
+  readonly sessionId: string
+  readonly turnId: string
+  readonly rootTaskId: string
+  readonly toTaskId: string
+  readonly ownerId: string
+  readonly attemptCount: number
+  readonly stepId: string
+  readonly limit: number
+}
+
 export type ChildMailboxReader = {
   readonly listPendingMessages: (input: {
     readonly userId: string
@@ -18,6 +30,7 @@ export type ChildMailboxReader = {
     readonly toTaskId: string
     readonly limit: number
   }) => Promise<readonly CoordinationMailboxMessage[]>
+  readonly hydrateMessages?: (input: ChildMailboxHydrationInput) => Promise<readonly CoordinationMailboxMessage[]>
 }
 
 export type ChildContextBuilder = {
@@ -163,9 +176,15 @@ export function createChildContextBuilder(task: SubagentTaskRecord, initial = ch
   return {
     async build(request: { scope: TenantScope; identity: ExecutionOwnerFence; stepId: string; snapshot: StepContextSnapshot }): Promise<StepContext> {
       assertOwner(task, request.identity, request.scope)
-      const pendingMessages = mailboxReader
-        ? await mailboxReader.listPendingMessages({ userId: task.userId, sessionId: task.sessionId, toTaskId: task.id, limit: CHILD_MAILBOX_READ_LIMIT })
-        : []
+      if (request.identity.kind !== "task") throw new Error("child_context_owner_mismatch")
+      const pendingMessages = mailboxReader?.hydrateMessages
+        ? await mailboxReader.hydrateMessages({
+          userId: task.userId, sessionId: task.sessionId, turnId: task.turnId!, rootTaskId: task.rootTaskId, toTaskId: task.id,
+          ownerId: request.identity.ownerId, attemptCount: request.identity.attemptCount, stepId: request.stepId, limit: CHILD_MAILBOX_READ_LIMIT,
+        })
+        : mailboxReader
+          ? await mailboxReader.listPendingMessages({ userId: task.userId, sessionId: task.sessionId, toTaskId: task.id, limit: CHILD_MAILBOX_READ_LIMIT })
+          : []
       const scopedMessages = pendingMessages.filter(message => typeof message.id === "string" && message.id.length > 0
         && message.sessionId === task.sessionId && message.turnId === task.turnId && message.toTaskId === task.id)
       const seenThisBuild = new Set<string>()
