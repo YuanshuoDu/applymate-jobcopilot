@@ -210,13 +210,94 @@ describe("executePlanCommands", () => {
         const taskId = request.id.endsWith(":first") ? "task-1" : "task-2"
         return { ...request, status: "completed" as const, output: { taskId, rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" }, errorCode: null }
       }
-      return { ...request, status: "completed" as const, output: { waitId: "wait-1", status: "ready", taskIds: ["task-1", "task-2"], matchedTaskIds: ["task-1", "task-2"] }, errorCode: null }
+      return { ...request, status: "completed" as const, output: { waitId: "wait-1", status: "ready", taskIds: ["task-1", "task-2"], matchedTaskIds: ["task-1", "task-2"], tasks: [{ taskId: "task-1", status: "completed", role: "scout", result: null, failureReason: null }, { taskId: "task-2", status: "completed", role: "scout", result: null, failureReason: null }] }, errorCode: null }
     }) }
     const join = { ...base, localId: "join", kind: "join" as const, objective: "Join children", inputRefs: ["first", "second"], dependsOn: ["first", "second"], joinMode: mode, timeoutMs: 5_000 }
     const plan = dispatch([delegate("first"), delegate("second"), join])
     const result = await executePlanCommands(plan, { ...runtime(router), rootTaskId: "root-1" })
     expect(result.status).toBe("completed")
     expect(requests[2]?.input).toMatchObject({ taskIds: ["task-1", "task-2"], mode, timeoutMs: 5_000 })
+  })
+
+  it("accepts a waiting join without task evidence for adapter compatibility", async () => {
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
+      if (request.toolName === "spawn_subagent") return { ...request, status: "completed" as const, output: { taskId: "task-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" }, errorCode: null }
+      return { ...request, status: "completed" as const, output: { waitId: "wait-1", status: "waiting", taskIds: ["task-1"], matchedTaskIds: [] }, errorCode: null }
+    }) }
+    const result = await executePlanCommands(dispatch([delegate("child"), { ...base, localId: "join", kind: "join" as const, objective: "Join child", inputRefs: ["child"], dependsOn: ["child"], joinMode: "all" as const, timeoutMs: 5_000 }]), { ...runtime(router), rootTaskId: "root-1" })
+    expect(result.status).toBe("waiting")
+    expect(result.waiting?.result.output).not.toHaveProperty("tasks")
+  })
+
+  it("rejects malformed ready join task evidence", async () => {
+    const validTask = (taskId: string) => ({ taskId, status: "completed", role: "scout", result: null, failureReason: null })
+    const invalidTasks: unknown[][] = [
+      [validTask("task-1")],
+      [validTask("task-1"), validTask("task-1")],
+      [validTask("task-1"), { ...validTask("task-2"), taskId: "foreign-task" }],
+      [validTask("task-1"), { ...validTask("task-2"), result: { sessionId: "foreign-session" } }],
+      [validTask("task-1"), { ...validTask("task-2"), result: { nested: { taskId: "foreign-task" } } }],
+      [validTask("task-1"), { ...validTask("task-2"), extra: true }],
+    ]
+    for (const tasks of invalidTasks) {
+      const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
+        if (request.toolName === "spawn_subagent") {
+          const taskId = request.id.endsWith(":first") ? "task-1" : "task-2"
+          return { ...request, status: "completed" as const, output: { taskId, rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" }, errorCode: null }
+        }
+        return { ...request, status: "completed" as const, output: { waitId: "wait-1", status: "ready", taskIds: ["task-1", "task-2"], matchedTaskIds: ["task-1"], tasks }, errorCode: null }
+      }) }
+      const join = { ...base, localId: "join", kind: "join" as const, objective: "Join children", inputRefs: ["first", "second"], dependsOn: ["first", "second"], joinMode: "all" as const, timeoutMs: 5_000 }
+      await expect(executePlanCommands(dispatch([delegate("first"), delegate("second"), join]), { ...runtime(router), rootTaskId: "root-1" })).rejects.toMatchObject({ code: "router_result_mismatch" })
+      expect(router.execute).toHaveBeenCalledTimes(3)
+    }
+  })
+
+  it("rejects foreign or duplicate target and matched IDs", async () => {
+    const validTasks = [
+      { taskId: "task-1", status: "completed", role: "scout", result: null, failureReason: null },
+      { taskId: "task-2", status: "completed", role: "scout", result: null, failureReason: null },
+    ]
+    const invalidIds = [
+      { taskIds: ["task-1", "foreign"], matchedTaskIds: ["task-1"] },
+      { taskIds: ["task-1", "task-1"], matchedTaskIds: ["task-1"] },
+      { taskIds: ["task-1", "task-2"], matchedTaskIds: ["foreign"] },
+      { taskIds: ["task-1", "task-2"], matchedTaskIds: ["task-1", "task-1"] },
+    ]
+    for (const ids of invalidIds) {
+      const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
+        if (request.toolName === "spawn_subagent") {
+          const taskId = request.id.endsWith(":first") ? "task-1" : "task-2"
+          return { ...request, status: "completed" as const, output: { taskId, rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" }, errorCode: null }
+        }
+        return { ...request, status: "completed" as const, output: { waitId: "wait-ids", status: "ready", ...ids, tasks: validTasks }, errorCode: null }
+      }) }
+      const join = { ...base, localId: "join", kind: "join" as const, objective: "Join children", inputRefs: ["first", "second"], dependsOn: ["first", "second"], joinMode: "all" as const, timeoutMs: 5_000 }
+      await expect(executePlanCommands(dispatch([delegate("first"), delegate("second"), join]), { ...runtime(router), rootTaskId: "root-1" })).rejects.toMatchObject({ code: "router_result_mismatch" })
+      expect(router.execute).toHaveBeenCalledTimes(3)
+    }
+  })
+
+  it.each([
+    ["ready", ["task-1"]],
+    ["timed_out", []],
+  ] as const)("accepts valid %s join target and matched IDs", async (status, matchedTaskIds) => {
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
+      if (request.toolName === "spawn_subagent") {
+        const taskId = request.id.endsWith(":first") ? "task-1" : "task-2"
+        return { ...request, status: "completed" as const, output: { taskId, rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" }, errorCode: null }
+      }
+      return { ...request, status: "completed" as const, output: {
+        waitId: `wait-${status}`, status, taskIds: ["task-1", "task-2"], matchedTaskIds,
+        tasks: [
+          { taskId: "task-1", status: "completed", role: "scout", result: null, failureReason: null },
+          { taskId: "task-2", status: "completed", role: "scout", result: null, failureReason: null },
+        ],
+      }, errorCode: null }
+    }) }
+    const join = { ...base, localId: "join", kind: "join" as const, objective: "Join children", inputRefs: ["first", "second"], dependsOn: ["first", "second"], joinMode: "all" as const, timeoutMs: 5_000 }
+    await expect(executePlanCommands(dispatch([delegate("first"), delegate("second"), join]), { ...runtime(router), rootTaskId: "root-1" })).resolves.toMatchObject({ status: "completed" })
+    expect(router.execute).toHaveBeenCalledTimes(3)
   })
 
   it("fails a join before routing when delegate output is missing or duplicated", async () => {

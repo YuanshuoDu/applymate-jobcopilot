@@ -244,12 +244,14 @@ describe("coordination executors", () => {
     const runtime = makeRuntime()
     const child = makeTask({ id: "child", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/child", depth: 1, role: "scout", status: "queued", result: { sessionId: "foreign-session", apiKey: "secret", summary: "pending" }, failureReason: "é".repeat(300) })
     runtime.store.tasks.set(child.id, child)
-    runtime.wait.wait = vi.fn(async () => {
-      runtime.store.tasks.set(child.id, makeTask({ ...child, status: "completed", result: { summary: "late" } }))
-      return { waitId: "wait-pending", status: "waiting" as const, deadlineAt: "2026-09-03T00:01:00.000Z", matchedTaskIds: [] }
-    })
+    const pendingWait = {
+      wait: vi.fn(async () => {
+        runtime.store.tasks.set(child.id, makeTask({ ...child, status: "completed", result: { summary: "late" } }))
+        return { waitId: "wait-pending", status: "waiting" as const, deadlineAt: "2026-09-03T00:01:00.000Z", matchedTaskIds: [] }
+      }),
+    } satisfies DurableWaitPort
 
-    const result = await executeWaitSubagents(context({ taskId: "root-1", rootTaskId: "root-1" }), { idempotencyKey: "wait-pending", taskIds: [child.id], mode: "all", timeoutMs: 5000 }, runtime.options)
+    const result = await executeWaitSubagents(context({ taskId: "root-1", rootTaskId: "root-1" }), { idempotencyKey: "wait-pending", taskIds: [child.id], mode: "all", timeoutMs: 5000 }, { ...runtime.options, wait: pendingWait })
     expect(result.tasks).toEqual([{ taskId: "child", status: "queued", role: "scout", result: { apiKey: "[REDACTED]", summary: "pending" }, failureReason: expect.any(String) }])
     expect(result.tasks[0]).not.toHaveProperty("sessionId")
     expect(Buffer.byteLength(result.tasks[0]!.failureReason ?? "", "utf8")).toBeLessThanOrEqual(500)

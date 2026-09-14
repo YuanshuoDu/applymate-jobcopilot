@@ -1,14 +1,11 @@
 import { Buffer } from "node:buffer"
-
 import { PLAN_MAX_NODES, isPlainJsonObject } from "./goal-plan-contract.js"
 import type { PlanDispatchCommand, PlanDispatchResult } from "./plan-intent-dispatcher.js"
 import { schedulePlanCommands, type PlanCommandExecutionStep, type PlanCommandSchedulerRuntime } from "./plan-command-scheduler.js"
 import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
-
 const MAX_RESULT_BYTES = 8 * 1024
 const MAX_OUTPUTS = PLAN_MAX_NODES
 export type PlanCommandExecutionErrorCode = "runtime_unavailable" | "invalid_plan" | "router_result_mismatch" | "observer_failed" | "input_reference_unavailable" | "input_reference_conflict"
-
 export class PlanCommandExecutionError extends Error {
   constructor(readonly code: PlanCommandExecutionErrorCode, message: string) {
     super(message)
@@ -34,7 +31,6 @@ export type PlanInputReferenceResolutionRequest = {
 export type PlanControlRecord =
   | { readonly localId: string; readonly kind: "request_input"; readonly dependsOn: readonly string[]; readonly question: string; readonly approvalBoundary?: string }
   | { readonly localId: string; readonly kind: "propose_completion"; readonly dependsOn: readonly string[]; readonly completionCriteria: readonly string[] }
-
 export type PlanCommandExecutionRuntime = {
   readonly router?: { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> }
   readonly createContext?: (request: CommandContextRequest) => ToolRouterContext | Promise<ToolRouterContext>
@@ -45,7 +41,6 @@ export type PlanCommandExecutionRuntime = {
   readonly resolveReplayedJoin?: (request: { readonly command: JoinCommand; readonly taskIds: readonly string[] }) => ToolExecutionResult | undefined | Promise<ToolExecutionResult | undefined>
   readonly observe?: (record: PlanCommandExecutionRecord | PlanControlRecord) => void | Promise<void>
 }
-
 export type PlanCommandExecutionResult = {
   readonly status: "completed" | "failed" | "blocked" | "waiting"
   readonly completed: readonly PlanCommandExecutionRecord[]
@@ -53,14 +48,8 @@ export type PlanCommandExecutionResult = {
   readonly blocked?: PlanControlRecord
   readonly waiting?: PlanCommandExecutionRecord
 }
-function row(value: unknown): Record<string, unknown> | null {
-  return isPlainJsonObject(value) ? value : null
-}
-
-function strings(value: unknown): value is readonly string[] {
-  return Array.isArray(value) && value.length <= 32 && value.every(item => typeof item === "string" && item.trim().length > 0 && item.length <= 4_000)
-}
-
+function row(value: unknown): Record<string, unknown> | null { return isPlainJsonObject(value) ? value : null }
+function strings(value: unknown): value is readonly string[] { return Array.isArray(value) && value.length <= 32 && value.every(item => typeof item === "string" && item.trim().length > 0 && item.length <= 4_000) }
 function plainJson(value: unknown, seen = new Set<object>()): boolean {
   if (value === null || typeof value === "string" || typeof value === "boolean") return true
   if (typeof value === "number") return Number.isFinite(value)
@@ -95,7 +84,6 @@ function executable(value: unknown): value is ExecutableCommand {
     && typeof delegateInput.goal === "string" && Boolean(delegateInput.goal.trim())
     && strings(delegateInput.constraints) && strings(delegateInput.successCriteria) && strings(delegateInput.allowedActions)
 }
-
 function control(value: unknown): value is PlanControlRecord {
   const command = row(value)
   if (!command || (command.kind !== "request_input" && command.kind !== "propose_completion")) return false
@@ -103,10 +91,7 @@ function control(value: unknown): value is PlanControlRecord {
   if (command.kind === "request_input") return typeof command.question === "string" && Boolean(command.question.trim()) && (command.approvalBoundary === undefined || typeof command.approvalBoundary === "string")
   return strings(command.completionCriteria)
 }
-function request(command: ExecutableCommand): ToolCallRequest {
-  return command.call
-}
-
+function request(command: ExecutableCommand): ToolCallRequest { return command.call }
 function resolvedRequest(runtime: PlanCommandExecutionRuntime, command: ExecutableCommand, outputs: ReadonlyMap<string, unknown>): ToolCallRequest {
   const original = request(command)
   if (command.inputRefs.length === 0) return original
@@ -129,7 +114,7 @@ function resolvedRequest(runtime: PlanCommandExecutionRuntime, command: Executab
   return { ...original, input: { ...command.call.input, context: resolved } }
 }
 const IDENTITY_KEYS = new Set(["userId", "sessionId", "turnId", "stepId", "taskId", "parentTaskId", "rootTaskId", "ownerId", "lease", "leaseOwnerId", "leaseVersion", "idempotencyKey", "capabilities", "permissions", "allowedCapabilities", "budgetLimit", "maxBudget"])
-
+const WAIT_TASK_KEYS = new Set(["taskId", "status", "role", "result", "failureReason"])
 function containsIdentityKey(value: unknown, allowed = new Set<string>(), seen = new Set<object>()): boolean {
   if (!value || typeof value !== "object" || seen.has(value)) return false
   if (Array.isArray(value)) { seen.add(value); const found = value.some(item => containsIdentityKey(item, allowed, seen)); seen.delete(value); return found }
@@ -137,7 +122,6 @@ function containsIdentityKey(value: unknown, allowed = new Set<string>(), seen =
   if (Object.keys(value).some(key => IDENTITY_KEYS.has(key) && !allowed.has(key))) return true
   seen.add(value); const found = Object.values(value).some(item => containsIdentityKey(item, allowed, seen)); seen.delete(value); return found
 }
-
 function joinTaskIds(runtime: PlanCommandExecutionRuntime, command: JoinCommand, outputs: ReadonlyMap<string, unknown>): readonly string[] {
   const taskIds: string[] = []
   for (const ref of command.inputRefs) {
@@ -153,18 +137,40 @@ function joinTaskIds(runtime: PlanCommandExecutionRuntime, command: JoinCommand,
   if (taskIds.length === 0 || taskIds.length > 8) throw new PlanCommandExecutionError("input_reference_unavailable", "Join delegate outputs are unavailable")
   return taskIds
 }
-
-function waitingJoin(value: unknown): boolean {
-  const output = row(value)
-  return Boolean(output && output.status === "waiting" && typeof output.waitId === "string" && output.waitId.trim())
+function waitingJoin(value: unknown): boolean { const output = row(value); return Boolean(output && output.status === "waiting" && typeof output.waitId === "string" && output.waitId.trim()) }
+function boundedJson(value: unknown): boolean { try { const encoded = JSON.stringify(value); return encoded !== undefined && Buffer.byteLength(encoded, "utf8") <= MAX_RESULT_BYTES } catch { return false } }
+function validIds(value: unknown, expected: readonly string[], allowEmpty: boolean): value is readonly string[] {
+  return Array.isArray(value) && (allowEmpty || value.length > 0) && value.length <= 8 && value.every(item => typeof item === "string" && item.trim() && item.length <= 256) && new Set(value).size === value.length && value.every(item => expected.includes(item))
 }
-function validateJoinResult(value: unknown): void {
+function exactIds(value: unknown, expected: readonly string[]): boolean { return validIds(value, expected, false) && value.length === expected.length }
+function validJoinTasks(value: unknown, expectedTaskIds: readonly string[]): boolean {
+  if (!Array.isArray(value) || value.length !== expectedTaskIds.length) return false
+  const seen = new Set<string>()
+  for (const candidate of value) {
+    const task = row(candidate)
+    const keys = task && Object.keys(task)
+    if (!task || !keys || (keys.length !== 4 && keys.length !== 5) || keys.some(key => !WAIT_TASK_KEYS.has(key))
+      || containsIdentityKey(task, new Set(["taskId"])) || containsIdentityKey(task.result)) return false
+    if (typeof task.taskId !== "string" || !task.taskId.trim() || task.taskId.length > 256
+      || !expectedTaskIds.includes(task.taskId) || seen.has(task.taskId)) return false
+    if (typeof task.status !== "string" || !task.status.trim() || task.status.length > 256
+      || (task.role !== undefined && (typeof task.role !== "string" || !task.role.trim() || task.role.length > 256))) return false
+    if (!plainJson(task.result) || !boundedJson(task.result)
+      || (task.failureReason !== null && (typeof task.failureReason !== "string" || Buffer.byteLength(task.failureReason, "utf8") > MAX_RESULT_BYTES))) return false
+    seen.add(task.taskId)
+  }
+  return seen.size === expectedTaskIds.length
+}
+function validateJoinResult(value: unknown, expectedTaskIds: readonly string[]): void {
   const output = row(value)
   if (!output || !plainJson(output) || containsIdentityKey(output, new Set(["taskId"])) || !["waiting", "ready", "timed_out"].includes(String(output.status)) || typeof output.waitId !== "string" || !output.waitId.trim() || output.waitId.length > 256) throw new PlanCommandExecutionError("router_result_mismatch", "Wait router returned an invalid result")
-  if (output.taskIds !== undefined && (!Array.isArray(output.taskIds) || output.taskIds.length > 8 || !output.taskIds.every(item => typeof item === "string" && item.trim()))) throw new PlanCommandExecutionError("router_result_mismatch", "Wait router returned an invalid result")
-  if (output.matchedTaskIds !== undefined && (!Array.isArray(output.matchedTaskIds) || output.matchedTaskIds.length > 8 || !output.matchedTaskIds.every(item => typeof item === "string" && item.trim()))) throw new PlanCommandExecutionError("router_result_mismatch", "Wait router returned an invalid result")
+  const status = output.status
+  const validTargets = status === "ready" || status === "timed_out" ? exactIds(output.taskIds, expectedTaskIds) : output.taskIds === undefined || exactIds(output.taskIds, expectedTaskIds)
+  const validMatches = validIds(output.matchedTaskIds, expectedTaskIds, status !== "ready")
+  if (!validTargets || !validMatches) throw new PlanCommandExecutionError("router_result_mismatch", "Wait router returned an invalid result")
+  const hasTasks = Object.prototype.hasOwnProperty.call(output, "tasks")
+  if (((output.status === "ready" || output.status === "timed_out") && !hasTasks) || (hasTasks && !validJoinTasks(output.tasks, expectedTaskIds))) throw new PlanCommandExecutionError("router_result_mismatch", "Wait router returned an invalid result")
 }
-
 function context(runtime: PlanCommandExecutionRuntime, command: ExecutableCommand): Promise<ToolRouterContext> {
   if (!runtime.createContext) throw new PlanCommandExecutionError("runtime_unavailable", "Plan command context is unavailable")
   let provided: ToolRouterContext | Promise<ToolRouterContext>
@@ -178,18 +184,15 @@ function context(runtime: PlanCommandExecutionRuntime, command: ExecutableComman
     throw new PlanCommandExecutionError("runtime_unavailable", "Plan command context is unavailable")
   })
 }
-
 async function observe(runtime: PlanCommandExecutionRuntime, record: PlanCommandExecutionRecord | PlanControlRecord): Promise<void> {
   if (!runtime.observe) return
   try { await runtime.observe(record) } catch { throw new PlanCommandExecutionError("observer_failed", "Plan command observation failed") }
 }
-
 function validatePlanCommands(value: PlanDispatchResult): readonly PlanDispatchCommand[] {
   if (!value || !Array.isArray(value.commands) || value.commands.length > PLAN_MAX_NODES) throw new PlanCommandExecutionError("invalid_plan", "Plan command count exceeds the runtime bound")
   for (const command of value.commands) if (!executable(command) && !control(command)) throw new PlanCommandExecutionError("invalid_plan", "Plan command is invalid")
   return value.commands
 }
-
 function result(value: unknown, requestValue: ToolCallRequest): ToolExecutionResult {
   const parsed = row(value)
   if (!parsed) throw new PlanCommandExecutionError("router_result_mismatch", "Tool router returned an invalid result")
@@ -210,7 +213,6 @@ function storeOutput(outputs: Map<string, unknown>, record: PlanCommandExecution
   try { encoded = JSON.stringify(record.result.output) } catch { encoded = undefined }
   if (encoded !== undefined && Buffer.byteLength(encoded, "utf8") <= MAX_RESULT_BYTES && outputs.size < MAX_OUTPUTS) outputs.set(record.localId, record.result.output)
 }
-
 async function executeCommand(runtime: PlanCommandExecutionRuntime, command: ExecutableCommand, outputs: ReadonlyMap<string, unknown>): Promise<PlanCommandExecutionStep> {
   const taskIds = command.kind === "join" ? joinTaskIds(runtime, command, outputs) : undefined
   const requestValue = command.kind === "join" ? { ...command.call, input: { ...command.call.input, taskIds: [...taskIds!] } } : resolvedRequest(runtime, command, outputs)
@@ -218,7 +220,7 @@ async function executeCommand(runtime: PlanCommandExecutionRuntime, command: Exe
   try {
     const replayed = command.kind === "join" ? await runtime.resolveReplayedJoin?.({ command, taskIds: taskIds! }) : undefined
     response = result(replayed ?? await runtime.router!.execute(await context(runtime, command), requestValue), requestValue)
-    if (command.kind === "join" && response.status === "completed") validateJoinResult(response.output)
+    if (command.kind === "join" && response.status === "completed") validateJoinResult(response.output, taskIds!)
   } catch (error: unknown) {
     if (error instanceof PlanCommandExecutionError) throw error
     if (error instanceof Error && error.name === "CanonicalPlanError") throw error
@@ -227,13 +229,11 @@ async function executeCommand(runtime: PlanCommandExecutionRuntime, command: Exe
   const record: PlanCommandExecutionRecord = { localId: command.localId, kind: command.kind, dependsOn: [...command.dependsOn], result: response }
   return { record, waiting: command.kind === "join" && waitingJoin(response.output) }
 }
-
 function parallelLimit(value: number | undefined): number | undefined {
   if (value === undefined) return undefined
   if (!Number.isSafeInteger(value) || value < 1 || value > 4 || value > PLAN_MAX_NODES) throw new PlanCommandExecutionError("runtime_unavailable", "Plan parallel delegate bound is invalid")
   return value
 }
-
 export async function executePlanCommands(plan: PlanDispatchResult, runtime: PlanCommandExecutionRuntime): Promise<PlanCommandExecutionResult> {
   const commands = validatePlanCommands(plan)
   if (!runtime.router || typeof runtime.router.execute !== "function") throw new PlanCommandExecutionError("runtime_unavailable", "Plan command router is unavailable")
