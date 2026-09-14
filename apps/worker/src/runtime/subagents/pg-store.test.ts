@@ -227,6 +227,29 @@ describe("PgSubagentTaskStore", () => {
     expect(update?.[0]).toContain('"attemptCount" = $9')
     expect(update?.[0]).toContain('"leaseExpiresAt" > CURRENT_TIMESTAMP')
     expect(update?.[1]).toContain(1)
+    const dispatchReset = fake.calls.find(([sql]) => sql.startsWith('UPDATE "agent_outbox"'))
+    expect(dispatchReset?.[0]).toContain('"publishedAt" = NULL')
+    expect(dispatchReset?.[0]).toContain('"attemptCount" = "attemptCount" + 1')
+    expect(dispatchReset?.[0]).toContain('"lastError" = NULL')
+    expect(dispatchReset?.[0]).toContain('"topic" = \'agent.subagent.dispatch\'')
+    expect(dispatchReset?.[0]).toContain('"idempotencyKey" = $1')
+    expect(dispatchReset?.[0]).toContain('"aggregateId" = $2')
+    expect(dispatchReset?.[1]).toEqual(["subagent-dispatch:task-1", "session-1"])
+    expect(fake.calls.indexOf(dispatchReset!)).toBeGreaterThan(fake.calls.indexOf(update!))
+  })
+
+  it("rolls back the queued task when retry dispatch reset fails", async () => {
+    const fake = fakePool(sql => {
+      if (sql.includes('FROM "sub_agent_tasks" task')) return { rows: [taskRow({ status: "running", leaseOwner: "worker-1", attemptCount: 1, leaseExpiresAt: new Date(now.getTime() + 60_000) })], rowCount: 1 }
+      if (sql.startsWith('UPDATE "agent_outbox"')) throw new Error("dispatch reset unavailable")
+      if (sql.startsWith('UPDATE "sub_agent_tasks"')) return { rowCount: 1 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.finish({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, status: "failed", failureReason: "timeout", now })).rejects.toThrow("dispatch reset unavailable")
+    expect(fake.calls.map(([sql]) => sql)).toContain("ROLLBACK")
+    expect(fake.calls.some(([sql]) => sql === "COMMIT")).toBe(false)
   })
 
   it("completes the task and consumes the read mailbox ids in one transaction", async () => {
@@ -309,6 +332,7 @@ describe("PgSubagentTaskStore", () => {
 
     await expect(store.finish({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, status: "failed", failureReason: "provider failed", now, mailboxMessageIds: ["message-1"] })).resolves.toBe(maxAttempts === 1 ? "failed" : "retrying")
     expect(fake.calls.some(([sql]) => sql.includes('UPDATE "agent_mailbox_messages"'))).toBe(false)
+    expect(fake.calls.some(([sql]) => sql.includes('UPDATE "agent_outbox"'))).toBe(maxAttempts !== 1)
   })
 
   it.each([

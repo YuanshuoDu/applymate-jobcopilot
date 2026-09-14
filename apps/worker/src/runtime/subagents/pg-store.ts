@@ -201,6 +201,11 @@ export class PgSubagentTaskStore implements SubagentStore {
                 AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled'))`,
         [input.taskId, input.sessionId, status, json(input.result, null), input.failureReason ?? null, terminal, input.now, input.ownerId, input.attemptCount])
         if (updated.rowCount !== 1) throw new FinishFenceSignal()
+        if (retry) {
+          await client.query(`UPDATE "agent_outbox" SET "publishedAt" = NULL, "attemptCount" = "attemptCount" + 1, "lastError" = NULL
+            WHERE "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $1 AND "aggregateId" = $2`,
+          [`subagent-dispatch:${input.taskId}`, input.sessionId])
+        }
         if (status === "completed" && mailboxMessageIds.length > 0) {
           await client.query(`UPDATE "agent_mailbox_messages" AS message
             SET "consumedAt" = CURRENT_TIMESTAMP
