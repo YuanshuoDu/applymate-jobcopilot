@@ -822,3 +822,11 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Astra independently verified the coordination-executor and mailbox-store suites at **43/43** (17 + 26), Worker tsc --noEmit --skipLibCheck, shared build through test preflight, source line bounds, and git diff --check.
 - This remains a candidate increment: no live PostgreSQL/RLS wait transaction, Redis/BullMQ delivery, process restart, cross-process concurrency, provider/browser behavior, or complete child-parent E2E was run. The cognitive gate remains disabled and overall acceptance remains **P0 accepted 1/8 (12.5%)**.
 
+
+## P4-62 integration / verification
+
+- Integrated code commit: `68b923b2`.
+- Canonical plan joins now fail closed when the wait result for `ready` or `timed_out` omits hydrated task evidence, carries a foreign or duplicate target/matched ID, or contains malformed, oversized, extra-field, or nested-identity task data. Target IDs must be the exact expected child set; ready matches are non-empty and timed-out matches may be empty. Waiting results may still omit `tasks` for adapter compatibility.
+- The P4-61 waiting fixture now injects an independently typed wait port, so the production contract is unchanged and Worker type checking remains sound.
+- Astra independently verified the plan executor and coordination executor suites at **42/42** (24 + 18), the shared build through Worker test preflight, Worker `tsc --noEmit --skipLibCheck`, source line bounds, and `git diff --check`.
+- This remains a candidate increment: no live PostgreSQL/RLS transaction, Redis/BullMQ wakeup, process restart, cross-process concurrency, provider/browser behavior, or complete child-parent E2E was run. The cognitive gate remains disabled and overall acceptance remains **P0 accepted 1/8 (12.5%)**.
