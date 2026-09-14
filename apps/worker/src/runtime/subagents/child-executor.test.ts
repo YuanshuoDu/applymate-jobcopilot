@@ -192,6 +192,31 @@ describe("child executor composition", () => {
     expect(JSON.stringify(requests[0]?.messages)).toContain("UNTRUSTED_DATA")
   })
 
+  it("starts a recovered child attempt after durable steps and restores tool observations", async () => {
+    const child = lease(); const requests: HarnessModelRequest[] = []; const startedOrdinals: number[] = []
+    const resumeLoader = vi.fn(async () => ({
+      resume: { nextOrdinal: 3, stepCount: 3, toolCallCount: 1, inputThroughSequence: 8n, consumedInputIds: ["input-1"], usage: { inputTokens: 10, outputTokens: 4, estimatedCostUsd: 0.2 } },
+      observations: [{ id: "child-resume:item-result", content: { toolCallId: "prior-call", toolName: "jobs.search", input: {}, status: "completed", output: { jobs: [{ id: "job-1" }] }, errorCode: null } }],
+    }))
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) { requests.push(request); yield { type: "text_delta", text: "recovered" }; yield { type: "completed", finishReason: "stop" } },
+    }
+    const executor = createChildExecutor({
+      store: { ...executionStore([], requests), startStep: async ({ ordinal, stepId }) => { startedOrdinals.push(ordinal); return { id: stepId, ordinal } } },
+      treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => model,
+      toolRuntimeFactory: () => ({ definitions: [tool("jobs.search", "jobs")], router: { execute: async (_context, request) => ({ ...request, status: "completed", errorCode: null }) } }),
+      resumeLoader,
+    })
+
+    await expect(executor({ lease: child })).resolves.toMatchObject({ status: "completed", result: { stepCount: 4 } })
+    expect(resumeLoader).toHaveBeenCalledWith(child)
+    expect(startedOrdinals).toEqual([3])
+    expect(JSON.stringify(requests[0]?.messages)).toContain("prior-call")
+    expect(JSON.stringify(requests[0]?.messages)).toContain("job-1")
+    expect(requests[0]?.metadata).not.toHaveProperty("continuation")
+  })
+
   it("runs a server-owned context adapter hook before the child model", async () => {
     const child = lease(); const order: string[] = []; const requests: HarnessModelRequest[] = []; let modelCalls = 0
     const hook = vi.fn<ContextSnapshotAdapter["hook"]>(async input => {

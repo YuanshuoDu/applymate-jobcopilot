@@ -11,8 +11,10 @@ import { visibleToolPolicy, getSubagentRolePolicy } from "./role-policy.js"
 import { childContextSnapshot, createChildContextBuilder, type ChildMailboxReader } from "./child-context.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { createObservedEvidenceIndex, parseAndBindStructuredResult, recordReadToolOutput } from "./child-evidence.js"
+import type { ChildResumeLoader } from "./child-resume.js"
 import { SubagentLeaseError, type SubagentExecutionResult, type SubagentLease, type SubagentTaskRecord } from "./types.js"
 import type { TurnExecutionStore } from "../turns/turn-execution-types.js"
+import type { TurnResumeState } from "../turns/turn-engine-types.js"
 import { createToolRouterExecutor } from "../turns/turn-engine-helpers.js"
 import { runTurnExecutionLoop } from "../turns/turn-execution-loop.js"
 import { createUsageAwareModelAdapter, type UsageAwareModelOptions } from "../turns/usage-aware-model.js"
@@ -74,6 +76,8 @@ export type ChildExecutorOptions = {
   readonly contextSnapshotAdapter?: ContextSnapshotAdapter
   /** Reads pending child mailbox messages without acknowledging or consuming them. */
   readonly mailboxReader?: ChildMailboxReader
+  /** Restores only server-owned state from prior durable attempts. */
+  readonly resumeLoader?: ChildResumeLoader
   readonly now?: () => Date
 }
 
@@ -129,6 +133,17 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
     const definitions = visibleDefinitions(lease, runtime.definitions)
     const policy = getSubagentRolePolicy(lease.role)
     if (!policy) return { status: "failed", failureReason: "subagent_role_unknown" }
+    let snapshot = childContextSnapshot(lease)
+    let resume: TurnResumeState | undefined
+    if (options.resumeLoader && lease.attemptCount > 1) {
+      try {
+        const restored = await options.resumeLoader(lease)
+        if (restored) {
+          resume = restored.resume
+          snapshot = { ...snapshot, toolObservations: [...restored.observations] }
+        }
+      } catch { return { status: "failed", failureReason: "child_resume_unavailable" } }
+    }
     const adapter = await (options.modelRuntimeFactory?.({ task: lease }) ?? defaultModel(lease))
     const model = createUsageAwareModelAdapter(adapter, { owner, authorize: options.authorizeUsage, treeBudget: options.treeBudget })
     const observedEvidence = createObservedEvidenceIndex()
@@ -138,9 +153,9 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       if (toolResult.status === "completed" && toolResult.errorCode === null) recordReadToolOutput(observedEvidence, input.call.toolName, toolResult.output)
       return toolResult
     }
-    const contextBuilder = createChildContextBuilder(lease, undefined, options.mailboxReader)
+    const contextBuilder = createChildContextBuilder(lease, snapshot, options.mailboxReader)
     const result = await runTurnExecutionLoop({
-      identity: owner, scope: { userId: lease.userId }, goal: lease.goal, snapshot: childContextSnapshot(lease),
+      identity: owner, scope: { userId: lease.userId }, goal: lease.goal, snapshot,
       contextBuilder, store: options.store, model, tools: definitions,
       executeTool, actorRole: policy.actorRole, capabilities: policy.capabilities,
       validateToolArguments: runtime.validateArguments, signal: lease.signal, now: options.now, publishReasoningSummary: false,
@@ -149,6 +164,7 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       // A retry is a new durable attempt. Keep IDs deterministic within that
       // attempt while preventing attempt 1 and attempt 2 collisions.
       idFactory: prefix => `${prefix}:attempt:${lease.attemptCount}`,
+      resume,
       isOwnershipLost: (error, signal) => signal.aborted || error instanceof SubagentLeaseError,
       signalError: () => new Error("subagent_lease_lost"),
     })

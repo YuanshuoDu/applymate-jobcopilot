@@ -13,6 +13,7 @@ import type { ContextSnapshotAdapter } from "../context/context-snapshot-adapter
 import { createPgTreeBudgetReservationStore } from "./tree-budget-store.js"
 import type { TreeBudgetReservationStore } from "./tree-budget-types.js"
 import { createChildExecutor, type ChildExecutorOptions, type ChildToolRuntime } from "./child-executor.js"
+import { loadChildAttemptResume } from "./child-resume.js"
 import { PgCoordinationStore } from "../mailbox/store.js"
 import type { ExecutionOwner, ExecutionOwnerFence } from "../execution-owner.js"
 import type { SubagentLease, SubagentTaskRecord } from "./types.js"
@@ -26,6 +27,7 @@ export type ProductionChildRuntimeOptions = {
   readonly toolRuntimeFactory?: ChildExecutorOptions["toolRuntimeFactory"]
   readonly contextSnapshotAdapter?: ContextSnapshotAdapter
   readonly mailboxReader?: ChildExecutorOptions["mailboxReader"]
+  readonly resumeLoader?: ChildExecutorOptions["resumeLoader"]
 }
 
 function record(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {} }
@@ -72,18 +74,25 @@ function defaultMailboxReader(pool: pg.Pool): ChildExecutorOptions["mailboxReade
   return new PgCoordinationStore(pool)
 }
 
+function defaultResumeLoader(pool: pg.Pool): ChildExecutorOptions["resumeLoader"] | undefined {
+  const candidate = pool as unknown as { readonly connect?: unknown }
+  if (typeof candidate.connect !== "function") return undefined
+  return lease => loadChildAttemptResume(pool, lease)
+}
+
 /** Build the production child seam only when the explicit feature flag is on. */
 export function createProductionChildExecutor(options: ProductionChildRuntimeOptions): SubagentExecutor {
   const engineStore = options.turnStore ?? createPgTurnEngineStore(options.pool)
   const treeBudget = options.treeBudget ?? createPgTreeBudgetReservationStore(options.pool)
   const authorizeUsage = options.authorizeUsage ?? createWorkerUsageAuthorizer()
   const mailboxReader = options.mailboxReader ?? defaultMailboxReader(options.pool)
+  const resumeLoader = options.resumeLoader ?? defaultResumeLoader(options.pool)
   return createChildExecutor({
     store: bindStore(engineStore), treeBudget, authorizeUsage,
     modelRuntimeFactory: options.modelRuntimeFactory,
     toolRuntimeFactory: options.toolRuntimeFactory ?? (({ task, lease, owner }) => defaultTools(options.pool, engineStore, task, lease, owner)),
     contextSnapshotAdapter: options.contextSnapshotAdapter,
-    mailboxReader,
+    mailboxReader, resumeLoader,
   })
 }
 

@@ -134,4 +134,44 @@ describe("production child runtime", () => {
     expect(hook).toHaveBeenCalledTimes(2)
     expect(connect).not.toHaveBeenCalled()
   })
+
+  it("uses the server-owned default resume loader for a recovered attempt", async () => {
+    const child = { ...lease(), attemptCount: 2, leaseExpiresAt: new Date("2099-09-14T12:00:00.000Z") }
+    const client = {
+      query: vi.fn(async (sql: string) => {
+        if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+        if (sql.includes('SELECT task."id"')) return {
+          rows: [{ id: child.id, userId: child.userId, sessionId: child.sessionId, turnId: child.turnId, rootTaskId: child.rootTaskId, status: "running", leaseOwner: child.ownerId, attemptCount: child.attemptCount, leaseExpiresAt: child.leaseExpiresAt, interruptRequestedAt: null, turnStatus: "in_progress", rootStatus: "running" }], rowCount: 1,
+        }
+        if (sql.includes('FROM "agent_steps"')) return { rows: [], rowCount: 0 }
+        throw new Error(`unexpected resume query: ${sql}`)
+      }),
+      release: vi.fn(),
+    }
+    const poolWithConnect = { connect: vi.fn(async () => client), query: vi.fn() }
+    const pool = poolWithConnect as unknown as never
+    let modelCalls = 0
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream() {
+        modelCalls += 1
+        if (modelCalls === 1) {
+          yield { type: "tool_call_completed", callId: "resume-call", name: "jobs.search", arguments: {} }
+          yield { type: "completed", finishReason: "tool_calls" }
+        } else {
+          yield { type: "text_delta", text: "resumed" }
+          yield { type: "completed", finishReason: "stop" }
+        }
+      },
+    }
+    const executor = createOptionalProductionChildExecutor({
+      enabled: true, pool, turnStore: store(), treeBudget: budget(), authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => model, toolRuntimeFactory: () => ({ definitions: [publicTool("jobs.search")], router: { execute: async (_context: unknown, request: { id: string; toolName: string; toolVersion: string }) => ({ ...request, status: "completed" as const, errorCode: null }) } }),
+      mailboxReader: { listPendingMessages: async () => [] },
+    })
+    if (!executor) throw new Error("child executor was not created")
+    await expect(executor({ lease: child })).resolves.toMatchObject({ status: "completed" })
+    expect(poolWithConnect.connect).toHaveBeenCalledOnce()
+    expect(client.query.mock.calls.map(([sql]) => sql)).toContain("SELECT set_config($1, $2, true)")
+  })
 })
