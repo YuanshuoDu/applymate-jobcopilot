@@ -85,6 +85,7 @@ const TaskOutputSchema = Type.Object({
   role: Type.String(), taskType: Type.String(), status: StatusSchema,
   attemptCount: Type.Integer({ minimum: 0 }), maxAttempts: Type.Integer({ minimum: 1 }),
   leaseExpiresAt: Type.Union([Type.String(), Type.Null()]), interruptRequestedAt: Type.Union([Type.String(), Type.Null()]),
+  result: Type.Unknown(), failureReason: Type.Union([Type.String({ maxLength: 500 }), Type.Null()]),
 }, { additionalProperties: false })
 const ListOutputSchema = Type.Object({ tasks: Type.Array(TaskOutputSchema, { maxItems: 50 }) }, { additionalProperties: false })
 const InterruptOutputSchema = Type.Object({

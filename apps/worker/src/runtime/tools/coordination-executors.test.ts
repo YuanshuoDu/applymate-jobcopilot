@@ -9,6 +9,7 @@ import {
   executeSpawn,
   executeWaitSubagents,
 } from "./coordination-executors.js"
+import { createCoordinationTools } from "./coordination-tools.js"
 import type {
   CloseSubagentInput,
   InterruptSubagentInput,
@@ -24,6 +25,7 @@ import type {
   CoordinationTaskView,
   DurableWaitPort,
 } from "./coordination-types.js"
+import { ToolSchemaValidator } from "./schema-validator.js"
 import type { ToolExecutionContext } from "./types.js"
 
 const baseTask: CoordinationTaskView = {
@@ -270,10 +272,10 @@ describe("coordination executors", () => {
 
   it("lists only the current tree and protects close/interrupt transitions", async () => {
     const runtime = makeRuntime()
-    runtime.store.tasks.set("queued", makeTask({ id: "queued", rootTaskId: "root-1", path: "/root-1/queued", status: "queued" }))
+    runtime.store.tasks.set("queued", makeTask({ id: "queued", rootTaskId: "root-1", path: "/root-1/queued", status: "queued", result: { summary: "hidden" }, failureReason: "hidden" }))
     runtime.store.tasks.set("done", makeTask({ id: "done", rootTaskId: "root-1", path: "/root-1/done", status: "completed" }))
     await expect(executeListSubagents(context({ taskId: "root-1", rootTaskId: "root-1" }), { includeTerminal: false } satisfies ListSubagentsInput, runtime.options))
-      .resolves.toMatchObject({ tasks: [expect.objectContaining({ taskId: "queued" })] })
+      .resolves.toMatchObject({ tasks: [{ taskId: "queued", result: null, failureReason: null }] })
     await expect(executeCloseSubagent(context({ taskId: "root-1", rootTaskId: "root-1" }), { taskId: "root-1" } satisfies CloseSubagentInput, runtime.options))
       .rejects.toMatchObject({ code: "coordination_close_not_allowed" })
     await expect(executeCloseSubagent(context({ taskId: "root-1", rootTaskId: "root-1" }), { taskId: "queued" } satisfies CloseSubagentInput, runtime.options))
@@ -282,6 +284,59 @@ describe("coordination executors", () => {
       .resolves.toMatchObject({ rootTaskId: "root-1", status: "interrupt_requested" })
     expect(runtime.manager.interruptSubtree).toHaveBeenCalledWith("session-a", "root-1", "/root-1/queued")
     expect(runtime.wait.cancel).toHaveBeenCalledWith(expect.objectContaining({ taskId: "queued", reason: "interrupted" }))
+  })
+
+  it("returns redacted bounded evidence for terminal tasks and suppresses active values", async () => {
+    const runtime = makeRuntime()
+    runtime.store.tasks.set("done", makeTask({
+      id: "done", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/done", depth: 1, status: "completed",
+      result: { summary: "finished", userId: "foreign-user", nested: { sessionId: "foreign-session", taskId: "foreign-task", safe: "ok" } },
+      failureReason: "é".repeat(300),
+    }))
+    runtime.store.tasks.set("large", makeTask({
+      id: "large", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/large", depth: 1, status: "failed",
+      result: { summary: "x".repeat(3_000) }, failureReason: "failed",
+    }))
+    runtime.store.tasks.set("running", makeTask({
+      id: "running", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/running", depth: 1, status: "running",
+      result: { summary: "in-flight", sessionId: "foreign-session" }, failureReason: "hidden",
+    }))
+
+    const output = await executeListSubagents(context({ taskId: "root-1", rootTaskId: "root-1" }), { includeTerminal: true }, runtime.options)
+    const done = output.tasks.find(task => task.taskId === "done")
+    const large = output.tasks.find(task => task.taskId === "large")
+    const running = output.tasks.find(task => task.taskId === "running")
+    expect(done).toMatchObject({ result: { summary: "finished", nested: { safe: "ok" } }, failureReason: expect.any(String) })
+    expect(done?.result).not.toHaveProperty("userId")
+    expect(done?.result).not.toHaveProperty("nested.sessionId")
+    expect(done?.result).not.toHaveProperty("nested.taskId")
+    expect(Buffer.byteLength(done?.failureReason ?? "", "utf8")).toBeLessThanOrEqual(500)
+    expect(large?.result).toMatchObject({ $truncated: true })
+    expect(running).toMatchObject({ result: null, failureReason: null })
+  })
+
+  it("caps list output at 50 rows after preserving store order", async () => {
+    const runtime = makeRuntime()
+    for (let index = 0; index < 55; index += 1) {
+      const task = makeTask({ id: `child-${index}`, rootTaskId: "root-1", parentTaskId: "root-1", path: `/root-1/child-${index}`, depth: 1, status: "queued" })
+      runtime.store.tasks.set(task.id, task)
+    }
+    const output = await executeListSubagents(context({ taskId: "root-1", rootTaskId: "root-1" }), {}, runtime.options)
+    expect(output.tasks).toHaveLength(50)
+    expect(output.tasks[0]?.taskId).toBe("child-0")
+    expect(output.tasks[49]?.taskId).toBe("child-49")
+  })
+
+  it("keeps list evidence compatible with the strict output schema", async () => {
+    const runtime = makeRuntime()
+    const child = makeTask({ id: "done", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/done", depth: 1, status: "completed", result: { summary: "finished" } })
+    runtime.store.tasks.set(child.id, child)
+    const output = await executeListSubagents(context({ taskId: "root-1", rootTaskId: "root-1" }), { includeTerminal: true }, runtime.options)
+    const definition = createCoordinationTools(runtime.options).find(tool => tool.name === "list_subagents")
+    if (!definition) throw new Error("list_subagents definition missing")
+    expect(() => new ToolSchemaValidator().validate(definition.outputSchema, output, "list_subagents output")).not.toThrow()
+    expect(output.tasks[0]).toHaveProperty("result")
+    expect(output.tasks[0]).toHaveProperty("failureReason")
   })
 
   it("allows a root caller to interrupt a descendant and a child caller to close its own descendant", async () => {

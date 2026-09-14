@@ -14,6 +14,7 @@ export type CoordinationExecutorOptions = CoordinationRuntimeOptions
 const WAIT_RESULT_MAX_BYTES = 2 * 1024
 const WAIT_FAILURE_MAX_BYTES = 500
 const FOREIGN_RESULT_KEYS = new Set(["userId", "sessionId", "turnId", "stepId", "taskId", "parentTaskId", "rootTaskId", "ownerId", "lease", "leaseOwnerId", "leaseVersion", "idempotencyKey", "capabilities", "permissions", "allowedCapabilities", "budgetLimit", "maxBudget"])
+const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "interrupted", "cancelled", "closed"])
 
 export async function executeSpawn(context: ToolExecutionContext, input: SpawnSubagentInput, options: CoordinationExecutorOptions) {
   const parentTaskId = await resolveSpawnParent(context, input.parentTaskId, options)
@@ -99,7 +100,7 @@ export async function executeListSubagents(context: ToolExecutionContext, input:
   const rootTaskId = current?.rootTaskId ?? context.rootTaskId
   const tasks = await options.store.listTasks({ userId: context.scope.userId, sessionId: context.sessionId, rootTaskId, includeTerminal: input.includeTerminal ?? false })
   await activity(context, options, "list_subagents", current?.id ?? null, { count: tasks.length })
-  return { tasks: tasks.filter(task => task.id !== current?.id).map(taskOutput) }
+  return { tasks: tasks.filter(task => task.id !== current?.id).slice(0, 50).map(taskOutput) }
 }
 
 export async function executeInterruptSubagent(context: ToolExecutionContext, input: InterruptSubagentInput, options: CoordinationExecutorOptions) {
@@ -161,7 +162,10 @@ async function uniqueTasks(context: ToolExecutionContext, ids: readonly string[]
 }
 
 function spawnOutput(task: CoordinationTaskView, replay: boolean) { return { taskId: task.id, rootTaskId: task.rootTaskId, parentTaskId: task.parentTaskId, path: task.path, depth: task.depth, status: task.status, replay } }
-function taskOutput(task: CoordinationTaskView) { return { taskId: task.id, rootTaskId: task.rootTaskId, parentTaskId: task.parentTaskId, path: task.path, depth: task.depth, role: task.role, taskType: task.taskType, status: task.status, attemptCount: task.attemptCount, maxAttempts: task.maxAttempts, leaseExpiresAt: task.leaseExpiresAt?.toISOString() ?? null, interruptRequestedAt: task.interruptRequestedAt?.toISOString() ?? null } }
+function taskOutput(task: CoordinationTaskView) {
+  const terminal = TERMINAL_TASK_STATUSES.has(task.status)
+  return { taskId: task.id, rootTaskId: task.rootTaskId, parentTaskId: task.parentTaskId, path: task.path, depth: task.depth, role: task.role, taskType: task.taskType, status: task.status, attemptCount: task.attemptCount, maxAttempts: task.maxAttempts, leaseExpiresAt: task.leaseExpiresAt?.toISOString() ?? null, interruptRequestedAt: task.interruptRequestedAt?.toISOString() ?? null, result: terminal ? waitResult(task.result) : null, failureReason: terminal ? boundedFailureReason(task.failureReason) : null }
+}
 function waitTaskOutput(task: CoordinationTaskView) { return { taskId: task.id, status: task.status, role: task.role, result: waitResult(task.result), failureReason: boundedFailureReason(task.failureReason) } }
 function waitResult(value: unknown): ReturnType<typeof sanitizeLifecyclePreview> | null {
   if (value === undefined || value === null) return null
