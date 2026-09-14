@@ -761,3 +761,10 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - `PgSubagentTaskStore.finish` locks and validates the running task owner, attempt, lease, open session, root task, and Turn fence. It updates the task and, when the final status is `completed`, marks the scoped mailbox IDs consumed in the same transaction. Unknown or already-consumed IDs are idempotent; a mailbox write failure rolls back the task finish.
 - Astra independently verified the affected suites at **128/128** (Pg store, manager, child context, child executor, mailbox store, production child runtime, and coordination executors), plus Worker `tsc --noEmit --skipLibCheck`, shared build, and `git diff --check`.
 - This remains a candidate increment: no live PostgreSQL/RLS transaction, Redis/BullMQ delivery, process restart, cross-process child-parent E2E, or production gate enablement was performed. Schema, migration, outbox consumer, and external actions remain unchanged. Overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-54 integration / verification
+
+- Integrated code commit: `4716aa13`.
+- Child mailbox payloads are normalized into deterministic JSON before context injection. Each payload is bounded to 8 KiB of UTF-8; oversized values become a server-owned `{truncated, byteLength, preview}` marker, with preview cut only at Unicode code-point boundaries. Message order, scoped IDs, metadata, and `external_untrusted` trust remain intact.
+- Astra independently verified the child-context suite at **9/9** and Worker `tsc --noEmit --skipLibCheck`; shared build ran through the test preflight and `git diff --check` passed.
+- This is a context-safety candidate only: no aggregate context cap, live PostgreSQL/RLS, Redis/BullMQ delivery, process restart, provider/browser behavior, or child-parent E2E was run. Overall acceptance remains **P0 accepted 1/8 (12.5%)**.
