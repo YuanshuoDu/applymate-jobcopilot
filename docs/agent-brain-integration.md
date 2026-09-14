@@ -753,3 +753,11 @@ Live PostgreSQL/RLS, real concurrent execution, Redis/BullMQ delivery, Worker re
 Commit `ee197502` hardens the mailbox consume primitive with a server-owned owner fence. The transaction locks the target task and requires the same owner and attempt, `running` status, no interrupt request, an unexpired lease, and an open tenant session before updating only `consumedAt IS NULL` rows. Repeated and unknown IDs remain idempotent; `deliveredAt` is unchanged.
 
 This is infrastructure only: child executor acknowledgment, schema migration, outbox consumer, and exactly-once crash recovery remain unimplemented. Root independently verified the mailbox suite at **23/23**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Live PostgreSQL/RLS, real concurrency, Redis/BullMQ, Worker restart, provider/browser behavior, and child-parent E2E remain unverified. The cognitive gate remains disabled; overall phase acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-53 integration / verification
+
+- Integrated code commit: `b1ae8e4d`.
+- Child execution records the mailbox IDs it actually read across all context builds. Only a completed child result carries those IDs; waiting, failed, and interrupted results leave them unacknowledged. `AgentTreeManager` forwards the IDs only on the completed path.
+- `PgSubagentTaskStore.finish` locks and validates the running task owner, attempt, lease, open session, root task, and Turn fence. It updates the task and, when the final status is `completed`, marks the scoped mailbox IDs consumed in the same transaction. Unknown or already-consumed IDs are idempotent; a mailbox write failure rolls back the task finish.
+- Astra independently verified the affected suites at **128/128** (Pg store, manager, child context, child executor, mailbox store, production child runtime, and coordination executors), plus Worker `tsc --noEmit --skipLibCheck`, shared build, and `git diff --check`.
+- This remains a candidate increment: no live PostgreSQL/RLS transaction, Redis/BullMQ delivery, process restart, cross-process child-parent E2E, or production gate enablement was performed. Schema, migration, outbox consumer, and external actions remain unchanged. Overall acceptance remains **P0 accepted 1/8 (12.5%)**.
