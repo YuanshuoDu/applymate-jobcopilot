@@ -120,6 +120,24 @@ function readSequenceModel(text: string, toolNames: readonly string[]): ModelAda
   }
 }
 
+function textOnlyModel(text: string, onRequest?: (request: HarnessModelRequest) => void): ModelAdapter {
+  return {
+    id: "fixture-model", profile,
+    async *stream(request) {
+      onRequest?.(request)
+      yield { type: "text_delta", text }
+      yield { type: "completed", finishReason: "stop" }
+    },
+  }
+}
+
+function restoredRead(id: string, toolName: string, output: unknown, overrides: Record<string, unknown> = {}) {
+  return {
+    id,
+    content: { toolCallId: `call-${id}`, toolName, input: {}, status: "completed", output, errorCode: null, ...overrides },
+  }
+}
+
 function finalTextExecutor(model: ModelAdapter, outputs: Readonly<Record<string, unknown>> = {}) {
   return createChildExecutor({
     store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
@@ -215,6 +233,63 @@ describe("child executor composition", () => {
     expect(JSON.stringify(requests[0]?.messages)).toContain("prior-call")
     expect(JSON.stringify(requests[0]?.messages)).toContain("job-1")
     expect(requests[0]?.metadata).not.toHaveProperty("continuation")
+  })
+
+  it("binds restored jobs, persona, and resume evidence before a resumed provider call", async () => {
+    const child = structuredLease("analyst"); const requests: HarnessModelRequest[] = []
+    const resultText = JSON.stringify(analystReadEvidenceResult())
+    const resumeLoader = vi.fn(async () => ({
+      resume: { nextOrdinal: 3, stepCount: 3, toolCallCount: 3, inputThroughSequence: 8n, consumedInputIds: ["input-1"], usage: { inputTokens: 10, outputTokens: 4, estimatedCostUsd: 0.2 } },
+      observations: [
+        restoredRead("job", "jobs.search", { jobs: [{ id: "job-1", source: "greenhouse" }] }),
+        restoredRead("fact", "persona.retrieve", { facts: [{ id: "fact-1", source: "persona.database" }] }),
+        restoredRead("resume", "resume.get_base", { resume: { id: "resume-1" } }),
+      ],
+    }))
+    const model = textOnlyModel(resultText, request => requests.push(request))
+    const executor = createChildExecutor({
+      store: executionStore([], requests), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => model,
+      toolRuntimeFactory: () => ({ definitions: [tool("jobs.search", "jobs"), tool("persona.retrieve", "persona"), tool("resume.get_base", "resume")], router: { execute: async (_context, request) => ({ ...request, status: "completed", errorCode: null }) } }),
+      resumeLoader,
+    })
+
+    const result = await executor({ lease: child })
+    expect(result).toMatchObject({ status: "completed", result: { status: "completed", structuredResult: { role: "analyst" } } })
+    expect((result.result as { readonly structuredResult: { readonly evidence: readonly unknown[] } }).structuredResult.evidence).toEqual([
+      { id: "read:job:job-1", kind: "job", ref: "job-1", source: "greenhouse" },
+      { id: "read:persona:fact-1", kind: "persona", ref: "fact-1", source: "persona.database" },
+      { id: "read:resume:resume-1", kind: "resume", ref: "resume-1", source: "resume.get_base" },
+    ])
+    expect(requests).toHaveLength(1)
+  })
+
+  it("fails closed before the provider when restored evidence is malformed", async () => {
+    const child = structuredLease("scout"); const modelRuntimeFactory = vi.fn(() => textOnlyModel("unreachable"))
+    const executor = createChildExecutor({
+      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory,
+      toolRuntimeFactory: () => ({ definitions: [tool("jobs.search", "jobs")], router: { execute: async (_context, request) => ({ ...request, status: "completed", errorCode: null }) } }),
+      resumeLoader: async () => ({
+        resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 1n, consumedInputIds: [], usage: { inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0 } },
+        observations: [restoredRead("bad", "jobs.search", { jobs: [] }, { errorCode: undefined })],
+      }),
+    })
+
+    await expect(executor({ lease: child })).resolves.toMatchObject({ status: "failed", failureReason: "child_resume_evidence_unavailable" })
+    expect(modelRuntimeFactory).not.toHaveBeenCalled()
+  })
+
+  it("keeps attempt one unchanged and does not invoke the resume loader", async () => {
+    const child = { ...lease(), attemptCount: 1 }; const resumeLoader = vi.fn(async () => undefined); const modelRuntimeFactory = vi.fn(() => finalTextModel("completed output"))
+    const executor = createChildExecutor({
+      store: { ...executionStore([], []), startStep: async ({ ordinal, stepId }) => ({ id: stepId, ordinal }) },
+      treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory,
+      toolRuntimeFactory: () => ({ definitions: [tool("jobs.search", "jobs")], router: { execute: async (_context, request) => ({ ...request, status: "completed", errorCode: null }) } }), resumeLoader,
+    })
+
+    await expect(executor({ lease: child })).resolves.toMatchObject({ status: "completed" })
+    expect(resumeLoader).not.toHaveBeenCalled()
+    expect(modelRuntimeFactory).toHaveBeenCalledOnce()
   })
 
   it("runs a server-owned context adapter hook before the child model", async () => {

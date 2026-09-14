@@ -10,7 +10,7 @@ import { createHarnessModelRuntime } from "../harness-model.js"
 import { visibleToolPolicy, getSubagentRolePolicy } from "./role-policy.js"
 import { childContextSnapshot, createChildContextBuilder, type ChildMailboxReader } from "./child-context.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
-import { createObservedEvidenceIndex, parseAndBindStructuredResult, recordReadToolOutput } from "./child-evidence.js"
+import { createObservedEvidenceIndex, hydrateObservedEvidence, parseAndBindStructuredResult, recordReadToolOutput } from "./child-evidence.js"
 import type { ChildResumeLoader } from "./child-resume.js"
 import { SubagentLeaseError, type SubagentExecutionResult, type SubagentLease, type SubagentTaskRecord } from "./types.js"
 import type { TurnExecutionStore } from "../turns/turn-execution-types.js"
@@ -133,12 +133,14 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
     const definitions = visibleDefinitions(lease, runtime.definitions)
     const policy = getSubagentRolePolicy(lease.role)
     if (!policy) return { status: "failed", failureReason: "subagent_role_unknown" }
+    const observedEvidence = createObservedEvidenceIndex()
     let snapshot = childContextSnapshot(lease)
     let resume: TurnResumeState | undefined
     if (options.resumeLoader && lease.attemptCount > 1) {
       try {
         const restored = await options.resumeLoader(lease)
         if (restored) {
+          try { hydrateObservedEvidence(observedEvidence, restored.observations) } catch { return { status: "failed", failureReason: "child_resume_evidence_unavailable" } }
           resume = restored.resume
           snapshot = { ...snapshot, toolObservations: [...restored.observations] }
         }
@@ -146,7 +148,6 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
     }
     const adapter = await (options.modelRuntimeFactory?.({ task: lease }) ?? defaultModel(lease))
     const model = createUsageAwareModelAdapter(adapter, { owner, authorize: options.authorizeUsage, treeBudget: options.treeBudget })
-    const observedEvidence = createObservedEvidenceIndex()
     const routedTool = createToolRouterExecutor(runtime.router)
     const executeTool: typeof routedTool = async input => {
       const toolResult = await routedTool(input)

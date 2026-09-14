@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest"
 import { Buffer } from "node:buffer"
 
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
-import { createObservedEvidenceIndex, parseAndBindStructuredResult, recordReadToolOutput } from "./child-evidence.js"
+import { createObservedEvidenceIndex, hydrateObservedEvidence, parseAndBindStructuredResult, recordReadToolOutput } from "./child-evidence.js"
 
 function scoutResult(overrides: Record<string, unknown> = {}) {
   return {
@@ -18,6 +18,13 @@ function emptyScoutResult() {
 
 function entry(index: ReturnType<typeof createObservedEvidenceIndex>, kind: string, ref: string) {
   return index.entries.get(`${kind}\u0000${ref}`)
+}
+
+function restored(id: string, toolName: string, output: unknown, overrides: Record<string, unknown> = {}) {
+  return {
+    id,
+    content: { toolCallId: `call-${id}`, toolName, input: {}, status: "completed", output, errorCode: null, ...overrides },
+  }
 }
 
 describe("child evidence binding", () => {
@@ -90,5 +97,56 @@ describe("child evidence binding", () => {
     const oversized = { ...emptyScoutResult(), summary: "x".repeat(9_000) }
     expect(Buffer.byteLength(JSON.stringify(oversized), "utf8")).toBeGreaterThan(8 * 1024)
     expect(parseAndBindStructuredResult(JSON.stringify(oversized), "scout", createObservedEvidenceIndex())).toBeUndefined()
+  })
+
+  it("hydrates restored jobs, persona, and resume reads into canonical evidence", () => {
+    const index = createObservedEvidenceIndex()
+    hydrateObservedEvidence(index, [
+      restored("job", "jobs.search", { jobs: [{ id: "job-1", source: "greenhouse" }] }),
+      restored("fact", "persona.retrieve", { facts: [{ id: "fact-1", source: "persona.database" }] }),
+      restored("resume", "resume.get_base", { resume: { id: "resume-1" } }),
+    ])
+
+    const result = parseAndBindStructuredResult(JSON.stringify({
+      schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
+      findings: [{ jobId: "job-1", score: 8, evidenceIds: ["job", "fact", "resume"] }],
+      evidence: [
+        { id: "job", kind: "job", ref: "job-1", source: "model" },
+        { id: "fact", kind: "persona", ref: "fact-1", source: "model" },
+        { id: "resume", kind: "resume", ref: "resume-1", source: "model" },
+      ], summary: "restored",
+    }), "analyst", index)
+
+    expect(result?.evidence).toEqual([
+      { id: "read:job:job-1", kind: "job", ref: "job-1", source: "greenhouse" },
+      { id: "read:persona:fact-1", kind: "persona", ref: "fact-1", source: "persona.database" },
+      { id: "read:resume:resume-1", kind: "resume", ref: "resume-1", source: "resume.get_base" },
+    ])
+  })
+
+  it("skips a valid historical failed read without inventing evidence", () => {
+    const index = createObservedEvidenceIndex()
+    hydrateObservedEvidence(index, [
+      restored("failed", "jobs.search", { jobs: [{ id: "job-failed", source: "greenhouse" }] }, { status: "failed", errorCode: "tool_execution_failed" }),
+      restored("job", "jobs.search", { jobs: [{ id: "job-1", source: "greenhouse" }] }),
+    ])
+
+    expect(entry(index, "job", "job-failed")).toBeUndefined()
+    expect(entry(index, "job", "job-1")).toBeDefined()
+  })
+
+  it.each([
+    ["malformed shape", restored("bad", "jobs.search", { jobs: [] }, { errorCode: undefined })],
+    ["foreign tool", restored("foreign", "admin.lookup", { jobs: [] })],
+    ["oversized content", restored("large", "jobs.search", { jobs: [{ id: "job-1", source: "x".repeat(9_000) }] })],
+  ] as const)("rejects %s restored evidence", (_name, observation) => {
+    expect(() => hydrateObservedEvidence(createObservedEvidenceIndex(), [observation])).toThrow()
+  })
+
+  it("fails closed on conflicting restored sources", () => {
+    expect(() => hydrateObservedEvidence(createObservedEvidenceIndex(), [
+      restored("first", "jobs.search", { jobs: [{ id: "job-1", source: "greenhouse" }] }),
+      restored("second", "jobs.get", { job: { id: "job-1", source: "lever" } }),
+    ])).toThrow("child_resume_evidence_conflict")
   })
 })
