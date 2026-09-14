@@ -279,15 +279,60 @@ describe("child executor composition", () => {
     expect(modelRuntimeFactory).not.toHaveBeenCalled()
   })
 
-  it("returns a terminal disposition when the recovered attempt cannot be loaded", async () => {
+  it("returns a terminal disposition for deterministic recovered history conflicts", async () => {
     const child = lease(); const modelRuntimeFactory = vi.fn(() => textOnlyModel("unreachable"))
     const executor = createChildExecutor({
       store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory,
       toolRuntimeFactory: () => ({ definitions: [tool("jobs.search", "jobs")], router: { execute: async (_context, request) => ({ ...request, status: "completed", errorCode: null }) } }),
-      resumeLoader: async () => { throw new Error("resume snapshot is unavailable") },
+      resumeLoader: async () => { throw new Error("child_resume_tool_call_conflict") },
     })
 
     await expect(executor({ lease: child })).resolves.toMatchObject({ status: "failed", failureReason: "child_resume_unavailable", retryDisposition: "terminal" })
+    expect(modelRuntimeFactory).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    "child_resume_owner_mismatch",
+    "child_resume_lease_expired",
+  ] as const)("keeps %s retryable", async failureCode => {
+    const child = lease(); const modelRuntimeFactory = vi.fn(() => textOnlyModel("unreachable"))
+    const executor = createChildExecutor({
+      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory,
+      toolRuntimeFactory: () => ({ definitions: [tool("jobs.search", "jobs")], router: { execute: async (_context, request) => ({ ...request, status: "completed", errorCode: null }) } }),
+      resumeLoader: async () => { throw new Error(failureCode) },
+    })
+
+    const result = await executor({ lease: child })
+    expect(result).toMatchObject({ status: "failed", failureReason: "child_resume_unavailable" })
+    expect(result.retryDisposition).toBeUndefined()
+    expect(modelRuntimeFactory).not.toHaveBeenCalled()
+  })
+
+  it("keeps an unknown resume loader error retryable", async () => {
+    const child = lease(); const modelRuntimeFactory = vi.fn(() => textOnlyModel("unreachable"))
+    const executor = createChildExecutor({
+      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory,
+      toolRuntimeFactory: () => ({ definitions: [tool("jobs.search", "jobs")], router: { execute: async (_context, request) => ({ ...request, status: "completed", errorCode: null }) } }),
+      resumeLoader: async () => { throw new Error("resume database connection failed") },
+    })
+
+    const result = await executor({ lease: child })
+    expect(result).toMatchObject({ status: "failed", failureReason: "child_resume_unavailable" })
+    expect(result.retryDisposition).toBeUndefined()
+    expect(modelRuntimeFactory).not.toHaveBeenCalled()
+  })
+
+  it("keeps a non-Error resume loader rejection retryable", async () => {
+    const child = lease(); const modelRuntimeFactory = vi.fn(() => textOnlyModel("unreachable"))
+    const executor = createChildExecutor({
+      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory,
+      toolRuntimeFactory: () => ({ definitions: [tool("jobs.search", "jobs")], router: { execute: async (_context, request) => ({ ...request, status: "completed", errorCode: null }) } }),
+      resumeLoader: async () => { throw { code: "resume_database_error" } },
+    })
+
+    const result = await executor({ lease: child })
+    expect(result).toMatchObject({ status: "failed", failureReason: "child_resume_unavailable" })
+    expect(result.retryDisposition).toBeUndefined()
     expect(modelRuntimeFactory).not.toHaveBeenCalled()
   })
 

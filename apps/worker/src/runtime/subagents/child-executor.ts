@@ -124,6 +124,18 @@ function resultStatus(status: "completed" | "waiting_for_dependency" | "waiting_
   return "failed"
 }
 
+function isDeterministicChildResumeError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  const code = error.message
+  if (!code.startsWith("child_resume_") || code.includes("owner_mismatch") || code.includes("lease_expired")) return false
+  return code.startsWith("child_resume_invalid_")
+    || code.endsWith("_lineage")
+    || code.endsWith("_limit")
+    || code.endsWith("_tool_call_conflict")
+    || code.endsWith("_tool_result_conflict")
+    || code === "child_resume_usage_overflow"
+}
+
 export function createChildExecutor(options: ChildExecutorOptions): (input: { lease: SubagentLease }) => Promise<SubagentExecutionResult> {
   if (!options.treeBudget) throw new TypeError("treeBudget is required for child execution")
   return async ({ lease }) => {
@@ -144,7 +156,10 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
           resume = restored.resume
           snapshot = { ...snapshot, toolObservations: [...restored.observations] }
         }
-      } catch { return { status: "failed", failureReason: "child_resume_unavailable", retryDisposition: "terminal" } }
+      } catch (error: unknown) {
+        if (isDeterministicChildResumeError(error)) return { status: "failed", failureReason: "child_resume_unavailable", retryDisposition: "terminal" }
+        return { status: "failed", failureReason: "child_resume_unavailable" }
+      }
     }
     const adapter = await (options.modelRuntimeFactory?.({ task: lease }) ?? defaultModel(lease))
     const model = createUsageAwareModelAdapter(adapter, { owner, authorize: options.authorizeUsage, treeBudget: options.treeBudget })
