@@ -789,3 +789,10 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Child mailbox hydration now requires exact `message.turnId === task.turnId` in both the server query and the child-context projection. Cross-turn rows are excluded before caching, model visibility, or completion acknowledgement; stable ordering, per-execution cache, payload bound, and at-least-once semantics are unchanged.
 - Astra independently verified the child-context and mailbox-store suites at **38/38** (15 + 23), Worker `tsc --noEmit --skipLibCheck`, shared build through the test preflight, and `git diff --check`.
 - This remains a candidate increment: no live PostgreSQL/RLS, Redis/BullMQ delivery, process restart, cross-process concurrency, provider/browser behavior, or complete child-parent E2E was run. The cognitive gate remains disabled and overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-58 integration / verification
+
+- Integrated code commit: `d205e80a`.
+- The atomic completed-child mailbox acknowledgement now requires the canonical target task's `turnId` to equal the mailbox row's `turnId`, in addition to the existing session, task, owner, attempt, lease, root, and open-session fences. A cross-turn ID therefore cannot be consumed even if a future caller accidentally supplies a mixed ID set; unknown and already-consumed IDs remain idempotent.
+- Astra independently verified `pg-store.test.ts` at **47/47**, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check`.
+- This remains a candidate increment: no live PostgreSQL/RLS transaction, Redis/BullMQ delivery, process restart, cross-process concurrency, provider/browser behavior, or complete child-parent E2E was run. The cognitive gate remains disabled and overall acceptance remains **P0 accepted 1/8 (12.5%)**.
