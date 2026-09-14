@@ -2159,6 +2159,7 @@ model SubAgentTask {
   budgetSnapshot       Json      @default("{}")
   attemptCount         Int       @default(0)
   maxAttempts          Int       @default(1)
+  nextAttemptAt        DateTime?
   leaseOwner           String?
   leaseExpiresAt       DateTime?
   startedAt            DateTime?
@@ -2185,6 +2186,7 @@ model SubAgentTask {
   treeBudgetReservationsAsTask AgentTreeBudgetReservation[] @relation("AgentTreeBudgetReservationTask")
 
   @@index([sessionId, status])
+  @@index([status, nextAttemptAt, updatedAt])
   @@index([sessionId, role])
   @@index([sessionId, path])
   @@index([sessionId, rootTaskId, path])

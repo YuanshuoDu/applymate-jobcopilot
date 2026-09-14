@@ -70,8 +70,9 @@ export async function repairStaleSubagentDispatches(
             AND task."startedAt" IS NOT NULL
             AND task."leaseOwner" IS NULL
             AND task."leaseExpiresAt" IS NULL
-            AND task."interruptRequestedAt" IS NULL
-            AND task."attemptCount" < task."maxAttempts"
+             AND task."interruptRequestedAt" IS NULL
+             AND task."attemptCount" < task."maxAttempts"
+             AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)
             AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
             AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
             AND dispatch."publishedAt" IS NOT NULL
@@ -107,6 +108,7 @@ export async function repairStaleSubagentDispatches(
         AND task."leaseExpiresAt" IS NULL
         AND task."interruptRequestedAt" IS NULL
         AND task."attemptCount" < task."maxAttempts"
+        AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)
         AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
         AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
         AND dispatch."publishedAt" IS NOT NULL
@@ -148,6 +150,7 @@ export async function repairStaleSubagentDispatches(
           AND task."leaseExpiresAt" IS NULL
           AND task."interruptRequestedAt" IS NULL
           AND task."attemptCount" < task."maxAttempts"
+          AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)
           AND session."id" = $5
           AND session."status" NOT IN ('aborted', 'archived')
           AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')

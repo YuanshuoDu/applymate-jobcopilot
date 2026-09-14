@@ -155,6 +155,17 @@ describe("AgentTreeManager", () => {
     expect(store.records.get(task.id)?.status).toBe("completed")
   })
 
+  it("skips a queued task until its durable retry eligibility time", async () => {
+    const store = new MemoryStore()
+    const manager = new AgentTreeManager(store, { clock: new FakeClock() })
+    const task = await manager.spawn(spec({ policy: { maxConcurrency: 1, maxAttempts: 2 } }))
+    store.records.set(task.id, { ...task, nextAttemptAt: new Date("2099-01-01T00:00:00.000Z") })
+
+    await expect(manager.run(payload(task), async () => ({ status: "completed" }))).resolves.toMatchObject({ status: "skipped", reason: "not_available" })
+    expect(store.records.get(task.id)?.status).toBe("queued")
+    expect(manager.activeCount(task.sessionId)).toBe(0)
+  })
+
   it("forwards a terminal retry disposition without retrying the child", async () => {
     const store = new MemoryStore()
     const manager = new AgentTreeManager(store, { clock: new FakeClock() })

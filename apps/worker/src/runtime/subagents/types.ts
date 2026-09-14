@@ -93,6 +93,8 @@ export type SubagentTaskRecord = {
   failureReason: string | null
   attemptCount: number
   maxAttempts: number
+  /** Server-owned durable retry eligibility; null means immediately eligible. */
+  nextAttemptAt?: Date | null
   leaseOwner: string | null
   leaseExpiresAt: Date | null
   interruptRequestedAt: Date | null

@@ -225,8 +225,10 @@ describe("PgSubagentTaskStore", () => {
     await expect(store.finish({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, status: "failed", failureReason: "timeout", now })).resolves.toBe("retrying")
     const update = fake.calls.find(([sql]) => sql.startsWith("UPDATE"))
     expect(update?.[0]).toContain('"attemptCount" = $9')
+    expect(update?.[0]).toContain('"nextAttemptAt" = $10')
     expect(update?.[0]).toContain('"leaseExpiresAt" > CURRENT_TIMESTAMP')
     expect(update?.[1]).toContain(1)
+    expect(update?.[1]?.[9]).toEqual(new Date(now.getTime() + 1_000))
     const dispatchReset = fake.calls.find(([sql]) => sql.startsWith('UPDATE "agent_outbox"'))
     expect(dispatchReset?.[0]).toContain('"publishedAt" = NULL')
     expect(dispatchReset?.[0]).toContain('"attemptCount" = "attemptCount" + 1')
@@ -479,6 +481,7 @@ describe("PgSubagentTaskStore", () => {
     await expect(store.interruptTree({ sessionId: "session-1", rootTaskId: "task-1", now })).resolves.toBe(3)
     const update = fake.calls.find(([sql]) => sql.startsWith("UPDATE"))?.[0] ?? ""
     expect(update).toContain('"interruptRequestedAt"')
+    expect(update).toContain('"nextAttemptAt"')
     expect(update).toContain("'waiting_for_user'")
   })
 

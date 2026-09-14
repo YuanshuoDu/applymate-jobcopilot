@@ -200,6 +200,8 @@ describe("Subagent queue", () => {
     const scan = fake.calls.find(([sql]) => sql.includes('SELECT dispatch."id"') && sql.includes("ORDER BY dispatch."))
     expect(scan?.[0]).toMatch(/ORDER BY dispatch\."createdAt" ASC, dispatch\."id" ASC\s+LIMIT \$2 FOR UPDATE OF dispatch, session SKIP LOCKED/)
     expect(scan?.[0]).toContain('session."id" = dispatch."aggregateId"')
+    const taskFence = fake.calls.find(([sql]) => sql.includes('JOIN "sub_agent_tasks" AS task') && sql.includes('FOR UPDATE OF dispatch, task'))
+    expect(taskFence?.[0]).toContain('task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP')
     const sessionLock = fake.calls.findIndex(([sql]) => sql.includes('SELECT session."id"') && sql.includes("FOR UPDATE"))
     const outboxLock = fake.calls.findIndex(([sql]) => sql.includes('SELECT dispatch."id"') && sql.includes('WHERE dispatch."id"'))
     expect(sessionLock).toBeGreaterThan(-1)

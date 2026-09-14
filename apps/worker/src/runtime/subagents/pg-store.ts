@@ -14,6 +14,7 @@ import {
   type SubagentTaskSpec,
   type SubagentPolicy,
 } from "./types.js"
+import { computeSubagentNextAttemptAt } from "./retry-policy.js"
 
 type Queryable = Pick<pg.PoolClient, "query">
 
@@ -42,7 +43,7 @@ function rowToTask(row: Record<string, unknown>): SubagentTaskRecord {
     constraints: row.constraints, successCriteria: row.successCriteria, allowedActions: row.allowedActions,
     context: row.context, expectedOutputSchema: row.expectedOutputSchema, result: row.result ?? null,
     failureReason: row.failureReason ? String(row.failureReason) : null, attemptCount: Number(row.attemptCount),
-    maxAttempts: Number(row.maxAttempts), leaseOwner: row.leaseOwner ? String(row.leaseOwner) : null,
+    maxAttempts: Number(row.maxAttempts), nextAttemptAt: dateValue(row.nextAttemptAt), leaseOwner: row.leaseOwner ? String(row.leaseOwner) : null,
     leaseExpiresAt: dateValue(row.leaseExpiresAt), interruptRequestedAt: dateValue(row.interruptRequestedAt),
     modelProfileSnapshot: row.modelProfileSnapshot, budgetSnapshot: row.budgetSnapshot, toolPolicySnapshot: row.toolPolicySnapshot,
   }
@@ -121,6 +122,7 @@ export class PgSubagentTaskStore implements SubagentStore {
             "attemptCount" = "attemptCount" + 1, "startedAt" = COALESCE("startedAt", CURRENT_TIMESTAMP), "updatedAt" = CURRENT_TIMESTAMP
         WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'queued' AND "interruptRequestedAt" IS NULL
           AND "attemptCount" < "maxAttempts" AND ("leaseOwner" IS NULL OR "leaseExpiresAt" <= CURRENT_TIMESTAMP)
+          AND ("nextAttemptAt" IS NULL OR "nextAttemptAt" <= CURRENT_TIMESTAMP)
           AND EXISTS (SELECT 1 FROM "agent_sessions" AS session
             WHERE session."id" = "sub_agent_tasks"."sessionId"
               AND session."status" NOT IN ('aborted', 'archived'))
@@ -187,9 +189,10 @@ export class PgSubagentTaskStore implements SubagentStore {
         const retry = input.status === "failed" && !interrupted && input.retryDisposition !== "terminal" && Number(row.attemptCount) < Number(row.maxAttempts)
         const status = interrupted ? "interrupted" : retry ? "queued" : input.status
         const terminal = isTerminalSubagentStatus(status)
+        const nextAttemptAt = retry ? computeSubagentNextAttemptAt(input.attemptCount, input.now) : null
         const updated = await client.query(`UPDATE "sub_agent_tasks" SET "status" = $3, "result" = $4::jsonb,
           "failureReason" = $5, "leaseOwner" = NULL, "leaseExpiresAt" = NULL,
-          "completedAt" = CASE WHEN $6 THEN $7 ELSE NULL END, "updatedAt" = $7
+          "nextAttemptAt" = $10, "completedAt" = CASE WHEN $6 THEN $7 ELSE NULL END, "updatedAt" = $7
           WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $8 AND "status" = 'running'
             AND "attemptCount" = $9 AND "leaseExpiresAt" > CURRENT_TIMESTAMP
             AND EXISTS (SELECT 1 FROM "agent_sessions" AS session
@@ -200,7 +203,7 @@ export class PgSubagentTaskStore implements SubagentStore {
                 AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
                 AND turn."id" = "sub_agent_tasks"."turnId" AND turn."sessionId" = "sub_agent_tasks"."sessionId"
                 AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled'))`,
-        [input.taskId, input.sessionId, status, json(input.result, null), input.failureReason ?? null, terminal, input.now, input.ownerId, input.attemptCount])
+        [input.taskId, input.sessionId, status, json(input.result, null), input.failureReason ?? null, terminal, input.now, input.ownerId, input.attemptCount, nextAttemptAt])
         if (updated.rowCount !== 1) throw new FinishFenceSignal()
         if (retry) {
           await client.query(`UPDATE "agent_outbox" SET "publishedAt" = NULL, "attemptCount" = "attemptCount" + 1, "lastError" = NULL
@@ -230,7 +233,7 @@ export class PgSubagentTaskStore implements SubagentStore {
   async release(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; now: Date }): Promise<boolean> {
     return transaction(this.pool, async client => {
       const updated = await client.query(`UPDATE "sub_agent_tasks"
-        SET "status" = 'queued', "leaseOwner" = NULL, "leaseExpiresAt" = NULL, "updatedAt" = $5
+        SET "status" = 'queued', "nextAttemptAt" = NULL, "leaseOwner" = NULL, "leaseExpiresAt" = NULL, "updatedAt" = $5
         WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $3 AND "attemptCount" = $4
           AND "interruptRequestedAt" IS NULL AND "status" = 'running'
           AND EXISTS (SELECT 1 FROM "agent_sessions" AS session
@@ -249,7 +252,7 @@ export class PgSubagentTaskStore implements SubagentStore {
     const client = await this.pool.connect()
     try {
       const result = await client.query(`UPDATE "sub_agent_tasks" SET "status" = 'closed', "leaseOwner" = NULL,
-        "leaseExpiresAt" = NULL, "closedAt" = $3, "completedAt" = $3, "updatedAt" = $3
+        "leaseExpiresAt" = NULL, "nextAttemptAt" = NULL, "closedAt" = $3, "completedAt" = $3, "updatedAt" = $3
         WHERE "id" = $1 AND "sessionId" = $2 AND "status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')`, [input.taskId, input.sessionId, input.now])
       return result.rowCount === 1
     } finally { client.release() }
@@ -261,6 +264,7 @@ export class PgSubagentTaskStore implements SubagentStore {
       const result = await client.query(`UPDATE "sub_agent_tasks" SET
         "interruptRequestedAt" = COALESCE("interruptRequestedAt", $3),
         "status" = CASE WHEN "status" IN ('queued', 'retrying', 'waiting', 'waiting_for_user') THEN 'interrupted' ELSE "status" END,
+        "nextAttemptAt" = CASE WHEN "status" IN ('queued', 'retrying', 'waiting', 'waiting_for_user') THEN NULL ELSE "nextAttemptAt" END,
         "completedAt" = CASE WHEN "status" IN ('queued', 'retrying', 'waiting', 'waiting_for_user') THEN $3 ELSE "completedAt" END,
         "updatedAt" = $3 WHERE "sessionId" = $1 AND "rootTaskId" = $2
           AND "status" IN ('queued', 'running', 'retrying', 'waiting', 'waiting_for_user')`, [input.sessionId, input.rootTaskId, input.now])
@@ -277,6 +281,7 @@ export class PgSubagentTaskStore implements SubagentStore {
       const result = await client.query(`UPDATE "sub_agent_tasks" SET
         "interruptRequestedAt" = COALESCE("interruptRequestedAt", $4),
         "status" = CASE WHEN "status" IN ('queued', 'retrying', 'waiting', 'waiting_for_user') THEN 'interrupted' ELSE "status" END,
+        "nextAttemptAt" = CASE WHEN "status" IN ('queued', 'retrying', 'waiting', 'waiting_for_user') THEN NULL ELSE "nextAttemptAt" END,
         "completedAt" = CASE WHEN "status" IN ('queued', 'retrying', 'waiting', 'waiting_for_user') THEN $4 ELSE "completedAt" END,
         "updatedAt" = $4 WHERE "sessionId" = $1 AND "rootTaskId" = $2
           AND ("path" = $3 OR "path" LIKE $3 || '/%')
@@ -296,9 +301,10 @@ export class PgSubagentTaskStore implements SubagentStore {
         const interrupted = sessionClosed || row.interruptRequestedAt !== null
         const terminal = interrupted || Number(row.attemptCount) >= Number(row.maxAttempts)
         const status = terminal ? (interrupted ? "interrupted" : "failed") : "queued"
+        const nextAttemptAt = terminal ? null : computeSubagentNextAttemptAt(Number(row.attemptCount), input.now)
         await client.query(`UPDATE "sub_agent_tasks" SET "status" = $3, "leaseOwner" = NULL, "leaseExpiresAt" = NULL,
-          "completedAt" = CASE WHEN $4 THEN $5 ELSE NULL END, "updatedAt" = $5 WHERE "id" = $1 AND "sessionId" = $2`, [row.id, row.sessionId, status, terminal, input.now])
-        recovered.push({ ...rowToTask(row), status, leaseOwner: null, leaseExpiresAt: null })
+          "nextAttemptAt" = $4, "completedAt" = CASE WHEN $5 THEN $6 ELSE NULL END, "updatedAt" = $6 WHERE "id" = $1 AND "sessionId" = $2`, [row.id, row.sessionId, status, nextAttemptAt, terminal, input.now])
+        recovered.push({ ...rowToTask(row), status, nextAttemptAt, leaseOwner: null, leaseExpiresAt: null })
       }
       return recovered
     })
@@ -388,4 +394,5 @@ const INSERT_TASK = `INSERT INTO "sub_agent_tasks" (
 const SELECT_RECOVERABLE = `SELECT task.*, session."userId" AS "userId", session."status" AS "sessionStatus"
   FROM "sub_agent_tasks" task JOIN "agent_sessions" session ON session."id" = task."sessionId"
   WHERE task."status" = 'running' AND (task."leaseExpiresAt" IS NULL OR task."leaseExpiresAt" <= $1)
+    AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)
   ORDER BY task."updatedAt" ASC, task."id" ASC`

@@ -13,6 +13,7 @@ import {
   type SubagentTaskRecord,
   type SubagentTaskSpec,
 } from "./types.js"
+import { isSubagentRetryDue } from "./retry-policy.js"
 
 export interface SubagentClock {
   setInterval(handler: () => void, timeout: number): ReturnType<typeof setInterval>
@@ -78,6 +79,7 @@ export class AgentTreeManager {
     if (this.active.has(payload.taskId)) return null
     const task = await this.store.get(payload.taskId, payload.sessionId)
     if (!task || task.rootTaskId !== payload.rootTaskId) return null
+    if (task.status === "queued" && !isSubagentRetryDue(task.nextAttemptAt, now)) return null
     const policy = policyFromTask(task)
     const slot = this.limiter.reserve(payload.sessionId, payload.taskId, policy)
     const claimed = await this.store.claim({ ...payload, policy, now }).catch(error => {
@@ -87,7 +89,9 @@ export class AgentTreeManager {
     if (!claimed) {
       slot.release()
       const latest = await this.store.get(payload.taskId, payload.sessionId)
-      if (latest?.status === "queued") throw new SubagentLimitError("concurrency", "Session subagent concurrency is temporarily full")
+      if (latest?.status === "queued" && isSubagentRetryDue(latest.nextAttemptAt, now)) {
+        throw new SubagentLimitError("concurrency", "Session subagent concurrency is temporarily full")
+      }
       return null
     }
     const controller = new AbortController()

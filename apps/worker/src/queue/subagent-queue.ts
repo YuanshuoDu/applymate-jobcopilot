@@ -78,8 +78,9 @@ export async function repairMissingSubagentDispatches(pool: PgSubagentPool, owne
             AND turn."userId" = session."userId"
           LEFT JOIN "agent_outbox" AS dispatch
             ON dispatch."topic" = $1 AND dispatch."idempotencyKey" = 'subagent-dispatch:' || task."id"
-          WHERE task."sessionId" = session."id" AND task."status" IN ('queued', 'retrying')
-            AND task."interruptRequestedAt" IS NULL AND task."attemptCount" < task."maxAttempts"
+           WHERE task."sessionId" = session."id" AND task."status" IN ('queued', 'retrying')
+             AND task."interruptRequestedAt" IS NULL AND task."attemptCount" < task."maxAttempts"
+             AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)
             AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
             AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled')
             AND dispatch."id" IS NULL)
@@ -95,8 +96,9 @@ export async function repairMissingSubagentDispatches(pool: PgSubagentPool, owne
         AND turn."userId" = session."userId"
       LEFT JOIN "agent_outbox" AS dispatch
         ON dispatch."topic" = $2 AND dispatch."idempotencyKey" = 'subagent-dispatch:' || task."id"
-      WHERE task."status" IN ('queued', 'retrying')
-        AND task."interruptRequestedAt" IS NULL AND task."attemptCount" < task."maxAttempts"
+       WHERE task."status" IN ('queued', 'retrying')
+         AND task."interruptRequestedAt" IS NULL AND task."attemptCount" < task."maxAttempts"
+         AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)
         AND session."id" = ANY($1::text[])
         AND session."status" NOT IN ('aborted', 'archived')
         AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
@@ -114,8 +116,9 @@ export async function repairMissingSubagentDispatches(pool: PgSubagentPool, owne
           JOIN "sub_agent_tasks" AS root ON root."id" = task."rootTaskId" AND root."sessionId" = task."sessionId"
           JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
             AND turn."userId" = session."userId"
-          WHERE task."id" = $6 AND task."sessionId" = $3 AND task."status" IN ('queued', 'retrying')
-            AND task."interruptRequestedAt" IS NULL AND task."attemptCount" < task."maxAttempts"
+           WHERE task."id" = $6 AND task."sessionId" = $3 AND task."status" IN ('queued', 'retrying')
+             AND task."interruptRequestedAt" IS NULL AND task."attemptCount" < task."maxAttempts"
+             AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)
             AND session."status" NOT IN ('aborted', 'archived')
             AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
             AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled'))
@@ -157,10 +160,28 @@ export async function dispatchPendingSubagentOutbox(pool: PgSubagentPool, queue:
         const session = await client.query<{ id: string }>(`SELECT session."id" FROM "agent_sessions" AS session
           WHERE session."id" = $1 AND session."status" NOT IN ('aborted', 'archived') FOR UPDATE`, [row.aggregateId])
         if (!session.rows[0]) return false
-        const pending = await client.query<{ id: string }>(`SELECT dispatch."id" FROM "agent_outbox" AS dispatch
-          WHERE dispatch."id" = $1 AND dispatch."aggregateId" = $2
-            AND dispatch."topic" = $3 AND dispatch."publishedAt" IS NULL FOR UPDATE`,
-        [row.id, row.aggregateId, SUBAGENT_DISPATCH_TOPIC])
+         const pending = await client.query<{ id: string }>(`SELECT dispatch."id" FROM "agent_outbox" AS dispatch
+           JOIN "sub_agent_tasks" AS task
+             ON task."id" = dispatch."payload"->>'taskId' AND task."sessionId" = dispatch."aggregateId"
+           JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+           JOIN "sub_agent_tasks" AS root
+             ON root."id" = task."rootTaskId" AND root."sessionId" = task."sessionId" AND root."turnId" = task."turnId"
+           JOIN "agent_turns" AS turn
+             ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+            AND turn."userId" = session."userId"
+           WHERE dispatch."id" = $1 AND dispatch."aggregateId" = $2
+             AND dispatch."topic" = $3 AND dispatch."publishedAt" IS NULL
+             AND dispatch."payload"->>'sessionId' = task."sessionId"
+             AND dispatch."payload"->>'rootTaskId' = task."rootTaskId"
+             AND task."status" IN ('queued', 'retrying')
+             AND task."leaseOwner" IS NULL AND task."leaseExpiresAt" IS NULL
+             AND task."interruptRequestedAt" IS NULL AND task."attemptCount" < task."maxAttempts"
+             AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)
+             AND session."status" NOT IN ('aborted', 'archived')
+             AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
+             AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
+           FOR UPDATE OF dispatch, task`,
+         [row.id, row.aggregateId, SUBAGENT_DISPATCH_TOPIC])
         if (!pending.rows[0]) return false
         queueAddStarted = true
         try {
@@ -244,7 +265,7 @@ export function createSubagentQueue(options: { manager: AgentTreeManager; execut
   const queue = options.queue ?? new Queue<SubagentJobPayload>(SUBAGENT_QUEUE_NAME, { connection: redisConnection, skipVersionCheck: true })
   const worker = new Worker<SubagentJobPayload>(SUBAGENT_QUEUE_NAME, async (job: Pick<Job<SubagentJobPayload>, "data">) => {
     const payload = parseSubagentJobPayload(job.data); if (!payload) throw new TypeError("Invalid Subagent queue payload")
-    const outcome = await options.manager.run(payload, options.execute); if (outcome.status === "retrying" || outcome.status === "lease_lost") throw new Error(outcome.reason ?? "Subagent should be retried"); return outcome
+    const outcome = await options.manager.run(payload, options.execute); if (outcome.status === "lease_lost") throw new Error(outcome.reason ?? "Subagent lease was lost"); return outcome
   }, { connection: redisConnection, skipVersionCheck: true, ...workerPollingOptions(), concurrency: 8 })
   return { queue, worker, async close() { await worker.close(); await queue.close?.() } }
 }

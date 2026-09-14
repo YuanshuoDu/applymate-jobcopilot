@@ -138,6 +138,7 @@ describe("stale subagent dispatch recovery", () => {
     expect(fake.calls[taskIndex]?.[0]).toContain('task."startedAt" IS NOT NULL')
     expect(fake.calls[taskIndex]?.[0]).toContain('task."leaseOwner" IS NULL')
     expect(fake.calls[taskIndex]?.[0]).toContain('task."leaseExpiresAt" IS NULL')
+    expect(fake.calls[taskIndex]?.[0]).toContain('task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP')
     expect(fake.calls[taskIndex]?.[0]).toContain('task."interruptRequestedAt" IS NULL')
     expect(fake.calls[taskIndex]?.[0]).toContain('dispatch."publishedAt" < task."updatedAt"')
     expect(fake.calls[tenantIndex]?.[1]).toEqual(["user-1"])
