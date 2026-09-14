@@ -31,6 +31,12 @@ export type CoordinationMailboxConsumeResult = {
   readonly count: number
 }
 
+export type CoordinationMailboxOwnerFence = {
+  readonly ownerId: string
+  readonly attemptCount: number
+  readonly now: Date
+}
+
 export interface CoordinationStore {
   getTask(input: { userId: string; sessionId: string; taskId: string }): Promise<CoordinationTaskView | null>
   listTasks(input: { userId: string; sessionId: string; rootTaskId?: string; includeTerminal: boolean }): Promise<CoordinationTaskView[]>
@@ -56,6 +62,7 @@ export interface CoordinationStore {
     sessionId: string
     toTaskId: string
     messageIds: readonly string[]
+    owner: CoordinationMailboxOwnerFence
   }): Promise<CoordinationMailboxConsumeResult>
   getSpawnReplay(input: { userId: string; sessionId: string; idempotencyKey: string }): Promise<CoordinationTaskView | null>
   /** Records the operation and dispatches the task atomically. */

@@ -2,10 +2,22 @@ import type pg from "pg"
 import { describe, expect, it } from "vitest"
 
 import { PgCoordinationStore } from "./store.js"
-import type { CoordinationMailboxMessage, CoordinationTaskView } from "../tools/coordination-types.js"
+import type { CoordinationMailboxMessage, CoordinationMailboxOwnerFence, CoordinationTaskView } from "../tools/coordination-types.js"
 
 type QueryRecord = { sql: string; values: readonly unknown[] }
 type MailboxRow = { -readonly [Key in keyof CoordinationMailboxMessage]: CoordinationMailboxMessage[Key] }
+type OwnerTaskState = Pick<CoordinationTaskView, "status" | "attemptCount" | "leaseOwner" | "leaseExpiresAt" | "interruptRequestedAt">
+
+const ownerFence: CoordinationMailboxOwnerFence = {
+  ownerId: "worker-1", attemptCount: 2, now: new Date("2026-09-03T00:01:00.000Z"),
+}
+
+function activeOwnerTask(overrides: Partial<OwnerTaskState> = {}): OwnerTaskState {
+  return {
+    status: "running", attemptCount: ownerFence.attemptCount, leaseOwner: ownerFence.ownerId,
+    leaseExpiresAt: new Date("2026-09-03T00:02:00.000Z"), interruptRequestedAt: null, ...overrides,
+  }
+}
 
 const task: CoordinationTaskView = {
   id: "task-1", userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "task-1", parentTaskId: null,
@@ -31,9 +43,17 @@ class FakeClient {
     private readonly sessionStatus = "running",
     mailboxRows: readonly MailboxRow[] = [],
     private readonly sessionUser = "user-a",
+    private readonly ownerTask: OwnerTaskState = activeOwnerTask(),
   ) {
     this.rows = { ...task, createdAt: new Date("2026-09-03T00:00:00.000Z") }
     this.mailboxRows = mailboxRows.map(row => ({ ...row }))
+  }
+
+  private matchesOwner(taskId: string, sessionId: string, userId: string, ownerId: string, attemptCount: number, now: Date | null): boolean {
+    return this.mode === "task" && taskId === task.id && sessionId === task.sessionId && userId === this.sessionUser
+      && this.sessionStatus === "running" && this.ownerTask.status === "running" && this.ownerTask.leaseOwner === ownerId
+      && this.ownerTask.attemptCount === attemptCount && this.ownerTask.interruptRequestedAt === null
+      && this.ownerTask.leaseExpiresAt !== null && now !== null && this.ownerTask.leaseExpiresAt.getTime() > now.getTime()
   }
 
   async query(sql: unknown, values: readonly unknown[] = []): Promise<{ rows: Record<string, unknown>[]; rowCount: number }> {
@@ -43,11 +63,21 @@ class FakeClient {
     if (text.includes('FROM "agent_sessions"') && text.includes("FOR UPDATE") && text.includes('"status" NOT IN')) {
       return ["aborted", "archived"].includes(this.sessionStatus) || String(values[1]) !== this.sessionUser ? { rows: [], rowCount: 0 } : { rows: [{ id: "ok" }], rowCount: 1 }
     }
+    if (text.includes('FROM "sub_agent_tasks" AS target') && text.includes("FOR UPDATE")) {
+      const now = values[5] instanceof Date ? values[5] : null
+      const valid = this.matchesOwner(String(values[0]), String(values[1]), String(values[2]), String(values[3]), Number(values[4]), now)
+      return valid ? { rows: [{ id: task.id }], rowCount: 1 } : { rows: [], rowCount: 0 }
+    }
     if (text.includes('UPDATE "agent_mailbox_messages"')) {
       const sessionId = String(values[0])
+      const userId = String(values[1])
       const toTaskId = String(values[2])
       const requested = Array.isArray(values[3]) ? values[3].map(value => String(value)) : []
-      const confirmed = this.mailboxRows.filter(row => row.sessionId === sessionId && row.toTaskId === toTaskId && row.consumedAt === null && requested.includes(row.id))
+      const now = values[6] instanceof Date ? values[6] : null
+      const ownerValid = this.matchesOwner(sessionId === task.sessionId ? toTaskId : "", sessionId, userId, String(values[4]), Number(values[5]), now)
+      const confirmed = ownerValid
+        ? this.mailboxRows.filter(row => row.sessionId === sessionId && row.toTaskId === toTaskId && row.consumedAt === null && requested.includes(row.id))
+        : []
       for (const row of confirmed) row.consumedAt = new Date("2026-09-03T00:02:00.000Z")
       return { rows: confirmed.map(row => ({ id: row.id })), rowCount: confirmed.length }
     }
@@ -127,6 +157,58 @@ describe("PgCoordinationStore", () => {
     expect(closedClient.queries.some(query => query.sql.includes('FROM "agent_mailbox_messages"'))).toBe(false)
   })
 
+  it("consumes a mailbox row when the target task owner fence is current", async () => {
+    const client = new FakeClient("task", "running", [mailboxRow()])
+    const store = new PgCoordinationStore(pool(client))
+
+    await expect(store.consumeMessages({ userId: "user-a", sessionId: "session-a", toTaskId: "task-1", messageIds: ["message-1"], owner: ownerFence }))
+      .resolves.toEqual({ messageIds: ["message-1"], count: 1 })
+    expect(client.mailboxRows[0]?.consumedAt).toEqual(new Date("2026-09-03T00:02:00.000Z"))
+
+    const validation = client.queries.find(query => query.sql.includes('FROM "sub_agent_tasks" AS target') && query.sql.includes("FOR UPDATE"))
+    expect(validation?.sql).toContain('target."status" = \'running\'')
+    expect(validation?.sql).toContain('target."leaseOwner" = $4')
+    expect(validation?.sql).toContain('target."attemptCount" = $5')
+    expect(validation?.sql).toContain('target."interruptRequestedAt" IS NULL')
+    expect(validation?.sql).toContain('target."leaseExpiresAt" > $6')
+    expect(validation?.values).toEqual(["task-1", "session-a", "user-a", ownerFence.ownerId, ownerFence.attemptCount, ownerFence.now])
+
+    const update = client.queries.find(query => query.sql.includes('UPDATE "agent_mailbox_messages"'))
+    expect(update?.values).toEqual(["session-a", "user-a", "task-1", ["message-1"], ownerFence.ownerId, ownerFence.attemptCount, ownerFence.now])
+    expect(client.queries.map(query => query.sql)).toEqual(expect.arrayContaining(["BEGIN", "COMMIT"]))
+  })
+
+  it.each([
+    ["stale owner", { leaseOwner: "worker-stale" }],
+    ["wrong attempt", { attemptCount: ownerFence.attemptCount + 1 }],
+    ["interrupted task", { interruptRequestedAt: new Date("2026-09-03T00:00:30.000Z") }],
+    ["expired lease", { leaseExpiresAt: ownerFence.now }],
+    ["closed task", { status: "closed" }],
+  ] as const)("rejects consume for a %s owner fence before updating the mailbox", async (_label, overrides) => {
+    const client = new FakeClient("task", "running", [mailboxRow()], "user-a", activeOwnerTask(overrides))
+    const store = new PgCoordinationStore(pool(client))
+
+    await expect(store.consumeMessages({ userId: "user-a", sessionId: "session-a", toTaskId: "task-1", messageIds: ["message-1"], owner: ownerFence }))
+      .rejects.toMatchObject({ code: "coordination_mailbox_owner_conflict" })
+    expect(client.queries.some(query => query.sql.includes('UPDATE "agent_mailbox_messages"'))).toBe(false)
+    expect(client.mailboxRows[0]?.consumedAt).toBeNull()
+    expect(client.queries.map(query => query.sql)).toContain("ROLLBACK")
+  })
+
+  it.each([
+    ["closed session", { sessionStatus: "archived", sessionUser: "user-a" }],
+    ["foreign session", { sessionStatus: "running", sessionUser: "user-b" }],
+  ] as const)("fails closed for a %s before updating the mailbox", async (_label, options) => {
+    const client = new FakeClient("task", options.sessionStatus, [mailboxRow()], options.sessionUser)
+    const store = new PgCoordinationStore(pool(client))
+
+    await expect(store.consumeMessages({ userId: "user-a", sessionId: "session-a", toTaskId: "task-1", messageIds: ["message-1"], owner: ownerFence }))
+      .rejects.toMatchObject({ code: "coordination_scope_error" })
+    expect(client.queries.some(query => query.sql.includes('UPDATE "agent_mailbox_messages"'))).toBe(false)
+    expect(client.mailboxRows[0]?.consumedAt).toBeNull()
+    expect(client.queries.map(query => query.sql)).toContain("ROLLBACK")
+  })
+
   it("consumes only selected pending rows and makes repeated consume idempotent", async () => {
     const selected = mailboxRow({ id: "message-selected" })
     const second = mailboxRow({ id: "message-second" })
@@ -136,7 +218,7 @@ describe("PgCoordinationStore", () => {
     const client = new FakeClient("task", "running", [selected, second, alreadyConsumed, otherTask, foreign])
     const store = new PgCoordinationStore(pool(client))
 
-    const first = await store.consumeMessages({ userId: "user-a", sessionId: "session-a", toTaskId: "task-1", messageIds: [second.id, "missing", selected.id, second.id] })
+    const first = await store.consumeMessages({ userId: "user-a", sessionId: "session-a", toTaskId: "task-1", messageIds: [second.id, "missing", selected.id, second.id], owner: ownerFence })
     expect(first).toEqual({ messageIds: [second.id, selected.id], count: 2 })
     expect(client.mailboxRows.find(row => row.id === selected.id)?.consumedAt).toEqual(new Date("2026-09-03T00:02:00.000Z"))
     expect(client.mailboxRows.find(row => row.id === alreadyConsumed.id)?.consumedAt).toEqual(alreadyConsumed.consumedAt)
@@ -146,9 +228,9 @@ describe("PgCoordinationStore", () => {
     const update = client.queries.find(query => query.sql.includes('UPDATE "agent_mailbox_messages"'))
     expect(update?.sql).toContain('message."consumedAt" IS NULL')
     expect(update?.sql).not.toContain('deliveredAt')
-    expect(update?.values).toEqual(["session-a", "user-a", "task-1", [second.id, "missing", selected.id]])
+    expect(update?.values).toEqual(["session-a", "user-a", "task-1", [second.id, "missing", selected.id], ownerFence.ownerId, ownerFence.attemptCount, ownerFence.now])
 
-    const secondConsume = await store.consumeMessages({ userId: "user-a", sessionId: "session-a", toTaskId: "task-1", messageIds: [second.id, selected.id] })
+    const secondConsume = await store.consumeMessages({ userId: "user-a", sessionId: "session-a", toTaskId: "task-1", messageIds: [second.id, selected.id], owner: ownerFence })
     expect(secondConsume).toEqual({ messageIds: [], count: 0 })
     expect(client.queries.filter(query => query.sql.includes('UPDATE "agent_mailbox_messages"'))).toHaveLength(2)
   })
@@ -157,7 +239,7 @@ describe("PgCoordinationStore", () => {
     const client = new FakeClient("task", sessionStatus, [mailboxRow()])
     const store = new PgCoordinationStore(pool(client))
 
-    await expect(store.consumeMessages({ userId: "user-a", sessionId: "session-a", toTaskId: "task-1", messageIds: ["message-1"] }))
+    await expect(store.consumeMessages({ userId: "user-a", sessionId: "session-a", toTaskId: "task-1", messageIds: ["message-1"], owner: ownerFence }))
       .rejects.toMatchObject({ code: "coordination_scope_error" })
     expect(client.queries.some(query => query.sql.includes('UPDATE "agent_mailbox_messages"'))).toBe(false)
     expect(client.mailboxRows[0]?.consumedAt).toBeNull()

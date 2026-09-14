@@ -5,6 +5,7 @@ import type {
   CoordinationActivity,
   CoordinationMailboxConsumeResult,
   CoordinationMailboxMessage,
+  CoordinationMailboxOwnerFence,
   CoordinationMessage,
   CoordinationStore,
   CoordinationTaskView,
@@ -68,11 +69,12 @@ export class PgCoordinationStore implements CoordinationStore {
     })
   }
 
-  async consumeMessages(input: { userId: string; sessionId: string; toTaskId: string; messageIds: readonly string[] }): Promise<CoordinationMailboxConsumeResult> {
+  async consumeMessages(input: { userId: string; sessionId: string; toTaskId: string; messageIds: readonly string[]; owner: CoordinationMailboxOwnerFence }): Promise<CoordinationMailboxConsumeResult> {
+    const owner = mailboxOwnerFence(input.owner)
     const messageIds = uniqueMessageIds(input.messageIds)
     return transaction(this.pool, input.userId, async client => {
       await requireSession(client, input)
-      await requireTask(client, input.userId, input.sessionId, input.toTaskId, "Target task is unavailable")
+      await requireMailboxOwner(client, input, owner)
       if (messageIds.length === 0) return { messageIds: [], count: 0 }
       const result = await client.query(`UPDATE "agent_mailbox_messages" AS message
         SET "consumedAt" = CURRENT_TIMESTAMP
@@ -82,8 +84,11 @@ export class PgCoordinationStore implements CoordinationStore {
             WHERE session."id" = message."sessionId" AND session."userId" = $2
               AND session."status" NOT IN ('aborted', 'archived'))
           AND EXISTS (SELECT 1 FROM "sub_agent_tasks" AS target
-            WHERE target."id" = message."toTaskId" AND target."sessionId" = message."sessionId")
-        RETURNING message."id"`, [input.sessionId, input.userId, input.toTaskId, messageIds])
+            WHERE target."id" = message."toTaskId" AND target."sessionId" = message."sessionId"
+              AND target."id" = $3 AND target."sessionId" = $1 AND target."status" = 'running'
+              AND target."leaseOwner" = $5 AND target."attemptCount" = $6
+              AND target."interruptRequestedAt" IS NULL AND target."leaseExpiresAt" > $7)
+        RETURNING message."id"`, [input.sessionId, input.userId, input.toTaskId, messageIds, owner.ownerId, owner.attemptCount, owner.now])
       const consumedIds = result.rows.map(row => String(row.id))
       return { messageIds: orderMessageIds(messageIds, consumedIds), count: consumedIds.length }
     })
@@ -197,6 +202,16 @@ async function requireTask(client: Queryable, userId: string, sessionId: string,
 function taskRow(row: Record<string, unknown>): CoordinationTaskView {
   return { id: String(row.id), userId: String(row.userId), sessionId: String(row.sessionId), turnId: row.turnId ? String(row.turnId) : null, rootTaskId: String(row.rootTaskId ?? row.id), parentTaskId: row.parentTaskId ? String(row.parentTaskId) : null, path: String(row.path), depth: Number(row.depth), role: String(row.role), taskType: String(row.taskType), status: String(row.status) as CoordinationTaskView["status"], goal: String(row.goal), attemptCount: Number(row.attemptCount), maxAttempts: Number(row.maxAttempts), leaseOwner: row.leaseOwner ? String(row.leaseOwner) : null, leaseExpiresAt: row.leaseExpiresAt instanceof Date ? row.leaseExpiresAt : row.leaseExpiresAt ? new Date(String(row.leaseExpiresAt)) : null, interruptRequestedAt: row.interruptRequestedAt instanceof Date ? row.interruptRequestedAt : row.interruptRequestedAt ? new Date(String(row.interruptRequestedAt)) : null }
 }
+async function requireMailboxOwner(client: Queryable, input: { userId: string; sessionId: string; toTaskId: string }, owner: CoordinationMailboxOwnerFence): Promise<void> {
+  const result = await client.query(`SELECT target."id"
+    FROM "sub_agent_tasks" AS target
+    JOIN "agent_sessions" AS session ON session."id" = target."sessionId"
+    WHERE target."id" = $1 AND target."sessionId" = $2 AND session."userId" = $3
+      AND target."status" = 'running' AND target."leaseOwner" = $4 AND target."attemptCount" = $5
+      AND target."interruptRequestedAt" IS NULL AND target."leaseExpiresAt" > $6
+    FOR UPDATE`, [input.toTaskId, input.sessionId, input.userId, owner.ownerId, owner.attemptCount, owner.now])
+  if (!result.rows[0]) throw new CoordinationError("coordination_mailbox_owner_conflict", "Mailbox target task is not owned by the active lease")
+}
 function messageRow(row: Record<string, unknown>): CoordinationMessage { return { id: String(row.id), sessionId: String(row.sessionId), turnId: String(row.turnId), fromTaskId: row.fromTaskId ? String(row.fromTaskId) : null, toTaskId: String(row.toTaskId), kind: String(row.kind), idempotencyKey: String(row.idempotencyKey), createdAt: row.createdAt instanceof Date ? row.createdAt : new Date(String(row.createdAt)) } }
 function mailboxMessageRow(row: Record<string, unknown>): CoordinationMailboxMessage {
   return { ...messageRow(row), payload: row.payload, deliveredAt: nullableDate(row.deliveredAt), consumedAt: nullableDate(row.consumedAt) }
@@ -210,6 +225,17 @@ function uniqueMessageIds(ids: readonly string[]): string[] { return [...new Set
 function orderMessageIds(requested: readonly string[], confirmed: readonly string[]): string[] {
   const confirmedSet = new Set(confirmed)
   return requested.filter(id => confirmedSet.has(id))
+}
+function mailboxOwnerFence(value: unknown): CoordinationMailboxOwnerFence {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new CoordinationError("coordination_invalid_input", "Mailbox owner fence is invalid")
+  const row = value as Record<string, unknown>
+  const ownerId = row.ownerId
+  const attemptCount = row.attemptCount
+  const now = row.now
+  if (typeof ownerId !== "string" || ownerId.trim().length === 0) throw new CoordinationError("coordination_invalid_input", "Mailbox owner fence ownerId is invalid")
+  if (!Number.isSafeInteger(attemptCount) || Number(attemptCount) < 1) throw new CoordinationError("coordination_invalid_input", "Mailbox owner fence attemptCount is invalid")
+  if (!(now instanceof Date) || !Number.isFinite(now.getTime())) throw new CoordinationError("coordination_invalid_input", "Mailbox owner fence now is invalid")
+  return { ownerId, attemptCount: Number(attemptCount), now }
 }
 function json(value: unknown): string { return JSON.stringify(value ?? null) }
 function stableJson(value: unknown): string { if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`; if (value && typeof value === "object") return `{${Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, child]) => `${JSON.stringify(key)}:${stableJson(child)}`).join(",")}}`; return JSON.stringify(value) ?? "null" }
