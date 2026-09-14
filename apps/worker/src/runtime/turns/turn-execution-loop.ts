@@ -19,7 +19,7 @@ import { verifyPlanCompletion } from "../planning/plan-completion-verifier.js"
 import { buildPlanCompletionFeedback, buildPlanCompletionFeedbackEvent, currentPlanId, MAX_PLAN_COMPLETION_RECOVERY_ATTEMPTS, planCompletionFeedbackIdempotencyKey, PLAN_COMPLETION_FEEDBACK_EVENT_TYPE, planCompletionRecoveryCount } from "../planning/plan-completion-feedback.js"
 import { buildReplanFeedback, deriveReplanObligation, MAX_PLAN_REPLAN_FEEDBACK_ATTEMPTS, replanFeedbackAttempts, type ReplanObligation } from "../planning/plan-replan-obligation.js"
 import { runContextCompaction } from "../context/context-compaction-runtime.js"
-import type { StepContextSnapshot } from "../context/step-context-builder.js"
+import type { StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
 
 const DEFAULT_MAX_STEPS = 32
 const PLAN_OBSERVATION_MAX_BYTES = 8 * 1024
@@ -79,6 +79,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           scope: options.scope, identity: options.identity, stepId: step.id, snapshot,
           rootInputId: ordinal === 0 ? options.rootInputId : undefined, now: now(),
         })
+        const freshSteering = hasFreshSteering(context, consumedInputIds)
         inputThroughSequence = context.inputThroughSequence
         consumedInputIds = context.consumedInputIds
         const request = buildModelRequest({
@@ -86,13 +87,14 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           sessionId: options.identity.sessionId, turnId: options.identity.turnId, stepId: step.id,
           taskId: options.identity.taskId, userId: options.identity.userId, signal, continuation,
           replanRequired: obligationAfterCompaction !== undefined,
+          freshSteering,
         })
           assertModelAllowance(budget.snapshot())
         const reservation = budget.reserveModel()
         const output = await runModelStep(options.model, request, options.validateToolArguments)
         stepOutput = output; reservation.settle(output.usage ?? { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }); continuation = output.continuation ?? undefined
         const obligation = activeReplanObligation(options, snapshot)
-        const replanBatchAllowed = replanToolBatchAllowed(output.toolCalls, obligation)
+        const replanBatchAllowed = replanToolBatchAllowed(output.toolCalls, obligation, freshSteering)
         await writer.append(
           "model.usage", step.id, null,
           { provider: output.provider, model: output.model, usage: output.usage, taskId: options.identity.taskId },
@@ -311,8 +313,23 @@ async function rejectReplanOutput(options: TurnExecutionOptions, writer: TurnExe
   return appendReplanFeedback(options, writer, snapshot, obligation)
 }
 
-function replanToolBatchAllowed(toolCalls: readonly TurnEngineToolCall[], obligation: ReplanObligation | undefined): boolean {
-  return obligation === undefined || (toolCalls.length === 1 && toolCalls[0]?.name === "agent.plan.propose")
+function hasFreshSteering(context: StepContext, consumedInputIds: readonly string[]): boolean {
+  const consumedBeforeBuild = new Set(consumedInputIds)
+  const newlyConsumed = new Set(context.consumedInputIds.filter(inputId => !consumedBeforeBuild.has(inputId)))
+  return context.blocks.some(block => {
+    if (block.layer !== "pending_input" || block.role !== "data" || block.source !== "user_input" || block.trust !== "external_untrusted") return false
+    const content = block.content
+    if (!content || typeof content !== "object" || Array.isArray(content)) return false
+    const inputId = content.inputId
+    return typeof inputId === "string" && inputId.trim().length > 0 && newlyConsumed.has(inputId)
+  })
+}
+
+function replanToolBatchAllowed(toolCalls: readonly TurnEngineToolCall[], obligation: ReplanObligation | undefined, freshSteering: boolean): boolean {
+  if (obligation === undefined) return true
+  if (toolCalls.length !== 1) return false
+  const name = toolCalls[0]?.name
+  return name === "agent.plan.propose" || (freshSteering && name === "agent.goal.update")
 }
 
 async function assertCompletionAllowed(options: TurnExecutionOptions, writer: TurnExecutionEventWriter, step: TurnEngineStep, signal: AbortSignal, now: () => Date): Promise<void> {

@@ -94,6 +94,27 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
   return { options, events, notifications, planEvents, items, finalResponses, stepTasks, stepAttempts, stepStatuses, requests }
 }
 
+function addSteeringInput(root: Fixture, alreadyConsumed = false): void {
+  const inputId = "steer-1"
+  const baseBuilder = root.options.contextBuilder
+  const pending: StepContext["blocks"][number] = {
+    id: `${inputId}:part:0`, layer: "pending_input", role: "data", trust: "external_untrusted", source: "user_input",
+    content: { inputId, partIndex: 0, text: "Change the target to senior roles" },
+  }
+  root.options = {
+    ...root.options,
+    ...(alreadyConsumed ? {
+      resume: { nextOrdinal: 0, stepCount: 0, toolCallCount: 0, inputThroughSequence: 0n, consumedInputIds: [inputId], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
+    } : {}),
+    contextBuilder: {
+      build: async request => {
+        const context = await baseBuilder.build(request)
+        return { ...context, consumedInputIds: [...new Set([...context.consumedInputIds, inputId])], blocks: [...context.blocks, pending] }
+      },
+    },
+  }
+}
+
 const replanGoal: GoalContract = { revision: 1, objective: "Find jobs", constraints: [], successCriteria: [], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" }
 
 function replanGoalRef(): GoalContractRef {
@@ -118,6 +139,57 @@ function durableFailedWaitObservations(): Array<{ id: string; content: unknown }
 }
 
 describe("owner-agnostic turn execution loop", () => {
+  it("allows exactly one goal update for fresh steering while replanning", async () => {
+    const goalContract = { ...replanGoal, revision: 2, objective: "Find senior jobs" }
+    const goalReceipt = { status: "accepted", goalRevision: 2, basedOnGoalRevision: 1, goalContract }
+    const goalRef = replanGoalRef()
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, failedJoinObservations(), false, undefined, {
+      name: "agent.goal.update", arguments: { changes: { objective: "Find senior jobs" } }, output: goalReceipt,
+    }, false, goalRef)
+    addSteeringInput(root)
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "completed", stepCount: 2, toolCallCount: 1 })
+    expect(root.planEvents).toHaveLength(0)
+    expect(root.events.some(event => event.type === "goal.revision")).toBe(true)
+    expect(root.requests[0]?.messages[0]).toEqual(expect.objectContaining({ role: "system", content: [{ type: "text", text: expect.stringContaining("Fresh authenticated user steering") }] }))
+  })
+
+  it("does not treat an already consumed steer as fresh and keeps proposal-only enforcement", async () => {
+    const proposal: PlanProposal = { schemaVersion: PLAN_PROPOSAL_SCHEMA_VERSION, basedOnGoalRevision: 1, basedOnPlanRevision: 1, nodes: [], completionCriteria: [], briefRationale: "replan" }
+    const accepted = { status: "accepted" as const, goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1, proposal, intents: [], proposalHash: fingerprintPlanProposal(proposal) }
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, failedJoinObservations(), false, undefined, {
+      name: "agent.plan.propose", arguments: { proposal }, output: accepted,
+    }, false, replanGoalRef(), async ({ call }) => ({ id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, output: accepted, errorCode: null }))
+    addSteeringInput(root, true)
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "completed", stepCount: 2, toolCallCount: 1 })
+    expect(root.requests[0]?.messages[0]).toEqual(expect.objectContaining({ role: "system", content: [{ type: "text", text: expect.stringContaining("A child task failure requires replanning") }] }))
+    expect(root.requests[0]?.messages[0]).not.toEqual(expect.objectContaining({ content: [{ type: "text", text: expect.stringContaining("Fresh authenticated user steering") }] }))
+  })
+
+  it("rejects fresh steering mixed with a side-effect tool before execution", async () => {
+    let executions = 0
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, failedJoinObservations(), false, undefined, undefined, false, replanGoalRef(),
+      async ({ call }) => { executions += 1; return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, output: {}, errorCode: null } },
+      [{ name: "agent.goal.update", arguments: { changes: { objective: "Find senior jobs" } } }, { name: "jobs.search", arguments: { location: "Dublin" } }])
+    addSteeringInput(root)
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "failed", errorCode: "final_unverified", toolCallCount: 0 })
+    expect(executions).toBe(0)
+    expect(root.planEvents).toHaveLength(2)
+  })
+
+  it("keeps the obligation active when the fresh goal update fails", async () => {
+    const root = fixture(identity("turn", "root-1"), { id: "goal-call", toolName: "agent.goal.update", toolVersion: "1", status: "failed", output: null, errorCode: "goal_update_rejected" }, undefined, failedJoinObservations(), false, undefined, {
+      id: "goal-call", name: "agent.goal.update", arguments: { changes: { objective: "Find senior jobs" } },
+    }, false, replanGoalRef())
+    addSteeringInput(root)
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "failed", errorCode: "final_unverified", toolCallCount: 1 })
+    expect(root.events.some(event => event.type === "goal.revision")).toBe(false)
+    expect(root.planEvents).toHaveLength(2)
+  })
+
   it("blocks an unqualified final while a child failure replan obligation is active", async () => {
     const root = fixture(identity("turn", "root-1"), undefined, undefined, failedJoinObservations(), false, undefined, undefined, false, replanGoalRef())
     let calls = 0

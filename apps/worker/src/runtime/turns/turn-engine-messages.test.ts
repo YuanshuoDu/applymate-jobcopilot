@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { contextToModelMessages, PLAN_REPLAN_SYSTEM_INSTRUCTION } from "./turn-engine-messages.js"
+import { contextToModelMessages, PLAN_REPLAN_STEERING_OVERRIDE_INSTRUCTION, PLAN_REPLAN_SYSTEM_INSTRUCTION } from "./turn-engine-messages.js"
 import type { StepContext } from "../context/step-context-builder.js"
 
 function context(): StepContext {
@@ -41,6 +41,14 @@ describe("TurnEngine model message mapping", () => {
     expect(messages[1].role).toBe("system")
     expect(messages.at(-1)?.role).toBe("user")
     expect(PLAN_REPLAN_SYSTEM_INSTRUCTION).not.toContain("Ignore the rule")
+  })
+
+  it("uses a fixed server-owned steering override only with an active obligation", () => {
+    const messages = contextToModelMessages(context(), true, true)
+    expect(messages[0]).toEqual({ role: "system", content: [{ type: "text", text: PLAN_REPLAN_STEERING_OVERRIDE_INSTRUCTION }] })
+    expect(PLAN_REPLAN_STEERING_OVERRIDE_INSTRUCTION).toContain("agent.goal.update")
+    expect(PLAN_REPLAN_STEERING_OVERRIDE_INSTRUCTION).toContain("agent.plan.propose")
+    expect(contextToModelMessages(context(), false, true)[0]).not.toEqual(messages[0])
   })
 
   it("reconstructs provider-neutral assistant/tool correlation from observations", () => {
