@@ -106,10 +106,14 @@ export type SubagentLease = SubagentTaskRecord & {
   signal: AbortSignal
 }
 
+export type SubagentRetryDisposition = "retryable" | "terminal"
+
 export type SubagentExecutionResult = {
   status: "completed" | "waiting" | "waiting_for_user" | "failed"
   result?: unknown
   failureReason?: string
+  /** Server-owned retry policy for deterministic execution outcomes. */
+  retryDisposition?: SubagentRetryDisposition
   /** Mailbox rows read during this attempt; acknowledged only with terminal success. */
   mailboxMessageIds?: readonly string[]
 }
@@ -120,7 +124,7 @@ export type SubagentStore = {
   get(taskId: string, sessionId: string): Promise<SubagentTaskRecord | null>
   claim(input: { taskId: string; sessionId: string; ownerId: string; policy: SubagentPolicy; now: Date }): Promise<SubagentTaskRecord | null>
   heartbeat(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; now: Date }): Promise<"renewed" | "interrupted" | "lost">
-  finish(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; status: SubagentExecutionResult["status"]; result?: unknown; failureReason?: string; mailboxMessageIds?: readonly string[]; now: Date }): Promise<"completed" | "retrying" | "failed" | "waiting" | "waiting_for_user" | "interrupted" | null>
+  finish(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; status: SubagentExecutionResult["status"]; result?: unknown; failureReason?: string; retryDisposition?: SubagentRetryDisposition; mailboxMessageIds?: readonly string[]; now: Date }): Promise<"completed" | "retrying" | "failed" | "waiting" | "waiting_for_user" | "interrupted" | null>
   release?(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; now: Date }): Promise<boolean>
   close(input: { taskId: string; sessionId: string; now: Date }): Promise<boolean>
   interruptTree(input: { sessionId: string; rootTaskId: string; now: Date }): Promise<number>

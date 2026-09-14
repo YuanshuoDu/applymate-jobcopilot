@@ -21,6 +21,7 @@ class MemoryStore implements SubagentStore {
   readonly records = new Map<string, SubagentTaskRecord>()
   readonly finishCalls: Array<{ taskId: string; status: SubagentExecutionResult["status"]; attemptCount: number }> = []
   readonly finishMailboxMessageIds: Array<readonly string[] | undefined> = []
+  readonly finishRetryDispositions: Array<SubagentExecutionResult["retryDisposition"]> = []
   heartbeatResult: "renewed" | "interrupted" | "lost" | null = null
   private nextId = 1
 
@@ -67,13 +68,14 @@ class MemoryStore implements SubagentStore {
     return "renewed"
   }
 
-  async finish(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; status: SubagentExecutionResult["status"]; result?: unknown; failureReason?: string; mailboxMessageIds?: readonly string[]; now: Date }): Promise<"completed" | "retrying" | "failed" | "waiting" | "waiting_for_user" | "interrupted" | null> {
+  async finish(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; status: SubagentExecutionResult["status"]; result?: unknown; failureReason?: string; retryDisposition?: SubagentExecutionResult["retryDisposition"]; mailboxMessageIds?: readonly string[]; now: Date }): Promise<"completed" | "retrying" | "failed" | "waiting" | "waiting_for_user" | "interrupted" | null> {
     this.finishCalls.push({ taskId: input.taskId, status: input.status, attemptCount: input.attemptCount })
     this.finishMailboxMessageIds.push(input.mailboxMessageIds)
+    this.finishRetryDispositions.push(input.retryDisposition)
     const task = this.records.get(input.taskId)
     if (!task || task.sessionId !== input.sessionId || task.leaseOwner !== input.ownerId || task.status !== "running") return null
     const interrupted = task.interruptRequestedAt !== null
-    const retry = input.status === "failed" && !interrupted && task.attemptCount < task.maxAttempts
+    const retry = input.status === "failed" && !interrupted && input.retryDisposition !== "terminal" && task.attemptCount < task.maxAttempts
     const status = interrupted ? "interrupted" : retry ? "queued" : input.status
     this.records.set(task.id, { ...task, status, result: input.result ?? null, failureReason: input.failureReason ?? null, leaseOwner: null, leaseExpiresAt: null })
     if (interrupted) return "interrupted"
@@ -151,6 +153,18 @@ describe("AgentTreeManager", () => {
     expect(second.status).toBe("completed")
     expect(manager.activeCount(task.sessionId)).toBe(0)
     expect(store.records.get(task.id)?.status).toBe("completed")
+  })
+
+  it("forwards a terminal retry disposition without retrying the child", async () => {
+    const store = new MemoryStore()
+    const manager = new AgentTreeManager(store, { clock: new FakeClock() })
+    const task = await manager.spawn(spec({ policy: { maxAttempts: 2 } }))
+
+    await expect(manager.run(payload(task), async () => ({
+      status: "failed", failureReason: "child_resume_unavailable", retryDisposition: "terminal" as const,
+    }))).resolves.toMatchObject({ status: "failed" })
+    expect(store.finishRetryDispositions).toEqual(["terminal"])
+    expect(store.records.get(task.id)).toMatchObject({ status: "failed", leaseOwner: null, leaseExpiresAt: null })
   })
 
   it("forwards mailbox ids only for successful child completion", async () => {

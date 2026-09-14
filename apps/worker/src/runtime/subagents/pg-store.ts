@@ -8,6 +8,7 @@ import {
   type AtomicSubagentSpawnResult,
   type PgSubagentPool,
   type SubagentExecutionResult,
+  type SubagentRetryDisposition,
   type SubagentStore,
   type SubagentTaskRecord,
   type SubagentTaskSpec,
@@ -163,7 +164,7 @@ export class PgSubagentTaskStore implements SubagentStore {
     })
   }
 
-  async finish(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; status: SubagentExecutionResult["status"]; result?: unknown; failureReason?: string; mailboxMessageIds?: readonly string[]; now: Date }): Promise<"completed" | "retrying" | "failed" | "waiting" | "waiting_for_user" | "interrupted" | null> {
+  async finish(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; status: SubagentExecutionResult["status"]; result?: unknown; failureReason?: string; retryDisposition?: SubagentRetryDisposition; mailboxMessageIds?: readonly string[]; now: Date }): Promise<"completed" | "retrying" | "failed" | "waiting" | "waiting_for_user" | "interrupted" | null> {
     const mailboxMessageIds = uniqueMessageIds(input.mailboxMessageIds)
     try {
       return await transaction(this.pool, async (client) => {
@@ -183,7 +184,7 @@ export class PgSubagentTaskStore implements SubagentStore {
         const leaseExpiresAt = dateValue(row.leaseExpiresAt)
         if (!leaseExpiresAt || !Number.isFinite(leaseExpiresAt.getTime()) || leaseExpiresAt.getTime() <= input.now.getTime()) return null
         const interrupted = row.interruptRequestedAt !== null && row.interruptRequestedAt !== undefined
-        const retry = input.status === "failed" && !interrupted && Number(row.attemptCount) < Number(row.maxAttempts)
+        const retry = input.status === "failed" && !interrupted && input.retryDisposition !== "terminal" && Number(row.attemptCount) < Number(row.maxAttempts)
         const status = interrupted ? "interrupted" : retry ? "queued" : input.status
         const terminal = isTerminalSubagentStatus(status)
         const updated = await client.query(`UPDATE "sub_agent_tasks" SET "status" = $3, "result" = $4::jsonb,

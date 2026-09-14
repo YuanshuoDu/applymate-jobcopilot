@@ -252,6 +252,29 @@ describe("PgSubagentTaskStore", () => {
     expect(fake.calls.some(([sql]) => sql === "COMMIT")).toBe(false)
   })
 
+  it.each([
+    ["resume loader", "child_resume_unavailable"],
+    ["resume evidence hydration", "child_resume_evidence_unavailable"],
+  ] as const)("writes a terminal %s failure without resetting dispatch", async (_label, failureReason) => {
+    const fake = fakePool(sql => {
+      if (sql.includes('FROM "sub_agent_tasks" task')) return { rows: [taskRow({ status: "running", leaseOwner: "worker-1", attemptCount: 1, maxAttempts: 2, leaseExpiresAt: new Date(now.getTime() + 60_000) })], rowCount: 1 }
+      if (sql.startsWith('UPDATE "sub_agent_tasks"')) return { rowCount: 1 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.finish({
+      taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1,
+      status: "failed", failureReason, retryDisposition: "terminal", now,
+    })).resolves.toBe("failed")
+    const update = fake.calls.find(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks"'))
+    expect(update?.[0]).toContain('"status" = $3')
+    expect(update?.[0]).toContain('"leaseOwner" = NULL')
+    expect(update?.[0]).toContain('"leaseExpiresAt" = NULL')
+    expect(update?.[1]?.[2]).toBe("failed")
+    expect(fake.calls.some(([sql]) => sql.includes('UPDATE "agent_outbox"'))).toBe(false)
+  })
+
   it("completes the task and consumes the read mailbox ids in one transaction", async () => {
     const fake = fakePool(sql => {
       if (sql.includes('FROM "sub_agent_tasks" task')) return { rows: [taskRow({ status: "running", leaseOwner: "worker-1", attemptCount: 1, leaseExpiresAt: new Date(now.getTime() + 60_000) })], rowCount: 1 }

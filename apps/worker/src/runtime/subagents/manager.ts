@@ -123,7 +123,7 @@ export class AgentTreeManager {
       const status = await this.store.finish({
         taskId: payload.taskId, sessionId: payload.sessionId, ownerId: payload.ownerId,
         attemptCount: lease.attemptCount,
-        status: result.status, result: result.result, failureReason: result.failureReason, now: this.now(),
+        status: result.status, result: result.result, failureReason: result.failureReason, retryDisposition: result.retryDisposition, now: this.now(),
         ...(result.status === "completed" ? { mailboxMessageIds: result.mailboxMessageIds } : {}),
       })
       if (!status) return { taskId: payload.taskId, status: "lease_lost", reason: "Subagent lease was fenced" }

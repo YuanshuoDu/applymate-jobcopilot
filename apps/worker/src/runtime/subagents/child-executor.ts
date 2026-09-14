@@ -140,11 +140,11 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       try {
         const restored = await options.resumeLoader(lease)
         if (restored) {
-          try { hydrateObservedEvidence(observedEvidence, restored.observations) } catch { return { status: "failed", failureReason: "child_resume_evidence_unavailable" } }
+          try { hydrateObservedEvidence(observedEvidence, restored.observations) } catch { return { status: "failed", failureReason: "child_resume_evidence_unavailable", retryDisposition: "terminal" } }
           resume = restored.resume
           snapshot = { ...snapshot, toolObservations: [...restored.observations] }
         }
-      } catch { return { status: "failed", failureReason: "child_resume_unavailable" } }
+      } catch { return { status: "failed", failureReason: "child_resume_unavailable", retryDisposition: "terminal" } }
     }
     const adapter = await (options.modelRuntimeFactory?.({ task: lease }) ?? defaultModel(lease))
     const model = createUsageAwareModelAdapter(adapter, { owner, authorize: options.authorizeUsage, treeBudget: options.treeBudget })
