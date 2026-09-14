@@ -131,7 +131,7 @@ describe("child context", () => {
     expect(second.consumedInputIds).toEqual([])
   })
 
-  it("records only scoped mailbox ids once in stable read order across steps", async () => {
+  it("caches scoped mailbox blocks in stable order and appends only new messages", async () => {
     const listPendingMessages = vi.fn<ChildMailboxReader["listPendingMessages"]>()
       .mockResolvedValueOnce([
         mailboxMessage({ result: "second" }, { id: "message-2" }),
@@ -148,7 +148,43 @@ describe("child context", () => {
     const second = await builder.build({ ...request, stepId: "step-2" })
 
     expect(first.blocks.filter(block => block.layer === "pending_input").map(block => block.id)).toEqual(["mailbox:message-2", "mailbox:message-1"])
-    expect(second.blocks.filter(block => block.layer === "pending_input").map(block => block.id)).toEqual(["mailbox:message-1", "mailbox:message-3"])
+    expect(second.blocks.filter(block => block.layer === "pending_input").map(block => block.id)).toEqual(["mailbox:message-2", "mailbox:message-1", "mailbox:message-3"])
+    expect(second.blocks.find(block => block.id === "mailbox:message-1")?.content).toMatchObject({ payload: { result: "first" } })
     expect(builder.getMailboxMessageIds()).toEqual(["message-2", "message-1", "message-3"])
+  })
+
+  it("keeps the cache bounded and reports omitted valid messages", async () => {
+    const messages = Array.from({ length: 22 }, (_, index) => mailboxMessage({ order: index }, { id: `message-${index}` }))
+    const listPendingMessages = vi.fn<ChildMailboxReader["listPendingMessages"]>(async () => messages)
+    const builder = createChildContextBuilder(task, childContextSnapshot(task), { listPendingMessages })
+    const request = { scope: { userId: task.userId }, identity, stepId: "step-1", snapshot: childContextSnapshot(task) }
+
+    const first = await builder.build(request)
+    const second = await builder.build({ ...request, stepId: "step-2" })
+    const messageIds = (context: Awaited<ReturnType<typeof builder.build>>) => context.blocks
+      .filter(block => {
+        const content = block.content
+        return block.source === "subagent-mailbox" && content !== null && typeof content === "object" && !Array.isArray(content) && "messageId" in content
+      })
+      .map(block => block.id)
+
+    expect(messageIds(first)).toHaveLength(20)
+    expect(messageIds(second)).toEqual(messageIds(first))
+    expect(first.blocks.find(block => block.id === "mailbox:metadata")?.content).toEqual({ cachedMessageCount: 20, maxCachedMessageCount: 20, omittedMessageCount: 2, omittedMessageCountScope: "max_per_read" })
+    expect(second.blocks.find(block => block.id === "mailbox:metadata")?.content).toEqual({ cachedMessageCount: 20, maxCachedMessageCount: 20, omittedMessageCount: 2, omittedMessageCountScope: "max_per_read" })
+    expect(builder.getMailboxMessageIds()).toEqual(messages.slice(0, 20).map(message => message.id))
+  })
+
+  it("keeps cached ids when a later mailbox read fails", async () => {
+    const error = new Error("mailbox read failed on step two")
+    const listPendingMessages = vi.fn<ChildMailboxReader["listPendingMessages"]>()
+      .mockResolvedValueOnce([mailboxMessage({ result: "cached" })])
+      .mockRejectedValueOnce(error)
+    const builder = createChildContextBuilder(task, childContextSnapshot(task), { listPendingMessages })
+    const request = { scope: { userId: task.userId }, identity, stepId: "step-1", snapshot: childContextSnapshot(task) }
+
+    await builder.build(request)
+    await expect(builder.build({ ...request, stepId: "step-2" })).rejects.toBe(error)
+    expect(builder.getMailboxMessageIds()).toEqual(["mailbox-1"])
   })
 })

@@ -107,6 +107,22 @@ function mailboxBlock(message: CoordinationMailboxMessage): ContextBlock {
   })
 }
 
+function mailboxMetadataBlock(cachedMessageCount: number, omittedMessageCount: number): ContextBlock {
+  return seed("pending_input", "data", "external_untrusted", "subagent-mailbox", {
+    id: "mailbox:metadata",
+    content: {
+      cachedMessageCount,
+      maxCachedMessageCount: CHILD_MAILBOX_READ_LIMIT,
+      omittedMessageCount,
+      omittedMessageCountScope: "max_per_read",
+    },
+  })
+}
+
+function copyBlock(block: ContextBlock): ContextBlock {
+  return { ...block, content: json(block.content) }
+}
+
 export function childContextSnapshot(task: SubagentTaskRecord): StepContextSnapshot {
   return {
     system: [{ id: "child-execution", content: "Complete only this scoped child task. Use read tools permitted by the role policy." }],
@@ -136,7 +152,12 @@ function assertOwner(task: SubagentTaskRecord, identity: ExecutionOwnerFence, sc
 }
 
 export function createChildContextBuilder(task: SubagentTaskRecord, initial = childContextSnapshot(task), mailboxReader?: ChildMailboxReader): ChildContextBuilder {
-  const mailboxMessageIds = new Set<string>()
+  // Keep the first normalized block for each id. A Map preserves first-read
+  // order and prevents later reads from replacing an already visible payload.
+  const mailboxBlocks = new Map<string, ContextBlock>()
+  // This is the largest number of distinct valid rows omitted by one read.
+  // It reports the bounded overflow without retaining an unbounded id set.
+  let omittedMessageCount = 0
   return {
     async build(request: { scope: TenantScope; identity: ExecutionOwnerFence; stepId: string; snapshot: StepContextSnapshot }): Promise<StepContext> {
       assertOwner(task, request.identity, request.scope)
@@ -145,12 +166,19 @@ export function createChildContextBuilder(task: SubagentTaskRecord, initial = ch
         : []
       const scopedMessages = pendingMessages.filter(message => typeof message.id === "string" && message.id.length > 0 && message.sessionId === task.sessionId && message.toTaskId === task.id)
       const seenThisBuild = new Set<string>()
-      const uniqueMessages = scopedMessages.filter(message => {
-        if (seenThisBuild.has(message.id)) return false
+      let omittedThisBuild = 0
+      for (const message of scopedMessages) {
+        if (seenThisBuild.has(message.id) || mailboxBlocks.has(message.id)) continue
         seenThisBuild.add(message.id)
-        mailboxMessageIds.add(message.id)
-        return true
-      })
+        if (mailboxBlocks.size >= CHILD_MAILBOX_READ_LIMIT) {
+          omittedThisBuild += 1
+          continue
+        }
+        mailboxBlocks.set(message.id, mailboxBlock(message))
+      }
+      omittedMessageCount = Math.max(omittedMessageCount, omittedThisBuild)
+      const cachedMailboxBlocks = [...mailboxBlocks.values()].map(copyBlock)
+      if (omittedMessageCount > 0) cachedMailboxBlocks.push(mailboxMetadataBlock(mailboxBlocks.size, omittedMessageCount))
       const blocks: ContextBlock[] = [
         ...initial.system.map(item => seed("system", "instruction", "system", "child-harness", item)),
         // All task contract fields originate in a parent model request. Keep
@@ -159,11 +187,11 @@ export function createChildContextBuilder(task: SubagentTaskRecord, initial = ch
         ...(initial.goal ? [seed("goal", "data", "external_untrusted", "subagent-task", initial.goal)] : []),
         ...request.snapshot.steerHistory.map(item => ({ id: item.id, layer: "steer_history" as const, role: "data" as const, trust: "external_untrusted" as const, source: "child-steer", content: json(item.content) })),
         ...request.snapshot.toolObservations.map(item => seed("tool_observation", "data", "external_untrusted", "tool-or-subagent", item)),
-        ...uniqueMessages.map(mailboxBlock),
+        ...cachedMailboxBlocks,
       ]
       const result = { schemaVersion: "agent-harness.v2" as const, sessionId: task.sessionId, turnId: task.turnId!, stepId: request.stepId, inputThroughSequence: 0n, consumedInputIds: [], blocks }
       return { ...result, canonicalJson: JSON.stringify({ ...result, inputThroughSequence: "0" }) }
     },
-    getMailboxMessageIds: () => [...mailboxMessageIds],
+    getMailboxMessageIds: () => [...mailboxBlocks.keys()],
   }
 }
