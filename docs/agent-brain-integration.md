@@ -830,3 +830,10 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - The P4-61 waiting fixture now injects an independently typed wait port, so the production contract is unchanged and Worker type checking remains sound.
 - Astra independently verified the plan executor and coordination executor suites at **42/42** (24 + 18), the shared build through Worker test preflight, Worker `tsc --noEmit --skipLibCheck`, source line bounds, and `git diff --check`.
 - This remains a candidate increment: no live PostgreSQL/RLS transaction, Redis/BullMQ wakeup, process restart, cross-process concurrency, provider/browser behavior, or complete child-parent E2E was run. The cognitive gate remains disabled and overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-63 integration / verification
+
+- Integrated code commit: `567e006e`.
+- `list_subagents` now exposes bounded evidence for terminal child tasks. Completed, failed, interrupted, cancelled, and closed tasks return the existing server-owned 2 KiB sanitized result preview plus a 500-byte UTF-8 bounded failure reason. Queued, running, retrying, waiting, and waiting-for-user tasks always return `result: null` and `failureReason: null`, even if a stale store snapshot contains values. Recursive foreign identity, lease, capability, and budget keys remain stripped; the current-tree fence, ordering, `includeTerminal` behavior, and 50-row output bound remain intact.
+- The coordination output schema declares the additive evidence fields with `additionalProperties: false`. Focused executor and schema tests passed at **24/24**; Worker `tsc --noEmit --skipLibCheck`, the shared build through test preflight, and `git diff --check` also passed.
+- This remains a candidate increment: no live PostgreSQL/RLS transaction, Redis/BullMQ wakeup, process restart, cross-process concurrency, provider/browser behavior, or complete child-parent E2E was run. The cognitive gate remains disabled and overall acceptance remains **P0 accepted 1/8 (12.5%)**.
