@@ -6,6 +6,7 @@ import { createWorkerControlHandler, resolveWorkerAdminHost } from "./admin/cont
 import { bindWorkerControl, getWorkerRuntimeState, restoreWorkerRuntimeState } from "./admin/worker-state.js";
 import { closeSharedRedisConnections } from "./redis.js";
 import { workerHarnessFeatureHealth } from "./admin/harness-health.js";
+import { startSubagentMailboxOutboxConsumer } from "./runtime/mailbox/outbox-consumer.js";
 import { startAgentWakeupConsumer } from "./runtime/wakeup/consumer.js";
 import { resolveProductionAgentFlags } from "./runtime/production-agent-flags.js";
 import { createProductionContextCompactionOptions } from "./runtime/context/production-context-compaction.js";
@@ -112,6 +113,8 @@ async function main() {
 
   const agentWakeupConsumer = startAgentWakeupConsumer();
   console.log("[worker] Agent Turn wakeup consumer started");
+  const agentMailboxOutboxConsumer = startSubagentMailboxOutboxConsumer(pool);
+  console.log("[worker] Agent subagent mailbox outbox consumer started");
 
   const workerControls = {
     "apply-tasks": bindWorkerControl(applyQueue, applyWorker),
@@ -177,6 +180,7 @@ async function main() {
     await closeDeadLetterResources();
     automationScheduler.close();
     await closeAllSlots();
+    await agentMailboxOutboxConsumer.close();
     await agentWakeupConsumer.close();
     await closePool();
     await closeSharedRedisConnections();
