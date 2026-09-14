@@ -796,3 +796,10 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - The atomic completed-child mailbox acknowledgement now requires the canonical target task's `turnId` to equal the mailbox row's `turnId`, in addition to the existing session, task, owner, attempt, lease, root, and open-session fences. A cross-turn ID therefore cannot be consumed even if a future caller accidentally supplies a mixed ID set; unknown and already-consumed IDs remain idempotent.
 - Astra independently verified `pg-store.test.ts` at **47/47**, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check`.
 - This remains a candidate increment: no live PostgreSQL/RLS transaction, Redis/BullMQ delivery, process restart, cross-process concurrency, provider/browser behavior, or complete child-parent E2E was run. The cognitive gate remains disabled and overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-59 integration / verification
+
+- Integrated code commit: `29371dd4`.
+- Coordination `send_message` now requires the target task and optional runtime sender to belong to the server-owned current turn before any activity, mailbox, or outbox write. The PostgreSQL send path repeats the exact task-turn predicate as defense in depth; cross-turn sends fail closed while same-turn child-to-parent sends and idempotent retries remain unchanged.
+- Astra independently verified the coordination-executor and mailbox-store suites at **40/40** (15 + 25), Worker `tsc --noEmit --skipLibCheck`, the shared build through test preflight, and `git diff --check`.
+- This remains a candidate increment: no live PostgreSQL/RLS transaction, Redis/BullMQ wakeup, process restart, cross-process concurrency, provider/browser behavior, or complete child-parent E2E was run. The cognitive gate remains disabled and overall acceptance remains **P0 accepted 1/8 (12.5%)**.
