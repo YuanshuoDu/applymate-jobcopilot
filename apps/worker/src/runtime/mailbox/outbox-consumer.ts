@@ -162,7 +162,7 @@ async function deliverRow(client: Queryable, row: OutboxRow): Promise<void> {
   }
   const lineage = message.rows[0]
   // Session and lineage locks precede the task CAS; the dispatch reset is last.
-  if (lineage.deliveredAt === null) await wakeWaitingTask(client, payload, lineage)
+  await wakeWaitingTask(client, payload, lineage)
   if (lineage.deliveredAt === null) {
     await client.query(`UPDATE "agent_mailbox_messages" SET "deliveredAt" = CURRENT_TIMESTAMP
       WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "toTaskId" = $4 AND "deliveredAt" IS NULL`,

@@ -223,6 +223,20 @@ describe("subagent mailbox outbox consumer", () => {
     expect(fake.client.outboxRows[0]).toMatchObject({ publishedAt: expect.any(Date), attemptCount: 1, lastError: null })
   })
 
+  it("wakes a waiting target even when its delivery receipt already exists", async () => {
+    const deliveredAt = new Date("2026-09-14T09:59:00.000Z")
+    const fake = fakePool({ taskStatus: "waiting" })
+    fake.client.mailboxRows[0]!.deliveredAt = deliveredAt
+
+    await expect(drainSubagentMailboxOutbox(fake.pool)).resolves.toBe(1)
+
+    expect(fake.client.task.status).toBe("queued")
+    expect(fake.client.dispatch).toMatchObject({ publishedAt: null, attemptCount: 3, lastError: null })
+    expect(fake.client.mailboxRows[0]?.deliveredAt).toBe(deliveredAt)
+    expect(fake.client.calls.filter(call => call.sql.startsWith('UPDATE "agent_mailbox_messages"'))).toHaveLength(0)
+    expect(fake.client.calls.filter(call => call.sql.includes('SET "publishedAt" = NULL'))).toHaveLength(1)
+  })
+
   it("wakes a waiting target and resets its existing dispatch in the same transaction", async () => {
     const fake = fakePool({ taskStatus: "waiting", dispatchAttemptCount: 2, dispatchLastError: "stale" })
 
