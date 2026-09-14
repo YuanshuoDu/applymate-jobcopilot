@@ -768,3 +768,10 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Child mailbox payloads are normalized into deterministic JSON before context injection. Each payload is bounded to 8 KiB of UTF-8; oversized values become a server-owned `{truncated, byteLength, preview}` marker, with preview cut only at Unicode code-point boundaries. Message order, scoped IDs, metadata, and `external_untrusted` trust remain intact.
 - Astra independently verified the child-context suite at **9/9** and Worker `tsc --noEmit --skipLibCheck`; shared build ran through the test preflight and `git diff --check` passed.
 - This is a context-safety candidate only: no aggregate context cap, live PostgreSQL/RLS, Redis/BullMQ delivery, process restart, provider/browser behavior, or child-parent E2E was run. Overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-55 integration / verification
+
+- Integrated code commit: `9c2a0e05`.
+- Child mailbox context now keeps a per-execution bounded cache. Each build still performs the server-scoped pending read so newly visible messages can be appended, while the first normalized payload for an existing ID remains stable across model steps. The cache reuses the 20-message bound; overflow remains visible through an `external_untrusted` `mailbox:metadata` block with the per-read omitted count. Returned blocks are detached copies, so a model-step consumer cannot mutate the cache. Completion acknowledgement and mailbox ID forwarding remain on the P4-53 completed path only.
+- Root independently verified the child-context and child-executor suites at **37/37**, Worker `tsc --noEmit --skipLibCheck`, shared build through the test preflight, and `git diff --check`.
+- This remains a candidate increment: no full Worker suite, live PostgreSQL/RLS, Redis/BullMQ delivery, process restart, cross-process concurrency, provider/browser behavior, or complete child-parent E2E was run. The cognitive gate remains disabled and overall acceptance remains **P0 accepted 1/8 (12.5%)**.
