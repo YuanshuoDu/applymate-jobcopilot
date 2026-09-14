@@ -17,6 +17,7 @@ import { visibleToolPolicy } from "../subagents/role-policy.js"
 import { validateRoleResult } from "../subagents/role-results.js"
 import { assertMigratedRole, roleContract } from "../subagents/scout-analyst-contracts.js"
 import { validateBoundStructuredEvidence } from "./structured-replay-evidence.js"
+import { inspectJoinFailureEvidence, replanRequiredControl } from "./plan-replan-signal.js"
 
 const MAX_OBSERVATIONS = 8
 const MAX_RESULT_BYTES = 8 * 1024
@@ -193,7 +194,9 @@ function recordObservation(callId: string, recordValue: PlanCommandExecutionReco
 function controlObservation(callId: string, control: PlanControlRecord): { id: string; content: Record<string, unknown> } {
   const content = control.kind === "request_input"
     ? { kind: "plan_control", localId: control.localId, status: "waiting_for_user", question: control.question, ...(control.approvalBoundary ? { approvalBoundary: control.approvalBoundary } : {}) }
-    : { kind: "plan_control", localId: control.localId, status: "completion_proposed", dependsOn: [...control.dependsOn], completionCriteria: [...control.completionCriteria] }
+    : control.kind === "propose_completion"
+      ? { kind: "plan_control", localId: control.localId, status: "completion_proposed", dependsOn: [...control.dependsOn], completionCriteria: [...control.completionCriteria] }
+      : { kind: "plan_control", localId: control.localId, status: "replan_required", dependsOn: [...control.dependsOn], reason: control.reason, failedTaskIds: [...control.failedTaskIds] }
   return safeObservation(id("plan-control", callId, control.localId), content)
 }
 
@@ -373,10 +376,51 @@ function replayRuntime(
     const receipt = receipts.get(command.localId)
     if (command.kind === "join" && receipt?.status === "completed" && row(receipt.output)?.status === "waiting") replayJoinTaskIds(options, command, receipts, dispatched.commands)
   }
+  const currentReplanPrefix = `plan-control:${input.call.id}:`
+  const currentReplanObservations = input.snapshot.toolObservations.filter(observation => {
+    const content = row(observation.content)
+    return observation.id.startsWith(currentReplanPrefix) && content?.kind === "plan_control" && content.status === "replan_required"
+  })
+  const expectedReplanIds = new Set<string>()
+  for (const command of dispatched.commands) {
+    const receipt = receipts.get(command.localId)
+    if (command.kind !== "join" || receipt?.status !== "completed" || row(receipt.output)?.status !== "waiting") continue
+    const waitId = row(receipt.output)?.waitId
+    const replanId = id("plan-control", input.call.id, `${command.localId}:replan`)
+    const existing = currentReplanObservations.filter(observation => observation.id === replanId)
+    if (existing.length > 1) throw new CanonicalPlanError("invalid_plan_output")
+    if (typeof waitId !== "string" || !waitId.trim()) {
+      if (existing.length > 0) throw new CanonicalPlanError("invalid_plan_output")
+      continue
+    }
+    const resumed = replayWaitOutcome(input, options, command, receipts, dispatched.commands, waitId)
+    if (!resumed) {
+      if (existing.length > 0) throw new CanonicalPlanError("invalid_plan_output")
+      continue
+    }
+    const expectedRoles = new Map<string, string>()
+    const taskIds = replayJoinTaskIds(options, command, receipts, dispatched.commands, expectedRoles)
+    const inspection = inspectJoinFailureEvidence(resumed, taskIds)
+    if (!inspection.valid) throw new CanonicalPlanError("invalid_plan_output")
+    const control = replanRequiredControl(command.localId, command.dependsOn, inspection.failedTaskIds)
+    if (!control) {
+      if (existing.length > 0) throw new CanonicalPlanError("invalid_plan_output")
+      continue
+    }
+    const expected = controlObservation(input.call.id, control)
+    expectedReplanIds.add(expected.id)
+    if (existing.length > 0 && stableJson(existing[0]!.content) !== stableJson(expected.content)) throw new CanonicalPlanError("invalid_plan_output")
+  }
+  if (currentReplanObservations.some(observation => !expectedReplanIds.has(observation.id))) throw new CanonicalPlanError("invalid_plan_output")
   const observations: Array<{ readonly id: string; readonly content: Record<string, unknown> }> = []
   const observe = async (recordValue: PlanCommandExecutionRecord | PlanControlRecord): Promise<void> => {
     const observation = "result" in recordValue ? recordObservation(input.call.id, recordValue) : controlObservation(input.call.id, recordValue)
     if (receipts.has(recordValue.localId)) return
+    const existing = input.snapshot.toolObservations.find(candidate => candidate.id === observation.id)
+    if (existing) {
+      if (stableJson(existing.content) !== stableJson(observation.content)) throw new CanonicalPlanError("invalid_plan_output")
+      return
+    }
     observations.push(observation)
     if (options.persistOutcome) await options.persistOutcome(outcomeReceipt(input.call.id, planRevision, recordValue))
   }

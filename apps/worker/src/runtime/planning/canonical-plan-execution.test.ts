@@ -204,6 +204,82 @@ describe("createCanonicalPlanExecutionFactory", () => {
     else expect(result.wait).toBeUndefined()
   })
 
+  it("blocks static downstream commands and emits a durable child failure replan control", async () => {
+    const receipts: PlanCommandReceipt[] = []
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
+      if (request.toolName === "spawn_subagent") {
+        const taskId = request.id.endsWith(":first") ? "child-first" : "child-second"
+        return { ...request, status: "completed" as const, output: { taskId, rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" }, errorCode: null }
+      }
+      if (request.toolName === "wait_subagents") return {
+        ...request, status: "completed" as const,
+        output: { waitId: "wait-1", status: "ready", taskIds: ["child-first", "child-second"], matchedTaskIds: ["child-first", "child-second"], tasks: [
+          { taskId: "child-second", status: "cancelled", result: null, failureReason: "worker stopped" },
+          { taskId: "child-first", status: "failed", result: null, failureReason: "provider error" },
+        ] }, errorCode: null,
+      }
+      return { ...request, status: "completed" as const, output: { ok: true }, errorCode: null }
+    }) }
+    const hook = fixture(router, undefined, receipt => { receipts.push(receipt) }, undefined, undefined, undefined, ["use_tool", "delegate", "join"])
+    const plan = proposal([
+      delegate("first"), delegate("second"),
+      join("join", { inputRefs: ["first", "second"], dependsOn: ["first", "second"] }),
+      use("after", { dependsOn: ["join"] }),
+    ])
+    const result = await hook(input(output(plan)))
+    const control = result.observations.find(observation => {
+      if (!observation.content || typeof observation.content !== "object") return false
+      return "status" in observation.content && observation.content.status === "replan_required"
+    })
+    expect(result.wait).toBeUndefined()
+    expect(router.execute).toHaveBeenCalledTimes(3)
+    expect(control?.content).toMatchObject({ kind: "plan_control", localId: "join:replan", status: "replan_required", reason: "child_failure", failedTaskIds: ["child-first", "child-second"] })
+    expect(receipts.some(receipt => receipt.observationId === "plan-control:proposal-1:join:replan")).toBe(true)
+  })
+
+  it("keeps a ready join with only successful children flowing downstream", async () => {
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
+      if (request.toolName === "spawn_subagent") return { ...request, status: "completed" as const, output: { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" }, errorCode: null }
+      if (request.toolName === "wait_subagents") return { ...request, status: "completed" as const, output: { waitId: "wait-1", status: "ready", taskIds: ["child-1"], matchedTaskIds: ["child-1"], tasks: [{ taskId: "child-1", status: "completed", result: null, failureReason: null }] }, errorCode: null }
+      return { ...request, status: "completed" as const, output: { ok: true }, errorCode: null }
+    }) }
+    const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["use_tool", "delegate", "join"])
+    const result = await hook(input(output(proposal([delegate("child"), join(), use("after", { dependsOn: ["join"] })]))))
+    expect(result.wait).toBeUndefined()
+    expect(router.execute).toHaveBeenCalledTimes(3)
+    expect(result.observations.some(observation => JSON.stringify(observation.content).includes("replan_required"))).toBe(false)
+  })
+
+  it("replays a child failure replan signal without a second plan execution", async () => {
+    const plan = proposal([delegate("child"), join(), use("after", { dependsOn: ["join"] })])
+    const delegateObservation = { id: "plan-result:proposal-1:child", content: { kind: "plan_command", localId: "child", commandKind: "delegate", dependsOn: [], status: "completed", errorCode: null, output: { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" } } }
+    const joinObservation = { id: "plan-result:proposal-1:join", content: { kind: "plan_command", localId: "join", commandKind: "join", dependsOn: ["child"], status: "completed", errorCode: null, output: { waitId: "wait-1", status: "waiting", taskIds: ["child-1"], matchedTaskIds: [] } } }
+    const waitOutcome = { id: "wait-result:wait-1", content: { toolCallId: "wait:wait-1", toolName: "wait_subagents", input: { taskIds: ["child-1"], mode: "all" }, status: "completed", output: { waitId: "wait-1", status: "timed_out", targetTaskIds: ["child-1"], matchedTaskIds: [], tasks: [{ taskId: "child-1", status: "interrupted", result: null, failureReason: "lease expired" }] }, errorCode: null } }
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { ok: true }, errorCode: null })) }
+    const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["use_tool", "delegate", "join"])
+    const first = await hook(input(output(plan), "step-1", [delegateObservation, joinObservation, waitOutcome], true))
+    expect(first.wait).toBeUndefined()
+    expect(first.observations).toHaveLength(1)
+    expect(first.observations[0]?.content).toMatchObject({ localId: "join:replan", status: "replan_required", failedTaskIds: ["child-1"] })
+    expect(router.execute).not.toHaveBeenCalled()
+
+    const persisted = [...first.observations]
+    const second = await hook(input(output(plan), "step-1", [delegateObservation, joinObservation, waitOutcome, ...persisted], true))
+    expect(second).toEqual({ observations: [] })
+    expect(router.execute).not.toHaveBeenCalled()
+  })
+
+  it("rejects a replayed replan observation when failure evidence is clean", async () => {
+    const replay = replayWait("scout", {})
+    const clean = replay.observations.find(observation => observation.id === "wait-result:wait-1")
+    const forged = { id: "plan-control:proposal-1:join:replan", content: { kind: "plan_control", localId: "join:replan", status: "replan_required", dependsOn: ["child"], reason: "child_failure", failedTaskIds: ["child-1"] } }
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { ok: true }, errorCode: null })) }
+    const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["use_tool", "delegate", "join"])
+    const result = await hook(input(output(replay.plan), "step-1", [replay.observations[0]!, replay.observations[1]!, clean!, forged], true))
+    expect(observationCode(result)).toBe("invalid_plan_output")
+    expect(router.execute).not.toHaveBeenCalled()
+  })
+
   it("replays a waiting join without rerouting and resumes only from a strict consumed outcome", async () => {
     const proposalValue = proposal([delegate("child"), join(), use("after", { dependsOn: ["join"] })])
     const delegateObservation = { id: "plan-result:proposal-1:child", content: { kind: "plan_command", localId: "child", commandKind: "delegate", dependsOn: [], status: "completed", errorCode: null, output: { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" } } }

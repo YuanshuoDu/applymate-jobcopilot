@@ -7,6 +7,7 @@ type ControlCommand = Extract<PlanDispatchCommand, { kind: "request_input" | "pr
 export type PlanCommandExecutionStep = {
   readonly record: PlanCommandExecutionRecord
   readonly waiting: boolean
+  readonly blocked?: PlanControlRecord
 }
 
 export type PlanCommandSchedulerRuntime = Pick<PlanCommandExecutionRuntime, "parallelDelegateLimit"> & {
@@ -44,6 +45,10 @@ async function executeSerial(commands: readonly PlanDispatchCommand[], runtime: 
     runtime.storeOutput(step.record)
     if (step.waiting) return { status: "waiting", completed, waiting: step.record }
     completed.push(step.record)
+    if (step.blocked) {
+      await runtime.observe(step.blocked)
+      return { status: "blocked", completed, blocked: step.blocked }
+    }
   }
   return { status: "completed", completed }
 }
@@ -87,7 +92,7 @@ async function executeBatch(batch: readonly ReadyCommand[], runtime: PlanCommand
   const observed = await observeSettled(entries, runtime)
   if (observed.hasObserverError) throw observed.observerError
   if (observed.hasExecutionError) throw observed.executionError
-  const firstTerminal = observed.steps.findIndex(step => step.record.result.status !== "completed" || step.waiting)
+  const firstTerminal = observed.steps.findIndex(step => step.record.result.status !== "completed" || step.waiting || step.blocked)
   const terminalIndex = firstTerminal < 0 ? observed.steps.length : firstTerminal
   for (let index = 0; index < terminalIndex; index++) {
     const step = observed.steps[index]!
@@ -98,6 +103,12 @@ async function executeBatch(batch: readonly ReadyCommand[], runtime: PlanCommand
   }
   if (firstTerminal >= 0) {
     const terminal = observed.steps[firstTerminal]!
+    if (terminal.blocked) {
+      runtime.storeOutput(terminal.record)
+      completed.push(terminal.record)
+      await runtime.observe(terminal.blocked)
+      return { status: "blocked", completed, blocked: terminal.blocked }
+    }
     return terminal.record.result.status !== "completed" ? failed(completed, terminal) : { status: "waiting", completed, waiting: terminal.record }
   }
   for (const entry of batch) { done.add(entry.index); completedIds.add(entry.command.localId) }
@@ -136,6 +147,10 @@ async function executeParallel(commands: readonly PlanDispatchCommand[], runtime
     runtime.storeOutput(step.record)
     if (step.waiting) return { status: "waiting", completed, waiting: step.record }
     completed.push(step.record)
+    if (step.blocked) {
+      await runtime.observe(step.blocked)
+      return { status: "blocked", completed, blocked: step.blocked }
+    }
     done.add(first.index)
     completedIds.add(first.command.localId)
   }

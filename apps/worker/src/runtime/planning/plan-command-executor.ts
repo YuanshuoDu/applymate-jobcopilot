@@ -3,14 +3,12 @@ import { PLAN_MAX_NODES, isPlainJsonObject } from "./goal-plan-contract.js"
 import type { PlanDispatchCommand, PlanDispatchResult } from "./plan-intent-dispatcher.js"
 import { schedulePlanCommands, type PlanCommandExecutionStep, type PlanCommandSchedulerRuntime } from "./plan-command-scheduler.js"
 import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
+import { inspectJoinFailureEvidence, replanRequiredControl, type ReplanRequiredControl } from "./plan-replan-signal.js"
 const MAX_RESULT_BYTES = 8 * 1024
 const MAX_OUTPUTS = PLAN_MAX_NODES
 export type PlanCommandExecutionErrorCode = "runtime_unavailable" | "invalid_plan" | "router_result_mismatch" | "observer_failed" | "input_reference_unavailable" | "input_reference_conflict"
 export class PlanCommandExecutionError extends Error {
-  constructor(readonly code: PlanCommandExecutionErrorCode, message: string) {
-    super(message)
-    this.name = "PlanCommandExecutionError"
-  }
+  constructor(readonly code: PlanCommandExecutionErrorCode, message: string) { super(message); this.name = "PlanCommandExecutionError" }
 }
 type ExecutableCommand = Extract<PlanDispatchCommand, { kind: "tool_call" | "delegate" | "join" }>
 export type PlanJoinCommand = Extract<PlanDispatchCommand, { kind: "join" }>
@@ -28,9 +26,7 @@ export type PlanInputReferenceResolutionRequest = {
   readonly dependsOn: readonly string[]
   readonly outputs: ReadonlyMap<string, unknown>
 }
-export type PlanControlRecord =
-  | { readonly localId: string; readonly kind: "request_input"; readonly dependsOn: readonly string[]; readonly question: string; readonly approvalBoundary?: string }
-  | { readonly localId: string; readonly kind: "propose_completion"; readonly dependsOn: readonly string[]; readonly completionCriteria: readonly string[] }
+export type PlanControlRecord = { readonly localId: string; readonly kind: "request_input"; readonly dependsOn: readonly string[]; readonly question: string; readonly approvalBoundary?: string } | { readonly localId: string; readonly kind: "propose_completion"; readonly dependsOn: readonly string[]; readonly completionCriteria: readonly string[] } | ReplanRequiredControl
 export type PlanCommandExecutionRuntime = {
   readonly router?: { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> }
   readonly createContext?: (request: CommandContextRequest) => ToolRouterContext | Promise<ToolRouterContext>
@@ -84,7 +80,7 @@ function executable(value: unknown): value is ExecutableCommand {
     && typeof delegateInput.goal === "string" && Boolean(delegateInput.goal.trim())
     && strings(delegateInput.constraints) && strings(delegateInput.successCriteria) && strings(delegateInput.allowedActions)
 }
-function control(value: unknown): value is PlanControlRecord {
+function control(value: unknown): value is Exclude<PlanControlRecord, ReplanRequiredControl> {
   const command = row(value)
   if (!command || (command.kind !== "request_input" && command.kind !== "propose_completion")) return false
   if (typeof command.localId !== "string" || !command.localId.trim() || !strings(command.dependsOn)) return false
@@ -165,7 +161,8 @@ function validateJoinResult(value: unknown, expectedTaskIds: readonly string[]):
   const output = row(value)
   if (!output || !plainJson(output) || containsIdentityKey(output, new Set(["taskId"])) || !["waiting", "ready", "timed_out"].includes(String(output.status)) || typeof output.waitId !== "string" || !output.waitId.trim() || output.waitId.length > 256) throw new PlanCommandExecutionError("router_result_mismatch", "Wait router returned an invalid result")
   const status = output.status
-  const validTargets = status === "ready" || status === "timed_out" ? exactIds(output.taskIds, expectedTaskIds) : output.taskIds === undefined || exactIds(output.taskIds, expectedTaskIds)
+  const targetIds = output.taskIds ?? output.targetTaskIds
+  const validTargets = status === "ready" || status === "timed_out" ? exactIds(targetIds, expectedTaskIds) : targetIds === undefined || exactIds(targetIds, expectedTaskIds)
   const validMatches = validIds(output.matchedTaskIds, expectedTaskIds, status !== "ready")
   if (!validTargets || !validMatches) throw new PlanCommandExecutionError("router_result_mismatch", "Wait router returned an invalid result")
   const hasTasks = Object.prototype.hasOwnProperty.call(output, "tasks")
@@ -227,7 +224,8 @@ async function executeCommand(runtime: PlanCommandExecutionRuntime, command: Exe
     response = { ...requestValue, status: "failed", errorCode: "router_execution_failed" }
   }
   const record: PlanCommandExecutionRecord = { localId: command.localId, kind: command.kind, dependsOn: [...command.dependsOn], result: response }
-  return { record, waiting: command.kind === "join" && waitingJoin(response.output) }
+  let blocked: ReplanRequiredControl | undefined; if (command.kind === "join" && response.status === "completed") { const inspection = inspectJoinFailureEvidence(response.output, taskIds!); if (!inspection.valid) throw new PlanCommandExecutionError("router_result_mismatch", "Wait router returned invalid failure evidence"); blocked = replanRequiredControl(command.localId, command.dependsOn, inspection.failedTaskIds) }
+  return { record, waiting: command.kind === "join" && waitingJoin(response.output), ...(blocked ? { blocked } : {}) }
 }
 function parallelLimit(value: number | undefined): number | undefined {
   if (value === undefined) return undefined
