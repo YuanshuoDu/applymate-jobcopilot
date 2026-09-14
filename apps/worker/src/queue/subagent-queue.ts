@@ -1,25 +1,20 @@
 import { randomUUID } from "node:crypto"
 import { Queue, Worker, type Job } from "bullmq"
 import type pg from "pg"
-
 import { getPool } from "../db/apply-results.js"
 import { redisConnection } from "../redis.js"
 import { workerPollingOptions } from "./worker-polling-options.js"
 import { repairStaleSubagentDispatches } from "./subagent-dispatch-recovery.js"
+import { dispatchTaskInvalidReason, lockDispatchSession, lockDispatchTask, lockPendingDispatch, markDispatchTerminal } from "./subagent-dispatch-eligibility.js"
 import { AgentTreeManager } from "../runtime/subagents/manager.js"
 import { parseSubagentJobPayload, type PgSubagentPool, type SubagentJobPayload, type SubagentLease } from "../runtime/subagents/types.js"
-
 export const SUBAGENT_QUEUE_NAME = "agent-subagents"
 export const SUBAGENT_DISPATCH_TOPIC = "agent.subagent.dispatch"
 export const SUBAGENT_DISPATCH_POLL_MS = 30_000
 export const SUBAGENT_MAX_BATCH = 50
-export type SubagentQueueLike = {
-  add(name: string, payload: SubagentJobPayload, options?: { jobId?: string; attempts?: number; delay?: number }): Promise<unknown>
-  close?(): Promise<void>
-}
+export type SubagentQueueLike = { add(name: string, payload: SubagentJobPayload, options?: { jobId?: string; attempts?: number; delay?: number }): Promise<unknown>; close?(): Promise<void> }
 export type SubagentExecutor = (input: { lease: SubagentLease }) => Promise<{ status: "completed" | "waiting" | "waiting_for_user" | "failed"; result?: unknown; failureReason?: string }>
 type MissingDispatchRow = { id: string; sessionId: string; rootTaskId: string }
-
 /** BullMQ custom IDs reject colon characters; encode user controlled IDs. */
 export function subagentJobId(taskId: string, generation = 0): string {
   if (!Number.isSafeInteger(generation) || generation < 0) throw new RangeError("Subagent dispatch generation must be a non-negative integer")
@@ -28,21 +23,14 @@ export function subagentJobId(taskId: string, generation = 0): string {
 export function subagentDispatchKey(taskId: string): string { return `subagent-dispatch:${taskId}` }
 
 export async function enqueueSubagentTask(queue: SubagentQueueLike, payload: SubagentJobPayload, attempts = 3, generation = 0): Promise<void> {
-  if (!parseSubagentJobPayload(payload)) throw new TypeError("Invalid Subagent queue payload")
-  await queue.add("subagent", payload, { jobId: subagentJobId(payload.taskId, generation), attempts })
+  if (!parseSubagentJobPayload(payload)) throw new TypeError("Invalid Subagent queue payload"); await queue.add("subagent", payload, { jobId: subagentJobId(payload.taskId, generation), attempts })
 }
 
 async function transaction<T>(pool: PgSubagentPool, work: (client: pg.PoolClient) => Promise<T>): Promise<T> {
   const client = await pool.connect()
-  try {
-    await client.query("BEGIN")
-    const value = await work(client)
-    await client.query("COMMIT")
-    return value
-  } catch (error: unknown) {
-    await client.query("ROLLBACK").catch(() => undefined)
-    throw error
-  } finally { client.release() }
+  try { await client.query("BEGIN"); const value = await work(client); await client.query("COMMIT"); return value }
+  catch (error: unknown) { await client.query("ROLLBACK").catch(() => undefined); throw error }
+  finally { client.release() }
 }
 
 export async function persistSubagentDispatch(pool: PgSubagentPool, payload: SubagentJobPayload, resetPublished = false): Promise<void> {
@@ -56,11 +44,8 @@ export async function persistSubagentDispatch(pool: PgSubagentPool, payload: Sub
       ? `ON CONFLICT ("idempotencyKey") DO UPDATE SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL, "attemptCount" = "agent_outbox"."attemptCount" + 1
          WHERE "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"`
       : `ON CONFLICT ("idempotencyKey") DO NOTHING`
-    await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
-      SELECT $1, $2, $3, $4, $5::jsonb
-      WHERE EXISTS (SELECT 1 FROM "agent_sessions" AS session
-        WHERE session."id" = $3 AND session."status" NOT IN ('aborted', 'archived'))
-      ${conflict}`,
+    await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload") SELECT $1, $2, $3, $4, $5::jsonb
+      WHERE EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = $3 AND session."status" NOT IN ('aborted', 'archived')) ${conflict}`,
     [randomUUID(), SUBAGENT_DISPATCH_TOPIC, payload.sessionId, subagentDispatchKey(payload.taskId), JSON.stringify(payload)])
   })
 }
@@ -135,57 +120,51 @@ export async function dispatchPendingSubagentOutbox(pool: PgSubagentPool, queue:
   const rows = await transaction(pool, async client => {
     const result = await client.query<{ id: string; aggregateId: string; payload: unknown; attemptCount?: number }>(`SELECT dispatch."id", dispatch."aggregateId", dispatch."payload", dispatch."attemptCount"
       FROM "agent_outbox" AS dispatch
-      JOIN "agent_sessions" AS session
-        ON session."id" = dispatch."aggregateId"
-       AND session."status" NOT IN ('aborted', 'archived')
       WHERE dispatch."topic" = $1 AND dispatch."publishedAt" IS NULL
       ORDER BY dispatch."createdAt" ASC, dispatch."id" ASC
-      LIMIT $2 FOR UPDATE OF dispatch, session SKIP LOCKED`, [SUBAGENT_DISPATCH_TOPIC, limit])
+      LIMIT $2 FOR UPDATE OF dispatch SKIP LOCKED`, [SUBAGENT_DISPATCH_TOPIC, limit])
     return result.rows
   })
   let dispatched = 0
   for (const row of rows) {
-    const payload = parseSubagentJobPayload(row.payload)
-    if (!payload || payload.sessionId !== row.aggregateId) {
-      await markDispatchError(pool, row.id, "schema_invalid_payload", true)
-      continue
-    }
+    const scannedPayload = parseSubagentJobPayload(row.payload)
     let queueAddStarted = false
     let queueAddFailed = false
     let queueAddFailure: unknown
     try {
       const published = await transaction(pool, async client => {
-        // Hold the owning session fence across enqueue and publish marking. A
-        // close racing this transaction either waits for delivery or wins first.
-        const session = await client.query<{ id: string }>(`SELECT session."id" FROM "agent_sessions" AS session
-          WHERE session."id" = $1 AND session."status" NOT IN ('aborted', 'archived') FOR UPDATE`, [row.aggregateId])
-        if (!session.rows[0]) return false
-         const pending = await client.query<{ id: string }>(`SELECT dispatch."id" FROM "agent_outbox" AS dispatch
-           JOIN "sub_agent_tasks" AS task
-             ON task."id" = dispatch."payload"->>'taskId' AND task."sessionId" = dispatch."aggregateId"
-           JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
-           JOIN "sub_agent_tasks" AS root
-             ON root."id" = task."rootTaskId" AND root."sessionId" = task."sessionId" AND root."turnId" = task."turnId"
-           JOIN "agent_turns" AS turn
-             ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
-            AND turn."userId" = session."userId"
-           WHERE dispatch."id" = $1 AND dispatch."aggregateId" = $2
-             AND dispatch."topic" = $3 AND dispatch."publishedAt" IS NULL
-             AND dispatch."payload"->>'sessionId' = task."sessionId"
-             AND dispatch."payload"->>'rootTaskId' = task."rootTaskId"
-             AND task."status" IN ('queued', 'retrying')
-             AND task."leaseOwner" IS NULL AND task."leaseExpiresAt" IS NULL
-             AND task."interruptRequestedAt" IS NULL AND task."attemptCount" < task."maxAttempts"
-             AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)
-             AND session."status" NOT IN ('aborted', 'archived')
-             AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
-             AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
-           FOR UPDATE OF dispatch, task`,
-         [row.id, row.aggregateId, SUBAGENT_DISPATCH_TOPIC])
-        if (!pending.rows[0]) return false
+        if (!scannedPayload) {
+          const malformed = await lockPendingDispatch(client, { ...row, topic: SUBAGENT_DISPATCH_TOPIC })
+          if (malformed) await markDispatchTerminal(client, malformed.id, "schema_invalid_payload")
+          return false
+        }
+        const session = await lockDispatchSession(client, row.aggregateId)
+        if (!session) {
+          const missingSession = await lockPendingDispatch(client, { ...row, topic: SUBAGENT_DISPATCH_TOPIC })
+          if (missingSession) await markDispatchTerminal(client, missingSession.id, "session_missing")
+          return false
+        }
+        const task = await lockDispatchTask(client, { taskId: scannedPayload.taskId, sessionId: row.aggregateId, userId: session.userId })
+        const locked = await lockPendingDispatch(client, { ...row, topic: SUBAGENT_DISPATCH_TOPIC })
+        if (!locked) return false
+        const payload = parseSubagentJobPayload(locked.payload)
+        if (!payload || payload.sessionId !== locked.aggregateId || payload.taskId !== scannedPayload.taskId || payload.rootTaskId !== scannedPayload.rootTaskId) {
+          await markDispatchTerminal(client, locked.id, "schema_invalid_payload")
+          return false
+        }
+        if (session.status === "aborted" || session.status === "archived") {
+          await markDispatchTerminal(client, locked.id, "session_unavailable")
+          return false
+        }
+        const invalidReason = task ? dispatchTaskInvalidReason(task, payload, session.id, session.userId) : "task_missing"
+        if (invalidReason) {
+          if (invalidReason === "retry_deferred") return false
+          await markDispatchTerminal(client, locked.id, invalidReason)
+          return false
+        }
         queueAddStarted = true
         try {
-          await enqueueSubagentTask(queue, payload, 3, row.attemptCount ?? 0)
+          await enqueueSubagentTask(queue, payload, 3, locked.attemptCount ?? row.attemptCount ?? 0)
         } catch (error: unknown) {
           queueAddFailed = true
           queueAddFailure = error
@@ -194,7 +173,7 @@ export async function dispatchPendingSubagentOutbox(pool: PgSubagentPool, queue:
         await client.query(`UPDATE "agent_outbox" SET "publishedAt" = CURRENT_TIMESTAMP,
           "attemptCount" = "attemptCount" + 1, "lastError" = NULL
           WHERE "id" = $1 AND "aggregateId" = $2 AND "topic" = $3 AND "publishedAt" IS NULL`,
-        [row.id, row.aggregateId, SUBAGENT_DISPATCH_TOPIC])
+        [locked.id, locked.aggregateId, SUBAGENT_DISPATCH_TOPIC])
         return true
       })
       if (!published) continue
@@ -214,11 +193,10 @@ export async function dispatchPendingSubagentOutbox(pool: PgSubagentPool, queue:
 
 async function markDispatchError(pool: PgSubagentPool, id: string, error: string, terminal = false): Promise<void> {
   const client = await pool.connect()
-  try {
-    await client.query(`UPDATE "agent_outbox" SET "attemptCount" = "attemptCount" + 1,
-      "lastError" = $2, "publishedAt" = CASE WHEN $3 THEN CURRENT_TIMESTAMP ELSE "publishedAt" END
-      WHERE "id" = $1 AND "publishedAt" IS NULL`, [id, error, terminal])
-  } finally { client.release() }
+  try { await client.query(`UPDATE "agent_outbox" SET "attemptCount" = "attemptCount" + 1,
+    "lastError" = $2, "publishedAt" = CASE WHEN $3 THEN CURRENT_TIMESTAMP ELSE "publishedAt" END
+    WHERE "id" = $1 AND "publishedAt" IS NULL`, [id, error, terminal]) }
+  finally { client.release() }
 }
 
 export async function recoverSubagentQueue(pool: PgSubagentPool, queue: SubagentQueueLike, manager: AgentTreeManager, limit = SUBAGENT_MAX_BATCH): Promise<{ reclaimed: number; terminal: number; repaired: number; dispatched: number }> {
