@@ -534,7 +534,7 @@ describe("PgSubagentTaskStore", () => {
     expect(result).toHaveLength(1)
     expect(result[0].status).toBe("queued")
     const select = fake.calls.find(([sql]) => sql.includes("leaseExpiresAt") && sql.includes("FOR UPDATE"))?.[0] ?? ""
-    expect(select).toContain("LIMIT $2 FOR UPDATE OF task SKIP LOCKED")
+    expect(select).toContain("LIMIT $2 FOR UPDATE SKIP LOCKED")
   })
 
   it.each(["aborted", "archived"] as const)("reclaims a stale child from a %s session as interrupted", async status => {
