@@ -50,19 +50,46 @@ describe("plan replan obligation", () => {
   it.each([
     { name: "missing projection", observations: [join(), signal()] },
     { name: "missing join", observations: [projection("plan-1", 1, null), signal()] },
-    { name: "foreign goal", observations: [...activeObservations()], expectedGoalRevision: 2 },
     { name: "duplicate signal", observations: [...activeObservations(), signal()] },
     { name: "unsorted IDs", observations: [projection("plan-1", 1, null), join(), signal("plan-1", ["child-2", "child-1"])] },
     { name: "conflicting accepted revision", observations: [...activeObservations(), projection("other-plan", 1, null)] },
     { name: "revision gap", observations: [...activeObservations(), projection("plan-3", 3, 2)] },
-  ])("fails closed for $name", ({ observations, expectedGoalRevision = 1 }) => {
-    expect(deriveReplanObligation({ observations, expectedGoalRevision }).kind).toBe("invalid")
+  ])("fails closed for $name", ({ observations }) => {
+    expect(deriveReplanObligation({ observations, expectedGoalRevision: 1 }).kind).toBe("invalid")
   })
 
   it("accepts a legacy projection without an optional proposal hash", () => {
     const legacy = { ...projection("plan-1", 1, null) }
     delete (legacy.content as Record<string, unknown>).proposalHash
     expect(deriveReplanObligation({ observations: [legacy, join(), signal()], expectedGoalRevision: 1 }).kind).toBe("active")
+  })
+
+  it("ignores a valid obligation from a superseded goal revision", () => {
+    expect(deriveReplanObligation({ observations: activeObservations(), expectedGoalRevision: 2 })).toEqual({ kind: "none" })
+  })
+
+  it("ignores old history while enforcing the current goal obligation", () => {
+    const current = [projection("current-plan", 1, null, 2), join("current-plan"), signal("current-plan")]
+    const result = deriveReplanObligation({ observations: [...activeObservations(), ...current], expectedGoalRevision: 2 })
+    expect(result).toMatchObject({ kind: "active", obligation: { planCallId: "current-plan", goalRevision: 2 } })
+  })
+
+  it("fails closed for a future goal signal", () => {
+    const future = [projection("future-plan", 1, null, 2), join("future-plan"), signal("future-plan")]
+    expect(deriveReplanObligation({ observations: future, expectedGoalRevision: 1 })).toMatchObject({ kind: "invalid", reason: "future_replan_signal" })
+  })
+
+  it.each([
+    {
+      name: "malformed old signal",
+      observations: [projection("old-plan", 1, null, 1), join("old-plan"), { ...signal("old-plan"), content: { ...signal("old-plan").content, failedTaskIds: ["child-2", "child-1"] } }],
+    },
+    {
+      name: "malformed old plan",
+      observations: [{ ...projection("old-plan", 1, null, 1), content: { ...projection("old-plan", 1, null, 1).content, basedOnPlanRevision: 1 } }, join("old-plan"), signal("old-plan")],
+    },
+  ])("fails closed for $name instead of ignoring malformed history", ({ observations }) => {
+    expect(deriveReplanObligation({ observations, expectedGoalRevision: 2 }).kind).toBe("invalid")
   })
 
   it("rebuilds an active obligation from a durable failed wait when the control signal is missing", () => {

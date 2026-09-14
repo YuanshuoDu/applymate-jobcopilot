@@ -194,12 +194,19 @@ export function deriveReplanObligation(input: { readonly observations: readonly 
       if (!existing) signals.push(recovered)
     }
   }
-  if (signals.length === 0) return { kind: "none" }
+  const currentSignals: SignalEntry[] = []
   const active: ReplanObligation[] = []
   for (const item of signals) {
     if (signals.filter(candidate => candidate.observationId === item.observationId).length !== 1) return { kind: "invalid", reason: "duplicate_replan_signal" }
     const plan = projections.get(item.callId)
-    if (!plan || plan.goalRevision !== input.expectedGoalRevision || !joinMatches(input.observations, item)) return { kind: "invalid", reason: "orphan_replan_signal" }
+    if (!plan || !joinMatches(input.observations, item)) return { kind: "invalid", reason: "orphan_replan_signal" }
+    if (plan.goalRevision > input.expectedGoalRevision) return { kind: "invalid", reason: "future_replan_signal" }
+    if (plan.goalRevision < input.expectedGoalRevision) continue
+    currentSignals.push(item)
+  }
+  for (const item of currentSignals) {
+    const plan = projections.get(item.callId)
+    if (!plan) return { kind: "invalid", reason: "orphan_replan_signal" }
     const current = [...projections.values()].filter(candidate => candidate.goalRevision === input.expectedGoalRevision).sort((left, right) => left.planRevision - right.planRevision).at(-1)
     if (!current || current.planRevision < plan.planRevision) return { kind: "invalid", reason: "invalid_replan_revision" }
     if (current.planRevision === plan.planRevision) {

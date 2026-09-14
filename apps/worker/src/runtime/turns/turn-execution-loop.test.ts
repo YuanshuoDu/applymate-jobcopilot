@@ -206,6 +206,16 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.events.some(event => event.type === "turn.completed")).toBe(true)
   })
 
+  it("allows a new goal to proceed past stale failure evidence", async () => {
+    const current = { value: { ...replanGoal, revision: 2, objective: "New goal" } }
+    const goalRef: GoalContractRef = { get: () => current.value, update: next => { current.value = next } }
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, failedJoinObservations(), false, undefined, undefined, false, goalRef)
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "completed", stepCount: 2, toolCallCount: 1 })
+    expect(root.planEvents).toHaveLength(0)
+    expect(root.events.some(event => event.type === "turn.completed")).toBe(true)
+  })
+
   it("requires a server-owned completion proposal with completed same-plan dependencies when enabled", async () => {
     const root = fixture(identity("turn", "root-1"), undefined, undefined, [
       { id: "plan-result:plan:call:read", content: { kind: "plan_command", localId: "read", commandKind: "tool_call", dependsOn: [], status: "completed", errorCode: null, output: { job: "job-1" } } },
