@@ -868,3 +868,17 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Payloads are parsed and must match the database task/session/root IDs; mismatches fail closed. The update repeats all scope and lifecycle predicates, so a close, interrupt, lease reacquisition, terminal root/Turn, or concurrent repair wins without resetting the row.
 - Verification: Astra independently ran the stale-recovery and queue suites at **59/59**, `@jobcopilot/shared` build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check`.
 - Candidate boundary: no live PostgreSQL/RLS transaction, multi-worker lock race, Redis/BullMQ delivery, process restart, provider/browser behavior, or complete child-parent E2E was run. The timestamp comparison is a bounded recovery-gap heuristic until a live database run can validate its precision and operational metrics. The cognitive gate remains disabled and overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-68A - durable child mailbox hydration checkpoints
+
+- Code commit: `bacd6e8c` (pushed).
+- Added the server-owned `agent_mailbox_hydration_checkpoints` append-only table with tenant/session/Turn/root-task/task/attempt/step/message lineage, a per-session/task/attempt/message idempotency key, RLS isolation, and candidate-role insert/read-only grants. The Worker hydration transaction locks session -> target -> root -> Turn -> step -> checkpoint -> mailbox in that order, verifies the live owner/attempt/lease/interrupt fences, replays existing checkpoints, inserts missing message facts with `ON CONFLICT DO NOTHING`, and never mutates `deliveredAt`, `consumedAt`, outbox rows, task state, or the queue.
+- Root independently verified the hydration and mailbox-store suites at **46/46**, the shared build, Worker `tsc --noEmit --skipLibCheck`, Prisma schema validation with a non-production URL, and `git diff --check`.
+- Candidate boundary: the migration was not applied to a live database; RLS, concurrent transactions, process restart, queue delivery, and child-parent E2E remain for the final integration gate. The checkpoint table is durable storage; runtime consumption and completion acknowledgement remain unchanged.
+
+## P4-68B - child runtime durable hydration preference
+
+- Code commit: `40c3e65f` (pushed).
+- `ChildMailboxReader` now optionally exposes `hydrateMessages`. When available, every child context build passes the exact server-owned user/session/Turn/root/task/owner/attempt/step fence and the 20-message bound to durable hydration; the legacy pending reader remains the compatibility fallback. Durable hydration failures propagate instead of silently weakening the fence. Existing bounded cache, 8 KiB payload normalization, `external_untrusted` mailbox blocks, and completion-only acknowledgement IDs remain unchanged.
+- Root independently verified child context plus child executor at **43/43**, Worker `tsc --noEmit --skipLibCheck`, the shared build, and `git diff --check`.
+- Candidate boundary: production now resolves `PgCoordinationStore` (which implements the durable method), but no live migration/RLS, restart with a real worker process, cross-worker lock race, Redis/BullMQ delivery, provider/browser, or full child-parent E2E has been run. Overall acceptance remains **P0 accepted 1/8 (12.5%)**.
