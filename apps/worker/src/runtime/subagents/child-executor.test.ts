@@ -181,7 +181,7 @@ describe("child executor composition", () => {
       mailboxReader: { listPendingMessages },
     })
 
-    await expect(executor({ lease: child })).resolves.toMatchObject({ status: "completed" })
+    await expect(executor({ lease: child })).resolves.toMatchObject({ status: "completed", mailboxMessageIds: ["mailbox-child-1"] })
     expect(listPendingMessages).toHaveBeenCalledTimes(2)
     expect(JSON.stringify(requests[0]?.messages)).toContain("mailbox-child-1")
     expect(JSON.stringify(requests[0]?.messages)).toContain("UNTRUSTED_DATA")
@@ -480,6 +480,7 @@ describe("child executor composition", () => {
 
     const result = await executor({ lease: child })
     expect(result).toMatchObject({ status: "waiting", result: { status: "waiting_for_dependency" } })
+    expect(result).not.toHaveProperty("mailboxMessageIds")
     expect(result.result).not.toHaveProperty("finalText")
     expect(result.result).not.toHaveProperty("structuredResult")
   })

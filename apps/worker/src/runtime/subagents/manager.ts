@@ -124,6 +124,7 @@ export class AgentTreeManager {
         taskId: payload.taskId, sessionId: payload.sessionId, ownerId: payload.ownerId,
         attemptCount: lease.attemptCount,
         status: result.status, result: result.result, failureReason: result.failureReason, now: this.now(),
+        ...(result.status === "completed" ? { mailboxMessageIds: result.mailboxMessageIds } : {}),
       })
       if (!status) return { taskId: payload.taskId, status: "lease_lost", reason: "Subagent lease was fenced" }
       return { taskId: payload.taskId, status }

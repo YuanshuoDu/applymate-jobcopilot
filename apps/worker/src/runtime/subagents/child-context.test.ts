@@ -14,11 +14,12 @@ const task = {
 } satisfies SubagentTaskRecord
 const identity: ExecutionOwnerFence = { kind: "task", userId: task.userId, sessionId: task.sessionId, turnId: task.turnId!, taskId: task.id, rootTaskId: task.rootTaskId, ownerId: "worker-1", attemptCount: task.attemptCount, leaseExpiresAt: task.leaseExpiresAt! }
 
-function mailboxMessage(payload: unknown): CoordinationMailboxMessage {
+function mailboxMessage(payload: unknown, overrides: Partial<CoordinationMailboxMessage> = {}): CoordinationMailboxMessage {
   return {
     id: "mailbox-1", sessionId: task.sessionId, turnId: task.turnId!, fromTaskId: "sibling-1", toTaskId: task.id,
     kind: "research.result", payload, idempotencyKey: "mailbox-key-1", createdAt: new Date("2026-09-09T11:00:00.000Z"),
     deliveredAt: null, consumedAt: null,
+    ...overrides,
   }
 }
 
@@ -56,6 +57,7 @@ describe("child context", () => {
     })
     expect(context.inputThroughSequence).toBe(0n)
     expect(context.consumedInputIds).toEqual([])
+    expect(builder.getMailboxMessageIds()).toEqual(["mailbox-1"])
   })
 
   it("propagates mailbox reader errors without a fallback", async () => {
@@ -82,5 +84,26 @@ describe("child context", () => {
     expect(second.blocks.filter(block => block.layer === "pending_input")).toHaveLength(1)
     expect(second.inputThroughSequence).toBe(0n)
     expect(second.consumedInputIds).toEqual([])
+  })
+
+  it("records only scoped mailbox ids once in stable read order across steps", async () => {
+    const listPendingMessages = vi.fn<ChildMailboxReader["listPendingMessages"]>()
+      .mockResolvedValueOnce([
+        mailboxMessage({ result: "second" }, { id: "message-2" }),
+        mailboxMessage({ result: "foreign session" }, { id: "foreign-session", sessionId: "session-other" }),
+        mailboxMessage({ result: "first" }, { id: "message-1" }),
+        mailboxMessage({ result: "duplicate" }, { id: "message-2" }),
+        mailboxMessage({ result: "foreign task" }, { id: "foreign-task", toTaskId: "task-other" }),
+      ])
+      .mockResolvedValueOnce([mailboxMessage({ result: "first again" }, { id: "message-1" }), mailboxMessage({ result: "third" }, { id: "message-3" })])
+    const builder = createChildContextBuilder(task, childContextSnapshot(task), { listPendingMessages })
+    const request = { scope: { userId: task.userId }, identity, stepId: "step-1", snapshot: childContextSnapshot(task) }
+
+    const first = await builder.build(request)
+    const second = await builder.build({ ...request, stepId: "step-2" })
+
+    expect(first.blocks.filter(block => block.layer === "pending_input").map(block => block.id)).toEqual(["mailbox:message-2", "mailbox:message-1"])
+    expect(second.blocks.filter(block => block.layer === "pending_input").map(block => block.id)).toEqual(["mailbox:message-1", "mailbox:message-3"])
+    expect(builder.getMailboxMessageIds()).toEqual(["message-2", "message-1", "message-3"])
   })
 })

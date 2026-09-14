@@ -20,6 +20,7 @@ class FakeClock implements SubagentClock {
 class MemoryStore implements SubagentStore {
   readonly records = new Map<string, SubagentTaskRecord>()
   readonly finishCalls: Array<{ taskId: string; status: SubagentExecutionResult["status"]; attemptCount: number }> = []
+  readonly finishMailboxMessageIds: Array<readonly string[] | undefined> = []
   heartbeatResult: "renewed" | "interrupted" | "lost" | null = null
   private nextId = 1
 
@@ -66,8 +67,9 @@ class MemoryStore implements SubagentStore {
     return "renewed"
   }
 
-  async finish(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; status: SubagentExecutionResult["status"]; result?: unknown; failureReason?: string; now: Date }): Promise<"completed" | "retrying" | "failed" | "waiting" | "waiting_for_user" | "interrupted" | null> {
+  async finish(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; status: SubagentExecutionResult["status"]; result?: unknown; failureReason?: string; mailboxMessageIds?: readonly string[]; now: Date }): Promise<"completed" | "retrying" | "failed" | "waiting" | "waiting_for_user" | "interrupted" | null> {
     this.finishCalls.push({ taskId: input.taskId, status: input.status, attemptCount: input.attemptCount })
+    this.finishMailboxMessageIds.push(input.mailboxMessageIds)
     const task = this.records.get(input.taskId)
     if (!task || task.sessionId !== input.sessionId || task.leaseOwner !== input.ownerId || task.status !== "running") return null
     const interrupted = task.interruptRequestedAt !== null
@@ -149,6 +151,19 @@ describe("AgentTreeManager", () => {
     expect(second.status).toBe("completed")
     expect(manager.activeCount(task.sessionId)).toBe(0)
     expect(store.records.get(task.id)?.status).toBe("completed")
+  })
+
+  it("forwards mailbox ids only for successful child completion", async () => {
+    const store = new MemoryStore()
+    const manager = new AgentTreeManager(store, { clock: new FakeClock() })
+    const task = await manager.spawn(spec())
+
+    await expect(manager.run(payload(task), async () => ({ status: "completed", mailboxMessageIds: ["message-2", "message-1"] }))).resolves.toMatchObject({ status: "completed" })
+    expect(store.finishMailboxMessageIds).toEqual([["message-2", "message-1"]])
+
+    const retryTask = await manager.spawn(spec())
+    await expect(manager.run(payload(retryTask), async () => ({ status: "failed", mailboxMessageIds: ["should-not-consume"] }))).resolves.toMatchObject({ status: "retrying" })
+    expect(store.finishMailboxMessageIds).toEqual([["message-2", "message-1"], undefined])
   })
 
   it("propagates root interrupt to in-flight work and leaves no slot leak", async () => {

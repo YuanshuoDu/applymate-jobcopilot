@@ -163,34 +163,61 @@ export class PgSubagentTaskStore implements SubagentStore {
     })
   }
 
-  async finish(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; status: SubagentExecutionResult["status"]; result?: unknown; failureReason?: string; now: Date }): Promise<"completed" | "retrying" | "failed" | "waiting" | "waiting_for_user" | "interrupted" | null> {
-    return transaction(this.pool, async (client) => {
-      const task = await client.query(`${SELECT_TASK} FOR UPDATE`, [input.taskId, input.sessionId])
-      const row = task.rows[0] as Record<string, unknown> | undefined
-      if (!row || row.status !== "running" || row.leaseOwner !== input.ownerId) return null
-      const interrupted = row.interruptRequestedAt !== null && row.interruptRequestedAt !== undefined
-      const retry = input.status === "failed" && !interrupted && Number(row.attemptCount) < Number(row.maxAttempts)
-      const status = interrupted ? "interrupted" : retry ? "queued" : input.status
-      const terminal = isTerminalSubagentStatus(status)
-      const updated = await client.query(`UPDATE "sub_agent_tasks" SET "status" = $3, "result" = $4::jsonb,
-        "failureReason" = $5, "leaseOwner" = NULL, "leaseExpiresAt" = NULL,
-        "completedAt" = CASE WHEN $6 THEN $7 ELSE NULL END, "updatedAt" = $7
-        WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $8 AND "status" = 'running'
-          AND "attemptCount" = $9 AND "leaseExpiresAt" > CURRENT_TIMESTAMP
-          AND EXISTS (SELECT 1 FROM "agent_sessions" AS session
-            WHERE session."id" = "sub_agent_tasks"."sessionId"
-              AND session."status" NOT IN ('aborted', 'archived'))
+  async finish(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; status: SubagentExecutionResult["status"]; result?: unknown; failureReason?: string; mailboxMessageIds?: readonly string[]; now: Date }): Promise<"completed" | "retrying" | "failed" | "waiting" | "waiting_for_user" | "interrupted" | null> {
+    const mailboxMessageIds = uniqueMessageIds(input.mailboxMessageIds)
+    try {
+      return await transaction(this.pool, async (client) => {
+        const task = await client.query(`${SELECT_TASK}
+          AND task."status" = 'running' AND task."leaseOwner" = $3 AND task."attemptCount" = $4
+          AND task."leaseExpiresAt" > CURRENT_TIMESTAMP
+          AND session."status" NOT IN ('aborted', 'archived')
           AND EXISTS (SELECT 1 FROM "sub_agent_tasks" AS root JOIN "agent_turns" AS turn ON turn."id" = root."turnId"
-            WHERE root."id" = "sub_agent_tasks"."rootTaskId" AND root."sessionId" = "sub_agent_tasks"."sessionId"
+            WHERE root."id" = task."rootTaskId" AND root."sessionId" = task."sessionId"
               AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
-              AND turn."id" = "sub_agent_tasks"."turnId" AND turn."sessionId" = "sub_agent_tasks"."sessionId"
-              AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled'))`,
-      [input.taskId, input.sessionId, status, json(input.result, null), input.failureReason ?? null, terminal, input.now, input.ownerId, input.attemptCount])
-      if (updated.rowCount !== 1) return null
-      if (interrupted) return "interrupted"
-      if (retry) return "retrying"
-      return status as "completed" | "failed" | "waiting" | "waiting_for_user"
-    })
+              AND turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+              AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled'))
+          FOR UPDATE`, [input.taskId, input.sessionId, input.ownerId, input.attemptCount])
+        const row = task.rows[0] as Record<string, unknown> | undefined
+        if (!row || String(row.id) !== input.taskId || String(row.sessionId) !== input.sessionId
+          || row.status !== "running" || row.leaseOwner !== input.ownerId || Number(row.attemptCount) !== input.attemptCount) return null
+        const leaseExpiresAt = dateValue(row.leaseExpiresAt)
+        if (!leaseExpiresAt || !Number.isFinite(leaseExpiresAt.getTime()) || leaseExpiresAt.getTime() <= input.now.getTime()) return null
+        const interrupted = row.interruptRequestedAt !== null && row.interruptRequestedAt !== undefined
+        const retry = input.status === "failed" && !interrupted && Number(row.attemptCount) < Number(row.maxAttempts)
+        const status = interrupted ? "interrupted" : retry ? "queued" : input.status
+        const terminal = isTerminalSubagentStatus(status)
+        const updated = await client.query(`UPDATE "sub_agent_tasks" SET "status" = $3, "result" = $4::jsonb,
+          "failureReason" = $5, "leaseOwner" = NULL, "leaseExpiresAt" = NULL,
+          "completedAt" = CASE WHEN $6 THEN $7 ELSE NULL END, "updatedAt" = $7
+          WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $8 AND "status" = 'running'
+            AND "attemptCount" = $9 AND "leaseExpiresAt" > CURRENT_TIMESTAMP
+            AND EXISTS (SELECT 1 FROM "agent_sessions" AS session
+              WHERE session."id" = "sub_agent_tasks"."sessionId"
+                AND session."status" NOT IN ('aborted', 'archived'))
+            AND EXISTS (SELECT 1 FROM "sub_agent_tasks" AS root JOIN "agent_turns" AS turn ON turn."id" = root."turnId"
+              WHERE root."id" = "sub_agent_tasks"."rootTaskId" AND root."sessionId" = "sub_agent_tasks"."sessionId"
+                AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
+                AND turn."id" = "sub_agent_tasks"."turnId" AND turn."sessionId" = "sub_agent_tasks"."sessionId"
+                AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled'))`,
+        [input.taskId, input.sessionId, status, json(input.result, null), input.failureReason ?? null, terminal, input.now, input.ownerId, input.attemptCount])
+        if (updated.rowCount !== 1) throw new FinishFenceSignal()
+        if (status === "completed" && mailboxMessageIds.length > 0) {
+          await client.query(`UPDATE "agent_mailbox_messages" AS message
+            SET "consumedAt" = CURRENT_TIMESTAMP
+            WHERE message."sessionId" = $1 AND message."toTaskId" = $2
+              AND message."id" = ANY($3::text[]) AND message."consumedAt" IS NULL
+              AND EXISTS (SELECT 1 FROM "sub_agent_tasks" AS target
+                WHERE target."id" = $2 AND target."sessionId" = $1)`,
+          [input.sessionId, input.taskId, mailboxMessageIds])
+        }
+        if (interrupted) return "interrupted"
+        if (retry) return "retrying"
+        return status as "completed" | "failed" | "waiting" | "waiting_for_user"
+      })
+    } catch (error: unknown) {
+      if (error instanceof FinishFenceSignal) return null
+      throw error
+    }
   }
 
   async release(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; now: Date }): Promise<boolean> {
@@ -324,6 +351,7 @@ export class PgSubagentTaskStore implements SubagentStore {
 }
 
 class DuplicateSpawnSignal extends Error {}
+class FinishFenceSignal extends Error {}
 
 function asObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
@@ -331,6 +359,10 @@ function asObject(value: unknown): Record<string, unknown> {
 
 function actionList(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0) : []
+}
+
+function uniqueMessageIds(ids: readonly string[] | undefined): string[] {
+  return ids ? [...new Set(ids.filter(id => typeof id === "string" && id.length > 0))] : []
 }
 
 function dateValue(value: unknown): Date | null {

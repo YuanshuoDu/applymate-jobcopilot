@@ -138,9 +138,10 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       if (toolResult.status === "completed" && toolResult.errorCode === null) recordReadToolOutput(observedEvidence, input.call.toolName, toolResult.output)
       return toolResult
     }
+    const contextBuilder = createChildContextBuilder(lease, undefined, options.mailboxReader)
     const result = await runTurnExecutionLoop({
       identity: owner, scope: { userId: lease.userId }, goal: lease.goal, snapshot: childContextSnapshot(lease),
-      contextBuilder: createChildContextBuilder(lease, undefined, options.mailboxReader), store: options.store, model, tools: definitions,
+      contextBuilder, store: options.store, model, tools: definitions,
       executeTool, actorRole: policy.actorRole, capabilities: policy.capabilities,
       validateToolArguments: runtime.validateArguments, signal: lease.signal, now: options.now, publishReasoningSummary: false,
       contextCompaction: options.contextSnapshotAdapter?.hook,
@@ -162,10 +163,12 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       if (typeof result.finalText !== "string") return { status: "failed", result: { ...childResult, status: "failed" as const }, failureReason: "invalid_structured_result" }
       const structuredResult = parseAndBindStructuredResult(result.finalText, structuredRole, observedEvidence)
       if (!structuredResult) return { status: "failed", result: { ...childResult, status: "failed" as const }, failureReason: "invalid_structured_result" }
-      return { status: "completed", result: { ...childResult, finalText: projectChildFinalText(result.finalText), structuredResult }, failureReason: result.errorCode }
+      return { status: "completed", mailboxMessageIds: contextBuilder.getMailboxMessageIds(), result: { ...childResult, finalText: projectChildFinalText(result.finalText), structuredResult }, failureReason: result.errorCode }
     }
+    const status = resultStatus(result.status)
     return {
-      status: resultStatus(result.status),
+      status,
+      ...(status === "completed" ? { mailboxMessageIds: contextBuilder.getMailboxMessageIds() } : {}),
       result: { ...childResult, ...(result.status === "completed" && typeof result.finalText === "string" ? { finalText: projectChildFinalText(result.finalText) } : {}) },
       failureReason: result.errorCode,
     }

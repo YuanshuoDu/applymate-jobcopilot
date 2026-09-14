@@ -17,6 +17,11 @@ export type ChildMailboxReader = {
   }) => Promise<readonly CoordinationMailboxMessage[]>
 }
 
+export type ChildContextBuilder = {
+  build(request: { scope: TenantScope; identity: ExecutionOwnerFence; stepId: string; snapshot: StepContextSnapshot }): Promise<StepContext>
+  getMailboxMessageIds(): readonly string[]
+}
+
 function json(value: unknown): RepositoryJsonValue {
   if (value === null || typeof value === "string" || typeof value === "boolean") return value
   if (typeof value === "number") return Number.isFinite(value) ? value : null
@@ -80,13 +85,22 @@ function assertOwner(task: SubagentTaskRecord, identity: ExecutionOwnerFence, sc
   }
 }
 
-export function createChildContextBuilder(task: SubagentTaskRecord, initial = childContextSnapshot(task), mailboxReader?: ChildMailboxReader) {
+export function createChildContextBuilder(task: SubagentTaskRecord, initial = childContextSnapshot(task), mailboxReader?: ChildMailboxReader): ChildContextBuilder {
+  const mailboxMessageIds = new Set<string>()
   return {
     async build(request: { scope: TenantScope; identity: ExecutionOwnerFence; stepId: string; snapshot: StepContextSnapshot }): Promise<StepContext> {
       assertOwner(task, request.identity, request.scope)
       const pendingMessages = mailboxReader
         ? await mailboxReader.listPendingMessages({ userId: task.userId, sessionId: task.sessionId, toTaskId: task.id, limit: CHILD_MAILBOX_READ_LIMIT })
         : []
+      const scopedMessages = pendingMessages.filter(message => typeof message.id === "string" && message.id.length > 0 && message.sessionId === task.sessionId && message.toTaskId === task.id)
+      const seenThisBuild = new Set<string>()
+      const uniqueMessages = scopedMessages.filter(message => {
+        if (seenThisBuild.has(message.id)) return false
+        seenThisBuild.add(message.id)
+        mailboxMessageIds.add(message.id)
+        return true
+      })
       const blocks: ContextBlock[] = [
         ...initial.system.map(item => seed("system", "instruction", "system", "child-harness", item)),
         // All task contract fields originate in a parent model request. Keep
@@ -95,10 +109,11 @@ export function createChildContextBuilder(task: SubagentTaskRecord, initial = ch
         ...(initial.goal ? [seed("goal", "data", "external_untrusted", "subagent-task", initial.goal)] : []),
         ...request.snapshot.steerHistory.map(item => ({ id: item.id, layer: "steer_history" as const, role: "data" as const, trust: "external_untrusted" as const, source: "child-steer", content: json(item.content) })),
         ...request.snapshot.toolObservations.map(item => seed("tool_observation", "data", "external_untrusted", "tool-or-subagent", item)),
-        ...pendingMessages.map(mailboxBlock),
+        ...uniqueMessages.map(mailboxBlock),
       ]
       const result = { schemaVersion: "agent-harness.v2" as const, sessionId: task.sessionId, turnId: task.turnId!, stepId: request.stepId, inputThroughSequence: 0n, consumedInputIds: [], blocks }
       return { ...result, canonicalJson: JSON.stringify({ ...result, inputThroughSequence: "0" }) }
     },
+    getMailboxMessageIds: () => [...mailboxMessageIds],
   }
 }

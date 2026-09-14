@@ -229,6 +229,100 @@ describe("PgSubagentTaskStore", () => {
     expect(update?.[1]).toContain(1)
   })
 
+  it("completes the task and consumes the read mailbox ids in one transaction", async () => {
+    const fake = fakePool(sql => {
+      if (sql.includes('FROM "sub_agent_tasks" task')) return { rows: [taskRow({ status: "running", leaseOwner: "worker-1", attemptCount: 1, leaseExpiresAt: new Date(now.getTime() + 60_000) })], rowCount: 1 }
+      if (sql.includes('UPDATE "agent_mailbox_messages"')) return { rows: [{ id: "message-2" }, { id: "message-1" }], rowCount: 2 }
+      if (sql.startsWith('UPDATE "sub_agent_tasks"')) return { rowCount: 1 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.finish({
+      taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, status: "completed", now,
+      mailboxMessageIds: ["message-2", "unknown", "message-1", "message-2"],
+    })).resolves.toBe("completed")
+
+    const taskUpdateIndex = fake.calls.findIndex(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks"'))
+    const mailboxUpdateIndex = fake.calls.findIndex(([sql]) => sql.includes('UPDATE "agent_mailbox_messages"'))
+    const mailboxUpdate = fake.calls[mailboxUpdateIndex]
+    expect(taskUpdateIndex).toBeGreaterThan(-1)
+    expect(mailboxUpdateIndex).toBeGreaterThan(taskUpdateIndex)
+    expect(mailboxUpdate?.[0]).toContain('message."consumedAt" IS NULL')
+    expect(mailboxUpdate?.[1]).toEqual(["session-1", "task-1", ["message-2", "unknown", "message-1"]])
+    expect(fake.calls.map(([sql]) => sql)).toContain("BEGIN")
+    expect(fake.calls.map(([sql]) => sql)).toContain("COMMIT")
+  })
+
+  it("keeps completion idempotent when mailbox ids are unknown or already consumed", async () => {
+    const fake = fakePool(sql => {
+      if (sql.includes('FROM "sub_agent_tasks" task')) return { rows: [taskRow({ status: "running", leaseOwner: "worker-1", attemptCount: 1, leaseExpiresAt: new Date(now.getTime() + 60_000) })], rowCount: 1 }
+      if (sql.includes('UPDATE "agent_mailbox_messages"')) return { rows: [], rowCount: 0 }
+      if (sql.startsWith('UPDATE "sub_agent_tasks"')) return { rowCount: 1 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.finish({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, status: "completed", now, mailboxMessageIds: ["unknown", "unknown"] })).resolves.toBe("completed")
+    expect(fake.calls.filter(([sql]) => sql.includes('UPDATE "agent_mailbox_messages"'))).toHaveLength(1)
+    expect(fake.calls.map(([sql]) => sql)).toContain("COMMIT")
+  })
+
+  it.each([
+    ["terminal failure", 1],
+    ["retrying failure", 2],
+  ] as const)("does not consume mailbox ids for a %s", async (_label, maxAttempts) => {
+    const fake = fakePool(sql => {
+      if (sql.includes('FROM "sub_agent_tasks" task')) return { rows: [taskRow({ status: "running", leaseOwner: "worker-1", attemptCount: 1, maxAttempts, leaseExpiresAt: new Date(now.getTime() + 60_000) })], rowCount: 1 }
+      if (sql.startsWith('UPDATE "sub_agent_tasks"')) return { rowCount: 1 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.finish({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, status: "failed", failureReason: "provider failed", now, mailboxMessageIds: ["message-1"] })).resolves.toBe(maxAttempts === 1 ? "failed" : "retrying")
+    expect(fake.calls.some(([sql]) => sql.includes('UPDATE "agent_mailbox_messages"'))).toBe(false)
+  })
+
+  it.each([
+    ["foreign owner", { leaseOwner: "worker-foreign" }],
+    ["wrong attempt", { attemptCount: 2 }],
+    ["expired lease", { leaseExpiresAt: new Date(now.getTime() - 1) }],
+    ["foreign session", { sessionId: "session-other" }],
+  ] as const)("fences a finish from a %s", async (_label, overrides) => {
+    const fake = fakePool(sql => sql.includes('FROM "sub_agent_tasks" task') ? { rows: [taskRow({ status: "running", leaseOwner: "worker-1", attemptCount: 1, leaseExpiresAt: new Date(now.getTime() + 60_000), ...overrides })], rowCount: 1 } : {})
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.finish({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, status: "completed", now, mailboxMessageIds: ["message-1"] })).resolves.toBeNull()
+    expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
+    expect(fake.calls.some(([sql]) => sql.includes('UPDATE "agent_mailbox_messages"'))).toBe(false)
+  })
+
+  it("rolls back when the task update loses its fence", async () => {
+    const fake = fakePool(sql => {
+      if (sql.includes('FROM "sub_agent_tasks" task')) return { rows: [taskRow({ status: "running", leaseOwner: "worker-1", attemptCount: 1, leaseExpiresAt: new Date(now.getTime() + 60_000) })], rowCount: 1 }
+      if (sql.startsWith('UPDATE "sub_agent_tasks"')) return { rowCount: 0 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.finish({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, status: "completed", now, mailboxMessageIds: ["message-1"] })).resolves.toBeNull()
+    expect(fake.calls.map(([sql]) => sql)).toContain("ROLLBACK")
+    expect(fake.calls.some(([sql]) => sql.includes('UPDATE "agent_mailbox_messages"'))).toBe(false)
+  })
+
+  it("rolls back both writes when mailbox confirmation fails", async () => {
+    const fake = fakePool(sql => {
+      if (sql.includes('FROM "sub_agent_tasks" task')) return { rows: [taskRow({ status: "running", leaseOwner: "worker-1", attemptCount: 1, leaseExpiresAt: new Date(now.getTime() + 60_000) })], rowCount: 1 }
+      if (sql.includes('UPDATE "agent_mailbox_messages"')) throw new Error("mailbox unavailable")
+      if (sql.startsWith('UPDATE "sub_agent_tasks"')) return { rowCount: 1 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.finish({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, status: "completed", now, mailboxMessageIds: ["message-1"] })).rejects.toThrow("mailbox unavailable")
+    expect(fake.calls.map(([sql]) => sql)).toContain("ROLLBACK")
+  })
+
   it("does not report completion when the lease fence update loses a race", async () => {
     const fake = fakePool(sql => {
       if (sql.includes('FROM "sub_agent_tasks" task')) return { rows: [taskRow({ status: "running", leaseOwner: "worker-1", attemptCount: 1, leaseExpiresAt: new Date(now.getTime() + 60_000) })], rowCount: 1 }
