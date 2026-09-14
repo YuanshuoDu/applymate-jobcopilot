@@ -1,20 +1,29 @@
-import { Buffer } from "node:buffer"
-
 import { parsePlanRevisionEvent } from "./plan-revision-receipt.js"
 import { inspectJoinFailureEvidence } from "./plan-replan-signal.js"
 import { isPlainJsonObject } from "./goal-plan-contract.js"
+import {
+  buildReplanFeedback,
+  MAX_PLAN_REPLAN_FEEDBACK_ATTEMPTS,
+  PLAN_REPLAN_FEEDBACK_TEXT,
+  replanFeedbackAttempts,
+} from "./plan-replan-feedback.js"
 
 const MAX_OBSERVATIONS = 256
 const MAX_LOCAL_ID = 128
 const MAX_ID = 256
 const MAX_TASKS = 8
-const MAX_FEEDBACK_ATTEMPTS = 2
-const FEEDBACK_PREFIX = "plan-replan-feedback:"
-const FEEDBACK_TEXT = "Propose exactly one new accepted plan based on the failed plan revision before continuing."
 const SIGNAL_KEYS = ["kind", "localId", "status", "dependsOn", "reason", "failedTaskIds"]
 const PROJECTION_KEYS = ["kind", "planCallId", "goalRevision", "planRevision", "basedOnPlanRevision", "proposalHash"]
 const PROJECTION_KEYS_WITHOUT_HASH = PROJECTION_KEYS.filter(key => key !== "proposalHash")
 const RESULT_KEYS = ["kind", "localId", "commandKind", "dependsOn", "status", "errorCode", "output"]
+const WAIT_KEYS = ["waitId", "status", "taskIds", "matchedTaskIds", "tasks"]
+const WAIT_KEYS_WITH_TARGETS = [...WAIT_KEYS.slice(0, 1), "status", "taskIds", "targetTaskIds", "matchedTaskIds", "tasks"]
+const WAIT_KEYS_TARGET_ONLY = ["waitId", "status", "targetTaskIds", "matchedTaskIds", "tasks"]
+const WAITING_KEYS = ["waitId", "status", "taskIds", "matchedTaskIds"]
+const WAITING_KEYS_WITH_TARGETS = ["waitId", "status", "taskIds", "targetTaskIds", "matchedTaskIds"]
+const WAITING_KEYS_TARGET_ONLY = ["waitId", "status", "targetTaskIds", "matchedTaskIds"]
+const WAIT_RESULT_KEYS = ["toolCallId", "toolName", "input", "status", "output", "errorCode"]
+const WAIT_INPUT_KEYS = ["taskIds", "mode"]
 const FORBIDDEN_KEYS = new Set(["userId", "sessionId", "turnId", "stepId", "taskId", "parentTaskId", "rootTaskId", "ownerId", "leaseOwnerId", "leaseVersion", "idempotencyKey", "capabilities", "permissions", "allowedCapabilities", "budgetLimit", "maxBudget"])
 
 export type ReplanObligation = {
@@ -32,27 +41,23 @@ export type ReplanObligationResult =
   | { readonly kind: "active"; readonly obligation: ReplanObligation }
   | { readonly kind: "invalid"; readonly reason: string }
 
-export type ReplanFeedbackObservation = { readonly id: string; readonly content: Record<string, unknown> }
-
 type Observation = { readonly id: string; readonly content: unknown }
 type Projection = ReturnType<typeof parsePlanRevisionEvent>
 type SignalValue = { readonly callId: string; readonly joinLocalId: string; readonly failedTaskIds: readonly string[]; readonly dependsOn: readonly string[] }
+type SignalEntry = SignalValue & { readonly observationId: string }
+type WaitRecord = { readonly status: "waiting" | "ready" | "timed_out"; readonly waitId: string; readonly taskIds: readonly string[]; readonly matchedTaskIds: readonly string[]; readonly failedTaskIds: readonly string[] }
+type WaitLookup = { readonly kind: "missing" } | { readonly kind: "invalid" } | { readonly kind: "valid"; readonly record: WaitRecord }
 
 function row(value: unknown): Record<string, unknown> | null { return isPlainJsonObject(value) ? value : null }
 function exact(value: Record<string, unknown>, keys: readonly string[]): boolean { return Object.keys(value).length === keys.length && Object.keys(value).every(key => keys.includes(key)) }
 function id(value: unknown, limit = MAX_ID): value is string { return typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= limit }
 function integer(value: unknown, minimum: number): value is number { return typeof value === "number" && Number.isSafeInteger(value) && value >= minimum }
-function strings(value: unknown, limit: number, unique = true): value is readonly string[] {
-  return Array.isArray(value) && value.length > 0 && value.length <= MAX_TASKS && value.every(item => id(item, limit)) && (!unique || new Set(value).size === value.length)
+function strings(value: unknown, limit: number, unique = true, allowEmpty = false): value is readonly string[] {
+  return Array.isArray(value) && (allowEmpty || value.length > 0) && value.length <= MAX_TASKS && value.every(item => id(item, limit)) && (!unique || new Set(value).size === value.length)
 }
 function same(left: readonly string[], right: readonly string[]): boolean { return left.length === right.length && left.every((value, index) => value === right[index]) }
 function compare(left: string, right: string): number { return left < right ? -1 : left > right ? 1 : 0 }
 function sorted(value: readonly string[]): boolean { return value.every((item, index) => index === 0 || compare(value[index - 1]!, item) < 0) }
-function stable(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`
-  if (isPlainJsonObject(value)) return `{${Object.keys(value).sort(compare).map(key => `${JSON.stringify(key)}:${stable(value[key])}`).join(",")}}`
-  return JSON.stringify(value) ?? "null"
-}
 function foreign(value: unknown, allowed = new Set<string>(), seen = new Set<object>()): boolean {
   if (!value || typeof value !== "object" || seen.has(value)) return false
   if (Array.isArray(value)) { seen.add(value); const found = value.some(item => foreign(item, allowed, seen)); seen.delete(value); return found }
@@ -83,59 +88,72 @@ function signal(observation: Observation): { readonly value: { callId: string; j
   return { value: { callId, joinLocalId, failedTaskIds: content.failedTaskIds, dependsOn: content.dependsOn }, invalid: false }
 }
 
-function joinMatches(observations: readonly Observation[], item: SignalValue): boolean {
-  const matches = observations.filter(observation => observation.id === `plan-result:${item.callId}:${item.joinLocalId}`)
-  if (matches.length !== 1) return false
-  const content = row(matches[0]!.content)
-  if (!content || !exact(content, RESULT_KEYS) || content.kind !== "plan_command" || content.localId !== item.joinLocalId || content.commandKind !== "join" || content.status !== "completed" || content.errorCode !== null || !strings(content.dependsOn, MAX_LOCAL_ID) || !same(content.dependsOn, item.dependsOn)) return false
-  const output = row(content.output)
-  if (!output || foreign(output, new Set(["taskId"]))) return false
+function sameSet(left: readonly string[], right: readonly string[]): boolean { return left.length === right.length && [...left].sort(compare).every((value, index) => value === [...right].sort(compare)[index]) }
+
+function waitIds(output: Record<string, unknown>): { readonly taskIds: readonly string[]; readonly matchedTaskIds: readonly string[] } | null {
   const taskIds = output.taskIds
-  const targetIds = output.targetTaskIds
-  if (taskIds !== undefined && targetIds !== undefined && (!strings(taskIds, MAX_ID) || !strings(targetIds, MAX_ID) || !same([...taskIds].sort(compare), [...targetIds].sort(compare))) || (!strings(taskIds ?? targetIds, MAX_ID))) return false
-  const expected = (taskIds ?? targetIds) as readonly string[]
-  if (!Array.isArray(output.matchedTaskIds) || !output.matchedTaskIds.every(value => id(value, MAX_ID)) || new Set(output.matchedTaskIds).size !== output.matchedTaskIds.length || !output.matchedTaskIds.every(value => expected.includes(value))) return false
-  if (output.status === "ready" && !same([...output.matchedTaskIds].sort(compare), [...expected].sort(compare))) return false
-  const inspection = inspectJoinFailureEvidence(output, expected)
-  return inspection.valid && same(inspection.failedTaskIds, item.failedTaskIds)
+  const targetTaskIds = output.targetTaskIds
+  if (taskIds !== undefined && targetTaskIds !== undefined && (!strings(taskIds, MAX_ID) || !strings(targetTaskIds, MAX_ID) || !sameSet(taskIds, targetTaskIds))) return null
+  const selected = taskIds ?? targetTaskIds
+  if (!strings(selected, MAX_ID) || !strings(output.matchedTaskIds, MAX_ID, true, true) || !output.matchedTaskIds.every(value => selected.includes(value))) return null
+  return { taskIds: selected, matchedTaskIds: output.matchedTaskIds }
 }
 
-function feedbackId(turnId: string, obligation: ReplanObligation, attempt: number): string { return `${FEEDBACK_PREFIX}${turnId}:${obligation.planCallId}:${obligation.planRevision}:${attempt}` }
-
-function validObligation(value: ReplanObligation): boolean {
-  return Boolean(value) && typeof value === "object" && id(value.id) && id(value.sourceObservationId) && id(value.planCallId) && id(value.joinLocalId, MAX_LOCAL_ID) && integer(value.goalRevision, 1) && integer(value.planRevision, 1) && strings(value.failedTaskIds, MAX_ID) && sorted(value.failedTaskIds)
-}
-
-export function buildReplanFeedback(turnId: string, obligation: ReplanObligation, attempt: number): ReplanFeedbackObservation | null {
-  if (!id(turnId) || !validObligation(obligation) || !integer(attempt, 1) || attempt > MAX_FEEDBACK_ATTEMPTS) return null
-  const observation = { id: feedbackId(turnId, obligation, attempt), content: { kind: "plan_replan_feedback", status: "replan_required", attempt, obligationId: obligation.id, planCallId: obligation.planCallId, goalRevision: obligation.goalRevision, planRevision: obligation.planRevision, failedTaskIds: [...obligation.failedTaskIds], feedback: FEEDBACK_TEXT } }
-  return id(observation.id) && Buffer.byteLength(JSON.stringify(observation), "utf8") <= 8 * 1024 ? observation : null
-}
-
-export function replanFeedbackAttempts(observations: readonly Observation[], turnId: string, obligation: ReplanObligation): { readonly valid: true; readonly highest: number } | { readonly valid: false } {
-  if (!Array.isArray(observations) || observations.length > MAX_OBSERVATIONS || observations.some(observation => !observation || typeof observation.id !== "string" || !id(observation.id))) return { valid: false }
-  if (!id(turnId) || !validObligation(obligation)) return { valid: false }
-  const prefix = `${FEEDBACK_PREFIX}${turnId}:${obligation.planCallId}:${obligation.planRevision}:`
-  const matched = observations.filter(observation => observation.id.startsWith(prefix))
-  const attempts = new Set<number>()
-  for (const observation of matched) {
-    const parsedAttempt = Number(observation.id.slice(prefix.length))
-    if (!integer(parsedAttempt, 1) || parsedAttempt > MAX_FEEDBACK_ATTEMPTS || attempts.has(parsedAttempt)) return { valid: false }
-    const expected = buildReplanFeedback(turnId, obligation, parsedAttempt)
-    try {
-      if (!expected || stable(expected.content) !== stable(observation.content)) return { valid: false }
-    } catch {
-      return { valid: false }
-    }
-    attempts.add(parsedAttempt)
+function parseWaitOutput(value: unknown, expectedTaskIds?: readonly string[]): WaitRecord | null {
+  const output = row(value)
+  if (!output || foreign(output, new Set(["taskId"])) || !id(output.waitId) || !["waiting", "ready", "timed_out"].includes(String(output.status))) return null
+  const status = output.status as WaitRecord["status"]
+  const ids = waitIds(output)
+  if (!ids || (expectedTaskIds && !sameSet(ids.taskIds, expectedTaskIds))) return null
+  if (status === "waiting") {
+    if ((!exact(output, WAITING_KEYS) && !exact(output, WAITING_KEYS_WITH_TARGETS) && !exact(output, WAITING_KEYS_TARGET_ONLY))) return null
+    return { status, waitId: output.waitId, ...ids, failedTaskIds: [] }
   }
-  return { valid: true, highest: Math.max(0, ...attempts) }
+  if ((!exact(output, WAIT_KEYS) && !exact(output, WAIT_KEYS_WITH_TARGETS) && !exact(output, WAIT_KEYS_TARGET_ONLY)) || !Array.isArray(output.tasks)) return null
+  const inspection = inspectJoinFailureEvidence(output, ids.taskIds)
+  if (!inspection.valid || (status === "ready" && !sameSet(ids.matchedTaskIds, ids.taskIds))) return null
+  return { status, waitId: output.waitId, ...ids, failedTaskIds: inspection.failedTaskIds }
+}
+
+function joinRecord(observations: readonly Observation[], callId: string, joinLocalId: string): { readonly record: WaitRecord; readonly dependsOn: readonly string[] } | null {
+  const matches = observations.filter(observation => observation.id === `plan-result:${callId}:${joinLocalId}`)
+  if (matches.length !== 1) return null
+  const content = row(matches[0]!.content)
+  if (!content || !exact(content, RESULT_KEYS) || content.kind !== "plan_command" || content.localId !== joinLocalId || content.commandKind !== "join" || content.status !== "completed" || content.errorCode !== null || !strings(content.dependsOn, MAX_LOCAL_ID)) return null
+  const record = parseWaitOutput(content.output)
+  return record ? { record, dependsOn: content.dependsOn } : null
+}
+
+function durableWait(observations: readonly Observation[], join: WaitRecord): WaitLookup {
+  const matches = observations.filter(observation => observation.id === `wait-result:${join.waitId}`)
+  if (matches.length > 1) return { kind: "invalid" }
+  if (matches.length === 0) {
+    const claimsExpected = observations.filter(observation => observation.id.startsWith("wait-result:")).some(observation => {
+      const content = row(observation.content), output = row(content?.output)
+      return content?.toolCallId === `wait:${join.waitId}` || output?.waitId === join.waitId || (output && waitIds(output)?.taskIds && sameSet(waitIds(output)!.taskIds, join.taskIds))
+    })
+    return claimsExpected ? { kind: "invalid" } : { kind: "missing" }
+  }
+  const content = row(matches[0]!.content), input = row(content?.input)
+  if (!content || !exact(content, WAIT_RESULT_KEYS) || content.toolCallId !== `wait:${join.waitId}` || content.toolName !== "wait_subagents" || content.status !== "completed" || content.errorCode !== null || !input || !exact(input, WAIT_INPUT_KEYS) || foreign(input) || !strings(input.taskIds, MAX_ID) || input.mode !== "any" && input.mode !== "all" || !sameSet(input.taskIds, join.taskIds)) return { kind: "invalid" }
+  const record = parseWaitOutput(content.output, join.taskIds)
+  return record && record.status !== "waiting" && record.waitId === join.waitId ? { kind: "valid", record } : { kind: "invalid" }
+}
+
+function joinMatches(observations: readonly Observation[], item: SignalValue): boolean {
+  const join = joinRecord(observations, item.callId, item.joinLocalId)
+  if (!join || !strings(item.dependsOn, MAX_LOCAL_ID) || !same(join.dependsOn, item.dependsOn)) return false
+  const resolved = durableWait(observations, join.record)
+  if (resolved.kind === "invalid") return false
+  if (join.record.status !== "waiting" && resolved.kind === "valid" && (resolved.record.status !== join.record.status || !sameSet(resolved.record.taskIds, join.record.taskIds) || !sameSet(resolved.record.matchedTaskIds, join.record.matchedTaskIds))) return false
+  const evidence = resolved.kind === "valid" ? resolved.record : join.record
+  return evidence.status !== "waiting" && same(evidence.failedTaskIds, item.failedTaskIds)
 }
 
 export function deriveReplanObligation(input: { readonly observations: readonly Observation[]; readonly expectedGoalRevision: number }): ReplanObligationResult {
   if (!input || typeof input !== "object" || !Array.isArray(input.observations) || input.observations.length > MAX_OBSERVATIONS || input.observations.some(observation => !observation || typeof observation.id !== "string" || !id(observation.id)) || !integer(input.expectedGoalRevision, 1)) return { kind: "invalid", reason: "invalid_replan_scope" }
   const projections = new Map<string, NonNullable<Projection>>()
-  const signals: Array<{ observationId: string; callId: string; joinLocalId: string; failedTaskIds: readonly string[]; dependsOn: readonly string[] }> = []
+  const signals: SignalEntry[] = []
   for (const observation of input.observations) {
     const parsedProjection = projection(observation)
     if (parsedProjection?.invalid) return { kind: "invalid", reason: "invalid_plan_projection" }
@@ -145,7 +163,6 @@ export function deriveReplanObligation(input: { readonly observations: readonly 
     if (parsedSignal?.invalid) return { kind: "invalid", reason: "invalid_replan_signal" }
     if (parsedSignal) signals.push({ observationId: observation.id, ...parsedSignal.value })
   }
-  if (signals.length === 0) return { kind: "none" }
   const revisions = new Set<string>()
   for (const plan of projections.values()) {
     if (plan.goalRevision !== input.expectedGoalRevision) continue
@@ -159,6 +176,25 @@ export function deriveReplanObligation(input: { readonly observations: readonly 
     if (plan.planRevision !== (previousRevision === null ? 1 : previousRevision + 1) || plan.basedOnPlanRevision !== previousRevision) return { kind: "invalid", reason: "non_contiguous_plan_revision" }
     previousRevision = plan.planRevision
   }
+  for (const plan of orderedPlans) {
+    const joins = input.observations.filter(observation => observation.id.startsWith(`plan-result:${plan.planCallId}:`))
+    for (const observation of joins) {
+      const content = row(observation.content)
+      if (content?.kind !== "plan_command" || content.commandKind !== "join" || content.status !== "completed") continue
+      if (!id(content.localId, MAX_LOCAL_ID) || observation.id !== `plan-result:${plan.planCallId}:${content.localId}`) return { kind: "invalid", reason: "invalid_join_projection" }
+      const join = joinRecord(input.observations, plan.planCallId, content.localId)
+      if (!join) return { kind: "invalid", reason: "invalid_join_projection" }
+      if (join.record.status !== "waiting") continue
+      const resolved = durableWait(input.observations, join.record)
+      if (resolved.kind === "invalid") return { kind: "invalid", reason: "invalid_wait_projection" }
+      if (resolved.kind === "missing" || resolved.record.failedTaskIds.length === 0) continue
+      const recovered: SignalEntry = { observationId: `plan-control:${plan.planCallId}:${content.localId}:replan`, callId: plan.planCallId, joinLocalId: content.localId, failedTaskIds: resolved.record.failedTaskIds, dependsOn: join.dependsOn }
+      const existing = signals.find(candidate => candidate.observationId === recovered.observationId)
+      if (existing && (!same(existing.failedTaskIds, recovered.failedTaskIds) || !same(existing.dependsOn, recovered.dependsOn))) return { kind: "invalid", reason: "replan_wait_conflict" }
+      if (!existing) signals.push(recovered)
+    }
+  }
+  if (signals.length === 0) return { kind: "none" }
   const active: ReplanObligation[] = []
   for (const item of signals) {
     if (signals.filter(candidate => candidate.observationId === item.observationId).length !== 1) return { kind: "invalid", reason: "duplicate_replan_signal" }
@@ -177,4 +213,4 @@ export function deriveReplanObligation(input: { readonly observations: readonly 
   return active.length === 1 ? { kind: "active", obligation: active[0]! } : { kind: "none" }
 }
 
-export { FEEDBACK_TEXT as PLAN_REPLAN_FEEDBACK_TEXT, MAX_FEEDBACK_ATTEMPTS as MAX_PLAN_REPLAN_FEEDBACK_ATTEMPTS }
+export { buildReplanFeedback, MAX_PLAN_REPLAN_FEEDBACK_ATTEMPTS, PLAN_REPLAN_FEEDBACK_TEXT, replanFeedbackAttempts }

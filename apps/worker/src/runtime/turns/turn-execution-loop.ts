@@ -278,8 +278,18 @@ function replanSignalPresent(snapshot: StepContextSnapshot): boolean {
   })
 }
 
+function waitingJoinPresent(snapshot: StepContextSnapshot): boolean {
+  return snapshot.toolObservations.some(observation => {
+    if (!observation.id.startsWith("plan-result:")) return false
+    const content = observation.content
+    if (!content || typeof content !== "object" || Array.isArray(content)) return false
+    return "commandKind" in content && content.commandKind === "join" && "status" in content && content.status === "completed" && "output" in content &&
+      content.output !== null && typeof content.output === "object" && !Array.isArray(content.output) && "status" in content.output && content.output.status === "waiting"
+  })
+}
+
 function activeReplanObligation(options: TurnExecutionOptions, snapshot: typeof options.snapshot): ReplanObligation | undefined {
-  if (!replanSignalPresent(snapshot)) return undefined
+  if (!replanSignalPresent(snapshot) && !waitingJoinPresent(snapshot)) return undefined
   const expectedGoalRevision = options.goalRef?.get()?.revision
   if (typeof expectedGoalRevision !== "number" || !Number.isSafeInteger(expectedGoalRevision) || expectedGoalRevision < 1) throw new TurnEngineError("invalid_output", "Active replan obligation has no server-owned goal revision")
   const result = deriveReplanObligation({ observations: snapshot.toolObservations, expectedGoalRevision })

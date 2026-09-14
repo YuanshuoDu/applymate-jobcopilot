@@ -1,9 +1,7 @@
 import { describe, expect, it } from "vitest"
 
 import {
-  buildReplanFeedback,
   deriveReplanObligation,
-  replanFeedbackAttempts,
 } from "./plan-replan-obligation.js"
 
 const projection = (planCallId: string, planRevision: number, basedOnPlanRevision: number | null, goalRevision = 1) => ({
@@ -23,6 +21,16 @@ const join = (callId = "plan-1", failedTaskIds = ["child-1"]) => ({
 const signal = (callId = "plan-1", failedTaskIds = ["child-1"]) => ({
   id: `plan-control:${callId}:join:replan`,
   content: { kind: "plan_control", localId: "join:replan", status: "replan_required", dependsOn: ["child"], reason: "child_failure", failedTaskIds },
+})
+
+const waitingJoin = (callId = "plan-1", waitId = "wait-1") => ({
+  id: `plan-result:${callId}:join`,
+  content: { kind: "plan_command", localId: "join", commandKind: "join", dependsOn: ["child"], status: "completed", errorCode: null, output: { waitId, status: "waiting", taskIds: ["child-1"], matchedTaskIds: [] } },
+})
+
+const waitResult = (waitId = "wait-1", status: "ready" | "timed_out" = "ready", taskStatus = "failed") => ({
+  id: `wait-result:${waitId}`,
+  content: { toolCallId: `wait:${waitId}`, toolName: "wait_subagents", input: { taskIds: ["child-1"], mode: "all" }, status: "completed", output: { waitId, status, targetTaskIds: ["child-1"], matchedTaskIds: status === "ready" ? ["child-1"] : [], tasks: [{ taskId: "child-1", status: taskStatus, result: null, failureReason: taskStatus === "failed" ? "provider error" : null }] }, errorCode: null },
 })
 
 function activeObservations() { return [projection("plan-1", 1, null), join(), signal()] }
@@ -57,14 +65,18 @@ describe("plan replan obligation", () => {
     expect(deriveReplanObligation({ observations: [legacy, join(), signal()], expectedGoalRevision: 1 }).kind).toBe("active")
   })
 
-  it("keeps feedback deterministic, bounded, and idempotent", () => {
-    const result = deriveReplanObligation({ observations: activeObservations(), expectedGoalRevision: 1 })
-    if (result.kind !== "active") throw new Error("expected active obligation")
-    const first = buildReplanFeedback("turn-1", result.obligation, 1)!
-    const second = buildReplanFeedback("turn-1", result.obligation, 2)!
-    expect(replanFeedbackAttempts([first], "turn-1", result.obligation)).toEqual({ valid: true, highest: 1 })
-    expect(replanFeedbackAttempts([first, second], "turn-1", result.obligation)).toEqual({ valid: true, highest: 2 })
-    expect(replanFeedbackAttempts([{ ...first, content: { ...first.content, failedTaskIds: ["forged"] } }], "turn-1", result.obligation)).toEqual({ valid: false })
-    expect(buildReplanFeedback("turn-1", result.obligation, 3)).toBeNull()
+  it("rebuilds an active obligation from a durable failed wait when the control signal is missing", () => {
+    const result = deriveReplanObligation({ observations: [projection("plan-1", 1, null), waitingJoin(), waitResult()], expectedGoalRevision: 1 })
+    expect(result).toMatchObject({ kind: "active", obligation: { sourceObservationId: "plan-control:plan-1:join:replan", failedTaskIds: ["child-1"] } })
   })
+
+  it.each([
+    { name: "missing wait result", observations: [projection("plan-1", 1, null), waitingJoin(), signal()] },
+    { name: "foreign tool identity", observations: [projection("plan-1", 1, null), waitingJoin(), { ...waitResult(), content: { ...waitResult().content, toolCallId: "wait:other" } }, signal()] },
+    { name: "missing join wait id", observations: [projection("plan-1", 1, null), { ...join(), content: { ...join().content, output: { status: "ready", taskIds: ["child-1"], matchedTaskIds: ["child-1"], tasks: [{ taskId: "child-1", status: "failed", result: null, failureReason: "provider error" }] } } }, signal()] },
+    { name: "existing signal conflicts with durable result", observations: [projection("plan-1", 1, null), waitingJoin(), waitResult(), signal("plan-1", ["child-2"])] },
+  ])("fails closed for $name during durable wait recovery", ({ observations }) => {
+    expect(deriveReplanObligation({ observations, expectedGoalRevision: 1 }).kind).toBe("invalid")
+  })
+
 })

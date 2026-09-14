@@ -109,6 +109,14 @@ function failedJoinObservations(): Array<{ id: string; content: unknown }> {
   ]
 }
 
+function durableFailedWaitObservations(): Array<{ id: string; content: unknown }> {
+  return [
+    planRevisionObservation({ planCallId: "plan-1", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposalHash: `sha256:${"0".repeat(64)}` }),
+    { id: "plan-result:plan-1:join", content: { kind: "plan_command", localId: "join", commandKind: "join", dependsOn: ["child"], status: "completed", errorCode: null, output: { waitId: "wait-1", status: "waiting", taskIds: ["child-1"], matchedTaskIds: [] } } },
+    { id: "wait-result:wait-1", content: { toolCallId: "wait:wait-1", toolName: "wait_subagents", input: { taskIds: ["child-1"], mode: "all" }, status: "completed", output: { waitId: "wait-1", status: "ready", targetTaskIds: ["child-1"], matchedTaskIds: ["child-1"], tasks: [{ taskId: "child-1", status: "failed", result: null, failureReason: "provider error" }] }, errorCode: null } },
+  ]
+}
+
 describe("owner-agnostic turn execution loop", () => {
   it("blocks an unqualified final while a child failure replan obligation is active", async () => {
     const root = fixture(identity("turn", "root-1"), undefined, undefined, failedJoinObservations(), false, undefined, undefined, false, replanGoalRef())
@@ -135,6 +143,26 @@ describe("owner-agnostic turn execution loop", () => {
     ])
     expect(root.events.some(event => event.type === "turn.completed")).toBe(false)
     expect(root.events.filter(event => event.type === "plan.observation").length).toBeGreaterThanOrEqual(2)
+  })
+
+  it("recovers a missing replan signal from a durable failed wait", async () => {
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, durableFailedWaitObservations(), false, undefined, undefined, false, replanGoalRef())
+    const result = await runTurnExecutionLoop({
+      ...root.options,
+      model: {
+        ...root.options.model,
+        async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+          root.requests.push(request)
+          yield { type: "text_delta", text: "forged final" }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      },
+    })
+    expect(result).toMatchObject({ status: "failed", errorCode: "final_unverified", stepCount: 3 })
+    expect(root.planEvents.map(payload => (payload as { observationId: string }).observationId)).toEqual([
+      "plan-replan-feedback:turn-1:plan-1:1:1",
+      "plan-replan-feedback:turn-1:plan-1:1:2",
+    ])
   })
 
   it("fails closed when compaction drops an active replan obligation", async () => {
