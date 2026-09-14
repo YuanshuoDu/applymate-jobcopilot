@@ -141,6 +141,7 @@ describe("owner-agnostic turn execution loop", () => {
       "plan-replan-feedback:turn-1:plan-1:1:1",
       "plan-replan-feedback:turn-1:plan-1:1:2",
     ])
+    expect(root.requests[0]?.messages[0]).toMatchObject({ role: "system", content: [{ type: "text", text: expect.stringContaining("SERVER CONTROL") }] })
     expect(root.events.some(event => event.type === "turn.completed")).toBe(false)
     expect(root.events.filter(event => event.type === "plan.observation").length).toBeGreaterThanOrEqual(2)
   })
@@ -159,6 +160,27 @@ describe("owner-agnostic turn execution loop", () => {
       },
     })
     expect(result).toMatchObject({ status: "failed", errorCode: "final_unverified", stepCount: 3 })
+    expect(root.planEvents.map(payload => (payload as { observationId: string }).observationId)).toEqual([
+      "plan-replan-feedback:turn-1:plan-1:1:1",
+      "plan-replan-feedback:turn-1:plan-1:1:2",
+    ])
+  })
+
+  it.each([
+    { label: "a proposal mixed with another tool", tools: [{ name: "agent.plan.propose" }, { name: "jobs.search" }] },
+    { label: "multiple proposals", tools: [{ name: "agent.plan.propose" }, { name: "agent.plan.propose" }] },
+  ])("rejects $label before executing any tool while replanning", async ({ tools }) => {
+    const proposal = { schemaVersion: PLAN_PROPOSAL_SCHEMA_VERSION, basedOnGoalRevision: 1, basedOnPlanRevision: 1, nodes: [], completionCriteria: [], briefRationale: "replan" }
+    let executions = 0
+    const root = fixture(
+      identity("turn", "root-1"), undefined, undefined, failedJoinObservations(), false, undefined, undefined, false, replanGoalRef(),
+      async ({ call }) => { executions += 1; return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, output: {}, errorCode: null } },
+      tools.map(tool => ({ ...tool, arguments: tool.name === "agent.plan.propose" ? { proposal } : { location: "Dublin" } })),
+    )
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "failed", errorCode: "final_unverified", stepCount: 3, toolCallCount: 0 })
+    expect(executions).toBe(0)
+    expect(root.events.some(event => event.type === "tool_call.started")).toBe(false)
     expect(root.planEvents.map(payload => (payload as { observationId: string }).observationId)).toEqual([
       "plan-replan-feedback:turn-1:plan-1:1:1",
       "plan-replan-feedback:turn-1:plan-1:1:2",

@@ -85,31 +85,25 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           context, model: options.model, tools: options.tools,
           sessionId: options.identity.sessionId, turnId: options.identity.turnId, stepId: step.id,
           taskId: options.identity.taskId, userId: options.identity.userId, signal, continuation,
+          replanRequired: obligationAfterCompaction !== undefined,
         })
           assertModelAllowance(budget.snapshot())
         const reservation = budget.reserveModel()
         const output = await runModelStep(options.model, request, options.validateToolArguments)
         stepOutput = output; reservation.settle(output.usage ?? { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }); continuation = output.continuation ?? undefined
+        const obligation = activeReplanObligation(options, snapshot)
+        const replanBatchAllowed = replanToolBatchAllowed(output.toolCalls, obligation)
         await writer.append(
           "model.usage", step.id, null,
           { provider: output.provider, model: output.model, usage: output.usage, taskId: options.identity.taskId },
           `model-usage:${step.id}`,
         )
-        await publishReasoningSummary(writer, options, step, output.reasoningSummary, now)
-        if (output.toolCalls.length === 0) {
-          const obligation = activeReplanObligation(options, snapshot)
-          if (obligation) {
-            await updateExecutionStep(options, {
-              stepId: step.id, status: "completed", finishReason: output.finishReason, errorCode: "replan_required",
-              inputTokens: output.usage?.inputTokens ?? 0, outputTokens: output.usage?.outputTokens ?? 0,
-              estimatedCostUsd: output.usage?.estimatedCostUsd ?? 0, now: now(),
-            })
-            await writer.append("step.completed", step.id, null, { stepId: step.id, status: "completed", toolCallCount: 0, errorCode: "replan_required", taskId: options.identity.taskId }, `step-completed:${step.id}`)
-            snapshot = await appendReplanFeedback(options, writer, snapshot, obligation)
-            continuation = undefined
-            continue
-          }
+        if (!replanBatchAllowed) {
+          snapshot = await rejectReplanOutput(options, writer, step, output, snapshot, obligation!, now)
+          continuation = undefined
+          continue
         }
+        await publishReasoningSummary(writer, options, step, output.reasoningSummary, now)
         if (output.toolCalls.length > 0) {
           progress.observe({ snapshot, toolCalls: output.toolCalls })
           budget.reserveToolCalls(output.toolCalls.length)
@@ -305,6 +299,20 @@ async function appendReplanFeedback(options: TurnExecutionOptions, writer: TurnE
   if (!feedback) throw new TurnEngineError("invalid_output", "Replan feedback could not be built")
   await writer.append("plan.observation", obligation.planCallId, null, { planCallId: obligation.planCallId, observationId: feedback.id, content: feedback.content }, `plan-replan-feedback:${feedback.id}`)
   return { ...snapshot, toolObservations: [...snapshot.toolObservations, feedback] }
+}
+
+async function rejectReplanOutput(options: TurnExecutionOptions, writer: TurnExecutionEventWriter, step: TurnEngineStep, output: ModelStepResult, snapshot: typeof options.snapshot, obligation: ReplanObligation, now: () => Date): Promise<typeof options.snapshot> {
+  await updateExecutionStep(options, {
+    stepId: step.id, status: "completed", finishReason: output.finishReason, errorCode: "replan_required",
+    inputTokens: output.usage?.inputTokens ?? 0, outputTokens: output.usage?.outputTokens ?? 0,
+    estimatedCostUsd: output.usage?.estimatedCostUsd ?? 0, now: now(),
+  })
+  await writer.append("step.completed", step.id, null, { stepId: step.id, status: "completed", toolCallCount: 0, errorCode: "replan_required", taskId: options.identity.taskId }, `step-completed:${step.id}`)
+  return appendReplanFeedback(options, writer, snapshot, obligation)
+}
+
+function replanToolBatchAllowed(toolCalls: readonly TurnEngineToolCall[], obligation: ReplanObligation | undefined): boolean {
+  return obligation === undefined || (toolCalls.length === 1 && toolCalls[0]?.name === "agent.plan.propose")
 }
 
 async function assertCompletionAllowed(options: TurnExecutionOptions, writer: TurnExecutionEventWriter, step: TurnEngineStep, signal: AbortSignal, now: () => Date): Promise<void> {

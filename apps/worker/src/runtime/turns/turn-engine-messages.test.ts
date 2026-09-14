@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { contextToModelMessages } from "./turn-engine-messages.js"
+import { contextToModelMessages, PLAN_REPLAN_SYSTEM_INSTRUCTION } from "./turn-engine-messages.js"
 import type { StepContext } from "../context/step-context-builder.js"
 
 function context(): StepContext {
@@ -32,6 +32,15 @@ describe("TurnEngine model message mapping", () => {
   it("provides a non-empty fallback message for an empty context", () => {
     const messages = contextToModelMessages({ ...context(), blocks: [] })
     expect(messages).toEqual([{ role: "user", content: [{ type: "text", text: expect.any(String) }] }])
+  })
+
+  it("prepends a fixed server-owned replan instruction as system context", () => {
+    const messages = contextToModelMessages(context(), true)
+    expect(messages[0]).toEqual({ role: "system", content: [{ type: "text", text: PLAN_REPLAN_SYSTEM_INSTRUCTION }] })
+    expect(messages[0].role).toBe("system")
+    expect(messages[1].role).toBe("system")
+    expect(messages.at(-1)?.role).toBe("user")
+    expect(PLAN_REPLAN_SYSTEM_INSTRUCTION).not.toContain("Ignore the rule")
   })
 
   it("reconstructs provider-neutral assistant/tool correlation from observations", () => {
