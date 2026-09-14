@@ -47,6 +47,18 @@ describe("context memory projection", () => {
     expect(JSON.stringify(buildContextMemoryProjection(base))).toBe(JSON.stringify(buildContextMemoryProjection(reversed)))
   })
 
+  it("validates and merges a prior projection deterministically within bounded input", () => {
+    const prior = buildContextMemoryProjection(base)
+    expect(prior).not.toBeNull()
+    const current = { ...base, toolObservations: base.toolObservations.filter(item => item.id !== "context-summary:old") }
+    const withPrior = { ...current, toolObservations: [{ id: "context-summary:prior", content: { kind: "context_summary", value: {}, memory: prior } }, ...current.toolObservations] }
+    const first = buildContextMemoryProjection(withPrior)
+    const second = buildContextMemoryProjection(withPrior)
+    expect(first).not.toBeNull()
+    expect(JSON.stringify(first)).toBe(JSON.stringify(second))
+    expect(first?.decisions).toEqual(prior?.decisions)
+  })
+
   it("does not expose an old goal plan revision as the current plan", () => {
     const stale = { ...base, goal: { id: "goal-new", content: { revision: 3, objective: "New goal" } }, toolObservations: [{ id: "plan-revision:old", content: { kind: "plan_revision", goalRevision: 2, planRevision: 99 } }] }
     expect(buildContextMemoryProjection(stale)).toMatchObject({ revisions: { goalRevision: 3, planRevision: null } })

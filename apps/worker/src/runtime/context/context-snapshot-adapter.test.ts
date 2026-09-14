@@ -104,6 +104,25 @@ describe("StepContextSnapshot adapter", () => {
     expect(backing.saved).toHaveLength(0)
   })
 
+  it("revalidates embedded memory projections on idempotent replay and snapshot load", async () => {
+    const backing = store()
+    const adapter = createContextSnapshotAdapter({ store: backing, observationCountThreshold: 3, keepRecentObservations: 1 })
+    const input = request(observations(3))
+    await adapter.hook(input)
+    const saved = backing.saved[0]!
+    const summaryObservation = saved.snapshot.toolObservations[0]!
+    const summary = summaryObservation.content as Record<string, unknown>
+    const memory = summary.memory as Record<string, unknown>
+    const corruptedSnapshot: StepContextSnapshot = {
+      ...saved.snapshot,
+      toolObservations: [{ ...summaryObservation, content: { ...summary, memory: { ...memory, decisions: null } } }, ...saved.snapshot.toolObservations.slice(1)],
+    }
+    const replayStore = store({ loadByIdempotencyKey: async () => ({ ...saved, snapshot: corruptedSnapshot }), load: async inputValue => ({ snapshot: corruptedSnapshot, scope: inputValue.scope, sessionId: inputValue.sessionId, turnId: inputValue.turnId }) })
+    const replay = createContextSnapshotAdapter({ store: replayStore, observationCountThreshold: 3, keepRecentObservations: 1 })
+    await expect(replay.hook(input)).rejects.toThrow("memory projection")
+    await expect(replay.loadSnapshot({ snapshotRef: "opaque-ref", scope, sessionId: "session-1", turnId: "turn-1" })).resolves.toBeNull()
+  })
+
   it("fails closed when summarizer or store fails", async () => {
     const summarizer = vi.fn(() => { throw new Error("summary failure") })
     const first = createContextSnapshotAdapter({ store: store(), observationCountThreshold: 2, keepRecentObservations: 1, summarizer })

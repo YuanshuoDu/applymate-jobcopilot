@@ -4,6 +4,7 @@ import { Buffer } from "node:buffer"
 import type { TenantScope } from "@jobcopilot/agent-protocol"
 import { estimateCompactionTokens } from "./context-compaction-collector.js"
 import { buildContextMemoryProjection, isContextMemoryAnchorObservation } from "./context-memory-projection.js"
+import { validateContextMemoryProjection } from "./context-memory-schema.js"
 import { canonicalJson } from "./context-snapshot-json.js"
 import type { StepContextSnapshot } from "./step-context-builder.js"
 import type { ContextCompactionHook, ContextCompactionHookInput, ContextCompactionHookResult, ContextCompactionSnapshotLoader } from "./context-snapshot-compaction-seam.js"
@@ -90,6 +91,14 @@ function protectedSnapshot(snapshot: StepContextSnapshot): string {
   return canonicalJson({ system: snapshot.system, profile: snapshot.profile, goal: snapshot.goal, steerHistory: snapshot.steerHistory, businessRefs: snapshot.businessRefs })
 }
 
+function embeddedMemoryValid(snapshot: StepContextSnapshot, maxSummaryBytes: number): boolean {
+  for (const observation of snapshot.toolObservations) {
+    const content = observation.content && typeof observation.content === "object" && !Array.isArray(observation.content) ? observation.content as Record<string, unknown> : null
+    if (content?.kind === "context_summary" && content.memory !== undefined && !validateContextMemoryProjection(content.memory, { maxBytes: maxSummaryBytes })) return false
+  }
+  return true
+}
+
 function memoryObservations(snapshot: StepContextSnapshot): StepContextSnapshot["toolObservations"] {
   const retained = snapshot.toolObservations.filter(observation => {
     if (!isContextMemoryAnchorObservation(observation)) return false
@@ -106,11 +115,12 @@ function memoryObservations(snapshot: StepContextSnapshot): StepContextSnapshot[
   return retained
 }
 
-function restoredSnapshot(input: AdapterInput, stored: StoredSnapshot, maxSnapshotBytes: number): ContextCompactionHookResult {
+function restoredSnapshot(input: AdapterInput, stored: StoredSnapshot, maxSnapshotBytes: number, maxSummaryBytes: number): ContextCompactionHookResult {
   operationIdentity(input)
   if (!stored || typeof stored !== "object" || typeof stored.snapshotRef !== "string" || stored.snapshotRef.length !== 64 || !stored.scope || stored.scope.userId !== input.scope.userId || stored.sessionId !== input.sessionId || stored.turnId !== input.turnId || stored.stepId !== input.stepId || stored.idempotencyKey !== input.idempotencyKey || !snapshotShape(stored.snapshot) || stored.snapshot.toolObservations[0]?.id !== `context-summary:${input.stepId}`) throw new TypeError("Context snapshot store returned an invalid idempotent snapshot")
   measure(input.snapshot, maxSnapshotBytes)
   measure(stored.snapshot, maxSnapshotBytes)
+  if (!embeddedMemoryValid(stored.snapshot, maxSummaryBytes)) throw new TypeError("Context snapshot store returned an invalid memory projection")
   if (protectedSnapshot(input.snapshot) !== protectedSnapshot(stored.snapshot)) throw new TypeError("Context snapshot store returned a snapshot with changed protected context")
   if (calculateSnapshotRef(input, stored.snapshot) !== stored.snapshotRef) throw new TypeError("Context snapshot store returned a mismatched snapshot reference")
   return { status: "compacted", snapshot: stored.snapshot, snapshotRef: stored.snapshotRef }
@@ -139,7 +149,7 @@ export function createContextSnapshotAdapter(options: ContextSnapshotAdapterOpti
     identity(input)
     const loaded = await options.store.load(input)
     if (!loaded) return null
-    if (!loaded.scope || typeof loaded.scope !== "object" || typeof loaded.scope.userId !== "string" || loaded.sessionId !== input.sessionId || loaded.turnId !== input.turnId || loaded.scope.userId !== input.scope.userId || !snapshotShape(loaded.snapshot)) return null
+    if (!loaded.scope || typeof loaded.scope !== "object" || typeof loaded.scope.userId !== "string" || loaded.sessionId !== input.sessionId || loaded.turnId !== input.turnId || loaded.scope.userId !== input.scope.userId || !snapshotShape(loaded.snapshot) || !embeddedMemoryValid(loaded.snapshot, maxSummaryBytes)) return null
     try { measure(loaded.snapshot, maxSnapshotBytes) } catch { return null }
     return loaded
   }
@@ -148,7 +158,7 @@ export function createContextSnapshotAdapter(options: ContextSnapshotAdapterOpti
 
 async function loadOrCompact(options: ContextSnapshotAdapterOptions, input: AdapterInput, inputThreshold: number, observationThreshold: number, keepRecent: number, maxSummaryBytes: number, maxSnapshotBytes: number): Promise<ContextCompactionHookResult> {
   const stored = await options.store.loadByIdempotencyKey({ scope: input.scope, sessionId: input.sessionId, turnId: input.turnId, stepId: input.stepId, idempotencyKey: input.idempotencyKey })
-  if (stored) return restoredSnapshot(input, stored, maxSnapshotBytes)
+  if (stored) return restoredSnapshot(input, stored, maxSnapshotBytes, maxSummaryBytes)
   return compact(options, input, inputThreshold, observationThreshold, keepRecent, maxSummaryBytes, maxSnapshotBytes)
 }
 
