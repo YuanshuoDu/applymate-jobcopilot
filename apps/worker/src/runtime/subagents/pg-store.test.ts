@@ -223,6 +223,8 @@ describe("PgSubagentTaskStore", () => {
     })
     const store = new PgSubagentTaskStore(fake.pool)
     await expect(store.finish({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, status: "failed", failureReason: "timeout", now })).resolves.toBe("retrying")
+    const finishSelect = fake.calls.find(([sql]) => sql.includes('task."status" = \'running\''))?.[0] ?? ""
+    expect(finishSelect).toContain("FOR UPDATE OF task")
     const update = fake.calls.find(([sql]) => sql.startsWith("UPDATE"))
     expect(update?.[0]).toContain('"attemptCount" = $9')
     expect(update?.[0]).toContain('"nextAttemptAt" = $10')
@@ -532,7 +534,7 @@ describe("PgSubagentTaskStore", () => {
     expect(result).toHaveLength(1)
     expect(result[0].status).toBe("queued")
     const select = fake.calls.find(([sql]) => sql.includes("leaseExpiresAt") && sql.includes("FOR UPDATE"))?.[0] ?? ""
-    expect(select).toContain("LIMIT $2 FOR UPDATE SKIP LOCKED")
+    expect(select).toContain("LIMIT $2 FOR UPDATE OF task SKIP LOCKED")
   })
 
   it.each(["aborted", "archived"] as const)("reclaims a stale child from a %s session as interrupted", async status => {

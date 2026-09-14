@@ -179,7 +179,7 @@ export class PgSubagentTaskStore implements SubagentStore {
               AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
               AND turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
               AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled'))
-          FOR UPDATE`, [input.taskId, input.sessionId, input.ownerId, input.attemptCount])
+          FOR UPDATE OF task`, [input.taskId, input.sessionId, input.ownerId, input.attemptCount])
         const row = task.rows[0] as Record<string, unknown> | undefined
         if (!row || String(row.id) !== input.taskId || String(row.sessionId) !== input.sessionId
           || row.status !== "running" || row.leaseOwner !== input.ownerId || Number(row.attemptCount) !== input.attemptCount) return null
@@ -294,7 +294,7 @@ export class PgSubagentTaskStore implements SubagentStore {
   async recoverExpired(input: { now: Date; limit: number }): Promise<SubagentTaskRecord[]> {
     if (!Number.isInteger(input.limit) || input.limit < 1) throw new RangeError("Recovery limit must be positive")
     return transaction(this.pool, async (client) => {
-      const rows = await client.query(`${SELECT_RECOVERABLE} LIMIT $2 FOR UPDATE SKIP LOCKED`, [input.now, input.limit])
+      const rows = await client.query(`${SELECT_RECOVERABLE} LIMIT $2 FOR UPDATE OF task SKIP LOCKED`, [input.now, input.limit])
       const recovered: SubagentTaskRecord[] = []
       for (const row of rows.rows as Array<Record<string, unknown>>) {
         const sessionClosed = row.sessionStatus === "aborted" || row.sessionStatus === "archived"
