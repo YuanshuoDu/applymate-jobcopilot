@@ -254,6 +254,34 @@ describe("PgSubagentTaskStore", () => {
     expect(fake.calls.map(([sql]) => sql)).toContain("COMMIT")
   })
 
+  it("does not confirm a completed mailbox id from another turn", async () => {
+    const crossTurnId = "message-cross-turn"
+    const mailboxRows = [{ id: crossTurnId, sessionId: "session-1", toTaskId: "task-1", turnId: "turn-old" }]
+    const confirmedIds: string[] = []
+    const fake = fakePool((sql, params) => {
+      if (sql.includes('FROM "sub_agent_tasks" task')) return { rows: [taskRow({ status: "running", leaseOwner: "worker-1", attemptCount: 1, leaseExpiresAt: new Date(now.getTime() + 60_000) })], rowCount: 1 }
+      if (sql.includes('UPDATE "agent_mailbox_messages"')) {
+        const hasTurnFence = sql.includes('message."turnId" = target."turnId"')
+        const selected = mailboxRows.filter(row => params?.[2] instanceof Array && params[2].includes(row.id)
+          && (!hasTurnFence || row.turnId === "turn-1"))
+        confirmedIds.push(...selected.map(row => row.id))
+        return { rows: selected, rowCount: selected.length }
+      }
+      if (sql.startsWith('UPDATE "sub_agent_tasks"')) return { rowCount: 1 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.finish({
+      taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, status: "completed", now,
+      mailboxMessageIds: [crossTurnId],
+    })).resolves.toBe("completed")
+
+    const mailboxUpdate = fake.calls.find(([sql]) => sql.includes('UPDATE "agent_mailbox_messages"'))
+    expect(mailboxUpdate?.[0]).toContain('message."turnId" = target."turnId"')
+    expect(confirmedIds).toEqual([])
+  })
+
   it("keeps completion idempotent when mailbox ids are unknown or already consumed", async () => {
     const fake = fakePool(sql => {
       if (sql.includes('FROM "sub_agent_tasks" task')) return { rows: [taskRow({ status: "running", leaseOwner: "worker-1", attemptCount: 1, leaseExpiresAt: new Date(now.getTime() + 60_000) })], rowCount: 1 }

@@ -207,7 +207,8 @@ export class PgSubagentTaskStore implements SubagentStore {
             WHERE message."sessionId" = $1 AND message."toTaskId" = $2
               AND message."id" = ANY($3::text[]) AND message."consumedAt" IS NULL
               AND EXISTS (SELECT 1 FROM "sub_agent_tasks" AS target
-                WHERE target."id" = $2 AND target."sessionId" = $1)`,
+                WHERE target."id" = $2 AND target."sessionId" = $1
+                  AND message."turnId" = target."turnId")`,
           [input.sessionId, input.taskId, mailboxMessageIds])
         }
         if (interrupted) return "interrupted"
