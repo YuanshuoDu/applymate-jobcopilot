@@ -94,7 +94,68 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
   return { options, events, notifications, planEvents, items, finalResponses, stepTasks, stepAttempts, stepStatuses, requests }
 }
 
+const replanGoal: GoalContract = { revision: 1, objective: "Find jobs", constraints: [], successCriteria: [], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" }
+
+function replanGoalRef(): GoalContractRef {
+  const current = { value: replanGoal }
+  return { get: () => current.value, update: next => { current.value = next } }
+}
+
+function failedJoinObservations(): Array<{ id: string; content: unknown }> {
+  return [
+    planRevisionObservation({ planCallId: "plan-1", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposalHash: `sha256:${"0".repeat(64)}` }),
+    { id: "plan-result:plan-1:join", content: { kind: "plan_command", localId: "join", commandKind: "join", dependsOn: ["child"], status: "completed", errorCode: null, output: { waitId: "wait-1", status: "ready", taskIds: ["child-1"], matchedTaskIds: ["child-1"], tasks: [{ taskId: "child-1", status: "failed", result: null, failureReason: "provider error" }] } } },
+    { id: "plan-control:plan-1:join:replan", content: { kind: "plan_control", localId: "join:replan", status: "replan_required", dependsOn: ["child"], reason: "child_failure", failedTaskIds: ["child-1"] } },
+  ]
+}
+
 describe("owner-agnostic turn execution loop", () => {
+  it("blocks an unqualified final while a child failure replan obligation is active", async () => {
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, failedJoinObservations(), false, undefined, undefined, false, replanGoalRef())
+    let calls = 0
+    root.options = {
+      ...root.options,
+      model: {
+        ...root.options.model,
+        async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+          root.requests.push(request)
+          calls += 1
+          yield { type: "text_delta", text: "forged final" }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      },
+    }
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "failed", errorCode: "final_unverified", stepCount: 3 })
+    expect(calls).toBe(3)
+    expect(root.planEvents).toHaveLength(2)
+    expect(root.planEvents.map(payload => (payload as { observationId: string }).observationId)).toEqual([
+      "plan-replan-feedback:turn-1:plan-1:1:1",
+      "plan-replan-feedback:turn-1:plan-1:1:2",
+    ])
+    expect(root.events.some(event => event.type === "turn.completed")).toBe(false)
+    expect(root.events.filter(event => event.type === "plan.observation").length).toBeGreaterThanOrEqual(2)
+  })
+
+  it("fails closed when compaction drops an active replan obligation", async () => {
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, failedJoinObservations(), false, undefined, undefined, false, replanGoalRef())
+    const hook: NonNullable<TurnExecutionOptions["contextCompaction"]> = request => ({ status: "compacted", snapshot: { ...request.snapshot, toolObservations: [] }, snapshotRef: "snapshot-compact-1" })
+    const result = await runTurnExecutionLoop({ ...root.options, contextCompaction: hook })
+    expect(result).toMatchObject({ status: "failed", errorCode: "invalid_output" })
+    expect(root.requests).toHaveLength(0)
+    expect(JSON.stringify(root.events)).toContain("context.compaction")
+  })
+
+  it("clears the obligation only after an accepted next revision based on the failed revision", async () => {
+    const proposal: PlanProposal = { schemaVersion: PLAN_PROPOSAL_SCHEMA_VERSION, basedOnGoalRevision: 1, basedOnPlanRevision: 1, nodes: [], completionCriteria: [], briefRationale: "replan" }
+    const accepted = { status: "accepted" as const, goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1, proposal, intents: [], proposalHash: fingerprintPlanProposal(proposal) }
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, failedJoinObservations(), false, undefined, undefined, false, replanGoalRef(), async ({ call }) => ({ id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, output: accepted, errorCode: null }), [{ name: "agent.plan.propose", arguments: { proposal } }])
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "completed", stepCount: 2, toolCallCount: 1 })
+    expect(root.planEvents).toHaveLength(0)
+    expect(root.events.some(event => event.type === "turn.completed")).toBe(true)
+  })
+
   it("requires a server-owned completion proposal with completed same-plan dependencies when enabled", async () => {
     const root = fixture(identity("turn", "root-1"), undefined, undefined, [
       { id: "plan-result:plan:call:read", content: { kind: "plan_command", localId: "read", commandKind: "tool_call", dependsOn: [], status: "completed", errorCode: null, output: { job: "job-1" } } },

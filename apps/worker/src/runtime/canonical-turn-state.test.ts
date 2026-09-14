@@ -161,6 +161,7 @@ describe("loadCanonicalTurnState", () => {
     })
     const value = await loadCanonicalTurnState(fake, lease)
     expect(value.planRevision).toBe(2)
+    expect(value.snapshot.toolObservations).toEqual(expect.arrayContaining([{ id: "plan-revision:legacy-plan", content: expect.objectContaining({ planRevision: 1 }) }]))
     expect(value.snapshot.toolObservations).toEqual(expect.arrayContaining([{ id: "plan-revision:receipt-2", content: { kind: "plan_revision", planCallId: "receipt-2", goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1 } }]))
   })
 

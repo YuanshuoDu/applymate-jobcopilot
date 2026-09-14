@@ -17,7 +17,9 @@ import { parsePlanRevisionReceipt, planRevisionObservation } from "../planning/p
 import { goalRevisionObservation, parseGoalRevisionOutput } from "../planning/goal-revision-receipt.js"
 import { verifyPlanCompletion } from "../planning/plan-completion-verifier.js"
 import { buildPlanCompletionFeedback, buildPlanCompletionFeedbackEvent, currentPlanId, MAX_PLAN_COMPLETION_RECOVERY_ATTEMPTS, planCompletionFeedbackIdempotencyKey, PLAN_COMPLETION_FEEDBACK_EVENT_TYPE, planCompletionRecoveryCount } from "../planning/plan-completion-feedback.js"
+import { buildReplanFeedback, deriveReplanObligation, MAX_PLAN_REPLAN_FEEDBACK_ATTEMPTS, replanFeedbackAttempts, type ReplanObligation } from "../planning/plan-replan-obligation.js"
 import { runContextCompaction } from "../context/context-compaction-runtime.js"
+import type { StepContextSnapshot } from "../context/step-context-builder.js"
 
 const DEFAULT_MAX_STEPS = 32
 const PLAN_OBSERVATION_MAX_BYTES = 8 * 1024
@@ -64,12 +66,15 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
       )
       let stepOutput: ModelStepResult | null = null
       try {
+        const obligationBeforeCompaction = activeReplanObligation(options, snapshot)
         snapshot = (await runContextCompaction({
           hook: options.contextCompaction, loadSnapshot: options.contextCompactionLoadSnapshot, identity: options.identity, scope: options.scope,
           sessionId: options.identity.sessionId, turnId: options.identity.turnId, stepId: step.id,
           signal, now: now(), snapshot,
           append: (payload, key) => writer.append("context.compaction", step.id, null, payload, key),
         })).snapshot
+        const obligationAfterCompaction = activeReplanObligation(options, snapshot)
+        if (obligationBeforeCompaction && (!obligationAfterCompaction || stableJson(obligationBeforeCompaction) !== stableJson(obligationAfterCompaction))) throw new TurnEngineError("invalid_output", "Context compaction dropped the active replan obligation")
         const context = await options.contextBuilder.build({
           scope: options.scope, identity: options.identity, stepId: step.id, snapshot,
           rootInputId: ordinal === 0 ? options.rootInputId : undefined, now: now(),
@@ -91,6 +96,20 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           `model-usage:${step.id}`,
         )
         await publishReasoningSummary(writer, options, step, output.reasoningSummary, now)
+        if (output.toolCalls.length === 0) {
+          const obligation = activeReplanObligation(options, snapshot)
+          if (obligation) {
+            await updateExecutionStep(options, {
+              stepId: step.id, status: "completed", finishReason: output.finishReason, errorCode: "replan_required",
+              inputTokens: output.usage?.inputTokens ?? 0, outputTokens: output.usage?.outputTokens ?? 0,
+              estimatedCostUsd: output.usage?.estimatedCostUsd ?? 0, now: now(),
+            })
+            await writer.append("step.completed", step.id, null, { stepId: step.id, status: "completed", toolCallCount: 0, errorCode: "replan_required", taskId: options.identity.taskId }, `step-completed:${step.id}`)
+            snapshot = await appendReplanFeedback(options, writer, snapshot, obligation)
+            continuation = undefined
+            continue
+          }
+        }
         if (output.toolCalls.length > 0) {
           progress.observe({ snapshot, toolCalls: output.toolCalls })
           budget.reserveToolCalls(output.toolCalls.length)
@@ -250,6 +269,32 @@ function resolvePlanCompletionRecoveryLimit(options: TurnExecutionOptions): numb
     throw new TurnEngineError("invalid_output", "Plan completion recovery limit is outside the server-owned bound")
   }
   return limit
+}
+
+function replanSignalPresent(snapshot: StepContextSnapshot): boolean {
+  return snapshot.toolObservations.some(observation => {
+    const content = observation.content
+    return content !== null && typeof content === "object" && !Array.isArray(content) && "kind" in content && content.kind === "plan_control" && "status" in content && content.status === "replan_required"
+  })
+}
+
+function activeReplanObligation(options: TurnExecutionOptions, snapshot: typeof options.snapshot): ReplanObligation | undefined {
+  if (!replanSignalPresent(snapshot)) return undefined
+  const expectedGoalRevision = options.goalRef?.get()?.revision
+  if (typeof expectedGoalRevision !== "number" || !Number.isSafeInteger(expectedGoalRevision) || expectedGoalRevision < 1) throw new TurnEngineError("invalid_output", "Active replan obligation has no server-owned goal revision")
+  const result = deriveReplanObligation({ observations: snapshot.toolObservations, expectedGoalRevision })
+  if (result.kind === "invalid") throw new TurnEngineError("invalid_output", "Active replan obligation is invalid")
+  return result.kind === "active" ? result.obligation : undefined
+}
+
+async function appendReplanFeedback(options: TurnExecutionOptions, writer: TurnExecutionEventWriter, snapshot: typeof options.snapshot, obligation: ReplanObligation): Promise<typeof options.snapshot> {
+  const attempts = replanFeedbackAttempts(snapshot.toolObservations, options.identity.turnId, obligation)
+  if (!attempts.valid) throw new TurnEngineError("invalid_output", "Replan feedback history is invalid")
+  if (attempts.highest >= MAX_PLAN_REPLAN_FEEDBACK_ATTEMPTS) throw new TurnEngineError("final_unverified", "Replan obligation recovery limit exceeded")
+  const feedback = buildReplanFeedback(options.identity.turnId, obligation, attempts.highest + 1)
+  if (!feedback) throw new TurnEngineError("invalid_output", "Replan feedback could not be built")
+  await writer.append("plan.observation", obligation.planCallId, null, { planCallId: obligation.planCallId, observationId: feedback.id, content: feedback.content }, `plan-replan-feedback:${feedback.id}`)
+  return { ...snapshot, toolObservations: [...snapshot.toolObservations, feedback] }
 }
 
 async function assertCompletionAllowed(options: TurnExecutionOptions, writer: TurnExecutionEventWriter, step: TurnEngineStep, signal: AbortSignal, now: () => Date): Promise<void> {
