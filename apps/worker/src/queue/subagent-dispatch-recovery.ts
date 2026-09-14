@@ -75,7 +75,7 @@ export async function repairStaleSubagentDispatches(
             AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
             AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
             AND dispatch."publishedAt" IS NOT NULL
-            AND dispatch."publishedAt" <= task."updatedAt"
+            AND dispatch."publishedAt" < task."updatedAt"
         )
       ORDER BY session."updatedAt" ASC, session."id" ASC
       LIMIT $2 FOR UPDATE SKIP LOCKED`, [SUBAGENT_DISPATCH_TOPIC, limit])
@@ -110,7 +110,7 @@ export async function repairStaleSubagentDispatches(
         AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
         AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
         AND dispatch."publishedAt" IS NOT NULL
-        AND dispatch."publishedAt" <= task."updatedAt"
+        AND dispatch."publishedAt" < task."updatedAt"
       ORDER BY task."updatedAt" ASC, task."id" ASC
       LIMIT $3 FOR UPDATE OF task, dispatch SKIP LOCKED`, [sessionIds, SUBAGENT_DISPATCH_TOPIC, limit])
 
@@ -138,7 +138,7 @@ export async function repairStaleSubagentDispatches(
           AND dispatch."idempotencyKey" = $4
           AND dispatch."aggregateId" = $5
           AND dispatch."publishedAt" IS NOT NULL
-          AND dispatch."publishedAt" <= task."updatedAt"
+          AND dispatch."publishedAt" < task."updatedAt"
           AND task."id" = $6
           AND task."sessionId" = $5
           AND task."rootTaskId" = $7
