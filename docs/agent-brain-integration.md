@@ -782,3 +782,10 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Child context now enforces the live execution owner fence before reading the mailbox: owner identity must match the task lease owner, task status must remain `running`, and no interrupt request may be persisted. Existing tenant, session, turn, lineage, task, attempt, and scope checks remain unchanged. This preserves the P4-55 per-execution cache, P4-54 payload bound, and P4-53 completion-only atomic acknowledgement paths.
 - Astra independently verified the child-context and child-executor suites at **40/40** (14 + 26), Worker `tsc --noEmit --skipLibCheck`, shared build through the test preflight, and `git diff --check`.
 - This remains a candidate increment: no live PostgreSQL/RLS, Redis/BullMQ delivery, process restart, cross-process concurrency, provider/browser behavior, or complete child-parent E2E was run. No local lease-expiry comparison was added because the manager heartbeat renews the server lease without mutating the child task snapshot; the cognitive gate remains disabled and overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P4-57 integration / verification
+
+- Integrated code commit: `7cf2b88a`.
+- Child mailbox hydration now requires exact `message.turnId === task.turnId` in both the server query and the child-context projection. Cross-turn rows are excluded before caching, model visibility, or completion acknowledgement; stable ordering, per-execution cache, payload bound, and at-least-once semantics are unchanged.
+- Astra independently verified the child-context and mailbox-store suites at **38/38** (15 + 23), Worker `tsc --noEmit --skipLibCheck`, shared build through the test preflight, and `git diff --check`.
+- This remains a candidate increment: no live PostgreSQL/RLS, Redis/BullMQ delivery, process restart, cross-process concurrency, provider/browser behavior, or complete child-parent E2E was run. The cognitive gate remains disabled and overall acceptance remains **P0 accepted 1/8 (12.5%)**.
