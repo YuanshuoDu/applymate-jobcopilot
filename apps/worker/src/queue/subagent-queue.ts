@@ -5,6 +5,7 @@ import type pg from "pg"
 import { getPool } from "../db/apply-results.js"
 import { redisConnection } from "../redis.js"
 import { workerPollingOptions } from "./worker-polling-options.js"
+import { repairStaleSubagentDispatches } from "./subagent-dispatch-recovery.js"
 import { AgentTreeManager } from "../runtime/subagents/manager.js"
 import { parseSubagentJobPayload, type PgSubagentPool, type SubagentJobPayload, type SubagentLease } from "../runtime/subagents/types.js"
 
@@ -12,12 +13,10 @@ export const SUBAGENT_QUEUE_NAME = "agent-subagents"
 export const SUBAGENT_DISPATCH_TOPIC = "agent.subagent.dispatch"
 export const SUBAGENT_DISPATCH_POLL_MS = 30_000
 export const SUBAGENT_MAX_BATCH = 50
-
 export type SubagentQueueLike = {
   add(name: string, payload: SubagentJobPayload, options?: { jobId?: string; attempts?: number; delay?: number }): Promise<unknown>
   close?(): Promise<void>
 }
-
 export type SubagentExecutor = (input: { lease: SubagentLease }) => Promise<{ status: "completed" | "waiting" | "waiting_for_user" | "failed"; result?: unknown; failureReason?: string }>
 type MissingDispatchRow = { id: string; sessionId: string; rootTaskId: string }
 
@@ -207,7 +206,8 @@ export async function recoverSubagentQueue(pool: PgSubagentPool, queue: Subagent
     if (task.status !== "queued") continue
     await persistSubagentDispatch(pool, { taskId: task.id, sessionId: task.sessionId, rootTaskId: task.rootTaskId, ownerId: `recovery-${randomUUID()}` }, true)
   }
-  const repaired = await repairMissingSubagentDispatches(pool, `recovery-${randomUUID()}`, limit)
+  const staleRepaired = await repairStaleSubagentDispatches(pool, `recovery-${randomUUID()}`, limit)
+  const repaired = staleRepaired + await repairMissingSubagentDispatches(pool, `recovery-${randomUUID()}`, limit)
   const dispatched = await dispatchPendingSubagentOutbox(pool, queue, limit)
   return { reclaimed: report.reclaimed, terminal: report.terminal, repaired, dispatched }
 }
