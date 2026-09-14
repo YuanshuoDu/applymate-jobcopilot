@@ -77,6 +77,17 @@ describe("StepContextSnapshot adapter", () => {
     expect(result.snapshot.toolObservations[0]?.content).toMatchObject({ kind: "context_summary", memory: { revisions: { goalRevision: 1, planRevision: 1 } } })
   })
 
+  it("does not retain every large non-control event payload as a raw anchor", async () => {
+    const noise = Array.from({ length: 20 }, (_, index) => ({ id: `event:noise-${index}`, content: { payload: "x".repeat(7_000) } }))
+    const input = { ...base, toolObservations: noise }
+    const adapter = createContextSnapshotAdapter({ store: store(), observationCountThreshold: 2, keepRecentObservations: 1 })
+    const result = await adapter.hook(request(input))
+    expect(result).toMatchObject({ status: "compacted" })
+    if (result.status !== "compacted") return
+    expect(result.snapshot.toolObservations.filter(item => item.id.startsWith("event:"))).toHaveLength(1)
+    expect(result.snapshot.toolObservations[0]?.content).toMatchObject({ kind: "context_summary", memory: { eventRefs: expect.arrayContaining([{ id: "event:noise-0" }]) } })
+  })
+
   it("keeps the runtime snapshot ceiling at 256 KiB", async () => {
     expect(() => createContextSnapshotAdapter({ store: store(), observationCountThreshold: 2, keepRecentObservations: 1, maxSnapshotBytes: 256 * 1024 + 1 })).toThrow("bound")
     const oversized = { ...base, toolObservations: Array.from({ length: 600 }, (_, index) => ({ id: `large-${index}`, content: { text: "x".repeat(600) } })) }

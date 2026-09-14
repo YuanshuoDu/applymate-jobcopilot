@@ -47,6 +47,11 @@ describe("context memory projection", () => {
     expect(JSON.stringify(buildContextMemoryProjection(base))).toBe(JSON.stringify(buildContextMemoryProjection(reversed)))
   })
 
+  it("does not expose an old goal plan revision as the current plan", () => {
+    const stale = { ...base, goal: { id: "goal-new", content: { revision: 3, objective: "New goal" } }, toolObservations: [{ id: "plan-revision:old", content: { kind: "plan_revision", goalRevision: 2, planRevision: 99 } }] }
+    expect(buildContextMemoryProjection(stale)).toMatchObject({ revisions: { goalRevision: 3, planRevision: null } })
+  })
+
   it("trims low priority references to a requested byte budget", () => {
     const many: StepContextSnapshot = { ...base, toolObservations: Array.from({ length: 32 }, (_, index) => ({ id: `event:event-${index}`, content: { status: "recorded", sequence: String(index) } })) }
     const projection = buildContextMemoryProjection(many, { maxBytes: 900 })

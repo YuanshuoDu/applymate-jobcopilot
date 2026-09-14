@@ -240,11 +240,11 @@ export function buildContextMemoryProjection(snapshot: StepContextSnapshot, opti
       if (prior !== null && (covered === null || prior > covered)) covered = prior
     }
   }
-  const revisions = planRows.sort((left, right) => left.goalRevision - right.goalRevision || left.planRevision - right.planRevision)
-  const latest = revisions.at(-1)
   const goalContent = goal && plain(goal.content) ? goal.content : null
   if (goalContent?.revision !== undefined && (!Number.isSafeInteger(goalContent.revision) || (goalContent.revision as number) < 1)) return null
-  const goalRevision = goalContent?.revision as number | undefined ?? latest?.goalRevision ?? null
+  const revisions = planRows.sort((left, right) => left.goalRevision - right.goalRevision || left.planRevision - right.planRevision)
+  const goalRevision = goalContent?.revision as number | undefined ?? revisions.at(-1)?.goalRevision ?? null
+  const latest = revisions.filter(item => item.goalRevision === goalRevision).at(-1)
   const projection: ContextMemoryProjection = { schemaVersion: "agent-harness.cognitive-memory.v1", activeGoals: activeGoals.slice(0, MAX_ITEMS), fixedConstraints: fixedConstraints.slice(0, MAX_ITEMS), steering: userSteering.slice(0, MAX_ITEMS), revisions: { goalRevision, planRevision: latest?.planRevision ?? null }, unresolved: sorted([...unresolved.values()]).slice(0, MAX_ITEMS), waits: sorted([...waits.values()]).slice(0, MAX_ITEMS), approvals: sorted([...approvals.values()]).slice(0, MAX_ITEMS), verifiedEvidence: sorted([...verified.values()]).slice(0, MAX_ITEMS), artifacts: sorted([...artifacts.values()]).slice(0, MAX_ITEMS), taskRefs: sorted([...tasks.values()]).slice(0, MAX_ITEMS), eventRefs: sorted([...events.values()]).slice(0, MAX_ITEMS), omittedRanges: omittedRanges.sort((left, right) => left.fromId.localeCompare(right.fromId)).slice(0, MAX_ITEMS), coveredSequence: covered?.toString() ?? null }
   return trimProjection(projection, maxBytes)
 }

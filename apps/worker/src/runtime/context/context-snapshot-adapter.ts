@@ -10,6 +10,7 @@ import type { ContextCompactionHook, ContextCompactionHookInput, ContextCompacti
 
 const DEFAULT_MAX_SNAPSHOT_BYTES = 256 * 1024
 const DEFAULT_MAX_SUMMARY_BYTES = 8 * 1024
+const MAX_PROTECTED_OBSERVATION_BYTES = 16 * 1024
 
 type SnapshotIdentity = { readonly scope: TenantScope; readonly sessionId: string; readonly turnId: string; readonly stepId: string; readonly idempotencyKey: string }
 type StoredSnapshot = SnapshotIdentity & { readonly snapshotRef: string; readonly snapshot: StepContextSnapshot }
@@ -90,8 +91,18 @@ function protectedSnapshot(snapshot: StepContextSnapshot): string {
 }
 
 function memoryObservations(snapshot: StepContextSnapshot): StepContextSnapshot["toolObservations"] {
-  const retained = snapshot.toolObservations.filter(isContextMemoryAnchorObservation)
+  const retained = snapshot.toolObservations.filter(observation => {
+    if (!isContextMemoryAnchorObservation(observation)) return false
+    if (["plan-revision:", "plan-result:", "plan-control:", "wait-result:", "approval:"].some(prefix => observation.id.startsWith(prefix))) return true
+    const content = observation.content && typeof observation.content === "object" && !Array.isArray(observation.content) ? observation.content as Record<string, unknown> : null
+    return content?.kind === "plan_revision" || content?.kind === "plan_command" || content?.kind === "plan_control" || content?.kind === "plan_replan_feedback" || content?.toolName === "wait_subagents" || content?.approvalId !== undefined
+  })
   if (retained.length > 64) throw new TypeError("Context memory contains too many protected observations")
+  let bytes = 0
+  for (const observation of retained) {
+    bytes += Buffer.byteLength(canonicalJson(observation), "utf8")
+    if (bytes > MAX_PROTECTED_OBSERVATION_BYTES) throw new TypeError("Context memory protected observations exceed their bound")
+  }
   return retained
 }
 
