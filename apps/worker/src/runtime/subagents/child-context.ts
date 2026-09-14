@@ -146,7 +146,9 @@ export function childContextSnapshot(task: SubagentTaskRecord): StepContextSnaps
 
 function assertOwner(task: SubagentTaskRecord, identity: ExecutionOwnerFence, scope: TenantScope): void {
   if (identity.kind !== "task" || identity.userId !== task.userId || identity.sessionId !== task.sessionId || identity.turnId !== task.turnId
-    || identity.taskId !== task.id || identity.rootTaskId !== task.rootTaskId || identity.attemptCount !== task.attemptCount || scope.userId !== task.userId) {
+    || identity.taskId !== task.id || identity.rootTaskId !== task.rootTaskId || identity.ownerId !== task.leaseOwner
+    || identity.attemptCount !== task.attemptCount || task.status !== "running" || task.interruptRequestedAt !== null
+    || scope.userId !== task.userId) {
     throw new Error("child_context_owner_mismatch")
   }
 }

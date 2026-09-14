@@ -41,6 +41,19 @@ describe("child context", () => {
     await expect(createChildContextBuilder(task).build({ scope: { userId: task.userId }, identity: { ...identity, taskId: "sibling" }, stepId: "step-1", snapshot: childContextSnapshot(task) })).rejects.toThrow("child_context_owner_mismatch")
   })
 
+  it.each([
+    ["owner mismatch", { leaseOwner: "worker-2" }],
+    ["non-running task", { status: "waiting" as const }],
+    ["interrupt requested", { interruptRequestedAt: new Date("2026-09-09T11:30:00.000Z") }],
+  ] as const)("fails closed for %s before reading the mailbox", async (_label, overrides) => {
+    const fencedTask: SubagentTaskRecord = { ...task, ...overrides }
+    const listPendingMessages = vi.fn<ChildMailboxReader["listPendingMessages"]>(async () => [mailboxMessage({ result: "must not be read" })])
+    const builder = createChildContextBuilder(fencedTask, childContextSnapshot(fencedTask), { listPendingMessages })
+
+    await expect(builder.build({ scope: { userId: fencedTask.userId }, identity, stepId: "step-1", snapshot: childContextSnapshot(fencedTask) })).rejects.toThrow("child_context_owner_mismatch")
+    expect(listPendingMessages).not.toHaveBeenCalled()
+  })
+
   it("reads pending mailbox messages in the child scope and normalizes payload data", async () => {
     const listPendingMessages = vi.fn<ChildMailboxReader["listPendingMessages"]>(async input => {
       expect(input).toEqual({ userId: task.userId, sessionId: task.sessionId, toTaskId: task.id, limit: 20 })
