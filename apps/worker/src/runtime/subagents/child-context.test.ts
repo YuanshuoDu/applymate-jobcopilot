@@ -74,6 +74,26 @@ describe("child context", () => {
     expect(builder.getMailboxMessageIds()).toEqual(["mailbox-1"])
   })
 
+  it("excludes cross-turn mailbox rows before caching or projecting them", async () => {
+    const consumeMessages = vi.fn()
+    const listPendingMessages = vi.fn<ChildMailboxReader["listPendingMessages"]>(async () => [
+      mailboxMessage({ result: "stale" }, { id: "mailbox-stale", turnId: "turn-old" }),
+      mailboxMessage({ result: "current" }, { id: "mailbox-current" }),
+    ])
+    const mailboxStore = { listPendingMessages, consumeMessages }
+    const builder = createChildContextBuilder(task, childContextSnapshot(task), mailboxStore)
+
+    const context = await builder.build({ scope: { userId: task.userId }, identity, stepId: "step-1", snapshot: childContextSnapshot(task) })
+    const pendingBlocks = context.blocks.filter(block => block.layer === "pending_input")
+
+    expect(pendingBlocks.map(block => block.id)).toEqual(["mailbox:mailbox-current"])
+    expect(context.canonicalJson).toContain('"result":"current"')
+    expect(context.canonicalJson).not.toContain("mailbox-stale")
+    expect(context.canonicalJson).not.toContain('"result":"stale"')
+    expect(builder.getMailboxMessageIds()).toEqual(["mailbox-current"])
+    expect(consumeMessages).not.toHaveBeenCalled()
+  })
+
   it("bounds oversized ASCII payloads with a serializable marker", async () => {
     const oversized = "a".repeat(CHILD_MAILBOX_PAYLOAD_BYTE_LIMIT + 128)
     const listPendingMessages = vi.fn<ChildMailboxReader["listPendingMessages"]>(async () => [mailboxMessage({ oversized })])

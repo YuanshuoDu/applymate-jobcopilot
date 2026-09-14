@@ -62,7 +62,8 @@ export class PgCoordinationStore implements CoordinationStore {
         JOIN "agent_sessions" AS session ON session."id" = message."sessionId"
         JOIN "sub_agent_tasks" AS target ON target."id" = message."toTaskId" AND target."sessionId" = message."sessionId"
         WHERE message."sessionId" = $1 AND session."userId" = $2 AND message."toTaskId" = $3
-          AND target."id" = $3 AND target."sessionId" = $1 AND message."consumedAt" IS NULL
+          AND target."id" = $3 AND target."sessionId" = $1 AND message."turnId" = target."turnId"
+          AND message."consumedAt" IS NULL
         ORDER BY message."createdAt" ASC, message."id" ASC LIMIT $4`,
       [input.sessionId, input.userId, input.toTaskId, limit])
       return result.rows.map(row => mailboxMessageRow(row as Record<string, unknown>))

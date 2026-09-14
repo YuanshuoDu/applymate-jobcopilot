@@ -86,7 +86,7 @@ class FakeClient {
       const toTaskId = String(values[2])
       const limit = Number(values[3])
       const pending = this.mailboxRows
-        .filter(row => row.sessionId === sessionId && row.toTaskId === toTaskId && row.consumedAt === null)
+        .filter(row => row.sessionId === sessionId && row.toTaskId === toTaskId && row.turnId === task.turnId && row.consumedAt === null)
         .sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime() || left.id.localeCompare(right.id))
         .slice(0, limit)
       return { rows: pending.map(row => ({ ...row })), rowCount: pending.length }
@@ -126,6 +126,7 @@ describe("PgCoordinationStore", () => {
       mailboxRow({ id: "message-z", createdAt: sameTime, payload: { order: "z" } }),
       mailboxRow({ id: "message-a", createdAt: sameTime, payload: { order: "a" }, deliveredAt }),
       mailboxRow({ id: "message-old", createdAt: new Date("2026-09-03T00:00:00.000Z"), payload: { order: "old" } }),
+      mailboxRow({ id: "message-cross-turn", turnId: "turn-old", createdAt: new Date("2026-09-03T00:00:00.000Z"), payload: { order: "stale" } }),
       mailboxRow({ id: "message-consumed", consumedAt: new Date("2026-09-03T00:02:00.000Z") }),
       mailboxRow({ id: "message-foreign", sessionId: "session-b", toTaskId: "task-foreign" }),
     ])
@@ -139,6 +140,7 @@ describe("PgCoordinationStore", () => {
       ])
     const read = client.queries.find(query => query.sql.includes('FROM "agent_mailbox_messages"') && query.sql.includes("ORDER BY"))
     expect(read?.sql).toContain('message."consumedAt" IS NULL')
+    expect(read?.sql).toContain('message."turnId" = target."turnId"')
     expect(read?.sql).toContain('ORDER BY message."createdAt" ASC, message."id" ASC')
     expect(read?.values).toEqual(["session-a", "user-a", "task-1", 100])
   })

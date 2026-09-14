@@ -166,7 +166,8 @@ export function createChildContextBuilder(task: SubagentTaskRecord, initial = ch
       const pendingMessages = mailboxReader
         ? await mailboxReader.listPendingMessages({ userId: task.userId, sessionId: task.sessionId, toTaskId: task.id, limit: CHILD_MAILBOX_READ_LIMIT })
         : []
-      const scopedMessages = pendingMessages.filter(message => typeof message.id === "string" && message.id.length > 0 && message.sessionId === task.sessionId && message.toTaskId === task.id)
+      const scopedMessages = pendingMessages.filter(message => typeof message.id === "string" && message.id.length > 0
+        && message.sessionId === task.sessionId && message.turnId === task.turnId && message.toTaskId === task.id)
       const seenThisBuild = new Set<string>()
       let omittedThisBuild = 0
       for (const message of scopedMessages) {
