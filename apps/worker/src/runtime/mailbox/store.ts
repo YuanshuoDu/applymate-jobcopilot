@@ -101,8 +101,8 @@ export class PgCoordinationStore implements CoordinationStore {
     return transaction(this.pool, input.userId, async client => {
       await requireSession(client, input)
       await requireTurn(client, input)
-      await requireTask(client, input.userId, input.sessionId, input.toTaskId, "Target task is unavailable")
-      if (input.fromTaskId) await requireTask(client, input.userId, input.sessionId, input.fromTaskId, "Sender task is unavailable")
+      await requireTask(client, input.userId, input.sessionId, input.toTaskId, "Target task is unavailable", input.turnId)
+      if (input.fromTaskId) await requireTask(client, input.userId, input.sessionId, input.fromTaskId, "Sender task is unavailable", input.turnId)
       const existing = await client.query(`SELECT "id", "sessionId", "turnId", "fromTaskId", "toTaskId", "kind", "payload", "idempotencyKey", "createdAt"
         FROM "agent_mailbox_messages" WHERE "sessionId" = $1 AND "idempotencyKey" = $2`, [input.sessionId, input.idempotencyKey])
       if (existing.rows[0]) {
@@ -195,9 +195,12 @@ async function requireTurn(client: Queryable, input: { userId: string; sessionId
   const result = await client.query(`SELECT 1 FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`, [input.turnId, input.sessionId, input.userId])
   if (!result.rows[0]) throw new CoordinationError("coordination_scope_error", "Turn is unavailable")
 }
-async function requireTask(client: Queryable, userId: string, sessionId: string, taskId: string, message: string): Promise<void> {
+async function requireTask(client: Queryable, userId: string, sessionId: string, taskId: string, message: string, turnId?: string): Promise<void> {
+  const turnPredicate = turnId === undefined ? "" : ` AND task."turnId" = $4`
+  const values: unknown[] = [taskId, sessionId, userId]
+  if (turnId !== undefined) values.push(turnId)
   const result = await client.query(`SELECT 1 FROM "sub_agent_tasks" task JOIN "agent_sessions" session ON session."id" = task."sessionId"
-    WHERE task."id" = $1 AND task."sessionId" = $2 AND session."userId" = $3`, [taskId, sessionId, userId])
+    WHERE task."id" = $1 AND task."sessionId" = $2 AND session."userId" = $3${turnPredicate}`, values)
   if (!result.rows[0]) throw new CoordinationError("coordination_task_not_found", message)
 }
 function taskRow(row: Record<string, unknown>): CoordinationTaskView {

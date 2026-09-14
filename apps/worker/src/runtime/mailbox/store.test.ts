@@ -44,6 +44,7 @@ class FakeClient {
     mailboxRows: readonly MailboxRow[] = [],
     private readonly sessionUser = "user-a",
     private readonly ownerTask: OwnerTaskState = activeOwnerTask(),
+    private readonly taskTurnIds: Readonly<Record<string, string>> = {},
   ) {
     this.rows = { ...task, createdAt: new Date("2026-09-03T00:00:00.000Z") }
     this.mailboxRows = mailboxRows.map(row => ({ ...row }))
@@ -59,6 +60,13 @@ class FakeClient {
   async query(sql: unknown, values: readonly unknown[] = []): Promise<{ rows: Record<string, unknown>[]; rowCount: number }> {
     const text = String(sql)
     this.queries.push({ sql: text, values })
+    if (text.includes("FROM \"sub_agent_tasks\" task") && text.includes("SELECT 1")) {
+      const taskId = String(values[0])
+      const taskTurnId = this.taskTurnIds[taskId] ?? (taskId === task.id ? String(this.rows.turnId) : undefined)
+      const requestedTurnId = text.includes('task."turnId" = $4') ? String(values[3]) : undefined
+      const valid = this.mode === "task" && taskTurnId !== undefined && (requestedTurnId === undefined || taskTurnId === requestedTurnId)
+      return valid ? { rows: [this.rows], rowCount: 1 } : { rows: [], rowCount: 0 }
+    }
     if (text.includes("FROM \"sub_agent_tasks\" task") && text.includes("SELECT")) return { rows: this.mode === "task" ? [this.rows] : [], rowCount: this.mode === "task" ? 1 : 0 }
     if (text.includes('FROM "agent_sessions"') && text.includes("FOR UPDATE") && text.includes('"status" NOT IN')) {
       return ["aborted", "archived"].includes(this.sessionStatus) || String(values[1]) !== this.sessionUser ? { rows: [], rowCount: 0 } : { rows: [{ id: "ok" }], rowCount: 1 }
@@ -257,6 +265,20 @@ describe("PgCoordinationStore", () => {
     expect(client.queries.find(query => query.sql.includes("set_config('app.user_id'"))?.values).toContain("user-a")
     const sessionGuard = client.queries.find(query => query.sql.includes('FROM "agent_sessions"') && query.sql.includes("FOR UPDATE"))?.sql ?? ""
     expect(sessionGuard).toContain('"status" NOT IN (\'aborted\', \'archived\')')
+    const taskGuard = client.queries.find(query => query.sql.includes('FROM "sub_agent_tasks" task') && query.sql.includes('task."turnId" = $4'))
+    expect(taskGuard?.values).toEqual(["task-1", "session-a", "user-a", "turn-a"])
+  })
+
+  it.each(["target", "sender"] as const)("rejects a %s task from another turn before mailbox writes", async side => {
+    const taskTurnIds: Readonly<Record<string, string>> = side === "target" ? { "task-1": "turn-old" } : { "task-sender": "turn-old" }
+    const client = new FakeClient("task", "running", [], "user-a", activeOwnerTask(), taskTurnIds)
+    const store = new PgCoordinationStore(pool(client))
+    const fromTaskId = side === "sender" ? "task-sender" : null
+
+    await expect(store.sendMessage({ userId: "user-a", sessionId: "session-a", turnId: "turn-a", fromTaskId, toTaskId: "task-1", kind: "result", payload: { ok: true }, idempotencyKey: `cross-turn-${side}` }))
+      .rejects.toMatchObject({ code: "coordination_task_not_found" })
+    expect(client.queries.some(query => query.sql.includes('INSERT INTO "agent_mailbox_messages"'))).toBe(false)
+    expect(client.queries.map(query => query.sql)).toContain("ROLLBACK")
   })
 
   it.each(["aborted", "archived"] as const)("rejects sendMessage for a %s session before any write", async sessionStatus => {

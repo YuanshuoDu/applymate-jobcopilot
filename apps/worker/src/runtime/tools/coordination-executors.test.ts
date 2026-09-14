@@ -196,6 +196,19 @@ describe("coordination executors", () => {
       .rejects.toThrow("Subagent task is unavailable")
   })
 
+  it.each(["target", "sender"] as const)("fails closed when the %s task belongs to another turn", async side => {
+    const runtime = makeRuntime()
+    const crossed = makeTask({ id: "crossed", turnId: "turn-old", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/crossed", depth: 1 })
+    runtime.store.tasks.set(crossed.id, crossed)
+    const caller = side === "sender" ? context({ taskId: crossed.id, rootTaskId: "root-1" }) : context()
+    const taskId = side === "target" ? crossed.id : "root-1"
+
+    await expect(executeSendMessage(caller, { idempotencyKey: `cross-turn-${side}`, taskId, kind: "probe", payload: null }, runtime.options))
+      .rejects.toMatchObject({ code: "coordination_task_not_found" })
+    expect(runtime.store.messages).toHaveLength(0)
+    expect(runtime.store.activities).toHaveLength(0)
+  })
+
   it("delegates wait to the durable AH2-025 port and never starts a Worker", async () => {
     const runtime = makeRuntime()
     const child = makeTask({ id: "child", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/child", depth: 1, status: "queued" })

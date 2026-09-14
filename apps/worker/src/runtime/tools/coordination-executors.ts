@@ -61,14 +61,19 @@ export async function executeSpawn(context: ToolExecutionContext, input: SpawnSu
 }
 
 export async function executeSendMessage(context: ToolExecutionContext, input: SendMessageInput, options: CoordinationExecutorOptions) {
-  const target = await visibleTask(context, input.taskId, options)
-  const sender = context.taskId ? await visibleTask(context, context.taskId, options) : null
+  const target = currentTurnTask(context, await visibleTask(context, input.taskId, options))
+  const sender = context.taskId ? currentTurnTask(context, await visibleTask(context, context.taskId, options)) : null
   const result = await options.store.sendMessage({
     userId: context.scope.userId, sessionId: context.sessionId, turnId: context.turnId,
     fromTaskId: sender?.id ?? null, toTaskId: target.id, kind: input.kind, payload: input.payload, idempotencyKey: input.idempotencyKey,
   })
   await activity(context, options, "send_message", target.id, { kind: input.kind, duplicate: result.duplicate }, input.idempotencyKey)
   return { messageId: result.message.id, taskId: target.id, status: result.duplicate ? "duplicate" as const : "queued" as const }
+}
+
+function currentTurnTask(context: ToolExecutionContext, task: CoordinationTaskView): CoordinationTaskView {
+  if (task.turnId !== context.turnId) throw new CoordinationError("coordination_task_not_found", "Subagent task is unavailable")
+  return task
 }
 
 export async function executeWaitSubagents(context: ToolExecutionContext, input: WaitSubagentsInput, options: CoordinationExecutorOptions) {
