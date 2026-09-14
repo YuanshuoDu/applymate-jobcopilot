@@ -135,6 +135,17 @@ describe("child evidence binding", () => {
     expect(entry(index, "job", "job-1")).toBeDefined()
   })
 
+  it("accepts restored non-evidence read observations without projecting evidence", () => {
+    const index = createObservedEvidenceIndex()
+    hydrateObservedEvidence(index, [
+      restored("state", "application.get_state", { jobs: [{ id: "job-1", source: "greenhouse" }] }),
+      restored("tool-result", "tool_results.read", { facts: [{ id: "fact-1", source: "persona.database" }] }),
+    ])
+
+    expect(index.entries.size).toBe(0)
+    expect(index.conflicts.size).toBe(0)
+  })
+
   it.each([
     ["malformed shape", restored("bad", "jobs.search", { jobs: [] }, { errorCode: undefined })],
     ["foreign tool", restored("foreign", "admin.lookup", { jobs: [] })],

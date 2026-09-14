@@ -8,7 +8,7 @@ const MAX_EVIDENCE_ENTRIES = 50
 const MAX_EVIDENCE_FIELD_LENGTH = 256
 const MAX_RESTORED_OBSERVATIONS = 256
 const RESTORED_TOOL_KEYS = ["toolCallId", "toolName", "input", "status", "output", "errorCode"] as const
-const RESTORED_READ_TOOLS = new Set(["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"])
+const RESTORED_READ_TOOLS = new Set(["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base", "application.get_state", "tool_results.read"])
 type ObservedEvidenceKind = "job" | "persona" | "resume"
 
 export type ObservedEvidenceIndex = {
