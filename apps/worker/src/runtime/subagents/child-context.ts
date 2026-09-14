@@ -1,4 +1,5 @@
 import type { RepositoryJsonValue, TenantScope } from "@jobcopilot/agent-protocol"
+import { Buffer } from "node:buffer"
 
 import type { ExecutionOwnerFence } from "../execution-owner.js"
 import type { StepContext, StepContextSnapshot, ContextBlock, ContextSeedBlock } from "../context/step-context-builder.js"
@@ -6,6 +7,8 @@ import type { CoordinationMailboxMessage } from "../tools/coordination-types.js"
 import type { SubagentTaskRecord } from "./types.js"
 
 const CHILD_MAILBOX_READ_LIMIT = 20
+/** Maximum UTF-8 size of a normalized mailbox payload before it is summarized. */
+export const CHILD_MAILBOX_PAYLOAD_BYTE_LIMIT = 8 * 1024
 
 /** The child context only needs the server-owned pending-read capability. */
 export type ChildMailboxReader = {
@@ -30,6 +33,53 @@ function json(value: unknown): RepositoryJsonValue {
   return null
 }
 
+/**
+ * Normalizes a mailbox payload before measuring it. Sorting keys makes the
+ * encoded form stable, while the path set turns cyclic input into safe JSON.
+ */
+function mailboxJson(value: unknown, path = new Set<object>()): RepositoryJsonValue {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value
+  if (typeof value === "number") return Number.isFinite(value) ? value : null
+  if (!value || typeof value !== "object") return null
+  if (path.has(value)) return null
+  path.add(value)
+  try {
+    if (Array.isArray(value)) return value.map(child => mailboxJson(child, path))
+    const record = value as Record<string, unknown>
+    return Object.fromEntries(Object.keys(record).sort().flatMap(key => {
+      const child = record[key]
+      return child === undefined ? [] : [[key, mailboxJson(child, path)]]
+    }))
+  } finally {
+    path.delete(value)
+  }
+}
+
+function utf8Prefix(value: string, maxBytes: number): string {
+  if (maxBytes <= 0) return ""
+  let bytes = 0
+  let prefix = ""
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, "utf8")
+    if (bytes + characterBytes > maxBytes) break
+    prefix += character
+    bytes += characterBytes
+  }
+  return prefix
+}
+
+function boundedMailboxPayload(value: unknown): RepositoryJsonValue {
+  const normalized = mailboxJson(value)
+  const encoded = JSON.stringify(normalized)
+  const byteLength = Buffer.byteLength(encoded, "utf8")
+  if (byteLength <= CHILD_MAILBOX_PAYLOAD_BYTE_LIMIT) return normalized
+  return {
+    truncated: true,
+    byteLength,
+    preview: utf8Prefix(encoded, CHILD_MAILBOX_PAYLOAD_BYTE_LIMIT),
+  }
+}
+
 function seed(layer: ContextBlock["layer"], role: ContextBlock["role"], trust: ContextBlock["trust"], source: string, item: ContextSeedBlock): ContextBlock {
   return { id: item.id, layer, role, trust, source, content: json(item.content) }
 }
@@ -48,7 +98,7 @@ function mailboxBlock(message: CoordinationMailboxMessage): ContextBlock {
       fromTaskId: message.fromTaskId,
       toTaskId: message.toTaskId,
       kind: message.kind,
-      payload: json(message.payload),
+      payload: boundedMailboxPayload(message.payload),
       idempotencyKey: message.idempotencyKey,
       createdAt: mailboxDate(message.createdAt),
       deliveredAt: mailboxDate(message.deliveredAt),

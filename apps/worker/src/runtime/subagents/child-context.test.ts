@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from "vitest"
 
-import { childContextSnapshot, createChildContextBuilder, type ChildMailboxReader } from "./child-context.js"
+import { childContextSnapshot, createChildContextBuilder, CHILD_MAILBOX_PAYLOAD_BYTE_LIMIT, type ChildMailboxReader } from "./child-context.js"
 import type { SubagentTaskRecord } from "./types.js"
 import type { ExecutionOwnerFence } from "../execution-owner.js"
 import type { CoordinationMailboxMessage } from "../tools/coordination-types.js"
+import { Buffer } from "node:buffer"
 
 const task = {
   id: "child-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/child-1", depth: 1,
@@ -58,6 +59,50 @@ describe("child context", () => {
     expect(context.inputThroughSequence).toBe(0n)
     expect(context.consumedInputIds).toEqual([])
     expect(builder.getMailboxMessageIds()).toEqual(["mailbox-1"])
+  })
+
+  it("bounds oversized ASCII payloads with a serializable marker", async () => {
+    const oversized = "a".repeat(CHILD_MAILBOX_PAYLOAD_BYTE_LIMIT + 128)
+    const listPendingMessages = vi.fn<ChildMailboxReader["listPendingMessages"]>(async () => [mailboxMessage({ oversized })])
+    const builder = createChildContextBuilder(task, childContextSnapshot(task), { listPendingMessages })
+    const context = await builder.build({ scope: { userId: task.userId }, identity, stepId: "step-1", snapshot: childContextSnapshot(task) })
+    const block = context.blocks.find(item => item.layer === "pending_input")
+    const payload = (block?.content as { payload?: unknown }).payload
+
+    expect(payload).toMatchObject({ truncated: true, byteLength: expect.any(Number), preview: expect.any(String) })
+    const marker = payload as { truncated: boolean; byteLength: number; preview: string }
+    expect(marker.byteLength).toBeGreaterThan(CHILD_MAILBOX_PAYLOAD_BYTE_LIMIT)
+    expect(Buffer.byteLength(marker.preview, "utf8")).toBeLessThanOrEqual(CHILD_MAILBOX_PAYLOAD_BYTE_LIMIT)
+    expect(context.canonicalJson).not.toContain(oversized)
+    expect(() => JSON.stringify(JSON.parse(context.canonicalJson) as unknown)).not.toThrow()
+  })
+
+  it("bounds Unicode payloads at UTF-8 code-point boundaries", async () => {
+    const oversized = "😀界".repeat(CHILD_MAILBOX_PAYLOAD_BYTE_LIMIT)
+    const listPendingMessages = vi.fn<ChildMailboxReader["listPendingMessages"]>(async () => [mailboxMessage({ oversized })])
+    const builder = createChildContextBuilder(task, childContextSnapshot(task), { listPendingMessages })
+    const context = await builder.build({ scope: { userId: task.userId }, identity, stepId: "step-1", snapshot: childContextSnapshot(task) })
+    const block = context.blocks.find(item => item.layer === "pending_input")
+    const payload = (block?.content as { payload?: unknown }).payload as { truncated: boolean; byteLength: number; preview: string }
+
+    expect(payload.truncated).toBe(true)
+    expect(payload.byteLength).toBeGreaterThan(CHILD_MAILBOX_PAYLOAD_BYTE_LIMIT)
+    expect(Buffer.byteLength(payload.preview, "utf8")).toBeLessThanOrEqual(CHILD_MAILBOX_PAYLOAD_BYTE_LIMIT)
+    expect(payload.preview).not.toContain("�")
+    expect(Buffer.from(payload.preview, "utf8").toString("utf8")).toBe(payload.preview)
+    expect(context.canonicalJson).not.toContain(oversized)
+  })
+
+  it("normalizes cyclic payloads without breaking canonical JSON", async () => {
+    const cyclic: Record<string, unknown> = { value: "kept", omitted: undefined, invalid: Number.NaN }
+    cyclic.self = cyclic
+    const listPendingMessages = vi.fn<ChildMailboxReader["listPendingMessages"]>(async () => [mailboxMessage(cyclic)])
+    const builder = createChildContextBuilder(task, childContextSnapshot(task), { listPendingMessages })
+    const context = await builder.build({ scope: { userId: task.userId }, identity, stepId: "step-1", snapshot: childContextSnapshot(task) })
+    const block = context.blocks.find(item => item.layer === "pending_input")
+
+    expect(block?.content).toMatchObject({ payload: { invalid: null, self: null, value: "kept" } })
+    expect(() => JSON.parse(context.canonicalJson) as unknown).not.toThrow()
   })
 
   it("propagates mailbox reader errors without a fallback", async () => {
