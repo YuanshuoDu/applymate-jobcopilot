@@ -812,3 +812,13 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Astra independently verified the coordination-executor suite at **16/16**, Worker 	sc --noEmit --skipLibCheck, the shared build through test preflight, and git diff --check.
 - This remains a candidate increment: no live PostgreSQL/RLS wait transaction, Redis/BullMQ wakeup, process restart, cross-process concurrency, provider/browser behavior, or complete child-parent E2E was run. The cognitive gate remains disabled and overall acceptance remains **P0 accepted 1/8 (12.5%)**.
 
+
+
+## P4-61 integration / verification
+
+- Integrated code commit: 4d7bd2c2.
+- wait_subagents now refreshes non-waiting targets and returns exactly {taskId,status,role,result,failureReason} task evidence in stable target order. Results are server-read, recursively identity-stripped, sensitive-value redacted, and bounded to 2 KiB per task; failure reasons are bounded to 500 UTF-8 bytes. Waiting statuses keep the initial scoped task view.
+- CoordinationTaskView and PostgreSQL task projections now carry optional result/failure fields; tenant, session, current-turn and lineage fences are unchanged. This fills the direct ready-wait evidence gap used by canonical plan replay without exposing leases or user identity.
+- Astra independently verified the coordination-executor and mailbox-store suites at **43/43** (17 + 26), Worker 	sc --noEmit --skipLibCheck, shared build through test preflight, source line bounds, and git diff --check.
+- This remains a candidate increment: no live PostgreSQL/RLS wait transaction, Redis/BullMQ delivery, process restart, cross-process concurrency, provider/browser behavior, or complete child-parent E2E was run. The cognitive gate remains disabled and overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
