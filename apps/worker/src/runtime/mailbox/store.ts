@@ -17,7 +17,7 @@ type Queryable = Pick<pg.PoolClient, "query">
 
 const TASK_COLUMNS = `task."id", session."userId" AS "userId", task."sessionId", task."turnId", task."rootTaskId",
   task."parentTaskId", task."path", task."depth", task."role", task."taskType", task."status", task."goal",
-  task."attemptCount", task."maxAttempts", task."leaseOwner", task."leaseExpiresAt", task."interruptRequestedAt"`
+  task."attemptCount", task."maxAttempts", task."leaseOwner", task."leaseExpiresAt", task."interruptRequestedAt", task."result", task."failureReason"`
 const TERMINAL = ["completed", "failed", "interrupted", "cancelled", "closed"]
 const DEFAULT_MAILBOX_READ_LIMIT = 50
 const MAX_MAILBOX_READ_LIMIT = 100
@@ -204,7 +204,7 @@ async function requireTask(client: Queryable, userId: string, sessionId: string,
   if (!result.rows[0]) throw new CoordinationError("coordination_task_not_found", message)
 }
 function taskRow(row: Record<string, unknown>): CoordinationTaskView {
-  return { id: String(row.id), userId: String(row.userId), sessionId: String(row.sessionId), turnId: row.turnId ? String(row.turnId) : null, rootTaskId: String(row.rootTaskId ?? row.id), parentTaskId: row.parentTaskId ? String(row.parentTaskId) : null, path: String(row.path), depth: Number(row.depth), role: String(row.role), taskType: String(row.taskType), status: String(row.status) as CoordinationTaskView["status"], goal: String(row.goal), attemptCount: Number(row.attemptCount), maxAttempts: Number(row.maxAttempts), leaseOwner: row.leaseOwner ? String(row.leaseOwner) : null, leaseExpiresAt: row.leaseExpiresAt instanceof Date ? row.leaseExpiresAt : row.leaseExpiresAt ? new Date(String(row.leaseExpiresAt)) : null, interruptRequestedAt: row.interruptRequestedAt instanceof Date ? row.interruptRequestedAt : row.interruptRequestedAt ? new Date(String(row.interruptRequestedAt)) : null }
+  return { id: String(row.id), userId: String(row.userId), sessionId: String(row.sessionId), turnId: row.turnId ? String(row.turnId) : null, rootTaskId: String(row.rootTaskId ?? row.id), parentTaskId: row.parentTaskId ? String(row.parentTaskId) : null, path: String(row.path), depth: Number(row.depth), role: String(row.role), taskType: String(row.taskType), status: String(row.status) as CoordinationTaskView["status"], goal: String(row.goal), attemptCount: Number(row.attemptCount), maxAttempts: Number(row.maxAttempts), leaseOwner: row.leaseOwner ? String(row.leaseOwner) : null, leaseExpiresAt: row.leaseExpiresAt instanceof Date ? row.leaseExpiresAt : row.leaseExpiresAt ? new Date(String(row.leaseExpiresAt)) : null, interruptRequestedAt: row.interruptRequestedAt instanceof Date ? row.interruptRequestedAt : row.interruptRequestedAt ? new Date(String(row.interruptRequestedAt)) : null, result: row.result ?? null, failureReason: row.failureReason == null ? null : String(row.failureReason) }
 }
 async function requireMailboxOwner(client: Queryable, input: { userId: string; sessionId: string; toTaskId: string }, owner: CoordinationMailboxOwnerFence): Promise<void> {
   const result = await client.query(`SELECT target."id"

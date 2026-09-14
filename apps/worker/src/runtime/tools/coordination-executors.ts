@@ -1,4 +1,5 @@
 import { CoordinationError, type CoordinationRuntimeOptions, type CoordinationTaskView } from "./coordination-types.js"
+import { sanitizeLifecyclePreview } from "./redaction.js"
 import type { ToolExecutionContext } from "./types.js"
 import type {
   CloseSubagentInput,
@@ -10,6 +11,9 @@ import type {
 } from "./coordination-tools.js"
 
 export type CoordinationExecutorOptions = CoordinationRuntimeOptions
+const WAIT_RESULT_MAX_BYTES = 2 * 1024
+const WAIT_FAILURE_MAX_BYTES = 500
+const FOREIGN_RESULT_KEYS = new Set(["userId", "sessionId", "turnId", "stepId", "taskId", "parentTaskId", "rootTaskId", "ownerId", "lease", "leaseOwnerId", "leaseVersion", "idempotencyKey", "capabilities", "permissions", "allowedCapabilities", "budgetLimit", "maxBudget"])
 
 export async function executeSpawn(context: ToolExecutionContext, input: SpawnSubagentInput, options: CoordinationExecutorOptions) {
   const parentTaskId = await resolveSpawnParent(context, input.parentTaskId, options)
@@ -85,8 +89,9 @@ export async function executeWaitSubagents(context: ToolExecutionContext, input:
     taskId: current?.id ?? null, rootTaskId: current?.rootTaskId ?? context.rootTaskId ?? null,
     targetTaskIds: targets.map(task => task.id), mode: input.mode, timeoutMs: input.timeoutMs, idempotencyKey: input.idempotencyKey,
   })
+  const hydratedTargets = result.status === "waiting" ? targets : await Promise.all(targets.map(async task => currentTurnTask(context, await visibleTask(context, task.id, options))))
   await activity(context, options, "wait_subagents", current?.id ?? null, { status: result.status, targetCount: targets.length }, input.idempotencyKey)
-  return { waitId: result.waitId, status: result.status, taskIds: targets.map(task => task.id), deadlineAt: result.deadlineAt, matchedTaskIds: [...result.matchedTaskIds] }
+  return { waitId: result.waitId, status: result.status, taskIds: targets.map(task => task.id), deadlineAt: result.deadlineAt, matchedTaskIds: [...result.matchedTaskIds], tasks: hydratedTargets.map(waitTaskOutput) }
 }
 
 export async function executeListSubagents(context: ToolExecutionContext, input: ListSubagentsInput, options: CoordinationExecutorOptions) {
@@ -157,6 +162,23 @@ async function uniqueTasks(context: ToolExecutionContext, ids: readonly string[]
 
 function spawnOutput(task: CoordinationTaskView, replay: boolean) { return { taskId: task.id, rootTaskId: task.rootTaskId, parentTaskId: task.parentTaskId, path: task.path, depth: task.depth, status: task.status, replay } }
 function taskOutput(task: CoordinationTaskView) { return { taskId: task.id, rootTaskId: task.rootTaskId, parentTaskId: task.parentTaskId, path: task.path, depth: task.depth, role: task.role, taskType: task.taskType, status: task.status, attemptCount: task.attemptCount, maxAttempts: task.maxAttempts, leaseExpiresAt: task.leaseExpiresAt?.toISOString() ?? null, interruptRequestedAt: task.interruptRequestedAt?.toISOString() ?? null } }
+function waitTaskOutput(task: CoordinationTaskView) { return { taskId: task.id, status: task.status, role: task.role, result: waitResult(task.result), failureReason: boundedFailureReason(task.failureReason) } }
+function waitResult(value: unknown): ReturnType<typeof sanitizeLifecyclePreview> | null {
+  if (value === undefined || value === null) return null
+  try { return stripForeignResultKeys(sanitizeLifecyclePreview(value, WAIT_RESULT_MAX_BYTES)) }
+  catch { return { $truncated: true, summary: "Task result was omitted because it could not be safely encoded" } }
+}
+function stripForeignResultKeys(value: ReturnType<typeof sanitizeLifecyclePreview>): ReturnType<typeof sanitizeLifecyclePreview> {
+  if (Array.isArray(value)) return value.map(stripForeignResultKeys)
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).filter(([key]) => !FOREIGN_RESULT_KEYS.has(key)).map(([key, child]) => [key, stripForeignResultKeys(child)]))
+  return value
+}
+function boundedFailureReason(value: string | null | undefined): string | null {
+  if (value == null) return null
+  let result = ""
+  for (const character of value) { const next = result + character; if (Buffer.byteLength(next, "utf8") > WAIT_FAILURE_MAX_BYTES) break; result = next }
+  return result
+}
 function isTaskPathWithin(path: string, ancestorPath: string): boolean { return path.startsWith(`${ancestorPath}/`) }
 function managerError(error: unknown): CoordinationError { const code = error && typeof error === "object" && "code" in error && typeof error.code === "string" ? error.code : "manager_failed"; return new CoordinationError(`coordination_${code}`, error instanceof Error ? error.message : "Subagent manager operation failed") }
 async function activity(context: ToolExecutionContext, options: CoordinationExecutorOptions, operation: string, taskId: string | null, data: Record<string, unknown>, operationKey?: string): Promise<void> {

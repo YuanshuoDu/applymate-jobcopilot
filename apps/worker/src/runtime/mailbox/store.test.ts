@@ -45,8 +45,9 @@ class FakeClient {
     private readonly sessionUser = "user-a",
     private readonly ownerTask: OwnerTaskState = activeOwnerTask(),
     private readonly taskTurnIds: Readonly<Record<string, string>> = {},
+    private readonly taskEvidence: Pick<CoordinationTaskView, "result" | "failureReason"> = { result: null, failureReason: null },
   ) {
-    this.rows = { ...task, createdAt: new Date("2026-09-03T00:00:00.000Z") }
+    this.rows = { ...task, ...this.taskEvidence, createdAt: new Date("2026-09-03T00:00:00.000Z") }
     this.mailboxRows = mailboxRows.map(row => ({ ...row }))
   }
 
@@ -125,6 +126,15 @@ describe("PgCoordinationStore", () => {
     const read = client.queries.find(query => query.sql.includes("FROM \"sub_agent_tasks\" task"))
     expect(read?.values).toEqual(["task-1", "session-b", "user-b"])
     expect(client.queries.some(query => query.sql.includes("set_config('app.user_id'"))).toBe(true)
+  })
+
+  it("projects server-owned result and failure evidence from task reads", async () => {
+    const client = new FakeClient("task", "running", [], "user-a", activeOwnerTask(), {}, { result: { summary: "done" }, failureReason: "retry later" })
+    const store = new PgCoordinationStore(pool(client))
+    await expect(store.getTask({ userId: "user-a", sessionId: "session-a", taskId: "task-1" })).resolves.toMatchObject({ result: { summary: "done" }, failureReason: "retry later" })
+    const read = client.queries.find(query => query.sql.includes("FROM \"sub_agent_tasks\" task"))
+    expect(read?.sql).toContain('task."result"')
+    expect(read?.sql).toContain('task."failureReason"')
   })
 
   it("lists pending mailbox payloads in stable order and clamps the read limit", async () => {

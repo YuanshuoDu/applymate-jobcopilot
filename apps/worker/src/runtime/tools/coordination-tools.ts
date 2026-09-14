@@ -71,9 +71,13 @@ const SpawnOutputSchema = Type.Object({
   status: StatusSchema, replay: Type.Boolean(),
 }, { additionalProperties: false })
 const SendOutputSchema = Type.Object({ taskId: IdSchema, messageId: IdSchema, status: Type.Union([Type.Literal("queued"), Type.Literal("duplicate")]) }, { additionalProperties: false })
+const WaitTaskOutputSchema = Type.Object({
+  taskId: IdSchema, status: StatusSchema, role: Type.String({ minLength: 1, maxLength: 256 }), result: Type.Unknown(),
+  failureReason: Type.Union([Type.String({ maxLength: 500 }), Type.Null()]),
+}, { additionalProperties: false })
 const WaitOutputSchema = Type.Object({
   waitId: IdSchema, status: Type.Union([Type.Literal("waiting"), Type.Literal("ready"), Type.Literal("timed_out"), Type.Literal("interrupted"), Type.Literal("closed")]),
-  taskIds: Type.Array(IdSchema), deadlineAt: Type.String(), matchedTaskIds: Type.Array(IdSchema),
+  taskIds: Type.Array(IdSchema), deadlineAt: Type.String(), matchedTaskIds: Type.Array(IdSchema), tasks: Type.Array(WaitTaskOutputSchema, { minItems: 1, maxItems: 50 }),
 }, { additionalProperties: false })
 const TaskOutputSchema = Type.Object({
   taskId: IdSchema, rootTaskId: IdSchema, parentTaskId: Type.Union([IdSchema, Type.Null()]),

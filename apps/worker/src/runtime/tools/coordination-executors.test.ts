@@ -211,11 +211,48 @@ describe("coordination executors", () => {
 
   it("delegates wait to the durable AH2-025 port and never starts a Worker", async () => {
     const runtime = makeRuntime()
-    const child = makeTask({ id: "child", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/child", depth: 1, status: "queued" })
+    const child = makeTask({ id: "child", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/child", depth: 1, role: "scout", status: "queued" })
     runtime.store.tasks.set(child.id, child)
     const input: WaitSubagentsInput = { idempotencyKey: "wait-1", taskIds: [child.id], mode: "any", timeoutMs: 5000 }
-    await expect(executeWaitSubagents(context({ taskId: "root-1", rootTaskId: "root-1" }), input, runtime.options)).resolves.toMatchObject({ status: "ready", matchedTaskIds: ["child"] })
+    await expect(executeWaitSubagents(context({ taskId: "root-1", rootTaskId: "root-1" }), input, runtime.options)).resolves.toMatchObject({ status: "ready", matchedTaskIds: ["child"], tasks: [{ taskId: "child", status: "queued", role: "scout", result: null, failureReason: null }] })
     expect(runtime.wait.wait).toHaveBeenCalledWith(expect.objectContaining({ userId: "user-a", taskId: "root-1", rootTaskId: "root-1", targetTaskIds: ["child"], timeoutMs: 5000 }))
+  })
+
+  it("refreshes ready targets and returns redacted bounded task evidence", async () => {
+    const runtime = makeRuntime()
+    const child = makeTask({ id: "child", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/child", depth: 1, role: "scout", status: "queued" })
+    const large = makeTask({ id: "large", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/large", depth: 1, role: "scout", status: "queued" })
+    runtime.store.tasks.set(child.id, child)
+    runtime.store.tasks.set(large.id, large)
+    runtime.wait.wait = vi.fn(async () => {
+      runtime.store.tasks.set(child.id, makeTask({ ...child, status: "completed", result: { userId: "foreign-user", apiKey: "secret", summary: "ready" } }))
+      runtime.store.tasks.set(large.id, makeTask({ ...large, status: "failed", result: { summary: "x".repeat(3_000) }, failureReason: "é".repeat(300) }))
+      return { waitId: "wait-ready", status: "ready" as const, deadlineAt: "2026-09-03T00:01:00.000Z", matchedTaskIds: [child.id] }
+    })
+
+    const result = await executeWaitSubagents(context({ taskId: "root-1", rootTaskId: "root-1" }), { idempotencyKey: "wait-ready", taskIds: [child.id, large.id], mode: "any", timeoutMs: 5000 }, runtime.options)
+    expect(result.tasks).toEqual([
+      { taskId: "child", status: "completed", role: "scout", result: { apiKey: "[REDACTED]", summary: "ready" }, failureReason: null },
+      { taskId: "large", status: "failed", role: "scout", result: expect.objectContaining({ $truncated: true }), failureReason: expect.any(String) },
+    ])
+    expect(result.tasks[0]).not.toHaveProperty("userId")
+    expect(Buffer.byteLength(result.tasks[1]!.failureReason ?? "", "utf8")).toBeLessThanOrEqual(500)
+    expect(runtime.store.activities).toContain("wait_subagents")
+  })
+
+  it("returns the initial bounded task shape while a wait remains pending", async () => {
+    const runtime = makeRuntime()
+    const child = makeTask({ id: "child", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/child", depth: 1, role: "scout", status: "queued", result: { sessionId: "foreign-session", apiKey: "secret", summary: "pending" }, failureReason: "é".repeat(300) })
+    runtime.store.tasks.set(child.id, child)
+    runtime.wait.wait = vi.fn(async () => {
+      runtime.store.tasks.set(child.id, makeTask({ ...child, status: "completed", result: { summary: "late" } }))
+      return { waitId: "wait-pending", status: "waiting" as const, deadlineAt: "2026-09-03T00:01:00.000Z", matchedTaskIds: [] }
+    })
+
+    const result = await executeWaitSubagents(context({ taskId: "root-1", rootTaskId: "root-1" }), { idempotencyKey: "wait-pending", taskIds: [child.id], mode: "all", timeoutMs: 5000 }, runtime.options)
+    expect(result.tasks).toEqual([{ taskId: "child", status: "queued", role: "scout", result: { apiKey: "[REDACTED]", summary: "pending" }, failureReason: expect.any(String) }])
+    expect(result.tasks[0]).not.toHaveProperty("sessionId")
+    expect(Buffer.byteLength(result.tasks[0]!.failureReason ?? "", "utf8")).toBeLessThanOrEqual(500)
   })
 
   it("rejects a wait target from another turn before waiting or recording activity", async () => {

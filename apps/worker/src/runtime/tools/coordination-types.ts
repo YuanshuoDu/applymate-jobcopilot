@@ -6,7 +6,11 @@ export type CoordinationTaskView = Pick<SubagentTaskRecord,
   "id" | "userId" | "sessionId" | "turnId" | "rootTaskId" | "parentTaskId" | "path" | "depth" |
   "role" | "taskType" | "status" | "goal" | "attemptCount" | "maxAttempts" | "leaseOwner" |
   "leaseExpiresAt" | "interruptRequestedAt"
->
+> & {
+  /** Optional server-read evidence; never accepted from model tool input. */
+  readonly result?: unknown | null
+  readonly failureReason?: string | null
+}
 
 export type CoordinationMessage = {
   readonly id: string
