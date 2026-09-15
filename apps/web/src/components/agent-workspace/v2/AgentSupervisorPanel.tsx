@@ -7,6 +7,7 @@ import { useI18n } from '@/lib/i18n'
 
 import { flattenTaskTree, TaskTreePanel } from './TaskTreePanel'
 import { AgentSessionControlBar } from './AgentSessionControlBar'
+import { AgentTurnRetryControl } from './AgentTurnRetryControl'
 import { CognitiveAgendaCard, type CognitiveAgendaTaskLabel } from './cognitive-agenda-card'
 import { projectSupervisorTree, type SupervisorTaskSummary, type SupervisorTurnSummary } from './task-tree-projection'
 import type { AgentTimelineSnapshot } from './use-agent-timeline'
@@ -117,9 +118,16 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
     root: !task.parentTaskId,
   }])), [tasks])
   const selectedNode = useMemo(() => flattenTaskTree(nodes).find(node => node.id === selectedId), [nodes, selectedId])
+  const selectedTurn = useMemo(() => selectedNode?.kind === 'turn' && selectedNode.id.startsWith('turn:')
+    ? turns.find(turn => `turn:${turn.id}` === selectedNode.id) ?? null
+    : null, [selectedNode, turns])
   const selectedItem = selectedNode?.itemId ? timeline.items.find(item => item.id === selectedNode.itemId) : undefined
   const loading = Boolean(sessionId && (timeline.restoring || turnsQuery.loading || tasksQuery.loading))
   const error = timeline.error ?? turnsQuery.error ?? tasksQuery.error
+  const refetchSupervisorRecords = useCallback(() => {
+    refetchTurns()
+    refetchTasks()
+  }, [refetchTasks, refetchTurns])
 
   if (!sessionId) return null
 
@@ -177,6 +185,12 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
             {selectedNode.resultAvailable && <span style={{ color: 'var(--text-muted)', fontSize: 10 }}>{t('agent.toolResult')}</span>}
           </div>
           {selectedItem && <EvidenceSummary item={selectedItem} t={t} />}
+          <AgentTurnRetryControl
+            sessionId={sessionId}
+            turn={selectedTurn}
+            controlGate={timeline.controlGate}
+            onAccepted={refetchSupervisorRecords}
+          />
         </section>
       )}
     </aside>
