@@ -2,6 +2,8 @@
 
 import { AGENT_STREAM_SCHEMA_VERSION } from '@jobcopilot/agent-protocol'
 import { createCognitiveAgendaState, reduceCognitiveAgenda, type TimelineCognitiveAgendaState } from './timeline-cognitive-agenda'
+import { isPlanLedgerEventType, parsePlanLedgerEvent } from './plan-ledger-parser'
+import { createPlanLedgerState, reducePlanLedger, type PlanLedgerState } from './plan-ledger-view'
 import { emptyTimelineSteeringMarkerState, reduceTimelineSteeringMarkers, STEERING_MARKER_EVENT_TYPE, STEERING_MARKER_MAX_EVENTS, type TimelineSteeringMarkerEvent, type TimelineSteeringMarkerState } from './timeline-steering-markers'
 import { createTimelineSessionControlState, isSessionControlEventCandidate, parseTimelineSessionControl, reduceTimelineSessionControl, type TimelineSessionControlEvent, type TimelineSessionControlState } from './timeline-session-control'
 import { appendFallbackEvent, appendTimelineEvent, buildIndexes, compareItems, integer, isAfter, isRecord, itemFromTimelineEvent, mergeContent, numberOrUndefined, sequence, stringOrNull, timestamp } from './timeline-reducer-utils'
@@ -64,6 +66,7 @@ export interface TimelineState {
   sessionControl: TimelineSessionControlState
   lifecycleRevision: number
   cognitiveAgenda: TimelineCognitiveAgendaState
+  planLedger: PlanLedgerState
   steeringMarkers: TimelineSteeringMarkerState
   steeringMarkerEvents: readonly TimelineSteeringMarkerEvent[]
   connection: TimelineConnection
@@ -86,6 +89,7 @@ const KNOWN_EVENT_TYPES = new Set([
   'step.started', 'step.completed', 'item.started', 'item.delta', 'item.completed', 'item.failed',
   'input.accepted', 'input.consumed', 'tool_call.started', 'tool_call.completed', 'tool_call.failed',
   'policy.decision', 'approval.requested', 'approval.resolved', 'approval.consumed', 'approval.expired',
+  'plan.revision', 'plan.command', 'plan.observation',
   'question.answered', 'question.cancelled', 'external_action.reserved', 'stream.overflow', 'cognitive.agenda', STEERING_MARKER_EVENT_TYPE,
 ])
 
@@ -104,7 +108,7 @@ export function createTimelineState(sessionId: string): TimelineState {
     sessionId, events: [], byId: new Map(), byTurnId: new Map(), byToolCallId: new Map(), lastEventId: null,
     transientItems: new Map(), fallbackItems: [],
     itemIds: [], itemsById: {}, itemIdsByTurnId: {}, itemIdsByTaskId: {},
-    processedEventIds: {}, lastSequence: null, sessionControl: createTimelineSessionControlState(), lifecycleRevision: 0, cognitiveAgenda: createCognitiveAgendaState(sessionId), steeringMarkers: emptyTimelineSteeringMarkerState(), steeringMarkerEvents: [], connection: 'idle', snapshotRequired: false,
+    processedEventIds: {}, lastSequence: null, sessionControl: createTimelineSessionControlState(), lifecycleRevision: 0, cognitiveAgenda: createCognitiveAgendaState(sessionId), planLedger: createPlanLedgerState(sessionId), steeringMarkers: emptyTimelineSteeringMarkerState(), steeringMarkerEvents: [], connection: 'idle', snapshotRequired: false,
   }
 }
 
@@ -177,6 +181,8 @@ function reduceItems(state: TimelineState, values: unknown[], source: TimelineIt
 }
 
 function reduceEvent(state: TimelineState, value: unknown): TimelineState {
+  const planCandidate = isRecord(value) && isPlanLedgerEventType(value.type)
+  if (planCandidate) return reducePlanEvent(state, value)
   const sessionControl = parseTimelineSessionControl(value, state.sessionId)
   if (sessionControl) return reduceSessionControlEvent(state, sessionControl)
   if (isSessionControlEventCandidate(value)) return state
@@ -213,6 +219,24 @@ function reduceEvent(state: TimelineState, value: unknown): TimelineState {
   if (!KNOWN_EVENT_TYPES.has(event.type)) next = { ...next, fallbackItems: appendFallbackEvent(next.fallbackItems, event) }
   const item = itemFromTimelineEvent(event, status, existing, undefined, normalizeTimelineItem)
   return item ? upsertItem(next, item, item.source === 'unknown' ? 'unknown' : 'durable') : next
+}
+
+function reducePlanEvent(state: TimelineState, value: Record<string, unknown>): TimelineState {
+  const parsed = parsePlanLedgerEvent(value, state.sessionId)
+  if (!parsed || state.processedEventIds[parsed.id] || !isAfter(parsed.sequence, state.lastSequence)) return state
+  const event = normalizeTimelineEvent(value)
+  if (!event || event.sessionId !== state.sessionId) return state
+  const planLedger = reducePlanLedger(state.planLedger, value)
+  if (planLedger === state.planLedger) return state
+  const processedEventIds: Record<string, true> = { ...state.processedEventIds, [event.id]: true }
+  return {
+    ...state,
+    processedEventIds,
+    lastSequence: event.sequence && isAfter(event.sequence, state.lastSequence) ? event.sequence : state.lastSequence,
+    ...appendTimelineEvent(state.events, event),
+    lastEventId: event.id,
+    planLedger,
+  }
 }
 
 function reduceSessionControlEvent(state: TimelineState, event: TimelineSessionControlEvent): TimelineState {

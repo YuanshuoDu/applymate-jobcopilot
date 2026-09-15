@@ -9,6 +9,7 @@ import { flattenTaskTree, TaskTreePanel } from './TaskTreePanel'
 import { AgentSessionControlBar } from './AgentSessionControlBar'
 import { AgentTurnRetryControl } from './AgentTurnRetryControl'
 import { CognitiveAgendaCard, type CognitiveAgendaTaskLabel } from './cognitive-agenda-card'
+import { AgentPlanLedgerCard } from './AgentPlanLedgerCard'
 import { projectSupervisorTree, type SupervisorTaskSummary, type SupervisorTurnSummary } from './task-tree-projection'
 import type { AgentTimelineSnapshot } from './use-agent-timeline'
 
@@ -169,6 +170,7 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
       <AgentSessionControlBar sessionId={sessionId} controlGate={timeline.controlGate} controlRevision={timeline.controlRevision} />
       {loading && <p aria-live="polite" style={messageStyle}>{t('agent.loadingTasks')}</p>}
       {error && <p role="alert" style={{ ...messageStyle, color: 'var(--c-danger)' }}>{t('agent.supervisorUnavailable')}</p>}
+      <AgentPlanLedgerCard ledger={timeline.planLedger} />
       {timeline.cognitiveAgenda && <CognitiveAgendaCard agenda={timeline.cognitiveAgenda} agendas={timeline.cognitiveAgendas} taskLabels={agendaTaskLabels} />}
       {!loading && !nodes.length && !error && <p style={messageStyle}>{t('agent.noTaskRecords')}</p>}
       {!!nodes.length && <TaskTreePanel nodes={nodes} selectedId={selectedId} sessionKey={sessionId} showHeading={false} onSelect={setSelectedId} />}

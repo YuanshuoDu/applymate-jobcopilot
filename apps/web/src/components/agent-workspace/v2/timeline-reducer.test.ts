@@ -136,6 +136,25 @@ describe('timeline reducer', () => {
     expect(state.lifecycleRevision).toBe(0)
   })
 
+  it('folds valid durable plan receipts without creating timeline items or exposing their output', () => {
+    const revision = {
+      schemaVersion: 'agent-harness.v2', id: 'plan-revision-1', sessionId: 'session-1', turnId: 'turn-1', itemId: null, taskId: 'task-1',
+      type: 'plan.revision', actor: 'orchestrator', sequence: '11', payload: { planCallId: 'plan-1', goalRevision: 1, planRevision: 1, basedOnPlanRevision: null },
+    }
+    const command = {
+      schemaVersion: 'agent-harness.v2', id: 'plan-command-1', sessionId: 'session-1', turnId: 'turn-1', itemId: null, taskId: 'task-1',
+      type: 'plan.command', actor: 'orchestrator', sequence: '12', payload: { planCallId: 'plan-1', planRevision: 1, observationId: 'observation-1', content: {
+        kind: 'plan_command', localId: 'search', commandKind: 'tool_call', dependsOn: [], status: 'completed', errorCode: null, output: { secret: 'do not render' },
+      } },
+    }
+    let state = timelineReducer(createTimelineState('session-1'), { type: 'event', event: revision })
+    state = timelineReducer(state, { type: 'event', event: command })
+    expect(state.planLedger.currentPlan?.steps).toEqual([{ localId: 'search', actionKind: 'tool_call', status: 'completed', dependencyCount: 0 }])
+    expect(state.itemIds).toEqual([])
+    expect(JSON.stringify(state.planLedger)).not.toContain('do not render')
+    expect(timelineReducer(state, { type: 'event', event: { ...command, id: 'duplicate', sequence: '13' } })).toBe(state)
+  })
+
   it('keeps canonical root and child agenda projections isolated', () => {
     const childReceipt = { ...agendaReceipt, taskId: 'task-child', nextAction: 'await_children' }
     let state = timelineReducer(createTimelineState('session-1'), {
