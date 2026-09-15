@@ -194,6 +194,47 @@ describe('timeline reducer', () => {
     expect(state.itemIds).toEqual([])
   })
 
+  it('maps authoritative question answers to completed without allowing terminal regression', () => {
+    const question = {
+      schemaVersion: 'agent-harness.v2', id: 'question-item', sessionId: 'session-1', turnId: 'turn-1', stepId: null, taskId: null,
+      type: 'question', status: 'started', phase: 'commentary', revision: 0, content: {
+        waitKind: 'question', questionId: 'question-1', stage: 'profile', question: 'Choose?', options: [{ value: 'yes', label: 'Yes' }], answerAvailable: false, pending: true,
+      }, startedAt: null, completedAt: null, createdAt: '2026-09-15T00:00:00.000Z', updatedAt: '2026-09-15T00:00:00.000Z',
+    }
+    const answered = {
+      schemaVersion: 'agent-harness.v2', id: 'question-answered', sessionId: 'session-1', turnId: 'turn-1', itemId: 'question-item', taskId: null,
+      type: 'question.answered', actor: 'user', sequence: '2', correlationId: 'question-1', causationId: 'question-item', idempotencyKey: 'answer-1',
+      payload: { waitKind: 'question', waitId: 'question-1', itemId: 'question-item', turnId: 'turn-1', toolCallId: null, status: 'answered', nextTurnRevision: 3, answerAvailable: true },
+    }
+    let state = timelineReducer(createTimelineState('session-1'), { type: 'hydrate', items: [question] })
+    state = timelineReducer(state, { type: 'event', event: answered })
+    expect(state.itemsById['question-item']).toMatchObject({ status: 'completed', content: { answerAvailable: true, pending: false } })
+    expect(state.itemsById['question-item']?.content).not.toHaveProperty('answer')
+    expect(state.lifecycleRevision).toBe(1)
+    const regressed = { ...answered, id: 'question-cancelled-late', type: 'question.cancelled', actor: 'system', sequence: '3', payload: { waitKind: 'question', waitId: 'question-1', itemId: 'question-item', toolCallId: null, outcome: 'cancelled', reason: 'interrupt' } }
+    expect(timelineReducer(state, { type: 'event', event: regressed })).toBe(state)
+  })
+
+  it('maps interrupt question cancellation to interrupted and rejects a later answer', () => {
+    const question = {
+      schemaVersion: 'agent-harness.v2', id: 'question-item-2', sessionId: 'session-1', turnId: 'turn-1', stepId: null, taskId: null,
+      type: 'question', status: 'started', phase: 'commentary', revision: 0, content: { waitKind: 'question', questionId: 'question-2', stage: 'profile', question: 'Choose?', options: [], answerAvailable: false, pending: true },
+      startedAt: null, completedAt: null, createdAt: '2026-09-15T00:00:00.000Z', updatedAt: '2026-09-15T00:00:00.000Z',
+    }
+    const cancelled = {
+      schemaVersion: 'agent-harness.v2', id: 'question-cancelled', sessionId: 'session-1', turnId: 'turn-1', itemId: 'question-item-2', taskId: null,
+      type: 'question.cancelled', actor: 'system', sequence: '4', payload: { waitKind: 'question', waitId: 'question-2', itemId: 'question-item-2', toolCallId: null, outcome: 'cancelled', reason: 'interrupt' },
+    }
+    let state = timelineReducer(createTimelineState('session-1'), { type: 'hydrate', items: [question] })
+    state = timelineReducer(state, { type: 'event', event: cancelled })
+    expect(state.itemsById['question-item-2']).toMatchObject({ status: 'interrupted', content: { cancelled: true, cancellationReason: 'interrupt', pending: false } })
+    const lateAnswer = {
+      schemaVersion: 'agent-harness.v2', id: 'question-answered-late', sessionId: 'session-1', turnId: 'turn-1', itemId: 'question-item-2', taskId: null,
+      type: 'question.answered', actor: 'user', sequence: '5', payload: { waitKind: 'question', waitId: 'question-2', itemId: 'question-item-2', turnId: 'turn-1', toolCallId: null, status: 'answered', nextTurnRevision: 4, answerAvailable: true },
+    }
+    expect(timelineReducer(state, { type: 'event', event: lateAnswer })).toBe(state)
+  })
+
   it('keeps canonical root and child agenda projections isolated', () => {
     const childReceipt = { ...agendaReceipt, taskId: 'task-child', nextAction: 'await_children' }
     let state = timelineReducer(createTimelineState('session-1'), {

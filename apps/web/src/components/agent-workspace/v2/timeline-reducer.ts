@@ -6,6 +6,7 @@ import { createApprovalLedgerState, reduceApprovalLedger, type ApprovalLedgerSta
 import { createCognitiveAgendaState, reduceCognitiveAgenda, type TimelineCognitiveAgendaState } from './timeline-cognitive-agenda'
 import { isPlanLedgerEventType, parsePlanLedgerEvent } from './plan-ledger-parser'
 import { createPlanLedgerState, reducePlanLedger, type PlanLedgerState } from './plan-ledger-view'
+import { parseQuestionTerminalEvent } from './question-input-parser'
 import { emptyTimelineSteeringMarkerState, reduceTimelineSteeringMarkers, STEERING_MARKER_EVENT_TYPE, STEERING_MARKER_MAX_EVENTS, type TimelineSteeringMarkerEvent, type TimelineSteeringMarkerState } from './timeline-steering-markers'
 import { createTimelineSessionControlState, isSessionControlEventCandidate, parseTimelineSessionControl, reduceTimelineSessionControl, type TimelineSessionControlEvent, type TimelineSessionControlState } from './timeline-session-control'
 import { appendFallbackEvent, appendTimelineEvent, buildIndexes, compareItems, integer, isAfter, isRecord, itemFromTimelineEvent, mergeContent, numberOrUndefined, sequence, stringOrNull, timestamp } from './timeline-reducer-utils'
@@ -184,6 +185,8 @@ function reduceItems(state: TimelineState, values: unknown[], source: TimelineIt
 }
 
 function reduceEvent(state: TimelineState, value: unknown): TimelineState {
+  const questionTerminalCandidate = isRecord(value) && (value.type === 'question.answered' || value.type === 'question.cancelled')
+  if (questionTerminalCandidate) return reduceQuestionTerminalEvent(state, value)
   const approvalCandidate = isRecord(value) && isApprovalLedgerEventType(value.type)
   if (approvalCandidate) return reduceApprovalEvent(state, value)
   const planCandidate = isRecord(value) && isPlanLedgerEventType(value.type)
@@ -224,6 +227,30 @@ function reduceEvent(state: TimelineState, value: unknown): TimelineState {
   if (!KNOWN_EVENT_TYPES.has(event.type)) next = { ...next, fallbackItems: appendFallbackEvent(next.fallbackItems, event) }
   const item = itemFromTimelineEvent(event, status, existing, undefined, normalizeTimelineItem)
   return item ? upsertItem(next, item, item.source === 'unknown' ? 'unknown' : 'durable') : next
+}
+
+function reduceQuestionTerminalEvent(state: TimelineState, value: Record<string, unknown>): TimelineState {
+  const terminal = parseQuestionTerminalEvent(value, state.sessionId)
+  if (!terminal || state.processedEventIds[terminal.id] || !isAfter(terminal.sequence, state.lastSequence)) return state
+  const event = normalizeTimelineEvent(value)
+  if (!event || event.sessionId !== state.sessionId) return state
+  const existing = state.itemsById[terminal.itemId]
+  if (existing && (existing.type !== 'question' || existing.turnId !== terminal.turnId || existing.taskId !== terminal.taskId || !isRecord(existing.content) || existing.content.questionId !== terminal.questionId)) return state
+  if (existing && TERMINAL_STATUSES.has(existing.status) && existing.status !== terminal.status) return state
+  const processedEventIds: Record<string, true> = { ...state.processedEventIds, [event.id]: true }
+  let next: TimelineState = {
+    ...state,
+    processedEventIds,
+    lastSequence: terminal.sequence,
+    ...appendTimelineEvent(state.events, event),
+    lastEventId: event.id,
+    lifecycleRevision: LIFECYCLE_EVENT_TYPES.has(event.type) ? state.lifecycleRevision + 1 : state.lifecycleRevision,
+  }
+  if (!existing) return next
+  const content = isRecord(existing.content)
+    ? { ...existing.content, pending: false, answerAvailable: terminal.status === 'completed', ...(terminal.status === 'interrupted' ? { cancelled: true, cancellationReason: 'interrupt' } : {}) }
+    : existing.content
+  return upsertItem(next, { ...existing, status: terminal.status, content, completedAt: event.createdAt ?? existing.completedAt, updatedAt: event.createdAt ?? existing.updatedAt, sequence: terminal.sequence }, 'durable')
 }
 
 function reduceApprovalEvent(state: TimelineState, value: Record<string, unknown>): TimelineState {
