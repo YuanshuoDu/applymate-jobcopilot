@@ -10,6 +10,27 @@ function event(sequence: bigint) {
   }
 }
 
+function lifecycleEvent(sequence: bigint, type: "session.paused" | "session.resumed") {
+  const paused = type === "session.paused"
+  return {
+    id: `event_${sequence}`, sessionId: "session_1", turnId: null, itemId: null, taskId: null,
+    sequence, type, actor: "system", correlationId: "session_1", causationId: null,
+    idempotencyKey: `agent-session-control:client_${sequence}`,
+    payload: {
+      sessionId: "session_1", operation: paused ? "pause" : "resume",
+      previousGate: paused ? "open" : "user_paused", nextGate: paused ? "user_paused" : "open",
+      controlRevision: Number(sequence - BigInt(4)),
+      pausedAt: paused ? "2026-09-15T00:00:00.000Z" : null,
+    },
+  }
+}
+
+function frameData(frame: string): Record<string, unknown> {
+  const line = frame.split("\n").find((value) => value.startsWith("data: "))
+  if (!line) throw new Error("SSE frame did not contain data")
+  return JSON.parse(line.slice("data: ".length)) as Record<string, unknown>
+}
+
 function db(rows: unknown[]) {
   return { agentEvent: { findMany: vi.fn().mockResolvedValue(rows) } }
 }
@@ -45,6 +66,59 @@ describe("V2 agent event stream", () => {
     expect(text).toContain("id: 2")
     expect(text).toContain('"token":"[REDACTED]"')
     expect(database.agentEvent.findMany).toHaveBeenCalledWith(expect.objectContaining({ where: { sessionId: "session_1", sequence: { gt: BigInt(1) } } }))
+    controller.abort()
+    await reader.cancel()
+  })
+
+  it("streams session lifecycle events with durable sequence IDs and null turn scope", async () => {
+    const controller = new AbortController()
+    const database = db([lifecycleEvent(BigInt(5), "session.paused"), lifecycleEvent(BigInt(6), "session.resumed")])
+    const stream = createV2EventStream(database as never, {
+      sessionId: "session_1", afterSequence: BigInt(4), signal: controller.signal,
+      redisFactory: () => null, dbPollMs: 50, heartbeatMs: 100,
+    })
+    const reader = stream.getReader()
+    const paused = new TextDecoder().decode((await reader.read()).value)
+    const resumed = new TextDecoder().decode((await reader.read()).value)
+    expect(paused).toContain("event: session.paused\nid: 5\n")
+    expect(resumed).toContain("event: session.resumed\nid: 6\n")
+    expect(frameData(paused)).toMatchObject({
+      type: "session.paused", sessionId: "session_1", turnId: null, itemId: null, taskId: null,
+      actor: "system", correlationId: "session_1", sequence: "5",
+      payload: {
+        sessionId: "session_1", operation: "pause", previousGate: "open", nextGate: "user_paused",
+        controlRevision: 1, pausedAt: "2026-09-15T00:00:00.000Z",
+      },
+    })
+    expect(frameData(resumed)).toMatchObject({
+      type: "session.resumed", sessionId: "session_1", turnId: null, itemId: null, taskId: null,
+      actor: "system", correlationId: "session_1", sequence: "6",
+      payload: {
+        sessionId: "session_1", operation: "resume", previousGate: "user_paused", nextGate: "open",
+        controlRevision: 2, pausedAt: null,
+      },
+    })
+    expect(database.agentEvent.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { sessionId: "session_1", sequence: { gt: BigInt(4) } },
+    }))
+    controller.abort()
+    await reader.cancel()
+  })
+
+  it("uses the durable sequence cursor to resume after the last lifecycle event", async () => {
+    const controller = new AbortController()
+    const database = db([lifecycleEvent(BigInt(6), "session.resumed")])
+    const stream = createV2EventStream(database as never, {
+      sessionId: "session_1", afterSequence: BigInt(5), signal: controller.signal,
+      redisFactory: () => null, dbPollMs: 50, heartbeatMs: 100,
+    })
+    const reader = stream.getReader()
+    const resumed = new TextDecoder().decode((await reader.read()).value)
+    expect(resumed).toContain("event: session.resumed\nid: 6\n")
+    expect(resumed).not.toContain("session.paused")
+    expect(database.agentEvent.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { sessionId: "session_1", sequence: { gt: BigInt(5) } },
+    }))
     controller.abort()
     await reader.cancel()
   })
