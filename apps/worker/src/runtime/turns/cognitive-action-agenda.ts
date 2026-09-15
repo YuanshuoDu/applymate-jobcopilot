@@ -98,9 +98,9 @@ function boundedStrings(value: unknown, maxItems: number, maxLength: number): bo
 }
 function safeCompletionControl(record: Row, observationId: string): boolean {
   const canonicalId = observationId.startsWith("observation:") ? observationId.slice("observation:".length) : observationId
-  const separator = canonicalId.lastIndexOf(":")
-  const callId = canonicalId.startsWith("plan-control:") ? canonicalId.slice("plan-control:".length, separator) : ""
-  if (record.kind !== "plan_control" || record.status !== "completion_proposed" || separator <= "plan-control:".length || !safeId(callId) || !safeId(record.localId) || record.localId !== canonicalId.slice(separator + 1) || !boundedStrings(record.dependsOn, MAX_ITEMS, MAX_ID_LENGTH) || !boundedStrings(record.completionCriteria, MAX_ITEMS, 160)) return false
+  const localId = safeId(record.localId), suffix = localId ? `:${localId}` : ""
+  const callId = canonicalId.startsWith("plan-control:") && suffix && canonicalId.endsWith(suffix) ? canonicalId.slice("plan-control:".length, canonicalId.length - suffix.length) : ""
+  if (record.kind !== "plan_control" || record.status !== "completion_proposed" || !safeId(callId) || !localId || !boundedStrings(record.dependsOn, MAX_ITEMS, MAX_ID_LENGTH) || !boundedStrings(record.completionCriteria, MAX_ITEMS, 160)) return false
   return Object.keys(record).every(key => ["kind", "localId", "status", "dependsOn", "completionCriteria"].includes(key))
 }
 function choose(nextAction: CognitiveAction, blocker: CognitiveAgendaBlocker | null, ids: SignalSet): { readonly nextAction: CognitiveAction; readonly blockedBy: { readonly kind: CognitiveAgendaBlocker | null; readonly ids: readonly string[] } } {
