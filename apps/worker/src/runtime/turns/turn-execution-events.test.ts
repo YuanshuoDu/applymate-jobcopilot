@@ -68,6 +68,31 @@ describe("TurnExecutionEventWriter", () => {
     expect(subscriberSawCommit).toBe(true)
   })
 
+  it("passes the server-owned system actor through a batch", async () => {
+    const events: Array<{ actor?: string; type: string }> = []
+    const appendEvents: NonNullable<TurnExecutionStore["appendEvents"]> = vi.fn(async (inputs: Parameters<NonNullable<TurnExecutionStore["appendEvents"]>>[0]) => {
+      events.push(...inputs.map(input => ({ actor: input.actor, type: input.type })))
+      return inputs.map(input => ({ id: input.id }))
+    })
+    const writer = new TurnExecutionEventWriter(options(identity("turn", "root-1"), [], appendEvents))
+    await writer.appendBatch([
+      { type: "goal.revision", correlationId: "goal-call", itemId: null, payload: { revision: 2 }, key: "goal-revision:goal-call" },
+      { type: "agent.steering.marker", correlationId: "goal-call", itemId: null, payload: { status: "applied" }, key: "marker-applied:input-1", actor: "system" },
+    ])
+    expect(events).toEqual([{ type: "goal.revision" }, { type: "agent.steering.marker", actor: "system" }])
+  })
+
+  it("keeps marker event types server exact when lifecycle mapping is configured", async () => {
+    const captured: string[] = []
+    const appendEvents: NonNullable<TurnExecutionStore["appendEvents"]> = vi.fn(async (inputs: Parameters<NonNullable<TurnExecutionStore["appendEvents"]>>[0]) => {
+      captured.push(...inputs.map(input => input.type))
+      return inputs.map(input => ({ id: input.id }))
+    })
+    const writer = new TurnExecutionEventWriter({ ...options(identity("turn", "root-1"), [], appendEvents), lifecycle: { mapEventType: type => `mapped.${type}` } })
+    await writer.appendBatch([{ type: "agent.steering.marker", correlationId: "plan-call", itemId: null, payload: {}, key: "marker" }])
+    expect(captured).toEqual(["agent.steering.marker"])
+  })
+
   it("fails closed when the batch seam is absent or returns the wrong cardinality", async () => {
     const events: Array<{ id: string; type: string; itemId: string | null; identity: TurnExecutionIdentity }> = []
     const entry = { type: "plan.observation", correlationId: "plan-1", itemId: null, payload: { marker: "a" }, key: "plan-1:a" }

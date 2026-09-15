@@ -45,6 +45,8 @@ export type TurnEngineEventInput = {
   readonly causationId: string | null
   readonly idempotencyKey: string
   readonly payload: RepositoryJsonValue
+  /** Server-owned marker events may opt into the canonical system actor. */
+  readonly actor?: "system"
 }
 
 export type TurnEngineToolCall = {

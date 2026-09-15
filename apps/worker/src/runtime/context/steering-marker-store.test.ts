@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import {
+  appliedSteeringMarkerEntries,
+  buildAppliedSteeringMarker,
   buildObservedSteeringMarker,
   persistObservedSteeringMarker,
   SteeringMarkerStoreError,
@@ -71,5 +73,28 @@ describe("steering marker transaction store", () => {
     expect(client.calls.some(call => call.sql.startsWith('INSERT INTO "agent_events"'))).toBe(false)
     const conflictClient = makeClient({ id: `steering-marker-event:${marker.idempotencyKey}`, turnId: scope.turnId, taskId: scope.taskId, type: "agent.steering.marker", actor: "system", correlationId: scope.turnId, payload: { ...marker, stepId: "other-step" }, sequence: "9" })
     await expect(persistObservedSteeringMarker(queryClient(conflictClient), scope, { sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.taskId, stepId: "step-a", payload: marker })).rejects.toBeInstanceOf(SteeringMarkerStoreError)
+  })
+
+  it("builds an applied marker without copying input content", () => {
+    const applied = buildAppliedSteeringMarker({ marker, stepId: "step-b" })
+    expect(applied).toMatchObject({ kind: "applied", status: "applied", stepId: "step-b", inputId: marker.inputId, obligationId: marker.obligationId })
+    expect(applied.idempotencyKey).toBe(marker.idempotencyKey)
+    expect(JSON.stringify(applied)).not.toContain("Dublin")
+  })
+
+  it("selects matching active markers in stable order and excludes another obligation", () => {
+    const second = buildObservedSteeringMarker({ sessionId: scope.sessionId, turnId: scope.turnId, stepId: "step-a", context, markerInput: { id: "input-0", acceptedSequence: 3n } })
+    const other = buildObservedSteeringMarker({ sessionId: scope.sessionId, turnId: scope.turnId, stepId: "step-a", context: { ...context, obligationId: "other" }, markerInput: { id: "input-x", acceptedSequence: 2n } })
+    const entries = appliedSteeringMarkerEntries({ markers: [marker, other, second], context, stepId: "step-b" })
+    expect(entries.map(entry => entry.payload.inputId)).toEqual(["input-0", "input-1"])
+    expect(entries.every(entry => entry.key.startsWith("steering-marker-applied:"))).toBe(true)
+  })
+
+  it("fails closed when applied markers exceed the byte bound", () => {
+    const markers = Array.from({ length: 128 }, (_, index) => buildObservedSteeringMarker({
+      sessionId: scope.sessionId, turnId: scope.turnId, stepId: "step-a", context,
+      markerInput: { id: `input-${index}-${"x".repeat(80)}`, acceptedSequence: BigInt(index + 1) },
+    }))
+    expect(() => appliedSteeringMarkerEntries({ markers, context, stepId: "step-b" })).toThrow(/byte bound/)
   })
 })

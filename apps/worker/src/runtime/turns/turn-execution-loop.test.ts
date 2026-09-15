@@ -173,6 +173,73 @@ describe("owner-agnostic turn execution loop", () => {
     expect(seen[0]?.active).toEqual([marker])
   })
 
+  it("atomically applies matching markers and retires them before the next step", async () => {
+    const marker: SteeringMarkerPayload = {
+      schemaVersion: "agent-harness.steering-marker.v1", kind: "observed", status: "observed", sessionId: "session-1", turnId: "turn-1", taskId: "root-1",
+      stepId: "old-step", inputId: "steer-1", idempotencyKey: steeringMarkerIdempotencyKey("session-1", "turn-1", "steer-1"), obligationId: "plan-replan:plan-1:1", goalRevision: 1, planRevision: 1, acceptedSequence: "2",
+    }
+    const proposal: PlanProposal = { schemaVersion: PLAN_PROPOSAL_SCHEMA_VERSION, basedOnGoalRevision: 1, basedOnPlanRevision: 1, nodes: [], completionCriteria: [], briefRationale: "replan" }
+    const accepted = { status: "accepted" as const, goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1, proposal, intents: [], proposalHash: fingerprintPlanProposal(proposal) }
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, failedJoinObservations(), false, undefined, { name: "agent.plan.propose", arguments: { proposal }, output: accepted }, false, replanGoalRef(), async ({ call }) => ({ id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, output: accepted, errorCode: null }))
+    const seen: Array<readonly SteeringMarkerPayload[]> = []
+    const batches: Array<readonly { readonly type: string; readonly actor?: "system" }[]> = []
+    const baseBuilder = root.options.contextBuilder
+    const appendEvents = root.options.store.appendEvents!
+    root.options = {
+      ...root.options,
+      steeringMarkerState: { active: [marker] },
+      contextBuilder: { build: async request => { seen.push(request.steeringMarkerState?.active ?? []); return baseBuilder.build(request) } },
+      store: { ...root.options.store, appendEvents: async inputs => { batches.push(inputs); return appendEvents(inputs) } },
+    }
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result.status).toBe("completed")
+    expect(root.events.map(event => event.type)).toContain("agent.steering.marker")
+    expect(batches.find(batch => batch.some(entry => entry.type === "agent.steering.marker"))).toEqual([
+      expect.objectContaining({ type: "plan.revision" }), expect.objectContaining({ type: "agent.steering.marker", actor: "system" }),
+    ])
+    expect(seen[0]).toEqual([marker])
+    expect(seen[1]).toEqual([])
+  })
+
+  it("repairs an accepted replay with the revision and matching applied marker batch", async () => {
+    const marker: SteeringMarkerPayload = {
+      schemaVersion: "agent-harness.steering-marker.v1", kind: "observed", status: "observed", sessionId: "session-1", turnId: "turn-1", taskId: "root-1",
+      stepId: "old-step", inputId: "steer-1", idempotencyKey: steeringMarkerIdempotencyKey("session-1", "turn-1", "steer-1"), obligationId: "plan-replan:plan-1:1", goalRevision: 1, planRevision: 1, acceptedSequence: "2",
+    }
+    const proposal: PlanProposal = { schemaVersion: PLAN_PROPOSAL_SCHEMA_VERSION, basedOnGoalRevision: 1, basedOnPlanRevision: 1, nodes: [], completionCriteria: [], briefRationale: "replay" }
+    const output = { status: "accepted" as const, goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1, proposal, intents: [], proposalHash: fingerprintPlanProposal(proposal) }
+    const persisted = { id: "tool-result:plan-2", content: { toolCallId: "plan-2", toolName: "agent.plan.propose", input: { proposal }, status: "completed", output, errorCode: null } }
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, [...failedJoinObservations(), persisted], false, undefined, { id: "plan-2", name: "agent.plan.propose", arguments: { proposal } }, false, replanGoalRef())
+    const batches: Array<readonly { readonly type: string; readonly actor?: "system" }[]> = []
+    const appendEvents = root.options.store.appendEvents!
+    root.options = { ...root.options, steeringMarkerState: { active: [marker] }, store: { ...root.options.store, appendEvents: async inputs => { batches.push(inputs); return appendEvents(inputs) } } }
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result.status).toBe("completed")
+    expect(batches.find(batch => batch.some(entry => entry.type === "agent.steering.marker"))).toEqual([
+      expect.objectContaining({ type: "plan.revision" }), expect.objectContaining({ type: "agent.steering.marker", actor: "system" }),
+    ])
+  })
+
+  it("repairs an already projected replay with an applied-only batch", async () => {
+    const marker: SteeringMarkerPayload = {
+      schemaVersion: "agent-harness.steering-marker.v1", kind: "observed", status: "observed", sessionId: "session-1", turnId: "turn-1", taskId: "root-1",
+      stepId: "old-step", inputId: "steer-1", idempotencyKey: steeringMarkerIdempotencyKey("session-1", "turn-1", "steer-1"), obligationId: "plan-replan:plan-1:1", goalRevision: 1, planRevision: 1, acceptedSequence: "2",
+    }
+    const proposal: PlanProposal = { schemaVersion: PLAN_PROPOSAL_SCHEMA_VERSION, basedOnGoalRevision: 1, basedOnPlanRevision: 1, nodes: [], completionCriteria: [], briefRationale: "projected replay" }
+    const output = { status: "accepted" as const, goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1, proposal, intents: [], proposalHash: fingerprintPlanProposal(proposal) }
+    const persisted = { id: "tool-result:plan-2", content: { toolCallId: "plan-2", toolName: "agent.plan.propose", input: { proposal }, status: "completed", output, errorCode: null } }
+    const projection = planRevisionObservation({ planCallId: "plan-2", goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1, proposalHash: output.proposalHash })
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, [...failedJoinObservations(), persisted, projection], false, undefined, { id: "plan-2", name: "agent.plan.propose", arguments: { proposal } }, false, replanGoalRef())
+    const batches: Array<readonly { readonly type: string; readonly actor?: "system" }[]> = []
+    const appendEvents = root.options.store.appendEvents!
+    root.options = { ...root.options, steeringMarkerState: { active: [marker] }, store: { ...root.options.store, appendEvents: async inputs => { batches.push(inputs); return appendEvents(inputs) } } }
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result.status).toBe("completed")
+    expect(batches.find(batch => batch.some(entry => entry.type === "agent.steering.marker"))).toEqual([
+      expect.objectContaining({ type: "agent.steering.marker", actor: "system" }),
+    ])
+  })
+
   it("allows exactly one goal update for fresh steering while replanning", async () => {
     const goalContract = { ...replanGoal, revision: 2, objective: "Find senior jobs" }
     const goalReceipt = { status: "accepted", goalRevision: 2, basedOnGoalRevision: 1, goalContract }

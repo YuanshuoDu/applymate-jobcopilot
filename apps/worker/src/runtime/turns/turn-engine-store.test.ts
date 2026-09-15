@@ -158,6 +158,34 @@ describe("PostgreSQL TurnEngine store", () => {
     expect(JSON.parse(String(outboxInserts[1]?.values?.[3])).actor).toBe("orchestrator")
   })
 
+  it("allows only the server-owned system actor override", async () => {
+    const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
+    const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+      calls.push({ sql, values })
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1" }] }
+      if (sql.includes("FROM \"agent_events\"")) return { rows: [] }
+      if (sql.includes('SELECT turn."id"')) return { rows: [{ id: "turn-1" }] }
+      if (sql.includes("UPDATE \"agent_sessions\"")) return { rows: [{ eventSequence: 1n }] }
+      return { rows: [], rowCount: 1 }
+    }), release: vi.fn() }
+    const store = createPgTurnEngineStore({ connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">)
+    await store.appendEvent({ owner, id: "system-event", itemId: null, type: "agent.steering.marker", correlationId: "goal-call", causationId: null, idempotencyKey: "system-key", payload: {}, actor: "system" })
+    const eventInsert = calls.find(call => call.sql.includes('INSERT INTO "agent_events"'))
+    expect(eventInsert?.values).toContain("system")
+    await expect(store.appendEvent({ owner, id: "bad-actor", itemId: null, type: "agent.steering.marker", correlationId: "goal-call", causationId: null, idempotencyKey: "bad-key", payload: {}, actor: "orchestrator" as never })).rejects.toThrow(/actor/)
+  })
+
+  it("rejects an idempotency replay whose actor changed", async () => {
+    const client = { query: vi.fn(async (sql: string) => {
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1" }] }
+      if (sql.includes("FROM \"agent_events\"")) return { rows: [{ id: "existing", taskId: owner.taskId, turnId: owner.turnId, itemId: null, type: "agent.steering.marker", correlationId: "goal-call", causationId: null, sequence: 1n, actor: "orchestrator", payload: {} }] }
+      if (sql.includes('SELECT turn."id"')) return { rows: [{ id: "turn-1" }] }
+      return { rows: [], rowCount: 1 }
+    }), release: vi.fn() }
+    const store = createPgTurnEngineStore({ connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">)
+    await expect(store.appendEvent({ owner, id: "requested", itemId: null, type: "agent.steering.marker", correlationId: "goal-call", causationId: null, idempotencyKey: "same-key", payload: {}, actor: "system" })).rejects.toThrow(/identity/)
+  })
+
   it("fences child persistence and allocates a Turn-global ordinal", async () => {
     const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
     const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {

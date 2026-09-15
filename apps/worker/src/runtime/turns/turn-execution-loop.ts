@@ -13,14 +13,15 @@ import { TurnEngineError, toRepositoryJson, type TurnEngineResult, type TurnEngi
 import { executeToolWithItems, publishCommentary, publishFinalResponse, publishReasoningSummary, TurnExecutionEventWriter } from "./turn-execution-events.js"
 import type { TurnExecutionOptions } from "./turn-execution-types.js"
 import { assertExecutionAlive, assertModelAllowance, canEmitTurnCompleted, canPersistFinalResponse, makeExecutionId, resumedBudgetLimits, totalTurnUsage, turnErrorCode, updateExecutionStep } from "./turn-engine-helpers.js"
-import { parsePlanRevisionReceipt, planRevisionObservation } from "../planning/plan-revision-receipt.js"
-import { goalRevisionObservation, parseGoalRevisionOutput } from "../planning/goal-revision-receipt.js"
+import { parsePlanRevisionReceipt, planRevisionObservation, type PlanRevisionReceipt } from "../planning/plan-revision-receipt.js"
+import { goalRevisionObservation, parseGoalRevisionOutput, type GoalRevisionReceipt } from "../planning/goal-revision-receipt.js"
 import { verifyPlanCompletion } from "../planning/plan-completion-verifier.js"
 import { buildPlanCompletionFeedback, buildPlanCompletionFeedbackEvent, currentPlanId, MAX_PLAN_COMPLETION_RECOVERY_ATTEMPTS, planCompletionFeedbackIdempotencyKey, PLAN_COMPLETION_FEEDBACK_EVENT_TYPE, planCompletionRecoveryCount } from "../planning/plan-completion-feedback.js"
 import { buildReplanFeedback, deriveReplanObligation, MAX_PLAN_REPLAN_FEEDBACK_ATTEMPTS, replanFeedbackAttempts, type ReplanObligation } from "../planning/plan-replan-obligation.js"
 import { runContextCompaction } from "../context/context-compaction-runtime.js"
 import type { StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
-import type { SteeringMarkerPayload } from "../context/steering-marker.js"
+import { appliedSteeringMarkerEntries } from "../context/steering-marker-store.js"
+import { STEERING_MARKER_EVENT_TYPE, type SteeringMarkerPayload } from "../context/steering-marker.js"
 
 const DEFAULT_MAX_STEPS = 32
 const PLAN_OBSERVATION_MAX_BYTES = 8 * 1024
@@ -120,14 +121,15 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           progress.observe({ snapshot, toolCalls: output.toolCalls })
           budget.reserveToolCalls(output.toolCalls.length)
           if (output.text) await publishCommentary(writer, options, step, output.text, now)
-          let outcome: { wait: TurnEngineResult | null; snapshot: typeof options.snapshot }
+          let outcome: { wait: TurnEngineResult | null; snapshot: typeof options.snapshot; steeringMarkerState: typeof steeringMarkerState }
           try {
-            outcome = await executeTools(options, writer, step, output, snapshot, seenCallIds, signal, now)
+            outcome = await executeTools(options, writer, step, output, snapshot, seenCallIds, signal, now, steeringMarkerState)
           } finally {
             budget.accountToolCalls(output.toolCalls.length)
           }
           toolCalls += output.toolCalls.length
           snapshot = outcome.snapshot
+          steeringMarkerState = outcome.steeringMarkerState
           assertExecutionAlive(options, signal)
           const wait = outcome.wait
           const stepStatus = wait?.status === "waiting_for_dependency"
@@ -380,8 +382,10 @@ async function executeTools(
   seen: Set<string>,
   signal: AbortSignal,
   now: () => Date,
-): Promise<{ wait: TurnEngineResult | null; snapshot: typeof options.snapshot }> {
+  markerState: { readonly active: readonly SteeringMarkerPayload[] } | undefined,
+): Promise<{ wait: TurnEngineResult | null; snapshot: typeof options.snapshot; steeringMarkerState: typeof markerState }> {
   let snapshot = initial
+  let steeringMarkerState = markerState
   const completedToolResults: TurnEngineToolResult[] = []
   for (const call of output.toolCalls) {
     assertExecutionAlive(options, signal)
@@ -401,9 +405,10 @@ async function executeTools(
           if (!revision) throw new TurnEngineError("invalid_output", "Goal update returned an invalid persisted receipt")
           const projection = goalRevisionObservation(revision)
           const hasProjection = snapshot.toolObservations.some(observation => observation.id === projection.id)
-          if (!hasProjection) {
-            await writer.append("goal.revision", call.id, null, revision, `goal-revision:${call.id}`)
-          }
+          const obligation = replayReplanObligation(options, snapshot, steeringMarkerState, revision, "goal") ?? activeReplanObligation(options, snapshot)
+          if (hasAcceptedMarkerForRevision(options, steeringMarkerState, revision, "goal") && !obligation) throw new TurnEngineError("invalid_output", "Accepted goal replay cannot identify its prior replan obligation")
+          assertAcceptedGoalRevision(revision, obligation)
+          if (!hasProjection || obligation) steeringMarkerState = await appendAcceptedRevision(options, writer, call.id, "goal.revision", revision, obligation, steeringMarkerState, step.id, !hasProjection)
           const currentGoal = options.goalRef?.get()
           if (!currentGoal || currentGoal.revision <= revision.goalRevision) {
             options.goalRef?.update(revision.goalContract)
@@ -438,10 +443,11 @@ async function executeTools(
         const existingProjection = snapshot.toolObservations.find(observation => observation.id === projection.id)
         if (existingProjection && stableJson(existingProjection.content) !== stableJson(projection.content)) throw new TurnEngineError("invalid_output", "Plan proposal replay has a conflicting revision projection")
         const hasProjection = existingProjection !== undefined
-        if (!hasProjection) {
-          await writer.append("plan.revision", call.id, null, revision, `plan-revision:${call.id}`)
-          snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, projection] }
-        }
+        const obligation = replayReplanObligation(options, snapshot, steeringMarkerState, revision, "plan") ?? activeReplanObligation(options, snapshot)
+        if (hasAcceptedMarkerForRevision(options, steeringMarkerState, revision, "plan") && !obligation) throw new TurnEngineError("invalid_output", "Accepted plan replay cannot identify its prior replan obligation")
+        assertAcceptedPlanRevision(revision, obligation)
+        if (!hasProjection || obligation) steeringMarkerState = await appendAcceptedRevision(options, writer, call.id, "plan.revision", revision, obligation, steeringMarkerState, step.id, !hasProjection)
+        if (!hasProjection) snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, projection] }
         if (options.executePlan) {
           const replayedResult: TurnEngineToolResult = { id: call.id, toolName: call.name, toolVersion: "1", status: "completed", output: persisted.output, errorCode: null }
           const plan = await executePlanHook(options, step, call, replayedResult, [replayedResult], snapshot, signal, true)
@@ -455,7 +461,7 @@ async function executeTools(
             key: `plan-observation:${call.id}:${observation.id}`,
           })))
           if (plan.observations.length > 0) snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, ...plan.observations] }
-          if (plan.wait) return { wait: plan.wait, snapshot }
+          if (plan.wait) return { wait: plan.wait, snapshot, steeringMarkerState }
         }
       }
       continue
@@ -463,10 +469,10 @@ async function executeTools(
     const result = await executeToolWithItems(options, writer, step, call, now)
     assertExecutionAlive(options, signal)
     if (result.status === "failed" && result.errorCode === "policy_requires_approval") {
-      return { wait: { status: "waiting_for_approval", stepCount: 0, toolCallCount: 0, errorCode: result.errorCode }, snapshot }
+      return { wait: { status: "waiting_for_approval", stepCount: 0, toolCallCount: 0, errorCode: result.errorCode }, snapshot, steeringMarkerState }
     }
     if (result.status === "failed" && (result.errorCode === "policy_requires_user_input" || result.errorCode === "gmail_oauth_required")) {
-      return { wait: { status: "waiting_for_user", stepCount: 0, toolCallCount: 0, errorCode: result.errorCode }, snapshot }
+      return { wait: { status: "waiting_for_user", stepCount: 0, toolCallCount: 0, errorCode: result.errorCode }, snapshot, steeringMarkerState }
     }
     snapshot = {
       ...snapshot,
@@ -479,8 +485,11 @@ async function executeTools(
       completedToolResults.push(result)
       if (call.name === "agent.plan.propose") {
         const revision = parsePlanRevisionReceipt(result.output, call.id, { requireProposalHash: true })
+        const obligation = activeReplanObligation(options, snapshot)
+        if (!revision && obligation) throw new TurnEngineError("invalid_output", "Plan proposal did not return an accepted revision")
         if (revision) {
-          await writer.append("plan.revision", call.id, null, revision, `plan-revision:${call.id}`)
+          assertAcceptedPlanRevision(revision, obligation)
+          steeringMarkerState = await appendAcceptedRevision(options, writer, call.id, "plan.revision", revision, obligation, steeringMarkerState, step.id)
           const projection = planRevisionObservation(revision)
           if (!snapshot.toolObservations.some(observation => observation.id === projection.id)) snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, projection] }
         }
@@ -493,12 +502,14 @@ async function executeTools(
           key: `plan-observation:${call.id}:${observation.id}`,
         })))
         if (plan.observations.length > 0) snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, ...plan.observations] }
-        if (plan.wait) return { wait: plan.wait, snapshot }
+        if (plan.wait) return { wait: plan.wait, snapshot, steeringMarkerState }
       }
       if (call.name === "agent.goal.update") {
         const revision = parseGoalRevisionOutput(result.output)
         if (!revision) throw new TurnEngineError("invalid_output", "Goal update returned an invalid receipt")
-        await writer.append("goal.revision", call.id, null, revision, `goal-revision:${call.id}`)
+        const obligation = activeReplanObligation(options, snapshot)
+        assertAcceptedGoalRevision(revision, obligation)
+        steeringMarkerState = await appendAcceptedRevision(options, writer, call.id, "goal.revision", revision, obligation, steeringMarkerState, step.id)
         options.goalRef?.update(revision.goalContract)
         const projection = goalRevisionObservation(revision)
         snapshot = {
@@ -510,10 +521,97 @@ async function executeTools(
     }
     const dependencyWait = result.status === "completed" ? dependencyWaitReceipt(result.output) : null
     if (dependencyWait) {
-      return { wait: { status: "waiting_for_dependency", waitId: dependencyWait.waitId, stepCount: 0, toolCallCount: 0 }, snapshot }
+      return { wait: { status: "waiting_for_dependency", waitId: dependencyWait.waitId, stepCount: 0, toolCallCount: 0 }, snapshot, steeringMarkerState }
     }
   }
-  return { wait: null, snapshot }
+  return { wait: null, snapshot, steeringMarkerState }
+}
+
+function assertAcceptedPlanRevision(revision: PlanRevisionReceipt, obligation: ReplanObligation | undefined): void {
+  if (!obligation) return
+  if (revision.goalRevision !== obligation.goalRevision || revision.planRevision !== obligation.planRevision + 1 || revision.basedOnPlanRevision !== obligation.planRevision) {
+    throw new TurnEngineError("invalid_output", "Accepted plan revision does not release the active replan obligation")
+  }
+}
+
+function assertAcceptedGoalRevision(revision: GoalRevisionReceipt, obligation: ReplanObligation | undefined): void {
+  if (!obligation) return
+  if (revision.goalRevision !== obligation.goalRevision + 1 || revision.basedOnGoalRevision !== obligation.goalRevision) {
+    throw new TurnEngineError("invalid_output", "Accepted goal revision does not release the active replan obligation")
+  }
+}
+
+function hasAcceptedMarkerForRevision(options: TurnExecutionOptions, state: { readonly active: readonly SteeringMarkerPayload[] } | undefined, revision: PlanRevisionReceipt | GoalRevisionReceipt, kind: "plan" | "goal"): boolean {
+  const goalRevision = kind === "plan" ? (revision as PlanRevisionReceipt).goalRevision : (revision as GoalRevisionReceipt).basedOnGoalRevision
+  const planRevision = kind === "plan" ? (revision as PlanRevisionReceipt).basedOnPlanRevision : undefined
+  return (state?.active ?? []).some(marker => marker.taskId === options.identity.taskId && marker.obligationId !== null
+    && marker.planRevision !== null && marker.goalRevision === goalRevision && (kind === "goal" || marker.planRevision === planRevision))
+}
+
+function replayReplanObligation(
+  options: TurnExecutionOptions,
+  snapshot: typeof options.snapshot,
+  state: { readonly active: readonly SteeringMarkerPayload[] } | undefined,
+  revision: PlanRevisionReceipt | GoalRevisionReceipt,
+  kind: "plan" | "goal",
+): ReplanObligation | undefined {
+  const goalRevision = kind === "plan" ? (revision as PlanRevisionReceipt).goalRevision : (revision as GoalRevisionReceipt).basedOnGoalRevision
+  const planRevision = kind === "plan" ? (revision as PlanRevisionReceipt).basedOnPlanRevision : undefined
+  const candidates = (state?.active ?? []).filter(marker => marker.taskId === options.identity.taskId && marker.obligationId !== null
+    && marker.planRevision !== null && marker.goalRevision === goalRevision && (kind === "goal" || marker.planRevision === planRevision))
+  if (candidates.length === 0) return undefined
+  const target = candidates[0]!
+  if (target.planRevision === null) throw new TurnEngineError("invalid_output", "Accepted replay marker has no prior plan revision")
+  if (candidates.some(marker => marker.obligationId !== target.obligationId)) throw new TurnEngineError("invalid_output", "Accepted replay markers identify conflicting obligations")
+  const full = deriveReplanObligation({ observations: snapshot.toolObservations, expectedGoalRevision: target.goalRevision })
+  if (full.kind === "invalid") throw new TurnEngineError("invalid_output", "Accepted replay has invalid prior replan evidence")
+  const futureCalls = new Set<string>()
+  for (const observation of snapshot.toolObservations) {
+    if (!observation.id.startsWith("plan-revision:")) continue
+    const content = observation.content
+    if (!content || typeof content !== "object" || Array.isArray(content) || !("kind" in content) || content.kind !== "plan_revision" || !("planRevision" in content) || typeof content.planRevision !== "number" || content.planRevision <= target.planRevision || !("planCallId" in content) || typeof content.planCallId !== "string") continue
+    futureCalls.add(content.planCallId)
+  }
+  const prior = snapshot.toolObservations.filter(observation => {
+    const futureProjection = observation.id.startsWith("plan-revision:") && futureCalls.has(observation.id.slice("plan-revision:".length))
+    const futureCommand = [...futureCalls].some(callId => observation.id.startsWith(`plan-result:${callId}:`) || observation.id.startsWith(`plan-control:${callId}:`))
+    return !futureProjection && !futureCommand
+  })
+  const recovered = deriveReplanObligation({ observations: prior, expectedGoalRevision: target.goalRevision })
+  if (recovered.kind === "invalid") throw new TurnEngineError("invalid_output", "Accepted replay prior obligation is invalid")
+  if (recovered.kind !== "active" || recovered.obligation.id !== target.obligationId || recovered.obligation.planRevision !== target.planRevision) throw new TurnEngineError("invalid_output", "Accepted replay prior obligation is unavailable")
+  return recovered.obligation
+}
+
+async function appendAcceptedRevision(
+  options: TurnExecutionOptions,
+  writer: TurnExecutionEventWriter,
+  callId: string,
+  type: "goal.revision" | "plan.revision",
+  revision: unknown,
+  obligation: ReplanObligation | undefined,
+  markerState: { readonly active: readonly SteeringMarkerPayload[] } | undefined,
+  stepId: string,
+  includeRevision = true,
+): Promise<{ readonly active: readonly SteeringMarkerPayload[] } | undefined> {
+  if (!obligation) {
+    if (!includeRevision) return markerState
+    await writer.append(type, callId, null, revision, `${type === "goal.revision" ? "goal" : "plan"}-revision:${callId}`)
+    return markerState
+  }
+  const markers = appliedSteeringMarkerEntries({
+    markers: markerState?.active ?? [], stepId,
+    context: { taskId: options.identity.taskId, obligationId: obligation.id, goalRevision: obligation.goalRevision, planRevision: obligation.planRevision },
+  })
+  const entries = [
+    ...(includeRevision ? [{ type, correlationId: callId, itemId: null, payload: revision, key: `${type === "goal.revision" ? "goal" : "plan"}-revision:${callId}` }] : []),
+    ...markers.map(marker => ({ type: STEERING_MARKER_EVENT_TYPE, correlationId: callId, itemId: null, payload: marker.payload, key: marker.key, actor: "system" as const })),
+  ]
+  if (entries.length === 0) return markerState
+  await writer.appendBatch(entries)
+  if (markers.length === 0 || !markerState) return markerState
+  const applied = new Set(markers.map(marker => marker.payload.idempotencyKey))
+  return { active: markerState.active.filter(marker => !applied.has(marker.idempotencyKey)) }
 }
 
 type PlanHookResult = {

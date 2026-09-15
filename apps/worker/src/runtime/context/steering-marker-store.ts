@@ -2,6 +2,8 @@ import type pg from "pg"
 
 import {
   STEERING_MARKER_EVENT_TYPE,
+  STEERING_MARKER_MAX_BYTES,
+  STEERING_MARKER_MAX_EVENTS,
   parseSteeringMarkerPayload,
   steeringMarkerIdempotencyKey,
   type SteeringMarkerPayload,
@@ -32,6 +34,7 @@ export type SteeringMarkerDatabaseScope = {
   readonly lease?: { readonly ownerId: string; readonly now: Date }
 }
 export type SteeringMarkerInput = { readonly id: string; readonly acceptedSequence: bigint }
+export type AppliedSteeringMarkerEntry = { readonly key: string; readonly payload: SteeringMarkerPayload }
 export type SteeringMarkerTransaction = {
   readonly appendObservedSteeringMarker?: (input: SteeringMarkerWrite) => Promise<void>
 }
@@ -116,6 +119,41 @@ export function buildObservedSteeringMarker(input: { readonly sessionId: string;
   }
   if (!parseSteeringMarkerPayload(payload)) throw new SteeringMarkerStoreError("invalid_marker", "Steering marker construction failed validation")
   return payload
+}
+
+export function buildAppliedSteeringMarker(input: { readonly marker: SteeringMarkerPayload; readonly stepId: string }): SteeringMarkerPayload {
+  const marker = parseSteeringMarkerPayload(input.marker)
+  if (!marker || marker.kind !== "observed" || marker.status !== "observed") throw new SteeringMarkerStoreError("invalid_marker", "Applied marker source is invalid")
+  const payload: SteeringMarkerPayload = { ...marker, kind: "applied", status: "applied", stepId: input.stepId }
+  if (!parseSteeringMarkerPayload(payload)) throw new SteeringMarkerStoreError("invalid_marker", "Applied steering marker construction failed validation")
+  return payload
+}
+
+export function appliedSteeringMarkerEntries(input: {
+  readonly markers: readonly SteeringMarkerPayload[]
+  readonly context: SteeringMarkerContext
+  readonly stepId: string
+}): readonly AppliedSteeringMarkerEntry[] {
+  if (!Array.isArray(input.markers) || input.markers.length > STEERING_MARKER_MAX_EVENTS) throw new SteeringMarkerStoreError("invalid_marker", "Applied steering marker count exceeds the server bound")
+  const entries: AppliedSteeringMarkerEntry[] = [], seen = new Map<string, string>()
+  for (const candidate of input.markers) {
+    const marker = parseSteeringMarkerPayload(candidate)
+    if (!marker) throw new SteeringMarkerStoreError("invalid_marker", "Active steering marker is invalid")
+    if (marker.kind !== "observed" || marker.status !== "observed") throw new SteeringMarkerStoreError("invalid_marker", "Applied marker source is not active")
+    if (marker.taskId !== input.context.taskId || marker.obligationId !== input.context.obligationId || marker.goalRevision !== input.context.goalRevision || marker.planRevision !== input.context.planRevision) continue
+    const fingerprint = JSON.stringify(marker), prior = seen.get(marker.idempotencyKey)
+    if (prior !== undefined) {
+      if (prior !== fingerprint) throw new SteeringMarkerStoreError("idempotency_conflict", "Active steering marker is conflicting")
+      continue
+    }
+    seen.set(marker.idempotencyKey, fingerprint)
+    const payload = buildAppliedSteeringMarker({ marker, stepId: input.stepId })
+    entries.push({ key: `steering-marker-applied:${marker.inputId}:${input.context.obligationId}:${input.context.goalRevision}:${input.context.planRevision ?? "none"}`, payload })
+  }
+  entries.sort((left, right) => left.payload.idempotencyKey.localeCompare(right.payload.idempotencyKey))
+  const bytes = Buffer.byteLength(JSON.stringify(entries), "utf8")
+  if (bytes > STEERING_MARKER_MAX_BYTES) throw new SteeringMarkerStoreError("invalid_marker", "Applied steering markers exceed the byte bound")
+  return entries
 }
 
 export async function appendNewObservedSteeringMarkers(input: {

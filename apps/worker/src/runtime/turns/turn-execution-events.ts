@@ -6,8 +6,9 @@ import type { FinalResponse } from "../finalizer.js"
 import { toRepositoryJson, type TurnEngineItemPhase, type TurnEngineItemStatus, type TurnEngineItemType } from "./turn-engine-types.js"
 import { executionId, executionKey, type ExecutionItemHandle, type TurnExecutionOptions } from "./turn-execution-types.js"
 import type { TurnEngineStep, TurnEngineToolCall, TurnEngineToolResult } from "./turn-engine-types.js"
+import { STEERING_MARKER_EVENT_TYPE } from "../context/steering-marker.js"
 
-type BatchAppendEntry = { type: string; correlationId: string; itemId: string | null; payload: unknown; key: string }
+export type BatchAppendEntry = { type: string; correlationId: string; itemId: string | null; payload: unknown; key: string; actor?: "system" }
 
 export class TurnExecutionEventWriter {
   private causationId: string | null = null
@@ -37,9 +38,9 @@ export class TurnExecutionEventWriter {
     let causationId = this.causationId
     const pending = entries.map(entry => {
       const id = this.id(`event:${entry.key}`)
-      const mappedType = this.options.lifecycle?.mapEventType?.(entry.type) ?? ownerEventType(this.options.identity.kind, entry.type)
+      const mappedType = entry.type === STEERING_MARKER_EVENT_TYPE ? STEERING_MARKER_EVENT_TYPE : this.options.lifecycle?.mapEventType?.(entry.type) ?? ownerEventType(this.options.identity.kind, entry.type)
       const payload = toRepositoryJson(entry.payload)
-      const event = { identity: this.options.identity, id, itemId: entry.itemId, type: mappedType, correlationId: entry.correlationId, causationId, idempotencyKey: `${this.key}:event:${entry.key}`, payload }
+      const event = { identity: this.options.identity, id, itemId: entry.itemId, type: mappedType, correlationId: entry.correlationId, causationId, idempotencyKey: `${this.key}:event:${entry.key}`, payload, ...(entry.actor ? { actor: entry.actor } : {}) }
       causationId = id
       return { ...entry, id, mappedType, payload, event, causationId: event.causationId }
     })
