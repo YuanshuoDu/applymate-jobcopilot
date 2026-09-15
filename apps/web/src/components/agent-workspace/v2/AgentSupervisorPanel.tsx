@@ -11,6 +11,7 @@ import { AgentTurnRetryControl } from './AgentTurnRetryControl'
 import { CognitiveAgendaCard, type CognitiveAgendaTaskLabel } from './cognitive-agenda-card'
 import { AgentPlanLedgerCard } from './AgentPlanLedgerCard'
 import { AgentApprovalLedgerCard } from './AgentApprovalLedgerCard'
+import { AgentContextCompactionCard } from './AgentContextCompactionCard'
 import { AgentQuestionInputCard } from './AgentQuestionInputCard'
 import { projectSupervisorTree, type SupervisorTaskSummary, type SupervisorTurnSummary } from './task-tree-projection'
 import type { AgentTimelineSnapshot } from './use-agent-timeline'
@@ -174,6 +175,7 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
       {error && <p role="alert" style={{ ...messageStyle, color: 'var(--c-danger)' }}>{t('agent.supervisorUnavailable')}</p>}
       <AgentPlanLedgerCard ledger={timeline.planLedger} />
       <AgentApprovalLedgerCard ledger={timeline.approvalLedger} sessionId={sessionId} turns={turns} controlGate={timeline.controlGate} onAccepted={refetchSupervisorRecords} selectionKey={selectedId ?? ''} />
+      <AgentContextCompactionCard ledger={timeline.contextCompaction} />
       <AgentQuestionInputCard sessionId={sessionId} items={timeline.items} turns={turns} controlGate={timeline.controlGate} onAccepted={refetchSupervisorRecords} selectionKey={selectedId ?? ''} />
       {timeline.cognitiveAgenda && <CognitiveAgendaCard agenda={timeline.cognitiveAgenda} agendas={timeline.cognitiveAgendas} taskLabels={agendaTaskLabels} />}
       {!loading && !nodes.length && !error && <p style={messageStyle}>{t('agent.noTaskRecords')}</p>}

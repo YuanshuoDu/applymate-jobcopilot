@@ -9,7 +9,7 @@ import {
 
 import { BoundedStreamBuffer, type StreamFrame } from "./stream-buffer"
 import { redactStreamValue } from "./stream-redaction"
-
+import { CONTEXT_COMPACTION_EVENT_TYPE, projectContextCompactionRow } from "../../../components/agent-workspace/v2/timeline-context-compaction"
 const DEFAULT_DB_POLL_MS = 750
 const DEFAULT_HEARTBEAT_MS = 15_000
 const DEFAULT_BUFFER_CAPACITY = 128
@@ -31,12 +31,10 @@ type DurableEventRow = {
   idempotencyKey: string | null
   payload: unknown
 }
-
 export interface AgentStreamRedis {
   xread(...args: string[]): Promise<unknown>
   disconnect(): void
 }
-
 export interface V2EventStreamOptions {
   sessionId: string
   afterSequence: bigint
@@ -78,7 +76,6 @@ export function createV2EventStream(db: PrismaClient, options: V2EventStreamOpti
   const onRequestAbort = () => lifetime.abort()
   if (options.signal?.aborted) lifetime.abort()
   else options.signal?.addEventListener("abort", onRequestAbort, { once: true })
-
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       const producers = [
@@ -134,12 +131,14 @@ async function durableEventLoop(
       for (const row of rows) {
         const sequence = BigInt(row.sequence)
         if (sequence <= lastSequence) continue
-        const result = buffer.push({ kind: "durable", body: durableFrame(row) })
+        const body = durableFrame(row)
+        lastSequence = sequence
+        if (body === null) continue
+        const result = buffer.push({ kind: "durable", body })
         if (!result.accepted) {
           buffer.close()
           return
         }
-        lastSequence = sequence
       }
     } catch {
       // The next poll retries a transient database error without cancelling the Turn.
@@ -186,8 +185,11 @@ async function heartbeatLoop(options: V2EventStreamOptions, buffer: BoundedStrea
     if (!signal.aborted) buffer.push({ kind: "transient", body: ": heartbeat\n\n" })
   }
 }
-
-function durableFrame(row: DurableEventRow): string {
+function durableFrame(row: DurableEventRow): string | null {
+  if (row.type === CONTEXT_COMPACTION_EVENT_TYPE) {
+    const projected = projectContextCompactionRow(row, row.sessionId)
+    return projected ? sseFrame(row.type, row.sequence.toString(), projected) : null
+  }
   const payload: AgentStreamEnvelope = {
     schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: row.id, sessionId: row.sessionId, turnId: row.turnId,
     itemId: row.itemId, taskId: row.taskId, type: row.type, actor: row.actor,
@@ -196,15 +198,12 @@ function durableFrame(row: DurableEventRow): string {
   }
   return sseFrame(row.type, row.sequence.toString(), payload)
 }
-
 function deltaFrame(streamId: string, envelope: AgentDeltaEnvelope): string {
   return sseFrame(envelope.type, null, { ...envelope, payload: redactStreamValue(envelope.payload), streamId })
 }
-
 function sseFrame(event: string, id: string | null, data: unknown): string {
   return `${event ? `event: ${event}\n` : ""}${id ? `id: ${id}\n` : ""}data: ${JSON.stringify(data)}\n\n`
 }
-
 function readDeltaEntries(value: unknown, sessionId: string): Array<{ streamId: string; envelope: AgentDeltaEnvelope }> {
   if (!Array.isArray(value)) return []
   const entries: Array<{ streamId: string; envelope: AgentDeltaEnvelope }> = []
@@ -229,13 +228,11 @@ function readDeltaEntries(value: unknown, sessionId: string): Array<{ streamId: 
   }
   return entries
 }
-
 function defaultRedisFactory(): AgentStreamRedis | null {
   const url = process.env.REDIS_URL?.trim()
   if (!url) return null
   return new Redis(url, { lazyConnect: true, connectTimeout: 1_000, maxRetriesPerRequest: 1, retryStrategy: () => null })
 }
-
 async function delay(milliseconds: number, signal: AbortSignal): Promise<void> {
   await new Promise<void>((resolve) => {
     if (signal.aborted) { resolve(); return }

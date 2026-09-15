@@ -121,6 +121,16 @@ function approvalResolvedEvent(sequence = '4') {
   }
 }
 
+function compactionEvent(sequence = '8', id = `compaction-${sequence}`, overrides: Record<string, unknown> = {}) {
+  return {
+    schemaVersion: 'agent-harness.v2', id, sessionId: 'session-1', turnId: 'turn-1', itemId: null, taskId: 'task-1',
+    type: 'context.compaction', actor: 'orchestrator', sequence,
+    payload: {
+      kind: 'context_compacted', status: 'compacted', beforeInputTokens: 20, afterInputTokens: 8, beforeBytes: 80, afterBytes: 32,
+    }, ...overrides,
+  }
+}
+
 function questionStubEvent(sequence: string, questionId: string, overrides: Record<string, unknown> = {}) {
   return {
     schemaVersion: 'agent-harness.v2', id: `question-started-${sequence}`, sessionId: 'session-1', turnId: 'turn-1',
@@ -243,6 +253,39 @@ describe('V2 timeline stream client', () => {
     expect(state.events.some(event => event.id === 'approval-requested-8')).toBe(false)
   })
 
+  it('hydrates compaction facts in the stable first-page tail with agenda, plan, and approval facts', async () => {
+    let state: TimelineState = createTimelineState('session-1')
+    const dispatch = (action: TimelineAction) => { state = timelineReducer(state, action) }
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(JSON.stringify({
+      items: [], page: { hasMore: false, nextCursor: null }, agenda: agendaEvent({ sequence: '9' }),
+      planEvents: [planRevisionEvent('5')], approvalEvents: [approvalRequestedEvent('3')], compactionEvents: [compactionEvent('8')],
+    })))
+
+    await hydrateTimeline({ sessionId: 'session-1', dispatch, fetcher })
+
+    expect(state.events.map(event => event.id)).toEqual(['approval-requested-3', 'plan-revision-5', 'compaction-8', 'agenda-7'])
+    expect(state.contextCompaction.records).toHaveLength(1)
+    expect(state.contextCompaction.records).toMatchObject([{ taskId: 'task-1', sequence: '8', status: 'compacted' }])
+    expect(JSON.stringify(state.events.find(event => event.id === 'compaction-8'))).not.toMatch(/observationId|snapshotRef|stepId|idempotencyKey|errorCode/)
+  })
+
+  it('folds a live compaction event through the existing single SSE stream', async () => {
+    const controller = new AbortController()
+    let state: TimelineState = createTimelineState('session-1')
+    const dispatch = (action: TimelineAction) => {
+      state = timelineReducer(state, action)
+      if (action.type === 'event' && (action.event as { id?: unknown })?.id === 'compaction-live') controller.abort()
+    }
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [], page: { hasMore: false } })))
+      .mockResolvedValueOnce(new Response(streamFrom(sseEvent(compactionEvent('10', 'compaction-live'))), { headers: { 'Content-Type': 'text/event-stream' } }))
+
+    await streamAgentTimeline({ sessionId: 'session-1', dispatch, fetcher, signal: controller.signal, retryDelayMs: 0 })
+
+    expect(state.contextCompaction.records).toMatchObject([{ eventId: 'compaction-live', sequence: '10' }])
+    expect(fetcher).toHaveBeenCalledTimes(2)
+  })
+
   it('uses event id as the stable tie-breaker for first-page tail events', async () => {
     const dispatch = vi.fn()
     const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(JSON.stringify({
@@ -288,11 +331,12 @@ describe('V2 timeline stream client', () => {
     const fetcher = vi.fn<typeof fetch>()
       .mockResolvedValueOnce(new Response(JSON.stringify({ items: [], page: { hasMore: false } })))
       .mockResolvedValueOnce(new Response(streamFrom(`event: stream.overflow\ndata: ${overflow}\n\n`), { headers: { 'Content-Type': 'text/event-stream' } }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [], page: { hasMore: false }, agenda: agendaEvent() })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [], page: { hasMore: false }, agenda: agendaEvent(), compactionEvents: [compactionEvent('12', 'compaction-overflow')] })))
 
     await streamAgentTimeline({ sessionId: 'session-1', dispatch, fetcher, signal: controller.signal, retryDelayMs: 0 })
 
     expect(state.cognitiveAgenda.latest?.nextAction).toBe('continue_turn')
+    expect(state.contextCompaction.records[0]?.eventId).toBe('compaction-overflow')
     expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual([
       '/api/agent/sessions/session-1/timeline?limit=100',
       '/api/agent/sessions/session-1/events',

@@ -106,6 +106,17 @@ function brokerApprovalRow(sequence: bigint, status: "approved" | "rejected" = "
   }, { itemId: "wait-item-1" })
 }
 
+function compactionRow(sequence: bigint, overrides: Record<string, unknown> = {}) {
+  return {
+    id: `compaction_${sequence}`, sessionId: "session_1", turnId: "turn_1", itemId: null, taskId: "task_1", sequence,
+    type: "context.compaction", actor: "orchestrator", correlationId: "step_1", causationId: null, idempotencyKey: "turn:turn_1:event:context-compaction:step_1",
+    payload: {
+      kind: "context_compacted", observationId: "context-compacted:step_1", status: "compacted", stepId: "step_1",
+      idempotencyKey: "context-compaction:step_1", beforeInputTokens: 20, afterInputTokens: 8, beforeBytes: 80, afterBytes: 32, snapshotRef: "private-snapshot-ref",
+    }, ...overrides,
+  }
+}
+
 describe("agent timeline query API", () => {
   beforeEach(() => {
     vi.resetModules()
@@ -260,6 +271,30 @@ describe("agent timeline query API", () => {
 
     expect(body.approvalEvents.map((event: { id: string }) => event.id)).toEqual(["approval_1"])
     expect(JSON.stringify(body.approvalEvents)).not.toContain("raw secret")
+  })
+
+  it("returns a bounded, redacted compaction tail only on the first page", async () => {
+    mocks.agendaFindMany.mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([
+      compactionRow(BigInt(3)),
+      compactionRow(BigInt(2), { sessionId: "session_2" }),
+      compactionRow(BigInt(1), { payload: { ...compactionRow(BigInt(1)).payload, extra: "reject" } }),
+    ])
+    const { GET } = await import("./route")
+
+    const response = await GET(request("?limit=1") as never, params)
+    const body = await response.json()
+
+    expect(body.compactionEvents.map((entry: { id: string }) => entry.id)).toEqual(["compaction_3"])
+    expect(body.compactionEvents[0].payload).toEqual({ kind: "context_compacted", status: "compacted", beforeInputTokens: 20, afterInputTokens: 8, beforeBytes: 80, afterBytes: 32 })
+    expect(JSON.stringify(body.compactionEvents)).not.toContain("private-snapshot-ref")
+    expect(mocks.agendaFindMany).toHaveBeenNthCalledWith(5, expect.objectContaining({
+      where: { sessionId: "session_1", type: "context.compaction" }, orderBy: { sequence: "desc" }, take: 16,
+    }))
+
+    mocks.agendaFindMany.mockClear()
+    const next = await GET(request("?limit=1&cursor=eyJjb2xsZWN0aW9uIjoidGltZWxpbmUiLCJjcmVhdGVkQXQiOiIyMDI2LTA4LTMxVDAwOjAwOjAwLjAwMFoiLCJpZCI6Iml0ZW1fMSIsInNlc3Npb25JZCI6InNlc3Npb25fMSJ9") as never, params)
+    expect((await next.json()).compactionEvents).toBeUndefined()
+    expect(mocks.agendaFindMany).not.toHaveBeenCalled()
   })
 
   it("restores only a legal bounded marker pair after the authenticated session check", async () => {

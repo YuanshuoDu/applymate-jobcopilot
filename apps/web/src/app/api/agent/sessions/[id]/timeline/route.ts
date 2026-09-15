@@ -8,6 +8,7 @@ import { APPROVAL_LEDGER_EVENT_TYPES, APPROVAL_LEDGER_MAX_EVENTS, projectApprova
 import { parseCognitiveAgendaReceipt, type CognitiveAgendaScope } from "@/components/agent-workspace/v2/cognitive-agenda-view"
 import { isPlanLedgerEventType, parsePlanLedgerEvent, PLAN_LEDGER_EVENT_TYPES, PLAN_LEDGER_MAX_COMMAND_RECEIPT_BYTES, PLAN_LEDGER_MAX_PLANS, PLAN_LEDGER_MAX_RECEIPT_BYTES, PLAN_LEDGER_MAX_STEPS } from "@/components/agent-workspace/v2/timeline-plan-ledger"
 import { parseSteeringMarkerEvent, reduceTimelineSteeringMarkers, type TimelineSteeringMarkerEvent } from "@/components/agent-workspace/v2/timeline-steering-markers"
+import { recentTimelineContextCompactionEvents } from "@/components/agent-workspace/v2/timeline-context-compaction-query"
 
 import {
   afterCursor,
@@ -71,6 +72,7 @@ export async function GET(request: NextRequest, context: RouteContext) {
   const steeringMarkers = page.cursor === null ? await latestSteeringMarkers(sessionId) : []
   const planEvents = page.cursor === null ? await recentPlanEvents(sessionId) : []
   const approvalEvents = page.cursor === null ? await recentApprovalEvents(sessionId) : []
+  const compactionEvents = page.cursor === null ? await recentTimelineContextCompactionEvents(sessionId) : []
   return ok({
     items: result.rows.map(itemDto),
     page: result.page,
@@ -80,6 +82,7 @@ export async function GET(request: NextRequest, context: RouteContext) {
       ...(steeringMarkers.length > 0 ? { steeringMarkers } : {}),
       ...(planEvents.length > 0 ? { planEvents } : {}),
       ...(approvalEvents.length > 0 ? { approvalEvents } : {}),
+      ...(compactionEvents.length > 0 ? { compactionEvents } : {}),
     } : {}),
   })
 }

@@ -3,6 +3,7 @@
 import { isSessionControlEventCandidate, parseTimelineSessionControl } from './timeline-session-control'
 import { normalizeTimelineEvent, type TimelineAction } from './timeline-reducer'
 import { createQuestionHydrationPump, filterQuestionHydrationValues, QUESTION_HYDRATION_MAX_PAGES } from './question-hydration'
+import { CONTEXT_COMPACTION_EVENT_TYPE } from './timeline-context-compaction'
 
 interface TimelinePageResponse {
   items?: unknown[]
@@ -12,6 +13,7 @@ interface TimelinePageResponse {
   steeringMarkers?: unknown[]
   planEvents?: unknown[]
   approvalEvents?: unknown[]
+  compactionEvents?: unknown[]
 }
 
 export interface TimelineStreamClientOptions {
@@ -40,6 +42,7 @@ export async function hydrateTimeline(options: TimelineHydrationOptions): Promis
   let steeringMarkers: unknown[] | undefined
   let planEvents: unknown[] | undefined
   let approvalEvents: unknown[] | undefined
+  let compactionEvents: unknown[] | undefined
   let cursor: string | null = null
   let pages = 0
   const maxPages = options.maxPages ?? Number.POSITIVE_INFINITY
@@ -55,6 +58,7 @@ export async function hydrateTimeline(options: TimelineHydrationOptions): Promis
     if (cursor === null && Array.isArray(page.steeringMarkers)) steeringMarkers = page.steeringMarkers
     if (cursor === null && Array.isArray(page.planEvents)) planEvents = page.planEvents
     if (cursor === null && Array.isArray(page.approvalEvents)) approvalEvents = page.approvalEvents
+    if (cursor === null && Array.isArray(page.compactionEvents)) compactionEvents = page.compactionEvents
     pages += 1
     cursor = page.page?.hasMore === true && typeof page.page.nextCursor === 'string' ? page.page.nextCursor : null
   } while (cursor && pages < maxPages && !options.signal?.aborted)
@@ -62,6 +66,7 @@ export async function hydrateTimeline(options: TimelineHydrationOptions): Promis
   const agendaTail = agendas ?? (agenda === undefined || agenda === null ? [] : [agenda])
   const tail = [...agendaTail, ...(steeringMarkers ?? []), ...(planEvents ?? [])]
     .concat(approvalEvents ?? [])
+    .concat(compactionEvents ?? [])
     .filter(value => filterQuestionHydrationValues([value], options.sessionId).length > 0)
     .filter((value): value is unknown => value !== undefined && value !== null)
     .sort(compareTailEvents)
@@ -145,7 +150,8 @@ export async function streamAgentTimeline(options: TimelineStreamClientOptions):
           snapshotRequired = true
           options.dispatch({ type: 'snapshot-required' })
         } else {
-          options.dispatch(event.kind ? { type: 'delta', delta: event } : { type: 'event', event })
+          const canonicalEvent = event.type === CONTEXT_COMPACTION_EVENT_TYPE ? frame.data : event
+          options.dispatch(event.kind ? { type: 'delta', delta: event } : { type: 'event', event: canonicalEvent })
           questionHydration.request(frame.data)
         }
       }, options.signal)

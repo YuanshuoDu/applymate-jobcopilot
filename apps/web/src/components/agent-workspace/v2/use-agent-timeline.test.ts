@@ -4,6 +4,7 @@ import { createTimelineState, timelineReducer } from './timeline-reducer'
 import { timelineItemsForSession, type AgentTimelineSnapshot } from './use-agent-timeline'
 import { createPlanLedgerState, selectPlanLedgerProjection } from './plan-ledger-view'
 import { createApprovalLedgerState, selectApprovalLedgerProjection } from './approval-ledger-view'
+import { createTimelineContextCompactionState, selectTimelineContextCompactionProjection } from './timeline-context-compaction'
 
 describe('timeline session projection', () => {
   it('discards state from a previous session before rendering a switch', () => {
@@ -57,6 +58,7 @@ describe('timeline session projection', () => {
       cognitiveAgenda: state.cognitiveAgenda.latest, cognitiveAgendas: state.cognitiveAgenda.scoped,
       planLedger: selectPlanLedgerProjection(createPlanLedgerState('session-a')),
       approvalLedger: selectApprovalLedgerProjection(createApprovalLedgerState('session-a')),
+      contextCompaction: selectTimelineContextCompactionProjection(createTimelineContextCompactionState()),
       connection: 'idle', restoring: false, error: null,
     }
 

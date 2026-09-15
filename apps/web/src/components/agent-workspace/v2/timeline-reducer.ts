@@ -4,6 +4,7 @@ import { AGENT_STREAM_SCHEMA_VERSION } from '@jobcopilot/agent-protocol'
 import { isApprovalLedgerEventType, parseApprovalLedgerEvent } from './approval-ledger-parser'
 import { createApprovalLedgerState, reduceApprovalLedger, type ApprovalLedgerState } from './approval-ledger-view'
 import { createCognitiveAgendaState, reduceCognitiveAgenda, type TimelineCognitiveAgendaState } from './timeline-cognitive-agenda'
+import { CONTEXT_COMPACTION_EVENT_TYPE, createTimelineContextCompactionState, parseRedactedTimelineContextCompactionEvent, parseTimelineContextCompactionEvent, reduceTimelineContextCompaction, type TimelineContextCompactionState } from './timeline-context-compaction'
 import { isPlanLedgerEventType, parsePlanLedgerEvent } from './plan-ledger-parser'
 import { createPlanLedgerState, reducePlanLedger, type PlanLedgerState } from './plan-ledger-view'
 import { parseQuestionInputItem, parseQuestionTerminalEvent } from './question-input-parser'
@@ -71,6 +72,7 @@ export interface TimelineState {
   cognitiveAgenda: TimelineCognitiveAgendaState
   planLedger: PlanLedgerState
   approvalLedger: ApprovalLedgerState
+  contextCompaction: TimelineContextCompactionState
   steeringMarkers: TimelineSteeringMarkerState
   steeringMarkerEvents: readonly TimelineSteeringMarkerEvent[]
   connection: TimelineConnection
@@ -94,7 +96,7 @@ const KNOWN_EVENT_TYPES = new Set([
   'input.accepted', 'input.consumed', 'tool_call.started', 'tool_call.completed', 'tool_call.failed',
   'policy.decision', 'approval.requested', 'approval.resolved', 'approval.consumed', 'approval.expired',
   'plan.revision', 'plan.command', 'plan.observation',
-  'question.answered', 'question.cancelled', 'external_action.reserved', 'stream.overflow', 'cognitive.agenda', STEERING_MARKER_EVENT_TYPE,
+  'question.answered', 'question.cancelled', 'external_action.reserved', 'stream.overflow', 'cognitive.agenda', CONTEXT_COMPACTION_EVENT_TYPE, STEERING_MARKER_EVENT_TYPE,
 ])
 
 // Status-only events drive supervisor metadata refreshes. Item deltas are
@@ -112,7 +114,7 @@ export function createTimelineState(sessionId: string): TimelineState {
     sessionId, events: [], byId: new Map(), byTurnId: new Map(), byToolCallId: new Map(), lastEventId: null,
     transientItems: new Map(), fallbackItems: [],
     itemIds: [], itemsById: {}, itemIdsByTurnId: {}, itemIdsByTaskId: {},
-    processedEventIds: {}, lastSequence: null, sessionControl: createTimelineSessionControlState(), lifecycleRevision: 0, cognitiveAgenda: createCognitiveAgendaState(sessionId), planLedger: createPlanLedgerState(sessionId), approvalLedger: createApprovalLedgerState(sessionId), steeringMarkers: emptyTimelineSteeringMarkerState(), steeringMarkerEvents: [], connection: 'idle', snapshotRequired: false,
+    processedEventIds: {}, lastSequence: null, sessionControl: createTimelineSessionControlState(), lifecycleRevision: 0, cognitiveAgenda: createCognitiveAgendaState(sessionId), planLedger: createPlanLedgerState(sessionId), approvalLedger: createApprovalLedgerState(sessionId), contextCompaction: createTimelineContextCompactionState(), steeringMarkers: emptyTimelineSteeringMarkerState(), steeringMarkerEvents: [], connection: 'idle', snapshotRequired: false,
   }
 }
 
@@ -187,6 +189,7 @@ function reduceItems(state: TimelineState, values: unknown[], source: TimelineIt
 }
 
 function reduceEvent(state: TimelineState, value: unknown): TimelineState {
+  if (isRecord(value) && value.type === CONTEXT_COMPACTION_EVENT_TYPE) return reduceContextCompactionEvent(state, value)
   const questionTerminalCandidate = isRecord(value) && (value.type === 'question.answered' || value.type === 'question.cancelled')
   if (questionTerminalCandidate) return reduceQuestionTerminalEvent(state, value)
   const approvalCandidate = isRecord(value) && isApprovalLedgerEventType(value.type)
@@ -231,6 +234,23 @@ function reduceEvent(state: TimelineState, value: unknown): TimelineState {
   const item = itemFromTimelineEvent(event, status, existing, undefined, normalizeTimelineItem)
   if (item?.type === 'question' && isRecord(event.payload) && !parseQuestionInputItem(event.payload.item ?? event.payload, state.sessionId)) return next
   return item ? upsertItem(next, item, item.source === 'unknown' ? 'unknown' : 'durable') : next
+}
+
+function reduceContextCompactionEvent(state: TimelineState, value: Record<string, unknown>): TimelineState {
+  const parsed = parseTimelineContextCompactionEvent(value, state.sessionId) ??
+    parseRedactedTimelineContextCompactionEvent(value, state.sessionId)
+  if (!parsed || state.processedEventIds[parsed.id]) return state
+  const contextCompaction = reduceTimelineContextCompaction(state.contextCompaction, parsed)
+  const event = normalizeTimelineEvent(value)
+  if (!event || event.sessionId !== state.sessionId) return state
+  return {
+    ...state,
+    processedEventIds: { ...state.processedEventIds, [event.id]: true },
+    lastSequence: event.sequence && isAfter(event.sequence, state.lastSequence) ? event.sequence : state.lastSequence,
+    ...appendTimelineEvent(state.events, event),
+    lastEventId: event.id,
+    contextCompaction,
+  }
 }
 
 function reduceQuestionTerminalEvent(state: TimelineState, value: Record<string, unknown>): TimelineState {

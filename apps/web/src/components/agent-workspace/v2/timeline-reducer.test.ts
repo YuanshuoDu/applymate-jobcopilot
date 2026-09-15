@@ -136,6 +136,37 @@ describe('timeline reducer', () => {
     expect(state.lifecycleRevision).toBe(0)
   })
 
+  it('hydrates a redacted context compaction event through the same reducer path as raw events', () => {
+    const redacted = {
+      schemaVersion: 'agent-harness.v2', id: 'compaction-redacted', sessionId: 'session-1', turnId: 'turn-1', itemId: null, taskId: 'task-1',
+      type: 'context.compaction', actor: 'orchestrator', sequence: '8',
+      payload: { kind: 'context_compacted', status: 'compacted', beforeInputTokens: 20, afterInputTokens: 8, beforeBytes: 80, afterBytes: 32 },
+    }
+
+    const state = timelineReducer(createTimelineState('session-1'), { type: 'event', event: redacted })
+
+    expect(state.contextCompaction.records).toMatchObject([{ eventId: 'compaction-redacted', sequence: '8', status: 'compacted' }])
+    expect(state.events.map(value => value.id)).toEqual(['compaction-redacted'])
+    expect(state.itemsById).toEqual({})
+    expect(state.fallbackItems).toEqual([])
+  })
+
+  it('keeps foreign, extra, and malformed redacted compaction events out of state', () => {
+    const redacted = {
+      schemaVersion: 'agent-harness.v2', id: 'compaction-redacted', sessionId: 'session-1', turnId: 'turn-1', itemId: null, taskId: 'task-1',
+      type: 'context.compaction', actor: 'orchestrator', sequence: '8',
+      payload: { kind: 'context_compacted', status: 'compacted', beforeInputTokens: 20, afterInputTokens: 8, beforeBytes: 80, afterBytes: 32 },
+    }
+    const initial = createTimelineState('session-1')
+    const foreign = timelineReducer(initial, { type: 'event', event: { ...redacted, id: 'foreign', sessionId: 'session-2' } })
+    const extra = timelineReducer(initial, { type: 'event', event: { ...redacted, id: 'extra', payload: { ...redacted.payload, observationId: 'private' } } })
+    const malformed = timelineReducer(initial, { type: 'event', event: { ...redacted, id: 'malformed', payload: { ...redacted.payload, afterInputTokens: 20 } } })
+
+    expect(foreign).toBe(initial)
+    expect(extra).toBe(initial)
+    expect(malformed).toBe(initial)
+  })
+
   it('folds valid durable plan receipts without creating timeline items or exposing their output', () => {
     const revision = {
       schemaVersion: 'agent-harness.v2', id: 'plan-revision-1', sessionId: 'session-1', turnId: 'turn-1', itemId: null, taskId: 'task-1',
