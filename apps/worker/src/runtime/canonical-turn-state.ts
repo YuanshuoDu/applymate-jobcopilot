@@ -12,6 +12,9 @@ import { hydrateGoalContract } from "./planning/goal-contract-hydration.js"
 import type { GoalContract } from "./planning/goal-plan-contract.js"
 import { parseContextCompactionObservation } from "./context/context-snapshot-compaction-seam.js"
 import { currentPlanId, PLAN_COMPLETION_FEEDBACK_EVENT_TYPE, restorePlanCompletionFeedback, sanitizePlanCompletionFeedbackObservations } from "./planning/plan-completion-feedback.js"
+import { restoreCanonicalSteeringMarkers, type SteeringMarkerState } from "./canonical-steering-markers.js"
+import { priorConversation } from "./canonical-steering-markers.js"
+import { STEERING_MARKER_EVENT_TYPE } from "./context/steering-marker.js"
 export type CanonicalTurnState = {
   readonly scope: TenantScope
   readonly goal: string
@@ -24,6 +27,7 @@ export type CanonicalTurnState = {
   readonly snapshot: StepContextSnapshot
   readonly planRevision?: number | null
   readonly planProposalHashes?: readonly string[]
+  readonly steeringMarkers?: SteeringMarkerState
   readonly resume?: TurnResumeState
 }
 type Row = Record<string, unknown>; function object(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {} }
@@ -111,38 +115,6 @@ function contextCompactionObservations(events: readonly Row[]): StepContextSnaps
     return observation ? [{ id: observation.id, content: json(observation.content) }] : []
   })
 }
-function textContent(value: unknown): string | null {
-  const row = object(value)
-  if (typeof row.content === "string" && row.content.trim()) return row.content.trim()
-  if (typeof row.text === "string" && row.text.trim()) return row.text.trim()
-  if (typeof row.body === "string" && row.body.trim()) return row.body.trim()
-  if (typeof row.goal === "string" && row.goal.trim()) return row.goal.trim()
-  const partsSource = Array.isArray(value) ? value : row.parts
-  if (Array.isArray(partsSource)) {
-    const parts = partsSource.flatMap((part) => {
-      const item = object(part)
-      return item.type === "text" && typeof item.text === "string" ? [item.text] : []
-    })
-    if (parts.length > 0) return parts.join("\n").trim()
-  }
-  return null
-}
-type PriorHistoryEntry = { readonly id: string; readonly content: unknown; readonly sequence: bigint | null }
-function priorConversation(rows: readonly Row[], currentTurnId: string, throughSequence: bigint | null): PriorHistoryEntry[] {
-  return rows.flatMap((row) => {
-    const id = typeof row.id === "string" ? row.id : null
-    const turnId = typeof row.turnId === "string" ? row.turnId : row.targetTurnId
-    const text = textContent(row.content)
-    let sequence: bigint | null = null
-    try {
-      if (row.historySequence !== undefined && row.historySequence !== null) sequence = BigInt(String(row.historySequence))
-      else if (row.acceptedSequence !== undefined && row.acceptedSequence !== null) sequence = BigInt(String(row.acceptedSequence))
-    } catch { return [] }
-    if (throughSequence !== null && sequence !== null && sequence <= throughSequence) return []
-    const role = row.historyRole === "assistant" ? "assistant" : "user"
-    return id && turnId !== currentTurnId && text ? [{ id: `history:${role}:${id}`, content: { role, text }, sequence }] : []
-  })
-}
 export type CanonicalTurnStateLoadOptions = { readonly consumeWaitOutcomes?: boolean }
 export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lease: TurnLease, now = new Date(), options: CanonicalTurnStateLoadOptions = {}): Promise<CanonicalTurnState> {
   const client = await pool.connect()
@@ -172,7 +144,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
        AND ("taskId" IS NULL OR "taskId" = $3) AND "type" IN ('tool_call', 'tool_result') ORDER BY "createdAt" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId],
     )
     const eventsResult = await client.query<Row>(
-     `SELECT event."type", event."payload" FROM "agent_events" AS event JOIN "agent_sessions" AS event_session ON event_session."id" = event."sessionId" AND event_session."userId" = $4 JOIN "agent_turns" AS event_turn ON event_turn."id" = event."turnId" AND event_turn."sessionId" = event."sessionId" AND event_turn."userId" = $4 WHERE event."turnId" = $1 AND event."sessionId" = $2 AND (event."taskId" IS NULL OR event."taskId" = $3) AND event."type" IN ('tool_call.completed', 'tool_call.failed', 'plan.observation', 'plan.command', 'plan.revision', 'goal.revision', 'context.compaction', '${PLAN_COMPLETION_FEEDBACK_EVENT_TYPE}') ORDER BY event."sequence" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId, lease.userId],
+     `SELECT event."id", event."type", event."actor", event_session."userId" AS "userId", event."sessionId", event."turnId", event."taskId", event."sequence", event."payload" FROM "agent_events" AS event JOIN "agent_sessions" AS event_session ON event_session."id" = event."sessionId" AND event_session."userId" = $4 JOIN "agent_turns" AS event_turn ON event_turn."id" = event."turnId" AND event_turn."sessionId" = event."sessionId" AND event_turn."userId" = $4 WHERE event."turnId" = $1 AND event."sessionId" = $2 AND (event."taskId" IS NULL OR event."taskId" = $3) AND event."type" IN ('tool_call.completed', 'tool_call.failed', 'plan.observation', 'plan.command', 'plan.revision', 'goal.revision', 'context.compaction', '${PLAN_COMPLETION_FEEDBACK_EVENT_TYPE}', '${STEERING_MARKER_EVENT_TYPE}') ORDER BY event."sequence" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId, lease.userId],
     )
     const priorInputs = await client.query<Row>(
       `SELECT "id", "targetTurnId", "content", "acceptedSequence", 'user' AS "historyRole", "acceptedSequence" AS "historySequence" FROM "agent_inputs"
@@ -212,6 +184,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
       }
     }
     const hydratedGoal = hydrateGoalContract(turn.input)
+    const steeringMarkers = restoreCanonicalSteeringMarkers(eventsResult.rows, { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: typeof turn.rootTaskId === "string" ? turn.rootTaskId : null })
     const goalState = restoreGoalRevisions(hydratedGoal.goalContract, eventsResult.rows.map(event => ({ type: event.type, payload: eventPayload(event.payload) })))
     const revisionState = restorePlanRevisions(filterPlanRevisionEvents(eventsResult.rows.map(event => ({ type: event.type, payload: event.payload })), goalState.goalContract.revision).map(event => ({ type: event.type, payload: eventPayload(event.payload) })))
     const revision = revisionState.latest
@@ -264,7 +237,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
       consumedInputIds: Array.isArray(last?.consumedInputIds) ? last.consumedInputIds.filter((id): id is string => typeof id === "string") : [],
       usage,
     } satisfies TurnResumeState : undefined
-     const result = { scope, goal: goalState.goalContract.objective, goalContract: goalState.goalContract, modelProfileSnapshot: json(turn.modelProfileSnapshot), toolPolicySnapshot: turn.toolPolicySnapshot ?? {}, budgetSnapshot: turn.budgetSnapshot ?? {}, planRevision: revision?.planRevision ?? null, planProposalHashes: revisionState.hashes, ...(typeof turn.rootTaskId === "string" ? { rootTaskId: turn.rootTaskId } : {}), ...(rootInput.rows[0] ? { rootInputId: rootInput.rows[0].id } : {}), snapshot, ...(resume ? { resume } : {}) }
+     const result = { scope, goal: goalState.goalContract.objective, goalContract: goalState.goalContract, modelProfileSnapshot: json(turn.modelProfileSnapshot), toolPolicySnapshot: turn.toolPolicySnapshot ?? {}, budgetSnapshot: turn.budgetSnapshot ?? {}, planRevision: revision?.planRevision ?? null, planProposalHashes: revisionState.hashes, steeringMarkers, ...(typeof turn.rootTaskId === "string" ? { rootTaskId: turn.rootTaskId } : {}), ...(rootInput.rows[0] ? { rootInputId: rootInput.rows[0].id } : {}), snapshot, ...(resume ? { resume } : {}) }
     await client.query("COMMIT")
     committed = true
     return result

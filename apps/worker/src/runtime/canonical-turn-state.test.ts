@@ -2,11 +2,22 @@ import { describe, expect, it, vi } from "vitest"
 
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
 import { buildPlanCompletionFeedbackEvent, PLAN_COMPLETION_FEEDBACK_EVENT_TYPE, planCompletionRecoveryCount } from "./planning/plan-completion-feedback.js"
+import { STEERING_MARKER_EVENT_TYPE, steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "./context/steering-marker.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 1,
   leaseStartedAt: new Date("2026-09-09T00:00:00.000Z"), leaseExpiresAt: new Date("2026-09-10T00:01:00.000Z"),
 }
+
+const markerPayload = (kind: "observed" | "applied" = "observed"): SteeringMarkerPayload => ({
+  schemaVersion: "agent-harness.steering-marker.v1", kind, status: kind, sessionId: "session-1", turnId: "turn-1", taskId: "root-1",
+  stepId: "step-1", inputId: "input-1", idempotencyKey: steeringMarkerIdempotencyKey("session-1", "turn-1", "input-1"), obligationId: "obligation-1",
+  goalRevision: 1, planRevision: 1, acceptedSequence: "4",
+})
+const markerEvent = (kind: "observed" | "applied" = "observed", sequence = "4"): Record<string, unknown> => ({
+  id: `marker-${kind}`, type: STEERING_MARKER_EVENT_TYPE, actor: "system", userId: "user-1", sessionId: "session-1", turnId: "turn-1",
+  taskId: "root-1", sequence, payload: markerPayload(kind),
+})
 
 function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unknown>[]; items?: Record<string, unknown>[]; inputs?: Record<string, unknown>[]; events?: Record<string, unknown>[]; snapshots?: Record<string, unknown>[] }) {
   const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
@@ -26,12 +37,41 @@ function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unk
 }
 
 describe("loadCanonicalTurnState", () => {
+  it("replays scoped steering markers as independent canonical control state", async () => {
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      events: [markerEvent(), markerEvent("applied", "5")],
+    })
+    const value = await loadCanonicalTurnState(fake, lease)
+    expect(value.steeringMarkers?.observed).toHaveLength(1)
+    expect(value.steeringMarkers?.applied).toHaveLength(1)
+    expect(value.steeringMarkers?.active).toEqual([])
+    expect(value.snapshot.toolObservations.some(item => item.id === "marker-observed")).toBe(false)
+    const eventQuery = fake.client.query.mock.calls.find(([sql]) => typeof sql === "string" && sql.includes('FROM "agent_events"'))?.[0]
+    expect(eventQuery).toContain('event."id"')
+    expect(eventQuery).toContain('event."actor"')
+    expect(eventQuery).toContain('event_session."userId" AS "userId"')
+    expect(eventQuery).toContain('event."sequence"')
+    expect(eventQuery).toContain('event."payload"')
+    expect(eventQuery).toContain(`'${STEERING_MARKER_EVENT_TYPE}'`)
+    expect(eventQuery).toContain('(event."taskId" IS NULL OR event."taskId" = $3)')
+  })
+
+  it("fails closed when a scoped marker row is malformed", async () => {
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      events: [markerEvent("observed", "3")],
+    })
+    await expect(loadCanonicalTurnState(fake, lease)).rejects.toThrow("steering_marker_state_invalid")
+  })
+
   it("loads the owned turn and initial root input", async () => {
     const fake = pool({ turn: { input: { goal: "Find jobs" }, rootTaskId: null, contextSnapshotId: null, modelProfileSnapshot: { provider: "fixture" }, toolPolicySnapshot: {}, budgetSnapshot: {} }, inputs: [{ id: "input-1" }] })
     const value = await loadCanonicalTurnState(fake, lease)
     expect(value).toMatchObject({ goal: "Find jobs", rootInputId: "input-1", scope: { userId: "user-1" } })
     expect(value.goalContract).toEqual({ revision: 1, objective: "Find jobs", constraints: [], successCriteria: [], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" })
     expect(value.snapshot.goal).toEqual({ id: "turn-goal:turn-1", content: "Find jobs" })
+    expect(value.steeringMarkers).toEqual({ observed: [], applied: [], active: [] })
     expect(fake.client.query.mock.calls.some(([sql]) => typeof sql === "string" && sql.includes('agent_wait_conditions'))).toBe(false)
   })
 
@@ -277,7 +317,7 @@ describe("loadCanonicalTurnState", () => {
     const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
       if (sql.includes('"input"') && sql.includes('FROM "agent_turns"')) return { rows: [{ id: "turn-1", sessionId: "session-1", userId: "user-1", status: "in_progress", leaseOwnerId: lease.ownerId, leaseVersion: lease.leaseVersion, leaseExpiresAt: lease.leaseExpiresAt, input: { goal: "Continue" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} }], rowCount: 1 }
       if (sql.includes('FROM "agent_wait_conditions"')) return { rows: [wait], rowCount: 1 }
-      if (sql.includes('FROM "sub_agent_tasks"') && sql.includes("ANY($1::text[])")) return { rows: [{ id: "child-1", rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1", userId: "user-1", status: "completed", result: { summary: "done" }, failureReason: null }], rowCount: 1 }
+      if (sql.includes('FROM "sub_agent_tasks"') && sql.includes("ANY($1::text[])")) return { rows: [{ id: "child-1", rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1", userId: "user-1", role: "worker", status: "completed", result: { summary: "done" }, failureReason: null }], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ id: "root-1", rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1", userId: "user-1" }], rowCount: 1 }
       if (sql.includes('FROM "agent_steps"') && sql.includes('SELECT "ordinal"')) return { rows: [], rowCount: 0 }
       if (sql.includes('FROM "agent_steps"')) return { rows: [{ id: "step-1", taskId: "root-1", attempt: 1, status: "waiting_for_tool" }], rowCount: 1 }
