@@ -14,7 +14,7 @@ const scope: SteeringMarkerDatabaseScope = { userId: "user-a", sessionId: "sessi
 const context = { sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.taskId, obligationId: "obligation-1", goalRevision: 2, planRevision: 3 }
 const marker = buildObservedSteeringMarker({ sessionId: scope.sessionId, turnId: scope.turnId, stepId: "step-a", context, markerInput: { id: "input-1", acceptedSequence: 4n } })
 
-function makeClient(existing: Record<string, unknown> | null = null, taskPresent = true) {
+function makeClient(existing: Record<string, unknown> | null = null, taskPresent = true, outbox: Record<string, unknown> | null | undefined = undefined) {
   const calls: Array<{ sql: string; values: readonly unknown[] }> = []
   const client = {
     calls,
@@ -22,10 +22,11 @@ function makeClient(existing: Record<string, unknown> | null = null, taskPresent
       const text = String(sql)
       calls.push({ sql: text, values })
       if (text.includes('FROM "sub_agent_tasks"')) return { rows: taskPresent ? [{ id: scope.taskId }] : [] }
+      if (text.includes('FROM "agent_outbox"')) return { rows: outbox ? [outbox] : [] }
       if (text.includes('FROM "agent_events"')) return { rows: existing ? [existing] : [] }
       if (text.startsWith("UPDATE \"agent_sessions\"")) return { rows: [{ eventSequence: "9" }] }
       if (text.startsWith('INSERT INTO "agent_events"')) return { rowCount: 1, rows: [] }
-      if (text.startsWith('INSERT INTO "agent_outbox"')) return { rowCount: 1, rows: [] }
+      if (text.startsWith('INSERT INTO "agent_outbox"')) return { rowCount: outbox === undefined ? 1 : 0, rows: [] }
       throw new Error(`unexpected SQL ${text}`)
     }),
   }
@@ -65,6 +66,24 @@ describe("steering marker transaction store", () => {
     const reordered = Object.fromEntries([["status", marker.status], ["kind", marker.kind], ...Object.entries(marker).filter(([key]) => key !== "status" && key !== "kind")])
     const reorderedClient = makeClient({ id: `steering-marker-event:${marker.idempotencyKey}`, turnId: scope.turnId, taskId: scope.taskId, type: "agent.steering.marker", actor: "system", correlationId: scope.turnId, payload: reordered, sequence: "9" })
     await persistObservedSteeringMarker(queryClient(reorderedClient), scope, { sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.taskId, stepId: "step-a", payload: marker })
+  })
+
+  it("accepts a matching existing marker outbox row", async () => {
+    const eventId = `steering-marker-event:${marker.idempotencyKey}`
+    const existingEvent = { id: eventId, turnId: scope.turnId, taskId: scope.taskId, type: "agent.steering.marker", actor: "system", correlationId: scope.turnId, payload: { ...marker }, sequence: "9" }
+    const expectedPayload = { eventId, sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.taskId, itemId: null, sequence: "9", type: "agent.steering.marker", actor: "system", correlationId: scope.turnId, causationId: null, idempotencyKey: marker.idempotencyKey, payload: { ...marker } }
+    const outbox = { id: `steering-marker-outbox:${eventId}`, topic: "agent.events", aggregateId: scope.sessionId, idempotencyKey: `agent-event:${eventId}`, payload: { ...expectedPayload, payload: Object.fromEntries(Object.entries(marker).reverse()) } }
+    const client = makeClient(existingEvent, true, outbox)
+    await expect(persistObservedSteeringMarker(queryClient(client), scope, { sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.taskId, stepId: "step-a", payload: marker })).resolves.toBeUndefined()
+    expect(client.calls.some(call => call.sql.includes('FROM "agent_outbox"') && call.sql.includes("FOR UPDATE"))).toBe(true)
+  })
+
+  it("rejects a polluted existing marker outbox row", async () => {
+    const eventId = `steering-marker-event:${marker.idempotencyKey}`
+    const existingEvent = { id: eventId, turnId: scope.turnId, taskId: scope.taskId, type: "agent.steering.marker", actor: "system", correlationId: scope.turnId, payload: { ...marker }, sequence: "9" }
+    const polluted = { id: `steering-marker-outbox:${eventId}`, topic: "wrong.topic", aggregateId: scope.sessionId, idempotencyKey: `agent-event:${eventId}`, payload: {} }
+    const client = makeClient(existingEvent, true, polluted)
+    await expect(persistObservedSteeringMarker(queryClient(client), scope, { sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.taskId, stepId: "step-a", payload: marker })).rejects.toMatchObject({ code: "idempotency_conflict" })
   })
 
   it("rejects wrong task and conflicting payload before writing", async () => {

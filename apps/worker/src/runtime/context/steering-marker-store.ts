@@ -1,4 +1,5 @@
 import type pg from "pg"
+import { matchesAgentOutboxIdentity, type AgentOutboxIdentity, type AgentOutboxPayload } from "../outbox-identity.js"
 
 import {
   STEERING_MARKER_EVENT_TYPE,
@@ -70,8 +71,8 @@ function eventId(key: string): string {
   return `steering-marker-event:${key}`
 }
 function outboxKey(id: string): string { return `agent-event:${id}` }
-function outboxPayload(input: { eventId: string; payload: SteeringMarkerPayload; sequence: string }): string {
-  return JSON.stringify({ eventId: input.eventId, sessionId: input.payload.sessionId, turnId: input.payload.turnId, taskId: input.payload.taskId, itemId: null, sequence: input.sequence, type: STEERING_MARKER_EVENT_TYPE, actor: "system", correlationId: input.payload.turnId, causationId: null, idempotencyKey: input.payload.idempotencyKey, payload: input.payload })
+function outboxPayload(input: { eventId: string; payload: SteeringMarkerPayload; sequence: string }): AgentOutboxPayload {
+  return { eventId: input.eventId, sessionId: input.payload.sessionId, turnId: input.payload.turnId, taskId: input.payload.taskId, itemId: null, sequence: input.sequence, type: STEERING_MARKER_EVENT_TYPE, actor: "system", correlationId: input.payload.turnId, causationId: null, idempotencyKey: input.payload.idempotencyKey, payload: input.payload }
 }
 function validatedPayload(input: SteeringMarkerWrite, scope: SteeringMarkerDatabaseScope): SteeringMarkerPayload {
   const payload = parseSteeringMarkerPayload(input.payload)
@@ -84,9 +85,13 @@ function validatedPayload(input: SteeringMarkerWrite, scope: SteeringMarkerDatab
 }
 
 async function writeOutbox(client: QueryClient, payload: SteeringMarkerPayload, id: string, sequence: string): Promise<void> {
-  await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload") VALUES ($1, $2, $3, $4, $5::jsonb) ON CONFLICT ("idempotencyKey") DO NOTHING`, [
-    `steering-marker-outbox:${id}`, EVENT_TOPIC, payload.sessionId, outboxKey(id), outboxPayload({ eventId: id, payload, sequence }),
+  const expected: AgentOutboxIdentity = { id: `steering-marker-outbox:${id}`, topic: EVENT_TOPIC, aggregateId: payload.sessionId, idempotencyKey: outboxKey(id), payload: outboxPayload({ eventId: id, payload, sequence }) }
+  const inserted = await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload") VALUES ($1, $2, $3, $4, $5::jsonb) ON CONFLICT ("idempotencyKey") DO NOTHING`, [
+    expected.id, expected.topic, expected.aggregateId, expected.idempotencyKey, JSON.stringify(expected.payload),
   ])
+  if ((inserted.rowCount ?? 0) === 1) return
+  const existing = await client.query<Row>(`SELECT "id", "topic", "aggregateId", "idempotencyKey", "payload" FROM "agent_outbox" WHERE "idempotencyKey" = $1 FOR UPDATE`, [expected.idempotencyKey])
+  if (!matchesAgentOutboxIdentity(existing.rows[0], expected)) throw new SteeringMarkerStoreError("idempotency_conflict", "Observed steering marker outbox identity was reused with different content")
 }
 
 export async function persistObservedSteeringMarker(client: QueryClient, scope: SteeringMarkerDatabaseScope, input: SteeringMarkerWrite): Promise<void> {

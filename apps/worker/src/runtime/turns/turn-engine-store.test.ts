@@ -112,6 +112,39 @@ describe("PostgreSQL TurnEngine store", () => {
     expect(outboxInserts[1]?.sql).not.toContain("ON CONFLICT")
   })
 
+  it("accepts a matching existing event outbox row with reordered JSON", async () => {
+    const calls: string[] = []
+    const outbox = {
+      id: "agent-outbox-existing-event", topic: "agent.events", aggregateId: owner.sessionId, idempotencyKey: "agent-event:existing-event",
+      payload: Object.fromEntries(Object.entries({ eventId: "existing-event", sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.taskId, itemId: null, sequence: "4", type: "plan.observation", actor: "orchestrator", correlationId: "plan-1", causationId: null, idempotencyKey: "plan-event-existing", payload: { marker: "a" } }).reverse()),
+    }
+    const client = { query: vi.fn(async (sql: string) => {
+      calls.push(sql)
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: owner.sessionId }] }
+      if (sql.includes('FROM "agent_outbox"')) return { rows: [outbox] }
+      if (sql.includes('FROM "agent_events"')) return { rows: [{ id: "existing-event", taskId: owner.taskId, turnId: owner.turnId, itemId: null, type: "plan.observation", correlationId: "plan-1", causationId: null, sequence: 4n, actor: "orchestrator", payload: { marker: "a" } }] }
+      if (sql.includes('SELECT turn."id"')) return { rows: [{ id: owner.turnId }] }
+      if (sql.includes('INSERT INTO "agent_outbox"')) return { rows: [], rowCount: 0 }
+      return { rows: [], rowCount: 1 }
+    }), release: vi.fn() }
+    const store = createPgTurnEngineStore({ connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">)
+    await expect(store.appendEvent({ owner, id: "requested-existing", itemId: null, type: "plan.observation", correlationId: "plan-1", causationId: null, idempotencyKey: "plan-event-existing", payload: { marker: "a" } })).resolves.toEqual({ id: "existing-event" })
+    expect(calls.some(sql => sql.includes('FROM "agent_outbox"') && sql.includes("FOR UPDATE"))).toBe(true)
+  })
+
+  it("rejects a polluted existing event outbox row", async () => {
+    const client = { query: vi.fn(async (sql: string) => {
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: owner.sessionId }] }
+      if (sql.includes('FROM "agent_outbox"')) return { rows: [{ id: "agent-outbox-existing-event", topic: "wrong.topic", aggregateId: owner.sessionId, idempotencyKey: "agent-event:existing-event", payload: {} }] }
+      if (sql.includes('FROM "agent_events"')) return { rows: [{ id: "existing-event", taskId: owner.taskId, turnId: owner.turnId, itemId: null, type: "plan.observation", correlationId: "plan-1", causationId: null, sequence: 4n, actor: "orchestrator", payload: { marker: "a" } }] }
+      if (sql.includes('SELECT turn."id"')) return { rows: [{ id: owner.turnId }] }
+      if (sql.includes('INSERT INTO "agent_outbox"')) return { rows: [], rowCount: 0 }
+      return { rows: [], rowCount: 1 }
+    }), release: vi.fn() }
+    const store = createPgTurnEngineStore({ connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">)
+    await expect(store.appendEvent({ owner, id: "requested-existing", itemId: null, type: "plan.observation", correlationId: "plan-1", causationId: null, idempotencyKey: "plan-event-existing", payload: { marker: "a" } })).rejects.toThrow(/event outbox .* identity/)
+  })
+
   it("rolls back the entire batch when a later event insert fails", async () => {
     const calls: string[] = []
     let eventInserts = 0

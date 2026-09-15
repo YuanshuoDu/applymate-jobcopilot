@@ -1,11 +1,10 @@
 import type pg from "pg"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
-
 import type { ExecutionOwnerFence } from "../execution-owner.js"
 import { ownerFenceSql } from "./turn-engine-owner-sql.js"
 import { toRepositoryJson, type TurnEngineEventInput, type TurnEngineItem, type TurnEngineStore, type TurnEngineStep } from "./turn-engine-types.js"
 import { STEERING_MARKER_EVENT_TYPE, parseSteeringMarkerPayload, type SteeringMarkerPayload } from "../context/steering-marker.js"
-
+import { matchesAgentOutboxIdentity, type AgentOutboxIdentity, type AgentOutboxPayload } from "../outbox-identity.js"
 type TurnEnginePool = Pick<pg.Pool, "connect">
 type QueryClient = Pick<pg.PoolClient, "query" | "release">
 type Row = Record<string, unknown>
@@ -26,7 +25,6 @@ function sameEventPayload(type: unknown, left: unknown, right: unknown): boolean
   const leftMarker = parseSteeringMarkerPayload(left), rightMarker = parseSteeringMarkerPayload(right)
   return leftMarker !== null && rightMarker !== null && markerIdentity(leftMarker) === markerIdentity(rightMarker)
 }
-
 async function tenantTransaction<T>(pool: TurnEnginePool, userId: string, work: (client: QueryClient) => Promise<T>): Promise<T> {
   const client = await pool.connect(); let committed = false
   try {
@@ -40,7 +38,6 @@ async function tenantTransaction<T>(pool: TurnEnginePool, userId: string, work: 
     throw error
   } finally { client.release() }
 }
-
 function ownedTurn(owner: ExecutionOwnerFence, base: number, turnIdParameter: number, sessionParameter: number, allowWaiting = false): { sql: string; values: unknown[] } {
   const fence = ownerFenceSql(owner, base, allowWaiting)
   return {
@@ -83,7 +80,15 @@ async function assertCurrentItemLineage(client: QueryClient, owner: ExecutionOwn
   [itemId, owner.sessionId, owner.turnId, owner.taskId, attempt])
   if (!result.rows[0]) throw conflict(`item ${itemId} lineage`)
 }
-
+function eventOutboxPayload(input: { readonly owner: ExecutionOwnerFence; readonly itemId: string | null; readonly type: string; readonly correlationId: string; readonly causationId: string | null; readonly idempotencyKey: string; readonly eventId: string; readonly sequence: string; readonly actor: string; readonly payload: RepositoryJsonValue }): AgentOutboxPayload {
+  return { eventId: input.eventId, sessionId: input.owner.sessionId, turnId: input.owner.turnId, taskId: input.owner.taskId, itemId: input.itemId, sequence: input.sequence, type: input.type, actor: input.actor, correlationId: input.correlationId, causationId: input.causationId, idempotencyKey: input.idempotencyKey, payload: input.payload }
+}
+async function repairEventOutbox(client: QueryClient, expected: AgentOutboxIdentity): Promise<void> {
+  const inserted = await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload") VALUES ($1, 'agent.events', $2, $3, $4::jsonb) ON CONFLICT ("idempotencyKey") DO NOTHING`, [expected.id, expected.aggregateId, expected.idempotencyKey, json(expected.payload)])
+  if ((inserted.rowCount ?? 0) === 1) return
+  const existing = await client.query<Row>(`SELECT "id", "topic", "aggregateId", "idempotencyKey", "payload" FROM "agent_outbox" WHERE "idempotencyKey" = $1 FOR UPDATE`, [expected.idempotencyKey])
+  if (!matchesAgentOutboxIdentity(existing.rows[0], expected)) throw conflict(`event outbox ${expected.idempotencyKey} identity`)
+}
 async function appendEventBatch(pool: TurnEnginePool, inputs: readonly TurnEngineEventInput[]): Promise<readonly { id: string }[]> {
   if (inputs.length === 0) return []
   const owner = inputs[0]!.owner
@@ -107,8 +112,10 @@ async function appendEventBatch(pool: TurnEnginePool, inputs: readonly TurnEngin
         const row = existing.rows[0]
         if (row.taskId !== owner.taskId || row.turnId !== owner.turnId || row.itemId !== input.itemId || row.type !== input.type
           || row.correlationId !== input.correlationId || row.causationId !== causationId || String(row.actor) !== actor || !sameEventPayload(row.type, row.payload, input.payload)) throw conflict(`event ${input.idempotencyKey} identity`)
-        await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload") VALUES ($1, 'agent.events', $2, $3, $4::jsonb) ON CONFLICT ("idempotencyKey") DO NOTHING`,
-          [`agent-outbox-${row.id}`, owner.sessionId, `agent-event:${row.id}`, json(toRepositoryJson({ eventId: String(row.id), sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.taskId, itemId: input.itemId, sequence: String(row.sequence), type: input.type, actor: String(row.actor), correlationId: input.correlationId, causationId: row.causationId, idempotencyKey: input.idempotencyKey, payload: input.payload }))])
+        await repairEventOutbox(client, {
+          id: `agent-outbox-${row.id}`, topic: "agent.events", aggregateId: owner.sessionId, idempotencyKey: `agent-event:${row.id}`,
+          payload: eventOutboxPayload({ owner, eventId: String(row.id), itemId: input.itemId, sequence: String(row.sequence), type: input.type, actor: String(row.actor), correlationId: input.correlationId, causationId: row.causationId === null ? null : String(row.causationId), idempotencyKey: input.idempotencyKey, payload: input.payload }),
+        })
         result.push({ id: String(row.id) }); previousId = String(row.id); continue
       }
       if (input.itemId) {
