@@ -8,6 +8,10 @@ export type AgentCommandErrorCode =
   | "fork_boundary_not_found"
   | "fork_boundary_active"
   | "fork_idempotency_conflict"
+  | "retry_target_invalid"
+  | "retry_active_conflict"
+  | "retry_target_changed"
+  | "retry_input_invalid"
 
 export class AgentCommandError extends Error {
   readonly status: 404 | 409 | 422
@@ -87,6 +91,22 @@ export function forkBoundaryActive(turnId: string): AgentCommandError {
 
 export function forkIdempotencyConflict(): AgentCommandError {
   return new AgentCommandError("fork_idempotency_conflict", "The idempotency key was already used for a different fork", 409)
+}
+
+export function retryTargetInvalid(turnId: string, status: string | null = null): AgentCommandError {
+  return new AgentCommandError("retry_target_invalid", "The requested Turn is not retryable", 409, { turnId, status })
+}
+
+export function retryActiveConflict(turnId: string): AgentCommandError {
+  return new AgentCommandError("retry_active_conflict", "Another root Turn is already active in this session", 409, { turnId })
+}
+
+export function retryTargetChanged(turnId: string, expectedRevision: number, actualRevision: number): AgentCommandError {
+  return new AgentCommandError("retry_target_changed", "The retry target changed before the command was accepted", 409, { turnId, expectedRevision, actualRevision })
+}
+
+export function retryInputInvalid(turnId: string): AgentCommandError {
+  return new AgentCommandError("retry_input_invalid", "The retry target has no valid persisted user input", 409, { turnId })
 }
 
 export function isUniqueViolation(error: unknown): boolean {

@@ -20,12 +20,14 @@ function makeDb(options: {
   sessionSource?: string
   activeSource?: string
   activeTurnId?: string
+  activeRootTaskId?: string | null
+  retryTarget?: Row & { revision: number }
 } = {}) {
   const ownerId = options.ownerId ?? "user_1"
   const sessionExists = options.sessionExists ?? true
   const sessionOwnerId = options.sessionOwnerId ?? ownerId
   let active: (Row & { revision: number }) | null = options.activeSource
-    ? { id: options.activeTurnId ?? "turn_1", source: options.activeSource, status: "in_progress", revision: 0 }
+    ? { id: options.activeTurnId ?? "turn_1", source: options.activeSource, status: "in_progress", revision: 0, rootTaskId: options.activeRootTaskId ?? null }
     : null
   let execution: { id: string; sessionId: string; status: string } | null = options.executionStatus
     ? { id: "execution_1", sessionId: "session_1", status: options.executionStatus }
@@ -77,7 +79,14 @@ function makeDb(options: {
       }),
     },
     agentTurn: {
-      findFirst: vi.fn(async () => active),
+      findFirst: vi.fn(async (args: unknown) => {
+        const where = whereOf(args)
+        if (where.id) {
+          const target = options.retryTarget
+          return target && where.id === target.id && where.sessionId === "session_1" && where.userId === ownerId ? { ...target } : null
+        }
+        return active
+      }),
       create: vi.fn(async (args: unknown) => {
         const data = (args as { data: Row }).data
         active = { id: String(data.id), source: data.source, status: "queued", revision: 0 }
@@ -187,6 +196,14 @@ const content = [{ type: "text", text: "Find backend roles" }] as const
 
 function startCommand(clientMessageId: string, source: "user" | "automation" = "user") {
   return { sessionId: "session_1", userId: "user_1", clientMessageId, source, content: [...content] }
+}
+
+function retryTarget(status = "failed", input: unknown = { goal: "Find backend roles", content: [...content] }) {
+  return { id: "turn_failed", sessionId: "session_1", userId: "user_1", status, source: "user", revision: 4, input }
+}
+
+function retryCommand(clientMessageId: string, expectedRevision: number | null = 4) {
+  return { sessionId: "session_1", userId: "user_1", clientMessageId, source: "user" as const, targetTurnId: "turn_failed", expectedRevision }
 }
 
 describe("AgentCommandService", () => {
@@ -424,5 +441,60 @@ describe("AgentCommandService", () => {
     failed.tx.agentExecution.updateMany.mockRejectedValue(new Error("database unavailable"))
     await expect(new AgentCommandService(failed.db).cancelExecution({ executionId: "execution_1", userId: "user_1" })).rejects.toThrow("database unavailable")
     expect(failed.state.execution).toMatchObject({ status: "running" })
+  })
+
+  it("retries a failed Turn atomically from its persisted input", async () => {
+    const fake = makeDb({ retryTarget: { ...retryTarget(), rootTaskId: "task-claimed" } })
+    const result = await new AgentCommandService(fake.db).retry(retryCommand("retry_1"))
+
+    expect(result).toMatchObject({ disposition: "started", sequence: "2" })
+    expect(result.turnId).not.toBe("turn_failed")
+    expect(fake.state.active).toMatchObject({ status: "queued", source: "user" })
+    expect(fake.state.inputs).toHaveLength(1)
+    expect(fake.state.inputs[0]).toMatchObject({ delivery: "follow_up", content })
+    expect(fake.state.events.map(event => event.type)).toEqual(["turn.started", "input.accepted"])
+    expect(fake.state.outbox.filter(entry => entry.topic === "agent.turn.dispatch")).toHaveLength(1)
+  })
+
+  it("returns the original result for a duplicate retry without new durable facts", async () => {
+    const fake = makeDb({ retryTarget: retryTarget() })
+    const service = new AgentCommandService(fake.db)
+    const first = await service.retry(retryCommand("retry_duplicate"))
+    const second = await service.retry(retryCommand("retry_duplicate", 999))
+
+    expect(second).toMatchObject({ disposition: "duplicate", originalDisposition: "started", turnId: first.turnId, inputId: first.inputId, sequence: first.sequence })
+    expect(fake.state.inputs).toHaveLength(1)
+    expect(fake.state.events).toHaveLength(2)
+    expect(fake.state.outbox.filter(entry => entry.topic === "agent.turn.dispatch")).toHaveLength(1)
+  })
+
+  it("rejects an active conflict, invalid target, ownership mismatch, and malformed persisted input", async () => {
+    const active = makeDb({ activeSource: "user", activeRootTaskId: "task-claimed", retryTarget: retryTarget() })
+    await expect(new AgentCommandService(active.db).retry(retryCommand("retry_active"))).rejects.toMatchObject({ code: "retry_active_conflict", status: 409 })
+    expect(active.state.inputs).toHaveLength(0)
+
+    for (const target of [retryTarget("completed"), retryTarget("queued"), retryTarget("waiting_for_user")]) {
+      const fake = makeDb({ retryTarget: target })
+      await expect(new AgentCommandService(fake.db).retry(retryCommand(`retry_${target.status}`))).rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
+      expect(fake.state.inputs).toHaveLength(0)
+    }
+
+    const foreign = makeDb({ sessionOwnerId: "user_2", retryTarget: retryTarget() })
+    await expect(new AgentCommandService(foreign.db).retry(retryCommand("retry_foreign"))).rejects.toMatchObject({ code: "agent_session_not_found", status: 404 })
+
+    const malformed = makeDb({ retryTarget: retryTarget("failed", { content: [{ type: "text", text: "ok", secret: "reject" }] }) })
+    await expect(new AgentCommandService(malformed.db).retry(retryCommand("retry_malformed"))).rejects.toMatchObject({ code: "retry_input_invalid", status: 409 })
+    expect(malformed.state.inputs).toHaveLength(0)
+  })
+
+  it("rolls back retry Turn, facts, and dispatch when the transaction fails", async () => {
+    const fake = makeDb({ failOutbox: true, retryTarget: retryTarget() })
+    await expect(new AgentCommandService(fake.db).retry(retryCommand("retry_rollback"))).rejects.toThrow("outbox unavailable")
+    expect(fake.state.active).toBeNull()
+    expect(fake.state.items).toHaveLength(0)
+    expect(fake.state.inputs).toHaveLength(0)
+    expect(fake.state.events).toHaveLength(0)
+    expect(fake.state.outbox).toHaveLength(0)
+    expect(fake.state.rollbacks).toBe(1)
   })
 })
