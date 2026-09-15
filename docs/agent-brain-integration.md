@@ -1058,3 +1058,15 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Pause locks an owned, non-terminal session and rejects an in-progress root Turn before any write; queued, waiting, and idle sessions can be paused. Resume clears only the user gate and preserves runtime Turn, wait, and approval state. Repeated keys return the original result, while stale revisions and different fingerprints fail with typed conflicts.
 - Ordinary start, message, and retry admission checks the open gate and has no side effects while paused. Interrupt, cancellation, and typed wait decisions retain their existing availability. Session GET exposes only `controlGate`, `controlRevision`, and `pausedAt`; no synthetic session event is emitted because nullable session events and SSE lifecycle delivery remain a later P7-2e boundary.
 - Candidate boundary: focused Web command, parser, route, GET, protocol, schema, and migration checks only; no live PostgreSQL/RLS transaction, Worker coordination, SSE delivery or reconnect, process restart, browser/manual UI run, provider behavior, production deployment, or complete E2E was run.
+
+## P7-2c1 candidate - Worker claim gate
+
+- Commit `5a9e0ecb` adds the Worker `OPEN_SESSION` and `RUNNABLE_SESSION` SQL fences and accepts only the protocol control gates `open` and `user_paused`. New Turn and child-task claims require `controlGate = 'open'`, while in-flight lease cleanup and child lifecycle persistence retain the open-session fence.
+- Focused Worker coverage passed **73/73 tests across 3 files** (session gate 2, Turn lease 20, child-task store 51), with the Worker TypeScript check and diff check passing. Runtime status `paused` remains claimable when the user gate is `open`.
+- Candidate boundary: recovery and dispatch suppression, live PostgreSQL/RLS locking, process restart, Redis/BullMQ delivery, cross-worker races, provider/browser behavior, production deployment, and complete E2E remain unverified; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## P7-2c2 candidate - Worker recovery and dispatch suppression
+
+- Commit `d43107a2` applies `RUNNABLE_SESSION` to stale Turn reclaim, recoverable child-task selection, recovery reset and repair scans, guarded recovery inserts/updates, and pending Turn/Subagent dispatch session scans plus their inner session locks. User-paused sessions therefore remain unclaimed, unrecovered, and unpublished; missing Subagent sessions retain `session_missing` cleanup, while durable aggregate repair and in-flight cleanup keep `OPEN_SESSION` behavior.
+- Focused Worker coverage passed **147/147 tests across 4 files** (Turn recovery 25, child-task store 54, Subagent queue 43, stale Subagent dispatch recovery 25), with the Worker TypeScript check and diff check passing. Runtime status `paused` with `controlGate = 'open'` remains recoverable and dispatchable.
+- Candidate boundary: no live PostgreSQL/RLS locking, real Worker restart, Redis/BullMQ delivery, cross-worker recovery race, provider/browser behavior, production deployment, or complete E2E was run; overall progress remains **P0 accepted 1/8 (12.5%)**.
