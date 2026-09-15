@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   sessionFindFirst: vi.fn(),
   sessionDeleteMany: vi.fn(),
   sessionUpdate: vi.fn(),
+  sessionUpdateMany: vi.fn(),
   executionFindFirst: vi.fn(),
   transcriptCreate: vi.fn(),
   executionUpdate: vi.fn(),
@@ -35,7 +36,7 @@ vi.mock("@/lib/db", () => ({
       findFirst: mocks.automationFindFirst,
       updateMany: mocks.automationUpdateMany,
     },
-    agentSession: { create: mocks.sessionCreate, findFirst: mocks.sessionFindFirst, deleteMany: mocks.sessionDeleteMany, update: mocks.sessionUpdate },
+    agentSession: { create: mocks.sessionCreate, findFirst: mocks.sessionFindFirst, deleteMany: mocks.sessionDeleteMany, update: mocks.sessionUpdate, updateMany: mocks.sessionUpdateMany },
     agentExecution: { findFirst: mocks.executionFindFirst, update: mocks.executionUpdate },
     agentTranscriptEvent: { create: mocks.transcriptCreate },
     agentTurn: { findFirst: mocks.turnFindFirst, create: mocks.turnCreate },
@@ -87,6 +88,7 @@ describe("agent automation run API", () => {
     })
     mocks.sessionFindFirst.mockResolvedValue(null)
     mocks.sessionDeleteMany.mockResolvedValue({ count: 1 })
+    mocks.sessionUpdateMany.mockResolvedValue({ count: 1 })
     mocks.transcriptCreate.mockResolvedValue({
       id: "event_1",
       sessionId: "session_1",
@@ -153,7 +155,7 @@ describe("agent automation run API", () => {
       },
     })
     expect(mocks.automationUpdateMany).toHaveBeenCalledWith({
-      where: { id: "automation_1", userId: "user_1", enabled: true },
+      where: { id: "automation_1", userId: "user_1", enabled: true, OR: [{ sessionId: null }, { session: { is: { controlGate: "open" } } }] },
       data: { lastRunAt: expect.any(Date), nextRunAt: expect.any(Date) },
     })
     expect(mocks.enqueueAgentRun).toHaveBeenCalledWith({ userId: "user_1", sessionId: "session_1", turnId: "turn_1", executionId: "execution_1" })
@@ -176,6 +178,7 @@ describe("agent automation run API", () => {
       goal: "Run automation: Weekday Berlin SWE Scout",
       status: "failed",
       source: "automation",
+      controlGate: "open",
       memorySummary: "Dispatch failed",
       qualityScore: null,
       currentTaskId: null,
@@ -198,7 +201,7 @@ describe("agent automation run API", () => {
       autoApply: true,
       sessionId: "session_1",
     })
-    mocks.sessionFindFirst.mockResolvedValueOnce(existing)
+    mocks.sessionFindFirst.mockResolvedValue(existing)
     mocks.transcriptCreate.mockResolvedValueOnce({
       id: "event_2", sessionId: "session_1", type: "automation_started", speaker: "Orchestrator",
       title: "Automation started", body: "Started automation: Weekday Berlin SWE Scout", data: {}, durationMs: null,
@@ -210,13 +213,66 @@ describe("agent automation run API", () => {
 
     expect(res.status).toBe(201)
     expect(mocks.sessionCreate).not.toHaveBeenCalled()
-    expect(mocks.sessionUpdate).toHaveBeenCalledWith({
-      where: { id: "session_1" },
+    expect(mocks.sessionUpdateMany).toHaveBeenCalledWith({
+      where: { id: "session_1", userId: "user_1", controlGate: "open" },
       data: { status: "running", completedAt: null, memorySummary: "Automation queued for execution." },
     })
     expect(mocks.ensureExecution).toHaveBeenCalledWith({
       userId: "user_1", sessionId: "session_1", autonomous: true, restartForRun: true,
     })
+  })
+
+  it("returns stable 409 without side effects for a linked user-paused session", async () => {
+    mocks.automationFindFirst.mockResolvedValueOnce({
+      id: "automation_1", name: "Weekday Berlin SWE Scout", enabled: true, cron: null,
+      timezone: "Europe/Berlin", triggerType: "manual", targetRoles: [], targetLocations: [],
+      minScore: 85, dailyCap: 8, requireApproval: true, autoApply: true, sessionId: "session_1",
+    })
+    mocks.sessionFindFirst.mockResolvedValue({ id: "session_1", controlGate: "user_paused" })
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest() as never, ctx())
+
+    expect(res.status).toBe(409)
+    await expect(res.json()).resolves.toEqual({ error: "Automation session session_1 is user-paused" })
+    expect(mocks.executionFindFirst).not.toHaveBeenCalled()
+    expect(mocks.automationUpdateMany).not.toHaveBeenCalled()
+    expect(mocks.sessionCreate).not.toHaveBeenCalled()
+    expect(mocks.sessionUpdateMany).not.toHaveBeenCalled()
+    expect(mocks.sessionUpdate).not.toHaveBeenCalled()
+    expect(mocks.ensureExecution).not.toHaveBeenCalled()
+    expect(mocks.turnFindFirst).not.toHaveBeenCalled()
+    expect(mocks.turnCreate).not.toHaveBeenCalled()
+    expect(mocks.enqueueAgentRun).not.toHaveBeenCalled()
+    expect(mocks.transcriptCreate).not.toHaveBeenCalled()
+  })
+
+  it("fails closed when a linked session pauses after the automation claim", async () => {
+    mocks.automationFindFirst.mockResolvedValueOnce({
+      id: "automation_1", name: "Weekday Berlin SWE Scout", enabled: true, cron: null,
+      timezone: "Europe/Berlin", triggerType: "manual", targetRoles: [], targetLocations: [],
+      minScore: 85, dailyCap: 8, requireApproval: true, autoApply: true, sessionId: "session_1",
+    })
+    mocks.sessionFindFirst
+      .mockResolvedValueOnce({ id: "session_1", controlGate: "open" })
+      .mockResolvedValueOnce({ id: "session_1", controlGate: "user_paused" })
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest() as never, ctx())
+
+    expect(res.status).toBe(409)
+    await expect(res.json()).resolves.toEqual({ error: "Automation session session_1 is user-paused" })
+    expect(mocks.automationUpdateMany).toHaveBeenCalledWith({
+      where: { id: "automation_1", userId: "user_1", enabled: true, OR: [{ sessionId: null }, { session: { is: { controlGate: "open" } } }] },
+      data: { lastRunAt: expect.any(Date), nextRunAt: null },
+    })
+    expect(mocks.sessionCreate).not.toHaveBeenCalled()
+    expect(mocks.sessionUpdateMany).not.toHaveBeenCalled()
+    expect(mocks.ensureExecution).not.toHaveBeenCalled()
+    expect(mocks.turnFindFirst).not.toHaveBeenCalled()
+    expect(mocks.turnCreate).not.toHaveBeenCalled()
+    expect(mocks.enqueueAgentRun).not.toHaveBeenCalled()
+    expect(mocks.transcriptCreate).not.toHaveBeenCalled()
   })
 
   it("does not queue a second run while the canonical execution is active", async () => {

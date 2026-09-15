@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   sessionFindFirst: vi.fn(),
   sessionDeleteMany: vi.fn(),
   sessionUpdate: vi.fn(),
+  sessionUpdateMany: vi.fn(),
   transcriptCreate: vi.fn(),
   enqueueAgentRun: vi.fn(),
   executionFindFirst: vi.fn(),
@@ -34,7 +35,7 @@ vi.mock("@/lib/db", () => ({
       updateMany: mocks.automationUpdateMany,
       update: mocks.automationUpdate,
     },
-    agentSession: { create: mocks.sessionCreate, findFirst: mocks.sessionFindFirst, deleteMany: mocks.sessionDeleteMany, update: mocks.sessionUpdate },
+    agentSession: { create: mocks.sessionCreate, findFirst: mocks.sessionFindFirst, deleteMany: mocks.sessionDeleteMany, update: mocks.sessionUpdate, updateMany: mocks.sessionUpdateMany },
     agentExecution: { findFirst: mocks.executionFindFirst, update: mocks.executionUpdate },
     agentTranscriptEvent: { create: mocks.transcriptCreate },
     agentTurn: { findFirst: mocks.turnFindFirst, create: mocks.turnCreate },
@@ -74,6 +75,7 @@ describe("agent automation due scheduler API", () => {
     mocks.sessionCreate.mockResolvedValue({ id: "session_1" })
     mocks.sessionFindFirst.mockResolvedValue(null)
     mocks.sessionDeleteMany.mockResolvedValue({ count: 1 })
+    mocks.sessionUpdateMany.mockResolvedValue({ count: 1 })
     mocks.transcriptCreate.mockResolvedValue({ id: "event_1" })
     mocks.enqueueAgentRun.mockResolvedValue("task_1")
     mocks.automationUpdateMany.mockResolvedValue({ count: 1 })
@@ -100,7 +102,12 @@ describe("agent automation due scheduler API", () => {
       started: [{ automationId: "automation_1", sessionId: "session_1", taskId: "task_1" }],
     })
     expect(mocks.automationFindMany).toHaveBeenCalledWith({
-      where: { enabled: true, nextRunAt: { lte: expect.any(Date) }, user: { accountStatus: "active" } },
+      where: {
+        enabled: true,
+        nextRunAt: { lte: expect.any(Date) },
+        user: { accountStatus: "active" },
+        OR: [{ sessionId: null }, { session: { is: { controlGate: "open" } } }],
+      },
       orderBy: { nextRunAt: "asc" },
       take: 20,
     })
@@ -127,6 +134,7 @@ describe("agent automation due scheduler API", () => {
         enabled: true,
         nextRunAt: { lte: expect.any(Date) },
         user: { accountStatus: "active" },
+        OR: [{ sessionId: null }, { session: { is: { controlGate: "open" } } }],
       },
       data: { lastRunAt: expect.any(Date), nextRunAt: expect.any(Date) },
     })
@@ -163,6 +171,83 @@ describe("agent automation due scheduler API", () => {
     expect(mocks.automationUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
       data: { lastRunAt: expect.any(Date), nextRunAt: expect.any(Date) },
     }))
+  })
+
+  it("skips a linked user-paused session before claiming or creating run state", async () => {
+    mocks.automationFindMany.mockResolvedValueOnce([{
+      id: "automation_1", userId: "user_1", name: "Weekday Berlin SWE Scout", cron: "0 9 * * 1-5",
+      timezone: "Europe/Berlin", triggerType: "weekdays", targetRoles: ["SWE"], targetLocations: ["Berlin"],
+      minScore: 85, dailyCap: 8, requireApproval: true, autoApply: true, sessionId: "session_1",
+    }])
+    mocks.sessionFindFirst.mockResolvedValueOnce({ id: "session_1", controlGate: "user_paused" })
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest() as never)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({ started: [] })
+    expect(mocks.automationUpdateMany).not.toHaveBeenCalled()
+    expect(mocks.sessionCreate).not.toHaveBeenCalled()
+    expect(mocks.sessionUpdateMany).not.toHaveBeenCalled()
+    expect(mocks.ensureExecution).not.toHaveBeenCalled()
+    expect(mocks.turnCreate).not.toHaveBeenCalled()
+    expect(mocks.enqueueAgentRun).not.toHaveBeenCalled()
+    expect(mocks.transcriptCreate).not.toHaveBeenCalled()
+  })
+
+  it("dispatches a runtime-paused linked session when its control gate is open", async () => {
+    mocks.automationFindMany.mockResolvedValueOnce([{
+      id: "automation_1", userId: "user_1", name: "Weekday Berlin SWE Scout", cron: "0 9 * * 1-5",
+      timezone: "Europe/Berlin", triggerType: "weekdays", targetRoles: ["SWE"], targetLocations: ["Berlin"],
+      minScore: 85, dailyCap: 8, requireApproval: true, autoApply: true, sessionId: "session_1",
+    }])
+    mocks.sessionFindFirst.mockResolvedValue({ id: "session_1", status: "paused", controlGate: "open" })
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest() as never)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({ started: [{ sessionId: "session_1", taskId: "task_1" }] })
+    expect(mocks.sessionUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: "session_1", userId: "user_1", controlGate: "open" },
+      data: expect.objectContaining({ status: "running" }),
+    }))
+    expect(mocks.enqueueAgentRun).toHaveBeenCalled()
+  })
+
+  it("keeps a linked automation due when its session pauses after claim", async () => {
+    mocks.automationFindMany.mockResolvedValueOnce([{
+      id: "automation_1", userId: "user_1", name: "Weekday Berlin SWE Scout", cron: "0 9 * * 1-5",
+      timezone: "Europe/Berlin", triggerType: "weekdays", targetRoles: ["SWE"], targetLocations: ["Berlin"],
+      minScore: 85, dailyCap: 8, requireApproval: true, autoApply: true, sessionId: "session_1",
+    }])
+    mocks.sessionFindFirst
+      .mockResolvedValueOnce({ id: "session_1", controlGate: "open" })
+      .mockResolvedValueOnce({ id: "session_1", controlGate: "user_paused" })
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest() as never)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({ started: [] })
+    expect(mocks.automationUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        id: "automation_1",
+        userId: "user_1",
+        OR: [{ sessionId: null }, { session: { is: { controlGate: "open" } } }],
+      }),
+      data: { lastRunAt: expect.any(Date), nextRunAt: expect.any(Date) },
+    }))
+    expect(mocks.automationUpdate).toHaveBeenCalledWith({
+      where: { id: "automation_1", userId: "user_1" },
+      data: { nextRunAt: expect.any(Date) },
+    })
+    expect(mocks.sessionCreate).not.toHaveBeenCalled()
+    expect(mocks.sessionUpdateMany).not.toHaveBeenCalled()
+    expect(mocks.ensureExecution).not.toHaveBeenCalled()
+    expect(mocks.turnCreate).not.toHaveBeenCalled()
+    expect(mocks.enqueueAgentRun).not.toHaveBeenCalled()
+    expect(mocks.transcriptCreate).not.toHaveBeenCalled()
   })
 
   it("requires the configured cron secret", async () => {
