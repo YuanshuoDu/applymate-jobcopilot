@@ -14,6 +14,7 @@ import { PLAN_COMPLETION_FEEDBACK_EVENT_TYPE, planCompletionRecoveryCount } from
 import { reclaimExpiredTurns } from "./turns/recovery-scanner.js"
 import { runTurnJob } from "./turns/turn-queue.js"
 import type { TurnLease } from "./turns/lease.js"
+import { resolveProductionAgentFlags, type ProductionAgentFlags } from "./production-agent-flags.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 2,
@@ -243,10 +244,10 @@ function durableRestartFixture() {
   return { durable, pool, createRuntime, feedbackAppendSettled, loadedStates, requests, payload, recoverAt: new Date("2026-09-07T00:02:00.000Z") }
 }
 
-async function rootToolNames(coordinationEnabled: boolean, planningEnabled = false, capabilities = ["read"]): Promise<string[]> {
+async function rootToolNames(coordinationEnabled: boolean, planningEnabled = false, capabilities = ["read"], productionFlags?: ProductionAgentFlags): Promise<string[]> {
   const requests: HarnessModelRequest[] = []
   const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
-    workerId: "worker-1", coordinationEnabled, planningEnabled, stateLoader: async () => ({ ...state(), toolPolicySnapshot: { capabilities } }),
+    workerId: "worker-1", coordinationEnabled, planningEnabled, ...(productionFlags ? { productionFlags } : {}), stateLoader: async () => ({ ...state(), toolPolicySnapshot: { capabilities } }),
     rootTaskStore: rootStore() as never, turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
     modelRuntimeFactory: async () => ({ adapter: {
       ...model(() => []),
@@ -327,6 +328,23 @@ describe("createCanonicalTurnRuntime", () => {
     expect(forged).not.toContain("agent.plan.propose")
     const enabled = await rootToolNames(false, true)
     expect(enabled).toContain("agent.plan.propose")
+  })
+
+  it("uses one server activation contract for canonical runtime capabilities", async () => {
+    const canonicalOnly = resolveProductionAgentFlags({ ENABLE_AGENT_CANONICAL_AUTOMATION: "1" })
+    const canonicalOnlyTools = await rootToolNames(true, true, ["read"], canonicalOnly)
+    expect(canonicalOnlyTools).not.toContain("agent.plan.propose")
+    expect(canonicalOnlyTools).not.toContain("spawn_subagent")
+
+    const partial = resolveProductionAgentFlags({ ENABLE_AGENT_CANONICAL_AUTOMATION: "1", ENABLE_AGENT_PLANNING: "1", ENABLE_AGENT_PLAN_EXECUTION: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1" })
+    const partialTools = await rootToolNames(false, false, ["read"], partial)
+    expect(partialTools).toContain("agent.plan.propose")
+    expect(partialTools).toContain("spawn_subagent")
+
+    const full = resolveProductionAgentFlags({ ENABLE_AGENT_COGNITIVE_LOOP: "1" })
+    const fullTools = await rootToolNames(false, false, ["read"], full)
+    expect(fullTools).toContain("agent.plan.propose")
+    expect(fullTools).toContain("spawn_subagent")
   })
 
   it("uses the default plan bridge only when planning execution is explicitly enabled", async () => {

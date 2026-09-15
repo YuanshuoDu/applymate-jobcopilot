@@ -32,6 +32,7 @@ import { createPlanRevisionRecoveryDispatcher } from "./planning/plan-revision-r
 import type { ContextSnapshotAdapter } from "./context/context-snapshot-adapter.js"
 import { noopCanonicalExecutionProjection, type CanonicalExecutionProjection } from "./canonical-execution-projection.js"
 import { noopCanonicalSessionProjection, type CanonicalSessionProjection } from "./canonical-session-projection.js"
+import type { ProductionAgentFlags } from "./production-agent-flags.js"
 
 export type UsageAuthorization = {
   settle(input: { status: "success" | "error"; inputTokens: number; outputTokens: number; estimatedCostUsd: number; errorCode?: string }): Promise<void> | void
@@ -42,6 +43,8 @@ export type CanonicalPlanExecutionFactoryInput = CanonicalPlanExecutionOptions &
 
 export type CanonicalTurnRuntimeOptions = {
   readonly workerId: string
+  /** One server-owned activation contract for production route capabilities. */
+  readonly productionFlags?: ProductionAgentFlags
   readonly consumeWaitOutcomes?: boolean
   /** Server-derived production gate; user policy cannot enable coordination. */
   readonly coordinationEnabled?: boolean
@@ -192,6 +195,11 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
   const executionProjection = options.executionProjection ?? noopCanonicalExecutionProjection
   const sessionProjection = options.sessionProjection ?? noopCanonicalSessionProjection
   const reconcileTerminal = options.executionProjection || options.sessionProjection ? rootTasks.reconcileTerminal : undefined
+  const productionFlags = options.productionFlags
+  const consumeWaitOutcomes = productionFlags?.consumeWaitOutcomes ?? options.consumeWaitOutcomes === true
+  const coordinationEnabled = productionFlags?.coordinationEnabled ?? options.coordinationEnabled === true
+  const planningEnabled = productionFlags?.planningEnabled ?? options.planningEnabled === true
+  const planningExecutionEnabled = productionFlags?.planningExecutionEnabled ?? options.planningExecutionEnabled === true
   let closed = false
   const execute: TurnExecutor = async ({ lease, signal }): Promise<TurnExecutionResult> => {
     if (closed) throw new Error("canonical_runtime_closed")
@@ -213,13 +221,13 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     }
     const state = options.stateLoader
       ? await options.stateLoader(pool, lease, now())
-      : await loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes: options.consumeWaitOutcomes === true })
-    const selectedPolicy = createCanonicalPolicy(state.toolPolicySnapshot, options.coordinationEnabled === true, options.planningEnabled === true)
+      : await loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes })
+    const selectedPolicy = createCanonicalPolicy(state.toolPolicySnapshot, coordinationEnabled, planningEnabled)
     const configuredCapabilities = capabilities(state.toolPolicySnapshot).filter(capability => capability !== "canManageChildren" && capability !== "canPlan")
     const toolCapabilities = [...new Set([
       ...configuredCapabilities,
-      ...(options.coordinationEnabled ? ["canManageChildren"] : []),
-      ...(options.planningEnabled ? ["canPlan"] : []),
+      ...(coordinationEnabled ? ["canManageChildren"] : []),
+      ...(planningEnabled ? ["canPlan"] : []),
     ])]
     const turnStore = options.turnEngineStoreFactory?.(pool) ?? createPgTurnEngineStore(pool)
     let lifecycleSink: ToolLifecycleSink | null = null
@@ -232,16 +240,16 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       if (!lifecycleOwner) throw new Error("tool_result_owner_unavailable")
       return lifecycleOwner
     }
-    const coordination = options.coordinationEnabled ? {
+    const coordination = coordinationEnabled ? {
       manager,
       store: new PgCoordinationStore(pool),
       wait: createPgDurableWaitPort(pool),
     } : undefined
     const planningGoal = state.goalContract ?? hydrateGoalContract({ goal: state.goal }).goalContract
     const currentGoal = { value: planningGoal }; const goalRef: GoalContractRef = { get: () => currentGoal.value, update: next => { currentGoal.value = next } }
-    const allowedPlanActions = options.coordinationEnabled === true ? PLAN_ACTION_KINDS : PLAN_ACTION_KINDS.filter(action => action !== "delegate" && action !== "join")
-    const recoveryDispatcher = options.planningEnabled ? createPlanRevisionRecoveryDispatcher() : undefined
-    const planning = options.planningEnabled ? {
+    const allowedPlanActions = coordinationEnabled ? PLAN_ACTION_KINDS : PLAN_ACTION_KINDS.filter(action => action !== "delegate" && action !== "join")
+    const recoveryDispatcher = planningEnabled ? createPlanRevisionRecoveryDispatcher() : undefined
+    const planning = planningEnabled ? {
       goal: planningGoal, goalRef, allowedTools: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base", "application.get_state", "tool_results.read"],
       allowedTemplates: [], allowedRoles: ["scout", "analyst"], allowedPlanActions, maxNodes: PLAN_MAX_NODES, maxPlanRevisions: PLAN_MAX_REVISIONS, initialPlanRevision: state.planRevision ?? null, initialPlanHashes: state.planProposalHashes ?? [], ...(recoveryDispatcher ? { recoveryDispatcher } : {}),
     } : undefined
@@ -256,7 +264,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     lifecycleSink = options.lifecycleSinkFactory?.({ lease, store: turnStore, owner }) ?? durableLifecycleSink(turnStore, owner)
     const actorRole = (record(state.toolPolicySnapshot).role as PolicyRole | undefined) ?? "orchestrator"
     const planFactory = options.planExecutionFactory ?? createCanonicalPlanExecutionFactory
-    const executePlan = options.planningEnabled === true && options.planningExecutionEnabled === true && planning
+    const executePlan = planningEnabled && planningExecutionEnabled && planning
       ? planFactory({ lease, rootTaskId: root.id, taskId: root.id, state, scope: state.scope, router: toolRuntime.router, registry: toolRuntime.registry, policy: selectedPolicy, goal: planning.goal, goalRef, allowedTools: planning.allowedTools, allowedTemplates: planning.allowedTemplates, allowedRoles: planning.allowedRoles, allowedPlanActions: planning.allowedPlanActions, maxNodes: planning.maxNodes, maxPlanRevisions: planning.maxPlanRevisions, initialPlanRevision: planning.initialPlanRevision, initialPlanHashes: planning.initialPlanHashes, ...(recoveryDispatcher ? { recoveryDispatcher } : {}), capabilities: toolCapabilities, actorRole, persistOutcome: durablePlanCommandSink(turnStore, owner) })
       : undefined
     const config = options.modelRuntimeFactory ? undefined : await loadWorkerAiConfig(lease.userId)
@@ -268,7 +276,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const contextBuilder: TurnEngineOptions["contextBuilder"] = {
       build: request => baseContextBuilder.build({ ...request, taskId: root.id }),
     }
-    const planCompletionRequired = options.planningEnabled === true && options.planningExecutionEnabled === true
+    const planCompletionRequired = planningEnabled && planningExecutionEnabled
     const engine = new TurnEngine({
       lease, scope: state.scope, goal: state.goal, goalRef, snapshot: state.snapshot, contextBuilder,
       store: turnStore, model, tools: toolRuntime.registry.list(toolCapabilities),

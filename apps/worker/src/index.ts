@@ -77,32 +77,27 @@ async function main() {
   }
 
   const productionFlags = resolveProductionAgentFlags();
-  const childExecutionEnabled = productionFlags.cognitiveLoopEnabled || productionChildRuntimeModule.childExecutionEnabled();
   const pool = getPool();
   const contextCompactionOptions = createProductionContextCompactionOptions({
     enabled: productionFlags.contextCompactionEnabled,
     pool,
   });
   const childExecutor = productionChildRuntimeModule.createOptionalProductionChildExecutor({
-    enabled: childExecutionEnabled,
+    enabled: productionFlags.childExecutionEnabled,
     pool,
-    ...(childExecutionEnabled && contextCompactionOptions.contextSnapshotAdapter
+    ...(productionFlags.childExecutionEnabled && contextCompactionOptions.contextSnapshotAdapter
       ? { contextSnapshotAdapter: contextCompactionOptions.contextSnapshotAdapter }
       : {}),
   });
-  const consumeWaitOutcomes = (productionFlags.cognitiveLoopEnabled || process.env.ENABLE_AGENT_WAIT_RESOLVER === "1") && childExecutor !== undefined;
   const canonicalRuntime = await canonicalRuntimeModule.createCanonicalTurnRuntime(pool, {
     workerId: process.env.WORKER_ID ?? `worker-${process.pid}`,
     authorizeUsage: aiUsageBridgeModule.createWorkerUsageAuthorizer(),
-    consumeWaitOutcomes,
-    coordinationEnabled: consumeWaitOutcomes,
-    planningEnabled: productionFlags.planningEnabled,
-    planningExecutionEnabled: productionFlags.planningExecutionEnabled,
+    productionFlags,
     executionProjection: createCanonicalExecutionProjection(pool),
     sessionProjection: createCanonicalSessionProjection(pool),
     ...contextCompactionOptions,
   });
-  const waitResolver = consumeWaitOutcomes ? {} : undefined;
+  const waitResolver = productionFlags.consumeWaitOutcomes ? {} : undefined;
   const canonicalBootstrap = await productionBootstrapModule.createProductionWorkerBootstrap({
     pool,
     runtime: canonicalRuntime,
