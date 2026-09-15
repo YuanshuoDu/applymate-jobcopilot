@@ -15,7 +15,7 @@ describe("Agent command transaction helpers", () => {
   })
 
   it("locks an open session by user before command writes", async () => {
-    const queryRaw = vi.fn(async (_query: unknown) => [{ id: "session_1" }])
+    const queryRaw = vi.fn(async (_query: unknown) => [{ id: "session_1", controlGate: "open", controlRevision: 0, pausedAt: null }])
     await lockOpenSession({ $queryRaw: queryRaw } as unknown as CommandTransaction, "session_1", "user_1")
 
     const query = queryRaw.mock.calls[0]?.[0] as unknown as { strings?: readonly string[] }

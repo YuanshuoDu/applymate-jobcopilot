@@ -13,6 +13,12 @@ export type {
   ForkResult,
   MessageCommand,
   RetryCommand,
+  PauseCommand,
+  ResumeCommand,
+  SessionControlGate,
+  SessionControlOperation,
+  SessionControlDisposition,
+  SessionControlResult,
   StartCommand,
   SteerCommand,
 } from "./types"

@@ -1,16 +1,24 @@
 import type { PrismaClient } from "@prisma/client"
 import type { InputContentPart } from "@jobcopilot/agent-protocol"
 
-import { AgentCommandError, activeTurnChanged, automationCannotSteerUserTurn, invalidCommand, isUniqueViolation, retryActiveConflict, retryInputInvalid, retryTargetChanged, retryTargetInvalid } from "./errors"
+import { AgentCommandError, activeTurnChanged, automationCannotSteerUserTurn, invalidCommand, isUniqueViolation, retryActiveConflict, retryInputInvalid, retryTargetChanged, retryTargetInvalid, sessionControlRevisionChanged, sessionPauseConflict } from "./errors"
 import { cancelExecutionInTransaction, interruptActiveTurn, type CancelExecutionCommand } from "./execution-cancellation"
 import {
   acceptInputFacts,
+  assertAcceptingSession,
   assertExpectedTurn,
   createRootTurn,
   findActiveTurn,
   findExistingCommand,
+  findExistingSessionControl,
+  findInProgressTurn,
   fallbackDisposition,
+  assertSessionControlIdentity,
+  appendSessionControl,
+  controlFingerprint,
   lockOpenSession,
+  lockSessionControl,
+  sessionControlResult,
   type CommandTransaction,
 } from "./transaction"
 import type {
@@ -20,6 +28,10 @@ import type {
   InterruptResult,
   MessageCommand,
   RetryCommand,
+  PauseCommand,
+  ResumeCommand,
+  SessionControlOperation,
+  SessionControlResult,
   StartCommand,
   SteerCommand,
 } from "./types"
@@ -150,6 +162,14 @@ export class AgentCommandService {
     return this.retryUnique(() => this.retryOnce(command))
   }
 
+  async pause(command: PauseCommand): Promise<SessionControlResult> {
+    return this.sessionControl(command, "pause")
+  }
+
+  async resume(command: ResumeCommand): Promise<SessionControlResult> {
+    return this.sessionControl(command, "resume")
+  }
+
   async cancelExecution(command: CancelExecutionCommand): Promise<boolean> {
     return this.retryUnique(() => this.db.$transaction((tx) => cancelExecutionInTransaction(tx, command)))
   }
@@ -165,9 +185,10 @@ export class AgentCommandService {
 
   private startOnce(command: StartCommand): Promise<CommandResult> {
     return this.db.$transaction(async (tx) => {
-      await lockOpenSession(tx, command.sessionId, command.userId)
+      const session = await lockOpenSession(tx, command.sessionId, command.userId)
       const existing = await findExistingCommand(tx, command.sessionId, command.clientMessageId)
       if (existing) return duplicateCommandResult(tx, command, existing, "follow_up")
+      assertAcceptingSession(session, command.sessionId)
 
       const existingActive = await findActiveTurn(tx, command.sessionId, command.userId)
       const created = !existingActive
@@ -180,9 +201,10 @@ export class AgentCommandService {
 
   private messageOnce(command: MessageCommand): Promise<CommandResult> {
     return this.db.$transaction(async (tx) => {
-      await lockOpenSession(tx, command.sessionId, command.userId)
+      const session = await lockOpenSession(tx, command.sessionId, command.userId)
       const existing = await findExistingCommand(tx, command.sessionId, command.clientMessageId)
       if (existing) return duplicateCommandResult(tx, command, existing, command.delivery)
+      assertAcceptingSession(session, command.sessionId)
 
       const active = await findActiveTurn(tx, command.sessionId, command.userId)
       const expectedTurnId = command.delivery === "steer" || command.expectedTurnId ? command.expectedTurnId : undefined
@@ -218,9 +240,10 @@ export class AgentCommandService {
 
   private retryOnce(command: RetryCommand): Promise<CommandResult> {
     return this.db.$transaction(async (tx) => {
-      await lockOpenSession(tx, command.sessionId, command.userId)
+      const session = await lockOpenSession(tx, command.sessionId, command.userId)
       const existing = await findExistingCommand(tx, command.sessionId, command.clientMessageId)
       if (existing) return duplicateCommandResult(tx, command, existing, "follow_up")
+      assertAcceptingSession(session, command.sessionId)
 
       const target = await tx.agentTurn.findFirst({
         where: { id: command.targetTurnId, sessionId: command.sessionId, userId: command.userId },
@@ -237,6 +260,41 @@ export class AgentCommandService {
       const created = await createRootTurn(tx, command, persisted.content, persisted.goal)
       const facts = await acceptInputFacts(tx, command, persisted.content, created, "follow_up", "started", true)
       return { ...facts, disposition: "started" as const }
+    })
+  }
+
+  private sessionControl(
+    command: PauseCommand | ResumeCommand,
+    operation: SessionControlOperation,
+  ): Promise<SessionControlResult> {
+    return this.db.$transaction(async (tx) => {
+      if (command.source !== "user") throw invalidCommand("Only user commands may change the session control gate")
+      const session = await lockSessionControl(tx, command.sessionId, command.userId)
+      const fingerprint = controlFingerprint(operation, command.expectedRevision)
+      const existing = await findExistingSessionControl(tx, command.sessionId, command.clientMessageId)
+      if (existing) {
+        assertSessionControlIdentity(existing, operation, fingerprint)
+        return sessionControlResult(command, operation, existing.nextGate, existing.controlRevision, existing.pausedAt, "duplicate")
+      }
+      if (command.expectedRevision !== undefined && command.expectedRevision !== null && command.expectedRevision !== session.controlRevision) {
+        throw sessionControlRevisionChanged(command.expectedRevision, session.controlRevision)
+      }
+      if (operation === "pause" && session.controlGate === "open") {
+        const active = await findInProgressTurn(tx, command.sessionId, command.userId)
+        if (active) throw sessionPauseConflict(active.id)
+      }
+      const nextGate = operation === "pause" ? "user_paused" : "open"
+      const changed = nextGate !== session.controlGate
+      const revision = changed ? session.controlRevision + 1 : session.controlRevision
+      const pausedAt = nextGate === "user_paused" ? (changed ? new Date() : session.pausedAt) : null
+      if (changed) {
+        await tx.agentSession.update({
+          where: { id: command.sessionId },
+          data: { controlGate: nextGate, controlRevision: revision, pausedAt },
+        })
+      }
+      await appendSessionControl(tx, command, operation, fingerprint, session.controlGate, nextGate, revision, pausedAt)
+      return sessionControlResult(command, operation, nextGate, revision, pausedAt, changed ? "applied" : "noop")
     })
   }
 }

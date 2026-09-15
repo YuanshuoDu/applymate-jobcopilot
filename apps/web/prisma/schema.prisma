@@ -99,6 +99,7 @@ model User {
   agentRuns                   AgentRun[]
   agentExecutions             AgentExecution[]
   agentSessions               AgentSession[]
+  agentSessionControls        AgentSessionControl[]
   agentApprovals              AgentApproval[]
   agentActionReservations     AgentActionReservation[]
   agentTurns                  AgentTurn[]
@@ -1851,6 +1852,9 @@ model AgentSession {
   goal          String    @db.Text
   status        String
   source        String
+  controlGate   String    @default("open")
+  controlRevision Int      @default(0)
+  pausedAt      DateTime?
   memorySummary String    @default("") @db.Text
   qualityScore  Float?
   currentTaskId String?
@@ -1880,12 +1884,35 @@ model AgentSession {
   mailboxHydrationCheckpoints AgentMailboxHydrationCheckpoint[]
   execution          AgentExecution?
   automation         AgentAutomation?
+  controlOperations  AgentSessionControl[]
 
   @@index([userId, createdAt(sort: Desc)])
   @@index([userId, lastViewedAt(sort: Desc)])
   @@index([userId, status])
   @@unique([id, userId])
   @@map("agent_sessions")
+}
+
+model AgentSessionControl {
+  id              String   @id @default(cuid())
+  sessionId       String
+  userId          String
+  clientMessageId String
+  operation       String
+  fingerprint     String   @db.Text
+  previousGate    String
+  nextGate        String
+  controlRevision Int
+  pausedAt        DateTime?
+  createdAt       DateTime @default(now())
+
+  session AgentSession @relation(fields: [sessionId, userId], references: [id, userId], onDelete: Cascade)
+  user    User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([sessionId, clientMessageId])
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([sessionId, createdAt(sort: Desc)])
+  @@map("agent_session_controls")
 }
 
 // Harness 2.0 durable Turn boundary. Active root serialization is enforced
