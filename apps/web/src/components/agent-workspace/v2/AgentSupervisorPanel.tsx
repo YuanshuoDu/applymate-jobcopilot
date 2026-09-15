@@ -6,6 +6,7 @@ import { useApi } from '@/lib/hooks'
 import { useI18n } from '@/lib/i18n'
 
 import { flattenTaskTree, TaskTreePanel } from './TaskTreePanel'
+import { AgentSessionControlBar } from './AgentSessionControlBar'
 import { CognitiveAgendaCard, type CognitiveAgendaTaskLabel } from './cognitive-agenda-card'
 import { projectSupervisorTree, type SupervisorTaskSummary, type SupervisorTurnSummary } from './task-tree-projection'
 import type { AgentTimelineSnapshot } from './use-agent-timeline'
@@ -19,7 +20,7 @@ export interface AgentSupervisorPanelProps {
   readonly timeline: AgentTimelineSnapshot
 }
 
-/** Read-only V2 evidence panel. Commands remain owned by the composer. */
+/** V2 evidence panel with session controls owned by the timeline gate. */
 export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPanelProps) {
   const { t } = useI18n()
   const [selectedId, setSelectedId] = useState<string | undefined>()
@@ -157,6 +158,7 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
           {connectionLabel(timeline.connection, t)}
         </span>
       </div>
+      <AgentSessionControlBar sessionId={sessionId} controlGate={timeline.controlGate} controlRevision={timeline.controlRevision} />
       {loading && <p aria-live="polite" style={messageStyle}>{t('agent.loadingTasks')}</p>}
       {error && <p role="alert" style={{ ...messageStyle, color: 'var(--c-danger)' }}>{t('agent.supervisorUnavailable')}</p>}
       {timeline.cognitiveAgenda && <CognitiveAgendaCard agenda={timeline.cognitiveAgenda} agendas={timeline.cognitiveAgendas} taskLabels={agendaTaskLabels} />}
