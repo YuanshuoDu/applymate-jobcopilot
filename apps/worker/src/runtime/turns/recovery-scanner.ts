@@ -9,6 +9,7 @@ import {
   type TurnJobPayload,
 } from "./lease.js"
 import { recordTurnDlq } from "./dlq.js"
+import { OPEN_SESSION, RUNNABLE_SESSION } from "../session-gate.js"
 
 export const TURN_DISPATCH_TOPIC = "agent.turn.dispatch"
 export const TURN_DISPATCH_POLL_MS = 30_000
@@ -65,7 +66,7 @@ export async function reclaimExpiredTurns(pool: LeasePool, now: Date, limit: num
          FROM "agent_turns" AS turn
          JOIN "agent_sessions" AS session
            ON session."id" = turn."sessionId"
-          AND session."status" NOT IN ('aborted', 'archived')
+          AND ${RUNNABLE_SESSION}
          WHERE turn."status" = 'in_progress'
            AND (turn."leaseExpiresAt" IS NULL OR turn."leaseExpiresAt" <= $1)
          ORDER BY turn."updatedAt" ASC, turn."id" ASC
@@ -80,7 +81,7 @@ export async function reclaimExpiredTurns(pool: LeasePool, now: Date, limit: num
          AND EXISTS (
            SELECT 1 FROM "agent_sessions" AS session
            WHERE session."id" = turn."sessionId"
-             AND session."status" NOT IN ('aborted', 'archived')
+             AND ${RUNNABLE_SESSION}
          )
        RETURNING turn."id", turn."sessionId", turn."leaseVersion"`,
       [now, limit],
@@ -99,7 +100,7 @@ export async function persistTurnDispatch(
       const session = await client.query<{ id: string }>(
         `SELECT session."id" FROM "agent_sessions" AS session
          WHERE session."id" = $1
-           AND session."status" NOT IN ('aborted', 'archived')
+           AND ${RUNNABLE_SESSION}
          FOR UPDATE`,
         [payload.sessionId],
       )
@@ -137,7 +138,7 @@ export async function repairLegacyTurnDispatchAggregates(pool: LeasePool, limit 
           AND dispatch."publishedAt" IS NULL
           AND dispatch."payload"->>'turnId' = turn."id"
           AND dispatch."payload"->>'sessionId' = session."id"
-         WHERE session."status" NOT IN ('aborted', 'archived')
+         WHERE ${OPEN_SESSION}
          ORDER BY dispatch."createdAt" ASC, dispatch."id" ASC
          LIMIT $2 FOR UPDATE OF session, turn, dispatch SKIP LOCKED
        )
@@ -173,7 +174,7 @@ async function ensureQueuedTurnDispatches(
        FROM "agent_turns" AS turn
        JOIN "agent_sessions" AS session
          ON session."id" = turn."sessionId"
-        AND session."status" NOT IN ('aborted', 'archived')
+        AND ${RUNNABLE_SESSION}
        LEFT JOIN "agent_outbox" AS dispatch
          ON dispatch."topic" = $1
         AND dispatch."aggregateId" = turn."sessionId"
@@ -199,7 +200,7 @@ async function ensureQueuedTurnDispatches(
          WHERE EXISTS (
            SELECT 1 FROM "agent_sessions" AS session
            WHERE session."id" = $3
-             AND session."status" NOT IN ('aborted', 'archived')
+             AND ${RUNNABLE_SESSION}
          )
          ON CONFLICT ("idempotencyKey") DO UPDATE
          SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL,
@@ -225,7 +226,7 @@ export async function dispatchPendingTurnOutbox(
        FROM "agent_outbox" AS dispatch
        JOIN "agent_sessions" AS session
          ON session."id" = dispatch."aggregateId"
-        AND session."status" NOT IN ('aborted', 'archived')
+        AND ${RUNNABLE_SESSION}
        WHERE dispatch."topic" = $1 AND dispatch."publishedAt" IS NULL
        ORDER BY dispatch."createdAt" ASC, dispatch."id" ASC
        LIMIT $2 FOR UPDATE OF dispatch, session SKIP LOCKED`,
@@ -253,7 +254,7 @@ export async function dispatchPendingTurnOutbox(
         const session = await client.query<{ id: string }>(
           `SELECT session."id" FROM "agent_sessions" AS session
            WHERE session."id" = $1
-             AND session."status" NOT IN ('aborted', 'archived')
+             AND ${RUNNABLE_SESSION}
            FOR UPDATE`,
           [sessionId],
         )

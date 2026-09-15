@@ -538,9 +538,9 @@ describe("PgSubagentTaskStore", () => {
     expect(fake.calls.some(([sql]) => sql.startsWith("UPDATE"))).toBe(false)
   })
 
-  it("reclaims stale leases into queued or terminal states", async () => {
+  it.each(["running", "paused", "waiting_for_user"] as const)("reclaims stale leases from an open %s session", async sessionStatus => {
     const fake = fakePool(sql => {
-      if (sql.includes("leaseExpiresAt") && sql.includes("FOR UPDATE")) return { rows: [taskRow({ status: "running", sessionStatus: "running", leaseOwner: "dead-worker", leaseExpiresAt: new Date(now.getTime() - 1), attemptCount: 1 })], rowCount: 1 }
+      if (sql.includes("leaseExpiresAt") && sql.includes("FOR UPDATE")) return { rows: [taskRow({ status: "running", sessionStatus, controlGate: "open", leaseOwner: "dead-worker", leaseExpiresAt: new Date(now.getTime() - 1), attemptCount: 1 })], rowCount: 1 }
       if (sql.startsWith("UPDATE")) return { rowCount: 1 }
       return {}
     })
@@ -550,6 +550,19 @@ describe("PgSubagentTaskStore", () => {
     expect(result[0].status).toBe("queued")
     const select = fake.calls.find(([sql]) => sql.includes("leaseExpiresAt") && sql.includes("FOR UPDATE"))?.[0] ?? ""
     expect(select).toContain("LIMIT $2 FOR UPDATE SKIP LOCKED")
+    expect(select).toContain('session."controlGate" = \'open\'')
+  })
+
+  it("does not recover an expired child from a user-paused session", async () => {
+    const fake = fakePool(sql => {
+      if (sql.includes("leaseExpiresAt") && sql.includes("FOR UPDATE")) return { rows: [], rowCount: 0 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+    await expect(store.recoverExpired({ now, limit: 10 })).resolves.toEqual([])
+    const select = fake.calls.find(([sql]) => sql.includes("leaseExpiresAt") && sql.includes("FOR UPDATE"))?.[0] ?? ""
+    expect(select).toContain('session."controlGate" = \'open\'')
+    expect(fake.calls.some(([sql]) => sql.startsWith("UPDATE"))).toBe(false)
   })
 
   it.each(["aborted", "archived"] as const)("reclaims a stale child from a %s session as interrupted", async status => {

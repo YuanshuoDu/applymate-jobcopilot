@@ -5,9 +5,10 @@ import { getPool } from "../db/apply-results.js"
 import { redisConnection } from "../redis.js"
 import { workerPollingOptions } from "./worker-polling-options.js"
 import { repairStaleSubagentDispatches } from "./subagent-dispatch-recovery.js"
-import { dispatchTaskInvalidReason, lockDispatchSession, lockDispatchTask, lockPendingDispatch, markDispatchTerminal } from "./subagent-dispatch-eligibility.js"
+import { dispatchTaskInvalidReason, lockDispatchTask, lockPendingDispatch, markDispatchTerminal } from "./subagent-dispatch-eligibility.js"
 import { AgentTreeManager } from "../runtime/subagents/manager.js"
 import { parseSubagentJobPayload, type PgSubagentPool, type SubagentJobPayload, type SubagentLease } from "../runtime/subagents/types.js"
+import { OPEN_SESSION, RUNNABLE_SESSION } from "../runtime/session-gate.js"
 export const SUBAGENT_QUEUE_NAME = "agent-subagents"
 export const SUBAGENT_DISPATCH_TOPIC = "agent.subagent.dispatch"
 export const SUBAGENT_DISPATCH_POLL_MS = 30_000
@@ -33,11 +34,24 @@ async function transaction<T>(pool: PgSubagentPool, work: (client: pg.PoolClient
   finally { client.release() }
 }
 
+async function lockRunnableDispatchSession(client: Pick<pg.PoolClient, "query">, sessionId: string): Promise<{ id: string; status: string; userId: string } | undefined> {
+  const result = await client.query<{ id: string; status: string; userId: string }>(`SELECT session."id", session."status", session."userId" FROM "agent_sessions" AS session
+    WHERE session."id" = $1 AND ${RUNNABLE_SESSION} FOR UPDATE`, [sessionId])
+  return result.rows[0]
+}
+
+async function lockOpenDispatchSession(client: Pick<pg.PoolClient, "query">, sessionId: string): Promise<{ id: string } | undefined> {
+  const result = await client.query<{ id: string }>(`SELECT session."id" FROM "agent_sessions" AS session
+    WHERE session."id" = $1 AND ${OPEN_SESSION} FOR UPDATE`, [sessionId])
+  return result.rows[0]
+}
+
 export async function persistSubagentDispatch(pool: PgSubagentPool, payload: SubagentJobPayload, resetPublished = false): Promise<void> {
   await transaction(pool, async client => {
+    const sessionFence = resetPublished ? RUNNABLE_SESSION : OPEN_SESSION
     if (resetPublished) {
       const session = await client.query<{ id: string }>(`SELECT session."id" FROM "agent_sessions" AS session
-        WHERE session."id" = $1 AND session."status" NOT IN ('aborted', 'archived') FOR UPDATE`, [payload.sessionId])
+        WHERE session."id" = $1 AND ${sessionFence} FOR UPDATE`, [payload.sessionId])
       if (!session.rows[0]) return
     }
     const conflict = resetPublished
@@ -45,7 +59,7 @@ export async function persistSubagentDispatch(pool: PgSubagentPool, payload: Sub
          WHERE "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"`
       : `ON CONFLICT ("idempotencyKey") DO NOTHING`
     await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload") SELECT $1, $2, $3, $4, $5::jsonb
-      WHERE EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = $3 AND session."status" NOT IN ('aborted', 'archived')) ${conflict}`,
+      WHERE EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = $3 AND ${sessionFence}) ${conflict}`,
     [randomUUID(), SUBAGENT_DISPATCH_TOPIC, payload.sessionId, subagentDispatchKey(payload.taskId), JSON.stringify(payload)])
   })
 }
@@ -56,7 +70,7 @@ export async function repairMissingSubagentDispatches(pool: PgSubagentPool, owne
   return transaction(pool, async client => {
     const openSessions = await client.query<{ id: string }>(`SELECT session."id"
       FROM "agent_sessions" AS session
-      WHERE session."status" NOT IN ('aborted', 'archived')
+      WHERE ${RUNNABLE_SESSION}
         AND EXISTS (SELECT 1 FROM "sub_agent_tasks" AS task
           JOIN "sub_agent_tasks" AS root ON root."id" = task."rootTaskId" AND root."sessionId" = task."sessionId"
           JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
@@ -85,7 +99,7 @@ export async function repairMissingSubagentDispatches(pool: PgSubagentPool, owne
          AND task."interruptRequestedAt" IS NULL AND task."attemptCount" < task."maxAttempts"
          AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)
         AND session."id" = ANY($1::text[])
-        AND session."status" NOT IN ('aborted', 'archived')
+        AND ${RUNNABLE_SESSION}
         AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
         AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled')
         AND dispatch."id" IS NULL
@@ -104,7 +118,7 @@ export async function repairMissingSubagentDispatches(pool: PgSubagentPool, owne
            WHERE task."id" = $6 AND task."sessionId" = $3 AND task."status" IN ('queued', 'retrying')
              AND task."interruptRequestedAt" IS NULL AND task."attemptCount" < task."maxAttempts"
              AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)
-            AND session."status" NOT IN ('aborted', 'archived')
+            AND ${RUNNABLE_SESSION}
             AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
             AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled'))
         ON CONFLICT ("idempotencyKey") DO NOTHING`,
@@ -120,7 +134,10 @@ export async function dispatchPendingSubagentOutbox(pool: PgSubagentPool, queue:
   const rows = await transaction(pool, async client => {
     const result = await client.query<{ id: string; aggregateId: string; payload: unknown; attemptCount?: number }>(`SELECT dispatch."id", dispatch."aggregateId", dispatch."payload", dispatch."attemptCount"
       FROM "agent_outbox" AS dispatch
+      LEFT JOIN "agent_sessions" AS session
+        ON session."id" = dispatch."aggregateId"
       WHERE dispatch."topic" = $1 AND dispatch."publishedAt" IS NULL
+        AND (session."id" IS NULL OR ${RUNNABLE_SESSION})
       ORDER BY dispatch."createdAt" ASC, dispatch."id" ASC
       LIMIT $2 FOR UPDATE OF dispatch SKIP LOCKED`, [SUBAGENT_DISPATCH_TOPIC, limit])
     return result.rows
@@ -133,15 +150,18 @@ export async function dispatchPendingSubagentOutbox(pool: PgSubagentPool, queue:
     let queueAddFailure: unknown
     try {
       const published = await transaction(pool, async client => {
+        const session = await lockRunnableDispatchSession(client, row.aggregateId)
+        if (!session) {
+          const openSession = await lockOpenDispatchSession(client, row.aggregateId)
+          if (!openSession) {
+            const missingSession = await lockPendingDispatch(client, { ...row, topic: SUBAGENT_DISPATCH_TOPIC })
+            if (missingSession) await markDispatchTerminal(client, missingSession.id, "session_missing")
+          }
+          return false
+        }
         if (!scannedPayload) {
           const malformed = await lockPendingDispatch(client, { ...row, topic: SUBAGENT_DISPATCH_TOPIC })
           if (malformed) await markDispatchTerminal(client, malformed.id, "schema_invalid_payload")
-          return false
-        }
-        const session = await lockDispatchSession(client, row.aggregateId)
-        if (!session) {
-          const missingSession = await lockPendingDispatch(client, { ...row, topic: SUBAGENT_DISPATCH_TOPIC })
-          if (missingSession) await markDispatchTerminal(client, missingSession.id, "session_missing")
           return false
         }
         const task = await lockDispatchTask(client, { taskId: scannedPayload.taskId, sessionId: row.aggregateId, userId: session.userId })

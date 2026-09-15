@@ -9,7 +9,7 @@ import type { SubagentJobPayload } from "../runtime/subagents/types.js"
 
 const payload: SubagentJobPayload = { taskId: "task-1", sessionId: "session-1", rootTaskId: "root-1", ownerId: "worker-1" }
 
-type DispatchOptions = { sessionStatus?: string | null; aggregateId?: string; payload?: unknown; sessionMissing?: boolean; sessionMissingAfterScan?: boolean; outboxMissingAfterScan?: boolean; attemptCount?: number; task?: DispatchTaskOptions }
+type DispatchOptions = { sessionStatus?: string | null; controlGate?: string; aggregateId?: string; payload?: unknown; sessionMissing?: boolean; sessionMissingAfterScan?: boolean; outboxMissingAfterScan?: boolean; attemptCount?: number; task?: DispatchTaskOptions }
 
 type DispatchTaskOptions = { exists?: boolean; status?: string; sessionId?: string; rootTaskId?: string; rootId?: string; rootSessionId?: string; rootTurnId?: string; rootStatus?: string | null; turnId?: string; turnRowId?: string; turnSessionId?: string; turnUserId?: string; turnStatus?: string | null; leaseOwner?: string | null; leaseExpiresAt?: Date | null; interruptRequestedAt?: Date | string | null; attemptCount?: number; maxAttempts?: number; nextAttemptAt?: Date | null; retryDue?: boolean }
 
@@ -35,14 +35,18 @@ function fakePool(markError?: Error, options: DispatchOptions = {}) {
       if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") return { rows: [], rowCount: 0 }
       if (sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes("ORDER BY dispatch.")) {
         scanCompleted = true
+        const controlGate = options.controlGate ?? "open"
+        if (!options.sessionMissing && sql.includes('session."controlGate" = \'open\'') && controlGate !== "open") return { rows: [], rowCount: 0 }
         return { rows: [outbox], rowCount: 1 }
       }
       if (sql.includes('SELECT session."id"') && sql.includes('FROM "agent_sessions" AS session')) {
         const status = options.sessionStatus === undefined ? "running" : options.sessionStatus
         const resetQuery = sql.includes('session."status" NOT IN')
+        const runnableQuery = sql.includes('session."controlGate" = \'open\'')
+        const controlGate = options.controlGate ?? "open"
         const missing = options.sessionMissing || status === null || (scanCompleted && options.sessionMissingAfterScan)
         const unavailable = status === "aborted" || status === "archived"
-        return missing || (resetQuery && unavailable) ? { rows: [], rowCount: 0 } : { rows: [{ id: outbox.aggregateId, status, userId: "user-1" }], rowCount: 1 }
+        return missing || (resetQuery && unavailable) || (runnableQuery && controlGate !== "open") ? { rows: [], rowCount: 0 } : { rows: [{ id: outbox.aggregateId, status, userId: "user-1", controlGate }], rowCount: 1 }
       }
       if (sql.includes('SELECT dispatch."id"') && sql.includes('FROM "agent_outbox" AS dispatch')) {
         return options.outboxMissingAfterScan ? { rows: [], rowCount: 0 } : { rows: [outbox], rowCount: 1 }
@@ -63,7 +67,7 @@ function fakePool(markError?: Error, options: DispatchOptions = {}) {
 }
 
 type RepairOutbox = { id: string; sessionId: string; key: string; payload: SubagentJobPayload; publishedAt: Date | null; lastError: string | null }
-type RepairCandidate = { id: string; sessionId: string; rootTaskId: string; status?: string; rootStatus?: string; turnStatus?: string; sessionStatus?: string; interruptRequestedAt?: string | null; attemptCount?: number; maxAttempts?: number; scopeValid?: boolean }
+type RepairCandidate = { id: string; sessionId: string; rootTaskId: string; status?: string; rootStatus?: string; turnStatus?: string; sessionStatus?: string; controlGate?: string; interruptRequestedAt?: string | null; attemptCount?: number; maxAttempts?: number; scopeValid?: boolean }
 type RepairOptions = { candidate?: RepairCandidate | null; existing?: RepairOutbox[]; failInsert?: Error; respectExisting?: boolean }
 
 function eligibleCandidate(candidate: RepairCandidate): boolean {
@@ -74,6 +78,7 @@ function eligibleCandidate(candidate: RepairCandidate): boolean {
       && (candidate.turnStatus ?? "in_progress") !== "failed" && (candidate.turnStatus ?? "in_progress") !== "interrupted"
       && (candidate.turnStatus ?? "in_progress") !== "cancelled" && (candidate.sessionStatus ?? "running") !== "aborted"
       && (candidate.sessionStatus ?? "running") !== "archived" && candidate.interruptRequestedAt == null
+      && (candidate.controlGate ?? "open") === "open"
       && (candidate.attemptCount ?? 0) < (candidate.maxAttempts ?? 1) && candidate.scopeValid !== false
     : false
 }
@@ -87,7 +92,8 @@ function repairPool(options: RepairOptions = {}) {
       calls.push([sql, params])
       if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") return { rows: [], rowCount: 0 }
       if (sql.includes('FROM "agent_sessions" AS session') && sql.includes("LIMIT $2 FOR UPDATE SKIP LOCKED")) {
-        return candidate ? { rows: [{ id: candidate.sessionId }], rowCount: 1 } : { rows: [], rowCount: 0 }
+        const runnable = sql.includes('session."controlGate" = \'open\'')
+        return candidate && (!runnable || (candidate.controlGate ?? "open") === "open") ? { rows: [{ id: candidate.sessionId }], rowCount: 1 } : { rows: [], rowCount: 0 }
       }
       if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("FOR UPDATE OF task SKIP LOCKED")) {
         const key = candidate ? subagentDispatchKey(candidate.id) : ""
@@ -107,7 +113,9 @@ function repairPool(options: RepairOptions = {}) {
       }
       if (sql.includes('SELECT session."id"') && sql.includes('FROM "agent_sessions" AS session')) {
         const sessionStatus = candidate?.sessionStatus ?? "running"
-        return { rows: [{ id: outbox[0]?.sessionId ?? "session-1", status: sessionStatus, userId: "user-1" }], rowCount: 1 }
+        const controlGate = candidate?.controlGate ?? "open"
+        if (sql.includes('session."controlGate" = \'open\'') && controlGate !== "open") return { rows: [], rowCount: 0 }
+        return { rows: [{ id: outbox[0]?.sessionId ?? "session-1", status: sessionStatus, userId: "user-1", controlGate }], rowCount: 1 }
       }
       if (sql.includes('SELECT dispatch."id"') && sql.includes('FROM "agent_outbox" AS dispatch')) {
         const row = outbox.find(item => item.publishedAt === null)
@@ -216,8 +224,17 @@ describe("Subagent queue", () => {
     expect(lockIndex).toBeGreaterThan(-1)
     expect(lockIndex).toBeLessThan(insertIndex)
     expect(fake.calls[lockIndex]?.[0]).toContain('session."status" NOT IN (\'aborted\', \'archived\')')
+    expect(fake.calls[lockIndex]?.[0]).toContain('session."controlGate" = \'open\'')
     expect(fake.calls[insertIndex]?.[0]).toContain("WHERE EXISTS")
+    expect(fake.calls[insertIndex]?.[0]).toContain('session."controlGate" = \'open\'')
     expect(fake.calls[insertIndex]?.[0]).toContain('WHERE "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"')
+  })
+
+  it("does not reset a user-paused session dispatch", async () => {
+    const fake = fakePool(undefined, { controlGate: "user_paused" })
+    await expect(persistSubagentDispatch(fake.pool, payload, true)).resolves.toBeUndefined()
+    expect(fake.calls.some(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"'))).toBe(false)
+    expect(fake.calls.find(([sql]) => sql.includes('SELECT session."id"'))?.[0]).toContain('session."controlGate" = \'open\'')
   })
 
   it("dispatches pending intents and marks them published only after queue add", async () => {
@@ -227,6 +244,7 @@ describe("Subagent queue", () => {
     expect(queue.add).toHaveBeenCalledWith("subagent", payload, { jobId: subagentJobId("task-1", 0), attempts: 3 })
     const scan = fake.calls.find(([sql]) => sql.includes('SELECT dispatch."id"') && sql.includes("ORDER BY dispatch."))
     expect(scan?.[0]).toMatch(/ORDER BY dispatch\."createdAt" ASC, dispatch\."id" ASC\s+LIMIT \$2 FOR UPDATE OF dispatch SKIP LOCKED/)
+    expect(scan?.[0]).toContain('session."controlGate" = \'open\'')
     const taskFence = fake.calls.find(([sql]) => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes('FOR UPDATE OF task'))
     expect(taskFence?.[0]).toContain('task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP')
     const sessionLock = fake.calls.findIndex(([sql]) => sql.includes('SELECT session."id"') && sql.includes("FOR UPDATE"))
@@ -253,6 +271,17 @@ describe("Subagent queue", () => {
     expect(queue.add).toHaveBeenCalledTimes(1)
   })
 
+  it("leaves a user-paused pending dispatch unpublished", async () => {
+    const fake = fakePool(undefined, { controlGate: "user_paused" })
+    const queue = { add: vi.fn().mockResolvedValue(undefined) }
+    await expect(dispatchPendingSubagentOutbox(fake.pool, queue)).resolves.toBe(0)
+    expect(queue.add).not.toHaveBeenCalled()
+    expect(fake.outbox.publishedAt).toBeNull()
+    expect(fake.outbox.lastError).toBeNull()
+    const scan = fake.calls.find(([sql]) => sql.includes('SELECT dispatch."id"') && sql.includes("ORDER BY dispatch."))
+    expect(scan?.[0]).toContain('session."controlGate" = \'open\'')
+  })
+
   it("leaves a future retry unpublished until its durable due time", async () => {
     const fake = fakePool(undefined, { task: { nextAttemptAt: new Date("2099-01-01T00:00:00.000Z") } })
     const queue = { add: vi.fn() }
@@ -276,6 +305,15 @@ describe("Subagent queue", () => {
 
   it("rechecks the session fence after selecting an outbox row", async () => {
     const fake = fakePool(undefined, { sessionMissingAfterScan: true })
+    const queue = { add: vi.fn() }
+    await expect(dispatchPendingSubagentOutbox(fake.pool, queue)).resolves.toBe(0)
+    expect(queue.add).not.toHaveBeenCalled()
+    expect(fake.outbox.publishedAt).not.toBeNull()
+    expect(fake.outbox.lastError).toBe("session_missing")
+  })
+
+  it("cleans up a pending dispatch when its session is missing", async () => {
+    const fake = fakePool(undefined, { sessionMissing: true })
     const queue = { add: vi.fn() }
     await expect(dispatchPendingSubagentOutbox(fake.pool, queue)).resolves.toBe(0)
     expect(queue.add).not.toHaveBeenCalled()
@@ -333,6 +371,7 @@ describe("Subagent queue", () => {
     expect(scan?.[0]).toContain('task."interruptRequestedAt" IS NULL')
     expect(scan?.[0]).toContain('task."attemptCount" < task."maxAttempts"')
     expect(scan?.[0]).toContain('session."status" NOT IN (\'aborted\', \'archived\')')
+    expect(scan?.[0]).toContain('session."controlGate" = \'open\'')
     expect(scan?.[0]).toContain('root."status" NOT IN')
     expect(scan?.[0]).toContain('turn."status" NOT IN')
     expect(scan?.[0]).toContain("'subagent-dispatch:' || task.\"id\"")
@@ -343,8 +382,10 @@ describe("Subagent queue", () => {
     expect(sessionLockIndex).toBeGreaterThan(-1)
     expect(sessionLockIndex).toBeLessThan(taskLockIndex)
     expect(fake.calls[sessionLockIndex]?.[0]).toContain('session."status" NOT IN (\'aborted\', \'archived\')')
+    expect(fake.calls[sessionLockIndex]?.[0]).toContain('session."controlGate" = \'open\'')
     const insert = fake.calls.find(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"'))
     expect(insert?.[0]).toContain('ON CONFLICT ("idempotencyKey") DO NOTHING')
+    expect(insert?.[0]).toContain('session."controlGate" = \'open\'')
     expect(insert?.[1]?.[2]).toBe("session-1")
     await expect(dispatchPendingSubagentOutbox(fake.pool, { add: vi.fn().mockResolvedValue(undefined) })).resolves.toBe(1)
     expect(fake.outbox[0]?.publishedAt).not.toBeNull()
@@ -364,7 +405,7 @@ describe("Subagent queue", () => {
   const invalidCandidates: Array<[string, Partial<RepairCandidate>]> = [
     ["terminal task", { status: "completed" }], ["terminal root", { rootStatus: "completed" }],
     ["terminal Turn", { turnStatus: "completed" }], ["interrupt requested", { interruptRequestedAt: "2026-09-13T00:00:00.000Z" }],
-    ["attempts exhausted", { attemptCount: 2, maxAttempts: 2 }], ["aborted session", { sessionStatus: "aborted" }],
+    ["attempts exhausted", { attemptCount: 2, maxAttempts: 2 }], ["user-paused session", { controlGate: "user_paused" }], ["aborted session", { sessionStatus: "aborted" }],
     ["archived session", { sessionStatus: "archived" }], ["missing or cross-scope row", { scopeValid: false }],
   ]
   it.each(invalidCandidates)("skips a %s during repair", async (_label, overrides) => {

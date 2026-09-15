@@ -24,20 +24,21 @@ function matchingLegacyRows(rows: unknown[]): unknown[] {
   })
 }
 
-function pool(rows: unknown[] = [], sessionStatus: string | null = "running", queuedRows: unknown[] = [], legacyRows: unknown[] = []) {
+function pool(rows: unknown[] = [], sessionStatus: string | null = "running", queuedRows: unknown[] = [], legacyRows: unknown[] = [], controlGate = "open") {
   const calls: Array<[string, unknown[]?]> = []
   const open = sessionStatus !== null && !["aborted", "archived"].includes(sessionStatus)
+  const runnable = open && controlGate === "open"
   const client = {
     query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push([sql, params])
-      if (sql.includes("WITH stale")) return open ? { rows: [{ id: "turn_1", sessionId: "session_1", leaseVersion: 9 }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      if (sql.includes("WITH stale")) return runnable ? { rows: [{ id: "turn_1", sessionId: "session_1", leaseVersion: 9 }], rowCount: 1 } : { rows: [], rowCount: 0 }
       if (sql.includes("WITH candidates AS")) {
         const candidates = matchingLegacyRows(legacyRows)
         return open ? { rows: candidates, rowCount: candidates.length } : { rows: [], rowCount: 0 }
       }
-      if (sql.includes('FROM "agent_turns" AS turn')) return open ? { rows: queuedRows, rowCount: queuedRows.length } : { rows: [], rowCount: 0 }
-      if (sql.includes('FROM "agent_outbox"') && sql.includes('SELECT')) return open ? { rows, rowCount: rows.length } : { rows: [], rowCount: 0 }
-      if (sql.includes('FROM "agent_sessions"')) return open ? { rows: [{ id: "session_1" }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "agent_turns" AS turn')) return runnable ? { rows: queuedRows, rowCount: queuedRows.length } : { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "agent_outbox"') && sql.includes('SELECT')) return runnable ? { rows, rowCount: rows.length } : { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "agent_sessions"')) return sql.includes('session."controlGate" = \'open\'') ? (runnable ? { rows: [{ id: "session_1" }], rowCount: 1 } : { rows: [], rowCount: 0 }) : (open ? { rows: [{ id: "session_1" }], rowCount: 1 } : { rows: [], rowCount: 0 })
       if (sql.includes('FROM "agent_turns"')) return { rows: [], rowCount: 0 }
       return { rows: [], rowCount: 1 }
     }),
@@ -61,6 +62,7 @@ describe("Turn recovery scanner", () => {
     expect(sql).toContain("status\" = 'in_progress'")
     expect(sql).toMatch(/ORDER BY turn\."updatedAt" ASC, turn\."id" ASC\s+LIMIT \$2 FOR UPDATE OF turn, session SKIP LOCKED/)
     expect(sql).toContain('session."status" NOT IN (\'aborted\', \'archived\')')
+    expect(sql).toContain('session."controlGate" = \'open\'')
     expect(sql.match(/session\."status" NOT IN/g)?.length).toBeGreaterThanOrEqual(2)
   })
 
@@ -77,6 +79,10 @@ describe("Turn recovery scanner", () => {
     const resetFake = pool()
     await persistTurnDispatch(resetFake.pool, { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, true)
     expect(resetFake.calls.some(([sql]) => sql.includes('WHERE "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"'))).toBe(true)
+    const pausedResetFake = pool([], "running", [], [], "user_paused")
+    await persistTurnDispatch(pausedResetFake.pool, { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, true)
+    expect(pausedResetFake.calls.some(([sql]) => sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
+    expect(pausedResetFake.calls.find(([sql]) => sql.includes('SELECT session."id"'))?.[0]).toContain('session."controlGate" = \'open\'')
 
     const closedFake = pool([], "archived")
     await persistTurnDispatch(closedFake.pool, { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, true)
@@ -102,6 +108,8 @@ describe("Turn recovery scanner", () => {
     expect(repair).toContain('dispatch."topic" = $1')
     expect(repair).toContain('dispatch."aggregateId" = candidates."turnId"')
     expect(repair).toContain('dispatch."publishedAt" IS NULL')
+    expect(repair).toContain('session."status" NOT IN (\'aborted\', \'archived\')')
+    expect(repair).not.toContain('session."controlGate"')
   })
 
   it("is reentrant and does not update a repaired legacy row twice", async () => {
@@ -279,7 +287,7 @@ describe("Turn recovery scanner", () => {
     expect(dispatchInserts.every(([, params]) => params?.[2] === "session_1")).toBe(true)
     const guardedDispatchInserts = dispatchInserts.filter(([sql]) => sql.includes("SELECT $1, $2, $3, $4, $5::jsonb"))
     expect(guardedDispatchInserts.length).toBeGreaterThan(0)
-    expect(guardedDispatchInserts.every(([sql]) => sql.includes('session."id" = $3') && sql.includes('session."status" NOT IN'))).toBe(true)
+    expect(guardedDispatchInserts.every(([sql]) => sql.includes('session."id" = $3') && sql.includes('session."status" NOT IN') && sql.includes('session."controlGate" = \'open\''))).toBe(true)
   })
 
   it.each(["aborted", "archived", null] as const)("does not reclaim, repair, or queue a %s session", async (sessionStatus) => {
@@ -323,5 +331,22 @@ describe("Turn recovery scanner", () => {
     expect(report.repaired).toBe(1)
     expect(report.dispatched).toBe(1)
     expect(queue.add).toHaveBeenCalledWith("turn", { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, expect.objectContaining({ attempts: 5 }))
+  })
+
+  it("suppresses expired Turn recovery for a user-paused session", async () => {
+    const fake = pool([], "running", [], [], "user_paused")
+    await expect(reclaimExpiredTurns(fake.pool, new Date("2026-09-01T00:00:00.000Z"), 50)).resolves.toEqual([])
+    const scan = fake.calls.find(([sql]) => sql.includes("WITH stale"))?.[0] ?? ""
+    expect(scan).toContain('session."controlGate" = \'open\'')
+  })
+
+  it("leaves a user-paused pending Turn dispatch unpublished", async () => {
+    const fake = pool([{ id: "outbox_1", payload: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" } }], "running", [], [], "user_paused")
+    const queue = { add: vi.fn() }
+    await expect(dispatchPendingTurnOutbox(fake.pool, queue)).resolves.toBe(0)
+    expect(queue.add).not.toHaveBeenCalled()
+    expect(fake.calls.some(([sql]) => sql.includes('SET "publishedAt" = CURRENT_TIMESTAMP'))).toBe(false)
+    const scan = fake.calls.find(([sql]) => sql.includes('FROM "agent_outbox" AS dispatch'))?.[0] ?? ""
+    expect(scan).toContain('session."controlGate" = \'open\'')
   })
 })

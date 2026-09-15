@@ -1,6 +1,7 @@
 import type pg from "pg"
 
 import { parseSubagentJobPayload, type PgSubagentPool, type SubagentJobPayload } from "../runtime/subagents/types.js"
+import { RUNNABLE_SESSION } from "../runtime/session-gate.js"
 
 export const SUBAGENT_DISPATCH_TOPIC = "agent.subagent.dispatch"
 const DEFAULT_REPAIR_LIMIT = 50
@@ -49,7 +50,7 @@ export async function repairStaleSubagentDispatches(
     // Lock sessions first; the candidate query then locks tasks and dispatches.
     const sessions = await client.query<{ id: string }>(`SELECT session."id"
       FROM "agent_sessions" AS session
-      WHERE session."status" NOT IN ('aborted', 'archived')
+      WHERE ${RUNNABLE_SESSION}
         AND EXISTS (
           SELECT 1
           FROM "sub_agent_tasks" AS task
@@ -101,7 +102,7 @@ export async function repairStaleSubagentDispatches(
        AND dispatch."idempotencyKey" = 'subagent-dispatch:' || task."id"
        AND dispatch."aggregateId" = session."id"
       WHERE session."id" = ANY($1::text[])
-        AND session."status" NOT IN ('aborted', 'archived')
+        AND ${RUNNABLE_SESSION}
         AND task."status" IN ('queued', 'retrying')
         AND task."startedAt" IS NOT NULL
         AND task."leaseOwner" IS NULL
@@ -152,7 +153,7 @@ export async function repairStaleSubagentDispatches(
           AND task."attemptCount" < task."maxAttempts"
           AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)
           AND session."id" = $5
-          AND session."status" NOT IN ('aborted', 'archived')
+          AND ${RUNNABLE_SESSION}
           AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
           AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')`,
       [JSON.stringify(payload), row.dispatchId, SUBAGENT_DISPATCH_TOPIC, `subagent-dispatch:${row.taskId}`, row.sessionId, row.taskId, row.rootTaskId])

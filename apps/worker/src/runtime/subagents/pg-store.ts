@@ -396,6 +396,8 @@ const INSERT_TASK = `INSERT INTO "sub_agent_tasks" (
 
 const SELECT_RECOVERABLE = `SELECT task.*, session."userId" AS "userId", session."status" AS "sessionStatus"
   FROM "sub_agent_tasks" task JOIN "agent_sessions" session ON session."id" = task."sessionId"
-  WHERE task."status" = 'running' AND (task."leaseExpiresAt" IS NULL OR task."leaseExpiresAt" <= $1)
+  WHERE task."status" = 'running'
+    AND (session."status" IN ('aborted', 'archived') OR ${RUNNABLE_SESSION})
+    AND (task."leaseExpiresAt" IS NULL OR task."leaseExpiresAt" <= $1)
     AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)
   ORDER BY task."updatedAt" ASC, task."id" ASC`
