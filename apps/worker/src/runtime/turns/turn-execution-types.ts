@@ -21,6 +21,8 @@ import type {
 import type { GoalContractRef } from "../planning/goal-plan-contract.js"
 import type { PlanRevisionRecoveryDispatcher } from "../planning/plan-revision-receipt.js"
 import type { ContextCompactionHook, ContextCompactionSnapshotLoader } from "../context/context-snapshot-compaction-seam.js"
+import type { SteeringMarkerContext } from "../context/steering-marker-store.js"
+import type { SteeringMarkerPayload } from "../context/steering-marker.js"
 
 export type TurnEngineCompletionGateResult =
   | { readonly ok: true }
@@ -58,7 +60,10 @@ export type TurnExecutionContextBuilder = {
     stepId: string
     snapshot: StepContextSnapshot
     rootInputId?: string
+    taskId?: string
     now: Date
+    steeringMarkerContext?: SteeringMarkerContext
+    steeringMarkerState?: { readonly active: readonly SteeringMarkerPayload[] }
   }): Promise<StepContext>
 }
 
@@ -113,6 +118,8 @@ export type TurnExecutionOptions = {
   /** Optional server-owned context compaction hook; omitted preserves legacy behavior. */
   readonly contextCompaction?: ContextCompactionHook
   readonly contextCompactionLoadSnapshot?: ContextCompactionSnapshotLoader
+  /** Canonical replay state used only for server-side marker hydration. */
+  readonly steeringMarkerState?: { readonly active: readonly SteeringMarkerPayload[] }
 }
 
 export type TurnExecutionOutcome = TurnEngineResult

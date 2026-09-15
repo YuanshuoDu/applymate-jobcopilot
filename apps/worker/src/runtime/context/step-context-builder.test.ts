@@ -4,7 +4,7 @@ import type { InputContentPart, TenantScope } from "@jobcopilot/agent-protocol"
 
 import type { ClaimInputsRequest, ClaimedInputs, InputClaimStore, InputClaimTransaction, StepCheckpoint, StoredAgentInput } from "./input-claim-store.js"
 import { ContextOwnershipError, createPgContextOwnerFence, StepContextBuilder, type BusinessReference, type ContextOwnerFence, type StepContextRequest } from "./step-context-builder.js"
-import { parseSteeringMarkerPayload } from "./steering-marker.js"
+import { parseSteeringMarkerPayload, steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "./steering-marker.js"
 
 const scope: TenantScope = { userId: "user-a" }
 const now = new Date("2026-09-01T16:00:00.000Z")
@@ -57,6 +57,7 @@ class FakeInputClaimStore implements InputClaimStore {
         return { inputThroughSequence: value.inputThroughSequence, consumedInputIds: [...value.consumedInputIds] }
       },
       claimInputs: async (request) => this.claim(request),
+      loadActiveSteeringInputs: async ({ inputIds }) => this.inputs.filter(item => inputIds.includes(item.id) && item.delivery === "steer"),
       persistCheckpoint: async ({ stepId, checkpoint: value }) => {
         if (!this.checkpoints.has(stepId)) throw new Error("missing step")
         if (this.failCheckpoint) throw new Error("checkpoint failure")
@@ -90,7 +91,7 @@ function sequenceOrder(left: StoredAgentInput, right: StoredAgentInput): number 
 }
 
 function request(store: InputClaimStore, snapshot: StepContextRequest["snapshot"], stepId = "step-a", overrides: Partial<StepContextRequest> = {}): StepContextRequest & { store: InputClaimStore } {
-  return { store, scope, sessionId: "session-a", turnId: "turn-a", stepId, snapshot, now, ...overrides }
+  return { store, scope, sessionId: "session-a", turnId: "turn-a", taskId: "task-a", stepId, snapshot, now, ...overrides }
 }
 
 const emptySnapshot = { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] } as const
@@ -99,7 +100,29 @@ const testOwnerFence: ContextOwnerFence = {
   assertAttachmentOwned: async (reference) => ({ attachmentId: reference.attachmentId, mediaType: "application/pdf" }),
 }
 
+const activeMarker = (inputId = "steer-1"): SteeringMarkerPayload => ({
+  schemaVersion: "agent-harness.steering-marker.v1", kind: "observed", status: "observed", sessionId: "session-a", turnId: "turn-a", taskId: "task-a",
+  stepId: "old-step", inputId, idempotencyKey: steeringMarkerIdempotencyKey("session-a", "turn-a", inputId), obligationId: "obligation-1", goalRevision: 1, planRevision: 1, acceptedSequence: "2",
+})
+
 describe("StepContextBuilder", () => {
+  it("rehydrates an active marker input without adding the prior step ID to the new checkpoint", async () => {
+    const store = new FakeInputClaimStore([input("steer-1", 2n, [{ type: "text", text: "Dublin" }], { status: "consumed", consumedByStepId: "old-step", consumedAt: now })])
+    const context = await new StepContextBuilder(store).build(request(store, emptySnapshot, "step-a", { steeringMarkerState: { active: [activeMarker()] } }))
+    expect(context.blocks).toEqual(expect.arrayContaining([expect.objectContaining({ layer: "pending_input", content: expect.objectContaining({ inputId: "steer-1", text: "Dublin" }) })]))
+    expect(context.consumedInputIds).toEqual([])
+    expect(context.inputThroughSequence).toBe(0n)
+    expect(context.steeringMarkerControl).toEqual({ activeInputIds: ["steer-1"], newlyObservedInputIds: [], newlyObservedMarkers: [] })
+    expect(context.canonicalJson).not.toContain("activeInputIds")
+  })
+
+  it("does not rehydrate applied markers because only active markers are passed", async () => {
+    const store = new FakeInputClaimStore([input("steer-1", 2n, [{ type: "text", text: "Dublin" }], { status: "consumed", consumedByStepId: "old-step", consumedAt: now })])
+    const context = await new StepContextBuilder(store).build(request(store, emptySnapshot))
+    expect(context.blocks.filter(block => block.layer === "pending_input")).toHaveLength(0)
+    expect(context.steeringMarkerControl).toEqual({ activeInputIds: [], newlyObservedInputIds: [], newlyObservedMarkers: [] })
+  })
+
   it("writes observed steering markers between claim and checkpoint only for an active obligation", async () => {
     const store = new FakeInputClaimStore([input("root-input", 1n, [{ type: "text", text: "goal" }]), input("steer-1", 2n, [{ type: "text", text: "Dublin" }])])
     const context = await new StepContextBuilder(store).build(request(store, emptySnapshot, "step-a", {
@@ -108,6 +131,8 @@ describe("StepContextBuilder", () => {
     expect(context.consumedInputIds).toEqual(["root-input", "steer-1"])
     expect(store.writes).toEqual(["marker:steer-1", "step:step-a"])
     expect(parseSteeringMarkerPayload(store.markerWrites[0])).toMatchObject({ kind: "observed", inputId: "steer-1", taskId: "task-a", acceptedSequence: "2" })
+    expect(context.steeringMarkerControl?.newlyObservedInputIds).toEqual(["steer-1"])
+    expect(context.steeringMarkerControl?.newlyObservedMarkers).toEqual([expect.objectContaining({ inputId: "steer-1", kind: "observed" })])
   })
 
   it("does not write a second marker when the same step is retried or when no obligation exists", async () => {

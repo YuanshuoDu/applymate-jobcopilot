@@ -42,15 +42,18 @@ function bindStore(store: TurnEngineOptions["store"]): TurnExecutionStore {
 
 function bindContextBuilder(options: TurnEngineOptions, identity: TurnExecutionIdentity): TurnExecutionOptions["contextBuilder"] {
   return {
-    build: ({ scope, stepId, snapshot, rootInputId, now }) => options.contextBuilder.build({
+    build: ({ scope, stepId, snapshot, rootInputId, taskId, now, steeringMarkerContext, steeringMarkerState }) => options.contextBuilder.build({
       scope,
       sessionId: identity.sessionId,
       turnId: identity.turnId,
       stepId,
       snapshot,
       rootInputId,
+      taskId,
       lease: { ownerId: options.lease.ownerId, leaseVersion: options.lease.leaseVersion, now },
       now,
+      steeringMarkerContext,
+      steeringMarkerState,
     }),
   }
 }

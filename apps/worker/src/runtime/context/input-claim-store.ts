@@ -6,6 +6,7 @@ export type { ClaimInputsRequest, ClaimedInputs, StepCheckpoint, StoredAgentInpu
 export interface InputClaimTransaction {
   getCheckpoint(input: { sessionId: string; turnId: string; stepId: string; lease?: TurnExecutionFence }): Promise<StepCheckpoint>
   claimInputs(input: ClaimInputsRequest): Promise<ClaimedInputs>
+  loadActiveSteeringInputs?(input: { sessionId: string; turnId: string; inputIds: readonly string[]; lease?: TurnExecutionFence }): Promise<readonly StoredAgentInput[]>
   persistCheckpoint(input: { sessionId: string; turnId: string; stepId: string; checkpoint: StepCheckpoint; lease?: TurnExecutionFence }): Promise<void>
   appendObservedSteeringMarker?(input: SteeringMarkerWrite): Promise<void>
 }
@@ -183,6 +184,28 @@ function createTransaction(client: QueryClient, scope: TenantScope): InputClaimT
         inputs: sortInputs([...byId.values()]),
         newlyClaimedInputIds: newlyClaimed.map((item) => item.id),
       }
+    },
+    async loadActiveSteeringInputs(input) {
+      await assertOwner(client, scope, input, input.lease)
+      if (input.inputIds.length === 0) return []
+      if (input.inputIds.length > 128 || input.inputIds.some(id => typeof id !== "string" || id.trim() !== id || id.length === 0) || new Set(input.inputIds).size !== input.inputIds.length) throw new InputClaimStoreError("store_conflict", "Active steering marker input IDs are invalid")
+      const result = await client.query<InputRow>(
+        `SELECT "id", "sessionId", "targetTurnId", "userId", "clientMessageId",
+                "delivery", "status", "content", "acceptedSequence", "consumedByStepId",
+                "consumedAt", "createdAt"
+         FROM "agent_inputs"
+         WHERE "sessionId" = $1 AND "targetTurnId" = $2 AND "userId" = $3
+           AND "delivery" = 'steer' AND "id" = ANY($4::text[])
+           AND "status" IN ('accepted', 'queued', 'consumed')
+         ORDER BY "acceptedSequence" ASC, "id" ASC
+         FOR SHARE`,
+        [input.sessionId, input.turnId, scope.userId, [...input.inputIds]],
+      )
+      const inputs = sortInputs(result.rows.map(mapInput))
+      if (inputs.length !== new Set(input.inputIds).size || inputs.some((item) => item.sessionId !== input.sessionId || item.targetTurnId !== input.turnId || item.userId !== scope.userId || item.delivery !== "steer")) {
+        throw new InputClaimStoreError("owner_conflict", "Active steering marker input is outside the tenant Turn")
+      }
+      return inputs
     },
     async persistCheckpoint(input) {
       await assertOwner(client, scope, input, input.lease)

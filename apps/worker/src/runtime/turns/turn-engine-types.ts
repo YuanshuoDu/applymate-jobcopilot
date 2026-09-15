@@ -9,6 +9,8 @@ import type { TurnEngineCompletionGate } from "./turn-execution-types.js"
 import type { GoalContractRef } from "../planning/goal-plan-contract.js"
 import type { PlanRevisionRecoveryDispatcher } from "../planning/plan-revision-receipt.js"
 import type { ContextCompactionHook, ContextCompactionSnapshotLoader } from "../context/context-snapshot-compaction-seam.js"
+import type { SteeringMarkerContext } from "../context/steering-marker-store.js"
+import type { SteeringMarkerPayload } from "../context/steering-marker.js"
 
 export type TurnEngineItemType = "agent_message" | "reasoning_summary" | "tool_call" | "tool_result" | "error"
 export type TurnEngineItemPhase = "commentary" | "final_answer" | null
@@ -166,9 +168,12 @@ export type TurnEngineOptions = {
       stepId: string
       snapshot: StepContextSnapshot
       rootInputId?: string
+      taskId?: string
       mode?: "new" | "retry" | "rebuild"
       lease?: { ownerId: string; leaseVersion: number; now: Date }
       now?: Date
+      steeringMarkerContext?: SteeringMarkerContext
+      steeringMarkerState?: { readonly active: readonly SteeringMarkerPayload[] }
     }): Promise<StepContext>
   }
   readonly store: TurnEngineStore
@@ -209,6 +214,7 @@ export type TurnEngineOptions = {
   readonly noProgressRepeatLimit?: number
   /** Durable state recovered before starting the next fenced execution attempt. */
   readonly resume?: TurnResumeState
+  readonly steeringMarkerState?: { readonly active: readonly SteeringMarkerPayload[] }
 }
 
 export type TurnResumeState = {

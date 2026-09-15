@@ -20,6 +20,7 @@ import { buildPlanCompletionFeedback, buildPlanCompletionFeedbackEvent, currentP
 import { buildReplanFeedback, deriveReplanObligation, MAX_PLAN_REPLAN_FEEDBACK_ATTEMPTS, replanFeedbackAttempts, type ReplanObligation } from "../planning/plan-replan-obligation.js"
 import { runContextCompaction } from "../context/context-compaction-runtime.js"
 import type { StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
+import type { SteeringMarkerPayload } from "../context/steering-marker.js"
 
 const DEFAULT_MAX_STEPS = 32
 const PLAN_OBSERVATION_MAX_BYTES = 8 * 1024
@@ -40,6 +41,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
   let steps = options.resume?.stepCount ?? 0
   let toolCalls = options.resume?.toolCallCount ?? 0
   let continuation: ModelContinuation | undefined
+  let steeringMarkerState = options.steeringMarkerState
   const seenCallIds = new Set<string>()
   let lastStep: TurnEngineStep | null = null
   try {
@@ -56,7 +58,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
       const stepId = makeExecutionId(options, `step:${ordinal}`)
       const attempt = options.identity.kind === "task" ? options.identity.attemptCount ?? 1 : 1
       const step = await options.store.startStep({
-        identity: options.identity, stepId, ordinal, attempt, inputThroughSequence, consumedInputIds,
+        identity: options.identity, stepId, ordinal, attempt, inputThroughSequence, consumedInputIds: [],
         modelProfileSnapshot: toRepositoryJson(options.model.profile), now: now(),
       })
       lastStep = step
@@ -78,8 +80,16 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         const context = await options.contextBuilder.build({
           scope: options.scope, identity: options.identity, stepId: step.id, snapshot,
           rootInputId: ordinal === 0 ? options.rootInputId : undefined, now: now(),
+          taskId: options.identity.taskId,
+          steeringMarkerState: markerStateFor(options.identity.taskId, obligationAfterCompaction, steeringMarkerState),
+          steeringMarkerContext: obligationAfterCompaction ? {
+            taskId: options.identity.taskId, obligationId: obligationAfterCompaction.id,
+            goalRevision: obligationAfterCompaction.goalRevision, planRevision: obligationAfterCompaction.planRevision,
+          } : undefined,
         })
         const freshSteering = hasFreshSteering(context, consumedInputIds)
+        const newlyObservedMarkers = context.steeringMarkerControl?.newlyObservedMarkers ?? []
+        if (newlyObservedMarkers.length > 0) steeringMarkerState = rememberSteeringMarkers(steeringMarkerState, newlyObservedMarkers)
         inputThroughSequence = context.inputThroughSequence
         consumedInputIds = context.consumedInputIds
         const request = buildModelRequest({
@@ -314,6 +324,7 @@ async function rejectReplanOutput(options: TurnExecutionOptions, writer: TurnExe
 }
 
 function hasFreshSteering(context: StepContext, consumedInputIds: readonly string[]): boolean {
+  if (context.steeringMarkerControl && (context.steeringMarkerControl.activeInputIds.length > 0 || context.steeringMarkerControl.newlyObservedInputIds.length > 0)) return true
   const consumedBeforeBuild = new Set(consumedInputIds)
   const newlyConsumed = new Set(context.consumedInputIds.filter(inputId => !consumedBeforeBuild.has(inputId)))
   return context.blocks.some(block => {
@@ -330,6 +341,17 @@ function replanToolBatchAllowed(toolCalls: readonly TurnEngineToolCall[], obliga
   if (toolCalls.length !== 1) return false
   const name = toolCalls[0]?.name
   return name === "agent.plan.propose" || (freshSteering && name === "agent.goal.update")
+}
+
+function markerStateFor(taskId: string, obligation: ReplanObligation | undefined, state: { readonly active: readonly SteeringMarkerPayload[] } | undefined): { readonly active: readonly SteeringMarkerPayload[] } | undefined {
+  if (!obligation || !state) return undefined
+  return { active: state.active.filter(marker => marker.taskId === taskId && marker.obligationId === obligation.id && marker.goalRevision === obligation.goalRevision && marker.planRevision === obligation.planRevision) }
+}
+
+function rememberSteeringMarkers(current: { readonly active: readonly SteeringMarkerPayload[] } | undefined, additions: readonly SteeringMarkerPayload[]): { readonly active: readonly SteeringMarkerPayload[] } {
+  const byKey = new Map<string, SteeringMarkerPayload>()
+  for (const marker of [...current?.active ?? [], ...additions]) byKey.set(marker.idempotencyKey, marker)
+  return { active: [...byKey.values()].sort((left, right) => left.idempotencyKey.localeCompare(right.idempotencyKey)) }
 }
 
 async function assertCompletionAllowed(options: TurnExecutionOptions, writer: TurnExecutionEventWriter, step: TurnEngineStep, signal: AbortSignal, now: () => Date): Promise<void> {

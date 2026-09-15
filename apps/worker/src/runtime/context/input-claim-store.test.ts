@@ -9,7 +9,7 @@ import { buildObservedSteeringMarker } from "./steering-marker-store.js"
 const scope = { userId: "user-a" }
 const createdAt = new Date("2026-09-01T16:00:00.000Z")
 
-type FakeOptions = { sessionStatus?: string; sessionVisible?: boolean; sessionUserId?: string; turnVisible?: boolean; leaseValid?: boolean; failOn?: string }
+type FakeOptions = { sessionStatus?: string; sessionVisible?: boolean; sessionUserId?: string; turnVisible?: boolean; leaseValid?: boolean; failOn?: string; activeRow?: Record<string, unknown> | null }
 
 function row(overrides: Record<string, unknown> = {}) {
   return {
@@ -39,6 +39,7 @@ function makeClient(options: FakeOptions = {}) {
       }
       if (text.includes('FROM "sub_agent_tasks"')) return { rows: values[0] === "task-a" ? [{ id: "task-a" }] : [] }
       if (text.startsWith('SELECT "id", "turnId", "taskId", "type", "actor", "correlationId", "payload", "sequence" FROM "agent_events"')) return { rows: [] }
+      if (text.includes('FROM "agent_inputs"') && text.includes("FOR SHARE")) return { rows: options.activeRow === null ? [] : [row(options.activeRow ?? {})] }
       if (text.startsWith("UPDATE \"agent_sessions\"")) return { rows: [{ eventSequence: "9" }] }
       if (text.startsWith('INSERT INTO "agent_events"')) return { rowCount: 1, rows: [] }
       if (text.startsWith('INSERT INTO "agent_outbox"')) return { rowCount: 1, rows: [] }
@@ -142,6 +143,23 @@ describe("PostgreSQL AgentInput claim store", () => {
     }
     expect(fake.calls.map((call) => call.text)).toEqual(expect.arrayContaining(["BEGIN", "COMMIT", "SELECT set_config($1, $2, true)"]))
     expect(fake.client.query).not.toHaveBeenCalledWith(expect.stringContaining("ROLLBACK"))
+  })
+
+  it("hydrates active steering inputs with a tenant, Turn, and steer delivery fence", async () => {
+    const fake = makeClient({ activeRow: { id: "input-1" } })
+    const store = createPgInputClaimStore(fake.pool, scope)
+    const hydrated = await store.withTransaction(tx => tx.loadActiveSteeringInputs!({ sessionId: "session-a", turnId: "turn-a", inputIds: ["input-1"] }))
+    expect(hydrated.map(item => item.id)).toEqual(["input-1"])
+    const query = fake.calls.find(call => call.text.includes('FROM "agent_inputs"') && call.text.includes("FOR SHARE"))
+    expect(query?.text).toContain('"sessionId" = $1 AND "targetTurnId" = $2 AND "userId" = $3')
+    expect(query?.text).toContain('"delivery" = \'steer\'')
+    expect(query?.values).toEqual(["session-a", "turn-a", "user-a", ["input-1"]])
+  })
+
+  it("rejects a hydrated input whose returned delivery is not steer", async () => {
+    const fake = makeClient({ activeRow: { delivery: "follow_up" } })
+    const store = createPgInputClaimStore(fake.pool, scope)
+    await expect(store.withTransaction(tx => tx.loadActiveSteeringInputs!({ sessionId: "session-a", turnId: "turn-a", inputIds: ["input-1"] }))).rejects.toMatchObject({ code: "owner_conflict" })
   })
 
   it.each([

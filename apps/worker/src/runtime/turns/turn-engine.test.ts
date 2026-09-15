@@ -6,6 +6,9 @@ import { RootAbortController } from "../interrupt/registry.js"
 import { TurnLeaseError } from "./lease.js"
 import { createToolRouterExecutor, TurnEngine } from "./turn-engine.js"
 import { toRepositoryJson, type TurnEngineOptions, type TurnEngineStore } from "./turn-engine-types.js"
+import { planRevisionObservation } from "../planning/plan-revision-receipt.js"
+import type { GoalContract, GoalContractRef } from "../planning/goal-plan-contract.js"
+import { steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "../context/steering-marker.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "owner-1", userId: "user-1", leaseVersion: 4,
@@ -53,6 +56,14 @@ function contextBuilder(seen: StepContextSnapshot[]) {
   }
 }
 
+function failedReplanObservations() {
+  return [
+    planRevisionObservation({ planCallId: "plan-1", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposalHash: `sha256:${"0".repeat(64)}` }),
+    { id: "plan-result:plan-1:join", content: { kind: "plan_command", localId: "join", commandKind: "join", dependsOn: ["child"], status: "completed", errorCode: null, output: { waitId: "wait-1", status: "ready", taskIds: ["child-1"], matchedTaskIds: ["child-1"], tasks: [{ taskId: "child-1", status: "failed", result: null, failureReason: "provider error" }] } } },
+    { id: "plan-control:plan-1:join:replan", content: { kind: "plan_control", localId: "join:replan", status: "replan_required", dependsOn: ["child"], reason: "child_failure", failedTaskIds: ["child-1"] } },
+  ]
+}
+
 function baseOptions(overrides: Partial<TurnEngineOptions> = {}) {
   const fake = fakeStore()
   const snapshots: StepContextSnapshot[] = []
@@ -84,6 +95,39 @@ function baseOptions(overrides: Partial<TurnEngineOptions> = {}) {
 }
 
 describe("TurnEngine", () => {
+  it("forwards the runtime-owned task identity into context building", async () => {
+    const fixture = baseOptions()
+    const seen: string[] = []
+    const options: TurnEngineOptions = {
+      ...fixture.options,
+      contextBuilder: {
+        build: async (request: Parameters<TurnEngineOptions["contextBuilder"]["build"]>[0]) => {
+        seen.push(request.taskId ?? "")
+        return contextBuilder([]).build(request)
+      },
+      },
+    }
+    await expect(new TurnEngine(options).run()).resolves.toMatchObject({ status: "completed" })
+    expect(seen[0]).toBe("root-1")
+  })
+
+  it("forwards the active marker control through the bound context builder", async () => {
+    const fixture = baseOptions()
+    const marker: SteeringMarkerPayload = {
+      schemaVersion: "agent-harness.steering-marker.v1", kind: "observed", status: "observed", sessionId: "session-1", turnId: "turn-1", taskId: "root-1",
+      stepId: "old-step", inputId: "steer-1", idempotencyKey: steeringMarkerIdempotencyKey("session-1", "turn-1", "steer-1"), obligationId: "plan-replan:plan-1:1", goalRevision: 1, planRevision: 1, acceptedSequence: "2",
+    }
+    const goal: GoalContract = { revision: 1, objective: "Find jobs", constraints: [], successCriteria: [], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "test" }
+    const goalRef: GoalContractRef = { get: () => goal, update: () => undefined }
+    const seen: Array<Parameters<TurnEngineOptions["contextBuilder"]["build"]>[0]> = []
+    const options: TurnEngineOptions = {
+      ...fixture.options, goalRef, snapshot: { ...fixture.options.snapshot, toolObservations: failedReplanObservations() }, steeringMarkerState: { active: [marker] },
+      contextBuilder: { build: async request => { seen.push(request); return contextBuilder([]).build(request) } },
+    }
+    await new TurnEngine(options).run()
+    expect(seen[0]).toMatchObject({ taskId: "root-1", steeringMarkerContext: { taskId: "root-1", obligationId: "plan-replan:plan-1:1" }, steeringMarkerState: { active: [marker] } })
+  })
+
   it("runs a durable 3-step loop, feeds tool results into context, and emits one final", async () => {
     const fixture = baseOptions()
     const result = await new TurnEngine(fixture.options).run()

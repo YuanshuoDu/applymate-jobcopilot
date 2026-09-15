@@ -6,7 +6,7 @@ import type { PolicyEngine } from "@jobcopilot/agent-policy"
 import { loadWorkerAiConfig, type AiConfig } from "@jobcopilot/shared/llm"
 
 import { createHarnessModelRuntime, type HarnessModelRuntime } from "./harness-model.js"
-import { createPgContextOwnerFence, StepContextBuilder } from "./context/step-context-builder.js"
+import { createPgContextOwnerFence, StepContextBuilder, type StepContextSnapshot } from "./context/step-context-builder.js"
 import { createPgInputClaimStore } from "./context/input-claim-store.js"
 import { createWorkerToolRuntime, type ToolLifecycleEvent, type ToolLifecycleSink, type ToolRouter } from "./tools/index.js"
 import { createPgTurnEngineStore } from "./turns/turn-engine-store.js"
@@ -32,6 +32,9 @@ import { createPlanRevisionRecoveryDispatcher } from "./planning/plan-revision-r
 import type { ContextSnapshotAdapter } from "./context/context-snapshot-adapter.js"
 import { noopCanonicalExecutionProjection, type CanonicalExecutionProjection } from "./canonical-execution-projection.js"
 import { noopCanonicalSessionProjection, type CanonicalSessionProjection } from "./canonical-session-projection.js"
+import { deriveReplanObligation } from "./planning/plan-replan-obligation.js"
+import type { SteeringMarkerContext } from "./context/steering-marker-store.js"
+import type { SteeringMarkerPayload } from "./context/steering-marker.js"
 
 export type UsageAuthorization = {
   settle(input: { status: "success" | "error"; inputTokens: number; outputTokens: number; estimatedCostUsd: number; errorCode?: string }): Promise<void> | void
@@ -184,6 +187,23 @@ function defaultAuthorization(): never {
   throw error
 }
 
+function markerContextFor(snapshot: StepContextSnapshot, goalRef: GoalContractRef, taskId: string): SteeringMarkerContext | undefined {
+  const result = deriveReplanObligation({ observations: snapshot.toolObservations, expectedGoalRevision: goalRef.get().revision })
+  if (result.kind !== "active") return undefined
+  return { taskId, obligationId: result.obligation.id, goalRevision: result.obligation.goalRevision, planRevision: result.obligation.planRevision }
+}
+
+function markerStateFor(state: { readonly active: readonly SteeringMarkerPayload[] } | undefined, context: SteeringMarkerContext | undefined): { readonly active: readonly SteeringMarkerPayload[] } | undefined {
+  if (!state || !context) return undefined
+  return { active: state.active.filter(marker => marker.taskId === context.taskId && marker.obligationId === context.obligationId && marker.goalRevision === context.goalRevision && marker.planRevision === context.planRevision) }
+}
+
+function rememberMarkers(current: readonly SteeringMarkerPayload[], additions: readonly SteeringMarkerPayload[]): SteeringMarkerPayload[] {
+  const byKey = new Map<string, SteeringMarkerPayload>()
+  for (const marker of [...current, ...additions]) byKey.set(marker.idempotencyKey, marker)
+  return [...byKey.values()].sort((left, right) => left.idempotencyKey.localeCompare(right.idempotencyKey))
+}
+
 export async function createCanonicalTurnRuntime(pool: pg.Pool, options: CanonicalTurnRuntimeOptions): Promise<{ execute: TurnExecutor; manager: AgentTreeManager; close(): Promise<void> }> {
   if (!options.workerId.trim()) throw new TypeError("workerId must be non-empty")
   const now = options.now ?? (() => new Date())
@@ -264,7 +284,18 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const authorize = options.authorizeUsage ?? defaultAuthorization
     const model = modelWithUsage(modelRuntime, lease, authorize)
     const inputStore = createPgInputClaimStore(pool, state.scope)
-    const contextBuilder = options.contextBuilderFactory?.({ pool, scope: state.scope }) ?? new StepContextBuilder(inputStore, createPgContextOwnerFence(pool))
+    const baseContextBuilder = options.contextBuilderFactory?.({ pool, scope: state.scope }) ?? new StepContextBuilder(inputStore, createPgContextOwnerFence(pool))
+    let activeMarkers = [...state.steeringMarkers?.active ?? []]
+    const contextBuilder: TurnEngineOptions["contextBuilder"] = {
+      build: async request => {
+        const markerContext = markerContextFor(request.snapshot, goalRef, root.id)
+        const context = await baseContextBuilder.build({
+          ...request, taskId: root.id, steeringMarkerState: markerStateFor({ active: activeMarkers }, markerContext), steeringMarkerContext: markerContext,
+        })
+        activeMarkers = rememberMarkers(activeMarkers, context.steeringMarkerControl?.newlyObservedMarkers ?? [])
+        return context
+      },
+    }
     const planCompletionRequired = options.planningEnabled === true && options.planningExecutionEnabled === true
     const engine = new TurnEngine({
       lease, scope: state.scope, goal: state.goal, goalRef, snapshot: state.snapshot, contextBuilder,

@@ -16,6 +16,7 @@ import { PLAN_COMPLETION_FEEDBACK_EVENT_TYPE, PLAN_COMPLETION_FEEDBACK_TEXT } fr
 import type { ToolExecutionContext } from "../tools/types.js"
 import type { TurnEngineItem, TurnEngineStore, TurnEngineToolResult } from "./turn-engine-types.js"
 import type { TurnExecutionIdentity, TurnExecutionOptions, TurnExecutionStore } from "./turn-execution-types.js"
+import { steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "../context/steering-marker.js"
 
 const profile = {
   provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false,
@@ -30,7 +31,7 @@ function identity(kind: TurnExecutionIdentity["kind"], taskId: string, attemptCo
 }
 
 type FixtureTool = { readonly id?: string; readonly name: string; readonly arguments: unknown; readonly output?: unknown }
-type Fixture = { options: TurnExecutionOptions; events: Array<{ id: string; type: string; itemId: string | null; taskId: string; payload?: unknown; idempotencyKey?: string }>; notifications: string[]; planEvents: unknown[]; items: TurnEngineItem[]; finalResponses: string[]; stepTasks: string[]; stepAttempts: number[]; stepStatuses: string[]; requests: HarnessModelRequest[] }
+type Fixture = { options: TurnExecutionOptions; events: Array<{ id: string; type: string; itemId: string | null; taskId: string; payload?: unknown; idempotencyKey?: string }>; notifications: string[]; planEvents: unknown[]; items: TurnEngineItem[]; finalResponses: string[]; stepTasks: string[]; stepAttempts: number[]; stepStatuses: string[]; stepInputs: Array<{ inputThroughSequence: bigint; consumedInputIds: string[] }>; requests: HarnessModelRequest[] }
 
 function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult, planHook?: NonNullable<TurnExecutionOptions["executePlan"]>, initialToolObservations: Array<{ id: string; content: unknown }> = [], failPlanObservation = false, completionGate?: NonNullable<TurnExecutionOptions["completionGate"]>, firstTool?: FixtureTool, failGoalRevision = false, goalRef?: GoalContractRef, toolExecutor?: TurnExecutionOptions["executeTool"], firstTools?: readonly FixtureTool[]): Fixture {
   const events: Fixture["events"] = []
@@ -41,10 +42,11 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
   const stepTasks: string[] = []
   const stepAttempts: number[] = []
   const stepStatuses: string[] = []
+  const stepInputs: Fixture["stepInputs"] = []
   const requests: HarnessModelRequest[] = []
   const revisions = new Map<string, number>()
   const store: TurnExecutionStore = {
-    startStep: async ({ identity, stepId, attempt, ordinal }) => { stepTasks.push(identity.taskId); stepAttempts.push(attempt); return { id: stepId, ordinal } },
+    startStep: async ({ identity, stepId, attempt, ordinal, inputThroughSequence, consumedInputIds }) => { stepTasks.push(identity.taskId); stepAttempts.push(attempt); stepInputs.push({ inputThroughSequence, consumedInputIds: [...consumedInputIds] }); return { id: stepId, ordinal } },
     updateStep: async ({ status }) => { stepStatuses.push(status) },
     createItem: async ({ identity, itemId }) => { const item = { id: itemId, revision: 0 }; items.push(item); revisions.set(`${identity.taskId}:${itemId}`, 0); return item },
     updateItem: async ({ identity, itemId, expectedRevision }) => { const key = `${identity.taskId}:${itemId}`; expect(revisions.get(key)).toBe(expectedRevision); const revision = expectedRevision + 1; revisions.set(key, revision); return { id: itemId, revision } },
@@ -91,7 +93,7 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
     ...(planHook ? { executePlan: planHook } : {}),
     ...(completionGate ? { completionGate } : {}),
   }
-  return { options, events, notifications, planEvents, items, finalResponses, stepTasks, stepAttempts, stepStatuses, requests }
+  return { options, events, notifications, planEvents, items, finalResponses, stepTasks, stepAttempts, stepStatuses, stepInputs, requests }
 }
 
 function addSteeringInput(root: Fixture, alreadyConsumed = false): void {
@@ -139,6 +141,38 @@ function durableFailedWaitObservations(): Array<{ id: string; content: unknown }
 }
 
 describe("owner-agnostic turn execution loop", () => {
+  it("starts each new step with only its own claimed input IDs while retaining the cursor", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const baseBuilder = root.options.contextBuilder
+    root.options = {
+      ...root.options,
+      contextBuilder: {
+        build: async request => ({ ...(await baseBuilder.build(request)), inputThroughSequence: 7n, consumedInputIds: ["previous-step-input"] }),
+      },
+    }
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "completed", stepCount: 2 })
+    expect(root.stepInputs.map(step => step.consumedInputIds)).toEqual([[], []])
+    expect(root.stepInputs.map(step => step.inputThroughSequence)).toEqual([0n, 7n])
+  })
+
+  it("passes a matching durable marker state through the loop only for its active obligation", async () => {
+    const marker: SteeringMarkerPayload = {
+      schemaVersion: "agent-harness.steering-marker.v1", kind: "observed", status: "observed", sessionId: "session-1", turnId: "turn-1", taskId: "root-1",
+      stepId: "old-step", inputId: "steer-1", idempotencyKey: steeringMarkerIdempotencyKey("session-1", "turn-1", "steer-1"), obligationId: "plan-replan:plan-1:1", goalRevision: 1, planRevision: 1, acceptedSequence: "2",
+    }
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, failedJoinObservations(), false, undefined, undefined, false, replanGoalRef())
+    const seen: Array<{ readonly active?: readonly SteeringMarkerPayload[] }> = []
+    const baseBuilder = root.options.contextBuilder
+    const options: TurnExecutionOptions = {
+      ...root.options, steeringMarkerState: { active: [marker] }, contextBuilder: {
+        build: async request => { seen.push(request.steeringMarkerState ?? {}); return baseBuilder.build(request) },
+      },
+    }
+    await runTurnExecutionLoop(options)
+    expect(seen[0]?.active).toEqual([marker])
+  })
+
   it("allows exactly one goal update for fresh steering while replanning", async () => {
     const goalContract = { ...replanGoal, revision: 2, objective: "Find senior jobs" }
     const goalReceipt = { status: "accepted", goalRevision: 2, basedOnGoalRevision: 1, goalContract }

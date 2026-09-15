@@ -1,9 +1,10 @@
 import type { InputContentPart, TenantScope } from "@jobcopilot/agent-protocol"
 import type pg from "pg"
-
-import { InputClaimStoreError, type InputClaimStore, type InputClaimTransaction, type StepCheckpoint, type StoredAgentInput, type TurnExecutionFence } from "./input-claim-store.js"
-import { appendNewObservedSteeringMarkers, type SteeringMarkerContext } from "./steering-marker-store.js"
-
+import { InputClaimStoreError, type InputClaimStore, type InputClaimTransaction, type TurnExecutionFence } from "./input-claim-store.js"
+import { appendNewObservedSteeringMarkers, buildObservedSteeringMarker, type SteeringMarkerContext } from "./steering-marker-store.js"
+import type { SteeringMarkerPayload } from "./steering-marker.js"
+import { activeMarkerInputIds, assertHydratedSteeringInputs, mergeSteeringInputs } from "./steering-marker-hydration.js"
+import { checkpointWithInputs, ensureClaimTenant, pendingInputBlocks } from "./step-context-support.js"
 export type JsonValue = null | boolean | number | string | JsonValue[] | { readonly [key: string]: JsonValue }
 export type ContextTrust = "system" | "user_confirmed" | "internal_record" | "external_untrusted"
 export type ContextLayer = "system" | "profile" | "goal" | "steer_history" | "business" | "tool_observation" | "pending_input"
@@ -50,6 +51,13 @@ export type StepContext = {
   readonly consumedInputIds: readonly string[]
   readonly blocks: readonly ContextBlock[]
   readonly canonicalJson: string
+  readonly steeringMarkerControl?: StepSteeringMarkerControl
+}
+
+export type StepSteeringMarkerControl = {
+  readonly activeInputIds: readonly string[]
+  readonly newlyObservedInputIds: readonly string[]
+  readonly newlyObservedMarkers: readonly SteeringMarkerPayload[]
 }
 
 export interface ContextOwnerFence {
@@ -149,38 +157,6 @@ function referenceTrust(kind: BusinessReferenceKind): ContextTrust {
   return ["jd", "dom", "email"].includes(kind) ? "external_untrusted" : "internal_record"
 }
 
-function pendingBlocks(input: StoredAgentInput, ownerFence: ContextOwnerFence, scope: TenantScope): Promise<ContextBlock[]> {
-  return Promise.all(input.content.map(async (part, partIndex) => {
-    if (part.type === "attachment_ref") {
-      const attachment = await ownerFence.assertAttachmentOwned(part, scope)
-      if (attachment.attachmentId !== part.attachmentId) throw new ContextOwnershipError("reference_owner_mismatch", `Attachment resolver returned a different id`)
-      return block("pending_input", "data", "external_untrusted", "user_input", `${input.id}:part:${partIndex}`, {
-        inputId: input.id, partIndex, attachmentId: attachment.attachmentId, ...(attachment.mediaType ? { mediaType: attachment.mediaType } : {}), ...(attachment.filename ? { filename: attachment.filename } : {}),
-      })
-    }
-    return block("pending_input", "data", "external_untrusted", "user_input", `${input.id}:part:${partIndex}`, { inputId: input.id, partIndex, text: part.text })
-  }))
-}
-
-function checkpointWithInputs(checkpoint: StepCheckpoint, inputs: readonly StoredAgentInput[]): StepCheckpoint {
-  const ids = [...checkpoint.consumedInputIds]
-  const known = new Set(ids)
-  let through = checkpoint.inputThroughSequence
-  for (const input of [...inputs].sort((left, right) => left.acceptedSequence < right.acceptedSequence ? -1 : left.acceptedSequence > right.acceptedSequence ? 1 : left.id.localeCompare(right.id))) {
-    if (!known.has(input.id)) { ids.push(input.id); known.add(input.id) }
-    if (input.acceptedSequence > through) through = input.acceptedSequence
-  }
-  return { inputThroughSequence: through, consumedInputIds: ids }
-}
-
-function ensureClaimTenant(inputs: readonly StoredAgentInput[], request: StepContextRequest): void {
-  for (const input of inputs) {
-    if (input.sessionId !== request.sessionId || input.targetTurnId !== request.turnId || input.userId !== request.scope.userId || input.delivery !== "steer") {
-      throw new ContextOwnershipError("reference_owner_mismatch", `AgentInput ${input.id} is outside the tenant Turn`)
-    }
-  }
-}
-
 export type StepContextRequest = {
   readonly scope: TenantScope
   readonly sessionId: string
@@ -192,7 +168,9 @@ export type StepContextRequest = {
   readonly rebuild?: boolean
   readonly lease?: TurnExecutionFence
   readonly now?: Date
+  readonly taskId?: string
   readonly steeringMarkerContext?: SteeringMarkerContext
+  readonly steeringMarkerState?: { readonly active: readonly SteeringMarkerPayload[] }
 }
 
 export class StepContextBuilder {
@@ -215,7 +193,21 @@ export class StepContextBuilder {
       sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId, checkpoint: persisted,
       mode, lease: request.lease, now: request.now ?? this.clock(),
     })
-    ensureClaimTenant(claimed.inputs, request)
+    ensureClaimTenant(claimed.inputs, request, inputId => new ContextOwnershipError("reference_owner_mismatch", `AgentInput ${inputId} is outside the tenant Turn`))
+    const activeIds = activeMarkerInputIds(request.steeringMarkerState?.active, request.rootInputId, request.steeringMarkerState?.active.length ? {
+      sessionId: request.sessionId, turnId: request.turnId, taskId: request.taskId ?? "",
+      ...(request.steeringMarkerContext ? {
+        obligationId: request.steeringMarkerContext.obligationId,
+        goalRevision: request.steeringMarkerContext.goalRevision,
+        planRevision: request.steeringMarkerContext.planRevision,
+      } : {}),
+    } : undefined)
+    const loader = transaction.loadActiveSteeringInputs
+    if (activeIds.length > 0 && !loader) throw new InputClaimStoreError("store_conflict", "Active steering marker hydration is unavailable")
+    const hydrated = activeIds.length > 0 ? [...await loader!({ sessionId: request.sessionId, turnId: request.turnId, inputIds: activeIds, lease: request.lease })] : []
+    assertHydratedSteeringInputs(activeIds, hydrated)
+    const contextInputs = mergeSteeringInputs(claimed.inputs, hydrated)
+    ensureClaimTenant(contextInputs, request, inputId => new ContextOwnershipError("reference_owner_mismatch", `AgentInput ${inputId} is outside the tenant Turn`))
     const sequences = new Map<bigint, string>()
     for (const input of claimed.inputs) {
       const previous = sequences.get(input.acceptedSequence)
@@ -237,12 +229,22 @@ export class StepContextBuilder {
     for (const entry of request.snapshot.steerHistory) blocks.push(block("steer_history", "data", "external_untrusted", "steer_history", `history:${entry.id}`, entry.content))
     for (const reference of [...request.snapshot.businessRefs].sort((left, right) => left.kind.localeCompare(right.kind) || left.id.localeCompare(right.id))) blocks.push(block("business", "data", referenceTrust(reference.kind), "business_reference", `business:${reference.kind}:${reference.id}`, referenceContent(reference)))
     for (const observation of request.snapshot.toolObservations) blocks.push(block("tool_observation", "data", "external_untrusted", "tool_or_subagent", `observation:${observation.id}`, observation.content))
-    for (const input of claimed.inputs) if (input.id !== request.rootInputId) blocks.push(...await pendingBlocks(input, this.ownerFence, request.scope))
+    for (const input of contextInputs) if (input.id !== request.rootInputId) blocks.push(...await pendingInputBlocks(input, this.ownerFence, request.scope, block, message => new ContextOwnershipError("reference_owner_mismatch", message)))
     const ordered = blocks.sort((left, right) => layerOrder.indexOf(left.layer) - layerOrder.indexOf(right.layer))
     const result = {
       schemaVersion: "agent-harness.v2" as const, sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId,
       inputThroughSequence: nextCheckpoint.inputThroughSequence, consumedInputIds: [...nextCheckpoint.consumedInputIds], blocks: ordered,
     }
-    return { ...result, canonicalJson: stableJson({ ...result, inputThroughSequence: result.inputThroughSequence.toString() }) }
+    const newlyObservedInputIds = request.steeringMarkerContext
+      ? claimed.newlyClaimedInputIds.filter((inputId) => inputId !== request.rootInputId)
+      : []
+    const newlyObservedMarkers = request.steeringMarkerContext
+      ? claimed.inputs.filter(input => newlyObservedInputIds.includes(input.id)).map(markerInput => buildObservedSteeringMarker({ sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId, context: request.steeringMarkerContext!, markerInput }))
+      : []
+    return {
+      ...result,
+      canonicalJson: stableJson({ ...result, inputThroughSequence: result.inputThroughSequence.toString() }),
+      steeringMarkerControl: { activeInputIds: hydrated.map((input) => input.id), newlyObservedInputIds, newlyObservedMarkers },
+    }
   }
 }

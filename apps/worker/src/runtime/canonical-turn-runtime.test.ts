@@ -91,6 +91,7 @@ function realPgBoundary() {
     query: vi.fn(async (sql: string) => {
       calls.push(sql)
       if (sql.includes("WITH candidates")) return { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1" }], rowCount: 1 }
       if (sql.includes('FROM "agent_steps"')) return { rows: [{ inputThroughSequence: 0n, consumedInputIds: [] }], rowCount: 1 }
       if (sql.includes('FROM "agent_inputs"')) return { rows: [], rowCount: 0 }
       if (sql.includes('JOIN "agent_sessions"')) return { rows: [{ id: "turn-1" }], rowCount: 1 }
