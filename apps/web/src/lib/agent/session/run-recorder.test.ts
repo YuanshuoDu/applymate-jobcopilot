@@ -4,6 +4,7 @@ import { createRunSessionRecorder, mapPipelineEventToTranscript } from "./run-re
 interface MockDbOptions {
   sessionExists?: boolean
   sessionStatus?: string
+  controlGate?: string
   sessionUserId?: string
   updateCount?: number
 }
@@ -16,13 +17,14 @@ function queryText(query: unknown) {
 
 function mockDb(options: MockDbOptions = {}) {
   let sessionStatus = options.sessionStatus ?? "running"
+  let controlGate = options.controlGate
   let rollbackCount = 0
   const agentSession = {
     create: vi.fn(async ({ data }) => ({ id: "session_1", ...data })),
     update: vi.fn(async ({ data }) => ({ id: "session_1", ...data })),
     findFirst: vi.fn(async ({ where }: { where: { id: string; userId: string } }) => {
       const owned = options.sessionExists !== false && (options.sessionUserId ?? "user_1") === where.userId
-      return owned ? { id: where.id, status: sessionStatus } : null
+      return owned ? { id: where.id, status: sessionStatus, ...(controlGate === undefined ? {} : { controlGate }) } : null
     }),
     updateMany: vi.fn(async () => ({ count: options.updateCount ?? 1 })),
   }
@@ -59,6 +61,7 @@ function mockDb(options: MockDbOptions = {}) {
   }
   const state = {
     closeSession() { sessionStatus = "aborted" },
+    pauseGate() { controlGate = "user_paused" },
     get rollbackCount() { return rollbackCount },
   }
   return Object.assign(db, { db, tx, state })
@@ -97,7 +100,7 @@ describe("run session recorder", () => {
     expect(recorder.sessionId).toBe("chat_session_1")
     expect(db.agentSession.create).not.toHaveBeenCalled()
     expect(db.agentSession.updateMany).toHaveBeenCalledWith({
-      where: { id: "chat_session_1", userId: "user_1", status: { notIn: ["aborted", "archived"] } },
+      where: { id: "chat_session_1", userId: "user_1", controlGate: "open", status: { notIn: ["aborted", "archived"] } },
       data: { status: "running", completedAt: null },
     })
 
@@ -162,7 +165,7 @@ describe("run session recorder", () => {
   })
 
   it.each(["paused", "waiting_for_user"])("reopens an existing %s session", async (sessionStatus) => {
-    const db = mockDb({ sessionStatus })
+    const db = mockDb({ sessionStatus, controlGate: "open" })
 
     await expect(createRunSessionRecorder(db, {
       userId: "user_1",
@@ -170,6 +173,32 @@ describe("run session recorder", () => {
       sessionId: "chat_session_1",
     })).resolves.toMatchObject({ sessionId: "chat_session_1" })
     expect(db.agentSession.updateMany).toHaveBeenCalled()
+  })
+
+  it("keeps durable recording available after the user pauses the run", async () => {
+    const { db, state, tx } = mockDb({ controlGate: "open" })
+    const recorder = await createRunSessionRecorder(db, {
+      userId: "user_1",
+      goal: "Pause after start",
+      sessionId: "chat_session_1",
+    })
+    state.pauseGate()
+
+    await expect(recorder.record("agent_plan", { role: "scout", plan: "Persist after pause" })).resolves.toBeDefined()
+    expect(tx.agentTranscriptEvent.create).toHaveBeenCalled()
+  })
+
+  it("does not reopen an existing user-paused session", async () => {
+    const db = mockDb({ controlGate: "user_paused" })
+
+    await expect(createRunSessionRecorder(db, {
+      userId: "user_1",
+      goal: "Paused pipeline",
+      sessionId: "chat_session_1",
+    })).rejects.toThrow("does not exist for this user")
+    expect(db.agentSession.updateMany).not.toHaveBeenCalled()
+    expect(db.agentSession.update).not.toHaveBeenCalled()
+    expect(db.agentSession.create).not.toHaveBeenCalled()
   })
 
   it.each(["aborted", "archived"])("does not reopen a %s session", async (sessionStatus) => {

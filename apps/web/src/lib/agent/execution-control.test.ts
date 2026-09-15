@@ -17,7 +17,12 @@ describe("agent execution control plane", () => {
     mocks.updateMany.mockResolvedValue({ count: 1 })
     const { claimAgentExecution } = await import("./execution-control")
     await expect(claimAgentExecution({ id: "execution_1", userId: "user_1" })).resolves.toBe(true)
-    expect(mocks.updateMany).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ OR: expect.any(Array) }) }))
+    expect(mocks.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        session: { is: { controlGate: "open" } },
+        OR: expect.any(Array),
+      }),
+    }))
   })
 
   it("resets a finished execution when an automation starts another cycle", async () => {
@@ -27,9 +32,22 @@ describe("agent execution control plane", () => {
 
     await expect(ensureAgentExecution({ userId: "user_1", sessionId: "session_1", autonomous: true, restartForRun: true })).resolves.toEqual({ id: "execution_1", status: "queued" })
     expect(mocks.updateMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: { userId: "user_1", sessionId: "session_1", status: { in: ["completed", "failed", "cancelled"] } },
+      where: { userId: "user_1", sessionId: "session_1", session: { is: { controlGate: "open" } }, status: { in: ["completed", "failed", "cancelled"] } },
       data: expect.objectContaining({ status: "queued", checkpoint: "scout", workerTaskId: null }),
     }))
     expect(mocks.upsert).not.toHaveBeenCalled()
+  })
+
+  it("does not reset a finished execution while its session is user-paused", async () => {
+    mocks.updateMany.mockResolvedValueOnce({ count: 0 })
+    mocks.upsert.mockResolvedValueOnce({ id: "execution_1", status: "completed" })
+    const { ensureAgentExecution } = await import("./execution-control")
+
+    await expect(ensureAgentExecution({ userId: "user_1", sessionId: "session_1", autonomous: true, restartForRun: true }))
+      .resolves.toEqual({ id: "execution_1", status: "completed" })
+    expect(mocks.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ session: { is: { controlGate: "open" } } }),
+    }))
+    expect(mocks.upsert).toHaveBeenCalled()
   })
 })

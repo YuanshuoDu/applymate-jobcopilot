@@ -43,7 +43,7 @@ const CLOSED_SESSION_STATUSES = ["aborted", "archived"] as const
 
 type SessionLifecycleDb = AgentSessionDb & {
   agentSession: AgentSessionDb["agentSession"] & {
-    findFirst(args: { where: { id: string; userId: string }; select: { id: true; status: true } }): Promise<{ id: string; status: string } | null>
+    findFirst(args: { where: { id: string; userId: string }; select: { id: true; status: true; controlGate: true } }): Promise<{ id: string; status: string; controlGate?: string } | null>
     updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<{ count: number }>
   }
 }
@@ -68,13 +68,13 @@ async function reopenExistingSession(db: AgentSessionDb, input: { sessionId: str
   const sessionDb = db as SessionLifecycleDb
   const session = await sessionDb.agentSession.findFirst({
     where: { id: input.sessionId, userId: input.userId },
-    select: { id: true, status: true },
+    select: { id: true, status: true, controlGate: true },
   })
-  if (!session || CLOSED_SESSION_STATUSES.includes(session.status as (typeof CLOSED_SESSION_STATUSES)[number])) {
+  if (!session || CLOSED_SESSION_STATUSES.includes(session.status as (typeof CLOSED_SESSION_STATUSES)[number]) || (session.controlGate !== undefined && session.controlGate !== "open")) {
     throw new Error(`Agent session ${input.sessionId} does not exist for this user`)
   }
   const updated = await sessionDb.agentSession.updateMany({
-    where: { id: input.sessionId, userId: input.userId, status: { notIn: [...CLOSED_SESSION_STATUSES] } },
+    where: { id: input.sessionId, userId: input.userId, controlGate: "open", status: { notIn: [...CLOSED_SESSION_STATUSES] } },
     data: { status: "running", completedAt: null },
   })
   if (updated.count !== 1) throw new Error(`Agent session ${input.sessionId} does not exist for this user`)

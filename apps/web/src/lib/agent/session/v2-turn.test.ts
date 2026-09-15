@@ -7,9 +7,11 @@ interface MockDbOptions {
   fallbackTurn?: { id: string } | null
   sessionExists?: boolean
   sessionStatus?: string
+  controlGate?: string
   sessionUserId?: string
   createError?: unknown
   closeAfterCreate?: boolean
+  pauseAfterCreate?: boolean
 }
 
 function queryText(query: unknown) {
@@ -21,12 +23,14 @@ function queryText(query: unknown) {
 function mockDb(options: MockDbOptions = {}) {
   let transactionCalls = 0
   let sessionStatus = options.sessionStatus ?? "running"
+  let controlGate = options.controlGate
   const tx = {
     $queryRaw: vi.fn(async (query: unknown) => {
       if (!queryText(query).includes('FROM "agent_sessions"')) return []
       const owned = options.sessionExists !== false && (options.sessionUserId ?? "user_1") === "user_1"
       const closed = ["aborted", "archived"].includes(sessionStatus)
-      return owned && !closed ? [{ id: "session_1" }] : []
+      const runnable = queryText(query).includes('"controlGate" = \'open\'')
+      return owned && !closed && (!runnable || controlGate === undefined || controlGate === "open") ? [{ id: "session_1" }] : []
     }),
     agentTurn: {
       findFirst: vi.fn(async () => transactionCalls > 1
@@ -35,6 +39,7 @@ function mockDb(options: MockDbOptions = {}) {
       create: vi.fn(async () => {
         if (options.createError) {
           if (options.closeAfterCreate) sessionStatus = "aborted"
+          if (options.pauseAfterCreate) controlGate = "user_paused"
           throw options.createError
         }
         return { id: "turn_new" }
@@ -72,14 +77,30 @@ describe("ensureV2Turn", () => {
   })
 
   it.each(["paused", "waiting_for_user"])("accepts an open \"%s\" session", async (sessionStatus) => {
-    const { db, tx } = mockDb({ sessionStatus })
+    const { db, tx } = mockDb({ sessionStatus, controlGate: "open" })
 
-    await expect(ensureV2Turn(db as never, input)).resolves.toMatchObject({
+    await expect(ensureV2Turn(db as never, { ...input, source: "automation" })).resolves.toMatchObject({
       sessionId: "session_1",
       turnId: "turn_new",
       userId: "user_1",
     })
     expect(tx.agentTurn.create).toHaveBeenCalled()
+  })
+
+  it("allows user Turns while the control gate is user-paused", async () => {
+    const { db, tx } = mockDb({ controlGate: "user_paused", activeTurn: { id: "turn_review" } })
+
+    await expect(ensureV2Turn(db as never, input)).resolves.toMatchObject({ turnId: "turn_review" })
+    expect(tx.agentTurn.findFirst).toHaveBeenCalled()
+  })
+
+  it.each(["automation", "system"])("rejects a %s Turn while the control gate is user-paused before Turn reads or writes", async (source) => {
+    const { db, tx } = mockDb({ controlGate: "user_paused", activeTurn: { id: "turn_blocked" } })
+
+    await expect(ensureV2Turn(db as never, { ...input, source: source as "automation" | "system" }))
+      .rejects.toThrow("does not exist for this user")
+    expect(tx.agentTurn.findFirst).not.toHaveBeenCalled()
+    expect(tx.agentTurn.create).not.toHaveBeenCalled()
   })
 
   it("creates a fresh in-progress Turn after terminal history", async () => {
@@ -136,6 +157,16 @@ describe("ensureV2Turn", () => {
     const { db, tx } = mockDb({ createError: uniqueError, closeAfterCreate: true, fallbackTurn: { id: "turn_closed" } })
 
     await expect(ensureV2Turn(db as never, input)).rejects.toThrow("does not exist for this user")
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(2)
+    expect(tx.agentTurn.findFirst).toHaveBeenCalledTimes(1)
+  })
+
+  it("does not reuse a Turn when the control gate closes during P2002 recovery", async () => {
+    const uniqueError = Object.assign(new Error("active root conflict"), { code: "P2002" })
+    const { db, tx } = mockDb({ createError: uniqueError, pauseAfterCreate: true, fallbackTurn: { id: "turn_paused" } })
+
+    await expect(ensureV2Turn(db as never, { ...input, source: "automation" }))
+      .rejects.toThrow("does not exist for this user")
     expect(tx.$queryRaw).toHaveBeenCalledTimes(2)
     expect(tx.agentTurn.findFirst).toHaveBeenCalledTimes(1)
   })
