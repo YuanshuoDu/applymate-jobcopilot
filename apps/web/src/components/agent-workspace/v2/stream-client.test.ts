@@ -44,6 +44,19 @@ function canonicalItemEvent(sequence: string, itemId: string, turnId: string, ty
   })
 }
 
+function sessionControlEvent(type: 'session.paused' | 'session.resumed', sequence: string, id = `control-${sequence}`) {
+  const paused = type === 'session.paused'
+  return JSON.stringify({
+    schemaVersion: 'agent-harness.v2', id, sessionId: 'session-1', turnId: null, itemId: null, taskId: null,
+    type, actor: 'system', correlationId: 'session-1', causationId: null, idempotencyKey: `control:${id}`, sequence,
+    payload: {
+      sessionId: 'session-1', operation: paused ? 'pause' : 'resume',
+      previousGate: paused ? 'open' : 'user_paused', nextGate: paused ? 'user_paused' : 'open',
+      controlRevision: paused ? 1 : 2, pausedAt: paused ? '2026-09-15T00:00:00.000Z' : null,
+    },
+  })
+}
+
 function agendaEvent(overrides: Record<string, unknown> = {}) {
   return {
     schemaVersion: 'agent-harness.v2', id: 'agenda-7', sessionId: 'session-1', turnId: 'turn-1', itemId: null, taskId: 'task-1',
@@ -194,6 +207,40 @@ describe('V2 timeline stream client', () => {
     await streamAgentTimeline({ sessionId: 'session-1', dispatch, fetcher, signal: controller.signal, retryDelayMs: 0 })
 
     expect(state.itemsById['item-1']).toMatchObject({ status: 'completed', content: { text: 'done' } })
+    expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual([
+      '/api/agent/sessions/session-1/timeline?limit=100', '/api/agent/sessions/session-1/events',
+      '/api/agent/sessions/session-1/events?afterSequence=4',
+    ])
+  })
+
+  it('consumes session lifecycle events and advances the cursor without projecting them as turn events', async () => {
+    const controller = new AbortController()
+    let state: TimelineState = createTimelineState('session-1')
+    const actions: TimelineAction[] = []
+    const dispatch = (action: TimelineAction) => {
+      actions.push(action)
+      state = timelineReducer(state, action)
+      if (action.type === 'event' && (action.event as { id?: string })?.id === 'control-5') controller.abort()
+    }
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [], page: { hasMore: false } })))
+      .mockResolvedValueOnce(new Response(streamFrom([
+        `event: session.paused\ndata: ${sessionControlEvent('session.paused', '4')}\n\n`,
+        `event: session.paused\ndata: ${sessionControlEvent('session.paused', '4')}\n\n`,
+        `event: session.resumed\ndata: ${sessionControlEvent('session.resumed', '3')}\n\n`,
+      ].join('')), { headers: { 'Content-Type': 'text/event-stream' } }))
+      .mockResolvedValueOnce(new Response(streamFrom(
+        `event: session.resumed\ndata: ${sessionControlEvent('session.resumed', '5')}\n\n`,
+      ), { headers: { 'Content-Type': 'text/event-stream' } }))
+
+    await streamAgentTimeline({ sessionId: 'session-1', dispatch, fetcher, signal: controller.signal, retryDelayMs: 0 })
+
+    expect(actions.filter(action => action.type === 'event')).toHaveLength(2)
+    expect(state.sessionControl).toEqual({ controlGate: 'open', controlRevision: 2, pausedAt: null })
+    expect(state.lastSequence).toBe('5')
+    expect(state.events).toEqual([])
+    expect(state.byTurnId.size).toBe(0)
+    expect(state.itemIds).toEqual([])
     expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual([
       '/api/agent/sessions/session-1/timeline?limit=100', '/api/agent/sessions/session-1/events',
       '/api/agent/sessions/session-1/events?afterSequence=4',

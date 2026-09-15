@@ -3,6 +3,7 @@
 import { AGENT_STREAM_SCHEMA_VERSION } from '@jobcopilot/agent-protocol'
 import { createCognitiveAgendaState, reduceCognitiveAgenda, type TimelineCognitiveAgendaState } from './timeline-cognitive-agenda'
 import { emptyTimelineSteeringMarkerState, reduceTimelineSteeringMarkers, STEERING_MARKER_EVENT_TYPE, STEERING_MARKER_MAX_EVENTS, type TimelineSteeringMarkerEvent, type TimelineSteeringMarkerState } from './timeline-steering-markers'
+import { createTimelineSessionControlState, isSessionControlEventCandidate, parseTimelineSessionControl, reduceTimelineSessionControl, type TimelineSessionControlEvent, type TimelineSessionControlState } from './timeline-session-control'
 import { appendFallbackEvent, appendTimelineEvent, buildIndexes, compareItems, integer, isAfter, isRecord, itemFromTimelineEvent, mergeContent, numberOrUndefined, sequence, stringOrNull, timestamp } from './timeline-reducer-utils'
 
 export type TimelineConnection = 'idle' | 'connected' | 'reconnecting'
@@ -60,6 +61,7 @@ export interface TimelineState {
   itemIdsByTaskId: Record<string, string[]>
   processedEventIds: Record<string, true>
   lastSequence: string | null
+  sessionControl: TimelineSessionControlState
   lifecycleRevision: number
   cognitiveAgenda: TimelineCognitiveAgendaState
   steeringMarkers: TimelineSteeringMarkerState
@@ -102,7 +104,7 @@ export function createTimelineState(sessionId: string): TimelineState {
     sessionId, events: [], byId: new Map(), byTurnId: new Map(), byToolCallId: new Map(), lastEventId: null,
     transientItems: new Map(), fallbackItems: [],
     itemIds: [], itemsById: {}, itemIdsByTurnId: {}, itemIdsByTaskId: {},
-    processedEventIds: {}, lastSequence: null, lifecycleRevision: 0, cognitiveAgenda: createCognitiveAgendaState(sessionId), steeringMarkers: emptyTimelineSteeringMarkerState(), steeringMarkerEvents: [], connection: 'idle', snapshotRequired: false,
+    processedEventIds: {}, lastSequence: null, sessionControl: createTimelineSessionControlState(), lifecycleRevision: 0, cognitiveAgenda: createCognitiveAgendaState(sessionId), steeringMarkers: emptyTimelineSteeringMarkerState(), steeringMarkerEvents: [], connection: 'idle', snapshotRequired: false,
   }
 }
 
@@ -175,6 +177,9 @@ function reduceItems(state: TimelineState, values: unknown[], source: TimelineIt
 }
 
 function reduceEvent(state: TimelineState, value: unknown): TimelineState {
+  const sessionControl = parseTimelineSessionControl(value, state.sessionId)
+  if (sessionControl) return reduceSessionControlEvent(state, sessionControl)
+  if (isSessionControlEventCandidate(value)) return state
   const event = normalizeTimelineEvent(value)
   if (!event || event.sessionId !== state.sessionId || state.processedEventIds[event.id]) return state
   const markerState = event.type === STEERING_MARKER_EVENT_TYPE ? reduceMarkerEvent(state, event) : null
@@ -208,6 +213,17 @@ function reduceEvent(state: TimelineState, value: unknown): TimelineState {
   if (!KNOWN_EVENT_TYPES.has(event.type)) next = { ...next, fallbackItems: appendFallbackEvent(next.fallbackItems, event) }
   const item = itemFromTimelineEvent(event, status, existing, undefined, normalizeTimelineItem)
   return item ? upsertItem(next, item, item.source === 'unknown' ? 'unknown' : 'durable') : next
+}
+
+function reduceSessionControlEvent(state: TimelineState, event: TimelineSessionControlEvent): TimelineState {
+  if (state.processedEventIds[event.id] || !isAfter(event.sequence, state.lastSequence)) return state
+  return {
+    ...state,
+    processedEventIds: { ...state.processedEventIds, [event.id]: true },
+    lastEventId: event.id,
+    lastSequence: event.sequence,
+    sessionControl: reduceTimelineSessionControl(state.sessionControl, event),
+  }
 }
 
 function reduceMarkerEvent(state: TimelineState, event: TimelineEvent): { state: TimelineSteeringMarkerState; events: readonly TimelineSteeringMarkerEvent[] } | null {
