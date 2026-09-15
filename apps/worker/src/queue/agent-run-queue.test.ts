@@ -73,13 +73,17 @@ describe("agent-run queue", () => {
     });
   });
 
-  it("dispatches the canonical TurnEngine adapter only for a Turn-bound task", async () => {
+  it("uses the existing pipeline adapter as an explicit gate-off rollback", async () => {
     mocks.canonical.mockResolvedValue({ status: "completed", summary: "pipeline complete" });
     await import("./agent-run-queue.js");
 
     await expect(mocks.handler?.({ data: { userId: "user_1", sessionId: "session_1", turnId: "turn_1", executionId: "execution_1" } }))
       .resolves.toEqual({ status: "completed", summary: "pipeline complete" });
-    expect(mocks.canonical).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ turnId: "turn_1", executionId: "execution_1" }) }), expect.anything());
+    expect(mocks.canonical).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ turnId: "turn_1", executionId: "execution_1" }) }),
+      expect.anything(),
+    );
+    expect(mocks.producer.enqueue).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
   });
 

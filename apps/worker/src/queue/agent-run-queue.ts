@@ -32,11 +32,13 @@ function internalRunUrl() {
 export function createAgentRunProcessor(canonicalProducer: AgentRunCanonicalProducer = agentRunCanonicalProducer) {
   return async (task: { data: AgentRunTaskPayload; attemptsMade: number }) => {
     if (task.data.turnId) {
-      if (resolveProductionAgentFlags().canonicalAutomationEnabled) {
-        await canonicalProducer.enqueue({ sessionId: task.data.sessionId, turnId: task.data.turnId });
-        return { status: "routed" as const, queue: TURN_QUEUE_NAME, turnId: task.data.turnId };
+      if (!resolveProductionAgentFlags().canonicalAutomationEnabled) {
+        // Gate-off is an explicit, durable rollback to the existing pipeline
+        // adapter so a queued automation still reaches a terminal outcome.
+        return runCanonicalAgentTurn(task, getPool());
       }
-      return runCanonicalAgentTurn(task, getPool());
+      await canonicalProducer.enqueue({ sessionId: task.data.sessionId, turnId: task.data.turnId });
+      return { status: "routed" as const, queue: TURN_QUEUE_NAME, turnId: task.data.turnId };
     }
     const url = internalRunUrl();
     const secret = process.env.AGENT_WORKER_SECRET;

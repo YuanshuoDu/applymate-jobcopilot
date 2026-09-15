@@ -2106,3 +2106,15 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused Web validation passed **172 tests across 38 V2 files** and **75 focused route/SSE tests**, covering strict parsing, redaction, foreign/malformed/duplicate/older/bounds handling, bounded query ordering, first-page hydration, stable live/overflow ordering, hook projection, safe scope labels, and card rendering. Web `tsc --noEmit --skipLibCheck` and `git diff --check` pass.
 
 **Candidate boundary:** Live PostgreSQL/RLS, production SSE reconnect/overflow, process restart, Worker/Redis delivery, provider/browser behavior, deployment, and complete end-to-end compaction evidence remain unverified. The cognitive loop and production feature flags remain disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance.
+
+## 89. P8-1 — V2 canonical runtime cutover
+
+**Candidate status/date (2026-09-15):** P8-1 is recorded as a candidate V2 Worker runtime cutover slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Turn-bound `agent-runs` jobs retain the exact server-owned `ENABLE_AGENT_CANONICAL_AUTOMATION=1` rollout gate. When enabled, every `turnId` job uses the existing durable `agent-turns` producer and therefore reaches the production canonical runtime's ModelAdapter and ToolRouter chain. When disabled, the queue explicitly rolls back to the existing `pipeline-turn-adapter`, preserving terminal behavior for an already-created automation Turn instead of leaving it queued. Both the canonical producer and the legacy adapter derive owner/job identity from `turnId`; `executionId` is not used for ownership or job identity. Jobs without `turnId` remain on the authenticated internal Web pipeline.
+
+**Independent verification:** The focused Worker queue, legacy executor identity, and canonical-dispatch tests passed **13/13** after the cutover. Coverage includes gate-off compatibility, gate-on routing, legacy routing, enqueue failure propagation, deterministic identity, and execution-independent ownership. The shared package build completed as the Worker test pre-step.
+
+**Operational risk:** Gate-off intentionally uses the fixed adapter as rollback behavior, so it does not exercise the real ModelAdapter/ToolRouter path. Gate-on delivery, adapter terminalization against live state, and switching the rollout gate across retries require live Redis/PostgreSQL and Worker restart validation.
+
+**Candidate boundary:** No live PostgreSQL/RLS, Redis/BullMQ delivery, real Worker startup or restart, provider/model call, browser behavior, or complete V2-to-canonical end-to-end evidence was run. No schema, provider, Web, queue, or feature flag was added; the canonical rollout gate remains the production boundary.

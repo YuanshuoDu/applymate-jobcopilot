@@ -107,7 +107,7 @@ export async function runCanonicalAgentTurn(
     },
   }
   const result = await runTurnJob(
-    { data: { turnId: payload.turnId, sessionId: payload.sessionId, ownerId: `agent-run:${payload.executionId ?? payload.turnId}` }, attemptsMade: task.attemptsMade },
+    { data: { turnId: payload.turnId, sessionId: payload.sessionId, ownerId: `agent-run:${payload.turnId}` }, attemptsMade: task.attemptsMade },
     { pool, waitHandoff: async ({ lease, waitId, now }) => {
       await createPgDurableWaitPort(pool).suspendAndRelease({ lease, waitId, now })
     }, execute: async ({ lease, signal }): Promise<TurnExecutionResult> => {
