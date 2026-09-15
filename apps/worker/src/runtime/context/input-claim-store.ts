@@ -1,42 +1,13 @@
 import type pg from "pg"
 import type { InputContentPart, TenantScope } from "@jobcopilot/agent-protocol"
-export type StepCheckpoint = {
-  readonly inputThroughSequence: bigint
-  readonly consumedInputIds: readonly string[]
-}
-export type TurnExecutionFence = { readonly ownerId: string; readonly leaseVersion: number; readonly now: Date }
-export type StoredAgentInput = {
-  readonly id: string
-  readonly sessionId: string
-  readonly targetTurnId: string | null
-  readonly userId: string
-  readonly clientMessageId: string
-  readonly delivery: "steer" | "follow_up"
-  readonly status: "accepted" | "queued" | "consumed" | "cancelled" | "rejected"
-  readonly content: readonly InputContentPart[]
-  readonly acceptedSequence: bigint
-  readonly consumedByStepId: string | null
-  readonly consumedAt: Date | null
-  readonly createdAt: Date
-}
-export type ClaimInputsRequest = {
-  readonly sessionId: string
-  readonly turnId: string
-  readonly stepId: string
-  readonly checkpoint: StepCheckpoint
-  readonly mode?: "new" | "retry" | "rebuild"
-  readonly rebuild?: boolean
-  readonly lease?: TurnExecutionFence
-  readonly now: Date
-}
-export type ClaimedInputs = {
-  readonly inputs: readonly StoredAgentInput[]
-  readonly newlyClaimedInputIds: readonly string[]
-}
+import { persistObservedSteeringMarker, type SteeringMarkerWrite } from "./steering-marker-store.js"
+import type { ClaimInputsRequest, ClaimedInputs, StepCheckpoint, StoredAgentInput, TurnExecutionFence } from "./input-claim-types.js"
+export type { ClaimInputsRequest, ClaimedInputs, StepCheckpoint, StoredAgentInput, TurnExecutionFence } from "./input-claim-types.js"
 export interface InputClaimTransaction {
   getCheckpoint(input: { sessionId: string; turnId: string; stepId: string; lease?: TurnExecutionFence }): Promise<StepCheckpoint>
   claimInputs(input: ClaimInputsRequest): Promise<ClaimedInputs>
   persistCheckpoint(input: { sessionId: string; turnId: string; stepId: string; checkpoint: StepCheckpoint; lease?: TurnExecutionFence }): Promise<void>
+  appendObservedSteeringMarker?(input: SteeringMarkerWrite): Promise<void>
 }
 export interface InputClaimStore {
   readonly scope: TenantScope
@@ -222,6 +193,10 @@ function createTransaction(client: QueryClient, scope: TenantScope): InputClaimT
         [input.checkpoint.inputThroughSequence.toString(), JSON.stringify([...input.checkpoint.consumedInputIds]), input.stepId, input.sessionId, input.turnId],
       )
       if (result.rowCount !== 1) throw new InputClaimStoreError("checkpoint_conflict", `Step ${input.stepId} checkpoint was not persisted`)
+    },
+    async appendObservedSteeringMarker(input) {
+      await assertOwner(client, scope, input, input.lease)
+      await persistObservedSteeringMarker(client, { userId: scope.userId, sessionId: input.sessionId, turnId: input.turnId, taskId: input.taskId, lease: input.lease ? { ownerId: input.lease.ownerId, now: input.lease.now } : undefined }, input)
     },
   }
 }

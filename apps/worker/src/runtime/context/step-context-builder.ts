@@ -2,6 +2,7 @@ import type { InputContentPart, TenantScope } from "@jobcopilot/agent-protocol"
 import type pg from "pg"
 
 import { InputClaimStoreError, type InputClaimStore, type InputClaimTransaction, type StepCheckpoint, type StoredAgentInput, type TurnExecutionFence } from "./input-claim-store.js"
+import { appendNewObservedSteeringMarkers, type SteeringMarkerContext } from "./steering-marker-store.js"
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { readonly [key: string]: JsonValue }
 export type ContextTrust = "system" | "user_confirmed" | "internal_record" | "external_untrusted"
@@ -191,6 +192,7 @@ export type StepContextRequest = {
   readonly rebuild?: boolean
   readonly lease?: TurnExecutionFence
   readonly now?: Date
+  readonly steeringMarkerContext?: SteeringMarkerContext
 }
 
 export class StepContextBuilder {
@@ -220,6 +222,7 @@ export class StepContextBuilder {
       if (previous && previous !== input.id) throw new InputClaimStoreError("checkpoint_conflict", `Duplicate accepted sequence ${input.acceptedSequence}`)
       sequences.set(input.acceptedSequence, input.id)
     }
+    if (request.steeringMarkerContext) await appendNewObservedSteeringMarkers({ transaction, sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId, context: request.steeringMarkerContext, inputs: claimed.inputs, newlyClaimedInputIds: claimed.newlyClaimedInputIds, rootInputId: request.rootInputId, lease: request.lease })
     for (const reference of [...request.snapshot.businessRefs].sort((left, right) => left.kind.localeCompare(right.kind) || left.id.localeCompare(right.id))) {
       id(reference.id, "business reference id")
       if (reference.ownerId !== request.scope.userId) throw new ContextOwnershipError("reference_owner_mismatch", `Reference ${reference.id} is outside the tenant scope`)

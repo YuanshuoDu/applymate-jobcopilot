@@ -4,6 +4,7 @@ import type { InputContentPart, TenantScope } from "@jobcopilot/agent-protocol"
 
 import type { ClaimInputsRequest, ClaimedInputs, InputClaimStore, InputClaimTransaction, StepCheckpoint, StoredAgentInput } from "./input-claim-store.js"
 import { ContextOwnershipError, createPgContextOwnerFence, StepContextBuilder, type BusinessReference, type ContextOwnerFence, type StepContextRequest } from "./step-context-builder.js"
+import { parseSteeringMarkerPayload } from "./steering-marker.js"
 
 const scope: TenantScope = { userId: "user-a" }
 const now = new Date("2026-09-01T16:00:00.000Z")
@@ -25,9 +26,9 @@ class FakeInputClaimStore implements InputClaimStore {
   readonly inputs: StoredAgentInput[]
   readonly checkpoints = new Map<string, StepCheckpoint>()
   readonly writes: string[] = []
+  readonly markerWrites: unknown[] = []
   private tail = Promise.resolve()
-
-  constructor(inputs: StoredAgentInput[], steps: Record<string, StepCheckpoint> = { "step-a": checkpoint() }) {
+  constructor(inputs: StoredAgentInput[], steps: Record<string, StepCheckpoint> = { "step-a": checkpoint() }, private readonly failCheckpoint = false) {
     this.inputs = inputs.map((item) => ({ ...item, content: [...item.content] }))
     for (const [stepId, value] of Object.entries(steps)) this.checkpoints.set(stepId, { inputThroughSequence: value.inputThroughSequence, consumedInputIds: [...value.consumedInputIds] })
   }
@@ -36,9 +37,11 @@ class FakeInputClaimStore implements InputClaimStore {
     const run = this.tail.then(async () => {
       const inputs = this.inputs.map((item) => ({ ...item, content: [...item.content] }))
       const steps = new Map([...this.checkpoints].map(([key, value]) => [key, { inputThroughSequence: value.inputThroughSequence, consumedInputIds: [...value.consumedInputIds] }]))
+      const markers = [...this.markerWrites]
       try { return await work(this.transaction()) } catch (error: unknown) {
         this.inputs.splice(0, this.inputs.length, ...inputs)
         this.checkpoints.clear(); for (const [key, value] of steps) this.checkpoints.set(key, value)
+        this.markerWrites.splice(0, this.markerWrites.length, ...markers)
         throw error
       }
     })
@@ -56,8 +59,14 @@ class FakeInputClaimStore implements InputClaimStore {
       claimInputs: async (request) => this.claim(request),
       persistCheckpoint: async ({ stepId, checkpoint: value }) => {
         if (!this.checkpoints.has(stepId)) throw new Error("missing step")
+        if (this.failCheckpoint) throw new Error("checkpoint failure")
         this.checkpoints.set(stepId, { inputThroughSequence: value.inputThroughSequence, consumedInputIds: [...value.consumedInputIds] })
         this.writes.push(`step:${stepId}`)
+      },
+      appendObservedSteeringMarker: async ({ payload }) => {
+        this.markerWrites.push(payload)
+        const marker = payload as { inputId?: unknown }
+        this.writes.push(`marker:${String(marker.inputId)}`)
       },
     }
   }
@@ -91,6 +100,37 @@ const testOwnerFence: ContextOwnerFence = {
 }
 
 describe("StepContextBuilder", () => {
+  it("writes observed steering markers between claim and checkpoint only for an active obligation", async () => {
+    const store = new FakeInputClaimStore([input("root-input", 1n, [{ type: "text", text: "goal" }]), input("steer-1", 2n, [{ type: "text", text: "Dublin" }])])
+    const context = await new StepContextBuilder(store).build(request(store, emptySnapshot, "step-a", {
+      rootInputId: "root-input", steeringMarkerContext: { taskId: "task-a", obligationId: "obligation-1", goalRevision: 1, planRevision: 1 },
+    }))
+    expect(context.consumedInputIds).toEqual(["root-input", "steer-1"])
+    expect(store.writes).toEqual(["marker:steer-1", "step:step-a"])
+    expect(parseSteeringMarkerPayload(store.markerWrites[0])).toMatchObject({ kind: "observed", inputId: "steer-1", taskId: "task-a", acceptedSequence: "2" })
+  })
+
+  it("does not write a second marker when the same step is retried or when no obligation exists", async () => {
+    const store = new FakeInputClaimStore([input("steer-1", 1n, [{ type: "text", text: "Dublin" }])])
+    const builder = new StepContextBuilder(store)
+    const markerContext = { taskId: "task-a", obligationId: "obligation-1", goalRevision: 1, planRevision: 1 }
+    await builder.build(request(store, emptySnapshot, "step-a", { steeringMarkerContext: markerContext }))
+    await builder.build(request(store, emptySnapshot, "step-a", { mode: "retry", steeringMarkerContext: markerContext }))
+    expect(store.markerWrites).toHaveLength(1)
+    const noObligation = new FakeInputClaimStore([input("steer-2", 2n, [{ type: "text", text: "Amsterdam" }])])
+    await new StepContextBuilder(noObligation).build(request(noObligation, emptySnapshot))
+    expect(noObligation.markerWrites).toHaveLength(0)
+  })
+
+  it("rolls back a marker and claim when checkpoint persistence fails", async () => {
+    const store = new FakeInputClaimStore([input("steer-1", 1n, [{ type: "text", text: "Dublin" }])], undefined, true)
+    await expect(new StepContextBuilder(store).build(request(store, emptySnapshot, "step-a", {
+      steeringMarkerContext: { taskId: "task-a", obligationId: "obligation-1", goalRevision: 1, planRevision: 1 },
+    }))).rejects.toThrow("checkpoint failure")
+    expect(store.markerWrites).toHaveLength(0)
+    expect(store.inputs[0]?.status).toBe("accepted")
+  })
+
   it("builds the same ordered, layered context on a retry", async () => {
     const store = new FakeInputClaimStore([input("input-1", 2n, [{ type: "text", text: "Only consider Dublin" }]), input("follow-up", 3n, [{ type: "text", text: "run later" }], { delivery: "follow_up" })])
     const snapshot = {

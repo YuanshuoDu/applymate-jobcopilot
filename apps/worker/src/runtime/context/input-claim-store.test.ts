@@ -4,11 +4,12 @@ import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 
 import { createPgInputClaimStore, type InputClaimTransaction } from "./input-claim-store.js"
+import { buildObservedSteeringMarker } from "./steering-marker-store.js"
 
 const scope = { userId: "user-a" }
 const createdAt = new Date("2026-09-01T16:00:00.000Z")
 
-type FakeOptions = { sessionStatus?: string; sessionVisible?: boolean; sessionUserId?: string; turnVisible?: boolean; failOn?: string }
+type FakeOptions = { sessionStatus?: string; sessionVisible?: boolean; sessionUserId?: string; turnVisible?: boolean; leaseValid?: boolean; failOn?: string }
 
 function row(overrides: Record<string, unknown> = {}) {
   return {
@@ -34,8 +35,13 @@ function makeClient(options: FakeOptions = {}) {
         return { rows: matched ? [{ id: "session-a" }] : [] }
       }
       if (text.includes('FROM "agent_turns"') && text.includes("FOR UPDATE")) {
-        return { rows: turnVisible ? [{ id: "turn-a" }] : [] }
+        return { rows: turnVisible && (options.leaseValid ?? true) ? [{ id: "turn-a" }] : [] }
       }
+      if (text.includes('FROM "sub_agent_tasks"')) return { rows: values[0] === "task-a" ? [{ id: "task-a" }] : [] }
+      if (text.startsWith('SELECT "id", "turnId", "taskId", "type", "actor", "correlationId", "payload", "sequence" FROM "agent_events"')) return { rows: [] }
+      if (text.startsWith("UPDATE \"agent_sessions\"")) return { rows: [{ eventSequence: "9" }] }
+      if (text.startsWith('INSERT INTO "agent_events"')) return { rowCount: 1, rows: [] }
+      if (text.startsWith('INSERT INTO "agent_outbox"')) return { rowCount: 1, rows: [] }
       if (text.includes('FROM "agent_steps"')) return { rows: [{ inputThroughSequence: "0", consumedInputIds: [] }] }
       if (text.includes("WITH candidates")) return { rows: [row({ id: "input-2", acceptedSequence: "5" })] }
       if (text.includes('FROM "agent_inputs"') && text.includes("FOR UPDATE")) return { rows: [] }
@@ -56,6 +62,63 @@ async function transaction(store: ReturnType<typeof createPgInputClaimStore>): P
 }
 
 describe("PostgreSQL AgentInput claim store", () => {
+  it("keeps claim, observed marker, and checkpoint in one ordered transaction", async () => {
+    const fake = makeClient()
+    const store = createPgInputClaimStore(fake.pool, scope)
+    await store.withTransaction(async (tx) => {
+      const checkpoint = await tx.getCheckpoint({ sessionId: "session-a", turnId: "turn-a", stepId: "step-a" })
+      const claimed = await tx.claimInputs({ sessionId: "session-a", turnId: "turn-a", stepId: "step-a", checkpoint, now: createdAt })
+      const input = claimed.inputs.find((item) => item.id === "input-2")
+      if (!input) throw new Error("fixture input missing")
+      const payload = buildObservedSteeringMarker({ sessionId: "session-a", turnId: "turn-a", stepId: "step-a", context: { taskId: "task-a", obligationId: "obligation-1", goalRevision: 1, planRevision: 1 }, markerInput: input })
+      await tx.appendObservedSteeringMarker?.({ sessionId: "session-a", turnId: "turn-a", taskId: "task-a", stepId: "step-a", payload })
+      await tx.persistCheckpoint({ sessionId: "session-a", turnId: "turn-a", stepId: "step-a", checkpoint: { inputThroughSequence: 5n, consumedInputIds: claimed.inputs.map((item) => item.id) } })
+    })
+    const marker = fake.calls.findIndex((call) => call.text.startsWith('INSERT INTO "agent_events"'))
+    const checkpoint = fake.calls.findIndex((call) => call.text.includes('UPDATE "agent_steps"'))
+    expect(marker).toBeGreaterThan(-1)
+    expect(marker).toBeLessThan(checkpoint)
+    expect(fake.calls.map((call) => call.text)).toContain("COMMIT")
+  })
+
+  it("rolls back claimed input and marker when the marker outbox fails", async () => {
+    const fake = makeClient({ failOn: 'INSERT INTO "agent_outbox"' })
+    const store = createPgInputClaimStore(fake.pool, scope)
+    await expect(store.withTransaction(async (tx) => {
+      const checkpoint = await tx.getCheckpoint({ sessionId: "session-a", turnId: "turn-a", stepId: "step-a" })
+      const claimed = await tx.claimInputs({ sessionId: "session-a", turnId: "turn-a", stepId: "step-a", checkpoint, now: createdAt })
+      const input = claimed.inputs.find((item) => item.id === "input-2")
+      if (!input) throw new Error("fixture input missing")
+      const payload = buildObservedSteeringMarker({ sessionId: "session-a", turnId: "turn-a", stepId: "step-a", context: { taskId: "task-a", obligationId: "obligation-1", goalRevision: 1, planRevision: 1 }, markerInput: input })
+      await tx.appendObservedSteeringMarker?.({ sessionId: "session-a", turnId: "turn-a", taskId: "task-a", stepId: "step-a", payload })
+    })).rejects.toThrow("fixture query failure")
+    expect(fake.client.query).toHaveBeenCalledWith("ROLLBACK")
+  })
+
+  it("rejects a marker for a foreign task before event writes", async () => {
+    const fake = makeClient()
+    const store = createPgInputClaimStore(fake.pool, scope)
+    const payload = buildObservedSteeringMarker({ sessionId: "session-a", turnId: "turn-a", stepId: "step-a", context: { taskId: "task-b", obligationId: "obligation-1", goalRevision: 1, planRevision: 1 }, markerInput: { id: "input-2", acceptedSequence: 5n } })
+    await expect(store.withTransaction((tx) => tx.appendObservedSteeringMarker!({ sessionId: "session-a", turnId: "turn-a", taskId: "task-b", stepId: "step-a", payload }))).rejects.toMatchObject({ code: "scope_conflict" })
+    expect(fake.calls.some((call) => call.text.startsWith('INSERT INTO "agent_events"'))).toBe(false)
+  })
+
+  it("rejects an observed marker when the active lease fence is invalid", async () => {
+    const fake = makeClient({ leaseValid: false })
+    const store = createPgInputClaimStore(fake.pool, scope)
+    const payload = buildObservedSteeringMarker({ sessionId: "session-a", turnId: "turn-a", stepId: "step-a", context: { taskId: "task-a", obligationId: "obligation-1", goalRevision: 1, planRevision: 1 }, markerInput: { id: "input-2", acceptedSequence: 5n } })
+    await expect(store.withTransaction((tx) => tx.appendObservedSteeringMarker!({ sessionId: "session-a", turnId: "turn-a", taskId: "task-a", stepId: "step-a", payload, lease: { ownerId: "wrong-owner", leaseVersion: 9, now: createdAt } }))).rejects.toMatchObject({ code: "owner_conflict" })
+    expect(fake.calls.some((call) => call.text.startsWith('INSERT INTO "agent_events"'))).toBe(false)
+  })
+
+  it("rejects an observed marker for a foreign Turn before task validation", async () => {
+    const fake = makeClient()
+    const store = createPgInputClaimStore(fake.pool, scope)
+    const payload = buildObservedSteeringMarker({ sessionId: "session-b", turnId: "turn-a", stepId: "step-a", context: { taskId: "task-a", obligationId: "obligation-1", goalRevision: 1, planRevision: 1 }, markerInput: { id: "input-2", acceptedSequence: 5n } })
+    await expect(store.withTransaction((tx) => tx.appendObservedSteeringMarker!({ sessionId: "session-b", turnId: "turn-a", taskId: "task-a", stepId: "step-a", payload }))).rejects.toMatchObject({ code: "owner_conflict" })
+    expect(fake.calls.some((call) => call.text.includes('FROM "sub_agent_tasks"'))).toBe(false)
+  })
+
   it("uses tenant-fenced, FIFO row locks and one transaction for claim/checkpoint", async () => {
     const fake = makeClient()
     await transaction(createPgInputClaimStore(fake.pool, scope))
