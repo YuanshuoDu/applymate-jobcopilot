@@ -68,6 +68,25 @@ function steeringMarkerRow(sequence: bigint, kind: "observed" | "applied") {
   }
 }
 
+function planRevisionPayload(overrides: Record<string, unknown> = {}) {
+  return { planCallId: "plan-call-1", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, ...overrides }
+}
+
+function planCommandPayload(overrides: Record<string, unknown> = {}) {
+  return {
+    planCallId: "plan-call-1", planRevision: 1, observationId: "observation-1",
+    content: { kind: "plan_command", localId: "step-1", commandKind: "tool_call", dependsOn: [], status: "completed", errorCode: null, output: { secret: "private output" } },
+    ...overrides,
+  }
+}
+
+function planRow(sequence: bigint, type: "plan.revision" | "plan.command" | "plan.observation", payload: unknown, overrides: Record<string, unknown> = {}) {
+  return {
+    id: `plan_${sequence}`, sessionId: "session_1", turnId: "turn_1", itemId: null, taskId: "task_1", sequence,
+    type, actor: "orchestrator", correlationId: "plan-call-1", causationId: null, idempotencyKey: null, payload, ...overrides,
+  }
+}
+
 describe("agent timeline query API", () => {
   beforeEach(() => {
     vi.resetModules()
@@ -146,6 +165,48 @@ describe("agent timeline query API", () => {
     expect(mocks.agendaFindMany).not.toHaveBeenCalled()
   })
 
+  it("restores bounded legal plan receipts in durable sequence order after redaction", async () => {
+    mocks.agendaFindMany.mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([
+      planRow(BigInt(3), "plan.command", planCommandPayload()),
+      planRow(BigInt(2), "plan.revision", planRevisionPayload()),
+    ])
+    const { GET } = await import("./route")
+
+    const response = await GET(request() as never, params)
+    const body = await response.json()
+
+    expect(body.planEvents.map((event: { id: string }) => event.id)).toEqual(["plan_2", "plan_3"])
+    expect(body.planEvents[1].payload.content.output).toBeUndefined()
+    expect(JSON.stringify(body.planEvents)).not.toContain("private output")
+    expect(mocks.agendaFindMany).toHaveBeenNthCalledWith(3, {
+      where: { sessionId: "session_1", type: { in: ["plan.revision", "plan.command", "plan.observation"] } },
+      orderBy: { sequence: "desc" }, take: 272, select: expect.objectContaining({ payload: true, sequence: true }),
+    })
+  })
+
+  it("fails closed for foreign, malformed, wrong-scope, and oversized plan receipts", async () => {
+    mocks.agendaFindMany.mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([
+      planRow(BigInt(1), "plan.revision", planRevisionPayload()),
+      planRow(BigInt(2), "plan.command", planCommandPayload(), { sessionId: "session_2" }),
+      planRow(BigInt(3), "plan.command", planCommandPayload(), { itemId: "item_1" }),
+      planRow(BigInt(4), "plan.command", planCommandPayload(), { actor: "system" }),
+      planRow(BigInt(5), "plan.command", { ...planCommandPayload(), content: { kind: "unsupported", localId: "step-2" } }),
+      planRow(BigInt(6), "plan.command", planCommandPayload({ content: { ...planCommandPayload().content, output: { data: "x".repeat(9_000) } } })),
+      planRow(BigInt(7), "plan.command", planCommandPayload({ content: { ...planCommandPayload().content, output: "malformed output" } })),
+      planRow(BigInt(8), "plan.command", planCommandPayload({ content: { ...planCommandPayload().content, errorCode: 42 } })),
+      planRow(BigInt(9), "plan.observation", {
+        planCallId: "plan-call-1", planRevision: 1, observationId: "observation-9",
+        content: { kind: "plan_control", localId: "step-9", status: "completion_proposed", dependsOn: [], completionCriteria: "malformed criteria" },
+      }),
+    ])
+    const { GET } = await import("./route")
+
+    const response = await GET(request() as never, params)
+    const body = await response.json()
+
+    expect(body.planEvents.map((event: { id: string }) => event.id)).toEqual(["plan_1"])
+  })
+
   it("restores only a legal bounded marker pair after the authenticated session check", async () => {
     mocks.agendaFindMany.mockResolvedValueOnce([]).mockResolvedValueOnce([
       steeringMarkerRow(BigInt(11), "applied"), steeringMarkerRow(BigInt(10), "observed"),
@@ -169,7 +230,9 @@ describe("agent timeline query API", () => {
     const { GET } = await import("./route")
 
     const response = await GET(request() as never, params)
-    await expect(response.json()).resolves.toMatchObject({ items: [], page: { hasMore: false }, agenda: null })
+    const body = await response.json()
+    expect(body).toMatchObject({ items: [], page: { hasMore: false }, agenda: null })
+    expect(body.planEvents).toBeUndefined()
   })
 
   it("returns auth errors without querying the session", async () => {

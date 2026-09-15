@@ -5,6 +5,7 @@ import { db } from "@/lib/db"
 import { isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { redactStreamValue } from "@/lib/agent/session/stream-redaction"
 import { parseCognitiveAgendaReceipt, type CognitiveAgendaScope } from "@/components/agent-workspace/v2/cognitive-agenda-view"
+import { isPlanLedgerEventType, parsePlanLedgerEvent, PLAN_LEDGER_EVENT_TYPES, PLAN_LEDGER_MAX_COMMAND_RECEIPT_BYTES, PLAN_LEDGER_MAX_PLANS, PLAN_LEDGER_MAX_RECEIPT_BYTES, PLAN_LEDGER_MAX_STEPS } from "@/components/agent-workspace/v2/timeline-plan-ledger"
 import { parseSteeringMarkerEvent, reduceTimelineSteeringMarkers, type TimelineSteeringMarkerEvent } from "@/components/agent-workspace/v2/timeline-steering-markers"
 
 import {
@@ -41,6 +42,8 @@ const AGENDA_SELECT = {
   type: true, actor: true, correlationId: true, causationId: true, idempotencyKey: true, payload: true,
 } as const
 
+const PLAN_LEDGER_QUERY_LIMIT = PLAN_LEDGER_MAX_PLANS * (1 + PLAN_LEDGER_MAX_STEPS * 2)
+
 export async function GET(request: NextRequest, context: RouteContext) {
   const auth = await requireAuth(request)
   if (isErrorResponse(auth)) return auth
@@ -64,10 +67,16 @@ export async function GET(request: NextRequest, context: RouteContext) {
   const agendas = page.cursor === null ? await recentAgendas(sessionId) : []
   const agenda = page.cursor === null ? agendas[agendas.length - 1] ?? null : null
   const steeringMarkers = page.cursor === null ? await latestSteeringMarkers(sessionId) : []
+  const planEvents = page.cursor === null ? await recentPlanEvents(sessionId) : []
   return ok({
     items: result.rows.map(itemDto),
     page: result.page,
-    ...(page.cursor === null ? { agenda, ...(agendas.length > 0 ? { agendas } : {}), ...(steeringMarkers.length > 0 ? { steeringMarkers } : {}) } : {}),
+    ...(page.cursor === null ? {
+      agenda,
+      ...(agendas.length > 0 ? { agendas } : {}),
+      ...(steeringMarkers.length > 0 ? { steeringMarkers } : {}),
+      ...(planEvents.length > 0 ? { planEvents } : {}),
+    } : {}),
   })
 }
 
@@ -94,6 +103,82 @@ async function latestSteeringMarkers(sessionId: string): Promise<readonly Timeli
   }).reverse()
   const reduced = reduceTimelineSteeringMarkers(events, { sessionId })
   return reduced.valid ? events : []
+}
+
+async function recentPlanEvents(sessionId: string) {
+  const rows = await db.agentEvent.findMany({
+    where: { sessionId, type: { in: [...PLAN_LEDGER_EVENT_TYPES] } },
+    orderBy: { sequence: "desc" },
+    take: PLAN_LEDGER_QUERY_LIMIT,
+    select: AGENDA_SELECT,
+  }) as AgendaQueryRow[]
+  const envelopes = rows.flatMap(row => {
+    const envelope = planEnvelope(row, sessionId)
+    return envelope ? [envelope] : []
+  })
+  const revisionScopes = new Set(envelopes.filter(event => event.type === "plan.revision").map(planScopeKey))
+  return envelopes
+    .filter(event => revisionScopes.has(planScopeKey(event)))
+    .sort((left, right) => compareDecimalSequence(left.sequence, right.sequence) || left.id.localeCompare(right.id))
+}
+
+function planEnvelope(row: AgendaQueryRow, sessionId: string) {
+  const sequence = typeof row.sequence === "bigint" ? row.sequence.toString() : typeof row.sequence === "string" ? row.sequence : ""
+  if (row.sessionId !== sessionId || row.itemId !== null || typeof row.turnId !== "string" || typeof row.taskId !== "string" ||
+    (row.actor !== "orchestrator" && row.actor !== "subagent") || !isPlanLedgerEventType(row.type) ||
+    !/^(0|[1-9]\d*)$/.test(sequence) || sequence.length > 39) return null
+  const rawPayloadBytes = encodedJsonBytes(row.payload)
+  const maxPayloadBytes = row.type === "plan.revision" ? PLAN_LEDGER_MAX_RECEIPT_BYTES : PLAN_LEDGER_MAX_COMMAND_RECEIPT_BYTES
+  if (rawPayloadBytes === null || rawPayloadBytes > maxPayloadBytes) return null
+  const candidate = {
+    schemaVersion: AGENT_STREAM_SCHEMA_VERSION,
+    id: row.id,
+    sessionId: row.sessionId,
+    turnId: row.turnId,
+    itemId: null,
+    taskId: row.taskId,
+    type: row.type,
+    actor: row.actor,
+    sequence,
+    payload: row.payload,
+  }
+  if (!parsePlanLedgerEvent(candidate, sessionId)) return null
+  const envelope = { ...candidate, payload: redactedPlanPayload(row.payload) }
+  return parsePlanLedgerEvent(envelope, sessionId) ? envelope : null
+}
+
+function redactedPlanPayload(value: unknown): unknown {
+  const redacted = redactStreamValue(value)
+  if (!isRecord(value) || !isRecord(redacted) || !isRecord(value.content)) return redacted
+  const content = redactStreamValue(value.content)
+  if (!isRecord(content)) return redacted
+  const safeContent = { ...content }
+  delete safeContent.output
+  if (Object.prototype.hasOwnProperty.call(safeContent, "errorCode")) safeContent.errorCode = null
+  if (Array.isArray(value.content.dependsOn)) safeContent.dependsOn = value.content.dependsOn.map((_, index) => `dependency-${index + 1}`)
+  if (safeContent.kind === "plan_control" && safeContent.status === "waiting_for_user") delete safeContent.approvalBoundary
+  if (safeContent.kind === "plan_control" && safeContent.status === "completion_proposed") safeContent.completionCriteria = ["[REDACTED]"]
+  if (safeContent.kind === "plan_control" && safeContent.status === "replan_required") safeContent.failedTaskIds = []
+  return { ...redacted, content: safeContent }
+}
+
+function planScopeKey(event: { turnId: string; taskId: string }): string {
+  return `${event.turnId}\u0000${event.taskId}`
+}
+
+function compareDecimalSequence(left: string, right: string): number {
+  const leftValue = BigInt(left)
+  const rightValue = BigInt(right)
+  return leftValue === rightValue ? 0 : leftValue < rightValue ? -1 : 1
+}
+
+function encodedJsonBytes(value: unknown): number | null {
+  try {
+    const encoded = JSON.stringify(value)
+    return encoded === undefined ? null : new TextEncoder().encode(encoded).byteLength
+  } catch {
+    return null
+  }
 }
 
 function markerEnvelope(row: SteeringMarkerQueryRow, sessionId: string): TimelineSteeringMarkerEvent | null {

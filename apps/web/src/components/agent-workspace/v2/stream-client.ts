@@ -9,6 +9,7 @@ interface TimelinePageResponse {
   agenda?: unknown
   agendas?: unknown[]
   steeringMarkers?: unknown[]
+  planEvents?: unknown[]
 }
 
 export interface TimelineStreamClientOptions {
@@ -32,6 +33,7 @@ export async function hydrateTimeline(options: Pick<TimelineStreamClientOptions,
   let agenda: unknown = undefined
   let agendas: unknown[] | undefined
   let steeringMarkers: unknown[] | undefined
+  let planEvents: unknown[] | undefined
   let cursor: string | null = null
   do {
     const query = new URLSearchParams({ limit: String(options.pageSize ?? DEFAULT_PAGE_SIZE) })
@@ -43,10 +45,13 @@ export async function hydrateTimeline(options: Pick<TimelineStreamClientOptions,
     if (cursor === null && page.agenda !== undefined && page.agenda !== null) agenda = page.agenda
     if (cursor === null && Array.isArray(page.agendas)) agendas = page.agendas
     if (cursor === null && Array.isArray(page.steeringMarkers)) steeringMarkers = page.steeringMarkers
+    if (cursor === null && Array.isArray(page.planEvents)) planEvents = page.planEvents
     cursor = page.page?.hasMore === true && typeof page.page.nextCursor === 'string' ? page.page.nextCursor : null
   } while (cursor && !options.signal?.aborted)
   const agendaTail = agendas ?? (agenda === undefined || agenda === null ? [] : [agenda])
-  const tail = [...agendaTail, ...(steeringMarkers ?? [])].filter((value): value is unknown => value !== undefined && value !== null).sort(compareTailEvents)
+  const tail = [...agendaTail, ...(steeringMarkers ?? []), ...(planEvents ?? [])]
+    .filter((value): value is unknown => value !== undefined && value !== null)
+    .sort(compareTailEvents)
   options.dispatch(tail.length === 0 ? { type: 'hydrate', items } : { type: 'hydrate', items, tail })
 }
 
@@ -147,13 +152,19 @@ function compareTailEvents(left: unknown, right: unknown): number {
     if (bySequence !== 0) return bySequence
   } else if (leftSequence !== null) return -1
   else if (rightSequence !== null) return 1
-  return 0
+  return tailId(left).localeCompare(tailId(right))
 }
 
 function tailSequence(value: unknown): string | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const sequence = (value as { sequence?: unknown }).sequence
   return typeof sequence === 'string' && /^(0|[1-9]\d*)$/.test(sequence) && sequence.length <= 39 ? sequence : null
+}
+
+function tailId(value: unknown): string {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return ''
+  const id = (value as { id?: unknown }).id
+  return typeof id === 'string' ? id : ''
 }
 
 interface SseFrame { event: string; id: string | null; data: unknown }

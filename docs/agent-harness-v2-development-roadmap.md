@@ -2044,3 +2044,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Root reran the V2 suite at **110/110 tests across 27 files**, Web `tsc --noEmit --skipLibCheck`, and `git diff --check`. New coverage includes strict receipt redaction, malformed/foreign/stale rejection, goal-epoch reset, bounded retention, timeline folding, hook projection, and card rendering.
 
 **Candidate boundary:** The first implementation relies on the existing V2 SSE durable replay and does not yet add plan rows to the authenticated timeline hydration response. Live PostgreSQL/RLS, SSE reconnect/overflow, process restart, Worker/Redis delivery, provider/browser behavior, deployment, and complete end-to-end session evidence remain unverified. The cognitive loop and production feature flags remain disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance.
+
+## 83. P7-4 — Plan ledger hydration and replay ordering
+
+**Candidate status/date (2026-09-15):** P7-4 is recorded as a candidate durable restore projection slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** The authenticated first-page timeline route now queries a bounded tail of existing `plan.revision`, `plan.command`, and `plan.observation` events. Each raw envelope is strictly validated before redaction, then parsed again after sensitive output, error text, dependency identities, completion criteria, and approval boundaries are removed or neutralized. Only scopes with a valid revision are returned, in durable sequence order; wrong tenant/scope, actor/item, malformed, oversized, unsupported, and revisionless rows are omitted. `hydrateTimeline` reads the optional first-page `planEvents` field, merges it with agenda and steering-marker tails by decimal sequence and stable ID, and feeds the existing reducer without adding a subscription or side effect.
+
+**Independent verification:** Root reran the route and stream suites at **21/21**, the full V2 suite at **112/112 across 27 files**, Web `tsc --noEmit --skipLibCheck`, and `git diff --check`. Coverage includes bounded query shape, ascending output, raw/sanitized strict parsing, redaction, malformed rejection, first-page-only hydration, stable tie ordering, and legacy response compatibility.
+
+**Candidate boundary:** No live PostgreSQL/RLS query, production SSE reconnect/overflow, process restart, Worker/Redis delivery, provider/browser behavior, deployment, or complete end-to-end session evidence was added. The cognitive loop and production feature flags remain disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance.

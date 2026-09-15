@@ -86,6 +86,25 @@ function steeringMarkerEvent(sequence: string, kind: 'observed' | 'applied' = 'o
   }
 }
 
+function planRevisionEvent(sequence = '5') {
+  return {
+    schemaVersion: 'agent-harness.v2', id: `plan-revision-${sequence}`, sessionId: 'session-1', turnId: 'turn-1', itemId: null, taskId: 'task-1',
+    type: 'plan.revision', actor: 'orchestrator', sequence,
+    payload: { planCallId: 'plan-call-1', goalRevision: 1, planRevision: 1, basedOnPlanRevision: null },
+  }
+}
+
+function planCommandEvent(sequence = '6') {
+  return {
+    schemaVersion: 'agent-harness.v2', id: `plan-command-${sequence}`, sessionId: 'session-1', turnId: 'turn-1', itemId: null, taskId: 'task-1',
+    type: 'plan.command', actor: 'orchestrator', sequence,
+    payload: {
+      planCallId: 'plan-call-1', planRevision: 1, observationId: 'observation-1',
+      content: { kind: 'plan_command', localId: 'step-1', commandKind: 'tool_call', dependsOn: [], status: 'completed', errorCode: null },
+    },
+  }
+}
+
 describe('V2 timeline stream client', () => {
   it('hydrates every timeline page before attaching the stream', async () => {
     const dispatch = vi.fn()
@@ -129,6 +148,36 @@ describe('V2 timeline stream client', () => {
     expect(state.steeringMarkers).toMatchObject({ observedCount: 1, appliedCount: 1, activeCount: 0 })
     expect(state.events.map(event => event.id)).toEqual(['agenda-7', 'marker-10', 'marker-11'])
     expect(state.itemsById['item-1']).toMatchObject({ status: 'streaming' })
+  })
+
+  it('hydrates plan receipts only from the first page and folds them with the existing tail', async () => {
+    let state: TimelineState = createTimelineState('session-1')
+    const dispatch = (action: TimelineAction) => { state = timelineReducer(state, action) }
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(JSON.stringify({
+      items: [], page: { hasMore: true, nextCursor: 'next' },
+      planEvents: [planCommandEvent(), planRevisionEvent()], agenda: agendaEvent({ sequence: '7' }),
+    }))).mockResolvedValueOnce(new Response(JSON.stringify({
+      items: [], page: { hasMore: false, nextCursor: null }, planEvents: [planCommandEvent('8')], steeringMarkers: [steeringMarkerEvent('9')],
+    })))
+
+    await hydrateTimeline({ sessionId: 'session-1', dispatch, fetcher })
+
+    expect(state.events.map(event => event.id)).toEqual(['plan-revision-5', 'plan-command-6', 'agenda-7'])
+    expect(state.planLedger.currentPlan).toMatchObject({ planRevision: 1, steps: [{ localId: 'step-1', actionKind: 'tool_call', status: 'completed' }] })
+    expect(state.events.some(event => event.id === 'plan-command-8')).toBe(false)
+    expect(fetcher).toHaveBeenCalledTimes(2)
+  })
+
+  it('uses event id as the stable tie-breaker for first-page tail events', async () => {
+    const dispatch = vi.fn()
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(JSON.stringify({
+      items: [], page: { hasMore: false, nextCursor: null }, agenda: { id: 'z-event', sequence: '7' },
+      planEvents: [{ id: 'a-event', sequence: '7' }],
+    })))
+
+    await hydrateTimeline({ sessionId: 'session-1', dispatch, fetcher })
+
+    expect(dispatch).toHaveBeenCalledWith({ type: 'hydrate', items: [], tail: [{ id: 'a-event', sequence: '7' }, { id: 'z-event', sequence: '7' }] })
   })
 
   it('hydrates all first-page task agendas and markers through one sequence-sorted tail', async () => {
