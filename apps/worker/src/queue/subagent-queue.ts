@@ -22,30 +22,21 @@ export function subagentJobId(taskId: string, generation = 0): string {
   return `agent-subagent-${Buffer.from(taskId, "utf8").toString("base64url")}-${generation}`
 }
 export function subagentDispatchKey(taskId: string): string { return `subagent-dispatch:${taskId}` }
-
 export async function enqueueSubagentTask(queue: SubagentQueueLike, payload: SubagentJobPayload, attempts = 3, generation = 0): Promise<void> {
   if (!parseSubagentJobPayload(payload)) throw new TypeError("Invalid Subagent queue payload"); await queue.add("subagent", payload, { jobId: subagentJobId(payload.taskId, generation), attempts })
 }
-
 async function transaction<T>(pool: PgSubagentPool, work: (client: pg.PoolClient) => Promise<T>): Promise<T> {
   const client = await pool.connect()
   try { await client.query("BEGIN"); const value = await work(client); await client.query("COMMIT"); return value }
   catch (error: unknown) { await client.query("ROLLBACK").catch(() => undefined); throw error }
   finally { client.release() }
 }
-
 async function lockRunnableDispatchSession(client: Pick<pg.PoolClient, "query">, sessionId: string): Promise<{ id: string; status: string; userId: string } | undefined> {
-  const result = await client.query<{ id: string; status: string; userId: string }>(`SELECT session."id", session."status", session."userId" FROM "agent_sessions" AS session
-    WHERE session."id" = $1 AND ${RUNNABLE_SESSION} FOR UPDATE`, [sessionId])
-  return result.rows[0]
+  const result = await client.query<{ id: string; status: string; userId: string }>(`SELECT session."id", session."status", session."userId" FROM "agent_sessions" AS session WHERE session."id" = $1 AND ${RUNNABLE_SESSION} FOR UPDATE`, [sessionId]); return result.rows[0]
 }
-
 async function lockOpenDispatchSession(client: Pick<pg.PoolClient, "query">, sessionId: string): Promise<{ id: string } | undefined> {
-  const result = await client.query<{ id: string }>(`SELECT session."id" FROM "agent_sessions" AS session
-    WHERE session."id" = $1 AND ${OPEN_SESSION} FOR UPDATE`, [sessionId])
-  return result.rows[0]
+  const result = await client.query<{ id: string }>(`SELECT session."id" FROM "agent_sessions" AS session WHERE session."id" = $1 AND ${OPEN_SESSION} FOR UPDATE`, [sessionId]); return result.rows[0]
 }
-
 export async function persistSubagentDispatch(pool: PgSubagentPool, payload: SubagentJobPayload, resetPublished = false): Promise<void> {
   await transaction(pool, async client => {
     const sessionFence = resetPublished ? RUNNABLE_SESSION : OPEN_SESSION
@@ -63,7 +54,6 @@ export async function persistSubagentDispatch(pool: PgSubagentPool, payload: Sub
     [randomUUID(), SUBAGENT_DISPATCH_TOPIC, payload.sessionId, subagentDispatchKey(payload.taskId), JSON.stringify(payload)])
   })
 }
-
 /** Repairs runnable task rows that lost their durable dispatch intent. */
 export async function repairMissingSubagentDispatches(pool: PgSubagentPool, ownerId: string, limit = SUBAGENT_MAX_BATCH): Promise<number> {
   if (!Number.isInteger(limit) || limit < 1) throw new RangeError("Subagent dispatch limit must be positive")
@@ -128,7 +118,6 @@ export async function repairMissingSubagentDispatches(pool: PgSubagentPool, owne
     return repaired
   })
 }
-
 export async function dispatchPendingSubagentOutbox(pool: PgSubagentPool, queue: SubagentQueueLike, limit = SUBAGENT_MAX_BATCH): Promise<number> {
   if (!Number.isInteger(limit) || limit < 1) throw new RangeError("Subagent dispatch limit must be positive")
   const rows = await transaction(pool, async client => {
@@ -210,7 +199,6 @@ export async function dispatchPendingSubagentOutbox(pool: PgSubagentPool, queue:
   }
   return dispatched
 }
-
 async function markDispatchError(pool: PgSubagentPool, id: string, error: string, terminal = false): Promise<void> {
   const client = await pool.connect()
   try { await client.query(`UPDATE "agent_outbox" SET "attemptCount" = "attemptCount" + 1,
@@ -218,7 +206,6 @@ async function markDispatchError(pool: PgSubagentPool, id: string, error: string
     WHERE "id" = $1 AND "publishedAt" IS NULL`, [id, error, terminal]) }
   finally { client.release() }
 }
-
 export async function recoverSubagentQueue(pool: PgSubagentPool, queue: SubagentQueueLike, manager: AgentTreeManager, limit = SUBAGENT_MAX_BATCH): Promise<{ reclaimed: number; terminal: number; repaired: number; dispatched: number }> {
   const report = await manager.recover(limit)
   for (const task of report.rows) {
@@ -230,13 +217,7 @@ export async function recoverSubagentQueue(pool: PgSubagentPool, queue: Subagent
   const dispatched = await dispatchPendingSubagentOutbox(pool, queue, limit)
   return { reclaimed: report.reclaimed, terminal: report.terminal, repaired, dispatched }
 }
-
-export function startSubagentRecoveryScanner(
-  pool: PgSubagentPool = getPool(),
-  queue: SubagentQueueLike,
-  manager: AgentTreeManager,
-  intervalMs = SUBAGENT_DISPATCH_POLL_MS,
-) {
+export function startSubagentRecoveryScanner(pool: PgSubagentPool = getPool(), queue: SubagentQueueLike, manager: AgentTreeManager, intervalMs = SUBAGENT_DISPATCH_POLL_MS) {
   if (!Number.isInteger(intervalMs) || intervalMs < 1) throw new RangeError("Recovery interval must be positive")
   let closed = false
   let inFlight: Promise<unknown> | null = null
@@ -258,7 +239,6 @@ export function startSubagentRecoveryScanner(
     },
   }
 }
-
 export function createSubagentQueue(options: { manager: AgentTreeManager; execute: SubagentExecutor; queue?: SubagentQueueLike }): { queue: SubagentQueueLike; worker: Worker<SubagentJobPayload>; close: () => Promise<void> } {
   const queue = options.queue ?? new Queue<SubagentJobPayload>(SUBAGENT_QUEUE_NAME, { connection: redisConnection, skipVersionCheck: true })
   const worker = new Worker<SubagentJobPayload>(SUBAGENT_QUEUE_NAME, async (job: Pick<Job<SubagentJobPayload>, "data">) => {
