@@ -2,6 +2,7 @@ import type { HarnessModelRequest, ModelContinuation, ModelMessage } from "@jobc
 import type { ModelCapabilityProfile, ModelAdapter } from "@jobcopilot/agent-model"
 
 import type { StepContext } from "../context/step-context-builder.js"
+import { buildCognitiveActionAgenda, cognitiveActionAgendaText } from "./cognitive-action-agenda.js"
 import { buildCognitiveControlFrame, cognitiveControlFrameText } from "./cognitive-control-frame.js"
 import { buildCognitiveMemoryRecall, cognitiveMemoryRecallText } from "./cognitive-memory-recall.js"
 
@@ -30,6 +31,7 @@ export function contextToModelMessages(context: StepContext, replanRequired = fa
   messages.push({ role: "system", content: [{ type: "text", text: cognitiveControlFrameText(buildCognitiveControlFrame(context, { replanRequired, freshSteering })) }] })
   const memoryRecall = buildCognitiveMemoryRecall(context)
   if (memoryRecall) messages.push({ role: "system", content: [{ type: "text", text: cognitiveMemoryRecallText(memoryRecall) }] })
+  messages.push({ role: "system", content: [{ type: "text", text: cognitiveActionAgendaText(buildCognitiveActionAgenda(context, { replanRequired, freshSteering })) }] })
   for (const block of context.blocks) {
     const observation = block.layer === "tool_observation" ? asToolObservation(block.content) : null
     if (observation) {

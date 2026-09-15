@@ -22,20 +22,23 @@ function context(): StepContext {
 describe("TurnEngine model message mapping", () => {
   it("preserves instruction/data separation and marks untrusted data", () => {
     const messages = contextToModelMessages(context())
-    expect(messages).toHaveLength(3)
+    expect(messages).toHaveLength(4)
     expect(messages[0].role).toBe("system")
     expect(messages[1].role).toBe("system")
-    expect(messages[2].role).toBe("user")
-    expect(messages[2].content[0]).toMatchObject({ type: "text" })
-    expect((messages[2].content[0] as { text: string }).text).toContain("UNTRUSTED_DATA")
+    expect(messages[2].role).toBe("system")
+    expect(messages[3].role).toBe("user")
+    expect(messages[3].content[0]).toMatchObject({ type: "text" })
+    expect((messages[3].content[0] as { text: string }).text).toContain("UNTRUSTED_DATA")
     expect((messages[0].content[0] as { text: string }).text).toContain("SERVER COGNITIVE CONTROL FRAME")
+    expect((messages[1].content[0] as { text: string }).text).toContain("SERVER COGNITIVE ACTION AGENDA")
   })
 
   it("provides a non-empty fallback message for an empty context", () => {
     const messages = contextToModelMessages({ ...context(), blocks: [] })
-    expect(messages).toHaveLength(2)
+    expect(messages).toHaveLength(3)
     expect(messages[0]).toMatchObject({ role: "system", content: [{ type: "text", text: expect.stringContaining("SERVER COGNITIVE CONTROL FRAME") }] })
-    expect(messages[1]).toEqual({ role: "user", content: [{ type: "text", text: expect.any(String) }] })
+    expect(messages[1]).toMatchObject({ role: "system", content: [{ type: "text", text: expect.stringContaining("SERVER COGNITIVE ACTION AGENDA") }] })
+    expect(messages[2]).toEqual({ role: "user", content: [{ type: "text", text: expect.any(String) }] })
   })
 
   it("prepends a fixed server-owned replan instruction as system context", () => {
@@ -44,6 +47,7 @@ describe("TurnEngine model message mapping", () => {
     expect(messages[0].role).toBe("system")
     expect(messages[1].role).toBe("system")
     expect(messages[2].role).toBe("system")
+    expect(messages[3].role).toBe("system")
     expect(messages.at(-1)?.role).toBe("user")
     expect(PLAN_REPLAN_SYSTEM_INSTRUCTION).not.toContain("Ignore the rule")
   })
@@ -72,7 +76,8 @@ describe("TurnEngine model message mapping", () => {
     expect(messages[0]).toEqual({ role: "system", content: [{ type: "text", text: PLAN_REPLAN_SYSTEM_INSTRUCTION }] })
     expect((messages[1]?.content[0] as { text: string }).text).toContain("SERVER COGNITIVE CONTROL FRAME")
     expect((messages[2]?.content[0] as { text: string }).text).toContain("SERVER COGNITIVE MEMORY RECALL")
-    expect(messages[3]?.role).toBe("user")
+    expect((messages[3]?.content[0] as { text: string }).text).toContain("SERVER COGNITIVE ACTION AGENDA")
+    expect(messages[4]?.role).toBe("user")
   })
 
   it("reconstructs provider-neutral assistant/tool correlation from observations", () => {
