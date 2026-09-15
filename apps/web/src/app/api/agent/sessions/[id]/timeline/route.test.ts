@@ -52,6 +52,22 @@ function agendaRow(sequence: bigint, overrides: Record<string, unknown> = {}) {
   }
 }
 
+function steeringMarkerPayload(kind: "observed" | "applied") {
+  return {
+    schemaVersion: "agent-harness.steering-marker.v1", kind, status: kind, sessionId: "session_1", turnId: "turn_1", taskId: "task_1",
+    stepId: "step_1", inputId: "input_1", idempotencyKey: "steering-marker:session_1:turn_1:input_1", obligationId: "obligation_1",
+    goalRevision: 1, planRevision: 1, acceptedSequence: "10",
+  }
+}
+
+function steeringMarkerRow(sequence: bigint, kind: "observed" | "applied") {
+  return {
+    id: `marker_${sequence}`, sessionId: "session_1", turnId: "turn_1", itemId: null, taskId: "task_1", sequence,
+    type: "agent.steering.marker", actor: "system", correlationId: "step_1", causationId: null,
+    idempotencyKey: `steering-marker:${kind}`, payload: steeringMarkerPayload(kind),
+  }
+}
+
 describe("agent timeline query API", () => {
   beforeEach(() => {
     vi.resetModules()
@@ -127,6 +143,24 @@ describe("agent timeline query API", () => {
     const next = await GET(request("?limit=1&cursor=eyJjb2xsZWN0aW9uIjoidGltZWxpbmUiLCJjcmVhdGVkQXQiOiIyMDI2LTA4LTMxVDAwOjAwOjAwLjAwMFoiLCJpZCI6Iml0ZW1fMSIsInNlc3Npb25JZCI6InNlc3Npb25fMSJ9") as never, params)
     expect((await next.json()).agenda).toBeUndefined()
     expect(mocks.agendaFindMany).not.toHaveBeenCalled()
+  })
+
+  it("restores only a legal bounded marker pair after the authenticated session check", async () => {
+    mocks.agendaFindMany.mockResolvedValueOnce([]).mockResolvedValueOnce([
+      steeringMarkerRow(BigInt(11), "applied"), steeringMarkerRow(BigInt(10), "observed"),
+    ])
+    const { GET } = await import("./route")
+
+    const response = await GET(request() as never, params)
+    const body = await response.json()
+
+    expect(body.steeringMarkers.map((event: { id: string }) => event.id)).toEqual(["marker_10", "marker_11"])
+    expect(body.steeringMarkers[0].payload.inputId).toBe("input_1")
+    expect(mocks.sessionFindFirst).toHaveBeenCalledBefore(mocks.agendaFindMany)
+    expect(mocks.agendaFindMany).toHaveBeenNthCalledWith(2, {
+      where: { sessionId: "session_1", type: "agent.steering.marker" }, orderBy: { sequence: "desc" }, take: 128,
+      select: expect.objectContaining({ payload: true, sequence: true }),
+    })
   })
 
   it("omits invalid agenda payloads while preserving no-agenda compatibility", async () => {

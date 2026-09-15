@@ -102,6 +102,43 @@ describe('timeline reducer', () => {
     expect(state.lifecycleRevision).toBe(0)
   })
 
+  it('folds durable steering markers as known non-lifecycle events without rendering items', () => {
+    const markerPayload = (kind: 'observed' | 'applied') => ({
+      schemaVersion: 'agent-harness.steering-marker.v1', kind, status: kind, sessionId: 'session-1', turnId: 'turn-1',
+      taskId: 'task-1', stepId: 'step-1', inputId: 'input-1', idempotencyKey: 'steering-marker:session-1:turn-1:input-1',
+      obligationId: 'obligation-1', goalRevision: 1, planRevision: 1, acceptedSequence: '1',
+    })
+    const marker = (id: string, sequence: string, kind: 'observed' | 'applied') => ({
+      schemaVersion: 'agent-harness.v2', id, sessionId: 'session-1', turnId: 'turn-1', itemId: null, taskId: 'task-1',
+      type: 'agent.steering.marker', actor: 'system', sequence, payload: markerPayload(kind),
+    })
+
+    let state = timelineReducer(createTimelineState('session-1'), { type: 'event', event: marker('marker-observed', '1', 'observed') })
+    state = timelineReducer(state, { type: 'event', event: marker('marker-applied', '2', 'applied') })
+
+    expect(state.steeringMarkers).toMatchObject({ observedCount: 1, appliedCount: 1, activeCount: 0 })
+    expect(state.events.map(item => item.id)).toEqual(['marker-observed', 'marker-applied'])
+    expect(state.fallbackItems).toEqual([])
+    expect(selectTimelineItems(state)).toEqual([])
+    expect(state.lifecycleRevision).toBe(0)
+  })
+
+  it('does not change state when a marker conflicts or arrives from another session', () => {
+    const observed = {
+      schemaVersion: 'agent-harness.v2', id: 'marker-observed', sessionId: 'session-1', turnId: 'turn-1', itemId: null, taskId: 'task-1',
+      type: 'agent.steering.marker', actor: 'system', sequence: '1', payload: {
+        schemaVersion: 'agent-harness.steering-marker.v1', kind: 'observed', status: 'observed', sessionId: 'session-1', turnId: 'turn-1',
+        taskId: 'task-1', stepId: 'step-1', inputId: 'input-1', idempotencyKey: 'steering-marker:session-1:turn-1:input-1', obligationId: null,
+        goalRevision: 1, planRevision: null, acceptedSequence: '1',
+      },
+    }
+    const state = timelineReducer(createTimelineState('session-1'), { type: 'event', event: observed })
+    const conflict = timelineReducer(state, { type: 'event', event: { ...observed, id: 'marker-conflict', sequence: '2', payload: { ...observed.payload, goalRevision: 2 } } })
+    const foreign = timelineReducer(state, { type: 'event', event: { ...observed, id: 'marker-foreign', sessionId: 'session-2', payload: { ...observed.payload, sessionId: 'session-2', idempotencyKey: 'steering-marker:session-2:turn-1:input-1' } } })
+    expect(conflict).toBe(state)
+    expect(foreign).toBe(state)
+  })
+
   it('produces the same state for replay and live delivery across deterministic event logs', () => {
     const items = [baseItem('item-1')]
     const logs: TimelineEvent[][] = [

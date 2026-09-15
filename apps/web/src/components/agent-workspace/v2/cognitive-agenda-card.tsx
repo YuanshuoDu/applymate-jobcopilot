@@ -5,9 +5,10 @@ import React from 'react'
 import { useI18n } from '@/lib/i18n'
 
 import type { CognitiveAgendaAction, CognitiveAgendaBlocker, CognitiveAgendaSignal, CognitiveAgendaView } from './cognitive-agenda-view'
+import type { TimelineSteeringMarkerState } from './timeline-steering-markers'
 
 export interface CognitiveAgendaCardProps {
-  readonly agenda: CognitiveAgendaView
+  readonly agenda: CognitiveAgendaView & { readonly steeringMarkers?: TimelineSteeringMarkerState }
 }
 
 const ACTION_KEYS: Record<CognitiveAgendaAction, string> = {
@@ -36,6 +37,11 @@ export function CognitiveAgendaCard({ agenda }: CognitiveAgendaCardProps) {
       <div style={rowStyle}><span>{t('agent.cognitiveAgenda.blockedBy')}</span><span>{blocker}</span></div>
       <div style={revisionStyle}><span>{t('agent.cognitiveAgenda.goalRevision')}: {agenda.goalRevision ?? '—'}</span><span>{t('agent.cognitiveAgenda.planRevision')}: {agenda.planRevision ?? '—'}</span></div>
       <div style={signalsStyle}>{signals.map(([label, signal]) => <span key={label}>{label}: {signal.count}</span>)}</div>
+      {agenda.steeringMarkers && <div data-agent-steering-lifecycle="true" style={signalsStyle}>
+        <span>{t('agent.cognitiveAgenda.steering.observed')}: {agenda.steeringMarkers.observedCount}</span>
+        <span>{t('agent.cognitiveAgenda.steering.active')}: {agenda.steeringMarkers.activeCount}</span>
+        <span>{t('agent.cognitiveAgenda.steering.applied')}: {agenda.steeringMarkers.appliedCount}</span>
+      </div>}
     </section>
   )
 }

@@ -2,6 +2,7 @@
 
 import { AGENT_STREAM_SCHEMA_VERSION } from '@jobcopilot/agent-protocol'
 import { createCognitiveAgendaState, reduceCognitiveAgenda, type TimelineCognitiveAgendaState } from './timeline-cognitive-agenda'
+import { emptyTimelineSteeringMarkerState, reduceTimelineSteeringMarkers, STEERING_MARKER_EVENT_TYPE, STEERING_MARKER_MAX_EVENTS, type TimelineSteeringMarkerEvent, type TimelineSteeringMarkerState } from './timeline-steering-markers'
 import { appendFallbackEvent, appendTimelineEvent, buildIndexes, compareItems, integer, isAfter, isRecord, itemFromTimelineEvent, mergeContent, numberOrUndefined, sequence, stringOrNull, timestamp } from './timeline-reducer-utils'
 
 export type TimelineConnection = 'idle' | 'connected' | 'reconnecting'
@@ -61,6 +62,8 @@ export interface TimelineState {
   lastSequence: string | null
   lifecycleRevision: number
   cognitiveAgenda: TimelineCognitiveAgendaState
+  steeringMarkers: TimelineSteeringMarkerState
+  steeringMarkerEvents: readonly TimelineSteeringMarkerEvent[]
   connection: TimelineConnection
   snapshotRequired: boolean
 }
@@ -81,7 +84,7 @@ const KNOWN_EVENT_TYPES = new Set([
   'step.started', 'step.completed', 'item.started', 'item.delta', 'item.completed', 'item.failed',
   'input.accepted', 'input.consumed', 'tool_call.started', 'tool_call.completed', 'tool_call.failed',
   'policy.decision', 'approval.requested', 'approval.resolved', 'approval.consumed', 'approval.expired',
-  'question.answered', 'question.cancelled', 'external_action.reserved', 'stream.overflow', 'cognitive.agenda',
+  'question.answered', 'question.cancelled', 'external_action.reserved', 'stream.overflow', 'cognitive.agenda', STEERING_MARKER_EVENT_TYPE,
 ])
 
 // Status-only events drive supervisor metadata refreshes. Item deltas are
@@ -99,7 +102,7 @@ export function createTimelineState(sessionId: string): TimelineState {
     sessionId, events: [], byId: new Map(), byTurnId: new Map(), byToolCallId: new Map(), lastEventId: null,
     transientItems: new Map(), fallbackItems: [],
     itemIds: [], itemsById: {}, itemIdsByTurnId: {}, itemIdsByTaskId: {},
-    processedEventIds: {}, lastSequence: null, lifecycleRevision: 0, cognitiveAgenda: createCognitiveAgendaState(sessionId), connection: 'idle', snapshotRequired: false,
+    processedEventIds: {}, lastSequence: null, lifecycleRevision: 0, cognitiveAgenda: createCognitiveAgendaState(sessionId), steeringMarkers: emptyTimelineSteeringMarkerState(), steeringMarkerEvents: [], connection: 'idle', snapshotRequired: false,
   }
 }
 
@@ -145,6 +148,8 @@ export function normalizeTimelineEvent(value: unknown): TimelineEvent | null {
   if (!isRecord(value) || typeof value.id !== 'string' || typeof value.sessionId !== 'string' ||
     typeof value.turnId !== 'string' || typeof value.type !== 'string' ||
     value.schemaVersion !== AGENT_STREAM_SCHEMA_VERSION) return null
+  if (value.type === STEERING_MARKER_EVENT_TYPE && (value.actor !== 'system' || value.itemId !== null)) return null
+  if (value.type === STEERING_MARKER_EVENT_TYPE && Object.keys(value).some(key => !['schemaVersion', 'id', 'sessionId', 'turnId', 'itemId', 'taskId', 'type', 'actor', 'correlationId', 'causationId', 'idempotencyKey', 'sequence', 'payload', 'createdAt', 'kind', 'baseRevision', 'revision'].includes(key))) return null
   const rawKind = value.kind
   if (rawKind !== undefined && rawKind !== 'delta' && rawKind !== 'snapshot') return null
   const kind = rawKind === 'delta' || rawKind === 'snapshot' ? rawKind : undefined
@@ -172,6 +177,8 @@ function reduceItems(state: TimelineState, values: unknown[], source: TimelineIt
 function reduceEvent(state: TimelineState, value: unknown): TimelineState {
   const event = normalizeTimelineEvent(value)
   if (!event || event.sessionId !== state.sessionId || state.processedEventIds[event.id]) return state
+  const markerState = event.type === STEERING_MARKER_EVENT_TYPE ? reduceMarkerEvent(state, event) : null
+  if (event.type === STEERING_MARKER_EVENT_TYPE && !markerState) return state
   if (event.sequence !== null && !isAfter(event.sequence, state.lastSequence)) return state
   const processedEventIds: Record<string, true> = { ...state.processedEventIds, [event.id]: true }
   let next: TimelineState = {
@@ -184,6 +191,9 @@ function reduceEvent(state: TimelineState, value: unknown): TimelineState {
     ...appendTimelineEvent(next.events, event),
     lastEventId: event.id,
     lifecycleRevision: LIFECYCLE_EVENT_TYPES.has(event.type) ? state.lifecycleRevision + 1 : state.lifecycleRevision,
+  }
+  if (markerState) {
+    return { ...next, steeringMarkers: markerState.state, steeringMarkerEvents: markerState.events }
   }
   if (event.type === 'cognitive.agenda') next = { ...next, cognitiveAgenda: reduceCognitiveAgenda(next.cognitiveAgenda, event) }
   if (event.type === 'stream.overflow') return { ...next, snapshotRequired: true, connection: 'reconnecting' }
@@ -198,6 +208,27 @@ function reduceEvent(state: TimelineState, value: unknown): TimelineState {
   if (!KNOWN_EVENT_TYPES.has(event.type)) next = { ...next, fallbackItems: appendFallbackEvent(next.fallbackItems, event) }
   const item = itemFromTimelineEvent(event, status, existing, undefined, normalizeTimelineItem)
   return item ? upsertItem(next, item, item.source === 'unknown' ? 'unknown' : 'durable') : next
+}
+
+function reduceMarkerEvent(state: TimelineState, event: TimelineEvent): { state: TimelineSteeringMarkerState; events: readonly TimelineSteeringMarkerEvent[] } | null {
+  if (typeof event.sequence !== 'string' || !/^(0|[1-9]\d*)$/.test(event.sequence) || event.sequence.length > 20) return null
+  const candidate = event as unknown as TimelineSteeringMarkerEvent
+  const combined = [...state.steeringMarkerEvents, candidate]
+  const ordered = [...combined].sort((left, right) => {
+    const leftSequence = BigInt(left.sequence), rightSequence = BigInt(right.sequence)
+    return leftSequence === rightSequence ? left.id.localeCompare(right.id) : leftSequence < rightSequence ? -1 : 1
+  })
+  if (ordered.length <= STEERING_MARKER_MAX_EVENTS) {
+    const reduced = reduceTimelineSteeringMarkers(ordered, { sessionId: state.sessionId })
+    return reduced.valid ? { state: reduced.state, events: ordered } : null
+  }
+  const firstWindow = ordered.length - STEERING_MARKER_MAX_EVENTS
+  for (let offset = firstWindow; offset <= ordered.length; offset += 1) {
+    const events = ordered.slice(offset)
+    const reduced = reduceTimelineSteeringMarkers(events, { sessionId: state.sessionId })
+    if (reduced.valid) return { state: reduced.state, events }
+  }
+  return null
 }
 
 function reduceDelta(state: TimelineState, value: unknown, preprocessedId?: string): TimelineState {

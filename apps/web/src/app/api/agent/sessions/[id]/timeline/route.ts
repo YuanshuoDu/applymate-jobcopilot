@@ -5,6 +5,7 @@ import { db } from "@/lib/db"
 import { isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { redactStreamValue } from "@/lib/agent/session/stream-redaction"
 import { parseCognitiveAgendaReceipt, type CognitiveAgendaScope } from "@/components/agent-workspace/v2/cognitive-agenda-view"
+import { parseSteeringMarkerEvent, reduceTimelineSteeringMarkers, type TimelineSteeringMarkerEvent } from "@/components/agent-workspace/v2/timeline-steering-markers"
 
 import {
   afterCursor,
@@ -33,6 +34,8 @@ interface AgendaQueryRow {
   payload: unknown
 }
 
+type SteeringMarkerQueryRow = Omit<AgendaQueryRow, "type"> & { type: string }
+
 const AGENDA_SELECT = {
   id: true, sessionId: true, turnId: true, itemId: true, taskId: true, sequence: true,
   type: true, actor: true, correlationId: true, causationId: true, idempotencyKey: true, payload: true,
@@ -59,10 +62,11 @@ export async function GET(request: NextRequest, context: RouteContext) {
   })
   const result = pageResult(rows as ItemQueryRow[], page, "timeline", sessionId)
   const agenda = page.cursor === null ? await latestAgenda(sessionId) : null
+  const steeringMarkers = page.cursor === null ? await latestSteeringMarkers(sessionId) : []
   return ok({
     items: result.rows.map(itemDto),
     page: result.page,
-    ...(page.cursor === null ? { agenda } : {}),
+    ...(page.cursor === null ? { agenda, ...(steeringMarkers.length > 0 ? { steeringMarkers } : {}) } : {}),
   })
 }
 
@@ -78,6 +82,39 @@ async function latestAgenda(sessionId: string) {
     if (envelope) return envelope
   }
   return null
+}
+
+async function latestSteeringMarkers(sessionId: string): Promise<readonly TimelineSteeringMarkerEvent[]> {
+  const rows = await db.agentEvent.findMany({
+    where: { sessionId, type: "agent.steering.marker" },
+    orderBy: { sequence: "desc" },
+    take: 128,
+    select: AGENDA_SELECT,
+  }) as SteeringMarkerQueryRow[]
+  const events = rows.flatMap(row => {
+    const event = markerEnvelope(row, sessionId)
+    return event && parseSteeringMarkerEvent(event, { sessionId }) ? [event] : []
+  }).reverse()
+  const reduced = reduceTimelineSteeringMarkers(events, { sessionId })
+  return reduced.valid ? events : []
+}
+
+function markerEnvelope(row: SteeringMarkerQueryRow, sessionId: string): TimelineSteeringMarkerEvent | null {
+  if (row.sessionId !== sessionId || row.type !== "agent.steering.marker" || row.itemId !== null || typeof row.taskId !== "string") return null
+  const sequence = row.sequence.toString()
+  if (!/^(0|[1-9]\d*)$/.test(sequence) || sequence.length > 20) return null
+  return {
+    schemaVersion: AGENT_STREAM_SCHEMA_VERSION,
+    id: row.id,
+    sessionId: row.sessionId,
+    turnId: row.turnId,
+    itemId: null,
+    taskId: row.taskId,
+    type: "agent.steering.marker",
+    actor: row.actor as "system",
+    sequence,
+    payload: redactStreamValue(row.payload),
+  }
 }
 
 function agendaEnvelope(row: AgendaQueryRow, sessionId: string) {

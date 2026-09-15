@@ -54,4 +54,16 @@ describe('CognitiveAgendaCard', () => {
     expect(html).not.toContain('<button')
     expect(html).not.toContain('onClick')
   })
+
+  it('renders only bounded steering lifecycle counts from durable marker state', () => {
+    const html = renderToStaticMarkup(<I18nProvider><CognitiveAgendaCard agenda={{ ...agenda(), steeringMarkers: {
+      observed: [], applied: [], active: [], observedCount: 3, appliedCount: 1, activeCount: 2,
+    } }} /></I18nProvider>)
+
+    expect(html).toContain('data-agent-steering-lifecycle="true"')
+    expect(html).toContain('Observed: 3')
+    expect(html).toContain('Active: 2')
+    expect(html).toContain('Applied: 1')
+    expect(html).not.toContain('steer:')
+  })
 })

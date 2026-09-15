@@ -5,13 +5,19 @@ import { useEffect, useMemo, useState } from 'react'
 import { streamAgentTimeline } from './stream-client'
 import type { CognitiveAgendaView } from './cognitive-agenda-view'
 import { createTimelineState, selectTimelineItems, timelineReducer, type TimelineConnection, type TimelineItem, type TimelineState } from './timeline-reducer'
+import type { TimelineSteeringMarkerState } from './timeline-steering-markers'
+
+export type AgentCognitiveAgendaSnapshot = CognitiveAgendaView & {
+  readonly steeringMarkers?: TimelineSteeringMarkerState
+}
 
 export interface AgentTimelineSnapshot {
   readonly sessionId: string | null
   readonly items: readonly TimelineItem[]
   readonly lastEventId: string | null
   readonly lifecycleRevision: number
-  readonly cognitiveAgenda: CognitiveAgendaView | null
+  readonly cognitiveAgenda: AgentCognitiveAgendaSnapshot | null
+  readonly steeringMarkers?: TimelineSteeringMarkerState
   readonly connection: TimelineConnection
   readonly restoring: boolean
   readonly error: string | null
@@ -63,14 +69,18 @@ export function useAgentTimeline(sessionId: string | null): AgentTimelineSnapsho
 
   const items = useMemo(() => timelineItemsForSession(state, sessionId), [state, sessionId])
   const sessionMatches = Boolean(sessionId && state.sessionId === sessionId)
+  const cognitiveAgenda = sessionMatches && state.cognitiveAgenda.latest
+    ? { ...state.cognitiveAgenda.latest, steeringMarkers: state.steeringMarkers }
+    : null
   return useMemo(() => ({
     sessionId,
     items,
     lastEventId: sessionMatches ? state.lastEventId : null,
     lifecycleRevision: sessionMatches ? state.lifecycleRevision : 0,
-    cognitiveAgenda: sessionMatches ? state.cognitiveAgenda.latest : null,
+    cognitiveAgenda,
+    steeringMarkers: sessionMatches ? state.steeringMarkers : { observed: [], applied: [], active: [], observedCount: 0, appliedCount: 0, activeCount: 0 },
     connection: sessionMatches ? state.connection : 'idle',
     restoring: sessionMatches ? restoring : Boolean(sessionId),
     error: sessionMatches ? error : null,
-  }), [sessionId, items, sessionMatches, state.lastEventId, state.connection, restoring, error])
+  }), [sessionId, items, sessionMatches, state.lastEventId, state.connection, state.steeringMarkers, cognitiveAgenda, restoring, error])
 }

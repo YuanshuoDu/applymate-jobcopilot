@@ -6,6 +6,7 @@ interface TimelinePageResponse {
   items?: unknown[]
   page?: { hasMore?: boolean; nextCursor?: string | null }
   agenda?: unknown
+  steeringMarkers?: unknown[]
 }
 
 export interface TimelineStreamClientOptions {
@@ -27,6 +28,7 @@ export async function hydrateTimeline(options: Pick<TimelineStreamClientOptions,
   const fetcher = options.fetcher ?? fetch
   const items: unknown[] = []
   let agenda: unknown = undefined
+  let steeringMarkers: unknown[] | undefined
   let cursor: string | null = null
   do {
     const query = new URLSearchParams({ limit: String(options.pageSize ?? DEFAULT_PAGE_SIZE) })
@@ -36,9 +38,11 @@ export async function hydrateTimeline(options: Pick<TimelineStreamClientOptions,
     const page = await response.json() as TimelinePageResponse
     if (Array.isArray(page.items)) items.push(...page.items)
     if (cursor === null && page.agenda !== undefined && page.agenda !== null) agenda = page.agenda
+    if (cursor === null && Array.isArray(page.steeringMarkers)) steeringMarkers = page.steeringMarkers
     cursor = page.page?.hasMore === true && typeof page.page.nextCursor === 'string' ? page.page.nextCursor : null
   } while (cursor && !options.signal?.aborted)
-  options.dispatch(agenda === undefined ? { type: 'hydrate', items } : { type: 'hydrate', items, tail: [agenda] })
+  const tail = [agenda, ...(steeringMarkers ?? [])].filter((value): value is unknown => value !== undefined && value !== null).sort(compareTailEvents)
+  options.dispatch(tail.length === 0 ? { type: 'hydrate', items } : { type: 'hydrate', items, tail })
 }
 
 /** Attaches one reconnecting V2 SSE consumer to the same reducer used by replay. */
@@ -120,6 +124,23 @@ export async function streamAgentTimeline(options: TimelineStreamClientOptions):
 
 function isEventStream(response: Response): boolean {
   return response.headers.get('content-type')?.toLowerCase().includes('text/event-stream') === true
+}
+
+function compareTailEvents(left: unknown, right: unknown): number {
+  const leftSequence = tailSequence(left)
+  const rightSequence = tailSequence(right)
+  if (leftSequence !== null && rightSequence !== null) {
+    const bySequence = BigInt(leftSequence) < BigInt(rightSequence) ? -1 : BigInt(leftSequence) > BigInt(rightSequence) ? 1 : 0
+    if (bySequence !== 0) return bySequence
+  } else if (leftSequence !== null) return -1
+  else if (rightSequence !== null) return 1
+  return 0
+}
+
+function tailSequence(value: unknown): string | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const sequence = (value as { sequence?: unknown }).sequence
+  return typeof sequence === 'string' && /^(0|[1-9]\d*)$/.test(sequence) && sequence.length <= 39 ? sequence : null
 }
 
 interface SseFrame { event: string; id: string | null; data: unknown }

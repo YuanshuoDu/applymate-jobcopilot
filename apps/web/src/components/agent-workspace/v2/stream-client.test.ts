@@ -61,6 +61,18 @@ function agendaEvent(overrides: Record<string, unknown> = {}) {
   }
 }
 
+function steeringMarkerEvent(sequence: string, kind: 'observed' | 'applied' = 'observed') {
+  return {
+    schemaVersion: 'agent-harness.v2', id: `marker-${sequence}`, sessionId: 'session-1', turnId: 'turn-1', itemId: null, taskId: 'task-1',
+    type: 'agent.steering.marker', actor: 'system', sequence,
+    payload: {
+      schemaVersion: 'agent-harness.steering-marker.v1', kind, status: kind, sessionId: 'session-1', turnId: 'turn-1', taskId: 'task-1',
+      stepId: 'step-1', inputId: 'input-1', idempotencyKey: 'steering-marker:session-1:turn-1:input-1', obligationId: 'obligation-1',
+      goalRevision: 1, planRevision: 1, acceptedSequence: '1',
+    },
+  }
+}
+
 describe('V2 timeline stream client', () => {
   it('hydrates every timeline page before attaching the stream', async () => {
     const dispatch = vi.fn()
@@ -89,6 +101,21 @@ describe('V2 timeline stream client', () => {
     expect(state.cognitiveAgenda.latest).toMatchObject({ nextAction: 'continue_turn', goalRevision: 1, planRevision: 2 })
     expect(state.events.map(event => event.id)).toEqual(['agenda-7'])
     expect(state.lifecycleRevision).toBe(0)
+  })
+
+  it('hydrates marker events through the same reducer and orders the tail by durable sequence', async () => {
+    let state: TimelineState = createTimelineState('session-1')
+    const dispatch = (action: TimelineAction) => { state = timelineReducer(state, action) }
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(JSON.stringify({
+      items: [item('item-1')], page: { hasMore: false, nextCursor: null }, agenda: agendaEvent({ sequence: '9' }),
+      steeringMarkers: [steeringMarkerEvent('11', 'applied'), steeringMarkerEvent('10')],
+    })))
+
+    await hydrateTimeline({ sessionId: 'session-1', dispatch, fetcher })
+
+    expect(state.steeringMarkers).toMatchObject({ observedCount: 1, appliedCount: 1, activeCount: 0 })
+    expect(state.events.map(event => event.id)).toEqual(['agenda-7', 'marker-10', 'marker-11'])
+    expect(state.itemsById['item-1']).toMatchObject({ status: 'streaming' })
   })
 
   it('rehydrates the latest agenda after an SSE overflow', async () => {
