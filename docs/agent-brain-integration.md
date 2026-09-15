@@ -1068,5 +1068,6 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 ## P7-2c2 candidate - Worker recovery and dispatch suppression
 
 - Commit `d43107a2` applies `RUNNABLE_SESSION` to stale Turn reclaim, recoverable child-task selection, recovery reset and repair scans, guarded recovery inserts/updates, and pending Turn/Subagent dispatch session scans plus their inner session locks. User-paused sessions therefore remain unclaimed, unrecovered, and unpublished; missing Subagent sessions retain `session_missing` cleanup, while durable aggregate repair and in-flight cleanup keep `OPEN_SESSION` behavior.
+- Follow-up line-bound fix commit `9a8752d4` keeps `subagent-queue.ts` within the repository's 250-line source limit without changing the dispatch boundary or behavior.
 - Focused Worker coverage passed **147/147 tests across 4 files** (Turn recovery 25, child-task store 54, Subagent queue 43, stale Subagent dispatch recovery 25), with the Worker TypeScript check and diff check passing. Runtime status `paused` with `controlGate = 'open'` remains recoverable and dispatchable.
 - Candidate boundary: no live PostgreSQL/RLS locking, real Worker restart, Redis/BullMQ delivery, cross-worker recovery race, provider/browser behavior, production deployment, or complete E2E was run; overall progress remains **P0 accepted 1/8 (12.5%)**.
