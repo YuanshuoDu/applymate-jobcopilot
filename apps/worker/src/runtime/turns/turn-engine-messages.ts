@@ -2,6 +2,7 @@ import type { HarnessModelRequest, ModelContinuation, ModelMessage } from "@jobc
 import type { ModelCapabilityProfile, ModelAdapter } from "@jobcopilot/agent-model"
 
 import type { StepContext } from "../context/step-context-builder.js"
+import { buildCognitiveControlFrame, cognitiveControlFrameText } from "./cognitive-control-frame.js"
 
 export const PLAN_REPLAN_SYSTEM_INSTRUCTION = "SERVER CONTROL: A child task failure requires replanning. Output exactly one agent.plan.propose tool call for a new plan based on the failed plan revision and current goal. Do not call any other tool and do not return final text."
 export const PLAN_REPLAN_STEERING_OVERRIDE_INSTRUCTION = "SERVER CONTROL: Fresh authenticated user steering is available while replanning is required. If it explicitly changes the goal, output exactly one agent.goal.update tool call reflecting that change. Otherwise output exactly one agent.plan.propose tool call based on the failed plan revision and current goal. Do not call any other tool and do not return final text."
@@ -25,6 +26,7 @@ export function contextToModelMessages(context: StepContext, replanRequired = fa
     const text = freshSteering ? PLAN_REPLAN_STEERING_OVERRIDE_INSTRUCTION : PLAN_REPLAN_SYSTEM_INSTRUCTION
     messages.push({ role: "system", content: [{ type: "text", text }] })
   }
+  messages.push({ role: "system", content: [{ type: "text", text: cognitiveControlFrameText(buildCognitiveControlFrame(context, { replanRequired, freshSteering })) }] })
   for (const block of context.blocks) {
     const observation = block.layer === "tool_observation" ? asToolObservation(block.content) : null
     if (observation) {
@@ -48,7 +50,7 @@ export function contextToModelMessages(context: StepContext, replanRequired = fa
       content: [{ type: "text", text: blockText(block) }],
     })
   }
-  if (messages.length === 0) messages.push({ role: "user", content: [{ type: "text", text: "Continue the Turn according to the harness contract." }] })
+  if (context.blocks.length === 0) messages.push({ role: "user", content: [{ type: "text", text: "Continue the Turn according to the harness contract." }] })
   return messages
 }
 
