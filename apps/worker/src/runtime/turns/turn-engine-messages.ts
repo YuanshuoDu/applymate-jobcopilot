@@ -3,6 +3,7 @@ import type { ModelCapabilityProfile, ModelAdapter } from "@jobcopilot/agent-mod
 
 import type { StepContext } from "../context/step-context-builder.js"
 import { buildCognitiveControlFrame, cognitiveControlFrameText } from "./cognitive-control-frame.js"
+import { buildCognitiveMemoryRecall, cognitiveMemoryRecallText } from "./cognitive-memory-recall.js"
 
 export const PLAN_REPLAN_SYSTEM_INSTRUCTION = "SERVER CONTROL: A child task failure requires replanning. Output exactly one agent.plan.propose tool call for a new plan based on the failed plan revision and current goal. Do not call any other tool and do not return final text."
 export const PLAN_REPLAN_STEERING_OVERRIDE_INSTRUCTION = "SERVER CONTROL: Fresh authenticated user steering is available while replanning is required. If it explicitly changes the goal, output exactly one agent.goal.update tool call reflecting that change. Otherwise output exactly one agent.plan.propose tool call based on the failed plan revision and current goal. Do not call any other tool and do not return final text."
@@ -27,6 +28,8 @@ export function contextToModelMessages(context: StepContext, replanRequired = fa
     messages.push({ role: "system", content: [{ type: "text", text }] })
   }
   messages.push({ role: "system", content: [{ type: "text", text: cognitiveControlFrameText(buildCognitiveControlFrame(context, { replanRequired, freshSteering })) }] })
+  const memoryRecall = buildCognitiveMemoryRecall(context)
+  if (memoryRecall) messages.push({ role: "system", content: [{ type: "text", text: cognitiveMemoryRecallText(memoryRecall) }] })
   for (const block of context.blocks) {
     const observation = block.layer === "tool_observation" ? asToolObservation(block.content) : null
     if (observation) {

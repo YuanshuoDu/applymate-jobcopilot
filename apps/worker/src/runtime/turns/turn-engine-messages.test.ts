@@ -56,6 +56,25 @@ describe("TurnEngine model message mapping", () => {
     expect(contextToModelMessages(context(), false, true)[0]).not.toEqual(messages[0])
   })
 
+  it("orders replan instruction, control frame, recall, then context", () => {
+    const memory = {
+      schemaVersion: "agent-harness.cognitive-memory.v1", activeGoals: [], fixedConstraints: [], steering: [], revisions: { goalRevision: 1, planRevision: null },
+      decisions: [], unresolvedQuestions: [], unresolved: [], waits: [], approvals: [], verifiedEvidence: [], artifacts: [], taskRefs: [], eventRefs: [], omittedRanges: [], coveredSequence: "1",
+    }
+    const messages = contextToModelMessages({
+      ...context(),
+      blocks: [
+        { ...context().blocks[0]!, id: "goal-1", layer: "goal", role: "data", trust: "external_untrusted", source: "turn_goal", content: { revision: 1 } },
+        { id: "summary-1", layer: "tool_observation", role: "data", trust: "external_untrusted", source: "context_summary", content: { kind: "context_summary", memory } },
+        context().blocks[0]!, context().blocks[1]!,
+      ],
+    }, true)
+    expect(messages[0]).toEqual({ role: "system", content: [{ type: "text", text: PLAN_REPLAN_SYSTEM_INSTRUCTION }] })
+    expect((messages[1]?.content[0] as { text: string }).text).toContain("SERVER COGNITIVE CONTROL FRAME")
+    expect((messages[2]?.content[0] as { text: string }).text).toContain("SERVER COGNITIVE MEMORY RECALL")
+    expect(messages[3]?.role).toBe("user")
+  })
+
   it("reconstructs provider-neutral assistant/tool correlation from observations", () => {
     const messages = contextToModelMessages({
       ...context(),
