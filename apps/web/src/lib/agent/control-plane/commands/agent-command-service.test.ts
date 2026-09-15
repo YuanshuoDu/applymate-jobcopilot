@@ -10,29 +10,105 @@ function whereOf(args: unknown): Row {
   return ((args as { where?: Row }).where ?? {})
 }
 
-function makeDb(options: { ownerId?: string; failOutbox?: boolean } = {}) {
+function makeDb(options: {
+  ownerId?: string
+  sessionExists?: boolean
+  sessionStatus?: string
+  sessionOwnerId?: string
+  failOutbox?: boolean
+  executionStatus?: string
+  sessionSource?: string
+  activeSource?: string
+  activeTurnId?: string
+  activeRootTaskId?: string | null
+  activeStatus?: string
+  controlGate?: "open" | "user_paused"
+  controlRevision?: number
+  pausedAt?: Date | null
+  retryTarget?: Row & { revision: number }
+} = {}) {
   const ownerId = options.ownerId ?? "user_1"
-  let active: (Row & { revision: number }) | null = null
+  const sessionExists = options.sessionExists ?? true
+  const sessionOwnerId = options.sessionOwnerId ?? ownerId
+  let active: (Row & { revision: number }) | null = options.activeSource
+    ? { id: options.activeTurnId ?? "turn_1", source: options.activeSource, status: options.activeStatus ?? "in_progress", revision: 0, rootTaskId: options.activeRootTaskId ?? null }
+    : null
+  let execution: { id: string; sessionId: string; status: string } | null = options.executionStatus
+    ? { id: "execution_1", sessionId: "session_1", status: options.executionStatus }
+    : null
+  let sessionStatus = options.sessionStatus ?? "active"
+  let controlGate = options.controlGate ?? "open"
+  let controlRevision = options.controlRevision ?? 0
+  let pausedAt = options.pausedAt ?? null
+  const rawQueries: unknown[] = []
+  let rollbacks = 0
   let sequence = BigInt(0)
   let inputs: Row[] = []
   let items: Row[] = []
   let events: Row[] = []
   let outbox: Row[] = []
+  let controls: Row[] = []
   let transactionQueue = Promise.resolve()
 
   const tx = {
     $queryRaw: vi.fn(async (query: unknown) => {
+      rawQueries.push(query)
       const strings = (query as { strings?: readonly string[] }).strings ?? []
-      if (strings.join(" ").includes("SELECT")) return [{ id: "session_1" }]
+      const sql = strings.join(" ")
+      if (sql.includes("SELECT")) {
+        const openFence = sql.includes('"status" NOT IN')
+        const available = sessionExists && sessionOwnerId === ownerId && (!openFence || !["aborted", "archived"].includes(sessionStatus))
+        return available ? [{ id: "session_1", controlGate, controlRevision, pausedAt }] : []
+      }
       sequence += BigInt(1)
       return [{ eventSequence: sequence }]
     }),
-    agentSession: { findFirst: vi.fn() },
+    agentSession: {
+      findFirst: vi.fn(async () => (options.sessionSource ? { source: options.sessionSource } : null)),
+      updateMany: vi.fn(async (args: unknown) => {
+        const where = whereOf(args)
+        if (!options.sessionSource || where.id !== "session_1" || where.userId !== ownerId) return { count: 0 }
+        sessionStatus = "aborted"
+        return { count: 1 }
+      }),
+      update: vi.fn(async (args: unknown) => {
+        const data = (args as { data: Row }).data
+        controlGate = String(data.controlGate) as "open" | "user_paused"
+        controlRevision = Number(data.controlRevision)
+        pausedAt = (data.pausedAt as Date | null) ?? null
+        return data
+      }),
+    },
+    agentExecution: {
+      findFirst: vi.fn(async (args: unknown) => {
+        const where = whereOf(args)
+        if (!execution || where.id !== execution.id || where.userId !== ownerId || (where.sessionId && where.sessionId !== execution.sessionId)) return null
+        return { ...execution }
+      }),
+      updateMany: vi.fn(async (args: unknown) => {
+        const where = whereOf(args)
+        const statuses = (where.status as { in?: unknown[] } | undefined)?.in ?? []
+        if (!execution || where.id !== execution.id || where.userId !== ownerId || where.sessionId !== execution.sessionId || !statuses.includes(execution.status)) return { count: 0 }
+        execution = { ...execution, status: "cancelled" }
+        return { count: 1 }
+      }),
+    },
     agentTurn: {
-      findFirst: vi.fn(async () => active),
+      findFirst: vi.fn(async (args: unknown) => {
+        const where = whereOf(args)
+        if (where.id) {
+          const target = options.retryTarget
+          return target && where.id === target.id && where.sessionId === "session_1" && where.userId === ownerId ? { ...target } : null
+        }
+        if (!active) return null
+        if (where.status === "in_progress" && active.status !== "in_progress") return null
+        const statuses = (where.status as { in?: unknown[] } | undefined)?.in
+        if (statuses && !statuses.includes(active.status)) return null
+        return active
+      }),
       create: vi.fn(async (args: unknown) => {
         const data = (args as { data: Row }).data
-        active = { id: String(data.id), source: data.source, status: "queued", revision: 0 }
+        active = { id: String(data.id), source: data.source, status: "queued", revision: 0, input: data.input }
         return { id: active.id }
       }),
       updateMany: vi.fn(async (args: unknown) => {
@@ -83,20 +159,51 @@ function makeDb(options: { ownerId?: string; failOutbox?: boolean } = {}) {
         return data
       }),
     },
+    agentSessionControl: {
+      findFirst: vi.fn(async (args: unknown) => {
+        const where = whereOf(args)
+        return controls.find((control) => control.sessionId === where.sessionId && control.clientMessageId === where.clientMessageId) ?? null
+      }),
+      create: vi.fn(async (args: unknown) => {
+        const data = (args as { data: Row }).data
+        controls.push(data)
+        return data
+      }),
+    },
   }
 
   const transaction = vi.fn(<T>(work: (transaction: typeof tx) => Promise<T>) => {
     const run = transactionQueue.then(async () => {
-      const before = { active, sequence, inputs: [...inputs], items: [...items], events: [...events], outbox: [...outbox] }
+      const before = {
+        active,
+        execution,
+        sessionStatus,
+        controlGate,
+        controlRevision,
+        pausedAt,
+        sequence,
+        inputs: [...inputs],
+        items: [...items],
+        events: [...events],
+        outbox: [...outbox],
+        controls: [...controls],
+      }
       try {
         return await work(tx)
       } catch (error: unknown) {
+        rollbacks += 1
         active = before.active
+        execution = before.execution
+        sessionStatus = before.sessionStatus
+        controlGate = before.controlGate
+        controlRevision = before.controlRevision
+        pausedAt = before.pausedAt
         sequence = before.sequence
         inputs = before.inputs
         items = before.items
         events = before.events
         outbox = before.outbox
+        controls = before.controls
         throw error
       }
     })
@@ -109,11 +216,20 @@ function makeDb(options: { ownerId?: string; failOutbox?: boolean } = {}) {
     db,
     tx,
     state: {
+      rawQueries,
+      get rollbacks() { return rollbacks },
       get active() { return active },
+      setActive(value: (Row & { revision: number }) | null) { active = value },
+      get execution() { return execution },
+      get sessionStatus() { return sessionStatus },
+      get controlGate() { return controlGate },
+      get controlRevision() { return controlRevision },
+      get pausedAt() { return pausedAt },
       get inputs() { return inputs },
       get items() { return items },
       get events() { return events },
       get outbox() { return outbox },
+      get controls() { return controls },
     },
   }
 }
@@ -122,6 +238,18 @@ const content = [{ type: "text", text: "Find backend roles" }] as const
 
 function startCommand(clientMessageId: string, source: "user" | "automation" = "user") {
   return { sessionId: "session_1", userId: "user_1", clientMessageId, source, content: [...content] }
+}
+
+function retryTarget(status = "failed", input: unknown = { goal: "Find backend roles", content: [...content] }) {
+  return { id: "turn_failed", sessionId: "session_1", userId: "user_1", status, source: "user", revision: 4, input }
+}
+
+function retryCommand(clientMessageId: string, expectedRevision: number | null = 4) {
+  return { sessionId: "session_1", userId: "user_1", clientMessageId, source: "user" as const, targetTurnId: "turn_failed", expectedRevision }
+}
+
+function controlCommand(clientMessageId: string, expectedRevision: number | null = 0) {
+  return { sessionId: "session_1", userId: "user_1", clientMessageId, source: "user" as const, expectedRevision }
 }
 
 describe("AgentCommandService", () => {
@@ -152,6 +280,37 @@ describe("AgentCommandService", () => {
     expect(second).toMatchObject({ disposition: "duplicate", originalDisposition: "started", turnId: first.turnId, inputId: first.inputId })
     expect(fake.state.items).toHaveLength(1)
     expect(fake.state.inputs).toHaveLength(1)
+  })
+
+  it("collapses concurrent duplicate commands to one Turn and dispatch identity", async () => {
+    const fake = makeDb()
+    const service = new AgentCommandService(fake.db)
+    const command = startCommand("client_concurrent_duplicate")
+
+    const [first, second] = await Promise.all([service.start(command), service.start(command)])
+
+    expect(second.disposition).toBe("duplicate")
+    expect(second.turnId).toBe(first.turnId)
+    expect(fake.state.inputs).toHaveLength(1)
+    expect(fake.state.items).toHaveLength(1)
+    expect(fake.state.outbox.filter((entry) => entry.topic === "agent.turn.dispatch")).toHaveLength(1)
+  })
+
+  it("writes one canonical Turn dispatch intent with the root in the command transaction", async () => {
+    const fake = makeDb()
+    const service = new AgentCommandService(fake.db)
+
+    const first = await service.start(startCommand("client_dispatch"))
+    await service.start(startCommand("client_dispatch"))
+
+    const dispatches = fake.state.outbox.filter((outbox) => outbox.topic === "agent.turn.dispatch")
+    expect(dispatches).toHaveLength(1)
+    expect(dispatches[0]).toMatchObject({
+      idempotencyKey: `turn-dispatch:${first.turnId}`,
+      payload: { turnId: first.turnId, sessionId: "session_1", ownerId: `web:${first.turnId}` },
+    })
+    expect(dispatches[0]?.aggregateId).toBe("session_1")
+    expect(dispatches[0]?.aggregateId).not.toBe(first.turnId)
   })
 
   it("rejects stale expected Turn before writing a steer", async () => {
@@ -220,5 +379,290 @@ describe("AgentCommandService", () => {
 
     expect(result).toMatchObject({ disposition: "interrupted", turnId: started.turnId })
     expect(fake.state.active).toMatchObject({ status: "interrupted", revision: 1 })
+  })
+
+  it("uses the open session fence before command admission", async () => {
+    const fake = makeDb()
+    await new AgentCommandService(fake.db).start(startCommand("client_open_fence"))
+
+    const sessionLock = fake.state.rawQueries
+      .map((query) => ((query as { strings?: readonly string[] }).strings ?? []).join(" "))
+      .find((sql) => sql.includes('FROM "agent_sessions"') && sql.includes('"status" NOT IN') && sql.includes("FOR UPDATE"))
+    expect(sessionLock).toContain('"userId" =')
+    expect(sessionLock).toContain('"status" NOT IN (\'aborted\', \'archived\')')
+  })
+
+  it.each([
+    ["start", "aborted", { sessionStatus: "aborted" }],
+    ["message", "archived", { sessionStatus: "archived" }],
+    ["interrupt", "missing", { sessionExists: false }],
+    ["start", "cross-user", { sessionOwnerId: "user_2" }],
+    ["message", "aborted", { sessionStatus: "aborted" }],
+    ["interrupt", "archived", { sessionStatus: "archived" }],
+    ["start", "missing", { sessionExists: false }],
+    ["message", "cross-user", { sessionOwnerId: "user_2" }],
+    ["interrupt", "aborted", { sessionStatus: "aborted" }],
+    ["start", "archived", { sessionStatus: "archived" }],
+    ["message", "missing", { sessionExists: false }],
+    ["interrupt", "cross-user", { sessionOwnerId: "user_2" }],
+  ])("rejects %s on a %s session before durable mutations", async (action, _label, options) => {
+    const fake = makeDb(options)
+    const service = new AgentCommandService(fake.db)
+    const clientMessageId = `client_closed_${action}_${_label}`
+    const result: Promise<unknown> = action === "interrupt"
+      ? service.interrupt({ ...startCommand(clientMessageId), expectedTurnId: "turn_1" })
+      : action === "message"
+        ? service.message({ ...startCommand(clientMessageId), delivery: "follow_up" as const })
+        : service.start(startCommand(clientMessageId))
+
+    await expect(result).rejects.toMatchObject({ code: "agent_session_not_found", status: 404 })
+    expect(fake.state.rollbacks).toBe(1)
+    expect(fake.tx.agentInput.findFirst).not.toHaveBeenCalled()
+    expect(fake.tx.agentTurn.findFirst).not.toHaveBeenCalled()
+    expect(fake.tx.agentTurn.create).not.toHaveBeenCalled()
+    expect(fake.tx.agentTurn.updateMany).not.toHaveBeenCalled()
+    expect(fake.tx.agentItem.create).not.toHaveBeenCalled()
+    expect(fake.tx.agentEvent.findFirst).not.toHaveBeenCalled()
+    expect(fake.tx.agentEvent.create).not.toHaveBeenCalled()
+    expect(fake.tx.agentOutbox.create).not.toHaveBeenCalled()
+    expect(fake.state.inputs).toHaveLength(0)
+    expect(fake.state.items).toHaveLength(0)
+    expect(fake.state.events).toHaveLength(0)
+    expect(fake.state.outbox).toHaveLength(0)
+    expect(fake.state.rawQueries.length).toBe(1)
+    const sql = ((fake.state.rawQueries[0] as { strings?: readonly string[] }).strings ?? []).join(" ")
+    expect(sql).toContain('"status" NOT IN (\'aborted\', \'archived\')')
+    expect(sql).toContain("FOR UPDATE")
+    expect(sql).toContain('"userId" =')
+  })
+
+  it("cancels an automation execution and interrupts its active Turn in one transaction", async () => {
+    const fake = makeDb({ executionStatus: "running", sessionSource: "automation", activeSource: "automation", activeTurnId: "turn_automation_1" })
+    const service = new AgentCommandService(fake.db)
+
+    await expect(service.cancelExecution({ executionId: "execution_1", userId: "user_1", sessionId: "session_1" })).resolves.toBe(true)
+
+    expect(fake.state.execution).toMatchObject({ status: "cancelled" })
+    expect(fake.state.active).toMatchObject({ status: "interrupted", revision: 1 })
+    expect(fake.state.sessionStatus).toBe("aborted")
+    expect(fake.state.inputs).toHaveLength(1)
+    expect(fake.state.events.filter((event) => event.type === "turn.interrupted")).toHaveLength(1)
+    expect(fake.state.inputs[0]).toMatchObject({ clientMessageId: "agent-execution-cancel:execution_1:turn_automation_1" })
+  })
+
+  it("cancels safely without an active Turn and does not interrupt a user-owned Turn", async () => {
+    const noTurn = makeDb({ executionStatus: "running", sessionSource: "automation" })
+    await expect(new AgentCommandService(noTurn.db).cancelExecution({ executionId: "execution_1", userId: "user_1" })).resolves.toBe(true)
+    expect(noTurn.state.execution).toMatchObject({ status: "cancelled" })
+    expect(noTurn.state.inputs).toHaveLength(0)
+
+    const userTurn = makeDb({ executionStatus: "running", sessionSource: "automation", activeSource: "user" })
+    await expect(new AgentCommandService(userTurn.db).cancelExecution({ executionId: "execution_1", userId: "user_1" })).resolves.toBe(true)
+    expect(userTurn.state.active).toMatchObject({ status: "in_progress", revision: 0 })
+    expect(userTurn.state.inputs).toHaveLength(0)
+  })
+
+  it("keeps cancellation idempotent while a restarted execution gets a new Turn key", async () => {
+    const fake = makeDb({ executionStatus: "running", sessionSource: "automation", activeSource: "automation", activeTurnId: "turn_1" })
+    const service = new AgentCommandService(fake.db)
+
+    await service.cancelExecution({ executionId: "execution_1", userId: "user_1" })
+    fake.tx.agentExecution.findFirst.mockImplementation(async () => ({ id: "execution_1", sessionId: "session_1", status: "running" }))
+    fake.tx.agentExecution.updateMany.mockImplementation(async () => ({ count: 1 }))
+    fake.state.setActive({ id: "turn_2", source: "automation", status: "in_progress", revision: 0 })
+    await service.cancelExecution({ executionId: "execution_1", userId: "user_1" })
+
+    expect(fake.state.inputs.map((input) => input.clientMessageId)).toEqual([
+      "agent-execution-cancel:execution_1:turn_1",
+      "agent-execution-cancel:execution_1:turn_2",
+    ])
+  })
+
+  it("returns false for terminal executions and propagates cancellation write failures", async () => {
+    const terminal = makeDb({ executionStatus: "completed", sessionSource: "automation", activeSource: "automation" })
+    await expect(new AgentCommandService(terminal.db).cancelExecution({ executionId: "execution_1", userId: "user_1" })).resolves.toBe(false)
+    expect(terminal.state.inputs).toHaveLength(0)
+
+    const failed = makeDb({ executionStatus: "running", sessionSource: "automation" })
+    failed.tx.agentExecution.updateMany.mockRejectedValue(new Error("database unavailable"))
+    await expect(new AgentCommandService(failed.db).cancelExecution({ executionId: "execution_1", userId: "user_1" })).rejects.toThrow("database unavailable")
+    expect(failed.state.execution).toMatchObject({ status: "running" })
+  })
+
+  it("retries a failed Turn atomically from its persisted input", async () => {
+    const fake = makeDb({ retryTarget: { ...retryTarget("failed", { goal: "Canonical persisted retry objective", content: [...content] }), rootTaskId: "task-claimed" } })
+    const result = await new AgentCommandService(fake.db).retry(retryCommand("retry_1"))
+
+    expect(result).toMatchObject({ disposition: "started", sequence: "2" })
+    expect(result.turnId).not.toBe("turn_failed")
+    expect(fake.state.active).toMatchObject({ status: "queued", source: "user" })
+    expect(fake.state.active).toMatchObject({ input: { goal: "Canonical persisted retry objective", content } })
+    expect(fake.state.inputs).toHaveLength(1)
+    expect(fake.state.inputs[0]).toMatchObject({ delivery: "follow_up", content })
+    expect(fake.state.events.map(event => event.type)).toEqual(["turn.started", "input.accepted"])
+    expect(fake.state.outbox.filter(entry => entry.topic === "agent.turn.dispatch")).toHaveLength(1)
+  })
+
+  it("returns the original result for a duplicate retry without new durable facts", async () => {
+    const fake = makeDb({ retryTarget: retryTarget() })
+    const service = new AgentCommandService(fake.db)
+    const first = await service.retry(retryCommand("retry_duplicate"))
+    const second = await service.retry(retryCommand("retry_duplicate", 999))
+
+    expect(second).toMatchObject({ disposition: "duplicate", originalDisposition: "started", turnId: first.turnId, inputId: first.inputId, sequence: first.sequence })
+    expect(fake.state.inputs).toHaveLength(1)
+    expect(fake.state.events).toHaveLength(2)
+    expect(fake.state.outbox.filter(entry => entry.topic === "agent.turn.dispatch")).toHaveLength(1)
+  })
+
+  it("rejects an active conflict, invalid target, ownership mismatch, and malformed persisted input", async () => {
+    const active = makeDb({ activeSource: "user", activeRootTaskId: "task-claimed", retryTarget: retryTarget() })
+    await expect(new AgentCommandService(active.db).retry(retryCommand("retry_active"))).rejects.toMatchObject({ code: "retry_active_conflict", status: 409 })
+    expect(active.state.inputs).toHaveLength(0)
+
+    for (const target of [retryTarget("completed"), retryTarget("queued"), retryTarget("waiting_for_user")]) {
+      const fake = makeDb({ retryTarget: target })
+      await expect(new AgentCommandService(fake.db).retry(retryCommand(`retry_${target.status}`))).rejects.toMatchObject({ code: "retry_target_invalid", status: 409 })
+      expect(fake.state.inputs).toHaveLength(0)
+    }
+
+    const foreign = makeDb({ sessionOwnerId: "user_2", retryTarget: retryTarget() })
+    await expect(new AgentCommandService(foreign.db).retry(retryCommand("retry_foreign"))).rejects.toMatchObject({ code: "agent_session_not_found", status: 404 })
+
+    const malformed = makeDb({ retryTarget: retryTarget("failed", { content: [{ type: "text", text: "ok", secret: "reject" }] }) })
+    await expect(new AgentCommandService(malformed.db).retry(retryCommand("retry_malformed"))).rejects.toMatchObject({ code: "retry_input_invalid", status: 409 })
+    expect(malformed.state.inputs).toHaveLength(0)
+
+    for (const [label, input] of [
+      ["missing", { content: [...content] }],
+      ["empty", { goal: "", content: [...content] }],
+      ["foreign", { goal: "\u0001", content: [...content] }],
+    ] as const) {
+      const fake = makeDb({ retryTarget: retryTarget("failed", input) })
+      await expect(new AgentCommandService(fake.db).retry(retryCommand(`retry_goal_${label}`))).rejects.toMatchObject({ code: "retry_input_invalid", status: 409 })
+      expect(fake.state.active).toBeNull()
+      expect(fake.state.inputs).toHaveLength(0)
+      expect(fake.state.items).toHaveLength(0)
+      expect(fake.state.events).toHaveLength(0)
+      expect(fake.state.outbox).toHaveLength(0)
+    }
+  })
+
+  it("rolls back retry Turn, facts, and dispatch when the transaction fails", async () => {
+    const fake = makeDb({ failOutbox: true, retryTarget: retryTarget() })
+    await expect(new AgentCommandService(fake.db).retry(retryCommand("retry_rollback"))).rejects.toThrow("outbox unavailable")
+    expect(fake.state.active).toBeNull()
+    expect(fake.state.items).toHaveLength(0)
+    expect(fake.state.inputs).toHaveLength(0)
+    expect(fake.state.events).toHaveLength(0)
+    expect(fake.state.outbox).toHaveLength(0)
+    expect(fake.state.rollbacks).toBe(1)
+  })
+
+  it.each(["idle", "queued", "waiting_for_user"] as const)("pauses an %s session without touching its Turn facts", async (status) => {
+    const fake = makeDb(status === "idle" ? {} : { activeSource: "user", activeStatus: status })
+    const result = await new AgentCommandService(fake.db).pause(controlCommand(`pause_${status}`))
+
+    expect(result).toMatchObject({ operation: "pause", controlGate: "user_paused", controlRevision: 1, disposition: "applied" })
+    expect(fake.state.controlGate).toBe("user_paused")
+    expect(fake.state.active?.status ?? null).toBe(status === "idle" ? null : status)
+    expect(fake.state.controls).toHaveLength(1)
+    expect(fake.state.inputs).toHaveLength(0)
+    expect(fake.state.items).toHaveLength(0)
+    expect(fake.state.events).toHaveLength(1)
+    expect(fake.state.events[0]).toMatchObject({
+      turnId: null,
+      itemId: null,
+      taskId: null,
+      type: "session.paused",
+      actor: "system",
+      correlationId: "session_1",
+      idempotencyKey: `agent-session-control:pause_${status}`,
+      payload: {
+        sessionId: "session_1",
+        operation: "pause",
+        previousGate: "open",
+        nextGate: "user_paused",
+        controlRevision: 1,
+        pausedAt: expect.any(String),
+      },
+    })
+    expect(fake.state.outbox).toHaveLength(1)
+    expect(fake.state.outbox[0]).toMatchObject({
+      topic: "agent.session.event",
+      aggregateId: "session_1",
+      payload: { turnId: null, type: "session.paused", idempotencyKey: `agent-session-control:pause_${status}` },
+    })
+  })
+
+  it("rejects pause while a claimed in-progress root exists with zero writes", async () => {
+    const fake = makeDb({ activeSource: "user", activeRootTaskId: "claimed-root" })
+    await expect(new AgentCommandService(fake.db).pause(controlCommand("pause_active"))).rejects.toMatchObject({ code: "session_pause_conflict", status: 409 })
+    expect(fake.state.controlGate).toBe("open")
+    expect(fake.state.controlRevision).toBe(0)
+    expect(fake.state.controls).toHaveLength(0)
+    expect(fake.tx.agentSession.update).not.toHaveBeenCalled()
+    expect(fake.tx.agentSessionControl.create).not.toHaveBeenCalled()
+  })
+
+  it("applies pause and resume idempotently while preserving runtime Turn status", async () => {
+    const fake = makeDb({ activeSource: "user", activeStatus: "waiting_for_approval" })
+    const service = new AgentCommandService(fake.db)
+    const paused = await service.pause(controlCommand("pause_once"))
+    const duplicate = await service.pause(controlCommand("pause_once", 0))
+    expect(paused.disposition).toBe("applied")
+    expect(duplicate).toMatchObject({ disposition: "duplicate", controlGate: "user_paused", controlRevision: 1 })
+    await expect(service.resume(controlCommand("pause_once"))).rejects.toMatchObject({ code: "session_control_idempotency_conflict", status: 409 })
+
+    const resumed = await service.resume(controlCommand("resume_once", 1))
+    expect(resumed).toMatchObject({ operation: "resume", controlGate: "open", controlRevision: 2, disposition: "applied", pausedAt: null })
+    expect(fake.state.active).toMatchObject({ status: "waiting_for_approval" })
+    expect(fake.state.controls).toHaveLength(2)
+    expect(fake.state.events.map((event) => event.type)).toEqual(["session.paused", "session.resumed"])
+    expect(fake.state.outbox.filter((entry) => entry.topic === "agent.session.event")).toHaveLength(2)
+  })
+
+  it("records an open-session resume noop and rejects stale control revisions", async () => {
+    const noop = makeDb()
+    const noopResult = await new AgentCommandService(noop.db).resume(controlCommand("resume_noop"))
+    expect(noopResult).toMatchObject({ disposition: "noop", controlGate: "open", controlRevision: 0 })
+    expect(noop.state.controls).toHaveLength(1)
+    expect(noop.state.events).toHaveLength(0)
+    expect(noop.state.outbox).toHaveLength(0)
+    expect(noop.tx.agentSession.update).not.toHaveBeenCalled()
+
+    const stale = makeDb({ controlGate: "user_paused", controlRevision: 4 })
+    await expect(new AgentCommandService(stale.db).resume(controlCommand("resume_stale", 3))).rejects.toMatchObject({ code: "session_control_revision_changed", status: 409 })
+    expect(stale.state.controlGate).toBe("user_paused")
+    expect(stale.state.controls).toHaveLength(0)
+  })
+
+  it("keeps interrupt available while user-paused and blocks ordinary admission", async () => {
+    const fake = makeDb({ controlGate: "user_paused", controlRevision: 1, activeSource: "user" })
+    const service = new AgentCommandService(fake.db)
+    const before = { inputs: fake.state.inputs.length, items: fake.state.items.length, events: fake.state.events.length, outbox: fake.state.outbox.length }
+    await expect(service.start(startCommand("paused_start"))).rejects.toMatchObject({ code: "agent_session_paused", status: 409 })
+    await expect(service.message({ ...startCommand("paused_message"), delivery: "follow_up" as const })).rejects.toMatchObject({ code: "agent_session_paused", status: 409 })
+    await expect(service.retry(retryCommand("paused_retry"))).rejects.toMatchObject({ code: "agent_session_paused", status: 409 })
+    expect(fake.state.inputs.length).toBe(before.inputs)
+    expect(fake.state.items.length).toBe(before.items)
+    expect(fake.state.events.length).toBe(before.events)
+    expect(fake.state.outbox.length).toBe(before.outbox)
+    await expect(service.interrupt({ ...startCommand("paused_interrupt"), expectedTurnId: "turn_1" })).resolves.toMatchObject({ disposition: "interrupted" })
+  })
+
+  it("replays an already accepted command while user-paused before gate admission", async () => {
+    const fake = makeDb()
+    const service = new AgentCommandService(fake.db)
+    const command = startCommand("paused_duplicate")
+    const accepted = await service.start(command)
+    fake.state.setActive({ ...fake.state.active!, status: "waiting_for_user" })
+    await service.pause(controlCommand("pause_before_duplicate"))
+
+    const duplicate = await service.start(command)
+
+    expect(duplicate).toMatchObject({ disposition: "duplicate", inputId: accepted.inputId, turnId: accepted.turnId, originalDisposition: "started" })
+    expect(fake.state.inputs).toHaveLength(1)
+    expect(fake.state.controls).toHaveLength(1)
   })
 })

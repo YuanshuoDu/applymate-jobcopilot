@@ -8,7 +8,7 @@ import { mapLegacyTranscriptToV2 } from "./legacy-v2-mapping"
 import { insertProjectedTranscript } from "./transcript-projector"
 import type { AgentSessionStatus } from "./types"
 import type { AppendTranscriptEventInput } from "./repository"
-import { ensureV2Turn, type EnsureV2TurnInput, type V2TurnHandle } from "./v2-turn"
+import { ensureV2Turn, lockOpenSession, type EnsureV2TurnInput, type V2TurnHandle } from "./v2-turn"
 
 export interface RawPipelineEvent {
   name: string
@@ -63,15 +63,12 @@ export async function createDualWriteSession(
     ...turn,
     async record(legacy, raw) {
       return db.$transaction(async (tx) => {
-        const session = await tx.agentSession.findFirst({
-          where: { id: turn.sessionId, userId: turn.userId },
-          select: { id: true },
-        })
+        await lockOpenSession(tx, turn)
         const currentTurn = await tx.agentTurn.findFirst({
           where: { id: turn.turnId, sessionId: turn.sessionId, userId: turn.userId },
           select: { id: true },
         })
-        if (!session || !currentTurn) throw new Error("Cannot dual-write an unauthorized agent turn")
+        if (!currentTurn) throw new Error("Cannot dual-write an unauthorized agent turn")
 
         const mapping = mapLegacyTranscriptToV2(legacy, raw?.name)
         const safeLegacy = redactAgentEvent(legacy)
@@ -131,6 +128,8 @@ export async function createDualWriteSession(
           }),
           outboxTopic: "agent.session.event",
         })
+        const eventTurnId = event.turnId
+        if (eventTurnId === null) throw new Error("Cannot project a session-scoped event into a Turn transcript")
         if (legacy.type === "user_message") {
           await tx.agentInput.create({
             data: {
@@ -146,12 +145,13 @@ export async function createDualWriteSession(
             },
           })
         }
-        const projected = await insertProjectedTranscript(tx, event)
+        const projected = await insertProjectedTranscript(tx, { ...event, turnId: eventTurnId })
         return restoreLegacyResponse(projected, safeLegacy.data)
       })
     },
     async finalize(finalizeInput) {
       await db.$transaction(async (tx) => {
+        await lockOpenSession(tx, turn)
         const ownedTurn = await tx.agentTurn.findFirst({
           where: { id: turn.turnId, sessionId: turn.sessionId, userId: turn.userId },
           select: { id: true },

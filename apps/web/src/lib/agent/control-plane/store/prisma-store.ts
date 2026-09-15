@@ -124,6 +124,7 @@ function createUnitOfWork(tx: Transaction, scope: TenantScope): AgentRepositoryU
     },
 
     async appendEvent(input: AppendEventInput) {
+      if (input.turnId === null) throw conflict("turn scope is required for repository events")
       const ownedSession = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
         SELECT "id" FROM "agent_sessions"
         WHERE "id" = ${input.sessionId} AND "userId" = ${scope.userId}

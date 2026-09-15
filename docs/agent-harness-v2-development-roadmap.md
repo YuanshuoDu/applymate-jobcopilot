@@ -1320,3 +1320,813 @@ git diff --check
 上述 Lane 默认作为后续 Issue 规划和单 Issue 内 Subagent 切分依据；在当前“一次一个 Issue”策略下，不同时创建多个竞争性开发分支或 PR。
 
 最先应该交给开发的 Issue 是 **AH2-001**。在它合并之前，不开始新的 unattended external-write 能力。
+
+---
+
+## 21. P3-27A — 计划完成恢复候选切片
+
+**状态与进度口径（2026-09-12）：** P3-27A 记录为候选切片，不代表 P3 完成，也不代表完整 Harness 已交付。中文升级计划总进度仍按 **P0 已验收 1/8（12.5%）** 统计；本切片不改变该口径。
+
+**实现记录：** 代码提交为 `3595f2a1`，后续修复为 `57024914`。当 canonical planning 与 plan execution 同时启用、且计划完成校验失败时，执行循环追加固定的服务端拥有 `plan_completion_feedback` 观察，将其放入当前内存快照并进入下一模型步。恢复前清除 provider continuation，避免下一步复用已经失效的 continuation cursor。
+
+- 服务端拥有的 `planCompletionRecoveryLimit` 只接受整数 `0..2`；canonical planning + execution 默认上限为 `1`，设为 `0` 时立即以 `final_unverified` 失败；规划或执行任一关闭时不进行该恢复。
+- parser 只接受固定 observation ID 前缀、固定 `kind`/`status`/`blocker`/`feedback`、整数 attempt `1..2`、完整且有界的字段集合和 payload。count 只取当前 `turnId` 下通过 parser 的最高有效 attempt；伪造、malformed、越界和跨 turn 观察均被过滤。
+- 这是内存恢复候选：反馈没有写入持久化事件或数据库，进程重启、跨进程 replay 和持久化反馈恢复仍属于 **P3-27B**。因此本节不能用于宣称完整 Harness、重启恢复或生产级完成。
+
+**独立验证：** 根侧对 5 个 P3-27 相关文件验证 **105/105**；Worker TypeScript 检查、`@jobcopilot/shared` build 和 `git diff --check` 均通过。未覆盖 live DB/RLS、queue delivery、provider、process restart 或端到端（E2E）验证；这些边界仍需后续集成证据。
+
+---
+
+## 22. P3-27B — 计划完成反馈持久化候选切片
+
+**状态与进度口径（2026-09-12）：** P3-27A 与 P3-27B 均为候选切片，不代表 P3 完成、完整 Harness 或 Phase 完成。中文升级计划总进度仍按 **P0 已验收 1/8（12.5%）** 统计；本切片不改变该口径。
+
+**实现记录：** P3-27B 代码提交为 `3434006d`，scope 修复为 `7c7a1b2a`。计划完成 barrier recovery 在进入下一模型步前，先追加服务端拥有的 canonical `plan.completion_feedback` event；event 使用稳定的 step idempotency，append 失败则 fail closed，不继续执行恢复。成功追加后才把反馈投影到当前执行快照，并清除 provider continuation；planning gate 与 child gate 语义保持不变。
+
+- canonical state 会查询并恢复 `plan.completion_feedback`，只接受严格匹配当前 `turnId` 与当前 server-owned `planId` 的事件。重复事件保持幂等；相同 observation identity 的冲突 payload、malformed、恶意字段和超出 `0..2` 恢复上限的事件均被过滤或拒绝。
+- 旧的无 `planId` feedback 在新 plan generation 已建立后不计入恢复次数，避免旧计划消耗新计划的恢复预算；当前 plan 切换和 goal revision 会重新计算 scope。
+- P3-27A 的内存恢复与 P3-27B 的 canonical event 恢复都仍是候选切片，不能用于宣称完整 Harness、P3/Phase 完成或真实进程重启恢复。live DB/RLS、Redis/queue、provider、真实进程重启和浏览器/child-parent E2E 仍需独立证据。
+
+**独立验证：** 根侧对 3 个直接文件验证 **70/70 passed**，pretest shared build 通过；Worker TypeScript 与 `git diff --check` 均通过。未覆盖 live DB/RLS、Redis/queue、provider、真实进程重启过程或浏览器/child-parent E2E；总体进度仍为 **1/8（12.5%）**。
+
+---
+
+## 23. P3-28 — 计划完成反馈恢复回归候选切片
+
+**状态与进度口径（2026-09-12）：** P3-28 是针对 P3-27A/B 的候选回归切片；P3-27A、P3-27B、P3-28 均不代表 P3 完成、完整 Harness 或 Phase 完成。中文升级计划总进度仍按 **P0 已验收 1/8（12.5%）** 统计。
+
+**实现记录：** 提交为 `8b8db903`。fake lease-loss/crash window 在首轮完成 `plan.completion_feedback` event append 后触发，首轮以 `requeued/lease_lost` 结束；第二轮新建 canonical runtime，通过 `loadCanonicalTurnState` 从同一 event log 恢复。回归断言确认 feedback count 为 `1`、resume step state 恢复、provider continuation 没有复用，且 feedback event 没有重复追加。
+
+- 该切片验证的是 fake harness regression，证明 event append 与 canonical state 恢复之间的模拟租约丢失窗口；它不是 live DB/Redis/queue/provider 证据，也不是实际进程重启、浏览器 E2E 或 child-parent E2E 证据。
+- P3-27A/B 的候选边界仍然有效：恢复上限、current turn/current plan 过滤、稳定幂等和 planning/child gate 语义必须保持；本回归不能用于宣称完整 Harness 或 P3/Phase 完成。
+
+**独立验证：** 根侧对 `canonical-turn-runtime` 与 `turn-execution-loop` 验证 **63/63 passed**；pretest shared build、Worker TypeScript 与 `git diff --check` 均通过。未覆盖 live DB/RLS、Redis/queue、provider、真实进程重启、浏览器 E2E 或 child-parent E2E；总体进度仍为 **1/8（12.5%）**。
+
+---
+
+## 24. P3-29 — Legacy Orchestrator evaluate fail-closed 候选切片
+
+**状态与进度口径（2026-09-12）：** P3-29 是 legacy Orchestrator evaluate 的候选修复切片，不代表 ModelAdapter 全迁移、动态 TaskGraph、完整 Harness 或 P3/Phase 完成。中文升级计划总进度仍按 **P0 已验收 1/8（12.5%）** 统计。
+
+**实现记录：** 主分支集成提交为 `93f941bc`、`c5a51a23`、`52849bb6`、`8aa3dc3d`；对应原 Worker 提交为 `7dfb6c30`、`d69c608e`、`1c2e3c7e`、`562812cf`。Orchestrator evaluate 对 malformed JSON、缺少 `decision`、unknown decision、缺少/空/超长 `thinking`、`ask_user` 缺少问题、`retry` 缺少/为空/为数组，以及 `ask_options` 非数组、坏 option 或非法 action，均 fail closed 为 `abort`，不再默认 `proceed`；合法 decision 仍保持原有行为。
+
+- 本切片只修复 legacy Orchestrator evaluate 的输入边界和决策默认值，不能作为 ModelAdapter 全迁移、动态 TaskGraph 或完整 Harness 的证据。
+- 根侧独立验证：Web Orchestrator **23/23**，`web exec tsc` 通过，`git diff --check` 通过；未取得 live provider、E2E 或生产证据。
+
+**候选边界：** P3-29 与 P3-27A/B、P3-28 仍是候选切片；不能据此宣称完整 Harness 或 P3/Phase 完成。后续仍需分别验证 ModelAdapter 迁移、动态 TaskGraph、live provider、浏览器/E2E 及生产组合行为。
+
+---
+
+## 25. P3-30 — Canonical delegate role-scoped action allowlist
+
+**状态与进度口径（2026-09-12）：** P3-30 是 canonical planning 的候选安全修复切片，不代表动态 TaskGraph、完整 Harness 或 P3/Phase 完成。中文升级计划总进度仍按 **P0 已验收 1/8（12.5%）** 统计；本切片不改变该口径。
+
+**实现记录：** canonical plan execution 为每个 delegate 按 server-owned 的 scout/analyst 合同与 `visibleToolPolicy` 解析只读动作集合。Scout 只获得 `jobs.search`、`jobs.get`；Analyst 只获得 `jobs.search`、`jobs.get`、`persona.retrieve`、`resume.get_base`。集合仍受 canonical `allowedTools`、registry metadata、read risk/capability/domain 和既有 plan action gate 共同约束；未知角色、无匹配动作和 `tool_results.read` 均 fail closed 为 `role_actions_unavailable`。
+
+- 该切片保持 root/child/coordination gate、plan revision、action bounds 和 child executor 的私有 `tool_results.read` 语义；没有扩大到 nested supervisor 或 external writes。
+- 角色动作集合仅写入 server 生成的 `spawn_subagent` input，模型不能注入租约、身份、预算或能力字段。
+
+**独立验证：** canonical plan execution focused suite **34/34 passed**；workspace dependency build、Worker `tsc --noEmit --skipLibCheck` 和 `git diff --check` 均通过。未覆盖 live DB/RLS、Redis/queue、provider、真实进程重启、浏览器 E2E 或 child-parent E2E。
+
+**候选边界：** 本切片不能作为完整 Harness、P3/Phase 完成或生产安全证明；后续仍需验证实际 child dispatch、持久化恢复和生产组合行为。
+
+---
+
+## 26. P3-31 — Bounded canonical delegate fan-out
+
+**状态与进度口径（2026-09-12）：** P3-31 是 canonical delegate fan-out 的候选切片，不代表完整 Harness、P3/Phase 完成或生产并发证据。中文升级计划总进度仍按 **P0 已验收 1/8（12.5%）** 统计。
+
+**实现记录：** 集成提交为 `1ef54a3f`。canonical execution 使用服务端拥有的 delegate 并发上限 **4**；调用方未提供并发上限时保持默认串行。同一 ready layer 中没有 `inputRefs` 的独立 delegate 可并发运行，但调度器不会跨依赖层提前执行，依赖未完成或不可解析时保持原有阻断语义。
+
+- 并发结果统一按 plan 顺序 deterministic observe，因而 completion projection、output map 和后续依赖解析不受完成时序影响。
+- delegate 失败会 fail closed 并停止继续推进受影响计划；control command 仍是 barrier，按既有 blocked/waiting 语义返回；依赖 delegate 只在其依赖层成功并完成 observe 后解锁。
+- 服务端上限只允许有限值 `1..4`；canonical 路径固定使用 `4`，默认路径仍为串行。该切片没有扩大 tool/role、身份、预算或 external-write 权限边界。
+
+**独立验证：** 根侧对 canonical plan execution 的 focused 验证 **65/65 passed**；pretest shared build、Worker `tsc` 与 `git diff --check` 均通过。未覆盖 live DB/RLS、provider、Redis/queue、真实进程重启或浏览器/child-parent E2E。
+
+**候选边界：** P3-31 只证明受界限的 canonical scheduler 行为和回归测试，不代表动态 TaskGraph、真实队列/Worker 并发、live provider、生产部署或完整 Harness 已完成。
+
+---
+
+## 27. P3-32 — Durable wait outcome bounded synthesis
+
+**状态与进度口径（2026-09-12）：** P3-32 是 durable wait 结果投影的候选可靠性切片，不代表 P3 完成、完整 Harness 或真实 child-parent 恢复证据。中文升级计划总进度仍按 **P0 已验收 1/8（12.5%）** 统计；本切片不改变该口径。
+
+**实现记录：** 集成提交为 `4ab107fe`。`consumeDurableWaitOutcomes` 现在先建立保留 wait 身份、状态、目标/匹配 task IDs 和每个 child 的 `taskId/status` 的最小投影，再按确定性预算把 child result 与 failure reason 加入；整个 outcome 的 UTF-8 JSON 严格不超过 **8 KiB**，与 canonical plan replay 的 bounded-output 合约一致。大结果会被脱敏并压缩为有限摘要，循环引用、BigInt 或不可序列化值只产生安全的 `Result unavailable`/truncated 结果，不会阻塞恢复或写入原始敏感内容。
+
+- 已消费的 outcome 重新投影前会校验 wait/status/target IDs、匹配 IDs 以及每个预期 child 恰好出现一次；缺失、重复、跨目标或超界数据 fail closed，避免恢复时静默丢掉 child 状态。
+- lease、tenant、root lineage、step 状态、单次 `consumedAt` 更新和现有 SQL/RLS 边界保持不变；没有新增 migration、provider、model 或外部写入。
+
+**独立验证：** durable-wait-consumer focused suite **8/8 passed**；其中包含 8 个大结果的聚合上限、循环/BigInt 结果和 consumed replay。Worker `tsc --noEmit --skipLibCheck`、shared build 与 `git diff --check` 均通过；源文件保持在 250 行以内。
+
+**候选边界：** 本切片只证明 bounded projection 与纯测试回归，不代表 live PostgreSQL/RLS、Redis/queue delivery、真实进程重启、provider、browser 或 child-parent E2E 已验证；P3/Phase 和整体目标仍未完成。
+
+---
+
+## 28. P3-33 — Strict replay validation for wait task evidence
+
+**状态与进度口径（2026-09-12）：** P3-33 是 canonical wait replay 证据校验的候选安全切片，不代表 P3 完成、完整 Harness 或生产恢复证据。中文升级计划总进度仍按 **P0 已验收 1/8（12.5%）** 统计；本切片不改变该口径。
+
+**实现记录：** 集成提交为 `3ef27f74`。canonical `replayWaitOutcome` 现在要求持久化 wait outcome 的 `tasks` 数组与 join 目标集合一一对应：每个 child ID 恰好出现一次，entry 只能包含 `taskId/status/result/failureReason` 四个受控字段；status、result JSON/大小和 failure reason 都经过有界校验。任务本身及嵌套 result 中的 runtime identity 字段均 fail closed，避免不完整或伪造的 child evidence 被根 Agent 当成成功依据。
+
+- 保持既有 `ready`/`timed_out`、waitId、目标/匹配 ID、租户/租约和 replay 不重新路由语义；P3-32 生成的 one-task 与 eight-task projection 均可被消费。
+- 仅修改 canonical replay 校验与测试夹具，没有新增 migration、provider、model、queue 或 external-write 权限。
+
+**独立验证：** canonical plan execution focused suite **35/35 passed**；Worker `tsc --noEmit --skipLibCheck`、shared build 和 `git diff --check` 均通过。新增回归覆盖缺失、重复、外部 ID、空 status 和嵌套 identity result。
+
+**候选边界：** 本切片只证明 replay evidence schema 的确定性 fail-closed 校验，不代表 live PostgreSQL/RLS、Redis/queue、真实进程重启、provider、browser 或 child-parent E2E 已验证；P3/Phase 和整体目标仍未完成。
+
+---
+
+## 29. P3-34 — Recursive identity guard for plan input references
+
+**状态与进度口径（2026-09-12）：** P3-34 是 canonical plan input reference 的候选安全/可靠性切片，不代表 P3 完成、完整 Harness 或生产隔离证据。中文升级计划总进度仍按 **P0 已验收 1/8（12.5%）** 统计；本切片不改变该口径。
+
+**实现记录：** 集成提交为 `96fbd6ad`。`resolveInputRefs` 现在递归检查每个历史 observation 与前一节点 output，只要对象或数组内任意键命中 `FORBIDDEN_INPUT_KEYS` 就 fail closed 为 `input_reference_unavailable`，避免服务器内部身份、租约、权限或预算字段被带入后续工具调用。join/wait replay 仍保留各自专用的身份字段校验；普通嵌套职位、公司、地点和薪酬业务数据继续保留并透传。
+
+- 回归覆盖嵌套 `userId`、数组元素 `taskId`、深层 `permissions`/`allowedCapabilities`，并确认历史 observation 与 local output 两条 input reference 路径均不会泄漏字段。
+- 仅修改 canonical plan execution 与对应测试，没有新增 migration、provider、model、queue 或 external-write 权限。
+
+**独立验证：** canonical plan execution focused suite **40/40 passed**；shared build、Worker `tsc` 与 `git diff --check` 均通过。
+
+**候选边界：** 本切片只证明 input reference 的递归身份字段拒绝与普通嵌套业务数据回归，不代表 live DB/RLS、Redis/queue、provider、真实进程重启、browser 或 child-parent E2E 已验证；P3/Phase 和整体目标仍未完成。
+
+---
+
+## 30. P3-35 — Strict structured Scout/Analyst evidence boundary
+
+**状态与进度口径（2026-09-12）：** P3-35 是 Scout/Analyst 结构化业务证据边界的候选安全/可靠性切片，不代表 P3 完成、完整 Harness 或生产隔离证据。中文升级计划总进度仍按 **P0 已验收 1/8（12.5%）** 统计；本切片不改变该口径。
+
+**实现记录：** 集成提交为 `80b95034`。Scout 与 Analyst 结果现在分别使用 exact role-level schema；`evidence`、`candidate`、`finding` 也分别只接受受控字段集合，拒绝额外或缺失字段。结果入口递归拒绝 runtime identity、lease、capability 和 budget keys，并要求 plain JSON、无循环引用和 finite number；job/persona/resume/source 业务字符串与数组保持可用，legacy adapter 生成的合法结果保持兼容。
+
+- 既有 evidence 绑定、真实 job ID、score `0..10`、`completed`/`partial` 状态和成功结果字段保持不变；结构化结果不会携带服务器身份或权限上下文进入 root 业务证据。
+- 仅修改 role result validator 与对应 focused tests，没有新增 migration、provider、model、queue 或 external-write 权限。
+
+**独立验证：** 根侧 `role-results`、`partial-failure` 与 `aggregation` 验证 **30/30 passed**，`role-handlers` **3/3 passed**；shared build、Worker `tsc` 与 `git diff --check` 均通过。
+
+**候选边界：** 本切片只证明结构化 Scout/Analyst 结果的 schema、递归身份隔离与本地 adapter 回归，不代表 live DB/RLS、Redis/queue、provider、真实进程重启、browser 或 child-parent E2E 已验证；P3/Phase 和整体目标仍未完成。
+
+---
+
+## 31. P4-01 — Bounded child final response projection
+
+**状态与进度口径（2026-09-12）：** P4-01 是 bounded child final response projection 的候选可靠性切片；整体完成度仍为 **P0 accepted 1/8 (12.5%)**，本切片不改变该口径。
+
+**实现记录：** 集成提交为 `e448034a`。`TurnEngineResult.finalText` 是 server-owned 字段，仅在 candidate verifier、plan completion barrier、completion gate 和 final persistence 均通过、即将返回 `completed` 时出现。child executor 只投影 completed child 的 final text，先使用 `redactSensitiveText` 脱敏，再在 UTF-8 code-point 边界确定性截断至不超过 **8 KiB** 并附带截断标记；`waiting_for_dependency`、`waiting_for_user`、failed 和 interrupted 结果不携带 `finalText`。
+
+- durable manager/wait replay 会继续接收 bounded child result；本切片没有覆盖 root lifecycle 或 final-response overwrite，也没有新增 migration、provider、queue schema 或 external write。
+
+**独立验证：** 根侧对 turn loop **47/47** 与 child executor **9/9** 共 **56/56 passed**；shared build、Worker `tsc` 与 `git diff --check` 均通过。
+
+**候选边界：** live PostgreSQL/RLS、Redis/queue、provider、真实进程重启和 child-parent E2E 仍未验证；本切片不能据此宣称完整 Harness、P4/Phase 完成或生产恢复证据。
+
+---
+
+## 32. P4-02 — Structured child evidence projection
+
+**状态与进度口径（2026-09-12）：** P4-02 记录为结构化 child evidence projection 的候选切片；整体状态仍为 **P0 accepted 1/8 (12.5%)**，本切片不改变该口径。
+
+**实现记录：** 候选实现提交为 `f62a47dc`，后续状态一致性修复为 `56079bd9`。Root Scout/Analyst orchestration 为每个迁移角色设置服务端拥有的精确 marker `{schemaVersion: ROLE_RESULT_SCHEMA, role}`。child executor 只有在 marker 与 leased role 精确匹配且 turn 已完成时，才对原始 final model text 做严格 JSON parse；超过 **8 KiB**、fenced markdown、额外字段、runtime identity、缺失或重复 evidence、cross-role result、非法 score 等输出均被拒绝，并复用既有 `validateRoleResult` 校验。只有 completed child 的合法结果才会产生有界 `structuredResult`。
+
+- expected structured output malformed 或 invalid 时 fail closed：外层结果和 durable result 内层 status 均为 `failed`，`failureReason` 为 `invalid_structured_result`，且不包含 `finalText` 或 `structuredResult`。没有 marker 的 free-text 仍保持兼容；waiting、failed、interrupted child 不产生 projection。
+- durable manager/wait replay 继续通过 generic bounded `result` 接收该结果，root lifecycle 与 final response 保持不变；没有新增 migration、provider、queue 或 external write。
+
+**独立验证：** child-executor 与 root-orchestration focused tests 合计 **21/21 passed**；shared build、Worker `tsc --noEmit --skipLibCheck` 与 `git diff --check` 均通过。
+
+**候选边界：** live DB/RLS、Redis/queue、provider、真实进程重启、browser 和 child-parent E2E 均未验证；本切片不能据此宣称完整 Harness、P4/Phase 完成或生产恢复证据。
+
+---
+
+## 33. P4-03 — Replay validation for structured child evidence
+
+**状态与进度口径（2026-09-12）：** P4-03 记录为 structured child evidence replay validation 的候选切片；整体状态仍为 **P0 accepted 1/8 (12.5%)**，本切片不改变该口径。
+
+**实现记录：** 提交为 `c8cbbf8e`。canonical `validReplayWaitTasks` 对没有 `structuredResult` 的 generic legacy result 保持兼容；如果结果带有该字段，则要求 task 外层 status 为 `completed`，并复用既有 `validateRoleResult` 校验结构化 Scout/Analyst result，同时保留 plain JSON、递归 identity、evidence、role、score 和不超过 **8 KiB** 的 structured JSON 边界。Malformed、伪造、缺失或重复 evidence、cross-role、oversized，或 waiting/failed task 携带 `structuredResult` 的结果，均 fail closed 为 `invalid_plan_output`。
+
+- 既有 waitId、target/matched task IDs 和 no-reroute 语义保持不变；没有新增 migration、provider、queue 或 external write。
+
+**独立验证：** 根侧 canonical-plan-execution focused suite **40/40 passed**；shared build、Worker `tsc --noEmit --skipLibCheck` 与 `git diff --check` 均通过。
+
+**候选边界：** live DB/RLS、Redis/queue、provider、真实进程重启、browser 和 child-parent E2E 均未验证；本切片不能据此宣称完整 Harness、P4/Phase 完成或生产恢复证据。
+
+---
+
+## 34. P4-04 — Server-bound child evidence from read observations
+
+**Candidate status/date (2026-09-12):** P4-04 is recorded as a candidate server-bound child evidence slice; overall status remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `df223d70` adds the pure `child-evidence` helper and wires it into `child-executor`.
+
+The child records only successful read observations with `status: completed` and `errorCode: null` from `jobs.search`, `jobs.get`, `persona.retrieve`, and `resume.get_base`.
+
+Server-owned canonical IDs use `read:<kind>:<ref>`; model evidence IDs and sources are rewritten from the observed records before the structured result is revalidated.
+
+- Unknown, null, fabricated, conflicting, duplicate, or oversized claims fail closed as `invalid_structured_result`. An empty structured result with no claims is allowed when the observed search is empty.
+- A missing structured marker preserves generic free-text behavior. This slice adds no DB, provider, queue, or external-write changes.
+
+**Independent verification:** Focused tests passed **32/32** (**7 child-evidence + 25 child-executor**); shared build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
+
+**Candidate boundary:** Live DB/RLS, Redis/queue, provider, restart, browser, and child-parent E2E behavior remain unverified.
+
+## 35. P4-05 — Server-owned structured contract provenance
+
+**Candidate status/date (2026-09-12):** P4-05 is recorded as a candidate server-owned structured contract slice; overall status remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `7b33aa79` removes `expectedOutputSchema` from the public `spawn_subagent` schema. With `additionalProperties: false`, model input containing that field is rejected before execution.
+
+`executeSpawn` never forwards `expectedOutputSchema` to `manager.spawn`, including when a raw or cast runtime input attempts to inject it. The server-direct marker path in `root-orchestration.ts` is unchanged.
+
+This slice adds no migration, provider, queue, or external-write changes.
+
+**Independent verification:** `coordination-tools` and `coordination-executors` focused tests passed **10/10**; shared build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
+
+**Candidate boundary:** Live DB/RLS, Redis/queue, provider, restart, browser, and child-parent E2E behavior remain unverified.
+
+---
+
+## 36. P4-06 — Bound structured evidence on durable replay
+
+**Candidate status/date (2026-09-12):** P4-06 is recorded as a candidate durable replay evidence slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commits `e8724eba` and review fix `d5104760` add `apps/worker/src/runtime/planning/structured-replay-evidence.ts` and connect its validator at the canonical `validStructuredReplayResult` replay call point.
+
+Structured replay evidence accepts only `job`, `persona`, or `resume` kinds, with the canonical ID `read:<kind>:<ref>`.
+
+Each evidence `id`, `ref`, and `source` must be non-empty and no longer than **256** characters; the existing role/evidence binding remains authoritative, and the complete structured payload remains bounded to **8 KiB**.
+
+- Legacy model evidence IDs, `source` kind, canonical ID mismatches, duplicate evidence, and oversized claims fail closed as `invalid_plan_output`. Generic results without `structuredResult` remain compatible.
+- This slice adds no DB, provider, queue, or external-write changes.
+
+**Independent verification:** Focused helper and canonical tests passed **51/51** (**11 + 40**); shared build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
+
+**Candidate boundary:** Live DB/RLS, Redis/queue, provider, restart, browser, and child-parent E2E behavior remain unverified.
+
+---
+
+## 37. P4-07 — Server-bound role provenance for structured wait replay
+
+**Candidate status/date (2026-09-12):** P4-07 is recorded as a candidate server-bound role provenance slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `63da3b45` makes the durable wait consumer project the sanitized target `role` from the server-owned database task into newly generated outcomes. Canonical replay derives the expected role from the server-owned delegate command and pairs it with the `taskId` returned by that delegate receipt.
+
+Structured replay requires both the task role and `structuredResult.role` to match the canonical delegate role. Missing, malformed, oversized, cross-role, duplicate, or ambiguous role mappings fail closed as `invalid_plan_output`; generic legacy results without `structuredResult` remain compatible without a role.
+
+This slice adds no migration, provider, model, queue, or external-write changes.
+
+**Independent verification:** Canonical replay, durable wait consumer, and structured replay evidence focused tests passed **62/62** (**42 + 9 + 11**); shared build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
+
+**Candidate boundary:** Live DB/RLS, Redis/queue, provider, restart, browser, and child-parent E2E behavior remain unverified.
+
+---
+
+## 38. P4-08 — Canonical automation dispatch handoff
+
+**Candidate status/date (2026-09-13):** P4-08 is recorded as a candidate bounded canonical automation dispatch handoff; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `d68b5991` adds the exact server-owned `ENABLE_AGENT_CANONICAL_AUTOMATION=1` gate. For turn-bound `agent-runs` jobs, the Worker uses `enqueueTurn` to persist the durable `agent.turn.dispatch` outbox intent and enqueue the existing `agent-turns` queue with an execution-independent owner and deterministic idempotency/job identity. The untrusted `executionId` is not placed in the canonical payload. Jobs without a `turnId` continue through the authenticated internal Web pipeline; when the gate is off, turn-bound jobs preserve the existing `runCanonicalAgentTurn` adapter behavior. The producer has an explicit close path and constructs no additional Worker.
+
+**Independent verification:** The focused Worker suite passed **16/16**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Execution-control row synchronization is not part of this slice. Live Redis/PostgreSQL, real Worker startup, restart, provider, browser, and child-parent E2E behavior remain unverified. The canonical automation gate remains opt-in; this slice cannot be used to declare complete Harness, P4/Phase completion, or production recovery evidence.
+
+---
+
+## 39. P4-09 — Canonical execution projection and terminal-root reconciliation
+
+**Candidate status/date (2026-09-13):** P4-09 is recorded as a candidate canonical execution projection and failure-recovery slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `67397416` adds an opt-in server-owned projection from canonical Turn outcomes into the existing automation `AgentExecution` control row. The projection sets the tenant context, resolves the execution by session, constrains mutations to the session's `source = 'automation'`, maps completed/failed/dependency-wait/user-wait/interrupted outcomes to the existing control states, preserves cancelled and terminal rows, and keeps `startedAt` stable across retries.
+
+Canonical runtime execution now starts the projection before the engine, finishes the durable root first, and then finishes the projection. If projection finish fails after the root is durable, a lease-fenced optional `RootTaskStore.reconcileTerminal` seam reads and validates the persisted terminal root result on retry; the runtime retries only projection and returns the stored outcome without rerunning the model/engine or finishing the root twice. Legacy root-store test doubles remain compatible when the seam is absent.
+
+**Independent verification:** Focused Worker validation passed **48/48** across canonical execution projection, canonical runtime, and root-task-store tests; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** The projection is opt-in through existing Worker runtime wiring and only affects sessions selected by its automation-session SQL scope. Live PostgreSQL/RLS, Redis/queue delivery, real Worker startup or restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance.
+
+## 40. P4-10 — Execution cancellation interrupt bridge
+
+**Candidate status/date (2026-09-13):** P4-10 is recorded as a candidate bridge from Web Execution cancellation to canonical Turn interruption; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `b39ddd29` moves Execution DELETE cancellation through the server-owned command service. A single transaction scopes the user/session Execution update, the automation-owned active Turn, pending waits, interrupt facts and events/outbox, and the Session `aborted` projection. The interrupt idempotency key combines `executionId` and the current `turnId`, so a restarted execution with a new Turn receives a new cancellation command while repeated delivery of the same Turn is deduplicated.
+
+Ownership mismatches fail closed, ordinary user Turns are not interrupted, and no active Turn remains a safe cancellation path. Completed or failed executions are preserved; an already-cancelled execution is idempotent and can repair a missing durable interrupt. Revision and Execution status races roll back the transaction with typed conflicts, so a cancelled Execution is never resurrected and unknown database or permission errors remain surfaced.
+
+**Independent verification:** Focused Web route and command suites passed **23/23**; shared package build, Worker `tsc --noEmit --skipLibCheck`, Web `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, real Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness or P4/Phase completion; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 41. P4-11 — Turn-fenced canonical execution projection
+
+**Candidate status/date (2026-09-13):** P4-11 is recorded as a candidate stale-Turn projection race repair; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `2bade48d` extends the server-owned `CanonicalExecutionIdentity` with a strictly validated `userId`, `sessionId`, and `turnId`. Projection start and finish SQL require the target Turn to match all three identities and `source = 'automation'`, and require that no newer Turn exists for the same session and user. Newer Turns from any source, including a newly created user Turn, are ordered by `createdAt` with `id` as the deterministic tie-break and prevent the stale projection from updating the Execution row.
+
+The same Turn fence is passed from canonical runtime start, normal terminal finish, and terminal-root reconciliation finish. This closes the automation restart race where a late old-Turn queue delivery or reconciliation could otherwise mark the new generation's `AgentExecution` completed or failed; cancelled/terminal conditional guards and stable `startedAt` behavior remain unchanged.
+
+**Independent verification:** Root independently verified **3 focused suites / 50 tests** across projection, canonical runtime, and root-task-store regression; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, real Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness or P4/Phase completion; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 42. P4-12 — Automation Turn source isolation
+
+**Candidate status/date (2026-09-13):** P4-12 is recorded as a candidate automation-session Turn source-isolation slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `01dc8edd` makes both active and concurrent-race `ensureAutomationTurn` lookups require `source = 'automation'`. After a `P2002`, only a raced Turn with the same `userId`, `sessionId`, and automation source is reusable. If no such Turn is visible, the helper fails closed with `AutomationTurnOccupiedError` and `code = 'automation_turn_occupied'`, so a user or system Turn cannot be returned to an automation run.
+
+Manual automation POST maps this typed conflict to HTTP `409`. The due scheduler treats it as an unstartable round, performs no execution or queue dispatch, and restores `nextRunAt` to the current time for a safe retry. Other database and permission errors remain surfaced.
+
+**Independent verification:** Root independently verified the focused Web suites at **23/23**; Web `tsc --noEmit --skipLibCheck` and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrent database behavior, Redis/queue delivery, real Worker restart, production scheduler timing, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness, P4/Phase completion; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 43. P4-13 — Canonical automation session projection
+
+**Candidate status/date (2026-09-13):** P4-13 is recorded as a candidate Workbench session-state projection slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `7fe3fd7f` adds a server-owned canonical session projection whose identity is strictly bounded by `userId`, `sessionId`, and `turnId`. Every start and finish mutation uses transaction-local `app.user_id`, an automation-session source fence, and an exact/latest Turn fence that rejects any newer Turn from any source. Ordinary user sessions therefore remain no-ops.
+
+Session start moves only a non-`aborted` automation session to `running` and clears completion. Finish maps `completed` to `completed` with `completedAt`, `failed` to `failed` with `completedAt`, dependency waits to `paused`, user/approval waits to `waiting_for_user`, and interrupted Turns to `paused`. Conditional status guards preserve terminal, cancelled, and aborted sessions. Canonical runtime reconciliation and normal execution call the projections in the order root durable finish, execution projection, then session projection; production wiring supplies the session projection alongside the existing execution projection.
+
+**Independent verification:** Root independently verified the canonical session projection, canonical runtime, and root-task-store regression at **51/51**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrent database behavior, Redis/queue delivery, real Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 44. P4-14 — Session-state fence for Turn leasing
+
+**Candidate status/date (2026-09-13):** P4-14 is recorded as a candidate queued-Turn lease safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `eadbaa26` extends the single conditional `claimTurnLease` UPDATE with an `agent_sessions` existence fence. The payload `sessionId` must resolve to the Turn's session and the session `userId` must match the Turn `userId`; sessions with `status = 'aborted'` or `status = 'archived'` cannot be claimed. The fence does not filter by session source, so ordinary user/system sessions and resumable `running`, `paused`, and `waiting_for_user` sessions retain existing behavior. Cross-user and missing-session claims remain unavailable.
+
+A blocked or raced claim continues to surface only the recoverable `TurnLeaseError` with `code = 'lease_not_available'`; no session-state details are exposed to the queue.
+
+**Independent verification:** Root independently verified lease and Turn queue focused suites at **20/20**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real cross-process concurrency, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 45. P4-15 — Context snapshot loader serialization fence
+
+**Candidate status/date (2026-09-13):** P4-15 is recorded as a candidate server-owned context snapshot replay hardening slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `4a248447` adds a strict recursive serialization fence around context compaction input, loader envelopes, protected invariants, and appended observations. BigInt, cyclic references, Symbol/function values, non-finite numbers, non-plain objects, accessors, symbol properties, and sparse arrays fail closed as `TurnEngineError` with `code = 'invalid_output'` instead of reaching `stableJson` or contaminating a replayed snapshot. Loader replay keeps the existing user/session/turn scope fence, protected invariant comparison, bounded snapshot estimate, and no-hook/no-extra-model-call behavior for valid persisted projections.
+
+**Independent verification:** Focused context-compaction runtime tests passed **18/18**; the existing context snapshot adapter regression passed **6/6**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed. The changed runtime source remains within the 250-line project limit.
+
+**Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, provider behavior, process restart, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 46. P4-16 — Subagent claim session-state fence
+
+**Candidate status/date (2026-09-13):** P4-16 is recorded as a candidate queued child-task session-state safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `236180a6` extends `PgSubagentTaskStore.claim` with a server-owned session-state fence. The locked `agent_sessions` row is checked before a queued child claim, and the conditional task UPDATE also requires the session status not to be `aborted` or `archived`. Running, paused, and waiting-for-user sessions remain claimable, as do ordinary user/system sessions; existing root-task, Turn, lease, attempt, and concurrency fences remain unchanged.
+
+**Independent verification:** The focused pg-store suite passed **16/16**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrent transactions, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 47. P4-17 — Subagent creation session-state fence
+
+**Candidate status/date (2026-09-13):** P4-17 is recorded as a candidate queued child-task creation safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `cc7c66c4` extends `PgSubagentTaskStore.create` to read the locked session status and fail closed with the existing `Session is unavailable` error for `aborted` or `archived` sessions. Running, paused, and waiting-for-user sessions remain creatable, as do ordinary user/system sessions; parent-task depth, fan-out, action, model, budget, and other creation semantics remain unchanged.
+
+**Independent verification:** The focused pg-store suite passed **21/21**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrent transactions, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 48. P4-18 — Subagent lease lifecycle session fence
+
+**Candidate status/date (2026-09-13):** P4-18 is recorded as a candidate child-task lease lifecycle safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `d02ab9e0` extends child-task heartbeat, finish, and expired-lease recovery with a server-owned `agent_sessions` state fence. Heartbeat locks and reads the session before renewal and treats `aborted` or `archived` sessions as lost/interrupted without extending the lease. Finish uses the same session-state condition so late child success or failure cannot be written after cancellation or archival. `recoverExpired` reads the session state while reclaiming stale running children and converges closed-session children to `interrupted` instead of re-queueing them. Running, paused, waiting-for-user, and ordinary user/system sessions preserve existing reclaim and retry behavior, including root/Turn/lease/attempt semantics.
+
+**Independent verification:** Root independently verified the focused pg-store suite at **27/27**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real cross-process concurrency, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 49. P4-19 — Subagent shutdown release session fence
+
+**Candidate status/date (2026-09-13):** P4-19 is recorded as a candidate shutdown lease-release safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, and candidate slices do not count as accepted progress.
+
+**Implementation:** Commit `b5a57db9` adds an `agent_sessions` state fence to the conditional `release` UPDATE used during Worker shutdown. The task is returned to `queued` only when the existing task, session, owner, attempt, and interrupt conditions still match and the linked session status is not `aborted` or `archived`. A closed-session release returns `false`, so it does not reset the durable outbox row for republish; normal running, paused, waiting-for-user, and ordinary user/system session behavior remains compatible.
+
+**Independent verification:** Root independently verified the focused pg-store suite at **29/29**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real cross-process concurrency and shutdown races, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 50. P4-20 — Approval session-state fence
+
+**Candidate status/date (2026-09-13):** P4-20 is recorded as a candidate approval lifecycle session-state safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, and candidate slices do not count as accepted progress.
+
+**Implementation:** Commit `9cf15f19` adds an `agent_sessions` open-state fence across approval issue/projectWait, resolve, validate, inspect, consume, and consumeAndReserve paths. Approval reads use an open-session `EXISTS` condition, approval mutations repeat the condition, and `appendAudit` retains an open-session lock fence. Aborted or archived sessions fail closed; `consumeAndReserve` cannot create an external-action reservation or audit/outbox event, while running, paused, waiting-for-user, and ordinary user/system sessions remain compatible with the existing nonce, scope, revision, and tenant semantics. A project-wait closure rolls back the transaction before its wait/item/event side effects are committed.
+
+**Independent verification:** Root independently verified the focused approval-store suite at **13/13**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrency and transaction races, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This slice does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 51. P4-21 — Durable wait session-state fence
+
+**Candidate status/date (2026-09-13):** P4-21 is recorded as a candidate durable dependency-wait session-state safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `6fbb6a64` updates the durable wait store, resolver, handoff, and outcome consumer plus their sibling tests (8 wait modules total). Every wait create, resolve, cancel, scan/wake, suspend/requeue, dispatch-outbox, and consumed-outcome path is fenced by the linked `agent_sessions` status. `aborted` and `archived` sessions cannot create or resolve/cancel waits, be scanned or woken, suspend or requeue a Turn, dispatch an outbox row, or consume an outcome. Open `running`, `paused`, and `waiting_for_user` sessions, together with ordinary `user` and `system` sessions, remain compatible.
+
+Conditional wait/Turn/outbox mutations fail closed when a session closes during a wake or dispatch race; the surrounding transaction rolls back, so no partial wait or Turn wake is committed. A closed-session resolve race returns `null`. The existing lease, user/session scope, idempotency, replay, and deterministic dispatch behavior remain in force.
+
+**Independent verification:** Root independently verified the focused wait suites at **62/62**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, real cross-process concurrency, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 64. P4-34 — Cognitive loop composite startup gate
+
+**Candidate status/date (2026-09-13):** P4-34 is recorded as a candidate server-owned cognitive-loop startup safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `60da99e8` adds the exact-value `ENABLE_AGENT_COGNITIVE_LOOP=1` gate, disabled by default. When enabled, it derives canonical automation, planning, and plan execution together; Worker startup also derives the child executor plus wait resolver, coordination, and wait-outcome consumption as one composite loop gate. Context compaction remains independently controlled. Existing canonical automation, planning, plan-execution, child-execution, and wait-resolver flags retain their independent semantics when the composite gate is off, including the rule that plan execution cannot bypass planning. The agent-run queue continues to route through the production flag resolver, with no model or policy input able to enable the loop.
+
+**Independent verification:** Root independently verified the production flag and agent-run queue focused suites at **14/14**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/Redis behavior, real concurrent startup, Worker restart, provider, browser, and complete child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 63. P4-33 — Canonical root/task/execution session-first fence
+
+**Candidate status/date (2026-09-13):** P4-33 is recorded as a candidate Worker canonical root/task/execution admission safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `72ef8fc9` adds an open-session `FOR UPDATE` fence before every root Turn lease mutation (`claim`, `renew`, `expire`, `release`, and `interrupt`), then preserves the existing owner, version, expiry, status, and idempotency conditions. Root-task `ensure`, `checkCompletion`, and `finish` now lock the user-owned open `agent_sessions` row before the Turn/task path, so missing, cross-user, aborted, or archived sessions fail closed with rollback and no root task or Turn writes. Terminal reconciliation remains a read-only historical lookup so closed-session history and reservation cleanup are not disturbed; subsequent terminal mutations remain fenced. Canonical session and execution projections now lock the same user-owned open session before mutation and cannot reopen archived or aborted sessions. Existing running, paused, and waiting-for-user behavior remains compatible.
+
+**Independent verification:** Root independently verified the four affected focused suites at **80/80** (lease 18, root-task 25, session projection 18, execution projection 19); the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
+
+**Candidate boundary:** `canonical-turn-runtime.test.ts` remains **19/20** in the real-registry/context-builder case because the fake environment reaches a real registry/Redis dependency and returns a failed result; that test does not execute the new lease, root-task, or projection paths, so this remains an unresolved boundary outside P4-33 rather than an attributed regression. Live PostgreSQL/RLS, real concurrent lock races, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 62. P4-32 — V2/legacy session-first durable admission fence
+
+**Candidate status/date (2026-09-13):** P4-32 is recorded as a candidate Web V2/legacy session admission safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `12769a3b` makes `ensureV2Turn` lock the user-owned open `agent_sessions` row first with `status NOT IN ('aborted', 'archived')` and `FOR UPDATE`, then read or create the scoped Turn; P2002 recovery re-confirms the open session before reusing a raced Turn. Dual-write `record` and `finalize` repeat the session-first open fence before Turn, Item, Event, Input, or Outbox work, failing closed with rollback for closed, missing, or cross-user sessions. Review repair commit `3bd1f253` extends the same fence to legacy recorder role/task/transcript writes and finalize/pause session updates: role_start task/currentTask, role_done task completion, transcript append, finalize, and pause all lock the open session inside a transaction, so close races roll back without legacy writes and role task state is published only after successful transaction completion. Run-session recorder admission only advances an existing open or resumable session to `running`; it never reopens `aborted` or `archived` sessions. Fork historical closed-source reads remain unchanged, as do FIFO, idempotency, legacy, and in-memory semantics.
+
+**Independent verification:** Root independently verified the focused V2-turn, dual-write, and run-recorder suites at **39/39** after the repair; Web `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrent lock races, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 53. P4-23 — Mailbox coordination session-state fence
+
+**Candidate status/date (2026-09-13):** P4-23 is recorded as a candidate mailbox coordination safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `82bc4506` changes `requireSession` to use a session-first `FOR UPDATE` lock with `status NOT IN ('aborted', 'archived')`. `sendMessage`, `recordSpawn`, and `appendActivity` all run this guard before idempotency reads or any message, replay/dispatch outbox, activity item, event, or session-sequence write. Closed sessions return the typed `coordination_scope_error`; the transaction rolls back with no side effects. Read-only task/list/spawn-replay behavior is preserved, as are open `running`, `paused`, `waiting_for_user`, and ordinary `user`/`system` session behaviors and existing idempotency semantics.
+
+**Independent verification:** Root independently verified the focused mailbox suite at **10/10**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, real cross-process concurrency, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 54. P4-24 — Tree-budget admission session-state fence
+
+**Candidate status/date (2026-09-13):** P4-24 is recorded as a candidate tree-budget admission safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `bd4f765b` makes reserve lock the linked session first with an open status fence before root/lineage/reservation writes. `aborted`, `archived`, missing, or cross-user sessions fail closed as `root_not_found` with rollback and no writes. Existing reservation settlement remains tenant/session identity scoped and idempotent; `consumed` or `released` cleanup remains allowed after session closure without reopening or creating reservations. Open `running`, `paused`, and `waiting_for_user` sessions, together with ordinary user/system sessions, remain compatible.
+
+**Independent verification:** Root independently verified the focused tree-budget suite at **15/15**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrency, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 55. P4-25 — Tool-result reference write session-state fence
+
+**Candidate status/date (2026-09-13):** P4-25 is recorded as a candidate private tool-result reference admission safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `a5198e2c` makes `put` lock the linked `agent_sessions` row first by user and session with an open-state `FOR UPDATE` fence, before task, step, identity, or reference writes. `aborted`, `archived`, missing, or cross-user sessions fail closed with `tool_result_fence_rejected`, roll back, and issue no reference `INSERT`. Historical reads for root and descendant scopes, including completed, failed, or aborted session records, remain unchanged; open running, paused, waiting-for-user, and ordinary user/system sessions remain compatible.
+
+**Independent verification:** Root independently verified the focused tool-result repository suite at **13/13**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrency, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 56. P4-26 — TurnEngine durable-write session fence
+
+**Candidate status/date (2026-09-13):** P4-26 is recorded as a candidate TurnEngine persistence safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `d2c3af34` makes every TurnEngine mutating path lock the linked open `agent_sessions` row first with `FOR UPDATE`, then acquire the owned Turn lock. `appendEventBatch`, `startStep`, `updateStep`, `waitForUser`, `createItem`, `updateItem`, and `recordFinalResponse` fail closed for `aborted` or `archived` sessions before Step, Item, Event, Turn, session-sequence, or outbox writes, preserving the existing owner, lease, revision, lineage, and idempotency fences.
+
+**Independent verification:** Root independently verified `turn-engine-store.test.ts` at **11/11**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrency and lock races, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 57. P4-27 — Context snapshot write session-state fence
+
+**Candidate status/date (2026-09-13):** P4-27 is recorded as a candidate context snapshot persistence safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `2705047a` makes both snapshot `save` paths lock the linked open session first with `FOR UPDATE`, then perform step/turn scope checks and snapshot writes. `aborted`, `archived`, missing, or cross-user sessions fail closed before `INSERT` or memory-summary `UPDATE`; historical reads remain unchanged, including completed, failed, or aborted session records.
+
+**Independent verification:** Root independently verified the two focused snapshot suites at **17/17**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrency, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 58. P4-28 — Interrupt/terminal session-first fence
+
+**Candidate status/date (2026-09-13):** P4-28 is recorded as a candidate interrupt and terminal-event persistence safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `142360dc` makes durable interrupt persistence and terminal-event append lock the user-owned `agent_sessions` row first with `FOR UPDATE`, read its status, and then lock the scoped Turn with `FOR UPDATE`. Aborted or archived sessions fail closed for new interrupt and terminal writes before Turn updates, event-sequence increments, event inserts, or outbox inserts. Existing interrupt facts, interrupted Turns, and interrupted terminal events remain duplicate-idempotent after session closure. In-memory persistence and terminal-event behavior remain unchanged.
+
+**Independent verification:** Root independently verified the focused interrupt persistence and terminal-event suites at **26/26**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrent lock races, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 59. P4-29 — Input claim/checkpoint session-first fence
+
+**Candidate status/date (2026-09-13):** P4-29 is recorded as a candidate input claim and checkpoint persistence safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `c936b441` makes `assertOwner` lock the user-owned open `agent_sessions` row first with `status NOT IN ('aborted', 'archived')` and `FOR UPDATE`, then acquire the existing Turn ownership, status, and lease `FOR UPDATE` check. The fence covers `getCheckpoint`, `claimInputs`, and `persistCheckpoint`; closed, missing, or cross-user sessions return `owner_conflict` and roll back before subsequent Turn, Input, or Step reads or writes. FIFO, lease, rebuild, idempotency, in-memory, and historical read semantics remain unchanged.
+
+**Independent verification:** Root independently verified `input-claim-store.test.ts` at **9/9**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrent lock races, Redis/queue delivery, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 60. P4-30 — Gmail OAuth wait session-first fence
+
+**Candidate status/date (2026-09-13):** P4-30 is recorded as a candidate Gmail OAuth durable-wait persistence safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `a29fcc0e` makes `createPgGmailOAuthWaitPort().suspend` lock the user-owned open `agent_sessions` row first with `status NOT IN ('aborted', 'archived')` and `FOR UPDATE`, then lock the origin `in_progress` Turn with `FOR UPDATE`. Closed, missing, or cross-user sessions fail closed before `agent_items`, session event-sequence, or `agent_events` writes and roll back. The open path preserves session → Turn → item → sequence → event order plus privacy and reconnect URL/wait ID semantics. `persistSendEvidence` is intentionally unchanged so an already-sent external email retains recoverable durable audit evidence even if the session closes.
+
+**Independent verification:** Root independently verified `gmail-store.test.ts` at **8/8**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrent lock races, Redis/queue delivery, Worker restart, OAuth provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 61. P4-31 — Web command admission open-session fence
+
+**Candidate status/date (2026-09-13):** P4-31 is recorded as a candidate Web command-admission safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `4f704402` adds `lockOpenSession`, which locks the user-owned session with `status NOT IN ('aborted', 'archived')` and `FOR UPDATE` before command admission. `start`, `message`, `steer`, and `interrupt` fail closed with rollback before any Turn, Item, Event, Input, or Outbox mutation for closed, missing, or cross-user sessions. `lockOwnedSession` remains unchanged so fork can read historical closed source sessions and cancellation retains its existing idempotency and repair behavior.
+
+**Independent verification:** Root independently verified the command and cancellation suites at **36/36**, the fork route suite at **2/2**, Web `tsc --noEmit --skipLibCheck`, and `git diff --check`.
+
+**Candidate boundary:** Live database/RLS, real concurrency, Worker restart, and full route E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 52. P4-22 — Wakeup resume session-state fence
+
+**Candidate status/date (2026-09-13):** P4-22 is recorded as a candidate wakeup resume safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `54a93b0c` makes wakeup resume acquire the linked `agent_sessions` row with `FOR UPDATE` before reading or changing the Turn. `aborted` and `archived` wakeups return `ignored` before any Turn, item, event, session-sequence, or dispatch-outbox write. The conditional Turn update and session event-sequence update both require an open session fence. If a session closes at the resume-event boundary, the transaction rolls back with no partial writes. `drainAgentWakeups` marks the source wakeup published for ignored/already-resumed outcomes without creating resume side effects; open and duplicate delivery behavior remains compatible.
+
+**Independent verification:** Root independently verified the focused wakeup suite at **9/9**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, real cross-process concurrency, Worker restart, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 65. P4-35 — Atomic subagent spawn transaction
+
+**Candidate status/date (2026-09-13):** P4-35 is recorded as a candidate Worker atomic child-spawn durability slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `549636d6` adds `PgSubagentTaskStore.createWithSpawn`, which performs the open user/session fence, existing spawn idempotency replay before parent fan-out and depth checks, child task insertion, spawn operation outbox insertion, and dispatch outbox insertion in one PostgreSQL transaction. A failure rolls back the queued child and both outbox rows together. `AgentTreeManager` and `executeSpawn` select this atomic seam only when the store capability exists; memory and custom stores explicitly retain the prior two-phase fallback. Duplicate calls replay the winner and preserve replay activity. Existing parent/child scope, policy, depth, fan-out, and idempotency rules remain enforced.
+
+**Independent verification:** Root independently verified the focused Worker suites at **53/53**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrent transactions, Worker restart, Redis/BullMQ delivery, provider, browser, and child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 66. P4-36 — Deterministic child-wait-resume composition fixture
+
+**Candidate status/date (2026-09-13):** P4-36 is recorded as a candidate deterministic child-to-parent composition fixture; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `76227d96` adds a focused fixture that drives the actual Worker coordination seams through root spawn, child queueing via the queue helper, child claim/retry/finish, durable wait resolution and wake, parent Turn outbox dispatch, parent re-claim under a new lease, once-only wait outcome consumption, and the server-owned completion gate. It observes the child result and retry/wait boundary, proves duplicate resolver and consumer calls do not repeat wake or durable outcome writes, and records completion feedback only after the child reaches terminal state. Child dispatch in this fixture is a direct queue-helper invocation; parent wake uses the Turn outbox. The fixture uses an in-memory store, fake PostgreSQL, and an `ioredis` test disconnect stub; it does not enable the cognitive gate.
+
+**Independent verification:** Root independently verified the focused Worker composition and directly related suites at **90/90** across 8 files; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
+
+**Candidate boundary:** Live Redis/BullMQ, PostgreSQL/RLS, real concurrent transactions, Worker restart, provider, browser, and full production child-parent E2E behavior remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance; overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 67. P4-37 — Durable subagent dispatch repair and RLS aggregate scope
+
+**Candidate status/date (2026-09-13):** P4-37 is recorded as a candidate durable subagent dispatch recovery and aggregate-scoping slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commits `e56b0b06` (missing dispatch repair), `a602d8bd` (session-first lock and placeholder repair), and `1591b9d2` (shutdown release key and session scope) make recovery lock eligible open `agent_sessions` rows first, then lock queued or retrying runnable tasks with no deterministic `subagent-dispatch:${taskId}` intent. The repair inserts a session-scoped unpublished `agent_outbox` row with idempotent conflict handling, after which the normal dispatcher publishes it; queue failure leaves the row unpublished. Expired running-task recovery remains unchanged. The affected recovery queries also use valid PostgreSQL `LIMIT`-before-`FOR UPDATE` ordering. Session, root, Turn, interrupt, attempt, user scope, and terminal-state predicates remain enforced.
+
+**Independent verification:** Root independently verified the P4-37 queue, Pg store, and manager focused suites at **56/56**; an additional integration fixture in the same command brought the evidence to **57/57**. The shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrent lock races, Redis/BullMQ delivery, process restart, provider, browser, and full production child-parent E2E behavior remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance, and overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 68. P4-38 — PostgreSQL recovery locking clause order
+
+**Candidate status/date (2026-09-13):** P4-38 is recorded as a candidate PostgreSQL recovery SQL reliability slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `32368bb4` corrects the locking-clause order in exactly six active Worker recovery queries: the wakeup outbox, Turn reclaim CTE, queued Turn dispatch repair, pending Turn outbox, durable-wait Turn scan, and durable-wait condition scan. Only the clause order changed to `LIMIT ... FOR UPDATE [OF ...] SKIP LOCKED`; predicates, lock targets, and parameters remain unchanged. There is no behavior, model, or feature-gate change.
+
+**Independent verification:** Root independently verified 11 Worker suites at **151/151**, covering the affected three suites plus queue, Pg store, manager, coordination integration, durable waits, Turn queue, and root-task coverage. The shared package build, Worker `tsc --noEmit --skipLibCheck`, `git diff --check`, and a repository scan confirming no old-order pattern remains in `apps/worker/src` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrent lock races, Redis/BullMQ delivery, process restart, provider, browser, and full production child-parent E2E behavior remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance, and overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 69. P4-39 — Turn dispatch aggregate scope and recovery bookkeeping
+
+**Candidate status/date (2026-09-13):** P4-39 is recorded as a candidate session-scoped Turn dispatch consistency slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commits `331edc78`, `e48c596f`, and `704c1750` align `agent.turn.dispatch` aggregate scope across the Web root command, Turn recovery/repair, durable-wait handoff/resolver, and claim bookkeeping paths. Each dispatch intent uses the owning `sessionId` as `aggregateId`, while the idempotency key remains `turn-dispatch:<turnId>`. Recovery joins on both session identity and the deterministic key to prevent cross-Turn reuse, and `ON CONFLICT` handling preserves the session aggregate fence.
+
+**Independent verification:** Root independently verified the Web command-service and transaction suites at **30/30** and the Worker recovery-scanner, turn-queue, durable-wait-handoff, and durable-wait-resolver suites at **44/44**. Web and Worker `tsc --noEmit --skipLibCheck`, the shared package build, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, Redis/BullMQ delivery, real concurrent transactions, process restart, provider/browser behavior, and full child-parent E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance, and overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 70. P4-40 — Atomic root Scout/Analyst orchestration
+
+**Candidate status/date (2026-09-13):** P4-40 is recorded as a candidate atomic root orchestration slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `97b04bd7` adds atomic root Scout/Analyst orchestration. When `AgentTreeManager.supportsAtomicSpawn()` is true, root orchestration concurrently uses role-specific `${waitId}:scout` and `${waitId}:analyst` spawn idempotency keys. `spawnAtomic` commits the child task, spawn operation, and dispatch outbox in one transaction; the atomic path does not invoke the external dispatch callback. Duplicate tasks still enter durable wait. Non-atomic stores retain the `manager.spawn` plus dispatch fallback.
+
+**Independent verification:** Root independently verified the five focused Worker suites at **57/57** (root-orchestration 5, manager 5, Pg store 32, coordination-executors 9, production-bootstrap 6). The shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, Redis/BullMQ delivery, cross-process concurrency, process restart, provider/browser behavior, and full child-parent E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance, and overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 71. P4-41 — Turn reclaim, repair, and dispatch close-race fence
+
+**Candidate status/date (2026-09-13):** P4-41 is recorded as a candidate Turn dispatch close-race safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commits `ce679075` and `87c03b2d` fence all three Turn reclaim, repair, and dispatch paths with `session.status NOT IN ('aborted', 'archived')`. Before `queue.add`, dispatch re-locks the owning session and pending outbox row, then marks the outbox row published in the same transaction to control the close race.
+
+**Independent verification:** Root independently verified the focused Worker suites at **15/15**. Worker `tsc --noEmit --skipLibCheck`, the shared package build, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, Redis/BullMQ delivery, crash/restart behavior, cross-process close races, and complete Worker/child-parent E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance, and overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 72. P4-42 — Durable-wait handoff and resolver lock order
+
+**Candidate status/date (2026-09-13):** P4-42 is recorded as a candidate durable-wait lock-order safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `0cd75cb4` aligns durable-wait handoff and resolver locking. Handoff first locks the user-owned session and verifies the open-session fence, then locks the origin Turn. Resolver joins the user-owned session to the Turn and uses `LIMIT ... FOR UPDATE OF session, turn SKIP LOCKED`, preserving the session-before-Turn lock order.
+
+**Independent verification:** Root independently verified the focused Worker suites at **30/30**. Worker `tsc --noEmit --skipLibCheck`, the shared package build, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real cross-process lock ordering and close races, Redis/queue delivery, process restart, and complete Worker/child-parent E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance, and overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 73. P4-43 — Runtime legacy Turn dispatch aggregate repair
+
+**Candidate status/date (2026-09-13):** P4-43 is recorded as a candidate runtime legacy Turn dispatch repair slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `03cdd550` adds runtime legacy repair for Turn dispatch aggregates. The repair derives the session aggregate from the canonical session → Turn → outbox relationship and updates only rows that are open, unpublished, and have consistent topic, idempotency, and payload values. Stale predicates guard each `UPDATE`; `recoverTurnQueue` merges repaired rows into normal recovery. Canonical, closed, missing, and corrupt rows remain unchanged.
+
+**Independent verification:** Root independently verified the Recovery and Turn queue suites at **32/32**. Worker `tsc --noEmit --skipLibCheck`, the shared package build, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, restart behavior, and complete Worker E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance, and overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 74. P4-44 — Child subagent dispatch enqueue close-race fence
+
+**Candidate status/date (2026-09-13):** P4-44 is recorded as a candidate child dispatch recovery and enqueue safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commits `305ce8f3` and fixture repair `56db3eda` harden child `agent.subagent.dispatch` recovery and enqueue. The scan uses a canonical session JOIN with the open-session fence `session.status NOT IN ('aborted', 'archived')`. Before enqueue, dispatch re-locks the session and outbox, performs `queue.add`, and marks the outbox row published in the same transaction; payload aggregate mismatches fail closed. At-least-once delivery and the idempotent job ID remain intact. `56db3eda` only updates the combination fake adapter to match the P4-41 canonical Turn outbox SQL.
+
+**Independent verification:** Root independently verified the coordination integration, recovery scanner, and subagent queue suites at **52/52**. Worker `tsc --noEmit --skipLibCheck`, the shared package build, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, restart behavior, and complete Worker E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance, and overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 75. P4-46 — Recovered child dispatch session fence
+
+**Candidate status/date (2026-09-13):** P4-46 is recorded as a candidate recovered child dispatch admission safety slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commits `c408e2a4` and `7cb3b169` harden recovered child dispatch writes. Recovery reset now admits work through an open-session `FOR UPDATE` fence, every child dispatch insert path applies the same open guard, and conflict updates remain aggregate scoped. Closed, archived, and missing sessions are no-ops. `7cb3b169` only satisfies the 250-line source-file rule.
+
+**Independent verification:** Root independently verified the subagent, manager, coordination, and composition suites at **41/41**. Worker `tsc --noEmit --skipLibCheck`, the shared package build, and `git diff --check` also passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, Redis/queue delivery, restart behavior, and complete Worker E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance, and overall progress remains **P0 accepted 1/8 (12.5%)**.
+
+## 76. P4-47 — Scoped child-subtree interruption
+
+**Candidate status/date (2026-09-13):** P4-47 is recorded as a candidate scoped child-subtree interruption increment only; overall phase acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `5a6398e6` carries the selected task path through the coordination executor and `AgentTreeManager`. The manager exposes an optional `interruptSubtree` store seam, filters active executions by session/root/path subtree, aborts and disposes matching controllers, and uses the root legacy fallback only for a root target when the seam is unavailable. Unsupported non-root scoped interruption fails visibly. The PostgreSQL implementation applies a session-first open `FOR UPDATE` fence before updating the requested path subtree. Durable wait cancellation follows the selected task and subtree scope; closed, archived, and missing sessions are no-ops.
+
+**Independent verification:** Root independently verified the five focused Worker files at **71/71**; Worker `tsc --noEmit --skipLibCheck`, the `@jobcopilot/shared` build, and `git diff --check` passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrent execution, Redis/BullMQ, Worker restart, provider/browser behavior, and child-parent E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance. Overall phase acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## 80. P4-51 — Pending mailbox context injection
+
+**Candidate status/date (2026-09-14):** P4-51 is recorded as a candidate pending mailbox context injection slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `fc06ade3` adds `ChildMailboxReader` to every child context build. It reads at most 20 pending messages with user/session/task scope and maps each payload into `pending_input` data and `external_untrusted` blocks. Production defaults to `PgCoordinationStore`.
+
+This slice does not consume messages, mutate a checkpoint or cursor, add a migration, or add an outbox consumer; semantics remain at-least-once only. A known risk is repeated pending-message injection; future work should add claim/lease/checkpoint handling.
+
+**Independent verification:** Root independently verified the combined focused suite at **49/49**; the shared package build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrency, Redis/BullMQ delivery, Worker restart, provider/browser behavior, and complete E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance. Overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## 79. P4-50 — Durable mailbox pending read and idempotent consume seam
+
+**Candidate status/date (2026-09-14):** P4-50 is recorded as a candidate durable mailbox acknowledgement slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `af525085` adds an optional `CoordinationStore` `listPendingMessages`/`consumeMessages` seam. Pending reads use stable `createdAt,id` ordering, and both operations enforce the open-session plus tenant/task fences. Consumption updates only rows where `consumedAt IS NULL`, making retries idempotent while leaving `deliveredAt` unchanged. This slice adds no child context, outbox consumer, or migration; its semantics are limited to at-least-once inbox acknowledgement.
+
+**Independent verification:** Root independently verified the mailbox suite at **15/15**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrency, Redis/BullMQ delivery, process restart, provider, browser, and child-parent E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance. Overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## 78. P4-49 — Child lifecycle lineage authorization
+
+**Candidate status/date (2026-09-14):** P4-49 is recorded as a candidate child lifecycle lineage authorization slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `0941a812` fences root/child lifecycle controls by lineage. A root task may control the root and same-tree descendants; a non-root task may control itself and its descendants. Sibling, ancestor, and foreign tasks remain hidden. `send_message` behavior remains unchanged.
+
+**Independent verification:** Root independently verified the focused Worker suites at **13/13**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrent execution, Redis/BullMQ delivery, Worker restart, provider/browser behavior, and complete E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance. Overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## 77. P4-48 — Server-owned ActiveExecution interruption durability
+
+**Candidate status/date (2026-09-14):** P4-48 is recorded as a candidate server-owned interruption and durable terminalization slice; overall phase acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `4aacbda2` adds a server-owned `interrupted` marker to `ActiveExecution`. The `interrupt`, `interruptSubtree`, and `heartbeat(interrupted)` paths set the marker and trigger abort. A proactive interruption from `run()` follows the existing fenced `store.finish` path and immediately persists durable `interrupted`; genuine `lease_lost`, close/recovery, and shutdown retain their original semantics and do not finish. One-time disposal, slot release, and timer cleanup are protected, while late writes remain fenced by owner, session, attempt, and lease identity.
+
+**Independent verification:** Root independently verified the five focused Worker files at **75/75**; Worker `tsc --noEmit --skipLibCheck`, the `@jobcopilot/shared` build (pretest), and `git diff --check` passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, real concurrent execution, Redis/BullMQ, Worker restart, provider/browser behavior, and child-parent E2E remain unverified. The cognitive gate remains disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance. Overall phase acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## 81. P4-52 — Owner-fenced mailbox consumption
+
+**Candidate status/date (2026-09-14):** P4-52 records the server-owned lease fence required before mailbox acknowledgments can be connected to child terminal success; overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+**Implementation:** Commit `ee197502` requires `consumeMessages` to carry ownerId, attemptCount, and now. PostgreSQL locks the target task and requires the same owner and attempt, running status, no interrupt request, an unexpired lease, and an open tenant session before updating only unconsumed rows. Repeated and unknown IDs remain idempotent and deliveredAt is unchanged.
+
+**Boundary:** This slice does not wire acknowledgment into the child executor, add a migration or outbox consumer, or claim exactly-once recovery. A later design must reconcile terminal success with the manager finish transaction and lease races. Root verified the mailbox suite at **23/23**, shared build, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check`; live PostgreSQL/RLS, concurrency, Redis/BullMQ, restart, provider/browser, and child-parent E2E remain unverified. The cognitive gate remains disabled.
+
+## 82. P7-3 — V2 cognitive plan ledger projection
+
+**Candidate status/date (2026-09-15):** P7-3 is recorded as a candidate read-only plan visibility slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Web V2 now strictly parses the existing server-owned `plan.revision`, `plan.command`, and `plan.observation` envelopes and folds them into a bounded plan ledger. The projection validates session/Turn/task scope, null item binding, actor, decimal sequence, contiguous plan revisions, goal epochs, and bounded command/control receipt shapes. A new goal revision can restart at plan revision 1; late events from an older goal epoch cannot replace the current plan. The Supervisor renders only the latest revision and translated local step labels, action kinds, statuses, and dependency counts, keeping receipt IDs, raw objectives, rationale, output, error text, wait IDs, and other opaque data out of the React projection. The slice is read-only and does not change Worker/runtime/model behavior, queue admission, persistence, schema, or feature flags.
+
+**Independent verification:** Root reran the V2 suite at **110/110 tests across 27 files**, Web `tsc --noEmit --skipLibCheck`, and `git diff --check`. New coverage includes strict receipt redaction, malformed/foreign/stale rejection, goal-epoch reset, bounded retention, timeline folding, hook projection, and card rendering.
+
+**Candidate boundary:** The first implementation relies on the existing V2 SSE durable replay and does not yet add plan rows to the authenticated timeline hydration response. Live PostgreSQL/RLS, SSE reconnect/overflow, process restart, Worker/Redis delivery, provider/browser behavior, deployment, and complete end-to-end session evidence remain unverified. The cognitive loop and production feature flags remain disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance.
+
+## 83. P7-4 — Plan ledger hydration and replay ordering
+
+**Candidate status/date (2026-09-15):** P7-4 is recorded as a candidate durable restore projection slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** The authenticated first-page timeline route now queries a bounded tail of existing `plan.revision`, `plan.command`, and `plan.observation` events. Each raw envelope is strictly validated before redaction, then parsed again after sensitive output, error text, dependency identities, completion criteria, and approval boundaries are removed or neutralized. Only scopes with a valid revision are returned, in durable sequence order; wrong tenant/scope, actor/item, malformed, oversized, unsupported, and revisionless rows are omitted. `hydrateTimeline` reads the optional first-page `planEvents` field, merges it with agenda and steering-marker tails by decimal sequence and stable ID, and feeds the existing reducer without adding a subscription or side effect.
+
+**Independent verification:** Root reran the route and stream suites at **21/21**, the full V2 suite at **112/112 across 27 files**, Web `tsc --noEmit --skipLibCheck`, and `git diff --check`. Coverage includes bounded query shape, ascending output, raw/sanitized strict parsing, redaction, malformed rejection, first-page-only hydration, stable tie ordering, and legacy response compatibility.
+
+**Candidate boundary:** No live PostgreSQL/RLS query, production SSE reconnect/overflow, process restart, Worker/Redis delivery, provider/browser behavior, deployment, or complete end-to-end session evidence was added. The cognitive loop and production feature flags remain disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance.
+
+## 84. P7-5 — V2 approval ledger read-only projection
+
+**Candidate status/date (2026-09-15):** P7-5 is recorded as a candidate read-only approval visibility slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Web V2 now strictly parses the existing approval lifecycle events and folds them into a bounded approvalId-keyed ledger. Legacy audit receipts map `approval.resolved` to an explicit `resolved` state because they do not carry a decision; broker approved/rejected receipts preserve their decision, and the existing system interrupt receipt maps to `cancelled`. The React projection contains only safe action, status, revision, and pending-count fields. The authenticated first-page timeline exposes only bounded, raw-before-redaction, twice-validated `approvalEvents`, and the existing stream client merges them through the canonical reducer. No approve/decline write path, Worker/runtime behavior, schema, queue, or feature flag changed.
+
+**Runtime boundary:** `approval.expired` is accepted as a strict protocol shape for forward compatibility, but the current Web/Worker approval paths have no observed expired-event emitter. No synthetic expiration event is produced.
+
+**Candidate boundary:** Focused parser/view/card/reducer/route/stream validation covers strict envelopes, redaction, lineage and transition rejection, cancellation, hydration ordering, and legacy response compatibility. Live PostgreSQL/RLS, production SSE reconnect/overflow, process restart, Worker/Redis delivery, provider/browser behavior, deployment, and complete end-to-end approval evidence remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance.
+
+## 85. P7-6 — V2 Supervisor approval decision command
+
+**Candidate status/date (2026-09-15):** P7-6 is recorded as a candidate Web-only approval action slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Pending approval action references remain reducer-owned and carry only the strict event's approval, Turn, task lineage and safe action label. `AgentApprovalLedgerCard` enables localized approve/reject buttons only when the action's session-owned Turn supplies a safe current Turn revision. The command uses the existing `POST /api/agent/sessions/{id}/approvals/{approvalId}` Broker contract with one generated client message ID in both body and idempotency header, and sends no nonce, scope, job, user, or raw receipt material.
+
+**Concurrency and authority:** 202 `resolved` and `duplicate` responses acknowledge command acceptance only. The card has no optimistic ledger mutation; authoritative approval facts and the existing lifecycle-driven Supervisor refetch establish the resulting status. Per-approval double-submit guards, paused-session disabling, unavailable-Turn feedback, and render-time session/selection/revision fences prevent stale responses from contaminating the current view. No old `/actions` path, API route, Worker/runtime behavior, schema, queue, or feature flag changed.
+
+**Candidate boundary:** Focused action helper, ledger view, card, reducer, hook, and stream validation covers exact command payload/header, 202/duplicate/malformed response handling, pending action mapping, no-secret/no-ID rendering, paused and unavailable states, and epoch fencing. Live Broker/DB behavior, SSE timing, duplicate delivery under production concurrency, process restart, deployment, and complete end-to-end approval evidence remain unverified. `approval.expired` remains protocol-compatible only; no client-side expiry was introduced.
+
+## 86. P7-7 — V2 canonical question answer
+
+**Candidate status/date (2026-09-15):** P7-7 is recorded as a candidate Web-only canonical question answer slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Web V2 now strictly projects canonical `question` items with bounded safe question text, stage, and finite option labels/values. It excludes OAuth waits and malformed or incomplete items; because the current live `item.started` payload contains only identifiers, it fails closed until a full canonical item is available. Actionable pending state requires `status: started`, `pending: true`, and `answerAvailable: false`; answered and interrupted terminal items remain visible without controls.
+
+**Command and authority:** Option labels are rendered while option values remain in memory for submission. Free text is bounded and normalized before the existing `POST /api/agent/sessions/{id}/questions/{questionId}` Broker command. The body contains only `clientMessageId`, `expectedTurnId`, `expectedRevision` from the session-owned Turn, and `answer`, with the same client ID in the idempotency header. 202 `resolved` and `duplicate` acknowledgements trigger a safe refresh hint but never mutate the item optimistically; authoritative `question.answered` and system interrupt `question.cancelled` facts establish terminal state.
+
+**Candidate boundary:** Focused parser/action/card/reducer validation covers strict item/event parsing, OAuth exclusion, option/free-text controls, no-ID/no-answer rendering, paused and unavailable states, exact command payload/header, duplicate/malformed/network handling, terminal completion/interruption, regression rejection, and epoch fencing. The current producer's missing pending marker and ID-only `item.started` form remain runtime limitations; no API, wait helper, Broker, Worker, schema, queue, OAuth recovery, or feature flag changed.
+
+## 87. P7-8 — V2 live question hydration
+
+**Candidate status/date (2026-09-15):** P7-8 is recorded as a candidate Web-only live question hydration slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** The live V2 `item.started` question stub is used only to trigger an owner-scoped canonical timeline hydration. Strict schema, actor, session, sequence, item, and question payload checks reject malformed or foreign stubs. The reducer records the stub event metadata without materializing an unknown item. Canonical question items arrive through the existing timeline replay reducer, while foreign session values are filtered before dispatch.
+
+**Concurrency and fences:** A single hydration pump coalesces pending question keys, drains keys observed during an in-flight request, reuses the stream `AbortSignal`, and never opens a second SSE subscription. Aborted responses do not dispatch. The existing durable cursor and overflow snapshot path remain unchanged. Canonical hydration applies terminal answer/cancellation facts only when question lineage and sequence fences match, preventing stale terminal facts from regressing a newer snapshot.
+
+**Independent verification:** Focused Web validation passed **39/39 tests across 3 files** (question hydration, stream client, timeline reducer), Web `tsc --noEmit --skipLibCheck`, and `git diff --check`. No API, Worker, schema, queue, model, OAuth, or feature flag changed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, production SSE reconnect/overflow, process restart, Worker/Redis delivery, provider/browser behavior, deployment, and complete end-to-end question evidence remain unverified. The cognitive loop and production feature flags remain disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance.
+
+## 88. P7-9 — V2 context compaction ledger projection
+
+**Candidate status/date (2026-09-15):** P7-9 is recorded as a candidate Web-only context compaction visibility slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Web V2 now strictly parses the server-owned `context.compaction` envelope and folds valid records into a bounded ledger keyed by `(turnId, taskId)`. The projection retains only status, token/byte metrics, safe reduction values, sequence, and a generic scope ordinal; snapshot references, idempotency keys, failure codes, raw payloads, and task IDs are excluded from React. Duplicate or older records are ignored per scope, at most eight latest records are retained, and valid events from another scope remain accepted even when their sequence is older than the global cursor. The existing V2 SSE durable projection applies context.compaction-specific safe redaction, and the first-page timeline contract includes bounded `compactionEvents`; the existing single SSE stream, hydration, overflow rehydrate, hook snapshot, and localized read-only Supervisor card consume it without lifecycle refetch or a second subscription. No new API route, schema, Worker, queue, model, or feature flag was added.
+
+**Independent verification:** Focused Web validation passed **172 tests across 38 V2 files** and **75 focused route/SSE tests**, covering strict parsing, redaction, foreign/malformed/duplicate/older/bounds handling, bounded query ordering, first-page hydration, stable live/overflow ordering, hook projection, safe scope labels, and card rendering. Web `tsc --noEmit --skipLibCheck` and `git diff --check` pass.
+
+**Candidate boundary:** Live PostgreSQL/RLS, production SSE reconnect/overflow, process restart, Worker/Redis delivery, provider/browser behavior, deployment, and complete end-to-end compaction evidence remain unverified. The cognitive loop and production feature flags remain disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance.
+
+## 89. P8-1 — V2 canonical runtime cutover
+
+**Candidate status/date (2026-09-15):** P8-1 is recorded as a candidate V2 Worker runtime cutover slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Turn-bound `agent-runs` jobs retain the exact server-owned `ENABLE_AGENT_CANONICAL_AUTOMATION=1` rollout gate. When enabled, every `turnId` job uses the existing durable `agent-turns` producer and therefore reaches the production canonical runtime's ModelAdapter and ToolRouter chain. When disabled, the queue explicitly rolls back to the existing `pipeline-turn-adapter`, preserving terminal behavior for an already-created automation Turn instead of leaving it queued. Both the canonical producer and the legacy adapter derive owner/job identity from `turnId`; `executionId` is not used for ownership or job identity. Jobs without `turnId` remain on the authenticated internal Web pipeline.
+
+**Independent verification:** The focused Worker queue, legacy executor identity, and canonical-dispatch tests passed **13/13** after the cutover. Coverage includes gate-off compatibility, gate-on routing, legacy routing, enqueue failure propagation, deterministic identity, and execution-independent ownership. The shared package build completed as the Worker test pre-step.
+
+**Operational risk:** Gate-off intentionally uses the fixed adapter as rollback behavior, so it does not exercise the real ModelAdapter/ToolRouter path. Gate-on delivery, adapter terminalization against live state, and switching the rollout gate across retries require live Redis/PostgreSQL and Worker restart validation.
+
+**Candidate boundary:** No live PostgreSQL/RLS, Redis/BullMQ delivery, real Worker startup or restart, provider/model call, browser behavior, or complete V2-to-canonical end-to-end evidence was run. No schema, provider, Web, queue, or feature flag was added; the canonical rollout gate remains the production boundary.
+
+## 90. P8-2 — Native `agent.followup` coordination tool
+
+**Candidate status/date (2026-09-16):** P8-2 is recorded as a candidate native coordination follow-up slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** The coordination registry adds the gated `agent.followup` tool. It accepts only `idempotencyKey`, `taskId`, `goal`, optional bounded `constraints`/`successCriteria`, and optional `context`. The source is resolved through existing tenant/session/Turn/root/lineage visibility checks, must be terminal, and cannot be a root task. The current server-owned runtime task is always the new task's parent; source role/taskType are inherited while manager/store policy, allowed actions, model, tool policy, and budget inheritance remain server-owned.
+
+**Durability and replay:** Follow-ups use the existing atomic manager/store spawn path and therefore create the normal `agent.subagent.spawn` and `agent.subagent.dispatch` outbox intents. Existing source status/result is never changed. Replay validates persisted server-owned provenance (`kind`, source task, source status, attempt count, bounded prior result) against the requested source and current parent/Turn. Caller context and prior result use existing lifecycle redaction and foreign-key stripping, each bounded to 2 KiB; caller context cannot overwrite provenance. A same-key different-source request fails closed with `coordination_idempotency_conflict`.
+
+**Independent verification:** Focused Worker coordination, visibility, registry, runtime, and mailbox suites passed **70/70 tests across 6 files**; the shared package build ran as the Worker test pre-step, Worker `tsc --noEmit --skipLibCheck` passed, and `git diff --check` passed.
+
+**Candidate boundary:** No live PostgreSQL/RLS, real outbox/Redis/BullMQ delivery, concurrent production idempotency race, process restart, provider/model/browser behavior, migration, or complete supervisor/root/worker child-parent E2E evidence was added. No schema, Web, provider, queue, model, or feature flag changed; the coordination gate remains the runtime activation boundary.

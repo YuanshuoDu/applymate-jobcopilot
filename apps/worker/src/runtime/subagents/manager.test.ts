@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 
 import { AgentTreeManager, type SubagentClock } from "./manager.js"
 import {
@@ -11,12 +11,18 @@ import {
 } from "./types.js"
 
 class FakeClock implements SubagentClock {
+  clearCount = 0
+
   setInterval(): ReturnType<typeof setInterval> { return {} as ReturnType<typeof setInterval> }
-  clearInterval(): void {}
+  clearInterval(): void { this.clearCount += 1 }
 }
 
 class MemoryStore implements SubagentStore {
   readonly records = new Map<string, SubagentTaskRecord>()
+  readonly finishCalls: Array<{ taskId: string; status: SubagentExecutionResult["status"]; attemptCount: number }> = []
+  readonly finishMailboxMessageIds: Array<readonly string[] | undefined> = []
+  readonly finishRetryDispositions: Array<SubagentExecutionResult["retryDisposition"]> = []
+  heartbeatResult: "renewed" | "interrupted" | "lost" | null = null
   private nextId = 1
 
   async create(input: SubagentTaskSpec & { policy: SubagentPolicy }): Promise<SubagentTaskRecord> {
@@ -52,15 +58,24 @@ class MemoryStore implements SubagentStore {
     const task = this.records.get(input.taskId)
     if (!task || task.sessionId !== input.sessionId || task.leaseOwner !== input.ownerId || task.status !== "running") return "lost"
     if (task.interruptRequestedAt) return "interrupted"
+    if (this.heartbeatResult) {
+      const result = this.heartbeatResult
+      this.heartbeatResult = null
+      if (result === "interrupted") this.records.set(task.id, { ...task, interruptRequestedAt: input.now })
+      return result
+    }
     this.records.set(task.id, { ...task, leaseExpiresAt: new Date(input.now.getTime() + 60_000) })
     return "renewed"
   }
 
-  async finish(input: { taskId: string; sessionId: string; ownerId: string; status: SubagentExecutionResult["status"]; result?: unknown; failureReason?: string; now: Date }): Promise<"completed" | "retrying" | "failed" | "waiting" | "waiting_for_user" | "interrupted" | null> {
+  async finish(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; status: SubagentExecutionResult["status"]; result?: unknown; failureReason?: string; retryDisposition?: SubagentExecutionResult["retryDisposition"]; mailboxMessageIds?: readonly string[]; now: Date }): Promise<"completed" | "retrying" | "failed" | "waiting" | "waiting_for_user" | "interrupted" | null> {
+    this.finishCalls.push({ taskId: input.taskId, status: input.status, attemptCount: input.attemptCount })
+    this.finishMailboxMessageIds.push(input.mailboxMessageIds)
+    this.finishRetryDispositions.push(input.retryDisposition)
     const task = this.records.get(input.taskId)
     if (!task || task.sessionId !== input.sessionId || task.leaseOwner !== input.ownerId || task.status !== "running") return null
     const interrupted = task.interruptRequestedAt !== null
-    const retry = input.status === "failed" && !interrupted && task.attemptCount < task.maxAttempts
+    const retry = input.status === "failed" && !interrupted && input.retryDisposition !== "terminal" && task.attemptCount < task.maxAttempts
     const status = interrupted ? "interrupted" : retry ? "queued" : input.status
     this.records.set(task.id, { ...task, status, result: input.result ?? null, failureReason: input.failureReason ?? null, leaseOwner: null, leaseExpiresAt: null })
     if (interrupted) return "interrupted"
@@ -75,12 +90,32 @@ class MemoryStore implements SubagentStore {
     return true
   }
 
+  async release(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; now: Date }): Promise<boolean> {
+    const task = this.records.get(input.taskId)
+    if (!task || task.sessionId !== input.sessionId || task.leaseOwner !== input.ownerId || task.attemptCount !== input.attemptCount || task.interruptRequestedAt || task.status !== "running") return false
+    this.records.set(task.id, { ...task, status: "queued", leaseOwner: null, leaseExpiresAt: null })
+    return true
+  }
+
   async interruptTree(input: { sessionId: string; rootTaskId: string; now: Date }): Promise<number> {
     let count = 0
     for (const task of this.records.values()) {
       if (task.sessionId !== input.sessionId || task.rootTaskId !== input.rootTaskId || ["completed", "failed", "interrupted", "cancelled", "closed"].includes(task.status)) continue
       count += 1
       this.records.set(task.id, { ...task, interruptRequestedAt: input.now, status: task.status === "queued" ? "interrupted" : task.status })
+    }
+    return count
+  }
+
+  async interruptSubtree(input: { sessionId: string; rootTaskId: string; targetPath: string; now: Date }): Promise<number> {
+    let count = 0
+    for (const task of this.records.values()) {
+      if (task.sessionId !== input.sessionId || task.rootTaskId !== input.rootTaskId
+        || !(task.path === input.targetPath || task.path.startsWith(`${input.targetPath}/`))
+        || ["completed", "failed", "interrupted", "cancelled", "closed"].includes(task.status)) continue
+      count += 1
+      const interrupted = task.status === "queued" || task.status === "retrying" || task.status === "waiting" || task.status === "waiting_for_user"
+      this.records.set(task.id, { ...task, interruptRequestedAt: input.now, status: interrupted ? "interrupted" : task.status })
     }
     return count
   }
@@ -120,6 +155,42 @@ describe("AgentTreeManager", () => {
     expect(store.records.get(task.id)?.status).toBe("completed")
   })
 
+  it("skips a queued task until its durable retry eligibility time", async () => {
+    const store = new MemoryStore()
+    const manager = new AgentTreeManager(store, { clock: new FakeClock() })
+    const task = await manager.spawn(spec({ policy: { maxConcurrency: 1, maxAttempts: 2 } }))
+    store.records.set(task.id, { ...task, nextAttemptAt: new Date("2099-01-01T00:00:00.000Z") })
+
+    await expect(manager.run(payload(task), async () => ({ status: "completed" }))).resolves.toMatchObject({ status: "skipped", reason: "not_available" })
+    expect(store.records.get(task.id)?.status).toBe("queued")
+    expect(manager.activeCount(task.sessionId)).toBe(0)
+  })
+
+  it("forwards a terminal retry disposition without retrying the child", async () => {
+    const store = new MemoryStore()
+    const manager = new AgentTreeManager(store, { clock: new FakeClock() })
+    const task = await manager.spawn(spec({ policy: { maxAttempts: 2 } }))
+
+    await expect(manager.run(payload(task), async () => ({
+      status: "failed", failureReason: "child_resume_unavailable", retryDisposition: "terminal" as const,
+    }))).resolves.toMatchObject({ status: "failed" })
+    expect(store.finishRetryDispositions).toEqual(["terminal"])
+    expect(store.records.get(task.id)).toMatchObject({ status: "failed", leaseOwner: null, leaseExpiresAt: null })
+  })
+
+  it("forwards mailbox ids only for successful child completion", async () => {
+    const store = new MemoryStore()
+    const manager = new AgentTreeManager(store, { clock: new FakeClock() })
+    const task = await manager.spawn(spec())
+
+    await expect(manager.run(payload(task), async () => ({ status: "completed", mailboxMessageIds: ["message-2", "message-1"] }))).resolves.toMatchObject({ status: "completed" })
+    expect(store.finishMailboxMessageIds).toEqual([["message-2", "message-1"]])
+
+    const retryTask = await manager.spawn(spec())
+    await expect(manager.run(payload(retryTask), async () => ({ status: "failed", mailboxMessageIds: ["should-not-consume"] }))).resolves.toMatchObject({ status: "retrying" })
+    expect(store.finishMailboxMessageIds).toEqual([["message-2", "message-1"], undefined])
+  })
+
   it("propagates root interrupt to in-flight work and leaves no slot leak", async () => {
     const store = new MemoryStore()
     const manager = new AgentTreeManager(store, { clock: new FakeClock() })
@@ -133,6 +204,61 @@ describe("AgentTreeManager", () => {
     expect(manager.activeCount(task.sessionId)).toBe(0)
   })
 
+  it("finishes a non-cooperative active interruption before releasing its lease", async () => {
+    const store = new MemoryStore()
+    const clock = new FakeClock()
+    const manager = new AgentTreeManager(store, { clock })
+    const task = await manager.spawn(spec())
+    const running = manager.run(payload(task), async () => new Promise<SubagentExecutionResult>(() => undefined))
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    await manager.interrupt(task.sessionId, task.rootTaskId)
+    await expect(running).resolves.toMatchObject({ status: "interrupted" })
+    expect(store.finishCalls).toEqual([{ taskId: task.id, status: "failed", attemptCount: 1 }])
+    expect(store.records.get(task.id)).toMatchObject({ status: "interrupted", leaseOwner: null, leaseExpiresAt: null })
+    expect(manager.activeCount(task.sessionId)).toBe(0)
+    expect(clock.clearCount).toBe(1)
+  })
+
+  it("terminalizes a durable heartbeat interruption and does not finish a genuine lease loss", async () => {
+    const store = new MemoryStore()
+    const manager = new AgentTreeManager(store, { clock: new FakeClock() })
+    const interruptedTask = await manager.spawn(spec())
+    store.heartbeatResult = "interrupted"
+    const interruptedRun = manager.run(payload(interruptedTask), async () => new Promise<SubagentExecutionResult>(() => undefined))
+    await new Promise(resolve => setTimeout(resolve, 0))
+    await expect(manager.heartbeat(interruptedTask.id)).resolves.toBe(false)
+    await expect(interruptedRun).resolves.toMatchObject({ status: "interrupted" })
+    expect(store.finishCalls).toHaveLength(1)
+    expect(store.records.get(interruptedTask.id)).toMatchObject({ status: "interrupted", leaseOwner: null, leaseExpiresAt: null })
+
+    const lostTask = await manager.spawn(spec())
+    store.heartbeatResult = "lost"
+    const lostRun = manager.run(payload(lostTask, "worker-2"), async () => new Promise<SubagentExecutionResult>(() => undefined))
+    await new Promise(resolve => setTimeout(resolve, 0))
+    await expect(manager.heartbeat(lostTask.id)).resolves.toBe(false)
+    await expect(lostRun).resolves.toMatchObject({ status: "lease_lost" })
+    expect(store.finishCalls).toHaveLength(1)
+    expect(store.records.get(lostTask.id)).toMatchObject({ status: "running", leaseOwner: "worker-2" })
+  })
+
+  it("keeps duplicate interruption terminalization and disposal idempotent", async () => {
+    const store = new MemoryStore()
+    const clock = new FakeClock()
+    const manager = new AgentTreeManager(store, { clock })
+    const task = await manager.spawn(spec())
+    const running = manager.run(payload(task), async () => new Promise<SubagentExecutionResult>(() => undefined))
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    await manager.interrupt(task.sessionId, task.rootTaskId)
+    await manager.interrupt(task.sessionId, task.rootTaskId)
+    await expect(running).resolves.toMatchObject({ status: "interrupted" })
+    await manager.interrupt(task.sessionId, task.rootTaskId)
+    expect(store.finishCalls).toHaveLength(1)
+    expect(manager.activeCount(task.sessionId)).toBe(0)
+    expect(clock.clearCount).toBe(1)
+  })
+
   it("closes queued work without executing it", async () => {
     const store = new MemoryStore()
     const manager = new AgentTreeManager(store, { clock: new FakeClock() })
@@ -140,5 +266,61 @@ describe("AgentTreeManager", () => {
     await expect(manager.close(task.id, task.sessionId)).resolves.toBe(true)
     await expect(manager.run(payload(task), async () => ({ status: "completed" }))).resolves.toMatchObject({ status: "skipped" })
     expect(store.records.get(task.id)?.status).toBe("closed")
+  })
+
+  it("aborts active work and releases its lease for restart during Worker shutdown", async () => {
+    const store = new MemoryStore()
+    const manager = new AgentTreeManager(store, { clock: new FakeClock() })
+    const task = await manager.spawn(spec())
+    const running = manager.run(payload(task), async ({ lease }) => new Promise<SubagentExecutionResult>(resolve => {
+      lease.signal.addEventListener("abort", () => resolve({ status: "failed" }), { once: true })
+    }))
+    await new Promise(resolve => setTimeout(resolve, 0))
+    await manager.shutdown()
+    await expect(running).resolves.toMatchObject({ status: "lease_lost" })
+    expect(store.records.get(task.id)).toMatchObject({ status: "queued", leaseOwner: null, leaseExpiresAt: null })
+    expect(manager.activeCount(task.sessionId)).toBe(0)
+  })
+
+  it("interrupts only a target subtree, releases its slots, and keeps siblings running", async () => {
+    const store = new MemoryStore()
+    const manager = new AgentTreeManager(store, { clock: new FakeClock() })
+    const root = await manager.spawn(spec())
+    const target = await manager.spawn(spec({ parentTaskId: root.id }))
+    const descendant = await manager.spawn(spec({ parentTaskId: target.id }))
+    const sibling = await manager.spawn(spec({ parentTaskId: root.id }))
+    let finishSibling!: (result: SubagentExecutionResult) => void
+    const targetRun = manager.run(payload(target, "target-worker"), async ({ lease }) => new Promise<SubagentExecutionResult>(resolve => {
+      lease.signal.addEventListener("abort", () => resolve({ status: "failed" }), { once: true })
+    }))
+    const siblingRun = manager.run(payload(sibling, "sibling-worker"), async () => new Promise<SubagentExecutionResult>(resolve => {
+      finishSibling = resolve
+    }))
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    await expect(manager.interruptSubtree(target.sessionId, root.id, target.path)).resolves.toBe(2)
+    await expect(targetRun).resolves.toMatchObject({ status: "interrupted" })
+    expect(store.records.get(target.id)).toMatchObject({ status: "interrupted", interruptRequestedAt: expect.any(Date) })
+    expect(store.records.get(descendant.id)).toMatchObject({ status: "interrupted" })
+    expect(store.records.get(sibling.id)).toMatchObject({ status: "running", interruptRequestedAt: null })
+    expect(manager.activeCount(target.sessionId)).toBe(1)
+
+    finishSibling({ status: "completed" })
+    await expect(siblingRun).resolves.toMatchObject({ status: "completed" })
+    expect(manager.activeCount(target.sessionId)).toBe(0)
+    await expect(manager.interruptSubtree(root.sessionId, root.id, root.path)).resolves.toBe(1)
+  })
+
+  it("uses whole-root interruption only for an exact root path on legacy stores", async () => {
+    const store = new MemoryStore()
+    Object.defineProperty(store, "interruptSubtree", { value: undefined })
+    const interruptTree = vi.spyOn(store, "interruptTree")
+    const manager = new AgentTreeManager(store, { clock: new FakeClock() })
+    const root = await manager.spawn(spec())
+
+    await expect(manager.interruptSubtree(root.sessionId, root.rootTaskId, root.path)).resolves.toBe(1)
+    expect(interruptTree).toHaveBeenCalledOnce()
+    await expect(manager.interruptSubtree(root.sessionId, root.rootTaskId, `${root.path}/child`)).rejects.toMatchObject({ code: "not_available" })
+    expect(interruptTree).toHaveBeenCalledOnce()
   })
 })

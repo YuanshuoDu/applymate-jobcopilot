@@ -12,18 +12,19 @@ const options = {
 }
 
 describe("coordination tool definitions", () => {
-  it("exposes the six AH2-030 tools with coordination metadata and manager fencing", () => {
+  it("exposes the seven coordination tools with coordination metadata and manager fencing", () => {
     const definitions = createCoordinationTools(options)
     expect(definitions.map(definition => definition.name)).toEqual([
-      "spawn_subagent", "send_message", "wait_subagents", "list_subagents", "interrupt_subagent", "close_subagent",
+      "spawn_subagent", "agent.followup", "send_message", "wait_subagents", "list_subagents", "interrupt_subagent", "close_subagent",
     ])
     expect(definitions).toEqual(expect.arrayContaining([
       expect.objectContaining({ domain: "coordination", requiredCapabilities: ["canManageChildren"] }),
     ]))
-    expect(definitions.filter(definition => definition.risk === "internal_write")).toHaveLength(5)
+    expect(definitions.filter(definition => definition.risk === "internal_write")).toHaveLength(6)
+    expect(definitions.find(definition => definition.name === "agent.followup")).toMatchObject({ idempotency: "requires_key", risk: "internal_write", requiredCapabilities: ["canManageChildren"] })
     expect(definitions.find(definition => definition.name === "list_subagents")).toMatchObject({ risk: "read", capabilities: ["read", "coordination"] })
     expect(new ToolRegistry(definitions).list(["canManageChildren"]).map(definition => definition.name)).toEqual([
-      "spawn_subagent", "send_message", "wait_subagents", "list_subagents", "interrupt_subagent", "close_subagent",
+      "spawn_subagent", "agent.followup", "send_message", "wait_subagents", "list_subagents", "interrupt_subagent", "close_subagent",
     ])
     expect(new ToolRegistry(definitions).list(["other"])).toHaveLength(0)
   })
@@ -31,8 +32,11 @@ describe("coordination tool definitions", () => {
   it("rejects forged tenant, ownership, lineage, and unknown fields before execution", () => {
     const registry = new ToolRegistry(createCoordinationTools(options))
     const valid = { idempotencyKey: "spawn-1", role: "scout", taskType: "inspect", goal: "Inspect the job" }
+    const followup = { idempotencyKey: "followup-1", taskId: "task-1", goal: "Continue the task" }
+    expect(registry.validateArguments("agent.followup", followup)).toBe(true)
+    expect(registry.validateArguments("agent.followup", { ...followup, parentTaskId: "forged" })).not.toBe(true)
     expect(registry.validateArguments("spawn_subagent", valid)).toBe(true)
-    for (const key of ["userId", "sessionId", "ownerId", "path", "rootTaskId"]) {
+    for (const key of ["userId", "sessionId", "ownerId", "path", "rootTaskId", "expectedOutputSchema"]) {
       expect(registry.validateArguments("spawn_subagent", { ...valid, [key]: "forged" })).not.toBe(true)
     }
     expect(registry.validateArguments("spawn_subagent", { ...valid, extra: true })).not.toBe(true)
@@ -44,6 +48,7 @@ describe("coordination tool definitions", () => {
     const definitions = createCoordinationTools(options)
     const invalidInputs: Record<string, Record<string, unknown>> = {
       spawn_subagent: { role: "scout", taskType: "inspect", goal: "Inspect" },
+      "agent.followup": { taskId: "task-1", goal: "Continue" },
       send_message: { taskId: "task-1", kind: "result", payload: {} },
       wait_subagents: { taskIds: ["task-1"], mode: "all", timeoutMs: 1000 },
       list_subagents: { unexpected: true },

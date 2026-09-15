@@ -25,13 +25,14 @@ async function makeRow(): Promise<Record<string, unknown>> {
   }
 }
 
-function fakePool(row: Record<string, unknown>) {
+function fakePool(row: Record<string, unknown>, sessionStatus = "running", sessionSource = "automation", rejectLockedSession = false) {
   const calls: string[] = []
   const client = {
     query: vi.fn(async (text: string, _params?: unknown[]) => {
       calls.push(text)
+      if (text.includes('FROM "agent_sessions"') && (["aborted", "archived"].includes(sessionStatus) || rejectLockedSession && text.includes("FOR UPDATE"))) return { rows: [], rowCount: 0 }
       if (text.includes('SELECT "id", "sessionId"')) return { rows: [row], rowCount: 1 }
-      if (text.includes('SELECT "id" FROM "agent_sessions"')) return { rows: [{ id: scope.sessionId }], rowCount: 1 }
+      if (text.includes('FROM "agent_sessions"')) return { rows: [{ id: scope.sessionId, status: sessionStatus, source: sessionSource }], rowCount: 1 }
       if (text.includes('SELECT "id", "status", "revision" FROM "agent_turns"')) return { rows: [{ id: scope.turnId, status: "in_progress", revision: scope.revision }], rowCount: 1 }
       if (text.includes('SELECT "id" FROM "agent_turns"')) return { rows: [{ id: scope.turnId }], rowCount: 1 }
       if (text.includes('SELECT "id" FROM "Job"')) return { rows: [{ id: scope.jobId }], rowCount: 1 }
@@ -70,6 +71,52 @@ describe("Worker PG approval store", () => {
     expect((client.query.mock.calls as Array<[string, unknown[]?]>).some(([, params]) => Array.isArray(params) && params.includes("approval.requested"))).toBe(true)
     const auditCalls = (client.query.mock.calls as Array<[string, unknown[]?]>).filter(([text]) => text.includes('INSERT INTO "agent_events"') || text.includes('INSERT INTO "agent_outbox"'))
     expect(JSON.stringify(auditCalls)).not.toContain("secret-answer")
+  })
+
+  it.each(["running", "paused", "waiting_for_user"] as const)("keeps approval reads compatible with a %s session", async sessionStatus => {
+    const row = await makeRow()
+    const { pool } = fakePool(row, sessionStatus)
+    const store = createPgApprovalStore(pool, { userId: scope.userId })
+    await expect(store.validate(row.id as string, { ...scope, nonce: "nonce_1" })).resolves.toMatchObject({ id: row.id, status: "approved" })
+  })
+
+  it.each(["user", "system"] as const)("keeps approval reads compatible with an ordinary %s session", async sessionSource => {
+    const row = await makeRow()
+    const { pool } = fakePool(row, "running", sessionSource)
+    const store = createPgApprovalStore(pool, { userId: scope.userId })
+    await expect(store.validate(row.id as string, { ...scope, nonce: "nonce_1" })).resolves.toMatchObject({ id: row.id, status: "approved" })
+  })
+
+  it.each(["aborted", "archived"] as const)("fails closed for every approval action in a %s session", async sessionStatus => {
+    const row = await makeRow()
+    const { pool, client } = fakePool(row, sessionStatus)
+    const store = createPgApprovalStore(pool, { userId: scope.userId })
+    const submission = { userId: scope.userId, jobId: scope.jobId, scopeHash: row.scopeHash as string }
+
+    await expect(store.issue({ scope, title: "Submit", body: "Review", payload: {}, nonce: "nonce_1" })).rejects.toMatchObject({ code: "approval_scope_mismatch" })
+    await expect(store.validate(row.id as string, { ...scope, nonce: "nonce_1" })).rejects.toMatchObject({ code: "approval_not_found" })
+    await expect(store.inspectSubmission(row.id as string, submission)).rejects.toMatchObject({ code: "approval_not_found" })
+    await expect(store.resolve({ id: row.id as string, sessionId: scope.sessionId, decision: "approved" })).rejects.toMatchObject({ code: "approval_not_found" })
+    await expect(store.consumeSubmission(row.id as string, submission)).rejects.toMatchObject({ code: "approval_not_found" })
+    await expect(store.consume(row.id as string, { ...scope, nonce: "nonce_1" })).rejects.toMatchObject({ code: "approval_not_found" })
+    await expect(store.consumeAndReserve(row.id as string, { ...scope, nonce: "nonce_1" }, { idempotencyKey: "submit:task_1" })).rejects.toMatchObject({ code: "approval_not_found" })
+
+    const calls = (client.query.mock.calls as Array<[string, unknown[]?]>).map(([text]) => text)
+    expect(calls.some(text => text.includes('session."status" NOT IN (\'aborted\', \'archived\')'))).toBe(true)
+    expect(calls.some(text => text.includes('INSERT INTO "agent_approvals"'))).toBe(false)
+    expect(calls.some(text => text.includes('INSERT INTO "agent_action_reservations"'))).toBe(false)
+    expect(calls.some(text => text.includes('INSERT INTO "agent_events"') || text.includes('INSERT INTO "agent_outbox"'))).toBe(false)
+  })
+
+  it("rolls back issue when projectApprovalWait loses the open-session fence", async () => {
+    const row = await makeRow()
+    const { pool, client } = fakePool(row, "running", "automation", true)
+    const store = createPgApprovalStore(pool, { userId: scope.userId })
+    await expect(store.issue({ scope, title: "Submit", body: "Review", payload: {}, nonce: "nonce_1" })).rejects.toMatchObject({ code: "approval_scope_mismatch" })
+    const calls = (client.query.mock.calls as Array<[string, unknown[]?]>).map(([text]) => text)
+    expect(calls).toContain("ROLLBACK")
+    expect(calls).not.toContain("COMMIT")
+    expect(calls.some(text => text.includes('INSERT INTO "agent_items"') || text.includes('INSERT INTO "agent_events"') || text.includes('INSERT INTO "agent_outbox"'))).toBe(false)
   })
 
   it("rejects a mismatched tool before the consume update", async () => {

@@ -22,6 +22,7 @@ export async function ensureAgentExecution(input: { userId: string; sessionId: s
       where: {
         userId: input.userId,
         sessionId: input.sessionId,
+        session: { is: { controlGate: "open" } },
         status: { in: ["completed", "failed", "cancelled"] },
       },
       data: {
@@ -58,6 +59,7 @@ export async function claimAgentExecution(input: { id: string; userId: string })
     where: {
       id: input.id,
       userId: input.userId,
+      session: { is: { controlGate: "open" } },
       OR: [
         { status: { in: ["queued", "paused"] } },
         { status: "running", updatedAt: { lt: staleBefore } },

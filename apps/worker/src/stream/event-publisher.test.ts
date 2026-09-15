@@ -23,6 +23,25 @@ describe("agent stream publisher", () => {
     expect(connection.publish).toHaveBeenCalledWith("agent:session:session_1:events", expect.stringContaining('"sequence":"7"'))
   })
 
+  it("publishes session lifecycle events with a null turn", async () => {
+    const connection = redis()
+    await publishAgentEvent(connection, {
+      id: "event_paused", sessionId: "session_1", turnId: null, itemId: null, taskId: null,
+      sequence: BigInt(8), type: "session.paused", actor: "system", correlationId: "session_1",
+      causationId: null, idempotencyKey: "agent-session-control:client_1",
+      payload: {
+        sessionId: "session_1", operation: "pause", previousGate: "open", nextGate: "user_paused",
+        controlRevision: 1, pausedAt: "2026-09-15T00:00:00.000Z",
+      }, createdAt: "2026-09-15T00:00:00.000Z",
+    })
+    const published = connection.publish.mock.calls[0]?.[1]
+    expect(published).toBeDefined()
+    expect(JSON.parse(String(published))).toMatchObject({
+      type: "session.paused", sessionId: "session_1", turnId: null, itemId: null, taskId: null,
+      actor: "system", correlationId: "session_1", sequence: "8",
+    })
+  })
+
   it("writes bounded snapshots to the transient Redis stream", async () => {
     const connection = redis()
     const result = await publishAgentItemSnapshot(connection, update)

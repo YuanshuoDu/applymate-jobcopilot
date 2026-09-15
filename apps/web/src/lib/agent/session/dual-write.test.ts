@@ -2,18 +2,33 @@ import { describe, expect, it, vi } from "vitest"
 
 import { createDualWriteSession } from "./dual-write"
 
-function mockDb() {
+interface MockDbOptions {
+  sessionExists?: boolean
+  sessionStatus?: string
+  sessionUserId?: string
+  itemError?: Error
+}
+
+function queryText(query: unknown) {
+  return typeof query === "object" && query !== null && "strings" in query
+    ? ((query as { strings: readonly string[] }).strings ?? []).join(" ")
+    : ""
+}
+
+function mockDb(options: MockDbOptions = {}) {
+  let sessionStatus = options.sessionStatus ?? "running"
+  let rollbackCount = 0
   const tx = {
-    agentSession: {
-      findFirst: vi.fn().mockResolvedValue({ id: "session_1" }),
-    },
     agentTurn: {
       findFirst: vi.fn().mockResolvedValueOnce(null).mockResolvedValue({ id: "turn_1" }),
       create: vi.fn().mockResolvedValue({ id: "turn_1" }),
       update: vi.fn().mockResolvedValue({ id: "turn_1" }),
     },
     agentItem: {
-      create: vi.fn().mockResolvedValue({ id: "item_1" }),
+      create: vi.fn(async () => {
+        if (options.itemError) throw options.itemError
+        return { id: "item_1" }
+      }),
     },
     agentEvent: {
       findFirst: vi.fn().mockResolvedValue(null),
@@ -36,13 +51,35 @@ function mockDb() {
       })),
       findMany: vi.fn().mockResolvedValue([]),
     },
-    $queryRaw: vi.fn().mockResolvedValue([{ eventSequence: BigInt(1) }]),
+    $queryRaw: vi.fn(async (query: unknown) => {
+      const sql = queryText(query)
+      if (sql.includes('FROM "agent_sessions"') && sql.includes('"status" NOT IN')) {
+        const owned = options.sessionExists !== false && (options.sessionUserId ?? "user_1") === "user_1"
+        const open = !["aborted", "archived"].includes(sessionStatus)
+        return owned && open ? [{ id: "session_1" }] : []
+      }
+      return [{ eventSequence: BigInt(1) }]
+    }),
   }
   const db = {
-    $transaction: vi.fn(async <T>(work: (transaction: typeof tx) => Promise<T>) => work(tx)),
+    $transaction: vi.fn(async <T>(work: (transaction: typeof tx) => Promise<T>) => {
+      try {
+        return await work(tx)
+      } catch (error) {
+        rollbackCount += 1
+        throw error
+      }
+    }),
     agentTurn: { findFirst: vi.fn().mockResolvedValue(null) },
   }
-  return { db, tx }
+  return {
+    db,
+    tx,
+    state: {
+      closeSession() { sessionStatus = "aborted" },
+      get rollbackCount() { return rollbackCount },
+    },
+  }
 }
 
 describe("legacy/V2 dual writer", () => {
@@ -130,11 +167,110 @@ describe("legacy/V2 dual writer", () => {
 
     await writer.finalize({ status: "completed", finalResponse: "Done" })
 
-    expect(tx.agentSession.findFirst).toHaveBeenCalled()
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(2)
     expect(tx.agentTurn.update).toHaveBeenCalledWith(expect.objectContaining({
       where: { id: "turn_1" },
       data: expect.objectContaining({ status: "completed", finalResponse: "Done" }),
     }))
     expect(db.agentTurn.findFirst).not.toHaveBeenCalled()
+  })
+
+  it.each(["aborted", "archived"])("rejects %s sessions before dual-write mutations", async (sessionStatus) => {
+    const { db, tx, state } = mockDb({ sessionStatus })
+
+    await expect(createDualWriteSession(db as never, {
+      sessionId: "session_1",
+      userId: "user_1",
+      goal: "Closed run",
+      source: "user",
+    })).rejects.toThrow("does not exist for this user")
+    expect(tx.agentTurn.findFirst).not.toHaveBeenCalled()
+    expect(tx.agentTurn.create).not.toHaveBeenCalled()
+    expect(tx.agentItem.create).not.toHaveBeenCalled()
+    expect(tx.agentEvent.create).not.toHaveBeenCalled()
+    expect(state.rollbackCount).toBe(1)
+  })
+
+  it.each([
+    ["missing", { sessionExists: false }],
+    ["cross-user", { sessionUserId: "another_user" }],
+  ] as const)("rejects %s sessions before dual-write mutations", async (_label, options) => {
+    const { db, tx, state } = mockDb(options)
+
+    await expect(createDualWriteSession(db as never, {
+      sessionId: "session_1",
+      userId: "user_1",
+      goal: "Unauthorized run",
+      source: "user",
+    })).rejects.toThrow("does not exist for this user")
+    expect(tx.agentTurn.findFirst).not.toHaveBeenCalled()
+    expect(tx.agentTurn.create).not.toHaveBeenCalled()
+    expect(tx.agentItem.create).not.toHaveBeenCalled()
+    expect(tx.agentEvent.create).not.toHaveBeenCalled()
+    expect(state.rollbackCount).toBe(1)
+  })
+
+  it("rechecks the session before record and rolls back after close", async () => {
+    const { db, tx, state } = mockDb()
+    const writer = await createDualWriteSession(db as never, {
+      sessionId: "session_1",
+      userId: "user_1",
+      goal: "Close race",
+      source: "user",
+    })
+    const itemWritesBeforeClose = tx.agentItem.create.mock.calls.length
+    state.closeSession()
+
+    await expect(writer.record({
+      sessionId: "session_1",
+      type: "error",
+      speaker: "System",
+      title: "Late event",
+      body: "Should be rejected",
+    })).rejects.toThrow("does not exist for this user")
+    expect(tx.agentItem.create).toHaveBeenCalledTimes(itemWritesBeforeClose)
+    expect(tx.agentEvent.create).not.toHaveBeenCalled()
+    expect(tx.agentOutbox.create).not.toHaveBeenCalled()
+    expect(tx.agentInput.create).not.toHaveBeenCalled()
+    expect(state.rollbackCount).toBe(1)
+  })
+
+  it("rechecks the session before finalize and rolls back after close", async () => {
+    const { db, tx, state } = mockDb()
+    const writer = await createDualWriteSession(db as never, {
+      sessionId: "session_1",
+      userId: "user_1",
+      goal: "Close race",
+      source: "user",
+    })
+    state.closeSession()
+
+    await expect(writer.finalize({ status: "completed", finalResponse: "Late completion" }))
+      .rejects.toThrow("does not exist for this user")
+    expect(tx.agentTurn.update).not.toHaveBeenCalled()
+    expect(state.rollbackCount).toBe(1)
+  })
+
+  it("rolls back every dual-write mutation when item persistence fails", async () => {
+    const itemError = new Error("item unavailable")
+    const { db, tx, state } = mockDb({ itemError })
+    const writer = await createDualWriteSession(db as never, {
+      sessionId: "session_1",
+      userId: "user_1",
+      goal: "Item failure",
+      source: "user",
+    })
+
+    await expect(writer.record({
+      sessionId: "session_1",
+      type: "error",
+      speaker: "System",
+      title: "Item",
+      body: "Fails before event",
+    })).rejects.toThrow("item unavailable")
+    expect(tx.agentEvent.create).not.toHaveBeenCalled()
+    expect(tx.agentOutbox.create).not.toHaveBeenCalled()
+    expect(tx.agentTranscriptEvent.create).not.toHaveBeenCalled()
+    expect(state.rollbackCount).toBe(1)
   })
 })

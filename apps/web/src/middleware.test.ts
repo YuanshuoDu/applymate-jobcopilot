@@ -66,9 +66,33 @@ describe('web middleware entrypoint', () => {
   })
 
   it('keeps the local Agent preview accessible without a session', async () => {
+    vi.stubEnv('NODE_ENV', 'development')
     const response = await middleware(new NextRequest('http://localhost/agent-preview'))
 
     expect(response.status).toBe(200)
+    vi.unstubAllEnvs()
+  })
+
+  it('allows the production fixture only on loopback with its explicit flag', async () => {
+    vi.stubEnv('NODE_ENV', 'production')
+    vi.stubEnv('AGENT_PREVIEW_FIXTURE', '1')
+    const local = await middleware(new NextRequest('http://127.0.0.1:3000/agent-preview', { headers: { host: '127.0.0.1:3000' } }))
+    const spoofed = await middleware(new NextRequest('https://applymate.site/agent-preview', { headers: { 'x-forwarded-host': 'localhost' } }))
+    const authenticatedSpoofedRequest = new NextRequest('https://applymate.site/agent-preview', { headers: { 'x-forwarded-host': 'localhost' } })
+    authenticatedSpoofedRequest.cookies.set('authjs.session-token', 'present')
+    const authenticatedSpoofed = await middleware(authenticatedSpoofedRequest)
+    expect(local.status).toBe(200)
+    expect(spoofed.status).toBe(404)
+    expect(authenticatedSpoofed.status).toBe(404)
+    vi.unstubAllEnvs()
+  })
+
+  it('denies the production preview by default even on loopback', async () => {
+    vi.stubEnv('NODE_ENV', 'production')
+    vi.stubEnv('AGENT_PREVIEW_FIXTURE', '')
+    const response = await middleware(new NextRequest('http://127.0.0.1:3000/agent-preview'))
+    expect(response.status).toBe(404)
+    vi.unstubAllEnvs()
   })
 
   it('does not expose the local Agent preview on a public hostname', async () => {

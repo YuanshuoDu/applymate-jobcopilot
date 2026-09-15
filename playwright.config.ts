@@ -2,6 +2,7 @@ import { defineConfig, devices } from "@playwright/test";
 
 const hasExternalTarget = Boolean(process.env.E2E_BASE_URL);
 const shouldStartWeb = !hasExternalTarget;
+const localE2EBaseURL = "http://127.0.0.1:3100";
 
 export default defineConfig({
   testDir: ".",
@@ -13,23 +14,26 @@ export default defineConfig({
   reporter: process.env.CI ? [["github"], ["list"]] : "list",
   outputDir: "apps/web/tests/e2e/__artifacts__",
   use: {
-    baseURL: process.env.E2E_BASE_URL ?? "http://127.0.0.1:3000",
+    baseURL: process.env.E2E_BASE_URL ?? localE2EBaseURL,
     trace: "on",
     screenshot: "on",
     video: "retain-on-failure",
   },
   webServer: shouldStartWeb
     ? {
-        command: "pnpm --filter @jobcopilot/agent-protocol build && pnpm --filter @jobcopilot/shared build && pnpm --filter @jobcopilot/agent-model build && pnpm --filter @jobcopilot/agent-policy build && pnpm --filter web exec prisma generate && pnpm --filter web dev",
-        url: "http://127.0.0.1:3000",
+        command: "pnpm --filter @jobcopilot/agent-protocol build && pnpm --filter @jobcopilot/shared build && pnpm --filter @jobcopilot/agent-model build && pnpm --filter @jobcopilot/agent-policy build && pnpm --filter web build && pnpm --filter web exec next start --hostname 127.0.0.1 --port 3100",
+        url: localE2EBaseURL,
         env: {
           ...process.env,
-          AUTH_SECRET: process.env.AUTH_SECRET ?? "applymate-e2e-secret-change-me-32-bytes",
-          AUTH_URL: process.env.AUTH_URL ?? "http://127.0.0.1:3000",
-          NEXTAUTH_URL: process.env.NEXTAUTH_URL ?? "http://127.0.0.1:3000",
+          AUTH_SECRET: "applymate-e2e-secret-change-me-32-bytes",
+          AUTH_URL: localE2EBaseURL,
+          NEXTAUTH_URL: localE2EBaseURL,
+          DATABASE_URL: "postgresql://fixture:fixture@127.0.0.1:5432/fixture",
+          DIRECT_URL: "postgresql://fixture:fixture@127.0.0.1:5432/fixture",
+          AGENT_PREVIEW_FIXTURE: "1",
         },
-        reuseExistingServer: !process.env.CI,
-        timeout: 120_000,
+        reuseExistingServer: false,
+        timeout: 300_000,
       }
     : undefined,
   projects: [

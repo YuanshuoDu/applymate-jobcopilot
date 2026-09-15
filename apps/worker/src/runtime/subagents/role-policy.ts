@@ -29,6 +29,7 @@ export type ToolVisibilityReason =
   | "external_write_disabled"
   | "external_write_receipt_missing"
   | "external_write_receipt_invalid"
+  | "coordination_disabled"
 
 export type ToolVisibility = {
   readonly visible: boolean
@@ -65,6 +66,9 @@ export function visibleToolPolicy(
 ): ToolVisibility {
   const policy = getSubagentRolePolicy(role)
   if (!policy) return { visible: false, reason: "role_risk_denied" }
+  if (/^(spawn_subagent|send_message|wait_subagents|list_subagents|interrupt_subagent|close_subagent)$/.test(tool.name)) {
+    return { visible: false, reason: "coordination_disabled" }
+  }
   if (tool.risk === "external_write" || tool.capabilities?.includes("external_write") || looksLikeExternalAction(tool.name)) {
     if (!policy.externalWritesEnabled) return { visible: false, reason: "external_write_disabled" }
     if (!receipt) return { visible: false, reason: "external_write_receipt_missing" }

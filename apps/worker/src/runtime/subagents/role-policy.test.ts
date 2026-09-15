@@ -35,4 +35,9 @@ describe("subagent role policy", () => {
     expect(visibleSubagentTools("future-role", [tool("jobs.search", "read", "jobs")])).toEqual([])
     expect(preflightSubagentTool("executor", null)).toMatchObject({ allowed: false, execute: false })
   })
+
+  it("hides coordination tools even when their domain is otherwise visible", () => {
+    expect(visibleToolPolicy("reviewer", tool("spawn_subagent", "internal_write", "coordination")).reason).toBe("coordination_disabled")
+    expect(visibleToolPolicy("reviewer", tool("wait_subagents", "read", "coordination")).visible).toBe(false)
+  })
 })

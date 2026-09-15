@@ -53,7 +53,7 @@ interface ItemRow {
 interface EventRow {
   id: string
   sessionId: string
-  turnId: string
+  turnId: string | null
   itemId: string | null
   taskId: string | null
   sequence: bigint

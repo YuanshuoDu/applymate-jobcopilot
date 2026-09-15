@@ -16,8 +16,6 @@ import { sessionSubmissionPolicy } from './automation-policy'
 import type { TranscriptAction } from './TranscriptSpecialBlocks'
 import { ensureActionReceipt } from './approval-receipt-client'
 import { sendAgentTurnMessage, useAgentTurnComposerContext } from './agent-turn-commands'
-import { createTimelineState, selectTimelineItems, timelineReducer, type TimelineState } from './v2/timeline-reducer'
-import { streamAgentTimeline } from './v2/stream-client'
 import { createReadOnlySessionProjection, projectTimelineItems } from './v2/session-projection'
 import type { AgentUnifiedStreamProps, ComposerJobsResponse } from './AgentUnifiedStream.types'
 
@@ -29,7 +27,7 @@ function newClientMessageId() {
 export function AgentUnifiedStream({
   log, running, summary, applyQueue, waitingQuestion,
   savedCount, pendingCount, autonomousMode,
-  resetVersion, resumeSessionId, conversationTitle, conversationSubtitle, onAnswerQuestion, onAnswerOrchestrator, onApplied, onSessionRecorded,
+  resetVersion, resumeSessionId, timeline, conversationTitle, conversationSubtitle, onAnswerQuestion, onAnswerOrchestrator, onApplied, onSessionRecorded,
 }: AgentUnifiedStreamProps) {
   const { t } = useI18n()
   const streamEndRef = useRef<HTMLDivElement>(null)
@@ -41,9 +39,7 @@ export function AgentUnifiedStream({
   const shouldFollowScrollRef = useRef(true)
   const [chatInput, setChatInput] = useState('')
   const [chatLoading, setChatLoading] = useState(false)
-  const [isRestoringSession, setIsRestoringSession] = useState(false)
   const [addMenuOpen, setAddMenuOpen] = useState(false)
-  const [timelineState, setTimelineState] = useState<TimelineState>(() => createTimelineState(resumeSessionId ?? 'draft'))
   const [revealThinkingVersion, setRevealThinkingVersion] = useState(0)
   const [attachedFiles, setAttachedFiles] = useState<ComposerAttachment[]>([])
   const { data: jobsData } = useApi<ComposerJobsResponse>('/api/jobs?pageSize=6')
@@ -52,7 +48,8 @@ export function AgentUnifiedStream({
   const composerJobs = jobsData?.jobs ?? []
   const composerResumes = resumesData ?? []
   const turnComposer = useAgentTurnComposerContext()
-  const timelineItems = useMemo(() => selectTimelineItems(timelineState), [timelineState])
+  const timelineItems = timeline.items
+  const isRestoringSession = timeline.restoring
   // Once a Session exists, the V2 projection is the sole transcript source.
   // The page-level run log remains an operational control signal, not a second
   // rendered conversation state.
@@ -77,58 +74,22 @@ export function AgentUnifiedStream({
 
   useEffect(() => {
     if (shouldFollowScrollRef.current) scrollToBottom()
-  }, [transcriptLog.length, timelineItems.length, applyQueue.length])
+  }, [transcriptLog.length, timelineItems, applyQueue.length])
 
   useEffect(() => {
     shouldFollowScrollRef.current = true
     cancelChatRequest()
-    setIsRestoringSession(false)
     setChatInput('')
-    setTimelineState(createTimelineState('draft'))
     setRevealThinkingVersion(0)
     setAttachedFiles([])
   }, [resetVersion])
 
   useEffect(() => {
-    if (!resumeSessionId) {
-      setTimelineState(createTimelineState('draft'))
-      setIsRestoringSession(false)
-      return
-    }
-    const controller = new AbortController()
     cancelChatRequest()
     shouldFollowScrollRef.current = true
-    setTimelineState(createTimelineState(resumeSessionId))
-    setIsRestoringSession(true)
     setChatInput('')
     setAttachedFiles([])
-
-    void streamAgentTimeline({
-      sessionId: resumeSessionId,
-      signal: controller.signal,
-      onConnected: () => {
-        if (controller.signal.aborted) return
-        setIsRestoringSession(false)
-      },
-      dispatch: action => {
-        if (controller.signal.aborted) return
-        setTimelineState(current => timelineReducer(current, action))
-        requestAnimationFrame(scrollToBottom)
-      },
-    })
-      .then(() => {
-        if (controller.signal.aborted) return
-        setIsRestoringSession(false)
-        requestAnimationFrame(scrollToBottom)
-      })
-      .catch(error => {
-        if (controller.signal.aborted) return
-        setIsRestoringSession(false)
-        toast.error(t('agent.restoreFailed'), error instanceof Error ? error.message : t('agent.restoreFailed'))
-      })
-
-    return () => controller.abort()
-  }, [resumeSessionId, t, toast])
+  }, [resumeSessionId])
 
   useEffect(() => {
     function prefillComposer(event: Event) {
@@ -303,6 +264,11 @@ export function AgentUnifiedStream({
         conversationSubtitle={conversationSubtitle}
       />
 
+      {timeline.error && (
+        <div role="alert" style={{ flexShrink: 0, margin: '10px 18px 0', padding: '9px 12px', border: '1px solid var(--c-danger)', borderRadius: 8, color: 'var(--c-danger)', background: 'var(--bg-secondary)', fontSize: 11 }}>
+          {t('agent.restoreFailed')}
+        </div>
+      )}
       <AgentLiveStreamBody
         log={transcriptLog}
         liveBlocks={liveBlocks}

@@ -5,6 +5,9 @@ import { redisConnection } from "../redis.js";
 import { getPool } from "../db/apply-results.js";
 import { measureWorkerResponseBytes, recordWorkerExternalApiUsage } from "../api-usage/external-api-usage.js";
 import { runCanonicalAgentTurn } from "./agent-run-turn-executor.js";
+import { createAgentRunCanonicalProducer, type AgentRunCanonicalProducer } from "./agent-run-canonical-dispatch.js";
+import { resolveProductionAgentFlags } from "../runtime/production-agent-flags.js";
+import { TURN_QUEUE_NAME } from "../runtime/turns/turn-queue.js";
 
 export const AGENT_RUN_QUEUE_NAME = "agent-runs";
 
@@ -19,16 +22,24 @@ export interface AgentRunTaskPayload {
 const connection = redisConnection;
 
 export const agentRunQueue = new Queue<AgentRunTaskPayload>(AGENT_RUN_QUEUE_NAME, { connection, skipVersionCheck: true });
+const agentRunCanonicalProducer = createAgentRunCanonicalProducer();
 
 function internalRunUrl() {
   const base = process.env.AGENT_WEB_URL?.replace(/\/$/, "");
   return base ? `${base}/api/internal/agent-run` : null;
 }
 
-export const agentRunWorker = new Worker<AgentRunTaskPayload>(
-  AGENT_RUN_QUEUE_NAME,
-  async task => {
-    if (task.data.turnId) return runCanonicalAgentTurn(task, getPool());
+export function createAgentRunProcessor(canonicalProducer: AgentRunCanonicalProducer = agentRunCanonicalProducer) {
+  return async (task: { data: AgentRunTaskPayload; attemptsMade: number }) => {
+    if (task.data.turnId) {
+      if (!resolveProductionAgentFlags().canonicalAutomationEnabled) {
+        // Gate-off is an explicit, durable rollback to the existing pipeline
+        // adapter so a queued automation still reaches a terminal outcome.
+        return runCanonicalAgentTurn(task, getPool());
+      }
+      await canonicalProducer.enqueue({ sessionId: task.data.sessionId, turnId: task.data.turnId });
+      return { status: "routed" as const, queue: TURN_QUEUE_NAME, turnId: task.data.turnId };
+    }
     const url = internalRunUrl();
     const secret = process.env.AGENT_WORKER_SECRET;
     if (!url) throw new Error("AGENT_WEB_URL is required for scheduled agent runs");
@@ -65,7 +76,12 @@ export const agentRunWorker = new Worker<AgentRunTaskPayload>(
     const result = await response.json().catch(() => null) as { status?: string } | null;
     console.log(`[agent-run-worker] Session ${task.data.sessionId}: ${result?.status ?? "completed"}`);
     return result;
-  },
+  };
+}
+
+export const agentRunWorker = new Worker<AgentRunTaskPayload>(
+  AGENT_RUN_QUEUE_NAME,
+  createAgentRunProcessor(),
   { connection, skipVersionCheck: true, ...workerPollingOptions(), concurrency: 1 },
 );
 
@@ -75,6 +91,21 @@ function isTimeoutError(error: unknown): boolean {
 }
 
 export async function closeAgentRunResources() {
-  await agentRunWorker.close();
-  await agentRunQueue.close();
+  let firstError: unknown;
+  try {
+    await agentRunWorker.close();
+  } catch (error: unknown) {
+    firstError = error;
+  }
+  try {
+    await agentRunCanonicalProducer.close();
+  } catch (error: unknown) {
+    if (firstError === undefined) firstError = error;
+  }
+  try {
+    await agentRunQueue.close();
+  } catch (error: unknown) {
+    if (firstError === undefined) firstError = error;
+  }
+  if (firstError !== undefined) throw firstError;
 }

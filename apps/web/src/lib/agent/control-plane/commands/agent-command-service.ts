@@ -1,16 +1,24 @@
 import type { PrismaClient } from "@prisma/client"
 import type { InputContentPart } from "@jobcopilot/agent-protocol"
 
-import { AgentCommandError, activeTurnChanged, automationCannotSteerUserTurn, invalidCommand, isUniqueViolation } from "./errors"
-import { cancelPendingWaitsInTransaction } from "../../broker/interrupt"
+import { AgentCommandError, activeTurnChanged, automationCannotSteerUserTurn, invalidCommand, isUniqueViolation, retryActiveConflict, retryInputInvalid, retryTargetChanged, retryTargetInvalid, sessionControlRevisionChanged, sessionPauseConflict } from "./errors"
+import { cancelExecutionInTransaction, interruptActiveTurn, type CancelExecutionCommand } from "./execution-cancellation"
 import {
   acceptInputFacts,
+  assertAcceptingSession,
   assertExpectedTurn,
   createRootTurn,
   findActiveTurn,
   findExistingCommand,
+  findExistingSessionControl,
+  findInProgressTurn,
   fallbackDisposition,
-  lockOwnedSession,
+  assertSessionControlIdentity,
+  appendSessionControl,
+  controlFingerprint,
+  lockOpenSession,
+  lockSessionControl,
+  sessionControlResult,
   type CommandTransaction,
 } from "./transaction"
 import type {
@@ -19,12 +27,23 @@ import type {
   InterruptCommand,
   InterruptResult,
   MessageCommand,
+  RetryCommand,
+  PauseCommand,
+  ResumeCommand,
+  SessionControlOperation,
+  SessionControlResult,
   StartCommand,
   SteerCommand,
 } from "./types"
 
 type CommandEvent = { sequence: bigint; payload: unknown }
 type OriginalDisposition = Exclude<CommandDisposition, "duplicate"> | "interrupted"
+
+const RETRYABLE_STATUSES = new Set(["failed", "interrupted", "cancelled"])
+const MAX_RETRY_PARTS = 32
+const MAX_RETRY_ATTACHMENT_REFS = 8
+const MAX_RETRY_TEXT_BYTES = 20_000
+const MAX_RETRY_CONTENT_BYTES = 256 * 1024
 
 function assertContent(content: InputContentPart[]): void {
   if (content.length === 0) {
@@ -80,6 +99,44 @@ async function duplicateInterruptResult(
   }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  return Object.keys(value).every(key => keys.includes(key))
+}
+
+function boundedString(value: unknown, maxBytes: number): value is string {
+  return typeof value === "string" && value.length > 0 && value.trim() === value && new TextEncoder().encode(value).byteLength <= maxBytes && !/[\u0000-\u001f\u007f]/.test(value)
+}
+
+function boundedGoal(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.trim() === value && new TextEncoder().encode(value).byteLength <= MAX_RETRY_CONTENT_BYTES && !/[\u0000-\u0008\u000b-\u001f\u007f]/.test(value)
+}
+
+function persistedRetryContent(turnId: string, value: unknown): { goal: string; content: InputContentPart[] } {
+  if (!isRecord(value) || !exactKeys(value, ["goal", "content", "clientMessageId"]) ||
+    !boundedGoal(value.goal) || (value.clientMessageId !== undefined && !boundedString(value.clientMessageId, 256)) ||
+    !Array.isArray(value.content) || value.content.length < 1 || value.content.length > MAX_RETRY_PARTS) throw retryInputInvalid(turnId)
+  const content: InputContentPart[] = []
+  let attachmentCount = 0
+  for (const part of value.content) {
+    if (!isRecord(part) || typeof part.type !== "string") throw retryInputInvalid(turnId)
+    if (part.type === "text") {
+      if (Object.keys(part).length !== 2 || !boundedString(part.text, MAX_RETRY_TEXT_BYTES)) throw retryInputInvalid(turnId)
+      content.push({ type: "text", text: part.text })
+    } else if (part.type === "attachment_ref") {
+      if (!exactKeys(part, ["type", "attachmentId", "mediaType", "filename"]) || !boundedString(part.attachmentId, 256) || !boundedString(part.mediaType, 256) || (part.filename !== undefined && !boundedString(part.filename, 256))) throw retryInputInvalid(turnId)
+      attachmentCount += 1
+      if (attachmentCount > MAX_RETRY_ATTACHMENT_REFS) throw retryInputInvalid(turnId)
+      content.push({ type: "attachment_ref", attachmentId: part.attachmentId, mediaType: part.mediaType, ...(part.filename === undefined ? {} : { filename: part.filename }) })
+    } else throw retryInputInvalid(turnId)
+  }
+  if (new TextEncoder().encode(JSON.stringify(content)).byteLength > MAX_RETRY_CONTENT_BYTES) throw retryInputInvalid(turnId)
+  return { goal: value.goal, content }
+}
+
 export class AgentCommandService {
   constructor(private readonly db: PrismaClient) {}
 
@@ -101,6 +158,22 @@ export class AgentCommandService {
     return this.retryUnique(() => this.interruptOnce(command))
   }
 
+  async retry(command: RetryCommand): Promise<CommandResult> {
+    return this.retryUnique(() => this.retryOnce(command))
+  }
+
+  async pause(command: PauseCommand): Promise<SessionControlResult> {
+    return this.sessionControl(command, "pause")
+  }
+
+  async resume(command: ResumeCommand): Promise<SessionControlResult> {
+    return this.sessionControl(command, "resume")
+  }
+
+  async cancelExecution(command: CancelExecutionCommand): Promise<boolean> {
+    return this.retryUnique(() => this.db.$transaction((tx) => cancelExecutionInTransaction(tx, command)))
+  }
+
   private async retryUnique<T>(work: () => Promise<T>): Promise<T> {
     try {
       return await work()
@@ -112,9 +185,10 @@ export class AgentCommandService {
 
   private startOnce(command: StartCommand): Promise<CommandResult> {
     return this.db.$transaction(async (tx) => {
-      await lockOwnedSession(tx, command.sessionId, command.userId)
+      const session = await lockOpenSession(tx, command.sessionId, command.userId)
       const existing = await findExistingCommand(tx, command.sessionId, command.clientMessageId)
       if (existing) return duplicateCommandResult(tx, command, existing, "follow_up")
+      assertAcceptingSession(session, command.sessionId)
 
       const existingActive = await findActiveTurn(tx, command.sessionId, command.userId)
       const created = !existingActive
@@ -127,9 +201,10 @@ export class AgentCommandService {
 
   private messageOnce(command: MessageCommand): Promise<CommandResult> {
     return this.db.$transaction(async (tx) => {
-      await lockOwnedSession(tx, command.sessionId, command.userId)
+      const session = await lockOpenSession(tx, command.sessionId, command.userId)
       const existing = await findExistingCommand(tx, command.sessionId, command.clientMessageId)
       if (existing) return duplicateCommandResult(tx, command, existing, command.delivery)
+      assertAcceptingSession(session, command.sessionId)
 
       const active = await findActiveTurn(tx, command.sessionId, command.userId)
       const expectedTurnId = command.delivery === "steer" || command.expectedTurnId ? command.expectedTurnId : undefined
@@ -152,29 +227,74 @@ export class AgentCommandService {
 
   private interruptOnce(command: InterruptCommand): Promise<InterruptResult> {
     return this.db.$transaction(async (tx) => {
-      await lockOwnedSession(tx, command.sessionId, command.userId)
+      await lockOpenSession(tx, command.sessionId, command.userId)
       const existing = await findExistingCommand(tx, command.sessionId, command.clientMessageId)
       if (existing) return duplicateInterruptResult(tx, command, existing)
 
       const active = await findActiveTurn(tx, command.sessionId, command.userId)
       await assertExpectedTurn(command.expectedTurnId, command.expectedRevision, active)
       if (!active) throw activeTurnChanged(command.expectedTurnId, null)
-      const interrupted = await tx.agentTurn.updateMany({
-        where: { id: active.id, sessionId: command.sessionId, userId: command.userId, status: { in: ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] }, revision: active.revision },
-        data: { status: "interrupted", revision: { increment: 1 }, completedAt: new Date() },
-      })
-      if (interrupted.count !== 1) throw activeTurnChanged(command.expectedTurnId, active.id)
+      return interruptActiveTurn(tx, command, active)
+    })
+  }
 
-      await cancelPendingWaitsInTransaction(tx, {
-        sessionId: command.sessionId,
-        userId: command.userId,
-        turnId: active.id,
-        clientMessageId: command.clientMessageId,
-      })
+  private retryOnce(command: RetryCommand): Promise<CommandResult> {
+    return this.db.$transaction(async (tx) => {
+      const session = await lockOpenSession(tx, command.sessionId, command.userId)
+      const existing = await findExistingCommand(tx, command.sessionId, command.clientMessageId)
+      if (existing) return duplicateCommandResult(tx, command, existing, "follow_up")
+      assertAcceptingSession(session, command.sessionId)
 
-      const content: InputContentPart[] = [{ type: "text", text: "Interrupt requested" }]
-      return acceptInputFacts(tx, command, content, active, "steer", "interrupted", false)
-        .then((facts) => ({ ...facts, disposition: "interrupted" as const }))
+      const target = await tx.agentTurn.findFirst({
+        where: { id: command.targetTurnId, sessionId: command.sessionId, userId: command.userId },
+        select: { id: true, status: true, revision: true, input: true },
+      })
+      if (!target || !RETRYABLE_STATUSES.has(target.status)) throw retryTargetInvalid(command.targetTurnId, target?.status ?? null)
+      if (command.expectedRevision !== undefined && command.expectedRevision !== null && command.expectedRevision !== target.revision) {
+        throw retryTargetChanged(command.targetTurnId, command.expectedRevision, target.revision)
+      }
+      const active = await findActiveTurn(tx, command.sessionId, command.userId)
+      if (active) throw retryActiveConflict(active.id)
+      const persisted = persistedRetryContent(target.id, target.input)
+
+      const created = await createRootTurn(tx, command, persisted.content, persisted.goal)
+      const facts = await acceptInputFacts(tx, command, persisted.content, created, "follow_up", "started", true)
+      return { ...facts, disposition: "started" as const }
+    })
+  }
+
+  private sessionControl(
+    command: PauseCommand | ResumeCommand,
+    operation: SessionControlOperation,
+  ): Promise<SessionControlResult> {
+    return this.db.$transaction(async (tx) => {
+      if (command.source !== "user") throw invalidCommand("Only user commands may change the session control gate")
+      const session = await lockSessionControl(tx, command.sessionId, command.userId)
+      const fingerprint = controlFingerprint(operation, command.expectedRevision)
+      const existing = await findExistingSessionControl(tx, command.sessionId, command.clientMessageId)
+      if (existing) {
+        assertSessionControlIdentity(existing, operation, fingerprint)
+        return sessionControlResult(command, operation, existing.nextGate, existing.controlRevision, existing.pausedAt, "duplicate")
+      }
+      if (command.expectedRevision !== undefined && command.expectedRevision !== null && command.expectedRevision !== session.controlRevision) {
+        throw sessionControlRevisionChanged(command.expectedRevision, session.controlRevision)
+      }
+      if (operation === "pause" && session.controlGate === "open") {
+        const active = await findInProgressTurn(tx, command.sessionId, command.userId)
+        if (active) throw sessionPauseConflict(active.id)
+      }
+      const nextGate = operation === "pause" ? "user_paused" : "open"
+      const changed = nextGate !== session.controlGate
+      const revision = changed ? session.controlRevision + 1 : session.controlRevision
+      const pausedAt = nextGate === "user_paused" ? (changed ? new Date() : session.pausedAt) : null
+      if (changed) {
+        await tx.agentSession.update({
+          where: { id: command.sessionId },
+          data: { controlGate: nextGate, controlRevision: revision, pausedAt },
+        })
+      }
+      await appendSessionControl(tx, command, operation, fingerprint, session.controlGate, nextGate, revision, pausedAt)
+      return sessionControlResult(command, operation, nextGate, revision, pausedAt, changed ? "applied" : "noop")
     })
   }
 }

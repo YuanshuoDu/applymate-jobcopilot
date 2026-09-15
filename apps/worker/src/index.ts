@@ -6,7 +6,12 @@ import { createWorkerControlHandler, resolveWorkerAdminHost } from "./admin/cont
 import { bindWorkerControl, getWorkerRuntimeState, restoreWorkerRuntimeState } from "./admin/worker-state.js";
 import { closeSharedRedisConnections } from "./redis.js";
 import { workerHarnessFeatureHealth } from "./admin/harness-health.js";
+import { startSubagentMailboxOutboxConsumer } from "./runtime/mailbox/outbox-consumer.js";
 import { startAgentWakeupConsumer } from "./runtime/wakeup/consumer.js";
+import { resolveProductionAgentFlags } from "./runtime/production-agent-flags.js";
+import { createProductionContextCompactionOptions } from "./runtime/context/production-context-compaction.js";
+import { createCanonicalExecutionProjection } from "./runtime/canonical-execution-projection.js";
+import { createCanonicalSessionProjection } from "./runtime/canonical-session-projection.js";
 
 async function main() {
   const adminHost = resolveWorkerAdminHost();
@@ -18,6 +23,10 @@ async function main() {
     automationSchedulerModule,
     cloakPoolModule,
     deadLetterModule,
+    canonicalRuntimeModule,
+    aiUsageBridgeModule,
+    productionBootstrapModule,
+    productionChildRuntimeModule,
   ] = await Promise.all([
     import("./db/apply-results.js"),
     import("./queue/apply-queue.js"),
@@ -26,8 +35,12 @@ async function main() {
     import("./queue/automation-scheduler.js"),
     import("./cloak/pool.js"),
     import("./queue/dead-letter.js"),
+    import("./runtime/canonical-turn-runtime.js"),
+    import("./queue/ai-usage-bridge.js"),
+    import("./queue/production-bootstrap.js"),
+    import("./runtime/subagents/production-child-runtime.js"),
   ]);
-  const { ensureApplyResultsTable, closePool } = applyResultsModule;
+  const { ensureApplyResultsTable, closePool, getPool } = applyResultsModule;
   const { applyWorker, applyQueue, connection } = applyQueueModule;
   const { scoutWorker, scoutQueue, SCOUT_QUEUE_NAME } = scoutQueueModule;
   const { agentRunQueue, AGENT_RUN_QUEUE_NAME, closeAgentRunResources } = agentRunQueueModule;
@@ -63,8 +76,45 @@ async function main() {
     process.exit(1);
   }
 
+  const productionFlags = resolveProductionAgentFlags();
+  const childExecutionEnabled = productionFlags.cognitiveLoopEnabled || productionChildRuntimeModule.childExecutionEnabled();
+  const pool = getPool();
+  const contextCompactionOptions = createProductionContextCompactionOptions({
+    enabled: productionFlags.contextCompactionEnabled,
+    pool,
+  });
+  const childExecutor = productionChildRuntimeModule.createOptionalProductionChildExecutor({
+    enabled: childExecutionEnabled,
+    pool,
+    ...(childExecutionEnabled && contextCompactionOptions.contextSnapshotAdapter
+      ? { contextSnapshotAdapter: contextCompactionOptions.contextSnapshotAdapter }
+      : {}),
+  });
+  const consumeWaitOutcomes = (productionFlags.cognitiveLoopEnabled || process.env.ENABLE_AGENT_WAIT_RESOLVER === "1") && childExecutor !== undefined;
+  const canonicalRuntime = await canonicalRuntimeModule.createCanonicalTurnRuntime(pool, {
+    workerId: process.env.WORKER_ID ?? `worker-${process.pid}`,
+    authorizeUsage: aiUsageBridgeModule.createWorkerUsageAuthorizer(),
+    consumeWaitOutcomes,
+    coordinationEnabled: consumeWaitOutcomes,
+    planningEnabled: productionFlags.planningEnabled,
+    planningExecutionEnabled: productionFlags.planningExecutionEnabled,
+    executionProjection: createCanonicalExecutionProjection(pool),
+    sessionProjection: createCanonicalSessionProjection(pool),
+    ...contextCompactionOptions,
+  });
+  const waitResolver = consumeWaitOutcomes ? {} : undefined;
+  const canonicalBootstrap = await productionBootstrapModule.createProductionWorkerBootstrap({
+    pool,
+    runtime: canonicalRuntime,
+    ...(childExecutor ? { subagents: { execute: childExecutor } } : {}),
+    ...(waitResolver ? { waitResolver } : {}),
+  });
+  console.log("[worker] Canonical Turn consumer and recovery scanner started");
+
   const agentWakeupConsumer = startAgentWakeupConsumer();
   console.log("[worker] Agent Turn wakeup consumer started");
+  const agentMailboxOutboxConsumer = startSubagentMailboxOutboxConsumer(pool);
+  console.log("[worker] Agent subagent mailbox outbox consumer started");
 
   const workerControls = {
     "apply-tasks": bindWorkerControl(applyQueue, applyWorker),
@@ -77,6 +127,7 @@ async function main() {
   console.log(`[worker] Listening on queue 'apply-tasks' (concurrency: ${process.env.CLOAK_MAX_WORKERS ?? "1"})`);
   console.log(`[worker] Listening on queue '${SCOUT_QUEUE_NAME}' (concurrency: 1)`);
   console.log(`[worker] Listening on queue '${AGENT_RUN_QUEUE_NAME}' (concurrency: 1)`);
+  console.log("[worker] Listening on queue 'agent-turns' (concurrency: 1)");
   const automationScheduler = startAutomationScheduler();
   console.log(`[worker] Automation scheduler ${automationScheduler.status().enabled ? "started" : "disabled"}`);
 
@@ -125,9 +176,11 @@ async function main() {
     await scoutWorker.close();
     await applyWorker.close();
     await closeAgentRunResources();
+    await canonicalBootstrap.close();
     await closeDeadLetterResources();
     automationScheduler.close();
     await closeAllSlots();
+    await agentMailboxOutboxConsumer.close();
     await agentWakeupConsumer.close();
     await closePool();
     await closeSharedRedisConnections();

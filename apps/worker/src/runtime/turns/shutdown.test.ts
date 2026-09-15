@@ -21,7 +21,7 @@ function pool() {
 }
 
 describe("Turn shutdown", () => {
-  it("aborts active work, fences it as interrupted, and closes the queue", async () => {
+  it("aborts active work, requeues it for recovery, and closes the queue", async () => {
     const fake = pool()
     const active = new TurnExecutionRegistry()
     const abort = vi.fn().mockResolvedValue(undefined)
@@ -31,6 +31,7 @@ describe("Turn shutdown", () => {
     await controller.shutdown("SIGTERM")
     expect(abort).toHaveBeenCalledOnce()
     expect(fake.calls.some((sql) => sql.includes('SET "status" = $5'))).toBe(true)
+    expect(fake.calls.some((sql) => sql.includes('SET "status" = \'interrupted\''))).toBe(false)
     expect(closeQueue).toHaveBeenCalledOnce()
   })
 

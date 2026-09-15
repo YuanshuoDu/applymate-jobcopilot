@@ -44,6 +44,19 @@ describe("Harness model runtime", () => {
     expect(runtime.candidates[0]).toMatchObject({ target: { provider: "minimax", model: "MiniMax-M3" }, requirement: { nativeTools: true, streaming: true } })
   })
 
+  it("can require explicit route credentials without discovering environment fallbacks", () => {
+    vi.stubEnv("ANTHROPIC_API_KEY", "environment-key")
+    try {
+      expect(() => createHarnessModelRuntime({
+        primary: { provider: "anthropic", model: "claude-sonnet-5" },
+        allowEnvironmentFallbacks: false,
+        fetch: vi.fn() as unknown as HarnessFetch,
+      })).toThrow("No Harness model route has an API key configured")
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
   it("reroutes a failed MiniMax request to Anthropic without publishing a partial response", async () => {
     const selection: string[] = []
     let call = 0

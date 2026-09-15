@@ -20,7 +20,7 @@ function storeFixture(): { store: TurnEngineStore; events: Array<{ type: string;
   const items: Array<{ id: string; type: string; content: unknown; revision: number }> = []
   const steps = new Set<string>()
   const store: TurnEngineStore = {
-    startStep: async ({ stepId }) => { steps.add(stepId); return { id: stepId } },
+    startStep: async ({ stepId, ordinal }) => { steps.add(stepId); return { id: stepId, ordinal } },
     updateStep: async ({ stepId }) => { expect(steps.has(stepId)).toBe(true) },
     createItem: async ({ itemId, type, content }) => { const item = { id: itemId, type, content, revision: 0 }; items.push(item); return item },
     updateItem: async ({ itemId, expectedRevision, content, status }) => {
@@ -107,7 +107,7 @@ describe("MiniMax Harness runtime integration", () => {
     }
     const execute = createToolRouterExecutor(router)
     const executor = createHarnessTurnExecutor({
-      scope: { userId: "user-1" },
+      scope: { userId: "user-1" }, rootTaskId: "root-1",
       goal: "Find Dublin jobs",
       snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
       contextBuilder: contextBuilder(), store: fixture.store, tools: [tool()], executeTool: execute,

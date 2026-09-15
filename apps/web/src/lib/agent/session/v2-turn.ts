@@ -31,6 +31,10 @@ function isUniqueViolation(error: unknown) {
   return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === "P2002"
 }
 
+function requiresRunnableSession(source: V2TurnSource) {
+  return source === "automation" || source === "system"
+}
+
 async function findActiveTurn(tx: Prisma.TransactionClient, input: EnsureV2TurnInput) {
   return tx.agentTurn.findFirst({
     where: { sessionId: input.sessionId, userId: input.userId, status: { in: [...ACTIVE_TURN_STATUSES] } },
@@ -39,15 +43,33 @@ async function findActiveTurn(tx: Prisma.TransactionClient, input: EnsureV2TurnI
   })
 }
 
+export async function lockOpenSession(
+  tx: Prisma.TransactionClient,
+  input: Pick<EnsureV2TurnInput, "sessionId" | "userId">,
+  options: { requireOpenGate?: boolean } = {},
+): Promise<void> {
+  const rows = await tx.$queryRaw<Array<{ id: string }>>(options.requireOpenGate
+    ? Prisma.sql`
+      SELECT "id" FROM "agent_sessions"
+      WHERE "id" = ${input.sessionId} AND "userId" = ${input.userId}
+        AND "status" NOT IN ('aborted', 'archived')
+        AND "controlGate" = 'open'
+      FOR UPDATE
+    `
+    : Prisma.sql`
+      SELECT "id" FROM "agent_sessions"
+      WHERE "id" = ${input.sessionId} AND "userId" = ${input.userId}
+        AND "status" NOT IN ('aborted', 'archived')
+      FOR UPDATE
+    `)
+  if (!rows[0]) throw new Error(`Agent session ${input.sessionId} does not exist for this user`)
+}
+
 /** Reuses the active root and creates a fresh root after terminal history. */
 export async function ensureV2Turn(db: PrismaClient, input: EnsureV2TurnInput): Promise<V2TurnHandle> {
   try {
     return await db.$transaction(async (tx) => {
-      const session = await tx.agentSession.findFirst({
-        where: { id: input.sessionId, userId: input.userId },
-        select: { id: true },
-      })
-      if (!session) throw new Error(`Agent session ${input.sessionId} does not exist for this user`)
+      await lockOpenSession(tx, input, { requireOpenGate: requiresRunnableSession(input.source) })
 
       if (input.turnId) {
         const owned = await tx.agentTurn.findFirst({
@@ -81,12 +103,11 @@ export async function ensureV2Turn(db: PrismaClient, input: EnsureV2TurnInput): 
     })
   } catch (error) {
     if (!isUniqueViolation(error)) throw error
-    const active = await db.agentTurn.findFirst({
-      where: { sessionId: input.sessionId, userId: input.userId, status: { in: [...ACTIVE_TURN_STATUSES] } },
-      orderBy: { createdAt: "desc" },
-      select: { id: true },
+    return db.$transaction(async (tx) => {
+      await lockOpenSession(tx, input, { requireOpenGate: requiresRunnableSession(input.source) })
+      const active = await findActiveTurn(tx, input)
+      if (!active) throw error
+      return { sessionId: input.sessionId, turnId: active.id, userId: input.userId }
     })
-    if (!active) throw error
-    return { sessionId: input.sessionId, turnId: active.id, userId: input.userId }
   }
 }
