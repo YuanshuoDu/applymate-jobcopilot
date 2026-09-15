@@ -235,6 +235,43 @@ describe('timeline reducer', () => {
     expect(timelineReducer(state, { type: 'event', event: lateAnswer })).toBe(state)
   })
 
+  it('records an ID-only question start without materializing an unknown item', () => {
+    const stub = {
+      schemaVersion: 'agent-harness.v2', id: 'question-started', sessionId: 'session-1', turnId: 'turn-1',
+      itemId: 'question-item', taskId: null, type: 'item.started', actor: 'orchestrator', sequence: '20',
+      payload: { itemId: 'question-item', waitKind: 'question', questionId: 'question-1', toolCallId: null },
+    }
+
+    const state = timelineReducer(createTimelineState('session-1'), { type: 'event', event: stub })
+
+    expect(state.events.map(entry => entry.id)).toEqual(['question-started'])
+    expect(state.itemIds).toEqual([])
+    expect(state.fallbackItems).toEqual([])
+  })
+
+  it('does not apply a terminal fact to a newer canonical question snapshot', () => {
+    const terminal = {
+      schemaVersion: 'agent-harness.v2', id: 'question-answered', sessionId: 'session-1', turnId: 'turn-1',
+      itemId: 'question-item', taskId: null, type: 'question.answered', actor: 'user', sequence: '19',
+      payload: {
+        waitKind: 'question', waitId: 'question-1', itemId: 'question-item', turnId: 'turn-1', toolCallId: null,
+        status: 'answered', nextTurnRevision: 1, answerAvailable: true,
+      },
+    }
+    const question = {
+      schemaVersion: 'agent-harness.v2', id: 'question-item', sessionId: 'session-1', turnId: 'turn-1', stepId: null, taskId: null,
+      type: 'question', status: 'started', phase: 'commentary', revision: 0, sequence: '20', content: {
+        waitKind: 'question', questionId: 'question-1', stage: 'profile', question: 'Choose?', options: [{ value: 'yes', label: 'Yes' }],
+        answerAvailable: false, pending: true,
+      }, startedAt: null, completedAt: null, createdAt: '2026-09-15T00:00:00.000Z', updatedAt: '2026-09-15T00:00:00.000Z',
+    }
+
+    let state = timelineReducer(createTimelineState('session-1'), { type: 'event', event: terminal })
+    state = timelineReducer(state, { type: 'hydrate', items: [question] })
+
+    expect(state.itemsById['question-item']).toMatchObject({ status: 'started', content: { pending: true, answerAvailable: false } })
+  })
+
   it('keeps canonical root and child agenda projections isolated', () => {
     const childReceipt = { ...agendaReceipt, taskId: 'task-child', nextAction: 'await_children' }
     let state = timelineReducer(createTimelineState('session-1'), {

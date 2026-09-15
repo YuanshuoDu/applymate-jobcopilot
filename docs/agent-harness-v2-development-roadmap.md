@@ -2084,3 +2084,15 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Command and authority:** Option labels are rendered while option values remain in memory for submission. Free text is bounded and normalized before the existing `POST /api/agent/sessions/{id}/questions/{questionId}` Broker command. The body contains only `clientMessageId`, `expectedTurnId`, `expectedRevision` from the session-owned Turn, and `answer`, with the same client ID in the idempotency header. 202 `resolved` and `duplicate` acknowledgements trigger a safe refresh hint but never mutate the item optimistically; authoritative `question.answered` and system interrupt `question.cancelled` facts establish terminal state.
 
 **Candidate boundary:** Focused parser/action/card/reducer validation covers strict item/event parsing, OAuth exclusion, option/free-text controls, no-ID/no-answer rendering, paused and unavailable states, exact command payload/header, duplicate/malformed/network handling, terminal completion/interruption, regression rejection, and epoch fencing. The current producer's missing pending marker and ID-only `item.started` form remain runtime limitations; no API, wait helper, Broker, Worker, schema, queue, OAuth recovery, or feature flag changed.
+
+## 87. P7-8 — V2 live question hydration
+
+**Candidate status/date (2026-09-15):** P7-8 is recorded as a candidate Web-only live question hydration slice; overall progress remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** The live V2 `item.started` question stub is used only to trigger an owner-scoped canonical timeline hydration. Strict schema, actor, session, sequence, item, and question payload checks reject malformed or foreign stubs. The reducer records the stub event metadata without materializing an unknown item. Canonical question items arrive through the existing timeline replay reducer, while foreign session values are filtered before dispatch.
+
+**Concurrency and fences:** A single hydration pump coalesces pending question keys, drains keys observed during an in-flight request, reuses the stream `AbortSignal`, and never opens a second SSE subscription. Aborted responses do not dispatch. The existing durable cursor and overflow snapshot path remain unchanged. Canonical hydration applies terminal answer/cancellation facts only when question lineage and sequence fences match, preventing stale terminal facts from regressing a newer snapshot.
+
+**Independent verification:** Focused Web validation passed **39/39 tests across 3 files** (question hydration, stream client, timeline reducer), Web `tsc --noEmit --skipLibCheck`, and `git diff --check`. No API, Worker, schema, queue, model, OAuth, or feature flag changed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, production SSE reconnect/overflow, process restart, Worker/Redis delivery, provider/browser behavior, deployment, and complete end-to-end question evidence remain unverified. The cognitive loop and production feature flags remain disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance.

@@ -65,7 +65,7 @@ describe("worker tool runtime entry point", () => {
   it("passes the supplied durable wait port to the wait tool", async () => {
     const wait = { wait: vi.fn(async () => ({ waitId: "wait-1", status: "ready" as const, deadlineAt: "2026-09-09T12:00:00.000Z", matchedTaskIds: ["child-1"] })) } as unknown as DurableWaitPort
     const store = {
-      getTask: vi.fn(async () => ({ id: "child-1" })),
+      getTask: vi.fn(async () => ({ id: "child-1", turnId: "turn-1" })),
       appendActivity: vi.fn(async () => undefined),
     } as unknown as CoordinationStore
     const runtime = createWorkerToolRuntime(

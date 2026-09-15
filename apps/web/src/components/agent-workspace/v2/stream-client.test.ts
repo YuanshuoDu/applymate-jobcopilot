@@ -121,6 +121,49 @@ function approvalResolvedEvent(sequence = '4') {
   }
 }
 
+function questionStubEvent(sequence: string, questionId: string, overrides: Record<string, unknown> = {}) {
+  return {
+    schemaVersion: 'agent-harness.v2', id: `question-started-${sequence}`, sessionId: 'session-1', turnId: 'turn-1',
+    itemId: `question-item-${questionId}`, taskId: null, type: 'item.started', actor: 'orchestrator', sequence,
+    payload: { itemId: `question-item-${questionId}`, waitKind: 'question', questionId, toolCallId: null }, ...overrides,
+  }
+}
+
+function questionCanonicalItem(questionId: string, status: 'started' | 'completed' = 'started') {
+  return {
+    schemaVersion: 'agent-harness.v2', id: `question-item-${questionId}`, sessionId: 'session-1', turnId: 'turn-1',
+    stepId: null, taskId: null, type: 'question', status, phase: 'commentary', revision: 0,
+    content: {
+      waitKind: 'question', questionId, stage: 'profile', question: `Choose ${questionId}?`,
+      options: [{ value: 'yes', label: 'Yes' }], pending: status === 'started', answerAvailable: status === 'completed',
+    },
+    startedAt: '2026-09-15T00:00:00.000Z', completedAt: status === 'completed' ? '2026-09-15T00:00:01.000Z' : null,
+    createdAt: '2026-09-15T00:00:00.000Z', updatedAt: '2026-09-15T00:00:01.000Z',
+  }
+}
+
+function questionAnsweredEvent(sequence: string, questionId: string) {
+  return {
+    schemaVersion: 'agent-harness.v2', id: `question-answered-${sequence}`, sessionId: 'session-1', turnId: 'turn-1',
+    itemId: `question-item-${questionId}`, taskId: null, type: 'question.answered', actor: 'user', sequence,
+    correlationId: questionId, causationId: `question-item-${questionId}`, idempotencyKey: `answer-${questionId}`,
+    payload: {
+      waitKind: 'question', waitId: questionId, itemId: `question-item-${questionId}`, turnId: 'turn-1',
+      toolCallId: null, status: 'answered', nextTurnRevision: 1, answerAvailable: true,
+    },
+  }
+}
+
+function sseEvent(value: unknown, type = 'item.started') {
+  return `event: ${type}\ndata: ${JSON.stringify(value)}\n\n`
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>(next => { resolve = next })
+  return { promise, resolve }
+}
+
 describe('V2 timeline stream client', () => {
   it('hydrates every timeline page before attaching the stream', async () => {
     const dispatch = vi.fn()
@@ -271,6 +314,81 @@ describe('V2 timeline stream client', () => {
 
     expect(state.cognitiveAgenda.latest).toBeNull()
     expect(state.events.map(event => event.id)).toEqual(['agenda-bad'])
+  })
+
+  it('hydrates an ID-only question stub once and keeps its durable event metadata', async () => {
+    const controller = new AbortController()
+    let state: TimelineState = createTimelineState('session-1')
+    let hydrateCount = 0
+    const dispatch = (action: TimelineAction) => {
+      state = timelineReducer(state, action)
+      if (action.type === 'hydrate' && ++hydrateCount === 2) controller.abort()
+    }
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [], page: { hasMore: false } })))
+      .mockResolvedValueOnce(new Response(streamFrom(sseEvent(questionStubEvent('10', 'question-1'))), { headers: { 'Content-Type': 'text/event-stream' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [questionCanonicalItem('question-1')], page: { hasMore: false } })))
+
+    await streamAgentTimeline({ sessionId: 'session-1', dispatch, fetcher, signal: controller.signal, retryDelayMs: 0 })
+
+    expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual([
+      '/api/agent/sessions/session-1/timeline?limit=100',
+      '/api/agent/sessions/session-1/events',
+      '/api/agent/sessions/session-1/timeline?limit=100',
+    ])
+    expect(state.events.map(event => event.id)).toEqual(['question-started-10'])
+    expect(state.itemsById['question-item-question-1']).toMatchObject({ type: 'question', status: 'started' })
+    expect(state.fallbackItems).toEqual([])
+  })
+
+  it('coalesces question stubs received in one stream turn into one hydration', async () => {
+    const controller = new AbortController()
+    let state: TimelineState = createTimelineState('session-1')
+    let hydrateCount = 0
+    const dispatch = (action: TimelineAction) => {
+      state = timelineReducer(state, action)
+      if (action.type === 'hydrate' && ++hydrateCount === 2) controller.abort()
+    }
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [], page: { hasMore: false } })))
+      .mockResolvedValueOnce(new Response(streamFrom([
+        sseEvent(questionStubEvent('10', 'question-1')),
+        sseEvent(questionStubEvent('11', 'question-2')),
+      ].join('')), { headers: { 'Content-Type': 'text/event-stream' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [questionCanonicalItem('question-1'), questionCanonicalItem('question-2')], page: { hasMore: false } })))
+
+    await streamAgentTimeline({ sessionId: 'session-1', dispatch, fetcher, signal: controller.signal, retryDelayMs: 0 })
+
+    expect(fetcher).toHaveBeenCalledTimes(3)
+    expect(state.itemsById['question-item-question-1']).toMatchObject({ type: 'question', status: 'started' })
+    expect(state.itemsById['question-item-question-2']).toMatchObject({ type: 'question', status: 'started' })
+  })
+
+  it('does not dispatch a hydration response that becomes stale after abort', async () => {
+    const controller = new AbortController()
+    const dispatch = vi.fn()
+    const response = deferred<Response>()
+    const pending = hydrateTimeline({ sessionId: 'session-1', dispatch, signal: controller.signal, fetcher: vi.fn<typeof fetch>().mockReturnValue(response.promise) })
+    controller.abort()
+    response.resolve(new Response(JSON.stringify({ items: [questionCanonicalItem('question-1')], page: { hasMore: false } })))
+
+    await pending
+
+    expect(dispatch).not.toHaveBeenCalled()
+  })
+
+  it('filters foreign session items and tail events before dispatching hydration', async () => {
+    const dispatch = vi.fn()
+    const foreignItem = { ...questionCanonicalItem('question-foreign'), sessionId: 'session-2' }
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(JSON.stringify({
+      items: [questionCanonicalItem('question-1'), foreignItem],
+      page: { hasMore: false },
+      agenda: agendaEvent({ sessionId: 'session-2' }),
+    })))
+
+    await hydrateTimeline({ sessionId: 'session-1', dispatch, fetcher })
+
+    expect(dispatch).toHaveBeenCalledWith({ type: 'hydrate', items: [questionCanonicalItem('question-1')] })
   })
 
   it('uses the reducer for replay, live events, reconnect cursor, and legacy fallback', async () => {

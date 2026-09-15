@@ -2,6 +2,7 @@
 
 import { isSessionControlEventCandidate, parseTimelineSessionControl } from './timeline-session-control'
 import { normalizeTimelineEvent, type TimelineAction } from './timeline-reducer'
+import { createQuestionHydrationPump, filterQuestionHydrationValues, QUESTION_HYDRATION_MAX_PAGES } from './question-hydration'
 
 interface TimelinePageResponse {
   items?: unknown[]
@@ -26,9 +27,12 @@ export interface TimelineStreamClientOptions {
 
 const DEFAULT_RETRY_DELAY_MS = 250
 const DEFAULT_PAGE_SIZE = 100
+type TimelineHydrationOptions = Pick<TimelineStreamClientOptions, 'sessionId' | 'dispatch' | 'signal' | 'fetcher' | 'pageSize'> & {
+  maxPages?: number
+}
 
 /** Hydrates the canonical item projection before a live stream is attached. */
-export async function hydrateTimeline(options: Pick<TimelineStreamClientOptions, 'sessionId' | 'dispatch' | 'signal' | 'fetcher' | 'pageSize'>): Promise<void> {
+export async function hydrateTimeline(options: TimelineHydrationOptions): Promise<void> {
   const fetcher = options.fetcher ?? fetch
   const items: unknown[] = []
   let agenda: unknown = undefined
@@ -37,6 +41,8 @@ export async function hydrateTimeline(options: Pick<TimelineStreamClientOptions,
   let planEvents: unknown[] | undefined
   let approvalEvents: unknown[] | undefined
   let cursor: string | null = null
+  let pages = 0
+  const maxPages = options.maxPages ?? Number.POSITIVE_INFINITY
   do {
     const query = new URLSearchParams({ limit: String(options.pageSize ?? DEFAULT_PAGE_SIZE) })
     if (cursor) query.set('cursor', cursor)
@@ -49,14 +55,18 @@ export async function hydrateTimeline(options: Pick<TimelineStreamClientOptions,
     if (cursor === null && Array.isArray(page.steeringMarkers)) steeringMarkers = page.steeringMarkers
     if (cursor === null && Array.isArray(page.planEvents)) planEvents = page.planEvents
     if (cursor === null && Array.isArray(page.approvalEvents)) approvalEvents = page.approvalEvents
+    pages += 1
     cursor = page.page?.hasMore === true && typeof page.page.nextCursor === 'string' ? page.page.nextCursor : null
-  } while (cursor && !options.signal?.aborted)
+  } while (cursor && pages < maxPages && !options.signal?.aborted)
+  if (options.signal?.aborted) return
   const agendaTail = agendas ?? (agenda === undefined || agenda === null ? [] : [agenda])
   const tail = [...agendaTail, ...(steeringMarkers ?? []), ...(planEvents ?? [])]
     .concat(approvalEvents ?? [])
+    .filter(value => filterQuestionHydrationValues([value], options.sessionId).length > 0)
     .filter((value): value is unknown => value !== undefined && value !== null)
     .sort(compareTailEvents)
-  options.dispatch(tail.length === 0 ? { type: 'hydrate', items } : { type: 'hydrate', items, tail })
+  const sessionItems = filterQuestionHydrationValues(items, options.sessionId)
+  options.dispatch(tail.length === 0 ? { type: 'hydrate', items: sessionItems } : { type: 'hydrate', items: sessionItems, tail })
 }
 
 /** Attaches one reconnecting V2 SSE consumer to the same reducer used by replay. */
@@ -66,10 +76,16 @@ export async function streamAgentTimeline(options: TimelineStreamClientOptions):
   let afterSequence = BigInt(0)
   let selectedV2 = false
   let connected = false
+  const questionHydration = createQuestionHydrationPump({
+    sessionId: options.sessionId,
+    signal: options.signal,
+    hydrate: () => hydrateTimeline({ ...options, maxPages: QUESTION_HYDRATION_MAX_PAGES }),
+  })
 
   await hydrateTimeline(options)
 
   while (!options.signal?.aborted) {
+    questionHydration.pump()
     const path = `/api/agent/sessions/${encodeURIComponent(options.sessionId)}/events`
     const url = selectedV2 ? `${path}?afterSequence=${afterSequence.toString()}` : path
     let response: Response
@@ -130,11 +146,13 @@ export async function streamAgentTimeline(options: TimelineStreamClientOptions):
           options.dispatch({ type: 'snapshot-required' })
         } else {
           options.dispatch(event.kind ? { type: 'delta', delta: event } : { type: 'event', event })
+          questionHydration.request(frame.data)
         }
       }, options.signal)
     } finally {
       ended = true
     }
+    while (questionHydration.current()) await questionHydration.current()
     if (snapshotRequired && !options.signal?.aborted) await hydrateTimeline(options)
     if (ended && !options.signal?.aborted) {
       connected = false

@@ -6,7 +6,7 @@ import { createApprovalLedgerState, reduceApprovalLedger, type ApprovalLedgerSta
 import { createCognitiveAgendaState, reduceCognitiveAgenda, type TimelineCognitiveAgendaState } from './timeline-cognitive-agenda'
 import { isPlanLedgerEventType, parsePlanLedgerEvent } from './plan-ledger-parser'
 import { createPlanLedgerState, reducePlanLedger, type PlanLedgerState } from './plan-ledger-view'
-import { parseQuestionTerminalEvent } from './question-input-parser'
+import { parseQuestionInputItem, parseQuestionTerminalEvent } from './question-input-parser'
 import { emptyTimelineSteeringMarkerState, reduceTimelineSteeringMarkers, STEERING_MARKER_EVENT_TYPE, STEERING_MARKER_MAX_EVENTS, type TimelineSteeringMarkerEvent, type TimelineSteeringMarkerState } from './timeline-steering-markers'
 import { createTimelineSessionControlState, isSessionControlEventCandidate, parseTimelineSessionControl, reduceTimelineSessionControl, type TimelineSessionControlEvent, type TimelineSessionControlState } from './timeline-session-control'
 import { appendFallbackEvent, appendTimelineEvent, buildIndexes, compareItems, integer, isAfter, isRecord, itemFromTimelineEvent, mergeContent, numberOrUndefined, sequence, stringOrNull, timestamp } from './timeline-reducer-utils'
@@ -179,7 +179,9 @@ function reduceItems(state: TimelineState, values: unknown[], source: TimelineIt
   let next = state
   for (const value of values) {
     const item = normalizeTimelineItem(value, source)
-    if (item?.sessionId === state.sessionId) next = upsertItem(next, item, source)
+    if (item?.sessionId !== state.sessionId) continue
+    if (item.type === 'question' && !parseQuestionInputItem(value, state.sessionId)) continue
+    next = upsertItem(next, questionTerminalItem(next, item), source)
   }
   return next
 }
@@ -220,12 +222,14 @@ function reduceEvent(state: TimelineState, value: unknown): TimelineState {
     const existingRevision = state.itemsById[event.itemId ?? '']?.revision ?? 0
     return reduceDelta(next, { ...event, kind: 'delta', revision: event.revision ?? existingRevision + 1 }, event.id)
   }
+  if (event.type === 'item.started' && isRecord(event.payload) && event.payload.waitKind === 'question' && !isRecord(event.payload.item)) return next
   if (!event.itemId) return KNOWN_EVENT_TYPES.has(event.type) ? next : addUnknownEvent(next, event)
   const existing = state.itemsById[event.itemId]
   const status = event.type === 'item.completed' ? 'completed' : event.type === 'item.failed' ? 'failed' : existing?.status ?? 'started'
   if (existing && TERMINAL_STATUSES.has(existing.status) && status !== 'completed') return next
   if (!KNOWN_EVENT_TYPES.has(event.type)) next = { ...next, fallbackItems: appendFallbackEvent(next.fallbackItems, event) }
   const item = itemFromTimelineEvent(event, status, existing, undefined, normalizeTimelineItem)
+  if (item?.type === 'question' && isRecord(event.payload) && !parseQuestionInputItem(event.payload.item ?? event.payload, state.sessionId)) return next
   return item ? upsertItem(next, item, item.source === 'unknown' ? 'unknown' : 'durable') : next
 }
 
@@ -322,6 +326,29 @@ function reduceMarkerEvent(state: TimelineState, event: TimelineEvent): { state:
   return null
 }
 
+function questionTerminalItem(state: TimelineState, item: TimelineItem): TimelineItem {
+  if (item.type !== 'question' || TERMINAL_STATUSES.has(item.status)) return item
+  const input = parseQuestionInputItem(item, state.sessionId)
+  if (!input) return item
+  for (let index = state.events.length - 1; index >= 0; index -= 1) {
+    const event = state.events[index]
+    if (event.type !== 'question.answered' && event.type !== 'question.cancelled') continue
+    if (event.itemId !== item.id || event.turnId !== item.turnId || event.taskId !== item.taskId) continue
+    const terminal = parseQuestionTerminalEvent(event, state.sessionId)
+    if (!terminal || terminal.questionId !== input.questionId || terminal.turnId !== input.turnId || terminal.taskId !== input.taskId) continue
+    if (item.sequence !== null && !isAtLeast(terminal.sequence, item.sequence)) continue
+    const content = isRecord(item.content)
+      ? { ...item.content, pending: false, answerAvailable: terminal.status === 'completed', ...(terminal.status === 'interrupted' ? { cancelled: true, cancellationReason: 'interrupt' } : {}) }
+      : item.content
+    return { ...item, status: terminal.status, content, completedAt: terminal.createdAt ?? item.completedAt, sequence: terminal.sequence }
+  }
+  return item
+}
+
+function isAtLeast(left: string, right: string): boolean {
+  return left === right || isAfter(left, right)
+}
+
 function reduceDelta(state: TimelineState, value: unknown, preprocessedId?: string): TimelineState {
   const delta = normalizeTimelineEvent(value)
   if (!delta || delta.sessionId !== state.sessionId || !delta.itemId || (preprocessedId === undefined && state.processedEventIds[delta.id])) return state
@@ -376,6 +403,7 @@ function addUnknownEvent(state: TimelineState, event: TimelineEvent): TimelineSt
 
 function upsertItem(state: TimelineState, item: TimelineItem, source: TimelineItemSource, replaceContent = false): TimelineState {
   const existing = state.itemsById[item.id]
+  if (existing && existing.type === 'question' && TERMINAL_STATUSES.has(existing.status) && !TERMINAL_STATUSES.has(item.status)) return state
   if (existing && source === 'transient' && (TERMINAL_STATUSES.has(existing.status) || item.revision <= existing.revision)) return state
   if (existing && source === 'durable' && existing.sequence && item.sequence && !isAfter(item.sequence, existing.sequence) && item.status !== 'completed') return state
   const nextItem = source === 'transient' && existing
