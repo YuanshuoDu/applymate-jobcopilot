@@ -5,6 +5,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { streamAgentTimeline } from './stream-client'
 import type { CognitiveAgendaView } from './cognitive-agenda-view'
 import { createTimelineState, selectTimelineItems, timelineReducer, type TimelineConnection, type TimelineItem, type TimelineState } from './timeline-reducer'
+import type { TimelineCognitiveAgendaEntry } from './timeline-cognitive-agenda'
 import type { TimelineSteeringMarkerState } from './timeline-steering-markers'
 
 export type AgentCognitiveAgendaSnapshot = CognitiveAgendaView & {
@@ -17,6 +18,7 @@ export interface AgentTimelineSnapshot {
   readonly lastEventId: string | null
   readonly lifecycleRevision: number
   readonly cognitiveAgenda: AgentCognitiveAgendaSnapshot | null
+  readonly cognitiveAgendas: readonly TimelineCognitiveAgendaEntry[]
   readonly steeringMarkers?: TimelineSteeringMarkerState
   readonly connection: TimelineConnection
   readonly restoring: boolean
@@ -78,9 +80,10 @@ export function useAgentTimeline(sessionId: string | null): AgentTimelineSnapsho
     lastEventId: sessionMatches ? state.lastEventId : null,
     lifecycleRevision: sessionMatches ? state.lifecycleRevision : 0,
     cognitiveAgenda,
+    cognitiveAgendas: sessionMatches ? state.cognitiveAgenda.scoped : [],
     steeringMarkers: sessionMatches ? state.steeringMarkers : { observed: [], applied: [], active: [], observedCount: 0, appliedCount: 0, activeCount: 0 },
     connection: sessionMatches ? state.connection : 'idle',
     restoring: sessionMatches ? restoring : Boolean(sessionId),
     error: sessionMatches ? error : null,
-  }), [sessionId, items, sessionMatches, state.lastEventId, state.connection, state.steeringMarkers, cognitiveAgenda, restoring, error])
+  }), [sessionId, items, sessionMatches, state.lastEventId, state.connection, state.steeringMarkers, state.cognitiveAgenda.scoped, cognitiveAgenda, restoring, error])
 }

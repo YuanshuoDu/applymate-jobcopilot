@@ -134,6 +134,7 @@ describe("agent timeline query API", () => {
     const body = await response.json()
 
     expect(body.agenda).toMatchObject({ id: "agenda_8", sequence: "8", type: "cognitive.agenda", payload: { signals: { approvals: { count: 1, ids: ["[REDACTED]"] } } } })
+    expect(body.agendas.map((entry: { id: string }) => entry.id)).toEqual(["agenda_8"])
     expect(mocks.agendaFindMany).toHaveBeenCalledWith({
       where: { sessionId: "session_1", type: "cognitive.agenda" }, orderBy: { sequence: "desc" }, take: 64,
       select: expect.objectContaining({ payload: true, sequence: true }),

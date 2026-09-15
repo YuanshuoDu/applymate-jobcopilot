@@ -51,9 +51,11 @@ describe('timeline session projection', () => {
     })
     const snapshot: AgentTimelineSnapshot = {
       sessionId: 'session-a', items: [], lastEventId: state.lastEventId, lifecycleRevision: state.lifecycleRevision,
-      cognitiveAgenda: state.cognitiveAgenda.latest, connection: 'idle', restoring: false, error: null,
+      cognitiveAgenda: state.cognitiveAgenda.latest, cognitiveAgendas: state.cognitiveAgenda.scoped,
+      connection: 'idle', restoring: false, error: null,
     }
 
     expect(snapshot.cognitiveAgenda?.nextAction).toBe('continue_plan')
+    expect(snapshot.cognitiveAgendas).toHaveLength(1)
   })
 })

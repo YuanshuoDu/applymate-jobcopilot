@@ -6,7 +6,7 @@ import { useApi } from '@/lib/hooks'
 import { useI18n } from '@/lib/i18n'
 
 import { flattenTaskTree, TaskTreePanel } from './TaskTreePanel'
-import { CognitiveAgendaCard } from './cognitive-agenda-card'
+import { CognitiveAgendaCard, type CognitiveAgendaTaskLabel } from './cognitive-agenda-card'
 import { projectSupervisorTree, type SupervisorTaskSummary, type SupervisorTurnSummary } from './task-tree-projection'
 import type { AgentTimelineSnapshot } from './use-agent-timeline'
 
@@ -111,6 +111,10 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
     tasks,
     labels: { task: t('agent.tasks'), step: t('agent.plan'), tool: t('agent.toolActor') },
   }), [t, turns, timeline.items, tasks])
+  const agendaTaskLabels = useMemo(() => new Map<string, CognitiveAgendaTaskLabel>(tasks.map(task => [task.id, {
+    label: safeAgendaTaskLabel(task.role) || safeAgendaTaskLabel(task.taskType),
+    root: !task.parentTaskId,
+  }])), [tasks])
   const selectedNode = useMemo(() => flattenTaskTree(nodes).find(node => node.id === selectedId), [nodes, selectedId])
   const selectedItem = selectedNode?.itemId ? timeline.items.find(item => item.id === selectedNode.itemId) : undefined
   const loading = Boolean(sessionId && (timeline.restoring || turnsQuery.loading || tasksQuery.loading))
@@ -155,7 +159,7 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
       </div>
       {loading && <p aria-live="polite" style={messageStyle}>{t('agent.loadingTasks')}</p>}
       {error && <p role="alert" style={{ ...messageStyle, color: 'var(--c-danger)' }}>{t('agent.supervisorUnavailable')}</p>}
-      {timeline.cognitiveAgenda && <CognitiveAgendaCard agenda={timeline.cognitiveAgenda} />}
+      {timeline.cognitiveAgenda && <CognitiveAgendaCard agenda={timeline.cognitiveAgenda} agendas={timeline.cognitiveAgendas} taskLabels={agendaTaskLabels} />}
       {!loading && !nodes.length && !error && <p style={messageStyle}>{t('agent.noTaskRecords')}</p>}
       {!!nodes.length && <TaskTreePanel nodes={nodes} selectedId={selectedId} sessionKey={sessionId} showHeading={false} onSelect={setSelectedId} />}
       {hasMore && <button type="button" onClick={() => void loadMore()} disabled={loadingMore} style={loadMoreStyle}>
@@ -211,6 +215,11 @@ function statusLabel(status: string, t: (key: string) => string): string {
   if (status === 'interrupted' || status === 'cancelled') return t('agent.toolCancelled')
   if (status === 'paused') return t('agent.paused')
   return t('agent.unknownItem')
+}
+
+function safeAgendaTaskLabel(value: string): string {
+  const trimmed = value.trim()
+  return /^[A-Za-z][A-Za-z /_-]{0,39}$/.test(trimmed) ? trimmed : ''
 }
 
 const messageStyle: React.CSSProperties = { margin: 0, color: 'var(--text-muted)', fontSize: 11, lineHeight: 1.45 }

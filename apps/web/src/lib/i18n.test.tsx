@@ -69,6 +69,7 @@ describe('AI settings translations', () => {
       'agent.cognitiveAgenda.blocker.unresolvedFailure', 'agent.cognitiveAgenda.blocker.completionVerification', 'agent.cognitiveAgenda.signal.pendingInputs',
       'agent.cognitiveAgenda.signal.approvals', 'agent.cognitiveAgenda.signal.activeWaits', 'agent.cognitiveAgenda.signal.unresolved',
       'agent.cognitiveAgenda.signal.completionVerification', 'agent.cognitiveAgenda.signal.steeringActive', 'agent.cognitiveAgenda.signal.steeringNewlyObserved',
+      'agent.cognitiveAgenda.scopedTitle', 'agent.cognitiveAgenda.root', 'agent.cognitiveAgenda.current', 'agent.cognitiveAgenda.child', 'agent.cognitiveAgenda.task',
     ]
 
     for (const key of keys) {

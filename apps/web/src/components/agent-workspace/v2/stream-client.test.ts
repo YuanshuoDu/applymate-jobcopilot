@@ -118,6 +118,24 @@ describe('V2 timeline stream client', () => {
     expect(state.itemsById['item-1']).toMatchObject({ status: 'streaming' })
   })
 
+  it('hydrates all first-page task agendas and markers through one sequence-sorted tail', async () => {
+    let state: TimelineState = createTimelineState('session-1')
+    const dispatch = (action: TimelineAction) => { state = timelineReducer(state, action) }
+    const child = agendaEvent({
+      id: 'agenda-child', taskId: 'task-child', sequence: '8',
+      payload: { ...agendaEvent().payload, taskId: 'task-child', nextAction: 'await_children' },
+    })
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(JSON.stringify({
+      items: [], page: { hasMore: false, nextCursor: null }, agendas: [child, agendaEvent({ sequence: '7' })],
+      steeringMarkers: [steeringMarkerEvent('9')],
+    })))
+
+    await hydrateTimeline({ sessionId: 'session-1', dispatch, fetcher })
+
+    expect(state.events.map(event => event.id)).toEqual(['agenda-7', 'agenda-child', 'marker-9'])
+    expect(state.cognitiveAgenda.scoped.map(entry => entry.taskId)).toEqual(['task-child', 'task-1'])
+  })
+
   it('rehydrates the latest agenda after an SSE overflow', async () => {
     const controller = new AbortController()
     let state: TimelineState = createTimelineState('session-1')

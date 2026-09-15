@@ -61,27 +61,24 @@ export async function GET(request: NextRequest, context: RouteContext) {
     },
   })
   const result = pageResult(rows as ItemQueryRow[], page, "timeline", sessionId)
-  const agenda = page.cursor === null ? await latestAgenda(sessionId) : null
+  const agendas = page.cursor === null ? await recentAgendas(sessionId) : []
+  const agenda = page.cursor === null ? agendas[agendas.length - 1] ?? null : null
   const steeringMarkers = page.cursor === null ? await latestSteeringMarkers(sessionId) : []
   return ok({
     items: result.rows.map(itemDto),
     page: result.page,
-    ...(page.cursor === null ? { agenda, ...(steeringMarkers.length > 0 ? { steeringMarkers } : {}) } : {}),
+    ...(page.cursor === null ? { agenda, ...(agendas.length > 0 ? { agendas } : {}), ...(steeringMarkers.length > 0 ? { steeringMarkers } : {}) } : {}),
   })
 }
 
-async function latestAgenda(sessionId: string) {
+async function recentAgendas(sessionId: string) {
   const rows = await db.agentEvent.findMany({
     where: { sessionId, type: "cognitive.agenda" },
     orderBy: { sequence: "desc" },
     take: 64,
     select: AGENDA_SELECT,
   }) as AgendaQueryRow[]
-  for (const row of rows) {
-    const envelope = agendaEnvelope(row, sessionId)
-    if (envelope) return envelope
-  }
-  return null
+  return rows.map(row => agendaEnvelope(row, sessionId)).filter((envelope): envelope is NonNullable<typeof envelope> => envelope !== null).reverse()
 }
 
 async function latestSteeringMarkers(sessionId: string): Promise<readonly TimelineSteeringMarkerEvent[]> {
@@ -119,7 +116,7 @@ function markerEnvelope(row: SteeringMarkerQueryRow, sessionId: string): Timelin
 
 function agendaEnvelope(row: AgendaQueryRow, sessionId: string) {
   if (row.sessionId !== sessionId || row.type !== "cognitive.agenda" || row.itemId !== null ||
-    !/^\d{1,39}$/.test(row.sequence.toString())) return null
+    (row.actor !== "orchestrator" && row.actor !== "subagent") || !/^\d{1,39}$/.test(row.sequence.toString())) return null
   const payload = redactStreamValue(row.payload)
   const rawPayload = isRecord(payload) ? payload : {}
   const scope: CognitiveAgendaScope = {

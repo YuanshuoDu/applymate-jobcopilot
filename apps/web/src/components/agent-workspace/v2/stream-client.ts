@@ -6,6 +6,7 @@ interface TimelinePageResponse {
   items?: unknown[]
   page?: { hasMore?: boolean; nextCursor?: string | null }
   agenda?: unknown
+  agendas?: unknown[]
   steeringMarkers?: unknown[]
 }
 
@@ -28,6 +29,7 @@ export async function hydrateTimeline(options: Pick<TimelineStreamClientOptions,
   const fetcher = options.fetcher ?? fetch
   const items: unknown[] = []
   let agenda: unknown = undefined
+  let agendas: unknown[] | undefined
   let steeringMarkers: unknown[] | undefined
   let cursor: string | null = null
   do {
@@ -38,10 +40,12 @@ export async function hydrateTimeline(options: Pick<TimelineStreamClientOptions,
     const page = await response.json() as TimelinePageResponse
     if (Array.isArray(page.items)) items.push(...page.items)
     if (cursor === null && page.agenda !== undefined && page.agenda !== null) agenda = page.agenda
+    if (cursor === null && Array.isArray(page.agendas)) agendas = page.agendas
     if (cursor === null && Array.isArray(page.steeringMarkers)) steeringMarkers = page.steeringMarkers
     cursor = page.page?.hasMore === true && typeof page.page.nextCursor === 'string' ? page.page.nextCursor : null
   } while (cursor && !options.signal?.aborted)
-  const tail = [agenda, ...(steeringMarkers ?? [])].filter((value): value is unknown => value !== undefined && value !== null).sort(compareTailEvents)
+  const agendaTail = agendas ?? (agenda === undefined || agenda === null ? [] : [agenda])
+  const tail = [...agendaTail, ...(steeringMarkers ?? [])].filter((value): value is unknown => value !== undefined && value !== null).sort(compareTailEvents)
   options.dispatch(tail.length === 0 ? { type: 'hydrate', items } : { type: 'hydrate', items, tail })
 }
 

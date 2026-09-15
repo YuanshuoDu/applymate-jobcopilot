@@ -102,6 +102,21 @@ describe('timeline reducer', () => {
     expect(state.lifecycleRevision).toBe(0)
   })
 
+  it('keeps canonical root and child agenda projections isolated', () => {
+    const childReceipt = { ...agendaReceipt, taskId: 'task-child', nextAction: 'await_children' }
+    let state = timelineReducer(createTimelineState('session-1'), {
+      type: 'event', event: event({ id: 'agenda-root', type: 'cognitive.agenda', itemId: null, taskId: 'task-1', sequence: '9', kind: undefined, payload: agendaReceipt }),
+    })
+    state = timelineReducer(state, {
+      type: 'event', event: event({ id: 'agenda-child', type: 'cognitive.agenda', itemId: null, taskId: 'task-child', sequence: '10', kind: undefined, payload: childReceipt }),
+    })
+
+    expect(state.cognitiveAgenda.latest?.taskId).toBe('task-child')
+    expect(state.cognitiveAgenda.scoped.map(entry => entry.taskId)).toEqual(['task-child', 'task-1'])
+    expect(state.lifecycleRevision).toBe(0)
+    expect(selectTimelineItems(state)).toEqual([])
+  })
+
   it('folds durable steering markers as known non-lifecycle events without rendering items', () => {
     const markerPayload = (kind: 'observed' | 'applied') => ({
       schemaVersion: 'agent-harness.steering-marker.v1', kind, status: kind, sessionId: 'session-1', turnId: 'turn-1',
