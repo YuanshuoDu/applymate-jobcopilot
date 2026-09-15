@@ -15,6 +15,7 @@ import {
   type SubagentPolicy,
 } from "./types.js"
 import { computeSubagentNextAttemptAt } from "./retry-policy.js"
+import { isSessionControlGate, RUNNABLE_SESSION } from "../session-gate.js"
 
 type Queryable = Pick<pg.PoolClient, "query">
 
@@ -111,9 +112,11 @@ export class PgSubagentTaskStore implements SubagentStore {
 
   async claim(input: { taskId: string; sessionId: string; ownerId: string; policy: SubagentPolicy; now: Date }): Promise<SubagentTaskRecord | null> {
     return transaction(this.pool, async (client) => {
-      const session = await client.query(`SELECT "id", "status" FROM "agent_sessions" WHERE "id" = $1 FOR UPDATE`, [input.sessionId])
-      const sessionStatus = String(session.rows[0]?.status ?? "")
-      if (!session.rows[0] || sessionStatus === "aborted" || sessionStatus === "archived") return null
+      const session = await client.query<{ id: string; status: string; controlGate: unknown }>(`SELECT session."id", session."status", session."controlGate" FROM "agent_sessions" AS session
+        WHERE session."id" = $1 AND ${RUNNABLE_SESSION} FOR UPDATE`, [input.sessionId])
+      const sessionRow = session.rows[0]
+      const sessionStatus = String(sessionRow?.status ?? "")
+      if (!sessionRow || sessionStatus === "aborted" || sessionStatus === "archived" || !isSessionControlGate(sessionRow.controlGate) || sessionRow.controlGate !== "open") return null
       const running = await client.query(`SELECT COUNT(*)::int AS "count" FROM "sub_agent_tasks"
         WHERE "sessionId" = $1 AND "status" = 'running' AND "leaseExpiresAt" > CURRENT_TIMESTAMP`, [input.sessionId])
       if (Number(running.rows[0]?.count ?? 0) >= input.policy.maxConcurrency) return null
@@ -125,7 +128,7 @@ export class PgSubagentTaskStore implements SubagentStore {
           AND ("nextAttemptAt" IS NULL OR "nextAttemptAt" <= CURRENT_TIMESTAMP)
           AND EXISTS (SELECT 1 FROM "agent_sessions" AS session
             WHERE session."id" = "sub_agent_tasks"."sessionId"
-              AND session."status" NOT IN ('aborted', 'archived'))
+              AND ${RUNNABLE_SESSION})
           AND EXISTS (SELECT 1 FROM "sub_agent_tasks" AS root JOIN "agent_turns" AS turn ON turn."id" = root."turnId"
             WHERE root."id" = "sub_agent_tasks"."rootTaskId" AND root."sessionId" = "sub_agent_tasks"."sessionId"
               AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')

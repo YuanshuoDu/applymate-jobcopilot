@@ -1,5 +1,7 @@
 import type pg from "pg"
 
+import { isSessionControlGate, OPEN_SESSION, RUNNABLE_SESSION } from "../session-gate.js"
+
 /** Normal owner window. A scanner reclaims the Turn after this expires. */
 export const TURN_LEASE_WINDOW_MS = 60_000
 /** Renew before the 60s window expires, while the owner is still healthy. */
@@ -69,8 +71,8 @@ async function transaction<T>(pool: LeasePool, userId: string | null, work: (cli
 
 async function lockOpenSession(client: pg.PoolClient, sessionId: string, userId: string): Promise<void> {
   const result = await client.query(
-    `SELECT "id" FROM "agent_sessions"
-     WHERE "id" = $1 AND "userId" = $2 AND "status" NOT IN ('aborted', 'archived')
+    `SELECT session."id" FROM "agent_sessions" AS session
+     WHERE session."id" = $1 AND session."userId" = $2 AND ${OPEN_SESSION}
      FOR UPDATE`,
     [sessionId, userId],
   )
@@ -78,10 +80,10 @@ async function lockOpenSession(client: pg.PoolClient, sessionId: string, userId:
 }
 
 async function lockClaimSession(client: pg.PoolClient, payload: TurnJobPayload): Promise<string | null> {
-  const result = await client.query<{ userId: string }>(
-    `SELECT session."userId"
+  const result = await client.query<{ userId: string; controlGate: unknown }>(
+    `SELECT session."userId", session."controlGate"
      FROM "agent_sessions" AS session
-     WHERE session."id" = $1 AND session."status" NOT IN ('aborted', 'archived')
+     WHERE session."id" = $1 AND ${RUNNABLE_SESSION}
        AND EXISTS (
          SELECT 1 FROM "agent_turns" AS turn
          WHERE turn."id" = $2 AND turn."sessionId" = session."id" AND turn."userId" = session."userId"
@@ -89,8 +91,12 @@ async function lockClaimSession(client: pg.PoolClient, payload: TurnJobPayload):
      FOR UPDATE`,
     [payload.sessionId, payload.turnId],
   )
-  if (!result.rows[0] && result.rowCount !== 1) throw new LeaseUnavailable("Turn session is no longer open")
-  return result.rows[0]?.userId ?? null
+  const row = result.rows[0]
+  const controlGate = row?.controlGate
+  if ((!row && result.rowCount !== 1) || (row && ((result.rowCount !== undefined && result.rowCount !== 1) || (controlGate !== undefined && (!isSessionControlGate(controlGate) || controlGate !== "open"))))) {
+    throw new LeaseUnavailable("Turn session is not runnable")
+  }
+  return row?.userId ?? null
 }
 
 async function withOpenLease<T>(pool: LeasePool, current: TurnLease, fallback: T, work: (client: pg.PoolClient) => Promise<T>): Promise<T> {
@@ -132,7 +138,7 @@ export async function claimTurnLease(
            WHERE session."id" = "agent_turns"."sessionId"
              AND session."id" = $2
              AND session."userId" = "agent_turns"."userId"
-             AND session."status" NOT IN ('aborted', 'archived')
+             AND ${RUNNABLE_SESSION}
          )
          RETURNING "id", "sessionId", "userId", "leaseOwnerId", "leaseVersion",
                  "leaseStartedAt", "leaseExpiresAt"`,
