@@ -17,12 +17,14 @@ describe('approval ledger reducer', () => {
   it('folds requested, legacy resolved, and consumed facts into a safe terminal state', () => {
     let state = reduceApprovalLedger(createApprovalLedgerState('session-1'), audit('approval.requested', 'orchestrator', '1'))
     expect(selectApprovalLedgerPending(state)).toHaveLength(1)
+    expect(selectApprovalLedgerProjection(state).pendingActions).toEqual([{ approvalId: 'approval-1', turnId: 'turn-1', taskId: null, action: 'submit_application' }])
     state = reduceApprovalLedger(state, audit('approval.resolved', 'user', '2'))
     state = reduceApprovalLedger(state, audit('approval.consumed', 'system', '3'))
 
     expect(selectApprovalLedgerProjection(state)).toMatchObject({ pendingCount: 0, approvals: [{ status: 'consumed', action: 'submit_application', revision: 2 }] })
-    expect(JSON.stringify(selectApprovalLedgerProjection(state))).not.toContain('approval-1')
-    expect(JSON.stringify(selectApprovalLedgerProjection(state))).not.toContain('scopeHash')
+    expect(JSON.stringify(selectApprovalLedgerProjection(state).approvals)).not.toContain('approval-1')
+    expect(JSON.stringify(selectApprovalLedgerProjection(state).approvals)).not.toContain('scopeHash')
+    expect(selectApprovalLedgerProjection(state).pendingActions).toEqual([])
   })
 
   it('preserves broker approved or rejected decisions and allows consumption only after approval', () => {
@@ -58,6 +60,7 @@ describe('approval ledger reducer', () => {
     let state = reduceApprovalLedger(createApprovalLedgerState('session-1'), requested)
     state = reduceApprovalLedger(state, cancelled)
     expect(selectApprovalLedgerProjection(state).approvals[0]?.status).toBe('cancelled')
+    expect(selectApprovalLedgerProjection(state).pendingActions).toEqual([])
   })
 
   it('rejects the same approval id when a later event changes turn or task lineage', () => {

@@ -20,10 +20,19 @@ export interface ApprovalLedgerApproval {
   readonly revision?: number
 }
 
+/** In-memory references for a pending command; never render these values. */
+export interface ApprovalLedgerActionRef {
+  readonly approvalId: string
+  readonly turnId: string
+  readonly taskId: string | null
+  readonly action?: string
+}
+
 export interface ApprovalLedgerProjection {
   readonly sessionId: string
   readonly approvals: readonly ApprovalLedgerApproval[]
   readonly pending: readonly ApprovalLedgerApproval[]
+  readonly pendingActions: readonly ApprovalLedgerActionRef[]
   readonly currentPending: ApprovalLedgerApproval | null
   readonly pendingCount: number
 }
@@ -75,11 +84,12 @@ function nextRecord(current: ApprovalRecord | undefined, event: ParsedApprovalLe
 function buildProjection(sessionId: string, records: readonly ApprovalRecord[]): ApprovalLedgerProjection {
   const approvals = records.map(({ approvalId: _approvalId, turnId: _turnId, taskId: _taskId, sequence: _sequence, eventId: _eventId, ...safe }) => safe)
   const pending = approvals.filter(approval => approval.status === 'pending')
-  return { sessionId, approvals, pending, currentPending: pending[0] ?? null, pendingCount: pending.length }
+  const pendingActions = records.filter(record => record.status === 'pending').map(({ approvalId, turnId, taskId, action }) => ({ approvalId, turnId, taskId, ...(action === undefined ? {} : { action }) }))
+  return { sessionId, approvals, pending, pendingActions, currentPending: pending[0] ?? null, pendingCount: pending.length }
 }
 
 function emptyProjection(sessionId: string): ApprovalLedgerProjection {
-  return { sessionId, approvals: [], pending: [], currentPending: null, pendingCount: 0 }
+  return { sessionId, approvals: [], pending: [], pendingActions: [], currentPending: null, pendingCount: 0 }
 }
 
 function compareSequence(left: string, right: string): number {

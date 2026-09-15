@@ -172,7 +172,7 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
       {loading && <p aria-live="polite" style={messageStyle}>{t('agent.loadingTasks')}</p>}
       {error && <p role="alert" style={{ ...messageStyle, color: 'var(--c-danger)' }}>{t('agent.supervisorUnavailable')}</p>}
       <AgentPlanLedgerCard ledger={timeline.planLedger} />
-      <AgentApprovalLedgerCard ledger={timeline.approvalLedger} />
+      <AgentApprovalLedgerCard ledger={timeline.approvalLedger} sessionId={sessionId} turns={turns} controlGate={timeline.controlGate} onAccepted={refetchSupervisorRecords} selectionKey={selectedId ?? ''} />
       {timeline.cognitiveAgenda && <CognitiveAgendaCard agenda={timeline.cognitiveAgenda} agendas={timeline.cognitiveAgendas} taskLabels={agendaTaskLabels} />}
       {!loading && !nodes.length && !error && <p style={messageStyle}>{t('agent.noTaskRecords')}</p>}
       {!!nodes.length && <TaskTreePanel nodes={nodes} selectedId={selectedId} sessionKey={sessionId} showHeading={false} onSelect={setSelectedId} />}

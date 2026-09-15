@@ -2064,3 +2064,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Runtime boundary:** `approval.expired` is accepted as a strict protocol shape for forward compatibility, but the current Web/Worker approval paths have no observed expired-event emitter. No synthetic expiration event is produced.
 
 **Candidate boundary:** Focused parser/view/card/reducer/route/stream validation covers strict envelopes, redaction, lineage and transition rejection, cancellation, hydration ordering, and legacy response compatibility. Live PostgreSQL/RLS, production SSE reconnect/overflow, process restart, Worker/Redis delivery, provider/browser behavior, deployment, and complete end-to-end approval evidence remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance.
+
+## 85. P7-6 — V2 Supervisor approval decision command
+
+**Candidate status/date (2026-09-15):** P7-6 is recorded as a candidate Web-only approval action slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Pending approval action references remain reducer-owned and carry only the strict event's approval, Turn, task lineage and safe action label. `AgentApprovalLedgerCard` enables localized approve/reject buttons only when the action's session-owned Turn supplies a safe current Turn revision. The command uses the existing `POST /api/agent/sessions/{id}/approvals/{approvalId}` Broker contract with one generated client message ID in both body and idempotency header, and sends no nonce, scope, job, user, or raw receipt material.
+
+**Concurrency and authority:** 202 `resolved` and `duplicate` responses acknowledge command acceptance only. The card has no optimistic ledger mutation; authoritative approval facts and the existing lifecycle-driven Supervisor refetch establish the resulting status. Per-approval double-submit guards, paused-session disabling, unavailable-Turn feedback, and render-time session/selection/revision fences prevent stale responses from contaminating the current view. No old `/actions` path, API route, Worker/runtime behavior, schema, queue, or feature flag changed.
+
+**Candidate boundary:** Focused action helper, ledger view, card, reducer, hook, and stream validation covers exact command payload/header, 202/duplicate/malformed response handling, pending action mapping, no-secret/no-ID rendering, paused and unavailable states, and epoch fencing. Live Broker/DB behavior, SSE timing, duplicate delivery under production concurrency, process restart, deployment, and complete end-to-end approval evidence remain unverified. `approval.expired` remains protocol-compatible only; no client-side expiry was introduced.

@@ -93,7 +93,7 @@ export function useAgentTimeline(sessionId: string | null): AgentTimelineSnapsho
     cognitiveAgenda,
     cognitiveAgendas: sessionMatches ? state.cognitiveAgenda.scoped : [],
     planLedger: sessionMatches ? selectPlanLedgerProjection(state.planLedger) : { sessionId: sessionId ?? 'draft', plans: [], currentPlan: null },
-    approvalLedger: sessionMatches ? selectApprovalLedgerProjection(state.approvalLedger) : { sessionId: sessionId ?? 'draft', approvals: [], pending: [], currentPending: null, pendingCount: 0 },
+    approvalLedger: sessionMatches ? selectApprovalLedgerProjection(state.approvalLedger) : { sessionId: sessionId ?? 'draft', approvals: [], pending: [], pendingActions: [], currentPending: null, pendingCount: 0 },
     steeringMarkers: sessionMatches ? state.steeringMarkers : { observed: [], applied: [], active: [], observedCount: 0, appliedCount: 0, activeCount: 0 },
     connection: sessionMatches ? state.connection : 'idle',
     restoring: sessionMatches ? restoring : Boolean(sessionId),
