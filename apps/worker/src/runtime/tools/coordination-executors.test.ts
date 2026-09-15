@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest"
 import { AgentTreeManager } from "../subagents/manager.js"
 import {
   executeCloseSubagent,
+  executeFollowup,
   executeInterruptSubagent,
   executeListSubagents,
   executeSendMessage,
@@ -12,6 +13,7 @@ import {
 import { createCoordinationTools } from "./coordination-tools.js"
 import type {
   CloseSubagentInput,
+  FollowupInput,
   InterruptSubagentInput,
   ListSubagentsInput,
   SendMessageInput,
@@ -81,13 +83,13 @@ function makeRuntime() {
   const store = new MemoryCoordinationStore()
   let nextTask = 1
   const manager = {
-    spawn: vi.fn(async (input: { userId: string; sessionId: string; turnId?: string | null; parentTaskId?: string | null; role: string; taskType: string; goal: string }) => {
+    spawn: vi.fn(async (input: { userId: string; sessionId: string; turnId?: string | null; parentTaskId?: string | null; role: string; taskType: string; goal: string; context?: unknown }) => {
       const parent = input.parentTaskId ? store.tasks.get(input.parentTaskId) : undefined
       const task = makeTask({
         id: `child-${nextTask++}`, userId: input.userId, sessionId: input.sessionId, turnId: input.turnId ?? null,
         rootTaskId: parent?.rootTaskId ?? `child-${nextTask - 1}`, parentTaskId: parent?.id ?? null,
         path: `${parent?.path ?? ""}/child-${nextTask - 1}`, depth: (parent?.depth ?? -1) + 1,
-        role: input.role, taskType: input.taskType, goal: input.goal, status: "queued", leaseOwner: null,
+        role: input.role, taskType: input.taskType, goal: input.goal, context: input.context ?? null, status: "queued", leaseOwner: null,
       })
       store.tasks.set(task.id, task)
       return task
@@ -161,6 +163,107 @@ describe("coordination executors", () => {
     expect(result).toMatchObject({ taskId: "child-winner", replay: true })
     expect(runtime.manager.close).not.toHaveBeenCalled()
     expect(runtime.store.activities).toContain("spawn_subagent")
+  })
+
+  it("creates a follow-up from a terminal same-turn child under the current runtime parent", async () => {
+    const runtime = makeRuntime()
+    const source = makeTask({
+      id: "source", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/source", depth: 1,
+      role: "reviewer", taskType: "review", status: "completed", attemptCount: 2,
+      result: { summary: "done", email: "private@example.com", userId: "foreign-user", nested: { apiKey: "secret", safe: true }, text: "x".repeat(3_000) },
+    })
+    runtime.store.tasks.set(source.id, source)
+    const input: FollowupInput = {
+      idempotencyKey: "followup-1", taskId: source.id, goal: "Recheck the result",
+      constraints: ["read only"], successCriteria: ["explain the correction"],
+      context: { note: "caller context", sessionId: "foreign-session", secret: "hide", text: "y".repeat(3_000) },
+    }
+
+    const result = await executeFollowup(context({ taskId: "root-1", rootTaskId: "root-1" }), input, runtime.options)
+    expect(result).toMatchObject({ sourceTaskId: source.id, parentTaskId: "root-1", replay: false, status: "queued" })
+    const spawn = runtime.manager.spawn as unknown as ReturnType<typeof vi.fn>
+    expect(spawn).toHaveBeenCalledOnce()
+    expect(spawn.mock.calls[0]?.[0]).toMatchObject({ parentTaskId: "root-1", role: "reviewer", taskType: "review", goal: input.goal })
+    expect(spawn.mock.calls[0]?.[0]).not.toHaveProperty("allowedActions")
+    const followupContext = spawn.mock.calls[0]?.[0].context as Record<string, unknown>
+    expect(followupContext).toMatchObject({ callerContext: expect.objectContaining({ $truncated: true }), provenance: expect.objectContaining({ sourceTaskId: source.id, sourceStatus: "completed", sourceAttemptCount: 2, priorResult: expect.objectContaining({ $truncated: true }) }) })
+    expect(JSON.stringify(followupContext)).not.toMatch(/private@example\.com|foreign-user|foreign-session|secret/)
+    expect(JSON.stringify(followupContext)).not.toContain("toolPolicy")
+  })
+
+  it("keeps a follow-up replay durable and rejects reuse across sources", async () => {
+    const runtime = makeRuntime()
+    const source = makeTask({ id: "source", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/source", depth: 1, role: "scout", taskType: "research", status: "failed", attemptCount: 3 })
+    const other = makeTask({ id: "other", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/other", depth: 1, role: "scout", taskType: "research", status: "completed", attemptCount: 1 })
+    runtime.store.tasks.set(source.id, source)
+    runtime.store.tasks.set(other.id, other)
+    const input: FollowupInput = { idempotencyKey: "followup-replay", taskId: source.id, goal: "Retry the review" }
+    const first = await executeFollowup(context({ taskId: "root-1", rootTaskId: "root-1" }), input, runtime.options)
+    const second = await executeFollowup(context({ taskId: "root-1", rootTaskId: "root-1", toolCallId: "retry-call" }), input, runtime.options)
+    expect(first).toMatchObject({ replay: false })
+    expect(second).toMatchObject({ taskId: first.taskId, replay: true })
+    expect(runtime.manager.spawn).toHaveBeenCalledOnce()
+
+    await expect(executeFollowup(context({ taskId: "root-1", rootTaskId: "root-1" }), { ...input, taskId: other.id }, runtime.options))
+      .rejects.toMatchObject({ code: "coordination_idempotency_conflict" })
+    expect(runtime.manager.spawn).toHaveBeenCalledOnce()
+  })
+
+  it("supports atomic follow-up replay and fences duplicate winners to the current parent", async () => {
+    const runtime = makeRuntime()
+    const source = makeTask({ id: "source", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/source", depth: 1, role: "scout", taskType: "research", status: "completed" })
+    runtime.store.tasks.set(source.id, source)
+    let atomicCalls = 0
+    runtime.manager.supportsAtomicSpawn = vi.fn(() => true)
+    runtime.manager.spawnAtomic = vi.fn(async (spec: { parentTaskId?: string | null; role: string; taskType: string; goal: string; context?: unknown }) => {
+      atomicCalls += 1
+      if (atomicCalls > 1) return { task: null, duplicate: true, atomic: true }
+      const task = makeTask({ id: "atomic-followup", rootTaskId: "root-1", parentTaskId: spec.parentTaskId ?? null, path: "/root-1/atomic-followup", depth: 1, role: spec.role, taskType: spec.taskType, goal: spec.goal, status: "queued", context: spec.context })
+      runtime.store.tasks.set(task.id, task)
+      runtime.store.spawnOperations.set("session-a:atomic-followup", task.id)
+      return { task: task as never, duplicate: false, atomic: true }
+    })
+
+    const input: FollowupInput = { idempotencyKey: "atomic-followup", taskId: source.id, goal: "Continue" }
+    const first = await executeFollowup(context({ taskId: "root-1", rootTaskId: "root-1" }), input, runtime.options)
+    const winner = runtime.store.tasks.get("atomic-followup")
+    runtime.store.getSpawnReplay = vi.fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(winner ?? null)
+    const second = await executeFollowup(context({ taskId: "root-1", rootTaskId: "root-1", toolCallId: "atomic-retry" }), input, runtime.options)
+    expect(first).toMatchObject({ taskId: "atomic-followup", replay: false })
+    expect(second).toMatchObject({ taskId: "atomic-followup", replay: true })
+    expect(runtime.manager.close).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ["non-terminal", { id: "active", status: "running" as const }],
+    ["root", { id: "root-1", status: "completed" as const }],
+    ["cross-turn", { id: "old-turn", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/old-turn", depth: 1, status: "completed" as const, turnId: "turn-old" }],
+  ] as const)("rejects a %s follow-up source before spawn", async (_label, overrides) => {
+    const runtime = makeRuntime()
+    const source = makeTask(overrides)
+    runtime.store.tasks.set(source.id, source)
+    await expect(executeFollowup(context({ taskId: "root-1", rootTaskId: "root-1" }), { idempotencyKey: `followup-${source.id}`, taskId: source.id, goal: "Continue" }, runtime.options))
+      .rejects.toMatchObject({ code: overrides.id === "root-1" ? "coordination_followup_root_forbidden" : overrides.status === "running" ? "coordination_followup_source_not_terminal" : "coordination_task_not_found" })
+    expect(runtime.manager.spawn).not.toHaveBeenCalled()
+    expect(runtime.store.activities).toHaveLength(0)
+  })
+
+  it("rejects foreign sources and a missing, terminal, or cross-turn runtime parent", async () => {
+    const runtime = makeRuntime()
+    const source = makeTask({ id: "source", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/source", depth: 1, status: "completed" })
+    runtime.store.tasks.set(source.id, source)
+    runtime.store.tasks.set("foreign", makeTask({ id: "foreign", userId: "user-b", sessionId: "session-b", rootTaskId: "foreign", path: "/foreign", status: "completed" }))
+    const input = (taskId: string, idempotencyKey: string): FollowupInput => ({ taskId, idempotencyKey, goal: "Continue" })
+    await expect(executeFollowup(context({ taskId: "root-1", rootTaskId: "root-1" }), input("foreign", "followup-foreign"), runtime.options)).rejects.toMatchObject({ code: "coordination_task_not_found" })
+    await expect(executeFollowup(context(), input(source.id, "followup-no-parent"), runtime.options)).rejects.toMatchObject({ code: "coordination_task_not_found" })
+    const terminalParentStore = Object.assign(Object.create(Object.getPrototypeOf(runtime.store)), runtime.store, {
+      getTask: vi.fn(async ({ taskId }: { taskId: string }) => taskId === "root-1" ? makeTask({ status: "completed" }) : source),
+    }) as CoordinationStore
+    await expect(executeFollowup(context({ taskId: "root-1", rootTaskId: "root-1" }), input(source.id, "followup-parent-terminal"), { ...runtime.options, store: terminalParentStore })).rejects.toMatchObject({ code: "coordination_task_not_found" })
+    await expect(executeFollowup(context({ taskId: "root-1", rootTaskId: "root-1", turnId: "turn-new" }), input(source.id, "followup-parent-cross-turn"), runtime.options)).rejects.toMatchObject({ code: "coordination_task_not_found" })
+    expect(runtime.manager.spawn).not.toHaveBeenCalled()
   })
 
   it("does not pass an injected expected output schema to the manager", async () => {

@@ -8,6 +8,7 @@ export type CoordinationTaskView = Pick<SubagentTaskRecord,
   "leaseExpiresAt" | "interruptRequestedAt"
 > & {
   /** Optional server-read evidence; never accepted from model tool input. */
+  readonly context?: unknown | null
   readonly result?: unknown | null
   readonly failureReason?: string | null
 }

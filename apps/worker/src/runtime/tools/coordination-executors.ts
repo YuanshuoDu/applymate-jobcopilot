@@ -1,8 +1,17 @@
 import { CoordinationError, type CoordinationRuntimeOptions, type CoordinationTaskView } from "./coordination-types.js"
+import {
+  assertFollowupReplay,
+  followupContext,
+  followupOutput,
+  followupProvenance,
+  TERMINAL_TASK_STATUSES,
+} from "./coordination-followup.js"
+import { lifecycleTarget, visibleTask } from "./coordination-visibility.js"
 import { sanitizeLifecyclePreview } from "./redaction.js"
 import type { ToolExecutionContext } from "./types.js"
 import type {
   CloseSubagentInput,
+  FollowupInput,
   InterruptSubagentInput,
   ListSubagentsInput,
   SendMessageInput,
@@ -14,7 +23,6 @@ export type CoordinationExecutorOptions = CoordinationRuntimeOptions
 const WAIT_RESULT_MAX_BYTES = 2 * 1024
 const WAIT_FAILURE_MAX_BYTES = 500
 const FOREIGN_RESULT_KEYS = new Set(["userId", "sessionId", "turnId", "stepId", "taskId", "parentTaskId", "rootTaskId", "ownerId", "lease", "leaseOwnerId", "leaseVersion", "idempotencyKey", "capabilities", "permissions", "allowedCapabilities", "budgetLimit", "maxBudget"])
-const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "interrupted", "cancelled", "closed"])
 
 export async function executeSpawn(context: ToolExecutionContext, input: SpawnSubagentInput, options: CoordinationExecutorOptions) {
   const parentTaskId = await resolveSpawnParent(context, input.parentTaskId, options)
@@ -76,6 +84,61 @@ export async function executeSendMessage(context: ToolExecutionContext, input: S
   return { messageId: result.message.id, taskId: target.id, status: result.duplicate ? "duplicate" as const : "queued" as const }
 }
 
+export async function executeFollowup(context: ToolExecutionContext, input: FollowupInput, options: CoordinationExecutorOptions) {
+  const replay = await options.store.getSpawnReplay({ userId: context.scope.userId, sessionId: context.sessionId, idempotencyKey: input.idempotencyKey })
+  if (replay) {
+    const provenance = followupProvenance(replay.context)
+    if (!provenance || provenance.sourceTaskId !== input.taskId) throw new CoordinationError("coordination_idempotency_conflict", "Follow-up idempotency key was reused for a different source task")
+    const source = await followupSource(context, input.taskId, options)
+    const parent = await currentFollowupParent(context, options)
+    assertFollowupReplay(replay, source, parent, provenance, context.turnId)
+    await activity(context, options, "agent.followup", replay.id, { path: replay.path, status: replay.status, sourceTaskId: source.id, replay: true }, input.idempotencyKey)
+    return followupOutput(replay, source.id, true)
+  }
+
+  const source = await followupSource(context, input.taskId, options)
+  const parent = await currentFollowupParent(context, options)
+  const spec = {
+    userId: context.scope.userId, sessionId: context.sessionId, turnId: context.turnId, parentTaskId: parent.id,
+    role: source.role, taskType: source.taskType, goal: input.goal, constraints: input.constraints,
+    successCriteria: input.successCriteria, context: followupContext(input.context, source, value => waitResult(value)),
+  }
+  const atomic = typeof options.manager.supportsAtomicSpawn === "function" && options.manager.supportsAtomicSpawn()
+  let task: CoordinationTaskView
+  if (atomic) {
+    let result: Awaited<ReturnType<typeof options.manager.spawnAtomic>>
+    try { result = await options.manager.spawnAtomic(spec, input.idempotencyKey) } catch (error: unknown) { throw managerError(error) }
+    if (result.duplicate || !result.task) {
+      const winner = await options.store.getSpawnReplay({ userId: context.scope.userId, sessionId: context.sessionId, idempotencyKey: input.idempotencyKey })
+      if (!winner) throw new CoordinationError("coordination_idempotency_conflict", "Follow-up idempotency record was lost")
+      const winnerProvenance = followupProvenance(winner.context)
+      assertFollowupReplay(winner, source, parent, winnerProvenance, context.turnId)
+      await activity(context, options, "agent.followup", winner.id, { path: winner.path, status: winner.status, sourceTaskId: input.taskId, replay: true }, input.idempotencyKey)
+      return followupOutput(winner, input.taskId, true)
+    }
+    task = result.task
+  } else {
+    try { task = await options.manager.spawn(spec) } catch (error: unknown) { throw managerError(error) }
+    try {
+      const recorded = await options.store.recordSpawn({ userId: context.scope.userId, sessionId: context.sessionId, idempotencyKey: input.idempotencyKey, task })
+      if (!recorded) {
+        const winner = await options.store.getSpawnReplay({ userId: context.scope.userId, sessionId: context.sessionId, idempotencyKey: input.idempotencyKey })
+        await options.manager.close(task.id, context.sessionId)
+        if (!winner) throw new CoordinationError("coordination_idempotency_conflict", "Follow-up idempotency record was lost")
+        const winnerProvenance = followupProvenance(winner.context)
+        assertFollowupReplay(winner, source, parent, winnerProvenance, context.turnId)
+        await activity(context, options, "agent.followup", winner.id, { path: winner.path, status: winner.status, sourceTaskId: input.taskId, replay: true }, input.idempotencyKey)
+        return followupOutput(winner, input.taskId, true)
+      }
+    } catch (error: unknown) {
+      await options.manager.close(task.id, context.sessionId).catch(() => false)
+      throw error
+    }
+  }
+  await activity(context, options, "agent.followup", task.id, { path: task.path, status: task.status, sourceTaskId: source.id }, input.idempotencyKey)
+  return followupOutput(task, source.id, false)
+}
+
 function currentTurnTask(context: ToolExecutionContext, task: CoordinationTaskView): CoordinationTaskView {
   if (task.turnId !== context.turnId) throw new CoordinationError("coordination_task_not_found", "Subagent task is unavailable")
   return task
@@ -126,26 +189,19 @@ export async function executeCloseSubagent(context: ToolExecutionContext, input:
   return { taskId: target.id, status: "closed" as const, closed: true }
 }
 
-async function visibleTask(context: ToolExecutionContext, taskId: string, options: CoordinationExecutorOptions): Promise<CoordinationTaskView> {
-  const task = await options.store.getTask({ userId: context.scope.userId, sessionId: context.sessionId, taskId })
-  if (!task) throw new CoordinationError("coordination_task_not_found", "Subagent task is unavailable")
-  if (context.rootTaskId && task.rootTaskId !== context.rootTaskId) throw new CoordinationError("coordination_task_not_found", "Subagent task is unavailable")
-  if (context.taskId) {
-    const current = await options.store.getTask({ userId: context.scope.userId, sessionId: context.sessionId, taskId: context.taskId })
-    if (!current || current.rootTaskId !== task.rootTaskId) throw new CoordinationError("coordination_task_not_found", "Subagent task is unavailable")
-  }
-  return task
+async function followupSource(context: ToolExecutionContext, taskId: string, options: CoordinationExecutorOptions): Promise<CoordinationTaskView> {
+  const source = await lifecycleTarget(context, taskId, options)
+  if (source.turnId !== context.turnId) throw new CoordinationError("coordination_task_not_found", "Subagent task is unavailable")
+  if (source.id === source.rootTaskId) throw new CoordinationError("coordination_followup_root_forbidden", "A root task cannot be used as a follow-up source")
+  if (!TERMINAL_TASK_STATUSES.has(source.status)) throw new CoordinationError("coordination_followup_source_not_terminal", "Follow-up source task must be terminal")
+  return source
 }
 
-async function lifecycleTarget(context: ToolExecutionContext, taskId: string, options: CoordinationExecutorOptions): Promise<CoordinationTaskView> {
-  const target = await visibleTask(context, taskId, options)
-  if (!context.taskId) return target
-
-  const caller = await visibleTask(context, context.taskId, options)
-  const isRootCaller = caller.id === caller.rootTaskId
-  const isSelfOrDescendant = target.id === caller.id || isTaskPathWithin(target.path, caller.path)
-  if (isRootCaller || isSelfOrDescendant) return target
-  throw new CoordinationError("coordination_task_not_found", "Subagent task is unavailable")
+async function currentFollowupParent(context: ToolExecutionContext, options: CoordinationExecutorOptions): Promise<CoordinationTaskView> {
+  if (!context.taskId) throw new CoordinationError("coordination_task_not_found", "Current runtime task is unavailable")
+  const current = currentTurnTask(context, await visibleTask(context, context.taskId, options))
+  if (TERMINAL_TASK_STATUSES.has(current.status)) throw new CoordinationError("coordination_task_not_found", "Current runtime task is unavailable")
+  return current
 }
 
 async function resolveSpawnParent(context: ToolExecutionContext, requested: string | undefined, options: CoordinationExecutorOptions): Promise<string | null> {
@@ -183,7 +239,6 @@ function boundedFailureReason(value: string | null | undefined): string | null {
   for (const character of value) { const next = result + character; if (Buffer.byteLength(next, "utf8") > WAIT_FAILURE_MAX_BYTES) break; result = next }
   return result
 }
-function isTaskPathWithin(path: string, ancestorPath: string): boolean { return path.startsWith(`${ancestorPath}/`) }
 function managerError(error: unknown): CoordinationError { const code = error && typeof error === "object" && "code" in error && typeof error.code === "string" ? error.code : "manager_failed"; return new CoordinationError(`coordination_${code}`, error instanceof Error ? error.message : "Subagent manager operation failed") }
 async function activity(context: ToolExecutionContext, options: CoordinationExecutorOptions, operation: string, taskId: string | null, data: Record<string, unknown>, operationKey?: string): Promise<void> {
   const key = `${operationKey ?? context.toolCallId ?? `${context.sessionId}:${context.turnId}:${context.stepId}`}:${operation}`

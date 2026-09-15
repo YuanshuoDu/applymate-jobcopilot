@@ -3,6 +3,7 @@ import { schemaVersion } from "@jobcopilot/agent-protocol"
 
 import {
   executeCloseSubagent,
+  executeFollowup,
   executeInterruptSubagent,
   executeListSubagents,
   executeSendMessage,
@@ -34,6 +35,16 @@ export const SpawnSubagentInputSchema = Type.Object({
   parentTaskId: Type.Optional(IdSchema),
 }, { additionalProperties: false })
 export type SpawnSubagentInput = Static<typeof SpawnSubagentInputSchema>
+
+export const FollowupInputSchema = Type.Object({
+  idempotencyKey: KeySchema,
+  taskId: IdSchema,
+  goal: TextSchema,
+  constraints: Type.Optional(StringListSchema),
+  successCriteria: Type.Optional(StringListSchema),
+  context: Type.Optional(Type.Unknown()),
+}, { additionalProperties: false })
+export type FollowupInput = Static<typeof FollowupInputSchema>
 
 export const SendMessageInputSchema = Type.Object({
   idempotencyKey: KeySchema,
@@ -75,6 +86,11 @@ const WaitTaskOutputSchema = Type.Object({
   taskId: IdSchema, status: StatusSchema, role: Type.String({ minLength: 1, maxLength: 256 }), result: Type.Unknown(),
   failureReason: Type.Union([Type.String({ maxLength: 500 }), Type.Null()]),
 }, { additionalProperties: false })
+const FollowupOutputSchema = Type.Object({
+  taskId: IdSchema, sourceTaskId: IdSchema, rootTaskId: IdSchema, parentTaskId: Type.Union([IdSchema, Type.Null()]),
+  path: Type.String({ minLength: 1, maxLength: 2_048 }), depth: Type.Integer({ minimum: 0 }),
+  status: StatusSchema, replay: Type.Boolean(),
+}, { additionalProperties: false })
 const WaitOutputSchema = Type.Object({
   waitId: IdSchema, status: Type.Union([Type.Literal("waiting"), Type.Literal("ready"), Type.Literal("timed_out"), Type.Literal("interrupted"), Type.Literal("closed")]),
   taskIds: Type.Array(IdSchema), deadlineAt: Type.String(), matchedTaskIds: Type.Array(IdSchema), tasks: Type.Array(WaitTaskOutputSchema, { minItems: 1, maxItems: 50 }),
@@ -110,6 +126,11 @@ export function createCoordinationTools(options: CoordinationExecutorOptions): R
       ...metadata("spawn_subagent", "Create one permission-scoped child task and durably enqueue it", "internal_write", "requires_key"),
       inputSchema: SpawnSubagentInputSchema, outputSchema: SpawnOutputSchema,
       execute: (context, input) => executeSpawn(context, input as SpawnSubagentInput, options),
+    },
+    {
+      ...metadata("agent.followup", "Create a durable follow-up task from a terminal task result", "internal_write", "requires_key"),
+      inputSchema: FollowupInputSchema, outputSchema: FollowupOutputSchema,
+      execute: (context, input) => executeFollowup(context, input as FollowupInput, options),
     },
     {
       ...metadata("send_message", "Send one idempotent mailbox message to a visible subagent", "internal_write", "requires_key"),

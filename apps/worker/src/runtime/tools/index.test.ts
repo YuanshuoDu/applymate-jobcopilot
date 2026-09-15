@@ -57,8 +57,8 @@ describe("worker tool runtime entry point", () => {
       undefined,
       { manager: {} as never, store: {} as unknown as CoordinationStore, wait: {} as unknown as DurableWaitPort },
     )
-    expect(enabled.registry.list(["canManageChildren"]).map(definition => definition.name).filter(name => name.includes("subagent") || name === "send_message" || name === "wait_subagents" || name === "interrupt_subagent" || name === "close_subagent")).toEqual([
-      "spawn_subagent", "send_message", "wait_subagents", "list_subagents", "interrupt_subagent", "close_subagent",
+    expect(enabled.registry.list(["canManageChildren"]).map(definition => definition.name).filter(name => name.includes("subagent") || name === "agent.followup" || name === "send_message" || name === "wait_subagents" || name === "interrupt_subagent" || name === "close_subagent")).toEqual([
+      "spawn_subagent", "agent.followup", "send_message", "wait_subagents", "list_subagents", "interrupt_subagent", "close_subagent",
     ])
   })
 

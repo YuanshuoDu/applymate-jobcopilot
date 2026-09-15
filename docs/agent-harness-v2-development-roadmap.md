@@ -2118,3 +2118,15 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Operational risk:** Gate-off intentionally uses the fixed adapter as rollback behavior, so it does not exercise the real ModelAdapter/ToolRouter path. Gate-on delivery, adapter terminalization against live state, and switching the rollout gate across retries require live Redis/PostgreSQL and Worker restart validation.
 
 **Candidate boundary:** No live PostgreSQL/RLS, Redis/BullMQ delivery, real Worker startup or restart, provider/model call, browser behavior, or complete V2-to-canonical end-to-end evidence was run. No schema, provider, Web, queue, or feature flag was added; the canonical rollout gate remains the production boundary.
+
+## 90. P8-2 — Native `agent.followup` coordination tool
+
+**Candidate status/date (2026-09-16):** P8-2 is recorded as a candidate native coordination follow-up slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** The coordination registry adds the gated `agent.followup` tool. It accepts only `idempotencyKey`, `taskId`, `goal`, optional bounded `constraints`/`successCriteria`, and optional `context`. The source is resolved through existing tenant/session/Turn/root/lineage visibility checks, must be terminal, and cannot be a root task. The current server-owned runtime task is always the new task's parent; source role/taskType are inherited while manager/store policy, allowed actions, model, tool policy, and budget inheritance remain server-owned.
+
+**Durability and replay:** Follow-ups use the existing atomic manager/store spawn path and therefore create the normal `agent.subagent.spawn` and `agent.subagent.dispatch` outbox intents. Existing source status/result is never changed. Replay validates persisted server-owned provenance (`kind`, source task, source status, attempt count, bounded prior result) against the requested source and current parent/Turn. Caller context and prior result use existing lifecycle redaction and foreign-key stripping, each bounded to 2 KiB; caller context cannot overwrite provenance. A same-key different-source request fails closed with `coordination_idempotency_conflict`.
+
+**Independent verification:** Focused Worker coordination, visibility, registry, runtime, and mailbox suites passed **70/70 tests across 6 files**; the shared package build ran as the Worker test pre-step, Worker `tsc --noEmit --skipLibCheck` passed, and `git diff --check` passed.
+
+**Candidate boundary:** No live PostgreSQL/RLS, real outbox/Redis/BullMQ delivery, concurrent production idempotency race, process restart, provider/model/browser behavior, migration, or complete supervisor/root/worker child-parent E2E evidence was added. No schema, Web, provider, queue, model, or feature flag changed; the coordination gate remains the runtime activation boundary.
