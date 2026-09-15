@@ -84,6 +84,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           taskId: options.identity.taskId,
           steeringMarkerState: markerStateFor(options.identity.taskId, obligationAfterCompaction, steeringMarkerState),
           steeringMarkerContext: obligationAfterCompaction ? {
+            sessionId: options.identity.sessionId, turnId: options.identity.turnId,
             taskId: options.identity.taskId, obligationId: obligationAfterCompaction.id,
             goalRevision: obligationAfterCompaction.goalRevision, planRevision: obligationAfterCompaction.planRevision,
           } : undefined,
@@ -621,7 +622,7 @@ async function appendAcceptedRevision(
   }
   const markers = appliedSteeringMarkerEntries({
     markers: markerState?.active ?? [], stepId,
-    context: { taskId: options.identity.taskId, obligationId: obligation.id, goalRevision: obligation.goalRevision, planRevision: obligation.planRevision },
+    context: { sessionId: options.identity.sessionId, turnId: options.identity.turnId, taskId: options.identity.taskId, obligationId: obligation.id, goalRevision: obligation.goalRevision, planRevision: obligation.planRevision },
   })
   const entries = [
     ...(includeRevision ? [{ type, correlationId: callId, itemId: null, payload: revision, key: `${type === "goal.revision" ? "goal" : "plan"}-revision:${callId}` }] : []),

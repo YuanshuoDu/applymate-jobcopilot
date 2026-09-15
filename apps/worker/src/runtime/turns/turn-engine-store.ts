@@ -98,7 +98,7 @@ async function appendEventBatch(pool: TurnEnginePool, inputs: readonly TurnEngin
     const result: { id: string }[] = []; let previousId: string | null = null
     for (const input of inputs) {
       if (input.itemId) await assertCurrentItemLineage(client, owner, input.itemId)
-      if (input.actor !== undefined && input.actor !== "system") throw conflict(`event ${input.idempotencyKey} actor`)
+      if (input.actor !== undefined && (input.actor !== "system" || input.type !== STEERING_MARKER_EVENT_TYPE)) throw conflict(`event ${input.idempotencyKey} actor`)
       const actor = input.actor ?? (owner.kind === "task" ? "subagent" : "orchestrator")
       const existing = await client.query<Row>(`SELECT "id", "taskId", "turnId", "itemId", "type", "correlationId", "causationId", "sequence", "actor", "payload"
         FROM "agent_events" WHERE "sessionId" = $1 AND "idempotencyKey" = $2`, [owner.sessionId, input.idempotencyKey])

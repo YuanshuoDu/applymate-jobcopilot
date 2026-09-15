@@ -11,7 +11,7 @@ import {
 import { parseSteeringMarkerPayload } from "./steering-marker.js"
 
 const scope: SteeringMarkerDatabaseScope = { userId: "user-a", sessionId: "session-a", turnId: "turn-a", taskId: "root-turn-a" }
-const context = { taskId: scope.taskId, obligationId: "obligation-1", goalRevision: 2, planRevision: 3 }
+const context = { sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.taskId, obligationId: "obligation-1", goalRevision: 2, planRevision: 3 }
 const marker = buildObservedSteeringMarker({ sessionId: scope.sessionId, turnId: scope.turnId, stepId: "step-a", context, markerInput: { id: "input-1", acceptedSequence: 4n } })
 
 function makeClient(existing: Record<string, unknown> | null = null, taskPresent = true) {
@@ -88,6 +88,17 @@ describe("steering marker transaction store", () => {
     const entries = appliedSteeringMarkerEntries({ markers: [marker, other, second], context, stepId: "step-b" })
     expect(entries.map(entry => entry.payload.inputId)).toEqual(["input-0", "input-1"])
     expect(entries.every(entry => entry.key.startsWith("steering-marker-applied:"))).toBe(true)
+  })
+
+  it("rejects an active marker from another session or Turn", () => {
+    const foreignSession = buildObservedSteeringMarker({ sessionId: "session-b", turnId: scope.turnId, stepId: "step-a", context: { ...context, sessionId: "session-b" }, markerInput: { id: "input-foreign-session", acceptedSequence: 5n } })
+    const foreignTurn = buildObservedSteeringMarker({ sessionId: scope.sessionId, turnId: "turn-b", stepId: "step-a", context: { ...context, turnId: "turn-b" }, markerInput: { id: "input-foreign-turn", acceptedSequence: 6n } })
+    expect(appliedSteeringMarkerEntries({ markers: [foreignSession, foreignTurn], context, stepId: "step-b" })).toEqual([])
+  })
+
+  it("fails closed when the application context omits session or Turn scope", () => {
+    expect(() => appliedSteeringMarkerEntries({ markers: [marker], context: { ...context, sessionId: undefined } as never, stepId: "step-b" })).toThrow(/session and Turn scope/)
+    expect(() => appliedSteeringMarkerEntries({ markers: [marker], context: { ...context, turnId: undefined } as never, stepId: "step-b" })).toThrow(/session and Turn scope/)
   })
 
   it("fails closed when applied markers exceed the byte bound", () => {

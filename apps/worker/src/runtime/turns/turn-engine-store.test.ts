@@ -177,6 +177,7 @@ describe("PostgreSQL TurnEngine store", () => {
     await store.appendEvent({ owner, id: "system-event", itemId: null, type: "agent.steering.marker", correlationId: "goal-call", causationId: null, idempotencyKey: "system-key", payload: {}, actor: "system" })
     const eventInsert = calls.find(call => call.sql.includes('INSERT INTO "agent_events"'))
     expect(eventInsert?.values).toContain("system")
+    await expect(store.appendEvent({ owner, id: "ordinary-system-event", itemId: null, type: "goal.revision", correlationId: "goal-call", causationId: null, idempotencyKey: "ordinary-system-key", payload: {}, actor: "system" } as never)).rejects.toThrow(/actor/)
     await expect(store.appendEvent({ owner, id: "bad-actor", itemId: null, type: "agent.steering.marker", correlationId: "goal-call", causationId: null, idempotencyKey: "bad-key", payload: {}, actor: "orchestrator" as never })).rejects.toThrow(/actor/)
   })
 

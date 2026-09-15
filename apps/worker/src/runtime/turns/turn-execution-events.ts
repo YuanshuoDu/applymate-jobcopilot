@@ -8,7 +8,10 @@ import { executionId, executionKey, type ExecutionItemHandle, type TurnExecution
 import type { TurnEngineStep, TurnEngineToolCall, TurnEngineToolResult } from "./turn-engine-types.js"
 import { STEERING_MARKER_EVENT_TYPE } from "../context/steering-marker.js"
 
-export type BatchAppendEntry = { type: string; correlationId: string; itemId: string | null; payload: unknown; key: string; actor?: "system" }
+type BatchAppendEntryBase = { correlationId: string; itemId: string | null; payload: unknown; key: string }
+export type BatchAppendEntry =
+  | (BatchAppendEntryBase & { type: typeof STEERING_MARKER_EVENT_TYPE; actor?: "system" })
+  | (BatchAppendEntryBase & { type: string; actor?: never })
 
 export class TurnExecutionEventWriter {
   private causationId: string | null = null
@@ -37,6 +40,7 @@ export class TurnExecutionEventWriter {
     if (!appendEvents) throw new Error("plan_observation_batch_unavailable")
     let causationId = this.causationId
     const pending = entries.map(entry => {
+      if (entry.actor !== undefined && (entry.actor !== "system" || entry.type !== STEERING_MARKER_EVENT_TYPE)) throw new Error("system_actor_requires_steering_marker")
       const id = this.id(`event:${entry.key}`)
       const mappedType = entry.type === STEERING_MARKER_EVENT_TYPE ? STEERING_MARKER_EVENT_TYPE : this.options.lifecycle?.mapEventType?.(entry.type) ?? ownerEventType(this.options.identity.kind, entry.type)
       const payload = toRepositoryJson(entry.payload)

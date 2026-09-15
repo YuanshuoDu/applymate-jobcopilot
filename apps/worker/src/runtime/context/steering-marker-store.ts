@@ -13,10 +13,17 @@ const EVENT_TOPIC = "agent.events"
 const MAX_KEY = 512
 
 export type SteeringMarkerContext = {
+  /** Optional for observation-only context construction; applied markers require both scope fields. */
+  readonly sessionId?: string
+  readonly turnId?: string
   readonly taskId: string
   readonly obligationId: string
   readonly goalRevision: number
   readonly planRevision: number | null
+}
+export type AppliedSteeringMarkerContext = SteeringMarkerContext & {
+  readonly sessionId: string
+  readonly turnId: string
 }
 export type SteeringMarkerWrite = {
   readonly sessionId: string
@@ -109,6 +116,9 @@ export async function persistObservedSteeringMarker(client: QueryClient, scope: 
 }
 
 export function buildObservedSteeringMarker(input: { readonly sessionId: string; readonly turnId: string; readonly stepId: string; readonly context: SteeringMarkerContext; readonly markerInput: SteeringMarkerInput }): SteeringMarkerPayload {
+  if ((input.context.sessionId !== undefined && input.context.sessionId !== input.sessionId) || (input.context.turnId !== undefined && input.context.turnId !== input.turnId)) {
+    throw new SteeringMarkerStoreError("scope_conflict", "Observed steering marker context is outside the fenced session or Turn")
+  }
   const sequence = input.markerInput.acceptedSequence
   if (sequence < 0n) throw new SteeringMarkerStoreError("invalid_marker", "Steering input sequence is negative")
   const payload: SteeringMarkerPayload = {
@@ -131,16 +141,17 @@ export function buildAppliedSteeringMarker(input: { readonly marker: SteeringMar
 
 export function appliedSteeringMarkerEntries(input: {
   readonly markers: readonly SteeringMarkerPayload[]
-  readonly context: SteeringMarkerContext
+  readonly context: AppliedSteeringMarkerContext
   readonly stepId: string
 }): readonly AppliedSteeringMarkerEntry[] {
+  if (!input.context.sessionId || !input.context.turnId) throw new SteeringMarkerStoreError("scope_conflict", "Applied steering marker context requires a session and Turn scope")
   if (!Array.isArray(input.markers) || input.markers.length > STEERING_MARKER_MAX_EVENTS) throw new SteeringMarkerStoreError("invalid_marker", "Applied steering marker count exceeds the server bound")
   const entries: AppliedSteeringMarkerEntry[] = [], seen = new Map<string, string>()
   for (const candidate of input.markers) {
     const marker = parseSteeringMarkerPayload(candidate)
     if (!marker) throw new SteeringMarkerStoreError("invalid_marker", "Active steering marker is invalid")
     if (marker.kind !== "observed" || marker.status !== "observed") throw new SteeringMarkerStoreError("invalid_marker", "Applied marker source is not active")
-    if (marker.taskId !== input.context.taskId || marker.obligationId !== input.context.obligationId || marker.goalRevision !== input.context.goalRevision || marker.planRevision !== input.context.planRevision) continue
+    if (marker.sessionId !== input.context.sessionId || marker.turnId !== input.context.turnId || marker.taskId !== input.context.taskId || marker.obligationId !== input.context.obligationId || marker.goalRevision !== input.context.goalRevision || marker.planRevision !== input.context.planRevision) continue
     const fingerprint = JSON.stringify(marker), prior = seen.get(marker.idempotencyKey)
     if (prior !== undefined) {
       if (prior !== fingerprint) throw new SteeringMarkerStoreError("idempotency_conflict", "Active steering marker is conflicting")

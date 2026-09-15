@@ -82,6 +82,13 @@ describe("TurnExecutionEventWriter", () => {
     expect(events).toEqual([{ type: "goal.revision" }, { type: "agent.steering.marker", actor: "system" }])
   })
 
+  it("rejects a system actor on an ordinary event before persistence", async () => {
+    const appendEvents: NonNullable<TurnExecutionStore["appendEvents"]> = vi.fn(async (inputs: Parameters<NonNullable<TurnExecutionStore["appendEvents"]>>[0]) => inputs.map(input => ({ id: input.id })))
+    const writer = new TurnExecutionEventWriter(options(identity("turn", "root-1"), [], appendEvents))
+    await expect(writer.appendBatch([{ type: "goal.revision", correlationId: "goal-call", itemId: null, payload: { revision: 2 }, key: "goal-revision:goal-call", actor: "system" } as never])).rejects.toThrow("system_actor_requires_steering_marker")
+    expect(appendEvents).not.toHaveBeenCalled()
+  })
+
   it("keeps marker event types server exact when lifecycle mapping is configured", async () => {
     const captured: string[] = []
     const appendEvents: NonNullable<TurnExecutionStore["appendEvents"]> = vi.fn(async (inputs: Parameters<NonNullable<TurnExecutionStore["appendEvents"]>>[0]) => {
