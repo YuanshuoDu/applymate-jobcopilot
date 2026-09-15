@@ -21,7 +21,7 @@ const tenantModels = new Set([
   'AgentTranscriptEvent', 'AgentApproval', 'AgentAutomation', 'CustomAgentRole', 'Direction',
   'CoverLetter', 'SupportCase', 'SupportCaseMessage', 'AdminDataDeletionRequest', 'AiUsageEvent',
   'FormPattern', 'JobApiUsageEvent', 'ExternalApiUsageEvent', 'DiscoveryOptimizationEvent',
-  'AgentTurn', 'AgentStep', 'AgentInput', 'AgentItem', 'AgentEvent', 'AgentOutbox', 'AgentActionReservation',
+  'AgentTurn', 'AgentStep', 'AgentInput', 'AgentItem', 'AgentEvent', 'AgentOutbox', 'AgentActionReservation', 'AgentSessionControl',
 ])
 
 function modelDelegate(tx: unknown, model: string, operation: string) {
