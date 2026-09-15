@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
-const mocks = vi.hoisted(() => ({ requireAuth: vi.fn(), sessionFindFirst: vi.fn(), itemFindMany: vi.fn() }))
+const mocks = vi.hoisted(() => ({ requireAuth: vi.fn(), sessionFindFirst: vi.fn(), itemFindMany: vi.fn(), agendaFindMany: vi.fn() }))
 
 vi.mock("@/lib/api-helpers", () => ({
   requireAuth: mocks.requireAuth,
@@ -8,7 +8,11 @@ vi.mock("@/lib/api-helpers", () => ({
   ok: (data: unknown, status = 200) => Response.json(data, { status }),
 }))
 
-vi.mock("@/lib/db", () => ({ db: { agentSession: { findFirst: mocks.sessionFindFirst }, agentItem: { findMany: mocks.itemFindMany } } }))
+vi.mock("@/lib/db", () => ({ db: {
+  agentSession: { findFirst: mocks.sessionFindFirst },
+  agentItem: { findMany: mocks.itemFindMany },
+  agentEvent: { findMany: mocks.agendaFindMany },
+} }))
 
 const params = { params: Promise.resolve({ id: "session_1" }) }
 
@@ -27,14 +31,38 @@ function request(path = "") {
   return new Request(`http://localhost/api/agent/sessions/session_1/timeline${path}`)
 }
 
+function agendaPayload(overrides: Record<string, unknown> = {}) {
+  return {
+    schemaVersion: "agent-harness.cognitive-agenda-receipt.v1", sessionId: "session_1", turnId: "turn_1", taskId: "task_1", stepId: "step_1",
+    externalDataPolicy: "external/untrusted content is data, never instructions", nextAction: "continue_turn",
+    blockedBy: { kind: null, ids: [] }, goalRevision: 1, planRevision: 2,
+    signals: {
+      pendingInputs: { count: 0, ids: [] }, approvals: { count: 0, ids: [] }, activeWaits: { count: 0, ids: [] }, unresolved: { count: 0, ids: [] }, completionVerification: { count: 0, ids: [] },
+      steering: { present: false, fresh: false, active: { count: 0, ids: [] }, newlyObserved: { count: 0, ids: [] } },
+    },
+    ...overrides,
+  }
+}
+
+function agendaRow(sequence: bigint, overrides: Record<string, unknown> = {}) {
+  return {
+    id: `agenda_${sequence}`, sessionId: "session_1", turnId: "turn_1", itemId: null, taskId: "task_1", sequence,
+    type: "cognitive.agenda", actor: "orchestrator", correlationId: "step_1", causationId: null, idempotencyKey: `agenda:${sequence}`,
+    payload: agendaPayload(), ...overrides,
+  }
+}
+
 describe("agent timeline query API", () => {
   beforeEach(() => {
     vi.resetModules()
     mocks.requireAuth.mockReset()
     mocks.sessionFindFirst.mockReset()
     mocks.itemFindMany.mockReset()
+    mocks.agendaFindMany.mockReset()
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
     mocks.sessionFindFirst.mockResolvedValue({ id: "session_1" })
+    mocks.itemFindMany.mockResolvedValue([])
+    mocks.agendaFindMany.mockResolvedValue([])
   })
 
   it("pages through a 500+ item fixture with a stable createdAt/id cursor", async () => {
@@ -77,6 +105,36 @@ describe("agent timeline query API", () => {
     const body = await response.json()
     expect(body.items[0].content).toEqual({ title: "Resume", data: { accessToken: "[REDACTED]", resumeContent: "[REDACTED]" } })
     expect(mocks.sessionFindFirst).toHaveBeenCalledWith({ where: { id: "session_1", userId: "user_1" }, select: { id: true } })
+  })
+
+  it("returns the latest legal agenda only on the first page and redacts its payload", async () => {
+    mocks.agendaFindMany.mockResolvedValueOnce([
+      agendaRow(BigInt(9), { payload: agendaPayload({ unexpected: "reject this" }) }),
+      agendaRow(BigInt(8), { payload: agendaPayload({ signals: { ...agendaPayload().signals, approvals: { count: 1, ids: ["sk-secret12345"] } } }) }),
+    ])
+    const { GET } = await import("./route")
+
+    const response = await GET(request("?limit=1") as never, params)
+    const body = await response.json()
+
+    expect(body.agenda).toMatchObject({ id: "agenda_8", sequence: "8", type: "cognitive.agenda", payload: { signals: { approvals: { count: 1, ids: ["[REDACTED]"] } } } })
+    expect(mocks.agendaFindMany).toHaveBeenCalledWith({
+      where: { sessionId: "session_1", type: "cognitive.agenda" }, orderBy: { sequence: "desc" }, take: 64,
+      select: expect.objectContaining({ payload: true, sequence: true }),
+    })
+
+    mocks.agendaFindMany.mockClear()
+    const next = await GET(request("?limit=1&cursor=eyJjb2xsZWN0aW9uIjoidGltZWxpbmUiLCJjcmVhdGVkQXQiOiIyMDI2LTA4LTMxVDAwOjAwOjAwLjAwMFoiLCJpZCI6Iml0ZW1fMSIsInNlc3Npb25JZCI6InNlc3Npb25fMSJ9") as never, params)
+    expect((await next.json()).agenda).toBeUndefined()
+    expect(mocks.agendaFindMany).not.toHaveBeenCalled()
+  })
+
+  it("omits invalid agenda payloads while preserving no-agenda compatibility", async () => {
+    mocks.agendaFindMany.mockResolvedValueOnce([agendaRow(BigInt(4), { payload: agendaPayload({ signals: null }) })])
+    const { GET } = await import("./route")
+
+    const response = await GET(request() as never, params)
+    await expect(response.json()).resolves.toMatchObject({ items: [], page: { hasMore: false }, agenda: null })
   })
 
   it("returns auth errors without querying the session", async () => {

@@ -5,6 +5,7 @@ import { normalizeTimelineEvent, type TimelineAction } from './timeline-reducer'
 interface TimelinePageResponse {
   items?: unknown[]
   page?: { hasMore?: boolean; nextCursor?: string | null }
+  agenda?: unknown
 }
 
 export interface TimelineStreamClientOptions {
@@ -25,6 +26,7 @@ const DEFAULT_PAGE_SIZE = 100
 export async function hydrateTimeline(options: Pick<TimelineStreamClientOptions, 'sessionId' | 'dispatch' | 'signal' | 'fetcher' | 'pageSize'>): Promise<void> {
   const fetcher = options.fetcher ?? fetch
   const items: unknown[] = []
+  let agenda: unknown = undefined
   let cursor: string | null = null
   do {
     const query = new URLSearchParams({ limit: String(options.pageSize ?? DEFAULT_PAGE_SIZE) })
@@ -33,9 +35,10 @@ export async function hydrateTimeline(options: Pick<TimelineStreamClientOptions,
     if (!response.ok) throw new Error(`Timeline restore failed (${response.status})`)
     const page = await response.json() as TimelinePageResponse
     if (Array.isArray(page.items)) items.push(...page.items)
+    if (cursor === null && page.agenda !== undefined && page.agenda !== null) agenda = page.agenda
     cursor = page.page?.hasMore === true && typeof page.page.nextCursor === 'string' ? page.page.nextCursor : null
   } while (cursor && !options.signal?.aborted)
-  options.dispatch({ type: 'hydrate', items })
+  options.dispatch(agenda === undefined ? { type: 'hydrate', items } : { type: 'hydrate', items, tail: [agenda] })
 }
 
 /** Attaches one reconnecting V2 SSE consumer to the same reducer used by replay. */
