@@ -65,7 +65,7 @@ export type TimelineSteeringMarkerReduction =
   | { readonly valid: false; readonly reason: string }
 
 const PAYLOAD_KEYS = ['schemaVersion', 'kind', 'status', 'sessionId', 'turnId', 'taskId', 'stepId', 'inputId', 'idempotencyKey', 'obligationId', 'goalRevision', 'planRevision', 'acceptedSequence'] as const
-const EVENT_KEYS = new Set(['schemaVersion', 'id', 'sessionId', 'turnId', 'itemId', 'taskId', 'type', 'actor', 'sequence', 'payload', 'createdAt', 'kind', 'baseRevision', 'revision'])
+const EVENT_KEYS = new Set(['schemaVersion', 'id', 'sessionId', 'turnId', 'itemId', 'taskId', 'type', 'actor', 'sequence', 'payload', 'correlationId', 'causationId', 'idempotencyKey', 'createdAt', 'kind', 'baseRevision', 'revision'])
 
 function plain(value: unknown): value is Row {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
@@ -141,6 +141,9 @@ export function parseSteeringMarkerPayload(value: unknown): TimelineSteeringMark
 export function parseSteeringMarkerEvent(value: unknown, scope: TimelineSteeringMarkerScope): { readonly id: string; readonly sequence: string; readonly payload: TimelineSteeringMarkerPayload } | null {
   if (!plain(value) || [...Object.keys(value)].some(key => !EVENT_KEYS.has(key)) || value.schemaVersion !== AGENT_STREAM_SCHEMA_VERSION || value.type !== STEERING_MARKER_EVENT_TYPE || value.actor !== 'system' || value.itemId !== null) return null
   if (value.kind !== undefined || value.baseRevision !== undefined || value.revision !== undefined || value.createdAt !== undefined) return null
+  if (value.correlationId !== undefined && !safeText(value.correlationId)) return null
+  if (value.causationId !== undefined && value.causationId !== null && !safeText(value.causationId)) return null
+  if (value.idempotencyKey !== undefined && value.idempotencyKey !== null && !safeText(value.idempotencyKey, MAX_KEY_BYTES)) return null
   if (!safeText(value.id) || !safeText(value.sessionId) || !safeText(value.turnId) || !safeText(value.taskId)) return null
   if (!safeText(scope.sessionId) || value.sessionId !== scope.sessionId || (scope.turnId !== undefined && value.turnId !== scope.turnId) || (scope.taskId !== undefined && value.taskId !== scope.taskId)) return null
   const sequence = decimal(value.sequence)

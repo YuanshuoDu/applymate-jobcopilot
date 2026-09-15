@@ -63,6 +63,14 @@ describe('timeline steering marker reducer', () => {
     expect(parseSteeringMarkerEvent({ ...event('1'), shell: 'polluted' }, scope)).toBeNull()
   })
 
+  it('accepts the standard durable SSE envelope metadata', () => {
+    const liveEnvelope = {
+      ...event('1'), correlationId: 'turn-1', causationId: null, idempotencyKey: 'turn-event:marker-1',
+    }
+    expect(parseSteeringMarkerEvent(liveEnvelope, scope)).toMatchObject({ id: liveEnvelope.id, sequence: '1' })
+    expect(reduceTimelineSteeringMarkers([liveEnvelope], scope)).toMatchObject({ valid: true, state: { activeCount: 1 } })
+  })
+
   it('enforces bounded event count and bytes', () => {
     const many = Array.from({ length: 129 }, (_, index) => event(String(index + 1), `input-${index + 1}`))
     expect(reduceTimelineSteeringMarkers(many, scope)).toEqual({ valid: false, reason: 'event_limit' })
