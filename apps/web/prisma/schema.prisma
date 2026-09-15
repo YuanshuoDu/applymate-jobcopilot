@@ -2121,7 +2121,7 @@ model AgentItem {
 model AgentEvent {
   id             String   @id @default(cuid())
   sessionId      String
-  turnId         String
+  turnId         String?
   itemId         String?
   taskId         String?
   sequence       BigInt
@@ -2134,7 +2134,7 @@ model AgentEvent {
   createdAt      DateTime @default(now())
 
   session AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
-  turn    AgentTurn    @relation(fields: [turnId], references: [id], onDelete: Cascade)
+  turn    AgentTurn?   @relation(fields: [turnId], references: [id], onDelete: Cascade)
   item    AgentItem?   @relation(fields: [itemId], references: [id], onDelete: SetNull)
 
   @@unique([sessionId, sequence])

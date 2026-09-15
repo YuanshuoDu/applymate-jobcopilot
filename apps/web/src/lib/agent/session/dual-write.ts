@@ -128,6 +128,8 @@ export async function createDualWriteSession(
           }),
           outboxTopic: "agent.session.event",
         })
+        const eventTurnId = event.turnId
+        if (eventTurnId === null) throw new Error("Cannot project a session-scoped event into a Turn transcript")
         if (legacy.type === "user_message") {
           await tx.agentInput.create({
             data: {
@@ -143,7 +145,7 @@ export async function createDualWriteSession(
             },
           })
         }
-        const projected = await insertProjectedTranscript(tx, event)
+        const projected = await insertProjectedTranscript(tx, { ...event, turnId: eventTurnId })
         return restoreLegacyResponse(projected, safeLegacy.data)
       })
     },

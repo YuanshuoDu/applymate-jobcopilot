@@ -51,8 +51,8 @@ export {
   ToolResultItemSchema,
 } from './item.js'
 export type { AgentItem, AgentMessageItem, AgentMessagePhase, GenericItem, ItemStatus, ToolCallItem, ToolResultItem } from './item.js'
-export { AgentEventEnvelopeSchema, AgentEventTypeSchema, KnownAgentEventEnvelopeSchema, isKnownAgentEventType } from './event.js'
-export type { AgentEventEnvelope, AgentEventType, KnownAgentEventEnvelope } from './event.js'
+export { AgentEventEnvelopeSchema, AgentEventTypeSchema, KnownAgentEventEnvelopeSchema, isKnownAgentEventType, SessionControlEventPayloadSchema, SessionControlEventTypeSchema } from './event.js'
+export type { AgentEventEnvelope, AgentEventType, KnownAgentEventEnvelope, SessionControlEventPayload, SessionControlEventType } from './event.js'
 export type {
   AgentEventRecord,
   AgentItemRecord,

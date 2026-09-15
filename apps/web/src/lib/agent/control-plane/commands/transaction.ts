@@ -22,6 +22,10 @@ export function turnDispatchKey(turnId: string): string {
   return `turn-dispatch:${turnId}`
 }
 
+export function sessionControlEventKey(clientMessageId: string): string {
+  return `agent-session-control:${clientMessageId}`
+}
+
 export type CommandTransaction = Prisma.TransactionClient
 
 export interface ActiveTurn {
@@ -152,10 +156,20 @@ export async function findExistingSessionControl(
   sessionId: string,
   clientMessageId: string,
 ): Promise<ExistingSessionControl | null> {
-  return tx.agentSessionControl.findFirst({
+  const row = await tx.agentSessionControl.findFirst({
     where: { sessionId, clientMessageId },
     select: { id: true, operation: true, fingerprint: true, previousGate: true, nextGate: true, controlRevision: true, pausedAt: true },
-  }) as Promise<ExistingSessionControl | null>
+  })
+  if (!row) return null
+  return {
+    id: row.id,
+    operation: row.operation as SessionControlOperation,
+    fingerprint: row.fingerprint,
+    previousGate: row.previousGate as SessionControlGate,
+    nextGate: row.nextGate as SessionControlGate,
+    controlRevision: row.controlRevision,
+    pausedAt: row.pausedAt,
+  }
 }
 
 export async function appendSessionControl(
@@ -171,6 +185,28 @@ export async function appendSessionControl(
   await tx.agentSessionControl.create({
     data: { id: randomUUID(), sessionId: command.sessionId, userId: command.userId, clientMessageId: command.clientMessageId, operation, fingerprint, previousGate, nextGate, controlRevision, pausedAt },
   })
+  if (previousGate !== nextGate) {
+    await appendAgentEventWithOutboxInTransaction(tx, {
+      sessionId: command.sessionId,
+      turnId: null,
+      itemId: null,
+      taskId: null,
+      type: operation === "pause" ? "session.paused" : "session.resumed",
+      actor: "system",
+      correlationId: command.sessionId,
+      causationId: null,
+      idempotencyKey: sessionControlEventKey(command.clientMessageId),
+      payload: json({
+        sessionId: command.sessionId,
+        operation,
+        previousGate,
+        nextGate,
+        controlRevision,
+        pausedAt: pausedAt?.toISOString() ?? null,
+      }),
+      outboxTopic: "agent.session.event",
+    })
+  }
 }
 
 export function sessionControlResult(

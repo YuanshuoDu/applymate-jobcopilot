@@ -569,8 +569,30 @@ describe("AgentCommandService", () => {
     expect(fake.state.controls).toHaveLength(1)
     expect(fake.state.inputs).toHaveLength(0)
     expect(fake.state.items).toHaveLength(0)
-    expect(fake.state.events).toHaveLength(0)
-    expect(fake.state.outbox).toHaveLength(0)
+    expect(fake.state.events).toHaveLength(1)
+    expect(fake.state.events[0]).toMatchObject({
+      turnId: null,
+      itemId: null,
+      taskId: null,
+      type: "session.paused",
+      actor: "system",
+      correlationId: "session_1",
+      idempotencyKey: `agent-session-control:pause_${status}`,
+      payload: {
+        sessionId: "session_1",
+        operation: "pause",
+        previousGate: "open",
+        nextGate: "user_paused",
+        controlRevision: 1,
+        pausedAt: expect.any(String),
+      },
+    })
+    expect(fake.state.outbox).toHaveLength(1)
+    expect(fake.state.outbox[0]).toMatchObject({
+      topic: "agent.session.event",
+      aggregateId: "session_1",
+      payload: { turnId: null, type: "session.paused", idempotencyKey: `agent-session-control:pause_${status}` },
+    })
   })
 
   it("rejects pause while a claimed in-progress root exists with zero writes", async () => {
@@ -596,6 +618,8 @@ describe("AgentCommandService", () => {
     expect(resumed).toMatchObject({ operation: "resume", controlGate: "open", controlRevision: 2, disposition: "applied", pausedAt: null })
     expect(fake.state.active).toMatchObject({ status: "waiting_for_approval" })
     expect(fake.state.controls).toHaveLength(2)
+    expect(fake.state.events.map((event) => event.type)).toEqual(["session.paused", "session.resumed"])
+    expect(fake.state.outbox.filter((entry) => entry.topic === "agent.session.event")).toHaveLength(2)
   })
 
   it("records an open-session resume noop and rejects stale control revisions", async () => {
@@ -603,6 +627,8 @@ describe("AgentCommandService", () => {
     const noopResult = await new AgentCommandService(noop.db).resume(controlCommand("resume_noop"))
     expect(noopResult).toMatchObject({ disposition: "noop", controlGate: "open", controlRevision: 0 })
     expect(noop.state.controls).toHaveLength(1)
+    expect(noop.state.events).toHaveLength(0)
+    expect(noop.state.outbox).toHaveLength(0)
     expect(noop.tx.agentSession.update).not.toHaveBeenCalled()
 
     const stale = makeDb({ controlGate: "user_paused", controlRevision: 4 })
