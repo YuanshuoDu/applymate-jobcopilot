@@ -1,6 +1,7 @@
 /** CANONICAL Phase 9 timeline state root — do not duplicate. See #459. */
 
 import { AGENT_STREAM_SCHEMA_VERSION } from '@jobcopilot/agent-protocol'
+import { createCognitiveAgendaState, reduceCognitiveAgenda, type TimelineCognitiveAgendaState } from './timeline-cognitive-agenda'
 import { appendFallbackEvent, appendTimelineEvent, buildIndexes, compareItems, integer, isAfter, isRecord, itemFromTimelineEvent, mergeContent, numberOrUndefined, sequence, stringOrNull, timestamp } from './timeline-reducer-utils'
 
 export type TimelineConnection = 'idle' | 'connected' | 'reconnecting'
@@ -59,6 +60,7 @@ export interface TimelineState {
   processedEventIds: Record<string, true>
   lastSequence: string | null
   lifecycleRevision: number
+  cognitiveAgenda: TimelineCognitiveAgendaState
   connection: TimelineConnection
   snapshotRequired: boolean
 }
@@ -79,7 +81,7 @@ const KNOWN_EVENT_TYPES = new Set([
   'step.started', 'step.completed', 'item.started', 'item.delta', 'item.completed', 'item.failed',
   'input.accepted', 'input.consumed', 'tool_call.started', 'tool_call.completed', 'tool_call.failed',
   'policy.decision', 'approval.requested', 'approval.resolved', 'approval.consumed', 'approval.expired',
-  'question.answered', 'question.cancelled', 'external_action.reserved', 'stream.overflow',
+  'question.answered', 'question.cancelled', 'external_action.reserved', 'stream.overflow', 'cognitive.agenda',
 ])
 
 // Status-only events drive supervisor metadata refreshes. Item deltas are
@@ -97,7 +99,7 @@ export function createTimelineState(sessionId: string): TimelineState {
     sessionId, events: [], byId: new Map(), byTurnId: new Map(), byToolCallId: new Map(), lastEventId: null,
     transientItems: new Map(), fallbackItems: [],
     itemIds: [], itemsById: {}, itemIdsByTurnId: {}, itemIdsByTaskId: {},
-    processedEventIds: {}, lastSequence: null, lifecycleRevision: 0, connection: 'idle', snapshotRequired: false,
+    processedEventIds: {}, lastSequence: null, lifecycleRevision: 0, cognitiveAgenda: createCognitiveAgendaState(sessionId), connection: 'idle', snapshotRequired: false,
   }
 }
 
@@ -183,6 +185,7 @@ function reduceEvent(state: TimelineState, value: unknown): TimelineState {
     lastEventId: event.id,
     lifecycleRevision: LIFECYCLE_EVENT_TYPES.has(event.type) ? state.lifecycleRevision + 1 : state.lifecycleRevision,
   }
+  if (event.type === 'cognitive.agenda') next = { ...next, cognitiveAgenda: reduceCognitiveAgenda(next.cognitiveAgenda, event) }
   if (event.type === 'stream.overflow') return { ...next, snapshotRequired: true, connection: 'reconnecting' }
   if (event.type === 'item.delta') {
     const existingRevision = state.itemsById[event.itemId ?? '']?.revision ?? 0

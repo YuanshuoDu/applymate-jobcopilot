@@ -58,6 +58,29 @@ describe('AI settings translations', () => {
     }
   })
 
+  it('registers the cognitive agenda labels in English and Chinese', () => {
+    const keys = [
+      'agent.cognitiveAgenda.title', 'agent.cognitiveAgenda.brain', 'agent.cognitiveAgenda.nextAction', 'agent.cognitiveAgenda.blockedBy',
+      'agent.cognitiveAgenda.goalRevision', 'agent.cognitiveAgenda.planRevision', 'agent.cognitiveAgenda.action.replan',
+      'agent.cognitiveAgenda.action.applyFreshSteering', 'agent.cognitiveAgenda.action.resolvePendingInput', 'agent.cognitiveAgenda.action.awaitApproval',
+      'agent.cognitiveAgenda.action.awaitChildren', 'agent.cognitiveAgenda.action.continuePlan', 'agent.cognitiveAgenda.action.verifyCompletion',
+      'agent.cognitiveAgenda.action.continueTurn', 'agent.cognitiveAgenda.blocker.replanRequired', 'agent.cognitiveAgenda.blocker.freshSteering',
+      'agent.cognitiveAgenda.blocker.pendingInput', 'agent.cognitiveAgenda.blocker.approval', 'agent.cognitiveAgenda.blocker.childWait',
+      'agent.cognitiveAgenda.blocker.unresolvedFailure', 'agent.cognitiveAgenda.blocker.completionVerification', 'agent.cognitiveAgenda.signal.pendingInputs',
+      'agent.cognitiveAgenda.signal.approvals', 'agent.cognitiveAgenda.signal.activeWaits', 'agent.cognitiveAgenda.signal.unresolved',
+      'agent.cognitiveAgenda.signal.completionVerification', 'agent.cognitiveAgenda.signal.steeringActive', 'agent.cognitiveAgenda.signal.steeringNewlyObserved',
+    ]
+
+    for (const key of keys) {
+      expect(hasTranslation('en', key), key).toBe(true)
+      expect(hasTranslation('zh', key), key).toBe(true)
+      expect(translate('en', key), key).not.toBe(key)
+      expect(translate('zh', key), key).not.toBe(key)
+    }
+    expect(translate('en', 'agent.cognitiveAgenda.brain')).not.toMatch(/[\u3400-\u9fff]/)
+    expect(translate('zh', 'agent.cognitiveAgenda.brain')).toMatch(/[\u3400-\u9fff]/)
+  })
+
   it('does not leak an English fallback into the Chinese UI', () => {
     expect(translate('zh', 'missing.ui.key')).toBe('出现了问题')
   })

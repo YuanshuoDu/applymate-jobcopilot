@@ -6,6 +6,7 @@ import { useApi } from '@/lib/hooks'
 import { useI18n } from '@/lib/i18n'
 
 import { flattenTaskTree, TaskTreePanel } from './TaskTreePanel'
+import { CognitiveAgendaCard } from './cognitive-agenda-card'
 import { projectSupervisorTree, type SupervisorTaskSummary, type SupervisorTurnSummary } from './task-tree-projection'
 import type { AgentTimelineSnapshot } from './use-agent-timeline'
 
@@ -154,6 +155,7 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
       </div>
       {loading && <p aria-live="polite" style={messageStyle}>{t('agent.loadingTasks')}</p>}
       {error && <p role="alert" style={{ ...messageStyle, color: 'var(--c-danger)' }}>{t('agent.supervisorUnavailable')}</p>}
+      {timeline.cognitiveAgenda && <CognitiveAgendaCard agenda={timeline.cognitiveAgenda} />}
       {!loading && !nodes.length && !error && <p style={messageStyle}>{t('agent.noTaskRecords')}</p>}
       {!!nodes.length && <TaskTreePanel nodes={nodes} selectedId={selectedId} sessionKey={sessionId} showHeading={false} onSelect={setSelectedId} />}
       {hasMore && <button type="button" onClick={() => void loadMore()} disabled={loadingMore} style={loadMoreStyle}>

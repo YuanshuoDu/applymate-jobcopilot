@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from 'react'
 
 import { streamAgentTimeline } from './stream-client'
+import type { CognitiveAgendaView } from './cognitive-agenda-view'
 import { createTimelineState, selectTimelineItems, timelineReducer, type TimelineConnection, type TimelineItem, type TimelineState } from './timeline-reducer'
 
 export interface AgentTimelineSnapshot {
@@ -10,6 +11,7 @@ export interface AgentTimelineSnapshot {
   readonly items: readonly TimelineItem[]
   readonly lastEventId: string | null
   readonly lifecycleRevision: number
+  readonly cognitiveAgenda: CognitiveAgendaView | null
   readonly connection: TimelineConnection
   readonly restoring: boolean
   readonly error: string | null
@@ -66,6 +68,7 @@ export function useAgentTimeline(sessionId: string | null): AgentTimelineSnapsho
     items,
     lastEventId: sessionMatches ? state.lastEventId : null,
     lifecycleRevision: sessionMatches ? state.lifecycleRevision : 0,
+    cognitiveAgenda: sessionMatches ? state.cognitiveAgenda.latest : null,
     connection: sessionMatches ? state.connection : 'idle',
     restoring: sessionMatches ? restoring : Boolean(sessionId),
     error: sessionMatches ? error : null,
