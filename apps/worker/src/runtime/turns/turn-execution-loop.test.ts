@@ -302,14 +302,20 @@ describe("owner-agnostic turn execution loop", () => {
   })
 
   it("keeps the obligation active when the fresh goal update fails", async () => {
+    const goalRef = replanGoalRef()
+    const advancedGoal = { ...replanGoal, revision: 2, objective: "Find senior jobs" }
     const root = fixture(identity("turn", "root-1"), { id: "goal-call", toolName: "agent.goal.update", toolVersion: "1", status: "failed", output: null, errorCode: "goal_update_rejected" }, undefined, failedJoinObservations(), false, undefined, {
       id: "goal-call", name: "agent.goal.update", arguments: { changes: { objective: "Find senior jobs" } },
-    }, false, replanGoalRef())
+    }, false, goalRef, async ({ call }) => {
+      goalRef.update(advancedGoal)
+      return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "failed" as const, output: null, errorCode: "goal_update_rejected" }
+    })
     addSteeringInput(root)
     const result = await runTurnExecutionLoop(root.options)
     expect(result).toMatchObject({ status: "failed", errorCode: "final_unverified", toolCallCount: 1 })
     expect(root.events.some(event => event.type === "goal.revision")).toBe(false)
     expect(root.planEvents).toHaveLength(2)
+    expect(goalRef.get()).toEqual(replanGoal)
   })
 
   it("blocks an unqualified final while a child failure replan obligation is active", async () => {
@@ -600,26 +606,67 @@ describe("owner-agnostic turn execution loop", () => {
   })
 
   it("fails visibly when a goal update output or revision append is invalid", async () => {
+    const goalRef = replanGoalRef()
+    const advancedGoal = { ...replanGoal, revision: 2, objective: "Find senior jobs" }
+    const invalidOutput = { status: "accepted", goalRevision: 2, basedOnGoalRevision: 1 }
     const root = fixture(identity("turn", "root-1"), undefined, undefined, [], false, undefined, {
       name: "agent.goal.update", arguments: { changes: { objective: "Find senior jobs" } },
-      output: { status: "accepted", goalRevision: 2, basedOnGoalRevision: 1 },
+      output: invalidOutput,
+    }, false, goalRef, async ({ call }) => {
+      goalRef.update(advancedGoal)
+      return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, output: invalidOutput, errorCode: null }
     })
     const result = await runTurnExecutionLoop(root.options)
     expect(result).toMatchObject({ status: "failed", errorCode: "invalid_output" })
     expect(root.events.some(event => event.type === "goal.revision")).toBe(false)
     expect(root.events.some(event => event.type === "turn.completed")).toBe(false)
+    expect(goalRef.get()).toEqual(replanGoal)
   })
 
   it("fails visibly when the goal revision event cannot be appended", async () => {
     const goalContract = { revision: 2, objective: "Find senior jobs", constraints: ["EU"], successCriteria: [], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" }
+    const goalRef = replanGoalRef()
     const root = fixture(identity("turn", "root-1"), undefined, undefined, [], false, undefined, {
       name: "agent.goal.update", arguments: { changes: { objective: "Find senior jobs" } },
       output: { status: "accepted", goalRevision: 2, basedOnGoalRevision: 1, goalContract },
-    }, true)
+    }, true, goalRef, async ({ call }) => {
+      goalRef.update(goalContract)
+      return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, output: { status: "accepted", goalRevision: 2, basedOnGoalRevision: 1, goalContract }, errorCode: null }
+    })
     const result = await runTurnExecutionLoop(root.options)
     expect(result).toMatchObject({ status: "failed", errorCode: "turn_execution_failed" })
     expect(root.events.some(event => event.type === "goal.revision")).toBe(false)
     expect(root.events.some(event => event.type === "turn.completed")).toBe(false)
+    expect(goalRef.get()).toEqual(replanGoal)
+  })
+
+  it("restores the prior goal when the revision and marker batch fails", async () => {
+    const goalContract = { revision: 2, objective: "Find senior jobs", constraints: [], successCriteria: [], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" }
+    const goalReceipt = { status: "accepted", goalRevision: 2, basedOnGoalRevision: 1, goalContract }
+    const goalRef = replanGoalRef()
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, failedJoinObservations(), false, undefined, {
+      name: "agent.goal.update", arguments: { changes: { objective: "Find senior jobs" } }, output: goalReceipt,
+    }, false, goalRef, async ({ call }) => {
+      goalRef.update(goalContract)
+      return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, output: goalReceipt, errorCode: null }
+    })
+    addSteeringInput(root)
+    const marker: SteeringMarkerPayload = {
+      schemaVersion: "agent-harness.steering-marker.v1", kind: "observed", status: "observed", sessionId: "session-1", turnId: "turn-1", taskId: "root-1",
+      stepId: "old-step", inputId: "steer-1", idempotencyKey: steeringMarkerIdempotencyKey("session-1", "turn-1", "steer-1"), obligationId: "plan-replan:plan-1:1", goalRevision: 1, planRevision: 1, acceptedSequence: "2",
+    }
+    const appendEvents = root.options.store.appendEvents!
+    root.options = {
+      ...root.options, steeringMarkerState: { active: [marker] },
+      store: { ...root.options.store, appendEvents: async inputs => {
+        if (inputs.some(input => input.type === "goal.revision")) throw new Error("revision-marker batch failed")
+        return appendEvents(inputs)
+      } },
+    }
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "failed", errorCode: "turn_execution_failed" })
+    expect(goalRef.get()).toEqual(replanGoal)
+    expect(root.events.some(event => event.type === "goal.revision" || event.type === "agent.steering.marker")).toBe(false)
   })
 
   it("does not repeat a goal revision event for a replayed update call", async () => {
@@ -770,6 +817,34 @@ describe("owner-agnostic turn execution loop", () => {
     expect(recovered).toHaveBeenCalledWith({ goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposalHash: output.proposalHash })
   })
 
+  it("does not advance replay recovery before a missing revision is durable", async () => {
+    const proposal: PlanProposal = { schemaVersion: PLAN_PROPOSAL_SCHEMA_VERSION, basedOnGoalRevision: 1, basedOnPlanRevision: null, nodes: [], completionCriteria: [], briefRationale: "fixture" }
+    const output = { status: "accepted" as const, goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposal, intents: [], proposalHash: fingerprintPlanProposal(proposal) }
+    const persisted = [{ id: "tool-result:call:root-1", content: { toolCallId: "call:root-1", toolName: "agent.plan.propose", input: { proposal }, status: "completed", output, errorCode: null } }]
+    const dispatcher = createPlanRevisionRecoveryDispatcher()
+    const recovered = vi.fn()
+    dispatcher.register(recovered)
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, persisted, false, undefined, { name: "agent.plan.propose", arguments: { proposal } })
+    const appendEvent = root.options.store.appendEvent
+    const appendEvents = root.options.store.appendEvents!
+    root.options = {
+      ...root.options,
+      recoveryDispatcher: dispatcher,
+      store: { ...root.options.store, appendEvent: async input => {
+        if (input.type === "plan.revision") throw new Error("revision append failed")
+        return appendEvent(input)
+      },
+      appendEvents: async inputs => {
+        if (inputs.some(input => input.type === "plan.revision")) throw new Error("revision append failed")
+        return appendEvents(inputs)
+      } },
+    }
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "failed", errorCode: "turn_execution_failed" })
+    expect(recovered).not.toHaveBeenCalled()
+    expect(root.events.some(event => event.type === "plan.revision")).toBe(false)
+  })
+
   it("repairs a replayed plan receipt before the next proposal without replay side effects", async () => {
     const initialGoal: GoalContract = { revision: 1, objective: "Find jobs", constraints: [], successCriteria: [], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" }
     const current = { value: initialGoal }
@@ -854,7 +929,7 @@ describe("owner-agnostic turn execution loop", () => {
     expect(recovered).toHaveBeenCalledTimes(1)
   })
 
-  it("does not persist a plan projection when replay recovery rejects a revision gap", async () => {
+  it("persists a replay revision before a recovery gap is rejected", async () => {
     const dispatcher = createPlanRevisionRecoveryDispatcher()
     const proposal: PlanProposal = { schemaVersion: PLAN_PROPOSAL_SCHEMA_VERSION, basedOnGoalRevision: 1, basedOnPlanRevision: 2, nodes: [], completionCriteria: [], briefRationale: "gap" }
     const output = { status: "accepted" as const, goalRevision: 1, planRevision: 3, basedOnPlanRevision: 2, proposal, intents: [], proposalHash: fingerprintPlanProposal(proposal) }
@@ -863,7 +938,7 @@ describe("owner-agnostic turn execution loop", () => {
     const root = fixture(identity("turn", "root-1"), undefined, undefined, [persisted], false, undefined, { id: "gap", name: "agent.plan.propose", arguments: { proposal } })
     const result = await runTurnExecutionLoop({ ...root.options, recoveryDispatcher: dispatcher })
     expect(result).toMatchObject({ status: "failed", errorCode: "invalid_output" })
-    expect(root.events.some(event => event.type === "plan.revision")).toBe(false)
+    expect(root.events.some(event => event.type === "plan.revision")).toBe(true)
   })
 
   it.each([

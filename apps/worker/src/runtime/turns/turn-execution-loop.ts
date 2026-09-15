@@ -440,11 +440,6 @@ async function executeTools(
         if (!revision) throw new TurnEngineError("invalid_output", "Plan proposal returned an invalid persisted receipt")
         const currentGoal = options.goalRef?.get()
         if (currentGoal && revision.goalRevision !== currentGoal.revision) throw new TurnEngineError("invalid_output", "Plan proposal replay does not match the current goal revision")
-        try {
-          options.recoveryDispatcher?.recover({ goalRevision: revision.goalRevision, planRevision: revision.planRevision, basedOnPlanRevision: revision.basedOnPlanRevision, ...(revision.proposalHash === undefined ? {} : { proposalHash: revision.proposalHash }) })
-        } catch {
-          throw new TurnEngineError("invalid_output", "Plan proposal replay recovery failed closed")
-        }
         const projection = planRevisionObservation(revision)
         const existingProjection = snapshot.toolObservations.find(observation => observation.id === projection.id)
         if (existingProjection && stableJson(existingProjection.content) !== stableJson(projection.content)) throw new TurnEngineError("invalid_output", "Plan proposal replay has a conflicting revision projection")
@@ -453,6 +448,11 @@ async function executeTools(
         if (hasAcceptedMarkerForRevision(options, steeringMarkerState, revision, "plan") && !obligation) throw new TurnEngineError("invalid_output", "Accepted plan replay cannot identify its prior replan obligation")
         assertAcceptedPlanRevision(revision, obligation)
         if (!hasProjection || obligation) steeringMarkerState = await appendAcceptedRevision(options, writer, call.id, "plan.revision", revision, obligation, steeringMarkerState, step.id, !hasProjection)
+        try {
+          options.recoveryDispatcher?.recover({ goalRevision: revision.goalRevision, planRevision: revision.planRevision, basedOnPlanRevision: revision.basedOnPlanRevision, ...(revision.proposalHash === undefined ? {} : { proposalHash: revision.proposalHash }) })
+        } catch {
+          throw new TurnEngineError("invalid_output", "Plan proposal replay recovery failed closed")
+        }
         if (!hasProjection) snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, projection] }
         if (options.executePlan) {
           const replayedResult: TurnEngineToolResult = { id: call.id, toolName: call.name, toolVersion: "1", status: "completed", output: persisted.output, errorCode: null }
@@ -472,8 +472,17 @@ async function executeTools(
       }
       continue
     }
-    const result = await executeToolWithItems(options, writer, step, call, now)
-    assertExecutionAlive(options, signal)
+    const goalBeforeExecution = call.name === "agent.goal.update" ? options.goalRef?.get() : undefined
+    const restoreGoalBeforePersistence = (): void => { if (goalBeforeExecution) options.goalRef?.update(goalBeforeExecution) }
+    let result: TurnEngineToolResult
+    try {
+      result = await executeToolWithItems(options, writer, step, call, now)
+      assertExecutionAlive(options, signal)
+    } catch (error: unknown) {
+      restoreGoalBeforePersistence()
+      throw error
+    }
+    if (call.name === "agent.goal.update" && result.status !== "completed") restoreGoalBeforePersistence()
     if (result.status === "failed" && result.errorCode === "policy_requires_approval") {
       return { wait: { status: "waiting_for_approval", stepCount: 0, toolCallCount: 0, errorCode: result.errorCode }, snapshot, steeringMarkerState }
     }
@@ -511,17 +520,22 @@ async function executeTools(
         if (plan.wait) return { wait: plan.wait, snapshot, steeringMarkerState }
       }
       if (call.name === "agent.goal.update") {
-        const revision = parseGoalRevisionOutput(result.output)
-        if (!revision) throw new TurnEngineError("invalid_output", "Goal update returned an invalid receipt")
-        const obligation = activeReplanObligationForGoalRevision(snapshot, revision.basedOnGoalRevision)
-        assertAcceptedGoalRevision(revision, obligation)
-        steeringMarkerState = await appendAcceptedRevision(options, writer, call.id, "goal.revision", revision, obligation, steeringMarkerState, step.id)
-        options.goalRef?.update(revision.goalContract)
-        const projection = goalRevisionObservation(revision)
-        snapshot = {
-          ...snapshot,
-          goal: { id: `turn-goal:${options.identity.turnId}`, content: revision.goalContract.objective },
-          toolObservations: snapshot.toolObservations.some(observation => observation.id === projection.id) ? snapshot.toolObservations : [...snapshot.toolObservations, projection],
+        try {
+          const revision = parseGoalRevisionOutput(result.output)
+          if (!revision) throw new TurnEngineError("invalid_output", "Goal update returned an invalid receipt")
+          const obligation = activeReplanObligationForGoalRevision(snapshot, revision.basedOnGoalRevision)
+          assertAcceptedGoalRevision(revision, obligation)
+          steeringMarkerState = await appendAcceptedRevision(options, writer, call.id, "goal.revision", revision, obligation, steeringMarkerState, step.id)
+          options.goalRef?.update(revision.goalContract)
+          const projection = goalRevisionObservation(revision)
+          snapshot = {
+            ...snapshot,
+            goal: { id: `turn-goal:${options.identity.turnId}`, content: revision.goalContract.objective },
+            toolObservations: snapshot.toolObservations.some(observation => observation.id === projection.id) ? snapshot.toolObservations : [...snapshot.toolObservations, projection],
+          }
+        } catch (error: unknown) {
+          restoreGoalBeforePersistence()
+          throw error
         }
       }
     }
