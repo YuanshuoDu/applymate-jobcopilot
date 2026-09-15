@@ -99,10 +99,13 @@ function boundedString(value: unknown, maxBytes: number): value is string {
   return typeof value === "string" && value.length > 0 && value.trim() === value && new TextEncoder().encode(value).byteLength <= maxBytes && !/[\u0000-\u001f\u007f]/.test(value)
 }
 
-function persistedRetryContent(turnId: string, value: unknown): InputContentPart[] {
+function boundedGoal(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.trim() === value && new TextEncoder().encode(value).byteLength <= MAX_RETRY_CONTENT_BYTES && !/[\u0000-\u0008\u000b-\u001f\u007f]/.test(value)
+}
+
+function persistedRetryContent(turnId: string, value: unknown): { goal: string; content: InputContentPart[] } {
   if (!isRecord(value) || !exactKeys(value, ["goal", "content", "clientMessageId"]) ||
-    (value.goal !== undefined && (typeof value.goal !== "string" || value.goal.length === 0 || new TextEncoder().encode(value.goal).byteLength > MAX_RETRY_CONTENT_BYTES)) ||
-    (value.clientMessageId !== undefined && !boundedString(value.clientMessageId, 256)) ||
+    !boundedGoal(value.goal) || (value.clientMessageId !== undefined && !boundedString(value.clientMessageId, 256)) ||
     !Array.isArray(value.content) || value.content.length < 1 || value.content.length > MAX_RETRY_PARTS) throw retryInputInvalid(turnId)
   const content: InputContentPart[] = []
   let attachmentCount = 0
@@ -119,7 +122,7 @@ function persistedRetryContent(turnId: string, value: unknown): InputContentPart
     } else throw retryInputInvalid(turnId)
   }
   if (new TextEncoder().encode(JSON.stringify(content)).byteLength > MAX_RETRY_CONTENT_BYTES) throw retryInputInvalid(turnId)
-  return content
+  return { goal: value.goal, content }
 }
 
 export class AgentCommandService {
@@ -229,10 +232,10 @@ export class AgentCommandService {
       }
       const active = await findActiveTurn(tx, command.sessionId, command.userId)
       if (active) throw retryActiveConflict(active.id)
-      const content = persistedRetryContent(target.id, target.input)
+      const persisted = persistedRetryContent(target.id, target.input)
 
-      const created = await createRootTurn(tx, command, content)
-      const facts = await acceptInputFacts(tx, command, content, created, "follow_up", "started", true)
+      const created = await createRootTurn(tx, command, persisted.content, persisted.goal)
+      const facts = await acceptInputFacts(tx, command, persisted.content, created, "follow_up", "started", true)
       return { ...facts, disposition: "started" as const }
     })
   }

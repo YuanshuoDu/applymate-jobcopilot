@@ -110,8 +110,9 @@ export async function createRootTurn(
   tx: CommandTransaction,
   command: CommandIdentity,
   content: InputContentPart[],
+  explicitGoal?: string,
 ): Promise<ActiveTurn> {
-  const goal = content.filter((part) => part.type === "text").map((part) => part.text).join("\n").trim() || "Process the provided content"
+  const goal = explicitGoal ?? (content.filter((part) => part.type === "text").map((part) => part.text).join("\n").trim() || "Process the provided content")
   const turn = await tx.agentTurn.create({
     data: {
       id: randomUUID(),

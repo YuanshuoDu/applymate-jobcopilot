@@ -34,8 +34,11 @@ describe("Agent command transaction helpers", () => {
       { agentTurn, agentOutbox } as unknown as CommandTransaction,
       command,
       [{ type: "text", text: "Start" }],
+      "Canonical goal",
     )
 
+    const turnData = agentTurn.create.mock.calls[0]?.[0]?.data
+    expect(turnData.input).toEqual(expect.objectContaining({ goal: "Canonical goal" }))
     const outboxData = agentOutbox.create.mock.calls[0]?.[0]?.data
     expect(outboxData).toEqual(expect.objectContaining({
       aggregateId: command.sessionId,

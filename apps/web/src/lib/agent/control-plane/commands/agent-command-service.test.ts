@@ -89,7 +89,7 @@ function makeDb(options: {
       }),
       create: vi.fn(async (args: unknown) => {
         const data = (args as { data: Row }).data
-        active = { id: String(data.id), source: data.source, status: "queued", revision: 0 }
+        active = { id: String(data.id), source: data.source, status: "queued", revision: 0, input: data.input }
         return { id: active.id }
       }),
       updateMany: vi.fn(async (args: unknown) => {
@@ -444,12 +444,13 @@ describe("AgentCommandService", () => {
   })
 
   it("retries a failed Turn atomically from its persisted input", async () => {
-    const fake = makeDb({ retryTarget: { ...retryTarget(), rootTaskId: "task-claimed" } })
+    const fake = makeDb({ retryTarget: { ...retryTarget("failed", { goal: "Canonical persisted retry objective", content: [...content] }), rootTaskId: "task-claimed" } })
     const result = await new AgentCommandService(fake.db).retry(retryCommand("retry_1"))
 
     expect(result).toMatchObject({ disposition: "started", sequence: "2" })
     expect(result.turnId).not.toBe("turn_failed")
     expect(fake.state.active).toMatchObject({ status: "queued", source: "user" })
+    expect(fake.state.active).toMatchObject({ input: { goal: "Canonical persisted retry objective", content } })
     expect(fake.state.inputs).toHaveLength(1)
     expect(fake.state.inputs[0]).toMatchObject({ delivery: "follow_up", content })
     expect(fake.state.events.map(event => event.type)).toEqual(["turn.started", "input.accepted"])
@@ -485,6 +486,20 @@ describe("AgentCommandService", () => {
     const malformed = makeDb({ retryTarget: retryTarget("failed", { content: [{ type: "text", text: "ok", secret: "reject" }] }) })
     await expect(new AgentCommandService(malformed.db).retry(retryCommand("retry_malformed"))).rejects.toMatchObject({ code: "retry_input_invalid", status: 409 })
     expect(malformed.state.inputs).toHaveLength(0)
+
+    for (const [label, input] of [
+      ["missing", { content: [...content] }],
+      ["empty", { goal: "", content: [...content] }],
+      ["foreign", { goal: "\u0001", content: [...content] }],
+    ] as const) {
+      const fake = makeDb({ retryTarget: retryTarget("failed", input) })
+      await expect(new AgentCommandService(fake.db).retry(retryCommand(`retry_goal_${label}`))).rejects.toMatchObject({ code: "retry_input_invalid", status: 409 })
+      expect(fake.state.active).toBeNull()
+      expect(fake.state.inputs).toHaveLength(0)
+      expect(fake.state.items).toHaveLength(0)
+      expect(fake.state.events).toHaveLength(0)
+      expect(fake.state.outbox).toHaveLength(0)
+    }
   })
 
   it("rolls back retry Turn, facts, and dispatch when the transaction fails", async () => {
