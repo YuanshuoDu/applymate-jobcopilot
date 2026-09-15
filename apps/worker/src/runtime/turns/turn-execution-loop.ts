@@ -22,6 +22,8 @@ import { runContextCompaction } from "../context/context-compaction-runtime.js"
 import type { StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
 import { appliedSteeringMarkerEntries } from "../context/steering-marker-store.js"
 import { STEERING_MARKER_EVENT_TYPE, type SteeringMarkerPayload } from "../context/steering-marker.js"
+import { buildCognitiveActionAgenda } from "./cognitive-action-agenda.js"
+import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE, cognitiveAgendaReceiptIdempotencyKey } from "./cognitive-agenda-receipt.js"
 
 const DEFAULT_MAX_STEPS = 32
 const PLAN_OBSERVATION_MAX_BYTES = 8 * 1024
@@ -94,6 +96,18 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         if (newlyObservedMarkers.length > 0) steeringMarkerState = rememberSteeringMarkers(steeringMarkerState, newlyObservedMarkers)
         inputThroughSequence = context.inputThroughSequence
         consumedInputIds = context.consumedInputIds
+        const replanRequired = obligationAfterCompaction !== undefined
+        const receipt = buildCognitiveAgendaReceipt({
+          sessionId: options.identity.sessionId, turnId: options.identity.turnId, taskId: options.identity.taskId, stepId: step.id,
+          agenda: buildCognitiveActionAgenda(context, { replanRequired, freshSteering: replanRequired && freshSteering }),
+        })
+        const receiptKey = cognitiveAgendaReceiptIdempotencyKey(step.id)
+        if (!receipt || !receiptKey) throw new TurnEngineError("invalid_output", "Cognitive agenda receipt could not be built")
+        try {
+          await writer.append(COGNITIVE_AGENDA_EVENT_TYPE, step.id, null, receipt, receiptKey)
+        } catch {
+          throw new TurnEngineError("persistence_conflict", "Cognitive agenda receipt could not be persisted")
+        }
         const request = buildModelRequest({
           context, model: options.model, tools: options.tools,
           sessionId: options.identity.sessionId, turnId: options.identity.turnId, stepId: step.id,

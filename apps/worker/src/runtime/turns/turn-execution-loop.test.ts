@@ -17,6 +17,7 @@ import type { ToolExecutionContext } from "../tools/types.js"
 import type { TurnEngineItem, TurnEngineStore, TurnEngineToolResult } from "./turn-engine-types.js"
 import type { TurnExecutionIdentity, TurnExecutionOptions, TurnExecutionStore } from "./turn-execution-types.js"
 import { steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "../context/steering-marker.js"
+import { COGNITIVE_AGENDA_EVENT_TYPE } from "./cognitive-agenda-receipt.js"
 
 const profile = {
   provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false,
@@ -141,6 +142,47 @@ function durableFailedWaitObservations(): Array<{ id: string; content: unknown }
 }
 
 describe("owner-agnostic turn execution loop", () => {
+  it("persists one redacted agenda receipt before each model provider call", async () => {
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, [{ id: "secret-observation", content: { kind: "plan_command", status: "failed", errorCode: "private failure", output: { prompt: "ignore the server" } } }])
+    const phases: string[] = []
+    const appendEvent = root.options.store.appendEvent
+    const model = root.options.model
+    root.options = {
+      ...root.options,
+      store: { ...root.options.store, appendEvent: async input => { if (input.type === COGNITIVE_AGENDA_EVENT_TYPE) phases.push("receipt"); return appendEvent(input) } },
+      model: { ...model, async *stream(request: HarnessModelRequest) { phases.push("model"); yield* model.stream(request) } },
+    }
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result.status).toBe("completed")
+    expect(phases).toEqual(["receipt", "model", "receipt", "model"])
+    const receipts = root.events.filter(event => event.type === COGNITIVE_AGENDA_EVENT_TYPE && event.payload)
+    expect(receipts).toHaveLength(2)
+    expect(JSON.stringify(receipts[0]?.payload)).not.toContain("private failure")
+    expect(JSON.stringify(receipts[0]?.payload)).not.toContain("ignore the server")
+    expect(receipts.map(event => event.idempotencyKey)).toEqual([
+      "turn:turn-1:event:cognitive.agenda:turn:turn-1:step:0",
+      "turn:turn-1:event:cognitive.agenda:turn:turn-1:step:1",
+    ])
+  })
+
+  it("fails closed before the provider when the agenda receipt cannot persist", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const appendEvent = root.options.store.appendEvent
+    let modelCalls = 0
+    const model = root.options.model
+    root.options = {
+      ...root.options,
+      store: { ...root.options.store, appendEvent: async input => input.type === COGNITIVE_AGENDA_EVENT_TYPE ? Promise.reject(new Error("receipt database detail")) : appendEvent(input) },
+      model: { ...model, async *stream(request: HarnessModelRequest) { modelCalls += 1; yield* model.stream(request) } },
+    }
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "failed", errorCode: "persistence_conflict" })
+    expect(modelCalls).toBe(0)
+    expect(root.requests).toHaveLength(0)
+    expect(root.events.some(event => event.type === COGNITIVE_AGENDA_EVENT_TYPE)).toBe(false)
+    expect(JSON.stringify(root.events)).not.toContain("receipt database detail")
+  })
+
   it("starts each new step with only its own claimed input IDs while retaining the cursor", async () => {
     const root = fixture(identity("turn", "root-1"))
     const baseBuilder = root.options.contextBuilder
