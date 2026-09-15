@@ -246,12 +246,33 @@ describe("owner-agnostic turn execution loop", () => {
     const goalRef = replanGoalRef()
     const root = fixture(identity("turn", "root-1"), undefined, undefined, failedJoinObservations(), false, undefined, {
       name: "agent.goal.update", arguments: { changes: { objective: "Find senior jobs" } }, output: goalReceipt,
-    }, false, goalRef)
+    }, false, goalRef, async ({ call }) => {
+      goalRef.update(goalContract)
+      return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, output: goalReceipt, errorCode: null }
+    })
     addSteeringInput(root)
+    const marker: SteeringMarkerPayload = {
+      schemaVersion: "agent-harness.steering-marker.v1", kind: "observed", status: "observed", sessionId: "session-1", turnId: "turn-1", taskId: "root-1",
+      stepId: "old-step", inputId: "steer-1", idempotencyKey: steeringMarkerIdempotencyKey("session-1", "turn-1", "steer-1"), obligationId: "plan-replan:plan-1:1", goalRevision: 1, planRevision: 1, acceptedSequence: "2",
+    }
+    const batches: Array<readonly { readonly type: string; readonly actor?: "system" }[]> = []
+    const seen: Array<readonly SteeringMarkerPayload[]> = []
+    const baseBuilder = root.options.contextBuilder
+    const appendEvents = root.options.store.appendEvents!
+    root.options = {
+      ...root.options, steeringMarkerState: { active: [marker] },
+      contextBuilder: { build: async request => { seen.push(request.steeringMarkerState?.active ?? []); return baseBuilder.build(request) } },
+      store: { ...root.options.store, appendEvents: async inputs => { batches.push(inputs); return appendEvents(inputs) } },
+    }
     const result = await runTurnExecutionLoop(root.options)
     expect(result).toMatchObject({ status: "completed", stepCount: 2, toolCallCount: 1 })
     expect(root.planEvents).toHaveLength(0)
     expect(root.events.some(event => event.type === "goal.revision")).toBe(true)
+    expect(batches.find(batch => batch.some(entry => entry.type === "agent.steering.marker"))).toEqual([
+      expect.objectContaining({ type: "goal.revision" }), expect.objectContaining({ type: "agent.steering.marker", actor: "system" }),
+    ])
+    expect(seen[0]).toEqual([marker])
+    expect(seen[1]).toEqual([])
     expect(root.requests[0]?.messages[0]).toEqual(expect.objectContaining({ role: "system", content: [{ type: "text", text: expect.stringContaining("Fresh authenticated user steering") }] }))
   })
 

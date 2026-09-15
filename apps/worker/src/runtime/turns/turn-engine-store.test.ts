@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 
 import { createPgTurnEngineStore } from "./turn-engine-store.js"
+import { steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "../context/steering-marker.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "owner-1", userId: "user-1", leaseVersion: 3,
@@ -17,6 +18,10 @@ const childOwner = {
   kind: "task" as const, userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId,
   taskId: "child-1", rootTaskId: owner.taskId, ownerId: "child-worker", attemptCount: 2, leaseExpiresAt: lease.leaseExpiresAt,
 }
+const markerPayload = (stepId: string, changes: Partial<SteeringMarkerPayload> = {}): SteeringMarkerPayload => ({
+  schemaVersion: "agent-harness.steering-marker.v1", kind: "observed", status: "observed", sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.taskId,
+  stepId, inputId: "steer-1", idempotencyKey: steeringMarkerIdempotencyKey(owner.sessionId, owner.turnId, "steer-1"), obligationId: "plan-replan:plan-1:1", goalRevision: 1, planRevision: 1, acceptedSequence: "2", ...changes,
+})
 function assertDenseBindings(calls: Array<{ sql: string; values?: readonly unknown[] }>) {
   for (const call of calls) {
     if (!call.values) continue
@@ -184,6 +189,31 @@ describe("PostgreSQL TurnEngine store", () => {
     }), release: vi.fn() }
     const store = createPgTurnEngineStore({ connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">)
     await expect(store.appendEvent({ owner, id: "requested", itemId: null, type: "agent.steering.marker", correlationId: "goal-call", causationId: null, idempotencyKey: "same-key", payload: {}, actor: "system" })).rejects.toThrow(/identity/)
+  })
+
+  it("treats an applied marker replay with a new step as idempotent", async () => {
+    const oldPayload = markerPayload("old-step", { kind: "applied", status: "applied" })
+    const client = { query: vi.fn(async (sql: string) => {
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: owner.sessionId }] }
+      if (sql.includes('SELECT turn."id"')) return { rows: [{ id: owner.turnId }] }
+      if (sql.includes('FROM "agent_events"')) return { rows: [{ id: "existing", taskId: owner.taskId, turnId: owner.turnId, itemId: null, type: "agent.steering.marker", correlationId: "goal-call", causationId: null, sequence: 2n, actor: "system", payload: oldPayload }] }
+      return { rows: [], rowCount: 1 }
+    }), release: vi.fn() }
+    const store = createPgTurnEngineStore({ connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">)
+    await expect(store.appendEvent({ owner, id: "replayed", itemId: null, type: "agent.steering.marker", correlationId: "goal-call", causationId: null, idempotencyKey: oldPayload.idempotencyKey, payload: markerPayload("new-step", { kind: "applied", status: "applied" }), actor: "system" })).resolves.toEqual({ id: "existing" })
+  })
+
+  it("rejects marker replay conflicts beyond step provenance", async () => {
+    const oldPayload = markerPayload("old-step", { kind: "applied", status: "applied" })
+    const client = { query: vi.fn(async (sql: string) => {
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: owner.sessionId }] }
+      if (sql.includes('SELECT turn."id"')) return { rows: [{ id: owner.turnId }] }
+      if (sql.includes('FROM "agent_events"')) return { rows: [{ id: "existing", taskId: owner.taskId, turnId: owner.turnId, itemId: null, type: "agent.steering.marker", correlationId: "goal-call", causationId: null, sequence: 2n, actor: "system", payload: oldPayload }] }
+      return { rows: [], rowCount: 1 }
+    }), release: vi.fn() }
+    const store = createPgTurnEngineStore({ connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">)
+    await expect(store.appendEvent({ owner, id: "conflict-goal", itemId: null, type: "agent.steering.marker", correlationId: "goal-call", causationId: null, idempotencyKey: oldPayload.idempotencyKey, payload: markerPayload("new-step", { goalRevision: 2 }), actor: "system" })).rejects.toThrow(/identity/)
+    await expect(store.appendEvent({ owner, id: "conflict-kind", itemId: null, type: "agent.steering.marker", correlationId: "goal-call", causationId: null, idempotencyKey: oldPayload.idempotencyKey, payload: markerPayload("new-step"), actor: "system" })).rejects.toThrow(/identity/)
   })
 
   it("fences child persistence and allocates a Turn-global ordinal", async () => {

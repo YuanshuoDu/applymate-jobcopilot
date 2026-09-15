@@ -4,6 +4,7 @@ import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import type { ExecutionOwnerFence } from "../execution-owner.js"
 import { ownerFenceSql } from "./turn-engine-owner-sql.js"
 import { toRepositoryJson, type TurnEngineEventInput, type TurnEngineItem, type TurnEngineStore, type TurnEngineStep } from "./turn-engine-types.js"
+import { STEERING_MARKER_EVENT_TYPE, parseSteeringMarkerPayload, type SteeringMarkerPayload } from "../context/steering-marker.js"
 
 type TurnEnginePool = Pick<pg.Pool, "connect">
 type QueryClient = Pick<pg.PoolClient, "query" | "release">
@@ -17,6 +18,14 @@ function conflict(resource: string): Error {
   return error
 }
 function sameJson(left: unknown, right: unknown): boolean { return JSON.stringify(toRepositoryJson(left)) === JSON.stringify(toRepositoryJson(right)) }
+function markerIdentity(value: SteeringMarkerPayload): string {
+  return JSON.stringify({ schemaVersion: value.schemaVersion, kind: value.kind, status: value.status, sessionId: value.sessionId, turnId: value.turnId, taskId: value.taskId, inputId: value.inputId, idempotencyKey: value.idempotencyKey, obligationId: value.obligationId, goalRevision: value.goalRevision, planRevision: value.planRevision, acceptedSequence: value.acceptedSequence })
+}
+function sameEventPayload(type: unknown, left: unknown, right: unknown): boolean {
+  if (type !== STEERING_MARKER_EVENT_TYPE) return sameJson(left, right)
+  const leftMarker = parseSteeringMarkerPayload(left), rightMarker = parseSteeringMarkerPayload(right)
+  return leftMarker !== null && rightMarker !== null && markerIdentity(leftMarker) === markerIdentity(rightMarker)
+}
 
 async function tenantTransaction<T>(pool: TurnEnginePool, userId: string, work: (client: QueryClient) => Promise<T>): Promise<T> {
   const client = await pool.connect(); let committed = false
@@ -97,7 +106,7 @@ async function appendEventBatch(pool: TurnEnginePool, inputs: readonly TurnEngin
       if (existing.rows[0]) {
         const row = existing.rows[0]
         if (row.taskId !== owner.taskId || row.turnId !== owner.turnId || row.itemId !== input.itemId || row.type !== input.type
-          || row.correlationId !== input.correlationId || row.causationId !== causationId || String(row.actor) !== actor || !sameJson(row.payload, input.payload)) throw conflict(`event ${input.idempotencyKey} identity`)
+          || row.correlationId !== input.correlationId || row.causationId !== causationId || String(row.actor) !== actor || !sameEventPayload(row.type, row.payload, input.payload)) throw conflict(`event ${input.idempotencyKey} identity`)
         await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload") VALUES ($1, 'agent.events', $2, $3, $4::jsonb) ON CONFLICT ("idempotencyKey") DO NOTHING`,
           [`agent-outbox-${row.id}`, owner.sessionId, `agent-event:${row.id}`, json(toRepositoryJson({ eventId: String(row.id), sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.taskId, itemId: input.itemId, sequence: String(row.sequence), type: input.type, actor: String(row.actor), correlationId: input.correlationId, causationId: row.causationId, idempotencyKey: input.idempotencyKey, payload: input.payload }))])
         result.push({ id: String(row.id) }); previousId = String(row.id); continue

@@ -300,6 +300,12 @@ function activeReplanObligation(options: TurnExecutionOptions, snapshot: typeof 
   if (!replanSignalPresent(snapshot) && !waitingJoinPresent(snapshot)) return undefined
   const expectedGoalRevision = options.goalRef?.get()?.revision
   if (typeof expectedGoalRevision !== "number" || !Number.isSafeInteger(expectedGoalRevision) || expectedGoalRevision < 1) throw new TurnEngineError("invalid_output", "Active replan obligation has no server-owned goal revision")
+  return activeReplanObligationForGoalRevision(snapshot, expectedGoalRevision)
+}
+
+function activeReplanObligationForGoalRevision(snapshot: StepContextSnapshot, expectedGoalRevision: number): ReplanObligation | undefined {
+  if (!replanSignalPresent(snapshot) && !waitingJoinPresent(snapshot)) return undefined
+  if (!Number.isSafeInteger(expectedGoalRevision) || expectedGoalRevision < 1) throw new TurnEngineError("invalid_output", "Active replan obligation has no server-owned goal revision")
   const result = deriveReplanObligation({ observations: snapshot.toolObservations, expectedGoalRevision })
   if (result.kind === "invalid") throw new TurnEngineError("invalid_output", "Active replan obligation is invalid")
   return result.kind === "active" ? result.obligation : undefined
@@ -507,7 +513,7 @@ async function executeTools(
       if (call.name === "agent.goal.update") {
         const revision = parseGoalRevisionOutput(result.output)
         if (!revision) throw new TurnEngineError("invalid_output", "Goal update returned an invalid receipt")
-        const obligation = activeReplanObligation(options, snapshot)
+        const obligation = activeReplanObligationForGoalRevision(snapshot, revision.basedOnGoalRevision)
         assertAcceptedGoalRevision(revision, obligation)
         steeringMarkerState = await appendAcceptedRevision(options, writer, call.id, "goal.revision", revision, obligation, steeringMarkerState, step.id)
         options.goalRef?.update(revision.goalContract)
