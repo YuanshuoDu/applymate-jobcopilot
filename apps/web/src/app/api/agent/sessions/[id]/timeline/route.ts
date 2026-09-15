@@ -4,6 +4,7 @@ import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { db } from "@/lib/db"
 import { isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { redactStreamValue } from "@/lib/agent/session/stream-redaction"
+import { APPROVAL_LEDGER_EVENT_TYPES, APPROVAL_LEDGER_MAX_EVENTS, projectApprovalLedgerRow } from "@/components/agent-workspace/v2/approval-ledger-parser"
 import { parseCognitiveAgendaReceipt, type CognitiveAgendaScope } from "@/components/agent-workspace/v2/cognitive-agenda-view"
 import { isPlanLedgerEventType, parsePlanLedgerEvent, PLAN_LEDGER_EVENT_TYPES, PLAN_LEDGER_MAX_COMMAND_RECEIPT_BYTES, PLAN_LEDGER_MAX_PLANS, PLAN_LEDGER_MAX_RECEIPT_BYTES, PLAN_LEDGER_MAX_STEPS } from "@/components/agent-workspace/v2/timeline-plan-ledger"
 import { parseSteeringMarkerEvent, reduceTimelineSteeringMarkers, type TimelineSteeringMarkerEvent } from "@/components/agent-workspace/v2/timeline-steering-markers"
@@ -43,6 +44,7 @@ const AGENDA_SELECT = {
 } as const
 
 const PLAN_LEDGER_QUERY_LIMIT = PLAN_LEDGER_MAX_PLANS * (1 + PLAN_LEDGER_MAX_STEPS * 2)
+const APPROVAL_LEDGER_QUERY_LIMIT = APPROVAL_LEDGER_MAX_EVENTS * 4
 
 export async function GET(request: NextRequest, context: RouteContext) {
   const auth = await requireAuth(request)
@@ -68,6 +70,7 @@ export async function GET(request: NextRequest, context: RouteContext) {
   const agenda = page.cursor === null ? agendas[agendas.length - 1] ?? null : null
   const steeringMarkers = page.cursor === null ? await latestSteeringMarkers(sessionId) : []
   const planEvents = page.cursor === null ? await recentPlanEvents(sessionId) : []
+  const approvalEvents = page.cursor === null ? await recentApprovalEvents(sessionId) : []
   return ok({
     items: result.rows.map(itemDto),
     page: result.page,
@@ -76,6 +79,7 @@ export async function GET(request: NextRequest, context: RouteContext) {
       ...(agendas.length > 0 ? { agendas } : {}),
       ...(steeringMarkers.length > 0 ? { steeringMarkers } : {}),
       ...(planEvents.length > 0 ? { planEvents } : {}),
+      ...(approvalEvents.length > 0 ? { approvalEvents } : {}),
     } : {}),
   })
 }
@@ -120,6 +124,16 @@ async function recentPlanEvents(sessionId: string) {
   return envelopes
     .filter(event => revisionScopes.has(planScopeKey(event)))
     .sort((left, right) => compareDecimalSequence(left.sequence, right.sequence) || left.id.localeCompare(right.id))
+}
+
+async function recentApprovalEvents(sessionId: string) {
+  const rows = await db.agentEvent.findMany({
+    where: { sessionId, type: { in: [...APPROVAL_LEDGER_EVENT_TYPES] } }, orderBy: { sequence: "desc" }, take: APPROVAL_LEDGER_QUERY_LIMIT, select: AGENDA_SELECT,
+  }) as AgendaQueryRow[]
+  return rows.flatMap(row => {
+    const event = projectApprovalLedgerRow(row, sessionId, redactStreamValue)
+    return event ? [event] : []
+  }).sort((left, right) => compareDecimalSequence(left.sequence, right.sequence) || left.id.localeCompare(right.id))
 }
 
 function planEnvelope(row: AgendaQueryRow, sessionId: string) {

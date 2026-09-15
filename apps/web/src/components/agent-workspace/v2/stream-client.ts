@@ -10,6 +10,7 @@ interface TimelinePageResponse {
   agendas?: unknown[]
   steeringMarkers?: unknown[]
   planEvents?: unknown[]
+  approvalEvents?: unknown[]
 }
 
 export interface TimelineStreamClientOptions {
@@ -34,6 +35,7 @@ export async function hydrateTimeline(options: Pick<TimelineStreamClientOptions,
   let agendas: unknown[] | undefined
   let steeringMarkers: unknown[] | undefined
   let planEvents: unknown[] | undefined
+  let approvalEvents: unknown[] | undefined
   let cursor: string | null = null
   do {
     const query = new URLSearchParams({ limit: String(options.pageSize ?? DEFAULT_PAGE_SIZE) })
@@ -46,10 +48,12 @@ export async function hydrateTimeline(options: Pick<TimelineStreamClientOptions,
     if (cursor === null && Array.isArray(page.agendas)) agendas = page.agendas
     if (cursor === null && Array.isArray(page.steeringMarkers)) steeringMarkers = page.steeringMarkers
     if (cursor === null && Array.isArray(page.planEvents)) planEvents = page.planEvents
+    if (cursor === null && Array.isArray(page.approvalEvents)) approvalEvents = page.approvalEvents
     cursor = page.page?.hasMore === true && typeof page.page.nextCursor === 'string' ? page.page.nextCursor : null
   } while (cursor && !options.signal?.aborted)
   const agendaTail = agendas ?? (agenda === undefined || agenda === null ? [] : [agenda])
   const tail = [...agendaTail, ...(steeringMarkers ?? []), ...(planEvents ?? [])]
+    .concat(approvalEvents ?? [])
     .filter((value): value is unknown => value !== undefined && value !== null)
     .sort(compareTailEvents)
   options.dispatch(tail.length === 0 ? { type: 'hydrate', items } : { type: 'hydrate', items, tail })

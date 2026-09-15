@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from 'react'
 
 import { streamAgentTimeline } from './stream-client'
+import { selectApprovalLedgerProjection } from './approval-ledger-view'
 import type { CognitiveAgendaView } from './cognitive-agenda-view'
 import { createTimelineState, selectTimelineItems, timelineReducer, type TimelineConnection, type TimelineItem, type TimelineState } from './timeline-reducer'
 import { selectPlanLedgerProjection, type PlanLedgerProjection } from './plan-ledger-view'
@@ -25,6 +26,7 @@ export interface AgentTimelineSnapshot {
   readonly cognitiveAgenda: AgentCognitiveAgendaSnapshot | null
   readonly cognitiveAgendas: readonly TimelineCognitiveAgendaEntry[]
   readonly planLedger: PlanLedgerProjection
+  readonly approvalLedger: ReturnType<typeof selectApprovalLedgerProjection>
   readonly steeringMarkers?: TimelineSteeringMarkerState
   readonly connection: TimelineConnection
   readonly restoring: boolean
@@ -91,9 +93,10 @@ export function useAgentTimeline(sessionId: string | null): AgentTimelineSnapsho
     cognitiveAgenda,
     cognitiveAgendas: sessionMatches ? state.cognitiveAgenda.scoped : [],
     planLedger: sessionMatches ? selectPlanLedgerProjection(state.planLedger) : { sessionId: sessionId ?? 'draft', plans: [], currentPlan: null },
+    approvalLedger: sessionMatches ? selectApprovalLedgerProjection(state.approvalLedger) : { sessionId: sessionId ?? 'draft', approvals: [], pending: [], currentPending: null, pendingCount: 0 },
     steeringMarkers: sessionMatches ? state.steeringMarkers : { observed: [], applied: [], active: [], observedCount: 0, appliedCount: 0, activeCount: 0 },
     connection: sessionMatches ? state.connection : 'idle',
     restoring: sessionMatches ? restoring : Boolean(sessionId),
     error: sessionMatches ? error : null,
-  }), [sessionId, items, sessionMatches, state.lastEventId, state.sessionControl.controlGate, state.sessionControl.controlRevision, state.sessionControl.pausedAt, state.connection, state.steeringMarkers, state.cognitiveAgenda.scoped, state.planLedger, cognitiveAgenda, restoring, error])
+  }), [sessionId, items, sessionMatches, state.lastEventId, state.sessionControl.controlGate, state.sessionControl.controlRevision, state.sessionControl.pausedAt, state.connection, state.steeringMarkers, state.cognitiveAgenda.scoped, state.planLedger, state.approvalLedger, cognitiveAgenda, restoring, error])
 }

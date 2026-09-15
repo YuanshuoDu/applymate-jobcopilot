@@ -1,6 +1,8 @@
 /** CANONICAL Phase 9 timeline state root — do not duplicate. See #459. */
 
 import { AGENT_STREAM_SCHEMA_VERSION } from '@jobcopilot/agent-protocol'
+import { isApprovalLedgerEventType, parseApprovalLedgerEvent } from './approval-ledger-parser'
+import { createApprovalLedgerState, reduceApprovalLedger, type ApprovalLedgerState } from './approval-ledger-view'
 import { createCognitiveAgendaState, reduceCognitiveAgenda, type TimelineCognitiveAgendaState } from './timeline-cognitive-agenda'
 import { isPlanLedgerEventType, parsePlanLedgerEvent } from './plan-ledger-parser'
 import { createPlanLedgerState, reducePlanLedger, type PlanLedgerState } from './plan-ledger-view'
@@ -67,6 +69,7 @@ export interface TimelineState {
   lifecycleRevision: number
   cognitiveAgenda: TimelineCognitiveAgendaState
   planLedger: PlanLedgerState
+  approvalLedger: ApprovalLedgerState
   steeringMarkers: TimelineSteeringMarkerState
   steeringMarkerEvents: readonly TimelineSteeringMarkerEvent[]
   connection: TimelineConnection
@@ -108,7 +111,7 @@ export function createTimelineState(sessionId: string): TimelineState {
     sessionId, events: [], byId: new Map(), byTurnId: new Map(), byToolCallId: new Map(), lastEventId: null,
     transientItems: new Map(), fallbackItems: [],
     itemIds: [], itemsById: {}, itemIdsByTurnId: {}, itemIdsByTaskId: {},
-    processedEventIds: {}, lastSequence: null, sessionControl: createTimelineSessionControlState(), lifecycleRevision: 0, cognitiveAgenda: createCognitiveAgendaState(sessionId), planLedger: createPlanLedgerState(sessionId), steeringMarkers: emptyTimelineSteeringMarkerState(), steeringMarkerEvents: [], connection: 'idle', snapshotRequired: false,
+    processedEventIds: {}, lastSequence: null, sessionControl: createTimelineSessionControlState(), lifecycleRevision: 0, cognitiveAgenda: createCognitiveAgendaState(sessionId), planLedger: createPlanLedgerState(sessionId), approvalLedger: createApprovalLedgerState(sessionId), steeringMarkers: emptyTimelineSteeringMarkerState(), steeringMarkerEvents: [], connection: 'idle', snapshotRequired: false,
   }
 }
 
@@ -181,6 +184,8 @@ function reduceItems(state: TimelineState, values: unknown[], source: TimelineIt
 }
 
 function reduceEvent(state: TimelineState, value: unknown): TimelineState {
+  const approvalCandidate = isRecord(value) && isApprovalLedgerEventType(value.type)
+  if (approvalCandidate) return reduceApprovalEvent(state, value)
   const planCandidate = isRecord(value) && isPlanLedgerEventType(value.type)
   if (planCandidate) return reducePlanEvent(state, value)
   const sessionControl = parseTimelineSessionControl(value, state.sessionId)
@@ -219,6 +224,25 @@ function reduceEvent(state: TimelineState, value: unknown): TimelineState {
   if (!KNOWN_EVENT_TYPES.has(event.type)) next = { ...next, fallbackItems: appendFallbackEvent(next.fallbackItems, event) }
   const item = itemFromTimelineEvent(event, status, existing, undefined, normalizeTimelineItem)
   return item ? upsertItem(next, item, item.source === 'unknown' ? 'unknown' : 'durable') : next
+}
+
+function reduceApprovalEvent(state: TimelineState, value: Record<string, unknown>): TimelineState {
+  const parsed = parseApprovalLedgerEvent(value, state.sessionId)
+  if (!parsed || state.processedEventIds[parsed.id] || !isAfter(parsed.sequence, state.lastSequence)) return state
+  const event = normalizeTimelineEvent(value)
+  if (!event || event.sessionId !== state.sessionId) return state
+  const approvalLedger = reduceApprovalLedger(state.approvalLedger, value)
+  if (approvalLedger === state.approvalLedger) return state
+  const processedEventIds: Record<string, true> = { ...state.processedEventIds, [event.id]: true }
+  return {
+    ...state,
+    processedEventIds,
+    lastSequence: event.sequence && isAfter(event.sequence, state.lastSequence) ? event.sequence : state.lastSequence,
+    ...appendTimelineEvent(state.events, event),
+    lastEventId: event.id,
+    lifecycleRevision: LIFECYCLE_EVENT_TYPES.has(event.type) ? state.lifecycleRevision + 1 : state.lifecycleRevision,
+    approvalLedger,
+  }
 }
 
 function reducePlanEvent(state: TimelineState, value: Record<string, unknown>): TimelineState {

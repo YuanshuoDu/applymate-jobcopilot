@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { createTimelineState, timelineReducer } from './timeline-reducer'
 import { timelineItemsForSession, type AgentTimelineSnapshot } from './use-agent-timeline'
 import { createPlanLedgerState, selectPlanLedgerProjection } from './plan-ledger-view'
+import { createApprovalLedgerState, selectApprovalLedgerProjection } from './approval-ledger-view'
 
 describe('timeline session projection', () => {
   it('discards state from a previous session before rendering a switch', () => {
@@ -55,6 +56,7 @@ describe('timeline session projection', () => {
       controlGate: 'open', controlRevision: 0, pausedAt: null,
       cognitiveAgenda: state.cognitiveAgenda.latest, cognitiveAgendas: state.cognitiveAgenda.scoped,
       planLedger: selectPlanLedgerProjection(createPlanLedgerState('session-a')),
+      approvalLedger: selectApprovalLedgerProjection(createApprovalLedgerState('session-a')),
       connection: 'idle', restoring: false, error: null,
     }
 

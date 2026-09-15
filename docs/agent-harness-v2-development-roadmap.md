@@ -2054,3 +2054,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Root reran the route and stream suites at **21/21**, the full V2 suite at **112/112 across 27 files**, Web `tsc --noEmit --skipLibCheck`, and `git diff --check`. Coverage includes bounded query shape, ascending output, raw/sanitized strict parsing, redaction, malformed rejection, first-page-only hydration, stable tie ordering, and legacy response compatibility.
 
 **Candidate boundary:** No live PostgreSQL/RLS query, production SSE reconnect/overflow, process restart, Worker/Redis delivery, provider/browser behavior, deployment, or complete end-to-end session evidence was added. The cognitive loop and production feature flags remain disabled; this candidate does not establish complete Harness, P4/Phase completion, or production acceptance.
+
+## 84. P7-5 — V2 approval ledger read-only projection
+
+**Candidate status/date (2026-09-15):** P7-5 is recorded as a candidate read-only approval visibility slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Web V2 now strictly parses the existing approval lifecycle events and folds them into a bounded approvalId-keyed ledger. Legacy audit receipts map `approval.resolved` to an explicit `resolved` state because they do not carry a decision; broker approved/rejected receipts preserve their decision, and the existing system interrupt receipt maps to `cancelled`. The React projection contains only safe action, status, revision, and pending-count fields. The authenticated first-page timeline exposes only bounded, raw-before-redaction, twice-validated `approvalEvents`, and the existing stream client merges them through the canonical reducer. No approve/decline write path, Worker/runtime behavior, schema, queue, or feature flag changed.
+
+**Runtime boundary:** `approval.expired` is accepted as a strict protocol shape for forward compatibility, but the current Web/Worker approval paths have no observed expired-event emitter. No synthetic expiration event is produced.
+
+**Candidate boundary:** Focused parser/view/card/reducer/route/stream validation covers strict envelopes, redaction, lineage and transition rejection, cancellation, hydration ordering, and legacy response compatibility. Live PostgreSQL/RLS, production SSE reconnect/overflow, process restart, Worker/Redis delivery, provider/browser behavior, deployment, and complete end-to-end approval evidence remain unverified. This candidate does not establish complete Harness, P4/Phase completion, or production acceptance.

@@ -155,6 +155,45 @@ describe('timeline reducer', () => {
     expect(timelineReducer(state, { type: 'event', event: { ...command, id: 'duplicate', sequence: '13' } })).toBe(state)
   })
 
+  it('folds approval facts as lifecycle events without exposing receipt payloads', () => {
+    const requested = {
+      schemaVersion: 'agent-harness.v2', id: 'approval-requested', sessionId: 'session-1', turnId: 'turn-1', itemId: null, taskId: null,
+      type: 'approval.requested', actor: 'orchestrator', sequence: '14', payload: { approvalId: 'approval-1', action: 'submit_application', scopeHash: `sha256:${'a'.repeat(64)}`, revision: 2 },
+    }
+    const resolved = {
+      schemaVersion: 'agent-harness.v2', id: 'approval-resolved', sessionId: 'session-1', turnId: 'turn-1', itemId: null, taskId: null,
+      type: 'approval.resolved', actor: 'user', sequence: '15', payload: { approvalId: 'approval-1', action: 'submit_application', scopeHash: `sha256:${'a'.repeat(64)}`, revision: 2 },
+    }
+    let state = timelineReducer(createTimelineState('session-1'), { type: 'event', event: requested })
+    state = timelineReducer(state, { type: 'event', event: resolved })
+
+    expect(state.approvalLedger.projection.approvals).toEqual([{ status: 'resolved', action: 'submit_application', revision: 2 }])
+    expect(state.lifecycleRevision).toBe(2)
+    expect(state.itemIds).toEqual([])
+    expect(JSON.stringify(state.approvalLedger)).not.toContain('scopeHash')
+    expect(timelineReducer(state, { type: 'event', event: { ...requested, id: 'approval-duplicate', sequence: '16' } })).toBe(state)
+    expect(timelineReducer(state, { type: 'event', event: { ...requested, id: 'approval-malformed', sequence: '17', payload: { ...requested.payload, body: 'raw secret' } } })).toBe(state)
+  })
+
+  it('keeps interrupt cancellation as a distinct approval lifecycle status', () => {
+    const requested = {
+      schemaVersion: 'agent-harness.v2', id: 'cancel-requested', sessionId: 'session-1', turnId: 'turn-1', itemId: null, taskId: null,
+      type: 'approval.requested', actor: 'orchestrator', sequence: '18', payload: { approvalId: 'approval-cancelled', action: 'submit_application', scopeHash: `sha256:${'b'.repeat(64)}`, revision: 3 },
+    }
+    const cancelled = {
+      schemaVersion: 'agent-harness.v2', id: 'cancel-resolved', sessionId: 'session-1', turnId: 'turn-1', itemId: 'wait-item-cancelled', taskId: null,
+      type: 'approval.resolved', actor: 'system', sequence: '19', payload: {
+        waitKind: 'approval', waitId: 'approval-cancelled', itemId: 'wait-item-cancelled', turnId: 'turn-1', toolCallId: 'call-cancelled', outcome: 'cancelled', reason: 'interrupt',
+      },
+    }
+    let state = timelineReducer(createTimelineState('session-1'), { type: 'event', event: requested })
+    state = timelineReducer(state, { type: 'event', event: cancelled })
+
+    expect(state.approvalLedger.projection.approvals).toEqual([{ status: 'cancelled', action: 'submit_application', revision: 3 }])
+    expect(state.lifecycleRevision).toBe(2)
+    expect(state.itemIds).toEqual([])
+  })
+
   it('keeps canonical root and child agenda projections isolated', () => {
     const childReceipt = { ...agendaReceipt, taskId: 'task-child', nextAction: 'await_children' }
     let state = timelineReducer(createTimelineState('session-1'), {

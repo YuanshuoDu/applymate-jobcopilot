@@ -105,6 +105,22 @@ function planCommandEvent(sequence = '6') {
   }
 }
 
+function approvalRequestedEvent(sequence = '3') {
+  return {
+    schemaVersion: 'agent-harness.v2', id: `approval-requested-${sequence}`, sessionId: 'session-1', turnId: 'turn-1', itemId: null, taskId: null,
+    type: 'approval.requested', actor: 'orchestrator', sequence,
+    payload: { approvalId: 'wait-1', action: 'submit_application', scopeHash: `sha256:${'a'.repeat(64)}`, revision: 2 },
+  }
+}
+
+function approvalResolvedEvent(sequence = '4') {
+  return {
+    schemaVersion: 'agent-harness.v2', id: `approval-resolved-${sequence}`, sessionId: 'session-1', turnId: 'turn-1', itemId: 'wait-item-1', taskId: null,
+    type: 'approval.resolved', actor: 'user', sequence,
+    payload: { waitKind: 'approval', waitId: 'wait-1', itemId: 'wait-item-1', turnId: 'turn-1', toolCallId: 'call-1', status: 'approved', nextTurnRevision: 3, answerAvailable: false },
+  }
+}
+
 describe('V2 timeline stream client', () => {
   it('hydrates every timeline page before attaching the stream', async () => {
     const dispatch = vi.fn()
@@ -166,6 +182,22 @@ describe('V2 timeline stream client', () => {
     expect(state.planLedger.currentPlan).toMatchObject({ planRevision: 1, steps: [{ localId: 'step-1', actionKind: 'tool_call', status: 'completed' }] })
     expect(state.events.some(event => event.id === 'plan-command-8')).toBe(false)
     expect(fetcher).toHaveBeenCalledTimes(2)
+  })
+
+  it('hydrates approval facts from the first page and ignores approval events on later pages', async () => {
+    let state: TimelineState = createTimelineState('session-1')
+    const dispatch = (action: TimelineAction) => { state = timelineReducer(state, action) }
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(JSON.stringify({
+      items: [], page: { hasMore: true, nextCursor: 'next' }, approvalEvents: [approvalResolvedEvent(), approvalRequestedEvent()],
+    }))).mockResolvedValueOnce(new Response(JSON.stringify({
+      items: [], page: { hasMore: false, nextCursor: null }, approvalEvents: [approvalRequestedEvent('8')],
+    })))
+
+    await hydrateTimeline({ sessionId: 'session-1', dispatch, fetcher })
+
+    expect(state.events.map(event => event.id)).toEqual(['approval-requested-3', 'approval-resolved-4'])
+    expect(state.approvalLedger.projection.approvals[0]?.status).toBe('approved')
+    expect(state.events.some(event => event.id === 'approval-requested-8')).toBe(false)
   })
 
   it('uses event id as the stable tie-breaker for first-page tail events', async () => {

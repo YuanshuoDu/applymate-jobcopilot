@@ -87,6 +87,25 @@ function planRow(sequence: bigint, type: "plan.revision" | "plan.command" | "pla
   }
 }
 
+function approvalAuditPayload(overrides: Record<string, unknown> = {}) {
+  return { approvalId: "approval-1", action: "submit_application", scopeHash: `sha256:${"a".repeat(64)}`, revision: 2, ...overrides }
+}
+
+function approvalRow(sequence: bigint, type: "approval.requested" | "approval.resolved" | "approval.consumed" | "approval.expired", payload: unknown, overrides: Record<string, unknown> = {}) {
+  return {
+    id: `approval_${sequence}`, sessionId: "session_1", turnId: "turn_1", itemId: null, taskId: null, sequence,
+    type, actor: type === "approval.requested" ? "orchestrator" : type === "approval.resolved" ? "user" : "system",
+    correlationId: "approval-1", causationId: null, idempotencyKey: null, payload, ...overrides,
+  }
+}
+
+function brokerApprovalRow(sequence: bigint, status: "approved" | "rejected" = "approved") {
+  return approvalRow(sequence, "approval.resolved", {
+    waitKind: "approval", waitId: "approval-1", itemId: "wait-item-1", turnId: "turn_1", toolCallId: "tool-call-1",
+    status, nextTurnRevision: 4, answerAvailable: false,
+  }, { itemId: "wait-item-1" })
+}
+
 describe("agent timeline query API", () => {
   beforeEach(() => {
     vi.resetModules()
@@ -205,6 +224,42 @@ describe("agent timeline query API", () => {
     const body = await response.json()
 
     expect(body.planEvents.map((event: { id: string }) => event.id)).toEqual(["plan_1"])
+  })
+
+  it("restores legal approval facts in sequence order without returning receipt material", async () => {
+    mocks.agendaFindMany.mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([
+      brokerApprovalRow(BigInt(3)), approvalRow(BigInt(1), "approval.requested", approvalAuditPayload()),
+    ])
+    const { GET } = await import("./route")
+
+    const response = await GET(request() as never, params)
+    const body = await response.json()
+
+    expect(body.approvalEvents.map((event: { id: string }) => event.id)).toEqual(["approval_1", "approval_3"])
+    expect(body.approvalEvents[0].payload).toEqual({ approvalId: "approval-1", action: "submit_application", revision: 2 })
+    expect(JSON.stringify(body.approvalEvents)).not.toContain("scopeHash")
+    expect(mocks.agendaFindMany).toHaveBeenNthCalledWith(4, {
+      where: { sessionId: "session_1", type: { in: ["approval.requested", "approval.resolved", "approval.consumed", "approval.expired"] } },
+      orderBy: { sequence: "desc" }, take: 256, select: expect.objectContaining({ payload: true, sequence: true }),
+    })
+  })
+
+  it("filters foreign, wrong-actor, wrong-item, and malformed approval facts", async () => {
+    mocks.agendaFindMany.mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([
+      approvalRow(BigInt(1), "approval.requested", approvalAuditPayload()),
+      approvalRow(BigInt(2), "approval.requested", approvalAuditPayload(), { sessionId: "session-2" }),
+      approvalRow(BigInt(3), "approval.requested", approvalAuditPayload(), { actor: "user" }),
+      approvalRow(BigInt(4), "approval.requested", approvalAuditPayload(), { itemId: "item-1" }),
+      approvalRow(BigInt(5), "approval.requested", approvalAuditPayload({ approvalId: "", scopeHash: "bad" })),
+      approvalRow(BigInt(6), "approval.requested", { ...approvalAuditPayload(), body: "raw secret" }),
+    ])
+    const { GET } = await import("./route")
+
+    const response = await GET(request() as never, params)
+    const body = await response.json()
+
+    expect(body.approvalEvents.map((event: { id: string }) => event.id)).toEqual(["approval_1"])
+    expect(JSON.stringify(body.approvalEvents)).not.toContain("raw secret")
   })
 
   it("restores only a legal bounded marker pair after the authenticated session check", async () => {
