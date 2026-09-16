@@ -2154,3 +2154,15 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused Worker validation passed **165 tests across 6 files** (plan scheduler, plan executor, canonical plan execution, canonical turn state, budget helpers, and turn execution loop). Coverage includes parallel batch fail-closed admission, serial admission, receipt replay and partial replay charging, stable budget errors, command/observation deduplication, foreign/invalid receipt exclusion, and resumed budget boundaries. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 
 **Candidate boundary:** No live PostgreSQL/RLS, Redis/BullMQ delivery, process restart, provider/model call, browser behavior, deployment, or complete end-to-end evidence was added. This slice does not verify live DB/RLS, Redis, restart recovery, provider behavior, browser behavior, or full E2E acceptance.
+
+## 93. P8-4 — Durable canonical cancel to child-tree interruption
+
+**Candidate status/date (2026-09-16):** P8-4 is recorded as a candidate cancellation-closure slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Durable Web bridge:** The existing Web `interruptActiveTurn` transaction now updates the active Turn and its `sub_agent_tasks` in one transaction, scoped by the authenticated `userId`, `sessionId`, and `turnId`. `interruptRequestedAt` is set with `COALESCE`, queued/retrying/waiting/waiting-for-user rows become `interrupted`, and their retry/completion fields are cleared. Running rows retain their lease owner, lease expiry, status, and fencing fields so the existing child heartbeat/finish and recovery paths remain authoritative. Terminal rows and foreign session/user/Turn rows are excluded.
+
+**Worker seam:** `TurnCancelService.stop` accepts an optional server-owned turn-scope child interrupt port. The port runs only after durable persistence and root abort; it is invoked on duplicate requests as an idempotent reconciliation attempt. Bridge errors are swallowed so the existing persisted stop, root signal, external evidence reconciliation, and terminal event behavior remain unchanged; the durable marker remains the recovery source of truth. No new Web endpoint or Worker production wiring was introduced.
+
+**Independent verification:** Focused Web validation passed **46 tests across 2 command files** and Worker validation passed **4 interrupt-service tests**. The shared package build, Worker/Web TypeScript checks, and `git diff --check` are the bounded checks for this slice. No schema, migration, UI, provider, queue, or lease/fencing change was made.
+
+**Candidate boundary:** No live PostgreSQL/RLS, Redis/BullMQ, concurrent cancellation race, process restart, provider/model/browser behavior, deployment, or complete Web-to-Worker end-to-end cancel evidence was run. The optional Worker bridge remains an injection seam until a server-owned caller supplies it.

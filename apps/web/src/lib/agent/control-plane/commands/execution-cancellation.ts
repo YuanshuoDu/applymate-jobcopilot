@@ -1,4 +1,5 @@
 import type { InputContentPart } from "@jobcopilot/agent-protocol"
+import { Prisma } from "@prisma/client"
 
 import { cancelPendingWaitsInTransaction } from "../../broker/interrupt"
 import { activeTurnChanged, executionChanged, sessionNotFound } from "./errors"
@@ -20,16 +21,65 @@ function executionInterruptMessageId(executionId: string, turnId: string): strin
   return `agent-execution-cancel:${executionId}:${turnId}`
 }
 
+/**
+ * Mark the active task tree for the exact cancelled Turn. Running children
+ * keep their leases and fencing fields; their heartbeat/finish path observes
+ * the durable marker and converges them to interrupted.
+ */
+async function interruptActiveSubagentTree(
+  tx: CommandTransaction,
+  scope: { userId: string; sessionId: string; turnId: string; requestedAt: Date },
+): Promise<number> {
+  return tx.$executeRaw(Prisma.sql`
+    UPDATE "sub_agent_tasks" AS task
+    SET "interruptRequestedAt" = COALESCE(task."interruptRequestedAt", ${scope.requestedAt}),
+        "status" = CASE
+          WHEN task."status" IN ('queued', 'retrying', 'waiting', 'waiting_for_user') THEN 'interrupted'
+          ELSE task."status"
+        END,
+        "nextAttemptAt" = CASE
+          WHEN task."status" IN ('queued', 'retrying', 'waiting', 'waiting_for_user') THEN NULL
+          ELSE task."nextAttemptAt"
+        END,
+        "completedAt" = CASE
+          WHEN task."status" IN ('queued', 'retrying', 'waiting', 'waiting_for_user') THEN ${scope.requestedAt}
+          ELSE task."completedAt"
+        END,
+        "updatedAt" = ${scope.requestedAt}
+    WHERE task."sessionId" = ${scope.sessionId}
+      AND task."turnId" = ${scope.turnId}
+      AND task."status" IN ('queued', 'running', 'retrying', 'waiting', 'waiting_for_user')
+      AND EXISTS (
+        SELECT 1 FROM "agent_sessions" AS session
+        WHERE session."id" = task."sessionId" AND session."userId" = ${scope.userId}
+      )
+      AND EXISTS (
+        SELECT 1 FROM "agent_turns" AS turn
+        WHERE turn."id" = task."turnId"
+          AND turn."sessionId" = task."sessionId"
+          AND turn."userId" = ${scope.userId}
+      )
+  `)
+}
+
 export async function interruptActiveTurn(
   tx: CommandTransaction,
   command: InterruptCommand,
   active: ActiveTurn,
 ): Promise<InterruptResult> {
+  const requestedAt = new Date()
   const interrupted = await tx.agentTurn.updateMany({
     where: { id: active.id, sessionId: command.sessionId, userId: command.userId, status: { in: ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] }, revision: active.revision },
-    data: { status: "interrupted", revision: { increment: 1 }, completedAt: new Date() },
+    data: { status: "interrupted", revision: { increment: 1 }, completedAt: requestedAt },
   })
   if (interrupted.count !== 1) throw activeTurnChanged(command.expectedTurnId, active.id)
+
+  await interruptActiveSubagentTree(tx, {
+    userId: command.userId,
+    sessionId: command.sessionId,
+    turnId: active.id,
+    requestedAt,
+  })
 
   await cancelPendingWaitsInTransaction(tx, {
     sessionId: command.sessionId,

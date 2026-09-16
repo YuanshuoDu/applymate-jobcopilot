@@ -63,6 +63,7 @@ function makeDb(options: {
       sequence += BigInt(1)
       return [{ eventSequence: sequence }]
     }),
+    $executeRaw: vi.fn(async () => 0),
     agentSession: {
       findFirst: vi.fn(async () => (options.sessionSource ? { source: options.sessionSource } : null)),
       updateMany: vi.fn(async (args: unknown) => {

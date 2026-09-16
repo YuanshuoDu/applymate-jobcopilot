@@ -8,6 +8,17 @@ type State = {
   sessionSource: string | null
   sessionStatus: string
   active: { id: string; source: string; status: string; revision: number } | null
+  tasks: Array<{
+    userId: string
+    sessionId: string
+    turnId: string
+    status: string
+    interruptRequestedAt: Date | null
+    nextAttemptAt: Date | null
+    completedAt: Date | null
+    leaseOwner: string | null
+    leaseExpiresAt: Date | null
+  }>
   inputs: Array<Record<string, unknown>>
   events: Array<Record<string, unknown>>
 }
@@ -22,6 +33,7 @@ function makeTransaction(options: {
   activeSource?: string
   activeTurnId?: string
   userId?: string
+  childTasks?: State["tasks"]
 }) {
   const state: State = {
     execution: {
@@ -35,6 +47,7 @@ function makeTransaction(options: {
     active: options.activeSource
       ? { id: options.activeTurnId ?? "turn_1", source: options.activeSource, status: "in_progress", revision: 0 }
       : null,
+    tasks: options.childTasks ?? [],
     inputs: [],
     events: [],
   }
@@ -45,6 +58,26 @@ function makeTransaction(options: {
       if (strings.join(" ").includes("SELECT")) return [{ id: "session_1" }]
       sequence += BigInt(1)
       return [{ eventSequence: sequence }]
+    }),
+    $executeRaw: vi.fn(async (query: unknown) => {
+      const values = (query as { values?: readonly unknown[] }).values ?? []
+      const requestedAt = values[0] instanceof Date ? values[0] : new Date(String(values[0]))
+      const sessionId = String(values[3])
+      const turnId = String(values[4])
+      const userId = String(values[5])
+      let count = 0
+      for (const task of state.tasks) {
+        if (task.userId !== userId || task.sessionId !== sessionId || task.turnId !== turnId
+          || !["queued", "running", "retrying", "waiting", "waiting_for_user"].includes(task.status)) continue
+        count += 1
+        task.interruptRequestedAt ??= requestedAt
+        if (["queued", "retrying", "waiting", "waiting_for_user"].includes(task.status)) {
+          task.status = "interrupted"
+          task.nextAttemptAt = null
+          task.completedAt = requestedAt
+        }
+      }
+      return count
     }),
     agentExecution: {
       findFirst: vi.fn(async (args: unknown) => {
@@ -156,6 +189,36 @@ describe("execution cancellation transaction", () => {
       "agent-execution-cancel:execution_1:turn_1",
       "agent-execution-cancel:execution_1:turn_2",
     ])
+  })
+
+  it("interrupts only the exact user/session/Turn task tree and preserves running leases", async () => {
+    const runningLeaseExpiresAt = new Date("2026-09-16T12:05:00.000Z")
+    const runningNextAttemptAt = new Date("2026-09-16T12:01:00.000Z")
+    const childTasks: State["tasks"] = [
+      { userId: "user_1", sessionId: "session_1", turnId: "turn_1", status: "running", interruptRequestedAt: null, nextAttemptAt: runningNextAttemptAt, completedAt: null, leaseOwner: "child-owner", leaseExpiresAt: runningLeaseExpiresAt },
+      { userId: "user_1", sessionId: "session_1", turnId: "turn_1", status: "queued", interruptRequestedAt: null, nextAttemptAt: runningNextAttemptAt, completedAt: null, leaseOwner: null, leaseExpiresAt: null },
+      { userId: "user_1", sessionId: "session_1", turnId: "turn_2", status: "queued", interruptRequestedAt: null, nextAttemptAt: runningNextAttemptAt, completedAt: null, leaseOwner: null, leaseExpiresAt: null },
+      { userId: "user_1", sessionId: "session_2", turnId: "turn_1", status: "queued", interruptRequestedAt: null, nextAttemptAt: runningNextAttemptAt, completedAt: null, leaseOwner: null, leaseExpiresAt: null },
+      { userId: "user_2", sessionId: "session_1", turnId: "turn_1", status: "queued", interruptRequestedAt: null, nextAttemptAt: runningNextAttemptAt, completedAt: null, leaseOwner: null, leaseExpiresAt: null },
+      { userId: "user_1", sessionId: "session_1", turnId: "turn_1", status: "completed", interruptRequestedAt: null, nextAttemptAt: null, completedAt: runningNextAttemptAt, leaseOwner: null, leaseExpiresAt: null },
+    ]
+    const fake = makeTransaction({ executionStatus: "running", sessionSource: "automation", activeSource: "automation", childTasks })
+
+    await expect(cancelExecutionInTransaction(fake.tx, { executionId: "execution_1", userId: "user_1" })).resolves.toBe(true)
+
+    expect(childTasks[0]).toMatchObject({ status: "running", nextAttemptAt: runningNextAttemptAt, completedAt: null, leaseOwner: "child-owner", leaseExpiresAt: runningLeaseExpiresAt })
+    expect(childTasks[0]?.interruptRequestedAt).toBeInstanceOf(Date)
+    expect(childTasks[1]).toMatchObject({ status: "interrupted", nextAttemptAt: null, completedAt: expect.any(Date) })
+    expect(childTasks.slice(2).every((task) => task.interruptRequestedAt === null)).toBe(true)
+
+    const query = (fake.tx.$executeRaw as unknown as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as { strings?: readonly string[] }
+    const sql = query.strings?.join(" ") ?? ""
+    expect(sql).toContain('task."sessionId" =')
+    expect(sql).toContain('task."turnId" =')
+    expect(sql).toContain('session."userId" =')
+    expect(sql).toContain('turn."userId" =')
+    expect(sql).toContain('COALESCE(task."interruptRequestedAt"')
+    expect(sql).toContain("'running'")
   })
 
   it("repairs a previously cancelled execution once without duplicating its interrupt", async () => {
