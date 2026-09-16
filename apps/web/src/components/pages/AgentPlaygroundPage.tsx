@@ -63,6 +63,13 @@ export function AgentPlaygroundPage() {
     (activeRunPolicy ?? agentConfig)?.autoApply && !(activeRunPolicy ?? agentConfig)?.requireApproval,
   )
 
+  useEffect(() => {
+    if (!selectedSessionId || timeline.lifecycleRevision === 0) return
+    // The canonical timeline is the live source for Turn lifecycle changes.
+    // Refresh the command projection so Stop and steer controls do not lag it.
+    refetchTurnState()
+  }, [refetchTurnState, selectedSessionId, timeline.lifecycleRevision])
+
   const addLog = useCallback((entry: LogEntry) => { setRunLog(prev => [...prev, entry]) }, [])
 
   useEffect(() => {
@@ -346,7 +353,7 @@ export function AgentPlaygroundPage() {
     window.dispatchEvent(new Event('applymate:sessions-changed'))
   }, [addLog, sessionId])
 
-  const isRunning = !!currentRole || (runLog.length > 0 && !runDone)
+  const isRunning = Boolean(activeTurn) || !!currentRole || (runLog.length > 0 && !runDone)
   const visibleWaitingQuestion = waitingQuestion && runLog.some(entry =>
     entry.type === 'orchestrator_question'
       && entry.questionId === waitingQuestion.id

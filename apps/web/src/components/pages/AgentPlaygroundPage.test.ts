@@ -51,6 +51,12 @@ describe('Agent workspace responsive layout', () => {
     expect(source).not.toContain('liveSessionId')
   })
 
+  it('keeps canonical active Turn controls and running status in sync with lifecycle events', () => {
+    expect(source).toMatch(/if \(!selectedSessionId \|\| timeline\.lifecycleRevision === 0\) return/)
+    expect(source).toMatch(/refetchTurnState\(\)\n\s*\}, \[refetchTurnState, selectedSessionId, timeline\.lifecycleRevision\]\)/)
+    expect(source).toContain('const isRunning = Boolean(activeTurn) ||')
+  })
+
   it('keeps one execution stream and delegates session rendering to the V2 timeline client', () => {
     const retiredChatStreamModule = ['agent', 'chat', 'stream'].join('-')
     expect(source.match(/new EventSource\(/g) ?? []).toHaveLength(1)
