@@ -2252,3 +2252,15 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Luna's full focused set passed **67/67 tests across 6 files**: timeline reducer 22, stream client 20, question hydration 3, question input card 4, approval ledger card 6, and Agent Playground page 12. Web `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Root independently reran the direct question-hydration and stream-client suites at **23/23**, with Web TypeScript and diff checks passing.
 
 **Candidate boundary:** No real SSE reconnect/replay, browser, database/RLS, Worker/Redis delivery, process restart, provider/model call, deployment, or complete Workbench-to-canonical end-to-end evidence was run. This candidate records the long-session page-boundary repair only; overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## 102. P8-15 — Goal-scoped replayed plan receipts
+
+**Candidate status/date (2026-09-16):** P8-15 is recorded as a candidate Worker resume/replay consistency slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Problem and implementation:** Reviewed and pushed commit `29089f52` closes the case where canonical restore could replay persisted `plan.command` and `plan.observation` receipts from an older goal into the current goal snapshot. Restore now derives the current goal revision and the `planCallId` set from current-goal `plan.revision` observations. After a goal transition, only plan observations and parsed command receipts whose `payload.planCallId` or receipt `planCallId` belongs to that set are restored; stale plan command/control entries already present in the snapshot are filtered from the current scope. Goal and plan revision observations remain revision-scoped.
+
+**Compatibility boundary:** Historical `plan.observation` rows without `payload.planCallId` cannot be proven to belong to the current plan after a goal transition and are therefore filtered when the current goal revision is greater than one. When the current goal revision is one, the plan-ID filter remains unset so legacy histories without that field remain readable.
+
+**Independent verification:** Focused Worker validation passed **67/67 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No schema, migration, Web, provider, browser, dependency, or queue contract changed.
+
+**Candidate boundary:** No live PostgreSQL/RLS, Redis/BullMQ delivery, process restart/replay, provider/model call, browser, deployment, or complete production Workbench-to-Worker evidence was run. This remains a candidate consistency repair; formal acceptance remains **P0 accepted 1/8 (12.5%)**.
