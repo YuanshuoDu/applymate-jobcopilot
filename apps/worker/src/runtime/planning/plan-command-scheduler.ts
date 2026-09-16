@@ -3,6 +3,7 @@ import type { PlanDispatchCommand } from "./plan-intent-dispatcher.js"
 
 type ExecutableCommand = Extract<PlanDispatchCommand, { kind: "tool_call" | "delegate" | "join" }>
 type ControlCommand = Extract<PlanDispatchCommand, { kind: "request_input" | "propose_completion" }>
+const MAX_PARALLEL_DELEGATE_LIMIT = 4
 
 export type PlanCommandExecutionStep = {
   readonly record: PlanCommandExecutionRecord
@@ -40,9 +41,12 @@ function failed(completed: readonly PlanCommandExecutionRecord[], step: PlanComm
 }
 
 async function executeSerial(commands: readonly PlanDispatchCommand[], runtime: PlanCommandSchedulerRuntime): Promise<PlanCommandExecutionResult> {
+  validateGraph(commands, runtime)
   const completed: PlanCommandExecutionRecord[] = []
   const outputs = runtime.outputs
+  const completedIds = new Set<string>()
   for (const command of commands) {
+    if (!command.dependsOn.every(dependency => completedIds.has(dependency))) runtime.invalidPlan("Plan dependency graph is invalid")
     if (isControl(command)) {
       await runtime.observe(command)
       return { status: "blocked", completed, blocked: command }
@@ -59,6 +63,7 @@ async function executeSerial(commands: readonly PlanDispatchCommand[], runtime: 
       await runtime.observe(step.blocked)
       return { status: "blocked", completed, blocked: step.blocked }
     }
+    completedIds.add(command.localId)
   }
   return { status: "completed", completed }
 }
@@ -74,6 +79,21 @@ function validateGraph(commands: readonly PlanDispatchCommand[], runtime: PlanCo
   const ids = new Set<string>()
   for (const command of commands) if (ids.has(command.localId)) runtime.invalidPlan("Plan local IDs must be unique"); else ids.add(command.localId)
   for (const command of commands) for (const dependency of command.dependsOn) if (!ids.has(dependency)) runtime.invalidPlan("Plan dependency graph is invalid")
+  const indegree = new Map(commands.map(command => [command.localId, command.dependsOn.length]))
+  const dependents = new Map<string, string[]>()
+  for (const command of commands) for (const dependency of command.dependsOn) dependents.set(dependency, [...(dependents.get(dependency) ?? []), command.localId])
+  const readyIds = commands.filter(command => indegree.get(command.localId) === 0).map(command => command.localId)
+  let visited = 0
+  for (let index = 0; index < readyIds.length; index++) {
+    const localId = readyIds[index]!
+    visited++
+    for (const dependent of dependents.get(localId) ?? []) {
+      const next = (indegree.get(dependent) ?? 0) - 1
+      indegree.set(dependent, next)
+      if (next === 0) readyIds.push(dependent)
+    }
+  }
+  if (visited !== commands.length) runtime.invalidPlan("Plan dependency graph is invalid")
 }
 
 async function observeSettled(
@@ -104,6 +124,8 @@ async function executeBatch(batch: readonly ReadyCommand[], runtime: PlanCommand
   if (observed.hasObserverError) throw observed.observerError
   if (observed.hasExecutionError) throw observed.executionError
   const firstTerminal = observed.steps.findIndex(step => step.record.result.status !== "completed" || step.waiting || step.blocked)
+  const terminal = firstTerminal >= 0 ? observed.steps[firstTerminal]! : undefined
+  const terminalWaits = terminal !== undefined && terminal.record.result.status === "completed" && (terminal.waiting || terminal.blocked)
   const terminalIndex = firstTerminal < 0 ? observed.steps.length : firstTerminal
   for (let index = 0; index < terminalIndex; index++) {
     const step = observed.steps[index]!
@@ -113,14 +135,28 @@ async function executeBatch(batch: readonly ReadyCommand[], runtime: PlanCommand
     if (entry) { done.add(entry.index); completedIds.add(entry.command.localId) }
   }
   if (firstTerminal >= 0) {
-    const terminal = observed.steps[firstTerminal]!
+    if (!terminal) return undefined
+    if (terminalWaits) {
+      if (terminal.record.result.status === "completed") {
+        runtime.storeOutput(terminal.record)
+        if (terminal.blocked) completed.push(terminal.record)
+      }
+      for (let index = firstTerminal + 1; index < observed.steps.length; index++) {
+        const step = observed.steps[index]!
+        if (step.record.result.status !== "completed" || step.waiting || step.blocked) continue
+        runtime.storeOutput(step.record)
+        completed.push(step.record)
+        const entry = batch.find(candidate => candidate.command.localId === step.record.localId)
+        if (entry) { done.add(entry.index); completedIds.add(entry.command.localId) }
+      }
+    }
     if (terminal.blocked) {
-      runtime.storeOutput(terminal.record)
-      completed.push(terminal.record)
+      if (terminal.record.result.status !== "completed") return failed(completed, terminal)
       await runtime.observe(terminal.blocked)
       return { status: "blocked", completed, blocked: terminal.blocked }
     }
-    return terminal.record.result.status !== "completed" ? failed(completed, terminal) : { status: "waiting", completed, waiting: terminal.record }
+    if (terminal.record.result.status !== "completed") return failed(completed, terminal)
+    return { status: "waiting", completed, waiting: terminal.record }
   }
   for (const entry of batch) { done.add(entry.index); completedIds.add(entry.command.localId) }
   return undefined
@@ -170,5 +206,7 @@ async function executeParallel(commands: readonly PlanDispatchCommand[], runtime
 }
 
 export async function schedulePlanCommands(commands: readonly PlanDispatchCommand[], runtime: PlanCommandSchedulerRuntime): Promise<PlanCommandExecutionResult> {
+  const limit = runtime.parallelDelegateLimit
+  if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_PARALLEL_DELEGATE_LIMIT)) runtime.invalidPlan("Plan parallel delegate bound is invalid")
   return runtime.parallelDelegateLimit === undefined ? executeSerial(commands, runtime) : executeParallel(commands, runtime)
 }
