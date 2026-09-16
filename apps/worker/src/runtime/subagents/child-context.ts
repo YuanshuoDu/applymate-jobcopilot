@@ -137,21 +137,23 @@ function copyBlock(block: ContextBlock): ContextBlock {
   return { ...block, content: json(block.content) }
 }
 
-const ROLE_GUIDANCE: Readonly<Record<string, string>> = {
-  scout: "Read job data and report evidence only; do not write, submit, send, or manage children.",
-  analyst: "Read permitted job, persona, and resume data and analyze evidence only; do not write, submit, send, or manage children.",
-  writer: "Read permitted resume data and create drafts only; do not perform external writes, submit, send, or manage children.",
-  reviewer: "Read permitted artifacts and evidence and review them only; do not create drafts, submit, send, or manage children.",
-  auditor: "Read permitted records and produce redacted audit evidence only; do not mutate, submit, send, or manage children.",
-  executor: "Read permitted application state and run preflight checks only; do not execute external actions, submit, send, or manage children.",
-}
+const ROLE_GUIDANCE: ReadonlyMap<string, string> = new Map([
+  ["scout", "Read job data and report evidence only; do not write, submit, send, or manage children."],
+  ["analyst", "Read permitted job, persona, and resume data and analyze evidence only; do not write, submit, send, or manage children."],
+  ["writer", "Read permitted resume data and create drafts only; do not perform external writes, submit, send, or manage children."],
+  ["reviewer", "Read permitted artifacts and evidence and review them only; do not create drafts, submit, send, or manage children."],
+  ["auditor", "Read permitted records and produce redacted audit evidence only; do not mutate, submit, send, or manage children."],
+  ["executor", "Read permitted application state and run preflight checks only; do not execute external actions, submit, send, or manage children."],
+])
 
 function roleGuidance(role: string): string {
-  return ROLE_GUIDANCE[role] ?? "No server-owned capability contract exists for this role; do not execute tools."
+  return ROLE_GUIDANCE.get(role) ?? "No server-owned capability contract exists for this role; do not execute tools."
 }
 
 function roleContract(task: SubagentTaskRecord): Record<string, unknown> {
-  const policy = getSubagentRolePolicy(task.role)
+  // Guard before consulting the policy object: its legacy lookup must not
+  // treat prototype names such as "constructor" as known roles.
+  const policy = ROLE_GUIDANCE.has(task.role) ? getSubagentRolePolicy(task.role) : null
   return {
     role: task.role,
     taskType: task.taskType,

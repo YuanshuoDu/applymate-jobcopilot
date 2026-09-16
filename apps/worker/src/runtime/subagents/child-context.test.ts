@@ -63,6 +63,20 @@ describe("child context", () => {
     })
   })
 
+  it.each(["constructor", "toString", "__proto__"])("fails closed for prototype role %s", role => {
+    const profile = childContextSnapshot({ ...task, role, taskType: "prototype.task" }).profile[0]?.content
+    expect(profile).toMatchObject({
+      role,
+      taskType: "prototype.task",
+      roleContract: {
+        capabilities: [],
+        guidance: "No server-owned capability contract exists for this role; do not execute tools.",
+        externalWritesEnabled: false,
+        canManageChildren: false,
+      },
+    })
+  })
+
   it("rejects a context request from another task", async () => {
     await expect(createChildContextBuilder(task).build({ scope: { userId: task.userId }, identity: { ...identity, taskId: "sibling" }, stepId: "step-1", snapshot: childContextSnapshot(task) })).rejects.toThrow("child_context_owner_mismatch")
   })
