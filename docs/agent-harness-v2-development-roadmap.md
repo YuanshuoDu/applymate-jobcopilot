@@ -2176,3 +2176,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** The focused Worker Turn queue suite passed **10/10**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` are the bounded checks for this slice. No schema, migration, UI, provider, model, queue identity, or lease owner/version rule changed.
 
 **Candidate boundary:** No live PostgreSQL/RLS, Redis/BullMQ delivery, heartbeat timing under process failure, Worker restart, concurrent cancellation race, provider/model/browser behavior, deployment, or complete Web-to-Worker Stop evidence was run.
+
+## 95. P8-6 — Web automation canonical session observation
+
+**Candidate status/date (2026-09-16):** P8-6 is recorded as a candidate Web automation canonical session observation slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `687f1183` closes the Web automation run split brain. The existing `POST /api/agent/automations/:id/run` route already resolves the canonical automation session, ensures its canonical Turn, and enqueues one canonical Worker Turn. `AgentPlaygroundPage` now selects and observes the returned session, preserving the captured automation policy, and no longer opens the legacy `/api/agent/run` SSE endpoint. Existing refresh and user-visible error handling remain in the canonical route/list path.
+
+**Independent verification:** The focused Web page test passed **10/10**. The automation route test was attempted, but the local baseline reported two unrelated mock/timeout failures. No live PostgreSQL/RLS, Redis/BullMQ delivery, Worker execution, provider/model call, browser behavior, deployment, or complete end-to-end evidence was added.
+
+**Candidate boundary:** This slice establishes the single canonical session observation path in Web code and focused tests only. It does not establish live enqueue/delivery, database or queue behavior, provider/browser behavior, deployment readiness, or production acceptance; overall acceptance remains **P0 accepted 1/8 (12.5%)**.
