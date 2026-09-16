@@ -15,12 +15,12 @@ describe("coordination tool definitions", () => {
   it("exposes canonical coordination names with shared metadata and manager fencing", () => {
     const definitions = createCoordinationTools(options)
     expect(definitions.map(definition => definition.name)).toEqual([
-      "spawn_subagent", "agent.spawn", "agent.followup", "send_message", "agent.send", "wait_subagents", "agent.wait", "list_subagents", "interrupt_subagent", "agent.interrupt", "close_subagent",
+      "spawn_subagent", "agent.spawn", "agent.followup", "send_message", "agent.send", "wait_subagents", "agent.wait", "list_subagents", "agent.list", "interrupt_subagent", "agent.interrupt", "close_subagent", "agent.close",
     ])
     expect(definitions).toEqual(expect.arrayContaining([
       expect.objectContaining({ domain: "coordination", requiredCapabilities: ["canManageChildren"] }),
     ]))
-    expect(definitions.filter(definition => definition.risk === "internal_write")).toHaveLength(10)
+    expect(definitions.filter(definition => definition.risk === "internal_write")).toHaveLength(11)
     const legacySpawn = definitions.find(definition => definition.name === "spawn_subagent")
     const canonicalSpawn = definitions.find(definition => definition.name === "agent.spawn")
     expect(legacySpawn).toBeDefined()
@@ -89,16 +89,53 @@ describe("coordination tool definitions", () => {
     expect(canonicalInterrupt?.inputSchema).toBe(legacyInterrupt?.inputSchema)
     expect(canonicalInterrupt?.outputSchema).toBe(legacyInterrupt?.outputSchema)
     expect(canonicalInterrupt?.execute).toBe(legacyInterrupt?.execute)
+    const legacyList = definitions.find(definition => definition.name === "list_subagents")
+    const canonicalList = definitions.find(definition => definition.name === "agent.list")
+    expect(legacyList).toBeDefined()
+    expect(canonicalList).toMatchObject({
+      schemaVersion: legacyList?.schemaVersion,
+      version: legacyList?.version,
+      description: legacyList?.description,
+      capabilities: legacyList?.capabilities,
+      risk: legacyList?.risk,
+      domain: legacyList?.domain,
+      idempotency: legacyList?.idempotency,
+      timeoutMs: legacyList?.timeoutMs,
+      requiredCapabilities: legacyList?.requiredCapabilities,
+    })
+    expect(canonicalList?.inputSchema).toBe(legacyList?.inputSchema)
+    expect(canonicalList?.outputSchema).toBe(legacyList?.outputSchema)
+    expect(canonicalList?.execute).toBe(legacyList?.execute)
+    const legacyClose = definitions.find(definition => definition.name === "close_subagent")
+    const canonicalClose = definitions.find(definition => definition.name === "agent.close")
+    expect(legacyClose).toBeDefined()
+    expect(canonicalClose).toMatchObject({
+      schemaVersion: legacyClose?.schemaVersion,
+      version: legacyClose?.version,
+      description: legacyClose?.description,
+      capabilities: legacyClose?.capabilities,
+      risk: legacyClose?.risk,
+      domain: legacyClose?.domain,
+      idempotency: legacyClose?.idempotency,
+      timeoutMs: legacyClose?.timeoutMs,
+      requiredCapabilities: legacyClose?.requiredCapabilities,
+    })
+    expect(canonicalClose?.inputSchema).toBe(legacyClose?.inputSchema)
+    expect(canonicalClose?.outputSchema).toBe(legacyClose?.outputSchema)
+    expect(canonicalClose?.execute).toBe(legacyClose?.execute)
     expect(definitions.find(definition => definition.name === "agent.followup")).toMatchObject({ idempotency: "requires_key", risk: "internal_write", requiredCapabilities: ["canManageChildren"] })
     expect(definitions.find(definition => definition.name === "list_subagents")).toMatchObject({ risk: "read", capabilities: ["read", "coordination"] })
+    expect(definitions.find(definition => definition.name === "agent.list")).toMatchObject({ risk: "read", capabilities: ["read", "coordination"] })
     expect(new ToolRegistry(definitions).list(["canManageChildren"]).map(definition => definition.name)).toEqual([
-      "spawn_subagent", "agent.spawn", "agent.followup", "send_message", "agent.send", "wait_subagents", "agent.wait", "list_subagents", "interrupt_subagent", "agent.interrupt", "close_subagent",
+      "spawn_subagent", "agent.spawn", "agent.followup", "send_message", "agent.send", "wait_subagents", "agent.wait", "list_subagents", "agent.list", "interrupt_subagent", "agent.interrupt", "close_subagent", "agent.close",
     ])
     const registry = new ToolRegistry(definitions)
     expect(registry.resolve("agent.send", "1").execute).toBe(registry.resolve("send_message", "1").execute)
     expect(registry.resolve("agent.spawn", "1").execute).toBe(registry.resolve("spawn_subagent", "1").execute)
     expect(registry.resolve("agent.wait", "1").execute).toBe(registry.resolve("wait_subagents", "1").execute)
     expect(registry.resolve("agent.interrupt", "1").execute).toBe(registry.resolve("interrupt_subagent", "1").execute)
+    expect(registry.resolve("agent.list", "1").execute).toBe(registry.resolve("list_subagents", "1").execute)
+    expect(registry.resolve("agent.close", "1").execute).toBe(registry.resolve("close_subagent", "1").execute)
     expect(new ToolRegistry(definitions).list(["other"])).toHaveLength(0)
   })
 
@@ -119,6 +156,12 @@ describe("coordination tool definitions", () => {
     const validInterrupt = { taskId: "task-1", reason: "Stop this task" }
     expect(registry.validateArguments("interrupt_subagent", validInterrupt)).toBe(true)
     expect(registry.validateArguments("agent.interrupt", validInterrupt)).toBe(true)
+    const validList = {}
+    expect(registry.validateArguments("list_subagents", validList)).toBe(true)
+    expect(registry.validateArguments("agent.list", validList)).toBe(true)
+    const validClose = { taskId: "task-1" }
+    expect(registry.validateArguments("close_subagent", validClose)).toBe(true)
+    expect(registry.validateArguments("agent.close", validClose)).toBe(true)
     for (const key of ["userId", "sessionId", "ownerId", "path", "rootTaskId", "expectedOutputSchema"]) {
       expect(registry.validateArguments("spawn_subagent", { ...valid, [key]: "forged" })).not.toBe(true)
     }
@@ -138,9 +181,11 @@ describe("coordination tool definitions", () => {
       wait_subagents: { taskIds: ["task-1"], mode: "all", timeoutMs: 1000 },
       "agent.wait": { taskIds: ["task-1"], mode: "all", timeoutMs: 1000 },
       list_subagents: { unexpected: true },
+      "agent.list": { unexpected: true },
       interrupt_subagent: {},
       "agent.interrupt": {},
       close_subagent: {},
+      "agent.close": {},
     }
     for (const definition of definitions) {
       expect(() => validator.validate(definition.inputSchema, invalidInputs[definition.name], `${definition.name} input`)).toThrow(/schema validation/)

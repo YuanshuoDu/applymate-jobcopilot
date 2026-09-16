@@ -125,6 +125,8 @@ export function createCoordinationTools(options: CoordinationExecutorOptions): R
   const sendMessageExecutor: RuntimeToolDefinition["execute"] = (context, input) => executeSendMessage(context, input as SendMessageInput, options)
   const waitExecutor: RuntimeToolDefinition["execute"] = (context, input) => executeWaitSubagents(context, input as WaitSubagentsInput, options)
   const interruptExecutor: RuntimeToolDefinition["execute"] = (context, input) => executeInterruptSubagent(context, input as InterruptSubagentInput, options)
+  const listExecutor: RuntimeToolDefinition["execute"] = (context, input) => executeListSubagents(context, input as ListSubagentsInput, options)
+  const closeExecutor: RuntimeToolDefinition["execute"] = (context, input) => executeCloseSubagent(context, input as CloseSubagentInput, options)
   return [
     {
       ...metadata("spawn_subagent", "Create one permission-scoped child task and durably enqueue it", "internal_write", "requires_key"),
@@ -164,7 +166,12 @@ export function createCoordinationTools(options: CoordinationExecutorOptions): R
     {
       ...metadata("list_subagents", "List visible tasks in the current session and task tree", "read", "read_only"),
       inputSchema: ListSubagentsInputSchema, outputSchema: ListOutputSchema,
-      execute: (context, input) => executeListSubagents(context, input as ListSubagentsInput, options),
+      execute: listExecutor,
+    },
+    {
+      ...metadata("agent.list", "List visible tasks in the current session and task tree", "read", "read_only"),
+      inputSchema: ListSubagentsInputSchema, outputSchema: ListOutputSchema,
+      execute: listExecutor,
     },
     {
       ...metadata("interrupt_subagent", "Request interruption of a visible task tree", "internal_write", "idempotent"),
@@ -179,7 +186,12 @@ export function createCoordinationTools(options: CoordinationExecutorOptions): R
     {
       ...metadata("close_subagent", "Close a visible non-running task", "internal_write", "idempotent"),
       inputSchema: CloseSubagentInputSchema, outputSchema: CloseOutputSchema,
-      execute: (context, input) => executeCloseSubagent(context, input as CloseSubagentInput, options),
+      execute: closeExecutor,
+    },
+    {
+      ...metadata("agent.close", "Close a visible non-running task", "internal_write", "idempotent"),
+      inputSchema: CloseSubagentInputSchema, outputSchema: CloseOutputSchema,
+      execute: closeExecutor,
     },
   ]
 }
