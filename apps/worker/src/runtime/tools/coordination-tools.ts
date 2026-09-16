@@ -122,6 +122,7 @@ function metadata(name: string, description: string, risk: "read" | "internal_wr
 
 export function createCoordinationTools(options: CoordinationExecutorOptions): RuntimeToolDefinition[] {
   const spawnExecutor: RuntimeToolDefinition["execute"] = (context, input) => executeSpawn(context, input as SpawnSubagentInput, options)
+  const sendMessageExecutor: RuntimeToolDefinition["execute"] = (context, input) => executeSendMessage(context, input as SendMessageInput, options)
   return [
     {
       ...metadata("spawn_subagent", "Create one permission-scoped child task and durably enqueue it", "internal_write", "requires_key"),
@@ -141,7 +142,12 @@ export function createCoordinationTools(options: CoordinationExecutorOptions): R
     {
       ...metadata("send_message", "Send one idempotent mailbox message to a visible subagent", "internal_write", "requires_key"),
       inputSchema: SendMessageInputSchema, outputSchema: SendOutputSchema,
-      execute: (context, input) => executeSendMessage(context, input as SendMessageInput, options),
+      execute: sendMessageExecutor,
+    },
+    {
+      ...metadata("agent.send", "Send one idempotent mailbox message to a visible subagent", "internal_write", "requires_key"),
+      inputSchema: SendMessageInputSchema, outputSchema: SendOutputSchema,
+      execute: sendMessageExecutor,
     },
     {
       ...metadata("wait_subagents", "Durably wait for visible subagent results through the AH2-025 adapter", "internal_write", "requires_key"),

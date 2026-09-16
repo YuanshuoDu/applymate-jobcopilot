@@ -12,15 +12,15 @@ const options = {
 }
 
 describe("coordination tool definitions", () => {
-  it("exposes both spawn names with shared coordination metadata and manager fencing", () => {
+  it("exposes canonical coordination names with shared metadata and manager fencing", () => {
     const definitions = createCoordinationTools(options)
     expect(definitions.map(definition => definition.name)).toEqual([
-      "spawn_subagent", "agent.spawn", "agent.followup", "send_message", "wait_subagents", "list_subagents", "interrupt_subagent", "close_subagent",
+      "spawn_subagent", "agent.spawn", "agent.followup", "send_message", "agent.send", "wait_subagents", "list_subagents", "interrupt_subagent", "close_subagent",
     ])
     expect(definitions).toEqual(expect.arrayContaining([
       expect.objectContaining({ domain: "coordination", requiredCapabilities: ["canManageChildren"] }),
     ]))
-    expect(definitions.filter(definition => definition.risk === "internal_write")).toHaveLength(7)
+    expect(definitions.filter(definition => definition.risk === "internal_write")).toHaveLength(8)
     const legacySpawn = definitions.find(definition => definition.name === "spawn_subagent")
     const canonicalSpawn = definitions.find(definition => definition.name === "agent.spawn")
     expect(legacySpawn).toBeDefined()
@@ -38,12 +38,30 @@ describe("coordination tool definitions", () => {
     expect(canonicalSpawn?.inputSchema).toBe(legacySpawn?.inputSchema)
     expect(canonicalSpawn?.outputSchema).toBe(legacySpawn?.outputSchema)
     expect(canonicalSpawn?.execute).toBe(legacySpawn?.execute)
+    const legacySend = definitions.find(definition => definition.name === "send_message")
+    const canonicalSend = definitions.find(definition => definition.name === "agent.send")
+    expect(legacySend).toBeDefined()
+    expect(canonicalSend).toMatchObject({
+      schemaVersion: legacySend?.schemaVersion,
+      version: legacySend?.version,
+      description: legacySend?.description,
+      capabilities: legacySend?.capabilities,
+      risk: legacySend?.risk,
+      domain: legacySend?.domain,
+      idempotency: legacySend?.idempotency,
+      timeoutMs: legacySend?.timeoutMs,
+      requiredCapabilities: legacySend?.requiredCapabilities,
+    })
+    expect(canonicalSend?.inputSchema).toBe(legacySend?.inputSchema)
+    expect(canonicalSend?.outputSchema).toBe(legacySend?.outputSchema)
+    expect(canonicalSend?.execute).toBe(legacySend?.execute)
     expect(definitions.find(definition => definition.name === "agent.followup")).toMatchObject({ idempotency: "requires_key", risk: "internal_write", requiredCapabilities: ["canManageChildren"] })
     expect(definitions.find(definition => definition.name === "list_subagents")).toMatchObject({ risk: "read", capabilities: ["read", "coordination"] })
     expect(new ToolRegistry(definitions).list(["canManageChildren"]).map(definition => definition.name)).toEqual([
-      "spawn_subagent", "agent.spawn", "agent.followup", "send_message", "wait_subagents", "list_subagents", "interrupt_subagent", "close_subagent",
+      "spawn_subagent", "agent.spawn", "agent.followup", "send_message", "agent.send", "wait_subagents", "list_subagents", "interrupt_subagent", "close_subagent",
     ])
     const registry = new ToolRegistry(definitions)
+    expect(registry.resolve("agent.send", "1").execute).toBe(registry.resolve("send_message", "1").execute)
     expect(registry.resolve("agent.spawn", "1").execute).toBe(registry.resolve("spawn_subagent", "1").execute)
     expect(new ToolRegistry(definitions).list(["other"])).toHaveLength(0)
   })
@@ -56,6 +74,9 @@ describe("coordination tool definitions", () => {
     expect(registry.validateArguments("agent.followup", { ...followup, parentTaskId: "forged" })).not.toBe(true)
     expect(registry.validateArguments("spawn_subagent", valid)).toBe(true)
     expect(registry.validateArguments("agent.spawn", valid)).toBe(true)
+    const validMessage = { idempotencyKey: "message-1", taskId: "task-1", kind: "result", payload: {} }
+    expect(registry.validateArguments("send_message", validMessage)).toBe(true)
+    expect(registry.validateArguments("agent.send", validMessage)).toBe(true)
     for (const key of ["userId", "sessionId", "ownerId", "path", "rootTaskId", "expectedOutputSchema"]) {
       expect(registry.validateArguments("spawn_subagent", { ...valid, [key]: "forged" })).not.toBe(true)
     }
@@ -71,6 +92,7 @@ describe("coordination tool definitions", () => {
       "agent.spawn": { role: "scout", taskType: "inspect", goal: "Inspect" },
       "agent.followup": { taskId: "task-1", goal: "Continue" },
       send_message: { taskId: "task-1", kind: "result", payload: {} },
+      "agent.send": { taskId: "task-1", kind: "result", payload: {} },
       wait_subagents: { taskIds: ["task-1"], mode: "all", timeoutMs: 1000 },
       list_subagents: { unexpected: true },
       interrupt_subagent: {},
