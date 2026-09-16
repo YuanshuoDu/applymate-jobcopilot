@@ -2446,3 +2446,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Turn execution-loop focused validation passed **68/68 tests**; the full Worker suite passed **280 test files / 1,854 tests / 3 skipped**. Worker TypeScript and `git diff --check` passed.
 
 **Candidate boundary:** No live provider continuation stream, PostgreSQL/RLS, Redis/BullMQ delivery, process restart, browser, deployment, or complete multi-turn production evidence was run. P8-34 remains a candidate; overall acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## 121. P8-35 — Durable canonical Turn dispatch lineage and queued handoff recovery
+
+**Candidate status/date (2026-09-16):** P8-35 is recorded as a candidate Worker dispatch-safety and recovery slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `aeb63687` verifies the Turn↔Session↔User relationship under lock before persisting canonical dispatch intents. The pending outbox scanner rechecks aggregate/payload/Turn lineage immediately before queueing and terminally quarantines poisoned rows with `turn_dispatch_lineage_mismatch`. Runnable queued Turns rebuild a session-scoped dispatch intent even when the Redis handoff was lost before `turn.started`.
+
+**Independent verification:** Root ran the directly affected suites at **33/33 tests**; the Luna worker reported **42/42 focused tests**. Worker TypeScript and `git diff --check` passed.
+
+**Candidate boundary:** No live PostgreSQL/RLS, Redis/BullMQ delivery, concurrent outbox race, process restart, provider/model, browser, deployment or complete Turn recovery E2E evidence was run. P8-35 remains a candidate; overall acceptance stays **P0 accepted 1/8 (12.5%)**.
