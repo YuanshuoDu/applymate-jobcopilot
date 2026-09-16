@@ -2264,3 +2264,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused Worker validation passed **67/67 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No schema, migration, Web, provider, browser, dependency, or queue contract changed.
 
 **Candidate boundary:** No live PostgreSQL/RLS, Redis/BullMQ delivery, process restart/replay, provider/model call, browser, deployment, or complete production Workbench-to-Worker evidence was run. This remains a candidate consistency repair; formal acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## 103. P8-16 — Native stream completion fence
+
+**Candidate status/date (2026-09-16):** P8-16 is recorded as a candidate Worker model-output classification slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Reviewed and pushed commit `5e12c871` changes native model streaming so a stream that ends without a finish reason fails closed as the canonical `TurnEngineError("invalid_output")`, with the stable message `Model stream completed without a finish reason`, instead of leaking a generic `Error`.
+
+**Independent verification:** The focused Worker model-step suite passed **3/3**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No provider, schema, Web, migration, queue, or feature-flag change was made.
+
+**Candidate boundary:** No live provider/model stream, PostgreSQL/RLS, Redis/BullMQ delivery, Worker restart, browser, deployment, or complete end-to-end evidence was run. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.

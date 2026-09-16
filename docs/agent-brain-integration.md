@@ -1255,3 +1255,9 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Focused Worker validation passed **67/67 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No schema, migration, Web, provider, browser, dependency, or queue contract changed.
 - Compatibility boundary: historical `plan.observation` rows that predate `payload.planCallId` cannot be proven to belong to the current plan after a goal transition, so they are filtered when the current goal revision is greater than one. The revision-one path keeps the legacy unscoped behavior so old histories without that field remain readable.
 - Candidate boundary: no live PostgreSQL/RLS, Redis/BullMQ delivery, process restart/replay, provider/model call, browser, deployment, or complete production Workbench-to-Worker evidence was run. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-16 candidate - native stream completion fence
+
+- Reviewed and pushed commit `5e12c871` changes native model streaming so a stream that ends without a finish reason fails closed as the canonical `TurnEngineError("invalid_output")`, with the stable message `Model stream completed without a finish reason`, instead of leaking a generic `Error`.
+- Focused Worker model-step validation passed **3/3**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` also passed. No provider, schema, Web, migration, queue, or feature-flag change was made.
+- Candidate boundary: no live provider/model stream, PostgreSQL/RLS, Redis/BullMQ delivery, Worker restart, browser, deployment, or complete end-to-end evidence was run. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
