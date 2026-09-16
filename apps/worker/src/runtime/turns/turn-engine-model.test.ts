@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 import type { ModelAdapter, ModelResponse } from "@jobcopilot/agent-model"
 
 import { runModelStep } from "./turn-engine-model.js"
+import { TurnEngineError } from "./turn-engine-types.js"
 
 const request = {
   schemaVersion: "agent-harness.v2" as const,
@@ -40,6 +41,20 @@ describe("TurnEngine model step normalization", () => {
     expect(result).toMatchObject({ text: "I will inspect.", reasoningSummary: "Inspecting", finishReason: "tool_calls" })
     expect(result.toolCalls).toEqual([{ id: "call-1", name: "jobs.search", arguments: { location: "Dublin" } }])
     expect(result.usage).toMatchObject({ inputTokens: 10, outputTokens: 5 })
+  })
+
+  it("classifies a stream without a finish reason as invalid output", async () => {
+    const adapter: ModelAdapter = {
+      id: "fixture-native-incomplete",
+      profile: profile(true),
+      async *stream() {
+        yield { type: "text_delta", text: "Incomplete" }
+      },
+    }
+
+    const result = runModelStep(adapter, request)
+    await expect(result).rejects.toBeInstanceOf(TurnEngineError)
+    await expect(result).rejects.toMatchObject({ code: "invalid_output", message: "Model stream completed without a finish reason" })
   })
 
   it("normalizes the non-native structured fallback into a tool call", async () => {
