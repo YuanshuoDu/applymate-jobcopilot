@@ -2240,3 +2240,15 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** The root agent verified **216 focused Worker tests across 9 files**, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check`. No live infrastructure evidence was added.
 
 **Candidate boundary:** Live PostgreSQL/RLS, Redis/BullMQ delivery, real process restart and recovery, provider/model behavior, browser behavior, deployment, and complete child-to-parent end-to-end wake evidence remain unverified. Overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## 101. P8-14 — V2 long-session live question hydration
+
+**Candidate status/date (2026-09-16):** P8-14 is recorded as a candidate Web V2 long-session hydration slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `27bb2817` closes the boundary where a live `item.started` question stub carries only identifiers and the hydration pump stops after a fixed eight-page timeline window. When the canonical question item falls beyond that window, the question card never materializes and the user cannot answer it. The pump now passes target `itemId` values into canonical timeline hydration, which follows ascending pages until all requested targets are found or the timeline reaches its natural end.
+
+**Canonical-state invariant:** The repair preserves one canonical timeline state, one SSE subscription, the stream `AbortSignal`, tenant filtering, and the existing reducer/replay path. It changes no Worker, schema, migration, provider, browser, queue, model, or feature-flag behavior.
+
+**Independent verification:** Luna's full focused set passed **67/67 tests across 6 files**: timeline reducer 22, stream client 20, question hydration 3, question input card 4, approval ledger card 6, and Agent Playground page 12. Web `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Root independently reran the direct question-hydration and stream-client suites at **23/23**, with Web TypeScript and diff checks passing.
+
+**Candidate boundary:** No real SSE reconnect/replay, browser, database/RLS, Worker/Redis delivery, process restart, provider/model call, deployment, or complete Workbench-to-canonical end-to-end evidence was run. This candidate records the long-session page-boundary repair only; overall acceptance remains **P0 accepted 1/8 (12.5%)**.
