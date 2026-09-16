@@ -110,7 +110,7 @@ function memoryObservations(snapshot: StepContextSnapshot): StepContextSnapshot[
     if (!isContextMemoryAnchorObservation(observation)) return false
     if (["plan-revision:", "plan-result:", "plan-control:", "wait-result:", "approval:"].some(prefix => observation.id.startsWith(prefix))) return true
     const content = observation.content && typeof observation.content === "object" && !Array.isArray(observation.content) ? observation.content as Record<string, unknown> : null
-    return content?.kind === "plan_revision" || content?.kind === "plan_command" || content?.kind === "plan_control" || content?.kind === "plan_replan_feedback" || isWaitToolName(content?.toolName) || content?.approvalId !== undefined
+    return content?.kind === "context_snapshot_memory" || content?.kind === "plan_revision" || content?.kind === "plan_command" || content?.kind === "plan_control" || content?.kind === "plan_replan_feedback" || isWaitToolName(content?.toolName) || content?.approvalId !== undefined
   })
   if (retained.length > 64) throw new TypeError("Context memory contains too many protected observations")
   let bytes = 0

@@ -90,6 +90,35 @@ describe("StepContextSnapshot adapter", () => {
     expect(result.snapshot.toolObservations[0]?.content).toMatchObject({ memory: { waits: [{ id: canonicalWait.id, status: "completed" }] } })
   })
 
+  it("retains canonical snapshot memory across repeated compaction", async () => {
+    const snapshotMemory = {
+      id: "context-snapshot-memory",
+      content: {
+        kind: "context_snapshot_memory",
+        goal: "Find a role",
+        userConstraints: ["EU only"],
+        pendingApprovals: ["approval-1"],
+      },
+    }
+    const input = { ...observations(10), toolObservations: [snapshotMemory, ...observations(10).toolObservations] }
+    const adapter = createContextSnapshotAdapter({ store: store(), observationCountThreshold: 2, keepRecentObservations: 1 })
+
+    const result = await adapter.hook(request(input))
+
+    expect(result).toMatchObject({ status: "compacted" })
+    if (result.status !== "compacted") return
+    expect(result.snapshot.toolObservations).toContainEqual(snapshotMemory)
+
+    const repeatedInput = {
+      ...result.snapshot,
+      toolObservations: [...result.snapshot.toolObservations, { id: "tool-10", content: { text: "x".repeat(500) } }, { id: "tool-11", content: { text: "x".repeat(500) } }],
+    }
+    const repeated = await adapter.hook({ ...request(repeatedInput), stepId: "turn:turn-1:step:1" })
+    expect(repeated).toMatchObject({ status: "compacted" })
+    if (repeated.status !== "compacted") return
+    expect(repeated.snapshot.toolObservations).toContainEqual(snapshotMemory)
+  })
+
   it("does not retain every large non-control event payload as a raw anchor", async () => {
     const noise = Array.from({ length: 20 }, (_, index) => ({ id: `event:noise-${index}`, content: { payload: "x".repeat(7_000) } }))
     const input = { ...base, toolObservations: noise }

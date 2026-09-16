@@ -161,7 +161,7 @@ export function isContextMemoryAnchorObservation(observation: Observation): bool
   if (!validId(observation.id)) return false
   if (isCriticalId(observation.id)) return true
   const content = plain(observation.content) ? observation.content : null
-  return content?.kind === "plan_revision" || content?.kind === "plan_command" || content?.kind === "plan_control" || content?.kind === "plan_replan_feedback" || isWaitToolName(content?.toolName) || content?.approvalId !== undefined
+  return content?.kind === "context_snapshot_memory" || content?.kind === "plan_revision" || content?.kind === "plan_command" || content?.kind === "plan_control" || content?.kind === "plan_replan_feedback" || isWaitToolName(content?.toolName) || content?.approvalId !== undefined
 }
 
 function trimProjection(value: ContextMemoryProjection, maxBytes: number): ContextMemoryProjection | null {

@@ -21,6 +21,8 @@ import {
   type RebuildStepRequest,
 } from "./context-snapshot-types.js"
 
+const SNAPSHOT_MEMORY_OBSERVATION_ID = "context-snapshot-memory"
+
 function nonEmpty(value: string, field: string): string {
   if (typeof value !== "string" || value.trim().length === 0) throw new ContextSnapshotError("invalid_input", `${field} must be non-empty`)
   return value
@@ -87,15 +89,49 @@ function verifiedOwnerFence(snapshot: AgentContextSnapshot, scope: TenantScope):
   }
 }
 
+function hasCanonicalMemory(content: AgentContextSnapshot["content"]): boolean {
+  return content.userConstraints.length > 0
+    || content.confirmedDecisions.length > 0
+    || content.completedWork.length > 0
+    || content.openWork.length > 0
+    || content.pendingApprovals.length > 0
+    || content.artifacts.length > 0
+    || content.facts.length > 0
+    || content.failedAttempts.length > 0
+}
+
+function canonicalMemoryObservation(snapshot: AgentContextSnapshot): StepContextSnapshot["toolObservations"][number] {
+  const content = snapshot.content
+  if (content.context.toolObservations.some((observation) => observation.id === SNAPSHOT_MEMORY_OBSERVATION_ID)) {
+    throw new ContextSnapshotError("store_conflict", "Snapshot context already contains the reserved memory observation")
+  }
+  return {
+    id: SNAPSHOT_MEMORY_OBSERVATION_ID,
+    content: {
+      kind: "context_snapshot_memory",
+      goal: content.goal,
+      userConstraints: [...content.userConstraints],
+      confirmedDecisions: content.confirmedDecisions.map((decision) => ({ ...decision, evidenceEventIds: [...decision.evidenceEventIds] })),
+      completedWork: content.completedWork.map((work) => ({ ...work })),
+      openWork: content.openWork.map((work) => ({ ...work })),
+      pendingApprovals: [...content.pendingApprovals],
+      artifacts: content.artifacts.map((artifact) => ({ ...artifact })),
+      facts: content.facts.map((fact) => ({ ...fact })),
+      failedAttempts: content.failedAttempts.map((attempt) => ({ ...attempt, doNotRepeat: [...attempt.doNotRepeat] })),
+    },
+  }
+}
+
 function rebuildSnapshot(snapshot: AgentContextSnapshot): StepContextSnapshot {
   const content = snapshot.content
+  const memory = hasCanonicalMemory(content) ? [canonicalMemoryObservation(snapshot)] : []
   return {
     system: content.context.system,
     profile: content.context.profile,
     goal: content.context.goal ?? { id: "snapshot-goal", content: content.goal },
     steerHistory: content.context.steerHistory,
     businessRefs: content.references,
-    toolObservations: content.context.toolObservations,
+    toolObservations: [...content.context.toolObservations, ...memory],
   }
 }
 
