@@ -425,6 +425,7 @@ function upsertItem(state: TimelineState, item: TimelineItem, source: TimelineIt
   const existing = state.itemsById[item.id]
   if (existing && existing.type === 'question' && TERMINAL_STATUSES.has(existing.status) && !TERMINAL_STATUSES.has(item.status)) return state
   if (existing && source === 'transient' && (TERMINAL_STATUSES.has(existing.status) || item.revision <= existing.revision)) return state
+  if (existing && source === 'replay' && isOlderReplay(existing, item)) return state
   if (existing && source === 'durable' && existing.sequence && item.sequence && !isAfter(item.sequence, existing.sequence) && item.status !== 'completed') return state
   const nextItem = source === 'transient' && existing
     ? { ...existing, ...item, content: replaceContent ? item.content : mergeContent(existing.content, item.content), source }
@@ -435,4 +436,19 @@ function upsertItem(state: TimelineState, item: TimelineItem, source: TimelineIt
   if (source === 'transient') transientItems.set(item.id, nextItem)
   else transientItems.delete(item.id)
   return { ...state, itemsById, itemIds, transientItems, ...buildIndexes(itemsById) }
+}
+
+/** Prevent an in-flight snapshot from regressing evidence received from the live stream. */
+function isOlderReplay(existing: TimelineItem, incoming: TimelineItem): boolean {
+  if (existing.sequence && incoming.sequence) {
+    if (isAfter(existing.sequence, incoming.sequence)) return true
+    if (existing.sequence === incoming.sequence) {
+      if (existing.revision > incoming.revision) return true
+      if (TERMINAL_STATUSES.has(existing.status) && !TERMINAL_STATUSES.has(incoming.status)) return true
+      return existing.status === incoming.status
+    }
+    return false
+  }
+  if (existing.revision > incoming.revision) return true
+  return TERMINAL_STATUSES.has(existing.status) && !TERMINAL_STATUSES.has(incoming.status)
 }

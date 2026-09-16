@@ -113,6 +113,22 @@ describe('timeline reducer', () => {
     expect(state.lastSequence).toBe('8')
   })
 
+  it('does not let a stale reconnect snapshot regress newer live evidence', () => {
+    let state = timelineReducer(createTimelineState('session-1'), {
+      type: 'replay', items: [baseItem('item-1', { revision: 1, sequence: '7', content: { text: 'working' } })],
+    })
+    const completed = baseItem('item-1', {
+      status: 'completed', revision: 2, sequence: '8', content: { text: 'done' },
+      completedAt: '2026-09-01T00:00:01.000Z', updatedAt: '2026-09-01T00:00:01.000Z',
+    })
+    state = timelineReducer(state, { type: 'hydrate', items: [completed] })
+    state = timelineReducer(state, {
+      type: 'hydrate', items: [baseItem('item-1', { revision: 1, sequence: '7', content: { text: 'working' } })],
+    })
+
+    expect(state.itemsById['item-1']).toMatchObject({ status: 'completed', revision: 2, sequence: '8', content: { text: 'done' } })
+  })
+
   it('keeps reconnect non-terminal and safely materializes unknown items', () => {
     let state = timelineReducer(createTimelineState('session-1'), { type: 'connected' })
     state = timelineReducer(state, { type: 'disconnected' })
