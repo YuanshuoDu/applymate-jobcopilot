@@ -161,7 +161,7 @@ function projection(wait: Row, prepared: PreparedOutcome): Projection {
   return {
     id: `wait-result:${safeText(wait.id)}`,
     content: {
-      toolCallId: `wait:${safeText(wait.id)}`, toolName: "wait_subagents", input: { taskIds: prepared.taskIds, mode: prepared.mode },
+      toolCallId: `wait:${safeText(wait.id)}`, toolName: "agent.wait", input: { taskIds: prepared.taskIds, mode: prepared.mode },
       status: "completed", output: prepared.value, errorCode: null,
     },
   }

@@ -52,7 +52,7 @@ describe("durable wait outcome consumer", () => {
   it("projects a ready all result and consumes it once", async () => {
     const fake = fixture()
     const projections = await consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now })
-    expect(projections[0]).toMatchObject({ id: "wait-result:wait-1", content: { toolCallId: "wait:wait-1", toolName: "wait_subagents", input: { taskIds: ["child-1"], mode: "all" }, status: "completed", output: { status: "ready", matchedTaskIds: ["child-1"] } } })
+    expect(projections[0]).toMatchObject({ id: "wait-result:wait-1", content: { toolCallId: "wait:wait-1", toolName: "agent.wait", input: { taskIds: ["child-1"], mode: "all" }, status: "completed", output: { status: "ready", matchedTaskIds: ["child-1"] } } })
     expect(fake.state.consumedAt).toBe(now)
     expect(fake.state.result).toMatchObject({ request: { mode: "all" }, outcome: { waitId: "wait-1" } })
     expect(fake.state.updates).toBe(1)
@@ -98,10 +98,11 @@ describe("durable wait outcome consumer", () => {
     expect(output).toMatchObject({ tasks: [{ taskId: "child-1", status: "completed", result: { truncated: true } }] })
   })
 
-  it("rebuilds an already consumed outcome without writing a second receipt", async () => {
+  it("rebuilds a legacy persisted outcome as a canonical projection without writing a second receipt", async () => {
     const fake = fixture({ consumed: true })
     const projections = await consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now })
     expect(projections).toHaveLength(1)
+    expect(projections[0]?.content).toMatchObject({ toolCallId: "wait:wait-1", toolName: "agent.wait", output: { waitId: "wait-1", status: "ready" } })
     expect(fake.state.updates).toBe(0)
   })
 
