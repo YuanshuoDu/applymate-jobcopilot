@@ -598,6 +598,39 @@ describe("owner-agnostic turn execution loop", () => {
     ]))
   })
 
+  it("clears a provider continuation after tool feedback enters the next model context", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const requests: HarnessModelRequest[] = []
+    const baseModel = root.options.model
+    let calls = 0
+    root.options = {
+      ...root.options,
+      model: {
+        ...baseModel,
+        profile: { ...baseModel.profile, continuationCursor: true },
+        async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+          requests.push(request)
+          calls += 1
+          if (calls === 1) {
+            yield { type: "tool_call_completed", callId: "call:root-1", name: "jobs.search", arguments: { location: "Dublin" } }
+            yield { type: "continuation", continuation: { cursor: "stale-tool-cursor" } }
+            yield { type: "completed", finishReason: "tool_calls" }
+            return
+          }
+          yield { type: "text_delta", text: "done:root-1" }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      },
+    }
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "completed", stepCount: 2, toolCallCount: 1 })
+    expect(requests[1]?.continuation).toBeUndefined()
+    expect(requests[1]?.messages).toEqual(expect.arrayContaining([
+      { role: "assistant", content: [{ type: "tool_use", id: "call:root-1", name: "jobs.search", input: { location: "Dublin" } }] },
+      { role: "tool", content: [{ type: "tool_result", toolUseId: "call:root-1", content: '{"job":"job-1"}' }] },
+    ]))
+  })
+
   it("persists a goal revision before the next model step and updates the bounded snapshot", async () => {
     const goalContract = { revision: 2, objective: "Find senior jobs", constraints: ["EU"], successCriteria: [], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" }
     const root = fixture(identity("turn", "root-1"), undefined, undefined, [], false, undefined, {

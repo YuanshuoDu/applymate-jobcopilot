@@ -162,6 +162,8 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           toolCalls += output.toolCalls.length
           snapshot = outcome.snapshot
           steeringMarkerState = outcome.steeringMarkerState
+          // Tool results and plan observations are server-owned context; do not reuse a provider cursor across this boundary.
+          continuation = undefined
           assertExecutionAlive(options, signal)
           const wait = outcome.wait
           const stepStatus = wait?.status === "waiting_for_dependency"
