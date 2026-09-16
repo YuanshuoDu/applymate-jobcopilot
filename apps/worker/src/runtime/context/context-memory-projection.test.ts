@@ -84,4 +84,12 @@ describe("context memory projection", () => {
       "plan-revision:plan-1", "plan-result:plan-1:join", "plan-control:plan-1:join:replan", "wait-result:wait-1", "approval:approval-1", "task:child-1", "event:event-1",
     ])
   })
+
+  it.each(["agent.wait", "wait_subagents"] as const)("projects %s as a wait memory anchor", toolName => {
+    const observation = { id: `tool-wait-${toolName}`, content: { toolName, status: "completed" } }
+    const projection = buildContextMemoryProjection({ ...base, toolObservations: [observation] })
+
+    expect(projection?.waits).toEqual([{ id: observation.id, status: "completed" }])
+    expect(isContextMemoryAnchorObservation(observation)).toBe(true)
+  })
 })

@@ -10,6 +10,8 @@ const MAX_ID = 256
 const MAX_SUMMARY = 160
 const SNAPSHOT_KEYS = new Set(["system", "profile", "goal", "steerHistory", "businessRefs", "toolObservations"])
 const FAILURE_STATUSES = new Set(["failed", "interrupted", "cancelled"])
+const WAIT_TOOL_NAMES = ["agent.wait", "wait_subagents"] as const
+type WaitToolName = typeof WAIT_TOOL_NAMES[number]
 
 export type { CognitiveMemoryAnchor, CognitiveMemoryDecision, CognitiveMemoryOmittedRange, CognitiveMemoryQuestion, CognitiveMemoryReference, ContextMemoryProjection } from "./context-memory-schema.js"
 
@@ -17,6 +19,10 @@ export type ContextMemoryProjectionOptions = { readonly maxBytes?: number }
 type Row = Record<string, unknown>
 type Observation = StepContextSnapshot["toolObservations"][number]
 type BusinessRef = { readonly id: string; readonly kind: string; readonly ownerId: string; readonly resource?: string; readonly hash?: string }
+
+function isWaitToolName(value: unknown): value is WaitToolName {
+  return typeof value === "string" && WAIT_TOOL_NAMES.includes(value as WaitToolName)
+}
 
 function plain(value: unknown): value is Row {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value) && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)
@@ -155,7 +161,7 @@ export function isContextMemoryAnchorObservation(observation: Observation): bool
   if (!validId(observation.id)) return false
   if (isCriticalId(observation.id)) return true
   const content = plain(observation.content) ? observation.content : null
-  return content?.kind === "plan_revision" || content?.kind === "plan_command" || content?.kind === "plan_control" || content?.kind === "plan_replan_feedback" || content?.toolName === "wait_subagents" || content?.approvalId !== undefined
+  return content?.kind === "plan_revision" || content?.kind === "plan_command" || content?.kind === "plan_control" || content?.kind === "plan_replan_feedback" || isWaitToolName(content?.toolName) || content?.approvalId !== undefined
 }
 
 function trimProjection(value: ContextMemoryProjection, maxBytes: number): ContextMemoryProjection | null {
@@ -215,7 +221,7 @@ export function buildContextMemoryProjection(snapshot: StepContextSnapshot, opti
       if (kind !== "plan_revision" || !Number.isSafeInteger(content.goalRevision) || !Number.isSafeInteger(content.planRevision) || (content.goalRevision as number) < 1 || (content.planRevision as number) < 1) return null
       planRows.push({ goalRevision: content.goalRevision as number, planRevision: content.planRevision as number })
     }
-    if (item.id.startsWith("wait-result:") || kind === "wait_result" || content.toolName === "wait_subagents") if (!add(waits, current)) return null
+    if (item.id.startsWith("wait-result:") || kind === "wait_result" || isWaitToolName(content.toolName)) if (!add(waits, current)) return null
     if (item.id.startsWith("approval:") || typeof content.approvalId === "string" || kind === "approval") if (!add(approvals, current)) return null
     if (item.id.startsWith("artifact:") || typeof content.artifactId === "string") if (!add(artifacts, current)) return null
     if (item.id.startsWith("task:") || typeof content.taskId === "string") if (!add(tasks, current)) return null

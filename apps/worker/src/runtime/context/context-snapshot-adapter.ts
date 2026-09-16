@@ -12,6 +12,8 @@ import type { ContextCompactionHook, ContextCompactionHookInput, ContextCompacti
 const DEFAULT_MAX_SNAPSHOT_BYTES = 256 * 1024
 const DEFAULT_MAX_SUMMARY_BYTES = 8 * 1024
 const MAX_PROTECTED_OBSERVATION_BYTES = 16 * 1024
+const WAIT_TOOL_NAMES = ["agent.wait", "wait_subagents"] as const
+type WaitToolName = typeof WAIT_TOOL_NAMES[number]
 
 type SnapshotIdentity = { readonly scope: TenantScope; readonly sessionId: string; readonly turnId: string; readonly stepId: string; readonly idempotencyKey: string }
 type StoredSnapshot = SnapshotIdentity & { readonly snapshotRef: string; readonly snapshot: StepContextSnapshot }
@@ -36,6 +38,10 @@ export type ContextSnapshotAdapter = { readonly hook: ContextCompactionHook; rea
 
 type AdapterInput = ContextCompactionHookInput
 type CachedResult = Promise<ContextCompactionHookResult>
+
+function isWaitToolName(value: unknown): value is WaitToolName {
+  return typeof value === "string" && WAIT_TOOL_NAMES.includes(value as WaitToolName)
+}
 
 function positive(value: number | undefined, fallback: number): number {
   if (value === undefined) return fallback
@@ -104,7 +110,7 @@ function memoryObservations(snapshot: StepContextSnapshot): StepContextSnapshot[
     if (!isContextMemoryAnchorObservation(observation)) return false
     if (["plan-revision:", "plan-result:", "plan-control:", "wait-result:", "approval:"].some(prefix => observation.id.startsWith(prefix))) return true
     const content = observation.content && typeof observation.content === "object" && !Array.isArray(observation.content) ? observation.content as Record<string, unknown> : null
-    return content?.kind === "plan_revision" || content?.kind === "plan_command" || content?.kind === "plan_control" || content?.kind === "plan_replan_feedback" || content?.toolName === "wait_subagents" || content?.approvalId !== undefined
+    return content?.kind === "plan_revision" || content?.kind === "plan_command" || content?.kind === "plan_control" || content?.kind === "plan_replan_feedback" || isWaitToolName(content?.toolName) || content?.approvalId !== undefined
   })
   if (retained.length > 64) throw new TypeError("Context memory contains too many protected observations")
   let bytes = 0

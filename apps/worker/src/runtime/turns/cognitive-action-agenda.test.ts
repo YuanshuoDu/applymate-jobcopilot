@@ -57,6 +57,13 @@ describe("cognitive action agenda", () => {
     expect(text).not.toContain("never place this raw goal")
   })
 
+  it.each(["agent.wait", "wait_subagents"] as const)("recognizes %s as an active child wait", toolName => {
+    const agenda = buildCognitiveActionAgenda(context([goal(), observation("wait:1", { kind: "plan_command", toolName, status: "waiting" })]))
+
+    expect(agenda.nextAction).toBe("await_children")
+    expect(agenda.signals.activeWaits).toEqual({ count: 1, ids: ["wait:1"] })
+  })
+
   it("accepts only structurally safe completion proposals", () => {
     const malformed = buildCognitiveActionAgenda(context([goal(), observation("observation:plan-control:plan-1:finish", { kind: "plan_control", localId: "finish", status: "completion_proposed", dependsOn: [], completionCriteria: ["finish"], reason: "raw" })]))
     expect(malformed.nextAction).toBe("continue_turn")

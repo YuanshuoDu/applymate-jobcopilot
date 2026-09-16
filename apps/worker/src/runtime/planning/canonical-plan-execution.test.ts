@@ -53,17 +53,18 @@ function validAnalystStructuredResult() {
   }
 }
 
-function replayWait(role: "scout" | "analyst", task: Record<string, unknown>) {
+function replayWait(role: "scout" | "analyst", task: Record<string, unknown>, toolName: "agent.wait" | "wait_subagents" = "wait_subagents") {
   const plan = proposal([delegate("child", { role }), join(), use("after", { dependsOn: ["join"] })])
   const delegateObservation = { id: "plan-result:proposal-1:child", content: { kind: "plan_command", localId: "child", commandKind: "delegate", dependsOn: [], status: "completed", errorCode: null, output: { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" } } }
   const joinObservation = { id: "plan-result:proposal-1:join", content: { kind: "plan_command", localId: "join", commandKind: "join", dependsOn: ["child"], status: "completed", errorCode: null, output: { waitId: "wait-1", status: "waiting", taskIds: ["child-1"], matchedTaskIds: [] } } }
-  const waitObservation = { id: "wait-result:wait-1", content: { toolCallId: "wait:wait-1", toolName: "wait_subagents", input: { taskIds: ["child-1"], mode: "all" }, status: "completed", output: { waitId: "wait-1", status: "ready", targetTaskIds: ["child-1"], matchedTaskIds: ["child-1"], tasks: [{ taskId: "child-1", status: "completed", result: null, failureReason: null, ...task }] }, errorCode: null } }
+  const waitObservation = { id: "wait-result:wait-1", content: { toolCallId: "wait:wait-1", toolName, input: { taskIds: ["child-1"], mode: "all" }, status: "completed", output: { waitId: "wait-1", status: "ready", targetTaskIds: ["child-1"], matchedTaskIds: ["child-1"], tasks: [{ taskId: "child-1", status: "completed", result: null, failureReason: null, ...task }] }, errorCode: null } }
   return { plan, observations: [delegateObservation, joinObservation, waitObservation] as StepContextSnapshot["toolObservations"] }
 }
 
 type FixtureOverrides = {
   readonly allowedTools?: readonly string[]
   readonly allowedRoles?: readonly string[]
+  readonly waitDefinitions?: readonly Record<string, unknown>[]
 }
 
 function readDefinition(name: string, domain: "jobs" | "persona" | "resume" | "application") {
@@ -81,7 +82,7 @@ function fixture(router: { execute(context: ToolRouterContext, request: ToolCall
       readDefinition("jobs.search", "jobs"), readDefinition("jobs.get", "jobs"), readDefinition("persona.retrieve", "persona"),
       readDefinition("resume.get_base", "resume"), readDefinition("application.get_state", "application"),
       { name: "tool_results.read", version: "1", risk: "read", capabilities: ["read"], domain: "coordination", requiredCapabilities: [] },
-      { name: "wait_subagents", version: "1", risk: "internal_write", capabilities: ["coordination"], domain: "coordination", requiredCapabilities: [] },
+      ...(overrides.waitDefinitions ?? [{ name: "wait_subagents", version: "1", risk: "internal_write", capabilities: ["coordination"], domain: "coordination", requiredCapabilities: [] }]),
     ] },
     policy: {} as PolicyEngine, ...(persistOutcome ? { persistOutcome } : {}), ...(maxPlanRevisions === undefined ? {} : { maxPlanRevisions }), ...(initialPlanHashes ? { initialPlanHashes } : {}), ...(goalRef ? { goalRef } : {}), ...(allowedPlanActions === undefined ? {} : { allowedPlanActions }), ...(recoveryDispatcher ? { recoveryDispatcher } : {}),
   }
@@ -367,6 +368,40 @@ describe("createCanonicalPlanExecutionFactory", () => {
       expect(observationCode(rejected)).toBe("invalid_plan_output")
     }
     expect(router.execute).toHaveBeenCalledTimes(2)
+  })
+
+  it("replays canonical agent.wait outcomes while retaining the legacy join path", async () => {
+    const replay = replayWait("scout", {}, "agent.wait")
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { ok: true }, errorCode: null })) }
+    const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["use_tool", "delegate", "join"])
+
+    const result = await hook(input(output(replay.plan), "step-1", replay.observations, true))
+
+    expect(result.wait).toBeUndefined()
+    expect(result.observations).toHaveLength(1)
+    expect(result.observations[0]?.content).toMatchObject({ localId: "after", status: "completed" })
+    expect(router.execute).toHaveBeenCalledTimes(1)
+  })
+
+  it("prefers the canonical wait version before falling back to the legacy registry entry", async () => {
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
+      if (request.toolName === "spawn_subagent" || request.toolName === "agent.spawn") return { ...request, status: "completed" as const, output: { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" }, errorCode: null }
+      return { ...request, status: "completed" as const, output: { waitId: "wait-1", status: "ready", taskIds: ["child-1"], matchedTaskIds: ["child-1"], tasks: [{ taskId: "child-1", status: "completed", result: null, failureReason: null }] }, errorCode: null }
+    }) }
+    const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["delegate", "join"], undefined, {
+      waitDefinitions: [
+        { name: "agent.wait", version: "1", risk: "internal_write", capabilities: ["coordination"], domain: "coordination", requiredCapabilities: [] },
+        { name: "wait_subagents", version: "2", risk: "internal_write", capabilities: ["coordination"], domain: "coordination", requiredCapabilities: [] },
+      ],
+    })
+
+    const result = await hook(input(output(proposal([delegate("child"), join()]))))
+
+    expect(result.observations).toHaveLength(2)
+    expect(result.observations.some(observation => {
+      const content = observation.content
+      return content !== null && typeof content === "object" && !Array.isArray(content) && "kind" in content && content.kind === "plan_error"
+    })).toBe(false)
   })
 
   it("binds structured replay evidence to the canonical delegate role", async () => {

@@ -28,9 +28,9 @@ const waitingJoin = (callId = "plan-1", waitId = "wait-1") => ({
   content: { kind: "plan_command", localId: "join", commandKind: "join", dependsOn: ["child"], status: "completed", errorCode: null, output: { waitId, status: "waiting", taskIds: ["child-1"], matchedTaskIds: [] } },
 })
 
-const waitResult = (waitId = "wait-1", status: "ready" | "timed_out" = "ready", taskStatus = "failed") => ({
+const waitResult = (waitId = "wait-1", status: "ready" | "timed_out" = "ready", taskStatus = "failed", toolName: "agent.wait" | "wait_subagents" = "wait_subagents") => ({
   id: `wait-result:${waitId}`,
-  content: { toolCallId: `wait:${waitId}`, toolName: "wait_subagents", input: { taskIds: ["child-1"], mode: "all" }, status: "completed", output: { waitId, status, targetTaskIds: ["child-1"], matchedTaskIds: status === "ready" ? ["child-1"] : [], tasks: [{ taskId: "child-1", status: taskStatus, result: null, failureReason: taskStatus === "failed" ? "provider error" : null }] }, errorCode: null },
+  content: { toolCallId: `wait:${waitId}`, toolName, input: { taskIds: ["child-1"], mode: "all" }, status: "completed", output: { waitId, status, targetTaskIds: ["child-1"], matchedTaskIds: status === "ready" ? ["child-1"] : [], tasks: [{ taskId: "child-1", status: taskStatus, result: null, failureReason: taskStatus === "failed" ? "provider error" : null }] }, errorCode: null },
 })
 
 function activeObservations() { return [projection("plan-1", 1, null), join(), signal()] }
@@ -94,6 +94,11 @@ describe("plan replan obligation", () => {
 
   it("rebuilds an active obligation from a durable failed wait when the control signal is missing", () => {
     const result = deriveReplanObligation({ observations: [projection("plan-1", 1, null), waitingJoin(), waitResult()], expectedGoalRevision: 1 })
+    expect(result).toMatchObject({ kind: "active", obligation: { sourceObservationId: "plan-control:plan-1:join:replan", failedTaskIds: ["child-1"] } })
+  })
+
+  it("rebuilds an active obligation from a canonical agent.wait result", () => {
+    const result = deriveReplanObligation({ observations: [projection("plan-1", 1, null), waitingJoin(), waitResult("wait-1", "ready", "failed", "agent.wait")], expectedGoalRevision: 1 })
     expect(result).toMatchObject({ kind: "active", obligation: { sourceObservationId: "plan-control:plan-1:join:replan", failedTaskIds: ["child-1"] } })
   })
 

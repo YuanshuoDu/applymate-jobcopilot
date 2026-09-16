@@ -55,6 +55,13 @@ describe("cognitive control frame", () => {
     expect(buildCognitiveControlFrame(context({ blocks: [block("summary", "tool_observation", { kind: "context_summary", memory: { ...validMemory, decisions: null } })] })).memory).toBeUndefined()
   })
 
+  it.each(["agent.wait", "wait_subagents"] as const)("recognizes %s as an active child wait", toolName => {
+    const frame = buildCognitiveControlFrame(context({ blocks: [block("wait:1", "tool_observation", { kind: "plan_command", toolName, status: "waiting" })] }))
+
+    expect(frame.activeWaits).toEqual({ count: 1, ids: ["wait:1"] })
+    expect(frame.unresolved).toEqual({ count: 1, ids: ["wait:1"] })
+  })
+
   it("bounds every reference list while retaining its safe count", () => {
     const values = Array.from({ length: 24 }, (_, index) => `input-${String(index).padStart(2, "0")}`)
     const frame = buildCognitiveControlFrame(context({ blocks: values.map(id => block(`${id}:part:0`, "pending_input", { inputId: id, text: "untrusted" })) }))

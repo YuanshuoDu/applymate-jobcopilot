@@ -23,9 +23,17 @@ const MAX_OBSERVATIONS = 8
 const MAX_RESULT_BYTES = 8 * 1024
 const CANONICAL_PARALLEL_DELEGATE_LIMIT = 4
 const OUTPUT_KEYS = ["status", "goalRevision", "planRevision", "basedOnPlanRevision", "proposal", "intents", "proposalHash"]
+const CANONICAL_WAIT_TOOL_NAME = "agent.wait" as const
+const LEGACY_WAIT_TOOL_NAME = "wait_subagents" as const
+const WAIT_TOOL_NAMES = [CANONICAL_WAIT_TOOL_NAME, LEGACY_WAIT_TOOL_NAME] as const
+type WaitToolName = typeof WAIT_TOOL_NAMES[number]
 
 type Registry = { list(capabilities?: readonly string[]): readonly unknown[] }
 type Router = { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> }
+
+function isWaitToolName(value: unknown): value is WaitToolName {
+  return typeof value === "string" && WAIT_TOOL_NAMES.includes(value as WaitToolName)
+}
 
 export type CanonicalPlanExecutionOptions = {
   readonly goal: GoalContract
@@ -99,6 +107,14 @@ function id(prefix: string, callId: string, localId: string): string {
 function version(registry: Registry, capabilities: readonly string[], name: string): string | undefined {
   const definition = registry.list(capabilities).find(item => isPlainJsonObject(item) && item.name === name && typeof item.version === "string")
   return definition && isPlainJsonObject(definition) && typeof definition.version === "string" ? definition.version.trim() : undefined
+}
+
+function waitVersion(registry: Registry, capabilities: readonly string[]): string | undefined {
+  for (const name of WAIT_TOOL_NAMES) {
+    const resolved = version(registry, capabilities, name)
+    if (resolved !== undefined) return resolved
+  }
+  return undefined
 }
 
 const POLICY_DOMAINS: readonly PolicyDomain[] = ["jobs", "persona", "resume", "application", "gmail", "automation", "coordination", "unknown"]
@@ -361,7 +377,7 @@ function replayWaitOutcome(input: Parameters<TurnEnginePlanExecutionHook>[0], op
   const observation = matches[0]
   if (!observation) return undefined
   const content = row(observation.content)
-  if (!waitId.trim() || waitId.length > 256 || !content || !keysOnly(content, ["toolCallId", "toolName", "input", "status", "output", "errorCode"]) || content.toolCallId !== `wait:${waitId}` || content.toolName !== "wait_subagents" || content.status !== "completed" || content.errorCode !== null) throw new CanonicalPlanError("invalid_plan_output")
+  if (!waitId.trim() || waitId.length > 256 || !content || !keysOnly(content, ["toolCallId", "toolName", "input", "status", "output", "errorCode"]) || content.toolCallId !== `wait:${waitId}` || !isWaitToolName(content.toolName) || content.status !== "completed" || content.errorCode !== null) throw new CanonicalPlanError("invalid_plan_output")
   const waitInput = row(content.input)
   const output = row(content.output)
   if (!waitInput || !keysOnly(waitInput, ["taskIds", "mode"]) || hasForeignIdentity(waitInput) || !output || !plainJson(output) || !boundedJson(output) || hasForeignIdentity(output, WAIT_ALLOWED_IDENTITY_KEYS)) throw new CanonicalPlanError("invalid_plan_output")
@@ -545,7 +561,7 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
         createToolCallId: localId => id("plan-call", input.call.id, localId),
         createIdempotencyKey: localId => id("plan-idempotency", input.call.id, localId),
         deferInputRefs: true,
-        resolveWaitVersion: () => version(options.registry, options.capabilities, "wait_subagents"),
+        resolveWaitVersion: () => waitVersion(options.registry, options.capabilities),
         resolveDelegateActions: role => actions(options.registry, options.capabilities, allowedTools, role),
       })
       if (!replayed) {

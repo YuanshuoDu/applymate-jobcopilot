@@ -25,6 +25,10 @@ const WAITING_KEYS_TARGET_ONLY = ["waitId", "status", "targetTaskIds", "matchedT
 const WAIT_RESULT_KEYS = ["toolCallId", "toolName", "input", "status", "output", "errorCode"]
 const WAIT_INPUT_KEYS = ["taskIds", "mode"]
 const FORBIDDEN_KEYS = new Set(["userId", "sessionId", "turnId", "stepId", "taskId", "parentTaskId", "rootTaskId", "ownerId", "leaseOwnerId", "leaseVersion", "idempotencyKey", "capabilities", "permissions", "allowedCapabilities", "budgetLimit", "maxBudget"])
+const CANONICAL_WAIT_TOOL_NAME = "agent.wait" as const
+const LEGACY_WAIT_TOOL_NAME = "wait_subagents" as const
+const WAIT_TOOL_NAMES = [CANONICAL_WAIT_TOOL_NAME, LEGACY_WAIT_TOOL_NAME] as const
+type WaitToolName = typeof WAIT_TOOL_NAMES[number]
 
 export type ReplanObligation = {
   readonly id: string
@@ -47,6 +51,10 @@ type SignalValue = { readonly callId: string; readonly joinLocalId: string; read
 type SignalEntry = SignalValue & { readonly observationId: string }
 type WaitRecord = { readonly status: "waiting" | "ready" | "timed_out"; readonly waitId: string; readonly taskIds: readonly string[]; readonly matchedTaskIds: readonly string[]; readonly failedTaskIds: readonly string[] }
 type WaitLookup = { readonly kind: "missing" } | { readonly kind: "invalid" } | { readonly kind: "valid"; readonly record: WaitRecord }
+
+function isWaitToolName(value: unknown): value is WaitToolName {
+  return typeof value === "string" && WAIT_TOOL_NAMES.includes(value as WaitToolName)
+}
 
 function row(value: unknown): Record<string, unknown> | null { return isPlainJsonObject(value) ? value : null }
 function exact(value: Record<string, unknown>, keys: readonly string[]): boolean { return Object.keys(value).length === keys.length && Object.keys(value).every(key => keys.includes(key)) }
@@ -135,7 +143,7 @@ function durableWait(observations: readonly Observation[], join: WaitRecord): Wa
     return claimsExpected ? { kind: "invalid" } : { kind: "missing" }
   }
   const content = row(matches[0]!.content), input = row(content?.input)
-  if (!content || !exact(content, WAIT_RESULT_KEYS) || content.toolCallId !== `wait:${join.waitId}` || content.toolName !== "wait_subagents" || content.status !== "completed" || content.errorCode !== null || !input || !exact(input, WAIT_INPUT_KEYS) || foreign(input) || !strings(input.taskIds, MAX_ID) || input.mode !== "any" && input.mode !== "all" || !sameSet(input.taskIds, join.taskIds)) return { kind: "invalid" }
+  if (!content || !exact(content, WAIT_RESULT_KEYS) || content.toolCallId !== `wait:${join.waitId}` || !isWaitToolName(content.toolName) || content.status !== "completed" || content.errorCode !== null || !input || !exact(input, WAIT_INPUT_KEYS) || foreign(input) || !strings(input.taskIds, MAX_ID) || input.mode !== "any" && input.mode !== "all" || !sameSet(input.taskIds, join.taskIds)) return { kind: "invalid" }
   const record = parseWaitOutput(content.output, join.taskIds)
   return record && record.status !== "waiting" && record.waitId === join.waitId ? { kind: "valid", record } : { kind: "invalid" }
 }

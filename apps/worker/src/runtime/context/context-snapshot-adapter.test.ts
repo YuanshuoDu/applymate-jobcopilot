@@ -77,6 +77,19 @@ describe("StepContextSnapshot adapter", () => {
     expect(result.snapshot.toolObservations[0]?.content).toMatchObject({ kind: "context_summary", memory: { revisions: { goalRevision: 1, planRevision: 1 } } })
   })
 
+  it("retains a canonical agent.wait observation as a compacted memory anchor", async () => {
+    const canonicalWait = { id: "tool-wait-canonical", content: { toolName: "agent.wait", status: "completed" } }
+    const input = { ...observations(10), toolObservations: [canonicalWait, ...observations(10).toolObservations] }
+    const adapter = createContextSnapshotAdapter({ store: store(), observationCountThreshold: 4, keepRecentObservations: 1 })
+
+    const result = await adapter.hook(request(input))
+
+    expect(result).toMatchObject({ status: "compacted" })
+    if (result.status !== "compacted") return
+    expect(result.snapshot.toolObservations.map(item => item.id)).toContain(canonicalWait.id)
+    expect(result.snapshot.toolObservations[0]?.content).toMatchObject({ memory: { waits: [{ id: canonicalWait.id, status: "completed" }] } })
+  })
+
   it("does not retain every large non-control event payload as a raw anchor", async () => {
     const noise = Array.from({ length: 20 }, (_, index) => ({ id: `event:noise-${index}`, content: { payload: "x".repeat(7_000) } }))
     const input = { ...base, toolObservations: noise }

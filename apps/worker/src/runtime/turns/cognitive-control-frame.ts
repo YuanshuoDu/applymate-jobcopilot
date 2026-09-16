@@ -16,6 +16,8 @@ const KNOWN_STATUSES = new Set(["waiting", "pending", "running", "retrying", "fa
 const ACTIVE_WAIT_STATUSES = new Set(["waiting", "pending", "running", "retrying", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"])
 const ACTIVE_APPROVAL_STATUSES = new Set(["waiting", "pending", "running", "retrying", "required", "waiting_for_approval"])
 const UNRESOLVED_STATUSES = new Set(["waiting", "pending", "running", "retrying", "failed", "interrupted", "cancelled", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"])
+const WAIT_TOOL_NAMES = ["agent.wait", "wait_subagents"] as const
+type WaitToolName = typeof WAIT_TOOL_NAMES[number]
 
 export type CognitiveControlFrame = {
   readonly schemaVersion: typeof COGNITIVE_CONTROL_FRAME_SCHEMA_VERSION
@@ -58,6 +60,10 @@ export type CognitiveControlFrame = {
 type Row = Record<string, unknown>
 type FrameInput = { readonly replanRequired?: boolean; readonly freshSteering?: boolean }
 type IdSet = { readonly count: number; readonly ids: readonly string[] }
+
+function isWaitToolName(value: unknown): value is WaitToolName {
+  return typeof value === "string" && WAIT_TOOL_NAMES.includes(value as WaitToolName)
+}
 
 function plain(value: unknown): value is Row {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value) && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)
@@ -168,7 +174,7 @@ export function buildCognitiveControlFrame(context: StepContext, input: FrameInp
         planRevision = candidateRevision; planAnchorId = observationId
       }
     }
-    const isWait = kind === "wait_result" || record.toolName === "wait_subagents" || block.id.startsWith("observation:wait-result:") || kind === "plan_control" && currentStatus !== null && ACTIVE_WAIT_STATUSES.has(currentStatus)
+    const isWait = kind === "wait_result" || isWaitToolName(record.toolName) || block.id.startsWith("observation:wait-result:") || kind === "plan_control" && currentStatus !== null && ACTIVE_WAIT_STATUSES.has(currentStatus)
     const isApproval = kind === "approval" || typeof record.approvalId === "string" || block.id.startsWith("observation:approval:") || currentStatus === "waiting_for_approval"
     if (observationId && isWait && currentStatus !== null && ACTIVE_WAIT_STATUSES.has(currentStatus)) waitValues.push(observationId)
     if (observationId && isApproval && (currentStatus === null && kind === "approval" || currentStatus !== null && ACTIVE_APPROVAL_STATUSES.has(currentStatus))) approvalValues.push(observationId)
