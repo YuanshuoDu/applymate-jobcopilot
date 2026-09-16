@@ -1346,3 +1346,21 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Commit `a11d13dc` makes the server-owned completion verifier scope `completion_proposed` evidence to the latest contiguous accepted plan revision. Unknown, duplicate, stale, malformed, or cross-plan completion controls fail closed; dependency observations must remain unique, completed, bounded, and earlier than the completion control. Replan obligations now require matching server-owned plan and source-observation identities.
 - Root validation passed **16/16** focused completion-verifier and replan-feedback tests. Worker TypeScript, the shared build, and `git diff --check` passed. No schema, provider, queue, Web, or feature flag changed.
 - Candidate boundary: live PostgreSQL/RLS, Redis/BullMQ delivery, process restart, provider/model calls, browser behavior, deployment, and semantic evaluation of natural-language criteria remain unverified. Overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-32 candidate - planner capability catalog bound to the runtime registry
+
+- Commit `e59dad64` makes canonical planner tool/template allowlists derive from the server-owned `ToolRegistry` catalog after capability filtering. Requested names that are not executable in the active registry are removed before plan validation; unavailable registries, malformed allowlists, and malformed template metadata fail closed with typed errors. Canonical runtime, plan execution, and worker tool registration share the same catalog derivation.
+- Root's affected focused suite passed **167/167 tests**; the subsequent full Worker run passed **280 test files / 1,854 tests with 3 skips**, Worker TypeScript passed, and `git diff --check` passed. No provider, migration, dependency, Web, or legacy pipeline change was made.
+- Candidate boundary: no live registry drift test across processes, PostgreSQL/RLS, Redis/BullMQ delivery, process restart, provider/model, browser, deployment, or complete goal-to-plan-to-tool production proof was run. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-33 candidate - fail-closed canonical child and wait startup wiring
+
+- Commit `e59dad64` exposes the resolved server gates from `createCanonicalTurnRuntime` and makes `createProductionWorkerBootstrap` reject partial wiring before Turn consumer construction. An enabled child gate requires a child consumer; an enabled coordination gate requires the durable wait resolver. Cleanup still closes the canonical runtime on startup failure, and default-off gates plus the legacy rollback path remain intact.
+- The child-wiring worker run passed **34/34 focused tests**; the unified Worker suite, Worker TypeScript, and `git diff --check` passed as recorded above. This proves a visible startup contract, not live queue or wake delivery.
+- Candidate boundary: no live PostgreSQL/RLS, Redis/BullMQ, concurrent startup, Worker restart, provider/model, browser, deployment, or complete child-parent recovery evidence was run. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-34 candidate - invalidate provider continuation after server-owned tool feedback
+
+- Commit `7995d332` clears a provider continuation cursor whenever a tool result or plan observation becomes part of the next canonical model context. Durable assistant/tool messages and bounded snapshots remain available, while an opaque pre-tool provider cursor cannot be replayed against changed server-owned context. Existing approvals, waits, budgets, and replay contracts remain unchanged.
+- Root validation passed **68/68** Turn execution-loop tests, then the full Worker suite at **280 test files / 1,854 tests with 3 skips**; Worker TypeScript and `git diff --check` passed. No provider implementation or new model route was added.
+- Candidate boundary: live provider continuation semantics, PostgreSQL/RLS, Redis/BullMQ delivery, process restart, browser, deployment, and complete multi-turn production evidence remain unverified. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.

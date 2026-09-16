@@ -2416,3 +2416,33 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Root validation passed **16/16** focused completion-verifier and replan-feedback tests. Worker TypeScript, the shared build, and `git diff --check` passed. No schema, provider, queue, Web, or feature flag changed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, Redis/BullMQ delivery, process restart, provider/model calls, browser behavior, deployment, and semantic evaluation of natural-language criteria remain unverified. Overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## 118. P8-32 — Server-owned planner capability catalog
+
+**Candidate status/date (2026-09-16):** P8-32 is recorded as a candidate Worker planner/runtime-registry slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `e59dad64` derives canonical planner tool and template allowlists from the active `ToolRegistry` definitions after server capability filtering. Stale requested names are removed before proposal acceptance or plan execution; unavailable registries, malformed allowlists, and invalid template metadata fail closed with typed planner-capability errors. Optional validated template metadata is carried by public registry definitions, while the protocol tool schema remains unchanged.
+
+**Independent verification:** The affected canonical plan, planner capability, tool registry, tool runtime, and canonical runtime checks passed; the combined affected suite was **167/167 tests**. The full Worker suite passed **280 test files / 1,854 tests / 3 skipped**. Worker TypeScript and `git diff --check` passed.
+
+**Candidate boundary:** No live PostgreSQL/RLS, cross-process registry drift, Redis/BullMQ delivery, process restart, provider/model, browser, deployment, or complete goal-to-plan-to-tool production evidence was run. P8-32 remains a candidate and does not complete the Harness.
+
+## 119. P8-33 — Fail-closed canonical child and wait startup wiring
+
+**Candidate status/date (2026-09-16):** P8-33 is recorded as a candidate Worker production-composition guard; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `e59dad64` exposes server-owned `childExecutionEnabled` and `coordinationEnabled` from `createCanonicalTurnRuntime`. Before creating the Turn consumer, production bootstrap now rejects an enabled child gate without a child consumer or an enabled coordination gate without a durable wait resolver, then closes the canonical runtime. Default-off flags and the legacy rollback path remain unchanged.
+
+**Independent verification:** Child-wiring focused validation passed **34/34 tests**; the full Worker suite, Worker TypeScript, and `git diff --check` passed.
+
+**Candidate boundary:** This guard does not prove live child queue delivery, durable wait wakeup, PostgreSQL/RLS transactions, Redis/BullMQ behavior, concurrent startup, process restart, provider/model, browser, deployment, or complete parent-to-child-to-parent recovery. P8-33 remains a candidate.
+
+## 120. P8-34 — Clear stale provider continuation after tool feedback
+
+**Candidate status/date (2026-09-16):** P8-34 is recorded as a candidate Worker model-context continuity slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `7995d332` clears any provider continuation cursor after server-owned tool results or plan observations enter the next canonical model context. Existing canonical tool messages and bounded snapshots remain intact; opaque provider state cannot be reused against changed server-owned context. Approval, wait, budget, replay, and feature-gate contracts are preserved.
+
+**Independent verification:** Turn execution-loop focused validation passed **68/68 tests**; the full Worker suite passed **280 test files / 1,854 tests / 3 skipped**. Worker TypeScript and `git diff --check` passed.
+
+**Candidate boundary:** No live provider continuation stream, PostgreSQL/RLS, Redis/BullMQ delivery, process restart, browser, deployment, or complete multi-turn production evidence was run. P8-34 remains a candidate; overall acceptance stays **P0 accepted 1/8 (12.5%)**.

@@ -689,3 +689,23 @@ P3-26 focused evidence 为 **4 个文件 / 95 tests**；shared build、Worker `t
 `ProductionWorkerBootstrap` 现在在创建 canonical Turn consumer 后、启动 recovery scanner 和可选 child/wait consumer 前，先创建同一份 `TurnShutdownController`。如果后续任一启动步骤失败，cleanup 会暂停 Turn intake，中止当前 root execution，并按现有 owner/version fence release 或 expire lease，然后关闭 scanner/queue、manager 和 runtime；正常 Worker shutdown 继续复用该 controller。这样启动失败与进程重启共用 root lease recovery 边界，不会把已 claim 的 Turn 留到 lease 自然过期。
 
 Worker focused validation 为 **14/14 tests**（production bootstrap 与 production flags），Worker TypeScript 和 `git diff --check` 通过。未做 live PostgreSQL/RLS、Redis/BullMQ、并发启动、provider/model、browser、deployment 或完整 child → wait → parent resume 验证；本候选不改变默认 gate，也没有 migration、dependency 或 provider 变更。
+
+## P8-32 update
+
+Commit `e59dad64` adds a server-owned planner capability catalog. Canonical planning and the worker tool-runtime entry point now derive planner tool and template allowlists from the definitions that the active `ToolRegistry` can actually resolve, after applying the server capability fence. Stale requested tools are removed before a proposal can be accepted or persisted; malformed allowlists, unavailable registries, and malformed template metadata fail closed with typed planner-capability errors. Optional template metadata is validated and exposed through the public registry definition, while the existing tool schema contract remains unchanged.
+
+This makes the model-facing plan vocabulary match the executable runtime instead of a hand-maintained list. Role contracts, policy snapshots, feature gates, and the legacy executor path remain unchanged; no provider, migration, dependency, or new tool implementation was added. The affected focused suite passed **167/167 tests**, the full Worker suite passed **280 test files / 1,854 tests / 3 skipped**, Worker TypeScript passed, and `git diff --check` passed.
+
+Live PostgreSQL/RLS, cross-process registry drift, Redis/BullMQ delivery, process restart, provider/model behavior, browser behavior, deployment, and full goal-to-plan-to-tool production evidence remain unverified. Overall completion remains **1/8 (12.5%)**; P8-32 is a candidate increment.
+
+## P8-33 update
+
+The same commit `e59dad64` closes a partial-production-wiring hole. `createCanonicalTurnRuntime` exposes the resolved server-owned `childExecutionEnabled` and `coordinationEnabled` gates. `createProductionWorkerBootstrap` checks those gates before constructing the Turn consumer: child execution without a child consumer, or coordination without a durable wait resolver, now fails visibly and cleans up the canonical runtime instead of starting a process that can accept work with no consumer or wake path. Default-off feature flags and the legacy rollback path are unchanged.
+
+Production bootstrap and canonical-runtime focused validation passed **34/34 tests** in the child-wiring run; the unified Worker suite and type checks also passed. This is a startup contract guard, not proof of live child queue delivery, wait wakeup, or process restart recovery. Overall completion remains **1/8 (12.5%)**; P8-33 is a candidate increment.
+
+## P8-34 update
+
+Commit `7995d332` closes a model-context continuity hazard after server-owned tool execution. Once tool results or plan observations are incorporated into the next canonical step, the execution loop clears any provider continuation cursor before issuing the next model request. Existing canonical assistant/tool messages and bounded snapshots remain intact, but a provider cannot resume an opaque pre-tool cursor against context that the server has changed. This keeps continuation state subordinate to the durable execution ledger and preserves approval, wait, budget, and replay behavior.
+
+The focused Turn execution loop passed **68/68 tests**; the full Worker suite passed **280 files / 1,854 tests with 3 skips**, Worker TypeScript passed, and `git diff --check` passed. No provider, schema, Web, migration, queue, or feature-flag behavior was added. Live provider continuation behavior, PostgreSQL/RLS, Redis/BullMQ, process restart, browser, deployment, and complete multi-turn production evidence remain unverified. Overall completion remains **1/8 (12.5%)**; P8-34 is a candidate increment.
