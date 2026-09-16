@@ -1298,3 +1298,27 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - The durable-wait consumer uses `agent.wait` for new writes and replayed projections; historical `wait_subagents` remains compatible for reads.
 - The canonical aliases remain compatibility names at the runtime boundary. An older explicit `PolicySnapshot` that allows only legacy names still rejects a canonical name, because the persisted snapshot remains authoritative and alias resolution cannot widen a captured policy.
 - Focused Worker validation passed **173/173 tests across 12 files**; focused durable-wait-consumer validation passed **17/17**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Live PostgreSQL/RLS, Redis/BullMQ delivery, provider/model calls, browser behavior, process restart/recovery, deployment, and complete end-to-end evidence remain unverified. This remains an ongoing candidate slice; overall acceptance is unchanged.
+
+## P8-24 candidate - shared tree-budget attempt fencing
+
+- Commit `e8c370f7` adds the current child-task attempt to the server-owned lineage predicate used by shared tree-budget reservations. A task that has lost its lease and been reclaimed cannot reserve another unit from an older attempt, while existing idempotent reservation and released-reservation conflict behavior remains unchanged.
+- Root validation passed **15/15** focused tree-budget tests, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check`.
+- Candidate boundary: no live PostgreSQL/RLS lease race, process restart, Redis/BullMQ delivery, provider/model call, browser, deployment, or complete child-tree E2E evidence was run. Overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-25 candidate - native spawn role admission fence
+
+- Commit `136b1af5` validates a native `agent.spawn` role against the server-owned subagent policy before parent resolution, replay lookup, durable spawn creation, or dispatch. Unknown, privileged, and prototype-chain names (`constructor`, `toString`, `__proto__`) fail closed; valid roles keep the existing tenant, idempotency, replay, and queue path.
+- Root validation passed **49/49** focused role-policy and coordination tests, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check`.
+- Candidate boundary: no live PostgreSQL/RLS, Redis/BullMQ delivery, process restart, provider/model call, browser, deployment, or complete parent-to-child E2E evidence was run. Overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-26 candidate - server-owned child capability contract
+
+- Commits `d37dc12e` and `76037733` add server-owned child `role`, `taskType`, capabilities, guidance, and write/child-management flags to the profile context. The task profile remains `external_untrusted`; runtime-published tools and router policy remain authoritative. Policy and guidance lookups fail closed for prototype keys.
+- Root validation passed **26/26** focused child-context tests, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check`.
+- Candidate boundary: no live PostgreSQL/RLS, Redis/BullMQ delivery, process restart, provider/model call, browser, deployment, or complete parent-to-child E2E evidence was run. Overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-27 candidate - recoverable wakeup outbox and Gmail source lineage
+
+- Commits `62eef955` and `8c4b223f` harden `agent.turn.wakeup` consumption. The consumer locks the session first, fences aborted/archived sessions, verifies source-event scope and payload lineage, checks wait-item/tool lineage and Turn revision, quarantines malformed or terminally inconsistent rows with `lastError`, and leaves transient failures pending for retry. Duplicate delivery is idempotent after the first resume. Gmail OAuth recovery now atomically writes the canonical `turn.wakeup` fact and outbox entry, including the OAuth question-item `waitId` lineage.
+- Root validation passed **104/104** Worker tests across coordination, role policy, child context, tree budget, and wakeup suites; the wakeup consumer passed **14/14**; Gmail recovery passed **4/4**; Worker and Web typechecks passed; `git diff --check` passed.
+- Candidate boundary: no live PostgreSQL/RLS transaction or concurrent consumer race, Redis/BullMQ delivery, process restart, provider/model call, browser, deployment, or complete Gmail-to-Worker end-to-end evidence was run. This slice does not claim production recovery or full harness acceptance; overall acceptance remains **P0 accepted 1/8 (12.5%)**.

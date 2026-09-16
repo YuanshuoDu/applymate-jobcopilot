@@ -2336,3 +2336,43 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused Worker validation passed **173/173 tests across 12 files**; focused durable-wait-consumer validation passed **17/17**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, Redis/BullMQ delivery, provider/model calls, browser behavior, process restart/recovery, deployment, and complete end-to-end evidence remain unverified. This is an ongoing candidate hardening slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## 110. P8-24 — Shared tree-budget attempt fencing
+
+**Candidate status/date (2026-09-16):** P8-24 is recorded as a candidate Worker lease and budget consistency slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `e8c370f7` adds the current child-task attempt to the server-owned lineage predicate used by shared tree-budget reservations. A task that has lost its lease and been reclaimed cannot reserve another unit from an older attempt, even when the step, turn, and root identifiers still match. Existing idempotent reservation and released-reservation conflict behavior remains unchanged.
+
+**Independent verification:** Root validation passed **15/15** focused tree-budget tests, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check`.
+
+**Candidate boundary:** No live PostgreSQL/RLS lease race, process restart, Redis/BullMQ delivery, provider/model call, browser, deployment, or complete child-tree E2E evidence was run. This remains a candidate fencing repair; overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## 111. P8-25 — Native spawn role admission fence
+
+**Candidate status/date (2026-09-16):** P8-25 is recorded as a candidate Worker role-admission and dispatch-safety slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `136b1af5` validates a native `agent.spawn` role against the server-owned subagent policy before resolving the parent, reading replay state, creating durable spawn state, or dispatching a child. Unknown, privileged, and prototype-chain names such as `constructor`, `toString`, and `__proto__` fail closed, while valid roles retain the existing tenant, idempotency, replay, and queue path.
+
+**Independent verification:** Root validation passed **49/49** focused role-policy and coordination tests, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check`.
+
+**Candidate boundary:** No live PostgreSQL/RLS, Redis/BullMQ delivery, process restart, provider/model call, browser, deployment, or complete parent-to-child E2E evidence was run. This remains a candidate admission fence; overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## 112. P8-26 — Server-owned child capability contract
+
+**Candidate status/date (2026-09-16):** P8-26 is recorded as a candidate Worker child-context trust-boundary slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commits `d37dc12e` and `76037733` add the server-owned child `role`, `taskType`, capabilities, guidance, and write/child-management flags to the profile context. The task profile remains `external_untrusted`; runtime-published tools and router policy remain authoritative. Policy and guidance lookups are own-key/Map guarded so prototype names cannot inherit permissions or guidance.
+
+**Independent verification:** Root validation passed **26/26** focused child-context tests, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check`.
+
+**Candidate boundary:** No live PostgreSQL/RLS, Redis/BullMQ delivery, process restart, provider/model call, browser, deployment, or complete parent-to-child E2E evidence was run. This remains a candidate context contract; overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## 113. P8-27 — Recoverable wakeup outbox and Gmail source lineage
+
+**Candidate status/date (2026-09-16):** P8-27 is recorded as a candidate Worker/Web durable-wakeup reliability slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commits `62eef955` and `8c4b223f` harden `agent.turn.wakeup` consumption. The consumer locks the session before inspecting the Turn, fences aborted/archived sessions, verifies source-event scope and payload lineage, checks wait-item/tool lineage and the expected Turn revision, quarantines malformed or terminally inconsistent rows with `lastError`, and leaves transient failures pending for retry. Duplicate delivery is idempotent after the first resume. Gmail OAuth recovery now atomically writes the canonical `turn.wakeup` fact and its outbox entry, including the OAuth question-item `waitId` lineage, so recovery cannot create an orphaned wakeup.
+
+**Independent verification:** Root validation passed **104/104** Worker tests across coordination, role policy, child context, tree budget, and wakeup suites; the wakeup consumer passed **14/14**; Gmail recovery passed **4/4**; Worker and Web typechecks passed; `git diff --check` passed.
+
+**Candidate boundary:** No live PostgreSQL/RLS transaction or concurrent consumer race, Redis/BullMQ delivery, process restart, provider/model call, browser, deployment, or complete Gmail-to-Worker end-to-end evidence was run. This slice does not claim production recovery or full harness acceptance; overall acceptance remains **P0 accepted 1/8 (12.5%)**.
