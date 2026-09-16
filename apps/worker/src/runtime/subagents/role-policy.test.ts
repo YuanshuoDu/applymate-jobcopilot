@@ -36,8 +36,16 @@ describe("subagent role policy", () => {
     expect(preflightSubagentTool("executor", null)).toMatchObject({ allowed: false, execute: false })
   })
 
-  it("hides coordination tools even when their domain is otherwise visible", () => {
-    expect(visibleToolPolicy("reviewer", tool("spawn_subagent", "internal_write", "coordination")).reason).toBe("coordination_disabled")
-    expect(visibleToolPolicy("reviewer", tool("wait_subagents", "read", "coordination")).visible).toBe(false)
+  it("hides every canonical and legacy coordination tool from children", () => {
+    const names = [
+      "spawn_subagent", "agent.spawn", "agent.followup", "send_message", "agent.send",
+      "wait_subagents", "agent.wait", "list_subagents", "agent.list",
+      "interrupt_subagent", "agent.interrupt", "close_subagent", "agent.close",
+    ]
+    for (const name of names) {
+      const risk = name === "list_subagents" || name === "agent.list" ? "read" : "internal_write"
+      expect(visibleToolPolicy("reviewer", tool(name, risk, "coordination"))).toMatchObject({ visible: false, reason: "coordination_disabled" })
+    }
+    expect(visibleToolPolicy("reviewer", tool("jobs.search", "read", "jobs")).visible).toBe(true)
   })
 })

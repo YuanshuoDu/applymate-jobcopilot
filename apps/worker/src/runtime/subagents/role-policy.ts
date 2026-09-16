@@ -41,6 +41,12 @@ type RoleToolMetadata = Pick<RuntimeToolDefinition, "name" | "risk" | "domain" |
 }
 
 const READ_DOMAINS: readonly PolicyDomain[] = ["jobs", "persona", "resume", "application", "coordination", "unknown"]
+const COORDINATION_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "spawn_subagent", "agent.spawn", "agent.followup",
+  "send_message", "agent.send", "wait_subagents", "agent.wait",
+  "list_subagents", "agent.list", "interrupt_subagent", "agent.interrupt",
+  "close_subagent", "agent.close",
+])
 
 const POLICIES: Readonly<Record<HarnessSubagentRole, SubagentRolePolicy>> = {
   scout: { role: "scout", actorRole: "subagent", capabilities: ["read"], allowedRisks: ["read"], allowedDomains: ["jobs"], canManageChildren: false, externalWritesEnabled: false },
@@ -66,7 +72,7 @@ export function visibleToolPolicy(
 ): ToolVisibility {
   const policy = getSubagentRolePolicy(role)
   if (!policy) return { visible: false, reason: "role_risk_denied" }
-  if (/^(spawn_subagent|send_message|wait_subagents|list_subagents|interrupt_subagent|close_subagent)$/.test(tool.name)) {
+  if (COORDINATION_TOOL_NAMES.has(tool.name)) {
     return { visible: false, reason: "coordination_disabled" }
   }
   if (tool.risk === "external_write" || tool.capabilities?.includes("external_write") || looksLikeExternalAction(tool.name)) {

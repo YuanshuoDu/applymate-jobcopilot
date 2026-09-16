@@ -3,11 +3,19 @@ import type { PolicyEvaluationContext, PolicyToolDescriptor, PolicySnapshot } fr
 
 import { createCanonicalPolicy } from "./canonical-policy.js"
 
-const coordinationTool: PolicyToolDescriptor = {
-  name: "spawn_subagent", version: "1", risk: "internal_write", domain: "coordination", capabilities: ["coordination"], requiredCapabilities: ["canManageChildren"],
-}
-const coordinationReadTool: PolicyToolDescriptor = {
-  name: "list_subagents", version: "1", risk: "read", domain: "coordination", capabilities: ["read", "coordination"], requiredCapabilities: ["canManageChildren"],
+const coordinationWriteToolNames = [
+  "spawn_subagent", "agent.spawn", "agent.followup",
+  "send_message", "agent.send", "wait_subagents", "agent.wait",
+  "interrupt_subagent", "agent.interrupt", "close_subagent", "agent.close",
+] as const
+const coordinationReadToolNames = ["list_subagents", "agent.list"] as const
+
+function coordinationTool(name: string, risk: "read" | "internal_write"): PolicyToolDescriptor {
+  return {
+    name, version: "1", risk, domain: "coordination",
+    capabilities: risk === "read" ? ["read", "coordination"] : ["coordination"],
+    requiredCapabilities: ["canManageChildren"],
+  }
 }
 const planningTool: PolicyToolDescriptor = {
   name: "agent.plan.propose", version: "1", risk: "internal_write", domain: "coordination", capabilities: ["coordination"], requiredCapabilities: ["canPlan"],
@@ -23,10 +31,14 @@ function context(tool: PolicyToolDescriptor, capabilities = ["read", "canManageC
 }
 
 describe("canonical root policy", () => {
-  it("allows gated coordination and keeps the safe read baseline", () => {
+  it("allows every gated canonical and legacy coordination name", () => {
     const policy = createCanonicalPolicy({}, true)
-    expect(policy.evaluate(context(coordinationTool))).toMatchObject({ outcome: "allow", reasonCode: "server_coordination_gate" })
-    expect(policy.evaluate(context(coordinationReadTool))).toMatchObject({ outcome: "allow", reasonCode: "server_coordination_read_gate" })
+    for (const name of coordinationWriteToolNames) {
+      expect(policy.evaluate(context(coordinationTool(name, "internal_write")))).toMatchObject({ outcome: "allow", reasonCode: "server_coordination_gate" })
+    }
+    for (const name of coordinationReadToolNames) {
+      expect(policy.evaluate(context(coordinationTool(name, "read")))).toMatchObject({ outcome: "allow", reasonCode: "server_coordination_read_gate" })
+    }
     expect(policy.evaluate(context(readTool))).toMatchObject({ outcome: "allow", reasonCode: "safe_read_baseline" })
   })
 
@@ -36,11 +48,16 @@ describe("canonical root policy", () => {
 
   it("preserves an explicit policy denial and does not fallback over it", () => {
     const explicit: PolicySnapshot = { version: "policy.v1", rules: [{ id: "deny-coordination", roles: ["orchestrator"], domains: ["coordination"], outcome: "deny", reasonCode: "explicit_deny", reason: "Coordination is disabled by policy" }] }
-    expect(createCanonicalPolicy(explicit, true).evaluate(context(coordinationTool))).toMatchObject({ outcome: "deny", reasonCode: "explicit_deny" })
+    const policy = createCanonicalPolicy(explicit, true)
+    expect(policy.evaluate(context(coordinationTool("agent.spawn", "internal_write")))).toMatchObject({ outcome: "deny", reasonCode: "explicit_deny" })
+    expect(policy.evaluate(context(coordinationTool("agent.list", "read")))).toMatchObject({ outcome: "deny", reasonCode: "explicit_deny" })
   })
 
-  it("keeps coordination denied when the server gate is off", () => {
-    expect(createCanonicalPolicy({}, false).evaluate(context(coordinationTool))).toMatchObject({ outcome: "deny", reasonCode: "missing_policy" })
+  it("keeps coordination writes denied when the server gate is off", () => {
+    const policy = createCanonicalPolicy({}, false)
+    for (const name of coordinationWriteToolNames) {
+      expect(policy.evaluate(context(coordinationTool(name, "internal_write")))).toMatchObject({ outcome: "deny", reasonCode: "missing_policy" })
+    }
   })
 
   it("allows planning only with the planning gate and derived capability", () => {
@@ -52,12 +69,13 @@ describe("canonical root policy", () => {
   it("fails closed for a present but malformed snapshot instead of falling back", () => {
     expect(() => createCanonicalPolicy({ version: "policy.v1" }, true)).toThrow()
     expect(() => createCanonicalPolicy({ rules: [] }, true)).toThrow()
+    expect(() => createCanonicalPolicy({ version: "policy.v1", rules: "invalid" }, true)).toThrow()
   })
 
   it("treats existing runtime metadata as missing policy without granting it authority", () => {
     for (const metadata of [{ capabilities: ["read"] }, { role: "orchestrator" }]) {
-      expect(createCanonicalPolicy(metadata, true).evaluate(context(coordinationTool))).toMatchObject({ outcome: "allow" })
-      expect(createCanonicalPolicy(metadata, false).evaluate(context(coordinationTool))).toMatchObject({ outcome: "deny", reasonCode: "missing_policy" })
+      expect(createCanonicalPolicy(metadata, true).evaluate(context(coordinationTool("agent.spawn", "internal_write")))).toMatchObject({ outcome: "allow" })
+      expect(createCanonicalPolicy(metadata, false).evaluate(context(coordinationTool("agent.spawn", "internal_write")))).toMatchObject({ outcome: "deny", reasonCode: "missing_policy" })
     }
   })
 })

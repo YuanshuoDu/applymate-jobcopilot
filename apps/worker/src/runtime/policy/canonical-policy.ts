@@ -1,17 +1,24 @@
 import { PolicyEngine, type PolicySnapshot } from "@jobcopilot/agent-policy"
 
+const COORDINATION_WRITE_TOOL_NAMES = [
+  "spawn_subagent", "agent.spawn", "agent.followup",
+  "send_message", "agent.send", "wait_subagents", "agent.wait",
+  "interrupt_subagent", "agent.interrupt", "close_subagent", "agent.close",
+]
+const COORDINATION_READ_TOOL_NAMES = ["list_subagents", "agent.list"]
+
 const FALLBACK_POLICY: PolicySnapshot = {
   version: "policy.v1",
   rules: [
     {
       id: "canonical-root-coordination",
-      roles: ["orchestrator"], tools: ["spawn_subagent", "send_message", "wait_subagents", "interrupt_subagent", "close_subagent"],
+      roles: ["orchestrator"], tools: COORDINATION_WRITE_TOOL_NAMES,
       risks: ["internal_write"], domains: ["coordination"], requiredCapabilities: ["canManageChildren"],
       outcome: "allow", reasonCode: "server_coordination_gate", reason: "The server enabled scoped root coordination tools",
     },
     {
       id: "canonical-root-coordination-read",
-      roles: ["orchestrator"], tools: ["list_subagents"], risks: ["read"], domains: ["coordination"], requiredCapabilities: ["canManageChildren"],
+      roles: ["orchestrator"], tools: COORDINATION_READ_TOOL_NAMES, risks: ["read"], domains: ["coordination"], requiredCapabilities: ["canManageChildren"],
       outcome: "allow", reasonCode: "server_coordination_read_gate", reason: "The server enabled scoped root coordination reads",
     },
     {
