@@ -33,8 +33,34 @@ describe("child context", () => {
     } })
     expect(context.blocks.map(block => block.layer)).toEqual(["system", "profile", "goal", "tool_observation"])
     expect(context.blocks.filter(block => block.source === "subagent-task").every(block => block.trust === "external_untrusted")).toBe(true)
+    expect(context.blocks.find(block => block.layer === "system")?.content).toContain("server-owned role/taskType capability contract")
+    expect(context.blocks.find(block => block.layer === "profile")).toMatchObject({
+      trust: "external_untrusted",
+      content: {
+        role: "analyst",
+        taskType: "research",
+        roleContract: { capabilities: ["read"], externalWritesEnabled: false, canManageChildren: false },
+      },
+    })
     expect(context.canonicalJson).toContain("Find matching jobs")
     expect(context.canonicalJson).toContain("job-1")
+  })
+
+  it.each([
+    ["scout", "read", "Read job data"],
+    ["analyst", "read", "Read permitted job"],
+    ["writer", "read,draft", "create drafts only"],
+    ["reviewer", "read,review", "review them only"],
+    ["auditor", "read,auditEvidence", "redacted audit evidence only"],
+    ["executor", "read,preflight", "preflight checks only"],
+  ] as const)("includes the server-owned %s capability contract", (role, capabilities, guidance) => {
+    const snapshot = childContextSnapshot({ ...task, role, taskType: `${role}.task` })
+    const profile = snapshot.profile[0]?.content
+    expect(profile).toMatchObject({
+      role,
+      taskType: `${role}.task`,
+      roleContract: { capabilities: capabilities.split(","), guidance: expect.stringContaining(guidance), externalWritesEnabled: false, canManageChildren: false },
+    })
   })
 
   it("rejects a context request from another task", async () => {

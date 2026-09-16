@@ -4,6 +4,7 @@ import { Buffer } from "node:buffer"
 import type { ExecutionOwnerFence } from "../execution-owner.js"
 import type { StepContext, StepContextSnapshot, ContextBlock, ContextSeedBlock } from "../context/step-context-builder.js"
 import type { CoordinationMailboxMessage } from "../tools/coordination-types.js"
+import { getSubagentRolePolicy } from "./role-policy.js"
 import type { SubagentTaskRecord } from "./types.js"
 
 const CHILD_MAILBOX_READ_LIMIT = 20
@@ -136,12 +137,40 @@ function copyBlock(block: ContextBlock): ContextBlock {
   return { ...block, content: json(block.content) }
 }
 
+const ROLE_GUIDANCE: Readonly<Record<string, string>> = {
+  scout: "Read job data and report evidence only; do not write, submit, send, or manage children.",
+  analyst: "Read permitted job, persona, and resume data and analyze evidence only; do not write, submit, send, or manage children.",
+  writer: "Read permitted resume data and create drafts only; do not perform external writes, submit, send, or manage children.",
+  reviewer: "Read permitted artifacts and evidence and review them only; do not create drafts, submit, send, or manage children.",
+  auditor: "Read permitted records and produce redacted audit evidence only; do not mutate, submit, send, or manage children.",
+  executor: "Read permitted application state and run preflight checks only; do not execute external actions, submit, send, or manage children.",
+}
+
+function roleGuidance(role: string): string {
+  return ROLE_GUIDANCE[role] ?? "No server-owned capability contract exists for this role; do not execute tools."
+}
+
+function roleContract(task: SubagentTaskRecord): Record<string, unknown> {
+  const policy = getSubagentRolePolicy(task.role)
+  return {
+    role: task.role,
+    taskType: task.taskType,
+    capabilities: policy ? [...policy.capabilities] : [],
+    guidance: roleGuidance(task.role),
+    externalWritesEnabled: policy?.externalWritesEnabled ?? false,
+    canManageChildren: policy?.canManageChildren ?? false,
+  }
+}
+
 export function childContextSnapshot(task: SubagentTaskRecord): StepContextSnapshot {
   return {
-    system: [{ id: "child-execution", content: "Complete only this scoped child task. Use read tools permitted by the role policy." }],
+    system: [{ id: "child-execution", content: "Complete only this scoped child task. Use the server-owned role/taskType capability contract in the profile to choose work; runtime-published tools and router policy are authoritative for access." }],
     profile: [{
       id: `child-contract:${task.id}`,
       content: {
+        role: task.role,
+        taskType: task.taskType,
+        roleContract: roleContract(task),
         constraints: task.constraints,
         successCriteria: task.successCriteria,
         context: task.context,
