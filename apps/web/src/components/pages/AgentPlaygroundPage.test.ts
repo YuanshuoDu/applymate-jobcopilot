@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
+import { isDurableTurnRunning } from './AgentPlaygroundPage'
 
 const source = readFileSync(new URL('./AgentPlaygroundPage.tsx', import.meta.url), 'utf8')
 const streamSource = readFileSync(new URL('../agent-workspace/AgentUnifiedStream.tsx', import.meta.url), 'utf8')
@@ -54,7 +55,21 @@ describe('Agent workspace responsive layout', () => {
   it('keeps canonical active Turn controls and running status in sync with lifecycle events', () => {
     expect(source).toMatch(/if \(!selectedSessionId \|\| timeline\.lifecycleRevision === 0\) return/)
     expect(source).toMatch(/refetchTurnState\(\)\n\s*\}, \[refetchTurnState, selectedSessionId, timeline\.lifecycleRevision\]\)/)
-    expect(source).toContain('const isRunning = Boolean(activeTurn) ||')
+    expect(source).toMatch(/function isDurableTurnRunning\(status: ActiveTurnStatus \| undefined\): boolean \{\n\s*return status === 'queued' \|\| status === 'in_progress'/)
+    expect(source).toContain('const isRunning = isDurableTurnRunning(activeTurn?.status) ||')
+    expect(source).toContain('(runLog.length > 0 && !runDone)')
+    expect(source).not.toContain("status === 'waiting_for_approval' ||")
+    expect(source).not.toContain("status === 'waiting_for_user' ||")
+    expect(source).not.toContain("status === 'waiting_for_dependency' ||")
+  })
+
+  it('marks only queued and in-progress durable Turns as running', () => {
+    expect(isDurableTurnRunning('queued')).toBe(true)
+    expect(isDurableTurnRunning('in_progress')).toBe(true)
+    expect(isDurableTurnRunning('waiting_for_dependency')).toBe(false)
+    expect(isDurableTurnRunning('waiting_for_approval')).toBe(false)
+    expect(isDurableTurnRunning('waiting_for_user')).toBe(false)
+    expect(isDurableTurnRunning(undefined)).toBe(false)
   })
 
   it('keeps one execution stream and delegates session rendering to the V2 timeline client', () => {

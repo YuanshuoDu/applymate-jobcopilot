@@ -14,7 +14,7 @@ import { AgentSupervisorPanel } from '@/components/agent-workspace/v2/AgentSuper
 import { sessionHeaderSubtitle, type AgentSessionsResponse } from '@/components/agent-workspace/session-view-model'
 import type { LogEntry, QuestionOption, RunSummary } from '@/components/agent-workspace/live-run-types'
 import type { SubmissionPolicySettings } from '@/components/agent-workspace/automation-policy'
-import { useAgentSessionState, useAgentSessionUrl } from '@/components/agent-workspace/agent-session-state'
+import { useAgentSessionState, useAgentSessionUrl, type ActiveTurnStatus } from '@/components/agent-workspace/agent-session-state'
 import { AgentTurnComposerProvider, useAgentTurnComposer } from '@/components/agent-workspace/agent-turn-commands'
 import { useAgentTimeline } from '@/components/agent-workspace/v2/use-agent-timeline'
 import { useNav } from '@/lib/nav-context'
@@ -27,6 +27,10 @@ import { useI18n } from '@/lib/i18n'
 // ── Chat types ────────────────────────────────────────────────────────────────
 
 // ── Main Page ─────────────────────────────────────────────────────────────────
+
+export function isDurableTurnRunning(status: ActiveTurnStatus | undefined): boolean {
+  return status === 'queued' || status === 'in_progress'
+}
 
 export function AgentPlaygroundPage() {
   const toast = useToast()
@@ -353,7 +357,9 @@ export function AgentPlaygroundPage() {
     window.dispatchEvent(new Event('applymate:sessions-changed'))
   }, [addLog, sessionId])
 
-  const isRunning = Boolean(activeTurn) || !!currentRole || (runLog.length > 0 && !runDone)
+  // Waiting gates remain in activeTurn for Stop/Steer/approval controls, but
+  // the header should reserve Running for work that is actively progressing.
+  const isRunning = isDurableTurnRunning(activeTurn?.status) || !!currentRole || (runLog.length > 0 && !runDone)
   const visibleWaitingQuestion = waitingQuestion && runLog.some(entry =>
     entry.type === 'orchestrator_question'
       && entry.questionId === waitingQuestion.id
