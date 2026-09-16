@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto'
 import { Prisma, type PrismaClient } from '@prisma/client'
 import { appendAgentEventWithOutboxInTransaction } from '@/lib/agent/session/fact-store'
 
@@ -36,19 +35,25 @@ export async function resumeGmailOAuthWait(db: PrismaClient, input: { userId: st
     const turn = await tx.agentTurn.findFirst({ where: { id: item.turnId, sessionId: item.sessionId, userId: input.userId }, select: { id: true, revision: true, status: true } })
     if (!turn || turn.status !== 'waiting_for_user') return false
     await tx.agentItem.update({ where: { id: item.id }, data: { status: 'completed', completedAt: new Date(), content: { ...content, answerAvailable: true, reconnected: true } as Prisma.InputJsonValue } })
-    await appendAgentEventWithOutboxInTransaction(tx, {
+    const reconnected = await appendAgentEventWithOutboxInTransaction(tx, {
       sessionId: item.sessionId, turnId: item.turnId, itemId: item.id, taskId: null,
       type: 'gmail.oauth_reconnected', actor: 'system', correlationId: input.waitId, causationId: item.id,
       idempotencyKey: `gmail-oauth:${input.waitId}:reconnected`, payload: { waitId: input.waitId, itemId: item.id }, outboxTopic: 'agent.session.event',
     })
-    const wakeEventId = randomUUID()
-    await tx.agentOutbox.create({ data: {
-      id: `gmail-oauth-wakeup:${input.waitId}`, topic: 'agent.turn.wakeup', aggregateId: item.sessionId,
-      idempotencyKey: `gmail-oauth:${input.waitId}:wakeup`, payload: {
-        eventId: wakeEventId, sessionId: item.sessionId, turnId: item.turnId, itemId: item.id, type: 'turn.wakeup',
-        payload: { waitKind: 'question', waitId: input.waitId, itemId: item.id, toolCallId: typeof content.toolCallId === 'string' ? content.toolCallId : null, status: 'answered', nextTurnRevision: turn.revision },
-      } as Prisma.InputJsonValue,
-    } })
+    const wakeupPayload = {
+      waitKind: 'question' as const,
+      waitId: input.waitId,
+      itemId: item.id,
+      turnId: item.turnId,
+      toolCallId: typeof content.toolCallId === 'string' ? content.toolCallId : null,
+      status: 'answered' as const,
+      nextTurnRevision: turn.revision,
+    }
+    await appendAgentEventWithOutboxInTransaction(tx, {
+      sessionId: item.sessionId, turnId: item.turnId, itemId: item.id, taskId: null,
+      type: 'turn.wakeup', actor: 'system', correlationId: item.turnId, causationId: reconnected.event.id,
+      idempotencyKey: `gmail-oauth:${input.waitId}:wakeup`, payload: wakeupPayload, outboxTopic: 'agent.turn.wakeup',
+    })
     return true
   })
 }
