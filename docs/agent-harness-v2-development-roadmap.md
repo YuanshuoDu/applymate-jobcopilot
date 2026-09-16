@@ -2206,3 +2206,15 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** The focused Web V2 timeline reducer suite passed **22/22 tests**, including the stale reconnect regression and existing replay, hydration, revision, sequence, and terminal-state behavior. `git diff --check` passed.
 
 **Candidate boundary:** No live PostgreSQL/RLS, production SSE reconnect/overflow timing, cross-tab or cross-worker race, process restart, Worker/Redis delivery, provider/model/browser behavior, deployment, or complete Workbench end-to-end evidence was added. No Worker, schema, provider, queue, model, or feature flag changed; overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## 98. P8-11 — Worker post-bootstrap startup failure fence
+
+**Candidate status/date (2026-09-16):** P8-11 is recorded as a candidate Worker startup-failure cleanup slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `163cb826` adds a server-owned, one-shot post-bootstrap cleanup fence in `apps/worker/src/index.ts`. The fence covers failures after `createProductionWorkerBootstrap` succeeds: delayed agent-run router startup, Turn wakeup consumer startup, subagent mailbox outbox consumer startup, `restoreWorkerRuntimeState`, automation scheduler initialization, and health/admin initialization. A failure closes every resource that was actually created, including queue workers, canonical bootstrap/runtime and lease resources, cloak slots, the pool, shared Redis connections, and optional consumers, before the original startup error reaches `main().catch`.
+
+**Shutdown contract:** Cleanup continues after an individual close error and preserves the first cleanup error. Normal SIGINT/SIGTERM shutdown uses the existing close order through the same fence, with the admin HTTP server included; an unstarted or already-closed listener is skipped so the shutdown path does not close a resource that never became active. The existing rollout gates and canonical bootstrap boundary are unchanged.
+
+**Independent verification:** Focused Worker validation passed **11/11 tests** across the startup-fence helper and agent-run queue suites (2 + 9). The shared package build ran as the Worker test pre-step; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+**Candidate boundary:** No live PostgreSQL/RLS, Redis/BullMQ delivery or shutdown race, real process restart, provider/model call, browser behavior, deployment, or complete Worker/V2 end-to-end evidence was added. Overall acceptance remains **P0 accepted 1/8 (12.5%)**.
