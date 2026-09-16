@@ -10,12 +10,21 @@ export type PlanCommandExecutionStep = {
   readonly blocked?: PlanControlRecord
 }
 
-export type PlanCommandSchedulerRuntime = Pick<PlanCommandExecutionRuntime, "parallelDelegateLimit"> & {
+export type PlanCommandSchedulerRuntime = Pick<PlanCommandExecutionRuntime, "parallelDelegateLimit" | "admit" | "shouldAdmit"> & {
   readonly outputs: Map<string, unknown>
   readonly execute: (command: ExecutableCommand, outputs: ReadonlyMap<string, unknown>) => Promise<PlanCommandExecutionStep>
   readonly observe: (record: PlanCommandExecutionRecord | PlanControlRecord) => Promise<void>
   readonly storeOutput: (record: PlanCommandExecutionRecord) => void
   readonly invalidPlan: (message: string) => never
+}
+
+function admissionCount(commands: readonly ExecutableCommand[], runtime: PlanCommandSchedulerRuntime): number {
+  return commands.reduce((count, command) => count + (runtime.shouldAdmit?.(command) === false ? 0 : 1), 0)
+}
+
+function admit(commands: readonly ExecutableCommand[], runtime: PlanCommandSchedulerRuntime): void {
+  const count = admissionCount(commands, runtime)
+  if (count > 0) runtime.admit?.(count)
 }
 
 function isControl(command: PlanDispatchCommand): command is ControlCommand {
@@ -39,6 +48,7 @@ async function executeSerial(commands: readonly PlanDispatchCommand[], runtime: 
       return { status: "blocked", completed, blocked: command }
     }
     if (!isExecutable(command)) runtime.invalidPlan("Plan executable command is invalid")
+    admit([command], runtime)
     const step = await runtime.execute(command, outputs)
     await runtime.observe(step.record)
     if (step.record.result.status !== "completed") return failed(completed, step)
@@ -87,6 +97,7 @@ async function observeSettled(
 }
 
 async function executeBatch(batch: readonly ReadyCommand[], runtime: PlanCommandSchedulerRuntime, completed: PlanCommandExecutionRecord[], outputs: Map<string, unknown>, done: Set<number>, completedIds: Set<string>): Promise<PlanCommandExecutionResult | undefined> {
+  admit(batch.map(entry => entry.command as ExecutableCommand), runtime)
   const settled = await Promise.allSettled(batch.map(entry => Promise.resolve().then(() => runtime.execute(entry.command as ExecutableCommand, outputs))))
   const entries = batch.map((entry, index) => ({ command: entry.command as ExecutableCommand, settled: settled[index]! }))
   const observed = await observeSettled(entries, runtime)
@@ -141,6 +152,7 @@ async function executeParallel(commands: readonly PlanDispatchCommand[], runtime
       if (outcome) return outcome
       continue
     }
+    admit([first.command], runtime)
     const step = await runtime.execute(first.command, outputs)
     await runtime.observe(step.record)
     if (step.record.result.status !== "completed") return failed(completed, step)

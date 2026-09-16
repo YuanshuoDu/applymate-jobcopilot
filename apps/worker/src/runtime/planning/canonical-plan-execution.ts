@@ -209,6 +209,17 @@ function failureObservation(callId: string, code: string): { id: string; content
   return safeObservation(`plan-error:${callId}`, { kind: "plan_error", status: "failed", errorCode: code.slice(0, 64) })
 }
 
+function planAdmission(input: Parameters<TurnEnginePlanExecutionHook>[0]): (count: number) => void {
+  return count => {
+    if (!input.admitPlanCommands) return
+    try {
+      input.admitPlanCommands(count)
+    } catch {
+      throw new PlanCommandExecutionError("plan_budget_exhausted", "Plan command budget exhausted")
+    }
+  }
+}
+
 function waitFrom(recordValue: PlanCommandExecutionRecord): TurnEnginePlanExecutionHookResult["wait"] | undefined {
   if (recordValue.result.status !== "completed") return undefined
   const output = row(recordValue.result.output)
@@ -438,6 +449,8 @@ function replayRuntime(
           return { ...request, status: receipt.status, ...(Object.prototype.hasOwnProperty.call(receipt, "output") ? { output: receipt.output } : {}), errorCode: receipt.errorCode }
         },
       },
+      admit: planAdmission(input),
+      shouldAdmit: command => !receipts.has(command.localId),
       createContext: request => ({ scope: options.scope, sessionId: options.lease.sessionId, turnId: options.lease.turnId, stepId: `${input.stepId}:plan:${request.localId}`, taskId: options.taskId, rootTaskId: options.rootTaskId, actorRole: options.actorRole, capabilities: [...options.capabilities], signal: input.signal }),
       parallelDelegateLimit: CANONICAL_PARALLEL_DELEGATE_LIMIT,
       rootTaskId: options.rootTaskId,
@@ -546,6 +559,7 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
         parallelDelegateLimit: CANONICAL_PARALLEL_DELEGATE_LIMIT,
         rootTaskId: options.rootTaskId,
         resolveInputRefs: request => resolveInputRefs(input.snapshot, request),
+        admit: planAdmission(input),
         ...(options.persistOutcome ? { observe: async recordValue => options.persistOutcome!(outcomeReceipt(input.call.id, output.planRevision, recordValue)) } : {}),
       }
       const executed = await executePlanCommands(dispatched, commandRuntime)

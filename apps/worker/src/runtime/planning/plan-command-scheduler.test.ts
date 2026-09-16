@@ -64,4 +64,39 @@ describe("schedulePlanCommands", () => {
     expect(peak).toBe(1)
     expect(observed).toEqual(["first", "second"])
   })
+
+  it("admits each serial command before starting it", async () => {
+    const admissions: number[] = []
+    const started: string[] = []
+    const execute = async (command: ExecutableCommand) => { started.push(command.localId); return step(command as DelegateCommand) }
+    const result = await schedulePlanCommands([delegate("first"), delegate("second")], {
+      ...runtime(execute, []), parallelDelegateLimit: undefined, admit: count => admissions.push(count),
+    })
+    expect(result.status).toBe("completed")
+    expect(admissions).toEqual([1, 1])
+    expect(started).toEqual(["first", "second"])
+  })
+
+  it("admits a parallel batch before starting any sibling", async () => {
+    const admissions: number[] = []
+    const started: string[] = []
+    const execute = async (command: ExecutableCommand) => { started.push(command.localId); return step(command as DelegateCommand) }
+    await expect(schedulePlanCommands([delegate("first"), delegate("second")], {
+      ...runtime(execute, []), admit: count => { admissions.push(count); throw new Error("plan budget exhausted") },
+    })).rejects.toThrow("plan budget exhausted")
+    expect(admissions).toEqual([2])
+    expect(started).toEqual([])
+  })
+
+  it("does not admit replayed commands", async () => {
+    const admissions: number[] = []
+    const replayed = new Set(["first"])
+    const execute = async (command: ExecutableCommand) => step(command as DelegateCommand)
+    const result = await schedulePlanCommands([delegate("first"), delegate("second")], {
+      ...runtime(execute, []), parallelDelegateLimit: undefined, admit: count => admissions.push(count),
+      shouldAdmit: command => !replayed.has(command.localId),
+    })
+    expect(result.status).toBe("completed")
+    expect(admissions).toEqual([1])
+  })
 })

@@ -37,6 +37,23 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
     maxSteps: options.budget?.maxSteps ?? options.maxSteps ?? DEFAULT_MAX_STEPS,
   }
   const budget = createTurnBudgetLedger(resumedBudgetLimits(baseBudget, options.resume) ?? {})
+  const executionOptions: TurnExecutionOptions = options.executePlan ? {
+    ...options,
+    executePlan: async input => {
+      let admitted = 0
+      try {
+        return await options.executePlan!({
+          ...input,
+          admitPlanCommands: count => {
+            budget.reserveToolCalls(count)
+            admitted += count
+          },
+        })
+      } finally {
+        budget.accountToolCalls(admitted)
+      }
+    },
+  } : options
   const progress = createProgressDetector(options.noProgressRepeatLimit ?? 2)
   let snapshot = options.snapshot
   let inputThroughSequence = options.resume?.inputThroughSequence ?? 0n
@@ -138,7 +155,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           if (output.text) await publishCommentary(writer, options, step, output.text, now)
           let outcome: { wait: TurnEngineResult | null; snapshot: typeof options.snapshot; steeringMarkerState: typeof steeringMarkerState }
           try {
-            outcome = await executeTools(options, writer, step, output, snapshot, seenCallIds, signal, now, steeringMarkerState)
+            outcome = await executeTools(executionOptions, writer, step, output, snapshot, seenCallIds, signal, now, steeringMarkerState)
           } finally {
             budget.accountToolCalls(output.toolCalls.length)
           }

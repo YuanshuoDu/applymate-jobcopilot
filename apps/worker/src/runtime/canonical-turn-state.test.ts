@@ -254,6 +254,29 @@ describe("loadCanonicalTurnState", () => {
     expect(eventQuery).toContain("'plan.command'")
   })
 
+  it("counts valid plan action receipts once across command and observation events", async () => {
+    const read = { planCallId: "plan-1", planRevision: 1, observationId: "plan-result:plan-1:read", content: { kind: "plan_command", commandKind: "tool_call", status: "completed", errorCode: null } }
+    const delegate = { planCallId: "plan-1", planRevision: 1, observationId: "plan-result:plan-1:delegate", content: { kind: "plan_command", commandKind: "delegate", status: "failed", errorCode: "router_execution_failed" } }
+    const join = { planCallId: "plan-1", observationId: "plan-result:plan-1:join", content: { kind: "plan_command", commandKind: "join", status: "completed", errorCode: null } }
+    const control = { planCallId: "plan-1", planRevision: 1, observationId: "plan-control:plan-1:ask", content: { kind: "plan_control", status: "waiting_for_user" } }
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      steps: [{ ordinal: 0, attempt: 1, inputThroughSequence: "1", consumedInputIds: [], inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }],
+      events: [
+        { type: "plan.command", payload: read },
+        { type: "plan.observation", payload: read },
+        { type: "plan.command", payload: delegate },
+        { type: "plan.observation", payload: delegate },
+        { type: "plan.observation", payload: join },
+        { type: "plan.command", payload: control },
+        { type: "plan.command", payload: { ...read, observationId: "invalid", planRevision: "bad" } },
+        { type: "plan.command", taskId: "child-1", payload: { ...read, observationId: "foreign" } },
+      ],
+    })
+    const value = await loadCanonicalTurnState(fake, lease)
+    expect(value.resume?.planActionCount).toBe(3)
+  })
+
   it("falls back to a scoped legacy accepted plan receipt when no revision event exists", async () => {
     const fake = pool({
       turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },

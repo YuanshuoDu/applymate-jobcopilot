@@ -88,12 +88,13 @@ function fixture(router: { execute(context: ToolRouterContext, request: ToolCall
   return createCanonicalPlanExecutionFactory(options)
 }
 
-function input(value: unknown, stepId = "step-1", toolObservations: StepContextSnapshot["toolObservations"] = [], replayed = false) {
+function input(value: unknown, stepId = "step-1", toolObservations: StepContextSnapshot["toolObservations"] = [], replayed = false, admitPlanCommands?: (count: number) => void) {
   return {
     identity: executionOwnerFence({ kind: "turn", taskId: "root-1", lease }), scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId,
     signal: new AbortController().signal, call: { id: "proposal-1", name: "agent.plan.propose", arguments: {} },
     result: { id: "proposal-1", toolName: "agent.plan.propose", toolVersion: "1", status: "completed" as const, output: value, errorCode: null },
     completedToolResults: [], replayed, snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations },
+    ...(admitPlanCommands ? { admitPlanCommands } : {}),
   }
 }
 
@@ -110,6 +111,24 @@ function expectRecoveryError(action: () => void): void {
 }
 
 describe("createCanonicalPlanExecutionFactory", () => {
+  it("returns a stable plan budget error observation when admission fails", async () => {
+    const hook = fixture()
+    const result = await hook(input(output(proposal([use("read")])), "step-1", [], false, () => { throw new Error("budget exhausted") }))
+    expect(observationCode(result)).toBe("plan_budget_exhausted")
+  })
+
+  it("admits only missing commands during replay", async () => {
+    const plan = proposal([use("read"), use("next", { dependsOn: ["read"] })])
+    const existing = { id: "plan-result:proposal-1:read", content: { kind: "plan_command", localId: "read", commandKind: "tool_call", dependsOn: [], status: "completed", errorCode: null, output: { jobId: "job-1" } } }
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { ok: true }, errorCode: null })) }
+    const hook = fixture(router)
+    const admissions: number[] = []
+    const result = await hook(input(output(plan), "step-1", [existing], true, count => admissions.push(count)))
+    expect(result.observations).toHaveLength(1)
+    expect(admissions).toEqual([1])
+    expect(router.execute).toHaveBeenCalledTimes(1)
+  })
+
   it("executes read and delegate commands with runtime-owned context and IDs", async () => {
     const requests: ToolCallRequest[] = []
     const contexts: ToolRouterContext[] = []

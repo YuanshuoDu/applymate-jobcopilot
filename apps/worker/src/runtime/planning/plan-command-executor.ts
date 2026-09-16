@@ -6,7 +6,7 @@ import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "..
 import { inspectJoinFailureEvidence, replanRequiredControl, type ReplanRequiredControl } from "./plan-replan-signal.js"
 const MAX_RESULT_BYTES = 8 * 1024
 const MAX_OUTPUTS = PLAN_MAX_NODES
-export type PlanCommandExecutionErrorCode = "runtime_unavailable" | "invalid_plan" | "router_result_mismatch" | "observer_failed" | "input_reference_unavailable" | "input_reference_conflict"
+export type PlanCommandExecutionErrorCode = "runtime_unavailable" | "invalid_plan" | "router_result_mismatch" | "observer_failed" | "input_reference_unavailable" | "input_reference_conflict" | "plan_budget_exhausted"
 export class PlanCommandExecutionError extends Error {
   constructor(readonly code: PlanCommandExecutionErrorCode, message: string) { super(message); this.name = "PlanCommandExecutionError" }
 }
@@ -35,6 +35,7 @@ export type PlanCommandExecutionRuntime = {
   readonly parallelDelegateLimit?: number
   readonly rootTaskId?: string
   readonly resolveReplayedJoin?: (request: { readonly command: JoinCommand; readonly taskIds: readonly string[] }) => ToolExecutionResult | undefined | Promise<ToolExecutionResult | undefined>
+  readonly admit?: (count: number) => void; readonly shouldAdmit?: (command: PlanDispatchCommand) => boolean
   readonly observe?: (record: PlanCommandExecutionRecord | PlanControlRecord) => void | Promise<void>
 }
 export type PlanCommandExecutionResult = {
@@ -239,6 +240,7 @@ export async function executePlanCommands(plan: PlanDispatchResult, runtime: Pla
   const scheduler: PlanCommandSchedulerRuntime = {
     outputs,
     parallelDelegateLimit: parallelLimit(runtime.parallelDelegateLimit),
+    admit: runtime.admit, shouldAdmit: runtime.shouldAdmit,
     execute: (command, currentOutputs) => executeCommand(runtime, command, currentOutputs),
     observe: record => observe(runtime, record),
     storeOutput: record => storeOutput(outputs, record),

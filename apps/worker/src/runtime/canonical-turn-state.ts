@@ -109,6 +109,7 @@ function planRevisionObservations(events: readonly Row[], goalRevision: number):
   })
 }
 function planCommandObservations(events: readonly Row[]): StepContextSnapshot["toolObservations"] { return events.filter(event => event.type === "plan.command").flatMap(event => { const receipt = parsePlanCommandReceipt(eventPayload(event.payload)); return receipt ? [planCommandObservation(receipt)] : [] }) }
+function planActionCount(events: readonly Row[]): number { const counted = new Set<string>(); for (const event of events) { if (event.type !== "plan.command" && event.type !== "plan.observation") continue; const payload = eventPayload(event.payload), receipt = event.type === "plan.command" ? parsePlanCommandReceipt(payload) : null, observationId = event.type === "plan.command" ? receipt?.observationId : payload.observationId, content = event.type === "plan.command" ? receipt?.content : payload.content, contentObject = object(content); if (typeof observationId !== "string" || observationId.trim() !== observationId || observationId.length === 0 || observationId.length > 256 || !isBoundedPlanJson(content) || counted.has(observationId) || contentObject.kind !== "plan_command" || !["tool_call", "delegate", "join"].includes(String(contentObject.commandKind))) continue; counted.add(observationId) } return counted.size }
 function contextCompactionObservations(events: readonly Row[]): StepContextSnapshot["toolObservations"] {
   return events.filter(event => event.type === "context.compaction").flatMap(event => {
     const observation = parseContextCompactionObservation(eventPayload(event.payload))
@@ -233,6 +234,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
       nextOrdinal: (maxOrdinal ?? Number(last.ordinal)) + 1,
       stepCount: steps.length,
       toolCallCount: itemsResult.rows.filter(item => item.type === "tool_call").length,
+      planActionCount: planActionCount(eventsResult.rows),
       inputThroughSequence: BigInt(String(last?.inputThroughSequence ?? 0)),
       consumedInputIds: Array.isArray(last?.consumedInputIds) ? last.consumedInputIds.filter((id): id is string => typeof id === "string") : [],
       usage,

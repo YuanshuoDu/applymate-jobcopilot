@@ -38,7 +38,7 @@ export function resumedBudgetLimits(limits: TurnBudgetLimits | undefined, resume
   if (!limits || !resume) return limits
   return {
     ...(limits.maxSteps === undefined ? {} : { maxSteps: Math.max(0, limits.maxSteps - resume.stepCount) }),
-    ...(limits.maxToolCalls === undefined ? {} : { maxToolCalls: Math.max(0, limits.maxToolCalls - resume.toolCallCount) }),
+    ...(limits.maxToolCalls === undefined ? {} : { maxToolCalls: Math.max(0, limits.maxToolCalls - resume.toolCallCount - (resume.planActionCount ?? 0)) }),
     ...(limits.maxInputTokens === undefined ? {} : { maxInputTokens: Math.max(0, limits.maxInputTokens - resume.usage.inputTokens) }),
     ...(limits.maxOutputTokens === undefined ? {} : { maxOutputTokens: Math.max(0, limits.maxOutputTokens - resume.usage.outputTokens) }),
     ...(limits.maxCostUsd === undefined ? {} : { maxCostUsd: Math.max(0, limits.maxCostUsd - resume.usage.estimatedCostUsd) }),

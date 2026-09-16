@@ -88,6 +88,8 @@ export type TurnEnginePlanExecutionHook = (input: {
   /** Server-owned marker: replay reconciliation must not advance the normal CAS cursor. */
   readonly replayed: boolean
   readonly snapshot: StepContextSnapshot
+  /** Server-owned admission for plan action budget units. */
+  readonly admitPlanCommands?: (count: number) => void
 }) => Promise<TurnEnginePlanExecutionHookResult> | TurnEnginePlanExecutionHookResult
 
 export type TurnEngineStore = {
@@ -223,6 +225,8 @@ export type TurnResumeState = {
   readonly nextOrdinal: number
   readonly stepCount: number
   readonly toolCallCount: number
+  /** Durable server-owned plan action units; model toolCallCount remains model-only. */
+  readonly planActionCount?: number
   readonly inputThroughSequence: bigint
   readonly consumedInputIds: readonly string[]
   readonly usage: {
