@@ -124,6 +124,7 @@ export function createCoordinationTools(options: CoordinationExecutorOptions): R
   const spawnExecutor: RuntimeToolDefinition["execute"] = (context, input) => executeSpawn(context, input as SpawnSubagentInput, options)
   const sendMessageExecutor: RuntimeToolDefinition["execute"] = (context, input) => executeSendMessage(context, input as SendMessageInput, options)
   const waitExecutor: RuntimeToolDefinition["execute"] = (context, input) => executeWaitSubagents(context, input as WaitSubagentsInput, options)
+  const interruptExecutor: RuntimeToolDefinition["execute"] = (context, input) => executeInterruptSubagent(context, input as InterruptSubagentInput, options)
   return [
     {
       ...metadata("spawn_subagent", "Create one permission-scoped child task and durably enqueue it", "internal_write", "requires_key"),
@@ -168,7 +169,12 @@ export function createCoordinationTools(options: CoordinationExecutorOptions): R
     {
       ...metadata("interrupt_subagent", "Request interruption of a visible task tree", "internal_write", "idempotent"),
       inputSchema: InterruptSubagentInputSchema, outputSchema: InterruptOutputSchema,
-      execute: (context, input) => executeInterruptSubagent(context, input as InterruptSubagentInput, options),
+      execute: interruptExecutor,
+    },
+    {
+      ...metadata("agent.interrupt", "Request interruption of a visible task tree", "internal_write", "idempotent"),
+      inputSchema: InterruptSubagentInputSchema, outputSchema: InterruptOutputSchema,
+      execute: interruptExecutor,
     },
     {
       ...metadata("close_subagent", "Close a visible non-running task", "internal_write", "idempotent"),
