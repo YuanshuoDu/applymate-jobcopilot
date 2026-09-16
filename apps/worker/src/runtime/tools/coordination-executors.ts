@@ -9,6 +9,7 @@ import {
 import { lifecycleTarget, visibleTask } from "./coordination-visibility.js"
 import { sanitizeLifecyclePreview } from "./redaction.js"
 import type { ToolExecutionContext } from "./types.js"
+import { getSubagentRolePolicy } from "../subagents/role-policy.js"
 import type {
   CloseSubagentInput,
   FollowupInput,
@@ -25,6 +26,8 @@ const WAIT_FAILURE_MAX_BYTES = 500
 const FOREIGN_RESULT_KEYS = new Set(["userId", "sessionId", "turnId", "stepId", "taskId", "parentTaskId", "rootTaskId", "ownerId", "lease", "leaseOwnerId", "leaseVersion", "idempotencyKey", "capabilities", "permissions", "allowedCapabilities", "budgetLimit", "maxBudget"])
 
 export async function executeSpawn(context: ToolExecutionContext, input: SpawnSubagentInput, options: CoordinationExecutorOptions) {
+  const policy = typeof input.role === "string" ? getSubagentRolePolicy(input.role) : null
+  if (!policy || policy.actorRole !== "subagent" || policy.canManageChildren || policy.externalWritesEnabled) throw new CoordinationError("coordination_invalid_input", "Unsupported subagent role")
   const parentTaskId = await resolveSpawnParent(context, input.parentTaskId, options)
   const replay = await options.store.getSpawnReplay({ userId: context.scope.userId, sessionId: context.sessionId, idempotencyKey: input.idempotencyKey })
   if (replay) {

@@ -2,7 +2,7 @@ import { Type } from "@sinclair/typebox"
 import { schemaVersion } from "@jobcopilot/agent-protocol"
 import { describe, expect, it } from "vitest"
 
-import { getSubagentRolePolicy, preflightSubagentTool, visibleSubagentTools, visibleToolPolicy } from "./role-policy.js"
+import { getSubagentRolePolicy, isHarnessSubagentRole, preflightSubagentTool, visibleSubagentTools, visibleToolPolicy } from "./role-policy.js"
 import type { RuntimeToolDefinition } from "../tools/types.js"
 
 function tool(name: string, risk: RuntimeToolDefinition["risk"], domain: RuntimeToolDefinition["domain"]): RuntimeToolDefinition {
@@ -47,5 +47,15 @@ describe("subagent role policy", () => {
       expect(visibleToolPolicy("reviewer", tool(name, risk, "coordination"))).toMatchObject({ visible: false, reason: "coordination_disabled" })
     }
     expect(visibleToolPolicy("reviewer", tool("jobs.search", "read", "jobs")).visible).toBe(true)
+  })
+
+  it.each(["root", "orchestrator", "admin", "elevated", "future-role", "toString", "constructor", "__proto__"])("rejects unsupported harness role %s", role => {
+    expect(isHarnessSubagentRole(role)).toBe(false)
+    expect(getSubagentRolePolicy(role)).toBeNull()
+  })
+
+  it("hides coordination tools even when their domain is otherwise visible", () => {
+    expect(visibleToolPolicy("reviewer", tool("spawn_subagent", "internal_write", "coordination")).reason).toBe("coordination_disabled")
+    expect(visibleToolPolicy("reviewer", tool("wait_subagents", "read", "coordination")).visible).toBe(false)
   })
 })

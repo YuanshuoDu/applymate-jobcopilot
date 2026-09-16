@@ -62,7 +62,7 @@ export function getSubagentRolePolicy(role: string): SubagentRolePolicy | null {
 }
 
 export function isHarnessSubagentRole(role: string): role is HarnessSubagentRole {
-  return role in POLICIES
+  return Object.prototype.hasOwnProperty.call(POLICIES, role)
 }
 
 export function visibleToolPolicy(

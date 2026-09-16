@@ -165,6 +165,15 @@ describe("coordination executors", () => {
     expect(runtime.store.activities).toContain("spawn_subagent")
   })
 
+  it.each(["root", "orchestrator", "admin", "elevated", "future-role", "toString", "constructor", "__proto__"])("rejects unsupported spawn role %s before dispatch", async role => {
+    const runtime = makeRuntime()
+    await expect(executeSpawn(context(), { idempotencyKey: `spawn-${role}`, role, taskType: "inspect", goal: "Inspect" }, runtime.options)).rejects.toMatchObject({ code: "coordination_invalid_input" })
+    expect(runtime.manager.spawn).not.toHaveBeenCalled()
+    expect(runtime.store.spawnOperations.size).toBe(0)
+    expect(runtime.store.activities).toHaveLength(0)
+    expect(runtime.store.tasks.size).toBe(1)
+  })
+
   it("creates a follow-up from a terminal same-turn child under the current runtime parent", async () => {
     const runtime = makeRuntime()
     const source = makeTask({
