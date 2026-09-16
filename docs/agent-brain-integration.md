@@ -1322,3 +1322,27 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Commits `62eef955` and `8c4b223f` harden `agent.turn.wakeup` consumption. The consumer locks the session first, fences aborted/archived sessions, verifies source-event scope and payload lineage, checks wait-item/tool lineage and Turn revision, quarantines malformed or terminally inconsistent rows with `lastError`, and leaves transient failures pending for retry. Duplicate delivery is idempotent after the first resume. Gmail OAuth recovery now atomically writes the canonical `turn.wakeup` fact and outbox entry, including the OAuth question-item `waitId` lineage.
 - Root validation passed **104/104** Worker tests across coordination, role policy, child context, tree budget, and wakeup suites; the wakeup consumer passed **14/14**; Gmail recovery passed **4/4**; Worker and Web typechecks passed; `git diff --check` passed.
 - Candidate boundary: no live PostgreSQL/RLS transaction or concurrent consumer race, Redis/BullMQ delivery, process restart, provider/model call, browser, deployment, or complete Gmail-to-Worker end-to-end evidence was run. This slice does not claim production recovery or full harness acceptance; overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-28 candidate - replay-safe ready and timed-out join feedback
+
+- Commit `c329396b` fixes a canonical plan replay gap where a persisted `ready` or `timed_out` join result with child failure evidence was treated as an orphaned observation. Replay now validates the join's server-owned task lineage and derives the same `replan_required` control for direct ready/timed-out outcomes without rerouting the prior wait or delegate commands. Conflicting, duplicate, or malformed controls still fail closed.
+- Root validation passed **93/93** planning tests across canonical plan execution, command scheduler, and command executor suites. Worker TypeScript, the shared build, and `git diff --check` passed. No schema, Web, provider, queue, or feature flag changed.
+- Candidate boundary: live PostgreSQL/RLS, Redis/BullMQ delivery, process restart, provider/model calls, browser behavior, deployment, and complete child-to-parent replay evidence remain unverified. Overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-29 candidate - canonical snapshot memory survives rebuild and compaction
+
+- Commit `730e8f71` preserves canonical snapshot state that previously disappeared when a step was rebuilt from `context.*` seeds. Rebuild injects a bounded data-only `context_snapshot_memory` observation containing pending approvals, open and completed work, confirmed decisions and evidence IDs, artifacts, facts, and failed-attempt guards. The reserved observation ID collides fail closed and is treated as a protected memory anchor during repeated compaction.
+- Root validation passed **25/25** focused snapshot rebuild, adapter, memory projection, and compaction seam tests; the Luna context run covered **179** context tests. Worker TypeScript and `git diff --check` passed. No schema, provider, queue, or Web change was introduced.
+- Candidate boundary: live PostgreSQL/RLS, cross-process provider cursor recovery, process restart, deployment, and full long-session end-to-end evidence remain unverified. The existing protected-observation 16 KiB bound can reject an oversized snapshot memory payload. Overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-30 candidate - retry closed-task wait cancellation on replay
+
+- Commit `e96b6133` closes a durable cleanup gap in `close_subagent`. If the task is closed but the first durable wait cancellation fails transiently, a repeated close command now retries the cancellation before returning the already-closed result; the close mutation itself remains idempotent and is not repeated.
+- Root validation passed **37/37** coordination executor tests; Worker TypeScript and `git diff --check` passed. No schema, provider, queue, Web, or feature flag changed.
+- Candidate boundary: live PostgreSQL transaction races, Redis/BullMQ delivery, process restart, provider/model calls, browser behavior, deployment, and full close-to-wait recovery remain unverified. Overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-31 candidate - completion evidence bound to the latest accepted plan
+
+- Commit `a11d13dc` makes the server-owned completion verifier scope `completion_proposed` evidence to the latest contiguous accepted plan revision. Unknown, duplicate, stale, malformed, or cross-plan completion controls fail closed; dependency observations must remain unique, completed, bounded, and earlier than the completion control. Replan obligations now require matching server-owned plan and source-observation identities.
+- Root validation passed **16/16** focused completion-verifier and replan-feedback tests. Worker TypeScript, the shared build, and `git diff --check` passed. No schema, provider, queue, Web, or feature flag changed.
+- Candidate boundary: live PostgreSQL/RLS, Redis/BullMQ delivery, process restart, provider/model calls, browser behavior, deployment, and semantic evaluation of natural-language criteria remain unverified. Overall acceptance remains **P0 accepted 1/8 (12.5%)**.
