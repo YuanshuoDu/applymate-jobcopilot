@@ -6,6 +6,8 @@ const mocks = vi.hoisted(() => ({
   producer: { enqueue: vi.fn(), close: vi.fn() },
   createProducer: vi.fn(),
   workerClose: vi.fn(),
+  workerRun: vi.fn(),
+  workerOptions: undefined as Record<string, unknown> | undefined,
   queueCloses: [] as Array<ReturnType<typeof vi.fn>>,
 }));
 const pinnedFetch = vi.hoisted(() => vi.fn((input: string | URL, init?: unknown) => globalThis.fetch(String(input), init as RequestInit)));
@@ -21,9 +23,10 @@ vi.mock("bullmq", () => ({
     mocks.queueCloses.push(close);
     return { add: vi.fn(), close };
   }),
-  Worker: vi.fn().mockImplementation((_name, handler) => {
+  Worker: vi.fn().mockImplementation((_name, handler, options) => {
     mocks.handler = handler;
-    return { close: mocks.workerClose };
+    mocks.workerOptions = options;
+    return { close: mocks.workerClose, run: mocks.workerRun };
   }),
 }));
 vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnect: vi.fn() })) }));
@@ -39,6 +42,8 @@ describe("agent-run queue", () => {
     mocks.producer.close.mockReset();
     mocks.createProducer.mockReset().mockReturnValue(mocks.producer);
     mocks.workerClose.mockReset().mockResolvedValue(undefined);
+    mocks.workerRun.mockReset().mockResolvedValue(undefined);
+    mocks.workerOptions = undefined;
     mocks.queueCloses.length = 0;
     vi.stubEnv("AGENT_WEB_URL", "https://app.applymate.test/");
     vi.stubEnv("AGENT_WORKER_SECRET", "worker-secret");
@@ -98,6 +103,17 @@ describe("agent-run queue", () => {
     expect(mocks.producer.enqueue.mock.calls[0]?.[0]).not.toHaveProperty("executionId");
     expect(mocks.canonical).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("keeps the agent-run router stopped until startup explicitly opens it", async () => {
+    const module = await import("./agent-run-queue.js");
+
+    expect(mocks.workerOptions).toMatchObject({ autorun: false });
+    expect(mocks.workerRun).not.toHaveBeenCalled();
+    module.startAgentRunWorker();
+    module.startAgentRunWorker();
+
+    expect(mocks.workerRun).toHaveBeenCalledOnce();
   });
 
   it("routes a Turn-bound task when the complete cognitive loop gate is enabled", async () => {

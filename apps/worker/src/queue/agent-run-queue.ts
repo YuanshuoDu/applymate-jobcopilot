@@ -82,8 +82,22 @@ export function createAgentRunProcessor(canonicalProducer: AgentRunCanonicalProd
 export const agentRunWorker = new Worker<AgentRunTaskPayload>(
   AGENT_RUN_QUEUE_NAME,
   createAgentRunProcessor(),
-  { connection, skipVersionCheck: true, ...workerPollingOptions(), concurrency: 1 },
+  // The router must not consume jobs until the canonical Turn consumer and
+  // recovery scanner have been assembled by Worker startup. Otherwise a
+  // queued Turn can be handed off before its execution owner exists.
+  { connection, skipVersionCheck: true, autorun: false, ...workerPollingOptions(), concurrency: 1 },
 );
+
+let agentRunWorkerStarted = false;
+
+/** Start the routing worker after canonical Worker resources are ready. */
+export function startAgentRunWorker(): void {
+  if (agentRunWorkerStarted) return;
+  agentRunWorkerStarted = true;
+  void agentRunWorker.run().catch((error: unknown) => {
+    console.error("[agent-run-worker] worker loop failed:", error);
+  });
+}
 
 function isTimeoutError(error: unknown): boolean {
   return (error instanceof DOMException && (error.name === "AbortError" || error.name === "TimeoutError")) ||

@@ -43,7 +43,7 @@ async function main() {
   const { ensureApplyResultsTable, closePool, getPool } = applyResultsModule;
   const { applyWorker, applyQueue, connection } = applyQueueModule;
   const { scoutWorker, scoutQueue, SCOUT_QUEUE_NAME } = scoutQueueModule;
-  const { agentRunQueue, AGENT_RUN_QUEUE_NAME, closeAgentRunResources } = agentRunQueueModule;
+  const { agentRunQueue, AGENT_RUN_QUEUE_NAME, closeAgentRunResources, startAgentRunWorker } = agentRunQueueModule;
   const { publicAutomationSchedulerStatus, startAutomationScheduler } = automationSchedulerModule;
   const { closeAllSlots } = cloakPoolModule;
   const { deadLetterQueue, registerDeadLetterListeners, closeDeadLetterResources } = deadLetterModule;
@@ -105,6 +105,11 @@ async function main() {
     ...(waitResolver ? { waitResolver } : {}),
   });
   console.log("[worker] Canonical Turn consumer and recovery scanner started");
+  // The agent-runs queue is a router into the canonical Turn queue. Start it
+  // only after the canonical consumer/recovery boundary is ready, so a job
+  // cannot be accepted by the router while the execution owner is absent.
+  startAgentRunWorker();
+  console.log("[worker] Agent run router started");
 
   const agentWakeupConsumer = startAgentWakeupConsumer();
   console.log("[worker] Agent Turn wakeup consumer started");
