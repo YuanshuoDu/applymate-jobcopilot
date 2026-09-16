@@ -385,6 +385,33 @@ describe('V2 timeline stream client', () => {
     expect(state.fallbackItems).toEqual([])
   })
 
+  it('continues targeted question hydration past eight pages in a long session', async () => {
+    const controller = new AbortController()
+    let state: TimelineState = createTimelineState('session-1')
+    let hydrateCount = 0
+    const dispatch = (action: TimelineAction) => {
+      state = timelineReducer(state, action)
+      if (action.type === 'hydrate' && ++hydrateCount === 2) controller.abort()
+    }
+    const pages = Array.from({ length: 9 }, (_, index) => ({
+      items: [index === 8 ? questionCanonicalItem('long-session') : item(`history-${index}`)],
+      page: { hasMore: index < 8, nextCursor: index < 8 ? `cursor-${index + 1}` : null },
+    }))
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ items: [], page: { hasMore: false } })))
+      .mockResolvedValueOnce(new Response(streamFrom(sseEvent(questionStubEvent('10', 'long-session'))), { headers: { 'Content-Type': 'text/event-stream' } }))
+    for (const page of pages) fetcher.mockResolvedValueOnce(new Response(JSON.stringify(page)))
+
+    await streamAgentTimeline({ sessionId: 'session-1', dispatch, fetcher, signal: controller.signal, retryDelayMs: 0 })
+
+    expect(fetcher).toHaveBeenCalledTimes(11)
+    expect(fetcher.mock.calls.slice(2).map(([url]) => String(url))).toEqual([
+      '/api/agent/sessions/session-1/timeline?limit=100',
+      ...Array.from({ length: 8 }, (_, index) => `/api/agent/sessions/session-1/timeline?limit=100&cursor=cursor-${index + 1}`),
+    ])
+    expect(state.itemsById['question-item-long-session']).toMatchObject({ type: 'question', status: 'started' })
+  })
+
   it('coalesces question stubs received in one stream turn into one hydration', async () => {
     const controller = new AbortController()
     let state: TimelineState = createTimelineState('session-1')

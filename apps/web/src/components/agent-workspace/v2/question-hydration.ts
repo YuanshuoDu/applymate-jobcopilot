@@ -1,11 +1,9 @@
 import { normalizeTimelineEvent } from './timeline-reducer'
 
-export const QUESTION_HYDRATION_MAX_PAGES = 8
-
 export interface QuestionHydrationPumpOptions {
   sessionId: string
   signal?: AbortSignal
-  hydrate: () => Promise<void>
+  hydrate: (itemIds: readonly string[]) => Promise<void>
 }
 
 export interface QuestionHydrationPump {
@@ -14,7 +12,7 @@ export interface QuestionHydrationPump {
   current(): Promise<void> | null
 }
 
-/** Queues strict live question stubs behind one bounded canonical snapshot request. */
+/** Queues strict live question stubs behind one targeted canonical snapshot request. */
 export function createQuestionHydrationPump(options: QuestionHydrationPumpOptions): QuestionHydrationPump {
   let current: Promise<void> | null = null
   let scheduled = false
@@ -31,7 +29,7 @@ export function createQuestionHydrationPump(options: QuestionHydrationPumpOption
       let failed = false
       current = (async () => {
         try {
-          await options.hydrate()
+          await options.hydrate([...batch].map(itemIdFromKey))
         } catch {
           failed = true
           for (const key of batch) pending.add(key)
@@ -69,6 +67,11 @@ function questionStubKey(value: unknown, sessionId: string): string | null {
     payload.waitKind !== 'question' || !safeId(payload.questionId) ||
     (payload.toolCallId !== null && !safeId(payload.toolCallId))) return null
   return `${event.itemId}\u0000${payload.questionId}`
+}
+
+function itemIdFromKey(value: string): string {
+  const separator = value.indexOf('\u0000')
+  return separator === -1 ? value : value.slice(0, separator)
 }
 
 function belongsToSession(value: unknown, sessionId: string): boolean {

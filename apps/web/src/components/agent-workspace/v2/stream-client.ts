@@ -2,7 +2,7 @@
 
 import { isSessionControlEventCandidate, parseTimelineSessionControl } from './timeline-session-control'
 import { normalizeTimelineEvent, type TimelineAction } from './timeline-reducer'
-import { createQuestionHydrationPump, filterQuestionHydrationValues, QUESTION_HYDRATION_MAX_PAGES } from './question-hydration'
+import { createQuestionHydrationPump, filterQuestionHydrationValues } from './question-hydration'
 import { CONTEXT_COMPACTION_EVENT_TYPE } from './timeline-context-compaction'
 
 interface TimelinePageResponse {
@@ -30,7 +30,7 @@ export interface TimelineStreamClientOptions {
 const DEFAULT_RETRY_DELAY_MS = 250
 const DEFAULT_PAGE_SIZE = 100
 type TimelineHydrationOptions = Pick<TimelineStreamClientOptions, 'sessionId' | 'dispatch' | 'signal' | 'fetcher' | 'pageSize'> & {
-  maxPages?: number
+  targetItemIds?: readonly string[]
 }
 
 /** Hydrates the canonical item projection before a live stream is attached. */
@@ -44,8 +44,7 @@ export async function hydrateTimeline(options: TimelineHydrationOptions): Promis
   let approvalEvents: unknown[] | undefined
   let compactionEvents: unknown[] | undefined
   let cursor: string | null = null
-  let pages = 0
-  const maxPages = options.maxPages ?? Number.POSITIVE_INFINITY
+  const targetItemIds = options.targetItemIds?.length ? new Set(options.targetItemIds) : null
   do {
     const query = new URLSearchParams({ limit: String(options.pageSize ?? DEFAULT_PAGE_SIZE) })
     if (cursor) query.set('cursor', cursor)
@@ -59,9 +58,10 @@ export async function hydrateTimeline(options: TimelineHydrationOptions): Promis
     if (cursor === null && Array.isArray(page.planEvents)) planEvents = page.planEvents
     if (cursor === null && Array.isArray(page.approvalEvents)) approvalEvents = page.approvalEvents
     if (cursor === null && Array.isArray(page.compactionEvents)) compactionEvents = page.compactionEvents
-    pages += 1
-    cursor = page.page?.hasMore === true && typeof page.page.nextCursor === 'string' ? page.page.nextCursor : null
-  } while (cursor && pages < maxPages && !options.signal?.aborted)
+    const sessionItems = filterQuestionHydrationValues(items, options.sessionId)
+    const targetFound = targetItemIds !== null && hasAllTargetItems(sessionItems, targetItemIds)
+    cursor = !targetFound && page.page?.hasMore === true && typeof page.page.nextCursor === 'string' ? page.page.nextCursor : null
+  } while (cursor && !options.signal?.aborted)
   if (options.signal?.aborted) return
   const agendaTail = agendas ?? (agenda === undefined || agenda === null ? [] : [agenda])
   const tail = [...agendaTail, ...(steeringMarkers ?? []), ...(planEvents ?? [])]
@@ -84,7 +84,7 @@ export async function streamAgentTimeline(options: TimelineStreamClientOptions):
   const questionHydration = createQuestionHydrationPump({
     sessionId: options.sessionId,
     signal: options.signal,
-    hydrate: () => hydrateTimeline({ ...options, maxPages: QUESTION_HYDRATION_MAX_PAGES }),
+    hydrate: targetItemIds => hydrateTimeline({ ...options, targetItemIds }),
   })
 
   await hydrateTimeline(options)
@@ -193,6 +193,16 @@ function tailId(value: unknown): string {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return ''
   const id = (value as { id?: unknown }).id
   return typeof id === 'string' ? id : ''
+}
+
+function hasAllTargetItems(items: readonly unknown[], targetItemIds: ReadonlySet<string>): boolean {
+  const found = new Set<string>()
+  for (const item of items) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue
+    const id = (item as { id?: unknown }).id
+    if (typeof id === 'string' && targetItemIds.has(id)) found.add(id)
+  }
+  return found.size === targetItemIds.size
 }
 
 interface SseFrame { event: string; id: string | null; data: unknown }

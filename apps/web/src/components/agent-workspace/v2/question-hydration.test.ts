@@ -19,7 +19,7 @@ function deferred<T>() {
 describe('question hydration pump', () => {
   it('coalesces synchronous stubs into one hydration and loops newly queued keys', async () => {
     const first = deferred<void>()
-    const hydrate = vi.fn<() => Promise<void>>()
+    const hydrate = vi.fn<(itemIds: readonly string[]) => Promise<void>>()
       .mockReturnValueOnce(first.promise)
       .mockResolvedValueOnce(undefined)
     const pump = createQuestionHydrationPump({ sessionId: 'session-1', hydrate })
@@ -35,11 +35,13 @@ describe('question hydration pump', () => {
     await Promise.resolve()
 
     expect(hydrate).toHaveBeenCalledTimes(2)
+    expect(hydrate.mock.calls[0]?.[0]).toEqual(['item-one', 'item-two'])
+    expect(hydrate.mock.calls[1]?.[0]).toEqual(['item-three'])
   })
 
   it('does not start or dispatch work after the stream signal is aborted', async () => {
     const controller = new AbortController()
-    const hydrate = vi.fn<() => Promise<void>>().mockResolvedValue(undefined)
+    const hydrate = vi.fn<(itemIds: readonly string[]) => Promise<void>>().mockResolvedValue(undefined)
     const pump = createQuestionHydrationPump({ sessionId: 'session-1', signal: controller.signal, hydrate })
 
     controller.abort()
@@ -52,7 +54,7 @@ describe('question hydration pump', () => {
   })
 
   it('rejects malformed or foreign stubs and filters foreign hydration values', () => {
-    const hydrate = vi.fn<() => Promise<void>>().mockResolvedValue(undefined)
+    const hydrate = vi.fn<(itemIds: readonly string[]) => Promise<void>>().mockResolvedValue(undefined)
     const pump = createQuestionHydrationPump({ sessionId: 'session-1', hydrate })
     pump.request(questionStub('valid'))
     pump.request(questionStub('foreign', { sessionId: 'session-2' }))
