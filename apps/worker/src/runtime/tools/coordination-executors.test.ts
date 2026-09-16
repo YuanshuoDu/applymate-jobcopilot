@@ -398,6 +398,22 @@ describe("coordination executors", () => {
     expect(runtime.wait.cancel).toHaveBeenCalledWith(expect.objectContaining({ taskId: "queued", reason: "interrupted" }))
   })
 
+  it("retries durable wait cancellation after close succeeds but the first cancel fails", async () => {
+    const runtime = makeRuntime()
+    runtime.wait.cancel.mockRejectedValueOnce(new Error("temporary wait store failure"))
+    const input = { taskId: "root-1" } satisfies CloseSubagentInput
+    runtime.store.tasks.set("queued", makeTask({ id: "queued", rootTaskId: "root-1", path: "/root-1/queued", status: "queued" }))
+
+    await expect(executeCloseSubagent(context({ taskId: "root-1", rootTaskId: "root-1" }), { ...input, taskId: "queued" }, runtime.options))
+      .rejects.toThrow("temporary wait store failure")
+    await expect(executeCloseSubagent(context({ taskId: "root-1", rootTaskId: "root-1" }), { ...input, taskId: "queued" }, runtime.options))
+      .resolves.toMatchObject({ taskId: "queued", status: "closed", closed: false })
+
+    expect(runtime.manager.close).toHaveBeenCalledOnce()
+    expect(runtime.wait.cancel).toHaveBeenCalledTimes(2)
+    expect(runtime.wait.cancel).toHaveBeenLastCalledWith({ userId: "user-a", sessionId: "session-a", taskId: "queued", reason: "closed" })
+  })
+
   it("returns redacted bounded evidence for terminal tasks and suppresses active values", async () => {
     const runtime = makeRuntime()
     runtime.store.tasks.set("done", makeTask({

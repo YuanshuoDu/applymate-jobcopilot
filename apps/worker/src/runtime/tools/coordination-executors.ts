@@ -19,7 +19,6 @@ import type {
   SpawnSubagentInput,
   WaitSubagentsInput,
 } from "./coordination-tools.js"
-
 export type CoordinationExecutorOptions = CoordinationRuntimeOptions
 const WAIT_RESULT_MAX_BYTES = 2 * 1024
 const WAIT_FAILURE_MAX_BYTES = 500
@@ -182,6 +181,7 @@ export async function executeCloseSubagent(context: ToolExecutionContext, input:
   const target = await lifecycleTarget(context, input.taskId, options)
   if (["running"].includes(target.status)) throw new CoordinationError("coordination_close_not_allowed", "Running subagents must be interrupted before close")
   if (["completed", "failed", "interrupted", "cancelled", "closed"].includes(target.status)) {
+    if (target.status === "closed") await options.wait?.cancel?.({ userId: context.scope.userId, sessionId: context.sessionId, taskId: target.id, reason: "closed" })
     await activity(context, options, "close_subagent", target.id, { status: target.status, closed: false }, target.id)
     return { taskId: target.id, status: target.status as "completed" | "failed" | "interrupted" | "cancelled" | "closed", closed: false }
   }
