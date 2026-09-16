@@ -289,6 +289,26 @@ describe("createCanonicalPlanExecutionFactory", () => {
     expect(router.execute).not.toHaveBeenCalled()
   })
 
+  it("replays a direct ready child failure replan signal without rejecting its control", async () => {
+    const plan = proposal([delegate("first"), delegate("second"), join("join", { inputRefs: ["first", "second"], dependsOn: ["first", "second"] }), use("after", { dependsOn: ["join"] })])
+    const delegateObservations = ["first", "second"].map((localId, index) => ({
+      id: `plan-result:proposal-1:${localId}`,
+      content: { kind: "plan_command", localId, commandKind: "delegate", dependsOn: [], status: "completed", errorCode: null, output: { taskId: `child-${index === 0 ? "first" : "second"}`, rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" } },
+    }))
+    const joinObservation = { id: "plan-result:proposal-1:join", content: { kind: "plan_command", localId: "join", commandKind: "join", dependsOn: ["first", "second"], status: "completed", errorCode: null, output: {
+      waitId: "wait-1", status: "ready", taskIds: ["child-first", "child-second"], matchedTaskIds: ["child-first", "child-second"], tasks: [
+        { taskId: "child-first", status: "failed", result: null, failureReason: "provider error" },
+        { taskId: "child-second", status: "cancelled", result: null, failureReason: "worker stopped" },
+      ],
+    } } }
+    const replanObservation = { id: "plan-control:proposal-1:join:replan", content: { kind: "plan_control", localId: "join:replan", status: "replan_required", dependsOn: ["first", "second"], reason: "child_failure", failedTaskIds: ["child-first", "child-second"] } }
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { unexpected: true }, errorCode: null })) }
+    const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["use_tool", "delegate", "join"])
+    const result = await hook(input(output(plan), "step-1", [...delegateObservations, joinObservation, replanObservation], true))
+    expect(result).toEqual({ observations: [] })
+    expect(router.execute).not.toHaveBeenCalled()
+  })
+
   it("rejects a replayed replan observation when failure evidence is clean", async () => {
     const replay = replayWait("scout", {})
     const clean = replay.observations.find(observation => observation.id === "wait-result:wait-1")

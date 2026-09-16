@@ -411,16 +411,21 @@ function replayRuntime(
   const expectedReplanIds = new Set<string>()
   for (const command of dispatched.commands) {
     const receipt = receipts.get(command.localId)
-    if (command.kind !== "join" || receipt?.status !== "completed" || row(receipt.output)?.status !== "waiting") continue
-    const waitId = row(receipt.output)?.waitId
+    if (command.kind !== "join" || receipt?.status !== "completed") continue
+    const output = row(receipt.output)
+    const waiting = output?.status === "waiting"
+    if (!waiting && output?.status !== "ready" && output?.status !== "timed_out") continue
+    const waitId = output?.waitId
     const replanId = id("plan-control", input.call.id, `${command.localId}:replan`)
     const existing = currentReplanObservations.filter(observation => observation.id === replanId)
     if (existing.length > 1) throw new CanonicalPlanError("invalid_plan_output")
-    if (typeof waitId !== "string" || !waitId.trim()) {
+    if (waiting && (typeof waitId !== "string" || !waitId.trim())) {
       if (existing.length > 0) throw new CanonicalPlanError("invalid_plan_output")
       continue
     }
-    const resumed = replayWaitOutcome(input, options, command, receipts, dispatched.commands, waitId)
+    const resumed = waiting
+      ? replayWaitOutcome(input, options, command, receipts, dispatched.commands, waitId as string)
+      : output
     if (!resumed) {
       if (existing.length > 0) throw new CanonicalPlanError("invalid_plan_output")
       continue
