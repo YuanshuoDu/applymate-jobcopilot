@@ -38,6 +38,12 @@ export type UsageAuthorization = {
   settle(input: { status: "success" | "error"; inputTokens: number; outputTokens: number; estimatedCostUsd: number; errorCode?: string }): Promise<void> | void
 }
 
+function isResumableRootResult(result: Pick<TurnExecutionResult, "status">): boolean {
+  return result.status === "waiting_for_dependency"
+    || result.status === "waiting_for_approval"
+    || result.status === "waiting_for_user"
+}
+
 /** Server-owned inputs for the gated default or custom plan execution bridge. */
 export type CanonicalPlanExecutionFactoryInput = CanonicalPlanExecutionOptions & { readonly state: CanonicalTurnState }
 
@@ -204,7 +210,12 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
   const execute: TurnExecutor = async ({ lease, signal }): Promise<TurnExecutionResult> => {
     if (closed) throw new Error("canonical_runtime_closed")
     const terminal = await reconcileTerminal?.({ lease, now: now() })
-    if (terminal) {
+    // A root task is marked waiting before a dependency/user wake releases
+    // the Turn. Once the wake queues and reclaims that Turn, the root still
+    // carries the old waiting result until ensure() rebinds it. Treat those
+    // states as resumable; only durable terminal results may short-circuit
+    // execution or a wake would be mistaken for a second terminal outcome.
+    if (terminal && !isResumableRootResult(terminal.result)) {
       await executionProjection.finish({
         userId: lease.userId,
         sessionId: lease.sessionId,

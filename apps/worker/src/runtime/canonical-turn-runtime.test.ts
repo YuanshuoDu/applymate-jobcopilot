@@ -529,19 +529,20 @@ describe("createCanonicalTurnRuntime", () => {
     expect(executionProjection.finish.mock.invocationCallOrder[0]).toBeLessThan(sessionProjection.finish.mock.invocationCallOrder[0] ?? Number.MAX_SAFE_INTEGER)
   })
 
-  it("reconciles a terminal root through the session projection without rerunning the engine", async () => {
-    const roots = { ...rootStore(), reconcileTerminal: vi.fn().mockResolvedValue({ rootTaskId: "root-1", result: { status: "waiting_for_user" as const, summary: "needs_input" } }) }
+  it.each(["waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] as const)("rebinds a %s root after its wake instead of treating it as terminal", async status => {
+    const result = { status, summary: "needs_resume", ...(status === "waiting_for_dependency" ? { waitId: "wait-1" } : {}) }
+    const roots = { ...rootStore(), reconcileTerminal: vi.fn().mockResolvedValue({ rootTaskId: "root-1", result }) }
     const sessionProjection = { start: vi.fn(async () => undefined), finish: vi.fn(async () => undefined) }
     const fixture = setup({ rootTaskStore: roots, sessionProjection })
     const runtime = await fixture.runtime
 
-    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toEqual({ status: "waiting_for_user", summary: "needs_input" })
-    expect(sessionProjection.finish).toHaveBeenCalledWith({
-      userId: "user-1", sessionId: "session-1", turnId: "turn-1", result: { status: "waiting_for_user", errorCode: "needs_input" },
-    })
-    expect(sessionProjection.start).not.toHaveBeenCalled()
-    expect(fixture.getModelCalls()).toBe(0)
-    expect(roots.ensure).not.toHaveBeenCalled()
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "completed" })
+    expect(roots.ensure).toHaveBeenCalledTimes(1)
+    expect(fixture.getModelCalls()).toBe(2)
+    expect(sessionProjection.start).toHaveBeenCalledOnce()
+    expect(sessionProjection.finish).toHaveBeenCalledWith(expect.objectContaining({
+      userId: "user-1", sessionId: "session-1", turnId: "turn-1", result: expect.objectContaining({ status: "completed" }),
+    }))
   })
 
   it("reconciles a terminal root on projection retry without rerunning the engine", async () => {
