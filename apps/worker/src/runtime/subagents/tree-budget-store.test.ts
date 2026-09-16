@@ -48,6 +48,7 @@ describe("tree budget reservation store", () => {
     expect(queries[2]).toContain('FOR UPDATE')
     expect(queries[3]).toContain('FOR UPDATE')
     expect(queries[5]).toContain("step.\"status\" = 'streaming'")
+    expect(queries[5]).toContain('task.\"attemptCount\" = $7')
     expect(queries[6]).toContain("status\" IN ('reserved', 'consumed')")
   })
 

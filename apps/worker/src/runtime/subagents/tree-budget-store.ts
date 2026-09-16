@@ -131,6 +131,7 @@ async function assertLineage(client: Client, input: TreeBudgetReserveInput): Pro
     WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4
       AND session."userId" = $5 AND turn."userId" = $5
       AND task."status" = 'running' AND task."interruptRequestedAt" IS NULL
+      AND task."attemptCount" = $7
       AND task."leaseOwner" IS NOT NULL AND task."leaseExpiresAt" > CURRENT_TIMESTAMP
       AND root_task."status" IN (${ACTIVE_ROOT}) AND root_task."interruptRequestedAt" IS NULL
       AND turn."status" IN (${ACTIVE_TURN}) AND step."attempt" = $7 AND step."status" = 'streaming'
