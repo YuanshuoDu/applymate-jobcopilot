@@ -106,6 +106,7 @@ export async function createProductionWorkerBootstrap(
   let recoveryFactory = options.turnRecoveryFactory
   let turns: TurnConsumer | null = null
   let turnRecovery: TurnRecovery | null = null
+  let turnShutdown: TurnShutdownController | null = null
   let waitResolver: WaitResolver | null = null
   let subagentConsumer: SubagentConsumer | null = null
   let subagentRecovery: SubagentRecovery | null = null
@@ -122,6 +123,15 @@ export async function createProductionWorkerBootstrap(
       waitHandoff: async input => {
         await createPgDurableWaitPort(options.pool).suspendAndRelease(input)
       },
+    })
+    // Build the shutdown fence before starting recovery. If scanner startup
+    // fails, active turns still need to be aborted and released for restart.
+    turnShutdown = new TurnShutdownController({
+      pool: options.pool,
+      active: turns.active,
+      stopIntake: async () => { await turns?.worker.pause?.(true) },
+      closeQueue: () => turns!.close(),
+      closeScanner: async () => { await turnRecovery?.close() },
     })
     turnRecovery = recoveryFactory(options.pool, turns.queue, options.ownerId, options.turnRecoveryIntervalMs)
     if (options.waitResolver) {
@@ -150,14 +160,7 @@ export async function createProductionWorkerBootstrap(
     }
 
     const createdTurns = turns
-    const createdTurnRecovery = turnRecovery
-    const turnShutdown = new TurnShutdownController({
-      pool: options.pool,
-      active: createdTurns.active,
-      stopIntake: async () => { await createdTurns.worker.pause?.(true) },
-      closeQueue: () => createdTurns.close(),
-      closeScanner: () => createdTurnRecovery.close(),
-    })
+    const createdTurnShutdown = turnShutdown
     let closed = false
     return {
       runtime: options.runtime,
@@ -172,7 +175,7 @@ export async function createProductionWorkerBootstrap(
           subagentConsumer ? async () => { await subagentConsumer!.worker.pause?.(true) } : undefined,
           subagentRecovery ? () => subagentRecovery!.close() : undefined,
           waitResolver ? () => waitResolver!.close() : undefined,
-          () => turnShutdown.shutdown("worker_close"),
+          () => createdTurnShutdown.shutdown("worker_close"),
           () => options.runtime.manager.shutdown(),
           subagentConsumer ? () => subagentConsumer!.close() : undefined,
           () => options.runtime.close(),
@@ -184,10 +187,9 @@ export async function createProductionWorkerBootstrap(
       subagentConsumer ? async () => { await subagentConsumer!.worker.pause?.(true) } : undefined,
       subagentRecovery ? () => subagentRecovery!.close() : undefined,
       waitResolver ? () => waitResolver!.close() : undefined,
+      turnShutdown ? () => turnShutdown!.shutdown("bootstrap_failure") : undefined,
       turns ? () => options.runtime.manager.shutdown() : undefined,
-      turnRecovery ? () => turnRecovery!.close() : undefined,
       subagentConsumer ? () => subagentConsumer!.close() : undefined,
-      turns ? () => turns!.close() : undefined,
       () => options.runtime.close(),
     ]).catch(() => undefined)
     throw error

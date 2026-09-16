@@ -683,3 +683,9 @@ Commit `4b63cbcf2354fb9673329a73842e874d08770d03` 让 server-owned `ContextSnaps
 提交 `5bef2542` 完成 P3-26 candidate：当 canonical root runtime 同时开启 `planningEnabled && planningExecutionEnabled` 时，final response 必须通过 server-owned plan completion barrier。计划必须真实产生同一最新 revision 下唯一的 `plan_control` / `completion_proposed` observation；该 control 携带 server-owned `dependsOn`，并且每个依赖只能精确对应同一 plan 的 `plan-result` observation，且必须在 control 之前 `status=completed`、`errorCode=null`。缺失、失败、重复、跨计划、畸形或顺序错误的 evidence 都 fail closed，并写入 `final.rejected`。`completionCriteria` 只作为有界的模型声明文本保存并可 replay；本切片不把自然语言 criteria 当作已证明的语义条件。`request_input` replay 保持兼容；child runtime 默认不强制。
 
 P3-26 focused evidence 为 **4 个文件 / 95 tests**；shared build、Worker `tsc --noEmit --skipLibCheck`、`git diff --check` 均通过。未做 live DB/RLS、Redis/queue delivery、provider、process restart、browser/child-parent E2E 验证。overall completion 仍为 **1/8（12.5%）**，P3-26 仍是 candidate，不能视为 P3 完成。
+
+## P8-7 update
+
+`ProductionWorkerBootstrap` 现在在创建 canonical Turn consumer 后、启动 recovery scanner 和可选 child/wait consumer 前，先创建同一份 `TurnShutdownController`。如果后续任一启动步骤失败，cleanup 会暂停 Turn intake，中止当前 root execution，并按现有 owner/version fence release 或 expire lease，然后关闭 scanner/queue、manager 和 runtime；正常 Worker shutdown 继续复用该 controller。这样启动失败与进程重启共用 root lease recovery 边界，不会把已 claim 的 Turn 留到 lease 自然过期。
+
+Worker focused validation 为 **14/14 tests**（production bootstrap 与 production flags），Worker TypeScript 和 `git diff --check` 通过。未做 live PostgreSQL/RLS、Redis/BullMQ、并发启动、provider/model、browser、deployment 或完整 child → wait → parent resume 验证；本候选不改变默认 gate，也没有 migration、dependency 或 provider 变更。

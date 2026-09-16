@@ -255,6 +255,46 @@ describe("production Worker bootstrap", () => {
     expect(canonical.close).toHaveBeenCalledTimes(1)
   })
 
+  it("releases active turns when recovery scanner startup fails", async () => {
+    const events: string[] = []
+    const canonical = runtime(events)
+    const lease = {
+      turnId: "turn_startup_failure", sessionId: "session_startup_failure", ownerId: "worker_fixture", userId: "user_fixture", leaseVersion: 3,
+      leaseStartedAt: new Date("2026-09-01T00:00:00.000Z"), leaseExpiresAt: new Date("2026-09-01T00:10:00.000Z"),
+    }
+    const abort = vi.fn(async () => { events.push("turn.abort") })
+    const active = { values: () => [{ lease, abort }] }
+    const queries: string[] = []
+    const client = {
+      query: vi.fn(async (sql: string) => {
+        queries.push(sql)
+        if (sql.includes('SELECT session."id"')) return { rows: [{ id: lease.sessionId }], rowCount: 1 }
+        if (sql.includes('UPDATE "agent_turns"')) return { rows: [], rowCount: 1 }
+        return { rows: [], rowCount: 1 }
+      }),
+      release: vi.fn(),
+    }
+    const pool = { connect: vi.fn(async () => client) }
+    const turnQueue = {
+      queue: { add: vi.fn() },
+      worker: { pause: vi.fn(async () => { events.push("turn.pause") }) },
+      active,
+      close: vi.fn(async () => { events.push("turn.close") }),
+    } as unknown as ReturnType<typeof createTurnQueue>
+    const failure = new Error("recovery scanner startup failed")
+
+    await expect(createProductionWorkerBootstrap({
+      pool: pool as never,
+      runtime: canonical,
+      turnQueueFactory: vi.fn(() => turnQueue) as unknown as Parameters<typeof createProductionWorkerBootstrap>[0]["turnQueueFactory"],
+      turnRecoveryFactory: vi.fn(() => { throw failure }) as unknown as Parameters<typeof createProductionWorkerBootstrap>[0]["turnRecoveryFactory"],
+    })).rejects.toBe(failure)
+
+    expect(events).toEqual(["turn.pause", "turn.abort", "turn.close", "manager.shutdown", "runtime.close"])
+    expect(queries.some(sql => sql.includes('SET "status" = $5'))).toBe(true)
+    expect(canonical.close).toHaveBeenCalledOnce()
+  })
+
   it("runs the same bootstrap binding through TurnEngine and ToolRouter with a deterministic model", async () => {
     const fixture = await compositionRuntime()
     let execute: CanonicalTurnRuntime["execute"] | undefined
