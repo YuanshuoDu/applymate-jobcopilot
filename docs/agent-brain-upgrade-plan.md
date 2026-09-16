@@ -715,3 +715,11 @@ The focused Turn execution loop passed **68/68 tests**; the full Worker suite pa
 Commit `aeb63687` hardens the durable canonical Turn dispatch seam. Outbox creation now locks and verifies the Turn↔Session↔User relationship before persisting a dispatch intent. The recovery scanner validates aggregate, payload and Turn lineage again immediately before `queue.add`; poisoned rows are marked terminal with `turn_dispatch_lineage_mismatch` and never enter BullMQ. Queued Turns can also rebuild a session-scoped dispatch intent when the Redis handoff was lost before `turn.started`, without relying on a separate event row.
 
 Root independently reran the two directly affected suites at **33/33 tests**; the Luna worker reported **42/42 focused tests**. Worker TypeScript and `git diff --check` passed. No schema, migration, provider, Web or new dependency changed. Live PostgreSQL/RLS, Redis/BullMQ delivery, process restart, provider/model, browser, deployment and complete Turn recovery evidence remain unverified. Overall completion remains **1/8 (12.5%)**; P8-35 is a candidate increment.
+
+## P8-36 update
+
+Commit `ec3c2fd1` projects successful server-owned read observations into stable verifier evidence. `jobs.search` and `jobs.get` produce `read:job:*` references, `persona.retrieve` produces `read:persona:*`, and `resume.get_base` produces `read:resume:*`; the original `toolCallId` evidence remains available for audit and replay. `application.get_state` and `tool_results.read` stay contextual and cannot manufacture business-read evidence.
+
+The projection is bounded and fail closed: malformed, cyclic, oversized, non-plain, foreign-shaped, or getter-throwing outputs produce no `read:*` reference. A successful candidate can therefore cite a server-derived domain fact while the verifier refuses to treat arbitrary context or identity-bearing payloads as proof.
+
+Root validation passed the verifier focused file at **6/6 tests**; Worker TypeScript and `git diff --check` passed. No schema, migration, provider, queue, Web, or dependency change was introduced. Live PostgreSQL/RLS ownership, Redis/BullMQ delivery, process restart, provider/model, browser, deployment, and complete goal-to-read-to-final production evidence remain unverified. Overall completion remains **1/8 (12.5%)**; P8-36 is a candidate increment.

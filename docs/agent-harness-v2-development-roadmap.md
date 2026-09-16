@@ -2456,3 +2456,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Root ran the directly affected suites at **33/33 tests**; the Luna worker reported **42/42 focused tests**. Worker TypeScript and `git diff --check` passed.
 
 **Candidate boundary:** No live PostgreSQL/RLS, Redis/BullMQ delivery, concurrent outbox race, process restart, provider/model, browser, deployment or complete Turn recovery E2E evidence was run. P8-35 remains a candidate; overall acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## 122. P8-36 — Canonical read evidence projection
+
+**Candidate status/date (2026-09-16):** P8-36 is recorded as a candidate Worker verifier/evidence slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `ec3c2fd1` projects successful server-owned `jobs.search` and `jobs.get` outputs into stable `read:job:*` evidence, `persona.retrieve` outputs into `read:persona:*`, and `resume.get_base` outputs into `read:resume:*`. The original `toolCallId` observation remains the audit anchor. `application.get_state` and `tool_results.read` are deliberately context-only and cannot create business-read evidence. Plain-JSON, bounded UTF-8, entry/text, cycle, getter, and foreign identity/lease/budget/capability checks fail closed before any projection is emitted.
+
+**Independent verification:** Root ran the verifier focused file at **6/6 tests**. Worker TypeScript and `git diff --check` passed. No schema, migration, provider, queue, Web, or dependency change was introduced.
+
+**Candidate boundary:** No live PostgreSQL/RLS ownership check, Redis/BullMQ delivery, process restart, provider/model, browser, deployment, or complete goal-to-read-to-final production evidence was run. P8-36 remains a candidate; overall acceptance stays **P0 accepted 1/8 (12.5%)**.
