@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest'
 const source = readFileSync(new URL('./AgentPlaygroundPage.tsx', import.meta.url), 'utf8')
 const streamSource = readFileSync(new URL('../agent-workspace/AgentUnifiedStream.tsx', import.meta.url), 'utf8')
 const appShellSource = readFileSync(new URL('../layout/AppShell.tsx', import.meta.url), 'utf8')
+const automationSource = readFileSync(new URL('../agent-workspace/AutomationList.tsx', import.meta.url), 'utf8')
 
 describe('Agent workspace responsive layout', () => {
   it('stacks the workspace before the tablet split pane can overflow', () => {
@@ -65,5 +66,22 @@ describe('Agent workspace responsive layout', () => {
 
   it('does not stop an active Turn from page cleanup', () => {
     expect(source).not.toContain('beforeunload')
+  })
+})
+
+describe('canonical automation runs', () => {
+  it('selects the already-enqueued session without opening the legacy SSE run', () => {
+    const onRunSessionBody = source.match(/onRunSession=\{\(sessionId, policy\) => \{([\s\S]*?)\n\s*\}\}/)?.[1]
+
+    expect(onRunSessionBody).toBeTruthy()
+    expect(onRunSessionBody).toContain('selectAutomationSession(sessionId, policy)')
+    expect(onRunSessionBody).not.toContain('startRun(')
+    expect(source).toContain('setActiveRunPolicy(policy)')
+  })
+
+  it('hands the canonical run response session to the page after refresh', () => {
+    expect(automationSource).toContain("/api/agent/automations/${row.id}/run")
+    expect(automationSource).toContain("window.dispatchEvent(new Event('applymate:sessions-changed'))")
+    expect(automationSource).toContain('onSessionStarted?.(sessionId, row)')
   })
 })

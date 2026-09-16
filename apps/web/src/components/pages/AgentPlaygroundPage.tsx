@@ -119,6 +119,13 @@ export function AgentPlaygroundPage() {
     void fetch(`/api/agent/sessions/${encodeURIComponent(sessionId)}`, { method: 'PATCH' }).catch(() => undefined)
   }, [])
 
+  const selectAutomationSession = useCallback((sessionId: string, policy: SubmissionPolicySettings) => {
+    // The automation route has already enqueued the canonical Worker task.
+    // Attach the UI to that durable session instead of starting a legacy SSE run.
+    selectSession(sessionId)
+    setActiveRunPolicy(policy)
+  }, [selectSession])
+
   const restoreLastSession = useCallback((data: AgentSessionsResponse) => {
     if (initialSessionRestoredRef.current) return
     initialSessionRestoredRef.current = true
@@ -597,9 +604,8 @@ export function AgentPlaygroundPage() {
               setMobileSessionDrawerOpen(false)
             }}
             onRunSession={(sessionId, policy) => {
-              selectSession(sessionId)
+              selectAutomationSession(sessionId, policy)
               setMobileSessionDrawerOpen(false)
-              startRun(undefined, sessionId, policy)
             }}
             onAddAgent={() => setShowAddModal(true)}
             onNewChat={() => {
