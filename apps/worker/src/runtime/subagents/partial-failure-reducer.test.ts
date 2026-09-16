@@ -100,6 +100,35 @@ describe("Scout/Analyst partial failure reducer", () => {
     expect(reduced.failures).toEqual([])
   })
 
+  it("fails closed when roles reuse an evidence id with different provenance", () => {
+    const scoutEvidence = evidence("shared", "job-1")
+    const analystEvidence = evidence("analyst-job", "job-2")
+    const foreignEvidence: RoleEvidence = { id: "shared", kind: "source", ref: "source-1", source: "analyst-source" }
+    const analystWithConflict: AnalystResult = {
+      schemaVersion: ROLE_RESULT_SCHEMA,
+      role: "analyst",
+      status: "completed",
+      findings: [{ jobId: "job-2", score: 8, evidenceIds: [analystEvidence.id] }],
+      evidence: [analystEvidence, foreignEvidence],
+      summary: "analyst result",
+    }
+    const reduced = reduceScoutAnalystOutcomes([
+      { role: "analyst", taskId: "task-analyst", status: "completed", result: analystWithConflict },
+      { role: "scout", taskId: "task-scout", status: "completed", result: scoutResult(["job-1"], [scoutEvidence]) },
+    ])
+
+    expect(reduced.status).toBe("failed")
+    expect(reduced.successfulRoles).toEqual([])
+    expect(reduced.failedRoles).toEqual(["scout", "analyst"])
+    expect(reduced.results).toEqual({})
+    expect(reduced.evidence).toEqual([])
+    expect(reduced.jobIds).toEqual([])
+    expect(reduced.failures).toEqual([
+      { role: "scout", taskId: "task-scout", reason: "Conflicting evidence id" },
+      { role: "analyst", taskId: "task-analyst", reason: "Conflicting evidence id" },
+    ])
+  })
+
   it("keeps only the latest failure per role and orders failures canonically", () => {
     const reduced = reduceScoutAnalystOutcomes([
       { role: "analyst", taskId: "task-z", status: "failed", failureReason: "analyst unavailable" },

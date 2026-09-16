@@ -48,6 +48,13 @@ export function reduceScoutAnalystOutcomes(outcomes: readonly RoleExecutionOutco
     }
   }
 
+  for (const role of conflictingEvidenceRoles(results)) {
+    const outcome = latestByRole.get(role)
+    if (!outcome) continue
+    delete results[role]
+    failures.push({ role, taskId: safeTaskId(outcome), reason: "Conflicting evidence id" })
+  }
+
   const successfulRoles = MIGRATED_ROLES.filter(role => results[role] !== undefined)
   const failedRoles = MIGRATED_ROLES.filter(role => failures.some(failure => failure.role === role))
   const orderedResults = MIGRATED_ROLES.flatMap(role => results[role] ? [results[role]!] : [])
@@ -103,6 +110,34 @@ function uniqueEvidence(evidence: readonly RoleEvidence[]): RoleEvidence[] {
     if (unique.at(-1)?.id !== item.id) unique.push(item)
   }
   return unique
+}
+
+function conflictingEvidenceRoles(results: Partial<Record<MigratedRole, StructuredRoleResult>>): Set<MigratedRole> {
+  const byId = new Map<string, { readonly evidence: RoleEvidence; readonly roles: Set<MigratedRole> }>()
+  const conflictingIds = new Set<string>()
+  for (const role of MIGRATED_ROLES) {
+    const result = results[role]
+    if (!result) continue
+    for (const item of result.evidence) {
+      const existing = byId.get(item.id)
+      if (!existing) {
+        byId.set(item.id, { evidence: item, roles: new Set([role]) })
+      } else {
+        existing.roles.add(role)
+        if (!sameEvidence(existing.evidence, item)) conflictingIds.add(item.id)
+      }
+    }
+  }
+
+  const affectedRoles = new Set<MigratedRole>()
+  for (const id of conflictingIds) {
+    for (const role of byId.get(id)?.roles ?? []) affectedRoles.add(role)
+  }
+  return affectedRoles
+}
+
+function sameEvidence(left: RoleEvidence, right: RoleEvidence): boolean {
+  return left.id === right.id && left.kind === right.kind && left.ref === right.ref && left.source === right.source
 }
 
 function compareEvidence(left: RoleEvidence, right: RoleEvidence): number {
