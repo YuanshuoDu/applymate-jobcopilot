@@ -1,6 +1,12 @@
 import { isPlainJsonObject, type PlanNode, type PlanProposal } from "./goal-plan-contract.js"
 import { PlanValidationError, type PlanValidationContext, validatePlanProposal } from "./goal-plan-validator.js"
 
+const CANONICAL_DELEGATE_TOOL_NAME = "agent.spawn" as const
+const LEGACY_DELEGATE_TOOL_NAME = "spawn_subagent" as const
+const CANONICAL_WAIT_TOOL_NAME = "agent.wait" as const
+const LEGACY_WAIT_TOOL_NAME = "wait_subagents" as const
+type CoordinationVersionResolver = (toolName: string) => string | undefined
+
 export type PlanDispatchErrorCode = "unknown_tool" | "input_reference_unavailable" | "role_actions_unavailable" | "control_barrier" | "invalid_plan"
 export type PlanDispatchIssue = { readonly path: string; readonly code: string; readonly message: string }
 
@@ -18,13 +24,16 @@ export type PlanInputReferenceRequest = {
 }
 
 export type PlanDispatchRuntime = {
-  readonly resolveToolVersion?: (toolName: string) => string | undefined
+  readonly resolveToolVersion?: CoordinationVersionResolver
   readonly createToolCallId?: (localId: string) => string
   readonly createIdempotencyKey?: (localId: string) => string
   readonly resolveInputRefs?: (request: PlanInputReferenceRequest) => unknown
   /** Keep references as runtime-owned inputs until each command is executed. */
   readonly deferInputRefs?: boolean
-  readonly resolveWaitVersion?: () => string | undefined
+  /** Resolve the canonical wait tool; zero-argument legacy callbacks remain assignable. */
+  readonly resolveWaitVersion?: CoordinationVersionResolver
+  /** Optional dedicated resolver for the canonical delegate tool. */
+  readonly resolveDelegateVersion?: CoordinationVersionResolver
   readonly resolveDelegateActions?: (role: string) => readonly string[] | undefined
 }
 
@@ -41,8 +50,8 @@ type CommandBase = {
 
 export type PlanDispatchCommand =
   | (CommandBase & { readonly kind: "tool_call"; readonly call: { readonly id: string; readonly toolName: string; readonly toolVersion: string; readonly input: Record<string, unknown> } })
-  | (CommandBase & { readonly kind: "delegate"; readonly call: { readonly id: string; readonly toolName: "spawn_subagent"; readonly toolVersion: "1"; readonly input: { readonly idempotencyKey: string; readonly role: string; readonly taskType: string; readonly goal: string; readonly constraints: readonly string[]; readonly successCriteria: readonly string[]; readonly allowedActions: readonly string[]; readonly context?: Record<string, unknown> } } })
-  | (CommandBase & { readonly kind: "join"; readonly call: { readonly id: string; readonly toolName: "wait_subagents"; readonly toolVersion: "1"; readonly input: { readonly idempotencyKey: string; readonly taskIds: readonly string[]; readonly mode: "any" | "all"; readonly timeoutMs: number } } })
+  | (CommandBase & { readonly kind: "delegate"; readonly call: { readonly id: string; readonly toolName: typeof CANONICAL_DELEGATE_TOOL_NAME | typeof LEGACY_DELEGATE_TOOL_NAME; readonly toolVersion: "1"; readonly input: { readonly idempotencyKey: string; readonly role: string; readonly taskType: string; readonly goal: string; readonly constraints: readonly string[]; readonly successCriteria: readonly string[]; readonly allowedActions: readonly string[]; readonly context?: Record<string, unknown> } } })
+  | (CommandBase & { readonly kind: "join"; readonly call: { readonly id: string; readonly toolName: typeof CANONICAL_WAIT_TOOL_NAME | typeof LEGACY_WAIT_TOOL_NAME; readonly toolVersion: "1"; readonly input: { readonly idempotencyKey: string; readonly taskIds: readonly string[]; readonly mode: "any" | "all"; readonly timeoutMs: number } } })
   | (CommandBase & { readonly kind: "request_input"; readonly question: string; readonly approvalBoundary?: string })
   | (CommandBase & { readonly kind: "propose_completion"; readonly completionCriteria: readonly string[] })
 
@@ -81,6 +90,18 @@ function runtimeString(callback: (() => unknown) | undefined, code: PlanDispatch
 
 function toolVersion(runtime: PlanDispatchRuntime, toolName: string): string {
   return runtimeString(runtime.resolveToolVersion ? () => runtime.resolveToolVersion!(toolName) : undefined, "unknown_tool", "Tool version is unavailable")
+}
+
+function coordinationVersion(runtime: PlanDispatchRuntime, toolName: string, dedicated: CoordinationVersionResolver | undefined, message: string): "1" {
+  if (!dedicated && !runtime.resolveToolVersion) return "1"
+  const resolver = dedicated ?? runtime.resolveToolVersion
+  let value: unknown
+  try { value = resolver?.(toolName) } catch { value = undefined }
+  // Keep the historical v1 default when a generic resolver does not know an alias.
+  if (value === undefined && !dedicated) return "1"
+  if (typeof value !== "string" || !value.trim()) throw new PlanDispatchError("unknown_tool", message)
+  if (value.trim() !== "1") throw new PlanDispatchError("unknown_tool", message)
+  return "1"
 }
 
 function callId(runtime: PlanDispatchRuntime, localId: string): string {
@@ -143,13 +164,12 @@ function command(node: PlanNode, runtime: PlanDispatchRuntime, planCompletionCri
   if (node.kind === "delegate") {
     const role = node.role ?? ""
     const idempotencyKey = runtimeString(runtime.createIdempotencyKey ? () => runtime.createIdempotencyKey!(node.localId) : undefined, "invalid_plan", "Runtime delegate identity is unavailable")
-    return { ...shared, kind: "delegate", call: { id: callId(runtime, node.localId), toolName: "spawn_subagent", toolVersion: "1", input: { idempotencyKey, role, taskType: node.taskType ?? "", goal: node.objective, constraints: [...(node.constraints ?? [])], successCriteria: [...node.successCriteria], allowedActions: actions(runtime, role) } } }
+    return { ...shared, kind: "delegate", call: { id: callId(runtime, node.localId), toolName: CANONICAL_DELEGATE_TOOL_NAME, toolVersion: coordinationVersion(runtime, CANONICAL_DELEGATE_TOOL_NAME, runtime.resolveDelegateVersion, "Delegate tool version is unavailable"), input: { idempotencyKey, role, taskType: node.taskType ?? "", goal: node.objective, constraints: [...(node.constraints ?? [])], successCriteria: [...node.successCriteria], allowedActions: actions(runtime, role) } } }
   }
   if (node.kind === "join") {
-    const waitVersion = runtime.resolveWaitVersion ? runtimeString(runtime.resolveWaitVersion, "unknown_tool", "Wait tool version is unavailable") : "1"
-    if (waitVersion !== "1") throw new PlanDispatchError("unknown_tool", "Wait tool version is unavailable")
+    const waitVersion = coordinationVersion(runtime, CANONICAL_WAIT_TOOL_NAME, runtime.resolveWaitVersion, "Wait tool version is unavailable")
     const idempotencyKey = runtimeString(runtime.createIdempotencyKey ? () => runtime.createIdempotencyKey!(node.localId) : undefined, "invalid_plan", "Runtime join identity is unavailable")
-    return { ...shared, kind: "join", call: { id: callId(runtime, node.localId), toolName: "wait_subagents", toolVersion: "1", input: { idempotencyKey, taskIds: [], mode: node.joinMode ?? "all", timeoutMs: node.timeoutMs as number } } }
+    return { ...shared, kind: "join", call: { id: callId(runtime, node.localId), toolName: CANONICAL_WAIT_TOOL_NAME, toolVersion: waitVersion, input: { idempotencyKey, taskIds: [], mode: node.joinMode ?? "all", timeoutMs: node.timeoutMs as number } } }
   }
   if (node.kind === "request_input") return { ...shared, kind: "request_input", question: node.question ?? "", ...(node.approvalBoundary ? { approvalBoundary: node.approvalBoundary } : {}) }
   return { ...shared, kind: "propose_completion", completionCriteria: [...new Set([...planCompletionCriteria, ...node.successCriteria])] }

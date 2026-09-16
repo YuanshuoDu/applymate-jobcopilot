@@ -6,7 +6,7 @@ import type { PlanValidationContext } from "./goal-plan-validator.js"
 
 const validation: PlanValidationContext = {
   goalRevision: 1, planRevision: null, maxNodes: 8,
-  allowedActions: ["use_tool", "delegate", "request_input", "propose_completion"],
+  allowedActions: ["use_tool", "delegate", "join", "request_input", "propose_completion"],
   allowedTools: ["jobs.search"], allowedTemplates: [], allowedRoles: ["scout"],
 }
 
@@ -22,7 +22,7 @@ function delegate(localId: string, overrides: Partial<PlanProposal["nodes"][numb
 }
 function runtime(overrides: Partial<PlanDispatchRuntime> = {}): PlanDispatchRuntime {
   return {
-    resolveToolVersion: toolName => toolName === "jobs.search" ? "1" : undefined,
+    resolveToolVersion: toolName => toolName === "jobs.search" || toolName === "agent.spawn" || toolName === "agent.wait" ? "1" : undefined,
     createToolCallId: localId => `call:${localId}`,
     createIdempotencyKey: localId => `idem:${localId}`,
     resolveInputRefs: request => ({ from: request.inputRefs[0] }),
@@ -36,8 +36,18 @@ describe("dispatchPlanProposal", () => {
     const result = dispatchPlanProposal(proposal([delegate("delegate", { dependsOn: ["search"] }), use("search", { inputRefs: ["goal"] })]), validation, runtime())
     expect(result.commands.map(command => command.localId)).toEqual(["search", "delegate"])
     expect(result.commands[0]).toMatchObject({ kind: "tool_call", successCriteria: ["done"], outputSchemaRef: null, call: { id: "call:search", toolName: "jobs.search", toolVersion: "1", input: { from: "goal" } } })
-    expect(result.commands[1]).toMatchObject({ kind: "delegate", call: { id: "call:delegate", input: { idempotencyKey: "idem:delegate", role: "scout", taskType: "research", goal: "Delegate delegate", allowedActions: ["jobs.search"] } } })
+    expect(result.commands[1]).toMatchObject({ kind: "delegate", call: { id: "call:delegate", toolName: "agent.spawn", toolVersion: "1", input: { idempotencyKey: "idem:delegate", role: "scout", taskType: "research", goal: "Delegate delegate", allowedActions: ["jobs.search"] } } })
     expect(JSON.stringify(result.commands)).not.toMatch(/userId|taskId|parentTaskId|lease|budgetLimit|maxBudget/)
+  })
+
+  it("emits canonical wait commands and resolves canonical coordination versions", () => {
+    const resolved: string[] = []
+    const join = { ...base, localId: "join", kind: "join" as const, objective: "Join child", inputRefs: ["child"], dependsOn: ["child"], joinMode: "all" as const, timeoutMs: 5_000 }
+    const result = dispatchPlanProposal(proposal([delegate("child"), join]), validation, runtime({
+      resolveToolVersion: toolName => { resolved.push(toolName); return toolName === "agent.spawn" || toolName === "agent.wait" ? "1" : undefined },
+    }))
+    expect(result.commands.map(command => command.kind === "delegate" || command.kind === "join" ? `${command.call.toolName}@${command.call.toolVersion}` : command.kind)).toEqual(["agent.spawn@1", "agent.wait@1"])
+    expect(resolved).toEqual(["agent.spawn", "agent.wait"])
   })
 
   it("keeps non-empty input references deferred only when the server requests it", () => {

@@ -62,10 +62,10 @@ function executable(value: unknown): value is ExecutableCommand {
   if (!command || (command.kind !== "tool_call" && command.kind !== "delegate" && command.kind !== "join")) return false
   if (typeof command.localId !== "string" || !command.localId.trim() || !strings(command.dependsOn) || !strings(command.inputRefs)) return false
   const call = row(command.call)
-  if (!call || typeof call.id !== "string" || !call.id.trim() || typeof call.toolName !== "string" || !call.toolName.trim() || typeof call.toolVersion !== "string" || !call.toolVersion.trim()) return false
+  if (!call || Object.keys(call).some(key => !["id", "toolName", "toolVersion", "input"].includes(key)) || typeof call.id !== "string" || !call.id.trim() || typeof call.toolName !== "string" || !call.toolName.trim() || typeof call.toolVersion !== "string" || !call.toolVersion.trim()) return false
   if (command.kind === "join") {
     const joinInput = row(call.input)
-    return call.toolName === "wait_subagents" && call.toolVersion === "1" && Boolean(joinInput)
+    return (call.toolName === "agent.wait" || call.toolName === "wait_subagents") && call.toolVersion === "1" && Boolean(joinInput)
       && typeof joinInput?.idempotencyKey === "string" && Boolean(joinInput.idempotencyKey.trim())
       && Object.keys(joinInput).every(key => ["idempotencyKey", "taskIds", "mode", "timeoutMs"].includes(key))
       && Array.isArray(joinInput.taskIds) && joinInput.taskIds.length === 0
@@ -73,10 +73,10 @@ function executable(value: unknown): value is ExecutableCommand {
       && typeof joinInput.timeoutMs === "number" && Number.isSafeInteger(joinInput.timeoutMs) && joinInput.timeoutMs >= 1 && joinInput.timeoutMs <= 30_000
   }
   if (command.kind === "tool_call") return isPlainJsonObject(call.input) && plainJson(call.input)
-  const delegateInput = row(call.input)
-  return call.toolName === "spawn_subagent" && call.toolVersion === "1" && Boolean(delegateInput)
-    && typeof delegateInput?.idempotencyKey === "string" && Boolean(delegateInput.idempotencyKey.trim())
-    && typeof delegateInput.role === "string" && Boolean(delegateInput.role.trim())
+  const delegateInput = row(call.input); if (!delegateInput) return false
+  return (call.toolName === "agent.spawn" || call.toolName === "spawn_subagent") && call.toolVersion === "1"
+    && Object.keys(delegateInput).every(key => ["idempotencyKey", "role", "taskType", "goal", "constraints", "successCriteria", "allowedActions", "context"].includes(key)) && (delegateInput.context === undefined || isPlainJsonObject(delegateInput.context)) && plainJson(delegateInput) && !containsIdentityKey(delegateInput, new Set(["idempotencyKey"])) && !containsIdentityKey(delegateInput.context)
+    && typeof delegateInput?.idempotencyKey === "string" && Boolean(delegateInput.idempotencyKey.trim()) && typeof delegateInput.role === "string" && Boolean(delegateInput.role.trim())
     && typeof delegateInput.taskType === "string" && Boolean(delegateInput.taskType.trim())
     && typeof delegateInput.goal === "string" && Boolean(delegateInput.goal.trim())
     && strings(delegateInput.constraints) && strings(delegateInput.successCriteria) && strings(delegateInput.allowedActions)

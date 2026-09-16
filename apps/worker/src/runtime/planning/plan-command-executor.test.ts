@@ -37,6 +37,16 @@ function runtime(router: PlanCommandExecutionRuntime["router"], createContext = 
 function completed(request: ToolCallRequest): ToolExecutionResult {
   return { ...request, status: "completed", output: { observed: request.id }, errorCode: null }
 }
+function legacyCoordinationNames(plan: PlanDispatchResult): PlanDispatchResult {
+  return {
+    ...plan,
+    commands: plan.commands.map(command => command.kind === "delegate"
+      ? { ...command, call: { ...command.call, toolName: "spawn_subagent" as const } }
+      : command.kind === "join"
+        ? { ...command, call: { ...command.call, toolName: "wait_subagents" as const } }
+        : command),
+  }
+}
 
 describe("executePlanCommands", () => {
   it("executes tool and delegate commands in order through the router", async () => {
@@ -47,9 +57,35 @@ describe("executePlanCommands", () => {
     const result = await executePlanCommands(plan, { router, createContext: request => { contexts.push(request); return context(request) } })
     expect(result.status).toBe("completed")
     expect(requests).toHaveLength(2)
-    expect(requests[1]).toMatchObject({ id: "call:child", toolName: "spawn_subagent", toolVersion: "1", input: { idempotencyKey: "idem:child", role: "scout" } })
+    expect(requests[1]).toMatchObject({ id: "call:child", toolName: "agent.spawn", toolVersion: "1", input: { idempotencyKey: "idem:child", role: "scout" } })
     expect(contexts).toEqual([{ localId: "search", kind: "tool_call" }, { localId: "child", kind: "delegate" }])
     expect(result.completed[0]).toMatchObject({ localId: "search", dependsOn: [], result: { status: "completed", id: "call:search" } })
+  })
+
+  it("accepts legacy coordination names and preserves them in router requests", async () => {
+    const requests: ToolCallRequest[] = []
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
+      requests.push(request)
+      if (request.toolName === "spawn_subagent") return { ...request, status: "completed" as const, output: { taskId: "task-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" }, errorCode: null }
+      return { ...request, status: "completed" as const, output: { waitId: "wait-1", status: "ready", taskIds: ["task-1"], matchedTaskIds: ["task-1"], tasks: [{ taskId: "task-1", status: "completed", role: "scout", result: null, failureReason: null }] }, errorCode: null }
+    }) }
+    const join = { ...base, localId: "join", kind: "join" as const, objective: "Join child", inputRefs: ["child"], dependsOn: ["child"], joinMode: "all" as const, timeoutMs: 5_000 }
+    const result = await executePlanCommands(legacyCoordinationNames(dispatch([delegate("child"), join])), { ...runtime(router), rootTaskId: "root-1" })
+    expect(result.status).toBe("completed")
+    expect(requests.map(request => `${request.toolName}@${request.toolVersion}`)).toEqual(["spawn_subagent@1", "wait_subagents@1"])
+  })
+
+  it("fails closed for malformed canonical delegate input before routing", async () => {
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => completed(request)) }
+    const plan = dispatch([delegate("child")])
+    const forged: PlanDispatchResult = {
+      ...plan,
+      commands: plan.commands.map(command => command.kind === "delegate"
+        ? { ...command, call: { ...command.call, input: { ...command.call.input, taskId: "foreign-task" } } }
+        : command),
+    }
+    await expect(executePlanCommands(forged, runtime(router))).rejects.toMatchObject({ code: "invalid_plan" })
+    expect(router.execute).not.toHaveBeenCalled()
   })
 
   it("keeps delegate execution serial unless the server-owned bound is set", async () => {
@@ -206,7 +242,7 @@ describe("executePlanCommands", () => {
     const requests: ToolCallRequest[] = []
     const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
       requests.push(request)
-      if (request.toolName === "spawn_subagent") {
+      if (request.toolName === "agent.spawn") {
         const taskId = request.id.endsWith(":first") ? "task-1" : "task-2"
         return { ...request, status: "completed" as const, output: { taskId, rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" }, errorCode: null }
       }
@@ -221,7 +257,7 @@ describe("executePlanCommands", () => {
 
   it("accepts a waiting join without task evidence for adapter compatibility", async () => {
     const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
-      if (request.toolName === "spawn_subagent") return { ...request, status: "completed" as const, output: { taskId: "task-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" }, errorCode: null }
+      if (request.toolName === "agent.spawn") return { ...request, status: "completed" as const, output: { taskId: "task-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" }, errorCode: null }
       return { ...request, status: "completed" as const, output: { waitId: "wait-1", status: "waiting", taskIds: ["task-1"], matchedTaskIds: [] }, errorCode: null }
     }) }
     const result = await executePlanCommands(dispatch([delegate("child"), { ...base, localId: "join", kind: "join" as const, objective: "Join child", inputRefs: ["child"], dependsOn: ["child"], joinMode: "all" as const, timeoutMs: 5_000 }]), { ...runtime(router), rootTaskId: "root-1" })
@@ -241,7 +277,7 @@ describe("executePlanCommands", () => {
     ]
     for (const tasks of invalidTasks) {
       const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
-        if (request.toolName === "spawn_subagent") {
+        if (request.toolName === "agent.spawn") {
           const taskId = request.id.endsWith(":first") ? "task-1" : "task-2"
           return { ...request, status: "completed" as const, output: { taskId, rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" }, errorCode: null }
         }
@@ -266,7 +302,7 @@ describe("executePlanCommands", () => {
     ]
     for (const ids of invalidIds) {
       const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
-        if (request.toolName === "spawn_subagent") {
+        if (request.toolName === "agent.spawn") {
           const taskId = request.id.endsWith(":first") ? "task-1" : "task-2"
           return { ...request, status: "completed" as const, output: { taskId, rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" }, errorCode: null }
         }
@@ -283,7 +319,7 @@ describe("executePlanCommands", () => {
     ["timed_out", []],
   ] as const)("accepts valid %s join target and matched IDs", async (status, matchedTaskIds) => {
     const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
-      if (request.toolName === "spawn_subagent") {
+      if (request.toolName === "agent.spawn") {
         const taskId = request.id.endsWith(":first") ? "task-1" : "task-2"
         return { ...request, status: "completed" as const, output: { taskId, rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" }, errorCode: null }
       }
