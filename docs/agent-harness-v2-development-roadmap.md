@@ -2294,3 +2294,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** The focused Worker coordination suite passed **3/3**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No database, migration, scheduler, Web, queue, provider, or feature-flag change was made.
 
 **Candidate boundary:** No live PostgreSQL/RLS, Redis/BullMQ delivery, Worker restart, provider/model call, browser, deployment, or complete end-to-end evidence was run. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## 106. P8-19 — Canonical agent wait tool alias
+
+**Candidate status/date (2026-09-16):** P8-19 is recorded as a candidate Worker coordination-tool naming slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `4bf1a2bf` exposes canonical `agent.wait` alongside legacy `wait_subagents`. Both names share the exact input/output schemas, executor, coordination policy metadata, required capability, capability set, timeout and idempotency contract, so they reach the same permission-scoped durable wait path; the legacy alias remains available.
+
+**Independent verification:** The main worktree focused Worker coordination suite passed **3/3**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No database, migration, scheduler, Web, queue, provider, or feature-flag change was made.
+
+**Candidate boundary:** No live PostgreSQL/RLS, Redis/BullMQ delivery, Worker restart, provider/model call, browser, deployment, or complete end-to-end evidence was run. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
