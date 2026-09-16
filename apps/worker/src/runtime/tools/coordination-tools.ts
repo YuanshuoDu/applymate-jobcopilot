@@ -121,11 +121,17 @@ function metadata(name: string, description: string, risk: "read" | "internal_wr
 }
 
 export function createCoordinationTools(options: CoordinationExecutorOptions): RuntimeToolDefinition[] {
+  const spawnExecutor: RuntimeToolDefinition["execute"] = (context, input) => executeSpawn(context, input as SpawnSubagentInput, options)
   return [
     {
       ...metadata("spawn_subagent", "Create one permission-scoped child task and durably enqueue it", "internal_write", "requires_key"),
       inputSchema: SpawnSubagentInputSchema, outputSchema: SpawnOutputSchema,
-      execute: (context, input) => executeSpawn(context, input as SpawnSubagentInput, options),
+      execute: spawnExecutor,
+    },
+    {
+      ...metadata("agent.spawn", "Create one permission-scoped child task and durably enqueue it", "internal_write", "requires_key"),
+      inputSchema: SpawnSubagentInputSchema, outputSchema: SpawnOutputSchema,
+      execute: spawnExecutor,
     },
     {
       ...metadata("agent.followup", "Create a durable follow-up task from a terminal task result", "internal_write", "requires_key"),
