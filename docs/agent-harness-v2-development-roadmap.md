@@ -2186,3 +2186,23 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** The focused Web page test passed **10/10**. The automation route test was attempted, but the local baseline reported two unrelated mock/timeout failures. No live PostgreSQL/RLS, Redis/BullMQ delivery, Worker execution, provider/model call, browser behavior, deployment, or complete end-to-end evidence was added.
 
 **Candidate boundary:** This slice establishes the single canonical session observation path in Web code and focused tests only. It does not establish live enqueue/delivery, database or queue behavior, provider/browser behavior, deployment readiness, or production acceptance; overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## 96. P8-9 — Delayed agent-run router startup
+
+**Candidate status/date (2026-09-16):** P8-9 is recorded as a candidate Worker startup-order slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `20cd4762` keeps the BullMQ `agent-runs` router stopped during module loading by setting `autorun: false`. Worker startup calls the new idempotent `startAgentRunWorker()` only after `createProductionWorkerBootstrap` has assembled the canonical Turn consumer and recovery scanner. A Turn-bound route therefore cannot be accepted by the router before the canonical execution owner and its recovery boundary exist. Existing canonical automation, cognitive-loop, and gate-off rollback semantics remain unchanged.
+
+**Independent verification:** The focused Worker agent-run queue suite passed **9/9 tests**, covering scheduled legacy routing, canonical and cognitive gate routing, enqueue failure propagation, shutdown, and delayed/idempotent startup. The shared package build ran as the Worker test pre-step; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+**Candidate boundary:** No live PostgreSQL/RLS, Redis/BullMQ process startup, crash/restart timing, cross-worker race, provider/model call, browser behavior, deployment, or complete V2-to-canonical end-to-end evidence was added. No new feature flag was introduced and the existing rollout gates remain default-off.
+
+## 97. P8-10 — Web timeline replay ordering guard
+
+**Candidate status/date (2026-09-16):** P8-10 is recorded as a candidate Web timeline consistency slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `b2d1e9df` adds a replay-source ordering fence to the V2 timeline reducer. When a reconnect or hydration snapshot arrives after newer live evidence, an incoming item is ignored if its durable sequence or revision is older, or if it would regress a terminal live state. Equal-identity replay remains idempotent. The guard preserves the existing single timeline subscription and does not add optimistic execution state or a second stream.
+
+**Independent verification:** The focused Web V2 timeline reducer suite passed **22/22 tests**, including the stale reconnect regression and existing replay, hydration, revision, sequence, and terminal-state behavior. `git diff --check` passed.
+
+**Candidate boundary:** No live PostgreSQL/RLS, production SSE reconnect/overflow timing, cross-tab or cross-worker race, process restart, Worker/Redis delivery, provider/model/browser behavior, deployment, or complete Workbench end-to-end evidence was added. No Worker, schema, provider, queue, model, or feature flag changed; overall acceptance remains **P0 accepted 1/8 (12.5%)**.
