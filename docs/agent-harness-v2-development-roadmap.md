@@ -2314,3 +2314,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** The main worktree focused Worker coordination suite passed **3/3**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No database, migration, scheduler, Web, queue, provider, or feature-flag change was made.
 
 **Candidate boundary:** No live PostgreSQL/RLS, Redis/BullMQ delivery, Worker restart, provider/model call, browser, deployment, or complete end-to-end evidence was run. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## 108. P8-21/22 — Canonical agent list and close tools
+
+**Candidate status/date (2026-09-16):** P8-21/22 is recorded as a candidate Worker coordination-tool naming slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `efd64e4c` exposes canonical `agent.list` alongside legacy `list_subagents`, and canonical `agent.close` alongside legacy `close_subagent`. Each canonical/legacy pair shares the exact input/output schemas, executor, coordination metadata/policy, required capability, capability set, timeout and idempotency contract. `agent.list` retains `read`/`read_only`; `agent.close` retains `internal_write`/`idempotent`. All legacy aliases and previously exposed canonical names remain available.
+
+**Independent verification:** The main worktree focused Worker coordination suite passed **3/3**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No database, migration, scheduler, Web, queue, provider, or feature-flag change was made.
+
+**Candidate boundary:** No live PostgreSQL/RLS, Redis/BullMQ delivery, Worker restart, provider/model call, browser, deployment, or complete end-to-end evidence was run. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.

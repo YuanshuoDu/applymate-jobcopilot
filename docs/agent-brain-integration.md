@@ -1285,3 +1285,9 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Implementation commit `424a151f` exposes canonical `agent.interrupt` alongside legacy `interrupt_subagent`. Both names share the exact input/output schemas, executor, coordination metadata/policy, required capability, capability set, timeout and idempotency contract, so they reach the same permission-scoped durable interrupt path; the legacy alias remains available.
 - The main worktree focused Worker coordination suite passed **3/3**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No database, migration, scheduler, Web, queue, provider, or feature-flag change was made.
 - Candidate boundary: no live PostgreSQL/RLS, Redis/BullMQ delivery, Worker restart, provider/model call, browser, deployment, or complete end-to-end evidence was run. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-21/22 candidate - canonical agent list and close tools
+
+- Implementation commit `efd64e4c` exposes canonical `agent.list` alongside legacy `list_subagents`, and canonical `agent.close` alongside legacy `close_subagent`. Each canonical/legacy pair shares the exact input/output schemas, executor, coordination metadata/policy, required capability, capability set, timeout and idempotency contract. `agent.list` retains `read`/`read_only`; `agent.close` retains `internal_write`/`idempotent`. All legacy aliases and previously exposed canonical names remain available.
+- The main worktree focused Worker coordination suite passed **3/3**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No database, migration, scheduler, Web, queue, provider, or feature-flag change was made.
+- Candidate boundary: no live PostgreSQL/RLS, Redis/BullMQ delivery, Worker restart, provider/model call, browser, deployment, or complete end-to-end evidence was run. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
