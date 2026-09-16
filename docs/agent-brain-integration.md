@@ -1389,3 +1389,21 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Commit `fbb4f122` adds selected-item projection in `AgentSupervisorPanel`. It exposes only sanitized item metadata, tool/call identifiers, result availability, and bounded reference IDs; raw lifecycle payloads remain opaque. Plain-record, depth, node, array, string, reference, cycle, getter, URL, and sensitive-identifier guards fail closed before anything is rendered.
 - Root validation passed **4/4 Supervisor panel tests**, Web `tsc --noEmit --skipLibCheck`, and `git diff --check`. No worker, schema, migration, provider, queue, or dependency change was made.
 - Candidate boundary: no authenticated live session, real subagent, approval/resume interaction, PostgreSQL/RLS, Redis/BullMQ, provider/model, process restart, browser, or deployment evidence was run. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-39 candidate - fail-closed durable wait replay
+
+- Commit `cb66d059` selects all scoped suspended terminal waits and reuses consumed rows only when their persisted outcome validates against wait identity, status, mode, target IDs, and task records. A consumed row without a valid outcome raises `wait_consume_outcome_invalid` instead of letting the parent continue without feedback.
+- Root validation passed the affected Worker files at **40/40 tests**; Worker TypeScript, shared build, and `git diff --check` passed. No schema, migration, provider, queue, Web, or dependency change was made.
+- Candidate boundary: no live transaction race, PostgreSQL/RLS, Redis/BullMQ delivery, process restart, provider/model, browser, deployment, or complete child-to-parent production evidence was run. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-40 candidate - reject uncertain tool replay
+
+- Commit `cb66d059` makes canonical turn rebuild reject persisted tool calls without a matching terminal result and reject nonterminal tool call/result statuses. The transaction rolls back before replay, while completed and failed outcomes continue using the authoritative event-output path.
+- Root validation covered canonical state and adjacent coordination suites at **40/40 tests**; Worker TypeScript and `git diff --check` passed. No provider, schema, migration, queue, Web, or dependency change was made.
+- Candidate boundary: no live database concurrency, process restart, provider continuation, browser, deployment, or full multi-turn production evidence was run. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-41 candidate - localized Supervisor control-state projection
+
+- Commit `cb66d059` adds a bounded Supervisor control summary for the server-owned session gate and validated control revision. Invalid revisions render `N/A`; only state metadata/data attributes are emitted, and the existing control bar remains the mutation authority.
+- Root validation passed **6/6 Supervisor panel tests**, Web TypeScript, and `git diff --check`. No Worker, schema, migration, provider, queue, or dependency change was made.
+- Candidate boundary: no authenticated live session or real pause/resume interaction was run. PostgreSQL/RLS, Redis/BullMQ, process restart, provider/model, browser, and deployment evidence remain unverified. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.

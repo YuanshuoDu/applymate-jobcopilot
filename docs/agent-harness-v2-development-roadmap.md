@@ -2486,3 +2486,33 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Root validation passed **4/4 Supervisor panel tests**; Web TypeScript and `git diff --check` passed. No worker, schema, migration, provider, queue, or dependency change was introduced.
 
 **Candidate boundary:** No authenticated live session, real subagent, approval/resume interaction, PostgreSQL/RLS, Redis/BullMQ delivery, process restart, provider/model, browser, or deployment evidence was run. P8-38 remains a candidate; overall acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## 125. P8-39 — Fail-closed durable wait replay
+
+**Candidate status/date (2026-09-16):** P8-39 is recorded as a candidate Worker durable-wait integrity slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `cb66d059` selects all scoped suspended terminal waits and reuses consumed rows only when the persisted outcome validates against wait ID, mode, status, target IDs, and task records. A consumed row without a valid outcome raises `wait_consume_outcome_invalid`, preventing a parent from continuing after an exactly-once marker with missing feedback. The deterministic integration fake was updated for the broadened query.
+
+**Independent verification:** Root validation passed the affected Worker files at **40/40 tests**; Worker TypeScript, shared build, and `git diff --check` passed. No schema, migration, provider, queue, Web, or dependency change was introduced.
+
+**Candidate boundary:** No live transaction race, PostgreSQL/RLS, Redis/BullMQ delivery, process restart, provider/model, browser, deployment, or complete child-to-parent production evidence was run. P8-39 remains a candidate; overall acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## 126. P8-40 — Reject uncertain canonical tool replay
+
+**Candidate status/date (2026-09-16):** P8-40 is recorded as a candidate Worker replay-safety slice; overall acceptance remains **1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `cb66d059` makes canonical turn reconstruction read item status and fail closed when a persisted tool call has no matching terminal result or when a call/result is still nonterminal. The loader rolls back before replay; completed and failed outcomes retain the authoritative event-output path.
+
+**Independent verification:** Root validation covered canonical state and adjacent coordination suites at **40/40 tests**; Worker TypeScript and `git diff --check` passed. No provider, schema, migration, queue, Web, or dependency change was made.
+
+**Candidate boundary:** No live database concurrency, process restart, provider continuation, browser, deployment, or full multi-turn production evidence was run. P8-40 remains a candidate; overall acceptance stays **1/8 (12.5%)**.
+
+## 127. P8-41 — Localized Supervisor control-state projection
+
+**Candidate status/date (2026-09-16):** P8-41 is recorded as a candidate Web Supervisor control-observability slice; overall acceptance remains **1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `cb66d059` adds a localized, privacy-safe summary for the server-owned session gate and validated control revision. Invalid revisions render `N/A`; only bounded state metadata and data attributes are emitted, with no session identity or raw payload/error values. Existing mutation controls remain authoritative.
+
+**Independent verification:** Root validation passed **6/6 Supervisor panel tests**; Web TypeScript and `git diff --check` passed. No Worker, schema, migration, provider, queue, or dependency change was introduced.
+
+**Candidate boundary:** No authenticated live session or real pause/resume interaction was run. PostgreSQL/RLS, Redis/BullMQ delivery, process restart, provider/model, browser, and deployment evidence remain unverified. P8-41 remains a candidate; overall acceptance stays **1/8 (12.5%)**.

@@ -735,3 +735,21 @@ Root validation passed the reducer focused file at **10/10 tests**; Worker TypeS
 Commit `fbb4f122` adds a privacy-bounded evidence projection to the Web Supervisor panel. Selecting a timeline item can show a sanitized item ID, type/status, tool name and call ID, result availability, and bounded reference IDs. Standard tool lifecycle fields are recognized for metadata and reference extraction, while raw input/output/result values, labels, URLs, sensitive identifiers, cycles, getters, oversized structures, and malformed shapes are rejected or kept opaque and are never rendered.
 
 Root validation passed the Supervisor panel focused file at **4/4 tests** using the workspace-relative path; Web TypeScript and `git diff --check` passed. No live authenticated session, real child execution, approval/resume interaction, database, provider, queue, or deployment evidence was run. Overall completion remains **1/8 (12.5%)**; P8-38 is a candidate increment.
+
+## P8-39 update
+
+Commit `cb66d059` hardens durable wait replay. The consumer now selects every suspended terminal wait in the scoped parent turn, reuses a previously consumed wait only when its persisted outcome still validates against the wait identity, mode, status, target IDs, and task records, and raises a typed fail-closed error when `consumedAt` is present without a valid outcome. A parent therefore cannot continue after an exactly-once marker with missing or forged feedback.
+
+Root validation passed the affected Worker files at **40/40 tests**; Worker TypeScript and the shared build passed. No schema, migration, provider, queue, Web, or dependency change was introduced. Live transaction races, Redis/BullMQ delivery, process restart, provider/model, browser, deployment, and complete child-to-parent production evidence remain unverified. Overall completion remains **1/8 (12.5%)**; P8-39 is a candidate increment.
+
+## P8-40 update
+
+The same commit `cb66d059` makes canonical turn rebuild fail closed when a persisted tool call has no matching terminal tool result, or when a tool call/result is still in a nonterminal status. The loader now reads the item status, checks call/result pairing before replay, and rolls back instead of treating uncertain execution as a reusable observation. Completed and failed tool outcomes retain the existing authoritative event-output path.
+
+Root validation covered the canonical state and adjacent coordination suites at **40/40 tests**; Worker TypeScript and `git diff --check` passed. No provider, schema, migration, queue, Web, or dependency change was made. Live database concurrency, process restart, provider continuation, browser, deployment, and full multi-turn production evidence remain unverified. Overall completion remains **1/8 (12.5%)**; P8-40 is a candidate increment.
+
+## P8-41 update
+
+Commit `cb66d059` adds a localized, privacy-safe Supervisor control summary showing the server-owned session gate and a validated control revision. Invalid revisions render `N/A`; only bounded state metadata and data attributes are emitted, with no session identity or raw payload/error values. This complements the selected evidence projection while keeping the existing control bar authoritative for mutations.
+
+Root validation passed the Supervisor panel focused file at **6/6 tests**; Web TypeScript and `git diff --check` passed. No Worker, schema, migration, provider, queue, or dependency change was introduced. No authenticated live session or real pause/resume interaction was run. Overall completion remains **1/8 (12.5%)**; P8-41 is a candidate increment.
