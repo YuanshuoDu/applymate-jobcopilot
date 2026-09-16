@@ -12,7 +12,6 @@ import { resolveProductionAgentFlags } from "./runtime/production-agent-flags.js
 import { createProductionContextCompactionOptions } from "./runtime/context/production-context-compaction.js";
 import { createCanonicalExecutionProjection } from "./runtime/canonical-execution-projection.js";
 import { createCanonicalSessionProjection } from "./runtime/canonical-session-projection.js";
-import { createPostBootstrapStartupFence } from "./queue/post-bootstrap-startup.js";
 
 type ClosableHttpServer = { close(callback: (error?: Error) => void): unknown; listening?: boolean };
 
@@ -37,6 +36,7 @@ async function main() {
     aiUsageBridgeModule,
     productionBootstrapModule,
     productionChildRuntimeModule,
+    postBootstrapStartupModule,
   ] = await Promise.all([
     import("./db/apply-results.js"),
     import("./queue/apply-queue.js"),
@@ -49,12 +49,14 @@ async function main() {
     import("./queue/ai-usage-bridge.js"),
     import("./queue/production-bootstrap.js"),
     import("./runtime/subagents/production-child-runtime.js"),
+    import("./queue/post-bootstrap-startup.js"),
   ]);
   const { ensureApplyResultsTable, closePool, getPool } = applyResultsModule;
   const { applyWorker, applyQueue, connection } = applyQueueModule;
   const { scoutWorker, scoutQueue, SCOUT_QUEUE_NAME } = scoutQueueModule;
   const { agentRunQueue, AGENT_RUN_QUEUE_NAME, closeAgentRunResources, startAgentRunWorker } = agentRunQueueModule;
   const { publicAutomationSchedulerStatus, startAutomationScheduler } = automationSchedulerModule;
+  const { createPostBootstrapStartupFence } = postBootstrapStartupModule;
   const { closeAllSlots } = cloakPoolModule;
   const { deadLetterQueue, registerDeadLetterListeners, closeDeadLetterResources } = deadLetterModule;
   registerDeadLetterListeners([
