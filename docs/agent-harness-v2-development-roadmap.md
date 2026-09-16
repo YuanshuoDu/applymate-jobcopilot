@@ -2228,3 +2228,15 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused Web validation passed **53/53 tests** across the Agent Playground regression and V2 timeline/stream suites. Web `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 
 **Candidate boundary:** No live PostgreSQL/RLS, production SSE reconnect/restore timing, Worker/Redis delivery or restart recovery, provider/model call, browser behavior, deployment, or complete Web-to-Worker end-to-end evidence was added. Overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## 100. P8-13 — Canonical waiting-root wake recovery
+
+**Candidate status/date (2026-09-16):** P8-13 is recorded as a candidate Worker canonical runtime recovery slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `3a1c161f` closes the case where a parent Turn is reclaimed after child dispatch completion or after a dependency, approval, or user wait is satisfied, while its persisted root task still has a waiting status. `waiting_for_dependency`, `waiting_for_approval`, and `waiting_for_user` are resumable root results. The canonical runtime must therefore continue past `reconcileTerminal`, call `ensure()` to rebind the root, restore the durable canonical ledger and wait outcome, and continue the model decision loop. Truly terminal root results retain the existing reconciliation projection retry fence.
+
+**Recovery invariant:** A wake event must restore the canonical runtime from durable state and produce the next decision. A stale waiting projection cannot terminate the parent or discard its lease. This slice changes only Worker runtime behavior and focused regression coverage; it introduces no schema, migration, queue contract, provider, browser, or feature-flag change.
+
+**Independent verification:** The root agent verified **216 focused Worker tests across 9 files**, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check`. No live infrastructure evidence was added.
+
+**Candidate boundary:** Live PostgreSQL/RLS, Redis/BullMQ delivery, real process restart and recovery, provider/model behavior, browser behavior, deployment, and complete child-to-parent end-to-end wake evidence remain unverified. Overall acceptance remains **P0 accepted 1/8 (12.5%)**.
