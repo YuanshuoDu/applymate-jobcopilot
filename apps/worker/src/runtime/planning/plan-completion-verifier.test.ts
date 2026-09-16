@@ -28,6 +28,13 @@ function completion(callId: string, localId = "finish", dependsOn: readonly stri
   }
 }
 
+function revision(planCallId: string, planRevision: number, goalRevision = 1, basedOnPlanRevision: number | null = planRevision === 1 ? null : planRevision - 1) {
+  return {
+    id: `plan-revision:${planCallId}`,
+    content: { kind: "plan_revision", planCallId, goalRevision, planRevision, basedOnPlanRevision },
+  }
+}
+
 describe("verifyPlanCompletion", () => {
   it("preserves compatibility when the server-owned requirement is disabled", () => {
     expect(verifyPlanCompletion({ snapshot: snapshot([]) })).toEqual({ ok: true })
@@ -62,6 +69,35 @@ describe("verifyPlanCompletion", () => {
     const resultValue = verifyPlanCompletion({ snapshot: snapshot(observations), required: true })
     expect(resultValue.ok).toBe(false)
     expect(JSON.stringify(resultValue)).not.toContain("other")
+  })
+
+  it("requires completion evidence for the latest accepted plan revision", () => {
+    const observations = [
+      revision("plan-1", 1), result("plan-1", "read"), completion("plan-1"),
+      revision("plan-2", 2), result("plan-2", "read"),
+    ]
+    expect(verifyPlanCompletion({ snapshot: snapshot(observations), required: true })).toEqual({
+      ok: false, blocker: PLAN_COMPLETION_BLOCKER, feedback: PLAN_COMPLETION_FEEDBACK,
+    })
+  })
+
+  it("does not let an unknown or stale completion control bypass the accepted revision", () => {
+    const observations = [
+      revision("plan-1", 1), result("plan-1", "read"), completion("plan-1"),
+      revision("plan-2", 2), result("plan-2", "read"), completion("plan-2"),
+      completion("unaccepted"),
+    ]
+    expect(verifyPlanCompletion({ snapshot: snapshot(observations), required: true })).toEqual({
+      ok: false, blocker: PLAN_COMPLETION_BLOCKER, feedback: PLAN_COMPLETION_FEEDBACK,
+    })
+  })
+
+  it("fails closed for malformed observations instead of throwing while matching dependencies", () => {
+    const observations = [result("plan-1", "read"), completion("plan-1"), null] as unknown as StepContextSnapshot["toolObservations"]
+    expect(() => verifyPlanCompletion({ snapshot: snapshot(observations), required: true })).not.toThrow()
+    expect(verifyPlanCompletion({ snapshot: snapshot(observations), required: true })).toEqual({
+      ok: false, blocker: PLAN_COMPLETION_BLOCKER, feedback: PLAN_COMPLETION_FEEDBACK,
+    })
   })
 
   it("does not include untrusted observation content in fixed failure feedback", () => {

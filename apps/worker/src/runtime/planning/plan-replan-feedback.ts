@@ -39,6 +39,8 @@ function sorted(value: readonly string[]): boolean {
 
 function validObligation(value: ReplanFeedbackObligation): boolean {
   return Boolean(value) && typeof value === "object" && id(value.id) && id(value.sourceObservationId) && id(value.planCallId) && id(value.joinLocalId, 128) && integer(value.goalRevision, 1) && integer(value.planRevision, 1) && strings(value.failedTaskIds) && sorted(value.failedTaskIds)
+    && value.id === `plan-replan:${value.planCallId}:${value.planRevision}`
+    && value.sourceObservationId === `plan-control:${value.planCallId}:${value.joinLocalId}:replan`
 }
 
 function feedbackId(turnId: string, obligation: ReplanFeedbackObligation, attempt: number): string {

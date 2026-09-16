@@ -1,5 +1,6 @@
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 import { isPlainJsonObject } from "./goal-plan-contract.js"
+import { parsePlanRevisionEvent, type PlanRevisionReceipt } from "./plan-revision-receipt.js"
 
 const MAX_LOCAL_ID_LENGTH = 128
 const MAX_DEPENDENCIES = 8
@@ -30,6 +31,11 @@ type CompletionCandidate = {
   readonly localId: string
   readonly dependsOn: readonly string[]
   readonly completionCriteria: readonly string[]
+}
+
+type PlanRevisionState = {
+  readonly acceptedPlanIds: ReadonlySet<string>
+  readonly latestPlanId: string
 }
 
 function failed(): PlanCompletionVerification {
@@ -103,11 +109,49 @@ function observationsFor(input: PlanCompletionVerifierInput): StepContextSnapsho
   return "snapshot" in input ? input.snapshot.toolObservations : input.toolObservations
 }
 
+function planRevisionState(observations: readonly StepContextSnapshot["toolObservations"][number][]): PlanRevisionState | null | false {
+  const revisions: PlanRevisionReceipt[] = []
+  for (const observation of observations) {
+    if (!observation || typeof observation !== "object") continue
+    const content = row(observation.content)
+    if (content?.kind !== "plan_revision") continue
+    if (typeof observation.id !== "string") return false
+    const { kind: _kind, ...metadata } = content
+    const revision = parsePlanRevisionEvent(metadata)
+    if (!revision || observation.id !== `plan-revision:${revision.planCallId}`) return false
+    revisions.push(revision)
+  }
+  if (revisions.length === 0) return null
+
+  const byGoal = new Map<number, Map<number, PlanRevisionReceipt>>()
+  const acceptedPlanIds = new Set<string>()
+  for (const revision of revisions) {
+    const byRevision = byGoal.get(revision.goalRevision) ?? new Map<number, PlanRevisionReceipt>()
+    if (byRevision.has(revision.planRevision) || acceptedPlanIds.has(revision.planCallId)) return false
+    byRevision.set(revision.planRevision, revision)
+    byGoal.set(revision.goalRevision, byRevision)
+    acceptedPlanIds.add(revision.planCallId)
+  }
+
+  let latest: PlanRevisionReceipt | undefined
+  for (const byRevision of byGoal.values()) {
+    const ordered = [...byRevision.values()].sort((left, right) => left.planRevision - right.planRevision)
+    let previous: number | null = null
+    for (const revision of ordered) {
+      if (revision.planRevision !== (previous === null ? 1 : previous + 1) || revision.basedOnPlanRevision !== previous) return false
+      previous = revision.planRevision
+      if (!latest || revision.goalRevision > latest.goalRevision || (revision.goalRevision === latest.goalRevision && revision.planRevision > latest.planRevision)) latest = revision
+    }
+  }
+  return latest ? { acceptedPlanIds, latestPlanId: latest.planCallId } : false
+}
+
 /** Verify only server-owned structural completion evidence; criteria text is never semantically evaluated. */
 export function verifyPlanCompletion(input: PlanCompletionVerifierInput): PlanCompletionVerification {
   if (input.required !== true) return { ok: true }
   const observations = observationsFor(input)
   if (!Array.isArray(observations)) return failed()
+  if (observations.some(observation => !isPlainJsonObject(observation) || typeof observation.id !== "string")) return failed()
   const controls: CompletionCandidate[] = []
   for (const [index, observation] of observations.entries()) {
     if (!observation || typeof observation.id !== "string") continue
@@ -118,11 +162,16 @@ export function verifyPlanCompletion(input: PlanCompletionVerifierInput): PlanCo
     controls.push(candidate)
   }
   if (controls.length === 0) return failed()
-  const latest = controls[controls.length - 1]!
-  if (controls.filter(candidate => candidate.callId === latest.callId).length !== 1) return failed()
+  if (new Set(controls.map(candidate => candidate.id)).size !== controls.length) return failed()
+  const revisions = planRevisionState(observations)
+  if (revisions === false) return failed()
+  const scopedControls = revisions === null ? controls : controls.filter(candidate => revisions.acceptedPlanIds.has(candidate.callId))
+  if (revisions !== null && scopedControls.length !== controls.length) return failed()
+  const latest = revisions === null ? controls[controls.length - 1]! : scopedControls.find(candidate => candidate.callId === revisions.latestPlanId)
+  if (!latest || scopedControls.filter(candidate => candidate.callId === latest.callId).length !== 1) return failed()
   for (const dependency of latest.dependsOn) {
     const expectedId = `plan-result:${latest.callId}:${dependency}`
-    const matches = observations.flatMap((observation, index) => observation.id === expectedId ? [{ observation, index }] : [])
+    const matches = observations.flatMap((observation, index) => observation && typeof observation === "object" && observation.id === expectedId ? [{ observation, index }] : [])
     if (matches.length !== 1 || matches[0]!.index >= latest.index || !validResult(matches[0]!.observation, dependency)) return failed()
   }
   return { ok: true }
