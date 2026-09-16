@@ -15,12 +15,12 @@ describe("coordination tool definitions", () => {
   it("exposes canonical coordination names with shared metadata and manager fencing", () => {
     const definitions = createCoordinationTools(options)
     expect(definitions.map(definition => definition.name)).toEqual([
-      "spawn_subagent", "agent.spawn", "agent.followup", "send_message", "agent.send", "wait_subagents", "list_subagents", "interrupt_subagent", "close_subagent",
+      "spawn_subagent", "agent.spawn", "agent.followup", "send_message", "agent.send", "wait_subagents", "agent.wait", "list_subagents", "interrupt_subagent", "close_subagent",
     ])
     expect(definitions).toEqual(expect.arrayContaining([
       expect.objectContaining({ domain: "coordination", requiredCapabilities: ["canManageChildren"] }),
     ]))
-    expect(definitions.filter(definition => definition.risk === "internal_write")).toHaveLength(8)
+    expect(definitions.filter(definition => definition.risk === "internal_write")).toHaveLength(9)
     const legacySpawn = definitions.find(definition => definition.name === "spawn_subagent")
     const canonicalSpawn = definitions.find(definition => definition.name === "agent.spawn")
     expect(legacySpawn).toBeDefined()
@@ -55,14 +55,32 @@ describe("coordination tool definitions", () => {
     expect(canonicalSend?.inputSchema).toBe(legacySend?.inputSchema)
     expect(canonicalSend?.outputSchema).toBe(legacySend?.outputSchema)
     expect(canonicalSend?.execute).toBe(legacySend?.execute)
+    const legacyWait = definitions.find(definition => definition.name === "wait_subagents")
+    const canonicalWait = definitions.find(definition => definition.name === "agent.wait")
+    expect(legacyWait).toBeDefined()
+    expect(canonicalWait).toMatchObject({
+      schemaVersion: legacyWait?.schemaVersion,
+      version: legacyWait?.version,
+      description: legacyWait?.description,
+      capabilities: legacyWait?.capabilities,
+      risk: legacyWait?.risk,
+      domain: legacyWait?.domain,
+      idempotency: legacyWait?.idempotency,
+      timeoutMs: legacyWait?.timeoutMs,
+      requiredCapabilities: legacyWait?.requiredCapabilities,
+    })
+    expect(canonicalWait?.inputSchema).toBe(legacyWait?.inputSchema)
+    expect(canonicalWait?.outputSchema).toBe(legacyWait?.outputSchema)
+    expect(canonicalWait?.execute).toBe(legacyWait?.execute)
     expect(definitions.find(definition => definition.name === "agent.followup")).toMatchObject({ idempotency: "requires_key", risk: "internal_write", requiredCapabilities: ["canManageChildren"] })
     expect(definitions.find(definition => definition.name === "list_subagents")).toMatchObject({ risk: "read", capabilities: ["read", "coordination"] })
     expect(new ToolRegistry(definitions).list(["canManageChildren"]).map(definition => definition.name)).toEqual([
-      "spawn_subagent", "agent.spawn", "agent.followup", "send_message", "agent.send", "wait_subagents", "list_subagents", "interrupt_subagent", "close_subagent",
+      "spawn_subagent", "agent.spawn", "agent.followup", "send_message", "agent.send", "wait_subagents", "agent.wait", "list_subagents", "interrupt_subagent", "close_subagent",
     ])
     const registry = new ToolRegistry(definitions)
     expect(registry.resolve("agent.send", "1").execute).toBe(registry.resolve("send_message", "1").execute)
     expect(registry.resolve("agent.spawn", "1").execute).toBe(registry.resolve("spawn_subagent", "1").execute)
+    expect(registry.resolve("agent.wait", "1").execute).toBe(registry.resolve("wait_subagents", "1").execute)
     expect(new ToolRegistry(definitions).list(["other"])).toHaveLength(0)
   })
 
@@ -77,6 +95,9 @@ describe("coordination tool definitions", () => {
     const validMessage = { idempotencyKey: "message-1", taskId: "task-1", kind: "result", payload: {} }
     expect(registry.validateArguments("send_message", validMessage)).toBe(true)
     expect(registry.validateArguments("agent.send", validMessage)).toBe(true)
+    const validWait = { idempotencyKey: "wait-1", taskIds: ["task-1"], mode: "any", timeoutMs: 1000 }
+    expect(registry.validateArguments("wait_subagents", validWait)).toBe(true)
+    expect(registry.validateArguments("agent.wait", validWait)).toBe(true)
     for (const key of ["userId", "sessionId", "ownerId", "path", "rootTaskId", "expectedOutputSchema"]) {
       expect(registry.validateArguments("spawn_subagent", { ...valid, [key]: "forged" })).not.toBe(true)
     }
@@ -94,6 +115,7 @@ describe("coordination tool definitions", () => {
       send_message: { taskId: "task-1", kind: "result", payload: {} },
       "agent.send": { taskId: "task-1", kind: "result", payload: {} },
       wait_subagents: { taskIds: ["task-1"], mode: "all", timeoutMs: 1000 },
+      "agent.wait": { taskIds: ["task-1"], mode: "all", timeoutMs: 1000 },
       list_subagents: { unexpected: true },
       interrupt_subagent: {},
       close_subagent: {},
