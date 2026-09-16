@@ -27,6 +27,8 @@ function runtime(events: string[]): CanonicalTurnRuntime {
       return { status: "completed" as const, summary: "fixture" }
     }),
     manager,
+    childExecutionEnabled: false,
+    coordinationEnabled: false,
     close: vi.fn(async () => { events.push("runtime.close") }),
   }
 }
@@ -171,6 +173,37 @@ describe("production Worker bootstrap", () => {
     expect(bootstrap.waitResolver).toBe(resolver)
     await bootstrap.close()
     expect(resolver.close).toHaveBeenCalledOnce()
+  })
+
+  it("fails closed when child execution is enabled without a child consumer", async () => {
+    const events: string[] = []
+    const canonical = { ...runtime(events), childExecutionEnabled: true }
+    const turnQueueFactory = vi.fn()
+
+    await expect(createProductionWorkerBootstrap({
+      pool: { connect: vi.fn() }, runtime: canonical,
+      turnQueueFactory: turnQueueFactory as never,
+      turnRecoveryFactory: vi.fn() as never,
+    })).rejects.toThrow("canonical_child_execution_unconfigured")
+
+    expect(turnQueueFactory).not.toHaveBeenCalled()
+    expect(canonical.close).toHaveBeenCalledOnce()
+  })
+
+  it("fails closed when coordination is enabled without a wait resolver", async () => {
+    const events: string[] = []
+    const canonical = { ...runtime(events), childExecutionEnabled: true, coordinationEnabled: true }
+    const turnQueueFactory = vi.fn()
+
+    await expect(createProductionWorkerBootstrap({
+      pool: { connect: vi.fn() }, runtime: canonical,
+      turnQueueFactory: turnQueueFactory as never,
+      turnRecoveryFactory: vi.fn() as never,
+      subagents: { execute: vi.fn(async () => ({ status: "completed" as const })) },
+    })).rejects.toThrow("canonical_wait_resolver_unconfigured")
+
+    expect(turnQueueFactory).not.toHaveBeenCalled()
+    expect(canonical.close).toHaveBeenCalledOnce()
   })
 
   it("keeps child queue registration behind an explicit executor seam", async () => {

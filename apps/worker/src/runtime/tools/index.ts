@@ -19,6 +19,7 @@ import { createWriteTools, type WriteToolOptions } from "./write-tools.js"
 import type { RuntimeToolDefinition } from "./types.js"
 import { createPlanProposalTool, type PlanProposalToolOptions } from "../planning/plan-proposal-tool.js"
 import { createGoalUpdateTool, type GoalUpdateToolOptions } from "../planning/goal-update-tool.js"
+import { derivePlannerCapabilityCatalog } from "../planning/planner-capabilities.js"
 
 export * from "./lifecycle.js"
 export * from "./read-data-source.js"
@@ -83,9 +84,13 @@ export function createWorkerToolRuntime(
   if (gmail) definitions.push(...createGmailTools(gmail))
   if (artifacts) definitions.push(...createArtifactTools(artifacts.store))
   if (write) definitions.push(...createWriteTools({ pool, ...write }))
-  if (planning) definitions.push(createPlanProposalTool(planning) as RuntimeToolDefinition)
-  if (goalUpdate && planning) definitions.push(createGoalUpdateTool(goalUpdate) as RuntimeToolDefinition)
   const registry = new ToolRegistry(definitions)
+  if (planning) {
+    const catalog = derivePlannerCapabilityCatalog(registry, undefined, planning.allowedTools, planning.allowedTemplates)
+    const scopedPlanning: PlanProposalToolOptions = { ...planning, allowedTools: catalog.tools, allowedTemplates: catalog.templates }
+    registry.register(createPlanProposalTool(scopedPlanning) as RuntimeToolDefinition)
+    if (goalUpdate) registry.register(createGoalUpdateTool(goalUpdate) as RuntimeToolDefinition)
+  }
   const lifecycle = new ToolLifecycle({ ...lifecycleOptions, durableResults })
   return { registry, router: new ToolRouter(registry, lifecycle, policy), references: lifecycleOptions.references }
 }

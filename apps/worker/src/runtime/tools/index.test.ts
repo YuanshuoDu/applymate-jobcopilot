@@ -87,6 +87,23 @@ describe("worker tool runtime entry point", () => {
     expect(enabled.registry.resolve("agent.plan.propose", "1")).toMatchObject({ requiredCapabilities: ["canPlan"], risk: "internal_write" })
   })
 
+  it("narrows stale planner tools to the registered catalog before accepting a proposal", async () => {
+    const options: PlanProposalToolOptions = {
+      goal: { revision: 1, objective: "Find jobs", constraints: [], successCriteria: ["review"], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" },
+      allowedTools: ["jobs.missing"], allowedTemplates: [], allowedRoles: ["scout"], maxNodes: 8,
+    }
+    const runtime = createWorkerToolRuntime({} as never, { sink: new InMemoryToolLifecycleSink(), resolveOwner: () => owner }, undefined, undefined, undefined, undefined, undefined, options)
+    const definition = runtime.registry.resolve("agent.plan.propose", "1")
+    const proposal = {
+      schemaVersion: "agent-harness.plan.v1", basedOnGoalRevision: 1, basedOnPlanRevision: null,
+      nodes: [{ localId: "read", kind: "use_tool", objective: "Read missing", inputRefs: [], dependsOn: [], successCriteria: ["done"], outputSchemaRef: null, toolName: "jobs.missing" }],
+      completionCriteria: ["review"], briefRationale: "bounded",
+    }
+    await expect(definition.execute({ scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "step-1", signal: new AbortController().signal, capabilities: ["canPlan"], reportProgress: async () => undefined }, { proposal })).rejects.toMatchObject({
+      code: "plan_invalid", safeOutput: { issues: expect.arrayContaining([expect.objectContaining({ code: "unknown_tool" })]) },
+    })
+  })
+
   it("registers goal updates only alongside the server planning gate and canPlan capability", () => {
     const goal: GoalUpdateToolOptions = { goal: { revision: 1, objective: "Find jobs", constraints: [], successCriteria: [], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" } }
     const disabled = createWorkerToolRuntime({} as never, { sink: new InMemoryToolLifecycleSink(), resolveOwner: () => owner })

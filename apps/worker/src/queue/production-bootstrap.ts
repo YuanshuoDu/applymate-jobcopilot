@@ -23,6 +23,9 @@ type LeasePool = Pick<pg.Pool, "connect">
 export interface CanonicalTurnRuntime {
   readonly execute: TurnExecutor
   readonly manager: AgentTreeManager
+  /** Server-owned gates used to reject partial child-agent production wiring. */
+  readonly childExecutionEnabled: boolean
+  readonly coordinationEnabled: boolean
   close(): Promise<void>
 }
 
@@ -94,6 +97,15 @@ async function closeAll(resources: ReadonlyArray<(() => Promise<void>) | undefin
   if (firstError !== undefined) throw firstError
 }
 
+function assertCanonicalWiring(options: ProductionBootstrapOptions): void {
+  if (options.runtime.childExecutionEnabled && !options.subagents) {
+    throw new Error("canonical_child_execution_unconfigured")
+  }
+  if (options.runtime.coordinationEnabled && !options.waitResolver) {
+    throw new Error("canonical_wait_resolver_unconfigured")
+  }
+}
+
 /**
  * Assemble the same canonical consumers used by Worker startup. The runtime
  * factory is kept outside this module so tests can inject a deterministic
@@ -111,6 +123,7 @@ export async function createProductionWorkerBootstrap(
   let subagentConsumer: SubagentConsumer | null = null
   let subagentRecovery: SubagentRecovery | null = null
   try {
+    assertCanonicalWiring(options)
     if (!turnFactory) turnFactory = (await import("../runtime/turns/turn-queue.js")).createTurnQueue
     if (!recoveryFactory) recoveryFactory = (await import("../runtime/turns/recovery-scanner.js")).startTurnRecoveryScanner
     // Keep construction inside the cleanup boundary. Queue constructors can

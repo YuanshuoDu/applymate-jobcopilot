@@ -112,6 +112,15 @@ function expectRecoveryError(action: () => void): void {
 }
 
 describe("createCanonicalPlanExecutionFactory", () => {
+  it("rejects a plan tool that is absent from the registered capability catalog", async () => {
+    const hook = fixture(undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, {
+      allowedTools: ["jobs.missing"],
+    })
+    const result = await hook(input(output(proposal([use("read", { toolName: "jobs.missing" })]))))
+
+    expect(observationCode(result)).toBe("invalid_plan")
+  })
+
   it("returns a stable plan budget error observation when admission fails", async () => {
     const hook = fixture()
     const result = await hook(input(output(proposal([use("read")])), "step-1", [], false, () => { throw new Error("budget exhausted") }))

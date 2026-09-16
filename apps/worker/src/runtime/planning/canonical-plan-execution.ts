@@ -18,6 +18,7 @@ import { validateRoleResult } from "../subagents/role-results.js"
 import { assertMigratedRole, roleContract } from "../subagents/scout-analyst-contracts.js"
 import { validateBoundStructuredEvidence } from "./structured-replay-evidence.js"
 import { inspectJoinFailureEvidence, replanRequiredControl } from "./plan-replan-signal.js"
+import { derivePlannerCapabilityCatalog } from "./planner-capabilities.js"
 
 const MAX_OBSERVATIONS = 8
 const MAX_RESULT_BYTES = 8 * 1024
@@ -487,8 +488,9 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
   const maxPlanRevisions = options.maxPlanRevisions ?? PLAN_MAX_REVISIONS
   if (!Number.isSafeInteger(maxPlanRevisions) || maxPlanRevisions < 1 || maxPlanRevisions > PLAN_MAX_REVISIONS) throw new TypeError("Invalid max plan revisions")
   if (options.initialPlanRevision !== undefined && options.initialPlanRevision !== null && (!Number.isSafeInteger(options.initialPlanRevision) || options.initialPlanRevision < 1 || options.initialPlanRevision > maxPlanRevisions)) throw new TypeError("Invalid initial plan revision")
-  const allowedTools = Object.freeze([...options.allowedTools])
-  const allowedTemplates = Object.freeze([...options.allowedTemplates])
+  const capabilityCatalog = derivePlannerCapabilityCatalog(options.registry, options.capabilities, options.allowedTools, options.allowedTemplates)
+  const allowedTools = capabilityCatalog.tools
+  const allowedTemplates = capabilityCatalog.templates
   const allowedRoles = Object.freeze([...options.allowedRoles])
   const allowedPlanActions = copyAllowedPlanActions(options.allowedPlanActions)
   const seenPlanHashes = new Set(copyPlanFingerprints(options.initialPlanHashes))

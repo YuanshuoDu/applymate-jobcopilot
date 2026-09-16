@@ -316,6 +316,25 @@ async function runDefaultPlanBridge(planningExecutionEnabled: boolean) {
 }
 
 describe("createCanonicalTurnRuntime", () => {
+  it("exposes the resolved child and coordination gates for production bootstrap", async () => {
+    const runtime = await setup({ productionFlags: resolveProductionAgentFlags({ ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1" }) }).runtime
+
+    expect(runtime.childExecutionEnabled).toBe(true)
+    expect(runtime.coordinationEnabled).toBe(true)
+  })
+
+  it("rejects an inconsistent server activation contract", async () => {
+    const productionFlags = {
+      ...resolveProductionAgentFlags(),
+      childExecutionEnabled: false,
+      coordinationEnabled: true,
+    }
+
+    await expect(createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+      workerId: "worker-1", productionFlags,
+    })).rejects.toThrow("coordination_requires_child_execution")
+  })
+
   it("derives root coordination capability from the production gate", async () => {
     const disabled = await rootToolNames(false)
     expect(disabled).not.toEqual(expect.arrayContaining(["spawn_subagent", "wait_subagents", "list_subagents", "send_message", "interrupt_subagent", "close_subagent"]))

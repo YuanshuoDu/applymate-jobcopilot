@@ -8,7 +8,7 @@ import { loadWorkerAiConfig, type AiConfig } from "@jobcopilot/shared/llm"
 import { createHarnessModelRuntime, type HarnessModelRuntime } from "./harness-model.js"
 import { createPgContextOwnerFence, StepContextBuilder } from "./context/step-context-builder.js"
 import { createPgInputClaimStore } from "./context/input-claim-store.js"
-import { createWorkerToolRuntime, type ToolLifecycleEvent, type ToolLifecycleSink, type ToolRouter } from "./tools/index.js"
+import { createWorkerToolRuntime, READ_ONLY_TOOL_NAMES, TOOL_RESULTS_READ_NAME, type ToolLifecycleEvent, type ToolLifecycleSink, type ToolRouter } from "./tools/index.js"
 import { createPgTurnEngineStore } from "./turns/turn-engine-store.js"
 import { createToolRouterExecutor } from "./turns/turn-engine-helpers.js"
 import { TurnEngine } from "./turns/turn-engine.js"
@@ -26,6 +26,7 @@ import { executionOwnerFence, type ExecutionOwner, type ExecutionOwnerFence } fr
 import { createCanonicalPolicy } from "./policy/canonical-policy.js"
 import { PLAN_ACTION_KINDS, PLAN_MAX_NODES, PLAN_MAX_REVISIONS, type GoalContractRef } from "./planning/goal-plan-contract.js"
 import { createCanonicalPlanExecutionFactory, type CanonicalPlanExecutionOptions } from "./planning/canonical-plan-execution.js"
+import { derivePlannerCapabilityCatalog } from "./planning/planner-capabilities.js"
 import { hydrateGoalContract } from "./planning/goal-contract-hydration.js"
 import type { PlanCommandReceipt } from "./planning/plan-command-receipt.js"
 import { createPlanRevisionRecoveryDispatcher } from "./planning/plan-revision-receipt.js"
@@ -193,7 +194,13 @@ function defaultAuthorization(): never {
   throw error
 }
 
-export async function createCanonicalTurnRuntime(pool: pg.Pool, options: CanonicalTurnRuntimeOptions): Promise<{ execute: TurnExecutor; manager: AgentTreeManager; close(): Promise<void> }> {
+export async function createCanonicalTurnRuntime(pool: pg.Pool, options: CanonicalTurnRuntimeOptions): Promise<{
+  execute: TurnExecutor
+  manager: AgentTreeManager
+  childExecutionEnabled: boolean
+  coordinationEnabled: boolean
+  close(): Promise<void>
+}> {
   if (!options.workerId.trim()) throw new TypeError("workerId must be non-empty")
   const now = options.now ?? (() => new Date())
   const manager = options.manager ?? new AgentTreeManager(new PgSubagentTaskStore(pool), { now })
@@ -206,6 +213,8 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
   const coordinationEnabled = productionFlags?.coordinationEnabled ?? options.coordinationEnabled === true
   const planningEnabled = productionFlags?.planningEnabled ?? options.planningEnabled === true
   const planningExecutionEnabled = productionFlags?.planningExecutionEnabled ?? options.planningExecutionEnabled === true
+  const childExecutionEnabled = productionFlags?.childExecutionEnabled ?? coordinationEnabled
+  if (coordinationEnabled && !childExecutionEnabled) throw new Error("coordination_requires_child_execution")
   let closed = false
   const execute: TurnExecutor = async ({ lease, signal }): Promise<TurnExecutionResult> => {
     if (closed) throw new Error("canonical_runtime_closed")
@@ -260,11 +269,15 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const currentGoal = { value: planningGoal }; const goalRef: GoalContractRef = { get: () => currentGoal.value, update: next => { currentGoal.value = next } }
     const allowedPlanActions = coordinationEnabled ? PLAN_ACTION_KINDS : PLAN_ACTION_KINDS.filter(action => action !== "delegate" && action !== "join")
     const recoveryDispatcher = planningEnabled ? createPlanRevisionRecoveryDispatcher() : undefined
-    const planning = planningEnabled ? {
-      goal: planningGoal, goalRef, allowedTools: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base", "application.get_state", "tool_results.read"],
+    const planningConfiguration = planningEnabled ? {
+      goal: planningGoal, goalRef, allowedTools: [...READ_ONLY_TOOL_NAMES, TOOL_RESULTS_READ_NAME],
       allowedTemplates: [], allowedRoles: ["scout", "analyst"], allowedPlanActions, maxNodes: PLAN_MAX_NODES, maxPlanRevisions: PLAN_MAX_REVISIONS, initialPlanRevision: state.planRevision ?? null, initialPlanHashes: state.planProposalHashes ?? [], ...(recoveryDispatcher ? { recoveryDispatcher } : {}),
     } : undefined
-    const toolRuntime = options.toolRuntimeFactory?.({ pool, policy: selectedPolicy, manager, state }) ?? createWorkerToolRuntime(pool, { sink: sinkProxy, resolveOwner }, selectedPolicy, coordination, undefined, undefined, undefined, planning, planning ? { goal: planning.goal, goalRef } : undefined)
+    const toolRuntime = options.toolRuntimeFactory?.({ pool, policy: selectedPolicy, manager, state }) ?? createWorkerToolRuntime(pool, { sink: sinkProxy, resolveOwner }, selectedPolicy, coordination, undefined, undefined, undefined, planningConfiguration, planningConfiguration ? { goal: planningConfiguration.goal, goalRef } : undefined)
+    const planning = planningConfiguration ? {
+      ...planningConfiguration,
+      ...derivePlannerCapabilityCatalog(toolRuntime.registry, toolCapabilities, planningConfiguration.allowedTools, planningConfiguration.allowedTemplates),
+    } : undefined
     const allowedActions = toolRuntime.registry.list(toolCapabilities).flatMap((definition) => {
       const name = definition && typeof definition === "object" && "name" in definition ? (definition as { name?: unknown }).name : undefined
       return typeof name === "string" ? [name] : []
@@ -315,6 +328,8 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
   return {
     execute,
     manager,
+    childExecutionEnabled,
+    coordinationEnabled,
     async close() { closed = true },
   }
 }

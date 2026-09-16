@@ -21,13 +21,15 @@ const ToolResultsReadOutputSchema = Type.Object({
 
 export type ToolResultOwnerResolver = (context: ToolExecutionContext) => ExecutionOwner
 
+export const TOOL_RESULTS_READ_NAME = "tool_results.read" as const
+
 export function createToolResultsReadTool(
   repository: ToolResultReferenceRepository,
   resolveOwner: ToolResultOwnerResolver,
 ): RuntimeToolDefinition<ToolResultsReadInput, ToolResultChunk> {
   return {
     schemaVersion,
-    name: "tool_results.read",
+    name: TOOL_RESULTS_READ_NAME,
     version: "1",
     description: "Read a bounded UTF-8 chunk from a private durable tool result",
     capabilities: ["read"],

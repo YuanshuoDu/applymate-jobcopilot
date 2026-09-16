@@ -33,6 +33,8 @@ export interface RuntimeToolDefinition<TInput = unknown, TOutput = unknown> {
   readonly schemaVersion: typeof schemaVersion
   readonly name: string
   readonly version: string
+  /** Optional server-owned template id advertised by this tool. */
+  readonly template?: string
   readonly description: string
   readonly capabilities: readonly ToolCapability[]
   readonly inputSchema: TSchema
@@ -53,6 +55,7 @@ export type PublicToolDefinition = Omit<ToolDefinition, "inputSchema" | "outputS
   idempotency: ToolIdempotency
   timeoutMs: number
   requiredCapabilities: readonly string[]
+  readonly template?: string
 }
 
 export interface ToolCallRequest {
