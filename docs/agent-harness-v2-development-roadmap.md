@@ -2218,3 +2218,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused Worker validation passed **11/11 tests** across the startup-fence helper and agent-run queue suites (2 + 9). The shared package build ran as the Worker test pre-step; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 
 **Candidate boundary:** No live PostgreSQL/RLS, Redis/BullMQ delivery or shutdown race, real process restart, provider/model call, browser behavior, deployment, or complete Worker/V2 end-to-end evidence was added. Overall acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## 99. P8-12 — Web active Turn waiting-state projection
+
+**Candidate status/date (2026-09-16):** P8-12 is recorded as a candidate Web status-projection slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** `AgentPlaygroundPage` now derives the header Running state from the canonical `ActiveTurnStatus` predicate. Only `queued` and `in_progress` produce Running. `waiting_for_dependency`, `waiting_for_approval`, and `waiting_for_user` remain in `activeTurn` for the existing Stop, Steer, approval, and question controls, while the Supervisor tree continues to expose their Waiting state. The legacy `currentRole` and `runLog` fallback remains unchanged; no timeline, command projection, Worker, schema, or runtime behavior changed.
+
+**Independent verification:** Focused Web validation passed **53/53 tests** across the Agent Playground regression and V2 timeline/stream suites. Web `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+**Candidate boundary:** No live PostgreSQL/RLS, production SSE reconnect/restore timing, Worker/Redis delivery or restart recovery, provider/model call, browser behavior, deployment, or complete Web-to-Worker end-to-end evidence was added. Overall acceptance remains **P0 accepted 1/8 (12.5%)**.
