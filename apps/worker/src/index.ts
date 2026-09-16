@@ -12,6 +12,16 @@ import { resolveProductionAgentFlags } from "./runtime/production-agent-flags.js
 import { createProductionContextCompactionOptions } from "./runtime/context/production-context-compaction.js";
 import { createCanonicalExecutionProjection } from "./runtime/canonical-execution-projection.js";
 import { createCanonicalSessionProjection } from "./runtime/canonical-session-projection.js";
+import { createPostBootstrapStartupFence } from "./queue/post-bootstrap-startup.js";
+
+type ClosableHttpServer = { close(callback: (error?: Error) => void): unknown; listening?: boolean };
+
+async function closeHttpServer(server: ClosableHttpServer | undefined): Promise<void> {
+  if (!server || server.listening === false) return;
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => error ? reject(error) : resolve());
+  });
+}
 
 async function main() {
   const adminHost = resolveWorkerAdminHost();
@@ -105,85 +115,101 @@ async function main() {
     ...(waitResolver ? { waitResolver } : {}),
   });
   console.log("[worker] Canonical Turn consumer and recovery scanner started");
-  // The agent-runs queue is a router into the canonical Turn queue. Start it
-  // only after the canonical consumer/recovery boundary is ready, so a job
-  // cannot be accepted by the router while the execution owner is absent.
-  startAgentRunWorker();
-  console.log("[worker] Agent run router started");
+  let agentWakeupConsumer: ReturnType<typeof startAgentWakeupConsumer> | undefined;
+  let agentMailboxOutboxConsumer: ReturnType<typeof startSubagentMailboxOutboxConsumer> | undefined;
+  let automationScheduler: ReturnType<typeof startAutomationScheduler> | undefined;
+  let adminServer: ClosableHttpServer | undefined;
+  const postBootstrapFence = createPostBootstrapStartupFence(() => [
+    () => scoutWorker.close(),
+    () => applyWorker.close(),
+    () => closeAgentRunResources(),
+    () => canonicalBootstrap.close(),
+    () => closeDeadLetterResources(),
+    () => automationScheduler?.close(),
+    () => closeAllSlots(),
+    () => agentMailboxOutboxConsumer?.close(),
+    () => agentWakeupConsumer?.close(),
+    () => closeHttpServer(adminServer),
+    () => closePool(),
+    () => closeSharedRedisConnections(),
+  ]);
+  try {
+    // The agent-runs queue is a router into the canonical Turn queue. Start it
+    // only after the canonical consumer/recovery boundary is ready, so a job
+    // cannot be accepted by the router while the execution owner is absent.
+    startAgentRunWorker();
+    console.log("[worker] Agent run router started");
 
-  const agentWakeupConsumer = startAgentWakeupConsumer();
-  console.log("[worker] Agent Turn wakeup consumer started");
-  const agentMailboxOutboxConsumer = startSubagentMailboxOutboxConsumer(pool);
-  console.log("[worker] Agent subagent mailbox outbox consumer started");
+    agentWakeupConsumer = startAgentWakeupConsumer();
+    console.log("[worker] Agent Turn wakeup consumer started");
+    agentMailboxOutboxConsumer = startSubagentMailboxOutboxConsumer(pool);
+    console.log("[worker] Agent subagent mailbox outbox consumer started");
 
-  const workerControls = {
-    "apply-tasks": bindWorkerControl(applyQueue, applyWorker),
-    "scout-tasks": bindWorkerControl(scoutQueue, scoutWorker),
-    "agent-runs": bindWorkerControl(agentRunQueue, agentRunQueueModule.agentRunWorker),
-  };
-  const workerRuntimeState = await restoreWorkerRuntimeState(connection, workerControls);
-  console.log(`[worker] Runtime control state: ${workerRuntimeState.status}`);
+    const workerControls = {
+      "apply-tasks": bindWorkerControl(applyQueue, applyWorker),
+      "scout-tasks": bindWorkerControl(scoutQueue, scoutWorker),
+      "agent-runs": bindWorkerControl(agentRunQueue, agentRunQueueModule.agentRunWorker),
+    };
+    const workerRuntimeState = await restoreWorkerRuntimeState(connection, workerControls);
+    console.log(`[worker] Runtime control state: ${workerRuntimeState.status}`);
 
-  console.log(`[worker] Listening on queue 'apply-tasks' (concurrency: ${process.env.CLOAK_MAX_WORKERS ?? "1"})`);
-  console.log(`[worker] Listening on queue '${SCOUT_QUEUE_NAME}' (concurrency: 1)`);
-  console.log(`[worker] Listening on queue '${AGENT_RUN_QUEUE_NAME}' (concurrency: 1)`);
-  console.log("[worker] Listening on queue 'agent-turns' (concurrency: 1)");
-  const automationScheduler = startAutomationScheduler();
-  console.log(`[worker] Automation scheduler ${automationScheduler.status().enabled ? "started" : "disabled"}`);
+    console.log(`[worker] Listening on queue 'apply-tasks' (concurrency: ${process.env.CLOAK_MAX_WORKERS ?? "1"})`);
+    console.log(`[worker] Listening on queue '${SCOUT_QUEUE_NAME}' (concurrency: 1)`);
+    console.log(`[worker] Listening on queue '${AGENT_RUN_QUEUE_NAME}' (concurrency: 1)`);
+    console.log("[worker] Listening on queue 'agent-turns' (concurrency: 1)");
+    const startedAutomationScheduler = startAutomationScheduler();
+    automationScheduler = startedAutomationScheduler;
+    console.log(`[worker] Automation scheduler ${startedAutomationScheduler.status().enabled ? "started" : "disabled"}`);
 
-  const adminApp = express();
-  adminApp.get("/healthz", (_req, res) => res.status(200).json({
-    status: getWorkerRuntimeState().status === "paused" ? "paused" : "ok",
-    workerState: getWorkerRuntimeState().status,
-    automationScheduler: publicAutomationSchedulerStatus(automationScheduler.status()),
-    agentHarnessFlags: workerHarnessFeatureHealth(),
-  }));
-  adminApp.post("/internal/admin/control", express.text({ type: "application/json", limit: "16kb" }), createWorkerControlHandler());
+    const adminApp = express();
+    adminApp.get("/healthz", (_req, res) => res.status(200).json({
+      status: getWorkerRuntimeState().status === "paused" ? "paused" : "ok",
+      workerState: getWorkerRuntimeState().status,
+      automationScheduler: publicAutomationSchedulerStatus(startedAutomationScheduler.status()),
+      agentHarnessFlags: workerHarnessFeatureHealth(),
+    }));
+    adminApp.post("/internal/admin/control", express.text({ type: "application/json", limit: "16kb" }), createWorkerControlHandler());
 
-  // Bull Board contains task and application metadata. It is disabled unless
-  // explicitly enabled, including in production, and is always password-gated.
-  if (process.env.ENABLE_BULL_BOARD === "1") {
-    const password = process.env.BULL_BOARD_PASSWORD;
-    if (!password) throw new Error("BULL_BOARD_PASSWORD is required when ENABLE_BULL_BOARD=1");
+    // Bull Board contains task and application metadata. It is disabled unless
+    // explicitly enabled, including in production, and is always password-gated.
+    if (process.env.ENABLE_BULL_BOARD === "1") {
+      const password = process.env.BULL_BOARD_PASSWORD;
+      if (!password) throw new Error("BULL_BOARD_PASSWORD is required when ENABLE_BULL_BOARD=1");
 
-    const serverAdapter = new ExpressAdapter();
-    serverAdapter.setBasePath("/admin/queues");
-    createBullBoard({
-      queues: [new BullMQAdapter(applyQueue), new BullMQAdapter(scoutQueue), new BullMQAdapter(agentRunQueue), new BullMQAdapter(deadLetterQueue)],
-      serverAdapter,
+      const serverAdapter = new ExpressAdapter();
+      serverAdapter.setBasePath("/admin/queues");
+      createBullBoard({
+        queues: [new BullMQAdapter(applyQueue), new BullMQAdapter(scoutQueue), new BullMQAdapter(agentRunQueue), new BullMQAdapter(deadLetterQueue)],
+        serverAdapter,
+      });
+
+      adminApp.use("/admin/queues", (req, res, next) => {
+        const expected = "Basic " + Buffer.from("admin:" + password).toString("base64");
+        if (req.headers.authorization !== expected) {
+          res.setHeader("WWW-Authenticate", 'Basic realm="Bull Board"');
+          return res.status(401).send("Unauthorized");
+        }
+        next();
+      });
+      adminApp.use("/admin/queues", serverAdapter.getRouter());
+      console.log("[bull-board] Enabled at /admin/queues");
+    }
+
+    const boardPort = Number(process.env.BULL_BOARD_PORT ?? "3001");
+    adminServer = adminApp.listen(boardPort, adminHost, () =>
+      console.log(`[worker-health] http://${adminHost}:${boardPort}/healthz`)
+    );
+  } catch (error: unknown) {
+    await postBootstrapFence.close().catch((cleanupError: unknown) => {
+      console.error("[worker] Post-bootstrap cleanup failed:", cleanupError);
     });
-
-    adminApp.use("/admin/queues", (req, res, next) => {
-      const expected = "Basic " + Buffer.from("admin:" + password).toString("base64");
-      if (req.headers.authorization !== expected) {
-        res.setHeader("WWW-Authenticate", 'Basic realm="Bull Board"');
-        return res.status(401).send("Unauthorized");
-      }
-      next();
-    });
-    adminApp.use("/admin/queues", serverAdapter.getRouter());
-    console.log("[bull-board] Enabled at /admin/queues");
+    throw error;
   }
-
-  const boardPort = Number(process.env.BULL_BOARD_PORT ?? "3001");
-  adminApp.listen(boardPort, adminHost, () =>
-    console.log(`[worker-health] http://${adminHost}:${boardPort}/healthz`)
-  );
 
   // Graceful shutdown
   const shutdown = async (signal: string) => {
     console.log(`[worker] Received ${signal}, shutting down...`);
-    await scoutWorker.close();
-    await applyWorker.close();
-    await closeAgentRunResources();
-    await canonicalBootstrap.close();
-    await closeDeadLetterResources();
-    automationScheduler.close();
-    await closeAllSlots();
-    await agentMailboxOutboxConsumer.close();
-    await agentWakeupConsumer.close();
-    await closePool();
-    await closeSharedRedisConnections();
+    await postBootstrapFence.close();
     process.exit(0);
   };
 
