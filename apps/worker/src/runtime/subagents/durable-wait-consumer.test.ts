@@ -18,9 +18,10 @@ function outputOf(content: unknown): OutcomeOutput {
   return output as OutcomeOutput
 }
 
-function fixture(input: { waitStatus?: string; consumed?: boolean; targetStatus?: string; targetRole?: string; foreign?: boolean; failUpdate?: boolean; large?: boolean; targetCount?: number; malformed?: boolean; sessionStatus?: string; sessionSource?: string; closeBeforeUpdate?: boolean } = {}) {
+function fixture(input: { waitStatus?: string; consumed?: boolean; corruptConsumed?: boolean; missingConsumedOutcome?: boolean; targetStatus?: string; targetRole?: string; foreign?: boolean; failUpdate?: boolean; large?: boolean; targetCount?: number; malformed?: boolean; sessionStatus?: string; sessionSource?: string; closeBeforeUpdate?: boolean } = {}) {
   const targetIds = Array.from({ length: input.targetCount ?? 1 }, (_, index) => `child-${index + 1}`)
-  const wait = { id: "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "root-1", stepId: "step-1", targetTaskIds: targetIds, mode: "all", status: input.waitStatus ?? "ready", matchedTaskIds: targetIds, result: input.consumed ? { request: { mode: "all" }, outcome: { waitId: "wait-1", status: "ready", targetTaskIds: targetIds, matchedTaskIds: targetIds, tasks: targetIds.map(taskId => ({ taskId, status: "completed", result: null, failureReason: null })) } } : { request: { mode: "all" } }, suspendedAt: now, consumedAt: input.consumed ? now : null }
+  const outcome = { waitId: input.corruptConsumed ? "wait-other" : "wait-1", status: "ready", targetTaskIds: targetIds, matchedTaskIds: targetIds, tasks: targetIds.map(taskId => ({ taskId, status: "completed", result: null, failureReason: null })) }
+  const wait = { id: "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "root-1", stepId: "step-1", targetTaskIds: targetIds, mode: "all", status: input.waitStatus ?? "ready", matchedTaskIds: targetIds, result: input.consumed ? { request: { mode: "all" }, ...(input.missingConsumedOutcome ? {} : { outcome }) } : { request: { mode: "all" } }, suspendedAt: now, consumedAt: input.consumed ? now : null }
   const state: { wait: typeof wait; consumedAt: Date | null; result: Record<string, unknown>; updates: number; sessionStatus: string; sessionSource: string } = { wait, consumedAt: wait.consumedAt, result: wait.result, updates: 0, sessionStatus: input.sessionStatus ?? "running", sessionSource: input.sessionSource ?? "automation" }
   const calls: string[] = []
   const client = {
@@ -104,6 +105,13 @@ describe("durable wait outcome consumer", () => {
     expect(projections).toHaveLength(1)
     expect(projections[0]?.content).toMatchObject({ toolCallId: "wait:wait-1", toolName: "agent.wait", output: { waitId: "wait-1", status: "ready" } })
     expect(fake.state.updates).toBe(0)
+  })
+
+  it.each([{ corruptConsumed: true }, { missingConsumedOutcome: true }])("fails closed when a consumed wait has no valid persisted outcome", async input => {
+    const fake = fixture({ consumed: true, ...input })
+    await expect(consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now })).rejects.toThrow("wait_consume_outcome_invalid")
+    expect(fake.state.updates).toBe(0)
+    expect(fake.state.consumedAt).toBe(now)
   })
 
   it("fails closed for stale ownership and foreign lineage", async () => {

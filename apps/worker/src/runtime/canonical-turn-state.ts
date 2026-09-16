@@ -65,12 +65,16 @@ function authoritativeOutputs(events: readonly Row[]): Map<string, unknown> {
   return outputs
 }
 function observations(items: readonly Row[], events: readonly Row[], currentGoalRevision: number): StepContextSnapshot["toolObservations"] {
-  const calls = new Map<string, Row>()
+  const calls = new Map<string, Row>(), results = new Set<string>()
   const outputs = authoritativeOutputs(events)
   for (const item of items) {
     const content = object(item.content)
-    if (item.type === "tool_call" && typeof content.toolCallId === "string") calls.set(content.toolCallId, content)
+    if (typeof content.toolCallId !== "string") continue
+    if ((item.type === "tool_call" || item.type === "tool_result") && item.status !== undefined && item.status !== null && item.status !== "completed" && item.status !== "failed") throw new Error("tool_result_replay_uncertain")
+    if (item.type === "tool_call") calls.set(content.toolCallId, content)
+    if (item.type === "tool_result") results.add(content.toolCallId)
   }
+  if ([...calls.keys()].some(callId => !results.has(callId))) throw new Error("tool_result_replay_uncertain")
   return items.filter(item => item.type === "tool_result").flatMap(item => {
     const content = object(item.content)
     if (typeof content.toolCallId !== "string") return []
@@ -142,7 +146,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
        ORDER BY "ordinal" ASC, "attempt" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId],
     )
     const itemsResult = await client.query<Row>(
-      `SELECT "id", "type", "content" FROM "agent_items" WHERE "turnId" = $1 AND "sessionId" = $2
+      `SELECT "id", "type", "status", "content" FROM "agent_items" WHERE "turnId" = $1 AND "sessionId" = $2
        AND ("taskId" IS NULL OR "taskId" = $3) AND "type" IN ('tool_call', 'tool_result') ORDER BY "createdAt" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId],
     )
     const eventsResult = await client.query<Row>(

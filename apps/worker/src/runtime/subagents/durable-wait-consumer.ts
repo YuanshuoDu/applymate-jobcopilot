@@ -201,15 +201,15 @@ export async function consumeDurableWaitOutcomes(input: DurableWaitConsumerInput
   const waits = await input.client.query<Row>(
     `SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "targetTaskIds", "mode", "status", "matchedTaskIds", "result", "suspendedAt", "consumedAt"
      FROM "agent_wait_conditions"
-     WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3
-       AND "parentTaskId" = $4 AND "status" IN ('ready', 'timed_out') AND "suspendedAt" IS NOT NULL
-       AND ("consumedAt" IS NULL OR ("result" ? 'outcome')) AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_wait_conditions"."sessionId" AND session."status" NOT IN ('aborted', 'archived'))
+     WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "parentTaskId" = $4 AND "status" IN ('ready', 'timed_out') AND "suspendedAt" IS NOT NULL
+       AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_wait_conditions"."sessionId" AND session."status" NOT IN ('aborted', 'archived'))
      ORDER BY "resolvedAt" ASC NULLS LAST, "id" ASC FOR UPDATE`,
     [input.lease.userId, input.lease.sessionId, input.lease.turnId, input.turn.rootTaskId],
   )
   const projections: Projection[] = []
   for (const wait of waits.rows) {
     const prior = wait.consumedAt ? storedOutcome(wait) : null
+    if (wait.consumedAt && !prior) throw new Error("wait_consume_outcome_invalid")
     if (prior) { projections.push(projection(wait, prior)); continue }
     const parent = (await input.client.query<Row>(
       `SELECT task."id", task."rootTaskId", task."turnId", task."sessionId", session."userId" AS "userId"

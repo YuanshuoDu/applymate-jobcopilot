@@ -171,6 +171,7 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
         </span>
       </div>
       <AgentSessionControlBar sessionId={sessionId} controlGate={timeline.controlGate} controlRevision={timeline.controlRevision} />
+      <SupervisorControlSummary controlGate={timeline.controlGate} controlRevision={timeline.controlRevision} t={t} />
       {loading && <p aria-live="polite" style={messageStyle}>{t('agent.loadingTasks')}</p>}
       {error && <p role="alert" style={{ ...messageStyle, color: 'var(--c-danger)' }}>{t('agent.supervisorUnavailable')}</p>}
       <AgentPlanLedgerCard ledger={timeline.planLedger} />
@@ -202,6 +203,20 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
         </section>
       )}
     </aside>
+  )
+}
+
+export function SupervisorControlSummary({ controlGate, controlRevision, t }: {
+  readonly controlGate: AgentTimelineSnapshot['controlGate']
+  readonly controlRevision: AgentTimelineSnapshot['controlRevision']
+  readonly t: (key: string) => string
+}) {
+  const revision = Number.isSafeInteger(controlRevision) && controlRevision >= 0 ? String(controlRevision) : t('agent.notAvailable')
+  return (
+    <div data-agent-supervisor-control-state="true" data-agent-supervisor-control-gate={controlGate} data-agent-supervisor-control-revision={revision} style={controlSummaryStyle}>
+      <span>{t('agent.gate')}: {controlGate === 'user_paused' ? t('agent.paused') : t('agent.running')}</span>
+      <span>{t('agent.approvalLedger.revision')}: {revision}</span>
+    </div>
   )
 }
 
@@ -350,3 +365,4 @@ function safeAgendaTaskLabel(value: string): string {
 
 const messageStyle: React.CSSProperties = { margin: 0, color: 'var(--text-muted)', fontSize: 11, lineHeight: 1.45 }
 const loadMoreStyle: React.CSSProperties = { border: '1px solid var(--border)', borderRadius: 7, padding: '7px 9px', background: 'var(--bg)', color: 'var(--primary)', cursor: 'pointer', font: 'inherit', fontSize: 10 }
+const controlSummaryStyle: React.CSSProperties = { display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', gap: 6, margin: '7px 0 10px', color: 'var(--text-muted)', fontSize: 9 }

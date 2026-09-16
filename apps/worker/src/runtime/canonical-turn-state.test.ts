@@ -143,6 +143,19 @@ describe("loadCanonicalTurnState", () => {
     expect(value.snapshot.toolObservations).toEqual([expect.objectContaining({ id: "tool-result:call-1", content: expect.objectContaining({ toolName: "jobs.search" }) })])
   })
 
+  it("fails closed before replay when a tool call has no terminal result", async () => {
+    const call = { type: "tool_call", status: "completed", content: { toolCallId: "call-1", toolName: "jobs.search", input: { location: "Dublin" }, status: "completed" } }
+    const cases = [
+      [call],
+      [call, { type: "tool_result", status: "started", content: { toolCallId: "call-1", output: { jobs: [] }, errorCode: null } }],
+    ] as Record<string, unknown>[][]
+    for (const items of cases) {
+      const fake = pool({ turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} }, items })
+      await expect(loadCanonicalTurnState(fake, lease)).rejects.toThrow("tool_result_replay_uncertain")
+      expect(fake.client.query.mock.calls.at(-1)?.[0]).toBe("ROLLBACK")
+    }
+  })
+
   it("keeps the tenant setting inside a fenced transaction and restores a private lifecycle receipt", async () => {
     const fake = pool({
       turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },

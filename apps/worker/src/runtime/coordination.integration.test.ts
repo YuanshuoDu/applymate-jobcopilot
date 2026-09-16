@@ -185,7 +185,7 @@ class IntegrationPg {
       const children = [...this.store.records.values()].filter(task => task.rootTaskId === this.state.turn.rootTaskId && task.id !== this.state.turn.rootTaskId && !["completed", "failed", "interrupted", "cancelled", "closed"].includes(task.status))
       return { rows: children.map(task => this.taskRow(task)), rowCount: children.length }
     }
-    if (sql.includes('FROM "agent_wait_conditions"') && sql.includes('("consumedAt" IS NULL OR')) return this.state.wait.status === "ready" || this.state.wait.status === "timed_out" ? { rows: [this.waitRow()], rowCount: 1 } : { rows: [], rowCount: 0 }
+    if (sql.includes('FROM "agent_wait_conditions"') && sql.includes('AND "parentTaskId" = $4') && sql.includes('"suspendedAt" IS NOT NULL')) return this.state.wait.status === "ready" || this.state.wait.status === "timed_out" ? { rows: [this.waitRow()], rowCount: 1 } : { rows: [], rowCount: 0 }
     if (sql.includes('FROM "agent_wait_conditions"') && sql.includes('WHERE "userId"') && sql.includes('"consumedAt" IS NULL')) return this.state.wait.consumedAt === null && (this.state.wait.status === "waiting" || this.state.wait.status === "ready" || this.state.wait.status === "timed_out") ? { rows: [this.waitRow()], rowCount: 1 } : { rows: [], rowCount: 0 }
     if (sql.includes('FROM "agent_wait_conditions"') && sql.includes('WHERE "id" = $1') && sql.includes("FOR UPDATE")) return { rows: [this.waitRow()], rowCount: 1 }
     if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes('WHERE task."id" = $1') && !sql.includes("ANY")) return { rows: [this.taskRow(this.store.records.get(this.state.turn.rootTaskId)!)], rowCount: 1 }
