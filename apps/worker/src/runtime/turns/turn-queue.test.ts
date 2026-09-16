@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest"
 
 vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnect: vi.fn() })) }))
 
-import { markTurnDispatchClaimed, runTurnJob, TurnExecutionRegistry } from "./turn-queue.js"
+import { markTurnDispatchClaimed, runTurnJob, TurnExecutionRegistry, type TurnExecutionResult } from "./turn-queue.js"
 import type { TurnLease } from "./lease.js"
 import { RootAbortControllerRegistry } from "../interrupt/registry.js"
 
@@ -15,6 +15,22 @@ function pool() {
   const calls: string[] = []
   const client = {
     query: vi.fn(async (sql: string) => { calls.push(sql); return { rows: [{ ...lease, id: lease.turnId, leaseOwnerId: lease.ownerId }], rowCount: 1 } }),
+    release: vi.fn(),
+  }
+  return { pool: { connect: vi.fn().mockResolvedValue(client) }, calls }
+}
+
+function interruptedAfterHeartbeatPool() {
+  const calls: Array<[string, unknown[] | undefined]> = []
+  const client = {
+    query: vi.fn(async (sql: string, params?: unknown[]) => {
+      calls.push([sql, params])
+      if (sql.includes('SET "leaseExpiresAt"')) return { rows: [], rowCount: 0 }
+      if (sql.includes('SET "leaseOwnerId" = NULL, "leaseExpiresAt" = $5')) return { rows: [], rowCount: 0 }
+      if (sql.includes('SET "status" = $5')) return { rows: [], rowCount: 0 }
+      if (sql.includes('SELECT "status" FROM "agent_turns"')) return { rows: [{ status: "interrupted" }], rowCount: 1 }
+      return { rows: [{ ...lease, id: lease.turnId, leaseOwnerId: lease.ownerId }], rowCount: 1 }
+    }),
     release: vi.fn(),
   }
   return { pool: { connect: vi.fn().mockResolvedValue(client) }, calls }
@@ -198,5 +214,23 @@ describe("Turn queue processor", () => {
     expect(execute).toHaveBeenCalledWith(expect.objectContaining({ signal: expect.any(AbortSignal) }))
     expect(interrupts.size).toBe(0)
     expect(fake.calls.some((sql) => sql.includes('SET "status" = $5'))).toBe(true)
+  })
+
+  it("converges a durable interrupted Turn after heartbeat renewal is fenced", async () => {
+    const fake = interruptedAfterHeartbeatPool()
+    const execute = vi.fn(({ signal }: { signal: AbortSignal }) => new Promise<TurnExecutionResult>((_resolve, reject) => {
+      if (signal.aborted) return reject(signal.reason)
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true })
+    }))
+    const result = await runTurnJob(
+      { data: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptsMade: 0 },
+      { pool: fake.pool, execute, heartbeatMs: 1 },
+    )
+
+    expect(result).toEqual({ status: "interrupted", summary: "Turn stopped by a persisted interrupt" })
+    const statusRead = fake.calls.find(([sql]) => sql.includes('SELECT "status" FROM "agent_turns"'))
+    expect(statusRead?.[1]).toEqual(["turn_1", "session_1", "user_1"])
+    expect(fake.calls.some(([sql, params]) => sql.includes("set_config('app.user_id'") && params?.[0] === "user_1")).toBe(true)
+    expect(fake.calls.some(([sql]) => sql.includes('SET "leaseOwnerId" = NULL, "leaseExpiresAt" = $5'))).toBe(true)
   })
 })

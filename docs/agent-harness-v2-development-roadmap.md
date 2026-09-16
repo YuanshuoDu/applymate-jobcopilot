@@ -2166,3 +2166,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused Web validation passed **46 tests across 2 command files** and Worker validation passed **4 interrupt-service tests**. The shared package build, Worker/Web TypeScript checks, and `git diff --check` are the bounded checks for this slice. No schema, migration, UI, provider, queue, or lease/fencing change was made.
 
 **Candidate boundary:** No live PostgreSQL/RLS, Redis/BullMQ, concurrent cancellation race, process restart, provider/model/browser behavior, deployment, or complete Web-to-Worker end-to-end cancel evidence was run. The optional Worker bridge remains an injection seam until a server-owned caller supplies it.
+
+## 94. P8-5 — Durable Stop to Turn lease convergence
+
+**Candidate status/date (2026-09-16):** P8-5 is recorded as a candidate root Turn lease-convergence slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** A Web Stop can fence an active Turn before the Worker heartbeat observes it. `runTurnJob` now probes the exact `{userId, sessionId, turnId}` durable Turn status after a release fence or heartbeat renewal loss; the default probe runs in a short transaction with `app.user_id` set to the lease owner before the exact tenant/session/Turn query. An already persisted `interrupted` status returns terminal `interrupted` instead of being classified as `lease_lost` and requeued. Ordinary lease loss keeps its existing recovery path. The probe is an injectable server-owned seam for deterministic tests and fails closed to the prior lease-loss behavior when unavailable.
+
+**Independent verification:** The focused Worker Turn queue suite passed **10/10**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` are the bounded checks for this slice. No schema, migration, UI, provider, model, queue identity, or lease owner/version rule changed.
+
+**Candidate boundary:** No live PostgreSQL/RLS, Redis/BullMQ delivery, heartbeat timing under process failure, Worker restart, concurrent cancellation race, provider/model/browser behavior, deployment, or complete Web-to-Worker Stop evidence was run.

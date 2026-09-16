@@ -70,6 +70,8 @@ export interface RunTurnJobOptions {
   now?: () => Date
   /** Atomically suspends or requeues a dependency wait before ordinary release. */
   waitHandoff?: TurnWaitHandoff
+  /** Server-owned probe for a durable Stop that fenced the active lease. */
+  isInterrupted?: (lease: TurnLease) => Promise<boolean>
 }
 
 export async function markTurnDispatchClaimed(pool: LeasePool, payload: TurnJobPayload): Promise<void> {
@@ -82,6 +84,27 @@ export async function markTurnDispatchClaimed(pool: LeasePool, payload: TurnJobP
          AND "aggregateId" = $2 AND "publishedAt" IS NULL`,
       [`turn-dispatch:${payload.turnId}`, payload.sessionId],
     )
+  } finally {
+    client.release()
+  }
+}
+
+async function persistedInterrupt(options: RunTurnJobOptions, lease: TurnLease): Promise<boolean> {
+  if (options.isInterrupted) return options.isInterrupted(lease).catch(() => false)
+  const client = await options.pool.connect().catch(() => null)
+  if (!client) return false
+  try {
+    await client.query("BEGIN")
+    await client.query("SELECT set_config('app.user_id', $1, true)", [lease.userId])
+    const result = await client.query<{ status: string }>(
+      `SELECT "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+      [lease.turnId, lease.sessionId, lease.userId],
+    )
+    await client.query("COMMIT")
+    return result.rows[0]?.status === "interrupted"
+  } catch {
+    await client.query("ROLLBACK").catch(() => undefined)
+    return false
   } finally {
     client.release()
   }
@@ -146,11 +169,17 @@ export async function runTurnJob(
       return result
     }
     const released = await releaseTurnLease(options.pool, heartbeat.currentLease, result.status, options.now?.() ?? new Date())
-    if (!released && root?.stopped) return { status: "interrupted", summary: "Turn stopped by a persisted interrupt" }
+    if (!released && (root?.stopped || await persistedInterrupt(options, heartbeat.currentLease))) {
+      return { status: "interrupted", summary: "Turn stopped by a persisted interrupt" }
+    }
     if (!released) throw new TurnLeaseError("lease_lost", "Turn lease was fenced before completion")
     return result
   } catch (error: unknown) {
     if (root?.stopped || signalWasInterrupted(linked.signal)) {
+      await releaseTurnLease(options.pool, heartbeat.currentLease, "interrupted", options.now?.() ?? new Date()).catch(() => undefined)
+      return { status: "interrupted", summary: "Turn stopped by a persisted interrupt" }
+    }
+    if (error instanceof TurnLeaseError && error.code === "lease_lost" && await persistedInterrupt(options, heartbeat.currentLease)) {
       await releaseTurnLease(options.pool, heartbeat.currentLease, "interrupted", options.now?.() ?? new Date()).catch(() => undefined)
       return { status: "interrupted", summary: "Turn stopped by a persisted interrupt" }
     }
