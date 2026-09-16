@@ -1267,3 +1267,9 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Reviewed and pushed commit `bb266ba8` exposes canonical `agent.spawn` alongside legacy `spawn_subagent`. The canonical name shares the exact input/output schemas, executor, coordination policy metadata, required capability, risk, timeout and idempotency contract with the legacy tool, so both names reach the same permission-scoped durable spawn path.
 - Focused Worker coordination validation passed **3/3**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No database, migration, scheduler, Web, queue, provider, or feature-flag change was made. Remaining canonical tool names stay intentionally separate until their own contracts are ready.
 - Candidate boundary: no live PostgreSQL/RLS, Redis/BullMQ delivery, Worker restart, provider/model call, browser, deployment, or complete end-to-end evidence was run. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-18 candidate - canonical agent send tool alias
+
+- Reviewed and pushed commit `9494e94d` exposes canonical `agent.send` alongside legacy `send_message`. Both names share the exact input/output schemas, executor, coordination policy metadata, required capability, capability set, timeout and idempotency contract, so they reach the same permission-scoped durable mailbox path. The P8-17 `agent.spawn` candidate remains recorded separately; other canonical names remain intentionally separate.
+- Focused Worker coordination validation passed **3/3**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No database, migration, scheduler, Web, queue, provider, or feature-flag change was made.
+- Candidate boundary: no live PostgreSQL/RLS, Redis/BullMQ delivery, Worker restart, provider/model call, browser, deployment, or complete end-to-end evidence was run. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
