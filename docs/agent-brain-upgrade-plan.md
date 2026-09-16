@@ -723,3 +723,15 @@ Commit `ec3c2fd1` projects successful server-owned read observations into stable
 The projection is bounded and fail closed: malformed, cyclic, oversized, non-plain, foreign-shaped, or getter-throwing outputs produce no `read:*` reference. A successful candidate can therefore cite a server-derived domain fact while the verifier refuses to treat arbitrary context or identity-bearing payloads as proof.
 
 Root validation passed the verifier focused file at **6/6 tests**; Worker TypeScript and `git diff --check` passed. No schema, migration, provider, queue, Web, or dependency change was introduced. Live PostgreSQL/RLS ownership, Redis/BullMQ delivery, process restart, provider/model, browser, deployment, and complete goal-to-read-to-final production evidence remain unverified. Overall completion remains **1/8 (12.5%)**; P8-36 is a candidate increment.
+
+## P8-37 update
+
+Commits `55c130b6` and `e07b9c1e` harden the Scout/Analyst aggregate reducer at the child-result boundary. The reducer now treats malformed, foreign-shaped, getter-throwing, and otherwise invalid completed results as one failed role outcome; duplicate role inputs use the last supplied outcome; successful results, evidence, job IDs, and failures are emitted in stable order with deterministic deduplication. If roles reuse an evidence ID with different kind, ref, or source provenance, every affected role is rejected fail closed rather than allowing an ambiguous aggregate to survive.
+
+Root validation passed the reducer focused file at **10/10 tests**; Worker TypeScript and `git diff --check` passed. No schema, migration, provider, queue, Web, or dependency change was introduced. Live child dispatch, PostgreSQL/RLS, Redis/BullMQ, process restart, provider/model, browser, deployment, and complete Scout-to-Analyst production evidence remain unverified. Overall completion remains **1/8 (12.5%)**; P8-37 is a candidate increment.
+
+## P8-38 update
+
+Commit `fbb4f122` adds a privacy-bounded evidence projection to the Web Supervisor panel. Selecting a timeline item can show a sanitized item ID, type/status, tool name and call ID, result availability, and bounded reference IDs. Standard tool lifecycle fields are recognized for metadata and reference extraction, while raw input/output/result values, labels, URLs, sensitive identifiers, cycles, getters, oversized structures, and malformed shapes are rejected or kept opaque and are never rendered.
+
+Root validation passed the Supervisor panel focused file at **4/4 tests** using the workspace-relative path; Web TypeScript and `git diff --check` passed. No live authenticated session, real child execution, approval/resume interaction, database, provider, queue, or deployment evidence was run. Overall completion remains **1/8 (12.5%)**; P8-38 is a candidate increment.

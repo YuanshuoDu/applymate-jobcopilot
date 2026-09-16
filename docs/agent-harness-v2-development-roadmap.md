@@ -2466,3 +2466,23 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Root ran the verifier focused file at **6/6 tests**. Worker TypeScript and `git diff --check` passed. No schema, migration, provider, queue, Web, or dependency change was introduced.
 
 **Candidate boundary:** No live PostgreSQL/RLS ownership check, Redis/BullMQ delivery, process restart, provider/model, browser, deployment, or complete goal-to-read-to-final production evidence was run. P8-36 remains a candidate; overall acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## 123. P8-37 — Fail-closed Scout/Analyst outcome reduction
+
+**Candidate status/date (2026-09-16):** P8-37 is recorded as a candidate Worker reducer and evidence-integrity slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commits `55c130b6` and `e07b9c1e` make malformed, foreign-shaped, getter-throwing, and invalid completed role results become deterministic failed outcomes. Duplicate role inputs use the last occurrence. Successful results, evidence, job IDs, and failures are stably ordered and deduplicated. If the same evidence ID appears across roles with different kind, ref, or source provenance, all affected roles fail closed and no ambiguous result, evidence, or job ID is emitted.
+
+**Independent verification:** Root validation passed **10/10 reducer tests**; Worker TypeScript and `git diff --check` passed. No schema, migration, provider, queue, Web, or dependency change was introduced.
+
+**Candidate boundary:** No live child dispatch, PostgreSQL/RLS, Redis/BullMQ delivery, process restart, provider/model, browser, deployment, or complete Scout-to-Analyst production evidence was run. P8-37 remains a candidate; overall acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## 124. P8-38 — Privacy-bounded Supervisor evidence projection
+
+**Candidate status/date (2026-09-16):** P8-38 is recorded as a candidate Web Supervisor observability and privacy slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `fbb4f122` adds a selected timeline-item projection to `AgentSupervisorPanel`. The panel can display sanitized item ID/type/status, tool name and call ID, result availability, and bounded reference IDs. Raw input/output/result values remain opaque; URL-like or sensitive identifiers, malformed or foreign shapes, cycles, throwing getters, and oversized structures are rejected before rendering. Standard tool lifecycle metadata is available without exposing payload contents.
+
+**Independent verification:** Root validation passed **4/4 Supervisor panel tests**; Web TypeScript and `git diff --check` passed. No worker, schema, migration, provider, queue, or dependency change was introduced.
+
+**Candidate boundary:** No authenticated live session, real subagent, approval/resume interaction, PostgreSQL/RLS, Redis/BullMQ delivery, process restart, provider/model, browser, or deployment evidence was run. P8-38 remains a candidate; overall acceptance stays **P0 accepted 1/8 (12.5%)**.

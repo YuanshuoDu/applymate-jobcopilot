@@ -1377,3 +1377,15 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - The projection validates plain JSON, UTF-8 size, entry and text bounds, cycle safety, getter failures, and foreign identity/lease/budget/capability keys before emitting evidence. Invalid outputs fail closed without erasing the original tool-call audit evidence.
 - Root validation passed **6/6 verifier tests**; Worker TypeScript and `git diff --check` passed. No schema, migration, provider, queue, Web, or dependency change was introduced.
 - Candidate boundary: live PostgreSQL/RLS ownership, Redis/BullMQ delivery, process restart, provider/model, browser, deployment, and complete goal-to-read-to-final production evidence remain unverified. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-37 candidate - fail-closed Scout/Analyst outcome reduction
+
+- Commits `55c130b6` and `e07b9c1e` make the partial-failure reducer tolerate malformed, foreign-shaped, throwing, and invalid completed role outputs by recording deterministic failed outcomes. Last input wins for duplicate roles; results, evidence, job IDs, and failures are stably ordered and deduplicated. Cross-role reuse of an evidence ID with different provenance is rejected for every affected role instead of being silently merged.
+- Root validation passed **10/10 reducer tests**, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check`. No schema, migration, provider, queue, Web, or dependency change was made.
+- Candidate boundary: no live child dispatch, PostgreSQL/RLS, Redis/BullMQ delivery, process restart, provider/model, browser, deployment, or complete Scout-to-Analyst production evidence was run. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-38 candidate - privacy-bounded Supervisor evidence projection
+
+- Commit `fbb4f122` adds selected-item projection in `AgentSupervisorPanel`. It exposes only sanitized item metadata, tool/call identifiers, result availability, and bounded reference IDs; raw lifecycle payloads remain opaque. Plain-record, depth, node, array, string, reference, cycle, getter, URL, and sensitive-identifier guards fail closed before anything is rendered.
+- Root validation passed **4/4 Supervisor panel tests**, Web `tsc --noEmit --skipLibCheck`, and `git diff --check`. No worker, schema, migration, provider, queue, or dependency change was made.
+- Candidate boundary: no authenticated live session, real subagent, approval/resume interaction, PostgreSQL/RLS, Redis/BullMQ, provider/model, process restart, browser, or deployment evidence was run. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
