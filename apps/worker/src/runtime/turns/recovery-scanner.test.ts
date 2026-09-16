@@ -24,7 +24,7 @@ function matchingLegacyRows(rows: unknown[]): unknown[] {
   })
 }
 
-function pool(rows: unknown[] = [], sessionStatus: string | null = "running", queuedRows: unknown[] = [], legacyRows: unknown[] = [], controlGate = "open") {
+function pool(rows: unknown[] = [], sessionStatus: string | null = "running", queuedRows: unknown[] = [], legacyRows: unknown[] = [], controlGate = "open", lineageRows: readonly unknown[] = [{ id: "turn_1" }]) {
   const calls: Array<[string, unknown[]?]> = []
   const open = sessionStatus !== null && !["aborted", "archived"].includes(sessionStatus)
   const runnable = open && controlGate === "open"
@@ -36,6 +36,8 @@ function pool(rows: unknown[] = [], sessionStatus: string | null = "running", qu
         const candidates = matchingLegacyRows(legacyRows)
         return open ? { rows: candidates, rowCount: candidates.length } : { rows: [], rowCount: 0 }
       }
+      if (sql.includes('WHERE turn."id" = $1') && sql.includes("FOR UPDATE OF turn, session")) return { rows: lineageRows, rowCount: lineageRows.length }
+      if (sql.includes('WHERE turn."id" = $1') && sql.includes("FOR UPDATE OF turn, turnSession")) return { rows: lineageRows, rowCount: lineageRows.length }
       if (sql.includes('FROM "agent_turns" AS turn')) return runnable ? { rows: queuedRows, rowCount: queuedRows.length } : { rows: [], rowCount: 0 }
       if (sql.includes('FROM "agent_outbox"') && sql.includes('SELECT')) return runnable ? { rows, rowCount: rows.length } : { rows: [], rowCount: 0 }
       if (sql.includes('FROM "agent_sessions"')) return sql.includes('session."controlGate" = \'open\'') ? (runnable ? { rows: [{ id: "session_1" }], rowCount: 1 } : { rows: [], rowCount: 0 }) : (open ? { rows: [{ id: "session_1" }], rowCount: 1 } : { rows: [], rowCount: 0 })
@@ -155,6 +157,47 @@ describe("Turn recovery scanner", () => {
     expect(legacyIndex).toBeLessThan(queuedIndex)
   })
 
+  it("repairs a queued automation Turn when the Redis handoff lost turn.started", async () => {
+    const calls: Array<[string, unknown[]?]> = []
+    const client = {
+      query: vi.fn(async (sql: string, params?: unknown[]) => {
+        calls.push([sql, params])
+        if (sql.includes("WITH stale") || sql.includes("WITH candidates AS")) return { rows: [], rowCount: 0 }
+        if (sql.includes('FROM "agent_turns" AS turn') && sql.includes('LEFT JOIN "agent_outbox" AS dispatch')) {
+          return sql.includes(`event."type" = 'turn.started'`)
+            ? { rows: [], rowCount: 0 }
+            : { rows: [{ id: "turn_automation", sessionId: "session_1" }], rowCount: 1 }
+        }
+        if (sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes('SELECT dispatch."id"')) return { rows: [], rowCount: 0 }
+        if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session_1" }], rowCount: 1 }
+        return { rows: [], rowCount: 1 }
+      }),
+      release: vi.fn(),
+    }
+    const fakePool = { connect: vi.fn().mockResolvedValue(client) }
+    const report = await recoverTurnQueue(fakePool, { add: vi.fn() }, "recovery-owner", new Date("2026-09-01T00:00:00.000Z"))
+
+    expect(report).toEqual({ reclaimed: 0, repaired: 1, dispatched: 0 })
+    const insert = calls.find(([sql]) => sql.includes('INSERT INTO "agent_outbox"'))
+    expect(insert?.[1]).toEqual(expect.arrayContaining(["session_1", "turn-dispatch:turn_automation"]))
+    const queuedScan = calls.find(([sql]) => sql.includes('LEFT JOIN "agent_outbox" AS dispatch'))?.[0] ?? ""
+    expect(queuedScan).not.toContain(`event."type" = 'turn.started'`)
+  })
+
+  it.each([
+    ["aggregate/payload session mismatch", { turnId: "turn_1", sessionId: "session_2", ownerId: "owner_1" }, [{ id: "turn_1" }]],
+    ["turn/session mismatch", { turnId: "turn_other", sessionId: "session_1", ownerId: "owner_1" }, []],
+  ] as const)("quarantines a poisoned %s dispatch without queueing it", async (_kind, payload, lineageRows) => {
+    const fake = pool([{ id: "outbox_poison", aggregateId: "session_1", payload }], "running", [], [], "open", lineageRows)
+    const queue = { add: vi.fn() }
+
+    await expect(dispatchPendingTurnOutbox(fake.pool, queue)).resolves.toBe(0)
+
+    expect(queue.add).not.toHaveBeenCalled()
+    const quarantine = fake.calls.find(([sql]) => sql.includes('"lastError" = $2') && sql.includes('"publishedAt" = CURRENT_TIMESTAMP'))
+    expect(quarantine?.[1]).toEqual(["outbox_poison", "turn_dispatch_lineage_mismatch"])
+  })
+
   it.each([
     ["aborted", "archived", { turnId: "turn_1", sessionId: "session_1" }],
     ["archived", "archived", { turnId: "turn_1", sessionId: "session_1" }],
@@ -176,6 +219,7 @@ describe("Turn recovery scanner", () => {
     const state = { attemptCount: 0, published: false }
     const client = {
       query: vi.fn(async (sql: string, params?: unknown[]) => {
+        if (sql.includes('WHERE turn."id" = $1') && (sql.includes("FOR UPDATE OF turn, session") || sql.includes("FOR UPDATE OF turn, turnSession"))) return { rows: [{ id: "turn:1" }], rowCount: 1 }
         if (sql.includes('FROM "agent_outbox"') && sql.includes("SELECT")) {
           return state.published ? { rows: [], rowCount: 0 } : {
             rows: [{ id: "dispatch_1", payload: { turnId: "turn:1", sessionId: "session_1", ownerId: "owner_1" }, attemptCount: state.attemptCount }], rowCount: 1,
@@ -246,6 +290,7 @@ describe("Turn recovery scanner", () => {
       query: vi.fn(async (sql: string, params?: unknown[]) => {
         calls.push([sql, params])
         if (sql.includes('FROM "agent_outbox"') && sql.includes("SELECT")) return { rows: [{ id: "outbox_1", payload: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptCount: 4 }], rowCount: 1 }
+        if (sql.includes('WHERE turn."id" = $1') && sql.includes("FOR UPDATE OF turn, turnSession")) return { rows: [{ id: "turn_1" }], rowCount: 1 }
         if (sql.includes('WHERE "id" = $1 AND "publishedAt" IS NULL')) throw new Error("database unavailable")
         if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session_1" }], rowCount: 1 }
         return { rows: [], rowCount: 1 }
@@ -266,6 +311,7 @@ describe("Turn recovery scanner", () => {
         calls.push([sql, params])
         if (sql.includes("WITH stale")) return { rows: [{ id: "turn_1", sessionId: "session_1", leaseVersion: 2 }], rowCount: 1 }
         if (sql.includes('FROM "agent_turns" AS turn') && sql.includes('LEFT JOIN "agent_outbox" AS dispatch')) return { rows: [{ id: "turn_1", sessionId: "session_1" }], rowCount: 1 }
+        if (sql.includes('WHERE turn."id" = $1') && (sql.includes("FOR UPDATE OF turn, session") || sql.includes("FOR UPDATE OF turn, turnSession"))) return { rows: [{ id: "turn_1" }], rowCount: 1 }
         if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session_1" }], rowCount: 1 }
         if (sql.includes('FROM "agent_outbox"') && sql.includes("SELECT")) return { rows: [{ id: "dispatch_1", payload: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_2" } }], rowCount: 1 }
         return { rows: [], rowCount: 1 }

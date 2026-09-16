@@ -5,11 +5,14 @@ vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnec
 import { createAgentRunCanonicalProducer } from "./agent-run-canonical-dispatch.js"
 import { turnJobId } from "../runtime/turns/recovery-scanner.js"
 
-function fakePool() {
+function fakePool(lineageExists = true) {
   const calls: Array<{ sql: string; params?: unknown[] }> = []
   const client = {
     query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push({ sql, params })
+      if (sql.includes('WHERE turn."id" = $1') && sql.includes("FOR UPDATE OF turn, session")) {
+        return lineageExists ? { rows: [{ id: "turn-1" }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      }
       return { rows: [], rowCount: 1 }
     }),
     release: vi.fn(),
@@ -54,6 +57,16 @@ describe("agent run canonical producer", () => {
 
     await expect(producer.enqueue({ sessionId: "session-1", turnId: "turn-1" })).rejects.toThrow("redis unavailable")
     expect(fake.calls.some(({ sql }) => sql.includes('INSERT INTO "agent_outbox"'))).toBe(true)
+  })
+
+  it("rejects a canonical request whose Turn is outside the supplied session", async () => {
+    const fake = fakePool(false)
+    const queue = { add: vi.fn(), close: vi.fn().mockResolvedValue(undefined) }
+    const producer = createAgentRunCanonicalProducer({ pool: fake.pool, queue })
+
+    await expect(producer.enqueue({ sessionId: "session-1", turnId: "turn-1" })).rejects.toThrow("turn_dispatch_lineage_mismatch")
+    expect(queue.add).not.toHaveBeenCalled()
+    expect(fake.calls.some(({ sql }) => sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
   })
 
   it("closes its injected queue once and does not create a worker", async () => {

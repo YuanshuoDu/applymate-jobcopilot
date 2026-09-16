@@ -20,8 +20,10 @@ export type TurnDispatchQueue = {
 }
 
 type OutboxRow = { id: string; aggregateId?: string; payload: unknown; attemptCount?: number }
-type StartedTurnRow = { id: string; sessionId: string }
+type QueuedTurnRow = { id: string; sessionId: string }
 type ReclaimedTurn = { turnId: string; sessionId: string; previousLeaseVersion: number }
+type DispatchOutcome = "skipped" | "published" | "poisoned"
+const TURN_DISPATCH_LINEAGE_ERROR = "turn_dispatch_lineage_mismatch"
 
 export function turnDispatchKey(turnId: string): string {
   return `turn-dispatch:${turnId}`
@@ -106,6 +108,17 @@ export async function persistTurnDispatch(
       )
       if (!session.rows[0]) return
     }
+    const lineage = await client.query<{ id: string }>(
+      `SELECT turn."id"
+       FROM "agent_turns" AS turn
+       JOIN "agent_sessions" AS session
+         ON session."id" = turn."sessionId"
+        AND session."userId" = turn."userId"
+       WHERE turn."id" = $1 AND turn."sessionId" = $2
+       FOR UPDATE OF turn, session`,
+      [payload.turnId, payload.sessionId],
+    )
+    if (!lineage.rows[0]) throw new Error(TURN_DISPATCH_LINEAGE_ERROR)
     const conflictClause = resetPublished
       ? `ON CONFLICT ("idempotencyKey") DO UPDATE SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL, "attemptCount" = "agent_outbox"."attemptCount" + 1
          WHERE "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"`
@@ -165,11 +178,11 @@ async function ensureQueuedTurnDispatches(
   ownerId: string,
   limit: number,
 ): Promise<number> {
-  // The generic agent.session.event outbox may already be consumed by the
-  // stream publisher. Derive dispatch from the canonical turn.started fact so
-  // a published event can never strand a queued Turn.
+  // A queued Turn is runnable work even when the agent-runs Redis handoff was
+  // lost before turn.started or its canonical dispatch intent was recorded.
+  // Rebuild the session-scoped intent so the durable scanner can recover it.
   return withTransaction(pool, async (client) => {
-    const rows = await client.query<StartedTurnRow>(
+    const rows = await client.query<QueuedTurnRow>(
       `SELECT turn."id", turn."sessionId"
        FROM "agent_turns" AS turn
        JOIN "agent_sessions" AS session
@@ -180,10 +193,6 @@ async function ensureQueuedTurnDispatches(
         AND dispatch."aggregateId" = turn."sessionId"
         AND dispatch."idempotencyKey" = 'turn-dispatch:' || turn."id"
        WHERE turn."status" = 'queued'
-         AND EXISTS (
-           SELECT 1 FROM "agent_events" AS event
-           WHERE event."turnId" = turn."id" AND event."type" = 'turn.started'
-         )
          AND (
            dispatch."id" IS NULL OR dispatch."publishedAt" IS NOT NULL
          )
@@ -247,7 +256,7 @@ export async function dispatchPendingTurnOutbox(
     let queueAddFailed = false
     let queueAddFailure: unknown
     try {
-      const published = await withTransaction(pool, async (client) => {
+      const outcome = await withTransaction<DispatchOutcome>(pool, async (client) => {
         // Keep the session fence held across queue.add and the publish mark. A
         // close racing this transaction either waits for delivery to commit
         // or wins first and makes the row ineligible without queueing.
@@ -258,7 +267,7 @@ export async function dispatchPendingTurnOutbox(
            FOR UPDATE`,
           [sessionId],
         )
-        if (!session.rows[0]) return false
+        if (!session.rows[0]) return "skipped"
         const pending = await client.query<{ id: string }>(
           `SELECT dispatch."id" FROM "agent_outbox" AS dispatch
            WHERE dispatch."id" = $1 AND dispatch."aggregateId" = $2
@@ -266,7 +275,26 @@ export async function dispatchPendingTurnOutbox(
            FOR UPDATE`,
           [row.id, sessionId, TURN_DISPATCH_TOPIC],
         )
-        if (!pending.rows[0]) return false
+        if (!pending.rows[0]) return "skipped"
+        const lineageMismatch = (row.aggregateId !== undefined && row.aggregateId !== payload.sessionId) || sessionId !== payload.sessionId
+        if (lineageMismatch) {
+          await quarantineTurnDispatch(client, row.id)
+          return "poisoned"
+        }
+        const lineage = await client.query<{ id: string }>(
+          `SELECT turn."id"
+           FROM "agent_turns" AS turn
+           JOIN "agent_sessions" AS turnSession
+             ON turnSession."id" = turn."sessionId"
+            AND turnSession."userId" = turn."userId"
+           WHERE turn."id" = $1 AND turn."sessionId" = $2
+           FOR UPDATE OF turn, turnSession`,
+          [payload.turnId, sessionId],
+        )
+        if (!lineage.rows[0]) {
+          await quarantineTurnDispatch(client, row.id)
+          return "poisoned"
+        }
         queueAddStarted = true
         try {
           await queue.add("turn", payload, { jobId: turnJobId(payload.turnId, row.attemptCount ?? 0), attempts: 5 })
@@ -281,9 +309,13 @@ export async function dispatchPendingTurnOutbox(
            WHERE "id" = $1 AND "publishedAt" IS NULL`,
           [row.id],
         )
-        return true
+        return "published"
       })
-      if (!published) continue
+      if (outcome === "skipped") continue
+      if (outcome === "poisoned") {
+        console.error("[turn-dispatch] quarantined outbox row with invalid session/Turn lineage:", row.id)
+        continue
+      }
     } catch (error: unknown) {
       if (queueAddFailed) {
         await markDispatchError(pool, row.id, "queue_add_failed")
@@ -298,6 +330,16 @@ export async function dispatchPendingTurnOutbox(
     dispatched += 1
   }
   return dispatched
+}
+
+async function quarantineTurnDispatch(client: pg.PoolClient, outboxId: string): Promise<void> {
+  await client.query(
+    `UPDATE "agent_outbox"
+     SET "attemptCount" = "attemptCount" + 1, "lastError" = $2,
+         "publishedAt" = CURRENT_TIMESTAMP
+     WHERE "id" = $1 AND "publishedAt" IS NULL`,
+    [outboxId, TURN_DISPATCH_LINEAGE_ERROR],
+  )
 }
 
 async function markDispatchError(pool: LeasePool, outboxId: string, code: string, terminal = false): Promise<void> {
