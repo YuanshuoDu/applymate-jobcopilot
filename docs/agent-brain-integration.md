@@ -1279,3 +1279,9 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Implementation commit `4bf1a2bf` exposes canonical `agent.wait` alongside legacy `wait_subagents`. Both names share the exact input/output schemas, executor, coordination policy metadata, required capability, capability set, timeout and idempotency contract, so they reach the same permission-scoped durable wait path; the legacy alias remains available.
 - The main worktree focused Worker coordination suite passed **3/3**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No database, migration, scheduler, Web, queue, provider, or feature-flag change was made.
 - Candidate boundary: no live PostgreSQL/RLS, Redis/BullMQ delivery, Worker restart, provider/model call, browser, deployment, or complete end-to-end evidence was run. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-20 candidate - canonical agent interrupt tool alias
+
+- Implementation commit `424a151f` exposes canonical `agent.interrupt` alongside legacy `interrupt_subagent`. Both names share the exact input/output schemas, executor, coordination metadata/policy/capability/timeout/idempotency contract, so they reach the same permission-scoped durable interruption path; the legacy alias remains available.
+- The main worktree focused Worker coordination suite passed **3/3**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No database, migration, scheduler, Web, queue, provider, or feature-flag change was made.
+- Candidate boundary: no live PostgreSQL/RLS, Redis/BullMQ delivery, Worker restart, provider/model call, browser, deployment, or complete end-to-end evidence was run. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
