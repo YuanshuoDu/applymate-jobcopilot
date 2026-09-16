@@ -2274,3 +2274,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** The focused Worker model-step suite passed **3/3**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No provider, schema, Web, migration, queue, or feature-flag change was made.
 
 **Candidate boundary:** No live provider/model stream, PostgreSQL/RLS, Redis/BullMQ delivery, Worker restart, browser, deployment, or complete end-to-end evidence was run. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## 104. P8-17 — Canonical agent spawn tool alias
+
+**Candidate status/date (2026-09-16):** P8-17 is recorded as a candidate Worker coordination-tool naming slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Reviewed and pushed commit `bb266ba8` exposes canonical `agent.spawn` alongside legacy `spawn_subagent`. The canonical name shares the exact input/output schemas, executor, coordination policy metadata, required capability, risk, timeout and idempotency contract with the legacy tool, so both names reach the same permission-scoped durable spawn path. Remaining canonical tool names stay intentionally separate until their own contracts are ready.
+
+**Independent verification:** The focused Worker coordination suite passed **3/3**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No database, migration, scheduler, Web, queue, provider, or feature-flag change was made.
+
+**Candidate boundary:** No live PostgreSQL/RLS, Redis/BullMQ delivery, Worker restart, provider/model call, browser, deployment, or complete end-to-end evidence was run. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
