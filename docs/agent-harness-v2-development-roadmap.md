@@ -2309,8 +2309,8 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 
 **Candidate status/date (2026-09-16):** P8-20 is recorded as a candidate Worker coordination-tool naming slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
 
-**Implementation:** Commit `424a151f` exposes canonical `agent.interrupt` alongside legacy `interrupt_subagent`. Both names share the exact input/output schema, executor, coordination metadata/policy/capability/timeout/idempotency contract, so they reach the same permission-scoped durable interruption path; the legacy alias remains available.
+**Implementation:** Commit `424a151f` exposes canonical `agent.interrupt` alongside legacy `interrupt_subagent`. Both names share the exact input/output schemas, executor, coordination metadata/policy, required capability, capability set, timeout and idempotency contract, so they reach the same permission-scoped durable interrupt path; the legacy alias remains available.
 
 **Independent verification:** The main worktree focused Worker coordination suite passed **3/3**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No database, migration, scheduler, Web, queue, provider, or feature-flag change was made.
 
-**Candidate boundary:** No live PostgreSQL/RLS, Redis/BullMQ delivery, Worker restart, provider/model call, browser, deployment, or complete end-to-end evidence was added. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
+**Candidate boundary:** No live PostgreSQL/RLS, Redis/BullMQ delivery, Worker restart, provider/model call, browser, deployment, or complete end-to-end evidence was run. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
