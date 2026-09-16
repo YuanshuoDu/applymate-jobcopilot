@@ -113,6 +113,26 @@ describe("loadCanonicalTurnState", () => {
     expect(value.snapshot.toolObservations.some(item => item.id === "tool-result:old-plan-call")).toBe(false)
   })
 
+  it("does not replay old-goal plan command receipts into the current goal snapshot", async () => {
+    const current = { revision: 2, objective: "Find senior jobs", constraints: [], successCriteria: [], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" }
+    const oldCommand = {
+      planCallId: "old-plan", planRevision: 1, observationId: "plan-result:old-plan:read",
+      content: { kind: "plan_command", localId: "read", commandKind: "tool_call", dependsOn: [], status: "completed", errorCode: null, output: { old: true } },
+    }
+    const value = await loadCanonicalTurnState(pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      events: [
+        { type: "plan.revision", payload: { planCallId: "old-plan", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null } },
+        { type: "plan.command", payload: oldCommand },
+        { type: "goal.revision", payload: { goalRevision: 2, basedOnGoalRevision: 1, goalContract: current } },
+        { type: "plan.revision", payload: { planCallId: "new-plan", goalRevision: 2, planRevision: 1, basedOnPlanRevision: null } },
+      ],
+    }), lease)
+    expect(value.goalContract).toEqual(current)
+    expect(value.snapshot.toolObservations.some(item => item.id === oldCommand.observationId)).toBe(false)
+    expect(value.snapshot.toolObservations).toEqual(expect.arrayContaining([{ id: "plan-revision:new-plan", content: expect.objectContaining({ goalRevision: 2, planRevision: 1 }) }]))
+  })
+
   it("rebuilds durable tool observations and usage for resume", async () => {
     const value = await loadCanonicalTurnState(pool({
       turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: { limits: { maxSteps: 3 } } },

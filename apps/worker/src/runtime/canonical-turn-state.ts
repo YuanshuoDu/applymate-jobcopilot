@@ -86,9 +86,10 @@ function observations(items: readonly Row[], events: readonly Row[], currentGoal
     }) }]
   })
 }
-function planObservations(events: readonly Row[]): StepContextSnapshot["toolObservations"] {
+function planObservations(events: readonly Row[], currentPlanIds?: ReadonlySet<string>): StepContextSnapshot["toolObservations"] {
   return events.filter(event => event.type === "plan.observation").flatMap(event => {
-    const payload = eventPayload(event.payload), id = payload.observationId, content = payload.content
+    const payload = eventPayload(event.payload), id = payload.observationId, content = payload.content, planCallId = payload.planCallId
+    if (currentPlanIds && (typeof planCallId !== "string" || !currentPlanIds.has(planCallId))) return []
     if (typeof id !== "string" || id.trim() !== id || id.length === 0 || id.length > 256 || !isBoundedPlanJson(content)) return []
     const encoded = JSON.stringify(content); return encoded === undefined || Buffer.byteLength(encoded, "utf8") > 8 * 1024 ? [] : [{ id, content: json(content) }]
   })
@@ -108,7 +109,7 @@ function planRevisionObservations(events: readonly Row[], goalRevision: number):
     return [{ id: projection.id, content: json(projection.content) }]
   })
 }
-function planCommandObservations(events: readonly Row[]): StepContextSnapshot["toolObservations"] { return events.filter(event => event.type === "plan.command").flatMap(event => { const receipt = parsePlanCommandReceipt(eventPayload(event.payload)); return receipt ? [planCommandObservation(receipt)] : [] }) }
+function planCommandObservations(events: readonly Row[], currentPlanIds?: ReadonlySet<string>): StepContextSnapshot["toolObservations"] { return events.filter(event => event.type === "plan.command").flatMap(event => { const receipt = parsePlanCommandReceipt(eventPayload(event.payload)); return receipt && (!currentPlanIds || currentPlanIds.has(receipt.planCallId)) ? [planCommandObservation(receipt)] : [] }) }
 function planActionCount(events: readonly Row[]): number { const counted = new Set<string>(); for (const event of events) { if (event.type !== "plan.command" && event.type !== "plan.observation") continue; const payload = eventPayload(event.payload), receipt = event.type === "plan.command" ? parsePlanCommandReceipt(payload) : null, observationId = event.type === "plan.command" ? receipt?.observationId : payload.observationId, content = event.type === "plan.command" ? receipt?.content : payload.content, contentObject = object(content); if (typeof observationId !== "string" || observationId.trim() !== observationId || observationId.length === 0 || observationId.length > 256 || !isBoundedPlanJson(content) || counted.has(observationId) || contentObject.kind !== "plan_command" || !["tool_call", "delegate", "join"].includes(String(contentObject.commandKind))) continue; counted.add(observationId) } return counted.size }
 function contextCompactionObservations(events: readonly Row[]): StepContextSnapshot["toolObservations"] {
   return events.filter(event => event.type === "context.compaction").flatMap(event => {
@@ -189,8 +190,10 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     const goalState = restoreGoalRevisions(hydratedGoal.goalContract, eventsResult.rows.map(event => ({ type: event.type, payload: eventPayload(event.payload) })))
     const revisionState = restorePlanRevisions(filterPlanRevisionEvents(eventsResult.rows.map(event => ({ type: event.type, payload: event.payload })), goalState.goalContract.revision).map(event => ({ type: event.type, payload: eventPayload(event.payload) })))
     const revision = revisionState.latest
-    const restoredBase = [...observations(itemsResult.rows, eventsResult.rows, goalState.goalContract.revision), ...planObservations(eventsResult.rows), ...planRevisionObservations(eventsResult.rows, goalState.goalContract.revision), ...planCommandObservations(eventsResult.rows), ...contextCompactionObservations(eventsResult.rows), ...(goalState.receipt ? [goalRevisionObservation(goalState.receipt)] : []), ...(revision ? [planRevisionObservation(revision)] : [])]
-    const scopedSnapshot = sanitizePlanCompletionFeedbackObservations(snapshot.toolObservations, lease.turnId).filter(item => { const content = object(item.content); const output = object(content.output); return (content.kind !== "plan_revision" || content.goalRevision === goalState.goalContract.revision) && (content.toolName !== "agent.plan.propose" || output.status !== "accepted" || output.goalRevision === goalState.goalContract.revision) })
+    const currentRevisionObservations = planRevisionObservations(eventsResult.rows, goalState.goalContract.revision)
+    const currentPlanIds = goalState.goalContract.revision > 1 ? new Set(currentRevisionObservations.flatMap(item => { const content = object(item.content); return typeof content.planCallId === "string" ? [content.planCallId] : [] })) : undefined
+    const restoredBase = [...observations(itemsResult.rows, eventsResult.rows, goalState.goalContract.revision), ...planObservations(eventsResult.rows, currentPlanIds), ...currentRevisionObservations, ...planCommandObservations(eventsResult.rows, currentPlanIds), ...contextCompactionObservations(eventsResult.rows), ...(goalState.receipt ? [goalRevisionObservation(goalState.receipt)] : []), ...(revision ? [planRevisionObservation(revision)] : [])]
+    const scopedSnapshot = sanitizePlanCompletionFeedbackObservations(snapshot.toolObservations, lease.turnId).filter(item => { const content = object(item.content); const output = object(content.output); return (content.kind !== "plan_revision" || content.goalRevision === goalState.goalContract.revision) && (content.toolName !== "agent.plan.propose" || output.status !== "accepted" || output.goalRevision === goalState.goalContract.revision) && (!currentPlanIds || (content.kind !== "plan_command" && content.kind !== "plan_control")) })
     const currentPlan = currentPlanId([...scopedSnapshot, ...restoredBase])
     snapshot = { ...snapshot, toolObservations: sanitizePlanCompletionFeedbackObservations(scopedSnapshot, lease.turnId, currentPlan) }
     const restoredFeedback = restorePlanCompletionFeedback(eventsResult.rows.map(event => ({ type: event.type, payload: eventPayload(event.payload) })), lease.turnId, currentPlan)
