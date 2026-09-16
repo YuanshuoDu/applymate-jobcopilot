@@ -111,6 +111,16 @@ describe("Agent wakeup consumer", () => {
     expect(fake.calls.some(([sql]) => sql.includes('session."userId" = turn."userId"'))).toBe(true)
   })
 
+  it("accepts the canonical waitId used by Gmail OAuth question items", async () => {
+    const fake = fakePool({ item: {
+      status: "completed",
+      content: { waitKind: "question", oauth: true, waitId: "q1", toolCallId: "call_1" },
+    } })
+
+    await expect(resumeAgentTurn(fake.pool, wakeup)).resolves.toMatchObject({ status: "resumed" })
+    expect(fake.calls.some(([sql]) => sql.includes("SET \"status\" = 'queued'"))).toBe(true)
+  })
+
   it("claims and marks durable wakeups after the same-lineage resume", async () => {
     const fake = fakePool()
     await expect(drainAgentWakeups(fake.pool, 1)).resolves.toBe(1)
