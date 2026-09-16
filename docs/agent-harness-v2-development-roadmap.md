@@ -2324,3 +2324,15 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** The main worktree focused Worker coordination suite passed **3/3**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No database, migration, scheduler, Web, queue, provider, or feature-flag change was made.
 
 **Candidate boundary:** No live PostgreSQL/RLS, Redis/BullMQ delivery, Worker restart, provider/model call, browser, deployment, or complete end-to-end evidence was run. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## 109. P8-23 — Canonical plan coordination and scheduler hardening (candidate/ongoing)
+
+**Candidate status/date (2026-09-16):** P8-23 is recorded as a candidate/ongoing Worker plan-coordination and scheduler-hardening slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commits `edbf1053`, `6ad04aa2`, `be91f035`, `5765e817`, and `63ea9fe4` make the plan compiler emit versioned canonical `agent.spawn@1` and `agent.wait@1` commands. Plan execution, replay, and projection accept both canonical and legacy command names. The scheduler validates `parallelDelegateLimit` in the inclusive range `1..4`, pre-validates the delegation DAG, and records sibling bookkeeping deterministically. Fallback policy and child-role policy resolution accept canonical aliases while preserving the existing policy contract.
+
+**Compatibility boundary:** An older explicit `PolicySnapshot` that allows only legacy names still rejects canonical names. The persisted snapshot remains authoritative; alias handling does not widen an already captured policy.
+
+**Independent verification:** Focused Worker validation passed **173/173 tests across 12 files**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, Redis/BullMQ delivery, provider/model calls, browser behavior, process restart/recovery, deployment, and complete end-to-end evidence remain unverified. This is an ongoing candidate hardening slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**.
