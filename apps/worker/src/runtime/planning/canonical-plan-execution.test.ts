@@ -53,7 +53,7 @@ function validAnalystStructuredResult() {
   }
 }
 
-function replayWait(role: "scout" | "analyst", task: Record<string, unknown>, toolName: "agent.wait" | "wait_subagents" = "wait_subagents") {
+function replayWait(role: "scout" | "analyst", task: Record<string, unknown>, toolName: "agent.wait" | "wait_subagents" = "agent.wait") {
   const plan = proposal([delegate("child", { role }), join(), use("after", { dependsOn: ["join"] })])
   const delegateObservation = { id: "plan-result:proposal-1:child", content: { kind: "plan_command", localId: "child", commandKind: "delegate", dependsOn: [], status: "completed", errorCode: null, output: { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" } } }
   const joinObservation = { id: "plan-result:proposal-1:join", content: { kind: "plan_command", localId: "join", commandKind: "join", dependsOn: ["child"], status: "completed", errorCode: null, output: { waitId: "wait-1", status: "waiting", taskIds: ["child-1"], matchedTaskIds: [] } } }
@@ -82,7 +82,7 @@ function fixture(router: { execute(context: ToolRouterContext, request: ToolCall
       readDefinition("jobs.search", "jobs"), readDefinition("jobs.get", "jobs"), readDefinition("persona.retrieve", "persona"),
       readDefinition("resume.get_base", "resume"), readDefinition("application.get_state", "application"),
       { name: "tool_results.read", version: "1", risk: "read", capabilities: ["read"], domain: "coordination", requiredCapabilities: [] },
-      ...(overrides.waitDefinitions ?? [{ name: "wait_subagents", version: "1", risk: "internal_write", capabilities: ["coordination"], domain: "coordination", requiredCapabilities: [] }]),
+      ...(overrides.waitDefinitions ?? [{ name: "agent.wait", version: "1", risk: "internal_write", capabilities: ["coordination"], domain: "coordination", requiredCapabilities: [] }]),
     ] },
     policy: {} as PolicyEngine, ...(persistOutcome ? { persistOutcome } : {}), ...(maxPlanRevisions === undefined ? {} : { maxPlanRevisions }), ...(initialPlanHashes ? { initialPlanHashes } : {}), ...(goalRef ? { goalRef } : {}), ...(allowedPlanActions === undefined ? {} : { allowedPlanActions }), ...(recoveryDispatcher ? { recoveryDispatcher } : {}),
   }
@@ -138,7 +138,7 @@ describe("createCanonicalPlanExecutionFactory", () => {
     const result = await hook(input(output(proposal([use("read"), delegate("child", { dependsOn: ["read"] })]))))
     expect(result.wait).toBeUndefined()
     expect(router.execute).toHaveBeenCalledTimes(2)
-    expect(requests.map(request => request.toolName)).toEqual(["jobs.search", "spawn_subagent"])
+    expect(requests.map(request => request.toolName)).toEqual(["jobs.search", "agent.spawn"])
     expect(contexts).toEqual(expect.arrayContaining([expect.objectContaining({ scope: { userId: "user-1" }, taskId: "root-1", rootTaskId: "root-1", stepId: "step-1:plan:read" })]))
     expect(requests[1]?.input).toMatchObject({ role: "scout", taskType: "research", allowedActions: ["jobs.search"] })
     expect(JSON.stringify(requests[1]?.input)).not.toMatch(/userId|taskId|parentTaskId|rootTaskId|lease|budgetLimit|maxBudget/)
@@ -214,7 +214,7 @@ describe("createCanonicalPlanExecutionFactory", () => {
     const requests: ToolCallRequest[] = []
     const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
       requests.push(request)
-      if (request.toolName === "spawn_subagent") return { ...request, status: "completed" as const, output: { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" }, errorCode: null }
+      if (request.toolName === "agent.spawn") return { ...request, status: "completed" as const, output: { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" }, errorCode: null }
       return { ...request, status: "completed" as const, output: { waitId: "wait-1", status, taskIds: ["child-1"], matchedTaskIds: status === "waiting" ? [] : ["child-1"] }, errorCode: null }
     }) }
     const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["delegate", "join"])
@@ -227,11 +227,11 @@ describe("createCanonicalPlanExecutionFactory", () => {
   it("blocks static downstream commands and emits a durable child failure replan control", async () => {
     const receipts: PlanCommandReceipt[] = []
     const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
-      if (request.toolName === "spawn_subagent") {
+      if (request.toolName === "agent.spawn") {
         const taskId = request.id.endsWith(":first") ? "child-first" : "child-second"
         return { ...request, status: "completed" as const, output: { taskId, rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" }, errorCode: null }
       }
-      if (request.toolName === "wait_subagents") return {
+      if (request.toolName === "agent.wait") return {
         ...request, status: "completed" as const,
         output: { waitId: "wait-1", status: "ready", taskIds: ["child-first", "child-second"], matchedTaskIds: ["child-first", "child-second"], tasks: [
           { taskId: "child-second", status: "cancelled", result: null, failureReason: "worker stopped" },
@@ -259,8 +259,8 @@ describe("createCanonicalPlanExecutionFactory", () => {
 
   it("keeps a ready join with only successful children flowing downstream", async () => {
     const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
-      if (request.toolName === "spawn_subagent") return { ...request, status: "completed" as const, output: { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" }, errorCode: null }
-      if (request.toolName === "wait_subagents") return { ...request, status: "completed" as const, output: { waitId: "wait-1", status: "ready", taskIds: ["child-1"], matchedTaskIds: ["child-1"], tasks: [{ taskId: "child-1", status: "completed", result: null, failureReason: null }] }, errorCode: null }
+      if (request.toolName === "agent.spawn") return { ...request, status: "completed" as const, output: { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" }, errorCode: null }
+      if (request.toolName === "agent.wait") return { ...request, status: "completed" as const, output: { waitId: "wait-1", status: "ready", taskIds: ["child-1"], matchedTaskIds: ["child-1"], tasks: [{ taskId: "child-1", status: "completed", result: null, failureReason: null }] }, errorCode: null }
       return { ...request, status: "completed" as const, output: { ok: true }, errorCode: null }
     }) }
     const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["use_tool", "delegate", "join"])
@@ -270,7 +270,7 @@ describe("createCanonicalPlanExecutionFactory", () => {
     expect(result.observations.some(observation => JSON.stringify(observation.content).includes("replan_required"))).toBe(false)
   })
 
-  it("replays a child failure replan signal without a second plan execution", async () => {
+  it("replays a legacy wait_subagents child failure replan signal without a second plan execution", async () => {
     const plan = proposal([delegate("child"), join(), use("after", { dependsOn: ["join"] })])
     const delegateObservation = { id: "plan-result:proposal-1:child", content: { kind: "plan_command", localId: "child", commandKind: "delegate", dependsOn: [], status: "completed", errorCode: null, output: { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" } } }
     const joinObservation = { id: "plan-result:proposal-1:join", content: { kind: "plan_command", localId: "join", commandKind: "join", dependsOn: ["child"], status: "completed", errorCode: null, output: { waitId: "wait-1", status: "waiting", taskIds: ["child-1"], matchedTaskIds: [] } } }
@@ -304,7 +304,7 @@ describe("createCanonicalPlanExecutionFactory", () => {
     const proposalValue = proposal([delegate("child"), join(), use("after", { dependsOn: ["join"] })])
     const delegateObservation = { id: "plan-result:proposal-1:child", content: { kind: "plan_command", localId: "child", commandKind: "delegate", dependsOn: [], status: "completed", errorCode: null, output: { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" } } }
     const joinObservation = { id: "plan-result:proposal-1:join", content: { kind: "plan_command", localId: "join", commandKind: "join", dependsOn: ["child"], status: "completed", errorCode: null, output: { waitId: "wait-1", status: "waiting", taskIds: ["child-1"], matchedTaskIds: [] } } }
-    const waitOutcome = { id: "wait-result:wait-1", content: { toolCallId: "wait:wait-1", toolName: "wait_subagents", input: { taskIds: ["child-1"], mode: "all" }, status: "completed", output: { waitId: "wait-1", status: "ready", targetTaskIds: ["child-1"], matchedTaskIds: ["child-1"], tasks: [{ taskId: "child-1", status: "completed", result: null, failureReason: null }] }, errorCode: null } }
+    const waitOutcome = { id: "wait-result:wait-1", content: { toolCallId: "wait:wait-1", toolName: "agent.wait", input: { taskIds: ["child-1"], mode: "all" }, status: "completed", output: { waitId: "wait-1", status: "ready", targetTaskIds: ["child-1"], matchedTaskIds: ["child-1"], tasks: [{ taskId: "child-1", status: "completed", result: null, failureReason: null }] }, errorCode: null } }
     const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { ok: true }, errorCode: null })) }
     const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["use_tool", "delegate", "join"])
     const waiting = await hook(input(output(proposalValue), "step-1", [delegateObservation, joinObservation], true))
@@ -385,7 +385,7 @@ describe("createCanonicalPlanExecutionFactory", () => {
 
   it("prefers the canonical wait version before falling back to the legacy registry entry", async () => {
     const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
-      if (request.toolName === "spawn_subagent" || request.toolName === "agent.spawn") return { ...request, status: "completed" as const, output: { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" }, errorCode: null }
+      if (request.toolName === "agent.spawn") return { ...request, status: "completed" as const, output: { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" }, errorCode: null }
       return { ...request, status: "completed" as const, output: { waitId: "wait-1", status: "ready", taskIds: ["child-1"], matchedTaskIds: ["child-1"], tasks: [{ taskId: "child-1", status: "completed", result: null, failureReason: null }] }, errorCode: null }
     }) }
     const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["delegate", "join"], undefined, {
@@ -470,7 +470,7 @@ describe("createCanonicalPlanExecutionFactory", () => {
     const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => { order.push(`router:${request.toolName}`); return { ...request, status: "completed" as const, output: { ok: true }, errorCode: null } }) }
     const hook = fixture(router, undefined, receipt => { order.push(`receipt:${receipt.observationId}`); receipts.push(receipt) })
     await hook(input(output(proposal([use("read"), delegate("child", { dependsOn: ["read"] })]))))
-    expect(order).toEqual(["router:jobs.search", "receipt:plan-result:proposal-1:read", "router:spawn_subagent", "receipt:plan-result:proposal-1:child"])
+    expect(order).toEqual(["router:jobs.search", "receipt:plan-result:proposal-1:read", "router:agent.spawn", "receipt:plan-result:proposal-1:child"])
     const failed = fixture({ execute: async (_context, request) => ({ ...request, status: "failed" as const, output: { safe: true }, errorCode: "denied" }) }, undefined, receipt => { receipts.push(receipt) })
     await failed(input(output(proposal([use("failed")]))))
     expect(receipts.map(receipt => receipt.content)).toEqual(expect.arrayContaining([expect.objectContaining({ status: "failed" })]))
