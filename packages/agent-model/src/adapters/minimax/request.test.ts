@@ -24,13 +24,18 @@ describe("MiniMax request profile", () => {
 
   it("resolves the CN endpoint from the deployment region", () => {
     vi.stubEnv("MINIMAX_REGION", "cn")
-    expect(resolveMiniMaxBaseUrl({ apiBase: "https://api.minimax.io/v1" })).toBe("https://api.minimax.cn/v1")
+    expect(resolveMiniMaxBaseUrl({ apiBase: "https://api.minimax.io/v1" })).toBe("https://api.minimaxi.com/v1")
+  })
+
+  it("resolves the CN endpoint from a China Token Plan key", () => {
+    expect(resolveMiniMaxBaseUrl({ apiBase: "https://api.minimax.io/v1", apiKey: "sk-cp-test-key" }))
+      .toBe("https://api.minimaxi.com/v1")
   })
 
   it("allows an explicit deployment base URL and normalizes its trailing slash", () => {
-    vi.stubEnv("MINIMAX_BASE_URL", "https://api.minimax.cn/v1/")
+    vi.stubEnv("MINIMAX_BASE_URL", "https://api.minimaxi.com/v1/")
     vi.stubEnv("MINIMAX_REGION", "international")
-    expect(resolveMiniMaxBaseUrl()).toBe("https://api.minimax.cn/v1")
+    expect(resolveMiniMaxBaseUrl()).toBe("https://api.minimaxi.com/v1")
   })
 
   it("replaces deprecated max_tokens and adds M3 reasoning controls", () => {

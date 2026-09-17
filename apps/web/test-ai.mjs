@@ -19,9 +19,10 @@ if (envPath) {
 const MINIMAX_KEY  = env.MINIMAX_API_KEY  || ''
 const DEEPSEEK_KEY = env.DEEPSEEK_API_KEY || ''
 const MINIMAX_REGION = (env.MINIMAX_REGION || '').trim().toLowerCase()
+const MINIMAX_KEY_REGION = MINIMAX_KEY.trim().toLowerCase().startsWith('sk-cp') ? 'cn' : ''
 const MINIMAX_BASE_URL = (env.MINIMAX_BASE_URL || (MINIMAX_REGION === 'cn' || MINIMAX_REGION === 'china'
-  ? 'https://api.minimax.cn/v1'
-  : 'https://api.minimax.io/v1')).replace(/\/+$/, '')
+  ? 'https://api.minimaxi.com/v1'
+  : MINIMAX_KEY_REGION === 'cn' ? 'https://api.minimaxi.com/v1' : 'https://api.minimax.io/v1')).replace(/\/+$/, '')
 
 const G = '\x1b[32m'; const R = '\x1b[31m'; const Y = '\x1b[33m'; const C = '\x1b[36m'; const X = '\x1b[0m'
 

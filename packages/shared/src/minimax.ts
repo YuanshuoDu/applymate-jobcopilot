@@ -8,8 +8,8 @@
 
 export type MiniMaxRegion = "cn" | "international"
 
-export const MINIMAX_CN_OPENAI_BASE_URL = "https://api.minimax.cn/v1"
-export const MINIMAX_CN_ANTHROPIC_BASE_URL = "https://api.minimax.cn/anthropic"
+export const MINIMAX_CN_OPENAI_BASE_URL = "https://api.minimaxi.com/v1"
+export const MINIMAX_CN_ANTHROPIC_BASE_URL = "https://api.minimaxi.com/anthropic"
 export const MINIMAX_INTERNATIONAL_OPENAI_BASE_URL = "https://api.minimax.io/v1"
 export const MINIMAX_INTERNATIONAL_ANTHROPIC_BASE_URL = "https://api.minimax.io/anthropic"
 
@@ -23,6 +23,11 @@ export function parseMiniMaxRegion(value: string | undefined): MiniMaxRegion | u
   return undefined
 }
 
+/** MiniMax Token Plan keys are issued with the China-only `sk-cp` prefix. */
+export function inferMiniMaxRegionFromApiKey(apiKey: string | undefined): MiniMaxRegion | undefined {
+  return apiKey?.trim().toLowerCase().startsWith("sk-cp") ? "cn" : undefined
+}
+
 export function miniMaxOpenAiBaseUrl(region: MiniMaxRegion): string {
   return region === "cn" ? MINIMAX_CN_OPENAI_BASE_URL : MINIMAX_INTERNATIONAL_OPENAI_BASE_URL
 }
@@ -34,6 +39,7 @@ export function miniMaxAnthropicBaseUrl(region: MiniMaxRegion): string {
 export interface MiniMaxBaseUrlOptions {
   baseUrl?: string
   apiBase?: string
+  apiKey?: string
   region?: string
   environmentBaseUrl?: string
   environmentRegion?: string
@@ -42,9 +48,11 @@ export interface MiniMaxBaseUrlOptions {
 /**
  * Resolve the OpenAI-compatible MiniMax endpoint.
  *
- * MINIMAX_BASE_URL and MINIMAX_REGION are deployment overrides. Explicit
- * config is used next, followed by the international endpoint for backwards
- * compatibility. Trailing slashes are removed so callers can append paths.
+ * MINIMAX_BASE_URL and MINIMAX_REGION are deployment overrides. A China
+ * Token Plan key selects the China endpoint when the persisted endpoint is a
+ * known MiniMax default; custom proxy endpoints remain untouched. The
+ * international endpoint is the final fallback for backwards compatibility.
+ * Trailing slashes are removed so callers can append paths.
  */
 export function resolveMiniMaxBaseUrl(options: MiniMaxBaseUrlOptions = {}): string {
   const environmentBase = normalizeBaseUrl(options.environmentBaseUrl)
@@ -54,10 +62,20 @@ export function resolveMiniMaxBaseUrl(options: MiniMaxBaseUrlOptions = {}): stri
   if (environmentRegion) return miniMaxOpenAiBaseUrl(environmentRegion)
 
   const configuredBase = normalizeBaseUrl(options.baseUrl ?? options.apiBase)
+  const configuredRegion = parseMiniMaxRegion(options.region)
+  if (!configuredBase && configuredRegion) return miniMaxOpenAiBaseUrl(configuredRegion)
+
+  const inferredRegion = inferMiniMaxRegionFromApiKey(options.apiKey)
+  if (inferredRegion && (!configuredBase || isKnownMiniMaxOpenAiBaseUrl(configuredBase))) {
+    return miniMaxOpenAiBaseUrl(inferredRegion)
+  }
   if (configuredBase) return configuredBase
 
-  const configuredRegion = parseMiniMaxRegion(options.region)
   return configuredRegion ? miniMaxOpenAiBaseUrl(configuredRegion) : MINIMAX_DEFAULT_BASE_URL
+}
+
+function isKnownMiniMaxOpenAiBaseUrl(value: string): boolean {
+  return value === MINIMAX_CN_OPENAI_BASE_URL || value === MINIMAX_INTERNATIONAL_OPENAI_BASE_URL
 }
 
 function normalizeBaseUrl(value: string | undefined): string | undefined {

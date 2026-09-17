@@ -214,6 +214,7 @@ export function resolveConfig(userConfig?: AiConfig | null, options?: { preserve
     : cfg.provider === 'minimax'
       ? resolveMiniMaxBaseUrl({
           baseUrl: option?.defaultBase,
+          apiKey: resolvedKey,
           environmentBaseUrl: process.env.MINIMAX_BASE_URL,
           environmentRegion: process.env.MINIMAX_REGION,
         })

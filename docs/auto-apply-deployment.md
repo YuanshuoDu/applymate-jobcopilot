@@ -43,6 +43,8 @@ Set the following Web environment variables in Vercel:
 | `WORKER_CONTROL_URL` | Worker base URL without `/internal/admin/control`; for Fly use `https://applymate-worker.fly.dev` |
 | `WORKER_CONTROL_SECRET` | HMAC secret that exactly matches the Worker secret for admin queue and ATS controls |
 | `MINIMAX_API_KEY` | Platform default model, unless every user brings a key |
+| `MINIMAX_REGION` | Optional MiniMax deployment region (`cn`/`international`); `sk-cp...` Token Plan keys auto-select `cn` |
+| `MINIMAX_BASE_URL` | Optional explicit MiniMax OpenAI-compatible endpoint; overrides the region selector |
 | `PAID_REDIS_KV_REST_API_URL` | Server-only Upstash REST endpoint used for the Redis usage alert |
 | `PAID_REDIS_KV_REST_API_TOKEN` | Server-only Upstash standard REST token; never expose as `NEXT_PUBLIC_*` |
 | `PAID_REDIS_DATABASE_ID` | Upstash database ID used by the current-month management stats endpoint |

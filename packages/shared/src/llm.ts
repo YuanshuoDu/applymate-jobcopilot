@@ -201,9 +201,11 @@ async function callOpenAICompat(
   messages: ChatMessage[],
   config: AiConfig
 ): Promise<ChatResult> {
+  const key = config.apiKey || getServerKey(config.provider)
   const base = config.provider === "minimax"
     ? resolveMiniMaxBaseUrl({
         apiBase: config.apiBase,
+        apiKey: key,
         environmentBaseUrl: process.env.MINIMAX_BASE_URL,
         environmentRegion: process.env.MINIMAX_REGION,
       })
@@ -211,7 +213,6 @@ async function callOpenAICompat(
   if (config.provider === "custom" && !isSafeAiEndpoint(base)) {
     throw new Error("Custom AI endpoint is not an allowed public HTTPS destination");
   }
-  const key = config.apiKey || getServerKey(config.provider);
   if (!key) throw new Error(`No API key for provider "${config.provider}"`);
 
   // Keep MiniMax reasoning in message.content for the harness's multi-turn

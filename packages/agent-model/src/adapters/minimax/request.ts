@@ -11,11 +11,13 @@ import {
 } from "./types.js"
 
 export function resolveMiniMaxBaseUrl(
-  config: Pick<MiniMaxConfig, "baseUrl" | "apiBase" | "region"> = {},
+  config: Pick<MiniMaxConfig, "baseUrl" | "apiBase" | "region" | "apiKey" | "platformApiKey"> = {},
 ): string {
   const environment = readEnvironment()
+  const credentials = resolveMiniMaxCredentials(config)
   return resolveSharedMiniMaxBaseUrl({
     ...config,
+    apiKey: credentials.apiKey,
     environmentBaseUrl: environment.MINIMAX_BASE_URL,
     environmentRegion: environment.MINIMAX_REGION,
   })
