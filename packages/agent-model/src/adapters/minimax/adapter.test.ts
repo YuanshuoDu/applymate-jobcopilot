@@ -32,7 +32,13 @@ describe("MiniMax provider profile", () => {
   it("resolves the China Token Plan endpoint from MINIMAX_REGION", () => {
     vi.stubEnv("MINIMAX_REGION", "cn")
     const adapter = createMiniMaxM3Adapter({ platformApiKey: "platform-key" })
-    expect(adapter.config).toMatchObject({ model: "MiniMax-M3", baseUrl: "https://api.minimax.cn/v1" })
+    expect(adapter.config).toMatchObject({ model: "MiniMax-M3", baseUrl: "https://api.minimaxi.com/v1" })
+  })
+
+  it("resolves the China Token Plan endpoint from the platform key", () => {
+    vi.stubEnv("MINIMAX_API_KEY", "sk-cp-platform-key")
+    const adapter = createMiniMaxM3Adapter({ apiBase: "https://api.minimax.io/v1" })
+    expect(adapter.config).toMatchObject({ model: "MiniMax-M3", baseUrl: "https://api.minimaxi.com/v1" })
   })
 
   it("uses the generic adapter while sending MiniMax M3 options and normalizing reasoning", async () => {

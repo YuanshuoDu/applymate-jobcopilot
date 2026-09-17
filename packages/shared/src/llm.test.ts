@@ -51,16 +51,15 @@ describe('shared/llm exports — existence guards', () => {
   })
 
   it('uses the China endpoint for a MiniMax Token Plan deployment', async () => {
-    vi.stubEnv('MINIMAX_REGION', 'cn')
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
       choices: [{ message: { content: 'ok' } }],
     })))
 
     await callLlm([{ role: 'user', content: 'Ping' }], {
-      provider: 'minimax', model: 'MiniMax-M3', apiKey: 'test-key', apiBase: 'https://api.minimax.io/v1',
+      provider: 'minimax', model: 'MiniMax-M3', apiKey: 'sk-cp-test-key', apiBase: 'https://api.minimax.io/v1',
     })
 
-    expect(fetchMock.mock.calls[0][0]).toBe('https://api.minimax.cn/v1/chat/completions')
+    expect(fetchMock.mock.calls[0][0]).toBe('https://api.minimaxi.com/v1/chat/completions')
   })
 
   it.each([

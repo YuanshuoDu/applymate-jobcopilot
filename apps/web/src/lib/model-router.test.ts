@@ -134,14 +134,34 @@ describe('model catalogue and MiniMax compatibility', () => {
       model: 'MiniMax-M3',
       apiKey: 'platform-key',
       apiBase: 'https://api.minimax.io/v1',
-    })).toMatchObject({ apiBase: 'https://api.minimax.cn/v1' })
+    })).toMatchObject({ apiBase: 'https://api.minimaxi.com/v1' })
   })
 
   it('lets an explicit MiniMax deployment base URL win over the region selector', () => {
-    vi.stubEnv('MINIMAX_BASE_URL', 'https://api.minimax.cn/v1/')
+    vi.stubEnv('MINIMAX_BASE_URL', 'https://api.minimaxi.com/v1/')
     vi.stubEnv('MINIMAX_REGION', 'international')
     expect(resolveConfig({ provider: 'minimax', model: 'MiniMax-M3', apiKey: 'platform-key' }))
-      .toMatchObject({ apiBase: 'https://api.minimax.cn/v1' })
+      .toMatchObject({ apiBase: 'https://api.minimaxi.com/v1' })
+  })
+
+  it('resolves MiniMax CN from a China Token Plan platform key without a region setting', () => {
+    vi.stubEnv('MINIMAX_API_KEY', 'sk-cp-platform-key')
+    expect(resolveConfig({
+      provider: 'minimax',
+      model: 'MiniMax-M3',
+      apiBase: 'https://api.minimax.io/v1',
+    })).toMatchObject({ apiBase: 'https://api.minimaxi.com/v1', resolvedKey: 'sk-cp-platform-key' })
+  })
+
+  it('sends Web model calls to the China endpoint for the platform Token Plan key', async () => {
+    vi.stubEnv('MINIMAX_API_KEY', 'sk-cp-platform-key')
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      choices: [{ message: { content: 'ok' } }],
+    })))
+
+    await modelChat([{ role: 'user', content: 'Ping' }], { provider: 'minimax', model: 'MiniMax-M3' })
+
+    expect(fetchMock.mock.calls[0][0]).toBe('https://api.minimaxi.com/v1/chat/completions')
   })
 
   it('does not use a server API key for a user-controlled custom endpoint', () => {

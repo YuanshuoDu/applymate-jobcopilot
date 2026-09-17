@@ -15,6 +15,7 @@ export {
   MINIMAX_INTERNATIONAL_OPENAI_BASE_URL,
   miniMaxAnthropicBaseUrl,
   miniMaxOpenAiBaseUrl,
+  inferMiniMaxRegionFromApiKey,
   parseMiniMaxRegion,
   resolveMiniMaxBaseUrl,
   type MiniMaxBaseUrlOptions,
