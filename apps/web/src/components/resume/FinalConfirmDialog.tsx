@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 import { AlertTriangle, Check, FileCheck2, FileText, Link2, LoaderCircle, Sparkles, X } from 'lucide-react'
 import { ResumeRenderer } from '@/components/resume/ResumeRenderer'
 import type { ApplicationAudit, Job, ResumeContent, TemplateOptions } from '@/lib/types'
@@ -26,6 +26,7 @@ type Props = {
   templateId: string
   templateOptions: TemplateOptions
   coverLetterContent: string | null
+  initialAudit?: ApplicationAudit | null
   onClose: () => void
   onReviewSuggestions: () => void
   onCreateCoverLetter: () => void
@@ -47,10 +48,11 @@ const icons = {
 
 export function FinalConfirmDialog({
   job, resumeName, templateName, pendingSuggestions, isDirty, packReady, resumeContent, templateId, templateOptions, coverLetterContent,
+  initialAudit,
   onClose, onReviewSuggestions, onCreateCoverLetter, onLinkJob, onAudit, onConfirm, onDownload, exportedPackFolder,
 }: Props) {
   const { t } = useI18n()
-  const [audit, setAudit] = useState<ApplicationAudit | null>(null)
+  const [audit, setAudit] = useState<ApplicationAudit | null>(initialAudit ?? null)
   const items = useMemo<ReadinessItem[]>(() => [
     {
       id: 'suggestions',
@@ -76,7 +78,7 @@ export function FinalConfirmDialog({
       id: 'audit',
       label: t('resume.independentAudit'),
       detail: audit ? audit.summary : t('resume.auditComparison'),
-      complete: audit?.verdict === 'pass',
+      complete: !isDirty && audit?.verdict === 'pass',
       blocking: true,
     },
     {
@@ -107,20 +109,36 @@ export function FinalConfirmDialog({
 
   useEffect(() => setConfirmed(packReady), [packReady])
 
+  useEffect(() => {
+    setAudit(initialAudit ?? null)
+  }, [initialAudit])
+
   const unresolvedBeforeAudit = items.filter(item => item.id !== 'audit' && !item.complete && item.blocking !== false)
   const ready = checkedCount === items.length && unresolvedBeforeAudit.length === 0
 
-  async function handleConfirm() {
+  async function runAudit() {
+    if (confirming) return null
     setConfirming(true)
-    const nextAudit = await onAudit()
-    setAudit(nextAudit)
-    if (!nextAudit || nextAudit.verdict !== 'pass') {
+    try {
+      const nextAudit = await onAudit()
+      setAudit(nextAudit)
+      return nextAudit
+    } finally {
       setConfirming(false)
-      return
     }
-    const success = await onConfirm(nextAudit)
-    setConfirming(false)
-    if (success) setConfirmed(true)
+  }
+
+  async function handleConfirm() {
+    const nextAudit = await runAudit()
+    if (!nextAudit || nextAudit.verdict !== 'pass') return
+
+    setConfirming(true)
+    try {
+      const success = await onConfirm(nextAudit)
+      if (success) setConfirmed(true)
+    } finally {
+      setConfirming(false)
+    }
   }
 
   function runAction(item: ReadinessItem) {
@@ -156,8 +174,18 @@ export function FinalConfirmDialog({
                   <strong>{item.label}</strong>
                   <span>{item.detail}</span>
                 </div>
-                {checked && item.action && <button onClick={() => runAction(item)}>{item.action}</button>}
-                {checked && !item.action && <span className="final-confirm-status">{item.id === 'audit' && confirming ? t('resume.auditing') : item.complete ? t('resume.completed') : item.blocking === false ? t('resume.afterConfirm') : t('resume.needsReview')}</span>}
+                {checked && item.action && <button type="button" onClick={() => runAction(item)}>{item.action}</button>}
+                {checked && item.id === 'audit' && !item.complete && !item.action && (
+                  <button
+                    type="button"
+                    className="final-confirm-status-action"
+                    disabled={confirming}
+                    onClick={() => void runAudit()}
+                  >
+                    {confirming ? t('resume.auditing') : t('resume.needsReview')}
+                  </button>
+                )}
+                {checked && !item.action && !(item.id === 'audit' && !item.complete) && <span className="final-confirm-status">{item.complete ? t('resume.completed') : item.blocking === false ? t('resume.afterConfirm') : t('resume.needsReview')}</span>}
               </div>
             )
           })}

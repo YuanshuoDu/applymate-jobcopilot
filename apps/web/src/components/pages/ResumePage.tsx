@@ -44,7 +44,39 @@ function saveCache(data: { resumeId: string | null; jobId: string | null; resume
   _cachedAnalyses = entries
   try { localStorage.setItem(LS_KEY, JSON.stringify(entries)) } catch {}
 }
-type StoredApplicationAudit = { resumeId: string; coverLetterId: string; audit: ApplicationAudit }
+type StoredApplicationAudit = {
+  resumeId: string
+  coverLetterId: string
+  resumeUpdatedAt?: string
+  coverLetterUpdatedAt?: string
+  audit: ApplicationAudit
+}
+
+type ApplicationAuditResponse = ApplicationAudit & {
+  resumeUpdatedAt?: string
+  coverLetterUpdatedAt?: string
+}
+
+function auditMatchesCurrentMaterials(
+  record: StoredApplicationAudit | null,
+  resumeId: string | null,
+  coverLetterId: string | null,
+  resumeUpdatedAt: string | null,
+  coverLetterUpdatedAt: string | null,
+  dirty: boolean,
+) {
+  if (dirty || !record || record.resumeId !== resumeId || record.coverLetterId !== coverLetterId) return false
+  const auditedAt = Date.parse(record.audit.auditedAt)
+  if (!Number.isFinite(auditedAt)) return false
+
+  // New records carry exact document revisions. Legacy activity records only
+  // have auditedAt, so use it as a conservative lower-bound check instead.
+  if (record.resumeUpdatedAt && resumeUpdatedAt && record.resumeUpdatedAt !== resumeUpdatedAt) return false
+  if (record.coverLetterUpdatedAt && coverLetterUpdatedAt && record.coverLetterUpdatedAt !== coverLetterUpdatedAt) return false
+  if (!record.resumeUpdatedAt && resumeUpdatedAt && auditedAt < Date.parse(resumeUpdatedAt)) return false
+  if (!record.coverLetterUpdatedAt && coverLetterUpdatedAt && auditedAt < Date.parse(coverLetterUpdatedAt)) return false
+  return true
+}
 
 function toAuditSuggestions(audit: ApplicationAudit): Suggestion[] {
   return audit.findings
@@ -594,6 +626,8 @@ export function ResumePage() {
   // Responses from superseded calls are silently discarded (race-condition guard).
   const analysisEpochRef = useRef(0)
   const lastSyncedAuditRef = useRef<string | null>(null)
+  const [latestApplicationAudit, setLatestApplicationAudit] = useState<StoredApplicationAudit | null>(null)
+  const [latestSavedCoverLetter, setLatestSavedCoverLetter] = useState<CoverLetter | null>(null)
 
   const [showTemplates,   setShowTemplates]   = useState(false)
   const [showCoverLetter, setShowCoverLetter] = useState(false)
@@ -884,7 +918,12 @@ export function ResumePage() {
       toast.error('Save failed', error)
       return false
     } else {
-      if (data) setCachedApiResponse(`/api/resume/${selectedResumeId}`, data)
+      if (data) {
+        setCachedApiResponse(`/api/resume/${selectedResumeId}`, data)
+        setResumes(previous => previous.map(resume => resume.id === data.id
+          ? { ...resume, name: data.name, updatedAt: data.updatedAt }
+          : resume))
+      }
       setDirty(false)
       setLastSavedAt(new Date())
       toast.success('Saved', 'Resume updated successfully')
@@ -1158,10 +1197,36 @@ export function ResumePage() {
   const templateName = TEMPLATES.find(template => template.id === templateId)?.name ?? templateId
   const pendingSuggestions = suggestions.filter(suggestion => !suggestion.applied).length
   const { data: linkedCoverLetters } = useApi<CoverLetter[]>(`/api/jobs/${resumeLinkedJob?.id ?? '__none__'}/cover-letters`)
-  const finalCoverLetter = linkedCoverLetters?.find(letter =>
+  const linkedFinalCoverLetter = linkedCoverLetters?.find(letter =>
     letter.id === resumeLinkedJob?.finalCoverLetterId && letter.resumeId === selectedResumeId,
   ) ?? null
+  const savedFinalCoverLetter = latestSavedCoverLetter
+    && latestSavedCoverLetter.id === resumeLinkedJob?.finalCoverLetterId
+    && latestSavedCoverLetter.resumeId === selectedResumeId
+    ? latestSavedCoverLetter
+    : null
+  const finalCoverLetter = savedFinalCoverLetter ?? linkedFinalCoverLetter
   const { data: storedApplicationAudit } = useApi<StoredApplicationAudit | null>(`/api/jobs/${resumeLinkedJob?.id ?? '__none__'}/audit-application`)
+  const currentApplicationAuditRecord = auditMatchesCurrentMaterials(
+    latestApplicationAudit,
+    selectedResumeId,
+    finalCoverLetter?.id ?? null,
+    selectedResumeUpdatedAt,
+    finalCoverLetter?.updatedAt ?? null,
+    dirty || saving,
+  )
+    ? latestApplicationAudit
+    : auditMatchesCurrentMaterials(
+        storedApplicationAudit,
+        selectedResumeId,
+        finalCoverLetter?.id ?? null,
+        selectedResumeUpdatedAt,
+        finalCoverLetter?.updatedAt ?? null,
+        dirty || saving,
+      )
+      ? storedApplicationAudit
+      : null
+  const currentApplicationAudit = currentApplicationAuditRecord?.audit ?? null
   const jobContext: AiFieldContext = selectedJob ? {
     jobTitle:       selectedJob.role,
     jobCompany:     selectedJob.company,
@@ -1210,7 +1275,7 @@ export function ResumePage() {
       toast.info('Select a matching cover letter', 'Generate or select a cover letter for this exact resume version before auditing.')
       return null
     }
-    const { data, error } = await apiMutate<ApplicationAudit>(`/api/jobs/${resumeLinkedJob.id}/audit-application`, 'POST', {
+    const { data, error } = await apiMutate<ApplicationAuditResponse>(`/api/jobs/${resumeLinkedJob.id}/audit-application`, 'POST', {
       resumeId: selectedResumeId,
       coverLetterId: finalCoverLetter.id,
     })
@@ -1218,6 +1283,13 @@ export function ResumePage() {
       toast.error('Audit could not run', error ?? 'Please try again')
       return null
     }
+    setLatestApplicationAudit({
+      resumeId: selectedResumeId,
+      coverLetterId: finalCoverLetter.id,
+      resumeUpdatedAt: data.resumeUpdatedAt ?? selectedResumeUpdatedAt ?? undefined,
+      coverLetterUpdatedAt: data.coverLetterUpdatedAt ?? finalCoverLetter.updatedAt,
+      audit: data,
+    })
     if (data.verdict !== 'pass') {
       // Keep the manually opened Resume page in sync with the Auditor. These
       // suggestions are scoped to this exact resume + job pair, so they never
@@ -1744,6 +1816,7 @@ export function ResumePage() {
           templateName={templateName}
           templateOptions={templateOptions}
           onClose={() => setShowCoverLetter(false)}
+          onSaved={saved => setLatestSavedCoverLetter(saved)}
           onFinalized={updated => setJobs(previous => previous.map(job => job.id === updated.id ? updated : job))}
         />
       )}
@@ -1787,7 +1860,7 @@ export function ResumePage() {
       )}
       {showFinalConfirm && (
         <FinalConfirmDialog
-          key={selectedResumeId}
+          key={`${selectedResumeId}:${finalCoverLetter?.id ?? 'no-cover-letter'}`}
           job={resumeLinkedJob}
           resumeName={resumeName}
           templateName={templateName}
@@ -1798,6 +1871,7 @@ export function ResumePage() {
           templateId={templateId}
           templateOptions={templateOptions}
           coverLetterContent={finalCoverLetter?.content ?? null}
+          initialAudit={currentApplicationAudit}
           onClose={() => setShowFinalConfirm(false)}
           onReviewSuggestions={() => { setShowFinalConfirm(false); toast.info(t('resume.toastSuggestions'), t('resume.toastSuggestionsDetail')) }}
           onCreateCoverLetter={() => { setShowFinalConfirm(false); setShowCoverLetter(true) }}

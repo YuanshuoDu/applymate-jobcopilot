@@ -70,6 +70,32 @@ describe('POST /api/jobs/[id]/audit-application', () => {
     expect(mocks.activityCreate.mock.calls[0][0].data.text).toContain('[Auditor] application-audit')
   })
 
+  it('returns and persists the exact resume and cover-letter revisions that were audited', async () => {
+    const resumeUpdatedAt = new Date('2026-09-17T10:00:00.000Z')
+    const coverLetterUpdatedAt = new Date('2026-09-17T10:01:00.000Z')
+    mocks.resumeFindFirst.mockResolvedValueOnce({
+      id: 'resume_final', parentResumeId: 'resume_base', updatedAt: resumeUpdatedAt,
+      content: { contact: {}, summary: 'Final', experience: [], education: [], skills: [] },
+    }).mockResolvedValueOnce({ content: { contact: {}, summary: 'Original', experience: [], education: [], skills: [] } })
+    mocks.coverLetterFindFirst.mockResolvedValue({ content: 'Dear Acme', updatedAt: coverLetterUpdatedAt })
+    mocks.modelChat.mockResolvedValue({ provider: 'minimax', model: 'MiniMax-M3', text: JSON.stringify({ verdict: 'pass', findings: [
+      { area: 'resume', severity: 'pass', title: 'Supported', evidence: 'Matches.', action: 'None.' },
+      { area: 'cover_letter', severity: 'pass', title: 'Supported', evidence: 'Matches.', action: 'None.' },
+      { area: 'job_match', severity: 'pass', title: 'Relevant', evidence: 'Relevant.', action: 'None.' },
+    ] }) })
+
+    const { POST } = await import('./route')
+    const response = (await POST(request({ resumeId: 'resume_final', coverLetterId: 'cover_1' }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    const body = await response.json()
+
+    expect(body).toMatchObject({
+      resumeUpdatedAt: resumeUpdatedAt.toISOString(),
+      coverLetterUpdatedAt: coverLetterUpdatedAt.toISOString(),
+    })
+    expect(mocks.activityCreate.mock.calls[0][0].data.text).toContain(`"resumeUpdatedAt":"${resumeUpdatedAt.toISOString()}"`)
+    expect(mocks.activityCreate.mock.calls[0][0].data.text).toContain(`"coverLetterUpdatedAt":"${coverLetterUpdatedAt.toISOString()}"`)
+  })
+
   it('blocks confirmation when the independent auditor finds an unsupported concrete claim', async () => {
     mocks.resumeFindFirst.mockResolvedValueOnce({ id: 'resume_final', parentResumeId: null, content: { contact: {}, summary: 'Final', experience: [], education: [], skills: [] } })
     mocks.resumeVersionFindFirst.mockResolvedValue({ content: { contact: {}, summary: 'Original', experience: [], education: [], skills: [] } })
