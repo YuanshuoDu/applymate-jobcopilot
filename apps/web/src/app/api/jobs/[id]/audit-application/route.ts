@@ -29,7 +29,14 @@ const AUDIT_ACTIVITY_PREFIX = '[Auditor] application-audit '
 type StoredApplicationAudit = {
   resumeId: string
   coverLetterId: string
+  resumeUpdatedAt?: string
+  coverLetterUpdatedAt?: string
   audit: ApplicationAudit
+}
+
+type ApplicationAuditResponse = ApplicationAudit & {
+  resumeUpdatedAt?: string
+  coverLetterUpdatedAt?: string
 }
 
 function toText(content: ResumeContent): string {
@@ -70,8 +77,18 @@ function normalize(raw: RawAudit, source: ApplicationAudit['source']): Applicati
   }
 }
 
-function auditActivityText(resumeId: string, coverLetterId: string, audit: ApplicationAudit) {
-  return `${AUDIT_ACTIVITY_PREFIX}${JSON.stringify({ resumeId, coverLetterId, audit })}`
+function auditActivityText(
+  resumeId: string,
+  coverLetterId: string,
+  audit: ApplicationAudit,
+  versions: Pick<StoredApplicationAudit, 'resumeUpdatedAt' | 'coverLetterUpdatedAt'> = {},
+) {
+  return `${AUDIT_ACTIVITY_PREFIX}${JSON.stringify({ resumeId, coverLetterId, ...versions, audit })}`
+}
+
+function toIso(value: unknown) {
+  if (value instanceof Date) return value.toISOString()
+  return typeof value === 'string' ? value : undefined
 }
 
 function isAbortError(error: unknown) {
@@ -182,7 +199,7 @@ export async function POST(req: NextRequest, { params }: Params) {
 
   const coverLetter = await db.coverLetter.findFirst({
     where: { id: coverLetterId, jobId, userId: prep.userId },
-    select: { content: true },
+    select: { content: true, updatedAt: true },
   })
   if (!coverLetter) return err('Final cover letter not found for this job', 404)
 
@@ -243,10 +260,18 @@ ${coverLetter.content.slice(0, 8_000)}`
       data: {
         userId: prep.userId, jobId, type: 'agent_action',
         color: audit.verdict === 'pass' ? '#059669' : audit.verdict === 'blocked' ? '#dc2626' : '#d97706',
-        text: auditActivityText(resume.id, coverLetterId, audit),
+        text: auditActivityText(resume.id, coverLetterId, audit, {
+          resumeUpdatedAt: toIso(resume.updatedAt),
+          coverLetterUpdatedAt: toIso(coverLetter.updatedAt),
+        }),
       },
     })
-    return ok({ ...audit, _model: `${result.provider}/${result.model}` })
+    const response: ApplicationAuditResponse = {
+      ...audit,
+      ...(toIso(resume.updatedAt) ? { resumeUpdatedAt: toIso(resume.updatedAt) } : {}),
+      ...(toIso(coverLetter.updatedAt) ? { coverLetterUpdatedAt: toIso(coverLetter.updatedAt) } : {}),
+    }
+    return ok({ ...response, _model: `${result.provider}/${result.model}` })
   } catch (error) {
     console.error('[/api/jobs/audit-application]', error)
     return err(`Application audit failed: ${(error as Error).message}`, 502)
