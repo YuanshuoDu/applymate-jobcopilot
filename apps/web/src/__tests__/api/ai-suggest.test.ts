@@ -78,4 +78,36 @@ describe('POST /api/ai/suggest', () => {
     const body = await res!.json()
     expect(body.suggestions).toHaveLength(3)
   })
+
+  it('scopes regenerated suggestions to the requested section', async () => {
+    const { POST } = await import('@/app/api/ai/suggest/route')
+
+    mockModelChat.mockResolvedValueOnce({ text: JSON.stringify([
+      { text: 'Keep only the strongest skills', target: 'skills', action: 'reorder', proposed: 'Docker, TypeScript' },
+      { text: 'This response should be scoped to skills', target: 'summary', action: 'rewrite', proposed: 'ignored target' },
+    ]) })
+
+    const req = fakeNextRequest({
+      resumeContent: { summary: 'Dev', skills: ['js'], experience: [] },
+      jobTitle: 'Cloud Engineer',
+      section: 'skills',
+    })
+    const res = await POST(req as never)
+    const body = await res!.json()
+
+    expect(res!.status).toBe(200)
+    expect(body.suggestions).toHaveLength(2)
+    expect(body.suggestions.every((suggestion: { target: string }) => suggestion.target === 'skills')).toBe(true)
+    expect(mockModelChat).toHaveBeenCalledWith(
+      [expect.objectContaining({ content: expect.stringContaining('Focus ONLY on the skills section') })],
+      expect.anything(),
+      3000,
+    )
+  })
+
+  it('rejects an unsupported section regeneration target', async () => {
+    const { POST } = await import('@/app/api/ai/suggest/route')
+    const res = await POST(fakeNextRequest({ resumeContent: { summary: 'Dev' }, section: 'contact' }) as never)
+    expect(res!.status).toBe(400)
+  })
 })
