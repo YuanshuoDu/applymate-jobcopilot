@@ -9,6 +9,7 @@ import {
   type TurnJobPayload,
 } from "./lease.js"
 import { recordTurnDlq } from "./dlq.js"
+import { OPEN_SESSION, RUNNABLE_SESSION } from "../session-gate.js"
 
 export const TURN_DISPATCH_TOPIC = "agent.turn.dispatch"
 export const TURN_DISPATCH_POLL_MS = 30_000
@@ -18,16 +19,24 @@ export type TurnDispatchQueue = {
   add(name: string, payload: TurnJobPayload, options?: { jobId?: string; attempts?: number }): Promise<unknown>
 }
 
-type OutboxRow = { id: string; payload: unknown }
-type StartedTurnRow = { id: string; sessionId: string }
+type OutboxRow = { id: string; aggregateId?: string; payload: unknown; attemptCount?: number }
+type QueuedTurnRow = { id: string; sessionId: string }
 type ReclaimedTurn = { turnId: string; sessionId: string; previousLeaseVersion: number }
+type DispatchOutcome = "skipped" | "published" | "poisoned"
+const TURN_DISPATCH_LINEAGE_ERROR = "turn_dispatch_lineage_mismatch"
 
 export function turnDispatchKey(turnId: string): string {
   return `turn-dispatch:${turnId}`
 }
 
-export function turnJobId(turnId: string): string {
-  return `agent-turn:${turnId}`
+/** BullMQ custom IDs cannot contain a colon; generation separates resumed work. */
+export function turnJobId(turnId: string, generation = 0): string {
+  if (!Number.isSafeInteger(generation) || generation < 0) throw new RangeError("Turn dispatch generation must be a non-negative integer")
+  return `agent-turn-${safeJobPart(turnId)}-${generation}`
+}
+
+function safeJobPart(value: string): string {
+  return Buffer.from(value, "utf8").toString("base64url")
 }
 
 function payloadJson(payload: TurnJobPayload): string {
@@ -55,15 +64,27 @@ export async function reclaimExpiredTurns(pool: LeasePool, now: Date, limit: num
   return withTransaction(pool, async (client) => {
     const result = await client.query<{ id: string; sessionId: string; leaseVersion: number }>(
       `WITH stale AS (
-         SELECT "id" FROM "agent_turns"
-         WHERE "status" = 'in_progress' AND ("leaseExpiresAt" IS NULL OR "leaseExpiresAt" <= $1)
-         ORDER BY "updatedAt" ASC, "id" ASC FOR UPDATE SKIP LOCKED LIMIT $2
+         SELECT turn."id"
+         FROM "agent_turns" AS turn
+         JOIN "agent_sessions" AS session
+           ON session."id" = turn."sessionId"
+          AND ${RUNNABLE_SESSION}
+         WHERE turn."status" = 'in_progress'
+           AND (turn."leaseExpiresAt" IS NULL OR turn."leaseExpiresAt" <= $1)
+         ORDER BY turn."updatedAt" ASC, turn."id" ASC
+         LIMIT $2 FOR UPDATE OF turn, session SKIP LOCKED
        )
        UPDATE "agent_turns" AS turn
        SET "status" = 'queued', "leaseOwnerId" = NULL, "leaseExpiresAt" = NULL,
            "leaseStartedAt" = NULL, "leaseVersion" = "leaseVersion" + 1,
            "revision" = "revision" + 1, "completedAt" = NULL, "updatedAt" = $1
-       FROM stale WHERE turn."id" = stale."id"
+       FROM stale
+       WHERE turn."id" = stale."id"
+         AND EXISTS (
+           SELECT 1 FROM "agent_sessions" AS session
+           WHERE session."id" = turn."sessionId"
+             AND ${RUNNABLE_SESSION}
+         )
        RETURNING turn."id", turn."sessionId", turn."leaseVersion"`,
       [now, limit],
     )
@@ -77,15 +98,78 @@ export async function persistTurnDispatch(
   resetPublished = false,
 ): Promise<void> {
   await withTransaction(pool, async (client) => {
+    if (resetPublished) {
+      const session = await client.query<{ id: string }>(
+        `SELECT session."id" FROM "agent_sessions" AS session
+         WHERE session."id" = $1
+           AND ${RUNNABLE_SESSION}
+         FOR UPDATE`,
+        [payload.sessionId],
+      )
+      if (!session.rows[0]) return
+    }
+    const lineage = await client.query<{ id: string }>(
+      `SELECT turn."id"
+       FROM "agent_turns" AS turn
+       JOIN "agent_sessions" AS session
+         ON session."id" = turn."sessionId"
+        AND session."userId" = turn."userId"
+       WHERE turn."id" = $1 AND turn."sessionId" = $2
+       FOR UPDATE OF turn, session`,
+      [payload.turnId, payload.sessionId],
+    )
+    if (!lineage.rows[0]) throw new Error(TURN_DISPATCH_LINEAGE_ERROR)
     const conflictClause = resetPublished
-      ? `ON CONFLICT ("idempotencyKey") DO UPDATE SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL`
+      ? `ON CONFLICT ("idempotencyKey") DO UPDATE SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL, "attemptCount" = "agent_outbox"."attemptCount" + 1
+         WHERE "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"`
       : `ON CONFLICT ("idempotencyKey") DO NOTHING`
     await client.query(
       `INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
        VALUES ($1, $2, $3, $4, $5::jsonb)
        ${conflictClause}`,
-      [randomUUID(), TURN_DISPATCH_TOPIC, payload.turnId, turnDispatchKey(payload.turnId), payloadJson(payload)],
+      [randomUUID(), TURN_DISPATCH_TOPIC, payload.sessionId, turnDispatchKey(payload.turnId), payloadJson(payload)],
     )
+  })
+}
+
+/** Rewrites pre-P4-39 pending dispatch rows to their canonical session aggregate. */
+export async function repairLegacyTurnDispatchAggregates(pool: LeasePool, limit = TURN_DISPATCH_MAX_BATCH): Promise<number> {
+  if (!Number.isInteger(limit) || limit < 1) throw new RangeError("Turn dispatch repair limit must be positive")
+  return withTransaction(pool, async (client) => {
+    const result = await client.query(
+      `WITH candidates AS (
+         SELECT dispatch."id" AS "dispatchId", turn."id" AS "turnId", session."id" AS "sessionId"
+         FROM "agent_sessions" AS session
+         JOIN "agent_turns" AS turn
+           ON turn."sessionId" = session."id"
+          AND turn."userId" = session."userId"
+         JOIN "agent_outbox" AS dispatch
+           ON dispatch."aggregateId" = turn."id"
+          AND dispatch."aggregateId" <> session."id"
+          AND dispatch."topic" = $1
+          AND dispatch."idempotencyKey" = 'turn-dispatch:' || turn."id"
+          AND dispatch."publishedAt" IS NULL
+          AND dispatch."payload"->>'turnId' = turn."id"
+          AND dispatch."payload"->>'sessionId' = session."id"
+         WHERE ${OPEN_SESSION}
+         ORDER BY dispatch."createdAt" ASC, dispatch."id" ASC
+         LIMIT $2 FOR UPDATE OF session, turn, dispatch SKIP LOCKED
+       )
+       UPDATE "agent_outbox" AS dispatch
+       SET "aggregateId" = candidates."sessionId"
+       FROM candidates
+       WHERE dispatch."id" = candidates."dispatchId"
+         AND dispatch."topic" = $1
+         AND dispatch."aggregateId" = candidates."turnId"
+         AND dispatch."aggregateId" <> candidates."sessionId"
+         AND dispatch."idempotencyKey" = 'turn-dispatch:' || candidates."turnId"
+         AND dispatch."publishedAt" IS NULL
+         AND dispatch."payload"->>'turnId' = candidates."turnId"
+         AND dispatch."payload"->>'sessionId' = candidates."sessionId"
+       RETURNING dispatch."id"`,
+      [TURN_DISPATCH_TOPIC, limit],
+    )
+    return result.rowCount ?? result.rows.length
   })
 }
 
@@ -94,39 +178,48 @@ async function ensureQueuedTurnDispatches(
   ownerId: string,
   limit: number,
 ): Promise<number> {
-  // The generic agent.session.event outbox may already be consumed by the
-  // stream publisher. Derive dispatch from the canonical turn.started fact so
-  // a published event can never strand a queued Turn.
+  // A queued Turn is runnable work even when the agent-runs Redis handoff was
+  // lost before turn.started or its canonical dispatch intent was recorded.
+  // Rebuild the session-scoped intent so the durable scanner can recover it.
   return withTransaction(pool, async (client) => {
-    const rows = await client.query<StartedTurnRow>(
+    const rows = await client.query<QueuedTurnRow>(
       `SELECT turn."id", turn."sessionId"
        FROM "agent_turns" AS turn
+       JOIN "agent_sessions" AS session
+         ON session."id" = turn."sessionId"
+        AND ${RUNNABLE_SESSION}
        LEFT JOIN "agent_outbox" AS dispatch
-         ON dispatch."topic" = $1 AND dispatch."aggregateId" = turn."id"
+         ON dispatch."topic" = $1
+        AND dispatch."aggregateId" = turn."sessionId"
+        AND dispatch."idempotencyKey" = 'turn-dispatch:' || turn."id"
        WHERE turn."status" = 'queued'
-         AND EXISTS (
-           SELECT 1 FROM "agent_events" AS event
-           WHERE event."turnId" = turn."id" AND event."type" = 'turn.started'
-         )
          AND (
            dispatch."id" IS NULL OR dispatch."publishedAt" IS NOT NULL
          )
        ORDER BY turn."createdAt" ASC, turn."id" ASC
-       FOR UPDATE OF turn SKIP LOCKED
-       LIMIT $2`,
+       LIMIT $2 FOR UPDATE OF turn, session SKIP LOCKED`,
       [TURN_DISPATCH_TOPIC, limit],
     )
+    let repaired = 0
     for (const row of rows.rows) {
       const payload: TurnJobPayload = { turnId: row.id, sessionId: row.sessionId, ownerId }
-      await client.query(
+      const inserted = await client.query(
         `INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
-         VALUES ($1, $2, $3, $4, $5::jsonb)
+         SELECT $1, $2, $3, $4, $5::jsonb
+         WHERE EXISTS (
+           SELECT 1 FROM "agent_sessions" AS session
+           WHERE session."id" = $3
+             AND ${RUNNABLE_SESSION}
+         )
          ON CONFLICT ("idempotencyKey") DO UPDATE
-         SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL`,
-        [randomUUID(), TURN_DISPATCH_TOPIC, row.id, turnDispatchKey(row.id), payloadJson(payload)],
-      )
+         SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL,
+             "attemptCount" = "agent_outbox"."attemptCount" + 1
+         WHERE "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"`,
+         [randomUUID(), TURN_DISPATCH_TOPIC, row.sessionId, turnDispatchKey(row.id), payloadJson(payload)],
+       )
+      repaired += inserted.rowCount ?? 0
     }
-    return rows.rows.length
+    return repaired
   })
 }
 
@@ -135,13 +228,17 @@ export async function dispatchPendingTurnOutbox(
   queue: TurnDispatchQueue,
   limit = TURN_DISPATCH_MAX_BATCH,
 ): Promise<number> {
+  if (!Number.isInteger(limit) || limit < 1) throw new RangeError("Turn dispatch limit must be positive")
   const rows = await withTransaction(pool, async (client) => {
     const result = await client.query<OutboxRow>(
-      `SELECT "id", "payload"
-       FROM "agent_outbox"
-       WHERE "topic" = $1 AND "publishedAt" IS NULL
-       ORDER BY "createdAt" ASC, "id" ASC
-       FOR UPDATE SKIP LOCKED LIMIT $2`,
+      `SELECT dispatch."id", dispatch."aggregateId", dispatch."payload", dispatch."attemptCount"
+       FROM "agent_outbox" AS dispatch
+       JOIN "agent_sessions" AS session
+         ON session."id" = dispatch."aggregateId"
+        AND ${RUNNABLE_SESSION}
+       WHERE dispatch."topic" = $1 AND dispatch."publishedAt" IS NULL
+       ORDER BY dispatch."createdAt" ASC, dispatch."id" ASC
+       LIMIT $2 FOR UPDATE OF dispatch, session SKIP LOCKED`,
       [TURN_DISPATCH_TOPIC, limit],
     )
     return result.rows
@@ -154,10 +251,95 @@ export async function dispatchPendingTurnOutbox(
       await markDispatchError(pool, row.id, "schema_invalid_payload", true)
       continue
     }
-    await queue.add("turn", payload, { jobId: turnJobId(payload.turnId), attempts: 5 })
+    const sessionId = row.aggregateId ?? payload.sessionId
+    let queueAddStarted = false
+    let queueAddFailed = false
+    let queueAddFailure: unknown
+    try {
+      const outcome = await withTransaction<DispatchOutcome>(pool, async (client) => {
+        // Keep the session fence held across queue.add and the publish mark. A
+        // close racing this transaction either waits for delivery to commit
+        // or wins first and makes the row ineligible without queueing.
+        const session = await client.query<{ id: string }>(
+          `SELECT session."id" FROM "agent_sessions" AS session
+           WHERE session."id" = $1
+             AND ${RUNNABLE_SESSION}
+           FOR UPDATE`,
+          [sessionId],
+        )
+        if (!session.rows[0]) return "skipped"
+        const pending = await client.query<{ id: string }>(
+          `SELECT dispatch."id" FROM "agent_outbox" AS dispatch
+           WHERE dispatch."id" = $1 AND dispatch."aggregateId" = $2
+             AND dispatch."topic" = $3 AND dispatch."publishedAt" IS NULL
+           FOR UPDATE`,
+          [row.id, sessionId, TURN_DISPATCH_TOPIC],
+        )
+        if (!pending.rows[0]) return "skipped"
+        const lineageMismatch = (row.aggregateId !== undefined && row.aggregateId !== payload.sessionId) || sessionId !== payload.sessionId
+        if (lineageMismatch) {
+          await quarantineTurnDispatch(client, row.id)
+          return "poisoned"
+        }
+        const lineage = await client.query<{ id: string }>(
+          `SELECT turn."id"
+           FROM "agent_turns" AS turn
+           JOIN "agent_sessions" AS turnSession
+             ON turnSession."id" = turn."sessionId"
+            AND turnSession."userId" = turn."userId"
+           WHERE turn."id" = $1 AND turn."sessionId" = $2
+           FOR UPDATE OF turn, turnSession`,
+          [payload.turnId, sessionId],
+        )
+        if (!lineage.rows[0]) {
+          await quarantineTurnDispatch(client, row.id)
+          return "poisoned"
+        }
+        queueAddStarted = true
+        try {
+          await queue.add("turn", payload, { jobId: turnJobId(payload.turnId, row.attemptCount ?? 0), attempts: 5 })
+        } catch (error: unknown) {
+          queueAddFailed = true
+          queueAddFailure = error
+          throw error
+        }
+        await client.query(
+          `UPDATE "agent_outbox"
+           SET "publishedAt" = CURRENT_TIMESTAMP, "attemptCount" = "attemptCount" + 1, "lastError" = NULL
+           WHERE "id" = $1 AND "publishedAt" IS NULL`,
+          [row.id],
+        )
+        return "published"
+      })
+      if (outcome === "skipped") continue
+      if (outcome === "poisoned") {
+        console.error("[turn-dispatch] quarantined outbox row with invalid session/Turn lineage:", row.id)
+        continue
+      }
+    } catch (error: unknown) {
+      if (queueAddFailed) {
+        await markDispatchError(pool, row.id, "queue_add_failed")
+        throw queueAddFailure ?? error
+      }
+      // The BullMQ job may already exist. Keep the row unpublished and reuse
+      // the same generation/job ID on the next scan instead of inventing a new
+      // delivery attempt for an uncertain enqueue.
+      if (queueAddStarted) throw new Error("turn_dispatch_delivery_uncertain", { cause: error })
+      throw error
+    }
     dispatched += 1
   }
   return dispatched
+}
+
+async function quarantineTurnDispatch(client: pg.PoolClient, outboxId: string): Promise<void> {
+  await client.query(
+    `UPDATE "agent_outbox"
+     SET "attemptCount" = "attemptCount" + 1, "lastError" = $2,
+         "publishedAt" = CURRENT_TIMESTAMP
+     WHERE "id" = $1 AND "publishedAt" IS NULL`,
+    [outboxId, TURN_DISPATCH_LINEAGE_ERROR],
+  )
 }
 
 async function markDispatchError(pool: LeasePool, outboxId: string, code: string, terminal = false): Promise<void> {
@@ -187,11 +369,12 @@ export async function recoverTurnQueue(
   ownerId = `recovery-${randomUUID()}`,
   now = new Date(),
 ): Promise<RecoveryReport> {
+  const legacyRepaired = await repairLegacyTurnDispatchAggregates(pool, TURN_DISPATCH_MAX_BATCH)
   const reclaimed = await reclaimExpiredTurns(pool, now, TURN_DISPATCH_MAX_BATCH)
   for (const turn of reclaimed) {
     await persistTurnDispatch(pool, { turnId: turn.turnId, sessionId: turn.sessionId, ownerId }, true)
   }
-  const repaired = await ensureQueuedTurnDispatches(pool, ownerId, TURN_DISPATCH_MAX_BATCH)
+  const repaired = legacyRepaired + await ensureQueuedTurnDispatches(pool, ownerId, TURN_DISPATCH_MAX_BATCH)
   const dispatched = await dispatchPendingTurnOutbox(pool, queue)
   return { reclaimed: reclaimed.length, repaired, dispatched }
 }

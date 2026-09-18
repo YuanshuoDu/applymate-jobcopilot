@@ -33,6 +33,9 @@ function serializeSession(session: {
   goal: string
   status: string
   source: string
+  controlGate: string
+  controlRevision: number
+  pausedAt: Date | null
   memorySummary: string
   qualityScore: number | null
   currentTaskId: string | null
@@ -72,6 +75,7 @@ function serializeSession(session: {
     createdAt: session.createdAt.toISOString(),
     updatedAt: session.updatedAt.toISOString(),
     completedAt: iso(session.completedAt),
+    pausedAt: iso(session.pausedAt),
     tasks: session.tasks.map(task => ({
       ...task,
       createdAt: task.createdAt.toISOString(),
@@ -98,6 +102,9 @@ export async function GET(req: NextRequest, ctx: RouteCtx) {
       goal: true,
       status: true,
       source: true,
+      controlGate: true,
+      controlRevision: true,
+      pausedAt: true,
       memorySummary: true,
       qualityScore: true,
       currentTaskId: true,

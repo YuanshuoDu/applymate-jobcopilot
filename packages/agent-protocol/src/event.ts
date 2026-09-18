@@ -18,6 +18,10 @@ export const AgentEventTypeSchema = Type.Union([
   Type.Literal('tool_call.started'),
   Type.Literal('tool_call.completed'),
   Type.Literal('tool_call.failed'),
+  Type.Literal('plan.observation'),
+  Type.Literal('plan.revision'),
+  Type.Literal('plan.command'),
+  Type.Literal('goal.revision'),
   Type.Literal('policy.decision'),
   Type.Literal('approval.requested'),
   Type.Literal('approval.resolved'),
@@ -26,43 +30,94 @@ export const AgentEventTypeSchema = Type.Union([
   Type.Literal('question.answered'),
   Type.Literal('question.cancelled'),
   Type.Literal('external_action.reserved'),
+  Type.Literal('session.paused'),
+  Type.Literal('session.resumed'),
 ])
 
-export const AgentEventEnvelopeSchema = Type.Object({
-  schemaVersion: SchemaVersionSchema,
-  id: IdSchema,
-  sessionId: IdSchema,
-  turnId: IdSchema,
-  itemId: NullableIdSchema,
-  taskId: NullableIdSchema,
-  sequence: SequenceSchema,
-  type: Type.String({ minLength: 1, maxLength: 128 }),
-  actor: ActorSchema,
-  correlationId: IdSchema,
-  causationId: NullableIdSchema,
-  idempotencyKey: NullableIdSchema,
-  payload: JsonValueSchema,
-  createdAt: TimestampSchema,
-}, { $id: 'agent.event.envelope', additionalProperties: false })
+export const SessionControlEventTypeSchema = Type.Union([
+  Type.Literal('session.paused'),
+  Type.Literal('session.resumed'),
+])
 
-export const KnownAgentEventEnvelopeSchema = Type.Object({
+export const SessionControlEventPayloadSchema = Type.Union([
+  Type.Object({
+    sessionId: IdSchema,
+    operation: Type.Literal('pause'),
+    previousGate: Type.Literal('open'),
+    nextGate: Type.Literal('user_paused'),
+    controlRevision: Type.Integer({ minimum: 1, maximum: 2_147_483_647 }),
+    pausedAt: TimestampSchema,
+  }, { additionalProperties: false }),
+  Type.Object({
+    sessionId: IdSchema,
+    operation: Type.Literal('resume'),
+    previousGate: Type.Literal('user_paused'),
+    nextGate: Type.Literal('open'),
+    controlRevision: Type.Integer({ minimum: 1, maximum: 2_147_483_647 }),
+    pausedAt: Type.Null(),
+  }, { additionalProperties: false }),
+])
+
+const eventEnvelopeFields = {
   schemaVersion: SchemaVersionSchema,
   id: IdSchema,
   sessionId: IdSchema,
-  turnId: IdSchema,
-  itemId: NullableIdSchema,
-  taskId: NullableIdSchema,
   sequence: SequenceSchema,
-  type: AgentEventTypeSchema,
-  actor: ActorSchema,
   correlationId: IdSchema,
   causationId: NullableIdSchema,
   idempotencyKey: NullableIdSchema,
-  payload: JsonValueSchema,
   createdAt: TimestampSchema,
-}, { $id: 'agent.event.known', additionalProperties: false })
+} as const
+
+const turnScopedEventTypeSchema = Type.Intersect([
+  Type.String({ minLength: 1, maxLength: 128 }),
+  Type.Not(SessionControlEventTypeSchema),
+])
+
+const sessionControlEventEnvelope = Type.Object({
+  ...eventEnvelopeFields,
+  type: SessionControlEventTypeSchema,
+  idempotencyKey: IdSchema,
+  turnId: Type.Null(),
+  itemId: Type.Null(),
+  taskId: Type.Null(),
+  actor: Type.Literal('system'),
+  payload: SessionControlEventPayloadSchema,
+}, { additionalProperties: false })
+
+const turnScopedEventEnvelope = Type.Object({
+  ...eventEnvelopeFields,
+  type: turnScopedEventTypeSchema,
+  turnId: IdSchema,
+  itemId: NullableIdSchema,
+  taskId: NullableIdSchema,
+  actor: ActorSchema,
+  payload: JsonValueSchema,
+}, { additionalProperties: false })
+
+const knownTurnScopedEventEnvelope = Type.Object({
+  ...eventEnvelopeFields,
+  type: Type.Exclude(AgentEventTypeSchema, SessionControlEventTypeSchema),
+  turnId: IdSchema,
+  itemId: NullableIdSchema,
+  taskId: NullableIdSchema,
+  actor: ActorSchema,
+  payload: JsonValueSchema,
+}, { additionalProperties: false })
+
+export const AgentEventEnvelopeSchema = Type.Union([
+  sessionControlEventEnvelope,
+  turnScopedEventEnvelope,
+], { $id: 'agent.event.envelope' })
+
+export const KnownAgentEventEnvelopeSchema = Type.Union([
+  sessionControlEventEnvelope,
+  knownTurnScopedEventEnvelope,
+], { $id: 'agent.event.known' })
 
 export type AgentEventType = Static<typeof AgentEventTypeSchema>
+export type SessionControlEventType = Static<typeof SessionControlEventTypeSchema>
+export type SessionControlEventPayload = Static<typeof SessionControlEventPayloadSchema>
 type AgentEventEnvelopeBase = Static<typeof AgentEventEnvelopeSchema>
 type KnownAgentEventEnvelopeBase = Static<typeof KnownAgentEventEnvelopeSchema>
 export type AgentEventEnvelope<TPayload = unknown> = Omit<AgentEventEnvelopeBase, 'payload'> & { payload: TPayload }

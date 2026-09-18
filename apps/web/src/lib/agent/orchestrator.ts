@@ -88,6 +88,45 @@ function parseDecision(raw: string): Record<string, unknown> | null {
   }
 }
 
+function isOrchestratorDecision(value: unknown): value is OrchestratorDecision['decision'] {
+  return value === 'proceed' || value === 'retry' || value === 'ask_user' || value === 'abort'
+}
+
+function isNonEmptyText(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0
+}
+
+function isBoundedNonEmptyText(value: unknown, maxLength: number): value is string {
+  return isNonEmptyText(value) && value.trim().length <= maxLength
+}
+
+function isPlainNonEmptyObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+  const prototype = Object.getPrototypeOf(value)
+  return (prototype === Object.prototype || prototype === null) && Object.keys(value).length > 0
+}
+
+const MAX_DECISION_THINKING_LENGTH = 120
+const MAX_QUESTION_OPTION_COUNT = 20
+const MAX_QUESTION_OPTION_TEXT_LENGTH = 200
+const MAX_QUESTION_ACTION_FIELD_LENGTH = 120
+
+function isQuestionOption(value: unknown): value is QuestionOption {
+  if (!isPlainNonEmptyObject(value)) return false
+  if (!isBoundedNonEmptyText(value.label, MAX_QUESTION_OPTION_TEXT_LENGTH)) return false
+  if (!isBoundedNonEmptyText(value.value, MAX_QUESTION_OPTION_TEXT_LENGTH)) return false
+  if (value.action === undefined) return true
+  return isPlainNonEmptyObject(value.action) &&
+    isBoundedNonEmptyText(value.action.field, MAX_QUESTION_ACTION_FIELD_LENGTH)
+}
+
+function isQuestionOptions(value: unknown): value is QuestionOption[] {
+  return Array.isArray(value) &&
+    value.length > 0 &&
+    value.length <= MAX_QUESTION_OPTION_COUNT &&
+    value.every((option, index) => Object.prototype.hasOwnProperty.call(value, index) && isQuestionOption(option))
+}
+
 // ── OrchestratorAgent ─────────────────────────────────────────────────────────
 
 export class OrchestratorAgent {
@@ -227,19 +266,36 @@ Respond ONLY in valid JSON (no markdown):
 
     try {
       const r      = await modelChat([{ role: 'user', content: prompt }], this.ctx.aiConfig, 400)
-      const parsed = parseDecision(r.text) as OrchestratorDecision | null
-      if (!parsed?.decision) throw new Error('no decision')
+      const parsed = parseDecision(r.text)
+      if (!parsed || !isOrchestratorDecision(parsed.decision)) throw new Error('invalid decision')
+      if (!isBoundedNonEmptyText(parsed.thinking, MAX_DECISION_THINKING_LENGTH)) throw new Error('invalid thinking')
+      if (parsed.ask_options !== undefined && !isQuestionOptions(parsed.ask_options)) {
+        throw new Error('invalid ask options')
+      }
+      if (parsed.decision === 'ask_user' && !isNonEmptyText(parsed.ask_question)) {
+        throw new Error('invalid ask question')
+      }
+      if (parsed.decision === 'retry' && !isPlainNonEmptyObject(parsed.retry_fix)) {
+        throw new Error('invalid retry fix')
+      }
+
+      const decision: OrchestratorDecision = {
+        ...parsed,
+        decision: parsed.decision,
+        thinking: extractFinalSentence(parsed.thinking),
+      }
 
       // Clean thinking field from any preamble too
-      if (parsed.thinking) parsed.thinking = extractFinalSentence(parsed.thinking)
-
-      this.history.push(`[${stage}] ${summary} → ${parsed.decision}: ${parsed.thinking}`)
-      this.emit('orchestrator_thinking', { stage, thinking: parsed.thinking, decision: parsed.decision })
-      return parsed
+      this.history.push(`[${stage}] ${summary} → ${decision.decision}: ${decision.thinking}`)
+      this.emit('orchestrator_thinking', { stage, thinking: decision.thinking, decision: decision.decision })
+      return decision
     } catch {
-      const fallback: OrchestratorDecision = { decision: 'proceed', thinking: 'Continue to the next stage' }
-      this.history.push(`[${stage}] ${summary} → proceed (fallback)`)
-      this.emit('orchestrator_thinking', { stage, thinking: fallback.thinking, decision: 'proceed' })
+      const fallback: OrchestratorDecision = {
+        decision: 'abort',
+        thinking: 'Unable to determine a safe next step; aborting the pipeline',
+      }
+      this.history.push(`[${stage}] ${summary} → abort (fallback)`)
+      this.emit('orchestrator_thinking', { stage, thinking: fallback.thinking, decision: 'abort' })
       return fallback
     }
   }

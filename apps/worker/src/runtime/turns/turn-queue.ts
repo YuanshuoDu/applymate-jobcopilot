@@ -34,9 +34,12 @@ export const TURN_QUEUE_NAME = "agent-turns"
 export type TurnExecutionResult = {
   status: LeaseReleaseStatus
   summary?: string
+  /** Durable dependency waits must carry their receipt to the lease handoff. */
+  waitId?: string
 }
 
 export type TurnExecutor = (input: { lease: TurnLease; signal: AbortSignal }) => Promise<TurnExecutionResult>
+export type TurnWaitHandoff = (input: { lease: TurnLease; waitId: string; now: Date }) => Promise<unknown>
 
 export type ActiveTurnExecution = {
   lease: TurnLease
@@ -65,6 +68,10 @@ export interface RunTurnJobOptions {
   leaseMs?: number
   heartbeatMs?: number
   now?: () => Date
+  /** Atomically suspends or requeues a dependency wait before ordinary release. */
+  waitHandoff?: TurnWaitHandoff
+  /** Server-owned probe for a durable Stop that fenced the active lease. */
+  isInterrupted?: (lease: TurnLease) => Promise<boolean>
 }
 
 export async function markTurnDispatchClaimed(pool: LeasePool, payload: TurnJobPayload): Promise<void> {
@@ -73,9 +80,31 @@ export async function markTurnDispatchClaimed(pool: LeasePool, payload: TurnJobP
     await client.query(
       `UPDATE "agent_outbox"
        SET "publishedAt" = CURRENT_TIMESTAMP, "attemptCount" = "attemptCount" + 1, "lastError" = NULL
-       WHERE "topic" = 'agent.turn.dispatch' AND "idempotencyKey" = $1 AND "publishedAt" IS NULL`,
-      [`turn-dispatch:${payload.turnId}`],
+       WHERE "topic" = 'agent.turn.dispatch' AND "idempotencyKey" = $1
+         AND "aggregateId" = $2 AND "publishedAt" IS NULL`,
+      [`turn-dispatch:${payload.turnId}`, payload.sessionId],
     )
+  } finally {
+    client.release()
+  }
+}
+
+async function persistedInterrupt(options: RunTurnJobOptions, lease: TurnLease): Promise<boolean> {
+  if (options.isInterrupted) return options.isInterrupted(lease).catch(() => false)
+  const client = await options.pool.connect().catch(() => null)
+  if (!client) return false
+  try {
+    await client.query("BEGIN")
+    await client.query("SELECT set_config('app.user_id', $1, true)", [lease.userId])
+    const result = await client.query<{ status: string }>(
+      `SELECT "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+      [lease.turnId, lease.sessionId, lease.userId],
+    )
+    await client.query("COMMIT")
+    return result.rows[0]?.status === "interrupted"
+  } catch {
+    await client.query("ROLLBACK").catch(() => undefined)
+    return false
   } finally {
     client.release()
   }
@@ -104,7 +133,14 @@ export async function runTurnJob(
     throw error
   }
 
-  await markTurnDispatchClaimed(options.pool, payload)
+  try {
+    await markTurnDispatchClaimed(options.pool, payload)
+  } catch (error: unknown) {
+    // Dispatch bookkeeping is part of the claim boundary. If it fails, put
+    // the fenced Turn back in the queue before letting BullMQ retry the job.
+    await releaseTurnLease(options.pool, lease, "queued", options.now?.() ?? new Date()).catch(() => undefined)
+    throw error
+  }
   const heartbeat = new TurnHeartbeat(lease, {
     pool: options.pool,
     intervalMs: options.heartbeatMs,
@@ -118,7 +154,6 @@ export async function runTurnJob(
   active.add({
     lease,
     abort: async () => {
-      root?.stop("worker_shutdown")
       await heartbeat.abort("Turn interrupted by Worker shutdown")
     },
   })
@@ -129,12 +164,22 @@ export async function runTurnJob(
       options.execute({ lease, signal: linked.signal }),
       heartbeat.lost.then((error) => { throw error }),
     ])
+    if (result.status === "waiting_for_dependency" && result.waitId && options.waitHandoff) {
+      await options.waitHandoff({ lease: heartbeat.currentLease, waitId: result.waitId, now: options.now?.() ?? new Date() })
+      return result
+    }
     const released = await releaseTurnLease(options.pool, heartbeat.currentLease, result.status, options.now?.() ?? new Date())
-    if (!released && root?.stopped) return { status: "interrupted", summary: "Turn stopped by a persisted interrupt" }
+    if (!released && (root?.stopped || await persistedInterrupt(options, heartbeat.currentLease))) {
+      return { status: "interrupted", summary: "Turn stopped by a persisted interrupt" }
+    }
     if (!released) throw new TurnLeaseError("lease_lost", "Turn lease was fenced before completion")
     return result
   } catch (error: unknown) {
     if (root?.stopped || signalWasInterrupted(linked.signal)) {
+      await releaseTurnLease(options.pool, heartbeat.currentLease, "interrupted", options.now?.() ?? new Date()).catch(() => undefined)
+      return { status: "interrupted", summary: "Turn stopped by a persisted interrupt" }
+    }
+    if (error instanceof TurnLeaseError && error.code === "lease_lost" && await persistedInterrupt(options, heartbeat.currentLease)) {
       await releaseTurnLease(options.pool, heartbeat.currentLease, "interrupted", options.now?.() ?? new Date()).catch(() => undefined)
       return { status: "interrupted", summary: "Turn stopped by a persisted interrupt" }
     }
@@ -172,6 +217,7 @@ export async function enqueueTurn(
 export function createTurnQueue(options: {
   pool: LeasePool
   execute: TurnExecutor
+  waitHandoff?: TurnWaitHandoff
   queue?: TurnQueueLike
   interrupts?: RootAbortControllerRegistry
   leaseMs?: number
@@ -184,6 +230,7 @@ export function createTurnQueue(options: {
     (job) => runTurnJob(job, {
       pool: options.pool,
       execute: options.execute,
+      waitHandoff: options.waitHandoff,
       active,
       interrupts: options.interrupts,
       leaseMs: options.leaseMs,

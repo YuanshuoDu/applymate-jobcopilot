@@ -1,0 +1,190 @@
+import { describe, expect, it, vi } from "vitest"
+
+import { createContextSnapshotAdapter, type ContextSnapshotAdapterStore } from "./context-snapshot-adapter.js"
+import type { StepContextSnapshot } from "./step-context-builder.js"
+
+const scope = { userId: "user-1" }
+const base: StepContextSnapshot = {
+  system: [{ id: "system", content: "keep" }], profile: [{ id: "profile", content: "keep" }], goal: { id: "goal", content: "keep" },
+  steerHistory: [{ id: "steer", content: "keep" }], businessRefs: [{ id: "ref", kind: "job", ownerId: "user-1" }], toolObservations: [],
+}
+
+function observations(count: number): StepContextSnapshot {
+  return { ...base, toolObservations: Array.from({ length: count }, (_, index) => ({ id: `tool-${index}`, content: { text: "x".repeat(500) } })) }
+}
+
+function store(overrides: Partial<ContextSnapshotAdapterStore> = {}): ContextSnapshotAdapterStore & { saved: Array<{ snapshotRef: string; scope: typeof scope; sessionId: string; turnId: string; stepId: string; idempotencyKey: string; snapshot: StepContextSnapshot }>; loadedInput?: unknown } {
+  const saved: Array<{ snapshotRef: string; scope: typeof scope; sessionId: string; turnId: string; stepId: string; idempotencyKey: string; snapshot: StepContextSnapshot }> = []
+  return {
+    saved,
+    save: async input => { saved.push(input); return { snapshotRef: input.snapshotRef, scope: input.scope, sessionId: input.sessionId, turnId: input.turnId } },
+    load: async input => { return { snapshot: base, scope: input.scope, sessionId: input.sessionId, turnId: input.turnId } },
+    loadByIdempotencyKey: async input => saved.find(item => item.scope.userId === input.scope.userId && item.sessionId === input.sessionId && item.turnId === input.turnId && item.stepId === input.stepId && item.idempotencyKey === input.idempotencyKey) ?? null,
+    ...overrides,
+  }
+}
+
+function request(snapshot: StepContextSnapshot) {
+  return { identity: { kind: "turn" as const, userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "root-1", rootTaskId: "root-1", ownerId: "worker-1", leaseVersion: 1, leaseExpiresAt: new Date("2026-09-12T00:00:00Z") }, scope, sessionId: "session-1", turnId: "turn-1", stepId: "turn:turn-1:step:0", signal: new AbortController().signal, now: new Date("2026-09-12T00:00:00Z"), snapshot, estimatedInputTokens: 0, estimatedBytes: 0, idempotencyKey: "context-compaction:turn:turn-1:step:0" }
+}
+
+describe("StepContextSnapshot adapter", () => {
+  it("does nothing below the observation threshold and protects fields", async () => {
+    const backing = store()
+    const adapter = createContextSnapshotAdapter({ store: backing, observationCountThreshold: 4, keepRecentObservations: 1 })
+    const value = await adapter.hook(request(observations(2)))
+    expect(value).toEqual({ status: "unchanged", snapshot: observations(2) })
+    expect(backing.saved).toHaveLength(0)
+  })
+
+  it("deterministically reduces observations and saves an opaque ref", async () => {
+    const backing = store()
+    const summarizer = vi.fn(() => ({ removed: "safe summary" }))
+    const adapter = createContextSnapshotAdapter({ store: backing, observationCountThreshold: 3, keepRecentObservations: 1, summarizer })
+    const input = request(observations(3))
+    const first = await adapter.hook(input)
+    const second = await adapter.hook(input)
+    expect(first).toEqual(second)
+    expect(first).toMatchObject({ status: "compacted", snapshot: { toolObservations: [{ id: "context-summary:turn:turn-1:step:0" }, { id: "tool-2" }] } })
+    expect(summarizer).toHaveBeenCalledTimes(1)
+    expect(backing.saved).toHaveLength(1)
+    expect(backing.saved[0]?.snapshotRef).toMatch(/^[0-9a-f]{64}$/)
+    expect(first.snapshot.system).toEqual(base.system)
+    expect(first.snapshot.profile).toEqual(base.profile)
+    expect(first.snapshot.goal).toEqual(base.goal)
+    expect(first.snapshot.steerHistory).toEqual(base.steerHistory)
+    expect(first.snapshot.businessRefs).toEqual(base.businessRefs)
+    const rebuilt = createContextSnapshotAdapter({ store: backing, observationCountThreshold: 3, keepRecentObservations: 1, summarizer })
+    const third = await rebuilt.hook(input)
+    expect(third).toMatchObject({ status: "compacted", snapshotRef: first.status === "compacted" ? first.snapshotRef : "" })
+    expect(summarizer).toHaveBeenCalledTimes(1)
+    expect(backing.saved).toHaveLength(1)
+  })
+
+  it("retains durable plan and wait anchors in the compacted snapshot memory", async () => {
+    const durable = [
+      { id: "plan-revision:plan-1", content: { kind: "plan_revision", goalRevision: 1, planRevision: 1 } },
+      { id: "plan-result:plan-1:join", content: { kind: "plan_command", localId: "join", commandKind: "join", status: "completed" } },
+      { id: "wait-result:wait-1", content: { toolCallId: "wait:wait-1", toolName: "wait_subagents", status: "completed" } },
+      { id: "plan-control:plan-1:join:replan", content: { kind: "plan_control", localId: "join:replan", status: "replan_required" } },
+    ]
+    const input = { ...observations(10), toolObservations: [...durable, ...observations(10).toolObservations] }
+    const adapter = createContextSnapshotAdapter({ store: store(), observationCountThreshold: 4, keepRecentObservations: 1 })
+    const result = await adapter.hook(request(input))
+    expect(result).toMatchObject({ status: "compacted" })
+    if (result.status !== "compacted") return
+    expect(result.snapshot.toolObservations.map(item => item.id)).toEqual(expect.arrayContaining(durable.map(item => item.id)))
+    expect(result.snapshot.toolObservations[0]?.content).toMatchObject({ kind: "context_summary", memory: { revisions: { goalRevision: 1, planRevision: 1 } } })
+  })
+
+  it("retains a canonical agent.wait observation as a compacted memory anchor", async () => {
+    const canonicalWait = { id: "tool-wait-canonical", content: { toolName: "agent.wait", status: "completed" } }
+    const input = { ...observations(10), toolObservations: [canonicalWait, ...observations(10).toolObservations] }
+    const adapter = createContextSnapshotAdapter({ store: store(), observationCountThreshold: 4, keepRecentObservations: 1 })
+
+    const result = await adapter.hook(request(input))
+
+    expect(result).toMatchObject({ status: "compacted" })
+    if (result.status !== "compacted") return
+    expect(result.snapshot.toolObservations.map(item => item.id)).toContain(canonicalWait.id)
+    expect(result.snapshot.toolObservations[0]?.content).toMatchObject({ memory: { waits: [{ id: canonicalWait.id, status: "completed" }] } })
+  })
+
+  it("retains canonical snapshot memory across repeated compaction", async () => {
+    const snapshotMemory = {
+      id: "context-snapshot-memory",
+      content: {
+        kind: "context_snapshot_memory",
+        goal: "Find a role",
+        userConstraints: ["EU only"],
+        pendingApprovals: ["approval-1"],
+      },
+    }
+    const input = { ...observations(10), toolObservations: [snapshotMemory, ...observations(10).toolObservations] }
+    const adapter = createContextSnapshotAdapter({ store: store(), observationCountThreshold: 2, keepRecentObservations: 1 })
+
+    const result = await adapter.hook(request(input))
+
+    expect(result).toMatchObject({ status: "compacted" })
+    if (result.status !== "compacted") return
+    expect(result.snapshot.toolObservations).toContainEqual(snapshotMemory)
+
+    const repeatedInput = {
+      ...result.snapshot,
+      toolObservations: [...result.snapshot.toolObservations, { id: "tool-10", content: { text: "x".repeat(500) } }, { id: "tool-11", content: { text: "x".repeat(500) } }],
+    }
+    const repeated = await adapter.hook({ ...request(repeatedInput), stepId: "turn:turn-1:step:1" })
+    expect(repeated).toMatchObject({ status: "compacted" })
+    if (repeated.status !== "compacted") return
+    expect(repeated.snapshot.toolObservations).toContainEqual(snapshotMemory)
+  })
+
+  it("does not retain every large non-control event payload as a raw anchor", async () => {
+    const noise = Array.from({ length: 20 }, (_, index) => ({ id: `event:noise-${index}`, content: { payload: "x".repeat(7_000) } }))
+    const input = { ...base, toolObservations: noise }
+    const adapter = createContextSnapshotAdapter({ store: store(), observationCountThreshold: 2, keepRecentObservations: 1 })
+    const result = await adapter.hook(request(input))
+    expect(result).toMatchObject({ status: "compacted" })
+    if (result.status !== "compacted") return
+    expect(result.snapshot.toolObservations.filter(item => item.id.startsWith("event:"))).toHaveLength(1)
+    expect(result.snapshot.toolObservations[0]?.content).toMatchObject({ kind: "context_summary", memory: { eventRefs: expect.arrayContaining([{ id: "event:noise-0" }]) } })
+  })
+
+  it("keeps the runtime snapshot ceiling at 256 KiB", async () => {
+    expect(() => createContextSnapshotAdapter({ store: store(), observationCountThreshold: 2, keepRecentObservations: 1, maxSnapshotBytes: 256 * 1024 + 1 })).toThrow("bound")
+    const oversized = { ...base, toolObservations: Array.from({ length: 600 }, (_, index) => ({ id: `large-${index}`, content: { text: "x".repeat(600) } })) }
+    const adapter = createContextSnapshotAdapter({ store: store(), inputTokenThreshold: 1, observationCountThreshold: Number.MAX_SAFE_INTEGER, keepRecentObservations: 1 })
+    await expect(adapter.hook(request(oversized))).rejects.toThrow("exceeds its bound")
+  })
+
+  it("fails closed on a corrupt persisted idempotency hit instead of compacting again", async () => {
+    const summarizer = vi.fn(() => ({ removed: "should not run" }))
+    const backing = store({ loadByIdempotencyKey: async input => ({ snapshotRef: "corrupt", scope: input.scope, sessionId: input.sessionId, turnId: input.turnId, stepId: input.stepId, idempotencyKey: input.idempotencyKey, snapshot: observations(3) }) })
+    const adapter = createContextSnapshotAdapter({ store: backing, observationCountThreshold: 3, keepRecentObservations: 1, summarizer })
+    await expect(adapter.hook(request(observations(3)))).rejects.toThrow("idempotent snapshot")
+    expect(summarizer).not.toHaveBeenCalled()
+    expect(backing.saved).toHaveLength(0)
+  })
+
+  it("revalidates embedded memory projections on idempotent replay and snapshot load", async () => {
+    const backing = store()
+    const adapter = createContextSnapshotAdapter({ store: backing, observationCountThreshold: 3, keepRecentObservations: 1 })
+    const input = request(observations(3))
+    await adapter.hook(input)
+    const saved = backing.saved[0]!
+    const summaryObservation = saved.snapshot.toolObservations[0]!
+    const summary = summaryObservation.content as Record<string, unknown>
+    const memory = summary.memory as Record<string, unknown>
+    const corruptedSnapshot: StepContextSnapshot = {
+      ...saved.snapshot,
+      toolObservations: [{ ...summaryObservation, content: { ...summary, memory: { ...memory, decisions: null } } }, ...saved.snapshot.toolObservations.slice(1)],
+    }
+    const replayStore = store({ loadByIdempotencyKey: async () => ({ ...saved, snapshot: corruptedSnapshot }), load: async inputValue => ({ snapshot: corruptedSnapshot, scope: inputValue.scope, sessionId: inputValue.sessionId, turnId: inputValue.turnId }) })
+    const replay = createContextSnapshotAdapter({ store: replayStore, observationCountThreshold: 3, keepRecentObservations: 1 })
+    await expect(replay.hook(input)).rejects.toThrow("memory projection")
+    await expect(replay.loadSnapshot({ snapshotRef: "opaque-ref", scope, sessionId: "session-1", turnId: "turn-1" })).resolves.toBeNull()
+  })
+
+  it("fails closed when summarizer or store fails", async () => {
+    const summarizer = vi.fn(() => { throw new Error("summary failure") })
+    const first = createContextSnapshotAdapter({ store: store(), observationCountThreshold: 2, keepRecentObservations: 1, summarizer })
+    await expect(first.hook(request(observations(2)))).rejects.toThrow()
+    const failingStore = store({ save: async () => { throw new Error("store failure") } })
+    const second = createContextSnapshotAdapter({ store: failingStore, observationCountThreshold: 2, keepRecentObservations: 1 })
+    await expect(second.hook(request(observations(2)))).rejects.toThrow()
+    const foreignStore = store({ save: async input => ({ snapshotRef: input.snapshotRef, scope: { userId: "foreign" }, sessionId: input.sessionId, turnId: input.turnId }) })
+    const third = createContextSnapshotAdapter({ store: foreignStore, observationCountThreshold: 2, keepRecentObservations: 1 })
+    await expect(third.hook(request(observations(2)))).rejects.toThrow()
+    const invalidSummary = createContextSnapshotAdapter({ store: store(), observationCountThreshold: 2, keepRecentObservations: 1, summarizer: () => new Date() })
+    await expect(invalidSummary.hook(request(observations(2)))).rejects.toThrow()
+  })
+
+  it("passes scoped loader identity and rejects a foreign response", async () => {
+    const backing = store()
+    const adapter = createContextSnapshotAdapter({ store: backing, observationCountThreshold: 2, keepRecentObservations: 1 })
+    const input = { snapshotRef: "opaque-ref", scope, sessionId: "session-1", turnId: "turn-1" }
+    await expect(adapter.loadSnapshot(input)).resolves.toMatchObject({ scope, sessionId: "session-1", turnId: "turn-1" })
+    const foreign = createContextSnapshotAdapter({ store: store({ load: async request => ({ snapshot: base, scope: request.scope, sessionId: "foreign", turnId: request.turnId }) }), observationCountThreshold: 2, keepRecentObservations: 1 })
+    await expect(foreign.loadSnapshot(input)).resolves.toBeNull()
+  })
+})

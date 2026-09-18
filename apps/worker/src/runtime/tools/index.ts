@@ -4,7 +4,8 @@ import { ToolLifecycle, type ToolLifecycleOptions } from "./lifecycle.js"
 import { createPostgresReadToolDataSource } from "./read-data-source.js"
 import { createReadOnlyTools } from "./read-tools.js"
 import { ToolRegistry } from "./registry.js"
-import { InMemoryToolResultReferenceStore } from "./redaction.js"
+import { createToolResultReferenceRepository } from "./tool-result-reference-repo.js"
+import { createToolResultsReadTool } from "./tool-results-read-tool.js"
 import { ToolRouter } from "./router.js"
 import type { PolicyEngine } from "../policy/index.js"
 import { createCoordinationTools } from "./coordination-tools.js"
@@ -15,6 +16,10 @@ import type { AgentTreeManager } from "../subagents/manager.js"
 import { createGmailTools } from "./gmail-tools.js"
 import type { GmailToolOptions } from "./gmail-types.js"
 import { createWriteTools, type WriteToolOptions } from "./write-tools.js"
+import type { RuntimeToolDefinition } from "./types.js"
+import { createPlanProposalTool, type PlanProposalToolOptions } from "../planning/plan-proposal-tool.js"
+import { createGoalUpdateTool, type GoalUpdateToolOptions } from "../planning/goal-update-tool.js"
+import { derivePlannerCapabilityCatalog } from "../planning/planner-capabilities.js"
 
 export * from "./lifecycle.js"
 export * from "./read-data-source.js"
@@ -34,6 +39,11 @@ export * from "./gmail-types.js"
 export * from "./artifact-tools.js"
 export * from "./application-submit-tool.js"
 export * from "./write-tools.js"
+export * from "./tool-result-reference-repo.js"
+export * from "./tool-result-reference-types.js"
+export * from "./tool-results-read-tool.js"
+export * from "../planning/plan-proposal-tool.js"
+export * from "../planning/goal-update-tool.js"
 export * from "../policy/index.js"
 
 export type WorkerCoordinationOptions = {
@@ -48,15 +58,21 @@ export type WorkerWriteOptions = Omit<WriteToolOptions, "pool">
 
 export function createWorkerToolRuntime(
   pool: pg.Pool,
-  lifecycleOptions: Omit<ToolLifecycleOptions, "references"> & { references?: ToolLifecycleOptions["references"] },
+  lifecycleOptions: ToolLifecycleOptions,
   policy?: PolicyEngine,
   coordination?: WorkerCoordinationOptions,
   gmail?: WorkerGmailOptions,
   artifacts?: WorkerArtifactOptions,
   write?: WorkerWriteOptions,
+  planning?: PlanProposalToolOptions,
+  goalUpdate?: GoalUpdateToolOptions,
 ): { registry: ToolRegistry; router: ToolRouter; references: ToolLifecycleOptions["references"] } {
-  const references = lifecycleOptions.references ?? new InMemoryToolResultReferenceStore()
+  const durableResults = lifecycleOptions.durableResults ?? createToolResultReferenceRepository(pool)
   const definitions = createReadOnlyTools(createPostgresReadToolDataSource(pool))
+  definitions.push(createToolResultsReadTool(durableResults, context => {
+    if (!lifecycleOptions.resolveOwner) throw new Error("tool_result_owner_unavailable")
+    return lifecycleOptions.resolveOwner(context)
+  }) as RuntimeToolDefinition)
   if (coordination) {
     const options: CoordinationRuntimeOptions = {
       manager: coordination.manager,
@@ -69,6 +85,12 @@ export function createWorkerToolRuntime(
   if (artifacts) definitions.push(...createArtifactTools(artifacts.store))
   if (write) definitions.push(...createWriteTools({ pool, ...write }))
   const registry = new ToolRegistry(definitions)
-  const lifecycle = new ToolLifecycle({ ...lifecycleOptions, references })
-  return { registry, router: new ToolRouter(registry, lifecycle, policy), references }
+  if (planning) {
+    const catalog = derivePlannerCapabilityCatalog(registry, undefined, planning.allowedTools, planning.allowedTemplates)
+    const scopedPlanning: PlanProposalToolOptions = { ...planning, allowedTools: catalog.tools, allowedTemplates: catalog.templates }
+    registry.register(createPlanProposalTool(scopedPlanning) as RuntimeToolDefinition)
+    if (goalUpdate) registry.register(createGoalUpdateTool(goalUpdate) as RuntimeToolDefinition)
+  }
+  const lifecycle = new ToolLifecycle({ ...lifecycleOptions, durableResults })
+  return { registry, router: new ToolRouter(registry, lifecycle, policy), references: lifecycleOptions.references }
 }

@@ -9,6 +9,9 @@ export const COMMAND_DISPOSITIONS = [
 
 export type CommandDisposition = (typeof COMMAND_DISPOSITIONS)[number]
 export type InterruptDisposition = "interrupted" | "duplicate"
+export type SessionControlGate = "open" | "user_paused"
+export type SessionControlOperation = "pause" | "resume"
+export type SessionControlDisposition = "applied" | "duplicate" | "noop"
 
 export interface CommandIdentity {
   sessionId: string
@@ -37,6 +40,28 @@ export interface SteerCommand extends CommandIdentity {
 export interface InterruptCommand extends CommandIdentity {
   expectedTurnId: string | null
   expectedRevision?: number | null
+}
+
+export interface RetryCommand extends CommandIdentity {
+  targetTurnId: string
+  expectedRevision?: number | null
+}
+
+export interface PauseCommand extends CommandIdentity {
+  expectedRevision?: number | null
+}
+
+export interface ResumeCommand extends CommandIdentity {
+  expectedRevision?: number | null
+}
+
+export interface SessionControlResult {
+  sessionId: string
+  operation: SessionControlOperation
+  controlGate: SessionControlGate
+  controlRevision: number
+  pausedAt: string | null
+  disposition: SessionControlDisposition
 }
 
 export interface ForkCommand extends CommandIdentity {

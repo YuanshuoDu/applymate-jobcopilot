@@ -37,7 +37,7 @@ export async function runModelStep(
   let continuation: ModelContinuation | null = null
   const calls = new Map<string, TurnEngineToolCall>()
   for await (const event of adapter.stream(request)) consume(event, calls, (value) => { text += value }, (value) => { reasoningSummary += value }, (value) => { finishReason = value }, (value) => { usage = value }, (value) => { continuation = value }, (value) => { provider = value }, (value) => { model = value })
-  if (!finishReason) throw new Error("Model stream completed without a finish reason")
+  if (!finishReason) throw new TurnEngineError("invalid_output", "Model stream completed without a finish reason")
   return { text, reasoningSummary, toolCalls: [...calls.values()], provider, model, finishReason, usage, continuation }
 }
 

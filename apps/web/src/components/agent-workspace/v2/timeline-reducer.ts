@@ -1,6 +1,15 @@
 /** CANONICAL Phase 9 timeline state root — do not duplicate. See #459. */
 
 import { AGENT_STREAM_SCHEMA_VERSION } from '@jobcopilot/agent-protocol'
+import { isApprovalLedgerEventType, parseApprovalLedgerEvent } from './approval-ledger-parser'
+import { createApprovalLedgerState, reduceApprovalLedger, type ApprovalLedgerState } from './approval-ledger-view'
+import { createCognitiveAgendaState, reduceCognitiveAgenda, type TimelineCognitiveAgendaState } from './timeline-cognitive-agenda'
+import { CONTEXT_COMPACTION_EVENT_TYPE, createTimelineContextCompactionState, parseRedactedTimelineContextCompactionEvent, parseTimelineContextCompactionEvent, reduceTimelineContextCompaction, type TimelineContextCompactionState } from './timeline-context-compaction'
+import { isPlanLedgerEventType, parsePlanLedgerEvent } from './plan-ledger-parser'
+import { createPlanLedgerState, reducePlanLedger, type PlanLedgerState } from './plan-ledger-view'
+import { parseQuestionInputItem, parseQuestionTerminalEvent } from './question-input-parser'
+import { emptyTimelineSteeringMarkerState, reduceTimelineSteeringMarkers, STEERING_MARKER_EVENT_TYPE, STEERING_MARKER_MAX_EVENTS, type TimelineSteeringMarkerEvent, type TimelineSteeringMarkerState } from './timeline-steering-markers'
+import { createTimelineSessionControlState, isSessionControlEventCandidate, parseTimelineSessionControl, reduceTimelineSessionControl, type TimelineSessionControlEvent, type TimelineSessionControlState } from './timeline-session-control'
 import { appendFallbackEvent, appendTimelineEvent, buildIndexes, compareItems, integer, isAfter, isRecord, itemFromTimelineEvent, mergeContent, numberOrUndefined, sequence, stringOrNull, timestamp } from './timeline-reducer-utils'
 
 export type TimelineConnection = 'idle' | 'connected' | 'reconnecting'
@@ -58,6 +67,14 @@ export interface TimelineState {
   itemIdsByTaskId: Record<string, string[]>
   processedEventIds: Record<string, true>
   lastSequence: string | null
+  sessionControl: TimelineSessionControlState
+  lifecycleRevision: number
+  cognitiveAgenda: TimelineCognitiveAgendaState
+  planLedger: PlanLedgerState
+  approvalLedger: ApprovalLedgerState
+  contextCompaction: TimelineContextCompactionState
+  steeringMarkers: TimelineSteeringMarkerState
+  steeringMarkerEvents: readonly TimelineSteeringMarkerEvent[]
   connection: TimelineConnection
   snapshotRequired: boolean
 }
@@ -78,7 +95,18 @@ const KNOWN_EVENT_TYPES = new Set([
   'step.started', 'step.completed', 'item.started', 'item.delta', 'item.completed', 'item.failed',
   'input.accepted', 'input.consumed', 'tool_call.started', 'tool_call.completed', 'tool_call.failed',
   'policy.decision', 'approval.requested', 'approval.resolved', 'approval.consumed', 'approval.expired',
-  'question.answered', 'question.cancelled', 'external_action.reserved', 'stream.overflow',
+  'plan.revision', 'plan.command', 'plan.observation',
+  'question.answered', 'question.cancelled', 'external_action.reserved', 'stream.overflow', 'cognitive.agenda', CONTEXT_COMPACTION_EVENT_TYPE, STEERING_MARKER_EVENT_TYPE,
+])
+
+// Status-only events drive supervisor metadata refreshes. Item deltas are
+// intentionally excluded so streamed text does not refetch turns and tasks.
+const LIFECYCLE_EVENT_TYPES = new Set([
+  'turn.started', 'turn.wakeup', 'turn.resumed', 'turn.completed', 'turn.failed',
+  'step.started', 'step.completed', 'item.started', 'item.completed', 'item.failed',
+  'tool_call.started', 'tool_call.completed', 'tool_call.failed',
+  'approval.requested', 'approval.resolved', 'approval.consumed', 'approval.expired',
+  'question.answered', 'question.cancelled', 'external_action.reserved',
 ])
 
 export function createTimelineState(sessionId: string): TimelineState {
@@ -86,7 +114,7 @@ export function createTimelineState(sessionId: string): TimelineState {
     sessionId, events: [], byId: new Map(), byTurnId: new Map(), byToolCallId: new Map(), lastEventId: null,
     transientItems: new Map(), fallbackItems: [],
     itemIds: [], itemsById: {}, itemIdsByTurnId: {}, itemIdsByTaskId: {},
-    processedEventIds: {}, lastSequence: null, connection: 'idle', snapshotRequired: false,
+    processedEventIds: {}, lastSequence: null, sessionControl: createTimelineSessionControlState(), lifecycleRevision: 0, cognitiveAgenda: createCognitiveAgendaState(sessionId), planLedger: createPlanLedgerState(sessionId), approvalLedger: createApprovalLedgerState(sessionId), contextCompaction: createTimelineContextCompactionState(), steeringMarkers: emptyTimelineSteeringMarkerState(), steeringMarkerEvents: [], connection: 'idle', snapshotRequired: false,
   }
 }
 
@@ -132,6 +160,8 @@ export function normalizeTimelineEvent(value: unknown): TimelineEvent | null {
   if (!isRecord(value) || typeof value.id !== 'string' || typeof value.sessionId !== 'string' ||
     typeof value.turnId !== 'string' || typeof value.type !== 'string' ||
     value.schemaVersion !== AGENT_STREAM_SCHEMA_VERSION) return null
+  if (value.type === STEERING_MARKER_EVENT_TYPE && (value.actor !== 'system' || value.itemId !== null)) return null
+  if (value.type === STEERING_MARKER_EVENT_TYPE && Object.keys(value).some(key => !['schemaVersion', 'id', 'sessionId', 'turnId', 'itemId', 'taskId', 'type', 'actor', 'correlationId', 'causationId', 'idempotencyKey', 'sequence', 'payload', 'createdAt', 'kind', 'baseRevision', 'revision'].includes(key))) return null
   const rawKind = value.kind
   if (rawKind !== undefined && rawKind !== 'delta' && rawKind !== 'snapshot') return null
   const kind = rawKind === 'delta' || rawKind === 'snapshot' ? rawKind : undefined
@@ -151,14 +181,28 @@ function reduceItems(state: TimelineState, values: unknown[], source: TimelineIt
   let next = state
   for (const value of values) {
     const item = normalizeTimelineItem(value, source)
-    if (item?.sessionId === state.sessionId) next = upsertItem(next, item, source)
+    if (item?.sessionId !== state.sessionId) continue
+    if (item.type === 'question' && !parseQuestionInputItem(value, state.sessionId)) continue
+    next = upsertItem(next, questionTerminalItem(next, item), source)
   }
   return next
 }
 
 function reduceEvent(state: TimelineState, value: unknown): TimelineState {
+  if (isRecord(value) && value.type === CONTEXT_COMPACTION_EVENT_TYPE) return reduceContextCompactionEvent(state, value)
+  const questionTerminalCandidate = isRecord(value) && (value.type === 'question.answered' || value.type === 'question.cancelled')
+  if (questionTerminalCandidate) return reduceQuestionTerminalEvent(state, value)
+  const approvalCandidate = isRecord(value) && isApprovalLedgerEventType(value.type)
+  if (approvalCandidate) return reduceApprovalEvent(state, value)
+  const planCandidate = isRecord(value) && isPlanLedgerEventType(value.type)
+  if (planCandidate) return reducePlanEvent(state, value)
+  const sessionControl = parseTimelineSessionControl(value, state.sessionId)
+  if (sessionControl) return reduceSessionControlEvent(state, sessionControl)
+  if (isSessionControlEventCandidate(value)) return state
   const event = normalizeTimelineEvent(value)
   if (!event || event.sessionId !== state.sessionId || state.processedEventIds[event.id]) return state
+  const markerState = event.type === STEERING_MARKER_EVENT_TYPE ? reduceMarkerEvent(state, event) : null
+  if (event.type === STEERING_MARKER_EVENT_TYPE && !markerState) return state
   if (event.sequence !== null && !isAfter(event.sequence, state.lastSequence)) return state
   const processedEventIds: Record<string, true> = { ...state.processedEventIds, [event.id]: true }
   let next: TimelineState = {
@@ -166,19 +210,163 @@ function reduceEvent(state: TimelineState, value: unknown): TimelineState {
     processedEventIds,
     lastSequence: event.sequence && isAfter(event.sequence, state.lastSequence) ? event.sequence : state.lastSequence,
   }
-  next = { ...next, ...appendTimelineEvent(next.events, event), lastEventId: event.id }
+  next = {
+    ...next,
+    ...appendTimelineEvent(next.events, event),
+    lastEventId: event.id,
+    lifecycleRevision: LIFECYCLE_EVENT_TYPES.has(event.type) ? state.lifecycleRevision + 1 : state.lifecycleRevision,
+  }
+  if (markerState) {
+    return { ...next, steeringMarkers: markerState.state, steeringMarkerEvents: markerState.events }
+  }
+  if (event.type === 'cognitive.agenda') next = { ...next, cognitiveAgenda: reduceCognitiveAgenda(next.cognitiveAgenda, event) }
   if (event.type === 'stream.overflow') return { ...next, snapshotRequired: true, connection: 'reconnecting' }
   if (event.type === 'item.delta') {
     const existingRevision = state.itemsById[event.itemId ?? '']?.revision ?? 0
     return reduceDelta(next, { ...event, kind: 'delta', revision: event.revision ?? existingRevision + 1 }, event.id)
   }
+  if (event.type === 'item.started' && isRecord(event.payload) && event.payload.waitKind === 'question' && !isRecord(event.payload.item)) return next
   if (!event.itemId) return KNOWN_EVENT_TYPES.has(event.type) ? next : addUnknownEvent(next, event)
   const existing = state.itemsById[event.itemId]
   const status = event.type === 'item.completed' ? 'completed' : event.type === 'item.failed' ? 'failed' : existing?.status ?? 'started'
   if (existing && TERMINAL_STATUSES.has(existing.status) && status !== 'completed') return next
   if (!KNOWN_EVENT_TYPES.has(event.type)) next = { ...next, fallbackItems: appendFallbackEvent(next.fallbackItems, event) }
   const item = itemFromTimelineEvent(event, status, existing, undefined, normalizeTimelineItem)
+  if (item?.type === 'question' && isRecord(event.payload) && !parseQuestionInputItem(event.payload.item ?? event.payload, state.sessionId)) return next
   return item ? upsertItem(next, item, item.source === 'unknown' ? 'unknown' : 'durable') : next
+}
+
+function reduceContextCompactionEvent(state: TimelineState, value: Record<string, unknown>): TimelineState {
+  const parsed = parseTimelineContextCompactionEvent(value, state.sessionId) ??
+    parseRedactedTimelineContextCompactionEvent(value, state.sessionId)
+  if (!parsed || state.processedEventIds[parsed.id]) return state
+  const contextCompaction = reduceTimelineContextCompaction(state.contextCompaction, parsed)
+  const event = normalizeTimelineEvent(value)
+  if (!event || event.sessionId !== state.sessionId) return state
+  return {
+    ...state,
+    processedEventIds: { ...state.processedEventIds, [event.id]: true },
+    lastSequence: event.sequence && isAfter(event.sequence, state.lastSequence) ? event.sequence : state.lastSequence,
+    ...appendTimelineEvent(state.events, event),
+    lastEventId: event.id,
+    contextCompaction,
+  }
+}
+
+function reduceQuestionTerminalEvent(state: TimelineState, value: Record<string, unknown>): TimelineState {
+  const terminal = parseQuestionTerminalEvent(value, state.sessionId)
+  if (!terminal || state.processedEventIds[terminal.id] || !isAfter(terminal.sequence, state.lastSequence)) return state
+  const event = normalizeTimelineEvent(value)
+  if (!event || event.sessionId !== state.sessionId) return state
+  const existing = state.itemsById[terminal.itemId]
+  if (existing && (existing.type !== 'question' || existing.turnId !== terminal.turnId || existing.taskId !== terminal.taskId || !isRecord(existing.content) || existing.content.questionId !== terminal.questionId)) return state
+  if (existing && TERMINAL_STATUSES.has(existing.status) && existing.status !== terminal.status) return state
+  const processedEventIds: Record<string, true> = { ...state.processedEventIds, [event.id]: true }
+  let next: TimelineState = {
+    ...state,
+    processedEventIds,
+    lastSequence: terminal.sequence,
+    ...appendTimelineEvent(state.events, event),
+    lastEventId: event.id,
+    lifecycleRevision: LIFECYCLE_EVENT_TYPES.has(event.type) ? state.lifecycleRevision + 1 : state.lifecycleRevision,
+  }
+  if (!existing) return next
+  const content = isRecord(existing.content)
+    ? { ...existing.content, pending: false, answerAvailable: terminal.status === 'completed', ...(terminal.status === 'interrupted' ? { cancelled: true, cancellationReason: 'interrupt' } : {}) }
+    : existing.content
+  return upsertItem(next, { ...existing, status: terminal.status, content, completedAt: event.createdAt ?? existing.completedAt, updatedAt: event.createdAt ?? existing.updatedAt, sequence: terminal.sequence }, 'durable')
+}
+
+function reduceApprovalEvent(state: TimelineState, value: Record<string, unknown>): TimelineState {
+  const parsed = parseApprovalLedgerEvent(value, state.sessionId)
+  if (!parsed || state.processedEventIds[parsed.id] || !isAfter(parsed.sequence, state.lastSequence)) return state
+  const event = normalizeTimelineEvent(value)
+  if (!event || event.sessionId !== state.sessionId) return state
+  const approvalLedger = reduceApprovalLedger(state.approvalLedger, value)
+  if (approvalLedger === state.approvalLedger) return state
+  const processedEventIds: Record<string, true> = { ...state.processedEventIds, [event.id]: true }
+  return {
+    ...state,
+    processedEventIds,
+    lastSequence: event.sequence && isAfter(event.sequence, state.lastSequence) ? event.sequence : state.lastSequence,
+    ...appendTimelineEvent(state.events, event),
+    lastEventId: event.id,
+    lifecycleRevision: LIFECYCLE_EVENT_TYPES.has(event.type) ? state.lifecycleRevision + 1 : state.lifecycleRevision,
+    approvalLedger,
+  }
+}
+
+function reducePlanEvent(state: TimelineState, value: Record<string, unknown>): TimelineState {
+  const parsed = parsePlanLedgerEvent(value, state.sessionId)
+  if (!parsed || state.processedEventIds[parsed.id] || !isAfter(parsed.sequence, state.lastSequence)) return state
+  const event = normalizeTimelineEvent(value)
+  if (!event || event.sessionId !== state.sessionId) return state
+  const planLedger = reducePlanLedger(state.planLedger, value)
+  if (planLedger === state.planLedger) return state
+  const processedEventIds: Record<string, true> = { ...state.processedEventIds, [event.id]: true }
+  return {
+    ...state,
+    processedEventIds,
+    lastSequence: event.sequence && isAfter(event.sequence, state.lastSequence) ? event.sequence : state.lastSequence,
+    ...appendTimelineEvent(state.events, event),
+    lastEventId: event.id,
+    planLedger,
+  }
+}
+
+function reduceSessionControlEvent(state: TimelineState, event: TimelineSessionControlEvent): TimelineState {
+  if (state.processedEventIds[event.id] || !isAfter(event.sequence, state.lastSequence)) return state
+  return {
+    ...state,
+    processedEventIds: { ...state.processedEventIds, [event.id]: true },
+    lastEventId: event.id,
+    lastSequence: event.sequence,
+    sessionControl: reduceTimelineSessionControl(state.sessionControl, event),
+  }
+}
+
+function reduceMarkerEvent(state: TimelineState, event: TimelineEvent): { state: TimelineSteeringMarkerState; events: readonly TimelineSteeringMarkerEvent[] } | null {
+  if (typeof event.sequence !== 'string' || !/^(0|[1-9]\d*)$/.test(event.sequence) || event.sequence.length > 20) return null
+  const candidate = event as unknown as TimelineSteeringMarkerEvent
+  const combined = [...state.steeringMarkerEvents, candidate]
+  const ordered = [...combined].sort((left, right) => {
+    const leftSequence = BigInt(left.sequence), rightSequence = BigInt(right.sequence)
+    return leftSequence === rightSequence ? left.id.localeCompare(right.id) : leftSequence < rightSequence ? -1 : 1
+  })
+  if (ordered.length <= STEERING_MARKER_MAX_EVENTS) {
+    const reduced = reduceTimelineSteeringMarkers(ordered, { sessionId: state.sessionId })
+    return reduced.valid ? { state: reduced.state, events: ordered } : null
+  }
+  const firstWindow = ordered.length - STEERING_MARKER_MAX_EVENTS
+  for (let offset = firstWindow; offset <= ordered.length; offset += 1) {
+    const events = ordered.slice(offset)
+    const reduced = reduceTimelineSteeringMarkers(events, { sessionId: state.sessionId })
+    if (reduced.valid) return { state: reduced.state, events }
+  }
+  return null
+}
+
+function questionTerminalItem(state: TimelineState, item: TimelineItem): TimelineItem {
+  if (item.type !== 'question' || TERMINAL_STATUSES.has(item.status)) return item
+  const input = parseQuestionInputItem(item, state.sessionId)
+  if (!input) return item
+  for (let index = state.events.length - 1; index >= 0; index -= 1) {
+    const event = state.events[index]
+    if (event.type !== 'question.answered' && event.type !== 'question.cancelled') continue
+    if (event.itemId !== item.id || event.turnId !== item.turnId || event.taskId !== item.taskId) continue
+    const terminal = parseQuestionTerminalEvent(event, state.sessionId)
+    if (!terminal || terminal.questionId !== input.questionId || terminal.turnId !== input.turnId || terminal.taskId !== input.taskId) continue
+    if (item.sequence !== null && !isAtLeast(terminal.sequence, item.sequence)) continue
+    const content = isRecord(item.content)
+      ? { ...item.content, pending: false, answerAvailable: terminal.status === 'completed', ...(terminal.status === 'interrupted' ? { cancelled: true, cancellationReason: 'interrupt' } : {}) }
+      : item.content
+    return { ...item, status: terminal.status, content, completedAt: terminal.createdAt ?? item.completedAt, sequence: terminal.sequence }
+  }
+  return item
+}
+
+function isAtLeast(left: string, right: string): boolean {
+  return left === right || isAfter(left, right)
 }
 
 function reduceDelta(state: TimelineState, value: unknown, preprocessedId?: string): TimelineState {
@@ -235,7 +423,9 @@ function addUnknownEvent(state: TimelineState, event: TimelineEvent): TimelineSt
 
 function upsertItem(state: TimelineState, item: TimelineItem, source: TimelineItemSource, replaceContent = false): TimelineState {
   const existing = state.itemsById[item.id]
+  if (existing && existing.type === 'question' && TERMINAL_STATUSES.has(existing.status) && !TERMINAL_STATUSES.has(item.status)) return state
   if (existing && source === 'transient' && (TERMINAL_STATUSES.has(existing.status) || item.revision <= existing.revision)) return state
+  if (existing && source === 'replay' && isOlderReplay(existing, item)) return state
   if (existing && source === 'durable' && existing.sequence && item.sequence && !isAfter(item.sequence, existing.sequence) && item.status !== 'completed') return state
   const nextItem = source === 'transient' && existing
     ? { ...existing, ...item, content: replaceContent ? item.content : mergeContent(existing.content, item.content), source }
@@ -246,4 +436,19 @@ function upsertItem(state: TimelineState, item: TimelineItem, source: TimelineIt
   if (source === 'transient') transientItems.set(item.id, nextItem)
   else transientItems.delete(item.id)
   return { ...state, itemsById, itemIds, transientItems, ...buildIndexes(itemsById) }
+}
+
+/** Prevent an in-flight snapshot from regressing evidence received from the live stream. */
+function isOlderReplay(existing: TimelineItem, incoming: TimelineItem): boolean {
+  if (existing.sequence && incoming.sequence) {
+    if (isAfter(existing.sequence, incoming.sequence)) return true
+    if (existing.sequence === incoming.sequence) {
+      if (existing.revision > incoming.revision) return true
+      if (TERMINAL_STATUSES.has(existing.status) && !TERMINAL_STATUSES.has(incoming.status)) return true
+      return existing.status === incoming.status
+    }
+    return false
+  }
+  if (existing.revision > incoming.revision) return true
+  return TERMINAL_STATUSES.has(existing.status) && !TERMINAL_STATUSES.has(incoming.status)
 }

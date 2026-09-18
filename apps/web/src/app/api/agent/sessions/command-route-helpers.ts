@@ -28,6 +28,16 @@ export type ParsedForkCommand = {
   editContent?: InputContentPart[]
 }
 
+export type ParsedRetryCommand = {
+  clientMessageId: string
+  expectedRevision: number | null
+}
+
+export type ParsedSessionControlCommand = {
+  clientMessageId: string
+  expectedRevision: number | null
+}
+
 type RecordBody = Record<string, unknown>
 
 function isRecord(value: unknown): value is RecordBody {
@@ -158,6 +168,28 @@ export function parseForkBody(body: unknown, request: Request): ParsedForkComman
   const editContent = body.editContent === undefined ? undefined : parseContent(body.editContent)
   if (!clientMessageId || !lastTurnId || (body.editContent !== undefined && !editContent)) return invalid("Invalid fork command payload")
   return { clientMessageId, lastTurnId, ...(editContent ? { editContent } : {}) }
+}
+
+export function parseRetryBody(body: unknown, request: Request): ParsedRetryCommand | NextResponse {
+  if (!isRecord(body) || !isAllowedKeys(body, ["schemaVersion", "clientMessageId", "expectedRevision"])) {
+    return invalid("Unsupported or forbidden retry field")
+  }
+  if (body.schemaVersion !== undefined && body.schemaVersion !== schemaVersion) return invalid("Unsupported command schema version")
+  const clientMessageId = commandId(body, request)
+  const expectedRevision = optionalRevision(body.expectedRevision)
+  if (!clientMessageId || expectedRevision === undefined) return invalid("Invalid retry command payload")
+  return { clientMessageId, expectedRevision }
+}
+
+export function parseSessionControlBody(body: unknown, request: Request): ParsedSessionControlCommand | NextResponse {
+  if (!isRecord(body) || !isAllowedKeys(body, ["schemaVersion", "clientMessageId", "expectedRevision"])) {
+    return invalid("Unsupported or forbidden session control field")
+  }
+  if (body.schemaVersion !== undefined && body.schemaVersion !== schemaVersion) return invalid("Unsupported command schema version")
+  const clientMessageId = commandId(body, request)
+  const expectedRevision = optionalRevision(body.expectedRevision)
+  if (!clientMessageId || expectedRevision === undefined) return invalid("Invalid session control command payload")
+  return { clientMessageId, expectedRevision }
 }
 
 export async function verifyAttachmentOwnership(

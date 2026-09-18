@@ -80,6 +80,8 @@ export function createPgGmailOAuthWaitPort(pool: PoolLike): GmailOAuthWaitPort {
       try {
         await client.query("BEGIN")
         await client.query("SELECT set_config($1, $2, true)", ["app.user_id", context.scope.userId])
+        const session = await client.query<{ id: string }>(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 AND "status" NOT IN ('aborted', 'archived') FOR UPDATE`, [context.sessionId, context.scope.userId])
+        if (!session.rows[0]) throw new Error("Gmail OAuth wait session is unavailable")
         const turn = await client.query<{ revision: number }>(`SELECT "revision" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "status" = 'in_progress' FOR UPDATE`, [context.turnId, context.sessionId, context.scope.userId])
         if (!turn.rows[0]) throw new Error("Gmail OAuth wait is outside the origin Turn")
         await client.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "type", "status", "phase", "content", "startedAt", "updatedAt") VALUES ($1, $2, $3, $4, 'question', 'started', 'commentary', $5::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, [itemId, context.sessionId, context.turnId, context.stepId, JSON.stringify({ waitKind: "question", oauth: true, waitId, toolCallId: context.toolCallId ?? null, reason: input.reason })])

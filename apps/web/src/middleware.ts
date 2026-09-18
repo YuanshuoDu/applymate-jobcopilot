@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { applyAdminSecurityHeaders } from '@/lib/admin/http-security'
+import { isAgentPreviewRequestAllowed } from '@/lib/agent-preview-access'
 import { adminOrigin, isAdminApiPath, isAdminAuthApiPath, isAdminHost, isAdminInvitationPath, isAdminPath, isAuthPath, isLocalHost } from '@/lib/host-routing'
 
 const PUBLIC_ROUTES = ['/landing', '/login', '/register', '/forgot-password', '/reset-password', '/api/auth']
@@ -54,10 +55,16 @@ export async function middleware(req: NextRequest) {
     return applyAdminSecurityHeaders(NextResponse.json({ error: 'Administrator API is only available on the administrator host' }, { status: 404 }))
   }
 
-  // The visual Agent workspace preview is intentionally available only to a
-  // local non-production developer session. It does not expose account data.
-  if (pathname === '/agent-preview' && isLocalHost(hostname) && process.env.NODE_ENV !== 'production') {
+  // The visual Agent workspace preview is intentionally limited to a local
+  // developer session or an explicitly flagged local production fixture.
+  if (pathname === '/agent-preview' && isAgentPreviewRequestAllowed({
+    environment: { NODE_ENV: process.env.NODE_ENV, AGENT_PREVIEW_FIXTURE: process.env.AGENT_PREVIEW_FIXTURE },
+    hostname, hostHeader: req.headers.get('host'), forwardedHost: req.headers.get('x-forwarded-host'),
+  })) {
     return NextResponse.next()
+  }
+  if (pathname === '/agent-preview' && process.env.NODE_ENV === 'production') {
+    return NextResponse.json({ error: 'Not found' }, { status: 404 })
   }
 
   // Invitation pages must remain reachable after the current account signs

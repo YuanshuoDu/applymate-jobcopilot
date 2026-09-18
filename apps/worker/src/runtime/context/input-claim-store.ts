@@ -1,43 +1,14 @@
 import type pg from "pg"
 import type { InputContentPart, TenantScope } from "@jobcopilot/agent-protocol"
-
-export type StepCheckpoint = {
-  readonly inputThroughSequence: bigint
-  readonly consumedInputIds: readonly string[]
-}
-export type TurnExecutionFence = { readonly ownerId: string; readonly leaseVersion: number; readonly now: Date }
-export type StoredAgentInput = {
-  readonly id: string
-  readonly sessionId: string
-  readonly targetTurnId: string | null
-  readonly userId: string
-  readonly clientMessageId: string
-  readonly delivery: "steer" | "follow_up"
-  readonly status: "accepted" | "queued" | "consumed" | "cancelled" | "rejected"
-  readonly content: readonly InputContentPart[]
-  readonly acceptedSequence: bigint
-  readonly consumedByStepId: string | null
-  readonly consumedAt: Date | null
-  readonly createdAt: Date
-}
-export type ClaimInputsRequest = {
-  readonly sessionId: string
-  readonly turnId: string
-  readonly stepId: string
-  readonly checkpoint: StepCheckpoint
-  readonly mode?: "new" | "retry" | "rebuild"
-  readonly rebuild?: boolean
-  readonly lease?: TurnExecutionFence
-  readonly now: Date
-}
-export type ClaimedInputs = {
-  readonly inputs: readonly StoredAgentInput[]
-  readonly newlyClaimedInputIds: readonly string[]
-}
+import { persistObservedSteeringMarker, type SteeringMarkerWrite } from "./steering-marker-store.js"
+import type { ClaimInputsRequest, ClaimedInputs, StepCheckpoint, StoredAgentInput, TurnExecutionFence } from "./input-claim-types.js"
+export type { ClaimInputsRequest, ClaimedInputs, StepCheckpoint, StoredAgentInput, TurnExecutionFence } from "./input-claim-types.js"
 export interface InputClaimTransaction {
   getCheckpoint(input: { sessionId: string; turnId: string; stepId: string; lease?: TurnExecutionFence }): Promise<StepCheckpoint>
   claimInputs(input: ClaimInputsRequest): Promise<ClaimedInputs>
+  loadActiveSteeringInputs?(input: { sessionId: string; turnId: string; inputIds: readonly string[]; lease?: TurnExecutionFence }): Promise<readonly StoredAgentInput[]>
   persistCheckpoint(input: { sessionId: string; turnId: string; stepId: string; checkpoint: StepCheckpoint; lease?: TurnExecutionFence }): Promise<void>
+  appendObservedSteeringMarker?(input: SteeringMarkerWrite): Promise<void>
 }
 export interface InputClaimStore {
   readonly scope: TenantScope
@@ -45,7 +16,6 @@ export interface InputClaimStore {
 }
 export class InputClaimStoreError extends Error {
   readonly recoverable = false
-
   constructor(readonly code: "owner_conflict" | "checkpoint_conflict" | "store_conflict", message: string) {
     super(message)
     this.name = "InputClaimStoreError"
@@ -126,6 +96,15 @@ function checkpoint(row: CheckpointRow): StepCheckpoint {
   return { inputThroughSequence, consumedInputIds: ids }
 }
 async function assertOwner(client: QueryClient, scope: TenantScope, input: { sessionId: string; turnId: string }, lease?: TurnExecutionFence): Promise<void> {
+  const session = await client.query(
+    `SELECT "id"
+     FROM "agent_sessions"
+     WHERE "id" = $1 AND "userId" = $2
+       AND "status" NOT IN ('aborted', 'archived')
+     FOR UPDATE`,
+    [input.sessionId, scope.userId],
+  )
+  if (!session.rows[0]) throw new InputClaimStoreError("owner_conflict", `Session ${input.sessionId} is outside the tenant scope`)
   const result = await client.query(
     `SELECT turn."id"
      FROM "agent_turns" AS turn
@@ -139,7 +118,6 @@ async function assertOwner(client: QueryClient, scope: TenantScope, input: { ses
   )
   if (!result.rows[0]) throw new InputClaimStoreError("owner_conflict", `Turn ${input.turnId} is outside the tenant scope`)
 }
-
 function inputSql(): string {
   return `SELECT "id", "sessionId", "targetTurnId", "userId", "clientMessageId",
                  "delivery", "status", "content", "acceptedSequence", "consumedByStepId",
@@ -151,11 +129,9 @@ function inputSql(): string {
           ORDER BY "acceptedSequence" ASC, "id" ASC
           FOR UPDATE`
 }
-
 function sortInputs(inputs: StoredAgentInput[]): StoredAgentInput[] {
   return inputs.sort((left, right) => left.acceptedSequence < right.acceptedSequence ? -1 : left.acceptedSequence > right.acceptedSequence ? 1 : left.id.localeCompare(right.id))
 }
-
 function createTransaction(client: QueryClient, scope: TenantScope): InputClaimTransaction {
   return {
     async getCheckpoint(input) {
@@ -169,7 +145,6 @@ function createTransaction(client: QueryClient, scope: TenantScope): InputClaimT
       if (!result.rows[0]) throw new InputClaimStoreError("checkpoint_conflict", `Step ${input.stepId} is not owned by the Turn`)
       return checkpoint(result.rows[0])
     },
-
     async claimInputs(input) {
       await assertOwner(client, scope, input, input.lease)
       const existing = await client.query<InputRow>(inputSql(), [input.sessionId, input.turnId, scope.userId, input.stepId, [...input.checkpoint.consumedInputIds]])
@@ -183,7 +158,6 @@ function createTransaction(client: QueryClient, scope: TenantScope): InputClaimT
       if ((input.mode ?? (input.rebuild ? "rebuild" : "new")) !== "new") {
         return { inputs: existingInputs, newlyClaimedInputIds: [] }
       }
-
       const claimed = await client.query<InputRow>(
         `WITH candidates AS (
            SELECT "id"
@@ -211,7 +185,28 @@ function createTransaction(client: QueryClient, scope: TenantScope): InputClaimT
         newlyClaimedInputIds: newlyClaimed.map((item) => item.id),
       }
     },
-
+    async loadActiveSteeringInputs(input) {
+      await assertOwner(client, scope, input, input.lease)
+      if (input.inputIds.length === 0) return []
+      if (input.inputIds.length > 128 || input.inputIds.some(id => typeof id !== "string" || id.trim() !== id || id.length === 0) || new Set(input.inputIds).size !== input.inputIds.length) throw new InputClaimStoreError("store_conflict", "Active steering marker input IDs are invalid")
+      const result = await client.query<InputRow>(
+        `SELECT "id", "sessionId", "targetTurnId", "userId", "clientMessageId",
+                "delivery", "status", "content", "acceptedSequence", "consumedByStepId",
+                "consumedAt", "createdAt"
+         FROM "agent_inputs"
+         WHERE "sessionId" = $1 AND "targetTurnId" = $2 AND "userId" = $3
+           AND "delivery" = 'steer' AND "id" = ANY($4::text[])
+           AND "status" IN ('accepted', 'queued', 'consumed')
+         ORDER BY "acceptedSequence" ASC, "id" ASC
+         FOR SHARE`,
+        [input.sessionId, input.turnId, scope.userId, [...input.inputIds]],
+      )
+      const inputs = sortInputs(result.rows.map(mapInput))
+      if (inputs.length !== new Set(input.inputIds).size || inputs.some((item) => item.sessionId !== input.sessionId || item.targetTurnId !== input.turnId || item.userId !== scope.userId || item.delivery !== "steer")) {
+        throw new InputClaimStoreError("owner_conflict", "Active steering marker input is outside the tenant Turn")
+      }
+      return inputs
+    },
     async persistCheckpoint(input) {
       await assertOwner(client, scope, input, input.lease)
       const result = await client.query(
@@ -222,9 +217,12 @@ function createTransaction(client: QueryClient, scope: TenantScope): InputClaimT
       )
       if (result.rowCount !== 1) throw new InputClaimStoreError("checkpoint_conflict", `Step ${input.stepId} checkpoint was not persisted`)
     },
+    async appendObservedSteeringMarker(input) {
+      await assertOwner(client, scope, input, input.lease)
+      await persistObservedSteeringMarker(client, { userId: scope.userId, sessionId: input.sessionId, turnId: input.turnId, taskId: input.taskId, lease: input.lease ? { ownerId: input.lease.ownerId, now: input.lease.now } : undefined }, input)
+    },
   }
 }
-
 export function createPgInputClaimStore(pool: Pick<pg.Pool, "connect">, scope: TenantScope): InputClaimStore {
   const boundScope = Object.freeze({ userId: scope.userId })
   return {

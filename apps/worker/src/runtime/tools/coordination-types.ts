@@ -6,7 +6,12 @@ export type CoordinationTaskView = Pick<SubagentTaskRecord,
   "id" | "userId" | "sessionId" | "turnId" | "rootTaskId" | "parentTaskId" | "path" | "depth" |
   "role" | "taskType" | "status" | "goal" | "attemptCount" | "maxAttempts" | "leaseOwner" |
   "leaseExpiresAt" | "interruptRequestedAt"
->
+> & {
+  /** Optional server-read evidence; never accepted from model tool input. */
+  readonly context?: unknown | null
+  readonly result?: unknown | null
+  readonly failureReason?: string | null
+}
 
 export type CoordinationMessage = {
   readonly id: string
@@ -17,6 +22,24 @@ export type CoordinationMessage = {
   readonly kind: string
   readonly idempotencyKey: string
   readonly createdAt: Date
+}
+
+/** Durable mailbox state returned by the server-owned pending-read seam. */
+export type CoordinationMailboxMessage = CoordinationMessage & {
+  readonly payload: unknown
+  readonly deliveredAt: Date | null
+  readonly consumedAt: Date | null
+}
+
+export type CoordinationMailboxConsumeResult = {
+  readonly messageIds: readonly string[]
+  readonly count: number
+}
+
+export type CoordinationMailboxOwnerFence = {
+  readonly ownerId: string
+  readonly attemptCount: number
+  readonly now: Date
 }
 
 export interface CoordinationStore {
@@ -32,6 +55,20 @@ export interface CoordinationStore {
     payload: unknown
     idempotencyKey: string
   }): Promise<{ message: CoordinationMessage; duplicate: boolean }>
+  /** Optional server-owned mailbox read/consume seam for durable child-context wiring. */
+  listPendingMessages?(input: {
+    userId: string
+    sessionId: string
+    toTaskId: string
+    limit?: number
+  }): Promise<CoordinationMailboxMessage[]>
+  consumeMessages?(input: {
+    userId: string
+    sessionId: string
+    toTaskId: string
+    messageIds: readonly string[]
+    owner: CoordinationMailboxOwnerFence
+  }): Promise<CoordinationMailboxConsumeResult>
   getSpawnReplay(input: { userId: string; sessionId: string; idempotencyKey: string }): Promise<CoordinationTaskView | null>
   /** Records the operation and dispatches the task atomically. */
   recordSpawn(input: { userId: string; sessionId: string; idempotencyKey: string; task: CoordinationTaskView }): Promise<boolean>

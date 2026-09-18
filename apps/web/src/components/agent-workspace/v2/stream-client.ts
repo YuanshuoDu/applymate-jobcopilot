@@ -1,10 +1,19 @@
 /** CANONICAL Phase 9 timeline state root — do not duplicate. See #459. */
 
+import { isSessionControlEventCandidate, parseTimelineSessionControl } from './timeline-session-control'
 import { normalizeTimelineEvent, type TimelineAction } from './timeline-reducer'
+import { createQuestionHydrationPump, filterQuestionHydrationValues } from './question-hydration'
+import { CONTEXT_COMPACTION_EVENT_TYPE } from './timeline-context-compaction'
 
 interface TimelinePageResponse {
   items?: unknown[]
   page?: { hasMore?: boolean; nextCursor?: string | null }
+  agenda?: unknown
+  agendas?: unknown[]
+  steeringMarkers?: unknown[]
+  planEvents?: unknown[]
+  approvalEvents?: unknown[]
+  compactionEvents?: unknown[]
 }
 
 export interface TimelineStreamClientOptions {
@@ -20,12 +29,22 @@ export interface TimelineStreamClientOptions {
 
 const DEFAULT_RETRY_DELAY_MS = 250
 const DEFAULT_PAGE_SIZE = 100
+type TimelineHydrationOptions = Pick<TimelineStreamClientOptions, 'sessionId' | 'dispatch' | 'signal' | 'fetcher' | 'pageSize'> & {
+  targetItemIds?: readonly string[]
+}
 
 /** Hydrates the canonical item projection before a live stream is attached. */
-export async function hydrateTimeline(options: Pick<TimelineStreamClientOptions, 'sessionId' | 'dispatch' | 'signal' | 'fetcher' | 'pageSize'>): Promise<void> {
+export async function hydrateTimeline(options: TimelineHydrationOptions): Promise<void> {
   const fetcher = options.fetcher ?? fetch
   const items: unknown[] = []
+  let agenda: unknown = undefined
+  let agendas: unknown[] | undefined
+  let steeringMarkers: unknown[] | undefined
+  let planEvents: unknown[] | undefined
+  let approvalEvents: unknown[] | undefined
+  let compactionEvents: unknown[] | undefined
   let cursor: string | null = null
+  const targetItemIds = options.targetItemIds?.length ? new Set(options.targetItemIds) : null
   do {
     const query = new URLSearchParams({ limit: String(options.pageSize ?? DEFAULT_PAGE_SIZE) })
     if (cursor) query.set('cursor', cursor)
@@ -33,9 +52,26 @@ export async function hydrateTimeline(options: Pick<TimelineStreamClientOptions,
     if (!response.ok) throw new Error(`Timeline restore failed (${response.status})`)
     const page = await response.json() as TimelinePageResponse
     if (Array.isArray(page.items)) items.push(...page.items)
-    cursor = page.page?.hasMore === true && typeof page.page.nextCursor === 'string' ? page.page.nextCursor : null
+    if (cursor === null && page.agenda !== undefined && page.agenda !== null) agenda = page.agenda
+    if (cursor === null && Array.isArray(page.agendas)) agendas = page.agendas
+    if (cursor === null && Array.isArray(page.steeringMarkers)) steeringMarkers = page.steeringMarkers
+    if (cursor === null && Array.isArray(page.planEvents)) planEvents = page.planEvents
+    if (cursor === null && Array.isArray(page.approvalEvents)) approvalEvents = page.approvalEvents
+    if (cursor === null && Array.isArray(page.compactionEvents)) compactionEvents = page.compactionEvents
+    const sessionItems = filterQuestionHydrationValues(items, options.sessionId)
+    const targetFound = targetItemIds !== null && hasAllTargetItems(sessionItems, targetItemIds)
+    cursor = !targetFound && page.page?.hasMore === true && typeof page.page.nextCursor === 'string' ? page.page.nextCursor : null
   } while (cursor && !options.signal?.aborted)
-  options.dispatch({ type: 'hydrate', items })
+  if (options.signal?.aborted) return
+  const agendaTail = agendas ?? (agenda === undefined || agenda === null ? [] : [agenda])
+  const tail = [...agendaTail, ...(steeringMarkers ?? []), ...(planEvents ?? [])]
+    .concat(approvalEvents ?? [])
+    .concat(compactionEvents ?? [])
+    .filter(value => filterQuestionHydrationValues([value], options.sessionId).length > 0)
+    .filter((value): value is unknown => value !== undefined && value !== null)
+    .sort(compareTailEvents)
+  const sessionItems = filterQuestionHydrationValues(items, options.sessionId)
+  options.dispatch(tail.length === 0 ? { type: 'hydrate', items: sessionItems } : { type: 'hydrate', items: sessionItems, tail })
 }
 
 /** Attaches one reconnecting V2 SSE consumer to the same reducer used by replay. */
@@ -45,10 +81,16 @@ export async function streamAgentTimeline(options: TimelineStreamClientOptions):
   let afterSequence = BigInt(0)
   let selectedV2 = false
   let connected = false
+  const questionHydration = createQuestionHydrationPump({
+    sessionId: options.sessionId,
+    signal: options.signal,
+    hydrate: targetItemIds => hydrateTimeline({ ...options, targetItemIds }),
+  })
 
   await hydrateTimeline(options)
 
   while (!options.signal?.aborted) {
+    questionHydration.pump()
     const path = `/api/agent/sessions/${encodeURIComponent(options.sessionId)}/events`
     const url = selectedV2 ? `${path}?afterSequence=${afterSequence.toString()}` : path
     let response: Response
@@ -89,6 +131,14 @@ export async function streamAgentTimeline(options: TimelineStreamClientOptions):
     let snapshotRequired = false
     try {
       await readSseBody(response.body, frame => {
+        const control = parseTimelineSessionControl(frame.data, options.sessionId)
+        if (control) {
+          if (BigInt(control.sequence) <= afterSequence) return
+          afterSequence = BigInt(control.sequence)
+          options.dispatch({ type: 'event', event: frame.data })
+          return
+        }
+        if (isSessionControlEventCandidate(frame.data)) return
         const event = normalizeTimelineEvent(frame.data)
         if (!event || event.sessionId !== options.sessionId) return
         if (event.sequence !== null) {
@@ -100,12 +150,15 @@ export async function streamAgentTimeline(options: TimelineStreamClientOptions):
           snapshotRequired = true
           options.dispatch({ type: 'snapshot-required' })
         } else {
-          options.dispatch(event.kind ? { type: 'delta', delta: event } : { type: 'event', event })
+          const canonicalEvent = event.type === CONTEXT_COMPACTION_EVENT_TYPE ? frame.data : event
+          options.dispatch(event.kind ? { type: 'delta', delta: event } : { type: 'event', event: canonicalEvent })
+          questionHydration.request(frame.data)
         }
       }, options.signal)
     } finally {
       ended = true
     }
+    while (questionHydration.current()) await questionHydration.current()
     if (snapshotRequired && !options.signal?.aborted) await hydrateTimeline(options)
     if (ended && !options.signal?.aborted) {
       connected = false
@@ -117,6 +170,39 @@ export async function streamAgentTimeline(options: TimelineStreamClientOptions):
 
 function isEventStream(response: Response): boolean {
   return response.headers.get('content-type')?.toLowerCase().includes('text/event-stream') === true
+}
+
+function compareTailEvents(left: unknown, right: unknown): number {
+  const leftSequence = tailSequence(left)
+  const rightSequence = tailSequence(right)
+  if (leftSequence !== null && rightSequence !== null) {
+    const bySequence = BigInt(leftSequence) < BigInt(rightSequence) ? -1 : BigInt(leftSequence) > BigInt(rightSequence) ? 1 : 0
+    if (bySequence !== 0) return bySequence
+  } else if (leftSequence !== null) return -1
+  else if (rightSequence !== null) return 1
+  return tailId(left).localeCompare(tailId(right))
+}
+
+function tailSequence(value: unknown): string | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const sequence = (value as { sequence?: unknown }).sequence
+  return typeof sequence === 'string' && /^(0|[1-9]\d*)$/.test(sequence) && sequence.length <= 39 ? sequence : null
+}
+
+function tailId(value: unknown): string {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return ''
+  const id = (value as { id?: unknown }).id
+  return typeof id === 'string' ? id : ''
+}
+
+function hasAllTargetItems(items: readonly unknown[], targetItemIds: ReadonlySet<string>): boolean {
+  const found = new Set<string>()
+  for (const item of items) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue
+    const id = (item as { id?: unknown }).id
+    if (typeof id === 'string' && targetItemIds.has(id)) found.add(id)
+  }
+  return found.size === targetItemIds.size
 }
 
 interface SseFrame { event: string; id: string | null; data: unknown }

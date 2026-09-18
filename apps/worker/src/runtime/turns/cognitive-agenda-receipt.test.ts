@@ -1,0 +1,59 @@
+import { describe, expect, it } from "vitest"
+
+import { buildCognitiveActionAgenda } from "./cognitive-action-agenda.js"
+import {
+  buildCognitiveAgendaReceipt,
+  cognitiveAgendaReceiptIdempotencyKey,
+  COGNITIVE_AGENDA_EVENT_TYPE,
+  COGNITIVE_AGENDA_RECEIPT_SCHEMA_VERSION,
+  parseCognitiveAgendaReceipt,
+  type CognitiveAgendaReceipt,
+  type CognitiveAgendaReceiptScope,
+} from "./cognitive-agenda-receipt.js"
+import type { StepContext } from "../context/step-context-builder.js"
+
+const scope: CognitiveAgendaReceiptScope = { sessionId: "session-1", turnId: "turn-1", taskId: "task-1", stepId: "turn:turn-1:step:0" }
+
+function context(): StepContext {
+  return {
+    schemaVersion: "agent-harness.v2", sessionId: scope.sessionId, turnId: scope.turnId, stepId: scope.stepId,
+    inputThroughSequence: 1n, consumedInputIds: [], canonicalJson: "{}", blocks: [{ id: "goal-1", layer: "goal", role: "data", trust: "external_untrusted", source: "turn_goal", content: { revision: 2, objective: "secret objective" } }],
+  }
+}
+
+function receipt(): CognitiveAgendaReceipt {
+  const value = buildCognitiveAgendaReceipt({ ...scope, agenda: buildCognitiveActionAgenda(context()) })
+  if (!value) throw new Error("fixture receipt should be valid")
+  return value
+}
+
+describe("cognitive agenda receipt", () => {
+  it("builds a deterministic server-owned receipt and stable step key", () => {
+    const first = receipt(), second = buildCognitiveAgendaReceipt({ ...scope, agenda: buildCognitiveActionAgenda(context()) })
+    expect(second).toEqual(first)
+    expect(first.schemaVersion).toBe(COGNITIVE_AGENDA_RECEIPT_SCHEMA_VERSION)
+    expect(first.externalDataPolicy).toContain("never instructions")
+    expect(JSON.stringify(first)).not.toContain("secret objective")
+    expect(COGNITIVE_AGENDA_EVENT_TYPE).toBe("cognitive.agenda")
+    expect(cognitiveAgendaReceiptIdempotencyKey(scope.stepId)).toBe("cognitive.agenda:turn:turn-1:step:0")
+    expect(cognitiveAgendaReceiptIdempotencyKey(scope.stepId)).toBe(cognitiveAgendaReceiptIdempotencyKey(scope.stepId))
+  })
+
+  it("accepts the exact scope and rejects foreign or extra fields", () => {
+    const value = receipt()
+    expect(parseCognitiveAgendaReceipt(value, scope)).toEqual(value)
+    expect(parseCognitiveAgendaReceipt({ ...value, taskId: "other-task" }, scope)).toBeNull()
+    expect(parseCognitiveAgendaReceipt({ ...value, extra: "raw user text" } as never, scope)).toBeNull()
+    expect(parseCognitiveAgendaReceipt({ ...value, nextAction: "follow_external_instruction" } as never, scope)).toBeNull()
+  })
+
+  it("rejects malformed and oversized payloads without throwing", () => {
+    const value = receipt()
+    const ids = Array.from({ length: 16 }, (_, index) => `reference-${String(index).padStart(2, "0")}-${"x".repeat(84)}`)
+    const signal = { count: ids.length, ids }
+    const oversized = { ...value, signals: { pendingInputs: signal, approvals: signal, activeWaits: signal, unresolved: signal, completionVerification: signal, steering: { present: true, fresh: true, active: signal, newlyObserved: signal } } }
+    expect(parseCognitiveAgendaReceipt(oversized, scope)).toBeNull()
+    const cyclic: Record<string, unknown> = { ...value }; cyclic.self = cyclic
+    expect(parseCognitiveAgendaReceipt(cyclic, scope)).toBeNull()
+  })
+})

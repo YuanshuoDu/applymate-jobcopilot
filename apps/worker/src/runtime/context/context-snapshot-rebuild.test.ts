@@ -7,7 +7,7 @@ import type { ContextSnapshotSourceData } from "./context-snapshot-types.js"
 
 const scope: TenantScope = { userId: "user-a" }
 
-async function makeSnapshot(ownerId = "user-a", includeReference = true) {
+async function makeSnapshot(ownerId = "user-a", includeReference = true, overrides: Partial<ContextSnapshotSourceData> = {}) {
   const source: ContextSnapshotSourceData = {
     goal: "Rebuild this step",
     userConstraints: [],
@@ -27,6 +27,7 @@ async function makeSnapshot(ownerId = "user-a", includeReference = true) {
       steerHistory: [{ id: "history-1", content: "Keep Dublin" }],
       toolObservations: [{ id: "tool-1", content: { status: "ready" } }],
     },
+    ...overrides,
   }
   return new AgentContextSnapshotBuilder(
     { load: vi.fn(async () => source) },
@@ -53,5 +54,37 @@ describe("context snapshot Step rebuild", () => {
   it("rejects an owner mismatch even when the snapshot has no references", async () => {
     const snapshot = await makeSnapshot("user-a", false)
     await expect(rebuildStepFromSnapshot(snapshot, { scope: { userId: "user-b" }, turnId: "turn-a", stepId: "step-a" })).rejects.toMatchObject({ code: "reference_cross_tenant" })
+  })
+
+  it("rehydrates canonical memory that is not duplicated in context seeds", async () => {
+    const snapshot = await makeSnapshot("user-a", false, {
+      userConstraints: ["EU only"],
+      confirmedDecisions: [{ id: "decision-1", decision: "Review before submit", evidenceEventIds: ["event-1"] }],
+      completedWork: [{ taskId: "task-done", resultRef: "result-1", summary: "Scouted roles" }],
+      openWork: [{ taskId: "task-open", status: "waiting", blocker: "approval" }],
+      pendingApprovals: ["approval-1"],
+      artifacts: [{ id: "artifact-1", type: "resume", hash: "hash-1" }],
+      facts: [{ factId: "fact-1", key: "location", source: "user-confirmed" }],
+      failedAttempts: [{ taskId: "task-failed", reason: "provider timeout", doNotRepeat: ["same request"] }],
+      context: { system: [], profile: [], steerHistory: [], toolObservations: [] },
+    })
+    const rebuilt = await rebuildStepFromSnapshot(snapshot, { scope, turnId: "turn-a", stepId: "step-a" })
+    const memory = rebuilt.blocks.find((block) => block.id === "observation:context-snapshot-memory")
+
+    expect(memory).toMatchObject({
+      layer: "tool_observation",
+      role: "data",
+      trust: "external_untrusted",
+      content: {
+        kind: "context_snapshot_memory",
+        goal: "Rebuild this step",
+        userConstraints: ["EU only"],
+        pendingApprovals: ["approval-1"],
+        openWork: [{ taskId: "task-open", status: "waiting", blocker: "approval" }],
+        confirmedDecisions: [{ id: "decision-1", evidenceEventIds: ["event-1"] }],
+        artifacts: [{ id: "artifact-1", hash: "hash-1" }],
+      },
+    })
+    expect(rebuilt).toEqual(await rebuildStepFromSnapshot(snapshot, { scope, turnId: "turn-a", stepId: "step-a" }))
   })
 })

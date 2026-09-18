@@ -99,6 +99,7 @@ model User {
   agentRuns                   AgentRun[]
   agentExecutions             AgentExecution[]
   agentSessions               AgentSession[]
+  agentSessionControls        AgentSessionControl[]
   agentApprovals              AgentApproval[]
   agentActionReservations     AgentActionReservation[]
   agentTurns                  AgentTurn[]
@@ -129,6 +130,11 @@ model User {
   adminWebAuthnChallenges     AdminWebAuthnChallenge[]
   adminReauthGrants           AdminReauthGrant[]
   supportCases                SupportCase[]                @relation("SupportRequester")
+  agentToolResultReferences   AgentToolResultReference[]
+  agentWaitConditions         AgentWaitCondition[]
+  agentTreeBudgetReservations AgentTreeBudgetReservation[]
+  agentContextCompactionSnapshots AgentContextCompactionSnapshot[]
+  agentMailboxHydrationCheckpoints AgentMailboxHydrationCheckpoint[]
   planChanges                 UserPlanChange[]
   planSubscription            UserPlanSubscription?
   featureOverrides            UserFeatureOverride[]
@@ -1846,6 +1852,9 @@ model AgentSession {
   goal          String    @db.Text
   status        String
   source        String
+  controlGate   String    @default("open")
+  controlRevision Int      @default(0)
+  pausedAt      DateTime?
   memorySummary String    @default("") @db.Text
   qualityScore  Float?
   currentTaskId String?
@@ -1865,16 +1874,45 @@ model AgentSession {
   turns              AgentTurn[]
   steps              AgentStep[]
   contextSnapshots AgentContextSnapshot[]
+  contextCompactionSnapshots AgentContextCompactionSnapshot[]
   inputs             AgentInput[]
   items              AgentItem[]
   events             AgentEvent[]
+  toolResultReferences AgentToolResultReference[]
+  waitConditions     AgentWaitCondition[]
+  treeBudgetReservations AgentTreeBudgetReservation[]
+  mailboxHydrationCheckpoints AgentMailboxHydrationCheckpoint[]
   execution          AgentExecution?
   automation         AgentAutomation?
+  controlOperations  AgentSessionControl[]
 
   @@index([userId, createdAt(sort: Desc)])
   @@index([userId, lastViewedAt(sort: Desc)])
   @@index([userId, status])
+  @@unique([id, userId])
   @@map("agent_sessions")
+}
+
+model AgentSessionControl {
+  id              String   @id @default(cuid())
+  sessionId       String
+  userId          String
+  clientMessageId String
+  operation       String
+  fingerprint     String   @db.Text
+  previousGate    String
+  nextGate        String
+  controlRevision Int
+  pausedAt        DateTime?
+  createdAt       DateTime @default(now())
+
+  session AgentSession @relation(fields: [sessionId, userId], references: [id, userId], onDelete: Cascade)
+  user    User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([sessionId, clientMessageId])
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([sessionId, createdAt(sort: Desc)])
+  @@map("agent_session_controls")
 }
 
 // Harness 2.0 durable Turn boundary. Active root serialization is enforced
@@ -1917,11 +1955,17 @@ model AgentTurn {
   approvals       AgentApproval[]
   subAgentTasks   SubAgentTask[]
   mailboxMessages AgentMailboxMessage[]
+  toolResultReferences AgentToolResultReference[] @relation("AgentToolResultReferenceTurn")
+  waitConditions AgentWaitCondition[] @relation("AgentWaitConditionTurn")
+  treeBudgetReservations AgentTreeBudgetReservation[] @relation("AgentTreeBudgetReservationTurn")
+  contextCompactionSnapshots AgentContextCompactionSnapshot[]
+  mailboxHydrationCheckpoints AgentMailboxHydrationCheckpoint[]
 
   @@index([sessionId, createdAt])
   @@index([userId, status, updatedAt(sort: Desc)])
   @@index([status, leaseExpiresAt])
   @@unique([id, sessionId])
+  @@unique([id, sessionId, userId])
   @@map("agent_turns")
 }
 
@@ -1956,10 +2000,16 @@ model AgentStep {
   childSteps     AgentStep[]  @relation("AgentStepRepairChain")
   consumedInputs AgentInput[] @relation("AgentStepConsumedInputs")
   items          AgentItem[]
+  toolResultReferences AgentToolResultReference[] @relation("AgentToolResultReferenceStep")
+  waitConditions AgentWaitCondition[] @relation("AgentWaitConditionStep")
+  treeBudgetReservations AgentTreeBudgetReservation[]
+  contextCompactionSnapshots AgentContextCompactionSnapshot[]
+  mailboxHydrationCheckpoints AgentMailboxHydrationCheckpoint[]
 
   @@unique([turnId, ordinal, attempt])
   @@index([turnId, status, createdAt])
   @@index([providerResponseId])
+  @@unique([id, turnId, sessionId])
   @@map("agent_steps")
 }
 
@@ -1988,6 +2038,32 @@ model AgentContextSnapshot {
   @@index([sessionId, createdAt(sort: Desc)])
   @@index([sessionId, throughSequence])
   @@map("agent_context_snapshots")
+}
+
+// Immutable context-compaction snapshots keyed by the complete step
+// idempotency identity. This separate model is the opt-in adapter storage for
+// P3-22 and does not alter the sequence-based context snapshot domain above.
+model AgentContextCompactionSnapshot {
+  id             String   @id @default(cuid())
+  userId         String
+  sessionId      String
+  turnId         String
+  stepId         String
+  idempotencyKey String
+  snapshotRef    String   @unique
+  snapshot       Json
+  byteCount      Int
+  createdAt      DateTime @default(now())
+
+  user    User        @relation(fields: [userId], references: [id], onDelete: Cascade, map: "agent_context_compaction_snapshots_userId_fkey")
+  session AgentSession @relation(fields: [sessionId, userId], references: [id, userId], onDelete: Cascade, map: "agent_context_compaction_snapshots_sessionId_fkey")
+  turn    AgentTurn   @relation(fields: [turnId, sessionId, userId], references: [id, sessionId, userId], onDelete: Cascade, map: "agent_context_compaction_snapshots_turnId_fkey")
+  step    AgentStep   @relation(fields: [stepId, turnId, sessionId], references: [id, turnId, sessionId], onDelete: Cascade, map: "agent_context_compaction_snapshots_stepId_fkey")
+
+  @@unique([userId, sessionId, turnId, stepId, idempotencyKey])
+  @@index([userId, sessionId, turnId, stepId])
+  @@index([sessionId, turnId, createdAt(sort: Desc)])
+  @@map("agent_context_compaction_snapshots")
 }
 
 model AgentInput {
@@ -2045,7 +2121,7 @@ model AgentItem {
 model AgentEvent {
   id             String   @id @default(cuid())
   sessionId      String
-  turnId         String
+  turnId         String?
   itemId         String?
   taskId         String?
   sequence       BigInt
@@ -2058,7 +2134,7 @@ model AgentEvent {
   createdAt      DateTime @default(now())
 
   session AgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
-  turn    AgentTurn    @relation(fields: [turnId], references: [id], onDelete: Cascade)
+  turn    AgentTurn?   @relation(fields: [turnId], references: [id], onDelete: Cascade)
   item    AgentItem?   @relation(fields: [itemId], references: [id], onDelete: SetNull)
 
   @@unique([sessionId, sequence])
@@ -2110,6 +2186,7 @@ model SubAgentTask {
   budgetSnapshot       Json      @default("{}")
   attemptCount         Int       @default(0)
   maxAttempts          Int       @default(1)
+  nextAttemptAt        DateTime?
   leaseOwner           String?
   leaseExpiresAt       DateTime?
   startedAt            DateTime?
@@ -2128,14 +2205,52 @@ model SubAgentTask {
   rootDescendants         SubAgentTask[]        @relation("SubAgentTaskRoot")
   mailboxMessagesSent     AgentMailboxMessage[] @relation("AgentMailboxFromTask")
   mailboxMessagesReceived AgentMailboxMessage[] @relation("AgentMailboxToTask")
+  mailboxHydrationCheckpointsAsRoot AgentMailboxHydrationCheckpoint[] @relation("AgentMailboxHydrationRootTask")
+  mailboxHydrationCheckpointsAsTask AgentMailboxHydrationCheckpoint[] @relation("AgentMailboxHydrationTask")
+  toolResultReferences     AgentToolResultReference[] @relation("AgentToolResultReferenceTask")
+  waitConditions           AgentWaitCondition[] @relation("AgentWaitConditionParentTask")
+  treeBudgetReservationsAsRoot AgentTreeBudgetReservation[] @relation("AgentTreeBudgetReservationRootTask")
+  treeBudgetReservationsAsTask AgentTreeBudgetReservation[] @relation("AgentTreeBudgetReservationTask")
 
   @@index([sessionId, status])
+  @@index([status, nextAttemptAt, updatedAt])
   @@index([sessionId, role])
   @@index([sessionId, path])
   @@index([sessionId, rootTaskId, path])
   @@index([sessionId, parentTaskId, createdAt])
   @@unique([id, sessionId])
   @@map("sub_agent_tasks")
+}
+
+// One durable unit per model step shared by every task in a root tree.
+model AgentTreeBudgetReservation {
+  id             String   @id @default(cuid())
+  userId         String
+  sessionId      String
+  turnId         String
+  rootTaskId     String
+  taskId         String
+  stepId         String
+  attempt        Int
+  units          Int      @default(1)
+  status         String   @default("reserved")
+  idempotencyKey String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  settledAt      DateTime?
+
+  user     User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  session  AgentSession @relation(fields: [sessionId, userId], references: [id, userId], onDelete: Cascade)
+  turn     AgentTurn   @relation("AgentTreeBudgetReservationTurn", fields: [turnId, sessionId, userId], references: [id, sessionId, userId], onDelete: Cascade)
+  rootTask SubAgentTask @relation("AgentTreeBudgetReservationRootTask", fields: [rootTaskId, sessionId], references: [id, sessionId], onDelete: Cascade)
+  task     SubAgentTask @relation("AgentTreeBudgetReservationTask", fields: [taskId, sessionId], references: [id, sessionId], onDelete: Cascade)
+  step     AgentStep   @relation(fields: [stepId, turnId, sessionId], references: [id, turnId, sessionId], onDelete: Cascade)
+
+  @@unique([rootTaskId, taskId, stepId, attempt])
+  @@unique([sessionId, idempotencyKey])
+  @@index([userId, sessionId, turnId, rootTaskId, status])
+  @@index([rootTaskId, status, createdAt])
+  @@map("agent_tree_budget_reservations")
 }
 
 model AgentMailboxMessage {
@@ -2155,11 +2270,103 @@ model AgentMailboxMessage {
   turn     AgentTurn     @relation(fields: [turnId, sessionId], references: [id, sessionId], onDelete: Cascade)
   fromTask SubAgentTask? @relation("AgentMailboxFromTask", fields: [fromTaskId, sessionId], references: [id, sessionId], onDelete: Cascade)
   toTask   SubAgentTask? @relation("AgentMailboxToTask", fields: [toTaskId, sessionId], references: [id, sessionId], onDelete: Cascade)
+  hydrationCheckpoints AgentMailboxHydrationCheckpoint[]
 
   @@unique([sessionId, idempotencyKey])
+  @@unique([id, sessionId])
   @@index([toTaskId, consumedAt, createdAt])
   @@index([sessionId, turnId, consumedAt, createdAt])
   @@map("agent_mailbox_messages")
+}
+
+model AgentMailboxHydrationCheckpoint {
+  id         String   @id
+  userId     String
+  sessionId  String
+  turnId     String
+  rootTaskId String
+  taskId     String
+  attempt    Int
+  stepId     String
+  messageId  String
+  createdAt  DateTime @default(now())
+
+  user     User               @relation(fields: [userId], references: [id], onDelete: Cascade, map: "agent_mailbox_hydration_checkpoints_userId_fkey")
+  session  AgentSession        @relation(fields: [sessionId, userId], references: [id, userId], onDelete: Cascade, map: "agent_mb_hydration_session_user_fkey")
+  turn     AgentTurn           @relation(fields: [turnId, sessionId, userId], references: [id, sessionId, userId], onDelete: Cascade, map: "agent_mb_hydration_turn_session_user_fkey")
+  rootTask SubAgentTask        @relation("AgentMailboxHydrationRootTask", fields: [rootTaskId, sessionId], references: [id, sessionId], onDelete: Cascade, map: "agent_mb_hydration_root_task_fkey")
+  task     SubAgentTask        @relation("AgentMailboxHydrationTask", fields: [taskId, sessionId], references: [id, sessionId], onDelete: Cascade, map: "agent_mb_hydration_task_fkey")
+  step     AgentStep           @relation(fields: [stepId, turnId, sessionId], references: [id, turnId, sessionId], onDelete: Cascade, map: "agent_mb_hydration_step_turn_session_fkey")
+  message  AgentMailboxMessage @relation(fields: [messageId, sessionId], references: [id, sessionId], onDelete: Cascade, map: "agent_mb_hydration_message_session_fkey")
+
+  @@unique([sessionId, taskId, attempt, messageId], map: "agent_mb_hydration_scope_key")
+  @@index([userId, createdAt], map: "agent_mailbox_hydration_checkpoints_userId_createdAt_idx")
+  @@index([sessionId, turnId, createdAt], map: "agent_mb_hydration_session_turn_created_idx")
+  @@index([sessionId, taskId, attempt, createdAt], map: "agent_mb_hydration_session_task_attempt_created_idx")
+  @@index([sessionId, rootTaskId, taskId, attempt, stepId, createdAt], map: "agent_mb_hydration_lineage_created_idx")
+  @@map("agent_mailbox_hydration_checkpoints")
+}
+
+// Private, redacted tool output retained across worker restarts. The Worker
+// enforces lease and lineage fences before writing or reading these rows.
+model AgentToolResultReference {
+  id            String   @id @default(cuid())
+  userId        String
+  sessionId     String
+  turnId        String
+  stepId        String
+  taskId        String
+  toolCallId    String
+  sanitizedJson Json
+  sha256        String
+  byteCount     Int
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  user    User        @relation(fields: [userId], references: [id], onDelete: Cascade, map: "agent_tool_result_references_userId_fkey")
+  session AgentSession @relation(fields: [sessionId, userId], references: [id, userId], onDelete: Cascade, map: "agent_tool_result_references_sessionId_fkey")
+  turn    AgentTurn @relation("AgentToolResultReferenceTurn", fields: [turnId, sessionId, userId], references: [id, sessionId, userId], onDelete: Cascade, map: "agent_tool_result_references_turnId_sessionId_fkey")
+  step    AgentStep @relation("AgentToolResultReferenceStep", fields: [stepId, turnId, sessionId], references: [id, turnId, sessionId], onDelete: Cascade, map: "agent_tool_result_references_stepId_fkey")
+  task    SubAgentTask @relation("AgentToolResultReferenceTask", fields: [taskId, sessionId], references: [id, sessionId], onDelete: Cascade, map: "agent_tool_result_references_taskId_sessionId_fkey")
+
+  @@unique([stepId, toolCallId])
+  @@index([userId, sessionId, turnId, taskId])
+  @@index([sessionId, taskId, createdAt])
+  @@map("agent_tool_result_references")
+}
+
+// Durable wait intent. Runtime matching/consumption is intentionally owned by
+// the coordination phase and is not registered in the current tool runtime.
+model AgentWaitCondition {
+  id             String   @id @default(cuid())
+  userId         String
+  sessionId      String
+  turnId         String
+  parentTaskId   String
+  stepId         String
+  idempotencyKey String
+  targetTaskIds  Json
+  mode           String
+  status         String
+  deadlineAt     DateTime
+  matchedTaskIds Json     @default("[]")
+  result         Json?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  resolvedAt     DateTime?
+  suspendedAt    DateTime?
+  consumedAt     DateTime?
+
+  user       User         @relation(fields: [userId], references: [id], onDelete: Cascade, map: "agent_wait_conditions_userId_fkey")
+  session    AgentSession @relation(fields: [sessionId, userId], references: [id, userId], onDelete: Cascade, map: "agent_wait_conditions_sessionId_fkey")
+  turn       AgentTurn    @relation("AgentWaitConditionTurn", fields: [turnId, sessionId, userId], references: [id, sessionId, userId], onDelete: Cascade, map: "agent_wait_conditions_turnId_sessionId_fkey")
+  step       AgentStep    @relation("AgentWaitConditionStep", fields: [stepId, turnId, sessionId], references: [id, turnId, sessionId], onDelete: Cascade, map: "agent_wait_conditions_stepId_fkey")
+  parentTask SubAgentTask @relation("AgentWaitConditionParentTask", fields: [parentTaskId, sessionId], references: [id, sessionId], onDelete: Cascade, map: "agent_wait_conditions_parentTaskId_sessionId_fkey")
+
+  @@unique([parentTaskId, idempotencyKey])
+  @@index([sessionId, turnId, status])
+  @@index([sessionId, deadlineAt])
+  @@map("agent_wait_conditions")
 }
 
 model AgentTranscriptEvent {

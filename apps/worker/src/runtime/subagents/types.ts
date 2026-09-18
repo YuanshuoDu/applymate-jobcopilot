@@ -59,6 +59,16 @@ export type SubagentTaskSpec = {
   policy?: Partial<SubagentPolicy>
 }
 
+export type AtomicSubagentSpawnInput = SubagentTaskSpec & {
+  policy: SubagentPolicy
+  spawnIdempotencyKey: string
+}
+
+export type AtomicSubagentSpawnResult = {
+  task: SubagentTaskRecord | null
+  duplicate: boolean
+}
+
 export type SubagentTaskRecord = {
   id: string
   userId: string
@@ -77,10 +87,14 @@ export type SubagentTaskRecord = {
   allowedActions: unknown
   context: unknown
   expectedOutputSchema: unknown
+  /** Server-side model route metadata; credentials are rejected at persistence boundaries. */
+  modelProfileSnapshot?: unknown
   result: unknown | null
   failureReason: string | null
   attemptCount: number
   maxAttempts: number
+  /** Server-owned durable retry eligibility; null means immediately eligible. */
+  nextAttemptAt?: Date | null
   leaseOwner: string | null
   leaseExpiresAt: Date | null
   interruptRequestedAt: Date | null
@@ -94,20 +108,29 @@ export type SubagentLease = SubagentTaskRecord & {
   signal: AbortSignal
 }
 
+export type SubagentRetryDisposition = "retryable" | "terminal"
+
 export type SubagentExecutionResult = {
   status: "completed" | "waiting" | "waiting_for_user" | "failed"
   result?: unknown
   failureReason?: string
+  /** Server-owned retry policy for deterministic execution outcomes. */
+  retryDisposition?: SubagentRetryDisposition
+  /** Mailbox rows read during this attempt; acknowledged only with terminal success. */
+  mailboxMessageIds?: readonly string[]
 }
 
 export type SubagentStore = {
   create(input: SubagentTaskSpec & { policy: SubagentPolicy }): Promise<SubagentTaskRecord>
+  createWithSpawn?(input: AtomicSubagentSpawnInput): Promise<AtomicSubagentSpawnResult>
   get(taskId: string, sessionId: string): Promise<SubagentTaskRecord | null>
   claim(input: { taskId: string; sessionId: string; ownerId: string; policy: SubagentPolicy; now: Date }): Promise<SubagentTaskRecord | null>
-  heartbeat(input: { taskId: string; sessionId: string; ownerId: string; now: Date }): Promise<"renewed" | "interrupted" | "lost">
-  finish(input: { taskId: string; sessionId: string; ownerId: string; status: SubagentExecutionResult["status"]; result?: unknown; failureReason?: string; now: Date }): Promise<"completed" | "retrying" | "failed" | "waiting" | "waiting_for_user" | "interrupted" | null>
+  heartbeat(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; now: Date }): Promise<"renewed" | "interrupted" | "lost">
+  finish(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; status: SubagentExecutionResult["status"]; result?: unknown; failureReason?: string; retryDisposition?: SubagentRetryDisposition; mailboxMessageIds?: readonly string[]; now: Date }): Promise<"completed" | "retrying" | "failed" | "waiting" | "waiting_for_user" | "interrupted" | null>
+  release?(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; now: Date }): Promise<boolean>
   close(input: { taskId: string; sessionId: string; now: Date }): Promise<boolean>
   interruptTree(input: { sessionId: string; rootTaskId: string; now: Date }): Promise<number>
+  interruptSubtree?(input: { sessionId: string; rootTaskId: string; targetPath: string; now: Date }): Promise<number>
   recoverExpired(input: { now: Date; limit: number }): Promise<SubagentTaskRecord[]>
 }
 

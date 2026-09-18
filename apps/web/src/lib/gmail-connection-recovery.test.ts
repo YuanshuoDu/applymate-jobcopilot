@@ -34,7 +34,9 @@ describe('canRecoverStaleGmailConnection', () => {
 
   it('marks the tenant-scoped wait answered and enqueues the origin Turn wakeup', async () => {
     const waitId = 'a'.repeat(32)
-    appendEvent.mockResolvedValue({ duplicate: false })
+    appendEvent
+      .mockResolvedValueOnce({ duplicate: false, event: { id: 'reconnected-event' } })
+      .mockResolvedValueOnce({ duplicate: false, event: { id: 'wakeup-event' } })
     const tx = {
       agentItem: {
         findFirst: vi.fn().mockResolvedValue({ id: `gmail-oauth:${waitId}`, sessionId: 'session-a', turnId: 'turn-a', status: 'started', content: { oauth: true, waitId, toolCallId: 'call-a' } }),
@@ -47,7 +49,32 @@ describe('canRecoverStaleGmailConnection', () => {
     await expect(resumeGmailOAuthWait(db, { userId: 'user-a', waitId })).resolves.toBe(true)
     expect(tx.agentItem.findFirst).toHaveBeenCalledWith(expect.objectContaining({ where: { id: `gmail-oauth:${waitId}`, session: { userId: 'user-a' } } }))
     expect(tx.agentItem.update).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ content: expect.objectContaining({ answerAvailable: true, reconnected: true }) }) }))
-    expect(tx.agentOutbox.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ topic: 'agent.turn.wakeup', aggregateId: 'session-a', idempotencyKey: `gmail-oauth:${waitId}:wakeup` }) }))
-    expect(JSON.stringify(tx.agentOutbox.create.mock.calls)).not.toContain('access-token')
+    expect(appendEvent).toHaveBeenCalledTimes(2)
+    expect(appendEvent.mock.calls[0]?.[1]).toMatchObject({
+      type: 'gmail.oauth_reconnected',
+      sessionId: 'session-a',
+      turnId: 'turn-a',
+      itemId: `gmail-oauth:${waitId}`,
+      outboxTopic: 'agent.session.event',
+    })
+    expect(appendEvent.mock.calls[1]?.[1]).toMatchObject({
+      type: 'turn.wakeup',
+      sessionId: 'session-a',
+      turnId: 'turn-a',
+      itemId: `gmail-oauth:${waitId}`,
+      causationId: 'reconnected-event',
+      idempotencyKey: `gmail-oauth:${waitId}:wakeup`,
+      outboxTopic: 'agent.turn.wakeup',
+      payload: {
+        waitKind: 'question',
+        waitId,
+        itemId: `gmail-oauth:${waitId}`,
+        turnId: 'turn-a',
+        toolCallId: 'call-a',
+        status: 'answered',
+        nextTurnRevision: 7,
+      },
+    })
+    expect(tx.agentOutbox.create).not.toHaveBeenCalled()
   })
 })

@@ -7,7 +7,7 @@ export type AgentStreamEnvelope = {
   schemaVersion: typeof schemaVersion
   id: string
   sessionId: string
-  turnId: string
+  turnId: string | null
   itemId: string | null
   taskId: string | null
   type: string
@@ -19,7 +19,8 @@ export type AgentStreamEnvelope = {
   payload: unknown
 }
 
-export type AgentDeltaEnvelope = AgentStreamEnvelope & {
+export type AgentDeltaEnvelope = Omit<AgentStreamEnvelope, 'turnId'> & {
+  turnId: string
   kind: 'delta' | 'snapshot'
   baseRevision: number
   revision: number

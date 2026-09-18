@@ -6,6 +6,9 @@ import { RootAbortController } from "../interrupt/registry.js"
 import { TurnLeaseError } from "./lease.js"
 import { createToolRouterExecutor, TurnEngine } from "./turn-engine.js"
 import { toRepositoryJson, type TurnEngineOptions, type TurnEngineStore } from "./turn-engine-types.js"
+import { planRevisionObservation } from "../planning/plan-revision-receipt.js"
+import type { GoalContract, GoalContractRef } from "../planning/goal-plan-contract.js"
+import { steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "../context/steering-marker.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "owner-1", userId: "user-1", leaseVersion: 4,
@@ -24,17 +27,19 @@ function profile() {
 
 function fakeStore() {
   const events: Array<{ id: string; type: string; causationId: string | null; itemId: string | null }> = []
+  const batches: string[][] = []
   const items: Array<{ id: string; type: string; phase: string | null; status: string; revision: number }> = []
   const steps: Array<{ id: string; status: string; errorCode: string | null }> = []
   const value: TurnEngineStore = {
-    startStep: async ({ stepId }) => { steps.push({ id: stepId, status: "streaming", errorCode: null }); return { id: stepId } },
+    startStep: async ({ stepId, ordinal }) => { steps.push({ id: stepId, status: "streaming", errorCode: null }); return { id: stepId, ordinal } },
     updateStep: async ({ stepId, status, errorCode }) => { const step = steps.find((entry) => entry.id === stepId)!; step.status = status; step.errorCode = errorCode },
     createItem: async ({ itemId, type, phase, status }) => { items.push({ id: itemId, type, phase, status, revision: 0 }); return { id: itemId, revision: 0 } },
     updateItem: async ({ itemId, expectedRevision, status }) => { const item = items.find((entry) => entry.id === itemId)!; expect(item.revision).toBe(expectedRevision); item.revision += 1; item.status = status; return { id: itemId, revision: item.revision } },
     appendEvent: async ({ id, type, causationId, itemId }) => { events.push({ id, type, causationId, itemId }); return { id } },
+    appendEvents: async inputs => { batches.push(inputs.map(input => input.id)); for (const input of inputs) events.push({ id: input.id, type: input.type, causationId: input.causationId, itemId: input.itemId }); return inputs.map(input => ({ id: input.id })) },
     recordFinalResponse: vi.fn(async () => undefined),
   }
-  return { value, events, items, steps }
+  return { value, events, batches, items, steps }
 }
 
 function contextBuilder(seen: StepContextSnapshot[]) {
@@ -49,6 +54,14 @@ function contextBuilder(seen: StepContextSnapshot[]) {
       return { schemaVersion: "agent-harness.v2", sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId, inputThroughSequence: BigInt(seen.length), consumedInputIds: seen.length === 1 ? ["steer-1"] : ["steer-1"], blocks, canonicalJson: JSON.stringify(blocks) }
     },
   }
+}
+
+function failedReplanObservations() {
+  return [
+    planRevisionObservation({ planCallId: "plan-1", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposalHash: `sha256:${"0".repeat(64)}` }),
+    { id: "plan-result:plan-1:join", content: { kind: "plan_command", localId: "join", commandKind: "join", dependsOn: ["child"], status: "completed", errorCode: null, output: { waitId: "wait-1", status: "ready", taskIds: ["child-1"], matchedTaskIds: ["child-1"], tasks: [{ taskId: "child-1", status: "failed", result: null, failureReason: "provider error" }] } } },
+    { id: "plan-control:plan-1:join:replan", content: { kind: "plan_control", localId: "join:replan", status: "replan_required", dependsOn: ["child"], reason: "child_failure", failedTaskIds: ["child-1"] } },
+  ]
 }
 
 function baseOptions(overrides: Partial<TurnEngineOptions> = {}) {
@@ -71,7 +84,7 @@ function baseOptions(overrides: Partial<TurnEngineOptions> = {}) {
     },
   }
   const options: TurnEngineOptions = {
-    lease, scope: { userId: "user-1" }, goal: "Find jobs", snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
+    lease, rootTaskId: "root-1", scope: { userId: "user-1" }, goal: "Find jobs", snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
     contextBuilder: contextBuilder(snapshots), store: fake.value, model, tools: [{ name: "jobs.search", version: "1" }, { name: "jobs.get", version: "1" }],
     executeTool: async ({ call }) => ({ id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed" as const, output: call.toolName === "jobs.search" ? { jobs: [{ id: "job-1" }] } : { job: { id: "job-1", role: "Engineer" } }, errorCode: null }),
     now: () => now, maxSteps: 5,
@@ -82,6 +95,39 @@ function baseOptions(overrides: Partial<TurnEngineOptions> = {}) {
 }
 
 describe("TurnEngine", () => {
+  it("forwards the runtime-owned task identity into context building", async () => {
+    const fixture = baseOptions()
+    const seen: string[] = []
+    const options: TurnEngineOptions = {
+      ...fixture.options,
+      contextBuilder: {
+        build: async (request: Parameters<TurnEngineOptions["contextBuilder"]["build"]>[0]) => {
+        seen.push(request.taskId ?? "")
+        return contextBuilder([]).build(request)
+      },
+      },
+    }
+    await expect(new TurnEngine(options).run()).resolves.toMatchObject({ status: "completed" })
+    expect(seen[0]).toBe("root-1")
+  })
+
+  it("forwards the active marker control through the bound context builder", async () => {
+    const fixture = baseOptions()
+    const marker: SteeringMarkerPayload = {
+      schemaVersion: "agent-harness.steering-marker.v1", kind: "observed", status: "observed", sessionId: "session-1", turnId: "turn-1", taskId: "root-1",
+      stepId: "old-step", inputId: "steer-1", idempotencyKey: steeringMarkerIdempotencyKey("session-1", "turn-1", "steer-1"), obligationId: "plan-replan:plan-1:1", goalRevision: 1, planRevision: 1, acceptedSequence: "2",
+    }
+    const goal: GoalContract = { revision: 1, objective: "Find jobs", constraints: [], successCriteria: [], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "test" }
+    const goalRef: GoalContractRef = { get: () => goal, update: () => undefined }
+    const seen: Array<Parameters<TurnEngineOptions["contextBuilder"]["build"]>[0]> = []
+    const options: TurnEngineOptions = {
+      ...fixture.options, goalRef, snapshot: { ...fixture.options.snapshot, toolObservations: failedReplanObservations() }, steeringMarkerState: { active: [marker] },
+      contextBuilder: { build: async request => { seen.push(request); return contextBuilder([]).build(request) } },
+    }
+    await new TurnEngine(options).run()
+    expect(seen[0]).toMatchObject({ taskId: "root-1", steeringMarkerContext: { taskId: "root-1", obligationId: "plan-replan:plan-1:1" }, steeringMarkerState: { active: [marker] } })
+  })
+
   it("runs a durable 3-step loop, feeds tool results into context, and emits one final", async () => {
     const fixture = baseOptions()
     const result = await new TurnEngine(fixture.options).run()
@@ -154,6 +200,33 @@ describe("TurnEngine", () => {
     expect(executeTool).toHaveBeenCalledWith(expect.objectContaining({ call: expect.objectContaining({ id: "call-2" }) }))
   })
 
+  it("passes the server-owned plan hook through with the fenced turn identity", async () => {
+    let modelCall = 0
+    const executePlan = vi.fn(async (input: Parameters<NonNullable<TurnEngineOptions["executePlan"]>>[0]) => {
+      expect(input.identity).toMatchObject({ kind: "turn", taskId: "root-1", turnId: "turn-1" })
+      expect(input.scope).toEqual({ userId: "user-1" })
+      return { observations: [{ id: "plan-accepted", content: { accepted: true } }] }
+    })
+    const fixture = baseOptions({
+      model: {
+        id: "plan-model", profile: profile(), async *stream() {
+          modelCall += 1
+          if (modelCall === 1) {
+            yield { type: "tool_call_completed", callId: "plan-call", name: "agent.plan.propose", arguments: { proposal: { nodes: [] } } }
+            yield { type: "completed", finishReason: "tool_calls" }
+          } else {
+            yield { type: "text_delta", text: "Plan accepted." }
+            yield { type: "completed", finishReason: "stop" }
+          }
+        },
+      },
+      executePlan,
+    })
+    await expect(new TurnEngine(fixture.options).run()).resolves.toMatchObject({ status: "completed" })
+    expect(executePlan).toHaveBeenCalledTimes(1)
+    expect(fixture.fake.batches[0]?.[0]).toContain("turn:turn-1:event:plan-observation:plan-call:plan-accepted")
+  })
+
   it("fails closed when a replayed call id has different arguments", async () => {
     const executeTool = vi.fn()
     const fixture = baseOptions({
@@ -173,6 +246,17 @@ describe("TurnEngine", () => {
     expect(result).toMatchObject({ status: "failed", errorCode: "budget_exhausted", finalItemId: expect.any(String) })
     expect(fixture.fake.events.some((event) => event.type === "turn.budget_exhausted")).toBe(true)
     expect(fixture.fake.items.filter((item) => item.type === "agent_message" && item.phase === "final_answer")).toHaveLength(1)
+  })
+
+  it("does not invoke the model when a resumed finite model budget has no allowance", async () => {
+    const fixture = baseOptions({
+      budget: { maxInputTokens: 10 },
+      resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 0, inputThroughSequence: 1n, consumedInputIds: [], usage: { inputTokens: 10, outputTokens: 0, estimatedCostUsd: 0 } },
+      model: { id: "must-not-run", profile: profile(), async *stream() { throw new Error("provider invoked") } },
+    })
+    const result = await new TurnEngine(fixture.options).run()
+    expect(result).toMatchObject({ status: "failed", errorCode: "budget_exhausted" })
+    expect(fixture.requests).toHaveLength(0)
   })
 
   it("stops repeated no-op tool results with a reason-coded event", async () => {

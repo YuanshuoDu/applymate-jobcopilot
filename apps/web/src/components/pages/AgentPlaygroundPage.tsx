@@ -10,11 +10,13 @@ import { AddAgentModal } from '@/components/agent-workspace/AddAgentModal'
 import { AgentUnifiedStream } from '@/components/agent-workspace/AgentUnifiedStream'
 import type { ApplyReadyJob } from '@/components/agent-workspace/ApplyJobCard'
 import { AgentSessionConsole } from '@/components/agent-workspace/AgentSessionConsole'
+import { AgentSupervisorPanel } from '@/components/agent-workspace/v2/AgentSupervisorPanel'
 import { sessionHeaderSubtitle, type AgentSessionsResponse } from '@/components/agent-workspace/session-view-model'
 import type { LogEntry, QuestionOption, RunSummary } from '@/components/agent-workspace/live-run-types'
 import type { SubmissionPolicySettings } from '@/components/agent-workspace/automation-policy'
-import { useAgentSessionState, useAgentSessionUrl } from '@/components/agent-workspace/agent-session-state'
+import { useAgentSessionState, useAgentSessionUrl, type ActiveTurnStatus } from '@/components/agent-workspace/agent-session-state'
 import { AgentTurnComposerProvider, useAgentTurnComposer } from '@/components/agent-workspace/agent-turn-commands'
+import { useAgentTimeline } from '@/components/agent-workspace/v2/use-agent-timeline'
 import { useNav } from '@/lib/nav-context'
 import { useI18n } from '@/lib/i18n'
 
@@ -25,6 +27,10 @@ import { useI18n } from '@/lib/i18n'
 // ── Chat types ────────────────────────────────────────────────────────────────
 
 // ── Main Page ─────────────────────────────────────────────────────────────────
+
+export function isDurableTurnRunning(status: ActiveTurnStatus | undefined): boolean {
+  return status === 'queued' || status === 'in_progress'
+}
 
 export function AgentPlaygroundPage() {
   const toast = useToast()
@@ -38,6 +44,7 @@ export function AgentPlaygroundPage() {
   const [applyQueue,    setApplyQueue]    = useState<ApplyReadyJob[]>([])
   const { sessionId, setSessionId } = useAgentSessionUrl()
   const selectedSessionId = sessionId
+  const timeline = useAgentTimeline(selectedSessionId)
   const { activeTurn, refetch: refetchTurnState } = useAgentSessionState(sessionId)
   const turnComposer = useAgentTurnComposer(sessionId, activeTurn, refetchTurnState)
   const [conversationTitle, setConversationTitle] = useState<string | null>(null)
@@ -59,6 +66,13 @@ export function AgentPlaygroundPage() {
   const autonomousMode = Boolean(
     (activeRunPolicy ?? agentConfig)?.autoApply && !(activeRunPolicy ?? agentConfig)?.requireApproval,
   )
+
+  useEffect(() => {
+    if (!selectedSessionId || timeline.lifecycleRevision === 0) return
+    // The canonical timeline is the live source for Turn lifecycle changes.
+    // Refresh the command projection so Stop and steer controls do not lag it.
+    refetchTurnState()
+  }, [refetchTurnState, selectedSessionId, timeline.lifecycleRevision])
 
   const addLog = useCallback((entry: LogEntry) => { setRunLog(prev => [...prev, entry]) }, [])
 
@@ -115,6 +129,13 @@ export function AgentPlaygroundPage() {
     // The server owns this preference and scopes it to the authenticated user.
     void fetch(`/api/agent/sessions/${encodeURIComponent(sessionId)}`, { method: 'PATCH' }).catch(() => undefined)
   }, [])
+
+  const selectAutomationSession = useCallback((sessionId: string, policy: SubmissionPolicySettings) => {
+    // The automation route has already enqueued the canonical Worker task.
+    // Attach the UI to that durable session instead of starting a legacy SSE run.
+    selectSession(sessionId)
+    setActiveRunPolicy(policy)
+  }, [selectSession])
 
   const restoreLastSession = useCallback((data: AgentSessionsResponse) => {
     if (initialSessionRestoredRef.current) return
@@ -336,7 +357,9 @@ export function AgentPlaygroundPage() {
     window.dispatchEvent(new Event('applymate:sessions-changed'))
   }, [addLog, sessionId])
 
-  const isRunning = !!currentRole || (runLog.length > 0 && !runDone)
+  // Waiting gates remain in activeTurn for Stop/Steer/approval controls, but
+  // the header should reserve Running for work that is actively progressing.
+  const isRunning = isDurableTurnRunning(activeTurn?.status) || !!currentRole || (runLog.length > 0 && !runDone)
   const visibleWaitingQuestion = waitingQuestion && runLog.some(entry =>
     entry.type === 'orchestrator_question'
       && entry.questionId === waitingQuestion.id
@@ -390,6 +413,7 @@ export function AgentPlaygroundPage() {
             position: relative;
             min-height: 0 !important;
             overflow: hidden !important;
+            flex-direction: column !important;
           }
 
           .agent-session-drawer-trigger {
@@ -593,9 +617,8 @@ export function AgentPlaygroundPage() {
               setMobileSessionDrawerOpen(false)
             }}
             onRunSession={(sessionId, policy) => {
-              selectSession(sessionId)
+              selectAutomationSession(sessionId, policy)
               setMobileSessionDrawerOpen(false)
-              startRun(undefined, sessionId, policy)
             }}
             onAddAgent={() => setShowAddModal(true)}
             onNewChat={() => {
@@ -619,6 +642,7 @@ export function AgentPlaygroundPage() {
             autonomousMode={autonomousMode}
             resetVersion={chatResetVersion}
             resumeSessionId={sessionId}
+            timeline={timeline}
             conversationTitle={conversationTitle}
             conversationSubtitle={conversationSubtitle}
             onAnswerQuestion={handleAnswerQuestion}
@@ -659,6 +683,7 @@ export function AgentPlaygroundPage() {
             }}
           />
         </AgentTurnComposerProvider>
+        <AgentSupervisorPanel sessionId={selectedSessionId} timeline={timeline} />
       </div>
     </div>
   )
