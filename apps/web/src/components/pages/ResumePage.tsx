@@ -117,6 +117,7 @@ import type { AiFieldContext } from '@/components/resume/AiFieldSuggestion'
 import { exportApplicationPackLocally } from '@/lib/bundle'
 import { downloadResumePdf } from '@/lib/resume-export'
 import { auditResume, type ResumeAuditResult } from '@/lib/resume-audit'
+import { analysisTargetKey, shouldPreserveAnalysis, shouldStartAutomaticAnalysis } from '@/lib/resume-analysis-state'
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -613,9 +614,10 @@ export function ResumePage() {
   const [suggestions, setSuggestions] = useState<Suggestion[]>([])
   const [scoring,     setScoring]     = useState(false)
   const [suggesting,  setSuggesting]  = useState(false)
-  // Tracks which jobId the current analysis belongs to — used to skip redundant re-runs
-  // after tab navigation (component remount) when cache has already been restored.
-  const analysisJobIdRef  = useRef<string | null>(null)
+  // Tracks the resume/job pair the current analysis belongs to. A save changes
+  // resume.updatedAt, but it must not discard the visible result or trigger a
+  // new model request. Re-analysis is explicit through the AiPanel action.
+  const analysisTargetRef = useRef<string | null>(null)
   // True only on the very first resume load (initial mount / tab-remount).
   // Prevents the selectedResumeId effect from wiping cached analysis on remount.
   const isFirstResumeLoad = useRef(true)
@@ -721,7 +723,7 @@ export function ResumePage() {
     if (!isFirstResumeLoad.current) {
       // User actively switched to a different resume — clear stale analysis
       setScoreResult(null); setSuggestions([])
-      analysisJobIdRef.current = null
+      analysisTargetRef.current = null
     }
     isFirstResumeLoad.current = false
     if (cachedResume) {
@@ -761,16 +763,20 @@ export function ResumePage() {
   }, [jobs, resumes, selectedResumeId])
 
   useEffect(() => {
+    const targetKey = analysisTargetKey(selectedResumeId, selectedJobId)
     const cached = getAnalysisCache(selectedResumeId, selectedJobId, selectedResumeUpdatedAt)
     if (cached) {
       setScoreResult(cached.score)
       setSuggestions(cached.suggs)
-      analysisJobIdRef.current = cached.jobId
+      analysisTargetRef.current = targetKey
       return
     }
+    // Saving an edit changes updatedAt and invalidates the persisted cache, but
+    // the current in-memory result remains useful until the user re-analyzes.
+    if (shouldPreserveAnalysis(analysisTargetRef.current, targetKey)) return
     setScoreResult(null)
     setSuggestions([])
-    analysisJobIdRef.current = null
+    analysisTargetRef.current = null
   }, [selectedJobId, selectedResumeId, selectedResumeUpdatedAt])
 
   useEffect(() => {
@@ -779,17 +785,29 @@ export function ResumePage() {
     // cache after tab navigation). The user can still force a re-run via the ↻ button.
     const cached = getAnalysisCache(selectedResumeId, selectedJobId, selectedResumeUpdatedAt)
     if (cached) {
-      if (analysisJobIdRef.current !== selectedJobId) {
+      const targetKey = analysisTargetKey(selectedResumeId, selectedJobId)
+      if (analysisTargetRef.current !== targetKey) {
         setScoreResult(cached.score)
         setSuggestions(cached.suggs)
-        analysisJobIdRef.current = selectedJobId
+        analysisTargetRef.current = targetKey
       }
       return
     }
-    if (scoreResult && analysisJobIdRef.current === selectedJobId) return
+    // Edits intentionally leave the existing suggestions visible. The stale
+    // banner offers the user an explicit re-analysis action, avoiding a
+    // save -> analyze -> replace-the-panel loop and unnecessary token usage.
+    const targetKey = analysisTargetKey(selectedResumeId, selectedJobId)
+    if (!shouldStartAutomaticAnalysis({
+      targetKey,
+      activeTargetKey: analysisTargetRef.current,
+      hasScore: Boolean(scoreResult),
+      hasContent: Boolean(content),
+      hasJobs: jobs.length > 0,
+      contentChangedSinceAnalysis,
+    })) return
     runAnalysis(content, selectedJobId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedJobId, selectedResumeId, selectedResumeUpdatedAt, jobs])
+  }, [selectedJobId, selectedResumeId, selectedResumeUpdatedAt, jobs, contentChangedSinceAnalysis])
 
   const [flashField, setFlashField] = useState('')
 
@@ -858,7 +876,7 @@ export function ResumePage() {
     setScoring(false); setSuggesting(false)
     if (scoreRes.status === 'fulfilled' && scoreRes.value.data) {
       setScoreResult(scoreRes.value.data)
-      analysisJobIdRef.current = jobId
+      analysisTargetRef.current = analysisTargetKey(selectedResumeId, jobId)
       setContentChangedSinceAnalysis(false)  // analysis is now up-to-date
     } else { const msg = scoreRes.status === 'fulfilled' ? (scoreRes.value.error ?? 'Unknown') : scoreRes.reason; toast.error('Analysis failed', typeof msg === 'string' ? msg : 'Check ANTHROPIC_API_KEY') }
     if (suggestRes.status === 'fulfilled' && suggestRes.value.data?.suggestions) {
@@ -1047,12 +1065,11 @@ export function ResumePage() {
         break
 
       case 'skills':
-        setContent(prev => {
-          if (!prev) return prev
-          const existing = new Set(prev.skills?.map(s => s.toLowerCase()) ?? [])
-          if (existing.has(keyword.toLowerCase())) return prev
-          return { ...prev, skills: [...(prev.skills ?? []), keyword] }
-        })
+        patch(p => {
+          const existing = new Set(p.skills?.map(s => s.toLowerCase()) ?? [])
+          if (existing.has(keyword.toLowerCase())) return p
+          return { ...p, skills: [...(p.skills ?? []), keyword] }
+        }, 'skills')
         triggerFlash('skills')
         toast.success('Skill added', `"${keyword}" added to Skills`)
         break
@@ -1063,12 +1080,11 @@ export function ResumePage() {
         break
 
       default:
-        setContent(prev => {
-          if (!prev) return prev
-          const existing = new Set(prev.skills?.map(s => s.toLowerCase()) ?? [])
-          if (existing.has(keyword.toLowerCase())) return prev
-          return { ...prev, skills: [...(prev.skills ?? []), keyword] }
-        })
+        patch(p => {
+          const existing = new Set(p.skills?.map(s => s.toLowerCase()) ?? [])
+          if (existing.has(keyword.toLowerCase())) return p
+          return { ...p, skills: [...(p.skills ?? []), keyword] }
+        }, 'skills')
         triggerFlash('skills')
         toast.success('Added', `"${keyword}" added`)
     }
@@ -1078,7 +1094,6 @@ export function ResumePage() {
     const s = suggestions[i]
     if (!s) return
     setSuggestions(prev => { const n = [...prev]; n[i] = { ...n[i], applied: true }; return n })
-    setDirty(true)
 
     const hasProposed = s.proposed && s.proposed.trim()
 
@@ -1101,14 +1116,11 @@ export function ResumePage() {
           // Add ALL section-targeted missing keywords
           const skillsKw = scoreResult.missingItems.filter(m => m.target === 'skills').map(m => m.keyword)
           if (skillsKw.length > 0) {
-            setContent(prev => {
-              if (!prev) return prev
-              const existing = new Set(prev.skills?.map(sk => sk.toLowerCase()) ?? [])
+            patch(p => {
+              const existing = new Set(p.skills?.map(sk => sk.toLowerCase()) ?? [])
               const added = skillsKw.filter(kw => !existing.has(kw.toLowerCase()))
-              if (added.length === 0) return prev
-              return { ...prev, skills: [...(prev.skills ?? []), ...added] }
-            })
-            setContentChangedSinceAnalysis(true)
+              return added.length === 0 ? p : { ...p, skills: [...(p.skills ?? []), ...added] }
+            }, 'skills')
             triggerFlash('skills')
             toast.success('Skills updated', `Added ${skillsKw.length} targeted keyword(s)`)
           }
@@ -1237,6 +1249,16 @@ export function ResumePage() {
 
   useEffect(() => {
     if (!storedApplicationAudit || storedApplicationAudit.resumeId !== selectedResumeId || !resumeLinkedJob) return
+    // A persisted audit belongs to an exact resume/cover-letter revision. Do
+    // not re-inject its findings after an edit has made that audit stale.
+    if (!auditMatchesCurrentMaterials(
+      storedApplicationAudit,
+      selectedResumeId,
+      finalCoverLetter?.id ?? null,
+      selectedResumeUpdatedAt,
+      finalCoverLetter?.updatedAt ?? null,
+      dirty || saving,
+    )) return
     const audit = storedApplicationAudit.audit
     const auditKey = `${storedApplicationAudit.resumeId}:${storedApplicationAudit.coverLetterId}:${audit.auditedAt}`
     if (lastSyncedAuditRef.current === auditKey) return
@@ -1252,7 +1274,7 @@ export function ResumePage() {
       score: scoreResult,
       suggs: syncedSuggestions,
     })
-  }, [storedApplicationAudit, selectedResumeId, resumeLinkedJob, selectedResumeUpdatedAt, scoreResult, suggestions])
+  }, [storedApplicationAudit, selectedResumeId, resumeLinkedJob, finalCoverLetter, selectedResumeUpdatedAt, dirty, saving, scoreResult, suggestions])
 
   async function linkResumeToJob(jobId: string) {
     if (!selectedResumeId) return
@@ -1416,7 +1438,7 @@ export function ResumePage() {
       setSelectedJobId(null)
       setScoreResult(null)
       setSuggestions([])
-      analysisJobIdRef.current = null
+      analysisTargetRef.current = null
     }
     toast.success('Job link removed', 'The resume is no longer marked as Final for that job')
   }
