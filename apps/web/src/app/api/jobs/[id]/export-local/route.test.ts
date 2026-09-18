@@ -46,6 +46,29 @@ describe('local application-pack export', () => {
     expect(mocks.writeFile).toHaveBeenCalledTimes(2)
   })
 
+  it('writes a resume-only package when the audited job has no cover letter', async () => {
+    mocks.jobFindFirst.mockResolvedValue({ id: 'job_1', company: 'Acme', role: 'Engineer', finalResumeId: 'resume_1', finalCoverLetterId: null })
+    mocks.activityFindFirst.mockResolvedValue({ text: '[Auditor] application-audit {"resumeId":"resume_1","coverLetterId":null,"audit":{"verdict":"pass"}}' })
+    mocks.spawn.mockImplementation(() => {
+      const child = new EventEmitter() as EventEmitter & { stdin: PassThrough; stdout: PassThrough; stderr: PassThrough }
+      child.stdin = new PassThrough(); child.stdout = new PassThrough(); child.stderr = new PassThrough()
+      queueMicrotask(() => {
+        child.stdout.end(JSON.stringify({ resumePdf: Buffer.from('pdf').toString('base64') }))
+        child.emit('close', 0)
+      })
+      return child
+    })
+
+    const { POST } = await import('./route')
+    const response = await POST(new Request('http://localhost/api/jobs/job_1/export-local', { method: 'POST', body: '{}' }) as never, { params: Promise.resolve({ id: 'job_1' }) })
+    const body = await response.json()
+
+    expect(response.status).toBe(200)
+    expect(body.coverLetterFile).toBeUndefined()
+    expect(mocks.coverLetterFindFirst).not.toHaveBeenCalled()
+    expect(mocks.writeFile).toHaveBeenCalledTimes(1)
+  })
+
   it('refuses local export when the final documents have not passed factual audit', async () => {
     mocks.activityFindFirst.mockResolvedValue({ text: '[Auditor] application-audit {"resumeId":"resume_1","coverLetterId":"letter_1","audit":{"verdict":"blocked"}}' })
     const { POST } = await import('./route')

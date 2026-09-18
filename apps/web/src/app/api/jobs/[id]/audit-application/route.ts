@@ -1,9 +1,10 @@
 /**
  * POST /api/jobs/:id/audit-application
  *
- * Independently audits the final resume and cover letter against the candidate's
- * pre-tailoring source material and the job description. This is a review gate,
- * not a truth oracle: unsupported claims are blocked for the candidate to fix.
+ * Independently audits the final resume, and the optional cover letter, against
+ * the candidate's pre-tailoring source material and the job description. This
+ * is a review gate, not a truth oracle: unsupported claims are blocked for the
+ * candidate to fix.
  */
 import { NextRequest } from 'next/server'
 import { db } from '@/lib/db'
@@ -28,7 +29,7 @@ const AUDIT_ACTIVITY_PREFIX = '[Auditor] application-audit '
 
 type StoredApplicationAudit = {
   resumeId: string
-  coverLetterId: string
+  coverLetterId: string | null
   resumeUpdatedAt?: string
   coverLetterUpdatedAt?: string
   audit: ApplicationAudit
@@ -43,20 +44,21 @@ function toText(content: ResumeContent): string {
   return JSON.stringify(content, null, 2).slice(0, 12_000)
 }
 
-function normalize(raw: RawAudit, source: ApplicationAudit['source']): ApplicationAudit {
+function normalize(raw: RawAudit, source: ApplicationAudit['source'], includeCoverLetter: boolean): ApplicationAudit {
   const findings: ApplicationAuditFinding[] = (Array.isArray(raw.findings) ? raw.findings : []).slice(0, 12).map(finding => ({
     area: AREAS.has(finding.area as ApplicationAuditFinding['area']) ? finding.area as ApplicationAuditFinding['area'] : 'resume',
     severity: SEVERITIES.has(finding.severity as ApplicationAuditFinding['severity']) ? finding.severity as ApplicationAuditFinding['severity'] : 'warning',
-    resolution: finding.resolution === 'evidence_needed' ? 'evidence_needed' : 'contradiction',
+    resolution: (finding.resolution === 'evidence_needed' ? 'evidence_needed' : 'contradiction') as ApplicationAuditFinding['resolution'],
     title: String(finding.title ?? 'Review application material').slice(0, 120),
     evidence: String(finding.evidence ?? 'The auditor could not establish enough evidence.').slice(0, 500),
     action: String(finding.action ?? 'Review and correct this item before confirming.').slice(0, 300),
-  }))
+  })).filter(finding => includeCoverLetter || finding.area !== 'cover_letter')
   const auditedAreas = new Set(findings.map(finding => finding.area))
   // The audit gate verifies factual integrity of the submitted documents.
   // Job-fit gaps are useful advice, but absence of a requested skill is never
   // evidence that the candidate fabricated a claim.
-  const incomplete = (['resume', 'cover_letter'] as const).filter(area => !auditedAreas.has(area))
+  const requiredAreas = includeCoverLetter ? (['resume', 'cover_letter'] as const) : (['resume'] as const)
+  const incomplete = requiredAreas.filter(area => !auditedAreas.has(area))
   if (incomplete.length) findings.push({
     area: incomplete[0], severity: 'warning', title: 'Incomplete independent audit',
     resolution: 'evidence_needed',
@@ -79,7 +81,7 @@ function normalize(raw: RawAudit, source: ApplicationAudit['source']): Applicati
 
 function auditActivityText(
   resumeId: string,
-  coverLetterId: string,
+  coverLetterId: string | null,
   audit: ApplicationAudit,
   versions: Pick<StoredApplicationAudit, 'resumeUpdatedAt' | 'coverLetterUpdatedAt'> = {},
 ) {
@@ -124,7 +126,7 @@ async function runAuditModel(prompt: string, cfg: AiConfig) {
   throw lastError
 }
 
-function unavailableAudit(source: ApplicationAudit['source']): ApplicationAudit {
+function unavailableAudit(source: ApplicationAudit['source'], includeCoverLetter: boolean): ApplicationAudit {
   return {
     verdict: 'needs_review',
     summary: 'The auditor did not return a structured result. No application documents were changed; retry the independent audit.',
@@ -132,23 +134,25 @@ function unavailableAudit(source: ApplicationAudit['source']): ApplicationAudit 
     findings: [{
       area: 'job_match', severity: 'warning', title: 'Audit response needs retry',
       evidence: 'The AI response was not valid structured audit data.',
-      action: 'Retry the independent audit. The existing resume and cover letter will be reused unchanged.',
+      action: includeCoverLetter
+        ? 'Retry the independent audit. The existing resume and cover letter will be reused unchanged.'
+        : 'Retry the independent audit. The existing resume will be reused unchanged.',
     }],
     source,
     auditedAt: new Date().toISOString(),
   }
 }
 
-async function runParsedAudit(prompt: string, cfg: AiConfig, source: ApplicationAudit['source']) {
+async function runParsedAudit(prompt: string, cfg: AiConfig, source: ApplicationAudit['source'], includeCoverLetter: boolean) {
   for (let attempt = 0; attempt < 2; attempt++) {
     const retryInstruction = attempt
       ? '\n\nYour previous response was invalid. Return only the JSON object — no prose, markdown, or reasoning.'
       : ''
     const result = await runAuditModel(prompt + retryInstruction, cfg)
     try {
-      return { result, audit: normalize(parseAiJson<RawAudit>(result.text), source) }
+      return { result, audit: normalize(parseAiJson<RawAudit>(result.text), source, includeCoverLetter) }
     } catch {
-      if (attempt === 1) return { result, audit: unavailableAudit(source) }
+      if (attempt === 1) return { result, audit: unavailableAudit(source, includeCoverLetter) }
     }
   }
   throw new Error('Independent audit did not produce a result')
@@ -158,7 +162,7 @@ function parseStoredAudit(text: string): StoredApplicationAudit | null {
   if (!text.startsWith(AUDIT_ACTIVITY_PREFIX)) return null
   try {
     const stored = JSON.parse(text.slice(AUDIT_ACTIVITY_PREFIX.length)) as StoredApplicationAudit
-    if (!stored.resumeId || !stored.coverLetterId || !stored.audit?.verdict || !Array.isArray(stored.audit.findings)) return null
+    if (!stored.resumeId || stored.coverLetterId === undefined || !stored.audit?.verdict || !Array.isArray(stored.audit.findings)) return null
     return stored
   } catch {
     return null
@@ -184,7 +188,7 @@ export async function POST(req: NextRequest, { params }: Params) {
   const { id: jobId } = await params
   const body = await req.json().catch(() => null)
   if (!body) return err('Invalid JSON body')
-  const { resumeId, coverLetterId } = body as { resumeId?: string; coverLetterId?: string }
+  const { resumeId, coverLetterId } = body as { resumeId?: string; coverLetterId?: string | null }
   if (!resumeId) return err('resumeId is required')
 
   const [job, resume, persona] = await Promise.all([
@@ -195,13 +199,12 @@ export async function POST(req: NextRequest, { params }: Params) {
   if (!job) return err('Job not found', 404)
   if (!resume) return err('Resume not found', 404)
   if (!job.description) return err('A job description is required for an independent audit', 400)
-  if (!coverLetterId) return err('Select a final cover letter before auditing', 400)
-
-  const coverLetter = await db.coverLetter.findFirst({
+  const coverLetter = coverLetterId ? await db.coverLetter.findFirst({
     where: { id: coverLetterId, jobId, userId: prep.userId },
     select: { content: true, updatedAt: true },
-  })
-  if (!coverLetter) return err('Final cover letter not found for this job', 404)
+  }) : null
+  if (coverLetterId && !coverLetter) return err('Final cover letter not found for this job', 404)
+  const includeCoverLetter = Boolean(coverLetter)
 
   let sourceContent = resume.content as unknown as ResumeContent
   let source: ApplicationAudit['source'] = 'current_resume'
@@ -226,16 +229,23 @@ export async function POST(req: NextRequest, { params }: Params) {
     : undefined, prep.cfg)
   const rolePrompt = auditorRole?.systemPrompt ?? 'You are an independent application auditor. Be conservative and evidence-based.'
 
+  const coverLetterGuidance = coverLetter
+    ? 'The FINAL RESUME and FINAL COVER LETTER may contain AI edits. Audit both documents.'
+    : 'No final cover letter is supplied. A cover letter is optional, so audit the FINAL RESUME only and do not create a cover_letter finding.'
+  const auditedAreas = coverLetter ? 'resume, cover_letter, and job_match' : 'resume and job_match'
+  const finalCoverLetterSection = coverLetter
+    ? `FINAL COVER LETTER TO AUDIT:\n${coverLetter.content.slice(0, 8_000)}`
+    : 'NO FINAL COVER LETTER SUPPLIED (optional)'
   const prompt = `${rolePrompt}
 
-You are auditing, not rewriting. The SOURCE RESUME is the candidate's evidence baseline. The FINAL RESUME and COVER LETTER may contain AI edits.
-Your only release gate is factual integrity. The SOURCE RESUME and CONFIRMED PERSONA are the evidence baseline. Verify every concrete employer, current employment status or location, role, date or duration, credential, project, skill, metric, and outcome in the FINAL RESUME and COVER LETTER against that baseline.
+You are auditing, not rewriting. The SOURCE RESUME is the candidate's evidence baseline. ${coverLetterGuidance}
+Your only release gate is factual integrity. The SOURCE RESUME and CONFIRMED PERSONA are the evidence baseline. Verify every concrete employer, current employment status or location, role, date or duration, credential, project, skill, metric, and outcome in the FINAL RESUME${coverLetter ? ' and COVER LETTER' : ''} against that baseline.
 
 Use "resolution":"contradiction" and severity "critical" only when a source explicitly contradicts the final claim (including stale/current-status claims such as saying the candidate currently works in Shanghai when the source dates ended). Use "resolution":"evidence_needed" and severity "warning" when the source simply does not contain enough evidence to verify a claim: this is not fabrication, and the candidate may add a confirmed Persona fact or remove/soften the claim. Quote the exact final claim and the source fact or absence in "evidence", and state a precise correction in "action".
 
 Do not treat a missing job requirement, indirect experience, a different presentation order, or lack of Copilot/MLOps exposure as a factual issue. Those are optional fit notes only: put them in "job_match" with severity "pass" and wording like "Optional future emphasis", and never downgrade the verdict for them. Do not infer LLM automation from a general AI or Q&A project. Do not infer security-threat detection metrics from cybersecurity work.
 
-Return ONLY JSON. Always return at least one finding for EACH area: resume, cover_letter, and job_match. Use severity "pass" when an area is supported and safe. A pass verdict is valid only when resume and cover-letter claims are supported with no unresolved factual warnings.
+Return ONLY JSON. Always return at least one finding for EACH area: ${auditedAreas}. Use severity "pass" when an area is supported and safe. A pass verdict is valid only when the audited document claims are supported with no unresolved factual warnings.
 {"verdict":"pass|needs_review|blocked","summary":"...","matchScore":0,"findings":[{"area":"resume|cover_letter|job_match","severity":"pass|warning|critical","resolution":"contradiction|evidence_needed","title":"...","evidence":"quote or precise comparison","action":"..."}]}
 
 SOURCE RESUME (truth baseline):
@@ -251,25 +261,24 @@ TARGET JOB: ${job.role} at ${job.company}
 JOB DESCRIPTION:
 ${job.description.slice(0, 8_000)}
 
-FINAL COVER LETTER TO AUDIT:
-${coverLetter.content.slice(0, 8_000)}`
+${finalCoverLetterSection}`
 
   try {
-    const { result, audit } = await runParsedAudit(prompt, cfg, source)
+    const { result, audit } = await runParsedAudit(prompt, cfg, source, includeCoverLetter)
     await db.activity.create({
       data: {
         userId: prep.userId, jobId, type: 'agent_action',
         color: audit.verdict === 'pass' ? '#059669' : audit.verdict === 'blocked' ? '#dc2626' : '#d97706',
-        text: auditActivityText(resume.id, coverLetterId, audit, {
+        text: auditActivityText(resume.id, coverLetterId ?? null, audit, {
           resumeUpdatedAt: toIso(resume.updatedAt),
-          coverLetterUpdatedAt: toIso(coverLetter.updatedAt),
+          coverLetterUpdatedAt: toIso(coverLetter?.updatedAt),
         }),
       },
     })
     const response: ApplicationAuditResponse = {
       ...audit,
       ...(toIso(resume.updatedAt) ? { resumeUpdatedAt: toIso(resume.updatedAt) } : {}),
-      ...(toIso(coverLetter.updatedAt) ? { coverLetterUpdatedAt: toIso(coverLetter.updatedAt) } : {}),
+      ...(toIso(coverLetter?.updatedAt) ? { coverLetterUpdatedAt: toIso(coverLetter?.updatedAt) } : {}),
     }
     return ok({ ...response, _model: `${result.provider}/${result.model}` })
   } catch (error) {

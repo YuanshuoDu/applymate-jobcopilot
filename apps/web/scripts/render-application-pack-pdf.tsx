@@ -11,7 +11,7 @@ import { ResumeRenderer } from '@/components/resume/ResumeRenderer'
 import { CoverLetterPreview } from '@/components/coverletter/CoverLetterPanel'
 import type { CoverLetter, Job, Resume } from '@/lib/types'
 
-type Payload = { resume: Resume; coverLetter: CoverLetter; job: Pick<Job, 'company' | 'role'> }
+type Payload = { resume: Resume; coverLetter: CoverLetter | null; job: Pick<Job, 'company' | 'role'> }
 
 function html(body: string, title: string) {
   return `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title><style>
@@ -51,16 +51,20 @@ async function main() {
   const resumeMarkup = html(renderToStaticMarkup(React.createElement(ResumeRenderer, {
     content: payload.resume.content, templateId: payload.resume.templateId, templateOptions: payload.resume.templateOptions,
   })), 'Resume')
-  const coverMarkup = html(renderToStaticMarkup(React.createElement(CoverLetterPreview, {
+  const coverMarkup = payload.coverLetter ? html(renderToStaticMarkup(React.createElement(CoverLetterPreview, {
     content: payload.coverLetter.content, applicant: contact, fallbackName: payload.resume.name,
     company: payload.job.company, role: payload.job.role,
     templateId: payload.resume.templateId ?? payload.coverLetter.templateId ?? 'clean',
     templateOptions: payload.resume.templateOptions ?? payload.coverLetter.templateOptions ?? {},
-  })), 'Cover letter')
+  })), 'Cover letter') : null
   const browser = await puppeteer.launch({ headless: true, executablePath: chrome, args: ['--disable-gpu'] })
   try {
-    const [resumePdf, coverLetterPdf] = await Promise.all([renderPage(browser, resumeMarkup), renderPage(browser, coverMarkup)])
-    process.stdout.write(JSON.stringify({ resumePdf: resumePdf.toString('base64'), coverLetterPdf: coverLetterPdf.toString('base64') }))
+    const resumePdf = await renderPage(browser, resumeMarkup)
+    const coverLetterPdf = coverMarkup ? await renderPage(browser, coverMarkup) : null
+    process.stdout.write(JSON.stringify({
+      resumePdf: resumePdf.toString('base64'),
+      ...(coverLetterPdf ? { coverLetterPdf: coverLetterPdf.toString('base64') } : {}),
+    }))
   } finally {
     await browser.close()
   }

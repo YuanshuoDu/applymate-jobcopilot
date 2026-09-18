@@ -1071,7 +1071,7 @@ function renderSalary(salary: unknown): string {
 
 type StoredApplicationAudit = {
   resumeId: string
-  coverLetterId: string
+  coverLetterId: string | null
   audit: ApplicationAudit
 }
 
@@ -1081,7 +1081,7 @@ function findLatestApplicationAudit(activity: Activity[]): StoredApplicationAudi
     if (!item.text.startsWith(prefix)) continue
     try {
       const parsed = JSON.parse(item.text.slice(prefix.length)) as StoredApplicationAudit
-      if (parsed.resumeId && parsed.coverLetterId && parsed.audit?.verdict && Array.isArray(parsed.audit.findings)) return parsed
+      if (parsed.resumeId && parsed.coverLetterId !== undefined && parsed.audit?.verdict && Array.isArray(parsed.audit.findings)) return parsed
     } catch {
       // Ignore legacy or malformed activity entries rather than breaking the job drawer.
     }

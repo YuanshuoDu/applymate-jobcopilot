@@ -46,7 +46,7 @@ function saveCache(data: { resumeId: string | null; jobId: string | null; resume
 }
 type StoredApplicationAudit = {
   resumeId: string
-  coverLetterId: string
+  coverLetterId: string | null
   resumeUpdatedAt?: string
   coverLetterUpdatedAt?: string
   audit: ApplicationAudit
@@ -939,11 +939,10 @@ export function ResumePage() {
     if (saving) { toast.info(t('resume.toastSaving'), t('resume.toastSavingDetail')); return null }
     if (dirty && !(await handleSave())) return null
     if (!latestContent.current) return null
-    // Reuse the same evidence-based Auditor whenever this resume is attached to
-    // a complete application. The standalone fallback remains intentionally
-    // local: without a source version and matching cover letter it cannot
-    // honestly verify whether a fact is true.
-    if (resumeLinkedJob && finalCoverLetter) {
+    // Reuse the same evidence-based Auditor whenever this resume is attached
+    // to a saved job. The cover letter is optional; the API audits the final
+    // resume alone when no cover letter exists.
+    if (resumeLinkedJob) {
       const independent = await auditApplicationPack()
       if (independent) {
         return {
@@ -1197,12 +1196,15 @@ export function ResumePage() {
   const templateName = TEMPLATES.find(template => template.id === templateId)?.name ?? templateId
   const pendingSuggestions = suggestions.filter(suggestion => !suggestion.applied).length
   const { data: linkedCoverLetters } = useApi<CoverLetter[]>(`/api/jobs/${resumeLinkedJob?.id ?? '__none__'}/cover-letters`)
-  const linkedFinalCoverLetter = linkedCoverLetters?.find(letter =>
-    letter.id === resumeLinkedJob?.finalCoverLetterId && letter.resumeId === selectedResumeId,
-  ) ?? null
+  const matchingCoverLetters = linkedCoverLetters?.filter(letter =>
+    letter.resumeId === selectedResumeId || letter.resumeId === null,
+  ) ?? []
+  const linkedFinalCoverLetter = matchingCoverLetters.find(letter => letter.id === resumeLinkedJob?.finalCoverLetterId)
+    ?? matchingCoverLetters[0]
+    ?? null
   const savedFinalCoverLetter = latestSavedCoverLetter
-    && latestSavedCoverLetter.id === resumeLinkedJob?.finalCoverLetterId
-    && latestSavedCoverLetter.resumeId === selectedResumeId
+    && latestSavedCoverLetter.jobId === resumeLinkedJob?.id
+    && (latestSavedCoverLetter.resumeId === selectedResumeId || latestSavedCoverLetter.resumeId === null)
     ? latestSavedCoverLetter
     : null
   const finalCoverLetter = savedFinalCoverLetter ?? linkedFinalCoverLetter
@@ -1271,13 +1273,9 @@ export function ResumePage() {
       const saved = await handleSave()
       if (!saved) return null
     }
-    if (!finalCoverLetter) {
-      toast.info('Select a matching cover letter', 'Generate or select a cover letter for this exact resume version before auditing.')
-      return null
-    }
     const { data, error } = await apiMutate<ApplicationAuditResponse>(`/api/jobs/${resumeLinkedJob.id}/audit-application`, 'POST', {
       resumeId: selectedResumeId,
-      coverLetterId: finalCoverLetter.id,
+      ...(finalCoverLetter ? { coverLetterId: finalCoverLetter.id } : {}),
     })
     if (!data || error) {
       toast.error('Audit could not run', error ?? 'Please try again')
@@ -1285,9 +1283,9 @@ export function ResumePage() {
     }
     setLatestApplicationAudit({
       resumeId: selectedResumeId,
-      coverLetterId: finalCoverLetter.id,
+      coverLetterId: finalCoverLetter?.id ?? null,
       resumeUpdatedAt: data.resumeUpdatedAt ?? selectedResumeUpdatedAt ?? undefined,
-      coverLetterUpdatedAt: data.coverLetterUpdatedAt ?? finalCoverLetter.updatedAt,
+      coverLetterUpdatedAt: data.coverLetterUpdatedAt ?? finalCoverLetter?.updatedAt,
       audit: data,
     })
     if (data.verdict !== 'pass') {
@@ -1316,7 +1314,10 @@ export function ResumePage() {
       toast.warning('Audit must pass', 'Resolve all Auditor findings before confirming this application package.')
       return false
     }
-    const { data, error } = await apiMutate<Job>(`/api/jobs/${resumeLinkedJob.id}/assign`, 'PATCH', { finalResumeId: selectedResumeId })
+    const { data, error } = await apiMutate<Job>(`/api/jobs/${resumeLinkedJob.id}/assign`, 'PATCH', {
+      finalResumeId: selectedResumeId,
+      finalCoverLetterId: finalCoverLetter?.id ?? null,
+    })
     if (!data || error) {
       toast.error('Could not confirm application pack', error ?? 'Please try again')
       return false
@@ -1332,7 +1333,9 @@ export function ResumePage() {
       return resume
     }))
     setApplicationPackReadyResumeId(selectedResumeId)
-    toast.success('Application pack confirmed', 'Audited final resume and cover letter are ready in My Jobs and for PDF export')
+    toast.success('Application pack confirmed', finalCoverLetter
+      ? 'Audited final resume and cover letter are ready in My Jobs and for PDF export'
+      : 'Audited final resume is ready in My Jobs and for PDF export')
     if (returnToJobs) {
       const url = new URL(window.location.href)
       url.searchParams.delete('returnToJobs')
@@ -1810,6 +1813,7 @@ export function ResumePage() {
       {showCoverLetter && content && selectedJob && (
         <CoverLetterPanel
           job={selectedJob}
+          resumeId={selectedResumeId ?? undefined}
           resumeContent={content}
           resumeName={resumeName}
           templateId={templateId}
@@ -1817,7 +1821,6 @@ export function ResumePage() {
           templateOptions={templateOptions}
           onClose={() => setShowCoverLetter(false)}
           onSaved={saved => setLatestSavedCoverLetter(saved)}
-          onFinalized={updated => setJobs(previous => previous.map(job => job.id === updated.id ? updated : job))}
         />
       )}
       {showVersions && (

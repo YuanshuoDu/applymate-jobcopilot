@@ -11,6 +11,7 @@ type ReadinessItem = {
   label: string
   detail: string
   complete: boolean
+  optional?: boolean
   blocking?: boolean
   action?: string
 }
@@ -70,14 +71,15 @@ export function FinalConfirmDialog({
     {
       id: 'cover-letter',
       label: t('resume.checkingCoverLetter'),
-      detail: coverLetterContent ? t('resume.coverLetterLinked') : job ? t('resume.selectCoverLetter') : t('resume.linkJobForCoverLetter'),
-      complete: Boolean(coverLetterContent),
-      action: job && !coverLetterContent ? t('resume.createNow') : undefined,
+      detail: coverLetterContent ? t('resume.coverLetterLinked') : t('resume.coverLetterOptional'),
+      complete: true,
+      optional: !coverLetterContent,
+      blocking: false,
     },
     {
       id: 'audit',
       label: t('resume.independentAudit'),
-      detail: audit ? audit.summary : t('resume.auditComparison'),
+      detail: audit ? audit.summary : coverLetterContent ? t('resume.auditComparison') : t('resume.auditResumeOnly'),
       complete: !isDirty && audit?.verdict === 'pass',
       blocking: true,
     },
@@ -185,7 +187,7 @@ export function FinalConfirmDialog({
                     {confirming ? t('resume.auditing') : t('resume.needsReview')}
                   </button>
                 )}
-                {checked && !item.action && !(item.id === 'audit' && !item.complete) && <span className="final-confirm-status">{item.complete ? t('resume.completed') : item.blocking === false ? t('resume.afterConfirm') : t('resume.needsReview')}</span>}
+                {checked && !item.action && !(item.id === 'audit' && !item.complete) && <span className="final-confirm-status">{item.optional ? t('resume.optional') : item.complete ? t('resume.completed') : item.blocking === false ? t('resume.afterConfirm') : t('resume.needsReview')}</span>}
               </div>
             )
           })}

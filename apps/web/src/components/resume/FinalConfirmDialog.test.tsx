@@ -18,7 +18,7 @@ const audit: ApplicationAudit = {
   findings: [], source: 'parent_resume', auditedAt: '2026-09-17T10:00:00.000Z',
 }
 
-function renderDialog(initialAudit: ApplicationAudit | null) {
+function renderDialog(initialAudit: ApplicationAudit | null, coverLetterContent: string | null = 'Dear Acme') {
   return renderToStaticMarkup(
     <FinalConfirmDialog
       job={job}
@@ -30,7 +30,7 @@ function renderDialog(initialAudit: ApplicationAudit | null) {
       resumeContent={resumeContent}
       templateId="clean"
       templateOptions={{}}
-      coverLetterContent="Dear Acme"
+      coverLetterContent={coverLetterContent}
       initialAudit={initialAudit}
       onClose={vi.fn()}
       onReviewSuggestions={vi.fn()}
@@ -57,5 +57,13 @@ describe('FinalConfirmDialog audit state', () => {
 
     expect(source).toContain('className="final-confirm-status-action"')
     expect(source).toContain('onClick={() => void runAudit()}')
+  })
+
+  it('treats a missing cover letter as optional in final confirmation', () => {
+    const markup = renderDialog(null, null)
+
+    expect(markup).toContain('Optional — no cover letter selected')
+    expect(markup).toContain('Reviews the final resume against the pre-tailoring resume')
+    expect(markup).not.toContain('Select a final cover letter made for this resume version before confirming')
   })
 })

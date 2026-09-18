@@ -11,7 +11,7 @@ import type { ApplicationAudit, CoverLetter, Resume } from '@/lib/types'
 export const runtime = 'nodejs'
 
 type Params = { params: Promise<{ id: string }> }
-type StoredAudit = { resumeId: string; coverLetterId: string; audit: ApplicationAudit }
+type StoredAudit = { resumeId: string; coverLetterId: string | null; audit: ApplicationAudit }
 const AUDIT_PREFIX = '[Auditor] application-audit '
 const openFile = promisify(execFile)
 
@@ -23,7 +23,7 @@ function parseAudit(text: string): StoredAudit | null {
   if (!text.startsWith(AUDIT_PREFIX)) return null
   try {
     const result = JSON.parse(text.slice(AUDIT_PREFIX.length)) as StoredAudit
-    return result.resumeId && result.coverLetterId && result.audit?.verdict ? result : null
+    return result.resumeId && result.coverLetterId !== undefined && result.audit?.verdict ? result : null
   } catch { return null }
 }
 
@@ -69,9 +69,9 @@ async function findWebAppRoot() {
   throw new Error('Could not locate apps/web/scripts/render-application-pack-pdf.tsx.')
 }
 
-async function renderExactApplicationPack(resume: Resume, coverLetter: CoverLetter, job: { company: string; role: string }) {
+async function renderExactApplicationPack(resume: Resume, coverLetter: CoverLetter | null, job: { company: string; role: string }) {
   const payload = JSON.stringify({ resume, coverLetter, job })
-  return new Promise<{ resumePdf: Buffer; coverLetterPdf: Buffer }>((resolve, reject) => {
+  return new Promise<{ resumePdf: Buffer; coverLetterPdf?: Buffer }>((resolve, reject) => {
     void findTsxLoader().then(({ appRoot, loader }) => {
       const child = spawn(process.execPath, ['--import', pathToFileURL(loader).href, join('scripts', 'render-application-pack-pdf.tsx')], { cwd: appRoot, stdio: ['pipe', 'pipe', 'pipe'] })
       const output: Buffer[] = []
@@ -82,8 +82,11 @@ async function renderExactApplicationPack(resume: Resume, coverLetter: CoverLett
       child.once('close', code => {
         if (code !== 0) return reject(new Error(Buffer.concat(errors).toString() || `Application-pack renderer exited with ${code}`))
         try {
-          const result = JSON.parse(Buffer.concat(output).toString()) as { resumePdf: string; coverLetterPdf: string }
-          resolve({ resumePdf: Buffer.from(result.resumePdf, 'base64'), coverLetterPdf: Buffer.from(result.coverLetterPdf, 'base64') })
+          const result = JSON.parse(Buffer.concat(output).toString()) as { resumePdf: string; coverLetterPdf?: string }
+          resolve({
+            resumePdf: Buffer.from(result.resumePdf, 'base64'),
+            ...(result.coverLetterPdf ? { coverLetterPdf: Buffer.from(result.coverLetterPdf, 'base64') } : {}),
+          })
         } catch (error) { reject(error) }
       })
       child.stdin.end(payload)
@@ -99,7 +102,7 @@ export async function POST(req: NextRequest, { params }: Params) {
   const body = await req.json().catch(() => ({})) as { openFolder?: boolean; openOnly?: boolean }
 
   const job = await db.job.findFirst({ where: { id: jobId, userId: auth.userId } })
-  if (!job?.finalResumeId || !job.finalCoverLetterId) return err('A final resume and matching cover letter are required before export.', 409)
+  if (!job?.finalResumeId) return err('A final resume is required before export.', 409)
   const auditActivity = await db.activity.findFirst({
     where: { userId: auth.userId, jobId, text: { startsWith: AUDIT_PREFIX } },
     orderBy: { createdAt: 'desc' }, select: { text: true },
@@ -116,27 +119,25 @@ export async function POST(req: NextRequest, { params }: Params) {
     return ok({ folderPath, opened: process.platform === 'win32' })
   }
 
-  const [resume, coverLetter] = await Promise.all([
-    db.resume.findFirst({ where: { id: job.finalResumeId, userId: auth.userId } }),
-    db.coverLetter.findFirst({ where: { id: job.finalCoverLetterId, jobId, userId: auth.userId } }),
-  ])
-  if (!resume || !coverLetter) return err('Final application documents could not be found.', 404)
+  const resume = await db.resume.findFirst({ where: { id: job.finalResumeId, userId: auth.userId } })
+  const coverLetter = job.finalCoverLetterId
+    ? await db.coverLetter.findFirst({ where: { id: job.finalCoverLetterId, jobId, userId: auth.userId } })
+    : null
+  if (!resume || (job.finalCoverLetterId && !coverLetter)) return err('Final application documents could not be found.', 404)
 
   try {
     const finalResume = resume as unknown as Resume
-    const finalCoverLetter = coverLetter as unknown as CoverLetter
+    const finalCoverLetter = coverLetter as unknown as CoverLetter | null
     const { resumePdf, coverLetterPdf: coverPdf } = await renderExactApplicationPack(finalResume, finalCoverLetter, { company: job.company, role: job.role })
     await mkdir(folderPath, { recursive: true })
-    const [resumeFile, coverLetterFile] = await Promise.all([
-      writePdf(folderPath, 'Resume.pdf', resumePdf),
-      writePdf(folderPath, 'Cover Letter.pdf', coverPdf),
-    ])
+    const resumeFile = await writePdf(folderPath, 'Resume.pdf', resumePdf)
+    const coverLetterFile = coverPdf ? await writePdf(folderPath, 'Cover Letter.pdf', coverPdf) : undefined
     let opened = false
     if (body.openFolder && process.platform === 'win32') {
       await openFile('explorer.exe', [folderPath])
       opened = true
     }
-    return ok({ folderPath, opened, resumeFile, coverLetterFile })
+    return ok({ folderPath, opened, resumeFile, ...(coverLetterFile ? { coverLetterFile } : {}) })
   } catch (error) {
     console.error('[/api/jobs/export-local]', error)
     return err(`Could not export PDFs locally: ${(error as Error).message}`, 500)
