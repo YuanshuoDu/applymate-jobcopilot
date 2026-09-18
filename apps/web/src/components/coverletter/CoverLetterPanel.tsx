@@ -7,6 +7,7 @@ import type { CoverLetter, Job, ResumeContent, TemplateOptions } from '@/lib/typ
 
 interface Props {
   job:           Job
+  resumeId?:     string
   resumeContent: ResumeContent | null
   resumeName:    string
   templateId:    string
@@ -14,7 +15,6 @@ interface Props {
   templateOptions: TemplateOptions
   onClose:       () => void
   onSaved?:      (cl: CoverLetter) => void
-  onFinalized?:  (job: Job) => void
 }
 
 const TONES = ['professional', 'enthusiastic', 'concise'] as const
@@ -22,7 +22,9 @@ type Tone = typeof TONES[number]
 const LANGUAGES = ['en', 'de', 'fr', 'nl', 'es'] as const
 type CoverLetterLanguage = typeof LANGUAGES[number]
 
-export function CoverLetterPanel({ job, resumeContent, resumeName, templateId, templateName, templateOptions, onClose, onSaved, onFinalized }: Props) {
+type AutosaveStatus = 'idle' | 'pending' | 'saving' | 'saved' | 'error'
+
+export function CoverLetterPanel({ job, resumeId, resumeContent, resumeName, templateId, templateName, templateOptions, onClose, onSaved }: Props) {
   const { t } = useI18n()
   const toast = useToast()
   const [confirm, ConfirmDialog] = useConfirm()
@@ -33,13 +35,20 @@ export function CoverLetterPanel({ job, resumeContent, resumeName, templateId, t
   const [localTone,    setLocalTone]      = useState<Tone>('professional')
   const [localLanguage, setLocalLanguage] = useState<CoverLetterLanguage>('en')
   const [loading,      setLoading]        = useState(true)
-  const [saving,       setSaving]         = useState(false)
+  const [autosaveStatus, setAutosaveStatus] = useState<AutosaveStatus>('idle')
   const [generating,   setGenerating]     = useState(false)
-  const [assigning,    setAssigning]      = useState(false)
   const [downloading,  setDownloading]    = useState(false)
   const [previewing,   setPreviewing]     = useState(false)
   const [visible,      setVisible]        = useState(false)
+  const [hydrated,     setHydrated]       = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const autoSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const draftRef = useRef({ activeId: null as string | null, content: '', tone: 'professional' as Tone })
+  const draftRevisionRef = useRef(0)
+  const dirtyDraftRef = useRef(false)
+  const savingRef = useRef(false)
+  const queuedSaveRef = useRef(false)
+  const skipAutoSaveRef = useRef(false)
 
   // Animate in on mount
   useEffect(() => {
@@ -49,6 +58,13 @@ export function CoverLetterPanel({ job, resumeContent, resumeName, templateId, t
 
   // Load cover letters on mount
   useEffect(() => {
+    if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current)
+    autoSaveTimer.current = null
+    setHydrated(false)
+    setAutosaveStatus('idle')
+    dirtyDraftRef.current = false
+    queuedSaveRef.current = false
+    skipAutoSaveRef.current = true
     setLoading(true)
     fetch(`/api/jobs/${job.id}/cover-letters`)
       .then(r => r.json())
@@ -60,11 +76,28 @@ export function CoverLetterPanel({ job, resumeContent, resumeName, templateId, t
         setActiveId(initialId)
         if (initialId) {
           const cl = list.find(c => c.id === initialId)
-          if (cl) { setLocalContent(cl.content); setLocalTone((cl.tone as Tone) ?? 'professional') }
+          if (cl) {
+            setLocalContent(cl.content)
+            setLocalTone((cl.tone as Tone) ?? 'professional')
+            draftRef.current = { activeId: cl.id, content: cl.content, tone: (cl.tone as Tone) ?? 'professional' }
+          }
+        } else {
+          setLocalContent('')
+          setLocalTone('professional')
+          draftRef.current = { activeId: null, content: '', tone: 'professional' }
         }
       })
-      .catch(() => setCoverLetters([]))
-      .finally(() => setLoading(false))
+      .catch(() => {
+        setCoverLetters([])
+        setActiveId(null)
+        setLocalContent('')
+        setLocalTone('professional')
+        draftRef.current = { activeId: null, content: '', tone: 'professional' }
+      })
+      .finally(() => {
+        setLoading(false)
+        setHydrated(true)
+      })
   }, [job.id, job.finalCoverLetterId])
 
   // Auto-grow textarea
@@ -75,7 +108,8 @@ export function CoverLetterPanel({ job, resumeContent, resumeName, templateId, t
     ta.style.height = `${ta.scrollHeight}px`
   }, [localContent])
 
-  const activeCL = coverLetters.find(cl => cl.id === activeId) ?? null
+  const activeRecord = coverLetters.find(cl => cl.id === activeId) ?? null
+  const activeCL = activeRecord ? { ...activeRecord, content: localContent, tone: localTone } : null
 
   // Version dropdown label: newest = highest index, labeled vN down to v1
   const total = coverLetters.length
@@ -83,43 +117,88 @@ export function CoverLetterPanel({ job, resumeContent, resumeName, templateId, t
     return `v${total - idx} · ${cl.tone} · ${new Date(cl.createdAt).toLocaleDateString()}`
   }
 
+  async function persistDraft() {
+    const draft = draftRef.current
+    if (!draft.activeId) {
+      dirtyDraftRef.current = false
+      return
+    }
+    if (savingRef.current) {
+      queuedSaveRef.current = true
+      return
+    }
+
+    const revision = draftRevisionRef.current
+    const id = draft.activeId
+    savingRef.current = true
+    setAutosaveStatus('saving')
+    const { data, error } = await apiMutate<CoverLetter>(`/api/cover-letters/${id}`, 'PATCH', {
+      content: draft.content,
+      tone: draft.tone,
+    })
+    savingRef.current = false
+
+    if (data) {
+      setCoverLetters(previous => previous.map(coverLetter => coverLetter.id === data.id ? data : coverLetter))
+      onSaved?.(data)
+      if (draftRevisionRef.current === revision && draftRef.current.activeId === id) {
+        dirtyDraftRef.current = false
+        setAutosaveStatus('saved')
+      }
+    } else {
+      setAutosaveStatus('error')
+      toast.error(t('coverLetter.panel.autosaveFailed'), error ?? t('coverLetter.panel.autosaveFailedDetail'))
+    }
+
+    const shouldFlush = queuedSaveRef.current && dirtyDraftRef.current && Boolean(draftRef.current.activeId)
+    queuedSaveRef.current = false
+    if (shouldFlush) void persistDraft()
+  }
+
+  useEffect(() => {
+    draftRef.current = { activeId, content: localContent, tone: localTone }
+  }, [activeId, localContent, localTone])
+
+  useEffect(() => {
+    if (!hydrated || !activeId) return
+    if (skipAutoSaveRef.current) {
+      skipAutoSaveRef.current = false
+      return
+    }
+
+    draftRevisionRef.current += 1
+    dirtyDraftRef.current = true
+    setAutosaveStatus('pending')
+    if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current)
+    autoSaveTimer.current = setTimeout(() => {
+      autoSaveTimer.current = null
+      void persistDraft()
+    }, 900)
+
+    return () => {
+      if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current)
+    }
+  }, [activeId, hydrated, localContent, localTone])
+
   function handleVersionChange(id: string) {
     const cl = coverLetters.find(c => c.id === id)
     if (!cl) return
+    if (dirtyDraftRef.current) void persistDraft()
+    if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current)
+    autoSaveTimer.current = null
+    draftRevisionRef.current += 1
+    dirtyDraftRef.current = false
+    queuedSaveRef.current = false
+    skipAutoSaveRef.current = true
+    setAutosaveStatus('idle')
     setActiveId(id)
     setLocalContent(cl.content)
     setLocalTone((cl.tone as Tone) ?? 'professional')
   }
 
-  async function handleSave() {
-    if (!activeId) return
-    setSaving(true)
-    const { data, error } = await apiMutate<CoverLetter>(`/api/cover-letters/${activeId}`, 'PATCH', { content: localContent, tone: localTone })
-    setSaving(false)
-    if (data) {
-      setCoverLetters(prev => prev.map(c => c.id === data.id ? data : c))
-      toast.success(t('coverLetter.panel.save'), 'Cover letter saved')
-      onSaved?.(data)
-    } else {
-      toast.error('Save failed', error ?? 'Could not save cover letter')
-    }
-  }
-
-  async function handleSetFinal() {
-    if (!activeId) return
-    setAssigning(true)
-    const { data, error } = await apiMutate<Job>(`/api/jobs/${job.id}/assign`, 'PATCH', { finalCoverLetterId: activeId })
-    setAssigning(false)
-    if (data) {
-      onFinalized?.(data)
-      toast.success(t('coverLetter.panel.setFinal'), `v${total - coverLetters.findIndex(c => c.id === activeId)} set as final`)
-    } else {
-      toast.error('Failed', error ?? 'Could not set as final')
-    }
-  }
-
   async function handleDelete() {
     if (!activeId) return
+    if (dirtyDraftRef.current) await persistDraft()
     const ok = await confirm({
       title:        'Delete cover letter?',
       message:      t('coverLetter.panel.deleteConfirm'),
@@ -131,6 +210,11 @@ export function CoverLetterPanel({ job, resumeContent, resumeName, templateId, t
     if (error) { toast.error('Delete failed', error); return }
     const idx = coverLetters.findIndex(c => c.id === activeId)
     const next = coverLetters.filter(c => c.id !== activeId)
+    skipAutoSaveRef.current = true
+    draftRevisionRef.current += 1
+    dirtyDraftRef.current = false
+    queuedSaveRef.current = false
+    setAutosaveStatus('idle')
     setCoverLetters(next)
     const nextActive = next[Math.max(0, idx - 1)]?.id ?? null
     setActiveId(nextActive)
@@ -139,6 +223,7 @@ export function CoverLetterPanel({ job, resumeContent, resumeName, templateId, t
       if (cl) { setLocalContent(cl.content); setLocalTone((cl.tone as Tone) ?? 'professional') }
     } else {
       setLocalContent(''); setLocalTone('professional')
+      draftRef.current = { activeId: null, content: '', tone: 'professional' }
     }
     toast.info('Deleted', 'Cover letter version removed')
   }
@@ -172,19 +257,29 @@ export function CoverLetterPanel({ job, resumeContent, resumeName, templateId, t
     const { data: saved, error: saveErr } = await apiMutate<CoverLetter>(`/api/jobs/${job.id}/cover-letters`, 'POST', {
       content: generated,
       tone:    localTone,
+      ...(resumeId ? { resumeId } : {}),
     })
     setGenerating(false)
     if (saved) {
+      if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current)
+      autoSaveTimer.current = null
+      skipAutoSaveRef.current = true
+      draftRevisionRef.current += 1
+      dirtyDraftRef.current = false
+      queuedSaveRef.current = false
+      setAutosaveStatus('idle')
       const updated = [saved, ...coverLetters]
       setCoverLetters(updated)
       setActiveId(saved.id)
       setLocalContent(saved.content)
       setLocalTone((saved.tone as Tone) ?? localTone)
+      draftRef.current = { activeId: saved.id, content: saved.content, tone: (saved.tone as Tone) ?? localTone }
       toast.success(t('coverLetter.panel.generate'), 'New version created')
       onSaved?.(saved)
     } else {
       toast.error('Save failed', saveErr ?? 'Cover letter generated but could not be saved')
       // At least show the text to the user
+      skipAutoSaveRef.current = true
       setLocalContent(generated)
     }
   }
@@ -231,6 +326,9 @@ export function CoverLetterPanel({ job, resumeContent, resumeName, templateId, t
   }
 
   function handleClose() {
+    if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current)
+    autoSaveTimer.current = null
+    if (dirtyDraftRef.current) void persistDraft()
     setVisible(false)
     setTimeout(onClose, 220)
   }
@@ -369,12 +467,12 @@ export function CoverLetterPanel({ job, resumeContent, resumeName, templateId, t
           flexShrink:     0,
           alignItems:    'center',
         }}>
-          <Btn small variant="primary" onClick={handleSave} disabled={!activeId || saving}>
-            {saving ? t('coverLetter.panel.saving') : t('coverLetter.panel.save')}
-          </Btn>
-          <Btn small variant="success" onClick={handleSetFinal} disabled={!activeId || assigning}>
-            {assigning ? t('coverLetter.panel.setting') : t('coverLetter.panel.setFinal')}
-          </Btn>
+          <span aria-live="polite" style={{ fontSize: 10, color: autosaveStatus === 'error' ? 'var(--danger)' : 'var(--text-muted)' }}>
+            {autosaveStatus === 'pending' && t('resume.savingSoon')}
+            {autosaveStatus === 'saving' && t('coverLetter.panel.saving')}
+            {autosaveStatus === 'saved' && t('resume.savedJustNow')}
+            {autosaveStatus === 'error' && t('coverLetter.panel.autosaveFailed')}
+          </span>
           <Btn small variant="glass" onClick={() => setPreviewing(value => !value)} disabled={!activeCL}>
             {previewing ? t('coverLetter.panel.edit') : t('coverLetter.panel.preview')}
           </Btn>
@@ -433,7 +531,6 @@ export function CoverLetterPanel({ job, resumeContent, resumeName, templateId, t
               ref={textareaRef}
               value={localContent}
               onChange={e => setLocalContent(e.target.value)}
-              onKeyDown={e => { if ((e.metaKey || e.ctrlKey) && e.key === 's') { e.preventDefault(); handleSave() } }}
               placeholder={t('coverLetter.panel.placeholder')}
               style={{
                 width:       '100%',

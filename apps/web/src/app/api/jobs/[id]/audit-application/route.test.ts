@@ -96,6 +96,30 @@ describe('POST /api/jobs/[id]/audit-application', () => {
     expect(mocks.activityCreate.mock.calls[0][0].data.text).toContain(`"coverLetterUpdatedAt":"${coverLetterUpdatedAt.toISOString()}"`)
   })
 
+  it('audits the final resume without requiring a cover letter', async () => {
+    mocks.resumeFindFirst.mockResolvedValueOnce({
+      id: 'resume_final', parentResumeId: 'resume_base',
+      content: { contact: {}, summary: 'Final', experience: [], education: [], skills: [] },
+    }).mockResolvedValueOnce({ content: { contact: {}, summary: 'Original', experience: [], education: [], skills: [] } })
+    mocks.modelChat.mockResolvedValue({ provider: 'minimax', model: 'MiniMax-M3', text: JSON.stringify({ verdict: 'pass', findings: [
+      { area: 'resume', severity: 'pass', title: 'Supported resume', evidence: 'Matches source.', action: 'None.' },
+      { area: 'cover_letter', severity: 'critical', title: 'Should be ignored', evidence: 'No letter was supplied.', action: 'Ignore.' },
+      { area: 'job_match', severity: 'pass', title: 'Relevant', evidence: 'TypeScript is required.', action: 'None.' },
+    ] }) })
+
+    const { POST } = await import('./route')
+    const response = (await POST(request({ resumeId: 'resume_final' }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    const body = await response.json()
+
+    expect(response.status).toBe(200)
+    expect(body.verdict).toBe('pass')
+    expect(body.findings).not.toEqual(expect.arrayContaining([expect.objectContaining({ area: 'cover_letter' })]))
+    expect(mocks.coverLetterFindFirst).not.toHaveBeenCalled()
+    expect(mocks.modelChat.mock.calls[0][0][0].content).toContain('No final cover letter is supplied')
+    expect(mocks.modelChat.mock.calls[0][0][0].content).not.toContain('FINAL COVER LETTER TO AUDIT')
+    expect(mocks.activityCreate.mock.calls[0][0].data.text).toContain('"coverLetterId":null')
+  })
+
   it('blocks confirmation when the independent auditor finds an unsupported concrete claim', async () => {
     mocks.resumeFindFirst.mockResolvedValueOnce({ id: 'resume_final', parentResumeId: null, content: { contact: {}, summary: 'Final', experience: [], education: [], skills: [] } })
     mocks.resumeVersionFindFirst.mockResolvedValue({ content: { contact: {}, summary: 'Original', experience: [], education: [], skills: [] } })
@@ -219,6 +243,13 @@ describe('POST /api/jobs/[id]/audit-application', () => {
     const response = (await GET(new Request('http://localhost/api/jobs/job_1/audit-application') as never, { params: Promise.resolve({ id: 'job_1' }) }))!
     await expect(response.json()).resolves.toMatchObject({ resumeId: 'resume_final', coverLetterId: 'cover_1', audit: { verdict: 'needs_review' } })
     expect(mocks.activityFindFirst).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ jobId: 'job_1' }) }))
+  })
+
+  it('returns a persisted resume-only audit with a null cover-letter id', async () => {
+    mocks.activityFindFirst.mockResolvedValue({ text: '[Auditor] application-audit {"resumeId":"resume_final","coverLetterId":null,"audit":{"verdict":"pass","summary":"Resume supported.","matchScore":80,"findings":[]}}' })
+    const { GET } = await import('./route')
+    const response = (await GET(new Request('http://localhost/api/jobs/job_1/audit-application') as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    await expect(response.json()).resolves.toMatchObject({ resumeId: 'resume_final', coverLetterId: null, audit: { verdict: 'pass' } })
   })
 
   it('does not report a completed audit when its canonical record could not be saved', async () => {
