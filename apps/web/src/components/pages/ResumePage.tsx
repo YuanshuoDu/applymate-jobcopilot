@@ -117,7 +117,10 @@ import type { AiFieldContext } from '@/components/resume/AiFieldSuggestion'
 import { exportApplicationPackLocally } from '@/lib/bundle'
 import { downloadResumePdf } from '@/lib/resume-export'
 import { auditResume, type ResumeAuditResult } from '@/lib/resume-audit'
-import { analysisTargetKey, shouldPreserveAnalysis, shouldStartAutomaticAnalysis } from '@/lib/resume-analysis-state'
+import { analysisTargetKey, replaceSectionSuggestions, shouldPreserveAnalysis, shouldStartAutomaticAnalysis } from '@/lib/resume-analysis-state'
+
+const AI_SUGGESTION_SECTIONS = ['summary', 'skills', 'experience', 'education', 'projects'] as const
+type AiSuggestionSection = (typeof AI_SUGGESTION_SECTIONS)[number]
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -614,6 +617,7 @@ export function ResumePage() {
   const [suggestions, setSuggestions] = useState<Suggestion[]>([])
   const [scoring,     setScoring]     = useState(false)
   const [suggesting,  setSuggesting]  = useState(false)
+  const [regeneratingSection, setRegeneratingSection] = useState<AiSuggestionSection | null>(null)
   // Tracks the resume/job pair the current analysis belongs to. A save changes
   // resume.updatedAt, but it must not discard the visible result or trigger a
   // new model request. Re-analysis is explicit through the AiPanel action.
@@ -863,6 +867,7 @@ export function ResumePage() {
   }
 
   async function runAnalysis(c: ResumeContent, jobId: string) {
+    if (regeneratingSection) return
     const job = jobs.find(j => j.id === jobId); if (!job) return
     // Epoch guard: if a newer analysis starts before this one finishes, discard this result
     const epoch = ++analysisEpochRef.current
@@ -896,6 +901,48 @@ export function ResumePage() {
           suggs: suggestRes.status === 'fulfilled' ? (suggestRes.value.data?.suggestions ?? []) : [],
         })
       } catch {}
+    }
+  }
+
+  async function regenerateSection(section: string) {
+    if (!content || !selectedJobId || scoring || suggesting || regeneratingSection) return
+    if (!AI_SUGGESTION_SECTIONS.includes(section as AiSuggestionSection)) return
+    const targetSection = section as AiSuggestionSection
+    const job = jobs.find(item => item.id === selectedJobId)
+    if (!job) return
+
+    setRegeneratingSection(targetSection)
+    try {
+      const { data, error } = await apiMutate<{ suggestions: Suggestion[] }>('/api/ai/suggest', 'POST', {
+        resumeContent: content,
+        jobTitle: job.role,
+        jobCompany: job.company,
+        jobDescription: job.description ?? undefined,
+        section: targetSection,
+      })
+      if (error || !data) {
+        toast.error(t('resume.sectionRegenerationFailed'), error ?? t('resume.sectionRegenerationFailedDetail'))
+        return
+      }
+
+      const appliedHistory = suggestions.filter(suggestion => suggestion.target === targetSection && suggestion.applied)
+      const freshSuggestions = (data.suggestions ?? []).filter(suggestion => suggestion.target === targetSection)
+      const freshTexts = new Set(appliedHistory.map(suggestion => suggestion.text))
+      const merged = replaceSectionSuggestions(suggestions, targetSection, [
+        ...appliedHistory,
+        ...freshSuggestions.filter(suggestion => !freshTexts.has(suggestion.text)),
+      ])
+      setSuggestions(merged)
+      saveCache({
+        resumeId: selectedResumeId,
+        jobId: selectedJobId,
+        resumeUpdatedAt: selectedResumeUpdatedAt,
+        score: scoreResult,
+        suggs: merged,
+      })
+      toast.success(t('resume.sectionRegenerated'), freshSuggestions.length > 0 ? t('resume.sectionRegeneratedDetail') : t('resume.noNewSectionSuggestions'))
+    } finally {
+      setRegeneratingSection(null)
     }
   }
 
@@ -1809,6 +1856,8 @@ export function ResumePage() {
             onAddKeyword={kw => patch(p => ({ ...p, skills: [...(p.skills ?? []), kw] }), 'skills')}
             onApplyTargeted={applyTargeted}
             onEditSection={sec => setEditSection(sec)}
+            onRegenerateSection={section => void regenerateSection(section)}
+            regeneratingSection={regeneratingSection}
             currentSummary={content?.summary}
             currentSkills={content?.skills}
             contentChangedSinceAnalysis={contentChangedSinceAnalysis}

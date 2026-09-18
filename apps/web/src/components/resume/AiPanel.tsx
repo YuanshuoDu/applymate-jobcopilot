@@ -31,7 +31,7 @@ const SEC_LABELS: Record<string, string> = {
 }
 const SEC_ORDER = ['Summary', 'Skills', 'Experience', 'Education', 'Projects']
 
-export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, suggesting, noJobSelected, onApplySuggestion, onAnalyze, onAddKeyword, onApplyTargeted, onEditSection, currentSummary, currentSkills, contentChangedSinceAnalysis, onAudit }: {
+export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, suggesting, noJobSelected, onApplySuggestion, onAnalyze, onAddKeyword, onApplyTargeted, onEditSection, onRegenerateSection, regeneratingSection, currentSummary, currentSkills, contentChangedSinceAnalysis, onAudit }: {
   selectedJob:       Job | null
   scoreResult:                  ScoreResult | null
   suggestions:                  Suggestion[]
@@ -43,6 +43,8 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
   onAddKeyword:                 (kw: string) => void
   onApplyTargeted?:             (t: { type: string; section: string; keyword: string; value?: string }) => void
   onEditSection?:               (section: string) => void
+  onRegenerateSection?:         (section: string) => void
+  regeneratingSection?:         string | null
   currentSummary?:              string
   currentSkills?:               string[]
   contentChangedSinceAnalysis?: boolean
@@ -205,26 +207,35 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
                       {/* Tip + Edit button */}
                       <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6, marginBottom: 4 }}>
                         {tip && <div style={{ fontSize: 9, color: 'var(--text-muted)', flex: 1 }}>💡 {tip}</div>}
-                        <button onClick={() => onEditSection?.(targetKey)}
-                          style={{ fontSize: 9, color: 'var(--primary)', background: 'rgba(79,70,229,0.06)', border: '0.5px solid rgba(79,70,229,0.20)', borderRadius: 4, padding: '2px 7px', cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0, fontWeight: 500 }}>
-                          ✏️ {t('common.edit')}
-                        </button>
+                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'stretch', gap: 4, flexShrink: 0 }}>
+                          <button onClick={() => onEditSection?.(targetKey)}
+                            style={{ fontSize: 9, color: 'var(--primary)', background: 'rgba(79,70,229,0.06)', border: '0.5px solid rgba(79,70,229,0.20)', borderRadius: 4, padding: '2px 7px', cursor: 'pointer', whiteSpace: 'nowrap', fontWeight: 500 }}>
+                            ✏️ {t('common.edit')}
+                          </button>
+                          {onRegenerateSection && (
+                            <button onClick={() => onRegenerateSection(targetKey)} disabled={Boolean(regeneratingSection) || scoring || suggesting}
+                              title={t('resume.regenerateSection')}
+                              style={{ fontSize: 8, color: 'var(--text-muted)', background: 'transparent', border: '0.5px solid var(--border)', borderRadius: 4, padding: '2px 5px', cursor: regeneratingSection ? 'wait' : 'pointer', whiteSpace: 'nowrap', fontWeight: 500, opacity: (regeneratingSection && regeneratingSection !== targetKey) || scoring || suggesting ? 0.55 : 1 }}>
+                              {regeneratingSection === targetKey ? '…' : `↻ ${t('resume.regenerateSection')}`}
+                            </button>
+                          )}
+                        </div>
                       </div>
                       {/* Suggestions for this section */}
-                      {secSuggestions.filter(s => !s.applied).map((s, si) => {
+                      {secSuggestions.map((s, si) => {
                         const idx = suggestions.indexOf(s)
                         const actionLabel = s.action === 'rewrite' ? t('resume.applyRewrite') : s.action === 'reorder' ? t('resume.applyReorder') : t('common.apply')
                         return (
-                          <div key={si} style={{ marginTop: 6, padding: 6, background: '#FFFBEB', borderRadius: 5, border: '0.5px solid rgba(234,179,8,0.3)' }}>
+                          <div key={si} style={{ marginTop: 6, padding: 6, background: s.applied ? 'rgba(5,150,105,0.06)' : '#FFFBEB', borderRadius: 5, border: s.applied ? '0.5px solid rgba(5,150,105,0.28)' : '0.5px solid rgba(234,179,8,0.3)' }}>
                             <div style={{ fontSize: 10, color: 'var(--text)', marginBottom: 4, lineHeight: 1.4 }}>{s.text}</div>
                             {s.proposed && (
                               <div style={{ fontSize: 9, color: 'var(--c-success)', padding: '3px 6px', borderRadius: 4, background: 'rgba(59,109,17,0.04)', borderLeft: '2px solid #EAB308', marginBottom: 4, fontStyle: 'italic', maxHeight: 60, overflow: 'hidden' }}>
                                 {s.proposed.length > 180 ? s.proposed.slice(0, 180) + '…' : s.proposed}
                               </div>
                             )}
-                            <button onClick={() => onApplySuggestion(idx)}
-                              style={{ fontSize: 9, color: 'var(--primary)', background: 'rgba(79,70,229,0.08)', border: '0.5px solid rgba(79,70,229,0.20)', borderRadius: 4, padding: '2px 8px', cursor: 'pointer', fontWeight: 600 }}>
-                          {actionLabel} →
+                            <button onClick={() => onApplySuggestion(idx)} disabled={s.applied}
+                              style={{ fontSize: 9, color: s.applied ? 'var(--c-success)' : 'var(--primary)', background: s.applied ? 'rgba(5,150,105,0.08)' : 'rgba(79,70,229,0.08)', border: s.applied ? '0.5px solid rgba(5,150,105,0.24)' : '0.5px solid rgba(79,70,229,0.20)', borderRadius: 4, padding: '2px 8px', cursor: s.applied ? 'default' : 'pointer', fontWeight: 600 }}>
+                          {s.applied ? `✓ ${t('resume.applied')}` : `${actionLabel} →`}
                             </button>
                           </div>
                         )
@@ -248,10 +259,10 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
           <SectionHeader label={t('resume.otherSuggestions')} count={uncategorized.filter(s => !s.applied).length || undefined} collapsed={suggestCollapsed} onToggle={() => setSuggestCollapsed(v => !v)} />
           {!suggestCollapsed && (
             <div style={{ marginTop: 8 }}>
-              {uncategorized.filter(s => !s.applied).map((s, i) => {
+              {uncategorized.map((s, i) => {
                 const idx = suggestions.indexOf(s)
                 return (
-                  <div key={i} style={{ marginBottom: 6, padding: 8, background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 7 }}>
+                  <div key={i} style={{ marginBottom: 6, padding: 8, background: s.applied ? 'rgba(5,150,105,0.06)' : 'var(--bg)', border: s.applied ? '1px solid rgba(5,150,105,0.28)' : '1px solid var(--border)', borderRadius: 7 }}>
                     <div style={{ fontSize: 10, color: 'var(--text)', marginBottom: 4, lineHeight: 1.4 }}>{s.text}</div>
                     {s.proposed && (
                       <div style={{ fontSize: 9, color: 'var(--text-muted)', padding: '3px 6px', borderRadius: 4, background: 'var(--bg-secondary)', borderLeft: '2px solid #EAB308', marginBottom: 4, fontStyle: 'italic', maxHeight: 50, overflow: 'hidden' }}>
@@ -259,7 +270,7 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
                       </div>
                     )}
                     <div style={{ display: 'flex', gap: 10 }}>
-                      <button onClick={() => onApplySuggestion(idx)} style={{ fontSize: 9, color: 'var(--primary)', background: 'none', border: 'none', cursor: 'pointer', padding: 0, fontWeight: 600 }}>{t('common.apply')} →</button>
+                      <button onClick={() => onApplySuggestion(idx)} disabled={s.applied} style={{ fontSize: 9, color: s.applied ? 'var(--c-success)' : 'var(--primary)', background: 'none', border: 'none', cursor: s.applied ? 'default' : 'pointer', padding: 0, fontWeight: 600 }}>{s.applied ? `✓ ${t('resume.applied')}` : `${t('common.apply')} →`}</button>
                       <button onClick={() => copySuggestion(s.text, idx)} style={{ fontSize: 9, color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>{copied === idx ? `✓ ${t('resume.copied')}` : t('common.copy')}</button>
                     </div>
                   </div>

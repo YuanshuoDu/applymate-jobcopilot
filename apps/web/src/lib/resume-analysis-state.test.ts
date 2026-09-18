@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { analysisTargetKey, shouldPreserveAnalysis, shouldStartAutomaticAnalysis } from './resume-analysis-state'
+import { analysisTargetKey, replaceSectionSuggestions, shouldPreserveAnalysis, shouldStartAutomaticAnalysis } from './resume-analysis-state'
 
 describe('resume analysis state', () => {
   const target = analysisTargetKey('resume-1', 'job-1')
@@ -37,5 +37,16 @@ describe('resume analysis state', () => {
       hasJobs: true,
       contentChangedSinceAnalysis: true,
     })).toBe(false)
+  })
+
+  it('replaces only one section while preserving suggestions for other sections', () => {
+    const current = [
+      { target: 'summary', text: 'old summary' },
+      { target: 'skills', text: 'keep skills' },
+    ]
+    expect(replaceSectionSuggestions(current, 'summary', [{ target: 'summary', text: 'new summary' }])).toEqual([
+      { target: 'skills', text: 'keep skills' },
+      { target: 'summary', text: 'new summary' },
+    ])
   })
 })

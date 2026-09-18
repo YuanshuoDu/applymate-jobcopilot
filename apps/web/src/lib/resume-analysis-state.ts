@@ -24,3 +24,11 @@ export function shouldStartAutomaticAnalysis({
   if (!targetKey || !hasContent || !hasJobs || contentChangedSinceAnalysis) return false
   return !(hasScore && activeTargetKey === targetKey)
 }
+
+export function replaceSectionSuggestions<T extends { target: string }>(
+  suggestions: T[],
+  section: string,
+  replacement: T[],
+) {
+  return [...suggestions.filter(suggestion => suggestion.target !== section), ...replacement]
+}

@@ -361,7 +361,7 @@ export interface ScoreResult {
 
 export interface Suggestion {
   text:     string
-  target:   'summary' | 'skills' | 'experience' | 'education' | 'general'
+  target:   'summary' | 'skills' | 'experience' | 'education' | 'projects' | 'general'
   action:   'rewrite' | 'reorder' | 'enhance' | 'add_keywords' | 'none'
   proposed?: string
   applied:  boolean
