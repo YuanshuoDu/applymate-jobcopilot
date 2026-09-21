@@ -21,17 +21,18 @@ const lease = {
   leaseStartedAt: new Date("2026-09-07T00:00:00.000Z"), leaseExpiresAt: new Date("2026-09-07T00:01:00.000Z"),
 }
 const recoveredPlanHash = `sha256:${"a".repeat(64)}`
+type RuntimeEvent = { id?: string; type: string; payload: unknown; correlationId?: string; idempotencyKey?: string; owner?: unknown }
 
 function state(): CanonicalTurnState {
   return { scope: { userId: "user-1" }, goal: "Find jobs", modelProfileSnapshot: { provider: "fixture", model: "fixture" }, toolPolicySnapshot: {}, budgetSnapshot: { limits: { maxSteps: 4 } }, snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] } }
 }
 
-function store(events: Array<{ type: string; payload: unknown; correlationId?: string; idempotencyKey?: string; owner?: unknown }> = []): TurnEngineStore {
+function store(events: RuntimeEvent[] = []): TurnEngineStore {
   return {
     startStep: async ({ stepId, ordinal }) => ({ id: stepId, ordinal }), updateStep: async () => undefined,
     createItem: async ({ itemId }) => ({ id: itemId, revision: 0 }), updateItem: async ({ itemId, expectedRevision }) => ({ id: itemId, revision: expectedRevision + 1 }),
-    appendEvent: async ({ id, type, payload, correlationId, idempotencyKey, owner }) => { events.push({ type, payload, correlationId, idempotencyKey, owner }); return { id } }, recordFinalResponse: async () => undefined,
-    appendEvents: async inputs => { events.push(...inputs.map(input => ({ type: input.type, payload: input.payload, correlationId: input.correlationId, idempotencyKey: input.idempotencyKey, owner: input.owner }))); return inputs.map(input => ({ id: input.id })) },
+    appendEvent: async ({ id, type, payload, correlationId, idempotencyKey, owner }) => { events.push({ id, type, payload, correlationId, idempotencyKey, owner }); return { id } }, recordFinalResponse: async () => undefined,
+    appendEvents: async inputs => { events.push(...inputs.map(input => ({ id: input.id, type: input.type, payload: input.payload, correlationId: input.correlationId, idempotencyKey: input.idempotencyKey, owner: input.owner }))); return inputs.map(input => ({ id: input.id })) },
   }
 }
 
@@ -266,10 +267,9 @@ async function rootToolNames(coordinationEnabled: boolean, planningEnabled = fal
   }) ?? []
 }
 
-async function runDefaultPlanBridge(planningExecutionEnabled: boolean) {
+async function runDefaultPlanBridge(planningExecutionEnabled: boolean, ownerId = "worker-1", events: RuntimeEvent[] = []) {
   const roots = rootStore()
   const calls: string[] = []
-  const events: Array<{ type: string; payload: unknown; correlationId?: string; idempotencyKey?: string; owner?: unknown }> = []
   let modelCalls = 0
   const proposal: PlanProposal = {
     schemaVersion: "agent-harness.plan.v1", basedOnGoalRevision: 1, basedOnPlanRevision: null,
@@ -294,7 +294,7 @@ async function runDefaultPlanBridge(planningExecutionEnabled: boolean) {
     router: { execute: async (context: unknown, call: { id: string; toolName: string; toolVersion: string; input: unknown }) => tool.execute(context, call) },
   }
   const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
-    workerId: "worker-1", planningEnabled: true, planningExecutionEnabled, stateLoader: async () => state(), rootTaskStore: roots as never,
+    workerId: ownerId, planningEnabled: true, planningExecutionEnabled, stateLoader: async () => state(), rootTaskStore: roots as never,
     modelRuntimeFactory: async () => ({ adapter: {
       ...model(() => []),
       async *stream() {
@@ -311,7 +311,7 @@ async function runDefaultPlanBridge(planningExecutionEnabled: boolean) {
     toolRuntimeFactory: () => tool as never, turnEngineStoreFactory: () => store(events), contextBuilderFactory: () => contextBuilder(),
     authorizeUsage: async () => ({ settle: async () => undefined }),
   })
-  const result = await runtime.execute({ lease, signal: new AbortController().signal })
+  const result = await runtime.execute({ lease: { ...lease, ownerId }, signal: new AbortController().signal })
   return { result, calls, events }
 }
 
@@ -377,6 +377,20 @@ describe("createCanonicalTurnRuntime", () => {
     expect(enabled.events).toEqual(expect.arrayContaining([expect.objectContaining({
       type: "plan.command", payload: expect.objectContaining({ content: expect.objectContaining({ kind: "plan_control", localId: "finish", status: "completion_proposed", dependsOn: ["read"] }) }),
     })]))
+    const graphEvents = enabled.events.filter(event => event.type === "plan.task_graph")
+    expect(graphEvents).toHaveLength(4)
+    expect(graphEvents).toEqual(expect.arrayContaining([
+      expect.objectContaining({ correlationId: "root-1:plan-call:1", idempotencyKey: expect.stringMatching(/^turn:plan-task-graph:[0-9a-f]{64}$/), owner: expect.objectContaining({ taskId: "root-1" }) }),
+    ]))
+    expect(graphEvents.every(event => typeof event.idempotencyKey === "string" && event.idempotencyKey.length <= 128)).toBe(true)
+    expect(graphEvents.every(event => typeof event.payload === "object" && event.payload !== null && "runKey" in event.payload && event.payload.runKey === "root-1:plan-call:1")).toBe(true)
+    expect(enabled.events.findIndex(event => event.type === "plan.task_graph")).toBeLessThan(enabled.events.findIndex(event => event.type === "plan.command"))
+    const sharedEvents: RuntimeEvent[] = []
+    await runDefaultPlanBridge(true, "worker-1", sharedEvents)
+    const firstGraph = sharedEvents.filter(event => event.type === "plan.task_graph")
+    await runDefaultPlanBridge(true, "worker-2", sharedEvents)
+    const secondGraph = sharedEvents.filter(event => event.type === "plan.task_graph").slice(firstGraph.length)
+    expect(secondGraph.map(event => [event.id, event.idempotencyKey, JSON.stringify(event.payload)])).toEqual(firstGraph.map(event => [event.id, event.idempotencyKey, JSON.stringify(event.payload)]))
   })
 
   it("rejects canonical finals when completion evidence is missing or a dependency failed", async () => {

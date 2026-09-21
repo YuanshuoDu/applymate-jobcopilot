@@ -1,3 +1,5 @@
+import { Buffer } from "node:buffer"
+
 import type { PlanCommandExecutionRecord, PlanControlRecord } from "./plan-command-executor.js"
 import type { PlanDispatchCommand, PlanDispatchResult } from "./plan-intent-dispatcher.js"
 import {
@@ -10,6 +12,7 @@ import {
 
 type ObservablePlanRecord = PlanCommandExecutionRecord | PlanControlRecord
 type PersistTaskGraph = (input: { readonly runKey: string; readonly event: TaskGraphEvent; readonly state: TaskGraphState }) => void | Promise<void>
+const MAX_GRAPH_PAYLOAD_BYTES = 8 * 1024
 
 export type PlanTaskGraphAdapterErrorCode = TaskGraphErrorCode | "invalid_record" | "persistence_failed"
 
@@ -69,7 +72,11 @@ export function createPlanTaskGraphAdapter(plan: PlanDispatchResult, options: Pl
   const runKey = options.runKey.trim()
 
   const persist = async (event: TaskGraphEvent, nextState: TaskGraphState): Promise<void> => {
-    try { await options.persist({ runKey, event, state: nextState }) } catch { throw new PlanTaskGraphAdapterError("persistence_failed", "Task graph persistence failed") }
+    const payload = { runKey, event, state: nextState }
+    let encoded: string | undefined
+    try { encoded = JSON.stringify(payload) } catch { encoded = undefined }
+    if (encoded === undefined || Buffer.byteLength(encoded, "utf8") > MAX_GRAPH_PAYLOAD_BYTES) throw new PlanTaskGraphAdapterError("persistence_failed", "Task graph persistence exceeded the bounded payload")
+    try { await options.persist(payload) } catch { throw new PlanTaskGraphAdapterError("persistence_failed", "Task graph persistence failed") }
   }
 
   const apply = async (localId: string, phase: TaskGraphEvent["type"]): Promise<void> => {

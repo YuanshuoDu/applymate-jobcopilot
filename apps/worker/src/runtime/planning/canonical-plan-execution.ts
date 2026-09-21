@@ -19,6 +19,8 @@ import { assertMigratedRole, roleContract } from "../subagents/scout-analyst-con
 import { validateBoundStructuredEvidence } from "./structured-replay-evidence.js"
 import { inspectJoinFailureEvidence, replanRequiredControl } from "./plan-replan-signal.js"
 import { derivePlannerCapabilityCatalog } from "./planner-capabilities.js"
+import { createPlanTaskGraphAdapter, type PlanTaskGraphAdapterOptions } from "./plan-task-graph-adapter.js"
+import type { TaskGraphEvent, TaskGraphState } from "./task-graph-reducer.js"
 
 const MAX_OBSERVATIONS = 8
 const MAX_RESULT_BYTES = 8 * 1024
@@ -56,6 +58,7 @@ export type CanonicalPlanExecutionOptions = {
   readonly registry: Registry
   readonly policy: PolicyEngine
   readonly persistOutcome?: (receipt: PlanCommandReceipt) => Promise<void> | void
+  readonly persistTaskGraph?: (input: { readonly runKey: string; readonly event: TaskGraphEvent; readonly state: TaskGraphState }) => Promise<void> | void
   /** Server-owned upper bound for accepted revisions. */
   readonly maxPlanRevisions?: number
   /** Server-owned hashes recovered from prior accepted proposals. */
@@ -102,6 +105,12 @@ function accepted(value: unknown, goalRevision: number, expectedPlanRevision: nu
 function id(prefix: string, callId: string, localId: string): string {
   const value = `${prefix}:${callId}:${localId}`
   if (value.length > 256) throw new CanonicalPlanError("invalid_plan_output")
+  return value
+}
+
+function taskGraphRunKey(rootTaskId: string, planCallId: string, planRevision: number): string {
+  const value = `${rootTaskId}:${planCallId}:${planRevision}`
+  if (!rootTaskId.trim() || !planCallId.trim() || value.length > 256) throw new CanonicalPlanError("invalid_plan_output")
   return value
 }
 
@@ -576,6 +585,9 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
         currentPlanRevision = output.planRevision
       }
       const replay = replayed ? replayRuntime(options, input, dispatched, output.planRevision) : undefined
+      const taskGraph = !replayed && options.persistTaskGraph
+        ? createPlanTaskGraphAdapter(dispatched, { runKey: taskGraphRunKey(options.rootTaskId, input.call.id, output.planRevision), persist: options.persistTaskGraph } satisfies PlanTaskGraphAdapterOptions)
+        : undefined
       const commandRuntime: PlanCommandExecutionRuntime = replay?.runtime ?? {
         router: options.router,
         createContext: request => ({ scope: options.scope, sessionId: options.lease.sessionId, turnId: options.lease.turnId, stepId: `${input.stepId}:plan:${request.localId}`, taskId: options.taskId, rootTaskId: options.rootTaskId, actorRole: options.actorRole, capabilities: [...options.capabilities], signal: input.signal }),
@@ -583,6 +595,7 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
         rootTaskId: options.rootTaskId,
         resolveInputRefs: request => resolveInputRefs(input.snapshot, request),
         admit: planAdmission(input),
+        ...(taskGraph ? { taskGraphAdapter: taskGraph } : {}),
         ...(options.persistOutcome ? { observe: async recordValue => options.persistOutcome!(outcomeReceipt(input.call.id, output.planRevision, recordValue)) } : {}),
       }
       const executed = await executePlanCommands(dispatched, commandRuntime)

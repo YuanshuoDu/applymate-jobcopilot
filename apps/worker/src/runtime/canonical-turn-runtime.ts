@@ -30,6 +30,7 @@ import { derivePlannerCapabilityCatalog } from "./planning/planner-capabilities.
 import { hydrateGoalContract } from "./planning/goal-contract-hydration.js"
 import type { PlanCommandReceipt } from "./planning/plan-command-receipt.js"
 import { createPlanRevisionRecoveryDispatcher } from "./planning/plan-revision-receipt.js"
+import type { TaskGraphEvent, TaskGraphState } from "./planning/task-graph-reducer.js"
 import type { ContextSnapshotAdapter } from "./context/context-snapshot-adapter.js"
 import { noopCanonicalExecutionProjection, type CanonicalExecutionProjection } from "./canonical-execution-projection.js"
 import { noopCanonicalSessionProjection, type CanonicalSessionProjection } from "./canonical-session-projection.js"
@@ -194,6 +195,24 @@ function defaultAuthorization(): never {
   throw error
 }
 
+function durablePlanTaskGraphSink(store: TurnEngineStore, owner: ExecutionOwnerFence): NonNullable<CanonicalPlanExecutionOptions["persistTaskGraph"]> {
+  return async ({ runKey, event, state }: { readonly runKey: string; readonly event: TaskGraphEvent; readonly state: TaskGraphState }) => {
+    const ownerKey = `${owner.kind}:${owner.userId}:${owner.sessionId}:${owner.turnId}:${owner.taskId}`
+    const eventKey = `${ownerKey}:${runKey}:${event.eventId}`
+    const digest = createHash("sha256").update(eventKey).digest("hex")
+    await store.appendEvent({
+      owner,
+      id: `plan-task-graph:${digest.slice(0, 24)}`,
+      itemId: null,
+      type: "plan.task_graph",
+      correlationId: runKey,
+      causationId: null,
+      idempotencyKey: `${owner.kind}:plan-task-graph:${digest}`,
+      payload: toRepositoryJson({ runKey, event, state }),
+    })
+  }
+}
+
 export async function createCanonicalTurnRuntime(pool: pg.Pool, options: CanonicalTurnRuntimeOptions): Promise<{
   execute: TurnExecutor
   manager: AgentTreeManager
@@ -289,7 +308,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const actorRole = (record(state.toolPolicySnapshot).role as PolicyRole | undefined) ?? "orchestrator"
     const planFactory = options.planExecutionFactory ?? createCanonicalPlanExecutionFactory
     const executePlan = planningEnabled && planningExecutionEnabled && planning
-      ? planFactory({ lease, rootTaskId: root.id, taskId: root.id, state, scope: state.scope, router: toolRuntime.router, registry: toolRuntime.registry, policy: selectedPolicy, goal: planning.goal, goalRef, allowedTools: planning.allowedTools, allowedTemplates: planning.allowedTemplates, allowedRoles: planning.allowedRoles, allowedPlanActions: planning.allowedPlanActions, maxNodes: planning.maxNodes, maxPlanRevisions: planning.maxPlanRevisions, initialPlanRevision: planning.initialPlanRevision, initialPlanHashes: planning.initialPlanHashes, ...(recoveryDispatcher ? { recoveryDispatcher } : {}), capabilities: toolCapabilities, actorRole, persistOutcome: durablePlanCommandSink(turnStore, owner) })
+      ? planFactory({ lease, rootTaskId: root.id, taskId: root.id, state, scope: state.scope, router: toolRuntime.router, registry: toolRuntime.registry, policy: selectedPolicy, goal: planning.goal, goalRef, allowedTools: planning.allowedTools, allowedTemplates: planning.allowedTemplates, allowedRoles: planning.allowedRoles, allowedPlanActions: planning.allowedPlanActions, maxNodes: planning.maxNodes, maxPlanRevisions: planning.maxPlanRevisions, initialPlanRevision: planning.initialPlanRevision, initialPlanHashes: planning.initialPlanHashes, ...(recoveryDispatcher ? { recoveryDispatcher } : {}), capabilities: toolCapabilities, actorRole, persistOutcome: durablePlanCommandSink(turnStore, owner), persistTaskGraph: durablePlanTaskGraphSink(turnStore, owner) })
       : undefined
     const config = options.modelRuntimeFactory ? undefined : await loadWorkerAiConfig(lease.userId)
     const modelRuntime = await (options.modelRuntimeFactory?.({ userId: lease.userId, config, state }) ?? createHarnessModelRuntime({ primary: config, fallbacks: [], allowEnvironmentFallbacks: false }))

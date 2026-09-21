@@ -118,6 +118,15 @@ describe("plan task graph adapter", () => {
     }
   })
 
+  it("fails closed before persistence when the serialized graph state exceeds 8 KiB", async () => {
+    const persist = vi.fn<PlanTaskGraphAdapterOptions["persist"]>().mockResolvedValue(undefined)
+    const longCommands = Array.from({ length: 8 }, (_, index) => command(`${"node".repeat(700)}-${index}`))
+    const value = createPlanTaskGraphAdapter(plan(...longCommands), { runKey: "run-1", persist })
+    await expect(value.observe(record(longCommands[0]!.localId, "completed"))).rejects.toMatchObject({ code: "persistence_failed" })
+    expect(persist).not.toHaveBeenCalled()
+    expect(value.state.appliedEvents).toEqual([])
+  })
+
   it("retains blocked successors after an observed failure", async () => {
     const { value } = adapter([command("first"), command("next", ["first"])])
     await value.observe(record("first", "failed"))
