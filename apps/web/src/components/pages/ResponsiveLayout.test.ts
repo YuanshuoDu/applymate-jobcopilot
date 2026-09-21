@@ -45,7 +45,7 @@ describe('tablet and phone layout safeguards', () => {
     expect(globalCss).toMatch(/\.app-sidebar-toggle\s*\{[\s\S]*position:\s*absolute[\s\S]*right:\s*-14px/)
   })
 
-  it('expands the collapsed sidebar for a readable account menu', () => {
+  it('floats the collapsed account menu without expanding the sidebar', () => {
     expect(sidebarSource).toContain('className="app-sidebar-account-menu"')
     expect(sidebarSource).toContain("' is-account-menu-open'")
     expect(globalCss).toMatch(/\.app-sidebar\.is-collapsed\.is-account-menu-open\s*\{[\s\S]*z-index:\s*120/)
