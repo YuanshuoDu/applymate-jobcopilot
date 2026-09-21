@@ -1587,3 +1587,9 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Commit `49df725a` makes fresh canonical plan execution construct `PlanTaskGraphAdapter` only when the execution is not replayed, then persist `plan.task_graph` events through a server-owned durable sink. Persistence is adapter-first and fail-closed; the stable run key is `rootTaskId:planCallId:planRevision`, the owner worker ID is excluded from event identity so lease takeover preserves idempotency, and the serialized graph payload is capped at 8 KiB.
 - Replay/restore is deliberately excluded because the adapter has no initial durable state. Graph events and `plan.command` receipts are not one atomic batch. Focused validation passed **14/14 adapter tests**, **57/57 canonical-plan tests**, and **25/25 canonical-runtime tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 - Real PostgreSQL/RLS, cross-process recovery, and production supervisor evidence remain unverified. P8-67 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## P8-68 candidate - canonical TaskGraph replay hydration and receipt consistency
+
+- Commits `529f6056`, `79b5a066`, and `f94f230e` add the bounded TaskGraph hydration reducer, scoped `plan.task_graph` loader projection, reducer-derived adapter initial state, and canonical replay graph/`plan.command` consistency gate. Persisted state snapshots are treated as metadata only; legacy replay without graph events remains compatible.
+- Focused evidence passed **10/10 reducer**, **60/60 canonical state plus adapter**, **61/61 canonical-plan**, and **26/26 canonical-runtime** tests. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+- Boundary: real PostgreSQL/RLS, queue delivery across processes, process restart, and production supervisor E2E remain unverified. Graph and `plan.command` writes are not one atomic batch. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.

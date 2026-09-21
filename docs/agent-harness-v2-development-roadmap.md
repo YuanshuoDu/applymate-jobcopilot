@@ -2828,3 +2828,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused validation passed **14/14 adapter tests**, **57/57 canonical-plan tests**, and **25/25 canonical-runtime tests**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 
 **Candidate boundary:** Real PostgreSQL/RLS, cross-process recovery, and production supervisor evidence remain unverified. P8-67 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## 154. P8-68 — Canonical TaskGraph replay hydration and receipt gate
+
+**Candidate status/date (2026-09-22):** P8-68 is recorded as a candidate replay-hydration and receipt-consistency slice; formal acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commits `529f6056`, `79b5a066`, and `f94f230e` add the pure TaskGraph hydration reducer, bounded current-turn/root-task `plan.task_graph` projection, reducer-derived adapter initial state, and canonical replay graph/`plan.command` consistency gate. Persisted state snapshots are not authoritative. Legacy replay with no graph events remains compatible.
+
+**Independent verification:** Focused validation passed **10/10 reducer tests**, **60/60 canonical state plus adapter tests**, **61/61 canonical-plan tests**, and **26/26 canonical-runtime tests**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+**Candidate boundary:** Real PostgreSQL/RLS, queue delivery across processes, process restart, and production supervisor E2E remain unverified. Graph and `plan.command` writes are not one atomic batch. P8-68 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.

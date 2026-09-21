@@ -959,3 +959,11 @@ Commit `49df725a` wires fresh canonical plan execution to construct `PlanTaskGra
 Replay/restore is deliberately excluded because the adapter has no initial durable state, and graph events with `plan.command` receipts are not one atomic batch. Focused validation passed **14/14 adapter tests**, **57/57 canonical-plan tests**, and **25/25 canonical-runtime tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 
 Real PostgreSQL/RLS, cross-process recovery, and production supervisor evidence remain unverified. P8-67 remains a candidate; formal acceptance stays **1/8 (12.5%)**.
+
+## P8-68 update
+
+Commits `529f6056`, `79b5a066`, and `f94f230e` add the bounded TaskGraph replay path. The reducer provides hydration from ordered `plan.task_graph` events; the canonical event loader projects only the current turn/root task scope and the adapter derives initial state from reducer events rather than trusting persisted snapshots. Replay wiring gates graph/`plan.command` receipt consistency and preserves legacy no-event replay compatibility.
+
+Focused evidence passed: reducer **10/10**, canonical state plus adapter **60/60**, canonical plan **61/61**, and canonical runtime **26/26**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+Real PostgreSQL/RLS, queue delivery, cross-process/process-restart, and production supervisor E2E remain unverified. Graph and `plan.command` writes are not one atomic batch. Formal acceptance remains **P0 accepted 1/8 (12.5%)**; P8-68 is a candidate increment.
