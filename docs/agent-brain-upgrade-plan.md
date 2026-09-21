@@ -853,3 +853,11 @@ Commit `30486423` filters superseded plan-owned waiting controls from current ac
 Root focused validation passed **6 suites / 118 tests** across plan scope, context memory, recall, action agenda, and control-frame coverage; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Source bounds were checked: `cognitive-action-agenda` 189 and `cognitive-control-frame` 233 lines. No schema, migration, Web, provider, queue, or dependency change was introduced. Production Neon/Postgres/RLS, Redis/BullMQ delivery, process restart, provider/model, browser/CloakBrowser, deployment, and legacy→V2 semantic cutover evidence remain unverified. Formal acceptance remains **P0 accepted 1/8 (12.5%)**; P8-53 is a candidate increment.
 
 Follow-up P8-54: audit the Web legacy/canonical entry fence; this is not implemented yet.
+
+## P8-54 update
+
+Goal: prevent the legacy Agent Run SSE/pipeline from entering while an owned session already has an active canonical `AgentTurn`.
+
+Commit `237db735` adds an entry guard that returns HTTP `409` with code `legacy_agent_run_blocked_by_active_turn` before SSE or legacy-pipeline execution when an owned session has an `AgentTurn` in `queued`, `in_progress`, `waiting_for_dependency`, `waiting_for_approval`, or `waiting_for_user`. No-session, deleted/foreign-session, and no-active-turn cases preserve their existing behavior.
+
+Root Web focused validation passed **8/8 tests**; Web `tsc --noEmit --skipLibCheck` and `git diff --check` passed. The guarded route is 74 lines. No schema, migration, Worker, provider, queue, or dependency change was introduced. This is an entry guard only; the full legacy wait protocol and the worker identity-spread issue remain separate follow-ups. Production Neon/Postgres/RLS, Redis/BullMQ delivery, process restart, provider/model, browser/CloakBrowser, deployment, and legacy→V2 semantic cutover evidence remain unverified. Formal acceptance remains **P0 accepted 1/8 (12.5%)**; P8-54 is a candidate increment.
