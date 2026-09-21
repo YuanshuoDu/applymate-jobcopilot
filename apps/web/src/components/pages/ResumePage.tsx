@@ -30,17 +30,31 @@ function loadAnalysisCache() {
     return _cachedAnalyses
   } catch { return null }
 }
+function isAuditSuggestion(suggestion: Suggestion) {
+  return suggestion.text.startsWith(AUDIT_SUGGESTION_PREFIX)
+}
+function withoutAuditSuggestions(suggestions: Suggestion[]) {
+  return suggestions.filter(suggestion => !isAuditSuggestion(suggestion))
+}
 function getAnalysisCache(resumeId: string | null, jobId: string | null, resumeUpdatedAt: string | null) {
   if (!resumeId || !jobId) return null
   const cached = loadAnalysisCache()?.[cacheKey(resumeId, jobId)] ?? null
   // A tailored resume is revised in place after a failed audit. Never reuse
   // suggestions scored against its previous content.
-  return cached?.resumeUpdatedAt === resumeUpdatedAt ? cached : null
+  return cached?.resumeUpdatedAt === resumeUpdatedAt
+    ? cached && { ...cached, suggs: withoutAuditSuggestions(cached.suggs) }
+    : null
 }
 function saveCache(data: { resumeId: string | null; jobId: string | null; resumeUpdatedAt: string | null; score: ScoreResult | null; suggs: Suggestion[]; [k: string]: unknown }) {
   if (!data.jobId || !data.resumeId) return
   const entries = loadAnalysisCache() ?? {}
-  entries[cacheKey(data.resumeId, data.jobId)] = { resumeId: data.resumeId, jobId: data.jobId, resumeUpdatedAt: data.resumeUpdatedAt, score: data.score, suggs: data.suggs }
+  entries[cacheKey(data.resumeId, data.jobId)] = {
+    resumeId: data.resumeId,
+    jobId: data.jobId,
+    resumeUpdatedAt: data.resumeUpdatedAt,
+    score: data.score,
+    suggs: withoutAuditSuggestions(data.suggs),
+  }
   _cachedAnalyses = entries
   try { localStorage.setItem(LS_KEY, JSON.stringify(entries)) } catch {}
 }
@@ -78,22 +92,10 @@ function auditMatchesCurrentMaterials(
   return true
 }
 
-function toAuditSuggestions(audit: ApplicationAudit): Suggestion[] {
-  return audit.findings
-    .filter(finding => finding.severity !== 'pass')
-    .map(finding => ({
-      text: `${AUDIT_SUGGESTION_PREFIX}${finding.title}: ${finding.evidence} Required revision: ${finding.action}`,
-      // An audit action is an instruction for the AI/editor, not replacement
-      // text for a single field. It must not overwrite a resume section.
-      target: 'general' as const,
-      action: 'none' as const,
-      applied: false,
-    }))
-}
 import { Btn, useToast, useConfirm } from '@/components/ui'
 import { useApi, apiMutate, fmtDate, fmtRelative } from '@/lib/hooks'
 import { getCachedApiResponse, setCachedApiResponse } from '@/lib/api-cache'
-import type { ApplicationAudit, CoverLetter, ResumeListItem, ResumeContent, Resume, Job, ScoreResult, Suggestion, TemplateOptions, Direction } from '@/lib/types'
+import type { ApplicationAudit, ApplicationAuditFinding, CoverLetter, ResumeListItem, ResumeContent, Resume, Job, ScoreResult, Suggestion, TemplateOptions, Direction } from '@/lib/types'
 import { CoverLetterPanel } from '@/components/coverletter/CoverLetterPanel'
 import { TemplateModal, TEMPLATES } from '@/components/resume/TemplateModal'
 import { ResumeRenderer } from '@/components/resume/ResumeRenderer'
@@ -629,7 +631,6 @@ export function ResumePage() {
   // Monotonically increasing counter — incremented on each runAnalysis call.
   // Responses from superseded calls are silently discarded (race-condition guard).
   const analysisEpochRef = useRef(0)
-  const lastSyncedAuditRef = useRef<string | null>(null)
   const [latestApplicationAudit, setLatestApplicationAudit] = useState<StoredApplicationAudit | null>(null)
   const [auditingApplication, setAuditingApplication] = useState(false)
   const [auditError, setAuditError] = useState<string | null>(null)
@@ -1233,7 +1234,7 @@ export function ResumePage() {
   // resume switch or after cancelling a link.
   const linkedJob = resumeLinkedJob
   const templateName = TEMPLATES.find(template => template.id === templateId)?.name ?? templateId
-  const pendingSuggestions = suggestions.filter(suggestion => !suggestion.applied).length
+  const pendingSuggestions = suggestions.filter(suggestion => !isAuditSuggestion(suggestion) && !suggestion.applied).length
   const { data: linkedCoverLetters } = useApi<CoverLetter[]>(`/api/jobs/${resumeLinkedJob?.id ?? '__none__'}/cover-letters`)
   const matchingCoverLetters = linkedCoverLetters?.filter(letter =>
     letter.resumeId === selectedResumeId || letter.resumeId === null,
@@ -1273,35 +1274,6 @@ export function ResumePage() {
     jobCompany:     selectedJob.company,
     jobDescription: selectedJob.description ?? undefined,
   } : {}
-
-  useEffect(() => {
-    if (!storedApplicationAudit || storedApplicationAudit.resumeId !== selectedResumeId || !resumeLinkedJob) return
-    // A persisted audit belongs to an exact resume/cover-letter revision. Do
-    // not re-inject its findings after an edit has made that audit stale.
-    if (!auditMatchesCurrentMaterials(
-      storedApplicationAudit,
-      selectedResumeId,
-      finalCoverLetter?.id ?? null,
-      selectedResumeUpdatedAt,
-      finalCoverLetter?.updatedAt ?? null,
-      dirty || saving,
-    )) return
-    const audit = storedApplicationAudit.audit
-    const auditKey = `${storedApplicationAudit.resumeId}:${storedApplicationAudit.coverLetterId}:${audit.auditedAt}`
-    if (lastSyncedAuditRef.current === auditKey) return
-    lastSyncedAuditRef.current = auditKey
-
-    const baseSuggestions = suggestions.filter(suggestion => !suggestion.text.startsWith(AUDIT_SUGGESTION_PREFIX))
-    const syncedSuggestions = audit.verdict === 'pass' ? baseSuggestions : [...baseSuggestions, ...toAuditSuggestions(audit)]
-    setSuggestions(syncedSuggestions)
-    saveCache({
-      resumeId: selectedResumeId,
-      jobId: resumeLinkedJob.id,
-      resumeUpdatedAt: selectedResumeUpdatedAt,
-      score: scoreResult,
-      suggs: syncedSuggestions,
-    })
-  }, [storedApplicationAudit, selectedResumeId, resumeLinkedJob, finalCoverLetter, selectedResumeUpdatedAt, dirty, saving, scoreResult, suggestions])
 
   async function linkResumeToJob(jobId: string) {
     if (!selectedResumeId) return
@@ -1350,10 +1322,9 @@ export function ResumePage() {
       audit: data,
     })
     // Keep the Resume page in sync without replacing unrelated AI suggestions
-    // or re-triggering a full analysis. Re-auditing also removes stale audit
-    // suggestions after the candidate has corrected the flagged material.
-    const baseSuggestions = suggestions.filter(suggestion => !suggestion.text.startsWith(AUDIT_SUGGESTION_PREFIX))
-    const syncedSuggestions = data.verdict === 'pass' ? baseSuggestions : [...baseSuggestions, ...toAuditSuggestions(data)]
+    // or re-triggering a full analysis. Audit findings stay in the audit card;
+    // they are not duplicated as generic "Other suggestions".
+    const syncedSuggestions = withoutAuditSuggestions(suggestions)
     setSuggestions(syncedSuggestions)
     saveCache({
       resumeId: selectedResumeId,
@@ -1362,9 +1333,7 @@ export function ResumePage() {
       score: scoreResult,
       suggs: syncedSuggestions,
     })
-    if (data.verdict !== 'pass') {
-      toast.warning('Audit needs revision', `${data.summary} Suggestions have been refreshed in Resume.`)
-    }
+    if (data.verdict !== 'pass') toast.warning('Audit needs revision', `${data.summary} Review the findings in the audit card.`)
     return data
   }
 
@@ -1378,6 +1347,18 @@ export function ResumePage() {
       auditRunRef.current = false
       setAuditingApplication(false)
     }
+  }
+
+  function reviewAuditFinding(area: ApplicationAuditFinding['area']) {
+    if (area === 'cover_letter') {
+      setShowCoverLetter(true)
+      return
+    }
+    if (area === 'job_match') {
+      toast.info('Review job match', 'This finding is guidance about the role, not a resume edit.')
+      return
+    }
+    document.querySelector<HTMLElement>('[data-resume-editor]')?.scrollTo({ top: 0, behavior: 'smooth' })
   }
 
   async function confirmApplicationPack(audit: ApplicationAudit): Promise<boolean> {
@@ -1718,7 +1699,7 @@ export function ResumePage() {
             </div>
             </>}
           </aside>
-          <div className="resume-workspace" style={{ flex: 1, overflowY: 'auto', padding: 24 }}>
+          <div className="resume-workspace" data-resume-editor style={{ flex: 1, overflowY: 'auto', padding: 24 }}>
             {/* Empty-state banner: no directions set up */}
             {directions.length === 0 && (
               <div style={{ padding: '8px 12px', background: 'rgba(217,119,6,0.06)', border: '0.5px solid rgba(217,119,6,0.20)', borderRadius: 7, marginBottom: 12, fontSize: 11, color: 'var(--c-warning)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -1869,6 +1850,7 @@ export function ResumePage() {
             auditError={auditError}
             hasLinkedJob={Boolean(resumeLinkedJob)}
             hasCoverLetter={Boolean(finalCoverLetter)}
+            onReviewFinding={reviewAuditFinding}
             onAudit={() => { if (!content) { toast.info('Select a resume first'); return }; void runResumeAudit() }}
           />
           </>}

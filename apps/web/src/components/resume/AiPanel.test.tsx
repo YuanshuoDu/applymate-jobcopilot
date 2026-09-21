@@ -39,6 +39,7 @@ const scoreResult = {
 const suggestions: Suggestion[] = [
   { text: 'Applied summary suggestion', target: 'summary', action: 'rewrite', proposed: 'Updated summary', applied: true },
   { text: 'Pending general suggestion', target: 'general', action: 'none', applied: false },
+  { text: '[Audit] Unsupported claim', target: 'general', action: 'none', applied: false },
 ]
 
 describe('AiPanel suggestion states', () => {
@@ -64,5 +65,6 @@ describe('AiPanel suggestion states', () => {
     expect(markup).toContain('✓ Applied')
     expect(markup).toContain('↻ Regenerate section')
     expect(markup).toContain('Pending general suggestion')
+    expect(markup).not.toContain('[Audit] Unsupported claim')
   })
 })

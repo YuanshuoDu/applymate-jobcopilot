@@ -22,6 +22,21 @@ vi.mock('@/lib/i18n', () => ({
       'resume.auditNoIssues': 'No unresolved factual issues found.',
       'resume.auditRun': 'Run independent audit',
       'resume.auditRunAgain': 'Run audit again',
+      'resume.auditFindingsTitle': 'Findings to fix',
+      'resume.auditFindingsCount': 'items',
+      'resume.auditAreaResume': 'Resume',
+      'resume.auditAreaCoverLetter': 'Cover letter',
+      'resume.auditAreaJobMatch': 'Job match',
+      'resume.auditCritical': 'Critical',
+      'resume.auditWarning': 'Warning',
+      'resume.auditEvidenceLabel': 'Evidence',
+      'resume.auditActionLabel': 'Recommended fix',
+      'resume.auditEditResume': 'Edit resume',
+      'resume.auditEditCoverLetter': 'Edit cover letter',
+      'resume.auditReviewJob': 'Review job',
+      'resume.auditCopyAction': 'Copy fix',
+      'resume.auditCopiedAction': 'Copied',
+      'resume.auditFixThenRerun': 'Make the change, then run the audit again.',
     }[key] ?? key),
   }),
 }))
@@ -35,6 +50,15 @@ const passedAudit: ApplicationAudit = {
   findings: [{ area: 'resume', severity: 'pass', title: 'Resume supported', evidence: 'Supported', action: 'No action' }],
   source: 'parent_resume',
   auditedAt: '2026-09-21T12:00:00.000Z',
+}
+
+const needsReviewAudit: ApplicationAudit = {
+  verdict: 'needs_review',
+  summary: 'One factual claim needs attention.',
+  matchScore: 76,
+  findings: [{ area: 'resume', severity: 'warning', title: 'Unsupported claim', evidence: 'The source does not contain this metric.', action: 'Remove or soften the metric.' }],
+  source: 'parent_resume',
+  auditedAt: '2026-09-21T12:01:00.000Z',
 }
 
 describe('ResumeAuditCard', () => {
@@ -56,5 +80,17 @@ describe('ResumeAuditCard', () => {
     expect(markup).toContain('Audit passed')
     expect(markup).toContain('The final materials are supported by the source resume.')
     expect(markup).toContain('No unresolved factual issues found.')
+  })
+
+  it('keeps findings and their editing actions in the same audit surface', () => {
+    const markup = renderToStaticMarkup(
+      <ResumeAuditCard audit={needsReviewAudit} auditing={false} hasLinkedJob hasCoverLetter={false} onReviewFinding={vi.fn()} onAudit={vi.fn()} />,
+    )
+
+    expect(markup).toContain('Findings to fix')
+    expect(markup).toContain('Unsupported claim')
+    expect(markup).toContain('Edit resume')
+    expect(markup).toContain('Copy fix')
+    expect(markup).toContain('Make the change, then run the audit again.')
   })
 })

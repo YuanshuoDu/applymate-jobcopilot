@@ -2,7 +2,7 @@
 
 import { useState } from 'react'
 import { MatchScoreRing, Divider } from '@/components/ui'
-import type { ApplicationAudit, Job, ScoreResult, Suggestion } from '@/lib/types'
+import type { ApplicationAudit, ApplicationAuditFinding, Job, ScoreResult, Suggestion } from '@/lib/types'
 import { useI18n } from '@/lib/i18n'
 import { ResumeAuditCard } from '@/components/resume/ResumeAuditCard'
 
@@ -32,7 +32,7 @@ const SEC_LABELS: Record<string, string> = {
 }
 const SEC_ORDER = ['Summary', 'Skills', 'Experience', 'Education', 'Projects']
 
-export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, suggesting, noJobSelected, onApplySuggestion, onAnalyze, onAddKeyword, onApplyTargeted, onEditSection, onRegenerateSection, regeneratingSection, currentSummary, currentSkills, contentChangedSinceAnalysis, applicationAudit, auditing, auditError, hasLinkedJob, hasCoverLetter, onAudit }: {
+export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, suggesting, noJobSelected, onApplySuggestion, onAnalyze, onAddKeyword, onApplyTargeted, onEditSection, onRegenerateSection, regeneratingSection, currentSummary, currentSkills, contentChangedSinceAnalysis, applicationAudit, auditing, auditError, hasLinkedJob, hasCoverLetter, onReviewFinding, onAudit }: {
   selectedJob:       Job | null
   scoreResult:                  ScoreResult | null
   suggestions:                  Suggestion[]
@@ -54,6 +54,7 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
   auditError?:                  string | null
   hasLinkedJob?:                boolean
   hasCoverLetter?:              boolean
+  onReviewFinding?:            (area: ApplicationAuditFinding['area']) => void
   onAudit?:                     () => void
 }) {
   const { t } = useI18n()
@@ -65,13 +66,14 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
     navigator.clipboard.writeText(text).then(() => { setCopied(i); setTimeout(() => setCopied(null), 1500) })
   }
 
-  const pendingSuggestions = suggestions.filter(s => !s.applied).length
-  const hasAnalysis = scoreResult || suggestions.length > 0
+  const visibleSuggestions = suggestions.filter(suggestion => !suggestion.text.startsWith('[Audit] '))
+  const pendingSuggestions = visibleSuggestions.filter(s => !s.applied).length
+  const hasAnalysis = scoreResult || visibleSuggestions.length > 0
   const hasJob      = selectedJob && !noJobSelected
 
   // Group suggestions by section target
   const suggByTarget: Record<string, Suggestion[]> = {}
-  for (const s of suggestions) {
+  for (const s of visibleSuggestions) {
     (suggByTarget[s.target] ??= []).push(s)
   }
 
@@ -95,10 +97,10 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
                 <>
                   {(() => {
                     // CV optimisation: base score + section bonuses + per-suggestion delta
-                    const applied = suggestions.filter(s => s.applied).length
-                    const secBonus = (suggestions.some(s => s.target==='summary' && s.applied) ? 8 : 0)
-                      + (suggestions.some(s => s.target==='skills' && s.applied) ? 6 : 0)
-                      + (suggestions.some(s => s.target==='experience' && s.applied) ? 6 : 0)
+                    const applied = visibleSuggestions.filter(s => s.applied).length
+                    const secBonus = (visibleSuggestions.some(s => s.target==='summary' && s.applied) ? 8 : 0)
+                      + (visibleSuggestions.some(s => s.target==='skills' && s.applied) ? 6 : 0)
+                      + (visibleSuggestions.some(s => s.target==='experience' && s.applied) ? 6 : 0)
                     const optScore = Math.min(100, scoreResult.score + applied * 3 + secBonus)
                     const delta = optScore - scoreResult.score
                     return (<div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
@@ -134,6 +136,18 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
           <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('resume.selectJobToMatch')}</div>
         )}
       </div>
+
+      {/* Audit is the source of truth for factual findings. Keep it above the
+          AI suggestions so the user can review and fix one workflow in place. */}
+      <ResumeAuditCard
+        audit={applicationAudit}
+        auditing={Boolean(auditing)}
+        auditError={auditError}
+        hasLinkedJob={hasLinkedJob ?? Boolean(hasJob)}
+        hasCoverLetter={Boolean(hasCoverLetter)}
+        onReviewFinding={onReviewFinding}
+        onAudit={onAudit ?? (() => undefined)}
+      />
 
       {/* ── Section-by-section analysis ── */}
       {scoreResult && (
@@ -259,7 +273,7 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
 
       {/* Uncategorized suggestions (target=general) — shown separately */}
       {(() => {
-        const uncategorized = suggestions.filter(s => !['summary','skills','experience','education','projects'].includes(s.target))
+        const uncategorized = visibleSuggestions.filter(s => !['summary','skills','experience','education','projects'].includes(s.target))
         if (uncategorized.length === 0) return null
         return (<div>
           <SectionHeader label={t('resume.otherSuggestions')} count={uncategorized.filter(s => !s.applied).length || undefined} collapsed={suggestCollapsed} onToggle={() => setSuggestCollapsed(v => !v)} />
@@ -307,14 +321,6 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
           <span>{t('resume.linkJobToAnalyze')}</span>
         </div>
       )}
-      <ResumeAuditCard
-        audit={applicationAudit}
-        auditing={Boolean(auditing)}
-        auditError={auditError}
-        hasLinkedJob={hasLinkedJob ?? Boolean(hasJob)}
-        hasCoverLetter={Boolean(hasCoverLetter)}
-        onAudit={onAudit ?? (() => undefined)}
-      />
     </div>
   )
 }
