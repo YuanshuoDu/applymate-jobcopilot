@@ -2702,3 +2702,15 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused Worker validation passed **3 files / 58 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Approval, schema, and legacy pipeline behavior were not changed.
 
 **Candidate boundary:** No production Neon/Postgres/RLS, Redis/BullMQ, process restart, provider/model, browser/CloakBrowser, deployment, or legacy→V2 semantic cutover validation was run. P8-56 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## 143. P8-57 — Legacy answer quarantine for canonical Turn ownership
+
+**Candidate status/date (2026-09-21):** P8-57 is recorded as a candidate Web legacy-answer quarantine slice; formal acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Goal:** Keep the legacy `/api/agent/answer` path from answering a wait already owned by an active canonical Turn, while preventing duplicate enqueue through conditional question and execution claims.
+
+**Implementation:** Commit `f55e5895` quarantines an active canonical Turn with HTTP `409` and code `canonical_turn_owns_wait`. The question and execution conditional claims gate the legacy answer path so a duplicate enqueue is not reported as successful. No schema, internal, adapter, or full migration change was introduced.
+
+**Independent verification:** Root Web focused validation passed **4/4 tests**; Web `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+**Candidate boundary:** The check-vs-claim race and full legacy→canonical migration remain explicitly unverified. No production Neon/Postgres/RLS, Redis/BullMQ, process restart, provider/model, browser/CloakBrowser, deployment, or legacy→V2 semantic cutover validation was run. P8-57 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.

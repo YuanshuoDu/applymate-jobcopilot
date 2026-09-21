@@ -1514,3 +1514,10 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Commit `cd841319` supplements canonical durable wait replay with metadata from the unique `plan.command` and `plan.revision` scope. The current plan remains current; old, conflicting, and legacy wait records preserve their existing compatibility behavior.
 - Focused Worker validation passed **3 files / 58 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Approval, schema, and legacy pipeline behavior were not changed.
 - Candidate boundary: no production Neon/Postgres/RLS, Redis/BullMQ, process restart, provider/model, browser/CloakBrowser, deployment, or legacy→V2 semantic cutover validation was run. P8-56 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## P8-57 candidate - legacy answer quarantine for canonical Turn ownership
+
+- Goal: keep the legacy `/api/agent/answer` path from answering a wait already owned by an active canonical Turn, while preventing duplicate enqueue through conditional question and execution claims.
+- Commit `f55e5895` quarantines an active canonical Turn with HTTP `409` and code `canonical_turn_owns_wait`. The question and execution conditional claims gate the legacy answer path so a duplicate enqueue is not reported as successful. No schema, internal, adapter, or full migration change was introduced.
+- Root Web focused validation passed **4/4 tests**; Web `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+- Candidate boundary: the check-vs-claim race and full legacy→canonical migration remain explicitly unverified. No production Neon/Postgres/RLS, Redis/BullMQ, process restart, provider/model, browser/CloakBrowser, deployment, or legacy→V2 semantic cutover validation was run. P8-57 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
