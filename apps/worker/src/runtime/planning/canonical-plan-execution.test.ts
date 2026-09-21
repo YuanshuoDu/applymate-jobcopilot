@@ -6,6 +6,7 @@ import { executionOwnerFence } from "../execution-owner.js"
 import { PLAN_PROPOSAL_SCHEMA_VERSION, type GoalContract, type GoalContractRef, type PlanActionKind, type PlanProposal } from "./goal-plan-contract.js"
 import { fingerprintPlanProposal } from "./plan-fingerprint.js"
 import { createCanonicalPlanExecutionFactory, type CanonicalPlanExecutionOptions } from "./canonical-plan-execution.js"
+import type { PersistedTaskGraphEvent } from "./plan-task-graph-adapter.js"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 import type { PlanCommandReceipt } from "./plan-command-receipt.js"
 import { createPlanRevisionRecoveryDispatcher, PlanRevisionRecoveryError, type PlanRevisionRecoveryDispatcher } from "./plan-revision-receipt.js"
@@ -67,6 +68,7 @@ type FixtureOverrides = {
   readonly allowedRoles?: readonly string[]
   readonly waitDefinitions?: readonly Record<string, unknown>[]
   readonly persistTaskGraph?: (input: { readonly runKey: string; readonly event: TaskGraphEvent; readonly state: TaskGraphState }) => Promise<void> | void
+  readonly initialTaskGraphEvents?: readonly PersistedTaskGraphEvent[]
   readonly rootTaskId?: string
 }
 
@@ -87,7 +89,7 @@ function fixture(router: { execute(context: ToolRouterContext, request: ToolCall
       { name: "tool_results.read", version: "1", risk: "read", capabilities: ["read"], domain: "coordination", requiredCapabilities: [] },
       ...(overrides.waitDefinitions ?? [{ name: "agent.wait", version: "1", risk: "internal_write", capabilities: ["coordination"], domain: "coordination", requiredCapabilities: [] }]),
     ] },
-    policy: {} as PolicyEngine, ...(persistOutcome ? { persistOutcome } : {}), ...(overrides.persistTaskGraph ? { persistTaskGraph: overrides.persistTaskGraph } : {}), ...(maxPlanRevisions === undefined ? {} : { maxPlanRevisions }), ...(initialPlanHashes ? { initialPlanHashes } : {}), ...(goalRef ? { goalRef } : {}), ...(allowedPlanActions === undefined ? {} : { allowedPlanActions }), ...(recoveryDispatcher ? { recoveryDispatcher } : {}),
+    policy: {} as PolicyEngine, ...(persistOutcome ? { persistOutcome } : {}), ...(overrides.persistTaskGraph ? { persistTaskGraph: overrides.persistTaskGraph } : {}), ...(overrides.initialTaskGraphEvents ? { initialTaskGraphEvents: overrides.initialTaskGraphEvents } : {}), ...(maxPlanRevisions === undefined ? {} : { maxPlanRevisions }), ...(initialPlanHashes ? { initialPlanHashes } : {}), ...(goalRef ? { goalRef } : {}), ...(allowedPlanActions === undefined ? {} : { allowedPlanActions }), ...(recoveryDispatcher ? { recoveryDispatcher } : {}),
   }
   return createCanonicalPlanExecutionFactory(options)
 }
@@ -100,6 +102,10 @@ function input(value: unknown, stepId = "step-1", toolObservations: StepContextS
     completedToolResults: [], replayed, snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations },
     ...(admitPlanCommands ? { admitPlanCommands } : {}),
   }
+}
+
+function graphEvent(runKey: string, type: TaskGraphEvent["type"], nodeId: string): PersistedTaskGraphEvent {
+  return { runKey, event: { type, nodeId, eventId: `${runKey}:${nodeId}:${type}` } }
 }
 
 function observationCode(result: Awaited<ReturnType<ReturnType<typeof fixture>>>) {
@@ -532,6 +538,70 @@ describe("createCanonicalPlanExecutionFactory", () => {
     const hook = fixture(undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, { persistTaskGraph })
     const result = await hook(input(output(proposal([use("read")])), "step-1", [existing], true))
     expect(result.observations).toEqual([])
+    expect(persistTaskGraph).not.toHaveBeenCalled()
+  })
+
+  it("hydrates matching graph history for replay and skips existing receipts", async () => {
+    const plan = proposal([use("read")])
+    const graphEvents: PersistedTaskGraphEvent[] = []
+    const fresh = fixture(undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, {
+      persistTaskGraph: entry => { graphEvents.push(entry) },
+    })
+    const first = await fresh(input(output(plan)))
+    expect(graphEvents.map(entry => entry.event.eventId)).toEqual(["root-1:proposal-1:1:read:start", "root-1:proposal-1:1:read:complete"])
+    const replayPersist = vi.fn<NonNullable<CanonicalPlanExecutionOptions["persistTaskGraph"]>>()
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { unexpected: true }, errorCode: null })) }
+    const replay = fixture(router, undefined, undefined, undefined, undefined, undefined, undefined, undefined, {
+      initialTaskGraphEvents: graphEvents, persistTaskGraph: replayPersist,
+    })
+    expect(await replay(input(output(plan), "step-1", first.observations, true))).toEqual({ observations: [] })
+    expect(router.execute).not.toHaveBeenCalled()
+    expect(replayPersist).not.toHaveBeenCalled()
+  })
+
+  it("fails replay before routing when graph history has a missing or mismatched receipt", async () => {
+    const plan = proposal([use("read")])
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { unexpected: true }, errorCode: null })) }
+    const missing = fixture(router, undefined, undefined, undefined, undefined, undefined, undefined, undefined, {
+      initialTaskGraphEvents: [graphEvent("root-1:proposal-1:1", "start", "read"), graphEvent("root-1:proposal-1:1", "complete", "read")],
+    })
+    expect(observationCode(await missing(input(output(plan), "step-1", [], true)))).toBe("invalid_plan_output")
+    expect(router.execute).not.toHaveBeenCalled()
+    const mismatched = fixture(router, undefined, undefined, undefined, undefined, undefined, undefined, undefined, {
+      initialTaskGraphEvents: [graphEvent("root-1:proposal-1:1", "start", "read"), graphEvent("root-1:proposal-1:1", "fail", "read")],
+    })
+    const existing = { id: "plan-result:proposal-1:read", content: { kind: "plan_command", localId: "read", commandKind: "tool_call", dependsOn: [], status: "completed", errorCode: null, output: { ok: true } } }
+    expect(observationCode(await mismatched(input(output(plan), "step-1", [existing], true)))).toBe("invalid_plan_output")
+    expect(router.execute).not.toHaveBeenCalled()
+  })
+
+  it("fails replay closed for illegal graph history while leaving the legacy no-history path unchanged", async () => {
+    const plan = proposal([use("read")])
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { ok: true }, errorCode: null })) }
+    const invalid = fixture(router, undefined, undefined, undefined, undefined, undefined, undefined, undefined, {
+      initialTaskGraphEvents: [graphEvent("root-1:proposal-1:1", "complete", "read")],
+    })
+    expect(observationCode(await invalid(input(output(plan), "step-1", [], true)))).toBe("invalid_plan_output")
+    expect(router.execute).not.toHaveBeenCalled()
+    const legacy = fixture(router)
+    const existing = { id: "plan-result:proposal-1:read", content: { kind: "plan_command", localId: "read", commandKind: "tool_call", dependsOn: [], status: "completed", errorCode: null, output: { ok: true } } }
+    expect(await legacy(input(output(plan), "step-1", [existing], true))).toEqual({ observations: [] })
+  })
+
+  it("keeps replay replan controls out of the graph event stream", async () => {
+    const plan = proposal([delegate("child"), join(), use("after", { dependsOn: ["join"] })])
+    const delegateObservation = { id: "plan-result:proposal-1:child", content: { kind: "plan_command", localId: "child", commandKind: "delegate", dependsOn: [], status: "completed", errorCode: null, output: { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" } } }
+    const joinObservation = { id: "plan-result:proposal-1:join", content: { kind: "plan_command", localId: "join", commandKind: "join", dependsOn: ["child"], status: "completed", errorCode: null, output: { waitId: "wait-1", status: "waiting", taskIds: ["child-1"], matchedTaskIds: [] } } }
+    const waitOutcome = { id: "wait-result:wait-1", content: { toolCallId: "wait:wait-1", toolName: "wait_subagents", input: { taskIds: ["child-1"], mode: "all" }, status: "completed", output: { waitId: "wait-1", status: "timed_out", targetTaskIds: ["child-1"], matchedTaskIds: [], tasks: [{ taskId: "child-1", status: "interrupted", result: null, failureReason: "lease expired" }] }, errorCode: null } }
+    const persistTaskGraph = vi.fn<NonNullable<CanonicalPlanExecutionOptions["persistTaskGraph"]>>()
+    const hook = fixture(undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, {
+      initialTaskGraphEvents: [
+        graphEvent("root-1:proposal-1:1", "start", "child"), graphEvent("root-1:proposal-1:1", "complete", "child"),
+        graphEvent("root-1:proposal-1:1", "start", "join"), graphEvent("root-1:proposal-1:1", "wait", "join"),
+      ], persistTaskGraph,
+    })
+    const result = await hook(input(output(plan), "step-1", [delegateObservation, joinObservation, waitOutcome], true))
+    expect(result.observations[0]?.content).toMatchObject({ localId: "join:replan", status: "replan_required" })
     expect(persistTaskGraph).not.toHaveBeenCalled()
   })
 

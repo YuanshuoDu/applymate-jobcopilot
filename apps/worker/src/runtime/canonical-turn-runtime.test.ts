@@ -8,6 +8,7 @@ import { createCanonicalTurnRuntime } from "./canonical-turn-runtime.js"
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
 import { createPgRootTaskStore } from "./subagents/root-task-store.js"
 import type { PlanProposal } from "./planning/goal-plan-contract.js"
+import type { PersistedTaskGraphEvent } from "./planning/plan-task-graph-adapter.js"
 import { PLAN_MAX_REVISIONS } from "./planning/goal-plan-contract.js"
 import { fingerprintPlanProposal } from "./planning/plan-fingerprint.js"
 import { PLAN_COMPLETION_FEEDBACK_EVENT_TYPE, planCompletionRecoveryCount } from "./planning/plan-completion-feedback.js"
@@ -465,6 +466,25 @@ describe("createCanonicalTurnRuntime", () => {
     const fixture = setup({ planningEnabled: true, planningExecutionEnabled: true, stateLoader: async () => ({ ...state(), planRevision: 2, planProposalHashes: [recoveredPlanHash] }), planExecutionFactory: factory })
     await (await fixture.runtime).execute({ lease, signal: new AbortController().signal })
     expect(factory).toHaveBeenCalledTimes(1)
+  })
+
+  it("passes server-hydrated task graph events only when present", async () => {
+    const events: readonly PersistedTaskGraphEvent[] = [{ runKey: "root-1:proposal-1:1", event: { type: "start", nodeId: "read", eventId: "root-1:proposal-1:1:read:start" } }]
+    const withHistoryFactory = vi.fn((input: { initialTaskGraphEvents?: readonly PersistedTaskGraphEvent[] }) => {
+      expect(input.initialTaskGraphEvents).toBe(events)
+      return async () => ({ observations: [] })
+    })
+    const withHistory = setup({ planningEnabled: true, planningExecutionEnabled: true, stateLoader: async () => ({ ...state(), taskGraphEvents: events }), planExecutionFactory: withHistoryFactory })
+    await (await withHistory.runtime).execute({ lease, signal: new AbortController().signal })
+    expect(withHistoryFactory).toHaveBeenCalledTimes(1)
+
+    const withoutHistoryFactory = vi.fn((input: { initialTaskGraphEvents?: readonly PersistedTaskGraphEvent[] }) => {
+      expect(input.initialTaskGraphEvents).toBeUndefined()
+      return async () => ({ observations: [] })
+    })
+    const withoutHistory = setup({ planningEnabled: true, planningExecutionEnabled: true, planExecutionFactory: withoutHistoryFactory })
+    await (await withoutHistory.runtime).execute({ lease, signal: new AbortController().signal })
+    expect(withoutHistoryFactory).toHaveBeenCalledTimes(1)
   })
 
   it("derives plan action capabilities from the server coordination gate", async () => {
