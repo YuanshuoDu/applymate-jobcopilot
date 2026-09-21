@@ -939,3 +939,9 @@ Focused Worker validation passed **42/42 tests**; Worker TypeScript and `git dif
 Commit `a3864d13` adds a 131-line pure TaskGraph reducer with a sibling **10/10 tests** suite. This is a bounded planning foundation for future supervisor graph reduction; it is not connected to the canonical runtime and does not add database persistence or a cross-process recovery path.
 
 Worker TypeScript and `git diff --check` passed. Canonical runtime integration, database persistence, cross-process recovery, and production supervisor behavior remain unverified. P8-64 is not counted as formal stage completion; acceptance remains **1/8 (12.5%)**.
+
+## P8-65 update
+
+Commit `5fbba903` adds an 83-line `plan-task-graph-adapter` with a focused **13/13 tests** suite. It provides a bounded observe seam over the TaskGraph planning foundation, but is not connected to the scheduler or executor and does not claim runtime dispatch.
+
+Worker TypeScript and `git diff --check` passed. Replan and plan-revision behavior, database persistence, cross-process recovery, and production supervisor evidence remain unverified. P8-65 remains a candidate and formal acceptance stays **1/8 (12.5%)**.

@@ -2796,3 +2796,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Worker TypeScript and `git diff --check` passed. No runtime dispatch, database, schema, queue producer, provider, or UI behavior was added by this planning slice.
 
 **Candidate boundary:** Canonical runtime integration, database persistence, cross-process recovery, and production supervisor evidence remain unverified. P8-64 remains a candidate and is not counted toward formal stage completion; acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## 151. P8-65 — Plan TaskGraph adapter observe seam
+
+**Candidate status/date (2026-09-21):** P8-65 is recorded as a planning adapter candidate; formal acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `5fbba903` adds an 83-line `plan-task-graph-adapter` and a focused **13/13 tests** suite. The adapter exposes an observe seam over the TaskGraph planning foundation, but it is not connected to the scheduler or executor.
+
+**Independent verification:** Worker TypeScript and `git diff --check` passed. No scheduler/executor wiring, database persistence, schema, queue producer, provider, or UI behavior was added.
+
+**Candidate boundary:** Replan and plan-revision behavior, database persistence, cross-process recovery, and production supervisor evidence remain unverified. P8-65 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.

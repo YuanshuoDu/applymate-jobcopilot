@@ -1569,3 +1569,9 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Commit `a3864d13` adds a 131-line pure TaskGraph reducer with a sibling **10/10 tests** suite. It is a deterministic planning foundation for future supervisor graph reduction and does not introduce a new runtime dispatch path.
 - Worker TypeScript and `git diff --check` passed. The reducer is not wired into the canonical runtime and adds no database persistence, queue producer, schema, or provider behavior.
 - Candidate boundary: canonical runtime integration, database persistence, cross-process recovery, and production supervisor evidence remain unverified. P8-64 remains a planning candidate only; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## P8-65 candidate - plan TaskGraph adapter observe seam
+
+- Commit `5fbba903` adds an 83-line `plan-task-graph-adapter` around the pure TaskGraph planning foundation, with a focused **13/13 tests** suite. It exposes an observe seam for future planning integration without changing the existing scheduler or executor path.
+- Worker TypeScript and `git diff --check` passed. The observe seam is not yet connected to the scheduler/executor; no database, schema, queue producer, provider, or UI behavior was added.
+- Candidate boundary: replan and plan-revision behavior, database persistence, cross-process recovery, and production supervisor evidence remain unverified. P8-65 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
