@@ -921,3 +921,9 @@ Commit `a7cfddd6` places the proof-gated bridge first in `/api/agent/answer`. `b
 `legacy_only` retains the old conditional question claim and waiting execution queue path. An active canonical Turn in a non-waiting status remains quarantined with `canonical_turn_owns_wait`. `dispatch_pending` is limited to enqueue failure after the old path's claim rollback. The route does not assert Worker continuation or successful legacy execution resume; canonical `resumed` is explicitly false and legacy `resumed` only describes the old enqueue branch.
 
 Root Web route validation passed **10/10 tests**. No schema or Worker consumer change was made. Outbox dispatch, Worker wakeup consumption, canonical Turn continuation, and production recovery remain unverified; P8-61 is a candidate increment and formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## P8-62 update
+
+Commit `1ef25e5a` adds the Worker wakeup continuation seam. Once the canonical Turn CAS succeeds, the wakeup transaction conditionally updates the same user/session `AgentExecution` from `waiting_for_user` to `queued`, clearing `error` and `completedAt`. Zero matching execution rows are legal for a pure canonical session; duplicate/foreign/paused executions remain unchanged.
+
+The focused fake transaction also verifies rollback when the execution reset fails, but this is not real PostgreSQL/RLS evidence. Worker queue delivery, process restart, cross-process continuation, and a complete wakeup-to-execution E2E remain unverified. Focused Worker validation passed **19/19 tests**; P8-62 narrows the continuation gap but formal acceptance remains **P0 accepted 1/8 (12.5%)**.

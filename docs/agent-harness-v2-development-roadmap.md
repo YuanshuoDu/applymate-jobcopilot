@@ -2764,3 +2764,15 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Root Web route validation passed **10/10 tests**. No schema, Worker executor, or wakeup-consumer change was made.
 
 **Candidate boundary:** Outbox dispatch, Worker wakeup consumption, canonical Turn continuation, live PostgreSQL/RLS concurrency, process restart, and complete legacy→canonical migration remain unverified. P8-61 remains a candidate.
+
+## 148. P8-62 — Worker wakeup legacy execution continuation seam
+
+**Candidate status/date (2026-09-21):** P8-62 is recorded as a candidate Worker wakeup-continuation seam; formal acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `1ef25e5a` updates the Worker `turn.wakeup` consumer so a successful canonical Turn queue transition conditionally requeues the same user/session `AgentExecution` from `waiting_for_user` to `queued`, clearing its error and completion fields in the same transaction. Zero matching execution rows are valid for canonical-only sessions. Duplicate/already-resumed wakeups, foreign rows, and paused executions do not modify the execution.
+
+**Failure boundary:** The focused transaction fixture rolls back and leaves the wakeup unpublished when the execution reset fails, but no real PostgreSQL/RLS rollback or concurrency proof was run.
+
+**Independent verification:** Focused Worker wakeup validation passed **19/19 tests**. This narrows the canonical wakeup-to-legacy execution continuation gap without changing the Worker queue contract.
+
+**Candidate boundary:** Real Worker queue delivery, process restart, cross-process E2E, and complete wakeup-to-continuation evidence remain unverified. P8-62 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
