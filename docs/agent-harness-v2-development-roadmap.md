@@ -2776,3 +2776,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused Worker wakeup validation passed **19/19 tests**. PR #497 head `089082de` has all ordinary CI checks green; the protected current dump rehearsal was skipped. This narrows the canonical wakeup-to-legacy execution continuation gap without changing the Worker queue contract.
 
 **Candidate boundary:** Real PostgreSQL/RLS, Worker queue delivery across processes, process restart, cross-process E2E, and complete wakeup-to-execution evidence remain unverified. P8-62 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## 149. P8-63 — Non-atomic spawn replay activity completion
+
+**Candidate status/date (2026-09-21):** P8-63 is recorded as a candidate Worker supervisor observability fix; formal acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `37b311a6` closes the missing activity branch in non-atomic `agent.spawn` idempotency races. After the loser task is closed and the server confirms the competing winner, the runtime records the same `spawn_subagent` replay activity marker used by the normal replay paths. Existing owner/session/root lineage validation, server-owned idempotency, and loser cleanup remain intact.
+
+**Independent verification:** The focused `coordination-executors.test.ts` suite passed **42/42 tests**; Worker TypeScript and `git diff --check` passed. No ownership/lease fence behavior was changed.
+
+**Candidate boundary:** Real concurrent behavior, PostgreSQL/RLS, queue delivery, process restart, and cross-process supervisor evidence remain unverified. P8-63 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.

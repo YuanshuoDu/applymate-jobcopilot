@@ -1557,3 +1557,9 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Duplicate or already-resumed wakeups, foreign execution/session rows, and paused executions do not change the execution row. A failed execution reset rolls back the fake transaction and leaves the wakeup unpublished in the focused fixture.
 - Root focused Worker validation passed **19/19 tests**. PR #497 head `089082de` has all ordinary CI checks green; the protected current dump rehearsal was skipped. This narrows the continuation gap between canonical wakeup facts and the legacy execution queue seam, but does not prove real PostgreSQL/RLS transaction rollback or concurrency.
 - Candidate boundary: real PostgreSQL/RLS, Worker queue delivery across processes, process restart, and complete wakeup-to-execution E2E evidence remain unverified. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-63 candidate - non-atomic spawn replay activity completion
+
+- Commit `37b311a6` fixes the non-atomic `agent.spawn` idempotency race: after the losing task is closed, a confirmed winner now records the same server-owned supervisor activity replay marker as the other spawn replay paths. The existing winner lineage assertion, tenant/session scope, idempotency key and loser close behavior are unchanged.
+- Focused Worker validation passed **42/42 tests**; Worker TypeScript and `git diff --check` passed. No schema, migration, queue producer, provider, Web, or ToolRegistry/PolicyEngine change was made.
+- This candidate does not add or alter the ownership/lease fence. Real concurrent database behavior, PostgreSQL/RLS, queue delivery, process restart, and cross-process supervisor evidence remain unverified. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.

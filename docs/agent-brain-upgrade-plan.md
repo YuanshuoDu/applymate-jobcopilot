@@ -927,3 +927,9 @@ Root Web route validation passed **10/10 tests**. No schema or Worker consumer c
 Commit `1ef25e5a` adds the Worker wakeup continuation seam. Once the canonical Turn CAS succeeds, the wakeup transaction conditionally updates the same user/session `AgentExecution` from `waiting_for_user` to `queued`, clearing `error` and `completedAt`. Zero matching execution rows are legal for a pure canonical session; duplicate/foreign/paused executions remain unchanged.
 
 The focused fake transaction also verifies rollback when the execution reset fails, but this is not real PostgreSQL/RLS evidence. Focused Worker validation passed **19/19 tests**. PR #497 head `089082de` has all ordinary CI checks green; the protected current dump rehearsal was skipped. Worker queue delivery across processes, process restart, and a complete wakeup-to-execution E2E remain unverified; P8-62 narrows the continuation gap but formal acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-63 update
+
+Commit `37b311a6` fixes a supervisor observability gap in the non-atomic `agent.spawn` idempotency race. When this caller loses the durable record race, the loser task is still closed and the validated winner is returned, but the replay activity marker was previously omitted. The path now records the same server-owned `spawn_subagent` replay activity used by the other spawn replay branches, while preserving the existing owner/session/root lineage checks and idempotent loser cleanup.
+
+Focused Worker validation passed **42/42 tests**; Worker TypeScript and `git diff --check` passed. This candidate does not change the ownership/lease fence. Real concurrent behavior, PostgreSQL/RLS, queue delivery, process restart, and cross-process supervisor evidence remain unverified. Formal acceptance remains **1/8 (12.5%)**.
