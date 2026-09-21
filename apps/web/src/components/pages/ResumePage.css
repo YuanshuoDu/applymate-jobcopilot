@@ -147,11 +147,32 @@
 .resume-library-resize-handle > span { width: 2px; height: 100%; border-radius: 999px; background: transparent; transition: background .15s ease, box-shadow .15s ease; }
 .resume-library-resize-handle:hover > span, .resume-library-resize-handle:focus-visible > span, .resume-library-layout.is-library-resizing .resume-library-resize-handle > span { background: #8c80f1; box-shadow: 0 0 0 3px rgba(76,50,239,.10); }
 .resume-workspace { grid-column: 2; grid-row: 1; min-width: 0; padding: 16px 24px 28px !important; background: #fcfcff; }
-.resume-workspace-head { display: flex; align-items: center; justify-content: space-between; max-width: 760px; margin: 0 auto 13px; }
-.resume-workspace-head h2 { display: flex; align-items: baseline; gap: 9px; margin: 0; color: #151a35; font-size: 18px; letter-spacing: -.03em; }
-.resume-workspace-head h2 span { color: #787f9e; font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
-.resume-workspace-actions { display: inline-flex; align-items: center; gap: 10px; }
-.resume-workspace-actions button { min-height: 28px; padding: 5px 9px; border: 1px solid #e1dff2; border-radius: 6px; color: #44358f; background: #fff; font: inherit; font-size: 10px; font-weight: 700; cursor: pointer; }
+.resume-workspace-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; max-width: 794px; margin: 0 auto 16px; }
+.resume-workspace-title-copy { display: grid; min-width: 0; gap: 5px; }
+.resume-workspace-eyebrow { display: inline-flex; align-items: center; gap: 6px; color: #7a819e; font-size: 10px; font-weight: 750; letter-spacing: .1em; line-height: 1; text-transform: uppercase; }
+.resume-workspace-eyebrow-icon { display: inline-flex; align-items: center; justify-content: center; width: 21px; height: 21px; border: 1px solid #ddd9f8; border-radius: 6px; color: #5941ed; background: #f2f0ff; }
+.resume-workspace-name-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; }
+.resume-workspace-head h2 { min-width: 0; overflow: hidden; margin: 0; color: #151a35; font-size: 22px; font-weight: 760; letter-spacing: -.045em; line-height: 1.12; text-overflow: ellipsis; white-space: nowrap; }
+.resume-workspace-version-chip { display: inline-flex; align-items: center; min-height: 21px; padding: 0 8px; border: 1px solid #ddd9f8; border-radius: 999px; color: #5a40ee; background: #f4f2ff; font-size: 9px; font-weight: 750; letter-spacing: .03em; text-transform: uppercase; }
+.resume-workspace-version-chip.is-default { border-color: #cbe9dc; color: #16865d; background: #effaf4; }
+.resume-workspace-actions { display: inline-flex; align-items: center; gap: 10px; padding-top: 2px; }
+.resume-workspace-preview-button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-height: 32px; padding: 0 12px; border: 1px solid #dcd8f5; border-radius: 8px; color: #44358f; background: #fff; box-shadow: 0 2px 5px rgba(67,46,196,.05); font: inherit; font-size: 11px; font-weight: 750; cursor: pointer; }
+.resume-workspace-preview-button:hover, .resume-workspace-preview-button:focus-visible { border-color: #8c7eff; color: #3925c8; background: #f7f5ff; outline: none; }
+.resume-workspace-preview-button[aria-pressed="true"] { border-color: #725ff3; color: #fff; background: #4c32ef; box-shadow: 0 5px 12px rgba(76,50,239,.18); }
+.resume-format-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 58px; margin: 0 auto 12px; padding: 9px 12px; border: 1px solid #e4e2f3; border-radius: 11px; background: linear-gradient(180deg, #fff 0%, #fbfaff 100%); box-shadow: 0 4px 14px rgba(51,42,126,.045); }
+.resume-format-toolbar-title { display: inline-flex; align-items: center; gap: 9px; min-width: 155px; }
+.resume-format-toolbar-icon { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 8px; color: #5941ed; background: #f0eeff; }
+.resume-format-toolbar-copy { display: grid; gap: 2px; }
+.resume-format-toolbar-copy strong { color: #2a304d; font-size: 11px; line-height: 1.1; }
+.resume-format-toolbar-copy small { color: #858ca8; font-size: 9px; line-height: 1.2; white-space: nowrap; }
+.resume-format-toolbar-groups { display: inline-flex; align-items: center; gap: 10px; min-width: 0; }
+.resume-format-group { display: inline-flex; align-items: center; gap: 3px; padding: 3px; border: 1px solid #e7e5f3; border-radius: 8px; background: #fff; }
+.resume-format-group-label { margin: 0 4px 0 5px; color: #8a91aa; font-size: 9px; font-weight: 750; letter-spacing: .05em; text-transform: uppercase; }
+.resume-format-toolbar-divider { width: 1px; height: 25px; background: #e5e3f1; }
+.resume-format-button { display: inline-flex; align-items: center; justify-content: center; min-width: 30px; height: 28px; padding: 0 7px; border: 0; border-radius: 6px; color: #39405d; background: transparent; font: inherit; font-size: 11px; font-weight: 600; cursor: pointer; }
+.resume-format-button:hover, .resume-format-button:focus-visible { color: #4c32ef; background: #f0eeff; outline: none; }
+.resume-format-button-h1, .resume-format-button-h2 { min-width: 35px; font-weight: 700; }
+.resume-format-button-bullet { font-size: 16px; line-height: 1; }
 .resume-workspace-actions span { color: #169b69; font-size: 10px; font-weight: 600; }
 .resume-workspace-actions span.is-unsaved { color: #b7791f; }
 .resume-linked-job-bar { display: flex; align-items: center; justify-content: space-between; max-width: 680px; margin: 0 auto 12px; padding: 10px 13px; border: 1px solid #dedbfa; border-radius: 8px; background: #fff; }
@@ -216,6 +237,11 @@
   .resume-library-sidebar { width: auto; flex-basis: auto; border-right: 0; border-bottom: 1px solid #ebeaf6; }
   .resume-library-list { grid-template-columns: minmax(0, 1fr); }
   .resume-workspace { padding: 16px 12px !important; }
+  .resume-workspace-head { gap: 10px; }
+  .resume-workspace-head h2 { font-size: 18px; }
+  .resume-format-toolbar { align-items: stretch; flex-direction: column; gap: 10px; }
+  .resume-format-toolbar-title { min-width: 0; }
+  .resume-format-toolbar-groups { justify-content: space-between; flex-wrap: wrap; }
   .resume-paper { padding: 22px 18px !important; }
   .resume-linked-job-bar { align-items: flex-start; gap: 10px; }
   .resume-link-empty { grid-template-columns: 1fr; }

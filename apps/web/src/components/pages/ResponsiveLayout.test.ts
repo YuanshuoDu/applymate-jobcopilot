@@ -45,14 +45,26 @@ describe('tablet and phone layout safeguards', () => {
     expect(globalCss).toMatch(/\.app-sidebar-toggle\s*\{[\s\S]*position:\s*absolute[\s\S]*right:\s*-14px/)
   })
 
-  it('moves the collapsed account menu into a readable flyout', () => {
+  it('expands the collapsed sidebar for a readable account menu', () => {
     expect(sidebarSource).toContain('className="app-sidebar-account-menu"')
-    expect(globalCss).toMatch(/\.app-sidebar\.is-collapsed \.app-sidebar-account-menu\s*\{[\s\S]*left:\s*calc\(100% \+ 10px\)[\s\S]*width:\s*228px/)
+    expect(sidebarSource).toContain("' is-account-menu-open'")
+    expect(globalCss).toMatch(/\.app-sidebar\.is-collapsed\.is-account-menu-open\s*\{[\s\S]*width:\s*var\(--sidebar-w\)/)
+    expect(globalCss).toMatch(/\.app-sidebar\.is-collapsed\.is-account-menu-open \.app-sidebar-account-menu\s*\{[\s\S]*left:\s*0[\s\S]*right:\s*0[\s\S]*width:\s*auto/)
     expect(globalCss).toMatch(/\.app-sidebar-account-menu-item\s*\{[\s\S]*white-space:\s*nowrap/)
   })
 
   it('uses a stable one-pixel selected resume border', () => {
     expect(resumeCss).toMatch(/\.resume-library-item\s*\{[\s\S]*border:\s*1px solid var\(--border\)/)
     expect(resumeCss).toMatch(/\.resume-library-item\.is-selected\s*\{[\s\S]*border-width:\s*1px !important/)
+  })
+
+  it('gives the resume editor title and formatting toolkit a clear hierarchy', () => {
+    expect(resumePageSource).toContain('className="resume-workspace-title-copy"')
+    expect(resumePageSource).toContain('className="resume-format-toolbar"')
+    expect(resumePageSource).toContain('role="toolbar"')
+    expect(resumePageSource).toContain('aria-label={tool.title}')
+    expect(resumeCss).toMatch(/\.resume-workspace-title-copy\s*\{[\s\S]*display:\s*grid/)
+    expect(resumeCss).toMatch(/\.resume-format-toolbar\s*\{[\s\S]*display:\s*flex/)
+    expect(resumeCss).toMatch(/\.resume-format-group\s*\{[\s\S]*border:/)
   })
 })
