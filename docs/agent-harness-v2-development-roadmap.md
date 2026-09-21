@@ -2600,3 +2600,15 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused Worker validation passed **3 files / 32 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No database migration, Web, provider, queue, or dependency change was introduced.
 
 **Candidate boundary:** No production Neon/Postgres/RLS, Redis/BullMQ, process restart, provider/model, browser/CloakBrowser, deployment, or legacy→V2 semantic cutover validation was run. The legacy diagnostic taxonomy remains a future follow-up/no-op; P8-48 does not claim that legacy→V2 semantic cutover is fixed. P8-48 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## 135. P8-49 — Completion verifier goal-revision fence
+
+**Candidate status/date (2026-09-21):** P8-49 is recorded as a candidate Worker completion-verification/barrier slice; formal acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Goal:** Bind completion verification to the current server-owned `GoalContract` revision so that after `agent.goal.update`, completion control, dependency evidence, and plan evidence from the old goal fail closed.
+
+**Implementation:** Commit `f88f6b38` passes the current server-owned goal revision into the completion verifier/barrier. Old-goal completion/control/dependency evidence is rejected after a goal update; a later goal with future or missing `plan_revision` metadata also fails closed. Expected goal revision `1` without `plan_revision` metadata preserves the legacy compatibility path, while a new plan under goal revision `2` can complete.
+
+**Independent verification:** Focused Worker verifier and Turn execution validation passed **2 files / 88 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No schema, migration, Web, provider, queue, or dependency change was introduced.
+
+**Candidate boundary:** No production Neon/Postgres/RLS, Redis/BullMQ, process restart, provider/model, browser/CloakBrowser, deployment, or legacy→V2 semantic cutover validation was run. The legacy diagnostic taxonomy remains a future follow-up/no-op; P8-49 does not claim that legacy→V2 semantic cutover is fixed. P8-49 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
