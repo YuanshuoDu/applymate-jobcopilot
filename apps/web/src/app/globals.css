@@ -265,11 +265,15 @@ body {
   white-space: nowrap;
 }
 
-.app-sidebar.is-collapsed .app-sidebar-account-menu {
-  left: calc(100% + 10px);
-  right: auto;
-  width: 228px;
-  max-width: calc(100vw - 84px);
+.app-sidebar.is-collapsed.is-account-menu-open {
+  width: var(--sidebar-w);
+}
+
+.app-sidebar.is-collapsed.is-account-menu-open .app-sidebar-account-menu {
+  left: 0;
+  right: 0;
+  width: auto;
+  max-width: none;
 }
 
 .app-nav-button {
