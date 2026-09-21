@@ -299,6 +299,53 @@ describe("loadCanonicalTurnState", () => {
     expect(value.snapshot.toolObservations.some(item => item.id === command.observationId)).toBe(false)
   })
 
+  it("rejects an unknown planCallId from the current plan scope and action count", async () => {
+    const current = { revision: 2, objective: "Find senior jobs", constraints: [], successCriteria: [], knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "runtime:turn" }
+    const command = { planCallId: "current-plan", planRevision: 1, observationId: "plan-result:current-plan:read", content: { kind: "plan_command", commandKind: "tool_call", status: "completed", output: { found: true } } }
+    const foreign = { ...command, planCallId: "foreign-plan", observationId: "plan-result:foreign-plan:read" }
+    const value = await loadCanonicalTurnState(pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      steps: [{ ordinal: 0, attempt: 1, inputThroughSequence: "1", consumedInputIds: [], inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }],
+      events: [
+        { type: "goal.revision", payload: { goalRevision: 2, basedOnGoalRevision: 1, goalContract: current } },
+        { type: "plan.revision", payload: { planCallId: "current-plan", goalRevision: 2, planRevision: 1, basedOnPlanRevision: null } },
+        { type: "plan.command", payload: command },
+        { type: "plan.command", payload: foreign },
+      ],
+    }), lease)
+    expect(value.snapshot.toolObservations.some(item => item.id === command.observationId)).toBe(true)
+    expect(value.snapshot.toolObservations.some(item => item.id === foreign.observationId)).toBe(false)
+    expect(value.resume?.planActionCount).toBe(1)
+  })
+
+  it("rejects a plan command receipt without an accepted revision", async () => {
+    const command = { planCallId: "accepted-plan", planRevision: 1, observationId: "plan-result:accepted-plan:read", content: { kind: "plan_command", commandKind: "tool_call", status: "completed", output: { found: true } } }
+    const foreign = { ...command, planCallId: "unaccepted-plan", observationId: "plan-result:unaccepted-plan:read" }
+    const value = await loadCanonicalTurnState(pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      steps: [{ ordinal: 0, attempt: 1, inputThroughSequence: "1", consumedInputIds: [], inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }],
+      events: [
+        { type: "plan.revision", payload: { planCallId: "accepted-plan", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null } },
+        { type: "plan.command", payload: command },
+        { type: "plan.command", payload: foreign },
+      ],
+    }), lease)
+    expect(value.snapshot.toolObservations.some(item => item.id === command.observationId)).toBe(true)
+    expect(value.snapshot.toolObservations.some(item => item.id === foreign.observationId)).toBe(false)
+    expect(value.resume?.planActionCount).toBe(1)
+  })
+
+  it("preserves revision-one plan command receipts when no accepted revision metadata exists", async () => {
+    const command = { planCallId: "legacy-plan", planRevision: 1, observationId: "plan-result:legacy-plan:read", content: { kind: "plan_command", commandKind: "tool_call", status: "completed", output: { found: true } } }
+    const value = await loadCanonicalTurnState(pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      steps: [{ ordinal: 0, attempt: 1, inputThroughSequence: "1", consumedInputIds: [], inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }],
+      events: [{ type: "plan.command", payload: command }],
+    }), lease)
+    expect(value.snapshot.toolObservations).toEqual(expect.arrayContaining([{ id: command.observationId, content: command.content }]))
+    expect(value.resume?.planActionCount).toBe(1)
+  })
+
   it("counts valid plan action receipts once across command and observation events", async () => {
     const read = { planCallId: "plan-1", planRevision: 1, observationId: "plan-result:plan-1:read", content: { kind: "plan_command", commandKind: "tool_call", status: "completed", errorCode: null } }
     const delegate = { planCallId: "plan-1", planRevision: 1, observationId: "plan-result:plan-1:delegate", content: { kind: "plan_command", commandKind: "delegate", status: "failed", errorCode: "router_execution_failed" } }

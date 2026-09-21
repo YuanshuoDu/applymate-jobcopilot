@@ -124,14 +124,19 @@ function acceptedPlanRevisions(observations: StepContextSnapshot["toolObservatio
 function expectedPlanRevision(payload: Record<string, unknown>, revisions: ReadonlyMap<string, number>): number | undefined {
   return typeof payload.planCallId === "string" ? revisions.get(payload.planCallId) : undefined
 }
+function planReceiptInScope(planCallId: unknown, currentPlanIds: ReadonlySet<string> | undefined, acceptedRevisions: ReadonlyMap<string, number>): boolean {
+  if (currentPlanIds) return typeof planCallId === "string" && currentPlanIds.has(planCallId)
+  if (acceptedRevisions.size > 0) return typeof planCallId === "string" && acceptedRevisions.has(planCallId)
+  return true
+}
 function planCommandObservations(events: readonly Row[], currentPlanIds?: ReadonlySet<string>, revisions: ReadonlyMap<string, number> = new Map()): StepContextSnapshot["toolObservations"] {
   return events.filter(event => event.type === "plan.command").flatMap(event => {
     const payload = eventPayload(event.payload)
     const receipt = parsePlanCommandReceipt(payload, undefined, expectedPlanRevision(payload, revisions))
-    return receipt && (!currentPlanIds || currentPlanIds.has(receipt.planCallId)) ? [planCommandObservation(receipt)] : []
+    return receipt && planReceiptInScope(receipt.planCallId, currentPlanIds, revisions) ? [planCommandObservation(receipt)] : []
   })
 }
-function planActionCount(events: readonly Row[], revisions: ReadonlyMap<string, number> = new Map()): number {
+function planActionCount(events: readonly Row[], currentPlanIds?: ReadonlySet<string>, revisions: ReadonlyMap<string, number> = new Map()): number {
   const counted = new Set<string>()
   for (const event of events) {
     if (event.type !== "plan.command" && event.type !== "plan.observation") continue
@@ -139,6 +144,8 @@ function planActionCount(events: readonly Row[], revisions: ReadonlyMap<string, 
     const receipt = event.type === "plan.command"
       ? parsePlanCommandReceipt(payload, undefined, expectedPlanRevision(payload, revisions))
       : null
+    const planCallId = event.type === "plan.command" ? receipt?.planCallId : payload.planCallId
+    if (!planReceiptInScope(planCallId, currentPlanIds, revisions)) continue
     const observationId = event.type === "plan.command" ? receipt?.observationId : payload.observationId
     const content = event.type === "plan.command" ? receipt?.content : payload.content
     const contentObject = object(content)
@@ -274,7 +281,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
       nextOrdinal: (maxOrdinal ?? Number(last.ordinal)) + 1,
       stepCount: steps.length,
       toolCallCount: itemsResult.rows.filter(item => item.type === "tool_call").length,
-      planActionCount: planActionCount(eventsResult.rows, acceptedRevisions),
+      planActionCount: planActionCount(eventsResult.rows, currentPlanIds, acceptedRevisions),
       inputThroughSequence: BigInt(String(last?.inputThroughSequence ?? 0)),
       consumedInputIds: Array.isArray(last?.consumedInputIds) ? last.consumedInputIds.filter((id): id is string => typeof id === "string") : [],
       usage,
