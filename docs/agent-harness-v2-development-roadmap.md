@@ -2612,3 +2612,15 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused Worker verifier and Turn execution validation passed **2 files / 88 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No schema, migration, Web, provider, queue, or dependency change was introduced.
 
 **Candidate boundary:** No production Neon/Postgres/RLS, Redis/BullMQ, process restart, provider/model, browser/CloakBrowser, deployment, or legacy→V2 semantic cutover validation was run. The legacy diagnostic taxonomy remains a future follow-up/no-op; P8-49 does not claim that legacy→V2 semantic cutover is fixed. P8-49 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## 136. P8-50 — Current-plan replan blocker scoping
+
+**Candidate status/date (2026-09-21):** P8-50 is recorded as a candidate Worker plan-revision and active-signal classification slice; formal acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Goal:** Scope canonical `replan_required` blockers to the current accepted plan so a newer plan can supersede stale blocker evidence without discarding historical observations or replay evidence.
+
+**Implementation:** Commit `4daf02e7` adds a shared plan-revision-scope helper that derives the latest `planCallId` from the current goal's contiguous accepted plan revisions. During active-signal classification only, `cognitive-control-frame` and `action-agenda` ignore a canonical `replan_required` blocker superseded by a newer plan; the current blocker remains active. Duplicate, gap, unknown, and legacy cases remain fail-closed blockers.
+
+**Independent verification:** Focused Worker validation passed **3 files / 39 tests** across `plan-revision-scope`, `cognitive-control-frame`, and `cognitive-action-agenda`; Worker `tsc --noEmit --skipLibCheck`, `git diff --check`, and the source-file-under-250-lines check passed. No schema, migration, Web, provider, queue, or dependency change was introduced.
+
+**Candidate boundary:** No production Neon/Postgres/RLS, Redis/BullMQ, process restart, provider/model, browser/CloakBrowser, deployment, or legacy→V2 semantic cutover validation was run. The legacy diagnostic taxonomy remains a future follow-up/no-op; P8-50 does not claim that legacy→V2 semantic cutover is fixed. P8-50 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
