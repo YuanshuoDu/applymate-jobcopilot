@@ -4,6 +4,10 @@ import { Prisma, PrismaClient } from "@prisma/client"
 import { redactAgentEvent, redactSensitiveValue } from "@jobcopilot/shared"
 
 import { appendAgentEventWithOutboxInTransaction } from "./fact-store"
+import {
+  parseCanonicalQuestionPayload,
+  prepareCanonicalQuestionInTransaction,
+} from "./canonical-question-dual-write"
 import { mapLegacyTranscriptToV2 } from "./legacy-v2-mapping"
 import { insertProjectedTranscript } from "./transcript-projector"
 import type { AgentSessionStatus } from "./types"
@@ -58,6 +62,7 @@ export async function createDualWriteSession(
   input: EnsureV2TurnInput,
 ): Promise<DualWriteSession> {
   const turn = await ensureV2Turn(db, turnInput(input))
+  const hasExplicitTurn = typeof input.turnId === "string" && input.turnId.length > 0
 
   return {
     ...turn,
@@ -66,15 +71,36 @@ export async function createDualWriteSession(
         await lockOpenSession(tx, turn)
         const currentTurn = await tx.agentTurn.findFirst({
           where: { id: turn.turnId, sessionId: turn.sessionId, userId: turn.userId },
-          select: { id: true },
+          select: { id: true, sessionId: true, userId: true, status: true, revision: true },
         })
         if (!currentTurn) throw new Error("Cannot dual-write an unauthorized agent turn")
 
         const mapping = mapLegacyTranscriptToV2(legacy, raw?.name)
         const safeLegacy = redactAgentEvent(legacy)
         const safeSourcePayload = redactSensitiveValue(raw?.payload ?? legacy.data ?? null)
-        const eventIdempotencyKey = `legacy-transcript:${turn.turnId}:${randomUUID()}`
-        const itemId = randomUUID()
+        const question = hasExplicitTurn && raw?.name === "orchestrator_question"
+          ? parseCanonicalQuestionPayload(raw.payload)
+          : null
+        const canonical = question && currentTurn
+          ? await prepareCanonicalQuestionInTransaction({
+            tx,
+            session: { id: turn.sessionId, userId: turn.userId },
+            turn: currentTurn,
+            question,
+            sourcePayload: safeSourcePayload,
+            legacy,
+            safeLegacy,
+          })
+          : null
+        const questionMapping = canonical
+          ? { eventType: "item.started", actor: "orchestrator" as const, itemType: "question", itemStatus: "started" as const, phase: "commentary" as const, opaque: false }
+          : null
+        const eventMapping = questionMapping ?? mapping
+        const sourceEvent = canonical ? "orchestrator_question" : raw?.name ?? legacy.type
+        const eventIdempotencyKey = canonical
+          ? `agent-wait:${canonical.itemId}:started`
+          : `legacy-transcript:${turn.turnId}:${randomUUID()}`
+        const itemId = canonical?.itemId ?? randomUUID()
         const timestamp = new Date()
         const content = {
           legacyType: legacy.type,
@@ -83,35 +109,37 @@ export async function createDualWriteSession(
           body: safeLegacy.body,
           durationMs: legacy.durationMs ?? null,
           data: safeLegacy.data,
-          sourceEvent: raw?.name ?? legacy.type,
+          sourceEvent,
           sourcePayload: safeSourcePayload,
-          opaque: mapping.opaque,
+          opaque: eventMapping.opaque,
         }
-        await tx.agentItem.create({
-          data: {
-            id: itemId,
-            sessionId: turn.sessionId,
-            turnId: turn.turnId,
-            taskId: legacy.taskId ?? null,
-            type: mapping.itemType,
-            status: mapping.itemStatus,
-            phase: mapping.phase,
-            revision: 0,
-            content: json(content),
-            startedAt: mapping.itemStatus === "started" ? timestamp : null,
-            completedAt: mapping.itemStatus === "completed" || mapping.itemStatus === "failed" ? timestamp : null,
-          },
-        })
+        if (!canonical) {
+          await tx.agentItem.create({
+            data: {
+              id: itemId,
+              sessionId: turn.sessionId,
+              turnId: turn.turnId,
+              taskId: legacy.taskId ?? null,
+              type: eventMapping.itemType,
+              status: eventMapping.itemStatus,
+              phase: eventMapping.phase,
+              revision: 0,
+              content: json(content),
+              startedAt: eventMapping.itemStatus === "started" ? timestamp : null,
+              completedAt: eventMapping.itemStatus === "completed" || eventMapping.itemStatus === "failed" ? timestamp : null,
+            },
+          })
+        }
 
-        const { event } = await appendAgentEventWithOutboxInTransaction(tx, {
+        const { event, duplicate } = await appendAgentEventWithOutboxInTransaction(tx, {
           sessionId: turn.sessionId,
           turnId: turn.turnId,
           itemId,
           taskId: legacy.taskId ?? null,
-          type: mapping.eventType,
-          actor: mapping.actor,
-          correlationId: turn.turnId,
-          causationId: null,
+          type: eventMapping.eventType,
+          actor: eventMapping.actor,
+          correlationId: canonical ? itemId : turn.turnId,
+          causationId: canonical ? question?.id ?? null : null,
           idempotencyKey: eventIdempotencyKey,
           payload: json({
             legacy: {
@@ -122,9 +150,9 @@ export async function createDualWriteSession(
               durationMs: legacy.durationMs ?? null,
               data: safeLegacy.data,
             },
-            sourceEvent: raw?.name ?? legacy.type,
+            sourceEvent,
             sourcePayload: safeSourcePayload,
-            opaque: mapping.opaque,
+            opaque: eventMapping.opaque,
           }),
           outboxTopic: "agent.session.event",
         })
@@ -145,7 +173,7 @@ export async function createDualWriteSession(
             },
           })
         }
-        const projected = await insertProjectedTranscript(tx, { ...event, turnId: eventTurnId })
+        const projected = duplicate ? restoreLegacyResponse(legacy, safeLegacy.data) : await insertProjectedTranscript(tx, { ...event, turnId: eventTurnId })
         return restoreLegacyResponse(projected, safeLegacy.data)
       })
     },
