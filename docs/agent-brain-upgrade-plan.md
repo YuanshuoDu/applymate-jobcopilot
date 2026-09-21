@@ -835,3 +835,11 @@ Commit `43c7daa7` adds plan ownership parsing for `plan-result`, `plan-control`,
 Focused Worker validation passed **4 suites / 73 tests**, including `cognitive-memory-recall`; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Source line bounds were checked: `plan-revision-scope` 86, `cognitive-control-frame` 229, and `cognitive-action-agenda` 186 lines. No schema, migration, Web, provider, queue, or dependency change was introduced. Production Neon/Postgres/RLS, Redis/BullMQ delivery, process restart, provider/model, browser/CloakBrowser, deployment, and legacy→V2 semantic cutover evidence remain unverified. Formal acceptance remains **P0 accepted 1/8 (12.5%)**; P8-51 is a candidate increment.
 
 Follow-up P8-52: fence same-goal references from an older plan in context-memory recall and active wait/approval signals; this has been audited but is not implemented yet.
+
+## P8-52 update
+
+Goal: prevent same-goal active waits, pending approvals, and unresolved references from an older plan from remaining actionable after a valid current plan revision advances, while preserving metadata-free legacy behavior and failing closed for future, invalid, or ambiguous metadata.
+
+Commit `ed62779e` applies the current plan-revision fence across context-memory projection/schema/recall and the active action-agenda/control-frame paths. Old-plan active waits, pending approvals, and unresolved references no longer drive current action selection when the current plan revision is valid; historical references remain durable and metadata-free legacy references remain compatible.
+
+Focused Worker validation passed **6 suites / 104 tests**, including `plan-revision-scope`; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Source line bounds were checked: context-memory projection 250, context-memory schema 174, cognitive-memory recall 183, cognitive-action-agenda 188, and cognitive-control-frame 231 lines. No schema, migration, Web, provider, queue, or dependency change was introduced. Production Neon/Postgres/RLS, Redis/BullMQ delivery, process restart, provider/model, browser/CloakBrowser, deployment, and legacy→V2 semantic cutover evidence remain unverified. Formal acceptance remains **P0 accepted 1/8 (12.5%)**; P8-52 is a candidate increment.

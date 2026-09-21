@@ -2638,3 +2638,15 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Candidate boundary:** No production Neon/Postgres/RLS, Redis/BullMQ, process restart, provider/model, browser/CloakBrowser, deployment, or legacy→V2 semantic cutover validation was run. P8-51 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
 
 **Follow-up P8-52:** Fence same-goal references from an older plan in context-memory recall and active wait/approval signals; this has been audited but is not implemented yet.
+
+## 138. P8-52 — Same-goal stale-plan active reference fencing
+
+**Candidate status/date (2026-09-21):** P8-52 is recorded as a candidate Worker same-goal stale-plan active-reference fencing slice; formal acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Goal:** Prevent same-goal active waits, pending approvals, and unresolved references from an older plan from remaining actionable after a valid current plan revision advances, while preserving metadata-free legacy behavior and failing closed for future, invalid, or ambiguous metadata.
+
+**Implementation:** Commit `ed62779e` applies the current plan-revision fence across context-memory projection/schema/recall and the active action-agenda/control-frame paths. Old-plan active waits, pending approvals, and unresolved references no longer drive current action selection when the current plan revision is valid; historical references remain durable and metadata-free legacy references remain compatible.
+
+**Independent verification:** Focused Worker validation passed **6 suites / 104 tests**, including `plan-revision-scope`; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Source line bounds were checked: context-memory projection 250, context-memory schema 174, cognitive-memory recall 183, cognitive-action-agenda 188, and cognitive-control-frame 231 lines. No schema, migration, Web, provider, queue, or dependency change was introduced.
+
+**Candidate boundary:** No production Neon/Postgres/RLS, Redis/BullMQ, process restart, provider/model, browser/CloakBrowser, deployment, or legacy→V2 semantic cutover validation was run. P8-52 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
