@@ -165,6 +165,58 @@ describe("coordination executors", () => {
     expect(runtime.store.activities).toContain("spawn_subagent")
   })
 
+  it("rejects an existing spawn replay from another turn", async () => {
+    const runtime = makeRuntime()
+    const stale = makeTask({ id: "stale-child", turnId: "turn-old", rootTaskId: "stale-child", path: "/stale-child", status: "queued" })
+    runtime.store.tasks.set(stale.id, stale)
+    runtime.store.spawnOperations.set("session-a:spawn-stale", stale.id)
+
+    await expect(executeSpawn(context(), { idempotencyKey: "spawn-stale", role: "scout", taskType: "inspect", goal: "Inspect" }, runtime.options))
+      .rejects.toMatchObject({ code: "coordination_idempotency_conflict" })
+    expect(runtime.store.activities).toHaveLength(0)
+    expect(runtime.manager.spawn).not.toHaveBeenCalled()
+  })
+
+  it("rejects an existing spawn replay from the wrong parent branch", async () => {
+    const runtime = makeRuntime()
+    const otherRoot = makeTask({ id: "root-2", rootTaskId: "root-2", path: "/root-2" })
+    const stale = makeTask({ id: "stale-child", parentTaskId: "root-1", rootTaskId: "root-1", path: "/root-1/stale-child", depth: 1, status: "queued" })
+    runtime.store.tasks.set(otherRoot.id, otherRoot)
+    runtime.store.tasks.set(stale.id, stale)
+    runtime.store.spawnOperations.set("session-a:spawn-branch", stale.id)
+
+    await expect(executeSpawn(context({ taskId: otherRoot.id, rootTaskId: otherRoot.rootTaskId }), { idempotencyKey: "spawn-branch", role: "scout", taskType: "inspect", goal: "Inspect" }, runtime.options))
+      .rejects.toMatchObject({ code: "coordination_idempotency_conflict" })
+    expect(runtime.store.activities).toHaveLength(0)
+    expect(runtime.manager.spawn).not.toHaveBeenCalled()
+  })
+
+  it("rejects an atomic duplicate winner from another turn or branch", async () => {
+    const runtime = makeRuntime()
+    const stale = makeTask({ id: "atomic-stale", turnId: "turn-old", parentTaskId: "root-1", rootTaskId: "root-1", path: "/root-1/atomic-stale", depth: 1, status: "queued" })
+    runtime.store.tasks.set(stale.id, stale)
+    runtime.manager.supportsAtomicSpawn = vi.fn(() => true)
+    runtime.manager.spawnAtomic = vi.fn(async () => ({ task: null, duplicate: true, atomic: true }))
+    runtime.store.getSpawnReplay = vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce(stale)
+
+    await expect(executeSpawn(context({ taskId: "root-1", rootTaskId: "root-1" }), { idempotencyKey: "spawn-atomic-stale", role: "scout", taskType: "inspect", goal: "Inspect" }, runtime.options))
+      .rejects.toMatchObject({ code: "coordination_idempotency_conflict" })
+    expect(runtime.store.activities).toHaveLength(0)
+  })
+
+  it("rejects a record-race winner from another turn or branch after closing the loser", async () => {
+    const runtime = makeRuntime()
+    const stale = makeTask({ id: "race-stale", turnId: "turn-old", parentTaskId: "root-1", rootTaskId: "root-1", path: "/root-1/race-stale", depth: 1, status: "queued" })
+    runtime.store.tasks.set(stale.id, stale)
+    runtime.store.recordSpawn = vi.fn(async () => false)
+    runtime.store.getSpawnReplay = vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce(stale)
+
+    await expect(executeSpawn(context({ taskId: "root-1", rootTaskId: "root-1" }), { idempotencyKey: "spawn-race-stale", role: "scout", taskType: "inspect", goal: "Inspect" }, runtime.options))
+      .rejects.toMatchObject({ code: "coordination_idempotency_conflict" })
+    expect(runtime.manager.close).toHaveBeenCalledWith("child-1", "session-a")
+    expect(runtime.store.activities).toHaveLength(0)
+  })
+
   it.each(["root", "orchestrator", "admin", "elevated", "future-role", "toString", "constructor", "__proto__"])("rejects unsupported spawn role %s before dispatch", async role => {
     const runtime = makeRuntime()
     await expect(executeSpawn(context(), { idempotencyKey: `spawn-${role}`, role, taskType: "inspect", goal: "Inspect" }, runtime.options)).rejects.toMatchObject({ code: "coordination_invalid_input" })

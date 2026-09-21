@@ -27,9 +27,11 @@ const FOREIGN_RESULT_KEYS = new Set(["userId", "sessionId", "turnId", "stepId", 
 export async function executeSpawn(context: ToolExecutionContext, input: SpawnSubagentInput, options: CoordinationExecutorOptions) {
   const policy = typeof input.role === "string" ? getSubagentRolePolicy(input.role) : null
   if (!policy || policy.actorRole !== "subagent" || policy.canManageChildren || policy.externalWritesEnabled) throw new CoordinationError("coordination_invalid_input", "Unsupported subagent role")
-  const parentTaskId = await resolveSpawnParent(context, input.parentTaskId, options)
+  const lineage = await resolveSpawnLineage(context, input.parentTaskId, options)
+  const parentTaskId = lineage.parentTaskId
   const replay = await options.store.getSpawnReplay({ userId: context.scope.userId, sessionId: context.sessionId, idempotencyKey: input.idempotencyKey })
   if (replay) {
+    assertSpawnReplay(replay, context, lineage)
     await activity(context, options, "spawn_subagent", replay.id, { path: replay.path, status: replay.status, replay: true }, input.idempotencyKey)
     return spawnOutput(replay, true)
   }
@@ -48,6 +50,7 @@ export async function executeSpawn(context: ToolExecutionContext, input: SpawnSu
     if (result.duplicate || !result.task) {
       const winner = await options.store.getSpawnReplay({ userId: context.scope.userId, sessionId: context.sessionId, idempotencyKey: input.idempotencyKey })
       if (winner) {
+        assertSpawnReplay(winner, context, lineage)
         await activity(context, options, "spawn_subagent", winner.id, { path: winner.path, status: winner.status, replay: true }, input.idempotencyKey)
         return spawnOutput(winner, true)
       }
@@ -63,7 +66,10 @@ export async function executeSpawn(context: ToolExecutionContext, input: SpawnSu
       if (!recorded) {
         const winner = await options.store.getSpawnReplay({ userId: context.scope.userId, sessionId: context.sessionId, idempotencyKey: input.idempotencyKey })
         await options.manager.close(task.id, context.sessionId)
-        if (winner) return spawnOutput(winner, true)
+        if (winner) {
+          assertSpawnReplay(winner, context, lineage)
+          return spawnOutput(winner, true)
+        }
         throw new CoordinationError("coordination_idempotency_conflict", "Spawn idempotency record was lost")
       }
     } catch (error: unknown) {
@@ -207,11 +213,24 @@ async function currentFollowupParent(context: ToolExecutionContext, options: Coo
   return current
 }
 
-async function resolveSpawnParent(context: ToolExecutionContext, requested: string | undefined, options: CoordinationExecutorOptions): Promise<string | null> {
+type SpawnLineage = {
+  readonly parentTaskId: string | null
+  /** Undefined means the caller did not provide a branch root to compare. */
+  readonly rootTaskId?: string
+}
+
+async function resolveSpawnLineage(context: ToolExecutionContext, requested: string | undefined, options: CoordinationExecutorOptions): Promise<SpawnLineage> {
   if (requested && (!context.taskId || requested !== context.taskId)) throw new CoordinationError("coordination_scope_error", "Spawn parent must be the runtime-owned current task")
-  if (!requested) return context.taskId ?? null
-  await visibleTask(context, requested, options)
-  return requested
+  if (!context.taskId) return { parentTaskId: null, rootTaskId: context.rootTaskId }
+  const current = currentTurnTask(context, await visibleTask(context, context.taskId, options))
+  return { parentTaskId: current.id, rootTaskId: current.rootTaskId }
+}
+
+function assertSpawnReplay(replay: CoordinationTaskView, context: ToolExecutionContext, lineage: SpawnLineage): void {
+  if (replay.turnId !== context.turnId || replay.parentTaskId !== lineage.parentTaskId
+    || (lineage.rootTaskId !== undefined && replay.rootTaskId !== lineage.rootTaskId)) {
+    throw new CoordinationError("coordination_idempotency_conflict", "Spawn replay does not match the current runtime lineage")
+  }
 }
 
 async function uniqueTasks(context: ToolExecutionContext, ids: readonly string[], options: CoordinationExecutorOptions): Promise<CoordinationTaskView[]> {
