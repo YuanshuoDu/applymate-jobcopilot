@@ -144,6 +144,8 @@ const RESUME_LIBRARY_DEFAULT_WIDTH = 230
 const RESUME_LIBRARY_COLLAPSED_WIDTH = 54
 const RESUME_LIBRARY_COLLAPSE_THRESHOLD = 155
 const MAIN_NAV_COLLAPSE_DRAG_DISTANCE = 72
+const RESUME_LIBRARY_COLLAPSE_ANIMATION_MS = 180
+const MAIN_NAV_COLLAPSE_DELAY_MS = 240
 
 const ADDABLE_SECTIONS = [
   { id: 'summary',          label: 'Summary' },
@@ -181,7 +183,7 @@ function CompletenessBar({ content }: { content: ResumeContent }) {
   const color = score >= 80 ? 'var(--c-success)' : score >= 50 ? 'var(--primary)' : 'var(--c-warning)'
   const [showTips, setShowTips] = useState(false)
   return (
-    <div style={{ marginBottom: 12, padding: '8px 12px', background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 8 }}>
+    <div className="resume-completeness">
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 5 }}>
         <span style={{ fontSize: 10, fontWeight: 500, color: 'var(--text-muted)' }}>{t('resume.completeness')}</span>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -586,6 +588,8 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   const toast = useToast()
   const [confirm, ConfirmDialog] = useConfirm()
   const { t } = useI18n()
+  const sidebarCollapsedRef = useRef(sidebarCollapsed)
+  const sidebarCollapseTimer = useRef<number | null>(null)
 
   const { data: resumeList, loading: loadingList } = useApi<ResumeListItem[]>('/api/resume')
   const [resumes,          setResumes]          = useState<ResumeListItem[]>([])
@@ -597,18 +601,30 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     if (requested) setSelectedResumeId(requested)
   }, [])
   const [libraryCollapsed, setLibraryCollapsed] = useState(false)
+  const [libraryCollapsing, setLibraryCollapsing] = useState(false)
   const [libraryWidth, setLibraryWidth] = useState(RESUME_LIBRARY_DEFAULT_WIDTH)
   const [libraryResizing, setLibraryResizing] = useState(false)
+  const libraryCollapseAnimationTimer = useRef<number | null>(null)
   const libraryResizeStart = useRef<{
     pointerId: number
     startX: number
     startWidth: number
     wasCollapsed: boolean
     sidebarToggleSent: boolean
+    libraryCollapseStaged: boolean
   } | null>(null)
   const [aiPanelWidth, setAiPanelWidth] = useState(AI_PANEL_DEFAULT_WIDTH)
   const [aiPanelResizing, setAiPanelResizing] = useState(false)
   const aiPanelResizeStart = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null)
+
+  useEffect(() => {
+    sidebarCollapsedRef.current = sidebarCollapsed
+  }, [sidebarCollapsed])
+
+  useEffect(() => () => {
+    if (sidebarCollapseTimer.current !== null) window.clearTimeout(sidebarCollapseTimer.current)
+    if (libraryCollapseAnimationTimer.current !== null) window.clearTimeout(libraryCollapseAnimationTimer.current)
+  }, [])
 
   const { data: directionList, refetch: refetchDirections } = useApi<Direction[]>('/api/directions')
   const [directions,       setDirections]       = useState<Direction[]>([])
@@ -767,10 +783,41 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     return Math.min(RESUME_LIBRARY_MAX_WIDTH, Math.max(RESUME_LIBRARY_MIN_WIDTH, width))
   }
 
-  function triggerSidebarCollapse(start: NonNullable<typeof libraryResizeStart.current>) {
-    if (sidebarCollapsed || start.sidebarToggleSent || !onToggleSidebar) return
+  function cancelPendingSidebarCollapse(start: NonNullable<typeof libraryResizeStart.current>) {
+    if (sidebarCollapseTimer.current !== null) {
+      window.clearTimeout(sidebarCollapseTimer.current)
+      sidebarCollapseTimer.current = null
+    }
+    start.sidebarToggleSent = false
+  }
+
+  function cancelLibraryCollapseAnimation(start: NonNullable<typeof libraryResizeStart.current>) {
+    if (libraryCollapseAnimationTimer.current !== null) {
+      window.clearTimeout(libraryCollapseAnimationTimer.current)
+      libraryCollapseAnimationTimer.current = null
+    }
+    start.libraryCollapseStaged = false
+    setLibraryCollapsing(false)
+  }
+
+  function stageLibraryCollapse(start: NonNullable<typeof libraryResizeStart.current>) {
+    if (start.libraryCollapseStaged) return
+    start.libraryCollapseStaged = true
+    setLibraryCollapsed(true)
+    setLibraryCollapsing(true)
+    libraryCollapseAnimationTimer.current = window.setTimeout(() => {
+      libraryCollapseAnimationTimer.current = null
+      setLibraryCollapsing(false)
+    }, RESUME_LIBRARY_COLLAPSE_ANIMATION_MS)
+  }
+
+  function scheduleSidebarCollapse(start: NonNullable<typeof libraryResizeStart.current>) {
+    if (sidebarCollapsedRef.current || start.sidebarToggleSent || !onToggleSidebar) return
     start.sidebarToggleSent = true
-    onToggleSidebar()
+    sidebarCollapseTimer.current = window.setTimeout(() => {
+      sidebarCollapseTimer.current = null
+      if (!sidebarCollapsedRef.current) onToggleSidebar()
+    }, MAIN_NAV_COLLAPSE_DELAY_MS)
   }
 
   function updateLibraryWidth(clientX: number) {
@@ -781,23 +828,28 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
 
     if (start.wasCollapsed) {
       if (deltaX >= 28) {
+        cancelPendingSidebarCollapse(start)
+        cancelLibraryCollapseAnimation(start)
         setLibraryCollapsed(false)
         setLibraryWidth(clampLibraryWidth(RESUME_LIBRARY_DEFAULT_WIDTH + deltaX))
       } else if (dragLeft >= MAIN_NAV_COLLAPSE_DRAG_DISTANCE) {
-        triggerSidebarCollapse(start)
+        scheduleSidebarCollapse(start)
       }
       return
     }
 
     const nextWidth = start.startWidth + deltaX
     if (nextWidth <= RESUME_LIBRARY_COLLAPSE_THRESHOLD) {
-      setLibraryCollapsed(true)
+      stageLibraryCollapse(start)
       if (dragLeft >= start.startWidth - RESUME_LIBRARY_COLLAPSE_THRESHOLD + MAIN_NAV_COLLAPSE_DRAG_DISTANCE) {
-        triggerSidebarCollapse(start)
+        scheduleSidebarCollapse(start)
       }
       return
     }
 
+    cancelPendingSidebarCollapse(start)
+    cancelLibraryCollapseAnimation(start)
+    setLibraryCollapsed(false)
     setLibraryWidth(clampLibraryWidth(nextWidth))
   }
 
@@ -811,6 +863,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       startWidth: libraryCollapsed ? RESUME_LIBRARY_COLLAPSED_WIDTH : libraryWidth,
       wasCollapsed: libraryCollapsed,
       sidebarToggleSent: false,
+      libraryCollapseStaged: false,
     }
     setLibraryResizing(true)
   }
@@ -822,6 +875,11 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
 
   function handleLibraryResizeEnd(event: React.PointerEvent<HTMLDivElement>) {
     if (libraryResizeStart.current?.pointerId !== event.pointerId) return
+    const start = libraryResizeStart.current
+    if (event.type === 'pointercancel') {
+      cancelPendingSidebarCollapse(start)
+      cancelLibraryCollapseAnimation(start)
+    }
     libraryResizeStart.current = null
     setLibraryResizing(false)
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
@@ -1852,7 +1910,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
         </div>
       ) : (
         <div
-          className={`resume-library-layout${libraryCollapsed ? ' is-library-collapsed' : ''}${libraryResizing ? ' is-library-resizing' : ''}${aiPanelResizing ? ' is-ai-panel-resizing' : ''}`}
+          className={`resume-library-layout${libraryCollapsed ? ' is-library-collapsed' : ''}${libraryCollapsing ? ' is-library-collapsing' : ''}${libraryResizing ? ' is-library-resizing' : ''}${aiPanelResizing ? ' is-ai-panel-resizing' : ''}`}
           style={{ '--resume-library-width': `${libraryCollapsed ? RESUME_LIBRARY_COLLAPSED_WIDTH : libraryWidth}px`, '--resume-ai-width': `${aiPanelWidth}px`, flex: 1, display: 'flex', overflow: 'hidden', background: 'var(--bg-tertiary)' } as React.CSSProperties}
         >
           <aside className="resume-library-sidebar">
@@ -1937,6 +1995,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
                 </button>
               </div>
             )}
+            <div className="resume-editor-content">
             <div className="resume-workspace-head">
               <div className="resume-workspace-title-copy">
                 <div className="resume-workspace-eyebrow">
@@ -1951,8 +2010,8 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
               </div>
               <div className="resume-workspace-actions">
                 <button className="resume-workspace-preview-button" onClick={() => setPreviewMode(value => !value)} aria-pressed={previewMode}>
-                  <Eye size={14} aria-hidden="true" />
-                  {previewMode ? 'Edit resume' : 'Preview'}
+                  <span className="resume-workspace-preview-icon"><Eye size={15} aria-hidden="true" /></span>
+                  <span>{previewMode ? 'Edit resume' : 'Preview'}</span>
                 </button>
               </div>
             </div>
@@ -2033,9 +2092,10 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
                   + Add Section
                 </button>
               </div>
+             </div>
+             </>)}
             </div>
-            </>)}
-          </div>
+           </div>
 
           <div
             className="resume-ai-resize-handle"

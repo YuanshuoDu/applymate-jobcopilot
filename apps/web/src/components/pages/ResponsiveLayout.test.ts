@@ -68,4 +68,17 @@ describe('tablet and phone layout safeguards', () => {
     expect(resumeCss).toMatch(/\.resume-format-toolbar\s*\{[\s\S]*display:\s*flex/)
     expect(resumeCss).toMatch(/\.resume-format-group\s*\{[\s\S]*border:/)
   })
+
+  it('aligns editor chrome to the A4 paper and stages the left-collapse motion', () => {
+    expect(resumePageSource).toContain('className="resume-editor-content"')
+    expect(resumePageSource).toContain('className="resume-completeness"')
+    expect(resumePageSource).toContain('className="resume-workspace-preview-icon"')
+    expect(resumeCss).toMatch(/\.resume-editor-content\s*\{[\s\S]*width:\s*100%[\s\S]*max-width:\s*794px/)
+    expect(resumeCss).toMatch(/\.resume-completeness\s*\{[\s\S]*width:\s*100%/)
+    expect(resumeCss).toMatch(/\.resume-workspace-preview-button\s*\{[\s\S]*min-width:\s*108px[\s\S]*min-height:\s*40px/)
+    expect(resumeCss).toMatch(/\.resume-library-layout\.is-library-collapsing\s*\{[\s\S]*transition:\s*grid-template-columns/)
+    expect(resumePageSource).toContain('RESUME_LIBRARY_COLLAPSE_ANIMATION_MS')
+    expect(resumePageSource).toContain('MAIN_NAV_COLLAPSE_DELAY_MS')
+    expect(resumePageSource).toContain('scheduleSidebarCollapse')
+  })
 })
