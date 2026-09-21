@@ -36,6 +36,7 @@ export type PlanTaskGraphAdapter = {
 export type PlanTaskGraphAdapterOptions = {
   readonly runKey: string
   readonly persist: PersistTaskGraph
+  readonly initialState?: TaskGraphState
 }
 
 export type PlanTaskGraphHydrationOptions = {
@@ -45,6 +46,8 @@ export type PlanTaskGraphHydrationOptions = {
 
 const graphNodes = (commands: readonly PlanDispatchCommand[]) => commands.map(command => ({ id: command.localId, dependsOn: [...command.dependsOn] }))
 const eventId = (runKey: string, localId: string, phase: TaskGraphEvent["type"]): string => `${runKey}:${localId}:${phase}`
+const graphStatuses = new Set(["pending", "ready", "running", "completed", "failed", "waiting", "cancelled"])
+const graphBlockers = new Set(["waiting_on_dependencies", "dependency_failed"])
 
 function normalizedRunKey(value: unknown): string {
   if (typeof value !== "string" || !value.trim()) throw new PlanTaskGraphAdapterError("invalid_record", "Plan task graph runKey is invalid")
@@ -101,6 +104,26 @@ function boundedHistory(runKey: string, events: readonly PersistedTaskGraphEvent
   }
 }
 
+function initialStateShape(value: unknown): value is TaskGraphState {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false
+  const state = value as Record<string, unknown>
+  if (Object.keys(state).some(key => !["nodes", "statuses", "readyNodeIds", "blockedReasons", "appliedEvents"].includes(key))) return false
+  if (!Array.isArray(state.nodes) || !state.statuses || typeof state.statuses !== "object" || Array.isArray(state.statuses) || !Array.isArray(state.readyNodeIds) || !state.blockedReasons || typeof state.blockedReasons !== "object" || Array.isArray(state.blockedReasons) || !Array.isArray(state.appliedEvents)) return false
+  if (state.nodes.some(node => {
+    if (!node || typeof node !== "object" || Array.isArray(node)) return true
+    const candidate = node as Record<string, unknown>
+    return Object.keys(candidate).some(key => !["id", "dependsOn"].includes(key)) || typeof candidate.id !== "string" || !candidate.id || !Array.isArray(candidate.dependsOn) || candidate.dependsOn.some(dependency => typeof dependency !== "string" || !dependency)
+  })) return false
+  const nodeIds = new Set(state.nodes.map(node => (node as Record<string, unknown>).id))
+  const statuses = state.statuses as Record<string, unknown>
+  if (Object.keys(statuses).some(id => !nodeIds.has(id) || typeof statuses[id] !== "string" || !graphStatuses.has(statuses[id] as string)) || nodeIds.size !== Object.keys(statuses).length) return false
+  if (state.readyNodeIds.some(id => typeof id !== "string" || !nodeIds.has(id)) || new Set(state.readyNodeIds).size !== state.readyNodeIds.length) return false
+  const blockedReasons = state.blockedReasons as Record<string, unknown>
+  if (Object.keys(blockedReasons).some(id => !nodeIds.has(id) || typeof blockedReasons[id] !== "string" || !graphBlockers.has(blockedReasons[id] as string))) return false
+  try { state.appliedEvents.forEach(event => hydrationEvent(event)) } catch { return false }
+  return true
+}
+
 export function hydratePlanTaskGraph(plan: PlanDispatchResult, options: PlanTaskGraphHydrationOptions): TaskGraphState {
   const runKey = boundedRunKey(options.runKey)
   if (!Array.isArray(options.events)) throw new PlanTaskGraphAdapterError("invalid_record", "Persisted task graph history is invalid")
@@ -152,7 +175,15 @@ function isExecutionRecord(record: ObservablePlanRecord): record is PlanCommandE
 
 export function createPlanTaskGraphAdapter(plan: PlanDispatchResult, options: PlanTaskGraphAdapterOptions): PlanTaskGraphAdapter {
   const runKey = boundedRunKey(options.runKey)
-  let state = createTaskGraph(graphNodes(plan.commands))
+  const freshState = createTaskGraph(graphNodes(plan.commands))
+  let state = freshState
+  if (options.initialState !== undefined) {
+    if (!initialStateShape(options.initialState)) throw new PlanTaskGraphAdapterError("graph_mismatch", "Initial task graph state is malformed")
+    if (JSON.stringify(options.initialState.nodes) !== JSON.stringify(freshState.nodes)) throw new PlanTaskGraphAdapterError("graph_mismatch", "Initial task graph nodes do not match the dispatched plan")
+    const hydrated = hydratePlanTaskGraph(plan, { runKey, events: options.initialState.appliedEvents.map(event => ({ runKey, event })) })
+    if (JSON.stringify(hydrated) !== JSON.stringify(options.initialState)) throw new PlanTaskGraphAdapterError("graph_mismatch", "Initial task graph state is not reducer-derived")
+    state = hydrated
+  }
 
   const persist = async (event: TaskGraphEvent, nextState: TaskGraphState): Promise<void> => {
     const payload = { runKey, event, state: nextState }

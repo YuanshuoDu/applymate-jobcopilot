@@ -151,6 +151,27 @@ describe("plan task graph adapter", () => {
     expect(value.appliedEvents.map(event => event.eventId)).toEqual(["run-1:first:start", "run-1:first:complete"])
   })
 
+  it("accepts reducer-derived initial state without trusting a persisted snapshot", () => {
+    const dispatched = plan(command("first"))
+    const initialState = hydratePlanTaskGraph(dispatched, { runKey: "run-1", events: [persisted("run-1", "start", "first")] })
+    const persist = vi.fn<PlanTaskGraphAdapterOptions["persist"]>().mockResolvedValue(undefined)
+    const value = createPlanTaskGraphAdapter(dispatched, { runKey: "run-1", persist, initialState })
+    expect(value.state.statuses.first).toBe("running")
+    expect(value.state.appliedEvents).toEqual([{ type: "start", nodeId: "first", eventId: "run-1:first:start" }])
+  })
+
+  it("rejects malformed initial state with a typed adapter error", () => {
+    const dispatched = plan(command("first"))
+    const initialState = hydratePlanTaskGraph(dispatched, { runKey: "run-1", events: [] })
+    for (const malformed of [
+      { ...initialState, appliedEvents: undefined },
+      { ...initialState, nodes: null },
+      { ...initialState, statuses: { first: "forged" } },
+    ]) {
+      expect(() => createPlanTaskGraphAdapter(dispatched, { runKey: "run-1", persist: vi.fn(), initialState: malformed as never })).toThrowError(PlanTaskGraphAdapterError)
+    }
+  })
+
   it("hydrates waiting and failure graphs while preserving dependent blocking", () => {
     const waiting = hydratePlanTaskGraph(plan(command("wait")), { runKey: "run-1", events: [persisted("run-1", "start", "wait"), persisted("run-1", "wait", "wait")] })
     expect(waiting.statuses.wait).toBe("waiting")

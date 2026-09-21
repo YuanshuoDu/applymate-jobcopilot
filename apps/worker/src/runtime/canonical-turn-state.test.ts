@@ -20,6 +20,10 @@ const markerEvent = (kind: "observed" | "applied" = "observed", sequence = "4"):
   id: `marker-${kind}`, type: STEERING_MARKER_EVENT_TYPE, actor: "system", userId: "user-1", sessionId: "session-1", turnId: "turn-1",
   taskId: "root-1", sequence, payload: markerPayload(kind),
 })
+const graphEvent = (type: "start" | "complete" | "fail" | "wait" | "cancel", nodeId: string, sequence: string, payload: Record<string, unknown> = {}): Record<string, unknown> => ({
+  id: `graph-${sequence}`, type: "plan.task_graph", actor: "worker", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "root-1", sequence,
+  payload: { runKey: "root-1:proposal-1:1", event: { type, nodeId, eventId: `root-1:proposal-1:1:${nodeId}:${type}` }, ...payload },
+})
 
 function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unknown>[]; items?: Record<string, unknown>[]; inputs?: Record<string, unknown>[]; events?: Record<string, unknown>[]; snapshots?: Record<string, unknown>[] }) {
   const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
@@ -39,6 +43,34 @@ function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unk
 }
 
 describe("loadCanonicalTurnState", () => {
+  it("loads bounded plan task graph events from the scoped ordered event query", async () => {
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      events: [graphEvent("start", "first", "11"), graphEvent("complete", "first", "12")],
+    })
+    const value = await loadCanonicalTurnState(fake, lease)
+    expect(value.taskGraphEvents?.map(item => item.event.eventId)).toEqual(["root-1:proposal-1:1:first:start", "root-1:proposal-1:1:first:complete"])
+    const eventQuery = fake.client.query.mock.calls.find(([sql]) => typeof sql === "string" && sql.includes('FROM "agent_events"'))?.[0]
+    expect(eventQuery).toContain("'plan.task_graph'")
+  })
+
+  it.each([
+    ["foreign scope", { ...graphEvent("start", "first", "11"), userId: "other-user" }],
+    ["unknown envelope field", graphEvent("start", "first", "11", { extra: true })],
+    ["invalid state snapshot", graphEvent("start", "first", "11", { state: "forged" })],
+  ])("rejects %s task graph payloads", async (_label, event) => {
+    const fake = pool({ turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} }, events: [event] })
+    await expect(loadCanonicalTurnState(fake, lease)).rejects.toThrow()
+  })
+
+  it("rejects oversized task graph payloads before returning state", async () => {
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      events: [graphEvent("start", "first", "11", { state: { oversized: "x".repeat(8 * 1024) } })],
+    })
+    await expect(loadCanonicalTurnState(fake, lease)).rejects.toThrow("task_graph_payload_too_large")
+  })
+
   it("replays scoped steering markers as independent canonical control state", async () => {
     const fake = pool({
       turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },

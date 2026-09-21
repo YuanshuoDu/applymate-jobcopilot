@@ -16,6 +16,7 @@ import { restoreCanonicalSteeringMarkers, type SteeringMarkerState } from "./can
 import { priorConversation } from "./canonical-steering-markers.js"
 import { STEERING_MARKER_EVENT_TYPE } from "./context/steering-marker.js"
 import { scopeCanonicalWaitProjections } from "./canonical-wait-scope.js"
+import type { PersistedTaskGraphEvent } from "./planning/plan-task-graph-adapter.js"
 export type CanonicalTurnState = {
   readonly scope: TenantScope
   readonly goal: string
@@ -28,6 +29,7 @@ export type CanonicalTurnState = {
   readonly snapshot: StepContextSnapshot
   readonly planRevision?: number | null
   readonly planProposalHashes?: readonly string[]
+  readonly taskGraphEvents?: readonly PersistedTaskGraphEvent[]
   readonly steeringMarkers?: SteeringMarkerState
   readonly resume?: TurnResumeState
 }
@@ -54,6 +56,39 @@ function snapshotFromContent(value: unknown, scope: TenantScope, sessionId: stri
 function eventPayload(value: unknown): Record<string, unknown> {
   const payload = object(value)
   return object(payload.payload ?? payload)
+}
+function strictObject(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null
+  const prototype = Object.getPrototypeOf(value)
+  return (prototype === Object.prototype || prototype === null) ? value as Record<string, unknown> : null
+}
+function taskGraphEvent(value: unknown): PersistedTaskGraphEvent["event"] {
+  const candidate = strictObject(value)
+  if (!candidate || Object.keys(candidate).length !== 3 || !["type", "nodeId", "eventId"].every(key => Object.hasOwn(candidate, key))) throw new Error("task_graph_event_invalid")
+  if (!(typeof candidate.type === "string" && ["start", "complete", "fail", "wait", "cancel"].includes(candidate.type))) throw new Error("task_graph_event_invalid")
+  if (typeof candidate.nodeId !== "string" || !candidate.nodeId || candidate.nodeId.length > 256 || typeof candidate.eventId !== "string" || !candidate.eventId || candidate.eventId.length > 512) throw new Error("task_graph_event_invalid")
+  return { type: candidate.type as PersistedTaskGraphEvent["event"]["type"], nodeId: candidate.nodeId, eventId: candidate.eventId }
+}
+function taskGraphEvents(events: readonly Row[], lease: TurnLease, rootTaskId: unknown): readonly PersistedTaskGraphEvent[] {
+  const graphRows = events.filter(event => event.type === "plan.task_graph")
+  if (graphRows.length === 0) return []
+  if (typeof rootTaskId !== "string" || !rootTaskId) throw new Error("task_graph_scope_invalid")
+  let previousSequence: bigint | null = null
+  return graphRows.map(row => {
+    if (row.userId !== lease.userId || row.sessionId !== lease.sessionId || row.turnId !== lease.turnId || row.taskId !== rootTaskId) throw new Error("task_graph_scope_invalid")
+    const payload = eventPayload(row.payload)
+    const encoded = JSON.stringify(payload)
+    if (encoded === undefined || Buffer.byteLength(encoded, "utf8") > 8 * 1024) throw new Error("task_graph_payload_too_large")
+    const envelope = strictObject(payload)
+    if (!envelope || Object.keys(envelope).some(key => !["runKey", "event", "state"].includes(key)) || typeof envelope.runKey !== "string" || !envelope.runKey || envelope.runKey.length > 256 || !envelope.runKey.startsWith(`${rootTaskId}:`)) throw new Error("task_graph_payload_invalid")
+    const event = taskGraphEvent(envelope.event)
+    if (Object.hasOwn(envelope, "state") && !strictObject(envelope.state)) throw new Error("task_graph_state_invalid")
+    let sequence: bigint
+    try { sequence = BigInt(String(row.sequence)) } catch { throw new Error("task_graph_sequence_invalid") }
+    if (previousSequence !== null && sequence <= previousSequence) throw new Error("task_graph_sequence_invalid")
+    previousSequence = sequence
+    return { runKey: envelope.runKey, event, ...(Object.hasOwn(envelope, "state") ? { state: json(envelope.state) } : {}) }
+  })
 }
 function authoritativeOutputs(events: readonly Row[]): Map<string, unknown> {
   const outputs = new Map<string, unknown>()
@@ -190,7 +225,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
        AND ("taskId" IS NULL OR "taskId" = $3) AND "type" IN ('tool_call', 'tool_result') ORDER BY "createdAt" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId],
     )
     const eventsResult = await client.query<Row>(
-     `SELECT event."id", event."type", event."actor", event_session."userId" AS "userId", event."sessionId", event."turnId", event."taskId", event."sequence", event."payload" FROM "agent_events" AS event JOIN "agent_sessions" AS event_session ON event_session."id" = event."sessionId" AND event_session."userId" = $4 JOIN "agent_turns" AS event_turn ON event_turn."id" = event."turnId" AND event_turn."sessionId" = event."sessionId" AND event_turn."userId" = $4 WHERE event."turnId" = $1 AND event."sessionId" = $2 AND (event."taskId" IS NULL OR event."taskId" = $3) AND event."type" IN ('tool_call.completed', 'tool_call.failed', 'plan.observation', 'plan.command', 'plan.revision', 'goal.revision', 'context.compaction', '${PLAN_COMPLETION_FEEDBACK_EVENT_TYPE}', '${STEERING_MARKER_EVENT_TYPE}') ORDER BY event."sequence" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId, lease.userId],
+      `SELECT event."id", event."type", event."actor", event_session."userId" AS "userId", event."sessionId", event."turnId", event."taskId", event."sequence", event."payload" FROM "agent_events" AS event JOIN "agent_sessions" AS event_session ON event_session."id" = event."sessionId" AND event_session."userId" = $4 JOIN "agent_turns" AS event_turn ON event_turn."id" = event."turnId" AND event_turn."sessionId" = event."sessionId" AND event_turn."userId" = $4 WHERE event."turnId" = $1 AND event."sessionId" = $2 AND (event."taskId" IS NULL OR event."taskId" = $3) AND event."type" IN ('tool_call.completed', 'tool_call.failed', 'plan.observation', 'plan.command', 'plan.revision', 'goal.revision', 'context.compaction', 'plan.task_graph', '${PLAN_COMPLETION_FEEDBACK_EVENT_TYPE}', '${STEERING_MARKER_EVENT_TYPE}') ORDER BY event."sequence" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId, lease.userId],
     )
     const priorInputs = await client.query<Row>(
       `SELECT "id", "targetTurnId", "content", "acceptedSequence", 'user' AS "historyRole", "acceptedSequence" AS "historySequence" FROM "agent_inputs"
@@ -234,6 +269,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     const goalState = restoreGoalRevisions(hydratedGoal.goalContract, eventsResult.rows.map(event => ({ type: event.type, payload: eventPayload(event.payload) })))
     const revisionState = restorePlanRevisions(filterPlanRevisionEvents(eventsResult.rows.map(event => ({ type: event.type, payload: event.payload })), goalState.goalContract.revision).map(event => ({ type: event.type, payload: eventPayload(event.payload) })))
     const revision = revisionState.latest
+    const restoredTaskGraphEvents = taskGraphEvents(eventsResult.rows, lease, turn.rootTaskId)
     const currentRevisionObservations = planRevisionObservations(eventsResult.rows, goalState.goalContract.revision)
     const acceptedRevisions = acceptedPlanRevisions(currentRevisionObservations)
     const currentPlanIds = goalState.goalContract.revision > 1 ? new Set(currentRevisionObservations.flatMap(item => { const content = object(item.content); return typeof content.planCallId === "string" ? [content.planCallId] : [] })) : undefined
@@ -287,7 +323,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
       consumedInputIds: Array.isArray(last?.consumedInputIds) ? last.consumedInputIds.filter((id): id is string => typeof id === "string") : [],
       usage,
     } satisfies TurnResumeState : undefined
-     const result = { scope, goal: goalState.goalContract.objective, goalContract: goalState.goalContract, modelProfileSnapshot: json(turn.modelProfileSnapshot), toolPolicySnapshot: turn.toolPolicySnapshot ?? {}, budgetSnapshot: turn.budgetSnapshot ?? {}, planRevision: revision?.planRevision ?? null, planProposalHashes: revisionState.hashes, steeringMarkers, ...(typeof turn.rootTaskId === "string" ? { rootTaskId: turn.rootTaskId } : {}), ...(rootInput.rows[0] ? { rootInputId: rootInput.rows[0].id } : {}), snapshot, ...(resume ? { resume } : {}) }
+     const result = { scope, goal: goalState.goalContract.objective, goalContract: goalState.goalContract, modelProfileSnapshot: json(turn.modelProfileSnapshot), toolPolicySnapshot: turn.toolPolicySnapshot ?? {}, budgetSnapshot: turn.budgetSnapshot ?? {}, planRevision: revision?.planRevision ?? null, planProposalHashes: revisionState.hashes, ...(restoredTaskGraphEvents.length > 0 ? { taskGraphEvents: restoredTaskGraphEvents } : {}), steeringMarkers, ...(typeof turn.rootTaskId === "string" ? { rootTaskId: turn.rootTaskId } : {}), ...(rootInput.rows[0] ? { rootInputId: rootInput.rows[0].id } : {}), snapshot, ...(resume ? { resume } : {}) }
     await client.query("COMMIT")
     committed = true
     return result
