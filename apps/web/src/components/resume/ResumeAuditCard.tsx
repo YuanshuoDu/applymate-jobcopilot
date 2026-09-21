@@ -1,8 +1,11 @@
 'use client'
 
-import { AlertTriangle, Check, LoaderCircle, RefreshCw, ShieldCheck } from 'lucide-react'
-import type { ApplicationAudit } from '@/lib/types'
+import { useState } from 'react'
+import { Check, Clipboard, ExternalLink, LoaderCircle, RefreshCw, ShieldCheck } from 'lucide-react'
+import type { ApplicationAudit, ApplicationAuditFinding } from '@/lib/types'
 import { useI18n } from '@/lib/i18n'
+
+type AuditTone = 'running' | 'idle' | 'pass' | 'blocked' | 'needs-review'
 
 type Props = {
   audit: ApplicationAudit | null | undefined
@@ -10,21 +13,39 @@ type Props = {
   auditError?: string | null
   hasLinkedJob: boolean
   hasCoverLetter: boolean
+  onReviewFinding?: (area: ApplicationAuditFinding['area']) => void
   onAudit: () => void
 }
 
 function statusCopy(audit: ApplicationAudit | null | undefined, auditing: boolean, t: (key: string) => string) {
-  if (auditing) return { label: t('resume.auditRunning'), tone: 'running' }
-  if (!audit) return { label: t('resume.auditNotRun'), tone: 'idle' }
-  if (audit.verdict === 'pass') return { label: t('resume.auditPassed'), tone: 'pass' }
-  if (audit.verdict === 'blocked') return { label: t('resume.auditBlockedShort'), tone: 'blocked' }
-  return { label: t('resume.auditNeedsReviewShort'), tone: 'needs-review' }
+  if (auditing) return { label: t('resume.auditRunning'), tone: 'running' as AuditTone }
+  if (!audit) return { label: t('resume.auditNotRun'), tone: 'idle' as AuditTone }
+  if (audit.verdict === 'pass') return { label: t('resume.auditPassed'), tone: 'pass' as AuditTone }
+  if (audit.verdict === 'blocked') return { label: t('resume.auditBlockedShort'), tone: 'blocked' as AuditTone }
+  return { label: t('resume.auditNeedsReviewShort'), tone: 'needs-review' as AuditTone }
 }
 
-export function ResumeAuditCard({ audit, auditing, auditError, hasLinkedJob, hasCoverLetter, onAudit }: Props) {
+function areaLabel(area: ApplicationAuditFinding['area'], t: (key: string) => string) {
+  if (area === 'cover_letter') return t('resume.auditAreaCoverLetter')
+  if (area === 'job_match') return t('resume.auditAreaJobMatch')
+  return t('resume.auditAreaResume')
+}
+
+export function ResumeAuditCard({ audit, auditing, auditError, hasLinkedJob, hasCoverLetter, onReviewFinding, onAudit }: Props) {
   const { t } = useI18n()
+  const [copiedFinding, setCopiedFinding] = useState<number | null>(null)
   const status = statusCopy(audit, auditing, t)
   const unresolvedFindings = audit?.findings.filter(finding => finding.severity !== 'pass') ?? []
+
+  async function copyAction(action: string, index: number) {
+    try {
+      await navigator.clipboard.writeText(action)
+      setCopiedFinding(index)
+      window.setTimeout(() => setCopiedFinding(current => current === index ? null : current), 1500)
+    } catch {
+      // Clipboard access is optional; the action remains visible in the card.
+    }
+  }
 
   return (
     <section className={`resume-audit-card is-${status.tone}`} data-resume-audit-card aria-live="polite">
@@ -50,15 +71,34 @@ export function ResumeAuditCard({ audit, auditing, auditError, hasLinkedJob, has
             <p className="resume-audit-card-success"><Check size={13} /> {t('resume.auditNoIssues')}</p>
           ) : (
             <div className="resume-audit-card-findings">
+              <div className="resume-audit-card-findings-heading">
+                <strong>{t('resume.auditFindingsTitle')}</strong>
+                <span>{unresolvedFindings.length} {t('resume.auditFindingsCount')}</span>
+              </div>
               {unresolvedFindings.map((finding, index) => (
-                <div className="resume-audit-card-finding" key={`${finding.title}-${index}`}>
-                  <AlertTriangle size={13} />
-                  <div>
-                    <strong>{finding.title}</strong>
-                    <span>{finding.evidence}</span>
-                    <em>{finding.action}</em>
+                <article className="resume-audit-card-finding" key={`${finding.title}-${index}`}>
+                  <div className="resume-audit-card-finding-heading">
+                    <span className={`resume-audit-card-severity is-${finding.severity}`}>
+                      {finding.severity === 'critical' ? t('resume.auditCritical') : t('resume.auditWarning')}
+                    </span>
+                    <span className="resume-audit-card-area">{areaLabel(finding.area, t)}</span>
                   </div>
-                </div>
+                  <strong>{finding.title}</strong>
+                  <p><b>{t('resume.auditEvidenceLabel')}:</b> {finding.evidence}</p>
+                  <p className="resume-audit-card-action-copy"><b>{t('resume.auditActionLabel')}:</b> {finding.action}</p>
+                  <div className="resume-audit-card-finding-actions">
+                    {onReviewFinding && (
+                      <button type="button" onClick={() => onReviewFinding(finding.area)}>
+                        <ExternalLink size={12} />
+                        {finding.area === 'cover_letter' ? t('resume.auditEditCoverLetter') : finding.area === 'job_match' ? t('resume.auditReviewJob') : t('resume.auditEditResume')}
+                      </button>
+                    )}
+                    <button type="button" onClick={() => void copyAction(finding.action, index)}>
+                      <Clipboard size={12} />
+                      {copiedFinding === index ? t('resume.auditCopiedAction') : t('resume.auditCopyAction')}
+                    </button>
+                  </div>
+                </article>
               ))}
             </div>
           )}
@@ -73,6 +113,9 @@ export function ResumeAuditCard({ audit, auditing, auditError, hasLinkedJob, has
         {auditing ? <LoaderCircle size={14} /> : audit ? <RefreshCw size={14} /> : <ShieldCheck size={14} />}
         {auditing ? t('resume.auditRunning') : audit ? t('resume.auditRunAgain') : t('resume.auditRun')}
       </button>
+      {audit && audit.verdict !== 'pass' && !auditing && (
+        <p className="resume-audit-card-hint">{t('resume.auditFixThenRerun')}</p>
+      )}
     </section>
   )
 }

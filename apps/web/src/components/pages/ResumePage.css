@@ -51,7 +51,7 @@
 .final-confirm-note { margin: 11px 0 0; color: #8790ab; font-size: 10px; line-height: 1.45; text-align: center; }
 .final-confirm-resume-name { display: block; margin-top: 13px; color: #a0a6bb; font-size: 9px; text-align: center; }
 
-.resume-audit-card { display: grid; gap: 9px; margin-top: 14px; padding: 11px; border: 1px solid rgba(79,70,229,.22); border-radius: 9px; background: #fbfaff; }
+.resume-audit-card { display: grid; gap: 9px; margin: 0; padding: 11px; border: 1px solid rgba(79,70,229,.22); border-radius: 9px; background: #fbfaff; }
 .resume-audit-card.is-pass { border-color: rgba(5,150,105,.28); background: #f7fdf9; }
 .resume-audit-card.is-needs-review, .resume-audit-card.is-blocked { border-color: rgba(217,119,6,.32); background: #fffaf2; }
 .resume-audit-card-heading { display: flex; align-items: flex-start; gap: 7px; min-width: 0; }
@@ -67,16 +67,28 @@
 .resume-audit-card.is-needs-review .resume-audit-card-status, .resume-audit-card.is-blocked .resume-audit-card-status { color: #b56b0b; }
 .resume-audit-card-message { margin: 0; color: #66708e; font-size: 9px; line-height: 1.45; }
 .resume-audit-card-success { display: flex; align-items: center; gap: 4px; margin: 0; color: #159866; font-size: 9px; font-weight: 650; }
-.resume-audit-card-findings { display: grid; gap: 6px; max-height: 190px; overflow: auto; }
-.resume-audit-card-finding { display: flex; align-items: flex-start; gap: 6px; padding: 7px; border: 1px solid rgba(217,119,6,.18); border-radius: 6px; color: #b56b0b; background: rgba(217,119,6,.05); }
-.resume-audit-card-finding > div { display: grid; min-width: 0; gap: 3px; }
+.resume-audit-card-findings { display: grid; gap: 6px; }
+.resume-audit-card-findings-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; color: #6f4a13; }
+.resume-audit-card-findings-heading strong { font-size: 9px; }
+.resume-audit-card-findings-heading span { color: #9a671d; font-size: 8px; }
+.resume-audit-card-finding { display: grid; gap: 5px; padding: 8px; border: 1px solid rgba(217,119,6,.18); border-radius: 6px; color: #765d3a; background: rgba(217,119,6,.05); }
+.resume-audit-card-finding-heading { display: flex; align-items: center; gap: 5px; min-width: 0; }
 .resume-audit-card-finding strong { color: #6f4a13; font-size: 9px; line-height: 1.3; }
-.resume-audit-card-finding span, .resume-audit-card-finding em { color: #765d3a; font-size: 8px; font-style: normal; line-height: 1.35; }
-.resume-audit-card-finding em { color: #9a671d; }
+.resume-audit-card-finding > p { margin: 0; color: #765d3a; font-size: 8px; line-height: 1.4; }
+.resume-audit-card-finding > p b { color: #6f4a13; }
+.resume-audit-card-action-copy { color: #9a671d !important; }
+.resume-audit-card-severity, .resume-audit-card-area { flex: 0 0 auto; border-radius: 999px; padding: 2px 5px; font-size: 7px; font-weight: 750; text-transform: uppercase; letter-spacing: .02em; }
+.resume-audit-card-severity.is-critical { color: #a33b25; background: rgba(220,38,38,.10); }
+.resume-audit-card-severity.is-warning { color: #986016; background: rgba(217,119,6,.12); }
+.resume-audit-card-area { color: #6e6a82; background: rgba(79,70,229,.08); }
+.resume-audit-card-finding-actions { display: flex; flex-wrap: wrap; gap: 5px; }
+.resume-audit-card-finding-actions button { display: inline-flex; align-items: center; gap: 4px; min-height: 24px; padding: 0 6px; border: 1px solid rgba(79,70,229,.20); border-radius: 5px; color: #4c32ef; background: #fff; font: inherit; font-size: 8px; font-weight: 650; cursor: pointer; }
+.resume-audit-card-finding-actions button:hover { background: #f1efff; }
 .resume-audit-card-error { margin: 0; padding: 6px 7px; border-radius: 5px; color: #b42318; background: #fff1f0; font-size: 9px; line-height: 1.4; }
 .resume-audit-card-action { display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-height: 29px; padding: 0 8px; border: 1px solid rgba(79,70,229,.27); border-radius: 6px; color: #4c32ef; background: #fff; font: inherit; font-size: 9px; font-weight: 700; cursor: pointer; }
 .resume-audit-card-action:hover:not(:disabled) { background: #f1efff; }
 .resume-audit-card-action:disabled { cursor: wait; opacity: .6; }
+.resume-audit-card-hint { margin: -2px 0 0; color: #8a6b40; font-size: 8px; line-height: 1.35; }
 .final-confirm-audit-results { display: grid; gap: 8px; margin-top: 16px; padding: 12px; border: 1px solid rgba(217,119,6,.3); border-radius: 10px; background: #fffaf0; color: #87500a; font-size: 11px; }
 .final-confirm-audit-results span { color: #765d3a; line-height: 1.45; }
 .final-confirm-audit-results button { justify-self: start; }
