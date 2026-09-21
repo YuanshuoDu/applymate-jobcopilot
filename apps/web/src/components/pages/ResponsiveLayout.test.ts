@@ -45,9 +45,11 @@ describe('tablet and phone layout safeguards', () => {
     expect(globalCss).toMatch(/\.app-sidebar-toggle\s*\{[\s\S]*position:\s*absolute[\s\S]*right:\s*-14px/)
   })
 
-  it('moves the collapsed account menu into a readable flyout', () => {
+  it('expands the collapsed sidebar for a readable account menu', () => {
     expect(sidebarSource).toContain('className="app-sidebar-account-menu"')
-    expect(globalCss).toMatch(/\.app-sidebar\.is-collapsed \.app-sidebar-account-menu\s*\{[\s\S]*left:\s*calc\(100% \+ 10px\)[\s\S]*width:\s*228px/)
+    expect(sidebarSource).toContain("' is-account-menu-open'")
+    expect(globalCss).toMatch(/\.app-sidebar\.is-collapsed\.is-account-menu-open\s*\{[\s\S]*width:\s*var\(--sidebar-w\)/)
+    expect(globalCss).toMatch(/\.app-sidebar\.is-collapsed\.is-account-menu-open \.app-sidebar-account-menu\s*\{[\s\S]*left:\s*0[\s\S]*right:\s*0[\s\S]*width:\s*auto/)
     expect(globalCss).toMatch(/\.app-sidebar-account-menu-item\s*\{[\s\S]*white-space:\s*nowrap/)
   })
 
