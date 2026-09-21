@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from "vitest"
 import { PLAN_PROPOSAL_SCHEMA_VERSION, type PlanProposal } from "./goal-plan-contract.js"
 import { dispatchPlanProposal, type PlanDispatchRuntime, type PlanDispatchResult } from "./plan-intent-dispatcher.js"
 import { executePlanCommands, type CommandContextRequest, type PlanCommandExecutionRuntime } from "./plan-command-executor.js"
+import { createPlanTaskGraphAdapter } from "./plan-task-graph-adapter.js"
+import type { TaskGraphState } from "./task-graph-reducer.js"
 import type { PlanValidationContext } from "./goal-plan-validator.js"
 import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
 
@@ -33,6 +35,9 @@ function context(request: CommandContextRequest): ToolRouterContext {
 }
 function runtime(router: PlanCommandExecutionRuntime["router"], createContext = context): PlanCommandExecutionRuntime {
   return { router, createContext }
+}
+function adapterState(): TaskGraphState {
+  return { nodes: [], statuses: {}, readyNodeIds: [], blockedReasons: {}, appliedEvents: [] }
 }
 function completed(request: ToolCallRequest): ToolExecutionResult {
   return { ...request, status: "completed", output: { observed: request.id }, errorCode: null }
@@ -207,6 +212,62 @@ describe("executePlanCommands", () => {
       },
     })).rejects.toMatchObject({ code: "observer_failed" })
     expect(observed).toEqual(["first", "second"])
+  })
+
+  it("runs the task graph adapter before the existing observer", async () => {
+    const order: string[] = []
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => completed(request)) }
+    const taskGraphAdapter = { observe: vi.fn(async record => { order.push(`adapter:${record.localId}`); return adapterState() }) }
+    const result = await executePlanCommands(dispatch([use("read")]), {
+      ...runtime(router), taskGraphAdapter,
+      observe: record => { order.push(`existing:${record.localId}`) },
+    })
+    expect(result.status).toBe("completed")
+    expect(order).toEqual(["adapter:read", "existing:read"])
+    expect(taskGraphAdapter.observe).toHaveBeenCalledTimes(1)
+  })
+
+  it("keeps the existing observer path unchanged when no adapter is supplied", async () => {
+    const observed: string[] = []
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => completed(request)) }
+    await expect(executePlanCommands(dispatch([use("read")]), { ...runtime(router), observe: record => { observed.push(record.localId) } })).resolves.toMatchObject({ status: "completed" })
+    expect(observed).toEqual(["read"])
+  })
+
+  it("maps adapter failures to observer_failed before invoking the existing observer", async () => {
+    const existing = vi.fn()
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => completed(request)) }
+    const taskGraphAdapter = { observe: vi.fn(async () => { throw new Error("graph store unavailable") }) }
+    await expect(executePlanCommands(dispatch([use("read")]), { ...runtime(router), taskGraphAdapter, observe: existing })).rejects.toMatchObject({ code: "observer_failed" })
+    expect(existing).not.toHaveBeenCalled()
+    expect(taskGraphAdapter.observe).toHaveBeenCalledTimes(1)
+  })
+
+  it("calls the adapter once for every record in a parallel batch", async () => {
+    const observed: string[] = []
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => completed(request)) }
+    const taskGraphAdapter = { observe: vi.fn(async record => { observed.push(record.localId); return adapterState() }) }
+    const result = await executePlanCommands(dispatch([delegate("first"), delegate("second")]), { ...runtime(router), parallelDelegateLimit: 2, taskGraphAdapter })
+    expect(result.status).toBe("completed")
+    expect(taskGraphAdapter.observe).toHaveBeenCalledTimes(2)
+    expect(observed).toEqual(["first", "second"])
+  })
+
+  it("lets the adapter ignore replan_required without creating a graph event", async () => {
+    const child = delegate("child")
+    const join = { ...base, localId: "join", kind: "join" as const, objective: "Join child", inputRefs: ["child"], dependsOn: ["child"], joinMode: "all" as const, timeoutMs: 5_000 }
+    const plan = dispatch([child, join])
+    const persisted: string[] = []
+    const taskGraphAdapter = createPlanTaskGraphAdapter(plan, {
+      runKey: "run-1", persist: ({ event }) => { persisted.push(event.eventId) },
+    })
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => request.toolName === "agent.spawn"
+      ? { ...request, status: "completed" as const, output: { taskId: "task-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" }, errorCode: null }
+      : { ...request, status: "completed" as const, output: { waitId: "wait-1", status: "ready", taskIds: ["task-1"], matchedTaskIds: ["task-1"], tasks: [{ taskId: "task-1", status: "failed", role: "scout", result: null, failureReason: "denied" }] }, errorCode: null }) }
+    const result = await executePlanCommands(plan, { ...runtime(router), rootTaskId: "root-1", taskGraphAdapter })
+    expect(result.status).toBe("blocked")
+    expect(persisted).toEqual(["run-1:child:start", "run-1:child:complete", "run-1:join:start", "run-1:join:complete"])
+    expect(persisted.some(eventId => eventId.includes(":replan"))).toBe(false)
   })
 
   it("resolves completed local output before routing a dependent command", async () => {

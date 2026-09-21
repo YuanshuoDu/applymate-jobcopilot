@@ -4,6 +4,7 @@ import type { PlanDispatchCommand, PlanDispatchResult } from "./plan-intent-disp
 import { schedulePlanCommands, type PlanCommandExecutionStep, type PlanCommandSchedulerRuntime } from "./plan-command-scheduler.js"
 import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
 import { inspectJoinFailureEvidence, replanRequiredControl, type ReplanRequiredControl } from "./plan-replan-signal.js"
+import type { PlanTaskGraphAdapter } from "./plan-task-graph-adapter.js"
 const MAX_RESULT_BYTES = 8 * 1024
 const MAX_OUTPUTS = PLAN_MAX_NODES
 export type PlanCommandExecutionErrorCode = "runtime_unavailable" | "invalid_plan" | "router_result_mismatch" | "observer_failed" | "input_reference_unavailable" | "input_reference_conflict" | "plan_budget_exhausted"
@@ -36,6 +37,7 @@ export type PlanCommandExecutionRuntime = {
   readonly rootTaskId?: string
   readonly resolveReplayedJoin?: (request: { readonly command: JoinCommand; readonly taskIds: readonly string[] }) => ToolExecutionResult | undefined | Promise<ToolExecutionResult | undefined>
   readonly admit?: (count: number) => void; readonly shouldAdmit?: (command: PlanDispatchCommand) => boolean
+  readonly taskGraphAdapter?: Pick<PlanTaskGraphAdapter, "observe">
   readonly observe?: (record: PlanCommandExecutionRecord | PlanControlRecord) => void | Promise<void>
 }
 export type PlanCommandExecutionResult = {
@@ -183,6 +185,9 @@ function context(runtime: PlanCommandExecutionRuntime, command: ExecutableComman
   })
 }
 async function observe(runtime: PlanCommandExecutionRuntime, record: PlanCommandExecutionRecord | PlanControlRecord): Promise<void> {
+  if (runtime.taskGraphAdapter) {
+    try { await runtime.taskGraphAdapter.observe(record) } catch { throw new PlanCommandExecutionError("observer_failed", "Task graph observation failed") }
+  }
   if (!runtime.observe) return
   try { await runtime.observe(record) } catch { throw new PlanCommandExecutionError("observer_failed", "Plan command observation failed") }
 }
