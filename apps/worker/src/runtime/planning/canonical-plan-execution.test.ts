@@ -559,6 +559,33 @@ describe("createCanonicalPlanExecutionFactory", () => {
     expect(replayPersist).not.toHaveBeenCalled()
   })
 
+  it("skips starts for existing replay receipts and starts each missing command once", async () => {
+    const plan = proposal([use("read"), use("next", { dependsOn: ["read"] })])
+    const graphEvents: PersistedTaskGraphEvent[] = []
+    const fresh = fixture(undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, {
+      persistTaskGraph: entry => { graphEvents.push(entry) },
+    })
+    const first = await fresh(input(output(plan)))
+    const existing = first.observations.find(observation => observation.id === "plan-result:proposal-1:read")
+    expect(existing).toBeDefined()
+    const readHistory = graphEvents.filter(entry => entry.event.nodeId === "read")
+    expect(readHistory.map(entry => entry.event.eventId)).toEqual([
+      "root-1:proposal-1:1:read:start", "root-1:proposal-1:1:read:complete",
+    ])
+    const replayPersist = vi.fn<NonNullable<CanonicalPlanExecutionOptions["persistTaskGraph"]>>()
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { replayed: true }, errorCode: null })) }
+    const replay = fixture(router, undefined, undefined, undefined, undefined, undefined, undefined, undefined, {
+      initialTaskGraphEvents: readHistory, persistTaskGraph: replayPersist,
+    })
+    const result = await replay(input(output(plan), "step-1", [existing!], true))
+    expect(result.observations).toHaveLength(1)
+    expect(result.observations[0]?.id).toBe("plan-result:proposal-1:next")
+    expect(router.execute).toHaveBeenCalledTimes(1)
+    expect(replayPersist.mock.calls.map(([entry]) => entry.event.eventId)).toEqual([
+      "root-1:proposal-1:1:next:start", "root-1:proposal-1:1:next:complete",
+    ])
+  })
+
   it("fails replay before routing when graph history has a missing or mismatched receipt", async () => {
     const plan = proposal([use("read")])
     const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { unexpected: true }, errorCode: null })) }

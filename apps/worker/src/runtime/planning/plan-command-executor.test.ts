@@ -227,6 +227,58 @@ describe("executePlanCommands", () => {
     expect(taskGraphAdapter.observe).toHaveBeenCalledTimes(1)
   })
 
+  it("persists task graph start before routing and before the existing observer", async () => {
+    const order: string[] = []
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => { order.push(`router:${request.id}`); return completed(request) }) }
+    const taskGraphAdapter = {
+      start: vi.fn(async (localId: string) => { order.push(`start:${localId}`); return adapterState() }),
+      observe: vi.fn(async record => { order.push(`adapter:${record.localId}`); return adapterState() }),
+    }
+    const result = await executePlanCommands(dispatch([use("read")]), {
+      ...runtime(router), taskGraphAdapter,
+      observe: record => { order.push(`existing:${record.localId}`) },
+    })
+    expect(result.status).toBe("completed")
+    expect(order).toEqual(["start:read", "router:call:read", "adapter:read", "existing:read"])
+    expect(taskGraphAdapter.start).toHaveBeenCalledTimes(1)
+  })
+
+  it("blocks routing when task graph start persistence fails", async () => {
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => completed(request)) }
+    const observe = vi.fn()
+    const taskGraphAdapter = { start: vi.fn(async () => { throw new Error("graph store unavailable") }), observe: vi.fn() }
+    await expect(executePlanCommands(dispatch([use("read")]), { ...runtime(router), taskGraphAdapter, observe })).rejects.toMatchObject({ code: "observer_failed" })
+    expect(router.execute).not.toHaveBeenCalled()
+    expect(taskGraphAdapter.observe).not.toHaveBeenCalled()
+    expect(observe).not.toHaveBeenCalled()
+  })
+
+  it("starts independent delegates in parallel", async () => {
+    const starts: string[] = []
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => completed(request)) }
+    const taskGraphAdapter = {
+      start: vi.fn(async (localId: string) => { starts.push(localId); return adapterState() }),
+      observe: vi.fn(async () => adapterState()),
+    }
+    const result = await executePlanCommands(dispatch([delegate("first"), delegate("second")]), { ...runtime(router), parallelDelegateLimit: 2, taskGraphAdapter })
+    expect(result.status).toBe("completed")
+    expect(starts).toEqual(["first", "second"])
+    expect(taskGraphAdapter.start).toHaveBeenCalledTimes(2)
+  })
+
+  it("starts a control before observing it", async () => {
+    const order: string[] = []
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => completed(request)) }
+    const taskGraphAdapter = {
+      start: vi.fn(async (localId: string) => { order.push(`start:${localId}`); return adapterState() }),
+      observe: vi.fn(async record => { order.push(`adapter:${record.localId}`); return adapterState() }),
+    }
+    const ask = { ...base, localId: "ask", kind: "request_input" as const, objective: "Need input", question: "Where?" }
+    const result = await executePlanCommands(dispatch([ask]), { ...runtime(router), taskGraphAdapter, observe: record => { order.push(`existing:${record.localId}`) } })
+    expect(result.status).toBe("blocked")
+    expect(order).toEqual(["start:ask", "adapter:ask", "existing:ask"])
+  })
+
   it("keeps the existing observer path unchanged when no adapter is supplied", async () => {
     const observed: string[] = []
     const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => completed(request)) }

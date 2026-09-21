@@ -36,6 +36,17 @@ describe("plan task graph adapter", () => {
     expect(value.state.readyNodeIds).toEqual(["first"])
   })
 
+  it("persists a standalone start once and rejects unknown or non-ready nodes", async () => {
+    const { value, persist } = adapter([command("first"), command("next", ["first"])])
+    await value.start!("first")
+    await value.start!("first")
+    await expect(value.start!("next")).rejects.toMatchObject({ code: "illegal_transition" })
+    await expect(value.start!("missing")).rejects.toMatchObject({ code: "unknown_node" })
+    await value.observe(record("first", "completed"))
+    expect(persist.mock.calls.map(([entry]) => entry.event.eventId)).toEqual(["run-1:first:start", "run-1:first:complete"])
+    expect(value.state.statuses.first).toBe("completed")
+  })
+
   it("persists stable start and complete events for a completed record", async () => {
     const { value, persist } = adapter([command("first")])
     await value.observe(record("first", "completed"))

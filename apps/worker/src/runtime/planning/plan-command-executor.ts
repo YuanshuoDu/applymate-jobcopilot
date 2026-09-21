@@ -37,7 +37,7 @@ export type PlanCommandExecutionRuntime = {
   readonly rootTaskId?: string
   readonly resolveReplayedJoin?: (request: { readonly command: JoinCommand; readonly taskIds: readonly string[] }) => ToolExecutionResult | undefined | Promise<ToolExecutionResult | undefined>
   readonly admit?: (count: number) => void; readonly shouldAdmit?: (command: PlanDispatchCommand) => boolean
-  readonly taskGraphAdapter?: Pick<PlanTaskGraphAdapter, "observe">
+  readonly taskGraphAdapter?: Pick<PlanTaskGraphAdapter, "observe"> & Partial<Pick<PlanTaskGraphAdapter, "start">>
   readonly observe?: (record: PlanCommandExecutionRecord | PlanControlRecord) => void | Promise<void>
 }
 export type PlanCommandExecutionResult = {
@@ -185,11 +185,16 @@ function context(runtime: PlanCommandExecutionRuntime, command: ExecutableComman
   })
 }
 async function observe(runtime: PlanCommandExecutionRuntime, record: PlanCommandExecutionRecord | PlanControlRecord): Promise<void> {
+  if (record.kind === "request_input" || record.kind === "propose_completion") await start(runtime, record.localId)
   if (runtime.taskGraphAdapter) {
     try { await runtime.taskGraphAdapter.observe(record) } catch { throw new PlanCommandExecutionError("observer_failed", "Task graph observation failed") }
   }
   if (!runtime.observe) return
   try { await runtime.observe(record) } catch { throw new PlanCommandExecutionError("observer_failed", "Plan command observation failed") }
+}
+async function start(runtime: PlanCommandExecutionRuntime, localId: string): Promise<void> {
+  if (!runtime.taskGraphAdapter?.start) return
+  try { await runtime.taskGraphAdapter.start(localId) } catch { throw new PlanCommandExecutionError("observer_failed", "Task graph start failed") }
 }
 function validatePlanCommands(value: PlanDispatchResult): readonly PlanDispatchCommand[] {
   if (!value || !Array.isArray(value.commands) || value.commands.length > PLAN_MAX_NODES) throw new PlanCommandExecutionError("invalid_plan", "Plan command count exceeds the runtime bound")
@@ -221,8 +226,10 @@ async function executeCommand(runtime: PlanCommandExecutionRuntime, command: Exe
   const requestValue = command.kind === "join" ? { ...command.call, input: { ...command.call.input, taskIds: [...taskIds!] } } : resolvedRequest(runtime, command, outputs)
   let response: ToolExecutionResult
   try {
+    const requestContext = await context(runtime, command)
+    await start(runtime, command.localId)
     const replayed = command.kind === "join" ? await runtime.resolveReplayedJoin?.({ command, taskIds: taskIds! }) : undefined
-    response = result(replayed ?? await runtime.router!.execute(await context(runtime, command), requestValue), requestValue)
+    response = result(replayed ?? await runtime.router!.execute(requestContext, requestValue), requestValue)
     if (command.kind === "join" && response.status === "completed") validateJoinResult(response.output, taskIds!)
   } catch (error: unknown) {
     if (error instanceof PlanCommandExecutionError) throw error

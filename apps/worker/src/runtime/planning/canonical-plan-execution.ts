@@ -435,6 +435,11 @@ function replayRuntime(
   if (taskGraph && !options.persistTaskGraph && dispatched.commands.some(command => !receipts.has(command.localId))) throw new CanonicalPlanError("invalid_plan_output")
   const replayTaskGraph = taskGraph ? {
     get state() { return taskGraph.state },
+    start: async (localId: string) => {
+      if (receipts.has(localId)) return taskGraph.state
+      if (!taskGraph.start) throw new PlanTaskGraphAdapterError("persistence_failed", "Task graph start is unavailable")
+      return taskGraph.start(localId)
+    },
     observe: async (record: PlanCommandExecutionRecord | PlanControlRecord) => receipts.has(record.localId) ? taskGraph.state : taskGraph.observe(record),
   } satisfies PlanTaskGraphAdapter : undefined
   for (const command of dispatched.commands) {

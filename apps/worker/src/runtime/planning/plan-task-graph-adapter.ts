@@ -30,6 +30,7 @@ export class PlanTaskGraphAdapterError extends Error {
 
 export type PlanTaskGraphAdapter = {
   readonly state: TaskGraphState
+  readonly start?: (localId: string) => Promise<TaskGraphState>
   readonly observe: (record: ObservablePlanRecord) => Promise<TaskGraphState>
 }
 
@@ -203,6 +204,15 @@ export function createPlanTaskGraphAdapter(plan: PlanDispatchResult, options: Pl
     state = reduction.state
   }
 
+  const start = async (localId: string): Promise<TaskGraphState> => {
+    const started = eventId(runKey, localId, "start")
+    if (state.appliedEvents.some(previous => previous.eventId === started && previous.nodeId === localId && previous.type === "start")) return state
+    if (!(localId in state.statuses)) throw new PlanTaskGraphAdapterError("unknown_node", `Unknown node ${localId}`)
+    if (state.statuses[localId] !== "ready" && state.statuses[localId] !== "waiting") throw new PlanTaskGraphAdapterError("illegal_transition", `Cannot start node ${localId} from ${state.statuses[localId]}`)
+    await apply(localId, "start")
+    return state
+  }
+
   const observe = async (record: ObservablePlanRecord): Promise<TaskGraphState> => {
     if (!record || typeof record !== "object") throw new PlanTaskGraphAdapterError("invalid_record", "Unsupported plan observation record")
     if (isReplan(record)) return state
@@ -211,10 +221,10 @@ export function createPlanTaskGraphAdapter(plan: PlanDispatchResult, options: Pl
     if (controlRecord(record)) phase = "wait"
     else if (isExecutionRecord(record)) phase = terminalPhase(record)
     else throw new PlanTaskGraphAdapterError("invalid_record", "Unsupported plan observation record")
-    await apply(record.localId, "start")
+    await start(record.localId)
     await apply(record.localId, phase)
     return state
   }
 
-  return { get state() { return state }, observe }
+  return { get state() { return state }, start, observe }
 }
