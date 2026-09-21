@@ -287,6 +287,18 @@ describe("loadCanonicalTurnState", () => {
     expect(eventQuery).toContain("'plan.command'")
   })
 
+  it("rejects a plan command receipt whose revision differs from the accepted plan revision", async () => {
+    const command = { planCallId: "plan-1", planRevision: 2, observationId: "plan-result:plan-1:read", content: { kind: "plan_command", commandKind: "tool_call", status: "completed", output: { found: true } } }
+    const value = await loadCanonicalTurnState(pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      events: [
+        { type: "plan.revision", payload: { planCallId: "plan-1", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null } },
+        { type: "plan.command", payload: command },
+      ],
+    }), lease)
+    expect(value.snapshot.toolObservations.some(item => item.id === command.observationId)).toBe(false)
+  })
+
   it("counts valid plan action receipts once across command and observation events", async () => {
     const read = { planCallId: "plan-1", planRevision: 1, observationId: "plan-result:plan-1:read", content: { kind: "plan_command", commandKind: "tool_call", status: "completed", errorCode: null } }
     const delegate = { planCallId: "plan-1", planRevision: 1, observationId: "plan-result:plan-1:delegate", content: { kind: "plan_command", commandKind: "delegate", status: "failed", errorCode: "router_execution_failed" } }

@@ -113,8 +113,40 @@ function planRevisionObservations(events: readonly Row[], goalRevision: number):
     return [{ id: projection.id, content: json(projection.content) }]
   })
 }
-function planCommandObservations(events: readonly Row[], currentPlanIds?: ReadonlySet<string>): StepContextSnapshot["toolObservations"] { return events.filter(event => event.type === "plan.command").flatMap(event => { const receipt = parsePlanCommandReceipt(eventPayload(event.payload)); return receipt && (!currentPlanIds || currentPlanIds.has(receipt.planCallId)) ? [planCommandObservation(receipt)] : [] }) }
-function planActionCount(events: readonly Row[]): number { const counted = new Set<string>(); for (const event of events) { if (event.type !== "plan.command" && event.type !== "plan.observation") continue; const payload = eventPayload(event.payload), receipt = event.type === "plan.command" ? parsePlanCommandReceipt(payload) : null, observationId = event.type === "plan.command" ? receipt?.observationId : payload.observationId, content = event.type === "plan.command" ? receipt?.content : payload.content, contentObject = object(content); if (typeof observationId !== "string" || observationId.trim() !== observationId || observationId.length === 0 || observationId.length > 256 || !isBoundedPlanJson(content) || counted.has(observationId) || contentObject.kind !== "plan_command" || !["tool_call", "delegate", "join"].includes(String(contentObject.commandKind))) continue; counted.add(observationId) } return counted.size }
+function acceptedPlanRevisions(observations: StepContextSnapshot["toolObservations"]): ReadonlyMap<string, number> {
+  const revisions = new Map<string, number>()
+  for (const observation of observations) {
+    const content = object(observation.content)
+    if (typeof content.planCallId === "string" && typeof content.planRevision === "number") revisions.set(content.planCallId, content.planRevision)
+  }
+  return revisions
+}
+function expectedPlanRevision(payload: Record<string, unknown>, revisions: ReadonlyMap<string, number>): number | undefined {
+  return typeof payload.planCallId === "string" ? revisions.get(payload.planCallId) : undefined
+}
+function planCommandObservations(events: readonly Row[], currentPlanIds?: ReadonlySet<string>, revisions: ReadonlyMap<string, number> = new Map()): StepContextSnapshot["toolObservations"] {
+  return events.filter(event => event.type === "plan.command").flatMap(event => {
+    const payload = eventPayload(event.payload)
+    const receipt = parsePlanCommandReceipt(payload, undefined, expectedPlanRevision(payload, revisions))
+    return receipt && (!currentPlanIds || currentPlanIds.has(receipt.planCallId)) ? [planCommandObservation(receipt)] : []
+  })
+}
+function planActionCount(events: readonly Row[], revisions: ReadonlyMap<string, number> = new Map()): number {
+  const counted = new Set<string>()
+  for (const event of events) {
+    if (event.type !== "plan.command" && event.type !== "plan.observation") continue
+    const payload = eventPayload(event.payload)
+    const receipt = event.type === "plan.command"
+      ? parsePlanCommandReceipt(payload, undefined, expectedPlanRevision(payload, revisions))
+      : null
+    const observationId = event.type === "plan.command" ? receipt?.observationId : payload.observationId
+    const content = event.type === "plan.command" ? receipt?.content : payload.content
+    const contentObject = object(content)
+    if (typeof observationId !== "string" || observationId.trim() !== observationId || observationId.length === 0 || observationId.length > 256 || !isBoundedPlanJson(content) || counted.has(observationId) || contentObject.kind !== "plan_command" || !["tool_call", "delegate", "join"].includes(String(contentObject.commandKind))) continue
+    counted.add(observationId)
+  }
+  return counted.size
+}
 function contextCompactionObservations(events: readonly Row[]): StepContextSnapshot["toolObservations"] {
   return events.filter(event => event.type === "context.compaction").flatMap(event => {
     const observation = parseContextCompactionObservation(eventPayload(event.payload))
@@ -195,8 +227,9 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     const revisionState = restorePlanRevisions(filterPlanRevisionEvents(eventsResult.rows.map(event => ({ type: event.type, payload: event.payload })), goalState.goalContract.revision).map(event => ({ type: event.type, payload: eventPayload(event.payload) })))
     const revision = revisionState.latest
     const currentRevisionObservations = planRevisionObservations(eventsResult.rows, goalState.goalContract.revision)
+    const acceptedRevisions = acceptedPlanRevisions(currentRevisionObservations)
     const currentPlanIds = goalState.goalContract.revision > 1 ? new Set(currentRevisionObservations.flatMap(item => { const content = object(item.content); return typeof content.planCallId === "string" ? [content.planCallId] : [] })) : undefined
-    const restoredBase = [...observations(itemsResult.rows, eventsResult.rows, goalState.goalContract.revision), ...planObservations(eventsResult.rows, currentPlanIds), ...currentRevisionObservations, ...planCommandObservations(eventsResult.rows, currentPlanIds), ...contextCompactionObservations(eventsResult.rows), ...(goalState.receipt ? [goalRevisionObservation(goalState.receipt)] : []), ...(revision ? [planRevisionObservation(revision)] : [])]
+    const restoredBase = [...observations(itemsResult.rows, eventsResult.rows, goalState.goalContract.revision), ...planObservations(eventsResult.rows, currentPlanIds), ...currentRevisionObservations, ...planCommandObservations(eventsResult.rows, currentPlanIds, acceptedRevisions), ...contextCompactionObservations(eventsResult.rows), ...(goalState.receipt ? [goalRevisionObservation(goalState.receipt)] : []), ...(revision ? [planRevisionObservation(revision)] : [])]
     const scopedSnapshot = sanitizePlanCompletionFeedbackObservations(snapshot.toolObservations, lease.turnId).filter(item => { const content = object(item.content); const output = object(content.output); return (content.kind !== "plan_revision" || content.goalRevision === goalState.goalContract.revision) && (content.toolName !== "agent.plan.propose" || output.status !== "accepted" || output.goalRevision === goalState.goalContract.revision) && (!currentPlanIds || (content.kind !== "plan_command" && content.kind !== "plan_control")) })
     const currentPlan = currentPlanId([...scopedSnapshot, ...restoredBase])
     snapshot = { ...snapshot, toolObservations: sanitizePlanCompletionFeedbackObservations(scopedSnapshot, lease.turnId, currentPlan) }
@@ -241,7 +274,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
       nextOrdinal: (maxOrdinal ?? Number(last.ordinal)) + 1,
       stepCount: steps.length,
       toolCallCount: itemsResult.rows.filter(item => item.type === "tool_call").length,
-      planActionCount: planActionCount(eventsResult.rows),
+      planActionCount: planActionCount(eventsResult.rows, acceptedRevisions),
       inputThroughSequence: BigInt(String(last?.inputThroughSequence ?? 0)),
       consumedInputIds: Array.isArray(last?.consumedInputIds) ? last.consumedInputIds.filter((id): id is string => typeof id === "string") : [],
       usage,
