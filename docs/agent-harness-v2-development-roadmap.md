@@ -2564,3 +2564,27 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused Worker validation passed **28/28 tests**. No schema, migration, Web, provider, queue, or dependency change was introduced.
 
 **Candidate boundary:** No live PostgreSQL/RLS transaction race, Redis/BullMQ delivery, process restart, provider/model call, browser, deployment, or complete goal-to-plan-to-replay evidence was run. The legacy→V2 split-brain diagnostic/design audit remains a follow-up/risk only; P8-45 does not claim that split-brain behavior is fixed. P8-45 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## 132. P8-46 — Web approval freshness parity
+
+**Candidate status/date (2026-09-21):** P8-46 is recorded as a candidate Web approval-freshness parity slice; formal acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Goal:** Keep the Web approval decision path aligned with the Worker freshness fence, so a pending approval cannot authorize an action after a later goal/plan revision or without durable request evidence, while an already-consumed submission receipt remains replayable.
+
+**Implementation:** Commit `82eae8d3` adds the Web-side server-owned approval freshness check. The decision transaction locks the session, requires an `approval.requested` event in the same session/Turn lineage, rejects a later `goal.revision` or `plan.revision`, and preserves consumed-receipt replay semantics. Missing or unavailable request/session evidence fails closed.
+
+**Independent verification:** Web focused approval/API validation passed **21/21 tests**; Web `tsc --noEmit --skipLibCheck` passed. No Worker, schema, migration, provider, queue, or dependency change was introduced.
+
+**Candidate boundary:** No live authenticated Web approval/API request, PostgreSQL/RLS transaction race, Redis/BullMQ delivery, process restart, provider/model call, browser, deployment, or complete approval-to-action production evidence was run. The legacy diagnostic taxonomy remains a future follow-up/no-op; P8-46 does not claim that legacy→V2 split-brain behavior is fixed. P8-46 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## 133. P8-47 — Foreign plan receipt scope fence
+
+**Candidate status/date (2026-09-21):** P8-47 is recorded as a candidate Worker canonical plan-receipt scope slice; formal acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Goal:** Prevent a persisted `plan.command` receipt belonging to another plan from being restored as current evidence or included in the canonical action count.
+
+**Implementation:** Commit `6a1550f1` scopes restored plan-command receipts and action counting to the current plan IDs or accepted plan revisions. Foreign `planCallId` values are omitted, while revision-one receipts remain compatible when no accepted revision metadata exists; stored events are not rewritten.
+
+**Independent verification:** Focused Worker validation passed **31/31 tests**; Worker `tsc --noEmit --skipLibCheck` passed. No schema, migration, Web, provider, queue, or dependency change was introduced.
+
+**Candidate boundary:** No live PostgreSQL/RLS transaction race, Redis/BullMQ delivery, process restart, provider/model call, browser, deployment, or complete goal-to-plan-to-replay production evidence was run. The legacy diagnostic taxonomy remains a future follow-up/no-op; P8-47 does not claim that legacy→V2 split-brain behavior is fixed. P8-47 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
