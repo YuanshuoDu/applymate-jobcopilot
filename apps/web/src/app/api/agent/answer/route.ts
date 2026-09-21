@@ -9,6 +9,8 @@ import { NextRequest }                          from 'next/server'
 import { db }                                    from '@/lib/db'
 import { requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { enqueueAgentRun } from '@/lib/agent-run-queue-client'
+import { AgentWaitError } from '@/lib/agent/broker/errors'
+import { answerLegacyQuestion, type LegacyQuestionAnswerResult } from '@/lib/agent/broker/legacy-question-answer'
 
 const ACTIVE_CANONICAL_TURN_STATUSES = [
   'queued',
@@ -19,6 +21,8 @@ const ACTIVE_CANONICAL_TURN_STATUSES = [
 ] as const
 
 const CANONICAL_WAIT_CODE = 'canonical_turn_owns_wait'
+const BRIDGE_PENDING_CODE = 'legacy_question_bridge_pending'
+const DISPATCH_PENDING_CODE = 'dispatch_pending'
 
 export async function POST(req: NextRequest) {
   const auth = await requireAuth(req)
@@ -26,6 +30,45 @@ export async function POST(req: NextRequest) {
 
   const body = await req.json().catch(() => null)
   if (typeof body?.questionId !== 'string' || typeof body?.answer !== 'string' || !body.answer.trim()) return err('Missing questionId or answer')
+
+  let bridgeResult: LegacyQuestionAnswerResult
+  try {
+    bridgeResult = await answerLegacyQuestion(db, {
+      questionId: body.questionId,
+      userId: auth.userId,
+      answer: body.answer,
+      ...(typeof body.clientMessageId === 'string' ? { clientMessageId: body.clientMessageId } : {}),
+    })
+  } catch (error) {
+    if (error instanceof AgentWaitError) {
+      return Response.json({ error: error.message, code: error.code, details: error.details }, { status: error.status })
+    }
+    return Response.json({ error: error instanceof Error ? error.message : 'Could not answer the Agent', code: 'answer_bridge_failed' }, { status: 503 })
+  }
+
+  if (bridgeResult.disposition === 'bridged' || bridgeResult.disposition === 'duplicate') {
+    return ok({
+      answered: true,
+      questionId: bridgeResult.questionId,
+      answer: body.answer,
+      resumed: false,
+      continuation: 'canonical_turn_wakeup_recorded',
+      disposition: bridgeResult.disposition,
+      turnId: bridgeResult.turnId,
+      itemId: bridgeResult.itemId,
+      nextTurnRevision: bridgeResult.nextTurnRevision,
+    })
+  }
+
+  if (bridgeResult.disposition === 'bridge_pending') {
+    return Response.json({
+      error: 'The canonical question bridge is pending proof.',
+      code: BRIDGE_PENDING_CODE,
+      reason: bridgeResult.reason,
+    }, { status: 409 })
+  }
+
+  if (bridgeResult.disposition === 'legacy_only' && bridgeResult.reason === 'question_not_found') return err('Question not found', 404)
 
   const q = await db.agentRunQuestion.findFirst({
     where: { id: body.questionId, userId: auth.userId },
@@ -88,7 +131,12 @@ export async function POST(req: NextRequest) {
         where: { id: execution.id, userId: auth.userId, status: "queued" },
         data: { status: "waiting_for_user" },
       }).catch(() => undefined)
-      return err(error instanceof Error ? error.message : "Could not resume the Agent", 503)
+      return Response.json({
+        error: error instanceof Error ? error.message : "Could not resume the Agent",
+        code: DISPATCH_PENDING_CODE,
+        questionId: body.questionId,
+        resumed: false,
+      }, { status: 503 })
     }
   }
 
