@@ -20,9 +20,15 @@ describe('tablet and phone layout safeguards', () => {
   })
 
   it('exposes a draggable AI panel divider while keeping it hidden on narrow layouts', () => {
-    expect(resumeCss).toMatch(/grid-template-columns:[^;]*var\(--resume-ai-width, 340px\)/)
+    expect(resumeCss).toMatch(/grid-template-columns:[^;]*var\(--resume-ai-width, 380px\)/)
     expect(resumeCss).toMatch(/\.resume-ai-resize-handle[\s\S]*cursor:\s*col-resize/)
     expect(resumeCss).toMatch(/@media \(max-width: 960px\)[\s\S]*\.resume-ai-resize-handle\s*\{\s*display:\s*none/)
+  })
+
+  it('uses an A4 editor paper on desktop and releases the fixed page shape responsively', () => {
+    expect(resumeCss).toMatch(/\.resume-paper\s*\{[\s\S]*width:\s*100%[\s\S]*max-width:\s*794px[\s\S]*min-height:\s*1123px[\s\S]*aspect-ratio:\s*794\s*\/\s*1123/)
+    expect(resumeCss).toMatch(/@media \(max-width: 960px\)[\s\S]*\.resume-paper\s*\{[\s\S]*min-height:\s*0[\s\S]*aspect-ratio:\s*auto/)
+    expect(resumePageSource).toContain('const A4_W = 794')
   })
 
   it('uses a nested draggable resume-list divider and removes the old hide button', () => {

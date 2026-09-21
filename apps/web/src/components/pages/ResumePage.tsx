@@ -135,7 +135,8 @@ const EMPTY_CONTENT: ResumeContent = {
 const DEFAULT_ORDER = ['summary', 'experience', 'skills', 'education', 'languages']
 const AI_PANEL_MIN_WIDTH = 280
 const AI_PANEL_MAX_WIDTH = 520
-const AI_PANEL_DEFAULT_WIDTH = 340
+const AI_PANEL_LEGACY_DEFAULT_WIDTH = 340
+const AI_PANEL_DEFAULT_WIDTH = 380
 const AI_PANEL_WIDTH_STORAGE_KEY = 'applymate_resume_ai_panel_width'
 const RESUME_LIBRARY_MIN_WIDTH = 190
 const RESUME_LIBRARY_MAX_WIDTH = 320
@@ -298,6 +299,7 @@ function AddDirectionDialog({ onClose, onCreate }: {
 
 // ── ResumePreview (page-aware preview panel) ──────────────────────────────────
 
+const A4_W = 794 // px at 96 dpi
 const A4_H = 1123 // px at 96 dpi
 
 type PageFit =
@@ -340,7 +342,7 @@ function ResumePreview({ content, templateId, templateOptions }: {
   const isTwoPage = fit?.type === 'two-page' || fit?.type === 'too-long'
 
   return (
-    <div style={{ maxWidth: 794, margin: '0 auto' }}>
+    <div style={{ maxWidth: A4_W, margin: '0 auto' }}>
 
       {/* Status bar */}
       {fit && (
@@ -695,7 +697,8 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       const storedValue = window.localStorage.getItem(AI_PANEL_WIDTH_STORAGE_KEY)
       const storedWidth = storedValue === null ? NaN : Number(storedValue)
       if (Number.isFinite(storedWidth)) {
-        setAiPanelWidth(Math.min(AI_PANEL_MAX_WIDTH, Math.max(AI_PANEL_MIN_WIDTH, storedWidth)))
+        const migratedWidth = storedWidth === AI_PANEL_LEGACY_DEFAULT_WIDTH ? AI_PANEL_DEFAULT_WIDTH : storedWidth
+        setAiPanelWidth(Math.min(AI_PANEL_MAX_WIDTH, Math.max(AI_PANEL_MIN_WIDTH, migratedWidth)))
       }
     } catch { /* localStorage may be unavailable in private browsing */ }
   }, [])
@@ -1949,7 +1952,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
             <CompletenessBar content={content} />
 
             {/* Resume paper */}
-            <div className="resume-paper" style={{ maxWidth: 680, margin: '0 auto', background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 10, padding: '32px 36px' }}>
+            <div className="resume-paper" style={{ margin: '0 auto', background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 10, padding: '32px 36px' }}>
               {/* Contact (fixed, not draggable) */}
               <ContactSection
                 contact={content.contact}
