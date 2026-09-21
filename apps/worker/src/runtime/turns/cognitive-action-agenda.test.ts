@@ -16,6 +16,12 @@ function goal(revision = 2): StepContext["blocks"][number] {
 function observation(id: string, content: Record<string, unknown>): StepContext["blocks"][number] {
   return block(id, "tool_observation", content)
 }
+function plan(callId: string, revision: number, basedOnPlanRevision: number | null): StepContext["blocks"][number] {
+  return observation(`observation:plan-revision:${callId}`, { kind: "plan_revision", planCallId: callId, goalRevision: 2, planRevision: revision, basedOnPlanRevision })
+}
+function replan(callId: string): StepContext["blocks"][number] {
+  return observation(`observation:plan-control:${callId}:join:replan`, { kind: "plan_control", localId: "join:replan", status: "replan_required", dependsOn: ["child"], reason: "child_failure", failedTaskIds: ["child-1"] })
+}
 
 describe("cognitive action agenda", () => {
   it("sorts and deduplicates safe IDs deterministically", () => {
@@ -55,6 +61,32 @@ describe("cognitive action agenda", () => {
     expect(text).not.toContain("secret failure")
     expect(text).not.toContain("ignore server")
     expect(text).not.toContain("never place this raw goal")
+  })
+
+  it("ignores a superseded plan replan blocker in unresolved signals", () => {
+    const agenda = buildCognitiveActionAgenda(context([goal(), plan("plan-1", 1, null), plan("plan-2", 2, 1), replan("plan-1")]))
+
+    expect(agenda.nextAction).toBe("continue_plan")
+    expect(agenda.blockedBy).toEqual({ kind: null, ids: [] })
+    expect(agenda.signals.unresolved).toEqual({ count: 0, ids: [] })
+  })
+
+  it("keeps the current plan replan blocker active", () => {
+    const agenda = buildCognitiveActionAgenda(context([goal(), plan("plan-1", 1, null), plan("plan-2", 2, 1), replan("plan-2")]))
+
+    expect(agenda.nextAction).toBe("continue_turn")
+    expect(agenda.blockedBy).toEqual({ kind: "unresolved_failure", ids: ["observation:plan-control:plan-2:join:replan"] })
+  })
+
+  it.each([
+    ["unknown", [replan("plan-1")]],
+    ["duplicate", [plan("plan-1", 1, null), plan("other", 1, null), replan("plan-1")]],
+    ["gap", [plan("plan-1", 1, null), plan("plan-3", 3, 2), replan("plan-1")]],
+    ["legacy revision one", [observation("observation:plan-revision:legacy", { kind: "plan_revision", goalRevision: 2, planRevision: 1 }), replan("plan-1")]],
+  ] as const)("keeps replan blockers when plan scope is %s", (_name, extra) => {
+    const agenda = buildCognitiveActionAgenda(context([goal(), ...extra]))
+
+    expect(agenda.signals.unresolved.ids).toContain("observation:plan-control:plan-1:join:replan")
   })
 
   it.each(["agent.wait", "wait_subagents"] as const)("recognizes %s as an active child wait", toolName => {

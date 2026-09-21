@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer"
 
 import type { StepContext } from "../context/step-context-builder.js"
+import { resolveLatestAcceptedPlanCallId, replanSignalPlanCallId } from "../planning/plan-revision-scope.js"
 
 export const COGNITIVE_ACTION_AGENDA_SCHEMA_VERSION = "agent-harness.cognitive-action-agenda.v1" as const
 export const schemaVersion = COGNITIVE_ACTION_AGENDA_SCHEMA_VERSION
@@ -117,6 +118,7 @@ function choose(nextAction: CognitiveAction, blocker: CognitiveAgendaBlocker | n
 
 export function buildCognitiveActionAgenda(context: StepContext, input: AgendaInput = {}): CognitiveActionAgenda {
   const currentGoalRevision = goalRevision(context)
+  const planScope = currentGoalRevision === null ? { kind: "unknown" as const } : resolveLatestAcceptedPlanCallId(context.blocks.filter(block => block.layer === "tool_observation").map(block => ({ id: block.id, content: block.content })), currentGoalRevision)
   const pending: unknown[] = [], approvals: unknown[] = [], waits: unknown[] = [], unresolved: unknown[] = [], completion: unknown[] = []
   let currentPlanRevision: number | null = null, duplicatePlanRevision = false
   const planRevisions = new Set<number>()
@@ -140,7 +142,9 @@ export function buildCognitiveActionAgenda(context: StepContext, input: AgendaIn
     const isCompletionProposal = observationKind === "plan_control" && observationStatus === "completion_proposed"
     const safeCompletion = isCompletionProposal && safeCompletionControl(record, observationId)
     if (safeCompletion) completion.push(observationId)
-    if (observationStatus !== null && FAILURE_STATUSES.has(observationStatus) || observationKind === "plan_control" && observationStatus !== null && observationStatus !== "completed" && observationStatus !== "completion_proposed" && !waitKind && !approvalKind) unresolved.push(observationId)
+    const replanCallId = observationKind === "plan_control" && observationStatus === "replan_required" ? replanSignalPlanCallId({ id: block.id, content: record }) : null
+    const supersededReplan = planScope.kind === "known" && replanCallId !== null && replanCallId !== planScope.planCallId
+    if (observationStatus !== null && FAILURE_STATUSES.has(observationStatus) || observationKind === "plan_control" && observationStatus !== null && observationStatus !== "completed" && observationStatus !== "completion_proposed" && !waitKind && !approvalKind && !supersededReplan) unresolved.push(observationId)
   }
   const pendingSet = signal(pending), approvalSet = signal(approvals), waitSet = signal(waits), unresolvedSet = signal(unresolved), completionSet = signal(completion)
   const control = plain(context.steeringMarkerControl) ? context.steeringMarkerControl : undefined

@@ -14,6 +14,12 @@ function context(overrides: Partial<StepContext> = {}): StepContext {
 function block(id: string, layer: StepContext["blocks"][number]["layer"], content: unknown, role: StepContext["blocks"][number]["role"] = "data"): StepContext["blocks"][number] {
   return { id, layer, role, trust: layer === "system" ? "system" : "external_untrusted", source: "test", content: content as never }
 }
+function plan(callId: string, revision: number, basedOnPlanRevision: number | null): StepContext["blocks"][number] {
+  return block(`observation:plan-revision:${callId}`, "tool_observation", { kind: "plan_revision", planCallId: callId, goalRevision: 1, planRevision: revision, basedOnPlanRevision })
+}
+function replan(callId: string): StepContext["blocks"][number] {
+  return block(`observation:plan-control:${callId}:join:replan`, "tool_observation", { kind: "plan_control", localId: "join:replan", status: "replan_required", dependsOn: ["child"], reason: "child_failure", failedTaskIds: ["child-1"] })
+}
 
 describe("cognitive control frame", () => {
   it("derives deterministic bounded sorted state from server-shaped fields", () => {
@@ -53,6 +59,30 @@ describe("cognitive control frame", () => {
     const valid = context({ blocks: [block("goal", "goal", { revision: 1 }), block("summary", "tool_observation", { kind: "context_summary", memory: validMemory })] })
     expect(buildCognitiveControlFrame(valid).memory).toMatchObject({ schemaVersion: "agent-harness.cognitive-memory.v1", coveredSequence: "8", decisionCount: 1, questionCount: 0, referenceCounts: { approvals: 1 } })
     expect(buildCognitiveControlFrame(context({ blocks: [block("summary", "tool_observation", { kind: "context_summary", memory: { ...validMemory, decisions: null } })] })).memory).toBeUndefined()
+  })
+
+  it("excludes a superseded plan replan blocker while retaining the current plan state", () => {
+    const frame = buildCognitiveControlFrame(context({ blocks: [block("goal", "goal", { revision: 1 }), plan("plan-1", 1, null), plan("plan-2", 2, 1), replan("plan-1")] }))
+
+    expect(frame.plan).toEqual({ anchorId: "observation:plan-revision:plan-2", revision: 2 })
+    expect(frame.unresolved).toEqual({ count: 0, ids: [] })
+  })
+
+  it("keeps the current plan replan blocker active", () => {
+    const frame = buildCognitiveControlFrame(context({ blocks: [block("goal", "goal", { revision: 1 }), plan("plan-1", 1, null), plan("plan-2", 2, 1), replan("plan-2")] }))
+
+    expect(frame.unresolved).toEqual({ count: 1, ids: ["observation:plan-control:plan-2:join:replan"] })
+  })
+
+  it.each([
+    ["unknown", [replan("plan-1")]],
+    ["duplicate", [plan("plan-1", 1, null), plan("other", 1, null), replan("plan-1")]],
+    ["gap", [plan("plan-1", 1, null), plan("plan-3", 3, 2), replan("plan-1")]],
+    ["legacy revision one", [block("observation:plan-revision:legacy", "tool_observation", { kind: "plan_revision", goalRevision: 1, planRevision: 1 }), replan("plan-1")]],
+  ] as const)("keeps replan blockers when plan scope is %s", (_name, extra) => {
+    const frame = buildCognitiveControlFrame(context({ blocks: [block("goal", "goal", { revision: 1 }), ...extra] }))
+
+    expect(frame.unresolved.ids).toContain("observation:plan-control:plan-1:join:replan")
   })
 
   it.each(["agent.wait", "wait_subagents"] as const)("recognizes %s as an active child wait", toolName => {
