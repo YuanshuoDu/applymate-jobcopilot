@@ -266,14 +266,14 @@ body {
 }
 
 .app-sidebar.is-collapsed.is-account-menu-open {
-  width: var(--sidebar-w);
+  z-index: 120;
 }
 
 .app-sidebar.is-collapsed.is-account-menu-open .app-sidebar-account-menu {
   left: 0;
-  right: 0;
-  width: auto;
-  max-width: none;
+  right: auto;
+  width: 300px;
+  max-width: calc(100vw - 24px);
 }
 
 .app-nav-button {

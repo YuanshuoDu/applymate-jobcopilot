@@ -45,11 +45,12 @@ describe('tablet and phone layout safeguards', () => {
     expect(globalCss).toMatch(/\.app-sidebar-toggle\s*\{[\s\S]*position:\s*absolute[\s\S]*right:\s*-14px/)
   })
 
-  it('expands the collapsed sidebar for a readable account menu', () => {
+  it('floats the collapsed account menu without expanding the sidebar', () => {
     expect(sidebarSource).toContain('className="app-sidebar-account-menu"')
     expect(sidebarSource).toContain("' is-account-menu-open'")
-    expect(globalCss).toMatch(/\.app-sidebar\.is-collapsed\.is-account-menu-open\s*\{[\s\S]*width:\s*var\(--sidebar-w\)/)
-    expect(globalCss).toMatch(/\.app-sidebar\.is-collapsed\.is-account-menu-open \.app-sidebar-account-menu\s*\{[\s\S]*left:\s*0[\s\S]*right:\s*0[\s\S]*width:\s*auto/)
+    expect(globalCss).toMatch(/\.app-sidebar\.is-collapsed\.is-account-menu-open\s*\{[\s\S]*z-index:\s*120/)
+    expect(globalCss).toMatch(/\.app-sidebar\.is-collapsed\.is-account-menu-open \.app-sidebar-account-menu\s*\{[\s\S]*left:\s*0[\s\S]*right:\s*auto[\s\S]*width:\s*300px[\s\S]*max-width:\s*calc\(100vw - 24px\)/)
+    expect(globalCss).not.toMatch(/\.app-sidebar\.is-collapsed\.is-account-menu-open\s*\{[\s\S]*width:\s*var\(--sidebar-w\)/)
     expect(globalCss).toMatch(/\.app-sidebar-account-menu-item\s*\{[\s\S]*white-space:\s*nowrap/)
   })
 
@@ -66,5 +67,18 @@ describe('tablet and phone layout safeguards', () => {
     expect(resumeCss).toMatch(/\.resume-workspace-title-copy\s*\{[\s\S]*display:\s*grid/)
     expect(resumeCss).toMatch(/\.resume-format-toolbar\s*\{[\s\S]*display:\s*flex/)
     expect(resumeCss).toMatch(/\.resume-format-group\s*\{[\s\S]*border:/)
+  })
+
+  it('aligns editor chrome to the A4 paper and stages the left-collapse motion', () => {
+    expect(resumePageSource).toContain('className="resume-editor-content"')
+    expect(resumePageSource).toContain('className="resume-completeness"')
+    expect(resumePageSource).toContain('className="resume-workspace-preview-icon"')
+    expect(resumeCss).toMatch(/\.resume-editor-content\s*\{[\s\S]*width:\s*100%[\s\S]*max-width:\s*794px/)
+    expect(resumeCss).toMatch(/\.resume-completeness\s*\{[\s\S]*width:\s*100%/)
+    expect(resumeCss).toMatch(/\.resume-workspace-preview-button\s*\{[\s\S]*min-width:\s*108px[\s\S]*min-height:\s*40px/)
+    expect(resumeCss).toMatch(/\.resume-library-layout\.is-library-collapsing\s*\{[\s\S]*transition:\s*grid-template-columns/)
+    expect(resumePageSource).toContain('RESUME_LIBRARY_COLLAPSE_ANIMATION_MS')
+    expect(resumePageSource).toContain('MAIN_NAV_COLLAPSE_DELAY_MS')
+    expect(resumePageSource).toContain('scheduleSidebarCollapse')
   })
 })
