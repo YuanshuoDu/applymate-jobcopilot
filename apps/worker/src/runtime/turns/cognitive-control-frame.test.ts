@@ -26,6 +26,9 @@ function planResult(callId: string, status: "failed" | "interrupted" | "cancelle
 function planError(callId: string): StepContext["blocks"][number] {
   return block(`observation:plan-error:${callId}`, "tool_observation", { kind: "plan_error", status: "failed", errorCode: "test" })
 }
+function planControlWait(callId: string, status: "waiting_for_user" | "waiting_for_dependency"): StepContext["blocks"][number] {
+  return block(`observation:plan-control:${callId}:ask`, "tool_observation", { kind: "plan_control", localId: "ask", status, ...(status === "waiting_for_user" ? { question: "Where?" } : {}) })
+}
 
 describe("cognitive control frame", () => {
   it("derives deterministic bounded sorted state from server-shaped fields", () => {
@@ -107,6 +110,15 @@ describe("cognitive control frame", () => {
     expect(frame.unresolved.ids).toEqual(["observation:approval:current", "observation:wait-result:current"])
   })
 
+  it.each(["waiting_for_user", "waiting_for_dependency"] as const)("filters superseded plan-control %s while retaining the current gate", status => {
+    const frame = buildCognitiveControlFrame(context({ blocks: [
+      block("goal", "goal", { revision: 1 }), plan("plan-1", 1, null), plan("plan-2", 2, 1), planControlWait("plan-1", status), planControlWait("plan-2", status),
+    ] }))
+    expect(frame.activeWaits.ids).not.toContain("observation:plan-control:plan-1:ask")
+    expect(frame.unresolved.ids).not.toContain("observation:plan-control:plan-1:ask")
+    expect(frame.activeWaits.ids.includes("observation:plan-control:plan-2:ask") || frame.unresolved.ids.includes("observation:plan-control:plan-2:ask")).toBe(true)
+  })
+
   it("retains an ordinary unowned failure", () => {
     const frame = buildCognitiveControlFrame(context({ blocks: [block("goal", "goal", { revision: 1 }), plan("plan-1", 1, null), plan("plan-2", 2, 1), block("observation:failure:1", "tool_observation", { kind: "plan_command", status: "failed" })] }))
 
@@ -133,6 +145,19 @@ describe("cognitive control frame", () => {
     const frame = buildCognitiveControlFrame(context({ blocks: [block("goal", "goal", { revision: 1 }), ...extra] }))
 
     expect(frame.unresolved.ids).toContain("observation:plan-result:plan-1:read")
+  })
+
+  it.each([
+    ["unknown", [planControlWait("plan-1", "waiting_for_user")]],
+    ["duplicate", [plan("plan-1", 1, null), plan("other", 1, null), planControlWait("plan-1", "waiting_for_dependency")]],
+    ["gap", [plan("plan-1", 1, null), plan("plan-3", 3, 2), planControlWait("plan-1", "waiting_for_user")]],
+    ["legacy revision one", [block("observation:plan-revision:legacy", "tool_observation", { kind: "plan_revision", goalRevision: 1, planRevision: 1 }), planControlWait("plan-1", "waiting_for_dependency")]],
+    ["malformed", [block("observation:plan-revision:wrong-id", "tool_observation", { kind: "plan_revision", planCallId: "plan-1", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null }), planControlWait("plan-1", "waiting_for_user")]],
+  ] as const)("retains plan-control waits when plan scope is %s", (_name, extra) => {
+    const frame = buildCognitiveControlFrame(context({ blocks: [block("goal", "goal", { revision: 1 }), ...extra] }))
+
+    const id = "observation:plan-control:plan-1:ask"
+    expect(frame.activeWaits.ids.includes(id) || frame.unresolved.ids.includes(id)).toBe(true)
   })
 
   it.each(["agent.wait", "wait_subagents"] as const)("recognizes %s as an active child wait", toolName => {

@@ -180,11 +180,13 @@ export function buildCognitiveControlFrame(context: StepContext, input: FrameInp
     }
     const isWait = kind === "wait_result" || isWaitToolName(record.toolName) || block.id.startsWith("observation:wait-result:") || kind === "plan_control" && currentStatus !== null && ACTIVE_WAIT_STATUSES.has(currentStatus)
     const isApproval = kind === "approval" || typeof record.approvalId === "string" || block.id.startsWith("observation:approval:") || currentStatus === "waiting_for_approval"
-    const referencePlanRevision = safeRevision(record.planRevision), stalePlanReference = planScope.kind === "known" && goalRevision !== null && safeRevision(record.goalRevision) === goalRevision && referencePlanRevision !== null && referencePlanRevision < planScope.planRevision
+    const planOwner = planOwnedObservationOwner({ id: block.id, content: record })
+    const supersededPlan = planScope.kind === "known" && planOwner !== null && planOwner !== planScope.planCallId
+    const supersededPlanControl = supersededPlan && kind === "plan_control" && (currentStatus === "waiting_for_user" || currentStatus === "waiting_for_dependency")
+    const referencePlanRevision = safeRevision(record.planRevision), stalePlanReference = planScope.kind === "known" && goalRevision !== null && safeRevision(record.goalRevision) === goalRevision && referencePlanRevision !== null && referencePlanRevision < planScope.planRevision || supersededPlanControl
     if (observationId && isWait && currentStatus !== null && ACTIVE_WAIT_STATUSES.has(currentStatus) && !stalePlanReference) waitValues.push(observationId)
     if (observationId && isApproval && (currentStatus === null && kind === "approval" || currentStatus !== null && ACTIVE_APPROVAL_STATUSES.has(currentStatus)) && !stalePlanReference) approvalValues.push(observationId)
-    const planOwner = planOwnedObservationOwner({ id: block.id, content: record })
-    const supersededPlanFailure = planScope.kind === "known" && planOwner !== null && planOwner !== planScope.planCallId && currentStatus !== null && FAILURE_STATUSES.has(currentStatus)
+    const supersededPlanFailure = supersededPlan && currentStatus !== null && FAILURE_STATUSES.has(currentStatus)
     const replanCallId = kind === "plan_control" && currentStatus === "replan_required" ? replanSignalPlanCallId({ id: block.id, content: record }) : null
     const supersededReplan = planScope.kind === "known" && replanCallId !== null && replanCallId !== planScope.planCallId
     if (observationId && (kind === "plan_control" && currentStatus === "replan_required" && !supersededReplan || currentStatus !== null && UNRESOLVED_STATUSES.has(currentStatus) && !supersededPlanFailure && !stalePlanReference)) unresolvedValues.push(observationId)

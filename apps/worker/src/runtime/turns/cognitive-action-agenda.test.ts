@@ -31,6 +31,9 @@ function planError(callId: string): StepContext["blocks"][number] {
 function completionProposal(callId: string): StepContext["blocks"][number] {
   return observation(`observation:plan-control:${callId}:finish`, { kind: "plan_control", localId: "finish", status: "completion_proposed", dependsOn: [], completionCriteria: ["finish"] })
 }
+function planControlWait(callId: string, status: "waiting_for_user" | "waiting_for_dependency"): StepContext["blocks"][number] {
+  return observation(`observation:plan-control:${callId}:ask`, { kind: "plan_control", localId: "ask", status, ...(status === "waiting_for_user" ? { question: "Where?" } : {}) })
+}
 
 describe("cognitive action agenda", () => {
   it("sorts and deduplicates safe IDs deterministically", () => {
@@ -127,6 +130,15 @@ describe("cognitive action agenda", () => {
     expect(agenda.signals.approvals.ids).toEqual(["observation:approval:current"])
   })
 
+  it.each(["waiting_for_user", "waiting_for_dependency"] as const)("filters superseded plan-control %s while retaining the current gate", status => {
+    const agenda = buildCognitiveActionAgenda(context([
+      goal(), plan("plan-1", 1, null), plan("plan-2", 2, 1), planControlWait("plan-1", status), planControlWait("plan-2", status),
+    ]))
+    expect(agenda.signals.activeWaits.ids).not.toContain("observation:plan-control:plan-1:ask")
+    expect(agenda.signals.unresolved.ids).not.toContain("observation:plan-control:plan-1:ask")
+    expect(agenda.signals.activeWaits.ids.includes("observation:plan-control:plan-2:ask") || agenda.signals.unresolved.ids.includes("observation:plan-control:plan-2:ask")).toBe(true)
+  })
+
   it.each([
     ["unknown", [replan("plan-1")]],
     ["duplicate", [plan("plan-1", 1, null), plan("other", 1, null), replan("plan-1")]],
@@ -147,6 +159,19 @@ describe("cognitive action agenda", () => {
     const agenda = buildCognitiveActionAgenda(context([goal(), ...extra]))
 
     expect(agenda.signals.unresolved.ids).toContain("observation:plan-result:plan-1:read")
+  })
+
+  it.each([
+    ["unknown", [planControlWait("plan-1", "waiting_for_user")]],
+    ["duplicate", [plan("plan-1", 1, null), plan("other", 1, null), planControlWait("plan-1", "waiting_for_dependency")]],
+    ["gap", [plan("plan-1", 1, null), plan("plan-3", 3, 2), planControlWait("plan-1", "waiting_for_user")]],
+    ["legacy revision one", [observation("observation:plan-revision:legacy", { kind: "plan_revision", goalRevision: 2, planRevision: 1 }), planControlWait("plan-1", "waiting_for_dependency")]],
+    ["malformed", [observation("observation:plan-revision:wrong-id", { kind: "plan_revision", planCallId: "plan-1", goalRevision: 2, planRevision: 1, basedOnPlanRevision: null }), planControlWait("plan-1", "waiting_for_user")]],
+  ] as const)("retains plan-control waits when plan scope is %s", (_name, extra) => {
+    const agenda = buildCognitiveActionAgenda(context([goal(), ...extra]))
+
+    const id = "observation:plan-control:plan-1:ask"
+    expect(agenda.signals.activeWaits.ids.includes(id) || agenda.signals.unresolved.ids.includes(id)).toBe(true)
   })
 
   it.each(["agent.wait", "wait_subagents"] as const)("recognizes %s as an active child wait", toolName => {

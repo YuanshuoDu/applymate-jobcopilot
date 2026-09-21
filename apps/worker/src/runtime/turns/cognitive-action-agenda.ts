@@ -138,18 +138,19 @@ export function buildCognitiveActionAgenda(context: StepContext, input: AgendaIn
     if (!observationId) continue
     const waitKind = observationKind === "wait_result" || isWaitToolName(record.toolName) || block.id.startsWith("observation:wait-result:") || observationKind === "plan_control" && observationStatus === "waiting_for_dependency"
     const approvalKind = observationKind === "approval" || typeof record.approvalId === "string" || block.id.startsWith("observation:approval:") || observationStatus === "waiting_for_approval"
-    const stalePlanReferenceValue = stalePlanReference(record, planScope, currentGoalRevision)
+    const planOwner = planOwnedObservationOwner({ id: block.id, content: record })
+    const supersededPlan = planScope.kind === "known" && planOwner !== null && planOwner !== planScope.planCallId
+    const supersededPlanControl = supersededPlan && observationKind === "plan_control" && (observationStatus === "waiting_for_user" || observationStatus === "waiting_for_dependency")
+    const stalePlanReferenceValue = stalePlanReference(record, planScope, currentGoalRevision) || supersededPlanControl
     if (waitKind && observationStatus !== null && ACTIVE_WAIT_STATUSES.has(observationStatus) && !stalePlanReferenceValue) waits.push(observationId)
     if (approvalKind && (observationStatus === null && observationKind === "approval" || observationStatus !== null && ACTIVE_APPROVAL_STATUSES.has(observationStatus)) && !stalePlanReferenceValue) approvals.push(observationId)
     const isCompletionProposal = observationKind === "plan_control" && observationStatus === "completion_proposed"
-    const planOwner = planOwnedObservationOwner({ id: block.id, content: record })
-    const supersededPlan = planScope.kind === "known" && planOwner !== null && planOwner !== planScope.planCallId
     const supersededPlanFailure = supersededPlan && observationStatus !== null && FAILURE_STATUSES.has(observationStatus)
     const safeCompletion = isCompletionProposal && safeCompletionControl(record, observationId) && !supersededPlan
     if (safeCompletion) completion.push(observationId)
     const replanCallId = observationKind === "plan_control" && observationStatus === "replan_required" ? replanSignalPlanCallId({ id: block.id, content: record }) : null
     const supersededReplan = planScope.kind === "known" && replanCallId !== null && replanCallId !== planScope.planCallId
-    if (observationStatus !== null && FAILURE_STATUSES.has(observationStatus) && !supersededPlanFailure && !stalePlanReferenceValue || observationKind === "plan_control" && observationStatus !== null && observationStatus !== "completed" && observationStatus !== "completion_proposed" && !waitKind && !approvalKind && !supersededReplan) unresolved.push(observationId)
+    if (observationStatus !== null && FAILURE_STATUSES.has(observationStatus) && !supersededPlanFailure && !stalePlanReferenceValue || observationKind === "plan_control" && observationStatus !== null && observationStatus !== "completed" && observationStatus !== "completion_proposed" && !waitKind && !approvalKind && !supersededReplan && !supersededPlanControl) unresolved.push(observationId)
   }
   const pendingSet = signal(pending), approvalSet = signal(approvals), waitSet = signal(waits), unresolvedSet = signal(unresolved), completionSet = signal(completion)
   const control = plain(context.steeringMarkerControl) ? context.steeringMarkerControl : undefined
