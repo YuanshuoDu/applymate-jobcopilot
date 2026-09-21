@@ -2773,6 +2773,6 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 
 **Failure boundary:** The focused transaction fixture rolls back and leaves the wakeup unpublished when the execution reset fails, but no real PostgreSQL/RLS rollback or concurrency proof was run.
 
-**Independent verification:** Focused Worker wakeup validation passed **19/19 tests**. This narrows the canonical wakeup-to-legacy execution continuation gap without changing the Worker queue contract.
+**Independent verification:** Focused Worker wakeup validation passed **19/19 tests**. PR #497 head `089082de` has all ordinary CI checks green; the protected current dump rehearsal was skipped. This narrows the canonical wakeup-to-legacy execution continuation gap without changing the Worker queue contract.
 
-**Candidate boundary:** Real Worker queue delivery, process restart, cross-process E2E, and complete wakeup-to-continuation evidence remain unverified. P8-62 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+**Candidate boundary:** Real PostgreSQL/RLS, Worker queue delivery across processes, process restart, cross-process E2E, and complete wakeup-to-execution evidence remain unverified. P8-62 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
