@@ -945,3 +945,9 @@ Worker TypeScript and `git diff --check` passed. Canonical runtime integration, 
 Commit `5fbba903` adds an 83-line `plan-task-graph-adapter` with a focused **13/13 tests** suite. It provides a bounded observe seam over the TaskGraph planning foundation, but is not connected to the scheduler or executor and does not claim runtime dispatch.
 
 Worker TypeScript and `git diff --check` passed. Replan and plan-revision behavior, database persistence, cross-process recovery, and production supervisor evidence remain unverified. P8-65 remains a candidate and formal acceptance stays **1/8 (12.5%)**.
+
+## P8-66 update
+
+`plan-command-executor` now optionally invokes `PlanTaskGraphAdapter.observe` before the legacy observer. Adapter failures map to `observer_failed` and prevent the legacy observer from running; parallel delegate batches observe every record, and `replan_required` remains a control-only outcome with no graph event.
+
+Focused executor validation passed **31/31 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. This is an execution observation seam, not default canonical-runtime wiring. Database persistence, cross-process recovery, and production supervisor proof remain unverified; formal acceptance stays **1/8 (12.5%)**.

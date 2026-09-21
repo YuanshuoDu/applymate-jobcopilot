@@ -2806,3 +2806,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Worker TypeScript and `git diff --check` passed. No scheduler/executor wiring, database persistence, schema, queue producer, provider, or UI behavior was added.
 
 **Candidate boundary:** Replan and plan-revision behavior, database persistence, cross-process recovery, and production supervisor evidence remain unverified. P8-65 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## 152. P8-66 — Plan command execution observation seam
+
+**Candidate status/date (2026-09-21):** P8-66 is recorded as an execution observation seam; formal acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** `plan-command-executor` optionally invokes `PlanTaskGraphAdapter.observe` before the legacy observer. Adapter failures map to `observer_failed` and block the legacy observer. Parallel delegate batches observe each record; `replan_required` remains control-only and produces no graph event.
+
+**Independent verification:** Focused executor validation passed **31/31 tests**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. This seam is not default wiring from the canonical runtime.
+
+**Candidate boundary:** Database persistence, cross-process recovery, and production supervisor proof remain unverified. P8-66 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.

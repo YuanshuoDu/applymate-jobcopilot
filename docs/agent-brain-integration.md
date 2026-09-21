@@ -1575,3 +1575,9 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Commit `5fbba903` adds an 83-line `plan-task-graph-adapter` around the pure TaskGraph planning foundation, with a focused **13/13 tests** suite. It exposes an observe seam for future planning integration without changing the existing scheduler or executor path.
 - Worker TypeScript and `git diff --check` passed. The observe seam is not yet connected to the scheduler/executor; no database, schema, queue producer, provider, or UI behavior was added.
 - Candidate boundary: replan and plan-revision behavior, database persistence, cross-process recovery, and production supervisor evidence remain unverified. P8-65 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## P8-66 candidate - plan command execution observation seam
+
+- `plan-command-executor` now optionally invokes `PlanTaskGraphAdapter.observe` before the legacy observer. Adapter failures map to `observer_failed` and block the legacy observer; parallel delegate batches observe each record, while `replan_required` remains control-only and emits no graph event.
+- Focused executor validation passed **31/31 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+- This is an execution observation seam, not default wiring from the canonical runtime. Database persistence, cross-process recovery, and production supervisor proof remain unverified; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
