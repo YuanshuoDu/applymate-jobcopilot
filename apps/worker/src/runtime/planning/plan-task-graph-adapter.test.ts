@@ -4,7 +4,9 @@ import type { PlanDispatchCommand, PlanDispatchResult } from "./plan-intent-disp
 import {
   PlanTaskGraphAdapterError,
   createPlanTaskGraphAdapter,
+  hydratePlanTaskGraph,
   type PlanTaskGraphAdapterOptions,
+  type PersistedTaskGraphEvent,
 } from "./plan-task-graph-adapter.js"
 
 const command = (localId: string, dependsOn: readonly string[] = []): PlanDispatchCommand => ({
@@ -23,6 +25,9 @@ const adapter = (commands: readonly PlanDispatchCommand[], overrides: Partial<Pl
   const value = createPlanTaskGraphAdapter(plan(...commands), { runKey: "run-1", persist, ...overrides })
   return { value, persist }
 }
+const persisted = (runKey: string, type: "start" | "complete" | "fail" | "wait" | "cancel", nodeId: string, state?: unknown): PersistedTaskGraphEvent => ({
+  runKey, event: { type, nodeId, eventId: `${runKey}:${nodeId}:${type}` }, ...(state === undefined ? {} : { state }),
+})
 
 describe("plan task graph adapter", () => {
   it("maps dispatch commands to graph nodes and initial readiness", () => {
@@ -132,5 +137,57 @@ describe("plan task graph adapter", () => {
     await value.observe(record("first", "failed"))
     expect(value.state.readyNodeIds).toEqual([])
     expect(value.state.blockedReasons.next).toBe("dependency_failed")
+  })
+
+  it("hydrates completed graphs from ordered events and ignores the snapshot", () => {
+    const value = hydratePlanTaskGraph(plan(command("first")), {
+      runKey: "run-1",
+      events: [
+        persisted("run-1", "start", "first", { statuses: { first: "completed" } }),
+        persisted("run-1", "complete", "first", { statuses: { first: "ready" } }),
+      ],
+    })
+    expect(value.statuses.first).toBe("completed")
+    expect(value.appliedEvents.map(event => event.eventId)).toEqual(["run-1:first:start", "run-1:first:complete"])
+  })
+
+  it("hydrates waiting and failure graphs while preserving dependent blocking", () => {
+    const waiting = hydratePlanTaskGraph(plan(command("wait")), { runKey: "run-1", events: [persisted("run-1", "start", "wait"), persisted("run-1", "wait", "wait")] })
+    expect(waiting.statuses.wait).toBe("waiting")
+    const failed = hydratePlanTaskGraph(plan(command("first"), command("next", ["first"])), { runKey: "run-1", events: [persisted("run-1", "start", "first"), persisted("run-1", "fail", "first")] })
+    expect(failed.statuses.first).toBe("failed")
+    expect(failed.blockedReasons.next).toBe("dependency_failed")
+  })
+
+  it.each([
+    ["empty", ""],
+    ["whitespace", "   "],
+    ["overlong", "r".repeat(257)],
+  ])("rejects %s hydration run keys", (_label, runKey) => {
+    expect(() => hydratePlanTaskGraph(plan(command("first")), { runKey, events: [] })).toThrowError(PlanTaskGraphAdapterError)
+  })
+
+  it("rejects an overlong fresh adapter run key", () => {
+    const persist = vi.fn<PlanTaskGraphAdapterOptions["persist"]>()
+    expect(() => createPlanTaskGraphAdapter(plan(command("first")), { runKey: "r".repeat(257), persist })).toThrowError(PlanTaskGraphAdapterError)
+    expect(persist).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ["wrong runKey", [{ ...persisted("other", "start", "first"), runKey: "other" }]],
+    ["wrong eventId", [{ ...persisted("run-1", "start", "first"), event: { type: "start" as const, nodeId: "first", eventId: "run-1:first:other" } }]],
+    ["unknown node", [persisted("run-1", "start", "missing")]],
+    ["duplicate event", [persisted("run-1", "start", "first"), persisted("run-1", "start", "first")]],
+    ["illegal transition", [persisted("run-1", "complete", "first")]],
+  ])("fails closed for %s", (_label, events) => {
+    expect(() => hydratePlanTaskGraph(plan(command("first")), { runKey: "run-1", events })).toThrow(PlanTaskGraphAdapterError)
+  })
+
+  it("rejects malformed event fields and oversized history", () => {
+    const malformed = { runKey: "run-1", event: { type: "start", nodeId: "first", eventId: "run-1:first:start", extra: true } } as unknown as PersistedTaskGraphEvent
+    expect(() => hydratePlanTaskGraph(plan(command("first")), { runKey: "run-1", events: [malformed] })).toThrowError(/malformed/)
+    expect(() => hydratePlanTaskGraph(plan(command("first")), { runKey: "run-1", events: [persisted("run-1", "start", "first", "x".repeat(9000))] })).toThrowError(PlanTaskGraphAdapterError)
+    const extraEntry = { ...persisted("run-1", "start", "first"), source: "untrusted" } as unknown as PersistedTaskGraphEvent
+    expect(() => hydratePlanTaskGraph(plan(command("first")), { runKey: "run-1", events: [extraEntry] })).toThrowError(/entry is malformed/)
   })
 })

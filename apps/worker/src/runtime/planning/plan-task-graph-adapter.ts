@@ -11,10 +11,15 @@ import {
 } from "./task-graph-reducer.js"
 
 type ObservablePlanRecord = PlanCommandExecutionRecord | PlanControlRecord
-type PersistTaskGraph = (input: { readonly runKey: string; readonly event: TaskGraphEvent; readonly state: TaskGraphState }) => void | Promise<void>
+export type PersistedTaskGraphEvent = {
+  readonly runKey: string
+  readonly event: TaskGraphEvent
+  readonly state?: unknown
+}
+type PersistTaskGraph = (input: PersistedTaskGraphEvent & { readonly state: TaskGraphState }) => void | Promise<void>
 const MAX_GRAPH_PAYLOAD_BYTES = 8 * 1024
 
-export type PlanTaskGraphAdapterErrorCode = TaskGraphErrorCode | "invalid_record" | "persistence_failed"
+export type PlanTaskGraphAdapterErrorCode = TaskGraphErrorCode | "invalid_event" | "graph_mismatch" | "invalid_record" | "persistence_failed"
 
 export class PlanTaskGraphAdapterError extends Error {
   constructor(readonly code: PlanTaskGraphAdapterErrorCode, message: string) {
@@ -33,8 +38,87 @@ export type PlanTaskGraphAdapterOptions = {
   readonly persist: PersistTaskGraph
 }
 
+export type PlanTaskGraphHydrationOptions = {
+  readonly runKey: string
+  readonly events: readonly PersistedTaskGraphEvent[]
+}
+
 const graphNodes = (commands: readonly PlanDispatchCommand[]) => commands.map(command => ({ id: command.localId, dependsOn: [...command.dependsOn] }))
 const eventId = (runKey: string, localId: string, phase: TaskGraphEvent["type"]): string => `${runKey}:${localId}:${phase}`
+
+function normalizedRunKey(value: unknown): string {
+  if (typeof value !== "string" || !value.trim()) throw new PlanTaskGraphAdapterError("invalid_record", "Plan task graph runKey is invalid")
+  return value.trim()
+}
+
+function boundedRunKey(value: unknown): string {
+  const runKey = normalizedRunKey(value)
+  if (runKey.length > 256) throw new PlanTaskGraphAdapterError("invalid_record", "Plan task graph runKey is invalid")
+  return runKey
+}
+
+function graphError(error: unknown): PlanTaskGraphAdapterError {
+  if (error instanceof PlanTaskGraphAdapterError) return error
+  if (error && typeof error === "object" && "code" in error && typeof error.code === "string") {
+    return new PlanTaskGraphAdapterError(error.code as PlanTaskGraphAdapterErrorCode, error instanceof Error ? error.message : "Task graph operation rejected")
+  }
+  return new PlanTaskGraphAdapterError("invalid_record", "Task graph operation rejected")
+}
+
+function hydrationEvent(value: unknown): TaskGraphEvent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new PlanTaskGraphAdapterError("invalid_event", "Persisted task graph event is malformed")
+  const candidate = value as Record<string, unknown>
+  const keys = Reflect.ownKeys(candidate)
+  if (keys.length !== 3 || keys.some(key => typeof key !== "string" || !["type", "nodeId", "eventId"].includes(key))) {
+    throw new PlanTaskGraphAdapterError("invalid_event", "Persisted task graph event is malformed")
+  }
+  if (!(["start", "complete", "fail", "wait", "cancel"] as readonly unknown[]).includes(candidate.type)) {
+    throw new PlanTaskGraphAdapterError("invalid_event", "Persisted task graph event type is invalid")
+  }
+  if (typeof candidate.nodeId !== "string" || !candidate.nodeId || candidate.nodeId.length > 256 || typeof candidate.eventId !== "string" || !candidate.eventId || candidate.eventId.length > 512) {
+    throw new PlanTaskGraphAdapterError("invalid_event", "Persisted task graph event fields are invalid")
+  }
+  return { type: candidate.type as TaskGraphEvent["type"], nodeId: candidate.nodeId, eventId: candidate.eventId }
+}
+
+function hydrationEntry(value: unknown, runKey: string): { readonly event: TaskGraphEvent } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new PlanTaskGraphAdapterError("invalid_record", "Persisted task graph entry is malformed")
+  const candidate = value as Record<string, unknown>
+  const keys = Reflect.ownKeys(candidate)
+  if (keys.some(key => typeof key !== "string" || !["runKey", "event", "state"].includes(key))
+    || !Object.hasOwn(candidate, "runKey") || !Object.hasOwn(candidate, "event")) {
+    throw new PlanTaskGraphAdapterError("invalid_record", "Persisted task graph entry is malformed")
+  }
+  if (candidate.runKey !== runKey) throw new PlanTaskGraphAdapterError("graph_mismatch", "Persisted task graph runKey does not match")
+  return { event: hydrationEvent(candidate.event) }
+}
+
+function boundedHistory(runKey: string, events: readonly PersistedTaskGraphEvent[]): void {
+  let encoded: string | undefined
+  try { encoded = JSON.stringify({ runKey, events }) } catch { encoded = undefined }
+  if (encoded === undefined || Buffer.byteLength(encoded, "utf8") > MAX_GRAPH_PAYLOAD_BYTES) {
+    throw new PlanTaskGraphAdapterError("persistence_failed", "Persisted task graph history exceeded the bounded payload")
+  }
+}
+
+export function hydratePlanTaskGraph(plan: PlanDispatchResult, options: PlanTaskGraphHydrationOptions): TaskGraphState {
+  const runKey = boundedRunKey(options.runKey)
+  if (!Array.isArray(options.events)) throw new PlanTaskGraphAdapterError("invalid_record", "Persisted task graph history is invalid")
+  boundedHistory(runKey, options.events)
+  let state: TaskGraphState
+  try { state = createTaskGraph(graphNodes(plan.commands)) } catch (error: unknown) { throw graphError(error) }
+  const seen = new Set<string>()
+  for (const persisted of options.events) {
+    const { event } = hydrationEntry(persisted, runKey)
+    if (seen.has(event.eventId)) throw new PlanTaskGraphAdapterError("duplicate_event", `Persisted task graph event ${event.eventId} is duplicated`)
+    if (event.eventId !== eventId(runKey, event.nodeId, event.type)) throw new PlanTaskGraphAdapterError("graph_mismatch", "Persisted task graph event ID does not match its runKey and phase")
+    const reduction = reduceTaskGraph(state, event)
+    if (!reduction.ok) throw new PlanTaskGraphAdapterError(reduction.errorCode, reduction.message)
+    seen.add(event.eventId)
+    state = reduction.state
+  }
+  return state
+}
 
 function outputStatus(record: PlanCommandExecutionRecord): string | undefined {
   if (!record.result || typeof record.result !== "object") return undefined
@@ -67,9 +151,8 @@ function isExecutionRecord(record: ObservablePlanRecord): record is PlanCommandE
 }
 
 export function createPlanTaskGraphAdapter(plan: PlanDispatchResult, options: PlanTaskGraphAdapterOptions): PlanTaskGraphAdapter {
-  if (typeof options.runKey !== "string" || !options.runKey.trim()) throw new PlanTaskGraphAdapterError("invalid_record", "Plan task graph runKey is required")
+  const runKey = boundedRunKey(options.runKey)
   let state = createTaskGraph(graphNodes(plan.commands))
-  const runKey = options.runKey.trim()
 
   const persist = async (event: TaskGraphEvent, nextState: TaskGraphState): Promise<void> => {
     const payload = { runKey, event, state: nextState }
