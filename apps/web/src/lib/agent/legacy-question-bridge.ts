@@ -65,6 +65,8 @@ function sameJson(left: unknown, right: unknown): boolean {
 function hasQuestionProvenance(provenance: unknown, questionId: string): "missing" | "mismatch" | "match" {
   if (provenance === null || provenance === undefined) return "missing"
   const row = record(provenance)
+  if (!("sourceEvent" in row) && !("sourcePayload" in row)) return "missing"
+  if (row.sourceEvent === "orchestrator_question" && (row.sourcePayload === undefined || row.sourcePayload === null)) return "missing"
   const sourcePayload = record(row.sourcePayload)
   if (row.sourceEvent === "orchestrator_question" && sourcePayload.id === questionId) return "match"
   return "mismatch"
