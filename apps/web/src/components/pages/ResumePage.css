@@ -70,15 +70,13 @@
 @keyframes final-confirm-fade { from { opacity: 0; } to { opacity: 1; } }
 @keyframes final-confirm-rise { from { opacity: 0; transform: translateY(10px) scale(.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
 @keyframes final-confirm-spin { to { transform: rotate(360deg); } }
-.resume-library-layout { display: grid !important; grid-template-columns: minmax(210px, 230px) minmax(0, 1fr) minmax(280px, var(--resume-ai-width, 340px)); grid-template-rows: minmax(0, 1fr); min-width: 0; min-height: 0; overflow: hidden !important; background: #fcfcff !important; }
+.resume-library-layout { display: grid !important; grid-template-columns: minmax(0, var(--resume-library-width, 230px)) minmax(0, 1fr) minmax(280px, var(--resume-ai-width, 340px)); grid-template-rows: minmax(0, 1fr); min-width: 0; min-height: 0; overflow: hidden !important; background: #fcfcff !important; }
 .resume-library-layout.is-library-collapsed { grid-template-columns: 54px minmax(0, 1fr) minmax(280px, var(--resume-ai-width, 340px)); min-width: 0; }
 .resume-library-sidebar { grid-column: 1; grid-row: 1; position: relative; min-width: 0; width: auto; display: flex; flex-direction: column; gap: 15px; padding: 20px 16px; overflow-x: hidden; overflow-y: auto; border-right: 1px solid #ebeaf6; background: #fff; }
 .resume-library-layout.is-library-collapsed .resume-library-sidebar { align-items: center; padding: 12px 8px; }
 .resume-library-collapsed-list { display: grid; align-content: start; gap: 8px; width: 100%; padding-top: 50px; }
 .resume-library-collapsed-item { display: grid; place-items: center; width: 100%; height: 36px; padding: 4px; border: 1px solid transparent; border-radius: 7px; color: #837aa8; background: transparent; cursor: pointer; }
 .resume-library-collapsed-item:hover, .resume-library-collapsed-item.is-selected { border-color: #cfcaf8; color: #4c32ef; background: #f1efff; }
-.resume-library-collapse { position: absolute; z-index: 4; top: 54px; right: -1px; display: inline-flex; align-items: center; justify-content: center; width: 25px; height: 32px; padding: 0; border: 1px solid #e4e3f4; border-right: 0; border-radius: 7px 0 0 7px; color: #5a4bcf; background: #fff; box-shadow: -2px 2px 7px rgba(41,31,130,.06); cursor: pointer; }
-.resume-library-layout.is-library-collapsed .resume-library-collapse { top: 18px; right: -1px; }
 .resume-library-sidebar-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .resume-library-sidebar-head > div { display: grid; gap: 3px; }
 .resume-library-sidebar-head span { color: #19203d; font-size: 14px; font-weight: 700; letter-spacing: -.02em; white-space: nowrap; }
@@ -114,6 +112,9 @@
 .resume-library-import-copy { display: grid; gap: 4px; min-width: 0; padding: 1px 18px 0 2px; }
 .resume-library-import-copy strong { color: #4c32ef; font-size: 12px; font-weight: 700; line-height: 1.28; }
 .resume-library-import-copy small { color: #7a819e; font-size: 10px; }
+.resume-library-resize-handle { grid-column: 1; grid-row: 1; z-index: 6; justify-self: end; display: flex; align-items: stretch; justify-content: center; width: 14px; min-height: 0; margin-right: -7px; padding: 0; border: 0; background: transparent; cursor: col-resize; touch-action: none; outline: none; }
+.resume-library-resize-handle > span { width: 2px; height: 100%; border-radius: 999px; background: transparent; transition: background .15s ease, box-shadow .15s ease; }
+.resume-library-resize-handle:hover > span, .resume-library-resize-handle:focus-visible > span, .resume-library-layout.is-library-resizing .resume-library-resize-handle > span { background: #8c80f1; box-shadow: 0 0 0 3px rgba(76,50,239,.10); }
 .resume-workspace { grid-column: 2; grid-row: 1; min-width: 0; padding: 16px 24px 28px !important; background: #fcfcff; }
 .resume-workspace-head { display: flex; align-items: center; justify-content: space-between; max-width: 760px; margin: 0 auto 13px; }
 .resume-workspace-head h2 { display: flex; align-items: baseline; gap: 9px; margin: 0; color: #151a35; font-size: 18px; letter-spacing: -.03em; }
@@ -162,7 +163,8 @@
 .resume-library-page .resume-paper > div:first-child { padding-bottom: 18px; border-bottom: 1px solid #e8e7f3; }
 .resume-library-page .resume-paper button { border-radius: 6px; }
 @media (max-width: 960px) {
-  .resume-library-layout { display: grid !important; grid-template-columns: minmax(190px, 230px) minmax(0, 1fr); grid-template-rows: auto auto; min-width: 0; overflow-y: auto !important; }
+  .resume-library-layout { display: grid !important; grid-template-columns: minmax(0, var(--resume-library-width, 230px)) minmax(0, 1fr); grid-template-rows: auto auto; min-width: 0; overflow-y: auto !important; }
+  .resume-library-resize-handle { display: none; }
   .resume-ai-resize-handle { display: none; }
   .resume-workspace { overflow: visible !important; }
   .resume-ai-column { grid-column: 1 / -1; grid-row: 2; width: auto; flex-basis: auto; border-top: 1px solid #ebeaf6; border-left: 0; }
