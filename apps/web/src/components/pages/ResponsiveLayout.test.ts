@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest'
 const globalCss = readFileSync(new URL('../../app/globals.css', import.meta.url), 'utf8')
 const resumeCss = readFileSync(new URL('./ResumePage.css', import.meta.url), 'utf8')
 const resumePageSource = readFileSync(new URL('./ResumePage.tsx', import.meta.url), 'utf8')
+const sidebarSource = readFileSync(new URL('../layout/Sidebar.tsx', import.meta.url), 'utf8')
 
 describe('tablet and phone layout safeguards', () => {
   it('stacks settings controls while the desktop sidebar is still present', () => {
@@ -42,6 +43,12 @@ describe('tablet and phone layout safeguards', () => {
 
   it('places the main navigation toggle on the sidebar edge', () => {
     expect(globalCss).toMatch(/\.app-sidebar-toggle\s*\{[\s\S]*position:\s*absolute[\s\S]*right:\s*-14px/)
+  })
+
+  it('moves the collapsed account menu into a readable flyout', () => {
+    expect(sidebarSource).toContain('className="app-sidebar-account-menu"')
+    expect(globalCss).toMatch(/\.app-sidebar\.is-collapsed \.app-sidebar-account-menu\s*\{[\s\S]*left:\s*calc\(100% \+ 10px\)[\s\S]*width:\s*228px/)
+    expect(globalCss).toMatch(/\.app-sidebar-account-menu-item\s*\{[\s\S]*white-space:\s*nowrap/)
   })
 
   it('uses a stable one-pixel selected resume border', () => {

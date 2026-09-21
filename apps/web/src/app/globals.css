@@ -235,6 +235,43 @@ body {
   display: none;
 }
 
+.app-sidebar-account-area {
+  position: relative;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+
+.app-sidebar-account-menu {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 8px);
+  z-index: 110;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg);
+  box-shadow: 0 16px 36px rgba(15, 23, 42, 0.16);
+}
+
+.app-sidebar-account-menu-item {
+  white-space: nowrap;
+}
+
+.app-sidebar-account-menu-item > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-sidebar.is-collapsed .app-sidebar-account-menu {
+  left: calc(100% + 10px);
+  right: auto;
+  width: 228px;
+  max-width: calc(100vw - 84px);
+}
+
 .app-nav-button {
   position: relative;
 }

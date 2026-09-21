@@ -175,9 +175,9 @@ export function Sidebar({ active, onNav, onNavIntent, session, jobCount: jobCoun
       <div style={{ borderTop: '1px solid var(--border)', padding: '10px 10px 12px', display: 'flex', flexDirection: 'column', gap: 8 }}>
 
         {/* ── User info + sign out ── */}
-        <div ref={accountAreaRef} style={{ borderTop: '1px solid var(--border)', paddingTop: 8, position: 'relative' }}>
+        <div ref={accountAreaRef} className="app-sidebar-account-area">
           {notificationPanel}
-          {accountMenuOpen && <div role="menu" aria-label={t('nav.accountMenu')} style={{ position: 'absolute', left: 0, right: 0, bottom: 'calc(100% + 8px)', padding: 6, border: '1px solid var(--border)', borderRadius: 12, background: 'var(--bg)', boxShadow: '0 16px 36px rgba(15,23,42,0.16)', zIndex: 110 }}>
+          {accountMenuOpen && <div role="menu" aria-label={t('nav.accountMenu')} className="app-sidebar-account-menu">
             <div style={{ padding: '7px 8px 8px', marginBottom: 3, borderBottom: '1px solid var(--border)' }}>
               <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text)' }}>{user?.name ?? user?.email?.split('@')[0] ?? 'User'}</div>
               <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{user?.email ?? ''}</div>
@@ -213,7 +213,7 @@ export function Sidebar({ active, onNav, onNavIntent, session, jobCount: jobCoun
 function AccountMenuItem({ icon, label, badge, danger = false, onClick }: { icon: React.ReactNode; label: string; badge?: string; danger?: boolean; onClick: () => void }) {
   const [hovered, setHovered] = useState(false)
 
-  return <button type="button" role="menuitem" onClick={onClick} onMouseEnter={() => setHovered(true)} onMouseLeave={() => setHovered(false)} style={{ width: '100%', border: 'none', borderRadius: 7, padding: '7px 8px', background: hovered ? (danger ? 'rgba(220,38,38,0.08)' : 'var(--nav-active)') : 'transparent', color: danger ? '#DC2626' : 'var(--text)', display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontFamily: 'inherit', fontSize: 11, textAlign: 'left' }}>
+  return <button type="button" role="menuitem" className="app-sidebar-account-menu-item" onClick={onClick} onMouseEnter={() => setHovered(true)} onMouseLeave={() => setHovered(false)} style={{ width: '100%', border: 'none', borderRadius: 7, padding: '7px 8px', background: hovered ? (danger ? 'rgba(220,38,38,0.08)' : 'var(--nav-active)') : 'transparent', color: danger ? '#DC2626' : 'var(--text)', display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontFamily: 'inherit', fontSize: 11, textAlign: 'left' }}>
     {icon}<span style={{ flex: 1 }}>{label}</span>{badge && <span style={{ fontSize: 9, fontWeight: 600, color: 'var(--primary)', background: 'rgba(79,70,229,0.10)', borderRadius: 999, padding: '1px 5px' }}>{badge}</span>}
   </button>
 }
