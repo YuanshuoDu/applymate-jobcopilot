@@ -73,6 +73,26 @@ describe("context memory schema", () => {
     expect(current?.unresolvedQuestions.map(item => item.sourceRef)).toEqual(["wait-result:wait-1"])
   })
 
+  it("filters stale references for the expected goal while retaining legacy references", () => {
+    const value = projection()
+    const scoped = validateContextMemoryProjection({
+      ...value,
+      waits: [{ id: "wait-legacy" }, ...value.waits],
+      eventRefs: [{ id: "event-legacy" }, { id: "event-stale", goalRevision: 1 }],
+    }, { expectedGoalRevision: 3 })
+    expect(scoped?.waits).toEqual([{ id: "wait-legacy" }])
+    expect(scoped?.eventRefs).toEqual([{ id: "event-legacy" }])
+  })
+
+  it("rejects a future reference for the expected goal", () => {
+    const value = projection()
+    expect(validateContextMemoryProjection({
+      ...value,
+      revisions: { goalRevision: 3, planRevision: 4 },
+      eventRefs: [{ id: "event-future", goalRevision: 4 }],
+    }, { expectedGoalRevision: 3 })).toBeNull()
+  })
+
   it("rejects a malformed new field instead of treating it as absent", () => {
     expect(validateContextMemoryProjection({ ...projection(), decisions: null })).toBeNull()
   })

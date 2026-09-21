@@ -114,19 +114,14 @@ function reference(observation: Observation, content: Row): CognitiveMemoryRefer
   if (currentSequence !== undefined) result.sequence = currentSequence
   return result
 }
-function add(map: Map<string, CognitiveMemoryReference>, value: CognitiveMemoryReference | null): boolean {
+function add<T extends { readonly id: string }>(map: Map<string, T>, value: T | null): boolean {
   if (!value) return false
   const previous = map.get(value.id)
   if (previous && JSON.stringify(previous) !== JSON.stringify(value)) return false
   map.set(value.id, value)
   return true
 }
-function addNarrative<T extends { readonly id: string }>(map: Map<string, T>, value: T): boolean {
-  const previous = map.get(value.id)
-  if (previous && JSON.stringify(previous) !== JSON.stringify(value)) return false
-  map.set(value.id, value)
-  return true
-}
+function referenceScope(value: CognitiveMemoryReference, expectedGoalRevision: number | undefined): "current" | "stale" | "future" { if (expectedGoalRevision === undefined || value.goalRevision === undefined || value.goalRevision === expectedGoalRevision) return "current"; return value.goalRevision > expectedGoalRevision ? "future" : "stale" }
 function mergePriorMemory(content: Row, maps: readonly Map<string, CognitiveMemoryReference>[], decisions: Map<string, CognitiveMemoryDecision>, questions: Map<string, CognitiveMemoryQuestion>, plans: { goalRevision: number; planRevision: number }[], ranges: CognitiveMemoryOmittedRange[], expectedGoalRevision: number | undefined): bigint | null | false {
   const memory = content.memory
   const normalized = validateContextMemoryProjection(memory, expectedGoalRevision === undefined ? {} : { expectedGoalRevision })
@@ -135,8 +130,8 @@ function mergePriorMemory(content: Row, maps: readonly Map<string, CognitiveMemo
   for (const [index, field] of fields.entries()) {
     for (const value of normalized[field as keyof ContextMemoryProjection] as readonly CognitiveMemoryReference[]) if (!add(maps[index]!, value)) return false
   }
-  for (const value of normalized.decisions) if (!addNarrative(decisions, value)) return false
-  for (const value of normalized.unresolvedQuestions) if (!addNarrative(questions, value)) return false
+  for (const value of normalized.decisions) if (!add(decisions, value)) return false
+  for (const value of normalized.unresolvedQuestions) if (!add(questions, value)) return false
   const goalRevision = normalized.revisions.goalRevision, planRevision = normalized.revisions.planRevision
   if (goalRevision !== null && planRevision !== null) plans.push({ goalRevision, planRevision })
   ranges.push(...normalized.omittedRanges)
@@ -184,7 +179,6 @@ function trimProjection(value: ContextMemoryProjection, maxBytes: number): Conte
   candidate = strip("activeGoals")
   return Buffer.byteLength(encoded(candidate), "utf8") <= maxBytes ? candidate : null
 }
-
 export function buildContextMemoryProjection(snapshot: StepContextSnapshot, options: ContextMemoryProjectionOptions = {}): ContextMemoryProjection | null {
   const maxBytes = options.maxBytes ?? MAX_BYTES
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 256 || maxBytes > MAX_BYTES || !snapshotShape(snapshot)) return null
@@ -215,19 +209,23 @@ export function buildContextMemoryProjection(snapshot: StepContextSnapshot, opti
     if (isCriticalId(item.id) && !criticalObservationValid(item.id, content)) return null
     const current = reference(item as Observation, content)
     if (!current) return null
+    const scope = referenceScope(current, expectedGoalRevision)
+    if (scope === "future") return null
     if (current.sequence !== undefined) { const value = BigInt(current.sequence); if (covered === null || value > covered) covered = value }
     const kind = typeof content.kind === "string" ? content.kind : ""
     if (item.id.startsWith("plan-revision:") || kind === "plan_revision") {
       if (kind !== "plan_revision" || !Number.isSafeInteger(content.goalRevision) || !Number.isSafeInteger(content.planRevision) || (content.goalRevision as number) < 1 || (content.planRevision as number) < 1) return null
       planRows.push({ goalRevision: content.goalRevision as number, planRevision: content.planRevision as number })
     }
-    if (item.id.startsWith("wait-result:") || kind === "wait_result" || isWaitToolName(content.toolName)) if (!add(waits, current)) return null
-    if (item.id.startsWith("approval:") || typeof content.approvalId === "string" || kind === "approval") if (!add(approvals, current)) return null
-    if (item.id.startsWith("artifact:") || typeof content.artifactId === "string") if (!add(artifacts, current)) return null
-    if (item.id.startsWith("task:") || typeof content.taskId === "string") if (!add(tasks, current)) return null
-    if (item.id.startsWith("event:") || typeof content.eventId === "string" || isCriticalId(item.id)) if (!add(events, current)) return null
-    if (content.verified === true || typeof content.evidenceRef === "string" || item.id.startsWith("evidence:") || item.id.startsWith("read:")) if (!add(verified, current)) return null
-    if (["waiting", "pending", "running", "retrying", ...FAILURE_STATUSES].includes(current.status ?? "") || kind === "plan_control") if (!add(unresolved, current)) return null
+    if (scope === "current") {
+      if (item.id.startsWith("wait-result:") || kind === "wait_result" || isWaitToolName(content.toolName)) if (!add(waits, current)) return null
+      if (item.id.startsWith("approval:") || typeof content.approvalId === "string" || kind === "approval") if (!add(approvals, current)) return null
+      if (item.id.startsWith("artifact:") || typeof content.artifactId === "string") if (!add(artifacts, current)) return null
+      if (item.id.startsWith("task:") || typeof content.taskId === "string") if (!add(tasks, current)) return null
+      if (item.id.startsWith("event:") || typeof content.eventId === "string" || isCriticalId(item.id)) if (!add(events, current)) return null
+      if (content.verified === true || typeof content.evidenceRef === "string" || item.id.startsWith("evidence:") || item.id.startsWith("read:")) if (!add(verified, current)) return null
+      if (["waiting", "pending", "running", "retrying", ...FAILURE_STATUSES].includes(current.status ?? "") || kind === "plan_control") if (!add(unresolved, current)) return null
+    }
     if (kind === "context_summary" && plain(content.value) && Array.isArray(content.value.removedObservationIds) && content.value.removedObservationIds.every(validId)) {
       const ids = content.value.removedObservationIds as string[]
       if (ids.length > 0) omittedRanges.push({ fromId: ids[0]!, toId: ids[ids.length - 1]!, reason: "compaction" })
@@ -244,8 +242,8 @@ export function buildContextMemoryProjection(snapshot: StepContextSnapshot, opti
   for (const [id, item] of decisions) if (item.goalRevision !== goalRevision) decisions.delete(id)
   for (const [id, item] of questions) if (item.goalRevision !== goalRevision) questions.delete(id)
   const narrative = deriveContextMemoryNarrative(snapshot.toolObservations, goalRevision)
-  for (const item of narrative.decisions) if (!addNarrative(decisions, item)) return null
-  for (const item of narrative.unresolvedQuestions) if (!addNarrative(questions, item)) return null
+  for (const item of narrative.decisions) if (!add(decisions, item)) return null
+  for (const item of narrative.unresolvedQuestions) if (!add(questions, item)) return null
   const projection: ContextMemoryProjection = { schemaVersion: "agent-harness.cognitive-memory.v1", activeGoals: activeGoals.slice(0, MAX_ITEMS), fixedConstraints: fixedConstraints.slice(0, MAX_ITEMS), steering: userSteering.slice(0, MAX_ITEMS), revisions: { goalRevision, planRevision: latest?.planRevision ?? null }, decisions: sorted([...decisions.values()]).slice(0, MAX_ITEMS), unresolvedQuestions: sorted([...questions.values()]).slice(0, MAX_ITEMS), unresolved: sorted([...unresolved.values()]).slice(0, MAX_ITEMS), waits: sorted([...waits.values()]).slice(0, MAX_ITEMS), approvals: sorted([...approvals.values()]).slice(0, MAX_ITEMS), verifiedEvidence: sorted([...verified.values()]).slice(0, MAX_ITEMS), artifacts: sorted([...artifacts.values()]).slice(0, MAX_ITEMS), taskRefs: sorted([...tasks.values()]).slice(0, MAX_ITEMS), eventRefs: sorted([...events.values()]).slice(0, MAX_ITEMS), omittedRanges: omittedRanges.sort((left, right) => left.fromId.localeCompare(right.fromId)).slice(0, MAX_ITEMS), coveredSequence: covered?.toString() ?? null }
   const trimmed = trimProjection(projection, maxBytes)
   return trimmed ? validateContextMemoryProjection(trimmed, { maxBytes, ...(goalRevision === null ? {} : { expectedGoalRevision: goalRevision }) }) : null

@@ -64,6 +64,41 @@ describe("context memory projection", () => {
     expect(buildContextMemoryProjection(stale)).toMatchObject({ revisions: { goalRevision: 3, planRevision: null } })
   })
 
+  it("filters stale goal references from prior and current observations while retaining legacy references", () => {
+    const old = buildContextMemoryProjection({
+      ...base,
+      toolObservations: [
+        { id: "plan-revision:old", content: { kind: "plan_revision", goalRevision: 2, planRevision: 1, sequence: "20" } },
+        { id: "wait-result:old", content: { kind: "wait_result", status: "pending", goalRevision: 2, planRevision: 1, sequence: "21" } },
+        { id: "approval:old", content: { kind: "approval", status: "pending", goalRevision: 2, planRevision: 1, sequence: "22" } },
+        { id: "event:old", content: { kind: "event", status: "recorded", goalRevision: 2, sequence: "23" } },
+        { id: "wait-result:legacy", content: { kind: "wait_result", status: "pending", sequence: "24" } },
+      ],
+    })
+    expect(old).not.toBeNull()
+    const current = buildContextMemoryProjection({
+      ...base,
+      goal: { id: "goal-new", content: { revision: 3, objective: "New goal" } },
+      toolObservations: [
+        { id: "context-summary:old", content: { kind: "context_summary", value: {}, memory: old } },
+        { id: "wait-result:old-direct", content: { kind: "wait_result", status: "pending", goalRevision: 2, sequence: "25" } },
+        { id: "approval:old-direct", content: { kind: "approval", status: "pending", goalRevision: 2, sequence: "26" } },
+        { id: "event:old-direct", content: { kind: "event", status: "recorded", goalRevision: 2, sequence: "27" } },
+        { id: "wait-result:legacy-direct", content: { kind: "wait_result", status: "pending", sequence: "28" } },
+        { id: "event:legacy-direct", content: { kind: "event", status: "recorded", sequence: "29" } },
+      ],
+    })
+    expect(current?.waits.map(item => item.id)).toEqual(["wait-result:legacy", "wait-result:legacy-direct"])
+    expect(current?.approvals).toEqual([])
+    expect(current?.eventRefs.map(item => item.id)).toEqual(["event:legacy-direct", "wait-result:legacy", "wait-result:legacy-direct"])
+    expect(current?.unresolved.map(item => item.id)).toEqual(["wait-result:legacy", "wait-result:legacy-direct"])
+  })
+
+  it("fails closed for a future goal reference", () => {
+    const future = { ...base, toolObservations: [{ id: "event:future", content: { kind: "event", status: "recorded", goalRevision: 3 } }] }
+    expect(buildContextMemoryProjection(future)).toBeNull()
+  })
+
   it("trims low priority references to a requested byte budget", () => {
     const many: StepContextSnapshot = { ...base, toolObservations: Array.from({ length: 32 }, (_, index) => ({ id: `event:event-${index}`, content: { status: "recorded", sequence: String(index) } })) }
     const projection = buildContextMemoryProjection(many, { maxBytes: 900 })

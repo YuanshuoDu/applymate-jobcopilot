@@ -76,6 +76,20 @@ describe("cognitive memory recall", () => {
     expect(buildCognitiveMemoryRecall(context([block("goal", "goal", { revision: 3 }), summary(malformed)]))).toBeNull()
   })
 
+  it("filters stale references while retaining legacy references for the current goal", () => {
+    const recall = buildCognitiveMemoryRecall(context([block("goal", "goal", { revision: 3 }), summary(memory({
+      waits: [{ id: "wait-legacy", status: "pending" }, { id: "wait-stale", status: "pending", goalRevision: 2 }],
+      eventRefs: [{ id: "event-legacy" }, { id: "event-stale", goalRevision: 2 }],
+    }))]))
+    expect(recall?.references.waits.ids).toEqual(["wait-legacy"])
+    expect(recall?.references.eventRefs.ids).toEqual(["event-legacy"])
+  })
+
+  it("omits memory containing a future goal reference", () => {
+    const future = memory({ eventRefs: [{ id: "event-future", goalRevision: 4 }] })
+    expect(buildCognitiveMemoryRecall(context([block("goal", "goal", { revision: 3 }), summary(future)]))).toBeNull()
+  })
+
   it("bounds and sorts reference metadata without leaking unsupported statuses", () => {
     const eventRefs: CognitiveMemoryRecallReference[] = Array.from({ length: 24 }, (_, index) => ({ id: `event:${String(index).padStart(2, "0")}`, status: index === 0 ? "pending" : "model-secret", goalRevision: 3, planRevision: 2, sequence: String(index) }))
     const recall = buildCognitiveMemoryRecall(context([block("goal", "goal", { revision: 3 }), summary(memory({ eventRefs, coveredSequence: "23" }))]))!
