@@ -249,7 +249,17 @@ describe("legacy/V2 dual writer", () => {
         sourcePayload: expect.objectContaining({ id: "question_1" }),
       }),
     }) }))
-    expect(tx.agentOutbox.create).toHaveBeenCalledOnce()
+    expect(tx.agentOutbox.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({
+      topic: "agent.session.event",
+      payload: expect.objectContaining({
+        itemId: "agent-wait:question:question_1",
+        type: "item.started",
+        payload: expect.objectContaining({
+          sourceEvent: "orchestrator_question",
+          sourcePayload: expect.objectContaining({ id: "question_1" }),
+        }),
+      }),
+    }) }))
     expect(tx.agentTranscriptEvent.create).toHaveBeenCalledOnce()
   })
 
