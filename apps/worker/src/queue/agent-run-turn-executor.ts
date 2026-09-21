@@ -32,6 +32,47 @@ function pipelineToolInput(value: unknown): Record<string, unknown> | null {
   return isPlainJsonObject(value) ? value : null
 }
 
+type PipelineToolResult = {
+  status: "completed" | "failed"
+  errorCode: string | null
+  output?: unknown
+}
+
+const LEGACY_WAIT_ERROR = "legacy_wait_unsupported"
+
+function normalizedMarker(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "")
+}
+
+function isLegacyWaitValue(value: unknown, depth = 0): boolean {
+  if (typeof value === "string") {
+    const marker = normalizedMarker(value)
+    return marker === "waitingforuser" || marker.includes("agentpauseerror")
+  }
+  if (depth >= 3 || !isPlainJsonObject(value)) return false
+  return Object.values(value).some(child => isLegacyWaitValue(child, depth + 1))
+}
+
+function hasLegacyWaitMarker(value: Record<string, unknown>): boolean {
+  const markerFields = ["status", "errorCode", "code", "name", "type", "error", "reason", "message", "details", "failureReason"]
+  return markerFields.some(field => isLegacyWaitValue(value[field]))
+}
+
+function classifyPipelineResponse(value: unknown): PipelineToolResult {
+  if (!isPlainJsonObject(value)) return { status: "failed", errorCode: "pipeline_malformed_response", output: value }
+  if (hasLegacyWaitMarker(value) || (value.status === "failed" && value.report === null)) {
+    return { status: "failed", errorCode: LEGACY_WAIT_ERROR, output: value }
+  }
+  if (value.status === "completed" && isPlainJsonObject(value.report)) {
+    return { status: "completed", errorCode: null, output: value }
+  }
+  if (value.status === "failed") {
+    const errorCode = typeof value.errorCode === "string" && value.errorCode.length > 0 ? value.errorCode : "pipeline_failed"
+    return { status: "failed", errorCode, output: value }
+  }
+  return { status: "failed", errorCode: "pipeline_malformed_response", output: value }
+}
+
 function contextBuilder() {
   return {
     async build(input: Parameters<TurnEngineOptions["contextBuilder"]["build"]>[0]): Promise<StepContext> {
@@ -94,7 +135,7 @@ async function executePipelineTool(task: AgentRunTaskPayload, input: { signal: A
   const result = await response.json().catch(() => null) as unknown
   if (response.status === 403) return { status: "failed" as const, errorCode: "authorization_revoked", output: result }
   if (!response.ok) return { status: "failed" as const, errorCode: `pipeline_http_${response.status}`, output: result }
-  return { status: "completed" as const, errorCode: null, output: result }
+  return classifyPipelineResponse(result)
 }
 
 export async function runCanonicalAgentTurn(

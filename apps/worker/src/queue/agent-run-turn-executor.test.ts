@@ -57,6 +57,7 @@ describe("runCanonicalAgentTurn", () => {
     vi.clearAllMocks()
     vi.stubEnv("AGENT_WEB_URL", "https://applymate.example")
     vi.stubEnv("AGENT_WORKER_SECRET", "secret")
+    mocks.pinnedFetch.mockResolvedValue(new Response(JSON.stringify({ status: "completed", report: { processed: 1 } }), { status: 200 }))
   })
 
   afterEach(() => vi.unstubAllEnvs())
@@ -95,5 +96,60 @@ describe("runCanonicalAgentTurn", () => {
   it("fails closed without making a request for malformed tool input", async () => {
     await expect(executePipelineCall(["malformed"])).resolves.toMatchObject({ status: "failed", errorCode: "invalid_tool_input" })
     expect(mocks.pinnedFetch).not.toHaveBeenCalled()
+  })
+
+  it("quarantines a legacy 200 failure with no report", async () => {
+    mocks.pinnedFetch.mockResolvedValue(new Response(JSON.stringify({ status: "failed", report: null }), { status: 200 }))
+
+    await expect(executePipelineCall({ mode: "resume" })).resolves.toMatchObject({
+      status: "failed", errorCode: "legacy_wait_unsupported",
+    })
+  })
+
+  it.each([
+    { status: "waiting_for_user", message: "candidate answer required" },
+    { status: "failed", error: { name: "AgentPauseError", message: "writer paused" } },
+  ])("quarantines legacy wait marker: %j", async body => {
+    mocks.pinnedFetch.mockResolvedValue(new Response(JSON.stringify(body), { status: 200 }))
+
+    await expect(executePipelineCall({ mode: "resume" })).resolves.toMatchObject({
+      status: "failed", errorCode: "legacy_wait_unsupported",
+    })
+  })
+
+  it("keeps an explicit non-wait pipeline failure failed", async () => {
+    mocks.pinnedFetch.mockResolvedValue(new Response(JSON.stringify({ status: "failed", errorCode: "provider_unavailable" }), { status: 200 }))
+
+    await expect(executePipelineCall({ mode: "resume" })).resolves.toMatchObject({
+      status: "failed", errorCode: "provider_unavailable",
+    })
+  })
+
+  it("preserves the existing HTTP failure fence", async () => {
+    mocks.pinnedFetch.mockResolvedValue(new Response(JSON.stringify({ error: "upstream unavailable" }), { status: 503 }))
+
+    await expect(executePipelineCall({ mode: "resume" })).resolves.toMatchObject({
+      status: "failed", errorCode: "pipeline_http_503",
+    })
+  })
+
+  it("accepts a completed report from the legacy-compatible route", async () => {
+    mocks.pinnedFetch.mockResolvedValue(new Response(JSON.stringify({ status: "completed", report: { processed: 1 } }), { status: 200 }))
+
+    await expect(executePipelineCall({ mode: "resume" })).resolves.toMatchObject({ status: "completed", errorCode: null })
+  })
+
+  it("fails closed for a malformed successful response", async () => {
+    mocks.pinnedFetch.mockResolvedValue(new Response("not-json", { status: 200 }))
+
+    await expect(executePipelineCall({ mode: "resume" })).resolves.toMatchObject({
+      status: "failed", errorCode: "pipeline_malformed_response",
+    })
+  })
+
+  it("preserves the turn identity fence", async () => {
+    await expect(runCanonicalAgentTurn({
+      data: { userId: "user-1", sessionId: "session-1" }, attemptsMade: 0,
+    }, {} as never)).rejects.toThrow("Canonical agent run requires turnId")
   })
 })
