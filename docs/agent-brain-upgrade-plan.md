@@ -913,3 +913,11 @@ Commit `c72f2717` adds the pure proof classifier and `answerLegacyQuestion` tran
 Only the proven branch atomically updates the legacy answer, completes the canonical question Item with a revision CAS, advances the same Turn revision, and appends `question.answered` plus `turn.wakeup` facts/outbox rows. Raw answers are excluded from event/outbox payloads. The stable client-message key returns `duplicate` on replay and leaves the second answer at 409 without another mutation. The service does not enqueue or mutate `AgentExecution`.
 
 Focused Web validation passed **3 files / 38 tests** across answer, classifier, and dual-write coverage. This is a Web-side compatibility bridge, not proof that outbox dispatch, Worker wakeup consumption, canonical Turn continuation, live database concurrency/RLS, restart recovery, or full legacy migration works. P8-60 remains a candidate increment; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## P8-61 update
+
+Commit `a7cfddd6` places the proof-gated bridge first in `/api/agent/answer`. `bridged` and `duplicate` return `resumed: false` with `canonical_turn_wakeup_recorded`, and do not claim or enqueue legacy execution. `bridge_pending` returns HTTP 409 with `legacy_question_bridge_pending` before any legacy answer mutation or enqueue.
+
+`legacy_only` retains the old conditional question claim and waiting execution queue path. An active canonical Turn in a non-waiting status remains quarantined with `canonical_turn_owns_wait`. `dispatch_pending` is limited to enqueue failure after the old path's claim rollback. The route does not assert Worker continuation or successful legacy execution resume; canonical `resumed` is explicitly false and legacy `resumed` only describes the old enqueue branch.
+
+Root Web route validation passed **10/10 tests**. No schema or Worker consumer change was made. Outbox dispatch, Worker wakeup consumption, canonical Turn continuation, and production recovery remain unverified; P8-61 is a candidate increment and formal acceptance stays **P0 accepted 1/8 (12.5%)**.

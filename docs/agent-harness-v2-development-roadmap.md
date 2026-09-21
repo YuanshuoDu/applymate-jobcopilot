@@ -2752,3 +2752,15 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Root focused Web validation passed **3 files / 38 tests** across answer, bridge classifier, and dual-write suites. No schema or Worker executor change was made.
 
 **Candidate boundary:** This slice proves only the Web-side proof-gated atomic projection and wakeup facts. Outbox dispatch, Worker wakeup consumption, canonical Turn continuation, live PostgreSQL/RLS concurrency, process restart, and complete legacy→canonical migration remain unverified. P8-60 remains a candidate.
+
+## 147. P8-61 — Legacy answer route bridge gate
+
+**Candidate status/date (2026-09-21):** P8-61 is recorded as a candidate Web route compatibility slice; formal acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `a7cfddd6` calls the proof-gated answer service before `/api/agent/answer` enters the legacy path. `bridged` and `duplicate` return `resumed: false` with `canonical_turn_wakeup_recorded`, without legacy mutation or queue enqueue. `bridge_pending` returns HTTP 409 with `legacy_question_bridge_pending` before any legacy answer claim. `legacy_only` preserves the old conditional answer claim and waiting-execution queue path; an active canonical Turn with a non-waiting status remains quarantined by `canonical_turn_owns_wait`.
+
+**Failure boundary:** `dispatch_pending` applies only when enqueue fails after the old legacy path's conditional claim rollback. It is not a canonical bridge result. The route does not claim Worker continuation or successful legacy execution resume: canonical success explicitly reports `resumed: false`, and legacy `resumed` only reflects the old enqueue branch.
+
+**Independent verification:** Root Web route validation passed **10/10 tests**. No schema, Worker executor, or wakeup-consumer change was made.
+
+**Candidate boundary:** Outbox dispatch, Worker wakeup consumption, canonical Turn continuation, live PostgreSQL/RLS concurrency, process restart, and complete legacy→canonical migration remain unverified. P8-61 remains a candidate.
