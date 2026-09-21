@@ -48,8 +48,9 @@ describe('tablet and phone layout safeguards', () => {
   it('expands the collapsed sidebar for a readable account menu', () => {
     expect(sidebarSource).toContain('className="app-sidebar-account-menu"')
     expect(sidebarSource).toContain("' is-account-menu-open'")
-    expect(globalCss).toMatch(/\.app-sidebar\.is-collapsed\.is-account-menu-open\s*\{[\s\S]*width:\s*var\(--sidebar-w\)/)
-    expect(globalCss).toMatch(/\.app-sidebar\.is-collapsed\.is-account-menu-open \.app-sidebar-account-menu\s*\{[\s\S]*left:\s*0[\s\S]*right:\s*0[\s\S]*width:\s*auto/)
+    expect(globalCss).toMatch(/\.app-sidebar\.is-collapsed\.is-account-menu-open\s*\{[\s\S]*z-index:\s*120/)
+    expect(globalCss).toMatch(/\.app-sidebar\.is-collapsed\.is-account-menu-open \.app-sidebar-account-menu\s*\{[\s\S]*left:\s*0[\s\S]*right:\s*auto[\s\S]*width:\s*300px[\s\S]*max-width:\s*calc\(100vw - 24px\)/)
+    expect(globalCss).not.toMatch(/\.app-sidebar\.is-collapsed\.is-account-menu-open\s*\{[\s\S]*width:\s*var\(--sidebar-w\)/)
     expect(globalCss).toMatch(/\.app-sidebar-account-menu-item\s*\{[\s\S]*white-space:\s*nowrap/)
   })
 
