@@ -1421,3 +1421,17 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Commit `e13599b1` preserves the server-owned `dependsOn` list when replaying a persisted completion `plan_control`. A current-format completion receipt with matching dependencies replays without re-executing the tool, while the older format without `dependsOn` fails closed as `invalid_plan_output`.
 - Focused Worker validation passed **52/52 tests** in `apps/worker/src/runtime/planning/canonical-plan-execution.test.ts`; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No schema, migration, Web, provider, queue, or dependency change was introduced.
 - Candidate boundary: no live PostgreSQL/RLS transaction race, Redis/BullMQ delivery, process restart, provider/model call, browser, deployment, or complete goal-to-plan-to-completion replay evidence was run. The legacy→V2 split-brain audit remains an open follow-up/risk; this slice does not claim that split-brain behavior is fixed. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-44 candidate - spawn replay lineage fencing
+
+- Goal: prevent a durable spawn idempotency replay from another Turn or parent/root branch from being returned as the current result or recording misleading activity.
+- Commit `f0b0d50e` derives the runtime-owned spawn lineage and validates every existing-replay, atomic-duplicate-winner, and record-race-winner path against the current `turnId`, `parentTaskId`, and known `rootTaskId`. A mismatch fails closed as `coordination_idempotency_conflict`; a record-race loser is closed before a conflicting winner is rejected. This fences the coordination replay contract only and does not reconcile the legacy executor/session path with V2.
+- Focused Worker validation passed **41/41 tests**, plus coordination integration **1/1**. No schema, migration, Web, provider, queue, or dependency change was introduced.
+- Candidate boundary: no live PostgreSQL/RLS transaction race, Redis/BullMQ delivery, process restart, provider/model call, browser, deployment, or complete parent-to-child replay evidence was run. The legacy→V2 split-brain diagnostic/design audit remains an open follow-up/risk; this slice does not claim that split-brain behavior is fixed. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-45 candidate - plan.command receipt revision fence
+
+- Goal: prevent a persisted `plan.command` receipt from an obsolete plan revision from being restored as current evidence or included in the action count.
+- Commit `d4ae24db` derives the accepted plan revision for each `planCallId` from current `plan.revision` observations and passes that expected revision into `plan.command` receipt parsing during canonical restoration and action-count calculation. A receipt with a different revision is omitted from the replayed observation set and count; stored events are not rewritten, and no database constraint is added.
+- Focused Worker validation passed **28/28 tests**. No schema, migration, Web, provider, queue, or dependency change was introduced.
+- Candidate boundary: no live PostgreSQL/RLS transaction race, Redis/BullMQ delivery, process restart, provider/model call, browser, deployment, or complete goal-to-plan-to-replay evidence was run. The legacy→V2 split-brain diagnostic/design audit remains an open follow-up/risk; this slice does not claim that split-brain behavior is fixed. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.

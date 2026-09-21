@@ -2540,3 +2540,27 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** The focused Worker canonical plan execution suite passed **52/52 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No schema, migration, Web, provider, queue, or dependency change was introduced.
 
 **Candidate boundary:** No live PostgreSQL/RLS transaction race, Redis/BullMQ delivery, process restart, provider/model call, browser, deployment, or complete goal-to-plan-to-completion replay evidence was run. The legacy→V2 split-brain audit remains a follow-up/risk only; P8-43 does not claim that split-brain behavior is fixed. P8-43 remains a candidate; overall acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## 130. P8-44 — Spawn replay lineage fencing
+
+**Candidate status/date (2026-09-21):** P8-44 is recorded as a candidate Worker coordination replay-safety slice; formal acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Goal:** Prevent a durable spawn idempotency replay from another Turn or parent/root branch from being returned as the current result or recording misleading activity.
+
+**Implementation:** Commit `f0b0d50e` derives the runtime-owned spawn lineage and validates existing-replay, atomic-duplicate-winner, and record-race-winner paths against the current `turnId`, `parentTaskId`, and known `rootTaskId`. A mismatch fails closed as `coordination_idempotency_conflict`; a record-race loser is closed before a conflicting winner is rejected. The implementation is bounded to the coordination replay contract and does not reconcile the legacy executor/session path with V2.
+
+**Independent verification:** Focused Worker validation passed **41/41 tests**, plus coordination integration **1/1**. No schema, migration, Web, provider, queue, or dependency change was introduced.
+
+**Candidate boundary:** No live PostgreSQL/RLS transaction race, Redis/BullMQ delivery, process restart, provider/model call, browser, deployment, or complete parent-to-child replay evidence was run. The legacy→V2 split-brain diagnostic/design audit remains a follow-up/risk only; P8-44 does not claim that split-brain behavior is fixed. P8-44 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## 131. P8-45 — Plan.command receipt revision fence
+
+**Candidate status/date (2026-09-21):** P8-45 is recorded as a candidate Worker canonical replay-consistency slice; formal acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Goal:** Prevent a persisted `plan.command` receipt from an obsolete plan revision from being restored as current evidence or included in the action count.
+
+**Implementation:** Commit `d4ae24db` derives the accepted plan revision for each `planCallId` from current `plan.revision` observations and passes that expected revision into `plan.command` receipt parsing during canonical restoration and action-count calculation. A receipt with a different revision is omitted from the replayed observation set and count; stored events are not rewritten, and no database constraint is added.
+
+**Independent verification:** Focused Worker validation passed **28/28 tests**. No schema, migration, Web, provider, queue, or dependency change was introduced.
+
+**Candidate boundary:** No live PostgreSQL/RLS transaction race, Redis/BullMQ delivery, process restart, provider/model call, browser, deployment, or complete goal-to-plan-to-replay evidence was run. The legacy→V2 split-brain diagnostic/design audit remains a follow-up/risk only; P8-45 does not claim that split-brain behavior is fixed. P8-45 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
