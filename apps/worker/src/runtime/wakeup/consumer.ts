@@ -107,6 +107,12 @@ async function resumeInTransaction(client: Client, payload: AgentTurnWakeupPaylo
     [payload.turnId, payload.sessionId, session.userId, payload.nextTurnRevision],
   )
   if (updated.rowCount !== 1) return { status: "already_resumed", sessionId: payload.sessionId, turnId: payload.turnId, itemId: payload.itemId, toolCallId: payload.toolCallId }
+  await client.query(
+    `UPDATE "agent_executions"
+     SET "status" = 'queued', "error" = NULL, "completedAt" = NULL
+     WHERE "userId" = $1 AND "sessionId" = $2 AND "status" = 'waiting_for_user'`,
+    [session.userId, payload.sessionId],
+  )
   await appendResumeEvent(client, payload, session.userId)
   return { status: "resumed", sessionId: payload.sessionId, turnId: payload.turnId, itemId: payload.itemId, toolCallId: payload.toolCallId }
 }

@@ -17,7 +17,9 @@ type FakeOptions = {
   turn?: { userId: string; status: string; revision: number } | null
   item?: { status: string; content: unknown } | null
   event?: { sessionId: string; turnId: string; itemId: string | null; type: string; payload: unknown } | null
+  execution?: { userId: string; sessionId: string; status: string; error: string | null; completedAt: string | null } | null
   failEventOnce?: boolean
+  failExecutionUpdateOnce?: boolean
   turnUpdateRows?: number
 }
 
@@ -38,7 +40,9 @@ function fakePool(options: FakeOptions = {}) {
   let turn = options.turn === undefined ? { userId: "user_1", status: "waiting_for_user", revision: 6 } : options.turn
   const item = options.item === undefined ? { status: "completed", content: { waitKind: "question", questionId: "q1", toolCallId: "call_1", answer: "secret-answer" } } : options.item
   const event = options.event === undefined ? { sessionId: wakeup.sessionId, turnId: wakeup.turnId, itemId: wakeup.itemId, type: "turn.wakeup", payload: wakeupEnvelope().payload } : options.event
+  const execution = options.execution === undefined ? { userId: "user_1", sessionId: wakeup.sessionId, status: "waiting_for_user", error: "old error", completedAt: "old completion" } : options.execution
   let failEventOnce = options.failEventOnce ?? false
+  let failExecutionUpdateOnce = options.failExecutionUpdateOnce ?? false
   let sessionSequenceCall = 0
   const client = {
     query: vi.fn(async (sql: string, params?: unknown[]) => {
@@ -70,6 +74,20 @@ function fakePool(options: FakeOptions = {}) {
         const eventSequence = configured === undefined ? "10" : configured
         return eventSequence === null ? { rows: [], rowCount: 0 } : { rows: [{ eventSequence }], rowCount: 1 }
       }
+      if (sql.includes('UPDATE "agent_executions"')) {
+        if (failExecutionUpdateOnce) {
+          failExecutionUpdateOnce = false
+          throw new Error("execution update failed")
+        }
+        const currentExecution = execution
+        const matches = currentExecution !== null && currentExecution.userId === params?.[0] && currentExecution.sessionId === params?.[1] && currentExecution.status === "waiting_for_user"
+        if (matches) {
+          currentExecution.status = "queued"
+          currentExecution.error = null
+          currentExecution.completedAt = null
+        }
+        return { rows: [], rowCount: matches ? 1 : 0 }
+      }
       if (sql.includes('UPDATE "agent_turns"')) {
         const rowCount = options.turnUpdateRows ?? 1
         if (rowCount === 1 && sql.includes("SET \"status\" = 'queued'")) turn = turn ? { ...turn, status: "queued", revision: turn.revision + 1 } : turn
@@ -87,7 +105,7 @@ function fakePool(options: FakeOptions = {}) {
     release: vi.fn(),
   }
   const pool = { connect: vi.fn(async () => client) } as unknown as pg.Pool
-  return { pool, client, calls, outboxUpdates, rows }
+  return { pool, client, calls, outboxUpdates, rows, execution }
 }
 
 function hasCall(calls: Array<[string, unknown[] | undefined]>, fragment: string): boolean {
@@ -109,6 +127,7 @@ describe("Agent wakeup consumer", () => {
     expect(JSON.stringify(fake.calls)).not.toContain("secret-answer")
     expect(fake.calls.some(([sql, params]) => sql.includes('UPDATE "agent_turns" AS turn') && sql.includes('SET "status" = \'queued\'') && params?.includes(6))).toBe(true)
     expect(fake.calls.some(([sql]) => sql.includes('session."userId" = turn."userId"'))).toBe(true)
+    expect(fake.execution).toEqual({ userId: "user_1", sessionId: wakeup.sessionId, status: "queued", error: null, completedAt: null })
   })
 
   it("accepts the canonical waitId used by Gmail OAuth question items", async () => {
@@ -154,6 +173,34 @@ describe("Agent wakeup consumer", () => {
     await expect(resumeAgentTurn(fake.pool, wakeup)).resolves.toMatchObject({ status: "already_resumed" })
     expect(hasCall(fake.calls, 'SELECT "status", "content"')).toBe(false)
     expect(hasCall(fake.calls, "INSERT INTO")).toBe(false)
+    expect(hasCall(fake.calls, 'UPDATE "agent_executions"')).toBe(false)
+  })
+
+  it("allows a pure canonical session with no legacy execution", async () => {
+    const fake = fakePool({ execution: null })
+
+    await expect(resumeAgentTurn(fake.pool, wakeup)).resolves.toMatchObject({ status: "resumed" })
+    expect(hasCall(fake.calls, 'UPDATE "agent_executions"')).toBe(true)
+  })
+
+  it.each([
+    { userId: "user-1", sessionId: "other-session", status: "waiting_for_user", error: "keep", completedAt: "keep" },
+    { userId: "user-1", sessionId: wakeup.sessionId, status: "paused", error: "keep", completedAt: "keep" },
+    { userId: "other-user", sessionId: wakeup.sessionId, status: "waiting_for_user", error: "keep", completedAt: "keep" },
+  ])("leaves a non-claimable legacy execution unchanged: %j", async execution => {
+    const fake = fakePool({ execution })
+
+    await expect(resumeAgentTurn(fake.pool, wakeup)).resolves.toMatchObject({ status: "resumed" })
+    expect(fake.execution).toEqual(execution)
+  })
+
+  it("rolls back and leaves the wakeup unpublished when legacy execution reset fails", async () => {
+    const fake = fakePool({ failExecutionUpdateOnce: true })
+
+    await expect(drainAgentWakeups(fake.pool, 1)).resolves.toBe(0)
+    expect(hasCall(fake.calls, "ROLLBACK")).toBe(true)
+    expect(fake.outboxUpdates).toEqual([{ id: "outbox_1", lastError: "processing_error" }])
+    expect(fake.execution).toEqual({ userId: "user_1", sessionId: wakeup.sessionId, status: "waiting_for_user", error: "old error", completedAt: "old completion" })
   })
 
   it("treats a fenced Turn update miss as an already-resumed no-op", async () => {
@@ -183,7 +230,7 @@ describe("Agent wakeup consumer", () => {
       { id: "duplicate_1", lastError: null },
       { id: "duplicate_2", lastError: null },
     ])
-    expect(fake.calls.filter(([sql]) => sql.includes("SET \"status\" = 'queued'")).length).toBe(1)
+    expect(fake.calls.filter(([sql]) => sql.includes('UPDATE "agent_turns"') && sql.includes("SET \"status\" = 'queued'")).length).toBe(1)
   })
 
   it("terminalizes malformed rows and continues with later wakeups", async () => {
