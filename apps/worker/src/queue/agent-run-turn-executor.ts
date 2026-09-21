@@ -7,6 +7,7 @@ import { toRepositoryJson, type TurnEngineOptions } from "../runtime/turns/turn-
 import type { LeasePool } from "../runtime/turns/lease.js"
 import { createPgRootTaskStore } from "../runtime/subagents/root-task-store.js"
 import { createPgDurableWaitPort } from "../runtime/subagents/durable-wait-store.js"
+import { isPlainJsonObject } from "../runtime/planning/goal-plan-contract.js"
 import type { AgentRunTaskPayload } from "./agent-run-queue.js"
 import { pinnedFetch } from "@jobcopilot/shared"
 
@@ -25,6 +26,10 @@ const PIPELINE_TOOL = {
 const PIPELINE_SNAPSHOT: TurnEngineOptions["snapshot"] = {
   system: [{ id: "pipeline-adapter", content: "Execute the pipeline tool exactly once, then report its result." }],
   profile: [], steerHistory: [], businessRefs: [], toolObservations: [],
+}
+
+function pipelineToolInput(value: unknown): Record<string, unknown> | null {
+  return isPlainJsonObject(value) ? value : null
 }
 
 function contextBuilder() {
@@ -71,6 +76,8 @@ function adapter(): ModelAdapter {
 }
 
 async function executePipelineTool(task: AgentRunTaskPayload, input: { signal: AbortSignal; callInput: unknown }) {
+  const callInput = pipelineToolInput(input.callInput)
+  if (!callInput) return { status: "failed" as const, errorCode: "invalid_tool_input" }
   const url = process.env.AGENT_WEB_URL?.replace(/\/$/, "")
   const secret = process.env.AGENT_WORKER_SECRET
   if (!url) throw new Error("AGENT_WEB_URL is required for canonical agent runs")
@@ -79,8 +86,8 @@ async function executePipelineTool(task: AgentRunTaskPayload, input: { signal: A
     method: "POST",
     headers: { "Content-Type": "application/json", "x-agent-worker-secret": secret },
     body: JSON.stringify({
+      ...callInput,
       userId: task.userId, sessionId: task.sessionId, turnId: task.turnId, executionId: task.executionId,
-      ...(input.callInput && typeof input.callInput === "object" ? input.callInput : {}),
     }),
     signal: input.signal,
   })
