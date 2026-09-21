@@ -1563,3 +1563,9 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Commit `37b311a6` fixes the non-atomic `agent.spawn` idempotency race: after the losing task is closed, a confirmed winner now records the same server-owned supervisor activity replay marker as the other spawn replay paths. The existing winner lineage assertion, tenant/session scope, idempotency key and loser close behavior are unchanged.
 - Focused Worker validation passed **42/42 tests**; Worker TypeScript and `git diff --check` passed. No schema, migration, queue producer, provider, Web, or ToolRegistry/PolicyEngine change was made.
 - This candidate does not add or alter the ownership/lease fence. Real concurrent database behavior, PostgreSQL/RLS, queue delivery, process restart, and cross-process supervisor evidence remain unverified. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-64 candidate - bounded TaskGraph planning foundation
+
+- Commit `a3864d13` adds a 131-line pure TaskGraph reducer with a sibling **10/10 tests** suite. It is a deterministic planning foundation for future supervisor graph reduction and does not introduce a new runtime dispatch path.
+- Worker TypeScript and `git diff --check` passed. The reducer is not wired into the canonical runtime and adds no database persistence, queue producer, schema, or provider behavior.
+- Candidate boundary: canonical runtime integration, database persistence, cross-process recovery, and production supervisor evidence remain unverified. P8-64 remains a planning candidate only; formal acceptance stays **P0 accepted 1/8 (12.5%)**.

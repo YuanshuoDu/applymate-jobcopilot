@@ -933,3 +933,9 @@ The focused fake transaction also verifies rollback when the execution reset fai
 Commit `37b311a6` fixes a supervisor observability gap in the non-atomic `agent.spawn` idempotency race. When this caller loses the durable record race, the loser task is still closed and the validated winner is returned, but the replay activity marker was previously omitted. The path now records the same server-owned `spawn_subagent` replay activity used by the other spawn replay branches, while preserving the existing owner/session/root lineage checks and idempotent loser cleanup.
 
 Focused Worker validation passed **42/42 tests**; Worker TypeScript and `git diff --check` passed. This candidate does not change the ownership/lease fence. Real concurrent behavior, PostgreSQL/RLS, queue delivery, process restart, and cross-process supervisor evidence remain unverified. Formal acceptance remains **1/8 (12.5%)**.
+
+## P8-64 update
+
+Commit `a3864d13` adds a 131-line pure TaskGraph reducer with a sibling **10/10 tests** suite. This is a bounded planning foundation for future supervisor graph reduction; it is not connected to the canonical runtime and does not add database persistence or a cross-process recovery path.
+
+Worker TypeScript and `git diff --check` passed. Canonical runtime integration, database persistence, cross-process recovery, and production supervisor behavior remain unverified. P8-64 is not counted as formal stage completion; acceptance remains **1/8 (12.5%)**.

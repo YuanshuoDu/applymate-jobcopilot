@@ -2786,3 +2786,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** The focused `coordination-executors.test.ts` suite passed **42/42 tests**; Worker TypeScript and `git diff --check` passed. No ownership/lease fence behavior was changed.
 
 **Candidate boundary:** Real concurrent behavior, PostgreSQL/RLS, queue delivery, process restart, and cross-process supervisor evidence remain unverified. P8-63 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## 150. P8-64 — Bounded TaskGraph planning foundation
+
+**Candidate status/date (2026-09-21):** P8-64 is recorded as a planning foundation only; formal acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `a3864d13` adds a 131-line pure TaskGraph reducer and a sibling **10/10 tests** suite. The reducer is intended as a deterministic foundation for future native supervisor graph planning and is not connected to the canonical runtime, database persistence, or cross-process recovery.
+
+**Independent verification:** Worker TypeScript and `git diff --check` passed. No runtime dispatch, database, schema, queue producer, provider, or UI behavior was added by this planning slice.
+
+**Candidate boundary:** Canonical runtime integration, database persistence, cross-process recovery, and production supervisor evidence remain unverified. P8-64 remains a candidate and is not counted toward formal stage completion; acceptance stays **P0 accepted 1/8 (12.5%)**.
