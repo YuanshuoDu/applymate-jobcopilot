@@ -2816,3 +2816,15 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused executor validation passed **31/31 tests**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. This seam is not default wiring from the canonical runtime.
 
 **Candidate boundary:** Database persistence, cross-process recovery, and production supervisor proof remain unverified. P8-66 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## 153. P8-67 — Canonical plan TaskGraph event persistence
+
+**Candidate status/date (2026-09-22):** P8-67 is recorded as a candidate canonical plan execution persistence seam; formal acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `49df725a` constructs `PlanTaskGraphAdapter` only for fresh canonical plan execution, then persists `plan.task_graph` events through a server-owned durable sink. Graph persistence is adapter-first and fail-closed. The stable run key is `rootTaskId:planCallId:planRevision`; owner worker ID is excluded from event identity so lease takeover keeps idempotency, and serialized graph payloads are capped at 8 KiB.
+
+**Replay boundary:** Replay/restore is deliberately excluded because the adapter has no initial durable state. Graph events and `plan.command` receipts are not one atomic batch.
+
+**Independent verification:** Focused validation passed **14/14 adapter tests**, **57/57 canonical-plan tests**, and **25/25 canonical-runtime tests**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+**Candidate boundary:** Real PostgreSQL/RLS, cross-process recovery, and production supervisor evidence remain unverified. P8-67 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.

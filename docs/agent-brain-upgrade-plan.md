@@ -951,3 +951,11 @@ Worker TypeScript and `git diff --check` passed. Replan and plan-revision behavi
 `plan-command-executor` now optionally invokes `PlanTaskGraphAdapter.observe` before the legacy observer. Adapter failures map to `observer_failed` and prevent the legacy observer from running; parallel delegate batches observe every record, and `replan_required` remains a control-only outcome with no graph event.
 
 Focused executor validation passed **31/31 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. This is an execution observation seam, not default canonical-runtime wiring. Database persistence, cross-process recovery, and production supervisor proof remain unverified; formal acceptance stays **1/8 (12.5%)**.
+
+## P8-67 update
+
+Commit `49df725a` wires fresh canonical plan execution to construct `PlanTaskGraphAdapter` only when the execution is not replayed and to persist `plan.task_graph` events through a server-owned durable sink. Graph persistence is adapter-first and fail-closed. The stable run key is `rootTaskId:planCallId:planRevision`; the owner worker ID is excluded from event identity so lease takeover preserves idempotency; serialized graph payloads are capped at 8 KiB.
+
+Replay/restore is deliberately excluded because the adapter has no initial durable state, and graph events with `plan.command` receipts are not one atomic batch. Focused validation passed **14/14 adapter tests**, **57/57 canonical-plan tests**, and **25/25 canonical-runtime tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+Real PostgreSQL/RLS, cross-process recovery, and production supervisor evidence remain unverified. P8-67 remains a candidate; formal acceptance stays **1/8 (12.5%)**.

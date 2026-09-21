@@ -1581,3 +1581,9 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - `plan-command-executor` now optionally invokes `PlanTaskGraphAdapter.observe` before the legacy observer. Adapter failures map to `observer_failed` and block the legacy observer; parallel delegate batches observe each record, while `replan_required` remains control-only and emits no graph event.
 - Focused executor validation passed **31/31 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 - This is an execution observation seam, not default wiring from the canonical runtime. Database persistence, cross-process recovery, and production supervisor proof remain unverified; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## P8-67 candidate - canonical plan TaskGraph event persistence
+
+- Commit `49df725a` makes fresh canonical plan execution construct `PlanTaskGraphAdapter` only when the execution is not replayed, then persist `plan.task_graph` events through a server-owned durable sink. Persistence is adapter-first and fail-closed; the stable run key is `rootTaskId:planCallId:planRevision`, the owner worker ID is excluded from event identity so lease takeover preserves idempotency, and the serialized graph payload is capped at 8 KiB.
+- Replay/restore is deliberately excluded because the adapter has no initial durable state. Graph events and `plan.command` receipts are not one atomic batch. Focused validation passed **14/14 adapter tests**, **57/57 canonical-plan tests**, and **25/25 canonical-runtime tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+- Real PostgreSQL/RLS, cross-process recovery, and production supervisor evidence remain unverified. P8-67 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
