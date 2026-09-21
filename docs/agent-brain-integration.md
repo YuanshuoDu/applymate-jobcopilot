@@ -1407,3 +1407,17 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Commit `cb66d059` adds a bounded Supervisor control summary for the server-owned session gate and validated control revision. Invalid revisions render `N/A`; only state metadata/data attributes are emitted, and the existing control bar remains the mutation authority.
 - Root validation passed **6/6 Supervisor panel tests**, Web TypeScript, and `git diff --check`. No Worker, schema, migration, provider, queue, or dependency change was made.
 - Candidate boundary: no authenticated live session or real pause/resume interaction was run. PostgreSQL/RLS, Redis/BullMQ, process restart, provider/model, browser, and deployment evidence remain unverified. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-42 candidate - approval freshness after goal or plan revision
+
+- Goal: prevent an approval issued under an obsolete goal or plan from authorizing a later action, while keeping already-consumed submission receipts replayable.
+- Commit `c1f9ccc1` adds a server-owned freshness check for approval receipts. The approval request event must exist in the same session/Turn lineage, and any later `goal.revision` or `plan.revision` invalidates pending or actionable approvals before validation, submission inspection, consumption, or resolution. A consumed submission receipt remains inspectable and replay-safe after a later revision, while a missing request event fails closed.
+- Focused Worker validation passed **18/18 tests** in `apps/worker/src/runtime/approval/pg-store.test.ts`; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No schema, migration, Web, provider, queue, or dependency change was introduced.
+- Candidate boundary: no live PostgreSQL/RLS transaction race, Redis/BullMQ delivery, process restart, provider/model call, browser, deployment, or complete approval-to-action evidence was run. The legacy→V2 split-brain audit remains an open follow-up/risk; this slice does not claim that split-brain behavior is fixed. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-43 candidate - completion-control replay preserves dependencies
+
+- Goal: ensure completion replay retains the dependency set that was accepted with the plan, so replay cannot silently drop prerequisite evidence or re-execute completed tools.
+- Commit `e13599b1` preserves the server-owned `dependsOn` list when replaying a persisted completion `plan_control`. A current-format completion receipt with matching dependencies replays without re-executing the tool, while the older format without `dependsOn` fails closed as `invalid_plan_output`.
+- Focused Worker validation passed **52/52 tests** in `apps/worker/src/runtime/planning/canonical-plan-execution.test.ts`; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No schema, migration, Web, provider, queue, or dependency change was introduced.
+- Candidate boundary: no live PostgreSQL/RLS transaction race, Redis/BullMQ delivery, process restart, provider/model call, browser, deployment, or complete goal-to-plan-to-completion replay evidence was run. The legacy→V2 split-brain audit remains an open follow-up/risk; this slice does not claim that split-brain behavior is fixed. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.

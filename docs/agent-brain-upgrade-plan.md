@@ -753,3 +753,19 @@ Root validation covered the canonical state and adjacent coordination suites at 
 Commit `cb66d059` adds a localized, privacy-safe Supervisor control summary showing the server-owned session gate and a validated control revision. Invalid revisions render `N/A`; only bounded state metadata and data attributes are emitted, with no session identity or raw payload/error values. This complements the selected evidence projection while keeping the existing control bar authoritative for mutations.
 
 Root validation passed the Supervisor panel focused file at **6/6 tests**; Web TypeScript and `git diff --check` passed. No Worker, schema, migration, provider, queue, or dependency change was introduced. No authenticated live session or real pause/resume interaction was run. Overall completion remains **1/8 (12.5%)**; P8-41 is a candidate increment.
+
+## P8-42 update
+
+Goal: prevent an approval issued under an obsolete goal or plan from authorizing a later action, while keeping already-consumed submission receipts replayable.
+
+Commit `c1f9ccc1` adds a server-owned approval freshness fence. The approval request event must be present in the same session/Turn lineage, and a later `goal.revision` or `plan.revision` makes pending or actionable approval receipts stale before validation, submission inspection, consumption, or resolution. Consumed submission receipts remain inspectable and return their existing consumed state after a later revision; missing request evidence fails closed.
+
+The focused Worker approval-store suite passed **18/18 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No schema, migration, Web, provider, queue, or dependency change was introduced. Live PostgreSQL/RLS races, Redis/BullMQ delivery, process restart, provider/model, browser, deployment, and complete approval-to-action evidence remain unverified. The legacy→V2 split-brain audit remains a follow-up/risk only and is not claimed as fixed. Overall completion remains **1/8 (12.5%)**; P8-42 is a candidate increment.
+
+## P8-43 update
+
+Goal: ensure completion replay retains the dependency set that was accepted with the plan, so replay cannot silently drop prerequisite evidence or re-execute completed tools.
+
+Commit `e13599b1` preserves `dependsOn` in the server-owned completion `plan_control` replay contract. A persisted current-format completion receipt with matching dependencies replays without re-executing the tool; the previous receipt shape without `dependsOn` fails closed as `invalid_plan_output`.
+
+The focused canonical plan execution suite passed **52/52 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No schema, migration, Web, provider, queue, or dependency change was introduced. Live PostgreSQL/RLS races, Redis/BullMQ delivery, process restart, provider/model, browser, deployment, and complete goal-to-plan-to-completion replay evidence remain unverified. The legacy→V2 split-brain audit remains a follow-up/risk only and is not claimed as fixed. Overall completion remains **1/8 (12.5%)**; P8-43 is a candidate increment.

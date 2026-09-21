@@ -2516,3 +2516,27 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Root validation passed **6/6 Supervisor panel tests**; Web TypeScript and `git diff --check` passed. No Worker, schema, migration, provider, queue, or dependency change was introduced.
 
 **Candidate boundary:** No authenticated live session or real pause/resume interaction was run. PostgreSQL/RLS, Redis/BullMQ delivery, process restart, provider/model, browser, and deployment evidence remain unverified. P8-41 remains a candidate; overall acceptance stays **1/8 (12.5%)**.
+
+## 128. P8-42 — Approval freshness after goal or plan revision
+
+**Candidate status/date (2026-09-21):** P8-42 is recorded as a candidate Worker approval-freshness slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Goal:** Prevent an approval issued under an obsolete goal or plan from authorizing a later action, while keeping already-consumed submission receipts replayable.
+
+**Implementation:** Commit `c1f9ccc1` adds a server-owned freshness check for approval receipts. The durable `approval.requested` event must exist in the same session/Turn lineage, and any later `goal.revision` or `plan.revision` invalidates pending or actionable approvals before validation, submission inspection, consumption, or resolution. A consumed submission receipt remains inspectable after a later revision, while missing request evidence fails closed.
+
+**Independent verification:** The focused Worker approval-store suite passed **18/18 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No schema, migration, Web, provider, queue, or dependency change was introduced.
+
+**Candidate boundary:** No live PostgreSQL/RLS transaction race, Redis/BullMQ delivery, process restart, provider/model call, browser, deployment, or complete approval-to-action evidence was run. The legacy→V2 split-brain audit remains a follow-up/risk only; P8-42 does not claim that split-brain behavior is fixed. P8-42 remains a candidate; overall acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## 129. P8-43 — Completion-control replay preserves dependencies
+
+**Candidate status/date (2026-09-21):** P8-43 is recorded as a candidate Worker completion-replay consistency slice; overall acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Goal:** Ensure completion replay retains the dependency set accepted with the plan, so replay cannot silently drop prerequisite evidence or re-execute completed tools.
+
+**Implementation:** Commit `e13599b1` preserves the server-owned `dependsOn` list in persisted completion `plan_control` receipts. A current-format completion receipt with matching dependencies replays without re-executing the tool; an older completion receipt without `dependsOn` fails closed as `invalid_plan_output`.
+
+**Independent verification:** The focused Worker canonical plan execution suite passed **52/52 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No schema, migration, Web, provider, queue, or dependency change was introduced.
+
+**Candidate boundary:** No live PostgreSQL/RLS transaction race, Redis/BullMQ delivery, process restart, provider/model call, browser, deployment, or complete goal-to-plan-to-completion replay evidence was run. The legacy→V2 split-brain audit remains a follow-up/risk only; P8-43 does not claim that split-brain behavior is fixed. P8-43 remains a candidate; overall acceptance stays **P0 accepted 1/8 (12.5%)**.
