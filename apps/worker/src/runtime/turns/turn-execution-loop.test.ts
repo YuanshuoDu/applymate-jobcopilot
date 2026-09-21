@@ -469,6 +469,27 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.events.some(event => event.type === "final.rejected")).toBe(false)
   })
 
+  it("keeps a goal 1 completion blocked after a same-turn goal update to revision 2", async () => {
+    const nextGoal: GoalContract = { ...replanGoal, revision: 2, objective: "Find senior jobs" }
+    const goalReceipt = { status: "accepted" as const, goalRevision: 2, basedOnGoalRevision: 1, goalContract: nextGoal }
+    const goalRef = replanGoalRef()
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, [
+      planRevisionObservation({ planCallId: "old-plan", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null }),
+      { id: "plan-result:old-plan:read", content: { kind: "plan_command", localId: "read", commandKind: "tool_call", dependsOn: [], status: "completed", errorCode: null, output: { job: "job-1" } } },
+      { id: "plan-control:old-plan:finish", content: { kind: "plan_control", localId: "finish", status: "completion_proposed", dependsOn: ["read"], completionCriteria: ["finish"] } },
+    ], false, undefined, {
+      name: "agent.goal.update", arguments: { changes: { objective: "Find senior jobs" } }, output: goalReceipt,
+    }, false, goalRef, async ({ call }) => {
+      goalRef.update(nextGoal)
+      return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, output: goalReceipt, errorCode: null }
+    })
+    const result = await runTurnExecutionLoop({ ...root.options, planCompletionRequired: true, planCompletionRecoveryLimit: 1 })
+    expect(result).toMatchObject({ status: "failed", errorCode: "final_unverified", stepCount: 3, toolCallCount: 1 })
+    expect(root.events.filter(event => event.type === PLAN_COMPLETION_FEEDBACK_EVENT_TYPE && event.payload)).toHaveLength(1)
+    expect(root.events.some(event => event.type === "turn.completed")).toBe(false)
+    expect(goalRef.get().revision).toBe(2)
+  })
+
   it.each([
     { label: "missing proposal", observations: [] },
     { label: "failed dependency", observations: [

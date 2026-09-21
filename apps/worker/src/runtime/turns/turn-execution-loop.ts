@@ -206,7 +206,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           )
           throw new TurnEngineError(verification.code, verification.blocker)
         }
-        const planCompletion = verifyPlanCompletion({ snapshot, required: options.planCompletionRequired === true })
+        const planCompletion = verifyPlanCompletion({ snapshot, required: options.planCompletionRequired === true, expectedGoalRevision: options.goalRef?.get().revision })
         if (!planCompletion.ok) {
           const planId = currentPlanId(snapshot.toolObservations)
           const usedRecoveryAttempts = planCompletionRecoveryCount(snapshot.toolObservations, options.identity.turnId, planId)

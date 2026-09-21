@@ -21,8 +21,8 @@ export type PlanCompletionVerification =
   | { readonly ok: false; readonly blocker: string; readonly feedback: string }
 
 export type PlanCompletionVerifierInput =
-  | { readonly snapshot: Pick<StepContextSnapshot, "toolObservations">; readonly required?: boolean }
-  | { readonly toolObservations: StepContextSnapshot["toolObservations"]; readonly required?: boolean }
+  | { readonly snapshot: Pick<StepContextSnapshot, "toolObservations">; readonly required?: boolean; readonly expectedGoalRevision?: number }
+  | { readonly toolObservations: StepContextSnapshot["toolObservations"]; readonly required?: boolean; readonly expectedGoalRevision?: number }
 
 type CompletionCandidate = {
   readonly index: number
@@ -109,7 +109,7 @@ function observationsFor(input: PlanCompletionVerifierInput): StepContextSnapsho
   return "snapshot" in input ? input.snapshot.toolObservations : input.toolObservations
 }
 
-function planRevisionState(observations: readonly StepContextSnapshot["toolObservations"][number][]): PlanRevisionState | null | false {
+function planRevisionState(observations: readonly StepContextSnapshot["toolObservations"][number][], expectedGoalRevision?: number): PlanRevisionState | null | false {
   const revisions: PlanRevisionReceipt[] = []
   for (const observation of observations) {
     if (!observation || typeof observation !== "object") continue
@@ -122,10 +122,13 @@ function planRevisionState(observations: readonly StepContextSnapshot["toolObser
     revisions.push(revision)
   }
   if (revisions.length === 0) return null
+  if (expectedGoalRevision !== undefined && revisions.some(revision => revision.goalRevision > expectedGoalRevision)) return false
+  const scopedRevisions = expectedGoalRevision === undefined ? revisions : revisions.filter(revision => revision.goalRevision === expectedGoalRevision)
+  if (scopedRevisions.length === 0) return false
 
   const byGoal = new Map<number, Map<number, PlanRevisionReceipt>>()
   const acceptedPlanIds = new Set<string>()
-  for (const revision of revisions) {
+  for (const revision of scopedRevisions) {
     const byRevision = byGoal.get(revision.goalRevision) ?? new Map<number, PlanRevisionReceipt>()
     if (byRevision.has(revision.planRevision) || acceptedPlanIds.has(revision.planCallId)) return false
     byRevision.set(revision.planRevision, revision)
@@ -149,6 +152,8 @@ function planRevisionState(observations: readonly StepContextSnapshot["toolObser
 /** Verify only server-owned structural completion evidence; criteria text is never semantically evaluated. */
 export function verifyPlanCompletion(input: PlanCompletionVerifierInput): PlanCompletionVerification {
   if (input.required !== true) return { ok: true }
+  const expectedGoalRevision = input.expectedGoalRevision
+  if (expectedGoalRevision !== undefined && (!Number.isSafeInteger(expectedGoalRevision) || expectedGoalRevision < 1)) return failed()
   const observations = observationsFor(input)
   if (!Array.isArray(observations)) return failed()
   if (observations.some(observation => !isPlainJsonObject(observation) || typeof observation.id !== "string")) return failed()
@@ -163,8 +168,9 @@ export function verifyPlanCompletion(input: PlanCompletionVerifierInput): PlanCo
   }
   if (controls.length === 0) return failed()
   if (new Set(controls.map(candidate => candidate.id)).size !== controls.length) return failed()
-  const revisions = planRevisionState(observations)
+  const revisions = planRevisionState(observations, expectedGoalRevision)
   if (revisions === false) return failed()
+  if (expectedGoalRevision !== undefined && expectedGoalRevision !== 1 && revisions === null) return failed()
   const scopedControls = revisions === null ? controls : controls.filter(candidate => revisions.acceptedPlanIds.has(candidate.callId))
   if (revisions !== null && scopedControls.length !== controls.length) return failed()
   const latest = revisions === null ? controls[controls.length - 1]! : scopedControls.find(candidate => candidate.callId === revisions.latestPlanId)

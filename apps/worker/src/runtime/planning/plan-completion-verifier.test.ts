@@ -51,6 +51,41 @@ describe("verifyPlanCompletion", () => {
     })).toEqual({ ok: true })
   })
 
+  it("rejects a goal 1 completion when the server-owned goal revision is 2", () => {
+    const observations = [
+      revision("goal-1-plan", 1, 1), result("goal-1-plan", "read"), completion("goal-1-plan"),
+      revision("goal-2-plan", 1, 2),
+    ]
+    expect(verifyPlanCompletion({ snapshot: snapshot(observations), required: true, expectedGoalRevision: 2 })).toEqual({
+      ok: false, blocker: PLAN_COMPLETION_BLOCKER, feedback: PLAN_COMPLETION_FEEDBACK,
+    })
+  })
+
+  it("accepts completion evidence for the server-owned goal revision", () => {
+    const observations = [
+      revision("goal-1-plan", 1, 1),
+      revision("goal-2-plan", 1, 2), result("goal-2-plan", "read"), completion("goal-2-plan"),
+    ]
+    expect(verifyPlanCompletion({ snapshot: snapshot(observations), required: true, expectedGoalRevision: 2 })).toEqual({ ok: true })
+  })
+
+  it("keeps the legacy path when the expected goal revision is omitted", () => {
+    const callId = "legacy-plan"
+    expect(verifyPlanCompletion({ snapshot: snapshot([result(callId, "read"), completion(callId)]), required: true })).toEqual({ ok: true })
+  })
+
+  it("keeps revision-one compatibility when expected goal revision is one", () => {
+    const callId = "legacy-plan"
+    expect(verifyPlanCompletion({ snapshot: snapshot([result(callId, "read"), completion(callId)]), required: true, expectedGoalRevision: 1 })).toEqual({ ok: true })
+  })
+
+  it("rejects metadata-free completion evidence for a later goal revision", () => {
+    const callId = "legacy-plan"
+    expect(verifyPlanCompletion({ snapshot: snapshot([result(callId, "read"), completion(callId)]), required: true, expectedGoalRevision: 2 })).toEqual({
+      ok: false, blocker: PLAN_COMPLETION_BLOCKER, feedback: PLAN_COMPLETION_FEEDBACK,
+    })
+  })
+
   it.each([
     { label: "missing completion control", observations: [result("plan:1", "read")] },
     { label: "missing dependency", observations: [completion("plan:1")] },
