@@ -147,6 +147,87 @@ body {
 /* ─── App chrome primitives ─────────────────────────────────────────── */
 .app-sidebar {
   width: var(--sidebar-w);
+  transition: width 0.18s ease;
+}
+
+.app-sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.app-sidebar-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text-muted);
+  background: transparent;
+  cursor: pointer;
+}
+
+.app-sidebar-toggle:hover,
+.app-sidebar-toggle:focus-visible {
+  color: var(--primary);
+  border-color: var(--border-strong);
+  background: var(--nav-active);
+}
+
+.app-sidebar.is-collapsed {
+  width: 64px;
+}
+
+.app-sidebar.is-collapsed .app-sidebar-header {
+  flex-direction: column;
+  padding: 12px 8px 10px !important;
+}
+
+.app-sidebar.is-collapsed .app-sidebar-header > div:first-child {
+  width: 100%;
+  justify-content: center;
+}
+
+.app-sidebar.is-collapsed .app-sidebar-brand-copy,
+.app-sidebar.is-collapsed .app-nav-label,
+.app-sidebar.is-collapsed .app-nav-badge,
+.app-sidebar.is-collapsed .app-sidebar-account-copy,
+.app-sidebar.is-collapsed .app-sidebar-notification-control {
+  display: none;
+}
+
+.app-sidebar.is-collapsed nav {
+  padding-inline: 8px !important;
+}
+
+.app-sidebar.is-collapsed .app-nav-button {
+  justify-content: center;
+  padding-inline: 10px !important;
+}
+
+.app-sidebar.is-collapsed .app-nav-status {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  margin-left: 0 !important;
+}
+
+.app-sidebar.is-collapsed > div:last-child {
+  padding-inline: 8px !important;
+}
+
+.app-sidebar.is-collapsed .app-sidebar-account-button {
+  justify-content: center;
+  padding-inline: 0 !important;
+}
+
+.app-sidebar.is-collapsed .app-sidebar-account-button > svg {
+  display: none;
 }
 
 .app-nav-button {

@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { signOut } from 'next-auth/react'
 import type { Session } from 'next-auth'
-import { ChevronDown, CreditCard, LogOut, Settings, UserRound } from 'lucide-react'
+import { ChevronDown, CreditCard, LogOut, PanelLeftClose, PanelLeftOpen, Settings, UserRound } from 'lucide-react'
 import type { Page } from '@/lib/types'
 import { UserAvatar } from '@/components/ui'
 import { useI18n } from '@/lib/i18n'
@@ -19,6 +19,8 @@ interface SidebarProps {
   accountMenuOpen?: boolean
   onAccountMenuToggle?: () => void
   onDismissSidebarPopovers?: () => void
+  collapsed?: boolean
+  onToggleCollapsed?: () => void
 }
 
 export type SidebarNavItem = { id: Page; label: string }
@@ -50,7 +52,7 @@ export function getSidebarNavItems(t: (key: string) => string): SidebarNavItem[]
   ]
 }
 
-export function Sidebar({ active, onNav, onNavIntent, session, jobCount: jobCountProp, notificationControl, notificationPanel, accountMenuOpen = false, onAccountMenuToggle = () => {}, onDismissSidebarPopovers = () => {} }: SidebarProps) {
+export function Sidebar({ active, onNav, onNavIntent, session, jobCount: jobCountProp, notificationControl, notificationPanel, accountMenuOpen = false, onAccountMenuToggle = () => {}, onDismissSidebarPopovers = () => {}, collapsed = false, onToggleCollapsed = () => {} }: SidebarProps) {
   const user = session?.user
   const { t } = useI18n()
 
@@ -99,7 +101,7 @@ export function Sidebar({ active, onNav, onNavIntent, session, jobCount: jobCoun
   const NAV_ITEMS = getSidebarNavItems(t)
 
   return (
-    <div className="app-sidebar" style={{
+    <div className={`app-sidebar${collapsed ? ' is-collapsed' : ''}`} style={{
       flexShrink: 0,
       background: 'var(--glass-sidebar)',
       backdropFilter: 'blur(24px) saturate(180%)',
@@ -110,7 +112,7 @@ export function Sidebar({ active, onNav, onNavIntent, session, jobCount: jobCoun
     }}>
 
       {/* ── Logo ── */}
-      <div style={{ padding: '18px 16px 14px', borderBottom: '1px solid var(--border)' }}>
+      <div className="app-sidebar-header" style={{ padding: '18px 16px 14px', borderBottom: '1px solid var(--border)' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <div style={{
             width: 30, height: 30, borderRadius: 9,
@@ -119,7 +121,7 @@ export function Sidebar({ active, onNav, onNavIntent, session, jobCount: jobCoun
             color: '#fff', fontSize: 13, fontWeight: 700, flexShrink: 0,
             boxShadow: '0 3px 10px rgba(79,70,229,0.40)',
           }}>A</div>
-          <div>
+          <div className="app-sidebar-brand-copy">
             <div style={{
               fontSize: 13, fontWeight: 700, lineHeight: 1.2,
               background: 'var(--brand-gradient)',
@@ -127,13 +129,22 @@ export function Sidebar({ active, onNav, onNavIntent, session, jobCount: jobCoun
             }}>ApplyMate AI</div>
             <div style={{ fontSize: 10, color: 'var(--text-subtle)', lineHeight: 1.2, marginTop: 1 }}>{t('landing.jobCopilotEurope')}</div>
           </div>
+          <button
+            type="button"
+            className="app-sidebar-toggle"
+            aria-label={collapsed ? 'Expand main navigation' : 'Collapse main navigation'}
+            title={collapsed ? 'Expand main navigation' : 'Collapse main navigation'}
+            onClick={onToggleCollapsed}
+          >
+            {collapsed ? <PanelLeftOpen size={15} aria-hidden="true" /> : <PanelLeftClose size={15} aria-hidden="true" />}
+          </button>
         </div>
       </div>
 
       {/* ── Nav ── */}
       <nav style={{ flex: 1, padding: '10px 8px', display: 'flex', flexDirection: 'column', gap: 2, overflowY: 'auto' }}>
         {NAV_ITEMS.map(item => (
-          <button key={item.id} className="app-nav-button" data-active={active === item.id} onClick={() => onNav(item.id)} onMouseEnter={() => onNavIntent?.(item.id)} onFocus={() => onNavIntent?.(item.id)} style={{
+          <button key={item.id} className="app-nav-button" data-active={active === item.id} title={collapsed ? item.label : undefined} onClick={() => onNav(item.id)} onMouseEnter={() => onNavIntent?.(item.id)} onFocus={() => onNavIntent?.(item.id)} style={{
             display: 'flex', alignItems: 'center', gap: 9,
             padding: '8px 10px 8px 14px', borderRadius: 8, border: 'none', cursor: 'pointer',
             background: 'transparent',
@@ -142,17 +153,17 @@ export function Sidebar({ active, onNav, onNavIntent, session, jobCount: jobCoun
             fontSize: 13, textAlign: 'left', width: '100%', transition: 'all 0.15s',
           }}>
             <NavIcon id={item.id} />
-            {item.label}
+            <span className="app-nav-label">{item.label}</span>
             {item.id === 'jobs' && (jobCountProp ?? jobCount) != null && (jobCountProp ?? jobCount)! > 0 && (
-              <span style={{ marginLeft: 'auto', fontSize: 10, background: 'rgba(79,70,229,0.12)', color: 'var(--primary)', borderRadius: 999, padding: '1px 6px', fontWeight: 600 }}>
+              <span className="app-nav-badge" style={{ marginLeft: 'auto', fontSize: 10, background: 'rgba(79,70,229,0.12)', color: 'var(--primary)', borderRadius: 999, padding: '1px 6px', fontWeight: 600 }}>
                 {(jobCountProp ?? jobCount)! > 99 ? '99+' : (jobCountProp ?? jobCount)}
               </span>
             )}
             {item.id === 'gmail' && gmailUnread != null && gmailUnread > 0 && (
-              <span style={{ marginLeft: 'auto', fontSize: 10, background: 'rgba(79,70,229,0.12)', color: 'var(--primary)', borderRadius: 999, padding: '1px 6px', fontWeight: 600 }}>{gmailUnread}</span>
+              <span className="app-nav-badge" style={{ marginLeft: 'auto', fontSize: 10, background: 'rgba(79,70,229,0.12)', color: 'var(--primary)', borderRadius: 999, padding: '1px 6px', fontWeight: 600 }}>{gmailUnread}</span>
             )}
             {item.id === 'agent' && (
-              <span style={{ marginLeft: 'auto', width: 6, height: 6, borderRadius: '50%', background: '#22C55E', flexShrink: 0 }} />
+              <span className="app-nav-status" style={{ marginLeft: 'auto', width: 6, height: 6, borderRadius: '50%', background: '#22C55E', flexShrink: 0 }} />
             )}
           </button>
         ))}
@@ -178,15 +189,15 @@ export function Sidebar({ active, onNav, onNavIntent, session, jobCount: jobCoun
 
           {/* User row */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 6 }}>
-            <button type="button" onClick={onAccountMenuToggle} aria-expanded={accountMenuOpen} aria-haspopup="menu" title={t('account.menu')} style={{ display: 'flex', flex: 1, minWidth: 0, alignItems: 'center', gap: 8, padding: '5px 6px', border: '1px solid transparent', borderRadius: 8, background: accountMenuOpen ? 'var(--nav-active)' : 'transparent', cursor: 'pointer', textAlign: 'left', fontFamily: 'inherit' }}>
+            <button type="button" className="app-sidebar-account-button" onClick={onAccountMenuToggle} aria-expanded={accountMenuOpen} aria-haspopup="menu" title={t('account.menu')} style={{ display: 'flex', flex: 1, minWidth: 0, alignItems: 'center', gap: 8, padding: '5px 6px', border: '1px solid transparent', borderRadius: 8, background: accountMenuOpen ? 'var(--nav-active)' : 'transparent', cursor: 'pointer', textAlign: 'left', fontFamily: 'inherit' }}>
               <UserAvatar src={user?.image} name={user?.name} email={user?.email} size={26} />
-              <span style={{ flex: 1, minWidth: 0 }}>
+              <span className="app-sidebar-account-copy" style={{ flex: 1, minWidth: 0 }}>
                 <span style={{ display: 'block', fontSize: 12, fontWeight: 500, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{user?.name ?? user?.email?.split('@')[0] ?? 'User'}</span>
                 <span style={{ display: 'block', fontSize: 10, color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{user?.email ?? ''}</span>
               </span>
               <ChevronDown size={14} aria-hidden="true" style={{ color: 'var(--text-muted)', transform: accountMenuOpen ? 'rotate(180deg)' : undefined, transition: 'transform 0.15s' }} />
             </button>
-            {notificationControl}
+            <span className="app-sidebar-notification-control">{notificationControl}</span>
             <button tabIndex={-1} aria-hidden="true" style={{ display: 'none' }}>
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 15a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
             </button>
