@@ -843,3 +843,13 @@ Goal: prevent same-goal active waits, pending approvals, and unresolved referenc
 Commit `ed62779e` applies the current plan-revision fence across context-memory projection/schema/recall and the active action-agenda/control-frame paths. Old-plan active waits, pending approvals, and unresolved references no longer drive current action selection when the current plan revision is valid; historical references remain durable and metadata-free legacy references remain compatible.
 
 Focused Worker validation passed **6 suites / 104 tests**, including `plan-revision-scope`; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Source line bounds were checked: context-memory projection 250, context-memory schema 174, cognitive-memory recall 183, cognitive-action-agenda 188, and cognitive-control-frame 231 lines. No schema, migration, Web, provider, queue, or dependency change was introduced. Production Neon/Postgres/RLS, Redis/BullMQ delivery, process restart, provider/model, browser/CloakBrowser, deployment, and legacy→V2 semantic cutover evidence remain unverified. Formal acceptance remains **P0 accepted 1/8 (12.5%)**; P8-52 is a candidate increment.
+
+## P8-53 update
+
+Goal: prevent stale plan-owned `plan_control` observations with `waiting_for_user` or `waiting_for_dependency` status from remaining current active waits or unresolved signals after a newer plan supersedes their owner, while keeping the current plan actionable and preserving fail-closed ambiguity handling.
+
+Commit `30486423` filters superseded plan-owned waiting controls from current active wait and unresolved projections when plan scope is known and the owner is superseded. The current plan remains active; unknown, duplicate, gap, legacy, and malformed observations remain fail-closed.
+
+Root focused validation passed **6 suites / 118 tests** across plan scope, context memory, recall, action agenda, and control-frame coverage; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Source bounds were checked: `cognitive-action-agenda` 189 and `cognitive-control-frame` 233 lines. No schema, migration, Web, provider, queue, or dependency change was introduced. Production Neon/Postgres/RLS, Redis/BullMQ delivery, process restart, provider/model, browser/CloakBrowser, deployment, and legacy→V2 semantic cutover evidence remain unverified. Formal acceptance remains **P0 accepted 1/8 (12.5%)**; P8-53 is a candidate increment.
+
+Follow-up P8-54: audit the Web legacy/canonical entry fence; this is not implemented yet.
