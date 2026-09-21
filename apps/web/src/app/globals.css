@@ -155,9 +155,14 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  position: relative;
 }
 
 .app-sidebar-toggle {
+  position: absolute;
+  top: 16px;
+  right: -14px;
+  z-index: 20;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -168,7 +173,8 @@ body {
   border: 1px solid var(--border);
   border-radius: 7px;
   color: var(--text-muted);
-  background: transparent;
+  background: var(--bg);
+  box-shadow: 0 3px 10px rgba(31, 27, 84, 0.10);
   cursor: pointer;
 }
 
@@ -184,8 +190,7 @@ body {
 }
 
 .app-sidebar.is-collapsed .app-sidebar-header {
-  flex-direction: column;
-  padding: 12px 8px 10px !important;
+  padding: 18px 8px 14px !important;
 }
 
 .app-sidebar.is-collapsed .app-sidebar-header > div:first-child {

@@ -131,16 +131,16 @@ export function Sidebar({ active, onNav, onNavIntent, session, jobCount: jobCoun
             }}>ApplyMate AI</div>
             <div style={{ fontSize: 10, color: 'var(--text-subtle)', lineHeight: 1.2, marginTop: 1 }}>{t('landing.jobCopilotEurope')}</div>
           </div>
-          <button
-            type="button"
-            className="app-sidebar-toggle"
-            aria-label={collapsed ? 'Expand main navigation' : 'Collapse main navigation'}
-            title={collapsed ? 'Expand main navigation' : 'Collapse main navigation'}
-            onClick={onToggleCollapsed}
-          >
-            {collapsed ? <PanelLeftOpen size={15} aria-hidden="true" /> : <PanelLeftClose size={15} aria-hidden="true" />}
-          </button>
         </div>
+        <button
+          type="button"
+          className="app-sidebar-toggle"
+          aria-label={collapsed ? 'Expand main navigation' : 'Collapse main navigation'}
+          title={collapsed ? 'Expand main navigation' : 'Collapse main navigation'}
+          onClick={onToggleCollapsed}
+        >
+          {collapsed ? <PanelLeftOpen size={15} aria-hidden="true" /> : <PanelLeftClose size={15} aria-hidden="true" />}
+        </button>
       </div>
 
       {/* ── Nav ── */}

@@ -469,7 +469,13 @@ export function AppShell() {
                 />
               </div>
               <div id="main-content" style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-                <PageComp key={activeUserId ?? 'anonymous'} />
+                {page === 'resume' ? (
+                  <ResumePage
+                    key={activeUserId ?? 'anonymous'}
+                    sidebarCollapsed={sidebarCollapsed}
+                    onToggleSidebar={() => setSidebarCollapsed(value => !value)}
+                  />
+                ) : <PageComp key={activeUserId ?? 'anonymous'} />}
               </div>
             </div>
 
