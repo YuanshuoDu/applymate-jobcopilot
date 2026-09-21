@@ -15,6 +15,7 @@ import { currentPlanId, PLAN_COMPLETION_FEEDBACK_EVENT_TYPE, restorePlanCompleti
 import { restoreCanonicalSteeringMarkers, type SteeringMarkerState } from "./canonical-steering-markers.js"
 import { priorConversation } from "./canonical-steering-markers.js"
 import { STEERING_MARKER_EVENT_TYPE } from "./context/steering-marker.js"
+import { scopeCanonicalWaitProjections } from "./canonical-wait-scope.js"
 export type CanonicalTurnState = {
   readonly scope: TenantScope
   readonly goal: string
@@ -237,7 +238,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     const acceptedRevisions = acceptedPlanRevisions(currentRevisionObservations)
     const currentPlanIds = goalState.goalContract.revision > 1 ? new Set(currentRevisionObservations.flatMap(item => { const content = object(item.content); return typeof content.planCallId === "string" ? [content.planCallId] : [] })) : undefined
     const restoredBase = [...observations(itemsResult.rows, eventsResult.rows, goalState.goalContract.revision), ...planObservations(eventsResult.rows, currentPlanIds), ...currentRevisionObservations, ...planCommandObservations(eventsResult.rows, currentPlanIds, acceptedRevisions), ...contextCompactionObservations(eventsResult.rows), ...(goalState.receipt ? [goalRevisionObservation(goalState.receipt)] : []), ...(revision ? [planRevisionObservation(revision)] : [])]
-    const scopedSnapshot = sanitizePlanCompletionFeedbackObservations(snapshot.toolObservations, lease.turnId).filter(item => { const content = object(item.content); const output = object(content.output); return (content.kind !== "plan_revision" || content.goalRevision === goalState.goalContract.revision) && (content.toolName !== "agent.plan.propose" || output.status !== "accepted" || output.goalRevision === goalState.goalContract.revision) && (!currentPlanIds || (content.kind !== "plan_command" && content.kind !== "plan_control")) })
+    const scopedSnapshot = scopeCanonicalWaitProjections(sanitizePlanCompletionFeedbackObservations(snapshot.toolObservations, lease.turnId), eventsResult.rows).filter(item => { const content = object(item.content); const output = object(content.output); return (content.kind !== "plan_revision" || content.goalRevision === goalState.goalContract.revision) && (content.toolName !== "agent.plan.propose" || output.status !== "accepted" || output.goalRevision === goalState.goalContract.revision) && (!currentPlanIds || (content.kind !== "plan_command" && content.kind !== "plan_control")) })
     const currentPlan = currentPlanId([...scopedSnapshot, ...restoredBase])
     snapshot = { ...snapshot, toolObservations: sanitizePlanCompletionFeedbackObservations(scopedSnapshot, lease.turnId, currentPlan) }
     const restoredFeedback = restorePlanCompletionFeedback(eventsResult.rows.map(event => ({ type: event.type, payload: eventPayload(event.payload) })), lease.turnId, currentPlan)
@@ -262,7 +263,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
       ...snapshot,
       goal: { id: `turn-goal:${lease.turnId}`, content: goalState.goalContract.objective },
       steerHistory: [...snapshot.steerHistory, ...history.filter(item => !seenHistory.has(item.id)).map(({ sequence: _sequence, ...item }) => item)],
-      toolObservations: [...snapshot.toolObservations, ...restoredNew, ...consumedWaits.filter(item => !seenWithRestored.has(item.id))],
+      toolObservations: [...snapshot.toolObservations, ...restoredNew, ...scopeCanonicalWaitProjections(consumedWaits, eventsResult.rows).filter(item => !seenWithRestored.has(item.id))],
     }
     const steps = stepsResult.rows
     const last = steps[steps.length - 1]

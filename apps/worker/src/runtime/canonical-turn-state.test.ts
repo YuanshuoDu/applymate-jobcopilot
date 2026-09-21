@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest"
 
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
+import { scopeCanonicalWaitProjections } from "./canonical-wait-scope.js"
+import { buildContextMemoryProjection } from "./context/context-memory-projection.js"
 import { buildPlanCompletionFeedbackEvent, PLAN_COMPLETION_FEEDBACK_EVENT_TYPE, planCompletionRecoveryCount } from "./planning/plan-completion-feedback.js"
 import { STEERING_MARKER_EVENT_TYPE, steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "./context/steering-marker.js"
 
@@ -444,5 +446,61 @@ describe("loadCanonicalTurnState", () => {
     const value = await loadCanonicalTurnState({ connect: vi.fn(async () => client) } as never, lease, new Date("2026-09-09T12:00:00.000Z"), { consumeWaitOutcomes: true })
     expect(value.snapshot.toolObservations).toEqual([expect.objectContaining({ id: "wait-result:wait-1", content: expect.objectContaining({ toolCallId: "wait:wait-1", input: { taskIds: ["child-1"], mode: "all" } }) })])
     expect(wait.consumedAt).not.toBeNull()
+  })
+
+  it("scopes a durable wait result to its proven historical plan revision", async () => {
+    const wait: { id: string; userId: string; sessionId: string; turnId: string; parentTaskId: string; stepId: string; targetTaskIds: string[]; mode: string; status: string; matchedTaskIds: string[]; result: Record<string, unknown>; suspendedAt: Date; consumedAt: Date | null } = { id: "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "root-1", stepId: "step-1", targetTaskIds: ["child-1"], mode: "all", status: "ready", matchedTaskIds: ["child-1"], result: { request: { mode: "all" } }, suspendedAt: new Date("2026-09-09T00:00:00.000Z"), consumedAt: null }
+    const command = { planCallId: "plan-1", planRevision: 1, observationId: "plan-result:plan-1:join", content: { kind: "plan_command", localId: "join", commandKind: "join", dependsOn: [], status: "completed", errorCode: null, output: { status: "waiting", waitId: "wait-1" } } }
+    const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+      if (sql.includes('"input"') && sql.includes('FROM "agent_turns"')) return { rows: [{ id: "turn-1", sessionId: "session-1", userId: "user-1", status: "in_progress", leaseOwnerId: lease.ownerId, leaseVersion: lease.leaseVersion, leaseExpiresAt: lease.leaseExpiresAt, input: { goal: "Continue" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} }], rowCount: 1 }
+      if (sql.includes('FROM "agent_wait_conditions"')) return { rows: [wait], rowCount: 1 }
+      if (sql.includes('FROM "sub_agent_tasks"') && sql.includes("ANY($1::text[])")) return { rows: [{ id: "child-1", rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1", userId: "user-1", role: "worker", status: "completed", result: { summary: "done" }, failureReason: null }], rowCount: 1 }
+      if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ id: "root-1", rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1", userId: "user-1" }], rowCount: 1 }
+      if (sql.includes('FROM "agent_steps"') && sql.includes('SELECT "ordinal"')) return { rows: [], rowCount: 1 }
+      if (sql.includes('FROM "agent_steps"')) return { rows: [{ id: "step-1", taskId: "root-1", attempt: 1, status: "waiting_for_tool" }], rowCount: 1 }
+      if (sql.includes('UPDATE "agent_wait_conditions"')) { wait.consumedAt = new Date(String(values?.[1])); wait.result = { ...wait.result, outcome: { waitId: "wait-1" } }; return { rows: [{ id: "wait-1" }], rowCount: 1 } }
+      if (sql.includes('MAX("ordinal")')) return { rows: [{ maxOrdinal: -1 }], rowCount: 1 }
+      if (sql.includes('FROM "agent_items"') || sql.includes('FROM "agent_inputs"') || sql.includes('FROM "agent_context_snapshots"')) return { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "agent_events"')) return { rows: [
+        { type: "plan.revision", payload: { planCallId: "plan-1", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null } },
+        { type: "plan.command", payload: command },
+        { type: "plan.revision", payload: { planCallId: "plan-2", goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1 } },
+      ], rowCount: 3 }
+      return { rows: [], rowCount: 1 }
+    }), release: vi.fn() }
+    const value = await loadCanonicalTurnState({ connect: vi.fn(async () => client) } as never, lease, new Date("2026-09-09T12:00:00.000Z"), { consumeWaitOutcomes: true })
+    const waitProjection = value.snapshot.toolObservations.find(item => item.id === "wait-result:wait-1")
+    expect(waitProjection?.content).toMatchObject({ goalRevision: 1, planRevision: 1 })
+    const memory = buildContextMemoryProjection({ ...value.snapshot, goal: { id: "goal-1", content: { revision: 1, objective: "Continue" } } })
+    expect(memory?.revisions).toEqual({ goalRevision: 1, planRevision: 2 })
+    expect(memory?.waits.some(item => item.id === "wait-result:wait-1")).toBe(false)
+  })
+
+  it("keeps a current-plan durable wait as current memory", () => {
+    const projection = { id: "wait-result:current", content: { toolCallId: "wait:current", toolName: "agent.wait", status: "completed", output: { status: "ready" }, errorCode: null } }
+    const scoped = scopeCanonicalWaitProjections([projection], [
+      { type: "plan.revision", payload: { planCallId: "plan-current", goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1 } },
+      { type: "plan.command", payload: { planCallId: "plan-current", planRevision: 2, observationId: "plan-result:plan-current:join", content: { kind: "plan_command", localId: "join", commandKind: "join", dependsOn: [], status: "completed", errorCode: null, output: { status: "waiting", waitId: "current" } } } },
+    ])
+    expect(scoped[0]?.content).toMatchObject({ goalRevision: 1, planRevision: 2 })
+    const memory = buildContextMemoryProjection({
+      system: [], profile: [], goal: { id: "goal-1", content: { revision: 1, objective: "Continue" } }, steerHistory: [], businessRefs: [],
+      toolObservations: [
+        { id: "plan-revision:plan-current", content: { kind: "plan_revision", planCallId: "plan-current", goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1 } },
+        scoped[0]!,
+      ],
+    })
+    expect(memory?.waits.map(item => item.id)).toEqual(["wait-result:current"])
+  })
+
+  it("leaves an ambiguously mapped legacy wait without guessed scope", () => {
+    const projection = { id: "wait-result:legacy", content: { toolCallId: "wait:legacy", toolName: "agent.wait", status: "completed", output: { status: "ready" }, errorCode: null } }
+    const events = [
+      { type: "plan.revision", payload: { planCallId: "plan-one", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null } },
+      { type: "plan.revision", payload: { planCallId: "plan-two", goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1 } },
+      { type: "plan.command", payload: { planCallId: "plan-one", planRevision: 1, observationId: "plan-result:plan-one:join", content: { kind: "plan_command", localId: "join", commandKind: "join", dependsOn: [], status: "completed", errorCode: null, output: { status: "waiting", waitId: "legacy" } } } },
+      { type: "plan.command", payload: { planCallId: "plan-two", planRevision: 2, observationId: "plan-result:plan-two:join", content: { kind: "plan_command", localId: "join", commandKind: "join", dependsOn: [], status: "completed", errorCode: null, output: { status: "waiting", waitId: "legacy" } } } },
+    ]
+    expect(scopeCanonicalWaitProjections([projection], events)).toEqual([projection])
   })
 })
