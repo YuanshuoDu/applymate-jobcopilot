@@ -217,6 +217,19 @@ describe("coordination executors", () => {
     expect(runtime.store.activities).toHaveLength(0)
   })
 
+  it("records supervisor activity when a non-atomic spawn loses the idempotency race", async () => {
+    const runtime = makeRuntime()
+    const winner = makeTask({ id: "race-winner", path: "/race-winner", status: "queued" })
+    runtime.store.tasks.set(winner.id, winner)
+    runtime.store.recordSpawn = vi.fn(async () => false)
+    runtime.store.getSpawnReplay = vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce(winner)
+
+    await expect(executeSpawn(context(), { idempotencyKey: "spawn-race", role: "scout", taskType: "inspect", goal: "Inspect" }, runtime.options))
+      .resolves.toMatchObject({ taskId: winner.id, replay: true })
+    expect(runtime.manager.close).toHaveBeenCalledWith("child-1", "session-a")
+    expect(runtime.store.activities).toEqual(["spawn_subagent"])
+  })
+
   it.each(["root", "orchestrator", "admin", "elevated", "future-role", "toString", "constructor", "__proto__"])("rejects unsupported spawn role %s before dispatch", async role => {
     const runtime = makeRuntime()
     await expect(executeSpawn(context(), { idempotencyKey: `spawn-${role}`, role, taskType: "inspect", goal: "Inspect" }, runtime.options)).rejects.toMatchObject({ code: "coordination_invalid_input" })

@@ -68,6 +68,7 @@ export async function executeSpawn(context: ToolExecutionContext, input: SpawnSu
         await options.manager.close(task.id, context.sessionId)
         if (winner) {
           assertSpawnReplay(winner, context, lineage)
+          await activity(context, options, "spawn_subagent", winner.id, { path: winner.path, status: winner.status, replay: true }, input.idempotencyKey)
           return spawnOutput(winner, true)
         }
         throw new CoordinationError("coordination_idempotency_conflict", "Spawn idempotency record was lost")
