@@ -2738,3 +2738,17 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Root focused Worker validation passed **15/15 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No Web, schema, or migration change was introduced.
 
 **Candidate boundary:** No production Neon/Postgres/RLS, Redis/BullMQ, process restart, provider/model, browser/CloakBrowser, deployment, or legacy→V2 semantic cutover validation was run. P8-59 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## 146. P8-60 — Proof-gated legacy question answer bridge
+
+**Candidate status/date (2026-09-21):** P8-60 is recorded as a candidate Web compatibility bridge; formal acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Goal:** Map a legacy question answer to the canonical wait only when the complete session, Turn, Item, content, ownership, and provenance evidence proves one lineage, while retaining explicit `bridge_pending` and `legacy_only` outcomes.
+
+**Implementation:** Commit `c72f2717` adds `answerLegacyQuestion` and uses the pure legacy-question provenance classifier. The transaction locks the owned canonical session, requires `q.runId === session.id`, finds exactly one active `waiting_for_user` Turn, and validates deterministic `agent-wait:question:<questionId>` identity, question/stage/options content, and `orchestrator_question` provenance. Missing or ambiguous canonical evidence returns `bridge_pending`; no session, no active Turn, non-waiting Turn, or unmapped legacy question stays `legacy_only`; foreign or conflicting canonical evidence fails closed. The bridge does not guess the latest Turn or Item.
+
+**Atomicity and privacy:** Only the proven branch updates the legacy answer, canonical question Item, and Turn revision in one transaction. It appends `question.answered` and `turn.wakeup` through the existing event/outbox path, with raw answers omitted from event and outbox payloads. Stable client-message idempotency returns `duplicate`; a second answer is rejected without a second mutation. The service does not enqueue or mutate `AgentExecution`.
+
+**Independent verification:** Root focused Web validation passed **3 files / 38 tests** across answer, bridge classifier, and dual-write suites. No schema or Worker executor change was made.
+
+**Candidate boundary:** This slice proves only the Web-side proof-gated atomic projection and wakeup facts. Outbox dispatch, Worker wakeup consumption, canonical Turn continuation, live PostgreSQL/RLS concurrency, process restart, and complete legacy→canonical migration remain unverified. P8-60 remains a candidate.

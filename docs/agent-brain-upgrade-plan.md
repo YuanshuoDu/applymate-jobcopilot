@@ -903,3 +903,13 @@ Goal: prevent legacy pipeline adapters from presenting unsupported pause states 
 Commit `67bf6598` maps HTTP 200 responses with `report: null` and `status: failed`, plus `waiting_for_user` or `AgentPauseError` markers, to `legacy_wait_unsupported`. Normal success, explicit failure, and malformed responses preserve their existing fail-closed behavior.
 
 Root focused Worker validation passed **15/15 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No Web, schema, or migration change was introduced. Production Neon/Postgres/RLS, Redis/BullMQ delivery, process restart, provider/model, browser/CloakBrowser, deployment, and legacy→V2 semantic cutover evidence remain unverified. Formal acceptance remains **P0 accepted 1/8 (12.5%)**; P8-59 is a candidate increment.
+
+## P8-60 update
+
+Goal: answer a legacy `AgentRunQuestion` through canonical wait state only when ownership, session/Turn lineage, question content, deterministic Item identity, and explicit provenance are all proven.
+
+Commit `c72f2717` adds the pure proof classifier and `answerLegacyQuestion` transaction service. The service locks the owned canonical session, requires `q.runId === session.id`, refuses zero or multiple active Turns, and accepts only one `waiting_for_user` Turn with a matching `agent-wait:question:<questionId>` Item and `orchestrator_question` provenance. Missing or ambiguous canonical evidence returns `bridge_pending`; no session, no active Turn, non-waiting Turn, or unmapped legacy question remains `legacy_only`; foreign/conflicting canonical evidence fails closed. It never selects a latest Turn or Item.
+
+Only the proven branch atomically updates the legacy answer, completes the canonical question Item with a revision CAS, advances the same Turn revision, and appends `question.answered` plus `turn.wakeup` facts/outbox rows. Raw answers are excluded from event/outbox payloads. The stable client-message key returns `duplicate` on replay and leaves the second answer at 409 without another mutation. The service does not enqueue or mutate `AgentExecution`.
+
+Focused Web validation passed **3 files / 38 tests** across answer, classifier, and dual-write coverage. This is a Web-side compatibility bridge, not proof that outbox dispatch, Worker wakeup consumption, canonical Turn continuation, live database concurrency/RLS, restart recovery, or full legacy migration works. P8-60 remains a candidate increment; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
