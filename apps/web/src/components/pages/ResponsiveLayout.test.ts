@@ -60,6 +60,15 @@ describe('tablet and phone layout safeguards', () => {
     expect(resumeCss).toMatch(/\.resume-library-item\.is-selected\s*\{[\s\S]*border-width:\s*1px !important/)
   })
 
+  it('contains resume-list badges and reserves a stable editor action slot', () => {
+    expect(resumeCss).toMatch(/\.resume-library-item\s*\{[\s\S]*min-height:\s*126px[\s\S]*align-items:\s*stretch/)
+    expect(resumeCss).toMatch(/\.resume-library-item-copy\s*\{[\s\S]*display:\s*flex[\s\S]*flex-direction:\s*column/)
+    expect(resumeCss).toMatch(/\.resume-library-item-badges\s*\{[\s\S]*display:\s*flex[\s\S]*flex-wrap:\s*wrap/)
+    expect(resumeCss).toMatch(/\.resume-workspace-name-row\s*\{[\s\S]*flex-wrap:\s*nowrap/)
+    expect(resumeCss).toMatch(/\.resume-workspace-actions\s*\{[\s\S]*width:\s*128px[\s\S]*flex:\s*0 0 128px/)
+    expect(resumeCss).toMatch(/\.resume-workspace-preview-button\s*\{[\s\S]*width:\s*128px[\s\S]*min-width:\s*128px[\s\S]*height:\s*40px/)
+  })
+
   it('gives the resume editor title and formatting toolkit a clear hierarchy', () => {
     expect(resumePageSource).toContain('className="resume-workspace-title-copy"')
     expect(resumePageSource).toContain('className="resume-format-toolbar"')
@@ -78,7 +87,7 @@ describe('tablet and phone layout safeguards', () => {
     expect(resumeCss).toMatch(/\.resume-completeness\s*\{[\s\S]*width:\s*100%/)
     expect(resumeCss).toMatch(/\.resume-paper\s*\{[\s\S]*max-width:\s*794px[\s\S]*min-height:\s*1123px/)
     expect(resumeCss).not.toMatch(/\.resume-paper\s*\{[^}]*aspect-ratio:/)
-    expect(resumeCss).toMatch(/\.resume-workspace-preview-button\s*\{[\s\S]*min-width:\s*108px[\s\S]*min-height:\s*40px/)
+    expect(resumeCss).toMatch(/\.resume-workspace-preview-button\s*\{[\s\S]*width:\s*128px[\s\S]*min-width:\s*128px[\s\S]*height:\s*40px/)
     expect(resumeCss).toMatch(/\.resume-library-layout\.is-library-collapsing\s*\{[\s\S]*transition:\s*grid-template-columns/)
     expect(resumePageSource).toContain('RESUME_LIBRARY_COLLAPSE_ANIMATION_MS')
     expect(resumePageSource).toContain('MAIN_NAV_COLLAPSE_DELAY_MS')
