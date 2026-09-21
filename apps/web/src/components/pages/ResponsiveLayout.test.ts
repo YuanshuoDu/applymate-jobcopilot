@@ -26,9 +26,10 @@ describe('tablet and phone layout safeguards', () => {
     expect(resumeCss).toMatch(/@media \(max-width: 960px\)[\s\S]*\.resume-ai-resize-handle\s*\{\s*display:\s*none/)
   })
 
-  it('uses an A4 editor paper on desktop and releases the fixed page shape responsively', () => {
-    expect(resumeCss).toMatch(/\.resume-paper\s*\{[\s\S]*width:\s*100%[\s\S]*max-width:\s*794px[\s\S]*min-height:\s*1123px[\s\S]*aspect-ratio:\s*794\s*\/\s*1123/)
-    expect(resumeCss).toMatch(/@media \(max-width: 960px\)[\s\S]*\.resume-paper\s*\{[\s\S]*min-height:\s*0[\s\S]*aspect-ratio:\s*auto/)
+  it('keeps an A4 minimum paper that grows with longer resumes', () => {
+    expect(resumeCss).toMatch(/\.resume-paper\s*\{[\s\S]*width:\s*100%[\s\S]*max-width:\s*794px[\s\S]*min-height:\s*1123px/)
+    expect(resumeCss).not.toMatch(/\.resume-paper\s*\{[^}]*aspect-ratio:/)
+    expect(resumeCss).toMatch(/@media \(max-width: 960px\)[\s\S]*\.resume-paper\s*\{[\s\S]*min-height:\s*0/)
     expect(resumePageSource).toContain('const A4_W = 794')
   })
 
@@ -75,6 +76,8 @@ describe('tablet and phone layout safeguards', () => {
     expect(resumePageSource).toContain('className="resume-workspace-preview-icon"')
     expect(resumeCss).toMatch(/\.resume-editor-content\s*\{[\s\S]*width:\s*100%[\s\S]*max-width:\s*794px/)
     expect(resumeCss).toMatch(/\.resume-completeness\s*\{[\s\S]*width:\s*100%/)
+    expect(resumeCss).toMatch(/\.resume-paper\s*\{[\s\S]*max-width:\s*794px[\s\S]*min-height:\s*1123px/)
+    expect(resumeCss).not.toMatch(/\.resume-paper\s*\{[^}]*aspect-ratio:/)
     expect(resumeCss).toMatch(/\.resume-workspace-preview-button\s*\{[\s\S]*min-width:\s*108px[\s\S]*min-height:\s*40px/)
     expect(resumeCss).toMatch(/\.resume-library-layout\.is-library-collapsing\s*\{[\s\S]*transition:\s*grid-template-columns/)
     expect(resumePageSource).toContain('RESUME_LIBRARY_COLLAPSE_ANIMATION_MS')
