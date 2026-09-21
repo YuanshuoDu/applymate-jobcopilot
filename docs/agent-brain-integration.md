@@ -1521,3 +1521,17 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Commit `f55e5895` quarantines an active canonical Turn with HTTP `409` and code `canonical_turn_owns_wait`. The question and execution conditional claims gate the legacy answer path so a duplicate enqueue is not reported as successful. No schema, internal, adapter, or full migration change was introduced.
 - Root Web focused validation passed **4/4 tests**; Web `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 - Candidate boundary: the check-vs-claim race and full legacy→canonical migration remain explicitly unverified. No production Neon/Postgres/RLS, Redis/BullMQ, process restart, provider/model, browser/CloakBrowser, deployment, or legacy→V2 semantic cutover validation was run. P8-57 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## P8-58 candidate - Web internal agent-run canonical identity fence
+
+- Goal: prevent an internal legacy agent-run request from attaching to the wrong canonical Turn or execution while retaining legacy-only compatibility.
+- Commit `d527b1e8` fences internal agent-run requests by server-owned Turn/session/user ownership, active Turn status, and execution association. Requests without `turnId` remain compatible with the legacy-only path.
+- Root Web focused validation passed **6/6 tests**; Web `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No schema change was introduced.
+- Candidate boundary: the remaining read/claim race is unverified. No production Neon/Postgres/RLS, Redis/BullMQ, process restart, provider/model, browser/CloakBrowser, deployment, or legacy→V2 semantic cutover validation was run. P8-58 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## P8-59 candidate - Worker pipeline adapter legacy pause quarantine
+
+- Goal: prevent legacy pipeline adapters from presenting unsupported pause states as successful execution while retaining fail-closed behavior for normal success, explicit failure, and malformed responses.
+- Commit `67bf6598` maps HTTP 200 responses with `report: null` and `status: failed`, plus `waiting_for_user` or `AgentPauseError` markers, to `legacy_wait_unsupported`. Normal success, explicit failure, and malformed responses preserve their existing fail-closed behavior.
+- Root focused Worker validation passed **15/15 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No Web, schema, or migration change was introduced.
+- Candidate boundary: no production Neon/Postgres/RLS, Redis/BullMQ, process restart, provider/model, browser/CloakBrowser, deployment, or legacy→V2 semantic cutover validation was run. P8-59 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
