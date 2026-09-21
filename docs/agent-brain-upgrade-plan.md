@@ -967,3 +967,11 @@ Commits `529f6056`, `79b5a066`, and `f94f230e` add the bounded TaskGraph replay 
 Focused evidence passed: reducer **10/10**, canonical state plus adapter **60/60**, canonical plan **61/61**, and canonical runtime **26/26**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 
 Real PostgreSQL/RLS, queue delivery, cross-process/process-restart, and production supervisor E2E remain unverified. Graph and `plan.command` writes are not one atomic batch. Formal acceptance remains **P0 accepted 1/8 (12.5%)**; P8-68 is a candidate increment.
+
+## P8-69 update
+
+Commit `fe2d3801` adds a durable idempotent TaskGraph start intent before router execution. Ready or waiting nodes move to `running`; a failed start blocks routing, replayed receipts skip a duplicate start, missing commands start once, and `replan_required` remains graph-free.
+
+Focused evidence passed: adapter **29/29**, executor **35/35**, and canonical plan **62/62**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+Real PostgreSQL/RLS, queue delivery, restart, cross-process, and production supervisor E2E remain unverified. Graph and `plan.command` writes are not one atomic batch. Formal acceptance remains **P0 accepted 1/8 (12.5%)**; P8-69 is a candidate increment.

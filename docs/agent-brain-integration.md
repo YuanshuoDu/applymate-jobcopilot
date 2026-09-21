@@ -1593,3 +1593,9 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Commits `529f6056`, `79b5a066`, and `f94f230e` add the bounded TaskGraph hydration reducer, scoped `plan.task_graph` loader projection, reducer-derived adapter initial state, and canonical replay graph/`plan.command` consistency gate. Persisted state snapshots are treated as metadata only; legacy replay without graph events remains compatible.
 - Focused evidence passed **10/10 reducer**, **60/60 canonical state plus adapter**, **61/61 canonical-plan**, and **26/26 canonical-runtime** tests. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 - Boundary: real PostgreSQL/RLS, queue delivery across processes, process restart, and production supervisor E2E remain unverified. Graph and `plan.command` writes are not one atomic batch. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-69 candidate - durable TaskGraph start intent before routing
+
+- Commit `fe2d3801` persists an idempotent TaskGraph start intent before router execution. Ready or waiting nodes move to `running`; start failure blocks routing. Existing replay receipts skip duplicate starts, missing commands start once, and `replan_required` remains graph-free.
+- Focused evidence passed **29/29 adapter**, **35/35 executor**, and **62/62 canonical-plan** tests. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+- Boundary: real PostgreSQL/RLS, queue delivery across processes, process restart, and production supervisor E2E remain unverified. Graph and `plan.command` writes are not one atomic batch. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.

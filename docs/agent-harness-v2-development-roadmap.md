@@ -2838,3 +2838,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused validation passed **10/10 reducer tests**, **60/60 canonical state plus adapter tests**, **61/61 canonical-plan tests**, and **26/26 canonical-runtime tests**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 
 **Candidate boundary:** Real PostgreSQL/RLS, queue delivery across processes, process restart, and production supervisor E2E remain unverified. Graph and `plan.command` writes are not one atomic batch. P8-68 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## 155. P8-69 — Durable TaskGraph start intent before routing
+
+**Candidate status/date (2026-09-22):** P8-69 is recorded as a candidate durable start-intent slice; formal acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `fe2d3801` persists an idempotent TaskGraph start intent before router execution. Ready and waiting nodes transition to `running`; start failure blocks routing. Replay receipts skip an existing start, missing commands start exactly once, and `replan_required` remains graph-free.
+
+**Independent verification:** Focused validation passed **29/29 adapter tests**, **35/35 executor tests**, and **62/62 canonical-plan tests**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+**Candidate boundary:** Real PostgreSQL/RLS, queue delivery across processes, process restart, and production supervisor E2E remain unverified. Graph and `plan.command` writes are not one atomic batch. P8-69 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
