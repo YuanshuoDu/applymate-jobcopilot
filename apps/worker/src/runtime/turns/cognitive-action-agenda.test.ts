@@ -22,6 +22,15 @@ function plan(callId: string, revision: number, basedOnPlanRevision: number | nu
 function replan(callId: string): StepContext["blocks"][number] {
   return observation(`observation:plan-control:${callId}:join:replan`, { kind: "plan_control", localId: "join:replan", status: "replan_required", dependsOn: ["child"], reason: "child_failure", failedTaskIds: ["child-1"] })
 }
+function planResult(callId: string, status: "failed" | "interrupted" | "cancelled"): StepContext["blocks"][number] {
+  return observation(`observation:plan-result:${callId}:read`, { kind: "plan_command", localId: "read", status, errorCode: "test" })
+}
+function planError(callId: string): StepContext["blocks"][number] {
+  return observation(`observation:plan-error:${callId}`, { kind: "plan_error", status: "failed", errorCode: "test" })
+}
+function completionProposal(callId: string): StepContext["blocks"][number] {
+  return observation(`observation:plan-control:${callId}:finish`, { kind: "plan_control", localId: "finish", status: "completion_proposed", dependsOn: [], completionCriteria: ["finish"] })
+}
 
 describe("cognitive action agenda", () => {
   it("sorts and deduplicates safe IDs deterministically", () => {
@@ -78,6 +87,33 @@ describe("cognitive action agenda", () => {
     expect(agenda.blockedBy).toEqual({ kind: "unresolved_failure", ids: ["observation:plan-control:plan-2:join:replan"] })
   })
 
+  it.each(["failed", "interrupted", "cancelled"] as const)("filters superseded plan-result %s failures only", status => {
+    const agenda = buildCognitiveActionAgenda(context([goal(), plan("plan-1", 1, null), plan("plan-2", 2, 1), planResult("plan-1", status), planResult("plan-2", status)]))
+
+    expect(agenda.signals.unresolved.ids).not.toContain("observation:plan-result:plan-1:read")
+    expect(agenda.signals.unresolved.ids).toContain("observation:plan-result:plan-2:read")
+  })
+
+  it("filters a superseded plan-error while retaining the current plan error", () => {
+    const agenda = buildCognitiveActionAgenda(context([goal(), plan("plan-1", 1, null), plan("plan-2", 2, 1), planError("plan-1"), planError("plan-2")]))
+
+    expect(agenda.signals.unresolved.ids).not.toContain("observation:plan-error:plan-1")
+    expect(agenda.signals.unresolved.ids).toContain("observation:plan-error:plan-2")
+  })
+
+  it("retains an ordinary unowned failure", () => {
+    const agenda = buildCognitiveActionAgenda(context([goal(), plan("plan-1", 1, null), plan("plan-2", 2, 1), observation("observation:failure:1", { kind: "plan_command", status: "failed" })]))
+
+    expect(agenda.signals.unresolved.ids).toContain("observation:failure:1")
+  })
+
+  it("filters a superseded completion proposal while retaining the current proposal", () => {
+    const agenda = buildCognitiveActionAgenda(context([goal(), plan("plan-1", 1, null), plan("plan-2", 2, 1), completionProposal("plan-1"), completionProposal("plan-2")]))
+
+    expect(agenda.nextAction).toBe("verify_completion")
+    expect(agenda.signals.completionVerification).toEqual({ count: 1, ids: ["observation:plan-control:plan-2:finish"] })
+  })
+
   it.each([
     ["unknown", [replan("plan-1")]],
     ["duplicate", [plan("plan-1", 1, null), plan("other", 1, null), replan("plan-1")]],
@@ -87,6 +123,17 @@ describe("cognitive action agenda", () => {
     const agenda = buildCognitiveActionAgenda(context([goal(), ...extra]))
 
     expect(agenda.signals.unresolved.ids).toContain("observation:plan-control:plan-1:join:replan")
+  })
+
+  it.each([
+    ["unknown", [planResult("plan-1", "failed")]],
+    ["duplicate", [plan("plan-1", 1, null), plan("other", 1, null), planResult("plan-1", "failed")]],
+    ["gap", [plan("plan-1", 1, null), plan("plan-3", 3, 2), planResult("plan-1", "failed")]],
+    ["legacy revision one", [observation("observation:plan-revision:legacy", { kind: "plan_revision", goalRevision: 2, planRevision: 1 }), planResult("plan-1", "failed")]],
+  ] as const)("retains plan-owned failures when plan scope is %s", (_name, extra) => {
+    const agenda = buildCognitiveActionAgenda(context([goal(), ...extra]))
+
+    expect(agenda.signals.unresolved.ids).toContain("observation:plan-result:plan-1:read")
   })
 
   it.each(["agent.wait", "wait_subagents"] as const)("recognizes %s as an active child wait", toolName => {

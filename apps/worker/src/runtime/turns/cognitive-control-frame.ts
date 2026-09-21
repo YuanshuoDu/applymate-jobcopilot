@@ -2,7 +2,7 @@ import { Buffer } from "node:buffer"
 
 import { validateContextMemoryProjection, type ContextMemoryProjection } from "../context/context-memory-schema.js"
 import type { StepContext } from "../context/step-context-builder.js"
-import { resolveLatestAcceptedPlanCallId, replanSignalPlanCallId } from "../planning/plan-revision-scope.js"
+import { planOwnedObservationOwner, resolveLatestAcceptedPlanCallId, replanSignalPlanCallId } from "../planning/plan-revision-scope.js"
 
 export const COGNITIVE_CONTROL_FRAME_SCHEMA_VERSION = "agent-harness.cognitive-control.v1" as const
 export const schemaVersion = COGNITIVE_CONTROL_FRAME_SCHEMA_VERSION
@@ -16,6 +16,7 @@ const KNOWN_KINDS = new Set(["approval", "context_summary", "plan_command", "pla
 const KNOWN_STATUSES = new Set(["waiting", "pending", "running", "retrying", "failed", "interrupted", "cancelled", "completed", "ready", "timed_out", "replan_required", "required", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"])
 const ACTIVE_WAIT_STATUSES = new Set(["waiting", "pending", "running", "retrying", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"])
 const ACTIVE_APPROVAL_STATUSES = new Set(["waiting", "pending", "running", "retrying", "required", "waiting_for_approval"])
+const FAILURE_STATUSES = new Set(["failed", "interrupted", "cancelled"])
 const UNRESOLVED_STATUSES = new Set(["waiting", "pending", "running", "retrying", "failed", "interrupted", "cancelled", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"])
 const WAIT_TOOL_NAMES = ["agent.wait", "wait_subagents"] as const
 type WaitToolName = typeof WAIT_TOOL_NAMES[number]
@@ -180,9 +181,11 @@ export function buildCognitiveControlFrame(context: StepContext, input: FrameInp
     const isApproval = kind === "approval" || typeof record.approvalId === "string" || block.id.startsWith("observation:approval:") || currentStatus === "waiting_for_approval"
     if (observationId && isWait && currentStatus !== null && ACTIVE_WAIT_STATUSES.has(currentStatus)) waitValues.push(observationId)
     if (observationId && isApproval && (currentStatus === null && kind === "approval" || currentStatus !== null && ACTIVE_APPROVAL_STATUSES.has(currentStatus))) approvalValues.push(observationId)
+    const planOwner = planOwnedObservationOwner({ id: block.id, content: record })
+    const supersededPlanFailure = planScope.kind === "known" && planOwner !== null && planOwner !== planScope.planCallId && currentStatus !== null && FAILURE_STATUSES.has(currentStatus)
     const replanCallId = kind === "plan_control" && currentStatus === "replan_required" ? replanSignalPlanCallId({ id: block.id, content: record }) : null
     const supersededReplan = planScope.kind === "known" && replanCallId !== null && replanCallId !== planScope.planCallId
-    if (observationId && (kind === "plan_control" && currentStatus === "replan_required" && !supersededReplan || currentStatus !== null && UNRESOLVED_STATUSES.has(currentStatus))) unresolvedValues.push(observationId)
+    if (observationId && (kind === "plan_control" && currentStatus === "replan_required" && !supersededReplan || currentStatus !== null && UNRESOLVED_STATUSES.has(currentStatus) && !supersededPlanFailure)) unresolvedValues.push(observationId)
   }
   const control = plain(context.steeringMarkerControl) ? context.steeringMarkerControl : undefined
   const steeringActive = ids(control?.activeInputIds ?? []), steeringNew = ids(control?.newlyObservedInputIds ?? [])

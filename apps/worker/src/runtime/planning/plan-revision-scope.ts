@@ -67,3 +67,20 @@ export function replanSignalPlanCallId(observation: PlanRevisionScopeObservation
   const planCallId = observationId.slice(prefix.length, observationId.length - suffix.length)
   return id(planCallId) && observationId === `${prefix}${planCallId}${suffix}` ? planCallId : null
 }
+
+export function planOwnedObservationOwner(observation: PlanRevisionScopeObservation): string | null {
+  if (!observation || typeof observation.id !== "string") return null
+  const content = row(observation.content), observationId = canonicalId(observation.id)
+  if (!content || !id(observationId)) return null
+  if (content.kind === "plan_error") {
+    const prefix = "plan-error:", planCallId = observationId.startsWith(prefix) ? observationId.slice(prefix.length) : ""
+    return id(planCallId) && observationId === `${prefix}${planCallId}` ? planCallId : null
+  }
+  const prefix = content.kind === "plan_command" ? "plan-result:" : content.kind === "plan_control" ? "plan-control:" : null
+  const localId = content.localId
+  if (prefix === null || !id(localId, MAX_LOCAL_ID)) return null
+  const suffix = `:${localId}`
+  if (!observationId.startsWith(prefix) || !observationId.endsWith(suffix)) return null
+  const planCallId = observationId.slice(prefix.length, observationId.length - suffix.length)
+  return id(planCallId) && observationId === `${prefix}${planCallId}${suffix}` ? planCallId : null
+}

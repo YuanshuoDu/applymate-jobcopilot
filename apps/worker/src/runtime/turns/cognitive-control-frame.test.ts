@@ -20,6 +20,12 @@ function plan(callId: string, revision: number, basedOnPlanRevision: number | nu
 function replan(callId: string): StepContext["blocks"][number] {
   return block(`observation:plan-control:${callId}:join:replan`, "tool_observation", { kind: "plan_control", localId: "join:replan", status: "replan_required", dependsOn: ["child"], reason: "child_failure", failedTaskIds: ["child-1"] })
 }
+function planResult(callId: string, status: "failed" | "interrupted" | "cancelled"): StepContext["blocks"][number] {
+  return block(`observation:plan-result:${callId}:read`, "tool_observation", { kind: "plan_command", localId: "read", status, errorCode: "test" })
+}
+function planError(callId: string): StepContext["blocks"][number] {
+  return block(`observation:plan-error:${callId}`, "tool_observation", { kind: "plan_error", status: "failed", errorCode: "test" })
+}
 
 describe("cognitive control frame", () => {
   it("derives deterministic bounded sorted state from server-shaped fields", () => {
@@ -74,6 +80,26 @@ describe("cognitive control frame", () => {
     expect(frame.unresolved).toEqual({ count: 1, ids: ["observation:plan-control:plan-2:join:replan"] })
   })
 
+  it.each(["failed", "interrupted", "cancelled"] as const)("filters superseded plan-result %s failures only", status => {
+    const frame = buildCognitiveControlFrame(context({ blocks: [block("goal", "goal", { revision: 1 }), plan("plan-1", 1, null), plan("plan-2", 2, 1), planResult("plan-1", status), planResult("plan-2", status)] }))
+
+    expect(frame.unresolved.ids).not.toContain(`observation:plan-result:plan-1:read`)
+    expect(frame.unresolved.ids).toContain(`observation:plan-result:plan-2:read`)
+  })
+
+  it("filters a superseded plan-error while retaining the current plan error", () => {
+    const frame = buildCognitiveControlFrame(context({ blocks: [block("goal", "goal", { revision: 1 }), plan("plan-1", 1, null), plan("plan-2", 2, 1), planError("plan-1"), planError("plan-2")] }))
+
+    expect(frame.unresolved.ids).not.toContain("observation:plan-error:plan-1")
+    expect(frame.unresolved.ids).toContain("observation:plan-error:plan-2")
+  })
+
+  it("retains an ordinary unowned failure", () => {
+    const frame = buildCognitiveControlFrame(context({ blocks: [block("goal", "goal", { revision: 1 }), plan("plan-1", 1, null), plan("plan-2", 2, 1), block("observation:failure:1", "tool_observation", { kind: "plan_command", status: "failed" })] }))
+
+    expect(frame.unresolved.ids).toContain("observation:failure:1")
+  })
+
   it.each([
     ["unknown", [replan("plan-1")]],
     ["duplicate", [plan("plan-1", 1, null), plan("other", 1, null), replan("plan-1")]],
@@ -83,6 +109,17 @@ describe("cognitive control frame", () => {
     const frame = buildCognitiveControlFrame(context({ blocks: [block("goal", "goal", { revision: 1 }), ...extra] }))
 
     expect(frame.unresolved.ids).toContain("observation:plan-control:plan-1:join:replan")
+  })
+
+  it.each([
+    ["unknown", [planResult("plan-1", "failed")]],
+    ["duplicate", [plan("plan-1", 1, null), plan("other", 1, null), planResult("plan-1", "failed")]],
+    ["gap", [plan("plan-1", 1, null), plan("plan-3", 3, 2), planResult("plan-1", "failed")]],
+    ["legacy revision one", [block("observation:plan-revision:legacy", "tool_observation", { kind: "plan_revision", goalRevision: 1, planRevision: 1 }), planResult("plan-1", "failed")]],
+  ] as const)("retains plan-owned failures when plan scope is %s", (_name, extra) => {
+    const frame = buildCognitiveControlFrame(context({ blocks: [block("goal", "goal", { revision: 1 }), ...extra] }))
+
+    expect(frame.unresolved.ids).toContain("observation:plan-result:plan-1:read")
   })
 
   it.each(["agent.wait", "wait_subagents"] as const)("recognizes %s as an active child wait", toolName => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { resolveLatestAcceptedPlanCallId, replanSignalPlanCallId } from "./plan-revision-scope.js"
+import { planOwnedObservationOwner, resolveLatestAcceptedPlanCallId, replanSignalPlanCallId } from "./plan-revision-scope.js"
 
 const projection = (planCallId: string, planRevision: number, basedOnPlanRevision: number | null, goalRevision = 1) => ({
   id: `plan-revision:${planCallId}`,
@@ -27,5 +27,23 @@ describe("plan revision scope", () => {
 
   it("fails closed for malformed replan signal identity", () => {
     expect(replanSignalPlanCallId({ id: "plan-control:plan-1:join:replan", content: { kind: "plan_control", status: "replan_required" } })).toBeNull()
+  })
+
+  it.each([
+    ["plan result", { id: "observation:plan-result:plan-1:read", content: { kind: "plan_command", localId: "read" } }, "plan-1"],
+    ["plan control", { id: "plan-control:plan:call:finish", content: { kind: "plan_control", localId: "finish" } }, "plan:call"],
+    ["plan error", { id: "plan-error:plan:call", content: { kind: "plan_error" } }, "plan:call"],
+  ] as const)("parses the owner for a canonical %s", (_name, observation, expected) => {
+    expect(planOwnedObservationOwner(observation)).toBe(expected)
+  })
+
+  it.each([
+    { id: "plan-result:plan-1:read", content: { kind: "plan_control", localId: "read" } },
+    { id: "plan-result:plan-1:read:extra", content: { kind: "plan_command", localId: "read" } },
+    { id: "plan-control:plan-1:finish", content: { kind: "plan_control", localId: "other" } },
+    { id: "plan-error:", content: { kind: "plan_error" } },
+    { id: "foreign:plan-1:read", content: { kind: "plan_command", localId: "read" } },
+  ])("fails closed for a malformed or foreign plan observation identity", observation => {
+    expect(planOwnedObservationOwner(observation)).toBeNull()
   })
 })
