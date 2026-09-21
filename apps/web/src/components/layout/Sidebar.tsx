@@ -103,7 +103,7 @@ export function Sidebar({ active, onNav, onNavIntent, session, jobCount: jobCoun
   const NAV_ITEMS = getSidebarNavItems(t)
 
   return (
-    <div className={`app-sidebar${collapsed ? ' is-collapsed' : ''}`} style={{
+    <div className={`app-sidebar${collapsed ? ' is-collapsed' : ''}${accountMenuOpen ? ' is-account-menu-open' : ''}`} style={{
       flexShrink: 0,
       background: 'var(--glass-sidebar)',
       backdropFilter: 'blur(24px) saturate(180%)',
