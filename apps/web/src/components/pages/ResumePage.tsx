@@ -131,6 +131,10 @@ const EMPTY_CONTENT: ResumeContent = {
 }
 
 const DEFAULT_ORDER = ['summary', 'experience', 'skills', 'education', 'languages']
+const AI_PANEL_MIN_WIDTH = 280
+const AI_PANEL_MAX_WIDTH = 520
+const AI_PANEL_DEFAULT_WIDTH = 340
+const AI_PANEL_WIDTH_STORAGE_KEY = 'applymate_resume_ai_panel_width'
 
 const ADDABLE_SECTIONS = [
   { id: 'summary',          label: 'Summary' },
@@ -578,6 +582,9 @@ export function ResumePage() {
     if (requested) setSelectedResumeId(requested)
   }, [])
   const [libraryCollapsed, setLibraryCollapsed] = useState(false)
+  const [aiPanelWidth, setAiPanelWidth] = useState(AI_PANEL_DEFAULT_WIDTH)
+  const [aiPanelResizing, setAiPanelResizing] = useState(false)
+  const aiPanelResizeStart = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null)
 
   const { data: directionList, refetch: refetchDirections } = useApi<Direction[]>('/api/directions')
   const [directions,       setDirections]       = useState<Direction[]>([])
@@ -661,6 +668,76 @@ export function ResumePage() {
   const [versions,        setVersions]        = useState<Array<{ id: string; name: string; createdAt: string }>>([])
   const [loadingVers,     setLoadingVers]     = useState(false)
   const [restoring,       setRestoring]       = useState(false)
+
+  useEffect(() => {
+    try {
+      const storedValue = window.localStorage.getItem(AI_PANEL_WIDTH_STORAGE_KEY)
+      const storedWidth = storedValue === null ? NaN : Number(storedValue)
+      if (Number.isFinite(storedWidth)) {
+        setAiPanelWidth(Math.min(AI_PANEL_MAX_WIDTH, Math.max(AI_PANEL_MIN_WIDTH, storedWidth)))
+      }
+    } catch { /* localStorage may be unavailable in private browsing */ }
+  }, [])
+
+  useEffect(() => {
+    try { window.localStorage.setItem(AI_PANEL_WIDTH_STORAGE_KEY, String(aiPanelWidth)) } catch { /* ignore storage failures */ }
+  }, [aiPanelWidth])
+
+  useEffect(() => {
+    if (!aiPanelResizing) return
+    const previousUserSelect = document.body.style.userSelect
+    const previousCursor = document.body.style.cursor
+    document.body.style.userSelect = 'none'
+    document.body.style.cursor = 'col-resize'
+    return () => {
+      document.body.style.userSelect = previousUserSelect
+      document.body.style.cursor = previousCursor
+    }
+  }, [aiPanelResizing])
+
+  function updateAiPanelWidth(clientX: number) {
+    const start = aiPanelResizeStart.current
+    if (!start) return
+    const nextWidth = start.startWidth + start.startX - clientX
+    setAiPanelWidth(Math.min(AI_PANEL_MAX_WIDTH, Math.max(AI_PANEL_MIN_WIDTH, nextWidth)))
+  }
+
+  function handleAiPanelResizeStart(event: React.PointerEvent<HTMLDivElement>) {
+    if (window.matchMedia('(max-width: 960px)').matches) return
+    event.preventDefault()
+    event.currentTarget.setPointerCapture(event.pointerId)
+    aiPanelResizeStart.current = { pointerId: event.pointerId, startX: event.clientX, startWidth: aiPanelWidth }
+    setAiPanelResizing(true)
+  }
+
+  function handleAiPanelResizeMove(event: React.PointerEvent<HTMLDivElement>) {
+    if (aiPanelResizeStart.current?.pointerId !== event.pointerId) return
+    updateAiPanelWidth(event.clientX)
+  }
+
+  function handleAiPanelResizeEnd(event: React.PointerEvent<HTMLDivElement>) {
+    if (aiPanelResizeStart.current?.pointerId !== event.pointerId) return
+    aiPanelResizeStart.current = null
+    setAiPanelResizing(false)
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
+  }
+
+  function handleAiPanelResizeKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
+    const step = event.shiftKey ? 40 : 16
+    const current = aiPanelWidth
+    const nextWidth = event.key === 'ArrowLeft'
+      ? current + step
+      : event.key === 'ArrowRight'
+        ? current - step
+        : event.key === 'Home'
+          ? AI_PANEL_MIN_WIDTH
+          : event.key === 'End'
+            ? AI_PANEL_MAX_WIDTH
+            : null
+    if (nextWidth === null) return
+    event.preventDefault()
+    setAiPanelWidth(Math.min(AI_PANEL_MAX_WIDTH, Math.max(AI_PANEL_MIN_WIDTH, nextWidth)))
+  }
 
   // Section ordering
   const [sectionOrder,    setSectionOrder]    = useState<string[]>(DEFAULT_ORDER)
@@ -1662,7 +1739,10 @@ export function ResumePage() {
           <div style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>{t('resume.selectOrCreate')}</div>
         </div>
       ) : (
-        <div className={`resume-library-layout${libraryCollapsed ? ' is-library-collapsed' : ''}`} style={{ flex: 1, display: 'flex', overflow: 'hidden', background: 'var(--bg-tertiary)' }}>
+        <div
+          className={`resume-library-layout${libraryCollapsed ? ' is-library-collapsed' : ''}${aiPanelResizing ? ' is-ai-panel-resizing' : ''}`}
+          style={{ '--resume-ai-width': `${aiPanelWidth}px`, flex: 1, display: 'flex', overflow: 'hidden', background: 'var(--bg-tertiary)' } as React.CSSProperties}
+        >
           <aside className="resume-library-sidebar">
             <button className="resume-library-collapse" onClick={() => setLibraryCollapsed(value => !value)} aria-label={libraryCollapsed ? 'Show resume library' : 'Hide resume library'}>
               {libraryCollapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
@@ -1733,7 +1813,7 @@ export function ResumePage() {
             )}
             <div className="resume-workspace-head">
               <div>
-                <h2>{resumeName}<span>{selectedResume?.kind === 'adapted' ? 'Tailored resume' : 'Resume editor'}</span></h2>
+                <h2>{resumeName}<span>{selectedResume?.kind === 'adapted' ? t('resume.tailoredVersion') : t('resume.editor')}</span></h2>
               </div>
               <div className="resume-workspace-actions">
                 <button onClick={() => setPreviewMode(value => !value)}>
@@ -1818,6 +1898,23 @@ export function ResumePage() {
             </>)}
           </div>
 
+          <div
+            className="resume-ai-resize-handle"
+            role="separator"
+            aria-label={t('resume.resizeAiPanel')}
+            aria-orientation="vertical"
+            aria-valuemin={AI_PANEL_MIN_WIDTH}
+            aria-valuemax={AI_PANEL_MAX_WIDTH}
+            aria-valuenow={aiPanelWidth}
+            tabIndex={0}
+            onPointerDown={handleAiPanelResizeStart}
+            onPointerMove={handleAiPanelResizeMove}
+            onPointerUp={handleAiPanelResizeEnd}
+            onPointerCancel={handleAiPanelResizeEnd}
+            onKeyDown={handleAiPanelResizeKeyDown}
+          >
+            <span aria-hidden="true" />
+          </div>
           <aside className="resume-ai-column">
           <div className="resume-ai-title" style={{ display: 'flex', gap: 6 }}>
             <button onClick={() => setRightPanel('insights')} style={{ border: 0, background: 'transparent', color: rightPanel === 'insights' ? 'var(--text)' : 'var(--text-muted)', font: 'inherit', fontWeight: 700, cursor: 'pointer', padding: 0 }}>{t('resume.aiInsights')}</button>

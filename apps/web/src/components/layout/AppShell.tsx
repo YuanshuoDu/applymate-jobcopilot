@@ -170,8 +170,11 @@ function writePageToUrl(nextPage: Page, mode: 'push' | 'replace' = 'push') {
   window.history[mode === 'replace' ? 'replaceState' : 'pushState']({}, '', nextUrl)
 }
 
+const SIDEBAR_COLLAPSED_STORAGE_KEY = 'applymate_sidebar_collapsed'
+
 export function AppShell() {
   const [page, setPage]         = useState<Page>(getInitialPage)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [timedOut, setTimedOut] = useState(false)
   const [jobCount, setJobCount] = useState(0)
   const { data: session, status } = useSession()
@@ -181,6 +184,14 @@ export function AppShell() {
   const previousUserIdRef = useRef<string | null>(null)
   const PageComp = PAGES[page]
   const activeUserId = session?.user?.id ?? null
+
+  useEffect(() => {
+    try { setSidebarCollapsed(window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === '1') } catch { /* ignore storage failures */ }
+  }, [])
+
+  useEffect(() => {
+    try { window.localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, sidebarCollapsed ? '1' : '0') } catch { /* ignore storage failures */ }
+  }, [sidebarCollapsed])
 
   const [checkingOnboard, setCheckingOnboard] = useState(true)
   const [needsOnboarding, setNeedsOnboarding] = useState(false)
@@ -434,6 +445,8 @@ export function AppShell() {
                   onNavIntent={prefetchPage}
                   session={session}
                   jobCount={jobCount}
+                  collapsed={sidebarCollapsed}
+                  onToggleCollapsed={() => setSidebarCollapsed(value => !value)}
                   accountMenuOpen={sidebarPopover === 'account'}
                   onAccountMenuToggle={() => setSidebarPopover(current => current === 'account' ? null : 'account')}
                   onDismissSidebarPopovers={() => setSidebarPopover(null)}
