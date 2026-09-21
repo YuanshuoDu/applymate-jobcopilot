@@ -277,7 +277,7 @@ function replayReceipt(snapshot: StepContextSnapshot, callId: string, command: P
   const content = row(observation.content)
   if (!content) throw new CanonicalPlanError("invalid_plan_output")
   if (control) {
-    if (!keysOnly(content, command.kind === "request_input" ? ["kind", "localId", "status", "question", "approvalBoundary"] : ["kind", "localId", "status", "completionCriteria"]) || content.kind !== "plan_control" || content.localId !== command.localId) throw new CanonicalPlanError("invalid_plan_output")
+    if (!keysOnly(content, command.kind === "request_input" ? ["kind", "localId", "status", "question", "approvalBoundary"] : ["kind", "localId", "status", "dependsOn", "completionCriteria"]) || content.kind !== "plan_control" || content.localId !== command.localId) throw new CanonicalPlanError("invalid_plan_output")
     if (command.kind === "request_input") {
       if (content.status !== "waiting_for_user" || content.question !== command.question ||
         (command.approvalBoundary === undefined ? content.approvalBoundary !== undefined : content.approvalBoundary !== command.approvalBoundary)) throw new CanonicalPlanError("invalid_plan_output")

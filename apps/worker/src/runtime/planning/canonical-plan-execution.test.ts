@@ -607,7 +607,8 @@ describe("createCanonicalPlanExecutionFactory", () => {
   it("records completion dependencies and rejects an old completion replay shape", async () => {
     const completionNode = { ...baseNode, localId: "finish", kind: "propose_completion" as const, objective: "Finish", dependsOn: ["read"], successCriteria: ["finish"] }
     const plan = proposal([use("read"), completionNode])
-    const hook = fixture()
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { ok: true }, errorCode: null })) }
+    const hook = fixture(router)
     const fresh = await hook(input(output(plan)))
     expect(fresh.observations).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: "plan-control:proposal-1:finish", content: expect.objectContaining({ status: "completion_proposed", dependsOn: ["read"] }) }),
@@ -615,9 +616,18 @@ describe("createCanonicalPlanExecutionFactory", () => {
 
     const persisted = [
       { id: "plan-result:proposal-1:read", content: { kind: "plan_command", localId: "read", commandKind: "tool_call", dependsOn: [], status: "completed", errorCode: null, output: { ok: true } } },
+      { id: "plan-control:proposal-1:finish", content: { kind: "plan_control", localId: "finish", status: "completion_proposed", dependsOn: ["read"], completionCriteria: ["finish"] } },
+    ]
+    router.execute.mockClear()
+    const replayedCorrectly = await hook(input(output(plan), "step-1", persisted, true))
+    expect(replayedCorrectly).toEqual({ observations: [] })
+    expect(router.execute).not.toHaveBeenCalled()
+
+    const oldFormatPersisted = [
+      persisted[0]!,
       { id: "plan-control:proposal-1:finish", content: { kind: "plan_control", localId: "finish", status: "completion_proposed", completionCriteria: ["finish"] } },
     ]
-    const replayed = await hook(input(output(plan), "step-1", persisted, true))
+    const replayed = await hook(input(output(plan), "step-1", oldFormatPersisted, true))
     expect(observationCode(replayed)).toBe("invalid_plan_output")
   })
 
