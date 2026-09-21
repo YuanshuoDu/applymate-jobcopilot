@@ -861,3 +861,13 @@ Goal: prevent the legacy Agent Run SSE/pipeline from entering while an owned ses
 Commit `237db735` adds an entry guard that returns HTTP `409` with code `legacy_agent_run_blocked_by_active_turn` before SSE or legacy-pipeline execution when an owned session has an `AgentTurn` in `queued`, `in_progress`, `waiting_for_dependency`, `waiting_for_approval`, or `waiting_for_user`. No-session, deleted/foreign-session, and no-active-turn cases preserve their existing behavior.
 
 Root Web focused validation passed **8/8 tests**; Web `tsc --noEmit --skipLibCheck` and `git diff --check` passed. The guarded route is 74 lines. No schema, migration, Worker, provider, queue, or dependency change was introduced. This is an entry guard only; the full legacy wait protocol and the worker identity-spread issue remain separate follow-ups. Production Neon/Postgres/RLS, Redis/BullMQ delivery, process restart, provider/model, browser/CloakBrowser, deployment, and legacy→V2 semantic cutover evidence remain unverified. Formal acceptance remains **P0 accepted 1/8 (12.5%)**; P8-54 is a candidate increment.
+
+## P8-55 update
+
+Goal: keep model-supplied pipeline tool input from choosing execution identity or reaching the network with malformed shape.
+
+Commit `e01364f0` requires pipeline tool `callInput` to be a plain JSON object. Server-owned `userId`, `sessionId`, `turnId`, and `executionId` override any model-supplied values; malformed input returns `invalid_tool_input` before network access, while normal mode behavior remains unchanged.
+
+Root focused Worker validation passed **7/7 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. The executor is 129 lines. No schema, migration, Web, queue, dependency, or provider change was introduced. Production Neon/Postgres/RLS, Redis/BullMQ delivery, process restart, provider/model, browser/CloakBrowser, deployment, and legacy→V2 semantic cutover evidence remain unverified. Formal acceptance remains **P0 accepted 1/8 (12.5%)**; P8-55 is a candidate increment.
+
+Possible follow-up P8-56: audit canonical wait/approval metadata propagation; this is only an audit item and is not implemented.

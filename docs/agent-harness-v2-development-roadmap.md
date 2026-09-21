@@ -2676,3 +2676,17 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Root Web focused validation passed **8/8 tests**; Web `tsc --noEmit --skipLibCheck` and `git diff --check` passed. The guarded route is 74 lines. No schema, migration, Worker, provider, queue, or dependency change was introduced.
 
 **Candidate boundary:** This is an entry guard only. The full legacy wait protocol and the worker identity-spread issue remain separate follow-ups. No production Neon/Postgres/RLS, Redis/BullMQ, process restart, provider/model, browser/CloakBrowser, deployment, or legacy→V2 semantic cutover validation was run. P8-54 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## 141. P8-55 — Worker pipeline identity boundary
+
+**Candidate status/date (2026-09-21):** P8-55 is recorded as a candidate Worker pipeline identity-boundary slice; formal acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Goal:** Keep model-supplied pipeline tool input from choosing execution identity or reaching the network with malformed shape.
+
+**Implementation:** Commit `e01364f0` requires pipeline tool `callInput` to be a plain JSON object. Server-owned `userId`, `sessionId`, `turnId`, and `executionId` override any model-supplied values; malformed input returns `invalid_tool_input` before network access, while normal mode behavior remains unchanged.
+
+**Independent verification:** Root focused Worker validation passed **7/7 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. The executor is 129 lines. No schema, migration, Web, queue, dependency, or provider change was introduced.
+
+**Candidate boundary:** No production Neon/Postgres/RLS, Redis/BullMQ, process restart, provider/model, browser/CloakBrowser, deployment, or legacy→V2 semantic cutover validation was run. P8-55 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+**Possible follow-up P8-56:** Audit canonical wait/approval metadata propagation; this is only an audit item and is not implemented.
