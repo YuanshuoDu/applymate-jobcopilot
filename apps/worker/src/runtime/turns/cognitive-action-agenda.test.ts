@@ -114,6 +114,19 @@ describe("cognitive action agenda", () => {
     expect(agenda.signals.completionVerification).toEqual({ count: 1, ids: ["observation:plan-control:plan-2:finish"] })
   })
 
+  it("ignores stale plan waits and approvals after a newer accepted plan", () => {
+    const agenda = buildCognitiveActionAgenda(context([
+      goal(), plan("plan-1", 1, null), plan("plan-2", 2, 1),
+      observation("observation:wait-result:old", { kind: "wait_result", status: "waiting", goalRevision: 2, planRevision: 1 }),
+      observation("observation:approval:old", { kind: "approval", status: "pending", approvalId: "old", goalRevision: 2, planRevision: 1 }),
+      observation("observation:wait-result:current", { kind: "wait_result", status: "waiting", goalRevision: 2, planRevision: 2 }),
+      observation("observation:approval:current", { kind: "approval", status: "pending", approvalId: "current", goalRevision: 2, planRevision: 2 }),
+    ]))
+    expect(agenda.nextAction).toBe("await_approval")
+    expect(agenda.signals.activeWaits.ids).toEqual(["observation:wait-result:current"])
+    expect(agenda.signals.approvals.ids).toEqual(["observation:approval:current"])
+  })
+
   it.each([
     ["unknown", [replan("plan-1")]],
     ["duplicate", [plan("plan-1", 1, null), plan("other", 1, null), replan("plan-1")]],

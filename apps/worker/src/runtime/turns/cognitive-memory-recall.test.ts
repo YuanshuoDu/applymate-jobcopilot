@@ -85,6 +85,24 @@ describe("cognitive memory recall", () => {
     expect(recall?.references.eventRefs.ids).toEqual(["event-legacy"])
   })
 
+  it("filters stale plan wait and approval references after a newer accepted plan", () => {
+    const value = memory({
+      waits: [{ id: "wait-current", status: "pending", goalRevision: 3, planRevision: 2 }, { id: "wait-old", status: "pending", goalRevision: 3, planRevision: 1 }],
+      approvals: [{ id: "approval-current", status: "pending", goalRevision: 3, planRevision: 2 }, { id: "approval-old", status: "pending", goalRevision: 3, planRevision: 1 }],
+      unresolvedQuestions: [
+        { id: "question:approval:approval-current", summary: "Approval is required before continuing", sourceRef: "approval:approval-current", goalRevision: 3, planRevision: 2 },
+        { id: "question:approval:approval-old", summary: "Approval is required before continuing", sourceRef: "approval:approval-old", goalRevision: 3, planRevision: 1 },
+      ],
+    })
+    const plan1 = block("observation:plan-revision:plan-1", "tool_observation", { kind: "plan_revision", planCallId: "plan-1", goalRevision: 3, planRevision: 1, basedOnPlanRevision: null })
+    const plan2 = block("observation:plan-revision:plan-2", "tool_observation", { kind: "plan_revision", planCallId: "plan-2", goalRevision: 3, planRevision: 2, basedOnPlanRevision: 1 })
+    const recall = buildCognitiveMemoryRecall(context([block("goal", "goal", { revision: 3 }), plan1, plan2, summary(value)]))
+    expect(recall?.planRevision).toBe(2)
+    expect(recall?.references.waits.ids).toEqual(["wait-current"])
+    expect(recall?.references.approvals.ids).toEqual(["approval-current"])
+    expect(recall?.unresolvedQuestions.map(item => item.sourceRef)).toEqual(["approval:approval-current"])
+  })
+
   it("omits memory containing a future goal reference", () => {
     const future = memory({ eventRefs: [{ id: "event-future", goalRevision: 4 }] })
     expect(buildCognitiveMemoryRecall(context([block("goal", "goal", { revision: 3 }), summary(future)]))).toBeNull()

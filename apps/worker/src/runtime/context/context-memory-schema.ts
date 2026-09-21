@@ -116,7 +116,7 @@ function ranges(value: unknown): CognitiveMemoryOmittedRange[] | null {
   return result.every((item, index) => index === 0 || item.fromId.localeCompare(result[index - 1]!.fromId) > 0) ? result : null
 }
 
-export type ContextMemoryValidationOptions = { readonly maxBytes?: number; readonly expectedGoalRevision?: number }
+export type ContextMemoryValidationOptions = { readonly maxBytes?: number; readonly expectedGoalRevision?: number; readonly expectedPlanRevision?: number }
 export function validateContextMemoryProjection(value: unknown, options: ContextMemoryValidationOptions = {}): ContextMemoryProjection | null {
   const maxBytes = options.maxBytes ?? MAX_BYTES
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 256 || maxBytes > MAX_BYTES || !plain(value) || !keys(value, ["schemaVersion", "activeGoals", "fixedConstraints", "steering", "revisions", "decisions", "unresolvedQuestions", "unresolved", "waits", "approvals", "verifiedEvidence", "artifacts", "taskRefs", "eventRefs", "omittedRanges", "coveredSequence"]) || value.schemaVersion !== "agent-harness.cognitive-memory.v1") return null
@@ -131,6 +131,7 @@ export function validateContextMemoryProjection(value: unknown, options: Context
   const planRevision: number | null | undefined = value.revisions.planRevision === null ? null : revision(value.revisions.planRevision) ? value.revisions.planRevision : undefined
   if (goalRevision === undefined || planRevision === undefined || value.coveredSequence !== null && parseSequence(value.coveredSequence) === null || value.coveredSequence === undefined) return null
   if (options.expectedGoalRevision !== undefined && (!revision(options.expectedGoalRevision) || (goalRevision !== null && goalRevision > options.expectedGoalRevision))) return null
+  if (options.expectedPlanRevision !== undefined && !revision(options.expectedPlanRevision) || options.expectedPlanRevision !== undefined && planRevision !== null && planRevision > options.expectedPlanRevision) return null
   const covered = value.coveredSequence === null ? null : BigInt(value.coveredSequence as string)
   const allRefs = [...unresolved, ...waits, ...approvals, ...verifiedEvidence, ...artifacts, ...taskRefs, ...eventRefs]
   if (covered === null && allRefs.some(item => item.sequence !== undefined)) return null
@@ -144,15 +145,18 @@ export function validateContextMemoryProjection(value: unknown, options: Context
   if (goalRevision === null && narrativesAll.length > 0 || planRevision === null && decisions.length > 0 || planRevision === null && unresolvedQuestions.some(item => item.planRevision !== undefined)) return null
   if (planRevision !== null && narrativesAll.some(item => item.planRevision !== undefined && item.planRevision > planRevision)) return null
   if (options.expectedGoalRevision !== undefined && narrativesAll.some(item => item.goalRevision > options.expectedGoalRevision!)) return null
+  if (options.expectedPlanRevision !== undefined && narrativesAll.some(item => item.planRevision !== undefined && item.planRevision > options.expectedPlanRevision!)) return null
+  const expectedPlanRevision = options.expectedPlanRevision
   const scoped = (values: readonly CognitiveMemoryReference[]): readonly CognitiveMemoryReference[] => expectedGoalRevision === undefined
     ? values
-    : values.filter(item => item.goalRevision === undefined || item.goalRevision === expectedGoalRevision)
-  const result: ContextMemoryProjection = { schemaVersion: "agent-harness.cognitive-memory.v1", activeGoals, fixedConstraints, steering, revisions: { goalRevision, planRevision }, decisions: decisions as CognitiveMemoryDecision[], unresolvedQuestions: unresolvedQuestions as CognitiveMemoryQuestion[], unresolved: scoped(unresolved), waits: scoped(waits), approvals: scoped(approvals), verifiedEvidence: scoped(verifiedEvidence), artifacts: scoped(artifacts), taskRefs: scoped(taskRefs), eventRefs: scoped(eventRefs), omittedRanges, coveredSequence: value.coveredSequence as string | null }
+    : values.filter(item => item.goalRevision === undefined || item.goalRevision === expectedGoalRevision && (expectedPlanRevision === undefined || item.planRevision === undefined || item.planRevision === expectedPlanRevision))
+  const scopedNarrative = <T extends CognitiveMemoryDecision | CognitiveMemoryQuestion>(values: readonly T[]): readonly T[] => expectedPlanRevision === undefined ? values : values.filter(item => item.planRevision === undefined || item.planRevision === expectedPlanRevision)
+  const result: ContextMemoryProjection = { schemaVersion: "agent-harness.cognitive-memory.v1", activeGoals, fixedConstraints, steering, revisions: { goalRevision, planRevision }, decisions: scopedNarrative(decisions) as CognitiveMemoryDecision[], unresolvedQuestions: scopedNarrative(unresolvedQuestions) as CognitiveMemoryQuestion[], unresolved: scoped(unresolved), waits: scoped(waits), approvals: scoped(approvals), verifiedEvidence: scoped(verifiedEvidence), artifacts: scoped(artifacts), taskRefs: scoped(taskRefs), eventRefs: scoped(eventRefs), omittedRanges, coveredSequence: value.coveredSequence as string | null }
   return Buffer.byteLength(JSON.stringify(result), "utf8") <= maxBytes ? result : null
 }
 
 export type ContextMemoryNarrative = { readonly decisions: readonly CognitiveMemoryDecision[]; readonly unresolvedQuestions: readonly CognitiveMemoryQuestion[] }
-export function deriveContextMemoryNarrative(observations: readonly Observation[], expectedGoalRevision: number | null): ContextMemoryNarrative {
+export function deriveContextMemoryNarrative(observations: readonly Observation[], expectedGoalRevision: number | null, expectedPlanRevision?: number): ContextMemoryNarrative {
   if (expectedGoalRevision === null) return { decisions: [], unresolvedQuestions: [] }
   const decisions = new Map<string, CognitiveMemoryDecision>(), questions = new Map<string, CognitiveMemoryQuestion>()
   for (const observation of observations) {
@@ -162,6 +166,7 @@ export function deriveContextMemoryNarrative(observations: readonly Observation[
     const goalRevision: number | undefined = revision(content.goalRevision) ? content.goalRevision : undefined
     const planRevision: number | undefined = revision(content.planRevision) ? content.planRevision : undefined
     if (goalRevision !== expectedGoalRevision || !planRevision) continue
+    if (expectedPlanRevision !== undefined && planRevision !== expectedPlanRevision) continue
     if (content.kind === "wait_result" && content.status === "waiting") questions.set(`question:${observation.id}`, { id: `question:${observation.id}`, summary: "A child task result is still pending", sourceRef: observation.id, goalRevision, planRevision })
     if (content.kind === "approval" && content.status === "pending") questions.set(`question:${observation.id}`, { id: `question:${observation.id}`, summary: "Approval is required before continuing", sourceRef: observation.id, goalRevision, planRevision })
   }

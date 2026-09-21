@@ -64,6 +64,23 @@ describe("context memory projection", () => {
     expect(buildContextMemoryProjection(stale)).toMatchObject({ revisions: { goalRevision: 3, planRevision: null } })
   })
 
+  it("filters active waits, approvals, and unresolved refs from superseded plans", () => {
+    const observations = [
+      { id: "plan-revision:plan-1", content: { kind: "plan_revision", planCallId: "plan-1", goalRevision: 2, planRevision: 1, basedOnPlanRevision: null } },
+      { id: "plan-revision:plan-2", content: { kind: "plan_revision", planCallId: "plan-2", goalRevision: 2, planRevision: 2, basedOnPlanRevision: 1 } },
+      { id: "wait-result:old", content: { kind: "wait_result", status: "waiting", goalRevision: 2, planRevision: 1 } },
+      { id: "approval:old", content: { kind: "approval", status: "pending", goalRevision: 2, planRevision: 1 } },
+      { id: "wait-result:current", content: { kind: "wait_result", status: "waiting", goalRevision: 2, planRevision: 2 } },
+      { id: "approval:current", content: { kind: "approval", status: "pending", goalRevision: 2, planRevision: 2 } },
+    ]
+    const value = buildContextMemoryProjection({ ...base, toolObservations: observations })
+    expect(value?.revisions).toEqual({ goalRevision: 2, planRevision: 2 })
+    expect(value?.waits.map(item => item.id)).toEqual(["wait-result:current"])
+    expect(value?.approvals.map(item => item.id)).toEqual(["approval:current"])
+    expect(value?.unresolved.map(item => item.id)).toEqual(["approval:current", "wait-result:current"])
+    expect(value?.unresolvedQuestions.map(item => item.sourceRef)).toEqual(["approval:current", "wait-result:current"])
+  })
+
   it("filters stale goal references from prior and current observations while retaining legacy references", () => {
     const old = buildContextMemoryProjection({
       ...base,

@@ -84,6 +84,22 @@ describe("context memory schema", () => {
     expect(scoped?.eventRefs).toEqual([{ id: "event-legacy" }])
   })
 
+  it("filters stale plan references while retaining metadata-free history", () => {
+    const value = projection()
+    const scoped = validateContextMemoryProjection({
+      ...value,
+      revisions: { goalRevision: 2, planRevision: 4 },
+      waits: [{ id: "wait-current", goalRevision: 2, planRevision: 4 }, { id: "wait-legacy" }, { id: "wait-stale", goalRevision: 2, planRevision: 3 }],
+      approvals: [{ id: "approval-current", goalRevision: 2, planRevision: 4 }, { id: "approval-stale", goalRevision: 2, planRevision: 3 }],
+    }, { expectedGoalRevision: 2, expectedPlanRevision: 4 })
+    expect(scoped?.waits).toEqual([{ id: "wait-current", goalRevision: 2, planRevision: 4 }, { id: "wait-legacy" }])
+    expect(scoped?.approvals).toEqual([{ id: "approval-current", goalRevision: 2, planRevision: 4 }])
+  })
+
+  it("rejects a future plan reference for the expected plan", () => {
+    expect(validateContextMemoryProjection({ ...projection(), waits: [{ id: "wait-future", goalRevision: 2, planRevision: 5 }] }, { expectedGoalRevision: 2, expectedPlanRevision: 4 })).toBeNull()
+  })
+
   it("rejects a future reference for the expected goal", () => {
     const value = projection()
     expect(validateContextMemoryProjection({

@@ -94,6 +94,19 @@ describe("cognitive control frame", () => {
     expect(frame.unresolved.ids).toContain("observation:plan-error:plan-2")
   })
 
+  it("ignores stale plan waits and approvals after a newer accepted plan", () => {
+    const frame = buildCognitiveControlFrame(context({ blocks: [
+      block("goal", "goal", { revision: 1 }), plan("plan-1", 1, null), plan("plan-2", 2, 1),
+      block("observation:wait-result:old", "tool_observation", { kind: "wait_result", status: "waiting", goalRevision: 1, planRevision: 1 }),
+      block("observation:approval:old", "tool_observation", { kind: "approval", status: "pending", approvalId: "old", goalRevision: 1, planRevision: 1 }),
+      block("observation:wait-result:current", "tool_observation", { kind: "wait_result", status: "waiting", goalRevision: 1, planRevision: 2 }),
+      block("observation:approval:current", "tool_observation", { kind: "approval", status: "pending", approvalId: "current", goalRevision: 1, planRevision: 2 }),
+    ] }))
+    expect(frame.activeWaits.ids).toEqual(["observation:wait-result:current"])
+    expect(frame.approvals.ids).toEqual(["observation:approval:current"])
+    expect(frame.unresolved.ids).toEqual(["observation:approval:current", "observation:wait-result:current"])
+  })
+
   it("retains an ordinary unowned failure", () => {
     const frame = buildCognitiveControlFrame(context({ blocks: [block("goal", "goal", { revision: 1 }), plan("plan-1", 1, null), plan("plan-2", 2, 1), block("observation:failure:1", "tool_observation", { kind: "plan_command", status: "failed" })] }))
 

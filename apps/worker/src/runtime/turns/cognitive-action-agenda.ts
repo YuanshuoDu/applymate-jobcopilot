@@ -56,6 +56,7 @@ function safeId(value: unknown): string | null {
 function revision(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 1 ? value : null
 }
+function stalePlanReference(record: Row, scope: ReturnType<typeof resolveLatestAcceptedPlanCallId>, goal: number | null): boolean { const goalRevision = revision(record.goalRevision), planRevision = revision(record.planRevision); return scope.kind === "known" && goal !== null && goalRevision === goal && planRevision !== null && planRevision < scope.planRevision }
 function compare(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0
 }
@@ -137,8 +138,9 @@ export function buildCognitiveActionAgenda(context: StepContext, input: AgendaIn
     if (!observationId) continue
     const waitKind = observationKind === "wait_result" || isWaitToolName(record.toolName) || block.id.startsWith("observation:wait-result:") || observationKind === "plan_control" && observationStatus === "waiting_for_dependency"
     const approvalKind = observationKind === "approval" || typeof record.approvalId === "string" || block.id.startsWith("observation:approval:") || observationStatus === "waiting_for_approval"
-    if (waitKind && observationStatus !== null && ACTIVE_WAIT_STATUSES.has(observationStatus)) waits.push(observationId)
-    if (approvalKind && (observationStatus === null && observationKind === "approval" || observationStatus !== null && ACTIVE_APPROVAL_STATUSES.has(observationStatus))) approvals.push(observationId)
+    const stalePlanReferenceValue = stalePlanReference(record, planScope, currentGoalRevision)
+    if (waitKind && observationStatus !== null && ACTIVE_WAIT_STATUSES.has(observationStatus) && !stalePlanReferenceValue) waits.push(observationId)
+    if (approvalKind && (observationStatus === null && observationKind === "approval" || observationStatus !== null && ACTIVE_APPROVAL_STATUSES.has(observationStatus)) && !stalePlanReferenceValue) approvals.push(observationId)
     const isCompletionProposal = observationKind === "plan_control" && observationStatus === "completion_proposed"
     const planOwner = planOwnedObservationOwner({ id: block.id, content: record })
     const supersededPlan = planScope.kind === "known" && planOwner !== null && planOwner !== planScope.planCallId
@@ -147,7 +149,7 @@ export function buildCognitiveActionAgenda(context: StepContext, input: AgendaIn
     if (safeCompletion) completion.push(observationId)
     const replanCallId = observationKind === "plan_control" && observationStatus === "replan_required" ? replanSignalPlanCallId({ id: block.id, content: record }) : null
     const supersededReplan = planScope.kind === "known" && replanCallId !== null && replanCallId !== planScope.planCallId
-    if (observationStatus !== null && FAILURE_STATUSES.has(observationStatus) && !supersededPlanFailure || observationKind === "plan_control" && observationStatus !== null && observationStatus !== "completed" && observationStatus !== "completion_proposed" && !waitKind && !approvalKind && !supersededReplan) unresolved.push(observationId)
+    if (observationStatus !== null && FAILURE_STATUSES.has(observationStatus) && !supersededPlanFailure && !stalePlanReferenceValue || observationKind === "plan_control" && observationStatus !== null && observationStatus !== "completed" && observationStatus !== "completion_proposed" && !waitKind && !approvalKind && !supersededReplan) unresolved.push(observationId)
   }
   const pendingSet = signal(pending), approvalSet = signal(approvals), waitSet = signal(waits), unresolvedSet = signal(unresolved), completionSet = signal(completion)
   const control = plain(context.steeringMarkerControl) ? context.steeringMarkerControl : undefined
