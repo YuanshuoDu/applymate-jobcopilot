@@ -2,8 +2,9 @@
 
 import { useState } from 'react'
 import { MatchScoreRing, Divider } from '@/components/ui'
-import type { Job, ScoreResult, Suggestion } from '@/lib/types'
+import type { ApplicationAudit, Job, ScoreResult, Suggestion } from '@/lib/types'
 import { useI18n } from '@/lib/i18n'
+import { ResumeAuditCard } from '@/components/resume/ResumeAuditCard'
 
 function SectionHeader({ label, count, collapsed, onToggle }: {
   label: string; count?: number; collapsed: boolean; onToggle: () => void
@@ -31,7 +32,7 @@ const SEC_LABELS: Record<string, string> = {
 }
 const SEC_ORDER = ['Summary', 'Skills', 'Experience', 'Education', 'Projects']
 
-export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, suggesting, noJobSelected, onApplySuggestion, onAnalyze, onAddKeyword, onApplyTargeted, onEditSection, onRegenerateSection, regeneratingSection, currentSummary, currentSkills, contentChangedSinceAnalysis, onAudit }: {
+export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, suggesting, noJobSelected, onApplySuggestion, onAnalyze, onAddKeyword, onApplyTargeted, onEditSection, onRegenerateSection, regeneratingSection, currentSummary, currentSkills, contentChangedSinceAnalysis, applicationAudit, auditing, auditError, hasLinkedJob, hasCoverLetter, onAudit }: {
   selectedJob:       Job | null
   scoreResult:                  ScoreResult | null
   suggestions:                  Suggestion[]
@@ -48,6 +49,11 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
   currentSummary?:              string
   currentSkills?:               string[]
   contentChangedSinceAnalysis?: boolean
+  applicationAudit?:            ApplicationAudit | null
+  auditing?:                    boolean
+  auditError?:                  string | null
+  hasLinkedJob?:                boolean
+  hasCoverLetter?:              boolean
   onAudit?:                     () => void
 }) {
   const { t } = useI18n()
@@ -301,9 +307,14 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
           <span>{t('resume.linkJobToAnalyze')}</span>
         </div>
       )}
-      <button onClick={onAudit} style={{ width: '100%', marginTop: 14, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, fontSize: 11, color: 'var(--primary)', background: 'rgba(79,70,229,0.08)', border: '1px solid rgba(79,70,229,0.25)', borderRadius: 7, padding: '8px 10px', cursor: 'pointer', fontWeight: 600 }}>
-        ✓ {t('resume.auditSave')}
-      </button>
+      <ResumeAuditCard
+        audit={applicationAudit}
+        auditing={Boolean(auditing)}
+        auditError={auditError}
+        hasLinkedJob={hasLinkedJob ?? Boolean(hasJob)}
+        hasCoverLetter={Boolean(hasCoverLetter)}
+        onAudit={onAudit ?? (() => undefined)}
+      />
     </div>
   )
 }
