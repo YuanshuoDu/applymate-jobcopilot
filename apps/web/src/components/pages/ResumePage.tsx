@@ -109,14 +109,12 @@ import { CustomSection } from '@/components/resume/CustomSection'
 import { AiPanel } from '@/components/resume/AiPanel'
 import { PersonaPanel } from '@/components/resume/PersonaPanel'
 import { FinalConfirmDialog } from '@/components/resume/FinalConfirmDialog'
-import { ResumeAuditDialog } from '@/components/resume/ResumeAuditDialog'
 import { UploadResumeModal } from '@/components/resume/UploadResumeModal'
 import { ResumeIntakeDialog } from '@/components/resume/ResumeIntakeDialog'
 import type { DragHandleProps } from '@/components/resume/SectionHeader'
 import type { AiFieldContext } from '@/components/resume/AiFieldSuggestion'
 import { exportApplicationPackLocally } from '@/lib/bundle'
 import { downloadResumePdf } from '@/lib/resume-export'
-import { auditResume, type ResumeAuditResult } from '@/lib/resume-audit'
 import { analysisTargetKey, replaceSectionSuggestions, shouldPreserveAnalysis, shouldStartAutomaticAnalysis } from '@/lib/resume-analysis-state'
 
 const AI_SUGGESTION_SECTIONS = ['summary', 'skills', 'experience', 'education', 'projects'] as const
@@ -633,15 +631,23 @@ export function ResumePage() {
   const analysisEpochRef = useRef(0)
   const lastSyncedAuditRef = useRef<string | null>(null)
   const [latestApplicationAudit, setLatestApplicationAudit] = useState<StoredApplicationAudit | null>(null)
+  const [auditingApplication, setAuditingApplication] = useState(false)
+  const [auditError, setAuditError] = useState<string | null>(null)
+  const auditRunRef = useRef(false)
   const [latestSavedCoverLetter, setLatestSavedCoverLetter] = useState<CoverLetter | null>(null)
 
   const [showTemplates,   setShowTemplates]   = useState(false)
   const [showCoverLetter, setShowCoverLetter] = useState(false)
   const [showFinalConfirm, setShowFinalConfirm] = useState(false)
-  const [showResumeAudit, setShowResumeAudit] = useState(false)
   // Confirmation is scoped to a resume. A global boolean made the previously
   // confirmed resume look ready after the user selected a different version.
   const [applicationPackReadyResumeId, setApplicationPackReadyResumeId] = useState<string | null>(null)
+  useEffect(() => {
+    if (!dirty || !selectedResumeId) return
+    // Any edit invalidates the previously confirmed copy. The user must run
+    // the independent audit again before the application pack can be confirmed.
+    setApplicationPackReadyResumeId(previous => previous === selectedResumeId ? null : previous)
+  }, [dirty, selectedResumeId])
   const [exportedPackFolder, setExportedPackFolder] = useState<string | null>(null)
   const [showNewResume,   setShowNewResume]   = useState(false)
   const [renamingResume,  setRenamingResume]  = useState<ResumeListItem | null>(null)
@@ -1000,32 +1006,6 @@ export function ResumePage() {
     }
   }
 
-  async function saveAndAuditResume(): Promise<ResumeAuditResult | null> {
-    if (saving) { toast.info(t('resume.toastSaving'), t('resume.toastSavingDetail')); return null }
-    if (dirty && !(await handleSave())) return null
-    if (!latestContent.current) return null
-    // Reuse the same evidence-based Auditor whenever this resume is attached
-    // to a saved job. The cover letter is optional; the API audits the final
-    // resume alone when no cover letter exists.
-    if (resumeLinkedJob) {
-      const independent = await auditApplicationPack()
-      if (independent) {
-        return {
-          ready: independent.verdict === 'pass',
-          findings: independent.findings
-            .filter(finding => finding.area !== 'job_match')
-            .map((finding, index) => ({
-              id: `independent-${index}`,
-              severity: finding.severity === 'pass' ? 'pass' : 'attention',
-              title: finding.title,
-              detail: `${finding.evidence} ${finding.action}`,
-            })),
-        }
-      }
-    }
-    return auditResume({ ...latestContent.current, sectionOrder: latestSectionOrder.current })
-  }
-
   // Auto-save: 2 s debounce after any edit
   const autoSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   useEffect(() => {
@@ -1334,8 +1314,17 @@ export function ResumePage() {
   }
 
   async function auditApplicationPack(): Promise<ApplicationAudit | null> {
+    setAuditError(null)
     if (!selectedResumeId || !resumeLinkedJob) {
-      toast.info('Link a saved job first', 'Choose an opportunity in My Jobs before final confirmation')
+      const message = 'Link a saved job first'
+      setAuditError(message)
+      toast.info(message, 'Choose an opportunity in My Jobs before running the independent audit')
+      return null
+    }
+    if (saving) {
+      const message = t('resume.toastSaving')
+      setAuditError(message)
+      toast.info(message, t('resume.toastSavingDetail'))
       return null
     }
     if (dirty) {
@@ -1347,9 +1336,12 @@ export function ResumePage() {
       ...(finalCoverLetter ? { coverLetterId: finalCoverLetter.id } : {}),
     })
     if (!data || error) {
-      toast.error('Audit could not run', error ?? 'Please try again')
+      const message = error ?? 'Please try again'
+      setAuditError(message)
+      toast.error('Audit could not run', message)
       return null
     }
+    setAuditError(null)
     setLatestApplicationAudit({
       resumeId: selectedResumeId,
       coverLetterId: finalCoverLetter?.id ?? null,
@@ -1357,24 +1349,35 @@ export function ResumePage() {
       coverLetterUpdatedAt: data.coverLetterUpdatedAt ?? finalCoverLetter?.updatedAt,
       audit: data,
     })
+    // Keep the Resume page in sync without replacing unrelated AI suggestions
+    // or re-triggering a full analysis. Re-auditing also removes stale audit
+    // suggestions after the candidate has corrected the flagged material.
+    const baseSuggestions = suggestions.filter(suggestion => !suggestion.text.startsWith(AUDIT_SUGGESTION_PREFIX))
+    const syncedSuggestions = data.verdict === 'pass' ? baseSuggestions : [...baseSuggestions, ...toAuditSuggestions(data)]
+    setSuggestions(syncedSuggestions)
+    saveCache({
+      resumeId: selectedResumeId,
+      jobId: resumeLinkedJob.id,
+      resumeUpdatedAt: data.resumeUpdatedAt ?? selectedResumeUpdatedAt,
+      score: scoreResult,
+      suggs: syncedSuggestions,
+    })
     if (data.verdict !== 'pass') {
-      // Keep the manually opened Resume page in sync with the Auditor. These
-      // suggestions are scoped to this exact resume + job pair, so they never
-      // leak into another role or resume version.
-      const auditSuggestions = toAuditSuggestions(data)
-      if (auditSuggestions.length) {
-        setSuggestions(auditSuggestions)
-        saveCache({
-          resumeId: selectedResumeId,
-          jobId: resumeLinkedJob.id,
-          resumeUpdatedAt: selectedResumeUpdatedAt,
-          score: scoreResult,
-          suggs: auditSuggestions,
-        })
-      }
       toast.warning('Audit needs revision', `${data.summary} Suggestions have been refreshed in Resume.`)
     }
     return data
+  }
+
+  async function runResumeAudit() {
+    if (auditRunRef.current) return
+    auditRunRef.current = true
+    setAuditingApplication(true)
+    try {
+      await auditApplicationPack()
+    } finally {
+      auditRunRef.current = false
+      setAuditingApplication(false)
+    }
   }
 
   async function confirmApplicationPack(audit: ApplicationAudit): Promise<boolean> {
@@ -1861,7 +1864,12 @@ export function ResumePage() {
             currentSummary={content?.summary}
             currentSkills={content?.skills}
             contentChangedSinceAnalysis={contentChangedSinceAnalysis}
-            onAudit={() => { if (!content) { toast.info('Select a resume first'); return }; setShowResumeAudit(true) }}
+            applicationAudit={currentApplicationAudit}
+            auditing={auditingApplication}
+            auditError={auditError}
+            hasLinkedJob={Boolean(resumeLinkedJob)}
+            hasCoverLetter={Boolean(finalCoverLetter)}
+            onAudit={() => { if (!content) { toast.info('Select a resume first'); return }; void runResumeAudit() }}
           />
           </>}
           </aside>
@@ -1954,13 +1962,15 @@ export function ResumePage() {
             if (selectedJobId) { void linkResumeToJob(selectedJobId); return }
             toast.info('Link a saved job', 'Choose a job in the Linked opportunity panel')
           }}
-          onAudit={auditApplicationPack}
+          onReviewAudit={() => {
+            setShowFinalConfirm(false)
+            window.setTimeout(() => document.querySelector<HTMLElement>('[data-resume-audit-card]')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 0)
+          }}
           onConfirm={confirmApplicationPack}
           onDownload={downloadApplicationPack}
           exportedPackFolder={exportedPackFolder}
         />
       )}
-      {showResumeAudit && <ResumeAuditDialog resumeName={resumeName} onClose={() => setShowResumeAudit(false)} onSaveAndAudit={saveAndAuditResume} />}
       {renamingResume && <RenameResumeModal resume={renamingResume} onClose={() => setRenamingResume(null)} onRename={name => handleRenameResume(renamingResume, name)} />}
       {showUploadModal && (
         <UploadResumeModal onClose={() => setShowUploadModal(false)} onImport={handleImportResume} />

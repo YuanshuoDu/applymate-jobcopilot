@@ -36,7 +36,7 @@ function renderDialog(initialAudit: ApplicationAudit | null, coverLetterContent:
       onReviewSuggestions={vi.fn()}
       onCreateCoverLetter={vi.fn()}
       onLinkJob={vi.fn()}
-      onAudit={vi.fn().mockResolvedValue(audit)}
+      onReviewAudit={vi.fn()}
       onConfirm={vi.fn().mockResolvedValue(true)}
       onDownload={vi.fn().mockResolvedValue(undefined)}
       exportedPackFolder={null}
@@ -52,18 +52,20 @@ describe('FinalConfirmDialog audit state', () => {
     expect(markup).not.toContain('Compares the final resume and cover letter')
   })
 
-  it('keeps the Needs review status as a direct independent-audit action', async () => {
+  it('routes unresolved audits back to Resume instead of running a second audit here', async () => {
     const source = await import('node:fs').then(fs => fs.readFileSync(new URL('./FinalConfirmDialog.tsx', import.meta.url), 'utf8'))
 
     expect(source).toContain('className="final-confirm-status-action"')
-    expect(source).toContain('onClick={() => void runAudit()}')
+    expect(source).toContain('onClick={onReviewAudit}')
+    expect(source).not.toContain('onAudit: () => Promise<ApplicationAudit | null>')
+    expect(source).not.toContain('async function runAudit()')
   })
 
   it('treats a missing cover letter as optional in final confirmation', () => {
     const markup = renderDialog(null, null)
 
     expect(markup).toContain('Optional — no cover letter selected')
-    expect(markup).toContain('Reviews the final resume against the pre-tailoring resume')
+    expect(markup).toContain('Run the independent audit from Resume before final confirmation.')
     expect(markup).not.toContain('Select a final cover letter made for this resume version before confirming')
   })
 })
