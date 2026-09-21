@@ -2624,3 +2624,17 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused Worker validation passed **3 files / 39 tests** across `plan-revision-scope`, `cognitive-control-frame`, and `cognitive-action-agenda`; Worker `tsc --noEmit --skipLibCheck`, `git diff --check`, and the source-file-under-250-lines check passed. No schema, migration, Web, provider, queue, or dependency change was introduced.
 
 **Candidate boundary:** No production Neon/Postgres/RLS, Redis/BullMQ, process restart, provider/model, browser/CloakBrowser, deployment, or legacy→V2 semantic cutover validation was run. The legacy diagnostic taxonomy remains a future follow-up/no-op; P8-50 does not claim that legacy→V2 semantic cutover is fixed. P8-50 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## 137. P8-51 — Stale plan active-signal fencing
+
+**Candidate status/date (2026-09-21):** P8-51 is recorded as a candidate Worker stale-plan active-signal fencing slice; formal acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Goal:** Prevent stale plan-owned failures and completion proposals from remaining actionable after a newer plan is accepted, while preserving historical observations and fail-closed behavior for ambiguous signals.
+
+**Implementation:** Commit `43c7daa7` adds plan ownership parsing for `plan-result`, `plan-control`, and `plan-error` observations. `cognitive-control-frame` and `cognitive-action-agenda` suppress stale plan-owned `failed`, `interrupted`, and `cancelled` signals and stale `completion_proposed` signals when a newer plan is current. Unknown, duplicate, gap, legacy, and unowned observations remain active blockers.
+
+**Independent verification:** Focused Worker validation passed **4 suites / 73 tests**, including `cognitive-memory-recall`; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Source line bounds were checked: `plan-revision-scope` 86, `cognitive-control-frame` 229, and `cognitive-action-agenda` 186 lines. No schema, migration, Web, provider, queue, or dependency change was introduced.
+
+**Candidate boundary:** No production Neon/Postgres/RLS, Redis/BullMQ, process restart, provider/model, browser/CloakBrowser, deployment, or legacy→V2 semantic cutover validation was run. P8-51 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+**Follow-up P8-52:** Fence same-goal references from an older plan in context-memory recall and active wait/approval signals; this has been audited but is not implemented yet.

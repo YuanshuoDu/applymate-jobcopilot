@@ -825,3 +825,13 @@ Goal: scope canonical `replan_required` blockers to the current accepted plan so
 Commit `4daf02e7` adds a shared plan-revision-scope helper that derives the latest `planCallId` from the current goal's contiguous accepted plan revisions. During active-signal classification only, `cognitive-control-frame` and `action-agenda` ignore a canonical `replan_required` blocker superseded by a newer plan; the current blocker remains active, while duplicate, gap, unknown, and legacy cases remain fail-closed blockers.
 
 Focused Worker validation passed **3 files / 39 tests** across `plan-revision-scope`, `cognitive-control-frame`, and `cognitive-action-agenda`; Worker `tsc --noEmit --skipLibCheck`, `git diff --check`, and the source-file-under-250-lines check passed. No schema, migration, Web, provider, queue, or dependency change was introduced. Production Neon/Postgres/RLS, Redis/BullMQ delivery, process restart, provider/model, browser/CloakBrowser, deployment, and legacy→V2 semantic cutover evidence remain unverified. The legacy diagnostic taxonomy remains a future follow-up/no-op; this slice does not claim that legacy→V2 semantic cutover is fixed. Formal acceptance remains **P0 accepted 1/8 (12.5%)**; P8-50 is a candidate increment.
+
+## P8-51 update
+
+Goal: prevent stale plan-owned failures and completion proposals from remaining actionable after a newer plan is accepted, while preserving historical observations and fail-closed handling for ambiguous signals.
+
+Commit `43c7daa7` adds plan ownership parsing for `plan-result`, `plan-control`, and `plan-error` observations. `cognitive-control-frame` and `cognitive-action-agenda` suppress stale plan-owned `failed`, `interrupted`, and `cancelled` signals and stale `completion_proposed` signals when a newer plan is current. Unknown, duplicate, gap, legacy, and unowned observations remain active blockers.
+
+Focused Worker validation passed **4 suites / 73 tests**, including `cognitive-memory-recall`; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Source line bounds were checked: `plan-revision-scope` 86, `cognitive-control-frame` 229, and `cognitive-action-agenda` 186 lines. No schema, migration, Web, provider, queue, or dependency change was introduced. Production Neon/Postgres/RLS, Redis/BullMQ delivery, process restart, provider/model, browser/CloakBrowser, deployment, and legacy→V2 semantic cutover evidence remain unverified. Formal acceptance remains **P0 accepted 1/8 (12.5%)**; P8-51 is a candidate increment.
+
+Follow-up P8-52: fence same-goal references from an older plan in context-memory recall and active wait/approval signals; this has been audited but is not implemented yet.
