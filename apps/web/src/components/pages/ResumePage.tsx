@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { useI18n } from '@/lib/i18n'
 import { useNav } from '@/lib/nav-context'
-import { FileDown, FileText, History, LayoutTemplate, Plus, ShieldCheck, Upload } from 'lucide-react'
+import { Eye, FileDown, FileText, History, LayoutTemplate, Plus, ShieldCheck, Type, Upload } from 'lucide-react'
 import './ResumePage.css'
 
 // Analysis cache is keyed by resume + job so switching versions never discards a
@@ -1663,6 +1663,28 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
 
   // ── Render ────────────────────────────────────────────────────────────────
 
+  const formatTools: Array<{ key: string; label: string; title: string; group: 'emphasis' | 'structure'; wrap: [string, string]; style?: React.CSSProperties }> = [
+    { key: 'B', label: 'B', title: 'Bold', group: 'emphasis', wrap: ['**', '**'], style: { fontWeight: 700 } },
+    { key: 'I', label: 'I', title: 'Italic', group: 'emphasis', wrap: ['_', '_'], style: { fontStyle: 'italic' } },
+    { key: 'U', label: 'U', title: 'Underline', group: 'emphasis', wrap: ['<u>', '</u>'], style: { textDecoration: 'underline' } },
+    { key: 'H1', label: 'H1', title: 'Heading 1', group: 'structure', wrap: ['# ', ''] },
+    { key: 'H2', label: 'H2', title: 'Heading 2', group: 'structure', wrap: ['## ', ''] },
+    { key: '•', label: '•', title: 'Bullet point', group: 'structure', wrap: ['• ', ''] },
+  ]
+
+  const renderFormatTools = (group: 'emphasis' | 'structure') => formatTools.filter(tool => tool.group === group).map(tool => (
+    <button
+      key={tool.key}
+      className={`resume-format-button resume-format-button-${tool.key === '•' ? 'bullet' : tool.key.toLowerCase()}`}
+      onClick={() => applyFormat(tool.wrap)}
+      title={tool.title}
+      aria-label={tool.title}
+      style={tool.style}
+    >
+      {tool.label}
+    </button>
+  ))
+
   return (
     <div className="resume-library-page" style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
       <ConfirmDialog />
@@ -1788,11 +1810,20 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
               </div>
             )}
             <div className="resume-workspace-head">
-              <div>
-                <h2>{resumeName}<span>{selectedResume?.kind === 'adapted' ? t('resume.tailoredVersion') : t('resume.editor')}</span></h2>
+              <div className="resume-workspace-title-copy">
+                <div className="resume-workspace-eyebrow">
+                  <span className="resume-workspace-eyebrow-icon"><FileText size={12} aria-hidden="true" /></span>
+                  <span>{t('resume.editor')}</span>
+                </div>
+                <div className="resume-workspace-name-row">
+                  <h2>{resumeName}</h2>
+                  {selectedResume?.kind === 'adapted' && <span className="resume-workspace-version-chip">{t('resume.tailoredVersion')}</span>}
+                  {selectedResume?.isDefault && <span className="resume-workspace-version-chip is-default">{t('resume.default')}</span>}
+                </div>
               </div>
               <div className="resume-workspace-actions">
-                <button onClick={() => setPreviewMode(value => !value)}>
+                <button className="resume-workspace-preview-button" onClick={() => setPreviewMode(value => !value)} aria-pressed={previewMode}>
+                  <Eye size={14} aria-hidden="true" />
                   {previewMode ? 'Edit resume' : 'Preview'}
                 </button>
               </div>
@@ -1803,21 +1834,25 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
             {!previewMode && (<>
 
             {/* Format toolbar */}
-            <div style={{ display: 'flex', gap: 4, marginBottom: 12, padding: '6px 10px', background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-              {([
-                { key: 'B', label: 'B', title: 'Bold', wrap: ['**', '**'] as [string,string], style: { fontWeight: 700 } },
-                { key: 'I', label: 'I', title: 'Italic', wrap: ['_', '_'] as [string,string], style: { fontStyle: 'italic' as const } },
-                { key: 'U', label: 'U', title: 'Underline', wrap: ['<u>', '</u>'] as [string,string], style: { textDecoration: 'underline' as const } },
-                { key: 'H1', label: 'H1', title: 'Heading 1', wrap: ['# ', ''] as [string,string], style: {} },
-                { key: 'H2', label: 'H2', title: 'Heading 2', wrap: ['## ', ''] as [string,string], style: {} },
-                { key: '•', label: '•', title: 'Bullet point', wrap: ['• ', ''] as [string,string], style: {} },
-              ]).map(f => (
-                <button key={f.key} onClick={() => applyFormat(f.wrap)} title={f.title} style={{
-                  width: f.key.length > 1 ? 'auto' : 26, height: 26, padding: f.key.length > 1 ? '0 8px' : 0,
-                  borderRadius: 4, border: '0.5px solid var(--border)', background: 'var(--bg-secondary)',
-                  fontSize: 11, cursor: 'pointer', color: 'var(--text)', ...f.style,
-                }}>{f.label}</button>
-              ))}
+            <div className="resume-format-toolbar" role="toolbar" aria-label="Resume formatting tools">
+              <div className="resume-format-toolbar-title">
+                <span className="resume-format-toolbar-icon"><Type size={14} aria-hidden="true" /></span>
+                <span className="resume-format-toolbar-copy">
+                  <strong>Format text</strong>
+                  <small>Select text in the resume first</small>
+                </span>
+              </div>
+              <div className="resume-format-toolbar-groups">
+                <div className="resume-format-group" role="group" aria-label="Text emphasis">
+                  <span className="resume-format-group-label">Text</span>
+                  {renderFormatTools('emphasis')}
+                </div>
+                <span className="resume-format-toolbar-divider" aria-hidden="true" />
+                <div className="resume-format-group" role="group" aria-label="Text structure">
+                  <span className="resume-format-group-label">Structure</span>
+                  {renderFormatTools('structure')}
+                </div>
+              </div>
             </div>
 
             {/* Completeness bar */}
