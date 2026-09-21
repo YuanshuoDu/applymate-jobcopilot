@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { useI18n } from '@/lib/i18n'
 import { useNav } from '@/lib/nav-context'
-import { FileDown, FileText, History, LayoutTemplate, PanelLeftClose, PanelLeftOpen, Plus, ShieldCheck, Upload } from 'lucide-react'
+import { FileDown, FileText, History, LayoutTemplate, Plus, ShieldCheck, Upload } from 'lucide-react'
 import './ResumePage.css'
 
 // Analysis cache is keyed by resume + job so switching versions never discards a
@@ -135,8 +135,15 @@ const EMPTY_CONTENT: ResumeContent = {
 const DEFAULT_ORDER = ['summary', 'experience', 'skills', 'education', 'languages']
 const AI_PANEL_MIN_WIDTH = 280
 const AI_PANEL_MAX_WIDTH = 520
-const AI_PANEL_DEFAULT_WIDTH = 340
+const AI_PANEL_LEGACY_DEFAULT_WIDTH = 340
+const AI_PANEL_DEFAULT_WIDTH = 380
 const AI_PANEL_WIDTH_STORAGE_KEY = 'applymate_resume_ai_panel_width'
+const RESUME_LIBRARY_MIN_WIDTH = 190
+const RESUME_LIBRARY_MAX_WIDTH = 320
+const RESUME_LIBRARY_DEFAULT_WIDTH = 230
+const RESUME_LIBRARY_COLLAPSED_WIDTH = 54
+const RESUME_LIBRARY_COLLAPSE_THRESHOLD = 155
+const MAIN_NAV_COLLAPSE_DRAG_DISTANCE = 72
 
 const ADDABLE_SECTIONS = [
   { id: 'summary',          label: 'Summary' },
@@ -292,6 +299,7 @@ function AddDirectionDialog({ onClose, onCreate }: {
 
 // ── ResumePreview (page-aware preview panel) ──────────────────────────────────
 
+const A4_W = 794 // px at 96 dpi
 const A4_H = 1123 // px at 96 dpi
 
 type PageFit =
@@ -334,7 +342,7 @@ function ResumePreview({ content, templateId, templateOptions }: {
   const isTwoPage = fit?.type === 'two-page' || fit?.type === 'too-long'
 
   return (
-    <div style={{ maxWidth: 794, margin: '0 auto' }}>
+    <div style={{ maxWidth: A4_W, margin: '0 auto' }}>
 
       {/* Status bar */}
       {fit && (
@@ -566,7 +574,12 @@ function ResumeLibraryPanel({
 
 // ── ResumePage ────────────────────────────────────────────────────────────────
 
-export function ResumePage() {
+interface ResumePageProps {
+  sidebarCollapsed?: boolean
+  onToggleSidebar?: () => void
+}
+
+export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: ResumePageProps) {
   const { navigate } = useNav()
   const [returnToJobs] = useState(() => new URLSearchParams(window.location.search).get('returnToJobs') === '1')
   const [returnJobId] = useState(() => new URLSearchParams(window.location.search).get('returnJobId'))
@@ -584,6 +597,15 @@ export function ResumePage() {
     if (requested) setSelectedResumeId(requested)
   }, [])
   const [libraryCollapsed, setLibraryCollapsed] = useState(false)
+  const [libraryWidth, setLibraryWidth] = useState(RESUME_LIBRARY_DEFAULT_WIDTH)
+  const [libraryResizing, setLibraryResizing] = useState(false)
+  const libraryResizeStart = useRef<{
+    pointerId: number
+    startX: number
+    startWidth: number
+    wasCollapsed: boolean
+    sidebarToggleSent: boolean
+  } | null>(null)
   const [aiPanelWidth, setAiPanelWidth] = useState(AI_PANEL_DEFAULT_WIDTH)
   const [aiPanelResizing, setAiPanelResizing] = useState(false)
   const aiPanelResizeStart = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null)
@@ -675,7 +697,8 @@ export function ResumePage() {
       const storedValue = window.localStorage.getItem(AI_PANEL_WIDTH_STORAGE_KEY)
       const storedWidth = storedValue === null ? NaN : Number(storedValue)
       if (Number.isFinite(storedWidth)) {
-        setAiPanelWidth(Math.min(AI_PANEL_MAX_WIDTH, Math.max(AI_PANEL_MIN_WIDTH, storedWidth)))
+        const migratedWidth = storedWidth === AI_PANEL_LEGACY_DEFAULT_WIDTH ? AI_PANEL_DEFAULT_WIDTH : storedWidth
+        setAiPanelWidth(Math.min(AI_PANEL_MAX_WIDTH, Math.max(AI_PANEL_MIN_WIDTH, migratedWidth)))
       }
     } catch { /* localStorage may be unavailable in private browsing */ }
   }, [])
@@ -685,7 +708,7 @@ export function ResumePage() {
   }, [aiPanelWidth])
 
   useEffect(() => {
-    if (!aiPanelResizing) return
+    if (!aiPanelResizing && !libraryResizing) return
     const previousUserSelect = document.body.style.userSelect
     const previousCursor = document.body.style.cursor
     document.body.style.userSelect = 'none'
@@ -694,7 +717,7 @@ export function ResumePage() {
       document.body.style.userSelect = previousUserSelect
       document.body.style.cursor = previousCursor
     }
-  }, [aiPanelResizing])
+  }, [aiPanelResizing, libraryResizing])
 
   function updateAiPanelWidth(clientX: number) {
     const start = aiPanelResizeStart.current
@@ -738,6 +761,92 @@ export function ResumePage() {
     if (nextWidth === null) return
     event.preventDefault()
     setAiPanelWidth(Math.min(AI_PANEL_MAX_WIDTH, Math.max(AI_PANEL_MIN_WIDTH, nextWidth)))
+  }
+
+  function clampLibraryWidth(width: number) {
+    return Math.min(RESUME_LIBRARY_MAX_WIDTH, Math.max(RESUME_LIBRARY_MIN_WIDTH, width))
+  }
+
+  function triggerSidebarCollapse(start: NonNullable<typeof libraryResizeStart.current>) {
+    if (sidebarCollapsed || start.sidebarToggleSent || !onToggleSidebar) return
+    start.sidebarToggleSent = true
+    onToggleSidebar()
+  }
+
+  function updateLibraryWidth(clientX: number) {
+    const start = libraryResizeStart.current
+    if (!start) return
+    const deltaX = clientX - start.startX
+    const dragLeft = Math.max(0, -deltaX)
+
+    if (start.wasCollapsed) {
+      if (deltaX >= 28) {
+        setLibraryCollapsed(false)
+        setLibraryWidth(clampLibraryWidth(RESUME_LIBRARY_DEFAULT_WIDTH + deltaX))
+      } else if (dragLeft >= MAIN_NAV_COLLAPSE_DRAG_DISTANCE) {
+        triggerSidebarCollapse(start)
+      }
+      return
+    }
+
+    const nextWidth = start.startWidth + deltaX
+    if (nextWidth <= RESUME_LIBRARY_COLLAPSE_THRESHOLD) {
+      setLibraryCollapsed(true)
+      if (dragLeft >= start.startWidth - RESUME_LIBRARY_COLLAPSE_THRESHOLD + MAIN_NAV_COLLAPSE_DRAG_DISTANCE) {
+        triggerSidebarCollapse(start)
+      }
+      return
+    }
+
+    setLibraryWidth(clampLibraryWidth(nextWidth))
+  }
+
+  function handleLibraryResizeStart(event: React.PointerEvent<HTMLDivElement>) {
+    if (window.matchMedia('(max-width: 960px)').matches) return
+    event.preventDefault()
+    event.currentTarget.setPointerCapture(event.pointerId)
+    libraryResizeStart.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startWidth: libraryCollapsed ? RESUME_LIBRARY_COLLAPSED_WIDTH : libraryWidth,
+      wasCollapsed: libraryCollapsed,
+      sidebarToggleSent: false,
+    }
+    setLibraryResizing(true)
+  }
+
+  function handleLibraryResizeMove(event: React.PointerEvent<HTMLDivElement>) {
+    if (libraryResizeStart.current?.pointerId !== event.pointerId) return
+    updateLibraryWidth(event.clientX)
+  }
+
+  function handleLibraryResizeEnd(event: React.PointerEvent<HTMLDivElement>) {
+    if (libraryResizeStart.current?.pointerId !== event.pointerId) return
+    libraryResizeStart.current = null
+    setLibraryResizing(false)
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
+  }
+
+  function handleLibraryResizeKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
+    const step = event.shiftKey ? 40 : 16
+    const current = libraryCollapsed ? RESUME_LIBRARY_COLLAPSED_WIDTH : libraryWidth
+    const nextWidth = event.key === 'ArrowLeft'
+      ? current - step
+      : event.key === 'ArrowRight'
+        ? current + step
+        : event.key === 'Home'
+          ? RESUME_LIBRARY_COLLAPSED_WIDTH
+          : event.key === 'End'
+            ? RESUME_LIBRARY_MAX_WIDTH
+            : null
+    if (nextWidth === null) return
+    event.preventDefault()
+    if (nextWidth <= RESUME_LIBRARY_COLLAPSE_THRESHOLD) {
+      setLibraryCollapsed(true)
+      return
+    }
+    setLibraryCollapsed(false)
+    setLibraryWidth(clampLibraryWidth(nextWidth))
   }
 
   // Section ordering
@@ -1721,13 +1830,10 @@ export function ResumePage() {
         </div>
       ) : (
         <div
-          className={`resume-library-layout${libraryCollapsed ? ' is-library-collapsed' : ''}${aiPanelResizing ? ' is-ai-panel-resizing' : ''}`}
-          style={{ '--resume-ai-width': `${aiPanelWidth}px`, flex: 1, display: 'flex', overflow: 'hidden', background: 'var(--bg-tertiary)' } as React.CSSProperties}
+          className={`resume-library-layout${libraryCollapsed ? ' is-library-collapsed' : ''}${libraryResizing ? ' is-library-resizing' : ''}${aiPanelResizing ? ' is-ai-panel-resizing' : ''}`}
+          style={{ '--resume-library-width': `${libraryCollapsed ? RESUME_LIBRARY_COLLAPSED_WIDTH : libraryWidth}px`, '--resume-ai-width': `${aiPanelWidth}px`, flex: 1, display: 'flex', overflow: 'hidden', background: 'var(--bg-tertiary)' } as React.CSSProperties}
         >
           <aside className="resume-library-sidebar">
-            <button className="resume-library-collapse" onClick={() => setLibraryCollapsed(value => !value)} aria-label={libraryCollapsed ? 'Show resume library' : 'Hide resume library'}>
-              {libraryCollapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
-            </button>
             {libraryCollapsed ? (
               <div className="resume-library-collapsed-list" aria-label={t('resume.thumbnails')}>
                 {filteredResumes.map(resume => {
@@ -1779,6 +1885,23 @@ export function ResumePage() {
             </div>
             </>}
           </aside>
+          <div
+            className="resume-library-resize-handle"
+            role="separator"
+            aria-label={t('resume.resizeLibrary')}
+            aria-orientation="vertical"
+            aria-valuemin={RESUME_LIBRARY_COLLAPSED_WIDTH}
+            aria-valuemax={RESUME_LIBRARY_MAX_WIDTH}
+            aria-valuenow={libraryCollapsed ? RESUME_LIBRARY_COLLAPSED_WIDTH : libraryWidth}
+            tabIndex={0}
+            onPointerDown={handleLibraryResizeStart}
+            onPointerMove={handleLibraryResizeMove}
+            onPointerUp={handleLibraryResizeEnd}
+            onPointerCancel={handleLibraryResizeEnd}
+            onKeyDown={handleLibraryResizeKeyDown}
+          >
+            <span aria-hidden="true" />
+          </div>
           <div className="resume-workspace" data-resume-editor style={{ flex: 1, overflowY: 'auto', padding: 24 }}>
             {/* Empty-state banner: no directions set up */}
             {directions.length === 0 && (
@@ -1829,7 +1952,7 @@ export function ResumePage() {
             <CompletenessBar content={content} />
 
             {/* Resume paper */}
-            <div className="resume-paper" style={{ maxWidth: 680, margin: '0 auto', background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 10, padding: '32px 36px' }}>
+            <div className="resume-paper" style={{ margin: '0 auto', background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 10, padding: '32px 36px' }}>
               {/* Contact (fixed, not draggable) */}
               <ContactSection
                 contact={content.contact}

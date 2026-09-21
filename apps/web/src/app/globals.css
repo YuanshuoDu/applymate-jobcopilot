@@ -155,9 +155,14 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  position: relative;
 }
 
 .app-sidebar-toggle {
+  position: absolute;
+  top: 16px;
+  right: -14px;
+  z-index: 20;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -168,7 +173,8 @@ body {
   border: 1px solid var(--border);
   border-radius: 7px;
   color: var(--text-muted);
-  background: transparent;
+  background: var(--bg);
+  box-shadow: 0 3px 10px rgba(31, 27, 84, 0.10);
   cursor: pointer;
 }
 
@@ -184,8 +190,7 @@ body {
 }
 
 .app-sidebar.is-collapsed .app-sidebar-header {
-  flex-direction: column;
-  padding: 12px 8px 10px !important;
+  padding: 18px 8px 14px !important;
 }
 
 .app-sidebar.is-collapsed .app-sidebar-header > div:first-child {
@@ -228,6 +233,43 @@ body {
 
 .app-sidebar.is-collapsed .app-sidebar-account-button > svg {
   display: none;
+}
+
+.app-sidebar-account-area {
+  position: relative;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+
+.app-sidebar-account-menu {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 8px);
+  z-index: 110;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg);
+  box-shadow: 0 16px 36px rgba(15, 23, 42, 0.16);
+}
+
+.app-sidebar-account-menu-item {
+  white-space: nowrap;
+}
+
+.app-sidebar-account-menu-item > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-sidebar.is-collapsed .app-sidebar-account-menu {
+  left: calc(100% + 10px);
+  right: auto;
+  width: 228px;
+  max-width: calc(100vw - 84px);
 }
 
 .app-nav-button {
