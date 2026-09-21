@@ -871,3 +871,11 @@ Commit `e01364f0` requires pipeline tool `callInput` to be a plain JSON object. 
 Root focused Worker validation passed **7/7 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. The executor is 129 lines. No schema, migration, Web, queue, dependency, or provider change was introduced. Production Neon/Postgres/RLS, Redis/BullMQ delivery, process restart, provider/model, browser/CloakBrowser, deployment, and legacy→V2 semantic cutover evidence remain unverified. Formal acceptance remains **P0 accepted 1/8 (12.5%)**; P8-55 is a candidate increment.
 
 Possible follow-up P8-56: audit canonical wait/approval metadata propagation; this is only an audit item and is not implemented.
+
+## P8-56 update
+
+Goal: make canonical durable wait replay recover the current plan metadata from a unique `plan.command` join scoped by `plan.revision`, while retaining the existing fail-open compatibility behavior for old, conflicting, and legacy waits.
+
+Commit `cd841319` supplements canonical durable wait replay with metadata from the unique `plan.command` and `plan.revision` scope. The current plan remains current; old, conflicting, and legacy wait records preserve their existing compatibility behavior.
+
+Focused Worker validation passed **3 files / 58 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Approval, schema, and legacy pipeline behavior were not changed. Production Neon/Postgres/RLS, Redis/BullMQ delivery, process restart, provider/model, browser/CloakBrowser, deployment, and legacy→V2 semantic cutover evidence remain unverified. Formal acceptance remains **P0 accepted 1/8 (12.5%)**; P8-56 is a candidate increment.

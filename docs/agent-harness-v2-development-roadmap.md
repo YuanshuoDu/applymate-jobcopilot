@@ -2690,3 +2690,15 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Candidate boundary:** No production Neon/Postgres/RLS, Redis/BullMQ, process restart, provider/model, browser/CloakBrowser, deployment, or legacy→V2 semantic cutover validation was run. P8-55 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
 
 **Possible follow-up P8-56:** Audit canonical wait/approval metadata propagation; this is only an audit item and is not implemented.
+
+## 142. P8-56 — Canonical durable wait replay metadata
+
+**Candidate status/date (2026-09-21):** P8-56 is recorded as a candidate Worker canonical durable-wait replay metadata slice; formal acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Goal:** Make canonical durable wait replay recover the current plan metadata from a unique `plan.command` join scoped by `plan.revision`, while retaining the existing fail-open compatibility behavior for old, conflicting, and legacy waits.
+
+**Implementation:** Commit `cd841319` supplements canonical durable wait replay with metadata from the unique `plan.command` and `plan.revision` scope. The current plan remains current; old, conflicting, and legacy wait records preserve their existing compatibility behavior.
+
+**Independent verification:** Focused Worker validation passed **3 files / 58 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Approval, schema, and legacy pipeline behavior were not changed.
+
+**Candidate boundary:** No production Neon/Postgres/RLS, Redis/BullMQ, process restart, provider/model, browser/CloakBrowser, deployment, or legacy→V2 semantic cutover validation was run. P8-56 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
