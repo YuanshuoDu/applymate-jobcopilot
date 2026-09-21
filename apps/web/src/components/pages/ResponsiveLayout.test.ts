@@ -57,4 +57,14 @@ describe('tablet and phone layout safeguards', () => {
     expect(resumeCss).toMatch(/\.resume-library-item\s*\{[\s\S]*border:\s*1px solid var\(--border\)/)
     expect(resumeCss).toMatch(/\.resume-library-item\.is-selected\s*\{[\s\S]*border-width:\s*1px !important/)
   })
+
+  it('gives the resume editor title and formatting toolkit a clear hierarchy', () => {
+    expect(resumePageSource).toContain('className="resume-workspace-title-copy"')
+    expect(resumePageSource).toContain('className="resume-format-toolbar"')
+    expect(resumePageSource).toContain('role="toolbar"')
+    expect(resumePageSource).toContain('aria-label={tool.title}')
+    expect(resumeCss).toMatch(/\.resume-workspace-title-copy\s*\{[\s\S]*display:\s*grid/)
+    expect(resumeCss).toMatch(/\.resume-format-toolbar\s*\{[\s\S]*display:\s*flex/)
+    expect(resumeCss).toMatch(/\.resume-format-group\s*\{[\s\S]*border:/)
+  })
 })
