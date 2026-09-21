@@ -2588,3 +2588,15 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused Worker validation passed **31/31 tests**; Worker `tsc --noEmit --skipLibCheck` passed. No schema, migration, Web, provider, queue, or dependency change was introduced.
 
 **Candidate boundary:** No live PostgreSQL/RLS transaction race, Redis/BullMQ delivery, process restart, provider/model call, browser, deployment, or complete goal-to-plan-to-replay production evidence was run. The legacy diagnostic taxonomy remains a future follow-up/no-op; P8-47 does not claim that legacy→V2 split-brain behavior is fixed. P8-47 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## 134. P8-48 — Context-memory goal-revision fence
+
+**Candidate status/date (2026-09-21):** P8-48 is recorded as a candidate Worker context-memory consistency slice; formal acceptance remains **P0 accepted 1/8 (12.5%)**, unchanged by this slice.
+
+**Goal:** Prevent context-memory projection, schema validation, and recall from carrying stale references across goal revisions while preserving legacy references and current-goal narrative filtering.
+
+**Implementation:** Commit `f63ab7ce` applies the expected goal revision across context-memory projection, schema validation, and recall. Stale goal-scoped references in waits, approvals, unresolved items, events, artifacts, tasks, evidence, and related reference collections are dropped; future goal references fail closed. Legacy references without `goalRevision` remain readable, and narrative decisions/unresolved questions continue to be filtered by the current goal.
+
+**Independent verification:** Focused Worker validation passed **3 files / 32 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No database migration, Web, provider, queue, or dependency change was introduced.
+
+**Candidate boundary:** No production Neon/Postgres/RLS, Redis/BullMQ, process restart, provider/model, browser/CloakBrowser, deployment, or legacy→V2 semantic cutover validation was run. The legacy diagnostic taxonomy remains a future follow-up/no-op; P8-48 does not claim that legacy→V2 semantic cutover is fixed. P8-48 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.

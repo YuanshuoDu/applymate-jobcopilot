@@ -801,3 +801,11 @@ Goal: prevent a persisted `plan.command` receipt belonging to another plan from 
 Commit `6a1550f1` scopes restored plan-command receipts and action counting to the current plan IDs or accepted plan revisions. Foreign `planCallId` values are omitted, while revision-one receipts remain compatible when no accepted revision metadata exists; stored events are not rewritten.
 
 Focused Worker validation passed **31/31 tests**; Worker `tsc --noEmit --skipLibCheck` passed. No schema, migration, Web, provider, queue, or dependency change was introduced. Live PostgreSQL/RLS races, Redis/BullMQ delivery, process restart, provider/model, browser, deployment, and complete goal-to-plan-to-replay production evidence remain unverified. The legacy diagnostic taxonomy remains a future follow-up/no-op; this slice does not claim that legacy→V2 split-brain behavior is fixed. Formal acceptance remains **P0 accepted 1/8 (12.5%)**; P8-47 is a candidate increment.
+
+## P8-48 update
+
+Goal: prevent context-memory projection, schema validation, and recall from carrying stale references across goal revisions while preserving legacy references and current-goal narrative filtering.
+
+Commit `f63ab7ce` applies the expected goal revision across context-memory projection, schema validation, and recall. Stale goal-scoped references in waits, approvals, unresolved items, events, artifacts, tasks, evidence, and related reference collections are dropped; future goal references fail closed. Legacy references without `goalRevision` remain readable, and narrative decisions/unresolved questions continue to be filtered by the current goal.
+
+Focused Worker validation passed **32/32 tests across 3 files**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. No database migration, Web, provider, queue, or dependency change was introduced. Production Neon/Postgres/RLS, Redis/BullMQ delivery, process restart, provider/model, browser/CloakBrowser, deployment, and legacy→V2 semantic cutover evidence remain unverified. The legacy diagnostic taxonomy remains a future follow-up/no-op; this slice does not claim that legacy→V2 semantic cutover is fixed. Formal acceptance remains **P0 accepted 1/8 (12.5%)**; P8-48 is a candidate increment.
