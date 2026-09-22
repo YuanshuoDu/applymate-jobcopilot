@@ -1,6 +1,8 @@
 import { Buffer } from "node:buffer"
 import { PLAN_MAX_NODES, isPlainJsonObject } from "./goal-plan-contract.js"
 import type { PlanDispatchCommand, PlanDispatchResult } from "./plan-intent-dispatcher.js"
+import { graphReady } from "./plan-command-readiness.js"
+import { containsIdentityKey, plainJson } from "./plan-command-validation.js"
 import { schedulePlanCommands, type PlanCommandExecutionStep, type PlanCommandSchedulerRuntime } from "./plan-command-scheduler.js"
 import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
 import { inspectJoinFailureEvidence, replanRequiredControl, type ReplanRequiredControl } from "./plan-replan-signal.js"
@@ -37,7 +39,7 @@ export type PlanCommandExecutionRuntime = {
   readonly rootTaskId?: string
   readonly resolveReplayedJoin?: (request: { readonly command: JoinCommand; readonly taskIds: readonly string[] }) => ToolExecutionResult | undefined | Promise<ToolExecutionResult | undefined>
   readonly admit?: (count: number) => void; readonly shouldAdmit?: (command: PlanDispatchCommand) => boolean
-  readonly taskGraphAdapter?: Pick<PlanTaskGraphAdapter, "observe"> & Partial<Pick<PlanTaskGraphAdapter, "start">>
+  readonly taskGraphAdapter?: Pick<PlanTaskGraphAdapter, "observe"> & Partial<Pick<PlanTaskGraphAdapter, "start" | "state">>
   readonly observe?: (record: PlanCommandExecutionRecord | PlanControlRecord) => void | Promise<void>
 }
 export type PlanCommandExecutionResult = {
@@ -49,16 +51,6 @@ export type PlanCommandExecutionResult = {
 }
 function row(value: unknown): Record<string, unknown> | null { return isPlainJsonObject(value) ? value : null }
 function strings(value: unknown): value is readonly string[] { return Array.isArray(value) && value.length <= 32 && value.every(item => typeof item === "string" && item.trim().length > 0 && item.length <= 4_000) }
-function plainJson(value: unknown, seen = new Set<object>()): boolean {
-  if (value === null || typeof value === "string" || typeof value === "boolean") return true
-  if (typeof value === "number") return Number.isFinite(value)
-  if (typeof value !== "object" || seen.has(value)) return false
-  if (!Array.isArray(value) && !isPlainJsonObject(value)) return false
-  seen.add(value)
-  const valid = Object.values(value).every(child => plainJson(child, seen))
-  seen.delete(value)
-  return valid
-}
 function executable(value: unknown): value is ExecutableCommand {
   const command = row(value)
   if (!command || (command.kind !== "tool_call" && command.kind !== "delegate" && command.kind !== "join")) return false
@@ -112,15 +104,6 @@ function resolvedRequest(runtime: PlanCommandExecutionRuntime, command: Executab
   if (command.kind === "tool_call") return { ...original, input: resolved }
   return { ...original, input: { ...command.call.input, context: resolved } }
 }
-const IDENTITY_KEYS = new Set(["userId", "sessionId", "turnId", "stepId", "taskId", "parentTaskId", "rootTaskId", "ownerId", "lease", "leaseOwnerId", "leaseVersion", "idempotencyKey", "capabilities", "permissions", "allowedCapabilities", "budgetLimit", "maxBudget"])
-const WAIT_TASK_KEYS = new Set(["taskId", "status", "role", "result", "failureReason"])
-function containsIdentityKey(value: unknown, allowed = new Set<string>(), seen = new Set<object>()): boolean {
-  if (!value || typeof value !== "object" || seen.has(value)) return false
-  if (Array.isArray(value)) { seen.add(value); const found = value.some(item => containsIdentityKey(item, allowed, seen)); seen.delete(value); return found }
-  if (!isPlainJsonObject(value)) return false
-  if (Object.keys(value).some(key => IDENTITY_KEYS.has(key) && !allowed.has(key))) return true
-  seen.add(value); const found = Object.values(value).some(item => containsIdentityKey(item, allowed, seen)); seen.delete(value); return found
-}
 function joinTaskIds(runtime: PlanCommandExecutionRuntime, command: JoinCommand, outputs: ReadonlyMap<string, unknown>): readonly string[] {
   const taskIds: string[] = []
   for (const ref of command.inputRefs) {
@@ -142,6 +125,7 @@ function validIds(value: unknown, expected: readonly string[], allowEmpty: boole
   return Array.isArray(value) && (allowEmpty || value.length > 0) && value.length <= 8 && value.every(item => typeof item === "string" && item.trim() && item.length <= 256) && new Set(value).size === value.length && value.every(item => expected.includes(item))
 }
 function exactIds(value: unknown, expected: readonly string[]): boolean { return validIds(value, expected, false) && value.length === expected.length }
+const WAIT_TASK_KEYS = new Set(["taskId", "status", "role", "result", "failureReason"])
 function validJoinTasks(value: unknown, expectedTaskIds: readonly string[]): boolean {
   if (!Array.isArray(value) || value.length !== expectedTaskIds.length) return false
   const seen = new Set<string>()
@@ -252,6 +236,7 @@ export async function executePlanCommands(plan: PlanDispatchResult, runtime: Pla
   const scheduler: PlanCommandSchedulerRuntime = {
     outputs,
     parallelDelegateLimit: parallelLimit(runtime.parallelDelegateLimit),
+    isReady: runtime.taskGraphAdapter?.state === undefined ? undefined : command => graphReady(runtime, command),
     admit: runtime.admit, shouldAdmit: runtime.shouldAdmit,
     execute: (command, currentOutputs) => executeCommand(runtime, command, currentOutputs),
     observe: record => observe(runtime, record),

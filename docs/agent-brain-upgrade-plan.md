@@ -1035,3 +1035,9 @@ P8-77 adds a bounded linearization seam to `plan-task-graph-adapter`: public `st
 Focused adapter validation passed **39/39**, related Worker planning validation passed **319/319**, Worker TypeScript and `git diff --check` passed. The existing scheduler remains unchanged: reducer-derived readiness unification across dependency layers, waits, and retry is an explicit follow-up seam. No new scheduler, child queue, schema, migration, provider, Web, or dispatch path was introduced.
 
 Real PostgreSQL/RLS, cross-process persistence, process restart, and production supervisor evidence remain unverified. P8-77 is a candidate hardening slice; formal P0-P7 acceptance remains **1/8 (12.5%)**.
+
+## P8-78 update
+
+P8-78 adds a bounded scheduler readiness projection at the plan command execution seam. When a server-owned `PlanTaskGraphAdapter.state` is available, the scheduler reads reducer-derived `readyNodeIds` dynamically so a dependent becomes eligible only after its observed predecessor completes. Durable completed, failed, cancelled, and waiting graph states remain eligible for replay receipts; pending and running states fail closed. An adapter without state keeps the existing dependency-bookkeeping behavior.
+
+Focused Worker scheduler, executor, and canonical replay validation passed **125/125 tests**; the full Worker planning suite passed **323/323 tests**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Real PostgreSQL/RLS persistence, process restart and cross-process scheduler recovery, production supervisor readiness, and provider/model invocation evidence remain unverified. No schema, queue, provider, Web, planning capability, or legacy executor path was changed; P8-78 remains a candidate.

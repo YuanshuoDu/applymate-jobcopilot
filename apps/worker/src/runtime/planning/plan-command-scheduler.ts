@@ -13,6 +13,7 @@ export type PlanCommandExecutionStep = {
 
 export type PlanCommandSchedulerRuntime = Pick<PlanCommandExecutionRuntime, "parallelDelegateLimit" | "admit" | "shouldAdmit"> & {
   readonly outputs: Map<string, unknown>
+  readonly isReady?: (command: PlanDispatchCommand) => boolean
   readonly execute: (command: ExecutableCommand, outputs: ReadonlyMap<string, unknown>) => Promise<PlanCommandExecutionStep>
   readonly observe: (record: PlanCommandExecutionRecord | PlanControlRecord) => Promise<void>
   readonly storeOutput: (record: PlanCommandExecutionRecord) => void
@@ -46,7 +47,7 @@ async function executeSerial(commands: readonly PlanDispatchCommand[], runtime: 
   const outputs = runtime.outputs
   const completedIds = new Set<string>()
   for (const command of commands) {
-    if (!command.dependsOn.every(dependency => completedIds.has(dependency))) runtime.invalidPlan("Plan dependency graph is invalid")
+    if (!isReady(command, completedIds, runtime)) runtime.invalidPlan("Plan dependency graph is invalid")
     if (isControl(command)) {
       await runtime.observe(command)
       return { status: "blocked", completed, blocked: command }
@@ -71,8 +72,12 @@ async function executeSerial(commands: readonly PlanDispatchCommand[], runtime: 
 type ReadyCommand = { readonly command: PlanDispatchCommand; readonly index: number }
 type SettledStep = PromiseSettledResult<PlanCommandExecutionStep>
 
-function ready(commands: readonly PlanDispatchCommand[], done: ReadonlySet<number>, completedIds: ReadonlySet<string>): ReadyCommand[] {
-  return commands.flatMap((command, index) => done.has(index) || !command.dependsOn.every(dependency => completedIds.has(dependency)) ? [] : [{ command, index }])
+function isReady(command: PlanDispatchCommand, completedIds: ReadonlySet<string>, runtime: PlanCommandSchedulerRuntime): boolean {
+  return runtime.isReady?.(command) ?? command.dependsOn.every(dependency => completedIds.has(dependency))
+}
+
+function ready(commands: readonly PlanDispatchCommand[], done: ReadonlySet<number>, completedIds: ReadonlySet<string>, runtime: PlanCommandSchedulerRuntime): ReadyCommand[] {
+  return commands.flatMap((command, index) => done.has(index) || !isReady(command, completedIds, runtime) ? [] : [{ command, index }])
 }
 
 function validateGraph(commands: readonly PlanDispatchCommand[], runtime: PlanCommandSchedulerRuntime): void {
@@ -171,7 +176,7 @@ async function executeParallel(commands: readonly PlanDispatchCommand[], runtime
   const limit = runtime.parallelDelegateLimit ?? 1
 
   while (done.size < commands.length) {
-    const candidates = ready(commands, done, completedIds)
+    const candidates = ready(commands, done, completedIds, runtime)
     if (candidates.length === 0) runtime.invalidPlan("Plan dependency graph is invalid")
     const first = candidates[0]!
     if (isControl(first.command)) {

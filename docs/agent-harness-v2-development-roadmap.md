@@ -2928,3 +2928,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused adapter validation passed **39/39**; related Worker planning validation passed **319/319**; Worker TypeScript and `git diff --check` passed.
 
 **Follow-up boundary:** The existing scheduler still owns its current dependency bookkeeping. A later bounded slice may expose reducer-derived readiness across dependency layers, waits, and retry, but this candidate does not rewrite the scheduler or add a new dispatch/child queue path. Real PostgreSQL/RLS, cross-process persistence, process restart, and production supervisor evidence remain unverified.
+
+## 164. P8-78 — Reducer-derived scheduler readiness
+
+**Candidate status/date (2026-09-22):** P8-78 is recorded as a bounded plan execution readiness slice; formal P0-P7 acceptance remains **1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Plan command execution now optionally supplies the scheduler with a dynamic server-owned readiness callback backed by `PlanTaskGraphAdapter.state`. Reducer-derived `readyNodeIds` unlock dependent commands after observed completion. Persisted completed, failed, cancelled, and waiting states remain eligible for durable replay receipts, while pending and running states fail closed. If the adapter has no state, the existing dependency bookkeeping remains in force.
+
+**Independent verification:** Focused scheduler, executor, and canonical replay validation passed **125/125 tests**; the full Worker planning suite passed **323/323 tests**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+**Candidate boundary:** Real PostgreSQL/RLS persistence, process restart and cross-process scheduler recovery, production supervisor readiness, and provider/model invocation evidence remain unverified. No schema, queue, provider, Web, planning capability, or legacy executor path was changed.

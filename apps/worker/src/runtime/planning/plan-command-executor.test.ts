@@ -266,6 +266,69 @@ describe("executePlanCommands", () => {
     expect(taskGraphAdapter.start).toHaveBeenCalledTimes(2)
   })
 
+  it("reads reducer readiness dynamically as completed work unlocks a dependent", async () => {
+    const plan = dispatch([delegate("first"), delegate("dependent", { dependsOn: ["first"] })])
+    const graph = createPlanTaskGraphAdapter(plan, { runKey: "run-1", persist: async () => undefined })
+    const readinessSnapshots: readonly string[][] = []
+    const taskGraphAdapter = {
+      get state() {
+        const current = [...graph.state.readyNodeIds]
+        ;(readinessSnapshots as string[][]).push(current)
+        return graph.state
+      },
+      start: graph.start,
+      observe: graph.observe,
+    }
+    const started: string[] = []
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => {
+      started.push(request.id)
+      return completed(request)
+    }) }
+    const result = await executePlanCommands(plan, { ...runtime(router), parallelDelegateLimit: 2, taskGraphAdapter })
+    expect(result.status).toBe("completed")
+    expect(started).toEqual(["call:first", "call:dependent"])
+    expect(readinessSnapshots).toContainEqual(["first"])
+    expect(readinessSnapshots[readinessSnapshots.length - 1]).toEqual(["dependent"])
+  })
+
+  it("consumes a fully terminal graph replay without invalidating the schedule", async () => {
+    const plan = dispatch([delegate("first"), delegate("dependent", { dependsOn: ["first"] })])
+    const terminalState: TaskGraphState = {
+      nodes: [{ id: "first", dependsOn: [] }, { id: "dependent", dependsOn: ["first"] }],
+      statuses: { first: "completed", dependent: "completed" }, readyNodeIds: [], blockedReasons: {}, appliedEvents: [],
+    }
+    const taskGraphAdapter = {
+      get state() { return terminalState },
+      start: vi.fn(async () => terminalState),
+      observe: vi.fn(async () => terminalState),
+    }
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => completed(request)) }
+    const result = await executePlanCommands(plan, { ...runtime(router), taskGraphAdapter })
+    expect(result.status).toBe("completed")
+    expect(router.execute).toHaveBeenCalledTimes(2)
+    expect(taskGraphAdapter.start).toHaveBeenCalledTimes(2)
+    expect(taskGraphAdapter.observe).toHaveBeenCalledTimes(2)
+  })
+
+  it("consumes a waiting graph replay as a control barrier", async () => {
+    const ask = { ...base, localId: "ask", kind: "request_input" as const, objective: "Need input", question: "Where?" }
+    const plan = dispatch([ask])
+    const waitingState: TaskGraphState = {
+      nodes: [{ id: "ask", dependsOn: [] }], statuses: { ask: "waiting" }, readyNodeIds: [], blockedReasons: {}, appliedEvents: [],
+    }
+    const taskGraphAdapter = {
+      get state() { return waitingState },
+      start: vi.fn(async () => waitingState),
+      observe: vi.fn(async () => waitingState),
+    }
+    const router = { execute: vi.fn() }
+    const result = await executePlanCommands(plan, { ...runtime(router), taskGraphAdapter })
+    expect(result.status).toBe("blocked")
+    expect(router.execute).not.toHaveBeenCalled()
+    expect(taskGraphAdapter.start).toHaveBeenCalledWith("ask")
+    expect(taskGraphAdapter.observe).toHaveBeenCalledWith(expect.objectContaining({ localId: "ask", kind: "request_input" }))
+  })
+
   it("starts a control before observing it", async () => {
     const order: string[] = []
     const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => completed(request)) }

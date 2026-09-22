@@ -71,6 +71,19 @@ describe("schedulePlanCommands", () => {
     expect(observed).toEqual(["first", "second"])
   })
 
+  it("gives the server-owned readiness callback precedence over dependency bookkeeping", async () => {
+    const started: string[] = []
+    const execute = async (command: ExecutableCommand) => {
+      started.push(command.localId)
+      return step(command as DelegateCommand)
+    }
+    const result = await schedulePlanCommands([delegate("dependent", ["first"]), delegate("first")], {
+      ...runtime(execute, []), parallelDelegateLimit: undefined, isReady: () => true,
+    })
+    expect(result.status).toBe("completed")
+    expect(started).toEqual(["dependent", "first"])
+  })
+
   it("admits each serial command before starting it", async () => {
     const admissions: number[] = []
     const started: string[] = []
