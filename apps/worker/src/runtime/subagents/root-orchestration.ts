@@ -37,18 +37,37 @@ export async function spawnScoutAnalystAndWait(
 ): Promise<ScoutAnalystSpawnResult> {
   if (!input.parentTaskId.trim()) throw new Error("Root orchestration requires the runtime-owned parent task")
   const atomic = typeof manager.supportsAtomicSpawn === "function" && manager.supportsAtomicSpawn()
-  const [scout, analyst] = await Promise.all([
+  const spawned = await Promise.allSettled([
     spawnRole(manager, input, "scout", input.scoutGoal, atomic, options.idempotencyKey),
     spawnRole(manager, input, "analyst", input.analystGoal, atomic, options.idempotencyKey),
   ])
-  if (scout.rootTaskId !== analyst.rootTaskId) throw new Error("Scout and Analyst must share one root task")
-  if (!atomic) await Promise.all([dispatch(scout), dispatch(analyst)])
-  const wait = await waitPort.wait({
-    userId: input.userId, sessionId: input.sessionId, turnId: input.turnId, stepId: options.stepId,
-    taskId: input.parentTaskId, rootTaskId: scout.rootTaskId,
-    targetTaskIds: [scout.id, analyst.id], mode: "all", timeoutMs: options.timeoutMs, idempotencyKey: options.idempotencyKey,
-  })
-  return { tasks: [scout, analyst], wait }
+  const created = spawned.flatMap(result => result.status === "fulfilled" && result.value.created ? [result.value.task] : [])
+  const spawnError = spawned.find(result => result.status === "rejected")
+  if (spawnError) return failAfterCleanup(manager, input, created, spawnError.reason)
+  const [scout, analyst] = spawned.map(result => (result as PromiseFulfilledResult<SpawnedRole>).value.task) as [SubagentTaskRecord, SubagentTaskRecord]
+  try {
+    if (scout.rootTaskId !== analyst.rootTaskId) throw new Error("Scout and Analyst must share one root task")
+    if (!atomic) {
+      const dispatched = await Promise.allSettled([dispatch(scout), dispatch(analyst)])
+      const dispatchError = dispatched.find(result => result.status === "rejected")
+      if (dispatchError) return failAfterCleanup(manager, input, created, dispatchError.reason)
+    }
+    const wait = await waitPort.wait({
+      userId: input.userId, sessionId: input.sessionId, turnId: input.turnId, stepId: options.stepId,
+      taskId: input.parentTaskId, rootTaskId: scout.rootTaskId,
+      targetTaskIds: [scout.id, analyst.id], mode: "all", timeoutMs: options.timeoutMs, idempotencyKey: options.idempotencyKey,
+    })
+    return { tasks: [scout, analyst], wait }
+  } catch (error: unknown) {
+    return failAfterCleanup(manager, input, created, error)
+  }
+}
+
+type SpawnedRole = { readonly task: SubagentTaskRecord; readonly created: boolean }
+
+async function failAfterCleanup(manager: AgentTreeManager, input: RootRoleSpawnInput, created: readonly SubagentTaskRecord[], error: unknown): Promise<never> {
+  await Promise.allSettled(created.map(child => manager.interruptSubtree(input.sessionId, child.rootTaskId, child.path)))
+  throw error
 }
 
 async function spawnRole(
@@ -58,12 +77,12 @@ async function spawnRole(
   goal: string,
   atomic: boolean,
   idempotencyKey: string,
-): Promise<SubagentTaskRecord> {
+): Promise<SpawnedRole> {
   const spec = roleSpec(input, role, goal)
-  if (!atomic) return manager.spawn(spec)
+  if (!atomic) return { task: await manager.spawn(spec), created: true }
   const result = await manager.spawnAtomic(spec, `${idempotencyKey}:${role}`)
   if (!result.task) throw new Error(`Atomic ${role} spawn did not return a task`)
-  return result.task
+  return { task: result.task, created: !result.duplicate }
 }
 
 function roleSpec(input: RootRoleSpawnInput, role: MigratedRole, goal: string): SubagentTaskSpec {

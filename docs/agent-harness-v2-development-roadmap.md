@@ -3010,3 +3010,11 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused Web validation passed **29/29 tests** across `apps/web/src/lib/agent/approval/legacy-receipt.test.ts`, `apps/web/src/lib/agent/approval/legacy-approval-fence.test.ts`, `apps/web/src/app/api/agent/sessions/[id]/actions/route.test.ts`, and `apps/web/src/app/api/gmail/send-draft/route.test.ts`; Web `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS lock behavior, cross-process concurrency, Redis delivery, process restart/recovery, and production E2E remain unverified. No schema, migration, Worker, Redis, SSE, or lockfile change was made; P8-85 remains a candidate.
+
+## 172. P8-86 — Root Scout/Analyst orphan cleanup
+
+**Candidate status/date (2026-09-22):** P8-86 is recorded as a bounded Worker orchestration cleanup slice; formal P0-P7 acceptance remains **1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** `spawnScoutAnalystAndWait` tracks only children actually created by the current invocation. Spawn, dispatch, root-lineage, and durable-wait failures interrupt each recorded child subtree via all-settled cleanup, then rethrow the original failure. Atomic duplicate results remain available to the wait but are not interrupted.
+
+**Independent verification:** Focused `root-orchestration.test.ts` validation passed **9/9 tests**, covering success, partial spawn rejection, dispatch rejection, wait rejection, and atomic duplicate cleanup; `git diff --check` passed. No live PostgreSQL/RLS, queue, process-restart, or production evidence is claimed; P8-86 remains a candidate.

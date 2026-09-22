@@ -36,7 +36,7 @@ describe("Scout/Analyst root orchestration", () => {
     const spawnAtomic = vi.fn()
       .mockResolvedValueOnce({ task: tasks[0], duplicate: false, atomic: true })
       .mockResolvedValueOnce({ task: tasks[1], duplicate: true, atomic: true })
-    const manager = { supportsAtomicSpawn: vi.fn(() => true), spawnAtomic } as unknown as AgentTreeManager
+    const manager = { supportsAtomicSpawn: vi.fn(() => true), spawnAtomic, interruptSubtree: vi.fn().mockResolvedValue(1) } as unknown as AgentTreeManager
     const dispatch = vi.fn(async () => undefined)
     const wait = vi.fn(async (input: { targetTaskIds: readonly string[] }) => ({ waitId: "wait-atomic", status: "ready" as const, deadlineAt: "2026-09-03T00:10:00.000Z", matchedTaskIds: [...input.targetTaskIds] }))
 
@@ -53,7 +53,7 @@ describe("Scout/Analyst root orchestration", () => {
     const spawnAtomic = vi.fn()
       .mockResolvedValueOnce({ task: null, duplicate: true, atomic: true })
       .mockResolvedValueOnce({ task: task("task-analyst", "analyst"), duplicate: false, atomic: true })
-    const manager = { supportsAtomicSpawn: vi.fn(() => true), spawnAtomic } as unknown as AgentTreeManager
+    const manager = { supportsAtomicSpawn: vi.fn(() => true), spawnAtomic, interruptSubtree: vi.fn().mockResolvedValue(1) } as unknown as AgentTreeManager
     const dispatch = vi.fn(async () => undefined)
 
     await expect(spawnScoutAnalystAndWait(manager, {} as never, { userId: "u", sessionId: "s", turnId: "t", parentTaskId: "root-1", scoutGoal: "s", analystGoal: "a" }, dispatch, { stepId: "step", timeoutMs: 1, idempotencyKey: "key" })).rejects.toThrow("Atomic scout spawn did not return a task")
@@ -64,7 +64,7 @@ describe("Scout/Analyst root orchestration", () => {
     const scout = task("task-scout", "scout")
     const analyst = { ...task("task-analyst", "analyst"), rootTaskId: "other-root" }
     const spawn = vi.fn().mockResolvedValueOnce(scout).mockResolvedValueOnce(analyst)
-    const manager = { spawn } as unknown as AgentTreeManager
+    const manager = { spawn, interruptSubtree: vi.fn().mockResolvedValue(1) } as unknown as AgentTreeManager
 
     await expect(spawnScoutAnalystAndWait(manager, {} as never, { userId: "u", sessionId: "s", turnId: "t", parentTaskId: "root-1", scoutGoal: "s", analystGoal: "a" }, async () => undefined, { stepId: "step", timeoutMs: 1, idempotencyKey: "key" })).rejects.toThrow("share one root")
   })
@@ -72,5 +72,49 @@ describe("Scout/Analyst root orchestration", () => {
   it("requires a runtime-owned parent so both children share one root", async () => {
     const manager = {} as AgentTreeManager
     await expect(spawnScoutAnalystAndWait(manager, {} as never, { userId: "u", sessionId: "s", turnId: "t", parentTaskId: "", scoutGoal: "s", analystGoal: "a" }, async () => undefined, { stepId: "step", timeoutMs: 1, idempotencyKey: "key" })).rejects.toThrow(/parent task/)
+  })
+
+  it("interrupts the child that was created when the other spawn rejects", async () => {
+    const scout = task("task-scout", "scout")
+    const failure = new Error("analyst spawn failed")
+    const spawn = vi.fn().mockResolvedValueOnce(scout).mockRejectedValueOnce(failure)
+    const interruptSubtree = vi.fn().mockResolvedValue(1)
+    const manager = { spawn, interruptSubtree } as unknown as AgentTreeManager
+
+    await expect(spawnScoutAnalystAndWait(manager, {} as never, { userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "root-1", scoutGoal: "s", analystGoal: "a" }, async () => undefined, { stepId: "step", timeoutMs: 1, idempotencyKey: "key" })).rejects.toBe(failure)
+    expect(interruptSubtree).toHaveBeenCalledWith("session-1", "root-1", "/root-1/task-scout")
+  })
+
+  it("interrupts both created children when dispatch rejects", async () => {
+    const tasks = [task("task-scout", "scout"), task("task-analyst", "analyst")] as const
+    const interruptSubtree = vi.fn().mockResolvedValue(1)
+    const manager = { spawn: vi.fn().mockResolvedValueOnce(tasks[0]).mockResolvedValueOnce(tasks[1]), interruptSubtree } as unknown as AgentTreeManager
+    const failure = new Error("dispatch failed")
+
+    await expect(spawnScoutAnalystAndWait(manager, {} as never, { userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "root-1", scoutGoal: "s", analystGoal: "a" }, vi.fn().mockRejectedValueOnce(failure).mockResolvedValueOnce(undefined), { stepId: "step", timeoutMs: 1, idempotencyKey: "key" })).rejects.toBe(failure)
+    expect(interruptSubtree).toHaveBeenCalledTimes(2)
+  })
+
+  it("interrupts both created children when durable wait rejects", async () => {
+    const tasks = [task("task-scout", "scout"), task("task-analyst", "analyst")] as const
+    const interruptSubtree = vi.fn().mockResolvedValue(1)
+    const manager = { spawn: vi.fn().mockResolvedValueOnce(tasks[0]).mockResolvedValueOnce(tasks[1]), interruptSubtree } as unknown as AgentTreeManager
+    const failure = new Error("wait failed")
+
+    await expect(spawnScoutAnalystAndWait(manager, { wait: vi.fn().mockRejectedValue(failure) }, { userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "root-1", scoutGoal: "s", analystGoal: "a" }, async () => undefined, { stepId: "step", timeoutMs: 1, idempotencyKey: "key" })).rejects.toBe(failure)
+    expect(interruptSubtree).toHaveBeenCalledTimes(2)
+  })
+
+  it("does not interrupt an atomic duplicate child", async () => {
+    const scout = task("task-scout", "scout")
+    const analyst = task("task-analyst", "analyst")
+    const spawnAtomic = vi.fn().mockResolvedValueOnce({ task: scout, duplicate: true, atomic: true }).mockResolvedValueOnce({ task: analyst, duplicate: false, atomic: true })
+    const interruptSubtree = vi.fn().mockResolvedValue(1)
+    const manager = { supportsAtomicSpawn: vi.fn(() => true), spawnAtomic, interruptSubtree } as unknown as AgentTreeManager
+    const failure = new Error("wait failed")
+
+    await expect(spawnScoutAnalystAndWait(manager, { wait: vi.fn().mockRejectedValue(failure) }, { userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "root-1", scoutGoal: "s", analystGoal: "a" }, async () => undefined, { stepId: "step", timeoutMs: 1, idempotencyKey: "key" })).rejects.toBe(failure)
+    expect(interruptSubtree).toHaveBeenCalledTimes(1)
+    expect(interruptSubtree).toHaveBeenCalledWith("session-1", "root-1", "/root-1/task-analyst")
   })
 })
