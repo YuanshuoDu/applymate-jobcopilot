@@ -10,8 +10,11 @@ import type { TreeBudgetReservation, TreeBudgetReservationStore } from "../runti
 import type { CoordinationStore, CoordinationTaskView, DurableWaitPort } from "../runtime/tools/coordination-types.js"
 import { createCoordinationTools } from "../runtime/tools/coordination-tools.js"
 import { createCanonicalPolicy } from "../runtime/policy/canonical-policy.js"
+import { createPgDurableWaitPort } from "../runtime/subagents/durable-wait-store.js"
+import { reconcileDurableWaits } from "../runtime/subagents/durable-wait-resolver.js"
 import type { createSubagentQueue } from "./subagent-queue.js"
 import type { createTurnQueue } from "../runtime/turns/turn-queue.js"
+import type { TurnLease } from "../runtime/turns/lease.js"
 import { createProductionWorkerBootstrap, type CanonicalTurnRuntime } from "./production-bootstrap.js"
 import { createCanonicalTurnRuntime, type UsageAuthorization } from "../runtime/canonical-turn-runtime.js"
 import { createTurnEngineExecutor } from "../runtime/turns/turn-engine.js"
@@ -128,13 +131,170 @@ async function compositionRuntime(): Promise<{ runtime: CanonicalTurnRuntime; to
   }
 }
 
-async function coordinationRuntime(input: { manager: AgentTreeManager; store: CoordinationStore; wait: DurableWaitPort; model: ModelAdapter }): Promise<{ runtime: CanonicalTurnRuntime; execute: CanonicalTurnRuntime["execute"] }> {
+async function coordinationRuntime(input: { manager: AgentTreeManager; store: CoordinationStore; wait: DurableWaitPort; model: ModelAdapter; stateLoader?: (state: CanonicalTurnState) => CanonicalTurnState | Promise<CanonicalTurnState> }): Promise<{ runtime: CanonicalTurnRuntime; execute: CanonicalTurnRuntime["execute"] }> {
   const read: RuntimeToolDefinition = { schemaVersion, name: "fixture.read", version: "1", description: "Read fixture evidence", capabilities: ["read"], inputSchema: Type.Object({}, { additionalProperties: false }), outputSchema: Type.Object({ jobs: Type.Array(Type.Object({ id: Type.String() }, { additionalProperties: false })) }, { additionalProperties: false }), risk: "read", domain: "jobs", idempotency: "read_only", timeoutMs: 1_000, requiredCapabilities: [], execute: async () => ({ jobs: [{ id: "job-fixture" }] }) }
   const registry = new ToolRegistry([read, ...createCoordinationTools({ manager: input.manager, store: input.store, wait: input.wait })])
   const router = new ToolRouter(registry, new ToolLifecycle({ sink: new InMemoryToolLifecycleSink(), references: new InMemoryToolResultReferenceStore() }), createCanonicalPolicy(undefined, true, false))
   const state: CanonicalTurnState = { scope: { userId: "user_fixture" }, goal: "Read fixture state", modelProfileSnapshot: {} as never, toolPolicySnapshot: { role: "orchestrator", capabilities: ["read", "coordination"] }, budgetSnapshot: { limits: { maxSteps: 5 } }, snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] } }
-  const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, { workerId: "worker_fixture", manager: input.manager, coordinationEnabled: true, stateLoader: async () => state, modelRuntimeFactory: async () => ({ adapter: input.model, registry: {} as never, candidates: [] }), toolRuntimeFactory: () => ({ registry, router }), rootTaskStore: { ensure: vi.fn(async () => ({ id: "root_fixture" } as never)), finish: vi.fn(async () => undefined) }, turnEngineStoreFactory: () => compositionStore(), contextBuilderFactory: () => new StepContextBuilder({ scope: { userId: "user_fixture" }, withTransaction: async work => work({ getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }), claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }), persistCheckpoint: async () => undefined }) } satisfies InputClaimStore), authorizeUsage: vi.fn(async () => ({ settle: vi.fn(async () => undefined) })) })
+  const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, { workerId: "worker_fixture", manager: input.manager, coordinationEnabled: true, stateLoader: async () => input.stateLoader ? input.stateLoader(state) : state, modelRuntimeFactory: async () => ({ adapter: input.model, registry: {} as never, candidates: [] }), toolRuntimeFactory: () => ({ registry, router }), rootTaskStore: { ensure: vi.fn(async () => ({ id: "root_fixture" } as never)), finish: vi.fn(async () => undefined) }, turnEngineStoreFactory: () => compositionStore(), contextBuilderFactory: () => new StepContextBuilder({ scope: { userId: "user_fixture" }, withTransaction: async work => work({ getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }), claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }), persistCheckpoint: async () => undefined }) } satisfies InputClaimStore), authorizeUsage: vi.fn(async () => ({ settle: vi.fn(async () => undefined) })) })
   return { runtime, execute: runtime.execute }
+}
+
+type DurableCompositionRow = Record<string, unknown>
+
+/**
+ * A small PostgreSQL-shaped state machine for the composition test. It keeps
+ * the SQL transaction entry points and the row-level fences visible while
+ * avoiding a live database in this focused suite.
+ */
+function durableCompositionPool(input: {
+  readonly root: SubagentTaskRecord
+  readonly tasks: Map<string, SubagentTaskRecord>
+  readonly now: Date
+}) {
+  type DurableCompositionTurn = {
+    id: string
+    userId: string
+    sessionId: string
+    rootTaskId: string | null
+    status: string
+    leaseOwnerId: string | null
+    leaseVersion: number
+    leaseExpiresAt: Date | null
+    leaseStartedAt: Date | null
+  }
+  const turn: DurableCompositionTurn = {
+    id: String(input.root.turnId), userId: input.root.userId, sessionId: input.root.sessionId, rootTaskId: input.root.rootTaskId,
+    status: "in_progress", leaseOwnerId: "worker_root", leaseVersion: 1,
+    leaseExpiresAt: new Date(input.now.getTime() + 60_000), leaseStartedAt: input.now,
+  }
+  const state = {
+    session: { id: input.root.sessionId, userId: input.root.userId, status: "running", eventSequence: 40 },
+    turn,
+    step: { id: "step_pending", taskId: input.root.id, turnId: input.root.turnId, sessionId: input.root.sessionId, attempt: 1, status: "waiting_for_tool" },
+    wait: null as DurableCompositionRow | null,
+    events: [] as DurableCompositionRow[],
+    outbox: [] as DurableCompositionRow[],
+    calls: [] as string[],
+  }
+  const row = (value: DurableCompositionRow): DurableCompositionRow => ({ ...value })
+  const rootRow = (): DurableCompositionRow => ({ id: input.root.id, rootTaskId: input.root.rootTaskId, turnId: input.root.turnId, sessionId: input.root.sessionId, status: input.root.status, userId: input.root.userId, path: input.root.path })
+  const turnRow = (): DurableCompositionRow => ({ ...state.turn })
+  const taskRows = (ids: readonly string[]): DurableCompositionRow[] => ids.flatMap(id => {
+    const task = input.tasks.get(id)
+    return task ? [{ id: task.id, rootTaskId: task.rootTaskId, turnId: task.turnId, sessionId: task.sessionId, status: task.status, userId: task.userId }] : []
+  })
+  const waitRow = (): DurableCompositionRow | undefined => state.wait ? row(state.wait) : undefined
+  const response = <T>(rows: DurableCompositionRow[], rowCount = rows.length) => ({ rows: rows as T[], rowCount })
+  const client = {
+    query: vi.fn(async <T = DurableCompositionRow>(sql: string, params: readonly unknown[] = []) => {
+      state.calls.push(sql)
+      const statement = sql.trim()
+      if (statement === "BEGIN" || statement === "COMMIT" || statement === "ROLLBACK" || sql.includes("set_config")) return response<T>([], 1)
+
+      if (sql.includes('SELECT session."id", session."userId", session."status"')) {
+        return response<T>(state.session.status === "running" ? [{ ...state.session }] : [], state.session.status === "running" ? 1 : 0)
+      }
+      if (sql.includes('UPDATE "agent_sessions"')) {
+        state.session.eventSequence += 1
+        return response<T>([{ eventSequence: String(state.session.eventSequence) }], 1)
+      }
+
+      if (sql.includes('FROM "agent_wait_conditions"')) {
+        const current = waitRow()
+        if (!current) return response<T>([])
+        if (sql.includes('"turnId" = $3')) {
+          return response<T>(String(params[2]) === state.turn.id && String(current.status) !== "closed" && current.consumedAt == null ? [current] : [])
+        }
+        if (String(params[0]) === String(current.id) || (String(params[0]) === input.root.id && String(params[1]) === String(current.idempotencyKey))) return response<T>([current])
+        return response<T>([])
+      }
+
+      if (sql.includes('FROM "agent_steps"')) {
+        if (typeof params[0] === "string") state.step.id = params[0]
+        return response<T>([{ ...state.step }])
+      }
+
+      if (sql.includes('ANY($1::text[])')) {
+        const ids = Array.isArray(params[0]) ? params[0].map(String) : []
+        return response<T>(taskRows(ids))
+      }
+      if (sql.includes('FROM "sub_agent_tasks" AS task')) {
+        return response<T>(String(params[0]) === input.root.id ? [rootRow()] : [])
+      }
+
+      if (sql.includes('JOIN "agent_turns" AS turn')) {
+        const active = ["in_progress", "waiting_for_dependency"].includes(state.turn.status)
+        return response<T>(active ? [turnRow()] : [], active ? 1 : 0)
+      }
+      if (sql.includes('FROM "agent_turns" AS turn')) return response<T>([turnRow()])
+
+      if (sql.includes('INSERT INTO "agent_wait_conditions"')) {
+        const targetTaskIds = JSON.parse(String(params[7])) as string[]
+        const matchedTaskIds = JSON.parse(String(params[11])) as string[]
+        state.step.id = String(params[5])
+        state.wait = {
+          id: String(params[0]), userId: String(params[1]), sessionId: String(params[2]), turnId: String(params[3]), parentTaskId: String(params[4]), stepId: String(params[5]), idempotencyKey: String(params[6]), targetTaskIds, mode: String(params[8]), status: String(params[9]), deadlineAt: params[10], matchedTaskIds, result: JSON.parse(String(params[12])), createdAt: params[13], updatedAt: params[13], suspendedAt: null, consumedAt: null,
+        }
+        return response<T>([state.wait])
+      }
+      if (sql.includes('UPDATE "agent_wait_conditions"')) {
+        if (!state.wait) return response<T>([], 0)
+        if (sql.includes('SET "status" = $1')) {
+          state.wait.status = String(params[0]); state.wait.matchedTaskIds = JSON.parse(String(params[1])); state.wait.resolvedAt = params[2]
+          return response<T>([{ id: state.wait.id, status: state.wait.status, deadlineAt: state.wait.deadlineAt, matchedTaskIds: state.wait.matchedTaskIds }])
+        }
+        state.wait.suspendedAt = params[1]
+        return response<T>([], 1)
+      }
+
+      if (sql.includes('UPDATE "agent_turns"')) {
+        if (sql.includes("SET \"status\" = 'waiting_for_dependency'")) {
+          state.turn.status = "waiting_for_dependency"; state.turn.leaseOwnerId = null; state.turn.leaseExpiresAt = null; state.turn.leaseStartedAt = null
+        } else if (sql.includes("SET \"status\" = 'queued'")) {
+          state.turn.status = "queued"; state.turn.leaseOwnerId = null; state.turn.leaseExpiresAt = null; state.turn.leaseStartedAt = null
+        }
+        return response<T>([], 1)
+      }
+
+      if (sql.includes('FROM "agent_events"')) {
+        const found = state.events.filter(event => String(event.sessionId) === String(params[0]) && String(event.idempotencyKey) === String(params[1]))
+        return response<T>(found)
+      }
+      if (sql.includes('INSERT INTO "agent_events"')) {
+        const payload = JSON.parse(String(params[6])) as DurableCompositionRow
+        const event = { id: String(params[0]), sessionId: String(params[1]), turnId: String(params[2]), sequence: String(params[3]), type: "turn.resumed", actor: "system", correlationId: String(params[2]), causationId: String(params[4]), idempotencyKey: String(params[5]), payload }
+        state.events.push(event)
+        return response<T>([], 1)
+      }
+
+      if (sql.includes('SELECT "id", "topic", "aggregateId", "idempotencyKey", "payload" FROM "agent_outbox"')) {
+        return response<T>(state.outbox.filter(item => String(item.idempotencyKey) === String(params[0])))
+      }
+      if (sql.includes('SELECT "id" FROM "agent_outbox"')) {
+        return response<T>(state.outbox.filter(item => String(item.topic) === String(params[0]) && String(item.idempotencyKey) === String(params[1]) && String(item.aggregateId) === String(params[2])))
+      }
+      if (sql.includes('INSERT INTO "agent_outbox"')) {
+        const sessionEvent = sql.includes("'agent.session.event'")
+        const topic = sessionEvent ? "agent.session.event" : String(params[1])
+        const aggregateId = sessionEvent ? String(params[1]) : String(params[2])
+        const idempotencyKey = sessionEvent ? String(params[2]) : String(params[3])
+        const payloadIndex = sessionEvent ? 3 : 4
+        const payload = JSON.parse(String(params[payloadIndex])) as DurableCompositionRow
+        const existingIndex = state.outbox.findIndex(item => String(item.idempotencyKey) === idempotencyKey)
+        if (existingIndex >= 0) {
+          if (topic === "agent.turn.dispatch") state.outbox[existingIndex] = { ...state.outbox[existingIndex], payload, publishedAt: null, attemptCount: Number(state.outbox[existingIndex]?.attemptCount ?? 0) + 1 }
+          return response<T>([], 0)
+        }
+        state.outbox.push({ id: String(params[0]), topic, aggregateId, idempotencyKey, payload, publishedAt: null, attemptCount: 0 })
+        return response<T>([], 1)
+      }
+
+      throw new Error(`Unexpected durable composition query: ${statement}`)
+    }),
+    release: vi.fn(),
+  }
+  return { pool: { connect: vi.fn(async () => client) }, state }
 }
 
 describe("production Worker bootstrap", () => {
@@ -436,23 +596,33 @@ describe("production Worker bootstrap", () => {
       modelRuntimeFactory: childModelRuntimeFactory,
       toolRuntimeFactory: childToolRuntimeFactory,
     })
+    const durableFixture = durableCompositionPool({ root: rootTask, tasks, now })
+    durableFixture.state.turn.leaseOwnerId = "worker_fixture"
+    const durableWait = createPgDurableWaitPort(durableFixture.pool as never)
     let bootstrappedChildExecutor: ((input: { lease: SubagentLease }) => Promise<SubagentExecutionResult>) | undefined
     let waitCalls = 0
-    const wait: DurableWaitPort = { wait: async input => { waitCalls += 1; expect(bootstrappedChildExecutor).toBe(childExecutor); const outcome = await manager.run({ taskId: child.id, sessionId: input.sessionId, rootTaskId: "root_fixture", ownerId: "queue_fixture" }, bootstrappedChildExecutor!); expect(outcome.status).toBe("completed"); expect(tasks.get(child.id)?.result).toMatchObject({ status: "completed", toolCallCount: 1 }); return { waitId: "wait_fixture", status: "ready", deadlineAt: now.toISOString(), matchedTaskIds: [child.id] } } }
+    let parentResuming = false
+    let resumeObservation: CanonicalTurnState["snapshot"]["toolObservations"] = []
+    const wait: DurableWaitPort = { wait: async input => {
+      waitCalls += 1
+      return durableWait.wait(input)
+    } }
     const requests: HarnessModelRequest[] = []
     let calls = 0
     const model: ModelAdapter = { id: "fixture-model", profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false, supportsReasoningSummary: false, supportsResponseContinuation: false, supportsProviderConversation: false, supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low" }, async *stream(request) { requests.push(request); calls += 1; if (calls === 1) yield* [{ type: "tool_call_completed", callId: "spawn", name: "agent.spawn", arguments: { idempotencyKey: "spawn_fixture", role: "scout", taskType: "research", goal: "Find fixture evidence" } }, { type: "completed", finishReason: "tool_calls" }]; else if (calls === 2) yield* [{ type: "tool_call_completed", callId: "wait", name: "agent.wait", arguments: { idempotencyKey: "wait_fixture", taskIds: [child.id], mode: "all", timeoutMs: 1_000 } }, { type: "completed", finishReason: "tool_calls" }]; else if (calls === 3) yield* [{ type: "tool_call_completed", callId: "read", name: "fixture.read", arguments: {} }, { type: "completed", finishReason: "tool_calls" }]; else yield* [{ type: "text_delta", text: "Found job-fixture." }, { type: "completed", finishReason: "stop" }] } }
-    const fixture = await coordinationRuntime({ manager, store: coordinationStore, wait, model })
+    const fixture = await coordinationRuntime({ manager, store: coordinationStore, wait, model, stateLoader: state => parentResuming ? { ...state, snapshot: { ...state.snapshot, toolObservations: resumeObservation } } : state })
     let execute: CanonicalTurnRuntime["execute"] | undefined
+    let waitHandoff: Parameters<typeof createTurnQueue>[0]["waitHandoff"] | undefined
     const childQueueFactory = vi.fn(options => {
       bootstrappedChildExecutor = options.execute as typeof childExecutor
       return { queue: { add: vi.fn() }, worker: {}, close: vi.fn(async () => undefined) } as never
     })
     const bootstrap = await createProductionWorkerBootstrap({
-      pool: { connect: vi.fn() },
+      pool: durableFixture.pool as never,
       runtime: fixture.runtime,
       turnQueueFactory: vi.fn(options => {
         execute = options.execute
+        waitHandoff = options.waitHandoff
         return { queue: { add: vi.fn() }, worker: {}, active: { size: 0, values: () => [] }, close: vi.fn(async () => undefined) } as never
       }) as never,
       turnRecoveryFactory: vi.fn(() => ({ close: vi.fn(async () => undefined) })) as never,
@@ -467,8 +637,66 @@ describe("production Worker bootstrap", () => {
     expect(bootstrap.subagents).toBeDefined()
     expect(bootstrap.waitResolver).toBeDefined()
     expect(childQueueFactory).toHaveBeenCalledWith(expect.objectContaining({ execute: childExecutor, manager }))
-    const result = await execute!({ lease: { turnId: "turn_fixture", sessionId: "session_fixture", ownerId: "worker_fixture", userId: "user_fixture", leaseVersion: 1, leaseStartedAt: now, leaseExpiresAt: new Date(now.getTime() + 60_000) } as never, signal: new AbortController().signal })
-    expect(result).toMatchObject({ status: "completed" }); expect(waitCalls).toBe(1); expect(tasks.get(child.id)?.status).toBe("completed"); expect(childModelRuntimeFactory).toHaveBeenCalledOnce(); expect(childToolRuntimeFactory).toHaveBeenCalledOnce(); expect(childRequests).toHaveLength(2); expect(childRequests[0]?.tools).toEqual([expect.objectContaining({ name: "fixture.read" })]); expect(childTool).toHaveBeenCalledOnce(); expect(childToolCalls).toHaveLength(1); expect(childToolCalls[0]?.context).toMatchObject({ taskId: child.id, rootTaskId: "root_fixture", actorRole: "subagent" }); expect(childBudget.reserve).toHaveBeenCalledTimes(2); expect(childBudget.settle).toHaveBeenCalledTimes(2); expect(childBudgetReservations.every(reservation => reservation.status === "consumed")).toBe(true); expect(requests).toHaveLength(4); expect(JSON.stringify(requests[2]?.messages)).toContain("job-fixture")
+    try {
+      expect(waitHandoff).toBeDefined()
+      const firstLease: TurnLease = { turnId: "turn_fixture", sessionId: "session_fixture", ownerId: "worker_fixture", userId: "user_fixture", leaseVersion: 1, leaseStartedAt: now, leaseExpiresAt: new Date(now.getTime() + 60_000) }
+      const waiting = await execute!({ lease: firstLease, signal: new AbortController().signal })
+      expect(waiting).toMatchObject({ status: "waiting_for_dependency" })
+      expect(waitCalls).toBe(1)
+      expect(durableFixture.state.wait).toMatchObject({ status: "waiting", suspendedAt: null, targetTaskIds: [child.id] })
+
+      const waitId = String(durableFixture.state.wait?.id)
+      await waitHandoff!({ lease: firstLease, waitId, now })
+      expect(durableFixture.state.wait).toMatchObject({ status: "waiting", suspendedAt: now })
+      expect(durableFixture.state.turn).toMatchObject({ status: "waiting_for_dependency", leaseOwnerId: null })
+
+      expect(bootstrappedChildExecutor).toBe(childExecutor)
+      const childOutcome = await manager.run({ taskId: child.id, sessionId: "session_fixture", rootTaskId: "root_fixture", ownerId: "queue_fixture" }, bootstrappedChildExecutor!)
+      expect(childOutcome).toMatchObject({ taskId: child.id, status: "completed" })
+      expect(tasks.get(child.id)?.result).toMatchObject({ status: "completed", toolCallCount: 1, finalText: "Child found job-fixture." })
+
+      await expect(reconcileDurableWaits(durableFixture.pool as never, { now: new Date(now.getTime() + 1_000), ownerId: "resolver_fixture" })).resolves.toEqual({ scanned: 1, resolved: 1, woken: 1 })
+      expect(durableFixture.state.wait).toMatchObject({ status: "ready", matchedTaskIds: [child.id] })
+      expect(durableFixture.state.turn).toMatchObject({ status: "queued", leaseOwnerId: null })
+      expect(durableFixture.state.events).toHaveLength(1)
+      expect(durableFixture.state.outbox.filter(item => item.topic === "agent.session.event")).toHaveLength(1)
+      expect(durableFixture.state.outbox.filter(item => item.topic === "agent.turn.dispatch")).toHaveLength(1)
+
+      await expect(reconcileDurableWaits(durableFixture.pool as never, { now: new Date(now.getTime() + 2_000), ownerId: "resolver_fixture" })).resolves.toEqual({ scanned: 0, resolved: 0, woken: 0 })
+      await expect(durableWait.suspendAndRelease({ lease: firstLease, waitId, now })).resolves.toMatchObject({ handoff: "queued", idempotent: true })
+      expect(durableFixture.state.events).toHaveLength(1)
+      expect(durableFixture.state.outbox.filter(item => item.topic === "agent.session.event")).toHaveLength(1)
+      expect(durableFixture.state.outbox.filter(item => item.topic === "agent.turn.dispatch")).toHaveLength(1)
+
+      await expect(durableWait.wait({ userId: "user_fixture", sessionId: "session_fixture", turnId: "turn_fixture", stepId: String(durableFixture.state.wait?.stepId), taskId: "root_fixture", rootTaskId: "root_fixture", targetTaskIds: [child.id], mode: "all", timeoutMs: 1_000, idempotencyKey: "wait_fixture" })).resolves.toMatchObject({ status: "ready", matchedTaskIds: [child.id] })
+      const childResult = tasks.get(child.id)?.result
+      resumeObservation = [{ id: "tool-result:wait", content: { toolCallId: "wait", toolName: "agent.wait", input: { idempotencyKey: "wait_fixture", taskIds: [child.id], mode: "all", timeoutMs: 1_000 }, status: "completed", output: { waitId, status: "ready", taskIds: [child.id], targetTaskIds: [child.id], matchedTaskIds: [child.id], deadlineAt: String(durableFixture.state.wait?.deadlineAt), tasks: [{ taskId: child.id, status: "completed", result: childResult, failureReason: null }] }, errorCode: null } }] as never
+
+      expect(durableFixture.state.turn.status).toBe("queued")
+      durableFixture.state.turn.status = "in_progress"
+      durableFixture.state.turn.leaseOwnerId = "worker_resume"
+      durableFixture.state.turn.leaseVersion = 2
+      durableFixture.state.turn.leaseStartedAt = new Date(now.getTime() + 3_000)
+      durableFixture.state.turn.leaseExpiresAt = new Date(now.getTime() + 63_000)
+      parentResuming = true
+      const resumed = await execute!({ lease: { ...firstLease, ownerId: "worker_resume", leaseVersion: 2, leaseStartedAt: new Date(now.getTime() + 3_000), leaseExpiresAt: new Date(now.getTime() + 63_000) }, signal: new AbortController().signal })
+      expect(resumed).toMatchObject({ status: "completed" })
+      expect(waitCalls).toBe(1)
+      expect(JSON.stringify(requests[2]?.messages)).toContain("Child found job-fixture.")
+      expect(childModelRuntimeFactory).toHaveBeenCalledOnce()
+      expect(childToolRuntimeFactory).toHaveBeenCalledOnce()
+      expect(childRequests).toHaveLength(2)
+      expect(childRequests[0]?.tools).toEqual([expect.objectContaining({ name: "fixture.read" })])
+      expect(childTool).toHaveBeenCalledOnce()
+      expect(childToolCalls).toHaveLength(1)
+      expect(childToolCalls[0]?.context).toMatchObject({ taskId: child.id, rootTaskId: "root_fixture", actorRole: "subagent" })
+      expect(childBudget.reserve).toHaveBeenCalledTimes(2)
+      expect(childBudget.settle).toHaveBeenCalledTimes(2)
+      expect(childBudgetReservations.every(reservation => reservation.status === "consumed")).toBe(true)
+      expect(requests).toHaveLength(4)
+    } finally {
+      vi.useRealTimers()
+    }
     await bootstrap.close()
   })
 })
