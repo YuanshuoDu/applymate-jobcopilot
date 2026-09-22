@@ -975,3 +975,11 @@ Commit `fe2d3801` adds a durable idempotent TaskGraph start intent before router
 Focused evidence passed: adapter **29/29**, executor **35/35**, and canonical plan **62/62**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 
 Real PostgreSQL/RLS, queue delivery, restart, cross-process, and production supervisor E2E remain unverified. Graph and `plan.command` writes are not one atomic batch. Formal acceptance remains **P0 accepted 1/8 (12.5%)**; P8-69 is a candidate increment.
+
+## P8-70 update
+
+P8-70 is a candidate hardening slice. Terminal `plan.task_graph` events and their corresponding `plan.command` receipts are written through `TurnEngineStore.appendEvents` as one atomic batch; pre-route start intent remains separately durable. If `appendEvents` is unavailable, execution fails closed. Replay skips existing receipts and missing commands use the hydrated graph; `replan_required` retains its legacy receipt behavior.
+
+Focused evidence passed: adapter **31/31**, canonical plan **64/64**, and canonical runtime **28/28**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed; ioredis output was limited to existing runtime warnings.
+
+This does not change the formal P0-P7 route: acceptance remains **1/8 (12.5%)**. Real PostgreSQL/RLS, cross-process queue/restart, complete wakeup, and production E2E remain unverified.

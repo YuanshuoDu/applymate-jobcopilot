@@ -1599,3 +1599,10 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Commit `fe2d3801` persists an idempotent TaskGraph start intent before router execution. Ready or waiting nodes move to `running`; start failure blocks routing. Existing replay receipts skip duplicate starts, missing commands start once, and `replan_required` remains graph-free.
 - Focused evidence passed **29/29 adapter**, **35/35 executor**, and **62/62 canonical-plan** tests. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 - Boundary: real PostgreSQL/RLS, queue delivery across processes, process restart, and production supervisor E2E remain unverified. Graph and `plan.command` writes are not one atomic batch. Formal acceptance remains **P0 accepted 1/8 (12.5%)**.
+
+## P8-70 candidate - atomic terminal TaskGraph and receipt hardening
+
+- Terminal `plan.task_graph` events and matching `plan.command` receipts use one `TurnEngineStore.appendEvents` atomic batch. Pre-route start remains separately durable, and an unavailable `appendEvents` path fails closed.
+- Replay skips existing receipts and missing commands use the hydrated graph. `replan_required` retains its legacy receipt behavior.
+- Focused evidence passed **31/31 adapter**, **64/64 canonical-plan**, and **28/28 canonical-runtime** tests. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed; ioredis output was limited to existing runtime warnings.
+- Candidate boundary: real PostgreSQL/RLS, cross-process queue/restart, complete wakeup, and production E2E remain unverified. P8-70 does not change formal P0-P7 acceptance, which remains **1/8 (12.5%)**.

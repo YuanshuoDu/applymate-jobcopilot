@@ -2848,3 +2848,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused validation passed **29/29 adapter tests**, **35/35 executor tests**, and **62/62 canonical-plan tests**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 
 **Candidate boundary:** Real PostgreSQL/RLS, queue delivery across processes, process restart, and production supervisor E2E remain unverified. Graph and `plan.command` writes are not one atomic batch. P8-69 remains a candidate; formal acceptance stays **P0 accepted 1/8 (12.5%)**.
+
+## 156. P8-70 — Atomic terminal TaskGraph and receipt hardening
+
+**Candidate status/date (2026-09-22):** P8-70 is recorded as a candidate hardening slice and does not change the formal P0-P7 route; acceptance remains **1/8 (12.5%)**.
+
+**Design boundary:** Terminal `plan.task_graph` events and the corresponding `plan.command` receipt use one `TurnEngineStore.appendEvents` atomic batch. Pre-route start intent remains separately persisted. An unavailable `appendEvents` path fails closed. Replay skips existing receipts and missing commands use the hydrated graph; `replan_required` keeps its legacy receipt behavior.
+
+**Independent verification:** Focused validation passed **31/31 adapter tests**, **64/64 canonical-plan tests**, and **28/28 canonical-runtime tests**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. ioredis output was limited to existing runtime warnings.
+
+**Candidate boundary:** Real PostgreSQL/RLS, cross-process queue delivery and restart, complete wakeup, and production E2E remain unverified. P8-70 is a candidate hardening slice only.
