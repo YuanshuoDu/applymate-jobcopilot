@@ -262,6 +262,23 @@ describe("child executor composition", () => {
       { id: "read:resume:resume-1", kind: "resume", ref: "resume-1", source: "resume.get_base" },
     ])
     expect(requests).toHaveLength(1)
+    expect(requests[0]?.outputSchema).toMatchObject({ properties: { schemaVersion: { const: ROLE_RESULT_SCHEMA }, role: { const: "analyst" }, status: { enum: ["completed", "partial"] }, findings: { items: { properties: { evidenceIds: { minItems: 1 } }, additionalProperties: false } }, evidence: { items: { additionalProperties: false } } }, additionalProperties: false })
+  })
+
+  it.each([
+    ["marker mismatch", { expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" }, profile }],
+    ["unsupported structured output", { expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" }, profile: { ...profile, structuredOutput: false } }],
+    ["non-native structured output", { expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" }, profile: { ...profile, nativeTools: false, structuredOutput: true } }],
+  ] as const)("does not pass a role result schema for %s", (_label, overrides) => {
+    const child = { ...structuredLease("analyst"), expectedOutputSchema: overrides.expectedOutputSchema }
+    const requests: HarnessModelRequest[] = []
+    const model = textOnlyModel(_label === "marker mismatch" ? "done" : JSON.stringify(validAnalystResult()), request => requests.push(request))
+    const executor = createChildExecutor({
+      store: executionStore([], requests), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => ({ ...model, profile: overrides.profile }),
+      toolRuntimeFactory: () => ({ definitions: [tool("jobs.search", "jobs")], router: { execute: async (_context, request) => ({ ...request, status: "completed", errorCode: null }) } }),
+    })
+    return expect(executor({ lease: child })).resolves.toMatchObject({ status: "failed" }).then(() => expect(requests[0]?.outputSchema).toBeUndefined())
   })
 
   it("fails closed before the provider when restored evidence is malformed", async () => {

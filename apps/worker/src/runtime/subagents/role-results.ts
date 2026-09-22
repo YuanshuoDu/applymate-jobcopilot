@@ -1,4 +1,13 @@
 export const ROLE_RESULT_SCHEMA = "agent-harness.v2.subagent.result" as const
+type JsonSchema = Record<string, unknown>
+const evidenceSchema: JsonSchema = { type: "object", properties: { id: { type: "string", minLength: 1 }, kind: { type: "string", enum: ["job", "persona", "resume", "source"] }, ref: { type: "string", minLength: 1 }, source: { type: "string", minLength: 1 } }, required: ["id", "kind", "ref", "source"], additionalProperties: false }
+const evidenceIdsSchema: JsonSchema = { type: "array", items: { type: "string", minLength: 1 }, minItems: 1 }
+const baseSchema = (items: JsonSchema, itemName: "candidates" | "findings"): JsonSchema => ({ type: "object", properties: { schemaVersion: { const: ROLE_RESULT_SCHEMA }, role: { const: itemName === "candidates" ? "scout" : "analyst" }, status: { type: "string", enum: ["completed", "partial"] }, [itemName]: { type: "array", items, }, evidence: { type: "array", items: evidenceSchema }, summary: { type: "string" } }, required: ["schemaVersion", "role", "status", itemName, "evidence", "summary"], additionalProperties: false })
+const candidateSchema: JsonSchema = { type: "object", properties: { jobId: { type: "string", minLength: 1 }, source: { type: "string", minLength: 1 }, url: { anyOf: [{ type: "string", minLength: 1 }, { type: "null" }] }, evidenceIds: evidenceIdsSchema }, required: ["jobId", "source", "url", "evidenceIds"], additionalProperties: false }
+const findingSchema: JsonSchema = { type: "object", properties: { jobId: { type: "string", minLength: 1 }, score: { type: "number", minimum: 0, maximum: 10 }, evidenceIds: evidenceIdsSchema }, required: ["jobId", "score", "evidenceIds"], additionalProperties: false }
+export const SCOUT_ROLE_RESULT_OUTPUT_SCHEMA: JsonSchema = baseSchema(candidateSchema, "candidates")
+export const ANALYST_ROLE_RESULT_OUTPUT_SCHEMA: JsonSchema = baseSchema(findingSchema, "findings")
+export function roleResultOutputSchema(role: "scout" | "analyst"): JsonSchema { return role === "scout" ? SCOUT_ROLE_RESULT_OUTPUT_SCHEMA : ANALYST_ROLE_RESULT_OUTPUT_SCHEMA }
 export type RoleResultStatus = "completed" | "partial"
 export type EvidenceKind = "job" | "persona" | "resume" | "source"
 

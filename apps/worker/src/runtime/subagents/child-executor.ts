@@ -9,7 +9,7 @@ import type { ContextSnapshotAdapter } from "../context/context-snapshot-adapter
 import { createHarnessModelRuntime } from "../harness-model.js"
 import { visibleToolPolicy, getSubagentRolePolicy } from "./role-policy.js"
 import { childContextSnapshot, createChildContextBuilder, type ChildMailboxReader } from "./child-context.js"
-import { ROLE_RESULT_SCHEMA } from "./role-results.js"
+import { ROLE_RESULT_SCHEMA, roleResultOutputSchema } from "./role-results.js"
 import { createObservedEvidenceIndex, hydrateObservedEvidence, parseAndBindStructuredResult, recordReadToolOutput } from "./child-evidence.js"
 import type { ChildResumeLoader } from "./child-resume.js"
 import { SubagentLeaseError, type SubagentExecutionResult, type SubagentLease, type SubagentTaskRecord } from "./types.js"
@@ -162,6 +162,7 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       }
     }
     const adapter = await (options.modelRuntimeFactory?.({ task: lease }) ?? defaultModel(lease))
+    const structuredRole = expectedStructuredRole(lease.expectedOutputSchema, lease.role)
     const model = createUsageAwareModelAdapter(adapter, { owner, authorize: options.authorizeUsage, treeBudget: options.treeBudget })
     const routedTool = createToolRouterExecutor(runtime.router)
     const executeTool: typeof routedTool = async input => {
@@ -183,6 +184,7 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       resume,
       isOwnershipLost: (error, signal) => signal.aborted || error instanceof SubagentLeaseError,
       signalError: () => new Error("subagent_lease_lost"),
+      ...(adapter.profile.nativeTools && adapter.profile.structuredOutput && structuredRole ? { outputSchema: roleResultOutputSchema(structuredRole) } : {}),
     })
     const childResult = {
       status: result.status,
@@ -190,7 +192,6 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       toolCallCount: result.toolCallCount,
       finalItemId: result.finalItemId ?? null,
     }
-    const structuredRole = expectedStructuredRole(lease.expectedOutputSchema, lease.role)
     if (result.status === "completed" && structuredRole) {
       if (typeof result.finalText !== "string") return { status: "failed", result: { ...childResult, status: "failed" as const }, failureReason: "invalid_structured_result" }
       const structuredResult = parseAndBindStructuredResult(result.finalText, structuredRole, observedEvidence)

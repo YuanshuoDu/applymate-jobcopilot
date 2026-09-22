@@ -115,6 +115,7 @@ export function buildModelRequest(input: {
   taskId: string
   signal: AbortSignal
   maxOutputTokens?: number
+  outputSchema?: unknown
   continuation?: ModelContinuation
   replanRequired?: boolean
   freshSteering?: boolean
@@ -126,6 +127,7 @@ export function buildModelRequest(input: {
     messages: contextToModelMessages(input.context, input.replanRequired === true, input.freshSteering === true && input.replanRequired === true, hasCanonicalPlanTool(input.tools)),
     tools: [...input.tools],
     capabilities: capabilities(input.model.profile),
+    ...(input.outputSchema === undefined ? {} : { outputSchema: input.outputSchema }),
     ...(input.model.profile.nativeTools && input.tools.length > 0 ? { toolChoice: "auto" as const } : {}),
     ...(input.model.profile.continuationCursor && input.continuation ? { continuation: input.continuation } : {}),
     ...(input.maxOutputTokens === undefined ? {} : { maxOutputTokens: input.maxOutputTokens }),

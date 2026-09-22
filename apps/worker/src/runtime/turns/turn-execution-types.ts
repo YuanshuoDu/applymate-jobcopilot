@@ -85,6 +85,7 @@ export type TurnExecutionOptions = {
   readonly contextBuilder: TurnExecutionContextBuilder
   readonly store: TurnExecutionStore
   readonly model: ModelAdapter
+  readonly outputSchema?: unknown
   readonly tools: readonly unknown[]
   readonly executeTool: TurnEngineToolExecutor
   readonly rootInputId?: string

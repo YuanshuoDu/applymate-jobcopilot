@@ -136,6 +136,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           taskId: options.identity.taskId, userId: options.identity.userId, signal, continuation,
           replanRequired,
           freshSteering,
+          outputSchema: options.outputSchema,
         })
           assertModelAllowance(budget.snapshot())
         const reservation = budget.reserveModel()

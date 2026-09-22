@@ -3118,3 +3118,11 @@ Focused message tests and Worker typecheck passed. Live provider/model behavior 
 When a child task carries the exact server-owned Scout/Analyst structured-result marker, `childContextSnapshot` adds a fixed system instruction requiring one JSON result with the role-specific candidates/findings, evidence, evidenceIds, status, and summary fields. Plain and null-prototype JSON markers are accepted; symbol keys, extra fields, mismatched roles, Reviewer/Auditor tasks, and legacy prose paths receive no instruction. Server validation, role policy, public spawn schema, production gates, providers, and persistence remain unchanged.
 
 **Independent verification:** `child-context.test.ts` and `child-executor.test.ts` passed **67/67** tests; Worker TypeScript, source line limit, and `git diff --check` passed. Live provider/model behavior, queue delivery, process restart, and production evidence remain unverified.
+
+## 184. P8-103 — Provider-gated structured child output schema
+
+**Candidate status/date (2026-09-22):** P8-103 is a bounded Worker model-request contract slice; formal P0-P7 acceptance remains **1/8 (12.5%)**.
+
+Exact server-owned Scout/Analyst markers now select role-specific closed JSON schemas only when the model profile advertises both native tools and structured output. Unsupported profiles, reviewer/auditor, marker mismatches, and legacy prose paths omit `outputSchema`; routing, fallback, public spawn, validation, production gates, provider configuration, and persistence remain unchanged.
+
+Focused child-executor, role-result, model-message, and turn-loop tests passed **144/144**; Worker TypeScript and `git diff --check` passed. Live provider/model behavior and production evidence remain unverified.
