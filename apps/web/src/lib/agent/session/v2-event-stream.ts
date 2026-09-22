@@ -9,6 +9,7 @@ import {
 
 import { BoundedStreamBuffer, type StreamFrame } from "./stream-buffer"
 import { redactStreamValue } from "./stream-redaction"
+import { createDurablePollWakeup, startAgentEventWakeup, waitForDuration, type AgentEventPubSubFactory } from "./event-wakeup"
 import { CONTEXT_COMPACTION_EVENT_TYPE, projectContextCompactionRow } from "../../../components/agent-workspace/v2/timeline-context-compaction"
 const DEFAULT_DB_POLL_MS = 750
 const DEFAULT_HEARTBEAT_MS = 15_000
@@ -43,6 +44,7 @@ export interface V2EventStreamOptions {
   heartbeatMs?: number
   bufferCapacity?: number
   redisFactory?: () => AgentStreamRedis | null
+  eventRedisFactory?: AgentEventPubSubFactory
 }
 
 export function parseAfterSequence(request: Request): bigint | Response {
@@ -73,13 +75,15 @@ export function createV2EventStream(db: PrismaClient, options: V2EventStreamOpti
     }) }),
     options.bufferCapacity ?? DEFAULT_BUFFER_CAPACITY,
   )
+  const durableWakeup = createDurablePollWakeup()
   const onRequestAbort = () => lifetime.abort()
   if (options.signal?.aborted) lifetime.abort()
   else options.signal?.addEventListener("abort", onRequestAbort, { once: true })
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       const producers = [
-        durableEventLoop(db, options, buffer, signal),
+        durableEventLoop(db, options, buffer, signal, durableWakeup),
+        startAgentEventWakeup(options.sessionId, options.eventRedisFactory, durableWakeup, signal),
         deltaLoop(options, buffer, signal),
         heartbeatLoop(options, buffer, signal),
       ]
@@ -120,6 +124,7 @@ async function durableEventLoop(
   options: V2EventStreamOptions,
   buffer: BoundedStreamBuffer,
   signal: AbortSignal,
+  wakeup: ReturnType<typeof createDurablePollWakeup>,
 ): Promise<void> {
   let lastSequence = options.afterSequence
   while (!signal.aborted) {
@@ -143,7 +148,7 @@ async function durableEventLoop(
     } catch {
       // The next poll retries a transient database error without cancelling the Turn.
     }
-    await delay(options.dbPollMs ?? DEFAULT_DB_POLL_MS, signal)
+    await wakeup.wait(options.dbPollMs ?? DEFAULT_DB_POLL_MS, signal)
   }
 }
 
@@ -181,7 +186,7 @@ async function deltaLoop(
 
 async function heartbeatLoop(options: V2EventStreamOptions, buffer: BoundedStreamBuffer, signal: AbortSignal): Promise<void> {
   while (!signal.aborted) {
-    await delay(options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS, signal)
+    await waitForDuration(options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS, signal)
     if (!signal.aborted) buffer.push({ kind: "transient", body: ": heartbeat\n\n" })
   }
 }
@@ -232,15 +237,4 @@ function defaultRedisFactory(): AgentStreamRedis | null {
   const url = process.env.REDIS_URL?.trim()
   if (!url) return null
   return new Redis(url, { lazyConnect: true, connectTimeout: 1_000, maxRetriesPerRequest: 1, retryStrategy: () => null })
-}
-async function delay(milliseconds: number, signal: AbortSignal): Promise<void> {
-  await new Promise<void>((resolve) => {
-    if (signal.aborted) { resolve(); return }
-    const onAbort = () => { clearTimeout(timer); resolve() }
-    const timer = setTimeout(() => {
-      signal.removeEventListener("abort", onAbort)
-      resolve()
-    }, milliseconds)
-    signal.addEventListener("abort", onAbort, { once: true })
-  })
 }

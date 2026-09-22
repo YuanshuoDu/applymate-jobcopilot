@@ -2968,3 +2968,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused consumer validation passed **19/19**; the three-file wiring validation passed **27/27**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 
 **Candidate boundary:** Real PostgreSQL/RLS, cross-process Redis/BullMQ delivery, process restart recovery, and production supervisor evidence remain unverified. No schema, migration, Web, or provider changes were made; P8-81 remains a candidate.
+
+## 168. P8-82 — Web V2 SSE durable event wakeup hint
+
+**Candidate status/date (2026-09-22):** P8-82 adds a bounded Web V2 SSE Redis wakeup hint while formal P0-P7 acceptance remains **1/8 (12.5%)**.
+
+**Implementation:** Each Web V2 SSE connection now creates an independent Redis Pub/Sub subscriber and subscribes only to `agentEventChannel(sessionId)`. Pub/Sub messages only wake the durable PostgreSQL poll; `agentEvent.findMany` remains the sole source of truth, fetching `sequence > cursor` in ascending order and emitting canonical SSE frames. Duplicate, out-of-order, malformed, lost, or unavailable Redis notifications fall back to the existing DB poll, and Redis payloads are never written directly to SSE. Abort cleanup removes listeners, unsubscribes, and disconnects the subscriber; existing reconnect, `Last-Event-ID`, sequence, and timeline contracts remain unchanged.
+
+**Independent verification:** Focused Web stream validation passed **2 files / 17 tests**; Web `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, live Redis Pub/Sub, process restart recovery, deployment, and production supervisor evidence remain unverified. No Worker, schema, route, protocol, or package changes were made; P8-82 remains a candidate.
