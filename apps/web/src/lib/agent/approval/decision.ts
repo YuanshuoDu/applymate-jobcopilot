@@ -38,7 +38,7 @@ interface ApprovalFreshnessRow {
  * Event sequence is session-global, so a later goal/plan revision is stale
  * even when it belongs to a different Turn in the same session.
  */
-async function assertApprovalFreshnessInTransaction(tx: Tx, row: ApprovalFreshnessRow): Promise<void> {
+export async function assertApprovalFreshnessInTransaction(tx: Tx, row: ApprovalFreshnessRow): Promise<void> {
   const session = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
     SELECT "id" FROM "agent_sessions"
     WHERE "id" = ${row.sessionId}

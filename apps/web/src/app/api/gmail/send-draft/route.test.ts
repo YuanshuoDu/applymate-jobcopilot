@@ -21,6 +21,24 @@ const mocks = vi.hoisted(() => ({
 }))
 const pinnedFetch = vi.hoisted(() => vi.fn((input: string | URL, init?: unknown) => globalThis.fetch(String(input), init as RequestInit)))
 
+function canonicalResolution(decision: 'approved' | 'rejected', disposition: 'resolved' | 'duplicate' = 'resolved') {
+  return {
+    disposition: 'canonical_wait',
+    decision,
+    result: {
+      waitKind: 'approval',
+      waitId: 'approval_1',
+      itemId: 'agent-wait:approval:approval_1',
+      turnId: 'turn_1',
+      toolCallId: 'gmail-send:1',
+      disposition,
+      status: decision,
+      nextTurnRevision: 1,
+      sequence: '9',
+    },
+  }
+}
+
 vi.mock('@/lib/api-helpers', () => ({
   requireAuth: mocks.requireAuth,
   isErrorResponse: (value: unknown) => value instanceof Response,
@@ -118,5 +136,30 @@ describe('POST /api/gmail/send-draft', () => {
     }) as never)
 
     await expect(response.json()).resolves.toEqual({ error: 'Gmail send failed (HTTP 429)' })
+  })
+
+  it.each([
+    ['approved', 'approved'],
+    ['rejected', 'rejected'],
+  ] as const)('returns a 202 canonical %s disposition without Gmail side effects', async (decision, expectedDisposition) => {
+    mocks.resolveLegacyApproval.mockResolvedValueOnce(canonicalResolution(decision))
+    const { POST } = await import('./route')
+
+    const response = await POST(new Request('http://localhost/api/gmail/send-draft', {
+      method: 'POST', body: JSON.stringify({
+        to: 'recruiter@example.com', draft: 'Thank you.', gmailMessageId: 'gmail-1',
+        approvalId: 'approval_1', sessionId: 'session_1', ...(decision === 'approved' ? { receiptNonce: 'nonce_1' } : {}), decision,
+      }),
+    }) as never)
+
+    expect(response.status).toBe(202)
+    await expect(response.json()).resolves.toEqual({ sent: false, disposition: expectedDisposition, duplicate: false })
+    expect(mocks.resolveLegacyApproval).toHaveBeenCalledTimes(1)
+    expect(mocks.getGoogleAccessToken).not.toHaveBeenCalled()
+    expect(fetch).not.toHaveBeenCalled()
+    expect(mocks.agentTurnUpdate).not.toHaveBeenCalled()
+    expect(mocks.consumeLegacyReceipt).not.toHaveBeenCalled()
+    expect(mocks.jobUpdate).not.toHaveBeenCalled()
+    expect(mocks.activityCreate).not.toHaveBeenCalled()
   })
 })

@@ -203,8 +203,10 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
         toolName: "automation.mutate", domain: "automation", risk: "internal_write", capabilities: ["read", "write"],
         input: { requiresReceipt: true, receiptValidated: true, unknownSensitiveFacts: false },
       })
-      await validateReceiptForApproval(db, automationApproval, action.receiptNonce, auth.userId, id, { automationName: action.draft.name })
-      await resolveLegacyApproval(db, { approval: automationApproval, userId: auth.userId, sessionId: id, decision: "approved" })
+      const resolution = await resolveLegacyApproval(db, { approval: automationApproval, userId: auth.userId, sessionId: id, decision: "approved" }, {
+        beforeResolve: () => validateReceiptForApproval(db, automationApproval, action.receiptNonce!, auth.userId, id, { automationName: action.draft.name }),
+      })
+      if (resolution?.disposition === "canonical_wait") return canonicalApprovalResponse(resolution)
       if (automationApproval.turnId) await db.agentTurn.update({ where: { id: automationApproval.turnId }, data: { status: "in_progress" } })
       await consumeReceiptForApproval(db, automationApproval, action.receiptNonce, auth.userId, id, { automationName: action.draft.name })
     } catch (error) {
@@ -241,7 +243,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
   let approval: ScopedApproval | null = null
   if (action.approvalId) {
     approval = await db.agentApproval.findFirst({
-      where: { id: action.approvalId, sessionId: id, userId: auth.userId, status: 'pending' },
+      where: { id: action.approvalId, sessionId: id, userId: auth.userId, status: "pending" },
       select: {
         id: true, type: true, payload: true, turnId: true, toolCallId: true, jobId: true,
         revision: true, expiresAt: true, resourceHash: true, materialHash: true, answersHash: true,
@@ -258,7 +260,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
         toolCallId: approval.toolCallId ?? `approval:${action.approvalId}`,
         toolName: policy.toolName,
         domain: policy.domain,
-        risk: policy.risk,
+        risk: action.decision === "approved" ? policy.risk : "internal_write",
         capabilities: policy.capabilities,
         input: {
           requiresReceipt: action.decision === "approved",
@@ -277,13 +279,17 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
       if (aiAccess === "exhausted") return err("Monthly AI credits exhausted", 429)
     }
     try {
-      if (action.decision === "approved") await validateReceiptForApproval(db, approval, action.receiptNonce!, auth.userId, id)
-      await resolveLegacyApproval(db, {
+      const resolution = await resolveLegacyApproval(db, {
         approval,
         userId: auth.userId,
         sessionId: id,
         decision: action.decision === "approved" ? "approved" : "rejected",
+      }, {
+        beforeResolve: action.decision === "approved"
+          ? () => validateReceiptForApproval(db, approval!, action.receiptNonce!, auth.userId, id)
+          : undefined,
       })
+      if (resolution?.disposition === "canonical_wait") return canonicalApprovalResponse(resolution)
       if (approval.turnId) {
         await db.agentTurn.update({ where: { id: approval.turnId }, data: { status: "in_progress" } })
       }
@@ -501,6 +507,13 @@ function policyErrorResponse(error: unknown) {
     ? 422
     : 428
   return err(message, status)
+}
+
+function canonicalApprovalResponse(resolution: Extract<Awaited<ReturnType<typeof resolveLegacyApproval>>, { disposition: "canonical_wait" }>) {
+  return ok({
+    disposition: resolution.decision,
+    duplicate: resolution.result.disposition === "duplicate",
+  }, 202)
 }
 
 async function consumeReceiptForApproval(db: Parameters<typeof consumeLegacyReceipt>[0], approval: ScopedApproval, nonce: string, userId: string, sessionId: string, resource?: unknown) {

@@ -13,7 +13,7 @@ import {
 
 import { appendAgentEventWithOutboxInTransaction } from "../session/fact-store"
 import { projectApprovalWaitInTransaction } from "../broker/item-projector"
-import { resolvePendingApprovalInTransaction } from "./decision"
+import { assertApprovalFreshnessInTransaction, resolvePendingApprovalInTransaction } from "./decision"
 import {
   ApprovalStoreError,
   assertScopeInput,
@@ -218,6 +218,7 @@ export async function consumeApprovalAndReserve(
     return await db.$transaction(async (tx) => {
       const row = await loadApproval(tx, id, expected.userId)
       const scope = await assertScope(row, expected, now)
+      await assertApprovalFreshnessInTransaction(tx, { id: row.id, sessionId: row.sessionId, turnId: scope.turnId })
       const updated = await tx.agentApproval.updateMany({
         where: { id, userId: expected.userId, status: "approved", revision: expected.revision, scopeHash: row.scopeHash, nonceHash: row.nonceHash, expiresAt: { gt: now } },
         data: { status: "consumed", consumedAt: now },

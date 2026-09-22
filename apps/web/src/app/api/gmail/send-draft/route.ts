@@ -21,9 +21,9 @@ export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => null)
   if (!body || typeof body !== 'object') return err('Missing email draft', 400)
 
-  const { to, subject, draft, jobId, gmailMessageId, threadId, messageKind, approvalId, receiptNonce, sessionId } = body as {
+  const { to, subject, draft, jobId, gmailMessageId, threadId, messageKind, approvalId, receiptNonce, sessionId, decision: rawDecision } = body as {
     to?: unknown; subject?: unknown; draft?: unknown; jobId?: unknown; gmailMessageId?: unknown; threadId?: unknown; messageKind?: unknown
-    approvalId?: unknown; receiptNonce?: unknown; sessionId?: unknown
+    approvalId?: unknown; receiptNonce?: unknown; sessionId?: unknown; decision?: unknown
   }
   if (typeof to !== 'string' || !to.trim() || typeof draft !== 'string' || !draft.trim()) return err('Missing to or draft', 400)
   if (draft.length > 50_000) return err('Draft is too large', 400)
@@ -31,44 +31,63 @@ export async function POST(req: NextRequest) {
   const normalizedJobId = typeof jobId === 'string' && jobId ? jobId : undefined
   const normalizedMessageId = typeof gmailMessageId === 'string' && gmailMessageId ? gmailMessageId : undefined
   const normalizedThreadId = typeof threadId === 'string' && threadId ? threadId : undefined
+  const approvalDecision: 'approved' | 'rejected' = rawDecision === 'rejected' ? 'rejected' : 'approved'
+  const approvalKey = typeof approvalId === 'string' && approvalId ? approvalId : null
+  const sessionKey = typeof sessionId === 'string' && sessionId ? sessionId : null
+  const receiptKey = typeof receiptNonce === 'string' && receiptNonce ? receiptNonce : null
   const matchedJob = await findFollowUpJob(auth.userId, normalizedJobId, normalizedMessageId)
   if (!matchedJob) return err('Link this email to one of your tracked jobs before sending a follow-up.', 409)
-  const token = await getGoogleAccessToken(auth.userId)
-  if (!token) return err('Gmail not connected. Please connect Google account in Settings.')
 
-  if (typeof approvalId !== 'string' || typeof receiptNonce !== 'string' || typeof sessionId !== 'string') {
+  if (approvalDecision === 'approved' && (!approvalKey || !sessionKey || !receiptKey)) {
+    const token = await getGoogleAccessToken(auth.userId)
+    if (!token) return err('Gmail not connected. Please connect Google account in Settings.')
     return createSendApproval(auth.userId, matchedJob.id, {
       to: to.trim(), subject: normalizedSubject, draft, gmailMessageId: normalizedMessageId, threadId: normalizedThreadId, messageKind,
     })
   }
+  if (!approvalKey || !sessionKey) return err('The Gmail approval is no longer valid.', 409)
 
   const approval = await db.agentApproval.findFirst({
-    where: { id: approvalId, sessionId, userId: auth.userId, status: 'pending', type: 'send_gmail' },
+    where: { id: approvalKey, sessionId: sessionKey, userId: auth.userId, status: 'pending', type: 'send_gmail' },
     select: { id: true, type: true, payload: true, turnId: true, toolCallId: true, jobId: true, revision: true, expiresAt: true },
   })
   if (!approval || approval.jobId !== matchedJob.id || !approval.turnId || !approval.toolCallId || !approval.expiresAt) return err('The Gmail approval is no longer valid.', 409)
   try {
     requireLegacyPolicy({
-      userId: auth.userId, sessionId, turnId: approval.turnId, stepId: `gmail:${approval.id}`, toolCallId: approval.toolCallId,
-      toolName: 'gmail.send', domain: 'gmail', risk: 'external_write', capabilities: ['read', 'write', 'external_write'],
-      input: { requiresReceipt: true, receiptValidated: true, unknownSensitiveFacts: false },
+      userId: auth.userId, sessionId: sessionKey, turnId: approval.turnId, stepId: `gmail:${approval.id}`, toolCallId: approval.toolCallId,
+      toolName: 'gmail.send', domain: 'gmail',
+      risk: approvalDecision === 'approved' ? 'external_write' : 'internal_write',
+      capabilities: approvalDecision === 'approved' ? ['read', 'write', 'external_write'] : ['read', 'write'],
+      input: { requiresReceipt: approvalDecision === 'approved', receiptValidated: Boolean(receiptKey), unknownSensitiveFacts: false },
     })
-    await validateLegacyReceipt(db, {
-      approvalId: approval.id, userId: auth.userId, sessionId, turnId: approval.turnId, toolCallId: approval.toolCallId, jobId: matchedJob.id,
-      action: 'send_gmail', nonce: receiptNonce, resource: { jobId: matchedJob.id, gmailMessageId: normalizedMessageId, threadId: normalizedThreadId },
-      material: { to: to.trim(), subject: normalizedSubject, draft }, answers: null, revision: approval.revision, expiresAt: approval.expiresAt,
+    const resolution = await resolveLegacyApproval(db, {
+      approval, userId: auth.userId, sessionId: sessionKey, decision: approvalDecision,
+    }, {
+      beforeResolve: approvalDecision === 'approved'
+        ? async () => { await validateLegacyReceipt(db, {
+          approvalId: approval.id, userId: auth.userId, sessionId: sessionKey, turnId: approval.turnId!, toolCallId: approval.toolCallId!, jobId: matchedJob.id,
+          action: 'send_gmail', nonce: receiptKey!, resource: { jobId: matchedJob.id, gmailMessageId: normalizedMessageId, threadId: normalizedThreadId },
+          material: { to: to.trim(), subject: normalizedSubject, draft }, answers: null, revision: approval.revision, expiresAt: approval.expiresAt!,
+        }) }
+        : undefined,
     })
-    await resolveLegacyApproval(db, { approval, userId: auth.userId, sessionId, decision: 'approved' })
+    if (resolution?.disposition === 'canonical_wait') {
+      return ok({ sent: false, disposition: resolution.decision, duplicate: resolution.result.disposition === 'duplicate' }, 202)
+    }
+    if (approvalDecision === 'rejected') return ok({ sent: false, disposition: 'rejected' }, 202)
     await db.agentTurn.update({ where: { id: approval.turnId }, data: { status: 'in_progress' } })
     await consumeLegacyReceipt(db, {
-      approvalId: approval.id, userId: auth.userId, sessionId, turnId: approval.turnId, toolCallId: approval.toolCallId, jobId: matchedJob.id,
-      action: 'send_gmail', nonce: receiptNonce, resource: { jobId: matchedJob.id, gmailMessageId: normalizedMessageId, threadId: normalizedThreadId },
+      approvalId: approval.id, userId: auth.userId, sessionId: sessionKey, turnId: approval.turnId, toolCallId: approval.toolCallId, jobId: matchedJob.id,
+      action: 'send_gmail', nonce: receiptKey!, resource: { jobId: matchedJob.id, gmailMessageId: normalizedMessageId, threadId: normalizedThreadId },
       material: { to: to.trim(), subject: normalizedSubject, draft }, answers: null, revision: approval.revision, expiresAt: approval.expiresAt,
       reservationKey: `gmail-send:${approval.id}`,
     })
   } catch (error) {
     return err(error instanceof Error ? error.message : 'The Gmail approval could not be consumed.', 409)
   }
+
+  const token = await getGoogleAccessToken(auth.userId)
+  if (!token) return err('Gmail not connected. Please connect Google account in Settings.')
 
   // Build RFC 2822 message
   const fromRes = await trackedExternalApiFetch('https://gmail.googleapis.com/gmail/v1/users/me/profile', {

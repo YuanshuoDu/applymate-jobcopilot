@@ -89,6 +89,24 @@ function approvalRecord(overrides: Record<string, unknown> = {}) {
   }
 }
 
+function canonicalResolution(decision: "approved" | "rejected", disposition: "resolved" | "duplicate" = "resolved") {
+  return {
+    disposition: "canonical_wait",
+    decision,
+    result: {
+      waitKind: "approval",
+      waitId: "approval_1",
+      itemId: "agent-wait:approval:approval_1",
+      turnId: "turn_1",
+      toolCallId: "call_1",
+      disposition,
+      status: decision,
+      nextTurnRevision: 1,
+      sequence: "9",
+    },
+  }
+}
+
 const ctx = { params: Promise.resolve({ id: "session_1" }) }
 
 describe("agent session actions API", () => {
@@ -352,7 +370,7 @@ describe("agent session actions API", () => {
     expect(mocks.resolveLegacyApproval).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       approval: expect.objectContaining({ id: "approval_1" }),
       decision: "approved",
-    }))
+    }), expect.objectContaining({ beforeResolve: expect.any(Function) }))
     expect(mocks.consumeLegacyReceipt).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       approvalId: "approval_1",
       nonce: "nonce_1",
@@ -379,6 +397,67 @@ describe("agent session actions API", () => {
         completedAt: expect.any(Date),
       },
     })
+  })
+
+  it.each([
+    ["approved", "approved"],
+    ["rejected", "rejected"],
+  ] as const)("returns a 202 canonical %s disposition without legacy side effects", async (decision, expectedDisposition) => {
+    mocks.resolveLegacyApproval.mockResolvedValueOnce(canonicalResolution(decision))
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest({
+      type: "approval_response",
+      approvalId: "approval_1",
+      decision,
+      ...(decision === "approved" ? { receiptNonce: "nonce_1" } : {}),
+    }) as never, ctx)
+
+    expect(res.status).toBe(202)
+    await expect(res.json()).resolves.toEqual({ disposition: expectedDisposition, duplicate: false })
+    expect(mocks.resolveLegacyApproval).toHaveBeenCalledTimes(1)
+    expect(mocks.agentTurnUpdate).not.toHaveBeenCalled()
+    expect(mocks.consumeLegacyReceipt).not.toHaveBeenCalled()
+    expect(mocks.transcriptCreate).not.toHaveBeenCalled()
+    expect(mocks.sessionUpdate).not.toHaveBeenCalled()
+    expect(mocks.tailorResumeForAgent).not.toHaveBeenCalled()
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled()
+  })
+
+  it("returns a duplicate canonical disposition without replaying the action", async () => {
+    mocks.resolveLegacyApproval.mockResolvedValueOnce(canonicalResolution("approved", "duplicate"))
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest({
+      type: "approval_response", approvalId: "approval_1", decision: "approved", receiptNonce: "nonce_1",
+    }) as never, ctx)
+
+    expect(res.status).toBe(202)
+    await expect(res.json()).resolves.toEqual({ disposition: "approved", duplicate: true })
+    expect(mocks.agentTurnUpdate).not.toHaveBeenCalled()
+    expect(mocks.consumeLegacyReceipt).not.toHaveBeenCalled()
+    expect(mocks.transcriptCreate).not.toHaveBeenCalled()
+  })
+
+  it("stops before canonical delegation when the scoped receipt is invalid", async () => {
+    mocks.validateLegacyReceipt.mockRejectedValueOnce(new Error("Approval nonce does not match"))
+    mocks.resolveLegacyApproval.mockImplementationOnce(async (_db, _input, options) => {
+      await options?.beforeResolve?.()
+      return canonicalResolution("approved")
+    })
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest({
+      type: "approval_response", approvalId: "approval_1", decision: "approved", receiptNonce: "bad_nonce",
+    }) as never, ctx)
+
+    expect(res.status).toBe(409)
+    await expect(res.json()).resolves.toEqual({ error: "Approval nonce does not match" })
+    expect(mocks.resolveLegacyApproval).toHaveBeenCalledTimes(1)
+    expect(mocks.validateLegacyReceipt).toHaveBeenCalledTimes(1)
+    expect(mocks.agentTurnUpdate).not.toHaveBeenCalled()
+    expect(mocks.consumeLegacyReceipt).not.toHaveBeenCalled()
+    expect(mocks.transcriptCreate).not.toHaveBeenCalled()
   })
 
   it("rejects stale approval responses without writing transcript events", async () => {

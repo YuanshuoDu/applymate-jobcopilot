@@ -2988,3 +2988,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused Worker validation passed **32/32** tests; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, live Redis delivery, process restart recovery, cross-process supervisor behavior, and production evidence remain unverified. No schema, Web, protocol, producer, or package changes were made; P8-83 remains a candidate.
+
+## 170. P8-84 — Legacy approval/action to canonical V2 durable resume bridge
+
+**Candidate status/date (2026-09-22):** P8-84 adds a bounded legacy approval/action delegation bridge to canonical V2 durable resume while formal P0-P7 acceptance remains **1/8 (12.5%)**.
+
+**Implementation:** Legacy session actions and Gmail send-draft endpoints now resolve scoped approvals against the canonical wait Item. When that wait exists, the legacy endpoint delegates exactly once to `decideApproval` and returns an explicit `202` with the approved/rejected disposition; it does not update the Turn directly, consume the legacy receipt, or execute Gmail/automation external side effects. Legacy-only approvals without a canonical Item retain their compatibility path. Web consumption and Worker publication remain aligned on durable `approval.requested` lineage and goal/plan revision freshness, with PostgreSQL as the durable authority and Redis as delivery/wakeup transport.
+
+**Independent verification:** Focused actions, Gmail, and approval-store validation passed **30/30**; Web `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, cross-process Redis delivery, process restart/recovery, and production E2E remain unverified. P8-84 remains a candidate.

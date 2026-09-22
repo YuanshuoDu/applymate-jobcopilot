@@ -44,6 +44,14 @@ export interface ScopedApprovalRecord {
   expiresAt: Date | null
 }
 
+export type LegacyApprovalResolution =
+  | { disposition: "legacy_only"; decision: "approved" | "rejected" }
+  | {
+      disposition: "canonical_wait"
+      decision: "approved" | "rejected"
+      result: Awaited<ReturnType<typeof decideApproval>>
+    }
+
 export async function issueLegacyReceipt(db: PrismaClient, input: LegacyReceiptInput): Promise<ApprovalReceiptResult> {
   const scope: ApprovalScopeInput = {
     userId: input.userId,
@@ -81,7 +89,8 @@ export async function validateLegacyReceipt(db: PrismaClient, input: LegacyRecei
 export async function resolveLegacyApproval(
   db: PrismaClient,
   input: { approval: ScopedApprovalRecord; userId: string; sessionId: string; decision: "approved" | "rejected" },
-) {
+  options: { beforeResolve?: () => Promise<void> } = {},
+): Promise<LegacyApprovalResolution> {
   const approval = input.approval
   if (!approval.turnId || !approval.toolCallId || !approval.jobId || !approval.expiresAt) {
     throw new Error("Approval is missing its scoped wait state")
@@ -95,8 +104,12 @@ export async function resolveLegacyApproval(
     select: { id: true, revision: true },
   }) : null
   if (!turn) throw new Error("Approval turn is no longer available")
-  if (!item) return resolveApproval(db, { id: approval.id, userId: input.userId, sessionId: input.sessionId, decision: input.decision })
-  return decideApproval(db, {
+  await options.beforeResolve?.()
+  if (!item) {
+    await resolveApproval(db, { id: approval.id, userId: input.userId, sessionId: input.sessionId, decision: input.decision })
+    return { disposition: "legacy_only", decision: input.decision }
+  }
+  const result = await decideApproval(db, {
     waitId: approval.id,
     sessionId: input.sessionId,
     userId: input.userId,
@@ -105,6 +118,7 @@ export async function resolveLegacyApproval(
     expectedRevision: turn.revision,
     decision: input.decision,
   })
+  return { disposition: "canonical_wait", decision: input.decision, result }
 }
 
 export async function hashLegacyValue(label: string, value: unknown): Promise<string> {
