@@ -1,7 +1,8 @@
 import { Buffer } from "node:buffer"
 import { redactSensitiveText } from "@jobcopilot/shared"
 import type { StepContextSnapshot } from "./step-context-builder.js"
-import { deriveContextMemoryNarrative, validateContextMemoryProjection, type CognitiveMemoryAnchor, type CognitiveMemoryDecision, type CognitiveMemoryOmittedRange, type CognitiveMemoryQuestion, type CognitiveMemoryReference, type ContextMemoryProjection } from "./context-memory-schema.js"
+import { deriveContextMemoryNarrative, validateContextMemoryProjection, type CognitiveMemoryAnchor, type CognitiveMemoryDecision, type CognitiveMemoryJobEvidenceExcerpt, type CognitiveMemoryOmittedRange, type CognitiveMemoryQuestion, type CognitiveMemoryReference, type ContextMemoryProjection } from "./context-memory-schema.js"
+import { addJobEvidence, extractJobEvidence, mergePriorMemory, referenceScope } from "./context-memory-job-evidence.js"
 import { resolveLatestAcceptedPlanCallId } from "../planning/plan-revision-scope.js"
 const MAX_BYTES = 8 * 1024
 const MAX_ENTRIES = 256
@@ -119,26 +120,6 @@ function add<T extends { readonly id: string }>(map: Map<string, T>, value: T | 
   map.set(value.id, value)
   return true
 }
-function referenceScope(value: CognitiveMemoryReference, expectedGoalRevision: number | undefined, expectedPlanRevision: number | undefined): "current" | "stale" | "future" { if (expectedGoalRevision === undefined || value.goalRevision === undefined || value.goalRevision === expectedGoalRevision && (expectedPlanRevision === undefined || value.planRevision === undefined || value.planRevision === expectedPlanRevision)) return "current"; if (value.goalRevision !== undefined && value.goalRevision > expectedGoalRevision!) return "future"; if (expectedPlanRevision !== undefined && value.goalRevision === expectedGoalRevision && value.planRevision !== undefined && value.planRevision > expectedPlanRevision) return "future"; return "stale" }
-function mergePriorMemory(content: Row, maps: readonly Map<string, CognitiveMemoryReference>[], decisions: Map<string, CognitiveMemoryDecision>, questions: Map<string, CognitiveMemoryQuestion>, plans: { goalRevision: number; planRevision: number }[], ranges: CognitiveMemoryOmittedRange[], expectedGoalRevision: number | undefined, expectedPlanRevision: number | undefined): bigint | null | false {
-  const memory = content.memory
-  const normalized = validateContextMemoryProjection(memory, expectedGoalRevision === undefined ? {} : { expectedGoalRevision, ...(expectedPlanRevision === undefined ? {} : { expectedPlanRevision }) })
-  if (!normalized) return false
-  const fields = ["unresolved", "waits", "approvals", "verifiedEvidence", "artifacts", "taskRefs", "eventRefs"]
-  for (const [index, field] of fields.entries()) {
-    for (const value of normalized[field as keyof ContextMemoryProjection] as readonly CognitiveMemoryReference[]) { const scope = referenceScope(value, expectedGoalRevision, expectedPlanRevision); if (scope === "future") return false; if (scope === "current" && !add(maps[index]!, value)) return false }
-  }
-  for (const value of normalized.decisions) if (!add(decisions, value)) return false
-  for (const value of normalized.unresolvedQuestions) if (!add(questions, value)) return false
-  const goalRevision = normalized.revisions.goalRevision, planRevision = normalized.revisions.planRevision
-  if (goalRevision !== null && planRevision !== null && (expectedPlanRevision === undefined || goalRevision !== expectedGoalRevision || planRevision <= expectedPlanRevision)) plans.push({ goalRevision, planRevision })
-  ranges.push(...normalized.omittedRanges)
-  if (maps.some(map => map.size > MAX_ITEMS) || decisions.size > MAX_ITEMS || questions.size > MAX_ITEMS || ranges.length > MAX_ITEMS) return false
-  if (normalized.coveredSequence === null) return null
-  const covered = sequence(normalized.coveredSequence)
-  return covered === null ? false : covered === undefined ? null : BigInt(covered)
-}
-
 function isCriticalId(id: string): boolean {
   return ["plan-revision:", "plan-result:", "plan-control:", "wait-result:", "approval:", "artifact:", "task:", "event:"].some(prefix => id.startsWith(prefix))
 }
@@ -160,7 +141,7 @@ export function isContextMemoryAnchorObservation(observation: Observation): bool
 function trimProjection(value: ContextMemoryProjection, maxBytes: number): ContextMemoryProjection | null {
   const encoded = (candidate: ContextMemoryProjection): string => JSON.stringify(candidate)
   if (Buffer.byteLength(encoded(value), "utf8") <= maxBytes) return value
-  const fields: (keyof ContextMemoryProjection)[] = ["eventRefs", "taskRefs", "artifacts", "verifiedEvidence", "unresolved"]
+  const fields: (keyof ContextMemoryProjection)[] = ["jobEvidenceExcerpts", "eventRefs", "taskRefs", "artifacts", "verifiedEvidence", "unresolved"]
   let candidate = value
   for (const field of fields) {
     if (!Array.isArray(candidate[field])) continue
@@ -195,7 +176,8 @@ export function buildContextMemoryProjection(snapshot: StepContextSnapshot, opti
   const planScope = expectedGoalRevision === undefined ? { kind: "unknown" as const } : resolveLatestAcceptedPlanCallId(observations.map(item => ({ id: item.id, content: item.content })), expectedGoalRevision)
   const expectedPlanRevision = planScope.kind === "known" ? planScope.planRevision : undefined
   const unresolved = new Map<string, CognitiveMemoryReference>(), waits = new Map<string, CognitiveMemoryReference>(), approvals = new Map<string, CognitiveMemoryReference>(), verified = new Map<string, CognitiveMemoryReference>(), artifacts = new Map<string, CognitiveMemoryReference>(), tasks = new Map<string, CognitiveMemoryReference>(), events = new Map<string, CognitiveMemoryReference>()
-  const decisions = new Map<string, CognitiveMemoryDecision>(), questions = new Map<string, CognitiveMemoryQuestion>()
+  const decisions = new Map<string, CognitiveMemoryDecision>(), questions = new Map<string, CognitiveMemoryQuestion>(), jobEvidence = new Map<string, CognitiveMemoryJobEvidenceExcerpt>()
+  const publicJobRefs = new Set(business.filter(item => (item.kind === "job" || item.kind === "jd") && (item.resource === undefined || item.resource === "job")).map(item => item.id))
   const planRows: { goalRevision: number; planRevision: number }[] = []
   let covered: bigint | null = null
   const omittedRanges: CognitiveMemoryOmittedRange[] = []
@@ -231,9 +213,14 @@ export function buildContextMemoryProjection(snapshot: StepContextSnapshot, opti
       if (ids.length > 0) omittedRanges.push({ fromId: ids[0]!, toId: ids[ids.length - 1]!, reason: "compaction" })
     }
     if (kind === "context_summary" && content.memory !== undefined) {
-      const prior = mergePriorMemory(content, [unresolved, waits, approvals, verified, artifacts, tasks, events], decisions, questions, planRows, omittedRanges, expectedGoalRevision, expectedPlanRevision)
+      const prior = mergePriorMemory(content, [unresolved, waits, approvals, verified, artifacts, tasks, events], jobEvidence, decisions, questions, planRows, omittedRanges, expectedGoalRevision, expectedPlanRevision)
       if (prior === false) return null
       if (prior !== null && (covered === null || prior > covered)) covered = prior
+    }
+    if (scope === "current") {
+      const evidence = extractJobEvidence(item as Observation, content, publicJobRefs, current)
+      if (evidence === null) continue
+      for (const value of evidence ?? []) addJobEvidence(jobEvidence, value)
     }
   }
   const revisions = planRows.sort((left, right) => left.goalRevision - right.goalRevision || left.planRevision - right.planRevision)
@@ -244,7 +231,7 @@ export function buildContextMemoryProjection(snapshot: StepContextSnapshot, opti
   const narrative = deriveContextMemoryNarrative(snapshot.toolObservations, goalRevision, expectedPlanRevision)
   for (const item of narrative.decisions) if (!add(decisions, item)) return null
   for (const item of narrative.unresolvedQuestions) if (!add(questions, item)) return null
-  const projection: ContextMemoryProjection = { schemaVersion: "agent-harness.cognitive-memory.v1", activeGoals: activeGoals.slice(0, MAX_ITEMS), fixedConstraints: fixedConstraints.slice(0, MAX_ITEMS), steering: userSteering.slice(0, MAX_ITEMS), revisions: { goalRevision, planRevision: latest?.planRevision ?? null }, decisions: sorted([...decisions.values()]).slice(0, MAX_ITEMS), unresolvedQuestions: sorted([...questions.values()]).slice(0, MAX_ITEMS), unresolved: sorted([...unresolved.values()]).slice(0, MAX_ITEMS), waits: sorted([...waits.values()]).slice(0, MAX_ITEMS), approvals: sorted([...approvals.values()]).slice(0, MAX_ITEMS), verifiedEvidence: sorted([...verified.values()]).slice(0, MAX_ITEMS), artifacts: sorted([...artifacts.values()]).slice(0, MAX_ITEMS), taskRefs: sorted([...tasks.values()]).slice(0, MAX_ITEMS), eventRefs: sorted([...events.values()]).slice(0, MAX_ITEMS), omittedRanges: omittedRanges.sort((left, right) => left.fromId.localeCompare(right.fromId)).slice(0, MAX_ITEMS), coveredSequence: covered?.toString() ?? null }
+  const projection: ContextMemoryProjection = { schemaVersion: "agent-harness.cognitive-memory.v1", activeGoals: activeGoals.slice(0, MAX_ITEMS), fixedConstraints: fixedConstraints.slice(0, MAX_ITEMS), steering: userSteering.slice(0, MAX_ITEMS), revisions: { goalRevision, planRevision: latest?.planRevision ?? null }, decisions: sorted([...decisions.values()]).slice(0, MAX_ITEMS), unresolvedQuestions: sorted([...questions.values()]).slice(0, MAX_ITEMS), jobEvidenceExcerpts: sorted([...jobEvidence.values()]).slice(0, 8), unresolved: sorted([...unresolved.values()]).slice(0, MAX_ITEMS), waits: sorted([...waits.values()]).slice(0, MAX_ITEMS), approvals: sorted([...approvals.values()]).slice(0, MAX_ITEMS), verifiedEvidence: sorted([...verified.values()]).slice(0, MAX_ITEMS), artifacts: sorted([...artifacts.values()]).slice(0, MAX_ITEMS), taskRefs: sorted([...tasks.values()]).slice(0, MAX_ITEMS), eventRefs: sorted([...events.values()]).slice(0, MAX_ITEMS), omittedRanges: omittedRanges.sort((left, right) => left.fromId.localeCompare(right.fromId)).slice(0, MAX_ITEMS), coveredSequence: covered?.toString() ?? null }
   const trimmed = trimProjection(projection, maxBytes)
   return trimmed ? validateContextMemoryProjection(trimmed, { maxBytes, ...(goalRevision === null ? {} : { expectedGoalRevision: goalRevision }), ...(expectedPlanRevision === undefined ? {} : { expectedPlanRevision }) }) : null
 }

@@ -61,6 +61,24 @@ describe("StepContextSnapshot adapter", () => {
     expect(backing.saved).toHaveLength(1)
   })
 
+  it("carries validated public job excerpts through compaction", async () => {
+    const input = {
+      ...base,
+      toolObservations: [
+        { id: "tool-result:jobs-1", content: { toolCallId: "jobs-1", toolName: "jobs.get", status: "completed", errorCode: null, output: { job: { id: "ref", company: "Example", role: "Engineer", location: "Dublin", status: "open", score: 8, url: "https://jobs.example/ref", source: "greenhouse", salary: "€70k", description: "Public role recruiter@example.com +353 87 123 4567", keywords: "private ranking metadata" } } } },
+        ...observations(3).toolObservations,
+      ],
+    }
+    const adapter = createContextSnapshotAdapter({ store: store(), observationCountThreshold: 3, keepRecentObservations: 1 })
+    const result = await adapter.hook(request(input))
+    expect(result.status).toBe("compacted")
+    if (result.status !== "compacted") return
+    expect(result.snapshot.toolObservations[0]?.content).toMatchObject({ kind: "context_summary", memory: { jobEvidenceExcerpts: [{ referenceId: "ref", trust: "external_untrusted" }] } })
+    expect(JSON.stringify(result.snapshot.toolObservations[0])).not.toContain("private ranking metadata")
+    expect(JSON.stringify(result.snapshot.toolObservations[0])).not.toContain("recruiter@example.com")
+    expect(JSON.stringify(result.snapshot.toolObservations[0])).not.toContain("+353 87 123 4567")
+  })
+
   it("retains durable plan and wait anchors in the compacted snapshot memory", async () => {
     const durable = [
       { id: "plan-revision:plan-1", content: { kind: "plan_revision", goalRevision: 1, planRevision: 1 } },

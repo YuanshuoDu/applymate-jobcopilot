@@ -32,7 +32,8 @@ describe("context memory schema", () => {
     const legacy = { ...value } as unknown as Record<string, unknown>
     delete legacy.decisions
     delete legacy.unresolvedQuestions
-    expect(validateContextMemoryProjection(legacy)).toMatchObject({ decisions: [], unresolvedQuestions: [] })
+    delete legacy.jobEvidenceExcerpts
+    expect(validateContextMemoryProjection(legacy)).toMatchObject({ decisions: [], unresolvedQuestions: [], jobEvidenceExcerpts: [] })
   })
 
   it.each([
@@ -111,5 +112,6 @@ describe("context memory schema", () => {
 
   it("rejects a malformed new field instead of treating it as absent", () => {
     expect(validateContextMemoryProjection({ ...projection(), decisions: null })).toBeNull()
+    expect(validateContextMemoryProjection({ ...projection(), jobEvidenceExcerpts: null })).toBeNull()
   })
 })

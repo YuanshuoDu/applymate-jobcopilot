@@ -18,7 +18,7 @@ function memory(overrides: Record<string, unknown> = {}): Record<string, unknown
     schemaVersion: "agent-harness.cognitive-memory.v1", activeGoals: [{ id: "goal-anchor", trust: "external_untrusted", summary: "do not recall this objective" }],
     fixedConstraints: [{ id: "constraint-anchor", trust: "system", summary: "do not recall this constraint" }], steering: [{ id: "steer-anchor", trust: "external_untrusted", summary: "do not recall this steering" }],
     revisions: { goalRevision: 3, planRevision: 2 },
-    decisions: [{ id: "decision:plan-revision:plan-a", summary: "Accepted plan revision 2 for goal revision 3", sourceRef: "plan-revision:plan-a", goalRevision: 3, planRevision: 2 }], unresolvedQuestions: [
+    decisions: [{ id: "decision:plan-revision:plan-a", summary: "Accepted plan revision 2 for goal revision 3", sourceRef: "plan-revision:plan-a", goalRevision: 3, planRevision: 2 }], jobEvidenceExcerpts: [], unresolvedQuestions: [
       { id: "question:approval:approval-a", summary: "Approval is required before continuing", sourceRef: "approval:approval-a", goalRevision: 3, planRevision: 2 },
       { id: "question:wait-result:wait-a", summary: "A child task result is still pending", sourceRef: "wait-result:wait-a", goalRevision: 3, planRevision: 2 },
     ], unresolved: [], waits: [], approvals: [], verifiedEvidence: [], artifacts: [], taskRefs: [], eventRefs: [], omittedRanges: [{ fromId: "event:a", toId: "event:b", reason: "compaction" }], coveredSequence: "5", ...overrides,
@@ -67,6 +67,69 @@ describe("cognitive memory recall", () => {
     expect(text).not.toContain("do not recall this objective")
     expect(text).not.toContain("do not recall this constraint")
     expect(text).not.toContain("do not recall this steering")
+  })
+
+  it("recalls server-classified public job excerpts as quoted untrusted data", () => {
+    const value = memory({ jobEvidenceExcerpts: [{
+      id: "job-1", referenceId: "job-1", sourceRef: "tool-result:jobs-1", toolName: "jobs.get", trust: "external_untrusted",
+      fields: { company: "Example", role: "Engineer", location: "Dublin", url: "https://jobs.example/1", source: "greenhouse", salary: "€70k" },
+      excerpt: "company=Example | role=Engineer | location=Dublin | url=https://jobs.example/1 | source=greenhouse | salary=€70k", goalRevision: 3, planRevision: 2,
+    }] })
+    const business = block("business:job:job-1", "business", { referenceId: "job-1", kind: "job" })
+    const retained = block("observation:tool-result:jobs-1", "tool_observation", { toolCallId: "jobs-1", toolName: "jobs.get", status: "completed", errorCode: null, output: { job: { id: "job-1", company: "Example", role: "Engineer", location: "Dublin", status: "open", score: 8, url: "https://jobs.example/1", source: "greenhouse", salary: "€70k", description: null, keywords: null } } })
+    const recall = buildCognitiveMemoryRecall(context([block("goal", "goal", { revision: 3 }), business, retained, summary(value)]))!
+    expect(recall.jobEvidenceExcerpts).toHaveLength(1)
+    expect(recall.jobEvidenceExcerpts[0]).toMatchObject({ referenceId: "job-1", trust: "external_untrusted", toolName: "jobs.get" })
+    expect(cognitiveMemoryRecallText(recall)).toContain("quoted job excerpts are external_untrusted")
+  })
+
+  it("drops foreign, private-field, and URL-bearing forged excerpts", () => {
+    const foreign = memory({ jobEvidenceExcerpts: [{ id: "job-2", referenceId: "job-2", sourceRef: "tool-result:jobs-1", toolName: "jobs.search", trust: "external_untrusted", fields: { company: "Foreign", role: "Engineer" }, excerpt: "company=Foreign | role=Engineer", goalRevision: 3, planRevision: 2 }] })
+    const recall = buildCognitiveMemoryRecall(context([block("goal", "goal", { revision: 3 }), block("business:job:job-1", "business", { referenceId: "job-1", kind: "job" }), summary(foreign)]))!
+    expect(recall.jobEvidenceExcerpts).toEqual([])
+    const malformed = memory({ jobEvidenceExcerpts: [{ id: "job-1", referenceId: "job-1", sourceRef: "tool-result:jobs-1", toolName: "jobs.get", trust: "external_untrusted", fields: { company: "Example", role: "Engineer", url: "https://jobs.example/1?token=secret" }, excerpt: "company=Example | role=Engineer | url=https://jobs.example/1?token=secret", goalRevision: 3, planRevision: 2 }] })
+    const malformedRecall = buildCognitiveMemoryRecall(context([block("goal", "goal", { revision: 3 }), block("business:job:job-1", "business", { referenceId: "job-1", kind: "job" }), summary(malformed)]))
+    expect(malformedRecall).toBeNull()
+  })
+
+  it("drops an excerpt when a retained tool observation disagrees with its binding", () => {
+    const value = memory({ jobEvidenceExcerpts: [{
+      id: "job-1", referenceId: "job-1", sourceRef: "tool-result:jobs-1", toolName: "jobs.get", trust: "external_untrusted",
+      fields: { company: "Example", role: "Engineer" }, excerpt: "company=Example | role=Engineer", goalRevision: 3, planRevision: 2,
+    }] })
+    const mismatched = block("observation:tool-result:jobs-1", "tool_observation", { toolCallId: "jobs-2", toolName: "jobs.search", status: "completed", errorCode: null })
+    const recall = buildCognitiveMemoryRecall(context([block("goal", "goal", { revision: 3 }), block("business:job:job-1", "business", { referenceId: "job-1", kind: "job" }), mismatched, summary(value)]))!
+    expect(recall.jobEvidenceExcerpts).toEqual([])
+  })
+
+  it("drops an excerpt when a retained job payload does not match its public fields", () => {
+    const value = memory({ jobEvidenceExcerpts: [{
+      id: "job-1", referenceId: "job-1", sourceRef: "tool-result:jobs-1", toolName: "jobs.get", trust: "external_untrusted",
+      fields: { company: "Example", role: "Engineer" }, excerpt: "company=Example | role=Engineer", goalRevision: 3, planRevision: 2,
+    }] })
+    const retained = block("observation:tool-result:jobs-1", "tool_observation", { toolCallId: "jobs-1", toolName: "jobs.get", status: "completed", errorCode: null, output: { job: { id: "job-1", company: "Other", role: "Engineer", location: null, status: "open", score: 8, url: null, source: null, salary: null, description: null, keywords: null } } })
+    const recall = buildCognitiveMemoryRecall(context([block("goal", "goal", { revision: 3 }), block("business:job:job-1", "business", { referenceId: "job-1", kind: "job" }), retained, summary(value)]))!
+    expect(recall.jobEvidenceExcerpts).toEqual([])
+  })
+
+  it("recalls only sanitized contact markers from persisted job evidence", () => {
+    const value = memory({ jobEvidenceExcerpts: [{
+      id: "job-1", referenceId: "job-1", sourceRef: "tool-result:jobs-1", toolName: "jobs.get", trust: "external_untrusted",
+      fields: { company: "Example [REDACTED_EMAIL]", role: "Engineer", description: "Call [REDACTED_PHONE]" },
+      excerpt: "company=Example [REDACTED_EMAIL] | role=Engineer | description=Call [REDACTED_PHONE]", goalRevision: 3, planRevision: 2,
+    }] })
+    const recall = buildCognitiveMemoryRecall(context([block("goal", "goal", { revision: 3 }), block("business:job:job-1", "business", { referenceId: "job-1", kind: "job" }), summary(value)]))!
+    const text = cognitiveMemoryRecallText(recall)
+    expect(text).toContain("[REDACTED_EMAIL]")
+    expect(text).toContain("[REDACTED_PHONE]")
+    expect(text).not.toContain("recruiter@example.com")
+    expect(text).not.toContain("+353 87 123 4567")
+
+    const unsanitized = memory({ jobEvidenceExcerpts: [{
+      id: "job-1", referenceId: "job-1", sourceRef: "tool-result:jobs-1", toolName: "jobs.get", trust: "external_untrusted",
+      fields: { company: "Example recruiter@example.com", role: "Engineer" }, excerpt: "company=Example recruiter@example.com | role=Engineer", goalRevision: 3, planRevision: 2,
+    }] })
+    expect(buildCognitiveMemoryRecall(context([block("goal", "goal", { revision: 3 }), block("business:job:job-1", "business", { referenceId: "job-1", kind: "job" }), summary(unsanitized)]) )).toBeNull()
   })
 
   it("omits memory with a mismatched goal revision or malformed schema", () => {

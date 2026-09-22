@@ -23,6 +23,59 @@ const base: StepContextSnapshot = {
 }
 
 describe("context memory projection", () => {
+  it("projects only server-classified public job evidence and marks it untrusted", () => {
+    const snapshot: StepContextSnapshot = {
+      ...base,
+      businessRefs: [{ id: "job-1", kind: "job", ownerId: "user-1", resource: "job" }],
+      toolObservations: [{ id: "tool-result:jobs-1", content: {
+        toolCallId: "jobs-1", toolName: "jobs.search", status: "completed", errorCode: null,
+        input: { target: "engineer" }, output: { jobs: [{ id: "job-1", company: "Example", role: "Engineer", location: "Dublin", status: "open", score: 9, url: "https://jobs.example/1", source: "greenhouse", salary: "€70k", description: "Public role description", keywords: "typescript" }], page: 1, hasMore: false },
+      } }],
+    }
+    const projection = buildContextMemoryProjection(snapshot)
+    expect(projection?.jobEvidenceExcerpts).toEqual([expect.objectContaining({ referenceId: "job-1", sourceRef: "tool-result:jobs-1", toolName: "jobs.search", trust: "external_untrusted", fields: { company: "Example", role: "Engineer", location: "Dublin", url: "https://jobs.example/1", source: "greenhouse", salary: "€70k", description: "Public role description" } })])
+    expect(JSON.stringify(projection)).not.toContain("typescript")
+  })
+
+  it("sanitizes contact data from public job fields before projection", () => {
+    const snapshot: StepContextSnapshot = {
+      ...base,
+      businessRefs: [{ id: "job-1", kind: "job", ownerId: "user-1", resource: "job" }],
+      toolObservations: [{ id: "tool-result:jobs-contact", content: {
+        toolCallId: "jobs-contact", toolName: "jobs.get", status: "completed", errorCode: null,
+        output: { job: { id: "job-1", company: "Example recruiter@example.com", role: "Engineer", location: "Dublin", status: "open", score: 9, url: "https://jobs.example/1", source: "greenhouse", salary: "€70k", description: "Call +353 87 123 4567", keywords: null } },
+      } }],
+    }
+    const projection = buildContextMemoryProjection(snapshot)
+    expect(projection?.jobEvidenceExcerpts[0]?.fields).toMatchObject({ company: "Example [REDACTED_EMAIL]", description: "Call [REDACTED_PHONE]" })
+    expect(JSON.stringify(projection)).not.toContain("recruiter@example.com")
+    expect(JSON.stringify(projection)).not.toContain("+353 87 123 4567")
+  })
+
+  it("keeps repeated public job observations separately bound to their tool results", () => {
+    const job = { id: "job-1", company: "Example", role: "Engineer", location: "Dublin", status: "open", score: 9, url: "https://jobs.example/1", source: "greenhouse", salary: "€70k", description: "Public role description", keywords: "typescript" }
+    const snapshot: StepContextSnapshot = {
+      ...base,
+      businessRefs: [{ id: "job-1", kind: "job", ownerId: "user-1", resource: "job" }],
+      toolObservations: [
+        { id: "tool-result:jobs-1", content: { toolCallId: "jobs-1", toolName: "jobs.search", status: "completed", errorCode: null, output: { jobs: [job], page: 1, hasMore: false } } },
+        { id: "tool-result:jobs-2", content: { toolCallId: "jobs-2", toolName: "jobs.get", status: "completed", errorCode: null, output: { job } } },
+      ],
+    }
+    const excerpts = buildContextMemoryProjection(snapshot)?.jobEvidenceExcerpts
+    expect(excerpts).toHaveLength(1)
+    expect(excerpts?.[0]).toEqual(expect.objectContaining({ referenceId: "job-1", sourceRef: "tool-result:jobs-2" }))
+  })
+
+  it("fails closed for a foreign job or an unclassified evidence-looking observation", () => {
+    const foreign: StepContextSnapshot = { ...base, businessRefs: [{ id: "job-1", kind: "job", ownerId: "user-1", resource: "job" }], toolObservations: [{ id: "evidence:foreign", content: { kind: "evidence", verified: true, output: { id: "job-1" } } }] }
+    expect(buildContextMemoryProjection(foreign)?.jobEvidenceExcerpts).toEqual([])
+    const malformed: StepContextSnapshot = { ...base, businessRefs: [{ id: "job-1", kind: "job", ownerId: "user-1", resource: "job" }], toolObservations: [{ id: "tool-result:jobs-1", content: { toolCallId: "jobs-1", toolName: "jobs.get", status: "completed", errorCode: null, output: { job: { id: "job-2", company: "Foreign", role: "Engineer", location: null, status: "open", score: null, url: null, source: "source", salary: null, description: null, keywords: null } } } }] }
+    expect(buildContextMemoryProjection(malformed)?.jobEvidenceExcerpts).toEqual([])
+    const mismatchedCall = { ...malformed, toolObservations: [{ ...malformed.toolObservations[0]!, id: "tool-result:other-call" }] }
+    expect(buildContextMemoryProjection(mismatchedCall)?.jobEvidenceExcerpts).toEqual([])
+  })
+
   it("projects typed anchors and durable evidence without raw text", () => {
     const projection = buildContextMemoryProjection(base)
     expect(projection).toMatchObject({
