@@ -52,6 +52,13 @@ function publicTool(name: string): PublicToolDefinition {
   }
 }
 
+function validateFixtureToolArguments(name: string, input: unknown, version?: string): true | string {
+  const emptyObject = input !== null && typeof input === "object" && !Array.isArray(input) && Object.keys(input).length === 0
+  return name === "jobs.search" && (version === undefined || version === "1") && emptyObject
+    ? true
+    : "Tool arguments failed fixture schema validation"
+}
+
 describe("production child runtime", () => {
   it("keeps child construction behind the explicit flag", () => {
     expect(childExecutionEnabled("0")).toBe(false)
@@ -83,6 +90,7 @@ describe("production child runtime", () => {
       return {
         definitions: [publicTool("jobs.search")],
         router: { execute: async (_context: unknown, request: { id: string; toolName: string; toolVersion: string }) => ({ ...request, status: "completed" as const, errorCode: null }) },
+        validateArguments: validateFixtureToolArguments,
       }
     })
     const executor = createOptionalProductionChildExecutor({
@@ -122,7 +130,7 @@ describe("production child runtime", () => {
     const executor = createOptionalProductionChildExecutor({
       enabled: true, pool, turnStore: store(), treeBudget: budget(),
       authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => model,
-      toolRuntimeFactory: () => ({ definitions: [publicTool("jobs.search")], router: { execute: async (_context: unknown, request: { id: string; toolName: string; toolVersion: string }) => ({ ...request, status: "completed" as const, output: { job: "job-1" }, errorCode: null }) } }),
+      toolRuntimeFactory: () => ({ definitions: [publicTool("jobs.search")], router: { execute: async (_context: unknown, request: { id: string; toolName: string; toolVersion: string }) => ({ ...request, status: "completed" as const, output: { job: "job-1" }, errorCode: null }) }, validateArguments: validateFixtureToolArguments }),
       contextSnapshotAdapter: adapter,
     })
 
@@ -166,7 +174,7 @@ describe("production child runtime", () => {
     }
     const executor = createOptionalProductionChildExecutor({
       enabled: true, pool, turnStore: store(), treeBudget: budget(), authorizeUsage: async () => ({ settle: async () => undefined }),
-      modelRuntimeFactory: () => model, toolRuntimeFactory: () => ({ definitions: [publicTool("jobs.search")], router: { execute: async (_context: unknown, request: { id: string; toolName: string; toolVersion: string }) => ({ ...request, status: "completed" as const, errorCode: null }) } }),
+      modelRuntimeFactory: () => model, toolRuntimeFactory: () => ({ definitions: [publicTool("jobs.search")], router: { execute: async (_context: unknown, request: { id: string; toolName: string; toolVersion: string }) => ({ ...request, status: "completed" as const, errorCode: null }) }, validateArguments: validateFixtureToolArguments }),
       mailboxReader: { listPendingMessages: async () => [] },
     })
     if (!executor) throw new Error("child executor was not created")

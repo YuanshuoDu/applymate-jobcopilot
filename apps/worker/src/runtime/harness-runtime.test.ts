@@ -43,7 +43,7 @@ function tool() {
     version: "1",
     description: "Search the candidate job shortlist",
     capabilities: ["read"] as const,
-    inputSchema: { type: "object", additionalProperties: false },
+    inputSchema: { type: "object", properties: { query: { type: "string", minLength: 1 } }, required: ["query"], additionalProperties: false },
     outputSchema: { type: "object" },
     risk: "read" as const,
     domain: "jobs" as const,
@@ -51,6 +51,14 @@ function tool() {
     timeoutMs: 10_000,
     requiredCapabilities: [] as const,
   }
+}
+
+function validateFixtureToolArguments(toolName: string, input: unknown): boolean | string {
+  if (!input || typeof input !== "object" || Array.isArray(input) || toolName !== "jobs.search") return "Tool arguments failed fixture schema validation"
+  const value = input as Record<string, unknown>
+  return Object.keys(value).length === 1 && Object.hasOwn(value, "query") && typeof value.query === "string" && value.query.trim().length > 0
+    ? true
+    : "Tool arguments failed fixture schema validation"
 }
 
 function contextBuilder(): TurnEngineOptions["contextBuilder"] {
@@ -111,7 +119,7 @@ describe("MiniMax Harness runtime integration", () => {
       goal: "Find Dublin jobs",
       snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
       contextBuilder: contextBuilder(), store: fixture.store, tools: [tool()], executeTool: execute,
-      capabilities: ["read"], modelRuntime: runtime, maxSteps: 3,
+      capabilities: ["read"], validateToolArguments: validateFixtureToolArguments, modelRuntime: runtime, maxSteps: 3,
       idFactory: (() => { let id = 0; return (prefix: string) => `${prefix}:${++id}` })(),
     })
     const result = await executor({ lease, signal: new AbortController().signal })

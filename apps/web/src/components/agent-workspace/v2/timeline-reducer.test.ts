@@ -152,6 +152,32 @@ describe('timeline reducer', () => {
     expect(state.lifecycleRevision).toBe(0)
   })
 
+  it('refreshes supervisor data for authoritative child task lifecycle events only', () => {
+    const lifecycleTypes = ['task.started', 'task.completed', 'task.interrupted', 'task.failed']
+    let state = createTimelineState('session-1')
+    for (const [index, type] of lifecycleTypes.entries()) {
+      state = timelineReducer(state, {
+        type: 'event', event: event({ id: `task-lifecycle-${index}`, type, itemId: null, taskId: 'task-child', sequence: String(index + 1), kind: undefined, payload: { taskId: 'task-child' } }),
+      })
+    }
+    expect(state.lifecycleRevision).toBe(lifecycleTypes.length)
+    expect(state.fallbackItems).toEqual([])
+
+    for (const [index, type] of ['task.no_progress', 'task.budget_exhausted'].entries()) {
+      state = timelineReducer(state, {
+        type: 'event', event: event({ id: `task-diagnostic-${index}`, type, itemId: null, taskId: 'task-child', sequence: String(index + 5), kind: undefined }),
+      })
+    }
+    expect(state.lifecycleRevision).toBe(lifecycleTypes.length)
+    expect(state.fallbackItems.map(item => item.id)).toEqual(['task-diagnostic-0', 'task-diagnostic-1'])
+
+    state = timelineReducer(state, {
+      type: 'event', event: event({ id: 'task-lifecycle-missing-id', type: 'task.completed', itemId: null, taskId: null, sequence: '7', kind: undefined }),
+    })
+    expect(state.lifecycleRevision).toBe(lifecycleTypes.length)
+    expect(state.fallbackItems.map(item => item.id)).toEqual(['task-diagnostic-0', 'task-diagnostic-1'])
+  })
+
   it('hydrates a redacted context compaction event through the same reducer path as raw events', () => {
     const redacted = {
       schemaVersion: 'agent-harness.v2', id: 'compaction-redacted', sessionId: 'session-1', turnId: 'turn-1', itemId: null, taskId: 'task-1',

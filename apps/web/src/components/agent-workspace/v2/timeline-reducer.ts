@@ -92,6 +92,7 @@ export type TimelineAction =
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'interrupted'])
 const KNOWN_EVENT_TYPES = new Set([
   'turn.started', 'turn.wakeup', 'turn.resumed', 'turn.completed', 'turn.failed',
+  'task.started', 'task.completed', 'task.interrupted', 'task.failed',
   'step.started', 'step.completed', 'item.started', 'item.delta', 'item.completed', 'item.failed',
   'input.accepted', 'input.consumed', 'tool_call.started', 'tool_call.completed', 'tool_call.failed',
   'policy.decision', 'approval.requested', 'approval.resolved', 'approval.consumed', 'approval.expired',
@@ -103,11 +104,16 @@ const KNOWN_EVENT_TYPES = new Set([
 // intentionally excluded so streamed text does not refetch turns and tasks.
 const LIFECYCLE_EVENT_TYPES = new Set([
   'turn.started', 'turn.wakeup', 'turn.resumed', 'turn.completed', 'turn.failed',
+  'task.started', 'task.completed', 'task.interrupted', 'task.failed',
   'step.started', 'step.completed', 'item.started', 'item.completed', 'item.failed',
   'tool_call.started', 'tool_call.completed', 'tool_call.failed',
   'approval.requested', 'approval.resolved', 'approval.consumed', 'approval.expired',
   'question.answered', 'question.cancelled', 'external_action.reserved',
 ])
+
+function isLifecycleEvent(event: TimelineEvent): boolean {
+  return LIFECYCLE_EVENT_TYPES.has(event.type) && (!event.type.startsWith('task.') || event.taskId !== null)
+}
 
 export function createTimelineState(sessionId: string): TimelineState {
   return {
@@ -214,7 +220,7 @@ function reduceEvent(state: TimelineState, value: unknown): TimelineState {
     ...next,
     ...appendTimelineEvent(next.events, event),
     lastEventId: event.id,
-    lifecycleRevision: LIFECYCLE_EVENT_TYPES.has(event.type) ? state.lifecycleRevision + 1 : state.lifecycleRevision,
+    lifecycleRevision: isLifecycleEvent(event) ? state.lifecycleRevision + 1 : state.lifecycleRevision,
   }
   if (markerState) {
     return { ...next, steeringMarkers: markerState.state, steeringMarkerEvents: markerState.events }
@@ -268,7 +274,7 @@ function reduceQuestionTerminalEvent(state: TimelineState, value: Record<string,
     lastSequence: terminal.sequence,
     ...appendTimelineEvent(state.events, event),
     lastEventId: event.id,
-    lifecycleRevision: LIFECYCLE_EVENT_TYPES.has(event.type) ? state.lifecycleRevision + 1 : state.lifecycleRevision,
+    lifecycleRevision: isLifecycleEvent(event) ? state.lifecycleRevision + 1 : state.lifecycleRevision,
   }
   if (!existing) return next
   const content = isRecord(existing.content)
@@ -291,7 +297,7 @@ function reduceApprovalEvent(state: TimelineState, value: Record<string, unknown
     lastSequence: event.sequence && isAfter(event.sequence, state.lastSequence) ? event.sequence : state.lastSequence,
     ...appendTimelineEvent(state.events, event),
     lastEventId: event.id,
-    lifecycleRevision: LIFECYCLE_EVENT_TYPES.has(event.type) ? state.lifecycleRevision + 1 : state.lifecycleRevision,
+    lifecycleRevision: isLifecycleEvent(event) ? state.lifecycleRevision + 1 : state.lifecycleRevision,
     approvalLedger,
   }
 }

@@ -56,6 +56,22 @@ function contextBuilder(seen: StepContextSnapshot[]) {
   }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+}
+
+function hasOnlyStringArgument(input: unknown, key: string): boolean {
+  return isRecord(input) && Object.keys(input).length === 1 && Object.hasOwn(input, key) && typeof input[key] === "string" && input[key].length > 0
+}
+
+function validateFixtureToolArguments(toolName: string, input: unknown): boolean | string {
+  if (toolName === "jobs.search" && hasOnlyStringArgument(input, "location")) return true
+  if (toolName === "jobs.get" && hasOnlyStringArgument(input, "jobId")) return true
+  if (toolName === "agent.plan.propose" && isRecord(input) && Object.keys(input).length === 1 && isRecord(input.proposal) &&
+    Object.keys(input.proposal).length === 1 && Array.isArray(input.proposal.nodes) && input.proposal.nodes.length === 0) return true
+  return "Tool arguments failed fixture schema validation"
+}
+
 function failedReplanObservations() {
   return [
     planRevisionObservation({ planCallId: "plan-1", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null, proposalHash: `sha256:${"0".repeat(64)}` }),
@@ -87,6 +103,7 @@ function baseOptions(overrides: Partial<TurnEngineOptions> = {}) {
     lease, rootTaskId: "root-1", scope: { userId: "user-1" }, goal: "Find jobs", snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
     contextBuilder: contextBuilder(snapshots), store: fake.value, model, tools: [{ name: "jobs.search", version: "1" }, { name: "jobs.get", version: "1" }],
     executeTool: async ({ call }) => ({ id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed" as const, output: call.toolName === "jobs.search" ? { jobs: [{ id: "job-1" }] } : { job: { id: "job-1", role: "Engineer" } }, errorCode: null }),
+    validateToolArguments: validateFixtureToolArguments,
     now: () => now, maxSteps: 5,
     idFactory: (() => { let id = 0; return (prefix: string) => `${prefix}:${++id}` })(),
     ...overrides,
