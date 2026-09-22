@@ -32,6 +32,12 @@ const eventId = (runKey: string, nodeId: string, type: TaskGraphEvent["type"], a
 const persisted = (runKey: string, type: TaskGraphEvent["type"], nodeId: string, state?: unknown, attempt?: number): PersistedTaskGraphEvent => ({
   runKey, event: { type, nodeId, eventId: eventId(runKey, nodeId, type, attempt ?? 1), ...(attempt === undefined ? {} : { attempt }) }, ...(state === undefined ? {} : { state }),
 })
+const deferred = <T = void>() => {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => { resolve = resolvePromise; reject = rejectPromise })
+  return { promise, resolve, reject }
+}
 
 describe("plan task graph adapter", () => {
   it("maps dispatch commands to graph nodes and initial readiness", () => {
@@ -58,6 +64,62 @@ describe("plan task graph adapter", () => {
       ["run-1", "run-1:first:start", "start"], ["run-1", "run-1:first:complete", "complete"],
     ])
     expect(value.state.statuses.first).toBe("completed")
+  })
+
+  it("linearizes concurrent starts and matches sequential replay", async () => {
+    const gate = deferred()
+    const persist = vi.fn<PlanTaskGraphAdapterOptions["persist"]>(async input => {
+      if (input.event.nodeId === "first") await gate.promise
+    })
+    const concurrent = createPlanTaskGraphAdapter(plan(command("first"), command("second")), { runKey: "run-1", persist })
+    const first = concurrent.start!("first")
+    const second = concurrent.start!("second")
+    await Promise.resolve()
+    expect(persist).toHaveBeenCalledTimes(1)
+    gate.resolve()
+    await Promise.all([first, second])
+
+    const sequential = adapter([command("first"), command("second")])
+    await sequential.value.start!("first")
+    await sequential.value.start!("second")
+    expect(concurrent.state).toEqual(sequential.value.state)
+    expect(persist.mock.calls.map(([entry]) => entry.event.eventId)).toEqual([
+      "run-1:first:start", "run-1:second:start",
+    ])
+  })
+
+  it("linearizes a queued retry after its durable start", async () => {
+    const gate = deferred()
+    const persist = vi.fn<PlanTaskGraphAdapterOptions["persist"]>(async input => {
+      if (input.event.type === "start") await gate.promise
+    })
+    const { value } = adapter([command("first")], { persist })
+    const start = value.start!("first")
+    const retry = value.retry!("first")
+    await Promise.resolve()
+    expect(persist).toHaveBeenCalledTimes(1)
+    gate.resolve()
+    await expect(start).resolves.toMatchObject({ statuses: { first: "running" } })
+    await expect(retry).resolves.toMatchObject({ statuses: { first: "ready" } })
+    expect(value.state.appliedEvents.map(event => event.eventId)).toEqual([
+      "run-1:first:start", "run-1:first:attempt:2:retry",
+    ])
+  })
+
+  it("serializes concurrent terminal observations and replays the durable result", async () => {
+    const { value } = adapter([command("first")])
+    await value.start!("first")
+    const gate = deferred()
+    const terminalPersist = vi.fn<PlanTaskGraphAdapterOptions["persist"]>(async () => gate.promise)
+    const first = value.observe(record("first", "completed"), terminalPersist)
+    await vi.waitFor(() => expect(terminalPersist).toHaveBeenCalledTimes(1))
+    const second = value.observe(record("first", "completed"), terminalPersist)
+    await Promise.resolve()
+    expect(terminalPersist).toHaveBeenCalledTimes(1)
+    gate.resolve()
+    await Promise.all([first, second])
+    expect(value.state.statuses.first).toBe("completed")
+    expect(value.state.appliedEvents.map(event => event.eventId)).toEqual(["run-1:first:start", "run-1:first:complete"])
   })
 
   it("uses a terminal persistence override after the durable start", async () => {
@@ -135,6 +197,18 @@ describe("plan task graph adapter", () => {
     await expect(value.observe(record("first", "completed"))).rejects.toBeInstanceOf(PlanTaskGraphAdapterError)
     expect(value.state.statuses.first).toBe("ready")
     expect(value.state.appliedEvents).toEqual([])
+  })
+
+  it("keeps queued routing on the prior state after a failed durable start", async () => {
+    const persist = vi.fn<PlanTaskGraphAdapterOptions["persist"]>().mockRejectedValue(new Error("db down"))
+    const { value } = adapter([command("first"), command("next", ["first"])], { persist })
+    const failedStart = value.start!("first")
+    const queuedSuccessor = value.start!("next")
+    await expect(failedStart).rejects.toMatchObject({ code: "persistence_failed" })
+    await expect(queuedSuccessor).rejects.toMatchObject({ code: "illegal_transition" })
+    expect(value.state.statuses).toMatchObject({ first: "ready", next: "pending" })
+    expect(value.state.appliedEvents).toEqual([])
+    expect(persist).toHaveBeenCalledTimes(1)
   })
 
   it("rejects malformed observations without creating a start event", async () => {

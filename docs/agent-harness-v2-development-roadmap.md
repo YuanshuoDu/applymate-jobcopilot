@@ -2918,3 +2918,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused Worker context-compaction runtime validation passed **22/22**, with **162/162** related context-adapter, canonical-state, and turn-execution-loop regression tests also passing. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 
 **Candidate boundary:** Real PostgreSQL/RLS, process restart and cross-process rehydrate, production rehydrate, provider/model invocation evidence, and production supervisor E2E remain unverified. No schema, migration, Web, provider, queue, or feature-gate change was made; P8-76 remains a candidate.
+
+## 163. P8-77 — Linearizable TaskGraph adapter mutations
+
+**Candidate status/date (2026-09-22):** P8-77 is recorded as a bounded adapter hardening slice; formal P0-P7 acceptance remains **1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** `plan-task-graph-adapter` now serializes public `start`, `retry`, and `observe` mutations. A reducer transition is committed to in-memory state only after its bounded durable persistence succeeds, so a failed write leaves the previous state and routing decisions intact. Start, retry, terminal observation, stable event IDs, replay, and terminal-before-start ordering remain on the existing reducer/persistence path.
+
+**Independent verification:** Focused adapter validation passed **39/39**; related Worker planning validation passed **319/319**; Worker TypeScript and `git diff --check` passed.
+
+**Follow-up boundary:** The existing scheduler still owns its current dependency bookkeeping. A later bounded slice may expose reducer-derived readiness across dependency layers, waits, and retry, but this candidate does not rewrite the scheduler or add a new dispatch/child queue path. Real PostgreSQL/RLS, cross-process persistence, process restart, and production supervisor evidence remain unverified.

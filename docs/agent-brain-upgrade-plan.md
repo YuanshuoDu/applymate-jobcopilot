@@ -1027,3 +1027,11 @@ Focused Worker wakeup and recovery-scanner validation passed **52/52 tests**; Wo
 P8-76 adds bounded context compaction snapshot rehydrate at the canonical turn runtime seam. When a restarted step contains an oversized snapshot and the latest prior `context_compacted` marker, the runtime uses the marker's scoped loader to recover the persisted compacted snapshot, validates scope/session/turn and loader identity, protected invariants, the marker step summary, complete bounded `removedObservationIds`, and the 256 KiB JSON bound, then retains only observations after the marker from the current projection. Missing/conflicting IDs, mismatched markers, unsafe JSON, invariant changes, loader failures, and bound violations fail closed; current-step replay remains idempotent and does not rerun the compaction hook.
 
 Focused Worker validation passed **22/22** context-compaction runtime tests and **162/162** related context-adapter, canonical-state, and turn-execution-loop regression tests. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Real PostgreSQL/RLS, cross-process restart recovery, and production rehydrate evidence remain unverified. The default-off gate and schema, migration, Web, provider, and queue boundaries are unchanged.
+
+## P8-77 update
+
+P8-77 adds a bounded linearization seam to `plan-task-graph-adapter`: public `start`, `retry`, and `observe` mutations execute in invocation order, each reducer state becomes visible only after its durable persistence succeeds, and persistence failure leaves the prior state available to subsequent routing. Stable event IDs and reducer replay remain idempotent; terminal observation cannot commit before its durable start.
+
+Focused adapter validation passed **39/39**, related Worker planning validation passed **319/319**, Worker TypeScript and `git diff --check` passed. The existing scheduler remains unchanged: reducer-derived readiness unification across dependency layers, waits, and retry is an explicit follow-up seam. No new scheduler, child queue, schema, migration, provider, Web, or dispatch path was introduced.
+
+Real PostgreSQL/RLS, cross-process persistence, process restart, and production supervisor evidence remain unverified. P8-77 is a candidate hardening slice; formal P0-P7 acceptance remains **1/8 (12.5%)**.

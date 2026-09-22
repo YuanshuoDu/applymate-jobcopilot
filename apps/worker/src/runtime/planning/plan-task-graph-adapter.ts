@@ -171,6 +171,14 @@ export function createPlanTaskGraphAdapter(plan: PlanDispatchResult, options: Pl
   const runKey = boundedRunKey(options.runKey)
   const freshState = createTaskGraph(graphNodes(plan.commands))
   let state = freshState
+  let mutationTail = Promise.resolve()
+  const serialized = async <T>(work: () => Promise<T>): Promise<T> => {
+    const previous = mutationTail
+    let release!: () => void
+    mutationTail = new Promise(resolve => { release = resolve })
+    await previous
+    try { return await work() } finally { release() }
+  }
   if (options.initialState !== undefined) {
     if (!initialStateShape(options.initialState)) throw new PlanTaskGraphAdapterError("graph_mismatch", "Initial task graph state is malformed")
     if (JSON.stringify(options.initialState.nodes) !== JSON.stringify(freshState.nodes)) throw new PlanTaskGraphAdapterError("graph_mismatch", "Initial task graph nodes do not match the dispatched plan")
@@ -204,7 +212,7 @@ export function createPlanTaskGraphAdapter(plan: PlanDispatchResult, options: Pl
     state = reduction.state
   }
 
-  const start = async (localId: string): Promise<TaskGraphState> => {
+  const startUnsafe = async (localId: string): Promise<TaskGraphState> => {
     if (!(localId in state.statuses)) throw new PlanTaskGraphAdapterError("unknown_node", `Unknown node ${localId}`)
     const attempt = currentAttempt(localId)
     const started = eventId(runKey, localId, "start", attempt)
@@ -213,16 +221,18 @@ export function createPlanTaskGraphAdapter(plan: PlanDispatchResult, options: Pl
     await apply(localId, "start", attempt)
     return state
   }
+  const start = (localId: string): Promise<TaskGraphState> => serialized(() => startUnsafe(localId))
 
-  const retry = async (localId: string): Promise<TaskGraphState> => {
+  const retryUnsafe = async (localId: string): Promise<TaskGraphState> => {
     if (!(localId in state.statuses)) throw new PlanTaskGraphAdapterError("unknown_node", `Unknown node ${localId}`)
     const attempt = currentAttempt(localId)
     if (state.statuses[localId] !== "running" || attempt !== 1) throw new PlanTaskGraphAdapterError("illegal_transition", `Cannot retry node ${localId} from ${state.statuses[localId]} attempt ${attempt}`)
     await apply(localId, "retry", 2)
     return state
   }
+  const retry = (localId: string): Promise<TaskGraphState> => serialized(() => retryUnsafe(localId))
 
-  const observe = async (record: ObservablePlanRecord, persistOverride?: PersistTaskGraph): Promise<TaskGraphState> => {
+  const observeUnsafe = async (record: ObservablePlanRecord, persistOverride?: PersistTaskGraph): Promise<TaskGraphState> => {
     if (!record || typeof record !== "object") throw new PlanTaskGraphAdapterError("invalid_record", "Unsupported plan observation record")
     if (isReplan(record)) return state
     if (!record || typeof record.localId !== "string" || !record.localId.trim()) throw new PlanTaskGraphAdapterError("invalid_record", "Plan observation localId is required")
@@ -230,10 +240,11 @@ export function createPlanTaskGraphAdapter(plan: PlanDispatchResult, options: Pl
     if (controlRecord(record)) phase = "wait"
     else if (isExecutionRecord(record)) phase = terminalPhase(record)
     else throw new PlanTaskGraphAdapterError("invalid_record", "Unsupported plan observation record")
-    await start(record.localId)
+    await startUnsafe(record.localId)
     await apply(record.localId, phase, currentAttempt(record.localId), persistOverride)
     return state
   }
 
+  const observe = (record: ObservablePlanRecord, persistOverride?: PersistTaskGraph): Promise<TaskGraphState> => serialized(() => observeUnsafe(record, persistOverride))
   return { get state() { return state }, start, retry, observe }
 }
