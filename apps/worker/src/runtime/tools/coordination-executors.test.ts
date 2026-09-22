@@ -419,6 +419,36 @@ describe("coordination executors", () => {
     expect(runtime.store.activities).toContain("wait_subagents")
   })
 
+  it("returns a bounded Scout/Analyst aggregate and preserves legacy results", async () => {
+    const runtime = makeRuntime()
+    const scout = makeTask({ id: "scout", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/scout", depth: 1, role: "scout", status: "completed", result: { structuredResult: { schemaVersion: "agent-harness.v2.subagent.result", role: "scout", status: "completed", candidates: [{ jobId: "job-2", source: "source", url: null, evidenceIds: ["e-2"] }], evidence: [{ id: "e-2", kind: "job", ref: "job-2", source: "source" }], summary: "found" } } })
+    const analyst = makeTask({ id: "analyst", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/analyst", depth: 1, role: "analyst", status: "completed", result: { structuredResult: { role: "scout" } } })
+    const legacy = makeTask({ id: "legacy", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/legacy", depth: 1, role: "other", status: "completed", result: { summary: "legacy" } })
+    runtime.store.tasks.set(scout.id, scout); runtime.store.tasks.set(analyst.id, analyst); runtime.store.tasks.set(legacy.id, legacy)
+    const result = await executeWaitSubagents(context({ taskId: "root-1", rootTaskId: "root-1" }), { idempotencyKey: "aggregate", taskIds: [scout.id, analyst.id, legacy.id], mode: "all", timeoutMs: 5000 }, runtime.options)
+    expect(result.aggregate).toMatchObject({ status: "partial", successfulRoles: ["scout"], failedRoles: ["analyst"], jobIds: ["job-2"] })
+    expect(result.tasks.find(task => task.taskId === legacy.id)?.result).toEqual({ summary: "legacy" })
+  })
+
+  it("fails closed for invalid structured results and reports pending roles", async () => {
+    const runtime = makeRuntime()
+    const invalid = makeTask({ id: "scout", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/scout", depth: 1, role: "scout", status: "completed", result: { structuredResult: { role: "analyst" } } })
+    const pending = makeTask({ id: "analyst", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/analyst", depth: 1, role: "analyst", status: "running", result: { structuredResult: { secret: "omit" } } })
+    runtime.store.tasks.set(invalid.id, invalid); runtime.store.tasks.set(pending.id, pending)
+    const result = await executeWaitSubagents(context({ taskId: "root-1", rootTaskId: "root-1" }), { idempotencyKey: "aggregate-invalid", taskIds: [invalid.id, pending.id], mode: "all", timeoutMs: 5000 }, runtime.options)
+    expect(result.tasks[0]).toMatchObject({ result: null, failureReason: "invalid_structured_result" })
+    expect(result.aggregate).toMatchObject({ status: "pending", failedRoles: ["scout"], pendingRoles: ["analyst"] })
+  })
+
+  it("omits the aggregate when a valid structured result cannot survive wait projection", async () => {
+    const runtime = makeRuntime()
+    const large = makeTask({ id: "scout", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/scout", depth: 1, role: "scout", status: "completed", result: { structuredResult: { schemaVersion: "agent-harness.v2.subagent.result", role: "scout", status: "completed", candidates: [], evidence: [], summary: "x".repeat(3_000) } } })
+    runtime.store.tasks.set(large.id, large)
+    const result = await executeWaitSubagents(context({ taskId: "root-1", rootTaskId: "root-1" }), { idempotencyKey: "aggregate-large", taskIds: [large.id], mode: "all", timeoutMs: 5000 }, runtime.options)
+    expect(result).not.toHaveProperty("aggregate")
+    expect(result.tasks[0]?.result).toMatchObject({ $truncated: true })
+  })
+
   it("returns the initial bounded task shape while a wait remains pending", async () => {
     const runtime = makeRuntime()
     const child = makeTask({ id: "child", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/child", depth: 1, role: "scout", status: "queued", result: { sessionId: "foreign-session", apiKey: "secret", summary: "pending" }, failureReason: "é".repeat(300) })

@@ -534,6 +534,20 @@ describe("createCanonicalPlanExecutionFactory", () => {
     expect(receipts.map(receipt => receipt.content)).toEqual(expect.arrayContaining([expect.objectContaining({ status: "waiting_for_user" })]))
   })
 
+  it.each([
+    { name: "malformed", aggregate: { status: "completed", successfulRoles: ["scout"], failedRoles: [], jobIds: [], failures: [] } },
+    { name: "foreign", aggregate: { status: "completed", successfulRoles: ["scout"], failedRoles: [], jobIds: [], failures: [{ role: "scout", taskId: "foreign", reason: "x" }] } },
+    { name: "oversized", aggregate: { status: "completed", successfulRoles: ["scout"], failedRoles: [], jobIds: ["x".repeat(9_000)], failures: [] } },
+  ])("rejects $name replayed wait aggregate", async ({ aggregate }) => {
+    const replay = replayWait("scout", {})
+    const hook = fixture(undefined, undefined, undefined, undefined, undefined, undefined, ["use_tool", "delegate", "join"])
+    const wait = replay.observations.find(observation => observation.id === "wait-result:wait-1")!
+    const content = wait.content as Record<string, unknown>
+    content.output = { ...(content.output as Record<string, unknown>), aggregate }
+    const result = await hook(input(output(replay.plan), "step-1", replay.observations, true))
+    expect(observationCode(result)).toBe("invalid_plan_output")
+  })
+
   it("persists fresh graph phases before the legacy plan receipt with a stable run key", async () => {
     const trace: string[] = []
     const graphEvents: Array<{ runKey: string; event: TaskGraphEvent }> = []

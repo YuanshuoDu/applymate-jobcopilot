@@ -460,9 +460,49 @@ function replayWaitOutcome(input: Parameters<TurnEnginePlanExecutionHook>[0], op
   if (!waitInput || !keysOnly(waitInput, ["taskIds", "mode"]) || hasForeignIdentity(waitInput) || !output || !plainJson(output) || !boundedJson(output) || hasForeignIdentity(output, WAIT_ALLOWED_IDENTITY_KEYS)) throw new CanonicalPlanError("invalid_plan_output")
   const expectedRoles = new Map<string, string>()
   const taskIds = replayJoinTaskIds(options, command, receipts, commands, expectedRoles)
-  if (!uniqueIds(waitInput.taskIds) || !sameIds(waitInput.taskIds, taskIds) || waitInput.mode !== command.call.input.mode || !uniqueIds(output.targetTaskIds) || !sameIds(output.targetTaskIds, taskIds) || !uniqueIds(output.matchedTaskIds, output.status === "timed_out") || output.matchedTaskIds.some(id => !taskIds.includes(id)) || !validReplayWaitTasks(output.tasks, taskIds, expectedRoles)) throw new CanonicalPlanError("invalid_plan_output")
+  if (!uniqueIds(waitInput.taskIds) || !sameIds(waitInput.taskIds, taskIds) || waitInput.mode !== command.call.input.mode || !uniqueIds(output.targetTaskIds) || !sameIds(output.targetTaskIds, taskIds) || !uniqueIds(output.matchedTaskIds, output.status === "timed_out") || output.matchedTaskIds.some(id => !taskIds.includes(id)) || !validReplayWaitTasks(output.tasks, taskIds, expectedRoles) || (Object.prototype.hasOwnProperty.call(output, "aggregate") && !validReplayAggregate(output.aggregate, output.tasks, expectedRoles, taskIds))) throw new CanonicalPlanError("invalid_plan_output")
   if (output.waitId !== waitId || (output.status !== "ready" && output.status !== "timed_out")) throw new CanonicalPlanError("invalid_plan_output")
   return output
+}
+
+function validReplayAggregate(value: unknown, tasks: unknown, expectedRoles: ReadonlyMap<string, string>, taskIds: readonly string[]): boolean {
+  const aggregate = row(value)
+  if (!aggregate || !boundedJson(aggregate) || !keysOnly(aggregate, ["status", "successfulRoles", "failedRoles", "pendingRoles", "jobIds", "failures"].filter(key => key !== "pendingRoles" || Object.prototype.hasOwnProperty.call(aggregate, key)))) return false
+  if (!["completed", "partial", "failed", "pending"].includes(String(aggregate.status))) return false
+  const roles = (input: unknown): input is readonly string[] => Array.isArray(input) && input.length <= 2 && input.every(role => role === "scout" || role === "analyst") && new Set(input).size === input.length
+  if (!roles(aggregate.successfulRoles) || !roles(aggregate.failedRoles) || (aggregate.pendingRoles !== undefined && !roles(aggregate.pendingRoles)) || !Array.isArray(aggregate.jobIds) || aggregate.jobIds.length > 64 || !aggregate.jobIds.every(id => typeof id === "string" && id.length > 0 && id.length <= 256) || !Array.isArray(aggregate.failures) || aggregate.failures.length > 2) return false
+  const successfulRoles = aggregate.successfulRoles as readonly string[]
+  const failedRoles = aggregate.failedRoles as readonly string[]
+  const pendingAggregateRoles = (aggregate.pendingRoles ?? []) as readonly string[]
+  if (!aggregate.failures.every(item => { const failure = row(item); return !!failure && keysOnly(failure, ["role", "taskId", "reason"]) && roles([failure.role]) && typeof failure.taskId === "string" && taskIds.includes(failure.taskId) && expectedRoles.get(failure.taskId) === failure.role && typeof failure.reason === "string" && Buffer.byteLength(failure.reason, "utf8") <= 500 })) return false
+  const taskRows = Array.isArray(tasks) ? tasks.map(row).filter((task): task is Record<string, unknown> => !!task) : []
+  const latestByRole = new Map<string, Record<string, unknown>>()
+  for (const task of taskRows) if (task.role === "scout" || task.role === "analyst") latestByRole.set(task.role, task)
+  const latestTasks = [...latestByRole.values()]
+  const terminalRoles = new Set(latestTasks.filter(task => ["completed", "failed", "interrupted", "cancelled", "closed"].includes(String(task.status))).map(task => String(task.role)))
+  const pendingRoles = new Set(latestTasks.filter(task => !["completed", "failed", "interrupted", "cancelled", "closed"].includes(String(task.status))).map(task => String(task.role)))
+  const allRoles = new Set([...aggregate.successfulRoles, ...aggregate.failedRoles, ...(aggregate.pendingRoles ?? [])])
+  if (![...allRoles].every(role => expectedRoles.size === 0 || [...expectedRoles.values()].includes(role)) || [...aggregate.successfulRoles, ...aggregate.failedRoles].every(role => terminalRoles.has(role)) === false || !(aggregate.pendingRoles ?? []).every(role => pendingRoles.has(role))) return false
+  if (successfulRoles.some(role => failedRoles.includes(role)) || successfulRoles.some(role => pendingAggregateRoles.includes(role))) return false
+  if (pendingAggregateRoles.length > 0 && aggregate.status !== "pending") return false
+  if (aggregate.status === "pending" && pendingAggregateRoles.length === 0) return false
+  if (aggregate.status === "partial" && (successfulRoles.length === 0 || failedRoles.length === 0 || pendingAggregateRoles.length > 0)) return false
+  if (aggregate.status === "completed" && (successfulRoles.length === 0 || failedRoles.length > 0 || pendingAggregateRoles.length > 0)) return false
+  if (aggregate.status === "failed" && (successfulRoles.length > 0 || failedRoles.length === 0 || pendingAggregateRoles.length > 0)) return false
+  const expectedJobIds = new Set<string>()
+  const structuredRoles = new Set<string>()
+  for (const task of latestByRole.values()) {
+    if (task.status !== "completed" || (task.role !== "scout" && task.role !== "analyst")) continue
+    const result = row(task.result)
+    if (!result || !Object.prototype.hasOwnProperty.call(result, "structuredResult")) continue
+    try {
+      const structured = validateRoleResult(result.structuredResult, task.role)
+      structuredRoles.add(task.role)
+      const values = structured.role === "scout" ? structured.candidates.map(item => item.jobId) : structured.findings.map(item => item.jobId)
+      for (const id of values) expectedJobIds.add(id)
+    } catch { return false }
+  }
+  return successfulRoles.every(role => structuredRoles.has(role)) && [...aggregate.jobIds as string[]].sort().join("\u0000") === [...expectedJobIds].sort().join("\u0000")
 }
 
 function canonicalTaskGraphAdapter(options: CanonicalPlanExecutionOptions, taskGraph: PlanTaskGraphAdapter, planCallId: string, planRevision: number, receipts?: ReadonlyMap<string, ReplayCommandReceipt>): PlanTaskGraphAdapter {

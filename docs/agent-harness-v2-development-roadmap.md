@@ -3018,3 +3018,11 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Implementation:** `spawnScoutAnalystAndWait` tracks only children actually created by the current invocation. Spawn, dispatch, root-lineage, and durable-wait failures interrupt each recorded child subtree via all-settled cleanup, then rethrow the original failure. Atomic duplicate results remain available to the wait but are not interrupted.
 
 **Independent verification:** Focused `root-orchestration.test.ts` validation passed **9/9 tests**, covering success, partial spawn rejection, dispatch rejection, wait rejection, and atomic duplicate cleanup; `git diff --check` passed. No live PostgreSQL/RLS, queue, process-restart, or production evidence is claimed; P8-86 remains a candidate.
+
+## 173. P8-87 — Bounded Scout/Analyst aggregate in canonical waits
+
+**Candidate status/date (2026-09-22):** P8-87 is a bounded Worker coordination and replay-validation slice; formal P0-P7 acceptance remains **1/8 (12.5%)**.
+
+**Implementation:** `agent.wait` and `wait_subagents` optionally return a deterministic aggregate derived from terminal migrated-role targets. Structured results are validated against the server-owned role before exposure; invalid payloads are hidden with bounded `invalid_structured_result`, results that cannot survive the 2 KiB wait projection omit the aggregate, legacy unstructured results remain readable, and pending roles are explicit. Replay rejects malformed, foreign, contradictory, oversized, or job-ID-inconsistent aggregates.
+
+**Independent verification:** Focused coordination executors, aggregate helper, and canonical-plan validation passed **123/123 tests**; no live PostgreSQL/RLS, queue delivery, process restart, or production evidence is claimed.

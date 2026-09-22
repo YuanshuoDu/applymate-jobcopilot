@@ -10,6 +10,7 @@ import { lifecycleTarget, visibleTask } from "./coordination-visibility.js"
 import { sanitizeLifecyclePreview } from "./redaction.js"
 import type { ToolExecutionContext } from "./types.js"
 import { getSubagentRolePolicy } from "../subagents/role-policy.js"
+import { buildScoutAnalystAggregate, validatedStructuredResult } from "./coordination-result-aggregate.js"
 import type {
   CloseSubagentInput,
   FollowupInput,
@@ -164,7 +165,9 @@ export async function executeWaitSubagents(context: ToolExecutionContext, input:
   })
   const hydratedTargets = result.status === "waiting" ? targets : await Promise.all(targets.map(async task => currentTurnTask(context, await visibleTask(context, task.id, options))))
   await activity(context, options, "wait_subagents", current?.id ?? null, { status: result.status, targetCount: targets.length }, input.idempotencyKey)
-  return { waitId: result.waitId, status: result.status, taskIds: targets.map(task => task.id), deadlineAt: result.deadlineAt, matchedTaskIds: [...result.matchedTaskIds], tasks: hydratedTargets.map(waitTaskOutput) }
+  const tasks = hydratedTargets.map(waitTaskOutput)
+  const aggregate = buildScoutAnalystAggregate(hydratedTargets)
+  return { waitId: result.waitId, status: result.status, taskIds: targets.map(task => task.id), deadlineAt: result.deadlineAt, matchedTaskIds: [...result.matchedTaskIds], tasks, ...(aggregate ? { aggregate } : {}) }
 }
 
 export async function executeListSubagents(context: ToolExecutionContext, input: ListSubagentsInput, options: CoordinationExecutorOptions) {
@@ -245,7 +248,10 @@ function taskOutput(task: CoordinationTaskView) {
   const terminal = TERMINAL_TASK_STATUSES.has(task.status)
   return { taskId: task.id, rootTaskId: task.rootTaskId, parentTaskId: task.parentTaskId, path: task.path, depth: task.depth, role: task.role, taskType: task.taskType, status: task.status, attemptCount: task.attemptCount, maxAttempts: task.maxAttempts, leaseExpiresAt: task.leaseExpiresAt?.toISOString() ?? null, interruptRequestedAt: task.interruptRequestedAt?.toISOString() ?? null, result: terminal ? waitResult(task.result) : null, failureReason: terminal ? boundedFailureReason(task.failureReason) : null }
 }
-function waitTaskOutput(task: CoordinationTaskView) { return { taskId: task.id, status: task.status, role: task.role, result: waitResult(task.result), failureReason: boundedFailureReason(task.failureReason) } }
+function waitTaskOutput(task: CoordinationTaskView) {
+  const checked = validatedStructuredResult(task)
+  return { taskId: task.id, status: task.status, role: task.role, result: checked.invalid ? null : waitResult(task.result), failureReason: boundedFailureReason(checked.invalid ? "invalid_structured_result" : task.failureReason) }
+}
 function waitResult(value: unknown): ReturnType<typeof sanitizeLifecyclePreview> | null {
   if (value === undefined || value === null) return null
   try { return stripForeignResultKeys(sanitizeLifecyclePreview(value, WAIT_RESULT_MAX_BYTES)) }

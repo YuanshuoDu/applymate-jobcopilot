@@ -1697,3 +1697,7 @@ Focused validation passed **29/29** Web tests across the legacy resolver, transa
 ## P8-86 candidate - root orchestration orphan cleanup
 
 `spawnScoutAnalystAndWait` retains the exact children created during this invocation. On spawn, dispatch, root mismatch, or wait failure it interrupts each created subtree with all-settled cleanup and rethrows the triggering error; atomic duplicate children are excluded from cleanup. Focused Worker root-orchestration validation passed **9/9 tests**. Real queue, PostgreSQL/RLS, process-restart, and production evidence remain unverified; P8-86 remains a candidate.
+
+## P8-87 candidate - bounded Scout/Analyst wait aggregate
+
+Canonical wait output now optionally carries a server-derived, bounded Scout/Analyst aggregate. Terminal structured child results are role-validated before exposure; invalid structured payloads are omitted with `invalid_structured_result`, results too large for the wait projection omit the aggregate, legacy unstructured results remain compatible, and replay validates aggregate shape, lineage, role/status consistency, and derived job IDs. Focused Worker validation passed **123/123 tests** across coordination executors, aggregate helper, and canonical-plan suites. Live queue, PostgreSQL/RLS, restart, and production evidence remain unverified; formal P0-P7 acceptance remains **1/8 (12.5%)**.

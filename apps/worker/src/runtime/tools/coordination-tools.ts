@@ -86,6 +86,14 @@ const WaitTaskOutputSchema = Type.Object({
   taskId: IdSchema, status: StatusSchema, role: Type.String({ minLength: 1, maxLength: 256 }), result: Type.Unknown(),
   failureReason: Type.Union([Type.String({ maxLength: 500 }), Type.Null()]),
 }, { additionalProperties: false })
+const WaitAggregateSchema = Type.Object({
+  status: Type.Union([Type.Literal("completed"), Type.Literal("partial"), Type.Literal("failed"), Type.Literal("pending")]),
+  successfulRoles: Type.Array(Type.Union([Type.Literal("scout"), Type.Literal("analyst")]), { maxItems: 2 }),
+  failedRoles: Type.Array(Type.Union([Type.Literal("scout"), Type.Literal("analyst")]), { maxItems: 2 }),
+  pendingRoles: Type.Optional(Type.Array(Type.Union([Type.Literal("scout"), Type.Literal("analyst")]), { maxItems: 2 })),
+  jobIds: Type.Array(IdSchema, { maxItems: 64 }),
+  failures: Type.Array(Type.Object({ role: Type.Union([Type.Literal("scout"), Type.Literal("analyst")]), taskId: IdSchema, reason: Type.String({ maxLength: 500 }) }, { additionalProperties: false }), { maxItems: 2 }),
+}, { additionalProperties: false })
 const FollowupOutputSchema = Type.Object({
   taskId: IdSchema, sourceTaskId: IdSchema, rootTaskId: IdSchema, parentTaskId: Type.Union([IdSchema, Type.Null()]),
   path: Type.String({ minLength: 1, maxLength: 2_048 }), depth: Type.Integer({ minimum: 0 }),
@@ -93,7 +101,7 @@ const FollowupOutputSchema = Type.Object({
 }, { additionalProperties: false })
 const WaitOutputSchema = Type.Object({
   waitId: IdSchema, status: Type.Union([Type.Literal("waiting"), Type.Literal("ready"), Type.Literal("timed_out"), Type.Literal("interrupted"), Type.Literal("closed")]),
-  taskIds: Type.Array(IdSchema), deadlineAt: Type.String(), matchedTaskIds: Type.Array(IdSchema), tasks: Type.Array(WaitTaskOutputSchema, { minItems: 1, maxItems: 50 }),
+  taskIds: Type.Array(IdSchema), deadlineAt: Type.String(), matchedTaskIds: Type.Array(IdSchema), tasks: Type.Array(WaitTaskOutputSchema, { minItems: 1, maxItems: 50 }), aggregate: Type.Optional(WaitAggregateSchema),
 }, { additionalProperties: false })
 const TaskOutputSchema = Type.Object({
   taskId: IdSchema, rootTaskId: IdSchema, parentTaskId: Type.Union([IdSchema, Type.Null()]),
