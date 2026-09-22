@@ -17,7 +17,7 @@ import type { createSubagentQueue } from "./subagent-queue.js"
 import { runTurnJob, type createTurnQueue, type TurnExecutor } from "../runtime/turns/turn-queue.js"
 import type { TurnLease } from "../runtime/turns/lease.js"
 import { recoverTurnQueue, turnJobId } from "../runtime/turns/recovery-scanner.js"
-import { createProductionWorkerBootstrap, type CanonicalTurnRuntime } from "./production-bootstrap.js"
+import { createProductionWorkerBootstrap, startProductionAgentRuntime, type CanonicalTurnRuntime } from "./production-bootstrap.js"
 import { createCanonicalTurnRuntime, type UsageAuthorization } from "../runtime/canonical-turn-runtime.js"
 import { createTurnEngineExecutor } from "../runtime/turns/turn-engine.js"
 import type { TurnEngineStore } from "../runtime/turns/turn-engine-types.js"
@@ -48,27 +48,35 @@ function runtime(events: string[]): CanonicalTurnRuntime {
   }
 }
 
-function compositionStore(): TurnEngineStore {
-  const items = new Map<string, { revision: number }>()
+function compositionStore(
+  persistedItems: Array<{ type: string; status: string; content: unknown }> = [],
+  persistedEvents: Array<{ type: string; payload: unknown }> = [],
+): TurnEngineStore {
+  const items = new Map<string, { revision: number; type: string }>()
   return {
     startStep: async ({ stepId, ordinal }) => ({ id: stepId, ordinal }),
     updateStep: async () => undefined,
-    createItem: async ({ itemId }) => {
-      items.set(itemId, { revision: 0 })
+    createItem: async ({ itemId, type, status, content }) => {
+      items.set(itemId, { revision: 0, type })
+      persistedItems.push({ type, status, content })
       return { id: itemId, revision: 0 }
     },
-    updateItem: async ({ itemId, expectedRevision }) => {
+    updateItem: async ({ itemId, expectedRevision, status, content }) => {
       const item = items.get(itemId)
       if (!item || item.revision !== expectedRevision) throw new Error(`Unknown fixture item ${itemId}`)
       item.revision += 1
+      persistedItems.push({ type: item.type, status, content })
       return { id: itemId, revision: item.revision }
     },
-    appendEvent: async ({ id }) => ({ id }),
+    appendEvent: async ({ id, type, payload }) => {
+      persistedEvents.push({ type, payload })
+      return { id }
+    },
     recordFinalResponse: async () => undefined,
   }
 }
 
-async function compositionRuntime(): Promise<{ runtime: CanonicalTurnRuntime; tool: ReturnType<typeof vi.fn>; lifecycle: InMemoryToolLifecycleSink; requests: HarnessModelRequest[]; manager: AgentTreeManager }> {
+async function compositionRuntime(): Promise<{ runtime: CanonicalTurnRuntime; tool: ReturnType<typeof vi.fn>; lifecycle: InMemoryToolLifecycleSink; requests: HarnessModelRequest[]; manager: AgentTreeManager; validatedArguments: Array<{ name: string; input: unknown; version?: string }>; persistedItems: Array<{ type: string; status: string; content: unknown }>; persistedEvents: Array<{ type: string; payload: unknown }> }> {
   const tool = vi.fn(async (context: { scope: { userId: string } }) => ({ user: context.scope.userId }))
   const definition: RuntimeToolDefinition = {
     schemaVersion, name: "fixture.read", version: "1", description: "Read deterministic fixture state",
@@ -78,10 +86,17 @@ async function compositionRuntime(): Promise<{ runtime: CanonicalTurnRuntime; to
     execute: tool,
   }
   const registry = new ToolRegistry([definition])
+  const validatedArguments: Array<{ name: string; input: unknown; version?: string }> = []
+  vi.spyOn(registry, "validateArguments").mockImplementation((name, input, version) => {
+    validatedArguments.push({ name, input, ...(version === undefined ? {} : { version }) })
+    return ToolRegistry.prototype.validateArguments.call(registry, name, input, version)
+  })
   const lifecycle = new InMemoryToolLifecycleSink()
   const router = new ToolRouter(registry, new ToolLifecycle({ sink: lifecycle, references: new InMemoryToolResultReferenceStore() }))
   let calls = 0
   const requests: HarnessModelRequest[] = []
+  const persistedItems: Array<{ type: string; status: string; content: unknown }> = []
+  const persistedEvents: Array<{ type: string; payload: unknown }> = []
   const model: ModelAdapter = {
     id: "fixture-model",
     profile: {
@@ -116,7 +131,7 @@ async function compositionRuntime(): Promise<{ runtime: CanonicalTurnRuntime; to
       ensure: vi.fn(async () => ({ id: "root_fixture" } as never)),
       finish: vi.fn(async () => undefined),
     },
-    turnEngineStoreFactory: () => compositionStore(),
+    turnEngineStoreFactory: () => compositionStore(persistedItems, persistedEvents),
     contextBuilderFactory: () => {
       const checkpoints = new Map<string, { inputThroughSequence: bigint; consumedInputIds: readonly string[] }>()
       const inputStore = {
@@ -132,7 +147,7 @@ async function compositionRuntime(): Promise<{ runtime: CanonicalTurnRuntime; to
     authorizeUsage: vi.fn(async () => ({ settle: vi.fn(async (_input: Parameters<UsageAuthorization["settle"]>[0]) => undefined) })),
   })
   return {
-    runtime, tool, lifecycle, requests, manager,
+    runtime, tool, lifecycle, requests, manager, validatedArguments, persistedItems, persistedEvents,
   }
 }
 
@@ -603,32 +618,83 @@ describe("production Worker bootstrap", () => {
     expect(canonical.close).toHaveBeenCalledOnce()
   })
 
-  it("runs the same bootstrap binding through TurnEngine and ToolRouter with a deterministic model", async () => {
-    const fixture = await compositionRuntime()
+  it("creates the canonical runtime inside the shared startup helper before consumers and router", async () => {
+    let fixture: Awaited<ReturnType<typeof compositionRuntime>> | undefined
     let execute: CanonicalTurnRuntime["execute"] | undefined
+    const startup: string[] = []
     const lease = {
       turnId: "turn_fixture", sessionId: "session_fixture", ownerId: "worker_fixture", userId: "user_fixture", leaseVersion: 1,
       leaseStartedAt: new Date("2026-09-01T00:00:00.000Z"), leaseExpiresAt: new Date("2026-09-01T00:10:00.000Z"),
     }
-    const bootstrap = await createProductionWorkerBootstrap({
-      pool: { connect: vi.fn() }, runtime: fixture.runtime,
-      turnQueueFactory: vi.fn((options) => {
-        execute = options.execute
-        return { queue: { add: vi.fn() }, worker: {}, active: { size: 0, values: () => [] }, close: vi.fn(async () => undefined) } as never
-      }) as unknown as Parameters<typeof createProductionWorkerBootstrap>[0]["turnQueueFactory"],
-      turnRecoveryFactory: vi.fn(() => ({ close: vi.fn(async () => undefined) })) as unknown as Parameters<typeof createProductionWorkerBootstrap>[0]["turnRecoveryFactory"],
+    const bootstrap = await startProductionAgentRuntime({
+      pool: { connect: vi.fn() },
+      createRuntime: async () => {
+        startup.push("runtime-factory:start")
+        const created = await compositionRuntime()
+        fixture = created
+        startup.push("runtime-factory:ready")
+        return created.runtime
+      },
+      bootstrapOptions: {
+        turnQueueFactory: vi.fn((options) => {
+          startup.push("turn-consumer")
+          execute = options.execute
+          return { queue: { add: vi.fn() }, worker: {}, active: { size: 0, values: () => [] }, close: vi.fn(async () => undefined) } as never
+        }) as unknown as Parameters<typeof createProductionWorkerBootstrap>[0]["turnQueueFactory"],
+        turnRecoveryFactory: vi.fn(() => {
+          startup.push("turn-recovery")
+          return { close: vi.fn(async () => undefined) }
+        }) as unknown as Parameters<typeof createProductionWorkerBootstrap>[0]["turnRecoveryFactory"],
+      },
+      onBootstrapReady: ready => { expect(ready.turns).toBeDefined(); startup.push("bootstrap-ready") },
+      startAgentRunWorker: () => { startup.push("agent-run-router") },
     })
 
+    expect(startup).toEqual(["runtime-factory:start", "runtime-factory:ready", "turn-consumer", "turn-recovery", "bootstrap-ready", "agent-run-router"])
+    const composedFixture = fixture
+    if (!composedFixture) throw new Error("canonical runtime fixture was not created")
+    expect(execute).toBe(composedFixture.runtime.execute)
     const result = await execute!({ lease, signal: new AbortController().signal })
 
     expect(result).toMatchObject({ status: "completed" })
-    expect(fixture.tool).toHaveBeenCalledWith(expect.objectContaining({ scope: { userId: "user_fixture" } }), {})
-    expect(fixture.lifecycle.events.map((event) => event.phase)).toEqual(["started", "completed"])
-    expect(fixture.requests).toHaveLength(2)
-    expect(JSON.stringify(fixture.requests[1]?.messages)).toContain("fixture-call")
-    expect(JSON.stringify(fixture.requests[1]?.messages)).toContain("user_fixture")
+    expect(composedFixture.tool).toHaveBeenCalledWith(expect.objectContaining({ scope: { userId: "user_fixture" } }), {})
+    expect(composedFixture.validatedArguments).toContainEqual({ name: "fixture.read", input: {}, version: "1" })
+    expect(composedFixture.lifecycle.events.map((event) => event.phase)).toEqual(["started", "completed"])
+    expect(composedFixture.requests).toHaveLength(2)
+    expect(JSON.stringify(composedFixture.requests[1]?.messages)).toContain("fixture-call")
+    expect(JSON.stringify(composedFixture.requests[1]?.messages)).toContain("user_fixture")
+    expect(JSON.stringify(composedFixture.requests[1]?.messages)).toContain('"toolUseId":"fixture-call"')
+    expect(JSON.stringify(composedFixture.requests[1]?.messages)).toContain('"content":"{\\"user\\":\\"user_fixture\\"}"')
+    expect(composedFixture.persistedItems).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "tool_result", status: "completed",
+        content: expect.objectContaining({ toolCallId: "fixture-call", output: { user: "user_fixture" } }),
+      }),
+    ]))
+    expect(composedFixture.persistedEvents.some(event => event.type === "tool_call.completed" && JSON.stringify(event.payload).includes("fixture-call"))).toBe(true)
     await bootstrap.close()
-    expect(fixture.manager.shutdown).toHaveBeenCalledOnce()
+    expect(composedFixture.manager.shutdown).toHaveBeenCalledOnce()
+  })
+
+  it("fails before starting the run router when enabled child execution is not wired", async () => {
+    const events: string[] = []
+    const canonical = { ...runtime(events), childExecutionEnabled: true }
+    const startRouter = vi.fn()
+    const turnQueueFactory = vi.fn()
+    const bootstrapReady = vi.fn()
+
+    await expect(startProductionAgentRuntime({
+      pool: { connect: vi.fn() },
+      createRuntime: async () => canonical,
+      bootstrapOptions: { turnQueueFactory: turnQueueFactory as never },
+      onBootstrapReady: bootstrapReady,
+      startAgentRunWorker: startRouter,
+    })).rejects.toThrow("canonical_child_execution_unconfigured")
+
+    expect(turnQueueFactory).not.toHaveBeenCalled()
+    expect(bootstrapReady).not.toHaveBeenCalled()
+    expect(startRouter).not.toHaveBeenCalled()
+    expect(events).toEqual(["runtime.close"])
   })
 
   it("composes root TurnEngine coordination with a leased child execution and wait closure", async () => {
@@ -685,7 +751,14 @@ describe("production Worker bootstrap", () => {
       expect(task.id).toBe(child.id)
       expect(lease.id).toBe(child.id)
       expect(owner).toMatchObject({ taskId: child.id, rootTaskId: "root_fixture", ownerId: "queue_fixture", attemptCount: 1 })
-      return { definitions: [childDefinition], router: { execute: childRouter } }
+      return {
+        definitions: [childDefinition], router: { execute: childRouter },
+        validateArguments: (name: string, input: unknown, version?: string): true | string => {
+          if (name !== childDefinition.name || (version !== undefined && version !== childDefinition.version)) return "unknown fixture tool"
+          if (!input || typeof input !== "object" || Array.isArray(input) || Object.keys(input).length > 0) return "invalid fixture arguments"
+          return true
+        },
+      }
     })
     const childExecutor = createProductionChildExecutor({
       pool: { connect: vi.fn() } as never,

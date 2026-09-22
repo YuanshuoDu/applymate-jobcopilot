@@ -95,29 +95,9 @@ async function main() {
     enabled: productionFlags.contextCompactionEnabled,
     pool,
   });
-  const childExecutor = productionChildRuntimeModule.createOptionalProductionChildExecutor({
-    enabled: productionFlags.childExecutionEnabled,
-    pool,
-    ...(productionFlags.childExecutionEnabled && contextCompactionOptions.contextSnapshotAdapter
-      ? { contextSnapshotAdapter: contextCompactionOptions.contextSnapshotAdapter }
-      : {}),
-  });
-  const canonicalRuntime = await canonicalRuntimeModule.createCanonicalTurnRuntime(pool, {
-    workerId: process.env.WORKER_ID ?? `worker-${process.pid}`,
-    authorizeUsage: aiUsageBridgeModule.createWorkerUsageAuthorizer(),
-    productionFlags,
-    executionProjection: createCanonicalExecutionProjection(pool),
-    sessionProjection: createCanonicalSessionProjection(pool),
-    ...contextCompactionOptions,
-  });
   const waitResolver = productionFlags.consumeWaitOutcomes ? {} : undefined;
-  const canonicalBootstrap = await productionBootstrapModule.createProductionWorkerBootstrap({
-    pool,
-    runtime: canonicalRuntime,
-    ...(childExecutor ? { subagents: { execute: childExecutor } } : {}),
-    ...(waitResolver ? { waitResolver } : {}),
-  });
-  console.log("[worker] Canonical Turn consumer and recovery scanner started");
+  let childExecutor: ReturnType<typeof productionChildRuntimeModule.createOptionalProductionChildExecutor> = undefined;
+  let canonicalBootstrap: Awaited<ReturnType<typeof productionBootstrapModule.createProductionWorkerBootstrap>> | undefined;
   let agentWakeupConsumer: ReturnType<typeof startAgentWakeupConsumer> | undefined;
   let agentMailboxOutboxConsumer: ReturnType<typeof startSubagentMailboxOutboxConsumer> | undefined;
   let agentEventOutboxConsumer: ReturnType<typeof startAgentEventOutboxConsumer> | undefined;
@@ -127,7 +107,7 @@ async function main() {
     () => scoutWorker.close(),
     () => applyWorker.close(),
     () => closeAgentRunResources(),
-    () => canonicalBootstrap.close(),
+    async () => { await canonicalBootstrap?.close(); },
     () => closeDeadLetterResources(),
     () => automationScheduler?.close(),
     () => closeAllSlots(),
@@ -139,11 +119,40 @@ async function main() {
     () => closeSharedRedisConnections(),
   ]);
   try {
-    // The agent-runs queue is a router into the canonical Turn queue. Start it
-    // only after the canonical consumer/recovery boundary is ready, so a job
-    // cannot be accepted by the router while the execution owner is absent.
-    startAgentRunWorker();
-    console.log("[worker] Agent run router started");
+    canonicalBootstrap = await productionBootstrapModule.startProductionAgentRuntime({
+      pool,
+      createRuntime: async () => {
+        childExecutor = productionChildRuntimeModule.createOptionalProductionChildExecutor({
+          enabled: productionFlags.childExecutionEnabled,
+          pool,
+          ...(productionFlags.childExecutionEnabled && contextCompactionOptions.contextSnapshotAdapter
+            ? { contextSnapshotAdapter: contextCompactionOptions.contextSnapshotAdapter }
+            : {}),
+        });
+        return canonicalRuntimeModule.createCanonicalTurnRuntime(pool, {
+          workerId: process.env.WORKER_ID ?? `worker-${process.pid}`,
+          authorizeUsage: aiUsageBridgeModule.createWorkerUsageAuthorizer(),
+          productionFlags,
+          executionProjection: createCanonicalExecutionProjection(pool),
+          sessionProjection: createCanonicalSessionProjection(pool),
+          ...contextCompactionOptions,
+        });
+      },
+      bootstrapOptions: () => ({
+        ...(childExecutor ? { subagents: { execute: childExecutor } } : {}),
+        ...(waitResolver ? { waitResolver } : {}),
+      }),
+      onBootstrapReady: bootstrap => {
+        canonicalBootstrap = bootstrap;
+        console.log("[worker] Canonical Turn consumer and recovery scanner started");
+      },
+      startAgentRunWorker: () => {
+        // The agent-runs queue routes into canonical Turn. Register it only
+        // after the execution and recovery boundary is ready.
+        startAgentRunWorker();
+        console.log("[worker] Agent run router started");
+      },
+    });
 
     agentWakeupConsumer = startAgentWakeupConsumer();
     console.log("[worker] Agent Turn wakeup consumer started");

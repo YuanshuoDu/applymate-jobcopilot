@@ -83,6 +83,38 @@ export interface ProductionWorkerBootstrap {
   close(): Promise<void>
 }
 
+export interface ProductionAgentRuntimeStartupOptions {
+  readonly pool: LeasePool
+  readonly createRuntime: () => Promise<CanonicalTurnRuntime>
+  readonly bootstrapOptions?: Omit<ProductionBootstrapOptions, "pool" | "runtime">
+    | ((runtime: CanonicalTurnRuntime) => Omit<ProductionBootstrapOptions, "pool" | "runtime">)
+  /** Synchronously transfers cleanup ownership to the Worker's startup fence. */
+  readonly onBootstrapReady?: (bootstrap: ProductionWorkerBootstrap) => void
+  readonly startAgentRunWorker: () => void
+}
+
+/** Keep canonical bootstrap registration ahead of the production run router. */
+export async function startProductionAgentRuntime(
+  options: ProductionAgentRuntimeStartupOptions,
+): Promise<ProductionWorkerBootstrap> {
+  const runtime = await options.createRuntime()
+  let bootstrap: ProductionWorkerBootstrap | undefined
+  let cleanupTransferred = false
+  try {
+    const extra = typeof options.bootstrapOptions === "function"
+      ? options.bootstrapOptions(runtime)
+      : options.bootstrapOptions
+    bootstrap = await createProductionWorkerBootstrap({ pool: options.pool, runtime, ...extra })
+    options.onBootstrapReady?.(bootstrap)
+    cleanupTransferred = options.onBootstrapReady !== undefined
+    options.startAgentRunWorker()
+    return bootstrap
+  } catch (error: unknown) {
+    if (bootstrap && !cleanupTransferred) await bootstrap.close().catch(() => undefined)
+    throw error
+  }
+}
+
 /** Close every owned resource and report the first failure after cleanup. */
 async function closeAll(resources: ReadonlyArray<(() => Promise<void>) | undefined>): Promise<void> {
   let firstError: unknown
