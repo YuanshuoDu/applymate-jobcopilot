@@ -1713,3 +1713,7 @@ Canonical turn state now restores the latest strictly scoped `cognitive.agenda` 
 ## P8-90 candidate - canonical cognitive agenda resume fence
 
 Newly written agenda receipts may carry the server-owned step cursor (`inputThroughSequence` and `consumedInputIds`). On restore, the canonical loader requires that cursor and step identity to match the latest durable step; drift fails closed before provider runtime construction. Legacy receipts without the optional fence remain readable. The receipt, raw narrative, and `nextAction` are never injected into model context. Formal P0-P7 acceptance remains **1/8 (12.5%)**; P8-90 is a candidate pending live PostgreSQL/RLS, restart, and production evidence.
+
+## P8-91 candidate - explainable cognitive agenda fence retry
+
+The existing Turn queue now identifies `cognitive_agenda_resume_fence_invalid` as a retryable deterministic execution failure before the ordinary retry limit. At the existing limit it still releases the Turn as failed and writes the existing `agent.turn.dlq` envelope with `max_retries_exhausted` plus the stable fence `error_code`; no new DB status or schema was added, and ordinary failure classification is unchanged. Formal P0-P7 acceptance remains **1/8 (12.5%)**.

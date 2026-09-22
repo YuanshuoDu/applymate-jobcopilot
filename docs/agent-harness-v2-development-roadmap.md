@@ -3050,3 +3050,9 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Implementation:** Each newly written cognitive agenda receipt may carry the current step's `inputThroughSequence` and `consumedInputIds`. Canonical state restore compares that fence with the matching durable step identity and cursor, failing closed on drift before provider runtime construction. Legacy receipts without the optional fence remain readable. The receipt is never injected into model context and `nextAction` remains informational audit state.
 
 **Independent verification:** Focused Worker agenda, state, loop, and canonical runtime validation passed **168/168 tests**; Worker TypeScript and `git diff --check` passed. Live PostgreSQL/RLS, process restart, and production evidence remain unverified; P8-90 remains a candidate.
+
+## 177. P8-91 — Explainable cognitive agenda fence retry
+
+**Candidate status/date (2026-09-22):** P8-91 is a bounded queue/DLQ classification slice; formal P0-P7 acceptance remains **1/8 (12.5%)**.
+
+The existing Turn queue now preserves `cognitive_agenda_resume_fence_invalid` as an identifiable retry reason before the normal retry limit, while attempts at the existing limit still produce the existing `max_retries_exhausted` DLQ outcome with the stable fence error code. No new status, schema, or reconciliation state was introduced; ordinary failures retain their existing classification.

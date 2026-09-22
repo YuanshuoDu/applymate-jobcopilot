@@ -5,6 +5,7 @@ vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnec
 import { markTurnDispatchClaimed, runTurnJob, TurnExecutionRegistry, type TurnExecutionResult } from "./turn-queue.js"
 import type { TurnLease } from "./lease.js"
 import { RootAbortControllerRegistry } from "../interrupt/registry.js"
+import { COGNITIVE_AGENDA_RESUME_FENCE_INVALID } from "./dlq.js"
 
 const lease: TurnLease = {
   turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1", userId: "user_1", leaseVersion: 1,
@@ -231,6 +232,24 @@ describe("Turn queue processor", () => {
     expect(execute).toHaveBeenCalledWith(expect.objectContaining({ signal: expect.any(AbortSignal) }))
     expect(interrupts.size).toBe(0)
     expect(fake.calls.some((sql) => sql.includes('SET "status" = $5'))).toBe(true)
+  })
+
+  it("requeues a resume fence drift with an identifiable error and DLQs it at the existing limit", async () => {
+    const first = pool()
+    const error = new Error(COGNITIVE_AGENDA_RESUME_FENCE_INVALID)
+    await expect(runTurnJob(
+      { data: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptsMade: 0 },
+      { pool: first.pool, execute: vi.fn().mockRejectedValue(error) },
+    )).rejects.toBe(error)
+    expect(first.calls.some(sql => sql.includes('SET "status" = $5'))).toBe(true)
+
+    const terminal = pool()
+    const result = await runTurnJob(
+      { data: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptsMade: 4 },
+      { pool: terminal.pool, execute: vi.fn().mockRejectedValue(error) },
+    )
+    expect(result).toEqual({ status: "dead_lettered", reasonCode: "max_retries_exhausted" })
+    expect(terminal.calls.some(sql => sql.includes('INSERT INTO "agent_outbox"'))).toBe(true)
   })
 
   it("converges a durable interrupted Turn after heartbeat renewal is fenced", async () => {
