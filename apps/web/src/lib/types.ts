@@ -371,15 +371,32 @@ export interface Suggestion {
 
 export type ApplicationAuditSeverity = 'pass' | 'warning' | 'critical'
 export type ApplicationAuditVerdict = 'pass' | 'needs_review' | 'blocked'
+export type ApplicationAuditTarget =
+  | 'contact'
+  | 'summary'
+  | 'skills'
+  | 'experience'
+  | 'education'
+  | 'languages'
+  | 'projects'
+  | 'certifications'
+  | 'cover_letter'
 
 export interface ApplicationAuditFinding {
   area: 'resume' | 'cover_letter' | 'job_match'
   severity: ApplicationAuditSeverity
   /** A missing Persona fact needs user input; it is not evidence of fabrication. */
   resolution?: 'contradiction' | 'evidence_needed'
+  /** The exact document section that a generated correction can replace. */
+  target?: ApplicationAuditTarget
   title: string
   evidence: string
   action: string
+  /** Complete replacement content generated from the confirmed evidence boundary. */
+  proposedValue?: unknown
+  /** Set by the apply endpoint; the finding stays visible until the audit reruns. */
+  applied?: boolean
+  appliedAt?: string
 }
 
 export interface ApplicationAudit {

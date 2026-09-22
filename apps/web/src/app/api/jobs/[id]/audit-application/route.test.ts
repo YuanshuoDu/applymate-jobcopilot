@@ -151,7 +151,7 @@ describe('POST /api/jobs/[id]/audit-application', () => {
     const { POST } = await import('./route')
     const response = (await POST(request({ resumeId: 'resume_final', coverLetterId: 'cover_1' }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
     expect(response.status).toBe(200)
-    expect(mocks.modelChat).toHaveBeenCalledWith(expect.anything(), expect.objectContaining(settingsCfg), 2048)
+    expect(mocks.modelChat).toHaveBeenCalledWith(expect.anything(), expect.objectContaining(settingsCfg), 4096)
   })
 
   it('retries one aborted model call before failing the audit', async () => {
@@ -180,7 +180,7 @@ describe('POST /api/jobs/[id]/audit-application', () => {
     const { POST } = await import('./route')
     const response = (await POST(request({ resumeId: 'resume_final', coverLetterId: 'cover_1' }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
     expect(response.status).toBe(200)
-    expect(mocks.modelChat).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ provider: 'minimax', model: 'MiniMax-M3', thinking: 'disabled' }), 2048)
+    expect(mocks.modelChat).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ provider: 'minimax', model: 'MiniMax-M3', thinking: 'disabled' }), 4096)
   })
 
   it('returns a retryable audit state when both model responses are malformed', async () => {

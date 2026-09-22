@@ -12,6 +12,7 @@ import { prepareAiRoute, requireAuth, isErrorResponse, ok, err } from '@/lib/api
 import { modelChat, parseAiJson, withMiniMaxThinking, type AiConfig } from '@/lib/model-router'
 import { roleAiConfig } from '@/lib/agent/role-config'
 import { buildPersona } from '@/lib/persona'
+import { auditActivityText, AUDIT_ACTIVITY_PREFIX, isApplicationAuditTarget, parseStoredApplicationAudit, sanitizeProposedValue, targetForAuditFinding } from '@/lib/application-audit'
 import type { ApplicationAudit, ApplicationAuditFinding, ResumeContent } from '@/lib/types'
 
 type Params = { params: Promise<{ id: string }> }
@@ -25,15 +26,6 @@ type RawAudit = {
 
 const AREAS = new Set<ApplicationAuditFinding['area']>(['resume', 'cover_letter', 'job_match'])
 const SEVERITIES = new Set<ApplicationAuditFinding['severity']>(['pass', 'warning', 'critical'])
-const AUDIT_ACTIVITY_PREFIX = '[Auditor] application-audit '
-
-type StoredApplicationAudit = {
-  resumeId: string
-  coverLetterId: string | null
-  resumeUpdatedAt?: string
-  coverLetterUpdatedAt?: string
-  audit: ApplicationAudit
-}
 
 type ApplicationAuditResponse = ApplicationAudit & {
   resumeUpdatedAt?: string
@@ -45,14 +37,27 @@ function toText(content: ResumeContent): string {
 }
 
 function normalize(raw: RawAudit, source: ApplicationAudit['source'], includeCoverLetter: boolean): ApplicationAudit {
-  const findings: ApplicationAuditFinding[] = (Array.isArray(raw.findings) ? raw.findings : []).slice(0, 12).map(finding => ({
-    area: AREAS.has(finding.area as ApplicationAuditFinding['area']) ? finding.area as ApplicationAuditFinding['area'] : 'resume',
-    severity: SEVERITIES.has(finding.severity as ApplicationAuditFinding['severity']) ? finding.severity as ApplicationAuditFinding['severity'] : 'warning',
-    resolution: (finding.resolution === 'evidence_needed' ? 'evidence_needed' : 'contradiction') as ApplicationAuditFinding['resolution'],
-    title: String(finding.title ?? 'Review application material').slice(0, 120),
-    evidence: String(finding.evidence ?? 'The auditor could not establish enough evidence.').slice(0, 500),
-    action: String(finding.action ?? 'Review and correct this item before confirming.').slice(0, 300),
-  })).filter(finding => includeCoverLetter || finding.area !== 'cover_letter')
+  const findings: ApplicationAuditFinding[] = (Array.isArray(raw.findings) ? raw.findings : []).slice(0, 12).map(finding => {
+    const base: ApplicationAuditFinding = {
+      area: AREAS.has(finding.area as ApplicationAuditFinding['area']) ? finding.area as ApplicationAuditFinding['area'] : 'resume',
+      severity: SEVERITIES.has(finding.severity as ApplicationAuditFinding['severity']) ? finding.severity as ApplicationAuditFinding['severity'] : 'warning',
+      resolution: (finding.resolution === 'evidence_needed' ? 'evidence_needed' : 'contradiction') as ApplicationAuditFinding['resolution'],
+      title: String(finding.title ?? 'Review application material').slice(0, 120),
+      evidence: String(finding.evidence ?? 'The auditor could not establish enough evidence.').slice(0, 500),
+      action: String(finding.action ?? 'Review and correct this item before confirming.').slice(0, 300),
+    }
+    const target = base.severity !== 'pass' && base.area !== 'job_match'
+      ? (isApplicationAuditTarget(finding.target) ? finding.target : targetForAuditFinding(base))
+      : undefined
+    const proposedValue = target && finding.proposedValue !== undefined
+      ? sanitizeProposedValue(target, finding.proposedValue)
+      : null
+    return {
+      ...base,
+      ...(target ? { target } : {}),
+      ...(proposedValue !== null ? { proposedValue } : {}),
+    }
+  }).filter(finding => includeCoverLetter || finding.area !== 'cover_letter')
   const auditedAreas = new Set(findings.map(finding => finding.area))
   // The audit gate verifies factual integrity of the submitted documents.
   // Job-fit gaps are useful advice, but absence of a requested skill is never
@@ -67,8 +72,6 @@ function normalize(raw: RawAudit, source: ApplicationAudit['source'], includeCov
   })
   const hasCritical = findings.some(finding => finding.area !== 'job_match' && finding.severity === 'critical')
   const hasFactualWarning = findings.some(finding => finding.area !== 'job_match' && finding.severity === 'warning')
-  const requestedVerdict = raw.verdict === 'pass' || raw.verdict === 'blocked' || raw.verdict === 'needs_review'
-    ? raw.verdict : 'needs_review'
   return {
     verdict: hasCritical ? 'blocked' : (hasFactualWarning || incomplete.length) ? 'needs_review' : 'pass',
     summary: String(raw.summary ?? 'Independent audit completed. Review all findings before final confirmation.').slice(0, 600),
@@ -77,15 +80,6 @@ function normalize(raw: RawAudit, source: ApplicationAudit['source'], includeCov
     source,
     auditedAt: new Date().toISOString(),
   }
-}
-
-function auditActivityText(
-  resumeId: string,
-  coverLetterId: string | null,
-  audit: ApplicationAudit,
-  versions: Pick<StoredApplicationAudit, 'resumeUpdatedAt' | 'coverLetterUpdatedAt'> = {},
-) {
-  return `${AUDIT_ACTIVITY_PREFIX}${JSON.stringify({ resumeId, coverLetterId, ...versions, audit })}`
 }
 
 function toIso(value: unknown) {
@@ -108,16 +102,16 @@ async function runAuditModel(prompt: string, cfg: AiConfig) {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       // Keep the audit output bounded for factual evidence review.
-      return await modelChat([{ role: 'user', content: prompt }], cfg, 2_048)
+      return await modelChat([{ role: 'user', content: prompt }], cfg, 4_096)
     } catch (error) {
       lastError = error
       if (isMiniMaxReasoningExhausted(error, cfg)) {
         // Retained M3 configurations can retry without private reasoning.
         if (cfg.model === 'MiniMax-M3') {
-          return modelChat([{ role: 'user', content: prompt }], withMiniMaxThinking(cfg, 'disabled'), 2_048)
+          return modelChat([{ role: 'user', content: prompt }], withMiniMaxThinking(cfg, 'disabled'), 4_096)
         }
         // Retry through the platform's M3 direct-answer mode.
-        return modelChat([{ role: 'user', content: prompt }], { ...cfg, model: 'MiniMax-M3', thinking: 'disabled' }, 1_800)
+        return modelChat([{ role: 'user', content: prompt }], { ...cfg, model: 'MiniMax-M3', thinking: 'disabled' }, 3_600)
       }
       if (!isAbortError(error) || attempt === 1) throw error
       await new Promise(resolve => setTimeout(resolve, 750))
@@ -158,17 +152,6 @@ async function runParsedAudit(prompt: string, cfg: AiConfig, source: Application
   throw new Error('Independent audit did not produce a result')
 }
 
-function parseStoredAudit(text: string): StoredApplicationAudit | null {
-  if (!text.startsWith(AUDIT_ACTIVITY_PREFIX)) return null
-  try {
-    const stored = JSON.parse(text.slice(AUDIT_ACTIVITY_PREFIX.length)) as StoredApplicationAudit
-    if (!stored.resumeId || stored.coverLetterId === undefined || !stored.audit?.verdict || !Array.isArray(stored.audit.findings)) return null
-    return stored
-  } catch {
-    return null
-  }
-}
-
 /** The canonical persisted audit used by My Jobs, Resume, and the extension. */
 export async function GET(req: NextRequest, { params }: Params) {
   const auth = await requireAuth(req)
@@ -179,7 +162,7 @@ export async function GET(req: NextRequest, { params }: Params) {
     orderBy: { createdAt: 'desc' },
     select: { text: true },
   })
-  return ok(parseStoredAudit(activity?.text ?? '') ?? null)
+  return ok(parseStoredApplicationAudit(activity?.text ?? '') ?? null)
 }
 
 export async function POST(req: NextRequest, { params }: Params) {
@@ -243,10 +226,12 @@ Your only release gate is factual integrity. The SOURCE RESUME and CONFIRMED PER
 
 Use "resolution":"contradiction" and severity "critical" only when a source explicitly contradicts the final claim (including stale/current-status claims such as saying the candidate currently works in Shanghai when the source dates ended). Use "resolution":"evidence_needed" and severity "warning" when the source simply does not contain enough evidence to verify a claim: this is not fabrication, and the candidate may add a confirmed Persona fact or remove/soften the claim. Quote the exact final claim and the source fact or absence in "evidence", and state a precise correction in "action".
 
+For every unresolved resume or cover_letter finding, also return "target" and a "proposedValue". The target must be the smallest affected section: contact, summary, skills, experience, education, languages, projects, certifications, or cover_letter. proposedValue must be a complete replacement for that section using the same JSON type as the final material. It must remove or soften unsupported claims, or use a confirmed Persona fact when one exists; never invent a metric, employer, title, date, credential, project, or outcome. If no safe replacement can be generated, omit proposedValue and explain the required user evidence in action. Do not return proposedValue for job_match findings or pass findings.
+
 Do not treat a missing job requirement, indirect experience, a different presentation order, or lack of Copilot/MLOps exposure as a factual issue. Those are optional fit notes only: put them in "job_match" with severity "pass" and wording like "Optional future emphasis", and never downgrade the verdict for them. Do not infer LLM automation from a general AI or Q&A project. Do not infer security-threat detection metrics from cybersecurity work.
 
 Return ONLY JSON. Always return at least one finding for EACH area: ${auditedAreas}. Use severity "pass" when an area is supported and safe. A pass verdict is valid only when the audited document claims are supported with no unresolved factual warnings.
-{"verdict":"pass|needs_review|blocked","summary":"...","matchScore":0,"findings":[{"area":"resume|cover_letter|job_match","severity":"pass|warning|critical","resolution":"contradiction|evidence_needed","title":"...","evidence":"quote or precise comparison","action":"..."}]}
+{"verdict":"pass|needs_review|blocked","summary":"...","matchScore":0,"findings":[{"area":"resume|cover_letter|job_match","severity":"pass|warning|critical","resolution":"contradiction|evidence_needed","target":"contact|summary|skills|experience|education|languages|projects|certifications|cover_letter","title":"...","evidence":"quote or precise comparison","action":"...","proposedValue":"complete replacement value or null"}]}
 
 SOURCE RESUME (truth baseline):
 ${toText(sourceContent)}

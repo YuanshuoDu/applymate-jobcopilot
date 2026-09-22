@@ -18,12 +18,15 @@ vi.mock('@/lib/i18n', () => ({
       'resume.auditNotRun': 'Not run yet',
       'resume.auditPassed': 'Audit passed',
       'resume.auditNeedsReviewShort': 'Needs review',
+      'resume.auditNeedsRerunShort': 'Needs re-run',
       'resume.auditBlockedShort': 'Blocked',
       'resume.auditNoIssues': 'No unresolved factual issues found.',
+      'resume.auditChangedSinceRun': 'The material changed after this audit. Run it again before confirming.',
       'resume.auditRun': 'Run independent audit',
       'resume.auditRunAgain': 'Run audit again',
       'resume.auditFindingsTitle': 'Findings to fix',
       'resume.auditFindingsCount': 'items',
+      'resume.auditAppliedCount': 'applied',
       'resume.auditAreaResume': 'Resume',
       'resume.auditAreaCoverLetter': 'Cover letter',
       'resume.auditAreaJobMatch': 'Job match',
@@ -31,9 +34,14 @@ vi.mock('@/lib/i18n', () => ({
       'resume.auditWarning': 'Warning',
       'resume.auditEvidenceLabel': 'Evidence',
       'resume.auditActionLabel': 'Recommended fix',
+      'resume.auditGeneratedLabel': 'Generated correction',
       'resume.auditEditResume': 'Edit resume',
       'resume.auditEditCoverLetter': 'Edit cover letter',
       'resume.auditReviewJob': 'Review job',
+      'resume.auditApplyGenerated': 'Apply generated fix',
+      'resume.auditGenerateAndApply': 'Generate & apply',
+      'resume.auditAppliedAction': 'Applied',
+      'resume.auditCopyGenerated': 'Copy generated content',
       'resume.auditCopyAction': 'Copy fix',
       'resume.auditCopiedAction': 'Copied',
       'resume.auditFixThenRerun': 'Make the change, then run the audit again.',
@@ -59,6 +67,15 @@ const needsReviewAudit: ApplicationAudit = {
   findings: [{ area: 'resume', severity: 'warning', title: 'Unsupported claim', evidence: 'The source does not contain this metric.', action: 'Remove or soften the metric.' }],
   source: 'parent_resume',
   auditedAt: '2026-09-21T12:01:00.000Z',
+}
+
+const generatedAudit: ApplicationAudit = {
+  ...needsReviewAudit,
+  findings: [{
+    ...needsReviewAudit.findings[0],
+    target: 'summary',
+    proposedValue: 'A supported summary without the unsupported metric.',
+  }],
 }
 
 describe('ResumeAuditCard', () => {
@@ -92,5 +109,25 @@ describe('ResumeAuditCard', () => {
     expect(markup).toContain('Edit resume')
     expect(markup).toContain('Copy fix')
     expect(markup).toContain('Make the change, then run the audit again.')
+  })
+
+  it('shows generated correction content and keeps the apply action visible', () => {
+    const onApply = vi.fn()
+    const markup = renderToStaticMarkup(
+      <ResumeAuditCard audit={generatedAudit} auditing={false} hasLinkedJob hasCoverLetter={false} onApplyFinding={onApply} onAudit={vi.fn()} />,
+    )
+
+    expect(markup).toContain('Generated correction')
+    expect(markup).toContain('A supported summary without the unsupported metric.')
+    expect(markup).toContain('Apply generated fix')
+  })
+
+  it('shows an applied finding instead of removing it from the audit card', () => {
+    const markup = renderToStaticMarkup(
+      <ResumeAuditCard audit={{ ...generatedAudit, findings: [{ ...generatedAudit.findings[0], applied: true }] }} auditing={false} hasLinkedJob hasCoverLetter={false} onApplyFinding={vi.fn()} onAudit={vi.fn()} />,
+    )
+
+    expect(markup).toContain('Applied')
+    expect(markup).not.toContain('Apply generated fix')
   })
 })
