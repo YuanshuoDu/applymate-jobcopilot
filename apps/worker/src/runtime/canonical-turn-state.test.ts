@@ -30,8 +30,8 @@ function patchGraphEvent(row: Record<string, unknown>, patch: Record<string, unk
   const payload = row.payload as Record<string, unknown>
   return { ...row, payload: { ...payload, event: { ...(payload.event as Record<string, unknown>), ...patch } } }
 }
-function agendaEvent(sequence = "20", patch: Record<string, unknown> = {}): Record<string, unknown> {
-  const value = buildCognitiveAgendaReceipt({ sessionId: "session-1", turnId: "turn-1", taskId: "root-1", stepId: "step-1", agenda: buildCognitiveActionAgenda({ schemaVersion: "agent-harness.v2", sessionId: "session-1", turnId: "turn-1", stepId: "step-1", inputThroughSequence: 1n, consumedInputIds: [], canonicalJson: "{}", blocks: [] }) })
+function agendaEvent(sequence = "20", patch: Record<string, unknown> = {}, fence?: { inputThroughSequence: bigint; consumedInputIds: readonly string[] }): Record<string, unknown> {
+  const value = buildCognitiveAgendaReceipt({ sessionId: "session-1", turnId: "turn-1", taskId: "root-1", stepId: "step-1", ...(fence ?? {}), agenda: buildCognitiveActionAgenda({ schemaVersion: "agent-harness.v2", sessionId: "session-1", turnId: "turn-1", stepId: "step-1", inputThroughSequence: 1n, consumedInputIds: [], canonicalJson: "{}", blocks: [] }) })
   if (!value) throw new Error("agenda fixture should be valid")
   return { id: `agenda-${sequence}`, type: COGNITIVE_AGENDA_EVENT_TYPE, actor: "system", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null, sequence, payload: { ...value, ...patch } }
 }
@@ -77,6 +77,14 @@ describe("loadCanonicalTurnState", () => {
   it("rejects out-of-order cognitive agenda receipts", async () => {
     const fake = pool({ turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} }, events: [agendaEvent("21"), agendaEvent("20")] })
     await expect(loadCanonicalTurnState(fake, lease)).rejects.toThrow("cognitive_agenda_sequence_invalid")
+  })
+
+  it("accepts a matching agenda resume fence and rejects cursor drift", async () => {
+    const step = { id: "step-1", ordinal: 0, taskId: "root-1", inputThroughSequence: "4", consumedInputIds: ["input-1"], inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }
+    const valid = pool({ turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} }, steps: [step], events: [agendaEvent("20", {}, { inputThroughSequence: 4n, consumedInputIds: ["input-1"] })] })
+    await expect(loadCanonicalTurnState(valid, lease)).resolves.toMatchObject({ cognitiveAgendaReceipt: { resumeFence: { inputThroughSequence: "4", consumedInputIds: ["input-1"] } } })
+    const drifted = pool({ turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} }, steps: [step], events: [agendaEvent("20", {}, { inputThroughSequence: 5n, consumedInputIds: ["input-1"] })] })
+    await expect(loadCanonicalTurnState(drifted, lease)).rejects.toThrow("cognitive_agenda_resume_fence_invalid")
   })
 
   it("loads bounded plan task graph events from the scoped ordered event query", async () => {

@@ -1709,3 +1709,7 @@ The queue executor contract now uses the full runtime `SubagentExecutionResult`,
 ## P8-89 candidate - canonical cognitive agenda audit restore
 
 Canonical turn state now restores the latest strictly scoped `cognitive.agenda` receipt as bounded audit state. The loader rejects malformed, foreign, stale, or out-of-order agenda rows and keeps the receipt out of model context; no narrative agenda content is injected into the snapshot. Focused canonical state validation passed **59/59 tests**; live PostgreSQL/RLS and restart evidence remain unverified.
+
+## P8-90 candidate - canonical cognitive agenda resume fence
+
+Newly written agenda receipts may carry the server-owned step cursor (`inputThroughSequence` and `consumedInputIds`). On restore, the canonical loader requires that cursor and step identity to match the latest durable step; drift fails closed before provider runtime construction. Legacy receipts without the optional fence remain readable. The receipt, raw narrative, and `nextAction` are never injected into model context. Formal P0-P7 acceptance remains **1/8 (12.5%)**; P8-90 is a candidate pending live PostgreSQL/RLS, restart, and production evidence.

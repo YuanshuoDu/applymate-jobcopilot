@@ -126,6 +126,12 @@ function cognitiveAgendaReceipt(events: readonly Row[], lease: TurnLease, rootTa
   }
   return latest
 }
+function validateAgendaResumeFence(receipt: CognitiveAgendaReceipt | undefined, steps: readonly Row[]): void {
+  const fence = receipt?.resumeFence
+  if (!fence) return
+  const last = steps[steps.length - 1]
+  if (!last || last.id !== receipt.stepId || String(last.inputThroughSequence ?? "") !== fence.inputThroughSequence || !Array.isArray(last.consumedInputIds) || JSON.stringify(last.consumedInputIds) !== JSON.stringify(fence.consumedInputIds)) throw new Error("cognitive_agenda_resume_fence_invalid")
+}
 function authoritativeOutputs(events: readonly Row[]): Map<string, unknown> {
   const outputs = new Map<string, unknown>()
   for (const event of events) {
@@ -308,7 +314,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     if (!turn) throw new Error("turn_not_owned")
     const consumedWaits = options.consumeWaitOutcomes ? await consumeDurableWaitOutcomes({ client, lease, turn, now }) : []
     const stepsResult = await client.query<Row>(
-      `SELECT "ordinal", "attempt", "inputThroughSequence", "consumedInputIds", "inputTokens", "outputTokens", "estimatedCostUsd"
+      `SELECT "id", "ordinal", "attempt", "inputThroughSequence", "consumedInputIds", "inputTokens", "outputTokens", "estimatedCostUsd"
        FROM "agent_steps" WHERE "turnId" = $1 AND "sessionId" = $2 AND ("taskId" IS NULL OR "taskId" = $3)
        ORDER BY "ordinal" ASC, "attempt" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId],
     )
@@ -416,6 +422,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
       consumedInputIds: Array.isArray(last?.consumedInputIds) ? last.consumedInputIds.filter((id): id is string => typeof id === "string") : [],
       usage,
     } satisfies TurnResumeState : undefined
+    validateAgendaResumeFence(restoredAgenda, steps)
      const result = { scope, goal: goalState.goalContract.objective, goalContract: goalState.goalContract, modelProfileSnapshot: json(turn.modelProfileSnapshot), toolPolicySnapshot: turn.toolPolicySnapshot ?? {}, budgetSnapshot: turn.budgetSnapshot ?? {}, planRevision: revision?.planRevision ?? null, planProposalHashes: revisionState.hashes, ...(restoredTaskGraphEvents.length > 0 ? { taskGraphEvents: restoredTaskGraphEvents } : {}), steeringMarkers, ...(restoredAgenda ? { cognitiveAgendaReceipt: restoredAgenda } : {}), ...(typeof turn.rootTaskId === "string" ? { rootTaskId: turn.rootTaskId } : {}), ...(rootInput.rows[0] ? { rootInputId: rootInput.rows[0].id } : {}), snapshot, ...(resume ? { resume } : {}) }
     await client.query("COMMIT")
     committed = true

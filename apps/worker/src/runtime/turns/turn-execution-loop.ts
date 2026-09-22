@@ -120,6 +120,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         const replanRequired = obligationAfterCompaction !== undefined || questionReplanAfterCompaction
         const receipt = buildCognitiveAgendaReceipt({
           sessionId: options.identity.sessionId, turnId: options.identity.turnId, taskId: options.identity.taskId, stepId: step.id,
+          inputThroughSequence, consumedInputIds,
           agenda: buildCognitiveActionAgenda(context, { replanRequired, freshSteering: replanRequired && freshSteering }),
         })
         const receiptKey = cognitiveAgendaReceiptIdempotencyKey(step.id)

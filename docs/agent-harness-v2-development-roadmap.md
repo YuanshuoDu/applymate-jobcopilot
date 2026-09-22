@@ -3042,3 +3042,11 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Implementation:** The canonical state loader validates scoped `cognitive.agenda` event receipts, requires strictly increasing event sequences, restores only the latest server-owned receipt, and exposes it as audit state. Malformed, foreign, stale, or out-of-order rows fail closed; the receipt is not added to model context.
 
 **Independent verification:** `canonical-turn-state.test.ts` passed **59/59 tests**; live PostgreSQL/RLS, process restart, and production evidence remain unverified.
+
+## 176. P8-90 — Canonical cognitive agenda resume fence
+
+**Candidate status/date (2026-09-22):** P8-90 is a bounded server-owned resume fence; formal P0-P7 acceptance remains **1/8 (12.5%)**.
+
+**Implementation:** Each newly written cognitive agenda receipt may carry the current step's `inputThroughSequence` and `consumedInputIds`. Canonical state restore compares that fence with the matching durable step identity and cursor, failing closed on drift before provider runtime construction. Legacy receipts without the optional fence remain readable. The receipt is never injected into model context and `nextAction` remains informational audit state.
+
+**Independent verification:** Focused Worker agenda, state, loop, and canonical runtime validation passed **168/168 tests**; Worker TypeScript and `git diff --check` passed. Live PostgreSQL/RLS, process restart, and production evidence remain unverified; P8-90 remains a candidate.

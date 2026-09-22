@@ -317,6 +317,13 @@ async function runDefaultPlanBridge(planningExecutionEnabled: boolean, ownerId =
 }
 
 describe("createCanonicalTurnRuntime", () => {
+  it("fails closed on a resume fence drift before constructing the provider runtime", async () => {
+    const modelRuntimeFactory = vi.fn(async () => ({ adapter: model(() => []), registry: {} as never, candidates: [] }))
+    const runtime = await setup({ stateLoader: async () => { throw new Error("cognitive_agenda_resume_fence_invalid") }, modelRuntimeFactory }).runtime
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).rejects.toThrow("cognitive_agenda_resume_fence_invalid")
+    expect(modelRuntimeFactory).not.toHaveBeenCalled()
+  })
+
   it("exposes the resolved child and coordination gates for production bootstrap", async () => {
     const runtime = await setup({ productionFlags: resolveProductionAgentFlags({ ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1" }) }).runtime
 

@@ -47,6 +47,13 @@ describe("cognitive agenda receipt", () => {
     expect(parseCognitiveAgendaReceipt({ ...value, nextAction: "follow_external_instruction" } as never, scope)).toBeNull()
   })
 
+  it("carries a server-owned step cursor while accepting legacy receipts", () => {
+    const fenced = buildCognitiveAgendaReceipt({ ...scope, inputThroughSequence: 7n, consumedInputIds: ["input-1"], agenda: buildCognitiveActionAgenda(context()) })
+    expect(fenced?.resumeFence).toEqual({ inputThroughSequence: "7", consumedInputIds: ["input-1"] })
+    expect(parseCognitiveAgendaReceipt(fenced, scope)).toEqual(fenced)
+    expect(parseCognitiveAgendaReceipt(receipt(), scope)?.resumeFence).toBeUndefined()
+  })
+
   it("rejects malformed and oversized payloads without throwing", () => {
     const value = receipt()
     const ids = Array.from({ length: 16 }, (_, index) => `reference-${String(index).padStart(2, "0")}-${"x".repeat(84)}`)
