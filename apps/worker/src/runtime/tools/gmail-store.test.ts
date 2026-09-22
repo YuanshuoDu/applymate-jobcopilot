@@ -36,14 +36,14 @@ function makeWaitFixture(options: WaitFixtureOptions = {}) {
   return { calls, client, pool }
 }
 
-function waitInput() {
+function waitInput(toolCallId: string | null = "call-a") {
   return {
     context: {
       scope: { userId: "user-a" },
       sessionId: "session-a",
       turnId: "turn-a",
       stepId: "step-a",
-      toolCallId: "call-a",
+      toolCallId: toolCallId ?? undefined,
       signal: new AbortController().signal,
       capabilities: [],
       reportProgress: vi.fn(async () => {}),
@@ -82,6 +82,27 @@ describe("Postgres Gmail evidence and OAuth stores", () => {
     expect(itemWrite).toBeLessThan(sequenceWrite)
     expect(sequenceWrite).toBeLessThan(eventWrite)
     expect(fixture.calls[sessionLock]?.values).toEqual(["session-a", "user-a"])
+    const outboxWrite = sqls.findIndex((sql) => sql.includes('INSERT INTO "agent_outbox"') && sql.includes("'agent.session.event'"))
+    const eventCall = fixture.calls[eventWrite]
+    const outboxCall = fixture.calls[outboxWrite]
+    const eventId = String(eventCall?.values?.[0])
+    expect(outboxWrite).toBeGreaterThan(eventWrite)
+    expect(outboxCall?.sql).toContain('ON CONFLICT ("idempotencyKey") DO NOTHING')
+    expect(outboxCall?.values?.slice(0, 3)).toEqual([`agent-outbox-${eventId}`, "session-a", `agent-event:${eventId}`])
+    expect(JSON.parse(String(outboxCall?.values?.[3]))).toEqual({
+      eventId,
+      sessionId: "session-a",
+      turnId: "turn-a",
+      itemId: `gmail-oauth:${result.waitId}`,
+      taskId: null,
+      sequence: "9",
+      type: "item.started",
+      actor: "orchestrator",
+      correlationId: `gmail-oauth:${result.waitId}`,
+      causationId: null,
+      idempotencyKey: `gmail-oauth:${result.waitId}:started`,
+      payload: { itemId: `gmail-oauth:${result.waitId}`, waitId: result.waitId, toolCallId: "call-a" },
+    })
   })
 
   it.each([
@@ -122,5 +143,23 @@ describe("Postgres Gmail evidence and OAuth stores", () => {
     expect(sqls).toContain("ROLLBACK")
     expect(sqls).not.toContain("COMMIT")
     expect(fixture.client.release).toHaveBeenCalledOnce()
+  })
+
+  it("rolls back the canonical event when its idempotent outbox insert fails", async () => {
+    const fixture = makeWaitFixture({ failOn: 'INSERT INTO "agent_outbox"' })
+    await expect(createPgGmailOAuthWaitPort(fixture.pool).suspend(waitInput())).rejects.toThrow("fixture query failure")
+    const sqls = fixture.calls.map(({ sql }) => sql)
+    expect(sqls.findIndex((sql) => sql.includes('INSERT INTO "agent_events"'))).toBeLessThan(sqls.findIndex((sql) => sql.includes('INSERT INTO "agent_outbox"')))
+    expect(sqls).toContain("ROLLBACK")
+    expect(sqls).not.toContain("COMMIT")
+  })
+
+  it("keeps sparse OAuth lineage compatible with the canonical event envelope", async () => {
+    const fixture = makeWaitFixture()
+    const result = await createPgGmailOAuthWaitPort(fixture.pool).suspend(waitInput(null))
+    const outboxCall = fixture.calls.find(({ sql }) => sql.includes('INSERT INTO "agent_outbox"') && sql.includes("'agent.session.event'"))
+    const envelope = JSON.parse(String(outboxCall?.values?.[3])) as Record<string, unknown>
+    expect(envelope).toMatchObject({ itemId: `gmail-oauth:${result.waitId}`, taskId: null, causationId: null })
+    expect(envelope.payload).toEqual({ itemId: `gmail-oauth:${result.waitId}`, waitId: result.waitId, toolCallId: null })
   })
 })

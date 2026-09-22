@@ -88,7 +88,16 @@ export function createPgGmailOAuthWaitPort(pool: PoolLike): GmailOAuthWaitPort {
         const sequence = await client.query<{ eventSequence: string | bigint }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1 WHERE "id" = $1 AND "userId" = $2 RETURNING "eventSequence"`, [context.sessionId, context.scope.userId])
         const next = sequence.rows[0]?.eventSequence
         if (next === undefined) throw new Error("Gmail OAuth wait session is unavailable")
-        await client.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload") VALUES ($1, $2, $3, $4, $5, 'item.started', 'orchestrator', $4, $6, $7::jsonb)`, [randomUUID(), context.sessionId, context.turnId, itemId, String(next), `gmail-oauth:${waitId}:started`, JSON.stringify({ itemId, waitId, toolCallId: context.toolCallId ?? null })])
+        const eventId = randomUUID()
+        const eventIdempotencyKey = `gmail-oauth:${waitId}:started`
+        const eventPayload = { itemId, waitId, toolCallId: context.toolCallId ?? null }
+        const eventSequence = String(next)
+        await client.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload") VALUES ($1, $2, $3, $4, $5, 'item.started', 'orchestrator', $4, $6, $7::jsonb)`, [eventId, context.sessionId, context.turnId, itemId, eventSequence, eventIdempotencyKey, JSON.stringify(eventPayload)])
+        await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload") VALUES ($1, 'agent.session.event', $2, $3, $4::jsonb) ON CONFLICT ("idempotencyKey") DO NOTHING`, [`agent-outbox-${eventId}`, context.sessionId, `agent-event:${eventId}`, JSON.stringify({
+          eventId, sessionId: context.sessionId, turnId: context.turnId, itemId, taskId: null,
+          sequence: eventSequence, type: "item.started", actor: "orchestrator", correlationId: itemId,
+          causationId: null, idempotencyKey: eventIdempotencyKey, payload: eventPayload,
+        })])
         await client.query("COMMIT")
         return { waitId, reconnectUrl: `/api/gmail/oauth/start?agentWaitId=${encodeURIComponent(waitId)}&returnTo=/?page=agent` }
       } catch (error) {

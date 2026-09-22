@@ -2978,3 +2978,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused Web stream validation passed **2 files / 17 tests**; Web `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, live Redis Pub/Sub, process restart recovery, deployment, and production supervisor evidence remain unverified. No Worker, schema, route, protocol, or package changes were made; P8-82 remains a candidate.
+
+## 169. P8-83 — Historical session event topic compatibility
+
+**Candidate status/date (2026-09-22):** P8-83 adds bounded compatibility for historical `agent.events` rows while formal P0-P7 acceptance remains **1/8 (12.5%)**.
+
+**Implementation:** The Worker session-event outbox consumer now scans both `agent.session.event` and historical `agent.events` topics. It carries the actual row topic through re-lock, canonical lineage validation, publish marking, and retry marking; unknown topics remain safely outside the consumer. Both topics publish the canonical `agent_events` row through the existing Redis event channel, so PostgreSQL remains the durable authority and Redis remains delivery/wakeup transport. The Gmail OAuth suspend path writes its question item, canonical `item.started` event, and matching `agent.session.event` outbox row in one transaction, preserving rollback and idempotency boundaries.
+
+**Independent verification:** Focused Worker validation passed **32/32** tests; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, live Redis delivery, process restart recovery, cross-process supervisor behavior, and production evidence remain unverified. No schema, Web, protocol, producer, or package changes were made; P8-83 remains a candidate.

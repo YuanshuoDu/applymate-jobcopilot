@@ -4,6 +4,8 @@ import { publishAgentEvent, type StreamPublisherRedis } from "../../stream/event
 import { matchesCanonicalAgentEvent, parseAgentEventOutboxPayload, toCanonicalAgentEvent, type AgentEventRow } from "./outbox-contract.js"
 
 export const AGENT_EVENT_OUTBOX_TOPIC = "agent.session.event"
+export const LEGACY_AGENT_EVENT_OUTBOX_TOPIC = "agent.events"
+const SUPPORTED_AGENT_EVENT_OUTBOX_TOPICS = [AGENT_EVENT_OUTBOX_TOPIC, LEGACY_AGENT_EVENT_OUTBOX_TOPIC] as const
 const DEFAULT_BATCH_SIZE = 10
 const MAX_BATCH_SIZE = 50
 const DEFAULT_POLL_MS = 1_000
@@ -14,7 +16,7 @@ const TERMINAL_ERRORS = ["schema_invalid_payload", "outbox_scope_mismatch", "eve
 type PoolLike = Pick<pg.Pool, "connect">
 type Queryable = Pick<pg.PoolClient, "query">
 export type AgentEventOutboxPublisher = StreamPublisherRedis
-type OutboxRow = { id: string; aggregateId: string; payload: unknown; publishedAt: Date | string | null }
+type OutboxRow = { id: string; topic: string; aggregateId: string; payload: unknown; publishedAt: Date | string | null }
 type StartOptions = {
   pollMs?: number
   drain?: (pool: PoolLike, publisher: AgentEventOutboxPublisher, batchSize?: number) => Promise<number>
@@ -40,24 +42,24 @@ async function transaction<T>(pool: PoolLike, work: (client: pg.PoolClient) => P
 }
 
 async function selectPending(pool: PoolLike, limit: number): Promise<OutboxRow[]> {
-  return transaction(pool, async client => (await client.query<OutboxRow>(`SELECT "id", "aggregateId", "payload", "publishedAt"
+  return transaction(pool, async client => (await client.query<OutboxRow>(`SELECT "id", "topic", "aggregateId", "payload", "publishedAt"
     FROM "agent_outbox"
-    WHERE "topic" = $1 AND "publishedAt" IS NULL
+    WHERE "topic" IN ($1, $2) AND "publishedAt" IS NULL
     ORDER BY "createdAt" ASC, "id" ASC
-    LIMIT $2 FOR UPDATE SKIP LOCKED`, [AGENT_EVENT_OUTBOX_TOPIC, limit])).rows)
+    LIMIT $3 FOR UPDATE SKIP LOCKED`, [...SUPPORTED_AGENT_EVENT_OUTBOX_TOPICS, limit])).rows)
 }
 
-async function markPublished(client: Queryable, id: string, error: string | null): Promise<void> {
+async function markPublished(client: Queryable, id: string, topic: string, error: string | null): Promise<void> {
   await client.query(`UPDATE "agent_outbox"
     SET "publishedAt" = CURRENT_TIMESTAMP, "attemptCount" = "attemptCount" + 1, "lastError" = $2
-    WHERE "id" = $1 AND "topic" = $3 AND "publishedAt" IS NULL`, [id, error, AGENT_EVENT_OUTBOX_TOPIC])
+    WHERE "id" = $1 AND "topic" = $3 AND "publishedAt" IS NULL`, [id, error, topic])
 }
 
-async function markRetry(pool: PoolLike, id: string, error: string): Promise<void> {
+async function markRetry(pool: PoolLike, id: string, topic: string, error: string): Promise<void> {
   await transaction(pool, async client => {
     await client.query(`UPDATE "agent_outbox"
       SET "attemptCount" = "attemptCount" + 1, "lastError" = $2
-      WHERE "id" = $1 AND "topic" = $3 AND "publishedAt" IS NULL`, [id, error, AGENT_EVENT_OUTBOX_TOPIC])
+      WHERE "id" = $1 AND "topic" = $3 AND "publishedAt" IS NULL`, [id, error, topic])
   })
 }
 
@@ -67,27 +69,27 @@ async function processRow(pool: PoolLike, publisher: AgentEventOutboxPublisher, 
   let publishStarted = false
   try {
     return await transaction(pool, async client => {
-      const current = (await client.query<OutboxRow>(`SELECT "id", "aggregateId", "payload", "publishedAt"
-        FROM "agent_outbox" WHERE "id" = $1 AND "topic" = $2 FOR UPDATE`, [row.id, AGENT_EVENT_OUTBOX_TOPIC])).rows[0]
-      if (!current || current.publishedAt != null) return "skipped"
+      const current = (await client.query<OutboxRow>(`SELECT "id", "topic", "aggregateId", "payload", "publishedAt"
+        FROM "agent_outbox" WHERE "id" = $1 AND "topic" = $2 FOR UPDATE`, [row.id, row.topic])).rows[0]
+      if (!current || current.publishedAt != null || !SUPPORTED_AGENT_EVENT_OUTBOX_TOPICS.includes(current.topic as typeof SUPPORTED_AGENT_EVENT_OUTBOX_TOPICS[number])) return "skipped"
       const payload = parseAgentEventOutboxPayload(current.payload)
-      if (!payload) { await markPublished(client, current.id, TERMINAL_ERRORS[0]); return "processed" }
-      if (current.aggregateId !== payload.sessionId) { await markPublished(client, current.id, TERMINAL_ERRORS[1]); return "processed" }
+      if (!payload) { await markPublished(client, current.id, current.topic, TERMINAL_ERRORS[0]); return "processed" }
+      if (current.aggregateId !== payload.sessionId) { await markPublished(client, current.id, current.topic, TERMINAL_ERRORS[1]); return "processed" }
       const event = (await client.query<AgentEventRow>(`SELECT "id", "sessionId", "turnId", "itemId", "taskId", "sequence",
           "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload", "createdAt"
         FROM "agent_events" WHERE "id" = $1 AND "sessionId" = $2 FOR SHARE`, [payload.eventId, payload.sessionId])).rows[0]
       const canonical = event && toCanonicalAgentEvent(event)
       if (!canonical || !matchesCanonicalAgentEvent(canonical, payload)) {
-        await markPublished(client, current.id, TERMINAL_ERRORS[2])
+        await markPublished(client, current.id, current.topic, TERMINAL_ERRORS[2])
         return "processed"
       }
       publishStarted = true
       await publishAgentEvent(publisher, canonical)
-      await markPublished(client, current.id, null)
+      await markPublished(client, current.id, current.topic, null)
       return "processed"
     })
   } catch (error: unknown) {
-    await markRetry(pool, row.id, publishStarted ? RETRY_ERROR : PROCESSING_ERROR).catch(() => undefined)
+    await markRetry(pool, row.id, row.topic, publishStarted ? RETRY_ERROR : PROCESSING_ERROR).catch(() => undefined)
     return "retry"
   }
 }

@@ -1,10 +1,15 @@
 import type pg from "pg"
 import { describe, expect, it, vi } from "vitest"
 
-import { AGENT_EVENT_OUTBOX_TOPIC, drainAgentEventOutbox } from "./outbox-consumer.js"
+import {
+  AGENT_EVENT_OUTBOX_TOPIC,
+  LEGACY_AGENT_EVENT_OUTBOX_TOPIC,
+  drainAgentEventOutbox,
+} from "./outbox-consumer.js"
 
 type OutboxRow = {
   id: string
+  topic: string
   aggregateId: string
   payload: unknown
   publishedAt: Date | null
@@ -52,7 +57,7 @@ function payload(overrides: Record<string, unknown> = {}) {
 
 function outbox(overrides: Partial<OutboxRow> = {}): OutboxRow {
   return {
-    id: "outbox-1", aggregateId: event.sessionId, payload: payload(), publishedAt: null, attemptCount: 0, lastError: null,
+    id: "outbox-1", topic: AGENT_EVENT_OUTBOX_TOPIC, aggregateId: event.sessionId, payload: payload(), publishedAt: null, attemptCount: 0, lastError: null,
     createdAt: new Date("2026-09-22T09:00:00.000Z"), ...overrides,
   }
 }
@@ -79,9 +84,10 @@ function fakePool(rows: OutboxRow[] = [outbox()], events: EventRow[] = [event]) 
         return { rows: [], rowCount: 0 }
       }
       if (sql.includes('FROM "agent_outbox"') && sql.includes('"publishedAt" IS NULL') && sql.includes("LIMIT")) {
-        const limit = Number(values[1])
+        const limit = Number(values[values.length - 1])
+        const topics = values.slice(0, -1).map(String)
         const selected = [...outboxRows.values()]
-          .filter(row => row.publishedAt === null)
+          .filter(row => row.publishedAt === null && topics.includes(row.topic))
           .sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime() || left.id.localeCompare(right.id))
           .slice(0, limit)
         return { rows: selected as T[], rowCount: selected.length }
@@ -97,7 +103,7 @@ function fakePool(rows: OutboxRow[] = [outbox()], events: EventRow[] = [event]) 
       }
       if (sql.includes('SET "publishedAt" = CURRENT_TIMESTAMP')) {
         const row = outboxRows.get(String(values[0]))
-        if (row && row.publishedAt === null) {
+        if (row && row.topic === String(values[2]) && row.publishedAt === null) {
           row.publishedAt = new Date("2026-09-22T10:01:00.000Z")
           row.attemptCount += 1
           row.lastError = values[1] === null ? null : String(values[1])
@@ -107,7 +113,7 @@ function fakePool(rows: OutboxRow[] = [outbox()], events: EventRow[] = [event]) 
       }
       if (sql.includes('SET "attemptCount" = "attemptCount" + 1')) {
         const row = outboxRows.get(String(values[0]))
-        if (row && row.publishedAt === null) {
+        if (row && row.topic === String(values[2]) && row.publishedAt === null) {
           row.attemptCount += 1
           row.lastError = String(values[1])
           return { rows: [], rowCount: 1 }
@@ -141,10 +147,24 @@ describe("agent event outbox consumer", () => {
     expect(redis.publish).toHaveBeenCalledWith("agent:session:session-1:events", expect.stringContaining('"sequence":"7"'))
     expect(fake.outboxRows.get("outbox-1")).toMatchObject({ publishedAt: expect.any(Date), attemptCount: 1, lastError: null })
     const select = fake.calls.find(call => call.sql.includes('FROM "agent_outbox"') && call.sql.includes("LIMIT"))
-    expect(select?.sql).toContain('WHERE "topic" = $1 AND "publishedAt" IS NULL')
-    expect(select?.sql).toContain("LIMIT $2 FOR UPDATE SKIP LOCKED")
-    expect(select?.values).toEqual([AGENT_EVENT_OUTBOX_TOPIC, 50])
+    expect(select?.sql).toContain('WHERE "topic" IN ($1, $2) AND "publishedAt" IS NULL')
+    expect(select?.sql).toContain("LIMIT $3 FOR UPDATE SKIP LOCKED")
+    expect(select?.values).toEqual([AGENT_EVENT_OUTBOX_TOPIC, LEGACY_AGENT_EVENT_OUTBOX_TOPIC, 50])
     expect(fake.calls.some(call => call.sql.includes('FROM "agent_events"') && call.sql.includes("FOR SHARE"))).toBe(true)
+  })
+
+  it("publishes a historical agent.events row using its actual topic for locking and marking", async () => {
+    const fake = fakePool([outbox({ topic: LEGACY_AGENT_EVENT_OUTBOX_TOPIC })])
+    const redis = publisher()
+
+    await expect(drainAgentEventOutbox(fake.pool, redis)).resolves.toBe(1)
+
+    expect(redis.publish).toHaveBeenCalledTimes(1)
+    const lock = fake.calls.find(call => call.sql.includes('FROM "agent_outbox" WHERE "id" = $1'))
+    const mark = fake.calls.find(call => call.sql.includes('SET "publishedAt" = CURRENT_TIMESTAMP'))
+    expect(lock?.values).toEqual(["outbox-1", LEGACY_AGENT_EVENT_OUTBOX_TOPIC])
+    expect(mark?.values[2]).toBe(LEGACY_AGENT_EVENT_OUTBOX_TOPIC)
+    expect(fake.outboxRows.get("outbox-1")).toMatchObject({ topic: LEGACY_AGENT_EVENT_OUTBOX_TOPIC, publishedAt: expect.any(Date), lastError: null })
   })
 
   it("publishes a sparse mailbox envelope from the canonical event row", async () => {
@@ -218,8 +238,8 @@ describe("agent event outbox consumer", () => {
     expect(fake.outboxRows.get("outbox-1")).toMatchObject({ publishedAt: expect.any(Date), attemptCount: 1, lastError: "event_lineage_mismatch" })
   })
 
-  it("records a bounded retry error and leaves a Redis failure unpublished", async () => {
-    const fake = fakePool()
+  it.each([AGENT_EVENT_OUTBOX_TOPIC, LEGACY_AGENT_EVENT_OUTBOX_TOPIC])("records a bounded retry error and leaves a Redis failure unpublished for %s", async topic => {
+    const fake = fakePool([outbox({ topic })])
     const redis = publisher()
     redis.publish.mockRejectedValueOnce(new Error("redis connection dropped"))
 
@@ -228,6 +248,21 @@ describe("agent event outbox consumer", () => {
 
     await expect(drainAgentEventOutbox(fake.pool, redis)).resolves.toBe(1)
     expect(fake.outboxRows.get("outbox-1")).toMatchObject({ publishedAt: expect.any(Date), attemptCount: 2, lastError: null })
+  })
+
+  it("filters unknown topics and keeps legacy lineage failures terminal and topic-scoped", async () => {
+    const unknown = outbox({ id: "unknown-outbox", topic: "agent.unknown" })
+    const legacy = outbox({ id: "legacy-outbox", topic: LEGACY_AGENT_EVENT_OUTBOX_TOPIC, payload: payload({ sequence: "8" }) })
+    const fake = fakePool([unknown, legacy])
+    const redis = publisher()
+
+    await expect(drainAgentEventOutbox(fake.pool, redis)).resolves.toBe(1)
+
+    expect(redis.publish).not.toHaveBeenCalled()
+    expect(fake.outboxRows.get("unknown-outbox")).toMatchObject({ topic: "agent.unknown", publishedAt: null, attemptCount: 0, lastError: null })
+    expect(fake.outboxRows.get("legacy-outbox")).toMatchObject({ topic: LEGACY_AGENT_EVENT_OUTBOX_TOPIC, publishedAt: expect.any(Date), attemptCount: 1, lastError: "event_lineage_mismatch" })
+    const mark = fake.calls.find(call => call.sql.includes('SET "publishedAt" = CURRENT_TIMESTAMP'))
+    expect(mark?.values[2]).toBe(LEGACY_AGENT_EVENT_OUTBOX_TOPIC)
   })
 
   it("does not select more than the bounded maximum", async () => {
