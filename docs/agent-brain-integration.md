@@ -1701,3 +1701,7 @@ Focused validation passed **29/29** Web tests across the legacy resolver, transa
 ## P8-87 candidate - bounded Scout/Analyst wait aggregate
 
 Canonical wait output now optionally carries a server-derived, bounded Scout/Analyst aggregate. Terminal structured child results are role-validated before exposure; invalid structured payloads are omitted with `invalid_structured_result`, results too large for the wait projection omit the aggregate, legacy unstructured results remain compatible, and replay validates aggregate shape, lineage, role/status consistency, and derived job IDs. Focused Worker validation passed **123/123 tests** across coordination executors, aggregate helper, and canonical-plan suites. Live queue, PostgreSQL/RLS, restart, and production evidence remain unverified; formal P0-P7 acceptance remains **1/8 (12.5%)**.
+
+## P8-88 candidate - complete subagent queue outcome contract
+
+The queue executor contract now uses the full runtime `SubagentExecutionResult`, preserving server-owned `retryDisposition` and `mailboxMessageIds` through the manager boundary instead of narrowing them at queue type level. Focused queue validation covers both fields. This is a candidate contract hardening slice; live queue delivery, restart recovery, and production evidence remain unverified.

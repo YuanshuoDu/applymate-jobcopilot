@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest"
 vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnect: vi.fn() })) }))
 
 import type pg from "pg"
-import { dispatchPendingSubagentOutbox, enqueueSubagentTask, persistSubagentDispatch, recoverSubagentQueue, repairMissingSubagentDispatches, startSubagentRecoveryScanner, subagentDispatchKey, subagentJobId } from "./subagent-queue.js"
+import { dispatchPendingSubagentOutbox, enqueueSubagentTask, persistSubagentDispatch, recoverSubagentQueue, repairMissingSubagentDispatches, startSubagentRecoveryScanner, subagentDispatchKey, subagentJobId, type SubagentExecutor } from "./subagent-queue.js"
 import type { AgentTreeManager } from "../runtime/subagents/manager.js"
 import type { SubagentJobPayload } from "../runtime/subagents/types.js"
 
@@ -186,6 +186,10 @@ function recoveredDispatchPool() {
 }
 
 describe("Subagent queue", () => {
+  it("keeps retry and mailbox outcome fields in the queue executor contract", async () => {
+    const execute: SubagentExecutor = async () => ({ status: "failed", failureReason: "temporary", retryDisposition: "retryable", mailboxMessageIds: ["mailbox-1"] })
+    await expect(execute({ lease: {} as never })).resolves.toMatchObject({ retryDisposition: "retryable", mailboxMessageIds: ["mailbox-1"] })
+  })
   it("uses a strict payload and deterministic job id", async () => {
     const queue = { add: vi.fn().mockResolvedValue(undefined) }
     await enqueueSubagentTask(queue, payload)

@@ -3026,3 +3026,11 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Implementation:** `agent.wait` and `wait_subagents` optionally return a deterministic aggregate derived from terminal migrated-role targets. Structured results are validated against the server-owned role before exposure; invalid payloads are hidden with bounded `invalid_structured_result`, results that cannot survive the 2 KiB wait projection omit the aggregate, legacy unstructured results remain readable, and pending roles are explicit. Replay rejects malformed, foreign, contradictory, oversized, or job-ID-inconsistent aggregates.
 
 **Independent verification:** Focused coordination executors, aggregate helper, and canonical-plan validation passed **123/123 tests**; no live PostgreSQL/RLS, queue delivery, process restart, or production evidence is claimed.
+
+## 174. P8-88 — Preserve complete subagent queue outcomes
+
+**Candidate status/date (2026-09-22):** P8-88 is a bounded Worker queue contract slice; formal P0-P7 acceptance remains **1/8 (12.5%)**.
+
+**Implementation:** `SubagentExecutor` now returns the complete runtime `SubagentExecutionResult`, including `retryDisposition` and `mailboxMessageIds`, so the queue-to-manager boundary cannot erase retry policy or mailbox acknowledgement metadata. No schema, migration, provider, Web, or UI change was made.
+
+**Independent verification:** Focused subagent queue validation covers both outcome fields; live BullMQ/Redis delivery, process restart, and production evidence remain unverified.

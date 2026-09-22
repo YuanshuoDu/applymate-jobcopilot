@@ -7,14 +7,15 @@ import { workerPollingOptions } from "./worker-polling-options.js"
 import { repairStaleSubagentDispatches } from "./subagent-dispatch-recovery.js"
 import { dispatchTaskInvalidReason, lockDispatchTask, lockPendingDispatch, markDispatchTerminal } from "./subagent-dispatch-eligibility.js"
 import { AgentTreeManager } from "../runtime/subagents/manager.js"
-import { parseSubagentJobPayload, type PgSubagentPool, type SubagentJobPayload, type SubagentLease } from "../runtime/subagents/types.js"
+import { parseSubagentJobPayload, type PgSubagentPool, type SubagentExecutionResult, type SubagentJobPayload, type SubagentLease } from "../runtime/subagents/types.js"
 import { OPEN_SESSION, RUNNABLE_SESSION } from "../runtime/session-gate.js"
 export const SUBAGENT_QUEUE_NAME = "agent-subagents"
 export const SUBAGENT_DISPATCH_TOPIC = "agent.subagent.dispatch"
 export const SUBAGENT_DISPATCH_POLL_MS = 30_000
 export const SUBAGENT_MAX_BATCH = 50
 export type SubagentQueueLike = { add(name: string, payload: SubagentJobPayload, options?: { jobId?: string; attempts?: number; delay?: number }): Promise<unknown>; close?(): Promise<void> }
-export type SubagentExecutor = (input: { lease: SubagentLease }) => Promise<{ status: "completed" | "waiting" | "waiting_for_user" | "failed"; result?: unknown; failureReason?: string }>
+/** Queue boundary preserves the complete runtime outcome for manager.run to persist. */
+export type SubagentExecutor = (input: { lease: SubagentLease }) => Promise<SubagentExecutionResult>
 type MissingDispatchRow = { id: string; sessionId: string; rootTaskId: string }
 /** BullMQ custom IDs reject colon characters; encode user controlled IDs. */
 export function subagentJobId(taskId: string, generation = 0): string {
