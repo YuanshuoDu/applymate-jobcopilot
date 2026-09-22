@@ -2,10 +2,11 @@ import type { PrismaClient } from "@prisma/client"
 import { type ApprovalType } from "@jobcopilot/agent-protocol"
 import { hashAgentReceiptValue } from "@jobcopilot/shared"
 
-import { consumeApprovalAndReserve, issueApprovalReceipt, resolveApproval, validatePendingApprovalReceipt } from "./store"
+import { consumeApprovalAndReserve, issueApprovalReceipt, validatePendingApprovalReceipt } from "./store"
 import { reissueApprovalNonce } from "./receipt-rotation"
 import { decideApproval } from "../broker/store"
 import { waitItemId } from "../broker/item-ids"
+import { ApprovalWaitActiveError, CanonicalWaitFoundError, resolveLegacyOnlyInTransaction } from "./legacy-approval-fence"
 import type { ApprovalReceiptResult, ApprovalScopeInput } from "./types"
 
 export interface LegacyReceiptInput {
@@ -52,6 +53,8 @@ export type LegacyApprovalResolution =
       result: Awaited<ReturnType<typeof decideApproval>>
     }
 
+export { ApprovalWaitActiveError }
+
 export async function issueLegacyReceipt(db: PrismaClient, input: LegacyReceiptInput): Promise<ApprovalReceiptResult> {
   const scope: ApprovalScopeInput = {
     userId: input.userId,
@@ -95,21 +98,23 @@ export async function resolveLegacyApproval(
   if (!approval.turnId || !approval.toolCallId || !approval.jobId || !approval.expiresAt) {
     throw new Error("Approval is missing its scoped wait state")
   }
-  const turn = await db.agentTurn.findFirst({
-    where: { id: approval.turnId, sessionId: input.sessionId, userId: input.userId },
-    select: { id: true, revision: true },
-  })
+  await options.beforeResolve?.()
   const item = db.agentItem ? await db.agentItem.findFirst({
     where: { id: waitItemId("approval", approval.id), sessionId: input.sessionId, turnId: approval.turnId },
     select: { id: true, revision: true },
   }) : null
-  if (!turn) throw new Error("Approval turn is no longer available")
-  await options.beforeResolve?.()
   if (!item) {
-    await options.beforeLegacyOnlyResolve?.()
-    await resolveApproval(db, { id: approval.id, userId: input.userId, sessionId: input.sessionId, decision: input.decision })
-    return { disposition: "legacy_only", decision: input.decision }
+    try {
+      return await resolveLegacyOnlyInTransaction(db, input, options)
+    } catch (error) {
+      if (!(error instanceof CanonicalWaitFoundError)) throw error
+    }
   }
+  const turn = await db.agentTurn.findFirst({
+    where: { id: approval.turnId, sessionId: input.sessionId, userId: input.userId },
+    select: { id: true, revision: true },
+  })
+  if (!turn) throw new Error("Approval turn is no longer available")
   const result = await decideApproval(db, {
     waitId: approval.id,
     sessionId: input.sessionId,

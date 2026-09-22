@@ -109,6 +109,12 @@ export async function POST(req: NextRequest) {
     })
   } catch (error) {
     if (error instanceof Error && error.message === GMAIL_NOT_CONNECTED) return err(GMAIL_NOT_CONNECTED)
+    const code = error && typeof error === 'object' && 'code' in error
+      ? (error as { code?: unknown }).code
+      : undefined
+    if (code === 'approval_wait_active') {
+      return Response.json({ error: error instanceof Error ? error.message : 'The Gmail approval could not be consumed.', code }, { status: 409 })
+    }
     return err(error instanceof Error ? error.message : 'The Gmail approval could not be consumed.', 409)
   }
 

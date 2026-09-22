@@ -3000,3 +3000,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused validation passed **39/39** across `apps/web/src/app/api/agent/sessions/[id]/actions/route.test.ts`, `apps/web/src/app/api/gmail/send-draft/route.test.ts`, `apps/web/src/lib/agent/approval/store.test.ts`, and `apps/web/src/lib/agent/approval/decision.test.ts`; Web `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, cross-process Redis delivery, process restart/recovery, same-Turn active-wait probing, and production E2E remain unverified. P8-84 remains a candidate.
+
+## 171. P8-85 — Same-Turn canonical active-wait fence for legacy approvals
+
+**Candidate status/date (2026-09-22):** P8-85 is recorded as a bounded Web legacy approval fence; formal P0-P7 acceptance remains **1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** When a legacy approval key has no matching canonical approval Item, the legacy resolver locks the owned session row and probes the same user/session/Turn for every `started` `approval_request` Item whose payload points to a pending approval. Any matching active wait fails closed with `code = approval_wait_active` before Turn updates, receipt consumption, automation writes, or Gmail token/provider calls. With no other active wait, the resolver keeps the legacy-only path and performs the pending approval transition plus `approval.resolved` outbox write in that same transaction; a matching Item continues to delegate to `decideApproval`.
+
+**Independent verification:** Focused Web validation passed **29/29 tests** across `apps/web/src/lib/agent/approval/legacy-receipt.test.ts`, `apps/web/src/lib/agent/approval/legacy-approval-fence.test.ts`, `apps/web/src/app/api/agent/sessions/[id]/actions/route.test.ts`, and `apps/web/src/app/api/gmail/send-draft/route.test.ts`; Web `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS lock behavior, cross-process concurrency, Redis delivery, process restart/recovery, and production E2E remain unverified. No schema, migration, Worker, Redis, SSE, or lockfile change was made; P8-85 remains a candidate.

@@ -219,4 +219,25 @@ describe('POST /api/gmail/send-draft', () => {
     expect(mocks.jobUpdate).not.toHaveBeenCalled()
     expect(mocks.activityCreate).not.toHaveBeenCalled()
   })
+
+  it('fails closed when another approval wait is active in the same Turn', async () => {
+    mocks.resolveLegacyApproval.mockRejectedValueOnce(Object.assign(new Error('Another approval wait is already active for this Turn'), { code: 'approval_wait_active' }))
+    const { POST } = await import('./route')
+
+    const response = await POST(new Request('http://localhost/api/gmail/send-draft', {
+      method: 'POST', body: JSON.stringify({
+        to: 'recruiter@example.com', draft: 'Thank you.', gmailMessageId: 'gmail-1',
+        approvalId: 'approval_1', receiptNonce: 'nonce_1', sessionId: 'session_1',
+      }),
+    }) as never)
+
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({ error: 'Another approval wait is already active for this Turn', code: 'approval_wait_active' })
+    expect(mocks.getGoogleAccessToken).not.toHaveBeenCalled()
+    expect(fetch).not.toHaveBeenCalled()
+    expect(mocks.agentTurnUpdate).not.toHaveBeenCalled()
+    expect(mocks.consumeLegacyReceipt).not.toHaveBeenCalled()
+    expect(mocks.jobUpdate).not.toHaveBeenCalled()
+    expect(mocks.activityCreate).not.toHaveBeenCalled()
+  })
 })

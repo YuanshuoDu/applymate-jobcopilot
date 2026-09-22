@@ -439,6 +439,23 @@ describe("agent session actions API", () => {
     expect(mocks.transcriptCreate).not.toHaveBeenCalled()
   })
 
+  it("fails closed when another approval wait is active in the same Turn", async () => {
+    mocks.resolveLegacyApproval.mockRejectedValueOnce(Object.assign(new Error("Another approval wait is already active for this Turn"), { code: "approval_wait_active" }))
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest({
+      type: "approval_response", approvalId: "approval_1", decision: "approved", receiptNonce: "nonce_1",
+    }) as never, ctx)
+
+    expect(res.status).toBe(409)
+    await expect(res.json()).resolves.toEqual({ error: "Another approval wait is already active for this Turn", code: "approval_wait_active" })
+    expect(mocks.agentTurnUpdate).not.toHaveBeenCalled()
+    expect(mocks.consumeLegacyReceipt).not.toHaveBeenCalled()
+    expect(mocks.transcriptCreate).not.toHaveBeenCalled()
+    expect(mocks.sessionUpdate).not.toHaveBeenCalled()
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled()
+  })
+
   it("stops before canonical delegation when the scoped receipt is invalid", async () => {
     mocks.validateLegacyReceipt.mockRejectedValueOnce(new Error("Approval nonce does not match"))
     mocks.resolveLegacyApproval.mockImplementationOnce(async (_db, _input, options) => {

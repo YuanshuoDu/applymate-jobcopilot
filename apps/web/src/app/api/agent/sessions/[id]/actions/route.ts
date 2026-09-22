@@ -210,7 +210,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
       if (automationApproval.turnId) await db.agentTurn.update({ where: { id: automationApproval.turnId }, data: { status: "in_progress" } })
       await consumeReceiptForApproval(db, automationApproval, action.receiptNonce, auth.userId, id, { automationName: action.draft.name })
     } catch (error) {
-      return err(error instanceof Error ? error.message : "Automation approval could not be consumed", 409)
+      return legacyApprovalErrorResponse(error, "Automation approval could not be consumed")
     }
     const existing = await db.agentAutomation.findFirst({
       where: { userId: auth.userId, name: action.draft.name },
@@ -297,7 +297,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
         await consumeReceiptForApproval(db, approval, action.receiptNonce!, auth.userId, id)
       }
     } catch (error) {
-      return err(error instanceof Error ? error.message : "Approval could not be resolved", 409)
+      return legacyApprovalErrorResponse(error, "Approval could not be resolved")
     }
   }
 
@@ -507,6 +507,16 @@ function policyErrorResponse(error: unknown) {
     ? 422
     : 428
   return err(message, status)
+}
+
+function legacyApprovalErrorResponse(error: unknown, fallback: string) {
+  const code = error && typeof error === "object" && "code" in error
+    ? (error as { code?: unknown }).code
+    : undefined
+  if (code === "approval_wait_active") {
+    return Response.json({ error: error instanceof Error ? error.message : fallback, code }, { status: 409 })
+  }
+  return err(error instanceof Error ? error.message : fallback, 409)
 }
 
 function canonicalApprovalResponse(resolution: Extract<Awaited<ReturnType<typeof resolveLegacyApproval>>, { disposition: "canonical_wait" }>) {
