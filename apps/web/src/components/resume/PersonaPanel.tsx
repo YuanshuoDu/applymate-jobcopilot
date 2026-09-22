@@ -1,9 +1,11 @@
 'use client'
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Download, Pencil, Plus, ShieldCheck, Trash2 } from 'lucide-react'
+import { ClipboardPaste, Download, LoaderCircle, Pencil, Plus, ShieldCheck, Sparkles, Trash2 } from 'lucide-react'
 import type { PersonaField, PersonaProfile } from '@/lib/persona'
 import { useI18n } from '@/lib/i18n'
+import type { ResumeContent } from '@/lib/types'
+import { personaFieldsFromResumeContent } from '@/lib/persona-paste'
 
 const categories = ['personal', 'contact', 'work', 'education', 'preferences'] as const
 export function PersonaPanel({ isDefault, onEditResume, onUseAsProfile }: { isDefault: boolean; onEditResume: (section: string) => void; onUseAsProfile: () => void }) {
@@ -13,6 +15,10 @@ export function PersonaPanel({ isDefault, onEditResume, onUseAsProfile }: { isDe
   const [draft, setDraft] = useState<Partial<PersonaField> | null>(null)
   const [error, setError] = useState('')
   const [indexing, setIndexing] = useState(false)
+  const [pasteOpen, setPasteOpen] = useState(false)
+  const [pasteText, setPasteText] = useState('')
+  const [extractingPaste, setExtractingPaste] = useState(false)
+  const [extractedFields, setExtractedFields] = useState<PersonaField[]>([])
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -62,6 +68,35 @@ export function PersonaPanel({ isDefault, onEditResume, onUseAsProfile }: { isDe
     setIndexing(false)
   }
 
+  async function extractPastedFacts() {
+    if (pasteText.trim().length < 50) { setError(t('persona.pasteTooShort')); return }
+    setExtractingPaste(true); setError(''); setExtractedFields([])
+    try {
+      const form = new FormData()
+      form.append('source', 'paste')
+      form.append('text', pasteText.trim())
+      const response = await fetch('/api/resume/intake', { method: 'POST', body: form })
+      const payload = await response.json().catch(() => null)
+      if (!response.ok || !payload?.parsed) { setError(payload?.error ?? t('persona.pasteExtractFailed')); return }
+      const fields = personaFieldsFromResumeContent(payload.parsed as ResumeContent)
+      if (!fields.length) { setError(t('persona.pasteNoFacts')); return }
+      setExtractedFields(fields)
+    } catch { setError(t('persona.pasteExtractFailed')) }
+    finally { setExtractingPaste(false) }
+  }
+
+  async function saveExtractedFacts() {
+    if (!extractedFields.length) return
+    setError('')
+    const response = await fetch('/api/me/persona/fields', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fields: extractedFields }),
+    })
+    const payload = await response.json().catch(() => null)
+    if (!response.ok) { setError(payload?.error ?? t('persona.saveFailed')); return }
+    setExtractedFields([]); setPasteText(''); setPasteOpen(false); await load()
+  }
+
   return <div style={{ padding: 14, overflowY: 'auto', height: '100%', boxSizing: 'border-box' }}>
     <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'start', marginBottom: 12 }}>
       <div><div style={{ fontWeight: 700, fontSize: 15 }}>{t('persona.title')}</div><div style={{ color: 'var(--text-muted)', fontSize: 11, lineHeight: 1.45, marginTop: 3 }}>{t('persona.description')}</div></div>
@@ -71,6 +106,20 @@ export function PersonaPanel({ isDefault, onEditResume, onUseAsProfile }: { isDe
     <div style={privacyStyle}><ShieldCheck size={16} /><span><strong>{t('persona.controlled')}</strong> {t('persona.privacy')}</span></div>
     <button onClick={() => void buildKnowledgeIndex()} disabled={indexing} style={indexButton}>{indexing ? t('persona.indexing') : t('persona.buildIndex')}</button>
     <div style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.4, margin: '-7px 0 12px' }}>{t('persona.indexDescription')}</div>
+    <div style={pasteCardStyle}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 700, fontSize: 12 }}><ClipboardPaste size={14} /> {t('persona.pasteTitle')}</div>
+      <div style={{ color: 'var(--text-muted)', fontSize: 10, lineHeight: 1.4, marginTop: 4 }}>{t('persona.pasteDescription')}</div>
+      <button onClick={() => { setPasteOpen(value => !value); setError('') }} style={pasteButton}>{pasteOpen ? t('common.cancel') : t('persona.pasteAction')}</button>
+      {pasteOpen && <div style={{ display: 'grid', gap: 7, marginTop: 8 }}>
+        <textarea value={pasteText} onChange={event => { setPasteText(event.target.value); setExtractedFields([]) }} placeholder={t('persona.pastePlaceholder')} rows={6} style={pasteTextareaStyle} />
+        <button onClick={() => void extractPastedFacts()} disabled={extractingPaste || pasteText.trim().length < 50} style={extractButton}>{extractingPaste ? <><LoaderCircle size={13} className="spin" /> {t('persona.pasteAnalyzing')}</> : <><Sparkles size={13} /> {t('persona.pasteAnalyze')}</>}</button>
+        {extractedFields.length > 0 && <div style={previewStyle}>
+          <strong>{t('persona.pastePreview')}</strong>
+          <div style={{ display: 'grid', gap: 5, marginTop: 6 }}>{extractedFields.map(field => <div key={field.key} style={previewItemStyle}><b>{field.label}</b><span>{field.value}</span></div>)}</div>
+          <button onClick={() => void saveExtractedFacts()} style={saveButton}>{t('persona.pasteConfirm')}</button>
+        </div>}
+      </div>}
+    </div>
     {isDefault ? <div style={sharedProfileStyle}>{t('persona.sharedDefault')}</div> : <div style={sharedProfileStyle}>{t('persona.usingDefault')} <button onClick={onUseAsProfile} style={profileButton}>{t('persona.useAsBase')}</button></div>}
 
     <PanelTitle title={`${t('persona.confirmedFacts')} · ${profile?.sourceResumeCount ?? 0} ${t(profile?.sourceResumeCount === 1 ? 'persona.baseResume' : 'persona.baseResumes')}`} />
@@ -111,3 +160,9 @@ const addButton = { display: 'inline-flex', alignItems: 'center', gap: 3, border
 const saveButton = { border: 'none', borderRadius: 6, background: 'var(--primary)', color: '#fff', padding: '6px 9px', cursor: 'pointer', fontSize: 11, fontWeight: 600 }
 const cancelButton = { border: '1px solid var(--border)', borderRadius: 6, background: 'transparent', color: 'var(--text-muted)', padding: '6px 9px', cursor: 'pointer', fontSize: 11 }
 const indexButton = { width: '100%', border: '1px solid var(--primary)', borderRadius: 6, background: 'transparent', color: 'var(--primary)', padding: '7px 9px', cursor: 'pointer', fontSize: 11, fontWeight: 700, marginBottom: 9 }
+const pasteCardStyle = { padding: 9, border: '1px solid rgba(79,70,229,.25)', borderRadius: 8, background: 'rgba(79,70,229,.035)', marginBottom: 12 }
+const pasteButton = { border: 'none', background: 'transparent', color: 'var(--primary)', padding: '5px 0 0', cursor: 'pointer', fontSize: 11, fontWeight: 700 }
+const pasteTextareaStyle = { width: '100%', boxSizing: 'border-box' as const, resize: 'vertical' as const, padding: 8, border: '1px solid var(--border)', borderRadius: 6, font: 'inherit', fontSize: 11, lineHeight: 1.45, background: 'var(--bg)' }
+const extractButton = { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 5, border: 'none', borderRadius: 6, background: 'var(--primary)', color: '#fff', padding: '7px 9px', cursor: 'pointer', fontSize: 11, fontWeight: 700 }
+const previewStyle = { padding: 8, border: '1px solid rgba(16,185,129,.35)', borderRadius: 7, background: 'rgba(16,185,129,.05)', fontSize: 11 }
+const previewItemStyle = { display: 'grid', gap: 2, padding: '5px 0', borderTop: '1px solid rgba(0,0,0,.08)' }

@@ -71,6 +71,16 @@ type ApplicationAuditResponse = ApplicationAudit & {
   coverLetterUpdatedAt?: string
 }
 
+type AuditApplyResponse = {
+  audit: ApplicationAudit
+  target: ApplicationAuditFinding['target']
+  appliedContent: unknown
+  resume: Resume | null
+  coverLetter: CoverLetter | null
+  resumeUpdatedAt?: string
+  coverLetterUpdatedAt?: string
+}
+
 function auditMatchesCurrentMaterials(
   record: StoredApplicationAudit | null,
   resumeId: string | null,
@@ -678,6 +688,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   const analysisEpochRef = useRef(0)
   const [latestApplicationAudit, setLatestApplicationAudit] = useState<StoredApplicationAudit | null>(null)
   const [auditingApplication, setAuditingApplication] = useState(false)
+  const [applyingAuditFinding, setApplyingAuditFinding] = useState<number | null>(null)
   const [auditError, setAuditError] = useState<string | null>(null)
   const auditRunRef = useRef(false)
   const [latestSavedCoverLetter, setLatestSavedCoverLetter] = useState<CoverLetter | null>(null)
@@ -1513,6 +1524,20 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       ? storedApplicationAudit
       : null
   const currentApplicationAudit = currentApplicationAuditRecord?.audit ?? null
+  const displayedApplicationAuditRecord = [latestApplicationAudit, storedApplicationAudit].find(record =>
+    record
+      && record.resumeId === selectedResumeId
+      && record.coverLetterId === (finalCoverLetter?.id ?? null),
+  ) ?? null
+  const displayedApplicationAudit = displayedApplicationAuditRecord?.audit ?? null
+  const auditStale = Boolean(displayedApplicationAuditRecord && !auditMatchesCurrentMaterials(
+    displayedApplicationAuditRecord,
+    selectedResumeId,
+    finalCoverLetter?.id ?? null,
+    selectedResumeUpdatedAt,
+    finalCoverLetter?.updatedAt ?? null,
+    dirty || saving,
+  ))
   const jobContext: AiFieldContext = selectedJob ? {
     jobTitle:       selectedJob.role,
     jobCompany:     selectedJob.company,
@@ -1603,6 +1628,46 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       return
     }
     document.querySelector<HTMLElement>('[data-resume-editor]')?.scrollTo({ top: 0, behavior: 'smooth' })
+  }
+
+  async function applyAuditFinding(index: number) {
+    if (!selectedResumeId || !resumeLinkedJob || !displayedApplicationAuditRecord || auditStale) {
+      toast.info('Run the audit again first', 'The current resume or cover letter changed after this audit.')
+      return
+    }
+    setApplyingAuditFinding(index)
+    try {
+      const { data, error } = await apiMutate<AuditApplyResponse>(`/api/jobs/${resumeLinkedJob.id}/audit-application/apply`, 'POST', {
+        resumeId: selectedResumeId,
+        coverLetterId: finalCoverLetter?.id ?? null,
+        findingIndex: index,
+      })
+      if (!data || error) {
+        toast.error('Could not apply audit correction', error ?? 'Please run the audit again')
+        return
+      }
+
+      if (data.resume) {
+        setContent(data.resume.content)
+        setSectionOrder(data.resume.content.sectionOrder ?? DEFAULT_ORDER)
+        setDirty(false)
+        setContentChangedSinceAnalysis(true)
+        setCachedApiResponse(`/api/resume/${selectedResumeId}`, data.resume)
+        setResumes(previous => previous.map(resume => resume.id === data.resume?.id
+          ? { ...resume, name: data.resume.name, updatedAt: data.resume.updatedAt }
+          : resume))
+      }
+      if (data.coverLetter) setLatestSavedCoverLetter(data.coverLetter)
+      setLatestApplicationAudit({
+        ...displayedApplicationAuditRecord,
+        resumeUpdatedAt: data.resumeUpdatedAt ?? displayedApplicationAuditRecord.resumeUpdatedAt,
+        coverLetterUpdatedAt: data.coverLetterUpdatedAt ?? displayedApplicationAuditRecord.coverLetterUpdatedAt,
+        audit: data.audit,
+      })
+      toast.success('Audit correction applied', 'The finding stays visible as Applied. Re-run the audit when you are ready to verify the package again.')
+    } finally {
+      setApplyingAuditFinding(null)
+    }
   }
 
   async function confirmApplicationPack(audit: ApplicationAudit): Promise<boolean> {
@@ -2160,12 +2225,15 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
             currentSummary={content?.summary}
             currentSkills={content?.skills}
             contentChangedSinceAnalysis={contentChangedSinceAnalysis}
-            applicationAudit={currentApplicationAudit}
+            applicationAudit={displayedApplicationAudit}
             auditing={auditingApplication}
             auditError={auditError}
+            auditStale={auditStale}
+            applyingAuditFinding={applyingAuditFinding}
             hasLinkedJob={Boolean(resumeLinkedJob)}
             hasCoverLetter={Boolean(finalCoverLetter)}
             onReviewFinding={reviewAuditFinding}
+            onApplyAuditFinding={index => void applyAuditFinding(index)}
             onAudit={() => { if (!content) { toast.info('Select a resume first'); return }; void runResumeAudit() }}
           />
           </>}

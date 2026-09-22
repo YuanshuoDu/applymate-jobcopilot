@@ -11,15 +11,19 @@ type Props = {
   audit: ApplicationAudit | null | undefined
   auditing: boolean
   auditError?: string | null
+  auditStale?: boolean
+  applyingIndex?: number | null
   hasLinkedJob: boolean
   hasCoverLetter: boolean
   onReviewFinding?: (area: ApplicationAuditFinding['area']) => void
+  onApplyFinding?: (index: number) => void
   onAudit: () => void
 }
 
-function statusCopy(audit: ApplicationAudit | null | undefined, auditing: boolean, t: (key: string) => string) {
+function statusCopy(audit: ApplicationAudit | null | undefined, auditing: boolean, auditStale: boolean, t: (key: string) => string) {
   if (auditing) return { label: t('resume.auditRunning'), tone: 'running' as AuditTone }
   if (!audit) return { label: t('resume.auditNotRun'), tone: 'idle' as AuditTone }
+  if (auditStale) return { label: t('resume.auditNeedsRerunShort'), tone: 'needs-review' as AuditTone }
   if (audit.verdict === 'pass') return { label: t('resume.auditPassed'), tone: 'pass' as AuditTone }
   if (audit.verdict === 'blocked') return { label: t('resume.auditBlockedShort'), tone: 'blocked' as AuditTone }
   return { label: t('resume.auditNeedsReviewShort'), tone: 'needs-review' as AuditTone }
@@ -31,15 +35,23 @@ function areaLabel(area: ApplicationAuditFinding['area'], t: (key: string) => st
   return t('resume.auditAreaResume')
 }
 
-export function ResumeAuditCard({ audit, auditing, auditError, hasLinkedJob, hasCoverLetter, onReviewFinding, onAudit }: Props) {
+function proposedText(value: unknown) {
+  if (typeof value === 'string') return value
+  try { return JSON.stringify(value, null, 2) } catch { return '' }
+}
+
+export function ResumeAuditCard({ audit, auditing, auditError, auditStale = false, applyingIndex = null, hasLinkedJob, hasCoverLetter, onReviewFinding, onApplyFinding, onAudit }: Props) {
   const { t } = useI18n()
   const [copiedFinding, setCopiedFinding] = useState<number | null>(null)
-  const status = statusCopy(audit, auditing, t)
-  const unresolvedFindings = audit?.findings.filter(finding => finding.severity !== 'pass') ?? []
+  const status = statusCopy(audit, auditing, auditStale, t)
+  const unresolvedFindings = audit?.findings
+    .map((finding, index) => ({ finding, index }))
+    .filter(({ finding }) => finding.severity !== 'pass') ?? []
+  const appliedFindings = unresolvedFindings.filter(({ finding }) => finding.applied).length
 
-  async function copyAction(action: string, index: number) {
+  async function copyValue(value: string, index: number) {
     try {
-      await navigator.clipboard.writeText(action)
+      await navigator.clipboard.writeText(value)
       setCopiedFinding(index)
       window.setTimeout(() => setCopiedFinding(current => current === index ? null : current), 1500)
     } catch {
@@ -51,7 +63,7 @@ export function ResumeAuditCard({ audit, auditing, auditError, hasLinkedJob, has
     <section className={`resume-audit-card is-${status.tone}`} data-resume-audit-card aria-live="polite">
       <div className="resume-audit-card-heading">
         <span className="resume-audit-card-icon">
-          {auditing ? <LoaderCircle size={15} /> : audit?.verdict === 'pass' ? <Check size={15} /> : <ShieldCheck size={15} />}
+          {auditing ? <LoaderCircle size={15} /> : audit?.verdict === 'pass' && !auditStale ? <Check size={15} /> : <ShieldCheck size={15} />}
         </span>
         <div className="resume-audit-card-title">
           <strong>{t('resume.independentAudit')}</strong>
@@ -67,16 +79,17 @@ export function ResumeAuditCard({ audit, auditing, auditError, hasLinkedJob, has
       ) : audit ? (
         <>
           <p className="resume-audit-card-message">{audit.summary}</p>
-          {audit.verdict === 'pass' ? (
+          {auditStale && <p className="resume-audit-card-stale">{t('resume.auditChangedSinceRun')}</p>}
+          {audit.verdict === 'pass' && !auditStale ? (
             <p className="resume-audit-card-success"><Check size={13} /> {t('resume.auditNoIssues')}</p>
           ) : (
             <div className="resume-audit-card-findings">
               <div className="resume-audit-card-findings-heading">
                 <strong>{t('resume.auditFindingsTitle')}</strong>
-                <span>{unresolvedFindings.length} {t('resume.auditFindingsCount')}</span>
+                <span>{unresolvedFindings.filter(({ finding }) => !finding.applied).length} {t('resume.auditFindingsCount')}{appliedFindings > 0 ? ` · ${appliedFindings} ${t('resume.auditAppliedCount')}` : ''}</span>
               </div>
-              {unresolvedFindings.map((finding, index) => (
-                <article className="resume-audit-card-finding" key={`${finding.title}-${index}`}>
+              {unresolvedFindings.map(({ finding, index }) => (
+                <article className={`resume-audit-card-finding${finding.applied ? ' is-applied' : ''}`} key={`${finding.title}-${index}`}>
                   <div className="resume-audit-card-finding-heading">
                     <span className={`resume-audit-card-severity is-${finding.severity}`}>
                       {finding.severity === 'critical' ? t('resume.auditCritical') : t('resume.auditWarning')}
@@ -86,6 +99,12 @@ export function ResumeAuditCard({ audit, auditing, auditError, hasLinkedJob, has
                   <strong>{finding.title}</strong>
                   <p><b>{t('resume.auditEvidenceLabel')}:</b> {finding.evidence}</p>
                   <p className="resume-audit-card-action-copy"><b>{t('resume.auditActionLabel')}:</b> {finding.action}</p>
+                  {finding.proposedValue !== undefined && (
+                    <div className="resume-audit-card-proposed">
+                      <b>{t('resume.auditGeneratedLabel')}:</b>
+                      <pre>{proposedText(finding.proposedValue)}</pre>
+                    </div>
+                  )}
                   <div className="resume-audit-card-finding-actions">
                     {onReviewFinding && (
                       <button type="button" onClick={() => onReviewFinding(finding.area)}>
@@ -93,7 +112,19 @@ export function ResumeAuditCard({ audit, auditing, auditError, hasLinkedJob, has
                         {finding.area === 'cover_letter' ? t('resume.auditEditCoverLetter') : finding.area === 'job_match' ? t('resume.auditReviewJob') : t('resume.auditEditResume')}
                       </button>
                     )}
-                    <button type="button" onClick={() => void copyAction(finding.action, index)}>
+                    {onApplyFinding && finding.area !== 'job_match' && (
+                      <button type="button" disabled={finding.applied || auditStale || applyingIndex === index} onClick={() => onApplyFinding(index)}>
+                        {applyingIndex === index ? <LoaderCircle size={12} /> : finding.applied ? <Check size={12} /> : null}
+                        {finding.applied ? t('resume.auditAppliedAction') : finding.proposedValue !== undefined ? t('resume.auditApplyGenerated') : t('resume.auditGenerateAndApply')}
+                      </button>
+                    )}
+                    {finding.proposedValue !== undefined && (
+                      <button type="button" onClick={() => void copyValue(proposedText(finding.proposedValue), index)}>
+                        <Clipboard size={12} />
+                        {copiedFinding === index ? t('resume.auditCopiedAction') : t('resume.auditCopyGenerated')}
+                      </button>
+                    )}
+                    <button type="button" onClick={() => void copyValue(finding.action, index)}>
                       <Clipboard size={12} />
                       {copiedFinding === index ? t('resume.auditCopiedAction') : t('resume.auditCopyAction')}
                     </button>

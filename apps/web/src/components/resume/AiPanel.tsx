@@ -32,7 +32,7 @@ const SEC_LABELS: Record<string, string> = {
 }
 const SEC_ORDER = ['Summary', 'Skills', 'Experience', 'Education', 'Projects']
 
-export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, suggesting, noJobSelected, onApplySuggestion, onAnalyze, onAddKeyword, onApplyTargeted, onEditSection, onRegenerateSection, regeneratingSection, currentSummary, currentSkills, contentChangedSinceAnalysis, applicationAudit, auditing, auditError, hasLinkedJob, hasCoverLetter, onReviewFinding, onAudit }: {
+export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, suggesting, noJobSelected, onApplySuggestion, onAnalyze, onAddKeyword, onApplyTargeted, onEditSection, onRegenerateSection, regeneratingSection, currentSummary, currentSkills, contentChangedSinceAnalysis, applicationAudit, auditing, auditError, auditStale, applyingAuditFinding, hasLinkedJob, hasCoverLetter, onReviewFinding, onApplyAuditFinding, onAudit }: {
   selectedJob:       Job | null
   scoreResult:                  ScoreResult | null
   suggestions:                  Suggestion[]
@@ -52,9 +52,12 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
   applicationAudit?:            ApplicationAudit | null
   auditing?:                    boolean
   auditError?:                  string | null
+  auditStale?:                  boolean
+  applyingAuditFinding?:        number | null
   hasLinkedJob?:                boolean
   hasCoverLetter?:              boolean
   onReviewFinding?:            (area: ApplicationAuditFinding['area']) => void
+  onApplyAuditFinding?:         (index: number) => void
   onAudit?:                     () => void
 }) {
   const { t } = useI18n()
@@ -143,9 +146,12 @@ export function AiPanel({ selectedJob, scoreResult, suggestions, scoring, sugges
         audit={applicationAudit}
         auditing={Boolean(auditing)}
         auditError={auditError}
+        auditStale={auditStale}
+        applyingIndex={applyingAuditFinding}
         hasLinkedJob={hasLinkedJob ?? Boolean(hasJob)}
         hasCoverLetter={Boolean(hasCoverLetter)}
         onReviewFinding={onReviewFinding}
+        onApplyFinding={onApplyAuditFinding}
         onAudit={onAudit ?? (() => undefined)}
       />
 
