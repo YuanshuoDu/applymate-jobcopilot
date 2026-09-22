@@ -14,9 +14,11 @@ const approvalWakeup: AgentTurnWakeupPayload = {
 }
 
 type FakeOutboxRow = { id: string; aggregateId: string; payload: unknown; publishedAt?: Date | null }
+type FakeDispatchRow = { id: string; aggregateId: string; idempotencyKey: string; payload: unknown; publishedAt: Date | null; attemptCount?: number; topic?: string }
 type FakeOptions = {
   payload?: AgentTurnWakeupPayload
   rows?: FakeOutboxRow[]
+  dispatchRows?: FakeDispatchRow[]
   sessionStatus?: string
   sessionSequenceRows?: Array<string | bigint | null>
   turn?: { userId: string; status: string; revision: number; leaseOwnerId?: string | null; leaseExpiresAt?: string | null; leaseStartedAt?: string | null } | null
@@ -25,6 +27,7 @@ type FakeOptions = {
   execution?: { userId: string; sessionId: string; status: string; error: string | null; completedAt: string | null } | null
   failEventOnce?: boolean
   failExecutionUpdateOnce?: boolean
+  failDispatchAfterWriteOnce?: boolean
   turnUpdateRows?: number
 }
 
@@ -53,11 +56,30 @@ function fakePool(options: FakeOptions = {}) {
   const execution = options.execution === undefined ? { userId: "user_1", sessionId: wakeup.sessionId, status: "waiting_for_user", error: "old error", completedAt: "old completion" } : options.execution
   let failEventOnce = options.failEventOnce ?? false
   let failExecutionUpdateOnce = options.failExecutionUpdateOnce ?? false
+  let failDispatchAfterWriteOnce = options.failDispatchAfterWriteOnce ?? false
+  let dispatchRows = (options.dispatchRows ?? []).map(row => ({ ...row }))
   let sessionSequenceCall = 0
+  let transactionSnapshot: { turn: typeof turn; execution: typeof execution; dispatchRows: FakeDispatchRow[] } | null = null
   const client = {
     query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push([sql, params])
-      if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") return { rows: [], rowCount: 0 }
+      if (sql === "BEGIN") {
+        transactionSnapshot = { turn: turn ? { ...turn } : turn, execution: execution ? { ...execution } : execution, dispatchRows: dispatchRows.map(row => ({ ...row })) }
+        return { rows: [], rowCount: 0 }
+      }
+      if (sql === "COMMIT") {
+        transactionSnapshot = null
+        return { rows: [], rowCount: 0 }
+      }
+      if (sql === "ROLLBACK") {
+        if (transactionSnapshot) {
+          turn = transactionSnapshot.turn ? { ...transactionSnapshot.turn } : transactionSnapshot.turn
+          if (execution && transactionSnapshot.execution) Object.assign(execution, transactionSnapshot.execution)
+          dispatchRows = transactionSnapshot.dispatchRows.map(row => ({ ...row }))
+        }
+        transactionSnapshot = null
+        return { rows: [], rowCount: 0 }
+      }
       if (sql.includes('SELECT "id", "aggregateId", "payload"') && sql.includes('"publishedAt" IS NULL')) {
         const pending = [...rows.values()].filter((row) => row.publishedAt === null).map(({ publishedAt: _publishedAt, ...row }) => row)
         return { rows: pending, rowCount: pending.length }
@@ -76,6 +98,11 @@ function fakePool(options: FakeOptions = {}) {
         }
         return { rows: event ? [event] : [], rowCount: event ? 1 : 0 }
       }
+      if (sql.includes('SELECT "aggregateId", "topic" FROM "agent_outbox"')) {
+        const row = dispatchRows.find(candidate => candidate.idempotencyKey === String(params?.[0]))
+        return row ? { rows: [{ aggregateId: row.aggregateId, topic: row.topic ?? "agent.turn.dispatch" }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      }
+      if (sql.includes('SELECT turn."id"') && sql.includes('FROM "agent_turns"')) return { rows: turn ? [{ id: currentWakeup.turnId }] : [], rowCount: turn ? 1 : 0 }
       if (sql.includes('SELECT turn."userId"')) return { rows: turn ? [turn] : [], rowCount: turn ? 1 : 0 }
       if (sql.includes('SELECT set_config')) return { rows: [], rowCount: 1 }
       if (sql.includes('SELECT "status", "content"')) return { rows: item ? [item] : [], rowCount: item ? 1 : 0 }
@@ -103,6 +130,22 @@ function fakePool(options: FakeOptions = {}) {
         if (rowCount === 1 && sql.includes("SET \"status\" = 'queued'")) turn = turn ? { ...turn, status: "queued", revision: turn.revision + 1, leaseOwnerId: null, leaseExpiresAt: null, leaseStartedAt: null } : turn
         return { rows: [], rowCount }
       }
+      if (sql.includes('INSERT INTO "agent_outbox"') && params?.[1] === "agent.turn.dispatch") {
+        const idempotencyKey = String(params?.[3])
+        const existing = dispatchRows.find(row => row.idempotencyKey === idempotencyKey)
+        const nextPayload = JSON.parse(String(params?.[4]))
+        const sameScope = existing?.aggregateId === String(params?.[2]) && (existing.topic ?? "agent.turn.dispatch") === "agent.turn.dispatch"
+        if (existing && sql.includes('DO UPDATE') && sameScope) {
+          existing.payload = nextPayload
+          existing.publishedAt = null
+          existing.attemptCount = (existing.attemptCount ?? 0) + 1
+        } else if (!existing) dispatchRows.push({ id: String(params?.[0]), aggregateId: String(params?.[2]), idempotencyKey, payload: nextPayload, publishedAt: null })
+        if (failDispatchAfterWriteOnce) {
+          failDispatchAfterWriteOnce = false
+          throw new Error("dispatch write failed")
+        }
+        return { rows: [], rowCount: existing ? 0 : 1 }
+      }
       if (sql.includes('UPDATE "agent_outbox"')) {
         const id = String(params?.[0])
         const row = rows.get(id)
@@ -115,7 +158,7 @@ function fakePool(options: FakeOptions = {}) {
     release: vi.fn(),
   }
   const pool = { connect: vi.fn(async () => client) } as unknown as pg.Pool
-  return { pool, client, calls, outboxUpdates, rows, execution, get turn() { return turn } }
+  return { pool, client, calls, outboxUpdates, rows, dispatchRows: () => dispatchRows, execution, get turn() { return turn } }
 }
 
 function hasCall(calls: Array<[string, unknown[] | undefined]>, fragment: string): boolean {
@@ -138,6 +181,12 @@ describe("Agent wakeup consumer", () => {
     expect(fake.calls.some(([sql, params]) => sql.includes('UPDATE "agent_turns" AS turn') && sql.includes('SET "status" = \'queued\'') && params?.includes(6))).toBe(true)
     expect(fake.calls.some(([sql]) => sql.includes('session."userId" = turn."userId"'))).toBe(true)
     expect(fake.execution).toEqual({ userId: "user_1", sessionId: wakeup.sessionId, status: "queued", error: null, completedAt: null })
+    expect(fake.dispatchRows()).toHaveLength(1)
+    const dispatch = fake.dispatchRows()[0]
+    expect(dispatch.aggregateId).toBe(wakeup.sessionId)
+    expect(dispatch.idempotencyKey).toBe("turn-dispatch:turn_1")
+    expect(Object.keys(dispatch.payload as object).sort()).toEqual(["ownerId", "sessionId", "turnId"])
+    expect(dispatch.payload).toEqual({ turnId: wakeup.turnId, sessionId: wakeup.sessionId, ownerId: "wakeup:event_wakeup" })
   })
 
   it("accepts the canonical waitId used by Gmail OAuth question items", async () => {
@@ -165,6 +214,50 @@ describe("Agent wakeup consumer", () => {
     expect(turnUpdate).toContain('"leaseOwnerId" = NULL')
     expect(turnUpdate).toContain('"leaseExpiresAt" = NULL')
     expect(turnUpdate).toContain('"leaseStartedAt" = NULL')
+    expect(fake.dispatchRows()[0]?.payload).toEqual({ turnId: approvalWakeup.turnId, sessionId: approvalWakeup.sessionId, ownerId: "wakeup:event_approval" })
+  })
+
+  it("resets a prior dispatch once for a new wakeup and not on repeated delivery", async () => {
+    const publishedAt = new Date("2026-09-22T10:00:00.000Z")
+    const fake = fakePool({ dispatchRows: [{ id: "dispatch_1", aggregateId: wakeup.sessionId, idempotencyKey: "turn-dispatch:turn_1", payload: { turnId: wakeup.turnId, sessionId: wakeup.sessionId, ownerId: "old-server-owner" }, publishedAt }] })
+
+    await expect(resumeAgentTurn(fake.pool, wakeup)).resolves.toMatchObject({ status: "resumed" })
+    expect(fake.dispatchRows()[0]?.publishedAt).toBeNull()
+    expect(fake.dispatchRows()[0]?.payload).toEqual({ turnId: wakeup.turnId, sessionId: wakeup.sessionId, ownerId: "wakeup:event_wakeup" })
+    await expect(resumeAgentTurn(fake.pool, wakeup)).resolves.toMatchObject({ status: "already_resumed" })
+
+    expect(fake.dispatchRows()).toHaveLength(1)
+    expect(fake.calls.filter(([sql, params]) => sql.includes('INSERT INTO "agent_outbox"') && params?.[1] === "agent.turn.dispatch")).toHaveLength(1)
+  })
+
+  it("fails closed when a foreign dispatch row reuses the Turn idempotency key", async () => {
+    const fake = fakePool({ dispatchRows: [{ id: "foreign_dispatch", aggregateId: "other_session", idempotencyKey: "turn-dispatch:turn_1", payload: { turnId: wakeup.turnId, sessionId: "other_session", ownerId: "foreign" }, publishedAt: null }] })
+
+    await expect(resumeAgentTurn(fake.pool, wakeup)).rejects.toMatchObject({ code: "outbox_scope_mismatch" })
+    expect(fake.turn).toMatchObject({ status: "waiting_for_user", revision: wakeup.nextTurnRevision })
+    expect(fake.dispatchRows()).toHaveLength(1)
+  })
+
+  it("fails closed and leaves a foreign-topic dispatch row unchanged", async () => {
+    const foreign = { id: "foreign_topic", aggregateId: wakeup.sessionId, idempotencyKey: "turn-dispatch:turn_1", payload: { turnId: "foreign_turn", sessionId: wakeup.sessionId, ownerId: "foreign" }, publishedAt: new Date("2026-09-22T10:00:00.000Z"), attemptCount: 4, topic: "agent.other.topic" }
+    const fake = fakePool({ dispatchRows: [foreign] })
+
+    await expect(resumeAgentTurn(fake.pool, wakeup)).rejects.toMatchObject({ code: "outbox_scope_mismatch" })
+    expect(fake.turn).toMatchObject({ status: "waiting_for_user", revision: wakeup.nextTurnRevision })
+    expect(fake.dispatchRows()).toEqual([foreign])
+  })
+
+  it("rolls back a dispatch reset when its transaction fails", async () => {
+    const publishedAt = new Date("2026-09-22T10:00:00.000Z")
+    const fake = fakePool({
+      dispatchRows: [{ id: "dispatch_1", aggregateId: wakeup.sessionId, idempotencyKey: "turn-dispatch:turn_1", payload: { turnId: wakeup.turnId, sessionId: wakeup.sessionId, ownerId: "old-server-owner" }, publishedAt }],
+      failDispatchAfterWriteOnce: true,
+    })
+
+    await expect(resumeAgentTurn(fake.pool, wakeup)).rejects.toThrow("dispatch write failed")
+    expect(fake.turn).toMatchObject({ status: "waiting_for_user", revision: wakeup.nextTurnRevision })
+    expect(fake.dispatchRows()[0]?.publishedAt).toBe(publishedAt)
+    expect(fake.dispatchRows()[0]?.payload).toEqual({ turnId: wakeup.turnId, sessionId: wakeup.sessionId, ownerId: "old-server-owner" })
   })
 
   it("claims and marks durable wakeups after the same-lineage resume", async () => {
@@ -228,6 +321,7 @@ describe("Agent wakeup consumer", () => {
     expect(hasCall(fake.calls, "ROLLBACK")).toBe(true)
     expect(fake.outboxUpdates).toEqual([{ id: "outbox_1", lastError: "processing_error" }])
     expect(fake.execution).toEqual({ userId: "user_1", sessionId: wakeup.sessionId, status: "waiting_for_user", error: "old error", completedAt: "old completion" })
+    expect(fake.dispatchRows()).toHaveLength(0)
   })
 
   it("treats a fenced Turn update miss as an already-resumed no-op", async () => {
@@ -258,6 +352,7 @@ describe("Agent wakeup consumer", () => {
       { id: "duplicate_2", lastError: null },
     ])
     expect(fake.calls.filter(([sql]) => sql.includes('UPDATE "agent_turns"') && sql.includes("SET \"status\" = 'queued'")).length).toBe(1)
+    expect(fake.dispatchRows()).toHaveLength(1)
   })
 
   it("terminalizes malformed rows and continues with later wakeups", async () => {
@@ -300,6 +395,7 @@ describe("Agent wakeup consumer", () => {
     await expect(drainAgentWakeups(lineage.pool, 1)).resolves.toBe(1)
     expect(lineage.outboxUpdates).toEqual([{ id: "lineage", lastError: "event_lineage_mismatch" }])
     expect(lineage.calls.some(([sql]) => sql.includes("SET \"status\" = 'queued'"))).toBe(false)
+    expect(lineage.calls.some(([sql, params]) => sql.includes('INSERT INTO "agent_outbox"') && params?.[1] === "agent.turn.dispatch")).toBe(false)
 
     const tool = fakePool({ rows: [{ id: "tool", aggregateId: wakeup.sessionId, payload: wakeupEnvelope() }], item: { status: "completed", content: { waitKind: "question", questionId: "q1", toolCallId: "other_call" } } })
     await expect(drainAgentWakeups(tool.pool, 1)).resolves.toBe(1)

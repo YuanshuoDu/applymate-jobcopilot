@@ -1,15 +1,14 @@
 import { randomUUID } from "node:crypto"
 import type pg from "pg"
 import { getPool } from "../../db/apply-results.js"
+import { persistWakeupTurnDispatchInTransaction } from "../turns/recovery-scanner.js"
 import { AGENT_TURN_WAKEUP_TOPIC, parseWakeup, type AgentTurnWakeupPayload, type WakeupResult } from "./types.js"
-
 type Client = pg.PoolClient
 type PoolLike = Pick<pg.Pool, "connect">
 interface OutboxRow { id: string; aggregateId: string; payload: unknown; publishedAt?: Date | string | null }
 interface WakeupEventRow { sessionId: string; turnId: string; itemId: string | null; type: string; payload: unknown }
 type TerminalWakeupErrorCode = "schema_invalid_payload" | "outbox_scope_mismatch" | "event_lineage_mismatch" | "item_lineage_mismatch" | "tool_lineage_mismatch" | "turn_revision_conflict" | "wait_scope_mismatch"
 class TerminalWakeupError extends Error { constructor(readonly code: TerminalWakeupErrorCode, message: string) { super(message); this.name = "TerminalWakeupError" } }
-
 const DEFAULT_BATCH_SIZE = 10
 const DEFAULT_POLL_MS = 1_000
 const CLOSED_SESSION_STATUSES = new Set(["aborted", "archived"])
@@ -59,7 +58,6 @@ async function resumeInTransaction(client: Client, payload: AgentTurnWakeupPaylo
     return { status: "ignored", sessionId: payload.sessionId, turnId: payload.turnId, itemId: payload.itemId, toolCallId: payload.toolCallId }
   }
   await client.query(`SELECT set_config($1, $2, true)`, ["app.user_id", session.userId])
-
   const turnResult = await client.query<{ userId: string; status: string; revision: number }>(
     `SELECT turn."userId", turn."status", turn."revision" FROM "agent_turns" AS turn WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 FOR UPDATE`,
     [payload.turnId, payload.sessionId, session.userId],
@@ -67,7 +65,6 @@ async function resumeInTransaction(client: Client, payload: AgentTurnWakeupPaylo
   const turn = turnResult.rows[0]
   if (!turn) return { status: "ignored", sessionId: payload.sessionId, turnId: payload.turnId, itemId: payload.itemId, toolCallId: payload.toolCallId }
   await assertWakeupEvent(client, payload)
-
   if (turn.status === "queued" || turn.status === "in_progress") {
     return { status: "already_resumed", sessionId: payload.sessionId, turnId: payload.turnId, itemId: payload.itemId, toolCallId: payload.toolCallId }
   }
@@ -79,7 +76,6 @@ async function resumeInTransaction(client: Client, payload: AgentTurnWakeupPaylo
   if (turn.revision !== payload.nextTurnRevision) {
     throw new TerminalWakeupError("turn_revision_conflict", "Agent Turn revision changed before wakeup")
   }
-
   const itemResult = await client.query<{ status: string; content: unknown }>(
     `SELECT "status", "content" FROM "agent_items" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "type" = $4 FOR UPDATE`,
     [payload.itemId, payload.sessionId, payload.turnId, payload.waitKind === "approval" ? "approval_request" : "question"],
@@ -116,6 +112,7 @@ async function resumeInTransaction(client: Client, payload: AgentTurnWakeupPaylo
     [session.userId, payload.sessionId],
   )
   await appendResumeEvent(client, payload, session.userId)
+  if (!await persistWakeupTurnDispatchInTransaction(client, payload.turnId, payload.sessionId, payload.eventId)) throw new TerminalWakeupError("outbox_scope_mismatch", "Turn dispatch lineage does not match wakeup scope")
   return { status: "resumed", sessionId: payload.sessionId, turnId: payload.turnId, itemId: payload.itemId, toolCallId: payload.toolCallId }
 }
 export async function resumeAgentTurn(pool: PoolLike, payload: AgentTurnWakeupPayload): Promise<WakeupResult> {

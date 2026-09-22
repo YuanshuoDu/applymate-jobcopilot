@@ -97,39 +97,73 @@ export async function persistTurnDispatch(
   payload: TurnJobPayload,
   resetPublished = false,
 ): Promise<void> {
-  await withTransaction(pool, async (client) => {
-    if (resetPublished) {
-      const session = await client.query<{ id: string }>(
-        `SELECT session."id" FROM "agent_sessions" AS session
-         WHERE session."id" = $1
-           AND ${RUNNABLE_SESSION}
-         FOR UPDATE`,
-        [payload.sessionId],
-      )
-      if (!session.rows[0]) return
-    }
-    const lineage = await client.query<{ id: string }>(
-      `SELECT turn."id"
-       FROM "agent_turns" AS turn
-       JOIN "agent_sessions" AS session
-         ON session."id" = turn."sessionId"
-        AND session."userId" = turn."userId"
-       WHERE turn."id" = $1 AND turn."sessionId" = $2
-       FOR UPDATE OF turn, session`,
-      [payload.turnId, payload.sessionId],
+  await withTransaction(pool, (client) => persistTurnDispatchInTransaction(client, payload, resetPublished))
+}
+
+/** Writes one canonical dispatch intent inside an already-open transaction. */
+export async function persistTurnDispatchInTransaction(
+  client: Pick<pg.PoolClient, "query">,
+  payload: TurnJobPayload,
+  resetPublished = false,
+  requireRunnableSession = resetPublished,
+): Promise<void> {
+  if (requireRunnableSession) {
+    const session = await client.query<{ id: string }>(
+      `SELECT session."id" FROM "agent_sessions" AS session
+       WHERE session."id" = $1
+         AND ${RUNNABLE_SESSION}
+       FOR UPDATE`,
+      [payload.sessionId],
     )
-    if (!lineage.rows[0]) throw new Error(TURN_DISPATCH_LINEAGE_ERROR)
-    const conflictClause = resetPublished
-      ? `ON CONFLICT ("idempotencyKey") DO UPDATE SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL, "attemptCount" = "agent_outbox"."attemptCount" + 1
-         WHERE "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"`
-      : `ON CONFLICT ("idempotencyKey") DO NOTHING`
-    await client.query(
-      `INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
-       VALUES ($1, $2, $3, $4, $5::jsonb)
-       ${conflictClause}`,
-      [randomUUID(), TURN_DISPATCH_TOPIC, payload.sessionId, turnDispatchKey(payload.turnId), payloadJson(payload)],
+    if (!session.rows[0]) return
+  }
+  const lineage = await client.query<{ id: string }>(
+    `SELECT turn."id"
+     FROM "agent_turns" AS turn
+     JOIN "agent_sessions" AS session
+       ON session."id" = turn."sessionId"
+      AND session."userId" = turn."userId"
+     WHERE turn."id" = $1 AND turn."sessionId" = $2
+     FOR UPDATE OF turn, session`,
+    [payload.turnId, payload.sessionId],
+  )
+  if (!lineage.rows[0]) throw new Error(TURN_DISPATCH_LINEAGE_ERROR)
+  const idempotencyKey = turnDispatchKey(payload.turnId)
+  const conflictClause = resetPublished
+    ? `ON CONFLICT ("idempotencyKey") DO UPDATE SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL, "attemptCount" = "agent_outbox"."attemptCount" + 1
+       WHERE "agent_outbox"."topic" = EXCLUDED."topic"
+         AND "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"`
+    : `ON CONFLICT ("idempotencyKey") DO NOTHING`
+  const written = await client.query(
+    `INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
+     VALUES ($1, $2, $3, $4, $5::jsonb)
+     ${conflictClause}`,
+    [randomUUID(), TURN_DISPATCH_TOPIC, payload.sessionId, idempotencyKey, payloadJson(payload)],
+  )
+  if (resetPublished && written.rowCount !== 1) {
+    const conflict = await client.query<{ aggregateId: string; topic: string }>(
+      `SELECT "aggregateId", "topic" FROM "agent_outbox"
+       WHERE "idempotencyKey" = $1 FOR UPDATE`,
+      [idempotencyKey],
     )
-  })
+    if (conflict.rows[0]?.topic !== TURN_DISPATCH_TOPIC || conflict.rows[0]?.aggregateId !== payload.sessionId) throw new Error(TURN_DISPATCH_LINEAGE_ERROR)
+  }
+}
+
+/** Adds a wakeup-owned dispatch generation without opening a second transaction. */
+export async function persistWakeupTurnDispatchInTransaction(
+  client: Pick<pg.PoolClient, "query">,
+  turnId: string,
+  sessionId: string,
+  eventId: string,
+): Promise<boolean> {
+  try {
+    await persistTurnDispatchInTransaction(client, { turnId, sessionId, ownerId: `wakeup:${eventId}` }, true, false)
+    return true
+  } catch (error) {
+    if (error instanceof Error && error.message === TURN_DISPATCH_LINEAGE_ERROR) return false
+    throw error
+  }
 }
 
 /** Rewrites pre-P4-39 pending dispatch rows to their canonical session aggregate. */

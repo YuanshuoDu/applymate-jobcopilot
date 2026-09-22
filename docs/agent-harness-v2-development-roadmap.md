@@ -2898,3 +2898,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused Worker validation passed **220/220**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, queue delivery, process restart recovery, and end-to-end production evidence remain unverified. No schema, Web, or unsafe-orphan scope is claimed. P8-74 remains a candidate.
+
+## 161. P8-75 — Atomic wakeup dispatch intent
+
+**Candidate status/date (2026-09-22):** P8-75 is recorded as a candidate Worker wakeup-to-dispatch closure; formal P0-P7 acceptance remains **1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** The Worker wakeup transaction now writes one session-aggregated `agent.turn.dispatch` intent after the waiting Turn is successfully moved to `queued`. The payload is strictly `{turnId, sessionId, ownerId}` with the stable server-owned `wakeup:<eventId>` owner. Existing `turn-dispatch:<turnId>` idempotency uses a guarded same-aggregate `ON CONFLICT DO UPDATE` to clear `publishedAt`/`lastError`, update the payload, and advance the dispatch generation for a legitimate new wakeup; an already-queued duplicate returns before resetting the row, and foreign conflicts fail closed.
+
+**Independent verification:** Focused wakeup and recovery-scanner validation passed **52/52 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Question and approval waits, stale/foreign lineage, duplicate delivery, queue failure bookkeeping, and rollback behavior are covered with fake transactions/queues.
+
+**Candidate boundary:** Live PostgreSQL/RLS, Redis/BullMQ delivery, process restart recovery, and end-to-end production wakeup continuation remain unverified. No schema, Web, provider, legacy bridge, or approval-policy change was made; P8-75 remains a candidate.

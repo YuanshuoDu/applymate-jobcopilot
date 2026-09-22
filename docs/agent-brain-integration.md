@@ -1632,3 +1632,10 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Resume requires exact `plan.command`/`plan.revision` lineage. The current-plan replan gate ignores stale answers so an old observation cannot repeat a command; missing current-plan control evidence remains fail-closed.
 - Focused Worker validation passed **220/220** tests; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Formal P0-P7 acceptance remains **1/8 (12.5%)**.
 - Boundary: live PostgreSQL/RLS, queue delivery, process restart recovery, and end-to-end production evidence remain unverified. No schema, Web, or unsafe-orphan scope is claimed; P8-74 remains a candidate.
+
+## P8-75 candidate - atomic wakeup dispatch intent
+
+- `resumeInTransaction` now writes the session-aggregated `agent.turn.dispatch` intent in the same transaction as the waiting Turn CAS, legacy execution reset, and `turn.resumed` event. The dispatch payload is exactly `{turnId, sessionId, ownerId}` with the stable server-owned `wakeup:<eventId>` owner. A legitimate new wakeup uses the existing `turn-dispatch:<turnId>` key with a guarded same-aggregate `DO UPDATE` to clear `publishedAt`/`lastError` and advance the dispatch generation; a repeated already-queued wakeup returns before this reset.
+- Question and approval wakeups are covered, including stale/foreign lineage rejection and transaction rollback of the newly written intent. Recovery scanner behavior remains compatible through the shared in-transaction dispatch writer.
+- Focused Worker validation passed **52/52 tests** across wakeup and recovery-scanner suites; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+- Candidate boundary: fake transaction/queue evidence only; live PostgreSQL/RLS, Redis/BullMQ delivery, process restart, and end-to-end production wakeup continuation remain unverified. No schema, Web, provider, legacy bridge, or approval-policy change was made.

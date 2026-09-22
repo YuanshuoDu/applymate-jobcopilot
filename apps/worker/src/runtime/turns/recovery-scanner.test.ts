@@ -80,7 +80,7 @@ describe("Turn recovery scanner", () => {
 
     const resetFake = pool()
     await persistTurnDispatch(resetFake.pool, { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, true)
-    expect(resetFake.calls.some(([sql]) => sql.includes('WHERE "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"'))).toBe(true)
+    expect(resetFake.calls.some(([sql]) => sql.includes('WHERE "agent_outbox"."topic" = EXCLUDED."topic"') && sql.includes('"agent_outbox"."aggregateId" = EXCLUDED."aggregateId"'))).toBe(true)
     const pausedResetFake = pool([], "running", [], [], "user_paused")
     await persistTurnDispatch(pausedResetFake.pool, { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, true)
     expect(pausedResetFake.calls.some(([sql]) => sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)

@@ -1015,3 +1015,9 @@ P8-74 is a candidate canonical `request_input` question wait/resume slice. The W
 Focused Worker validation passed **220/220 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Formal P0-P7 acceptance remains **1/8 (12.5%)**.
 
 Live PostgreSQL/RLS, queue delivery, process restart recovery, and end-to-end production evidence remain unverified. P8-74 remains a candidate; no schema, Web, or unsafe-orphan scope is claimed.
+
+## P8-75 update
+
+P8-75 closes the Worker wakeup-to-dispatch intent gap. After the waiting Turn CAS succeeds, `resumeInTransaction` writes the canonical session-aggregated `agent.turn.dispatch` row in the same transaction as the execution reset and `turn.resumed` projection. The dispatch payload is exactly `{turnId, sessionId, ownerId}` with the stable server-owned `wakeup:<eventId>` owner. The existing `turn-dispatch:<turnId>` key uses a guarded same-aggregate `ON CONFLICT DO UPDATE` to update the payload, clear `publishedAt`/`lastError`, and advance the dispatch generation for a legitimate new wakeup; duplicate already-queued wakeups return before resetting the row, and foreign conflicts fail closed.
+
+Focused Worker wakeup and recovery-scanner validation passed **52/52 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Question and approval waits, stale/foreign mismatches, duplicate delivery, queue failure bookkeeping, and transaction rollback are covered with fake transaction/queue fixtures. Live PostgreSQL/RLS, Redis/BullMQ delivery, process restart recovery, and end-to-end production evidence remain unverified. P8-75 remains a candidate; no schema, Web, provider, legacy bridge, or approval-policy change was introduced.
