@@ -275,6 +275,23 @@ export class PgSubagentTaskStore implements SubagentStore {
     } finally { client.release() }
   }
 
+  async interruptTurn(input: { userId: string; sessionId: string; turnId: string; now: Date }): Promise<number> {
+    const client = await this.pool.connect()
+    try {
+      const result = await client.query(`UPDATE "sub_agent_tasks" AS task SET
+        "interruptRequestedAt" = COALESCE(task."interruptRequestedAt", $4),
+        "status" = CASE WHEN task."status" IN ('queued', 'retrying', 'waiting', 'waiting_for_user') THEN 'interrupted' ELSE task."status" END,
+        "nextAttemptAt" = CASE WHEN task."status" IN ('queued', 'retrying', 'waiting', 'waiting_for_user') THEN NULL ELSE task."nextAttemptAt" END,
+        "completedAt" = CASE WHEN task."status" IN ('queued', 'retrying', 'waiting', 'waiting_for_user') THEN $4 ELSE task."completedAt" END,
+        "updatedAt" = $4
+        FROM "agent_sessions" AS session
+        WHERE task."sessionId" = $1 AND task."turnId" = $2 AND session."id" = task."sessionId"
+          AND session."userId" = $3 AND task."status" IN ('queued', 'running', 'retrying', 'waiting', 'waiting_for_user')`,
+      [input.sessionId, input.turnId, input.userId, input.now])
+      return result.rowCount ?? 0
+    } finally { client.release() }
+  }
+
   async interruptSubtree(input: { sessionId: string; rootTaskId: string; targetPath: string; now: Date }): Promise<number> {
     return transaction(this.pool, async client => {
       const session = await client.query(`SELECT "id", "status" FROM "agent_sessions"

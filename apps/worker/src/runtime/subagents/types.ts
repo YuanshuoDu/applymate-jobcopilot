@@ -130,6 +130,7 @@ export type SubagentStore = {
   release?(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; now: Date }): Promise<boolean>
   close(input: { taskId: string; sessionId: string; now: Date }): Promise<boolean>
   interruptTree(input: { sessionId: string; rootTaskId: string; now: Date }): Promise<number>
+  interruptTurn?(input: { userId: string; sessionId: string; turnId: string; now: Date }): Promise<number>
   interruptSubtree?(input: { sessionId: string; rootTaskId: string; targetPath: string; now: Date }): Promise<number>
   recoverExpired(input: { now: Date; limit: number }): Promise<SubagentTaskRecord[]>
 }

@@ -133,6 +133,7 @@ export async function createProductionWorkerBootstrap(
       pool: options.pool,
       execute: options.runtime.execute,
       interrupts: options.interrupts,
+      interruptSubagents: lease => options.runtime.manager.interruptForTurn(lease),
       waitHandoff: async input => {
         await createPgDurableWaitPort(options.pool).suspendAndRelease(input)
       },

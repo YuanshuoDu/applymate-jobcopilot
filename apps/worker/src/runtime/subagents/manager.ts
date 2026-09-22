@@ -165,6 +165,17 @@ export class AgentTreeManager {
     return count
   }
 
+  async interruptForTurn(input: { userId: string; sessionId: string; turnId: string }): Promise<number> {
+    const interruptTurn = this.store.interruptTurn
+    if (!interruptTurn) return 0
+    const count = await interruptTurn.call(this.store, { ...input, now: this.now() })
+    for (const active of this.active.values()) {
+      if (active.lease.userId !== input.userId || active.lease.sessionId !== input.sessionId || active.lease.turnId !== input.turnId) continue
+      this.signalLoss(active, true, new SubagentLeaseError("lost", "Parent Turn lease was lost"))
+    }
+    return count
+  }
+
   async interruptSubtree(sessionId: string, rootTaskId: string, targetPath: string): Promise<number> {
     const normalizedTargetPath = normalizeTaskPath(targetPath)
     if (!normalizedTargetPath) throw new SubagentLeaseError("not_available", "Scoped subagent interruption target is invalid")

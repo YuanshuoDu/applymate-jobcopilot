@@ -502,6 +502,17 @@ describe("PgSubagentTaskStore", () => {
     expect(update).toContain("'waiting_for_user'")
   })
 
+  it("interrupts every nonterminal task for an owned Turn", async () => {
+    const fake = fakePool(sql => sql.startsWith("UPDATE") ? { rowCount: 2 } : {})
+    const store = new PgSubagentTaskStore(fake.pool)
+    await expect(store.interruptTurn({ userId: "user-1", sessionId: "session-1", turnId: "turn-1", now })).resolves.toBe(2)
+    const update = fake.calls.find(([sql]) => sql.startsWith("UPDATE"))?.[0] ?? ""
+    expect(update).toContain('session."userId" = $3')
+    expect(update).toContain('task."turnId" = $2')
+    expect(update).toContain('"interruptRequestedAt"')
+    expect(update).toContain("'running'")
+  })
+
   it("interrupts only the requested path subtree in a transaction", async () => {
     const fake = fakePool(sql => {
       if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "session-1", status: "running" }], rowCount: 1 }

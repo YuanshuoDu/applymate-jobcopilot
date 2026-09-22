@@ -72,6 +72,8 @@ export interface RunTurnJobOptions {
   waitHandoff?: TurnWaitHandoff
   /** Server-owned probe for a durable Stop that fenced the active lease. */
   isInterrupted?: (lease: TurnLease) => Promise<boolean>
+  /** Durable child fence used when this Turn loses ownership unexpectedly. */
+  interruptSubagents?: (lease: TurnLease) => Promise<unknown>
 }
 
 export async function markTurnDispatchClaimed(pool: LeasePool, payload: TurnJobPayload): Promise<void> {
@@ -187,6 +189,7 @@ export async function runTurnJob(
     if (decision.disposition === "skip") return { status: "skipped", reasonCode: decision.reasonCode }
     if (decision.disposition === "retry") {
       if (decision.reasonCode === "lease_lost") {
+        await options.interruptSubagents?.(heartbeat.currentLease).catch(() => undefined)
         await expireTurnLease(options.pool, heartbeat.currentLease, options.now?.() ?? new Date()).catch(() => undefined)
         return { status: "requeued", reasonCode: decision.reasonCode }
       }
@@ -222,6 +225,7 @@ export function createTurnQueue(options: {
   interrupts?: RootAbortControllerRegistry
   leaseMs?: number
   heartbeatMs?: number
+  interruptSubagents?: (lease: TurnLease) => Promise<unknown>
 }): { queue: TurnQueueLike; worker: Worker<TurnJobPayload>; active: TurnExecutionRegistry; close: () => Promise<void> } {
   const queue = options.queue ?? new Queue<TurnJobPayload>(TURN_QUEUE_NAME, { connection: redisConnection, skipVersionCheck: true })
   const active = new TurnExecutionRegistry()
@@ -235,6 +239,7 @@ export function createTurnQueue(options: {
       interrupts: options.interrupts,
       leaseMs: options.leaseMs,
       heartbeatMs: options.heartbeatMs,
+      interruptSubagents: options.interruptSubagents,
     }),
     { connection: redisConnection, concurrency: 1, skipVersionCheck: true, ...workerPollingOptions() },
   )

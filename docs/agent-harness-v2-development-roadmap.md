@@ -3056,3 +3056,11 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Candidate status/date (2026-09-22):** P8-91 is a bounded queue/DLQ classification slice; formal P0-P7 acceptance remains **1/8 (12.5%)**.
 
 The existing Turn queue now preserves `cognitive_agenda_resume_fence_invalid` as an identifiable retry reason before the normal retry limit, while attempts at the existing limit still produce the existing `max_retries_exhausted` DLQ outcome with the stable fence error code. No new status, schema, or reconciliation state was introduced; ordinary failures retain their existing classification.
+
+## 178. P8-96 — Production Turn stop and lease-loss child fence
+
+**Candidate status/date (2026-09-22):** P8-96 is a bounded Worker cancellation-fence slice; formal P0-P7 acceptance remains **1/8 (12.5%)**.
+
+The authenticated Web stop transaction already fences the exact user/session/Turn child tree. Worker production composition now applies the same server-owned fence before requeueing a Turn after lease loss: the manager resolves children by `userId`, `sessionId`, and `turnId`, writes idempotent `interruptRequestedAt`, and aborts matching active child executions. Child heartbeat and finish checks reject late success writes. Cleanup remains best-effort and does not alter the root Turn's existing `lease_lost` requeue behavior. No schema, provider, ATS, Web, or UI change was made in this slice.
+
+Focused Worker tests and typecheck passed. Live PostgreSQL/RLS behavior, BullMQ cross-process delivery, process restart, and production evidence remain unverified.

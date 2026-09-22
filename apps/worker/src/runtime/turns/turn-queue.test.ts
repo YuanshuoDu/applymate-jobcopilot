@@ -6,6 +6,7 @@ import { markTurnDispatchClaimed, runTurnJob, TurnExecutionRegistry, type TurnEx
 import type { TurnLease } from "./lease.js"
 import { RootAbortControllerRegistry } from "../interrupt/registry.js"
 import { COGNITIVE_AGENDA_RESUME_FENCE_INVALID } from "./dlq.js"
+import { TurnLeaseError } from "./lease.js"
 
 const lease: TurnLease = {
   turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1", userId: "user_1", leaseVersion: 1,
@@ -250,6 +251,29 @@ describe("Turn queue processor", () => {
     )
     expect(result).toEqual({ status: "dead_lettered", reasonCode: "max_retries_exhausted" })
     expect(terminal.calls.some(sql => sql.includes('INSERT INTO "agent_outbox"'))).toBe(true)
+  })
+
+  it("interrupts the child tree before requeueing a lost Turn lease", async () => {
+    const fake = pool()
+    const execute = vi.fn().mockRejectedValue(new TurnLeaseError("lease_lost", "lost"))
+    const interruptSubagents = vi.fn().mockResolvedValue(2)
+    await expect(runTurnJob(
+      { data: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptsMade: 0 },
+      { pool: fake.pool, execute, interruptSubagents },
+    )).resolves.toEqual({ status: "requeued", reasonCode: "lease_lost" })
+    expect(interruptSubagents).toHaveBeenCalledWith(expect.objectContaining(lease))
+  })
+
+  it("keeps lease-loss requeue semantics when child cleanup fails", async () => {
+    const fake = pool()
+    const execute = vi.fn().mockRejectedValue(new TurnLeaseError("lease_lost", "lost"))
+    const interruptSubagents = vi.fn().mockRejectedValue(new Error("child bridge unavailable"))
+    await expect(runTurnJob(
+      { data: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptsMade: 0 },
+      { pool: fake.pool, execute, interruptSubagents },
+    )).resolves.toEqual({ status: "requeued", reasonCode: "lease_lost" })
+    expect(interruptSubagents).toHaveBeenCalledOnce()
+    expect(fake.calls.some(sql => sql.includes('SET "leaseOwnerId" = NULL, "leaseExpiresAt" = $5'))).toBe(true)
   })
 
   it("converges a durable interrupted Turn after heartbeat renewal is fenced", async () => {

@@ -107,6 +107,18 @@ class MemoryStore implements SubagentStore {
     return count
   }
 
+  async interruptTurn(input: { userId: string; sessionId: string; turnId: string; now: Date }): Promise<number> {
+    let count = 0
+    for (const task of this.records.values()) {
+      if (task.userId !== input.userId || task.sessionId !== input.sessionId || task.turnId !== input.turnId
+        || ["completed", "failed", "interrupted", "cancelled", "closed"].includes(task.status)) continue
+      count += 1
+      const terminalize = ["queued", "retrying", "waiting", "waiting_for_user"].includes(task.status)
+      this.records.set(task.id, { ...task, interruptRequestedAt: input.now, status: terminalize ? "interrupted" : task.status })
+    }
+    return count
+  }
+
   async interruptSubtree(input: { sessionId: string; rootTaskId: string; targetPath: string; now: Date }): Promise<number> {
     let count = 0
     for (const task of this.records.values()) {
@@ -309,6 +321,20 @@ describe("AgentTreeManager", () => {
     await expect(siblingRun).resolves.toMatchObject({ status: "completed" })
     expect(manager.activeCount(target.sessionId)).toBe(0)
     await expect(manager.interruptSubtree(root.sessionId, root.id, root.path)).resolves.toBe(1)
+  })
+
+  it("interrupts active work when its parent Turn loses ownership", async () => {
+    const store = new MemoryStore()
+    const manager = new AgentTreeManager(store, { clock: new FakeClock() })
+    const root = await manager.spawn(spec({ turnId: "turn-1" }))
+    const child = await manager.spawn(spec({ parentTaskId: root.id, turnId: "turn-1" }))
+    const run = manager.run(payload(child), async ({ lease }) => new Promise<SubagentExecutionResult>(resolve => {
+      lease.signal.addEventListener("abort", () => resolve({ status: "failed" }), { once: true })
+    }))
+    await new Promise(resolve => setTimeout(resolve, 0))
+    await expect(manager.interruptForTurn({ userId: child.userId, sessionId: child.sessionId, turnId: "turn-1" })).resolves.toBe(2)
+    await expect(run).resolves.toMatchObject({ status: "interrupted" })
+    expect(store.records.get(child.id)).toMatchObject({ status: "interrupted", interruptRequestedAt: expect.any(Date) })
   })
 
   it("uses whole-root interruption only for an exact root path on legacy stores", async () => {
