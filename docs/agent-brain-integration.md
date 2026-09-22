@@ -1625,3 +1625,10 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Commit `189662e0` extends `releaseTurnLease` with a `waiting_for_approval` owner/version/session fence. Wakeup atomically moves `waiting → queued` and clears `leaseOwnerId`, `leaseExpiresAt`, and `leaseStartedAt`, preserving tenant, lineage, revision, and idempotency boundaries.
 - Focused lease, turn-queue, and wakeup validation passed **52/52**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 - Boundary: live PostgreSQL/RLS, cross-process queue/restart, complete wakeup, and production E2E remain unverified. Formal P0-P7 acceptance remains **1/8 (12.5%)**; P8-73 is a candidate hardening slice.
+
+## P8-74 candidate - canonical `request_input` question wait/resume
+
+- Canonical plan `request_input` now has a durable Worker question wait/resume path. The question Item and `item.started` event are Web-parser-compatible with `taskId = null`, and the question ID is Turn-bound as `question:<turnId>:<planCallId>:<planRevision>:<localId>`.
+- Resume requires exact `plan.command`/`plan.revision` lineage. The current-plan replan gate ignores stale answers so an old observation cannot repeat a command; missing current-plan control evidence remains fail-closed.
+- Focused Worker validation passed **220/220** tests; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Formal P0-P7 acceptance remains **1/8 (12.5%)**.
+- Boundary: live PostgreSQL/RLS, queue delivery, process restart recovery, and end-to-end production evidence remain unverified. No schema, Web, or unsafe-orphan scope is claimed; P8-74 remains a candidate.

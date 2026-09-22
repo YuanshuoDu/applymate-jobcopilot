@@ -12,7 +12,7 @@ import type { ContextCompactionHook, ContextCompactionSnapshotLoader } from "../
 import type { SteeringMarkerContext } from "../context/steering-marker-store.js"
 import type { SteeringMarkerPayload } from "../context/steering-marker.js"
 
-export type TurnEngineItemType = "agent_message" | "reasoning_summary" | "tool_call" | "tool_result" | "error"
+export type TurnEngineItemType = "agent_message" | "reasoning_summary" | "tool_call" | "tool_result" | "question" | "error"
 export type TurnEngineItemPhase = "commentary" | "final_answer" | null
 export type TurnEngineItemStatus = "started" | "streaming" | "completed" | "failed" | "interrupted"
 
@@ -64,6 +64,27 @@ export type TurnEngineToolResult = {
   readonly errorCode: string | null
 }
 
+export type TurnEngineQuestionOption = {
+  readonly value: string
+  readonly label: string
+}
+
+export type TurnEngineQuestionWait = {
+  readonly turnId: string
+  readonly questionId: string
+  readonly toolCallId: string
+  readonly question: string
+  readonly options: readonly TurnEngineQuestionOption[]
+  readonly planCallId: string
+  readonly localId: string
+  readonly goalRevision: number
+  readonly planRevision: number
+}
+
+export function canonicalQuestionId(turnId: string, planCallId: string, planRevision: number, localId: string): string {
+  return `question:${turnId}:${planCallId}:${planRevision}:${localId}`
+}
+
 /** Server-owned result for executing an accepted plan after its proposal receipt. */
 export type TurnEnginePlanExecutionHookResult = {
   readonly observations: readonly { readonly id: string; readonly content: unknown }[]
@@ -71,6 +92,7 @@ export type TurnEnginePlanExecutionHookResult = {
     readonly status: "waiting_for_dependency" | "waiting_for_approval" | "waiting_for_user"
     readonly waitId?: string
     readonly errorCode?: string
+    readonly question?: TurnEngineQuestionWait
   }
 }
 
@@ -115,6 +137,12 @@ export type TurnEngineStore = {
     now: Date
   }): Promise<void>
   waitForUser?(input: { owner: ExecutionOwnerFence; now: Date }): Promise<void>
+  createQuestionWait?(input: {
+    owner: ExecutionOwnerFence
+    stepId: string
+    now: Date
+    question: TurnEngineQuestionWait
+  }): Promise<{ itemId: string; turnRevision: number }>
   createItem(input: {
     owner: ExecutionOwnerFence
     itemId: string
@@ -241,6 +269,7 @@ export type TurnEngineResult = {
   readonly stepCount: number
   readonly toolCallCount: number
   readonly waitId?: string
+  readonly question?: TurnEngineQuestionWait
   readonly finalItemId?: string
   /** Server-owned projection of the verified final response for completed turns. */
   readonly finalText?: string

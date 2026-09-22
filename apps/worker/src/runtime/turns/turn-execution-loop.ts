@@ -9,11 +9,12 @@ import { snapshotEvidence, verifyCandidateFinal } from "../verifier.js"
 import { buildModelRequest } from "./turn-engine-messages.js"
 import { runModelStep, type ModelStepResult } from "./turn-engine-model.js"
 import { findToolObservation, findToolResultObservation, stableJson } from "./turn-engine-replay.js"
-import { TurnEngineError, toRepositoryJson, type TurnEngineResult, type TurnEngineStep, type TurnEngineToolCall, type TurnEngineToolResult } from "./turn-engine-types.js"
+import { canonicalQuestionId, TurnEngineError, toRepositoryJson, type TurnEngineQuestionWait, type TurnEngineResult, type TurnEngineStep, type TurnEngineStore, type TurnEngineToolCall, type TurnEngineToolResult } from "./turn-engine-types.js"
 import { executeToolWithItems, publishCommentary, publishFinalResponse, publishReasoningSummary, TurnExecutionEventWriter } from "./turn-execution-events.js"
 import type { TurnExecutionOptions } from "./turn-execution-types.js"
 import { assertExecutionAlive, assertModelAllowance, canEmitTurnCompleted, canPersistFinalResponse, makeExecutionId, resumedBudgetLimits, totalTurnUsage, turnErrorCode, updateExecutionStep } from "./turn-engine-helpers.js"
-import { parsePlanRevisionReceipt, planRevisionObservation, type PlanRevisionReceipt } from "../planning/plan-revision-receipt.js"
+import { isQuestionText, parseQuestionOptions, QUESTION_MAX_TEXT_BYTES } from "./turn-question-wait-store.js"
+import { parsePlanRevisionEvent, parsePlanRevisionReceipt, planRevisionObservation, type PlanRevisionReceipt } from "../planning/plan-revision-receipt.js"
 import { goalRevisionObservation, parseGoalRevisionOutput, type GoalRevisionReceipt } from "../planning/goal-revision-receipt.js"
 import { verifyPlanCompletion } from "../planning/plan-completion-verifier.js"
 import { buildPlanCompletionFeedback, buildPlanCompletionFeedbackEvent, currentPlanId, MAX_PLAN_COMPLETION_RECOVERY_ATTEMPTS, planCompletionFeedbackIdempotencyKey, PLAN_COMPLETION_FEEDBACK_EVENT_TYPE, planCompletionRecoveryCount } from "../planning/plan-completion-feedback.js"
@@ -89,6 +90,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
       let stepOutput: ModelStepResult | null = null
       try {
         const obligationBeforeCompaction = activeReplanObligation(options, snapshot)
+        const questionReplanBeforeCompaction = questionAnswerReplanPresent(options, snapshot)
         snapshot = (await runContextCompaction({
           hook: options.contextCompaction, loadSnapshot: options.contextCompactionLoadSnapshot, identity: options.identity, scope: options.scope,
           sessionId: options.identity.sessionId, turnId: options.identity.turnId, stepId: step.id,
@@ -96,7 +98,9 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           append: (payload, key) => writer.append("context.compaction", step.id, null, payload, key),
         })).snapshot
         const obligationAfterCompaction = activeReplanObligation(options, snapshot)
+        const questionReplanAfterCompaction = questionAnswerReplanPresent(options, snapshot)
         if (obligationBeforeCompaction && (!obligationAfterCompaction || stableJson(obligationBeforeCompaction) !== stableJson(obligationAfterCompaction))) throw new TurnEngineError("invalid_output", "Context compaction dropped the active replan obligation")
+        if (questionReplanBeforeCompaction && !questionReplanAfterCompaction) throw new TurnEngineError("invalid_output", "Context compaction dropped the answered question")
         const context = await options.contextBuilder.build({
           scope: options.scope, identity: options.identity, stepId: step.id, snapshot,
           rootInputId: ordinal === 0 ? options.rootInputId : undefined, now: now(),
@@ -113,7 +117,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         if (newlyObservedMarkers.length > 0) steeringMarkerState = rememberSteeringMarkers(steeringMarkerState, newlyObservedMarkers)
         inputThroughSequence = context.inputThroughSequence
         consumedInputIds = context.consumedInputIds
-        const replanRequired = obligationAfterCompaction !== undefined
+        const replanRequired = obligationAfterCompaction !== undefined || questionReplanAfterCompaction
         const receipt = buildCognitiveAgendaReceipt({
           sessionId: options.identity.sessionId, turnId: options.identity.turnId, taskId: options.identity.taskId, stepId: step.id,
           agenda: buildCognitiveActionAgenda(context, { replanRequired, freshSteering: replanRequired && freshSteering }),
@@ -129,7 +133,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           context, model: options.model, tools: options.tools,
           sessionId: options.identity.sessionId, turnId: options.identity.turnId, stepId: step.id,
           taskId: options.identity.taskId, userId: options.identity.userId, signal, continuation,
-          replanRequired: obligationAfterCompaction !== undefined,
+          replanRequired,
           freshSteering,
         })
           assertModelAllowance(budget.snapshot())
@@ -137,14 +141,16 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         const output = await runModelStep(options.model, request, options.validateToolArguments)
         stepOutput = output; reservation.settle(output.usage ?? { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }); continuation = output.continuation ?? undefined
         const obligation = activeReplanObligation(options, snapshot)
-        const replanBatchAllowed = replanToolBatchAllowed(output.toolCalls, obligation, freshSteering)
+        const questionReplanRequired = questionAnswerReplanPresent(options, snapshot)
+        const replanBatchAllowed = replanToolBatchAllowed(output.toolCalls, obligation, freshSteering, questionReplanRequired)
         await writer.append(
           "model.usage", step.id, null,
           { provider: output.provider, model: output.model, usage: output.usage, taskId: options.identity.taskId },
           `model-usage:${step.id}`,
         )
         if (!replanBatchAllowed) {
-          snapshot = await rejectReplanOutput(options, writer, step, output, snapshot, obligation!, now)
+          if (obligation) snapshot = await rejectReplanOutput(options, writer, step, output, snapshot, obligation, now)
+          else await rejectForcedReplanOutput(options, writer, step, output, now)
           continuation = undefined
           continue
         }
@@ -180,9 +186,20 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
             `step-completed:${step.id}`,
           )
           if (wait) {
-            if (wait.status === "waiting_for_user") await options.store.waitForUser?.({ identity: options.identity, now: now() })
+            if (wait.status === "waiting_for_user") {
+              const questionStore = options.store as TurnExecutionOptions["store"] & Pick<TurnEngineStore, "createQuestionWait">
+              if (wait.question && questionStore.createQuestionWait) await questionStore.createQuestionWait({ owner: options.identity, stepId: step.id, now: now(), question: wait.question })
+              else await options.store.waitForUser?.({ identity: options.identity, now: now() })
+            }
             return { ...wait, stepCount: steps, toolCallCount: toolCalls }
           }
+          continue
+        }
+        if (replanRequired) {
+          const currentObligation = activeReplanObligation(options, snapshot)
+          if (currentObligation) snapshot = await rejectReplanOutput(options, writer, step, output, snapshot, currentObligation, now)
+          else await rejectForcedReplanOutput(options, writer, step, output, now)
+          continuation = undefined
           continue
         }
         await updateExecutionStep(options, {
@@ -330,6 +347,102 @@ function waitingJoinPresent(snapshot: StepContextSnapshot): boolean {
   })
 }
 
+type QuestionAnswerLineage = { readonly questionId: string; readonly planCallId: string; readonly localId: string; readonly question: string; readonly goalRevision: number; readonly planRevision: number }
+
+function plainRow(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null
+}
+
+function exactKeys(value: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): boolean {
+  const allowed = new Set([...required, ...optional])
+  return required.every(key => Object.hasOwn(value, key)) && Object.keys(value).every(key => allowed.has(key))
+}
+
+function questionAnswerLineage(options: TurnExecutionOptions, content: Record<string, unknown>): QuestionAnswerLineage {
+  const goalRevision = options.goalRef?.get()?.revision ?? 1
+  if (content.kind !== "question_answer" || !exactKeys(content, ["kind", "questionId", "toolCallId", "question", "answer", "answerAvailable", "planCallId", "localId", "goalRevision", "planRevision"]) ||
+    content.answerAvailable !== true || !isQuestionText(content.questionId, 256) || !isQuestionText(content.toolCallId, 256) ||
+    !isQuestionText(content.question, QUESTION_MAX_TEXT_BYTES) || !isQuestionText(content.answer, 20 * 1024) ||
+    !isQuestionText(content.planCallId, 256) || !isQuestionText(content.localId, 128) ||
+    !Number.isSafeInteger(content.goalRevision) || Number(content.goalRevision) < 1 || !Number.isSafeInteger(content.planRevision) || Number(content.planRevision) < 1 ||
+    content.toolCallId !== content.planCallId || content.goalRevision !== goalRevision ||
+    content.questionId !== canonicalQuestionId(options.identity.turnId, content.planCallId, Number(content.planRevision), content.localId)) throw new TurnEngineError("invalid_output", "Answered question has invalid server lineage")
+  return { questionId: content.questionId, planCallId: content.planCallId, localId: content.localId, question: content.question, goalRevision: Number(content.goalRevision), planRevision: Number(content.planRevision) }
+}
+
+function assertQuestionAnswerLineage(options: TurnExecutionOptions, snapshot: StepContextSnapshot, content: Record<string, unknown>): QuestionAnswerLineage {
+  const lineage = questionAnswerLineage(options, content)
+  const controlId = `plan-control:${lineage.planCallId}:${lineage.localId}`
+  const controls = snapshot.toolObservations.filter(observation => observation.id === controlId)
+  const conflictingControls = snapshot.toolObservations.filter(observation => observation.id.startsWith(`${controlId}:`))
+  if (controls.length !== 1 || conflictingControls.length > 0) throw new TurnEngineError("invalid_output", "Answered question plan control lineage is missing or ambiguous")
+  const control = plainRow(controls[0]!.content)
+  if (!control || !exactKeys(control, ["kind", "localId", "status", "question"], ["approvalBoundary"]) || control.kind !== "plan_control" ||
+    control.localId !== lineage.localId || control.status !== "waiting_for_user" || control.question !== lineage.question ||
+    (Object.hasOwn(control, "approvalBoundary") && !isQuestionText(control.approvalBoundary, 1_000))) throw new TurnEngineError("invalid_output", "Answered question plan control is conflicting")
+  const revisionId = `plan-revision:${lineage.planCallId}`
+  const revisions = snapshot.toolObservations.filter(observation => {
+    const row = plainRow(observation.content)
+    return observation.id === revisionId || row?.kind === "plan_revision" && row.planCallId === lineage.planCallId
+  })
+  const matchingRevisions = revisions.filter(observation => {
+    const row = plainRow(observation.content)
+    return observation.id === revisionId && row?.goalRevision === lineage.goalRevision && row.planRevision === lineage.planRevision &&
+      exactKeys(row, ["kind", "planCallId", "goalRevision", "planRevision", "basedOnPlanRevision"], ["proposalHash"])
+  })
+  if (revisions.length !== 1 || matchingRevisions.length !== 1) throw new TurnEngineError("invalid_output", "Answered question plan revision lineage is missing or ambiguous")
+  return lineage
+}
+
+function currentServerPlan(options: TurnExecutionOptions, snapshot: StepContextSnapshot, planCallId: string): PlanRevisionReceipt {
+  const expectedGoalRevision = options.goalRef?.get()?.revision ?? 1
+  if (!Number.isSafeInteger(expectedGoalRevision) || expectedGoalRevision < 1) throw new TurnEngineError("invalid_output", "Answered question has no current server plan")
+  const revisionId = `plan-revision:${planCallId}`
+  const revisions = snapshot.toolObservations.filter(observation => {
+    const row = plainRow(observation.content)
+    return observation.id === revisionId || row?.kind === "plan_revision" && row.planCallId === planCallId
+  })
+  if (revisions.length !== 1) throw new TurnEngineError("invalid_output", "Current server plan revision is missing or ambiguous")
+  const observation = revisions[0]!
+  const row = plainRow(observation.content)
+  if (!row || observation.id !== revisionId || row.kind !== "plan_revision" || row.planCallId !== planCallId) throw new TurnEngineError("invalid_output", "Current server plan revision is conflicting")
+  const { kind: _kind, ...metadata } = row
+  const revision = parsePlanRevisionEvent(metadata)
+  if (!revision || revision.planCallId !== planCallId || revision.goalRevision !== expectedGoalRevision) throw new TurnEngineError("invalid_output", "Current server plan revision is invalid")
+  return revision
+}
+
+function questionAnswerReplanPresent(options: TurnExecutionOptions, snapshot: StepContextSnapshot): boolean {
+  let found = false
+  const seenQuestionIds = new Set<string>()
+  const activePlanCallId = currentPlanId(snapshot.toolObservations)
+  const currentGoalRevision = options.goalRef?.get()?.revision ?? 1
+  const hasQuestionAnswer = snapshot.toolObservations.some(observation => plainRow(observation.content)?.kind === "question_answer")
+  const currentPlan = activePlanCallId !== null && hasQuestionAnswer ? currentServerPlan(options, snapshot, activePlanCallId) : null
+  for (const observation of snapshot.toolObservations) {
+    const content = plainRow(observation.content)
+    if (!content) continue
+    if (content.kind !== "question_answer") {
+      if (Object.hasOwn(content, "questionId") || Object.hasOwn(content, "answerAvailable")) throw new TurnEngineError("invalid_output", "Answered question context has an invalid kind")
+      continue
+    }
+    if (!isQuestionText(content.questionId, 256) || !isQuestionText(content.planCallId, 256) || content.answerAvailable !== true ||
+      !Number.isSafeInteger(content.goalRevision) || Number(content.goalRevision) < 1) throw new TurnEngineError("invalid_output", "Answered question has invalid basic shape")
+    if (currentPlan === null || content.planCallId !== currentPlan.planCallId) {
+      if (currentPlan === null && Number(content.goalRevision) >= currentGoalRevision) throw new TurnEngineError("invalid_output", "Current-goal question answer has no active server plan")
+      if (seenQuestionIds.has(content.questionId)) throw new TurnEngineError("invalid_output", "Answered question context is duplicated")
+      seenQuestionIds.add(content.questionId)
+      continue
+    }
+    const lineage = assertQuestionAnswerLineage(options, snapshot, content)
+    const questionId = typeof content.questionId === "string" ? content.questionId : null
+    if (questionId !== null && seenQuestionIds.has(questionId)) throw new TurnEngineError("invalid_output", "Answered question context is duplicated")
+    if (questionId !== null) seenQuestionIds.add(questionId)
+    if (lineage.planCallId === currentPlan.planCallId && lineage.planRevision === currentPlan.planRevision) found = true
+  }
+  return found
+}
+
 function activeReplanObligation(options: TurnExecutionOptions, snapshot: typeof options.snapshot): ReplanObligation | undefined {
   if (!replanSignalPresent(snapshot) && !waitingJoinPresent(snapshot)) return undefined
   const expectedGoalRevision = options.goalRef?.get()?.revision
@@ -365,6 +478,15 @@ async function rejectReplanOutput(options: TurnExecutionOptions, writer: TurnExe
   return appendReplanFeedback(options, writer, snapshot, obligation)
 }
 
+async function rejectForcedReplanOutput(options: TurnExecutionOptions, writer: TurnExecutionEventWriter, step: TurnEngineStep, output: ModelStepResult, now: () => Date): Promise<void> {
+  await updateExecutionStep(options, {
+    stepId: step.id, status: "completed", finishReason: output.finishReason, errorCode: "replan_required",
+    inputTokens: output.usage?.inputTokens ?? 0, outputTokens: output.usage?.outputTokens ?? 0,
+    estimatedCostUsd: output.usage?.estimatedCostUsd ?? 0, now: now(),
+  })
+  await writer.append("step.completed", step.id, null, { stepId: step.id, status: "completed", toolCallCount: output.toolCalls.length, errorCode: "replan_required", taskId: options.identity.taskId }, `step-completed:${step.id}`)
+}
+
 function hasFreshSteering(context: StepContext, consumedInputIds: readonly string[]): boolean {
   if (context.steeringMarkerControl && (context.steeringMarkerControl.activeInputIds.length > 0 || context.steeringMarkerControl.newlyObservedInputIds.length > 0)) return true
   const consumedBeforeBuild = new Set(consumedInputIds)
@@ -378,8 +500,8 @@ function hasFreshSteering(context: StepContext, consumedInputIds: readonly strin
   })
 }
 
-function replanToolBatchAllowed(toolCalls: readonly TurnEngineToolCall[], obligation: ReplanObligation | undefined, freshSteering: boolean): boolean {
-  if (obligation === undefined) return true
+function replanToolBatchAllowed(toolCalls: readonly TurnEngineToolCall[], obligation: ReplanObligation | undefined, freshSteering: boolean, questionReplanRequired = false): boolean {
+  if (obligation === undefined && !questionReplanRequired) return true
   if (toolCalls.length !== 1) return false
   const name = toolCalls[0]?.name
   return name === "agent.plan.propose" || (freshSteering && name === "agent.goal.update")
@@ -715,7 +837,9 @@ async function executePlanHook(
     if (value.wait.waitId !== undefined && (typeof value.wait.waitId !== "string" || value.wait.waitId.trim().length === 0 || value.wait.waitId.length > 256)) throw new TurnEngineError("invalid_output", "Plan execution hook returned an invalid wait id")
     if (value.wait.status === "waiting_for_dependency" && (typeof value.wait.waitId !== "string" || value.wait.waitId.trim().length === 0)) throw new TurnEngineError("invalid_output", "Dependency waits require a wait id")
     if (value.wait.errorCode !== undefined && (typeof value.wait.errorCode !== "string" || value.wait.errorCode.trim().length === 0 || value.wait.errorCode.length > 256)) throw new TurnEngineError("invalid_output", "Plan execution hook returned an invalid wait code")
-    wait = { status: value.wait.status, stepCount: 0, toolCallCount: 0, ...(value.wait.waitId ? { waitId: value.wait.waitId } : {}), ...(value.wait.errorCode ? { errorCode: value.wait.errorCode } : {}) }
+    const question = value.wait.question === undefined ? undefined : parseQuestionWait(value.wait.question, options.identity.turnId)
+    if (value.wait.question !== undefined && (!question || value.wait.status !== "waiting_for_user" || value.wait.waitId !== question.questionId)) throw new TurnEngineError("invalid_output", "Plan execution hook returned an invalid question wait")
+    wait = { status: value.wait.status, stepCount: 0, toolCallCount: 0, ...(value.wait.waitId ? { waitId: value.wait.waitId } : {}), ...(value.wait.errorCode ? { errorCode: value.wait.errorCode } : {}), ...(question ? { question } : {}) }
   }
   return { observations, wait }
 }
@@ -728,4 +852,18 @@ function dependencyWaitReceipt(value: unknown): DependencyWaitReceipt | null {
   if (record.status !== "waiting" || typeof record.waitId !== "string" || record.waitId.trim().length === 0 || typeof record.deadlineAt !== "string" || record.deadlineAt.trim().length === 0 || !Array.isArray(record.matchedTaskIds)) return null
   if (!record.matchedTaskIds.every(item => typeof item === "string" && item.trim().length > 0)) return null
   return { waitId: record.waitId, deadlineAt: record.deadlineAt, matchedTaskIds: record.matchedTaskIds }
+}
+
+function parseQuestionWait(value: unknown, expectedTurnId: string): TurnEngineQuestionWait | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null
+  const row = value as Record<string, unknown>
+  if (!isQuestionText(row.turnId, 256) || row.turnId !== expectedTurnId || !isQuestionText(row.questionId, 256) || !isQuestionText(row.toolCallId, 256)
+    || !isQuestionText(row.question, QUESTION_MAX_TEXT_BYTES)
+    || !isQuestionText(row.planCallId, 256) || !isQuestionText(row.localId, 128)
+    || !Number.isSafeInteger(row.goalRevision) || Number(row.goalRevision) < 1 || !Number.isSafeInteger(row.planRevision) || Number(row.planRevision) < 1
+    || !parseQuestionOptions(row.options)) return null
+  if (row.questionId !== canonicalQuestionId(expectedTurnId, row.planCallId, Number(row.planRevision), row.localId)) return null
+  const options = parseQuestionOptions(row.options)
+  if (!options) return null
+  return { turnId: expectedTurnId, questionId: row.questionId, toolCallId: row.toolCallId, question: row.question, options, planCallId: row.planCallId, localId: row.localId, goalRevision: Number(row.goalRevision), planRevision: Number(row.planRevision) }
 }

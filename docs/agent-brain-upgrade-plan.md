@@ -1007,3 +1007,11 @@ Commit `189662e0` extends `releaseTurnLease` with a `waiting_for_approval` owner
 Focused lease, turn-queue, and wakeup validation passed **52/52**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. P8-73 is a candidate hardening slice; formal P0-P7 acceptance remains **1/8 (12.5%)**.
 
 Live PostgreSQL/RLS, cross-process queue/restart, complete wakeup, and production E2E remain unverified.
+
+## P8-74 update
+
+P8-74 is a candidate canonical `request_input` question wait/resume slice. The Worker persists a Web-parser-compatible question Item and `item.started` event with `taskId = null`; the question ID is Turn-bound (`question:<turnId>:<planCallId>:<planRevision>:<localId>`). Resume evidence requires exact `plan.command`/`plan.revision` lineage, and the replan gate only consumes an answer for the current plan so stale answers cannot repeat a command. Missing current-plan control evidence remains fail-closed.
+
+Focused Worker validation passed **220/220 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Formal P0-P7 acceptance remains **1/8 (12.5%)**.
+
+Live PostgreSQL/RLS, queue delivery, process restart recovery, and end-to-end production evidence remain unverified. P8-74 remains a candidate; no schema, Web, or unsafe-orphan scope is claimed.

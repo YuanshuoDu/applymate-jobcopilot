@@ -877,6 +877,90 @@ describe("owner-agnostic turn execution loop", () => {
     expect(child.stepStatuses).toContain("waiting_for_tool")
   })
 
+  it("projects a canonical question through the atomic store seam", async () => {
+    const question = { turnId: "turn-1", questionId: "question:turn-1:plan-1:1:ask", toolCallId: "plan-1", question: "Where?", options: [], planCallId: "plan-1", localId: "ask", goalRevision: 1, planRevision: 1 } as const
+    const hook: NonNullable<TurnExecutionOptions["executePlan"]> = async () => ({ observations: [], wait: { status: "waiting_for_user", waitId: question.questionId, errorCode: "plan_request_input", question } })
+    const root = fixture(identity("turn", "root-1"), undefined, hook)
+    const createQuestionWait = vi.fn(async () => ({ itemId: `agent-wait:question:${question.questionId}`, turnRevision: 1 }))
+    const waitForUser = vi.fn(async () => undefined)
+    root.options = { ...root.options, store: { ...root.options.store, createQuestionWait, waitForUser } as typeof root.options.store }
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "waiting_for_user", waitId: question.questionId, question })
+    expect(createQuestionWait).toHaveBeenCalledWith(expect.objectContaining({ owner: root.options.identity, stepId: expect.any(String), question }))
+    expect(waitForUser).not.toHaveBeenCalled()
+  })
+
+  it("fails closed when a stale answer has no matching durable plan revision", async () => {
+    const questionId = "question:turn-1:plan-1:1:ask"
+    const observations = [
+      { id: `question-answer:${questionId}`, content: { kind: "question_answer", questionId, toolCallId: "plan-1", question: "Where?", answer: "Dublin", answerAvailable: true, planCallId: "plan-1", localId: "ask", goalRevision: 1, planRevision: 1 } },
+      { id: "plan-control:plan-1:ask", content: { kind: "plan_control", localId: "ask", status: "waiting_for_user", question: "Where?" } },
+    ]
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, observations)
+    let executed = 0
+    const executeTool = root.options.executeTool
+    root.options = { ...root.options, maxSteps: 1, executeTool: async input => { executed += 1; return executeTool(input) } }
+    await expect(runTurnExecutionLoop(root.options)).resolves.toMatchObject({ status: "failed" })
+    expect(executed).toBe(0)
+    expect(root.requests).toHaveLength(0)
+  })
+
+  it("consumes an answered question after a newer server plan is accepted", async () => {
+    const questionId = "question:turn-1:plan-1:1:ask"
+    const observations = [
+      { id: `question-answer:${questionId}`, content: { kind: "question_answer", questionId, toolCallId: "plan-1", question: "Where?", answer: "Dublin", answerAvailable: true, planCallId: "plan-1", localId: "ask", goalRevision: 1, planRevision: 1 } },
+      { id: "plan-revision:plan-1", content: { kind: "plan_revision", planCallId: "plan-1", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null } },
+      { id: "plan-revision:plan-2", content: { kind: "plan_revision", planCallId: "plan-2", goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1 } },
+    ]
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, observations)
+    let executed = 0
+    const executeTool = root.options.executeTool
+    root.options = { ...root.options, maxSteps: 1, executeTool: async input => { executed += 1; return executeTool(input) } }
+    await expect(runTurnExecutionLoop(root.options)).resolves.toMatchObject({ status: "failed" })
+    expect(executed).toBe(1)
+    expect(root.requests).toHaveLength(1)
+  })
+
+  it("fails closed when a question answer snapshot has the wrong kind", async () => {
+    const questionId = "question:turn-1:plan-1:1:ask"
+    const observations = [
+      { id: `question-answer:${questionId}`, content: { kind: "plan_command", questionId, toolCallId: "plan-1", question: "Where?", answer: "Dublin", answerAvailable: true, planCallId: "plan-1", localId: "ask", goalRevision: 1, planRevision: 1 } },
+      { id: "plan-control:plan-1:ask", content: { kind: "plan_control", localId: "ask", status: "waiting_for_user", question: "Where?" } },
+      { id: "plan-revision:plan-1", content: { kind: "plan_revision", planCallId: "plan-1", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null } },
+    ]
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, observations)
+    let executed = 0
+    const executeTool = root.options.executeTool
+    root.options = { ...root.options, maxSteps: 1, executeTool: async input => { executed += 1; return executeTool(input) } }
+    await expect(runTurnExecutionLoop(root.options)).resolves.toMatchObject({ status: "failed", errorCode: "invalid_output" })
+    expect(executed).toBe(0)
+    expect(root.requests).toHaveLength(0)
+  })
+
+  it("fails closed for a current-goal question answer without an active plan", async () => {
+    const questionId = "question:turn-1:plan-1:1:ask"
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, [
+      { id: `question-answer:${questionId}`, content: { kind: "question_answer", questionId, toolCallId: "plan-1", question: "Where?", answer: "Dublin", answerAvailable: true, planCallId: "plan-1", localId: "ask", goalRevision: 1, planRevision: 1 } },
+    ])
+    await expect(runTurnExecutionLoop(root.options)).resolves.toMatchObject({ status: "failed", errorCode: "invalid_output" })
+    expect(root.requests).toHaveLength(0)
+  })
+
+  it("ignores an old-goal question answer when no active plan remains", async () => {
+    const questionId = "question:turn-1:plan-1:1:ask"
+    const goalRef = replanGoalRef()
+    goalRef.update({ ...replanGoal, revision: 2 })
+    const root = fixture(identity("turn", "root-1"), undefined, undefined, [
+      { id: `question-answer:${questionId}`, content: { kind: "question_answer", questionId, toolCallId: "plan-1", question: "Where?", answer: "Dublin", answerAvailable: true, planCallId: "plan-1", localId: "ask", goalRevision: 1, planRevision: 1 } },
+    ], false, undefined, undefined, false, goalRef)
+    let executed = 0
+    const executeTool = root.options.executeTool
+    root.options = { ...root.options, maxSteps: 1, executeTool: async input => { executed += 1; return executeTool(input) } }
+    await expect(runTurnExecutionLoop(root.options)).resolves.toMatchObject({ status: "failed" })
+    expect(executed).toBe(1)
+    expect(root.requests).toHaveLength(1)
+  })
+
   it("persists validated plan observations as durable events", async () => {
     const hook: NonNullable<TurnExecutionOptions["executePlan"]> = async () => ({ observations: [{ id: "plan-observation", content: { marker: "durable" } }] })
     const root = fixture(identity("turn", "root-1"), undefined, hook)

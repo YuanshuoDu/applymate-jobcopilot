@@ -535,6 +535,68 @@ describe("loadCanonicalTurnState", () => {
     expect(stepQuery?.[0]).toContain('"taskId" IS NULL OR "taskId" = $3')
   })
 
+  it("projects a completed canonical question answer into the next context", async () => {
+    const questionId = "question:turn-1:plan-1:1:ask"
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      items: [{
+        id: `agent-wait:question:${questionId}`, taskId: "root-1", type: "question", status: "completed", revision: 1,
+        content: { waitKind: "question", questionId, stage: "plan", question: "Where?", options: [], toolCallId: "plan-1", pending: true, answer: "Dublin", answerAvailable: true },
+      }],
+      events: [
+        { type: "plan.revision", payload: { planCallId: "plan-1", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null } },
+        { type: "plan.command", payload: { planCallId: "plan-1", planRevision: 1, observationId: "plan-control:plan-1:ask", content: { kind: "plan_control", localId: "ask", status: "waiting_for_user", question: "Where?" } } },
+      ],
+    })
+    const value = await loadCanonicalTurnState(fake, lease)
+    expect(value.snapshot.toolObservations).toContainEqual({ id: `question-answer:${questionId}`, content: expect.objectContaining({ kind: "question_answer", questionId, answer: "Dublin", answerAvailable: true }) })
+    const itemQuery = fake.client.query.mock.calls.find(([sql]) => typeof sql === "string" && sql.includes('FROM "agent_items"'))?.[0]
+    expect(itemQuery).toContain("'question'")
+  })
+
+  it("fails closed when a question item is polluted with private plan metadata", async () => {
+    const questionId = "question:turn-1:plan-1:1:ask"
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      items: [{ id: `agent-wait:question:${questionId}`, taskId: "root-1", type: "question", status: "completed", revision: 1,
+        content: { waitKind: "question", questionId, stage: "plan", question: "Where?", options: [], toolCallId: "plan-1", pending: true, answer: "Dublin", answerAvailable: true, planCallId: "spoof" } }],
+      events: [{ type: "plan.revision", payload: { planCallId: "plan-1", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null } },
+        { type: "plan.command", payload: { planCallId: "plan-1", planRevision: 1, observationId: "plan-control:plan-1:ask", content: { kind: "plan_control", localId: "ask", status: "waiting_for_user", question: "Where?" } } }],
+    })
+    await expect(loadCanonicalTurnState(fake, lease)).rejects.toThrow("question_answer_replay_uncertain")
+  })
+
+  it("fails closed when question metadata cannot be mapped uniquely to durable plan receipts", async () => {
+    const questionId = "question:turn-1:plan-1:1:ask"
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      items: [{ id: `agent-wait:question:${questionId}`, taskId: "root-1", type: "question", status: "completed", revision: 1,
+        content: { waitKind: "question", questionId, stage: "plan", question: "Where?", options: [], toolCallId: "plan-1", pending: true, answer: "Dublin", answerAvailable: true } }],
+    })
+    await expect(loadCanonicalTurnState(fake, lease)).rejects.toThrow("question_answer_replay_uncertain")
+  })
+
+  it("rejects an answered value outside the persisted question options", async () => {
+    const questionId = "question:turn-1:plan-1:1:ask"
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      items: [{ id: `agent-wait:question:${questionId}`, taskId: "root-1", type: "question", status: "completed", revision: 1,
+        content: { waitKind: "question", questionId, stage: "plan", question: "Where?", options: [{ value: "dublin", label: "Dublin" }], toolCallId: "plan-1", pending: true, answer: "Berlin", answerAvailable: true } }],
+      events: [{ type: "plan.revision", payload: { planCallId: "plan-1", goalRevision: 1, planRevision: 1, basedOnPlanRevision: null } },
+        { type: "plan.command", payload: { planCallId: "plan-1", planRevision: 1, observationId: "plan-control:plan-1:ask", content: { kind: "plan_control", localId: "ask", status: "waiting_for_user", question: "Where?" } } }],
+    })
+    await expect(loadCanonicalTurnState(fake, lease)).rejects.toThrow("question_answer_replay_uncertain")
+  })
+
+  it("does not treat a non-plan question item as a canonical plan answer", async () => {
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      items: [{ id: "agent-wait:question:gmail-oauth", taskId: "root-1", type: "question", status: "completed", content: { waitKind: "question", questionId: "gmail-oauth", stage: "oauth", question: "Reconnect Gmail", answer: "done", answerAvailable: true } }],
+    })
+    const value = await loadCanonicalTurnState(fake, lease)
+    expect(value.snapshot.toolObservations.some(item => item.id === "question-answer:gmail-oauth")).toBe(false)
+  })
+
   it("projects a consumed wait outcome into the next root context", async () => {
     const wait: { id: string; userId: string; sessionId: string; turnId: string; parentTaskId: string; stepId: string; targetTaskIds: string[]; mode: string; status: string; matchedTaskIds: string[]; result: Record<string, unknown>; suspendedAt: Date; consumedAt: Date | null } = { id: "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "root-1", stepId: "step-1", targetTaskIds: ["child-1"], mode: "all", status: "ready", matchedTaskIds: ["child-1"], result: { request: { mode: "all" } }, suspendedAt: new Date("2026-09-09T00:00:00.000Z"), consumedAt: null }
     const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {

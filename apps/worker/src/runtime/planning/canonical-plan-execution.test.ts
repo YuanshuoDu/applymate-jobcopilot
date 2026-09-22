@@ -972,7 +972,10 @@ describe("createCanonicalPlanExecutionFactory", () => {
     const failed = await failedHook(input(output(proposal([use("read")]))))
     expect(failed.observations[0]?.content).toMatchObject({ status: "failed", errorCode: "policy_denied" })
     const waiting = await fixture()(input(output(proposal([{ ...baseNode, localId: "ask", kind: "request_input", objective: "Need location", question: "Where?", approvalBoundary: "before submission" } as PlanProposal["nodes"][number]]))))
-    expect(waiting.wait).toMatchObject({ status: "waiting_for_user", errorCode: "plan_request_input" })
+    expect(waiting.wait).toMatchObject({
+      status: "waiting_for_user", waitId: "question:turn-1:proposal-1:1:ask", errorCode: "plan_request_input",
+      question: { turnId: "turn-1", questionId: "question:turn-1:proposal-1:1:ask", toolCallId: "proposal-1", planCallId: "proposal-1", localId: "ask", goalRevision: 1, planRevision: 1, options: [] },
+    })
     expect(waiting.observations[0]?.content).toMatchObject({ status: "waiting_for_user", approvalBoundary: "before submission" })
     expect(waiting.observations).toHaveLength(1)
   })

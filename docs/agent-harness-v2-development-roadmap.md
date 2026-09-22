@@ -2888,3 +2888,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused lease, turn-queue, and wakeup validation passed **52/52**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, cross-process queue delivery and restart, complete wakeup, and production E2E remain unverified. P8-73 remains a candidate hardening slice.
+
+## 160. P8-74 — Canonical `request_input` question wait/resume
+
+**Candidate status/date (2026-09-22):** P8-74 is recorded as a candidate canonical plan question wait/resume slice; formal P0-P7 acceptance remains **1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Canonical plan `request_input` now maps to a durable Worker question wait/resume contract. The question Item and `item.started` event remain Web-parser-compatible with `taskId = null`; its ID is Turn-bound as `question:<turnId>:<planCallId>:<planRevision>:<localId>`. Resume accepts only exact question lineage through the matching `plan.command` and `plan.revision`, and the current-plan replan gate ignores stale answers so an old observation cannot repeat a command. Missing current-plan control evidence fails closed.
+
+**Independent verification:** Focused Worker validation passed **220/220**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, queue delivery, process restart recovery, and end-to-end production evidence remain unverified. No schema, Web, or unsafe-orphan scope is claimed. P8-74 remains a candidate.

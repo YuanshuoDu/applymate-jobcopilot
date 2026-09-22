@@ -12,7 +12,7 @@ import { createPlanCommandReceipt, type PlanCommandReceipt } from "./plan-comman
 import { PlanRevisionRecoveryError, recoverPlanRevision, type PlanRevisionRecoveryDispatcher } from "./plan-revision-receipt.js"
 import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
 import { READ_ONLY_TOOL_NAMES, TOOL_RESULTS_READ_NAME } from "../tools/index.js"
-import type { TurnEnginePlanExecutionHook, TurnEnginePlanExecutionHookResult } from "../turns/turn-engine-types.js"
+import { canonicalQuestionId, type TurnEnginePlanExecutionHook, type TurnEnginePlanExecutionHookResult } from "../turns/turn-engine-types.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 import { visibleToolPolicy } from "../subagents/role-policy.js"
 import { validateRoleResult } from "../subagents/role-results.js"
@@ -650,6 +650,7 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
   return async input => {
     const baseError = (code: string): TurnEnginePlanExecutionHookResult => ({ observations: [failureObservation(input.call.id, code)] })
     try {
+      if (input.sessionId !== options.lease.sessionId || input.turnId !== options.lease.turnId || input.identity.sessionId !== options.lease.sessionId || input.identity.turnId !== options.lease.turnId) throw new CanonicalPlanError("invalid_plan_output")
       const goal = options.goalRef?.get() ?? options.goal
       if (goal.revision !== goalRevision) {
         currentPlanRevision = null
@@ -719,7 +720,29 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
         if (!replay) observations.push(controlObservation(input.call.id, executed.blocked))
         // request_input is a user question; approval waits come from ToolRouter policy decisions.
         return executed.blocked.kind === "request_input"
-          ? { observations: observations.slice(0, MAX_OBSERVATIONS), wait: { status: "waiting_for_user", errorCode: "plan_request_input" } }
+          ? (() => {
+              const questionId = canonicalQuestionId(options.lease.turnId, input.call.id, output.planRevision, executed.blocked.localId)
+              if (questionId.length > 256) throw new CanonicalPlanError("invalid_plan_output")
+              return {
+                observations: observations.slice(0, MAX_OBSERVATIONS),
+                wait: {
+                  status: "waiting_for_user" as const,
+                  waitId: questionId,
+                  errorCode: "plan_request_input",
+                  question: {
+                    turnId: options.lease.turnId,
+                    questionId,
+                    toolCallId: input.call.id,
+                    question: executed.blocked.question,
+                    options: [],
+                    planCallId: input.call.id,
+                    localId: executed.blocked.localId,
+                    goalRevision: goal.revision,
+                    planRevision: output.planRevision,
+                  },
+                },
+              }
+            })()
           : { observations: observations.slice(0, MAX_OBSERVATIONS) }
       }
       const wait = records.map(waitFrom).find(value => value !== undefined)

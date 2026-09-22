@@ -17,6 +17,8 @@ import { priorConversation } from "./canonical-steering-markers.js"
 import { STEERING_MARKER_EVENT_TYPE } from "./context/steering-marker.js"
 import { scopeCanonicalWaitProjections } from "./canonical-wait-scope.js"
 import type { PersistedTaskGraphEvent } from "./planning/plan-task-graph-adapter.js"
+import { isQuestionText, parseQuestionOptions, QUESTION_MAX_TEXT_BYTES } from "./turns/turn-question-wait-store.js"
+import { canonicalQuestionId } from "./turns/turn-engine-types.js"
 export type CanonicalTurnState = {
   readonly scope: TenantScope
   readonly goal: string
@@ -137,6 +139,62 @@ function observations(items: readonly Row[], events: readonly Row[], currentGoal
     }) }]
   })
 }
+type QuestionPlanMetadata = { readonly planCallId: string; readonly localId: string; readonly goalRevision: number; readonly planRevision: number }
+
+function exactQuestionKeys(value: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): boolean {
+  const allowed = new Set([...required, ...optional])
+  return required.every(key => Object.hasOwn(value, key)) && Object.keys(value).every(key => allowed.has(key))
+}
+
+function questionPlanMetadata(turnId: string, questionId: string, toolCallId: string, question: string, events: readonly Row[]): QuestionPlanMetadata | null {
+  const revisions = events.flatMap(event => {
+    if (event.type !== "plan.revision") return []
+    const candidate = parsePlanRevisionEvent(eventPayload(event.payload))
+    return candidate ? [candidate] : []
+  })
+  const matches = events.flatMap(event => {
+    if (event.type !== "plan.command") return []
+    const receipt = parsePlanCommandReceipt(eventPayload(event.payload))
+    if (!receipt || receipt.planCallId !== toolCallId) return []
+    const content = strictObject(receipt.content)
+    if (!content || !exactQuestionKeys(content, ["kind", "localId", "status", "question"], ["approvalBoundary"]) ||
+      content.kind !== "plan_control" || content.status !== "waiting_for_user" ||
+      !isQuestionText(content.localId, 128) || !isQuestionText(content.question, QUESTION_MAX_TEXT_BYTES) || content.question !== question ||
+      (Object.hasOwn(content, "approvalBoundary") && !isQuestionText(content.approvalBoundary, 1_000))) return []
+    const metadata = { planCallId: receipt.planCallId, localId: content.localId, planRevision: receipt.planRevision }
+    if (receipt.observationId !== `plan-control:${metadata.planCallId}:${metadata.localId}` || questionId !== canonicalQuestionId(turnId, metadata.planCallId, metadata.planRevision, metadata.localId)) return []
+    const revisionMatches = revisions.filter(revision => revision.planCallId === metadata.planCallId && revision.planRevision === metadata.planRevision)
+    if (revisionMatches.length !== 1) throw new Error("question_answer_replay_uncertain")
+    return [{ ...metadata, goalRevision: revisionMatches[0]!.goalRevision }]
+  })
+  if (matches.length !== 1) throw new Error("question_answer_replay_uncertain")
+  return matches[0]!
+}
+
+function questionAnswerObservations(turnId: string, items: readonly Row[], events: readonly Row[], currentGoalRevision: number, currentPlanRevision: number | null): StepContextSnapshot["toolObservations"] {
+  const seen = new Set<string>()
+  return items.filter(item => item.type === "question" && item.status === "completed").flatMap(item => {
+    const content = strictObject(item.content)
+    if (!content) throw new Error("question_answer_replay_uncertain")
+    const canonicalPlanQuestion = content.stage === "plan" || ["planCallId", "planRevision", "localId", "goalRevision"].some(key => Object.hasOwn(content, key))
+    if (!canonicalPlanQuestion) return []
+    if (!exactQuestionKeys(content, ["waitKind", "questionId", "stage", "question", "options", "toolCallId", "pending", "answerAvailable"], ["answer", "answeredAt"]) ||
+      content.waitKind !== "question" || content.stage !== "plan" || !isQuestionText(content.questionId, 256) || item.id !== `agent-wait:question:${content.questionId}` ||
+      !isQuestionText(content.toolCallId, 256) || !isQuestionText(content.question, QUESTION_MAX_TEXT_BYTES) || content.pending !== true || content.answerAvailable !== true ||
+      !isQuestionText(content.answer, 20 * 1024) || (Object.hasOwn(content, "answeredAt") && !isQuestionText(content.answeredAt, 128)) || Number(item.revision) !== 1) throw new Error("question_answer_replay_uncertain")
+    if (seen.has(content.questionId)) throw new Error("question_answer_replay_uncertain")
+    seen.add(content.questionId)
+    const options = parseQuestionOptions(content.options)
+    if (!options || (options.length > 0 && !options.some(option => option.value === content.answer))) throw new Error("question_answer_replay_uncertain")
+    const metadata = questionPlanMetadata(turnId, content.questionId, content.toolCallId, content.question, events)
+    if (!metadata || metadata.goalRevision !== currentGoalRevision || (currentPlanRevision !== null && metadata.planRevision !== currentPlanRevision)) return []
+    return [{ id: `question-answer:${content.questionId}`, content: json({
+      kind: "question_answer", questionId: content.questionId, toolCallId: content.toolCallId, question: content.question,
+      answer: content.answer, answerAvailable: true, planCallId: metadata.planCallId, localId: metadata.localId,
+      goalRevision: metadata.goalRevision, planRevision: metadata.planRevision,
+    }) }]
+  })
+}
 function planObservations(events: readonly Row[], currentPlanIds?: ReadonlySet<string>): StepContextSnapshot["toolObservations"] {
   return events.filter(event => event.type === "plan.observation").flatMap(event => {
     const payload = eventPayload(event.payload), id = payload.observationId, content = payload.content, planCallId = payload.planCallId
@@ -232,8 +290,8 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
        ORDER BY "ordinal" ASC, "attempt" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId],
     )
     const itemsResult = await client.query<Row>(
-      `SELECT "id", "type", "status", "content" FROM "agent_items" WHERE "turnId" = $1 AND "sessionId" = $2
-       AND ("taskId" IS NULL OR "taskId" = $3) AND "type" IN ('tool_call', 'tool_result') ORDER BY "createdAt" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId],
+      `SELECT "id", "type", "status", "revision", "content" FROM "agent_items" WHERE "turnId" = $1 AND "sessionId" = $2
+       AND ("taskId" IS NULL OR "taskId" = $3) AND "type" IN ('tool_call', 'tool_result', 'question') ORDER BY "createdAt" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId],
     )
     const eventsResult = await client.query<Row>(
       `SELECT event."id", event."type", event."actor", event_session."userId" AS "userId", event."sessionId", event."turnId", event."taskId", event."sequence", event."payload" FROM "agent_events" AS event JOIN "agent_sessions" AS event_session ON event_session."id" = event."sessionId" AND event_session."userId" = $4 JOIN "agent_turns" AS event_turn ON event_turn."id" = event."turnId" AND event_turn."sessionId" = event."sessionId" AND event_turn."userId" = $4 WHERE event."turnId" = $1 AND event."sessionId" = $2 AND (event."taskId" IS NULL OR event."taskId" = $3) AND event."type" IN ('tool_call.completed', 'tool_call.failed', 'plan.observation', 'plan.command', 'plan.revision', 'goal.revision', 'context.compaction', 'plan.task_graph', '${PLAN_COMPLETION_FEEDBACK_EVENT_TYPE}', '${STEERING_MARKER_EVENT_TYPE}') ORDER BY event."sequence" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId, lease.userId],
@@ -284,7 +342,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     const currentRevisionObservations = planRevisionObservations(eventsResult.rows, goalState.goalContract.revision)
     const acceptedRevisions = acceptedPlanRevisions(currentRevisionObservations)
     const currentPlanIds = goalState.goalContract.revision > 1 ? new Set(currentRevisionObservations.flatMap(item => { const content = object(item.content); return typeof content.planCallId === "string" ? [content.planCallId] : [] })) : undefined
-    const restoredBase = [...observations(itemsResult.rows, eventsResult.rows, goalState.goalContract.revision), ...planObservations(eventsResult.rows, currentPlanIds), ...currentRevisionObservations, ...planCommandObservations(eventsResult.rows, currentPlanIds, acceptedRevisions), ...contextCompactionObservations(eventsResult.rows), ...(goalState.receipt ? [goalRevisionObservation(goalState.receipt)] : []), ...(revision ? [planRevisionObservation(revision)] : [])]
+    const restoredBase = [...observations(itemsResult.rows, eventsResult.rows, goalState.goalContract.revision), ...questionAnswerObservations(lease.turnId, itemsResult.rows, eventsResult.rows, goalState.goalContract.revision, revision?.planRevision ?? null), ...planObservations(eventsResult.rows, currentPlanIds), ...currentRevisionObservations, ...planCommandObservations(eventsResult.rows, currentPlanIds, acceptedRevisions), ...contextCompactionObservations(eventsResult.rows), ...(goalState.receipt ? [goalRevisionObservation(goalState.receipt)] : []), ...(revision ? [planRevisionObservation(revision)] : [])]
     const scopedSnapshot = scopeCanonicalWaitProjections(sanitizePlanCompletionFeedbackObservations(snapshot.toolObservations, lease.turnId), eventsResult.rows).filter(item => { const content = object(item.content); const output = object(content.output); return (content.kind !== "plan_revision" || content.goalRevision === goalState.goalContract.revision) && (content.toolName !== "agent.plan.propose" || output.status !== "accepted" || output.goalRevision === goalState.goalContract.revision) && (!currentPlanIds || (content.kind !== "plan_command" && content.kind !== "plan_control")) })
     const currentPlan = currentPlanId([...scopedSnapshot, ...restoredBase])
     snapshot = { ...snapshot, toolObservations: sanitizePlanCompletionFeedbackObservations(scopedSnapshot, lease.turnId, currentPlan) }
