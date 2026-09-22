@@ -28,12 +28,12 @@ function state(): CanonicalTurnState {
   return { scope: { userId: "user-1" }, goal: "Find jobs", modelProfileSnapshot: { provider: "fixture", model: "fixture" }, toolPolicySnapshot: {}, budgetSnapshot: { limits: { maxSteps: 4 } }, snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] } }
 }
 
-function store(events: RuntimeEvent[] = []): TurnEngineStore {
+function store(events: RuntimeEvent[] = [], batches: RuntimeEvent[][] = []): TurnEngineStore {
   return {
     startStep: async ({ stepId, ordinal }) => ({ id: stepId, ordinal }), updateStep: async () => undefined,
     createItem: async ({ itemId }) => ({ id: itemId, revision: 0 }), updateItem: async ({ itemId, expectedRevision }) => ({ id: itemId, revision: expectedRevision + 1 }),
     appendEvent: async ({ id, type, payload, correlationId, idempotencyKey, owner }) => { events.push({ id, type, payload, correlationId, idempotencyKey, owner }); return { id } }, recordFinalResponse: async () => undefined,
-    appendEvents: async inputs => { events.push(...inputs.map(input => ({ id: input.id, type: input.type, payload: input.payload, correlationId: input.correlationId, idempotencyKey: input.idempotencyKey, owner: input.owner }))); return inputs.map(input => ({ id: input.id })) },
+    appendEvents: async inputs => { const batch = inputs.map(input => ({ id: input.id, type: input.type, payload: input.payload, correlationId: input.correlationId, idempotencyKey: input.idempotencyKey, owner: input.owner })); batches.push(batch); events.push(...batch); return inputs.map(input => ({ id: input.id })) },
   }
 }
 
@@ -268,7 +268,7 @@ async function rootToolNames(coordinationEnabled: boolean, planningEnabled = fal
   }) ?? []
 }
 
-async function runDefaultPlanBridge(planningExecutionEnabled: boolean, ownerId = "worker-1", events: RuntimeEvent[] = []) {
+async function runDefaultPlanBridge(planningExecutionEnabled: boolean, ownerId = "worker-1", events: RuntimeEvent[] = [], storeFactory: () => TurnEngineStore = () => store(events)) {
   const roots = rootStore()
   const calls: string[] = []
   let modelCalls = 0
@@ -309,7 +309,7 @@ async function runDefaultPlanBridge(planningExecutionEnabled: boolean, ownerId =
         }
       },
     }, registry: {} as never, candidates: [] }),
-    toolRuntimeFactory: () => tool as never, turnEngineStoreFactory: () => store(events), contextBuilderFactory: () => contextBuilder(),
+    toolRuntimeFactory: () => tool as never, turnEngineStoreFactory: storeFactory, contextBuilderFactory: () => contextBuilder(),
     authorizeUsage: async () => ({ settle: async () => undefined }),
   })
   const result = await runtime.execute({ lease: { ...lease, ownerId }, signal: new AbortController().signal })
@@ -392,6 +392,42 @@ describe("createCanonicalTurnRuntime", () => {
     await runDefaultPlanBridge(true, "worker-2", sharedEvents)
     const secondGraph = sharedEvents.filter(event => event.type === "plan.task_graph").slice(firstGraph.length)
     expect(secondGraph.map(event => [event.id, event.idempotencyKey, JSON.stringify(event.payload)])).toEqual(firstGraph.map(event => [event.id, event.idempotencyKey, JSON.stringify(event.payload)]))
+  })
+
+  it("appends each terminal graph event and matching receipt as one ordered batch", async () => {
+    const events: RuntimeEvent[] = []
+    const batches: RuntimeEvent[][] = []
+    const enabled = await runDefaultPlanBridge(true, "worker-1", events, () => store(events, batches))
+    const atomicBatches = batches.filter(batch => batch[0]?.type === "plan.task_graph")
+    expect(enabled.result.status).toBe("completed")
+    expect(atomicBatches.map(batch => batch.map(event => event.type))).toEqual([
+      ["plan.task_graph", "plan.command"], ["plan.task_graph", "plan.command"],
+    ])
+    expect(atomicBatches.map(batch => batch.map(event => event.correlationId))).toEqual([
+      ["root-1:plan-call:1", "plan-call"], ["root-1:plan-call:1", "plan-call"],
+    ])
+    expect(atomicBatches.map(batch => batch.map(event => event.idempotencyKey))).toEqual([
+      [expect.stringMatching(/^turn:plan-task-graph:[0-9a-f]{64}$/), "turn:root-1:plan-command:plan-call:plan-result:plan-call:read"],
+      [expect.stringMatching(/^turn:plan-task-graph:[0-9a-f]{64}$/), "turn:root-1:plan-command:plan-call:plan-control:plan-call:finish"],
+    ])
+    expect(atomicBatches[0]?.[0]?.payload).toMatchObject({ runKey: "root-1:plan-call:1", event: { eventId: "root-1:plan-call:1:read:complete" } })
+    expect(atomicBatches[0]?.[1]?.payload).toMatchObject({ observationId: "plan-result:plan-call:read" })
+    expect(atomicBatches[1]?.[0]?.payload).toMatchObject({ runKey: "root-1:plan-call:1", event: { eventId: "root-1:plan-call:1:finish:wait" } })
+    expect(atomicBatches[1]?.[1]?.payload).toMatchObject({ observationId: "plan-control:plan-call:finish" })
+    expect(atomicBatches.every(batch => batch.every(event => event.owner && typeof event.id === "string" && event.id.length <= 256))).toBe(true)
+  })
+
+  it("fails closed when atomic appendEvents is unavailable", async () => {
+    const events: RuntimeEvent[] = []
+    const singleOnly = () => {
+      const base = store(events)
+      const { appendEvents: _appendEvents, ...withoutBatch } = base
+      return withoutBatch
+    }
+    const result = await runDefaultPlanBridge(true, "worker-1", events, singleOnly)
+    expect(result.result.status).toBe("failed")
+    expect(events.filter(event => event.type === "plan.task_graph").map(event => (event.payload as { event: { eventId: string } }).event.eventId)).toEqual(["root-1:plan-call:1:read:start"])
+    expect(events.some(event => event.type === "plan.command")).toBe(false)
   })
 
   it("rejects canonical finals when completion evidence is missing or a dependency failed", async () => {

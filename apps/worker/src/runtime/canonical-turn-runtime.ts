@@ -17,7 +17,7 @@ import { createPgDurableWaitPort } from "./subagents/durable-wait-store.js"
 import type { TurnBudgetLimits } from "./budget.js"
 import type { TurnExecutor, TurnExecutionResult } from "./turns/turn-queue.js"
 import type { TurnLease } from "./turns/lease.js"
-import { toRepositoryJson, type TurnEngineOptions, type TurnEngineStore } from "./turns/turn-engine-types.js"
+import { toRepositoryJson, type TurnEngineEventInput, type TurnEngineOptions, type TurnEngineStore } from "./turns/turn-engine-types.js"
 import { loadCanonicalTurnState, type CanonicalTurnState } from "./canonical-turn-state.js"
 import { AgentTreeManager } from "./subagents/manager.js"
 import { PgSubagentTaskStore } from "./subagents/pg-store.js"
@@ -182,11 +182,7 @@ export function durableLifecycleSink(store: TurnEngineStore, owner: ExecutionOwn
 }
 
 function durablePlanCommandSink(store: TurnEngineStore, owner: ExecutionOwnerFence): NonNullable<CanonicalPlanExecutionOptions["persistOutcome"]> {
-  return async (receipt: PlanCommandReceipt) => {
-    const key = `${owner.userId}:${owner.sessionId}:${owner.turnId}:${owner.taskId}:${receipt.planCallId}:${receipt.observationId}`
-    const receiptKey = `${receipt.planCallId}:${receipt.observationId}`
-    await store.appendEvent({ owner, id: `plan-command:${createHash("sha256").update(key).digest("hex").slice(0, 24)}`, itemId: null, type: "plan.command", correlationId: receipt.planCallId, causationId: null, idempotencyKey: `${owner.kind}:${owner.taskId}:plan-command:${receiptKey}`, payload: toRepositoryJson(receipt) })
-  }
+  return async receipt => { await store.appendEvent(durablePlanCommandEvent(owner, receipt)) }
 }
 
 function defaultAuthorization(): never {
@@ -196,20 +192,35 @@ function defaultAuthorization(): never {
 }
 
 function durablePlanTaskGraphSink(store: TurnEngineStore, owner: ExecutionOwnerFence): NonNullable<CanonicalPlanExecutionOptions["persistTaskGraph"]> {
-  return async ({ runKey, event, state }: { readonly runKey: string; readonly event: TaskGraphEvent; readonly state: TaskGraphState }) => {
-    const ownerKey = `${owner.kind}:${owner.userId}:${owner.sessionId}:${owner.turnId}:${owner.taskId}`
-    const eventKey = `${ownerKey}:${runKey}:${event.eventId}`
-    const digest = createHash("sha256").update(eventKey).digest("hex")
-    await store.appendEvent({
-      owner,
-      id: `plan-task-graph:${digest.slice(0, 24)}`,
-      itemId: null,
-      type: "plan.task_graph",
-      correlationId: runKey,
-      causationId: null,
-      idempotencyKey: `${owner.kind}:plan-task-graph:${digest}`,
-      payload: toRepositoryJson({ runKey, event, state }),
-    })
+  return async input => { await store.appendEvent(durablePlanTaskGraphEvent(owner, input)) }
+}
+
+function durablePlanCommandEvent(owner: ExecutionOwnerFence, receipt: PlanCommandReceipt): TurnEngineEventInput {
+  const key = `${owner.userId}:${owner.sessionId}:${owner.turnId}:${owner.taskId}:${receipt.planCallId}:${receipt.observationId}`
+  const receiptKey = `${receipt.planCallId}:${receipt.observationId}`
+  return { owner, id: `plan-command:${createHash("sha256").update(key).digest("hex").slice(0, 24)}`, itemId: null, type: "plan.command", correlationId: receipt.planCallId, causationId: null, idempotencyKey: `${owner.kind}:${owner.taskId}:plan-command:${receiptKey}`, payload: toRepositoryJson(receipt) }
+}
+
+function durablePlanTaskGraphEvent(owner: ExecutionOwnerFence, input: { readonly runKey: string; readonly event: TaskGraphEvent; readonly state: TaskGraphState }): TurnEngineEventInput {
+  const ownerKey = `${owner.kind}:${owner.userId}:${owner.sessionId}:${owner.turnId}:${owner.taskId}`
+  const eventKey = `${ownerKey}:${input.runKey}:${input.event.eventId}`
+  const digest = createHash("sha256").update(eventKey).digest("hex")
+  return {
+    owner,
+    id: `plan-task-graph:${digest.slice(0, 24)}`,
+    itemId: null,
+    type: "plan.task_graph",
+    correlationId: input.runKey,
+    causationId: null,
+    idempotencyKey: `${owner.kind}:plan-task-graph:${digest}`,
+    payload: toRepositoryJson(input),
+  }
+}
+
+function durableAtomicPlanTerminalSink(store: TurnEngineStore, owner: ExecutionOwnerFence): NonNullable<CanonicalPlanExecutionOptions["persistAtomicTerminal"]> {
+  return async input => {
+    if (!store.appendEvents) throw new Error("atomic_plan_persistence_unavailable")
+    await store.appendEvents([durablePlanTaskGraphEvent(owner, { runKey: input.runKey, event: input.event, state: input.state }), durablePlanCommandEvent(owner, input.receipt)])
   }
 }
 
@@ -308,7 +319,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const actorRole = (record(state.toolPolicySnapshot).role as PolicyRole | undefined) ?? "orchestrator"
     const planFactory = options.planExecutionFactory ?? createCanonicalPlanExecutionFactory
     const executePlan = planningEnabled && planningExecutionEnabled && planning
-      ? planFactory({ lease, rootTaskId: root.id, taskId: root.id, state, scope: state.scope, router: toolRuntime.router, registry: toolRuntime.registry, policy: selectedPolicy, goal: planning.goal, goalRef, allowedTools: planning.allowedTools, allowedTemplates: planning.allowedTemplates, allowedRoles: planning.allowedRoles, allowedPlanActions: planning.allowedPlanActions, maxNodes: planning.maxNodes, maxPlanRevisions: planning.maxPlanRevisions, initialPlanRevision: planning.initialPlanRevision, initialPlanHashes: planning.initialPlanHashes, ...(state.taskGraphEvents ? { initialTaskGraphEvents: state.taskGraphEvents } : {}), ...(recoveryDispatcher ? { recoveryDispatcher } : {}), capabilities: toolCapabilities, actorRole, persistOutcome: durablePlanCommandSink(turnStore, owner), persistTaskGraph: durablePlanTaskGraphSink(turnStore, owner) })
+      ? planFactory({ lease, rootTaskId: root.id, taskId: root.id, state, scope: state.scope, router: toolRuntime.router, registry: toolRuntime.registry, policy: selectedPolicy, goal: planning.goal, goalRef, allowedTools: planning.allowedTools, allowedTemplates: planning.allowedTemplates, allowedRoles: planning.allowedRoles, allowedPlanActions: planning.allowedPlanActions, maxNodes: planning.maxNodes, maxPlanRevisions: planning.maxPlanRevisions, initialPlanRevision: planning.initialPlanRevision, initialPlanHashes: planning.initialPlanHashes, ...(state.taskGraphEvents ? { initialTaskGraphEvents: state.taskGraphEvents } : {}), ...(recoveryDispatcher ? { recoveryDispatcher } : {}), capabilities: toolCapabilities, actorRole, persistOutcome: durablePlanCommandSink(turnStore, owner), persistTaskGraph: durablePlanTaskGraphSink(turnStore, owner), persistAtomicTerminal: durableAtomicPlanTerminalSink(turnStore, owner) })
       : undefined
     const config = options.modelRuntimeFactory ? undefined : await loadWorkerAiConfig(lease.userId)
     const modelRuntime = await (options.modelRuntimeFactory?.({ userId: lease.userId, config, state }) ?? createHarnessModelRuntime({ primary: config, fallbacks: [], allowEnvironmentFallbacks: false }))

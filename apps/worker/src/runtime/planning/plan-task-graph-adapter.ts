@@ -31,7 +31,7 @@ export class PlanTaskGraphAdapterError extends Error {
 export type PlanTaskGraphAdapter = {
   readonly state: TaskGraphState
   readonly start?: (localId: string) => Promise<TaskGraphState>
-  readonly observe: (record: ObservablePlanRecord) => Promise<TaskGraphState>
+  readonly observe: (record: ObservablePlanRecord, persistOverride?: PersistTaskGraph) => Promise<TaskGraphState>
 }
 
 export type PlanTaskGraphAdapterOptions = {
@@ -186,21 +186,27 @@ export function createPlanTaskGraphAdapter(plan: PlanDispatchResult, options: Pl
     state = hydrated
   }
 
-  const persist = async (event: TaskGraphEvent, nextState: TaskGraphState): Promise<void> => {
-    const payload = { runKey, event, state: nextState }
+  const persist: PersistTaskGraph = async payload => {
     let encoded: string | undefined
     try { encoded = JSON.stringify(payload) } catch { encoded = undefined }
     if (encoded === undefined || Buffer.byteLength(encoded, "utf8") > MAX_GRAPH_PAYLOAD_BYTES) throw new PlanTaskGraphAdapterError("persistence_failed", "Task graph persistence exceeded the bounded payload")
     try { await options.persist(payload) } catch { throw new PlanTaskGraphAdapterError("persistence_failed", "Task graph persistence failed") }
   }
 
-  const apply = async (localId: string, phase: TaskGraphEvent["type"]): Promise<void> => {
+  const apply = async (localId: string, phase: TaskGraphEvent["type"], persistOverride: PersistTaskGraph = persist): Promise<void> => {
     const event: TaskGraphEvent = { type: phase, nodeId: localId, eventId: eventId(runKey, localId, phase) }
     const replayed = state.appliedEvents.some(previous => previous.eventId === event.eventId && previous.nodeId === event.nodeId && previous.type === event.type)
     const reduction = reduceTaskGraph(state, event)
     if (!reduction.ok) throw new PlanTaskGraphAdapterError(reduction.errorCode, reduction.message)
     if (replayed) return
-    await persist(event, reduction.state)
+    const payload = { runKey, event, state: reduction.state }
+    let encoded: string | undefined
+    try { encoded = JSON.stringify(payload) } catch { encoded = undefined }
+    if (encoded === undefined || Buffer.byteLength(encoded, "utf8") > MAX_GRAPH_PAYLOAD_BYTES) throw new PlanTaskGraphAdapterError("persistence_failed", "Task graph persistence exceeded the bounded payload")
+    try { await persistOverride(payload) } catch (error: unknown) {
+      if (error instanceof PlanTaskGraphAdapterError) throw error
+      throw new PlanTaskGraphAdapterError("persistence_failed", "Task graph persistence failed")
+    }
     state = reduction.state
   }
 
@@ -213,7 +219,7 @@ export function createPlanTaskGraphAdapter(plan: PlanDispatchResult, options: Pl
     return state
   }
 
-  const observe = async (record: ObservablePlanRecord): Promise<TaskGraphState> => {
+  const observe = async (record: ObservablePlanRecord, persistOverride?: PersistTaskGraph): Promise<TaskGraphState> => {
     if (!record || typeof record !== "object") throw new PlanTaskGraphAdapterError("invalid_record", "Unsupported plan observation record")
     if (isReplan(record)) return state
     if (!record || typeof record.localId !== "string" || !record.localId.trim()) throw new PlanTaskGraphAdapterError("invalid_record", "Plan observation localId is required")
@@ -222,7 +228,7 @@ export function createPlanTaskGraphAdapter(plan: PlanDispatchResult, options: Pl
     else if (isExecutionRecord(record)) phase = terminalPhase(record)
     else throw new PlanTaskGraphAdapterError("invalid_record", "Unsupported plan observation record")
     await start(record.localId)
-    await apply(record.localId, phase)
+    await apply(record.localId, phase, persistOverride)
     return state
   }
 

@@ -56,6 +56,26 @@ describe("plan task graph adapter", () => {
     expect(value.state.statuses.first).toBe("completed")
   })
 
+  it("uses a terminal persistence override after the durable start", async () => {
+    const trace: string[] = []
+    const persist = vi.fn<PlanTaskGraphAdapterOptions["persist"]>(async input => { trace.push(`base:${input.event.type}`) })
+    const value = createPlanTaskGraphAdapter(plan(command("first")), { runKey: "run-1", persist })
+    const override = vi.fn<PlanTaskGraphAdapterOptions["persist"]>(async input => { trace.push(`override:${input.event.type}`) })
+    await value.observe(record("first", "completed"), override)
+    expect(trace).toEqual(["base:start", "override:complete"])
+    expect(value.state.statuses.first).toBe("completed")
+  })
+
+  it("does not advance the terminal state when the override fails", async () => {
+    const persist = vi.fn<PlanTaskGraphAdapterOptions["persist"]>().mockResolvedValue(undefined)
+    const value = createPlanTaskGraphAdapter(plan(command("first")), { runKey: "run-1", persist })
+    const override = vi.fn<PlanTaskGraphAdapterOptions["persist"]>().mockRejectedValue(new Error("atomic batch failed"))
+    await expect(value.observe(record("first", "completed"), override)).rejects.toBeInstanceOf(PlanTaskGraphAdapterError)
+    expect(value.state.statuses.first).toBe("running")
+    expect(value.state.appliedEvents.map(event => event.eventId)).toEqual(["run-1:first:start"])
+    expect(persist).toHaveBeenCalledTimes(1)
+  })
+
   it("maps failed and cancelled execution records to terminal events", async () => {
     const failed = adapter([command("failed")])
     await failed.value.observe(record("failed", "failed"))

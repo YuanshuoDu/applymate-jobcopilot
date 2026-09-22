@@ -33,6 +33,12 @@ type WaitToolName = typeof WAIT_TOOL_NAMES[number]
 
 type Registry = { list(capabilities?: readonly string[]): readonly unknown[] }
 type Router = { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> }
+type PersistAtomicTerminal = (input: {
+  readonly runKey: string
+  readonly event: TaskGraphEvent
+  readonly state: TaskGraphState
+  readonly receipt: PlanCommandReceipt
+}) => Promise<void> | void
 
 function isWaitToolName(value: unknown): value is WaitToolName {
   return typeof value === "string" && WAIT_TOOL_NAMES.includes(value as WaitToolName)
@@ -59,6 +65,7 @@ export type CanonicalPlanExecutionOptions = {
   readonly policy: PolicyEngine
   readonly persistOutcome?: (receipt: PlanCommandReceipt) => Promise<void> | void
   readonly persistTaskGraph?: (input: { readonly runKey: string; readonly event: TaskGraphEvent; readonly state: TaskGraphState }) => Promise<void> | void
+  readonly persistAtomicTerminal?: PersistAtomicTerminal
   readonly initialTaskGraphEvents?: readonly PersistedTaskGraphEvent[]
   /** Server-owned upper bound for accepted revisions. */
   readonly maxPlanRevisions?: number
@@ -419,6 +426,24 @@ function replayWaitOutcome(input: Parameters<TurnEnginePlanExecutionHook>[0], op
   return output
 }
 
+function canonicalTaskGraphAdapter(options: CanonicalPlanExecutionOptions, taskGraph: PlanTaskGraphAdapter, planCallId: string, planRevision: number, receipts?: ReadonlyMap<string, ReplayCommandReceipt>): PlanTaskGraphAdapter {
+  return {
+    get state() { return taskGraph.state },
+    start: async (localId: string) => {
+      if (receipts?.has(localId)) return taskGraph.state
+      if (!taskGraph.start) throw new PlanTaskGraphAdapterError("persistence_failed", "Task graph start is unavailable")
+      return taskGraph.start(localId)
+    },
+    observe: async (record: PlanCommandExecutionRecord | PlanControlRecord) => {
+      if (receipts?.has(record.localId)) return taskGraph.state
+      if (options.persistAtomicTerminal && record.kind !== "replan_required") {
+        return taskGraph.observe(record, graph => options.persistAtomicTerminal!({ ...graph, receipt: outcomeReceipt(planCallId, planRevision, record) }))
+      }
+      return taskGraph.observe(record)
+    },
+  }
+}
+
 function replayRuntime(
   options: CanonicalPlanExecutionOptions,
   input: Parameters<TurnEnginePlanExecutionHook>[0],
@@ -432,16 +457,8 @@ function replayRuntime(
     if (receipt) receipts.set(command.localId, receipt)
   }
   if (taskGraph) validateReplayTaskGraph(dispatched.commands, taskGraph.state, receipts)
-  if (taskGraph && !options.persistTaskGraph && dispatched.commands.some(command => !receipts.has(command.localId))) throw new CanonicalPlanError("invalid_plan_output")
-  const replayTaskGraph = taskGraph ? {
-    get state() { return taskGraph.state },
-    start: async (localId: string) => {
-      if (receipts.has(localId)) return taskGraph.state
-      if (!taskGraph.start) throw new PlanTaskGraphAdapterError("persistence_failed", "Task graph start is unavailable")
-      return taskGraph.start(localId)
-    },
-    observe: async (record: PlanCommandExecutionRecord | PlanControlRecord) => receipts.has(record.localId) ? taskGraph.state : taskGraph.observe(record),
-  } satisfies PlanTaskGraphAdapter : undefined
+  if (taskGraph && !options.persistTaskGraph && !options.persistAtomicTerminal && dispatched.commands.some(command => !receipts.has(command.localId))) throw new CanonicalPlanError("invalid_plan_output")
+  const replayTaskGraph = taskGraph ? canonicalTaskGraphAdapter(options, taskGraph, input.call.id, planRevision, receipts) : undefined
   for (const command of dispatched.commands) {
     const receipt = receipts.get(command.localId)
     if (command.kind === "join" && receipt?.status === "completed" && row(receipt.output)?.status === "waiting") replayJoinTaskIds(options, command, receipts, dispatched.commands)
@@ -497,7 +514,7 @@ function replayRuntime(
       return
     }
     observations.push(observation)
-    if (options.persistOutcome) await options.persistOutcome(outcomeReceipt(input.call.id, planRevision, recordValue))
+    if (options.persistOutcome && (!taskGraph || !options.persistAtomicTerminal || recordValue.kind === "replan_required")) await options.persistOutcome(outcomeReceipt(input.call.id, planRevision, recordValue))
   }
   return {
     runtime: {
@@ -632,6 +649,9 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
           ? createPlanTaskGraphAdapter(dispatched, { runKey: taskGraphRunKey(options.rootTaskId, input.call.id, output.planRevision), persist: options.persistTaskGraph } satisfies PlanTaskGraphAdapterOptions)
           : undefined
       const replay = replayed ? replayRuntime(options, input, dispatched, output.planRevision, taskGraph) : undefined
+      const commandTaskGraph = !replay && taskGraph && options.persistAtomicTerminal
+        ? canonicalTaskGraphAdapter(options, taskGraph, input.call.id, output.planRevision)
+        : taskGraph
       const commandRuntime: PlanCommandExecutionRuntime = replay?.runtime ?? {
         router: options.router,
         createContext: request => ({ scope: options.scope, sessionId: options.lease.sessionId, turnId: options.lease.turnId, stepId: `${input.stepId}:plan:${request.localId}`, taskId: options.taskId, rootTaskId: options.rootTaskId, actorRole: options.actorRole, capabilities: [...options.capabilities], signal: input.signal }),
@@ -639,8 +659,13 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
         rootTaskId: options.rootTaskId,
         resolveInputRefs: request => resolveInputRefs(input.snapshot, request),
         admit: planAdmission(input),
-        ...(taskGraph ? { taskGraphAdapter: taskGraph } : {}),
-        ...(options.persistOutcome ? { observe: async recordValue => options.persistOutcome!(outcomeReceipt(input.call.id, output.planRevision, recordValue)) } : {}),
+        ...(commandTaskGraph ? { taskGraphAdapter: commandTaskGraph } : {}),
+        ...(options.persistOutcome ? {
+          observe: async (recordValue: PlanCommandExecutionRecord | PlanControlRecord) => {
+            if (commandTaskGraph && options.persistAtomicTerminal && recordValue.kind !== "replan_required") return
+            await options.persistOutcome!(outcomeReceipt(input.call.id, output.planRevision, recordValue))
+          },
+        } : {}),
       }
       const executed = await executePlanCommands(dispatched, commandRuntime)
       const records = boundedRecords(executed)
