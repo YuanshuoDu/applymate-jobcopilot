@@ -11,6 +11,7 @@ import { PlanCommandExecutionError, executePlanCommands, type PlanCommandExecuti
 import { createPlanCommandReceipt, type PlanCommandReceipt } from "./plan-command-receipt.js"
 import { PlanRevisionRecoveryError, recoverPlanRevision, type PlanRevisionRecoveryDispatcher } from "./plan-revision-receipt.js"
 import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
+import { READ_ONLY_TOOL_NAMES, TOOL_RESULTS_READ_NAME } from "../tools/index.js"
 import type { TurnEnginePlanExecutionHook, TurnEnginePlanExecutionHookResult } from "../turns/turn-engine-types.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 import { visibleToolPolicy } from "../subagents/role-policy.js"
@@ -29,6 +30,7 @@ const OUTPUT_KEYS = ["status", "goalRevision", "planRevision", "basedOnPlanRevis
 const CANONICAL_WAIT_TOOL_NAME = "agent.wait" as const
 const LEGACY_WAIT_TOOL_NAME = "wait_subagents" as const
 const WAIT_TOOL_NAMES = [CANONICAL_WAIT_TOOL_NAME, LEGACY_WAIT_TOOL_NAME] as const
+const CANONICAL_RECOVERY_READ_TOOLS = new Set<string>([...READ_ONLY_TOOL_NAMES, TOOL_RESULTS_READ_NAME])
 type WaitToolName = typeof WAIT_TOOL_NAMES[number]
 
 type Registry = { list(capabilities?: readonly string[]): readonly unknown[] }
@@ -317,16 +319,53 @@ function expectedReplayGraphStatus(command: PlanDispatchCommand, receipt: Replay
   return ["waiting", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"].includes(String(outputStatus)) ? "waiting" : "completed"
 }
 
+function taskGraphAttempt(graph: TaskGraphState, localId: string): number {
+  for (let index = graph.appliedEvents.length - 1; index >= 0; index -= 1) {
+    const event = graph.appliedEvents[index]
+    if (event?.nodeId === localId) return event.attempt ?? 1
+  }
+  return 1
+}
+
 function validateReplayTaskGraph(commands: readonly PlanDispatchCommand[], graph: TaskGraphState, receipts: ReadonlyMap<string, ReplayCommandReceipt>): void {
   for (const command of commands) {
     const status = graph.statuses[command.localId]
     const receipt = receipts.get(command.localId)
     if (!receipt) {
+      if (status === "running" && taskGraphAttempt(graph, command.localId) === 1) continue
       if (status !== "pending" && status !== "ready") throw new CanonicalPlanError("invalid_plan_output")
       continue
     }
     if (status !== expectedReplayGraphStatus(command, receipt)) throw new CanonicalPlanError("invalid_plan_output")
   }
+}
+
+function isSafeReplayRecoveryCommand(options: CanonicalPlanExecutionOptions, command: PlanDispatchCommand): boolean {
+  if (command.kind !== "tool_call" || command.inputRefs.length > 0 || command.inputRefsDeferred || !CANONICAL_RECOVERY_READ_TOOLS.has(command.call.toolName)) return false
+  try {
+    return options.registry.list(options.capabilities).some(item => {
+      if (!isPlainJsonObject(item) || item.name !== command.call.toolName || item.version !== command.call.toolVersion) return false
+      return item.risk === "read" && Array.isArray(item.capabilities) && item.capabilities.every(capability => capability === "read")
+    })
+  } catch {
+    return false
+  }
+}
+
+async function recoverReplayOrphans(
+  options: CanonicalPlanExecutionOptions,
+  commands: readonly PlanDispatchCommand[],
+  graph: TaskGraphState,
+  receipts: ReadonlyMap<string, ReplayCommandReceipt>,
+  taskGraph: PlanTaskGraphAdapter,
+): Promise<void> {
+  const orphaned = commands.filter(command => !receipts.has(command.localId) && graph.statuses[command.localId] === "running")
+  if (orphaned.length === 0) return
+  if (!taskGraph.retry) throw new PlanTaskGraphAdapterError("persistence_failed", "Task graph retry is unavailable")
+  for (const command of orphaned) {
+    if (taskGraphAttempt(graph, command.localId) !== 1 || !isSafeReplayRecoveryCommand(options, command)) throw new CanonicalPlanError("invalid_plan_output")
+  }
+  for (const command of orphaned) await taskGraph.retry(command.localId)
 }
 
 const JOIN_ALLOWED_IDENTITY_KEYS = new Set(["taskId", "rootTaskId", "parentTaskId"])
@@ -434,6 +473,11 @@ function canonicalTaskGraphAdapter(options: CanonicalPlanExecutionOptions, taskG
       if (!taskGraph.start) throw new PlanTaskGraphAdapterError("persistence_failed", "Task graph start is unavailable")
       return taskGraph.start(localId)
     },
+    retry: async (localId: string) => {
+      if (receipts?.has(localId)) return taskGraph.state
+      if (!taskGraph.retry) throw new PlanTaskGraphAdapterError("persistence_failed", "Task graph retry is unavailable")
+      return taskGraph.retry(localId)
+    },
     observe: async (record: PlanCommandExecutionRecord | PlanControlRecord) => {
       if (receipts?.has(record.localId)) return taskGraph.state
       if (options.persistAtomicTerminal && record.kind !== "replan_required") {
@@ -444,13 +488,13 @@ function canonicalTaskGraphAdapter(options: CanonicalPlanExecutionOptions, taskG
   }
 }
 
-function replayRuntime(
+async function replayRuntime(
   options: CanonicalPlanExecutionOptions,
   input: Parameters<TurnEnginePlanExecutionHook>[0],
   dispatched: ReturnType<typeof dispatchPlanProposal>,
   planRevision: number,
   taskGraph?: PlanTaskGraphAdapter,
-): { runtime: PlanCommandExecutionRuntime; observations: Array<{ readonly id: string; readonly content: Record<string, unknown> }> } {
+): Promise<{ runtime: PlanCommandExecutionRuntime; observations: Array<{ readonly id: string; readonly content: Record<string, unknown> }> }> {
   const receipts = new Map<string, ReplayCommandReceipt>()
   for (const command of dispatched.commands) {
     const receipt = replayReceipt(input.snapshot, input.call.id, command)
@@ -459,6 +503,7 @@ function replayRuntime(
   if (taskGraph) validateReplayTaskGraph(dispatched.commands, taskGraph.state, receipts)
   if (taskGraph && !options.persistTaskGraph && !options.persistAtomicTerminal && dispatched.commands.some(command => !receipts.has(command.localId))) throw new CanonicalPlanError("invalid_plan_output")
   const replayTaskGraph = taskGraph ? canonicalTaskGraphAdapter(options, taskGraph, input.call.id, planRevision, receipts) : undefined
+  if (taskGraph && replayTaskGraph) await recoverReplayOrphans(options, dispatched.commands, taskGraph.state, receipts, replayTaskGraph)
   for (const command of dispatched.commands) {
     const receipt = receipts.get(command.localId)
     if (command.kind === "join" && receipt?.status === "completed" && row(receipt.output)?.status === "waiting") replayJoinTaskIds(options, command, receipts, dispatched.commands)
@@ -648,7 +693,7 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
         : !replayed && options.persistTaskGraph
           ? createPlanTaskGraphAdapter(dispatched, { runKey: taskGraphRunKey(options.rootTaskId, input.call.id, output.planRevision), persist: options.persistTaskGraph } satisfies PlanTaskGraphAdapterOptions)
           : undefined
-      const replay = replayed ? replayRuntime(options, input, dispatched, output.planRevision, taskGraph) : undefined
+      const replay = replayed ? await replayRuntime(options, input, dispatched, output.planRevision, taskGraph) : undefined
       const commandTaskGraph = !replay && taskGraph && options.persistAtomicTerminal
         ? canonicalTaskGraphAdapter(options, taskGraph, input.call.id, output.planRevision)
         : taskGraph

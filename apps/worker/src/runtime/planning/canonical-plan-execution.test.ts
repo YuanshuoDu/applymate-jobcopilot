@@ -70,6 +70,7 @@ type FixtureOverrides = {
   readonly persistTaskGraph?: (input: { readonly runKey: string; readonly event: TaskGraphEvent; readonly state: TaskGraphState }) => Promise<void> | void
   readonly persistAtomicTerminal?: NonNullable<CanonicalPlanExecutionOptions["persistAtomicTerminal"]>
   readonly initialTaskGraphEvents?: readonly PersistedTaskGraphEvent[]
+  readonly extraDefinitions?: readonly Record<string, unknown>[]
   readonly rootTaskId?: string
 }
 
@@ -88,6 +89,7 @@ function fixture(router: { execute(context: ToolRouterContext, request: ToolCall
       readDefinition("jobs.search", "jobs"), readDefinition("jobs.get", "jobs"), readDefinition("persona.retrieve", "persona"),
       readDefinition("resume.get_base", "resume"), readDefinition("application.get_state", "application"),
       { name: "tool_results.read", version: "1", risk: "read", capabilities: ["read"], domain: "coordination", requiredCapabilities: [] },
+      ...(overrides.extraDefinitions ?? []),
       ...(overrides.waitDefinitions ?? [{ name: "agent.wait", version: "1", risk: "internal_write", capabilities: ["coordination"], domain: "coordination", requiredCapabilities: [] }]),
     ] },
     policy: {} as PolicyEngine, ...(persistOutcome ? { persistOutcome } : {}), ...(overrides.persistTaskGraph ? { persistTaskGraph: overrides.persistTaskGraph } : {}), ...(overrides.persistAtomicTerminal ? { persistAtomicTerminal: overrides.persistAtomicTerminal } : {}), ...(overrides.initialTaskGraphEvents ? { initialTaskGraphEvents: overrides.initialTaskGraphEvents } : {}), ...(maxPlanRevisions === undefined ? {} : { maxPlanRevisions }), ...(initialPlanHashes ? { initialPlanHashes } : {}), ...(goalRef ? { goalRef } : {}), ...(allowedPlanActions === undefined ? {} : { allowedPlanActions }), ...(recoveryDispatcher ? { recoveryDispatcher } : {}),
@@ -105,8 +107,16 @@ function input(value: unknown, stepId = "step-1", toolObservations: StepContextS
   }
 }
 
-function graphEvent(runKey: string, type: TaskGraphEvent["type"], nodeId: string): PersistedTaskGraphEvent {
-  return { runKey, event: { type, nodeId, eventId: `${runKey}:${nodeId}:${type}` } }
+function graphEvent(runKey: string, type: TaskGraphEvent["type"], nodeId: string, attempt = 1): PersistedTaskGraphEvent {
+  return {
+    runKey,
+    event: {
+      type,
+      nodeId,
+      ...(attempt === 1 ? {} : { attempt }),
+      eventId: attempt === 1 ? `${runKey}:${nodeId}:${type}` : `${runKey}:${nodeId}:attempt:${attempt}:${type}`,
+    },
+  }
 }
 
 function observationCode(result: Awaited<ReturnType<ReturnType<typeof fixture>>>) {
@@ -582,6 +592,86 @@ describe("createCanonicalPlanExecutionFactory", () => {
     expect(await replay(input(output(plan), "step-1", first.observations, true))).toEqual({ observations: [] })
     expect(router.execute).not.toHaveBeenCalled()
     expect(replayPersist).not.toHaveBeenCalled()
+  })
+
+  it("recovers one orphaned read command and routes it as attempt two", async () => {
+    const graphPersist = vi.fn<NonNullable<CanonicalPlanExecutionOptions["persistTaskGraph"]>>()
+    const atomicPersist = vi.fn<NonNullable<CanonicalPlanExecutionOptions["persistAtomicTerminal"]>>()
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { recovered: true }, errorCode: null })) }
+    const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, undefined, undefined, {
+      initialTaskGraphEvents: [graphEvent("root-1:proposal-1:1", "start", "read")],
+      persistTaskGraph: graphPersist, persistAtomicTerminal: atomicPersist,
+    })
+
+    const result = await hook(input(output(proposal([use("read")])), "step-1", [], true))
+
+    expect(result.observations).toHaveLength(1)
+    expect(router.execute).toHaveBeenCalledTimes(1)
+    expect(graphPersist.mock.calls.map(([entry]) => entry.event.eventId)).toEqual([
+      "root-1:proposal-1:1:read:attempt:2:retry",
+      "root-1:proposal-1:1:read:attempt:2:start",
+    ])
+    expect(atomicPersist.mock.calls.map(([entry]) => entry.event.eventId)).toEqual(["root-1:proposal-1:1:read:attempt:2:complete"])
+  })
+
+  it("fails closed on orphan recovery persistence failure before routing", async () => {
+    const graphPersist = vi.fn<NonNullable<CanonicalPlanExecutionOptions["persistTaskGraph"]>>().mockRejectedValue(new Error("retry unavailable"))
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { unexpected: true }, errorCode: null })) }
+    const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, undefined, undefined, {
+      initialTaskGraphEvents: [graphEvent("root-1:proposal-1:1", "start", "read")], persistTaskGraph: graphPersist,
+    })
+
+    expect(observationCode(await hook(input(output(proposal([use("read")])), "step-1", [], true)))).toBe("invalid_plan_output")
+    expect(router.execute).not.toHaveBeenCalled()
+    expect(graphPersist.mock.calls.map(([entry]) => entry.event.eventId)).toEqual(["root-1:proposal-1:1:read:attempt:2:retry"])
+  })
+
+  it.each([
+    { name: "delegate", plan: proposal([delegate("child")]), actions: ["delegate"] as readonly PlanActionKind[], events: [graphEvent("root-1:proposal-1:1", "start", "child")] },
+    { name: "unknown tool", plan: proposal([use("read", { toolName: "unlisted.read" })]), actions: ["use_tool"] as readonly PlanActionKind[], events: [graphEvent("root-1:proposal-1:1", "start", "read")] },
+  ])("blocks unsafe $name orphan recovery", async ({ plan, actions, events }) => {
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { unexpected: true }, errorCode: null })) }
+    const graphPersist = vi.fn<NonNullable<CanonicalPlanExecutionOptions["persistTaskGraph"]>>()
+    const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, undefined, undefined, {
+      initialTaskGraphEvents: events, persistTaskGraph: graphPersist, allowedTools: ["jobs.search", "unlisted.read"],
+      ...(actions.includes("delegate") ? { allowedRoles: ["scout"] } : {
+        extraDefinitions: [readDefinition("unlisted.read", "jobs")],
+      }),
+    })
+
+    expect(observationCode(await hook(input(output(plan), "step-1", [], true)))).toBe("invalid_plan_output")
+    expect(router.execute).not.toHaveBeenCalled()
+    expect(graphPersist).not.toHaveBeenCalled()
+  })
+
+  it("blocks unsafe join orphan recovery after a completed child receipt", async () => {
+    const plan = proposal([delegate("child"), join()])
+    const child = { id: "plan-result:proposal-1:child", content: { kind: "plan_command", localId: "child", commandKind: "delegate", dependsOn: [], status: "completed", errorCode: null, output: { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued" } } }
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { unexpected: true }, errorCode: null })) }
+    const graphPersist = vi.fn<NonNullable<CanonicalPlanExecutionOptions["persistTaskGraph"]>>()
+    const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["delegate", "join"], undefined, {
+      initialTaskGraphEvents: [
+        graphEvent("root-1:proposal-1:1", "start", "child"), graphEvent("root-1:proposal-1:1", "complete", "child"), graphEvent("root-1:proposal-1:1", "start", "join"),
+      ], persistTaskGraph: graphPersist,
+    })
+
+    expect(observationCode(await hook(input(output(plan), "step-1", [child], true)))).toBe("invalid_plan_output")
+    expect(router.execute).not.toHaveBeenCalled()
+    expect(graphPersist).not.toHaveBeenCalled()
+  })
+
+  it("does not retry an attempt two orphan already running", async () => {
+    const graphPersist = vi.fn<NonNullable<CanonicalPlanExecutionOptions["persistTaskGraph"]>>()
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { unexpected: true }, errorCode: null })) }
+    const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, undefined, undefined, {
+      initialTaskGraphEvents: [
+        graphEvent("root-1:proposal-1:1", "start", "read"), graphEvent("root-1:proposal-1:1", "retry", "read", 2), graphEvent("root-1:proposal-1:1", "start", "read", 2),
+      ], persistTaskGraph: graphPersist,
+    })
+
+    expect(observationCode(await hook(input(output(proposal([use("read")])), "step-1", [], true)))).toBe("invalid_plan_output")
+    expect(router.execute).not.toHaveBeenCalled()
+    expect(graphPersist).not.toHaveBeenCalled()
   })
 
   it("skips starts for existing replay receipts and starts each missing command once", async () => {
