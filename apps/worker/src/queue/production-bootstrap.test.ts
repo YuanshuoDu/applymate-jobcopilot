@@ -16,6 +16,7 @@ import { consumeDurableWaitOutcomes } from "../runtime/subagents/durable-wait-co
 import type { createSubagentQueue } from "./subagent-queue.js"
 import { runTurnJob, type createTurnQueue, type TurnExecutor } from "../runtime/turns/turn-queue.js"
 import type { TurnLease } from "../runtime/turns/lease.js"
+import { recoverTurnQueue, turnJobId } from "../runtime/turns/recovery-scanner.js"
 import { createProductionWorkerBootstrap, type CanonicalTurnRuntime } from "./production-bootstrap.js"
 import { createCanonicalTurnRuntime, type UsageAuthorization } from "../runtime/canonical-turn-runtime.js"
 import { createTurnEngineExecutor } from "../runtime/turns/turn-engine.js"
@@ -335,6 +336,67 @@ function durableCompositionPool(input: {
 }
 
 describe("production Worker bootstrap", () => {
+  it("drains the durable Turn dispatch through the bootstrap-owned queue and remains idempotent", async () => {
+    const now = new Date("2026-09-22T00:00:00.000Z")
+    const payload = { turnId: "turn_dispatch", sessionId: "session_dispatch", ownerId: "recovery_fixture" }
+    let published = false
+    const calls: string[] = []
+    const client = {
+      query: vi.fn(async (sql: string) => {
+        calls.push(sql)
+        if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") return { rows: [], rowCount: 1 }
+        if (sql.includes("WITH candidates AS") || sql.includes("WITH stale")) return { rows: [], rowCount: 0 }
+        if (sql.includes('FROM "agent_turns" AS turn') && sql.includes('LEFT JOIN "agent_outbox" AS dispatch')) return { rows: [], rowCount: 0 }
+        if (sql.includes('SELECT dispatch."id", dispatch."aggregateId", dispatch."payload", dispatch."attemptCount"')) {
+          return published ? { rows: [], rowCount: 0 } : { rows: [{ id: "dispatch_1", aggregateId: payload.sessionId, payload, attemptCount: 4 }], rowCount: 1 }
+        }
+        if (sql.includes('SELECT session."id" FROM "agent_sessions"')) return { rows: [{ id: payload.sessionId }], rowCount: 1 }
+        if (sql.includes('SELECT dispatch."id" FROM "agent_outbox"')) return published ? { rows: [], rowCount: 0 } : { rows: [{ id: "dispatch_1" }], rowCount: 1 }
+        if (sql.includes('SELECT turn."id"') && sql.includes("turnSession")) return { rows: [{ id: payload.turnId }], rowCount: 1 }
+        if (sql.includes('UPDATE "agent_outbox"') && sql.includes('"publishedAt" = CURRENT_TIMESTAMP')) {
+          published = true
+          return { rows: [], rowCount: 1 }
+        }
+        return { rows: [], rowCount: 1 }
+      }),
+      release: vi.fn(),
+    }
+    const pool = { connect: vi.fn(async () => client) }
+    const add = vi.fn().mockResolvedValue(undefined)
+    const events: string[] = []
+    const canonical = runtime(events)
+    const turnQueue = {
+      queue: { add, close: vi.fn(async () => undefined) },
+      worker: { pause: vi.fn(async () => undefined) },
+      active: { size: 0, values: () => [] },
+      close: vi.fn(async () => undefined),
+    } as unknown as ReturnType<typeof createTurnQueue>
+    const turnFactory = vi.fn(() => turnQueue) as unknown as Parameters<typeof createProductionWorkerBootstrap>[0]["turnQueueFactory"]
+    const recoveryFactory = vi.fn((recoveryPool, queue) => {
+      const first = recoverTurnQueue(recoveryPool, queue, "bootstrap-recovery", now)
+      return {
+        close: async () => {
+          await first
+          await recoverTurnQueue(recoveryPool, queue, "bootstrap-recovery", now)
+        },
+      }
+    }) as unknown as Parameters<typeof createProductionWorkerBootstrap>[0]["turnRecoveryFactory"]
+
+    const bootstrap = await createProductionWorkerBootstrap({
+      pool: pool as never,
+      runtime: canonical,
+      turnQueueFactory: turnFactory,
+      turnRecoveryFactory: recoveryFactory,
+    })
+    await bootstrap.close()
+
+    expect(recoveryFactory).toHaveBeenCalledWith(pool, turnQueue.queue, undefined, undefined)
+    expect(add).toHaveBeenCalledOnce()
+    expect(add).toHaveBeenCalledWith("turn", payload, { jobId: turnJobId(payload.turnId, 4), attempts: 5 })
+    expect(published).toBe(true)
+    expect(calls.some(sql => sql.includes('UPDATE "agent_outbox"') && sql.includes('"publishedAt" = CURRENT_TIMESTAMP'))).toBe(true)
+  })
+
   it("binds the canonical executor to the turn consumer and closes recovery before execution resources", async () => {
     const events: string[] = []
     const canonical = runtime(events)
