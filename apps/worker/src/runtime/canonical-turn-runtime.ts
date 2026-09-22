@@ -189,6 +189,9 @@ function durablePlanCommandSink(store: TurnEngineStore, owner: ExecutionOwnerFen
 // Writer/executor remain deferred until their artifact/submission contracts
 // exist; reviewer/auditor are read-only and use bounded unstructured results.
 const CANONICAL_PLANNER_ROLES = ["scout", "analyst", "reviewer", "auditor"] as const
+const CANONICAL_COORDINATION_TOOL_NAMES = [
+  "agent.spawn", "agent.send", "agent.followup", "agent.wait", "agent.list", "agent.interrupt", "agent.close",
+] as const
 type PlannerRoleTool = Parameters<typeof visibleToolPolicy>[1]
 
 function plannerRoleTool(value: unknown): PlannerRoleTool | undefined {
@@ -233,6 +236,19 @@ function deriveCanonicalPlannerRoles(
       && (tool.domain !== "coordination" || tool.name === TOOL_RESULTS_READ_NAME)
       && visibleToolPolicy(role, tool).visible)
   })
+}
+
+function assertCanonicalCoordinationSurface(
+  registry: { readonly list: (capabilities?: readonly string[]) => readonly unknown[] },
+  capabilities: readonly string[],
+): void {
+  try {
+    const registered = registry.list(capabilities)
+    const names = new Set(registered.map(item => record(item).name).filter((name): name is string => typeof name === "string"))
+    if (CANONICAL_COORDINATION_TOOL_NAMES.some(name => !names.has(name))) throw new Error("missing canonical coordination tool")
+  } catch {
+    throw new Error("canonical_coordination_tools_unconfigured")
+  }
 }
 
 function defaultAuthorization(): never {
@@ -354,6 +370,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       allowedTemplates: [], allowedRoles: [...CANONICAL_PLANNER_ROLES], allowedPlanActions, maxNodes: PLAN_MAX_NODES, maxPlanRevisions: PLAN_MAX_REVISIONS, initialPlanRevision: state.planRevision ?? null, initialPlanHashes: state.planProposalHashes ?? [], ...(recoveryDispatcher ? { recoveryDispatcher } : {}),
     } : undefined
     const toolRuntime = options.toolRuntimeFactory?.({ pool, policy: selectedPolicy, manager, state }) ?? createWorkerToolRuntime(pool, { sink: sinkProxy, resolveOwner }, selectedPolicy, coordination, undefined, undefined, undefined, planningConfiguration, planningConfiguration ? { goal: planningConfiguration.goal, goalRef } : undefined)
+    if (coordinationEnabled) assertCanonicalCoordinationSurface(toolRuntime.registry, toolCapabilities)
     const planning = planningConfiguration ? (() => {
       const catalog = derivePlannerCapabilityCatalog(toolRuntime.registry, toolCapabilities, planningConfiguration.allowedTools, planningConfiguration.allowedTemplates)
       return {

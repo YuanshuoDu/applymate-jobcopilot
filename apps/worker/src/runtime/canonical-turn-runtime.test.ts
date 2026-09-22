@@ -110,22 +110,32 @@ function realPgBoundary() {
   return { pool: pool as unknown as pg.Pool, calls, client }
 }
 
-function tools() {
+const CANONICAL_COORDINATION_TOOL_NAMES = [
+  "agent.spawn", "agent.send", "agent.followup", "agent.wait", "agent.list", "agent.interrupt", "agent.close",
+] as const
+
+function coordinationDefinitions(missing: readonly string[] = []): readonly { name: string; version: string }[] {
+  return CANONICAL_COORDINATION_TOOL_NAMES
+    .filter(name => !missing.includes(name))
+    .map(name => ({ name, version: "1" }))
+}
+
+function tools(includeCoordination = false, missing: readonly string[] = []) {
   const execute = vi.fn(async (context: { taskId?: string; rootTaskId?: string }, call: { id: string; toolName: string; toolVersion: string }) => ({ ...call, status: "completed" as const, output: { ok: true }, errorCode: null, taskId: context.taskId, rootTaskId: context.rootTaskId }))
   return {
     execute,
-    registry: { list: () => [{ name: "jobs.search", version: "1" }], validateArguments: () => true as const },
+    registry: { list: () => [{ name: "jobs.search", version: "1" }, ...(includeCoordination ? coordinationDefinitions(missing) : [])], validateArguments: () => true as const },
     router: { execute },
   }
 }
 
-function plannerTools() {
-  const tool = tools()
+function plannerTools(includeCoordination = false) {
+  const tool = tools(includeCoordination)
   return {
     ...tool,
     registry: {
       ...tool.registry,
-      list: () => [{ name: "jobs.search", version: "1", risk: "read", domain: "jobs", capabilities: ["read"], requiredCapabilities: [] }],
+      list: () => [{ name: "jobs.search", version: "1", risk: "read", domain: "jobs", capabilities: ["read"], requiredCapabilities: [] }, ...(includeCoordination ? coordinationDefinitions() : [])],
     },
   }
 }
@@ -153,7 +163,7 @@ function waitingTools() {
 
 function setup(overrides: Record<string, unknown> = {}) {
   const roots = rootStore()
-  const tool = tools()
+  const tool = tools(overrides.coordinationEnabled === true)
   let calls = 0
   const runtime = createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
     workerId: "worker-1", stateLoader: async () => state(), rootTaskStore: roots as never,
@@ -370,6 +380,26 @@ describe("createCanonicalTurnRuntime", () => {
     })).rejects.toThrow("coordination_requires_child_execution")
   })
 
+  it("does not require coordination tools while the coordination gate is disabled", async () => {
+    const fixture = setup({ coordinationEnabled: false, toolRuntimeFactory: () => tools() as never })
+    await expect((await fixture.runtime).execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "completed" })
+    expect(fixture.getModelCalls()).toBeGreaterThan(0)
+  })
+
+  it("accepts a custom registry with the complete canonical coordination surface", async () => {
+    const fixture = setup({ coordinationEnabled: true, toolRuntimeFactory: () => tools(true) as never })
+    await expect((await fixture.runtime).execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "completed" })
+  })
+
+  it("fails closed before model invocation when a canonical coordination tool is missing", async () => {
+    const fixture = setup({
+      coordinationEnabled: true,
+      toolRuntimeFactory: () => tools(true, ["agent.close"]) as never,
+    })
+    await expect((await fixture.runtime).execute({ lease, signal: new AbortController().signal })).rejects.toThrow("canonical_coordination_tools_unconfigured")
+    expect(fixture.getModelCalls()).toBe(0)
+  })
+
   it("derives root coordination capability from the production gate", async () => {
     const disabled = await rootToolNames(false)
     expect(disabled).not.toEqual(expect.arrayContaining(["spawn_subagent", "wait_subagents", "list_subagents", "send_message", "interrupt_subagent", "close_subagent"]))
@@ -535,7 +565,7 @@ describe("createCanonicalTurnRuntime", () => {
       coordinationEnabled: true,
       planningEnabled: true,
       planningExecutionEnabled: true,
-      toolRuntimeFactory: () => plannerTools() as never,
+      toolRuntimeFactory: () => plannerTools(true) as never,
       planExecutionFactory: factory,
     })
     await (await enabled.runtime).execute({ lease, signal: new AbortController().signal })

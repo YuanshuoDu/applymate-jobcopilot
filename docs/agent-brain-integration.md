@@ -1765,3 +1765,9 @@ Exact server-owned Scout/Analyst output markers now select bounded role-specific
 The bounded test-only slice exercises the canonical production bootstrap with a canonical policy fixture and a real four-step root path: `spawn_subagent` → `wait_subagents` → `fixture.read` → final. The bootstrap-captured child executor runs through `AgentTreeManager.run`, covering child claim/lease/finish and the parent wait closure. Only `production-bootstrap.test.ts` changed; focused validation passed **10/10**, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
 
 This is an in-memory deterministic fixture only. Live PostgreSQL/RLS, Redis/BullMQ delivery, process restart, provider behavior, deployment, and full durable child-parent wake evidence remain unverified. Formal P0-P7 acceptance remains **1/8 (12.5%)**; P8-104 remains a candidate.
+
+## P8-105 candidate - canonical coordination surface wiring guard
+
+The canonical Turn runtime now fails closed with `canonical_coordination_tools_unconfigured` before model runtime construction when coordination is enabled but the server-owned registry does not expose all seven canonical coordination tools: `agent.spawn`, `agent.send`, `agent.followup`, `agent.wait`, `agent.list`, `agent.interrupt`, and `agent.close`. Extra tools and legacy aliases remain compatible, while coordination-disabled Turns keep their existing sparse/custom registry behavior. The bounded change is limited to `apps/worker/src/runtime/canonical-turn-runtime.ts` and its sibling test.
+
+Focused canonical runtime validation passed **34/34** tests; Worker `tsc` and `git diff --check` passed. Live PostgreSQL/RLS, Redis/BullMQ delivery, process restart, provider invocation, and deployment evidence remain unverified. Formal P0-P7 acceptance remains **1/8 (12.5%)**; P8-105 remains a candidate.
