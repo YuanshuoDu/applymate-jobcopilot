@@ -80,10 +80,21 @@ function planCommandPayload(overrides: Record<string, unknown> = {}) {
   }
 }
 
-function planRow(sequence: bigint, type: "plan.revision" | "plan.command" | "plan.observation", payload: unknown, overrides: Record<string, unknown> = {}) {
+function planRow(sequence: bigint, type: "plan.revision" | "plan.command" | "plan.observation" | "plan.task_graph", payload: unknown, overrides: Record<string, unknown> = {}) {
   return {
     id: `plan_${sequence}`, sessionId: "session_1", turnId: "turn_1", itemId: null, taskId: "task_1", sequence,
     type, actor: "orchestrator", correlationId: "plan-call-1", causationId: null, idempotencyKey: null, payload, ...overrides,
+  }
+}
+
+function planTaskGraphPayload() {
+  const runKey = "task_1:plan-call-1:1"
+  const event = { type: "start", nodeId: "step-1", eventId: `${runKey}:step-1:start` }
+  return {
+    runKey, event, state: {
+      nodes: [{ id: "step-1", dependsOn: [] }, { id: "step-2", dependsOn: ["step-1"] }],
+      statuses: { "step-1": "running", "step-2": "pending" }, readyNodeIds: [], blockedReasons: { "step-2": "waiting_on_dependencies" }, appliedEvents: [event],
+    },
   }
 }
 
@@ -195,8 +206,9 @@ describe("agent timeline query API", () => {
     expect(mocks.agendaFindMany).not.toHaveBeenCalled()
   })
 
-  it("restores bounded legal plan receipts in durable sequence order after redaction", async () => {
+  it("restores bounded plan receipts and a whitelisted task graph in durable sequence order", async () => {
     mocks.agendaFindMany.mockResolvedValueOnce([]).mockResolvedValueOnce([]).mockResolvedValueOnce([
+      planRow(BigInt(4), "plan.task_graph", planTaskGraphPayload()),
       planRow(BigInt(3), "plan.command", planCommandPayload()),
       planRow(BigInt(2), "plan.revision", planRevisionPayload()),
     ])
@@ -205,12 +217,20 @@ describe("agent timeline query API", () => {
     const response = await GET(request() as never, params)
     const body = await response.json()
 
-    expect(body.planEvents.map((event: { id: string }) => event.id)).toEqual(["plan_2", "plan_3"])
+    expect(body.planEvents.map((event: { id: string }) => event.id)).toEqual(["plan_2", "plan_3", "plan_4"])
     expect(body.planEvents[1].payload.content.output).toBeUndefined()
     expect(JSON.stringify(body.planEvents)).not.toContain("private output")
+    expect(body.planEvents[2].payload).toEqual({
+      runKey: "task_1:plan-call-1:1", eventId: "task_1:plan-call-1:1:step-1:start", nodeId: "step-1", phase: "start", attempt: 1,
+      nodes: [
+        { nodeId: "step-1", dependencyIds: [], phase: "start", attempt: 1, status: "running" },
+        { nodeId: "step-2", dependencyIds: ["step-1"], status: "pending" },
+      ],
+    })
+    expect(JSON.stringify(body.planEvents[2].payload)).not.toMatch(/blockedReasons|readyNodeIds|appliedEvents|provider|input|output/)
     expect(mocks.agendaFindMany).toHaveBeenNthCalledWith(3, {
-      where: { sessionId: "session_1", type: { in: ["plan.revision", "plan.command", "plan.observation"] } },
-      orderBy: { sequence: "desc" }, take: 272, select: expect.objectContaining({ payload: true, sequence: true }),
+      where: { sessionId: "session_1", type: { in: ["plan.revision", "plan.command", "plan.observation", "plan.task_graph"] } },
+      orderBy: { sequence: "desc" }, take: 784, select: expect.objectContaining({ payload: true, sequence: true }),
     })
   })
 

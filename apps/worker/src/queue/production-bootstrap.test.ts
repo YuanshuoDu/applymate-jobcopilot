@@ -151,12 +151,12 @@ async function compositionRuntime(): Promise<{ runtime: CanonicalTurnRuntime; to
   }
 }
 
-async function coordinationRuntime(input: { manager: AgentTreeManager; store: CoordinationStore; wait: DurableWaitPort; model: ModelAdapter; stateLoader?: (state: CanonicalTurnState) => CanonicalTurnState | Promise<CanonicalTurnState> }): Promise<{ runtime: CanonicalTurnRuntime; execute: CanonicalTurnRuntime["execute"] }> {
+async function coordinationRuntime(input: { workerId?: string; manager: AgentTreeManager; store: CoordinationStore; wait: DurableWaitPort; model: ModelAdapter; stateLoader?: (state: CanonicalTurnState, lease: TurnLease) => CanonicalTurnState | Promise<CanonicalTurnState> }): Promise<{ runtime: CanonicalTurnRuntime; execute: CanonicalTurnRuntime["execute"] }> {
   const read: RuntimeToolDefinition = { schemaVersion, name: "fixture.read", version: "1", description: "Read fixture evidence", capabilities: ["read"], inputSchema: Type.Object({}, { additionalProperties: false }), outputSchema: Type.Object({ jobs: Type.Array(Type.Object({ id: Type.String() }, { additionalProperties: false })) }, { additionalProperties: false }), risk: "read", domain: "jobs", idempotency: "read_only", timeoutMs: 1_000, requiredCapabilities: [], execute: async () => ({ jobs: [{ id: "job-fixture" }] }) }
   const registry = new ToolRegistry([read, ...createCoordinationTools({ manager: input.manager, store: input.store, wait: input.wait })])
   const router = new ToolRouter(registry, new ToolLifecycle({ sink: new InMemoryToolLifecycleSink(), references: new InMemoryToolResultReferenceStore() }), createCanonicalPolicy(undefined, true, false))
   const state: CanonicalTurnState = { scope: { userId: "user_fixture" }, goal: "Read fixture state", modelProfileSnapshot: {} as never, toolPolicySnapshot: { role: "orchestrator", capabilities: ["read", "coordination"] }, budgetSnapshot: { limits: { maxSteps: 5 } }, snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] } }
-  const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, { workerId: "worker_fixture", manager: input.manager, coordinationEnabled: true, stateLoader: async () => input.stateLoader ? input.stateLoader(state) : state, modelRuntimeFactory: async () => ({ adapter: input.model, registry: {} as never, candidates: [] }), toolRuntimeFactory: () => ({ registry, router }), rootTaskStore: { ensure: vi.fn(async () => ({ id: "root_fixture" } as never)), finish: vi.fn(async () => undefined) }, turnEngineStoreFactory: () => compositionStore(), contextBuilderFactory: () => new StepContextBuilder({ scope: { userId: "user_fixture" }, withTransaction: async work => work({ getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }), claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }), persistCheckpoint: async () => undefined }) } satisfies InputClaimStore), authorizeUsage: vi.fn(async () => ({ settle: vi.fn(async () => undefined) })) })
+  const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, { workerId: input.workerId ?? "worker_fixture", manager: input.manager, coordinationEnabled: true, stateLoader: async (_pool, lease) => input.stateLoader ? input.stateLoader(state, lease) : state, modelRuntimeFactory: async () => ({ adapter: input.model, registry: {} as never, candidates: [] }), toolRuntimeFactory: () => ({ registry, router }), rootTaskStore: { ensure: vi.fn(async () => ({ id: "root_fixture" } as never)), finish: vi.fn(async () => undefined) }, turnEngineStoreFactory: () => compositionStore(), contextBuilderFactory: () => new StepContextBuilder({ scope: { userId: "user_fixture" }, withTransaction: async work => work({ getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }), claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }), persistCheckpoint: async () => undefined }) } satisfies InputClaimStore), authorizeUsage: vi.fn(async () => ({ settle: vi.fn(async () => undefined) })) })
   return { runtime, execute: runtime.execute }
 }
 
@@ -226,10 +226,17 @@ function durableCompositionPool(input: {
         return response<T>([{ eventSequence: String(state.session.eventSequence) }], 1)
       }
 
+      if (sql.includes("WITH candidates AS") && sql.includes('UPDATE "agent_outbox"')) return response<T>([])
+      if (sql.includes("WITH stale AS") && sql.includes('UPDATE "agent_turns"')) return response<T>([])
+      if (sql.includes('LEFT JOIN "agent_outbox" AS dispatch') && sql.includes('turn."status" = \'queued\'')) return response<T>([])
+
       if (sql.includes('FROM "agent_wait_conditions"')) {
         const current = waitRow()
         if (!current) return response<T>([])
         if (sql.includes('"turnId" = $3')) {
+          if (sql.includes('"parentTaskId" = $4') && sql.includes('"status" IN (\'ready\', \'timed_out\')')) {
+            return response<T>(String(params[2]) === state.turn.id && String(params[3]) === input.root.id && ["ready", "timed_out"].includes(String(current.status)) && current.suspendedAt != null ? [current] : [])
+          }
           return response<T>(String(params[2]) === state.turn.id && String(current.status) !== "closed" && current.consumedAt == null ? [current] : [])
         }
         if (String(params[0]) === String(current.id) || (String(params[0]) === input.root.id && String(params[1]) === String(current.idempotencyKey))) return response<T>([current])
@@ -279,6 +286,13 @@ function durableCompositionPool(input: {
         return response<T>([], 1)
       }
 
+      if (sql.includes('UPDATE "agent_outbox"') && sql.includes('SET "publishedAt" = CURRENT_TIMESTAMP')) {
+        const item = state.outbox.find(value => String(value.id) === String(params[0]) && value.publishedAt == null)
+        if (!item) return response<T>([], 0)
+        item.publishedAt = new Date(input.now)
+        item.attemptCount = Number(item.attemptCount ?? 0) + 1
+        return response<T>([], 1)
+      }
       if (sql.includes('UPDATE "agent_outbox"')) {
         const idempotencyKey = String(params[0]); const aggregateId = String(params[1])
         const item = state.outbox.find(value => value.topic === "agent.turn.dispatch" && String(value.idempotencyKey) === idempotencyKey && String(value.aggregateId) === aggregateId && value.publishedAt == null)
@@ -323,6 +337,12 @@ function durableCompositionPool(input: {
 
       if (sql.includes('SELECT "id", "topic", "aggregateId", "idempotencyKey", "payload" FROM "agent_outbox"')) {
         return response<T>(state.outbox.filter(item => String(item.idempotencyKey) === String(params[0])))
+      }
+      if (sql.includes('SELECT dispatch."id", dispatch."aggregateId", dispatch."payload", dispatch."attemptCount"') && sql.includes('FROM "agent_outbox" AS dispatch')) {
+        return response<T>(state.outbox.filter(item => String(item.topic) === String(params[0]) && item.publishedAt == null).map(item => ({ id: item.id, aggregateId: item.aggregateId, payload: item.payload, attemptCount: item.attemptCount })))
+      }
+      if (sql.includes('SELECT dispatch."id" FROM "agent_outbox" AS dispatch')) {
+        return response<T>(state.outbox.filter(item => String(item.id) === String(params[0]) && String(item.aggregateId) === String(params[1]) && String(item.topic) === String(params[2]) && item.publishedAt == null).map(item => ({ id: item.id })))
       }
       if (sql.includes('SELECT "id" FROM "agent_outbox"')) {
         return response<T>(state.outbox.filter(item => String(item.topic) === String(params[0]) && String(item.idempotencyKey) === String(params[1]) && String(item.aggregateId) === String(params[2])))
@@ -787,8 +807,6 @@ describe("production Worker bootstrap", () => {
     const durableWait = createPgDurableWaitPort(durableFixture.pool as never)
     let bootstrappedChildExecutor: ((input: { lease: SubagentLease }) => Promise<SubagentExecutionResult>) | undefined
     let waitCalls = 0
-    let parentResuming = false
-    let resumeObservation: CanonicalTurnState["snapshot"]["toolObservations"] = []
     const wait: DurableWaitPort = { wait: async input => {
       waitCalls += 1
       return durableWait.wait(input)
@@ -808,8 +826,20 @@ describe("production Worker bootstrap", () => {
         else yield* [{ type: "text_delta", text: "Found both child results." }, { type: "completed", finishReason: "stop" }]
       },
     }
+    const resumeRequests: HarnessModelRequest[] = []
+    let resumeModelCalls = 0
+    const resumedModel: ModelAdapter = {
+      id: "fixture-model-restarted",
+      profile: model.profile,
+      async *stream(request) {
+        resumeRequests.push(request)
+        resumeModelCalls += 1
+        if (resumeModelCalls === 1) yield* [{ type: "tool_call_completed", callId: "read-resumed", name: "fixture.read", arguments: {} }, { type: "completed", finishReason: "tool_calls" }]
+        else yield* [{ type: "text_delta", text: "Found both child results after recovery." }, { type: "completed", finishReason: "stop" }]
+      },
+    }
     const parentPrivateObservation: CanonicalTurnState["snapshot"]["toolObservations"] = [{ id: "root-private", content: "parent-private-marker" }]
-    const fixture = await coordinationRuntime({ manager, store: coordinationStore, wait, model, stateLoader: state => ({ ...state, snapshot: { ...state.snapshot, toolObservations: parentResuming ? resumeObservation : parentPrivateObservation } }) })
+    const fixture = await coordinationRuntime({ manager, store: coordinationStore, wait, model, stateLoader: state => ({ ...state, snapshot: { ...state.snapshot, toolObservations: parentPrivateObservation } }) })
     let execute: CanonicalTurnRuntime["execute"] | undefined
     let waitHandoff: Parameters<typeof createTurnQueue>[0]["waitHandoff"] | undefined
     const childQueueFactory = vi.fn(options => {
@@ -842,19 +872,7 @@ describe("production Worker bootstrap", () => {
     try {
       expect(waitHandoff).toBeDefined()
       const firstLease: TurnLease = { turnId: "turn_fixture", sessionId: "session_fixture", ownerId: "worker_fixture", userId: "user_fixture", leaseVersion: 1, leaseStartedAt: now, leaseExpiresAt: new Date(now.getTime() + 60_000) }
-      let resumeProjection: Awaited<ReturnType<typeof consumeDurableWaitOutcomes>> = []
-      let projectionCalls = 0
       const parentExecutor: TurnExecutor = async input => {
-        if (input.lease.ownerId === "worker_resume") {
-          projectionCalls += 1
-          const client = await durableFixture.pool.connect()
-          try {
-            resumeProjection = [...await consumeDurableWaitOutcomes({ client: client as never, lease: input.lease, turn: { ...durableFixture.state.turn }, now: new Date(now.getTime() + 3_000) })]
-            resumeObservation = resumeProjection.map(projection => ({ id: projection.id, content: projection.content })) as never
-          } finally {
-            client.release()
-          }
-        }
         const result = await execute!({ lease: input.lease, signal: input.signal })
         return result.status === "waiting_for_dependency" && durableFixture.state.wait ? { ...result, waitId: String(durableFixture.state.wait.id) } : result
       }
@@ -880,14 +898,14 @@ describe("production Worker bootstrap", () => {
       expect(tasks.get(childA.id)?.result).toMatchObject({ status: "completed", toolCallCount: 1, finalText: `Child ${childA.id} found job-${childA.id}.` })
       expect(tasks.get(childB.id)?.result).toMatchObject({ status: "completed", toolCallCount: 1, finalText: `Child ${childB.id} found job-${childB.id}.` })
 
-      await expect(reconcileDurableWaits(durableFixture.pool as never, { now: new Date(now.getTime() + 1_000), ownerId: "resolver_fixture" })).resolves.toEqual({ scanned: 1, resolved: 1, woken: 1 })
+      await expect(reconcileDurableWaits(durableFixture.pool as never, { now: new Date(now.getTime() + 1_000), ownerId: "worker_recovery" })).resolves.toEqual({ scanned: 1, resolved: 1, woken: 1 })
       expect(durableFixture.state.wait).toMatchObject({ status: "ready", matchedTaskIds: [childA.id, childB.id] })
       expect(durableFixture.state.turn).toMatchObject({ status: "queued", leaseOwnerId: null })
       expect(durableFixture.state.events).toHaveLength(1)
       expect(durableFixture.state.outbox.filter(item => item.topic === "agent.session.event")).toHaveLength(1)
       expect(durableFixture.state.outbox.filter(item => item.topic === "agent.turn.dispatch")).toHaveLength(1)
 
-      await expect(reconcileDurableWaits(durableFixture.pool as never, { now: new Date(now.getTime() + 2_000), ownerId: "resolver_fixture" })).resolves.toEqual({ scanned: 0, resolved: 0, woken: 0 })
+      await expect(reconcileDurableWaits(durableFixture.pool as never, { now: new Date(now.getTime() + 2_000), ownerId: "worker_recovery" })).resolves.toEqual({ scanned: 0, resolved: 0, woken: 0 })
       await expect(durableWait.suspendAndRelease({ lease: firstLease, waitId, now })).resolves.toMatchObject({ handoff: "queued", idempotent: true })
       expect(durableFixture.state.events).toHaveLength(1)
       expect(durableFixture.state.outbox.filter(item => item.topic === "agent.session.event")).toHaveLength(1)
@@ -896,17 +914,98 @@ describe("production Worker bootstrap", () => {
       await expect(durableWait.wait({ userId: "user_fixture", sessionId: "session_fixture", turnId: "turn_fixture", stepId: String(durableFixture.state.wait?.stepId), taskId: "root_fixture", rootTaskId: "root_fixture", targetTaskIds: [childA.id, childB.id], mode: "all", timeoutMs: 1_000, idempotencyKey: "wait_fixture" })).resolves.toMatchObject({ status: "ready", matchedTaskIds: [childA.id, childB.id] })
 
       expect(durableFixture.state.turn.status).toBe("queued")
-      parentResuming = true
-      const resumed = await runTurnJob({ data: { turnId: "turn_fixture", sessionId: "session_fixture", ownerId: "worker_resume" }, attemptsMade: 0 }, { pool: durableFixture.pool as never, execute: parentExecutor, now: () => new Date(now.getTime() + 3_000), heartbeatMs: 60_000 })
-      expect(resumed).toMatchObject({ status: "completed" })
+      await bootstrap.close()
+
+      const recoveryNow = new Date(now.getTime() + 3_000)
+      const restartedManager = new AgentTreeManager(store, { now: () => recoveryNow, clock })
+      let resumeProjection: Awaited<ReturnType<typeof consumeDurableWaitOutcomes>> = []
+      let replayedProjection: Awaited<ReturnType<typeof consumeDurableWaitOutcomes>> = []
+      const resumedLeases: TurnLease[] = []
+      const restartedFixture = await coordinationRuntime({
+        workerId: "worker_recovery",
+        manager: restartedManager,
+        store: coordinationStore,
+        wait,
+        model: resumedModel,
+        stateLoader: async (state, lease) => {
+          resumedLeases.push(lease)
+          const client = await durableFixture.pool.connect()
+          try {
+            await client.query("BEGIN")
+            const turn = { ...durableFixture.state.turn }
+            resumeProjection = [...await consumeDurableWaitOutcomes({ client: client as never, lease, turn, now: recoveryNow })]
+            replayedProjection = [...await consumeDurableWaitOutcomes({ client: client as never, lease, turn, now: recoveryNow })]
+            await client.query("COMMIT")
+          } catch (error: unknown) {
+            await client.query("ROLLBACK").catch(() => undefined)
+            throw error
+          } finally {
+            client.release()
+          }
+          return { ...state, snapshot: { ...state.snapshot, toolObservations: resumeProjection.map(projection => ({ id: projection.id, content: projection.content })) as never } }
+        },
+      })
+      type RecoveredTurnPayload = Parameters<typeof runTurnJob>[0]["data"]
+      const recoveredJobs: Array<{ name: string; data: RecoveredTurnPayload; options?: { jobId?: string; attempts?: number } }> = []
+      const addRecoveredJob = vi.fn(async (name: string, data: RecoveredTurnPayload, options?: { jobId?: string; attempts?: number }) => {
+        recoveredJobs.push({ name, data, options })
+      })
+      let resumedExecute: CanonicalTurnRuntime["execute"] | undefined
+      let recoveryScan: ReturnType<typeof recoverTurnQueue> | undefined
+      const restartedBootstrap = await createProductionWorkerBootstrap({
+        pool: durableFixture.pool as never,
+        ownerId: "worker_recovery",
+        runtime: restartedFixture.runtime,
+        turnQueueFactory: vi.fn(options => {
+          resumedExecute = options.execute
+          return { queue: { add: addRecoveredJob }, worker: { pause: vi.fn(async () => undefined) }, active: { size: 0, values: () => [] }, close: vi.fn(async () => undefined) } as never
+        }) as never,
+        turnRecoveryFactory: vi.fn((recoveryPool, queue, ownerId) => {
+          recoveryScan = recoverTurnQueue(recoveryPool, queue, ownerId, recoveryNow)
+          return { close: async () => { await recoveryScan } }
+        }) as never,
+        waitResolver: { intervalMs: 60_000, batchSize: 1 },
+        waitResolverFactory: waitResolverFactory as never,
+        subagents: {
+          execute: childExecutor,
+          queueFactory: childQueueFactory as never,
+          recoveryFactory: vi.fn(() => ({ close: vi.fn(async () => undefined) })) as never,
+        },
+      })
+      try {
+        expect(restartedBootstrap.runtime).toBe(restartedFixture.runtime)
+        expect(restartedBootstrap.runtime).not.toBe(bootstrap.runtime)
+        expect(restartedManager).not.toBe(manager)
+        expect(childQueueFactory).toHaveBeenCalledWith(expect.objectContaining({ execute: childExecutor, manager: restartedManager }))
+        expect(recoveryScan).toBeDefined()
+        await expect(recoveryScan!).resolves.toEqual({ reclaimed: 0, repaired: 0, dispatched: 1 })
+        expect(recoveredJobs).toHaveLength(1)
+        expect(recoveredJobs[0]).toMatchObject({
+          name: "turn",
+          data: { turnId: "turn_fixture", sessionId: "session_fixture", ownerId: "worker_recovery" },
+          options: { attempts: 5 },
+        })
+        expect(durableFixture.state.outbox.find(item => item.topic === "agent.turn.dispatch")).toMatchObject({ publishedAt: expect.any(Date) })
+
+        const recovered = recoveredJobs[0]!
+        const resumed = await runTurnJob({ data: recovered.data, attemptsMade: 0 }, { pool: durableFixture.pool as never, execute: resumedExecute!, now: () => recoveryNow, heartbeatMs: 60_000 })
+        expect(resumed).toMatchObject({ status: "completed" })
+        expect(resumedLeases).toEqual([expect.objectContaining({ ownerId: "worker_recovery", leaseVersion: 2 })])
+        expect(durableFixture.state.wait?.consumedAt).toEqual(recoveryNow)
+        expect(durableFixture.state.calls.filter(sql => sql.includes('SET "result" = jsonb_set'))).toHaveLength(1)
+        expect(replayedProjection).toEqual(resumeProjection)
+        expect(resumeProjection).toHaveLength(1)
+        expect(JSON.stringify(resumeProjection[0]?.content)).toContain(`Child ${childA.id} found job-${childA.id}.`)
+        expect(JSON.stringify(resumeProjection[0]?.content)).toContain(`Child ${childB.id} found job-${childB.id}.`)
+        expect(durableFixture.state.turn).toMatchObject({ status: "completed", leaseOwnerId: null, leaseVersion: 2 })
+        expect(JSON.stringify(resumeRequests[0]?.messages)).toContain(`Child ${childA.id} found job-${childA.id}.`)
+        expect(JSON.stringify(resumeRequests[0]?.messages)).toContain(`Child ${childB.id} found job-${childB.id}.`)
+        expect(resumeRequests).toHaveLength(2)
+      } finally {
+        await restartedBootstrap.close()
+      }
+
       expect(waitCalls).toBe(1)
-      expect(projectionCalls).toBe(1)
-      expect(resumeProjection).toHaveLength(1)
-      expect(JSON.stringify(resumeProjection[0]?.content)).toContain(`Child ${childA.id} found job-${childA.id}.`)
-      expect(JSON.stringify(resumeProjection[0]?.content)).toContain(`Child ${childB.id} found job-${childB.id}.`)
-      expect(durableFixture.state.turn).toMatchObject({ status: "completed", leaseOwnerId: null, leaseVersion: 2 })
-      expect(JSON.stringify(requests[3]?.messages)).toContain(`Child ${childA.id} found job-${childA.id}.`)
-      expect(JSON.stringify(requests[3]?.messages)).toContain(`Child ${childB.id} found job-${childB.id}.`)
       expect(childModelRuntimeFactory).toHaveBeenCalledTimes(2)
       expect(childToolRuntimeFactory).toHaveBeenCalledTimes(2)
       expect(childOwners.map(({ userId, sessionId, turnId, taskId, rootTaskId, ownerId }) => ({ userId, sessionId, turnId, taskId, rootTaskId, ownerId })).sort((left, right) => left.taskId.localeCompare(right.taskId))).toEqual([
@@ -943,7 +1042,7 @@ describe("production Worker bootstrap", () => {
       expect(new Set(childBudgetReservations.map(reservation => reservation.idempotencyKey)).size).toBe(4)
       expect(new Set(childBudgetReservations.map(reservation => reservation.taskId))).toEqual(new Set([childA.id, childB.id]))
       expect(childBudgetReservations.every(reservation => reservation.userId === "user_fixture" && reservation.sessionId === "session_fixture" && reservation.turnId === "turn_fixture" && reservation.rootTaskId === "root_fixture" && reservation.attempt === 1)).toBe(true)
-      expect(requests).toHaveLength(5)
+      expect(requests).toHaveLength(3)
     } finally {
       await bootstrap.close()
       vi.useRealTimers()

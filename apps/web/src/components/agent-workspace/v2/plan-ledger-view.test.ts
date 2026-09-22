@@ -20,6 +20,23 @@ function command(sequence: string, id: string, localId: string, status = 'comple
   }, ...overrides })
 }
 
+function graph(sequence: string, nodeId: string, status: string, phase: string, overrides: Record<string, unknown> = {}) {
+  const runKey = 'task-1:plan-1:1'
+  const attempt = phase === 'retry' ? 2 : 1
+  const eventId = attempt === 1 ? `${runKey}:${nodeId}:${phase}` : `${runKey}:${nodeId}:attempt:${attempt}:${phase}`
+  const nodes = nodeId === 'search'
+    ? [
+      { nodeId: 'search', dependencyIds: [], phase, attempt, status },
+      { nodeId: 'review', dependencyIds: ['search'], status: status === 'completed' ? 'ready' : 'pending' },
+    ]
+    : [{ nodeId, dependencyIds: [], phase, attempt, status }]
+  return event({}, {
+    id: `graph-${sequence}`, type: 'plan.task_graph', sequence,
+    payload: { runKey, eventId, nodeId, phase, attempt, nodes },
+    ...overrides,
+  })
+}
+
 describe('plan ledger projection', () => {
   it('folds revision and command/observation duplicates into one safe latest plan', () => {
     let state = createPlanLedgerState('session-1')
@@ -43,6 +60,36 @@ describe('plan ledger projection', () => {
     expect(reducePlanLedger(state, { ...command('3', 'orphan', 'orphan'), taskId: 'task-2' })).toBe(before)
     expect(reducePlanLedger(state, command('0', 'stale', 'stale'))).toBe(before)
     expect(reducePlanLedger(state, { ...event(), id: 'foreign', sessionId: 'other' })).toBe(before)
+  })
+
+  it('folds task graph live states by plan revision without exposing worker task records', () => {
+    let state = createPlanLedgerState('session-1')
+    state = reducePlanLedger(state, event())
+    state = reducePlanLedger(state, graph('2', 'search', 'running', 'start'))
+    state = reducePlanLedger(state, graph('4', 'search', 'completed', 'complete'))
+
+    expect(state.currentPlan?.graphNodes).toEqual([
+      { nodeId: 'search', phase: 'complete', attempt: 1, status: 'completed', dependencyIds: [] },
+      { nodeId: 'review', status: 'ready', dependencyIds: ['search'] },
+    ])
+    const duplicate = state
+    expect(reducePlanLedger(state, graph('5', 'search', 'failed', 'fail', {
+      id: 'graph-replay', sequence: '5', payload: {
+        runKey: 'task-1:plan-1:1', eventId: 'task-1:plan-1:1:search:complete', nodeId: 'search', phase: 'complete', attempt: 1,
+        nodes: [{ nodeId: 'search', dependencyIds: [], phase: 'complete', attempt: 1, status: 'completed' }],
+      },
+    }))).toBe(duplicate)
+  })
+
+  it('drops late task graph events from a superseded plan', () => {
+    let state = createPlanLedgerState('session-1')
+    state = reducePlanLedger(state, event())
+    state = reducePlanLedger(state, graph('2', 'old-step', 'running', 'start'))
+    state = reducePlanLedger(state, event({}, { id: 'revision-2', sequence: '3', payload: { planCallId: 'plan-2', goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1 } }))
+    const current = state
+    state = reducePlanLedger(state, graph('4', 'old-step', 'completed', 'complete'))
+    expect(state).toBe(current)
+    expect(state.currentPlan?.graphNodes).toBeUndefined()
   })
 
   it('starts a new goal epoch at revision one and keeps late old epoch events out of current', () => {

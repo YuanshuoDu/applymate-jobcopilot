@@ -96,7 +96,7 @@ const KNOWN_EVENT_TYPES = new Set([
   'step.started', 'step.completed', 'item.started', 'item.delta', 'item.completed', 'item.failed',
   'input.accepted', 'input.consumed', 'tool_call.started', 'tool_call.completed', 'tool_call.failed',
   'policy.decision', 'approval.requested', 'approval.resolved', 'approval.consumed', 'approval.expired',
-  'plan.revision', 'plan.command', 'plan.observation',
+  'plan.revision', 'plan.command', 'plan.observation', 'plan.task_graph',
   'question.answered', 'question.cancelled', 'external_action.reserved', 'stream.overflow', 'cognitive.agenda', CONTEXT_COMPACTION_EVENT_TYPE, STEERING_MARKER_EVENT_TYPE,
 ])
 
@@ -305,9 +305,16 @@ function reduceApprovalEvent(state: TimelineState, value: Record<string, unknown
 function reducePlanEvent(state: TimelineState, value: Record<string, unknown>): TimelineState {
   const parsed = parsePlanLedgerEvent(value, state.sessionId)
   if (!parsed || state.processedEventIds[parsed.id] || !isAfter(parsed.sequence, state.lastSequence)) return state
-  const event = normalizeTimelineEvent(value)
+  const projectedValue = parsed.receipt.kind === 'graph'
+    ? { ...value, payload: {
+      runKey: parsed.receipt.runKey, eventId: parsed.receipt.eventId, nodeId: parsed.receipt.nodeId,
+      phase: parsed.receipt.phase, attempt: parsed.receipt.attempt,
+      nodes: parsed.receipt.nodes.map(node => ({ ...node, dependencyIds: [...node.dependencyIds] })),
+    } }
+    : value
+  const event = normalizeTimelineEvent(projectedValue)
   if (!event || event.sessionId !== state.sessionId) return state
-  const planLedger = reducePlanLedger(state.planLedger, value)
+  const planLedger = reducePlanLedger(state.planLedger, projectedValue)
   if (planLedger === state.planLedger) return state
   const processedEventIds: Record<string, true> = { ...state.processedEventIds, [event.id]: true }
   return {

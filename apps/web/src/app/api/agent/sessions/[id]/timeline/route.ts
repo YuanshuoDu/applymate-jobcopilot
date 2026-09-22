@@ -6,7 +6,7 @@ import { isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { redactStreamValue } from "@/lib/agent/session/stream-redaction"
 import { APPROVAL_LEDGER_EVENT_TYPES, APPROVAL_LEDGER_MAX_EVENTS, projectApprovalLedgerRow } from "@/components/agent-workspace/v2/approval-ledger-parser"
 import { parseCognitiveAgendaReceipt, type CognitiveAgendaScope } from "@/components/agent-workspace/v2/cognitive-agenda-view"
-import { isPlanLedgerEventType, parsePlanLedgerEvent, PLAN_LEDGER_EVENT_TYPES, PLAN_LEDGER_MAX_COMMAND_RECEIPT_BYTES, PLAN_LEDGER_MAX_PLANS, PLAN_LEDGER_MAX_RECEIPT_BYTES, PLAN_LEDGER_MAX_STEPS } from "@/components/agent-workspace/v2/timeline-plan-ledger"
+import { isPlanLedgerEventType, parsePlanLedgerEvent, PLAN_LEDGER_EVENT_TYPES, PLAN_LEDGER_MAX_COMMAND_RECEIPT_BYTES, PLAN_LEDGER_MAX_GRAPH_EVENTS_PER_NODE, PLAN_LEDGER_MAX_PLANS, PLAN_LEDGER_MAX_RECEIPT_BYTES, PLAN_LEDGER_MAX_STEPS, projectPlanTaskGraphPayload } from "@/components/agent-workspace/v2/timeline-plan-ledger"
 import { parseSteeringMarkerEvent, reduceTimelineSteeringMarkers, type TimelineSteeringMarkerEvent } from "@/components/agent-workspace/v2/timeline-steering-markers"
 import { recentTimelineContextCompactionEvents } from "@/components/agent-workspace/v2/timeline-context-compaction-query"
 
@@ -44,7 +44,7 @@ const AGENDA_SELECT = {
   type: true, actor: true, correlationId: true, causationId: true, idempotencyKey: true, payload: true,
 } as const
 
-const PLAN_LEDGER_QUERY_LIMIT = PLAN_LEDGER_MAX_PLANS * (1 + PLAN_LEDGER_MAX_STEPS * 2)
+const PLAN_LEDGER_QUERY_LIMIT = PLAN_LEDGER_MAX_PLANS * (1 + PLAN_LEDGER_MAX_STEPS * (2 + PLAN_LEDGER_MAX_GRAPH_EVENTS_PER_NODE))
 const APPROVAL_LEDGER_QUERY_LIMIT = APPROVAL_LEDGER_MAX_EVENTS * 4
 
 export async function GET(request: NextRequest, context: RouteContext) {
@@ -159,9 +159,14 @@ function planEnvelope(row: AgendaQueryRow, sessionId: string) {
     sequence,
     payload: row.payload,
   }
+  if (row.type === "plan.task_graph") {
+    const payload = projectPlanTaskGraphPayload(row.payload, row.taskId)
+    const projected = payload === null ? null : { ...candidate, payload }
+    return projected && parsePlanLedgerEvent(projected, sessionId) ? projected : null
+  }
   if (!parsePlanLedgerEvent(candidate, sessionId)) return null
-  const envelope = { ...candidate, payload: redactedPlanPayload(row.payload) }
-  return parsePlanLedgerEvent(envelope, sessionId) ? envelope : null
+  const redacted = { ...candidate, payload: redactedPlanPayload(row.payload) }
+  return parsePlanLedgerEvent(redacted, sessionId) ? redacted : null
 }
 
 function redactedPlanPayload(value: unknown): unknown {
