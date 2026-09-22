@@ -674,10 +674,45 @@ describe("createCanonicalPlanExecutionFactory", () => {
     expect(graphPersist.mock.calls.map(([entry]) => entry.event.eventId)).toEqual(["root-1:proposal-1:1:read:attempt:2:retry"])
   })
 
-  it.each([
-    { name: "delegate", plan: proposal([delegate("child")]), actions: ["delegate"] as readonly PlanActionKind[], events: [graphEvent("root-1:proposal-1:1", "start", "child")] },
-    { name: "unknown tool", plan: proposal([use("read", { toolName: "unlisted.read" })]), actions: ["use_tool"] as readonly PlanActionKind[], events: [graphEvent("root-1:proposal-1:1", "start", "read")] },
-  ])("blocks unsafe $name orphan recovery", async ({ plan, actions, events }) => {
+  it("recovers an orphaned idempotent delegate and lets spawn reconcile its child", async () => {
+    const graphPersist = vi.fn<NonNullable<CanonicalPlanExecutionOptions["persistTaskGraph"]>>()
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({
+      ...request, status: "completed" as const, output: { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued", replay: true }, errorCode: null,
+    })) }
+    const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["delegate"], undefined, {
+      initialTaskGraphEvents: [graphEvent("root-1:proposal-1:1", "start", "child")], persistTaskGraph: graphPersist,
+    })
+
+    const result = await hook(input(output(proposal([delegate("child")])), "step-1", [], true))
+
+    expect(result.observations).toHaveLength(1)
+    expect(router.execute).toHaveBeenCalledTimes(1)
+    expect(router.execute.mock.calls[0]?.[1]).toMatchObject({ toolName: "agent.spawn", input: { idempotencyKey: "plan-idempotency:proposal-1:child", role: "scout" } })
+    expect(graphPersist.mock.calls.map(([entry]) => entry.event.eventId)).toEqual([
+      "root-1:proposal-1:1:child:attempt:2:retry", "root-1:proposal-1:1:child:attempt:2:start", "root-1:proposal-1:1:child:attempt:2:complete",
+    ])
+  })
+
+  it("blocks an orphaned delegate whose runtime inputs were not durably resolved", async () => {
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { unexpected: true }, errorCode: null })) }
+    const graphPersist = vi.fn<NonNullable<CanonicalPlanExecutionOptions["persistTaskGraph"]>>()
+    const plan = proposal([use("read"), delegate("child", { inputRefs: ["read"], dependsOn: ["read"] })])
+    const read = { id: "plan-result:proposal-1:read", content: { kind: "plan_command", localId: "read", commandKind: "tool_call", dependsOn: [], status: "completed", errorCode: null, output: { jobId: "job-1" } } }
+    const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["use_tool", "delegate"], undefined, {
+      initialTaskGraphEvents: [
+        graphEvent("root-1:proposal-1:1", "start", "read"), graphEvent("root-1:proposal-1:1", "complete", "read"), graphEvent("root-1:proposal-1:1", "start", "child"),
+      ], persistTaskGraph: graphPersist,
+    })
+
+    expect(observationCode(await hook(input(output(plan), "step-1", [read], true)))).toBe("invalid_plan_output")
+    expect(router.execute).not.toHaveBeenCalled()
+    expect(graphPersist).not.toHaveBeenCalled()
+  })
+
+  it("blocks unsafe unknown tool orphan recovery", async () => {
+    const plan = proposal([use("read", { toolName: "unlisted.read" })])
+    const actions = ["use_tool"] as readonly PlanActionKind[]
+    const events = [graphEvent("root-1:proposal-1:1", "start", "read")]
     const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => ({ ...request, status: "completed" as const, output: { unexpected: true }, errorCode: null })) }
     const graphPersist = vi.fn<NonNullable<CanonicalPlanExecutionOptions["persistTaskGraph"]>>()
     const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, undefined, undefined, {

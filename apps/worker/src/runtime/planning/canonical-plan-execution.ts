@@ -346,7 +346,11 @@ function validateReplayTaskGraph(commands: readonly PlanDispatchCommand[], graph
 }
 
 function isSafeReplayRecoveryCommand(options: CanonicalPlanExecutionOptions, command: PlanDispatchCommand): boolean {
-  if (command.kind !== "tool_call" || command.inputRefs.length > 0 || command.inputRefsDeferred || !CANONICAL_RECOVERY_READ_TOOLS.has(command.call.toolName)) return false
+  if (command.inputRefs.length > 0 || command.inputRefsDeferred) return false
+  if (command.kind === "delegate") {
+    return (command.call.toolName === "agent.spawn" || command.call.toolName === "spawn_subagent") && command.call.toolVersion === "1"
+  }
+  if (command.kind !== "tool_call" || !CANONICAL_RECOVERY_READ_TOOLS.has(command.call.toolName)) return false
   try {
     return options.registry.list(options.capabilities).some(item => {
       if (!isPlainJsonObject(item) || item.name !== command.call.toolName || item.version !== command.call.toolVersion) return false
