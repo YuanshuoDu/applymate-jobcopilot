@@ -3110,3 +3110,11 @@ Focused Worker tests and typecheck passed. Live PostgreSQL/RLS behavior, BullMQ 
 The server-owned planner instruction now describes the advisory proposal shape: `schemaVersion`, goal/plan revisions, nodes, completion criteria and rationale; node dependency and completion fields; and the conditional delegate, join, and request-input fields. It states that dependencies must complete first and that deterministic server validation remains authoritative. The change does not alter `Type.Unknown`, public spawn, production gates, provider, database, or dependency behavior, and includes no user data in the instruction.
 
 Focused message tests and Worker typecheck passed. Live provider/model behavior and production evidence remain unverified.
+
+## 184. P8-102 — Structured child output contract guidance
+
+**Candidate status/date (2026-09-22):** P8-102 is a bounded child-model contract slice; formal P0-P7 acceptance remains **1/8 (12.5%)**.
+
+When a child task carries the exact server-owned Scout/Analyst structured-result marker, `childContextSnapshot` adds a fixed system instruction requiring one JSON result with the role-specific candidates/findings, evidence, evidenceIds, status, and summary fields. Plain and null-prototype JSON markers are accepted; symbol keys, extra fields, mismatched roles, Reviewer/Auditor tasks, and legacy prose paths receive no instruction. Server validation, role policy, public spawn schema, production gates, providers, and persistence remain unchanged.
+
+**Independent verification:** `child-context.test.ts` and `child-executor.test.ts` passed **67/67** tests; Worker TypeScript, source line limit, and `git diff --check` passed. Live provider/model behavior, queue delivery, process restart, and production evidence remain unverified.

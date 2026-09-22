@@ -1,16 +1,14 @@
 import type { RepositoryJsonValue, TenantScope } from "@jobcopilot/agent-protocol"
 import { Buffer } from "node:buffer"
-
 import type { ExecutionOwnerFence } from "../execution-owner.js"
 import type { StepContext, StepContextSnapshot, ContextBlock, ContextSeedBlock } from "../context/step-context-builder.js"
 import type { CoordinationMailboxMessage } from "../tools/coordination-types.js"
 import { getSubagentRolePolicy } from "./role-policy.js"
+import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import type { SubagentTaskRecord } from "./types.js"
-
 const CHILD_MAILBOX_READ_LIMIT = 20
 /** Maximum UTF-8 size of a normalized mailbox payload before it is summarized. */
 export const CHILD_MAILBOX_PAYLOAD_BYTE_LIMIT = 8 * 1024
-
 /** The child context only needs the server-owned pending-read capability. */
 export type ChildMailboxHydrationInput = {
   readonly userId: string
@@ -23,7 +21,6 @@ export type ChildMailboxHydrationInput = {
   readonly stepId: string
   readonly limit: number
 }
-
 export type ChildMailboxReader = {
   readonly listPendingMessages: (input: {
     readonly userId: string
@@ -33,12 +30,10 @@ export type ChildMailboxReader = {
   }) => Promise<readonly CoordinationMailboxMessage[]>
   readonly hydrateMessages?: (input: ChildMailboxHydrationInput) => Promise<readonly CoordinationMailboxMessage[]>
 }
-
 export type ChildContextBuilder = {
   build(request: { scope: TenantScope; identity: ExecutionOwnerFence; stepId: string; snapshot: StepContextSnapshot }): Promise<StepContext>
   getMailboxMessageIds(): readonly string[]
 }
-
 function json(value: unknown): RepositoryJsonValue {
   if (value === null || typeof value === "string" || typeof value === "boolean") return value
   if (typeof value === "number") return Number.isFinite(value) ? value : null
@@ -46,7 +41,6 @@ function json(value: unknown): RepositoryJsonValue {
   if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).filter(([, child]) => child !== undefined).map(([key, child]) => [key, json(child)]))
   return null
 }
-
 /**
  * Normalizes a mailbox payload before measuring it. Sorting keys makes the
  * encoded form stable, while the path set turns cyclic input into safe JSON.
@@ -68,7 +62,6 @@ function mailboxJson(value: unknown, path = new Set<object>()): RepositoryJsonVa
     path.delete(value)
   }
 }
-
 function utf8Prefix(value: string, maxBytes: number): string {
   if (maxBytes <= 0) return ""
   let bytes = 0
@@ -81,7 +74,6 @@ function utf8Prefix(value: string, maxBytes: number): string {
   }
   return prefix
 }
-
 function boundedMailboxPayload(value: unknown): RepositoryJsonValue {
   const normalized = mailboxJson(value)
   const encoded = JSON.stringify(normalized)
@@ -146,6 +138,13 @@ const ROLE_GUIDANCE: ReadonlyMap<string, string> = new Map([
   ["executor", "Read permitted application state and run preflight checks only; do not execute external actions, submit, send, or manage children."],
 ])
 
+function structuredOutputGuidance(task: SubagentTaskRecord): string | null {
+  try {
+    const marker = task.expectedOutputSchema; if ((task.role !== "scout" && task.role !== "analyst") || !marker || typeof marker !== "object" || Array.isArray(marker)) return null
+    const value = marker as Record<string, unknown>; const prototype = Object.getPrototypeOf(marker); return (prototype === Object.prototype || prototype === null) && Object.getOwnPropertySymbols(marker).length === 0 && Object.keys(value).sort().join(",") === "role,schemaVersion" && value.schemaVersion === ROLE_RESULT_SCHEMA && value.role === task.role ? "SERVER STRUCTURED RESULT CONTRACT: Final output must be one JSON object with exactly schemaVersion, role, status, candidates (scout) or findings (analyst), evidence, and summary. evidenceIds must reference evidence in this same result. status must be completed or partial. Do not include extra fields or identity, lease, capability, permission, or authorization data." : null
+  } catch { return null }
+}
+
 function roleGuidance(role: string): string {
   return ROLE_GUIDANCE.get(role) ?? "No server-owned capability contract exists for this role; do not execute tools."
 }
@@ -165,8 +164,9 @@ function roleContract(task: SubagentTaskRecord): Record<string, unknown> {
 }
 
 export function childContextSnapshot(task: SubagentTaskRecord): StepContextSnapshot {
+  const structured = structuredOutputGuidance(task)
   return {
-    system: [{ id: "child-execution", content: "Complete only this scoped child task. Use the server-owned role/taskType capability contract in the profile to choose work; runtime-published tools and router policy are authoritative for access." }],
+    system: [{ id: "child-execution", content: "Complete only this scoped child task. Use the server-owned role/taskType capability contract in the profile to choose work; runtime-published tools and router policy are authoritative for access." }, ...(structured ? [{ id: "structured-result", content: structured }] : [])],
     profile: [{
       id: `child-contract:${task.id}`,
       content: {

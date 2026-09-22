@@ -1749,3 +1749,9 @@ When the canonical `agent.plan.propose` tool is actually exposed to the model, t
 ## P8-101 candidate - advisory model-visible plan shape guidance
 
 The server-owned planner system instruction now gives model-visible, provider-neutral shape guidance for `agent.plan.propose`: proposal revisions and completion criteria, node identity/kind/objective/dependency fields, and conditional delegate, join, and request-input fields. It explicitly states that dependencies complete first and that the deterministic server validator remains the only authority. The guidance contains no user data and does not change the `Type.Unknown` input or validation compatibility. Focused message tests and Worker typecheck passed; live provider behavior and production evidence remain unverified. Formal P0-P7 acceptance remains **1/8 (12.5%)**.
+
+## P8-102 candidate - structured child output contract guidance
+
+When the server-owned child task carries the exact Scout/Analyst `agent-harness.v2.subagent.result` marker, the child context now adds a fixed system contract requiring one JSON result with the role-specific candidates/findings, evidence, evidenceIds, status, and summary fields. It rejects extra identity or permission data in the guidance and leaves Reviewer/Auditor, legacy prose, mismatched markers, and extra-field markers unchanged. The marker check accepts only plain or null-prototype JSON objects and fails closed on inspection errors; the result validator remains authoritative.
+
+**Independent verification:** Focused `child-context.test.ts` and `child-executor.test.ts` validation passed **67/67** tests; Worker `tsc --noEmit --skipLibCheck`, source line limit, and `git diff --check` passed. Live provider behavior, queue delivery, restart recovery, and production evidence remain unverified; formal P0-P7 acceptance remains **1/8 (12.5%)**.
