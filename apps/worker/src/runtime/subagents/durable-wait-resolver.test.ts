@@ -12,7 +12,7 @@ function fixture(input: { turnStatus?: string; waitStatus?: string; suspended?: 
   const secondWait = { ...wait, id: "wait-2", turnId: "turn-2", parentTaskId: "root-2", stepId: "step-2", userId: "user-2", sessionId: "session-2", targetTaskIds: ["child-2"] }
   const turns = input.turnCount === 2 ? [turn, secondTurn] : [turn]
   const waits = input.turnCount === 2 ? [wait, secondWait] : [wait]
-  const state = { turns, waits, targetUser: input.targetUser ?? "user-1", targetStatus: input.targetStatus ?? "completed", sessionStatus: input.sessionStatus ?? "running", sessionSource: input.sessionSource ?? "automation", waitUpdates: 0, turnUpdates: 0, outboxWrites: 0, outboxPublished: false, conflictResets: 0, outboxParams: null as unknown[] | null }
+  const state = { turns, waits, targetUser: input.targetUser ?? "user-1", targetStatus: input.targetStatus ?? "completed", sessionStatus: input.sessionStatus ?? "running", sessionSource: input.sessionSource ?? "automation", waitUpdates: 0, turnUpdates: 0, eventWrites: 0, eventOutboxWrites: 0, outboxWrites: 0, outboxPublished: false, conflictResets: 0, eventParams: null as unknown[] | null, eventOutboxParams: null as unknown[] | null, outboxParams: null as unknown[] | null }
   const calls: string[] = []
   const client = {
     query: async (sql: string, params?: unknown[]) => {
@@ -35,6 +35,7 @@ function fixture(input: { turnStatus?: string; waitStatus?: string; suspended?: 
       }
       if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ id: String(params?.[0]), rootTaskId: String(params?.[0]), turnId: String(params?.[2]), sessionId: String(params?.[1]), userId: String(params?.[3]) }], rowCount: 1 }
       if (sql.includes('FROM "agent_steps"')) return { rows: [{ id: "step-1", taskId: "root-1", attempt: 1, status: "waiting_for_tool" }], rowCount: 1 }
+      if (sql.includes('UPDATE "agent_sessions"')) return { rows: [{ eventSequence: "42" }], rowCount: 1 }
       if (sql.includes('UPDATE "agent_wait_conditions"')) {
         const found = state.waits.find(candidate => candidate.id === String(params?.[3]))
         if (found) { found.status = String(params?.[0]); found.matchedTaskIds = JSON.parse(String(params?.[1])); state.waitUpdates += 1; if (input.closeBeforeWake) state.sessionStatus = "aborted" }
@@ -46,7 +47,14 @@ function fixture(input: { turnStatus?: string; waitStatus?: string; suspended?: 
         if (found) { found.status = "queued"; state.turnUpdates += 1 }
         return { rows: [], rowCount: found ? 1 : 0 }
       }
+      if (sql.includes('INSERT INTO "agent_events"')) {
+        state.eventWrites += 1; state.eventParams = params ?? null; return { rows: [], rowCount: 1 }
+      }
       if (sql.includes('INSERT INTO "agent_outbox"')) {
+        if (sql.includes("'agent.session.event'")) {
+          if (input.closeBeforeOutbox) { state.sessionStatus = "aborted"; return { rows: [], rowCount: 0 } }
+          state.eventOutboxWrites += 1; state.eventOutboxParams = params ?? null; return { rows: [], rowCount: 1 }
+        }
         if (input.closeBeforeOutbox) { state.sessionStatus = "aborted"; if (!sql.includes(SESSION_FENCE)) throw new Error("missing session-state fence"); return { rows: [], rowCount: 0 } }
         state.outboxParams = params ?? null
         if (state.outboxPublished && sql.includes("DO UPDATE")) state.conflictResets += 1; state.outboxWrites += 1; state.outboxPublished = false; return { rows: [], rowCount: 1 }
@@ -69,6 +77,8 @@ describe("durable wait resolver", () => {
     expect(waitScan).toContain('ORDER BY "createdAt" ASC, "id" ASC LIMIT $4 FOR UPDATE SKIP LOCKED')
     expect(fake.state.waits[0].status).toBe("ready")
     expect(fake.state.turns[0].status).toBe("in_progress")
+    expect(fake.state.eventWrites).toBe(0)
+    expect(fake.state.eventOutboxWrites).toBe(0)
     expect(fake.state.outboxWrites).toBe(0)
   })
 
@@ -77,6 +87,12 @@ describe("durable wait resolver", () => {
     fake.state.outboxPublished = true
     await expect(reconcileDurableWaits(fake.pool as never, { now, ownerId: "resolver-1" })).resolves.toEqual({ scanned: 1, resolved: 1, woken: 1 })
     expect(fake.state.turns[0].status).toBe("queued")
+    expect(fake.state.eventWrites).toBe(1)
+    expect(fake.state.eventOutboxWrites).toBe(1)
+    expect(fake.state.eventParams?.[5]).toBe("agent-wait:wait-1:resumed")
+    expect(JSON.parse(String(fake.state.eventParams?.[6]))).toEqual({ waitId: "wait-1", turnId: "turn-1", status: "ready", matchedTaskIds: ["child-1"] })
+    expect(fake.state.eventOutboxParams?.[1]).toBe("session-1")
+    expect(JSON.parse(String(fake.state.eventOutboxParams?.[3]))).toMatchObject({ sessionId: "session-1", turnId: "turn-1", type: "turn.resumed", idempotencyKey: "agent-wait:wait-1:resumed", sequence: "42" })
     expect(fake.state.outboxWrites).toBe(1)
     expect(fake.state.conflictResets).toBe(1)
     expect(fake.state.outboxParams?.[2]).toBe("session-1")
@@ -87,8 +103,10 @@ describe("durable wait resolver", () => {
     expect(fake.state.turnUpdates).toBe(1)
     expect(fake.calls.some(sql => sql.includes('session."status" NOT IN (\'aborted\', \'archived\')'))).toBe(true)
     expect(fake.calls.some(sql => sql.includes('INSERT INTO "agent_outbox"') && sql.includes("WHERE EXISTS"))).toBe(true)
-    expect(fake.calls.filter(sql => sql.includes('UPDATE "agent_wait_conditions"') || sql.includes('UPDATE "agent_turns"') || sql.includes('INSERT INTO "agent_outbox"')).every(sql => sql.includes(SESSION_FENCE))).toBe(true)
+    expect(fake.calls.filter(sql => sql.includes('UPDATE "agent_wait_conditions"') || sql.includes('UPDATE "agent_turns"')).every(sql => sql.includes(SESSION_FENCE))).toBe(true)
     await expect(reconcileDurableWaits(fake.pool as never, { now, ownerId: "resolver-1" })).resolves.toEqual({ scanned: 0, resolved: 0, woken: 0 })
+    expect(fake.state.eventWrites).toBe(1)
+    expect(fake.state.eventOutboxWrites).toBe(1)
     expect(fake.state.outboxWrites).toBe(1)
   })
 
@@ -120,6 +138,8 @@ describe("durable wait resolver", () => {
   it("rolls back a wake when the session closes between wait and Turn updates", async () => {
     const fake = fixture({ suspended: true, turnStatus: "waiting_for_dependency", closeBeforeWake: true })
     await expect(reconcileDurableWaits(fake.pool as never, { now })).rejects.toThrow("wait_turn_wake_fenced")
+    expect(fake.state.eventWrites).toBe(0)
+    expect(fake.state.eventOutboxWrites).toBe(0)
     expect(fake.state.outboxWrites).toBe(0)
     expect(fake.calls.some(sql => sql === "ROLLBACK")).toBe(true)
   })

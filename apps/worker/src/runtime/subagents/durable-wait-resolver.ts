@@ -66,6 +66,26 @@ async function writeDispatch(client: Queryable, row: Row, ownerId: string): Prom
   if (written.rowCount !== 1) throw new Error("wait_session_closed")
 }
 
+async function writeResumeEvent(client: Queryable, wait: Row, turn: Row, status: string, matched: string[]): Promise<void> {
+  const eventId = randomUUID(); const sessionId = String(turn.sessionId); const turnId = String(turn.id); const waitId = String(wait.id)
+  const idempotencyKey = `agent-wait:${waitId}:resumed`; const eventPayload = { waitId, turnId, status, matchedTaskIds: matched }
+  const sequenceResult = await client.query<{ eventSequence: string | bigint }>(
+    `UPDATE "agent_sessions" AS session SET "eventSequence" = "eventSequence" + 1 WHERE session."id" = $1 AND session."userId" = $2 AND ${OPEN_SESSION} RETURNING "eventSequence"`,
+    [sessionId, String(turn.userId)],
+  )
+  const sequence = sequenceResult.rows[0]?.eventSequence
+  if (sequence === undefined) throw new Error("wait_resume_session_sequence_unavailable")
+  const eventSequence = String(sequence)
+  await client.query(
+    `INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload") VALUES ($1, $2, $3, NULL, NULL, $4, 'turn.resumed', 'system', $3, $5, $6, $7::jsonb)`,
+    [eventId, sessionId, turnId, eventSequence, waitId, idempotencyKey, json(eventPayload)],
+  )
+  await client.query(
+    `INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload") VALUES ($1, 'agent.session.event', $2, $3, $4::jsonb)`,
+    [`agent-outbox-${eventId}`, sessionId, `agent-event:${eventId}`, json({ eventId, sessionId, turnId, itemId: null, taskId: null, sequence: eventSequence, type: "turn.resumed", actor: "system", correlationId: turnId, causationId: waitId, idempotencyKey, payload: eventPayload })],
+  )
+}
+
 async function reconcileWait(client: Queryable, wait: Row, turn: Row, now: Date, ownerId: string): Promise<"resolved" | "woken" | "ignored"> {
   const rootTaskId = typeof turn.rootTaskId === "string" ? turn.rootTaskId : ""
   const parent = (await client.query<Row>(
@@ -122,6 +142,7 @@ async function reconcileWait(client: Queryable, wait: Row, turn: Row, now: Date,
     [turn.id, turn.sessionId, now, rootTaskId],
   )
   if (queued.rowCount !== 1) throw new Error("wait_turn_wake_fenced")
+  await writeResumeEvent(client, wait, turn, finalStatus, matched)
   await writeDispatch(client, turn, ownerId)
   return "woken"
 }

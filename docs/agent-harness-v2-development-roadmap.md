@@ -2938,3 +2938,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused scheduler, executor, and canonical replay validation passed **125/125 tests**; the full Worker planning suite passed **323/323 tests**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 
 **Candidate boundary:** Real PostgreSQL/RLS persistence, process restart and cross-process scheduler recovery, production supervisor readiness, and provider/model invocation evidence remain unverified. No schema, queue, provider, Web, planning capability, or legacy executor path was changed.
+
+## 165. P8-79 — Durable wait resume event and outbox
+
+**Candidate status/date (2026-09-22):** P8-79 is recorded as a bounded durable wait projection slice; formal P0-P7 acceptance remains **1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** After a suspended `waiting_for_dependency -> queued` CAS succeeds, the durable wait resolver increments the session event sequence and appends one `turn.resumed` event with idempotency key `agent-wait:<waitId>:resumed`, followed by the matching `agent.session.event` outbox envelope in the same transaction. The payload contains only server-owned `{waitId, turnId, status, matchedTaskIds}` values. Ignored, already-queued, and failed-CAS paths remain event-free.
+
+**Independent verification:** Focused durable-wait resolver validation passed **15/15**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, outbox delivery, process restart recovery, and complete child-to-parent continuation remain unverified. No schema, migration, Web, provider, or consumer change was made; P8-79 remains a candidate.
