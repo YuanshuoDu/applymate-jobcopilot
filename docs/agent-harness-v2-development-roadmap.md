@@ -3102,3 +3102,11 @@ Focused Worker tests and typecheck passed. Live PostgreSQL/RLS behavior, BullMQ 
 **Implementation:** When the server exposes the canonical `agent.plan.propose` tool, `buildModelRequest` adds a fixed planner contract system message. The contract tells the model to stay within the server role allowlist, use the exact `agent-harness.v2.subagent.result` output reference only for machine-aggregated Scout/Analyst delegates, keep Reviewer/Auditor unstructured, and leave identity, lease, capability, permission, and authorization fields to the server. The message is selected from the server-owned tool list and is absent for ordinary Turns or similarly named tools; it does not alter the public `agent.spawn` schema or production gates.
 
 **Independent verification:** `turn-engine-messages.test.ts` and `turn-execution-loop.test.ts` passed **82/82** tests; Worker TypeScript and `git diff --check` passed. This is advisory model guidance only; server validation and marker injection remain authoritative. Live PostgreSQL/RLS, queue delivery, process restart, provider invocation, and production evidence remain unverified; P8-100 remains a candidate.
+
+## 183. P8-101 — Advisory model-visible plan shape guidance
+
+**Candidate status/date (2026-09-22):** P8-101 is a bounded planner prompt-contract slice; formal P0-P7 acceptance remains **1/8 (12.5%)**.
+
+The server-owned planner instruction now describes the advisory proposal shape: `schemaVersion`, goal/plan revisions, nodes, completion criteria and rationale; node dependency and completion fields; and the conditional delegate, join, and request-input fields. It states that dependencies must complete first and that deterministic server validation remains authoritative. The change does not alter `Type.Unknown`, public spawn, production gates, provider, database, or dependency behavior, and includes no user data in the instruction.
+
+Focused message tests and Worker typecheck passed. Live provider/model behavior and production evidence remain unverified.

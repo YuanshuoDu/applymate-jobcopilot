@@ -8,7 +8,14 @@ import { buildCognitiveMemoryRecall, cognitiveMemoryRecallText } from "./cogniti
 
 export const PLAN_REPLAN_SYSTEM_INSTRUCTION = "SERVER CONTROL: A child task failure requires replanning. Output exactly one agent.plan.propose tool call for a new plan based on the failed plan revision and current goal. Do not call any other tool and do not return final text."
 export const PLAN_REPLAN_STEERING_OVERRIDE_INSTRUCTION = "SERVER CONTROL: Fresh authenticated user steering is available while replanning is required. If it explicitly changes the goal, output exactly one agent.goal.update tool call reflecting that change. Otherwise output exactly one agent.plan.propose tool call based on the failed plan revision and current goal. Do not call any other tool and do not return final text."
-export const CANONICAL_PLANNER_CONTRACT_INSTRUCTION = "SERVER PLANNER CONTRACT: Delegate nodes may use only roles in the server allowlist. Use outputSchemaRef exactly \"agent-harness.v2.subagent.result\" only for scout or analyst when a machine-aggregated structured result is required. Reviewer and auditor are unstructured and must not claim that schema. The server validates plans and injects internal result markers; never provide identity, lease, capability, permission, or authorization fields."
+export const CANONICAL_PLANNER_CONTRACT_INSTRUCTION = [
+  "SERVER PLANNER CONTRACT (ADVISORY): Propose a plan object with schemaVersion, basedOnGoalRevision, basedOnPlanRevision, nodes, completionCriteria, and briefRationale.",
+  "Each node should include localId, kind, objective, inputRefs, dependsOn, successCriteria, and outputSchemaRef.",
+  "Delegate nodes should also include role, taskType, and constraints; join nodes should include joinMode; request_input nodes should include question and approvalBoundary.",
+  "Every dependency must be completed before its dependent node runs. The deterministic server validator is the only authority; this guidance does not change Type.Unknown compatibility or validation.",
+  "Delegate nodes may use only roles in the server allowlist. Use outputSchemaRef exactly \"agent-harness.v2.subagent.result\" only for scout or analyst when a machine-aggregated structured result is required. Reviewer and auditor are unstructured and must not claim that schema.",
+  "The server validates plans and injects internal result markers; never provide identity, lease, capability, permission, or authorization fields.",
+].join(" ")
 const CANONICAL_PLAN_TOOL_NAME = "agent.plan.propose"
 
 function stableJson(value: unknown): string {

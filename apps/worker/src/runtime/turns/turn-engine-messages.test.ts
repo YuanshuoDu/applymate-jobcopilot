@@ -114,6 +114,13 @@ describe("TurnEngine model message mapping", () => {
     const plannerMessages = plannerRequest.messages.filter(message => message.role === "system")
     expect(plannerMessages).toContainEqual({ role: "system", content: [{ type: "text", text: CANONICAL_PLANNER_CONTRACT_INSTRUCTION }] })
     expect(CANONICAL_PLANNER_CONTRACT_INSTRUCTION).toContain("server allowlist")
+    expect(CANONICAL_PLANNER_CONTRACT_INSTRUCTION).toContain("schemaVersion")
+    expect(CANONICAL_PLANNER_CONTRACT_INSTRUCTION).toContain("basedOnGoalRevision")
+    expect(CANONICAL_PLANNER_CONTRACT_INSTRUCTION).toContain("basedOnPlanRevision")
+    expect(CANONICAL_PLANNER_CONTRACT_INSTRUCTION).toContain("localId, kind, objective, inputRefs, dependsOn, successCriteria, and outputSchemaRef")
+    expect(CANONICAL_PLANNER_CONTRACT_INSTRUCTION).toContain("joinMode")
+    expect(CANONICAL_PLANNER_CONTRACT_INSTRUCTION).toContain("question and approvalBoundary")
+    expect(CANONICAL_PLANNER_CONTRACT_INSTRUCTION).toContain("deterministic server validator is the only authority")
     expect(CANONICAL_PLANNER_CONTRACT_INSTRUCTION).toContain("agent-harness.v2.subagent.result")
     expect(CANONICAL_PLANNER_CONTRACT_INSTRUCTION).toContain("identity, lease, capability, permission")
 
