@@ -8,6 +8,8 @@ import { buildCognitiveMemoryRecall, cognitiveMemoryRecallText } from "./cogniti
 
 export const PLAN_REPLAN_SYSTEM_INSTRUCTION = "SERVER CONTROL: A child task failure requires replanning. Output exactly one agent.plan.propose tool call for a new plan based on the failed plan revision and current goal. Do not call any other tool and do not return final text."
 export const PLAN_REPLAN_STEERING_OVERRIDE_INSTRUCTION = "SERVER CONTROL: Fresh authenticated user steering is available while replanning is required. If it explicitly changes the goal, output exactly one agent.goal.update tool call reflecting that change. Otherwise output exactly one agent.plan.propose tool call based on the failed plan revision and current goal. Do not call any other tool and do not return final text."
+export const CANONICAL_PLANNER_CONTRACT_INSTRUCTION = "SERVER PLANNER CONTRACT: Delegate nodes may use only roles in the server allowlist. Use outputSchemaRef exactly \"agent-harness.v2.subagent.result\" only for scout or analyst when a machine-aggregated structured result is required. Reviewer and auditor are unstructured and must not claim that schema. The server validates plans and injects internal result markers; never provide identity, lease, capability, permission, or authorization fields."
+const CANONICAL_PLAN_TOOL_NAME = "agent.plan.propose"
 
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`
@@ -22,12 +24,17 @@ function blockText(block: StepContext["blocks"][number]): string {
   return `[harness context layer=${block.layer} trust=${trust} source=${block.source}]\n${stableJson(block.content)}`
 }
 
-export function contextToModelMessages(context: StepContext, replanRequired = false, freshSteering = false): ModelMessage[] {
+function hasCanonicalPlanTool(tools: readonly unknown[]): boolean {
+  return tools.some(tool => tool !== null && typeof tool === "object" && !Array.isArray(tool) && (tool as Record<string, unknown>).name === CANONICAL_PLAN_TOOL_NAME)
+}
+
+export function contextToModelMessages(context: StepContext, replanRequired = false, freshSteering = false, plannerContract = false): ModelMessage[] {
   const messages: ModelMessage[] = []
   if (replanRequired) {
     const text = freshSteering ? PLAN_REPLAN_STEERING_OVERRIDE_INSTRUCTION : PLAN_REPLAN_SYSTEM_INSTRUCTION
     messages.push({ role: "system", content: [{ type: "text", text }] })
   }
+  if (plannerContract) messages.push({ role: "system", content: [{ type: "text", text: CANONICAL_PLANNER_CONTRACT_INSTRUCTION }] })
   messages.push({ role: "system", content: [{ type: "text", text: cognitiveControlFrameText(buildCognitiveControlFrame(context, { replanRequired, freshSteering })) }] })
   const memoryRecall = buildCognitiveMemoryRecall(context)
   if (memoryRecall) messages.push({ role: "system", content: [{ type: "text", text: cognitiveMemoryRecallText(memoryRecall) }] })
@@ -109,7 +116,7 @@ export function buildModelRequest(input: {
     schemaVersion: "agent-harness.v2",
     provider: input.model.profile.provider,
     model: input.model.profile.model,
-    messages: contextToModelMessages(input.context, input.replanRequired === true, input.freshSteering === true && input.replanRequired === true),
+    messages: contextToModelMessages(input.context, input.replanRequired === true, input.freshSteering === true && input.replanRequired === true, hasCanonicalPlanTool(input.tools)),
     tools: [...input.tools],
     capabilities: capabilities(input.model.profile),
     ...(input.model.profile.nativeTools && input.tools.length > 0 ? { toolChoice: "auto" as const } : {}),
