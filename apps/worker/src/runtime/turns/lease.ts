@@ -217,7 +217,7 @@ export async function releaseTurnLease(
            "updatedAt" = $6
        WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwnerId" = $3
          AND "leaseVersion" = $4 AND "userId" = $7 AND "leaseExpiresAt" > $6
-         AND ("status" = 'in_progress' OR ("status" = 'waiting_for_user' AND $5 = 'waiting_for_user'))`,
+         AND ("status" = 'in_progress' OR ("status" = 'waiting_for_user' AND $5 = 'waiting_for_user') OR ("status" = 'waiting_for_approval' AND $5 = 'waiting_for_approval'))`,
       [current.turnId, current.sessionId, current.ownerId, current.leaseVersion, status, now, current.userId],
     )
     if (result.rowCount !== 1) throw new LeaseUnavailable("Turn lease is no longer owned")

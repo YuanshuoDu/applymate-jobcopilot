@@ -8,13 +8,18 @@ const wakeup: AgentTurnWakeupPayload = {
   eventId: "event_wakeup", sessionId: "session_1", turnId: "turn_1", itemId: "agent-wait:question:q1",
   waitKind: "question", waitId: "q1", toolCallId: "call_1", status: "answered", nextTurnRevision: 6,
 }
+const approvalWakeup: AgentTurnWakeupPayload = {
+  eventId: "event_approval", sessionId: "session_1", turnId: "turn_1", itemId: "agent-wait:approval:a1",
+  waitKind: "approval", waitId: "a1", toolCallId: "call_approval", status: "approved", nextTurnRevision: 6,
+}
 
 type FakeOutboxRow = { id: string; aggregateId: string; payload: unknown; publishedAt?: Date | null }
 type FakeOptions = {
+  payload?: AgentTurnWakeupPayload
   rows?: FakeOutboxRow[]
   sessionStatus?: string
   sessionSequenceRows?: Array<string | bigint | null>
-  turn?: { userId: string; status: string; revision: number } | null
+  turn?: { userId: string; status: string; revision: number; leaseOwnerId?: string | null; leaseExpiresAt?: string | null; leaseStartedAt?: string | null } | null
   item?: { status: string; content: unknown } | null
   event?: { sessionId: string; turnId: string; itemId: string | null; type: string; payload: unknown } | null
   execution?: { userId: string; sessionId: string; status: string; error: string | null; completedAt: string | null } | null
@@ -35,11 +40,16 @@ function wakeupEnvelope(payload = wakeup) {
 
 function fakePool(options: FakeOptions = {}) {
   const calls: Array<[string, unknown[] | undefined]> = []
-  const rows = new Map((options.rows ?? [{ id: "outbox_1", aggregateId: wakeup.sessionId, payload: wakeupEnvelope() }]).map((row) => [row.id, { ...row, publishedAt: row.publishedAt ?? null }]))
+  const currentWakeup = options.payload ?? wakeup
+  const rows = new Map((options.rows ?? [{ id: "outbox_1", aggregateId: currentWakeup.sessionId, payload: wakeupEnvelope(currentWakeup) }]).map((row) => [row.id, { ...row, publishedAt: row.publishedAt ?? null }]))
   const outboxUpdates: Array<{ id: string; lastError: unknown }> = []
-  let turn = options.turn === undefined ? { userId: "user_1", status: "waiting_for_user", revision: 6 } : options.turn
-  const item = options.item === undefined ? { status: "completed", content: { waitKind: "question", questionId: "q1", toolCallId: "call_1", answer: "secret-answer" } } : options.item
-  const event = options.event === undefined ? { sessionId: wakeup.sessionId, turnId: wakeup.turnId, itemId: wakeup.itemId, type: "turn.wakeup", payload: wakeupEnvelope().payload } : options.event
+  let turn = options.turn === undefined ? { userId: "user_1", status: currentWakeup.waitKind === "approval" ? "waiting_for_approval" : "waiting_for_user", revision: currentWakeup.nextTurnRevision } : options.turn
+  const item = options.item === undefined
+    ? currentWakeup.waitKind === "approval"
+      ? { status: "completed", content: { waitKind: "approval", approvalId: "a1", toolCallId: "call_approval" } }
+      : { status: "completed", content: { waitKind: "question", questionId: "q1", toolCallId: "call_1", answer: "secret-answer" } }
+    : options.item
+  const event = options.event === undefined ? { sessionId: currentWakeup.sessionId, turnId: currentWakeup.turnId, itemId: currentWakeup.itemId, type: "turn.wakeup", payload: wakeupEnvelope(currentWakeup).payload } : options.event
   const execution = options.execution === undefined ? { userId: "user_1", sessionId: wakeup.sessionId, status: "waiting_for_user", error: "old error", completedAt: "old completion" } : options.execution
   let failEventOnce = options.failEventOnce ?? false
   let failExecutionUpdateOnce = options.failExecutionUpdateOnce ?? false
@@ -90,7 +100,7 @@ function fakePool(options: FakeOptions = {}) {
       }
       if (sql.includes('UPDATE "agent_turns"')) {
         const rowCount = options.turnUpdateRows ?? 1
-        if (rowCount === 1 && sql.includes("SET \"status\" = 'queued'")) turn = turn ? { ...turn, status: "queued", revision: turn.revision + 1 } : turn
+        if (rowCount === 1 && sql.includes("SET \"status\" = 'queued'")) turn = turn ? { ...turn, status: "queued", revision: turn.revision + 1, leaseOwnerId: null, leaseExpiresAt: null, leaseStartedAt: null } : turn
         return { rows: [], rowCount }
       }
       if (sql.includes('UPDATE "agent_outbox"')) {
@@ -105,7 +115,7 @@ function fakePool(options: FakeOptions = {}) {
     release: vi.fn(),
   }
   const pool = { connect: vi.fn(async () => client) } as unknown as pg.Pool
-  return { pool, client, calls, outboxUpdates, rows, execution }
+  return { pool, client, calls, outboxUpdates, rows, execution, get turn() { return turn } }
 }
 
 function hasCall(calls: Array<[string, unknown[] | undefined]>, fragment: string): boolean {
@@ -138,6 +148,23 @@ describe("Agent wakeup consumer", () => {
 
     await expect(resumeAgentTurn(fake.pool, wakeup)).resolves.toMatchObject({ status: "resumed" })
     expect(fake.calls.some(([sql]) => sql.includes("SET \"status\" = 'queued'"))).toBe(true)
+  })
+
+  it("resumes an approval wait and clears stale lease ownership before queueing", async () => {
+    const fake = fakePool({
+      payload: approvalWakeup,
+      turn: {
+        userId: "user_1", status: "waiting_for_approval", revision: approvalWakeup.nextTurnRevision,
+        leaseOwnerId: "stale-owner", leaseExpiresAt: "2026-09-01T00:01:00.000Z", leaseStartedAt: "2026-09-01T00:00:00.000Z",
+      },
+    })
+
+    await expect(resumeAgentTurn(fake.pool, approvalWakeup)).resolves.toMatchObject({ status: "resumed", turnId: approvalWakeup.turnId, itemId: approvalWakeup.itemId })
+    expect(fake.turn).toMatchObject({ status: "queued", leaseOwnerId: null, leaseExpiresAt: null, leaseStartedAt: null })
+    const turnUpdate = fake.calls.find(([sql]) => sql.includes('UPDATE "agent_turns" AS turn'))?.[0] ?? ""
+    expect(turnUpdate).toContain('"leaseOwnerId" = NULL')
+    expect(turnUpdate).toContain('"leaseExpiresAt" = NULL')
+    expect(turnUpdate).toContain('"leaseStartedAt" = NULL')
   })
 
   it("claims and marks durable wakeups after the same-lineage resume", async () => {
@@ -260,6 +287,14 @@ describe("Agent wakeup consumer", () => {
     await expect(drainAgentWakeups(revision.pool, 1)).resolves.toBe(1)
     expect(revision.outboxUpdates).toEqual([{ id: "revision", lastError: "turn_revision_conflict" }])
     expect(revision.calls.some(([sql]) => sql.includes("SET \"status\" = 'queued'"))).toBe(false)
+
+    const waitKind = fakePool({
+      payload: approvalWakeup,
+      turn: { userId: "user_1", status: "waiting_for_user", revision: approvalWakeup.nextTurnRevision },
+    })
+    await expect(resumeAgentTurn(waitKind.pool, approvalWakeup)).rejects.toMatchObject({ code: "wait_scope_mismatch" })
+    expect(waitKind.outboxUpdates).toEqual([])
+    expect(waitKind.calls.some(([sql]) => sql.includes("SET \"status\" = 'queued'"))).toBe(false)
 
     const lineage = fakePool({ rows: [{ id: "lineage", aggregateId: wakeup.sessionId, payload: wakeupEnvelope() }], event: null })
     await expect(drainAgentWakeups(lineage.pool, 1)).resolves.toBe(1)

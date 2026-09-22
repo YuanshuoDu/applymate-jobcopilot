@@ -96,7 +96,9 @@ async function resumeInTransaction(client: Client, payload: AgentTurnWakeupPaylo
 
   const updated = await client.query(
     `UPDATE "agent_turns" AS turn
-     SET "status" = 'queued', "revision" = "revision" + 1, "completedAt" = NULL, "updatedAt" = CURRENT_TIMESTAMP
+     SET "status" = 'queued', "leaseOwnerId" = NULL, "leaseExpiresAt" = NULL,
+         "leaseStartedAt" = NULL, "revision" = "revision" + 1,
+         "completedAt" = NULL, "updatedAt" = CURRENT_TIMESTAMP
      WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3
        AND turn."status" IN ('waiting_for_approval', 'waiting_for_user') AND turn."revision" = $4
        AND EXISTS (

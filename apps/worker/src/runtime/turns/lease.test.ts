@@ -143,6 +143,7 @@ describe("database Turn lease", () => {
     const fake = fakePool([])
     const current: TurnLease = { ...payload, userId: row.userId, leaseVersion: row.leaseVersion, leaseStartedAt: now, leaseExpiresAt: row.leaseExpiresAt }
     await expect(releaseTurnLease(fake.pool, current, "completed", now)).resolves.toBe(false)
+    await expect(releaseTurnLease(fake.pool, current, "waiting_for_approval", now)).resolves.toBe(false)
     await expect(expireTurnLease(fake.pool, current, now)).resolves.toBe(false)
   })
 
@@ -155,6 +156,18 @@ describe("database Turn lease", () => {
     expect(sql).toContain('"userId" = $7')
     expect(sql).toContain('"leaseExpiresAt" > $6')
     expect(params).toEqual([current.turnId, current.sessionId, current.ownerId, current.leaseVersion, "waiting_for_user", now, current.userId])
+  })
+
+  it("releases a matching persisted approval wait with the same live fence", async () => {
+    const fake = fakePool()
+    const current: TurnLease = { ...payload, userId: row.userId, leaseVersion: row.leaseVersion, leaseStartedAt: now, leaseExpiresAt: row.leaseExpiresAt }
+    await expect(releaseTurnLease(fake.pool, current, "waiting_for_approval", now)).resolves.toBe(true)
+    const [sql, params] = fake.calls.find(([text]) => text.includes('SET "status" = $5')) ?? ["", []]
+    expect(sql).toContain('"status" = \'waiting_for_approval\' AND $5 = \'waiting_for_approval\'')
+    expect(sql).toContain('"leaseOwnerId" = $3')
+    expect(sql).toContain('"leaseVersion" = $4')
+    expect(sql).toContain('"leaseExpiresAt" > $6')
+    expect(params).toEqual([current.turnId, current.sessionId, current.ownerId, current.leaseVersion, "waiting_for_approval", now, current.userId])
   })
 
   it("can fence an already-expired heartbeat before a scanner reclaims it", async () => {

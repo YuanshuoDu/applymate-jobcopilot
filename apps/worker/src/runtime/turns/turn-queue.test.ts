@@ -51,7 +51,9 @@ function waitingPool() {
       if (sql.includes('UPDATE "agent_outbox"')) return { rows: [], rowCount: 1 }
       if (sql.includes('SET "status" = $5')) {
         const next = String(params?.[4])
-        const allowed = state.turnStatus === "in_progress" || (state.turnStatus === "waiting_for_user" && next === "waiting_for_user")
+        const allowed = state.turnStatus === "in_progress"
+          || (state.turnStatus === "waiting_for_user" && next === "waiting_for_user")
+          || (state.turnStatus === "waiting_for_approval" && next === "waiting_for_approval")
         if (!allowed || state.leaseOwnerId !== params?.[2] || state.leaseVersion !== params?.[3]) return { rows: [], rowCount: 0 }
         state.turnStatus = next
         state.leaseOwnerId = null
@@ -61,7 +63,7 @@ function waitingPool() {
     }),
     release: vi.fn(),
   }
-  return { pool: { connect: vi.fn().mockResolvedValue(client) }, calls, state, persistWait: () => { state.turnStatus = "waiting_for_user" } }
+  return { pool: { connect: vi.fn().mockResolvedValue(client) }, calls, state, persistWait: (status: "waiting_for_user" | "waiting_for_approval" = "waiting_for_user") => { state.turnStatus = status } }
 }
 
 describe("Turn queue processor", () => {
@@ -113,6 +115,21 @@ describe("Turn queue processor", () => {
     expect(result).toEqual({ status: "waiting_for_user" })
     expect(fake.state).toEqual({ turnStatus: "waiting_for_user", leaseOwnerId: null, leaseVersion: 1 })
     expect(fake.calls.some((sql) => sql.includes('"status" = \'in_progress\' OR ("status" = \'waiting_for_user\' AND $5 = \'waiting_for_user\')'))).toBe(true)
+  })
+
+  it("releases the turn after canonical runtime persists an approval wait", async () => {
+    const fake = waitingPool()
+    const execute = vi.fn(async () => {
+      fake.persistWait("waiting_for_approval")
+      return { status: "waiting_for_approval" as const }
+    })
+    const result = await runTurnJob(
+      { data: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptsMade: 0 },
+      { pool: fake.pool, execute },
+    )
+    expect(result).toEqual({ status: "waiting_for_approval" })
+    expect(fake.state).toEqual({ turnStatus: "waiting_for_approval", leaseOwnerId: null, leaseVersion: 1 })
+    expect(fake.calls.some((sql) => sql.includes('"status" = \'waiting_for_approval\' AND $5 = \'waiting_for_approval\''))).toBe(true)
   })
 
   it("fences duplicate concurrent delivery before either executor can run twice", async () => {
