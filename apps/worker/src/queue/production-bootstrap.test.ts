@@ -5,6 +5,8 @@ import type { ModelAdapter, ModelStreamEvent, HarnessModelRequest } from "@jobco
 
 import { AgentTreeManager, type SubagentClock } from "../runtime/subagents/manager.js"
 import type { SubagentExecutionResult, SubagentLease, SubagentStore, SubagentTaskRecord } from "../runtime/subagents/types.js"
+import { createProductionChildExecutor } from "../runtime/subagents/production-child-runtime.js"
+import type { TreeBudgetReservation, TreeBudgetReservationStore } from "../runtime/subagents/tree-budget-types.js"
 import type { CoordinationStore, CoordinationTaskView, DurableWaitPort } from "../runtime/tools/coordination-types.js"
 import { createCoordinationTools } from "../runtime/tools/coordination-tools.js"
 import { createCanonicalPolicy } from "../runtime/policy/canonical-policy.js"
@@ -18,7 +20,8 @@ import { InMemoryToolLifecycleSink, ToolLifecycle } from "../runtime/tools/lifec
 import { InMemoryToolResultReferenceStore } from "../runtime/tools/redaction.js"
 import { ToolRegistry } from "../runtime/tools/registry.js"
 import { ToolRouter } from "../runtime/tools/router.js"
-import type { RuntimeToolDefinition } from "../runtime/tools/types.js"
+import type { PublicToolDefinition, RuntimeToolDefinition, ToolCallRequest, ToolRouterContext } from "../runtime/tools/types.js"
+import type { ExecutionOwnerFence } from "../runtime/execution-owner.js"
 import type { CanonicalTurnState } from "../runtime/canonical-turn-state.js"
 import { StepContextBuilder } from "../runtime/context/step-context-builder.js"
 import type { InputClaimStore, InputClaimTransaction } from "../runtime/context/input-claim-store.js"
@@ -371,7 +374,7 @@ describe("production Worker bootstrap", () => {
 
   it("composes root TurnEngine coordination with a leased child execution and wait closure", async () => {
     const now = new Date("2026-09-01T00:00:00.000Z")
-    const child: SubagentTaskRecord = { id: "child_fixture", userId: "user_fixture", sessionId: "session_fixture", turnId: "turn_fixture", rootTaskId: "root_fixture", parentTaskId: "root_fixture", path: "/root_fixture/child_fixture", depth: 1, role: "scout", taskType: "research", status: "queued", goal: "Find fixture evidence", constraints: [], successCriteria: [], allowedActions: [], context: null, expectedOutputSchema: null, result: null, failureReason: null, attemptCount: 0, maxAttempts: 3, nextAttemptAt: null, leaseOwner: null, leaseExpiresAt: null, interruptRequestedAt: null, budgetSnapshot: {}, toolPolicySnapshot: {} }
+    const child: SubagentTaskRecord = { id: "child_fixture", userId: "user_fixture", sessionId: "session_fixture", turnId: "turn_fixture", rootTaskId: "root_fixture", parentTaskId: "root_fixture", path: "/root_fixture/child_fixture", depth: 1, role: "scout", taskType: "research", status: "queued", goal: "Find fixture evidence", constraints: [], successCriteria: [], allowedActions: ["fixture.read"], context: null, expectedOutputSchema: null, result: null, failureReason: null, attemptCount: 0, maxAttempts: 3, nextAttemptAt: null, leaseOwner: null, leaseExpiresAt: null, interruptRequestedAt: null, budgetSnapshot: { limits: { maxSteps: 4 }, subagentPolicy: { maxAttempts: 3 } }, toolPolicySnapshot: { capabilities: ["read"] } }
     const rootTask: SubagentTaskRecord = { ...child, id: "root_fixture", parentTaskId: null, path: "/root_fixture", depth: 0, role: "orchestrator", taskType: "turn", status: "running" }
     const tasks = new Map([[child.id, child]])
     const clock: SubagentClock = { setInterval: () => 1 as never, clearInterval: vi.fn() }
@@ -381,20 +384,91 @@ describe("production Worker bootstrap", () => {
     const view = (): CoordinationTaskView => ({ ...tasks.get(child.id)! })
     const replays = new Map<string, CoordinationTaskView>()
     const coordinationStore: CoordinationStore = { getTask: async input => input.taskId === "root_fixture" ? rootView : view(), listTasks: async () => [view()], sendMessage: vi.fn(), getSpawnReplay: async input => replays.get(input.idempotencyKey) ?? null, recordSpawn: async input => { replays.set(input.idempotencyKey, input.task); return true }, appendActivity: async () => undefined }
-    let childExecutor: ((input: { lease: SubagentLease }) => Promise<SubagentExecutionResult>) | undefined
+    const childRequests: HarnessModelRequest[] = []
+    const childToolCalls: Array<{ context: ToolRouterContext; request: ToolCallRequest }> = []
+    let childModelCalls = 0
+    const childModel: ModelAdapter = {
+      id: "fixture-child-model",
+      profile: { provider: "fixture", model: "fixture-child", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false, supportsReasoningSummary: false, supportsResponseContinuation: false, supportsProviderConversation: false, supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low" },
+      async *stream(request) {
+        childRequests.push(request)
+        childModelCalls += 1
+        if (childModelCalls === 1) yield* [{ type: "tool_call_completed", callId: "child-read", name: "fixture.read", arguments: {} }, { type: "completed", finishReason: "tool_calls" }]
+        else yield* [{ type: "text_delta", text: "Child found job-fixture." }, { type: "completed", finishReason: "stop" }]
+      },
+    }
+    const childTool = vi.fn(async (userId: string) => ({ child: userId, evidence: "job-fixture" }))
+    const childDefinition: PublicToolDefinition = { schemaVersion, name: "fixture.read", version: "1", description: "Read deterministic child evidence", capabilities: ["read"], inputSchema: Type.Object({}, { additionalProperties: false }), outputSchema: Type.Object({ child: Type.String(), evidence: Type.String() }, { additionalProperties: false }), risk: "read", domain: "jobs", idempotency: "read_only", timeoutMs: 1_000, requiredCapabilities: [] }
+    const childRouter = vi.fn(async (context: ToolRouterContext, request: ToolCallRequest) => {
+      childToolCalls.push({ context, request })
+      return { id: request.id, toolName: request.toolName, toolVersion: request.toolVersion, status: "completed" as const, output: await childTool(context.scope.userId), errorCode: null }
+    })
+    const childTurnStore = compositionStore()
+    const childBudgetReservations: TreeBudgetReservation[] = []
+    const childBudget: TreeBudgetReservationStore = {
+      reserve: vi.fn(async input => {
+        const timestamp = input.now ?? now
+        const reservation: TreeBudgetReservation = { ...input, id: `child-budget:${childBudgetReservations.length + 1}`, units: 1, status: "reserved", createdAt: timestamp, updatedAt: timestamp, settledAt: null }
+        childBudgetReservations.push(reservation)
+        return reservation
+      }),
+      settle: vi.fn(async input => {
+        const index = childBudgetReservations.findIndex(reservation => reservation.id === input.id)
+        if (index < 0) throw new Error(`Unknown child budget reservation ${input.id}`)
+        const timestamp = input.now ?? now
+        const reservation: TreeBudgetReservation = { ...childBudgetReservations[index]!, status: input.status, updatedAt: timestamp, settledAt: timestamp }
+        childBudgetReservations[index] = reservation
+        return reservation
+      }),
+    }
+    const childModelRuntimeFactory = vi.fn(() => childModel)
+    const childToolRuntimeFactory = vi.fn(({ task, lease, owner }: { task: SubagentTaskRecord; lease: SubagentLease; owner: ExecutionOwnerFence }) => {
+      expect(task.id).toBe(child.id)
+      expect(lease.id).toBe(child.id)
+      expect(owner).toMatchObject({ taskId: child.id, rootTaskId: "root_fixture", ownerId: "queue_fixture", attemptCount: 1 })
+      return { definitions: [childDefinition], router: { execute: childRouter } }
+    })
+    const childExecutor = createProductionChildExecutor({
+      pool: { connect: vi.fn() } as never,
+      turnStore: childTurnStore,
+      treeBudget: childBudget,
+      authorizeUsage: vi.fn(async () => ({ settle: vi.fn(async () => undefined) })),
+      modelRuntimeFactory: childModelRuntimeFactory,
+      toolRuntimeFactory: childToolRuntimeFactory,
+    })
+    let bootstrappedChildExecutor: ((input: { lease: SubagentLease }) => Promise<SubagentExecutionResult>) | undefined
     let waitCalls = 0
-    const wait: DurableWaitPort = { wait: async input => { waitCalls += 1; expect(childExecutor).toBeDefined(); const outcome = await manager.run({ taskId: child.id, sessionId: input.sessionId, rootTaskId: "root_fixture", ownerId: "queue_fixture" }, childExecutor!); expect(outcome.status).toBe("completed"); return { waitId: "wait_fixture", status: "ready", deadlineAt: now.toISOString(), matchedTaskIds: [child.id] } } }
+    const wait: DurableWaitPort = { wait: async input => { waitCalls += 1; expect(bootstrappedChildExecutor).toBe(childExecutor); const outcome = await manager.run({ taskId: child.id, sessionId: input.sessionId, rootTaskId: "root_fixture", ownerId: "queue_fixture" }, bootstrappedChildExecutor!); expect(outcome.status).toBe("completed"); expect(tasks.get(child.id)?.result).toMatchObject({ status: "completed", toolCallCount: 1 }); return { waitId: "wait_fixture", status: "ready", deadlineAt: now.toISOString(), matchedTaskIds: [child.id] } } }
     const requests: HarnessModelRequest[] = []
     let calls = 0
-    const model: ModelAdapter = { id: "fixture-model", profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false, supportsReasoningSummary: false, supportsResponseContinuation: false, supportsProviderConversation: false, supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low" }, async *stream(request) { requests.push(request); calls += 1; if (calls === 1) yield* [{ type: "tool_call_completed", callId: "spawn", name: "spawn_subagent", arguments: { idempotencyKey: "spawn_fixture", role: "scout", taskType: "research", goal: "Find fixture evidence" } }, { type: "completed", finishReason: "tool_calls" }]; else if (calls === 2) yield* [{ type: "tool_call_completed", callId: "wait", name: "wait_subagents", arguments: { idempotencyKey: "wait_fixture", taskIds: [child.id], mode: "all", timeoutMs: 1_000 } }, { type: "completed", finishReason: "tool_calls" }]; else if (calls === 3) yield* [{ type: "tool_call_completed", callId: "read", name: "fixture.read", arguments: {} }, { type: "completed", finishReason: "tool_calls" }]; else yield* [{ type: "text_delta", text: "Found job-fixture." }, { type: "completed", finishReason: "stop" }] } }
+    const model: ModelAdapter = { id: "fixture-model", profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false, supportsReasoningSummary: false, supportsResponseContinuation: false, supportsProviderConversation: false, supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low" }, async *stream(request) { requests.push(request); calls += 1; if (calls === 1) yield* [{ type: "tool_call_completed", callId: "spawn", name: "agent.spawn", arguments: { idempotencyKey: "spawn_fixture", role: "scout", taskType: "research", goal: "Find fixture evidence" } }, { type: "completed", finishReason: "tool_calls" }]; else if (calls === 2) yield* [{ type: "tool_call_completed", callId: "wait", name: "agent.wait", arguments: { idempotencyKey: "wait_fixture", taskIds: [child.id], mode: "all", timeoutMs: 1_000 } }, { type: "completed", finishReason: "tool_calls" }]; else if (calls === 3) yield* [{ type: "tool_call_completed", callId: "read", name: "fixture.read", arguments: {} }, { type: "completed", finishReason: "tool_calls" }]; else yield* [{ type: "text_delta", text: "Found job-fixture." }, { type: "completed", finishReason: "stop" }] } }
     const fixture = await coordinationRuntime({ manager, store: coordinationStore, wait, model })
     let execute: CanonicalTurnRuntime["execute"] | undefined
-    const childExecution = vi.fn(async (_input: { lease: SubagentLease }) => ({ status: "completed" as const, result: undefined }))
-    const bootstrap = await createProductionWorkerBootstrap({ pool: { connect: vi.fn() }, runtime: fixture.runtime, turnQueueFactory: vi.fn(options => { execute = options.execute; return { queue: { add: vi.fn() }, worker: {}, active: { size: 0, values: () => [] }, close: vi.fn(async () => undefined) } as never }) as never, turnRecoveryFactory: vi.fn(() => ({ close: vi.fn(async () => undefined) })) as never, waitResolver: { intervalMs: 60_000, batchSize: 1 }, waitResolverFactory: vi.fn(() => ({ close: vi.fn(async () => undefined) })) as never, subagents: { execute: childExecution, queueFactory: vi.fn(options => { childExecutor = options.execute as never; return { queue: { add: vi.fn() }, worker: {}, close: vi.fn(async () => undefined) } }) as never, recoveryFactory: vi.fn(() => ({ close: vi.fn(async () => undefined) })) as never } })
+    const childQueueFactory = vi.fn(options => {
+      bootstrappedChildExecutor = options.execute as typeof childExecutor
+      return { queue: { add: vi.fn() }, worker: {}, close: vi.fn(async () => undefined) } as never
+    })
+    const bootstrap = await createProductionWorkerBootstrap({
+      pool: { connect: vi.fn() },
+      runtime: fixture.runtime,
+      turnQueueFactory: vi.fn(options => {
+        execute = options.execute
+        return { queue: { add: vi.fn() }, worker: {}, active: { size: 0, values: () => [] }, close: vi.fn(async () => undefined) } as never
+      }) as never,
+      turnRecoveryFactory: vi.fn(() => ({ close: vi.fn(async () => undefined) })) as never,
+      waitResolver: { intervalMs: 60_000, batchSize: 1 },
+      waitResolverFactory: vi.fn(() => ({ close: vi.fn(async () => undefined) })) as never,
+      subagents: {
+        execute: childExecutor,
+        queueFactory: childQueueFactory as never,
+        recoveryFactory: vi.fn(() => ({ close: vi.fn(async () => undefined) })) as never,
+      },
+    })
     expect(bootstrap.subagents).toBeDefined()
     expect(bootstrap.waitResolver).toBeDefined()
+    expect(childQueueFactory).toHaveBeenCalledWith(expect.objectContaining({ execute: childExecutor, manager }))
     const result = await execute!({ lease: { turnId: "turn_fixture", sessionId: "session_fixture", ownerId: "worker_fixture", userId: "user_fixture", leaseVersion: 1, leaseStartedAt: now, leaseExpiresAt: new Date(now.getTime() + 60_000) } as never, signal: new AbortController().signal })
-    expect(result).toMatchObject({ status: "completed" }); expect(waitCalls).toBe(1); expect(tasks.get(child.id)?.status).toBe("completed"); expect(childExecution).toHaveBeenCalledOnce(); expect(requests).toHaveLength(4)
+    expect(result).toMatchObject({ status: "completed" }); expect(waitCalls).toBe(1); expect(tasks.get(child.id)?.status).toBe("completed"); expect(childModelRuntimeFactory).toHaveBeenCalledOnce(); expect(childToolRuntimeFactory).toHaveBeenCalledOnce(); expect(childRequests).toHaveLength(2); expect(childRequests[0]?.tools).toEqual([expect.objectContaining({ name: "fixture.read" })]); expect(childTool).toHaveBeenCalledOnce(); expect(childToolCalls).toHaveLength(1); expect(childToolCalls[0]?.context).toMatchObject({ taskId: child.id, rootTaskId: "root_fixture", actorRole: "subagent" }); expect(childBudget.reserve).toHaveBeenCalledTimes(2); expect(childBudget.settle).toHaveBeenCalledTimes(2); expect(childBudgetReservations.every(reservation => reservation.status === "consumed")).toBe(true); expect(requests).toHaveLength(4); expect(JSON.stringify(requests[2]?.messages)).toContain("job-fixture")
     await bootstrap.close()
   })
 })
