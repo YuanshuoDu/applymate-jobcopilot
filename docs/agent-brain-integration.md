@@ -1705,3 +1705,7 @@ Canonical wait output now optionally carries a server-derived, bounded Scout/Ana
 ## P8-88 candidate - complete subagent queue outcome contract
 
 The queue executor contract now uses the full runtime `SubagentExecutionResult`, preserving server-owned `retryDisposition` and `mailboxMessageIds` through the manager boundary instead of narrowing them at queue type level. Focused queue validation covers both fields. This is a candidate contract hardening slice; live queue delivery, restart recovery, and production evidence remain unverified.
+
+## P8-89 candidate - canonical cognitive agenda audit restore
+
+Canonical turn state now restores the latest strictly scoped `cognitive.agenda` receipt as bounded audit state. The loader rejects malformed, foreign, stale, or out-of-order agenda rows and keeps the receipt out of model context; no narrative agenda content is injected into the snapshot. Focused canonical state validation passed **59/59 tests**; live PostgreSQL/RLS and restart evidence remain unverified.

@@ -19,6 +19,7 @@ import { scopeCanonicalWaitProjections } from "./canonical-wait-scope.js"
 import type { PersistedTaskGraphEvent } from "./planning/plan-task-graph-adapter.js"
 import { isQuestionText, parseQuestionOptions, QUESTION_MAX_TEXT_BYTES } from "./turns/turn-question-wait-store.js"
 import { canonicalQuestionId } from "./turns/turn-engine-types.js"
+import { COGNITIVE_AGENDA_EVENT_TYPE, parseCognitiveAgendaReceipt, type CognitiveAgendaReceipt } from "./turns/cognitive-agenda-receipt.js"
 export type CanonicalTurnState = {
   readonly scope: TenantScope
   readonly goal: string
@@ -33,6 +34,8 @@ export type CanonicalTurnState = {
   readonly planProposalHashes?: readonly string[]
   readonly taskGraphEvents?: readonly PersistedTaskGraphEvent[]
   readonly steeringMarkers?: SteeringMarkerState
+  /** Latest validated agenda receipt; audit state only, never model context. */
+  readonly cognitiveAgendaReceipt?: CognitiveAgendaReceipt
   readonly resume?: TurnResumeState
 }
 type Row = Record<string, unknown>; function object(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {} }
@@ -102,6 +105,26 @@ function taskGraphEvents(events: readonly Row[], lease: TurnLease, rootTaskId: u
     previousSequence = sequence
     return { runKey: envelope.runKey, event, ...(Object.hasOwn(envelope, "state") ? { state: json(envelope.state) } : {}) }
   })
+}
+function cognitiveAgendaReceipt(events: readonly Row[], lease: TurnLease, rootTaskId: unknown): CognitiveAgendaReceipt | undefined {
+  const rows = events.filter(event => event.type === COGNITIVE_AGENDA_EVENT_TYPE)
+  if (rows.length === 0) return undefined
+  if (typeof rootTaskId !== "string" || !rootTaskId) throw new Error("cognitive_agenda_scope_invalid")
+  let previousSequence: bigint | null = null
+  let latest: CognitiveAgendaReceipt | undefined
+  for (const event of rows) {
+    if (event.userId !== lease.userId || event.sessionId !== lease.sessionId || event.turnId !== lease.turnId || (event.taskId !== null && event.taskId !== rootTaskId)) throw new Error("cognitive_agenda_scope_invalid")
+    let sequence: bigint
+    try { sequence = BigInt(String(event.sequence)) } catch { throw new Error("cognitive_agenda_sequence_invalid") }
+    if (previousSequence !== null && sequence <= previousSequence) throw new Error("cognitive_agenda_sequence_invalid")
+    previousSequence = sequence
+    const payload = eventPayload(event.payload)
+    const stepId = typeof payload.stepId === "string" ? payload.stepId : ""
+    const parsed = parseCognitiveAgendaReceipt(payload, { sessionId: lease.sessionId, turnId: lease.turnId, taskId: rootTaskId, stepId })
+    if (!parsed) throw new Error("cognitive_agenda_receipt_invalid")
+    latest = parsed
+  }
+  return latest
 }
 function authoritativeOutputs(events: readonly Row[]): Map<string, unknown> {
   const outputs = new Map<string, unknown>()
@@ -294,7 +317,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
        AND ("taskId" IS NULL OR "taskId" = $3) AND "type" IN ('tool_call', 'tool_result', 'question') ORDER BY "createdAt" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId],
     )
     const eventsResult = await client.query<Row>(
-      `SELECT event."id", event."type", event."actor", event_session."userId" AS "userId", event."sessionId", event."turnId", event."taskId", event."sequence", event."payload" FROM "agent_events" AS event JOIN "agent_sessions" AS event_session ON event_session."id" = event."sessionId" AND event_session."userId" = $4 JOIN "agent_turns" AS event_turn ON event_turn."id" = event."turnId" AND event_turn."sessionId" = event."sessionId" AND event_turn."userId" = $4 WHERE event."turnId" = $1 AND event."sessionId" = $2 AND (event."taskId" IS NULL OR event."taskId" = $3) AND event."type" IN ('tool_call.completed', 'tool_call.failed', 'plan.observation', 'plan.command', 'plan.revision', 'goal.revision', 'context.compaction', 'plan.task_graph', '${PLAN_COMPLETION_FEEDBACK_EVENT_TYPE}', '${STEERING_MARKER_EVENT_TYPE}') ORDER BY event."sequence" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId, lease.userId],
+      `SELECT event."id", event."type", event."actor", event_session."userId" AS "userId", event."sessionId", event."turnId", event."taskId", event."sequence", event."payload" FROM "agent_events" AS event JOIN "agent_sessions" AS event_session ON event_session."id" = event."sessionId" AND event_session."userId" = $4 JOIN "agent_turns" AS event_turn ON event_turn."id" = event."turnId" AND event_turn."sessionId" = event."sessionId" AND event_turn."userId" = $4 WHERE event."turnId" = $1 AND event."sessionId" = $2 AND (event."taskId" IS NULL OR event."taskId" = $3) AND event."type" IN ('tool_call.completed', 'tool_call.failed', 'plan.observation', 'plan.command', 'plan.revision', 'goal.revision', 'context.compaction', 'plan.task_graph', '${PLAN_COMPLETION_FEEDBACK_EVENT_TYPE}', '${STEERING_MARKER_EVENT_TYPE}', '${COGNITIVE_AGENDA_EVENT_TYPE}') ORDER BY event."sequence" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId, lease.userId],
     )
     const priorInputs = await client.query<Row>(
       `SELECT "id", "targetTurnId", "content", "acceptedSequence", 'user' AS "historyRole", "acceptedSequence" AS "historySequence" FROM "agent_inputs"
@@ -338,6 +361,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     const goalState = restoreGoalRevisions(hydratedGoal.goalContract, eventsResult.rows.map(event => ({ type: event.type, payload: eventPayload(event.payload) })))
     const revisionState = restorePlanRevisions(filterPlanRevisionEvents(eventsResult.rows.map(event => ({ type: event.type, payload: event.payload })), goalState.goalContract.revision).map(event => ({ type: event.type, payload: eventPayload(event.payload) })))
     const revision = revisionState.latest
+    const restoredAgenda = cognitiveAgendaReceipt(eventsResult.rows, lease, turn.rootTaskId)
     const restoredTaskGraphEvents = taskGraphEvents(eventsResult.rows, lease, turn.rootTaskId)
     const currentRevisionObservations = planRevisionObservations(eventsResult.rows, goalState.goalContract.revision)
     const acceptedRevisions = acceptedPlanRevisions(currentRevisionObservations)
@@ -392,7 +416,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
       consumedInputIds: Array.isArray(last?.consumedInputIds) ? last.consumedInputIds.filter((id): id is string => typeof id === "string") : [],
       usage,
     } satisfies TurnResumeState : undefined
-     const result = { scope, goal: goalState.goalContract.objective, goalContract: goalState.goalContract, modelProfileSnapshot: json(turn.modelProfileSnapshot), toolPolicySnapshot: turn.toolPolicySnapshot ?? {}, budgetSnapshot: turn.budgetSnapshot ?? {}, planRevision: revision?.planRevision ?? null, planProposalHashes: revisionState.hashes, ...(restoredTaskGraphEvents.length > 0 ? { taskGraphEvents: restoredTaskGraphEvents } : {}), steeringMarkers, ...(typeof turn.rootTaskId === "string" ? { rootTaskId: turn.rootTaskId } : {}), ...(rootInput.rows[0] ? { rootInputId: rootInput.rows[0].id } : {}), snapshot, ...(resume ? { resume } : {}) }
+     const result = { scope, goal: goalState.goalContract.objective, goalContract: goalState.goalContract, modelProfileSnapshot: json(turn.modelProfileSnapshot), toolPolicySnapshot: turn.toolPolicySnapshot ?? {}, budgetSnapshot: turn.budgetSnapshot ?? {}, planRevision: revision?.planRevision ?? null, planProposalHashes: revisionState.hashes, ...(restoredTaskGraphEvents.length > 0 ? { taskGraphEvents: restoredTaskGraphEvents } : {}), steeringMarkers, ...(restoredAgenda ? { cognitiveAgendaReceipt: restoredAgenda } : {}), ...(typeof turn.rootTaskId === "string" ? { rootTaskId: turn.rootTaskId } : {}), ...(rootInput.rows[0] ? { rootInputId: rootInput.rows[0].id } : {}), snapshot, ...(resume ? { resume } : {}) }
     await client.query("COMMIT")
     committed = true
     return result

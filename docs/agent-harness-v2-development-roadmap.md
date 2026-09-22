@@ -3034,3 +3034,11 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Implementation:** `SubagentExecutor` now returns the complete runtime `SubagentExecutionResult`, including `retryDisposition` and `mailboxMessageIds`, so the queue-to-manager boundary cannot erase retry policy or mailbox acknowledgement metadata. No schema, migration, provider, Web, or UI change was made.
 
 **Independent verification:** Focused subagent queue validation covers both outcome fields; live BullMQ/Redis delivery, process restart, and production evidence remain unverified.
+
+## 175. P8-89 — Restore canonical cognitive agenda receipt audit state
+
+**Candidate status/date (2026-09-22):** P8-89 is a bounded canonical turn-state replay slice; formal P0-P7 acceptance remains **1/8 (12.5%)**.
+
+**Implementation:** The canonical state loader validates scoped `cognitive.agenda` event receipts, requires strictly increasing event sequences, restores only the latest server-owned receipt, and exposes it as audit state. Malformed, foreign, stale, or out-of-order rows fail closed; the receipt is not added to model context.
+
+**Independent verification:** `canonical-turn-state.test.ts` passed **59/59 tests**; live PostgreSQL/RLS, process restart, and production evidence remain unverified.

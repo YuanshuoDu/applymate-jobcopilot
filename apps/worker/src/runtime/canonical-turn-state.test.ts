@@ -5,6 +5,8 @@ import { scopeCanonicalWaitProjections } from "./canonical-wait-scope.js"
 import { buildContextMemoryProjection } from "./context/context-memory-projection.js"
 import { buildPlanCompletionFeedbackEvent, PLAN_COMPLETION_FEEDBACK_EVENT_TYPE, planCompletionRecoveryCount } from "./planning/plan-completion-feedback.js"
 import { STEERING_MARKER_EVENT_TYPE, steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "./context/steering-marker.js"
+import { buildCognitiveActionAgenda } from "./turns/cognitive-action-agenda.js"
+import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE } from "./turns/cognitive-agenda-receipt.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 1,
@@ -28,6 +30,11 @@ function patchGraphEvent(row: Record<string, unknown>, patch: Record<string, unk
   const payload = row.payload as Record<string, unknown>
   return { ...row, payload: { ...payload, event: { ...(payload.event as Record<string, unknown>), ...patch } } }
 }
+function agendaEvent(sequence = "20", patch: Record<string, unknown> = {}): Record<string, unknown> {
+  const value = buildCognitiveAgendaReceipt({ sessionId: "session-1", turnId: "turn-1", taskId: "root-1", stepId: "step-1", agenda: buildCognitiveActionAgenda({ schemaVersion: "agent-harness.v2", sessionId: "session-1", turnId: "turn-1", stepId: "step-1", inputThroughSequence: 1n, consumedInputIds: [], canonicalJson: "{}", blocks: [] }) })
+  if (!value) throw new Error("agenda fixture should be valid")
+  return { id: `agenda-${sequence}`, type: COGNITIVE_AGENDA_EVENT_TYPE, actor: "system", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null, sequence, payload: { ...value, ...patch } }
+}
 
 function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unknown>[]; items?: Record<string, unknown>[]; inputs?: Record<string, unknown>[]; events?: Record<string, unknown>[]; snapshots?: Record<string, unknown>[] }) {
   const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
@@ -47,6 +54,31 @@ function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unk
 }
 
 describe("loadCanonicalTurnState", () => {
+  it("restores the latest scoped cognitive agenda receipt as audit state", async () => {
+    const fake = pool({ turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} }, events: [agendaEvent("20"), agendaEvent("21", { stepId: "step-2" })] })
+    const value = await loadCanonicalTurnState(fake, lease)
+    expect(value.cognitiveAgendaReceipt?.stepId).toBe("step-2")
+    expect(value.snapshot.toolObservations).not.toEqual(expect.arrayContaining([expect.objectContaining({ type: COGNITIVE_AGENDA_EVENT_TYPE })]))
+    const eventQuery = fake.client.query.mock.calls.find(([sql]) => typeof sql === "string" && sql.includes('FROM "agent_events"'))?.[0]
+    expect(eventQuery).toContain(`'${COGNITIVE_AGENDA_EVENT_TYPE}'`)
+  })
+
+  it.each([
+    ["foreign user", { userId: "other-user" }],
+    ["foreign payload scope", { taskId: "other-root" }],
+    ["malformed receipt", { nextAction: "invalid" }],
+  ])("rejects %s cognitive agenda receipt", async (_label, patch) => {
+    const event = agendaEvent("20", patch)
+    if (_label === "foreign user") event.userId = "other-user"
+    const fake = pool({ turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} }, events: [event] })
+    await expect(loadCanonicalTurnState(fake, lease)).rejects.toThrow(/cognitive_agenda_/)
+  })
+
+  it("rejects out-of-order cognitive agenda receipts", async () => {
+    const fake = pool({ turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} }, events: [agendaEvent("21"), agendaEvent("20")] })
+    await expect(loadCanonicalTurnState(fake, lease)).rejects.toThrow("cognitive_agenda_sequence_invalid")
+  })
+
   it("loads bounded plan task graph events from the scoped ordered event query", async () => {
     const fake = pool({
       turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
