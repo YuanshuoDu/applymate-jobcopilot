@@ -1759,3 +1759,9 @@ When the server-owned child task carries the exact Scout/Analyst `agent-harness.
 ## P8-103 candidate - provider-gated structured child output schema
 
 Exact server-owned Scout/Analyst output markers now select bounded role-specific JSON schemas for child model requests only when both native tools and structured output are supported. The schema uses closed objects, role/status constants, evidence/evidenceIds fields, and no identity or authorization fields; unsupported profiles, non-structured or legacy children omit `outputSchema`. Existing result validation remains authoritative. Astra reran child-executor, role-result, model-message, and turn-loop tests: **144/144** passed; Worker typecheck and `git diff --check` passed. Live provider behavior and production evidence remain unverified. Formal P0-P7 acceptance remains **1/8 (12.5%)**.
+
+## P8-104 candidate - production bootstrap child coordination composition
+
+The bounded test-only slice exercises the canonical production bootstrap with a canonical policy fixture and a real four-step root path: `spawn_subagent` → `wait_subagents` → `fixture.read` → final. The bootstrap-captured child executor runs through `AgentTreeManager.run`, covering child claim/lease/finish and the parent wait closure. Only `production-bootstrap.test.ts` changed; focused validation passed **10/10**, Worker `tsc --noEmit --skipLibCheck`, and `git diff --check` passed.
+
+This is an in-memory deterministic fixture only. Live PostgreSQL/RLS, Redis/BullMQ delivery, process restart, provider behavior, deployment, and full durable child-parent wake evidence remain unverified. Formal P0-P7 acceptance remains **1/8 (12.5%)**; P8-104 remains a candidate.

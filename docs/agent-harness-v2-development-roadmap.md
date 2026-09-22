@@ -3126,3 +3126,11 @@ When a child task carries the exact server-owned Scout/Analyst structured-result
 Exact server-owned Scout/Analyst markers now select role-specific closed JSON schemas only when the model profile advertises both native tools and structured output. Unsupported profiles, reviewer/auditor, marker mismatches, and legacy prose paths omit `outputSchema`; routing, fallback, public spawn, validation, production gates, provider configuration, and persistence remain unchanged.
 
 Focused child-executor, role-result, model-message, and turn-loop tests passed **144/144**; Worker TypeScript and `git diff --check` passed. Live provider/model behavior and production evidence remain unverified.
+
+## 185. P8-104 — Production bootstrap child coordination composition
+
+**Candidate status/date (2026-09-22):** P8-104 is a bounded test-only composition slice; formal P0-P7 acceptance remains **1/8 (12.5%)**.
+
+`production-bootstrap.test.ts` now uses a canonical policy fixture and exercises the real four-step root path `spawn_subagent` → `wait_subagents` → `fixture.read` → final. The bootstrap-captured child executor runs through `AgentTreeManager.run`, covering child claim/lease/finish and parent wait closure. Focused validation passed **10/10**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+The evidence is limited to an in-memory deterministic fixture. Live PostgreSQL/RLS, Redis/BullMQ delivery, process restart, provider behavior, deployment, and full durable child-parent wake evidence remain unverified. P8-104 remains a candidate.

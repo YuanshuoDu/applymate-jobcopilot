@@ -3,7 +3,11 @@ import { Type } from "@sinclair/typebox"
 import { schemaVersion } from "@jobcopilot/agent-protocol"
 import type { ModelAdapter, ModelStreamEvent, HarnessModelRequest } from "@jobcopilot/agent-model"
 
-import type { AgentTreeManager } from "../runtime/subagents/manager.js"
+import { AgentTreeManager, type SubagentClock } from "../runtime/subagents/manager.js"
+import type { SubagentExecutionResult, SubagentLease, SubagentStore, SubagentTaskRecord } from "../runtime/subagents/types.js"
+import type { CoordinationStore, CoordinationTaskView, DurableWaitPort } from "../runtime/tools/coordination-types.js"
+import { createCoordinationTools } from "../runtime/tools/coordination-tools.js"
+import { createCanonicalPolicy } from "../runtime/policy/canonical-policy.js"
 import type { createSubagentQueue } from "./subagent-queue.js"
 import type { createTurnQueue } from "../runtime/turns/turn-queue.js"
 import { createProductionWorkerBootstrap, type CanonicalTurnRuntime } from "./production-bootstrap.js"
@@ -119,6 +123,15 @@ async function compositionRuntime(): Promise<{ runtime: CanonicalTurnRuntime; to
   return {
     runtime, tool, lifecycle, requests, manager,
   }
+}
+
+async function coordinationRuntime(input: { manager: AgentTreeManager; store: CoordinationStore; wait: DurableWaitPort; model: ModelAdapter }): Promise<{ runtime: CanonicalTurnRuntime; execute: CanonicalTurnRuntime["execute"] }> {
+  const read: RuntimeToolDefinition = { schemaVersion, name: "fixture.read", version: "1", description: "Read fixture evidence", capabilities: ["read"], inputSchema: Type.Object({}, { additionalProperties: false }), outputSchema: Type.Object({ jobs: Type.Array(Type.Object({ id: Type.String() }, { additionalProperties: false })) }, { additionalProperties: false }), risk: "read", domain: "jobs", idempotency: "read_only", timeoutMs: 1_000, requiredCapabilities: [], execute: async () => ({ jobs: [{ id: "job-fixture" }] }) }
+  const registry = new ToolRegistry([read, ...createCoordinationTools({ manager: input.manager, store: input.store, wait: input.wait })])
+  const router = new ToolRouter(registry, new ToolLifecycle({ sink: new InMemoryToolLifecycleSink(), references: new InMemoryToolResultReferenceStore() }), createCanonicalPolicy(undefined, true, false))
+  const state: CanonicalTurnState = { scope: { userId: "user_fixture" }, goal: "Read fixture state", modelProfileSnapshot: {} as never, toolPolicySnapshot: { role: "orchestrator", capabilities: ["read", "coordination"] }, budgetSnapshot: { limits: { maxSteps: 5 } }, snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] } }
+  const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, { workerId: "worker_fixture", manager: input.manager, coordinationEnabled: true, stateLoader: async () => state, modelRuntimeFactory: async () => ({ adapter: input.model, registry: {} as never, candidates: [] }), toolRuntimeFactory: () => ({ registry, router }), rootTaskStore: { ensure: vi.fn(async () => ({ id: "root_fixture" } as never)), finish: vi.fn(async () => undefined) }, turnEngineStoreFactory: () => compositionStore(), contextBuilderFactory: () => new StepContextBuilder({ scope: { userId: "user_fixture" }, withTransaction: async work => work({ getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }), claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }), persistCheckpoint: async () => undefined }) } satisfies InputClaimStore), authorizeUsage: vi.fn(async () => ({ settle: vi.fn(async () => undefined) })) })
+  return { runtime, execute: runtime.execute }
 }
 
 describe("production Worker bootstrap", () => {
@@ -354,5 +367,32 @@ describe("production Worker bootstrap", () => {
     expect(JSON.stringify(fixture.requests[1]?.messages)).toContain("user_fixture")
     await bootstrap.close()
     expect(fixture.manager.shutdown).toHaveBeenCalledOnce()
+  })
+
+  it("composes root TurnEngine coordination with a leased child execution and wait closure", async () => {
+    const now = new Date("2026-09-01T00:00:00.000Z")
+    const child: SubagentTaskRecord = { id: "child_fixture", userId: "user_fixture", sessionId: "session_fixture", turnId: "turn_fixture", rootTaskId: "root_fixture", parentTaskId: "root_fixture", path: "/root_fixture/child_fixture", depth: 1, role: "scout", taskType: "research", status: "queued", goal: "Find fixture evidence", constraints: [], successCriteria: [], allowedActions: [], context: null, expectedOutputSchema: null, result: null, failureReason: null, attemptCount: 0, maxAttempts: 3, nextAttemptAt: null, leaseOwner: null, leaseExpiresAt: null, interruptRequestedAt: null, budgetSnapshot: {}, toolPolicySnapshot: {} }
+    const rootTask: SubagentTaskRecord = { ...child, id: "root_fixture", parentTaskId: null, path: "/root_fixture", depth: 0, role: "orchestrator", taskType: "turn", status: "running" }
+    const tasks = new Map([[child.id, child]])
+    const clock: SubagentClock = { setInterval: () => 1 as never, clearInterval: vi.fn() }
+    const store: SubagentStore = { async create() { throw new Error("non_atomic") }, async createWithSpawn(input) { tasks.set(child.id, { ...child, role: input.role, taskType: input.taskType, goal: input.goal }); return { task: tasks.get(child.id)!, duplicate: false } }, async get(id) { return id === rootTask.id ? rootTask : tasks.get(id) ?? null }, async claim(input) { const value = tasks.get(input.taskId); if (!value || value.status !== "queued") return null; const leased = { ...value, status: "running" as const, attemptCount: 1, leaseOwner: input.ownerId, leaseExpiresAt: new Date(now.getTime() + 60_000) }; tasks.set(value.id, leased); return leased }, async heartbeat() { return "renewed" }, async finish(input) { const value = tasks.get(input.taskId); if (!value || value.leaseOwner !== input.ownerId) return null; tasks.set(value.id, { ...value, status: input.status, result: input.result ?? null }); return input.status }, async close() { return false }, async interruptTree() { return 0 }, async recoverExpired() { return [] } }
+    const manager = new AgentTreeManager(store, { now: () => now, clock })
+    const rootView: CoordinationTaskView = { ...child, id: "root_fixture", parentTaskId: null, path: "/root_fixture", depth: 0, role: "orchestrator", taskType: "turn", status: "running" }
+    const view = (): CoordinationTaskView => ({ ...tasks.get(child.id)! })
+    const replays = new Map<string, CoordinationTaskView>()
+    const coordinationStore: CoordinationStore = { getTask: async input => input.taskId === "root_fixture" ? rootView : view(), listTasks: async () => [view()], sendMessage: vi.fn(), getSpawnReplay: async input => replays.get(input.idempotencyKey) ?? null, recordSpawn: async input => { replays.set(input.idempotencyKey, input.task); return true }, appendActivity: async () => undefined }
+    let childExecutor: ((input: { lease: SubagentLease }) => Promise<SubagentExecutionResult>) | undefined
+    let waitCalls = 0
+    const wait: DurableWaitPort = { wait: async input => { waitCalls += 1; expect(childExecutor).toBeDefined(); const outcome = await manager.run({ taskId: child.id, sessionId: input.sessionId, rootTaskId: "root_fixture", ownerId: "queue_fixture" }, childExecutor!); expect(outcome.status).toBe("completed"); return { waitId: "wait_fixture", status: "ready", deadlineAt: now.toISOString(), matchedTaskIds: [child.id] } } }
+    const requests: HarnessModelRequest[] = []
+    let calls = 0
+    const model: ModelAdapter = { id: "fixture-model", profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false, supportsReasoningSummary: false, supportsResponseContinuation: false, supportsProviderConversation: false, supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low" }, async *stream(request) { requests.push(request); calls += 1; if (calls === 1) yield* [{ type: "tool_call_completed", callId: "spawn", name: "spawn_subagent", arguments: { idempotencyKey: "spawn_fixture", role: "scout", taskType: "research", goal: "Find fixture evidence" } }, { type: "completed", finishReason: "tool_calls" }]; else if (calls === 2) yield* [{ type: "tool_call_completed", callId: "wait", name: "wait_subagents", arguments: { idempotencyKey: "wait_fixture", taskIds: [child.id], mode: "all", timeoutMs: 1_000 } }, { type: "completed", finishReason: "tool_calls" }]; else if (calls === 3) yield* [{ type: "tool_call_completed", callId: "read", name: "fixture.read", arguments: {} }, { type: "completed", finishReason: "tool_calls" }]; else yield* [{ type: "text_delta", text: "Found job-fixture." }, { type: "completed", finishReason: "stop" }] } }
+    const fixture = await coordinationRuntime({ manager, store: coordinationStore, wait, model })
+    let execute: CanonicalTurnRuntime["execute"] | undefined
+    const childExecution = vi.fn(async (_input: { lease: SubagentLease }) => ({ status: "completed" as const, result: undefined }))
+    const bootstrap = await createProductionWorkerBootstrap({ pool: { connect: vi.fn() }, runtime: fixture.runtime, turnQueueFactory: vi.fn(options => { execute = options.execute; return { queue: { add: vi.fn() }, worker: {}, active: { size: 0, values: () => [] }, close: vi.fn(async () => undefined) } as never }) as never, turnRecoveryFactory: vi.fn(() => ({ close: vi.fn(async () => undefined) })) as never, waitResolver: { intervalMs: 60_000, batchSize: 1 }, waitResolverFactory: vi.fn(() => ({ close: vi.fn(async () => undefined) })) as never, subagents: { execute: childExecution, queueFactory: vi.fn(options => { childExecutor = options.execute as never; return { queue: { add: vi.fn() }, worker: {}, close: vi.fn(async () => undefined) } }) as never, recoveryFactory: vi.fn(() => ({ close: vi.fn(async () => undefined) })) as never } })
+    const result = await execute!({ lease: { turnId: "turn_fixture", sessionId: "session_fixture", ownerId: "worker_fixture", userId: "user_fixture", leaseVersion: 1, leaseStartedAt: now, leaseExpiresAt: new Date(now.getTime() + 60_000) } as never, signal: new AbortController().signal })
+    expect(result).toMatchObject({ status: "completed" }); expect(waitCalls).toBe(1); expect(tasks.get(child.id)?.status).toBe("completed"); expect(childExecution).toHaveBeenCalledOnce(); expect(requests).toHaveLength(4)
+    await bootstrap.close()
   })
 })
