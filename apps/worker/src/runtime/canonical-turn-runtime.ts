@@ -22,6 +22,7 @@ import { loadCanonicalTurnState, type CanonicalTurnState } from "./canonical-tur
 import { AgentTreeManager } from "./subagents/manager.js"
 import { PgSubagentTaskStore } from "./subagents/pg-store.js"
 import { createPgRootTaskStore, type RootTaskStore } from "./subagents/root-task-store.js"
+import { getSubagentRolePolicy, visibleToolPolicy } from "./subagents/role-policy.js"
 import { executionOwnerFence, type ExecutionOwner, type ExecutionOwnerFence } from "./execution-owner.js"
 import { createCanonicalPolicy } from "./policy/canonical-policy.js"
 import { PLAN_ACTION_KINDS, PLAN_MAX_NODES, PLAN_MAX_REVISIONS, type GoalContractRef } from "./planning/goal-plan-contract.js"
@@ -185,6 +186,54 @@ function durablePlanCommandSink(store: TurnEngineStore, owner: ExecutionOwnerFen
   return async receipt => { await store.appendEvent(durablePlanCommandEvent(owner, receipt)) }
 }
 
+// Reviewer/auditor remain deferred until canonical plan execution has matching
+// role contracts, result schemas, and replay/aggregate validation.
+const CANONICAL_PLANNER_ROLES = ["scout", "analyst"] as const
+type PlannerRoleTool = Parameters<typeof visibleToolPolicy>[1]
+
+function plannerRoleTool(value: unknown): PlannerRoleTool | undefined {
+  const item = record(value)
+  const requiredCapabilities = item.requiredCapabilities
+  const toolCapabilities = item.capabilities
+  if (typeof item.name !== "string" || item.risk !== "read" || typeof item.domain !== "string"
+    || !Array.isArray(requiredCapabilities) || !requiredCapabilities.every(capability => typeof capability === "string")
+    || !Array.isArray(toolCapabilities) || !toolCapabilities.every(capability => typeof capability === "string")) return undefined
+  return {
+    name: item.name,
+    risk: "read",
+    domain: item.domain as PlannerRoleTool["domain"],
+    requiredCapabilities,
+    capabilities: toolCapabilities,
+  }
+}
+
+/**
+ * Resolve planner roles from the live server registry. The candidate universe
+ * intentionally excludes writer/executor until their artifact/submission
+ * contracts exist; every admitted role must still have a visible read tool.
+ */
+function deriveCanonicalPlannerRoles(
+  registry: { readonly list: (capabilities?: readonly string[]) => readonly unknown[] },
+  capabilities: readonly string[],
+  allowedTools: readonly string[],
+): readonly string[] {
+  let registered: readonly unknown[]
+  try {
+    registered = registry.list(capabilities)
+  } catch {
+    return []
+  }
+  if (!Array.isArray(registered)) return []
+  const allowed = new Set(allowedTools)
+  const tools = registered.map(plannerRoleTool).filter((tool): tool is PlannerRoleTool => tool !== undefined)
+  return CANONICAL_PLANNER_ROLES.filter(role => {
+    if (!getSubagentRolePolicy(role)) return false
+    return tools.some(tool => allowed.has(tool.name)
+      && tool.capabilities?.every(capability => capability === "read") === true
+      && visibleToolPolicy(role, tool).visible)
+  })
+}
+
 function defaultAuthorization(): never {
   const error = new Error("usage_authorization_unavailable")
   Object.assign(error, { code: "usage_authorization_unavailable" })
@@ -301,13 +350,17 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const recoveryDispatcher = planningEnabled ? createPlanRevisionRecoveryDispatcher() : undefined
     const planningConfiguration = planningEnabled ? {
       goal: planningGoal, goalRef, allowedTools: [...READ_ONLY_TOOL_NAMES, TOOL_RESULTS_READ_NAME],
-      allowedTemplates: [], allowedRoles: ["scout", "analyst"], allowedPlanActions, maxNodes: PLAN_MAX_NODES, maxPlanRevisions: PLAN_MAX_REVISIONS, initialPlanRevision: state.planRevision ?? null, initialPlanHashes: state.planProposalHashes ?? [], ...(recoveryDispatcher ? { recoveryDispatcher } : {}),
+      allowedTemplates: [], allowedRoles: [...CANONICAL_PLANNER_ROLES], allowedPlanActions, maxNodes: PLAN_MAX_NODES, maxPlanRevisions: PLAN_MAX_REVISIONS, initialPlanRevision: state.planRevision ?? null, initialPlanHashes: state.planProposalHashes ?? [], ...(recoveryDispatcher ? { recoveryDispatcher } : {}),
     } : undefined
     const toolRuntime = options.toolRuntimeFactory?.({ pool, policy: selectedPolicy, manager, state }) ?? createWorkerToolRuntime(pool, { sink: sinkProxy, resolveOwner }, selectedPolicy, coordination, undefined, undefined, undefined, planningConfiguration, planningConfiguration ? { goal: planningConfiguration.goal, goalRef } : undefined)
-    const planning = planningConfiguration ? {
-      ...planningConfiguration,
-      ...derivePlannerCapabilityCatalog(toolRuntime.registry, toolCapabilities, planningConfiguration.allowedTools, planningConfiguration.allowedTemplates),
-    } : undefined
+    const planning = planningConfiguration ? (() => {
+      const catalog = derivePlannerCapabilityCatalog(toolRuntime.registry, toolCapabilities, planningConfiguration.allowedTools, planningConfiguration.allowedTemplates)
+      return {
+        ...planningConfiguration,
+        ...catalog,
+        allowedRoles: deriveCanonicalPlannerRoles(toolRuntime.registry, toolCapabilities, catalog.tools),
+      }
+    })() : undefined
     const allowedActions = toolRuntime.registry.list(toolCapabilities).flatMap((definition) => {
       const name = definition && typeof definition === "object" && "name" in definition ? (definition as { name?: unknown }).name : undefined
       return typeof name === "string" ? [name] : []

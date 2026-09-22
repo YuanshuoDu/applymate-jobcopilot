@@ -3064,3 +3064,13 @@ The existing Turn queue now preserves `cognitive_agenda_resume_fence_invalid` as
 The authenticated Web stop transaction already fences the exact user/session/Turn child tree. Worker production composition now applies the same server-owned fence before requeueing a Turn after lease loss: the manager resolves children by `userId`, `sessionId`, and `turnId`, writes idempotent `interruptRequestedAt`, and aborts matching active child executions. Child heartbeat and finish checks reject late success writes. Cleanup remains best-effort and does not alter the root Turn's existing `lease_lost` requeue behavior. No schema, provider, ATS, Web, or UI change was made in this slice.
 
 Focused Worker tests and typecheck passed. Live PostgreSQL/RLS behavior, BullMQ cross-process delivery, process restart, and production evidence remain unverified.
+
+## 179. P8-97 — Canonical planner read-only role catalog
+
+**Candidate status/date (2026-09-22):** P8-97 is a bounded server-owned planner role-catalog slice; formal P0-P7 acceptance remains **1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Canonical planning retains an explicit executable read-only candidate universe of `scout` and `analyst`. After the runtime registry is built, the plan execution factory receives only roles that have a currently registered allowed tool with `risk = read`, read-only capabilities, and a positive `visibleToolPolicy` decision for that role. `reviewer` and `auditor` remain deferred because canonical plan execution still has Scout/Analyst-only role contracts, result schemas, and replay/aggregate validation; `writer` and `executor` remain excluded until their domain wiring exists. A sparse or malformed live catalog yields no executable delegate role, preserving fail-closed behavior; planning-disabled turns still do not invoke the planner factory.
+
+**Independent verification:** `canonical-turn-runtime.test.ts` passed **31/31** tests, including a throwing live-catalog fail-closed regression; Worker TypeScript and `git diff --check` passed.
+
+**Candidate boundary:** The proposal tool and execution factory share the Scout/Analyst upper bound, with the live registry and role-policy filter applied before plan execution. Reviewer/auditor contracts and end-to-end canonical reducers remain outside this slice. Live PostgreSQL/RLS, process restart, queue delivery, provider invocation, and production evidence remain unverified. No schema, dependency, Web/UI, provider, ATS, or external-write behavior changed; P8-97 remains a candidate.

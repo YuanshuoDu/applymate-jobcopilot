@@ -119,6 +119,33 @@ function tools() {
   }
 }
 
+function plannerTools() {
+  const tool = tools()
+  return {
+    ...tool,
+    registry: {
+      ...tool.registry,
+      list: () => [{ name: "jobs.search", version: "1", risk: "read", domain: "jobs", capabilities: ["read"], requiredCapabilities: [] }],
+    },
+  }
+}
+
+function throwingPlannerTools() {
+  const tool = plannerTools()
+  let calls = 0
+  return {
+    ...tool,
+    registry: {
+      ...tool.registry,
+      list: () => {
+        calls += 1
+        if (calls === 2) throw new Error("registry unavailable")
+        return tool.registry.list()
+      },
+    },
+  }
+}
+
 function waitingTools() {
   const execute = vi.fn(async (_context: unknown, call: { id: string; toolName: string; toolVersion: string }) => ({ ...call, status: "failed" as const, output: null, errorCode: "policy_requires_user_input" }))
   return { execute, registry: { list: () => [{ name: "jobs.search", version: "1" }], validateArguments: () => true as const }, router: { execute } }
@@ -497,6 +524,42 @@ describe("createCanonicalTurnRuntime", () => {
 
     const noFactory = setup({ planningEnabled: true, planningExecutionEnabled: true })
     await (await noFactory.runtime).execute({ lease, signal: new AbortController().signal })
+  })
+
+  it("derives only safe read-only planner roles from the live registry", async () => {
+    const factory = vi.fn((input: { allowedRoles?: readonly string[] }) => {
+      expect(input.allowedRoles).toEqual(["scout", "analyst"])
+      return async () => ({ observations: [] })
+    })
+    const enabled = setup({
+      coordinationEnabled: true,
+      planningEnabled: true,
+      planningExecutionEnabled: true,
+      toolRuntimeFactory: () => plannerTools() as never,
+      planExecutionFactory: factory,
+    })
+    await (await enabled.runtime).execute({ lease, signal: new AbortController().signal })
+    expect(factory).toHaveBeenCalledTimes(1)
+
+    const disabledFactory = vi.fn(() => async () => ({ observations: [] }))
+    const disabled = setup({ planningEnabled: false, planningExecutionEnabled: true, planExecutionFactory: disabledFactory })
+    await (await disabled.runtime).execute({ lease, signal: new AbortController().signal })
+    expect(disabledFactory).not.toHaveBeenCalled()
+  })
+
+  it("fails closed when the live planner role catalog is unavailable", async () => {
+    const factory = vi.fn((input: { allowedRoles?: readonly string[] }) => {
+      expect(input.allowedRoles).toEqual([])
+      return async () => ({ observations: [] })
+    })
+    const fixture = setup({
+      planningEnabled: true,
+      planningExecutionEnabled: true,
+      toolRuntimeFactory: () => throwingPlannerTools() as never,
+      planExecutionFactory: factory,
+    })
+    await (await fixture.runtime).execute({ lease, signal: new AbortController().signal })
+    expect(factory).toHaveBeenCalledTimes(1)
   })
 
   it("passes the recovered plan revision to the proposal and execution bridges", async () => {
