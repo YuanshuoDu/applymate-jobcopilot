@@ -111,6 +111,24 @@ function realPgBoundary() {
   return { pool: pool as unknown as pg.Pool, calls, client }
 }
 
+function defaultLoaderBoundary() {
+  const calls: string[] = []
+  const client = {
+    query: vi.fn(async (sql: string) => {
+      calls.push(sql)
+      if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+      if (sql.includes('"input"') && sql.includes('FROM "agent_turns"')) return {
+        rows: [{ id: "turn-1", sessionId: "session-1", userId: "user-1", status: "in_progress", leaseOwnerId: lease.ownerId, leaseVersion: lease.leaseVersion, leaseExpiresAt: lease.leaseExpiresAt, input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: { limits: { maxSteps: 4 } } }], rowCount: 1,
+      }
+      if (sql.includes('FROM "agent_wait_conditions"')) return { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "agent_steps"') || sql.includes('FROM "agent_items"') || sql.includes('FROM "agent_events"') || sql.includes('FROM "agent_inputs"') || sql.includes('FROM "agent_context_snapshots"')) return { rows: [], rowCount: 0 }
+      return { rows: [], rowCount: 0 }
+    }),
+    release: vi.fn(),
+  }
+  return { pool: { connect: vi.fn(async () => client) } as unknown as pg.Pool, calls }
+}
+
 const CANONICAL_COORDINATION_TOOL_NAMES = [
   "agent.spawn", "agent.send", "agent.followup", "agent.wait", "agent.list", "agent.interrupt", "agent.close",
 ] as const
@@ -688,6 +706,26 @@ describe("createCanonicalTurnRuntime", () => {
     } finally {
       engineRun.mockRestore()
     }
+  })
+
+  it("routes production wait-outcome consumption through the default state loader", async () => {
+    const run = async (productionFlags: ProductionAgentFlags) => {
+      const boundary = defaultLoaderBoundary()
+      const runtime = await createCanonicalTurnRuntime(boundary.pool, {
+        workerId: "worker-1", productionFlags, rootTaskStore: rootStore() as never,
+        modelRuntimeFactory: async () => ({ adapter: model(() => [{ type: "text_delta", text: "done" }, { type: "completed", finishReason: "stop" }]), registry: {} as never, candidates: [] }),
+        toolRuntimeFactory: () => tools(productionFlags.coordinationEnabled) as never,
+        turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
+        now: () => new Date("2026-09-07T00:00:00.000Z"),
+        authorizeUsage: async () => ({ settle: async () => undefined }),
+      })
+      await runtime.execute({ lease, signal: new AbortController().signal })
+      return boundary.calls
+    }
+    const enabledCalls = await run(resolveProductionAgentFlags({ ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1" }))
+    expect(enabledCalls.some(sql => sql.includes('FROM "agent_wait_conditions"'))).toBe(true)
+    const disabledCalls = await run(resolveProductionAgentFlags())
+    expect(disabledCalls.some(sql => sql.includes('FROM "agent_wait_conditions"'))).toBe(false)
   })
 
   it("composes a real model/tool continuation with runtime-owned root identity", async () => {

@@ -1807,3 +1807,9 @@ This remains test-only in the two allowed files. P8-111 now supplies the product
 The production canonical Turn runtime now preserves `TurnEngineResult.waitId` in its `TurnExecutionResult` when a Turn enters `waiting_for_dependency`, allowing `runTurnJob` to invoke the durable `waitHandoff` with the server-issued receipt. Existing status and summary mapping remains unchanged, and absent wait receipts are omitted. A focused regression stubs the canonical engine result and verifies both the queue-facing return value and durable root result.
 
 Focused canonical runtime validation passed **35/35**; Worker TypeScript and `git diff --check` passed. Live PostgreSQL/RLS, Redis/BullMQ delivery, process restart, cross-process wake, real provider/browser execution, deployment, and production data remain unverified; P8-111 remains a candidate.
+
+## P8-112 candidate - production wait-outcome flag to default state loader
+
+The canonical runtime regression now omits the custom `stateLoader` and runs against a deterministic PostgreSQL-shaped pool. With server-resolved child/wait gates enabled, `consumeWaitOutcomes` causes the runtime's default `loadCanonicalTurnState` path to issue the durable wait projection query; with production gates disabled, the same default path does not query `agent_wait_conditions`. This keeps the production wiring unchanged and proves the test no longer relies on a custom loader for this flag boundary.
+
+Focused canonical runtime, canonical state, and production flag validation passed **103/103**; Worker TypeScript and `git diff --check` passed. The pool remains deterministic and does not prove live PostgreSQL/RLS transactions, concurrent consumption, Redis/BullMQ delivery, process restart, provider/browser execution, deployment, or production data; P8-112 remains a candidate.
