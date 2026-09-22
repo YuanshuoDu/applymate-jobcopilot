@@ -391,6 +391,8 @@ describe("production Worker bootstrap", () => {
     let execute: CanonicalTurnRuntime["execute"] | undefined
     const childExecution = vi.fn(async (_input: { lease: SubagentLease }) => ({ status: "completed" as const, result: undefined }))
     const bootstrap = await createProductionWorkerBootstrap({ pool: { connect: vi.fn() }, runtime: fixture.runtime, turnQueueFactory: vi.fn(options => { execute = options.execute; return { queue: { add: vi.fn() }, worker: {}, active: { size: 0, values: () => [] }, close: vi.fn(async () => undefined) } as never }) as never, turnRecoveryFactory: vi.fn(() => ({ close: vi.fn(async () => undefined) })) as never, waitResolver: { intervalMs: 60_000, batchSize: 1 }, waitResolverFactory: vi.fn(() => ({ close: vi.fn(async () => undefined) })) as never, subagents: { execute: childExecution, queueFactory: vi.fn(options => { childExecutor = options.execute as never; return { queue: { add: vi.fn() }, worker: {}, close: vi.fn(async () => undefined) } }) as never, recoveryFactory: vi.fn(() => ({ close: vi.fn(async () => undefined) })) as never } })
+    expect(bootstrap.subagents).toBeDefined()
+    expect(bootstrap.waitResolver).toBeDefined()
     const result = await execute!({ lease: { turnId: "turn_fixture", sessionId: "session_fixture", ownerId: "worker_fixture", userId: "user_fixture", leaseVersion: 1, leaseStartedAt: now, leaseExpiresAt: new Date(now.getTime() + 60_000) } as never, signal: new AbortController().signal })
     expect(result).toMatchObject({ status: "completed" }); expect(waitCalls).toBe(1); expect(tasks.get(child.id)?.status).toBe("completed"); expect(childExecution).toHaveBeenCalledOnce(); expect(requests).toHaveLength(4)
     await bootstrap.close()
