@@ -6,6 +6,7 @@ import type { CanonicalTurnState } from "./canonical-turn-state.js"
 import type { TurnEngineStore } from "./turns/turn-engine-types.js"
 import { createCanonicalTurnRuntime } from "./canonical-turn-runtime.js"
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
+import { TurnEngine } from "./turns/turn-engine.js"
 import { createPgRootTaskStore } from "./subagents/root-task-store.js"
 import type { PlanProposal } from "./planning/goal-plan-contract.js"
 import type { PersistedTaskGraphEvent } from "./planning/plan-task-graph-adapter.js"
@@ -670,6 +671,23 @@ describe("createCanonicalTurnRuntime", () => {
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "waiting_for_user", summary: "policy_requires_user_input" })
     expect(boundary.getState()).toMatchObject({ turnStatus: "waiting_for_user", taskStatus: "waiting_for_user", taskLeaseOwner: null, taskLeaseExpiresAt: null })
     expect(boundary.calls.some(sql => sql.includes('"status" IN (\'in_progress\', \'waiting_for_user\')'))).toBe(true)
+  })
+
+  it("preserves a dependency waitId for the durable queue handoff", async () => {
+    const engineRun = vi.spyOn(TurnEngine.prototype, "run").mockResolvedValue({
+      status: "waiting_for_dependency", stepCount: 1, toolCallCount: 0, waitId: "wait-1",
+    })
+    try {
+      const fixture = setup()
+      await expect((await fixture.runtime).execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({
+        status: "waiting_for_dependency", waitId: "wait-1",
+      })
+      expect(fixture.roots.finish).toHaveBeenCalledWith(expect.objectContaining({
+        result: expect.objectContaining({ status: "waiting_for_dependency", waitId: "wait-1" }),
+      }))
+    } finally {
+      engineRun.mockRestore()
+    }
   })
 
   it("composes a real model/tool continuation with runtime-owned root identity", async () => {

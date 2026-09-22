@@ -424,7 +424,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     // The durable root is finalized first; a projection failure remains surfaced so queue retry can reconcile it.
     await executionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, result })
     await sessionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, result })
-    return { status: result.status, summary: result.errorCode }
+    return { status: result.status, summary: result.errorCode, ...(result.waitId ? { waitId: result.waitId } : {}) }
   }
   return {
     execute,
