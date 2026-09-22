@@ -195,9 +195,17 @@ describe("createCanonicalPlanExecutionFactory", () => {
 
   it("derives distinct read-only delegate actions from the requested role", async () => {
     const allowedTools = ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base", "application.get_state", "tool_results.read"]
+    const unsafeDefinitions = [
+      { name: "application.submit", version: "1", risk: "external_write", capabilities: ["external_write"], domain: "application", requiredCapabilities: [] },
+      { name: "agent.send", version: "1", risk: "internal_write", capabilities: ["coordination"], domain: "coordination", requiredCapabilities: [] },
+      { name: "events.read", version: "1", risk: "read", capabilities: ["read"], domain: "coordination", requiredCapabilities: [] },
+    ]
+    const requestedTools = [...allowedTools, "application.submit", "agent.send", "events.read"]
     const cases = [
       { role: "scout", expected: ["jobs.search", "jobs.get"] },
       { role: "analyst", expected: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"] },
+      { role: "reviewer", expected: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base", "application.get_state", "tool_results.read"] },
+      { role: "auditor", expected: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base", "application.get_state", "tool_results.read"] },
     ] as const
 
     for (const testCase of cases) {
@@ -206,7 +214,7 @@ describe("createCanonicalPlanExecutionFactory", () => {
         requests.push(request)
         return { ...request, status: "completed" as const, output: { ok: true }, errorCode: null }
       }) }
-      const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["delegate"], undefined, { allowedTools, allowedRoles: ["scout", "analyst"] })
+      const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["delegate"], undefined, { allowedTools: requestedTools, allowedRoles: ["scout", "analyst", "reviewer", "auditor"], extraDefinitions: unsafeDefinitions })
       const result = await hook(input(output(proposal([delegate(`${testCase.role}-child`, { role: testCase.role })]))))
 
       expect(result.observations).toHaveLength(1)

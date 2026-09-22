@@ -186,9 +186,9 @@ function durablePlanCommandSink(store: TurnEngineStore, owner: ExecutionOwnerFen
   return async receipt => { await store.appendEvent(durablePlanCommandEvent(owner, receipt)) }
 }
 
-// Reviewer/auditor remain deferred until canonical plan execution has matching
-// role contracts, result schemas, and replay/aggregate validation.
-const CANONICAL_PLANNER_ROLES = ["scout", "analyst"] as const
+// Writer/executor remain deferred until their artifact/submission contracts
+// exist; reviewer/auditor are read-only and use bounded unstructured results.
+const CANONICAL_PLANNER_ROLES = ["scout", "analyst", "reviewer", "auditor"] as const
 type PlannerRoleTool = Parameters<typeof visibleToolPolicy>[1]
 
 function plannerRoleTool(value: unknown): PlannerRoleTool | undefined {
@@ -230,6 +230,7 @@ function deriveCanonicalPlannerRoles(
     if (!getSubagentRolePolicy(role)) return false
     return tools.some(tool => allowed.has(tool.name)
       && tool.capabilities?.every(capability => capability === "read") === true
+      && (tool.domain !== "coordination" || tool.name === TOOL_RESULTS_READ_NAME)
       && visibleToolPolicy(role, tool).visible)
   })
 }

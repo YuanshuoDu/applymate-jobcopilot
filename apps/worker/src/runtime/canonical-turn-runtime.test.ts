@@ -528,7 +528,7 @@ describe("createCanonicalTurnRuntime", () => {
 
   it("derives only safe read-only planner roles from the live registry", async () => {
     const factory = vi.fn((input: { allowedRoles?: readonly string[] }) => {
-      expect(input.allowedRoles).toEqual(["scout", "analyst"])
+      expect(input.allowedRoles).toEqual(["scout", "analyst", "reviewer", "auditor"])
       return async () => ({ observations: [] })
     })
     const enabled = setup({

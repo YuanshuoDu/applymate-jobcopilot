@@ -3074,3 +3074,13 @@ Focused Worker tests and typecheck passed. Live PostgreSQL/RLS behavior, BullMQ 
 **Independent verification:** `canonical-turn-runtime.test.ts` passed **31/31** tests, including a throwing live-catalog fail-closed regression; Worker TypeScript and `git diff --check` passed.
 
 **Candidate boundary:** The proposal tool and execution factory share the Scout/Analyst upper bound, with the live registry and role-policy filter applied before plan execution. Reviewer/auditor contracts and end-to-end canonical reducers remain outside this slice. Live PostgreSQL/RLS, process restart, queue delivery, provider invocation, and production evidence remain unverified. No schema, dependency, Web/UI, provider, ATS, or external-write behavior changed; P8-97 remains a candidate.
+
+## 180. P8-98 — Canonical read-only reviewer/auditor delegates
+
+**Candidate status/date (2026-09-22):** P8-98 is a bounded Worker planner-action capability slice; formal P0-P7 acceptance remains **1/8 (12.5%)**.
+
+**Implementation:** Canonical plan delegate action resolution now consults the server-owned subagent role policy and `visibleToolPolicy` against the live registry. Reviewer and auditor are admitted only when the registry exposes allowed tools with `risk = read` and read-only capabilities, with the owner-fenced `tool_results.read` reader as the sole coordination-domain exception. External-write, internal-write, coordination-management, unknown coordination-domain, malformed, and unavailable definitions fail closed. Writer and executor remain excluded. Canonical structured result validation, aggregate derivation, and replay contracts remain Scout/Analyst-only, so reviewer/auditor delegates remain bounded unstructured child results.
+
+**Independent verification:** Focused canonical runtime and canonical plan execution suites passed **104/104** tests; Worker TypeScript and `git diff --check` passed.
+
+**Candidate boundary:** This slice changes delegate action visibility and does not widen structured-result schemas, aggregate role sets, replay evidence contracts, or external-write behavior. Live PostgreSQL/RLS, process restart, queue delivery, provider invocation, and production evidence remain unverified; P8-98 remains a candidate.

@@ -14,9 +14,8 @@ import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "..
 import { READ_ONLY_TOOL_NAMES, TOOL_RESULTS_READ_NAME } from "../tools/index.js"
 import { canonicalQuestionId, type TurnEnginePlanExecutionHook, type TurnEnginePlanExecutionHookResult } from "../turns/turn-engine-types.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
-import { visibleToolPolicy } from "../subagents/role-policy.js"
+import { getSubagentRolePolicy, visibleToolPolicy } from "../subagents/role-policy.js"
 import { validateRoleResult } from "../subagents/role-results.js"
-import { assertMigratedRole, roleContract } from "../subagents/scout-analyst-contracts.js"
 import { validateBoundStructuredEvidence } from "./structured-replay-evidence.js"
 import { inspectJoinFailureEvidence, replanRequiredControl } from "./plan-replan-signal.js"
 import { derivePlannerCapabilityCatalog } from "./planner-capabilities.js"
@@ -144,17 +143,18 @@ function isPolicyDomain(value: unknown): value is PolicyDomain {
 }
 
 function actions(registry: Registry, capabilities: readonly string[], allowedTools: readonly string[], role: string): readonly string[] {
-  let roleAllowedTools: ReadonlySet<string>
+  if (!getSubagentRolePolicy(role)) return []
+  let definitions: readonly unknown[]
   try {
-    assertMigratedRole(role)
-    roleAllowedTools = new Set(roleContract(role).allowedTools)
+    definitions = registry.list(capabilities)
   } catch {
     return []
   }
-  return [...new Set(registry.list(capabilities).flatMap(item => {
-    if (!isPlainJsonObject(item) || typeof item.name !== "string" || !allowedTools.includes(item.name) || !roleAllowedTools.has(item.name)) return []
+  if (!Array.isArray(definitions)) return []
+  return [...new Set(definitions.flatMap(item => {
+    if (!isPlainJsonObject(item) || typeof item.name !== "string" || !allowedTools.includes(item.name)) return []
     if (item.risk !== "read" || !Array.isArray(item.capabilities) || !item.capabilities.every(capability => capability === "read")) return []
-    if (!isPolicyDomain(item.domain) || !Array.isArray(item.requiredCapabilities) || !item.requiredCapabilities.every(capability => typeof capability === "string")) return []
+    if (!isPolicyDomain(item.domain) || (item.domain === "coordination" && item.name !== TOOL_RESULTS_READ_NAME) || !Array.isArray(item.requiredCapabilities) || !item.requiredCapabilities.every(capability => typeof capability === "string")) return []
     const visible = visibleToolPolicy(role, {
       name: item.name,
       risk: "read",
