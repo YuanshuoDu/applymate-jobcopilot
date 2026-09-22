@@ -10,14 +10,16 @@ const TURN_B = 'fixture-turn-b'
 const STEP_A = 'fixture-step-a'
 const ITEM_A = 'fixture-item-a'
 const ITEM_B = 'fixture-item-b'
+const CHILD_TASK_A = 'task-child-a'
+const APPROVAL_ID = 'fixture-approval-a'
 
 const times = {
   created: '2026-09-07T10:00:00.000Z',
   updated: '2026-09-07T10:01:00.000Z',
 }
 
-function json(route: Route, data: unknown) {
-  return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(data) })
+function json(route: Route, data: unknown, status = 200) {
+  return route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(data) })
 }
 
 function item(sessionId: string, turnId: string, id: string, text: string, overrides: Record<string, unknown> = {}) {
@@ -75,10 +77,27 @@ function event(sessionId: string, turnId: string, id: string, sequence: string, 
 }
 
 async function installSupervisorFixture(page: Page) {
-  let aStreamCount = 0
-  let lifecycleStarted = false
-  const stage = () => Math.min(aStreamCount, 3)
-  const stageStatus = () => ['queued', 'in_progress', 'waiting_for_user', 'completed'][stage()]
+  const fixture = {
+    aStreamCount: 0,
+    lifecycleStarted: false,
+    childTaskStarted: false,
+    childTaskCompleted: false,
+    taskLifecycleConnections: [] as number[],
+    tasksQueryCount: 0,
+    tasksQueryCountAtStartEvent: 0,
+    tasksQueryCountAtCompletedEvent: 0,
+    approvalDecisions: [] as Array<{
+      sessionId: string
+      approvalId: string
+      body: Record<string, unknown>
+      idempotencyKey: string | undefined
+    }>,
+  }
+  const stageStatus = () => {
+    if (fixture.aStreamCount >= 5) return 'completed'
+    return ['queued', 'in_progress', 'waiting_for_user'][Math.min(fixture.aStreamCount, 2)]
+  }
+  const childStatus = () => fixture.childTaskCompleted ? 'completed' : fixture.childTaskStarted ? 'running' : 'queued'
 
   await page.route('**/api/auth/session', route => json(route, {
     user: { id: 'agent-supervisor-fixture', email: 'fixture@applymate.local', name: 'Fixture' },
@@ -95,7 +114,7 @@ async function installSupervisorFixture(page: Page) {
   await page.route('**/api/notifications**', route => json(route, { notifications: [], unreadCount: 0 }))
   await page.route('**/api/gmail/unread', route => json(route, { hasGmail: false, unread: 0 }))
   await page.route('**/__agent_fixture__/lifecycle', async route => {
-    lifecycleStarted = true
+    fixture.lifecycleStarted = true
     return json(route, { ok: true })
   })
   await page.route(/\/api\/agent\/sessions(?:\?.*)?$/, route => json(route, {
@@ -111,34 +130,50 @@ async function installSupervisorFixture(page: Page) {
     const parts = url.pathname.split('/').filter(Boolean)
     const sessionId = parts[3]
     const resource = parts[4] ?? ''
+    if (resource === 'approvals' && route.request().method() === 'POST') {
+      fixture.approvalDecisions.push({
+        sessionId,
+        approvalId: parts[5] ?? '',
+        body: route.request().postDataJSON() as Record<string, unknown>,
+        idempotencyKey: route.request().headers()['idempotency-key'],
+      })
+      return json(route, { disposition: 'resolved' }, 202)
+    }
     if (resource === 'turns') {
       const selected = sessionId === SESSION_A
-        ? turn(SESSION_A, TURN_A, stageStatus(), stage() < 3 ? STEP_A : null)
+        ? turn(SESSION_A, TURN_A, stageStatus(), fixture.aStreamCount < 5 ? STEP_A : null)
         : turn(SESSION_B, TURN_B, 'completed', null)
       return json(route, { turns: [selected], projection: { activeTurnId: selected.status === 'completed' ? null : selected.id, activeTurn: selected.status === 'completed' ? null : { id: selected.id, status: selected.status, revision: selected.revision }, queuedInputCount: 0 } })
     }
     if (resource === 'tasks') {
+      fixture.tasksQueryCount += 1
       const selected = sessionId === SESSION_A ? stageStatus() : 'completed'
-      return json(route, { tasks: [{ id: `task-${sessionId}`, sessionId, turnId: sessionId === SESSION_A ? TURN_A : TURN_B, parentTaskId: null, role: 'Scout', taskType: 'read', status: selected, goal: sessionId === SESSION_A ? 'Inspect saved roles' : 'B session evidence', hasResult: selected === 'completed' }] })
+      const tasks = [{ id: `task-${sessionId}`, sessionId, turnId: sessionId === SESSION_A ? TURN_A : TURN_B, parentTaskId: null, role: 'Scout', taskType: 'read', status: selected, goal: sessionId === SESSION_A ? 'Inspect saved roles' : 'B session evidence', hasResult: selected === 'completed' }]
+      if (sessionId === SESSION_A) tasks.push({ id: CHILD_TASK_A, sessionId, turnId: TURN_A, parentTaskId: `task-${SESSION_A}`, role: 'Scout', taskType: 'research', status: childStatus(), goal: 'Check child evidence', hasResult: childStatus() === 'completed' })
+      return json(route, { tasks })
     }
     if (resource === 'timeline') {
       return json(route, { items: sessionId === SESSION_A
         ? [
             item(SESSION_A, TURN_A, 'fixture-plan-a', 'Read the current session plan.', { type: 'plan', phase: 'commentary', content: { steps: [{ id: 'step-a', label: 'Inspect saved roles', status: 'queued' }] } }),
             item(SESSION_A, TURN_A, 'fixture-tool-a', 'Read the saved roles.', { type: 'tool_call', phase: 'commentary', content: { toolCallId: 'call-a', toolName: 'jobs.search', input: { scope: 'saved roles' } } }),
-            item(SESSION_A, TURN_A, ITEM_A, 'The agent is executing the saved roles check.', { status: stage() === 3 ? 'completed' : 'queued' }),
+            item(SESSION_A, TURN_A, ITEM_A, 'The agent is executing the saved roles check.', { status: stageStatus() === 'completed' ? 'completed' : 'queued' }),
           ]
-        : [item(SESSION_B, TURN_B, ITEM_B, 'B session evidence is isolated from session A.', { status: 'completed', phase: 'final_answer', completedAt: times.updated })] })
+        : [item(SESSION_B, TURN_B, ITEM_B, 'B session evidence is isolated from session A.', { status: 'completed', phase: 'final_answer', completedAt: times.updated })],
+        approvalEvents: sessionId === SESSION_A
+          ? [event(SESSION_A, TURN_A, 'fixture-approval-requested', '0', 'approval.requested', { approvalId: APPROVAL_ID, action: 'submit_application', scopeHash: `sha256:${'a'.repeat(64)}`, revision: 1 }, { itemId: null, taskId: null, actor: 'orchestrator' })]
+          : [],
+      })
     }
     if (resource === 'events') {
       if (sessionId !== SESSION_A) {
         return route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': fixture B stream\n\n' })
       }
-      if (!lifecycleStarted) {
+      if (!fixture.lifecycleStarted) {
         return route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': waiting for lifecycle assertions\n\n' })
       }
-      aStreamCount += 1
-      const count = aStreamCount
+      fixture.aStreamCount += 1
+      const count = fixture.aStreamCount
       // Keep each lifecycle state visible long enough for the browser assertion to observe it.
       await new Promise(resolve => setTimeout(resolve, 1_000))
       const nextEvent = count === 1
@@ -146,17 +181,31 @@ async function installSupervisorFixture(page: Page) {
         : count === 2
           ? event(SESSION_A, TURN_A, 'fixture-event-waiting', '2', 'step.started', { status: 'waiting_for_user' }, { itemId: null, taskId: `task-${SESSION_A}` })
           : count === 3
-            ? event(SESSION_A, TURN_A, 'fixture-event-completed', '3', 'turn.completed', { status: 'completed' }, { itemId: null })
-            : event(SESSION_A, TURN_A, `fixture-event-late-${count}`, String(count), 'item.delta', { text: 'A late old-session event must stay discarded.' }, { itemId: ITEM_A, kind: 'delta', baseRevision: 3, revision: 4 })
+            ? event(SESSION_A, TURN_A, 'fixture-event-child-started', '3', 'task.started', { status: 'running' }, { itemId: null, taskId: CHILD_TASK_A })
+            : count === 4
+              ? event(SESSION_A, TURN_A, 'fixture-event-child-completed', '4', 'task.completed', { status: 'completed' }, { itemId: null, taskId: CHILD_TASK_A })
+              : count === 5
+                ? event(SESSION_A, TURN_A, 'fixture-event-completed', '5', 'turn.completed', { status: 'completed' }, { itemId: null })
+                : event(SESSION_A, TURN_A, `fixture-event-late-${count}`, String(count), 'item.delta', { text: 'A late old-session event must stay discarded.' }, { itemId: ITEM_A, kind: 'delta', baseRevision: 3, revision: 4 })
+      if (count === 3) {
+        fixture.tasksQueryCountAtStartEvent = fixture.tasksQueryCount
+        fixture.childTaskStarted = true
+        fixture.taskLifecycleConnections.push(count)
+      } else if (count === 4) {
+        fixture.tasksQueryCountAtCompletedEvent = fixture.tasksQueryCount
+        fixture.childTaskCompleted = true
+        fixture.taskLifecycleConnections.push(count)
+      }
       return route.fulfill({ status: 200, contentType: 'text/event-stream', body: `event: timeline\ndata: ${JSON.stringify(nextEvent)}\n\n` })
     }
     if (route.request().method() === 'PATCH') return json(route, {})
     return json(route, { session: { id: sessionId, goal: sessionId === SESSION_A ? 'Inspect saved roles' : 'B session evidence', status: sessionId === SESSION_A ? stageStatus() : 'completed', updatedAt: times.updated, tasks: [], approvals: [], applicationTasks: [], questions: [], artifacts: [], qualityScore: 100 } })
   })
+  return fixture
 }
 
 test('real page mounts the shared timeline, supervisor tree, and isolated session evidence', async ({ page }, testInfo) => {
-  await installSupervisorFixture(page)
+  const fixture = await installSupervisorFixture(page)
   const consoleErrors: string[] = []
   page.on('pageerror', error => consoleErrors.push(`pageerror: ${error.stack ?? error.message}`))
   page.on('console', message => {
@@ -173,16 +222,38 @@ test('real page mounts the shared timeline, supervisor tree, and isolated sessio
     ? { queued: /排队任务/, running: /运行中/, waiting: /等待中/, done: /完成/, connection: /实时连接|正在重新连接/ }
     : { queued: /Queued Tasks/, running: /Running/, waiting: /Waiting/, done: /Done/, connection: /Live connection|Reconnecting/ }
   const taskNode = page.locator('[data-task-node-id="task:task-fixture-session-a"]')
+  const childTaskNode = page.locator(`[data-task-node-id="task:${CHILD_TASK_A}"]`)
   const stepNode = page.locator('[data-task-node-id="step:fixture-step-a"]')
   await expect(taskNode).toContainText(labels.queued)
+  await expect(childTaskNode).toContainText(labels.queued)
   await expect(stepNode).toContainText(labels.queued)
   await expect(page.locator('[data-agent-supervisor-connection]')).toContainText(labels.connection)
+
+  const approvalCard = page.locator('[data-agent-approval-ledger="true"]')
+  await expect(approvalCard).toBeVisible()
+  const approveButton = approvalCard.getByRole('button').first()
+  await expect(approveButton).toBeEnabled()
+  await approveButton.click()
+  await expect(approveButton).toBeDisabled()
+  await expect.poll(() => fixture.approvalDecisions.length).toBe(1)
+  expect(fixture.approvalDecisions[0]).toMatchObject({
+    sessionId: SESSION_A,
+    approvalId: APPROVAL_ID,
+    body: { expectedTurnId: TURN_A, expectedRevision: 1, decision: 'approved' },
+  })
+  expect(fixture.approvalDecisions[0]?.idempotencyKey).toMatch(/^agent-approval-/)
+
   await page.evaluate(() => fetch('/__agent_fixture__/lifecycle', { method: 'POST' }))
 
   await expect(taskNode).toContainText(labels.running, { timeout: 5_000 })
   await expect(stepNode).toContainText(labels.running, { timeout: 5_000 })
   await expect(taskNode).toContainText(labels.waiting, { timeout: 5_000 })
   await expect(stepNode).toContainText(labels.waiting, { timeout: 5_000 })
+  await expect(childTaskNode).toContainText(labels.running, { timeout: 5_000 })
+  await expect.poll(() => fixture.tasksQueryCount).toBeGreaterThan(fixture.tasksQueryCountAtStartEvent)
+  await expect(childTaskNode).toContainText(labels.done, { timeout: 5_000 })
+  await expect.poll(() => fixture.tasksQueryCount).toBeGreaterThan(fixture.tasksQueryCountAtCompletedEvent)
+  expect(fixture.taskLifecycleConnections).toEqual([3, 4])
   await expect(taskNode).toContainText(labels.done, { timeout: 5_000 })
   await expect(page.locator('[data-agent-harness-item="fixture-item-a"]')).toContainText(labels.queued)
 

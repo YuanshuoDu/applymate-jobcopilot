@@ -697,36 +697,28 @@ describe("production Worker bootstrap", () => {
     expect(events).toEqual(["runtime.close"])
   })
 
-  it("composes root TurnEngine coordination with a leased child execution and wait closure", async () => {
+  it("composes root TurnEngine coordination with two leased child executions and wait closure", async () => {
     const now = new Date("2026-09-01T00:00:00.000Z")
-    const child: SubagentTaskRecord = { id: "child_fixture", userId: "user_fixture", sessionId: "session_fixture", turnId: "turn_fixture", rootTaskId: "root_fixture", parentTaskId: "root_fixture", path: "/root_fixture/child_fixture", depth: 1, role: "scout", taskType: "research", status: "queued", goal: "Find fixture evidence", constraints: [], successCriteria: [], allowedActions: ["fixture.read"], context: null, expectedOutputSchema: null, result: null, failureReason: null, attemptCount: 0, maxAttempts: 3, nextAttemptAt: null, leaseOwner: null, leaseExpiresAt: null, interruptRequestedAt: null, budgetSnapshot: { limits: { maxSteps: 4 }, subagentPolicy: { maxAttempts: 3 } }, toolPolicySnapshot: { capabilities: ["read"] } }
-    const rootTask: SubagentTaskRecord = { ...child, id: "root_fixture", parentTaskId: null, path: "/root_fixture", depth: 0, role: "orchestrator", taskType: "turn", status: "running" }
-    const tasks = new Map([[child.id, child]])
+    const childA: SubagentTaskRecord = { id: "child_fixture_a", userId: "user_fixture", sessionId: "session_fixture", turnId: "turn_fixture", rootTaskId: "root_fixture", parentTaskId: "root_fixture", path: "/root_fixture/child_fixture_a", depth: 1, role: "scout", taskType: "research", status: "queued", goal: "Find scout evidence", constraints: [], successCriteria: [], allowedActions: ["fixture.read"], context: { privateMarker: "child-a-private-marker" }, expectedOutputSchema: null, result: null, failureReason: null, attemptCount: 0, maxAttempts: 3, nextAttemptAt: null, leaseOwner: null, leaseExpiresAt: null, interruptRequestedAt: null, budgetSnapshot: { limits: { maxSteps: 4 }, subagentPolicy: { maxAttempts: 3 } }, toolPolicySnapshot: { capabilities: ["read"] } }
+    const childB: SubagentTaskRecord = { ...childA, id: "child_fixture_b", path: "/root_fixture/child_fixture_b", role: "analyst", goal: "Find analyst evidence", context: { privateMarker: "child-b-private-marker" } }
+    const childBySpawnKey = new Map([["spawn_fixture_a", childA], ["spawn_fixture_b", childB]])
+    const rootTask: SubagentTaskRecord = { ...childA, id: "root_fixture", parentTaskId: null, path: "/root_fixture", depth: 0, role: "orchestrator", taskType: "turn", status: "running" }
+    const tasks = new Map<string, SubagentTaskRecord>()
     const clock: SubagentClock = { setInterval: () => 1 as never, clearInterval: vi.fn() }
-    const store: SubagentStore = { async create() { throw new Error("non_atomic") }, async createWithSpawn(input) { tasks.set(child.id, { ...child, role: input.role, taskType: input.taskType, goal: input.goal }); return { task: tasks.get(child.id)!, duplicate: false } }, async get(id) { return id === rootTask.id ? rootTask : tasks.get(id) ?? null }, async claim(input) { const value = tasks.get(input.taskId); if (!value || value.status !== "queued") return null; const leased = { ...value, status: "running" as const, attemptCount: 1, leaseOwner: input.ownerId, leaseExpiresAt: new Date(now.getTime() + 60_000) }; tasks.set(value.id, leased); return leased }, async heartbeat() { return "renewed" }, async finish(input) { const value = tasks.get(input.taskId); if (!value || value.leaseOwner !== input.ownerId) return null; tasks.set(value.id, { ...value, status: input.status, result: input.result ?? null }); return input.status }, async close() { return false }, async interruptTree() { return 0 }, async recoverExpired() { return [] } }
+    const store: SubagentStore = { async create() { throw new Error("non_atomic") }, async createWithSpawn(input) { const template = childBySpawnKey.get(input.spawnIdempotencyKey); if (!template) throw new Error(`unexpected_spawn:${input.spawnIdempotencyKey}`); const task = { ...template, userId: input.userId, sessionId: input.sessionId, turnId: input.turnId ?? null, role: input.role, taskType: input.taskType, goal: input.goal, context: input.context, allowedActions: input.allowedActions ?? template.allowedActions }; tasks.set(task.id, task); return { task, duplicate: false } }, async get(id) { return id === rootTask.id ? rootTask : tasks.get(id) ?? null }, async claim(input) { const value = tasks.get(input.taskId); if (!value || value.status !== "queued") return null; const leased = { ...value, status: "running" as const, attemptCount: 1, leaseOwner: input.ownerId, leaseExpiresAt: new Date(now.getTime() + 60_000) }; tasks.set(value.id, leased); return leased }, async heartbeat() { return "renewed" }, async finish(input) { const value = tasks.get(input.taskId); if (!value || value.leaseOwner !== input.ownerId) return null; tasks.set(value.id, { ...value, status: input.status, result: input.result ?? null }); return input.status }, async close() { return false }, async interruptTree() { return 0 }, async recoverExpired() { return [] } }
     const manager = new AgentTreeManager(store, { now: () => now, clock })
-    const rootView: CoordinationTaskView = { ...child, id: "root_fixture", parentTaskId: null, path: "/root_fixture", depth: 0, role: "orchestrator", taskType: "turn", status: "running" }
-    const view = (): CoordinationTaskView => ({ ...tasks.get(child.id)! })
+    const rootView: CoordinationTaskView = { ...childA, id: "root_fixture", parentTaskId: null, path: "/root_fixture", depth: 0, role: "orchestrator", taskType: "turn", status: "running" }
+    const view = (id: string): CoordinationTaskView => ({ ...tasks.get(id)! })
     const replays = new Map<string, CoordinationTaskView>()
-    const coordinationStore: CoordinationStore = { getTask: async input => input.taskId === "root_fixture" ? rootView : view(), listTasks: async () => [view()], sendMessage: vi.fn(), getSpawnReplay: async input => replays.get(input.idempotencyKey) ?? null, recordSpawn: async input => { replays.set(input.idempotencyKey, input.task); return true }, appendActivity: async () => undefined }
-    const childRequests: HarnessModelRequest[] = []
+    const coordinationStore: CoordinationStore = { getTask: async input => input.taskId === "root_fixture" ? rootView : view(input.taskId), listTasks: async () => [...tasks.keys()].map(view), sendMessage: vi.fn(), getSpawnReplay: async input => replays.get(input.idempotencyKey) ?? null, recordSpawn: async input => { replays.set(input.idempotencyKey, input.task); return true }, appendActivity: async () => undefined }
+    const childRequests = new Map<string, HarnessModelRequest[]>()
     const childToolCalls: Array<{ context: ToolRouterContext; request: ToolCallRequest }> = []
-    let childModelCalls = 0
-    const childModel: ModelAdapter = {
-      id: "fixture-child-model",
-      profile: { provider: "fixture", model: "fixture-child", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false, supportsReasoningSummary: false, supportsResponseContinuation: false, supportsProviderConversation: false, supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low" },
-      async *stream(request) {
-        childRequests.push(request)
-        childModelCalls += 1
-        if (childModelCalls === 1) yield* [{ type: "tool_call_completed", callId: "child-read", name: "fixture.read", arguments: {} }, { type: "completed", finishReason: "tool_calls" }]
-        else yield* [{ type: "text_delta", text: "Child found job-fixture." }, { type: "completed", finishReason: "stop" }]
-      },
-    }
-    const childTool = vi.fn(async (userId: string) => ({ child: userId, evidence: "job-fixture" }))
+    const childCallsByTask = new Map<string, number>()
+    const childTool = vi.fn(async (taskId: string) => ({ child: taskId, evidence: `job-${taskId}` }))
     const childDefinition: PublicToolDefinition = { schemaVersion, name: "fixture.read", version: "1", description: "Read deterministic child evidence", capabilities: ["read"], inputSchema: Type.Object({}, { additionalProperties: false }), outputSchema: Type.Object({ child: Type.String(), evidence: Type.String() }, { additionalProperties: false }), risk: "read", domain: "jobs", idempotency: "read_only", timeoutMs: 1_000, requiredCapabilities: [] }
     const childRouter = vi.fn(async (context: ToolRouterContext, request: ToolCallRequest) => {
       childToolCalls.push({ context, request })
-      return { id: request.id, toolName: request.toolName, toolVersion: request.toolVersion, status: "completed" as const, output: await childTool(context.scope.userId), errorCode: null }
+      return { id: request.id, toolName: request.toolName, toolVersion: request.toolVersion, status: "completed" as const, output: await childTool(context.taskId!), errorCode: null }
     })
     const childTurnStore = compositionStore()
     const childBudgetReservations: TreeBudgetReservation[] = []
@@ -746,11 +738,28 @@ describe("production Worker bootstrap", () => {
         return reservation
       }),
     }
-    const childModelRuntimeFactory = vi.fn(() => childModel)
+    const childModelRuntimeFactory = vi.fn(({ task }: { task: SubagentTaskRecord }): ModelAdapter => {
+      const requestsForTask: HarnessModelRequest[] = []
+      childRequests.set(task.id, requestsForTask)
+      childCallsByTask.set(task.id, 0)
+      return {
+        id: `fixture-child-model-${task.id}`,
+        profile: { provider: "fixture", model: `fixture-child-${task.id}`, nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false, supportsReasoningSummary: false, supportsResponseContinuation: false, supportsProviderConversation: false, supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low" },
+        async *stream(request) {
+          requestsForTask.push(request)
+          const calls = (childCallsByTask.get(task.id) ?? 0) + 1
+          childCallsByTask.set(task.id, calls)
+          if (calls === 1) yield* [{ type: "tool_call_completed", callId: `child-read-${task.id}`, name: "fixture.read", arguments: {} }, { type: "completed", finishReason: "tool_calls" }]
+          else yield* [{ type: "text_delta", text: `Child ${task.id} found job-${task.id}.` }, { type: "completed", finishReason: "stop" }]
+        },
+      }
+    })
+    const childOwners: ExecutionOwnerFence[] = []
     const childToolRuntimeFactory = vi.fn(({ task, lease, owner }: { task: SubagentTaskRecord; lease: SubagentLease; owner: ExecutionOwnerFence }) => {
-      expect(task.id).toBe(child.id)
-      expect(lease.id).toBe(child.id)
-      expect(owner).toMatchObject({ taskId: child.id, rootTaskId: "root_fixture", ownerId: "queue_fixture", attemptCount: 1 })
+      childOwners.push(owner)
+      expect(task.id).toMatch(/^child_fixture_[ab]$/)
+      expect(lease.id).toBe(task.id)
+      expect(owner).toMatchObject({ userId: "user_fixture", sessionId: "session_fixture", turnId: "turn_fixture", taskId: task.id, rootTaskId: "root_fixture", ownerId: `queue_${task.id.slice(-1)}`, attemptCount: 1 })
       return {
         definitions: [childDefinition], router: { execute: childRouter },
         validateArguments: (name: string, input: unknown, version?: string): true | string => {
@@ -786,8 +795,21 @@ describe("production Worker bootstrap", () => {
     } }
     const requests: HarnessModelRequest[] = []
     let calls = 0
-    const model: ModelAdapter = { id: "fixture-model", profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false, supportsReasoningSummary: false, supportsResponseContinuation: false, supportsProviderConversation: false, supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low" }, async *stream(request) { requests.push(request); calls += 1; if (calls === 1) yield* [{ type: "tool_call_completed", callId: "spawn", name: "agent.spawn", arguments: { idempotencyKey: "spawn_fixture", role: "scout", taskType: "research", goal: "Find fixture evidence" } }, { type: "completed", finishReason: "tool_calls" }]; else if (calls === 2) yield* [{ type: "tool_call_completed", callId: "wait", name: "agent.wait", arguments: { idempotencyKey: "wait_fixture", taskIds: [child.id], mode: "all", timeoutMs: 1_000 } }, { type: "completed", finishReason: "tool_calls" }]; else if (calls === 3) yield* [{ type: "tool_call_completed", callId: "read", name: "fixture.read", arguments: {} }, { type: "completed", finishReason: "tool_calls" }]; else yield* [{ type: "text_delta", text: "Found job-fixture." }, { type: "completed", finishReason: "stop" }] } }
-    const fixture = await coordinationRuntime({ manager, store: coordinationStore, wait, model, stateLoader: state => parentResuming ? { ...state, snapshot: { ...state.snapshot, toolObservations: resumeObservation } } : state })
+    const model: ModelAdapter = {
+      id: "fixture-model",
+      profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false, supportsReasoningSummary: false, supportsResponseContinuation: false, supportsProviderConversation: false, supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low" },
+      async *stream(request) {
+        requests.push(request)
+        calls += 1
+        if (calls === 1) yield* [{ type: "tool_call_completed", callId: "spawn-a", name: "agent.spawn", arguments: { idempotencyKey: "spawn_fixture_a", role: "scout", taskType: "research", goal: "Find scout evidence", allowedActions: ["fixture.read"], context: { privateMarker: "child-a-private-marker" } } }, { type: "completed", finishReason: "tool_calls" }]
+        else if (calls === 2) yield* [{ type: "tool_call_completed", callId: "spawn-b", name: "agent.spawn", arguments: { idempotencyKey: "spawn_fixture_b", role: "analyst", taskType: "research", goal: "Find analyst evidence", allowedActions: ["fixture.read"], context: { privateMarker: "child-b-private-marker" } } }, { type: "completed", finishReason: "tool_calls" }]
+        else if (calls === 3) yield* [{ type: "tool_call_completed", callId: "wait", name: "agent.wait", arguments: { idempotencyKey: "wait_fixture", taskIds: [childA.id, childB.id], mode: "all", timeoutMs: 1_000 } }, { type: "completed", finishReason: "tool_calls" }]
+        else if (calls === 4) yield* [{ type: "tool_call_completed", callId: "read", name: "fixture.read", arguments: {} }, { type: "completed", finishReason: "tool_calls" }]
+        else yield* [{ type: "text_delta", text: "Found both child results." }, { type: "completed", finishReason: "stop" }]
+      },
+    }
+    const parentPrivateObservation: CanonicalTurnState["snapshot"]["toolObservations"] = [{ id: "root-private", content: "parent-private-marker" }]
+    const fixture = await coordinationRuntime({ manager, store: coordinationStore, wait, model, stateLoader: state => ({ ...state, snapshot: { ...state.snapshot, toolObservations: parentResuming ? resumeObservation : parentPrivateObservation } }) })
     let execute: CanonicalTurnRuntime["execute"] | undefined
     let waitHandoff: Parameters<typeof createTurnQueue>[0]["waitHandoff"] | undefined
     const childQueueFactory = vi.fn(options => {
@@ -839,7 +861,7 @@ describe("production Worker bootstrap", () => {
       const waiting = await runTurnJob({ data: { turnId: "turn_fixture", sessionId: "session_fixture", ownerId: "worker_fixture" }, attemptsMade: 0 }, { pool: durableFixture.pool as never, execute: parentExecutor, waitHandoff: waitHandoff!, now: () => now, heartbeatMs: 60_000 })
       expect(waiting).toMatchObject({ status: "waiting_for_dependency" })
       expect(waitCalls).toBe(1)
-      expect(durableFixture.state.wait).toMatchObject({ status: "waiting", targetTaskIds: [child.id] })
+      expect(durableFixture.state.wait).toMatchObject({ status: "waiting", targetTaskIds: [childA.id, childB.id] })
       expect(durableFixture.state.turn.leaseVersion).toBe(1)
 
       const waitId = String(durableFixture.state.wait?.id)
@@ -847,12 +869,19 @@ describe("production Worker bootstrap", () => {
       expect(durableFixture.state.turn).toMatchObject({ status: "waiting_for_dependency", leaseOwnerId: null })
 
       expect(bootstrappedChildExecutor).toBe(childExecutor)
-      const childOutcome = await manager.run({ taskId: child.id, sessionId: "session_fixture", rootTaskId: "root_fixture", ownerId: "queue_fixture" }, bootstrappedChildExecutor!)
-      expect(childOutcome).toMatchObject({ taskId: child.id, status: "completed" })
-      expect(tasks.get(child.id)?.result).toMatchObject({ status: "completed", toolCallCount: 1, finalText: "Child found job-fixture." })
+      const childOutcomes = await Promise.all([
+        manager.run({ taskId: childA.id, sessionId: "session_fixture", rootTaskId: "root_fixture", ownerId: "queue_a" }, bootstrappedChildExecutor!),
+        manager.run({ taskId: childB.id, sessionId: "session_fixture", rootTaskId: "root_fixture", ownerId: "queue_b" }, bootstrappedChildExecutor!),
+      ])
+      expect(childOutcomes).toEqual([
+        expect.objectContaining({ taskId: childA.id, status: "completed" }),
+        expect.objectContaining({ taskId: childB.id, status: "completed" }),
+      ])
+      expect(tasks.get(childA.id)?.result).toMatchObject({ status: "completed", toolCallCount: 1, finalText: `Child ${childA.id} found job-${childA.id}.` })
+      expect(tasks.get(childB.id)?.result).toMatchObject({ status: "completed", toolCallCount: 1, finalText: `Child ${childB.id} found job-${childB.id}.` })
 
       await expect(reconcileDurableWaits(durableFixture.pool as never, { now: new Date(now.getTime() + 1_000), ownerId: "resolver_fixture" })).resolves.toEqual({ scanned: 1, resolved: 1, woken: 1 })
-      expect(durableFixture.state.wait).toMatchObject({ status: "ready", matchedTaskIds: [child.id] })
+      expect(durableFixture.state.wait).toMatchObject({ status: "ready", matchedTaskIds: [childA.id, childB.id] })
       expect(durableFixture.state.turn).toMatchObject({ status: "queued", leaseOwnerId: null })
       expect(durableFixture.state.events).toHaveLength(1)
       expect(durableFixture.state.outbox.filter(item => item.topic === "agent.session.event")).toHaveLength(1)
@@ -864,7 +893,7 @@ describe("production Worker bootstrap", () => {
       expect(durableFixture.state.outbox.filter(item => item.topic === "agent.session.event")).toHaveLength(1)
       expect(durableFixture.state.outbox.filter(item => item.topic === "agent.turn.dispatch")).toHaveLength(1)
 
-      await expect(durableWait.wait({ userId: "user_fixture", sessionId: "session_fixture", turnId: "turn_fixture", stepId: String(durableFixture.state.wait?.stepId), taskId: "root_fixture", rootTaskId: "root_fixture", targetTaskIds: [child.id], mode: "all", timeoutMs: 1_000, idempotencyKey: "wait_fixture" })).resolves.toMatchObject({ status: "ready", matchedTaskIds: [child.id] })
+      await expect(durableWait.wait({ userId: "user_fixture", sessionId: "session_fixture", turnId: "turn_fixture", stepId: String(durableFixture.state.wait?.stepId), taskId: "root_fixture", rootTaskId: "root_fixture", targetTaskIds: [childA.id, childB.id], mode: "all", timeoutMs: 1_000, idempotencyKey: "wait_fixture" })).resolves.toMatchObject({ status: "ready", matchedTaskIds: [childA.id, childB.id] })
 
       expect(durableFixture.state.turn.status).toBe("queued")
       parentResuming = true
@@ -873,20 +902,48 @@ describe("production Worker bootstrap", () => {
       expect(waitCalls).toBe(1)
       expect(projectionCalls).toBe(1)
       expect(resumeProjection).toHaveLength(1)
-      expect(JSON.stringify(resumeProjection[0]?.content)).toContain("Child found job-fixture.")
+      expect(JSON.stringify(resumeProjection[0]?.content)).toContain(`Child ${childA.id} found job-${childA.id}.`)
+      expect(JSON.stringify(resumeProjection[0]?.content)).toContain(`Child ${childB.id} found job-${childB.id}.`)
       expect(durableFixture.state.turn).toMatchObject({ status: "completed", leaseOwnerId: null, leaseVersion: 2 })
-      expect(JSON.stringify(requests[2]?.messages)).toContain("Child found job-fixture.")
-      expect(childModelRuntimeFactory).toHaveBeenCalledOnce()
-      expect(childToolRuntimeFactory).toHaveBeenCalledOnce()
-      expect(childRequests).toHaveLength(2)
-      expect(childRequests[0]?.tools).toEqual([expect.objectContaining({ name: "fixture.read" })])
-      expect(childTool).toHaveBeenCalledOnce()
-      expect(childToolCalls).toHaveLength(1)
-      expect(childToolCalls[0]?.context).toMatchObject({ taskId: child.id, rootTaskId: "root_fixture", actorRole: "subagent" })
-      expect(childBudget.reserve).toHaveBeenCalledTimes(2)
-      expect(childBudget.settle).toHaveBeenCalledTimes(2)
+      expect(JSON.stringify(requests[3]?.messages)).toContain(`Child ${childA.id} found job-${childA.id}.`)
+      expect(JSON.stringify(requests[3]?.messages)).toContain(`Child ${childB.id} found job-${childB.id}.`)
+      expect(childModelRuntimeFactory).toHaveBeenCalledTimes(2)
+      expect(childToolRuntimeFactory).toHaveBeenCalledTimes(2)
+      expect(childOwners.map(({ userId, sessionId, turnId, taskId, rootTaskId, ownerId }) => ({ userId, sessionId, turnId, taskId, rootTaskId, ownerId })).sort((left, right) => left.taskId.localeCompare(right.taskId))).toEqual([
+        { userId: "user_fixture", sessionId: "session_fixture", turnId: "turn_fixture", taskId: childA.id, rootTaskId: "root_fixture", ownerId: "queue_a" },
+        { userId: "user_fixture", sessionId: "session_fixture", turnId: "turn_fixture", taskId: childB.id, rootTaskId: "root_fixture", ownerId: "queue_b" },
+      ])
+      expect(childRequests.get(childA.id)).toHaveLength(2)
+      expect(childRequests.get(childB.id)).toHaveLength(2)
+      expect(childRequests.get(childA.id)?.[0]?.tools).toEqual([expect.objectContaining({ name: "fixture.read" })])
+      expect(childRequests.get(childB.id)?.[0]?.tools).toEqual([expect.objectContaining({ name: "fixture.read" })])
+      expect(childTool).toHaveBeenCalledTimes(2)
+      expect(childTool.mock.calls.map(([taskId]) => taskId).sort()).toEqual([childA.id, childB.id])
+      expect(childToolCalls).toHaveLength(2)
+      expect(childToolCalls.map(call => call.context.taskId).sort()).toEqual([childA.id, childB.id])
+      for (const call of childToolCalls) {
+        expect(call.context).toMatchObject({ scope: { userId: "user_fixture" }, sessionId: "session_fixture", turnId: "turn_fixture", rootTaskId: "root_fixture", actorRole: "subagent" })
+      }
+      const childARequestJson = JSON.stringify(childRequests.get(childA.id))
+      const childBRequestJson = JSON.stringify(childRequests.get(childB.id))
+      expect(JSON.stringify(childRequests.get(childA.id)?.[1]?.messages)).toContain(`job-${childA.id}`)
+      expect(JSON.stringify(childRequests.get(childA.id)?.[1]?.messages)).not.toContain(`job-${childB.id}`)
+      expect(JSON.stringify(childRequests.get(childB.id)?.[1]?.messages)).toContain(`job-${childB.id}`)
+      expect(JSON.stringify(childRequests.get(childB.id)?.[1]?.messages)).not.toContain(`job-${childA.id}`)
+      expect(childARequestJson).toContain("child-a-private-marker")
+      expect(childARequestJson).not.toContain("child-b-private-marker")
+      expect(childARequestJson).not.toContain("parent-private-marker")
+      expect(childBRequestJson).toContain("child-b-private-marker")
+      expect(childBRequestJson).not.toContain("child-a-private-marker")
+      expect(childBRequestJson).not.toContain("parent-private-marker")
+      expect(JSON.stringify(requests[0]?.messages)).toContain("parent-private-marker")
+      expect(childBudget.reserve).toHaveBeenCalledTimes(4)
+      expect(childBudget.settle).toHaveBeenCalledTimes(4)
       expect(childBudgetReservations.every(reservation => reservation.status === "consumed")).toBe(true)
-      expect(requests).toHaveLength(4)
+      expect(new Set(childBudgetReservations.map(reservation => reservation.idempotencyKey)).size).toBe(4)
+      expect(new Set(childBudgetReservations.map(reservation => reservation.taskId))).toEqual(new Set([childA.id, childB.id]))
+      expect(childBudgetReservations.every(reservation => reservation.userId === "user_fixture" && reservation.sessionId === "session_fixture" && reservation.turnId === "turn_fixture" && reservation.rootTaskId === "root_fixture" && reservation.attempt === 1)).toBe(true)
+      expect(requests).toHaveLength(5)
     } finally {
       await bootstrap.close()
       vi.useRealTimers()
