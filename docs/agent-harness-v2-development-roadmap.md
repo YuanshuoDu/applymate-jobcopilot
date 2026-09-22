@@ -2868,3 +2868,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Compatibility and verification:** The path reuses `READ_ONLY_TOOL_NAMES` and `TOOL_RESULTS_READ_NAME`; legacy replay, atomic terminal persistence, and `replan_required` behavior remain intact. Retry reducer/adapter validation passed **51/51**; canonical replay validation passed **70/70**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 
 **Candidate boundary:** Real PostgreSQL/RLS, cross-process queue delivery and restart, complete wakeup, and production E2E remain unverified. P8-71 remains a candidate hardening slice.
+
+## 158. P8-72 — Canonical retry graph event loader hardening
+
+**Candidate status/date (2026-09-22):** P8-72 is recorded as a candidate loader hardening slice; formal P0-P7 acceptance remains **1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `88fda5ac` makes `canonical-turn-state` strictly accept legacy attempt 1 and P8-71 retry/attempt 2 graph events. It validates stable event IDs, attempt 1..2 and `retry=2`, and fails closed for extra or unknown fields, wrong IDs or run keys, sequence violations, and payload bounds. Persisted state snapshots remain untrusted, while foreign tasks stay within the existing scoped SQL filter.
+
+**Independent verification:** Canonical-turn-state validation passed **49/49**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. P8-71 retry reducer/adapter **51/51** and canonical replay **70/70** evidence remains green.
+
+**Candidate boundary:** Real PostgreSQL/RLS, live cross-process queue delivery and restart, complete wakeup, and production E2E remain unverified. P8-72 remains a candidate hardening slice.

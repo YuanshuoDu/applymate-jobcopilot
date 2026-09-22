@@ -991,3 +991,11 @@ P8-71 is a candidate retry hardening slice. Commit `b00e8823` adds retry reducer
 Focused evidence passed **51/51** for the retry reducer/adapter and **70/70** canonical replay tests; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. The implementation reuses `READ_ONLY_TOOL_NAMES` and `TOOL_RESULTS_READ_NAME`; legacy replay, atomic terminal persistence, and replan behavior remain preserved.
 
 Real PostgreSQL/RLS, cross-process queue/restart, complete wakeup, and production E2E remain unverified. Formal P0-P7 acceptance remains **1/8 (12.5%)**; P8-71 is a candidate hardening slice.
+
+## P8-72 update
+
+Commit `88fda5ac` hardens the canonical-turn-state loader for both legacy attempt 1 and P8-71 retry/attempt 2 graph events. It validates stable event IDs, attempt 1..2 and `retry=2`, and fails closed on extra or unknown fields, wrong IDs or run keys, invalid sequence, and oversized payloads. Persisted state snapshots remain non-authoritative; foreign tasks continue to be filtered by the existing scoped SQL.
+
+Canonical-turn-state validation passed **49/49**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. P8-71 evidence remains **51/51** retry reducer/adapter and **70/70** canonical replay tests.
+
+P8-72 is a candidate hardening slice. Real PostgreSQL/RLS, live cross-process queue/restart, complete wakeup, and production E2E remain unverified; formal P0-P7 acceptance remains **1/8 (12.5%)**.
