@@ -23,6 +23,22 @@ function compactedReplaySnapshot(): StepContextSnapshot {
   } }] }
 }
 
+function priorMarker(): { id: string; content: Record<string, unknown> } {
+  return { id: "context-compacted:prior-step", content: {
+    kind: "context_compacted", status: "compacted", stepId: "prior-step", idempotencyKey: "context-compaction:prior-step",
+    beforeInputTokens: 100, afterInputTokens: 1, beforeBytes: 300_000, afterBytes: 100, snapshotRef: "snapshot-prior-1",
+  } }
+}
+
+function oversizedWithPrior(removedCount = 260): { current: StepContextSnapshot; loaded: StepContextSnapshot } {
+  const old = Array.from({ length: removedCount }, (_, index) => ({ id: `old-${index}`, content: { text: "x".repeat(1_200) } }))
+  const marker = priorMarker()
+  return {
+    current: { ...snapshot, toolObservations: [...old, marker, { id: "new-tail", content: { status: "new" } }] },
+    loaded: { ...snapshot, toolObservations: [{ id: "context-summary:prior-step", content: { kind: "context_summary", value: { removedObservationIds: old.map(item => item.id) } } }, { id: "retained", content: { status: "retained" } }] },
+  }
+}
+
 const malformedNestedValues: readonly [string, () => unknown][] = [
   ["BigInt", () => BigInt(1)],
   ["cycle", () => { const value: Record<string, unknown> = {}; value.self = value; return value }],
@@ -132,5 +148,46 @@ describe("context compaction runtime seam", () => {
     const error = await runContextCompaction(value.value).catch(value => value as Error) as unknown as Error
     expect(error).toMatchObject({ code: "invalid_output", message: "Compacted snapshot replay failed closed" })
     expect(error.message).not.toContain("sensitive loader details")
+  })
+
+  it("rehydrates an oversized restart snapshot from the prior compaction and keeps only post-marker observations", async () => {
+    const data = oversizedWithPrior()
+    const hook = vi.fn(async (request: Parameters<ContextCompactionHook>[0]) => ({ status: "unchanged" as const, snapshot: request.snapshot }))
+    const value = input(hook, data.current, async request => {
+      expect(request).toMatchObject({ snapshotRef: "snapshot-prior-1", scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1" })
+      return { snapshot: data.loaded, scope: request.scope, sessionId: request.sessionId, turnId: request.turnId }
+    })
+    const result = await runContextCompaction(value.value)
+    const ids = result.snapshot.toolObservations.map(item => item.id)
+    expect(ids).toEqual(expect.arrayContaining(["context-summary:prior-step", "retained", "new-tail", "context-compacted:prior-step", "context-compacted:step:0"]))
+    expect(ids).not.toContain("old-0")
+    expect(hook).toHaveBeenCalledTimes(1)
+    expect(value.events).toHaveLength(1)
+    expect(hook.mock.calls[0]?.[0].estimatedBytes).toBeLessThanOrEqual(256 * 1024)
+  })
+
+  it("fails closed when the persisted summary does not completely account for pre-marker observations", async () => {
+    const data = oversizedWithPrior()
+    const incomplete = { ...data.loaded, toolObservations: [{ id: "context-summary:prior-step", content: { kind: "context_summary", value: { removedObservationIds: ["old-0"] } } }] }
+    const hook = vi.fn()
+    const value = input(hook, data.current, async request => ({ snapshot: incomplete, scope: request.scope, sessionId: request.sessionId, turnId: request.turnId }))
+    await expect(runContextCompaction(value.value)).rejects.toMatchObject({ code: "invalid_output" })
+    expect(hook).not.toHaveBeenCalled()
+    expect(value.events[0]).toMatchObject({ status: "failed", errorCode: "context_compaction_failed" })
+  })
+
+  it("fails closed when the loaded summary step does not match the prior marker", async () => {
+    const data = oversizedWithPrior()
+    const wrongStep = { ...data.loaded, toolObservations: [{ id: "context-summary:other-step", content: { kind: "context_summary", value: { removedObservationIds: ["old-0"] } } }] }
+    const value = input(vi.fn(), data.current, async request => ({ snapshot: wrongStep, scope: request.scope, sessionId: request.sessionId, turnId: request.turnId }))
+    await expect(runContextCompaction(value.value)).rejects.toMatchObject({ code: "invalid_output" })
+    expect(value.events[0]).toMatchObject({ status: "failed", errorCode: "context_compaction_failed" })
+  })
+
+  it("rejects an optional loader snapshot reference mismatch before invoking the hook", async () => {
+    const data = oversizedWithPrior()
+    const value = input(vi.fn(), data.current, async request => ({ snapshot: data.loaded, scope: request.scope, sessionId: request.sessionId, turnId: request.turnId, snapshotRef: "foreign-ref" } as never))
+    await expect(runContextCompaction(value.value)).rejects.toMatchObject({ code: "invalid_output" })
+    expect(value.events[0]).toMatchObject({ status: "failed", errorCode: "context_compaction_failed" })
   })
 })

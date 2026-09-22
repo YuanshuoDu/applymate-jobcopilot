@@ -2908,3 +2908,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused wakeup and recovery-scanner validation passed **52/52 tests**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Question and approval waits, stale/foreign lineage, duplicate delivery, queue failure bookkeeping, and rollback behavior are covered with fake transactions/queues.
 
 **Candidate boundary:** Live PostgreSQL/RLS, Redis/BullMQ delivery, process restart recovery, and end-to-end production wakeup continuation remain unverified. No schema, Web, provider, legacy bridge, or approval-policy change was made; P8-75 remains a candidate.
+
+## 162. P8-76 — Durable context compaction snapshot rehydrate
+
+**Candidate status/date (2026-09-22):** P8-76 is recorded as a bounded canonical context rehydrate slice; formal P0-P7 acceptance remains **1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Before estimating an oversized canonical step snapshot, `runContextCompaction` selects the newest prior `context_compacted` marker and uses its scoped snapshot loader. The runtime validates scope/session/turn and optional loader identity, protected invariants, the unique `context-summary:<marker.stepId>` summary, a bounded unique complete `removedObservationIds` list, JSON safety, and the 256 KiB bound. It rebuilds from the persisted compacted snapshot and observations after the prior marker, preserving the marker and avoiding a second historical projection; current-step replay remains idempotent and does not invoke the hook again. All failures fail closed, and the default-off gate is unchanged.
+
+**Independent verification:** Focused Worker context-compaction runtime validation passed **22/22**, with **162/162** related context-adapter, canonical-state, and turn-execution-loop regression tests also passing. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+**Candidate boundary:** Real PostgreSQL/RLS, process restart and cross-process rehydrate, production rehydrate, provider/model invocation evidence, and production supervisor E2E remain unverified. No schema, migration, Web, provider, queue, or feature-gate change was made; P8-76 remains a candidate.

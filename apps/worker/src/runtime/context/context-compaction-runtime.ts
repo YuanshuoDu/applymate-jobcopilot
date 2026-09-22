@@ -9,6 +9,8 @@ import { parseContextCompactionObservation, type ContextCompactionHook, type Con
 
 const MAX_INPUT_BYTES = 256 * 1024
 const MAX_OBSERVATION_BYTES = 8 * 1024
+const COMPACTION_PREFIX = "context-compacted:"
+const SUMMARY_PREFIX = "context-summary:"
 
 type RuntimeInput = {
   readonly hook?: ContextCompactionHook
@@ -26,13 +28,11 @@ type RuntimeInput = {
 
 type RuntimeResult = { readonly snapshot: StepContextSnapshot }
 type LoadedSnapshot = { readonly snapshot: StepContextSnapshot; readonly scope: TenantScope; readonly sessionId: string; readonly turnId: string }
+type ToolObservation = StepContextSnapshot["toolObservations"][number]
 
 function assertJsonValue(value: unknown, ancestors = new WeakSet<object>()): void {
   if (value === null || typeof value === "string" || typeof value === "boolean") return
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) throw new TypeError("non-finite number")
-    return
-  }
+  if (typeof value === "number") { if (!Number.isFinite(value)) throw new TypeError("non-finite number"); return }
   if (typeof value !== "object") throw new TypeError("non-JSON value")
   if (ancestors.has(value)) throw new TypeError("cyclic value")
   ancestors.add(value)
@@ -41,45 +41,31 @@ function assertJsonValue(value: unknown, ancestors = new WeakSet<object>()): voi
     if (keys.length > MAX_INPUT_BYTES) throw new TypeError("oversized object")
     if (Array.isArray(value)) {
       if (Object.getPrototypeOf(value) !== Array.prototype || value.length > MAX_INPUT_BYTES) throw new TypeError("non-plain array")
-      for (const key of keys) {
-        if (key === "length") continue
-        if (typeof key !== "string" || !/^(0|[1-9]\d*)$/.test(key) || Number(key) >= value.length) throw new TypeError("invalid array member")
-        const descriptor = Object.getOwnPropertyDescriptor(value, key)
-        if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) throw new TypeError("array accessor")
-      }
-      for (let index = 0; index < value.length; index += 1) {
-        const descriptor = Object.getOwnPropertyDescriptor(value, String(index))
-        if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) throw new TypeError("sparse array")
-        assertJsonValue(descriptor.value, ancestors)
-      }
+      for (const key of keys) { if (key === "length") continue; if (typeof key !== "string" || !/^(0|[1-9]\d*)$/.test(key) || Number(key) >= value.length) throw new TypeError("invalid array member"); const descriptor = Object.getOwnPropertyDescriptor(value, key); if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) throw new TypeError("array accessor") }
+      for (let index = 0; index < value.length; index += 1) { const descriptor = Object.getOwnPropertyDescriptor(value, String(index)); if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) throw new TypeError("sparse array"); assertJsonValue(descriptor.value, ancestors) }
       return
     }
     if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) throw new TypeError("non-plain object")
-    for (const key of keys) {
-      if (typeof key !== "string") throw new TypeError("symbol property")
-      const descriptor = Object.getOwnPropertyDescriptor(value, key)
-      if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) throw new TypeError("object accessor")
-      assertJsonValue(descriptor.value, ancestors)
-    }
+    for (const key of keys) { if (typeof key !== "string") throw new TypeError("symbol property"); const descriptor = Object.getOwnPropertyDescriptor(value, key); if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) throw new TypeError("object accessor"); assertJsonValue(descriptor.value, ancestors) }
   } finally {
     ancestors.delete(value)
   }
 }
 
 function safeStableJson(value: unknown, message: string): string {
-  try {
-    assertJsonValue(value)
-    return stableJson(value)
-  } catch {
-    throw new TurnEngineError("invalid_output", message)
-  }
+  try { assertJsonValue(value); return stableJson(value) } catch { throw new TurnEngineError("invalid_output", message) }
+}
+
+function measure(snapshot: StepContextSnapshot): { readonly tokens: number; readonly bytes: number } {
+  const encoded = safeStableJson(snapshot, "Context compaction snapshot is not JSON-safe")
+  return { tokens: Math.ceil(Array.from(encoded).length / 4), bytes: Buffer.byteLength(encoded, "utf8") }
 }
 
 function estimate(snapshot: StepContextSnapshot): { readonly tokens: number; readonly bytes: number } {
-  const encoded = safeStableJson(snapshot, "Context compaction snapshot is not JSON-safe")
-  const bytes = Buffer.byteLength(encoded, "utf8")
+  const measured = measure(snapshot)
+  const bytes = measured.bytes
   if (bytes > MAX_INPUT_BYTES) throw new TurnEngineError("invalid_output", "Context compaction input exceeds the bounded runtime limit")
-  return { tokens: Math.ceil(Array.from(encoded).length / 4), bytes }
+  return measured
 }
 
 function snapshotShape(value: unknown): value is StepContextSnapshot {
@@ -91,9 +77,7 @@ function snapshotShape(value: unknown): value is StepContextSnapshot {
     if (row.goal !== undefined && (!row.goal || typeof row.goal !== "object" || Array.isArray(row.goal))) return false
     safeStableJson(value, "Context compaction snapshot is not JSON-safe")
     return true
-  } catch {
-    return false
-  }
+  } catch { return false }
 }
 
 function loadedSnapshotShape(value: unknown): value is LoadedSnapshot {
@@ -105,9 +89,7 @@ function loadedSnapshotShape(value: unknown): value is LoadedSnapshot {
     if (typeof row.sessionId !== "string" || typeof row.turnId !== "string" || !snapshotShape(row.snapshot)) return false
     safeStableJson(value, "Compacted snapshot replay is not JSON-safe")
     return true
-  } catch {
-    return false
-  }
+  } catch { return false }
 }
 
 function invariantSnapshot(value: StepContextSnapshot): string {
@@ -124,6 +106,61 @@ function appendObservation(snapshot: StepContextSnapshot, observation: ContextCo
   return { ...snapshot, toolObservations: [...snapshot.toolObservations, { id: observation.id, content: observation.content }] }
 }
 
+function parseMarker(item: ToolObservation): ContextCompactionObservation | null {
+  if (typeof item.id !== "string" || !item.id.startsWith(COMPACTION_PREFIX)) return null
+  try {
+    const content = item.content && typeof item.content === "object" && !Array.isArray(item.content) ? item.content : {}; const parsed = parseContextCompactionObservation({ ...content, observationId: item.id })
+    if (!parsed || parsed.id !== item.id || parsed.content.stepId !== item.id.slice(COMPACTION_PREFIX.length) || (parsed.content.snapshotRef !== undefined && parsed.content.snapshotRef.trim() !== parsed.content.snapshotRef)) throw new Error("invalid compaction marker")
+    return parsed
+  } catch { throw new TurnEngineError("invalid_output", "Context compaction marker is invalid") }
+}
+
+function priorCompaction(snapshot: StepContextSnapshot, currentId: string): ContextCompactionObservation | null {
+  for (const item of [...snapshot.toolObservations].reverse()) if (item.id !== currentId) {
+    const marker = parseMarker(item); if (marker?.content.status === "compacted") return marker
+  }
+  return null
+}
+
+function validateLoadedIdentity(loaded: LoadedSnapshot, marker: ContextCompactionObservation): void {
+  const extra = loaded as unknown as Record<string, unknown>
+  if ((extra.snapshotRef !== undefined && extra.snapshotRef !== marker.content.snapshotRef) || (extra.stepId !== undefined && extra.stepId !== marker.content.stepId)) throw new TurnEngineError("invalid_output", "Compacted snapshot replay identity mismatch")
+  const summaries = loaded.snapshot.toolObservations.filter(item => typeof item.id === "string" && item.id.startsWith(SUMMARY_PREFIX))
+  if (summaries.length > 0 && summaries.filter(item => item.id === `${SUMMARY_PREFIX}${marker.content.stepId}`).length !== 1) throw new TurnEngineError("invalid_output", "Compacted snapshot replay step mismatch")
+}
+
+function rehydrateSnapshot(current: StepContextSnapshot, loaded: LoadedSnapshot, marker: ContextCompactionObservation): StepContextSnapshot {
+  const markerIndex = current.toolObservations.findIndex(item => item.id === marker.id); if (markerIndex < 0) throw new TurnEngineError("invalid_output", "Compacted snapshot replay marker is missing")
+  const summary = loaded.snapshot.toolObservations.filter(item => item.id === `${SUMMARY_PREFIX}${marker.content.stepId}`); if (summary.length !== 1) throw new TurnEngineError("invalid_output", "Compacted snapshot replay is missing its step summary")
+  const content = summary[0]!.content && typeof summary[0]!.content === "object" && !Array.isArray(summary[0]!.content) ? summary[0]!.content as Record<string, unknown> : null
+  const value = content?.kind === "context_summary" && content.value && typeof content.value === "object" && !Array.isArray(content.value) ? content.value as Record<string, unknown> : null; const rawIds = value?.removedObservationIds
+  if (!Array.isArray(rawIds) || rawIds.length === 0 || rawIds.length > MAX_INPUT_BYTES) throw new TurnEngineError("invalid_output", "Compacted snapshot replay has incomplete removed observation IDs")
+  const removed = new Set<string>()
+  for (const id of rawIds) { if (typeof id !== "string" || id.length === 0 || id.length > 256 || removed.has(id)) throw new TurnEngineError("invalid_output", "Compacted snapshot replay has invalid removed observation IDs"); removed.add(id) }
+  const loadedById = new Map<string, ToolObservation>()
+  for (const item of loaded.snapshot.toolObservations) { if (typeof item.id !== "string" || item.id.length === 0 || item.id.length > 256 || loadedById.has(item.id)) throw new TurnEngineError("invalid_output", "Compacted snapshot replay has duplicate observation IDs"); loadedById.set(item.id, item) }
+  const currentIds = new Set<string>()
+  for (const item of current.toolObservations) { if (typeof item.id !== "string" || item.id.length === 0 || item.id.length > 256 || currentIds.has(item.id)) throw new TurnEngineError("invalid_output", "Context compaction input has duplicate observation IDs"); currentIds.add(item.id) }
+  const before = current.toolObservations.slice(0, markerIndex); const after = current.toolObservations.slice(markerIndex + 1); const beforeIds = new Set(before.map(item => item.id))
+  for (const id of removed) if (!beforeIds.has(id) || loadedById.has(id)) throw new TurnEngineError("invalid_output", "Compacted snapshot replay removed observation IDs are incomplete")
+  for (const item of before) if (!loadedById.has(item.id) && !removed.has(item.id)) throw new TurnEngineError("invalid_output", "Compacted snapshot replay omitted a removed observation ID")
+  const merged = [...loaded.snapshot.toolObservations]; const mergedIds = new Set(merged.map(item => item.id))
+  for (const item of after) {
+    const loadedItem = loadedById.get(item.id)
+    if (removed.has(item.id)) throw new TurnEngineError("invalid_output", "Compacted snapshot replay marked a new observation as removed")
+    if (loadedItem || mergedIds.has(item.id)) {
+      if (loadedItem && safeStableJson(loadedItem.content, "Compacted snapshot replay observation is not JSON-safe") !== safeStableJson(item.content, "Context compaction observation is not JSON-safe")) throw new TurnEngineError("invalid_output", "Compacted snapshot replay has a conflicting observation")
+      continue
+    }
+    merged.push(item); mergedIds.add(item.id)
+  }
+  const markerItem = current.toolObservations[markerIndex]!
+  const loadedMarker = loadedById.get(markerItem.id)
+  if (loadedMarker && safeStableJson(loadedMarker.content, "Compacted snapshot replay observation is not JSON-safe") !== safeStableJson(markerItem.content, "Context compaction observation is not JSON-safe")) throw new TurnEngineError("invalid_output", "Compacted snapshot replay has a conflicting marker")
+  if (!loadedMarker) merged.push(markerItem)
+  return { ...loaded.snapshot, toolObservations: merged }
+}
+
 async function failClosed(input: RuntimeInput, observationId: string, idempotencyKey: string, before: { readonly tokens: number; readonly bytes: number }): Promise<never> {
   const failed = { kind: "context_compacted", observationId, status: "failed", stepId: input.stepId, idempotencyKey, beforeInputTokens: before.tokens, afterInputTokens: before.tokens, beforeBytes: before.bytes, afterBytes: before.bytes, errorCode: "context_compaction_failed" } as const
   await input.append(failed, idempotencyKey).catch(() => undefined)
@@ -136,12 +173,7 @@ export async function runContextCompaction(input: RuntimeInput): Promise<Runtime
   if (!snapshotShape(input.snapshot)) throw new TurnEngineError("invalid_output", "Context compaction input snapshot is not JSON-safe")
   const existing = input.snapshot.toolObservations.find(item => item.id === observationId)
   if (existing) {
-    let replay: ContextCompactionObservation | null
-    try {
-      replay = parseContextCompactionObservation({ ...((existing.content && typeof existing.content === "object" && !Array.isArray(existing.content)) ? existing.content : {}), observationId })
-    } catch {
-      throw new TurnEngineError("invalid_output", "Context compaction replay projection is invalid")
-    }
+    const replay = parseMarker(existing)
     if (!replay) throw new TurnEngineError("invalid_output", "Context compaction replay projection is invalid")
     if (replay.content.idempotencyKey !== idempotencyKey || replay.content.stepId !== input.stepId) throw new TurnEngineError("invalid_output", "Context compaction replay identity mismatch")
     if (replay.content.status === "failed") throw new TurnEngineError("invalid_output", "Context compaction replay failed closed")
@@ -154,18 +186,34 @@ export async function runContextCompaction(input: RuntimeInput): Promise<Runtime
       throw new TurnEngineError("invalid_output", "Compacted snapshot replay failed closed")
     }
     if (!loadedSnapshotShape(loaded) || loaded.sessionId !== input.sessionId || loaded.turnId !== input.turnId || loaded.scope.userId !== input.scope.userId) throw new TurnEngineError("invalid_output", "Compacted snapshot replay could not load a scoped snapshot")
+    validateLoadedIdentity(loaded, replay)
     estimate(loaded.snapshot)
     if (invariantSnapshot(loaded.snapshot) !== invariantSnapshot(input.snapshot)) throw new TurnEngineError("invalid_output", "Compacted snapshot replay changed protected invariants")
     return { snapshot: appendObservation(loaded.snapshot, replay) }
   }
   if (!input.hook) return { snapshot: input.snapshot }
-  const protectedBefore = invariantSnapshot(input.snapshot)
-  const before = estimate(input.snapshot)
+  const prior = priorCompaction(input.snapshot, observationId)
+  const rawBefore = measure(input.snapshot)
+  let workingSnapshot = input.snapshot
+  if (prior && rawBefore.bytes > MAX_INPUT_BYTES) {
+    if (!input.loadSnapshot) return failClosed(input, observationId, idempotencyKey, rawBefore)
+    try {
+      const loaded = await input.loadSnapshot({ snapshotRef: prior.content.snapshotRef!, scope: input.scope, sessionId: input.sessionId, turnId: input.turnId })
+      if (!loadedSnapshotShape(loaded) || loaded.sessionId !== input.sessionId || loaded.turnId !== input.turnId || loaded.scope.userId !== input.scope.userId) throw new Error("scoped snapshot")
+      validateLoadedIdentity(loaded, prior)
+      estimate(loaded.snapshot)
+      if (invariantSnapshot(loaded.snapshot) !== invariantSnapshot(input.snapshot)) throw new Error("protected snapshot")
+      workingSnapshot = rehydrateSnapshot(input.snapshot, loaded, prior)
+      estimate(workingSnapshot)
+    } catch { return failClosed(input, observationId, idempotencyKey, rawBefore) }
+  }
+  const protectedBefore = invariantSnapshot(workingSnapshot)
+  const before = estimate(workingSnapshot)
   let result: Awaited<ReturnType<ContextCompactionHook>>
   try {
     result = await input.hook({
       identity: input.identity, scope: input.scope, sessionId: input.sessionId, turnId: input.turnId,
-      stepId: input.stepId, signal: input.signal, now: input.now, snapshot: structuredClone(input.snapshot),
+      stepId: input.stepId, signal: input.signal, now: input.now, snapshot: structuredClone(workingSnapshot),
       estimatedInputTokens: before.tokens, estimatedBytes: before.bytes, idempotencyKey,
     })
   } catch {
