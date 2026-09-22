@@ -8,8 +8,9 @@ import {
 } from "./coordination-followup.js"
 import { lifecycleTarget, visibleTask } from "./coordination-visibility.js"
 import { sanitizeLifecyclePreview } from "./redaction.js"
-import type { ToolExecutionContext } from "./types.js"
+import type { DelegateOutputSchemaMarker, ToolExecutionContext } from "./types.js"
 import { getSubagentRolePolicy } from "../subagents/role-policy.js"
+import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 import { buildScoutAnalystAggregate, validatedStructuredResult } from "./coordination-result-aggregate.js"
 import type {
   CloseSubagentInput,
@@ -25,9 +26,18 @@ const WAIT_RESULT_MAX_BYTES = 2 * 1024
 const WAIT_FAILURE_MAX_BYTES = 500
 const FOREIGN_RESULT_KEYS = new Set(["userId", "sessionId", "turnId", "stepId", "taskId", "parentTaskId", "rootTaskId", "ownerId", "lease", "leaseOwnerId", "leaseVersion", "idempotencyKey", "capabilities", "permissions", "allowedCapabilities", "budgetLimit", "maxBudget"])
 
+function expectedOutputSchema(value: unknown, role: string): DelegateOutputSchemaMarker | undefined {
+  if (value === undefined) return undefined
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new CoordinationError("coordination_invalid_input", "Invalid delegate output schema marker")
+  const marker = value as Record<string, unknown>
+  if (Object.keys(marker).length !== 2 || marker.schemaVersion !== ROLE_RESULT_SCHEMA || marker.role !== role || (role !== "scout" && role !== "analyst")) throw new CoordinationError("coordination_invalid_input", "Invalid delegate output schema marker")
+  return { schemaVersion: ROLE_RESULT_SCHEMA, role }
+}
+
 export async function executeSpawn(context: ToolExecutionContext, input: SpawnSubagentInput, options: CoordinationExecutorOptions) {
   const policy = typeof input.role === "string" ? getSubagentRolePolicy(input.role) : null
   if (!policy || policy.actorRole !== "subagent" || policy.canManageChildren || policy.externalWritesEnabled) throw new CoordinationError("coordination_invalid_input", "Unsupported subagent role")
+  const expectedSchema = expectedOutputSchema(context.delegateOutputSchemaMarker, input.role)
   const lineage = await resolveSpawnLineage(context, input.parentTaskId, options)
   const parentTaskId = lineage.parentTaskId
   const replay = await options.store.getSpawnReplay({ userId: context.scope.userId, sessionId: context.sessionId, idempotencyKey: input.idempotencyKey })
@@ -41,6 +51,7 @@ export async function executeSpawn(context: ToolExecutionContext, input: SpawnSu
     userId: context.scope.userId, sessionId: context.sessionId, turnId: context.turnId, parentTaskId,
     role: input.role, taskType: input.taskType, goal: input.goal, constraints: input.constraints,
     successCriteria: input.successCriteria, allowedActions: input.allowedActions, context: input.context,
+    ...(expectedSchema === undefined ? {} : { expectedOutputSchema: expectedSchema }),
   }
   const atomic = typeof options.manager.supportsAtomicSpawn === "function" && options.manager.supportsAtomicSpawn()
   if (atomic) {

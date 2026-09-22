@@ -174,6 +174,32 @@ describe("createCanonicalPlanExecutionFactory", () => {
     expect(result.observations).toHaveLength(2)
   })
 
+  it("passes structured markers only to Scout or Analyst delegate contexts", async () => {
+    const requests: ToolCallRequest[] = []
+    const contexts: ToolRouterContext[] = []
+    const router = { execute: vi.fn(async (context: ToolRouterContext, request: ToolCallRequest) => {
+      contexts.push(context)
+      requests.push(request)
+      return { ...request, status: "completed" as const, output: { ok: true }, errorCode: null }
+    }) }
+    const hook = fixture(router, undefined, undefined, undefined, undefined, undefined, ["delegate"], undefined, {
+      allowedRoles: ["scout", "reviewer", "auditor"],
+    })
+    const result = await hook(input(output(proposal([
+      delegate("scout-child", { outputSchemaRef: ROLE_RESULT_SCHEMA }),
+      delegate("reviewer-child", { role: "reviewer", outputSchemaRef: ROLE_RESULT_SCHEMA }),
+      delegate("auditor-child", { role: "auditor", outputSchemaRef: ROLE_RESULT_SCHEMA }),
+    ]))))
+
+    expect(result.observations).toHaveLength(3)
+    expect(requests).toHaveLength(3)
+    expect(requests.every(request => !Object.prototype.hasOwnProperty.call(request.input, "delegateOutputSchemaMarker"))).toBe(true)
+    expect(requests.every(request => !Object.prototype.hasOwnProperty.call(request.input, "expectedOutputSchema"))).toBe(true)
+    expect(contexts.find(context => context.stepId.endsWith(":scout-child"))?.delegateOutputSchemaMarker).toEqual({ schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" })
+    expect(contexts.find(context => context.stepId.endsWith(":reviewer-child"))?.delegateOutputSchemaMarker).toBeUndefined()
+    expect(contexts.find(context => context.stepId.endsWith(":auditor-child"))?.delegateOutputSchemaMarker).toBeUndefined()
+  })
+
   it("enables bounded delegate fan-out for canonical execution", async () => {
     let releaseFirst!: () => void
     const firstGate = new Promise<void>(resolve => { releaseFirst = resolve })

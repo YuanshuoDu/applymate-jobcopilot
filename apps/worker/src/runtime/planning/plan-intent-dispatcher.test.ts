@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest"
 import { PLAN_PROPOSAL_SCHEMA_VERSION, type PlanProposal } from "./goal-plan-contract.js"
 import { dispatchPlanProposal, type PlanDispatchRuntime } from "./plan-intent-dispatcher.js"
 import type { PlanValidationContext } from "./goal-plan-validator.js"
+import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 
 const validation: PlanValidationContext = {
   goalRevision: 1, planRevision: null, maxNodes: 8,
@@ -48,6 +49,30 @@ describe("dispatchPlanProposal", () => {
     }))
     expect(result.commands.map(command => command.kind === "delegate" || command.kind === "join" ? `${command.call.toolName}@${command.call.toolVersion}` : command.kind)).toEqual(["agent.spawn@1", "agent.wait@1"])
     expect(resolved).toEqual(["agent.spawn", "agent.wait"])
+  })
+
+  it("keeps the structured result marker server-owned and role-bounded", () => {
+    const expandedValidation = { ...validation, allowedRoles: ["scout", "analyst", "reviewer", "auditor"] }
+    const result = dispatchPlanProposal(proposal([
+      delegate("scout", { outputSchemaRef: ROLE_RESULT_SCHEMA }),
+      delegate("analyst", { role: "analyst", outputSchemaRef: ROLE_RESULT_SCHEMA }),
+      delegate("unknown", { outputSchemaRef: "unknown.schema" }),
+      delegate("reviewer", { role: "reviewer", outputSchemaRef: ROLE_RESULT_SCHEMA }),
+    ]), expandedValidation, runtime({
+      resolveDelegateActions: () => ["jobs.search"],
+      resolveDelegateOutputSchema: (role, outputSchemaRef) => outputSchemaRef === ROLE_RESULT_SCHEMA && (role === "scout" || role === "analyst")
+        ? { schemaVersion: ROLE_RESULT_SCHEMA, role }
+        : undefined,
+    }))
+    const commands = result.commands.filter(command => command.kind === "delegate")
+    expect(commands[0]).toMatchObject({ delegateOutputSchemaMarker: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" } })
+    expect(commands[1]).toMatchObject({ delegateOutputSchemaMarker: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" } })
+    expect(commands[2]).not.toHaveProperty("delegateOutputSchemaMarker")
+    expect(commands[3]).not.toHaveProperty("delegateOutputSchemaMarker")
+    for (const command of commands) {
+      expect(command.call.input).not.toHaveProperty("delegateOutputSchemaMarker")
+      expect(command.call.input).not.toHaveProperty("expectedOutputSchema")
+    }
   })
 
   it("keeps non-empty input references deferred only when the server requests it", () => {

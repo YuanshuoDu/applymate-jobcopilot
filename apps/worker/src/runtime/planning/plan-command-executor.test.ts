@@ -7,6 +7,7 @@ import { createPlanTaskGraphAdapter } from "./plan-task-graph-adapter.js"
 import type { TaskGraphState } from "./task-graph-reducer.js"
 import type { PlanValidationContext } from "./goal-plan-validator.js"
 import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
+import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 
 const validation: PlanValidationContext = {
   goalRevision: 1, planRevision: null, maxNodes: 8,
@@ -23,15 +24,16 @@ function use(localId: string, overrides: Partial<PlanProposal["nodes"][number]> 
 function delegate(localId: string, overrides: Partial<PlanProposal["nodes"][number]> = {}) {
   return { ...base, localId, kind: "delegate" as const, objective: `Delegate ${localId}`, role: "scout", taskType: "research", ...overrides }
 }
-function dispatch(nodes: PlanProposal["nodes"]): PlanDispatchResult {
+function dispatch(nodes: PlanProposal["nodes"], overrides: Partial<PlanDispatchRuntime> = {}): PlanDispatchResult {
   const runtime: PlanDispatchRuntime = {
     resolveToolVersion: () => "1", createToolCallId: id => `call:${id}`, createIdempotencyKey: id => `idem:${id}`,
     resolveInputRefs: request => ({ from: request.inputRefs[0] }), resolveDelegateActions: () => ["jobs.search"],
+    ...overrides,
   }
   return dispatchPlanProposal(proposal(nodes), validation, runtime)
 }
 function context(request: CommandContextRequest): ToolRouterContext {
-  return { scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: `step:${request.localId}`, actorRole: "orchestrator", capabilities: ["read"], signal: new AbortController().signal }
+  return { scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: `step:${request.localId}`, actorRole: "orchestrator", capabilities: ["read"], signal: new AbortController().signal, ...(request.delegateOutputSchemaMarker === undefined ? {} : { delegateOutputSchemaMarker: request.delegateOutputSchemaMarker }) }
 }
 function runtime(router: PlanCommandExecutionRuntime["router"], createContext = context): PlanCommandExecutionRuntime {
   return { router, createContext }
@@ -212,6 +214,36 @@ describe("executePlanCommands", () => {
       },
     })).rejects.toMatchObject({ code: "observer_failed" })
     expect(observed).toEqual(["first", "second"])
+  })
+
+  it("passes a server-owned structured marker through context while keeping public input clean", async () => {
+    const marker = { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" }
+    const requests: ToolCallRequest[] = []
+    const contexts: ToolRouterContext[] = []
+    const router = { execute: vi.fn(async (requestContext: ToolRouterContext, request: ToolCallRequest) => { contexts.push(requestContext); requests.push(request); return completed(request) }) }
+    const plan = dispatch([delegate("child", { outputSchemaRef: ROLE_RESULT_SCHEMA })], {
+      resolveDelegateOutputSchema: (role, outputSchemaRef) => role === "scout" && outputSchemaRef === ROLE_RESULT_SCHEMA ? marker : undefined,
+    })
+    const result = await executePlanCommands(plan, { router, createContext: context })
+    expect(result.status).toBe("completed")
+    expect(contexts[0]?.delegateOutputSchemaMarker).toEqual(marker)
+    expect(requests[0]?.input).not.toHaveProperty("delegateOutputSchemaMarker")
+    expect(requests[0]?.input).not.toHaveProperty("expectedOutputSchema")
+  })
+
+  it("rejects forged or role-invalid persisted structured markers before routing", async () => {
+    const router = { execute: vi.fn(async (_context: ToolRouterContext, request: ToolCallRequest) => completed(request)) }
+    const plan = dispatch([delegate("child", { outputSchemaRef: ROLE_RESULT_SCHEMA })], {
+      resolveDelegateOutputSchema: () => ({ schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" }),
+    })
+    const forged: PlanDispatchResult = {
+      ...plan,
+      commands: plan.commands.map(command => command.kind === "delegate"
+        ? { ...command, delegateOutputSchemaMarker: { schemaVersion: "forged", role: "reviewer" } }
+        : command),
+    }
+    await expect(executePlanCommands(forged, runtime(router))).rejects.toMatchObject({ code: "invalid_plan" })
+    expect(router.execute).not.toHaveBeenCalled()
   })
 
   it("runs the task graph adapter before the existing observer", async () => {

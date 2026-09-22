@@ -1,5 +1,6 @@
 import { isPlainJsonObject, type PlanNode, type PlanProposal } from "./goal-plan-contract.js"
 import { PlanValidationError, type PlanValidationContext, validatePlanProposal } from "./goal-plan-validator.js"
+import type { DelegateOutputSchemaMarker } from "../tools/types.js"
 
 const CANONICAL_DELEGATE_TOOL_NAME = "agent.spawn" as const
 const LEGACY_DELEGATE_TOOL_NAME = "spawn_subagent" as const
@@ -35,6 +36,8 @@ export type PlanDispatchRuntime = {
   /** Optional dedicated resolver for the canonical delegate tool. */
   readonly resolveDelegateVersion?: CoordinationVersionResolver
   readonly resolveDelegateActions?: (role: string) => readonly string[] | undefined
+  /** Resolve server-owned structured-result metadata for a canonical delegate. */
+  readonly resolveDelegateOutputSchema?: (role: string, outputSchemaRef: string | null) => DelegateOutputSchemaMarker | undefined
 }
 
 type CommandBase = {
@@ -50,7 +53,7 @@ type CommandBase = {
 
 export type PlanDispatchCommand =
   | (CommandBase & { readonly kind: "tool_call"; readonly call: { readonly id: string; readonly toolName: string; readonly toolVersion: string; readonly input: Record<string, unknown> } })
-  | (CommandBase & { readonly kind: "delegate"; readonly call: { readonly id: string; readonly toolName: typeof CANONICAL_DELEGATE_TOOL_NAME | typeof LEGACY_DELEGATE_TOOL_NAME; readonly toolVersion: "1"; readonly input: { readonly idempotencyKey: string; readonly role: string; readonly taskType: string; readonly goal: string; readonly constraints: readonly string[]; readonly successCriteria: readonly string[]; readonly allowedActions: readonly string[]; readonly context?: Record<string, unknown> } } })
+  | (CommandBase & { readonly kind: "delegate"; readonly delegateOutputSchemaMarker?: DelegateOutputSchemaMarker; readonly call: { readonly id: string; readonly toolName: typeof CANONICAL_DELEGATE_TOOL_NAME | typeof LEGACY_DELEGATE_TOOL_NAME; readonly toolVersion: "1"; readonly input: { readonly idempotencyKey: string; readonly role: string; readonly taskType: string; readonly goal: string; readonly constraints: readonly string[]; readonly successCriteria: readonly string[]; readonly allowedActions: readonly string[]; readonly context?: Record<string, unknown> } } })
   | (CommandBase & { readonly kind: "join"; readonly call: { readonly id: string; readonly toolName: typeof CANONICAL_WAIT_TOOL_NAME | typeof LEGACY_WAIT_TOOL_NAME; readonly toolVersion: "1"; readonly input: { readonly idempotencyKey: string; readonly taskIds: readonly string[]; readonly mode: "any" | "all"; readonly timeoutMs: number } } })
   | (CommandBase & { readonly kind: "request_input"; readonly question: string; readonly approvalBoundary?: string })
   | (CommandBase & { readonly kind: "propose_completion"; readonly completionCriteria: readonly string[] })
@@ -164,7 +167,8 @@ function command(node: PlanNode, runtime: PlanDispatchRuntime, planCompletionCri
   if (node.kind === "delegate") {
     const role = node.role ?? ""
     const idempotencyKey = runtimeString(runtime.createIdempotencyKey ? () => runtime.createIdempotencyKey!(node.localId) : undefined, "invalid_plan", "Runtime delegate identity is unavailable")
-    return { ...shared, kind: "delegate", call: { id: callId(runtime, node.localId), toolName: CANONICAL_DELEGATE_TOOL_NAME, toolVersion: coordinationVersion(runtime, CANONICAL_DELEGATE_TOOL_NAME, runtime.resolveDelegateVersion, "Delegate tool version is unavailable"), input: { idempotencyKey, role, taskType: node.taskType ?? "", goal: node.objective, constraints: [...(node.constraints ?? [])], successCriteria: [...node.successCriteria], allowedActions: actions(runtime, role) } } }
+    const marker = runtime.resolveDelegateOutputSchema?.(role, node.outputSchemaRef)
+    return { ...shared, kind: "delegate", ...(marker === undefined ? {} : { delegateOutputSchemaMarker: marker }), call: { id: callId(runtime, node.localId), toolName: CANONICAL_DELEGATE_TOOL_NAME, toolVersion: coordinationVersion(runtime, CANONICAL_DELEGATE_TOOL_NAME, runtime.resolveDelegateVersion, "Delegate tool version is unavailable"), input: { idempotencyKey, role, taskType: node.taskType ?? "", goal: node.objective, constraints: [...(node.constraints ?? [])], successCriteria: [...node.successCriteria], allowedActions: actions(runtime, role) } } }
   }
   if (node.kind === "join") {
     const waitVersion = coordinationVersion(runtime, CANONICAL_WAIT_TOOL_NAME, runtime.resolveWaitVersion, "Wait tool version is unavailable")

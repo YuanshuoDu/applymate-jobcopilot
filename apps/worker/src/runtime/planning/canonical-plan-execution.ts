@@ -10,12 +10,12 @@ import { PlanValidationError, validatePlanProposal } from "./goal-plan-validator
 import { PlanCommandExecutionError, executePlanCommands, type PlanCommandExecutionRecord, type PlanCommandExecutionRuntime, type PlanControlRecord, type PlanInputReferenceResolutionRequest, type PlanJoinCommand } from "./plan-command-executor.js"
 import { createPlanCommandReceipt, type PlanCommandReceipt } from "./plan-command-receipt.js"
 import { PlanRevisionRecoveryError, recoverPlanRevision, type PlanRevisionRecoveryDispatcher } from "./plan-revision-receipt.js"
-import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
+import type { DelegateOutputSchemaMarker, ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
 import { READ_ONLY_TOOL_NAMES, TOOL_RESULTS_READ_NAME } from "../tools/index.js"
 import { canonicalQuestionId, type TurnEnginePlanExecutionHook, type TurnEnginePlanExecutionHookResult } from "../turns/turn-engine-types.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 import { getSubagentRolePolicy, visibleToolPolicy } from "../subagents/role-policy.js"
-import { validateRoleResult } from "../subagents/role-results.js"
+import { ROLE_RESULT_SCHEMA, validateRoleResult } from "../subagents/role-results.js"
 import { validateBoundStructuredEvidence } from "./structured-replay-evidence.js"
 import { inspectJoinFailureEvidence, replanRequiredControl } from "./plan-replan-signal.js"
 import { derivePlannerCapabilityCatalog } from "./planner-capabilities.js"
@@ -309,6 +309,11 @@ function replayReceipt(snapshot: StepContextSnapshot, callId: string, command: P
   if (content.status === "completed" && content.errorCode !== null) throw new CanonicalPlanError("invalid_plan_output")
   if (Object.prototype.hasOwnProperty.call(content, "output") && !plainJson(content.output)) throw new CanonicalPlanError("invalid_plan_output")
   return { observationId, status: content.status, ...(Object.prototype.hasOwnProperty.call(content, "output") ? { output: content.output } : {}), errorCode: content.errorCode }
+}
+
+function delegateOutputSchema(role: string, outputSchemaRef: string | null): DelegateOutputSchemaMarker | undefined {
+  if (outputSchemaRef !== ROLE_RESULT_SCHEMA || (role !== "scout" && role !== "analyst")) return undefined
+  return { schemaVersion: ROLE_RESULT_SCHEMA, role }
 }
 
 function expectedReplayGraphStatus(command: PlanDispatchCommand, receipt: ReplayCommandReceipt): TaskGraphState["statuses"][string] {
@@ -617,7 +622,7 @@ async function replayRuntime(
       },
       admit: planAdmission(input),
       shouldAdmit: command => !receipts.has(command.localId),
-      createContext: request => ({ scope: options.scope, sessionId: options.lease.sessionId, turnId: options.lease.turnId, stepId: `${input.stepId}:plan:${request.localId}`, taskId: options.taskId, rootTaskId: options.rootTaskId, actorRole: options.actorRole, capabilities: [...options.capabilities], signal: input.signal }),
+      createContext: request => ({ scope: options.scope, sessionId: options.lease.sessionId, turnId: options.lease.turnId, stepId: `${input.stepId}:plan:${request.localId}`, taskId: options.taskId, rootTaskId: options.rootTaskId, actorRole: options.actorRole, capabilities: [...options.capabilities], signal: input.signal, ...(request.delegateOutputSchemaMarker === undefined ? {} : { delegateOutputSchemaMarker: request.delegateOutputSchemaMarker }) }),
       parallelDelegateLimit: CANONICAL_PARALLEL_DELEGATE_LIMIT,
       rootTaskId: options.rootTaskId,
       resolveInputRefs: request => receipts.has(request.localId) ? {} : resolveInputRefs(input.snapshot, request),
@@ -716,6 +721,7 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
         deferInputRefs: true,
         resolveWaitVersion: () => waitVersion(options.registry, options.capabilities),
         resolveDelegateActions: role => actions(options.registry, options.capabilities, allowedTools, role),
+        resolveDelegateOutputSchema: delegateOutputSchema,
       })
       if (!replayed) {
         seenPlanHashes.add(computedHash)
@@ -740,7 +746,7 @@ export function createCanonicalPlanExecutionFactory(options: CanonicalPlanExecut
         : taskGraph
       const commandRuntime: PlanCommandExecutionRuntime = replay?.runtime ?? {
         router: options.router,
-        createContext: request => ({ scope: options.scope, sessionId: options.lease.sessionId, turnId: options.lease.turnId, stepId: `${input.stepId}:plan:${request.localId}`, taskId: options.taskId, rootTaskId: options.rootTaskId, actorRole: options.actorRole, capabilities: [...options.capabilities], signal: input.signal }),
+        createContext: request => ({ scope: options.scope, sessionId: options.lease.sessionId, turnId: options.lease.turnId, stepId: `${input.stepId}:plan:${request.localId}`, taskId: options.taskId, rootTaskId: options.rootTaskId, actorRole: options.actorRole, capabilities: [...options.capabilities], signal: input.signal, ...(request.delegateOutputSchemaMarker === undefined ? {} : { delegateOutputSchemaMarker: request.delegateOutputSchemaMarker }) }),
         parallelDelegateLimit: CANONICAL_PARALLEL_DELEGATE_LIMIT,
         rootTaskId: options.rootTaskId,
         resolveInputRefs: request => resolveInputRefs(input.snapshot, request),

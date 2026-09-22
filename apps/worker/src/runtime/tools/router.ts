@@ -122,6 +122,7 @@ export class ToolRouter {
       taskId: context.taskId,
       rootTaskId: context.rootTaskId,
       actorRole: context.actorRole,
+      delegateOutputSchemaMarker: context.delegateOutputSchemaMarker,
       signal: controller.signal,
       capabilities: context.capabilities ?? [],
       reportProgress: async (progress) => {

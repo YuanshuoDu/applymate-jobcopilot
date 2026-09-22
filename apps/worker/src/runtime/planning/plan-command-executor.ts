@@ -2,9 +2,9 @@ import { Buffer } from "node:buffer"
 import { PLAN_MAX_NODES, isPlainJsonObject } from "./goal-plan-contract.js"
 import type { PlanDispatchCommand, PlanDispatchResult } from "./plan-intent-dispatcher.js"
 import { graphReady } from "./plan-command-readiness.js"
-import { containsIdentityKey, plainJson } from "./plan-command-validation.js"
+import { containsIdentityKey, plainJson, validDelegateOutputSchemaMarker, validPlanCommandContext } from "./plan-command-validation.js"
 import { schedulePlanCommands, type PlanCommandExecutionStep, type PlanCommandSchedulerRuntime } from "./plan-command-scheduler.js"
-import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
+import type { DelegateOutputSchemaMarker, ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
 import { inspectJoinFailureEvidence, replanRequiredControl, type ReplanRequiredControl } from "./plan-replan-signal.js"
 import type { PlanTaskGraphAdapter } from "./plan-task-graph-adapter.js"
 const MAX_RESULT_BYTES = 8 * 1024
@@ -16,7 +16,7 @@ export class PlanCommandExecutionError extends Error {
 type ExecutableCommand = Extract<PlanDispatchCommand, { kind: "tool_call" | "delegate" | "join" }>
 export type PlanJoinCommand = Extract<PlanDispatchCommand, { kind: "join" }>
 type JoinCommand = PlanJoinCommand
-export type CommandContextRequest = { readonly localId: string; readonly kind: ExecutableCommand["kind"] }
+export type CommandContextRequest = { readonly localId: string; readonly kind: ExecutableCommand["kind"]; readonly delegateOutputSchemaMarker?: DelegateOutputSchemaMarker }
 export type PlanCommandExecutionRecord = {
   readonly localId: string
   readonly kind: ExecutableCommand["kind"]
@@ -57,6 +57,7 @@ function executable(value: unknown): value is ExecutableCommand {
   if (typeof command.localId !== "string" || !command.localId.trim() || !strings(command.dependsOn) || !strings(command.inputRefs)) return false
   const call = row(command.call)
   if (!call || Object.keys(call).some(key => !["id", "toolName", "toolVersion", "input"].includes(key)) || typeof call.id !== "string" || !call.id.trim() || typeof call.toolName !== "string" || !call.toolName.trim() || typeof call.toolVersion !== "string" || !call.toolVersion.trim()) return false
+  if (command.kind !== "delegate" && Object.prototype.hasOwnProperty.call(command, "delegateOutputSchemaMarker")) return false
   if (command.kind === "join") {
     const joinInput = row(call.input)
     return (call.toolName === "agent.wait" || call.toolName === "wait_subagents") && call.toolVersion === "1" && Boolean(joinInput)
@@ -68,6 +69,8 @@ function executable(value: unknown): value is ExecutableCommand {
   }
   if (command.kind === "tool_call") return isPlainJsonObject(call.input) && plainJson(call.input)
   const delegateInput = row(call.input); if (!delegateInput) return false
+  if (Object.prototype.hasOwnProperty.call(command, "delegateOutputSchemaMarker")
+    && !validDelegateOutputSchemaMarker(command.delegateOutputSchemaMarker, delegateInput.role, command.outputSchemaRef)) return false
   return (call.toolName === "agent.spawn" || call.toolName === "spawn_subagent") && call.toolVersion === "1"
     && Object.keys(delegateInput).every(key => ["idempotencyKey", "role", "taskType", "goal", "constraints", "successCriteria", "allowedActions", "context"].includes(key)) && (delegateInput.context === undefined || isPlainJsonObject(delegateInput.context)) && plainJson(delegateInput) && !containsIdentityKey(delegateInput, new Set(["idempotencyKey"])) && !containsIdentityKey(delegateInput.context)
     && typeof delegateInput?.idempotencyKey === "string" && Boolean(delegateInput.idempotencyKey.trim()) && typeof delegateInput.role === "string" && Boolean(delegateInput.role.trim())
@@ -158,11 +161,10 @@ function validateJoinResult(value: unknown, expectedTaskIds: readonly string[]):
 function context(runtime: PlanCommandExecutionRuntime, command: ExecutableCommand): Promise<ToolRouterContext> {
   if (!runtime.createContext) throw new PlanCommandExecutionError("runtime_unavailable", "Plan command context is unavailable")
   let provided: ToolRouterContext | Promise<ToolRouterContext>
-  try { provided = runtime.createContext({ localId: command.localId, kind: command.kind }) } catch { throw new PlanCommandExecutionError("runtime_unavailable", "Plan command context is unavailable") }
+  const delegateOutputSchemaMarker = command.kind === "delegate" ? command.delegateOutputSchemaMarker : undefined
+  try { provided = runtime.createContext({ localId: command.localId, kind: command.kind, ...(delegateOutputSchemaMarker === undefined ? {} : { delegateOutputSchemaMarker }) }) } catch { throw new PlanCommandExecutionError("runtime_unavailable", "Plan command context is unavailable") }
   return Promise.resolve(provided).then(value => {
-    const scope = row(value?.scope)
-    if (!value || typeof value !== "object" || !scope || typeof scope.userId !== "string" || !scope.userId.trim() || typeof value.sessionId !== "string" || !value.sessionId.trim() || typeof value.turnId !== "string" || !value.turnId.trim() || typeof value.stepId !== "string" || !value.stepId.trim()) throw new PlanCommandExecutionError("runtime_unavailable", "Plan command context is invalid")
-    return value
+    const role = command.kind === "delegate" ? command.call.input.role : undefined; if (!validPlanCommandContext(value, delegateOutputSchemaMarker, role, command.outputSchemaRef)) throw new PlanCommandExecutionError("runtime_unavailable", "Plan command context is invalid"); return value
   }).catch(error => {
     if (error instanceof PlanCommandExecutionError) throw error
     throw new PlanCommandExecutionError("runtime_unavailable", "Plan command context is unavailable")

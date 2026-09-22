@@ -29,6 +29,7 @@ import type {
 } from "./coordination-types.js"
 import { ToolSchemaValidator } from "./schema-validator.js"
 import type { ToolExecutionContext } from "./types.js"
+import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 
 const baseTask: CoordinationTaskView = {
   id: "root-1", userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "root-1", parentTaskId: null,
@@ -348,6 +349,7 @@ describe("coordination executors", () => {
       taskType: "inspect",
       goal: "Inspect the job",
       expectedOutputSchema: { schemaVersion: "forged", role: "analyst" },
+      delegateOutputSchemaMarker: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
     } as unknown as SpawnSubagentInput
 
     await executeSpawn(context(), input, runtime.options)
@@ -355,6 +357,24 @@ describe("coordination executors", () => {
     const spawn = runtime.manager.spawn as unknown as ReturnType<typeof vi.fn>
     expect(spawn).toHaveBeenCalledOnce()
     expect(spawn.mock.calls[0]?.[0]).not.toHaveProperty("expectedOutputSchema")
+  })
+
+  it("passes only the exact runtime-owned Scout marker to the manager spec", async () => {
+    const runtime = makeRuntime()
+    await executeSpawn(context({ delegateOutputSchemaMarker: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" } }), {
+      idempotencyKey: "spawn-structured", role: "scout", taskType: "inspect", goal: "Inspect the job",
+    }, runtime.options)
+    const spawn = runtime.manager.spawn as unknown as ReturnType<typeof vi.fn>
+    expect(spawn.mock.calls[0]?.[0]).toMatchObject({ expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" } })
+  })
+
+  it("rejects an invalid internal marker before lineage or manager dispatch", async () => {
+    const runtime = makeRuntime()
+    await expect(executeSpawn(context({ delegateOutputSchemaMarker: { schemaVersion: "forged", role: "reviewer" } }), {
+      idempotencyKey: "spawn-invalid-marker", role: "scout", taskType: "inspect", goal: "Inspect the job",
+    }, runtime.options)).rejects.toMatchObject({ code: "coordination_invalid_input" })
+    expect(runtime.manager.spawn).not.toHaveBeenCalled()
+    expect(runtime.store.activities).toHaveLength(0)
   })
 
   it("sends idempotent mailbox messages without implicitly spawning", async () => {

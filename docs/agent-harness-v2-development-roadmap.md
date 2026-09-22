@@ -3084,3 +3084,13 @@ Focused Worker tests and typecheck passed. Live PostgreSQL/RLS behavior, BullMQ 
 **Independent verification:** Focused canonical runtime and canonical plan execution suites passed **104/104** tests; Worker TypeScript and `git diff --check` passed.
 
 **Candidate boundary:** This slice changes delegate action visibility and does not widen structured-result schemas, aggregate role sets, replay evidence contracts, or external-write behavior. Live PostgreSQL/RLS, process restart, queue delivery, provider invocation, and production evidence remain unverified; P8-98 remains a candidate.
+
+## 181. P8-99 — Canonical structured delegate output marker
+
+**Candidate status/date (2026-09-22):** P8-99 is a bounded server-owned plan-to-child structured-result handoff; formal P0-P7 acceptance remains **1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** The canonical dispatcher resolves an exact `{ schemaVersion: ROLE_RESULT_SCHEMA, role }` marker only for `scout` and `analyst` delegates whose node `outputSchemaRef` is the existing `agent-harness.v2.subagent.result` value. The marker is internal command metadata carried through `PlanCommandExecutionRuntime`, `ToolRouterContext`, and `ToolExecutionContext`; it never enters public `agent.spawn` input, preserving `SpawnSubagentInputSchema` additional-properties rejection. `executeSpawn` validates the server-owned marker and supplies it as the manager's `expectedOutputSchema`. Reviewer/auditor delegates remain unstructured, and structured aggregate/replay semantics remain Scout/Analyst-only.
+
+**Fail-closed boundary:** Unknown schema references produce no marker. Persisted or replayed commands reject forged, role-mismatched, extra-field, or invalid markers before routing; direct model input cannot create one. No schema, dependency, Web/UI, provider, ATS, external-write, or role-expansion behavior changed.
+
+**Independent verification:** Focused plan dispatcher, command executor, canonical plan execution, and coordination executor validation passed **168/168** tests; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Live PostgreSQL/RLS, queue delivery, process restart, provider invocation, and production evidence remain unverified; P8-99 remains a candidate.
