@@ -235,6 +235,87 @@ describe("Turn queue processor", () => {
     expect(fake.calls.some((sql) => sql.includes('SET "status" = $5'))).toBe(true)
   })
 
+  it("polls the durable Stop marker and aborts an active Turn across Worker processes", async () => {
+    const fake = pool()
+    let probeCalls = 0
+    const isInterrupted = vi.fn(async () => {
+      probeCalls += 1
+      return probeCalls >= 2
+    })
+    const execute = vi.fn(({ signal }: { signal: AbortSignal }) => new Promise<TurnExecutionResult>((_resolve, reject) => {
+      if (signal.aborted) return reject(signal.reason)
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true })
+    }))
+
+    const result = await runTurnJob(
+      { data: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptsMade: 0 },
+      { pool: fake.pool, execute, isInterrupted, interruptPollMs: 1 },
+    )
+
+    expect(result).toEqual({ status: "interrupted", summary: "Turn stopped by a persisted interrupt" })
+    expect(isInterrupted).toHaveBeenCalledTimes(2)
+    expect(fake.calls.some(sql => sql.includes('SET "status" = $5'))).toBe(true)
+  })
+
+  it("preserves execution semantics when the durable Stop probe rejects", async () => {
+    const fake = pool()
+    const isInterrupted = vi.fn().mockRejectedValue(new Error("status probe unavailable"))
+    const execute = vi.fn().mockResolvedValue({ status: "completed" as const })
+
+    const result = await runTurnJob(
+      { data: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptsMade: 0 },
+      { pool: fake.pool, execute, isInterrupted, interruptPollMs: 1 },
+    )
+
+    expect(result).toEqual({ status: "completed" })
+    expect(execute).toHaveBeenCalledOnce()
+    expect(isInterrupted).toHaveBeenCalledOnce()
+  })
+
+  it("preserves execution semantics when the durable Stop probe returns a non-boolean", async () => {
+    const fake = pool()
+    const isInterrupted = vi.fn().mockResolvedValue("interrupted" as never)
+    const execute = vi.fn().mockResolvedValue({ status: "completed" as const })
+
+    const result = await runTurnJob(
+      { data: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptsMade: 0 },
+      { pool: fake.pool, execute, isInterrupted, interruptPollMs: 1 },
+    )
+
+    expect(result).toEqual({ status: "completed" })
+    expect(execute).toHaveBeenCalledOnce()
+    expect(isInterrupted).toHaveBeenCalledOnce()
+  })
+
+  it("validates the poll interval before creating a root or claiming a lease", async () => {
+    const fake = pool()
+    const interrupts = new RootAbortControllerRegistry()
+    await expect(runTurnJob(
+      { data: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptsMade: 0 },
+      { pool: fake.pool, execute: vi.fn(), interrupts, interruptPollMs: 0 },
+    )).rejects.toThrow(/Turn interrupt poll interval/)
+    expect(interrupts.size).toBe(0)
+    expect(fake.pool.connect).not.toHaveBeenCalled()
+  })
+
+  it("cleans the cross-process probe timer after a Turn completes", async () => {
+    vi.useFakeTimers()
+    try {
+      const fake = pool()
+      const isInterrupted = vi.fn().mockResolvedValue(false)
+      const result = await runTurnJob(
+        { data: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptsMade: 0 },
+        { pool: fake.pool, execute: vi.fn().mockResolvedValue({ status: "completed" as const }), isInterrupted, interruptPollMs: 10 },
+      )
+      const callsAtCleanup = isInterrupted.mock.calls.length
+      await vi.advanceTimersByTimeAsync(100)
+      expect(result).toEqual({ status: "completed" })
+      expect(isInterrupted).toHaveBeenCalledTimes(callsAtCleanup)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it("requeues a resume fence drift with an identifiable error and DLQs it at the existing limit", async () => {
     const first = pool()
     const error = new Error(COGNITIVE_AGENDA_RESUME_FENCE_INVALID)
