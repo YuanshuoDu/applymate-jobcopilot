@@ -89,7 +89,7 @@ export async function validateLegacyReceipt(db: PrismaClient, input: LegacyRecei
 export async function resolveLegacyApproval(
   db: PrismaClient,
   input: { approval: ScopedApprovalRecord; userId: string; sessionId: string; decision: "approved" | "rejected" },
-  options: { beforeResolve?: () => Promise<void> } = {},
+  options: { beforeResolve?: () => Promise<void>; beforeLegacyOnlyResolve?: () => Promise<void> } = {},
 ): Promise<LegacyApprovalResolution> {
   const approval = input.approval
   if (!approval.turnId || !approval.toolCallId || !approval.jobId || !approval.expiresAt) {
@@ -106,6 +106,7 @@ export async function resolveLegacyApproval(
   if (!turn) throw new Error("Approval turn is no longer available")
   await options.beforeResolve?.()
   if (!item) {
+    await options.beforeLegacyOnlyResolve?.()
     await resolveApproval(db, { id: approval.id, userId: input.userId, sessionId: input.sessionId, decision: input.decision })
     return { disposition: "legacy_only", decision: input.decision }
   }

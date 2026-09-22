@@ -111,7 +111,7 @@ describe('POST /api/gmail/send-draft', () => {
   it('sends a threaded follow-up and clears the matched job follow-up task', async () => {
     const { POST } = await import('./route')
     const firstResponse = await POST(new Request('http://localhost/api/gmail/send-draft', {
-      method: 'POST', body: JSON.stringify({ to: 'recruiter@example.com', subject: 'Re: Interview', draft: 'Thank you.', gmailMessageId: 'gmail-1', threadId: 'thread-1', messageKind: 'interview_invitation' }),
+      method: 'POST', body: JSON.stringify({ to: 'recruiter@example.com', subject: 'Re: Interview', draft: 'Thank you.', gmailMessageId: 'gmail-1', threadId: 'thread-1', messageKind: 'interview_invitation', approvalId: null, sessionId: null, receiptNonce: null }),
     }) as never)
     await expect(firstResponse.json()).resolves.toMatchObject({ approvalRequired: true, sessionId: 'session_1', approval: { id: 'approval_1', receiptNonce: 'nonce_1' } })
 
@@ -121,6 +121,7 @@ describe('POST /api/gmail/send-draft', () => {
 
     await expect(response.json()).resolves.toMatchObject({ sent: true, tracked: true, jobId: 'job-1' })
     expect(fetch).toHaveBeenNthCalledWith(2, 'https://gmail.googleapis.com/gmail/v1/users/me/messages/send', expect.objectContaining({ body: expect.stringContaining('"threadId":"thread-1"') }))
+    expect(mocks.getGoogleAccessToken).toHaveBeenCalledTimes(2)
     expect(mocks.jobUpdate).toHaveBeenCalledWith({ where: { id: 'job-1' }, data: { followUpAt: null } })
     expect(mocks.activityCreate).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ jobId: 'job-1', type: 'email_sent' }) }))
   })
@@ -136,6 +137,62 @@ describe('POST /api/gmail/send-draft', () => {
     }) as never)
 
     await expect(response.json()).resolves.toEqual({ error: 'Gmail send failed (HTTP 429)' })
+  })
+
+  it('keeps a legacy-only approval pending when the token is unavailable', async () => {
+    mocks.getGoogleAccessToken.mockResolvedValueOnce(null)
+    mocks.resolveLegacyApproval.mockImplementationOnce(async (_db, _input, options) => {
+      await options?.beforeLegacyOnlyResolve?.()
+      return { disposition: 'legacy_only', decision: 'approved' }
+    })
+    const { POST } = await import('./route')
+
+    const response = await POST(new Request('http://localhost/api/gmail/send-draft', {
+      method: 'POST', body: JSON.stringify({
+        to: 'recruiter@example.com', draft: 'Thank you.', gmailMessageId: 'gmail-1',
+        approvalId: 'approval_1', receiptNonce: 'nonce_1', sessionId: 'session_1',
+      }),
+    }) as never)
+
+    expect(response.status).toBe(400)
+    await expect(response.json()).resolves.toEqual({ error: 'Gmail not connected. Please connect Google account in Settings.' })
+    expect(mocks.getGoogleAccessToken).toHaveBeenCalledTimes(1)
+    expect(mocks.agentTurnUpdate).not.toHaveBeenCalled()
+    expect(mocks.consumeLegacyReceipt).not.toHaveBeenCalled()
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it('does not create a fresh approval for a partial approval context', async () => {
+    const { POST } = await import('./route')
+
+    const response = await POST(new Request('http://localhost/api/gmail/send-draft', {
+      method: 'POST', body: JSON.stringify({
+        to: 'recruiter@example.com', draft: 'Thank you.', gmailMessageId: 'gmail-1', approvalId: 'approval_1',
+      }),
+    }) as never)
+
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({ error: 'The Gmail approval context is incomplete.' })
+    expect(mocks.sessionCreate).not.toHaveBeenCalled()
+    expect(mocks.issueLegacyReceipt).not.toHaveBeenCalled()
+    expect(mocks.getGoogleAccessToken).not.toHaveBeenCalled()
+    expect(mocks.agentApprovalFindFirst).not.toHaveBeenCalled()
+  })
+
+  it('rejects unsupported approval decisions before resolving a Gmail approval', async () => {
+    const { POST } = await import('./route')
+
+    const response = await POST(new Request('http://localhost/api/gmail/send-draft', {
+      method: 'POST', body: JSON.stringify({
+        to: 'recruiter@example.com', draft: 'Thank you.', gmailMessageId: 'gmail-1', decision: 'cancelled',
+      }),
+    }) as never)
+
+    expect(response.status).toBe(400)
+    await expect(response.json()).resolves.toEqual({ error: 'Invalid Gmail approval decision.' })
+    expect(mocks.gmailMessageFindFirst).not.toHaveBeenCalled()
+    expect(mocks.sessionCreate).not.toHaveBeenCalled()
+    expect(mocks.resolveLegacyApproval).not.toHaveBeenCalled()
   })
 
   it.each([

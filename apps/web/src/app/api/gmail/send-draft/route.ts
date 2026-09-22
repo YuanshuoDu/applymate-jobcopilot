@@ -14,6 +14,8 @@ import { ensureV2Turn }                           from '@/lib/agent/session/v2-t
 import { clientReceipt, consumeLegacyReceipt, issueLegacyReceipt, resolveLegacyApproval, validateLegacyReceipt } from '@/lib/agent/approval/legacy-receipt'
 import { requireLegacyPolicy }                    from '@/lib/agent/policy/legacy'
 
+const GMAIL_NOT_CONNECTED = 'Gmail not connected. Please connect Google account in Settings.'
+
 export async function POST(req: NextRequest) {
   const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth
@@ -31,27 +33,40 @@ export async function POST(req: NextRequest) {
   const normalizedJobId = typeof jobId === 'string' && jobId ? jobId : undefined
   const normalizedMessageId = typeof gmailMessageId === 'string' && gmailMessageId ? gmailMessageId : undefined
   const normalizedThreadId = typeof threadId === 'string' && threadId ? threadId : undefined
-  const approvalDecision: 'approved' | 'rejected' = rawDecision === 'rejected' ? 'rejected' : 'approved'
-  const approvalKey = typeof approvalId === 'string' && approvalId ? approvalId : null
-  const sessionKey = typeof sessionId === 'string' && sessionId ? sessionId : null
-  const receiptKey = typeof receiptNonce === 'string' && receiptNonce ? receiptNonce : null
+  const approvalDecision: 'approved' | 'rejected' | null = rawDecision === undefined
+    ? 'approved'
+    : rawDecision === 'approved' || rawDecision === 'rejected' ? rawDecision : null
+  const approvalKey = typeof approvalId === 'string' && approvalId.trim() ? approvalId.trim() : null
+  const sessionKey = typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : null
+  const receiptKey = typeof receiptNonce === 'string' && receiptNonce.trim() ? receiptNonce.trim() : null
+  const suppliedApprovalId = approvalId !== undefined && approvalId !== null
+  const suppliedSessionId = sessionId !== undefined && sessionId !== null
+  const suppliedReceiptNonce = receiptNonce !== undefined && receiptNonce !== null
+  const hasApprovalContext = suppliedApprovalId || suppliedSessionId || suppliedReceiptNonce
+  if (!approvalDecision) return err('Invalid Gmail approval decision.', 400)
+  if (hasApprovalContext && (
+    !approvalKey || !sessionKey ||
+    (suppliedReceiptNonce && !receiptKey)
+  )) return err('The Gmail approval context is incomplete.', 409)
   const matchedJob = await findFollowUpJob(auth.userId, normalizedJobId, normalizedMessageId)
   if (!matchedJob) return err('Link this email to one of your tracked jobs before sending a follow-up.', 409)
 
-  if (approvalDecision === 'approved' && (!approvalKey || !sessionKey || !receiptKey)) {
+  if (rawDecision === undefined && !hasApprovalContext) {
     const token = await getGoogleAccessToken(auth.userId)
-    if (!token) return err('Gmail not connected. Please connect Google account in Settings.')
+    if (!token) return err(GMAIL_NOT_CONNECTED)
     return createSendApproval(auth.userId, matchedJob.id, {
       to: to.trim(), subject: normalizedSubject, draft, gmailMessageId: normalizedMessageId, threadId: normalizedThreadId, messageKind,
     })
   }
   if (!approvalKey || !sessionKey) return err('The Gmail approval is no longer valid.', 409)
+  if (approvalDecision === 'approved' && !receiptKey) return err('A scoped Gmail approval receipt is required.', 428)
 
   const approval = await db.agentApproval.findFirst({
     where: { id: approvalKey, sessionId: sessionKey, userId: auth.userId, status: 'pending', type: 'send_gmail' },
     select: { id: true, type: true, payload: true, turnId: true, toolCallId: true, jobId: true, revision: true, expiresAt: true },
   })
   if (!approval || approval.jobId !== matchedJob.id || !approval.turnId || !approval.toolCallId || !approval.expiresAt) return err('The Gmail approval is no longer valid.', 409)
+  let token: string | null = null
   try {
     requireLegacyPolicy({
       userId: auth.userId, sessionId: sessionKey, turnId: approval.turnId, stepId: `gmail:${approval.id}`, toolCallId: approval.toolCallId,
@@ -70,11 +85,21 @@ export async function POST(req: NextRequest) {
           material: { to: to.trim(), subject: normalizedSubject, draft }, answers: null, revision: approval.revision, expiresAt: approval.expiresAt!,
         }) }
         : undefined,
+      beforeLegacyOnlyResolve: approvalDecision === 'approved'
+        ? async () => {
+          token = await getGoogleAccessToken(auth.userId)
+          if (!token) throw new Error(GMAIL_NOT_CONNECTED)
+        }
+        : undefined,
     })
     if (resolution?.disposition === 'canonical_wait') {
       return ok({ sent: false, disposition: resolution.decision, duplicate: resolution.result.disposition === 'duplicate' }, 202)
     }
     if (approvalDecision === 'rejected') return ok({ sent: false, disposition: 'rejected' }, 202)
+    if (!token) {
+      token = await getGoogleAccessToken(auth.userId)
+      if (!token) return err(GMAIL_NOT_CONNECTED)
+    }
     await db.agentTurn.update({ where: { id: approval.turnId }, data: { status: 'in_progress' } })
     await consumeLegacyReceipt(db, {
       approvalId: approval.id, userId: auth.userId, sessionId: sessionKey, turnId: approval.turnId, toolCallId: approval.toolCallId, jobId: matchedJob.id,
@@ -83,11 +108,9 @@ export async function POST(req: NextRequest) {
       reservationKey: `gmail-send:${approval.id}`,
     })
   } catch (error) {
+    if (error instanceof Error && error.message === GMAIL_NOT_CONNECTED) return err(GMAIL_NOT_CONNECTED)
     return err(error instanceof Error ? error.message : 'The Gmail approval could not be consumed.', 409)
   }
-
-  const token = await getGoogleAccessToken(auth.userId)
-  if (!token) return err('Gmail not connected. Please connect Google account in Settings.')
 
   // Build RFC 2822 message
   const fromRes = await trackedExternalApiFetch('https://gmail.googleapis.com/gmail/v1/users/me/profile', {

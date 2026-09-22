@@ -2995,6 +2995,8 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 
 **Implementation:** Legacy session actions and Gmail send-draft endpoints now resolve scoped approvals against the canonical wait Item. When that wait exists, the legacy endpoint delegates exactly once to `decideApproval` and returns an explicit `202` with the approved/rejected disposition; it does not update the Turn directly, consume the legacy receipt, or execute Gmail/automation external side effects. Legacy-only approvals without a canonical Item retain their compatibility path. Web consumption and Worker publication remain aligned on durable `approval.requested` lineage and goal/plan revision freshness, with PostgreSQL as the durable authority and Redis as delivery/wakeup transport.
 
-**Independent verification:** Focused actions, Gmail, and approval-store validation passed **30/30**; Web `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+**Retry boundary:** Legacy routes remain pending fail-closed. If the first canonical response is lost, the retry must use the V2 `/approvals` endpoint rather than re-entering the legacy route; same-Turn probing for other active waits is also outside this slice.
 
-**Candidate boundary:** Live PostgreSQL/RLS, cross-process Redis delivery, process restart/recovery, and production E2E remain unverified. P8-84 remains a candidate.
+**Independent verification:** Focused validation passed **39/39** across `apps/web/src/app/api/agent/sessions/[id]/actions/route.test.ts`, `apps/web/src/app/api/gmail/send-draft/route.test.ts`, `apps/web/src/lib/agent/approval/store.test.ts`, and `apps/web/src/lib/agent/approval/decision.test.ts`; Web `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, cross-process Redis delivery, process restart/recovery, same-Turn active-wait probing, and production E2E remain unverified. P8-84 remains a candidate.
