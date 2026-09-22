@@ -62,12 +62,23 @@ function strictObject(value: unknown): Record<string, unknown> | null {
   const prototype = Object.getPrototypeOf(value)
   return (prototype === Object.prototype || prototype === null) ? value as Record<string, unknown> : null
 }
-function taskGraphEvent(value: unknown): PersistedTaskGraphEvent["event"] {
+function taskGraphEventId(runKey: string, nodeId: string, type: string, attempt = 1): string {
+  return attempt === 1 ? `${runKey}:${nodeId}:${type}` : `${runKey}:${nodeId}:attempt:${attempt}:${type}`
+}
+function taskGraphEvent(value: unknown, runKey: string): PersistedTaskGraphEvent["event"] {
   const candidate = strictObject(value)
-  if (!candidate || Object.keys(candidate).length !== 3 || !["type", "nodeId", "eventId"].every(key => Object.hasOwn(candidate, key))) throw new Error("task_graph_event_invalid")
-  if (!(typeof candidate.type === "string" && ["start", "complete", "fail", "wait", "cancel"].includes(candidate.type))) throw new Error("task_graph_event_invalid")
+  if (!candidate || Object.keys(candidate).some(key => !["type", "nodeId", "eventId", "attempt"].includes(key)) || !["type", "nodeId", "eventId"].every(key => Object.hasOwn(candidate, key))) throw new Error("task_graph_event_invalid")
+  if (!(typeof candidate.type === "string" && ["start", "complete", "fail", "wait", "cancel", "retry"].includes(candidate.type))) throw new Error("task_graph_event_invalid")
   if (typeof candidate.nodeId !== "string" || !candidate.nodeId || candidate.nodeId.length > 256 || typeof candidate.eventId !== "string" || !candidate.eventId || candidate.eventId.length > 512) throw new Error("task_graph_event_invalid")
-  return { type: candidate.type as PersistedTaskGraphEvent["event"]["type"], nodeId: candidate.nodeId, eventId: candidate.eventId }
+  const rawAttempt = candidate.attempt
+  if (rawAttempt !== undefined && (typeof rawAttempt !== "number" || !Number.isSafeInteger(rawAttempt) || rawAttempt < 1 || rawAttempt > 2)) throw new Error("task_graph_event_invalid")
+  const attempt = rawAttempt === undefined ? undefined : rawAttempt
+  if (candidate.type === "retry" && attempt !== 2) throw new Error("task_graph_event_invalid")
+  if (candidate.eventId !== taskGraphEventId(runKey, candidate.nodeId, candidate.type, attempt ?? 1)) throw new Error("task_graph_event_invalid")
+  return {
+    type: candidate.type as PersistedTaskGraphEvent["event"]["type"], nodeId: candidate.nodeId, eventId: candidate.eventId,
+    ...(attempt === undefined ? {} : { attempt: attempt as number }),
+  }
 }
 function taskGraphEvents(events: readonly Row[], lease: TurnLease, rootTaskId: unknown): readonly PersistedTaskGraphEvent[] {
   const graphRows = events.filter(event => event.type === "plan.task_graph")
@@ -81,7 +92,7 @@ function taskGraphEvents(events: readonly Row[], lease: TurnLease, rootTaskId: u
     if (encoded === undefined || Buffer.byteLength(encoded, "utf8") > 8 * 1024) throw new Error("task_graph_payload_too_large")
     const envelope = strictObject(payload)
     if (!envelope || Object.keys(envelope).some(key => !["runKey", "event", "state"].includes(key)) || typeof envelope.runKey !== "string" || !envelope.runKey || envelope.runKey.length > 256 || !envelope.runKey.startsWith(`${rootTaskId}:`)) throw new Error("task_graph_payload_invalid")
-    const event = taskGraphEvent(envelope.event)
+    const event = taskGraphEvent(envelope.event, envelope.runKey)
     if (Object.hasOwn(envelope, "state") && !strictObject(envelope.state)) throw new Error("task_graph_state_invalid")
     let sequence: bigint
     try { sequence = BigInt(String(row.sequence)) } catch { throw new Error("task_graph_sequence_invalid") }

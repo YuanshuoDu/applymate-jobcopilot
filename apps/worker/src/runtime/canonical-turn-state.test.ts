@@ -20,10 +20,14 @@ const markerEvent = (kind: "observed" | "applied" = "observed", sequence = "4"):
   id: `marker-${kind}`, type: STEERING_MARKER_EVENT_TYPE, actor: "system", userId: "user-1", sessionId: "session-1", turnId: "turn-1",
   taskId: "root-1", sequence, payload: markerPayload(kind),
 })
-const graphEvent = (type: "start" | "complete" | "fail" | "wait" | "cancel", nodeId: string, sequence: string, payload: Record<string, unknown> = {}): Record<string, unknown> => ({
+const graphEvent = (type: "start" | "complete" | "fail" | "wait" | "cancel" | "retry", nodeId: string, sequence: string, payload: Record<string, unknown> = {}, attempt?: number): Record<string, unknown> => ({
   id: `graph-${sequence}`, type: "plan.task_graph", actor: "worker", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "root-1", sequence,
-  payload: { runKey: "root-1:proposal-1:1", event: { type, nodeId, eventId: `root-1:proposal-1:1:${nodeId}:${type}` }, ...payload },
+  payload: { runKey: "root-1:proposal-1:1", event: { type, nodeId, eventId: attempt === undefined || attempt === 1 ? `root-1:proposal-1:1:${nodeId}:${type}` : `root-1:proposal-1:1:${nodeId}:attempt:${attempt}:${type}`, ...(attempt === undefined ? {} : { attempt }) }, ...payload },
 })
+function patchGraphEvent(row: Record<string, unknown>, patch: Record<string, unknown>): Record<string, unknown> {
+  const payload = row.payload as Record<string, unknown>
+  return { ...row, payload: { ...payload, event: { ...(payload.event as Record<string, unknown>), ...patch } } }
+}
 
 function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unknown>[]; items?: Record<string, unknown>[]; inputs?: Record<string, unknown>[]; events?: Record<string, unknown>[]; snapshots?: Record<string, unknown>[] }) {
   const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
@@ -54,13 +58,75 @@ describe("loadCanonicalTurnState", () => {
     expect(eventQuery).toContain("'plan.task_graph'")
   })
 
+  it.each(["complete", "fail", "wait", "cancel"] as const)("loads retry and attempt two %s events", async terminal => {
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      events: [
+        graphEvent("start", "first", "11"), graphEvent("retry", "first", "12", {}, 2), graphEvent("start", "first", "13", {}, 2), graphEvent(terminal, "first", "14", {}, 2),
+      ],
+    })
+    const value = await loadCanonicalTurnState(fake, lease)
+    expect(value.taskGraphEvents?.map(item => item.event)).toEqual([
+      { type: "start", nodeId: "first", eventId: "root-1:proposal-1:1:first:start" },
+      { type: "retry", nodeId: "first", eventId: "root-1:proposal-1:1:first:attempt:2:retry", attempt: 2 },
+      { type: "start", nodeId: "first", eventId: "root-1:proposal-1:1:first:attempt:2:start", attempt: 2 },
+      { type: terminal, nodeId: "first", eventId: `root-1:proposal-1:1:first:attempt:2:${terminal}`, attempt: 2 },
+    ])
+  })
+
+  it("keeps a persisted state snapshot non-authoritative while preserving the event", async () => {
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      events: [graphEvent("start", "first", "11", { state: { statuses: { first: "completed" }, appliedEvents: [] } })],
+    })
+    const value = await loadCanonicalTurnState(fake, lease)
+    expect(value.taskGraphEvents?.[0]?.event).toEqual({ type: "start", nodeId: "first", eventId: "root-1:proposal-1:1:first:start" })
+  })
+
+  it.each([
+    ["missing retry attempt", graphEvent("retry", "first", "11")],
+    ["retry attempt one", graphEvent("retry", "first", "11", {}, 1)],
+    ["attempt over bound", graphEvent("start", "first", "11", {}, 3)],
+    ["attempt two without attempt field", patchGraphEvent(graphEvent("start", "first", "11"), { eventId: "root-1:proposal-1:1:attempt:2:start" })],
+    ["wrong event id", patchGraphEvent(graphEvent("start", "first", "11"), { eventId: "root-1:proposal-1:1:first:complete" })],
+    ["unknown phase", patchGraphEvent(graphEvent("start", "first", "11"), { type: "unknown" })],
+    ["extra event field", patchGraphEvent(graphEvent("start", "first", "11"), { extra: true })],
+  ] as const)("rejects %s task graph events", async (_label, event) => {
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      events: [event],
+    })
+    await expect(loadCanonicalTurnState(fake, lease)).rejects.toThrow("task_graph_event_invalid")
+  })
+
+  it("rejects a retry event with an invalid run key", async () => {
+    const event = graphEvent("retry", "first", "11", {}, 2)
+    const payload = event.payload as Record<string, unknown>
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      events: [{ ...event, payload: { ...payload, runKey: "root-1:other-plan:1" } }],
+    })
+    await expect(loadCanonicalTurnState(fake, lease)).rejects.toThrow("task_graph_event_invalid")
+  })
+
   it.each([
     ["foreign scope", { ...graphEvent("start", "first", "11"), userId: "other-user" }],
+    ["foreign session", { ...graphEvent("start", "first", "11"), sessionId: "other-session" }],
+    ["foreign turn", { ...graphEvent("start", "first", "11"), turnId: "other-turn" }],
     ["unknown envelope field", graphEvent("start", "first", "11", { extra: true })],
     ["invalid state snapshot", graphEvent("start", "first", "11", { state: "forged" })],
   ])("rejects %s task graph payloads", async (_label, event) => {
     const fake = pool({ turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} }, events: [event] })
     await expect(loadCanonicalTurnState(fake, lease)).rejects.toThrow()
+  })
+
+  it("keeps foreign task graph rows out of the projection", async () => {
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      events: [{ ...graphEvent("start", "first", "11"), taskId: "other-task" }],
+    })
+    const value = await loadCanonicalTurnState(fake, lease)
+    expect(value.taskGraphEvents).toBeUndefined()
   })
 
   it("rejects oversized task graph payloads before returning state", async () => {
@@ -69,6 +135,14 @@ describe("loadCanonicalTurnState", () => {
       events: [graphEvent("start", "first", "11", { state: { oversized: "x".repeat(8 * 1024) } })],
     })
     await expect(loadCanonicalTurnState(fake, lease)).rejects.toThrow("task_graph_payload_too_large")
+  })
+
+  it("rejects out-of-order task graph event sequences", async () => {
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      events: [graphEvent("start", "first", "12"), graphEvent("complete", "first", "11")],
+    })
+    await expect(loadCanonicalTurnState(fake, lease)).rejects.toThrow("task_graph_sequence_invalid")
   })
 
   it("replays scoped steering markers as independent canonical control state", async () => {
