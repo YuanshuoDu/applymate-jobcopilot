@@ -999,3 +999,11 @@ Commit `88fda5ac` hardens the canonical-turn-state loader for both legacy attemp
 Canonical-turn-state validation passed **49/49**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. P8-71 evidence remains **51/51** retry reducer/adapter and **70/70** canonical replay tests.
 
 P8-72 is a candidate hardening slice. Real PostgreSQL/RLS, live cross-process queue/restart, complete wakeup, and production E2E remain unverified; formal P0-P7 acceptance remains **1/8 (12.5%)**.
+
+## P8-73 update
+
+Commit `189662e0` extends `releaseTurnLease` with a `waiting_for_approval` owner/version/session fence. Wakeup atomically moves `waiting → queued` and clears `leaseOwnerId`, `leaseExpiresAt`, and `leaseStartedAt`, while preserving tenant, lineage, revision, and idempotency boundaries.
+
+Focused lease, turn-queue, and wakeup validation passed **52/52**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. P8-73 is a candidate hardening slice; formal P0-P7 acceptance remains **1/8 (12.5%)**.
+
+Live PostgreSQL/RLS, cross-process queue/restart, complete wakeup, and production E2E remain unverified.

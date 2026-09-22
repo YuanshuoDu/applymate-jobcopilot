@@ -2878,3 +2878,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Canonical-turn-state validation passed **49/49**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. P8-71 retry reducer/adapter **51/51** and canonical replay **70/70** evidence remains green.
 
 **Candidate boundary:** Real PostgreSQL/RLS, live cross-process queue delivery and restart, complete wakeup, and production E2E remain unverified. P8-72 remains a candidate hardening slice.
+
+## 159. P8-73 — Approval lease release and wakeup fence hardening
+
+**Candidate status/date (2026-09-22):** P8-73 is recorded as a candidate lease/wakeup hardening slice; formal P0-P7 acceptance remains **1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `189662e0` makes `releaseTurnLease` accept the `waiting_for_approval` owner/version/session fence. The wakeup transition atomically moves `waiting → queued` and clears `leaseOwnerId`, `leaseExpiresAt`, and `leaseStartedAt`, while preserving tenant, lineage, revision, and idempotency boundaries.
+
+**Independent verification:** Focused lease, turn-queue, and wakeup validation passed **52/52**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+**Candidate boundary:** Live PostgreSQL/RLS, cross-process queue delivery and restart, complete wakeup, and production E2E remain unverified. P8-73 remains a candidate hardening slice.

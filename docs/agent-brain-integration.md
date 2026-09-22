@@ -1619,3 +1619,9 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Commit `88fda5ac` makes the canonical-turn-state loader accept legacy attempt 1 and P8-71 retry/attempt 2 graph events only after validating stable event IDs, attempt 1..2 and `retry=2`, sequence, runKey, and payload bounds. Extra/unknown fields and wrong IDs fail closed; persisted state snapshots remain non-authoritative.
 - Foreign tasks remain filtered by the existing scoped SQL and the loader does not expand task scope. Canonical-turn-state validation passed **49/49**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. P8-71 retry reducer/adapter **51/51** and canonical replay **70/70** remain green.
 - Boundary: real PostgreSQL/RLS, live cross-process queue/restart, complete wakeup, and production E2E remain unverified. Formal P0-P7 acceptance remains **1/8 (12.5%)**; P8-72 is a candidate hardening slice.
+
+## P8-73 candidate - approval lease release and wakeup fence hardening
+
+- Commit `189662e0` extends `releaseTurnLease` with a `waiting_for_approval` owner/version/session fence. Wakeup atomically moves `waiting → queued` and clears `leaseOwnerId`, `leaseExpiresAt`, and `leaseStartedAt`, preserving tenant, lineage, revision, and idempotency boundaries.
+- Focused lease, turn-queue, and wakeup validation passed **52/52**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+- Boundary: live PostgreSQL/RLS, cross-process queue/restart, complete wakeup, and production E2E remain unverified. Formal P0-P7 acceptance remains **1/8 (12.5%)**; P8-73 is a candidate hardening slice.
