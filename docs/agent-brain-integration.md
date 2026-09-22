@@ -1662,3 +1662,9 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - A pre-suspend `ready` or `timed_out` wait now appends one server-owned `turn.resumed` event and matching `agent.session.event` outbox row in the handoff transaction, reusing `agent-wait:<waitId>:resumed` and canonical sorted `matchedTaskIds`.
 - Replays preserve the original event sequence and identity, repair a missing matching outbox, and fail closed for mismatched event or outbox identity. Focused handoff validation passed **20/20** tests.
 - Boundary: Worker typecheck, live PostgreSQL/RLS, outbox delivery, process restart recovery, and complete parent continuation remain unverified; no schema, Web, provider, or queue contract changed.
+
+## P8-81 candidate - durable session event outbox delivery
+
+- The Worker now drains bounded unpublished `agent.session.event` rows with `FOR UPDATE SKIP LOCKED`, validates supplied envelope fields against the canonical row and publishes the canonical event, supports legacy sparse envelopes, rejects unknown/conflicting fields, terminalizes poison rows, and records retry bookkeeping for publish failures while leaving them unpublished.
+- The Worker index starts this consumer after canonical bootstrap is ready and closes it through `postBootstrapFence`. Focused consumer validation passed **19/19**; the three-file wiring validation passed **27/27**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+- Candidate boundary: real PostgreSQL/RLS, cross-process Redis/BullMQ delivery, process restart recovery, and production supervisor evidence remain unverified. Formal P0-P7 acceptance remains **1/8 (12.5%)**. No schema, Web, or provider changes were made.

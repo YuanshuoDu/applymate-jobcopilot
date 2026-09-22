@@ -4,9 +4,10 @@ import { BullMQAdapter } from "@bull-board/api/bullMQAdapter";
 import { ExpressAdapter } from "@bull-board/express";
 import { createWorkerControlHandler, resolveWorkerAdminHost } from "./admin/control-plane.js";
 import { bindWorkerControl, getWorkerRuntimeState, restoreWorkerRuntimeState } from "./admin/worker-state.js";
-import { closeSharedRedisConnections } from "./redis.js";
+import { closeSharedRedisConnections, redisConnection } from "./redis.js";
 import { workerHarnessFeatureHealth } from "./admin/harness-health.js";
 import { startSubagentMailboxOutboxConsumer } from "./runtime/mailbox/outbox-consumer.js";
+import { startAgentEventOutboxConsumer } from "./runtime/events/outbox-consumer.js";
 import { startAgentWakeupConsumer } from "./runtime/wakeup/consumer.js";
 import { resolveProductionAgentFlags } from "./runtime/production-agent-flags.js";
 import { createProductionContextCompactionOptions } from "./runtime/context/production-context-compaction.js";
@@ -119,6 +120,7 @@ async function main() {
   console.log("[worker] Canonical Turn consumer and recovery scanner started");
   let agentWakeupConsumer: ReturnType<typeof startAgentWakeupConsumer> | undefined;
   let agentMailboxOutboxConsumer: ReturnType<typeof startSubagentMailboxOutboxConsumer> | undefined;
+  let agentEventOutboxConsumer: ReturnType<typeof startAgentEventOutboxConsumer> | undefined;
   let automationScheduler: ReturnType<typeof startAutomationScheduler> | undefined;
   let adminServer: ClosableHttpServer | undefined;
   const postBootstrapFence = createPostBootstrapStartupFence(() => [
@@ -129,6 +131,7 @@ async function main() {
     () => closeDeadLetterResources(),
     () => automationScheduler?.close(),
     () => closeAllSlots(),
+    () => agentEventOutboxConsumer?.close(),
     () => agentMailboxOutboxConsumer?.close(),
     () => agentWakeupConsumer?.close(),
     () => closeHttpServer(adminServer),
@@ -146,6 +149,8 @@ async function main() {
     console.log("[worker] Agent Turn wakeup consumer started");
     agentMailboxOutboxConsumer = startSubagentMailboxOutboxConsumer(pool);
     console.log("[worker] Agent subagent mailbox outbox consumer started");
+    agentEventOutboxConsumer = startAgentEventOutboxConsumer(pool, redisConnection);
+    console.log("[worker] Agent session event outbox consumer started");
 
     const workerControls = {
       "apply-tasks": bindWorkerControl(applyQueue, applyWorker),

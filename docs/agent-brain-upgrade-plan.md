@@ -1053,3 +1053,9 @@ Focused evidence passed **15/15** durable-wait resolver, **49/49** wait/handoff/
 P8-80 closes the pre-suspend durable wait event gap. When a `ready` or `timed_out` wait is handed from an owned in-progress Turn to `queued`, the handoff now appends exactly one server-owned `turn.resumed` event and matching `agent.session.event` outbox row in the same transaction, using the canonical `agent-wait:<waitId>:resumed` identity and sorted `matchedTaskIds`. Already-queued replay repairs only a missing matching outbox, while event or outbox identity conflicts fail closed without advancing the session sequence.
 
 Focused handoff validation passed **20/20** tests, covering ready/timed-out paths, replay/idempotency, missing-outbox repair, identity conflicts, lease/session fences, and transaction rollback. Worker typecheck, live PostgreSQL/RLS, outbox delivery, process restart recovery, and complete parent continuation remain unverified; P8-80 remains a candidate.
+
+## P8-81 update
+
+P8-81 adds a bounded Worker consumer for unpublished `agent.session.event` rows. The consumer uses `FOR UPDATE SKIP LOCKED`, validates supplied envelope fields against the canonical row and publishes the canonical event, supports legacy sparse envelopes, rejects unknown/conflicting fields, terminalizes poison rows, and records retry bookkeeping while leaving publish failures unpublished.
+
+The Worker index starts the consumer after canonical bootstrap is ready and closes it through `postBootstrapFence`. Focused consumer validation passed **19/19**; the three-file wiring validation passed **27/27**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Formal P0-P7 acceptance remains **1/8 (12.5%)**. Real PostgreSQL/RLS, cross-process Redis/BullMQ delivery, process restart recovery, and production supervisor evidence remain unverified; no schema, Web, or provider changes were made.

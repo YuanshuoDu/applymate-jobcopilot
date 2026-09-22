@@ -2958,3 +2958,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused handoff validation passed **20/20** tests, including ready/timed-out handoff, replay/idempotency, outbox repair, identity mismatch, fence, and rollback cases.
 
 **Candidate boundary:** Worker typecheck, live PostgreSQL/RLS, outbox delivery, process restart recovery, and complete parent continuation remain unverified. No schema, migration, Web, provider, or queue contract changed; P8-80 remains a candidate.
+
+## 167. P8-81 — Durable session event outbox delivery
+
+**Candidate status/date (2026-09-22):** P8-81 adds bounded durable `agent.session.event` delivery while formal P0-P7 acceptance remains **1/8 (12.5%)**.
+
+**Implementation:** The Worker consumer scans unpublished `agent.session.event` rows with bounded `FOR UPDATE SKIP LOCKED` selection, validates supplied envelope fields against the canonical row and publishes the canonical event, supports legacy sparse envelopes, rejects unknown/conflicting fields, terminalizes poison rows, and records retry bookkeeping while leaving publish failures unpublished. The Worker index starts it after canonical bootstrap is ready and closes it through `postBootstrapFence`.
+
+**Independent verification:** Focused consumer validation passed **19/19**; the three-file wiring validation passed **27/27**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+**Candidate boundary:** Real PostgreSQL/RLS, cross-process Redis/BullMQ delivery, process restart recovery, and production supervisor evidence remain unverified. No schema, migration, Web, or provider changes were made; P8-81 remains a candidate.
