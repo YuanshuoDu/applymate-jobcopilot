@@ -89,6 +89,7 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
   const options: TurnExecutionOptions = {
     identity: owner, scope: { userId: "user-1" }, goal: "find jobs", ...(goalRef ? { goalRef } : {}), snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: initialToolObservations },
     contextBuilder, store, model, tools: [{ name: "jobs.search", version: "1" }, ...initialTools.map(tool => ({ name: tool.name, version: "1" }))], executeTool: toolExecutor ?? (async ({ call }) => toolResult ?? ({ id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed", output: call.toolName === "agent.plan.propose" ? acceptedPlanOutput : initialTool.output ?? { job: "job-1" }, errorCode: null })),
+    validateToolArguments: () => true,
     idFactory: prefix => prefix,
     subscribe: event => { notifications.push(event.type); events.push({ id: event.id, type: event.type, itemId: event.itemId, taskId: owner.taskId }) },
     ...(planHook ? { executePlan: planHook } : {}),

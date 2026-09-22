@@ -32,6 +32,15 @@ function pipelineToolInput(value: unknown): Record<string, unknown> | null {
   return isPlainJsonObject(value) ? value : null
 }
 
+function validatePipelineToolArguments(toolName: string, input: unknown): boolean | string {
+  if (toolName !== PIPELINE_TOOL.name) return "Unsupported pipeline tool"
+  const callInput = pipelineToolInput(input)
+  if (!callInput) return "pipeline.run arguments must be an object"
+  if (Object.keys(callInput).some(key => key !== "mode")) return "pipeline.run arguments contain unsupported fields"
+  if (Object.hasOwn(callInput, "mode") && callInput.mode !== "resume" && callInput.mode !== "start") return "pipeline.run mode is invalid"
+  return true
+}
+
 type PipelineToolResult = {
   status: "completed" | "failed"
   errorCode: string | null
@@ -147,6 +156,7 @@ export async function runCanonicalAgentTurn(
   const base: Omit<TurnEngineOptions, "lease" | "signal" | "rootTaskId" | "taskId"> = {
     scope: { userId: payload.userId }, goal: "Run the Agent job pipeline", snapshot: PIPELINE_SNAPSHOT,
     contextBuilder: contextBuilder(), store: createPgTurnEngineStore(pool), model: adapter(), tools: [PIPELINE_TOOL],
+    validateToolArguments: validatePipelineToolArguments,
     maxSteps: 2, capabilities: ["read", "write", "coordination"],
     executeTool: async ({ signal, call }) => {
       if (call.toolName !== "pipeline.run") return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "failed", errorCode: "unknown_tool" }

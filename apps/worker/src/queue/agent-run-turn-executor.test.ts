@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   createStore: vi.fn().mockReturnValue({}),
   pinnedFetch: vi.fn().mockResolvedValue(new Response("{}", { status: 200 })),
   toolInput: undefined as unknown,
+  turnOptions: undefined as { validateToolArguments?: (toolName: string, input: unknown) => boolean | string } | undefined,
 }))
 
 vi.mock("../runtime/turns/turn-queue.js", () => ({ runTurnJob: mocks.runTurnJob }))
@@ -19,16 +20,19 @@ vi.mock("../runtime/subagents/root-task-store.js", () => ({
   })),
 }))
 vi.mock("../runtime/turns/turn-engine.js", () => ({
-  TurnEngine: vi.fn().mockImplementation((options: { executeTool: TurnEngineToolExecutor }) => ({
-    run: async () => {
-      const toolResult = await options.executeTool({
-        scope: { userId: "runtime-user" }, sessionId: "runtime-session", turnId: "runtime-turn", stepId: "step-1",
-        signal: new AbortController().signal, capabilities: ["read"],
-        call: { id: "call-1", toolName: "pipeline.run", toolVersion: "1", input: mocks.toolInput },
-      })
-      return { status: toolResult.status, summary: "pipeline complete", errorCode: toolResult.errorCode }
-    },
-  })),
+  TurnEngine: vi.fn().mockImplementation((options: { executeTool: TurnEngineToolExecutor; validateToolArguments?: (toolName: string, input: unknown) => boolean | string }) => {
+    mocks.turnOptions = options
+    return {
+      run: async () => {
+        const toolResult = await options.executeTool({
+          scope: { userId: "runtime-user" }, sessionId: "runtime-session", turnId: "runtime-turn", stepId: "step-1",
+          signal: new AbortController().signal, capabilities: ["read"],
+          call: { id: "call-1", toolName: "pipeline.run", toolVersion: "1", input: mocks.toolInput },
+        })
+        return { status: toolResult.status, summary: "pipeline complete", errorCode: toolResult.errorCode }
+      },
+    }
+  }),
 }))
 
 import { runCanonicalAgentTurn } from "./agent-run-turn-executor.js"
@@ -96,6 +100,18 @@ describe("runCanonicalAgentTurn", () => {
   it("fails closed without making a request for malformed tool input", async () => {
     await expect(executePipelineCall(["malformed"])).resolves.toMatchObject({ status: "failed", errorCode: "invalid_tool_input" })
     expect(mocks.pinnedFetch).not.toHaveBeenCalled()
+  })
+
+  it("binds a strict pipeline.run argument validator", async () => {
+    await executePipelineCall({ mode: "start" })
+    const validate = mocks.turnOptions?.validateToolArguments
+    expect(validate).toBeTypeOf("function")
+    expect(validate?.("pipeline.run", { mode: "resume" })).toBe(true)
+    expect(validate?.("pipeline.run", {})).toBe(true)
+    expect(validate?.("pipeline.run", { mode: "pause" })).not.toBe(true)
+    expect(validate?.("pipeline.run", { mode: 1 })).not.toBe(true)
+    expect(validate?.("pipeline.run", { mode: "start", extra: true })).not.toBe(true)
+    expect(validate?.("other.tool", { mode: "start" })).not.toBe(true)
   })
 
   it("quarantines a legacy 200 failure with no report", async () => {
