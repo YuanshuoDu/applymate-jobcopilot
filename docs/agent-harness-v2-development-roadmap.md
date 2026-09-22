@@ -2858,3 +2858,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused validation passed **31/31 adapter tests**, **64/64 canonical-plan tests**, and **28/28 canonical-runtime tests**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. ioredis output was limited to existing runtime warnings.
 
 **Candidate boundary:** Real PostgreSQL/RLS, cross-process queue delivery and restart, complete wakeup, and production E2E remain unverified. P8-70 is a candidate hardening slice only.
+
+## 157. P8-71 — Retry reducer and canonical orphan recovery hardening
+
+**Candidate status/date (2026-09-22):** P8-71 is recorded as a candidate retry hardening slice; formal P0-P7 acceptance remains **1/8 (12.5%)**, unchanged by this slice.
+
+**Implementation:** Commit `b00e8823` preserves old events as attempt 1, permits one `attempt1 running → attempt2 ready` retry, and generates stable attempt 2 event IDs. Commit `4fda0f0a` performs one read-only canonical replay orphan recovery through retry, ready, attempt 2 start/router, and atomic terminal persistence. Unsafe delegate/join/unknown cases, an already-running attempt 2, and persistence failure fail closed.
+
+**Compatibility and verification:** The path reuses `READ_ONLY_TOOL_NAMES` and `TOOL_RESULTS_READ_NAME`; legacy replay, atomic terminal persistence, and `replan_required` behavior remain intact. Retry reducer/adapter validation passed **51/51**; canonical replay validation passed **70/70**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+
+**Candidate boundary:** Real PostgreSQL/RLS, cross-process queue delivery and restart, complete wakeup, and production E2E remain unverified. P8-71 remains a candidate hardening slice.

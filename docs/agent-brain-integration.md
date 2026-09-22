@@ -1606,3 +1606,10 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 - Replay skips existing receipts and missing commands use the hydrated graph. `replan_required` retains its legacy receipt behavior.
 - Focused evidence passed **31/31 adapter**, **64/64 canonical-plan**, and **28/28 canonical-runtime** tests. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed; ioredis output was limited to existing runtime warnings.
 - Candidate boundary: real PostgreSQL/RLS, cross-process queue/restart, complete wakeup, and production E2E remain unverified. P8-70 does not change formal P0-P7 acceptance, which remains **1/8 (12.5%)**.
+
+## P8-71 candidate - retry reducer and canonical orphan recovery hardening
+
+- Commit `b00e8823` keeps prior events at attempt 1, allows one `attempt1 running → attempt2 ready` retry, and gives attempt 2 stable event IDs. Commit `4fda0f0a` performs one read-only canonical replay orphan recovery through retry, ready, attempt 2 start/router, and atomic terminal persistence.
+- Unsafe delegate/join/unknown cases, attempt 2 already running, and persistence failure fail closed. `READ_ONLY_TOOL_NAMES` and `TOOL_RESULTS_READ_NAME` are reused; legacy replay, atomic terminal persistence, and `replan_required` behavior remain preserved.
+- Focused evidence passed **51/51 retry reducer/adapter** and **70/70 canonical replay** tests. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
+- Boundary: real PostgreSQL/RLS, cross-process queue/restart, complete wakeup, and production E2E remain unverified. Formal P0-P7 acceptance remains **1/8 (12.5%)**; P8-71 is a candidate hardening slice.

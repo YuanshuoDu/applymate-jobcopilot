@@ -983,3 +983,11 @@ P8-70 is a candidate hardening slice. Terminal `plan.task_graph` events and thei
 Focused evidence passed: adapter **31/31**, canonical plan **64/64**, and canonical runtime **28/28**. Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed; ioredis output was limited to existing runtime warnings.
 
 This does not change the formal P0-P7 route: acceptance remains **1/8 (12.5%)**. Real PostgreSQL/RLS, cross-process queue/restart, complete wakeup, and production E2E remain unverified.
+
+## P8-71 update
+
+P8-71 is a candidate retry hardening slice. Commit `b00e8823` adds retry reducer/adapter semantics: prior events remain attempt 1, one `attempt1 running → attempt2 ready` retry is allowed, and attempt 2 IDs remain stable. Commit `4fda0f0a` adds one read-only canonical replay orphan recovery: retry to ready, attempt 2 start/router, and atomic terminal persistence; unsafe delegate/join/unknown cases, attempt 2 already running, and persistence failure fail closed.
+
+Focused evidence passed **51/51** for the retry reducer/adapter and **70/70** canonical replay tests; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. The implementation reuses `READ_ONLY_TOOL_NAMES` and `TOOL_RESULTS_READ_NAME`; legacy replay, atomic terminal persistence, and replan behavior remain preserved.
+
+Real PostgreSQL/RLS, cross-process queue/restart, complete wakeup, and production E2E remain unverified. Formal P0-P7 acceptance remains **1/8 (12.5%)**; P8-71 is a candidate hardening slice.
