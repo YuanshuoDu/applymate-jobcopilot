@@ -1047,3 +1047,9 @@ Focused Worker scheduler, executor, and canonical replay validation passed **125
 P8-79 adds a bounded durable wait resume projection after a suspended `waiting_for_dependency -> queued` CAS. The resolver increments the session event sequence, writes one `turn.resumed` event with idempotency key `agent-wait:<waitId>:resumed`, and writes its matching `agent.session.event` outbox envelope in the same transaction. The payload is limited to server-owned `{waitId, turnId, status, matchedTaskIds}` values; ignored, already-queued, and failed-CAS paths do not append a resume event.
 
 Focused evidence passed **15/15** durable-wait resolver, **49/49** wait/handoff/consumer, **28/28** recovery-scanner, and **1/1** composition tests; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Formal P0-P7 acceptance remains **1/8 (12.5%)**. Live PostgreSQL/RLS, outbox delivery, process restart recovery, and complete end-to-end parent continuation remain unverified; P8-79 remains a candidate.
+
+## P8-80 update
+
+P8-80 closes the pre-suspend durable wait event gap. When a `ready` or `timed_out` wait is handed from an owned in-progress Turn to `queued`, the handoff now appends exactly one server-owned `turn.resumed` event and matching `agent.session.event` outbox row in the same transaction, using the canonical `agent-wait:<waitId>:resumed` identity and sorted `matchedTaskIds`. Already-queued replay repairs only a missing matching outbox, while event or outbox identity conflicts fail closed without advancing the session sequence.
+
+Focused handoff validation passed **20/20** tests, covering ready/timed-out paths, replay/idempotency, missing-outbox repair, identity conflicts, lease/session fences, and transaction rollback. Worker typecheck, live PostgreSQL/RLS, outbox delivery, process restart recovery, and complete parent continuation remain unverified; P8-80 remains a candidate.

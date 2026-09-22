@@ -2948,3 +2948,13 @@ This slice does not consume messages, mutate a checkpoint or cursor, add a migra
 **Independent verification:** Focused durable-wait resolver validation passed **15/15**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 
 **Candidate boundary:** Live PostgreSQL/RLS, outbox delivery, process restart recovery, and complete child-to-parent continuation remain unverified. No schema, migration, Web, provider, or consumer change was made; P8-79 remains a candidate.
+
+## 166. P8-80 — Ready/timed-out durable wait handoff resume projection
+
+**Candidate status/date (2026-09-22):** P8-80 closes the pre-suspend event-stream gap while formal P0-P7 acceptance remains **1/8 (12.5%)**.
+
+**Implementation:** A `ready` or `timed_out` wait handed from an owned in-progress Turn to `queued` now appends one server-owned `turn.resumed` event and matching `agent.session.event` outbox envelope in the same transaction. The handoff reuses `agent-wait:<waitId>:resumed`, canonicalizes `matchedTaskIds`, repairs only a missing matching outbox on replay, and fails closed on event/outbox identity conflicts.
+
+**Independent verification:** Focused handoff validation passed **20/20** tests, including ready/timed-out handoff, replay/idempotency, outbox repair, identity mismatch, fence, and rollback cases.
+
+**Candidate boundary:** Worker typecheck, live PostgreSQL/RLS, outbox delivery, process restart recovery, and complete parent continuation remain unverified. No schema, migration, Web, provider, or queue contract changed; P8-80 remains a candidate.

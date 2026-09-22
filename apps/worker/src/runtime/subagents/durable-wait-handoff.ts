@@ -2,12 +2,14 @@ import { randomUUID } from "node:crypto"
 
 import type pg from "pg"
 
+import { matchesAgentOutboxIdentity, type AgentOutboxIdentity } from "../outbox-identity.js"
 import { TurnLeaseError, type LeasePool, type TurnLease } from "../turns/lease.js"
 
 type Queryable = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
 
 const DISPATCH_TOPIC = "agent.turn.dispatch"
+const SESSION_EVENT_TOPIC = "agent.session.event"
 const OPEN_SESSION = `session."status" NOT IN ('aborted', 'archived')`
 
 export type DurableWaitHandoffInput = {
@@ -69,6 +71,10 @@ async function transaction<T>(pool: LeasePool, userId: string, work: (client: Qu
 }
 
 function dispatchKey(turnId: string): string { return `turn-dispatch:${turnId}` }
+function resumeKey(waitId: string): string { return `agent-wait:${waitId}:resumed` }
+function json(value: unknown): string { return JSON.stringify(value) }
+function ids(value: unknown): string[] { const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return [] } })() : value; return Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === "string" && entry.length > 0).sort() : [] }
+function object(value: unknown): Record<string, unknown> { if (typeof value === "string") { try { return object(JSON.parse(value) as unknown) } catch { return {} } } return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {} }
 
 async function enqueueDispatch(client: Queryable, input: DurableWaitHandoffInput, turnId: string, sessionId: string, resetPublished = true): Promise<void> {
   if (!resetPublished) {
@@ -92,6 +98,38 @@ async function enqueueDispatch(client: Queryable, input: DurableWaitHandoffInput
     [randomUUID(), DISPATCH_TOPIC, sessionId, dispatchKey(turnId), payload, sessionId],
   )
   if (written.rowCount !== 1) failLease("Session was closed during wait dispatch")
+}
+
+async function repairResumeOutbox(client: Queryable, expected: AgentOutboxIdentity): Promise<void> {
+  const inserted = await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload") VALUES ($1, '${SESSION_EVENT_TOPIC}', $2, $3, $4::jsonb) ON CONFLICT ("idempotencyKey") DO NOTHING`, [expected.id, expected.aggregateId, expected.idempotencyKey, json(expected.payload)])
+  if ((inserted.rowCount ?? 0) === 1) return
+  const existing = await client.query<Row>(`SELECT "id", "topic", "aggregateId", "idempotencyKey", "payload" FROM "agent_outbox" WHERE "idempotencyKey" = $1 FOR UPDATE`, [expected.idempotencyKey])
+  if (!matchesAgentOutboxIdentity(existing.rows[0], expected)) throw new Error("wait_resume_outbox_conflict")
+}
+
+async function writeResumeEvent(client: Queryable, wait: Row, turn: Row, status: string, matched: string[]): Promise<void> {
+  const sessionId = String(turn.sessionId); const turnId = String(turn.id); const waitId = String(wait.id); const idempotencyKey = resumeKey(waitId)
+  const existing = await client.query<Row>(`SELECT "id", "turnId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload" FROM "agent_events" WHERE "sessionId" = $1 AND "idempotencyKey" = $2 FOR UPDATE`, [sessionId, idempotencyKey])
+  let eventId: string; let eventSequence: string; let eventPayload: Record<string, unknown>
+  if (existing.rows[0]) {
+    const event = existing.rows[0]; const payload = object(event.payload)
+    if (String(event.id) === "undefined" || String(event.sequence) === "undefined" || String(event.turnId) !== turnId || String(event.type) !== "turn.resumed" || String(event.actor) !== "system" || String(event.correlationId) !== turnId
+      || String(event.causationId) !== waitId || String(event.idempotencyKey) !== idempotencyKey
+      || payload.waitId !== waitId || payload.turnId !== turnId || payload.status !== status
+      || JSON.stringify(payload.matchedTaskIds) !== JSON.stringify(matched)) throw new Error("wait_resume_event_conflict")
+    eventId = String(event.id); eventSequence = String(event.sequence); eventPayload = payload
+  } else {
+    eventId = randomUUID(); eventPayload = { waitId, turnId, status, matchedTaskIds: matched }
+    const sequenceResult = await client.query<{ eventSequence: string | bigint }>(`UPDATE "agent_sessions" AS session SET "eventSequence" = "eventSequence" + 1 WHERE session."id" = $1 AND session."userId" = $2 AND ${OPEN_SESSION} RETURNING "eventSequence"`, [sessionId, String(turn.userId)])
+    const sequence = sequenceResult.rows[0]?.eventSequence
+    if (sequence === undefined) throw new Error("wait_resume_session_sequence_unavailable")
+    eventSequence = String(sequence)
+    await client.query(
+      `INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload") VALUES ($1, $2, $3, NULL, NULL, $4, 'turn.resumed', 'system', $3, $5, $6, $7::jsonb)`,
+      [eventId, sessionId, turnId, eventSequence, waitId, idempotencyKey, json(eventPayload)],
+    )
+  }
+  await repairResumeOutbox(client, { id: `agent-outbox-${eventId}`, topic: SESSION_EVENT_TOPIC, aggregateId: sessionId, idempotencyKey: `agent-event:${eventId}`, payload: { eventId, sessionId, turnId, itemId: null, taskId: null, sequence: eventSequence, type: "turn.resumed", actor: "system", correlationId: turnId, causationId: waitId, idempotencyKey, payload: eventPayload } } as unknown as AgentOutboxIdentity)
 }
 
 function dateValue(row: Row, key: string): Date | null {
@@ -156,6 +194,7 @@ export async function suspendAndReleaseWait(pool: LeasePool, input: DurableWaitH
     if (alreadySuspended) return { waitId: String(wait.id), handoff: "suspended", waitStatus: "waiting", idempotent: true }
     const alreadyQueued = (waitStatus === "ready" || waitStatus === "timed_out") && turnStatus === "queued" && ownerCleared
     if (alreadyQueued) {
+      await writeResumeEvent(client, wait, turn, waitStatus, ids(wait.matchedTaskIds))
       await enqueueDispatch(client, input, lease.turnId, lease.sessionId, false)
       return { waitId: String(wait.id), handoff: "queued", waitStatus: waitStatus as "ready" | "timed_out", idempotent: true }
     }
@@ -201,6 +240,7 @@ export async function suspendAndReleaseWait(pool: LeasePool, input: DurableWaitH
       [lease.turnId, lease.sessionId, lease.ownerId, lease.leaseVersion, now, lease.userId],
     )
     if (queued.rowCount !== 1) failLease("Turn lease was fenced during wait requeue")
+    await writeResumeEvent(client, wait, turn, waitStatus, ids(wait.matchedTaskIds))
     await enqueueDispatch(client, input, lease.turnId, lease.sessionId)
     return { waitId: String(wait.id), handoff: "queued", waitStatus: waitStatus as "ready" | "timed_out", idempotent: false }
   })

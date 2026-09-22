@@ -1656,3 +1656,9 @@ This is infrastructure only: child executor acknowledgment, schema migration, ou
 
 - After a suspended `waiting_for_dependency -> queued` CAS succeeds, the resolver increments the session event sequence and writes one `turn.resumed` event plus its matching `agent.session.event` outbox envelope in the same transaction. The event key is `agent-wait:<waitId>:resumed`, with server-owned `{waitId, turnId, status, matchedTaskIds}` payload data; ignored, already-queued, and failed-CAS paths remain event-free.
 - Focused evidence passed **15/15** durable-wait resolver, **49/49** wait/handoff/consumer, **28/28** recovery-scanner, and **1/1** composition tests; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed. Formal acceptance remains **1/8 (12.5%)**; live PostgreSQL/RLS, outbox delivery, restart recovery, and complete end-to-end continuation remain unverified.
+
+## P8-80 candidate - ready/timed-out durable wait handoff resume event
+
+- A pre-suspend `ready` or `timed_out` wait now appends one server-owned `turn.resumed` event and matching `agent.session.event` outbox row in the handoff transaction, reusing `agent-wait:<waitId>:resumed` and canonical sorted `matchedTaskIds`.
+- Replays preserve the original event sequence and identity, repair a missing matching outbox, and fail closed for mismatched event or outbox identity. Focused handoff validation passed **20/20** tests.
+- Boundary: Worker typecheck, live PostgreSQL/RLS, outbox delivery, process restart recovery, and complete parent continuation remain unverified; no schema, Web, provider, or queue contract changed.
