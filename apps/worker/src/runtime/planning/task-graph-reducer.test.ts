@@ -6,13 +6,14 @@ import {
   type TaskGraphEvent,
 } from "./task-graph-reducer.js"
 
-const event = (type: TaskGraphEvent["type"], nodeId: string, eventId: string): TaskGraphEvent => ({ type, nodeId, eventId })
+const event = (type: TaskGraphEvent["type"], nodeId: string, eventId: string, attempt?: number): TaskGraphEvent => ({ type, nodeId, eventId, ...(attempt === undefined ? {} : { attempt }) })
 const apply = (state: ReturnType<typeof createTaskGraph>, next: TaskGraphEvent) => {
   const result = reduceTaskGraph(state, next)
   expect(result.ok).toBe(true)
   if (!result.ok) throw new Error(result.message)
   return result.state
 }
+const errorCode = (result: ReturnType<typeof reduceTaskGraph>) => result.ok ? undefined : result.errorCode
 
 describe("task graph reducer", () => {
   it("starts roots ready and reports dependency blockers", () => {
@@ -90,5 +91,37 @@ describe("task graph reducer", () => {
     const result = reduceTaskGraph(state, { type: "start", nodeId: "a", eventId: "" })
     expect(result).toMatchObject({ ok: false, errorCode: "invalid_event" })
     expect(result.state).toEqual(state)
+  })
+
+  it("recovers one orphaned running node into attempt two", () => {
+    let state = apply(createTaskGraph([{ id: "a", dependsOn: [] }]), event("start", "a", "run-1:a:start"))
+    state = apply(state, event("retry", "a", "run-1:a:attempt:2:retry", 2))
+    expect(state.statuses.a).toBe("ready")
+    state = apply(state, event("start", "a", "run-1:a:attempt:2:start", 2))
+    state = apply(state, event("complete", "a", "run-1:a:attempt:2:complete", 2))
+    expect(state.statuses.a).toBe("completed")
+    expect(state.appliedEvents.map(item => item.attempt ?? 1)).toEqual([1, 2, 2, 2])
+  })
+
+  it("rejects duplicate, illegal, and overbound recovery attempts", () => {
+    const initial = createTaskGraph([{ id: "a", dependsOn: [] }])
+    expect(errorCode(reduceTaskGraph(initial, event("retry", "a", "run-1:a:attempt:2:retry", 2)))).toBe("illegal_transition")
+    let running = apply(initial, event("start", "a", "run-1:a:start"))
+    const recovery = event("retry", "a", "run-1:a:attempt:2:retry", 2)
+    running = apply(running, recovery)
+    expect(errorCode(reduceTaskGraph(running, event("retry", "a", "run-1:a:attempt:2:retry-2", 2)))).toBe("illegal_transition")
+    expect(errorCode(reduceTaskGraph(running, event("retry", "a", "run-1:a:attempt:3:retry", 3)))).toBe("invalid_event")
+    expect(errorCode(reduceTaskGraph(running, { type: "retry", nodeId: "a", eventId: "run-1:a:attempt:2:retry-missing" }))).toBe("invalid_event")
+    expect(reduceTaskGraph(running, event("start", "a", "run-1:a:start"))).toMatchObject({ ok: false, errorCode: "duplicate_event" })
+  })
+
+  it.each(["failed", "completed", "waiting", "cancelled"] as const)("does not recover a %s node", status => {
+    let state = createTaskGraph([{ id: "a", dependsOn: [] }])
+    state = apply(state, event("start", "a", "run-1:a:start"))
+    if (status === "failed") state = apply(state, event("fail", "a", "run-1:a:fail"))
+    if (status === "completed") state = apply(state, event("complete", "a", "run-1:a:complete"))
+    if (status === "waiting") state = apply(state, event("wait", "a", "run-1:a:wait"))
+    if (status === "cancelled") state = apply(state, event("cancel", "a", "run-1:a:cancel"))
+    expect(reduceTaskGraph(state, event("retry", "a", "run-1:a:attempt:2:retry", 2))).toMatchObject({ ok: false, errorCode: "illegal_transition" })
   })
 })

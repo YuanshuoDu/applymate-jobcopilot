@@ -18,7 +18,6 @@ export type PersistedTaskGraphEvent = {
 }
 type PersistTaskGraph = (input: PersistedTaskGraphEvent & { readonly state: TaskGraphState }) => void | Promise<void>
 const MAX_GRAPH_PAYLOAD_BYTES = 8 * 1024
-
 export type PlanTaskGraphAdapterErrorCode = TaskGraphErrorCode | "invalid_event" | "graph_mismatch" | "invalid_record" | "persistence_failed"
 
 export class PlanTaskGraphAdapterError extends Error {
@@ -31,36 +30,33 @@ export class PlanTaskGraphAdapterError extends Error {
 export type PlanTaskGraphAdapter = {
   readonly state: TaskGraphState
   readonly start?: (localId: string) => Promise<TaskGraphState>
+  readonly retry?: (localId: string) => Promise<TaskGraphState>
   readonly observe: (record: ObservablePlanRecord, persistOverride?: PersistTaskGraph) => Promise<TaskGraphState>
 }
-
 export type PlanTaskGraphAdapterOptions = {
   readonly runKey: string
   readonly persist: PersistTaskGraph
   readonly initialState?: TaskGraphState
 }
-
 export type PlanTaskGraphHydrationOptions = {
   readonly runKey: string
   readonly events: readonly PersistedTaskGraphEvent[]
 }
-
 const graphNodes = (commands: readonly PlanDispatchCommand[]) => commands.map(command => ({ id: command.localId, dependsOn: [...command.dependsOn] }))
-const eventId = (runKey: string, localId: string, phase: TaskGraphEvent["type"]): string => `${runKey}:${localId}:${phase}`
+const eventId = (runKey: string, localId: string, phase: TaskGraphEvent["type"], attempt = 1): string => attempt === 1
+  ? `${runKey}:${localId}:${phase}`
+  : `${runKey}:${localId}:attempt:${attempt}:${phase}`
 const graphStatuses = new Set(["pending", "ready", "running", "completed", "failed", "waiting", "cancelled"])
 const graphBlockers = new Set(["waiting_on_dependencies", "dependency_failed"])
-
 function normalizedRunKey(value: unknown): string {
   if (typeof value !== "string" || !value.trim()) throw new PlanTaskGraphAdapterError("invalid_record", "Plan task graph runKey is invalid")
   return value.trim()
 }
-
 function boundedRunKey(value: unknown): string {
   const runKey = normalizedRunKey(value)
   if (runKey.length > 256) throw new PlanTaskGraphAdapterError("invalid_record", "Plan task graph runKey is invalid")
   return runKey
 }
-
 function graphError(error: unknown): PlanTaskGraphAdapterError {
   if (error instanceof PlanTaskGraphAdapterError) return error
   if (error && typeof error === "object" && "code" in error && typeof error.code === "string") {
@@ -68,23 +64,29 @@ function graphError(error: unknown): PlanTaskGraphAdapterError {
   }
   return new PlanTaskGraphAdapterError("invalid_record", "Task graph operation rejected")
 }
-
 function hydrationEvent(value: unknown): TaskGraphEvent {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new PlanTaskGraphAdapterError("invalid_event", "Persisted task graph event is malformed")
   const candidate = value as Record<string, unknown>
   const keys = Reflect.ownKeys(candidate)
-  if (keys.length !== 3 || keys.some(key => typeof key !== "string" || !["type", "nodeId", "eventId"].includes(key))) {
+  if (keys.some(key => typeof key !== "string" || !["type", "nodeId", "eventId", "attempt"].includes(key))
+    || !Object.hasOwn(candidate, "type") || !Object.hasOwn(candidate, "nodeId") || !Object.hasOwn(candidate, "eventId")) {
     throw new PlanTaskGraphAdapterError("invalid_event", "Persisted task graph event is malformed")
   }
-  if (!(["start", "complete", "fail", "wait", "cancel"] as readonly unknown[]).includes(candidate.type)) {
+  if (!(["start", "complete", "fail", "wait", "cancel", "retry"] as readonly unknown[]).includes(candidate.type)) {
     throw new PlanTaskGraphAdapterError("invalid_event", "Persisted task graph event type is invalid")
   }
   if (typeof candidate.nodeId !== "string" || !candidate.nodeId || candidate.nodeId.length > 256 || typeof candidate.eventId !== "string" || !candidate.eventId || candidate.eventId.length > 512) {
     throw new PlanTaskGraphAdapterError("invalid_event", "Persisted task graph event fields are invalid")
   }
-  return { type: candidate.type as TaskGraphEvent["type"], nodeId: candidate.nodeId, eventId: candidate.eventId }
+  if (candidate.attempt !== undefined && (typeof candidate.attempt !== "number" || !Number.isSafeInteger(candidate.attempt) || candidate.attempt < 1 || candidate.attempt > 2)) {
+    throw new PlanTaskGraphAdapterError("invalid_event", "Persisted task graph event attempt is invalid")
+  }
+  if (candidate.type === "retry" && candidate.attempt !== 2) throw new PlanTaskGraphAdapterError("invalid_event", "Persisted task graph retry attempt is invalid")
+  return {
+    type: candidate.type as TaskGraphEvent["type"], nodeId: candidate.nodeId, eventId: candidate.eventId,
+    ...(candidate.attempt === undefined ? {} : { attempt: candidate.attempt as number }),
+  }
 }
-
 function hydrationEntry(value: unknown, runKey: string): { readonly event: TaskGraphEvent } {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new PlanTaskGraphAdapterError("invalid_record", "Persisted task graph entry is malformed")
   const candidate = value as Record<string, unknown>
@@ -96,7 +98,6 @@ function hydrationEntry(value: unknown, runKey: string): { readonly event: TaskG
   if (candidate.runKey !== runKey) throw new PlanTaskGraphAdapterError("graph_mismatch", "Persisted task graph runKey does not match")
   return { event: hydrationEvent(candidate.event) }
 }
-
 function boundedHistory(runKey: string, events: readonly PersistedTaskGraphEvent[]): void {
   let encoded: string | undefined
   try { encoded = JSON.stringify({ runKey, events }) } catch { encoded = undefined }
@@ -104,7 +105,6 @@ function boundedHistory(runKey: string, events: readonly PersistedTaskGraphEvent
     throw new PlanTaskGraphAdapterError("persistence_failed", "Persisted task graph history exceeded the bounded payload")
   }
 }
-
 function initialStateShape(value: unknown): value is TaskGraphState {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false
   const state = value as Record<string, unknown>
@@ -124,7 +124,6 @@ function initialStateShape(value: unknown): value is TaskGraphState {
   try { state.appliedEvents.forEach(event => hydrationEvent(event)) } catch { return false }
   return true
 }
-
 export function hydratePlanTaskGraph(plan: PlanDispatchResult, options: PlanTaskGraphHydrationOptions): TaskGraphState {
   const runKey = boundedRunKey(options.runKey)
   if (!Array.isArray(options.events)) throw new PlanTaskGraphAdapterError("invalid_record", "Persisted task graph history is invalid")
@@ -135,7 +134,7 @@ export function hydratePlanTaskGraph(plan: PlanDispatchResult, options: PlanTask
   for (const persisted of options.events) {
     const { event } = hydrationEntry(persisted, runKey)
     if (seen.has(event.eventId)) throw new PlanTaskGraphAdapterError("duplicate_event", `Persisted task graph event ${event.eventId} is duplicated`)
-    if (event.eventId !== eventId(runKey, event.nodeId, event.type)) throw new PlanTaskGraphAdapterError("graph_mismatch", "Persisted task graph event ID does not match its runKey and phase")
+    if (event.eventId !== eventId(runKey, event.nodeId, event.type, event.attempt ?? 1)) throw new PlanTaskGraphAdapterError("graph_mismatch", "Persisted task graph event ID does not match its runKey, attempt, and phase")
     const reduction = reduceTaskGraph(state, event)
     if (!reduction.ok) throw new PlanTaskGraphAdapterError(reduction.errorCode, reduction.message)
     seen.add(event.eventId)
@@ -143,7 +142,6 @@ export function hydratePlanTaskGraph(plan: PlanDispatchResult, options: PlanTask
   }
   return state
 }
-
 function outputStatus(record: PlanCommandExecutionRecord): string | undefined {
   if (!record.result || typeof record.result !== "object") return undefined
   const output = record.result.output
@@ -151,7 +149,6 @@ function outputStatus(record: PlanCommandExecutionRecord): string | undefined {
   const status = (output as Record<string, unknown>).status
   return typeof status === "string" ? status : undefined
 }
-
 function terminalPhase(record: PlanCommandExecutionRecord): TaskGraphEvent["type"] {
   if (!record.result || typeof record.result !== "object") throw new PlanTaskGraphAdapterError("invalid_record", "Plan execution record result is required")
   const status = (record.result as { readonly status: string }).status
@@ -161,19 +158,15 @@ function terminalPhase(record: PlanCommandExecutionRecord): TaskGraphEvent["type
   if (status === "completed") return "complete"
   throw new PlanTaskGraphAdapterError("invalid_record", "Plan execution record has an unsupported status")
 }
-
 function isReplan(record: ObservablePlanRecord): record is Extract<PlanControlRecord, { readonly kind: "replan_required" }> {
   return Boolean(record && typeof record === "object" && record.kind === "replan_required")
 }
-
 function controlRecord(record: ObservablePlanRecord): record is Exclude<PlanControlRecord, { readonly kind: "replan_required" }> {
   return record.kind === "request_input" || record.kind === "propose_completion"
 }
-
 function isExecutionRecord(record: ObservablePlanRecord): record is PlanCommandExecutionRecord {
   return record.kind === "tool_call" || record.kind === "delegate" || record.kind === "join"
 }
-
 export function createPlanTaskGraphAdapter(plan: PlanDispatchResult, options: PlanTaskGraphAdapterOptions): PlanTaskGraphAdapter {
   const runKey = boundedRunKey(options.runKey)
   const freshState = createTaskGraph(graphNodes(plan.commands))
@@ -192,10 +185,11 @@ export function createPlanTaskGraphAdapter(plan: PlanDispatchResult, options: Pl
     if (encoded === undefined || Buffer.byteLength(encoded, "utf8") > MAX_GRAPH_PAYLOAD_BYTES) throw new PlanTaskGraphAdapterError("persistence_failed", "Task graph persistence exceeded the bounded payload")
     try { await options.persist(payload) } catch { throw new PlanTaskGraphAdapterError("persistence_failed", "Task graph persistence failed") }
   }
+  const currentAttempt = (localId: string): number => state.appliedEvents.slice().reverse().find(previous => previous.nodeId === localId)?.attempt ?? 1
 
-  const apply = async (localId: string, phase: TaskGraphEvent["type"], persistOverride: PersistTaskGraph = persist): Promise<void> => {
-    const event: TaskGraphEvent = { type: phase, nodeId: localId, eventId: eventId(runKey, localId, phase) }
-    const replayed = state.appliedEvents.some(previous => previous.eventId === event.eventId && previous.nodeId === event.nodeId && previous.type === event.type)
+  const apply = async (localId: string, phase: TaskGraphEvent["type"], attempt = currentAttempt(localId), persistOverride: PersistTaskGraph = persist): Promise<void> => {
+    const event: TaskGraphEvent = { type: phase, nodeId: localId, eventId: eventId(runKey, localId, phase, attempt), ...(attempt === 1 ? {} : { attempt }) }
+    const replayed = state.appliedEvents.some(previous => previous.eventId === event.eventId && previous.nodeId === event.nodeId && previous.type === event.type && (previous.attempt ?? 1) === attempt)
     const reduction = reduceTaskGraph(state, event)
     if (!reduction.ok) throw new PlanTaskGraphAdapterError(reduction.errorCode, reduction.message)
     if (replayed) return
@@ -211,11 +205,20 @@ export function createPlanTaskGraphAdapter(plan: PlanDispatchResult, options: Pl
   }
 
   const start = async (localId: string): Promise<TaskGraphState> => {
-    const started = eventId(runKey, localId, "start")
-    if (state.appliedEvents.some(previous => previous.eventId === started && previous.nodeId === localId && previous.type === "start")) return state
     if (!(localId in state.statuses)) throw new PlanTaskGraphAdapterError("unknown_node", `Unknown node ${localId}`)
+    const attempt = currentAttempt(localId)
+    const started = eventId(runKey, localId, "start", attempt)
+    if (state.appliedEvents.some(previous => previous.eventId === started && previous.nodeId === localId && previous.type === "start" && (previous.attempt ?? 1) === attempt)) return state
     if (state.statuses[localId] !== "ready" && state.statuses[localId] !== "waiting") throw new PlanTaskGraphAdapterError("illegal_transition", `Cannot start node ${localId} from ${state.statuses[localId]}`)
-    await apply(localId, "start")
+    await apply(localId, "start", attempt)
+    return state
+  }
+
+  const retry = async (localId: string): Promise<TaskGraphState> => {
+    if (!(localId in state.statuses)) throw new PlanTaskGraphAdapterError("unknown_node", `Unknown node ${localId}`)
+    const attempt = currentAttempt(localId)
+    if (state.statuses[localId] !== "running" || attempt !== 1) throw new PlanTaskGraphAdapterError("illegal_transition", `Cannot retry node ${localId} from ${state.statuses[localId]} attempt ${attempt}`)
+    await apply(localId, "retry", 2)
     return state
   }
 
@@ -228,9 +231,9 @@ export function createPlanTaskGraphAdapter(plan: PlanDispatchResult, options: Pl
     else if (isExecutionRecord(record)) phase = terminalPhase(record)
     else throw new PlanTaskGraphAdapterError("invalid_record", "Unsupported plan observation record")
     await start(record.localId)
-    await apply(record.localId, phase, persistOverride)
+    await apply(record.localId, phase, currentAttempt(record.localId), persistOverride)
     return state
   }
 
-  return { get state() { return state }, start, observe }
+  return { get state() { return state }, start, retry, observe }
 }

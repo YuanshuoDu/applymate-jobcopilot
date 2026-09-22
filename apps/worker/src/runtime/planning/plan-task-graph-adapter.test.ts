@@ -8,6 +8,7 @@ import {
   type PlanTaskGraphAdapterOptions,
   type PersistedTaskGraphEvent,
 } from "./plan-task-graph-adapter.js"
+import type { TaskGraphEvent } from "./task-graph-reducer.js"
 
 const command = (localId: string, dependsOn: readonly string[] = []): PlanDispatchCommand => ({
   localId, objective: localId, inputRefs: [], dependsOn: [...dependsOn], successCriteria: [], outputSchemaRef: null,
@@ -25,8 +26,11 @@ const adapter = (commands: readonly PlanDispatchCommand[], overrides: Partial<Pl
   const value = createPlanTaskGraphAdapter(plan(...commands), { runKey: "run-1", persist, ...overrides })
   return { value, persist }
 }
-const persisted = (runKey: string, type: "start" | "complete" | "fail" | "wait" | "cancel", nodeId: string, state?: unknown): PersistedTaskGraphEvent => ({
-  runKey, event: { type, nodeId, eventId: `${runKey}:${nodeId}:${type}` }, ...(state === undefined ? {} : { state }),
+const eventId = (runKey: string, nodeId: string, type: TaskGraphEvent["type"], attempt = 1): string => attempt === 1
+  ? `${runKey}:${nodeId}:${type}`
+  : `${runKey}:${nodeId}:attempt:${attempt}:${type}`
+const persisted = (runKey: string, type: TaskGraphEvent["type"], nodeId: string, state?: unknown, attempt?: number): PersistedTaskGraphEvent => ({
+  runKey, event: { type, nodeId, eventId: eventId(runKey, nodeId, type, attempt ?? 1), ...(attempt === undefined ? {} : { attempt }) }, ...(state === undefined ? {} : { state }),
 })
 
 describe("plan task graph adapter", () => {
@@ -241,5 +245,49 @@ describe("plan task graph adapter", () => {
     expect(() => hydratePlanTaskGraph(plan(command("first")), { runKey: "run-1", events: [persisted("run-1", "start", "first", "x".repeat(9000))] })).toThrowError(PlanTaskGraphAdapterError)
     const extraEntry = { ...persisted("run-1", "start", "first"), source: "untrusted" } as unknown as PersistedTaskGraphEvent
     expect(() => hydratePlanTaskGraph(plan(command("first")), { runKey: "run-1", events: [extraEntry] })).toThrowError(/entry is malformed/)
+  })
+
+  it("replays legacy attempt one history and persists a distinct attempt two recovery", async () => {
+    const { value, persist } = adapter([command("first")])
+    await value.start!("first")
+    await value.retry!("first")
+    await value.start!("first")
+    await value.observe(record("first", "completed"))
+    expect(persist.mock.calls.map(([entry]) => entry.event.eventId)).toEqual([
+      "run-1:first:start", "run-1:first:attempt:2:retry", "run-1:first:attempt:2:start", "run-1:first:attempt:2:complete",
+    ])
+    expect(persist.mock.calls.slice(1).every(([entry]) => entry.event.attempt === 2)).toBe(true)
+    expect(value.state.statuses.first).toBe("completed")
+  })
+
+  it("hydrates attempt two recovery history and rejects a second recovery", async () => {
+    const history = [persisted("run-1", "start", "first"), persisted("run-1", "retry", "first", undefined, 2)]
+    const initialState = hydratePlanTaskGraph(plan(command("first")), { runKey: "run-1", events: history })
+    const persist = vi.fn<PlanTaskGraphAdapterOptions["persist"]>().mockResolvedValue(undefined)
+    const value = createPlanTaskGraphAdapter(plan(command("first")), { runKey: "run-1", persist, initialState })
+    expect(value.state.statuses.first).toBe("ready")
+    await expect(value.retry!("first")).rejects.toMatchObject({ code: "illegal_transition" })
+    await value.start!("first")
+    await value.observe(record("first", "completed"))
+    expect(value.state.statuses.first).toBe("completed")
+  })
+
+  it("does not advance adapter state when recovery persistence fails", async () => {
+    const persist = vi.fn<PlanTaskGraphAdapterOptions["persist"]>()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("db down"))
+    const value = createPlanTaskGraphAdapter(plan(command("first")), { runKey: "run-1", persist })
+    await value.start!("first")
+    await expect(value.retry!("first")).rejects.toMatchObject({ code: "persistence_failed" })
+    expect(value.state.statuses.first).toBe("running")
+    expect(value.state.appliedEvents.map(event => event.eventId)).toEqual(["run-1:first:start"])
+  })
+
+  it("fails closed for malformed or mismatched recovery identity", () => {
+    const missingAttempt = { ...persisted("run-1", "retry", "first"), event: { type: "retry", nodeId: "first", eventId: "run-1:first:attempt:2:retry" } } as unknown as PersistedTaskGraphEvent
+    expect(() => hydratePlanTaskGraph(plan(command("first")), { runKey: "run-1", events: [missingAttempt] })).toThrowError(PlanTaskGraphAdapterError)
+    const mismatch = { ...persisted("run-1", "retry", "first", undefined, 2), event: { type: "retry", nodeId: "first", eventId: "run-1:first:attempt:2:wrong", attempt: 2 } } as PersistedTaskGraphEvent
+    expect(() => hydratePlanTaskGraph(plan(command("first")), { runKey: "run-1", events: [mismatch] })).toThrowError(/runKey, attempt, and phase/)
+    expect(() => hydratePlanTaskGraph(plan(command("first")), { runKey: "run-1", events: [persisted("run-1", "retry", "first", undefined, 3)] })).toThrowError(PlanTaskGraphAdapterError)
   })
 })

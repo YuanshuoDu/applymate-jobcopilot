@@ -4,8 +4,8 @@ export type TaskGraphNode = {
 }
 
 export type TaskGraphStatus = "pending" | "ready" | "running" | "completed" | "failed" | "waiting" | "cancelled"
-export type TaskGraphEventType = "start" | "complete" | "fail" | "wait" | "cancel"
-export type TaskGraphEvent = { readonly type: TaskGraphEventType; readonly nodeId: string; readonly eventId: string }
+export type TaskGraphEventType = "start" | "complete" | "fail" | "wait" | "cancel" | "retry"
+export type TaskGraphEvent = { readonly type: TaskGraphEventType; readonly nodeId: string; readonly eventId: string; readonly attempt?: number }
 export type TaskGraphBlockReason = "waiting_on_dependencies" | "dependency_failed"
 
 export type TaskGraphState = {
@@ -96,6 +96,16 @@ const derive = (state: Omit<TaskGraphState, "readyNodeIds" | "blockedReasons">):
   return { ...state, readyNodeIds, blockedReasons }
 }
 
+const eventAttempt = (event: TaskGraphEvent): number => event.attempt ?? 1
+
+const currentAttempt = (state: TaskGraphState, nodeId: string): number => {
+  for (let index = state.appliedEvents.length - 1; index >= 0; index -= 1) {
+    const event = state.appliedEvents[index]
+    if (event?.nodeId === nodeId) return eventAttempt(event)
+  }
+  return 1
+}
+
 export function createTaskGraph(input: readonly TaskGraphNode[]): TaskGraphState {
   validateNodes(input)
   const nodes = input.map((node) => ({ id: node.id, dependsOn: [...node.dependsOn] }))
@@ -104,9 +114,11 @@ export function createTaskGraph(input: readonly TaskGraphNode[]): TaskGraphState
 
 const validEvent = (event: TaskGraphEvent): boolean => {
   if (!event || typeof event !== "object") return false
-  return ["start", "complete", "fail", "wait", "cancel"].includes(event.type)
-    && typeof event.nodeId === "string" && event.nodeId.length > 0
-    && typeof event.eventId === "string" && event.eventId.length > 0
+  if (!["start", "complete", "fail", "wait", "cancel", "retry"].includes(event.type)) return false
+  if (typeof event.nodeId !== "string" || event.nodeId.length === 0 || typeof event.eventId !== "string" || event.eventId.length === 0) return false
+  if (event.attempt !== undefined && (!Number.isSafeInteger(event.attempt) || event.attempt < 1 || event.attempt > 2)) return false
+  if (event.type === "retry" && event.attempt !== 2) return false
+  return true
 }
 
 const nextStatus = (status: TaskGraphStatus, type: TaskGraphEventType): TaskGraphStatus | undefined => {
@@ -115,6 +127,7 @@ const nextStatus = (status: TaskGraphStatus, type: TaskGraphEventType): TaskGrap
   if (type === "fail" && status === "running") return "failed"
   if (type === "wait" && status === "running") return "waiting"
   if (type === "cancel" && ["pending", "ready", "running", "waiting"].includes(status)) return "cancelled"
+  if (type === "retry" && status === "running") return "ready"
   return undefined
 }
 
@@ -124,11 +137,18 @@ export function reduceTaskGraph(state: TaskGraphState, event: TaskGraphEvent): T
   if (!validEvent(event)) return failure(state, "invalid_event", "Malformed task graph event")
   const previous = state.appliedEvents.find((candidate) => candidate.eventId === event.eventId)
   if (previous) {
-    if (previous.nodeId === event.nodeId && previous.type === event.type) return { ok: true, state }
+    if (previous.nodeId === event.nodeId && previous.type === event.type && eventAttempt(previous) === eventAttempt(event)) {
+      if (eventAttempt(event) < currentAttempt(state, event.nodeId)) return failure(state, "duplicate_event", `Event id ${event.eventId} belongs to an earlier attempt`)
+      return { ok: true, state }
+    }
     return failure(state, "duplicate_event", `Event id ${event.eventId} was already applied`)
   }
   if (!(event.nodeId in state.statuses)) return failure(state, "unknown_node", `Unknown node ${event.nodeId}`)
   const current = state.statuses[event.nodeId]
+  const attempt = eventAttempt(event)
+  const activeAttempt = currentAttempt(state, event.nodeId)
+  if (event.type === "retry" && (attempt !== 2 || activeAttempt !== 1)) return failure(state, "illegal_transition", `Cannot retry node ${event.nodeId} from attempt ${activeAttempt}`)
+  if (event.type !== "retry" && attempt !== activeAttempt) return failure(state, "illegal_transition", `Event attempt ${attempt} does not match node ${event.nodeId} attempt ${activeAttempt}`)
   const next = nextStatus(current, event.type)
   if (!next) return failure(state, "illegal_transition", `Cannot ${event.type} node ${event.nodeId} from ${current}`)
   const updated = {
