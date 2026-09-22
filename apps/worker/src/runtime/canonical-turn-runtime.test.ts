@@ -138,15 +138,15 @@ function setup(overrides: Record<string, unknown> = {}) {
 }
 
 function durableRestartFixture() {
-  type DurableEvent = { id: string; type: string; payload: unknown; idempotencyKey: string; taskId: string | null; itemId: string | null; correlationId: string; causationId: string | null }
+  type DurableEvent = { id: string; type: string; payload: unknown; idempotencyKey: string; userId: string; sessionId: string; turnId: string; sequence: string; taskId: string | null; itemId: string | null; correlationId: string; causationId: string | null }
   type DurableStep = { id: string; ordinal: number; attempt: number; inputThroughSequence: bigint; consumedInputIds: string[]; inputTokens: number; outputTokens: number; estimatedCostUsd: number }
   const feedbackPlan = "plan-1"
   const durable: { status: "queued" | "in_progress"; ownerId: string | null; leaseVersion: number; leaseStartedAt: Date | null; leaseExpiresAt: Date | null; events: DurableEvent[]; steps: DurableStep[] } = {
     status: "queued", ownerId: null, leaseVersion: 0, leaseStartedAt: null, leaseExpiresAt: null,
     events: [
-      { id: "plan-revision-event", type: "plan.revision", payload: { planCallId: feedbackPlan, goalRevision: 1, planRevision: 1, basedOnPlanRevision: null }, idempotencyKey: "seed:plan-revision", taskId: "root-1", itemId: null, correlationId: feedbackPlan, causationId: null },
-      { id: "plan-result-event", type: "plan.observation", payload: { observationId: `plan-result:${feedbackPlan}:read`, content: { kind: "plan_command", localId: "read", commandKind: "tool_call", dependsOn: [], status: "completed", errorCode: null, output: { found: true } } }, idempotencyKey: "seed:plan-result", taskId: "root-1", itemId: null, correlationId: "read", causationId: null },
-      { id: "plan-control-event", type: "plan.observation", payload: { observationId: `plan-control:${feedbackPlan}:finish`, content: { kind: "plan_control", localId: "finish", status: "completion_proposed", dependsOn: ["missing"], completionCriteria: ["done"] } }, idempotencyKey: "seed:plan-control", taskId: "root-1", itemId: null, correlationId: "finish", causationId: null },
+      { id: "plan-revision-event", type: "plan.revision", payload: { planCallId: feedbackPlan, goalRevision: 1, planRevision: 1, basedOnPlanRevision: null }, idempotencyKey: "seed:plan-revision", userId: "user-1", sessionId: "session-1", turnId: "turn-1", sequence: "1", taskId: "root-1", itemId: null, correlationId: feedbackPlan, causationId: null },
+      { id: "plan-result-event", type: "plan.observation", payload: { observationId: `plan-result:${feedbackPlan}:read`, content: { kind: "plan_command", localId: "read", commandKind: "tool_call", dependsOn: [], status: "completed", errorCode: null, output: { found: true } } }, idempotencyKey: "seed:plan-result", userId: "user-1", sessionId: "session-1", turnId: "turn-1", sequence: "2", taskId: "root-1", itemId: null, correlationId: "read", causationId: null },
+      { id: "plan-control-event", type: "plan.observation", payload: { observationId: `plan-control:${feedbackPlan}:finish`, content: { kind: "plan_control", localId: "finish", status: "completion_proposed", dependsOn: ["missing"], completionCriteria: ["done"] } }, idempotencyKey: "seed:plan-control", userId: "user-1", sessionId: "session-1", turnId: "turn-1", sequence: "3", taskId: "root-1", itemId: null, correlationId: "finish", causationId: null },
     ],
     steps: [],
   }
@@ -201,7 +201,7 @@ function durableRestartFixture() {
   const append = async (input: Parameters<NonNullable<TurnEngineStore["appendEvent"]>>[0]) => {
     const existing = durable.events.find(event => event.idempotencyKey === input.idempotencyKey)
     if (existing) return { id: existing.id }
-    const event: DurableEvent = { id: input.id, type: input.type, payload: input.payload, idempotencyKey: input.idempotencyKey, taskId: input.owner.taskId, itemId: input.itemId, correlationId: input.correlationId, causationId: input.causationId }
+    const event: DurableEvent = { id: input.id, type: input.type, payload: input.payload, idempotencyKey: input.idempotencyKey, userId: "user-1", sessionId: "session-1", turnId: "turn-1", sequence: String(durable.events.length + 1), taskId: input.owner.taskId, itemId: input.itemId, correlationId: input.correlationId, causationId: input.causationId }
     durable.events.push(event)
     if (input.type === PLAN_COMPLETION_FEEDBACK_EVENT_TYPE && !crashWindow) {
       crashWindow = true
