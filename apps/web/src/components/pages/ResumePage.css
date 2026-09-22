@@ -159,6 +159,38 @@
 .resume-library-resize-handle:hover > span, .resume-library-resize-handle:focus-visible > span, .resume-library-layout.is-library-resizing .resume-library-resize-handle > span { background: #8c80f1; box-shadow: 0 0 0 3px rgba(76,50,239,.10); }
 .resume-workspace { grid-column: 2; grid-row: 1; min-width: 0; padding: 16px 24px 28px !important; background: #fcfcff; }
 .resume-editor-content { width: 100%; max-width: 794px; margin: 0 auto; }
+.resume-change-summary { display: grid; gap: 9px; margin: 0 0 14px; padding: 11px; border: 1px solid rgba(76,50,239,.28); border-radius: 10px; background: linear-gradient(180deg, #fbfaff 0%, #f5f3ff 100%); box-shadow: 0 6px 18px rgba(76,50,239,.08); }
+.resume-change-summary-heading { display: flex; align-items: flex-start; gap: 8px; }
+.resume-change-summary-icon { display: grid; flex: 0 0 auto; place-items: center; width: 25px; height: 25px; border-radius: 7px; color: #fff; background: #5a40ee; }
+.resume-change-summary-heading > div { flex: 1; min-width: 0; }
+.resume-change-summary-heading strong { display: block; color: #2a245e; font-size: 11px; }
+.resume-change-summary-heading p { margin: 3px 0 0; color: #6f6a91; font-size: 9px; line-height: 1.45; }
+.resume-change-clear { flex: 0 0 auto; padding: 3px 0; border: 0; color: #5a40ee; background: transparent; font: inherit; font-size: 9px; font-weight: 700; cursor: pointer; }
+.resume-change-list { display: grid; gap: 7px; max-height: 430px; overflow: auto; padding-right: 2px; }
+.resume-change-item { display: grid; gap: 6px; padding: 8px; border: 1px solid rgba(76,50,239,.16); border-radius: 7px; background: #fff; }
+.resume-change-item-heading { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.resume-change-item-heading > strong { overflow: hidden; flex: 1; color: #302b5c; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.resume-change-item-heading > button { display: grid; place-items: center; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 5px; color: #7d7897; background: transparent; cursor: pointer; }
+.resume-change-item-heading > button:hover, .resume-change-item-heading > button:focus-visible { color: #4c32ef; background: #f0eeff; outline: none; }
+.resume-change-source { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 3px; padding: 2px 5px; border-radius: 999px; font-size: 7px; font-weight: 800; letter-spacing: .02em; text-transform: uppercase; }
+.resume-change-source.is-ai_insights { color: #4c32ef; background: #f0edff; }
+.resume-change-source.is-audit { color: #087a52; background: #eaf9f1; }
+.resume-change-columns { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 7px; }
+.resume-change-column { min-width: 0; border-radius: 5px; padding: 6px; font-size: 9px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.resume-change-column.is-before { border: 1px solid rgba(220,38,38,.15); background: rgba(220,38,38,.035); }
+.resume-change-column.is-after { border: 1px solid rgba(5,150,105,.18); background: rgba(5,150,105,.04); }
+.resume-change-column-label { display: block; margin-bottom: 4px; font-size: 8px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; }
+.resume-change-column.is-before .resume-change-column-label { color: #ad4b43; }
+.resume-change-column.is-after .resume-change-column-label { color: #16865d; }
+.resume-change-diff-text { color: #3f4661; white-space: pre-wrap; }
+.resume-change-diff-token { padding: 0 1px; border-radius: 2px; color: inherit; font: inherit; }
+.resume-change-diff-token.is-removed { color: #a33b25; background: rgba(220,38,38,.16); text-decoration: line-through; text-decoration-thickness: 1px; }
+.resume-change-diff-token.is-added { color: #087a52; background: rgba(5,150,105,.18); font-weight: 650; }
+.resume-editor-section-shell { position: relative; margin: 0 -7px; padding: 0 7px; border-left: 3px solid transparent; border-radius: 7px; transition: border-color .18s ease, background .18s ease, box-shadow .18s ease; }
+.resume-editor-section-shell.has-resume-changes { border-left-color: #5a40ee; background: rgba(90,64,238,.035); box-shadow: inset 0 0 0 1px rgba(90,64,238,.08); }
+.resume-editor-section-change-label { display: flex; align-items: center; gap: 5px; min-height: 23px; padding: 4px 0 1px; color: #4c32ef; font-size: 8px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; }
+.resume-editor-section-change-label::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #5a40ee; box-shadow: 0 0 0 3px rgba(90,64,238,.12); }
+@media (max-width: 620px) { .resume-change-columns { grid-template-columns: 1fr; } .resume-change-list { max-height: none; } }
 .resume-workspace-head { display: flex; align-items: center; justify-content: space-between; gap: 18px; width: 100%; margin: 0 0 16px; }
 .resume-workspace-title-copy { display: grid; flex: 1 1 auto; min-width: 0; gap: 5px; }
 .resume-workspace-eyebrow { display: inline-flex; align-items: center; gap: 6px; color: #7a819e; font-size: 10px; font-weight: 750; letter-spacing: .1em; line-height: 1; text-transform: uppercase; }

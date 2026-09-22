@@ -119,6 +119,7 @@ import { ProjectsSection } from '@/components/resume/ProjectsSection'
 import { CertificationsSection } from '@/components/resume/CertificationsSection'
 import { CustomSection } from '@/components/resume/CustomSection'
 import { AiPanel } from '@/components/resume/AiPanel'
+import { ResumeChangeSummary } from '@/components/resume/ResumeChangeSummary'
 import { PersonaPanel } from '@/components/resume/PersonaPanel'
 import { FinalConfirmDialog } from '@/components/resume/FinalConfirmDialog'
 import { UploadResumeModal } from '@/components/resume/UploadResumeModal'
@@ -128,6 +129,8 @@ import type { AiFieldContext } from '@/components/resume/AiFieldSuggestion'
 import { exportApplicationPackLocally } from '@/lib/bundle'
 import { downloadResumePdf } from '@/lib/resume-export'
 import { analysisTargetKey, replaceSectionSuggestions, shouldPreserveAnalysis, shouldStartAutomaticAnalysis } from '@/lib/resume-analysis-state'
+import { formatResumeChangeValue, type ResumeChange, type ResumeChangeSection, type ResumeChangeSource } from '@/lib/resume-change-diff'
+import { targetForAuditFinding } from '@/lib/application-audit'
 
 const AI_SUGGESTION_SECTIONS = ['summary', 'skills', 'experience', 'education', 'projects'] as const
 type AiSuggestionSection = (typeof AI_SUGGESTION_SECTIONS)[number]
@@ -643,6 +646,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   const [editingDirId,     setEditingDirId]     = useState<string | null>(null)
 
   const [content,         setContent]         = useState<ResumeContent | null>(null)
+  const [resumeChanges,   setResumeChanges] = useState<ResumeChange[]>([])
   const [resumeName,      setResumeName]      = useState('My Resume')
   const [templateId,      setTemplateId]      = useState('clean')
   const [templateOptions, setTemplateOptions] = useState<TemplateOptions>({})
@@ -976,6 +980,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     if (!selectedResumeId) return
     const controller = new AbortController()
     const resumeUrl = `/api/resume/${selectedResumeId}`
+    setResumeChanges([])
     const applyResume = (resume: Resume) => {
       const c = (resume.content ?? EMPTY_CONTENT) as ResumeContent
       setContent(c)
@@ -1076,6 +1081,40 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   }, [selectedJobId, selectedResumeId, selectedResumeUpdatedAt, jobs, contentChangedSinceAnalysis])
 
   const [flashField, setFlashField] = useState('')
+
+  function currentResumeSectionValue(section: ResumeChangeSection, sourceContent: ResumeContent | null = content) {
+    if (!sourceContent || section === 'cover_letter') return undefined
+    return sourceContent[section as keyof ResumeContent]
+  }
+
+  function recordResumeChange(source: ResumeChangeSource, section: ResumeChangeSection, before: unknown, after: unknown) {
+    const beforeText = formatResumeChangeValue(section, before)
+    const afterText = formatResumeChangeValue(section, after)
+    if (beforeText === afterText) return
+    const change: ResumeChange = {
+      id: `${source}-${section}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      source,
+      section,
+      before: beforeText,
+      after: afterText,
+      createdAt: Date.now(),
+    }
+    setResumeChanges(previous => [change, ...previous].slice(0, 8))
+    window.requestAnimationFrame(() => document.querySelector('[data-resume-change-summary]')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }))
+  }
+
+  function dismissResumeChange(id: string) {
+    setResumeChanges(previous => previous.filter(change => change.id !== id))
+  }
+
+  function renderSectionChangeMarker(section: ResumeChangeSection) {
+    const changes = resumeChanges.filter(change => change.section === section)
+    if (!changes.length) return null
+    const sources = [...new Set(changes.map(change => change.source))]
+      .map(source => source === 'audit' ? t('resume.changeSourceAudit') : t('resume.changeSourceAi'))
+      .join(' + ')
+    return <div className="resume-editor-section-change-label">{sources} · {changes.length} {t('resume.changeAppliedLabel')}</div>
+  }
 
   function triggerFlash(fieldKey: string) {
     setFlashField(fieldKey)
@@ -1333,28 +1372,33 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
 
   // Apply a keyword/item to the correct section (not just skills)
   function applyTargeted(t: { type: string; section: string; keyword: string; value?: string }) {
+    if (!content) return
     const { section, keyword } = t
 
     switch (section) {
       case 'summary':
         // Append keyword context to summary
-        patch(p => {
-          const current = p.summary ?? ''
-          const addition = current ? ` ${keyword}.` : keyword
-          return { ...p, summary: current + addition }
-        }, 'summary')
-        triggerFlash('summary')
+        {
+          const before = content.summary ?? ''
+          const after = before ? `${before} ${keyword}.` : keyword
+          recordResumeChange('ai_insights', 'summary', before, after)
+          patch(p => ({ ...p, summary: after }), 'summary')
+        }
         toast.success('Summary updated', `Added "${keyword}" context`)
         break
 
       case 'skills':
-        patch(p => {
-          const existing = new Set(p.skills?.map(s => s.toLowerCase()) ?? [])
-          if (existing.has(keyword.toLowerCase())) return p
-          return { ...p, skills: [...(p.skills ?? []), keyword] }
-        }, 'skills')
-        triggerFlash('skills')
-        toast.success('Skill added', `"${keyword}" added to Skills`)
+        {
+          const before = content.skills ?? []
+          if (before.some(skill => skill.toLowerCase() === keyword.toLowerCase())) {
+            toast.info('Already present', `"${keyword}" is already in Skills`)
+            break
+          }
+          const after = [...before, keyword]
+          recordResumeChange('ai_insights', 'skills', before, after)
+          patch(p => ({ ...p, skills: after }), 'skills')
+          toast.success('Skill added', `"${keyword}" added to Skills`)
+        }
         break
 
       case 'experience':
@@ -1363,19 +1407,20 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
         break
 
       default:
-        patch(p => {
-          const existing = new Set(p.skills?.map(s => s.toLowerCase()) ?? [])
-          if (existing.has(keyword.toLowerCase())) return p
-          return { ...p, skills: [...(p.skills ?? []), keyword] }
-        }, 'skills')
-        triggerFlash('skills')
-        toast.success('Added', `"${keyword}" added`)
+        {
+          const before = content.skills ?? []
+          if (before.some(skill => skill.toLowerCase() === keyword.toLowerCase())) break
+          const after = [...before, keyword]
+          recordResumeChange('ai_insights', 'skills', before, after)
+          patch(p => ({ ...p, skills: after }), 'skills')
+          toast.success('Added', `"${keyword}" added`)
+        }
     }
   }
 
   function applySuggestion(i: number) {
     const s = suggestions[i]
-    if (!s) return
+    if (!s || !content) return
     setSuggestions(prev => { const n = [...prev]; n[i] = { ...n[i], applied: true }; return n })
 
     const hasProposed = s.proposed && s.proposed.trim()
@@ -1383,6 +1428,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     switch (s.target) {
       case 'summary':
         if (s.action === 'rewrite' && hasProposed) {
+          recordResumeChange('ai_insights', 'summary', content.summary, s.proposed!)
           patch(p => ({ ...p, summary: s.proposed! }), 'summary')
           toast.success('Summary updated', 'AI-rewritten summary applied')
         } else { toast.success('Noted', 'Suggestion marked as applied') }
@@ -1392,6 +1438,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
         if (s.action === 'reorder' && hasProposed) {
           const reordered = s.proposed!.split(/[,;]\s*/).map(x => x.trim()).filter(Boolean)
           if (reordered.length > 0) {
+            recordResumeChange('ai_insights', 'skills', content.skills, reordered)
             patch(p => ({ ...p, skills: reordered }), 'skills')
             toast.success('Skills reordered', `${reordered.length} skills reorganised for ATS`)
           }
@@ -1399,13 +1446,15 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
           // Add ALL section-targeted missing keywords
           const skillsKw = scoreResult.missingItems.filter(m => m.target === 'skills').map(m => m.keyword)
           if (skillsKw.length > 0) {
-            patch(p => {
-              const existing = new Set(p.skills?.map(sk => sk.toLowerCase()) ?? [])
-              const added = skillsKw.filter(kw => !existing.has(kw.toLowerCase()))
-              return added.length === 0 ? p : { ...p, skills: [...(p.skills ?? []), ...added] }
-            }, 'skills')
-            triggerFlash('skills')
-            toast.success('Skills updated', `Added ${skillsKw.length} targeted keyword(s)`)
+            const before = content.skills ?? []
+            const existing = new Set(before.map(sk => sk.toLowerCase()))
+            const added = skillsKw.filter(kw => !existing.has(kw.toLowerCase()))
+            if (added.length > 0) {
+              const after = [...before, ...added]
+              recordResumeChange('ai_insights', 'skills', before, after)
+              patch(p => ({ ...p, skills: after }), 'skills')
+              toast.success('Skills updated', `Added ${added.length} targeted keyword(s)`)
+            }
           }
           // Also toast for non-skills keywords
           const otherKw = scoreResult.missingItems.filter(m => m.target !== 'skills')
@@ -1635,6 +1684,11 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       toast.info('Run the audit again first', 'The current resume or cover letter changed after this audit.')
       return
     }
+    const finding = displayedApplicationAuditRecord.audit.findings[index]
+    const expectedTarget = finding ? targetForAuditFinding(finding) : undefined
+    const beforeChange = expectedTarget === 'cover_letter'
+      ? finalCoverLetter?.content
+      : expectedTarget ? currentResumeSectionValue(expectedTarget) : undefined
     setApplyingAuditFinding(index)
     try {
       const { data, error } = await apiMutate<AuditApplyResponse>(`/api/jobs/${resumeLinkedJob.id}/audit-application/apply`, 'POST', {
@@ -1658,6 +1712,12 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
           : resume))
       }
       if (data.coverLetter) setLatestSavedCoverLetter(data.coverLetter)
+      if (data.target) {
+        const afterChange = data.target === 'cover_letter'
+          ? data.coverLetter?.content
+          : data.resume ? currentResumeSectionValue(data.target, data.resume.content as ResumeContent) : undefined
+        recordResumeChange('audit', data.target, beforeChange, afterChange)
+      }
       setLatestApplicationAudit({
         ...displayedApplicationAuditRecord,
         resumeUpdatedAt: data.resumeUpdatedAt ?? displayedApplicationAuditRecord.resumeUpdatedAt,
@@ -2110,16 +2170,25 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
             {/* Completeness bar */}
             <CompletenessBar content={content} />
 
+            <ResumeChangeSummary
+              changes={resumeChanges}
+              onDismiss={dismissResumeChange}
+              onClear={() => setResumeChanges([])}
+            />
+
             {/* Resume paper */}
             <div className="resume-paper" style={{ margin: '0 auto', background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 10, padding: '32px 36px' }}>
               {/* Contact (fixed, not draggable) */}
-              <ContactSection
-                contact={content.contact}
-                editing={editSection === 'contact'}
-                onEdit={() => setEditSection('contact')}
-                onBlur={() => setEditSection(null)}
-                onChange={c => patch(p => ({ ...p, contact: c }))}
-              />
+              <div className={`resume-editor-section-shell${resumeChanges.some(change => change.section === 'contact') ? ' has-resume-changes' : ''}`}>
+                {renderSectionChangeMarker('contact')}
+                <ContactSection
+                  contact={content.contact}
+                  editing={editSection === 'contact'}
+                  onEdit={() => setEditSection('contact')}
+                  onBlur={() => setEditSection(null)}
+                  onChange={c => patch(p => ({ ...p, contact: c }))}
+                />
+              </div>
 
               {/* Dynamic draggable sections */}
               {sectionOrder.map((sectionId, sectionIdx) => (
@@ -2135,7 +2204,10 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
                     background: sectionDragOver === sectionIdx ? 'rgba(24,95,165,0.02)' : 'transparent',
                     transition: 'outline 0.1s, background 0.1s',
                   }}>
-                  {renderSection(sectionId, sectionIdx)}
+                  <div className={`resume-editor-section-shell${resumeChanges.some(change => change.section === sectionId) ? ' has-resume-changes' : ''}`}>
+                    {renderSectionChangeMarker(sectionId as ResumeChangeSection)}
+                    {renderSection(sectionId, sectionIdx)}
+                  </div>
                 </div>
               ))}
 
