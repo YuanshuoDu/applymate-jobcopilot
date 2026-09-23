@@ -19,14 +19,14 @@ const previewSession = {
 }
 
 /** Dev-only browser fixture for the real Agent page and V2 supervisor panel. */
-export function AgentSupervisorPreviewClient({ supervisorMode = false, locale }: { supervisorMode?: boolean; locale?: Lang }) {
+export function AgentSupervisorPreviewClient({ supervisorMode = false, locale, seedApplicationReviewQueue = false }: { supervisorMode?: boolean; locale?: Lang; seedApplicationReviewQueue?: boolean }) {
   if (!supervisorMode) return <AgentPreviewClient />
 
   return (
     <SessionProvider session={previewSession}>
       <I18nProvider>
         <PreviewLocale locale={locale}>
-          <AgentPlaygroundPage />
+          <AgentPlaygroundPage seedApplicationReviewQueue={seedApplicationReviewQueue} />
         </PreviewLocale>
       </I18nProvider>
     </SessionProvider>

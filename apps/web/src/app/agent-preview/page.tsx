@@ -3,7 +3,7 @@ import { notFound } from 'next/navigation'
 import { isAgentPreviewFixtureEnabled, isAgentPreviewRequestAllowed } from '@/lib/agent-preview-access'
 import { AgentSupervisorPreviewClient } from './AgentSupervisorPreviewClient'
 
-export default async function AgentPreviewPage({ searchParams }: { searchParams: Promise<{ supervisor?: string; locale?: string }> }) {
+export default async function AgentPreviewPage({ searchParams }: { searchParams: Promise<{ supervisor?: string; locale?: string; applicationReview?: string }> }) {
   const requestHeaders = await headers()
   const hostHeader = requestHeaders.get('host')
   if (!isAgentPreviewFixtureEnabled({ NODE_ENV: process.env.NODE_ENV, AGENT_PREVIEW_FIXTURE: process.env.AGENT_PREVIEW_FIXTURE }) ||
@@ -19,7 +19,7 @@ export default async function AgentPreviewPage({ searchParams }: { searchParams:
         @keyframes spin { to { transform: rotate(360deg); } }
         body { margin: 0; }
       `}</style>
-      <AgentSupervisorPreviewClient supervisorMode={params.supervisor === '1'} locale={params.locale === 'zh' ? 'zh' : undefined} />
+      <AgentSupervisorPreviewClient supervisorMode={params.supervisor === '1'} locale={params.locale === 'zh' ? 'zh' : undefined} seedApplicationReviewQueue={params.applicationReview === '1'} />
     </>
   )
 }

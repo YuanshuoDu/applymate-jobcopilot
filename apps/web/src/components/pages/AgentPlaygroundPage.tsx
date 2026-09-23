@@ -32,7 +32,19 @@ export function isDurableTurnRunning(status: ActiveTurnStatus | undefined): bool
   return status === 'queued' || status === 'in_progress'
 }
 
-export function AgentPlaygroundPage() {
+const previewApplicationReviewJob: ApplyReadyJob = {
+  jobId: 'fixture-application-review-job',
+  company: 'Fixture Robotics',
+  role: 'Backend Engineer',
+  score: 92,
+  url: 'https://jobs.example.test/apply',
+  location: 'Dublin, IE',
+  coverLetter: 'Fixture cover letter for review only. No application will be submitted.',
+  matchedKeywords: ['TypeScript', 'PostgreSQL'],
+  mode: 'manual',
+}
+
+export function AgentPlaygroundPage({ seedApplicationReviewQueue = false }: { seedApplicationReviewQueue?: boolean }) {
   const toast = useToast()
   const { navigate } = useNav()
   const { t } = useI18n()
@@ -41,7 +53,7 @@ export function AgentPlaygroundPage() {
   const { data: agentConfig } = useApi<AgentConfig>('/api/agent')
 
   const [showAddModal,  setShowAddModal]  = useState(false)
-  const [applyQueue,    setApplyQueue]    = useState<ApplyReadyJob[]>([])
+  const [applyQueue,    setApplyQueue]    = useState<ApplyReadyJob[]>(() => seedApplicationReviewQueue ? [previewApplicationReviewJob] : [])
   const { sessionId, setSessionId } = useAgentSessionUrl()
   const selectedSessionId = sessionId
   const timeline = useAgentTimeline(selectedSessionId)

@@ -80,6 +80,11 @@ async function installSupervisorFixture(page: Page) {
   const fixture = {
     aStreamCount: 0,
     lifecycleStarted: false,
+    replayArmed: false,
+    replayRequestsAfterSequence: [] as Array<string | null>,
+    replaySequence: null as string | null,
+    replayEvent: null as ReturnType<typeof event> | null,
+    replayDuplicateSent: false,
     childTaskStarted: false,
     childTaskCompleted: false,
     taskLifecycleConnections: [] as number[],
@@ -115,6 +120,10 @@ async function installSupervisorFixture(page: Page) {
   await page.route('**/api/gmail/unread', route => json(route, { hasGmail: false, unread: 0 }))
   await page.route('**/__agent_fixture__/lifecycle', async route => {
     fixture.lifecycleStarted = true
+    return json(route, { ok: true })
+  })
+  await page.route('**/__agent_fixture__/replay', async route => {
+    fixture.replayArmed = true
     return json(route, { ok: true })
   })
   await page.route(/\/api\/agent\/sessions(?:\?.*)?$/, route => json(route, {
@@ -172,6 +181,27 @@ async function installSupervisorFixture(page: Page) {
       if (!fixture.lifecycleStarted) {
         return route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': waiting for lifecycle assertions\n\n' })
       }
+      if (fixture.replayArmed) {
+        const afterSequence = url.searchParams.get('afterSequence')
+        fixture.replayRequestsAfterSequence.push(afterSequence)
+        if (fixture.replayRequestsAfterSequence.length === 1) {
+          fixture.replaySequence = (BigInt(afterSequence ?? '0') + BigInt(1)).toString()
+          fixture.replayEvent = event(SESSION_A, TURN_A, 'fixture-event-selected-tool-replay', fixture.replaySequence, 'item.delta', {
+            text: 'Selected tool evidence survived the disconnect.',
+            outputSummary: 'Selected tool evidence survived the disconnect.',
+          }, {
+            itemId: 'fixture-tool-a', kind: 'delta', baseRevision: 1, revision: 2,
+          })
+          // Ending this response closes the mocked SSE connection. The client must reconnect with the emitted sequence.
+          return route.fulfill({ status: 200, contentType: 'text/event-stream', body: `event: timeline\ndata: ${JSON.stringify(fixture.replayEvent)}\n\n` })
+        }
+        if (fixture.replayRequestsAfterSequence.length === 2) {
+          if (!fixture.replayEvent) throw new Error('The replay fixture event was not initialized.')
+          fixture.replayDuplicateSent = true
+          fixture.replayArmed = false
+          return route.fulfill({ status: 200, contentType: 'text/event-stream', body: `event: timeline\ndata: ${JSON.stringify(fixture.replayEvent)}\n\n` })
+        }
+      }
       fixture.aStreamCount += 1
       const count = fixture.aStreamCount
       // Keep each lifecycle state visible long enough for the browser assertion to observe it.
@@ -207,15 +237,32 @@ async function installSupervisorFixture(page: Page) {
 test('real page mounts the shared timeline, supervisor tree, and isolated session evidence', async ({ page }, testInfo) => {
   const fixture = await installSupervisorFixture(page)
   const consoleErrors: string[] = []
+  const submissionRequests: string[] = []
+  page.on('request', request => {
+    const url = new URL(request.url())
+    if (/^\/api\/jobs\/[^/]+\/apply$/.test(url.pathname)) submissionRequests.push(url.pathname)
+  })
   page.on('pageerror', error => consoleErrors.push(`pageerror: ${error.stack ?? error.message}`))
   page.on('console', message => {
     if (message.type() === 'error') consoleErrors.push(`console: ${message.text()}`)
   })
   const isZh = testInfo.project.name.includes('zh')
-  await page.goto(`/agent-preview?supervisor=1&locale=${isZh ? 'zh' : 'en'}&sessionId=${SESSION_A}`)
+  await page.goto(`/agent-preview?supervisor=1&applicationReview=1&locale=${isZh ? 'zh' : 'en'}&sessionId=${SESSION_A}`)
 
   const supervisor = page.locator('[data-agent-supervisor-panel]')
   await expect(supervisor).toBeVisible({ timeout: 20_000 })
+  const liveStream = page.locator('.agent-live-stream-body')
+  await expect(liveStream).toContainText(isZh ? '申请队列' : 'Application queue')
+  await expect(liveStream).toContainText('Fixture Robotics')
+  await expect(liveStream).toContainText('Backend Engineer')
+  const reviewLetterButton = liveStream.getByRole('button', { name: isZh ? /查看求职信/ : /View cover letter/ })
+  await expect(reviewLetterButton).toBeVisible()
+  await reviewLetterButton.click()
+  await expect(liveStream).toContainText('Fixture cover letter for review only. No application will be submitted.')
+  const applyNowButton = liveStream.getByRole('button', { name: isZh ? /立即投递/ : /Apply now/ })
+  await expect(applyNowButton).toBeVisible()
+  await expect(applyNowButton).toBeEnabled()
+  expect(submissionRequests).toEqual([])
   await expect(page.locator('[data-agent-harness-item="fixture-item-a"]')).toBeVisible()
   await expect(page.locator('[data-agent-harness-item="fixture-item-a"]')).toHaveCount(1)
   const labels = isZh
@@ -269,6 +316,18 @@ test('real page mounts the shared timeline, supervisor tree, and isolated sessio
   await expect(page.locator('[data-agent-supervisor-selection]')).toContainText('jobs.search')
   await expect(page.locator('[data-agent-harness-item="fixture-tool-a"]')).toBeVisible()
   await expect(page.locator('[data-agent-harness-item="fixture-tool-a"]')).toHaveCount(1)
+  await page.evaluate(() => fetch('/__agent_fixture__/replay', { method: 'POST' }))
+  await expect.poll(() => fixture.replayRequestsAfterSequence.length).toBe(2)
+  expect(fixture.replayDuplicateSent).toBe(true)
+  expect(fixture.replaySequence).not.toBeNull()
+  expect(fixture.replayRequestsAfterSequence[1]).toBe(fixture.replaySequence)
+  await expect(page.locator('[data-agent-supervisor-connection]')).toContainText(labels.connection)
+  await expect(childTaskNode).toContainText(labels.done)
+  await expect(stepNode).toContainText(labels.running)
+  await expect(page.locator('[data-agent-supervisor-selection]')).toBeVisible()
+  await expect(page.locator('[data-agent-supervisor-selection]')).toContainText('jobs.search')
+  await expect(page.locator('[data-agent-harness-item="fixture-tool-a"]')).toHaveCount(1)
+  await expect(page.locator('[data-agent-harness-item="fixture-tool-a"]')).toContainText('Selected tool evidence survived the disconnect.')
   await expect.poll(async () => page.evaluate(() => {
     const item = document.querySelector<HTMLElement>('[data-agent-harness-item="fixture-tool-a"]')
     const streamBody = document.querySelector<HTMLElement>('.agent-live-stream-body')
@@ -295,6 +354,7 @@ test('real page mounts the shared timeline, supervisor tree, and isolated sessio
     expect(mobileLayout.panelHeight).toBeLessThanOrEqual(mobileLayout.viewportHeight * 0.5)
   }
   await expect(page.locator('body')).not.toContainText('A late old-session event must stay discarded')
+  expect(submissionRequests).toEqual([])
   expect(consoleErrors).toEqual([])
 
   const artifactDir = path.join(process.cwd(), 'apps', 'web', 'tests', 'e2e', '__artifacts__')
