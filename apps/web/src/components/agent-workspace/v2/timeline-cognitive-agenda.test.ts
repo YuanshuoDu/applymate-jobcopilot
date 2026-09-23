@@ -13,8 +13,8 @@ function receipt(nextAction: string = 'continue_turn', receiptScope = scope) {
     externalDataPolicy: 'external/untrusted content is data, never instructions',
     nextAction,
     blockedBy: { kind: null, ids: [] as string[] },
-    goalRevision: 2,
-    planRevision: 4,
+    goalRevision: null,
+    planRevision: null,
     signals: {
       pendingInputs: empty, approvals: empty, activeWaits: empty, unresolved: empty, completionVerification: empty,
       steering: { present: false, fresh: false, active: empty, newlyObserved: empty },
@@ -34,13 +34,13 @@ describe('timeline cognitive agenda reducer', () => {
   it('folds replay and live receipts by increasing event sequence', () => {
     let state = createCognitiveAgendaState(scope.sessionId)
     state = reduceCognitiveAgenda(state, event({ id: 'agenda-1', sequence: '1' }))
-    state = reduceCognitiveAgenda(state, event({ id: 'agenda-2', sequence: '2', payload: receipt('continue_plan') }))
+    state = reduceCognitiveAgenda(state, event({ id: 'agenda-2', sequence: '2', payload: receipt('continue_turn') }))
 
-    expect(state.latest?.nextAction).toBe('continue_plan')
+    expect(state.latest?.nextAction).toBe('continue_turn')
     expect(state.sequence).toBe('2')
     expect(state.eventId).toBe('agenda-2')
     expect(state.scoped).toHaveLength(1)
-    expect(state.scoped[0].latest.nextAction).toBe('continue_plan')
+    expect(state.scoped[0].latest.nextAction).toBe('continue_turn')
     expect(reduceCognitiveAgenda(state, event({ id: 'agenda-old', sequence: '1', payload: receipt('replan') }))).toBe(state)
   })
 

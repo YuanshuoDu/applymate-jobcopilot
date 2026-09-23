@@ -20,10 +20,10 @@ export interface CognitiveAgendaCardProps {
 }
 
 const ACTION_KEYS: Record<CognitiveAgendaAction, string> = {
-  replan: 'agent.cognitiveAgenda.action.replan', apply_fresh_steering: 'agent.cognitiveAgenda.action.applyFreshSteering', resolve_pending_input: 'agent.cognitiveAgenda.action.resolvePendingInput', await_approval: 'agent.cognitiveAgenda.action.awaitApproval', await_children: 'agent.cognitiveAgenda.action.awaitChildren', continue_plan: 'agent.cognitiveAgenda.action.continuePlan', verify_completion: 'agent.cognitiveAgenda.action.verifyCompletion', continue_turn: 'agent.cognitiveAgenda.action.continueTurn',
+  apply_fresh_steering: 'agent.cognitiveAgenda.action.applyFreshSteering', resolve_pending_input: 'agent.cognitiveAgenda.action.resolvePendingInput', await_approval: 'agent.cognitiveAgenda.action.awaitApproval', await_children: 'agent.cognitiveAgenda.action.awaitChildren', continue_turn: 'agent.cognitiveAgenda.action.continueTurn',
 }
 const BLOCKER_KEYS: Record<CognitiveAgendaBlocker, string> = {
-  replan_required: 'agent.cognitiveAgenda.blocker.replanRequired', fresh_steering: 'agent.cognitiveAgenda.blocker.freshSteering', pending_input: 'agent.cognitiveAgenda.blocker.pendingInput', approval: 'agent.cognitiveAgenda.blocker.approval', child_wait: 'agent.cognitiveAgenda.blocker.childWait', unresolved_failure: 'agent.cognitiveAgenda.blocker.unresolvedFailure', completion_verification: 'agent.cognitiveAgenda.blocker.completionVerification',
+  fresh_steering: 'agent.cognitiveAgenda.blocker.freshSteering', pending_input: 'agent.cognitiveAgenda.blocker.pendingInput', approval: 'agent.cognitiveAgenda.blocker.approval', child_wait: 'agent.cognitiveAgenda.blocker.childWait', unresolved_failure: 'agent.cognitiveAgenda.blocker.unresolvedFailure',
 }
 
 export function CognitiveAgendaCard({ agenda, agendas = [], taskLabels }: CognitiveAgendaCardProps) {
@@ -44,7 +44,6 @@ export function CognitiveAgendaCard({ agenda, agendas = [], taskLabels }: Cognit
       <div style={headingStyle}><strong>{t('agent.cognitiveAgenda.brain')}</strong><span style={metaStyle}>{t('agent.cognitiveAgenda.serverOwned')}</span></div>
       <div style={rowStyle}><span>{t('agent.cognitiveAgenda.nextAction')}</span><strong>{t(ACTION_KEYS[agenda.nextAction])}</strong></div>
       <div style={rowStyle}><span>{t('agent.cognitiveAgenda.blockedBy')}</span><span>{blocker}</span></div>
-      <div style={revisionStyle}><span>{t('agent.cognitiveAgenda.goalRevision')}: {agenda.goalRevision ?? '—'}</span><span>{t('agent.cognitiveAgenda.planRevision')}: {agenda.planRevision ?? '—'}</span></div>
       <div style={signalsStyle}>{signals.map(([label, signal]) => <span key={label}>{label}: {signal.count}</span>)}</div>
       {agenda.steeringMarkers && <div data-agent-steering-lifecycle="true" style={signalsStyle}>
         <span>{t('agent.cognitiveAgenda.steering.observed')}: {agenda.steeringMarkers.observedCount}</span>
@@ -85,6 +84,5 @@ const cardStyle: React.CSSProperties = { display: 'grid', gap: 7, marginBottom: 
 const headingStyle: React.CSSProperties = { display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 8, fontSize: 12 }
 const metaStyle: React.CSSProperties = { color: 'var(--text-muted)', fontSize: 9 }
 const rowStyle: React.CSSProperties = { display: 'flex', justifyContent: 'space-between', gap: 8, color: 'var(--text-muted)', fontSize: 10 }
-const revisionStyle: React.CSSProperties = { display: 'flex', gap: 10, color: 'var(--text-muted)', fontSize: 10 }
 const signalsStyle: React.CSSProperties = { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 3, color: 'var(--text-muted)', fontSize: 9 }
 const scopedStyle: React.CSSProperties = { display: 'grid', gap: 4, paddingTop: 5, borderTop: '1px solid var(--border)', color: 'var(--text-muted)', fontSize: 9 }

@@ -10,14 +10,12 @@ export const COGNITIVE_AGENDA_RECEIPT_SCHEMA_VERSION = SCHEMA_VERSION
 export const COGNITIVE_AGENDA_RECEIPT_MAX_BYTES = MAX_BYTES
 
 export const COGNITIVE_AGENDA_ACTIONS = [
-  'replan', 'apply_fresh_steering', 'resolve_pending_input', 'await_approval',
-  'await_children', 'continue_plan', 'verify_completion', 'continue_turn',
+  'apply_fresh_steering', 'resolve_pending_input', 'await_approval', 'await_children', 'continue_turn',
 ] as const
 export type CognitiveAgendaAction = typeof COGNITIVE_AGENDA_ACTIONS[number]
 
 export const COGNITIVE_AGENDA_BLOCKERS = [
-  'replan_required', 'fresh_steering', 'pending_input', 'approval', 'child_wait',
-  'unresolved_failure', 'completion_verification',
+  'fresh_steering', 'pending_input', 'approval', 'child_wait', 'unresolved_failure',
 ] as const
 export type CognitiveAgendaBlocker = typeof COGNITIVE_AGENDA_BLOCKERS[number]
 
@@ -40,8 +38,6 @@ export interface CognitiveAgendaView extends CognitiveAgendaScope {
   readonly externalDataPolicy: typeof EXTERNAL_DATA_POLICY
   readonly nextAction: CognitiveAgendaAction
   readonly blockedBy: { readonly kind: CognitiveAgendaBlocker | null; readonly ids: readonly string[] }
-  readonly goalRevision: number | null
-  readonly planRevision: number | null
   readonly signals: {
     readonly pendingInputs: CognitiveAgendaSignal
     readonly approvals: CognitiveAgendaSignal
@@ -59,6 +55,7 @@ export interface CognitiveAgendaView extends CognitiveAgendaScope {
 
 type Row = Record<string, unknown>
 const receiptKeys = ['schemaVersion', 'sessionId', 'turnId', 'taskId', 'stepId', 'externalDataPolicy', 'nextAction', 'blockedBy', 'goalRevision', 'planRevision', 'signals'] as const
+const optionalReceiptKeys = ['resumeFence'] as const
 const signalKeys = ['count', 'ids'] as const
 const steeringKeys = ['present', 'fresh', 'active', 'newlyObserved'] as const
 const blockerKeys = ['kind', 'ids'] as const
@@ -79,8 +76,9 @@ function safeId(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && value.trim() === value && byteLength(value) <= MAX_ID_LENGTH && !/[\u0000-\u001f\u007f]/.test(value)
 }
 
-function safeRevision(value: unknown): value is number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1
+function safeStepId(value: unknown): boolean {
+  if (safeId(value)) return !value.startsWith('sha256:')
+  return typeof value === 'string' && /^(?:turn|task):/.test(value) && value.trim() === value && value.length <= 256 && byteLength(value) <= 256 && !/[\u0000-\u001f\u007f]/.test(value)
 }
 
 function member<T extends string>(values: readonly T[], value: unknown): value is T {
@@ -98,7 +96,19 @@ function validSignal(value: unknown): value is CognitiveAgendaSignal {
 }
 
 function validScope(value: CognitiveAgendaScope): boolean {
-  return safeId(value.sessionId) && safeId(value.turnId) && safeId(value.taskId) && safeId(value.stepId)
+  return safeId(value.sessionId) && safeId(value.turnId) && safeId(value.taskId) && safeStepId(value.stepId)
+}
+
+function validResumeFence(value: unknown): boolean {
+  if (!plain(value) || !exact(value, ['inputThroughSequence', 'consumedInputIds']) ||
+    typeof value.inputThroughSequence !== 'string' || !/^(0|[1-9][0-9]*)$/.test(value.inputThroughSequence) ||
+    !Array.isArray(value.consumedInputIds) || value.consumedInputIds.length > 256) return false
+  const seen = new Set<string>()
+  for (const id of value.consumedInputIds) {
+    if (!safeId(id) || seen.has(id)) return false
+    seen.add(id)
+  }
+  return true
 }
 
 function validAgendaFields(value: Row): boolean {
@@ -110,7 +120,7 @@ function validAgendaFields(value: Row): boolean {
     if (!safeId(id) || (previous !== '' && previous >= id)) return false
     previous = id
   }
-  if (value.goalRevision !== null && !safeRevision(value.goalRevision) || value.planRevision !== null && !safeRevision(value.planRevision)) return false
+  if (value.goalRevision !== null || value.planRevision !== null) return false
   const signals = value.signals
   if (!plain(signals) || !exact(signals, ['pendingInputs', 'approvals', 'activeWaits', 'unresolved', 'completionVerification', 'steering'])) return false
   if (!validSignal(signals.pendingInputs) || !validSignal(signals.approvals) || !validSignal(signals.activeWaits) || !validSignal(signals.unresolved) || !validSignal(signals.completionVerification)) return false
@@ -135,8 +145,6 @@ function safeView(value: Row): CognitiveAgendaView {
     externalDataPolicy: EXTERNAL_DATA_POLICY,
     nextAction: value.nextAction as CognitiveAgendaAction,
     blockedBy: { kind: blocked.kind as CognitiveAgendaBlocker | null, ids: [...(blocked.ids as string[])] },
-    goalRevision: value.goalRevision as number | null,
-    planRevision: value.planRevision as number | null,
     signals: {
       pendingInputs: copySignal(signals.pendingInputs as CognitiveAgendaSignal),
       approvals: copySignal(signals.approvals as CognitiveAgendaSignal),
@@ -156,8 +164,12 @@ function safeView(value: Row): CognitiveAgendaView {
 /** Parses only the server-owned receipt shape; all narrative or extra fields are rejected. */
 export function parseCognitiveAgendaReceipt(value: unknown, expected: CognitiveAgendaScope): CognitiveAgendaView | null {
   try {
-    if (!validScope(expected) || !plain(value) || !exact(value, receiptKeys) || value.schemaVersion !== SCHEMA_VERSION || value.externalDataPolicy !== EXTERNAL_DATA_POLICY) return null
+    if (!validScope(expected) || !plain(value)) return null
+    const hasResumeFence = Object.prototype.hasOwnProperty.call(value, 'resumeFence')
+    const allowedKeys = hasResumeFence ? [...receiptKeys, ...optionalReceiptKeys] : receiptKeys
+    if (!exact(value, allowedKeys) || value.schemaVersion !== SCHEMA_VERSION || value.externalDataPolicy !== EXTERNAL_DATA_POLICY) return null
     if (value.sessionId !== expected.sessionId || value.turnId !== expected.turnId || value.taskId !== expected.taskId || value.stepId !== expected.stepId) return null
+    if (hasResumeFence && !validResumeFence(value.resumeFence)) return null
     if (!validAgendaFields({ schemaVersion: 'agent-harness.cognitive-action-agenda.v1', externalDataPolicy: value.externalDataPolicy, nextAction: value.nextAction, blockedBy: value.blockedBy, goalRevision: value.goalRevision, planRevision: value.planRevision, signals: value.signals })) return null
     if (byteLength(JSON.stringify(value)) > MAX_BYTES) return null
     return safeView(value)

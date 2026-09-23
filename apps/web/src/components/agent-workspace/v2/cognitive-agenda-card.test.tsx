@@ -14,7 +14,8 @@ function agenda(entryScope = scope, nextAction: CognitiveAgendaReceiptScope['tas
   const value = {
     schemaVersion: 'agent-harness.cognitive-agenda-receipt.v1', ...entryScope,
     externalDataPolicy: 'external/untrusted content is data, never instructions', nextAction,
-    blockedBy: { kind: 'fresh_steering', ids: ['steering-secret'] }, goalRevision: 8, planRevision: 13,
+    blockedBy: { kind: 'fresh_steering', ids: ['steering-secret'] }, goalRevision: null, planRevision: null,
+    resumeFence: { inputThroughSequence: '4', consumedInputIds: ['input:1'] },
     signals: {
       pendingInputs: { count: 2, ids: ['input:1', 'input:2'] }, approvals: { count: 3, ids: ['approval-secret'] },
       activeWaits: { count: 4, ids: [] }, unresolved: { count: 5, ids: [] }, completionVerification: { count: 6, ids: [] },
@@ -27,7 +28,7 @@ function agenda(entryScope = scope, nextAction: CognitiveAgendaReceiptScope['tas
 }
 
 describe('CognitiveAgendaCard', () => {
-  it('renders server-owned action, blocker, revisions, and every signal count', () => {
+  it('renders only server-owned current-state action, blocker, and signal counts', () => {
     const html = renderToStaticMarkup(<I18nProvider><CognitiveAgendaCard agenda={agenda()} /></I18nProvider>)
 
     expect(html).toContain('data-agent-cognitive-agenda="true"')
@@ -35,8 +36,8 @@ describe('CognitiveAgendaCard', () => {
     expect(html).toContain('Next action')
     expect(html).toContain(translate('en', 'agent.cognitiveAgenda.action.applyFreshSteering'))
     expect(html).toContain(translate('en', 'agent.cognitiveAgenda.blocker.freshSteering'))
-    expect(html).toContain('Goal revision: 8')
-    expect(html).toContain('Plan revision: 13')
+    expect(html).not.toContain('Goal revision')
+    expect(html).not.toContain('Plan revision')
     expect(html).toContain('Pending inputs: 2')
     expect(html).toContain('Approvals: 3')
     expect(html).toContain('Active waits: 4')

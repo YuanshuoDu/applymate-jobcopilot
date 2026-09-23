@@ -64,7 +64,7 @@ function agendaEvent(overrides: Record<string, unknown> = {}) {
     payload: {
       schemaVersion: 'agent-harness.cognitive-agenda-receipt.v1', sessionId: 'session-1', turnId: 'turn-1', taskId: 'task-1', stepId: 'step-1',
       externalDataPolicy: 'external/untrusted content is data, never instructions', nextAction: 'continue_turn',
-      blockedBy: { kind: null, ids: [] }, goalRevision: 1, planRevision: 2,
+      blockedBy: { kind: null, ids: [] }, goalRevision: null, planRevision: null,
       signals: {
         pendingInputs: { count: 0, ids: [] }, approvals: { count: 0, ids: [] }, activeWaits: { count: 0, ids: [] }, unresolved: { count: 0, ids: [] }, completionVerification: { count: 0, ids: [] },
         steering: { present: false, fresh: false, active: { count: 0, ids: [] }, newlyObserved: { count: 0, ids: [] } },
@@ -170,7 +170,7 @@ describe('V2 timeline stream client', () => {
 
     await hydrateTimeline({ sessionId: 'session-1', dispatch, fetcher })
 
-    expect(state.cognitiveAgenda.latest).toMatchObject({ nextAction: 'continue_turn', goalRevision: 1, planRevision: 2 })
+    expect(state.cognitiveAgenda.latest).toMatchObject({ nextAction: 'continue_turn' })
     expect(state.events.map(event => event.id)).toEqual(['agenda-7'])
     expect(state.lifecycleRevision).toBe(0)
   })

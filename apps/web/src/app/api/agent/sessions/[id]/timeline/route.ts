@@ -142,15 +142,15 @@ function markerEnvelope(row: SteeringMarkerQueryRow, sessionId: string): Timelin
 function agendaEnvelope(row: AgendaQueryRow, sessionId: string) {
   if (row.sessionId !== sessionId || row.type !== "cognitive.agenda" || row.itemId !== null ||
     (row.actor !== "orchestrator" && row.actor !== "subagent") || !/^\d{1,39}$/.test(row.sequence.toString())) return null
-  const payload = redactStreamValue(row.payload)
-  const rawPayload = isRecord(payload) ? payload : {}
+  const rawPayload = isRecord(row.payload) ? row.payload : {}
   const scope: CognitiveAgendaScope = {
     sessionId: row.sessionId,
     turnId: row.turnId,
     taskId: row.taskId ?? "",
     stepId: typeof rawPayload.stepId === "string" ? rawPayload.stepId : "",
   }
-  if (!parseCognitiveAgendaReceipt(payload, scope)) return null
+  const agenda = parseCognitiveAgendaReceipt(row.payload, scope)
+  if (!agenda) return null
   return {
     schemaVersion: AGENT_STREAM_SCHEMA_VERSION,
     id: row.id,
@@ -164,7 +164,7 @@ function agendaEnvelope(row: AgendaQueryRow, sessionId: string) {
     causationId: row.causationId,
     idempotencyKey: row.idempotencyKey,
     sequence: row.sequence.toString(),
-    payload,
+    payload: redactStreamValue(agenda),
   }
 }
 

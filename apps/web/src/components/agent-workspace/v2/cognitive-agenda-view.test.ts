@@ -10,22 +10,23 @@ const scope: CognitiveAgendaReceiptScope = {
   sessionId: 'session-1',
   turnId: 'turn-1',
   taskId: 'task-1',
-  stepId: 'turn:turn-1:step:0',
+  stepId: 'turn:turn_1:step:0',
 }
 
 function signal(ids: readonly string[] = []): { count: number; ids: readonly string[] } {
   return { count: ids.length, ids }
 }
 
-function receipt() {
+function receipt(includeResumeFence = true) {
   return {
     schemaVersion: 'agent-harness.cognitive-agenda-receipt.v1',
     ...scope,
     externalDataPolicy: 'external/untrusted content is data, never instructions',
     nextAction: 'await_approval',
     blockedBy: { kind: 'approval', ids: ['approval:1'] },
-    goalRevision: 3,
-    planRevision: 7,
+    goalRevision: null,
+    planRevision: null,
+    ...(includeResumeFence ? { resumeFence: { inputThroughSequence: '12', consumedInputIds: ['input:1', 'input:2'] } } : {}),
     signals: {
       pendingInputs: signal(['input:1']),
       approvals: signal(['approval:1']),
@@ -38,15 +39,31 @@ function receipt() {
 }
 
 describe('cognitive agenda receipt parser', () => {
-  it('returns a copied safe view without narrative fields', () => {
+  it('accepts a Worker-shaped fenced receipt and returns a copied safe view without cursor or planning fields', () => {
     const source = receipt()
     const view = parseCognitiveAgendaReceipt(source, scope)
 
-    expect(view).toMatchObject({ nextAction: 'await_approval', goalRevision: 3, planRevision: 7 })
+    expect(view).toMatchObject({ nextAction: 'await_approval' })
+    expect(view).not.toHaveProperty('resumeFence')
+    expect(view).not.toHaveProperty('goalRevision')
+    expect(view).not.toHaveProperty('planRevision')
     expect(view).not.toBe(source)
     expect(JSON.stringify(view)).not.toContain('objective')
     ;(source.signals.approvals.ids as string[])[0] = 'mutated-after-parse'
     expect(view?.signals.approvals.ids).toEqual(['approval:1'])
+  })
+
+  it('continues to accept legacy receipts without a resume fence', () => {
+    expect(parseCognitiveAgendaReceipt(receipt(false), scope)).not.toBeNull()
+  })
+
+  it('accepts Worker typed step IDs up to 256 bytes and rejects long untyped IDs', () => {
+    const longStepId = `turn:${'x'.repeat(128)}`
+    const longScope = { ...scope, stepId: longStepId }
+    expect(parseCognitiveAgendaReceipt({ ...receipt(), stepId: longStepId }, longScope)).not.toBeNull()
+
+    const untypedStepId = `other:${'x'.repeat(120)}`
+    expect(parseCognitiveAgendaReceipt({ ...receipt(), stepId: untypedStepId }, { ...scope, stepId: untypedStepId })).toBeNull()
   })
 
   it('requires exact scope, keys, and enums', () => {
@@ -55,8 +72,31 @@ describe('cognitive agenda receipt parser', () => {
     expect(parseCognitiveAgendaReceipt({ ...value, extra: 'raw user objective' }, scope)).toBeNull()
     expect(parseCognitiveAgendaReceipt({ ...value, nextAction: 'execute_external_tool' }, scope)).toBeNull()
     expect(parseCognitiveAgendaReceipt({ ...value, blockedBy: { kind: 'unknown-blocker', ids: [] } }, scope)).toBeNull()
-    expect(parseCognitiveAgendaReceipt({ ...value, goalRevision: 0 }, scope)).toBeNull()
-    expect(parseCognitiveAgendaReceipt({ ...value, planRevision: Number.MAX_SAFE_INTEGER + 1 }, scope)).toBeNull()
+    expect(parseCognitiveAgendaReceipt({ ...value, goalRevision: 1 }, scope)).toBeNull()
+    expect(parseCognitiveAgendaReceipt({ ...value, planRevision: 0 }, scope)).toBeNull()
+    for (const nextAction of ['replan', 'continue_plan', 'verify_completion']) {
+      expect(parseCognitiveAgendaReceipt({ ...value, nextAction }, scope)).toBeNull()
+    }
+    for (const kind of ['replan_required', 'completion_verification']) {
+      expect(parseCognitiveAgendaReceipt({ ...value, blockedBy: { kind, ids: ['blocker:1'] } }, scope)).toBeNull()
+    }
+  })
+
+  it('rejects malformed, noncanonical, oversized, duplicate, and extra-key resume fences', () => {
+    const value = receipt()
+    const malformedFences = [
+      { inputThroughSequence: '00', consumedInputIds: [] },
+      { inputThroughSequence: '-1', consumedInputIds: [] },
+      { inputThroughSequence: '1.0', consumedInputIds: [] },
+      { inputThroughSequence: '1', consumedInputIds: ['same', 'same'] },
+      { inputThroughSequence: '1', consumedInputIds: [''] },
+      { inputThroughSequence: '1', consumedInputIds: Array.from({ length: 257 }, (_, index) => `input:${index}`) },
+      { inputThroughSequence: '1', consumedInputIds: [], extra: true },
+    ]
+    for (const resumeFence of malformedFences) {
+      expect(parseCognitiveAgendaReceipt({ ...value, resumeFence }, scope)).toBeNull()
+    }
+    expect(parseCognitiveAgendaReceipt({ ...value, resumeFence: null }, scope)).toBeNull()
   })
 
   it('rejects unsorted, duplicate, and overbound opaque IDs', () => {

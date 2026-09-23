@@ -42,11 +42,15 @@ Web remains the authenticated control plane. Worker owns long-running model and 
 7. Conversation and supervisor use one timeline subscription. Session switches and reconnects cannot apply stale session data; existing application review remains available.
 8. Missing dependencies, invalid model proposals, or ownership loss must stop execution rather than imply permission or successful completion.
 
+The supervisor may display a bounded, server-derived `cognitive.agenda` status receipt on that timeline. It is a readout of current waits, approvals, pending inputs, failures, and steering; this PR does not add a model-facing planning prompt or Plan Ledger. The Web projection validates the receipt and omits Worker-only resume cursors and unsupported plan revision fields.
+
 The root Turn's `maxSteps` and `maxToolCalls` ceilings apply across the root and descendant Tasks. The Worker checks durable step/tool-call records under the session/Turn locks before each new record is persisted. Token and cost usage remain tracked per execution and admitted through the existing user-level usage guard; this integration does not add an aggregate token/cost ledger for a whole Task tree.
 
 ## Persistence changes
 
 This scope includes the additive migrations needed by the accepted execution, recovery, and supervision contracts: private tool-result references and durable waits, tree-budget reservations, child retry eligibility, session control state, and nullable Turn scope on session events. They require migration source and CI/disposable-database evidence only; no shared or production migration was applied.
+
+Session pause/resume events have no Turn owner, so the shared `agent-protocol` event envelope and repository types narrowly permit a null `turnId` for those events. This is the contract prerequisite for the session-control gate and is not a general protocol-version expansion.
 
 Private results bind owner, session, Turn, step, Task, and tool-call identity. Wait records bind an immutable child target set and parent scope to a durable outcome and dispatch intent. Public task and timeline DTOs do not expose these private records.
 

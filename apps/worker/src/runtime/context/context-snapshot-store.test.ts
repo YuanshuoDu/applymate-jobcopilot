@@ -138,11 +138,11 @@ describe("PostgreSQL context snapshot store", () => {
     const store = createPgContextSnapshotStore(poolFor(client))
 
     await expect(store.save(value, scope)).rejects.toMatchObject({ code: "session_not_found" })
-    const sessionLock = client.calls.find((sql) => sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE"))
+    const sessionLock = client.calls.find(sql => sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE"))
     expect(sessionLock).toContain('"status" NOT IN (\'aborted\', \'archived\')')
     expect(sessionLock).toContain("FOR UPDATE")
-    expect(client.calls.some((sql) => sql.startsWith('INSERT INTO "agent_context_snapshots"'))).toBe(false)
-    expect(client.calls.some((sql) => sql.includes('SET "memorySummary"'))).toBe(false)
+    expect(client.calls.some(sql => sql.startsWith('INSERT INTO "agent_context_snapshots"'))).toBe(false)
+    expect(client.calls.some(sql => sql.includes('SET "memorySummary"'))).toBe(false)
     expect(client.calls).toContain("ROLLBACK")
   })
 
@@ -154,8 +154,8 @@ describe("PostgreSQL context snapshot store", () => {
     const client = new FakeClient(value, options)
     const store = createPgContextSnapshotStore(poolFor(client))
     return expect(store.save(value, scope)).rejects.toMatchObject({ code: "session_not_found" }).then(() => {
-      expect(client.calls.some((sql) => sql.startsWith('INSERT INTO "agent_context_snapshots"'))).toBe(false)
-      expect(client.calls.some((sql) => sql.includes('SET "memorySummary"'))).toBe(false)
+      expect(client.calls.some(sql => sql.startsWith('INSERT INTO "agent_context_snapshots"'))).toBe(false)
+      expect(client.calls.some(sql => sql.includes('SET "memorySummary"'))).toBe(false)
       expect(client.calls).toContain("ROLLBACK")
     })
   })

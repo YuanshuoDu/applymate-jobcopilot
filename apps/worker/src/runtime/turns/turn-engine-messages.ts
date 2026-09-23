@@ -2,9 +2,6 @@ import type { HarnessModelRequest, ModelContinuation, ModelMessage } from "@jobc
 import type { ModelCapabilityProfile, ModelAdapter } from "@jobcopilot/agent-model"
 
 import type { StepContext } from "../context/step-context-builder.js"
-import { buildCognitiveActionAgenda, cognitiveActionAgendaText } from "./cognitive-action-agenda.js"
-import { buildCognitiveControlFrame, cognitiveControlFrameText } from "./cognitive-control-frame.js"
-import { buildCognitiveMemoryRecall, cognitiveMemoryRecallText } from "./cognitive-memory-recall.js"
 
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`
@@ -19,12 +16,8 @@ function blockText(block: StepContext["blocks"][number]): string {
   return `[harness context layer=${block.layer} trust=${trust} source=${block.source}]\n${stableJson(block.content)}`
 }
 
-export function contextToModelMessages(context: StepContext, freshSteering = false): ModelMessage[] {
+export function contextToModelMessages(context: StepContext): ModelMessage[] {
   const messages: ModelMessage[] = []
-  messages.push({ role: "system", content: [{ type: "text", text: cognitiveControlFrameText(buildCognitiveControlFrame(context, { freshSteering })) }] })
-  const memoryRecall = buildCognitiveMemoryRecall(context)
-  if (memoryRecall) messages.push({ role: "system", content: [{ type: "text", text: cognitiveMemoryRecallText(memoryRecall) }] })
-  messages.push({ role: "system", content: [{ type: "text", text: cognitiveActionAgendaText(buildCognitiveActionAgenda(context, { freshSteering })) }] })
   for (const block of context.blocks) {
     const observation = block.layer === "tool_observation" ? asToolObservation(block.content) : null
     if (observation) {
@@ -48,7 +41,7 @@ export function contextToModelMessages(context: StepContext, freshSteering = fal
       content: [{ type: "text", text: blockText(block) }],
     })
   }
-  if (context.blocks.length === 0) messages.push({ role: "user", content: [{ type: "text", text: "Continue the Turn according to the harness contract." }] })
+  if (messages.length === 0) messages.push({ role: "user", content: [{ type: "text", text: "Continue the Turn according to the harness contract." }] })
   return messages
 }
 
@@ -102,7 +95,7 @@ export function buildModelRequest(input: {
     schemaVersion: "agent-harness.v2",
     provider: input.model.profile.provider,
     model: input.model.profile.model,
-    messages: contextToModelMessages(input.context, input.freshSteering === true),
+    messages: contextToModelMessages(input.context),
     tools: [...input.tools],
     capabilities: capabilities(input.model.profile),
     ...(input.outputSchema === undefined ? {} : { outputSchema: input.outputSchema }),
