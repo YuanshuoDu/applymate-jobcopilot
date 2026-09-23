@@ -79,6 +79,10 @@ jobs:
         env:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
         run: pnpm --filter @jobcopilot/web exec prisma migrate deploy --schema prisma/schema.prisma
+      - name: Generate Web Prisma client for the Worker usage-route integration
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+        run: pnpm --filter @jobcopilot/web exec prisma generate --schema prisma/schema.prisma
       - name: Build Worker workspace before focused test
         run: pnpm turbo build --filter=@jobcopilot/worker
       - name: Verify durable tool-result persistence and owner isolation
