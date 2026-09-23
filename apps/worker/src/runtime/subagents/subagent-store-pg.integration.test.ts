@@ -125,6 +125,35 @@ async function seedChild(pool: PgPool, tree: TaskTreeFixture, taskId: string, tu
   ])
 }
 
+async function installTestTenantRls(pool: PgPool): Promise<void> {
+  await pool.query(`CREATE OR REPLACE FUNCTION public.app_current_user_id()
+    RETURNS text LANGUAGE sql STABLE
+    AS $$ SELECT NULLIF(current_setting('app.user_id', true), '') $$`)
+  await pool.query(`ALTER TABLE "agent_sessions" ENABLE ROW LEVEL SECURITY`)
+  await pool.query(`ALTER TABLE "agent_turns" ENABLE ROW LEVEL SECURITY`)
+  await pool.query(`ALTER TABLE "sub_agent_tasks" ENABLE ROW LEVEL SECURITY`)
+
+  await pool.query(`DROP POLICY IF EXISTS candidate_agent_session_isolation ON "agent_sessions"`)
+  await pool.query(`CREATE POLICY candidate_agent_session_isolation ON "agent_sessions"
+    USING ("userId" = app_current_user_id()) WITH CHECK ("userId" = app_current_user_id())`)
+  await pool.query(`DROP POLICY IF EXISTS candidate_agent_turn_isolation ON "agent_turns"`)
+  await pool.query(`CREATE POLICY candidate_agent_turn_isolation ON "agent_turns"
+    USING ("userId" = app_current_user_id() AND EXISTS (
+      SELECT 1 FROM "agent_sessions" session
+      WHERE session."id" = "sessionId" AND session."userId" = app_current_user_id()))
+    WITH CHECK ("userId" = app_current_user_id() AND EXISTS (
+      SELECT 1 FROM "agent_sessions" session
+      WHERE session."id" = "sessionId" AND session."userId" = app_current_user_id()))`)
+  await pool.query(`DROP POLICY IF EXISTS candidate_sub_agent_task_isolation ON "sub_agent_tasks"`)
+  await pool.query(`CREATE POLICY candidate_sub_agent_task_isolation ON "sub_agent_tasks"
+    USING (EXISTS (
+      SELECT 1 FROM "agent_sessions" session
+      WHERE session."id" = "sessionId" AND session."userId" = app_current_user_id()))
+    WITH CHECK (EXISTS (
+      SELECT 1 FROM "agent_sessions" session
+      WHERE session."id" = "sessionId" AND session."userId" = app_current_user_id()))`)
+}
+
 async function setRuntimeIdentity(client: PoolClient, userId: string): Promise<void> {
   await client.query(`SET ROLE "${RUNTIME_ROLE}"`)
   await client.query("SELECT set_config('app.user_id', $1, false)", [userId])
@@ -164,7 +193,8 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
     END $$`)
     await adminPool.query(`ALTER ROLE ${RUNTIME_ROLE} NOLOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS`)
     await adminPool.query(`GRANT USAGE ON SCHEMA public TO ${RUNTIME_ROLE}`)
-    await adminPool.query(`GRANT EXECUTE ON FUNCTION app_current_user_id() TO ${RUNTIME_ROLE}`)
+    await installTestTenantRls(adminPool)
+    await adminPool.query(`GRANT EXECUTE ON FUNCTION public.app_current_user_id() TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT SELECT ON "agent_sessions", "agent_turns", "sub_agent_tasks" TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT UPDATE ("status", "leaseOwner", "leaseExpiresAt", "attemptCount", "startedAt", "updatedAt", "result", "failureReason", "nextAttemptAt", "completedAt") ON "sub_agent_tasks" TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT SELECT ON "agent_outbox" TO ${RUNTIME_ROLE}`)
@@ -192,23 +222,27 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
     try {
       await setRuntimeIdentity(roleProbe, userA.userId)
       const result = await roleProbe.query<{
+        tableName: string
         isSuperuser: boolean
         bypassesRls: boolean
         ownsTable: boolean
         tableRlsEnabled: boolean
         rowSecurityActive: boolean
       }>(`SELECT role.rolsuper AS "isSuperuser", role.rolbypassrls AS "bypassesRls",
-          pg_get_userbyid(relation.relowner) = current_user AS "ownsTable", relation.relrowsecurity AS "tableRlsEnabled",
-          row_security_active(relation.oid) AS "rowSecurityActive"
+          relation.relname AS "tableName", pg_get_userbyid(relation.relowner) = current_user AS "ownsTable",
+          relation.relrowsecurity AS "tableRlsEnabled", row_security_active(relation.oid) AS "rowSecurityActive"
         FROM pg_roles role CROSS JOIN pg_class AS relation
-        WHERE role.rolname = current_user AND relation.oid = 'sub_agent_tasks'::regclass`)
-      expect(result.rows[0]).toEqual({
+        WHERE role.rolname = current_user AND relation.oid = ANY(ARRAY[
+          'agent_sessions'::regclass, 'agent_turns'::regclass, 'sub_agent_tasks'::regclass
+        ]) ORDER BY relation.relname`)
+      expect(result.rows).toEqual(["agent_sessions", "agent_turns", "sub_agent_tasks"].map(tableName => ({
+        tableName,
         isSuperuser: false,
         bypassesRls: false,
         ownsTable: false,
         tableRlsEnabled: true,
         rowSecurityActive: true,
-      })
+      })))
     } finally {
       roleProbe.release()
     }
