@@ -204,7 +204,11 @@ describeWithRedis("production Turn dispatch and consumer (real Redis/BullMQ)", (
 
   it("dispatches the durable outbox through production recovery and fences replay after Worker reconstruction", async () => {
     const ids = { turnId: `redis-turn-${randomUUID()}`, sessionId: `redis-session-${randomUUID()}`, userId: `redis-user-${randomUUID()}` }
-    const payload: TurnPayload = { ...ids, ownerId: "redis-integration-worker" }
+    const payload: TurnPayload = {
+      turnId: ids.turnId,
+      sessionId: ids.sessionId,
+      ownerId: "redis-integration-worker",
+    }
     const fixture = createSqlFixture(ids)
     const { persistTurnDispatch, turnJobId } = await import("../runtime/turns/recovery-scanner.js")
     const { startProductionAgentRuntime } = await import("./production-bootstrap.js")
@@ -222,6 +226,7 @@ describeWithRedis("production Turn dispatch and consumer (real Redis/BullMQ)", (
     })
 
     await persistTurnDispatch(fixture.pool as never, payload)
+    expect(Object.keys(fixture.state.outbox!.payload).sort()).toEqual(["ownerId", "sessionId", "turnId"])
     const firstBootstrap = await startProductionAgentRuntime({
       pool: fixture.pool as never,
       createRuntime: async () => makeRuntime() as never,
