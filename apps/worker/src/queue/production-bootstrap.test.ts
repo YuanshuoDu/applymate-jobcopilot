@@ -12,7 +12,6 @@ import { createCoordinationTools } from "../runtime/tools/coordination-tools.js"
 import { createCanonicalPolicy } from "../runtime/policy/canonical-policy.js"
 import { createPgDurableWaitPort } from "../runtime/subagents/durable-wait-store.js"
 import { reconcileDurableWaits, startDurableWaitResolver } from "../runtime/subagents/durable-wait-resolver.js"
-import { consumeDurableWaitOutcomes } from "../runtime/subagents/durable-wait-consumer.js"
 import type { createSubagentQueue } from "./subagent-queue.js"
 import { runTurnJob, type createTurnQueue, type TurnExecutor } from "../runtime/turns/turn-queue.js"
 import type { TurnLease } from "../runtime/turns/lease.js"
@@ -151,12 +150,24 @@ async function compositionRuntime(): Promise<{ runtime: CanonicalTurnRuntime; to
   }
 }
 
-async function coordinationRuntime(input: { workerId?: string; manager: AgentTreeManager; store: CoordinationStore; wait: DurableWaitPort; model: ModelAdapter; stateLoader?: (state: CanonicalTurnState, lease: TurnLease) => CanonicalTurnState | Promise<CanonicalTurnState> }): Promise<{ runtime: CanonicalTurnRuntime; execute: CanonicalTurnRuntime["execute"] }> {
+async function coordinationRuntime(input: { workerId?: string; manager: AgentTreeManager; store: CoordinationStore; wait: DurableWaitPort; model: ModelAdapter; pool?: Parameters<typeof createCanonicalTurnRuntime>[0]; now?: () => Date; consumeWaitOutcomes?: boolean; stateLoader?: (state: CanonicalTurnState, lease: TurnLease) => CanonicalTurnState | Promise<CanonicalTurnState> }): Promise<{ runtime: CanonicalTurnRuntime; execute: CanonicalTurnRuntime["execute"] }> {
   const read: RuntimeToolDefinition = { schemaVersion, name: "fixture.read", version: "1", description: "Read fixture evidence", capabilities: ["read"], inputSchema: Type.Object({}, { additionalProperties: false }), outputSchema: Type.Object({ jobs: Type.Array(Type.Object({ id: Type.String() }, { additionalProperties: false })) }, { additionalProperties: false }), risk: "read", domain: "jobs", idempotency: "read_only", timeoutMs: 1_000, requiredCapabilities: [], execute: async () => ({ jobs: [{ id: "job-fixture" }] }) }
   const registry = new ToolRegistry([read, ...createCoordinationTools({ manager: input.manager, store: input.store, wait: input.wait })])
   const router = new ToolRouter(registry, new ToolLifecycle({ sink: new InMemoryToolLifecycleSink(), references: new InMemoryToolResultReferenceStore() }), createCanonicalPolicy(undefined, true, false))
   const state: CanonicalTurnState = { scope: { userId: "user_fixture" }, goal: "Read fixture state", modelProfileSnapshot: {} as never, toolPolicySnapshot: { role: "orchestrator", capabilities: ["read", "coordination"] }, budgetSnapshot: { limits: { maxSteps: 5 } }, snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] } }
-  const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, { workerId: input.workerId ?? "worker_fixture", manager: input.manager, coordinationEnabled: true, stateLoader: async (_pool, lease) => input.stateLoader ? input.stateLoader(state, lease) : state, modelRuntimeFactory: async () => ({ adapter: input.model, registry: {} as never, candidates: [] }), toolRuntimeFactory: () => ({ registry, router }), rootTaskStore: { ensure: vi.fn(async () => ({ id: "root_fixture" } as never)), finish: vi.fn(async () => undefined) }, turnEngineStoreFactory: () => compositionStore(), contextBuilderFactory: () => new StepContextBuilder({ scope: { userId: "user_fixture" }, withTransaction: async work => work({ getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }), claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }), persistCheckpoint: async () => undefined }) } satisfies InputClaimStore), authorizeUsage: vi.fn(async () => ({ settle: vi.fn(async () => undefined) })) })
+  const runtimeOptions: Parameters<typeof createCanonicalTurnRuntime>[1] = {
+    workerId: input.workerId ?? "worker_fixture", manager: input.manager, coordinationEnabled: true,
+    ...(input.now ? { now: input.now } : {}),
+    ...(input.consumeWaitOutcomes ? { consumeWaitOutcomes: true } : {}),
+    ...(input.stateLoader ? { stateLoader: async (_pool, lease) => input.stateLoader!(state, lease) } : {}),
+    modelRuntimeFactory: async () => ({ adapter: input.model, registry: {} as never, candidates: [] }),
+    toolRuntimeFactory: () => ({ registry, router }),
+    rootTaskStore: { ensure: vi.fn(async () => ({ id: "root_fixture" } as never)), finish: vi.fn(async () => undefined) },
+    turnEngineStoreFactory: () => compositionStore(),
+    contextBuilderFactory: () => new StepContextBuilder({ scope: { userId: "user_fixture" }, withTransaction: async work => work({ getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }), claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }), persistCheckpoint: async () => undefined }) } satisfies InputClaimStore),
+    authorizeUsage: vi.fn(async () => ({ settle: vi.fn(async () => undefined) })),
+  }
+  const runtime = await createCanonicalTurnRuntime(input.pool ?? ({ connect: vi.fn() } as never), runtimeOptions)
   return { runtime, execute: runtime.execute }
 }
 
@@ -191,7 +202,7 @@ function durableCompositionPool(input: {
   const state = {
     session: { id: input.root.sessionId, userId: input.root.userId, status: "running", eventSequence: 40 },
     turn,
-    step: { id: "step_pending", taskId: input.root.id, turnId: input.root.turnId, sessionId: input.root.sessionId, attempt: 1, status: "waiting_for_tool" },
+    step: { id: "step_pending", ordinal: 3, taskId: input.root.id, turnId: input.root.turnId, sessionId: input.root.sessionId, attempt: 1, status: "waiting_for_tool", inputThroughSequence: "0", consumedInputIds: [], inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
     wait: null as DurableCompositionRow | null,
     events: [] as DurableCompositionRow[],
     outbox: [] as DurableCompositionRow[],
@@ -218,6 +229,13 @@ function durableCompositionPool(input: {
       if (sql.includes('SELECT session."id" FROM "agent_sessions"')) {
         return response<T>(state.session.status === "running" ? [{ id: state.session.id }] : [], state.session.status === "running" ? 1 : 0)
       }
+      if (sql.includes('SELECT "id", "sessionId", "userId", "status", "leaseOwnerId"') && sql.includes('FROM "agent_turns" WHERE "id" = $1') && sql.includes("FOR UPDATE")) {
+        const queryNow = params[5] instanceof Date ? params[5] : new Date(String(params[5]))
+        const owned = String(params[0]) === state.turn.id && String(params[1]) === state.turn.sessionId && String(params[2]) === state.turn.userId &&
+          String(params[3]) === state.turn.leaseOwnerId && Number(params[4]) === state.turn.leaseVersion && state.turn.status === "in_progress" &&
+          state.turn.leaseExpiresAt !== null && state.turn.leaseExpiresAt.getTime() > queryNow.getTime()
+        return response<T>(owned ? [{ ...turnRow(), input: { goal: "Read fixture state" }, contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: { role: "orchestrator", capabilities: ["read", "coordination"] }, budgetSnapshot: { limits: { maxSteps: 5 } } }] : [], owned ? 1 : 0)
+      }
       if (sql.includes('SELECT session."id", session."userId", session."status"')) {
         return response<T>(state.session.status === "running" ? [{ ...state.session }] : [], state.session.status === "running" ? 1 : 0)
       }
@@ -243,10 +261,16 @@ function durableCompositionPool(input: {
         return response<T>([])
       }
 
+      if (sql.includes('SELECT MAX("ordinal") AS "maxOrdinal" FROM "agent_steps"')) return response<T>([{ maxOrdinal: state.step.ordinal }])
       if (sql.includes('FROM "agent_steps"')) {
-        if (typeof params[0] === "string") state.step.id = params[0]
+        if (sql.includes('WHERE "id" = $1') && typeof params[0] === "string") state.step.id = params[0]
         return response<T>([{ ...state.step }])
       }
+
+      if (sql.includes('FROM "agent_items" AS item LEFT JOIN')) return response<T>([])
+      if (sql.includes('FROM "agent_items" WHERE')) return response<T>([])
+      if (sql.includes('FROM "agent_inputs"')) return response<T>([])
+      if (sql.includes('FROM "agent_context_snapshots"')) return response<T>([])
 
       if (sql.includes('ANY($1::text[])')) {
         const ids = Array.isArray(params[0]) ? params[0].map(String) : []
@@ -918,32 +942,15 @@ describe("production Worker bootstrap", () => {
 
       const recoveryNow = new Date(now.getTime() + 3_000)
       const restartedManager = new AgentTreeManager(store, { now: () => recoveryNow, clock })
-      let resumeProjection: Awaited<ReturnType<typeof consumeDurableWaitOutcomes>> = []
-      let replayedProjection: Awaited<ReturnType<typeof consumeDurableWaitOutcomes>> = []
-      const resumedLeases: TurnLease[] = []
       const restartedFixture = await coordinationRuntime({
         workerId: "worker_recovery",
         manager: restartedManager,
         store: coordinationStore,
         wait,
         model: resumedModel,
-        stateLoader: async (state, lease) => {
-          resumedLeases.push(lease)
-          const client = await durableFixture.pool.connect()
-          try {
-            await client.query("BEGIN")
-            const turn = { ...durableFixture.state.turn }
-            resumeProjection = [...await consumeDurableWaitOutcomes({ client: client as never, lease, turn, now: recoveryNow })]
-            replayedProjection = [...await consumeDurableWaitOutcomes({ client: client as never, lease, turn, now: recoveryNow })]
-            await client.query("COMMIT")
-          } catch (error: unknown) {
-            await client.query("ROLLBACK").catch(() => undefined)
-            throw error
-          } finally {
-            client.release()
-          }
-          return { ...state, snapshot: { ...state.snapshot, toolObservations: resumeProjection.map(projection => ({ id: projection.id, content: projection.content })) as never } }
-        },
+        pool: durableFixture.pool as never,
+        now: () => recoveryNow,
+        consumeWaitOutcomes: true,
       })
       type RecoveredTurnPayload = Parameters<typeof runTurnJob>[0]["data"]
       const recoveredJobs: Array<{ name: string; data: RecoveredTurnPayload; options?: { jobId?: string; attempts?: number } }> = []
@@ -990,16 +997,16 @@ describe("production Worker bootstrap", () => {
         const recovered = recoveredJobs[0]!
         const resumed = await runTurnJob({ data: recovered.data, attemptsMade: 0 }, { pool: durableFixture.pool as never, execute: resumedExecute!, now: () => recoveryNow, heartbeatMs: 60_000 })
         expect(resumed).toMatchObject({ status: "completed" })
-        expect(resumedLeases).toEqual([expect.objectContaining({ ownerId: "worker_recovery", leaseVersion: 2 })])
         expect(durableFixture.state.wait?.consumedAt).toEqual(recoveryNow)
         expect(durableFixture.state.calls.filter(sql => sql.includes('SET "result" = jsonb_set'))).toHaveLength(1)
-        expect(replayedProjection).toEqual(resumeProjection)
-        expect(resumeProjection).toHaveLength(1)
-        expect(JSON.stringify(resumeProjection[0]?.content)).toContain(`Child ${childA.id} found job-${childA.id}.`)
-        expect(JSON.stringify(resumeProjection[0]?.content)).toContain(`Child ${childB.id} found job-${childB.id}.`)
+        expect(durableFixture.state.calls.some(sql => sql.includes('FROM "agent_turns" WHERE "id" = $1') && sql.includes("FOR UPDATE"))).toBe(true)
+        expect(durableFixture.state.calls.some(sql => sql.includes('FROM "agent_wait_conditions"') && sql.includes('"parentTaskId" = $4') && sql.includes('"status" IN (\'ready\', \'timed_out\')'))).toBe(true)
         expect(durableFixture.state.turn).toMatchObject({ status: "completed", leaseOwnerId: null, leaseVersion: 2 })
-        expect(JSON.stringify(resumeRequests[0]?.messages)).toContain(`Child ${childA.id} found job-${childA.id}.`)
-        expect(JSON.stringify(resumeRequests[0]?.messages)).toContain(`Child ${childB.id} found job-${childB.id}.`)
+        const resumedMessages = JSON.stringify(resumeRequests[0]?.messages).replaceAll('\\"', '"')
+        expect(resumedMessages).toContain(String(durableFixture.state.wait?.id))
+        expect(resumedMessages).toContain('"status":"ready"')
+        expect(resumedMessages).toContain(`Child ${childA.id} found job-${childA.id}.`)
+        expect(resumedMessages).toContain(`Child ${childB.id} found job-${childB.id}.`)
         expect(resumeRequests).toHaveLength(2)
       } finally {
         await restartedBootstrap.close()
