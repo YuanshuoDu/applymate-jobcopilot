@@ -151,7 +151,7 @@ These are local automated results. Real database/RLS execution, actual process r
 
 ## Follow-up sequence
 
-The owner's detailed next-upgrade plan is in [agent-brain-upgrade-plan.md](./agent-brain-upgrade-plan.md). It sequences execution ownership, real child execution and durable waits before dynamic planning, then covers domain tools, long-session context, supervision and acceptance. This supplements the existing roadmap without marking missing capabilities complete.
+The detailed next-upgrade plan is preserved on [the scoped harness follow-up branch](https://github.com/YuanshuoDu/applymate-jobcopilot/blob/codex/ah2-harness-followups/docs/agent-brain-upgrade-plan.md). P3 planning, context compaction and Gmail implementation are outside the current PR #497 scope; the candidate notes below remain historical context and do not claim these capabilities are included in its acceptance evidence.
 
 ### Review checkpoint and execution budget, 2026-09-08
 
