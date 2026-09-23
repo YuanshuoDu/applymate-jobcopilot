@@ -201,8 +201,8 @@ export function createPgTurnEngineStore(pool: TurnEnginePool): TurnEngineStore {
         const result = await client.query<{ id: string; revision: number }>(`INSERT INTO "agent_items"
           ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "content", "startedAt", "updatedAt")
           SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $10 ${guard.sql}
-          AND ($4 IS NULL OR EXISTS (SELECT 1 FROM "agent_steps" AS owner_step
-            WHERE owner_step."id" = $4 AND owner_step."turnId" = $3 AND owner_step."sessionId" = $2
+          AND ($4::text IS NULL OR EXISTS (SELECT 1 FROM "agent_steps" AS owner_step
+            WHERE owner_step."id" = $4::text AND owner_step."turnId" = $3 AND owner_step."sessionId" = $2
               AND owner_step."taskId" = $5 AND owner_step."attempt" = ${stepAttempt}))
           ON CONFLICT ("id") DO NOTHING RETURNING "id", "revision"`, [input.itemId, input.owner.sessionId, input.owner.turnId, input.stepId, input.owner.taskId, input.type, input.status, input.phase, json(input.content), input.now, ...guard.values])
         if (result.rows[0]) return result.rows[0]
