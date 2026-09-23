@@ -57,9 +57,21 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     env:
       AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
       AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+      RUN_AGENT_TURN_REDIS_INTEGRATION: "1"
+      AGENT_TURN_REDIS_TEST_DISPOSABLE: "true"
+      AGENT_TURN_REDIS_TEST_URL: redis://127.0.0.1:6379/15
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -74,6 +86,8 @@ jobs:
         run: pnpm turbo build --filter=@jobcopilot/worker
       - name: Verify durable tool-result persistence and owner isolation
         run: pnpm --filter @jobcopilot/worker test -- src/runtime/tools/tool-result-reference-pg.integration.test.ts
+      - name: Verify production Turn dispatch on disposable Redis/BullMQ
+        run: pnpm --filter @jobcopilot/worker test -- src/queue/production-bootstrap-redis.integration.test.ts
   lockfile:
     name: Lockfile
     runs-on: ubuntu-latest

@@ -3134,3 +3134,11 @@ Focused child-executor, role-result, model-message, and turn-loop tests passed *
 `production-bootstrap.test.ts` now uses a canonical policy fixture and exercises the real four-step root path `spawn_subagent` → `wait_subagents` → `fixture.read` → final. The bootstrap-captured child executor runs through `AgentTreeManager.run`, covering child claim/lease/finish and parent wait closure. Focused validation passed **10/10**; Worker `tsc --noEmit --skipLibCheck` and `git diff --check` passed.
 
 The evidence is limited to an in-memory deterministic fixture. Live PostgreSQL/RLS, Redis/BullMQ delivery, process restart, provider behavior, deployment, and full durable child-parent wake evidence remain unverified. P8-104 remains a candidate.
+
+## 186. P8-121 — Disposable Redis/BullMQ Turn dispatch subgate for #495
+
+**Candidate status/date (2026-09-23):** P8-121 adds a focused AC1/AC3 Worker queue acceptance subgate; formal P0-P7 acceptance remains **1/8 (12.5%)**.
+
+The new integration fixture uses the production startup/bootstrap, Turn queue, and recovery scanner defaults with a deterministic SQL-shaped outbox/lease fixture. It exercises real Redis/BullMQ durable job storage and consumer delivery, closes and reconstructs Worker/bootstrap objects, then redelivers the same session/Turn intent through `recoverTurnQueue`; the terminal lease fence must reject the repeat and the executor must remain single-run. CI supplies a disposable Redis service on loopback DB 15 and sets the explicit integration opt-ins. Local runs without those opt-ins skip safely and never use the ordinary Worker Redis URL.
+
+The local focused invocation skipped its one integration test because no disposable Redis was configured; Worker TypeScript and `git diff --check` passed. The real Redis path remains pending CI execution. The fixture does not prove real PostgreSQL/RLS, OS process crash/restart, cross-host recovery, complete control-plane AC1, provider execution, or production/staging readiness. P8-121 remains a candidate and does not advance formal stage acceptance.
