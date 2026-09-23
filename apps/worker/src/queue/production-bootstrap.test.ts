@@ -10,6 +10,8 @@ import type { TreeBudgetReservation, TreeBudgetReservationStore } from "../runti
 import type { CoordinationStore, CoordinationTaskView, DurableWaitPort } from "../runtime/tools/coordination-types.js"
 import { createCoordinationTools } from "../runtime/tools/coordination-tools.js"
 import { createCanonicalPolicy } from "../runtime/policy/canonical-policy.js"
+import { PLAN_PROPOSAL_SCHEMA_VERSION } from "../runtime/planning/goal-plan-contract.js"
+import { createPlanProposalTool } from "../runtime/planning/plan-proposal-tool.js"
 import { createPgDurableWaitPort } from "../runtime/subagents/durable-wait-store.js"
 import { reconcileDurableWaits, startDurableWaitResolver } from "../runtime/subagents/durable-wait-resolver.js"
 import type { createSubagentQueue } from "./subagent-queue.js"
@@ -70,6 +72,10 @@ function compositionStore(
     appendEvent: async ({ id, type, payload }) => {
       persistedEvents.push({ type, payload })
       return { id }
+    },
+    appendEvents: async inputs => {
+      for (const { type, payload } of inputs) persistedEvents.push({ type, payload })
+      return inputs.map(({ id }) => ({ id }))
     },
     recordFinalResponse: async () => undefined,
   }
@@ -718,6 +724,152 @@ describe("production Worker bootstrap", () => {
     expect(composedFixture.persistedEvents.some(event => event.type === "tool_call.completed" && JSON.stringify(event.payload).includes("fixture-call"))).toBe(true)
     await bootstrap.close()
     expect(composedFixture.manager.shutdown).toHaveBeenCalledOnce()
+  })
+
+  it("executes a model-proposed plan through production startup and continues on the next model step with bounded runtime evidence", async () => {
+    const goalContract = {
+      revision: 1, objective: "Read a bounded fixture result", constraints: [], successCriteria: [],
+      knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "fixture-budget",
+    }
+    const proposal = {
+      schemaVersion: PLAN_PROPOSAL_SCHEMA_VERSION, basedOnGoalRevision: 1, basedOnPlanRevision: null,
+      nodes: [
+        { localId: "search", kind: "use_tool", objective: "Read fixture evidence", inputRefs: [], dependsOn: [], successCriteria: ["Return fixture evidence"], outputSchemaRef: null, toolName: "jobs.search" },
+        { localId: "finish", kind: "propose_completion", objective: "Finish after reading the result", inputRefs: [], dependsOn: ["search"], successCriteria: ["The read completed"], outputSchemaRef: null },
+      ],
+      completionCriteria: ["Read the fixture result"], briefRationale: "One deterministic read is sufficient.",
+    }
+    const boundedEvidence = "bounded-fixture-evidence-".repeat(280)
+    const executedContexts: Array<{ scopeUserId: string; sessionId: string; turnId: string; taskId: string | null; rootTaskId: string | null; commandId: string | null }> = []
+    const jobsSearch: RuntimeToolDefinition = {
+      schemaVersion, name: "jobs.search", version: "1", description: "Read deterministic fixture evidence",
+      capabilities: ["read"] as const, inputSchema: Type.Object({}, { additionalProperties: false }),
+      outputSchema: Type.Object({ evidence: Type.String({ maxLength: 7_000 }), runtimeTaskId: Type.String(), runtimeCommandId: Type.String() }, { additionalProperties: false }),
+      risk: "read" as const, domain: "jobs" as const, idempotency: "read_only" as const, timeoutMs: 1_000, requiredCapabilities: [] as const,
+      execute: async context => {
+        executedContexts.push({ scopeUserId: context.scope.userId, sessionId: context.sessionId, turnId: context.turnId, taskId: context.taskId ?? null, rootTaskId: context.rootTaskId ?? null, commandId: context.toolCallId ?? null })
+        return { evidence: boundedEvidence, runtimeTaskId: context.taskId ?? "", runtimeCommandId: context.toolCallId ?? "" }
+      },
+    }
+    const planner = createPlanProposalTool({
+      goal: goalContract, allowedTools: ["jobs.search"], allowedTemplates: [], allowedRoles: [],
+      allowedPlanActions: ["use_tool", "propose_completion"], maxNodes: 8,
+    })
+    const registry = new ToolRegistry([jobsSearch, planner as unknown as RuntimeToolDefinition])
+    const validatedArguments: Array<{ name: string; input: unknown; version?: string }> = []
+    vi.spyOn(registry, "validateArguments").mockImplementation((name, input, version) => {
+      validatedArguments.push({ name, input, ...(version === undefined ? {} : { version }) })
+      return ToolRegistry.prototype.validateArguments.call(registry, name, input, version)
+    })
+    const lifecycle = new InMemoryToolLifecycleSink()
+    const requests: HarnessModelRequest[] = []
+    const model: ModelAdapter = {
+      id: "fixture-planner-model",
+      profile: {
+        provider: "fixture", model: "fixture-planner", nativeTools: true, structuredOutput: true, streaming: true,
+        continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false,
+        supportsReasoningSummary: false, supportsResponseContinuation: false, supportsProviderConversation: false,
+        supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 256, costClass: "low",
+      },
+      async *stream(request: HarnessModelRequest): AsyncIterable<ModelStreamEvent> {
+        requests.push(request)
+        if (requests.length === 1) {
+          yield { type: "tool_call_completed", callId: "proposal-call", name: "agent.plan.propose", arguments: { proposal } }
+          yield { type: "completed", finishReason: "tool_calls" }
+        } else {
+          yield { type: "text_delta", text: "The bounded fixture result was read successfully." }
+          yield { type: "completed", finishReason: "stop" }
+        }
+      },
+    }
+    const persistedItems: Array<{ type: string; status: string; content: unknown }> = []
+    const persistedEvents: Array<{ type: string; payload: unknown }> = []
+    const manager = { shutdown: vi.fn(async () => undefined) } as unknown as AgentTreeManager
+    const state: CanonicalTurnState = {
+      scope: { userId: "user_fixture" }, goal: goalContract.objective, goalContract, modelProfileSnapshot: {} as never,
+      toolPolicySnapshot: { role: "orchestrator", capabilities: ["read"] }, budgetSnapshot: { limits: { maxSteps: 4, maxToolCalls: 4 } },
+      snapshot: { system: [], profile: [], goal: { id: "goal_fixture", content: goalContract.objective }, steerHistory: [], businessRefs: [], toolObservations: [] },
+    }
+    const pool = { connect: vi.fn() }
+    let execute: CanonicalTurnRuntime["execute"] | undefined
+    const bootstrap = await startProductionAgentRuntime({
+      pool,
+      createRuntime: async () => createCanonicalTurnRuntime(pool as never, {
+        workerId: "worker_fixture",
+        productionFlags: {
+          cognitiveLoopEnabled: false, planningEnabled: true, planningExecutionEnabled: true,
+          childExecutionEnabled: false, coordinationEnabled: false, consumeWaitOutcomes: false,
+          contextCompactionEnabled: false, canonicalAutomationEnabled: false,
+        },
+        manager,
+        stateLoader: async () => state,
+        modelRuntimeFactory: async () => ({ adapter: model, registry: {} as never, candidates: [] }),
+        toolRuntimeFactory: ({ policy }) => ({ registry, router: new ToolRouter(registry, new ToolLifecycle({ sink: lifecycle, references: new InMemoryToolResultReferenceStore() }), policy) }),
+        rootTaskStore: { ensure: vi.fn(async () => ({ id: "root_fixture" } as never)), finish: vi.fn(async () => undefined) },
+        turnEngineStoreFactory: () => compositionStore(persistedItems, persistedEvents),
+        contextBuilderFactory: () => {
+          const checkpoints = new Map<string, { inputThroughSequence: bigint; consumedInputIds: readonly string[] }>()
+          const inputStore = {
+            scope: { userId: "user_fixture" },
+            withTransaction: async <T>(work: (transaction: InputClaimTransaction) => Promise<T>): Promise<T> => work({
+              getCheckpoint: async ({ stepId }) => checkpoints.get(stepId) ?? { inputThroughSequence: 0n, consumedInputIds: [] },
+              claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }),
+              persistCheckpoint: async ({ stepId, checkpoint }) => { checkpoints.set(stepId, checkpoint) },
+            }),
+          } satisfies InputClaimStore
+          return new StepContextBuilder(inputStore)
+        },
+        authorizeUsage: vi.fn(async () => ({ settle: vi.fn(async (_input: Parameters<UsageAuthorization["settle"]>[0]) => undefined) })),
+      }),
+      bootstrapOptions: {
+        turnQueueFactory: vi.fn(options => {
+          execute = options.execute
+          return { queue: { add: vi.fn() }, worker: {}, active: { size: 0, values: () => [] }, close: vi.fn(async () => undefined) } as never
+        }) as unknown as Parameters<typeof createProductionWorkerBootstrap>[0]["turnQueueFactory"],
+        turnRecoveryFactory: vi.fn(() => ({ close: vi.fn(async () => undefined) })) as unknown as Parameters<typeof createProductionWorkerBootstrap>[0]["turnRecoveryFactory"],
+      },
+      startAgentRunWorker: vi.fn(),
+    })
+
+    try {
+      if (!execute) throw new Error("production bootstrap did not register its canonical turn executor")
+      const result = await execute({
+        lease: {
+          turnId: "turn_fixture", sessionId: "session_fixture", ownerId: "worker_fixture", userId: "user_fixture", leaseVersion: 1,
+          leaseStartedAt: new Date("2026-09-01T00:00:00.000Z"), leaseExpiresAt: new Date("2026-09-01T00:10:00.000Z"),
+        },
+        signal: new AbortController().signal,
+      })
+
+      expect(result).toMatchObject({ status: "completed" })
+      expect(requests).toHaveLength(2)
+      expect(validatedArguments).toContainEqual({ name: "agent.plan.propose", input: { proposal }, version: "1" })
+      expect(executedContexts).toEqual([{
+        scopeUserId: "user_fixture", sessionId: "session_fixture", turnId: "turn_fixture",
+        taskId: "root_fixture", rootTaskId: "root_fixture", commandId: "plan-call:proposal-call:search",
+      }])
+      const taskGraphEvents = persistedEvents.filter(event => event.type === "plan.task_graph").map(event => event.payload as { runKey: string; event: { type: string; nodeId: string } })
+      expect(taskGraphEvents.map(value => `${value.runKey}:${value.event.nodeId}:${value.event.type}`)).toEqual([
+        "root_fixture:proposal-call:1:search:start",
+        "root_fixture:proposal-call:1:search:complete",
+        "root_fixture:proposal-call:1:finish:start",
+        "root_fixture:proposal-call:1:finish:wait",
+      ])
+      const resultObservation = persistedEvents.find(event => event.type === "plan.observation" && (event.payload as { observationId?: string }).observationId === "plan-result:proposal-call:search")
+      expect(resultObservation).toBeDefined()
+      const observationPayload = resultObservation!.payload as { content: unknown }
+      expect(new TextEncoder().encode(JSON.stringify(observationPayload.content)).byteLength).toBeLessThanOrEqual(8 * 1024)
+      const resumedMessages = JSON.stringify(requests[1]?.messages)
+      expect(resumedMessages).toContain("plan_command")
+      expect(resumedMessages).toContain("bounded-fixture-evidence")
+      expect(resumedMessages).toContain("root_fixture")
+      expect(resumedMessages).toContain("plan-call:proposal-call:search")
+      expect(resumedMessages).toContain(boundedEvidence)
+      expect(resumedMessages).not.toMatch(/\"(?:lease|leaseOwnerId|leaseVersion|budgetLimit|maxBudget)\"/)
+    } finally {
+      await bootstrap.close()
+    }
+    expect(manager.shutdown).toHaveBeenCalledOnce()
   })
 
   it("fails before starting the run router when enabled child execution is not wired", async () => {
