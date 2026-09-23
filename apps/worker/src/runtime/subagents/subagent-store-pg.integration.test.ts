@@ -345,7 +345,18 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
     const payloads = executionTrees.map((tree, index) => ({ taskId: tree.taskId, sessionId: tree.sessionId, rootTaskId: tree.rootTaskId, ownerId: `pg-production-child-worker-${index + 1}` }))
     try {
       for (const payload of payloads) {
-        await expect(manager.run(payload, executor)).resolves.toMatchObject({ taskId: payload.taskId, status: "completed" })
+        const outcome = await manager.run(payload, executor)
+        const task = await ownerAStore.get(payload.taskId, payload.sessionId)
+        const diagnostic = {
+          taskId: payload.taskId,
+          outcomeStatus: outcome.status,
+          taskStatus: task?.status,
+          failureReason: task?.failureReason,
+          attemptCount: task?.attemptCount,
+          modelCalls: modelCalls.get(payload.taskId) ?? 0,
+          toolCalls: toolCalls.filter(call => call.startsWith(`${payload.taskId}:`)).length,
+        }
+        expect(outcome, JSON.stringify(diagnostic)).toMatchObject({ taskId: payload.taskId, status: "completed" })
       }
       const storedTasks = await Promise.all(executionTrees.map(tree => ownerAStore.get(tree.taskId, tree.sessionId)))
       expect(storedTasks).toEqual(executionTrees.map(tree => expect.objectContaining({
