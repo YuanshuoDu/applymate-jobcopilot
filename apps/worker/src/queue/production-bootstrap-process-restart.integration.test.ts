@@ -54,6 +54,7 @@ const describeWithServices = databaseUrl && redisUrl ? describe : describe.skip
 
 type FixtureIds = { suffix: string; userId: string; sessionId: string; turnId: string }
 type WorkerChild = ChildProcess & { output: string[]; errors: string[] }
+type ExitWaitContext = { stage: string; pid?: number; requestedSignal?: string; signalAccepted?: boolean; timeoutMs?: number }
 
 const fixturePath = fileURLToPath(new URL("./production-bootstrap-process-restart.fixture.mjs", import.meta.url))
 const workerCwd = fileURLToPath(new URL("../..", import.meta.url))
@@ -98,15 +99,36 @@ async function waitForLine(child: WorkerChild, prefix: string, timeoutMs = 20_00
   throw new Error(`Timed out waiting for ${prefix}; stdout=${child.output.join(" | ")}; stderr=${child.errors.join(" | ")}`)
 }
 
-async function waitForExit(child: WorkerChild, timeoutMs = 10_000): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return
-  let timer: NodeJS.Timeout | undefined
-  try {
-    await Promise.race([
-      new Promise<void>(resolve => child.once("exit", () => resolve())),
-      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("Worker process did not exit")), timeoutMs) }),
-    ])
-  } finally { if (timer) clearTimeout(timer) }
+function exitWaitDiagnostics(child: WorkerChild, context: ExitWaitContext): string {
+  return `stage=${context.stage} pid=${context.pid ?? child.pid ?? "unknown"} killed=${child.killed} requestedSignal=${context.requestedSignal ?? "none"} signalAccepted=${context.signalAccepted ?? "not-recorded"} exitCode=${child.exitCode} signalCode=${child.signalCode} stdout=${child.output.join(" | ")} stderr=${child.errors.join(" | ")}`
+}
+
+function waitForExit(child: WorkerChild, context: ExitWaitContext): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let timer: NodeJS.Timeout | undefined
+    let settled = false
+    const cleanup = () => {
+      if (timer) clearTimeout(timer)
+      child.off("exit", onExit)
+      child.off("error", onError)
+    }
+    const finish = (error?: Error) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      if (error) reject(error)
+      else resolve()
+    }
+    const onExit = () => finish()
+    const onError = (error: Error) => finish(new Error(`${context.stage}: Worker child process error: ${error.message}; ${exitWaitDiagnostics(child, context)}`))
+    child.once("exit", onExit)
+    child.once("error", onError)
+    if (child.exitCode !== null || child.signalCode !== null) {
+      finish()
+      return
+    }
+    timer = setTimeout(() => finish(new Error(`Worker process did not exit; ${exitWaitDiagnostics(child, context)}`)), context.timeoutMs ?? 10_000)
+  })
 }
 
 async function waitForTurnStatus(pool: Pool, turnId: string, status: string, timeoutMs = 20_000): Promise<void> {
@@ -178,7 +200,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     for (const child of [workerOne, workerTwo]) {
       if (!child || child.exitCode !== null || child.signalCode !== null) continue
       child.stdin?.write("shutdown\n")
-      try { await waitForExit(child, 3_000) } catch { child.kill("SIGKILL") }
+      try { await waitForExit(child, { stage: "cleanup-after-shutdown", pid: child.pid, timeoutMs: 3_000 }) } catch { child.kill("SIGKILL") }
     }
     if (turnQueuePaused && turnQueue) {
       await turnQueue.resume().catch(() => undefined)
@@ -258,9 +280,16 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     })
     expect(await turnQueue!.isPaused()).toBe(true)
 
-    workerOne.kill("SIGKILL")
-    await waitForExit(workerOne)
-    expect(workerOne.signalCode).toBe("SIGKILL")
+    if (workerOne.pid === undefined) throw new Error("Worker 1 has no PID at the restart boundary")
+    const workerOnePid = workerOne.pid
+    const workerOneExitContext: ExitWaitContext = { stage: "worker1-after-SIGKILL", pid: workerOnePid, requestedSignal: "SIGKILL" }
+    const workerOneExit = waitForExit(workerOne, workerOneExitContext)
+    const killAccepted = workerOne.kill("SIGKILL")
+    workerOneExitContext.signalAccepted = killAccepted
+    await workerOneExit
+    expect(killAccepted, exitWaitDiagnostics(workerOne, workerOneExitContext)).toBe(true)
+    expect({ pid: workerOne.pid, killed: workerOne.killed, exitCode: workerOne.exitCode, signalCode: workerOne.signalCode })
+      .toEqual({ pid: workerOnePid, killed: true, exitCode: null, signalCode: "SIGKILL" })
     const parkedAfterKill = await pool!.query<{ status: string; leaseOwnerId: string | null; leaseVersion: number }>(
       `SELECT "status", "leaseOwnerId", "leaseVersion" FROM "agent_turns" WHERE "id" = $1`, [ids.turnId],
     )
@@ -270,7 +299,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     turnQueuePaused = false
     expect(await turnQueue!.isPaused()).toBe(false)
     workerTwo = startWorker("resume-parent", ids)
-    expect(workerTwo.pid).not.toBe(workerOne.pid)
+    expect(workerTwo.pid).not.toBe(workerOnePid)
     await waitForLine(workerTwo, "RESUME_CONTEXT_OK")
     await waitForTurnStatus(pool!, ids.turnId, "completed")
 
@@ -349,6 +378,6 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     expect(stable.rows[0]).toEqual(completedSnapshot)
 
     workerTwo.stdin?.write("shutdown\n")
-    await waitForExit(workerTwo)
+    await waitForExit(workerTwo, { stage: "worker2-after-shutdown", pid: workerTwo.pid })
   }, 60_000)
 })
