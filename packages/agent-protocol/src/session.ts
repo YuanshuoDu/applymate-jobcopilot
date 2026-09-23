@@ -18,6 +18,11 @@ export const SessionSourceSchema = Type.Union([
   Type.Literal('system'),
 ])
 
+export const SessionControlGateSchema = Type.Union([
+  Type.Literal('open'),
+  Type.Literal('user_paused'),
+])
+
 export const AgentSessionSchema = Type.Object({
   schemaVersion: SchemaVersionSchema,
   id: IdSchema,
@@ -25,6 +30,9 @@ export const AgentSessionSchema = Type.Object({
   goal: NonEmptyTextSchema,
   status: SessionStatusSchema,
   source: SessionSourceSchema,
+  controlGate: SessionControlGateSchema,
+  controlRevision: Type.Integer({ minimum: 0 }),
+  pausedAt: Type.Union([TimestampSchema, Type.Null()]),
   activeRootTurnId: NullableIdSchema,
   createdAt: TimestampSchema,
   updatedAt: TimestampSchema,
@@ -32,4 +40,5 @@ export const AgentSessionSchema = Type.Object({
 
 export type SessionStatus = Static<typeof SessionStatusSchema>
 export type SessionSource = Static<typeof SessionSourceSchema>
+export type SessionControlGate = Static<typeof SessionControlGateSchema>
 export type AgentSession = Static<typeof AgentSessionSchema>

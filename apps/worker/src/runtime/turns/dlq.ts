@@ -6,15 +6,17 @@ import { TurnLeaseError, type LeasePool, type TurnJobPayload } from "./lease.js"
 
 export const TURN_MAX_ATTEMPTS = 5
 export const TURN_DLQ_TOPIC = "agent.turn.dlq"
+export const COGNITIVE_AGENDA_RESUME_FENCE_INVALID = "cognitive_agenda_resume_fence_invalid"
 
 export type TurnFailureReasonCode =
   | "schema_invalid_payload"
   | "max_retries_exhausted"
   | "execution_failed"
   | "lease_lost"
+  | typeof COGNITIVE_AGENDA_RESUME_FENCE_INVALID
 
 export type TurnFailureDecision =
-  | { disposition: "retry"; reasonCode: "execution_failed" | "lease_lost" }
+  | { disposition: "retry"; reasonCode: "execution_failed" | "lease_lost" | typeof COGNITIVE_AGENDA_RESUME_FENCE_INVALID }
   | { disposition: "dead_letter"; reasonCode: "schema_invalid_payload" | "max_retries_exhausted" }
   | { disposition: "skip"; reasonCode: "lease_not_available" }
 
@@ -29,6 +31,7 @@ export type TurnDlqEvent = {
 function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error("Unknown Turn execution failure")
 }
+function isResumeFenceFailure(error: unknown): boolean { return asError(error).message === COGNITIVE_AGENDA_RESUME_FENCE_INVALID }
 
 export function classifyTurnFailure(
   error: unknown,
@@ -43,6 +46,9 @@ export function classifyTurnFailure(
   }
   if (error instanceof SyntaxError || asError(error).name === "TurnQueuePayloadError") {
     return { disposition: "dead_letter", reasonCode: "schema_invalid_payload" }
+  }
+  if (isResumeFenceFailure(error) && Number.isInteger(attemptsMade) && attemptsMade + 1 < maxAttempts) {
+    return { disposition: "retry", reasonCode: COGNITIVE_AGENDA_RESUME_FENCE_INVALID }
   }
   if (!Number.isInteger(attemptsMade) || attemptsMade + 1 >= maxAttempts) {
     return { disposition: "dead_letter", reasonCode: "max_retries_exhausted" }
@@ -63,6 +69,7 @@ export function payloadIdentity(value: unknown): Pick<TurnDlqEvent, "turnId" | "
 function errorCode(error: unknown): string {
   if (error instanceof TurnLeaseError) return error.code
   if (error instanceof Error && error.name === "TurnQueuePayloadError") return "invalid_payload"
+  if (isResumeFenceFailure(error)) return COGNITIVE_AGENDA_RESUME_FENCE_INVALID
   return "turn_execution_error"
 }
 

@@ -1,3 +1,5 @@
+import { Buffer } from "node:buffer"
+
 import type { StepContextSnapshot } from "./context/step-context-builder.js"
 
 export type FinalCandidate = {
@@ -29,6 +31,103 @@ export type VerifyCandidateInput = {
   readonly businessChecks?: readonly BusinessCheck[]
 }
 
+const MAX_READ_BYTES = 8 * 1024
+const MAX_READ_ENTRIES = 50
+const MAX_READ_TEXT = 256
+const READ_TOOLS = new Set(["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"])
+const FOREIGN_KEYS = new Set([
+  "userId", "sessionId", "turnId", "stepId", "taskId", "parentTaskId", "rootTaskId", "ownerId",
+  "lease", "leaseOwnerId", "leaseVersion", "idempotencyKey", "capabilities", "permissions", "allowedCapabilities",
+  "budgetLimit", "maxBudget",
+])
+type ReadEvidenceKind = "job" | "persona" | "resume"
+
+function plainRecord(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
+  try {
+    const prototype = Object.getPrototypeOf(value)
+    return (prototype === Object.prototype || prototype === null) && Object.getOwnPropertySymbols(value).length === 0
+      ? value as Record<string, unknown>
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function plainJson(value: unknown, seen = new Set<object>(), depth = 0): boolean {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true
+  if (typeof value === "number") return Number.isFinite(value)
+  if (typeof value !== "object" || depth > 32 || seen.has(value)) return false
+  if (!Array.isArray(value) && !plainRecord(value)) return false
+  seen.add(value)
+  try { return (Array.isArray(value) ? value : Object.values(value)).every(item => plainJson(item, seen, depth + 1)) } finally { seen.delete(value) }
+}
+
+function foreignShape(value: unknown, seen = new Set<object>()): boolean {
+  if (!value || typeof value !== "object") return false
+  if (seen.has(value)) return true
+  seen.add(value)
+  try {
+    if (Array.isArray(value)) return value.some(item => foreignShape(item, seen))
+    const record = plainRecord(value)
+    return !record || Object.keys(record).some(key => FOREIGN_KEYS.has(key)) || Object.values(record).some(item => foreignShape(item, seen))
+  } finally { seen.delete(value) }
+}
+
+function boundedJson(value: unknown): boolean {
+  try {
+    if (!plainJson(value) || foreignShape(value)) return false
+    const encoded = JSON.stringify(value)
+    return encoded !== undefined && Buffer.byteLength(encoded, "utf8") <= MAX_READ_BYTES
+  } catch {
+    return false
+  }
+}
+
+function boundedText(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0 && value.length <= MAX_READ_TEXT
+}
+
+function projectReadOutput(toolName: string, output: unknown): FinalEvidence[] {
+  if (!boundedJson(output)) return []
+  const value = plainRecord(output)
+  if (!value) return []
+  const projected: Array<{ readonly kind: ReadEvidenceKind; readonly ref: string }> = []
+  const add = (kind: ReadEvidenceKind, ref: unknown): boolean => {
+    if (!boundedText(ref) || projected.length >= MAX_READ_ENTRIES) return false
+    projected.push({ kind, ref })
+    return true
+  }
+  if (toolName === "jobs.search") {
+    if (!Array.isArray(value.jobs) || value.jobs.length > MAX_READ_ENTRIES) return []
+    for (const item of value.jobs) { const job = plainRecord(item); if (!job || !add("job", job.id)) return [] }
+  } else if (toolName === "jobs.get") {
+    const job = value.job === null ? null : plainRecord(value.job)
+    if (value.job !== null && (!job || !add("job", job.id))) return []
+  } else if (toolName === "persona.retrieve") {
+    if (!Array.isArray(value.facts) || value.facts.length > MAX_READ_ENTRIES) return []
+    for (const item of value.facts) { const fact = plainRecord(item); if (!fact || !add("persona", fact.id)) return [] }
+  } else if (toolName === "resume.get_base") {
+    const resume = value.resume === null ? null : plainRecord(value.resume)
+    if (value.resume !== null && (!resume || !add("resume", resume.id))) return []
+  } else return []
+  return projected.map(({ kind, ref }) => ({ id: `read:${kind}:${ref}`, status: "verified" as const }))
+}
+
+function readEvidence(content: unknown): FinalEvidence[] {
+  try {
+    const value = plainRecord(content)
+    if (!value || typeof value.toolCallId !== "string" || !boundedText(value.toolCallId)
+      || typeof value.toolName !== "string" || !READ_TOOLS.has(value.toolName)
+      || value.status !== "completed" || value.errorCode !== null
+      || !Object.prototype.hasOwnProperty.call(value, "input") || !Object.prototype.hasOwnProperty.call(value, "output")
+      || !boundedJson(value.input) || !boundedJson(value.output)) return []
+    return projectReadOutput(value.toolName, value.output)
+  } catch {
+    return []
+  }
+}
+
 function uniqueSorted(values: readonly string[]): string[] {
   return [...new Set(values.filter((value) => value.trim().length > 0))].sort()
 }
@@ -36,10 +135,16 @@ function uniqueSorted(values: readonly string[]): string[] {
 export function snapshotEvidence(snapshot: StepContextSnapshot): FinalEvidence[] {
   const business = snapshot.businessRefs.map((reference) => ({ id: reference.id, status: "verified" as const }))
   const observations = snapshot.toolObservations.flatMap((observation) => {
-    if (!observation.content || typeof observation.content !== "object" || Array.isArray(observation.content)) return []
-    const content = observation.content as Record<string, unknown>
-    if (typeof content.toolCallId !== "string") return []
-    return [{ id: content.toolCallId, status: content.status === "completed" ? "verified" as const : "conflicting" as const }]
+    try {
+      const content = plainRecord(observation.content)
+      if (!content || typeof content.toolCallId !== "string") return []
+      return [
+        { id: content.toolCallId, status: content.status === "completed" ? "verified" as const : "conflicting" as const },
+        ...readEvidence(content),
+      ]
+    } catch {
+      return []
+    }
   })
   return [...business, ...observations]
 }

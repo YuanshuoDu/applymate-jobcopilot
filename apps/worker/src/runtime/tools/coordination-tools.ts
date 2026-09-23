@@ -3,6 +3,7 @@ import { schemaVersion } from "@jobcopilot/agent-protocol"
 
 import {
   executeCloseSubagent,
+  executeFollowup,
   executeInterruptSubagent,
   executeListSubagents,
   executeSendMessage,
@@ -31,10 +32,19 @@ export const SpawnSubagentInputSchema = Type.Object({
   successCriteria: Type.Optional(StringListSchema),
   allowedActions: Type.Optional(StringListSchema),
   context: Type.Optional(Type.Unknown()),
-  expectedOutputSchema: Type.Optional(Type.Unknown()),
   parentTaskId: Type.Optional(IdSchema),
 }, { additionalProperties: false })
 export type SpawnSubagentInput = Static<typeof SpawnSubagentInputSchema>
+
+export const FollowupInputSchema = Type.Object({
+  idempotencyKey: KeySchema,
+  taskId: IdSchema,
+  goal: TextSchema,
+  constraints: Type.Optional(StringListSchema),
+  successCriteria: Type.Optional(StringListSchema),
+  context: Type.Optional(Type.Unknown()),
+}, { additionalProperties: false })
+export type FollowupInput = Static<typeof FollowupInputSchema>
 
 export const SendMessageInputSchema = Type.Object({
   idempotencyKey: KeySchema,
@@ -72,9 +82,26 @@ const SpawnOutputSchema = Type.Object({
   status: StatusSchema, replay: Type.Boolean(),
 }, { additionalProperties: false })
 const SendOutputSchema = Type.Object({ taskId: IdSchema, messageId: IdSchema, status: Type.Union([Type.Literal("queued"), Type.Literal("duplicate")]) }, { additionalProperties: false })
+const WaitTaskOutputSchema = Type.Object({
+  taskId: IdSchema, status: StatusSchema, role: Type.String({ minLength: 1, maxLength: 256 }), result: Type.Unknown(),
+  failureReason: Type.Union([Type.String({ maxLength: 500 }), Type.Null()]),
+}, { additionalProperties: false })
+const WaitAggregateSchema = Type.Object({
+  status: Type.Union([Type.Literal("completed"), Type.Literal("partial"), Type.Literal("failed"), Type.Literal("pending")]),
+  successfulRoles: Type.Array(Type.Union([Type.Literal("scout"), Type.Literal("analyst")]), { maxItems: 2 }),
+  failedRoles: Type.Array(Type.Union([Type.Literal("scout"), Type.Literal("analyst")]), { maxItems: 2 }),
+  pendingRoles: Type.Optional(Type.Array(Type.Union([Type.Literal("scout"), Type.Literal("analyst")]), { maxItems: 2 })),
+  jobIds: Type.Array(IdSchema, { maxItems: 64 }),
+  failures: Type.Array(Type.Object({ role: Type.Union([Type.Literal("scout"), Type.Literal("analyst")]), taskId: IdSchema, reason: Type.String({ maxLength: 500 }) }, { additionalProperties: false }), { maxItems: 2 }),
+}, { additionalProperties: false })
+const FollowupOutputSchema = Type.Object({
+  taskId: IdSchema, sourceTaskId: IdSchema, rootTaskId: IdSchema, parentTaskId: Type.Union([IdSchema, Type.Null()]),
+  path: Type.String({ minLength: 1, maxLength: 2_048 }), depth: Type.Integer({ minimum: 0 }),
+  status: StatusSchema, replay: Type.Boolean(),
+}, { additionalProperties: false })
 const WaitOutputSchema = Type.Object({
   waitId: IdSchema, status: Type.Union([Type.Literal("waiting"), Type.Literal("ready"), Type.Literal("timed_out"), Type.Literal("interrupted"), Type.Literal("closed")]),
-  taskIds: Type.Array(IdSchema), deadlineAt: Type.String(), matchedTaskIds: Type.Array(IdSchema),
+  taskIds: Type.Array(IdSchema), deadlineAt: Type.String(), matchedTaskIds: Type.Array(IdSchema), tasks: Type.Array(WaitTaskOutputSchema, { minItems: 1, maxItems: 50 }), aggregate: Type.Optional(WaitAggregateSchema),
 }, { additionalProperties: false })
 const TaskOutputSchema = Type.Object({
   taskId: IdSchema, rootTaskId: IdSchema, parentTaskId: Type.Union([IdSchema, Type.Null()]),
@@ -82,6 +109,7 @@ const TaskOutputSchema = Type.Object({
   role: Type.String(), taskType: Type.String(), status: StatusSchema,
   attemptCount: Type.Integer({ minimum: 0 }), maxAttempts: Type.Integer({ minimum: 1 }),
   leaseExpiresAt: Type.Union([Type.String(), Type.Null()]), interruptRequestedAt: Type.Union([Type.String(), Type.Null()]),
+  result: Type.Unknown(), failureReason: Type.Union([Type.String({ maxLength: 500 }), Type.Null()]),
 }, { additionalProperties: false })
 const ListOutputSchema = Type.Object({ tasks: Type.Array(TaskOutputSchema, { maxItems: 50 }) }, { additionalProperties: false })
 const InterruptOutputSchema = Type.Object({
@@ -101,36 +129,77 @@ function metadata(name: string, description: string, risk: "read" | "internal_wr
 }
 
 export function createCoordinationTools(options: CoordinationExecutorOptions): RuntimeToolDefinition[] {
+  const spawnExecutor: RuntimeToolDefinition["execute"] = (context, input) => executeSpawn(context, input as SpawnSubagentInput, options)
+  const sendMessageExecutor: RuntimeToolDefinition["execute"] = (context, input) => executeSendMessage(context, input as SendMessageInput, options)
+  const waitExecutor: RuntimeToolDefinition["execute"] = (context, input) => executeWaitSubagents(context, input as WaitSubagentsInput, options)
+  const interruptExecutor: RuntimeToolDefinition["execute"] = (context, input) => executeInterruptSubagent(context, input as InterruptSubagentInput, options)
+  const listExecutor: RuntimeToolDefinition["execute"] = (context, input) => executeListSubagents(context, input as ListSubagentsInput, options)
+  const closeExecutor: RuntimeToolDefinition["execute"] = (context, input) => executeCloseSubagent(context, input as CloseSubagentInput, options)
   return [
     {
       ...metadata("spawn_subagent", "Create one permission-scoped child task and durably enqueue it", "internal_write", "requires_key"),
       inputSchema: SpawnSubagentInputSchema, outputSchema: SpawnOutputSchema,
-      execute: (context, input) => executeSpawn(context, input as SpawnSubagentInput, options),
+      execute: spawnExecutor,
+    },
+    {
+      ...metadata("agent.spawn", "Create one permission-scoped child task and durably enqueue it", "internal_write", "requires_key"),
+      inputSchema: SpawnSubagentInputSchema, outputSchema: SpawnOutputSchema,
+      execute: spawnExecutor,
+    },
+    {
+      ...metadata("agent.followup", "Create a durable follow-up task from a terminal task result", "internal_write", "requires_key"),
+      inputSchema: FollowupInputSchema, outputSchema: FollowupOutputSchema,
+      execute: (context, input) => executeFollowup(context, input as FollowupInput, options),
     },
     {
       ...metadata("send_message", "Send one idempotent mailbox message to a visible subagent", "internal_write", "requires_key"),
       inputSchema: SendMessageInputSchema, outputSchema: SendOutputSchema,
-      execute: (context, input) => executeSendMessage(context, input as SendMessageInput, options),
+      execute: sendMessageExecutor,
+    },
+    {
+      ...metadata("agent.send", "Send one idempotent mailbox message to a visible subagent", "internal_write", "requires_key"),
+      inputSchema: SendMessageInputSchema, outputSchema: SendOutputSchema,
+      execute: sendMessageExecutor,
     },
     {
       ...metadata("wait_subagents", "Durably wait for visible subagent results through the AH2-025 adapter", "internal_write", "requires_key"),
       inputSchema: WaitSubagentsInputSchema, outputSchema: WaitOutputSchema,
-      execute: (context, input) => executeWaitSubagents(context, input as WaitSubagentsInput, options),
+      execute: waitExecutor,
+    },
+    {
+      ...metadata("agent.wait", "Durably wait for visible subagent results through the AH2-025 adapter", "internal_write", "requires_key"),
+      inputSchema: WaitSubagentsInputSchema, outputSchema: WaitOutputSchema,
+      execute: waitExecutor,
     },
     {
       ...metadata("list_subagents", "List visible tasks in the current session and task tree", "read", "read_only"),
       inputSchema: ListSubagentsInputSchema, outputSchema: ListOutputSchema,
-      execute: (context, input) => executeListSubagents(context, input as ListSubagentsInput, options),
+      execute: listExecutor,
+    },
+    {
+      ...metadata("agent.list", "List visible tasks in the current session and task tree", "read", "read_only"),
+      inputSchema: ListSubagentsInputSchema, outputSchema: ListOutputSchema,
+      execute: listExecutor,
     },
     {
       ...metadata("interrupt_subagent", "Request interruption of a visible task tree", "internal_write", "idempotent"),
       inputSchema: InterruptSubagentInputSchema, outputSchema: InterruptOutputSchema,
-      execute: (context, input) => executeInterruptSubagent(context, input as InterruptSubagentInput, options),
+      execute: interruptExecutor,
+    },
+    {
+      ...metadata("agent.interrupt", "Request interruption of a visible task tree", "internal_write", "idempotent"),
+      inputSchema: InterruptSubagentInputSchema, outputSchema: InterruptOutputSchema,
+      execute: interruptExecutor,
     },
     {
       ...metadata("close_subagent", "Close a visible non-running task", "internal_write", "idempotent"),
       inputSchema: CloseSubagentInputSchema, outputSchema: CloseOutputSchema,
-      execute: (context, input) => executeCloseSubagent(context, input as CloseSubagentInput, options),
+      execute: closeExecutor,
+    },
+    {
+      ...metadata("agent.close", "Close a visible non-running task", "internal_write", "idempotent"),
+      inputSchema: CloseSubagentInputSchema, outputSchema: CloseOutputSchema,
+      execute: closeExecutor,
     },
   ]
 }

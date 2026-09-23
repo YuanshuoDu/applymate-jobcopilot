@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
 import { createV2EventStream, parseAfterSequence, type AgentStreamRedis } from "./v2-event-stream"
+import type { AgentEventPubSubRedis } from "./event-wakeup"
 
 function event(sequence: bigint) {
   return {
@@ -8,6 +9,27 @@ function event(sequence: bigint) {
     sequence, type: sequence === BigInt(2) ? "item.completed" : "item.started", actor: "orchestrator",
     correlationId: "turn_1", causationId: null, idempotencyKey: null, payload: { token: "secret", text: `state-${sequence}` },
   }
+}
+
+function lifecycleEvent(sequence: bigint, type: "session.paused" | "session.resumed") {
+  const paused = type === "session.paused"
+  return {
+    id: `event_${sequence}`, sessionId: "session_1", turnId: null, itemId: null, taskId: null,
+    sequence, type, actor: "system", correlationId: "session_1", causationId: null,
+    idempotencyKey: `agent-session-control:client_${sequence}`,
+    payload: {
+      sessionId: "session_1", operation: paused ? "pause" : "resume",
+      previousGate: paused ? "open" : "user_paused", nextGate: paused ? "user_paused" : "open",
+      controlRevision: Number(sequence - BigInt(4)),
+      pausedAt: paused ? "2026-09-15T00:00:00.000Z" : null,
+    },
+  }
+}
+
+function frameData(frame: string): Record<string, unknown> {
+  const line = frame.split("\n").find((value) => value.startsWith("data: "))
+  if (!line) throw new Error("SSE frame did not contain data")
+  return JSON.parse(line.slice("data: ".length)) as Record<string, unknown>
 }
 
 function db(rows: unknown[]) {
@@ -31,6 +53,31 @@ function redis() {
   return connection
 }
 
+function eventRedis(options: { subscribe?: () => Promise<unknown> } = {}) {
+  let messageListener: ((channel: string, message: string) => void) | undefined
+  let errorListener: ((error: unknown) => void) | undefined
+  const connection = {
+    subscribe: vi.fn(options.subscribe ?? (async () => 1)),
+    unsubscribe: vi.fn(async () => 0),
+    onMessage: vi.fn(listener => { messageListener = listener }),
+    onError: vi.fn(listener => { errorListener = listener }),
+    removeMessageListener: vi.fn(listener => { if (messageListener === listener) messageListener = undefined }),
+    removeErrorListener: vi.fn(listener => { if (errorListener === listener) errorListener = undefined }),
+    disconnect: vi.fn(),
+  } satisfies AgentEventPubSubRedis
+  return {
+    connection,
+    emit(channel: string, message: string) { messageListener?.(channel, message) },
+    fail(error: unknown) { errorListener?.(error) },
+  }
+}
+
+async function waitFor(condition: () => boolean): Promise<void> {
+  const deadline = Date.now() + 1_000
+  while (!condition() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 1))
+  if (!condition()) throw new Error("Timed out waiting for test condition")
+}
+
 describe("V2 agent event stream", () => {
   beforeEach(() => vi.restoreAllMocks())
 
@@ -47,6 +94,153 @@ describe("V2 agent event stream", () => {
     expect(database.agentEvent.findMany).toHaveBeenCalledWith(expect.objectContaining({ where: { sessionId: "session_1", sequence: { gt: BigInt(1) } } }))
     controller.abort()
     await reader.cancel()
+  })
+
+  it("streams session lifecycle events with durable sequence IDs and null turn scope", async () => {
+    const controller = new AbortController()
+    const database = db([lifecycleEvent(BigInt(5), "session.paused"), lifecycleEvent(BigInt(6), "session.resumed")])
+    const stream = createV2EventStream(database as never, {
+      sessionId: "session_1", afterSequence: BigInt(4), signal: controller.signal,
+      redisFactory: () => null, dbPollMs: 50, heartbeatMs: 100,
+    })
+    const reader = stream.getReader()
+    const paused = new TextDecoder().decode((await reader.read()).value)
+    const resumed = new TextDecoder().decode((await reader.read()).value)
+    expect(paused).toContain("event: session.paused\nid: 5\n")
+    expect(resumed).toContain("event: session.resumed\nid: 6\n")
+    expect(frameData(paused)).toMatchObject({
+      type: "session.paused", sessionId: "session_1", turnId: null, itemId: null, taskId: null,
+      actor: "system", correlationId: "session_1", sequence: "5",
+      payload: {
+        sessionId: "session_1", operation: "pause", previousGate: "open", nextGate: "user_paused",
+        controlRevision: 1, pausedAt: "2026-09-15T00:00:00.000Z",
+      },
+    })
+    expect(frameData(resumed)).toMatchObject({
+      type: "session.resumed", sessionId: "session_1", turnId: null, itemId: null, taskId: null,
+      actor: "system", correlationId: "session_1", sequence: "6",
+      payload: {
+        sessionId: "session_1", operation: "resume", previousGate: "user_paused", nextGate: "open",
+        controlRevision: 2, pausedAt: null,
+      },
+    })
+    expect(database.agentEvent.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { sessionId: "session_1", sequence: { gt: BigInt(4) } },
+    }))
+    controller.abort()
+    await reader.cancel()
+  })
+
+  it("uses the durable sequence cursor to resume after the last lifecycle event", async () => {
+    const controller = new AbortController()
+    const database = db([lifecycleEvent(BigInt(6), "session.resumed")])
+    const stream = createV2EventStream(database as never, {
+      sessionId: "session_1", afterSequence: BigInt(5), signal: controller.signal,
+      redisFactory: () => null, dbPollMs: 50, heartbeatMs: 100,
+    })
+    const reader = stream.getReader()
+    const resumed = new TextDecoder().decode((await reader.read()).value)
+    expect(resumed).toContain("event: session.resumed\nid: 6\n")
+    expect(resumed).not.toContain("session.paused")
+    expect(database.agentEvent.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { sessionId: "session_1", sequence: { gt: BigInt(5) } },
+    }))
+    controller.abort()
+    await reader.cancel()
+  })
+
+  it("uses the session event channel as a durable database poll wakeup", async () => {
+    const controller = new AbortController()
+    const database = db([])
+    let calls = 0
+    database.agentEvent.findMany.mockImplementation(async () => {
+      calls += 1
+      return calls === 1 ? [] : [event(BigInt(2))]
+    })
+    const pubsub = eventRedis()
+    const stream = createV2EventStream(database as never, {
+      sessionId: "session_1", afterSequence: BigInt(0), signal: controller.signal,
+      redisFactory: () => null, eventRedisFactory: () => pubsub.connection, dbPollMs: 60_000, heartbeatMs: 60_000,
+    })
+    const reader = stream.getReader()
+    await waitFor(() => pubsub.connection.subscribe.mock.calls.length === 1)
+
+    pubsub.emit("agent:session:session_1:events", "malformed payload is ignored")
+    const text = new TextDecoder().decode((await reader.read()).value)
+
+    expect(text).toContain("event: item.completed\nid: 2\n")
+    expect(text).not.toContain("malformed payload")
+    expect(database.agentEvent.findMany).toHaveBeenCalledTimes(2)
+    controller.abort()
+    await reader.cancel()
+  })
+
+  it("keeps duplicate and out-of-order Pub/Sub hints behind the database cursor", async () => {
+    const controller = new AbortController()
+    const database = db([])
+    const cursors: bigint[] = []
+    let calls = 0
+    database.agentEvent.findMany.mockImplementation(async (args: { where: { sequence: { gt: bigint } } }) => {
+      cursors.push(args.where.sequence.gt)
+      calls += 1
+      return calls === 1 ? [event(BigInt(2))] : []
+    })
+    const pubsub = eventRedis()
+    const stream = createV2EventStream(database as never, {
+      sessionId: "session_1", afterSequence: BigInt(1), signal: controller.signal,
+      redisFactory: () => null, eventRedisFactory: () => pubsub.connection, dbPollMs: 60_000, heartbeatMs: 60_000,
+    })
+    const reader = stream.getReader()
+    const first = new TextDecoder().decode((await reader.read()).value)
+    await waitFor(() => pubsub.connection.subscribe.mock.calls.length === 1)
+
+    pubsub.emit("agent:session:session_1:events", JSON.stringify({ sequence: "99" }))
+    pubsub.emit("agent:session:session_1:events", JSON.stringify({ sequence: "1" }))
+    await waitFor(() => cursors.length >= 2)
+
+    expect(first).toContain("id: 2")
+    expect(cursors[0]).toBe(BigInt(1))
+    expect(cursors.slice(1).every(cursor => cursor === BigInt(2))).toBe(true)
+    controller.abort()
+    await reader.cancel()
+  })
+
+  it("keeps the PostgreSQL fallback when the Pub/Sub connection fails", async () => {
+    const controller = new AbortController()
+    const database = db([event(BigInt(2))])
+    const pubsub = eventRedis({ subscribe: vi.fn().mockRejectedValue(new Error("redis unavailable")) })
+    const stream = createV2EventStream(database as never, {
+      sessionId: "session_1", afterSequence: BigInt(1), signal: controller.signal,
+      redisFactory: () => null, eventRedisFactory: () => pubsub.connection, dbPollMs: 1, heartbeatMs: 60_000,
+    })
+    const reader = stream.getReader()
+    const text = new TextDecoder().decode((await reader.read()).value)
+
+    expect(text).toContain("event: item.completed\nid: 2\n")
+    expect(pubsub.connection.subscribe).toHaveBeenCalledWith("agent:session:session_1:events")
+    expect(database.agentEvent.findMany).toHaveBeenCalled()
+    controller.abort()
+    await reader.cancel()
+  })
+
+  it("cleans up the independent Pub/Sub subscriber on abort", async () => {
+    const controller = new AbortController()
+    const database = db([])
+    const pubsub = eventRedis()
+    const stream = createV2EventStream(database as never, {
+      sessionId: "session_1", afterSequence: BigInt(0), signal: controller.signal,
+      redisFactory: () => null, eventRedisFactory: () => pubsub.connection, dbPollMs: 60_000, heartbeatMs: 60_000,
+    })
+    const reader = stream.getReader()
+    await waitFor(() => pubsub.connection.subscribe.mock.calls.length === 1)
+
+    controller.abort()
+    await reader.cancel()
+    await waitFor(() => pubsub.connection.disconnect.mock.calls.length === 1)
+
+    expect(pubsub.connection.unsubscribe).toHaveBeenCalledWith("agent:session:session_1:events")
+    expect(pubsub.connection.removeMessageListener).toHaveBeenCalledTimes(1)
+    expect(pubsub.connection.removeErrorListener).toHaveBeenCalledTimes(1)
   })
 
   it("bridges a transient snapshot without using its id as Last-Event-ID", async () => {

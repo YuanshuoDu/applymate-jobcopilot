@@ -20,7 +20,7 @@ function storeFixture(): { store: TurnEngineStore; events: Array<{ type: string;
   const items: Array<{ id: string; type: string; content: unknown; revision: number }> = []
   const steps = new Set<string>()
   const store: TurnEngineStore = {
-    startStep: async ({ stepId }) => { steps.add(stepId); return { id: stepId } },
+    startStep: async ({ stepId, ordinal }) => { steps.add(stepId); return { id: stepId, ordinal } },
     updateStep: async ({ stepId }) => { expect(steps.has(stepId)).toBe(true) },
     createItem: async ({ itemId, type, content }) => { const item = { id: itemId, type, content, revision: 0 }; items.push(item); return item },
     updateItem: async ({ itemId, expectedRevision, content, status }) => {
@@ -43,7 +43,7 @@ function tool() {
     version: "1",
     description: "Search the candidate job shortlist",
     capabilities: ["read"] as const,
-    inputSchema: { type: "object", additionalProperties: false },
+    inputSchema: { type: "object", properties: { query: { type: "string", minLength: 1 } }, required: ["query"], additionalProperties: false },
     outputSchema: { type: "object" },
     risk: "read" as const,
     domain: "jobs" as const,
@@ -51,6 +51,14 @@ function tool() {
     timeoutMs: 10_000,
     requiredCapabilities: [] as const,
   }
+}
+
+function validateFixtureToolArguments(toolName: string, input: unknown): boolean | string {
+  if (!input || typeof input !== "object" || Array.isArray(input) || toolName !== "jobs.search") return "Tool arguments failed fixture schema validation"
+  const value = input as Record<string, unknown>
+  return Object.keys(value).length === 1 && Object.hasOwn(value, "query") && typeof value.query === "string" && value.query.trim().length > 0
+    ? true
+    : "Tool arguments failed fixture schema validation"
 }
 
 function contextBuilder(): TurnEngineOptions["contextBuilder"] {
@@ -107,11 +115,11 @@ describe("MiniMax Harness runtime integration", () => {
     }
     const execute = createToolRouterExecutor(router)
     const executor = createHarnessTurnExecutor({
-      scope: { userId: "user-1" },
+      scope: { userId: "user-1" }, rootTaskId: "root-1",
       goal: "Find Dublin jobs",
       snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
       contextBuilder: contextBuilder(), store: fixture.store, tools: [tool()], executeTool: execute,
-      capabilities: ["read"], modelRuntime: runtime, maxSteps: 3,
+      capabilities: ["read"], validateToolArguments: validateFixtureToolArguments, modelRuntime: runtime, maxSteps: 3,
       idFactory: (() => { let id = 0; return (prefix: string) => `${prefix}:${++id}` })(),
     })
     const result = await executor({ lease, signal: new AbortController().signal })

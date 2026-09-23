@@ -21,7 +21,6 @@ import {
   type ApprovalScopeMatch,
   type IssueApprovalReceiptInput,
 } from "./types.js"
-
 type Client = pg.PoolClient
 type RowValue = Date | string | null
 interface ApprovalRow {
@@ -29,9 +28,8 @@ interface ApprovalRow {
   type: string; status: string; title: string; body: string; payload: unknown; resourceHash: string | null; materialHash: string | null
   answersHash: string | null; scopeHash: string | null; nonceHash: string | null; revision: number; expiresAt: RowValue; decidedAt: RowValue; consumedAt: RowValue; createdAt: RowValue
 }
-
 const SELECT_APPROVAL = `SELECT "id", "sessionId", "taskId", "userId", "turnId", "toolCallId", "jobId", "type", "status", "title", "body", "payload", "resourceHash", "materialHash", "answersHash", "scopeHash", "nonceHash", "revision", "expiresAt", "decidedAt", "consumedAt", "createdAt" FROM "agent_approvals"`
-
+const OPEN_SESSION = `session."status" NOT IN ('aborted', 'archived')`
 function isUniqueViolation(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === "23505"
 }
@@ -64,13 +62,19 @@ function mapApproval(row: ApprovalRow): AgentApproval {
   }
 }
 async function load(client: Client, id: string, userId: string, forUpdate = false): Promise<ApprovalRow> {
-  const result = await client.query<ApprovalRow>(`${SELECT_APPROVAL} WHERE "id" = $1 AND "userId" = $2${forUpdate ? " FOR UPDATE" : ""}`, [id, userId])
+  const result = await client.query<ApprovalRow>(`${SELECT_APPROVAL} WHERE "id" = $1 AND "userId" = $2 AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_approvals"."sessionId" AND ${OPEN_SESSION})${forUpdate ? " FOR UPDATE" : ""}`, [id, userId])
   const row = result.rows[0]
   if (!row) throw new ApprovalStoreError("approval_not_found", "Approval receipt was not found")
   return row
 }
-
-async function assertScope(row: ApprovalRow, expected: ApprovalScopeMatch, now: Date): Promise<ApprovalScope> {
+async function assertApprovalFreshness(client: Client, row: ApprovalRow): Promise<void> {
+  if (!(await client.query(`SELECT "id" FROM "agent_sessions" AS session WHERE session."id" = $1 AND ${OPEN_SESSION} FOR UPDATE`, [row.sessionId])).rows[0]) throw new ApprovalStoreError("approval_not_found", "Approval session is no longer available")
+  const result = await client.query<{ hasRequest: boolean; hasRevision: boolean }>(`WITH request AS (SELECT "sequence" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'approval.requested' AND "correlationId" = $3 AND "idempotencyKey" = $4 ORDER BY "sequence" ASC LIMIT 1) SELECT EXISTS (SELECT 1 FROM request) AS "hasRequest", EXISTS (SELECT 1 FROM "agent_events" AS revision JOIN request ON true WHERE revision."sessionId" = $1 AND revision."type" IN ('goal.revision', 'plan.revision') AND revision."sequence" > request."sequence") AS "hasRevision"`, [row.sessionId, row.turnId, row.id, `approval:${row.id}:requested`])
+  const state = result.rows[0]
+  if (!state?.hasRequest) throw new ApprovalStoreError("approval_integrity_error", "Approval receipt request event is unavailable")
+  if (state.hasRevision) throw new ApprovalStoreError("approval_revision_mismatch", "Approval receipt is stale after a plan revision")
+}
+async function assertScope(client: Client, row: ApprovalRow, expected: ApprovalScopeMatch, now: Date): Promise<ApprovalScope> {
   if (row.status === "consumed") throw new ApprovalStoreError("approval_already_consumed", "Approval receipt has already been consumed")
   if (row.status !== "approved") throw new ApprovalStoreError("approval_not_approved", "Approval receipt is not approved")
   const expiry = date(row.expiresAt)
@@ -83,12 +87,11 @@ async function assertScope(row: ApprovalRow, expected: ApprovalScopeMatch, now: 
     if (row.revision !== expected.revision) throw new ApprovalStoreError("approval_revision_mismatch", "Approval receipt revision is stale")
     throw new ApprovalStoreError("approval_scope_mismatch", "Approval receipt scope does not match the requested action")
   }
+  await assertApprovalFreshness(client, row)
   return actual
 }
-
 type SubmissionScopeExpectation = { userId: string; jobId: string; scopeHash: string }
-
-async function assertSubmissionScope(row: ApprovalRow, expected: SubmissionScopeExpectation, now: Date): Promise<ApprovalScope> {
+async function assertSubmissionScope(client: Client, row: ApprovalRow, expected: SubmissionScopeExpectation, now: Date): Promise<ApprovalScope> {
   if (row.status !== "approved" && row.status !== "consumed") throw new ApprovalStoreError("approval_not_approved", "Approval receipt is not approved")
   const actual = scopeFromRow(row)
   if (row.scopeHash !== await hashApprovalScope(actual)) throw new ApprovalStoreError("approval_integrity_error", "Approval receipt scope integrity check failed")
@@ -96,10 +99,11 @@ async function assertSubmissionScope(row: ApprovalRow, expected: SubmissionScope
   if (actual.action !== "submit_application") throw new ApprovalStoreError("approval_scope_mismatch", "Approval receipt is not for application submission")
   const expiry = date(row.expiresAt)
   if (row.status === "approved" && (!expiry || expiry <= now)) throw new ApprovalStoreError("approval_expired", "Approval receipt has expired")
+  if (row.status === "approved") await assertApprovalFreshness(client, row)
   return actual
 }
 async function appendAudit(client: Client, input: { sessionId: string; turnId: string; itemId?: string | null; taskId: string | null; type: string; actor: "user" | "orchestrator" | "system"; approvalId: string; payload: Record<string, unknown>; key: string }): Promise<void> {
-  const session = await client.query<{ id: string }>(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 FOR UPDATE`, [input.sessionId])
+  const session = await client.query<{ id: string }>(`SELECT "id" FROM "agent_sessions" AS session WHERE session."id" = $1 AND ${OPEN_SESSION} FOR UPDATE`, [input.sessionId])
   if (!session.rows[0]) throw new ApprovalStoreError("approval_scope_mismatch", "Approval session does not exist")
   const sequence = await client.query<{ eventSequence: bigint | string }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1 WHERE "id" = $1 RETURNING "eventSequence"`, [input.sessionId])
   const next = sequence.rows[0]?.eventSequence
@@ -109,9 +113,8 @@ async function appendAudit(client: Client, input: { sessionId: string; turnId: s
   await client.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, $10, $11::jsonb)`, [eventId, input.sessionId, input.turnId, input.itemId ?? null, input.taskId, eventSequence.toString(), input.type, input.actor, input.approvalId, input.key, JSON.stringify(input.payload)])
   await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload") VALUES ($1, 'agent.session.event', $2, $3, $4::jsonb)`, [`agent-outbox-${eventId}`, input.sessionId, `agent-event:${eventId}`, JSON.stringify({ eventId, sessionId: input.sessionId, turnId: input.turnId, itemId: input.itemId ?? null, taskId: input.taskId, sequence: eventSequence.toString(), type: input.type, actor: input.actor, correlationId: input.approvalId, causationId: null, idempotencyKey: input.key, payload: input.payload })])
 }
-
 async function projectApprovalWait(client: Client, input: IssueApprovalReceiptInput, approvalId: string, scopeHash: string): Promise<string> {
-  const session = await client.query<{ id: string }>(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 FOR UPDATE`, [input.scope.sessionId, input.scope.userId])
+  const session = await client.query<{ id: string }>(`SELECT "id" FROM "agent_sessions" AS session WHERE session."id" = $1 AND session."userId" = $2 AND ${OPEN_SESSION} FOR UPDATE`, [input.scope.sessionId, input.scope.userId])
   if (!session.rows[0]) throw new ApprovalStoreError("approval_scope_mismatch", "Approval session is not owned by the Worker tenant")
   const turnResult = await client.query<{ id: string; status: string; revision: number }>(
     `SELECT "id", "status", "revision" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 FOR UPDATE`,
@@ -131,7 +134,6 @@ async function projectApprovalWait(client: Client, input: IssueApprovalReceiptIn
   await appendAudit(client, { sessionId: input.scope.sessionId, turnId: input.scope.turnId, itemId, taskId: input.taskId ?? null, type: "item.started", actor: "orchestrator", approvalId: itemId, payload: { itemId, waitKind: "approval", approvalId, toolCallId: input.scope.toolCallId }, key: `agent-wait:${itemId}:started` })
   return itemId
 }
-
 async function withTransaction<T>(pool: pg.Pool, userId: string, work: (client: Client) => Promise<T>): Promise<T> {
   const client = await pool.connect()
   try {
@@ -147,10 +149,8 @@ async function withTransaction<T>(pool: pg.Pool, userId: string, work: (client: 
     client.release()
   }
 }
-
 export function createPgApprovalStore(pool: pg.Pool, scope: { userId: string }) {
   const ensureTenant = (userId: string) => { if (userId !== scope.userId) throw new ApprovalStoreError("approval_scope_mismatch", "Approval user scope does not match the Worker tenant") }
-
   return {
     async issue(input: IssueApprovalReceiptInput): Promise<ApprovalReceiptResult> {
       ensureTenant(input.scope.userId)
@@ -162,7 +162,7 @@ export function createPgApprovalStore(pool: pg.Pool, scope: { userId: string }) 
       const id = input.approvalId ?? randomUUID()
       try {
         const row = await withTransaction(pool, scope.userId, async (client) => {
-          const session = await client.query(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2`, [input.scope.sessionId, scope.userId])
+          const session = await client.query(`SELECT "id" FROM "agent_sessions" AS session WHERE session."id" = $1 AND session."userId" = $2 AND ${OPEN_SESSION}`, [input.scope.sessionId, scope.userId])
           if (!session.rows[0]) throw new ApprovalStoreError("approval_scope_mismatch", "Approval session is not owned by the Worker tenant")
           const turn = await client.query(`SELECT "id" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`, [input.scope.turnId, input.scope.sessionId, scope.userId])
           if (!turn.rows[0]) throw new ApprovalStoreError("approval_scope_mismatch", "Approval turn is not owned by the session")
@@ -179,25 +179,24 @@ export function createPgApprovalStore(pool: pg.Pool, scope: { userId: string }) 
         throw error
       }
     },
-
     async validate(id: string, expected: ApprovalScopeMatch, now = new Date()): Promise<AgentApproval> {
       ensureTenant(expected.userId)
       assertScopeInput(expected)
-      return withTransaction(pool, scope.userId, async (client) => mapApproval(await load(client, id, scope.userId).then(async (row) => { await assertScope(row, expected, now); return row })))
+      return withTransaction(pool, scope.userId, async (client) => mapApproval(await load(client, id, scope.userId).then(async (row) => { await assertScope(client, row, expected, now); return row })))
     },
 
     async inspectSubmission(id: string, expected: SubmissionScopeExpectation, now = new Date()): Promise<AgentApproval> {
       ensureTenant(expected.userId)
-      return withTransaction(pool, scope.userId, async (client) => mapApproval(await load(client, id, scope.userId).then(async (row) => { await assertSubmissionScope(row, expected, now); return row })))
+      return withTransaction(pool, scope.userId, async (client) => mapApproval(await load(client, id, scope.userId).then(async (row) => { await assertSubmissionScope(client, row, expected, now); return row })))
     },
 
     async consumeSubmission(id: string, expected: SubmissionScopeExpectation, now = new Date()): Promise<AgentApproval> {
       ensureTenant(expected.userId)
       return withTransaction(pool, scope.userId, async (client) => {
         const row = await load(client, id, scope.userId, true)
-        const approvalScope = await assertSubmissionScope(row, expected, now)
+        const approvalScope = await assertSubmissionScope(client, row, expected, now)
         if (row.status === "consumed") throw new ApprovalStoreError("approval_already_consumed", "Approval receipt has already been consumed")
-        const consumed = await client.query(`UPDATE "agent_approvals" SET "status" = 'consumed', "consumedAt" = $1 WHERE "id" = $2 AND "userId" = $3 AND "status" = 'approved' AND "scopeHash" = $4 AND "expiresAt" > $1`, [now, id, scope.userId, row.scopeHash])
+        const consumed = await client.query(`UPDATE "agent_approvals" SET "status" = 'consumed', "consumedAt" = $1 WHERE "id" = $2 AND "userId" = $3 AND "status" = 'approved' AND "scopeHash" = $4 AND "expiresAt" > $1 AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_approvals"."sessionId" AND ${OPEN_SESSION})`, [now, id, scope.userId, row.scopeHash])
         if (consumed.rowCount !== 1) throw new ApprovalStoreError("approval_already_consumed", "Approval receipt was consumed by another request")
         await appendAudit(client, { sessionId: approvalScope.sessionId, turnId: approvalScope.turnId, taskId: row.taskId, type: "approval.consumed", actor: "system", approvalId: id, payload: auditPayload(id, approvalScope.action, row.scopeHash as string, approvalScope.revision), key: `approval:${id}:consumed` })
         return mapApproval({ ...row, status: "consumed", consumedAt: now })
@@ -213,7 +212,8 @@ export function createPgApprovalStore(pool: pg.Pool, scope: { userId: string }) 
         if (!row.turnId || row.status !== "pending") throw new ApprovalStoreError(row.status === "consumed" ? "approval_already_consumed" : "approval_not_approved", "Approval receipt is no longer pending")
         const expiry = date(row.expiresAt)
         if (!expiry || expiry <= now) throw new ApprovalStoreError("approval_expired", "Approval receipt has expired")
-        const result = await client.query(`UPDATE "agent_approvals" SET "status" = $1, "decidedAt" = $2 WHERE "id" = $3 AND "userId" = $4 AND "sessionId" = $5 AND "status" = 'pending'`, [input.decision, now, input.id, scope.userId, input.sessionId])
+        await assertApprovalFreshness(client, row)
+        const result = await client.query(`UPDATE "agent_approvals" SET "status" = $1, "decidedAt" = $2 WHERE "id" = $3 AND "userId" = $4 AND "sessionId" = $5 AND "status" = 'pending' AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_approvals"."sessionId" AND ${OPEN_SESSION})`, [input.decision, now, input.id, scope.userId, input.sessionId])
         if (result.rowCount !== 1) throw new ApprovalStoreError("approval_not_approved", "Approval receipt resolution raced with another decision")
         await appendAudit(client, { sessionId: row.sessionId, turnId: row.turnId, taskId: row.taskId, type: "approval.resolved", actor: "user", approvalId: row.id, payload: auditPayload(row.id, row.type, row.scopeHash ?? "legacy", row.revision), key: `approval:${row.id}:resolved:${input.decision}` })
       })
@@ -229,8 +229,8 @@ export function createPgApprovalStore(pool: pg.Pool, scope: { userId: string }) 
       try {
         return await withTransaction(pool, scope.userId, async (client) => {
           const row = await load(client, id, scope.userId, true)
-          const approvalScope = await assertScope(row, expected, now)
-          const consumed = await client.query(`UPDATE "agent_approvals" SET "status" = 'consumed', "consumedAt" = $1 WHERE "id" = $2 AND "userId" = $3 AND "status" = 'approved' AND "revision" = $4 AND "scopeHash" = $5 AND "nonceHash" = $6 AND "expiresAt" > $1`, [now, id, scope.userId, expected.revision, row.scopeHash, row.nonceHash])
+          const approvalScope = await assertScope(client, row, expected, now)
+          const consumed = await client.query(`UPDATE "agent_approvals" SET "status" = 'consumed', "consumedAt" = $1 WHERE "id" = $2 AND "userId" = $3 AND "status" = 'approved' AND "revision" = $4 AND "scopeHash" = $5 AND "nonceHash" = $6 AND "expiresAt" > $1 AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_approvals"."sessionId" AND ${OPEN_SESSION})`, [now, id, scope.userId, expected.revision, row.scopeHash, row.nonceHash])
           if (consumed.rowCount !== 1) throw new ApprovalStoreError("approval_already_consumed", "Approval receipt was consumed by another request")
           let reservationId: string | null = null
           if (reservation) {

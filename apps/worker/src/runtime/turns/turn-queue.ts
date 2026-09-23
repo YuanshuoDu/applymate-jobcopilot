@@ -27,16 +27,22 @@ import {
   type TurnDispatchQueue,
 } from "./recovery-scanner.js"
 import { linkAbortSignals } from "../interrupt/bridge.js"
-import { signalWasInterrupted, type RootAbortControllerRegistry } from "../interrupt/registry.js"
+import { RootAbortController, signalWasInterrupted, type RootAbortControllerRegistry } from "../interrupt/registry.js"
+import { interruptPollInterval, safePersistedInterrupt, startInterruptProbe, TURN_INTERRUPT_POLL_INTERVAL_MS } from "./turn-interrupt-probe.js"
+
+export { TURN_INTERRUPT_POLL_INTERVAL_MS } from "./turn-interrupt-probe.js"
 
 export const TURN_QUEUE_NAME = "agent-turns"
 
 export type TurnExecutionResult = {
   status: LeaseReleaseStatus
   summary?: string
+  /** Durable dependency waits must carry their receipt to the lease handoff. */
+  waitId?: string
 }
 
 export type TurnExecutor = (input: { lease: TurnLease; signal: AbortSignal }) => Promise<TurnExecutionResult>
+export type TurnWaitHandoff = (input: { lease: TurnLease; waitId: string; now: Date }) => Promise<unknown>
 
 export type ActiveTurnExecution = {
   lease: TurnLease
@@ -65,6 +71,14 @@ export interface RunTurnJobOptions {
   leaseMs?: number
   heartbeatMs?: number
   now?: () => Date
+  /** Atomically suspends or requeues a dependency wait before ordinary release. */
+  waitHandoff?: TurnWaitHandoff
+  /** Server-owned probe for a durable Stop that fenced the active lease. */
+  isInterrupted?: (lease: TurnLease) => Promise<boolean>
+  /** Bounded cross-process Stop probe interval; omitted means no probe. */
+  interruptPollMs?: number
+  /** Durable child fence used when this Turn loses ownership unexpectedly. */
+  interruptSubagents?: (lease: TurnLease) => Promise<unknown>
 }
 
 export async function markTurnDispatchClaimed(pool: LeasePool, payload: TurnJobPayload): Promise<void> {
@@ -73,8 +87,9 @@ export async function markTurnDispatchClaimed(pool: LeasePool, payload: TurnJobP
     await client.query(
       `UPDATE "agent_outbox"
        SET "publishedAt" = CURRENT_TIMESTAMP, "attemptCount" = "attemptCount" + 1, "lastError" = NULL
-       WHERE "topic" = 'agent.turn.dispatch' AND "idempotencyKey" = $1 AND "publishedAt" IS NULL`,
-      [`turn-dispatch:${payload.turnId}`],
+       WHERE "topic" = 'agent.turn.dispatch' AND "idempotencyKey" = $1
+         AND "aggregateId" = $2 AND "publishedAt" IS NULL`,
+      [`turn-dispatch:${payload.turnId}`, payload.sessionId],
     )
   } finally {
     client.release()
@@ -93,6 +108,7 @@ export async function runTurnJob(
     await recordTurnDlq(options.pool, job.data, job.attemptsMade + 1, "schema_invalid_payload", error)
     return { status: "dead_lettered", reasonCode: "schema_invalid_payload" }
   }
+  const pollIntervalMs = interruptPollInterval(options.interruptPollMs)
 
   let lease: TurnLease
   try {
@@ -104,7 +120,14 @@ export async function runTurnJob(
     throw error
   }
 
-  await markTurnDispatchClaimed(options.pool, payload)
+  try {
+    await markTurnDispatchClaimed(options.pool, payload)
+  } catch (error: unknown) {
+    // Dispatch bookkeeping is part of the claim boundary. If it fails, put
+    // the fenced Turn back in the queue before letting BullMQ retry the job.
+    await releaseTurnLease(options.pool, lease, "queued", options.now?.() ?? new Date()).catch(() => undefined)
+    throw error
+  }
   const heartbeat = new TurnHeartbeat(lease, {
     pool: options.pool,
     intervalMs: options.heartbeatMs,
@@ -113,12 +136,13 @@ export async function runTurnJob(
     expire: (current, now) => expireTurnLease(options.pool, current, now),
   })
   const active = options.active ?? new TurnExecutionRegistry()
-  const root = options.interrupts?.getOrCreate({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId })
+  const target = { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId }
+  const root = options.interrupts?.getOrCreate(target) ?? (options.isInterrupted ? new RootAbortController(target) : undefined)
   const linked = root ? linkAbortSignals([heartbeat.signal, root.signal]) : { signal: heartbeat.signal, dispose: () => undefined }
+  const stopInterruptProbe = root ? startInterruptProbe(options, lease, root, pollIntervalMs) : () => undefined
   active.add({
     lease,
     abort: async () => {
-      root?.stop("worker_shutdown")
       await heartbeat.abort("Turn interrupted by Worker shutdown")
     },
   })
@@ -129,8 +153,14 @@ export async function runTurnJob(
       options.execute({ lease, signal: linked.signal }),
       heartbeat.lost.then((error) => { throw error }),
     ])
+    if (result.status === "waiting_for_dependency" && result.waitId && options.waitHandoff) {
+      await options.waitHandoff({ lease: heartbeat.currentLease, waitId: result.waitId, now: options.now?.() ?? new Date() })
+      return result
+    }
     const released = await releaseTurnLease(options.pool, heartbeat.currentLease, result.status, options.now?.() ?? new Date())
-    if (!released && root?.stopped) return { status: "interrupted", summary: "Turn stopped by a persisted interrupt" }
+    if (!released && (root?.stopped || await safePersistedInterrupt(options.pool, heartbeat.currentLease, options.isInterrupted))) {
+      return { status: "interrupted", summary: "Turn stopped by a persisted interrupt" }
+    }
     if (!released) throw new TurnLeaseError("lease_lost", "Turn lease was fenced before completion")
     return result
   } catch (error: unknown) {
@@ -138,10 +168,15 @@ export async function runTurnJob(
       await releaseTurnLease(options.pool, heartbeat.currentLease, "interrupted", options.now?.() ?? new Date()).catch(() => undefined)
       return { status: "interrupted", summary: "Turn stopped by a persisted interrupt" }
     }
+    if (error instanceof TurnLeaseError && error.code === "lease_lost" && await safePersistedInterrupt(options.pool, heartbeat.currentLease, options.isInterrupted)) {
+      await releaseTurnLease(options.pool, heartbeat.currentLease, "interrupted", options.now?.() ?? new Date()).catch(() => undefined)
+      return { status: "interrupted", summary: "Turn stopped by a persisted interrupt" }
+    }
     const decision = classifyTurnFailure(error, job.attemptsMade, TURN_MAX_ATTEMPTS)
     if (decision.disposition === "skip") return { status: "skipped", reasonCode: decision.reasonCode }
     if (decision.disposition === "retry") {
       if (decision.reasonCode === "lease_lost") {
+        await options.interruptSubagents?.(heartbeat.currentLease).catch(() => undefined)
         await expireTurnLease(options.pool, heartbeat.currentLease, options.now?.() ?? new Date()).catch(() => undefined)
         return { status: "requeued", reasonCode: decision.reasonCode }
       }
@@ -152,6 +187,7 @@ export async function runTurnJob(
     await releaseTurnLease(options.pool, heartbeat.currentLease, "failed", options.now?.() ?? new Date()).catch(() => undefined)
     return { status: "dead_lettered", reasonCode: decision.reasonCode }
   } finally {
+    stopInterruptProbe()
     linked.dispose()
     if (root) options.interrupts?.release(root.target)
     heartbeat.stop()
@@ -172,10 +208,14 @@ export async function enqueueTurn(
 export function createTurnQueue(options: {
   pool: LeasePool
   execute: TurnExecutor
+  waitHandoff?: TurnWaitHandoff
   queue?: TurnQueueLike
   interrupts?: RootAbortControllerRegistry
   leaseMs?: number
   heartbeatMs?: number
+  interruptPollMs?: number
+  isInterrupted?: (lease: TurnLease) => Promise<boolean>
+  interruptSubagents?: (lease: TurnLease) => Promise<unknown>
 }): { queue: TurnQueueLike; worker: Worker<TurnJobPayload>; active: TurnExecutionRegistry; close: () => Promise<void> } {
   const queue = options.queue ?? new Queue<TurnJobPayload>(TURN_QUEUE_NAME, { connection: redisConnection, skipVersionCheck: true })
   const active = new TurnExecutionRegistry()
@@ -184,10 +224,14 @@ export function createTurnQueue(options: {
     (job) => runTurnJob(job, {
       pool: options.pool,
       execute: options.execute,
+      waitHandoff: options.waitHandoff,
       active,
       interrupts: options.interrupts,
       leaseMs: options.leaseMs,
       heartbeatMs: options.heartbeatMs,
+      interruptPollMs: options.interruptPollMs,
+      isInterrupted: options.isInterrupted ?? (lease => safePersistedInterrupt(options.pool, lease)),
+      interruptSubagents: options.interruptSubagents,
     }),
     { connection: redisConnection, concurrency: 1, skipVersionCheck: true, ...workerPollingOptions() },
   )

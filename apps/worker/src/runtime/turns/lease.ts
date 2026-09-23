@@ -1,5 +1,7 @@
 import type pg from "pg"
 
+import { isSessionControlGate, OPEN_SESSION, RUNNABLE_SESSION } from "../session-gate.js"
+
 /** Normal owner window. A scanner reclaims the Turn after this expires. */
 export const TURN_LEASE_WINDOW_MS = 60_000
 /** Renew before the 60s window expires, while the owner is still healthy. */
@@ -7,11 +9,7 @@ export const TURN_HEARTBEAT_INTERVAL_MS = 20_000
 /** Maximum continuous ownership; heartbeat renewal cannot extend beyond it. */
 export const TURN_MAX_LEASE_MS = 5 * 60_000
 
-export type TurnJobPayload = {
-  turnId: string
-  sessionId: string
-  ownerId: string
-}
+export type TurnJobPayload = { turnId: string; sessionId: string; ownerId: string }
 export function parseTurnJobPayload(value: unknown): TurnJobPayload | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null
   const row = value as Record<string, unknown>
@@ -21,58 +19,24 @@ export function parseTurnJobPayload(value: unknown): TurnJobPayload | null {
   return { turnId: row.turnId as string, sessionId: row.sessionId as string, ownerId: row.ownerId as string }
 }
 
-export type TurnLease = TurnJobPayload & {
-  userId: string
-  leaseVersion: number
-  leaseStartedAt: Date
-  leaseExpiresAt: Date
-}
+export type TurnLease = TurnJobPayload & { userId: string; leaseVersion: number; leaseStartedAt: Date; leaseExpiresAt: Date }
 
 export type LeasePool = Pick<pg.Pool, "connect">
-export type LeaseReleaseStatus =
-  | "queued"
-  | "waiting_for_dependency"
-  | "waiting_for_approval"
-  | "waiting_for_user"
-  | "interrupted"
-  | "failed"
-  | "completed"
+export type LeaseReleaseStatus = "queued" | "waiting_for_dependency" | "waiting_for_approval" | "waiting_for_user" | "interrupted" | "failed" | "completed"
 
 export type LeaseErrorCode = "lease_not_available" | "lease_lost"
 
 export class TurnLeaseError extends Error {
   readonly recoverable = true
-
-  constructor(readonly code: LeaseErrorCode, message: string) {
-    super(message)
-    this.name = "TurnLeaseError"
-  }
+  constructor(readonly code: LeaseErrorCode, message: string) { super(message); this.name = "TurnLeaseError" }
 }
 
-type LeaseRow = {
-  id: string
-  sessionId: string
-  userId: string
-  leaseOwnerId: string
-  leaseVersion: number
-  leaseStartedAt: Date | string
-  leaseExpiresAt: Date | string
-}
+type LeaseRow = { id: string; sessionId: string; userId: string; leaseOwnerId: string; leaseVersion: number; leaseStartedAt: Date | string; leaseExpiresAt: Date | string }
 
-function date(value: Date | string): Date {
-  return value instanceof Date ? value : new Date(value)
-}
+function date(value: Date | string): Date { return value instanceof Date ? value : new Date(value) }
 
 function lease(row: LeaseRow): TurnLease {
-  return {
-    turnId: row.id,
-    sessionId: row.sessionId,
-    ownerId: row.leaseOwnerId,
-    userId: row.userId,
-    leaseVersion: row.leaseVersion,
-    leaseStartedAt: date(row.leaseStartedAt),
-    leaseExpiresAt: date(row.leaseExpiresAt),
-  }
+  return { turnId: row.id, sessionId: row.sessionId, ownerId: row.leaseOwnerId, userId: row.userId, leaseVersion: row.leaseVersion, leaseStartedAt: date(row.leaseStartedAt), leaseExpiresAt: date(row.leaseExpiresAt) }
 }
 
 function validateWindow(leaseMs: number): void {
@@ -85,6 +49,65 @@ async function rollback(client: pg.PoolClient): Promise<void> {
   await client.query("ROLLBACK").catch(() => undefined)
 }
 
+class LeaseUnavailable extends Error {}
+
+async function transaction<T>(pool: LeasePool, userId: string | null, work: (client: pg.PoolClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect()
+  let committed = false
+  try {
+    await client.query("BEGIN")
+    if (userId) await client.query("SELECT set_config('app.user_id', $1, true)", [userId])
+    const result = await work(client)
+    await client.query("COMMIT")
+    committed = true
+    return result
+  } catch (error: unknown) {
+    if (!committed) await rollback(client)
+    throw error
+  } finally {
+    client.release()
+  }
+}
+
+async function lockOpenSession(client: pg.PoolClient, sessionId: string, userId: string): Promise<void> {
+  const result = await client.query(
+    `SELECT session."id" FROM "agent_sessions" AS session
+     WHERE session."id" = $1 AND session."userId" = $2 AND ${OPEN_SESSION}
+     FOR UPDATE`,
+    [sessionId, userId],
+  )
+  if (!result.rows[0] && result.rowCount !== 1) throw new LeaseUnavailable("Turn session is no longer open")
+}
+
+async function lockClaimSession(client: pg.PoolClient, payload: TurnJobPayload): Promise<string | null> {
+  const result = await client.query<{ userId: string; controlGate: unknown }>(
+    `SELECT session."userId", session."controlGate"
+     FROM "agent_sessions" AS session
+     WHERE session."id" = $1 AND ${RUNNABLE_SESSION}
+       AND EXISTS (
+         SELECT 1 FROM "agent_turns" AS turn
+         WHERE turn."id" = $2 AND turn."sessionId" = session."id" AND turn."userId" = session."userId"
+       )
+     FOR UPDATE`,
+    [payload.sessionId, payload.turnId],
+  )
+  const row = result.rows[0]
+  const controlGate = row?.controlGate
+  if ((!row && result.rowCount !== 1) || (row && ((result.rowCount !== undefined && result.rowCount !== 1) || (controlGate !== undefined && (!isSessionControlGate(controlGate) || controlGate !== "open"))))) {
+    throw new LeaseUnavailable("Turn session is not runnable")
+  }
+  return row?.userId ?? null
+}
+
+async function withOpenLease<T>(pool: LeasePool, current: TurnLease, fallback: T, work: (client: pg.PoolClient) => Promise<T>): Promise<T> {
+  try {
+    return await transaction(pool, current.userId, async client => { await lockOpenSession(client, current.sessionId, current.userId); return work(client) })
+  } catch (error: unknown) {
+    if (error instanceof LeaseUnavailable) return fallback
+    throw error
+  }
+}
+
 /** Claims with one conditional UPDATE. Never use a read-then-write claim. */
 export async function claimTurnLease(
   pool: LeasePool,
@@ -94,11 +117,11 @@ export async function claimTurnLease(
 ): Promise<TurnLease> {
   validateWindow(leaseMs)
   if (!parseTurnJobPayload(payload)) throw new TypeError("Invalid Turn lease payload")
-  const client = await pool.connect()
-  let committed = false
   try {
-    await client.query("BEGIN")
-    const result = await client.query<LeaseRow>(
+    return await transaction(pool, null, async (client) => {
+      const userId = await lockClaimSession(client, payload)
+      if (userId) await client.query("SELECT set_config('app.user_id', $1, true)", [userId])
+      const result = await client.query<LeaseRow>(
       `UPDATE "agent_turns"
        SET "status" = 'in_progress',
            "leaseOwnerId" = $3,
@@ -110,20 +133,24 @@ export async function claimTurnLease(
            "updatedAt" = $4
        WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'queued'
          AND ("leaseOwnerId" IS NULL OR "leaseExpiresAt" <= $4)
-       RETURNING "id", "sessionId", "userId", "leaseOwnerId", "leaseVersion",
+         AND EXISTS (
+           SELECT 1 FROM "agent_sessions" AS session
+           WHERE session."id" = "agent_turns"."sessionId"
+             AND session."id" = $2
+             AND session."userId" = "agent_turns"."userId"
+             AND ${RUNNABLE_SESSION}
+         )
+         RETURNING "id", "sessionId", "userId", "leaseOwnerId", "leaseVersion",
                  "leaseStartedAt", "leaseExpiresAt"`,
-      [payload.turnId, payload.sessionId, payload.ownerId, now, leaseMs],
-    )
-    const row = result.rows[0]
-    await client.query("COMMIT")
-    committed = true
-    if (!row) throw new TurnLeaseError("lease_not_available", "Turn is no longer available for execution")
-    return lease(row)
+        [payload.turnId, payload.sessionId, payload.ownerId, now, leaseMs],
+      )
+      const row = result.rows[0]
+      if (!row) throw new TurnLeaseError("lease_not_available", "Turn is no longer available for execution")
+      return lease(row)
+    })
   } catch (error: unknown) {
-    if (!committed) await rollback(client)
+    if (error instanceof LeaseUnavailable) throw new TurnLeaseError("lease_not_available", error.message)
     throw error
-  } finally {
-    client.release()
   }
 }
 
@@ -134,8 +161,7 @@ export async function renewTurnLease(
   leaseMs = TURN_LEASE_WINDOW_MS,
 ): Promise<TurnLease | null> {
   validateWindow(leaseMs)
-  const client = await pool.connect()
-  try {
+  return withOpenLease(pool, current, null, async client => {
     const result = await client.query<LeaseRow>(
       `UPDATE "agent_turns"
        SET "leaseExpiresAt" = LEAST(
@@ -151,10 +177,9 @@ export async function renewTurnLease(
                  "leaseStartedAt", "leaseExpiresAt"`,
       [current.turnId, current.sessionId, current.ownerId, current.leaseVersion, leaseMs, now, TURN_MAX_LEASE_MS],
     )
-    return result.rows[0] ? lease(result.rows[0]) : null
-  } finally {
-    client.release()
-  }
+    if (!result.rows[0]) throw new LeaseUnavailable("Turn lease is no longer renewable")
+    return lease(result.rows[0])
+  })
 }
 
 /** Leaves an in-progress Turn for the scanner after a lost heartbeat. */
@@ -163,8 +188,7 @@ export async function expireTurnLease(
   current: TurnLease,
   now = new Date(),
 ): Promise<boolean> {
-  const client = await pool.connect()
-  try {
+  return withOpenLease(pool, current, false, async client => {
     const result = await client.query(
       `UPDATE "agent_turns"
        SET "leaseOwnerId" = NULL, "leaseExpiresAt" = $5, "leaseStartedAt" = NULL,
@@ -173,10 +197,9 @@ export async function expireTurnLease(
          AND "leaseVersion" = $4 AND "status" = 'in_progress'`,
       [current.turnId, current.sessionId, current.ownerId, current.leaseVersion, now],
     )
-    return result.rowCount === 1
-  } finally {
-    client.release()
-  }
+    if (result.rowCount !== 1) throw new LeaseUnavailable("Turn lease is no longer owned")
+    return true
+  })
 }
 
 export async function releaseTurnLease(
@@ -185,8 +208,7 @@ export async function releaseTurnLease(
   status: LeaseReleaseStatus,
   now = new Date(),
 ): Promise<boolean> {
-  const client = await pool.connect()
-  try {
+  return withOpenLease(pool, current, false, async client => {
     const result = await client.query(
       `UPDATE "agent_turns"
        SET "status" = $5, "leaseOwnerId" = NULL, "leaseExpiresAt" = NULL,
@@ -194,13 +216,13 @@ export async function releaseTurnLease(
            "completedAt" = CASE WHEN $5 IN ('interrupted', 'failed', 'completed') THEN $6 ELSE NULL END,
            "updatedAt" = $6
        WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwnerId" = $3
-         AND "leaseVersion" = $4 AND "status" = 'in_progress'`,
-      [current.turnId, current.sessionId, current.ownerId, current.leaseVersion, status, now],
+         AND "leaseVersion" = $4 AND "userId" = $7 AND "leaseExpiresAt" > $6
+         AND ("status" = 'in_progress' OR ("status" = 'waiting_for_user' AND $5 = 'waiting_for_user') OR ("status" = 'waiting_for_approval' AND $5 = 'waiting_for_approval'))`,
+      [current.turnId, current.sessionId, current.ownerId, current.leaseVersion, status, now, current.userId],
     )
-    return result.rowCount === 1
-  } finally {
-    client.release()
-  }
+    if (result.rowCount !== 1) throw new LeaseUnavailable("Turn lease is no longer owned")
+    return true
+  })
 }
 
 /** Fallback for the shutdown race where heartbeat already cleared ownership. */
@@ -209,8 +231,7 @@ export async function interruptTurnLease(
   current: TurnLease,
   now = new Date(),
 ): Promise<boolean> {
-  const client = await pool.connect()
-  try {
+  return withOpenLease(pool, current, false, async client => {
     const result = await client.query(
       `UPDATE "agent_turns"
        SET "status" = 'interrupted', "leaseOwnerId" = NULL, "leaseExpiresAt" = NULL,
@@ -221,8 +242,7 @@ export async function interruptTurnLease(
          AND ("leaseOwnerId" = $4 OR ("leaseOwnerId" IS NULL AND "leaseExpiresAt" <= $5))`,
       [current.turnId, current.sessionId, current.leaseVersion, current.ownerId, now],
     )
-    return result.rowCount === 1
-  } finally {
-    client.release()
-  }
+    if (result.rowCount !== 1) throw new LeaseUnavailable("Turn lease is no longer owned")
+    return true
+  })
 }

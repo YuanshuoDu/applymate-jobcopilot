@@ -1,7 +1,15 @@
 /** CANONICAL Phase 9 timeline state root — do not duplicate. See #459. */
 
 import { AGENT_STREAM_SCHEMA_VERSION } from '@jobcopilot/agent-protocol'
-import { appendFallbackEvent, appendTimelineEvent, buildIndexes, compareItems, integer, isAfter, isRecord, itemFromTimelineEvent, mergeContent, numberOrUndefined, sequence, stringOrNull, timestamp } from './timeline-reducer-utils'
+import { createApprovalLedgerState, type ApprovalLedgerState } from './approval-ledger-view'
+import { createCognitiveAgendaState, type TimelineCognitiveAgendaState } from './timeline-cognitive-agenda'
+import { normalizeTimelineEvent } from './timeline-event-normalizer'
+import { reduceTimelineEvent } from './timeline-event-reducer'
+import { reduceTimelineDelta, reduceTimelineItems, upsertTimelineItem } from './timeline-reducer-items'
+import { appendTimelineEvent, isAfter, isRecord, stringOrNull } from './timeline-reducer-utils'
+import { emptyTimelineSteeringMarkerState, type TimelineSteeringMarkerEvent, type TimelineSteeringMarkerState } from './timeline-steering-markers'
+import { createTimelineSessionControlState, type TimelineSessionControlState } from './timeline-session-control'
+export { normalizeTimelineEvent, normalizeTimelineItem } from './timeline-event-normalizer'
 
 export type TimelineConnection = 'idle' | 'connected' | 'reconnecting'
 export type TimelineItemSource = 'replay' | 'durable' | 'transient' | 'unknown'
@@ -58,6 +66,12 @@ export interface TimelineState {
   itemIdsByTaskId: Record<string, string[]>
   processedEventIds: Record<string, true>
   lastSequence: string | null
+  sessionControl: TimelineSessionControlState
+  lifecycleRevision: number
+  cognitiveAgenda: TimelineCognitiveAgendaState
+  approvalLedger: ApprovalLedgerState
+  steeringMarkers: TimelineSteeringMarkerState
+  steeringMarkerEvents: readonly TimelineSteeringMarkerEvent[]
   connection: TimelineConnection
   snapshotRequired: boolean
 }
@@ -72,21 +86,14 @@ export type TimelineAction =
   | { type: 'disconnected' }
   | { type: 'snapshot-required' }
 
-const TERMINAL_STATUSES = new Set(['completed', 'failed', 'interrupted'])
-const KNOWN_EVENT_TYPES = new Set([
-  'turn.started', 'turn.wakeup', 'turn.resumed', 'turn.completed', 'turn.failed',
-  'step.started', 'step.completed', 'item.started', 'item.delta', 'item.completed', 'item.failed',
-  'input.accepted', 'input.consumed', 'tool_call.started', 'tool_call.completed', 'tool_call.failed',
-  'policy.decision', 'approval.requested', 'approval.resolved', 'approval.consumed', 'approval.expired',
-  'question.answered', 'question.cancelled', 'external_action.reserved', 'stream.overflow',
-])
+const RETIRED_PLAN_EVENT_TYPES = new Set(['plan.revision', 'plan.command', 'plan.observation', 'plan.task_graph'])
 
 export function createTimelineState(sessionId: string): TimelineState {
   return {
     sessionId, events: [], byId: new Map(), byTurnId: new Map(), byToolCallId: new Map(), lastEventId: null,
     transientItems: new Map(), fallbackItems: [],
     itemIds: [], itemsById: {}, itemIdsByTurnId: {}, itemIdsByTaskId: {},
-    processedEventIds: {}, lastSequence: null, connection: 'idle', snapshotRequired: false,
+    processedEventIds: {}, lastSequence: null, sessionControl: createTimelineSessionControlState(), lifecycleRevision: 0, cognitiveAgenda: createCognitiveAgendaState(sessionId), approvalLedger: createApprovalLedgerState(sessionId), steeringMarkers: emptyTimelineSteeringMarkerState(), steeringMarkerEvents: [], connection: 'idle', snapshotRequired: false,
   }
 }
 
@@ -97,14 +104,14 @@ export function selectTimelineItems(state: TimelineState): TimelineItem[] {
 export function timelineReducer(state: TimelineState, action: TimelineAction): TimelineState {
   switch (action.type) {
     case 'hydrate': {
-      let next = reduceItems(state, action.items, 'replay')
+      let next = reduceTimelineItems(state, action.items, 'replay')
       for (const event of action.tail ?? []) next = reduceEvent(next, event)
-      for (const delta of action.deltas ?? []) next = reduceDelta(next, delta)
+      for (const delta of action.deltas ?? []) next = reduceTimelineDelta(next, delta)
       return { ...next, snapshotRequired: false }
     }
-    case 'replay': return reduceItems(state, action.items, 'replay')
+    case 'replay': return reduceTimelineItems(state, action.items, 'replay')
     case 'event': return reduceEvent(state, action.event)
-    case 'delta': return reduceDelta(state, action.delta)
+    case 'delta': return reduceTimelineDelta(state, action.delta)
     case 'legacy': return reduceLegacy(state, action.event)
     case 'connected': return { ...state, connection: 'connected' }
     case 'disconnected': return { ...state, connection: 'reconnecting' }
@@ -112,100 +119,20 @@ export function timelineReducer(state: TimelineState, action: TimelineAction): T
   }
 }
 
-export function normalizeTimelineItem(value: unknown, source: TimelineItemSource = 'replay'): TimelineItem | null {
-  if (!isRecord(value) || typeof value.id !== 'string' || typeof value.sessionId !== 'string' ||
-    typeof value.turnId !== 'string' || typeof value.type !== 'string' ||
-    value.schemaVersion !== AGENT_STREAM_SCHEMA_VERSION) return null
-  const createdAt = timestamp(value.createdAt) ?? new Date(0).toISOString()
-  return {
-    schemaVersion: typeof value.schemaVersion === 'string' ? value.schemaVersion : AGENT_STREAM_SCHEMA_VERSION,
-    id: value.id, sessionId: value.sessionId, turnId: value.turnId,
-    stepId: stringOrNull(value.stepId), taskId: stringOrNull(value.taskId), type: value.type,
-    status: typeof value.status === 'string' ? value.status : 'started',
-    phase: stringOrNull(value.phase), revision: integer(value.revision), content: value.content ?? null,
-    startedAt: timestamp(value.startedAt), completedAt: timestamp(value.completedAt),
-    createdAt, updatedAt: timestamp(value.updatedAt) ?? createdAt, source, sequence: sequence(value.sequence),
-  }
-}
-
-export function normalizeTimelineEvent(value: unknown): TimelineEvent | null {
-  if (!isRecord(value) || typeof value.id !== 'string' || typeof value.sessionId !== 'string' ||
-    typeof value.turnId !== 'string' || typeof value.type !== 'string' ||
-    value.schemaVersion !== AGENT_STREAM_SCHEMA_VERSION) return null
-  const rawKind = value.kind
-  if (rawKind !== undefined && rawKind !== 'delta' && rawKind !== 'snapshot') return null
-  const kind = rawKind === 'delta' || rawKind === 'snapshot' ? rawKind : undefined
-  const rawSequence = value.sequence
-  if (rawSequence !== null && rawSequence !== undefined && sequence(rawSequence) === null) return null
-  return {
-    schemaVersion: typeof value.schemaVersion === 'string' ? value.schemaVersion : AGENT_STREAM_SCHEMA_VERSION,
-    id: value.id, sessionId: value.sessionId, turnId: value.turnId,
-    itemId: stringOrNull(value.itemId), taskId: stringOrNull(value.taskId), type: value.type,
-    actor: typeof value.actor === 'string' ? value.actor : 'system', sequence: sequence(rawSequence),
-    payload: value.payload ?? null, createdAt: timestamp(value.createdAt) ?? undefined, kind,
-    baseRevision: numberOrUndefined(value.baseRevision), revision: numberOrUndefined(value.revision),
-  }
-}
-
-function reduceItems(state: TimelineState, values: unknown[], source: TimelineItemSource): TimelineState {
-  let next = state
-  for (const value of values) {
-    const item = normalizeTimelineItem(value, source)
-    if (item?.sessionId === state.sessionId) next = upsertItem(next, item, source)
-  }
-  return next
-}
-
 function reduceEvent(state: TimelineState, value: unknown): TimelineState {
-  const event = normalizeTimelineEvent(value)
-  if (!event || event.sessionId !== state.sessionId || state.processedEventIds[event.id]) return state
-  if (event.sequence !== null && !isAfter(event.sequence, state.lastSequence)) return state
-  const processedEventIds: Record<string, true> = { ...state.processedEventIds, [event.id]: true }
-  let next: TimelineState = {
-    ...state,
-    processedEventIds,
-    lastSequence: event.sequence && isAfter(event.sequence, state.lastSequence) ? event.sequence : state.lastSequence,
-  }
-  next = { ...next, ...appendTimelineEvent(next.events, event), lastEventId: event.id }
-  if (event.type === 'stream.overflow') return { ...next, snapshotRequired: true, connection: 'reconnecting' }
-  if (event.type === 'item.delta') {
-    const existingRevision = state.itemsById[event.itemId ?? '']?.revision ?? 0
-    return reduceDelta(next, { ...event, kind: 'delta', revision: event.revision ?? existingRevision + 1 }, event.id)
-  }
-  if (!event.itemId) return KNOWN_EVENT_TYPES.has(event.type) ? next : addUnknownEvent(next, event)
-  const existing = state.itemsById[event.itemId]
-  const status = event.type === 'item.completed' ? 'completed' : event.type === 'item.failed' ? 'failed' : existing?.status ?? 'started'
-  if (existing && TERMINAL_STATUSES.has(existing.status) && status !== 'completed') return next
-  if (!KNOWN_EVENT_TYPES.has(event.type)) next = { ...next, fallbackItems: appendFallbackEvent(next.fallbackItems, event) }
-  const item = itemFromTimelineEvent(event, status, existing, undefined, normalizeTimelineItem)
-  return item ? upsertItem(next, item, item.source === 'unknown' ? 'unknown' : 'durable') : next
+  if (isRecord(value) && typeof value.type === 'string' && RETIRED_PLAN_EVENT_TYPES.has(value.type)) return advanceRetiredPlanEventCursor(state, value)
+  return reduceTimelineEvent(state, value)
 }
 
-function reduceDelta(state: TimelineState, value: unknown, preprocessedId?: string): TimelineState {
-  const delta = normalizeTimelineEvent(value)
-  if (!delta || delta.sessionId !== state.sessionId || !delta.itemId || (preprocessedId === undefined && state.processedEventIds[delta.id])) return state
-  if (preprocessedId === undefined && delta.sequence !== null && !isAfter(delta.sequence, state.lastSequence)) return state
-  const processedEventIds: Record<string, true> = preprocessedId === undefined
-    ? { ...state.processedEventIds, [delta.id]: true }
-    : state.processedEventIds
-  state = {
+function advanceRetiredPlanEventCursor(state: TimelineState, value: Record<string, unknown>): TimelineState {
+  const event = normalizeTimelineEvent(value)
+  if (!event || event.sessionId !== state.sessionId || event.sequence === null || state.processedEventIds[event.id] || !isAfter(event.sequence, state.lastSequence)) return state
+  return {
     ...state,
-    processedEventIds,
-    lastSequence: delta.sequence && isAfter(delta.sequence, state.lastSequence) ? delta.sequence : state.lastSequence,
+    processedEventIds: { ...state.processedEventIds, [event.id]: true },
+    lastEventId: event.id,
+    lastSequence: event.sequence,
   }
-  if (preprocessedId === undefined) state = { ...state, ...appendTimelineEvent(state.events, delta), lastEventId: delta.id }
-  const payload = isRecord(delta.payload) ? delta.payload : {}
-  const revision = delta.revision ?? numberOrUndefined(payload.revision)
-  if (revision === undefined) return state
-  const existing = state.itemsById[delta.itemId]
-  if (existing && (TERMINAL_STATUSES.has(existing.status) || revision <= existing.revision)) return state
-  if (delta.kind === 'delta' && delta.baseRevision !== undefined && delta.baseRevision > (existing?.revision ?? 0)) {
-    return { ...state, snapshotRequired: true, connection: 'reconnecting' }
-  }
-  const item = itemFromTimelineEvent(delta, 'streaming', existing, revision, normalizeTimelineItem)
-  if (!item) return state
-  const next = upsertItem(state, { ...item, revision, source: 'transient' }, 'transient', delta.kind === 'snapshot')
-  return delta.kind === 'snapshot' ? { ...next, snapshotRequired: false } : next
 }
 
 function reduceLegacy(state: TimelineState, value: unknown): TimelineState {
@@ -219,31 +146,5 @@ function reduceLegacy(state: TimelineState, value: unknown): TimelineState {
     startedAt: value.createdAt, completedAt: value.createdAt, createdAt: value.createdAt, updatedAt: value.createdAt,
     source: 'replay', sequence: null,
   }
-  return upsertItem(state, item, 'replay')
-}
-
-function addUnknownEvent(state: TimelineState, event: TimelineEvent): TimelineState {
-  const itemId = `unknown:${event.id}`
-  return upsertItem({ ...state, fallbackItems: appendFallbackEvent(state.fallbackItems, event) }, {
-    schemaVersion: event.schemaVersion, id: itemId, sessionId: event.sessionId, turnId: event.turnId,
-    stepId: null, taskId: event.taskId, type: 'unknown', status: 'completed', phase: 'commentary', revision: 0,
-    content: { eventType: event.type, payload: event.payload, opaque: true }, startedAt: event.createdAt ?? null,
-    completedAt: event.createdAt ?? null, createdAt: event.createdAt ?? new Date(0).toISOString(),
-    updatedAt: event.createdAt ?? new Date(0).toISOString(), source: 'unknown', sequence: event.sequence,
-  }, 'unknown')
-}
-
-function upsertItem(state: TimelineState, item: TimelineItem, source: TimelineItemSource, replaceContent = false): TimelineState {
-  const existing = state.itemsById[item.id]
-  if (existing && source === 'transient' && (TERMINAL_STATUSES.has(existing.status) || item.revision <= existing.revision)) return state
-  if (existing && source === 'durable' && existing.sequence && item.sequence && !isAfter(item.sequence, existing.sequence) && item.status !== 'completed') return state
-  const nextItem = source === 'transient' && existing
-    ? { ...existing, ...item, content: replaceContent ? item.content : mergeContent(existing.content, item.content), source }
-    : { ...existing, ...item, source }
-  const itemsById = { ...state.itemsById, [item.id]: nextItem }
-  const itemIds = Object.values(itemsById).sort(compareItems).map((entry) => entry.id)
-  const transientItems = new Map(state.transientItems)
-  if (source === 'transient') transientItems.set(item.id, nextItem)
-  else transientItems.delete(item.id)
-  return { ...state, itemsById, itemIds, transientItems, ...buildIndexes(itemsById) }
+  return upsertTimelineItem(state, item, 'replay')
 }

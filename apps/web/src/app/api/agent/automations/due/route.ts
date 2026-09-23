@@ -1,10 +1,11 @@
 import { NextRequest } from "next/server"
+import { Prisma } from "@prisma/client"
 import { db } from "@/lib/db"
 import { err, ok } from "@/lib/api-helpers"
 import { nextRunAfterCurrent } from "@/lib/agent/automation-schedule"
 import { enqueueAgentRun } from "@/lib/agent-run-queue-client"
 import { ensureAgentExecution } from "@/lib/agent/execution-control"
-import { ensureAutomationTurn, isActiveAutomationExecution, resolveAutomationSession } from "@/lib/agent/automation-session"
+import { assertExistingAutomationSessionOpen, AutomationSessionPausedError, AutomationTurnOccupiedError, ensureAutomationTurn, isActiveAutomationExecution, resolveAutomationSession } from "@/lib/agent/automation-session"
 import { hasEffectiveEntitlement } from '@/lib/entitlements'
 import { isRuntimeAgentHarnessFeatureEnabled } from '@/lib/runtime-feature-flags'
 import { createDualWriteSession } from '@/lib/agent/session/dual-write'
@@ -47,6 +48,17 @@ function automationPayload(automation: AutomationForRun) {
   }
 }
 
+function runnableAutomationWhere(automation: Pick<AutomationForRun, "id" | "userId">, now: Date): Prisma.AgentAutomationWhereInput {
+  return {
+    id: automation.id,
+    userId: automation.userId,
+    enabled: true,
+    nextRunAt: { lte: now },
+    user: { accountStatus: "active" },
+    OR: [{ sessionId: null }, { session: { is: { controlGate: "open" } } }],
+  }
+}
+
 async function startAutomation(automation: AutomationForRun, now: Date) {
   requireLegacyPolicy({
     userId: automation.userId, sessionId: automation.sessionId ?? `automation-scheduler:${automation.id}`,
@@ -55,13 +67,19 @@ async function startAutomation(automation: AutomationForRun, now: Date) {
     capabilities: ["read", "write", "coordination"], input: { mutation: "scheduled_run", requiresReceipt: false, unknownSensitiveFacts: false },
   })
   if (automation.sessionId) {
+    try {
+      await assertExistingAutomationSessionOpen(db, { sessionId: automation.sessionId, userId: automation.userId })
+    } catch (error: unknown) {
+      if (error instanceof AutomationSessionPausedError) return null
+      throw error
+    }
     const execution = await db.agentExecution.findFirst({
       where: { userId: automation.userId, sessionId: automation.sessionId },
       select: { status: true },
     })
     if (isActiveAutomationExecution(execution?.status)) {
       await db.agentAutomation.updateMany({
-        where: { id: automation.id, userId: automation.userId, enabled: true, nextRunAt: { lte: now }, user: { accountStatus: 'active' } },
+        where: runnableAutomationWhere(automation, now),
         data: { lastRunAt: now, nextRunAt: nextRunAfterCurrent(automation.cron, now, automation.timezone) },
       })
       return null
@@ -69,33 +87,70 @@ async function startAutomation(automation: AutomationForRun, now: Date) {
   }
 
   const claimed = await db.agentAutomation.updateMany({
-    where: { id: automation.id, userId: automation.userId, enabled: true, nextRunAt: { lte: now }, user: { accountStatus: 'active' } },
+    where: runnableAutomationWhere(automation, now),
     data: {
       lastRunAt: now,
       nextRunAt: nextRunAfterCurrent(automation.cron, now, automation.timezone),
     },
   })
-  if (claimed.count === 0) return null
-
-  const { session, created } = await resolveAutomationSession(db, {
-    automationId: automation.id,
-    userId: automation.userId,
-    sessionId: automation.sessionId,
-    name: automation.name,
-    memorySummary: "Automation picked up by scheduler.",
-  })
-  if (!created) {
-    await db.agentSession.update({
-      where: { id: session.id },
-      data: { status: "running", completedAt: null, memorySummary: "Automation picked up by scheduler." },
-    })
+  if (claimed.count === 0) {
+    if (automation.sessionId) {
+      try {
+        await assertExistingAutomationSessionOpen(db, { sessionId: automation.sessionId, userId: automation.userId })
+      } catch (error: unknown) {
+        if (error instanceof AutomationSessionPausedError) return null
+        throw error
+      }
+    }
+    return null
   }
 
-  const canonicalTurn = await ensureAutomationTurn(db, {
-    sessionId: session.id,
-    userId: automation.userId,
-    name: automation.name,
-  })
+  let resolution: Awaited<ReturnType<typeof resolveAutomationSession>>
+  try {
+    resolution = await resolveAutomationSession(db, {
+      automationId: automation.id,
+      userId: automation.userId,
+      sessionId: automation.sessionId,
+      name: automation.name,
+      memorySummary: "Automation picked up by scheduler.",
+    })
+  } catch (error: unknown) {
+    if (error instanceof AutomationSessionPausedError) {
+      await db.agentAutomation.update({ where: { id: automation.id, userId: automation.userId }, data: { nextRunAt: now } })
+      return null
+    }
+    throw error
+  }
+  const { session, created } = resolution
+  if (!created) {
+    const reopened = await db.agentSession.updateMany({
+      where: { id: session.id, userId: automation.userId, controlGate: "open" },
+      data: { status: "running", completedAt: null, memorySummary: "Automation picked up by scheduler." },
+    })
+    if (reopened.count !== 1) {
+      await db.agentAutomation.update({ where: { id: automation.id, userId: automation.userId }, data: { nextRunAt: now } })
+      return null
+    }
+  }
+
+  let canonicalTurn: Awaited<ReturnType<typeof ensureAutomationTurn>>
+  try {
+    canonicalTurn = await ensureAutomationTurn(db, {
+      sessionId: session.id,
+      userId: automation.userId,
+      name: automation.name,
+    })
+  } catch (error: unknown) {
+    if (error instanceof AutomationTurnOccupiedError) {
+      await db.agentAutomation.update({ where: { id: automation.id, userId: automation.userId }, data: { nextRunAt: now } })
+      return null
+    }
+    if (error instanceof AutomationSessionPausedError) {
+      await db.agentAutomation.update({ where: { id: automation.id, userId: automation.userId }, data: { nextRunAt: now } })
+      return null
+    }
+    throw error
+  }
 
   const dualWriteEnabled = await isRuntimeAgentHarnessFeatureEnabled(
     'AGENT_PROTOCOL_V2_DUAL_WRITE',
@@ -166,7 +221,12 @@ async function runDueAutomations(req: NextRequest) {
 
   const now = new Date()
   const automations = await db.agentAutomation.findMany({
-    where: { enabled: true, nextRunAt: { lte: now }, user: { accountStatus: 'active' } },
+    where: {
+      enabled: true,
+      nextRunAt: { lte: now },
+      user: { accountStatus: 'active' },
+      OR: [{ sessionId: null }, { session: { is: { controlGate: "open" } } }],
+    },
     orderBy: { nextRunAt: "asc" },
     take: 20,
   }) as AutomationForRun[]

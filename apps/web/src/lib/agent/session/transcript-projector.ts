@@ -164,8 +164,10 @@ export async function projectV2EventsToTranscript(
     const projectedIds = new Set(existing.map(row => transcriptProjectionMarker(row.data)?.eventId).filter((id): id is string => Boolean(id)))
     let inserted = 0
     for (const event of events) {
+      const eventTurnId = event.turnId
+      if (eventTurnId === null) continue
       if (projectedIds.has(event.id)) continue
-      await insertProjectedTranscript(tx, event)
+      await insertProjectedTranscript(tx, { ...event, turnId: eventTurnId })
       projectedIds.add(event.id)
       inserted += 1
     }

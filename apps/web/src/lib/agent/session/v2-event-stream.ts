@@ -9,7 +9,7 @@ import {
 
 import { BoundedStreamBuffer, type StreamFrame } from "./stream-buffer"
 import { redactStreamValue } from "./stream-redaction"
-
+import { createDurablePollWakeup, startAgentEventWakeup, waitForDuration, type AgentEventPubSubFactory } from "./event-wakeup"
 const DEFAULT_DB_POLL_MS = 750
 const DEFAULT_HEARTBEAT_MS = 15_000
 const DEFAULT_BUFFER_CAPACITY = 128
@@ -20,7 +20,7 @@ const MAX_DELTA_ENTRY_BYTES = 128 * 1024
 type DurableEventRow = {
   id: string
   sessionId: string
-  turnId: string
+  turnId: string | null
   itemId: string | null
   taskId: string | null
   sequence: bigint
@@ -31,12 +31,10 @@ type DurableEventRow = {
   idempotencyKey: string | null
   payload: unknown
 }
-
 export interface AgentStreamRedis {
   xread(...args: string[]): Promise<unknown>
   disconnect(): void
 }
-
 export interface V2EventStreamOptions {
   sessionId: string
   afterSequence: bigint
@@ -45,6 +43,7 @@ export interface V2EventStreamOptions {
   heartbeatMs?: number
   bufferCapacity?: number
   redisFactory?: () => AgentStreamRedis | null
+  eventRedisFactory?: AgentEventPubSubFactory
 }
 
 export function parseAfterSequence(request: Request): bigint | Response {
@@ -75,14 +74,15 @@ export function createV2EventStream(db: PrismaClient, options: V2EventStreamOpti
     }) }),
     options.bufferCapacity ?? DEFAULT_BUFFER_CAPACITY,
   )
+  const durableWakeup = createDurablePollWakeup()
   const onRequestAbort = () => lifetime.abort()
   if (options.signal?.aborted) lifetime.abort()
   else options.signal?.addEventListener("abort", onRequestAbort, { once: true })
-
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       const producers = [
-        durableEventLoop(db, options, buffer, signal),
+        durableEventLoop(db, options, buffer, signal, durableWakeup),
+        startAgentEventWakeup(options.sessionId, options.eventRedisFactory, durableWakeup, signal),
         deltaLoop(options, buffer, signal),
         heartbeatLoop(options, buffer, signal),
       ]
@@ -123,6 +123,7 @@ async function durableEventLoop(
   options: V2EventStreamOptions,
   buffer: BoundedStreamBuffer,
   signal: AbortSignal,
+  wakeup: ReturnType<typeof createDurablePollWakeup>,
 ): Promise<void> {
   let lastSequence = options.afterSequence
   while (!signal.aborted) {
@@ -144,7 +145,7 @@ async function durableEventLoop(
     } catch {
       // The next poll retries a transient database error without cancelling the Turn.
     }
-    await delay(options.dbPollMs ?? DEFAULT_DB_POLL_MS, signal)
+    await wakeup.wait(options.dbPollMs ?? DEFAULT_DB_POLL_MS, signal)
   }
 }
 
@@ -182,11 +183,10 @@ async function deltaLoop(
 
 async function heartbeatLoop(options: V2EventStreamOptions, buffer: BoundedStreamBuffer, signal: AbortSignal): Promise<void> {
   while (!signal.aborted) {
-    await delay(options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS, signal)
+    await waitForDuration(options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS, signal)
     if (!signal.aborted) buffer.push({ kind: "transient", body: ": heartbeat\n\n" })
   }
 }
-
 function durableFrame(row: DurableEventRow): string {
   const payload: AgentStreamEnvelope = {
     schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: row.id, sessionId: row.sessionId, turnId: row.turnId,
@@ -196,15 +196,12 @@ function durableFrame(row: DurableEventRow): string {
   }
   return sseFrame(row.type, row.sequence.toString(), payload)
 }
-
 function deltaFrame(streamId: string, envelope: AgentDeltaEnvelope): string {
   return sseFrame(envelope.type, null, { ...envelope, payload: redactStreamValue(envelope.payload), streamId })
 }
-
 function sseFrame(event: string, id: string | null, data: unknown): string {
   return `${event ? `event: ${event}\n` : ""}${id ? `id: ${id}\n` : ""}data: ${JSON.stringify(data)}\n\n`
 }
-
 function readDeltaEntries(value: unknown, sessionId: string): Array<{ streamId: string; envelope: AgentDeltaEnvelope }> {
   if (!Array.isArray(value)) return []
   const entries: Array<{ streamId: string; envelope: AgentDeltaEnvelope }> = []
@@ -229,21 +226,8 @@ function readDeltaEntries(value: unknown, sessionId: string): Array<{ streamId: 
   }
   return entries
 }
-
 function defaultRedisFactory(): AgentStreamRedis | null {
   const url = process.env.REDIS_URL?.trim()
   if (!url) return null
   return new Redis(url, { lazyConnect: true, connectTimeout: 1_000, maxRetriesPerRequest: 1, retryStrategy: () => null })
-}
-
-async function delay(milliseconds: number, signal: AbortSignal): Promise<void> {
-  await new Promise<void>((resolve) => {
-    if (signal.aborted) { resolve(); return }
-    const onAbort = () => { clearTimeout(timer); resolve() }
-    const timer = setTimeout(() => {
-      signal.removeEventListener("abort", onAbort)
-      resolve()
-    }, milliseconds)
-    signal.addEventListener("abort", onAbort, { once: true })
-  })
 }

@@ -13,6 +13,11 @@ import {
 export type ToolRisk = ProtocolToolRisk
 export type ToolDomain = PolicyDomain
 export type ToolIdempotency = "read_only" | "idempotent" | "requires_key" | "non_repeatable"
+/** Server-owned marker for the bounded structured Scout/Analyst result contract. */
+export type DelegateOutputSchemaMarker = {
+  readonly schemaVersion: string
+  readonly role: string
+}
 
 export interface ToolExecutionContext {
   readonly scope: TenantScope
@@ -24,6 +29,8 @@ export interface ToolExecutionContext {
   readonly taskId?: string
   readonly rootTaskId?: string
   readonly actorRole?: PolicyRole
+  /** Runtime-owned delegate metadata; never accepted from tool input. */
+  readonly delegateOutputSchemaMarker?: DelegateOutputSchemaMarker
   readonly signal: AbortSignal
   readonly capabilities: readonly string[]
   reportProgress(progress: unknown): Promise<void>
@@ -33,6 +40,8 @@ export interface RuntimeToolDefinition<TInput = unknown, TOutput = unknown> {
   readonly schemaVersion: typeof schemaVersion
   readonly name: string
   readonly version: string
+  /** Optional server-owned template id advertised by this tool. */
+  readonly template?: string
   readonly description: string
   readonly capabilities: readonly ToolCapability[]
   readonly inputSchema: TSchema
@@ -53,6 +62,7 @@ export type PublicToolDefinition = Omit<ToolDefinition, "inputSchema" | "outputS
   idempotency: ToolIdempotency
   timeoutMs: number
   requiredCapabilities: readonly string[]
+  readonly template?: string
 }
 
 export interface ToolCallRequest {
@@ -74,6 +84,8 @@ export interface ToolRouterContext {
   readonly capabilities?: readonly string[]
   /** Runtime-owned actor role; the model cannot supply or override this value. */
   readonly actorRole?: PolicyRole
+  /** Runtime-owned delegate metadata; never accepted from tool input. */
+  readonly delegateOutputSchemaMarker?: DelegateOutputSchemaMarker
 }
 
 export class ToolExecutionError extends Error {

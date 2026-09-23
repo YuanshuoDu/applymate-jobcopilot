@@ -11,6 +11,8 @@ export interface AutomationSessionRow {
   createdAt: Date
   updatedAt: Date
   completedAt: Date | null
+  /** Older compatibility seams may omit the P7-2a gate; omission means open. */
+  controlGate?: string
 }
 
 interface AutomationSessionDb {
@@ -26,6 +28,9 @@ interface AutomationSessionDb {
 }
 
 interface AutomationTurnDb {
+  agentSession?: {
+    findFirst(args: { where: { id: string; userId: string }; select: { id: true; controlGate: true } }): Promise<{ id: string; controlGate?: string } | null>
+  }
   agentTurn: {
     findFirst(args: { where: Record<string, unknown>; orderBy?: Record<string, unknown>; select: { id: true } }): Promise<{ id: string } | null>
     create(args: { data: Record<string, unknown>; select: { id: true } }): Promise<{ id: string }>
@@ -33,6 +38,24 @@ interface AutomationTurnDb {
 }
 
 const ACTIVE_AUTOMATION_TURN_STATUSES = ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"]
+
+export class AutomationTurnOccupiedError extends Error {
+  readonly code = "automation_turn_occupied"
+
+  constructor(readonly sessionId: string) {
+    super(`Automation session ${sessionId} has an active non-automation Turn`)
+    this.name = "AutomationTurnOccupiedError"
+  }
+}
+
+export class AutomationSessionPausedError extends Error {
+  readonly code = "automation_session_user_paused"
+
+  constructor(readonly sessionId: string) {
+    super(`Automation session ${sessionId} is user-paused`)
+    this.name = "AutomationSessionPausedError"
+  }
+}
 
 export const ACTIVE_AUTOMATION_EXECUTION_STATUSES = ["queued", "running", "waiting_for_user", "paused"] as const
 
@@ -44,13 +67,37 @@ function isUniqueViolation(error: unknown) {
   return Boolean(error && typeof error === "object" && "code" in error && (error as { code?: unknown }).code === "P2002")
 }
 
+function assertAutomationSessionOpen(session: Pick<AutomationSessionRow, "id" | "controlGate">) {
+  if (session.controlGate !== undefined && session.controlGate !== "open") throw new AutomationSessionPausedError(session.id)
+}
+
+export async function assertExistingAutomationSessionOpen(
+  db: unknown,
+  input: { sessionId?: string | null; userId: string },
+) {
+  if (!input.sessionId) return
+  const store = db as AutomationSessionDb
+  const existing = await store.agentSession.findFirst({ where: { id: input.sessionId, userId: input.userId } })
+  if (existing) assertAutomationSessionOpen(existing)
+}
+
+async function checkAutomationSessionGate(store: AutomationTurnDb, input: { sessionId: string; userId: string }) {
+  if (!store.agentSession) return
+  const session = await store.agentSession.findFirst({
+    where: { id: input.sessionId, userId: input.userId },
+    select: { id: true, controlGate: true },
+  })
+  if (session) assertAutomationSessionOpen(session)
+}
+
 /** Returns the active run Turn or atomically creates the next automation Turn. */
 export async function ensureAutomationTurn(
   db: unknown,
   input: { sessionId: string; userId: string; name: string },
 ) {
   const store = db as AutomationTurnDb
-  const where = { sessionId: input.sessionId, userId: input.userId, status: { in: ACTIVE_AUTOMATION_TURN_STATUSES } }
+  await checkAutomationSessionGate(store, input)
+  const where = { sessionId: input.sessionId, userId: input.userId, source: "automation", status: { in: ACTIVE_AUTOMATION_TURN_STATUSES } }
   const existing = await store.agentTurn.findFirst({ where, orderBy: { createdAt: "desc" }, select: { id: true } })
   if (existing) return { turnId: existing.id, created: false }
 
@@ -65,8 +112,9 @@ export async function ensureAutomationTurn(
     return { turnId: created.id, created: true }
   } catch (error: unknown) {
     if (!isUniqueViolation(error)) throw error
+    await checkAutomationSessionGate(store, input)
     const raced = await store.agentTurn.findFirst({ where, orderBy: { createdAt: "desc" }, select: { id: true } })
-    if (!raced) throw error
+    if (!raced) throw new AutomationTurnOccupiedError(input.sessionId)
     return { turnId: raced.id, created: false }
   }
 }
@@ -78,7 +126,10 @@ export async function resolveAutomationSession(
   const store = db as AutomationSessionDb
   if (input.sessionId) {
     const existing = await store.agentSession.findFirst({ where: { id: input.sessionId, userId: input.userId } })
-    if (existing) return { session: existing, created: false }
+    if (existing) {
+      assertAutomationSessionOpen(existing)
+      return { session: existing, created: false }
+    }
   }
 
   const created = await store.agentSession.create({

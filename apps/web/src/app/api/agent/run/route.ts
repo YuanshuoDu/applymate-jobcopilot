@@ -23,6 +23,16 @@ import { runAgentPipeline }                          from '@/lib/agent/run-servi
 import { hasEffectiveEntitlement }                   from '@/lib/entitlements'
 import { recordLegacyTraffic }                       from '@/lib/observability/legacy-counter'
 
+const ACTIVE_CANONICAL_TURN_STATUSES = [
+  'queued',
+  'in_progress',
+  'waiting_for_dependency',
+  'waiting_for_approval',
+  'waiting_for_user',
+] as const
+
+const LEGACY_ENTRY_FENCE_CODE = 'legacy_agent_run_blocked_by_active_turn'
+
 export async function GET(req: NextRequest) {
   recordLegacyTraffic('agent_run_endpoint')
   recordLegacyTraffic('agent_stream_connect')
@@ -41,6 +51,21 @@ export async function GET(req: NextRequest) {
     })
     if (!existing) return err('Session not found', 404)
     sessionId = existing.id
+
+    const activeTurn = await db.agentTurn.findFirst({
+      where: {
+        sessionId: existing.id,
+        userId: prep.userId,
+        status: { in: [...ACTIVE_CANONICAL_TURN_STATUSES] },
+      },
+      select: { id: true },
+    })
+    if (activeTurn) {
+      return Response.json({
+        error: 'A canonical agent turn is already active for this session.',
+        code: LEGACY_ENTRY_FENCE_CODE,
+      }, { status: 409 })
+    }
   }
 
   return sseResponse(async emit => {

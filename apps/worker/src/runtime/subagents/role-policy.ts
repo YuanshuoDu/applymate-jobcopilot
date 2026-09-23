@@ -29,6 +29,7 @@ export type ToolVisibilityReason =
   | "external_write_disabled"
   | "external_write_receipt_missing"
   | "external_write_receipt_invalid"
+  | "coordination_disabled"
 
 export type ToolVisibility = {
   readonly visible: boolean
@@ -40,6 +41,12 @@ type RoleToolMetadata = Pick<RuntimeToolDefinition, "name" | "risk" | "domain" |
 }
 
 const READ_DOMAINS: readonly PolicyDomain[] = ["jobs", "persona", "resume", "application", "coordination", "unknown"]
+const COORDINATION_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "spawn_subagent", "agent.spawn", "agent.followup",
+  "send_message", "agent.send", "wait_subagents", "agent.wait",
+  "list_subagents", "agent.list", "interrupt_subagent", "agent.interrupt",
+  "close_subagent", "agent.close",
+])
 
 const POLICIES: Readonly<Record<HarnessSubagentRole, SubagentRolePolicy>> = {
   scout: { role: "scout", actorRole: "subagent", capabilities: ["read"], allowedRisks: ["read"], allowedDomains: ["jobs"], canManageChildren: false, externalWritesEnabled: false },
@@ -55,7 +62,7 @@ export function getSubagentRolePolicy(role: string): SubagentRolePolicy | null {
 }
 
 export function isHarnessSubagentRole(role: string): role is HarnessSubagentRole {
-  return role in POLICIES
+  return Object.prototype.hasOwnProperty.call(POLICIES, role)
 }
 
 export function visibleToolPolicy(
@@ -65,6 +72,9 @@ export function visibleToolPolicy(
 ): ToolVisibility {
   const policy = getSubagentRolePolicy(role)
   if (!policy) return { visible: false, reason: "role_risk_denied" }
+  if (COORDINATION_TOOL_NAMES.has(tool.name)) {
+    return { visible: false, reason: "coordination_disabled" }
+  }
   if (tool.risk === "external_write" || tool.capabilities?.includes("external_write") || looksLikeExternalAction(tool.name)) {
     if (!policy.externalWritesEnabled) return { visible: false, reason: "external_write_disabled" }
     if (!receipt) return { visible: false, reason: "external_write_receipt_missing" }
