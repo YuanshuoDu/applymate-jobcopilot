@@ -68,11 +68,17 @@ function createSqlFixture(ids: { turnId: string; sessionId: string; userId: stri
     async query(sql: string, values: unknown[] = []) {
       const none = { rows: [] as Array<Record<string, unknown>>, rowCount: 0 }
       if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql)) return none
+      if (sql.includes("SELECT set_config('app.user_id'")) return { rows: [], rowCount: 1 }
       if (sql.includes("WITH candidates AS") || sql.includes("WITH stale AS")) return none
       if (sql.includes('SELECT turn."id", turn."sessionId"')) return none
       if (/SELECT\s+turn\."id"\s+FROM\s+"agent_turns"\s+AS\s+turn/.test(sql)) {
         return state.turn.id === values[0] && state.turn.sessionId === values[1]
           ? { rows: [{ id: state.turn.id }], rowCount: 1 }
+          : none
+      }
+      if (/SELECT\s+session\."userId"\s*,\s*session\."controlGate"\s+FROM\s+"agent_sessions"\s+AS\s+session/.test(sql)) {
+        return values[0] === state.turn.sessionId && values[1] === state.turn.id
+          ? { rows: [{ userId: state.turn.userId, controlGate: "open" }], rowCount: 1 }
           : none
       }
       if (sql.includes('SELECT session."id" FROM "agent_sessions"')) {
