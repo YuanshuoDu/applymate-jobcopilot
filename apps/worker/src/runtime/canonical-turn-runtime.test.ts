@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
+
+vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnect: vi.fn() })) }))
+
 import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
 import type pg from "pg"
 import type { StepContext } from "./context/step-context-builder.js"
@@ -891,6 +894,113 @@ describe("createCanonicalTurnRuntime", () => {
     expect(JSON.stringify(events)).not.toContain("sk-secretvalue123")
     expect(pg.pool.query).toHaveBeenCalledWith(expect.stringContaining('FROM "Job"'), expect.any(Array))
     expect(pg.calls.some(sql => sql === "BEGIN")).toBe(true)
+  })
+
+  it("routes distinct goals through different accepted read-only plans with the same capability catalog", async () => {
+    const scenarios = [
+      { objective: "Find current software engineering roles", toolName: "jobs.search" },
+      { objective: "Review my base resume", toolName: "resume.get_base" },
+    ] as const
+    const run = async (scenario: typeof scenarios[number]) => {
+      const pg = realPgBoundary()
+      const roots = rootStore()
+      const events: RuntimeEvent[] = []
+      const requests: HarnessModelRequest[] = []
+      let modelCalls = 0
+      const modelRuntime = await createCanonicalTurnRuntime(pg.pool, {
+        workerId: "worker-1", planningEnabled: true, planningExecutionEnabled: true,
+        stateLoader: async () => ({
+          ...state(), goal: scenario.objective,
+          goalContract: {
+            revision: 1, objective: scenario.objective, constraints: [], successCriteria: ["Complete the requested read"],
+            knownFacts: [], unresolvedQuestions: [], approvalBoundaries: ["Any application submission requires explicit approval"], budgetRef: "runtime:turn",
+          },
+          toolPolicySnapshot: { capabilities: ["read"] },
+          snapshot: { ...state().snapshot, goal: { id: "turn-goal:turn-1", content: scenario.objective } },
+        }),
+        rootTaskStore: roots as never,
+        contextBuilderFactory: () => ({
+          build: async request => {
+            const goal = request.snapshot.goal
+            const blocks: StepContext["blocks"] = [
+              ...(goal ? [{ id: goal.id, layer: "goal" as const, role: "data" as const, trust: "external_untrusted" as const, source: "turn_goal", content: goal.content as never }] : []),
+              ...request.snapshot.toolObservations.map(item => ({ id: item.id, layer: "tool_observation" as const, role: "data" as const, trust: "external_untrusted" as const, source: "tool_or_subagent", content: item.content as never })),
+            ]
+            return {
+              schemaVersion: "agent-harness.v2", sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId,
+              inputThroughSequence: 0n, consumedInputIds: [], blocks, canonicalJson: JSON.stringify(blocks),
+            }
+          },
+        }),
+        turnEngineStoreFactory: () => store(events),
+        modelRuntimeFactory: async () => ({
+          adapter: {
+            ...model(() => []),
+            async *stream(request: HarnessModelRequest) {
+              requests.push(request)
+              modelCalls += 1
+              if (modelCalls === 1) {
+                const serialized = JSON.stringify(request.messages)
+                const matchedGoal = scenarios.find(candidate => serialized.includes(candidate.objective))
+                if (!matchedGoal) throw new Error("canonical_goal_missing_from_model_request")
+                const proposal: PlanProposal = {
+                  schemaVersion: "agent-harness.plan.v1", basedOnGoalRevision: 1, basedOnPlanRevision: null,
+                  nodes: [
+                    { localId: "read", kind: "use_tool", objective: matchedGoal.objective, inputRefs: [], dependsOn: [], successCriteria: ["read completed"], outputSchemaRef: null, toolName: matchedGoal.toolName },
+                    { localId: "finish", kind: "propose_completion", objective: "Finish the requested read", inputRefs: [], dependsOn: ["read"], successCriteria: ["read completed"], outputSchemaRef: null },
+                  ],
+                  completionCriteria: ["read completed"], briefRationale: "Goal-directed read-only plan",
+                }
+                yield { type: "tool_call_completed", callId: "plan-call", name: "agent.plan.propose", arguments: { proposal } }
+                yield { type: "completed", finishReason: "tool_calls" }
+              } else {
+                yield { type: "text_delta", text: "The requested read is complete." }
+                yield { type: "completed", finishReason: "stop" }
+              }
+            },
+          }, registry: {} as never, candidates: [],
+        }),
+        authorizeUsage: async () => ({ settle: async () => undefined }),
+      })
+
+      const result = await modelRuntime.execute({ lease, signal: new AbortController().signal })
+      const goalReachedModel = requests[0] ? JSON.stringify(requests[0].messages).includes(scenario.objective) : false
+      const catalog = requests[0]?.tools.flatMap(tool => {
+        if (!tool || typeof tool !== "object" || !("name" in tool) || typeof tool.name !== "string") return []
+        return [tool.name]
+      }).sort() ?? []
+      const acceptedToolResult = events.find(event => event.type === "tool_call.completed" && JSON.stringify(event.payload).includes('"status":"accepted"'))
+      const dispatchedCommand = events.find(event => event.type === "plan.command" && JSON.stringify(event.payload).includes('"localId":"read"'))
+      return { result, catalog, modelCalls, goalReachedModel, acceptedToolResult, dispatchedCommand, events, scenario }
+    }
+
+    const [search, resume] = await Promise.all(scenarios.map(run))
+    expect(search.result).toMatchObject({ status: "completed" })
+    expect(resume.result).toMatchObject({ status: "completed" })
+    expect(search.modelCalls).toBeGreaterThan(1)
+    expect(resume.modelCalls).toBeGreaterThan(1)
+    expect(search.goalReachedModel).toBe(true)
+    expect(resume.goalReachedModel).toBe(true)
+    expect(search.catalog).toEqual(resume.catalog)
+    expect(search.catalog).toContain("jobs.search")
+    expect(search.catalog).toContain("resume.get_base")
+    expect(search.catalog).not.toContain("application.submit")
+    expect(search.acceptedToolResult).toBeDefined()
+    expect(resume.acceptedToolResult).toBeDefined()
+    expect(JSON.stringify(search.acceptedToolResult?.payload)).toContain('"status":"accepted"')
+    expect(JSON.stringify(resume.acceptedToolResult?.payload)).toContain('"status":"accepted"')
+    expect(JSON.stringify(search.acceptedToolResult?.payload)).toContain('"toolName":"jobs.search"')
+    expect(JSON.stringify(resume.acceptedToolResult?.payload)).toContain('"toolName":"resume.get_base"')
+    expect(search.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "tool_call.started", payload: expect.objectContaining({ toolName: "jobs.search" }) }),
+    ]))
+    expect(resume.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "tool_call.started", payload: expect.objectContaining({ toolName: "resume.get_base" }) }),
+    ]))
+    expect(JSON.stringify(search.dispatchedCommand?.payload)).toContain('"jobs"')
+    expect(JSON.stringify(resume.dispatchedCommand?.payload)).toContain('"resume":')
+    expect(JSON.stringify(search.events)).toContain(search.scenario.objective)
+    expect(JSON.stringify(resume.events)).toContain(resume.scenario.objective)
   })
 
   it("resumes durable plan feedback across lease recovery without reusing provider state", async () => {
