@@ -70,7 +70,7 @@ function createSqlFixture(ids: { turnId: string; sessionId: string; userId: stri
       if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql)) return none
       if (sql.includes("WITH candidates AS") || sql.includes("WITH stale AS")) return none
       if (sql.includes('SELECT turn."id", turn."sessionId"')) return none
-      if (sql.includes('SELECT turn."id" FROM "agent_turns"')) {
+      if (/SELECT\s+turn\."id"\s+FROM\s+"agent_turns"\s+AS\s+turn/.test(sql)) {
         return state.turn.id === values[0] && state.turn.sessionId === values[1]
           ? { rows: [{ id: state.turn.id }], rowCount: 1 }
           : none
