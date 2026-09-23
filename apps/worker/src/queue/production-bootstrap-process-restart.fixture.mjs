@@ -69,6 +69,30 @@ async function waitForSuspendedParent(turnId, timeoutMs = 15_000) {
   throw new Error("parent_wait_not_suspended")
 }
 
+async function restartDiagnostics() {
+  const [turns, tasks, waits, dispatches, steps, items] = await Promise.all([
+    pool.query(`SELECT "status", "leaseOwnerId", "leaseVersion", "rootTaskId" FROM "agent_turns" WHERE "id" = $1`, [ids.turnId]),
+    pool.query(`SELECT "id", "parentTaskId", "rootTaskId", "role", "status", "attemptCount", "leaseOwner", "failureReason", "result"
+      FROM "sub_agent_tasks" WHERE "turnId" = $1 ORDER BY "createdAt", "id"`, [ids.turnId]),
+    pool.query(`SELECT "id", "parentTaskId", "status", "suspendedAt", "consumedAt", "targetTaskIds", "matchedTaskIds", "result"
+      FROM "agent_wait_conditions" WHERE "turnId" = $1 ORDER BY "createdAt", "id"`, [ids.turnId]),
+    pool.query(`SELECT "topic", "idempotencyKey", "publishedAt", "attemptCount", "lastError", "payload"
+      FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" IN ('agent.turn.dispatch', 'agent.subagent.dispatch')
+      ORDER BY "createdAt", "id"`, [ids.sessionId]),
+    pool.query(`SELECT "ordinal", "status", "attempt" FROM "agent_steps" WHERE "turnId" = $1 ORDER BY "ordinal"`, [ids.turnId]),
+    pool.query(`SELECT "type", "content" FROM "agent_items" WHERE "turnId" = $1 AND "sessionId" = $2
+      ORDER BY "createdAt", "id"`, [ids.turnId, ids.sessionId]),
+  ])
+  return {
+    turn: turns.rows,
+    tasks: tasks.rows,
+    waits: waits.rows,
+    dispatches: dispatches.rows,
+    steps: steps.rows,
+    items: items.rows,
+  }
+}
+
 function spawnedTaskId(request, spawnCallId) {
   for (const message of request.messages) {
     for (const part of message.content) {
@@ -139,6 +163,7 @@ async function makeFirstWorker() {
     subagents: {
       intervalMs: 10,
       async execute({ lease }) {
+        say("CHILD_EXECUTOR_STARTED")
         await waitForSuspendedParent(lease.turnId)
         say("PARENT_SUSPENDED")
         await waitForCommand("persist-child-result")
@@ -168,7 +193,7 @@ async function makeFirstWorker() {
     }
     await sleep(20)
   }
-  if (!stopping) throw new Error("restart_fixture_timeout")
+  if (!stopping) throw new Error(`restart_fixture_timeout:${JSON.stringify(await restartDiagnostics())}`)
 }
 
 function modelProfile() {
