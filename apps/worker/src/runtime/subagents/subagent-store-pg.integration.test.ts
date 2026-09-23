@@ -415,7 +415,9 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
       const storedTasks = await Promise.all(executionTrees.map(tree => ownerAStore.get(tree.taskId, tree.sessionId)))
       expect(storedTasks).toEqual(executionTrees.map(tree => expect.objectContaining({
         id: tree.taskId, status: "completed", attemptCount: 1,
-        result: { status: "completed", toolCallCount: 1, finalText: `Found deterministic evidence for ${tree.taskId}.` },
+        result: expect.objectContaining({
+          status: "completed", stepCount: 2, toolCallCount: 1, finalText: `Found deterministic evidence for ${tree.taskId}.`,
+        }),
       })))
       expect(modelCalls).toEqual(new Map(executionTrees.map(tree => [tree.taskId, 2])))
       for (const tree of executionTrees) {
