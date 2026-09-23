@@ -46,6 +46,8 @@ describe("PgSubagentTaskStore", () => {
     expect(sessionQuery).toContain("FOR UPDATE")
     const insert = fake.calls.find(([sql]) => sql.startsWith("INSERT INTO"))
     expect(insert?.[1]).toContain(JSON.stringify({ subagentPolicy: policy }))
+    expect(insert?.[0]).toContain('"maxAttempts", "updatedAt")')
+    expect(insert?.[0]).toContain("$19, CURRENT_TIMESTAMP)")
   })
 
   it("atomically creates a child with its spawn operation and dispatch outbox", async () => {
@@ -68,6 +70,9 @@ describe("PgSubagentTaskStore", () => {
     expect(sessionIndex).toBeGreaterThan(-1)
     expect(sessionIndex).toBeLessThan(taskIndex)
     expect(operationIndex).toBeGreaterThan(taskIndex)
+    const taskInsert = fake.calls[taskIndex]?.[0] ?? ""
+    expect(taskInsert).toContain('"maxAttempts", "updatedAt")')
+    expect(taskInsert).toContain("$19, CURRENT_TIMESTAMP)")
     expect(fake.calls.map(([sql]) => sql)).toContain("COMMIT")
   })
 

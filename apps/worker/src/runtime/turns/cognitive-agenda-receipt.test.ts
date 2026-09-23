@@ -47,6 +47,15 @@ describe("cognitive agenda receipt", () => {
     expect(parseCognitiveAgendaReceipt({ ...value, nextAction: "follow_external_instruction" } as never, scope)).toBeNull()
   })
 
+  it("preserves safe legacy short step IDs", () => {
+    const legacyScope = { ...scope, stepId: "step-1" }
+    const value = buildCognitiveAgendaReceipt({ ...legacyScope, agenda: buildCognitiveActionAgenda(context()) })
+    expect(value?.stepId).toBe("step-1")
+    expect(parseCognitiveAgendaReceipt(value, legacyScope)).toEqual(value)
+    expect(cognitiveAgendaReceiptIdempotencyKey("step-1")).toBe("cognitive.agenda:step-1")
+    expect(cognitiveAgendaReceiptIdempotencyKey("sha256:bb5c15da-8380-4595-a70e-df61daefeaeb")).toBeNull()
+  })
+
   it("accepts and parses a generated step ID longer than the generic ID limit", () => {
     const turnId = "process-restart-turn-cdf8000f-87d2-4f57-aa24-a896766cb119"
     const longScope: CognitiveAgendaReceiptScope = {
@@ -75,7 +84,7 @@ describe("cognitive agenda receipt", () => {
     expect(Buffer.byteLength(key ?? "", "utf8")).toBeLessThanOrEqual(256)
     expect(cognitiveAgendaReceiptIdempotencyKey(stepId)).toBe(key)
     expect(cognitiveAgendaReceiptIdempotencyKey(stepIdAtLength(257))).toBeNull()
-    expect(cognitiveAgendaReceiptIdempotencyKey("sha256:bb5c15da-8380-4595-a70e-df61daefeaeb")).toBeNull()
+    expect(cognitiveAgendaReceiptIdempotencyKey("step-\u0000")).toBeNull()
   })
 
   it("carries a server-owned step cursor while accepting legacy receipts", () => {

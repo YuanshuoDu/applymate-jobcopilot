@@ -59,6 +59,7 @@ function safeId(value: unknown): value is string {
   return typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= MAX_ID_LENGTH && Buffer.byteLength(value, "utf8") <= MAX_ID_LENGTH && !/[\u0000-\u001f\u007f]/.test(value)
 }
 function safeStepId(value: unknown): value is string {
+  if (safeId(value)) return !value.startsWith("sha256:")
   return typeof value === "string" && /^(?:turn|task):/.test(value) && value.trim() === value && value.length <= MAX_STEP_ID_LENGTH && Buffer.byteLength(value, "utf8") <= MAX_STEP_ID_LENGTH && !/[\u0000-\u001f\u007f]/.test(value)
 }
 function safeRevision(value: unknown): value is number {
