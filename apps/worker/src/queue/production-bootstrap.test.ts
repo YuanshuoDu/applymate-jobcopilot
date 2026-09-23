@@ -12,6 +12,7 @@ import { createCoordinationTools } from "../runtime/tools/coordination-tools.js"
 import { createCanonicalPolicy } from "../runtime/policy/canonical-policy.js"
 import { PLAN_PROPOSAL_SCHEMA_VERSION } from "../runtime/planning/goal-plan-contract.js"
 import { createPlanProposalTool } from "../runtime/planning/plan-proposal-tool.js"
+import { PLAN_COMPLETION_FEEDBACK_TEXT } from "../runtime/planning/plan-completion-feedback.js"
 import { createPgDurableWaitPort } from "../runtime/subagents/durable-wait-store.js"
 import { reconcileDurableWaits, startDurableWaitResolver } from "../runtime/subagents/durable-wait-resolver.js"
 import type { createSubagentQueue } from "./subagent-queue.js"
@@ -858,14 +859,198 @@ describe("production Worker bootstrap", () => {
       const resultObservation = persistedEvents.find(event => event.type === "plan.observation" && (event.payload as { observationId?: string }).observationId === "plan-result:proposal-call:search")
       expect(resultObservation).toBeDefined()
       const observationPayload = resultObservation!.payload as { content: unknown }
+      expect(observationPayload.content).toMatchObject({
+        kind: "plan_command", localId: "search", commandKind: "tool_call", dependsOn: [], status: "completed", errorCode: null,
+      })
       expect(new TextEncoder().encode(JSON.stringify(observationPayload.content)).byteLength).toBeLessThanOrEqual(8 * 1024)
+      const completionObservation = persistedEvents.find(event => event.type === "plan.observation" && (event.payload as { observationId?: string }).observationId === "plan-control:proposal-call:finish")
+      expect(completionObservation).toBeDefined()
+      expect((completionObservation!.payload as { content: unknown }).content).toEqual({
+        kind: "plan_control", localId: "finish", status: "completion_proposed", dependsOn: ["search"],
+        completionCriteria: ["Read the fixture result", "The read completed"],
+      })
+      expect(persistedEvents.indexOf(resultObservation!)).toBeLessThan(persistedEvents.indexOf(completionObservation!))
       const resumedMessages = JSON.stringify(requests[1]?.messages)
       expect(resumedMessages).toContain("plan_command")
+      expect(resumedMessages).toContain("completion_proposed")
       expect(resumedMessages).toContain("bounded-fixture-evidence")
       expect(resumedMessages).toContain("root_fixture")
       expect(resumedMessages).toContain("plan-call:proposal-call:search")
       expect(resumedMessages).toContain(boundedEvidence)
       expect(resumedMessages).not.toMatch(/\"(?:lease|leaseOwnerId|leaseVersion|budgetLimit|maxBudget)\"/)
+    } finally {
+      await bootstrap.close()
+    }
+    expect(manager.shutdown).toHaveBeenCalledOnce()
+  })
+
+  it("replans from a failed dependency and completion feedback through production startup", async () => {
+    const goalContract = {
+      revision: 1, objective: "Read a bounded fixture result", constraints: [], successCriteria: [],
+      knownFacts: [], unresolvedQuestions: [], approvalBoundaries: [], budgetRef: "fixture-budget",
+    }
+    const failedProposal = {
+      schemaVersion: PLAN_PROPOSAL_SCHEMA_VERSION, basedOnGoalRevision: 1, basedOnPlanRevision: null,
+      nodes: [
+        { localId: "search", kind: "use_tool", objective: "Read fixture evidence", inputRefs: [], dependsOn: [], successCriteria: ["Return fixture evidence"], outputSchemaRef: null, toolName: "jobs.search" },
+        { localId: "finish", kind: "propose_completion", objective: "Finish after reading the result", inputRefs: [], dependsOn: ["search"], successCriteria: ["The read completed"], outputSchemaRef: null },
+      ],
+      completionCriteria: ["Read the fixture result"], briefRationale: "Try the primary read first.",
+    }
+    const replacementProposal = {
+      schemaVersion: PLAN_PROPOSAL_SCHEMA_VERSION, basedOnGoalRevision: 1, basedOnPlanRevision: 1,
+      nodes: [
+        { localId: "fallback", kind: "use_tool", objective: "Use the alternate read after primary failure", inputRefs: [], dependsOn: [], successCriteria: ["Return fallback evidence"], outputSchemaRef: null, toolName: "jobs.get" },
+        { localId: "finish", kind: "propose_completion", objective: "Finish after the alternate read", inputRefs: [], dependsOn: ["fallback"], successCriteria: ["The fallback read completed"], outputSchemaRef: null },
+      ],
+      completionCriteria: ["Read the fixture result using an available source"], briefRationale: "The primary read failed; use a distinct read-only fallback.",
+    }
+    const jobsSearch: RuntimeToolDefinition = {
+      schemaVersion, name: "jobs.search", version: "1", description: "Read deterministic fixture evidence",
+      capabilities: ["read"] as const, inputSchema: Type.Object({}, { additionalProperties: false }),
+      outputSchema: Type.Object({ evidence: Type.String() }, { additionalProperties: false }),
+      risk: "read" as const, domain: "jobs" as const, idempotency: "read_only" as const, timeoutMs: 1_000, requiredCapabilities: [] as const,
+      execute: async () => { throw new Error("fixture dependency failure") },
+    }
+    const fallbackContexts: Array<{ userId: string; sessionId: string; turnId: string; taskId: string | null; rootTaskId: string | null; toolCallId: string | null }> = []
+    const jobsFallback: RuntimeToolDefinition = {
+      schemaVersion, name: "jobs.get", version: "1", description: "Read alternate deterministic fixture evidence",
+      capabilities: ["read"] as const, inputSchema: Type.Object({}, { additionalProperties: false }),
+      outputSchema: Type.Object({ evidence: Type.String() }, { additionalProperties: false }),
+      risk: "read" as const, domain: "jobs" as const, idempotency: "read_only" as const, timeoutMs: 1_000, requiredCapabilities: [] as const,
+      execute: async context => {
+        fallbackContexts.push({
+          userId: context.scope.userId, sessionId: context.sessionId, turnId: context.turnId,
+          taskId: context.taskId ?? null, rootTaskId: context.rootTaskId ?? null, toolCallId: context.toolCallId ?? null,
+        })
+        return { evidence: "fallback-fixture-evidence" }
+      },
+    }
+    const planner = createPlanProposalTool({
+      goal: goalContract, allowedTools: ["jobs.search", "jobs.get"], allowedTemplates: [], allowedRoles: [],
+      allowedPlanActions: ["use_tool", "propose_completion"], maxNodes: 8,
+    })
+    const registry = new ToolRegistry([jobsSearch, jobsFallback, planner as unknown as RuntimeToolDefinition])
+    const lifecycle = new InMemoryToolLifecycleSink()
+    const requests: HarnessModelRequest[] = []
+    const model: ModelAdapter = {
+      id: "fixture-failing-planner-model",
+      profile: {
+        provider: "fixture", model: "fixture-planner", nativeTools: true, structuredOutput: true, streaming: true,
+        continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false,
+        supportsReasoningSummary: false, supportsResponseContinuation: false, supportsProviderConversation: false,
+        supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 256, costClass: "low",
+      },
+      async *stream(request: HarnessModelRequest): AsyncIterable<ModelStreamEvent> {
+        requests.push(request)
+        if (requests.length === 1) {
+          yield { type: "tool_call_completed", callId: "proposal-call", name: "agent.plan.propose", arguments: { proposal: failedProposal } }
+          yield { type: "completed", finishReason: "tool_calls" }
+        } else if (requests.length === 2) {
+          yield { type: "text_delta", text: "The primary fixture read succeeded." }
+          yield { type: "completed", finishReason: "stop" }
+        } else if (requests.length === 3) {
+          yield { type: "tool_call_completed", callId: "replacement-call", name: "agent.plan.propose", arguments: { proposal: replacementProposal } }
+          yield { type: "completed", finishReason: "tool_calls" }
+        } else {
+          yield { type: "text_delta", text: "The alternate fixture read supplied the result." }
+          yield { type: "completed", finishReason: "stop" }
+        }
+      },
+    }
+    const persistedItems: Array<{ type: string; status: string; content: unknown }> = []
+    const persistedEvents: Array<{ type: string; payload: unknown }> = []
+    const manager = { shutdown: vi.fn(async () => undefined) } as unknown as AgentTreeManager
+    const state: CanonicalTurnState = {
+      scope: { userId: "user_fixture" }, goal: goalContract.objective, goalContract, modelProfileSnapshot: {} as never,
+      toolPolicySnapshot: { role: "orchestrator", capabilities: ["read"] }, budgetSnapshot: { limits: { maxSteps: 4, maxToolCalls: 4 } },
+      snapshot: { system: [], profile: [], goal: { id: "goal_fixture", content: goalContract.objective }, steerHistory: [], businessRefs: [], toolObservations: [] },
+    }
+    const pool = { connect: vi.fn() }
+    let execute: CanonicalTurnRuntime["execute"] | undefined
+    const bootstrap = await startProductionAgentRuntime({
+      pool,
+      createRuntime: async () => createCanonicalTurnRuntime(pool as never, {
+        workerId: "worker_fixture",
+        productionFlags: {
+          cognitiveLoopEnabled: false, planningEnabled: true, planningExecutionEnabled: true,
+          childExecutionEnabled: false, coordinationEnabled: false, consumeWaitOutcomes: false,
+          contextCompactionEnabled: false, canonicalAutomationEnabled: false,
+        },
+        manager, stateLoader: async () => state,
+        modelRuntimeFactory: async () => ({ adapter: model, registry: {} as never, candidates: [] }),
+        toolRuntimeFactory: ({ policy }) => ({ registry, router: new ToolRouter(registry, new ToolLifecycle({ sink: lifecycle, references: new InMemoryToolResultReferenceStore() }), policy) }),
+        rootTaskStore: { ensure: vi.fn(async () => ({ id: "root_fixture" } as never)), finish: vi.fn(async () => undefined) },
+        turnEngineStoreFactory: () => compositionStore(persistedItems, persistedEvents),
+        contextBuilderFactory: () => {
+          const checkpoints = new Map<string, { inputThroughSequence: bigint; consumedInputIds: readonly string[] }>()
+          const inputStore = {
+            scope: { userId: "user_fixture" },
+            withTransaction: async <T>(work: (transaction: InputClaimTransaction) => Promise<T>): Promise<T> => work({
+              getCheckpoint: async ({ stepId }) => checkpoints.get(stepId) ?? { inputThroughSequence: 0n, consumedInputIds: [] },
+              claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }),
+              persistCheckpoint: async ({ stepId, checkpoint }) => { checkpoints.set(stepId, checkpoint) },
+            }),
+          } satisfies InputClaimStore
+          return new StepContextBuilder(inputStore)
+        },
+        authorizeUsage: vi.fn(async () => ({ settle: vi.fn(async (_input: Parameters<UsageAuthorization["settle"]>[0]) => undefined) })),
+      }),
+      bootstrapOptions: {
+        turnQueueFactory: vi.fn(options => {
+          execute = options.execute
+          return { queue: { add: vi.fn() }, worker: {}, active: { size: 0, values: () => [] }, close: vi.fn(async () => undefined) } as never
+        }) as unknown as Parameters<typeof createProductionWorkerBootstrap>[0]["turnQueueFactory"],
+        turnRecoveryFactory: vi.fn(() => ({ close: vi.fn(async () => undefined) })) as unknown as Parameters<typeof createProductionWorkerBootstrap>[0]["turnRecoveryFactory"],
+      },
+      startAgentRunWorker: vi.fn(),
+    })
+
+    try {
+      if (!execute) throw new Error("production bootstrap did not register its canonical turn executor")
+      const result = await execute({
+        lease: {
+          turnId: "turn_fixture", sessionId: "session_fixture", ownerId: "worker_fixture", userId: "user_fixture", leaseVersion: 1,
+          leaseStartedAt: new Date("2026-09-01T00:00:00.000Z"), leaseExpiresAt: new Date("2026-09-01T00:10:00.000Z"),
+        },
+        signal: new AbortController().signal,
+      })
+
+      expect(result).toMatchObject({ status: "completed" })
+      expect(requests).toHaveLength(4)
+      const failedDependency = persistedEvents.find(event => event.type === "plan.observation" && (event.payload as { observationId?: string }).observationId === "plan-result:proposal-call:search")
+      expect(failedDependency).toBeDefined()
+      expect((failedDependency!.payload as { content: unknown }).content).toMatchObject({ kind: "plan_command", localId: "search", status: "failed" })
+      const firstRecoveryMessages = JSON.stringify(requests[1]?.messages)
+      expect(firstRecoveryMessages).toContain("plan-result:proposal-call:search")
+      expect(firstRecoveryMessages).toContain('\\"status\\":\\"failed\\"')
+      const recoveryMessages = JSON.stringify(requests[2]?.messages)
+      expect(recoveryMessages).toContain("plan-result:proposal-call:search")
+      expect(recoveryMessages).toContain('\\"status\\":\\"failed\\"')
+      expect(recoveryMessages).toContain("plan_completion_feedback")
+      expect(recoveryMessages).toContain(PLAN_COMPLETION_FEEDBACK_TEXT)
+      const completionFeedback = persistedEvents.find(event => event.type === "plan.completion_feedback")
+      expect(completionFeedback).toBeDefined()
+      const replacementRevision = persistedEvents.find(event => event.type === "plan.revision" && (event.payload as { planCallId?: string }).planCallId === "replacement-call")
+      expect(replacementRevision).toMatchObject({ payload: { planCallId: "replacement-call", goalRevision: 1, planRevision: 2, basedOnPlanRevision: 1 } })
+      const firstRevision = persistedEvents.find(event => event.type === "plan.revision" && (event.payload as { planCallId?: string }).planCallId === "proposal-call")
+      expect((replacementRevision!.payload as { proposalHash?: string }).proposalHash).not.toBe((firstRevision!.payload as { proposalHash?: string }).proposalHash)
+      expect(persistedEvents.indexOf(completionFeedback!)).toBeLessThan(persistedEvents.indexOf(replacementRevision!))
+      const fallbackResult = persistedEvents.find(event => event.type === "plan.observation" && (event.payload as { observationId?: string }).observationId === "plan-result:replacement-call:fallback")
+      expect(fallbackResult).toBeDefined()
+      expect((fallbackResult!.payload as { content: unknown }).content).toMatchObject({ kind: "plan_command", localId: "fallback", status: "completed", output: { evidence: "fallback-fixture-evidence" } })
+      expect(fallbackContexts).toEqual([{
+        userId: "user_fixture", sessionId: "session_fixture", turnId: "turn_fixture",
+        taskId: "root_fixture", rootTaskId: "root_fixture", toolCallId: "plan-call:replacement-call:fallback",
+      }])
+      const completion = persistedEvents.find(event => event.type === "plan.observation" && (event.payload as { observationId?: string }).observationId === "plan-control:replacement-call:finish")
+      expect(completion).toBeDefined()
+      expect((completion!.payload as { content: unknown }).content).toMatchObject({ kind: "plan_control", status: "completion_proposed", dependsOn: ["fallback"] })
+      expect(persistedEvents.indexOf(fallbackResult!)).toBeLessThan(persistedEvents.indexOf(completion!))
+      const finalMessages = JSON.stringify(requests[3]?.messages)
+      expect(finalMessages).toContain("fallback-fixture-evidence")
+      expect(finalMessages).toContain("completion_proposed")
+      expect(persistedEvents.some(event => event.type === "turn.completed")).toBe(true)
     } finally {
       await bootstrap.close()
     }
