@@ -97,6 +97,12 @@ jobs:
           AGENT_TURN_REDIS_TEST_DISPOSABLE: "true"
           AGENT_TURN_REDIS_TEST_URL: redis://127.0.0.1:6379/15
         run: pnpm --filter @jobcopilot/worker exec vitest run src/queue/production-bootstrap-subagents-redis.integration.test.ts
+      - name: Verify durable parent resume across a Worker process restart
+        env:
+          AGENT_TURN_REDIS_TEST_URL: redis://127.0.0.1:6379/15
+          AGENT_TURN_REDIS_TEST_DISPOSABLE: "true"
+          REDIS_URL: redis://127.0.0.1:6379/15
+        run: pnpm --filter @jobcopilot/worker exec vitest run src/queue/production-bootstrap-process-restart.integration.test.ts
   lockfile:
     name: Lockfile
     runs-on: ubuntu-latest
