@@ -91,6 +91,12 @@ class FakeClient {
       for (const row of confirmed) row.consumedAt = new Date("2026-09-03T00:02:00.000Z")
       return { rows: confirmed.map(row => ({ id: row.id })), rowCount: confirmed.length }
     }
+    if (text.includes('FROM "agent_mailbox_messages"') && text.includes('WHERE "sessionId" = $1 AND "idempotencyKey" = $2')) {
+      const sessionId = String(values[0])
+      const idempotencyKey = String(values[1])
+      const existing = this.mailboxRows.find(row => row.sessionId === sessionId && row.idempotencyKey === idempotencyKey)
+      return { rows: existing ? [{ ...existing }] : [], rowCount: existing ? 1 : 0 }
+    }
     if (text.includes('FROM "agent_mailbox_messages"') && text.includes("SELECT")) {
       const sessionId = String(values[0])
       const toTaskId = String(values[2])
@@ -103,7 +109,17 @@ class FakeClient {
     }
     if (text.includes("FROM \"agent_sessions\"") || text.includes("FROM \"agent_turns\"") || text.includes("FROM \"sub_agent_tasks\"")) return { rows: [{ id: "ok" }], rowCount: 1 }
     if (text.includes("FROM \"agent_mailbox_messages\"")) return { rows: [], rowCount: 0 }
-    if (text.includes("INSERT INTO \"agent_mailbox_messages\"")) return { rows: [{ id: "mailbox-1", sessionId: "session-a", turnId: "turn-a", fromTaskId: null, toTaskId: "task-1", kind: "result", idempotencyKey: "message-1", createdAt: new Date("2026-09-03T00:00:00.000Z") }], rowCount: 1 }
+    if (text.includes("INSERT INTO \"agent_mailbox_messages\"")) {
+      const [id, sessionId, turnId, fromTaskId, toTaskId, kind, payload, idempotencyKey] = values
+      const row = mailboxRow({
+        id: String(id), sessionId: String(sessionId), turnId: String(turnId),
+        fromTaskId: fromTaskId == null ? null : String(fromTaskId), toTaskId: String(toTaskId), kind: String(kind),
+        payload: typeof payload === "string" ? JSON.parse(payload) as unknown : payload,
+        idempotencyKey: String(idempotencyKey), createdAt: new Date("2026-09-03T00:00:00.000Z"),
+      })
+      this.mailboxRows.push(row)
+      return { rows: [{ ...row }], rowCount: 1 }
+    }
     if (text.includes("UPDATE \"agent_sessions\"")) return { rows: [{ eventSequence: 1n }], rowCount: 1 }
     if (text.includes("SELECT 1 FROM \"agent_events\"")) return { rows: [], rowCount: 0 }
     if (text.includes("INSERT INTO \"agent_outbox\"")) return { rows: [], rowCount: 1 }
@@ -295,6 +311,39 @@ describe("PgCoordinationStore", () => {
     expect(sessionGuard).toContain('"status" NOT IN (\'aborted\', \'archived\')')
     const taskGuard = client.queries.find(query => query.sql.includes('FROM "sub_agent_tasks" task') && query.sql.includes('task."turnId" = $4'))
     expect(taskGuard?.values).toEqual(["task-1", "session-a", "user-a", "turn-a"])
+  })
+
+  it("replays an exact mailbox message duplicate without writing a second row", async () => {
+    const existing = mailboxRow({ id: "message-replay", fromTaskId: "task-sender", idempotencyKey: "same-key" })
+    const client = new FakeClient("task", "running", [existing], "user-a", activeOwnerTask(), { "task-sender": "turn-a" })
+    const store = new PgCoordinationStore(pool(client))
+    const input = {
+      userId: "user-a", sessionId: "session-a", turnId: "turn-a", fromTaskId: "task-sender",
+      toTaskId: "task-1", kind: "result", payload: { ok: true }, idempotencyKey: "same-key",
+    }
+
+    await expect(store.sendMessage(input)).resolves.toMatchObject({
+      duplicate: true, message: { id: "message-replay", turnId: "turn-a", fromTaskId: "task-sender" },
+    })
+    expect(client.queries.some(query => query.sql.includes('INSERT INTO "agent_mailbox_messages"'))).toBe(false)
+    expect(client.queries.some(query => query.sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
+  })
+
+  it.each([
+    ["sender provenance", mailboxRow({ fromTaskId: "task-original-sender", idempotencyKey: "same-key" }), "task-new-sender", "turn-a"],
+    ["cross-turn reuse", mailboxRow({ fromTaskId: null, turnId: "turn-old", idempotencyKey: "same-key" }), null, "turn-a"],
+  ] as const)("rejects mailbox idempotency-key reuse with changed %s", async (_label, existing, fromTaskId, turnId) => {
+    const taskTurnIds: Readonly<Record<string, string>> = fromTaskId === null ? {} : { [fromTaskId]: turnId }
+    const client = new FakeClient("task", "running", [existing], "user-a", activeOwnerTask(), taskTurnIds)
+    const store = new PgCoordinationStore(pool(client))
+
+    await expect(store.sendMessage({
+      userId: "user-a", sessionId: "session-a", turnId, fromTaskId,
+      toTaskId: "task-1", kind: "result", payload: { ok: true }, idempotencyKey: "same-key",
+    })).rejects.toMatchObject({ code: "coordination_idempotency_conflict" })
+    expect(client.queries.some(query => query.sql.includes('INSERT INTO "agent_mailbox_messages"'))).toBe(false)
+    expect(client.queries.some(query => query.sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
+    expect(client.queries.map(query => query.sql)).toContain("ROLLBACK")
   })
 
   it.each(["target", "sender"] as const)("rejects a %s task from another turn before mailbox writes", async side => {

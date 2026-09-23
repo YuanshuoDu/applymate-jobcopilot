@@ -110,7 +110,8 @@ export class PgCoordinationStore implements CoordinationStore {
         FROM "agent_mailbox_messages" WHERE "sessionId" = $1 AND "idempotencyKey" = $2`, [input.sessionId, input.idempotencyKey])
       if (existing.rows[0]) {
         const row = existing.rows[0] as Record<string, unknown>
-        if (String(row.toTaskId) !== input.toTaskId || String(row.kind) !== input.kind || stableJson(row.payload) !== stableJson(input.payload)) {
+        if (String(row.turnId) !== input.turnId || (row.fromTaskId == null ? null : String(row.fromTaskId)) !== input.fromTaskId
+          || String(row.toTaskId) !== input.toTaskId || String(row.kind) !== input.kind || stableJson(row.payload) !== stableJson(input.payload)) {
           throw new CoordinationError("coordination_idempotency_conflict", "Mailbox idempotency key was reused with different content")
         }
         return { message: messageRow(row), duplicate: true }
