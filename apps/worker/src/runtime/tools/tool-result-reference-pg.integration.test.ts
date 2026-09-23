@@ -166,10 +166,10 @@ describeWithPostgres("PostgreSQL private tool-result persistence (P1 slice)", ()
         tableRlsEnabled: boolean
         rowSecurityActive: boolean
       }>(`SELECT role.rolsuper AS "isSuperuser", role.rolbypassrls AS "bypassesRls",
-          pg_get_userbyid(table.relowner) = current_user AS "ownsTable", table.relrowsecurity AS "tableRlsEnabled",
-          row_security_active(table.oid) AS "rowSecurityActive"
-        FROM pg_roles role CROSS JOIN pg_class table
-        WHERE role.rolname = current_user AND table.oid = 'agent_tool_result_references'::regclass`)
+          pg_get_userbyid(relation.relowner) = current_user AS "ownsTable", relation.relrowsecurity AS "tableRlsEnabled",
+          row_security_active(relation.oid) AS "rowSecurityActive"
+        FROM pg_roles role CROSS JOIN pg_class AS relation
+        WHERE role.rolname = current_user AND relation.oid = 'agent_tool_result_references'::regclass`)
       expect(result.rows[0]).toEqual({
         isSuperuser: false,
         bypassesRls: false,
