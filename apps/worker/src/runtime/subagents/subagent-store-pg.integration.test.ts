@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool as PgPool, type PoolClient } from "pg"
 import { Type } from "@sinclair/typebox"
-import type { ModelAdapter } from "@jobcopilot/agent-model"
+import type { HarnessModelRequest, ModelAdapter } from "@jobcopilot/agent-model"
 import { schemaVersion } from "@jobcopilot/agent-protocol"
 import type { RuntimeToolDefinition } from "../tools/types.js"
 
@@ -54,6 +54,30 @@ type UserFixture = {
   readonly userId: string
   readonly email: string
   readonly trees: readonly TaskTreeFixture[]
+}
+type PgQueryFailure = {
+  readonly code: string | null
+  readonly message: string
+  readonly position: string | null
+  readonly sql: string
+}
+
+function queryText(value: unknown): string | null {
+  if (typeof value === "string") return value
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null
+  const text = (value as { text?: unknown }).text
+  return typeof text === "string" ? text : null
+}
+
+function pgQueryFailure(error: unknown, sql: string): PgQueryFailure {
+  const value = error && typeof error === "object" ? error as Record<string, unknown> : {}
+  return {
+    code: typeof value.code === "string" ? value.code : null,
+    message: typeof value.message === "string" ? value.message.slice(0, 500) : "Unknown PostgreSQL error",
+    position: typeof value.position === "string" ? value.position : null,
+    // Keep statement text only. Never retain pg's bind values or model/tool payloads.
+    sql: sql.slice(0, 4_000),
+  }
 }
 
 const suffix = randomUUID()
@@ -134,7 +158,7 @@ async function seedFixture(pool: PgPool, fixture: UserFixture): Promise<void> {
 async function seedChild(pool: PgPool, tree: TaskTreeFixture, taskId: string, turnId: string, label: string): Promise<void> {
   await pool.query(`INSERT INTO "sub_agent_tasks"
     ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal", "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "updatedAt")
-    VALUES ($1, $2, $3, $4, $4, $5, 1, 'scout', 'research', 'queued', 'P1 PostgreSQL subagent fencing test', '{}'::jsonb, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 0, 3, CURRENT_TIMESTAMP)`, [
+    VALUES ($1, $2, $3, $4, $4, $5, 1, 'scout', 'research', 'queued', 'P1 PostgreSQL subagent fencing test', '{}'::jsonb, '[]'::jsonb, '["jobs.search"]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 0, 3, CURRENT_TIMESTAMP)`, [
     taskId, tree.sessionId, turnId, tree.rootTaskId, `/root/${label}`,
   ])
 }
@@ -173,13 +197,34 @@ async function setRuntimeIdentity(client: PoolClient, userId: string): Promise<v
   await client.query("SELECT set_config('app.user_id', $1, false)", [userId])
 }
 
-function runtimePool(basePool: PgPool, userId: string): PgSubagentPool {
+function runtimePool(basePool: PgPool, userId: string, failures: PgQueryFailure[] = []): PgSubagentPool {
   return {
     async connect() {
       const client = await basePool.connect()
+      const tracedClient = new Proxy(client, {
+        get(target, property) {
+          if (property === "query") {
+            return (...args: unknown[]) => {
+              const sql = queryText(args[0])
+              try {
+                const result: unknown = Reflect.apply(target.query, target, args)
+                return Promise.resolve(result).catch(error => {
+                  if (sql) failures.push(pgQueryFailure(error, sql))
+                  throw error
+                })
+              } catch (error) {
+                if (sql) failures.push(pgQueryFailure(error, sql))
+                throw error
+              }
+            }
+          }
+          const value: unknown = Reflect.get(target, property, target)
+          return typeof value === "function" ? value.bind(target) : value
+        },
+      })
       try {
-        await setRuntimeIdentity(client, userId)
-        return client
+        await setRuntimeIdentity(tracedClient, userId)
+        return tracedClient
       } catch (error) {
         client.release()
         throw error
@@ -296,7 +341,8 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
 
   it("executes two real PostgreSQL child leases and preserves their separate root lineage", async () => {
     const executionTrees = [treeA!, treeAOther!]
-    const executionPool = runtimePool(ownerAPool!, userA.userId)
+    const queryFailures: PgQueryFailure[] = []
+    const executionPool = runtimePool(ownerAPool!, userA.userId, queryFailures)
     const modelProfile = {
       provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true,
       continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: true,
@@ -304,6 +350,7 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
       supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: null, costClass: "low" as const,
     }
     const modelCalls = new Map<string, number>()
+    const modelVisibleToolCatalogs = new Map<string, string[][]>()
     const searchTool: RuntimeToolDefinition = {
       schemaVersion, name: "jobs.search", version: "1", description: "Read fixture jobs",
       capabilities: ["read"], inputSchema: Type.Object({}, { additionalProperties: true }),
@@ -319,9 +366,15 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
       authorizeUsage: async () => ({ settle: async () => undefined }),
       modelRuntimeFactory: ({ task }) => ({
         id: `pg-child-fixture-model-${task.id}`, profile: modelProfile,
-        async *stream() {
+        async *stream(request: HarnessModelRequest) {
           const calls = (modelCalls.get(task.id) ?? 0) + 1
           modelCalls.set(task.id, calls)
+          const toolNames = request.tools.flatMap(tool => {
+            if (!tool || typeof tool !== "object" || Array.isArray(tool)) return []
+            const name = (tool as { name?: unknown }).name
+            return typeof name === "string" ? [name] : []
+          })
+          modelVisibleToolCatalogs.set(task.id, [...(modelVisibleToolCatalogs.get(task.id) ?? []), toolNames])
           if (calls === 1) {
             yield { type: "tool_call_completed", callId: `pg-child-read-${task.id}`, name: "jobs.search", arguments: {} }
             yield { type: "completed", finishReason: "tool_calls" }
@@ -355,6 +408,7 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
           attemptCount: task?.attemptCount,
           modelCalls: modelCalls.get(payload.taskId) ?? 0,
           toolCalls: toolCalls.filter(call => call.startsWith(`${payload.taskId}:`)).length,
+          pgQueryFailures: queryFailures.slice(-2),
         }
         expect(outcome, JSON.stringify(diagnostic)).toMatchObject({ taskId: payload.taskId, status: "completed" })
       }
@@ -364,6 +418,9 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
         result: { status: "completed", toolCallCount: 1, finalText: `Found deterministic evidence for ${tree.taskId}.` },
       })))
       expect(modelCalls).toEqual(new Map(executionTrees.map(tree => [tree.taskId, 2])))
+      for (const tree of executionTrees) {
+        expect(modelVisibleToolCatalogs.get(tree.taskId)).toEqual([["jobs.search"], ["jobs.search"]])
+      }
       expect(toolCalls).toEqual(executionTrees.map(tree => `${tree.taskId}:jobs.search`))
       for (let index = 0; index < executionTrees.length; index += 1) {
         const tree = executionTrees[index]!
