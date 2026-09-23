@@ -484,6 +484,7 @@ describe("child executor composition", () => {
 
   it("runs model → tool observation → model under child identity and shared reservation", async () => {
     const child = lease(); const events: Array<{ type: string; taskId: string }> = []; const requests: HarnessModelRequest[] = []; const budget = budgetStore(); let calls = 0
+    let routedToolCalls = 0
     const model: ModelAdapter = {
       id: "fixture-model", profile,
       async *stream(request) {
@@ -501,7 +502,10 @@ describe("child executor composition", () => {
     const executor = createChildExecutor({
       store: executionStore(events, requests), treeBudget: budget.store, authorizeUsage: authorize,
       modelRuntimeFactory: () => model,
-      toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs"), tool("spawn_subagent", "coordination")], async (_context, request) => ({ ...request, status: "completed", output: { job: "job-1" }, errorCode: null })),
+      toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs"), tool("spawn_subagent", "coordination")], async (_context, request) => {
+        routedToolCalls += 1
+        return { ...request, status: "completed", output: { job: "job-1" }, errorCode: null }
+      }),
     })
     await expect(executor({ lease: child })).resolves.toMatchObject({ status: "completed", result: { stepCount: 2, toolCallCount: 1 } })
     expect(requests).toHaveLength(2)
@@ -509,11 +513,58 @@ describe("child executor composition", () => {
     expect(requests[0].metadata.stepId).toContain(":attempt:2")
     expect(requests[0].tools.map(tool => (tool as { name: string }).name)).toEqual(["jobs.search"])
     expect(requests[1].messages).toEqual(expect.arrayContaining([{ role: "tool", content: [{ type: "tool_result", toolUseId: "call-1", content: '{"job":"job-1"}' }] }]))
+    expect(routedToolCalls).toBe(1)
     expect(authorize).toHaveBeenCalledTimes(2)
     expect(authorize.mock.calls.every(([input]) => input.executionOwner?.kind === "task" && input.executionOwner.attemptCount === 2)).toBe(true)
     expect(budget.statuses).toEqual(["consumed", "consumed"])
     expect(events.every(event => event.taskId === child.id)).toBe(true)
     expect(events.some(event => event.type === "turn.completed" || event.type === "turn.failed")).toBe(false)
+  })
+
+  it.each([
+    { name: "absent from persisted allowedActions", allowedActions: [], toolName: "jobs.search", domain: "jobs" as const, definitionVersion: "1", advertised: false },
+    { name: "hidden by role policy", allowedActions: ["persona.retrieve"], toolName: "persona.retrieve", domain: "persona" as const, definitionVersion: "1", advertised: false },
+    { name: "allowed name with an unsupported version", allowedActions: ["jobs.search"], toolName: "jobs.search", domain: "jobs" as const, definitionVersion: "2", advertised: true },
+  ])("denies model-emitted tools $name before router execution", async ({ allowedActions, toolName, domain, definitionVersion, advertised }) => {
+    const child = { ...lease(), allowedActions }
+    const requests: HarnessModelRequest[] = []
+    const events: Array<{ type: string; taskId: string }> = []
+    const routedCalls: string[] = []
+    let modelCalls = 0
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) {
+        requests.push(request)
+        modelCalls += 1
+        if (modelCalls === 1) {
+          yield { type: "tool_call_completed", callId: "denied-call", name: toolName, arguments: {} }
+          yield { type: "completed", finishReason: "tool_calls" }
+        } else {
+          yield { type: "text_delta", text: "done" }
+          yield { type: "completed", finishReason: "stop" }
+        }
+      },
+    }
+    const executor = createChildExecutor({
+      store: executionStore(events, requests), treeBudget: budgetStore().store,
+      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => model,
+      toolRuntimeFactory: () => childToolRuntime([{ ...tool(toolName, domain), version: definitionVersion }], async (_context, request) => {
+        routedCalls.push(request.toolName)
+        return { ...request, status: "completed", output: { unexpected: true }, errorCode: null }
+      }),
+    })
+
+    const outcome = await executor({ lease: child })
+    expect(outcome).toMatchObject({ result: { toolCallCount: 1 } })
+    expect(requests).toHaveLength(2)
+    expect(requests[0]?.tools.map(tool => (tool as { name: string }).name).includes(toolName)).toBe(advertised)
+    expect(routedCalls).toEqual([])
+    const toolMessage = requests[1]?.messages.find(message => message.role === "tool")
+    expect(toolMessage).toMatchObject({
+      role: "tool",
+      content: [{ type: "tool_result", toolUseId: "denied-call", content: '{"error":"tool_not_allowed"}', isError: true }],
+    })
+    expect(events.map(event => event.type)).toEqual(expect.arrayContaining(["tool_call.started", "tool_call.failed"]))
   })
 
   it("projects a redacted, bounded final response for a completed child", async () => {

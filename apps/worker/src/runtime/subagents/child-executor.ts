@@ -166,7 +166,11 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
     const model = createUsageAwareModelAdapter(adapter, { owner, authorize: options.authorizeUsage, treeBudget: options.treeBudget })
     const routedTool = createToolRouterExecutor(runtime.router)
     const executeTool: typeof routedTool = async input => {
-      const toolResult = await routedTool(input)
+      // Model-emitted calls can name tools omitted from the advertised catalog, so enforce the same filtered definitions here.
+      const permitted = definitions.some(definition => definition.name === input.call.toolName && definition.version === input.call.toolVersion)
+      const toolResult: ToolExecutionResult = permitted
+        ? await routedTool(input)
+        : { ...input.call, status: "failed", output: { error: "tool_not_allowed" }, errorCode: "child_action_denied" }
       if (toolResult.status === "completed" && toolResult.errorCode === null) recordReadToolOutput(observedEvidence, input.call.toolName, toolResult.output)
       return toolResult
     }
