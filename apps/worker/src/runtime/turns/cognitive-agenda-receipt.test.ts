@@ -47,6 +47,37 @@ describe("cognitive agenda receipt", () => {
     expect(parseCognitiveAgendaReceipt({ ...value, nextAction: "follow_external_instruction" } as never, scope)).toBeNull()
   })
 
+  it("accepts and parses a generated step ID longer than the generic ID limit", () => {
+    const turnId = "process-restart-turn-cdf8000f-87d2-4f57-aa24-a896766cb119"
+    const longScope: CognitiveAgendaReceiptScope = {
+      sessionId: "process-restart-session-cdf8000f-87d2-4f57-aa24-a896766cb119",
+      turnId,
+      taskId: `root-${turnId}`,
+      stepId: `turn:${turnId}:step:0:bb5c15da-8380-4595-a70e-df61daefeaeb`,
+    }
+    expect(longScope.stepId.length).toBeGreaterThan(96)
+    const value = buildCognitiveAgendaReceipt({
+      ...longScope,
+      inputThroughSequence: 7n,
+      consumedInputIds: [],
+      agenda: buildCognitiveActionAgenda(context()),
+    })
+    expect(value).not.toBeNull()
+    expect(parseCognitiveAgendaReceipt(value, longScope)).toEqual(value)
+  })
+
+  it("keeps long-step idempotency keys deterministic and within the key bound", () => {
+    const stepIdAtLength = (length: number) => `turn:${"t".repeat(length - "turn:".length - ":step:0:".length - 36)}:step:0:bb5c15da-8380-4595-a70e-df61daefeaeb`
+    const stepId = stepIdAtLength(256)
+    expect(stepId.length).toBe(256)
+    const key = cognitiveAgendaReceiptIdempotencyKey(stepId)
+    expect(key).toMatch(/^cognitive\.agenda:sha256:[a-f0-9]{64}$/)
+    expect(Buffer.byteLength(key ?? "", "utf8")).toBeLessThanOrEqual(256)
+    expect(cognitiveAgendaReceiptIdempotencyKey(stepId)).toBe(key)
+    expect(cognitiveAgendaReceiptIdempotencyKey(stepIdAtLength(257))).toBeNull()
+    expect(cognitiveAgendaReceiptIdempotencyKey("sha256:bb5c15da-8380-4595-a70e-df61daefeaeb")).toBeNull()
+  })
+
   it("carries a server-owned step cursor while accepting legacy receipts", () => {
     const fenced = buildCognitiveAgendaReceipt({ ...scope, inputThroughSequence: 7n, consumedInputIds: ["input-1"], agenda: buildCognitiveActionAgenda(context()) })
     expect(fenced?.resumeFence).toEqual({ inputThroughSequence: "7", consumedInputIds: ["input-1"] })
