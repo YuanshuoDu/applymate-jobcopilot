@@ -173,7 +173,7 @@ export function createPgTurnEngineStore(pool: TurnEnginePool): TurnEngineStore {
         const guard = ownedTurn(input.owner, 13, 10, 9, true)
         const result = await client.query(`UPDATE "agent_steps" AS step SET "status" = $1, "finishReason" = $2, "errorCode" = $3,
           "inputTokens" = $4, "outputTokens" = $5, "estimatedCostUsd" = $6,
-          "completedAt" = CASE WHEN $1 IN ('completed', 'failed', 'interrupted', 'waiting_for_tool', 'waiting_for_approval', 'waiting_for_user') THEN $7 ELSE NULL END
+          "completedAt" = CASE WHEN $1 IN ('completed', 'failed', 'interrupted', 'waiting_for_tool', 'waiting_for_approval', 'waiting_for_user') THEN $7::timestamp(3) ELSE NULL::timestamp(3) END
           ${guard.sql} AND step."id" = $8 AND step."sessionId" = $9 AND step."turnId" = $10 AND step."taskId" = $11 AND step."attempt" = $12
           AND turn."id" = step."turnId" AND turn."sessionId" = step."sessionId"`, [input.status, input.finishReason, input.errorCode, input.inputTokens, input.outputTokens, input.estimatedCostUsd, input.now, input.stepId, input.owner.sessionId, input.owner.turnId, input.owner.taskId, attempt, ...guard.values])
         if (result.rowCount !== 1) throw conflict(`step ${input.stepId}`)

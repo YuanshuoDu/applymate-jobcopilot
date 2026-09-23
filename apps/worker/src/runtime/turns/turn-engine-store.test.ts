@@ -274,9 +274,9 @@ describe("PostgreSQL TurnEngine store", () => {
   })
 
   it("locks the owner before updating a Step or Item", async () => {
-    const calls: string[] = []
-    const client = { query: vi.fn(async (sql: string) => {
-      calls.push(sql)
+    const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
+    const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+      calls.push({ sql, values })
       if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1" }], rowCount: 1 }
       if (sql.includes('SELECT turn."id"')) return { rows: [{ id: "turn-1" }], rowCount: 1 }
       if (sql.includes('SELECT item."id"')) return { rows: [{ id: "item-1" }], rowCount: 1 }
@@ -286,8 +286,11 @@ describe("PostgreSQL TurnEngine store", () => {
     const store = createPgTurnEngineStore({ connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">)
     await store.updateStep({ owner, stepId: "step-1", status: "completed", finishReason: "done", errorCode: null, inputTokens: 1, outputTokens: 2, estimatedCostUsd: 0.01, now })
     await store.updateItem({ owner, itemId: "item-1", expectedRevision: 0, status: "completed", phase: "commentary", content: { text: "done" }, startedAt: now, completedAt: now, now })
-    const locks = calls.reduce<number[]>((indices, sql, index) => sql.includes('SELECT turn."id"') ? [...indices, index] : indices, [])
-    const updates = calls.reduce<number[]>((indices, sql, index) => sql.includes('UPDATE "agent_') ? [...indices, index] : indices, [])
+    const stepUpdate = calls.find(call => call.sql.includes('UPDATE "agent_steps"'))
+    expect(stepUpdate?.sql).toContain("THEN $7::timestamp(3) ELSE NULL::timestamp(3) END")
+    expect(stepUpdate?.values?.[6]).toBe(now)
+    const locks = calls.reduce<number[]>((indices, call, index) => call.sql.includes('SELECT turn."id"') ? [...indices, index] : indices, [])
+    const updates = calls.reduce<number[]>((indices, call, index) => call.sql.includes('UPDATE "agent_') ? [...indices, index] : indices, [])
     expect(locks).toHaveLength(2)
     expect(locks[0]).toBeLessThan(updates[0])
     expect(locks[1]).toBeLessThan(updates[1])
