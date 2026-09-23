@@ -131,6 +131,39 @@ function waitForExit(child: WorkerChild, context: ExitWaitContext): Promise<void
   })
 }
 
+function workerHasExited(child: WorkerChild): boolean { return child.exitCode !== null || child.signalCode !== null }
+function cleanupError(error: unknown): string { return error instanceof Error ? error.stack ?? error.message : String(error) }
+
+async function stopWorkerForCleanup(child: WorkerChild, workerName: string): Promise<string | null> {
+  const gracefulContext: ExitWaitContext = { stage: `${workerName}-cleanup-after-shutdown`, pid: child.pid, timeoutMs: 3_000 }
+  const gracefulExit = waitForExit(child, gracefulContext)
+  let shutdownWriteError: string | null = null
+  try { child.stdin?.write("shutdown\n") } catch (error: unknown) { shutdownWriteError = cleanupError(error) }
+  try {
+    await gracefulExit
+    return null
+  } catch (gracefulError: unknown) {
+    if (workerHasExited(child)) return null
+    const forcedContext: ExitWaitContext = { stage: `${workerName}-cleanup-after-SIGKILL`, pid: child.pid, requestedSignal: "SIGKILL", timeoutMs: 3_000 }
+    const forcedExit = waitForExit(child, forcedContext)
+    let killError: string | null = null
+    try { forcedContext.signalAccepted = child.kill("SIGKILL") } catch (error: unknown) {
+      forcedContext.signalAccepted = false
+      killError = cleanupError(error)
+    }
+    try {
+      await forcedExit
+      return workerHasExited(child) ? null : `${workerName} cleanup wait ended without an exit state; ${exitWaitDiagnostics(child, forcedContext)}`
+    } catch (forcedError: unknown) {
+      return `${workerName} did not exit after graceful shutdown and SIGKILL; graceful=${cleanupError(gracefulError)}; shutdownWriteError=${shutdownWriteError ?? "none"}; killError=${killError ?? "none"}; forced=${cleanupError(forcedError)}; ${exitWaitDiagnostics(child, forcedContext)}`
+    }
+  }
+}
+
+async function attemptCleanup(failures: string[], label: string, action: () => Promise<unknown>): Promise<void> {
+  try { await action() } catch (error: unknown) { failures.push(`${label}: ${cleanupError(error)}`) }
+}
+
 async function waitForTurnStatus(pool: Pool, turnId: string, status: string, timeoutMs = 20_000): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
@@ -197,26 +230,45 @@ describeWithServices("production bootstrap recovery across a Worker process rest
   }, 20_000)
 
   afterAll(async () => {
-    for (const child of [workerOne, workerTwo]) {
-      if (!child || child.exitCode !== null || child.signalCode !== null) continue
-      child.stdin?.write("shutdown\n")
-      try { await waitForExit(child, { stage: "cleanup-after-shutdown", pid: child.pid, timeoutMs: 3_000 }) } catch { child.kill("SIGKILL") }
-    }
-    if (turnQueuePaused && turnQueue) {
-      await turnQueue.resume().catch(() => undefined)
-      turnQueuePaused = false
-    }
-    if (pool && typeof ids !== "undefined") await pool.query(`DELETE FROM "User" WHERE "id" = $1`, [ids.userId]).catch(() => undefined)
-    if (turnQueue && turnJobKey && typeof ids !== "undefined") {
-      for (const generation of [0, 1, 2]) {
-        await turnQueue.getJob(turnJobKey(ids.turnId, generation))?.then(job => job?.remove()).catch(() => undefined)
+    const cleanupFailures: string[] = []
+    for (const [workerName, child] of [["worker1", workerOne], ["worker2", workerTwo]] as const) {
+      if (!child || workerHasExited(child)) continue
+      try {
+        const failure = await stopWorkerForCleanup(child, workerName)
+        if (failure) cleanupFailures.push(failure)
+      } catch (error: unknown) {
+        cleanupFailures.push(`${workerName} cleanup threw: ${cleanupError(error)}; ${exitWaitDiagnostics(child, { stage: `${workerName}-cleanup`, pid: child.pid })}`)
       }
     }
-    if (childTaskId && childQueue && childJobKey) await childQueue.getJob(childJobKey(childTaskId))?.then(job => job?.remove()).catch(() => undefined)
-    await Promise.all([turnQueue?.close(), childQueue?.close()])
-    await import("../redis.js").then(module => module.closeSharedRedisConnections()).catch(() => undefined)
-    if (redis && redis.status !== "end") await redis.quit().catch(() => redis?.disconnect())
-    await pool?.end()
+    if (turnQueuePaused && turnQueue) {
+      await attemptCleanup(cleanupFailures, "turn queue resume", async () => {
+        await turnQueue!.resume()
+        turnQueuePaused = false
+      })
+    }
+    if (pool && typeof ids !== "undefined") await attemptCleanup(cleanupFailures, "fixture database cleanup", async () => {
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [ids.userId])
+    })
+    if (turnQueue && turnJobKey && typeof ids !== "undefined") {
+      for (const generation of [0, 1, 2]) {
+        await attemptCleanup(cleanupFailures, `turn job ${generation} cleanup`, async () => {
+          await turnQueue!.getJob(turnJobKey!(ids.turnId, generation))?.then(job => job?.remove())
+        })
+      }
+    }
+    if (childTaskId && childQueue && childJobKey) await attemptCleanup(cleanupFailures, "subagent job cleanup", async () => {
+      await childQueue!.getJob(childJobKey!(childTaskId!))?.then(job => job?.remove())
+    })
+    if (turnQueue) await attemptCleanup(cleanupFailures, "turn queue close", async () => { await turnQueue!.close() })
+    if (childQueue) await attemptCleanup(cleanupFailures, "subagent queue close", async () => { await childQueue!.close() })
+    await attemptCleanup(cleanupFailures, "shared Redis connection cleanup", async () => {
+      await import("../redis.js").then(module => module.closeSharedRedisConnections())
+    })
+    if (redis && redis.status !== "end") await attemptCleanup(cleanupFailures, "Redis client cleanup", async () => {
+      try { await redis!.quit() } catch (error: unknown) { redis!.disconnect(); throw error }
+    })
+    if (pool) await attemptCleanup(cleanupFailures, "PostgreSQL pool cleanup", async () => { await pool!.end() })
+    if (cleanupFailures.length > 0) throw new Error(`Process-restart fixture cleanup failed:\n${cleanupFailures.join("\n")}`)
   })
 
   it("persists a child result, kills its Worker, and resumes the parent from PostgreSQL under a new lease", async () => {
@@ -378,6 +430,9 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     expect(stable.rows[0]).toEqual(completedSnapshot)
 
     workerTwo.stdin?.write("shutdown\n")
+    await waitForLine(workerTwo, "SHUTDOWN_STAGE bootstrap_close:complete", 10_000)
     await waitForExit(workerTwo, { stage: "worker2-after-shutdown", pid: workerTwo.pid })
+    expect(workerTwo.exitCode).toBe(0)
+    expect(workerTwo.signalCode).toBeNull()
   }, 60_000)
 })

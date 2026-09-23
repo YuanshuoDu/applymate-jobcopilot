@@ -15,7 +15,7 @@ const queuedCommands = []
 const commandWaiters = new Map()
 
 process.stdin.setEncoding("utf8")
-process.stdin.on("data", chunk => {
+function onStdinData(chunk) {
   stdinBuffer += chunk
   const lines = stdinBuffer.split("\n")
   stdinBuffer = lines.pop() ?? ""
@@ -29,7 +29,8 @@ process.stdin.on("data", chunk => {
       resolve()
     } else queuedCommands.push(command)
   }
-})
+}
+process.stdin.on("data", onStdinData)
 
 function say(value) {
   process.stdout.write(`${value}\n`)
@@ -51,10 +52,26 @@ function waitForCommand(command) {
 async function waitForStop() {
   await waitForCommand("shutdown")
   stopping = true
+  process.stdin.off("data", onStdinData)
+  process.stdin.pause()
+  process.stdin.destroy()
 }
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+async function runShutdownStage(name, action) {
+  say(`SHUTDOWN_STAGE ${name}:start`)
+  try {
+    await action()
+    say(`SHUTDOWN_STAGE ${name}:complete`)
+  } catch (error) {
+    say(`SHUTDOWN_STAGE ${name}:failed`)
+    const message = error instanceof Error ? error.stack ?? error.message : String(error)
+    process.stderr.write(`${name}: ${message}\n`)
+    process.exitCode = 1
+  }
 }
 
 async function waitForSuspendedParent(turnId, timeoutMs = 15_000) {
@@ -249,8 +266,10 @@ try {
   process.stderr.write(`${message}\n`)
   process.exitCode = 1
 } finally {
-  if (bootstrap) await bootstrap.close().catch(error => process.stderr.write(`bootstrap_close: ${String(error)}\n`))
-  await pool.end().catch(() => undefined)
-  const { closeSharedRedisConnections } = await import("../redis.ts")
-  await closeSharedRedisConnections().catch(() => undefined)
+  await runShutdownStage("bootstrap_close", async () => { if (bootstrap) await bootstrap.close() })
+  await runShutdownStage("pool_end", async () => { await pool.end() })
+  await runShutdownStage("shared_redis_connections_close", async () => {
+    const { closeSharedRedisConnections } = await import("../redis.ts")
+    await closeSharedRedisConnections()
+  })
 }
