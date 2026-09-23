@@ -411,7 +411,10 @@ describeWithRedis("production child scheduling and wait wakeup (real Redis/BullM
 
     const job = await waitForCompletedJob(observerQueue!, subagentJobId(child.id))
     expect(job.data).toEqual(payload)
-    expect(job.returnvalue).toMatchObject({ taskId: child.id, status: "completed" })
+    expect(
+      job.returnvalue,
+      `child failureReason=${String(child.failureReason)}; child result=${JSON.stringify(child.result)}; tool calls=${JSON.stringify(toolCalls)}`,
+    ).toMatchObject({ taskId: child.id, status: "completed" })
     expect(fixture.outbox.find(row => row.topic === "agent.subagent.dispatch")).toMatchObject({ publishedAt: expect.any(Date), attemptCount: 1 })
     expect(child.status).toBe("completed")
     expect(child.result).toMatchObject({ status: "completed", toolCallCount: 1, finalText: "Found one deterministic candidate." })
