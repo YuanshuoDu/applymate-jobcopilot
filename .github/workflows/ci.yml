@@ -83,12 +83,20 @@ jobs:
         run: pnpm turbo build --filter=@jobcopilot/worker
       - name: Verify durable tool-result persistence and owner isolation
         run: pnpm --filter @jobcopilot/worker exec vitest run src/runtime/tools/tool-result-reference-pg.integration.test.ts
+      - name: Verify subagent task leases and attempt fencing on disposable PostgreSQL
+        run: pnpm --filter @jobcopilot/worker exec vitest run src/runtime/subagents/subagent-store-pg.integration.test.ts
       - name: Verify production Turn dispatch on disposable Redis/BullMQ
         env:
           RUN_AGENT_TURN_REDIS_INTEGRATION: "1"
           AGENT_TURN_REDIS_TEST_DISPOSABLE: "true"
           AGENT_TURN_REDIS_TEST_URL: redis://127.0.0.1:6379/15
         run: pnpm --filter @jobcopilot/worker exec vitest run src/queue/production-bootstrap-redis.integration.test.ts
+      - name: Verify production subagent dispatch and durable parent wake on disposable Redis/BullMQ
+        env:
+          RUN_AGENT_TURN_REDIS_INTEGRATION: "1"
+          AGENT_TURN_REDIS_TEST_DISPOSABLE: "true"
+          AGENT_TURN_REDIS_TEST_URL: redis://127.0.0.1:6379/15
+        run: pnpm --filter @jobcopilot/worker exec vitest run src/queue/production-bootstrap-subagents-redis.integration.test.ts
   lockfile:
     name: Lockfile
     runs-on: ubuntu-latest
