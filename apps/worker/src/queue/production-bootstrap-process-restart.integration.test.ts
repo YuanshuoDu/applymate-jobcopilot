@@ -126,6 +126,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
   let pool: Pool | undefined
   let redis: Redis | undefined
   let turnQueue: Queue | undefined
+  let turnQueuePaused = false
   let childQueue: Queue | undefined
   let turnJobKey: ((turnId: string, generation?: number) => string) | undefined
   let childJobKey: ((taskId: string) => string) | undefined
@@ -179,6 +180,10 @@ describeWithServices("production bootstrap recovery across a Worker process rest
       child.stdin?.write("shutdown\n")
       try { await waitForExit(child, 3_000) } catch { child.kill("SIGKILL") }
     }
+    if (turnQueuePaused && turnQueue) {
+      await turnQueue.resume().catch(() => undefined)
+      turnQueuePaused = false
+    }
     if (pool && typeof ids !== "undefined") await pool.query(`DELETE FROM "User" WHERE "id" = $1`, [ids.userId]).catch(() => undefined)
     if (turnQueue && turnJobKey && typeof ids !== "undefined") {
       for (const generation of [0, 1, 2]) {
@@ -194,17 +199,23 @@ describeWithServices("production bootstrap recovery across a Worker process rest
 
   it("persists a child result, kills its Worker, and resumes the parent from PostgreSQL under a new lease", async () => {
     workerOne = startWorker("park-parent", ids)
+    await waitForLine(workerOne, "PARENT_SUSPENDED")
+    // Freeze the real shared Turn queue before the child completes so Process 1 cannot claim its wakeup.
+    await turnQueue!.pause()
+    turnQueuePaused = true
+    expect(await turnQueue!.isPaused()).toBe(true)
+    workerOne.stdin?.write("persist-child-result\n")
     await waitForLine(workerOne, "READY_TO_RESTART")
 
     const parent = await pool!.query<{ status: string; leaseOwnerId: string | null; leaseVersion: number }>(
       `SELECT "status", "leaseOwnerId", "leaseVersion" FROM "agent_turns" WHERE "id" = $1`, [ids.turnId],
     )
-    expect(parent.rows[0]).toMatchObject({ status: "waiting_for_dependency", leaseOwnerId: null, leaseVersion: 1 })
+    expect(parent.rows[0]).toMatchObject({ status: "queued", leaseOwnerId: null, leaseVersion: 1 })
     const wait = await pool!.query<{ id: string; status: string; suspendedAt: Date | null; targetTaskIds: string[]; consumedAt: Date | null }>(
       `SELECT "id", "status", "suspendedAt", "targetTaskIds", "consumedAt" FROM "agent_wait_conditions" WHERE "turnId" = $1`, [ids.turnId],
     )
     expect(wait.rows).toHaveLength(1)
-    expect(wait.rows[0]).toMatchObject({ status: "waiting", consumedAt: null })
+    expect(wait.rows[0]).toMatchObject({ status: "ready", consumedAt: null })
     expect(wait.rows[0]?.suspendedAt).toBeInstanceOf(Date)
     childTaskId = Array.isArray(wait.rows[0]?.targetTaskIds)
       ? wait.rows[0].targetTaskIds[0]
@@ -228,15 +239,36 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     const rootBeforeRestart = await pool!.query<{ rootTaskId: string | null }>(
       `SELECT "rootTaskId" FROM "agent_turns" WHERE "id" = $1`, [ids.turnId],
     )
+    const resumedEventBeforeRestart = await pool!.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS "count" FROM "agent_events" WHERE "sessionId" = $1 AND "idempotencyKey" = $2`,
+      [ids.sessionId, `agent-wait:${wait.rows[0]!.id}:resumed`],
+    )
+    expect(resumedEventBeforeRestart.rows[0]?.count).toBe("1")
+    const dispatchBeforeRestart = await pool!.query<{ publishedAt: Date | null }>(
+      `SELECT "publishedAt" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.turn.dispatch' AND "idempotencyKey" = $2`,
+      [ids.sessionId, `turn-dispatch:${ids.turnId}`],
+    )
+    expect(dispatchBeforeRestart.rows[0]?.publishedAt).toBeInstanceOf(Date)
+    const wakeupJob = await turnQueue!.getJob(turnJobKey!(ids.turnId, 2))
+    expect(wakeupJob).toBeDefined()
+    expect(wakeupJob?.data).toMatchObject({
+      turnId: ids.turnId,
+      sessionId: ids.sessionId,
+      ownerId: `restart-wait-resolver-${workerOne.pid}`,
+    })
+    expect(await turnQueue!.isPaused()).toBe(true)
 
     workerOne.kill("SIGKILL")
     await waitForExit(workerOne)
     expect(workerOne.signalCode).toBe("SIGKILL")
-    const parkedAfterKill = await pool!.query<{ status: string; leaseVersion: number }>(
-      `SELECT "status", "leaseVersion" FROM "agent_turns" WHERE "id" = $1`, [ids.turnId],
+    const parkedAfterKill = await pool!.query<{ status: string; leaseOwnerId: string | null; leaseVersion: number }>(
+      `SELECT "status", "leaseOwnerId", "leaseVersion" FROM "agent_turns" WHERE "id" = $1`, [ids.turnId],
     )
-    expect(parkedAfterKill.rows[0]).toEqual({ status: "waiting_for_dependency", leaseVersion: 1 })
+    expect(parkedAfterKill.rows[0]).toEqual({ status: "queued", leaseOwnerId: null, leaseVersion: 1 })
 
+    await turnQueue!.resume()
+    turnQueuePaused = false
+    expect(await turnQueue!.isPaused()).toBe(false)
     workerTwo = startWorker("resume-parent", ids)
     expect(workerTwo.pid).not.toBe(workerOne.pid)
     await waitForLine(workerTwo, "RESUME_CONTEXT_OK")

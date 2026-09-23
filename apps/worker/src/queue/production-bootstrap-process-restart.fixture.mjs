@@ -10,21 +10,47 @@ const finalMarker = "parent-resumed-from-durable-child-result"
 const pool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 5 })
 let bootstrap
 let stopping = false
+let stdinBuffer = ""
+const queuedCommands = []
+const commandWaiters = new Map()
+
+process.stdin.setEncoding("utf8")
+process.stdin.on("data", chunk => {
+  stdinBuffer += chunk
+  const lines = stdinBuffer.split("\n")
+  stdinBuffer = lines.pop() ?? ""
+  for (const line of lines) {
+    const command = line.trim()
+    if (!command) continue
+    const waiters = commandWaiters.get(command)
+    const resolve = waiters?.shift()
+    if (resolve) {
+      if (waiters.length === 0) commandWaiters.delete(command)
+      resolve()
+    } else queuedCommands.push(command)
+  }
+})
 
 function say(value) {
   process.stdout.write(`${value}\n`)
 }
 
-function waitForStop() {
+function waitForCommand(command) {
+  const queuedIndex = queuedCommands.indexOf(command)
+  if (queuedIndex >= 0) {
+    queuedCommands.splice(queuedIndex, 1)
+    return Promise.resolve()
+  }
   return new Promise(resolve => {
-    process.stdin.setEncoding("utf8")
-    process.stdin.on("data", chunk => {
-      if (chunk.includes("shutdown")) {
-        stopping = true
-        resolve()
-      }
-    })
+    const waiters = commandWaiters.get(command) ?? []
+    waiters.push(resolve)
+    commandWaiters.set(command, waiters)
   })
+}
+
+async function waitForStop() {
+  await waitForCommand("shutdown")
+  stopping = true
 }
 
 function sleep(ms) {
@@ -109,11 +135,13 @@ async function makeFirstWorker() {
   })
   bootstrap = await createProductionWorkerBootstrap({
     pool, runtime, ownerId: `restart-worker-${process.pid}`, turnRecoveryIntervalMs: 10,
-    waitResolver: { intervalMs: 60_000, ownerId: `restart-wait-resolver-${process.pid}` },
+    waitResolver: { intervalMs: 10, ownerId: `restart-wait-resolver-${process.pid}` },
     subagents: {
       intervalMs: 10,
       async execute({ lease }) {
         await waitForSuspendedParent(lease.turnId)
+        say("PARENT_SUSPENDED")
+        await waitForCommand("persist-child-result")
         return { status: "completed", result: { proof: resultMarker, taskId: lease.id } }
       },
     },
@@ -123,11 +151,17 @@ async function makeFirstWorker() {
   })
   const deadline = Date.now() + 15_000
   while (!stopping && Date.now() < deadline) {
-    const result = await pool.query(`SELECT turn."status" AS "turnStatus", task."status" AS "childStatus"
-      FROM "agent_turns" AS turn LEFT JOIN "sub_agent_tasks" AS task ON task."turnId" = turn."id" AND task."role" = 'analyst'
+    const result = await pool.query(`SELECT turn."status" AS "turnStatus", turn."leaseOwnerId", task."status" AS "childStatus",
+        wait."status" AS "waitStatus", wait."suspendedAt", dispatch."publishedAt" AS "dispatchPublishedAt"
+      FROM "agent_turns" AS turn
+      LEFT JOIN "sub_agent_tasks" AS task ON task."turnId" = turn."id" AND task."role" = 'analyst'
+      LEFT JOIN "agent_wait_conditions" AS wait ON wait."turnId" = turn."id" AND wait."parentTaskId" = turn."rootTaskId"
+      LEFT JOIN "agent_outbox" AS dispatch ON dispatch."aggregateId" = turn."sessionId"
+        AND dispatch."topic" = 'agent.turn.dispatch' AND dispatch."idempotencyKey" = 'turn-dispatch:' || turn."id"
       WHERE turn."id" = $1`, [ids.turnId])
     const row = result.rows[0]
-    if (row?.turnStatus === "waiting_for_dependency" && row?.childStatus === "completed") {
+    if (row?.turnStatus === "queued" && row?.leaseOwnerId === null && row?.childStatus === "completed"
+      && row?.waitStatus === "ready" && row?.suspendedAt && row?.dispatchPublishedAt) {
       say("READY_TO_RESTART")
       await waitForStop()
       return

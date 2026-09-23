@@ -141,6 +141,9 @@ describe("createPgRootTaskStore", () => {
     const fake = fakePool()
     await createPgRootTaskStore(fake.pool).finish({ lease, rootTaskId: "root-turn-1", result: { status: "waiting_for_dependency", stepCount: 1, toolCallCount: 0, waitId: "wait-1" } })
     expect(fake.calls.some(sql => sql.includes('"leaseOwner" = NULL') && sql.includes('"leaseExpiresAt" = NULL'))).toBe(true)
+    const taskUpdate = fake.client.query.mock.calls.find(([sql]) => sql.includes('UPDATE "sub_agent_tasks" SET'))?.[0] ?? ""
+    expect(taskUpdate).toContain("THEN $4::timestamp(3) ELSE NULL::timestamp(3) END")
+    expect(taskUpdate).toContain('"updatedAt" = $4::timestamp(3)')
     expect(fake.client.query.mock.calls.some(([, values]) => String(values?.[1]).includes('"waitId":"wait-1"'))).toBe(true)
   })
 
