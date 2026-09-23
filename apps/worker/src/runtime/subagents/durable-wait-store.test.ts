@@ -59,6 +59,8 @@ describe("durable PostgreSQL wait port", () => {
     expect(test.calls.some(call => call.sql.includes("set_config('app.user_id'"))).toBe(true)
     expect(test.calls.some(call => call.sql.includes("ON CONFLICT"))).toBe(true)
     expect(test.calls.some(call => call.sql.includes('session."status" NOT IN (\'aborted\', \'archived\')'))).toBe(true)
+    const insert = test.calls.find(call => call.sql.includes('INSERT INTO "agent_wait_conditions"'))
+    expect(insert?.sql).toMatch(/"matchedTaskIds", "result", "createdAt", "updatedAt"\)\s+SELECT \$1, \$2, \$3, \$4, \$5, \$6, \$7, \$8::jsonb, \$9, \$10, \$11, \$12::jsonb, \$13::jsonb, \$14, \$14/)
     vi.useRealTimers()
   })
 

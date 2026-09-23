@@ -127,7 +127,7 @@ export function createPgDurableWaitPort(pool: Pool): DurableWaitStore {
       const matchedTaskIds = targets.rows.filter(target => TERMINAL_TASK_STATUSES.has(String(target.status))).map(target => String(target.id)).sort()
       const status = normalized.now >= deadlineAt ? "timed_out" : (input.mode === "any" ? matchedTaskIds.length > 0 : matchedTaskIds.length === targets.rows.length) ? "ready" : "waiting"
       const inserted = await client.query<Row>(`INSERT INTO "agent_wait_conditions"
-        ("id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "idempotencyKey", "targetTaskIds", "mode", "status", "deadlineAt", "matchedTaskIds", "createdAt", "updatedAt")
+        ("id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "idempotencyKey", "targetTaskIds", "mode", "status", "deadlineAt", "matchedTaskIds", "result", "createdAt", "updatedAt")
         SELECT $1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12::jsonb, $13::jsonb, $14, $14
         WHERE EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = $3 AND session."userId" = $2 AND ${OPEN_SESSION})
         ON CONFLICT ("parentTaskId", "idempotencyKey") DO NOTHING
