@@ -7,7 +7,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 
 import type { SubagentPolicy, SubagentStore, SubagentTaskRecord, SubagentTaskSpec, SubagentLease, SubagentJobPayload } from "../runtime/subagents/types.js"
 import type { TreeBudgetReservation, TreeBudgetReservationStore } from "../runtime/subagents/tree-budget-types.js"
-import type { TurnExecutionStore } from "../runtime/turns/turn-execution-types.js"
+import type { TurnEngineStore } from "../runtime/turns/turn-engine-types.js"
 import type { RuntimeToolDefinition } from "../runtime/tools/types.js"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 
@@ -271,6 +271,7 @@ const modelProfile = {
 async function deterministicChildRuntime(toolCalls: Array<{ taskId: string; toolName: string }>) {
   const { createProductionChildExecutor } = await import("../runtime/subagents/production-child-runtime.js")
   let modelCalls = 0
+  const events: Array<{ type: string; payload: unknown }> = []
   const model: ModelAdapter = {
     id: "fixture-child-model", profile: modelProfile,
     async *stream() {
@@ -292,16 +293,17 @@ async function deterministicChildRuntime(toolCalls: Array<{ taskId: string; tool
     async execute() { return { jobs: [{ id: "fixture-job" }] } },
   }
   const revisions = new Map<string, number>()
-  const turnStore: TurnExecutionStore = {
+  const turnStore: TurnEngineStore = {
     async startStep({ stepId, ordinal }) { return { id: stepId, ordinal } },
     async updateStep() {},
-    async createItem({ identity, itemId }) { revisions.set(`${identity.taskId}:${itemId}`, 0); return { id: itemId, revision: 0 } },
-    async updateItem({ identity, itemId, expectedRevision }) {
-      const key = `${identity.taskId}:${itemId}`
+    async createItem({ owner, itemId }) { revisions.set(`${owner.taskId}:${itemId}`, 0); return { id: itemId, revision: 0 } },
+    async updateItem({ owner, itemId, expectedRevision }) {
+      const key = `${owner.taskId}:${itemId}`
       revisions.set(key, expectedRevision + 1)
       return { id: itemId, revision: expectedRevision + 1 }
     },
-    async appendEvent() { return { id: `fixture-event-${randomUUID()}` } },
+    async appendEvent(input) { events.push({ type: input.type, payload: input.payload }); return { id: `fixture-event-${randomUUID()}` } },
+    async recordFinalResponse() {},
   }
   const treeBudget: TreeBudgetReservationStore = {
     async reserve(input) {
@@ -313,7 +315,7 @@ async function deterministicChildRuntime(toolCalls: Array<{ taskId: string; tool
   }
   const executor = createProductionChildExecutor({
     pool: { async connect() { throw new Error("fixture pool should not be used by the deterministic child runtime") } } as never,
-    turnStore: turnStore as never,
+    turnStore,
     treeBudget,
     authorizeUsage: async () => ({ settle: async () => undefined }),
     modelRuntimeFactory: () => model,
@@ -327,8 +329,32 @@ async function deterministicChildRuntime(toolCalls: Array<{ taskId: string; tool
     }),
     resumeLoader: async () => undefined,
   })
-  return executor
+  return { execute: executor, diagnostics: () => ({ modelCalls, events }) }
 }
+
+describe("deterministic production child fixture", () => {
+  it("executes the child runtime from a manager-issued lease without Redis", async () => {
+    const ids = { sessionId: `direct-session-${randomUUID()}`, turnId: `direct-turn-${randomUUID()}`, userId: `direct-user-${randomUUID()}` }
+    const { AgentTreeManager } = await import("../runtime/subagents/manager.js")
+    const { store } = createTaskStore()
+    const manager = new AgentTreeManager(store)
+    const root = await manager.spawn({ ...ids, role: "planner", taskType: "root", goal: "parent wait fixture" })
+    root.status = "running"
+    const child = await manager.spawn({
+      ...ids, parentTaskId: root.id, role: "analyst", taskType: "research", goal: "Read deterministic job evidence",
+      allowedActions: ["jobs.search"], modelProfileSnapshot: { provider: "fixture", model: "fixture-model" },
+    })
+    const payload: SubagentJobPayload = { taskId: child.id, sessionId: ids.sessionId, rootTaskId: root.id, ownerId: "direct-child-owner" }
+    const toolCalls: Array<{ taskId: string; toolName: string }> = []
+    const runtime = await deterministicChildRuntime(toolCalls)
+    try {
+      const outcome = await manager.run(payload, runtime.execute)
+      expect(outcome, JSON.stringify({ task: child, diagnostics: runtime.diagnostics(), toolCalls })).toMatchObject({ taskId: child.id, status: "completed" })
+    } finally {
+      await manager.shutdown()
+    }
+  }, 30_000)
+})
 
 describeWithRedis("production child scheduling and wait wakeup (real Redis/BullMQ)", () => {
   let probeRedis: Redis | undefined
@@ -402,7 +428,7 @@ describeWithRedis("production child scheduling and wait wakeup (real Redis/BullM
         }) as never,
         turnRecoveryFactory: () => ({ close: async () => undefined }) as never,
         waitResolver: { intervalMs: 10, batchSize: 1, ownerId: "redis-wait-resolver" },
-        subagents: { execute: childExecutor, intervalMs: 60_000, queue: dispatchQueue },
+        subagents: { execute: childExecutor.execute, intervalMs: 60_000, queue: dispatchQueue },
       },
       startAgentRunWorker: () => undefined,
     })
@@ -413,7 +439,7 @@ describeWithRedis("production child scheduling and wait wakeup (real Redis/BullM
     expect(job.data).toEqual(payload)
     expect(
       job.returnvalue,
-      `child failureReason=${String(child.failureReason)}; child result=${JSON.stringify(child.result)}; tool calls=${JSON.stringify(toolCalls)}`,
+      `child failureReason=${String(child.failureReason)}; child result=${JSON.stringify(child.result)}; diagnostics=${JSON.stringify(childExecutor.diagnostics())}; tool calls=${JSON.stringify(toolCalls)}`,
     ).toMatchObject({ taskId: child.id, status: "completed" })
     expect(fixture.outbox.find(row => row.topic === "agent.subagent.dispatch")).toMatchObject({ publishedAt: expect.any(Date), attemptCount: 1 })
     expect(child.status).toBe("completed")
