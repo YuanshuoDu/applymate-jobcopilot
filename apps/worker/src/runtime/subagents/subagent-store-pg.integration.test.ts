@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 import { Pool as PgPool, type PoolClient } from "pg"
 import { Type } from "@sinclair/typebox"
 import type { HarnessModelRequest, ModelAdapter } from "@jobcopilot/agent-model"
@@ -11,6 +11,25 @@ import { defaultSubagentPolicy, type PgSubagentPool } from "./types.js"
 import { createProductionChildExecutor } from "./production-child-runtime.js"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
 import { createPgTreeBudgetReservationStore } from "./tree-budget-store.js"
+import {
+  createWorkerUsageAuthorizer,
+  type WorkerUsageAuthorizationInput,
+  type WorkerUsageSettlementInput,
+} from "../../queue/ai-usage-bridge.js"
+
+const usageRouteMocks = vi.hoisted(() => ({
+  database: null as unknown,
+  resolveAiAccess: vi.fn(),
+  getEffectiveEntitlements: vi.fn(),
+  loadWorkerAiConfig: vi.fn(),
+}))
+
+vi.mock("@/lib/db", () => ({ db: usageRouteMocks.database }))
+vi.mock("@/lib/entitlements", () => ({
+  resolveAiAccess: usageRouteMocks.resolveAiAccess,
+  getEffectiveEntitlements: usageRouteMocks.getEffectiveEntitlements,
+}))
+vi.mock("@jobcopilot/shared/llm", () => ({ loadWorkerAiConfig: usageRouteMocks.loadWorkerAiConfig }))
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const RUNTIME_ROLE = "agent_runtime_p1_test"
@@ -111,6 +130,20 @@ const userA: UserFixture = {
       rootTaskId: `p1-subagent-root-a-second-${suffix}`,
       taskId: `p1-subagent-task-a-second-${suffix}`,
     },
+    {
+      sessionId: `p1-subagent-session-a-usage-one-${suffix}`,
+      turns: [{ id: `p1-subagent-turn-a-usage-one-${suffix}`, status: "in_progress" }],
+      turnId: `p1-subagent-turn-a-usage-one-${suffix}`,
+      rootTaskId: `p1-subagent-root-a-usage-one-${suffix}`,
+      taskId: `p1-subagent-task-a-usage-one-${suffix}`,
+    },
+    {
+      sessionId: `p1-subagent-session-a-usage-two-${suffix}`,
+      turns: [{ id: `p1-subagent-turn-a-usage-two-${suffix}`, status: "in_progress" }],
+      turnId: `p1-subagent-turn-a-usage-two-${suffix}`,
+      rootTaskId: `p1-subagent-root-a-usage-two-${suffix}`,
+      taskId: `p1-subagent-task-a-usage-two-${suffix}`,
+    },
   ],
 }
 const userB: UserFixture = {
@@ -170,6 +203,9 @@ async function installTestTenantRls(pool: PgPool): Promise<void> {
   await pool.query(`ALTER TABLE "agent_sessions" ENABLE ROW LEVEL SECURITY`)
   await pool.query(`ALTER TABLE "agent_turns" ENABLE ROW LEVEL SECURITY`)
   await pool.query(`ALTER TABLE "sub_agent_tasks" ENABLE ROW LEVEL SECURITY`)
+  await pool.query(`ALTER TABLE "agent_steps" ENABLE ROW LEVEL SECURITY`)
+  await pool.query(`ALTER TABLE ai_usage_events ENABLE ROW LEVEL SECURITY`)
+  await pool.query(`ALTER TABLE ai_budgets ENABLE ROW LEVEL SECURITY`)
 
   await pool.query(`DROP POLICY IF EXISTS candidate_agent_session_isolation ON "agent_sessions"`)
   await pool.query(`CREATE POLICY candidate_agent_session_isolation ON "agent_sessions"
@@ -190,6 +226,20 @@ async function installTestTenantRls(pool: PgPool): Promise<void> {
     WITH CHECK (EXISTS (
       SELECT 1 FROM "agent_sessions" session
       WHERE session."id" = "sessionId" AND session."userId" = app_current_user_id()))`)
+  await pool.query(`DROP POLICY IF EXISTS candidate_agent_step_isolation ON "agent_steps"`)
+  await pool.query(`CREATE POLICY candidate_agent_step_isolation ON "agent_steps"
+    USING (EXISTS (
+      SELECT 1 FROM "agent_turns" turn
+      WHERE turn."id" = "turnId" AND turn."userId" = app_current_user_id()))
+    WITH CHECK (EXISTS (
+      SELECT 1 FROM "agent_turns" turn
+      WHERE turn."id" = "turnId" AND turn."userId" = app_current_user_id()))`)
+  await pool.query(`DROP POLICY IF EXISTS candidate_ai_usage_event_isolation ON ai_usage_events`)
+  await pool.query(`CREATE POLICY candidate_ai_usage_event_isolation ON ai_usage_events
+    USING (user_id = app_current_user_id()) WITH CHECK (user_id = app_current_user_id())`)
+  await pool.query(`DROP POLICY IF EXISTS candidate_ai_budget_isolation ON ai_budgets`)
+  await pool.query(`CREATE POLICY candidate_ai_budget_isolation ON ai_budgets
+    USING (user_id = app_current_user_id()) WITH CHECK (user_id = app_current_user_id())`)
 }
 
 async function setRuntimeIdentity(client: PoolClient, userId: string): Promise<void> {
@@ -233,9 +283,78 @@ function runtimePool(basePool: PgPool, userId: string, failures: PgQueryFailure[
   }
 }
 
+type PrismaSqlShape = { readonly text: string; readonly values: readonly unknown[] }
+
+function prismaSqlShape(query: unknown): PrismaSqlShape {
+  if (!query || typeof query !== "object") throw new TypeError("Usage broker query was not a Prisma SQL object")
+  const row = query as { text?: unknown; values?: unknown }
+  if (typeof row.text !== "string" || !Array.isArray(row.values)) throw new TypeError("Usage broker query omitted parameterized SQL fields")
+  return { text: row.text, values: row.values }
+}
+
+function createPgUsageDatabase(pool: PgSubagentPool) {
+  return {
+    async $transaction<T>(work: (tx: { $queryRaw<T>(query: unknown): Promise<T> }) => Promise<T>): Promise<T> {
+      const client = await pool.connect()
+      try {
+        await client.query("BEGIN")
+        const result = await work({
+          async $queryRaw<Row>(query: unknown): Promise<Row> {
+            const statement = prismaSqlShape(query)
+            const response = await client.query(statement.text, statement.values as never)
+            return response.rows as Row
+          },
+        })
+        await client.query("COMMIT")
+        return result
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined)
+        throw error
+      } finally {
+        client.release()
+      }
+    },
+  }
+}
+
+type UsageSnapshot = {
+  readonly ledger: readonly {
+    id: string
+    userId: string | null
+    featureKey: string
+    provider: string
+    model: string
+    inputTokens: number
+    outputTokens: number
+    estimatedCostUsd: number
+    status: string
+    errorCode: string | null
+    credentialSource: string
+    runtime: string
+  }[]
+  readonly budgets: readonly { month: string; used: number; limit: number }[]
+}
+
+async function usageSnapshot(pool: PgPool, userId: string, month: string): Promise<UsageSnapshot> {
+  const [ledger, budgets] = await Promise.all([
+    pool.query<UsageSnapshot["ledger"][number]>(`SELECT id, user_id AS "userId", feature_key AS "featureKey",
+      provider, model, input_tokens AS "inputTokens", output_tokens AS "outputTokens",
+      estimated_cost_usd AS "estimatedCostUsd", status, error_code AS "errorCode",
+      credential_source AS "credentialSource", runtime FROM ai_usage_events
+      WHERE user_id = $1 ORDER BY id`, [userId]),
+    pool.query<UsageSnapshot["budgets"][number]>(`SELECT month, used, "limit" FROM ai_budgets
+      WHERE user_id = $1 AND month = $2 ORDER BY month`, [userId, month]),
+  ])
+  return { ledger: ledger.rows, budgets: budgets.rows }
+}
+
+function utcMonth(date = new Date()): string {
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}`
+}
+
 describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptance slice)", () => {
   const policy = { ...defaultSubagentPolicy(), maxConcurrency: 8 }
-  const [fenceTree, treeA, treeAOther] = userA.trees
+  const [fenceTree, treeA, treeAOther, usageTreeA, usageTreeB] = userA.trees
   const [treeB] = userB.trees
   let adminPool: PgPool | undefined
   let ownerAPool: PgPool | undefined
@@ -260,6 +379,7 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
     await adminPool.query(`GRANT UPDATE ("publishedAt", "attemptCount", "lastError") ON "agent_outbox" TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT UPDATE ("eventSequence") ON "agent_sessions" TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT SELECT, INSERT, UPDATE ON "agent_steps", "agent_items", "agent_events", "agent_tree_budget_reservations" TO ${RUNTIME_ROLE}`)
+    await adminPool.query(`GRANT SELECT, INSERT, UPDATE ON ai_usage_events, ai_budgets TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT INSERT ON "agent_outbox" TO ${RUNTIME_ROLE}`)
     await seedFixture(adminPool, userA)
     await seedFixture(adminPool, userB)
@@ -274,6 +394,8 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
     await ownerAPool?.end()
     await ownerBPool?.end()
     if (adminPool) {
+      await adminPool.query(`DELETE FROM ai_usage_events WHERE user_id = ANY($1::text[])`, [[userA.userId, userB.userId]])
+      await adminPool.query(`DELETE FROM ai_budgets WHERE user_id = ANY($1::text[])`, [[userA.userId, userB.userId]])
       await adminPool.query(`DELETE FROM "User" WHERE "id" = ANY($1::text[])`, [[userA.userId, userB.userId]])
       await adminPool.end()
     }
@@ -295,9 +417,10 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
           relation.relrowsecurity AS "tableRlsEnabled", row_security_active(relation.oid) AS "rowSecurityActive"
         FROM pg_roles role CROSS JOIN pg_class AS relation
         WHERE role.rolname = current_user AND relation.oid = ANY(ARRAY[
-          'agent_sessions'::regclass, 'agent_turns'::regclass, 'sub_agent_tasks'::regclass
+          'agent_sessions'::regclass, 'agent_turns'::regclass, 'sub_agent_tasks'::regclass,
+          'agent_steps'::regclass, 'ai_usage_events'::regclass, 'ai_budgets'::regclass
         ]) ORDER BY relation.relname`)
-      expect(result.rows).toEqual(["agent_sessions", "agent_turns", "sub_agent_tasks"].map(tableName => ({
+      expect(result.rows).toEqual(["agent_sessions", "agent_turns", "sub_agent_tasks", "agent_steps", "ai_usage_events", "ai_budgets"].sort().map(tableName => ({
         tableName,
         isSuperuser: false,
         bypassesRls: false,
@@ -477,4 +600,208 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
       await manager.shutdown()
     }
   }, 30_000)
+
+  it("admits trusted Worker child usage through the real route and settles account credits idempotently", async () => {
+    const executionPool = runtimePool(ownerAPool!, userA.userId)
+    const usageMonth = utcMonth()
+    const initialUserA = await usageSnapshot(adminPool!, userA.userId, usageMonth)
+    const initialUserB = await usageSnapshot(adminPool!, userB.userId, usageMonth)
+    expect(initialUserA).toEqual({ ledger: [], budgets: [] })
+    expect(initialUserB).toEqual({ ledger: [], budgets: [] })
+
+    usageRouteMocks.database = createPgUsageDatabase(executionPool)
+    usageRouteMocks.resolveAiAccess.mockResolvedValue("allowed")
+    usageRouteMocks.getEffectiveEntitlements.mockResolvedValue({ limits: { ai_credits: 10 } })
+    usageRouteMocks.loadWorkerAiConfig.mockResolvedValue({
+      provider: "fixture", model: "fixture-model", apiKey: "server-only-fixture-key",
+    })
+    vi.stubEnv("AGENT_WORKER_SECRET", "fixture-worker-secret")
+    // @ts-expect-error The Worker Vitest alias resolves this allowlisted Web route at runtime.
+    const { POST } = await import("@/app/api/internal/agent-runtime/usage/route")
+
+    type BridgeBody = { operation?: string; input?: Record<string, unknown> }
+    const requests: { body: BridgeBody; status: number; response: unknown }[] = []
+    const operationIdByStep = new Map<string, string>()
+    const bridge = createWorkerUsageAuthorizer({
+      endpointUrl: "http://agent-fixture/api/internal/agent-runtime/usage",
+      secret: "fixture-worker-secret",
+      fetch: async (input, init) => {
+        const body = JSON.parse(String(init?.body)) as BridgeBody
+        const response = await POST(new Request(String(input), init) as never)
+        const payload: unknown = await response.clone().json().catch(() => null)
+        requests.push({ body, status: response.status, response: payload })
+        if (body.operation === "authorize" && response.ok && typeof body.input?.stepId === "string" &&
+            payload && typeof payload === "object" && "operationId" in payload && typeof payload.operationId === "string") {
+          operationIdByStep.set(body.input.stepId, payload.operationId)
+        }
+        return response
+      },
+    })
+
+    type CapturedUsage = {
+      readonly input: WorkerUsageAuthorizationInput
+      readonly operationId: string
+      readonly reservation: Awaited<ReturnType<typeof bridge>>
+      settlement?: WorkerUsageSettlementInput
+    }
+    const captured: CapturedUsage[] = []
+    const inputByTask = new Map<string, WorkerUsageAuthorizationInput>()
+    const staleFenceChecks = new Set<string>()
+    const authorizeUsage = async (input: WorkerUsageAuthorizationInput) => {
+      const owner = input.executionOwner
+      if (!owner || owner.kind !== "task") throw new Error("Expected the production child task owner envelope")
+      inputByTask.set(owner.taskId, input)
+      // This untrusted field must be ignored: the route derives credential source
+      // from the server-side config loaded for the user.
+      const callerInput = Object.assign({}, input, { credentialSource: "platform" })
+      const reservation = await bridge(callerInput)
+      const operationId = operationIdByStep.get(input.stepId)
+      if (!operationId) throw new Error("The real usage route returned no operation identity")
+      const reserved = await adminPool!.query<{ status: string; userId: string | null; credentialSource: string; runtime: string }>(
+        `SELECT status, user_id AS "userId", credential_source AS "credentialSource", runtime
+          FROM ai_usage_events WHERE id = $1`, [operationId],
+      )
+      expect(reserved.rows).toEqual([{
+        status: "reserved", userId: userA.userId, credentialSource: "user", runtime: "worker",
+      }])
+      const reservationCount = captured.length + 1
+      const snapshot = await usageSnapshot(adminPool!, userA.userId, usageMonth)
+      expect(snapshot.ledger.filter(row => row.status === "reserved")).toHaveLength(1)
+      expect(snapshot.budgets).toEqual([{ month: usageMonth, used: reservationCount, limit: 10 }])
+      const entry: CapturedUsage = { input, operationId, reservation }
+      captured.push(entry)
+      return {
+        settle: async (settlement: WorkerUsageSettlementInput) => {
+          await reservation.settle(settlement)
+          entry.settlement = settlement
+          const settled = await adminPool!.query<{
+            status: string; userId: string | null; inputTokens: number; outputTokens: number; estimatedCostUsd: number
+          }>(`SELECT status, user_id AS "userId", input_tokens AS "inputTokens", output_tokens AS "outputTokens",
+              estimated_cost_usd AS "estimatedCostUsd" FROM ai_usage_events WHERE id = $1`, [operationId])
+          expect(settled.rows).toEqual([{
+            status: "success", userId: userA.userId, inputTokens: settlement.inputTokens,
+            outputTokens: settlement.outputTokens, estimatedCostUsd: settlement.estimatedCostUsd,
+          }])
+        },
+      }
+    }
+
+    const modelProfile = {
+      provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true,
+      continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: true,
+      supportsReasoningSummary: true, supportsResponseContinuation: false, supportsProviderConversation: false,
+      supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: null, costClass: "low" as const,
+    }
+    const modelCalls = new Map<string, number>()
+    const searchTool: RuntimeToolDefinition = {
+      schemaVersion, name: "jobs.search", version: "1", description: "Read fixture jobs",
+      capabilities: ["read"], inputSchema: Type.Object({}, { additionalProperties: true }),
+      outputSchema: Type.Object({}, { additionalProperties: true }), risk: "read", domain: "jobs",
+      idempotency: "read_only", timeoutMs: 1_000, requiredCapabilities: ["read"],
+      async execute() { return { jobs: [{ id: "usage-fixture-job" }] } },
+    }
+    const executor = createProductionChildExecutor({
+      pool: executionPool as unknown as PgPool,
+      turnStore: createPgTurnEngineStore(executionPool as never),
+      treeBudget: createPgTreeBudgetReservationStore(executionPool as never),
+      authorizeUsage,
+      modelRuntimeFactory: ({ task }) => ({
+        id: `usage-fixture-model-${task.id}`, profile: modelProfile,
+        async *stream(_request: HarnessModelRequest) {
+          const calls = (modelCalls.get(task.id) ?? 0) + 1
+          modelCalls.set(task.id, calls)
+          if (calls === 1 && staleFenceChecks.size === 0) {
+            const current = inputByTask.get(task.id)
+            if (!current?.executionOwner || current.executionOwner.kind !== "task") throw new Error("Missing current child usage owner")
+            const before = await usageSnapshot(adminPool!, userA.userId, usageMonth)
+            await expect(bridge({
+              ...current,
+              executionOwner: { ...current.executionOwner, attemptCount: current.executionOwner.attemptCount + 1 },
+            })).rejects.toMatchObject({ code: "usage_fence_rejected" })
+            expect(await usageSnapshot(adminPool!, userA.userId, usageMonth)).toEqual(before)
+            staleFenceChecks.add(task.id)
+          }
+          if (calls === 1) {
+            yield { type: "tool_call_completed", callId: `usage-child-read-${task.id}`, name: "jobs.search", arguments: {} }
+            yield { type: "usage", inputTokens: 21, outputTokens: 4, estimatedCostUsd: 0.002 }
+            yield { type: "completed", finishReason: "tool_calls" }
+          } else {
+            yield { type: "text_delta", text: `Trusted usage recorded for ${task.id}.` }
+            yield { type: "usage", inputTokens: 22, outputTokens: 5, estimatedCostUsd: 0.003 }
+            yield { type: "completed", finishReason: "stop" }
+          }
+        },
+      }),
+      toolRuntimeFactory: ({ task }) => ({
+        definitions: [searchTool],
+        router: { async execute(_context, request) {
+          return { ...request, status: "completed", output: { jobs: [{ id: `usage-fixture-${task.id}` }] }, errorCode: null }
+        } },
+        validateArguments: () => true,
+      }),
+      resumeLoader: async () => undefined,
+    })
+    const manager = new (await import("./manager.js")).AgentTreeManager(ownerAStore)
+    const executionTrees = [usageTreeA!, usageTreeB!]
+    const payloads = executionTrees.map((tree, index) => ({
+      taskId: tree.taskId, sessionId: tree.sessionId, rootTaskId: tree.rootTaskId,
+      ownerId: `pg-usage-child-worker-${index + 1}`,
+    }))
+
+    try {
+      for (const payload of payloads) {
+        await expect(manager.run(payload, executor)).resolves.toMatchObject({ taskId: payload.taskId, status: "completed" })
+      }
+      expect(modelCalls).toEqual(new Map(executionTrees.map(tree => [tree.taskId, 2])))
+      expect(staleFenceChecks).toEqual(new Set([executionTrees[0]!.taskId]))
+      expect(captured).toHaveLength(4)
+      expect(new Set(captured.map(value => value.input.stepId)).size).toBe(4)
+      expect(new Set(captured.map(value => value.operationId)).size).toBe(4)
+      expect(captured.map(value => value.settlement)).toEqual(expect.arrayContaining([
+        { status: "success", inputTokens: 21, outputTokens: 4, estimatedCostUsd: 0.002 },
+        { status: "success", inputTokens: 22, outputTokens: 5, estimatedCostUsd: 0.003 },
+      ]))
+
+      const completedSnapshot = await usageSnapshot(adminPool!, userA.userId, usageMonth)
+      expect(completedSnapshot.ledger).toHaveLength(4)
+      expect(completedSnapshot.ledger.map(row => row.id).sort()).toEqual(captured.map(value => value.operationId).sort())
+      expect(completedSnapshot.ledger.every(row => row.status === "success" && row.userId === userA.userId &&
+        row.featureKey === "autoApply" && row.provider === "fixture" && row.model === "fixture-model" &&
+        row.credentialSource === "user" && row.runtime === "worker" && row.errorCode === null)).toBe(true)
+      expect(completedSnapshot.budgets).toEqual([{ month: usageMonth, used: 4, limit: 10 }])
+
+      const replay = captured[0]!
+      expect(replay.settlement).toBeDefined()
+      const beforeReplay = await usageSnapshot(adminPool!, userA.userId, usageMonth)
+      await replay.reservation.settle(replay.settlement!)
+      expect(await usageSnapshot(adminPool!, userA.userId, usageMonth)).toEqual(beforeReplay)
+
+      const beforeForeign = await Promise.all([
+        usageSnapshot(adminPool!, userA.userId, usageMonth), usageSnapshot(adminPool!, userB.userId, usageMonth),
+      ])
+      await expect(bridge({ ...captured[0]!.input, userId: userB.userId })).rejects.toMatchObject({ code: "usage_fence_rejected" })
+      await expect(bridge({ ...captured[0]!.input, provider: "caller-provider", model: "caller-model" }))
+        .rejects.toMatchObject({ code: "model_not_authorized" })
+      expect(await Promise.all([
+        usageSnapshot(adminPool!, userA.userId, usageMonth), usageSnapshot(adminPool!, userB.userId, usageMonth),
+      ])).toEqual(beforeForeign)
+
+      const authorizeRequests = requests.filter(request => request.body.operation === "authorize")
+      expect(authorizeRequests.filter(request => request.status === 200)).toHaveLength(4)
+      expect(authorizeRequests.filter(request => request.status === 409).map(request => request.response)).toEqual([
+        expect.objectContaining({ code: "usage_fence_rejected" }),
+        expect.objectContaining({ code: "usage_fence_rejected" }),
+      ])
+      expect(authorizeRequests.filter(request => request.status === 403).map(request => request.response)).toEqual([
+        expect.objectContaining({ code: "model_not_authorized" }),
+      ])
+      expect(requests.filter(request => request.body.operation === "settle")).toHaveLength(5)
+      expect(authorizeRequests.filter(request => request.status === 200).every(request => request.body.input?.credentialSource === "platform")).toBe(true)
+      expect(requests.every(request => !Object.prototype.hasOwnProperty.call(request.body.input ?? {}, "apiKey"))).toBe(true)
+      expect(JSON.stringify(requests)).not.toContain("server-only-fixture-key")
+    } finally {
+      await manager.shutdown()
+      vi.unstubAllEnvs()
+    }
+  }, 60_000)
 })
