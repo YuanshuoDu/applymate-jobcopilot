@@ -434,18 +434,21 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
       for (const tree of executionTrees) {
         const taskId = tree.taskId
         const steps = await adminPool!.query<{ id: string; taskId: string; attempt: number; status: string }>(
-          `SELECT "id", "taskId", "attempt", "status" FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3`,
+          `SELECT "id", "taskId", "attempt", "status" FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 ORDER BY "ordinal"`,
           [tree.sessionId, tree.turnId, taskId],
         )
-        expect(steps.rows).toHaveLength(1)
-        expect(steps.rows[0]).toMatchObject({ taskId, attempt: 1, status: "completed" })
+        expect(steps.rows).toHaveLength(2)
+        expect(steps.rows.every(step => step.taskId === taskId && step.attempt === 1 && step.status === "completed")).toBe(true)
+        const stepIds = new Set(steps.rows.map(step => step.id))
+        expect(stepIds.size).toBe(2)
 
         const items = await adminPool!.query<{ id: string; stepId: string; taskId: string; type: string; status: string }>(
           `SELECT "id", "stepId", "taskId", "type", "status" FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 ORDER BY "createdAt", "id"`,
           [tree.sessionId, tree.turnId, taskId],
         )
         expect(items.rows.length).toBeGreaterThanOrEqual(3)
-        expect(items.rows.every(item => item.taskId === taskId && item.stepId === steps.rows[0]!.id && item.status === "completed")).toBe(true)
+        expect(items.rows.every(item => item.taskId === taskId && stepIds.has(item.stepId) && item.status === "completed")).toBe(true)
+        expect([...new Set(items.rows.map(item => item.stepId))].sort()).toEqual([...stepIds].sort())
         expect(items.rows.map(item => item.type)).toEqual(expect.arrayContaining(["tool_call", "tool_result", "agent_message"]))
 
         const events = await adminPool!.query<{ taskId: string; type: string; actor: string }>(
@@ -459,8 +462,10 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
           `SELECT "status", "taskId", "stepId", "attempt" FROM "agent_tree_budget_reservations" WHERE "sessionId" = $1 AND "rootTaskId" = $2 AND "taskId" = $3`,
           [tree.sessionId, tree.rootTaskId, taskId],
         )
-        expect(reservations.rows).toHaveLength(1)
-        expect(reservations.rows[0]).toMatchObject({ status: "consumed", taskId, stepId: steps.rows[0]!.id, attempt: 1 })
+        expect(reservations.rows).toHaveLength(2)
+        expect(reservations.rows.every(reservation => reservation.status === "consumed"
+          && reservation.taskId === taskId && stepIds.has(reservation.stepId) && reservation.attempt === 1)).toBe(true)
+        expect([...new Set(reservations.rows.map(reservation => reservation.stepId))].sort()).toEqual([...stepIds].sort())
 
         const root = await adminPool!.query<{ status: string; result: unknown }>(
           `SELECT "status", "result" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`,
