@@ -2060,9 +2060,9 @@ model AgentContextCompactionSnapshot {
   turn    AgentTurn   @relation(fields: [turnId, sessionId, userId], references: [id, sessionId, userId], onDelete: Cascade, map: "agent_context_compaction_snapshots_turnId_fkey")
   step    AgentStep   @relation(fields: [stepId, turnId, sessionId], references: [id, turnId, sessionId], onDelete: Cascade, map: "agent_context_compaction_snapshots_stepId_fkey")
 
-  @@unique([userId, sessionId, turnId, stepId, idempotencyKey])
-  @@index([userId, sessionId, turnId, stepId])
-  @@index([sessionId, turnId, createdAt(sort: Desc)])
+  @@unique([userId, sessionId, turnId, stepId, idempotencyKey], map: "agent_context_compaction_snapshots_scope_idempotency_key")
+  @@index([userId, sessionId, turnId, stepId], map: "agent_context_compaction_snapshots_scope_step_idx")
+  @@index([sessionId, turnId, createdAt(sort: Desc)], map: "agent_context_compaction_snapshots_session_turn_created_idx")
   @@map("agent_context_compaction_snapshots")
 }
 

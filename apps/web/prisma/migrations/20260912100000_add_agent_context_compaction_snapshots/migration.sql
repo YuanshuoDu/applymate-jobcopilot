@@ -43,13 +43,13 @@ CREATE TABLE "agent_context_compaction_snapshots" (
       ON DELETE CASCADE ON UPDATE CASCADE
 );
 
-CREATE UNIQUE INDEX "agent_context_compaction_snapshots_userId_sessionId_turnId_stepId_idempotencyKey_key"
+CREATE UNIQUE INDEX "agent_context_compaction_snapshots_scope_idempotency_key"
   ON "agent_context_compaction_snapshots"("userId", "sessionId", "turnId", "stepId", "idempotencyKey");
 CREATE UNIQUE INDEX "agent_context_compaction_snapshots_snapshotRef_key"
   ON "agent_context_compaction_snapshots"("snapshotRef");
-CREATE INDEX "agent_context_compaction_snapshots_userId_sessionId_turnId_stepId_idx"
+CREATE INDEX "agent_context_compaction_snapshots_scope_step_idx"
   ON "agent_context_compaction_snapshots"("userId", "sessionId", "turnId", "stepId");
-CREATE INDEX "agent_context_compaction_snapshots_sessionId_turnId_createdAt_idx"
+CREATE INDEX "agent_context_compaction_snapshots_session_turn_created_idx"
   ON "agent_context_compaction_snapshots"("sessionId", "turnId", "createdAt" DESC);
 
 CREATE OR REPLACE FUNCTION "prevent_agent_context_compaction_snapshot_update"()
