@@ -195,7 +195,8 @@ export class PgSubagentTaskStore implements SubagentStore {
         const nextAttemptAt = retry ? computeSubagentNextAttemptAt(input.attemptCount, input.now) : null
         const updated = await client.query(`UPDATE "sub_agent_tasks" SET "status" = $3, "result" = $4::jsonb,
           "failureReason" = $5, "leaseOwner" = NULL, "leaseExpiresAt" = NULL,
-          "nextAttemptAt" = $10, "completedAt" = CASE WHEN $6 THEN $7 ELSE NULL END, "updatedAt" = $7
+          "nextAttemptAt" = $10, "completedAt" = CASE WHEN $6 THEN $7::timestamp(3) ELSE NULL::timestamp(3) END,
+          "updatedAt" = $7::timestamp(3)
           WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $8 AND "status" = 'running'
             AND "attemptCount" = $9 AND "leaseExpiresAt" > CURRENT_TIMESTAMP
             AND EXISTS (SELECT 1 FROM "agent_sessions" AS session
