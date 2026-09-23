@@ -166,8 +166,8 @@ export class PgCoordinationStore implements CoordinationStore {
       const existing = await client.query(`SELECT 1 FROM "agent_events" WHERE "sessionId" = $1 AND "idempotencyKey" = $2`, [input.sessionId, key])
       if (existing.rows[0]) return
       const itemId = `activity-${randomUUID()}`
-      await client.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "content", "completedAt")
-        VALUES ($1, $2, $3, $4, $5, 'subagent_activity', $6, 'commentary', $7::jsonb, CURRENT_TIMESTAMP)`,
+      await client.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "content", "completedAt", "updatedAt")
+        VALUES ($1, $2, $3, $4, $5, 'subagent_activity', $6, 'commentary', $7::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
       [itemId, input.sessionId, input.turnId, input.stepId, input.taskId, input.status === "completed" ? "completed" : input.status === "failed" ? "failed" : "started", json({ operation: input.operation, data: input.data })])
       const sequence = await client.query<{ eventSequence: string | bigint }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1 WHERE "id" = $1 AND "userId" = $2 RETURNING "eventSequence"`, [input.sessionId, input.userId])
       if (!sequence.rows[0]) throw new CoordinationError("coordination_scope_error", "Session is unavailable")

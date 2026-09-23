@@ -161,14 +161,19 @@ describe("TurnEngine", () => {
     const root = new RootAbortController({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId })
     const fixture = baseOptions({
       signal: root.signal,
+      budget: { maxToolCalls: 1 },
       executeTool: async ({ call }) => {
         root.stop("user_stop")
         return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, output: {}, errorCode: null }
       },
     })
-    await expect(new TurnEngine(fixture.options).run()).resolves.toMatchObject({ status: "interrupted", stepCount: 1, toolCallCount: 0, errorCode: "interrupt_requested" })
+    await expect(new TurnEngine(fixture.options).run()).resolves.toMatchObject({ status: "interrupted", stepCount: 1, toolCallCount: 1, errorCode: "interrupt_requested" })
     expect(fixture.requests).toHaveLength(1)
     expect(fixture.fake.steps[0].status).toBe("interrupted")
+    expect(fixture.fake.items.filter((item) => item.type === "tool_call")).toMatchObject([{ status: "completed" }])
+    expect(fixture.fake.items.filter((item) => item.type === "tool_result")).toMatchObject([{ status: "completed" }])
+    expect(fixture.fake.events.filter((event) => event.type === "tool_call.started")).toHaveLength(1)
+    expect(fixture.fake.events.filter((event) => event.type === "tool_call.completed")).toHaveLength(1)
     expect(fixture.fake.events.filter((event) => event.type === "turn.completed")).toHaveLength(0)
     expect(fixture.fake.events.filter((event) => event.type === "turn.interrupted")).toHaveLength(1)
   })
@@ -196,11 +201,34 @@ describe("TurnEngine", () => {
         system: [], profile: [], steerHistory: [], businessRefs: [],
         toolObservations: [{ id: "tool-result:call-1", content: { toolCallId: "call-1", toolName: "jobs.search", input: { location: "Dublin" }, status: "completed", output: { jobs: [{ id: "job-1" }] }, errorCode: null } }],
       },
+      budget: { maxToolCalls: 2 },
       executeTool,
     })
-    await expect(new TurnEngine(fixture.options).run()).resolves.toMatchObject({ status: "completed", toolCallCount: 2 })
+    await expect(new TurnEngine(fixture.options).run()).resolves.toMatchObject({ status: "completed", toolCallCount: 1 })
     expect(executeTool).toHaveBeenCalledTimes(1)
     expect(executeTool).toHaveBeenCalledWith(expect.objectContaining({ call: expect.objectContaining({ id: "call-2" }) }))
+    expect(fixture.requests).toHaveLength(3)
+    expect(fixture.fake.items.filter((item) => item.type === "tool_call")).toMatchObject([{ id: expect.stringContaining("call-2"), status: "completed" }])
+    expect(fixture.fake.items.filter((item) => item.type === "tool_result")).toHaveLength(1)
+    expect(fixture.fake.events.filter((event) => event.type === "tool_call.started")).toHaveLength(1)
+    expect(fixture.fake.events.filter((event) => event.type === "tool_call.completed")).toHaveLength(1)
+  })
+
+  it("charges replayed model calls against the tool budget without persisting duplicate calls", async () => {
+    const executeTool = vi.fn()
+    const fixture = baseOptions({
+      snapshot: {
+        system: [], profile: [], steerHistory: [], businessRefs: [],
+        toolObservations: [{ id: "tool-result:call-1", content: { toolCallId: "call-1", toolName: "jobs.search", input: { location: "Dublin" }, status: "completed", output: { jobs: [{ id: "job-1" }] }, errorCode: null } }],
+      },
+      budget: { maxToolCalls: 1 },
+      executeTool,
+    })
+    await expect(new TurnEngine(fixture.options).run()).resolves.toMatchObject({ status: "failed", stepCount: 2, toolCallCount: 0, errorCode: "budget_exhausted" })
+    expect(fixture.requests).toHaveLength(2)
+    expect(executeTool).not.toHaveBeenCalled()
+    expect(fixture.fake.items.filter((item) => item.type === "tool_call")).toHaveLength(0)
+    expect(fixture.fake.events.some((event) => event.type === "turn.budget_exhausted")).toBe(true)
   })
 
   it("fails closed when a replayed call id has different arguments", async () => {

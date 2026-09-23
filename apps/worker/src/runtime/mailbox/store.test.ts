@@ -346,6 +346,9 @@ describe("PgCoordinationStore", () => {
     await store.appendActivity({ userId: "user-a", sessionId: "session-a", turnId: "turn-a", stepId: "step-a", taskId: "task-1", operation: "list_subagents", status: "completed", idempotencyKey: "call-1:list", data: { count: 1 } })
     const sql = client.queries.map(query => query.sql).join("\n")
     expect(sql).toMatch(/INSERT INTO "agent_items"[\s\S]*INSERT INTO "agent_events"[\s\S]*agent\.session\.event/)
+    const activityInsert = client.queries.find(query => query.sql.includes('INSERT INTO "agent_items"'))
+    expect(activityInsert?.sql).toContain('"completedAt", "updatedAt")')
+    expect(activityInsert?.sql).toContain("$7::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
     expect(client.queries.some(query => query.sql.includes("UPDATE \"agent_sessions\" SET \"eventSequence\""))).toBe(true)
   })
 
