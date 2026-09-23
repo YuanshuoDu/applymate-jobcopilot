@@ -166,7 +166,12 @@ async function waitForCompletedJob<T>(queue: Queue<T>, id: string, timeoutMs = 1
     const job = await queue.getJob(id)
     if (job) {
       const status = await job.getState()
-      if (status === "completed") return job
+      if (status === "completed") {
+        // getState reads Redis, but the Job's returnvalue is the snapshot from getJob above.
+        const completedJob = await queue.getJob(id)
+        if (!completedJob) throw new Error(`Completed Turn job ${id} disappeared before result read`)
+        return completedJob
+      }
       if (status === "failed") throw new Error(`Turn job ${id} failed: ${job.failedReason}`)
     }
     await new Promise(resolve => setTimeout(resolve, 25))
