@@ -21,6 +21,7 @@ import { runWorkdayFlow } from '../flows/workday-flow.js'
 import { runLeverFlow } from '../flows/lever-flow.js'
 import { runPersonioFlow } from '../flows/personio-flow.js'
 import { runSmartRecruitersFlow } from '../flows/smartrecruiters-flow.js'
+import { isValidSubmissionIntent, matchesSubmissionRequest, type SubmissionRequestIntent } from "../flows/submission-intent.js";
 import { createNotification } from "../notifications/create-notification.js";
 import { notifyApplyResult } from "../notifications/notify-apply-result.js";
 import { purgeTemporaryGeneratedCoverLetters } from "../notifications/purge-cover-letters.js";
@@ -98,6 +99,12 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
     let submissionTaskInactive = false;
     let pendingSubmissionFence: ApplicationSubmissionStartFence | null = null;
     let submissionFenceTimer: ReturnType<typeof setTimeout> | null = null;
+    let armedSubmissionIntent: SubmissionRequestIntent | null = null;
+    let submissionCandidateSeen = false;
+    const submissionRouteState: {
+      cleanup: (() => Promise<void>) | null;
+      work: Promise<void> | null;
+    } = { cleanup: null, work: null };
     let submissionFenceRelease: Promise<void> | null = null;
     let activePageClose: (() => Promise<void>) | null = null;
     const stopController = new AbortController();
@@ -133,6 +140,9 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
       if (!applicationTaskId || !operation) {
         console.warn(`[apply-worker] Skipping stale or revoked application task for job=${jobId}`);
         return;
+      }
+      if (operation === "submit" && (!receiptId || !constraintHash)) {
+        throw new Error("Canonical application submission requires both receiptId and constraintHash.");
       }
       if (!await claimApplicationTask(getPool(), applicationTaskId, userId, jobId)) {
         if (operation === "submit" && receiptId && constraintHash) {
@@ -224,17 +234,6 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
       await Promise.race([
         withCloakContext(userId, async (page) => {
         activePageClose = async () => { await page.close(); };
-        if (approvedTurnScope) {
-          page.on("request", (request) => {
-            if (!pendingSubmissionFence || !isSubmissionStartRequest(request)) return;
-            submissionRequestStarted = true;
-            void releaseSubmissionFence(true).catch(async (error: unknown) => {
-              submissionFenceUnavailable = true;
-              console.warn("[apply-worker] Could not commit submission-start fence:", error instanceof Error ? error.message : String(error));
-              await closeActivePage();
-            });
-          });
-        }
         if (stopController.signal.aborted || turnStopped) {
           await closeActivePage();
           return;
@@ -311,8 +310,10 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           allowSubmit: operation === "submit",
           confirmedAnswers: taskCtx.confirmedAnswers,
           ...(operation === "submit" ? {
-            beforeSubmit: async () => {
+            beforeSubmit: async (intent?: SubmissionRequestIntent) => {
               if (stopController.signal.aborted || turnStopped || submissionFenceUnavailable) return false;
+              if (!isValidSubmissionIntent(intent)) return false;
+              const requestIntent = intent;
               if (!await challengeAllowsAction()) return false;
               if (await applyQueue.isPaused()) return false;
               if (!await applicationTaskStillActive(getPool(), applicationTaskId, userId, jobId)) {
@@ -329,39 +330,198 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
               if (!isAllowedAtsDestination(page.url(), flow, taskCtx.applyUrl)) return false;
               if (!(await evaluateUnattendedApplyControl(getPool(), taskCtx.applyUrl, userId)).allowed) return false;
               if (!approvedTurnScope) return true;
-              if (pendingSubmissionFence || submissionRequestStarted) return false;
+              if (armedSubmissionIntent || submissionCandidateSeen || submissionRequestStarted) return false;
               try {
-                const fence = await acquireApplicationSubmissionStartFence(getPool(), approvedTurnScope);
-                if (fence.state !== "ready") {
-                  if (fence.state === "stopped") await interruptStoppedTurn();
-                  else submissionTaskInactive = true;
+                // Page routing does not see requests handled by a controlling
+                // Service Worker. Fail closed before arming the final submit.
+                const serviceWorkerControlsPage = await page.evaluate(
+                  () => Boolean(navigator.serviceWorker?.controller),
+                );
+                if (serviceWorkerControlsPage) {
+                  submissionFenceUnavailable = true;
                   return false;
                 }
-                pendingSubmissionFence = fence;
+
+                const submissionContext = page.context();
+                const submissionFrame = page.mainFrame();
+                const pagesPresentWhenArmed = new Set(submissionContext.pages());
+                // A context route is required to see a popup's first request.
+                // Keep its lifetime bounded to this final-submit window and
+                // immediately fall through every known unrelated request.
+                const routeMatcher = (): boolean => true;
+                const routeHandler = async (route: import("playwright-core").Route): Promise<void> => {
+                  const request = route.request();
+                  const armedIntent = armedSubmissionIntent;
+                  let requestFrame: import("playwright-core").Frame;
+                  let requestPage: import("playwright-core").Page;
+                  try {
+                    requestFrame = request.frame();
+                    requestPage = requestFrame.page();
+                  } catch {
+                    // While submit is armed, routing provenance must remain
+                    // readable so no new target can escape the page snapshot.
+                    await route.abort("aborted").catch(() => undefined);
+                    return;
+                  }
+                  let requestMethod: string;
+                  let isMainFrameNavigation: boolean;
+                  try {
+                    requestMethod = request.method().toUpperCase();
+                    isMainFrameNavigation = request.isNavigationRequest();
+                  } catch {
+                    await route.abort("aborted").catch(() => undefined);
+                    return;
+                  }
+                  const isSafeRead = requestMethod === "GET" || requestMethod === "HEAD" || requestMethod === "OPTIONS";
+                  if (requestPage !== page) {
+                    // A tab that existed before the final submit was armed is
+                    // unrelated. Abort a new page's first request even when
+                    // its URL differs from the form action. Once the approved
+                    // write starts, read-only confirmation pages are allowed.
+                    if (pagesPresentWhenArmed.has(requestPage)) {
+                      await route.fallback().catch(() => undefined);
+                    } else if (submissionRequestStarted && isSafeRead) {
+                      await route.fallback().catch(() => undefined);
+                    } else {
+                      await route.abort("aborted").catch(() => undefined);
+                    }
+                    return;
+                  }
+                  if (requestFrame !== submissionFrame) {
+                    // The known source page's iframe is unrelated, even when
+                    // it happens to use the same action URL and method.
+                    await route.fallback().catch(() => undefined);
+                    return;
+                  }
+                  let requestTargetsArmedAction: boolean;
+                  try {
+                    // Match the exact action URL independently from method so
+                    // a method mutation on the source frame cannot bypass the
+                    // request fence.
+                    requestTargetsArmedAction = matchesSubmissionRequest(requestIntent, {
+                      url: () => request.url(),
+                      method: () => requestIntent.method,
+                    });
+                  } catch {
+                    await route.abort("aborted").catch(() => undefined);
+                    return;
+                  }
+                  if (submissionRequestStarted) {
+                    const isDuplicateCandidate = requestTargetsArmedAction && Boolean(
+                      armedIntent && matchesSubmissionRequest(armedIntent, request),
+                    );
+                    if (isDuplicateCandidate || !isSafeRead) {
+                      await route.abort("aborted").catch(() => undefined);
+                    } else {
+                      // Once the authorized write has reached the network,
+                      // allow read-only confirmation redirects and polling.
+                      await route.fallback().catch(() => undefined);
+                    }
+                    return;
+                  }
+                  if (!requestTargetsArmedAction) {
+                    if (isMainFrameNavigation || !isSafeRead) {
+                      // A rewritten action URL or a write/navigation that
+                      // differs from the declared intent is undeclared.
+                      await route.abort("aborted").catch(() => undefined);
+                    } else {
+                      await route.fallback().catch(() => undefined);
+                    }
+                    return;
+                  }
+                  if (!armedIntent || !matchesSubmissionRequest(armedIntent, request)) {
+                    // Only the source page's exact main-frame URL+method is a
+                    // candidate. A method-changed request at this action URL
+                    // must never escape via fallback.
+                    await route.abort("aborted").catch(() => undefined);
+                    return;
+                  }
+                  if (submissionCandidateSeen || submissionRequestStarted) {
+                    await route.abort("aborted").catch(() => undefined);
+                    return;
+                  }
+
+                  // This is the exact request named by the ATS flow. Keep it
+                  // paused while Stop and this request serialize on the same
+                  // Session -> Turn -> ApplicationTask row locks.
+                  submissionCandidateSeen = true;
+                  if (submissionFenceTimer) clearTimeout(submissionFenceTimer);
+                  submissionFenceTimer = null;
+                  const work = (async () => {
+                    let continuationAttempted = false;
+                    try {
+                      if (stopController.signal.aborted || turnStopped || submissionFenceUnavailable) {
+                        await route.abort("aborted").catch(() => undefined);
+                        return;
+                      }
+                      const fence = await acquireApplicationSubmissionStartFence(getPool(), approvedTurnScope!);
+                      if (fence.state !== "ready") {
+                        if (fence.state === "stopped") await interruptStoppedTurn();
+                        else submissionTaskInactive = true;
+                        await route.abort("aborted").catch(() => undefined);
+                        return;
+                      }
+                      pendingSubmissionFence = fence;
+                      if (stopController.signal.aborted || turnStopped) {
+                        await route.abort("aborted").catch(() => undefined);
+                        await releaseSubmissionFence(false);
+                        return;
+                      }
+
+                      // The route is paused here. Mark uncertainty before
+                      // invoking continue because a thrown continuation can
+                      // still mean the browser sent the request.
+                      submissionRequestStarted = true;
+                      continuationAttempted = true;
+                      await route.continue();
+                    } catch (error: unknown) {
+                      submissionFenceUnavailable = true;
+                      console.warn(
+                        continuationAttempted
+                          ? "[apply-worker] Submission continuation outcome is uncertain:"
+                          : "[apply-worker] Could not establish submission request fence:",
+                        error instanceof Error ? error.message : String(error),
+                      );
+                      if (!continuationAttempted) await route.abort("failed").catch(() => undefined);
+                      await closeActivePage();
+                    } finally {
+                      if (pendingSubmissionFence) {
+                        await releaseSubmissionFence(continuationAttempted).catch((error: unknown) => {
+                          submissionFenceUnavailable = true;
+                          console.warn("[apply-worker] Could not finalize submission request fence:", error instanceof Error ? error.message : String(error));
+                        });
+                      }
+                    }
+                  })();
+                  submissionRouteState.work = work;
+                  try {
+                    await work;
+                  } finally {
+                    if (submissionRouteState.work === work) submissionRouteState.work = null;
+                  }
+                };
+
+                await submissionContext.route(routeMatcher, routeHandler);
+                submissionRouteState.cleanup = async () => { await submissionContext.unroute(routeMatcher, routeHandler); };
+                armedSubmissionIntent = requestIntent;
                 submissionFenceTimer = setTimeout(() => {
-                  if (!pendingSubmissionFence || submissionRequestStarted) return;
+                  if (!armedSubmissionIntent || submissionCandidateSeen || submissionRequestStarted) return;
                   submissionFenceUnavailable = true;
                   if (!stopController.signal.aborted) {
-                    stopController.abort(new Error("Submission request did not start after the final approval gate."));
+                    stopController.abort(new Error("The approved submission request did not start after the final approval gate."));
                   }
-                  void closeActivePage().finally(() => {
-                    if (!submissionRequestStarted) {
-                      void releaseSubmissionFence(false).catch((error: unknown) =>
-                        console.warn("[apply-worker] Could not release timed-out submission fence:", error instanceof Error ? error.message : String(error))
-                      );
-                    }
-                  });
+                  void closeActivePage();
                 }, SUBMISSION_START_OBSERVATION_TIMEOUT_MS);
                 submissionFenceTimer.unref?.();
                 if (stopController.signal.aborted || turnStopped) {
+                  armedSubmissionIntent = null;
                   await closeActivePage();
-                  await releaseSubmissionFence(false);
                   return false;
                 }
                 return true;
               } catch (error: unknown) {
                 submissionFenceUnavailable = true;
-                console.warn("[apply-worker] Could not fence submission against Agent Stop:", error instanceof Error ? error.message : String(error));
+                console.warn("[apply-worker] Could not arm exact submission request gate:", error instanceof Error ? error.message : String(error));
                 return false;
               }
             },
@@ -371,13 +531,13 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         // Keep the existing ATS/pattern/harness execution as one provider so
         // the typed tool owns receipt validation, artifact freshness, and
         // idempotency before this callback can reach an external submit.
-        const runBrowserFlow = async (typedSubmitGuard?: () => Promise<boolean>): Promise<HarnessResult> => {
+        const runBrowserFlow = async (typedSubmitGuard?: (intent?: SubmissionRequestIntent) => Promise<boolean>): Promise<HarnessResult> => {
           const browserTask: ApplyTask = typedSubmitGuard
             ? {
                 ...applyTask,
-                beforeSubmit: async () => {
-                  if (!await typedSubmitGuard()) return false;
-                  return applyTask.beforeSubmit ? applyTask.beforeSubmit() : true;
+                beforeSubmit: async (intent?: SubmissionRequestIntent) => {
+                  if (!await typedSubmitGuard(intent)) return false;
+                  return applyTask.beforeSubmit ? applyTask.beforeSubmit(intent) : true;
                 },
               }
             : applyTask;
@@ -737,10 +897,23 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
       return;
     } finally {
       stopProbe?.stop();
+      const activeSubmissionRouteWork = submissionRouteState.work;
+      if (activeSubmissionRouteWork) {
+        await closeActivePage().catch(() => undefined);
+        await activeSubmissionRouteWork.catch(() => undefined);
+      }
+      const removeSubmissionRoute = submissionRouteState.cleanup;
+      if (removeSubmissionRoute) {
+        await removeSubmissionRoute().catch((error: unknown) =>
+          console.warn("[apply-worker] Could not remove exact submission request route:", error instanceof Error ? error.message : String(error))
+        );
+      }
+      if (armedSubmissionIntent && !submissionCandidateSeen && !submissionRequestStarted) await closeActivePage();
       if (pendingSubmissionFence && !submissionRequestStarted) await closeActivePage();
       await releaseSubmissionFence(submissionRequestStarted).catch((error: unknown) =>
         console.warn("[apply-worker] Could not clean up submission start fence:", error instanceof Error ? error.message : String(error))
       );
+      if (submissionFenceTimer) clearTimeout(submissionFenceTimer);
       activePageClose = null;
       // Clean up temp resume PDF to avoid accumulating files on disk
       if (ctx?.resumeTempPath) {
@@ -820,10 +993,6 @@ async function persistStoppedSubmission(input: {
   }
   createApplyResultNotification({ ...input, status: "failed" })
     .catch((error: Error) => console.warn("[notify] in-app notification failed:", error.message));
-}
-
-function isSubmissionStartRequest(request: { method(): string; isNavigationRequest(): boolean }): boolean {
-  return ["POST", "PUT", "PATCH", "DELETE"].includes(request.method().toUpperCase()) || request.isNavigationRequest();
 }
 
 async function createApplyResultNotification(params: {

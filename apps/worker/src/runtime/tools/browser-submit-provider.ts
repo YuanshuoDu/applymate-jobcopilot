@@ -1,7 +1,8 @@
 import type { ApplicationSubmitProvider } from "./application-submit-tool.js"
 import type { HarnessResult } from "../../harness/agent-harness.js"
+import type { SubmissionRequestIntent } from "../../flows/submission-intent.js"
 
-export type BrowserSubmitRunner = (beforeSubmit: () => Promise<boolean>) => Promise<HarnessResult>
+export type BrowserSubmitRunner = (beforeSubmit: (intent?: SubmissionRequestIntent) => Promise<boolean>) => Promise<HarnessResult>
 
 export class BrowserApplicationSubmitError extends Error {
   readonly provider = "browser"
