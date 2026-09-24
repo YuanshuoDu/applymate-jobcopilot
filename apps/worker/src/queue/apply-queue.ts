@@ -224,15 +224,17 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
       await Promise.race([
         withCloakContext(userId, async (page) => {
         activePageClose = async () => { await page.close(); };
-        page.on("request", (request) => {
-          if (!pendingSubmissionFence || !isSubmissionStartRequest(request)) return;
-          submissionRequestStarted = true;
-          void releaseSubmissionFence(true).catch(async (error: unknown) => {
-            submissionFenceUnavailable = true;
-            console.warn("[apply-worker] Could not commit submission-start fence:", error instanceof Error ? error.message : String(error));
-            await closeActivePage();
+        if (approvedTurnScope) {
+          page.on("request", (request) => {
+            if (!pendingSubmissionFence || !isSubmissionStartRequest(request)) return;
+            submissionRequestStarted = true;
+            void releaseSubmissionFence(true).catch(async (error: unknown) => {
+              submissionFenceUnavailable = true;
+              console.warn("[apply-worker] Could not commit submission-start fence:", error instanceof Error ? error.message : String(error));
+              await closeActivePage();
+            });
           });
-        });
+        }
         if (stopController.signal.aborted || turnStopped) {
           await closeActivePage();
           return;
