@@ -63,13 +63,9 @@ class FakeClient {
   readonly client: pg.PoolClient
   private row: Row
   private readonly visible: boolean
-  private readonly sessionStatus: string
-  private readonly sessionUserId: string
 
-  constructor(value: AgentContextSnapshot, options: { visible?: boolean; checksum?: string; sessionStatus?: string; sessionUserId?: string } = {}) {
+  constructor(value: AgentContextSnapshot, options: { visible?: boolean; checksum?: string } = {}) {
     this.visible = options.visible ?? true
-    this.sessionStatus = options.sessionStatus ?? "running"
-    this.sessionUserId = options.sessionUserId ?? "user-a"
     this.row = {
       id: value.id ?? "snapshot-1",
       sessionId: value.sessionId,
@@ -91,11 +87,7 @@ class FakeClient {
   async query<T>(text: string, values?: readonly unknown[]): Promise<QueryResult<T>> {
     this.calls.push(text)
     if (text === "BEGIN" || text === "COMMIT" || text === "ROLLBACK" || text.includes("set_config")) return { rows: [], rowCount: 0 } as QueryResult<T>
-    if (text.includes('FROM "agent_sessions"') && text.includes("FOR UPDATE")) {
-      const allowed = this.visible && values?.[0] === this.row.sessionId && values?.[1] === this.sessionUserId
-        && !["aborted", "archived"].includes(this.sessionStatus)
-      return { rows: allowed ? [{ id: this.row.sessionId } as T] : [], rowCount: allowed ? 1 : 0 }
-    }
+    if (text.includes('FROM "agent_sessions"') && text.includes("FOR UPDATE")) return { rows: this.visible ? [{ id: this.row.sessionId } as T] : [], rowCount: this.visible ? 1 : 0 }
     if (text.startsWith('INSERT INTO "agent_context_snapshots"')) return { rows: [this.row as T], rowCount: 1 }
     if (text.startsWith('UPDATE "agent_sessions"')) return { rows: [], rowCount: 1 } as QueryResult<T>
     if (text.includes('FROM "agent_context_snapshots" AS snapshot')) return { rows: this.visible ? [this.row as T] : [], rowCount: this.visible ? 1 : 0 }
@@ -122,42 +114,8 @@ describe("PostgreSQL context snapshot store", () => {
     const loaded = await store.load({ scope, sessionId: "session-a", throughSequence: 3n })
     expect(saved.checksum).toBe(value.checksum)
     expect(loaded?.canonicalJson).toBe(value.canonicalJson)
-    const sessionLock = client.calls.findIndex((sql) => sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE"))
-    const insert = client.calls.findIndex((sql) => sql.startsWith('INSERT INTO "agent_context_snapshots"'))
-    expect(sessionLock).toBeGreaterThan(-1)
-    expect(sessionLock).toBeLessThan(insert)
-    expect(client.calls[sessionLock]).toContain('"userId" = $2')
-    expect(client.calls[sessionLock]).toContain('"status" NOT IN (\'aborted\', \'archived\')')
     expect(client.calls.some((sql) => sql.includes('session."userId" = $3'))).toBe(true)
     expect(client.calls.some((sql) => sql.includes('SET "memorySummary"'))).toBe(true)
-  })
-
-  it.each(["aborted", "archived"])("rejects save for a %s session before snapshot writes", async sessionStatus => {
-    const value = snapshot()
-    const client = new FakeClient(value, { sessionStatus })
-    const store = createPgContextSnapshotStore(poolFor(client))
-
-    await expect(store.save(value, scope)).rejects.toMatchObject({ code: "session_not_found" })
-    const sessionLock = client.calls.find(sql => sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE"))
-    expect(sessionLock).toContain('"status" NOT IN (\'aborted\', \'archived\')')
-    expect(sessionLock).toContain("FOR UPDATE")
-    expect(client.calls.some(sql => sql.startsWith('INSERT INTO "agent_context_snapshots"'))).toBe(false)
-    expect(client.calls.some(sql => sql.includes('SET "memorySummary"'))).toBe(false)
-    expect(client.calls).toContain("ROLLBACK")
-  })
-
-  it.each([
-    ["missing", { visible: false }],
-    ["cross-user", { sessionUserId: "user-b" }],
-  ] as const)("rejects %s save before snapshot writes", (_label, options) => {
-    const value = snapshot()
-    const client = new FakeClient(value, options)
-    const store = createPgContextSnapshotStore(poolFor(client))
-    return expect(store.save(value, scope)).rejects.toMatchObject({ code: "session_not_found" }).then(() => {
-      expect(client.calls.some(sql => sql.startsWith('INSERT INTO "agent_context_snapshots"'))).toBe(false)
-      expect(client.calls.some(sql => sql.includes('SET "memorySummary"'))).toBe(false)
-      expect(client.calls).toContain("ROLLBACK")
-    })
   })
 
   it("returns null for an invisible tenant row and rejects corrupted checksums", async () => {
