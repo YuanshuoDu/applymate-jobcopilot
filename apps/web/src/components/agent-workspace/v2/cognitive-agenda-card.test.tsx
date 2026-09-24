@@ -42,7 +42,7 @@ describe('CognitiveAgendaCard', () => {
     expect(html).toContain('Approvals: 3')
     expect(html).toContain('Active waits: 4')
     expect(html).toContain('Unresolved: 5')
-    expect(html).toContain('Completion checks: 6')
+    expect(html).not.toContain('Completion checks:')
     expect(html).toContain('Active steering: 7')
     expect(html).toContain('New steering: 9')
   })

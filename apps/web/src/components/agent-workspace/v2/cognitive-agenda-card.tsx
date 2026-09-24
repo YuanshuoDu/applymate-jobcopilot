@@ -33,7 +33,6 @@ export function CognitiveAgendaCard({ agenda, agendas = [], taskLabels }: Cognit
     [t('agent.cognitiveAgenda.signal.approvals'), agenda.signals.approvals],
     [t('agent.cognitiveAgenda.signal.activeWaits'), agenda.signals.activeWaits],
     [t('agent.cognitiveAgenda.signal.unresolved'), agenda.signals.unresolved],
-    [t('agent.cognitiveAgenda.signal.completionVerification'), agenda.signals.completionVerification],
     [t('agent.cognitiveAgenda.signal.steeringActive'), agenda.signals.steering.active],
     [t('agent.cognitiveAgenda.signal.steeringNewlyObserved'), agenda.signals.steering.newlyObserved],
   ]
