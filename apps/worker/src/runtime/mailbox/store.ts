@@ -27,20 +27,11 @@ export class PgCoordinationStore implements CoordinationStore {
   constructor(private readonly pool: PoolLike) {}
 
   async getTask(input: { userId: string; sessionId: string; taskId: string }): Promise<CoordinationTaskView | null> {
-    const client = await this.pool.connect()
-    try {
-      await setUser(client, input.userId)
-      const result = await client.query(`SELECT ${TASK_COLUMNS} FROM "sub_agent_tasks" task
-        JOIN "agent_sessions" session ON session."id" = task."sessionId"
-        WHERE task."id" = $1 AND task."sessionId" = $2 AND session."userId" = $3`, [input.taskId, input.sessionId, input.userId])
-      return result.rows[0] ? taskRow(result.rows[0] as Record<string, unknown>) : null
-    } finally { client.release() }
+    return transaction(this.pool, input.userId, client => readTask(client, input))
   }
 
   async listTasks(input: { userId: string; sessionId: string; rootTaskId?: string; includeTerminal: boolean }): Promise<CoordinationTaskView[]> {
-    const client = await this.pool.connect()
-    try {
-      await setUser(client, input.userId)
+    return transaction(this.pool, input.userId, async client => {
       const params: unknown[] = [input.sessionId, input.userId]
       const filters = [`task."sessionId" = $1`, `session."userId" = $2`]
       if (input.rootTaskId) { params.push(input.rootTaskId); filters.push(`task."rootTaskId" = $${params.length}`) }
@@ -49,7 +40,7 @@ export class PgCoordinationStore implements CoordinationStore {
         JOIN "agent_sessions" session ON session."id" = task."sessionId" WHERE ${filters.join(" AND ")}
         ORDER BY task."path" ASC, task."createdAt" ASC, task."id" ASC LIMIT 50`, params)
       return result.rows.map(row => taskRow(row as Record<string, unknown>))
-    } finally { client.release() }
+    })
   }
 
   async listPendingMessages(input: { userId: string; sessionId: string; toTaskId: string; limit?: number }): Promise<CoordinationMailboxMessage[]> {
@@ -134,15 +125,13 @@ export class PgCoordinationStore implements CoordinationStore {
   }
 
   async getSpawnReplay(input: { userId: string; sessionId: string; idempotencyKey: string }): Promise<CoordinationTaskView | null> {
-    const client = await this.pool.connect()
-    try {
-      await setUser(client, input.userId)
+    return transaction(this.pool, input.userId, async client => {
       const result = await client.query(`SELECT "payload" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.spawn'
         AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [input.sessionId, spawnKey(input.sessionId, input.idempotencyKey)])
       const payload = result.rows[0]?.payload as Record<string, unknown> | undefined
       const taskId = payload && typeof payload.taskId === "string" ? payload.taskId : null
-      return taskId ? this.getTask({ ...input, taskId }) : null
-    } finally { client.release() }
+      return taskId ? readTask(client, { ...input, taskId }) : null
+    })
   }
 
   async recordSpawn(input: { userId: string; sessionId: string; idempotencyKey: string; task: CoordinationTaskView }): Promise<boolean> {
@@ -187,6 +176,13 @@ async function transaction<T>(pool: PoolLike, userId: string, work: (client: pg.
   try { await client.query("BEGIN"); await setUser(client, userId); const value = await work(client); await client.query("COMMIT"); return value }
   catch (error: unknown) { await client.query("ROLLBACK").catch(() => undefined); throw error }
   finally { client.release() }
+}
+
+async function readTask(client: Queryable, input: { userId: string; sessionId: string; taskId: string }): Promise<CoordinationTaskView | null> {
+  const result = await client.query(`SELECT ${TASK_COLUMNS} FROM "sub_agent_tasks" task
+    JOIN "agent_sessions" session ON session."id" = task."sessionId"
+    WHERE task."id" = $1 AND task."sessionId" = $2 AND session."userId" = $3`, [input.taskId, input.sessionId, input.userId])
+  return result.rows[0] ? taskRow(result.rows[0] as Record<string, unknown>) : null
 }
 
 async function setUser(client: Queryable, userId: string): Promise<void> { await client.query(`SELECT set_config('app.user_id', $1, true)`, [userId]) }

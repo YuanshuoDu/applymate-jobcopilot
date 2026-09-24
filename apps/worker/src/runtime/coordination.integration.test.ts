@@ -1,4 +1,6 @@
-import { describe, expect, it, vi } from "vitest"
+import { randomUUID } from "node:crypto"
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
+import { Pool as PgPool, type PoolClient } from "pg"
 import type pg from "pg"
 
 vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnect: vi.fn() })) }))
@@ -26,6 +28,7 @@ import type {
   SubagentTaskSpec,
 } from "./subagents/types.js"
 import { normalizeSubagentPolicy } from "./subagents/types.js"
+import { PgCoordinationStore } from "./mailbox/store.js"
 
 const NOW = new Date("2026-09-13T12:00:00.000Z")
 const USER_ID = "user-1"
@@ -363,5 +366,178 @@ describe("canonical child wait resume composition", () => {
     expect(db.state.consumeWrites).toBe(1)
     expect(db.state.turn.status).toBe("completed")
     expect(store.activities.filter(activity => activity.operation === "spawn_subagent")).toHaveLength(1)
+  })
+})
+
+const MAILBOX_RLS_DATABASE_NAME = "applymate_agent_brain_ci"
+const mailboxRlsSuffix = randomUUID().replaceAll("-", "")
+const mailboxRlsRole = `coordination_mailbox_${mailboxRlsSuffix}`
+const mailboxRlsPolicyNames = {
+  session: `coord_mailbox_s_${mailboxRlsSuffix}`,
+  task: `coord_mailbox_t_${mailboxRlsSuffix}`,
+  outbox: `coord_mailbox_o_${mailboxRlsSuffix}`,
+}
+
+function dedicatedMailboxRlsUrl(): string | null {
+  const value = process.env.AGENT_RUNTIME_PG_TEST_URL
+  if (!value) return null
+  const url = new URL(value)
+  if (process.env.CI !== "true" || process.env.AGENT_RUNTIME_PG_TEST_DISPOSABLE !== "true"
+    || url.protocol !== "postgresql:" || url.hostname !== "127.0.0.1" || url.port !== "5432"
+    || url.username !== "postgres" || url.password !== "postgres"
+    || url.pathname !== `/${MAILBOX_RLS_DATABASE_NAME}` || url.search !== "" || url.hash !== "") {
+    throw new Error("Mailbox RLS integration requires the dedicated disposable Agent runtime PostgreSQL service")
+  }
+  return value
+}
+
+const mailboxRlsUrl = dedicatedMailboxRlsUrl()
+const describeWithMailboxRlsPostgres = mailboxRlsUrl ? describe : describe.skip
+
+type MailboxRlsFixture = { userId: string; sessionId: string; turnId: string; taskId: string; idempotencyKey: string }
+
+function mailboxRlsFixture(owner: "a" | "b"): MailboxRlsFixture {
+  return {
+    userId: `coord-mailbox-${owner}-${mailboxRlsSuffix}`,
+    sessionId: `coord-mailbox-session-${owner}-${mailboxRlsSuffix}`,
+    turnId: `coord-mailbox-turn-${owner}-${mailboxRlsSuffix}`,
+    taskId: `coord-mailbox-task-${owner}-${mailboxRlsSuffix}`,
+    idempotencyKey: `spawn-${owner}-${mailboxRlsSuffix}`,
+  }
+}
+
+const mailboxOwnerA = mailboxRlsFixture("a")
+const mailboxOwnerB = mailboxRlsFixture("b")
+
+async function seedMailboxRlsOwner(pool: PgPool, fixture: MailboxRlsFixture): Promise<void> {
+  await pool.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`, [
+    fixture.userId, `${fixture.userId}@example.invalid`,
+  ])
+  await pool.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+    VALUES ($1, $2, 'Mailbox RLS read fixture', 'running', 'test', CURRENT_TIMESTAMP)`, [fixture.sessionId, fixture.userId])
+  await pool.query(`INSERT INTO "agent_turns"
+    ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "updatedAt")
+    VALUES ($1, $2, $3, 'in_progress', 'user', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP)`, [
+    fixture.turnId, fixture.sessionId, fixture.userId,
+  ])
+  await pool.query(`INSERT INTO "sub_agent_tasks"
+    ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal", "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "updatedAt")
+    VALUES ($1, $2, $3, NULL, NULL, '/root', 0, 'orchestrator', 'root', 'queued', 'Mailbox RLS read fixture', '{}'::jsonb, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 0, 1, CURRENT_TIMESTAMP)`, [
+    fixture.taskId, fixture.sessionId, fixture.turnId,
+  ])
+  await pool.query(`UPDATE "sub_agent_tasks" SET "rootTaskId" = $1 WHERE "id" = $1`, [fixture.taskId])
+  await pool.query(`UPDATE "agent_turns" SET "rootTaskId" = $1 WHERE "id" = $2`, [fixture.taskId, fixture.turnId])
+  await pool.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
+    VALUES ($1, 'agent.subagent.spawn', $2, $3, $4::jsonb)`, [
+    `coord-mailbox-outbox-${fixture.taskId}`, fixture.sessionId,
+    `coordination-spawn:${fixture.sessionId}:${fixture.idempotencyKey}`, JSON.stringify({ taskId: fixture.taskId }),
+  ])
+}
+
+function restrictedMailboxPool(adminPool: PgPool): Pick<pg.Pool, "connect"> {
+  return {
+    async connect() {
+      const client = await adminPool.connect()
+      try {
+        await client.query(`SET ROLE "${mailboxRlsRole}"`)
+        return client
+      } catch (error) {
+        client.release()
+        throw error
+      }
+    },
+  }
+}
+
+describeWithMailboxRlsPostgres("mailbox reads under a restricted RLS role", () => {
+  let adminPool: PgPool | undefined
+  let readerPool: PgPool | undefined
+  let store: PgCoordinationStore
+  let roleCreated = false
+  const originalRlsState = new Map<string, boolean>()
+  const rlsTables = ["agent_sessions", "sub_agent_tasks", "agent_outbox"] as const
+
+  beforeAll(async () => {
+    adminPool = new PgPool({ connectionString: mailboxRlsUrl!, max: 4 })
+    for (const table of rlsTables) {
+      const result = await adminPool.query<{ rowSecurity: boolean }>(`SELECT relrowsecurity AS "rowSecurity" FROM pg_class WHERE oid = $1::regclass`, [table])
+      originalRlsState.set(table, result.rows[0]?.rowSecurity ?? false)
+    }
+    await adminPool.query(`CREATE ROLE "${mailboxRlsRole}" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS`)
+    roleCreated = true
+    await adminPool.query(`GRANT USAGE ON SCHEMA public TO "${mailboxRlsRole}"`)
+    await adminPool.query(`CREATE OR REPLACE FUNCTION public.app_current_user_id()
+      RETURNS text LANGUAGE sql STABLE AS $$ SELECT NULLIF(current_setting('app.user_id', true), '') $$`)
+    await adminPool.query(`GRANT EXECUTE ON FUNCTION public.app_current_user_id() TO "${mailboxRlsRole}"`)
+    await adminPool.query(`GRANT SELECT ON "agent_sessions", "sub_agent_tasks", "agent_outbox" TO "${mailboxRlsRole}"`)
+
+    await seedMailboxRlsOwner(adminPool, mailboxOwnerA)
+    await seedMailboxRlsOwner(adminPool, mailboxOwnerB)
+
+    await adminPool.query(`ALTER TABLE "agent_sessions" ENABLE ROW LEVEL SECURITY`)
+    await adminPool.query(`ALTER TABLE "sub_agent_tasks" ENABLE ROW LEVEL SECURITY`)
+    await adminPool.query(`ALTER TABLE "agent_outbox" ENABLE ROW LEVEL SECURITY`)
+    await adminPool.query(`CREATE POLICY "${mailboxRlsPolicyNames.session}" ON "agent_sessions"
+      USING ("userId" = app_current_user_id()) WITH CHECK ("userId" = app_current_user_id())`)
+    await adminPool.query(`CREATE POLICY "${mailboxRlsPolicyNames.task}" ON "sub_agent_tasks"
+      USING (EXISTS (SELECT 1 FROM "agent_sessions" session WHERE session."id" = "sessionId" AND session."userId" = app_current_user_id()))
+      WITH CHECK (EXISTS (SELECT 1 FROM "agent_sessions" session WHERE session."id" = "sessionId" AND session."userId" = app_current_user_id()))`)
+    await adminPool.query(`CREATE POLICY "${mailboxRlsPolicyNames.outbox}" ON "agent_outbox"
+      USING (EXISTS (SELECT 1 FROM "agent_sessions" session WHERE session."id" = "aggregateId" AND session."userId" = app_current_user_id()))
+      WITH CHECK (EXISTS (SELECT 1 FROM "agent_sessions" session WHERE session."id" = "aggregateId" AND session."userId" = app_current_user_id()))`)
+    readerPool = new PgPool({ connectionString: mailboxRlsUrl!, max: 2 })
+    store = new PgCoordinationStore(restrictedMailboxPool(readerPool))
+  })
+
+  afterAll(async () => {
+    if (!adminPool) return
+    const cleanupErrors: unknown[] = []
+    const cleanup = async (work: () => Promise<unknown>) => {
+      try { await work() } catch (error) { cleanupErrors.push(error) }
+    }
+    await cleanup(() => readerPool?.end() ?? Promise.resolve())
+    await cleanup(() => adminPool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = ANY($1::text[])`, [[mailboxOwnerA.sessionId, mailboxOwnerB.sessionId]]))
+    await cleanup(() => adminPool!.query(`DELETE FROM "User" WHERE "id" = ANY($1::text[])`, [[mailboxOwnerA.userId, mailboxOwnerB.userId]]))
+    await cleanup(() => adminPool!.query(`DROP POLICY IF EXISTS "${mailboxRlsPolicyNames.session}" ON "agent_sessions"`))
+    await cleanup(() => adminPool!.query(`DROP POLICY IF EXISTS "${mailboxRlsPolicyNames.task}" ON "sub_agent_tasks"`))
+    await cleanup(() => adminPool!.query(`DROP POLICY IF EXISTS "${mailboxRlsPolicyNames.outbox}" ON "agent_outbox"`))
+    for (const table of rlsTables) {
+      if (originalRlsState.has(table) && !originalRlsState.get(table)) {
+        await cleanup(() => adminPool!.query(`ALTER TABLE "${table}" DISABLE ROW LEVEL SECURITY`))
+      }
+    }
+    if (roleCreated) {
+      await cleanup(() => adminPool!.query(`DROP OWNED BY "${mailboxRlsRole}"`))
+      await cleanup(() => adminPool!.query(`DROP ROLE "${mailboxRlsRole}"`))
+    }
+    await cleanup(() => adminPool!.end())
+    if (cleanupErrors.length > 0) throw new AggregateError(cleanupErrors, "Mailbox RLS integration cleanup failed")
+  })
+
+  it("binds getTask, listTasks, and spawn replay reads to tenant context without cross-tenant visibility", async () => {
+    const roleProbe = await readerPool!.connect()
+    try {
+      await roleProbe.query(`SET ROLE "${mailboxRlsRole}"`)
+      const role = await roleProbe.query<{ superuser: boolean; bypassesRls: boolean; ownsTable: boolean; rlsEnabled: boolean; rlsActive: boolean }>(
+        `SELECT role.rolsuper AS "superuser", role.rolbypassrls AS "bypassesRls",
+            pg_get_userbyid(relation.relowner) = current_user AS "ownsTable", relation.relrowsecurity AS "rlsEnabled",
+            row_security_active(relation.oid) AS "rlsActive"
+          FROM pg_roles role CROSS JOIN pg_class relation
+          WHERE role.rolname = current_user AND relation.oid = 'agent_sessions'::regclass`,
+      )
+      expect(role.rows[0]).toEqual({ superuser: false, bypassesRls: false, ownsTable: false, rlsEnabled: true, rlsActive: true })
+    } finally {
+      roleProbe.release()
+    }
+
+    await expect(store.getTask({ userId: mailboxOwnerA.userId, sessionId: mailboxOwnerA.sessionId, taskId: mailboxOwnerA.taskId }))
+      .resolves.toMatchObject({ id: mailboxOwnerA.taskId, userId: mailboxOwnerA.userId, sessionId: mailboxOwnerA.sessionId, turnId: mailboxOwnerA.turnId })
+    await expect(store.getTask({ userId: mailboxOwnerB.userId, sessionId: mailboxOwnerA.sessionId, taskId: mailboxOwnerA.taskId })).resolves.toBeNull()
+    await expect(store.listTasks({ userId: mailboxOwnerA.userId, sessionId: mailboxOwnerA.sessionId, includeTerminal: true }))
+      .resolves.toMatchObject([{ id: mailboxOwnerA.taskId, sessionId: mailboxOwnerA.sessionId }])
+    await expect(store.listTasks({ userId: mailboxOwnerB.userId, sessionId: mailboxOwnerA.sessionId, includeTerminal: true })).resolves.toEqual([])
+    await expect(store.getSpawnReplay({ userId: mailboxOwnerA.userId, sessionId: mailboxOwnerA.sessionId, idempotencyKey: mailboxOwnerA.idempotencyKey }))
+      .resolves.toMatchObject({ id: mailboxOwnerA.taskId, turnId: mailboxOwnerA.turnId })
+    await expect(store.getSpawnReplay({ userId: mailboxOwnerB.userId, sessionId: mailboxOwnerA.sessionId, idempotencyKey: mailboxOwnerA.idempotencyKey })).resolves.toBeNull()
   })
 })

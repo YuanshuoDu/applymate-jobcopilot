@@ -89,6 +89,8 @@ jobs:
         run: pnpm --filter @jobcopilot/worker exec vitest run src/runtime/tools/tool-result-reference-pg.integration.test.ts
       - name: Verify subagent task leases and attempt fencing on disposable PostgreSQL
         run: pnpm --filter @jobcopilot/worker exec vitest run src/runtime/subagents/subagent-store-pg.integration.test.ts
+      - name: Verify mailbox task reads under tenant RLS on disposable PostgreSQL
+        run: pnpm --filter @jobcopilot/worker exec vitest run src/runtime/coordination.integration.test.ts
       - name: Verify production Turn dispatch on disposable Redis/BullMQ
         env:
           RUN_AGENT_TURN_REDIS_INTEGRATION: "1"

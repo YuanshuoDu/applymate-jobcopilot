@@ -5,7 +5,7 @@ import { PgCoordinationStore } from "./store.js"
 import type { ChildMailboxHydrationInput } from "./hydration.js"
 import type { CoordinationMailboxMessage, CoordinationMailboxOwnerFence, CoordinationTaskView } from "../tools/coordination-types.js"
 
-type QueryRecord = { sql: string; values: readonly unknown[] }
+type QueryRecord = { sql: string; values: readonly unknown[]; tenantContextActive?: boolean }
 type MailboxRow = { -readonly [Key in keyof CoordinationMailboxMessage]: CoordinationMailboxMessage[Key] }
 type OwnerTaskState = Pick<CoordinationTaskView, "status" | "attemptCount" | "leaseOwner" | "leaseExpiresAt" | "interruptRequestedAt">
 
@@ -37,6 +37,8 @@ function mailboxRow(overrides: Partial<MailboxRow> = {}): MailboxRow {
 class FakeClient {
   readonly queries: QueryRecord[] = []
   private readonly rows: Record<string, unknown>
+  private transactionOpen = false
+  private tenantContextActive = false
   readonly mailboxRows: MailboxRow[]
 
   constructor(
@@ -61,7 +63,24 @@ class FakeClient {
 
   async query(sql: unknown, values: readonly unknown[] = []): Promise<{ rows: Record<string, unknown>[]; rowCount: number }> {
     const text = String(sql)
-    this.queries.push({ sql: text, values })
+    if (text === "BEGIN") {
+      this.transactionOpen = true
+      this.tenantContextActive = false
+      this.queries.push({ sql: text, values, tenantContextActive: false })
+      return { rows: [], rowCount: 0 }
+    }
+    if (text === "COMMIT" || text === "ROLLBACK") {
+      this.queries.push({ sql: text, values, tenantContextActive: this.tenantContextActive })
+      this.transactionOpen = false
+      this.tenantContextActive = false
+      return { rows: [], rowCount: 0 }
+    }
+    if (text.includes("SELECT set_config('app.user_id'")) {
+      if (this.transactionOpen) this.tenantContextActive = true
+      this.queries.push({ sql: text, values, tenantContextActive: this.tenantContextActive })
+      return { rows: [], rowCount: 1 }
+    }
+    this.queries.push({ sql: text, values, tenantContextActive: this.transactionOpen && this.tenantContextActive })
     if (text.includes("FROM \"sub_agent_tasks\" task") && text.includes("SELECT 1")) {
       const taskId = String(values[0])
       const taskTurnId = this.taskTurnIds[taskId] ?? (taskId === task.id ? String(this.rows.turnId) : undefined)
@@ -107,6 +126,9 @@ class FakeClient {
         .slice(0, limit)
       return { rows: pending.map(row => ({ ...row })), rowCount: pending.length }
     }
+    if (text.includes('FROM "agent_outbox"') && text.includes('SELECT "payload"')) {
+      return { rows: [{ payload: { taskId: task.id } }], rowCount: 1 }
+    }
     if (text.includes("FROM \"agent_sessions\"") || text.includes("FROM \"agent_turns\"") || text.includes("FROM \"sub_agent_tasks\"")) return { rows: [{ id: "ok" }], rowCount: 1 }
     if (text.includes("FROM \"agent_mailbox_messages\"")) return { rows: [], rowCount: 0 }
     if (text.includes("INSERT INTO \"agent_mailbox_messages\"")) {
@@ -124,7 +146,6 @@ class FakeClient {
     if (text.includes("SELECT 1 FROM \"agent_events\"")) return { rows: [], rowCount: 0 }
     if (text.includes("INSERT INTO \"agent_outbox\"")) return { rows: [], rowCount: 1 }
     if (text.includes("INSERT INTO \"agent_items\"") || text.includes("INSERT INTO \"agent_events\"")) return { rows: [], rowCount: 1 }
-    if (text.includes("SELECT set_config")) return { rows: [], rowCount: 1 }
     return { rows: [], rowCount: 1 }
   }
 
@@ -133,6 +154,22 @@ class FakeClient {
 
 function pool(client: FakeClient): Pick<pg.Pool, "connect"> {
   return { connect: async () => client as unknown as pg.PoolClient }
+}
+
+function expectReadSharesTenantTransaction(client: FakeClient, read: QueryRecord): void {
+  const readIndex = client.queries.indexOf(read)
+  let beginIndex = -1
+  let contextIndex = -1
+  for (let index = 0; index < readIndex; index += 1) {
+    const query = client.queries[index]
+    if (query?.sql === "BEGIN") beginIndex = index
+    if (query?.sql.includes("set_config('app.user_id'")) contextIndex = index
+  }
+  const commitIndex = client.queries.findIndex((query, index) => index > readIndex && query.sql === "COMMIT")
+  expect(read.tenantContextActive).toBe(true)
+  expect(beginIndex).toBeGreaterThanOrEqual(0)
+  expect(contextIndex).toBeGreaterThan(beginIndex)
+  expect(commitIndex).toBeGreaterThan(readIndex)
 }
 
 class HydrationDelegateClient {
@@ -158,6 +195,34 @@ describe("PgCoordinationStore", () => {
     const read = client.queries.find(query => query.sql.includes("FROM \"sub_agent_tasks\" task"))
     expect(read?.values).toEqual(["task-1", "session-b", "user-b"])
     expect(client.queries.some(query => query.sql.includes("set_config('app.user_id'"))).toBe(true)
+    expectReadSharesTenantTransaction(client, read!)
+  })
+
+  it("lists session tasks while the tenant context remains active", async () => {
+    const client = new FakeClient()
+    const store = new PgCoordinationStore(pool(client))
+
+    await expect(store.listTasks({ userId: "user-a", sessionId: "session-a", rootTaskId: "root-a", includeTerminal: false }))
+      .resolves.toMatchObject([{ id: "task-1", sessionId: "session-a" }])
+    const read = client.queries.find(query => query.sql.includes('FROM "sub_agent_tasks" task') && query.sql.includes("ORDER BY"))
+    expect(read?.values).toEqual(["session-a", "user-a", "root-a", ["completed", "failed", "interrupted", "cancelled", "closed"]])
+    expectReadSharesTenantTransaction(client, read!)
+  })
+
+  it("keeps spawn replay lookup and its task projection in one tenant transaction", async () => {
+    const client = new FakeClient()
+    const store = new PgCoordinationStore(pool(client))
+
+    await expect(store.getSpawnReplay({ userId: "user-a", sessionId: "session-a", idempotencyKey: "spawn-key" }))
+      .resolves.toMatchObject({ id: "task-1", sessionId: "session-a" })
+    const operationRead = client.queries.find(query => query.sql.includes('FROM "agent_outbox"') && query.sql.includes('SELECT "payload"'))
+    const taskRead = client.queries.find(query => query.sql.includes('FROM "sub_agent_tasks" task'))
+    expect(operationRead?.values).toEqual(["session-a", "coordination-spawn:session-a:spawn-key"])
+    expect(taskRead?.values).toEqual(["task-1", "session-a", "user-a"])
+    expectReadSharesTenantTransaction(client, operationRead!)
+    expectReadSharesTenantTransaction(client, taskRead!)
+    expect(client.queries.filter(query => query.sql === "BEGIN")).toHaveLength(1)
+    expect(client.queries.filter(query => query.sql === "COMMIT")).toHaveLength(1)
   })
 
   it("projects server-owned result and failure evidence from task reads", async () => {
