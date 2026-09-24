@@ -22,7 +22,10 @@ vi.mock("./store", () => ({
   validatePendingApprovalReceipt: mocks.validatePendingApprovalReceipt,
 }))
 vi.mock("../broker/store", () => ({ decideApproval: mocks.decideApproval }))
-vi.mock("./decision", () => ({ resolvePendingApprovalInTransaction: mocks.resolvePendingApprovalInTransaction }))
+vi.mock("./decision", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./decision")>()),
+  resolvePendingApprovalInTransaction: mocks.resolvePendingApprovalInTransaction,
+}))
 vi.mock("../session/fact-store", () => ({ appendAgentEventWithOutboxInTransaction: mocks.appendAgentEventWithOutboxInTransaction }))
 
 function approvalRecord(overrides: Record<string, unknown> = {}) {
