@@ -50,7 +50,7 @@ export async function assertApprovalTurnActiveInTransaction(
 
 /**
  * Serializes the decision with session-scoped event writes, then checks the
- * durable request lineage and revision events before the approval mutates.
+ * durable request lineage and goal-revision events before the approval mutates.
  * Event sequence is session-global, so a later goal revision is stale
  * even when it belongs to a different Turn in the same session.
  */

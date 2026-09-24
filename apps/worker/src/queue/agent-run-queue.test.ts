@@ -47,7 +47,6 @@ describe("agent-run queue", () => {
     mocks.queueCloses.length = 0;
     vi.stubEnv("AGENT_WEB_URL", "https://app.applymate.test/");
     vi.stubEnv("AGENT_WORKER_SECRET", "worker-secret");
-    vi.stubEnv("ENABLE_AGENT_COGNITIVE_LOOP", "0");
     vi.stubEnv("ENABLE_AGENT_CANONICAL_AUTOMATION", "0");
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ status: "completed" }))));
   });
