@@ -8,6 +8,8 @@ export const TURN_DISPATCH_LINEAGE_ERROR = "turn_dispatch_lineage_mismatch"
 
 export type TurnDispatchQueue = {
   add(name: string, payload: TurnJobPayload, options?: { jobId?: string; attempts?: number }): Promise<unknown>
+  // Optional for focused fakes; a published dispatch is never re-armed without a successful state probe.
+  getJobState?(jobId: string): Promise<"completed" | "failed" | "delayed" | "active" | "prioritized" | "waiting" | "waiting-children" | "unknown">
 }
 
 export type ReclaimedTurn = { turnId: string; sessionId: string; previousLeaseVersion: number }

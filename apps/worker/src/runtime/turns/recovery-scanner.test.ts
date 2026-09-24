@@ -333,7 +333,7 @@ describe("Turn recovery scanner", () => {
     expect(dispatchInserts.every(([, params]) => params?.[2] === "session_1")).toBe(true)
     const guardedDispatchInserts = dispatchInserts.filter(([sql]) => sql.includes("SELECT $1, $2, $3, $4, $5::jsonb"))
     expect(guardedDispatchInserts.length).toBeGreaterThan(0)
-    expect(guardedDispatchInserts.every(([sql]) => sql.includes('session."id" = $3') && sql.includes('session."status" NOT IN') && sql.includes('session."controlGate" = \'open\''))).toBe(true)
+    expect(guardedDispatchInserts.every(([sql]) => sql.includes('turn."sessionId" = $3') && sql.includes('session."status" NOT IN') && sql.includes('session."controlGate" = \'open\''))).toBe(true)
   })
 
   it.each(["aborted", "archived", null] as const)("does not reclaim, repair, or queue a %s session", async (sessionStatus) => {

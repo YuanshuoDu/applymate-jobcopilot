@@ -177,6 +177,71 @@ async function waitForTurnStatus(pool: Pool, turnId: string, status: string, tim
   throw new Error(`Turn ${turnId} did not reach ${status}`)
 }
 
+type WakeupDispatchRow = {
+  id: string
+  attemptCount: number
+  publishedAt: Date | null
+  lastError: string | null
+  payload: unknown
+}
+
+type WakeupDispatchSnapshot = {
+  dispatchBeforeRestart: { rows: WakeupDispatchRow[] }
+  wakeupJob: Awaited<ReturnType<Queue["getJob"]>>
+}
+
+async function waitForWakeupDispatch(
+  pool: Pool,
+  queue: Queue,
+  ids: FixtureIds,
+  turnJobKey: (turnId: string, generation?: number) => string,
+  timeoutMs = 5_000,
+): Promise<WakeupDispatchSnapshot> {
+  const deadline = Date.now() + timeoutMs
+  let expectedJobId = turnJobKey(ids.turnId, 0)
+  while (Date.now() < deadline) {
+    const dispatchBeforeRestart = await pool.query<WakeupDispatchRow>(
+      `SELECT "id", "attemptCount", "publishedAt", "lastError", "payload"
+       FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.turn.dispatch' AND "idempotencyKey" = $2`,
+      [ids.sessionId, `turn-dispatch:${ids.turnId}`],
+    )
+    const attemptCount = Number(dispatchBeforeRestart.rows[0]?.attemptCount ?? 0)
+    const generation = Math.max(0, attemptCount - 1)
+    expectedJobId = turnJobKey(ids.turnId, generation)
+    const wakeupJob = await queue.getJob(expectedJobId)
+    if (dispatchBeforeRestart.rows[0]?.publishedAt && wakeupJob) {
+      return { dispatchBeforeRestart, wakeupJob }
+    }
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+
+  const dispatchBeforeRestart = await pool.query<WakeupDispatchRow>(
+    `SELECT "id", "attemptCount", "publishedAt", "lastError", "payload"
+     FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.turn.dispatch' AND "idempotencyKey" = $2`,
+    [ids.sessionId, `turn-dispatch:${ids.turnId}`],
+  )
+  const attemptCount = Number(dispatchBeforeRestart.rows[0]?.attemptCount ?? 0)
+  const recentGenerations = Array.from({ length: 6 }, (_, index) => Math.max(0, attemptCount - 4) + index)
+  const generations = [...new Set([0, 1, 2, Math.max(0, attemptCount - 1), ...recentGenerations])]
+  const [jobStates, queuePaused] = await Promise.all([
+    Promise.all(generations.map(async generation => {
+      const candidateId = turnJobKey(ids.turnId, generation)
+      try {
+        return { generation, jobId: candidateId, state: await queue.getJobState(candidateId) }
+      } catch (error: unknown) {
+        return { generation, jobId: candidateId, state: `error:${cleanupError(error)}` }
+      }
+    })),
+    queue.isPaused().catch((error: unknown) => `error:${cleanupError(error)}`),
+  ])
+  throw new Error(`Timed out waiting for published parent wakeup dispatch and current BullMQ generation: ${JSON.stringify({
+    outbox: dispatchBeforeRestart.rows[0] ?? null,
+    expectedJobId,
+    queuePaused,
+    jobStates,
+  })}`)
+}
+
 describeWithServices("production bootstrap recovery across a Worker process restart", () => {
   let pool: Pool | undefined
   let redis: Redis | undefined
@@ -189,6 +254,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
   let workerTwo: WorkerChild | undefined
   let ids: FixtureIds
   let childTaskId: string | undefined
+  let wakeupGeneration: number | undefined
 
   beforeAll(async () => {
     process.env.REDIS_URL = redisUrl!
@@ -250,7 +316,9 @@ describeWithServices("production bootstrap recovery across a Worker process rest
       await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [ids.userId])
     })
     if (turnQueue && turnJobKey && typeof ids !== "undefined") {
-      for (const generation of [0, 1, 2]) {
+      const generations = new Set([0, 1, 2])
+      if (wakeupGeneration !== undefined) generations.add(wakeupGeneration)
+      for (const generation of generations) {
         await attemptCleanup(cleanupFailures, `turn job ${generation} cleanup`, async () => {
           await turnQueue!.getJob(turnJobKey!(ids.turnId, generation))?.then(job => job?.remove())
         })
@@ -318,13 +386,12 @@ describeWithServices("production bootstrap recovery across a Worker process rest
       [ids.sessionId, `agent-wait:${wait.rows[0]!.id}:resumed`],
     )
     expect(resumedEventBeforeRestart.rows[0]?.count).toBe("1")
-    const dispatchBeforeRestart = await pool!.query<{ publishedAt: Date | null }>(
-      `SELECT "publishedAt" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.turn.dispatch' AND "idempotencyKey" = $2`,
-      [ids.sessionId, `turn-dispatch:${ids.turnId}`],
-    )
+    const { dispatchBeforeRestart, wakeupJob } = await waitForWakeupDispatch(pool!, turnQueue!, ids, turnJobKey!)
     expect(dispatchBeforeRestart.rows[0]?.publishedAt).toBeInstanceOf(Date)
-    const wakeupJob = await turnQueue!.getJob(turnJobKey!(ids.turnId, 2))
     expect(wakeupJob).toBeDefined()
+    const publishedGeneration = Math.max(0, Number(dispatchBeforeRestart.rows[0]?.attemptCount ?? 0) - 1)
+    wakeupGeneration = publishedGeneration
+    expect(wakeupJob?.id).toBe(turnJobKey!(ids.turnId, publishedGeneration))
     expect(wakeupJob?.data).toMatchObject({
       turnId: ids.turnId,
       sessionId: ids.sessionId,

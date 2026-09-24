@@ -13,8 +13,6 @@ import {
   type ReclaimedTurn,
 } from "./recovery-scanner-common.js"
 
-type QueuedTurnRow = { id: string; sessionId: string }
-
 /** Reclaims only stale in-progress rows; terminal statuses are never selected. */
 export async function reclaimExpiredTurns(pool: LeasePool, now: Date, limit: number): Promise<ReclaimedTurn[]> {
   if (!Number.isInteger(limit) || limit < 1) throw new RangeError("Recovery limit must be positive")
@@ -157,51 +155,5 @@ export async function repairLegacyTurnDispatchAggregates(pool: LeasePool, limit 
       [TURN_DISPATCH_TOPIC, limit],
     )
     return result.rowCount ?? result.rows.length
-  })
-}
-
-export async function ensureQueuedTurnDispatches(pool: LeasePool, ownerId: string, limit: number): Promise<number> {
-  // A queued Turn is runnable work even when the agent-runs Redis handoff was
-  // lost before turn.started or its canonical dispatch intent was recorded.
-  // Rebuild the session-scoped intent so the durable scanner can recover it.
-  return withTransaction(pool, async (client) => {
-    const rows = await client.query<QueuedTurnRow>(
-      `SELECT turn."id", turn."sessionId"
-       FROM "agent_turns" AS turn
-       JOIN "agent_sessions" AS session
-         ON session."id" = turn."sessionId"
-        AND ${RUNNABLE_SESSION}
-       LEFT JOIN "agent_outbox" AS dispatch
-         ON dispatch."topic" = $1
-        AND dispatch."aggregateId" = turn."sessionId"
-        AND dispatch."idempotencyKey" = 'turn-dispatch:' || turn."id"
-       WHERE turn."status" = 'queued'
-         AND (
-           dispatch."id" IS NULL OR dispatch."publishedAt" IS NOT NULL
-         )
-       ORDER BY turn."createdAt" ASC, turn."id" ASC
-       LIMIT $2 FOR UPDATE OF turn, session SKIP LOCKED`,
-      [TURN_DISPATCH_TOPIC, limit],
-    )
-    let repaired = 0
-    for (const row of rows.rows) {
-      const payload: TurnJobPayload = { turnId: row.id, sessionId: row.sessionId, ownerId }
-      const inserted = await client.query(
-        `INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
-         SELECT $1, $2, $3, $4, $5::jsonb
-         WHERE EXISTS (
-           SELECT 1 FROM "agent_sessions" AS session
-           WHERE session."id" = $3
-             AND ${RUNNABLE_SESSION}
-         )
-         ON CONFLICT ("idempotencyKey") DO UPDATE
-         SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL,
-             "attemptCount" = "agent_outbox"."attemptCount" + 1
-         WHERE "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"`,
-        [randomUUID(), TURN_DISPATCH_TOPIC, row.sessionId, turnDispatchKey(row.id), payloadJson(payload)],
-      )
-      repaired += inserted.rowCount ?? 0
-    }
-    return repaired
   })
 }

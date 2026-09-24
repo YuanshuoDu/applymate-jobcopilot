@@ -3,9 +3,9 @@ import { randomUUID } from "node:crypto"
 import { getPool } from "../../db/apply-results.js"
 import type { LeasePool } from "./lease.js"
 import { TURN_DISPATCH_MAX_BATCH, type TurnDispatchQueue } from "./recovery-scanner-common.js"
+import { ensureQueuedTurnDispatches } from "./recovery-scanner-queue-repair.js"
 import { dispatchPendingTurnOutbox } from "./recovery-scanner-delivery.js"
 import {
-  ensureQueuedTurnDispatches,
   persistTurnDispatch,
   reclaimExpiredTurns,
   repairLegacyTurnDispatchAggregates,
@@ -41,7 +41,7 @@ export async function recoverTurnQueue(
   for (const turn of reclaimed) {
     await persistTurnDispatch(pool, { turnId: turn.turnId, sessionId: turn.sessionId, ownerId }, true)
   }
-  const repaired = legacyRepaired + await ensureQueuedTurnDispatches(pool, ownerId, TURN_DISPATCH_MAX_BATCH)
+  const repaired = legacyRepaired + await ensureQueuedTurnDispatches(pool, queue, ownerId, TURN_DISPATCH_MAX_BATCH)
   const dispatched = await dispatchPendingTurnOutbox(pool, queue)
   return { reclaimed: reclaimed.length, repaired, dispatched }
 }
