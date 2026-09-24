@@ -5,11 +5,11 @@ import { resolvePendingApprovalInTransaction } from "./decision"
 
 const NOW = new Date("2026-09-01T00:00:00.000Z")
 
-type FreshnessState = { hasRequest: boolean; hasRevision: boolean }
+type FreshnessState = { hasRequest: boolean; hasGoalRevision: boolean }
 
 function makeTransaction(
   status: "pending" | "consumed" = "pending",
-  freshness: FreshnessState = { hasRequest: true, hasRevision: false },
+  freshness: FreshnessState = { hasRequest: true, hasGoalRevision: false },
   sessionPresent = true,
 ) {
   const row = {
@@ -49,8 +49,8 @@ const input = {
 }
 
 describe("Web pending approval freshness", () => {
-  it.each(["goal.revision", "plan.revision"] as const)("rejects a pending approval after a %s event", async () => {
-    const fake = makeTransaction("pending", { hasRequest: true, hasRevision: true })
+  it("rejects a pending approval after a goal revision event", async () => {
+    const fake = makeTransaction("pending", { hasRequest: true, hasGoalRevision: true })
 
     await expect(resolvePendingApprovalInTransaction(fake.tx, input)).rejects.toMatchObject({ code: "approval_revision_mismatch" })
     expect(fake.tx.agentApproval.updateMany).not.toHaveBeenCalled()
@@ -58,11 +58,11 @@ describe("Web pending approval freshness", () => {
     const rawCalls = fake.rawQuery.mock.calls as unknown as Array<[unknown]>
     const revisionQuery = rawCalls[1]?.[0] as { strings?: readonly string[] } | undefined
     expect(revisionQuery?.strings?.join(" ")).toContain("'goal.revision'")
-    expect(revisionQuery?.strings?.join(" ")).toContain("'plan.revision'")
+    expect(revisionQuery?.strings?.join(" ")).not.toContain('revision."type" IN')
   })
 
   it("fails closed when the durable approval request event is missing", async () => {
-    const fake = makeTransaction("pending", { hasRequest: false, hasRevision: false })
+    const fake = makeTransaction("pending", { hasRequest: false, hasGoalRevision: false })
 
     await expect(resolvePendingApprovalInTransaction(fake.tx, input)).rejects.toMatchObject({ code: "approval_integrity_error" })
     expect(fake.tx.agentApproval.updateMany).not.toHaveBeenCalled()
@@ -80,7 +80,7 @@ describe("Web pending approval freshness", () => {
   })
 
   it("preserves consumed receipt replay semantics without a freshness read", async () => {
-    const fake = makeTransaction("consumed", { hasRequest: true, hasRevision: true })
+    const fake = makeTransaction("consumed", { hasRequest: true, hasGoalRevision: true })
 
     await expect(resolvePendingApprovalInTransaction(fake.tx, input)).rejects.toMatchObject({ code: "approval_already_consumed" })
     expect(fake.tx.$queryRaw).not.toHaveBeenCalled()
@@ -88,7 +88,7 @@ describe("Web pending approval freshness", () => {
   })
 
   it("fails closed when the approval session cannot be locked", async () => {
-    const fake = makeTransaction("pending", { hasRequest: true, hasRevision: false }, false)
+    const fake = makeTransaction("pending", { hasRequest: true, hasGoalRevision: false }, false)
 
     await expect(resolvePendingApprovalInTransaction(fake.tx, input)).rejects.toMatchObject({ code: "approval_not_found" })
     expect(fake.tx.agentApproval.updateMany).not.toHaveBeenCalled()

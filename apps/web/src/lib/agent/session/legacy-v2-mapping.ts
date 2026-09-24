@@ -53,6 +53,7 @@ const TRANSCRIPT_EVENT_MAP: Record<string, Omit<LegacyV2Mapping, "opaque">> = {
   automation_cancelled: { eventType: "item.completed", actor: "user", itemType: "artifact", itemStatus: "completed", phase: "commentary" },
   job_results: { eventType: "item.completed", actor: "subagent", itemType: "artifact", itemStatus: "completed", phase: "commentary" },
   application_queued: { eventType: "item.completed", actor: "subagent", itemType: "artifact", itemStatus: "completed", phase: "commentary" },
+  session_memory: { eventType: "item.completed", actor: "system", itemType: "context_compaction", itemStatus: "completed", phase: "commentary" },
   final_report: { eventType: "turn.completed", actor: "orchestrator", itemType: "artifact", itemStatus: "completed", phase: "final_answer" },
   error: { eventType: "item.failed", actor: "system", itemType: "error", itemStatus: "failed", phase: "commentary" },
   pipeline_checkpoint: { eventType: "step.completed", actor: "orchestrator", itemType: "artifact", itemStatus: "completed", phase: "commentary" },

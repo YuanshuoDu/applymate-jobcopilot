@@ -85,7 +85,7 @@ async function resumeInTransaction(client: Client, payload: AgentTurnWakeupPaylo
   const content = item.content && typeof item.content === "object" && !Array.isArray(item.content) ? item.content as Record<string, unknown> : {}
   const itemWaitId = payload.waitKind === "approval"
     ? content.approvalId
-    : content.oauth === true ? content.waitId : content.questionId
+    : content.waitId ?? content.questionId
   if (content.waitKind !== payload.waitKind || itemWaitId !== payload.waitId) throw new TerminalWakeupError("item_lineage_mismatch", "Agent wait item lineage does not match wakeup")
   const itemToolCallId = typeof content.toolCallId === "string" ? content.toolCallId : null
   if (itemToolCallId !== payload.toolCallId) throw new TerminalWakeupError("tool_lineage_mismatch", "Agent wait tool lineage does not match wakeup")

@@ -116,8 +116,8 @@ describe("agent-run queue", () => {
     expect(mocks.workerRun).toHaveBeenCalledOnce();
   });
 
-  it("routes a Turn-bound task when the complete cognitive loop gate is enabled", async () => {
-    vi.stubEnv("ENABLE_AGENT_COGNITIVE_LOOP", "1");
+  it("routes a Turn-bound task when canonical automation is enabled", async () => {
+    vi.stubEnv("ENABLE_AGENT_CANONICAL_AUTOMATION", "1");
     await import("./agent-run-queue.js");
 
     await expect(mocks.handler?.({ data: { userId: "user_1", sessionId: "session_1", turnId: "turn_1" } }))

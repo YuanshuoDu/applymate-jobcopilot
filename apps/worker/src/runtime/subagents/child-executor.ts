@@ -71,7 +71,6 @@ export type ChildExecutorOptions = {
   readonly authorizeUsage: UsageAwareModelOptions["authorize"]
   readonly modelRuntimeFactory?: (input: { task: SubagentTaskRecord }) => Promise<ModelAdapter> | ModelAdapter
   readonly toolRuntimeFactory: (input: { task: SubagentTaskRecord; lease: SubagentLease; owner: ReturnType<typeof executionOwnerFence> }) => ChildToolRuntime
-  /** Reuses the server-owned context compaction adapter when production enables it. */
   /** Reads pending child mailbox messages without acknowledging or consuming them. */
   readonly mailboxReader?: ChildMailboxReader
   /** Restores only server-owned state from prior durable attempts. */

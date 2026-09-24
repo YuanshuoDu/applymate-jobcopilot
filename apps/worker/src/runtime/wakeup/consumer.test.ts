@@ -189,10 +189,10 @@ describe("Agent wakeup consumer", () => {
     expect(dispatch.payload).toEqual({ turnId: wakeup.turnId, sessionId: wakeup.sessionId, ownerId: "wakeup:event_wakeup" })
   })
 
-  it("accepts the canonical waitId used by Gmail OAuth question items", async () => {
+  it("accepts an explicit durable waitId on a question item", async () => {
     const fake = fakePool({ item: {
       status: "completed",
-      content: { waitKind: "question", oauth: true, waitId: "q1", toolCallId: "call_1" },
+      content: { waitKind: "question", waitId: "q1", toolCallId: "call_1" },
     } })
 
     await expect(resumeAgentTurn(fake.pool, wakeup)).resolves.toMatchObject({ status: "resumed" })

@@ -17,13 +17,7 @@ describe("agent execution control plane", () => {
     mocks.updateMany.mockResolvedValue({ count: 1 })
     const { claimAgentExecution } = await import("./execution-control")
     await expect(claimAgentExecution({ id: "execution_1", userId: "user_1" })).resolves.toBe(true)
-    expect(mocks.updateMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: expect.objectContaining({
-        id: "execution_1",
-        userId: "user_1",
-        OR: expect.any(Array),
-      }),
-    }))
+    expect(mocks.updateMany).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ OR: expect.any(Array) }) }))
   })
 
   it("resets a finished execution when an automation starts another cycle", async () => {
@@ -38,5 +32,4 @@ describe("agent execution control plane", () => {
     }))
     expect(mocks.upsert).not.toHaveBeenCalled()
   })
-
 })

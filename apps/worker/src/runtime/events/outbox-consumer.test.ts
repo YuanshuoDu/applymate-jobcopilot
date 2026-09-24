@@ -40,10 +40,10 @@ const event: EventRow = {
   idempotencyKey: "agent-wait:wait-1:resumed", payload: { waitId: "wait-1", status: "ready" }, createdAt: "2026-09-22T10:00:00.000Z",
 }
 
-const gmailEvent: EventRow = {
-  id: "gmail-event-1", sessionId: "session-1", turnId: "turn-1", itemId: null, taskId: null, sequence: 9n,
-  type: "gmail.sent", actor: "orchestrator", correlationId: "turn-1", causationId: null,
-  idempotencyKey: "gmail-send:send-1:evidence", payload: { evidenceId: "evidence-1", messageId: "message-1", jobId: "job-1" },
+const sparseEvent: EventRow = {
+  id: "sparse-event-1", sessionId: "session-1", turnId: "turn-1", itemId: "item-1", taskId: null, sequence: 9n,
+  type: "item.completed", actor: "tool", correlationId: "turn-1", causationId: "step-1",
+  idempotencyKey: "activity:sparse-event-1", payload: { operation: "list_subagents", status: "completed" },
   createdAt: "2026-09-22T10:00:00.000Z",
 }
 
@@ -183,24 +183,24 @@ describe("agent event outbox consumer", () => {
     })
   })
 
-  it("publishes a sparse Gmail envelope from the canonical event row", async () => {
+  it("publishes a sparse agent event envelope from the canonical event row", async () => {
     const fake = fakePool([outbox({
-      id: "gmail-outbox-1",
+      id: "sparse-event-outbox-1",
       payload: {
-        eventId: gmailEvent.id, sessionId: gmailEvent.sessionId, turnId: gmailEvent.turnId, type: gmailEvent.type,
-        actor: gmailEvent.actor, idempotencyKey: gmailEvent.idempotencyKey, payload: gmailEvent.payload,
+        eventId: sparseEvent.id, sessionId: sparseEvent.sessionId, turnId: sparseEvent.turnId, type: sparseEvent.type,
+        actor: sparseEvent.actor, idempotencyKey: sparseEvent.idempotencyKey, payload: sparseEvent.payload,
       },
-    })], [gmailEvent])
+    })], [sparseEvent])
     const redis = publisher()
 
     await expect(drainAgentEventOutbox(fake.pool, redis)).resolves.toBe(1)
 
     expect(redis.publish).toHaveBeenCalledTimes(1)
     expect(publishedEnvelope(redis)).toMatchObject({
-      id: gmailEvent.id, sessionId: gmailEvent.sessionId, turnId: gmailEvent.turnId, itemId: gmailEvent.itemId,
-      taskId: gmailEvent.taskId, sequence: gmailEvent.sequence.toString(), type: gmailEvent.type, actor: gmailEvent.actor,
-      correlationId: gmailEvent.correlationId, causationId: gmailEvent.causationId, idempotencyKey: gmailEvent.idempotencyKey,
-      payload: gmailEvent.payload,
+      id: sparseEvent.id, sessionId: sparseEvent.sessionId, turnId: sparseEvent.turnId, itemId: sparseEvent.itemId,
+      taskId: sparseEvent.taskId, sequence: sparseEvent.sequence.toString(), type: sparseEvent.type, actor: sparseEvent.actor,
+      correlationId: sparseEvent.correlationId, causationId: sparseEvent.causationId, idempotencyKey: sparseEvent.idempotencyKey,
+      payload: sparseEvent.payload,
     })
   })
 

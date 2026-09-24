@@ -69,10 +69,10 @@ async function load(client: Client, id: string, userId: string, forUpdate = fals
 }
 async function assertApprovalFreshness(client: Client, row: ApprovalRow): Promise<void> {
   if (!(await client.query(`SELECT "id" FROM "agent_sessions" AS session WHERE session."id" = $1 AND ${OPEN_SESSION} FOR UPDATE`, [row.sessionId])).rows[0]) throw new ApprovalStoreError("approval_not_found", "Approval session is no longer available")
-  const result = await client.query<{ hasRequest: boolean; hasRevision: boolean }>(`WITH request AS (SELECT "sequence" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'approval.requested' AND "correlationId" = $3 AND "idempotencyKey" = $4 ORDER BY "sequence" ASC LIMIT 1) SELECT EXISTS (SELECT 1 FROM request) AS "hasRequest", EXISTS (SELECT 1 FROM "agent_events" AS revision JOIN request ON true WHERE revision."sessionId" = $1 AND revision."type" IN ('goal.revision', 'plan.revision') AND revision."sequence" > request."sequence") AS "hasRevision"`, [row.sessionId, row.turnId, row.id, `approval:${row.id}:requested`])
+  const result = await client.query<{ hasRequest: boolean; hasGoalRevision: boolean }>(`WITH request AS (SELECT "sequence" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'approval.requested' AND "correlationId" = $3 AND "idempotencyKey" = $4 ORDER BY "sequence" ASC LIMIT 1) SELECT EXISTS (SELECT 1 FROM request) AS "hasRequest", EXISTS (SELECT 1 FROM "agent_events" AS revision JOIN request ON true WHERE revision."sessionId" = $1 AND revision."type" = 'goal.revision' AND revision."sequence" > request."sequence") AS "hasGoalRevision"`, [row.sessionId, row.turnId, row.id, `approval:${row.id}:requested`])
   const state = result.rows[0]
   if (!state?.hasRequest) throw new ApprovalStoreError("approval_integrity_error", "Approval receipt request event is unavailable")
-  if (state.hasRevision) throw new ApprovalStoreError("approval_revision_mismatch", "Approval receipt is stale after a plan revision")
+  if (state.hasGoalRevision) throw new ApprovalStoreError("approval_revision_mismatch", "Approval receipt is stale after a goal revision")
 }
 async function assertScope(client: Client, row: ApprovalRow, expected: ApprovalScopeMatch, now: Date): Promise<ApprovalScope> {
   if (row.status === "consumed") throw new ApprovalStoreError("approval_already_consumed", "Approval receipt has already been consumed")

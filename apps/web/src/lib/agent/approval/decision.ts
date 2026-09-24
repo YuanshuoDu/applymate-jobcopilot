@@ -47,7 +47,7 @@ export async function assertApprovalFreshnessInTransaction(tx: Tx, row: Approval
   `)
   if (!session[0]) throw new ApprovalStoreError("approval_not_found", "Approval session is no longer available")
 
-  const state = await tx.$queryRaw<Array<{ hasRequest: boolean; hasRevision: boolean }>>(Prisma.sql`
+  const state = await tx.$queryRaw<Array<{ hasRequest: boolean; hasGoalRevision: boolean }>>(Prisma.sql`
     WITH request AS (
       SELECT "sequence" FROM "agent_events"
       WHERE "sessionId" = ${row.sessionId}
@@ -64,13 +64,13 @@ export async function assertApprovalFreshnessInTransaction(tx: Tx, row: Approval
         SELECT 1 FROM "agent_events" AS revision
         JOIN request ON true
         WHERE revision."sessionId" = ${row.sessionId}
-          AND revision."type" IN ('goal.revision', 'plan.revision')
+          AND revision."type" = 'goal.revision'
           AND revision."sequence" > request."sequence"
-      ) AS "hasRevision"
+      ) AS "hasGoalRevision"
   `)
   const current = state[0]
   if (!current?.hasRequest) throw new ApprovalStoreError("approval_integrity_error", "Approval receipt request event is unavailable")
-  if (current.hasRevision) throw new ApprovalStoreError("approval_revision_mismatch", "Approval receipt is stale after a plan revision")
+  if (current.hasGoalRevision) throw new ApprovalStoreError("approval_revision_mismatch", "Approval receipt is stale after a goal revision")
 }
 
 /** Shared AH2-019 state transition used by both legacy and broker callers. */

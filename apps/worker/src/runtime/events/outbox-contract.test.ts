@@ -19,16 +19,16 @@ const mailboxEnvelope = {
   itemId: canonicalRow.itemId, taskId: canonicalRow.taskId, type: canonicalRow.type,
 }
 
-const gmailEnvelope = {
+const agentEventEnvelope = {
   eventId: canonicalRow.id, sessionId: canonicalRow.sessionId, turnId: canonicalRow.turnId,
   type: canonicalRow.type, actor: canonicalRow.actor, idempotencyKey: canonicalRow.idempotencyKey,
   payload: canonicalRow.payload,
 }
 
 describe("agent event outbox contract", () => {
-  it("accepts the sparse mailbox and Gmail envelopes while preserving provided fields", () => {
+  it("accepts sparse mailbox and agent event envelopes while preserving provided fields", () => {
     expect(parseAgentEventOutboxPayload(mailboxEnvelope)).toEqual(mailboxEnvelope)
-    expect(parseAgentEventOutboxPayload(gmailEnvelope)).toEqual(gmailEnvelope)
+    expect(parseAgentEventOutboxPayload(agentEventEnvelope)).toEqual(agentEventEnvelope)
   })
 
   it("allows omitted turn scope in sparse envelopes but rejects an explicit null turn ID", () => {
@@ -46,9 +46,9 @@ describe("agent event outbox contract", () => {
     ["unknown field", { ...mailboxEnvelope, extra: true }],
     ["missing event id", { sessionId: canonicalRow.sessionId }],
     ["empty session id", { eventId: canonicalRow.id, sessionId: "  " }],
-    ["invalid actor", { ...gmailEnvelope, actor: "browser" }],
+    ["invalid actor", { ...agentEventEnvelope, actor: "browser" }],
     ["invalid sequence", { ...mailboxEnvelope, sequence: "-1" }],
-    ["invalid payload", { ...gmailEnvelope, payload: { unsupported: undefined } }],
+    ["invalid payload", { ...agentEventEnvelope, payload: { unsupported: undefined } }],
   ])("rejects %s", (_label, value) => {
     expect(parseAgentEventOutboxPayload(value)).toBeNull()
   })
