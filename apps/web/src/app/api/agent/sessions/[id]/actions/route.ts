@@ -12,6 +12,7 @@ import { queueApplicationFill, queueAutonomousApplication } from "@/lib/auto-app
 import { clientReceipt, consumeLegacyReceipt, issueLegacyReceipt, resolveLegacyApproval, validateLegacyReceipt, type ScopedApprovalRecord } from "@/lib/agent/approval/legacy-receipt"
 import { ensureV2Turn } from "@/lib/agent/session/v2-turn"
 import { requireLegacyPolicy } from "@/lib/agent/policy/legacy"
+import { resumeLegacyApprovalTurnInTransaction } from "@/lib/agent/approval/legacy-approval-fence"
 
 interface RouteCtx {
   params: Promise<{ id: string }>
@@ -207,7 +208,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
         beforeResolve: () => validateReceiptForApproval(db, automationApproval, action.receiptNonce!, auth.userId, id, { automationName: action.draft.name }),
       })
       if (resolution?.disposition === "canonical_wait") return canonicalApprovalResponse(resolution)
-      if (automationApproval.turnId) await db.agentTurn.update({ where: { id: automationApproval.turnId }, data: { status: "in_progress" } })
+      if (automationApproval.turnId) await resumeLegacyApprovalTurnInTransaction(db, { sessionId: id, userId: auth.userId, turnId: automationApproval.turnId })
       await consumeReceiptForApproval(db, automationApproval, action.receiptNonce, auth.userId, id, { automationName: action.draft.name })
     } catch (error) {
       return legacyApprovalErrorResponse(error, "Automation approval could not be consumed")
@@ -290,9 +291,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
           : undefined,
       })
       if (resolution?.disposition === "canonical_wait") return canonicalApprovalResponse(resolution)
-      if (approval.turnId) {
-        await db.agentTurn.update({ where: { id: approval.turnId }, data: { status: "in_progress" } })
-      }
+      if (approval.turnId) await resumeLegacyApprovalTurnInTransaction(db, { sessionId: id, userId: auth.userId, turnId: approval.turnId })
       if (action.decision === "approved" && approval.type !== "submit_application") {
         await consumeReceiptForApproval(db, approval, action.receiptNonce!, auth.userId, id)
       }

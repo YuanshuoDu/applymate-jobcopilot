@@ -8,6 +8,10 @@ const mocks = vi.hoisted(() => ({
   approvalUpdateMany: vi.fn(),
   approvalCreate: vi.fn(),
   agentTurnUpdate: vi.fn(),
+  agentTurnFindFirst: vi.fn(),
+  agentTurnUpdateMany: vi.fn(),
+  transaction: vi.fn(),
+  queryRaw: vi.fn(),
   resolveLegacyApproval: vi.fn(),
   validateLegacyReceipt: vi.fn(),
   consumeLegacyReceipt: vi.fn(),
@@ -37,9 +41,10 @@ vi.mock("@/lib/api-helpers", () => ({
 
 vi.mock("@/lib/db", () => ({
   db: {
+    $transaction: mocks.transaction,
     agentSession: { findFirst: mocks.sessionFindFirst, update: mocks.sessionUpdate },
     agentApproval: { findFirst: mocks.approvalFindFirst, updateMany: mocks.approvalUpdateMany, create: mocks.approvalCreate },
-    agentTurn: { update: mocks.agentTurnUpdate, findFirst: vi.fn() },
+    agentTurn: { update: mocks.agentTurnUpdate, findFirst: mocks.agentTurnFindFirst, updateMany: mocks.agentTurnUpdateMany },
     agentAutomation: {
       findFirst: mocks.automationFindFirst,
       create: mocks.automationCreate,
@@ -108,6 +113,7 @@ function canonicalResolution(decision: "approved" | "rejected", disposition: "re
 }
 
 const ctx = { params: Promise.resolve({ id: "session_1" }) }
+let turnStatus = "waiting_for_approval"
 
 describe("agent session actions API", () => {
   beforeEach(() => {
@@ -119,6 +125,10 @@ describe("agent session actions API", () => {
     mocks.approvalUpdateMany.mockReset()
     mocks.approvalCreate.mockReset()
     mocks.agentTurnUpdate.mockReset()
+    mocks.agentTurnFindFirst.mockReset()
+    mocks.agentTurnUpdateMany.mockReset()
+    mocks.transaction.mockReset()
+    mocks.queryRaw.mockReset()
     mocks.resolveLegacyApproval.mockReset()
     mocks.validateLegacyReceipt.mockReset()
     mocks.consumeLegacyReceipt.mockReset()
@@ -134,6 +144,18 @@ describe("agent session actions API", () => {
     mocks.jobUpdate.mockReset()
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
     mocks.sessionFindFirst.mockResolvedValue({ id: "session_1" })
+    turnStatus = "waiting_for_approval"
+    mocks.queryRaw.mockResolvedValue([{ id: "session_1" }])
+    mocks.agentTurnFindFirst.mockImplementation(async () => ({ id: "turn_1", status: turnStatus }))
+    mocks.agentTurnUpdateMany.mockImplementation(async (args: { where: { status: { in: string[] } }; data: { status: string } }) => {
+      if (!args.where.status.in.includes(turnStatus)) return { count: 0 }
+      turnStatus = args.data.status
+      return { count: 1 }
+    })
+    mocks.transaction.mockImplementation(async (work: (tx: unknown) => Promise<unknown>) => work({
+      $queryRaw: mocks.queryRaw,
+      agentTurn: { findFirst: mocks.agentTurnFindFirst, updateMany: mocks.agentTurnUpdateMany },
+    }))
     mocks.sessionUpdate.mockResolvedValue({})
     mocks.approvalFindFirst.mockResolvedValue(approvalRecord())
     mocks.approvalUpdateMany.mockResolvedValue({ count: 1 })
@@ -417,6 +439,7 @@ describe("agent session actions API", () => {
     await expect(res.json()).resolves.toEqual({ disposition: expectedDisposition, duplicate: false })
     expect(mocks.resolveLegacyApproval).toHaveBeenCalledTimes(1)
     expect(mocks.agentTurnUpdate).not.toHaveBeenCalled()
+    expect(mocks.transaction).not.toHaveBeenCalled()
     expect(mocks.consumeLegacyReceipt).not.toHaveBeenCalled()
     expect(mocks.transcriptCreate).not.toHaveBeenCalled()
     expect(mocks.sessionUpdate).not.toHaveBeenCalled()
@@ -435,6 +458,7 @@ describe("agent session actions API", () => {
     expect(res.status).toBe(202)
     await expect(res.json()).resolves.toEqual({ disposition: "approved", duplicate: true })
     expect(mocks.agentTurnUpdate).not.toHaveBeenCalled()
+    expect(mocks.transaction).not.toHaveBeenCalled()
     expect(mocks.consumeLegacyReceipt).not.toHaveBeenCalled()
     expect(mocks.transcriptCreate).not.toHaveBeenCalled()
   })
@@ -454,6 +478,49 @@ describe("agent session actions API", () => {
     expect(mocks.transcriptCreate).not.toHaveBeenCalled()
     expect(mocks.sessionUpdate).not.toHaveBeenCalled()
     expect(mocks.enqueueApplyTask).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {
+      path: "generic approval",
+      approvalType: "review_application",
+      action: { type: "approval_response", approvalId: "approval_1", decision: "approved", receiptNonce: "nonce_1" },
+    },
+    {
+      path: "automation approval",
+      approvalType: "automation_mutation",
+      action: {
+        type: "create_automation",
+        approvalId: "approval_1",
+        receiptNonce: "nonce_1",
+        draft: { name: "Weekday Berlin SWE Scout" },
+      },
+    },
+  ] as const)("does not resume or consume when Stop wins before the $path continuation", async ({ approvalType, action }) => {
+    mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({
+      type: approvalType,
+      payload: { applicationTaskId: "task_1", jobId: "job_1" },
+    }))
+    mocks.resolveLegacyApproval.mockImplementationOnce(async () => {
+      turnStatus = "interrupted"
+      return { disposition: "legacy_only", decision: "approved" }
+    })
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest(action) as never, ctx)
+
+    expect(res.status).toBe(409)
+    await expect(res.json()).resolves.toEqual({ error: "Approval turn is no longer active" })
+    expect(mocks.queryRaw).toHaveBeenCalledTimes(1)
+    expect(mocks.queryRaw.mock.invocationCallOrder[0]).toBeLessThan(mocks.agentTurnFindFirst.mock.invocationCallOrder[0])
+    expect(mocks.agentTurnUpdateMany).not.toHaveBeenCalled()
+    expect(turnStatus).toBe("interrupted")
+    expect(mocks.consumeLegacyReceipt).not.toHaveBeenCalled()
+    expect(mocks.enqueueApplyTask).not.toHaveBeenCalled()
+    expect(mocks.automationCreate).not.toHaveBeenCalled()
+    expect(mocks.automationUpdate).not.toHaveBeenCalled()
+    expect(mocks.transcriptCreate).not.toHaveBeenCalled()
+    expect(mocks.sessionUpdate).not.toHaveBeenCalled()
   })
 
   it("stops before canonical delegation when the scoped receipt is invalid", async () => {

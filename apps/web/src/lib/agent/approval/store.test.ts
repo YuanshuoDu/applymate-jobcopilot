@@ -29,7 +29,7 @@ async function approvalRow(nonce = "nonce_1"): Promise<Prisma.AgentApprovalGetPa
   }
 }
 
-type FreshnessState = { hasRequest?: boolean; hasGoalRevision?: boolean; sessionPresent?: boolean }
+type FreshnessState = { hasRequest?: boolean; hasGoalRevision?: boolean; sessionPresent?: boolean; turnPresent?: boolean; turnStatus?: string }
 
 function mockDb(row: Prisma.AgentApprovalGetPayload<{}>, freshness: FreshnessState = {}) {
   const tx = {
@@ -41,7 +41,7 @@ function mockDb(row: Prisma.AgentApprovalGetPayload<{}>, freshness: FreshnessSta
     }),
     agentSession: { findFirst: vi.fn(async () => ({ id: row.sessionId })) },
     agentTurn: {
-      findFirst: vi.fn(async () => ({ id: row.turnId, status: "in_progress", revision: scopeInput.revision })),
+      findFirst: vi.fn(async () => freshness.turnPresent === false ? null : ({ id: row.turnId, status: freshness.turnStatus ?? "in_progress", revision: scopeInput.revision })),
       updateMany: vi.fn(async () => ({ count: 1 })),
     },
     agentItem: {
@@ -119,6 +119,18 @@ describe("Web approval receipt store", () => {
     expect(tx.agentApproval.updateMany).toHaveBeenCalledWith({ where: expect.objectContaining({ status: "approved", scopeHash: row.scopeHash, nonceHash: row.nonceHash }), data: expect.objectContaining({ status: "consumed" }) })
     expect(tx.agentActionReservation.create).toHaveBeenCalledWith({ data: expect.objectContaining({ approvalId: row.id, idempotencyKey: "submit:task_1", status: "reserved" }) })
     expect(tx.agentEvent.create).toHaveBeenCalledTimes(2)
+  })
+
+  it("does not consume an approval after its Turn has been interrupted", async () => {
+    const row = await approvalRow()
+    const { db, tx } = mockDb(row, { turnStatus: "interrupted" })
+
+    await expect(consumeApprovalAndReserve(db, row.id, { ...scopeInput, nonce: "nonce_1" }, { idempotencyKey: "submit:task_1" }, timeAt(1)))
+      .rejects.toMatchObject({ code: "approval_scope_mismatch", message: "Approval turn is no longer active" })
+    expect(tx.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(tx.agentTurn.findFirst.mock.invocationCallOrder[0])
+    expect(tx.agentApproval.updateMany).not.toHaveBeenCalled()
+    expect(tx.agentActionReservation.create).not.toHaveBeenCalled()
+    expect(tx.agentEvent.create).not.toHaveBeenCalled()
   })
 
   it("rejects consumption after a durable goal revision event", async () => {

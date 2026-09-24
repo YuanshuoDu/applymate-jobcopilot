@@ -1,20 +1,55 @@
 import { Prisma, type PrismaClient } from "@prisma/client"
 
 import { waitItemId } from "../broker/item-ids"
+import { ACTIVE_TURN_STATUSES, lockOpenSession } from "../control-plane/commands/transaction"
 import { appendAgentEventWithOutboxInTransaction } from "../session/fact-store"
 import { resolvePendingApprovalInTransaction } from "./decision"
 import type { LegacyApprovalResolution, ScopedApprovalRecord } from "./legacy-receipt"
 
-const ACTIVE_TURN_STATUSES = [
-  "queued",
-  "in_progress",
-  "waiting_for_dependency",
-  "waiting_for_approval",
-  "waiting_for_user",
-] as const
-
 function isActiveTurnStatus(status: string): boolean {
   return ACTIVE_TURN_STATUSES.some((activeStatus) => activeStatus === status)
+}
+
+export class ApprovalTurnInactiveError extends Error {
+  readonly code = "approval_turn_inactive" as const
+
+  constructor(message = "Approval turn is no longer active") {
+    super(message)
+    this.name = "ApprovalTurnInactiveError"
+  }
+}
+
+export async function assertActiveTurnInTransaction(
+  tx: Prisma.TransactionClient,
+  scope: { userId: string; sessionId: string; turnId: string },
+  inactiveMessage?: string,
+) {
+  const turn = await tx.agentTurn.findFirst({
+    where: { id: scope.turnId, sessionId: scope.sessionId, userId: scope.userId },
+    select: { id: true, status: true },
+  })
+  if (!turn || !isActiveTurnStatus(turn.status)) throw new ApprovalTurnInactiveError(inactiveMessage)
+  return turn
+}
+
+export async function resumeLegacyApprovalTurnInTransaction(
+  db: PrismaClient,
+  scope: { userId: string; sessionId: string; turnId: string },
+): Promise<void> {
+  await db.$transaction(async (tx) => {
+    await lockOpenSession(tx, scope.sessionId, scope.userId)
+    await assertActiveTurnInTransaction(tx, scope)
+    const updated = await tx.agentTurn.updateMany({
+      where: {
+        id: scope.turnId,
+        sessionId: scope.sessionId,
+        userId: scope.userId,
+        status: { in: [...ACTIVE_TURN_STATUSES] },
+      },
+      data: { status: "in_progress" },
+    })
+    if (updated.count !== 1) throw new ApprovalTurnInactiveError()
+  })
 }
 
 export class ApprovalWaitActiveError extends Error {
@@ -43,18 +78,9 @@ export async function resolveLegacyOnlyInTransaction(
   if (!turnId) throw new Error("Approval is missing its scoped wait state")
   const now = new Date()
   return db.$transaction(async (tx) => {
-    const session = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
-      SELECT "id" FROM "agent_sessions"
-      WHERE "id" = ${input.sessionId} AND "userId" = ${input.userId}
-      FOR UPDATE
-    `)
-    if (!session[0]) throw new Error("Approval session is no longer available")
+    await lockOpenSession(tx, input.sessionId, input.userId)
 
-    const turn = await tx.agentTurn.findFirst({
-      where: { id: turnId, sessionId: input.sessionId, userId: input.userId },
-      select: { id: true, status: true },
-    })
-    if (!turn || !isActiveTurnStatus(turn.status)) throw new Error("Approval turn is no longer available")
+    await assertActiveTurnInTransaction(tx, { turnId, sessionId: input.sessionId, userId: input.userId }, "Approval turn is no longer available")
 
     const itemId = waitItemId("approval", approval.id)
     const ownItem = await tx.agentItem.findFirst({
