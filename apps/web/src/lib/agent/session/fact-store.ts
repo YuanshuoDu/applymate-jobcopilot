@@ -6,8 +6,7 @@ import { redactAgentEvent } from "@jobcopilot/shared"
 
 export interface AppendAgentEventInput {
   sessionId: string
-  /** Omitted only for the nullable session control lifecycle events. */
-  turnId?: string | null
+  turnId: string
   itemId?: string | null
   taskId?: string | null
   type: string
@@ -48,42 +47,6 @@ export class AgentItemRevisionConflictError extends Error {
 }
 
 type AgentEventRecord = Prisma.AgentEventGetPayload<{}>
-
-const SESSION_CONTROL_EVENT_TYPES = new Set(["session.paused", "session.resumed"])
-const SESSION_CONTROL_PAYLOAD_KEYS = ["sessionId", "operation", "previousGate", "nextGate", "controlRevision", "pausedAt"] as const
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-}
-
-function isTimestamp(value: unknown): value is string {
-  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)
-}
-
-function assertAppendableEvent(input: AppendAgentEventInput): void {
-  const controlEvent = SESSION_CONTROL_EVENT_TYPES.has(input.type)
-  if (!controlEvent) {
-    if (!input.turnId) throw new Error("Turn-scoped AgentEvents require a turnId")
-    return
-  }
-  if ((input.turnId !== undefined && input.turnId !== null) || input.itemId != null || input.taskId != null || input.actor !== "system" || input.correlationId !== input.sessionId || !input.idempotencyKey) {
-    throw new Error("Session control AgentEvents require system scope and a stable idempotency key")
-  }
-  const payload: unknown = input.payload
-  if (!isRecord(payload) || Object.keys(payload).length !== SESSION_CONTROL_PAYLOAD_KEYS.length || !SESSION_CONTROL_PAYLOAD_KEYS.every(key => key in payload)) {
-    throw new Error("Session control AgentEvents contain an invalid payload")
-  }
-  const operation = payload.operation
-  const previousGate = payload.previousGate
-  const nextGate = payload.nextGate
-  const pausedAt = payload.pausedAt
-  const validLifecycle = input.type === "session.paused"
-    ? operation === "pause" && previousGate === "open" && nextGate === "user_paused" && typeof pausedAt === "string"
-    : operation === "resume" && previousGate === "user_paused" && nextGate === "open" && pausedAt === null
-  if (payload.sessionId !== input.sessionId || !validLifecycle || typeof payload.controlRevision !== "number" || !Number.isSafeInteger(payload.controlRevision) || payload.controlRevision < 1 || (pausedAt !== null && !isTimestamp(pausedAt))) {
-    throw new Error("Session control AgentEvents contain invalid lifecycle facts")
-  }
-}
 
 interface EventReader {
   agentEvent: {
@@ -134,7 +97,7 @@ function buildOutboxPayload(
   return {
     eventId,
     sessionId: input.sessionId,
-    turnId: input.turnId ?? null,
+    turnId: input.turnId,
     itemId: input.itemId ?? null,
     taskId: input.taskId ?? null,
     sequence: sequence.toString(),
@@ -155,7 +118,6 @@ export async function appendAgentEventWithOutbox(
   db: PrismaClient,
   input: AppendAgentEventInput,
 ): Promise<{ event: AgentEventRecord; duplicate: boolean }> {
-  assertAppendableEvent(input)
   const existing = await findExistingEvent(db, input)
   if (existing) return { event: existing, duplicate: true }
 
@@ -179,7 +141,6 @@ export async function appendAgentEventWithOutboxInTransaction(
   tx: Prisma.TransactionClient,
   input: AppendAgentEventInput,
 ): Promise<{ event: AgentEventRecord; duplicate: boolean }> {
-  assertAppendableEvent(input)
   const transactionExisting = await findExistingEvent(tx, input)
   if (transactionExisting) return { event: transactionExisting, duplicate: true }
 
@@ -189,7 +150,7 @@ export async function appendAgentEventWithOutboxInTransaction(
     data: {
       id: eventId,
       sessionId: input.sessionId,
-      turnId: input.turnId ?? null,
+      turnId: input.turnId,
       itemId: input.itemId ?? null,
       taskId: input.taskId ?? null,
       sequence,

@@ -52,7 +52,6 @@ describe('timeline session projection', () => {
     })
     const snapshot: AgentTimelineSnapshot = {
       sessionId: 'session-a', items: [], lastEventId: state.lastEventId, lifecycleRevision: state.lifecycleRevision,
-      controlGate: 'open', controlRevision: 0, pausedAt: null,
       cognitiveAgenda: state.cognitiveAgenda.latest, cognitiveAgendas: state.cognitiveAgenda.scoped,
       approvalLedger: selectApprovalLedgerProjection(createApprovalLedgerState('session-a')),
       connection: 'idle', restoring: false, error: null,
@@ -60,6 +59,5 @@ describe('timeline session projection', () => {
 
     expect(snapshot.cognitiveAgenda?.nextAction).toBe('continue_turn')
     expect(snapshot.cognitiveAgendas).toHaveLength(1)
-    expect(snapshot).toMatchObject({ controlGate: 'open', controlRevision: 0, pausedAt: null })
   })
 })

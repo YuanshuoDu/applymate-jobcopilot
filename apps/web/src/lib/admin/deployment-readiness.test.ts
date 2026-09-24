@@ -62,7 +62,7 @@ describe('deployment readiness', () => {
       'ai_usage_events',
       'external_api_usage_events',
       'agent_turns', 'agent_steps', 'agent_inputs', 'agent_items', 'agent_events', 'agent_outbox',
-      'agent_session_controls', 'agent_action_reservations', 'agent_tool_result_references', 'agent_wait_conditions',
+      'agent_action_reservations', 'agent_tool_result_references', 'agent_wait_conditions',
       'agent_tree_budget_reservations', 'agent_mailbox_hydration_checkpoints',
     ]))
   })

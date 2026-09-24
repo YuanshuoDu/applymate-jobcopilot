@@ -1,7 +1,6 @@
 import { Pool } from "pg"
 import { createCanonicalTurnRuntime } from "../runtime/canonical-turn-runtime.ts"
 import { createProductionWorkerBootstrap } from "./production-bootstrap.ts"
-import { enqueueTurn } from "../runtime/turns/turn-queue.ts"
 
 const [, , mode, rawIds] = process.argv
 const ids = JSON.parse(rawIds)
@@ -188,9 +187,6 @@ async function makeFirstWorker() {
       },
     },
   })
-  await enqueueTurn(pool, bootstrap.turns.queue, {
-    turnId: ids.turnId, sessionId: ids.sessionId, ownerId: `restart-worker-${process.pid}`,
-  })
   const deadline = Date.now() + 15_000
   while (!stopping && Date.now() < deadline) {
     const result = await pool.query(`SELECT turn."status" AS "turnStatus", turn."leaseOwnerId", task."status" AS "childStatus",
@@ -219,6 +215,32 @@ function modelProfile() {
     continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: true,
     supportsReasoningSummary: true, supportsResponseContinuation: false, supportsProviderConversation: false,
     supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: null, costClass: "low",
+  }
+}
+
+async function acceptMessage() {
+  const databaseUrl = process.env.AGENT_RUNTIME_PG_TEST_URL
+  if (!databaseUrl) throw new Error("command_acceptance_requires_disposable_postgres")
+  process.env.DATABASE_URL = databaseUrl
+  const [{ db }, { AgentCommandService }] = await Promise.all([
+    import("../../../web/src/lib/db.ts"),
+    import("../../../web/src/lib/agent/control-plane/commands/agent-command-service.ts"),
+  ])
+  const command = {
+    sessionId: ids.sessionId,
+    userId: ids.userId,
+    clientMessageId: `process-restart-message:${ids.suffix}`,
+    source: "user",
+    delivery: "follow_up",
+    content: [{ type: "text", text: "Resume and report the persisted child result" }],
+  }
+  try {
+    const service = new AgentCommandService(db)
+    const accepted = await service.message(command)
+    const duplicate = await service.message(command)
+    say(`COMMAND_ACCEPTED ${JSON.stringify({ accepted, duplicate })}`)
+  } finally {
+    await db.$disconnect()
   }
 }
 
@@ -254,7 +276,8 @@ async function makeSecondWorker() {
 }
 
 async function run() {
-  if (mode === "park-parent") await makeFirstWorker()
+  if (mode === "accept-message") await acceptMessage()
+  else if (mode === "park-parent") await makeFirstWorker()
   else if (mode === "resume-parent") await makeSecondWorker()
   else throw new Error("unknown_restart_fixture_mode")
 }
@@ -266,6 +289,11 @@ try {
   process.stderr.write(`${message}\n`)
   process.exitCode = 1
 } finally {
+  if (mode === "accept-message") {
+    process.stdin.off("data", onStdinData)
+    process.stdin.pause()
+    process.stdin.destroy()
+  }
   await runShutdownStage("bootstrap_close", async () => { if (bootstrap) await bootstrap.close() })
   await runShutdownStage("pool_end", async () => { await pool.end() })
   await runShutdownStage("shared_redis_connections_close", async () => {

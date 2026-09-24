@@ -79,6 +79,7 @@ function event(sessionId: string, turnId: string, id: string, sequence: string, 
 async function installSupervisorFixture(page: Page) {
   const fixture = {
     aStreamCount: 0,
+    eventSequence: 0,
     lifecycleStarted: false,
     replayArmed: false,
     replayRequestsAfterSequence: [] as Array<string | null>,
@@ -91,6 +92,13 @@ async function installSupervisorFixture(page: Page) {
     tasksQueryCount: 0,
     tasksQueryCountAtStartEvent: 0,
     tasksQueryCountAtCompletedEvent: 0,
+    retryTurnStatus: null as string | null,
+    retryRequests: [] as Array<{
+      sessionId: string
+      turnId: string
+      body: Record<string, unknown>
+      idempotencyKey: string | undefined
+    }>,
     approvalDecisions: [] as Array<{
       sessionId: string
       approvalId: string
@@ -99,10 +107,15 @@ async function installSupervisorFixture(page: Page) {
     }>,
   }
   const stageStatus = () => {
+    if (fixture.retryTurnStatus) return fixture.retryTurnStatus
     if (fixture.aStreamCount >= 5) return 'completed'
     return ['queued', 'in_progress', 'waiting_for_user'][Math.min(fixture.aStreamCount, 2)]
   }
   const childStatus = () => fixture.childTaskCompleted ? 'completed' : fixture.childTaskStarted ? 'running' : 'queued'
+  const nextEventSequence = () => {
+    fixture.eventSequence += 1
+    return String(fixture.eventSequence)
+  }
 
   await page.route('**/api/auth/session', route => json(route, {
     user: { id: 'agent-supervisor-fixture', email: 'fixture@applymate.local', name: 'Fixture' },
@@ -124,6 +137,11 @@ async function installSupervisorFixture(page: Page) {
   })
   await page.route('**/__agent_fixture__/replay', async route => {
     fixture.replayArmed = true
+    return json(route, { ok: true })
+  })
+  await page.route('**/__agent_fixture__/retryable', async route => {
+    fixture.retryTurnStatus = 'failed'
+    fixture.lifecycleStarted = false
     return json(route, { ok: true })
   })
   await page.route(/\/api\/agent\/sessions(?:\?.*)?$/, route => json(route, {
@@ -149,8 +167,18 @@ async function installSupervisorFixture(page: Page) {
       return json(route, { disposition: 'resolved' }, 202)
     }
     if (resource === 'turns') {
+      if (parts[6] === 'retry' && route.request().method() === 'POST') {
+        fixture.retryRequests.push({
+          sessionId,
+          turnId: parts[5] ?? '',
+          body: route.request().postDataJSON() as Record<string, unknown>,
+          idempotencyKey: route.request().headers()['idempotency-key'],
+        })
+        return json(route, { inputId: 'fixture-retry-input', turnId: TURN_A, disposition: 'started', sequence: '1' }, 202)
+      }
+      const selectedStatus = sessionId === SESSION_A ? stageStatus() : 'completed'
       const selected = sessionId === SESSION_A
-        ? turn(SESSION_A, TURN_A, stageStatus(), fixture.aStreamCount < 5 ? STEP_A : null)
+        ? turn(SESSION_A, TURN_A, selectedStatus, selectedStatus === 'completed' || selectedStatus === 'failed' ? null : STEP_A)
         : turn(SESSION_B, TURN_B, 'completed', null)
       return json(route, { turns: [selected], projection: { activeTurnId: selected.status === 'completed' ? null : selected.id, activeTurn: selected.status === 'completed' ? null : { id: selected.id, status: selected.status, revision: selected.revision }, queuedInputCount: 0 } })
     }
@@ -186,6 +214,7 @@ async function installSupervisorFixture(page: Page) {
         fixture.replayRequestsAfterSequence.push(afterSequence)
         if (fixture.replayRequestsAfterSequence.length === 1) {
           fixture.replaySequence = (BigInt(afterSequence ?? '0') + BigInt(1)).toString()
+          fixture.eventSequence = Number(fixture.replaySequence)
           fixture.replayEvent = event(SESSION_A, TURN_A, 'fixture-event-selected-tool-replay', fixture.replaySequence, 'item.delta', {
             text: 'Selected tool evidence survived the disconnect.',
             outputSummary: 'Selected tool evidence survived the disconnect.',
@@ -207,16 +236,16 @@ async function installSupervisorFixture(page: Page) {
       // Keep each lifecycle state visible long enough for the browser assertion to observe it.
       await new Promise(resolve => setTimeout(resolve, 1_000))
       const nextEvent = count === 1
-        ? event(SESSION_A, TURN_A, 'fixture-event-running', '1', 'turn.started', { status: 'in_progress' }, { itemId: null })
+        ? event(SESSION_A, TURN_A, 'fixture-event-running', nextEventSequence(), 'turn.started', { status: 'in_progress' }, { itemId: null })
         : count === 2
-          ? event(SESSION_A, TURN_A, 'fixture-event-waiting', '2', 'step.started', { status: 'waiting_for_user' }, { itemId: null, taskId: `task-${SESSION_A}` })
+          ? event(SESSION_A, TURN_A, 'fixture-event-waiting', nextEventSequence(), 'step.started', { status: 'waiting_for_user' }, { itemId: null, taskId: `task-${SESSION_A}` })
           : count === 3
-            ? event(SESSION_A, TURN_A, 'fixture-event-child-started', '3', 'task.started', { status: 'running' }, { itemId: null, taskId: CHILD_TASK_A })
+            ? event(SESSION_A, TURN_A, 'fixture-event-child-started', nextEventSequence(), 'task.started', { status: 'running' }, { itemId: null, taskId: CHILD_TASK_A })
             : count === 4
-              ? event(SESSION_A, TURN_A, 'fixture-event-child-completed', '4', 'task.completed', { status: 'completed' }, { itemId: null, taskId: CHILD_TASK_A })
+              ? event(SESSION_A, TURN_A, 'fixture-event-child-completed', nextEventSequence(), 'task.completed', { status: 'completed' }, { itemId: null, taskId: CHILD_TASK_A })
               : count === 5
-                ? event(SESSION_A, TURN_A, 'fixture-event-completed', '5', 'turn.completed', { status: 'completed' }, { itemId: null })
-                : event(SESSION_A, TURN_A, `fixture-event-late-${count}`, String(count), 'item.delta', { text: 'A late old-session event must stay discarded.' }, { itemId: ITEM_A, kind: 'delta', baseRevision: 3, revision: 4 })
+                ? event(SESSION_A, TURN_A, 'fixture-event-completed', nextEventSequence(), 'turn.completed', { status: 'completed' }, { itemId: null })
+                : event(SESSION_A, TURN_A, `fixture-event-late-${count}`, nextEventSequence(), 'item.delta', { text: 'A late old-session event must stay discarded.' }, { itemId: ITEM_A, kind: 'delta', baseRevision: 3, revision: 4 })
       if (count === 3) {
         fixture.tasksQueryCountAtStartEvent = fixture.tasksQueryCount
         fixture.childTaskStarted = true
@@ -355,10 +384,34 @@ test('real page mounts the shared timeline, supervisor tree, and isolated sessio
   }
   await expect(page.locator('body')).not.toContainText('A late old-session event must stay discarded')
   expect(submissionRequests).toEqual([])
-  expect(consoleErrors).toEqual([])
 
   const artifactDir = path.join(process.cwd(), 'apps', 'web', 'tests', 'e2e', '__artifacts__')
   if (testInfo.project.name === 'desktop-en' || testInfo.project.name === 'mobile-en') {
     await page.screenshot({ path: path.join(artifactDir, `agent-supervisor-${testInfo.project.name}.png`), fullPage: true })
   }
+
+  await page.evaluate(() => fetch('/__agent_fixture__/retryable', { method: 'POST' }))
+  if ((await page.evaluate(() => window.innerWidth)) <= 900) {
+    await page.getByRole('button', { name: isZh ? '对话' : 'Conversations', exact: true }).click()
+  }
+  await page.getByText('Inspect saved roles', { exact: true }).click()
+  const retryableTurn = page.locator(`[data-task-node-id="turn:${TURN_A}"]`)
+  await expect(retryableTurn).toBeVisible({ timeout: 20_000 })
+  await retryableTurn.click()
+  const retryPanel = page.locator('[data-agent-turn-retry="true"]')
+  await expect(retryPanel).toBeVisible()
+  const retryButton = retryPanel.getByRole('button', { name: isZh ? '重试' : 'Retry' })
+  await expect(retryButton).toBeEnabled()
+  await retryButton.click()
+  await expect.poll(() => fixture.retryRequests.length).toBe(1)
+  expect(fixture.retryRequests[0]).toMatchObject({
+    sessionId: SESSION_A,
+    turnId: TURN_A,
+    body: { expectedRevision: 1, clientMessageId: expect.any(String) },
+  })
+  expect(fixture.retryRequests[0]?.idempotencyKey).toBe(fixture.retryRequests[0]?.body.clientMessageId)
+  expect(fixture.retryRequests[0]?.idempotencyKey).toMatch(/^agent-turn-retry-/)
+  await expect(retryPanel.locator('[data-agent-turn-retry-status="accepted"]')).toBeVisible()
+  expect(submissionRequests).toEqual([])
+  expect(consoleErrors).toEqual([])
 })

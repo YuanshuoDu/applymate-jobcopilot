@@ -31,6 +31,17 @@ describe("agent event outbox contract", () => {
     expect(parseAgentEventOutboxPayload(gmailEnvelope)).toEqual(gmailEnvelope)
   })
 
+  it("allows omitted turn scope in sparse envelopes but rejects an explicit null turn ID", () => {
+    const withoutTurnId = { eventId: canonicalRow.id, sessionId: canonicalRow.sessionId }
+    expect(parseAgentEventOutboxPayload(withoutTurnId)).toEqual(withoutTurnId)
+    expect(parseAgentEventOutboxPayload({ ...mailboxEnvelope, turnId: null })).toBeNull()
+  })
+
+  it("rejects canonical event rows without a turn ID", () => {
+    const row = { ...canonicalRow, turnId: null } as unknown as AgentEventRow
+    expect(toCanonicalAgentEvent(row)).toBeNull()
+  })
+
   it.each([
     ["unknown field", { ...mailboxEnvelope, extra: true }],
     ["missing event id", { sessionId: canonicalRow.sessionId }],

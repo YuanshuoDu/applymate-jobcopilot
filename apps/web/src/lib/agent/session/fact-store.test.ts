@@ -85,60 +85,6 @@ describe("agent fact store", () => {
     })
   })
 
-  it("persists a bounded session control event with a nullable turn scope", async () => {
-    const { db, tx } = mockDb()
-    const controlInput = {
-      sessionId: "session_1",
-      turnId: null,
-      itemId: null,
-      taskId: null,
-      type: "session.paused",
-      actor: "system" as const,
-      correlationId: "session_1",
-      idempotencyKey: "agent-session-control:pause_1",
-      payload: {
-        sessionId: "session_1",
-        operation: "pause",
-        previousGate: "open",
-        nextGate: "user_paused",
-        controlRevision: 1,
-        pausedAt: "2026-08-31T00:00:00.000Z",
-      },
-      outboxTopic: "agent.session.event",
-    }
-
-    await expect(appendAgentEventWithOutbox(db, controlInput)).resolves.toMatchObject({ duplicate: false })
-    expect(tx.agentEvent.create).toHaveBeenCalledWith({
-      data: expect.objectContaining({
-        sessionId: "session_1", turnId: null, itemId: null, taskId: null,
-        type: "session.paused", actor: "system", correlationId: "session_1",
-      }),
-    })
-    expect(tx.agentOutbox.create).toHaveBeenCalledWith({
-      data: expect.objectContaining({
-        topic: "agent.session.event", aggregateId: "session_1",
-        payload: expect.objectContaining({ turnId: null, type: "session.paused" }),
-      }),
-    })
-  })
-
-  it("rejects nullable turn scope for ordinary events and sensitive control payloads", async () => {
-    const ordinary = mockDb()
-    await expect(appendAgentEventWithOutbox(ordinary.db, { ...input, turnId: null })).rejects.toThrow("require a turnId")
-    expect(ordinary.db.$transaction).not.toHaveBeenCalled()
-
-    const control = mockDb()
-    await expect(appendAgentEventWithOutbox(control.db, {
-      sessionId: "session_1", turnId: null, type: "session.resumed", actor: "system",
-      correlationId: "session_1", idempotencyKey: "agent-session-control:resume_1",
-      payload: {
-        sessionId: "session_1", operation: "resume", previousGate: "user_paused", nextGate: "open",
-        controlRevision: 2, pausedAt: null, token: "private",
-      }, outboxTopic: "agent.session.event",
-    })).rejects.toThrow("invalid payload")
-    expect(control.db.$transaction).not.toHaveBeenCalled()
-  })
-
   it("returns the original event for a duplicate idempotency key", async () => {
     const { db, tx } = mockDb()
     const original = makeEvent({ id: "original_event", sequence: BigInt(3) })

@@ -1,6 +1,5 @@
 /** CANONICAL Phase 9 timeline state root — do not duplicate. See #459. */
 
-import { isSessionControlEventCandidate, parseTimelineSessionControl } from './timeline-session-control'
 import { normalizeTimelineEvent, type TimelineAction } from './timeline-reducer'
 import { createQuestionHydrationPump, filterQuestionHydrationValues } from './question-hydration'
 import { hasAllTimelineTargetItems, sortTimelineTailEvents } from './timeline-hydration-order'
@@ -124,14 +123,6 @@ export async function streamAgentTimeline(options: TimelineStreamClientOptions):
     let snapshotRequired = false
     try {
       await readSseBody(response.body, frame => {
-        const control = parseTimelineSessionControl(frame.data, options.sessionId)
-        if (control) {
-          if (BigInt(control.sequence) <= afterSequence) return
-          afterSequence = BigInt(control.sequence)
-          options.dispatch({ type: 'event', event: frame.data })
-          return
-        }
-        if (isSessionControlEventCandidate(frame.data)) return
         const event = normalizeTimelineEvent(frame.data)
         if (!event || event.sessionId !== options.sessionId) return
         if (event.sequence !== null) {

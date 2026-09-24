@@ -22,9 +22,6 @@ function makeDb(options: {
   activeTurnId?: string
   activeRootTaskId?: string | null
   activeStatus?: string
-  controlGate?: "open" | "user_paused"
-  controlRevision?: number
-  pausedAt?: Date | null
   retryTarget?: Row & { revision: number }
 } = {}) {
   const ownerId = options.ownerId ?? "user_1"
@@ -37,9 +34,6 @@ function makeDb(options: {
     ? { id: "execution_1", sessionId: "session_1", status: options.executionStatus }
     : null
   let sessionStatus = options.sessionStatus ?? "active"
-  let controlGate = options.controlGate ?? "open"
-  let controlRevision = options.controlRevision ?? 0
-  let pausedAt = options.pausedAt ?? null
   const rawQueries: unknown[] = []
   let rollbacks = 0
   let sequence = BigInt(0)
@@ -47,7 +41,6 @@ function makeDb(options: {
   let items: Row[] = []
   let events: Row[] = []
   let outbox: Row[] = []
-  let controls: Row[] = []
   let transactionQueue = Promise.resolve()
 
   const tx = {
@@ -58,7 +51,7 @@ function makeDb(options: {
       if (sql.includes("SELECT")) {
         const openFence = sql.includes('"status" NOT IN')
         const available = sessionExists && sessionOwnerId === ownerId && (!openFence || !["aborted", "archived"].includes(sessionStatus))
-        return available ? [{ id: "session_1", controlGate, controlRevision, pausedAt }] : []
+        return available ? [{ id: "session_1" }] : []
       }
       sequence += BigInt(1)
       return [{ eventSequence: sequence }]
@@ -71,13 +64,6 @@ function makeDb(options: {
         if (!options.sessionSource || where.id !== "session_1" || where.userId !== ownerId) return { count: 0 }
         sessionStatus = "aborted"
         return { count: 1 }
-      }),
-      update: vi.fn(async (args: unknown) => {
-        const data = (args as { data: Row }).data
-        controlGate = String(data.controlGate) as "open" | "user_paused"
-        controlRevision = Number(data.controlRevision)
-        pausedAt = (data.pausedAt as Date | null) ?? null
-        return data
       }),
     },
     agentExecution: {
@@ -160,17 +146,6 @@ function makeDb(options: {
         return data
       }),
     },
-    agentSessionControl: {
-      findFirst: vi.fn(async (args: unknown) => {
-        const where = whereOf(args)
-        return controls.find((control) => control.sessionId === where.sessionId && control.clientMessageId === where.clientMessageId) ?? null
-      }),
-      create: vi.fn(async (args: unknown) => {
-        const data = (args as { data: Row }).data
-        controls.push(data)
-        return data
-      }),
-    },
   }
 
   const transaction = vi.fn(<T>(work: (transaction: typeof tx) => Promise<T>) => {
@@ -179,15 +154,11 @@ function makeDb(options: {
         active,
         execution,
         sessionStatus,
-        controlGate,
-        controlRevision,
-        pausedAt,
         sequence,
         inputs: [...inputs],
         items: [...items],
         events: [...events],
         outbox: [...outbox],
-        controls: [...controls],
       }
       try {
         return await work(tx)
@@ -196,15 +167,11 @@ function makeDb(options: {
         active = before.active
         execution = before.execution
         sessionStatus = before.sessionStatus
-        controlGate = before.controlGate
-        controlRevision = before.controlRevision
-        pausedAt = before.pausedAt
         sequence = before.sequence
         inputs = before.inputs
         items = before.items
         events = before.events
         outbox = before.outbox
-        controls = before.controls
         throw error
       }
     })
@@ -223,14 +190,10 @@ function makeDb(options: {
       setActive(value: (Row & { revision: number }) | null) { active = value },
       get execution() { return execution },
       get sessionStatus() { return sessionStatus },
-      get controlGate() { return controlGate },
-      get controlRevision() { return controlRevision },
-      get pausedAt() { return pausedAt },
       get inputs() { return inputs },
       get items() { return items },
       get events() { return events },
       get outbox() { return outbox },
-      get controls() { return controls },
     },
   }
 }
@@ -247,10 +210,6 @@ function retryTarget(status = "failed", input: unknown = { goal: "Find backend r
 
 function retryCommand(clientMessageId: string, expectedRevision: number | null = 4) {
   return { sessionId: "session_1", userId: "user_1", clientMessageId, source: "user" as const, targetTurnId: "turn_failed", expectedRevision }
-}
-
-function controlCommand(clientMessageId: string, expectedRevision: number | null = 0) {
-  return { sessionId: "session_1", userId: "user_1", clientMessageId, source: "user" as const, expectedRevision }
 }
 
 describe("AgentCommandService", () => {
@@ -560,110 +519,16 @@ describe("AgentCommandService", () => {
     expect(fake.state.rollbacks).toBe(1)
   })
 
-  it.each(["idle", "queued", "waiting_for_user"] as const)("pauses an %s session without touching its Turn facts", async (status) => {
-    const fake = makeDb(status === "idle" ? {} : { activeSource: "user", activeStatus: status })
-    const result = await new AgentCommandService(fake.db).pause(controlCommand(`pause_${status}`))
-
-    expect(result).toMatchObject({ operation: "pause", controlGate: "user_paused", controlRevision: 1, disposition: "applied" })
-    expect(fake.state.controlGate).toBe("user_paused")
-    expect(fake.state.active?.status ?? null).toBe(status === "idle" ? null : status)
-    expect(fake.state.controls).toHaveLength(1)
-    expect(fake.state.inputs).toHaveLength(0)
-    expect(fake.state.items).toHaveLength(0)
-    expect(fake.state.events).toHaveLength(1)
-    expect(fake.state.events[0]).toMatchObject({
-      turnId: null,
-      itemId: null,
-      taskId: null,
-      type: "session.paused",
-      actor: "system",
-      correlationId: "session_1",
-      idempotencyKey: `agent-session-control:pause_${status}`,
-      payload: {
-        sessionId: "session_1",
-        operation: "pause",
-        previousGate: "open",
-        nextGate: "user_paused",
-        controlRevision: 1,
-        pausedAt: expect.any(String),
-      },
-    })
-    expect(fake.state.outbox).toHaveLength(1)
-    expect(fake.state.outbox[0]).toMatchObject({
-      topic: "agent.session.event",
-      aggregateId: "session_1",
-      payload: { turnId: null, type: "session.paused", idempotencyKey: `agent-session-control:pause_${status}` },
-    })
-  })
-
-  it("rejects pause while a claimed in-progress root exists with zero writes", async () => {
-    const fake = makeDb({ activeSource: "user", activeRootTaskId: "claimed-root" })
-    await expect(new AgentCommandService(fake.db).pause(controlCommand("pause_active"))).rejects.toMatchObject({ code: "session_pause_conflict", status: 409 })
-    expect(fake.state.controlGate).toBe("open")
-    expect(fake.state.controlRevision).toBe(0)
-    expect(fake.state.controls).toHaveLength(0)
-    expect(fake.tx.agentSession.update).not.toHaveBeenCalled()
-    expect(fake.tx.agentSessionControl.create).not.toHaveBeenCalled()
-  })
-
-  it("applies pause and resume idempotently while preserving runtime Turn status", async () => {
-    const fake = makeDb({ activeSource: "user", activeStatus: "waiting_for_approval" })
-    const service = new AgentCommandService(fake.db)
-    const paused = await service.pause(controlCommand("pause_once"))
-    const duplicate = await service.pause(controlCommand("pause_once", 0))
-    expect(paused.disposition).toBe("applied")
-    expect(duplicate).toMatchObject({ disposition: "duplicate", controlGate: "user_paused", controlRevision: 1 })
-    await expect(service.resume(controlCommand("pause_once"))).rejects.toMatchObject({ code: "session_control_idempotency_conflict", status: 409 })
-
-    const resumed = await service.resume(controlCommand("resume_once", 1))
-    expect(resumed).toMatchObject({ operation: "resume", controlGate: "open", controlRevision: 2, disposition: "applied", pausedAt: null })
-    expect(fake.state.active).toMatchObject({ status: "waiting_for_approval" })
-    expect(fake.state.controls).toHaveLength(2)
-    expect(fake.state.events.map((event) => event.type)).toEqual(["session.paused", "session.resumed"])
-    expect(fake.state.outbox.filter((entry) => entry.topic === "agent.session.event")).toHaveLength(2)
-  })
-
-  it("records an open-session resume noop and rejects stale control revisions", async () => {
-    const noop = makeDb()
-    const noopResult = await new AgentCommandService(noop.db).resume(controlCommand("resume_noop"))
-    expect(noopResult).toMatchObject({ disposition: "noop", controlGate: "open", controlRevision: 0 })
-    expect(noop.state.controls).toHaveLength(1)
-    expect(noop.state.events).toHaveLength(0)
-    expect(noop.state.outbox).toHaveLength(0)
-    expect(noop.tx.agentSession.update).not.toHaveBeenCalled()
-
-    const stale = makeDb({ controlGate: "user_paused", controlRevision: 4 })
-    await expect(new AgentCommandService(stale.db).resume(controlCommand("resume_stale", 3))).rejects.toMatchObject({ code: "session_control_revision_changed", status: 409 })
-    expect(stale.state.controlGate).toBe("user_paused")
-    expect(stale.state.controls).toHaveLength(0)
-  })
-
-  it("keeps interrupt available while user-paused and blocks ordinary admission", async () => {
-    const fake = makeDb({ controlGate: "user_paused", controlRevision: 1, activeSource: "user" })
-    const service = new AgentCommandService(fake.db)
-    const before = { inputs: fake.state.inputs.length, items: fake.state.items.length, events: fake.state.events.length, outbox: fake.state.outbox.length }
-    await expect(service.start(startCommand("paused_start"))).rejects.toMatchObject({ code: "agent_session_paused", status: 409 })
-    await expect(service.message({ ...startCommand("paused_message"), delivery: "follow_up" as const })).rejects.toMatchObject({ code: "agent_session_paused", status: 409 })
-    await expect(service.retry(retryCommand("paused_retry"))).rejects.toMatchObject({ code: "agent_session_paused", status: 409 })
-    expect(fake.state.inputs.length).toBe(before.inputs)
-    expect(fake.state.items.length).toBe(before.items)
-    expect(fake.state.events.length).toBe(before.events)
-    expect(fake.state.outbox.length).toBe(before.outbox)
-    await expect(service.interrupt({ ...startCommand("paused_interrupt"), expectedTurnId: "turn_1" })).resolves.toMatchObject({ disposition: "interrupted" })
-  })
-
-  it("replays an already accepted command while user-paused before gate admission", async () => {
+  it("replays an accepted command after its active Turn advances without duplicate writes", async () => {
     const fake = makeDb()
     const service = new AgentCommandService(fake.db)
-    const command = startCommand("paused_duplicate")
+    const command = startCommand("advanced_duplicate")
     const accepted = await service.start(command)
     fake.state.setActive({ ...fake.state.active!, status: "waiting_for_user" })
-    await service.pause(controlCommand("pause_before_duplicate"))
 
     const duplicate = await service.start(command)
 
     expect(duplicate).toMatchObject({ disposition: "duplicate", inputId: accepted.inputId, turnId: accepted.turnId, originalDisposition: "started" })
     expect(fake.state.inputs).toHaveLength(1)
-    expect(fake.state.controls).toHaveLength(1)
   })
 })

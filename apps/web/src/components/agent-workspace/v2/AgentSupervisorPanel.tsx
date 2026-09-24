@@ -6,7 +6,6 @@ import { useApi } from '@/lib/hooks'
 import { useI18n } from '@/lib/i18n'
 
 import { flattenTaskTree, TaskTreePanel } from './TaskTreePanel'
-import { AgentSessionControlBar } from './AgentSessionControlBar'
 import { AgentTurnRetryControl } from './AgentTurnRetryControl'
 import { CognitiveAgendaCard, type CognitiveAgendaTaskLabel } from './cognitive-agenda-card'
 import { AgentApprovalLedgerCard } from './AgentApprovalLedgerCard'
@@ -27,7 +26,7 @@ export interface AgentSupervisorPanelProps {
   readonly timeline: AgentTimelineSnapshot
 }
 
-/** V2 evidence panel with session controls owned by the timeline gate. */
+/** V2 evidence panel for the live task tree and selected timeline evidence. */
 export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPanelProps) {
   const { t } = useI18n()
   const [selectedId, setSelectedId] = useState<string | undefined>()
@@ -172,12 +171,10 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
           {connectionLabel(timeline.connection, t)}
         </span>
       </div>
-      <AgentSessionControlBar sessionId={sessionId} controlGate={timeline.controlGate} controlRevision={timeline.controlRevision} />
-      <SupervisorControlSummary controlGate={timeline.controlGate} controlRevision={timeline.controlRevision} t={t} />
       {loading && <p aria-live="polite" style={messageStyle}>{t('agent.loadingTasks')}</p>}
       {error && <p role="alert" style={{ ...messageStyle, color: 'var(--c-danger)' }}>{t('agent.supervisorUnavailable')}</p>}
-      <AgentApprovalLedgerCard ledger={timeline.approvalLedger} sessionId={sessionId} turns={turns} controlGate={timeline.controlGate} onAccepted={refetchSupervisorRecords} selectionKey={selectedId ?? ''} />
-      <AgentQuestionInputCard sessionId={sessionId} items={timeline.items} turns={turns} controlGate={timeline.controlGate} onAccepted={refetchSupervisorRecords} selectionKey={selectedId ?? ''} />
+      <AgentApprovalLedgerCard ledger={timeline.approvalLedger} sessionId={sessionId} turns={turns} onAccepted={refetchSupervisorRecords} selectionKey={selectedId ?? ''} />
+      <AgentQuestionInputCard sessionId={sessionId} items={timeline.items} turns={turns} onAccepted={refetchSupervisorRecords} selectionKey={selectedId ?? ''} />
       {timeline.cognitiveAgenda && <CognitiveAgendaCard agenda={timeline.cognitiveAgenda} agendas={timeline.cognitiveAgendas} taskLabels={agendaTaskLabels} />}
       {!loading && !nodes.length && !error && <p style={messageStyle}>{t('agent.noTaskRecords')}</p>}
       {!!nodes.length && <TaskTreePanel nodes={nodes} selectedId={selectedId} sessionKey={sessionId} showHeading={false} onSelect={setSelectedId} />}
@@ -197,26 +194,11 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
           <AgentTurnRetryControl
             sessionId={sessionId}
             turn={selectedTurn}
-            controlGate={timeline.controlGate}
             onAccepted={refetchSupervisorRecords}
           />
         </section>
       )}
     </aside>
-  )
-}
-
-export function SupervisorControlSummary({ controlGate, controlRevision, t }: {
-  readonly controlGate: AgentTimelineSnapshot['controlGate']
-  readonly controlRevision: AgentTimelineSnapshot['controlRevision']
-  readonly t: (key: string) => string
-}) {
-  const revision = Number.isSafeInteger(controlRevision) && controlRevision >= 0 ? String(controlRevision) : t('agent.notAvailable')
-  return (
-    <div data-agent-supervisor-control-state="true" data-agent-supervisor-control-gate={controlGate} data-agent-supervisor-control-revision={revision} style={controlSummaryStyle}>
-      <span>{t('agent.gate')}: {controlGate === 'user_paused' ? t('agent.paused') : t('agent.running')}</span>
-      <span>{t('agent.approvalLedger.revision')}: {revision}</span>
-    </div>
   )
 }
 
@@ -233,4 +215,3 @@ function safeAgendaTaskLabel(value: string): string {
 
 const messageStyle: React.CSSProperties = { margin: 0, color: 'var(--text-muted)', fontSize: 11, lineHeight: 1.45 }
 const loadMoreStyle: React.CSSProperties = { border: '1px solid var(--border)', borderRadius: 7, padding: '7px 9px', background: 'var(--bg)', color: 'var(--primary)', cursor: 'pointer', font: 'inherit', fontSize: 10 }
-const controlSummaryStyle: React.CSSProperties = { display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', gap: 6, margin: '7px 0 10px', color: 'var(--text-muted)', fontSize: 9 }

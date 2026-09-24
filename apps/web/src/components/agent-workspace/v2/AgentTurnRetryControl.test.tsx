@@ -30,7 +30,7 @@ afterEach(() => fetchMock.mockReset())
 describe('AgentTurnRetryControl', () => {
   it('renders only for terminal selected root turns', () => {
     const render = (selected: SupervisorTurnSummary | null) => renderToStaticMarkup(
-      <I18nProvider><AgentTurnRetryControl sessionId="session/one" turn={selected} controlGate="open" onAccepted={vi.fn()} /></I18nProvider>,
+      <I18nProvider><AgentTurnRetryControl sessionId="session/one" turn={selected} onAccepted={vi.fn()} /></I18nProvider>,
     )
 
     expect(render(turn())).toContain(`data-agent-turn-retry="true"`)
@@ -39,13 +39,13 @@ describe('AgentTurnRetryControl', () => {
     expect(render(null)).toBe('')
   })
 
-  it('renders a disabled localized explanation while the authoritative gate is paused', () => {
+  it('keeps the retry action available for a retryable turn', () => {
     const html = renderToStaticMarkup(
-      <I18nProvider><AgentTurnRetryControl sessionId="session/one" turn={turn()} controlGate="user_paused" onAccepted={vi.fn()} /></I18nProvider>,
+      <I18nProvider><AgentTurnRetryControl sessionId="session/one" turn={turn()} onAccepted={vi.fn()} /></I18nProvider>,
     )
-    expect(html).toContain('disabled=""')
-    expect(html).toContain('data-agent-turn-retry-paused="true"')
-    expect(html).toContain(translate('en', 'agent.retryPaused'))
+    expect(html).toContain(translate('en', 'agent.retry'))
+    expect(html).not.toContain('disabled=""')
+    expect(html).not.toContain('data-agent-turn-retry-paused')
   })
 
   it('posts encoded ids, JSON content, click revision, and matching idempotency key', async () => {

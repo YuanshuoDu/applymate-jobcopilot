@@ -8,7 +8,6 @@ import { reduceTimelineEvent } from './timeline-event-reducer'
 import { reduceTimelineDelta, reduceTimelineItems, upsertTimelineItem } from './timeline-reducer-items'
 import { appendTimelineEvent, isAfter, isRecord, stringOrNull } from './timeline-reducer-utils'
 import { emptyTimelineSteeringMarkerState, type TimelineSteeringMarkerEvent, type TimelineSteeringMarkerState } from './timeline-steering-markers'
-import { createTimelineSessionControlState, type TimelineSessionControlState } from './timeline-session-control'
 export { normalizeTimelineEvent, normalizeTimelineItem } from './timeline-event-normalizer'
 
 export type TimelineConnection = 'idle' | 'connected' | 'reconnecting'
@@ -66,7 +65,6 @@ export interface TimelineState {
   itemIdsByTaskId: Record<string, string[]>
   processedEventIds: Record<string, true>
   lastSequence: string | null
-  sessionControl: TimelineSessionControlState
   lifecycleRevision: number
   cognitiveAgenda: TimelineCognitiveAgendaState
   approvalLedger: ApprovalLedgerState
@@ -93,7 +91,7 @@ export function createTimelineState(sessionId: string): TimelineState {
     sessionId, events: [], byId: new Map(), byTurnId: new Map(), byToolCallId: new Map(), lastEventId: null,
     transientItems: new Map(), fallbackItems: [],
     itemIds: [], itemsById: {}, itemIdsByTurnId: {}, itemIdsByTaskId: {},
-    processedEventIds: {}, lastSequence: null, sessionControl: createTimelineSessionControlState(), lifecycleRevision: 0, cognitiveAgenda: createCognitiveAgendaState(sessionId), approvalLedger: createApprovalLedgerState(sessionId), steeringMarkers: emptyTimelineSteeringMarkerState(), steeringMarkerEvents: [], connection: 'idle', snapshotRequired: false,
+    processedEventIds: {}, lastSequence: null, lifecycleRevision: 0, cognitiveAgenda: createCognitiveAgendaState(sessionId), approvalLedger: createApprovalLedgerState(sessionId), steeringMarkers: emptyTimelineSteeringMarkerState(), steeringMarkerEvents: [], connection: 'idle', snapshotRequired: false,
   }
 }
 

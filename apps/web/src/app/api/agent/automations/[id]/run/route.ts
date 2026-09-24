@@ -6,7 +6,7 @@ import { err, isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { nextRunAfterCurrent } from "@/lib/agent/automation-schedule"
 import { enqueueAgentRun } from "@/lib/agent-run-queue-client"
 import { ensureAgentExecution } from "@/lib/agent/execution-control"
-import { assertExistingAutomationSessionOpen, AutomationSessionPausedError, AutomationTurnOccupiedError, ensureAutomationTurn, isActiveAutomationExecution, resolveAutomationSession } from "@/lib/agent/automation-session"
+import { AutomationTurnOccupiedError, ensureAutomationTurn, isActiveAutomationExecution, resolveAutomationSession } from "@/lib/agent/automation-session"
 import { hasEffectiveEntitlement } from '@/lib/entitlements'
 import { isRuntimeAgentHarnessFeatureEnabled } from '@/lib/runtime-feature-flags'
 import { createDualWriteSession } from '@/lib/agent/session/dual-write'
@@ -85,7 +85,6 @@ function runnableAutomationWhere(automation: Pick<AutomationForRun, "id">, userI
     id: automation.id,
     userId,
     enabled: true,
-    OR: [{ sessionId: null }, { session: { is: { controlGate: "open" } } }],
   }
 }
 
@@ -112,12 +111,6 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
   if (!automation.enabled) return err("Automation is paused", 409)
 
   if (automation.sessionId) {
-    try {
-      await assertExistingAutomationSessionOpen(db, { sessionId: automation.sessionId, userId: auth.userId })
-    } catch (error: unknown) {
-      if (error instanceof AutomationSessionPausedError) return err(error.message, 409)
-      throw error
-    }
     const execution = await db.agentExecution.findFirst({
       where: { userId: auth.userId, sessionId: automation.sessionId },
       select: { status: true },
@@ -133,37 +126,21 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
       nextRunAt: nextRunAfterCurrent(automation.cron, runAt, automation.timezone),
     },
   })
-  if (claim.count === 0) {
-    if (automation.sessionId) {
-      try {
-        await assertExistingAutomationSessionOpen(db, { sessionId: automation.sessionId, userId: auth.userId })
-      } catch (error: unknown) {
-        if (error instanceof AutomationSessionPausedError) return err(error.message, 409)
-        throw error
-      }
-    }
-    return err("Automation is paused", 409)
-  }
+  if (claim.count === 0) return err("Automation is paused", 409)
 
-  let resolution: Awaited<ReturnType<typeof resolveAutomationSession>>
-  try {
-    resolution = await resolveAutomationSession(db, {
-      automationId: automation.id,
-      userId: auth.userId,
-      sessionId: automation.sessionId,
-      name: automation.name,
-    })
-  } catch (error: unknown) {
-    if (error instanceof AutomationSessionPausedError) return err(error.message, 409)
-    throw error
-  }
+  const resolution = await resolveAutomationSession(db, {
+    automationId: automation.id,
+    userId: auth.userId,
+    sessionId: automation.sessionId,
+    name: automation.name,
+  })
   const { session, created } = resolution
   if (!created) {
     const reopened = await db.agentSession.updateMany({
-      where: { id: session.id, userId: auth.userId, controlGate: "open" },
+      where: { id: session.id, userId: auth.userId },
       data: { status: "running", completedAt: null, memorySummary: "Automation queued for execution." },
     })
-    if (reopened.count !== 1) return err(`Automation session ${session.id} is user-paused`, 409)
+    if (reopened.count !== 1) return err(`Automation session ${session.id} is unavailable`, 409)
   }
 
   let canonicalTurn: Awaited<ReturnType<typeof ensureAutomationTurn>>
@@ -175,7 +152,6 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
     })
   } catch (error: unknown) {
     if (error instanceof AutomationTurnOccupiedError) return err(error.message, 409)
-    if (error instanceof AutomationSessionPausedError) return err(error.message, 409)
     throw error
   }
 

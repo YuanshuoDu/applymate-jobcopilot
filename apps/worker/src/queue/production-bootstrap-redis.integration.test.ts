@@ -76,9 +76,9 @@ function createSqlFixture(ids: { turnId: string; sessionId: string; userId: stri
           ? { rows: [{ id: state.turn.id }], rowCount: 1 }
           : none
       }
-      if (/SELECT\s+session\."userId"\s*,\s*session\."controlGate"\s+FROM\s+"agent_sessions"\s+AS\s+session/.test(sql)) {
+      if (/SELECT\s+session\."userId"\s+FROM\s+"agent_sessions"\s+AS\s+session/.test(sql)) {
         return values[0] === state.turn.sessionId && values[1] === state.turn.id
-          ? { rows: [{ userId: state.turn.userId, controlGate: "open" }], rowCount: 1 }
+          ? { rows: [{ userId: state.turn.userId }], rowCount: 1 }
           : none
       }
       if (sql.includes('SELECT session."id" FROM "agent_sessions"')) {

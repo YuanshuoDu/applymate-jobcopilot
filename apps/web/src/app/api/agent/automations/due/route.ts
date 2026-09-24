@@ -5,7 +5,7 @@ import { err, ok } from "@/lib/api-helpers"
 import { nextRunAfterCurrent } from "@/lib/agent/automation-schedule"
 import { enqueueAgentRun } from "@/lib/agent-run-queue-client"
 import { ensureAgentExecution } from "@/lib/agent/execution-control"
-import { assertExistingAutomationSessionOpen, AutomationSessionPausedError, AutomationTurnOccupiedError, ensureAutomationTurn, isActiveAutomationExecution, resolveAutomationSession } from "@/lib/agent/automation-session"
+import { AutomationTurnOccupiedError, ensureAutomationTurn, isActiveAutomationExecution, resolveAutomationSession } from "@/lib/agent/automation-session"
 import { hasEffectiveEntitlement } from '@/lib/entitlements'
 import { isRuntimeAgentHarnessFeatureEnabled } from '@/lib/runtime-feature-flags'
 import { createDualWriteSession } from '@/lib/agent/session/dual-write'
@@ -55,7 +55,6 @@ function runnableAutomationWhere(automation: Pick<AutomationForRun, "id" | "user
     enabled: true,
     nextRunAt: { lte: now },
     user: { accountStatus: "active" },
-    OR: [{ sessionId: null }, { session: { is: { controlGate: "open" } } }],
   }
 }
 
@@ -67,12 +66,6 @@ async function startAutomation(automation: AutomationForRun, now: Date) {
     capabilities: ["read", "write", "coordination"], input: { mutation: "scheduled_run", requiresReceipt: false, unknownSensitiveFacts: false },
   })
   if (automation.sessionId) {
-    try {
-      await assertExistingAutomationSessionOpen(db, { sessionId: automation.sessionId, userId: automation.userId })
-    } catch (error: unknown) {
-      if (error instanceof AutomationSessionPausedError) return null
-      throw error
-    }
     const execution = await db.agentExecution.findFirst({
       where: { userId: automation.userId, sessionId: automation.sessionId },
       select: { status: true },
@@ -93,38 +86,19 @@ async function startAutomation(automation: AutomationForRun, now: Date) {
       nextRunAt: nextRunAfterCurrent(automation.cron, now, automation.timezone),
     },
   })
-  if (claimed.count === 0) {
-    if (automation.sessionId) {
-      try {
-        await assertExistingAutomationSessionOpen(db, { sessionId: automation.sessionId, userId: automation.userId })
-      } catch (error: unknown) {
-        if (error instanceof AutomationSessionPausedError) return null
-        throw error
-      }
-    }
-    return null
-  }
+  if (claimed.count === 0) return null
 
-  let resolution: Awaited<ReturnType<typeof resolveAutomationSession>>
-  try {
-    resolution = await resolveAutomationSession(db, {
-      automationId: automation.id,
-      userId: automation.userId,
-      sessionId: automation.sessionId,
-      name: automation.name,
-      memorySummary: "Automation picked up by scheduler.",
-    })
-  } catch (error: unknown) {
-    if (error instanceof AutomationSessionPausedError) {
-      await db.agentAutomation.update({ where: { id: automation.id, userId: automation.userId }, data: { nextRunAt: now } })
-      return null
-    }
-    throw error
-  }
+  const resolution = await resolveAutomationSession(db, {
+    automationId: automation.id,
+    userId: automation.userId,
+    sessionId: automation.sessionId,
+    name: automation.name,
+    memorySummary: "Automation picked up by scheduler.",
+  })
   const { session, created } = resolution
   if (!created) {
     const reopened = await db.agentSession.updateMany({
-      where: { id: session.id, userId: automation.userId, controlGate: "open" },
+      where: { id: session.id, userId: automation.userId },
       data: { status: "running", completedAt: null, memorySummary: "Automation picked up by scheduler." },
     })
     if (reopened.count !== 1) {
@@ -142,10 +116,6 @@ async function startAutomation(automation: AutomationForRun, now: Date) {
     })
   } catch (error: unknown) {
     if (error instanceof AutomationTurnOccupiedError) {
-      await db.agentAutomation.update({ where: { id: automation.id, userId: automation.userId }, data: { nextRunAt: now } })
-      return null
-    }
-    if (error instanceof AutomationSessionPausedError) {
       await db.agentAutomation.update({ where: { id: automation.id, userId: automation.userId }, data: { nextRunAt: now } })
       return null
     }
@@ -225,7 +195,6 @@ async function runDueAutomations(req: NextRequest) {
       enabled: true,
       nextRunAt: { lte: now },
       user: { accountStatus: 'active' },
-      OR: [{ sessionId: null }, { session: { is: { controlGate: "open" } } }],
     },
     orderBy: { nextRunAt: "asc" },
     take: 20,

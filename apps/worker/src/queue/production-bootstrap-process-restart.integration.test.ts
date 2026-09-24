@@ -55,14 +55,21 @@ const describeWithServices = databaseUrl && redisUrl ? describe : describe.skip
 type FixtureIds = { suffix: string; userId: string; sessionId: string; turnId: string }
 type WorkerChild = ChildProcess & { output: string[]; errors: string[] }
 type ExitWaitContext = { stage: string; pid?: number; requestedSignal?: string; signalAccepted?: boolean; timeoutMs?: number }
+type CommandAcceptanceResult = {
+  inputId: string
+  turnId: string
+  disposition: string
+  originalDisposition?: string
+}
+type CommandAcceptance = { accepted: CommandAcceptanceResult; duplicate: CommandAcceptanceResult }
 
 const fixturePath = fileURLToPath(new URL("./production-bootstrap-process-restart.fixture.mjs", import.meta.url))
 const workerCwd = fileURLToPath(new URL("../..", import.meta.url))
 
-function startWorker(mode: "park-parent" | "resume-parent", ids: FixtureIds): WorkerChild {
+function startWorker(mode: "accept-message" | "park-parent" | "resume-parent", ids: FixtureIds): WorkerChild {
   const child = spawn(process.execPath, ["--import", "tsx", fixturePath, mode, JSON.stringify(ids)], {
     cwd: workerCwd,
-    env: { ...process.env, REDIS_URL: redisUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl! },
+    env: { ...process.env, DATABASE_URL: databaseUrl!, REDIS_URL: redisUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl! },
     stdio: ["pipe", "pipe", "pipe"],
   }) as WorkerChild
   child.output = []
@@ -84,6 +91,12 @@ function startWorker(mode: "park-parent" | "resume-parent", ids: FixtureIds): Wo
     child.errors.push(...lines.map(line => line.trim()).filter(Boolean))
   })
   return child
+}
+
+function parseCommandAcceptance(line: string): CommandAcceptance {
+  const prefix = "COMMAND_ACCEPTED "
+  if (!line.startsWith(prefix)) throw new Error(`Unexpected command acceptance output: ${line}`)
+  return JSON.parse(line.slice(prefix.length)) as CommandAcceptance
 }
 
 async function waitForLine(child: WorkerChild, prefix: string, timeoutMs = 20_000): Promise<string> {
@@ -252,6 +265,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
   let childJobKey: ((taskId: string) => string) | undefined
   let workerOne: WorkerChild | undefined
   let workerTwo: WorkerChild | undefined
+  let commandAcceptance: WorkerChild | undefined
   let ids: FixtureIds
   let childTaskId: string | undefined
   let wakeupGeneration: number | undefined
@@ -277,27 +291,16 @@ describeWithServices("production bootstrap recovery across a Worker process rest
       suffix,
       userId: `process-restart-user-${suffix}`,
       sessionId: `process-restart-session-${suffix}`,
-      turnId: `process-restart-turn-${suffix}`,
+      turnId: `process-restart-turn-pending-${suffix}`,
     }
     await pool.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`, [ids.userId, `${ids.userId}@example.invalid`])
     await pool.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
       VALUES ($1, $2, 'Resume a parent Turn after its child completes', 'running', 'test', CURRENT_TIMESTAMP)`, [ids.sessionId, ids.userId])
-    await pool.query(`INSERT INTO "agent_turns"
-      ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "updatedAt")
-      VALUES ($1, $2, $3, 'queued', 'user', $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb, CURRENT_TIMESTAMP)`, [
-      ids.turnId,
-      ids.sessionId,
-      ids.userId,
-      JSON.stringify({ goal: "Resume and report the persisted child result" }),
-      JSON.stringify({ provider: "fixture", model: "fixture-model" }),
-      JSON.stringify({}),
-      JSON.stringify({ limits: { maxSteps: 3, maxToolCalls: 2 } }),
-    ])
   }, 20_000)
 
   afterAll(async () => {
     const cleanupFailures: string[] = []
-    for (const [workerName, child] of [["worker1", workerOne], ["worker2", workerTwo]] as const) {
+    for (const [workerName, child] of [["command-acceptance", commandAcceptance], ["worker1", workerOne], ["worker2", workerTwo]] as const) {
       if (!child || workerHasExited(child)) continue
       try {
         const failure = await stopWorkerForCleanup(child, workerName)
@@ -340,6 +343,57 @@ describeWithServices("production bootstrap recovery across a Worker process rest
   })
 
   it("persists a child result, kills its Worker, and resumes the parent from PostgreSQL under a new lease", async () => {
+    // Exercise the Web command service against the migrated disposable database.
+    // The fixture calls message() twice with the same clientMessageId, then
+    // exits before any Worker consumer is started.
+    commandAcceptance = startWorker("accept-message", ids)
+    const acceptedLine = await waitForLine(commandAcceptance, "COMMAND_ACCEPTED ")
+    await waitForExit(commandAcceptance, { stage: "command-acceptance-after-result", pid: commandAcceptance.pid })
+    expect(commandAcceptance.exitCode).toBe(0)
+    const acceptance = parseCommandAcceptance(acceptedLine)
+    expect(acceptance.accepted.disposition).toBe("started")
+    expect(acceptance.duplicate).toMatchObject({
+      inputId: acceptance.accepted.inputId,
+      turnId: acceptance.accepted.turnId,
+      disposition: "duplicate",
+      originalDisposition: "started",
+    })
+    ids.turnId = acceptance.accepted.turnId
+    const acceptedFacts = await pool!.query<{
+      turnCount: string
+      inputCount: string
+      userMessageCount: string
+      acceptedEventCount: string
+      turnDispatchCount: string
+      turnStatus: string | null
+      outboxPublishedAt: Date | null
+    }>(
+      `SELECT
+         (SELECT COUNT(*)::text FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2) AS "turnCount",
+         (SELECT COUNT(*)::text FROM "agent_inputs" WHERE "sessionId" = $2 AND "clientMessageId" = $3 AND "targetTurnId" = $1) AS "inputCount",
+         (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = $1 AND "type" = 'user_message') AS "userMessageCount",
+         (SELECT COUNT(*)::text FROM "agent_events" WHERE "sessionId" = $2 AND "idempotencyKey" = $4) AS "acceptedEventCount",
+         (SELECT COUNT(*)::text FROM "agent_outbox" WHERE "aggregateId" = $2 AND "topic" = 'agent.turn.dispatch' AND "idempotencyKey" = $5) AS "turnDispatchCount",
+         (SELECT "status" FROM "agent_turns" WHERE "id" = $1) AS "turnStatus",
+         (SELECT "publishedAt" FROM "agent_outbox" WHERE "aggregateId" = $2 AND "topic" = 'agent.turn.dispatch' AND "idempotencyKey" = $5) AS "outboxPublishedAt"`,
+      [
+        ids.turnId,
+        ids.sessionId,
+        `process-restart-message:${ids.suffix}`,
+        `agent-command:process-restart-message:${ids.suffix}`,
+        `turn-dispatch:${ids.turnId}`,
+      ],
+    )
+    expect(acceptedFacts.rows[0]).toMatchObject({
+      turnCount: "1",
+      inputCount: "1",
+      userMessageCount: "1",
+      acceptedEventCount: "1",
+      turnDispatchCount: "1",
+      turnStatus: "queued",
+      outboxPublishedAt: null,
+    })
+
     workerOne = startWorker("park-parent", ids)
     await waitForLine(workerOne, "PARENT_SUSPENDED")
     // Freeze the real shared Turn queue before the child completes so Process 1 cannot claim its wakeup.

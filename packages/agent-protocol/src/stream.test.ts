@@ -29,19 +29,6 @@ describe('agent stream contract', () => {
     expect(delta).toMatchObject({ schemaVersion: 'agent-harness.v2', kind: 'snapshot', revision: 3 })
   })
 
-  it('allows session lifecycle events without a turn', () => {
-    const durable = createDurableEnvelope({
-      id: 'event_paused', sessionId: 'session_1', turnId: null, itemId: null, taskId: null,
-      type: 'session.paused', actor: 'system', correlationId: 'session_1', causationId: null,
-      idempotencyKey: 'agent-session-control:client_1', sequence: '8',
-      payload: {
-        sessionId: 'session_1', operation: 'pause', previousGate: 'open', nextGate: 'user_paused',
-        controlRevision: 1, pausedAt: '2026-09-15T00:00:00.000Z',
-      },
-    })
-    expect(durable).toMatchObject({ type: 'session.paused', turnId: null, correlationId: 'session_1' })
-  })
-
   it('keeps the transient stream bounded', () => {
     expect(AGENT_DELTA_STREAM_MAX_LENGTH).toBeGreaterThan(0)
   })

@@ -10,6 +10,7 @@ import { runModelStep, type ModelStepResult } from "./turn-engine-model.js"
 import { TurnEngineError, toRepositoryJson, type TurnEngineResult, type TurnEngineStep } from "./turn-engine-types.js"
 import { publishCommentary, publishFinalResponse, publishReasoningSummary, TurnExecutionEventWriter } from "./turn-execution-events.js"
 import type { TurnExecutionOptions } from "./turn-execution-types.js"
+import { assertCompletionAllowed } from "./turn-execution-completion-gate.js"
 import { assertExecutionAlive, assertModelAllowance, canEmitTurnCompleted, canPersistFinalResponse, makeExecutionId, resumedBudgetLimits, totalTurnUsage, turnErrorCode, updateExecutionStep } from "./turn-engine-helpers.js"
 import { STEERING_MARKER_EVENT_TYPE } from "../context/steering-marker.js"
 import { buildCognitiveActionAgenda } from "./cognitive-action-agenda.js"
@@ -231,21 +232,4 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
     ).catch(() => undefined)
     return { status: "failed", stepCount: steps, toolCallCount: toolCalls, errorCode: code, ...(finalItem ? { finalItemId: finalItem.id } : {}) }
   }
-}
-
-async function assertCompletionAllowed(options: TurnExecutionOptions, writer: TurnExecutionEventWriter, step: TurnEngineStep, signal: AbortSignal, now: () => Date): Promise<void> {
-  if (!options.completionGate) return
-  let decision: Awaited<ReturnType<NonNullable<TurnExecutionOptions["completionGate"]>>>
-  try {
-    decision = await options.completionGate({ identity: options.identity, scope: options.scope, rootTaskId: options.identity.rootTaskId, stepId: step.id, signal, now: now() })
-  } catch {
-    throw new TurnEngineError("invalid_output", "Completion gate failed closed")
-  }
-  if (!decision || typeof decision !== "object" || typeof decision.ok !== "boolean") throw new TurnEngineError("invalid_output", "Completion gate returned an invalid decision")
-  if (decision.ok) return
-  if (typeof decision.blocker !== "string" || typeof decision.feedback !== "string" || decision.blocker.length === 0 || decision.blocker.length > 256 || decision.feedback.length > 512) {
-    throw new TurnEngineError("invalid_output", "Completion gate returned an invalid blocker")
-  }
-  await writer.append("final.rejected", step.id, null, { code: "business_precondition_failed", blocker: decision.blocker, feedback: decision.feedback, taskId: options.identity.taskId }, `final-rejected:${step.id}`)
-  throw new TurnEngineError("business_precondition_failed", decision.blocker)
 }

@@ -13,7 +13,7 @@ const turns = [{
 }]
 
 function cardProps(ledger: ReturnType<typeof selectApprovalLedgerProjection>) {
-  return { ledger, sessionId: 'session-1', turns, controlGate: 'open' as const, onAccepted: () => undefined }
+  return { ledger, sessionId: 'session-1', turns, onAccepted: () => undefined }
 }
 
 function ledger() {
@@ -52,6 +52,7 @@ describe('AgentApprovalLedgerCard', () => {
     const pending = selectApprovalLedgerProjection(reduceApprovalLedger(createApprovalLedgerState('session-1'), requested))
     const html = renderToStaticMarkup(<I18nProvider><AgentApprovalLedgerCard {...cardProps(pending)} /></I18nProvider>)
     expect(html.match(/<button/g)).toHaveLength(2)
+    expect(html).not.toContain('disabled=""')
     expect(html).toContain(translate('en', 'agent.approvalLedger.approve'))
     expect(html).toContain(translate('en', 'agent.approvalLedger.reject'))
     expect(html).not.toContain('opaque-approval')
@@ -59,18 +60,17 @@ describe('AgentApprovalLedgerCard', () => {
     expect(html).not.toContain('scopeHash')
   })
 
-  it('disables controls and explains paused or unavailable Turn state', () => {
+  it('disables decisions when the referenced Turn is unavailable', () => {
     const requested = { schemaVersion: 'agent-harness.v2', id: 'request-2', sessionId: 'session-1', turnId: 'missing-turn', itemId: null, taskId: null, type: 'approval.requested', actor: 'orchestrator', sequence: '1', payload: { approvalId: 'opaque-approval', action: 'submit_application' } }
     const pending = selectApprovalLedgerProjection(reduceApprovalLedger(createApprovalLedgerState('session-1'), requested))
-    const html = renderToStaticMarkup(<I18nProvider><AgentApprovalLedgerCard {...cardProps(pending)} controlGate="user_paused" /></I18nProvider>)
+    const html = renderToStaticMarkup(<I18nProvider><AgentApprovalLedgerCard {...cardProps(pending)} /></I18nProvider>)
     expect(html.match(/disabled=""/g)).toHaveLength(2)
-    expect(html).toContain(translate('en', 'agent.approvalLedger.resumeFirst'))
     expect(html).toContain(translate('en', 'agent.approvalLedger.turnUnavailable'))
   })
 
   it('keeps acknowledged commands fenced until authoritative state changes', () => {
-    expect(isApprovalActionDisabled(false, false, false, 'accepted')).toBe(true)
-    expect(isApprovalActionDisabled(false, false, false, 'duplicate')).toBe(true)
-    expect(isApprovalActionDisabled(false, false, false, 'failed')).toBe(false)
+    expect(isApprovalActionDisabled(false, false, 'accepted')).toBe(true)
+    expect(isApprovalActionDisabled(false, false, 'duplicate')).toBe(true)
+    expect(isApprovalActionDisabled(false, false, 'failed')).toBe(false)
   })
 })

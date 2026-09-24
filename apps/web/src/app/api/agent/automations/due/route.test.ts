@@ -106,7 +106,6 @@ describe("agent automation due scheduler API", () => {
         enabled: true,
         nextRunAt: { lte: expect.any(Date) },
         user: { accountStatus: "active" },
-        OR: [{ sessionId: null }, { session: { is: { controlGate: "open" } } }],
       },
       orderBy: { nextRunAt: "asc" },
       take: 20,
@@ -134,7 +133,6 @@ describe("agent automation due scheduler API", () => {
         enabled: true,
         nextRunAt: { lte: expect.any(Date) },
         user: { accountStatus: "active" },
-        OR: [{ sessionId: null }, { session: { is: { controlGate: "open" } } }],
       },
       data: { lastRunAt: expect.any(Date), nextRunAt: expect.any(Date) },
     })
@@ -173,35 +171,13 @@ describe("agent automation due scheduler API", () => {
     }))
   })
 
-  it("skips a linked user-paused session before claiming or creating run state", async () => {
+  it("dispatches a runtime-paused linked session", async () => {
     mocks.automationFindMany.mockResolvedValueOnce([{
       id: "automation_1", userId: "user_1", name: "Weekday Berlin SWE Scout", cron: "0 9 * * 1-5",
       timezone: "Europe/Berlin", triggerType: "weekdays", targetRoles: ["SWE"], targetLocations: ["Berlin"],
       minScore: 85, dailyCap: 8, requireApproval: true, autoApply: true, sessionId: "session_1",
     }])
-    mocks.sessionFindFirst.mockResolvedValueOnce({ id: "session_1", controlGate: "user_paused" })
-    const { POST } = await import("./route")
-
-    const res = await POST(postRequest() as never)
-
-    expect(res.status).toBe(200)
-    await expect(res.json()).resolves.toMatchObject({ started: [] })
-    expect(mocks.automationUpdateMany).not.toHaveBeenCalled()
-    expect(mocks.sessionCreate).not.toHaveBeenCalled()
-    expect(mocks.sessionUpdateMany).not.toHaveBeenCalled()
-    expect(mocks.ensureExecution).not.toHaveBeenCalled()
-    expect(mocks.turnCreate).not.toHaveBeenCalled()
-    expect(mocks.enqueueAgentRun).not.toHaveBeenCalled()
-    expect(mocks.transcriptCreate).not.toHaveBeenCalled()
-  })
-
-  it("dispatches a runtime-paused linked session when its control gate is open", async () => {
-    mocks.automationFindMany.mockResolvedValueOnce([{
-      id: "automation_1", userId: "user_1", name: "Weekday Berlin SWE Scout", cron: "0 9 * * 1-5",
-      timezone: "Europe/Berlin", triggerType: "weekdays", targetRoles: ["SWE"], targetLocations: ["Berlin"],
-      minScore: 85, dailyCap: 8, requireApproval: true, autoApply: true, sessionId: "session_1",
-    }])
-    mocks.sessionFindFirst.mockResolvedValue({ id: "session_1", status: "paused", controlGate: "open" })
+    mocks.sessionFindFirst.mockResolvedValue({ id: "session_1", status: "paused" })
     const { POST } = await import("./route")
 
     const res = await POST(postRequest() as never)
@@ -209,45 +185,10 @@ describe("agent automation due scheduler API", () => {
     expect(res.status).toBe(200)
     await expect(res.json()).resolves.toMatchObject({ started: [{ sessionId: "session_1", taskId: "task_1" }] })
     expect(mocks.sessionUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: { id: "session_1", userId: "user_1", controlGate: "open" },
+      where: { id: "session_1", userId: "user_1" },
       data: expect.objectContaining({ status: "running" }),
     }))
     expect(mocks.enqueueAgentRun).toHaveBeenCalled()
-  })
-
-  it("keeps a linked automation due when its session pauses after claim", async () => {
-    mocks.automationFindMany.mockResolvedValueOnce([{
-      id: "automation_1", userId: "user_1", name: "Weekday Berlin SWE Scout", cron: "0 9 * * 1-5",
-      timezone: "Europe/Berlin", triggerType: "weekdays", targetRoles: ["SWE"], targetLocations: ["Berlin"],
-      minScore: 85, dailyCap: 8, requireApproval: true, autoApply: true, sessionId: "session_1",
-    }])
-    mocks.sessionFindFirst
-      .mockResolvedValueOnce({ id: "session_1", controlGate: "open" })
-      .mockResolvedValueOnce({ id: "session_1", controlGate: "user_paused" })
-    const { POST } = await import("./route")
-
-    const res = await POST(postRequest() as never)
-
-    expect(res.status).toBe(200)
-    await expect(res.json()).resolves.toMatchObject({ started: [] })
-    expect(mocks.automationUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: expect.objectContaining({
-        id: "automation_1",
-        userId: "user_1",
-        OR: [{ sessionId: null }, { session: { is: { controlGate: "open" } } }],
-      }),
-      data: { lastRunAt: expect.any(Date), nextRunAt: expect.any(Date) },
-    }))
-    expect(mocks.automationUpdate).toHaveBeenCalledWith({
-      where: { id: "automation_1", userId: "user_1" },
-      data: { nextRunAt: expect.any(Date) },
-    })
-    expect(mocks.sessionCreate).not.toHaveBeenCalled()
-    expect(mocks.sessionUpdateMany).not.toHaveBeenCalled()
-    expect(mocks.ensureExecution).not.toHaveBeenCalled()
-    expect(mocks.turnCreate).not.toHaveBeenCalled()
-    expect(mocks.enqueueAgentRun).not.toHaveBeenCalled()
-    expect(mocks.transcriptCreate).not.toHaveBeenCalled()
   })
 
   it("requires the configured cron secret", async () => {

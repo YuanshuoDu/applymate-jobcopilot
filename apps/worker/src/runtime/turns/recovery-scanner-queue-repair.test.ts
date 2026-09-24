@@ -87,7 +87,7 @@ describe("queued Turn dispatch repair", () => {
       expect(update?.[1]).toEqual(expect.arrayContaining(["dispatch_1", 3, "2026-09-24 01:00:00.123456+00"]))
       const turnLock = fake.client.query.mock.calls.find(([sql]) => String(sql).includes("FOR UPDATE OF turn, session"))
       expect(turnLock?.[0]).toContain('turn."status" = \'queued\' AND turn."leaseOwnerId" IS NULL')
-      expect(turnLock?.[0]).toContain('session."controlGate" = \'open\'')
+      expect(turnLock?.[0]).not.toContain('controlGate')
     },
   )
 

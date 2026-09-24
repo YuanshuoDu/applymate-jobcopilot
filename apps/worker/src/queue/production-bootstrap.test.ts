@@ -227,8 +227,8 @@ function durableCompositionPool(input: {
       const statement = sql.trim()
       if (statement === "BEGIN" || statement === "COMMIT" || statement === "ROLLBACK" || sql.includes("set_config")) return response<T>([], 1)
 
-      if (sql.includes('SELECT session."userId", session."controlGate"')) {
-        return response<T>(state.session.status === "running" ? [{ userId: state.session.userId, controlGate: "open" }] : [], state.session.status === "running" ? 1 : 0)
+      if (sql.includes('SELECT session."userId"')) {
+        return response<T>(state.session.status === "running" ? [{ userId: state.session.userId }] : [], state.session.status === "running" ? 1 : 0)
       }
       if (sql.includes('SELECT session."id" FROM "agent_sessions"')) {
         return response<T>(state.session.status === "running" ? [{ id: state.session.id }] : [], state.session.status === "running" ? 1 : 0)

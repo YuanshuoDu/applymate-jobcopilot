@@ -6,7 +6,6 @@ import { normalizeTimelineEvent, normalizeTimelineItem } from './timeline-event-
 import { reduceTimelineDelta, questionTerminalItem, upsertTimelineItem } from './timeline-reducer-items'
 import { appendFallbackEvent, appendTimelineEvent, isAfter, isRecord, itemFromTimelineEvent } from './timeline-reducer-utils'
 import { reduceTimelineSteeringMarkers, STEERING_MARKER_EVENT_TYPE, STEERING_MARKER_MAX_EVENTS, type TimelineSteeringMarkerEvent, type TimelineSteeringMarkerState } from './timeline-steering-markers'
-import { isSessionControlEventCandidate, parseTimelineSessionControl, reduceTimelineSessionControl, type TimelineSessionControlEvent } from './timeline-session-control'
 import type { TimelineEvent, TimelineItem, TimelineState } from './timeline-reducer'
 
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'interrupted'])
@@ -37,9 +36,6 @@ function isLifecycleEvent(event: TimelineEvent): boolean {
 export function reduceTimelineEvent(state: TimelineState, value: unknown): TimelineState {
   if (isRecord(value) && (value.type === 'question.answered' || value.type === 'question.cancelled')) return reduceQuestionTerminalEvent(state, value)
   if (isRecord(value) && isApprovalLedgerEventType(value.type)) return reduceApprovalEvent(state, value)
-  const sessionControl = parseTimelineSessionControl(value, state.sessionId)
-  if (sessionControl) return reduceSessionControlEvent(state, sessionControl)
-  if (isSessionControlEventCandidate(value)) return state
   const event = normalizeTimelineEvent(value)
   if (!event || event.sessionId !== state.sessionId || state.processedEventIds[event.id]) return state
   const markerState = event.type === STEERING_MARKER_EVENT_TYPE ? reduceMarkerEvent(state, event) : null
@@ -116,17 +112,6 @@ function reduceApprovalEvent(state: TimelineState, value: Record<string, unknown
     lastEventId: event.id,
     lifecycleRevision: isLifecycleEvent(event) ? state.lifecycleRevision + 1 : state.lifecycleRevision,
     approvalLedger,
-  }
-}
-
-function reduceSessionControlEvent(state: TimelineState, event: TimelineSessionControlEvent): TimelineState {
-  if (state.processedEventIds[event.id] || !isAfter(event.sequence, state.lastSequence)) return state
-  return {
-    ...state,
-    processedEventIds: { ...state.processedEventIds, [event.id]: true },
-    lastEventId: event.id,
-    lastSequence: event.sequence,
-    sessionControl: reduceTimelineSessionControl(state.sessionControl, event),
   }
 }
 

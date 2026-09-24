@@ -21,7 +21,7 @@ function item(content: Record<string, unknown>, overrides: Partial<TimelineItem>
 }
 
 function props(items: readonly TimelineItem[], overrides: Record<string, unknown> = {}) {
-  return { sessionId: 'session-1', items, turns, controlGate: 'open' as const, onAccepted: () => undefined, ...overrides }
+  return { sessionId: 'session-1', items, turns, onAccepted: () => undefined, ...overrides }
 }
 
 const pendingContent = { waitKind: 'question', questionId: 'opaque-question', stage: 'profile', question: 'Choose a safe option?', options: [{ value: 'opaque-option', label: 'Yes' }], answerAvailable: false, pending: true }
@@ -58,11 +58,12 @@ describe('AgentQuestionInputCard', () => {
     expect(renderToStaticMarkup(<I18nProvider><AgentQuestionInputCard {...props([item({ ...pendingContent, oauth: true })])} /></I18nProvider>)).toBe('')
   })
 
-  it('disables pending controls while paused or when the session Turn is unavailable', () => {
-    const pausedHtml = renderToStaticMarkup(<I18nProvider><AgentQuestionInputCard {...props([item(pendingContent)], { controlGate: 'user_paused' })} /></I18nProvider>)
-    expect(pausedHtml.match(/disabled=""/g)).toHaveLength(2)
-    expect(pausedHtml).toContain(translate('en', 'agent.question.resumeFirst'))
+  it('keeps pending option selection available and disables actions when the session Turn is unavailable', () => {
+    const availableHtml = renderToStaticMarkup(<I18nProvider><AgentQuestionInputCard {...props([item(pendingContent)])} /></I18nProvider>)
+    expect(availableHtml.match(/disabled=""/g)).toHaveLength(1)
+    expect(availableHtml).not.toContain('Resume the session first.')
     const unavailableHtml = renderToStaticMarkup(<I18nProvider><AgentQuestionInputCard {...props([item(pendingContent)], { turns: [] })} /></I18nProvider>)
+    expect(unavailableHtml.match(/disabled=""/g)).toHaveLength(2)
     expect(unavailableHtml).toContain(translate('en', 'agent.question.turnUnavailable'))
   })
 })

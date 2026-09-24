@@ -24,8 +24,8 @@ export {
 } from './common.js'
 export type { Actor } from './common.js'
 
-export { AgentSessionSchema, SessionControlGateSchema, SessionSourceSchema, SessionStatusSchema } from './session.js'
-export type { AgentSession, SessionControlGate, SessionSource, SessionStatus } from './session.js'
+export { AgentSessionSchema, SessionSourceSchema, SessionStatusSchema } from './session.js'
+export type { AgentSession, SessionSource, SessionStatus } from './session.js'
 export { AgentTurnSchema, TurnSourceSchema, TurnStatusSchema } from './turn.js'
 export type { AgentTurn, TurnSource, TurnStatus } from './turn.js'
 export { AgentStepSchema, AgentStepUsageSchema, StepStatusSchema } from './step.js'
@@ -51,8 +51,8 @@ export {
   ToolResultItemSchema,
 } from './item.js'
 export type { AgentItem, AgentMessageItem, AgentMessagePhase, GenericItem, ItemStatus, ToolCallItem, ToolResultItem } from './item.js'
-export { AgentEventEnvelopeSchema, AgentEventTypeSchema, KnownAgentEventEnvelopeSchema, isKnownAgentEventType, SessionControlEventPayloadSchema, SessionControlEventTypeSchema } from './event.js'
-export type { AgentEventEnvelope, AgentEventType, KnownAgentEventEnvelope, SessionControlEventPayload, SessionControlEventType } from './event.js'
+export { AgentEventEnvelopeSchema, AgentEventTypeSchema, KnownAgentEventEnvelopeSchema, isKnownAgentEventType } from './event.js'
+export type { AgentEventEnvelope, AgentEventType, KnownAgentEventEnvelope } from './event.js'
 export type {
   AgentEventRecord,
   AgentItemRecord,

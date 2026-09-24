@@ -33,11 +33,6 @@ export type ParsedRetryCommand = {
   expectedRevision: number | null
 }
 
-export type ParsedSessionControlCommand = {
-  clientMessageId: string
-  expectedRevision: number | null
-}
-
 type RecordBody = Record<string, unknown>
 
 function isRecord(value: unknown): value is RecordBody {
@@ -178,17 +173,6 @@ export function parseRetryBody(body: unknown, request: Request): ParsedRetryComm
   const clientMessageId = commandId(body, request)
   const expectedRevision = optionalRevision(body.expectedRevision)
   if (!clientMessageId || expectedRevision === undefined) return invalid("Invalid retry command payload")
-  return { clientMessageId, expectedRevision }
-}
-
-export function parseSessionControlBody(body: unknown, request: Request): ParsedSessionControlCommand | NextResponse {
-  if (!isRecord(body) || !isAllowedKeys(body, ["schemaVersion", "clientMessageId", "expectedRevision"])) {
-    return invalid("Unsupported or forbidden session control field")
-  }
-  if (body.schemaVersion !== undefined && body.schemaVersion !== schemaVersion) return invalid("Unsupported command schema version")
-  const clientMessageId = commandId(body, request)
-  const expectedRevision = optionalRevision(body.expectedRevision)
-  if (!clientMessageId || expectedRevision === undefined) return invalid("Invalid session control command payload")
   return { clientMessageId, expectedRevision }
 }
 

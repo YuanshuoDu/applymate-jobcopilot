@@ -3,7 +3,7 @@ import type { AgentEventRecord, Actor, RepositoryJsonValue } from "@jobcopilot/a
 export type AgentEventRow = {
   id: string
   sessionId: string
-  turnId: string | null
+  turnId: string
   itemId: string | null
   taskId: string | null
   sequence: bigint | string | number
@@ -19,7 +19,7 @@ export type AgentEventRow = {
 export type AgentEventOutboxPayload = {
   eventId: string
   sessionId: string
-  turnId?: string | null
+  turnId?: string
   itemId?: string | null
   taskId?: string | null
   sequence?: string
@@ -72,7 +72,7 @@ export function parseAgentEventOutboxPayload(value: unknown): AgentEventOutboxPa
   if (!hasOwn(row, "eventId") || !hasOwn(row, "sessionId") || !nonEmpty(row.eventId) || !nonEmpty(row.sessionId)) return null
   const result: AgentEventOutboxPayload = { eventId: row.eventId, sessionId: row.sessionId }
   if (hasOwn(row, "turnId")) {
-    if (!nullableId(row.turnId)) return null
+    if (!nonEmpty(row.turnId)) return null
     result.turnId = row.turnId
   }
   if (hasOwn(row, "itemId")) {
@@ -119,7 +119,7 @@ export function toCanonicalAgentEvent(row: AgentEventRow): AgentEventRecord | nu
   const parsedSequence = sequence(row.sequence)
   const payload = parseJson(row.payload)
   const createdAt = row.createdAt instanceof Date ? row.createdAt.toISOString() : row.createdAt
-  if (!nonEmpty(row.id) || !nonEmpty(row.sessionId) || !nullableId(row.turnId) || !nullableId(row.itemId) || !nullableId(row.taskId)
+  if (!nonEmpty(row.id) || !nonEmpty(row.sessionId) || !nonEmpty(row.turnId) || !nullableId(row.itemId) || !nullableId(row.taskId)
     || parsedSequence === null || !nonEmpty(row.type) || typeof row.actor !== "string" || !ACTORS.has(row.actor as Actor)
     || !nonEmpty(row.correlationId) || !nullableId(row.causationId) || !nullableId(row.idempotencyKey) || !jsonValue(payload)
     || typeof createdAt !== "string" || !Number.isFinite(new Date(createdAt).getTime())) return null

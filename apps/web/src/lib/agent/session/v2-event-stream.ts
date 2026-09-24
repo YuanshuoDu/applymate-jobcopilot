@@ -20,7 +20,7 @@ const MAX_DELTA_ENTRY_BYTES = 128 * 1024
 type DurableEventRow = {
   id: string
   sessionId: string
-  turnId: string | null
+  turnId: string
   itemId: string | null
   taskId: string | null
   sequence: bigint

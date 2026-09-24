@@ -14,7 +14,6 @@ type RepairCandidate = {
   rootStatus?: string
   turnStatus?: string
   sessionStatus?: string
-  controlGate?: string
   interruptRequestedAt?: string | null
   attemptCount?: number
   maxAttempts?: number
@@ -51,7 +50,6 @@ function staleCandidateEligible(candidate: StaleCandidate): boolean {
     && candidate.interruptRequestedAt == null && (candidate.attemptCount ?? 0) < (candidate.maxAttempts ?? 3)
     && !terminal.has(candidate.rootStatus ?? "running") && !terminal.has(candidate.turnStatus ?? "in_progress")
     && candidate.sessionStatus !== "aborted" && candidate.sessionStatus !== "archived" && candidate.publishedAt !== null
-    && (candidate.controlGate ?? "open") === "open"
     && candidate.publishedAt !== undefined && candidate.updatedAt !== undefined && candidate.publishedAt < candidate.updatedAt
     && candidate.scopeValid !== false
     && candidate.topic === "agent.subagent.dispatch" && candidate.aggregateId === candidate.sessionId
@@ -124,8 +122,8 @@ describe("stale subagent dispatch recovery", () => {
     await expect(repairStaleSubagentDispatches(fake.pool, "recovery-worker")).resolves.toBe(1)
   })
 
-  it("keeps runtime-paused sessions recoverable when the user gate is open", async () => {
-    const fake = staleRepairPool({ candidate: staleCandidate({ sessionStatus: "paused", controlGate: "open" }) })
+  it("keeps runtime-paused sessions recoverable", async () => {
+    const fake = staleRepairPool({ candidate: staleCandidate({ sessionStatus: "paused" }) })
     await expect(repairStaleSubagentDispatches(fake.pool, "recovery-worker")).resolves.toBe(1)
   })
 
@@ -148,8 +146,8 @@ describe("stale subagent dispatch recovery", () => {
     expect(fake.calls[taskIndex]?.[0]).toContain('task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP')
     expect(fake.calls[taskIndex]?.[0]).toContain('task."interruptRequestedAt" IS NULL')
     expect(fake.calls[taskIndex]?.[0]).toContain('dispatch."publishedAt" < task."updatedAt"')
-    expect(fake.calls[sessionIndex]?.[0]).toContain('session."controlGate" = \'open\'')
-    expect(fake.calls[taskIndex]?.[0]).toContain('session."controlGate" = \'open\'')
+    expect(fake.calls[sessionIndex]?.[0]).not.toContain('controlGate')
+    expect(fake.calls[taskIndex]?.[0]).not.toContain('controlGate')
     expect(fake.calls[tenantIndex]?.[1]).toEqual(["user-1"])
     expect(fake.calls[updateIndex]?.[0]).toContain('dispatch."idempotencyKey" = $4')
     expect(fake.calls[updateIndex]?.[0]).toContain('dispatch."aggregateId" = $5')
@@ -170,7 +168,7 @@ describe("stale subagent dispatch recovery", () => {
     ["running task", { status: "running" }], ["never-started task", { startedAt: false }], ["leased task", { leaseOwner: "other-worker" }],
     ["expiring lease", { leaseExpiresAt: "2026-09-14T00:00:01.000Z" }], ["interrupted task", { interruptRequestedAt: "2026-09-14T00:00:01.000Z" }],
     ["attempt exhausted", { attemptCount: 3, maxAttempts: 3 }], ["terminal root", { rootStatus: "completed" }],
-    ["terminal turn", { turnStatus: "closed" }], ["user-paused session", { controlGate: "user_paused" }], ["closed session", { sessionStatus: "archived" }],
+    ["terminal turn", { turnStatus: "closed" }], ["closed session", { sessionStatus: "archived" }],
     ["fresh dispatch", { publishedAt: new Date("2026-09-15T00:00:00.000Z") }], ["wrong topic", { topic: "agent.other" }],
     ["wrong key", { key: "subagent-dispatch:other-task" }], ["wrong aggregate", { aggregateId: "other-session" }],
     ["cross-scope task lineage", { scopeValid: false }],

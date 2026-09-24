@@ -4,7 +4,6 @@ import React, { useCallback, useEffect, useRef, useState } from 'react'
 
 import { useI18n } from '@/lib/i18n'
 
-import type { TimelineSessionControlGate } from './timeline-session-control'
 import type { SupervisorTurnSummary } from './task-tree-projection'
 
 const RETRYABLE_STATUSES = new Set(['failed', 'interrupted', 'cancelled'])
@@ -12,7 +11,6 @@ const RETRYABLE_STATUSES = new Set(['failed', 'interrupted', 'cancelled'])
 export interface AgentTurnRetryControlProps {
   readonly sessionId: string
   readonly turn: SupervisorTurnSummary | null
-  readonly controlGate: TimelineSessionControlGate
   readonly onAccepted: () => void
 }
 
@@ -75,7 +73,7 @@ export async function postAgentTurnRetry(
   return parseAgentTurnRetryResult(body)
 }
 
-export function AgentTurnRetryControl({ sessionId, turn, controlGate, onAccepted }: AgentTurnRetryControlProps) {
+export function AgentTurnRetryControl({ sessionId, turn, onAccepted }: AgentTurnRetryControlProps) {
   const { t } = useI18n()
   const [pending, setPending] = useState(false)
   const [feedback, setFeedback] = useState<'accepted' | 'failed' | null>(null)
@@ -95,9 +93,8 @@ export function AgentTurnRetryControl({ sessionId, turn, controlGate, onAccepted
     setFeedback(null)
   }, [selectionKey])
 
-  const paused = controlGate === 'user_paused'
   const handleRetry = useCallback(() => {
-    if (pending || paused || !turn) return
+    if (pending || !turn) return
     const requestEpoch = requestEpochRef.current
     const requestSelectionKey = selectionKey
     const clientMessageId = createAgentTurnRetryMessageId()
@@ -118,7 +115,7 @@ export function AgentTurnRetryControl({ sessionId, turn, controlGate, onAccepted
     }).finally(() => {
       if (isCurrentAgentTurnRetryRequest(requestEpochRef.current, requestEpoch, selectionKey, requestSelectionKey)) setPending(false)
     })
-  }, [onAccepted, paused, pending, selectionKey, sessionId, turn])
+  }, [onAccepted, pending, selectionKey, sessionId, turn])
 
   if (!isRetryableRootTurn(turn)) return null
 
@@ -127,13 +124,12 @@ export function AgentTurnRetryControl({ sessionId, turn, controlGate, onAccepted
       <button
         type="button"
         onClick={handleRetry}
-        disabled={pending || paused}
+        disabled={pending}
         aria-label={t('agent.retry')}
-        style={{ ...buttonStyle, opacity: pending || paused ? 0.68 : 1 }}
+        style={{ ...buttonStyle, opacity: pending ? 0.68 : 1 }}
       >
         {pending ? t('agent.retrying') : t('agent.retry')}
       </button>
-      {paused && <p role="status" aria-live="polite" data-agent-turn-retry-paused="true" style={hintStyle}>{t('agent.retryPaused')}</p>}
       {feedback === 'accepted' && <p role="status" aria-live="polite" data-agent-turn-retry-status="accepted" style={hintStyle}>{t('agent.retryAccepted')}</p>}
       {feedback === 'failed' && <p role="alert" data-agent-turn-retry-error="true" style={errorStyle}>{t('agent.retryFailed')}</p>}
     </section>

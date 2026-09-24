@@ -8,7 +8,6 @@ import type { CognitiveAgendaView } from './cognitive-agenda-view'
 import { createTimelineState, selectTimelineItems, timelineReducer, type TimelineConnection, type TimelineItem, type TimelineState } from './timeline-reducer'
 import type { TimelineCognitiveAgendaEntry } from './timeline-cognitive-agenda'
 import type { TimelineSteeringMarkerState } from './timeline-steering-markers'
-import type { TimelineSessionControlGate } from './timeline-session-control'
 
 export type AgentCognitiveAgendaSnapshot = CognitiveAgendaView & {
   readonly steeringMarkers?: TimelineSteeringMarkerState
@@ -19,9 +18,6 @@ export interface AgentTimelineSnapshot {
   readonly items: readonly TimelineItem[]
   readonly lastEventId: string | null
   readonly lifecycleRevision: number
-  readonly controlGate: TimelineSessionControlGate
-  readonly controlRevision: number
-  readonly pausedAt: string | null
   readonly cognitiveAgenda: AgentCognitiveAgendaSnapshot | null
   readonly cognitiveAgendas: readonly TimelineCognitiveAgendaEntry[]
   readonly approvalLedger: ReturnType<typeof selectApprovalLedgerProjection>
@@ -85,9 +81,6 @@ export function useAgentTimeline(sessionId: string | null): AgentTimelineSnapsho
     items,
     lastEventId: sessionMatches ? state.lastEventId : null,
     lifecycleRevision: sessionMatches ? state.lifecycleRevision : 0,
-    controlGate: sessionMatches ? state.sessionControl.controlGate : 'open',
-    controlRevision: sessionMatches ? state.sessionControl.controlRevision : 0,
-    pausedAt: sessionMatches ? state.sessionControl.pausedAt : null,
     cognitiveAgenda,
     cognitiveAgendas: sessionMatches ? state.cognitiveAgenda.scoped : [],
     approvalLedger: sessionMatches ? selectApprovalLedgerProjection(state.approvalLedger) : { sessionId: sessionId ?? 'draft', approvals: [], pending: [], pendingActions: [], currentPending: null, pendingCount: 0 },
@@ -95,5 +88,5 @@ export function useAgentTimeline(sessionId: string | null): AgentTimelineSnapsho
     connection: sessionMatches ? state.connection : 'idle',
     restoring: sessionMatches ? restoring : Boolean(sessionId),
     error: sessionMatches ? error : null,
-  }), [sessionId, items, sessionMatches, state.lastEventId, state.sessionControl.controlGate, state.sessionControl.controlRevision, state.sessionControl.pausedAt, state.connection, state.steeringMarkers, state.cognitiveAgenda.scoped, state.approvalLedger, cognitiveAgenda, restoring, error])
+  }), [sessionId, items, sessionMatches, state.lastEventId, state.connection, state.steeringMarkers, state.cognitiveAgenda.scoped, state.approvalLedger, cognitiveAgenda, restoring, error])
 }

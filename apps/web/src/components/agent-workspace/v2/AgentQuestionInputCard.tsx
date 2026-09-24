@@ -7,14 +7,12 @@ import { useI18n } from '@/lib/i18n'
 import { createAgentQuestionMessageId, isCurrentAgentQuestionRequest, postAgentQuestionAnswer, type QuestionActionResult } from './question-action'
 import { parseQuestionInputItem, type QuestionInputOption, type QuestionInputProjection, type QuestionInputStatus } from './question-input-parser'
 import type { TimelineItem } from './timeline-reducer'
-import type { TimelineSessionControlGate } from './timeline-session-control'
 import type { SupervisorTurnSummary } from './task-tree-projection'
 
 export interface AgentQuestionInputCardProps {
   readonly sessionId: string
   readonly items: readonly TimelineItem[]
   readonly turns: readonly SupervisorTurnSummary[]
-  readonly controlGate: TimelineSessionControlGate
   readonly onAccepted: () => void
   readonly selectionKey?: string
 }
@@ -29,7 +27,7 @@ const STATUS_KEYS: Record<Exclude<QuestionInputStatus, 'pending'>, string> = {
 }
 
 /** Renders canonical question waits and sends answers through the Broker only. */
-export function AgentQuestionInputCard({ sessionId, items, turns, controlGate, onAccepted, selectionKey: externalSelectionKey = '' }: AgentQuestionInputCardProps) {
+export function AgentQuestionInputCard({ sessionId, items, turns, onAccepted, selectionKey: externalSelectionKey = '' }: AgentQuestionInputCardProps) {
   const { t } = useI18n()
   const [answers, setAnswers] = useState<StringById>({})
   const [submitting, setSubmitting] = useState<BooleanById>({})
@@ -80,17 +78,16 @@ export function AgentQuestionInputCard({ sessionId, items, turns, controlGate, o
     <section data-agent-question-card="true" aria-label={t('agent.question.title')} style={cardStyle}>
       <div style={headingStyle}><strong>{t('agent.question.title')}</strong><span style={mutedStyle}>{t('agent.question.serverOwned')}</span></div>
       <div style={rowsStyle}>
-        {questions.map(question => <QuestionRow key={question.questionId} question={question} sessionId={sessionId} turns={turns} controlGate={controlGate} answer={answers[question.questionId] ?? ''} submitting={Boolean(submitting[question.questionId])} feedback={feedback[question.questionId]} onOption={(option: QuestionInputOption) => setAnswers(current => ({ ...current, [question.questionId]: option.value }))} onText={(answer: string) => setAnswers(current => ({ ...current, [question.questionId]: answer }))} onAnswer={handleAnswer} t={t} />)}
+        {questions.map(question => <QuestionRow key={question.questionId} question={question} sessionId={sessionId} turns={turns} answer={answers[question.questionId] ?? ''} submitting={Boolean(submitting[question.questionId])} feedback={feedback[question.questionId]} onOption={(option: QuestionInputOption) => setAnswers(current => ({ ...current, [question.questionId]: option.value }))} onText={(answer: string) => setAnswers(current => ({ ...current, [question.questionId]: answer }))} onAnswer={handleAnswer} t={t} />)}
       </div>
     </section>
   )
 }
 
-function QuestionRow({ question, sessionId, turns, controlGate, answer, submitting, feedback, onOption, onText, onAnswer, t }: {
+function QuestionRow({ question, sessionId, turns, answer, submitting, feedback, onOption, onText, onAnswer, t }: {
   readonly question: QuestionInputProjection
   readonly sessionId: string
   readonly turns: readonly SupervisorTurnSummary[]
-  readonly controlGate: TimelineSessionControlGate
   readonly answer: string
   readonly submitting: boolean
   readonly feedback: Feedback | undefined
@@ -101,15 +98,13 @@ function QuestionRow({ question, sessionId, turns, controlGate, answer, submitti
 }) {
   const expectedRevision = turnRevision(turns, sessionId, question.turnId)
   if (question.status !== 'pending') return <div data-agent-question-row="true" style={rowStyle}><p style={questionStyle}>{question.question}</p><span style={mutedStyle}>{t(STATUS_KEYS[question.status])}</span></div>
-  const paused = controlGate === 'user_paused'
   const unavailable = expectedRevision === null
-  const disabled = submitting || paused || unavailable || !answer.trim() || feedback === 'accepted' || feedback === 'duplicate'
+  const disabled = submitting || unavailable || !answer.trim() || feedback === 'accepted' || feedback === 'duplicate'
   return (
     <div data-agent-question-row="true" style={rowStyle}>
       <p style={questionStyle}>{question.question}</p>
-      {question.options.length > 0 ? <div style={optionsStyle}>{question.options.map(option => <button key={option.value} type="button" aria-pressed={answer === option.value} onClick={() => onOption(option)} disabled={submitting || paused || unavailable || feedback === 'accepted' || feedback === 'duplicate'} style={{ ...optionStyle, fontWeight: answer === option.value ? 700 : 400 }}>{option.label}</button>)}</div> : <input type="text" aria-label={question.question} placeholder={t('agent.question.freeTextPlaceholder')} maxLength={20_000} value={answer} onChange={event => onText(event.target.value)} disabled={submitting || paused || unavailable || feedback === 'accepted' || feedback === 'duplicate'} style={inputStyle} />}
+      {question.options.length > 0 ? <div style={optionsStyle}>{question.options.map(option => <button key={option.value} type="button" aria-pressed={answer === option.value} onClick={() => onOption(option)} disabled={submitting || unavailable || feedback === 'accepted' || feedback === 'duplicate'} style={{ ...optionStyle, fontWeight: answer === option.value ? 700 : 400 }}>{option.label}</button>)}</div> : <input type="text" aria-label={question.question} placeholder={t('agent.question.freeTextPlaceholder')} maxLength={20_000} value={answer} onChange={event => onText(event.target.value)} disabled={submitting || unavailable || feedback === 'accepted' || feedback === 'duplicate'} style={inputStyle} />}
       <button type="button" disabled={disabled} onClick={() => expectedRevision !== null && onAnswer(question, answer, expectedRevision)} style={{ ...answerButtonStyle, opacity: disabled ? 0.68 : 1 }}>{submitting ? t('agent.question.submitting') : t('agent.question.answer')}</button>
-      {paused && <p role="status" aria-live="polite" style={hintStyle}>{t('agent.question.resumeFirst')}</p>}
       {unavailable && <p role="status" aria-live="polite" style={hintStyle}>{t('agent.question.turnUnavailable')}</p>}
       {feedback === 'accepted' && <p role="status" aria-live="polite" style={hintStyle}>{t('agent.question.accepted')}</p>}
       {feedback === 'duplicate' && <p role="status" aria-live="polite" style={hintStyle}>{t('agent.question.duplicate')}</p>}

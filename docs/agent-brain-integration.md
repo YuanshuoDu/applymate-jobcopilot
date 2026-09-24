@@ -1,6 +1,6 @@
 # Canonical Agent execution and supervision
 
-Status: implementation evidence for [#495](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/495), tracked in Draft [PR #497](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/497).
+Status: implementation evidence for [#495](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/495), tracked in [PR #497](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/497).
 Baseline: `e484bd5cb1a8982c0c0ba3aa3af1eb4442588438`.
 
 ## Product outcome
@@ -48,9 +48,7 @@ The root Turn's `maxSteps` and `maxToolCalls` ceilings apply across the root and
 
 ## Persistence changes
 
-This scope includes the additive migrations needed by the accepted execution, recovery, and supervision contracts: private tool-result references and durable waits, tree-budget reservations, child retry eligibility, session control state, and nullable Turn scope on session events. They require migration source and CI/disposable-database evidence only; no shared or production migration was applied.
-
-Session pause/resume events have no Turn owner, so the shared `agent-protocol` event envelope and repository types narrowly permit a null `turnId` for those events. This is the contract prerequisite for the session-control gate and is not a general protocol-version expansion.
+This scope includes the additive migrations needed by the accepted execution, recovery, and supervision contracts: private tool-result references and durable waits, tree-budget reservations, mailbox hydration checkpoints, and child retry eligibility. They require migration source and CI/disposable-database evidence only; no shared or production migration was applied. Session pause/resume state, routes, UI, and their event protocol are excluded because the #495 acceptance criteria do not require session controls; they remain a separate follow-up.
 
 Private results bind owner, session, Turn, step, Task, and tool-call identity. Wait records bind an immutable child target set and parent scope to a durable outcome and dispatch intent. Public task and timeline DTOs do not expose these private records.
 
@@ -71,4 +69,4 @@ The CI disposable PostgreSQL/RLS test runs under a dedicated non-owner role with
 
 ## Split follow-up work
 
-The detailed upgrade plan and excluded implementation are preserved on the [scoped harness follow-up branch](https://github.com/YuanshuoDu/applymate-jobcopilot/tree/codex/ah2-harness-followups). P3 planning and Plan Ledger, context-compaction snapshots, and Gmail integration are outside PR #497 and should be reviewed as separate work.
+The detailed upgrade plan and excluded implementation are preserved on the [scoped harness follow-up branch](https://github.com/YuanshuoDu/applymate-jobcopilot/tree/codex/ah2-harness-followups). P3 planning and Plan Ledger, context-compaction snapshots, Gmail integration, and session pause/resume controls are outside PR #497 and should be reviewed as separate work.

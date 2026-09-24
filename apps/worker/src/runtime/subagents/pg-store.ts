@@ -13,7 +13,7 @@ import {
   type SubagentPolicy,
 } from "./types.js"
 import { computeSubagentNextAttemptAt } from "./retry-policy.js"
-import { isSessionControlGate, RUNNABLE_SESSION } from "../session-gate.js"
+import { RUNNABLE_SESSION } from "../session-gate.js"
 import { createSubagentTask, lockSubagentSession, readSubagentTask } from "./pg-store-create.js"
 import {
   dateValue,
@@ -78,11 +78,11 @@ export class PgSubagentTaskStore implements SubagentStore {
 
   async claim(input: { taskId: string; sessionId: string; ownerId: string; policy: SubagentPolicy; now: Date }): Promise<SubagentTaskRecord | null> {
     return transaction(this.pool, async (client) => {
-      const session = await client.query<{ id: string; status: string; controlGate: unknown }>(`SELECT session."id", session."status", session."controlGate" FROM "agent_sessions" AS session
+      const session = await client.query<{ id: string; status: string }>(`SELECT session."id", session."status" FROM "agent_sessions" AS session
         WHERE session."id" = $1 AND ${RUNNABLE_SESSION} FOR UPDATE`, [input.sessionId])
       const sessionRow = session.rows[0]
       const sessionStatus = String(sessionRow?.status ?? "")
-      if (!sessionRow || sessionStatus === "aborted" || sessionStatus === "archived" || !isSessionControlGate(sessionRow.controlGate) || sessionRow.controlGate !== "open") return null
+      if (!sessionRow || sessionStatus === "aborted" || sessionStatus === "archived") return null
       const running = await client.query(`SELECT COUNT(*)::int AS "count" FROM "sub_agent_tasks"
         WHERE "sessionId" = $1 AND "status" = 'running' AND "leaseExpiresAt" > CURRENT_TIMESTAMP`, [input.sessionId])
       if (Number(running.rows[0]?.count ?? 0) >= input.policy.maxConcurrency) return null

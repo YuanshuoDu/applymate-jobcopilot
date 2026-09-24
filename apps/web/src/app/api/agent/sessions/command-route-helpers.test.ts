@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { MAX_COMMAND_BODY_BYTES, parseForkBody, parseInterruptBody, parseMessageBody, parseRetryBody, parseSessionControlBody } from "./command-route-helpers"
+import { MAX_COMMAND_BODY_BYTES, parseForkBody, parseInterruptBody, parseMessageBody, parseRetryBody } from "./command-route-helpers"
 
 function request(body: unknown, headers: HeadersInit = {}) {
   return new Request("http://localhost/api/agent/sessions/session_1/messages", {
@@ -62,15 +62,4 @@ describe("agent command route boundaries", () => {
     expect(parseRetryBody({ clientMessageId: "retry_4", schemaVersion: "agent-harness.v0" }, request({}))).toBeInstanceOf(Response)
   })
 
-  it("parses pause and resume identity with strict fields and matching headers", async () => {
-    expect(parseSessionControlBody({ clientMessageId: "pause_1", expectedRevision: 2 }, request({}))).toEqual({ clientMessageId: "pause_1", expectedRevision: 2 })
-    expect(parseSessionControlBody({ expectedRevision: null }, request({}, { "idempotency-key": "resume_1" }))).toEqual({ clientMessageId: "resume_1", expectedRevision: null })
-    const forbidden = parseSessionControlBody({ clientMessageId: "pause_2", userId: "other" }, request({}))
-    expect(forbidden).toBeInstanceOf(Response)
-    await expect((forbidden as Response).json()).resolves.toMatchObject({ error: { code: "invalid_command" } })
-    const mismatch = parseSessionControlBody({ clientMessageId: "pause_3" }, request({}, { "idempotency-key": "other" }))
-    expect(mismatch).toBeInstanceOf(Response)
-    const wrongVersion = parseSessionControlBody({ clientMessageId: "pause_4", schemaVersion: "agent-harness.v0" }, request({}))
-    expect(wrongVersion).toBeInstanceOf(Response)
-  })
 })

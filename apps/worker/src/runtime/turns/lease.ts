@@ -1,6 +1,6 @@
 import type pg from "pg"
 
-import { isSessionControlGate, OPEN_SESSION, RUNNABLE_SESSION } from "../session-gate.js"
+import { OPEN_SESSION, RUNNABLE_SESSION } from "../session-gate.js"
 
 /** Normal owner window. A scanner reclaims the Turn after this expires. */
 export const TURN_LEASE_WINDOW_MS = 60_000
@@ -80,8 +80,8 @@ async function lockOpenSession(client: pg.PoolClient, sessionId: string, userId:
 }
 
 async function lockClaimSession(client: pg.PoolClient, payload: TurnJobPayload): Promise<string | null> {
-  const result = await client.query<{ userId: string; controlGate: unknown }>(
-    `SELECT session."userId", session."controlGate"
+  const result = await client.query<{ userId: string }>(
+    `SELECT session."userId"
      FROM "agent_sessions" AS session
      WHERE session."id" = $1 AND ${RUNNABLE_SESSION}
        AND EXISTS (
@@ -92,9 +92,8 @@ async function lockClaimSession(client: pg.PoolClient, payload: TurnJobPayload):
     [payload.sessionId, payload.turnId],
   )
   const row = result.rows[0]
-  const controlGate = row?.controlGate
-  if ((!row && result.rowCount !== 1) || (row && ((result.rowCount !== undefined && result.rowCount !== 1) || (controlGate !== undefined && (!isSessionControlGate(controlGate) || controlGate !== "open"))))) {
-    throw new LeaseUnavailable("Turn session is not runnable")
+  if ((!row && result.rowCount !== 1) || (row && result.rowCount !== undefined && result.rowCount !== 1)) {
+    throw new LeaseUnavailable("Turn session is no longer open")
   }
   return row?.userId ?? null
 }

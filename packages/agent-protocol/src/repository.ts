@@ -60,7 +60,7 @@ export interface AgentItemRecord {
 export interface AgentEventRecord<TPayload extends RepositoryJsonValue = RepositoryJsonValue> {
   id: string
   sessionId: string
-  turnId: string | null
+  turnId: string
   itemId: string | null
   taskId: string | null
   sequence: bigint
@@ -114,7 +114,7 @@ export interface UpdateItemInput {
 export interface AppendEventInput<TPayload extends RepositoryJsonValue = RepositoryJsonValue> {
   id: string
   sessionId: string
-  turnId: string | null
+  turnId: string
   itemId: string | null
   taskId: string | null
   type: AgentEventType | string

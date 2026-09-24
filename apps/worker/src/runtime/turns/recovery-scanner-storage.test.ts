@@ -19,13 +19,13 @@ function fakePool(handler: (sql: string, params?: unknown[]) => { rows?: unknown
 const payload: TurnJobPayload = { turnId: "turn-1", sessionId: "session-1", ownerId: "owner-1" }
 
 describe("recovery scanner persistence helpers", () => {
-  it("locks a runnable session and verifies Turn lineage before persisting a reset dispatch", async () => {
+  it("locks an open session and verifies Turn lineage before persisting a reset dispatch", async () => {
     const fake = fakePool(() => ({ rows: [{ id: "turn-1" }], rowCount: 1 }))
     await persistTurnDispatch(fake.pool, payload, true)
 
     const sql = fake.calls.map(([text]) => text)
     expect(sql[0]).toBe("BEGIN")
-    expect(sql[1]).toContain('session."controlGate" = \'open\'')
+    expect(sql[1]).toContain('session."status" NOT IN (\'aborted\', \'archived\')')
     expect(sql[2]).toContain('session."userId" = turn."userId"')
     expect(sql[3]).toContain('WHERE "agent_outbox"."topic" = EXCLUDED."topic"')
     expect(fake.calls[3]?.[1]).toEqual(expect.arrayContaining(["session-1", "turn-dispatch:turn-1"]))

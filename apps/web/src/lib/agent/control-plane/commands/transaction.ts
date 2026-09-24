@@ -7,20 +7,6 @@ import { appendAgentEventWithOutboxInTransaction } from "../../session/fact-stor
 import { activeTurnChanged, sessionNotFound } from "./errors"
 import type { CommandDisposition, CommandIdentity, InterruptDisposition } from "./types"
 
-export {
-  appendSessionControl,
-  assertAcceptingSession,
-  assertSessionControlIdentity,
-  controlFingerprint,
-  findExistingSessionControl,
-  findInProgressTurn,
-  lockAcceptingSession,
-  lockOpenSession,
-  lockSessionControl,
-  sessionControlEventKey,
-  sessionControlResult,
-} from "./session-control-transaction"
-export type { ExistingSessionControl, LockedSession } from "./session-control-transaction"
 export { fallbackDisposition, findExistingCommand } from "./existing-command"
 export type { ExistingCommand } from "./existing-command"
 
@@ -66,6 +52,17 @@ export async function lockOwnedSession(tx: CommandTransaction, sessionId: string
   const rows = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
     SELECT "id" FROM "agent_sessions"
     WHERE "id" = ${sessionId} AND "userId" = ${userId}
+    FOR UPDATE
+  `)
+  if (!rows[0]) throw sessionNotFound(sessionId)
+}
+
+/** Locks a live session owned by the command user before accepting writes. */
+export async function lockOpenSession(tx: CommandTransaction, sessionId: string, userId: string): Promise<void> {
+  const rows = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+    SELECT "id" FROM "agent_sessions"
+    WHERE "id" = ${sessionId} AND "userId" = ${userId}
+      AND "status" NOT IN ('aborted', 'archived')
     FOR UPDATE
   `)
   if (!rows[0]) throw sessionNotFound(sessionId)

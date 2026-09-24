@@ -6,14 +6,12 @@ import { useI18n } from '@/lib/i18n'
 
 import { createAgentApprovalMessageId, isCurrentAgentApprovalRequest, postAgentApprovalDecision, type ApprovalDecision } from './approval-action'
 import type { ApprovalLedgerActionRef, ApprovalLedgerApproval, ApprovalLedgerProjection, ApprovalLedgerProjectionStatus } from './approval-ledger-view'
-import type { TimelineSessionControlGate } from './timeline-session-control'
 import type { SupervisorTurnSummary } from './task-tree-projection'
 
 export interface AgentApprovalLedgerCardProps {
   readonly ledger: ApprovalLedgerProjection
   readonly sessionId: string
   readonly turns: readonly SupervisorTurnSummary[]
-  readonly controlGate: TimelineSessionControlGate
   readonly onAccepted: () => void
   readonly selectionKey?: string
 }
@@ -28,7 +26,7 @@ const STATUS_KEYS: Record<ApprovalLedgerProjectionStatus, string> = {
 }
 
 /** Server-owned approval facts with a guarded, non-optimistic decision command. */
-export function AgentApprovalLedgerCard({ ledger, sessionId, turns, controlGate, onAccepted, selectionKey: externalSelectionKey = '' }: AgentApprovalLedgerCardProps) {
+export function AgentApprovalLedgerCard({ ledger, sessionId, turns, onAccepted, selectionKey: externalSelectionKey = '' }: AgentApprovalLedgerCardProps) {
   const { t } = useI18n()
   const [submitting, setSubmitting] = useState<BooleanById>({})
   const [feedback, setFeedback] = useState<FeedbackById>({})
@@ -81,18 +79,17 @@ export function AgentApprovalLedgerCard({ ledger, sessionId, turns, controlGate,
       </div>
       <div style={summaryStyle}><span>{t('agent.approvalLedger.pending')}</span><strong>{ledger.pendingCount}</strong></div>
       <div data-agent-approval-ledger-rows="true" style={rowsStyle}>
-        {ledger.pendingActions.slice(0, 8).map(actionRef => <PendingApprovalRow key={actionRef.approvalId} actionRef={actionRef} sessionId={sessionId} turns={turns} controlGate={controlGate} submitting={Boolean(submitting[actionRef.approvalId])} feedback={feedback[actionRef.approvalId]} onDecision={handleDecision} t={t} />)}
+        {ledger.pendingActions.slice(0, 8).map(actionRef => <PendingApprovalRow key={actionRef.approvalId} actionRef={actionRef} sessionId={sessionId} turns={turns} submitting={Boolean(submitting[actionRef.approvalId])} feedback={feedback[actionRef.approvalId]} onDecision={handleDecision} t={t} />)}
         {terminalApprovals.map((approval, index) => <ApprovalRow key={`${index}-${approval.status}`} approval={approval} t={t} />)}
       </div>
     </section>
   )
 }
 
-function PendingApprovalRow({ actionRef, sessionId, turns, controlGate, submitting, feedback, onDecision, t }: {
+function PendingApprovalRow({ actionRef, sessionId, turns, submitting, feedback, onDecision, t }: {
   readonly actionRef: ApprovalLedgerActionRef
   readonly sessionId: string
   readonly turns: readonly SupervisorTurnSummary[]
-  readonly controlGate: TimelineSessionControlGate
   readonly submitting: boolean
   readonly feedback: ApprovalActionFeedback | undefined
   readonly onDecision: (actionRef: ApprovalLedgerActionRef, expectedRevision: number, decision: ApprovalDecision) => void
@@ -100,8 +97,7 @@ function PendingApprovalRow({ actionRef, sessionId, turns, controlGate, submitti
 }) {
   const expectedRevision = turnRevision(turns, sessionId, actionRef.turnId)
   const unavailable = expectedRevision === null
-  const paused = controlGate === 'user_paused'
-  const disabled = isApprovalActionDisabled(submitting, unavailable, paused, feedback)
+  const disabled = isApprovalActionDisabled(submitting, unavailable, feedback)
   return (
     <div data-agent-approval-ledger-row="true" style={rowStyle}>
       <span>{actionRef.action ?? t('agent.approvalLedger.unknownAction')}</span>
@@ -110,7 +106,6 @@ function PendingApprovalRow({ actionRef, sessionId, turns, controlGate, submitti
         <button type="button" disabled={disabled} onClick={() => expectedRevision !== null && onDecision(actionRef, expectedRevision, 'approved')} style={{ ...buttonStyle, opacity: disabled ? 0.68 : 1 }}>{submitting ? t('agent.approvalLedger.submitting') : t('agent.approvalLedger.approve')}</button>
         <button type="button" disabled={disabled} onClick={() => expectedRevision !== null && onDecision(actionRef, expectedRevision, 'rejected')} style={{ ...buttonStyle, opacity: disabled ? 0.68 : 1 }}>{t('agent.approvalLedger.reject')}</button>
       </div>
-      {paused && <p role="status" aria-live="polite" style={hintStyle}>{t('agent.approvalLedger.resumeFirst')}</p>}
       {unavailable && <p role="status" aria-live="polite" style={hintStyle}>{t('agent.approvalLedger.turnUnavailable')}</p>}
       {feedback === 'accepted' && <p role="status" aria-live="polite" style={hintStyle}>{t('agent.approvalLedger.accepted')}</p>}
       {feedback === 'duplicate' && <p role="status" aria-live="polite" style={hintStyle}>{t('agent.approvalLedger.duplicate')}</p>}
@@ -128,8 +123,8 @@ function turnRevision(turns: readonly SupervisorTurnSummary[], sessionId: string
   return turn && Number.isSafeInteger(turn.revision) ? turn.revision : null
 }
 
-export function isApprovalActionDisabled(submitting: boolean, unavailable: boolean, paused: boolean, feedback: ApprovalActionFeedback | undefined): boolean {
-  return submitting || unavailable || paused || feedback === 'accepted' || feedback === 'duplicate'
+export function isApprovalActionDisabled(submitting: boolean, unavailable: boolean, feedback: ApprovalActionFeedback | undefined): boolean {
+  return submitting || unavailable || feedback === 'accepted' || feedback === 'duplicate'
 }
 
 const cardStyle: React.CSSProperties = { display: 'grid', gap: 7, marginBottom: 10, padding: 10, border: '1px solid var(--border)', borderRadius: 9, background: 'var(--bg)' }

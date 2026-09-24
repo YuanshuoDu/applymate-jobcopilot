@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 
 import { translate } from '@/lib/i18n'
-import { EvidenceSummary, projectSelectedEvidence, SupervisorControlSummary } from './AgentSupervisorPanel'
+import { EvidenceSummary, projectSelectedEvidence } from './AgentSupervisorPanel'
 import type { TimelineItem } from './timeline-reducer'
 
 function item(overrides: Partial<TimelineItem> = {}): TimelineItem {
@@ -15,27 +15,6 @@ function item(overrides: Partial<TimelineItem> = {}): TimelineItem {
 }
 
 const t = (key: string) => translate('en', key)
-
-describe('AgentSupervisorPanel control projection', () => {
-  it('renders the server-owned gate and revision in the selected locale without payload data', () => {
-    const html = renderToStaticMarkup(<SupervisorControlSummary controlGate="user_paused" controlRevision={12} t={key => translate('zh', key)} />)
-
-    expect(html).toContain(`${translate('zh', 'agent.gate')}: ${translate('zh', 'agent.paused')}`)
-    expect(html).toContain(`${translate('zh', 'agent.approvalLedger.revision')}: 12`)
-    expect(html).toContain('data-agent-supervisor-control-gate="user_paused"')
-    expect(html).toContain('data-agent-supervisor-control-revision="12"')
-    expect(html).not.toContain('session-1')
-    expect(html).not.toContain('raw')
-    expect(html).not.toContain(translate('en', 'agent.paused'))
-  })
-
-  it('fails closed for an invalid control revision', () => {
-    const html = renderToStaticMarkup(<SupervisorControlSummary controlGate="open" controlRevision={Number.NaN} t={t} />)
-
-    expect(html).toContain(`${translate('en', 'agent.approvalLedger.revision')}: ${translate('en', 'agent.notAvailable')}`)
-    expect(html).not.toContain('NaN')
-  })
-})
 
 describe('AgentSupervisorPanel selected evidence', () => {
   it('projects bounded audit metadata and renders only safe references', () => {
