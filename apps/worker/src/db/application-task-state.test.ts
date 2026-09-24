@@ -1,4 +1,4 @@
-import type { Pool, PoolClient } from "pg";
+import type { Pool } from "pg";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const approvalIssue = vi.hoisted(() => vi.fn());
@@ -100,24 +100,88 @@ describe("isUserActive", () => {
 describe("markSubmissionRequestStarted", () => {
   const scope = { userId: "user_1", sessionId: "session_1", turnId: "turn_1", applicationTaskId: "task_1", jobId: "job_1" };
 
-  it("records the checkpoint only for the active task from the same session", async () => {
-    const query = vi.fn().mockResolvedValue({ rowCount: 1, rows: [{ id: "task_1" }] });
-    const client = { query } as unknown as PoolClient;
+  function fencedPool(options: {
+    sessionStatus?: string;
+    turnStatus?: string;
+    interrupted?: boolean;
+    taskStatus?: string;
+    checkpoint?: string;
+    updateCount?: number;
+  } = {}) {
+    const clientQuery = vi.fn(async (sql: string) => {
+      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rowCount: 1, rows: [] };
+      if (sql.includes('FROM "agent_sessions"')) return { rowCount: 1, rows: [{ status: options.sessionStatus ?? "running" }] };
+      if (sql.includes('FROM "agent_turns"')) return { rowCount: 1, rows: [{ status: options.turnStatus ?? "in_progress" }] };
+      if (sql.includes('FROM "agent_events"')) return { rowCount: 1, rows: [{ stopped: options.interrupted ?? false }] };
+      if (sql.includes("SELECT") && sql.includes("FROM application_tasks")) {
+        return { rowCount: 1, rows: [{ status: options.taskStatus ?? "filling", checkpoint: options.checkpoint ?? "browser_active" }] };
+      }
+      if (sql.includes("UPDATE application_tasks")) {
+        const rowCount = options.updateCount ?? 1;
+        return { rowCount, rows: rowCount === 1 ? [{ id: "task_1" }] : [] };
+      }
+      throw new Error(`Unexpected query: ${sql}`);
+    });
+    const release = vi.fn();
+    const pool = { connect: vi.fn().mockResolvedValue({ query: clientQuery, release }) } as unknown as Pool;
+    return { pool, clientQuery, release };
+  }
 
-    await expect(markSubmissionRequestStarted(client, scope)).resolves.toBe(true);
+  it("locks Session then Turn then ApplicationTask, commits the exact checkpoint, and releases before returning", async () => {
+    const { pool, clientQuery, release } = fencedPool();
 
-    expect(query).toHaveBeenCalledWith(expect.stringContaining('"status" = \'filling\''), ["task_1", "user_1", "job_1", "session_1"]);
-    expect(query).toHaveBeenCalledWith(expect.stringContaining("submission_request_started"), expect.any(Array));
+    await expect(markSubmissionRequestStarted(pool, scope)).resolves.toBe(true);
+
+    const statements = clientQuery.mock.calls.map(([sql]) => sql);
+    const sessionLock = statements.findIndex(sql => sql.includes('FROM "agent_sessions"'));
+    const turnLock = statements.findIndex(sql => sql.includes('FROM "agent_turns"'));
+    const taskLock = statements.findIndex(sql => sql.includes("SELECT") && sql.includes("FROM application_tasks"));
+    const taskUpdate = statements.findIndex(sql => sql.includes("UPDATE application_tasks"));
+    expect(statements.indexOf("BEGIN")).toBeLessThan(sessionLock);
+    expect(sessionLock).toBeLessThan(turnLock);
+    expect(turnLock).toBeLessThan(taskLock);
+    expect(taskLock).toBeLessThan(taskUpdate);
+    expect(statements.at(-1)).toBe("COMMIT");
+    expect(clientQuery).toHaveBeenCalledWith(expect.stringContaining('"status" = \'filling\''), ["task_1", "user_1", "job_1", "session_1"]);
+    expect(clientQuery).toHaveBeenCalledWith(expect.stringContaining('"checkpoint" = \'browser_active\''), expect.any(Array));
+    expect(clientQuery).toHaveBeenCalledWith(expect.stringContaining("submission_request_started"), expect.any(Array));
+    expect(release).toHaveBeenCalledOnce();
   });
 
-  it("returns false when the task is no longer at the active pre-submit checkpoint", async () => {
-    const query = vi.fn().mockResolvedValue({ rowCount: 0, rows: [] });
-    const client = { query } as unknown as PoolClient;
+  it.each([
+    ["aborted session", { sessionStatus: "aborted" }],
+    ["archived session", { sessionStatus: "archived" }],
+    ["interrupted Turn", { turnStatus: "interrupted" }],
+    ["durable interruption event", { interrupted: true }],
+  ] as const)("does not advance the task after %s", async (_label, options) => {
+    const { pool, clientQuery, release } = fencedPool(options);
 
-    await expect(markSubmissionRequestStarted(client, scope)).resolves.toBe(false);
+    await expect(markSubmissionRequestStarted(pool, scope)).resolves.toBe(false);
+
+    expect(clientQuery.mock.calls.some(([sql]) => sql.includes("UPDATE application_tasks"))).toBe(false);
+    expect(clientQuery).toHaveBeenCalledWith("ROLLBACK");
+    expect(clientQuery).not.toHaveBeenCalledWith("COMMIT");
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it.each(["completed", "failed"] as const)("allows naturally %s session and Turn states", async status => {
+    const { pool, clientQuery } = fencedPool({ sessionStatus: status, turnStatus: status });
+
+    await expect(markSubmissionRequestStarted(pool, scope)).resolves.toBe(true);
+
+    expect(clientQuery).toHaveBeenCalledWith(expect.stringContaining("submission_request_started"), expect.any(Array));
+    expect(clientQuery).toHaveBeenCalledWith("COMMIT");
+  });
+
+  it("fails closed when the ApplicationTask is no longer filling at browser_active", async () => {
+    const { pool, clientQuery } = fencedPool({ taskStatus: "cancelled", checkpoint: "turn_stopped_before_submit" });
+
+    await expect(markSubmissionRequestStarted(pool, scope)).resolves.toBe(false);
+
+    expect(clientQuery.mock.calls.some(([sql]) => sql.includes("UPDATE application_tasks"))).toBe(false);
+    expect(clientQuery).toHaveBeenCalledWith("ROLLBACK");
   });
 });
-
 describe("user takeover classification", () => {
   it.each([
     "CAPTCHA detected",

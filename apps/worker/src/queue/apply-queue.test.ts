@@ -12,7 +12,6 @@ const mockIsUserActive = vi.fn().mockResolvedValue(true);
 const mockSubmitContext = vi.fn();
 const mockMarkSubmissionRequestStarted = vi.fn().mockResolvedValue(true);
 const mockProviderSubmitClick = vi.fn();
-const mockPageRequest = vi.hoisted(() => ({ handler: undefined as ((request: { method(): string; isNavigationRequest(): boolean }) => void) | undefined }));
 const mockTurnState = vi.hoisted(() => ({ sessionStatus: "running", turnStatus: "in_progress", interrupted: false }));
 const mockPoolQuery = vi.hoisted(() => vi.fn().mockResolvedValue({ rowCount: 1, rows: [] }));
 const mockTurnClient = vi.hoisted(() => ({
@@ -28,9 +27,6 @@ const mockPage = vi.hoisted(() => ({
   goto: vi.fn().mockResolvedValue(undefined),
   url: vi.fn().mockReturnValue("https://example.com/jobs/123/apply"),
   close: vi.fn().mockResolvedValue(undefined),
-  on: vi.fn((event: string, handler: (request: { method(): string; isNavigationRequest(): boolean }) => void) => {
-    if (event === "request") mockPageRequest.handler = handler;
-  }),
 }));
 const approvalMocks = vi.hoisted(() => ({ inspectSubmission: vi.fn() }));
 const submitToolMocks = vi.hoisted(() => ({
@@ -155,13 +151,16 @@ describe("apply-queue (unit — mocked)", () => {
     vi.clearAllMocks();
     mockIsUserActive.mockResolvedValue(true);
     mockMarkSubmissionRequestStarted.mockReset().mockImplementation(async () =>
-      !mockTurnState.interrupted && !["interrupted", "cancelled", "completed", "failed"].includes(mockTurnState.turnStatus)
+      !mockTurnState.interrupted && mockTurnState.turnStatus !== "interrupted" && !["aborted", "archived"].includes(mockTurnState.sessionStatus)
     );
     mockProviderSubmitClick.mockReset();
-    mockPageRequest.handler = undefined;
     submitToolMocks.create.mockReset();
     submitToolMocks.execute.mockReset();
-    mockPoolQuery.mockResolvedValue({ rowCount: 1, rows: [] });
+    mockPoolQuery.mockImplementation(async (sql: string) =>
+      sql.includes('SELECT "sessionId" FROM application_tasks')
+        ? { rowCount: 1, rows: [{ sessionId: null }] }
+        : { rowCount: 1, rows: [] },
+    );
     mockTurnState.sessionStatus = "running";
     mockTurnState.turnStatus = "in_progress";
     mockTurnState.interrupted = false;
@@ -169,7 +168,6 @@ describe("apply-queue (unit — mocked)", () => {
     mockTurnClient.release.mockClear();
     mockPage.goto.mockClear();
     mockPage.close.mockClear();
-    mockPage.on.mockClear();
     approvalMocks.inspectSubmission.mockResolvedValue({
       type: "submit_application",
       status: "approved",
@@ -183,7 +181,6 @@ describe("apply-queue (unit — mocked)", () => {
       if (task.allowSubmit !== false && task.beforeSubmit) {
         if (!await task.beforeSubmit()) return { status: "submission_blocked", error: "Submission guard denied.", durationMs: 123 };
         mockProviderSubmitClick();
-        mockPageRequest.handler?.({ method: () => "POST", isNavigationRequest: () => false });
       }
       return task.allowSubmit === false
         ? { status: "manual", error: "Form filled and ready for user review.", durationMs: 123, reviewReady: true }
@@ -248,6 +245,54 @@ describe("apply-queue (unit — mocked)", () => {
     }));
   });
 
+  it("allows a receipt-less submit only after verifying a sessionless legacy task", async () => {
+    await import("./apply-queue.js");
+    await mockProcessor({ data: {
+      applicationTaskId: "application-task-1", operation: "submit", jobId: "job-1", userId: "user-1",
+      applyUrl: "https://example.com/jobs/123/apply", personaId: "persona-1", resumePath: "/resume.pdf", dryRun: false,
+    } });
+
+    expect(mockPoolQuery).toHaveBeenCalledWith(
+      expect.stringContaining('SELECT "sessionId" FROM application_tasks'),
+      ["application-task-1", "user-1", "job-1"],
+    );
+    expect(mockProviderSubmitClick).toHaveBeenCalledOnce();
+    expect(mockMarkSubmissionRequestStarted).not.toHaveBeenCalled();
+    expect(mockInsertApplyResult).toHaveBeenCalledWith(expect.objectContaining({ status: "submitted" }));
+  });
+
+  it("blocks a receipt-less session-linked task before browser or provider startup", async () => {
+    mockPoolQuery.mockImplementation(async (sql: string) => sql.includes('SELECT "sessionId" FROM application_tasks')
+      ? { rowCount: 1, rows: [{ sessionId: "agent-session-1" }] }
+      : { rowCount: 1, rows: [] });
+    await import("./apply-queue.js");
+    await mockProcessor({ data: {
+      applicationTaskId: "application-task-1", operation: "submit", jobId: "job-1", userId: "user-1",
+      applyUrl: "https://example.com/jobs/123/apply", personaId: "persona-1", resumePath: "/resume.pdf", dryRun: false,
+    } });
+
+    expect(mockWithCloakContext).not.toHaveBeenCalled();
+    expect(mockProviderSubmitClick).not.toHaveBeenCalled();
+    expect(mockMarkSubmissionRequestStarted).not.toHaveBeenCalled();
+    expect(mockInsertApplyResult).toHaveBeenCalledWith(expect.objectContaining({
+      status: "failed",
+      error: "V2-linked application submission requires its approved receipt.",
+    }));
+  });
+
+  it.each(["missing row", "lookup error"] as const)("fails closed for a receipt-less task with %s", async failure => {
+    if (failure === "missing row") mockPoolQuery.mockResolvedValueOnce({ rowCount: 0, rows: [] });
+    else mockPoolQuery.mockRejectedValueOnce(new Error("lineage lookup unavailable"));
+    await import("./apply-queue.js");
+    await mockProcessor({ data: {
+      applicationTaskId: "application-task-1", operation: "submit", jobId: "job-1", userId: "user-1",
+      applyUrl: "https://example.com/jobs/123/apply", personaId: "persona-1", resumePath: "/resume.pdf", dryRun: false,
+    } });
+
+    expect(mockWithCloakContext).not.toHaveBeenCalled();
+    expect(mockProviderSubmitClick).not.toHaveBeenCalled();
+    expect(mockMarkSubmissionRequestStarted).not.toHaveBeenCalled();
+  });
   it("routes a receipt-backed submit through application.submit before the browser flow", async () => {
     submitToolMocks.execute.mockResolvedValue({
       status: "submitted", confirmationId: "application:application-task-1", postSubmitUrl: "https://example.com/confirmation", errorCode: null, output: null,
@@ -280,6 +325,27 @@ describe("apply-queue (unit — mocked)", () => {
     expect(mockInsertApplyResult).toHaveBeenCalledWith(expect.objectContaining({ status: "submitted", flowUsed: "application.submit" }));
   });
 
+  it("allows an approved submission after the Turn and session naturally complete", async () => {
+    mockTurnState.sessionStatus = "completed";
+    mockTurnState.turnStatus = "completed";
+    submitToolMocks.create.mockImplementation(({ submit }: { submit: (input: unknown) => Promise<unknown> }) => ({
+      execute: async () => {
+        await submit({ target: {}, artifact: {}, context: {}, beforeSubmit: async () => true });
+        return { status: "submitted", confirmationId: "application:application-task-1", postSubmitUrl: null, errorCode: null, output: null };
+      },
+    }));
+
+    await import("./apply-queue.js");
+    await mockProcessor({ data: {
+      applicationTaskId: "application-task-1", operation: "submit", jobId: "job-1", userId: "user-1",
+      applyUrl: "https://example.com/jobs/123/apply", personaId: "persona-1", resumePath: "/resume.pdf", dryRun: false,
+      receiptId: "approval-1", constraintHash: "c".repeat(64),
+    } });
+
+    expect(mockMarkSubmissionRequestStarted).toHaveBeenCalledOnce();
+    expect(mockProviderSubmitClick).toHaveBeenCalledOnce();
+    expect(mockInsertApplyResult).toHaveBeenCalledWith(expect.objectContaining({ status: "submitted" }));
+  });
   it("cancels an approved submission when Stop wins before the ATS request starts", async () => {
     submitToolMocks.create.mockImplementation(({ submit }: { submit: (input: unknown) => Promise<unknown> }) => ({
       execute: async () => {
@@ -297,7 +363,6 @@ describe("apply-queue (unit — mocked)", () => {
       const allowed = task.beforeSubmit ? await task.beforeSubmit() : false;
       if (allowed) {
         mockProviderSubmitClick();
-        mockPageRequest.handler?.({ method: () => "POST", isNavigationRequest: () => false });
       }
       return { status: allowed ? "submitted" : "submission_blocked", error: null, durationMs: 123 };
     });
@@ -311,7 +376,7 @@ describe("apply-queue (unit — mocked)", () => {
       },
     });
 
-    expect(mockMarkSubmissionRequestStarted).not.toHaveBeenCalled();
+    expect(mockMarkSubmissionRequestStarted).toHaveBeenCalledOnce();
     expect(mockProviderSubmitClick).not.toHaveBeenCalled();
     expect(mockInsertApplyResult).toHaveBeenCalledWith(expect.objectContaining({ status: "failed", error: "Agent turn was stopped before the application submission request started." }));
     expect(mockFinishApplicationTask).toHaveBeenCalledWith(expect.anything(), "application-task-1", "failed", "turn_stopped_before_submit", expect.stringContaining("stopped before"));
@@ -333,7 +398,6 @@ describe("apply-queue (unit — mocked)", () => {
       const allowed = task.beforeSubmit ? await task.beforeSubmit() : false;
       if (!allowed) return { status: "submission_blocked", error: "Submission guard denied.", durationMs: 123 };
       mockProviderSubmitClick();
-      mockPageRequest.handler?.({ method: () => "POST", isNavigationRequest: () => false });
       await new Promise((resolve) => setTimeout(resolve, 5));
       mockTurnState.turnStatus = "interrupted";
       mockTurnState.interrupted = true;
