@@ -43,6 +43,16 @@ export class AgentPauseError extends Error {
   }
 }
 
+/** Safe, stable failure surfaced when the model cannot supply a valid decision. */
+export class OrchestratorDecisionError extends Error {
+  readonly code = 'orchestrator_decision_invalid'
+
+  constructor() {
+    super('The agent stopped because the orchestrator could not produce a valid decision. Please retry the run.')
+    this.name = 'OrchestratorDecisionError'
+  }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /**
@@ -74,7 +84,17 @@ function extractFinalSentence(raw: string): string {
  * Parse JSON from LLM response robustly.
  * Handles: ```json ... ```, thinking preamble before JSON, trailing text.
  */
-function parseDecision(raw: string): Record<string, unknown> | null {
+const MAX_DECISION_RESPONSE_CHARS = 16_000
+const MAX_THINKING_CHARS = 1_000
+const MAX_QUESTION_CHARS = 500
+const MAX_OPTION_LABEL_CHARS = 120
+const MAX_OPTION_VALUE_CHARS = 120
+const MAX_ACTION_FIELD_CHARS = 100
+const MAX_RETRY_FIX_FIELDS = 20
+const MAX_NESTED_VALUE_CHARS = 2_000
+
+function parseDecision(raw: unknown): unknown {
+  if (typeof raw !== 'string' || raw.length > MAX_DECISION_RESPONSE_CHARS) return null
   // Remove markdown fences
   let text = raw.replace(/```json|```/g, '').trim()
   // Find first { ... }
@@ -85,6 +105,91 @@ function parseDecision(raw: string): Record<string, unknown> | null {
     return JSON.parse(text.slice(start, end + 1))
   } catch {
     return null
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function hasOwn(value: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key)
+}
+
+function boundedString(value: unknown, maxLength: number): value is string {
+  return typeof value === 'string' && value.trim().length > 0 && value.length <= maxLength
+}
+
+function isBoundedJsonValue(value: unknown, depth = 0): boolean {
+  if (depth > 8) return false
+  if (value === null || typeof value === 'boolean') return true
+  if (typeof value === 'string') return value.length <= MAX_NESTED_VALUE_CHARS
+  if (typeof value === 'number') return Number.isFinite(value)
+  if (Array.isArray(value)) return value.length <= 20 && value.every(item => isBoundedJsonValue(item, depth + 1))
+  if (!isRecord(value)) return false
+
+  const entries = Object.entries(value)
+  return entries.length <= 20 && entries.every(([key, item]) =>
+    key.length > 0 && key.length <= MAX_ACTION_FIELD_CHARS && isBoundedJsonValue(item, depth + 1),
+  )
+}
+
+function validateDecision(value: unknown, autonomous: boolean): OrchestratorDecision | null {
+  if (!isRecord(value)) return null
+  if (!['proceed', 'retry', 'ask_user', 'abort'].includes(value.decision as string)) return null
+  if (!boundedString(value.thinking, MAX_THINKING_CHARS)) return null
+  const thinking = extractFinalSentence(value.thinking.trim())
+  if (!thinking) return null
+
+  switch (value.decision) {
+    case 'proceed':
+    case 'abort':
+      return { decision: value.decision, thinking }
+    case 'retry': {
+      if (!isRecord(value.retry_fix)) return null
+      const entries = Object.entries(value.retry_fix)
+      if (entries.length === 0 || entries.length > MAX_RETRY_FIX_FIELDS) return null
+      if (!entries.every(([key, item]) =>
+        key.length > 0 && key.length <= MAX_ACTION_FIELD_CHARS && isBoundedJsonValue(item),
+      )) return null
+      let serialized: string
+      try { serialized = JSON.stringify(value.retry_fix) }
+      catch { return null }
+      if (typeof serialized !== 'string' || serialized.length > MAX_NESTED_VALUE_CHARS) return null
+      return { decision: 'retry', thinking, retry_fix: value.retry_fix }
+    }
+    case 'ask_user': {
+      if (autonomous) return null
+      if (!boundedString(value.ask_question, MAX_QUESTION_CHARS)) return null
+      let askOptions: OrchestratorDecision['ask_options']
+      if (hasOwn(value, 'ask_options')) {
+        if (!Array.isArray(value.ask_options) || value.ask_options.length === 0 || value.ask_options.length > 10) return null
+        const parsedOptions: NonNullable<OrchestratorDecision['ask_options']> = []
+        const seenValues = new Set<string>()
+        for (const option of value.ask_options) {
+          if (!isRecord(option) || !boundedString(option.label, MAX_OPTION_LABEL_CHARS) || !boundedString(option.value, MAX_OPTION_VALUE_CHARS)) return null
+          const optionValue = option.value.trim()
+          if (seenValues.has(optionValue)) return null
+          seenValues.add(optionValue)
+
+          let action: NonNullable<OrchestratorDecision['ask_options']>[number]['action']
+          if (hasOwn(option, 'action')) {
+            if (!isRecord(option.action) || !boundedString(option.action.field, MAX_ACTION_FIELD_CHARS) || !hasOwn(option.action, 'value')) return null
+            if (!isBoundedJsonValue(option.action.value)) return null
+            let serialized: string
+            try { serialized = JSON.stringify(option.action.value) }
+            catch { return null }
+            if (typeof serialized !== 'string' || serialized.length > MAX_NESTED_VALUE_CHARS) return null
+            action = { field: option.action.field.trim(), value: option.action.value }
+          }
+          parsedOptions.push({ label: option.label.trim(), value: optionValue, ...(action ? { action } : {}) })
+        }
+        askOptions = parsedOptions
+      }
+      return { decision: 'ask_user', thinking, ask_question: value.ask_question.trim(), ...(askOptions ? { ask_options: askOptions } : {}) }
+    }
+    default:
+      return null
   }
 }
 
@@ -225,23 +330,18 @@ Respond ONLY in valid JSON (no markdown):
   "retry_fix": {"field": "value"}
 }`
 
+    let decision: OrchestratorDecision | null = null
     try {
-      const r      = await modelChat([{ role: 'user', content: prompt }], this.ctx.aiConfig, 400)
-      const parsed = parseDecision(r.text) as OrchestratorDecision | null
-      if (!parsed?.decision) throw new Error('no decision')
-
-      // Clean thinking field from any preamble too
-      if (parsed.thinking) parsed.thinking = extractFinalSentence(parsed.thinking)
-
-      this.history.push(`[${stage}] ${summary} → ${parsed.decision}: ${parsed.thinking}`)
-      this.emit('orchestrator_thinking', { stage, thinking: parsed.thinking, decision: parsed.decision })
-      return parsed
+      const r = await modelChat([{ role: 'user', content: prompt }], this.ctx.aiConfig, 400)
+      decision = validateDecision(parseDecision(r.text), this.autonomous)
     } catch {
-      const fallback: OrchestratorDecision = { decision: 'proceed', thinking: 'Continue to the next stage' }
-      this.history.push(`[${stage}] ${summary} → proceed (fallback)`)
-      this.emit('orchestrator_thinking', { stage, thinking: fallback.thinking, decision: 'proceed' })
-      return fallback
+      throw new OrchestratorDecisionError()
     }
+    if (!decision) throw new OrchestratorDecisionError()
+
+    this.history.push(`[${stage}] ${summary} → ${decision.decision}: ${decision.thinking}`)
+    this.emit('orchestrator_thinking', { stage, thinking: decision.thinking, decision: decision.decision })
+    return decision
   }
 
   // ── Ask: durable pause — worker exits and the answer endpoint requeues it ──

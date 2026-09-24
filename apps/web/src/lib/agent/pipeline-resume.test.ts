@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 
 const mocks = vi.hoisted(() => ({
   scout: vi.fn(), analyze: vi.fn(), prepare: vi.fn(), gate: vi.fn(), execute: vi.fn(), audit: vi.fn(),
-  checkpoint: vi.fn(),
+  checkpoint: vi.fn(), evaluate: vi.fn(),
 }))
 
 vi.mock("./stages/scout", () => ({ runScout: mocks.scout, acceptScout: vi.fn(() => ({ ok: true })) }))
@@ -26,7 +26,7 @@ vi.mock("./orchestrator", () => ({
     isExhausted = vi.fn(() => false)
     decideOnExhaustion = vi.fn()
     applyFix = vi.fn()
-    evaluate = vi.fn().mockResolvedValue({ decision: "proceed", thinking: "ok" })
+    evaluate = mocks.evaluate
     ask = vi.fn()
     applyOptionAction = vi.fn()
     complete = vi.fn()
@@ -39,6 +39,7 @@ const scored = { job, score: 90, matchedKeywords: ["TypeScript"], missingKeyword
 describe("pipeline checkpoint recovery", () => {
   beforeEach(() => {
     Object.values(mocks).forEach(mock => mock.mockReset())
+    mocks.evaluate.mockResolvedValue({ decision: "proceed", thinking: "ok" })
     mocks.gate.mockResolvedValue({ data: { approved: [], pending: [], skipped: [] }, metrics: { durationMs: 1, count: 0 } })
     mocks.execute.mockResolvedValue({ data: { queued: [], failed: [] }, metrics: { durationMs: 1, count: 0 } })
     mocks.audit.mockResolvedValue({ data: { warnings: [], report: {} }, metrics: { durationMs: 1, count: 0 } })
@@ -81,5 +82,20 @@ describe("pipeline checkpoint recovery", () => {
     expect(mocks.analyze).not.toHaveBeenCalled()
     expect(canonicalEvents.find(event => event.event === "pipeline_checkpoint")).toEqual(expect.objectContaining({ event: "pipeline_checkpoint" }))
     expect(mocks.checkpoint).toHaveBeenCalledWith(expect.objectContaining({ nextStage: "scout", eventIndex: expect.any(Number) }))
+  })
+
+  it("stops before Analyze when Scout orchestration fails", async () => {
+    const { runPipeline } = await import("./pipeline")
+    mocks.scout.mockResolvedValue({ data: { jobs: [job], discovered: 1 }, metrics: { durationMs: 1, count: 1 } })
+    mocks.evaluate.mockRejectedValue(new Error("orchestrator decision invalid"))
+
+    await expect(runPipeline({
+      userId: "user_1", sessionId: "session_1", agentCfg: { dailyLimit: 5, minMatchScore: 70, autoApply: false, requireApproval: true, targetLocations: [], targetRoles: [], excludeCompanies: [], priorityCompanies: [], autoCoverLetter: false, coverTone: "professional", useTailoredCV: false, model: "test" } as never,
+      roleConfigs: {} as never, resumeText: "resume", resumeContent: {} as never, defaultResume: { id: "resume_1", name: "CV", templateId: null, templateOptions: null, directionId: null, basicsDetached: false },
+      aiConfig: { provider: "minimax", model: "test", apiKey: "key" }, autonomous: false, emit: vi.fn(), checkpoint: mocks.checkpoint,
+    })).rejects.toThrow("orchestrator decision invalid")
+
+    expect(mocks.analyze).not.toHaveBeenCalled()
+    expect(mocks.prepare).not.toHaveBeenCalled()
   })
 })
