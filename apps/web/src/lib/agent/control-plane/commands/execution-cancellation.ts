@@ -62,6 +62,54 @@ async function interruptActiveSubagentTree(
   `)
 }
 
+/**
+ * Cancel only application submissions authorized by this exact Turn. The Turn
+ * has already been updated (and row-locked) by the caller, so this keeps the
+ * same Turn-then-ApplicationTask lock order as the Worker pre-submit gate.
+ */
+async function cancelAuthorizedApplicationsBeforeSubmit(
+  tx: CommandTransaction,
+  scope: { userId: string; sessionId: string; turnId: string; requestedAt: Date },
+): Promise<number> {
+  return tx.$executeRaw(Prisma.sql`
+    WITH stop AS (SELECT ${scope.requestedAt}::timestamptz AS "requestedAt")
+    UPDATE "application_tasks" AS application
+    SET "status" = 'cancelled',
+        "checkpoint" = 'turn_stopped_before_submit',
+        "completedAt" = stop."requestedAt",
+        "updatedAt" = stop."requestedAt"
+    FROM stop
+    WHERE application."userId" = ${scope.userId}
+      AND application."sessionId" = ${scope.sessionId}
+      AND (
+        (application."status" = 'filling'
+          AND application."checkpoint" IS DISTINCT FROM 'submission_request_started')
+        OR (application."status" = 'waiting_for_authorization'
+          AND application."checkpoint" = 'form_filled')
+      )
+      AND EXISTS (
+        SELECT 1 FROM "agent_approvals" AS approval
+        WHERE approval."userId" = ${scope.userId}
+          AND approval."sessionId" = ${scope.sessionId}
+          AND approval."turnId" = ${scope.turnId}
+          AND approval."type" = 'submit_application'
+          AND approval."status" IN ('approved', 'consumed')
+          AND approval."payload"->>'applicationTaskId' = application."id"
+      )
+      AND EXISTS (
+        SELECT 1 FROM "agent_sessions" AS session
+        WHERE session."id" = application."sessionId"
+          AND session."userId" = ${scope.userId}
+      )
+      AND EXISTS (
+        SELECT 1 FROM "agent_turns" AS turn
+        WHERE turn."id" = ${scope.turnId}
+          AND turn."sessionId" = application."sessionId"
+          AND turn."userId" = ${scope.userId}
+      )
+  `)
+}
+
 export async function interruptActiveTurn(
   tx: CommandTransaction,
   command: InterruptCommand,
@@ -73,6 +121,13 @@ export async function interruptActiveTurn(
     data: { status: "interrupted", revision: { increment: 1 }, completedAt: requestedAt },
   })
   if (interrupted.count !== 1) throw activeTurnChanged(command.expectedTurnId, active.id)
+
+  await cancelAuthorizedApplicationsBeforeSubmit(tx, {
+    userId: command.userId,
+    sessionId: command.sessionId,
+    turnId: active.id,
+    requestedAt,
+  })
 
   await interruptActiveSubagentTree(tx, {
     userId: command.userId,

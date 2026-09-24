@@ -1,4 +1,4 @@
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const approvalIssue = vi.hoisted(() => vi.fn());
@@ -16,6 +16,7 @@ import {
   needsUserTakeover,
   USER_TAKEOVER_CHECKPOINT,
   isUserActive,
+  markSubmissionRequestStarted,
 } from "./application-task-state.js";
 
 function testPool() {
@@ -93,6 +94,27 @@ describe("isUserActive", () => {
     query.mockRejectedValueOnce(new Error('column "accountStatus" does not exist'));
 
     await expect(isUserActive(pool, "user_1")).resolves.toBe(false);
+  });
+});
+
+describe("markSubmissionRequestStarted", () => {
+  const scope = { userId: "user_1", sessionId: "session_1", turnId: "turn_1", applicationTaskId: "task_1", jobId: "job_1" };
+
+  it("records the checkpoint only for the active task from the same session", async () => {
+    const query = vi.fn().mockResolvedValue({ rowCount: 1, rows: [{ id: "task_1" }] });
+    const client = { query } as unknown as PoolClient;
+
+    await expect(markSubmissionRequestStarted(client, scope)).resolves.toBe(true);
+
+    expect(query).toHaveBeenCalledWith(expect.stringContaining('"status" = \'filling\''), ["task_1", "user_1", "job_1", "session_1"]);
+    expect(query).toHaveBeenCalledWith(expect.stringContaining("submission_request_started"), expect.any(Array));
+  });
+
+  it("returns false when the task is no longer at the active pre-submit checkpoint", async () => {
+    const query = vi.fn().mockResolvedValue({ rowCount: 0, rows: [] });
+    const client = { query } as unknown as PoolClient;
+
+    await expect(markSubmissionRequestStarted(client, scope)).resolves.toBe(false);
   });
 });
 

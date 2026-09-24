@@ -19,6 +19,22 @@ type State = {
     leaseOwner: string | null
     leaseExpiresAt: Date | null
   }>
+  applicationTasks: Array<{
+    id: string
+    userId: string
+    sessionId: string
+    status: string
+    checkpoint: string | null
+    completedAt: Date | null
+  }>
+  approvals: Array<{
+    userId: string
+    sessionId: string
+    turnId: string
+    type: string
+    status: string
+    payload: Record<string, unknown>
+  }>
   inputs: Array<Record<string, unknown>>
   events: Array<Record<string, unknown>>
 }
@@ -34,6 +50,8 @@ function makeTransaction(options: {
   activeTurnId?: string
   userId?: string
   childTasks?: State["tasks"]
+  applicationTasks?: State["applicationTasks"]
+  approvals?: State["approvals"]
 }) {
   const state: State = {
     execution: {
@@ -48,6 +66,8 @@ function makeTransaction(options: {
       ? { id: options.activeTurnId ?? "turn_1", source: options.activeSource, status: "in_progress", revision: 0 }
       : null,
     tasks: options.childTasks ?? [],
+    applicationTasks: options.applicationTasks ?? [],
+    approvals: options.approvals ?? [],
     inputs: [],
     events: [],
   }
@@ -60,7 +80,30 @@ function makeTransaction(options: {
       return [{ eventSequence: sequence }]
     }),
     $executeRaw: vi.fn(async (query: unknown) => {
+      const strings = (query as { strings?: readonly string[] }).strings ?? []
+      const sql = strings.join(" ")
       const values = (query as { values?: readonly unknown[] }).values ?? []
+      if (sql.includes('UPDATE "application_tasks"')) {
+        const requestedAt = values[0] instanceof Date ? values[0] : new Date(String(values[0]))
+        const userId = String(values[1])
+        const sessionId = String(values[2])
+        const turnId = String(values[5])
+        let count = 0
+        for (const task of state.applicationTasks) {
+          const authorized = state.approvals.some((approval) => approval.userId === userId
+            && approval.sessionId === sessionId && approval.turnId === turnId
+            && approval.type === "submit_application" && ["approved", "consumed"].includes(approval.status)
+            && approval.payload.applicationTaskId === task.id)
+          const beforeSubmit = (task.status === "filling" && task.checkpoint !== "submission_request_started")
+            || (task.status === "waiting_for_authorization" && task.checkpoint === "form_filled")
+          if (task.userId !== userId || task.sessionId !== sessionId || !beforeSubmit || !authorized) continue
+          task.status = "cancelled"
+          task.checkpoint = "turn_stopped_before_submit"
+          task.completedAt = requestedAt
+          count += 1
+        }
+        return count
+      }
       const requestedAt = values[0] instanceof Date ? values[0] : new Date(String(values[0]))
       const sessionId = String(values[3])
       const turnId = String(values[4])
@@ -211,14 +254,116 @@ describe("execution cancellation transaction", () => {
     expect(childTasks[1]).toMatchObject({ status: "interrupted", nextAttemptAt: null, completedAt: expect.any(Date) })
     expect(childTasks.slice(2).every((task) => task.interruptRequestedAt === null)).toBe(true)
 
-    const query = (fake.tx.$executeRaw as unknown as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as { strings?: readonly string[] }
-    const sql = query.strings?.join(" ") ?? ""
+    const query = (fake.tx.$executeRaw as unknown as ReturnType<typeof vi.fn>).mock.calls
+      .map(([value]) => value as { strings?: readonly string[] })
+      .find((value) => (value.strings ?? []).join(" ").includes('UPDATE "sub_agent_tasks"'))
+    expect(query).toBeDefined()
+    const sql = query?.strings?.join(" ") ?? ""
     expect(sql).toContain('task."sessionId" =')
     expect(sql).toContain('task."turnId" =')
     expect(sql).toContain('session."userId" =')
     expect(sql).toContain('turn."userId" =')
     expect(sql).toContain('COALESCE(task."interruptRequestedAt"')
     expect(sql).toContain("'running'")
+  })
+
+  it("cancels approved and consumed application tasks before the submit checkpoint, after locking the Turn", async () => {
+    const applicationTasks: State["applicationTasks"] = [
+      { id: "application_approved", userId: "user_1", sessionId: "session_1", status: "filling", checkpoint: "browser_active", completedAt: null },
+      { id: "application_consumed", userId: "user_1", sessionId: "session_1", status: "filling", checkpoint: null, completedAt: null },
+    ]
+    const approvals: State["approvals"] = [
+      { userId: "user_1", sessionId: "session_1", turnId: "turn_1", type: "submit_application", status: "approved", payload: { applicationTaskId: "application_approved" } },
+      { userId: "user_1", sessionId: "session_1", turnId: "turn_1", type: "submit_application", status: "consumed", payload: { applicationTaskId: "application_consumed" } },
+    ]
+    const fake = makeTransaction({ executionStatus: "running", sessionSource: "automation", activeSource: "automation", applicationTasks, approvals })
+
+    await expect(cancelExecutionInTransaction(fake.tx, { executionId: "execution_1", userId: "user_1" })).resolves.toBe(true)
+
+    expect(applicationTasks).toEqual([
+      expect.objectContaining({ status: "cancelled", checkpoint: "turn_stopped_before_submit", completedAt: expect.any(Date) }),
+      expect.objectContaining({ status: "cancelled", checkpoint: "turn_stopped_before_submit", completedAt: expect.any(Date) }),
+    ])
+    const turnUpdateOrder = (fake.tx.agentTurn.updateMany as unknown as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]
+    const applicationUpdateOrder = (fake.tx.$executeRaw as unknown as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]
+    expect(turnUpdateOrder).toBeLessThan(applicationUpdateOrder)
+
+    const query = (fake.tx.$executeRaw as unknown as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as { strings?: readonly string[] }
+    const sql = query.strings?.join(" ") ?? ""
+    expect(sql).toContain('application."checkpoint" IS DISTINCT FROM \'submission_request_started\'')
+    expect(sql).toContain('application."status" = \'waiting_for_authorization\'')
+    expect(sql).toContain('application."checkpoint" = \'form_filled\'')
+    expect(sql).toContain('approval."status" IN (\'approved\', \'consumed\')')
+    expect(sql).toContain('approval."payload"->>\'applicationTaskId\' = application."id"')
+    expect(sql).toContain('approval."turnId" =')
+  })
+
+  it("preserves application tasks that crossed the submit checkpoint and terminal tasks", async () => {
+    const applicationTasks: State["applicationTasks"] = [
+      { id: "application_started", userId: "user_1", sessionId: "session_1", status: "filling", checkpoint: "submission_request_started", completedAt: null },
+      { id: "application_submitted", userId: "user_1", sessionId: "session_1", status: "submitted", checkpoint: "submitted", completedAt: new Date("2026-09-16T12:00:00.000Z") },
+    ]
+    const approvals: State["approvals"] = applicationTasks.map((task) => ({
+      userId: "user_1", sessionId: "session_1", turnId: "turn_1", type: "submit_application", status: "consumed", payload: { applicationTaskId: task.id },
+    }))
+    const before = applicationTasks.map((task) => ({ ...task }))
+    const fake = makeTransaction({ executionStatus: "running", sessionSource: "automation", activeSource: "automation", applicationTasks, approvals })
+
+    await expect(cancelExecutionInTransaction(fake.tx, { executionId: "execution_1", userId: "user_1" })).resolves.toBe(true)
+
+    expect(applicationTasks).toEqual(before)
+  })
+
+  it("cancels an approved filled task before its conditional queue transition", async () => {
+    const applicationTasks: State["applicationTasks"] = [
+      { id: "application_ready", userId: "user_1", sessionId: "session_1", status: "waiting_for_authorization", checkpoint: "form_filled", completedAt: null },
+    ]
+    const approvals: State["approvals"] = [
+      { userId: "user_1", sessionId: "session_1", turnId: "turn_1", type: "submit_application", status: "approved", payload: { applicationTaskId: "application_ready" } },
+    ]
+    const fake = makeTransaction({ executionStatus: "running", sessionSource: "automation", activeSource: "automation", applicationTasks, approvals })
+
+    await expect(cancelExecutionInTransaction(fake.tx, { executionId: "execution_1", userId: "user_1" })).resolves.toBe(true)
+
+    // Models queueAutonomousApplication's conditional status/checkpoint update.
+    const queuedTask = applicationTasks.find((task) => task.id === "application_ready"
+      && task.status === "waiting_for_authorization" && task.checkpoint === "form_filled")
+    if (queuedTask) {
+      queuedTask.status = "filling"
+      queuedTask.checkpoint = "submission_authorized"
+    }
+    expect(queuedTask).toBeUndefined()
+    expect(applicationTasks[0]).toMatchObject({ status: "cancelled", checkpoint: "turn_stopped_before_submit", completedAt: expect.any(Date) })
+  })
+
+  it("scope-fences linked approvals and stays idempotent when Stop is retried", async () => {
+    const applicationTasks: State["applicationTasks"] = [
+      { id: "application_valid", userId: "user_1", sessionId: "session_1", status: "filling", checkpoint: "browser_active", completedAt: null },
+      { id: "application_wrong_user", userId: "user_2", sessionId: "session_1", status: "filling", checkpoint: "browser_active", completedAt: null },
+      { id: "application_wrong_session", userId: "user_1", sessionId: "session_2", status: "filling", checkpoint: "browser_active", completedAt: null },
+      { id: "application_wrong_turn", userId: "user_1", sessionId: "session_1", status: "filling", checkpoint: "browser_active", completedAt: null },
+      { id: "application_wrong_type", userId: "user_1", sessionId: "session_1", status: "filling", checkpoint: "browser_active", completedAt: null },
+      { id: "application_pending", userId: "user_1", sessionId: "session_1", status: "filling", checkpoint: "browser_active", completedAt: null },
+    ]
+    const approvals: State["approvals"] = [
+      { userId: "user_1", sessionId: "session_1", turnId: "turn_1", type: "submit_application", status: "approved", payload: { applicationTaskId: "application_valid" } },
+      { userId: "user_2", sessionId: "session_1", turnId: "turn_1", type: "submit_application", status: "approved", payload: { applicationTaskId: "application_wrong_user" } },
+      { userId: "user_1", sessionId: "session_2", turnId: "turn_1", type: "submit_application", status: "approved", payload: { applicationTaskId: "application_wrong_session" } },
+      { userId: "user_1", sessionId: "session_1", turnId: "turn_2", type: "submit_application", status: "approved", payload: { applicationTaskId: "application_wrong_turn" } },
+      { userId: "user_1", sessionId: "session_1", turnId: "turn_1", type: "other_action", status: "approved", payload: { applicationTaskId: "application_wrong_type" } },
+      { userId: "user_1", sessionId: "session_1", turnId: "turn_1", type: "submit_application", status: "pending", payload: { applicationTaskId: "application_pending" } },
+    ]
+    const fake = makeTransaction({ executionStatus: "running", sessionSource: "automation", activeSource: "automation", applicationTasks, approvals })
+
+    await expect(cancelExecutionInTransaction(fake.tx, { executionId: "execution_1", userId: "user_1" })).resolves.toBe(true)
+    await expect(cancelExecutionInTransaction(fake.tx, { executionId: "execution_1", userId: "user_1" })).resolves.toBe(true)
+
+    expect(applicationTasks[0]).toMatchObject({ status: "cancelled", checkpoint: "turn_stopped_before_submit" })
+    expect(applicationTasks.slice(1).every((task) => task.status === "filling" && task.checkpoint === "browser_active")).toBe(true)
+    const applicationUpdates = (fake.tx.$executeRaw as unknown as ReturnType<typeof vi.fn>).mock.calls
+      .filter(([query]) => ((query as { strings?: readonly string[] }).strings ?? []).join(" ").includes('UPDATE "application_tasks"'))
+    expect(applicationUpdates).toHaveLength(1)
+    expect(fake.state.inputs).toHaveLength(1)
   })
 
   it("repairs a previously cancelled execution once without duplicating its interrupt", async () => {

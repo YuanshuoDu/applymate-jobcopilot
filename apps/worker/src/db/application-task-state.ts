@@ -1,4 +1,4 @@
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 import type { FormReviewNeeds } from "../harness/form-review.js";
 import { hashAgentReceiptValue, redactSensitiveText } from "@jobcopilot/shared";
 import { createPgApprovalStore } from "../runtime/approval/pg-store.js";
@@ -13,6 +13,28 @@ export const CAPTCHA_USER_TAKEOVER_MESSAGE =
 export const CHALLENGE_DETECTION_FAILED_MESSAGE =
   "Challenge detection failed. User takeover is required; no bypass was attempted.";
 
+export type ApplicationSubmissionStartScope = {
+  userId: string;
+  sessionId: string;
+  turnId: string;
+  applicationTaskId: string;
+  jobId: string;
+};
+
+/** Stage the checkpoint inside the caller's Session/Turn lock transaction. */
+export async function markSubmissionRequestStarted(
+  client: PoolClient,
+  scope: ApplicationSubmissionStartScope,
+): Promise<boolean> {
+  const result = await client.query(
+    `UPDATE application_tasks SET "checkpoint" = 'submission_request_started', "updatedAt" = NOW()
+      WHERE "id" = $1 AND "userId" = $2 AND "jobId" = $3 AND "sessionId" = $4
+        AND "status" = 'filling' AND "checkpoint" = 'browser_active'
+      RETURNING "id"`,
+    [scope.applicationTaskId, scope.userId, scope.jobId, scope.sessionId],
+  );
+  return result.rowCount === 1;
+}
 /** Worker-side account guard.  A state lookup failure must not open a browser. */
 export async function isUserActive(pool: Pool, userId: string): Promise<boolean> {
   try {
