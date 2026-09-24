@@ -464,6 +464,10 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
 
   it("executes two real PostgreSQL child leases and preserves their separate root lineage", async () => {
     const executionTrees = [treeA!, treeAOther!]
+    const expectedFinalTexts = new Map(executionTrees.map((tree, index) => [
+      tree.taskId,
+      `Found deterministic evidence for child ${index === 0 ? "A" : "B"}.`,
+    ] as const))
     const queryFailures: PgQueryFailure[] = []
     const executionPool = runtimePool(ownerAPool!, userA.userId, queryFailures)
     const modelProfile = {
@@ -502,7 +506,9 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
             yield { type: "tool_call_completed", callId: `pg-child-read-${task.id}`, name: "jobs.search", arguments: {} }
             yield { type: "completed", finishReason: "tool_calls" }
           } else {
-            yield { type: "text_delta", text: `Found deterministic evidence for ${task.id}.` }
+            const finalText = expectedFinalTexts.get(task.id)
+            if (!finalText) throw new Error("Unexpected child task in PostgreSQL fixture")
+            yield { type: "text_delta", text: finalText }
             yield { type: "completed", finishReason: "stop" }
           }
         },
@@ -539,7 +545,7 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
       expect(storedTasks).toEqual(executionTrees.map(tree => expect.objectContaining({
         id: tree.taskId, status: "completed", attemptCount: 1,
         result: expect.objectContaining({
-          status: "completed", stepCount: 2, toolCallCount: 1, finalText: `Found deterministic evidence for ${tree.taskId}.`,
+          status: "completed", stepCount: 2, toolCallCount: 1, finalText: expectedFinalTexts.get(tree.taskId),
         }),
       })))
       expect(modelCalls).toEqual(new Map(executionTrees.map(tree => [tree.taskId, 2])))
