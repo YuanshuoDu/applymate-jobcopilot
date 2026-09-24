@@ -28,7 +28,7 @@ describe("legacy approval transaction fence", () => {
     vi.resetModules()
     Object.values(mocks).forEach((mock) => mock.mockReset())
     mocks.queryRaw.mockResolvedValue([{ id: "session_1" }])
-    mocks.txTurnFindFirst.mockResolvedValue({ id: "turn_1" })
+    mocks.txTurnFindFirst.mockResolvedValue({ id: "turn_1", status: "in_progress" })
     mocks.txItemFindFirst.mockResolvedValue(null)
     mocks.txItemFindMany.mockResolvedValue([{ content: { approvalId: "approval_2" } }])
     mocks.txApprovalFindMany.mockResolvedValue([{ id: "approval_2" }])
@@ -49,4 +49,45 @@ describe("legacy approval transaction fence", () => {
     expect(mocks.resolvePendingApprovalInTransaction).not.toHaveBeenCalled()
     expect(mocks.appendAgentEventWithOutboxInTransaction).not.toHaveBeenCalled()
   })
+
+  it.each(["interrupted", "cancelled", "failed", "completed", "future_status"] as const)(
+    "rejects a legacy receipt when its Turn is %s",
+    async (status) => {
+      mocks.txTurnFindFirst.mockResolvedValue({ id: "turn_1", status })
+      const { resolveLegacyOnlyInTransaction } = await import("./legacy-approval-fence")
+
+      await expect(resolveLegacyOnlyInTransaction(fakeDb(), {
+        approval: {
+          id: "approval_1", type: "send_gmail", payload: {}, turnId: "turn_1", toolCallId: "call_1",
+          jobId: "job_1", revision: 0, expiresAt: new Date(Date.now() + 60_000),
+        },
+        userId: "user_1", sessionId: "session_1", decision: "approved",
+      }, {})).rejects.toThrow("Approval turn is no longer available")
+      expect(mocks.resolvePendingApprovalInTransaction).not.toHaveBeenCalled()
+      expect(mocks.appendAgentEventWithOutboxInTransaction).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each(["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] as const)(
+    "preserves legacy receipt resolution for a live %s Turn",
+    async (status) => {
+      mocks.txTurnFindFirst.mockResolvedValue({ id: "turn_1", status })
+      mocks.txItemFindMany.mockResolvedValue([])
+      mocks.txApprovalFindMany.mockResolvedValue([])
+      mocks.resolvePendingApprovalInTransaction.mockResolvedValue({
+        turnId: "turn_1", taskId: "task_1", type: "send_gmail", scopeHash: null, revision: 1,
+      })
+      const { resolveLegacyOnlyInTransaction } = await import("./legacy-approval-fence")
+
+      await expect(resolveLegacyOnlyInTransaction(fakeDb(), {
+        approval: {
+          id: "approval_1", type: "send_gmail", payload: {}, turnId: "turn_1", toolCallId: "call_1",
+          jobId: "job_1", revision: 0, expiresAt: new Date(Date.now() + 60_000),
+        },
+        userId: "user_1", sessionId: "session_1", decision: "approved",
+      }, {})).resolves.toEqual({ disposition: "legacy_only", decision: "approved" })
+      expect(mocks.resolvePendingApprovalInTransaction).toHaveBeenCalledOnce()
+      expect(mocks.appendAgentEventWithOutboxInTransaction).toHaveBeenCalledOnce()
+    },
+  )
 })

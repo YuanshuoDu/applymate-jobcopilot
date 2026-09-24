@@ -5,6 +5,18 @@ import { appendAgentEventWithOutboxInTransaction } from "../session/fact-store"
 import { resolvePendingApprovalInTransaction } from "./decision"
 import type { LegacyApprovalResolution, ScopedApprovalRecord } from "./legacy-receipt"
 
+const ACTIVE_TURN_STATUSES = [
+  "queued",
+  "in_progress",
+  "waiting_for_dependency",
+  "waiting_for_approval",
+  "waiting_for_user",
+] as const
+
+function isActiveTurnStatus(status: string): boolean {
+  return ACTIVE_TURN_STATUSES.some((activeStatus) => activeStatus === status)
+}
+
 export class ApprovalWaitActiveError extends Error {
   readonly code = "approval_wait_active" as const
 
@@ -40,9 +52,9 @@ export async function resolveLegacyOnlyInTransaction(
 
     const turn = await tx.agentTurn.findFirst({
       where: { id: turnId, sessionId: input.sessionId, userId: input.userId },
-      select: { id: true },
+      select: { id: true, status: true },
     })
-    if (!turn) throw new Error("Approval turn is no longer available")
+    if (!turn || !isActiveTurnStatus(turn.status)) throw new Error("Approval turn is no longer available")
 
     const itemId = waitItemId("approval", approval.id)
     const ownItem = await tx.agentItem.findFirst({
