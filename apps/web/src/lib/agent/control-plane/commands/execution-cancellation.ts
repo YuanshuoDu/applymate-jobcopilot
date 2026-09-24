@@ -85,7 +85,7 @@ async function cancelAuthorizedApplicationsBeforeSubmit(
         (application."status" = 'filling'
           AND application."checkpoint" IS DISTINCT FROM 'submission_request_started')
         OR (application."status" = 'waiting_for_authorization'
-          AND application."checkpoint" = 'form_filled')
+          AND application."checkpoint" IN ('form_filled', 'queue_retry'))
       )
       AND EXISTS (
         SELECT 1 FROM "agent_approvals" AS approval

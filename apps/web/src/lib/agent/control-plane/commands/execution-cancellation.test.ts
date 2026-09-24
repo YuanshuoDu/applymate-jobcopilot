@@ -95,7 +95,7 @@ function makeTransaction(options: {
             && approval.type === "submit_application" && ["approved", "consumed"].includes(approval.status)
             && approval.payload.applicationTaskId === task.id)
           const beforeSubmit = (task.status === "filling" && task.checkpoint !== "submission_request_started")
-            || (task.status === "waiting_for_authorization" && task.checkpoint === "form_filled")
+            || (task.status === "waiting_for_authorization" && ["form_filled", "queue_retry"].includes(task.checkpoint ?? ""))
           if (task.userId !== userId || task.sessionId !== sessionId || !beforeSubmit || !authorized) continue
           task.status = "cancelled"
           task.checkpoint = "turn_stopped_before_submit"
@@ -292,7 +292,7 @@ describe("execution cancellation transaction", () => {
     const sql = query.strings?.join(" ") ?? ""
     expect(sql).toContain('application."checkpoint" IS DISTINCT FROM \'submission_request_started\'')
     expect(sql).toContain('application."status" = \'waiting_for_authorization\'')
-    expect(sql).toContain('application."checkpoint" = \'form_filled\'')
+    expect(sql).toContain('application."checkpoint" IN (\'form_filled\', \'queue_retry\')')
     expect(sql).toContain('approval."status" IN (\'approved\', \'consumed\')')
     expect(sql).toContain('approval."payload"->>\'applicationTaskId\' = application."id"')
     expect(sql).toContain('approval."turnId" =')
@@ -334,6 +334,23 @@ describe("execution cancellation transaction", () => {
     }
     expect(queuedTask).toBeUndefined()
     expect(applicationTasks[0]).toMatchObject({ status: "cancelled", checkpoint: "turn_stopped_before_submit", completedAt: expect.any(Date) })
+  })
+
+  it("cancels an approved task when queue-failure recovery wins the race before Stop", async () => {
+    // Models the enqueue-failure recovery write landing before the Stop transaction.
+    const applicationTasks: State["applicationTasks"] = [
+      { id: "application_retry", userId: "user_1", sessionId: "session_1", status: "waiting_for_authorization", checkpoint: "queue_retry", completedAt: null },
+    ]
+    const approvals: State["approvals"] = [
+      { userId: "user_1", sessionId: "session_1", turnId: "turn_1", type: "submit_application", status: "consumed", payload: { applicationTaskId: "application_retry" } },
+    ]
+    const fake = makeTransaction({ executionStatus: "running", sessionSource: "automation", activeSource: "automation", applicationTasks, approvals })
+
+    await expect(cancelExecutionInTransaction(fake.tx, { executionId: "execution_1", userId: "user_1" })).resolves.toBe(true)
+
+    expect(applicationTasks[0]).toMatchObject({ status: "cancelled", checkpoint: "turn_stopped_before_submit", completedAt: expect.any(Date) })
+    // The recovery marker cannot remain eligible for a later authorization/requeue after Stop.
+    expect(applicationTasks.some(task => task.status === "waiting_for_authorization" && task.checkpoint === "queue_retry")).toBe(false)
   })
 
   it("scope-fences linked approvals and stays idempotent when Stop is retried", async () => {
