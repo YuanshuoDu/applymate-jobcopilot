@@ -287,10 +287,11 @@ describe("AgentCommandService", () => {
     expect(started.turnId).not.toBe("stale_turn")
   })
 
-  it("queues a follow-up when the caller intentionally leaves expected Turn empty", async () => {
+  it.each(["queued", "in_progress", "waiting_for_dependency"] as const)("queues a follow-up on a %s Turn", async (status) => {
     const fake = makeDb()
     const service = new AgentCommandService(fake.db)
     const started = await service.start(startCommand("client_start"))
+    fake.state.setActive({ ...fake.state.active!, status })
 
     const result = await service.message({
       ...startCommand("client_follow_up"),
@@ -300,6 +301,55 @@ describe("AgentCommandService", () => {
     })
 
     expect(result).toMatchObject({ disposition: "queued_follow_up", turnId: started.turnId })
+  })
+
+  it.each([
+    ["waiting_for_user", "steer"],
+    ["waiting_for_user", "follow_up"],
+    ["waiting_for_approval", "steer"],
+    ["waiting_for_approval", "follow_up"],
+  ] as const)("rejects a %s Turn %s command before writing durable facts", async (status, delivery) => {
+    const fake = makeDb({ activeSource: "user", activeStatus: status })
+    const service = new AgentCommandService(fake.db)
+
+    await expect(service.message({
+      ...startCommand(`client_${status}_${delivery}`),
+      delivery,
+      expectedTurnId: "turn_1",
+    })).rejects.toMatchObject({
+      code: "turn_wait_requires_dedicated_action",
+      status: 409,
+      details: { turnId: "turn_1", status },
+    })
+
+    expect(fake.tx.agentTurn.create).not.toHaveBeenCalled()
+    expect(fake.tx.agentInput.create).not.toHaveBeenCalled()
+    expect(fake.tx.agentItem.create).not.toHaveBeenCalled()
+    expect(fake.tx.agentEvent.create).not.toHaveBeenCalled()
+    expect(fake.tx.agentOutbox.create).not.toHaveBeenCalled()
+    expect(fake.state.inputs).toHaveLength(0)
+    expect(fake.state.items).toHaveLength(0)
+    expect(fake.state.events).toHaveLength(0)
+    expect(fake.state.outbox).toHaveLength(0)
+  })
+
+  it("replays a duplicate message before applying the parked Turn guard", async () => {
+    const fake = makeDb({ activeSource: "user", activeStatus: "in_progress" })
+    const service = new AgentCommandService(fake.db)
+    const command = { ...startCommand("client_waiting_duplicate"), delivery: "follow_up" as const }
+    const accepted = await service.message(command)
+    fake.state.setActive({ ...fake.state.active!, status: "waiting_for_user" })
+
+    const duplicate = await service.message(command)
+
+    expect(duplicate).toMatchObject({
+      disposition: "duplicate",
+      inputId: accepted.inputId,
+      turnId: accepted.turnId,
+    })
+    expect(fake.state.inputs).toHaveLength(1)
+    expect(fake.state.items).toHaveLength(1)
+    expect(fake.state.events).toHaveLength(1)
   })
 
   it("does not let automation steer a user Turn", async () => {

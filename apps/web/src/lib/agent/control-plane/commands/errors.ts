@@ -1,6 +1,7 @@
 export type AgentCommandErrorCode =
   | "agent_session_not_found"
   | "active_turn_changed"
+  | "turn_wait_requires_dedicated_action"
   | "execution_changed"
   | "automation_cannot_steer_user_turn"
   | "invalid_command"
@@ -47,6 +48,18 @@ export function activeTurnChanged(expectedTurnId: string | null, actualTurnId: s
     "The active Agent Turn changed before this command was accepted",
     409,
     { expectedTurnId, actualTurnId },
+  )
+}
+
+export function turnWaitRequiresDedicatedAction(
+  turnId: string,
+  status: "waiting_for_user" | "waiting_for_approval",
+): AgentCommandError {
+  return new AgentCommandError(
+    "turn_wait_requires_dedicated_action",
+    "This Turn is waiting for a required user or approval action",
+    409,
+    { turnId, status },
   )
 }
 

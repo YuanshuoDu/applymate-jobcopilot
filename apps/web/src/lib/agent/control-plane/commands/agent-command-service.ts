@@ -1,5 +1,5 @@
 import type { PrismaClient } from "@prisma/client"
-import { AgentCommandError, activeTurnChanged, automationCannotSteerUserTurn, isUniqueViolation, retryActiveConflict, retryTargetChanged, retryTargetInvalid } from "./errors"
+import { AgentCommandError, activeTurnChanged, automationCannotSteerUserTurn, isUniqueViolation, retryActiveConflict, retryTargetChanged, retryTargetInvalid, turnWaitRequiresDedicatedAction } from "./errors"
 import { assertContent, dispositionFromEvent } from "./command-content"
 import { cancelExecutionInTransaction, interruptActiveTurn, type CancelExecutionCommand } from "./execution-cancellation"
 import { isRetryableTurnStatus, parsePersistedRetryContent } from "./retry-input"
@@ -128,6 +128,9 @@ export class AgentCommandService {
       await assertExpectedTurn(expectedTurnId, command.expectedRevision, active)
       if (command.delivery === "steer" && command.source === "automation" && active?.source === "user") {
         throw automationCannotSteerUserTurn(active.id)
+      }
+      if (active?.status === "waiting_for_user" || active?.status === "waiting_for_approval") {
+        throw turnWaitRequiresDedicatedAction(active.id, active.status)
       }
 
       if (!active) {
