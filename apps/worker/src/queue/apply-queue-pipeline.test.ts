@@ -134,11 +134,6 @@ describe("apply-queue Phase 5 pipeline", () => {
     vi.resetModules();
     vi.clearAllMocks();
     mocks.workerHandler = undefined;
-    mocks.query.mockImplementation(async (sql: string) =>
-      sql.includes('SELECT "sessionId" FROM application_tasks')
-        ? { rowCount: 1, rows: [{ sessionId: null }] }
-        : { rowCount: 1, rows: [] },
-    );
     mocks.fakePage.goto.mockResolvedValue(undefined);
     mocks.withCloakContext.mockImplementation(async (_userId: string, fn: (page: typeof mocks.fakePage) => Promise<void>) => {
       await fn(mocks.fakePage);
@@ -290,7 +285,6 @@ describe("apply-queue Phase 5 pipeline", () => {
 
   it("does not open a second browser when a previous attempt is uncertain", async () => {
     mocks.query
-      .mockResolvedValueOnce({ rowCount: 1, rows: [{ sessionId: null }] })
       .mockResolvedValueOnce({ rowCount: 0, rows: [] })
       .mockResolvedValueOnce({ rowCount: 1, rows: [{ workflowState: "submitting" }] })
       .mockResolvedValueOnce({ rowCount: 1, rows: [] });

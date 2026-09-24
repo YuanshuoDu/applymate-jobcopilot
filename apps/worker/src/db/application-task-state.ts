@@ -1,4 +1,4 @@
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 import type { FormReviewNeeds } from "../harness/form-review.js";
 import { hashAgentReceiptValue, redactSensitiveText } from "@jobcopilot/shared";
 import { createPgApprovalStore } from "../runtime/approval/pg-store.js";
@@ -21,74 +21,20 @@ export type ApplicationSubmissionStartScope = {
   jobId: string;
 };
 
-/**
- * Serialize the pre-submit gate with Stop and commit the marker before the ATS
- * provider can click. The marker is the local linearization point; a small gap
- * remains between this commit and the browser sending the request.
- */
+/** Stage the checkpoint inside the caller's Session/Turn lock transaction. */
 export async function markSubmissionRequestStarted(
-  pool: Pool,
+  client: PoolClient,
   scope: ApplicationSubmissionStartScope,
 ): Promise<boolean> {
-  const client = await pool.connect();
-  let transactionOpen = false;
-  try {
-    await client.query("BEGIN");
-    transactionOpen = true;
-    await client.query("SELECT set_config($1, $2, true)", ["app.user_id", scope.userId]);
-    const session = await client.query<{ status: string }>(
-      `SELECT "status" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 FOR UPDATE`,
-      [scope.sessionId, scope.userId],
-    );
-    const turn = await client.query<{ status: string }>(
-      `SELECT "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 FOR UPDATE`,
-      [scope.turnId, scope.sessionId, scope.userId],
-    );
-    const interrupted = await client.query<{ stopped: boolean }>(
-      `SELECT EXISTS (SELECT 1 FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'turn.interrupted') AS "stopped"`,
-      [scope.sessionId, scope.turnId],
-    );
-    const task = await client.query<{ status: string; checkpoint: string }>(
-      `SELECT "status", "checkpoint" FROM application_tasks
-        WHERE "id" = $1 AND "userId" = $2 AND "jobId" = $3 AND "sessionId" = $4 FOR UPDATE`,
-      [scope.applicationTaskId, scope.userId, scope.jobId, scope.sessionId],
-    );
-    const sessionStatus = session.rows[0]?.status;
-    const turnStatus = turn.rows[0]?.status;
-    const taskState = task.rows[0];
-    if (
-      !sessionStatus || !turnStatus || !taskState ||
-      ["aborted", "archived"].includes(sessionStatus) ||
-      turnStatus === "interrupted" || interrupted.rows[0]?.stopped === true ||
-      taskState.status !== "filling" || taskState.checkpoint !== "browser_active"
-    ) {
-      await client.query("ROLLBACK");
-      transactionOpen = false;
-      return false;
-    }
-    const updated = await client.query(
-      `UPDATE application_tasks SET "checkpoint" = 'submission_request_started', "updatedAt" = NOW()
-        WHERE "id" = $1 AND "userId" = $2 AND "jobId" = $3 AND "sessionId" = $4
-          AND "status" = 'filling' AND "checkpoint" = 'browser_active'
-        RETURNING "id"`,
-      [scope.applicationTaskId, scope.userId, scope.jobId, scope.sessionId],
-    );
-    if (updated.rowCount !== 1) {
-      await client.query("ROLLBACK");
-      transactionOpen = false;
-      return false;
-    }
-    await client.query("COMMIT");
-    transactionOpen = false;
-    return true;
-  } catch (error: unknown) {
-    if (transactionOpen) await client.query("ROLLBACK").catch(() => undefined);
-    throw error;
-  } finally {
-    client.release();
-  }
+  const result = await client.query(
+    `UPDATE application_tasks SET "checkpoint" = 'submission_request_started', "updatedAt" = NOW()
+      WHERE "id" = $1 AND "userId" = $2 AND "jobId" = $3 AND "sessionId" = $4
+        AND "status" = 'filling' AND "checkpoint" = 'browser_active'
+      RETURNING "id"`,
+    [scope.applicationTaskId, scope.userId, scope.jobId, scope.sessionId],
+  );
+  return result.rowCount === 1;
 }
-
 /** Worker-side account guard.  A state lookup failure must not open a browser. */
 export async function isUserActive(pool: Pool, userId: string): Promise<boolean> {
   try {

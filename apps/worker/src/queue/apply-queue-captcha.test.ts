@@ -123,11 +123,6 @@ describe("apply-queue CAPTCHA handling", () => {
     vi.resetModules();
     vi.clearAllMocks();
     mocks.workerHandler = undefined;
-    mocks.query.mockImplementation(async (sql: string) =>
-      sql.includes('SELECT "sessionId" FROM application_tasks')
-        ? { rowCount: 1, rows: [{ sessionId: null }] }
-        : { rowCount: 1, rows: [] },
-    );
     mocks.fakePage.goto.mockResolvedValue(undefined);
     mocks.fakePage.url.mockReturnValue(payload.applyUrl);
     mocks.withCloakContext.mockImplementation(async (_userId: string, fn: (page: typeof mocks.fakePage) => Promise<void>) => {
