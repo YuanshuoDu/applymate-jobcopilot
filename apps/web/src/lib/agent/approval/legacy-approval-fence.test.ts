@@ -11,7 +11,10 @@ const mocks = vi.hoisted(() => ({
   appendAgentEventWithOutboxInTransaction: vi.fn(),
 }))
 
-vi.mock("./decision", () => ({ resolvePendingApprovalInTransaction: mocks.resolvePendingApprovalInTransaction }))
+vi.mock("./decision", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./decision")>()),
+  resolvePendingApprovalInTransaction: mocks.resolvePendingApprovalInTransaction,
+}))
 vi.mock("../session/fact-store", () => ({ appendAgentEventWithOutboxInTransaction: mocks.appendAgentEventWithOutboxInTransaction }))
 
 function fakeDb() {
@@ -61,6 +64,21 @@ describe("legacy approval transaction fence", () => {
       }),
       data: { status: "in_progress" },
     })
+  })
+
+  it("preserves the legacy inactive-Turn error when the shared active check rejects", async () => {
+    mocks.txTurnFindFirst.mockResolvedValue({ id: "turn_1", status: "interrupted" })
+    const { ApprovalTurnInactiveError, resumeLegacyApprovalTurnInTransaction } = await import("./legacy-approval-fence")
+    const result = resumeLegacyApprovalTurnInTransaction(fakeDb(), {
+      sessionId: "session_1", userId: "user_1", turnId: "turn_1",
+    })
+
+    await expect(result).rejects.toMatchObject({
+      code: "approval_turn_inactive",
+      message: "Approval turn is no longer active",
+    })
+    await expect(result).rejects.toBeInstanceOf(ApprovalTurnInactiveError)
+    expect(mocks.txTurnUpdateMany).not.toHaveBeenCalled()
   })
 
   it.each(["aborted", "archived"] as const)("rejects both legacy resolution and Turn resume for a %s session", async () => {
@@ -120,7 +138,10 @@ describe("legacy approval transaction fence", () => {
           jobId: "job_1", revision: 0, expiresAt: new Date(Date.now() + 60_000),
         },
         userId: "user_1", sessionId: "session_1", decision: "approved",
-      }, {})).rejects.toThrow("Approval turn is no longer available")
+      }, {})).rejects.toMatchObject({
+        code: "approval_turn_inactive",
+        message: "Approval turn is no longer available",
+      })
       expect(mocks.resolvePendingApprovalInTransaction).not.toHaveBeenCalled()
       expect(mocks.appendAgentEventWithOutboxInTransaction).not.toHaveBeenCalled()
     },

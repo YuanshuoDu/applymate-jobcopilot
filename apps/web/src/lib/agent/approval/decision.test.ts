@@ -11,6 +11,7 @@ function makeTransaction(
   status: "pending" | "consumed" = "pending",
   freshness: FreshnessState = { hasRequest: true, hasGoalRevision: false },
   sessionPresent = true,
+  turnStatus = "in_progress",
 ) {
   const row = {
     id: "approval_1",
@@ -36,8 +37,9 @@ function makeTransaction(
       findFirst: vi.fn(async () => row),
       updateMany: vi.fn(async () => ({ count: 1 })),
     },
+    agentTurn: { findFirst: vi.fn(async () => ({ id: row.turnId, status: turnStatus })) },
   }
-  return { row, tx: tx as unknown as Prisma.TransactionClient, rawQuery: tx.$queryRaw }
+  return { row, tx: tx as unknown as Prisma.TransactionClient, rawQuery: tx.$queryRaw, turnFindFirst: tx.agentTurn.findFirst }
 }
 
 const input = {
@@ -65,6 +67,18 @@ describe("Web pending approval freshness", () => {
     const fake = makeTransaction("pending", { hasRequest: false, hasGoalRevision: false })
 
     await expect(resolvePendingApprovalInTransaction(fake.tx, input)).rejects.toMatchObject({ code: "approval_integrity_error" })
+    expect(fake.tx.agentApproval.updateMany).not.toHaveBeenCalled()
+  })
+
+  it("rejects a terminal Turn after locking its session", async () => {
+    const fake = makeTransaction("pending", undefined, true, "interrupted")
+
+    await expect(resolvePendingApprovalInTransaction(fake.tx, input)).rejects.toMatchObject({
+      code: "approval_scope_mismatch",
+      message: "Approval turn is no longer active",
+    })
+    expect(fake.rawQuery.mock.invocationCallOrder[0]).toBeLessThan(fake.turnFindFirst.mock.invocationCallOrder[0])
+    expect(fake.tx.$queryRaw).toHaveBeenCalledOnce()
     expect(fake.tx.agentApproval.updateMany).not.toHaveBeenCalled()
   })
 

@@ -13,7 +13,6 @@ import {
 
 import { appendAgentEventWithOutboxInTransaction } from "../session/fact-store"
 import { projectApprovalWaitInTransaction } from "../broker/item-projector"
-import { ApprovalTurnInactiveError, assertActiveTurnInTransaction } from "./legacy-approval-fence"
 import { assertApprovalFreshnessInTransaction, resolvePendingApprovalInTransaction } from "./decision"
 import {
   ApprovalStoreError,
@@ -219,13 +218,7 @@ export async function consumeApprovalAndReserve(
     return await db.$transaction(async (tx) => {
       const row = await loadApproval(tx, id, expected.userId)
       const scope = await assertScope(row, expected, now)
-      await assertApprovalFreshnessInTransaction(tx, { id: row.id, sessionId: row.sessionId, turnId: scope.turnId })
-      try {
-        await assertActiveTurnInTransaction(tx, { turnId: scope.turnId, sessionId: scope.sessionId, userId: expected.userId })
-      } catch (error) {
-        if (!(error instanceof ApprovalTurnInactiveError)) throw error
-        throw new ApprovalStoreError("approval_scope_mismatch", "Approval turn is no longer active")
-      }
+      await assertApprovalFreshnessInTransaction(tx, { id: row.id, sessionId: row.sessionId, turnId: scope.turnId, userId: expected.userId })
       const updated = await tx.agentApproval.updateMany({
         where: { id, userId: expected.userId, status: "approved", revision: expected.revision, scopeHash: row.scopeHash, nonceHash: row.nonceHash, expiresAt: { gt: now } },
         data: { status: "consumed", consumedAt: now },

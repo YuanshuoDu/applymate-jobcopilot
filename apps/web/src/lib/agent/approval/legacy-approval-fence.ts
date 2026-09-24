@@ -1,14 +1,10 @@
-import { Prisma, type PrismaClient } from "@prisma/client"
+import type { PrismaClient } from "@prisma/client"
 
 import { waitItemId } from "../broker/item-ids"
 import { ACTIVE_TURN_STATUSES, lockOpenSession } from "../control-plane/commands/transaction"
 import { appendAgentEventWithOutboxInTransaction } from "../session/fact-store"
-import { resolvePendingApprovalInTransaction } from "./decision"
+import { assertApprovalTurnActiveInTransaction, resolvePendingApprovalInTransaction } from "./decision"
 import type { LegacyApprovalResolution, ScopedApprovalRecord } from "./legacy-receipt"
-
-function isActiveTurnStatus(status: string): boolean {
-  return ACTIVE_TURN_STATUSES.some((activeStatus) => activeStatus === status)
-}
 
 export class ApprovalTurnInactiveError extends Error {
   readonly code = "approval_turn_inactive" as const
@@ -19,17 +15,20 @@ export class ApprovalTurnInactiveError extends Error {
   }
 }
 
-export async function assertActiveTurnInTransaction(
-  tx: Prisma.TransactionClient,
+async function assertLegacyTurnActiveInTransaction(
+  tx: Parameters<typeof assertApprovalTurnActiveInTransaction>[0],
   scope: { userId: string; sessionId: string; turnId: string },
   inactiveMessage?: string,
-) {
-  const turn = await tx.agentTurn.findFirst({
-    where: { id: scope.turnId, sessionId: scope.sessionId, userId: scope.userId },
-    select: { id: true, status: true },
-  })
-  if (!turn || !isActiveTurnStatus(turn.status)) throw new ApprovalTurnInactiveError(inactiveMessage)
-  return turn
+): Promise<void> {
+  try {
+    await assertApprovalTurnActiveInTransaction(tx, scope, inactiveMessage)
+  } catch (error) {
+    const code = error && typeof error === "object" && "code" in error ? error.code : undefined
+    if (code === "approval_scope_mismatch" && error instanceof Error) {
+      throw new ApprovalTurnInactiveError(error.message)
+    }
+    throw error
+  }
 }
 
 export async function resumeLegacyApprovalTurnInTransaction(
@@ -38,7 +37,7 @@ export async function resumeLegacyApprovalTurnInTransaction(
 ): Promise<void> {
   await db.$transaction(async (tx) => {
     await lockOpenSession(tx, scope.sessionId, scope.userId)
-    await assertActiveTurnInTransaction(tx, scope)
+    await assertLegacyTurnActiveInTransaction(tx, scope)
     const updated = await tx.agentTurn.updateMany({
       where: {
         id: scope.turnId,
@@ -80,7 +79,7 @@ export async function resolveLegacyOnlyInTransaction(
   return db.$transaction(async (tx) => {
     await lockOpenSession(tx, input.sessionId, input.userId)
 
-    await assertActiveTurnInTransaction(tx, { turnId, sessionId: input.sessionId, userId: input.userId }, "Approval turn is no longer available")
+    await assertLegacyTurnActiveInTransaction(tx, { turnId, sessionId: input.sessionId, userId: input.userId }, "Approval turn is no longer available")
 
     const itemId = waitItemId("approval", approval.id)
     const ownItem = await tx.agentItem.findFirst({

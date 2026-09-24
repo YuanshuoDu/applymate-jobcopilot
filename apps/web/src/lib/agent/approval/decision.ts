@@ -1,5 +1,6 @@
 import { Prisma } from "@prisma/client"
 
+import { ACTIVE_TURN_STATUSES } from "../control-plane/commands/transaction"
 import { ApprovalStoreError, type ApprovalDecision } from "./types"
 
 type Tx = Prisma.TransactionClient
@@ -30,6 +31,21 @@ interface ApprovalFreshnessRow {
   id: string
   sessionId: string
   turnId: string
+  userId: string
+}
+
+export async function assertApprovalTurnActiveInTransaction(
+  tx: Tx,
+  scope: { userId: string; sessionId: string; turnId: string },
+  inactiveMessage = "Approval turn is no longer active",
+): Promise<void> {
+  const turn = await tx.agentTurn.findFirst({
+    where: { id: scope.turnId, sessionId: scope.sessionId, userId: scope.userId },
+    select: { id: true, status: true },
+  })
+  if (!turn || !ACTIVE_TURN_STATUSES.some((status) => status === turn.status)) {
+    throw new ApprovalStoreError("approval_scope_mismatch", inactiveMessage)
+  }
 }
 
 /**
@@ -46,6 +62,7 @@ export async function assertApprovalFreshnessInTransaction(tx: Tx, row: Approval
     FOR UPDATE
   `)
   if (!session[0]) throw new ApprovalStoreError("approval_not_found", "Approval session is no longer available")
+  await assertApprovalTurnActiveInTransaction(tx, row)
 
   const state = await tx.$queryRaw<Array<{ hasRequest: boolean; hasGoalRevision: boolean }>>(Prisma.sql`
     WITH request AS (
@@ -87,7 +104,7 @@ export async function resolvePendingApprovalInTransaction(
   if (typeof turnId !== "string" || turnId.length === 0) throw new ApprovalStoreError("approval_integrity_error", "Legacy approval records cannot become scoped receipts")
   if (row.status !== "pending") throw new ApprovalStoreError(row.status === "consumed" ? "approval_already_consumed" : "approval_not_approved", "Approval receipt is no longer pending")
   if (row.expiresAt && row.expiresAt <= input.now) throw new ApprovalStoreError("approval_expired", "Approval receipt has expired")
-  await assertApprovalFreshnessInTransaction(tx, { id: row.id, sessionId: row.sessionId, turnId })
+  await assertApprovalFreshnessInTransaction(tx, { id: row.id, sessionId: row.sessionId, turnId, userId: input.userId })
   const updated = await tx.agentApproval.updateMany({
     where: { id: input.id, userId: input.userId, sessionId: input.sessionId, status: "pending", turnId, revision: row.revision },
     data: { status: input.decision, decidedAt: input.now },
