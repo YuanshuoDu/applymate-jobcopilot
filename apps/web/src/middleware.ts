@@ -58,7 +58,12 @@ export async function middleware(req: NextRequest) {
   // The visual Agent workspace preview is intentionally limited to a local
   // developer session or an explicitly flagged local production fixture.
   if (pathname === '/agent-preview' && isAgentPreviewRequestAllowed({
-    environment: { NODE_ENV: process.env.NODE_ENV, AGENT_PREVIEW_FIXTURE: process.env.AGENT_PREVIEW_FIXTURE },
+    environment: {
+      NODE_ENV: process.env.NODE_ENV,
+      AGENT_PREVIEW_FIXTURE: process.env.AGENT_PREVIEW_FIXTURE,
+      VERCEL: process.env.VERCEL,
+      VERCEL_ENV: process.env.VERCEL_ENV,
+    },
     hostname, hostHeader: req.headers.get('host'), forwardedHost: req.headers.get('x-forwarded-host'),
   })) {
     return NextResponse.next()

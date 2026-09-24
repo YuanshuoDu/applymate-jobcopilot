@@ -1,6 +1,8 @@
 type PreviewEnvironment = {
   readonly NODE_ENV?: string
   readonly AGENT_PREVIEW_FIXTURE?: string
+  readonly VERCEL?: string
+  readonly VERCEL_ENV?: string
 }
 
 type PreviewRequest = {
@@ -12,10 +14,11 @@ type PreviewRequest = {
 
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]'])
 
-/** Keeps the local supervisor fixture disabled in production unless explicitly enabled for tests. */
+/** Keeps the supervisor fixture local, even when a production-mode test explicitly enables it. */
 export function isAgentPreviewFixtureEnabled(environment: PreviewEnvironment): boolean {
-  return environment.NODE_ENV === 'development'
-    || environment.NODE_ENV === 'production' && environment.AGENT_PREVIEW_FIXTURE === '1'
+  if (environment.NODE_ENV === 'development') return true
+  if (environment.NODE_ENV !== 'production' || environment.AGENT_PREVIEW_FIXTURE !== '1') return false
+  return environment.VERCEL === undefined && environment.VERCEL_ENV === undefined
 }
 
 /** Requires every host identity supplied by a request to remain on loopback. */

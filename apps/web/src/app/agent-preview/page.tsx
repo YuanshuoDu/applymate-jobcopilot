@@ -6,9 +6,15 @@ import { AgentSupervisorPreviewClient } from './AgentSupervisorPreviewClient'
 export default async function AgentPreviewPage({ searchParams }: { searchParams: Promise<{ supervisor?: string; locale?: string; applicationReview?: string }> }) {
   const requestHeaders = await headers()
   const hostHeader = requestHeaders.get('host')
-  if (!isAgentPreviewFixtureEnabled({ NODE_ENV: process.env.NODE_ENV, AGENT_PREVIEW_FIXTURE: process.env.AGENT_PREVIEW_FIXTURE }) ||
+  const environment = {
+    NODE_ENV: process.env.NODE_ENV,
+    AGENT_PREVIEW_FIXTURE: process.env.AGENT_PREVIEW_FIXTURE,
+    VERCEL: process.env.VERCEL,
+    VERCEL_ENV: process.env.VERCEL_ENV,
+  }
+  if (!isAgentPreviewFixtureEnabled(environment) ||
     !isAgentPreviewRequestAllowed({
-      environment: { NODE_ENV: process.env.NODE_ENV, AGENT_PREVIEW_FIXTURE: process.env.AGENT_PREVIEW_FIXTURE },
+      environment,
       hostname: hostHeader ?? '', hostHeader, forwardedHost: requestHeaders.get('x-forwarded-host'),
     })) notFound()
   const params = await searchParams
