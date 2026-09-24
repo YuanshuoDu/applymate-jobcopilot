@@ -29,14 +29,14 @@ async function approvalRow(nonce = "nonce_1"): Promise<Prisma.AgentApprovalGetPa
   }
 }
 
-type FreshnessState = { hasRequest?: boolean; hasRevision?: boolean; sessionPresent?: boolean }
+type FreshnessState = { hasRequest?: boolean; hasGoalRevision?: boolean; sessionPresent?: boolean }
 
 function mockDb(row: Prisma.AgentApprovalGetPayload<{}>, freshness: FreshnessState = {}) {
   const tx = {
     $queryRaw: vi.fn(async (query?: { strings?: readonly string[] }) => {
       const sql = query?.strings?.join(" ") ?? ""
       if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return freshness.sessionPresent === false ? [] : [{ id: row.sessionId }]
-      if (sql.includes("WITH request")) return [{ hasRequest: freshness.hasRequest !== false, hasRevision: freshness.hasRevision === true }]
+      if (sql.includes("WITH request")) return [{ hasRequest: freshness.hasRequest !== false, hasGoalRevision: freshness.hasGoalRevision === true }]
       return [{ eventSequence: BigInt(9) }]
     }),
     agentSession: { findFirst: vi.fn(async () => ({ id: row.sessionId })) },
@@ -121,9 +121,9 @@ describe("Web approval receipt store", () => {
     expect(tx.agentEvent.create).toHaveBeenCalledTimes(2)
   })
 
-  it.each(["goal.revision", "plan.revision"] as const)("rejects consumption after a durable %s event", async () => {
+  it("rejects consumption after a durable goal revision event", async () => {
     const row = await approvalRow()
-    const { db, tx } = mockDb(row, { hasRevision: true })
+    const { db, tx } = mockDb(row, { hasGoalRevision: true })
 
     await expect(consumeApprovalAndReserve(db, row.id, { ...scopeInput, nonce: "nonce_1" }, { idempotencyKey: "submit:task_1" }, timeAt(1))).rejects.toMatchObject({ code: "approval_revision_mismatch" })
     expect(tx.agentApproval.updateMany).not.toHaveBeenCalled()
@@ -142,7 +142,7 @@ describe("Web approval receipt store", () => {
 
   it("preserves consumed receipt replay semantics without a freshness read", async () => {
     const row = { ...(await approvalRow()), status: "consumed", consumedAt: timeAt(1) }
-    const { db, tx } = mockDb(row, { hasRequest: false, hasRevision: true })
+    const { db, tx } = mockDb(row, { hasRequest: false, hasGoalRevision: true })
 
     await expect(consumeApproval(db, row.id, { ...scopeInput, nonce: "nonce_1" }, timeAt(2))).rejects.toMatchObject({ code: "approval_already_consumed" })
     expect(tx.$queryRaw).not.toHaveBeenCalled()

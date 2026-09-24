@@ -35,7 +35,7 @@ interface ApprovalFreshnessRow {
 /**
  * Serializes the decision with session-scoped event writes, then checks the
  * durable request lineage and revision events before the approval mutates.
- * Event sequence is session-global, so a later goal/plan revision is stale
+ * Event sequence is session-global, so a later goal revision is stale
  * even when it belongs to a different Turn in the same session.
  */
 export async function assertApprovalFreshnessInTransaction(tx: Tx, row: ApprovalFreshnessRow): Promise<void> {
