@@ -25,6 +25,9 @@ const mocks = vi.hoisted(() => ({
   resumeFindFirst: vi.fn(),
   jobFindFirst: vi.fn(),
   jobUpdate: vi.fn(),
+  applicationTaskUpdateMany: vi.fn(),
+  queueApplicationFill: vi.fn(),
+  queueAutonomousApplication: vi.fn(),
   tailorResumeForAgent: vi.fn(),
   loadUserAiConfig: vi.fn(),
   enqueueApplyTask: vi.fn(),
@@ -53,12 +56,17 @@ vi.mock("@/lib/db", () => ({
     agentTranscriptEvent: { create: mocks.transcriptCreate },
     resume: { findFirst: mocks.resumeFindFirst },
     job: { findFirst: mocks.jobFindFirst, update: mocks.jobUpdate },
+    applicationTask: { updateMany: mocks.applicationTaskUpdateMany },
   },
 }))
 
 vi.mock("@/lib/model-router", () => ({ loadUserAiConfig: mocks.loadUserAiConfig }))
 vi.mock("@/lib/entitlements", () => ({ isFeatureAllowed: mocks.isFeatureAllowed, resolveAiAccess: mocks.resolveAiAccess }))
 vi.mock("@/lib/agent/resume-tailoring", () => ({ tailorResumeForAgent: mocks.tailorResumeForAgent }))
+vi.mock("@/lib/auto-apply", () => ({
+  queueApplicationFill: mocks.queueApplicationFill,
+  queueAutonomousApplication: mocks.queueAutonomousApplication,
+}))
 vi.mock("@/lib/apply-queue-client", () => ({ enqueueApplyTask: mocks.enqueueApplyTask }))
 vi.mock("@/lib/agent/approval/legacy-receipt", () => ({
   clientReceipt: mocks.clientReceipt,
@@ -114,6 +122,7 @@ function canonicalResolution(decision: "approved" | "rejected", disposition: "re
 
 const ctx = { params: Promise.resolve({ id: "session_1" }) }
 let turnStatus = "waiting_for_approval"
+let applicationTaskStatus = "waiting_for_authorization"
 
 describe("agent session actions API", () => {
   beforeEach(() => {
@@ -142,11 +151,20 @@ describe("agent session actions API", () => {
     mocks.resumeFindFirst.mockReset()
     mocks.jobFindFirst.mockReset()
     mocks.jobUpdate.mockReset()
+    mocks.applicationTaskUpdateMany.mockReset()
+    mocks.queueApplicationFill.mockReset()
+    mocks.queueAutonomousApplication.mockReset()
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
     mocks.sessionFindFirst.mockResolvedValue({ id: "session_1" })
     turnStatus = "waiting_for_approval"
     mocks.queryRaw.mockResolvedValue([{ id: "session_1" }])
     mocks.agentTurnFindFirst.mockImplementation(async () => ({ id: "turn_1", status: turnStatus }))
+    applicationTaskStatus = "waiting_for_authorization"
+    mocks.applicationTaskUpdateMany.mockImplementation(async (args: { where: { status?: string }; data: { status: string } }) => {
+      if (args.where.status && args.where.status !== applicationTaskStatus) return { count: 0 }
+      applicationTaskStatus = args.data.status
+      return { count: 1 }
+    })
     mocks.agentTurnUpdateMany.mockImplementation(async (args: { where: { status: { in: string[] } }; data: { status: string } }) => {
       if (!args.where.status.in.includes(turnStatus)) return { count: 0 }
       turnStatus = args.data.status
@@ -173,6 +191,8 @@ describe("agent session actions API", () => {
     mocks.loadUserAiConfig.mockResolvedValue({ provider: 'openai', model: 'test' })
     mocks.tailorResumeForAgent.mockResolvedValue({ id: 'resume_tailored', name: 'Tailored for N26', jobId: 'job_1', company: 'N26', role: 'Backend Engineer', reused: false })
     mocks.enqueueApplyTask.mockResolvedValue('apply_task_1')
+    mocks.queueApplicationFill.mockResolvedValue({ taskId: "fill_task_1" })
+    mocks.queueAutonomousApplication.mockResolvedValue({ taskId: "submit_task_1" })
     mocks.isFeatureAllowed.mockReset()
     mocks.resolveAiAccess.mockReset()
     mocks.isFeatureAllowed.mockResolvedValue(true)
@@ -445,6 +465,39 @@ describe("agent session actions API", () => {
     expect(mocks.sessionUpdate).not.toHaveBeenCalled()
     expect(mocks.tailorResumeForAgent).not.toHaveBeenCalled()
     expect(mocks.enqueueApplyTask).not.toHaveBeenCalled()
+  })
+
+  it("does not reopen a submission task when Stop cancels it during queue continuation", async () => {
+    mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({
+      type: "submit_application",
+      payload: { applicationTaskId: "task_1", jobId: "job_1", resumeId: "resume_1", coverLetterId: null },
+    }))
+    mocks.jobFindFirst.mockResolvedValueOnce({ url: "https://jobs.example/apply" })
+    mocks.queueAutonomousApplication.mockImplementationOnce(async () => {
+      turnStatus = "interrupted"
+      applicationTaskStatus = "cancelled"
+      throw new Error("This application is no longer ready for the approved submission step.")
+    })
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest({
+      type: "approval_response",
+      approvalId: "approval_1",
+      decision: "approved",
+      receiptNonce: "nonce_1",
+    }) as never, ctx)
+
+    expect(res.status).toBe(409)
+    expect(turnStatus).toBe("interrupted")
+    expect(applicationTaskStatus).toBe("cancelled")
+    expect(mocks.applicationTaskUpdateMany).toHaveBeenCalledWith({
+      where: { id: "task_1", userId: "user_1", status: "waiting_for_authorization" },
+      data: {
+        status: "waiting_for_authorization",
+        checkpoint: "queue_retry",
+        error: "This application is no longer ready for the approved submission step.",
+      },
+    })
   })
 
   it("returns a duplicate canonical disposition without replaying the action", async () => {

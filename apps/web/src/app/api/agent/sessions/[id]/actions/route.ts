@@ -435,7 +435,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
       return ok({ event: serializeEvent(event) })
     } catch (error) {
       const message = error instanceof Error ? error.message : "Could not queue the approved application."
-      await db.applicationTask.updateMany({ where: { id: payload.applicationTaskId, userId: auth.userId }, data: { status: "waiting_for_authorization", checkpoint: "queue_retry", error: message } })
+      await db.applicationTask.updateMany({ where: { id: payload.applicationTaskId, userId: auth.userId, status: "waiting_for_authorization" }, data: { status: "waiting_for_authorization", checkpoint: "queue_retry", error: message } })
       return err(message, 409)
     }
   }
