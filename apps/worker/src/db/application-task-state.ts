@@ -76,6 +76,7 @@ export async function finishApplicationTask(
            "completedAt" = CASE WHEN $2 IN ('submitted', 'failed') THEN NOW() ELSE NULL END,
            "updatedAt" = NOW()
      WHERE id = $1 AND status NOT IN ('cancelled', 'submitted')
+       AND NOT (status = 'waiting_for_user' AND "checkpoint" = 'submission_uncertain' AND $2 <> 'submitted')
        AND (status IS DISTINCT FROM $2 OR "checkpoint" IS DISTINCT FROM $3 OR error IS DISTINCT FROM $4)
      RETURNING "sessionId"`,
     [taskId, status, checkpoint, error],

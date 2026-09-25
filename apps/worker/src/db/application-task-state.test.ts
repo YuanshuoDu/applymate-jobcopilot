@@ -76,6 +76,42 @@ describe("finishApplicationTask", () => {
     expect(String(query.mock.calls[0]?.[0])).toContain('RETURNING "sessionId"');
   });
 
+  it("suppresses a late account-suspended failure after submission became uncertain", async () => {
+    const { pool, query } = testPool();
+    query.mockResolvedValueOnce({ rowCount: 0, rows: [] });
+
+    await finishApplicationTask(pool, "task_1", "failed", "account_suspended", "Account suspended by an administrator.");
+
+    const transition = String(query.mock.calls[0]?.[0]);
+    expect(transition).toContain("status = 'waiting_for_user'");
+    expect(transition).toContain("\"checkpoint\" = 'submission_uncertain'");
+    expect(transition).toContain("$2 <> 'submitted'");
+    expect(query.mock.calls[0]?.[1]).toEqual([
+      "task_1", "failed", "account_suspended", "Account suspended by an administrator.",
+    ]);
+    // A rejected transition must not create a misleading event or refresh the session.
+    expect(query).toHaveBeenCalledOnce();
+  });
+
+  it("allows an explicit submitted confirmation to resolve submission uncertainty", async () => {
+    const { pool, query } = testPool();
+    query
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ sessionId: "session_1" }] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] })
+      .mockResolvedValueOnce({ rows: [{ status: "filling" }] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] });
+
+    await finishApplicationTask(pool, "task_1", "submitted", "submission_verified", null);
+
+    const transition = String(query.mock.calls[0]?.[0]);
+    expect(transition).toContain("AND NOT (status = 'waiting_for_user' AND \"checkpoint\" = 'submission_uncertain' AND $2 <> 'submitted')");
+    expect(query.mock.calls[0]?.[1]).toEqual(["task_1", "submitted", "submission_verified", null]);
+    expect(query.mock.calls[1]?.[0]).toContain("INSERT INTO application_task_events");
+    expect(query.mock.calls[1]?.[1]).toEqual(["task_1", "submitted", "submission_verified"]);
+    expect(query.mock.calls[3]?.[1]).toEqual(["session_1", "running"]);
+    expect(query).toHaveBeenCalledTimes(4);
+  });
+
   it("suppresses a duplicate uncertainty callback after its first transition", async () => {
     const { pool, query } = testPool();
     query.mockResolvedValueOnce({ rowCount: 0, rows: [] });
