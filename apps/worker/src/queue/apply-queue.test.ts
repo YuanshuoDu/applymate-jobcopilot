@@ -179,11 +179,13 @@ type MockRequestRoute = {
   fallback(): Promise<void>;
 };
 
-async function dispatchPageRequest(url: string, method: string, options: { continueError?: Error; continueNeverResolves?: boolean; frame?: "main" | "iframe" | "other-tab" | "popup" | "unknown"; navigation?: boolean } = {}): Promise<{
+type MockPageRouteResult = {
   continue: ReturnType<typeof vi.fn>;
   abort: ReturnType<typeof vi.fn>;
   fallback: ReturnType<typeof vi.fn>;
-} | null> {
+};
+
+async function dispatchPageRequest(url: string, method: string, options: { continueError?: Error; continueNeverResolves?: boolean; frame?: "main" | "iframe" | "other-tab" | "popup" | "unknown"; navigation?: boolean; onRouteCreated?: (route: MockPageRouteResult) => void } = {}): Promise<MockPageRouteResult | null> {
   const matcher = mockPageRouting.matcher;
   if (matcher && !matcher(new URL(url))) return null;
   const requestFrame = options.frame === "iframe"
@@ -213,6 +215,7 @@ async function dispatchPageRequest(url: string, method: string, options: { conti
     abort: vi.fn().mockResolvedValue(undefined),
     fallback: vi.fn().mockResolvedValue(undefined),
   };
+  options.onRouteCreated?.(route);
   const handler = mockPageRouting.handler as ((value: MockRequestRoute) => Promise<void>) | undefined;
   if (handler) await handler(route);
   return route;
@@ -852,6 +855,74 @@ describe("apply-queue (unit — mocked)", () => {
       expect.anything(), "application-task-1", "waiting_for_user", "submission_uncertain", expect.stringContaining("started"),
     );
     expect(mockInsertApplyResult).toHaveBeenCalledTimes(1);
+  });
+
+  it("aborts a paused submission when timeout catch starts before fence acquisition resolves", async () => {
+    let releaseFenceAcquisition!: () => void;
+    const fenceAcquisitionGate = new Promise<void>((resolve) => { releaseFenceAcquisition = resolve; });
+    let beginCount = 0;
+    let commitCountBeforeFence = 0;
+    const defaultTurnQuery = mockTurnClient.query.getMockImplementation();
+    mockTurnClient.query.mockImplementation(async (sql: string) => {
+      if (sql === "BEGIN") {
+        beginCount += 1;
+        if (beginCount === 2) {
+          commitCountBeforeFence = mockTurnClient.query.mock.calls.filter(([query]) => query === "COMMIT").length;
+          await fenceAcquisitionGate;
+        }
+      }
+      return defaultTurnQuery!(sql);
+    });
+
+    vi.stubEnv("APPLY_TIMEOUT_MS", "100");
+    vi.resetModules();
+    const pausedRoute: { current: MockPageRouteResult | null } = { current: null };
+    configureMockBrowserSubmitTool();
+    mockHarnessRun.mockImplementation(async (_page: unknown, task: { beforeSubmit?: (intent?: { url: string; method: string }) => Promise<boolean> }) => {
+      const intent = { url: "https://example.com/jobs/123/apply", method: "POST" };
+      if (!await task.beforeSubmit?.(intent)) {
+        return { status: "submission_blocked", error: "Submission guard denied.", durationMs: 123 };
+      }
+      await dispatchPageRequest(intent.url, intent.method, { onRouteCreated: (route) => { pausedRoute.current = route; } });
+      return { status: "submitted", error: null, durationMs: 123 };
+    });
+
+    let pendingProcessor: Promise<unknown> | null = null;
+    try {
+      await import("./apply-queue.js");
+      pendingProcessor = Promise.resolve(mockProcessor({
+        data: {
+          applicationTaskId: "application-task-1", operation: "submit", jobId: "job-1", userId: "user-1",
+          applyUrl: "https://example.com/jobs/123/apply", personaId: "persona-1", resumePath: "/resume.pdf", dryRun: false,
+          receiptId: "approval-1", constraintHash: "c".repeat(64),
+        },
+      }));
+      await vi.waitFor(() => expect(beginCount).toBe(2), { timeout: 2_000 });
+      await vi.waitFor(() => {
+        expect(mockInsertApplyResult).toHaveBeenCalledWith(expect.objectContaining({
+          status: "manual",
+          error: expect.stringContaining("Apply timeout"),
+        }));
+      }, { timeout: 2_000 });
+    } finally {
+      releaseFenceAcquisition();
+      if (pendingProcessor) await pendingProcessor;
+      mockTurnClient.query.mockImplementation(defaultTurnQuery!);
+      vi.unstubAllEnvs();
+      vi.resetModules();
+    }
+
+    expect(pausedRoute.current).not.toBeNull();
+    expect(pausedRoute.current?.abort).toHaveBeenCalledOnce();
+    expect(pausedRoute.current?.continue).not.toHaveBeenCalled();
+    expect(mockProviderSubmitClick).not.toHaveBeenCalled();
+    expect(mockMarkSubmissionRequestStarted).toHaveBeenCalledOnce();
+    expect(mockTurnClient.query).toHaveBeenCalledWith("ROLLBACK");
+    expect(mockTurnClient.query.mock.calls.filter(([sql]) => sql === "COMMIT")).toHaveLength(commitCountBeforeFence);
+    expect(mockTurnClient.release).toHaveBeenCalledTimes(2);
+    expect(mockFinishApplicationTask).toHaveBeenCalledWith(
+      expect.anything(), "application-task-1", "waiting_for_user", "user_takeover", expect.stringContaining("Apply timeout"),
+    );
   });
 
   it("preserves uncertainty in catch finalization after the request-start fence", async () => {

@@ -477,7 +477,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                         return;
                       }
                       pendingSubmissionFence = fence;
-                      if (stopController.signal.aborted || turnStopped) {
+                      if (stopController.signal.aborted || turnStopped || queueCatchStarted) {
                         await route.abort("aborted").catch(() => undefined);
                         await releaseSubmissionFence(false);
                         return;
