@@ -107,6 +107,28 @@ describe("createPgRootTaskStore", () => {
     expect(taskUpdate).not.toContain('"leaseExpiresAt" > CURRENT_TIMESTAMP')
   })
 
+  it("accepts an already-committed matching root receipt without rewriting terminal identity", async () => {
+    const calls: string[] = []
+    const result = { status: "completed" as const, stepCount: 2, toolCallCount: 1, finalItemId: "final-item" }
+    const client = { query: vi.fn(async (sql: string) => {
+      calls.push(sql)
+      if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: lease.sessionId }], rowCount: 1 }
+      if (sql.includes('FROM "agent_turns"') && sql.includes("status")) return sql.includes(`"status" = 'completed'`)
+        ? { rows: [{ id: lease.turnId }], rowCount: 1 }
+        : { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "sub_agent_tasks"') && sql.includes('"status", "result"')) return { rows: [{ status: "completed", result, failureReason: null }], rowCount: 1 }
+      return { rows: [], rowCount: 1 }
+    }), release: vi.fn() }
+    const pool = { connect: vi.fn(async () => client) } as never
+
+    await expect(createPgRootTaskStore(pool).finish({ lease, rootTaskId: "root-turn-1", result })).resolves.toBeUndefined()
+
+    expect(calls.findIndex(sql => sql.includes('FROM "agent_sessions"'))).toBeLessThan(calls.findIndex(sql => sql.includes('FROM "agent_turns"')))
+    expect(calls.findIndex(sql => sql.includes('FROM "agent_turns"') && sql.includes(`"status" = 'completed'`))).toBeLessThan(calls.findIndex(sql => sql.includes('FROM "sub_agent_tasks"') && sql.includes('"status", "result"')))
+    expect(calls.some(sql => sql.includes('UPDATE "sub_agent_tasks"'))).toBe(false)
+  })
+
   it("finishes when copied root-task expiry is stale but the Turn lease is current", async () => {
     const fake = fakePool(row({ leaseExpiresAt: new Date("2026-09-07T00:00:30.000Z") }))
     await createPgRootTaskStore(fake.pool).finish({ lease, rootTaskId: "root-turn-1", result: { status: "completed", stepCount: 1, toolCallCount: 0 }, now: new Date("2026-09-07T00:02:00.000Z") })

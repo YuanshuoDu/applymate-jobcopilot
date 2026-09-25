@@ -86,6 +86,8 @@ async function cancelAuthorizedApplicationsBeforeSubmit(
           AND application."checkpoint" IS DISTINCT FROM 'submission_request_started')
         OR (application."status" = 'waiting_for_authorization'
           AND application."checkpoint" IN ('form_filled', 'queue_retry'))
+        OR (application."status" = 'waiting_for_user'
+          AND application."checkpoint" = 'user_takeover')
       )
       AND EXISTS (
         SELECT 1 FROM "agent_approvals" AS approval
@@ -110,6 +112,24 @@ async function cancelAuthorizedApplicationsBeforeSubmit(
   `)
 }
 
+/** Keep accepted follow-up inputs on a stopped Turn from being delivered later. */
+async function cancelActiveTurnFollowUps(
+  tx: CommandTransaction,
+  scope: { userId: string; sessionId: string; turnId: string; requestedAt: Date },
+): Promise<number> {
+  const cancelled = await tx.agentInput.updateMany({
+    where: {
+      userId: scope.userId,
+      sessionId: scope.sessionId,
+      targetTurnId: scope.turnId,
+      delivery: "follow_up",
+      status: { in: ["accepted", "queued", "consumed"] },
+    },
+    data: { status: "cancelled", cancelledAt: scope.requestedAt },
+  })
+  return cancelled.count
+}
+
 export async function interruptActiveTurn(
   tx: CommandTransaction,
   command: InterruptCommand,
@@ -123,6 +143,13 @@ export async function interruptActiveTurn(
   if (interrupted.count !== 1) throw activeTurnChanged(command.expectedTurnId, active.id)
 
   await cancelAuthorizedApplicationsBeforeSubmit(tx, {
+    userId: command.userId,
+    sessionId: command.sessionId,
+    turnId: active.id,
+    requestedAt,
+  })
+
+  await cancelActiveTurnFollowUps(tx, {
     userId: command.userId,
     sessionId: command.sessionId,
     turnId: active.id,

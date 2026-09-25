@@ -161,6 +161,53 @@ describe("database Turn lease", () => {
     expect(params).toEqual([current.turnId, current.sessionId, current.ownerId, current.leaseVersion, "waiting_for_approval", now, current.userId])
   })
 
+  it("cancels accepted, queued, and consumed follow-ups in the same failed Turn release", async () => {
+    const fake = fakePool()
+    const current: TurnLease = { ...payload, userId: row.userId, leaseVersion: row.leaseVersion, leaseStartedAt: now, leaseExpiresAt: row.leaseExpiresAt }
+
+    await expect(releaseTurnLease(fake.pool, current, "failed", now)).resolves.toBe(true)
+
+    const turnWrite = fake.calls.findIndex(([sql]) => sql.includes('UPDATE "agent_turns"'))
+    const inputWrite = fake.calls.findIndex(([sql]) => sql.includes('UPDATE "agent_inputs"'))
+    expect(turnWrite).toBeGreaterThan(-1)
+    expect(inputWrite).toBeGreaterThan(turnWrite)
+    expect(fake.calls[inputWrite]?.[0]).toContain('"delivery" = \'follow_up\'')
+    expect(fake.calls[inputWrite]?.[0]).toContain('"status" IN (\'accepted\', \'queued\', \'consumed\')')
+    expect(fake.calls[inputWrite]?.[0]).not.toContain('"consumedByStepId" IS NULL')
+    expect(fake.calls[inputWrite]?.[1]).toEqual([current.sessionId, current.userId, current.turnId, now])
+  })
+
+  it("cancels already-claimed follow-ups in the fenced shutdown interruption", async () => {
+    const fake = fakePool()
+    const current: TurnLease = { ...payload, userId: row.userId, leaseVersion: row.leaseVersion, leaseStartedAt: now, leaseExpiresAt: row.leaseExpiresAt }
+
+    await expect(interruptTurnLease(fake.pool, current, now)).resolves.toBe(true)
+
+    const turnWrite = fake.calls.findIndex(([sql]) => sql.includes('UPDATE "agent_turns"'))
+    const inputWrite = fake.calls.findIndex(([sql]) => sql.includes('UPDATE "agent_inputs"'))
+    expect(inputWrite).toBeGreaterThan(turnWrite)
+    expect(fake.calls[inputWrite]?.[0]).toContain('"status" IN (\'accepted\', \'queued\', \'consumed\')')
+    expect(fake.calls[inputWrite]?.[0]).toContain('"cancelledAt" IS NULL')
+  })
+
+  it("treats release as idempotent after an atomic completed Turn receipt", async () => {
+    const calls: string[] = []
+    const client = { query: vi.fn(async (sql: string) => {
+      calls.push(sql)
+      if (sql.includes('SELECT session."id"')) return { rows: [{ id: "session_1" }], rowCount: 1 }
+      if (sql.includes('UPDATE "agent_turns"')) return { rows: [], rowCount: 0 }
+      if (sql.includes('SELECT "id" FROM "agent_turns"') && sql.includes(`"status" = 'completed'`)) return { rows: [{ id: "turn_1" }], rowCount: 1 }
+      return { rows: [], rowCount: 0 }
+    }), release: vi.fn() }
+    const pool = { connect: vi.fn(async () => client) } as unknown as LeasePool
+    const current: TurnLease = { ...payload, userId: row.userId, leaseVersion: row.leaseVersion, leaseStartedAt: now, leaseExpiresAt: row.leaseExpiresAt }
+
+    await expect(releaseTurnLease(pool, current, "completed", now)).resolves.toBe(true)
+
+    expect(calls.filter(sql => sql.includes('UPDATE "agent_turns"'))).toHaveLength(1)
+    expect(calls.some(sql => sql.includes('UPDATE "agent_inputs"'))).toBe(false)
+  })
+
   it("can fence an already-expired heartbeat before a scanner reclaims it", async () => {
     const fake = fakePool([row])
     const current: TurnLease = { ...payload, userId: row.userId, leaseVersion: row.leaseVersion, leaseStartedAt: now, leaseExpiresAt: row.leaseExpiresAt }

@@ -2,6 +2,7 @@ import type { ModelAdapter, ModelCapabilityProfile } from "@jobcopilot/agent-mod
 import type { PolicyRole, RepositoryJsonValue, TenantScope } from "@jobcopilot/agent-protocol"
 import type { StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
 import type { TurnBudgetLimits } from "../budget.js"
+import type { TurnUsage } from "../budget.js"
 import type { BusinessCheck } from "../verifier.js"
 import type { ExecutionOwnerFence, TurnExecutionOwnerFence } from "../execution-owner.js"
 import type { TurnLease } from "./lease.js"
@@ -45,6 +46,19 @@ export type TurnEngineEventInput = {
   /** Server-owned marker events may opt into the canonical system actor. */
   readonly actor?: "system"
 }
+
+export type AtomicTurnCompletionInput = {
+  readonly stepId: string
+  readonly finalItemId: string
+  readonly finalContent: RepositoryJsonValue
+  readonly stepCount: number
+  readonly toolCallCount: number
+  readonly usage: TurnUsage
+}
+
+export type AtomicTurnCompletionResult =
+  | { readonly status: "pending_follow_up" }
+  | { readonly status: "completed"; readonly finalItemId: string; readonly events: readonly TurnEngineEvent[] }
 
 export type TurnEngineToolCall = {
   readonly id: string
@@ -120,7 +134,12 @@ export type TurnEngineStore = {
   }): Promise<TurnEngineItem>
   appendEvent(input: TurnEngineEventInput): Promise<{ id: string }>
   appendEvents?(inputs: readonly TurnEngineEventInput[]): Promise<readonly { id: string }[]>
-  recordFinalResponse(input: { owner: TurnExecutionOwnerFence; response: string; now: Date }): Promise<void>
+  recordFinalResponse(input: {
+    owner: TurnExecutionOwnerFence
+    response: string
+    now: Date
+    terminal?: AtomicTurnCompletionInput
+  }): Promise<void | AtomicTurnCompletionResult>
 }
 
 export type TurnEngineToolExecutor = (input: {

@@ -9,7 +9,7 @@ import { buildObservedSteeringMarker } from "./steering-marker-store.js"
 const scope = { userId: "user-a" }
 const createdAt = new Date("2026-09-01T16:00:00.000Z")
 
-type FakeOptions = { sessionStatus?: string; sessionVisible?: boolean; sessionUserId?: string; turnVisible?: boolean; leaseValid?: boolean; failOn?: string; activeRow?: Record<string, unknown> | null }
+type FakeOptions = { sessionStatus?: string; sessionVisible?: boolean; sessionUserId?: string; turnVisible?: boolean; leaseValid?: boolean; failOn?: string; activeRow?: Record<string, unknown> | null; candidateDelivery?: "steer" | "follow_up"; followUpRows?: Record<string, unknown>[] }
 
 function row(overrides: Record<string, unknown> = {}) {
   return {
@@ -39,12 +39,13 @@ function makeClient(options: FakeOptions = {}) {
       }
       if (text.includes('FROM "sub_agent_tasks"')) return { rows: values[0] === "task-a" ? [{ id: "task-a" }] : [] }
       if (text.startsWith('SELECT "id", "turnId", "taskId", "type", "actor", "correlationId", "payload", "sequence" FROM "agent_events"')) return { rows: [] }
+      if (text.includes("WITH candidates")) return { rows: [row({ id: "input-2", delivery: options.candidateDelivery ?? "steer", acceptedSequence: "5" })] }
+      if (text.includes('FROM "agent_inputs"') && text.includes('"delivery" = \'follow_up\'')) return { rows: options.followUpRows ?? [] }
       if (text.includes('FROM "agent_inputs"') && text.includes("FOR SHARE")) return { rows: options.activeRow === null ? [] : [row(options.activeRow ?? {})] }
       if (text.startsWith("UPDATE \"agent_sessions\"")) return { rows: [{ eventSequence: "9" }] }
       if (text.startsWith('INSERT INTO "agent_events"')) return { rowCount: 1, rows: [] }
       if (text.startsWith('INSERT INTO "agent_outbox"')) return { rowCount: 1, rows: [] }
       if (text.includes('FROM "agent_steps"')) return { rows: [{ inputThroughSequence: "0", consumedInputIds: [] }] }
-      if (text.includes("WITH candidates")) return { rows: [row({ id: "input-2", acceptedSequence: "5" })] }
       if (text.includes('FROM "agent_inputs"') && text.includes("FOR UPDATE")) return { rows: [] }
       if (text.includes('UPDATE "agent_steps"')) return { rowCount: 1, rows: [] }
       throw new Error(`unexpected SQL: ${text}`)
@@ -143,6 +144,34 @@ describe("PostgreSQL AgentInput claim store", () => {
     }
     expect(fake.calls.map((call) => call.text)).toEqual(expect.arrayContaining(["BEGIN", "COMMIT", "SELECT set_config($1, $2, true)"]))
     expect(fake.client.query).not.toHaveBeenCalledWith(expect.stringContaining("ROLLBACK"))
+  })
+
+  it("claims accepted follow-ups through the same FIFO, fenced checkpoint path", async () => {
+    const fake = makeClient({ candidateDelivery: "follow_up" })
+    let result: Awaited<ReturnType<InputClaimTransaction["claimInputs"]>> | undefined
+    await createPgInputClaimStore(fake.pool, scope).withTransaction(async tx => {
+      result = await tx.claimInputs({ sessionId: "session-a", turnId: "turn-a", stepId: "step-a", checkpoint: { inputThroughSequence: 0n, consumedInputIds: [] }, now: createdAt })
+    })
+
+    const query = fake.calls.find(call => call.text.includes("WITH candidates"))
+    expect(query?.text).toContain('"delivery" IN (\'steer\', \'follow_up\')')
+    expect(result?.inputs.map(input => input.delivery)).toEqual(["follow_up"])
+    expect(result?.newlyClaimedInputIds).toEqual(["input-2"])
+  })
+
+  it("rehydrates previously consumed follow-ups for a later Turn step regardless of its cursor", async () => {
+    const priorFollowUp = row({ id: "follow-up-1", delivery: "follow_up", status: "consumed", consumedByStepId: "step-0", acceptedSequence: "4" })
+    const fake = makeClient({ followUpRows: [priorFollowUp] })
+    let result: Awaited<ReturnType<InputClaimTransaction["claimInputs"]>> | undefined
+    await createPgInputClaimStore(fake.pool, scope).withTransaction(async tx => {
+      result = await tx.claimInputs({ sessionId: "session-a", turnId: "turn-a", stepId: "step-2", checkpoint: { inputThroughSequence: 99n, consumedInputIds: [] }, now: createdAt })
+    })
+
+    expect(result?.inputs.filter(input => input.delivery === "follow_up").map(input => [input.id, input.acceptedSequence])).toEqual([["follow-up-1", 4n]])
+    expect(result?.inputs.find(input => input.id === "follow-up-1")?.consumedByStepId).toBe("step-0")
+    const replay = fake.calls.find(call => call.text.includes('"delivery" = \'follow_up\'') && call.text.includes("FOR SHARE"))
+    expect(replay?.text).not.toContain('"acceptedSequence" >')
+    expect(replay?.values).toEqual(["session-a", "turn-a", "user-a"])
   })
 
   it("hydrates active steering inputs with a tenant, Turn, and steer delivery fence", async () => {

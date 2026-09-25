@@ -19,7 +19,7 @@ import { recoverTurnQueue, turnJobId } from "../runtime/turns/recovery-scanner.j
 import { createProductionWorkerBootstrap, startProductionAgentRuntime, type CanonicalTurnRuntime } from "./production-bootstrap.js"
 import { createCanonicalTurnRuntime, type UsageAuthorization } from "../runtime/canonical-turn-runtime.js"
 import { createTurnEngineExecutor } from "../runtime/turns/turn-engine.js"
-import type { TurnEngineStore } from "../runtime/turns/turn-engine-types.js"
+import type { TurnEngineEvent, TurnEngineStore } from "../runtime/turns/turn-engine-types.js"
 import { InMemoryToolLifecycleSink, ToolLifecycle } from "../runtime/tools/lifecycle.js"
 import { InMemoryToolResultReferenceStore } from "../runtime/tools/redaction.js"
 import { ToolRegistry } from "../runtime/tools/registry.js"
@@ -75,7 +75,18 @@ function compositionStore(
       for (const { type, payload } of inputs) persistedEvents.push({ type, payload })
       return inputs.map(({ id }) => ({ id }))
     },
-    recordFinalResponse: async () => undefined,
+    recordFinalResponse: async input => {
+      const terminal = input.terminal
+      if (!terminal) return
+      persistedItems.push({ type: "agent_message", status: "completed", content: terminal.finalContent })
+      const saved: TurnEngineEvent[] = [
+        { id: "final-started", type: "item.started", itemId: terminal.finalItemId, correlationId: terminal.stepId, causationId: null, payload: { itemId: terminal.finalItemId, type: "agent_message", phase: "final_answer" } },
+        { id: "final-completed", type: "item.completed", itemId: terminal.finalItemId, correlationId: terminal.finalItemId, causationId: "final-started", payload: { itemId: terminal.finalItemId, status: "completed", content: terminal.finalContent } },
+        { id: "turn-completed", type: "turn.completed", itemId: terminal.finalItemId, correlationId: terminal.stepId, causationId: "final-completed", payload: { turnId: input.owner.turnId, taskId: input.owner.taskId, finalItemId: terminal.finalItemId, usage: terminal.usage } },
+      ]
+      persistedEvents.push(...saved)
+      return { status: "completed", finalItemId: terminal.finalItemId, events: saved }
+    },
   }
 }
 

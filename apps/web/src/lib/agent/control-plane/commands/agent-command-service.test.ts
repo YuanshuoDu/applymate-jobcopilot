@@ -115,6 +115,19 @@ function makeDb(options: {
         inputs.push(data)
         return data
       }),
+      updateMany: vi.fn(async (args: unknown) => {
+        const where = whereOf(args)
+        const statuses = (where.status as { in?: unknown[] } | undefined)?.in ?? []
+        const data = (args as { data: Row }).data
+        let count = 0
+        for (const input of inputs) {
+          if (input.userId !== where.userId || input.sessionId !== where.sessionId || input.targetTurnId !== where.targetTurnId
+            || input.delivery !== where.delivery || !statuses.includes(input.status)) continue
+          Object.assign(input, data)
+          count += 1
+        }
+        return { count }
+      }),
     },
     agentItem: {
       create: vi.fn(async (args: unknown) => {
@@ -155,7 +168,7 @@ function makeDb(options: {
         execution,
         sessionStatus,
         sequence,
-        inputs: [...inputs],
+        inputs: inputs.map((input) => ({ ...input })),
         items: [...items],
         events: [...events],
         outbox: [...outbox],
@@ -303,6 +316,27 @@ describe("AgentCommandService", () => {
     expect(result).toMatchObject({ disposition: "queued_follow_up", turnId: started.turnId })
   })
 
+  it("starts a successor Turn when terminal completion won before follow-up acceptance", async () => {
+    const fake = makeDb({ activeSource: "user", activeTurnId: "turn_completed", activeStatus: "completed" })
+    const service = new AgentCommandService(fake.db)
+
+    const result = await service.message({
+      ...startCommand("client_after_completion"),
+      delivery: "follow_up",
+      expectedTurnId: null,
+      expectedRevision: null,
+    })
+
+    expect(result.disposition).toBe("started")
+    expect(result.turnId).not.toBe("turn_completed")
+    expect(fake.state.active).toMatchObject({ id: result.turnId, status: "queued" })
+    expect(fake.state.inputs).toHaveLength(1)
+    expect(fake.state.inputs[0]).toMatchObject({ targetTurnId: result.turnId, userId: "user_1", sessionId: "session_1", delivery: "follow_up" })
+    const dispatches = fake.state.outbox.filter(entry => entry.topic === "agent.turn.dispatch")
+    expect(dispatches).toHaveLength(1)
+    expect(dispatches[0]).toMatchObject({ aggregateId: "session_1", idempotencyKey: `turn-dispatch:${result.turnId}` })
+  })
+
   it.each([
     ["waiting_for_user", "steer"],
     ["waiting_for_user", "follow_up"],
@@ -381,6 +415,7 @@ describe("AgentCommandService", () => {
     const fake = makeDb()
     const service = new AgentCommandService(fake.db)
     const started = await service.start(startCommand("client_start"))
+    const followUp = await service.message({ ...startCommand("client_follow_up"), delivery: "follow_up" })
 
     const result = await service.interrupt({
       ...startCommand("client_interrupt"),
@@ -389,6 +424,7 @@ describe("AgentCommandService", () => {
 
     expect(result).toMatchObject({ disposition: "interrupted", turnId: started.turnId })
     expect(fake.state.active).toMatchObject({ status: "interrupted", revision: 1 })
+    expect(fake.state.inputs.find((input) => input.id === followUp.inputId)).toMatchObject({ status: "cancelled", cancelledAt: expect.any(Date) })
   })
 
   it("uses the open session fence before command admission", async () => {

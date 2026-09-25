@@ -52,7 +52,7 @@ const databaseUrl = dedicatedDatabaseUrl()
 const redisUrl = dedicatedRedisUrl()
 const describeWithServices = databaseUrl && redisUrl ? describe : describe.skip
 
-type FixtureIds = { suffix: string; userId: string; sessionId: string; turnId: string }
+type FixtureIds = { suffix: string; userId: string; sessionId: string; turnId: string; followUpInputId?: string }
 type WorkerChild = ChildProcess & { output: string[]; errors: string[] }
 type ExitWaitContext = { stage: string; pid?: number; requestedSignal?: string; signalAccepted?: boolean; timeoutMs?: number }
 type CommandAcceptanceResult = {
@@ -66,7 +66,7 @@ type CommandAcceptance = { accepted: CommandAcceptanceResult; duplicate: Command
 const fixturePath = fileURLToPath(new URL("./production-bootstrap-process-restart.fixture.mjs", import.meta.url))
 const workerCwd = fileURLToPath(new URL("../..", import.meta.url))
 
-function startWorker(mode: "accept-message" | "park-parent" | "resume-parent", ids: FixtureIds): WorkerChild {
+function startWorker(mode: "accept-message" | "park-parent" | "resume-parent" | "park-active-follow-up" | "accept-active-follow-up" | "resume-active-follow-up", ids: FixtureIds): WorkerChild {
   const child = spawn(process.execPath, ["--import", "tsx", fixturePath, mode, JSON.stringify(ids)], {
     cwd: workerCwd,
     env: { ...process.env, DATABASE_URL: databaseUrl!, REDIS_URL: redisUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl! },
@@ -555,6 +555,114 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     await waitForExit(workerTwo, { stage: "worker2-after-shutdown", pid: workerTwo.pid })
     expect(workerTwo.exitCode).toBe(0)
     expect(workerTwo.signalCode).toBeNull()
+  }, 60_000)
+
+  it("recovers an accepted active-Turn follow-up after a Worker process restart", async () => {
+    const suffix = randomUUID()
+    const followUpIds: FixtureIds = {
+      suffix,
+      userId: ids.userId,
+      sessionId: "active-follow-up-session-" + suffix,
+      turnId: "active-follow-up-pending-" + suffix,
+    }
+    await pool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+      VALUES ($1, $2, 'Recover an accepted active-Turn follow-up', 'running', 'test', CURRENT_TIMESTAMP)`, [followUpIds.sessionId, followUpIds.userId])
+    commandAcceptance = startWorker("accept-message", followUpIds)
+    const startedLine = await waitForLine(commandAcceptance, "COMMAND_ACCEPTED ")
+    await waitForExit(commandAcceptance, { stage: "active-follow-up-root-acceptance", pid: commandAcceptance.pid })
+    expect(commandAcceptance.exitCode).toBe(0)
+    const started = parseCommandAcceptance(startedLine)
+    expect(started.accepted.disposition).toBe("started")
+    expect(started.duplicate).toMatchObject({ inputId: started.accepted.inputId, disposition: "duplicate", originalDisposition: "started" })
+    followUpIds.turnId = started.accepted.turnId
+
+    workerOne = startWorker("park-active-follow-up", followUpIds)
+    await waitForLine(workerOne, "FIRST_PROVIDER_ACTIVE")
+    const active = await pool!.query<{
+      status: string; leaseOwnerId: string | null; rootTaskId: string | null; rootStatus: string | null
+      rootLeaseOwner: string | null; stepId: string | null; stepStatus: string | null; consumedInputIds: string[] | null
+    }>(
+      `SELECT turn."status", turn."leaseOwnerId", turn."rootTaskId", root."status" AS "rootStatus", root."leaseOwner" AS "rootLeaseOwner",
+         step."id" AS "stepId", step."status" AS "stepStatus", step."consumedInputIds"
+       FROM "agent_turns" AS turn
+       JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."turnId" = turn."id"
+       JOIN "agent_steps" AS step ON step."turnId" = turn."id" AND step."taskId" = root."id"
+       WHERE turn."id" = $1 ORDER BY step."ordinal" DESC LIMIT 1`,
+      [followUpIds.turnId],
+    )
+    expect(active.rows[0]).toMatchObject({ status: "in_progress", rootStatus: "running", stepStatus: "streaming" })
+    expect(active.rows[0]?.leaseOwnerId).toBeTruthy()
+    expect(active.rows[0]?.rootTaskId).toBeTruthy()
+    expect(active.rows[0]?.rootLeaseOwner).toBe(active.rows[0]?.leaseOwnerId)
+    expect(active.rows[0]?.consumedInputIds).toContain(started.accepted.inputId)
+
+    commandAcceptance = startWorker("accept-active-follow-up", followUpIds)
+    const followUpLine = await waitForLine(commandAcceptance, "COMMAND_ACCEPTED ")
+    await waitForExit(commandAcceptance, { stage: "active-follow-up-accepted-before-restart", pid: commandAcceptance.pid })
+    expect(commandAcceptance.exitCode).toBe(0)
+    const accepted = parseCommandAcceptance(followUpLine)
+    expect(accepted.accepted.disposition).toBe("queued_follow_up")
+    expect(accepted.duplicate).toMatchObject({ inputId: accepted.accepted.inputId, turnId: followUpIds.turnId, disposition: "duplicate", originalDisposition: "queued_follow_up" })
+    followUpIds.followUpInputId = accepted.accepted.inputId
+    const pending = await pool!.query<{
+      id: string; sessionId: string; targetTurnId: string; userId: string; status: string; delivery: string
+      consumedByStepId: string | null; inputCount: string; itemCount: string
+    }>(
+      `SELECT input."id", input."sessionId", input."targetTurnId", input."userId", input."status", input."delivery", input."consumedByStepId",
+         (SELECT COUNT(*)::text FROM "agent_inputs" AS duplicate WHERE duplicate."sessionId" = input."sessionId" AND duplicate."clientMessageId" = input."clientMessageId") AS "inputCount",
+         (SELECT COUNT(*)::text FROM "agent_items" AS item WHERE item."turnId" = input."targetTurnId" AND item."sessionId" = input."sessionId"
+           AND item."type" = 'user_message' AND item."content"->>'clientMessageId' = input."clientMessageId") AS "itemCount"
+       FROM "agent_inputs" AS input WHERE input."id" = $1`,
+      [accepted.accepted.inputId],
+    )
+    expect(pending.rows[0]).toMatchObject({
+      id: accepted.accepted.inputId, sessionId: followUpIds.sessionId, targetTurnId: followUpIds.turnId, userId: followUpIds.userId,
+      status: "accepted", delivery: "follow_up", consumedByStepId: null, inputCount: "1", itemCount: "1",
+    })
+    expect(active.rows[0]?.consumedInputIds).not.toContain(accepted.accepted.inputId)
+
+    if (!workerOne.pid) throw new Error("Active Worker 1 has no PID at the restart boundary")
+    const workerOnePid = workerOne.pid
+    const killContext: ExitWaitContext = { stage: "active-worker1-after-SIGKILL", pid: workerOnePid, requestedSignal: "SIGKILL" }
+    const killed = waitForExit(workerOne, killContext)
+    killContext.signalAccepted = workerOne.kill("SIGKILL")
+    await killed
+    expect(killContext.signalAccepted, exitWaitDiagnostics(workerOne, killContext)).toBe(true)
+    await pool!.query(`UPDATE "agent_turns" SET "leaseExpiresAt" = CURRENT_TIMESTAMP - INTERVAL '1 second'
+      WHERE "id" = $1 AND "status" = 'in_progress' AND "leaseOwnerId" = $2`, [followUpIds.turnId, active.rows[0]?.leaseOwnerId])
+    await pool!.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = CURRENT_TIMESTAMP - INTERVAL '1 second'
+      WHERE "id" = $1 AND "status" = 'running' AND "leaseOwner" = $2`, [active.rows[0]?.rootTaskId, active.rows[0]?.leaseOwnerId])
+
+    workerTwo = startWorker("resume-active-follow-up", followUpIds)
+    expect(workerTwo.pid).not.toBe(workerOnePid)
+    await waitForLine(workerTwo, "FOLLOW_UP_CONTEXT_OK")
+    await waitForTurnStatus(pool!, followUpIds.turnId, "completed")
+    const consumed = await pool!.query<{
+      status: string; consumedByStepId: string | null; delivery: string; targetTurnId: string; sessionId: string; userId: string
+    }>(`SELECT "status", "consumedByStepId", "delivery", "targetTurnId", "sessionId", "userId" FROM "agent_inputs" WHERE "id" = $1`, [accepted.accepted.inputId])
+    expect(consumed.rows[0]).toMatchObject({
+      status: "consumed", delivery: "follow_up", targetTurnId: followUpIds.turnId, sessionId: followUpIds.sessionId, userId: followUpIds.userId,
+    })
+    expect(consumed.rows[0]?.consumedByStepId).toBeTruthy()
+    const terminal = await pool!.query<{
+      status: string; finalResponse: string | null; rootStatus: string; completedEventCount: string; finalItemCount: string
+    }>(
+      `SELECT turn."status", turn."finalResponse"::text AS "finalResponse", root."status" AS "rootStatus",
+         (SELECT COUNT(*)::text FROM "agent_events" AS event WHERE event."sessionId" = turn."sessionId" AND event."turnId" = turn."id" AND event."idempotencyKey" = $2) AS "completedEventCount",
+         (SELECT COUNT(*)::text FROM "agent_items" AS item WHERE item."sessionId" = turn."sessionId" AND item."turnId" = turn."id" AND item."type" = 'agent_message') AS "finalItemCount"
+       FROM "agent_turns" AS turn JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" WHERE turn."id" = $1`,
+      [followUpIds.turnId, "turn:" + followUpIds.turnId + ":event:turn-completed"],
+    )
+    expect(terminal.rows[0]).toMatchObject({ status: "completed", rootStatus: "completed", completedEventCount: "1", finalItemCount: "1" })
+    expect(terminal.rows[0]?.finalResponse).toContain(FINAL_MARKER)
+    workerTwo.stdin?.write("shutdown\n")
+    await waitForLine(workerTwo, "SHUTDOWN_STAGE bootstrap_close:complete", 10_000)
+    await waitForExit(workerTwo, { stage: "active-worker2-after-shutdown", pid: workerTwo.pid })
+    expect(workerTwo.exitCode).toBe(0)
+    for (let generation = 0; generation <= 8; generation += 1) {
+      await turnQueue!.getJob(turnJobKey!(followUpIds.turnId, generation))?.then(job => job?.remove())
+    }
+    await pool!.query(`DELETE FROM "agent_sessions" WHERE "id" = $1`, [followUpIds.sessionId])
   }, 60_000)
 
   it("repairs a published legacy Turn dispatch and rearms one deterministic retry generation", async () => {

@@ -36,6 +36,7 @@ type State = {
     payload: Record<string, unknown>
   }>
   inputs: Array<Record<string, unknown>>
+  items: Array<Record<string, unknown>>
   events: Array<Record<string, unknown>>
 }
 
@@ -52,6 +53,8 @@ function makeTransaction(options: {
   childTasks?: State["tasks"]
   applicationTasks?: State["applicationTasks"]
   approvals?: State["approvals"]
+  inputs?: State["inputs"]
+  items?: State["items"]
 }) {
   const state: State = {
     execution: {
@@ -68,7 +71,8 @@ function makeTransaction(options: {
     tasks: options.childTasks ?? [],
     applicationTasks: options.applicationTasks ?? [],
     approvals: options.approvals ?? [],
-    inputs: [],
+    inputs: options.inputs ?? [],
+    items: options.items ?? [],
     events: [],
   }
   let sequence = BigInt(0)
@@ -96,6 +100,7 @@ function makeTransaction(options: {
             && approval.payload.applicationTaskId === task.id)
           const beforeSubmit = (task.status === "filling" && task.checkpoint !== "submission_request_started")
             || (task.status === "waiting_for_authorization" && ["form_filled", "queue_retry"].includes(task.checkpoint ?? ""))
+            || (task.status === "waiting_for_user" && task.checkpoint === "user_takeover")
           if (task.userId !== userId || task.sessionId !== sessionId || !beforeSubmit || !authorized) continue
           task.status = "cancelled"
           task.checkpoint = "turn_stopped_before_submit"
@@ -162,10 +167,27 @@ function makeTransaction(options: {
         state.inputs.push(data)
         return data
       }),
+      updateMany: vi.fn(async (args: unknown) => {
+        const where = whereOf(args)
+        const statuses = (where.status as { in?: unknown[] } | undefined)?.in ?? []
+        const data = (args as { data: Record<string, unknown> }).data
+        let count = 0
+        for (const input of state.inputs) {
+          if (input.userId !== where.userId || input.sessionId !== where.sessionId || input.targetTurnId !== where.targetTurnId
+            || input.delivery !== where.delivery || !statuses.includes(input.status)) continue
+          Object.assign(input, data)
+          count += 1
+        }
+        return { count }
+      }),
     },
     agentItem: {
       findMany: vi.fn(async () => []),
-      create: vi.fn(async (args: unknown) => (args as { data: Record<string, unknown> }).data),
+      create: vi.fn(async (args: unknown) => {
+        const data = (args as { data: Record<string, unknown> }).data
+        state.items.push(data)
+        return data
+      }),
       updateMany: vi.fn(async () => ({ count: 1 })),
     },
     agentApproval: { updateMany: vi.fn(async () => ({ count: 1 })) },
@@ -267,6 +289,61 @@ describe("execution cancellation transaction", () => {
     expect(sql).toContain("'running'")
   })
 
+  it("cancels exact-turn follow-ups after interrupting the Turn and preserves timeline items", async () => {
+    const previousCancelledAt = new Date("2026-09-15T12:00:00.000Z")
+    const inputs: State["inputs"] = [
+      { id: "followup_accepted", userId: "user_1", sessionId: "session_1", targetTurnId: "turn_1", delivery: "follow_up", status: "accepted", cancelledAt: null },
+      { id: "followup_queued", userId: "user_1", sessionId: "session_1", targetTurnId: "turn_1", delivery: "follow_up", status: "queued", cancelledAt: null },
+      { id: "followup_consumed", userId: "user_1", sessionId: "session_1", targetTurnId: "turn_1", delivery: "follow_up", status: "consumed", cancelledAt: null },
+      { id: "followup_wrong_turn", userId: "user_1", sessionId: "session_1", targetTurnId: "turn_2", delivery: "follow_up", status: "consumed", cancelledAt: null },
+      { id: "followup_wrong_session", userId: "user_1", sessionId: "session_2", targetTurnId: "turn_1", delivery: "follow_up", status: "accepted", cancelledAt: null },
+      { id: "followup_wrong_user", userId: "user_2", sessionId: "session_1", targetTurnId: "turn_1", delivery: "follow_up", status: "queued", cancelledAt: null },
+      { id: "steer_input", userId: "user_1", sessionId: "session_1", targetTurnId: "turn_1", delivery: "steer", status: "accepted", cancelledAt: null },
+      { id: "already_cancelled", userId: "user_1", sessionId: "session_1", targetTurnId: "turn_1", delivery: "follow_up", status: "cancelled", cancelledAt: previousCancelledAt },
+    ]
+    const initialInputCount = inputs.length
+    const unaffectedInputs = inputs.slice(3).map((input) => ({ ...input }))
+    const followUpItem = { id: "followup_item", sessionId: "session_1", turnId: "turn_1", type: "user_message", status: "completed", content: { text: "Follow-up message" } }
+    const fake = makeTransaction({
+      executionStatus: "running",
+      sessionSource: "automation",
+      activeSource: "automation",
+      inputs,
+      items: [{ ...followUpItem }],
+    })
+
+    await expect(cancelExecutionInTransaction(fake.tx, { executionId: "execution_1", userId: "user_1" })).resolves.toBe(true)
+
+    expect(fake.state.active).toMatchObject({ id: "turn_1", status: "interrupted" })
+    expect(inputs.slice(0, 3).map((input) => [input.status, input.cancelledAt])).toEqual([
+      ["cancelled", expect.any(Date)],
+      ["cancelled", expect.any(Date)],
+      ["cancelled", expect.any(Date)],
+    ])
+    expect(inputs.slice(3, initialInputCount)).toEqual(unaffectedInputs)
+    expect(fake.state.items.find((item) => item.id === "followup_item")).toEqual(followUpItem)
+    expect(fake.tx.agentItem.updateMany).not.toHaveBeenCalled()
+
+    const turnUpdateOrder = (fake.tx.agentTurn.updateMany as unknown as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]
+    const inputUpdate = fake.tx.agentInput.updateMany as unknown as ReturnType<typeof vi.fn>
+    const inputUpdateOrder = inputUpdate.mock.invocationCallOrder[0]
+    const applicationUpdateOrder = (fake.tx.$executeRaw as unknown as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]
+    expect(turnUpdateOrder).toBeLessThan(applicationUpdateOrder)
+    expect(applicationUpdateOrder).toBeLessThan(inputUpdateOrder)
+    expect(inputUpdate).toHaveBeenCalledWith({
+      where: {
+        userId: "user_1",
+        sessionId: "session_1",
+        targetTurnId: "turn_1",
+        delivery: "follow_up",
+        status: { in: ["accepted", "queued", "consumed"] },
+      },
+      data: { status: "cancelled", cancelledAt: expect.any(Date) },
+    })
+    const turnUpdateArgs = (fake.tx.agentTurn.updateMany as unknown as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as { data?: { completedAt?: Date } }
+    expect(inputs[0]?.cancelledAt).toEqual(turnUpdateArgs.data?.completedAt)
+  })
+
   it("cancels approved and consumed application tasks before the submit checkpoint, after locking the Turn", async () => {
     const applicationTasks: State["applicationTasks"] = [
       { id: "application_approved", userId: "user_1", sessionId: "session_1", status: "filling", checkpoint: "browser_active", completedAt: null },
@@ -312,6 +389,29 @@ describe("execution cancellation transaction", () => {
     await expect(cancelExecutionInTransaction(fake.tx, { executionId: "execution_1", userId: "user_1" })).resolves.toBe(true)
 
     expect(applicationTasks).toEqual(before)
+  })
+
+  it("cancels a linked pre-start user handoff while preserving uncertain submissions", async () => {
+    const applicationTasks: State["applicationTasks"] = [
+      { id: "application_filling", userId: "user_1", sessionId: "session_1", status: "filling", checkpoint: "browser_active", completedAt: null },
+      { id: "application_retry", userId: "user_1", sessionId: "session_1", status: "waiting_for_authorization", checkpoint: "queue_retry", completedAt: null },
+      { id: "application_handoff", userId: "user_1", sessionId: "session_1", status: "waiting_for_user", checkpoint: "user_takeover", completedAt: null },
+      { id: "application_uncertain", userId: "user_1", sessionId: "session_1", status: "waiting_for_user", checkpoint: "submission_uncertain", completedAt: null },
+    ]
+    const approvals: State["approvals"] = applicationTasks.map((task) => ({
+      userId: "user_1", sessionId: "session_1", turnId: "turn_1", type: "submit_application", status: "consumed", payload: { applicationTaskId: task.id },
+    }))
+    const fake = makeTransaction({ executionStatus: "running", sessionSource: "automation", activeSource: "automation", applicationTasks, approvals })
+
+    await expect(cancelExecutionInTransaction(fake.tx, { executionId: "execution_1", userId: "user_1" })).resolves.toBe(true)
+
+    expect(applicationTasks.slice(0, 3).every((task) => task.status === "cancelled" && task.checkpoint === "turn_stopped_before_submit")).toBe(true)
+    expect(applicationTasks[3]).toMatchObject({ status: "waiting_for_user", checkpoint: "submission_uncertain", completedAt: null })
+    const query = (fake.tx.$executeRaw as unknown as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as { strings?: readonly string[] }
+    const sql = query.strings?.join(" ") ?? ""
+    expect(sql).toContain('application."status" = \'waiting_for_user\'')
+    expect(sql).toContain('application."checkpoint" = \'user_takeover\'')
+    expect(sql).toContain('approval."turnId" =')
   })
 
   it("cancels an approved filled task before its conditional queue transition", async () => {

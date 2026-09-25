@@ -208,7 +208,20 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
              AND ${waitState ? `"status" IN ('in_progress', 'waiting_for_user')` : `"status" = 'in_progress'`} FOR UPDATE`,
            [input.lease.turnId, input.lease.sessionId, input.lease.userId, input.lease.ownerId, input.lease.leaseVersion],
         )
-        if (!ownedTurn.rows[0]) throw new Error("root_turn_fenced")
+        if (!ownedTurn.rows[0]) {
+          const completedTurn = input.result.status === "completed" ? await client.query<Row>(`SELECT "id" FROM "agent_turns"
+            WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "rootTaskId" = $5 AND "leaseVersion" = $4
+              AND "status" = 'completed' AND "leaseOwnerId" IS NULL AND "leaseExpiresAt" IS NULL FOR UPDATE`,
+          [input.lease.turnId, input.lease.sessionId, input.lease.userId, input.lease.leaseVersion, input.rootTaskId]) : { rows: [] }
+          if (!completedTurn.rows[0]) throw new Error("root_turn_fenced")
+          const settled = await client.query<Row>(`SELECT "status", "result", "failureReason" FROM "sub_agent_tasks"
+            WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $1 FOR UPDATE`, [input.rootTaskId, input.lease.sessionId, input.lease.turnId])
+          const saved = record(settled.rows[0]?.result)
+          if (settled.rows[0]?.status !== next || settled.rows[0]?.failureReason !== null || saved.status !== "completed"
+            || Number(saved.stepCount) !== input.result.stepCount || Number(saved.toolCallCount) !== input.result.toolCallCount
+            || (saved.finalItemId ?? null) !== (input.result.finalItemId ?? null) || (saved.waitId ?? null) !== null) throw new Error("root_task_terminal_receipt_conflict")
+          return
+        }
         const updated = await client.query(
           `UPDATE "sub_agent_tasks" SET "status" = $1, "result" = $2::jsonb,
            "failureReason" = $3, "leaseOwner" = NULL, "leaseExpiresAt" = NULL,

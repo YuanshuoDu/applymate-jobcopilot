@@ -5,7 +5,7 @@ import type { StepContext, StepContextSnapshot } from "../context/step-context-b
 import { RootAbortController } from "../interrupt/registry.js"
 import { TurnLeaseError } from "./lease.js"
 import { createToolRouterExecutor, TurnEngine } from "./turn-engine.js"
-import { toRepositoryJson, type TurnEngineOptions, type TurnEngineStore } from "./turn-engine-types.js"
+import { toRepositoryJson, type TurnEngineEvent, type TurnEngineOptions, type TurnEngineStore } from "./turn-engine-types.js"
 import { steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "../context/steering-marker.js"
 
 const lease = {
@@ -35,7 +35,18 @@ function fakeStore() {
     updateItem: async ({ itemId, expectedRevision, status }) => { const item = items.find((entry) => entry.id === itemId)!; expect(item.revision).toBe(expectedRevision); item.revision += 1; item.status = status; return { id: itemId, revision: item.revision } },
     appendEvent: async ({ id, type, causationId, itemId }) => { events.push({ id, type, causationId, itemId }); return { id } },
     appendEvents: async inputs => { batches.push(inputs.map(input => input.id)); for (const input of inputs) events.push({ id: input.id, type: input.type, causationId: input.causationId, itemId: input.itemId }); return inputs.map(input => ({ id: input.id })) },
-    recordFinalResponse: vi.fn(async () => undefined),
+    recordFinalResponse: vi.fn(async input => {
+      if (!input.terminal) return
+      items.push({ id: input.terminal.finalItemId, type: "agent_message", phase: "final_answer", status: "completed", revision: 1 })
+      const cause = events.at(-1)?.id ?? null
+      const finalEvents: TurnEngineEvent[] = [
+        { id: "final-started", type: "item.started", itemId: input.terminal.finalItemId, correlationId: "step", causationId: cause, payload: {} },
+        { id: "final-completed", type: "item.completed", itemId: input.terminal.finalItemId, correlationId: input.terminal.finalItemId, causationId: "final-started", payload: {} },
+        { id: "turn-completed", type: "turn.completed", itemId: input.terminal.finalItemId, correlationId: "step", causationId: "final-completed", payload: {} },
+      ]
+      events.push(...finalEvents.map(event => ({ id: event.id, type: event.type, causationId: event.causationId, itemId: event.itemId })))
+      return { status: "completed" as const, finalItemId: input.terminal.finalItemId, events: finalEvents }
+    }),
   }
   return { value, events, batches, items, steps }
 }

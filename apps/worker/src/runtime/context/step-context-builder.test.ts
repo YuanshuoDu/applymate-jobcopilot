@@ -73,16 +73,18 @@ class FakeInputClaimStore implements InputClaimStore {
   }
 
   private async claim(request: ClaimInputsRequest): Promise<ClaimedInputs> {
-    const existing = this.inputs.filter((item) => item.sessionId === request.sessionId && item.targetTurnId === request.turnId && item.userId === scope.userId && item.delivery === "steer" && (item.consumedByStepId === request.stepId || request.checkpoint.consumedInputIds.includes(item.id)))
+    const existing = this.inputs.filter((item) => item.sessionId === request.sessionId && item.targetTurnId === request.turnId && item.userId === scope.userId && (item.delivery === "steer" || item.delivery === "follow_up") && (item.consumedByStepId === request.stepId || request.checkpoint.consumedInputIds.includes(item.id)))
     if (request.checkpoint.consumedInputIds.some((id) => !existing.some((item) => item.id === id))) throw new Error("missing checkpoint input")
-    if (existing.some((item) => item.consumedByStepId !== request.stepId)) throw new Error("foreign checkpoint input")
-    if ((request.mode ?? (request.rebuild ? "rebuild" : "new")) !== "new") return { inputs: existing.sort(sequenceOrder), newlyClaimedInputIds: [] }
-    const candidates = this.inputs.filter((item) => item.sessionId === request.sessionId && item.targetTurnId === request.turnId && item.userId === scope.userId && item.delivery === "steer" && (item.status === "accepted" || item.status === "queued") && item.consumedByStepId === null && item.consumedAt === null && item.acceptedSequence > request.checkpoint.inputThroughSequence).sort(sequenceOrder)
+    if (existing.some((item) => item.status !== "consumed" || (item.delivery === "steer" && item.consumedByStepId !== request.stepId) || (item.delivery === "follow_up" && !item.consumedByStepId))) throw new Error("foreign checkpoint input")
+    const mode = request.mode ?? (request.rebuild ? "rebuild" : "new")
+    const durableFollowUps = this.inputs.filter(item => item.sessionId === request.sessionId && item.targetTurnId === request.turnId && item.userId === scope.userId && item.delivery === "follow_up" && item.status === "consumed" && item.consumedByStepId !== null && item.consumedAt !== null)
+    if (mode !== "new") return { inputs: [...new Map([...existing, ...durableFollowUps].map(item => [item.id, item])).values()].sort(sequenceOrder), newlyClaimedInputIds: [] }
+    const candidates = this.inputs.filter((item) => item.sessionId === request.sessionId && item.targetTurnId === request.turnId && item.userId === scope.userId && (item.delivery === "steer" || item.delivery === "follow_up") && (item.status === "accepted" || item.status === "queued") && item.consumedByStepId === null && item.consumedAt === null && (item.delivery === "follow_up" || item.acceptedSequence > request.checkpoint.inputThroughSequence)).sort(sequenceOrder)
     for (const item of candidates) {
       const mutable = item as unknown as { status: StoredAgentInput["status"]; consumedByStepId: string | null; consumedAt: Date | null }
       mutable.status = "consumed"; mutable.consumedByStepId = request.stepId; mutable.consumedAt = request.now
     }
-    return { inputs: [...existing, ...candidates].sort(sequenceOrder), newlyClaimedInputIds: candidates.map((item) => item.id) }
+    return { inputs: [...new Map([...existing, ...candidates, ...durableFollowUps].map(item => [item.id, item])).values()].sort(sequenceOrder), newlyClaimedInputIds: candidates.map((item) => item.id) }
   }
 }
 
@@ -135,6 +137,37 @@ describe("StepContextBuilder", () => {
     expect(context.steeringMarkerControl?.newlyObservedMarkers).toEqual([expect.objectContaining({ inputId: "steer-1", kind: "observed" })])
   })
 
+  it("claims active-turn follow-ups as untrusted user data without making steering markers", async () => {
+    const followUp = input("follow-up", 4n, [{ type: "text", text: "Also include Amsterdam roles" }], { delivery: "follow_up" })
+    const store = new FakeInputClaimStore([followUp])
+    const context = await new StepContextBuilder(store).build(request(store, emptySnapshot, "step-a", {
+      steeringMarkerContext: { taskId: "task-a", obligationId: "obligation-1", goalRevision: 1, planRevision: 1 },
+    }))
+
+    expect(context.blocks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ layer: "pending_input", role: "data", trust: "external_untrusted", source: "user_input", content: { inputId: "follow-up", partIndex: 0, text: "Also include Amsterdam roles" } }),
+    ]))
+    expect(context.consumedInputIds).toEqual(["follow-up"])
+    expect(store.inputs[0]).toMatchObject({ status: "consumed", consumedByStepId: "step-a" })
+    expect(store.markerWrites).toHaveLength(0)
+    expect(context.steeringMarkerControl).toMatchObject({ newlyObservedInputIds: [], newlyObservedMarkers: [] })
+  })
+
+  it("replays a claimed follow-up into a fresh later step after a simulated Worker restart", async () => {
+    const followUp = input("follow-up", 4n, [{ type: "text", text: "Keep senior roles in scope" }], { delivery: "follow_up" })
+    const store = new FakeInputClaimStore([followUp], { "step-a": checkpoint(), "step-b": checkpoint(4n) })
+    const first = await new StepContextBuilder(store).build(request(store, emptySnapshot, "step-a"))
+    const resumed = await new StepContextBuilder(store).build(request(store, emptySnapshot, "step-b"))
+
+    expect(first.blocks.filter(block => block.id === "follow-up:part:0")).toHaveLength(1)
+    expect(resumed.blocks.filter(block => block.id === "follow-up:part:0")).toEqual([
+      expect.objectContaining({ role: "data", trust: "external_untrusted", source: "user_input", content: { inputId: "follow-up", partIndex: 0, text: "Keep senior roles in scope" } }),
+    ])
+    expect(resumed.consumedInputIds).toEqual(["follow-up"])
+    expect(store.inputs[0]).toMatchObject({ status: "consumed", consumedByStepId: "step-a" })
+    expect(store.markerWrites).toHaveLength(0)
+  })
+
   it("does not write a second marker when the same step is retried or when no obligation exists", async () => {
     const store = new FakeInputClaimStore([input("steer-1", 1n, [{ type: "text", text: "Dublin" }])])
     const builder = new StepContextBuilder(store)
@@ -170,11 +203,11 @@ describe("StepContextBuilder", () => {
     const first = await builder.build(request(store, snapshot))
     const retry = await builder.build(request(store, snapshot))
     expect(first).toEqual(retry)
-    expect(first.blocks.map((block) => block.layer)).toEqual(["system", "profile", "goal", "steer_history", "business", "tool_observation", "pending_input"])
-    expect(first.consumedInputIds).toEqual(["input-1"])
-    expect(first.inputThroughSequence).toBe(2n)
-    expect(store.inputs.find((item) => item.id === "follow-up")?.status).toBe("accepted")
-    expect(first.canonicalJson).toContain('"inputThroughSequence":"2"')
+    expect(first.blocks.map((block) => block.layer)).toEqual(["system", "profile", "goal", "steer_history", "business", "tool_observation", "pending_input", "pending_input"])
+    expect(first.consumedInputIds).toEqual(["input-1", "follow-up"])
+    expect(first.inputThroughSequence).toBe(3n)
+    expect(store.inputs.find((item) => item.id === "follow-up")?.status).toBe("consumed")
+    expect(first.canonicalJson).toContain('"inputThroughSequence":"3"')
   })
 
   it("serializes duplicate claims and makes a same-step race converge", async () => {
@@ -220,6 +253,18 @@ describe("StepContextBuilder", () => {
     const store = new FakeInputClaimStore([])
     const build = new StepContextBuilder(store).build(request(store, emptySnapshot, "step-a", { scope: { userId: "user-b" } }))
     await expect(build).rejects.toMatchObject({ code: "reference_owner_mismatch" })
+  })
+
+  it("does not expose or consume a follow-up from another user or session", async () => {
+    const foreignUser = new FakeInputClaimStore([input("foreign-user", 1n, [{ type: "text", text: "foreign" }], { delivery: "follow_up", userId: "user-b" })])
+    const foreignSession = new FakeInputClaimStore([input("foreign-session", 1n, [{ type: "text", text: "foreign" }], { delivery: "follow_up", sessionId: "session-b" })])
+
+    const userContext = await new StepContextBuilder(foreignUser).build(request(foreignUser, emptySnapshot))
+    const sessionContext = await new StepContextBuilder(foreignSession).build(request(foreignSession, emptySnapshot))
+    expect(userContext.blocks.filter(block => block.layer === "pending_input")).toHaveLength(0)
+    expect(sessionContext.blocks.filter(block => block.layer === "pending_input")).toHaveLength(0)
+    expect(foreignUser.inputs[0]?.status).toBe("accepted")
+    expect(foreignSession.inputs[0]?.status).toBe("accepted")
   })
 
   it("can verify business ownership and canonical attachment metadata through PostgreSQL", async () => {

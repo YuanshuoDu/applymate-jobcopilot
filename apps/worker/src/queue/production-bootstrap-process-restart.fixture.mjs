@@ -209,6 +209,97 @@ async function makeFirstWorker() {
   if (!stopping) throw new Error(`restart_fixture_timeout:${JSON.stringify(await restartDiagnostics())}`)
 }
 
+async function acceptActiveFollowUp() {
+  const databaseUrl = process.env.AGENT_RUNTIME_PG_TEST_URL
+  if (!databaseUrl) throw new Error("active_follow_up_requires_disposable_postgres")
+  process.env.DATABASE_URL = databaseUrl
+  const [{ db }, { AgentCommandService }] = await Promise.all([
+    import("../../../web/src/lib/db.ts"),
+    import("../../../web/src/lib/agent/control-plane/commands/agent-command-service.ts"),
+  ])
+  const command = {
+    sessionId: ids.sessionId,
+    userId: ids.userId,
+    clientMessageId: "active-follow-up:" + ids.suffix,
+    source: "user",
+    delivery: "follow_up",
+    content: [{ type: "text", text: "Durable active-Turn follow-up " + ids.suffix }],
+  }
+  try {
+    const service = new AgentCommandService(db)
+    const accepted = await service.message(command)
+    const duplicate = await service.message(command)
+    say("COMMAND_ACCEPTED " + JSON.stringify({ accepted, duplicate }))
+  } finally {
+    await db.$disconnect()
+  }
+}
+
+async function makeActiveFollowUpWorker() {
+  const runtime = await createCanonicalTurnRuntime(pool, {
+    workerId: "active-follow-up-worker-" + process.pid,
+    coordinationEnabled: false,
+    authorizeUsage: async () => ({ settle() {} }),
+    modelRuntimeFactory() {
+      return {
+        adapter: {
+          id: "active-follow-up-first-worker-fixture-model",
+          profile: modelProfile(),
+          async *stream(request) {
+            say("FIRST_PROVIDER_ACTIVE")
+            await Promise.race([
+              waitForCommand("release-first-provider"),
+              new Promise((_, reject) => request.signal.addEventListener("abort", () => reject(new Error("fixture_provider_aborted")), { once: true })),
+            ])
+            yield { type: "text_delta", text: "This result must be interrupted by the test process." }
+            yield { type: "completed", finishReason: "stop" }
+          },
+        },
+        registry: {}, candidates: [],
+      }
+    },
+  })
+  bootstrap = await createProductionWorkerBootstrap({
+    pool, runtime, ownerId: "active-follow-up-worker-" + process.pid, turnRecoveryIntervalMs: 10,
+  })
+  say("FIRST_WORKER_READY")
+  await waitForStop()
+}
+
+async function makeFollowUpResumeWorker() {
+  if (typeof ids.followUpInputId !== "string" || !ids.followUpInputId) throw new Error("follow_up_input_id_missing")
+  const followUpText = "Durable active-Turn follow-up " + ids.suffix
+  const runtime = await createCanonicalTurnRuntime(pool, {
+    workerId: "active-follow-up-recovery-" + process.pid,
+    coordinationEnabled: false,
+    authorizeUsage: async () => ({ settle() {} }),
+    modelRuntimeFactory() {
+      return {
+        adapter: {
+          id: "active-follow-up-recovery-fixture-model",
+          profile: modelProfile(),
+          async *stream(request) {
+            const matchingParts = request.messages
+              .filter(message => message.role === "user" && Array.isArray(message.content))
+              .flatMap(message => message.content)
+              .filter(part => part.type === "text" && part.text.includes(ids.followUpInputId) && part.text.includes(followUpText))
+            if (matchingParts.length !== 1) throw new Error("recovered_provider_request_did_not_contain_exactly_one_original_follow_up_id_text_in_user_role")
+            say("FOLLOW_UP_CONTEXT_OK")
+            yield { type: "text_delta", text: finalMarker }
+            yield { type: "completed", finishReason: "stop" }
+          },
+        },
+        registry: {}, candidates: [],
+      }
+    },
+  })
+  bootstrap = await createProductionWorkerBootstrap({
+    pool, runtime, ownerId: "active-follow-up-recovery-" + process.pid, turnRecoveryIntervalMs: 10,
+  })
+  say("RECOVERY_WORKER_READY")
+  await waitForStop()
+}
+
 function modelProfile() {
   return {
     provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true,
@@ -279,6 +370,9 @@ async function run() {
   if (mode === "accept-message") await acceptMessage()
   else if (mode === "park-parent") await makeFirstWorker()
   else if (mode === "resume-parent") await makeSecondWorker()
+  else if (mode === "park-active-follow-up") await makeActiveFollowUpWorker()
+  else if (mode === "accept-active-follow-up") await acceptActiveFollowUp()
+  else if (mode === "resume-active-follow-up") await makeFollowUpResumeWorker()
   else throw new Error("unknown_restart_fixture_mode")
 }
 
@@ -289,7 +383,7 @@ try {
   process.stderr.write(`${message}\n`)
   process.exitCode = 1
 } finally {
-  if (mode === "accept-message") {
+  if (mode === "accept-message" || mode === "accept-active-follow-up") {
     process.stdin.off("data", onStdinData)
     process.stdin.pause()
     process.stdin.destroy()

@@ -64,6 +64,7 @@ export const connection = redisConnection;
 const APPLY_TIMEOUT_MS = Number(process.env.APPLY_TIMEOUT_MS ?? '300000');
 const TURN_STOPPED_MESSAGE = "Agent turn was stopped before the application submission request started.";
 const SUBMISSION_START_OBSERVATION_TIMEOUT_MS = 8_000;
+const BEST_EFFORT_PAGE_CLOSE_TIMEOUT_MS = 1_000;
 
 export const QUEUE_NAME = "apply-tasks";
 
@@ -90,6 +91,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
 
     const startedAt = Date.now();
     let resultWritten = false;
+    let resultWriteStarted = false;
     let browserAttemptStarted = false;
     let ctx: Awaited<ReturnType<typeof loadTaskContext>> | null = null;
     let approvedTurnScope: ApplicationSubmissionStartScope | null = null;
@@ -107,10 +109,23 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
     } = { cleanup: null, work: null };
     let submissionFenceRelease: Promise<void> | null = null;
     let activePageClose: (() => Promise<void>) | null = null;
+    let applicationTaskFinalized = false;
+    let queueCatchStarted = false;
     const stopController = new AbortController();
     let stopProbe: ReturnType<typeof startApplicationSubmissionStopProbe> | null = null;
     const closeActivePage = async (): Promise<void> => {
-      await activePageClose?.().catch(() => undefined);
+      if (!activePageClose) return;
+      let closeTimeout: ReturnType<typeof setTimeout> | null = null;
+      try {
+        await Promise.race([
+          Promise.resolve().then(() => activePageClose?.()).then(() => undefined).catch(() => undefined),
+          new Promise<void>((resolve) => {
+            closeTimeout = setTimeout(resolve, BEST_EFFORT_PAGE_CLOSE_TIMEOUT_MS);
+          }),
+        ]);
+      } finally {
+        if (closeTimeout) clearTimeout(closeTimeout);
+      }
     };
     const interruptStoppedTurn = async (): Promise<void> => {
       turnStopped = true;
@@ -473,7 +488,18 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                       // still mean the browser sent the request.
                       submissionRequestStarted = true;
                       continuationAttempted = true;
-                      await route.continue();
+                      let continuationFailed = false;
+                      let continuationFailure: unknown;
+                      const continuation = route.continue().then(
+                        () => undefined,
+                        (error: unknown) => {
+                          continuationFailed = true;
+                          continuationFailure = error;
+                        },
+                      );
+                      await releaseSubmissionFence(true);
+                      await continuation;
+                      if (continuationFailed) throw continuationFailure;
                     } catch (error: unknown) {
                       submissionFenceUnavailable = true;
                       console.warn(
@@ -483,6 +509,12 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                         error instanceof Error ? error.message : String(error),
                       );
                       if (!continuationAttempted) await route.abort("failed").catch(() => undefined);
+                      if (pendingSubmissionFence) {
+                        await releaseSubmissionFence(continuationAttempted).catch((releaseError: unknown) => {
+                          submissionFenceUnavailable = true;
+                          console.warn("[apply-worker] Could not release submission request fence:", releaseError instanceof Error ? releaseError.message : String(releaseError));
+                        });
+                      }
                       await closeActivePage();
                     } finally {
                       if (pendingSubmissionFence) {
@@ -687,6 +719,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           } finally {
             linkedSignal.dispose();
           }
+          if (queueCatchStarted) return;
           usedFlow = "application.submit";
           harnessResult = toolResult.status === "submitted" || toolResult.status === "replayed"
             ? { status: "submitted", turns: toolResult.status === "replayed" ? 0 : 1, durationMs: Date.now() - startedAt, error: null, log: [] }
@@ -706,6 +739,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           // all Web-created submit jobs now carry the canonical receipt.
           harnessResult = await runBrowserFlow();
         }
+        if (queueCatchStarted) return;
 
         if (turnStopped && !submissionRequestStarted && harnessResult.status !== "submitted") {
           harnessResult = { ...harnessResult, status: "failed", error: TURN_STOPPED_MESSAGE };
@@ -733,6 +767,20 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           usedFlow = null;
         }
 
+        const submissionUncertain = submissionRequestStarted && harnessResult.status !== "submitted";
+        if (submissionUncertain) {
+          await finishApplicationTask(
+            getPool(),
+            applicationTaskId,
+            "waiting_for_user",
+            "submission_uncertain",
+            harnessResult.error ?? UNCONFIRMED_SUBMISSION_MESSAGE,
+          );
+          applicationTaskFinalized = true;
+          await closeActivePage();
+        }
+        if (queueCatchStarted) return;
+
         if (operation === "fill" && harnessResult.reviewReady) {
           const needs = await inspectFormReviewNeeds(page);
           const needMessage = formNeedsMessage(needs);
@@ -757,17 +805,24 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         }
 
         const durationMs = Date.now() - startedAt;
-        await insertApplyResult({
-          userId,
-          jobId,
-          status: harnessResult.status,
-          mode: "unattended",
-          atsType: flow ?? "unknown",
-          flowUsed: usedFlow,
-          error: harnessResult.error ?? null,
-          durationMs,
-        });
-        resultWritten = true;
+        resultWriteStarted = true;
+        try {
+          await insertApplyResult({
+            userId,
+            jobId,
+            status: harnessResult.status,
+            mode: "unattended",
+            atsType: flow ?? "unknown",
+            flowUsed: usedFlow,
+            error: harnessResult.error ?? null,
+            durationMs,
+          });
+          resultWritten = true;
+        } catch (error: unknown) {
+          resultWriteStarted = false;
+          throw error;
+        }
+        if (queueCatchStarted) return;
 
         if (
           harnessResult.status === "submitted" ||
@@ -808,24 +863,27 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
             console.warn('[apply-worker] Could not apply cover-letter retention policy:', error.message)
           )
         }
+        if (queueCatchStarted) return;
         // Keep the durable job-state write last in this block. The retention
         // cleanup is best-effort and must not obscure the submission outcome.
         await getPool().query(
           'UPDATE "Job" SET status = $1, "workflowState" = $2, "appliedAt" = CASE WHEN $1 = \'applied\' THEN NOW() ELSE "appliedAt" END, "updatedAt" = NOW() WHERE id = $3 AND "userId" = $4',
           [newJobStatus, newWorkflowState, jobId, userId]
         )
+        if (queueCatchStarted) return;
         const requiresUserTakeover = harnessResult.status === "manual" || needsUserTakeover(harnessResult.error);
         const stoppedTask = turnStopped && !submissionRequestStarted
           ? await getPool().query<{ status: string }>(`SELECT "status" FROM application_tasks WHERE "id" = $1 AND "userId" = $2`, [applicationTaskId, userId])
           : null;
-        if (stoppedTask?.rows[0]?.status !== "cancelled") {
+        if (!applicationTaskFinalized && stoppedTask?.rows[0]?.status !== "cancelled") {
           await finishApplicationTask(
             getPool(),
             applicationTaskId,
-            isSubmitted ? "submitted" : isSubmissionBlocked ? "waiting_for_authorization" : requiresUserTakeover ? "waiting_for_user" : "failed",
-            isSubmitted ? "submission_verified" : turnStopped && !submissionRequestStarted ? "turn_stopped_before_submit" : isSubmissionBlocked ? "submission_blocked" : requiresUserTakeover ? USER_TAKEOVER_CHECKPOINT : "execution_failed",
+            isSubmitted ? "submitted" : submissionUncertain || requiresUserTakeover ? "waiting_for_user" : isSubmissionBlocked ? "waiting_for_authorization" : "failed",
+            isSubmitted ? "submission_verified" : submissionUncertain ? "submission_uncertain" : turnStopped && !submissionRequestStarted ? "turn_stopped_before_submit" : isSubmissionBlocked ? "submission_blocked" : requiresUserTakeover ? USER_TAKEOVER_CHECKPOINT : "execution_failed",
             harnessResult.error ?? null,
           );
+          applicationTaskFinalized = true;
         }
 
         }),
@@ -834,9 +892,28 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         ),
       ]);
     } catch (err: unknown) {
+      queueCatchStarted = true;
       const durationMs = Date.now() - startedAt;
       const message = err instanceof Error ? err.message : String(err);
       const stoppedBeforeRequest = turnStopped && !submissionRequestStarted;
+      const safeMessage = submissionRequestStarted
+        ? `${UNCONFIRMED_SUBMISSION_MESSAGE} Original error: ${message}`
+        : message;
+      if (submissionRequestStarted && applicationTaskId && !applicationTaskFinalized) {
+        try {
+          await finishApplicationTask(
+            getPool(),
+            applicationTaskId,
+            "waiting_for_user",
+            "submission_uncertain",
+            safeMessage,
+          );
+          applicationTaskFinalized = true;
+        } catch (stateError: unknown) {
+          console.warn("[apply-worker] Could not persist uncertain task state:", stateError instanceof Error ? stateError.message : String(stateError));
+        }
+        await closeActivePage();
+      }
       console.error(
         `[apply-worker] Failed for user=${userId}, job=${jobId}: ${message}`
       );
@@ -851,45 +928,51 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
           startedAt,
         });
         resultWritten = true;
-      } else if (!resultWritten) {
+      } else {
         const status = browserAttemptStarted ? "manual" : "failed";
-        const safeMessage = browserAttemptStarted
-          ? `${UNCONFIRMED_SUBMISSION_MESSAGE} Original error: ${message}`
-          : message;
-        await insertApplyResult({
-          userId,
-          jobId,
-          status,
-          mode: "unattended",
-          atsType: null,
-          flowUsed: null,
-          error: safeMessage,
-          durationMs,
-        });
-        if (browserAttemptStarted) {
+        if (!resultWritten && !resultWriteStarted) {
+          resultWriteStarted = true;
+          try {
+            await insertApplyResult({
+              userId,
+              jobId,
+              status,
+              mode: "unattended",
+              atsType: null,
+              flowUsed: null,
+              error: safeMessage,
+              durationMs,
+            });
+            resultWritten = true;
+          } finally {
+            resultWriteStarted = false;
+          }
+          createApplyResultNotification({
+            userId,
+            jobId,
+            jobTitle: ctx?.jobTitle ?? null,
+            jobCompany: ctx?.jobCompany ?? "Application",
+            status,
+          }).catch((e: Error) => console.warn("[notify] in-app notification failed:", e.message));
+        }
+        if (!stoppedBeforeRequest && browserAttemptStarted) {
           await releaseUncertainSubmission(getPool(), userId, jobId);
-        } else {
+        } else if (!stoppedBeforeRequest) {
           await getPool().query(
             'UPDATE "Job" SET status = $1, "workflowState" = $2, "updatedAt" = NOW() WHERE id = $3 AND "userId" = $4',
             ['saved', 'ready_to_apply', jobId, userId]
           );
         }
-        createApplyResultNotification({
-          userId,
-          jobId,
-          jobTitle: ctx?.jobTitle ?? null,
-          jobCompany: ctx?.jobCompany ?? "Application",
-          status,
-        }).catch((e: Error) => console.warn("[notify] in-app notification failed:", e.message));
       }
-      if (applicationTaskId && !stoppedBeforeRequest) {
+      if (applicationTaskId && !stoppedBeforeRequest && !applicationTaskFinalized) {
         await finishApplicationTask(
           getPool(),
           applicationTaskId,
           browserAttemptStarted ? "waiting_for_user" : "failed",
-          browserAttemptStarted ? "execution_interrupted" : "worker_failed",
-          message,
+          submissionRequestStarted ? "submission_uncertain" : browserAttemptStarted ? USER_TAKEOVER_CHECKPOINT : "worker_failed",
+          safeMessage,
         ).catch((stateError: Error) => console.warn("[apply-worker] Could not persist task failure:", stateError.message));
+        applicationTaskFinalized = true;
       }
       // Once a browser has started, BullMQ must not replay the task. A form
       // submit may have reached the ATS even when the worker lost its result.
@@ -900,13 +983,25 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
       const activeSubmissionRouteWork = submissionRouteState.work;
       if (activeSubmissionRouteWork) {
         await closeActivePage().catch(() => undefined);
-        await activeSubmissionRouteWork.catch(() => undefined);
+        const observedRouteWork = activeSubmissionRouteWork.catch((error: unknown) => {
+          console.warn("[apply-worker] Detached submission route failed:", error instanceof Error ? error.message : String(error));
+        });
+        if (submissionRequestStarted && (applicationTaskFinalized || queueCatchStarted)) {
+          void observedRouteWork;
+        } else {
+          await observedRouteWork;
+        }
       }
       const removeSubmissionRoute = submissionRouteState.cleanup;
       if (removeSubmissionRoute) {
-        await removeSubmissionRoute().catch((error: unknown) =>
+        const routeCleanup = removeSubmissionRoute().catch((error: unknown) =>
           console.warn("[apply-worker] Could not remove exact submission request route:", error instanceof Error ? error.message : String(error))
         );
+        if (submissionRequestStarted && (applicationTaskFinalized || queueCatchStarted)) {
+          void routeCleanup;
+        } else {
+          await routeCleanup;
+        }
       }
       if (armedSubmissionIntent && !submissionCandidateSeen && !submissionRequestStarted) await closeActivePage();
       if (pendingSubmissionFence && !submissionRequestStarted) await closeActivePage();

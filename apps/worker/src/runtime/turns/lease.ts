@@ -219,7 +219,19 @@ export async function releaseTurnLease(
          AND ("status" = 'in_progress' OR ("status" = 'waiting_for_user' AND $5 = 'waiting_for_user') OR ("status" = 'waiting_for_approval' AND $5 = 'waiting_for_approval'))`,
       [current.turnId, current.sessionId, current.ownerId, current.leaseVersion, status, now, current.userId],
     )
-    if (result.rowCount !== 1) throw new LeaseUnavailable("Turn lease is no longer owned")
+    if (result.rowCount !== 1) {
+      if (status === "completed") {
+        const receipt = await client.query(`SELECT "id" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3
+          AND "leaseVersion" = $4 AND "status" = 'completed' AND "leaseOwnerId" IS NULL AND "leaseExpiresAt" IS NULL`,
+        [current.turnId, current.sessionId, current.userId, current.leaseVersion])
+        if (receipt.rows[0]) return true
+      }
+      throw new LeaseUnavailable("Turn lease is no longer owned")
+    }
+    if (status === "failed" || status === "interrupted") await client.query(`UPDATE "agent_inputs" SET "status" = 'cancelled', "cancelledAt" = $4
+      WHERE "sessionId" = $1 AND "userId" = $2 AND "targetTurnId" = $3 AND "delivery" = 'follow_up'
+        AND "status" IN ('accepted', 'queued', 'consumed') AND "cancelledAt" IS NULL`,
+    [current.sessionId, current.userId, current.turnId, now])
     return true
   })
 }
@@ -238,10 +250,15 @@ export async function interruptTurnLease(
            "completedAt" = $5, "updatedAt" = $5
        WHERE "id" = $1 AND "sessionId" = $2 AND "leaseVersion" = $3
          AND "status" = 'in_progress'
-         AND ("leaseOwnerId" = $4 OR ("leaseOwnerId" IS NULL AND "leaseExpiresAt" <= $5))`,
+       AND ("leaseOwnerId" = $4 OR ("leaseOwnerId" IS NULL AND "leaseExpiresAt" <= $5))`,
       [current.turnId, current.sessionId, current.leaseVersion, current.ownerId, now],
     )
     if (result.rowCount !== 1) throw new LeaseUnavailable("Turn lease is no longer owned")
+    await client.query(`UPDATE "agent_inputs" SET "status" = 'cancelled', "cancelledAt" = $3
+      WHERE "sessionId" = $1 AND "userId" = (SELECT "userId" FROM "agent_turns" WHERE "id" = $2 AND "sessionId" = $1)
+        AND "targetTurnId" = $2 AND "delivery" = 'follow_up' AND "status" IN ('accepted', 'queued', 'consumed')
+        AND "cancelledAt" IS NULL`,
+    [current.sessionId, current.turnId, now])
     return true
   })
 }

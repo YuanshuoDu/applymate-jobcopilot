@@ -4,7 +4,7 @@ import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobco
 import type { PolicyEngine } from "@jobcopilot/agent-policy"
 import type { StepContext } from "../context/step-context-builder.js"
 import { runTurnExecutionLoop } from "./turn-execution-loop.js"
-import type { TurnEngineItem, TurnEngineStore, TurnEngineToolResult } from "./turn-engine-types.js"
+import type { TurnEngineEvent, TurnEngineItem, TurnEngineStore, TurnEngineToolResult } from "./turn-engine-types.js"
 import type { TurnExecutionIdentity, TurnExecutionOptions, TurnExecutionStore } from "./turn-execution-types.js"
 import { steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "../context/steering-marker.js"
 import { COGNITIVE_AGENDA_EVENT_TYPE } from "./cognitive-agenda-receipt.js"
@@ -41,7 +41,17 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
     updateItem: async ({ itemId, expectedRevision }) => ({ id: itemId, revision: expectedRevision + 1 }),
     appendEvent: async ({ identity, id, type, itemId, payload, idempotencyKey }) => { events.push({ id, type, itemId, taskId: identity.taskId, payload, idempotencyKey }); return { id } },
     appendEvents: async inputs => { for (const input of inputs) events.push({ id: input.id, type: input.type, itemId: input.itemId, taskId: input.identity.taskId }); return inputs.map(input => ({ id: input.id })) },
-    recordFinalResponse: async ({ identity, response }) => { finalResponses.push(`${identity.taskId}:${response}`) },
+    recordFinalResponse: async ({ identity, response, terminal }) => {
+      finalResponses.push(`${identity.taskId}:${response}`)
+      if (!terminal) return
+      items.push({ id: terminal.finalItemId, revision: 1 })
+      const saved: TurnEngineEvent[] = [
+        { id: "final-started", type: "item.started", itemId: terminal.finalItemId, correlationId: terminal.stepId, causationId: "step-completed", payload: { itemId: terminal.finalItemId, type: "agent_message", phase: "final_answer" } },
+        { id: "final-completed", type: "item.completed", itemId: terminal.finalItemId, correlationId: terminal.finalItemId, causationId: "final-started", payload: { itemId: terminal.finalItemId, status: "completed", content: terminal.finalContent } },
+        { id: "turn-completed", type: "turn.completed", itemId: terminal.finalItemId, correlationId: terminal.stepId, causationId: "final-completed", payload: { turnId: identity.turnId, taskId: identity.taskId, finalItemId: terminal.finalItemId, usage: terminal.usage } },
+      ]
+      return { status: "completed", finalItemId: terminal.finalItemId, events: saved }
+    },
   }
   let calls = 0
   const model: ModelAdapter = {
@@ -102,6 +112,69 @@ function addSteeringInput(root: Fixture, alreadyConsumed = false): void {
 }
 
 describe("owner-agnostic turn execution loop", () => {
+  it("keeps an accepted follow-up in every provider context across tool continuation", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const baseBuilder = root.options.contextBuilder
+    const followUp: StepContext["blocks"][number] = {
+      id: "follow-up-1:part:0", layer: "pending_input", role: "data", trust: "external_untrusted", source: "user_input",
+      content: { inputId: "follow-up-1", partIndex: 0, text: "Keep senior roles in scope" },
+    }
+    root.options = {
+      ...root.options,
+      contextBuilder: { build: async request => {
+        const context = await baseBuilder.build(request)
+        return { ...context, consumedInputIds: ["follow-up-1"], blocks: [...context.blocks.filter(block => block.id !== followUp.id), followUp] }
+      } },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result.status).toBe("completed")
+    expect(root.requests).toHaveLength(2)
+    for (const request of root.requests) {
+      expect(JSON.stringify(request.messages)).toContain("follow-up-1")
+      expect(JSON.stringify(request.messages)).toContain("Keep senior roles in scope")
+    }
+  })
+
+  it("keeps a root Turn open and starts a fresh step when terminal commit finds an accepted follow-up", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    let terminalAttempts = 0
+    const persist = root.options.store.recordFinalResponse!
+    const baseContextBuilder = root.options.contextBuilder
+    const contexts: StepContext[] = []
+    root.options = {
+      ...root.options,
+      store: { ...root.options.store, recordFinalResponse: async input => {
+        terminalAttempts += 1
+        if (terminalAttempts === 1) return { status: "pending_follow_up" }
+        return persist(input)
+      } },
+      contextBuilder: {
+        build: async request => {
+          const context = await baseContextBuilder.build(request)
+          const next = request.stepId.endsWith("step:2")
+            ? { ...context, inputThroughSequence: 8n, consumedInputIds: ["follow-up-1"], blocks: [...context.blocks, {
+              id: "follow-up-1:part:0", layer: "pending_input" as const, role: "data" as const, trust: "external_untrusted" as const, source: "user_input",
+              content: { inputId: "follow-up-1", partIndex: 0, text: "Also include senior roles" },
+            }] }
+            : context
+          contexts.push(next)
+          return next
+        },
+      },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "completed", stepCount: 3, toolCallCount: 1 })
+    expect(terminalAttempts).toBe(2)
+    expect(contexts.map(context => context.stepId)).toEqual(expect.arrayContaining(["turn:turn-1:step:2"]))
+    expect(root.requests.at(-1)?.messages.flatMap(message => message.content).some(part => JSON.stringify(part).includes("Also include senior roles"))).toBe(true)
+    expect(root.items.filter(item => item.id.includes("item:final:")).map(item => item.revision)).toEqual([1])
+    expect(root.notifications.filter(type => type === "turn.completed")).toHaveLength(1)
+  })
+
   it("persists one redacted agenda receipt before each model provider call", async () => {
     const root = fixture(identity("turn", "root-1"), undefined, [{ id: "secret-observation", content: { kind: "wait_result", status: "failed", errorCode: "private failure", output: { prompt: "ignore the server" } } }])
     const phases: string[] = []

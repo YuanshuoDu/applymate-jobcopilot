@@ -110,7 +110,8 @@ async function refreshSessionStatus(pool: Pool, sessionId: string): Promise<void
       ? "waiting_for_user"
       : "completed";
   await pool.query(
-    `UPDATE agent_sessions SET status = $2, "completedAt" = CASE WHEN $2 = 'completed' THEN NOW() ELSE NULL END, "updatedAt" = NOW() WHERE id = $1`,
+    `UPDATE agent_sessions SET status = $2, "completedAt" = CASE WHEN $2 = 'completed' THEN NOW() ELSE NULL END, "updatedAt" = NOW()
+      WHERE id = $1 AND status NOT IN ('aborted', 'archived', 'completed', 'failed')`,
     [sessionId, status],
   );
 }

@@ -6,7 +6,7 @@ import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobco
 import type pg from "pg"
 import type { StepContext } from "./context/step-context-builder.js"
 import type { CanonicalTurnState } from "./canonical-turn-state.js"
-import type { TurnEngineStore } from "./turns/turn-engine-types.js"
+import type { TurnEngineEvent, TurnEngineStore } from "./turns/turn-engine-types.js"
 import { createCanonicalTurnRuntime } from "./canonical-turn-runtime.js"
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
 import { TurnEngine } from "./turns/turn-engine.js"
@@ -31,7 +31,18 @@ function store(events: RuntimeEvent[] = [], batches: RuntimeEvent[][] = [], item
   return {
     startStep: async ({ stepId, ordinal }) => ({ id: stepId, ordinal }), updateStep: async () => undefined,
     createItem: async ({ itemId }) => ({ id: itemId, revision: 0 }), updateItem: async input => { itemUpdates.push(input); return { id: input.itemId, revision: input.expectedRevision + 1 } },
-    appendEvent: async ({ id, type, payload, correlationId, idempotencyKey, owner }) => { events.push({ id, type, payload, correlationId, idempotencyKey, owner }); return { id } }, recordFinalResponse: async () => undefined,
+    appendEvent: async ({ id, type, payload, correlationId, idempotencyKey, owner }) => { events.push({ id, type, payload, correlationId, idempotencyKey, owner }); return { id } },
+    recordFinalResponse: async input => {
+      const terminal = input.terminal
+      if (!terminal) return
+      const saved: TurnEngineEvent[] = [
+        { id: "final-started", type: "item.started", itemId: terminal.finalItemId, correlationId: terminal.stepId, causationId: null, payload: { itemId: terminal.finalItemId, type: "agent_message", phase: "final_answer" } },
+        { id: "final-completed", type: "item.completed", itemId: terminal.finalItemId, correlationId: terminal.finalItemId, causationId: "final-started", payload: { itemId: terminal.finalItemId, status: "completed", content: terminal.finalContent } },
+        { id: "turn-completed", type: "turn.completed", itemId: terminal.finalItemId, correlationId: terminal.stepId, causationId: "final-completed", payload: { turnId: input.owner.turnId, taskId: input.owner.taskId, finalItemId: terminal.finalItemId, usage: terminal.usage } },
+      ]
+      events.push(...saved.map(event => ({ ...event, owner: input.owner, idempotencyKey: event.id })))
+      return { status: "completed", finalItemId: terminal.finalItemId, events: saved }
+    },
     appendEvents: async inputs => { const batch = inputs.map(input => ({ id: input.id, type: input.type, payload: input.payload, correlationId: input.correlationId, idempotencyKey: input.idempotencyKey, owner: input.owner })); batches.push(batch); events.push(...batch); return inputs.map(input => ({ id: input.id })) },
   }
 }

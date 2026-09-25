@@ -13,6 +13,7 @@ import {
   CAPTCHA_USER_TAKEOVER_MESSAGE,
   CHALLENGE_DETECTION_FAILED_MESSAGE,
   completeFillForReview,
+  finishApplicationTask,
   needsUserTakeover,
   USER_TAKEOVER_CHECKPOINT,
   isUserActive,
@@ -23,6 +24,43 @@ function testPool() {
   const query = vi.fn();
   return { pool: { query } as unknown as Pool, query };
 }
+
+describe("finishApplicationTask session refresh", () => {
+  it("keeps submission uncertainty durable without reopening a stopped or terminal session", async () => {
+    const { pool, query } = testPool();
+    query
+      .mockResolvedValueOnce({ rows: [{ sessionId: "session_1" }] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] })
+      .mockResolvedValueOnce({ rows: [{ status: "waiting_for_user" }] })
+      .mockResolvedValueOnce({ rowCount: 0, rows: [] });
+
+    await finishApplicationTask(pool, "task_1", "waiting_for_user", "submission_uncertain", "Request outcome is uncertain");
+
+    expect(query.mock.calls[1]?.[0]).toContain('SET status = $2, "checkpoint" = $3');
+    expect(query.mock.calls[1]?.[1]).toEqual(["task_1", "waiting_for_user", "submission_uncertain", "Request outcome is uncertain"]);
+    const sessionRefresh = query.mock.calls[4]?.[0] as string;
+    expect(sessionRefresh).toContain('"completedAt" = CASE WHEN $2 = \'completed\' THEN NOW() ELSE NULL END');
+    expect(sessionRefresh).toContain("status NOT IN ('aborted', 'archived', 'completed', 'failed')");
+    expect(sessionRefresh.indexOf('"completedAt"')).toBeLessThan(sessionRefresh.indexOf("WHERE id = $1 AND status NOT IN"));
+    expect(query.mock.calls[4]?.[1]).toEqual(["session_1", "waiting_for_user"]);
+  });
+
+  it("retains ordinary refresh mapping for nonterminal sessions", async () => {
+    const { pool, query } = testPool();
+    query
+      .mockResolvedValueOnce({ rows: [{ sessionId: "session_1" }] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] })
+      .mockResolvedValueOnce({ rows: [{ status: "filling" }] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] });
+
+    await finishApplicationTask(pool, "task_1", "waiting_for_user", "submission_uncertain", "Request outcome is uncertain");
+
+    expect(query.mock.calls[4]?.[1]).toEqual(["session_1", "running"]);
+    expect(query.mock.calls[4]?.[0]).toContain("status NOT IN ('aborted', 'archived', 'completed', 'failed')");
+  });
+});
 
 describe("completeFillForReview", () => {
   beforeEach(() => {

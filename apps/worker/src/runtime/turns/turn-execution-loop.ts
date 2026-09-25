@@ -9,7 +9,7 @@ import { buildModelRequest } from "./turn-engine-messages.js"
 import { runModelStep, type ModelStepResult } from "./turn-engine-model.js"
 import { TurnEngineError, toRepositoryJson, type TurnEngineResult, type TurnEngineStep } from "./turn-engine-types.js"
 import { publishCommentary, publishFinalResponse, publishReasoningSummary, TurnExecutionEventWriter } from "./turn-execution-events.js"
-import type { TurnExecutionOptions } from "./turn-execution-types.js"
+import { executionId, type TurnExecutionOptions } from "./turn-execution-types.js"
 import { assertCompletionAllowed } from "./turn-execution-completion-gate.js"
 import { assertExecutionAlive, assertModelAllowance, canEmitTurnCompleted, canPersistFinalResponse, makeExecutionId, resumedBudgetLimits, totalTurnUsage, turnErrorCode, updateExecutionStep } from "./turn-engine-helpers.js"
 import { STEERING_MARKER_EVENT_TYPE } from "../context/steering-marker.js"
@@ -23,10 +23,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
   const signal = options.signal ?? new AbortController().signal
   const now = options.now ?? (() => new Date())
   const writer = new TurnExecutionEventWriter({ ...options, signal, now })
-  const baseBudget: TurnBudgetLimits = {
-    ...options.budget,
-    maxSteps: options.budget?.maxSteps ?? options.maxSteps ?? DEFAULT_MAX_STEPS,
-  }
+  const baseBudget: TurnBudgetLimits = { ...options.budget, maxSteps: options.budget?.maxSteps ?? options.maxSteps ?? DEFAULT_MAX_STEPS }
   const budget = createTurnBudgetLedger(resumedBudgetLimits(baseBudget, options.resume) ?? {})
   const executionOptions = options
   const progress = createProgressDetector(options.noProgressRepeatLimit ?? 2)
@@ -167,10 +164,26 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           goal: options.goal, verification, terminalReason: "goal_satisfied", response: output.text,
           usage: totalTurnUsage(options.resume?.usage, budget.usage()), stepCount: steps, toolCallCount: toolCalls,
         })
-        const finalItem = await publishFinalResponse(writer, options, step, finalResponse, now)
         if (canPersistFinalResponse(options)) {
-          await options.store.recordFinalResponse?.({ identity: options.identity, response: serializeFinalResponse(finalResponse), now: now() })
+          if (!options.store.recordFinalResponse) throw new TurnEngineError("persistence_conflict", "Atomic Turn completion is unavailable")
+          const finalItemId = options.idFactory?.(executionId(options.identity, `item:final:${step.id}`)) ?? executionId(options.identity, `item:final:${step.id}`)
+          const terminal = await options.store.recordFinalResponse({
+            identity: options.identity, response: serializeFinalResponse(finalResponse), now: now(),
+            terminal: {
+              stepId: step.id, finalItemId,
+              finalContent: toRepositoryJson({ text: finalResponse.response, final: toRepositoryJson(finalResponse) }),
+              stepCount: steps, toolCallCount: toolCalls, usage: finalResponse.usage,
+            },
+          })
+          if (!terminal) throw new TurnEngineError("persistence_conflict", "Atomic Turn completion returned no receipt")
+          if (terminal.status === "pending_follow_up") {
+            continuation = undefined
+            continue
+          }
+          for (const event of terminal.events) await Promise.resolve(options.subscribe?.(event)).catch(() => undefined)
+          return { status: "completed", stepCount: steps, toolCallCount: toolCalls, finalItemId: terminal.finalItemId, finalText: output.text }
         }
+        const finalItem = await publishFinalResponse(writer, options, step, finalResponse, now)
         if (canEmitTurnCompleted(options)) {
           await writer.append(
             "turn.completed", step.id, finalItem.id,
