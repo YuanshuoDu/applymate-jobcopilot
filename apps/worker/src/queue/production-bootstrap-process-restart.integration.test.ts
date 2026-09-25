@@ -147,6 +147,14 @@ function waitForExit(child: WorkerChild, context: ExitWaitContext): Promise<void
 function workerHasExited(child: WorkerChild): boolean { return child.exitCode !== null || child.signalCode !== null }
 function cleanupError(error: unknown): string { return error instanceof Error ? error.stack ?? error.message : String(error) }
 
+async function removeTurnFixtureJobAfterWorkersExit(queue: Queue, redis: Redis, jobId: string): Promise<void> {
+  // A SIGKILL leaves BullMQ's lock key until its TTL expires. These job IDs
+  // belong only to this disposable Redis fixture, and callers stop all child
+  // Workers before removing the lock and the corresponding job.
+  await redis.del(`${queue.toKey(jobId)}:lock`)
+  await queue.getJob(jobId)?.then(job => job?.remove())
+}
+
 async function stopWorkerForCleanup(child: WorkerChild, workerName: string): Promise<string | null> {
   const gracefulContext: ExitWaitContext = { stage: `${workerName}-cleanup-after-shutdown`, pid: child.pid, timeoutMs: 3_000 }
   const gracefulExit = waitForExit(child, gracefulContext)
@@ -276,6 +284,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
   let ids: FixtureIds
   let childTaskId: string | undefined
   let wakeupGeneration: number | undefined
+  const turnFixtureIds = new Set<string>()
 
   beforeAll(async () => {
     process.env.REDIS_URL = redisUrl!
@@ -300,6 +309,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
       sessionId: `process-restart-session-${suffix}`,
       turnId: `process-restart-turn-pending-${suffix}`,
     }
+    turnFixtureIds.add(ids.turnId)
     await pool.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`, [ids.userId, `${ids.userId}@example.invalid`])
     await pool.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
       VALUES ($1, $2, 'Resume a parent Turn after its child completes', 'running', 'test', CURRENT_TIMESTAMP)`, [ids.sessionId, ids.userId])
@@ -322,18 +332,22 @@ describeWithServices("production bootstrap recovery across a Worker process rest
         turnQueuePaused = false
       })
     }
+    const workersStopped = [commandAcceptance, workerOne, workerTwo].every(child => !child || workerHasExited(child))
+    if (turnQueue && turnJobKey && redis && workersStopped && typeof ids !== "undefined") {
+      turnFixtureIds.add(ids.turnId)
+      for (const turnId of turnFixtureIds) {
+        for (let generation = 0; generation <= Math.max(8, wakeupGeneration ?? 0); generation += 1) {
+          await attemptCleanup(cleanupFailures, `turn fixture job ${generation} cleanup`, async () => {
+            await removeTurnFixtureJobAfterWorkersExit(turnQueue!, redis!, turnJobKey!(turnId, generation))
+          })
+        }
+      }
+    } else if (turnQueue && typeof ids !== "undefined") {
+      cleanupFailures.push("Turn fixture job cleanup skipped because a child Worker may still be running")
+    }
     if (pool && typeof ids !== "undefined") await attemptCleanup(cleanupFailures, "fixture database cleanup", async () => {
       await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [ids.userId])
     })
-    if (turnQueue && turnJobKey && typeof ids !== "undefined") {
-      const generations = new Set([0, 1, 2])
-      if (wakeupGeneration !== undefined) generations.add(wakeupGeneration)
-      for (const generation of generations) {
-        await attemptCleanup(cleanupFailures, `turn job ${generation} cleanup`, async () => {
-          await turnQueue!.getJob(turnJobKey!(ids.turnId, generation))?.then(job => job?.remove())
-        })
-      }
-    }
     if (childTaskId && childQueue && childJobKey) await attemptCleanup(cleanupFailures, "subagent job cleanup", async () => {
       await childQueue!.getJob(childJobKey!(childTaskId!))?.then(job => job?.remove())
     })
@@ -366,6 +380,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
       originalDisposition: "started",
     })
     ids.turnId = acceptance.accepted.turnId
+    turnFixtureIds.add(ids.turnId)
     const acceptedFacts = await pool!.query<{
       turnCount: string
       inputCount: string
@@ -582,6 +597,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     expect(started.accepted.disposition).toBe("started")
     expect(started.duplicate).toMatchObject({ inputId: started.accepted.inputId, disposition: "duplicate", originalDisposition: "started" })
     followUpIds.turnId = started.accepted.turnId
+    turnFixtureIds.add(followUpIds.turnId)
 
     workerOne = startWorker("park-active-follow-up", followUpIds)
     await waitForLine(workerOne, "FIRST_PROVIDER_ACTIVE")
@@ -666,9 +682,6 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     await waitForLine(workerTwo, "SHUTDOWN_STAGE bootstrap_close:complete", 10_000)
     await waitForExit(workerTwo, { stage: "active-worker2-after-shutdown", pid: workerTwo.pid })
     expect(workerTwo.exitCode).toBe(0)
-    for (let generation = 0; generation <= 8; generation += 1) {
-      await turnQueue!.getJob(turnJobKey!(followUpIds.turnId, generation))?.then(job => job?.remove())
-    }
     await pool!.query(`DELETE FROM "agent_sessions" WHERE "id" = $1`, [followUpIds.sessionId])
   }, 60_000)
 
