@@ -3,8 +3,11 @@ import { describe, expect, it, vi } from "vitest"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 
-import { TurnExecutionEventWriter } from "./turn-execution-events.js"
+import { executeToolWithItems, TurnExecutionEventWriter } from "./turn-execution-events.js"
 import type { TurnExecutionIdentity, TurnExecutionOptions, TurnExecutionStore } from "./turn-execution-types.js"
+import { restoreToolCallState } from "./persisted-tool-call-state.js"
+import { findToolObservation, stableJson } from "./turn-engine-replay.js"
+import { executeTools } from "./turn-execution-tools.js"
 
 function identity(kind: TurnExecutionIdentity["kind"], taskId: string): TurnExecutionIdentity {
   const common = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId, rootTaskId: "root-1", ownerId: "worker-1", leaseExpiresAt: new Date("2026-09-08T03:00:00.000Z") }
@@ -37,6 +40,55 @@ describe("TurnExecutionEventWriter", () => {
     expect(events[0]?.type).toBe("item.started")
     expect(events[1]?.type).toBe("item.completed")
     expect(events.every(event => event.identity.taskId === "root-1")).toBe(true)
+  })
+
+  it("preserves completed tool-call input for replay after restoring persisted items", async () => {
+    const events: Array<{ id: string; type: string; itemId: string | null; identity: TurnExecutionIdentity }> = []
+    const items = new Map<string, { id: string; stepId: string | null; type: string; status: string; revision: number; content: unknown }>()
+    const base = options(identity("turn", "root-1"), events)
+    const executionOptions: TurnExecutionOptions = {
+      ...base,
+      store: {
+        ...base.store,
+        createItem: async ({ itemId, stepId, type, status, content }) => {
+          items.set(itemId, { id: itemId, stepId, type, status, revision: 0, content })
+          return { id: itemId, revision: 0 }
+        },
+        updateItem: async ({ itemId, expectedRevision, status, content }) => {
+          const current = items.get(itemId)
+          if (!current) throw new Error("fixture_item_missing")
+          items.set(itemId, { ...current, status, revision: expectedRevision + 1, content })
+          return { id: itemId, revision: expectedRevision + 1 }
+        },
+      },
+      executeTool: vi.fn(async ({ call }: Parameters<TurnExecutionOptions["executeTool"]>[0]) => ({
+        id: call.id, toolName: call.toolName, toolVersion: call.toolVersion,
+        status: "completed" as const, output: { taskId: "task-1" }, errorCode: null,
+      })),
+    }
+    const call = {
+      id: "spawn-call-1", name: "agent.spawn", arguments: {
+        idempotencyKey: "spawn-operation-1", role: "analyst", taskType: "research",
+        goal: "Research the company", context: { source: "fixture" },
+      },
+    }
+    const writer = new TurnExecutionEventWriter(executionOptions)
+
+    await executeToolWithItems(executionOptions, writer, { id: "step-1", ordinal: 0 }, call, () => new Date("2026-09-25T00:00:00.000Z"))
+
+    const restored = restoreToolCallState([...items.values()], [])
+    expect(restored.pending).toEqual([])
+    const observation = findToolObservation({ ...executionOptions.snapshot, toolObservations: restored.observations }, call.id)
+    expect(observation?.toolName).toBe(call.name)
+    expect(stableJson(observation?.input)).toBe(stableJson(call.arguments))
+    expect([...items.values()].find(item => item.type === "tool_call")?.content).toMatchObject({ input: call.arguments })
+
+    await expect(executeTools(executionOptions, writer, { id: "step-2", ordinal: 1 }, {
+      text: "", reasoningSummary: "", toolCalls: [call], provider: "fixture", model: "fixture",
+      finishReason: "tool_calls", usage: null, continuation: null,
+    }, { ...executionOptions.snapshot, toolObservations: restored.observations }, new Set(), new AbortController().signal,
+    () => new Date("2026-09-25T00:00:00.000Z"), undefined, () => undefined)).resolves.toMatchObject({ wait: null })
+    expect(executionOptions.executeTool).toHaveBeenCalledOnce()
   })
 
   it("names child turn lifecycle events as task activity", async () => {

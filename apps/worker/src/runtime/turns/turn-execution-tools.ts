@@ -1,5 +1,5 @@
 import type { ModelStepResult } from "./turn-engine-model.js"
-import { findToolObservation, stableJson } from "./turn-engine-replay.js"
+import { findToolResultObservation, stableJson } from "./turn-engine-replay.js"
 import { toRepositoryJson, TurnEngineError, type TurnEngineResult, type TurnEngineStep, type ToolCallRecovery } from "./turn-engine-types.js"
 import { executeToolWithItems, persistRecoveredToolCall, TurnExecutionEventWriter } from "./turn-execution-events.js"
 import type { TurnExecutionOptions } from "./turn-execution-types.js"
@@ -39,9 +39,11 @@ export async function executeTools(
     assertExecutionAlive(options, signal)
     if (seen.has(call.id)) throw new TurnEngineError("invalid_output", `Tool call ${call.id} was repeated in the Turn`)
     seen.add(call.id)
-    const replayed = findToolObservation(snapshot, call.id)
+    const replayed = findToolResultObservation(snapshot, call.id)
     if (replayed) {
       if (replayed.toolName !== call.name || stableJson(replayed.input) !== stableJson(call.arguments)) throw new TurnEngineError("invalid_output", `Tool call ${call.id} does not match its persisted replay record`)
+      const wait = dependencyWaitReceipt(replayed.status === "completed" ? replayed.output : null)
+      if (wait && !hasResolvedWaitOutcome(snapshot, wait.waitId)) return { wait: { status: "waiting_for_dependency", waitId: wait.waitId, stepCount: 0, toolCallCount: 0 }, snapshot, steeringMarkerState: markerState }
       continue
     }
     const result = await executeToolWithItems(options, writer, step, call, now, onToolCallPersisted)
@@ -97,4 +99,23 @@ function dependencyWaitReceipt(value: unknown): DependencyWaitReceipt | null {
   if (record.status !== "waiting" || typeof record.waitId !== "string" || !record.waitId.trim() || typeof record.deadlineAt !== "string" || !record.deadlineAt.trim() || !Array.isArray(record.matchedTaskIds)) return null
   if (!record.matchedTaskIds.every(item => typeof item === "string" && item.trim().length > 0)) return null
   return { waitId: record.waitId, deadlineAt: record.deadlineAt, matchedTaskIds: record.matchedTaskIds }
+}
+
+function hasResolvedWaitOutcome(snapshot: TurnExecutionOptions["snapshot"], waitId: string): boolean {
+  return snapshot.toolObservations.some(observation => {
+    if (observation.id !== `wait-result:${waitId}` || !observation.content || typeof observation.content !== "object" || Array.isArray(observation.content)) return false
+    const content = observation.content as Record<string, unknown>
+    if (content.toolCallId !== `wait:${waitId}` || content.toolName !== "agent.wait" || content.status !== "completed") return false
+    const output = content.output
+    if (!output || typeof output !== "object" || Array.isArray(output)) return false
+    const result = output as Record<string, unknown>
+    if (result.waitId !== waitId || (result.status !== "ready" && result.status !== "timed_out")) return false
+    if (!Array.isArray(result.targetTaskIds) || !Array.isArray(result.matchedTaskIds)) return false
+    const targetTaskIds: readonly unknown[] = result.targetTaskIds
+    const matchedTaskIds: readonly unknown[] = result.matchedTaskIds
+    if (!targetTaskIds.every((id: unknown) => typeof id === "string" && id.trim().length > 0)) return false
+    if (!matchedTaskIds.every((id: unknown) => typeof id === "string" && targetTaskIds.includes(id))) return false
+    return Array.isArray(result.tasks) && result.tasks.length === targetTaskIds.length
+      && (result.status !== "ready" || matchedTaskIds.length > 0)
+  })
 }

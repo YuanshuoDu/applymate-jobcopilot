@@ -121,7 +121,10 @@ export async function executeToolWithItems(
     if (signalWasInterrupted(options.signal ?? new AbortController().signal)) throw error
     result = { id: call.id, toolName: call.name, toolVersion: "1", status: "failed", errorCode: "tool_execution_failed" }
   }
-  await writer.completeItem(callItem, { toolCallId: call.id, toolName: call.name, toolVersion: result.toolVersion, status: result.status, errorCode: result.errorCode }, now(), `tool-call-completed:${call.id}`)
+  await writer.completeItem(callItem, {
+    toolCallId: call.id, toolName: call.name, toolVersion: result.toolVersion,
+    status: result.status, errorCode: result.errorCode, input: toRepositoryJson(call.arguments),
+  }, now(), `tool-call-completed:${call.id}`)
   await writer.append(
     result.status === "completed" ? "tool_call.completed" : "tool_call.failed", call.id, callItem.id,
     { toolCallId: call.id, toolName: call.name, status: result.status, errorCode: result.errorCode, taskId: options.identity.taskId },
@@ -143,7 +146,10 @@ export async function persistRecoveredToolCall(
   now: () => Date,
 ): Promise<void> {
   const callItem: ExecutionItemHandle = { id: recovery.callItem.id, type: "tool_call", phase: null, revision: recovery.callItem.revision }
-  const callContent = { toolCallId: recovery.call.id, toolName: recovery.call.name, toolVersion: recovery.toolVersion, status: result.status, errorCode: result.errorCode }
+  const callContent = {
+    toolCallId: recovery.call.id, toolName: recovery.call.name, toolVersion: recovery.toolVersion,
+    status: result.status, errorCode: result.errorCode, input: toRepositoryJson(recovery.call.arguments),
+  }
   await writer.completeItem(callItem, callContent, now(), `tool-call-recovered:${recovery.call.id}`)
   await writer.append(result.status === "completed" ? "tool_call.completed" : "tool_call.failed", recovery.call.id, callItem.id, {
     toolCallId: recovery.call.id, toolName: recovery.call.name, toolVersion: result.toolVersion, status: result.status,
