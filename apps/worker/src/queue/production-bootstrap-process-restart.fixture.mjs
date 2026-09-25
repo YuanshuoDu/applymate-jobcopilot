@@ -273,18 +273,46 @@ async function makeFollowUpResumeWorker() {
     workerId: "active-follow-up-recovery-" + process.pid,
     coordinationEnabled: false,
     authorizeUsage: async () => ({ settle() {} }),
+    toolRuntimeFactory() {
+      return {
+        registry: {
+          list: () => [{ name: "jobs.search", version: "1" }],
+          resolve: () => ({ idempotency: "read_only" }),
+          validateArguments: () => true,
+        },
+        router: {
+          async execute(_context, call) {
+            return {
+              id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed",
+              output: { jobs: [{
+                id: "fixture-job-" + ids.suffix, company: "Fixture Employer", role: "Software Engineer", location: "Dublin",
+                status: "active", score: null, url: null, source: "fixture", salary: null, description: null, keywords: null,
+              }], page: 1, hasMore: false }, errorCode: null,
+            }
+          },
+        },
+      }
+    },
     modelRuntimeFactory() {
+      let modelCalls = 0
       return {
         adapter: {
           id: "active-follow-up-recovery-fixture-model",
           profile: modelProfile(),
           async *stream(request) {
-            const matchingParts = request.messages
-              .filter(message => message.role === "user" && Array.isArray(message.content))
-              .flatMap(message => message.content)
-              .filter(part => part.type === "text" && part.text.includes(ids.followUpInputId) && part.text.includes(followUpText))
-            if (matchingParts.length !== 1) throw new Error("recovered_provider_request_did_not_contain_exactly_one_original_follow_up_id_text_in_user_role")
-            say("FOLLOW_UP_CONTEXT_OK")
+            modelCalls += 1
+            if (modelCalls === 1) {
+              const matchingParts = request.messages
+                .filter(message => message.role === "user" && Array.isArray(message.content))
+                .flatMap(message => message.content)
+                .filter(part => part.type === "text" && part.text.includes(ids.followUpInputId) && part.text.includes(followUpText))
+              if (matchingParts.length !== 1) throw new Error("recovered_provider_request_did_not_contain_exactly_one_original_follow_up_id_text_in_user_role")
+              say("FOLLOW_UP_CONTEXT_OK")
+              yield { type: "tool_call_completed", callId: "follow-up-evidence-" + ids.suffix, name: "jobs.search", arguments: { location: "Dublin" } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if (modelCalls !== 2) throw new Error("unexpected_follow_up_provider_round")
             yield { type: "text_delta", text: finalMarker }
             yield { type: "completed", finishReason: "stop" }
           },

@@ -31,7 +31,10 @@ function storeFixture(): { store: TurnEngineStore; events: Array<{ type: string;
       return { id: itemId, revision: item!.revision }
     },
     appendEvent: async ({ id, type, payload }) => { events.push({ type, payload }); return { id } },
-    recordFinalResponse: vi.fn(async () => undefined),
+    recordFinalResponse: vi.fn(async ({ terminal }: Parameters<NonNullable<TurnEngineStore["recordFinalResponse"]>>[0]) => {
+      if (!terminal) return undefined
+      return { status: "completed" as const, finalItemId: terminal.finalItemId, events: [] }
+    }),
   }
   return { store, events, items }
 }

@@ -177,13 +177,20 @@ async function attemptCleanup(failures: string[], label: string, action: () => P
   try { await action() } catch (error: unknown) { failures.push(`${label}: ${cleanupError(error)}`) }
 }
 
-async function waitForTurnStatus(pool: Pool, turnId: string, status: string, timeoutMs = 20_000): Promise<void> {
+async function waitForTurnStatus(pool: Pool, turnId: string, status: string, timeoutMs = 20_000, child?: WorkerChild): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const result = await pool.query<{ status: string }>(`SELECT "status" FROM "agent_turns" WHERE "id" = $1`, [turnId])
     if (result.rows[0]?.status === status) return
     if (["failed", "interrupted", "cancelled"].includes(String(result.rows[0]?.status))) {
-      throw new Error(`Turn entered unexpected terminal state ${result.rows[0]?.status}`)
+      const [state, failure] = await Promise.all([
+        pool.query<Record<string, unknown>>(`SELECT turn."status", turn."error", root."status" AS "rootStatus", root."failureReason", root."result",
+            (SELECT step."errorCode" FROM "agent_steps" AS step WHERE step."turnId" = turn."id" ORDER BY step."ordinal" DESC LIMIT 1) AS "latestStepErrorCode"
+          FROM "agent_turns" AS turn LEFT JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" WHERE turn."id" = $1`, [turnId]),
+        pool.query<Record<string, unknown>>(`SELECT event."payload" FROM "agent_events" AS event
+          WHERE event."turnId" = $1 AND event."type" = 'turn.failed' ORDER BY event."sequence" DESC LIMIT 1`, [turnId]),
+      ])
+      throw new Error(`Turn entered unexpected terminal state ${result.rows[0]?.status}; state=${JSON.stringify(state.rows[0] ?? null)}; failureEvent=${JSON.stringify(failure.rows[0]?.payload ?? null)}; workerStderr=${child?.errors.join(" | ") ?? "unavailable"}`)
     }
     await new Promise(resolve => setTimeout(resolve, 25))
   }
@@ -636,7 +643,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     workerTwo = startWorker("resume-active-follow-up", followUpIds)
     expect(workerTwo.pid).not.toBe(workerOnePid)
     await waitForLine(workerTwo, "FOLLOW_UP_CONTEXT_OK")
-    await waitForTurnStatus(pool!, followUpIds.turnId, "completed")
+    await waitForTurnStatus(pool!, followUpIds.turnId, "completed", 20_000, workerTwo)
     const consumed = await pool!.query<{
       status: string; consumedByStepId: string | null; delivery: string; targetTurnId: string; sessionId: string; userId: string
     }>(`SELECT "status", "consumedByStepId", "delivery", "targetTurnId", "sessionId", "userId" FROM "agent_inputs" WHERE "id" = $1`, [accepted.accepted.inputId])
