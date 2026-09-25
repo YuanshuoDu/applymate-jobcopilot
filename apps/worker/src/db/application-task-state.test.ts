@@ -25,40 +25,67 @@ function testPool() {
   return { pool: { query } as unknown as Pool, query };
 }
 
-describe("finishApplicationTask session refresh", () => {
+describe("finishApplicationTask", () => {
   it("keeps submission uncertainty durable without reopening a stopped or terminal session", async () => {
     const { pool, query } = testPool();
     query
-      .mockResolvedValueOnce({ rows: [{ sessionId: "session_1" }] })
-      .mockResolvedValueOnce({ rowCount: 1, rows: [] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ sessionId: "session_1" }] })
       .mockResolvedValueOnce({ rowCount: 1, rows: [] })
       .mockResolvedValueOnce({ rows: [{ status: "waiting_for_user" }] })
       .mockResolvedValueOnce({ rowCount: 0, rows: [] });
 
     await finishApplicationTask(pool, "task_1", "waiting_for_user", "submission_uncertain", "Request outcome is uncertain");
 
-    expect(query.mock.calls[1]?.[0]).toContain('SET status = $2, "checkpoint" = $3');
-    expect(query.mock.calls[1]?.[1]).toEqual(["task_1", "waiting_for_user", "submission_uncertain", "Request outcome is uncertain"]);
-    const sessionRefresh = query.mock.calls[4]?.[0] as string;
+    const transition = query.mock.calls[0]?.[0] as string;
+    expect(transition).toContain('SET status = $2, "checkpoint" = $3');
+    expect(transition).toContain("status NOT IN ('cancelled', 'submitted')");
+    expect(transition).toContain('status IS DISTINCT FROM $2 OR "checkpoint" IS DISTINCT FROM $3 OR error IS DISTINCT FROM $4');
+    expect(transition).toContain('RETURNING "sessionId"');
+    expect(query.mock.calls[0]?.[1]).toEqual(["task_1", "waiting_for_user", "submission_uncertain", "Request outcome is uncertain"]);
+    const sessionRefresh = query.mock.calls[3]?.[0] as string;
     expect(sessionRefresh).toContain('"completedAt" = CASE WHEN $2 = \'completed\' THEN NOW() ELSE NULL END');
     expect(sessionRefresh).toContain("status NOT IN ('aborted', 'archived', 'completed', 'failed')");
     expect(sessionRefresh.indexOf('"completedAt"')).toBeLessThan(sessionRefresh.indexOf("WHERE id = $1 AND status NOT IN"));
-    expect(query.mock.calls[4]?.[1]).toEqual(["session_1", "waiting_for_user"]);
+    expect(query.mock.calls[3]?.[1]).toEqual(["session_1", "waiting_for_user"]);
+    expect(query).toHaveBeenCalledTimes(4);
   });
 
   it("retains ordinary refresh mapping for nonterminal sessions", async () => {
     const { pool, query } = testPool();
     query
-      .mockResolvedValueOnce({ rows: [{ sessionId: "session_1" }] })
-      .mockResolvedValueOnce({ rowCount: 1, rows: [] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ sessionId: "session_1" }] })
       .mockResolvedValueOnce({ rowCount: 1, rows: [] })
       .mockResolvedValueOnce({ rows: [{ status: "filling" }] })
       .mockResolvedValueOnce({ rowCount: 1, rows: [] });
 
     await finishApplicationTask(pool, "task_1", "waiting_for_user", "submission_uncertain", "Request outcome is uncertain");
 
-    expect(query.mock.calls[4]?.[1]).toEqual(["session_1", "running"]);
-    expect(query.mock.calls[4]?.[0]).toContain("status NOT IN ('aborted', 'archived', 'completed', 'failed')");
+    expect(query.mock.calls[3]?.[1]).toEqual(["session_1", "running"]);
+    expect(query.mock.calls[3]?.[0]).toContain("status NOT IN ('aborted', 'archived', 'completed', 'failed')");
+    expect(query).toHaveBeenCalledTimes(4);
+  });
+
+  it.each(["cancelled", "submitted"] as const)("suppresses late callbacks after a %s task", async () => {
+    const { pool, query } = testPool();
+    query.mockResolvedValueOnce({ rowCount: 0, rows: [] });
+
+    await finishApplicationTask(pool, "task_1", "failed", "execution_failed", "Late worker callback");
+
+    expect(query).toHaveBeenCalledOnce();
+    expect(String(query.mock.calls[0]?.[0])).toContain("status NOT IN ('cancelled', 'submitted')");
+    expect(String(query.mock.calls[0]?.[0])).toContain('RETURNING "sessionId"');
+  });
+
+  it("suppresses a duplicate uncertainty callback after its first transition", async () => {
+    const { pool, query } = testPool();
+    query.mockResolvedValueOnce({ rowCount: 0, rows: [] });
+
+    await finishApplicationTask(pool, "task_1", "waiting_for_user", "submission_uncertain", "Request outcome is uncertain");
+
+    expect(query).toHaveBeenCalledOnce();
+    expect(String(query.mock.calls[0]?.[0])).toContain("status IS DISTINCT FROM $2");
+    expect(String(query.mock.calls[0]?.[0])).toContain('"checkpoint" IS DISTINCT FROM $3');
+    expect(String(query.mock.calls[0]?.[0])).toContain("error IS DISTINCT FROM $4");
   });
 });
 

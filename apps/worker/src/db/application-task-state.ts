@@ -70,21 +70,23 @@ export async function finishApplicationTask(
   checkpoint: string,
   error: string | null,
 ): Promise<void> {
-  const session = await pool.query(`SELECT "sessionId" FROM application_tasks WHERE id = $1`, [taskId]);
-  const sessionId = session.rows[0]?.sessionId as string | null | undefined;
-  await pool.query(
+  const transitioned = await pool.query<{ sessionId: string | null }>(
     `UPDATE application_tasks
        SET status = $2, "checkpoint" = $3, error = $4,
            "completedAt" = CASE WHEN $2 IN ('submitted', 'failed') THEN NOW() ELSE NULL END,
            "updatedAt" = NOW()
-     WHERE id = $1 AND status NOT IN ('cancelled', 'submitted')`,
+     WHERE id = $1 AND status NOT IN ('cancelled', 'submitted')
+       AND (status IS DISTINCT FROM $2 OR "checkpoint" IS DISTINCT FROM $3 OR error IS DISTINCT FROM $4)
+     RETURNING "sessionId"`,
     [taskId, status, checkpoint, error],
   );
+  if (transitioned.rowCount !== 1) return;
   await pool.query(
     `INSERT INTO application_task_events (id, "taskId", type, actor, body, "createdAt")
      VALUES ('evt_' || md5(random()::text || clock_timestamp()::text), $1, $2, 'worker', $3, NOW())`,
     [taskId, status, redactSensitiveText(error ?? checkpoint)],
   );
+  const sessionId = transitioned.rows[0]?.sessionId;
   if (sessionId) await refreshSessionStatus(pool, sessionId);
 }
 
