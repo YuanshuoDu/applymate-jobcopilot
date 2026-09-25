@@ -65,7 +65,7 @@ Private results bind owner, session, Turn, step, Task, and tool-call identity. W
 
 ## Acceptance evidence and limits
 
-Record exact checks against the pushed PR head in the PR body. Separate focused local checks from CI disposable PostgreSQL/Redis integration and browser-fixture evidence. Deterministic fixtures do not prove authenticated staging, actual operating-system process restart, live-provider behavior, employer submission, or production deployment. Keep #387 as a separate gate.
+Record exact checks against the pushed PR head in the PR body. Separate focused local checks from CI disposable PostgreSQL/Redis integration and browser-fixture evidence. These fixtures do not prove authenticated staging, employer submission, or production deployment. The process-restart integration fixture does spawn, SIGKILL, and replace a Node process running `createCanonicalTurnRuntime` with `createProductionWorkerBootstrap` against disposable PostgreSQL/Redis; it uses deterministic model adapters and a test child executor, so it does not prove the deployed Worker `index.ts` startup composition or live-provider behavior. Keep #387 as a separate gate.
 
 The CI disposable PostgreSQL/RLS test runs under a dedicated non-owner role with `NOBYPASSRLS`, which verifies policy behavior for that test role. This PR does not inspect Fly secrets or prove that the deployed Worker's `DATABASE_URL` role and privileges are restricted. Worker repositories set transaction-local `app.user_id` and retain explicit user/session/turn predicates, but whether RLS actually applies in deployment depends on the role behind `DATABASE_URL`. Confirm the operational RLS boundary before rollout. This deployment verification gap is not evidence of a live leak.
 

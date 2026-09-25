@@ -556,4 +556,169 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     expect(workerTwo.exitCode).toBe(0)
     expect(workerTwo.signalCode).toBeNull()
   }, 60_000)
+
+  it("repairs a published legacy Turn dispatch and rearms one deterministic retry generation", async () => {
+    const suffix = randomUUID()
+    const sessionId = `legacy-recovery-session-${suffix}`
+    const turnId = `legacy-recovery-turn-${suffix}`
+    const dispatchId = `legacy-recovery-dispatch-${suffix}`
+    const foreignUserId = `legacy-recovery-foreign-user-${suffix}`
+    const foreignTurnId = `legacy-recovery-foreign-turn-${suffix}`
+    const foreignIdempotencyKey = `turn-dispatch:${foreignTurnId}`
+    const idempotencyKey = `turn-dispatch:${turnId}`
+    const legacyPayload = { turnId, sessionId, ownerId: "legacy-owner" }
+    const foreignPayload = { turnId: foreignTurnId, sessionId, ownerId: "foreign-owner" }
+    const publishedAt = new Date(Date.now() - 120_000)
+    const recoveredAt = new Date()
+    const retryGeneration = 5
+    const retryJobId = turnJobKey!(turnId, retryGeneration)
+    const generationJobIds = Array.from({ length: retryGeneration + 1 }, (_, generation) => turnJobKey!(turnId, generation))
+    const recoveryQueue = new Queue(`agent-turn-recovery-${suffix}`, { connection: redis!, skipVersionCheck: true })
+    const recovery = await import("../runtime/turns/recovery-scanner.js")
+
+    try {
+      await recoveryQueue.waitUntilReady()
+      await pool!.query(
+        `INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+         VALUES ($1, $2, 'Repair a published legacy dispatch', 'running', 'test', CURRENT_TIMESTAMP)`,
+        [sessionId, ids.userId],
+      )
+      await pool!.query(
+        `INSERT INTO "agent_turns" (
+           "id", "sessionId", "userId", "status", "source", "input",
+           "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot",
+           "leaseOwnerId", "leaseStartedAt", "leaseExpiresAt", "leaseVersion", "updatedAt"
+         ) VALUES ($1, $2, $3, 'in_progress', 'system', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
+           'expired-legacy-owner', $4, $5, 7, $5)`,
+        [turnId, sessionId, ids.userId, new Date(recoveredAt.getTime() - 180_000), new Date(recoveredAt.getTime() - 60_000)],
+      )
+      await pool!.query(
+        `INSERT INTO "agent_outbox" (
+           "id", "topic", "aggregateId", "idempotencyKey", "payload", "publishedAt", "attemptCount"
+         ) VALUES ($1, 'agent.turn.dispatch', $2, $3, $4::jsonb, $5, 4)`,
+        [dispatchId, turnId, idempotencyKey, JSON.stringify(legacyPayload), publishedAt],
+      )
+      await pool!.query(
+        `INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`,
+        [foreignUserId, `${foreignUserId}@example.invalid`],
+      )
+      await pool!.query(
+        `INSERT INTO "agent_turns" (
+           "id", "sessionId", "userId", "status", "source", "input",
+           "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "updatedAt"
+         ) VALUES ($1, $2, $3, 'completed', 'system', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP)`,
+        [foreignTurnId, sessionId, foreignUserId],
+      )
+      await pool!.query(
+        `INSERT INTO "agent_outbox" (
+           "id", "topic", "aggregateId", "idempotencyKey", "payload", "publishedAt", "attemptCount"
+         ) VALUES ($1, 'agent.turn.dispatch', $2, $3, $4::jsonb, $5, 2)`,
+        [`${dispatchId}-foreign`, foreignTurnId, foreignIdempotencyKey, JSON.stringify(foreignPayload), publishedAt],
+      )
+
+      // Hold every row the repair locks so SKIP LOCKED behavior is exercised deterministically.
+      const blocker = await pool!.connect()
+      try {
+        await blocker.query("BEGIN")
+        const locked = await blocker.query(
+          `SELECT dispatch."id"
+           FROM "agent_sessions" AS session
+           JOIN "agent_turns" AS turn ON turn."sessionId" = session."id" AND turn."userId" = session."userId"
+           JOIN "agent_outbox" AS dispatch ON dispatch."aggregateId" = turn."id"
+           WHERE session."id" = $1 AND turn."id" = $2 AND dispatch."id" = $3
+           FOR UPDATE OF session, turn, dispatch`,
+          [sessionId, turnId, dispatchId],
+        )
+        expect(locked.rows).toHaveLength(1)
+        await expect(recovery.repairLegacyTurnDispatchAggregates(pool!, 50)).resolves.toBe(0)
+        await blocker.query("COMMIT")
+      } catch (error: unknown) {
+        await blocker.query("ROLLBACK").catch(() => undefined)
+        throw error
+      } finally {
+        blocker.release()
+      }
+
+      await expect(recovery.repairLegacyTurnDispatchAggregates(pool!, 50)).resolves.toBe(1)
+      const canonicalized = await pool!.query<{
+        id: string
+        topic: string
+        aggregateId: string
+        idempotencyKey: string
+        payload: unknown
+        publishedAt: Date | null
+        attemptCount: number
+      }>(
+        `SELECT "id", "topic", "aggregateId", "idempotencyKey", "payload", "publishedAt", "attemptCount"
+         FROM "agent_outbox" WHERE "idempotencyKey" = $1`,
+        [idempotencyKey],
+      )
+      expect(canonicalized.rows).toHaveLength(1)
+      expect(canonicalized.rows[0]).toMatchObject({
+        id: dispatchId,
+        topic: "agent.turn.dispatch",
+        aggregateId: sessionId,
+        idempotencyKey,
+        payload: legacyPayload,
+        attemptCount: 4,
+      })
+      expect(canonicalized.rows[0]?.publishedAt?.getTime()).toBe(publishedAt.getTime())
+      const foreignLineage = await pool!.query<{ aggregateId: string; publishedAt: Date | null; attemptCount: number; payload: unknown }>(
+        `SELECT "aggregateId", "publishedAt", "attemptCount", "payload"
+         FROM "agent_outbox" WHERE "idempotencyKey" = $1`,
+        [foreignIdempotencyKey],
+      )
+      expect(foreignLineage.rows).toHaveLength(1)
+      expect(foreignLineage.rows[0]).toMatchObject({
+        aggregateId: foreignTurnId,
+        publishedAt,
+        attemptCount: 2,
+        payload: foreignPayload,
+      })
+      await expect(recovery.repairLegacyTurnDispatchAggregates(pool!, 50)).resolves.toBe(0)
+
+      const report = await recovery.recoverTurnQueue(pool!, recoveryQueue, "legacy-recovery-owner", recoveredAt)
+      expect(report).toMatchObject({ reclaimed: 1, dispatched: 1 })
+      const retryJob = await recoveryQueue.getJob(retryJobId)
+      expect(retryJob?.id).toBe(retryJobId)
+      expect(retryJob?.data).toEqual({ turnId, sessionId, ownerId: "legacy-recovery-owner" })
+      expect(retryJob?.opts.attempts).toBe(5)
+      const presentGenerations = (await Promise.all(generationJobIds.map(async jobId =>
+        (await recoveryQueue.getJob(jobId)) ? jobId : null,
+      ))).filter((jobId): jobId is string => jobId !== null)
+      expect(presentGenerations).toEqual([retryJobId])
+
+      const rearmed = await pool!.query<{
+        id: string
+        topic: string
+        aggregateId: string
+        idempotencyKey: string
+        payload: unknown
+        publishedAt: Date | null
+        attemptCount: number
+      }>(
+        `SELECT "id", "topic", "aggregateId", "idempotencyKey", "payload", "publishedAt", "attemptCount"
+         FROM "agent_outbox" WHERE "idempotencyKey" = $1`,
+        [idempotencyKey],
+      )
+      expect(rearmed.rows).toHaveLength(1)
+      expect(rearmed.rows[0]).toMatchObject({
+        id: dispatchId,
+        topic: "agent.turn.dispatch",
+        aggregateId: sessionId,
+        idempotencyKey,
+        payload: { turnId, sessionId, ownerId: "legacy-recovery-owner" },
+        attemptCount: retryGeneration + 1,
+        publishedAt: expect.any(Date),
+      })
+    } finally {
+      for (const jobId of generationJobIds) {
+        await recoveryQueue.getJob(jobId).then(job => job?.remove()).catch(() => undefined)
+      }
+      await recoveryQueue.close()
+      await pool!.query(`DELETE FROM "agent_outbox" WHERE "idempotencyKey" = ANY($1::text[])`, [[idempotencyKey, foreignIdempotencyKey]])
+      await pool!.query(`DELETE FROM "agent_sessions" WHERE "id" = $1`, [sessionId])
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [foreignUserId])
+    }
+  }, 20_000)
 })

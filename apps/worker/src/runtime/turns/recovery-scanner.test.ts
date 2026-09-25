@@ -19,7 +19,7 @@ function matchingLegacyRows(rows: unknown[]): unknown[] {
     const idempotencyKey = row?.idempotencyKey
     const turnId = payload?.turnId
     const sessionId = payload?.sessionId
-    if (typeof id !== "string" || aggregateId !== turnId || topic !== "agent.turn.dispatch" || idempotencyKey !== `turn-dispatch:${String(turnId)}` || row?.publishedAt !== null || turnId !== "turn_1" || sessionId !== "session_1") return []
+    if (typeof id !== "string" || aggregateId !== turnId || topic !== "agent.turn.dispatch" || idempotencyKey !== `turn-dispatch:${String(turnId)}` || turnId !== "turn_1" || sessionId !== "session_1") return []
     return [{ id, turnId, sessionId }]
   })
 }
@@ -103,7 +103,7 @@ describe("Turn recovery scanner", () => {
     expect(repair).toContain('UPDATE "agent_outbox" AS dispatch')
     expect(repair).toContain('dispatch."topic" = $1')
     expect(repair).toContain('dispatch."aggregateId" = candidates."turnId"')
-    expect(repair).toContain('dispatch."publishedAt" IS NULL')
+    expect(repair).not.toContain('dispatch."publishedAt" IS NULL')
     expect(repair).toContain('session."status" NOT IN (\'aborted\', \'archived\')')
     expect(repair).not.toContain('session."controlGate"')
   })
@@ -149,6 +149,38 @@ describe("Turn recovery scanner", () => {
     expect(legacyIndex).toBeGreaterThanOrEqual(0)
     expect(legacyIndex).toBeLessThan(reclaimIndex)
     expect(legacyIndex).toBeLessThan(queuedIndex)
+  })
+
+  it("repairs a published legacy aggregate before rearming an expired Turn", async () => {
+    const publishedLegacy = {
+      id: "dispatch_legacy", aggregateId: "turn_1", topic: "agent.turn.dispatch",
+      idempotencyKey: "turn-dispatch:turn_1",
+      payload: { turnId: "turn_1", sessionId: "session_1", ownerId: "old-owner" },
+      publishedAt: new Date("2026-08-31T23:59:00.000Z"),
+    }
+    const pendingCanonical = {
+      ...publishedLegacy,
+      aggregateId: "session_1",
+      payload: { turnId: "turn_1", sessionId: "session_1", ownerId: "recovery-owner" },
+      attemptCount: 2,
+      publishedAt: null,
+    }
+    const fake = pool([pendingCanonical], "running", [], [publishedLegacy])
+    const queue = { add: vi.fn().mockResolvedValue(undefined) }
+
+    const report = await recoverTurnQueue(fake.pool, queue, "recovery-owner", new Date("2026-09-01T00:00:00.000Z"))
+
+    expect(report).toMatchObject({ reclaimed: 1, repaired: 1, dispatched: 1 })
+    expect(queue.add).toHaveBeenCalledWith(
+      "turn",
+      { turnId: "turn_1", sessionId: "session_1", ownerId: "recovery-owner" },
+      { jobId: turnJobId("turn_1", 2), attempts: 5 },
+    )
+    const repair = fake.calls.find(([sql]) => sql.includes("WITH candidates AS"))?.[0] ?? ""
+    expect(repair).toContain('turn."userId" = session."userId"')
+    expect(repair).toContain('dispatch."payload"->>\'turnId\' = turn."id"')
+    expect(repair).toContain('dispatch."payload"->>\'sessionId\' = session."id"')
+    expect(repair).not.toContain('dispatch."publishedAt" IS NULL')
   })
 
   it("repairs a queued automation Turn when the Redis handoff lost turn.started", async () => {

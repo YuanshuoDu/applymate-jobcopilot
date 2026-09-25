@@ -373,6 +373,18 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                     return;
                   }
                   const isSafeRead = requestMethod === "GET" || requestMethod === "HEAD" || requestMethod === "OPTIONS";
+                  let requestTargetsArmedAction: boolean;
+                  try {
+                    // Match the exact action URL independently from method so
+                    // a method mutation cannot use the safe-read exception.
+                    requestTargetsArmedAction = matchesSubmissionRequest(requestIntent, {
+                      url: () => request.url(),
+                      method: () => requestIntent.method,
+                    });
+                  } catch {
+                    await route.abort("aborted").catch(() => undefined);
+                    return;
+                  }
                   if (requestPage !== page) {
                     // A tab that existed before the final submit was armed is
                     // unrelated. Abort a new page's first request even when
@@ -380,6 +392,10 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                     // write starts, read-only confirmation pages are allowed.
                     if (pagesPresentWhenArmed.has(requestPage)) {
                       await route.fallback().catch(() => undefined);
+                    } else if (submissionRequestStarted && requestTargetsArmedAction) {
+                      // A new page may show confirmation content, but it may
+                      // not issue another request to the approved action URL.
+                      await route.abort("aborted").catch(() => undefined);
                     } else if (submissionRequestStarted && isSafeRead) {
                       await route.fallback().catch(() => undefined);
                     } else {
@@ -393,24 +409,8 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                     await route.fallback().catch(() => undefined);
                     return;
                   }
-                  let requestTargetsArmedAction: boolean;
-                  try {
-                    // Match the exact action URL independently from method so
-                    // a method mutation on the source frame cannot bypass the
-                    // request fence.
-                    requestTargetsArmedAction = matchesSubmissionRequest(requestIntent, {
-                      url: () => request.url(),
-                      method: () => requestIntent.method,
-                    });
-                  } catch {
-                    await route.abort("aborted").catch(() => undefined);
-                    return;
-                  }
                   if (submissionRequestStarted) {
-                    const isDuplicateCandidate = requestTargetsArmedAction && Boolean(
-                      armedIntent && matchesSubmissionRequest(armedIntent, request),
-                    );
-                    if (isDuplicateCandidate || !isSafeRead) {
+                    if (requestTargetsArmedAction || !isSafeRead) {
                       await route.abort("aborted").catch(() => undefined);
                     } else {
                       // Once the authorized write has reached the network,

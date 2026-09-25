@@ -180,7 +180,10 @@ function uniqueConfigs(configs: readonly AiConfig[]): AiConfig[] {
 }
 
 function hasCredential(config: AiConfig, allowEnvironmentFallbacks = true): boolean {
-  return Boolean(config.apiKey?.trim() || (allowEnvironmentFallbacks && environmentKey(config.provider)))
+  const hasPlatformMiniMaxCredential = config.provider === "minimax" &&
+    credential(config) === "platform" &&
+    environmentKey("minimax")
+  return Boolean(config.apiKey?.trim() || hasPlatformMiniMaxCredential || (allowEnvironmentFallbacks && environmentKey(config.provider)))
 }
 
 function credential(config: AiConfig): "platform" | "user" {

@@ -117,7 +117,7 @@ export async function persistWakeupTurnDispatchInTransaction(
   }
 }
 
-/** Rewrites pre-P4-39 pending dispatch rows to their canonical session aggregate. */
+/** Rewrites pre-P4-39 dispatch rows to their canonical session aggregate. */
 export async function repairLegacyTurnDispatchAggregates(pool: LeasePool, limit = TURN_DISPATCH_MAX_BATCH): Promise<number> {
   if (!Number.isInteger(limit) || limit < 1) throw new RangeError("Turn dispatch repair limit must be positive")
   return withTransaction(pool, async (client) => {
@@ -133,7 +133,6 @@ export async function repairLegacyTurnDispatchAggregates(pool: LeasePool, limit 
           AND dispatch."aggregateId" <> session."id"
           AND dispatch."topic" = $1
           AND dispatch."idempotencyKey" = 'turn-dispatch:' || turn."id"
-          AND dispatch."publishedAt" IS NULL
           AND dispatch."payload"->>'turnId' = turn."id"
           AND dispatch."payload"->>'sessionId' = session."id"
          WHERE ${OPEN_SESSION}
@@ -148,7 +147,6 @@ export async function repairLegacyTurnDispatchAggregates(pool: LeasePool, limit 
          AND dispatch."aggregateId" = candidates."turnId"
          AND dispatch."aggregateId" <> candidates."sessionId"
          AND dispatch."idempotencyKey" = 'turn-dispatch:' || candidates."turnId"
-         AND dispatch."publishedAt" IS NULL
          AND dispatch."payload"->>'turnId' = candidates."turnId"
          AND dispatch."payload"->>'sessionId' = candidates."sessionId"
        RETURNING dispatch."id"`,

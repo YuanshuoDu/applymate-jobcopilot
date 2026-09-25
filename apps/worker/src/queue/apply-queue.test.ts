@@ -600,6 +600,57 @@ describe("apply-queue (unit — mocked)", () => {
     }));
   });
 
+  it.each(["GET", "HEAD", "OPTIONS"] as const)(
+    "aborts post-start %s requests to the armed action URL from the source page and a popup",
+    async (method) => {
+      configureMockBrowserSubmitTool();
+      const changedMethodRoutes: Array<NonNullable<Awaited<ReturnType<typeof dispatchPageRequest>>>> = [];
+      const approvedPosts: Array<NonNullable<Awaited<ReturnType<typeof dispatchPageRequest>>>> = [];
+      const confirmationReads: Array<NonNullable<Awaited<ReturnType<typeof dispatchPageRequest>>>> = [];
+      mockHarnessRun.mockImplementation(async (_page: unknown, task: { beforeSubmit?: (intent?: { url: string; method: string }) => Promise<boolean> }) => {
+        const intent = { url: "https://example.com/jobs/123/apply", method: "POST" };
+        const allowed = task.beforeSubmit ? await task.beforeSubmit(intent) : false;
+        if (!allowed) return { status: "submission_blocked", error: "Submission guard denied.", durationMs: 123 };
+
+        const approvedPost = await dispatchPageRequest(intent.url, intent.method, { frame: "main" });
+        const changedMainFrame = await dispatchPageRequest(intent.url, method, { frame: "main" });
+        const changedPopup = await dispatchPageRequest(intent.url, method, { frame: "popup" });
+        const changedUnknown = await dispatchPageRequest(intent.url, method, { frame: "unknown" });
+        const confirmationRead = await dispatchPageRequest(
+          "https://example.com/application/confirmation",
+          "GET",
+          { frame: "popup", navigation: true },
+        );
+        if (approvedPost) approvedPosts.push(approvedPost);
+        if (changedMainFrame) changedMethodRoutes.push(changedMainFrame);
+        if (changedPopup) changedMethodRoutes.push(changedPopup);
+        if (changedUnknown) changedMethodRoutes.push(changedUnknown);
+        if (confirmationRead) confirmationReads.push(confirmationRead);
+        return { status: "manual", error: "Submission outcome is uncertain.", durationMs: 123 };
+      });
+
+      await import("./apply-queue.js");
+      await mockProcessor({
+        data: {
+          applicationTaskId: "application-task-1", operation: "submit", jobId: "job-1", userId: "user-1",
+          applyUrl: "https://example.com/jobs/123/apply", personaId: "persona-1", resumePath: "/resume.pdf", dryRun: false,
+          receiptId: "approval-1", constraintHash: "c".repeat(64),
+        },
+      });
+
+      expect(approvedPosts).toHaveLength(1);
+      expect(approvedPosts[0]?.continue).toHaveBeenCalledOnce();
+      expect(mockMarkSubmissionRequestStarted).toHaveBeenCalledOnce();
+      expect(changedMethodRoutes).toHaveLength(3);
+      for (const route of changedMethodRoutes) {
+        expect(route.abort).toHaveBeenCalledOnce();
+        expect(route.fallback).not.toHaveBeenCalled();
+      }
+      expect(confirmationReads).toHaveLength(1);
+      expect(confirmationReads[0]?.fallback).toHaveBeenCalledOnce();
+    },
+  );
+
   it("attempts best-effort browser interruption after an approved ATS request starts", async () => {
     submitToolMocks.create.mockImplementation(({ submit }: { submit: (input: unknown) => Promise<unknown> }) => ({
       execute: async () => {

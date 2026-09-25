@@ -57,6 +57,56 @@ describe("Harness model runtime", () => {
     }
   })
 
+  it("uses only the platform MiniMax env key when generic environment fallbacks are disabled", async () => {
+    vi.stubEnv("MINIMAX_API_KEY", "platform-key")
+    vi.stubEnv("ANTHROPIC_API_KEY", "anthropic-environment-key")
+    vi.stubEnv("OPENAI_API_KEY", "openai-environment-key")
+    const fetcher: HarnessFetch = vi.fn(async (_url, init) => {
+      expect(init.headers.Authorization).toBe("Bearer platform-key")
+      return streamResponse([], 503)
+    })
+    try {
+      const runtime = createHarnessModelRuntime({
+        primary: { provider: "minimax", model: "MiniMax-M3", credentialSource: "platform" },
+        fallbacks: [],
+        allowEnvironmentFallbacks: false,
+        fetch: fetcher,
+      })
+
+      expect(runtime.candidates).toHaveLength(1)
+      expect(runtime.candidates[0]).toMatchObject({
+        target: { provider: "minimax", model: "MiniMax-M3" },
+        requirement: { nativeTools: true, streaming: true },
+      })
+      await expect((async () => {
+        for await (const _event of runtime.adapter.stream(request())) undefined
+      })()).rejects.toMatchObject({ code: "provider_error" })
+      expect(fetcher).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it("does not use platform MiniMax credentials for user or custom routes", () => {
+    vi.stubEnv("MINIMAX_API_KEY", "platform-key")
+    vi.stubEnv("OPENAI_API_KEY", "openai-environment-key")
+    try {
+      for (const primary of [
+        { provider: "minimax", model: "MiniMax-M3", credentialSource: "user" },
+        { provider: "openai", model: "gpt-5.5" },
+        { provider: "custom", model: "custom-model", apiBase: "https://custom.example/v1", credentialSource: "user" },
+      ] as const) {
+        expect(() => createHarnessModelRuntime({
+          primary,
+          allowEnvironmentFallbacks: false,
+          fetch: vi.fn() as unknown as HarnessFetch,
+        })).toThrow("No Harness model route has an API key configured")
+      }
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
   it("reroutes a failed MiniMax request to Anthropic without publishing a partial response", async () => {
     const selection: string[] = []
     let call = 0
