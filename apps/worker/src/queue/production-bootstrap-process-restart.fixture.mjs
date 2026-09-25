@@ -236,22 +236,76 @@ async function acceptActiveFollowUp() {
 }
 
 async function makeActiveFollowUpWorker() {
+  const followUpText = "Durable active-Turn follow-up " + ids.suffix
   const runtime = await createCanonicalTurnRuntime(pool, {
     workerId: "active-follow-up-worker-" + process.pid,
     coordinationEnabled: false,
     authorizeUsage: async () => ({ settle() {} }),
+    toolRuntimeFactory() {
+      return {
+        registry: {
+          list: () => [{ name: "jobs.search", version: "1" }],
+          resolve: () => ({ idempotency: "read_only" }),
+          validateArguments: () => true,
+        },
+        router: {
+          async execute(_context, call) {
+            return {
+              id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed",
+              output: { jobs: [{
+                id: "active-follow-up-fixture-job-" + ids.suffix, company: "Fixture Employer", role: "Software Engineer", location: "Dublin",
+                status: "active", score: null, url: null, source: "fixture", salary: null, description: null, keywords: null,
+              }], page: 1, hasMore: false }, errorCode: null,
+            }
+          },
+        },
+      }
+    },
     modelRuntimeFactory() {
+      let modelCalls = 0
       return {
         adapter: {
           id: "active-follow-up-first-worker-fixture-model",
           profile: modelProfile(),
           async *stream(request) {
-            say("FIRST_PROVIDER_ACTIVE")
+            modelCalls += 1
+            if (modelCalls === 1) {
+              say("FIRST_PROVIDER_ACTIVE")
+              await Promise.race([
+                waitForCommand("release-first-provider"),
+                new Promise((_, reject) => request.signal.addEventListener("abort", () => reject(new Error("fixture_provider_aborted")), { once: true })),
+              ])
+              yield { type: "tool_call_completed", callId: "active-follow-up-search-" + ids.suffix, name: "jobs.search", arguments: { location: "Dublin" } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if (modelCalls === 2) {
+              const followUpParts = request.messages
+                .filter(message => message.role === "user" && Array.isArray(message.content))
+                .flatMap(message => message.content)
+                .filter(part => part.type === "text" && part.text.includes(followUpText))
+              if (followUpParts.length !== 0) throw new Error("follow_up_present_before_final_provider_started")
+              say("FINAL_PROVIDER_ACTIVE")
+              await Promise.race([
+                waitForCommand("release-pending-follow-up-provider"),
+                new Promise((_, reject) => request.signal.addEventListener("abort", () => reject(new Error("fixture_provider_aborted")), { once: true })),
+              ])
+              yield { type: "text_delta", text: finalMarker }
+              yield { type: "completed", finishReason: "stop" }
+              return
+            }
+            if (modelCalls !== 3) throw new Error("unexpected_active_follow_up_provider_round")
+            const followUpParts = request.messages
+              .filter(message => message.role === "user" && Array.isArray(message.content))
+              .flatMap(message => message.content)
+              .filter(part => part.type === "text" && part.text.includes(followUpText))
+            if (followUpParts.length !== 1) throw new Error("follow_up_missing_or_duplicated_in_final_provider_request")
+            say("FOLLOW_UP_CONTEXT_OK")
             await Promise.race([
-              waitForCommand("release-first-provider"),
+              waitForCommand("release-final-provider"),
               new Promise((_, reject) => request.signal.addEventListener("abort", () => reject(new Error("fixture_provider_aborted")), { once: true })),
             ])
-            yield { type: "text_delta", text: "This result must be interrupted by the test process." }
+            yield { type: "text_delta", text: finalMarker }
             yield { type: "completed", finishReason: "stop" }
           },
         },
