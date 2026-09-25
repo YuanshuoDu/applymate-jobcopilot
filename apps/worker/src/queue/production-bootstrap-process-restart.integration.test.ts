@@ -826,7 +826,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
       lockTransactionOpen = true
       const lockedRoot = await rootLock.query(`SELECT "id" FROM "sub_agent_tasks" WHERE "id" = $1 FOR UPDATE`, [active.rows[0].rootTaskId])
       expect(lockedRoot.rows).toHaveLength(1)
-      workerOne.stdin?.write("release-final-provider\n")
+      workerOne.stdin?.write("release-pending-follow-up-provider\n")
       await waitForLockWait(pool!, `SELECT "id", "status", "leaseOwner"`)
 
       expect(await turnQueue!.isPaused()).toBe(false)
@@ -889,34 +889,34 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     } finally {
       if (lockTransactionOpen) await rootLock.query("ROLLBACK").catch(() => undefined)
       rootLock.release()
-      if (turnQueuePaused && turnQueue) {
-        const cleanupFailures: string[] = []
+      const cleanupFailures: string[] = []
+      for (const [workerName, child] of [["terminal-race-command-acceptance", commandAcceptance], ["terminal-race-worker", workerOne]] as const) {
+        if (!child || workerHasExited(child)) continue
         try {
-          for (const [workerName, child] of [["terminal-race-command-acceptance", commandAcceptance], ["terminal-race-worker", workerOne]] as const) {
-            if (!child || workerHasExited(child)) continue
-            try {
-              const cleanupFailure = await stopWorkerForCleanup(child, workerName)
-              if (cleanupFailure) cleanupFailures.push(cleanupFailure)
-            } catch (error: unknown) {
-              cleanupFailures.push(`${workerName} cleanup threw: ${cleanupError(error)}`)
-            }
-          }
+          const cleanupFailure = await stopWorkerForCleanup(child, workerName)
+          if (cleanupFailure) cleanupFailures.push(cleanupFailure)
+        } catch (error: unknown) {
+          cleanupFailures.push(`${workerName} cleanup threw: ${cleanupError(error)}`)
+        }
+      }
+      try {
+        const sessionTurns = await pool!.query<{ id: string }>(`SELECT "id" FROM "agent_turns" WHERE "sessionId" = $1`, [raceIds.sessionId])
+        for (const turn of sessionTurns.rows) turnFixtureIds.add(turn.id)
+      } catch (error: unknown) {
+        cleanupFailures.push(`terminal-race Turn cleanup discovery failed: ${cleanupError(error)}`)
+      }
+      const workersStopped = [commandAcceptance, workerOne, workerTwo].every(child => !child || workerHasExited(child))
+      if (turnQueuePaused && turnQueue) {
+        if (workersStopped) {
           try {
-            const sessionTurns = await pool!.query<{ id: string }>(`SELECT "id" FROM "agent_turns" WHERE "sessionId" = $1`, [raceIds.sessionId])
-            for (const turn of sessionTurns.rows) turnFixtureIds.add(turn.id)
-          } catch (error: unknown) {
-            cleanupFailures.push(`terminal-race Turn cleanup discovery failed: ${cleanupError(error)}`)
-          }
-          const workersStopped = [commandAcceptance, workerOne, workerTwo].every(child => !child || workerHasExited(child))
-          if (!workersStopped) cleanupFailures.push("terminal-race Turn queue left paused because a child Worker is still alive")
-        } finally {
-          if ([commandAcceptance, workerOne, workerTwo].every(child => !child || workerHasExited(child))) {
             await turnQueue.resume()
             turnQueuePaused = false
+          } catch (error: unknown) {
+            cleanupFailures.push(`terminal-race Turn queue resume failed: ${cleanupError(error)}`)
           }
-        }
-        if (cleanupFailures.length > 0) throw new Error(cleanupFailures.join("\n"))
+        } else cleanupFailures.push("terminal-race Turn queue left paused because a child Worker is still alive")
       }
+      if (cleanupFailures.length > 0) throw new Error(cleanupFailures.join("\n"))
     }
     await pool!.query(`DELETE FROM "agent_sessions" WHERE "id" = $1`, [raceIds.sessionId])
   }, 60_000)
