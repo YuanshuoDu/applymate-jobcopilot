@@ -176,6 +176,73 @@ describe("automation scheduler", () => {
     expect(JSON.stringify(recordUsage.mock.calls[0][0])).not.toContain("private response body");
   });
 
+  it("continues independent tasks after one task fails", async () => {
+    const request = vi.fn()
+      .mockRejectedValueOnce(new TypeError("private response body"))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true })));
+    const recordUsage = vi.fn().mockResolvedValue(undefined);
+    const scheduler = createAutomationScheduler({
+      tasks: [
+        { name: "automations", endpoint: "https://app.applymate.test/api/agent/automations/due", secret: "scheduler-secret" },
+        { name: "alerts", endpoint: "https://app.applymate.test/api/admin/observability/alerts/evaluate", secret: "scheduler-secret" },
+      ],
+      intervalMs: 300_000,
+      request,
+      recordUsage,
+    });
+
+    await scheduler.run();
+
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(scheduler.status().lastError).toBe("network_error");
+    expect(recordUsage).toHaveBeenCalledTimes(2);
+  });
+
+  it("backs off a failing task instead of retrying it every scheduler tick", async () => {
+    let currentTime = 0;
+    const request = vi.fn().mockRejectedValue(new TypeError("private response body"));
+    const scheduler = createAutomationScheduler({
+      tasks: [{ name: "alerts", endpoint: "https://app.applymate.test/api/admin/observability/alerts/evaluate", secret: "scheduler-secret" }],
+      intervalMs: 1_000,
+      retryBaseDelayMs: 1_000,
+      retryMaxDelayMs: 4_000,
+      now: () => currentTime,
+      request,
+      recordUsage: vi.fn().mockResolvedValue(undefined),
+    });
+
+    await scheduler.run();
+    currentTime = 999;
+    await scheduler.run();
+    expect(request).toHaveBeenCalledTimes(1);
+
+    currentTime = 1_000;
+    await scheduler.run();
+    currentTime = 2_999;
+    await scheduler.run();
+    expect(request).toHaveBeenCalledTimes(2);
+
+    currentTime = 3_000;
+    await scheduler.run();
+    expect(request).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not turn usage telemetry failures into scheduler failures", async () => {
+    const request = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true })));
+    const recordUsage = vi.fn().mockRejectedValue(new Error("telemetry database unavailable"));
+    const scheduler = createAutomationScheduler({
+      tasks: [{ name: "automations", endpoint: "https://app.applymate.test/api/agent/automations/due", secret: "scheduler-secret" }],
+      intervalMs: 300_000,
+      request,
+      recordUsage,
+    });
+
+    await scheduler.run();
+
+    expect(scheduler.status().lastError).toBeNull();
+    expect(scheduler.status().lastSuccessAt).not.toBeNull();
+  });
+
   it("can be explicitly disabled for local worker usage", () => {
     const scheduler = startAutomationScheduler({ AGENT_SCHEDULER_ENABLED: "0" });
     expect(scheduler.status().enabled).toBe(false);
