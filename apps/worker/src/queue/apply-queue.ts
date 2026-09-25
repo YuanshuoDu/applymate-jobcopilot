@@ -406,7 +406,14 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                     // its URL differs from the form action. Once the approved
                     // write starts, read-only confirmation pages are allowed.
                     if (pagesPresentWhenArmed.has(requestPage)) {
-                      await route.fallback().catch(() => undefined);
+                      if (requestTargetsArmedAction) {
+                        // A pre-existing tab is unrelated unless it targets
+                        // the exact action URL, which only the source page may
+                        // submit regardless of HTTP method.
+                        await route.abort("aborted").catch(() => undefined);
+                      } else {
+                        await route.fallback().catch(() => undefined);
+                      }
                     } else if (submissionRequestStarted && requestTargetsArmedAction) {
                       // A new page may show confirmation content, but it may
                       // not issue another request to the approved action URL.

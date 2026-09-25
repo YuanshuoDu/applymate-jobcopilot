@@ -586,7 +586,11 @@ describe("apply-queue (unit — mocked)", () => {
       const iframeTelemetryRequest = await dispatchPageRequest("https://example.com/iframe/telemetry", "POST", { frame: "iframe" });
       expect(iframeTelemetryRequest?.fallback).toHaveBeenCalledOnce();
       const otherTabRequest = await dispatchPageRequest(intent.url, intent.method, { frame: "other-tab" });
-      expect(otherTabRequest?.fallback).toHaveBeenCalledOnce();
+      expect(otherTabRequest?.abort).toHaveBeenCalledOnce();
+      const otherTabMutatedMethod = await dispatchPageRequest(intent.url, "GET", { frame: "other-tab" });
+      expect(otherTabMutatedMethod?.abort).toHaveBeenCalledOnce();
+      const otherTabTelemetryRequest = await dispatchPageRequest("https://example.com/other-tab/telemetry", "POST", { frame: "other-tab" });
+      expect(otherTabTelemetryRequest?.fallback).toHaveBeenCalledOnce();
       const unknownFrameRequest = await dispatchPageRequest(intent.url, intent.method, { frame: "unknown" });
       expect(unknownFrameRequest?.abort).toHaveBeenCalledOnce();
       const mutatedMethod = await dispatchPageRequest(intent.url, "GET", { frame: "main" });
