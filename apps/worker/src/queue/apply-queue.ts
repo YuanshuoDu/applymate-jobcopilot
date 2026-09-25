@@ -419,9 +419,15 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                     return;
                   }
                   if (requestFrame !== submissionFrame) {
-                    // The known source page's iframe is unrelated, even when
-                    // it happens to use the same action URL and method.
-                    await route.fallback().catch(() => undefined);
+                    // Known source-page iframe traffic is unrelated unless it
+                    // targets the armed action URL. Treat every method at that
+                    // URL as an attempted action, but do not advance the
+                    // submission fence from an iframe request.
+                    if (requestTargetsArmedAction) {
+                      await route.abort("aborted").catch(() => undefined);
+                    } else {
+                      await route.fallback().catch(() => undefined);
+                    }
                     return;
                   }
                   if (submissionRequestStarted) {

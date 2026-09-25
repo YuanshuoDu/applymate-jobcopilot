@@ -573,14 +573,18 @@ describe("apply-queue (unit — mocked)", () => {
       const allowed = task.beforeSubmit ? await task.beforeSubmit(intent) : false;
       if (!allowed) return { status: "submission_blocked", error: null, durationMs: 123 };
 
-      // Unrelated writes stay outside the URL matcher. An iframe or a tab
-      // that existed before arming falls through even at the exact action URL.
+      // Unrelated writes stay outside the URL matcher. Known source-page
+      // iframe traffic falls through unless it targets the armed action URL.
       const telemetryRequest = await dispatchPageRequest("https://example.com/telemetry", "POST");
       expect(telemetryRequest?.abort).toHaveBeenCalledOnce();
       const safeRead = await dispatchPageRequest("https://example.com/assets/pixel", "GET");
       expect(safeRead?.fallback).toHaveBeenCalledOnce();
       const iframeRequest = await dispatchPageRequest(intent.url, intent.method, { frame: "iframe" });
-      expect(iframeRequest?.fallback).toHaveBeenCalledOnce();
+      expect(iframeRequest?.abort).toHaveBeenCalledOnce();
+      const iframeMutatedMethod = await dispatchPageRequest(intent.url, "GET", { frame: "iframe" });
+      expect(iframeMutatedMethod?.abort).toHaveBeenCalledOnce();
+      const iframeTelemetryRequest = await dispatchPageRequest("https://example.com/iframe/telemetry", "POST", { frame: "iframe" });
+      expect(iframeTelemetryRequest?.fallback).toHaveBeenCalledOnce();
       const otherTabRequest = await dispatchPageRequest(intent.url, intent.method, { frame: "other-tab" });
       expect(otherTabRequest?.fallback).toHaveBeenCalledOnce();
       const unknownFrameRequest = await dispatchPageRequest(intent.url, intent.method, { frame: "unknown" });
