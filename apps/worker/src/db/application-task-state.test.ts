@@ -84,7 +84,7 @@ describe("finishApplicationTask", () => {
 
     const transition = String(query.mock.calls[0]?.[0]);
     expect(transition).toContain("status = 'waiting_for_user'");
-    expect(transition).toContain("\"checkpoint\" = 'submission_uncertain'");
+    expect(transition).toContain("\"checkpoint\" IN ('submission_uncertain', 'admin_review')");
     expect(transition).toContain("$2 <> 'submitted'");
     expect(query.mock.calls[0]?.[1]).toEqual([
       "task_1", "failed", "account_suspended", "Account suspended by an administrator.",
@@ -104,12 +104,29 @@ describe("finishApplicationTask", () => {
     await finishApplicationTask(pool, "task_1", "submitted", "submission_verified", null);
 
     const transition = String(query.mock.calls[0]?.[0]);
-    expect(transition).toContain("AND NOT (status = 'waiting_for_user' AND \"checkpoint\" = 'submission_uncertain' AND $2 <> 'submitted')");
+    expect(transition).toContain("AND NOT (status = 'waiting_for_user' AND \"checkpoint\" IN ('submission_uncertain', 'admin_review') AND $2 <> 'submitted')");
     expect(query.mock.calls[0]?.[1]).toEqual(["task_1", "submitted", "submission_verified", null]);
     expect(query.mock.calls[1]?.[0]).toContain("INSERT INTO application_task_events");
     expect(query.mock.calls[1]?.[1]).toEqual(["task_1", "submitted", "submission_verified"]);
     expect(query.mock.calls[3]?.[1]).toEqual(["session_1", "running"]);
     expect(query).toHaveBeenCalledTimes(4);
+  });
+
+  it.each([
+    ["failed", "account_suspended", "Account suspended by an administrator."],
+    ["waiting_for_user", "submission_uncertain", "A late browser result was inconclusive."],
+  ] as const)("does not replace an admin review checkpoint with a late %s callback", async (status, checkpoint, error) => {
+    const { pool, query } = testPool();
+    query.mockResolvedValueOnce({ rowCount: 0, rows: [] });
+
+    await finishApplicationTask(pool, "task_1", status, checkpoint, error);
+
+    const transition = String(query.mock.calls[0]?.[0]);
+    expect(transition).toContain("\"checkpoint\" IN ('submission_uncertain', 'admin_review')");
+    expect(transition).toContain("$2 <> 'submitted'");
+    expect(query.mock.calls[0]?.[1]).toEqual(["task_1", status, checkpoint, error]);
+    // A rejected transition must not create a Worker event or refresh the session.
+    expect(query).toHaveBeenCalledOnce();
   });
 
   it("suppresses a duplicate uncertainty callback after its first transition", async () => {
