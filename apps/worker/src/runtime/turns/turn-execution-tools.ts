@@ -43,7 +43,7 @@ export async function executeTools(
     if (replayed) {
       if (replayed.toolName !== call.name || stableJson(replayed.input) !== stableJson(call.arguments)) throw new TurnEngineError("invalid_output", `Tool call ${call.id} does not match its persisted replay record`)
       const wait = dependencyWaitReceipt(replayed.status === "completed" ? replayed.output : null)
-      if (wait && !hasResolvedWaitOutcome(snapshot, wait.waitId)) return { wait: { status: "waiting_for_dependency", waitId: wait.waitId, stepCount: 0, toolCallCount: 0 }, snapshot, steeringMarkerState: markerState }
+      if (wait && !hasResolvedWaitOutcome(snapshot, wait.waitId, replayed.input)) return { wait: { status: "waiting_for_dependency", waitId: wait.waitId, stepCount: 0, toolCallCount: 0 }, snapshot, steeringMarkerState: markerState }
       continue
     }
     const result = await executeToolWithItems(options, writer, step, call, now, onToolCallPersisted)
@@ -101,21 +101,63 @@ function dependencyWaitReceipt(value: unknown): DependencyWaitReceipt | null {
   return { waitId: record.waitId, deadlineAt: record.deadlineAt, matchedTaskIds: record.matchedTaskIds }
 }
 
-function hasResolvedWaitOutcome(snapshot: TurnExecutionOptions["snapshot"], waitId: string): boolean {
+type WaitMode = "any" | "all"
+type WaitRequest = { readonly taskIds: readonly string[]; readonly mode: WaitMode }
+
+function waitRequest(value: unknown): WaitRequest | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null
+  const record = value as Record<string, unknown>
+  const taskIds = normalizedWaitIds(record.taskIds)
+  if (!taskIds || (record.mode !== "any" && record.mode !== "all")) return null
+  return { taskIds, mode: record.mode }
+}
+
+function normalizedWaitIds(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 8) return null
+  const ids: string[] = []
+  for (const id of value) {
+    if (typeof id !== "string" || id.length === 0 || id.length > 256 || id.trim() !== id) return null
+    ids.push(id)
+  }
+  if (new Set(ids).size !== ids.length) return null
+  return [...ids].sort()
+}
+
+function hasResolvedWaitOutcome(snapshot: TurnExecutionOptions["snapshot"], waitId: string, expectedInput: unknown): boolean {
+  const expected = waitRequest(expectedInput)
+  if (!expected) return false
   return snapshot.toolObservations.some(observation => {
     if (observation.id !== `wait-result:${waitId}` || !observation.content || typeof observation.content !== "object" || Array.isArray(observation.content)) return false
     const content = observation.content as Record<string, unknown>
     if (content.toolCallId !== `wait:${waitId}` || content.toolName !== "agent.wait" || content.status !== "completed") return false
+    const request = waitRequest(content.input)
+    if (!request || request.mode !== expected.mode || request.taskIds.length !== expected.taskIds.length
+      || request.taskIds.some((id, index) => id !== expected.taskIds[index])) return false
     const output = content.output
     if (!output || typeof output !== "object" || Array.isArray(output)) return false
     const result = output as Record<string, unknown>
     if (result.waitId !== waitId || (result.status !== "ready" && result.status !== "timed_out")) return false
     if (!Array.isArray(result.targetTaskIds) || !Array.isArray(result.matchedTaskIds)) return false
-    const targetTaskIds: readonly unknown[] = result.targetTaskIds
+    const targetTaskIds = normalizedWaitIds(result.targetTaskIds)
     const matchedTaskIds: readonly unknown[] = result.matchedTaskIds
-    if (!targetTaskIds.every((id: unknown) => typeof id === "string" && id.trim().length > 0)) return false
-    if (!matchedTaskIds.every((id: unknown) => typeof id === "string" && targetTaskIds.includes(id))) return false
-    return Array.isArray(result.tasks) && result.tasks.length === targetTaskIds.length
-      && (result.status !== "ready" || matchedTaskIds.length > 0)
+    if (!targetTaskIds || targetTaskIds.length !== expected.taskIds.length
+      || targetTaskIds.some((id, index) => id !== expected.taskIds[index])) return false
+    const matched = new Set<string>()
+    for (const id of matchedTaskIds) {
+      if (typeof id !== "string" || !targetTaskIds.includes(id) || matched.has(id)) return false
+      matched.add(id)
+    }
+    if (result.status === "ready" && (matched.size === 0 || (expected.mode === "all" && matched.size !== targetTaskIds.length))) return false
+    if (!Array.isArray(result.tasks) || result.tasks.length !== targetTaskIds.length) return false
+    const taskIds = new Set<string>()
+    for (const task of result.tasks) {
+      if (!task || typeof task !== "object" || Array.isArray(task)) return false
+      const row = task as Record<string, unknown>
+      if (typeof row.taskId !== "string" || row.taskId.length === 0 || row.taskId.length > 256 || row.taskId.trim() !== row.taskId
+        || !targetTaskIds.includes(row.taskId) || taskIds.has(row.taskId)
+        || typeof row.status !== "string" || row.status.trim().length === 0 || row.status.length > 256) return false
+      taskIds.add(row.taskId)
+    }
+    return taskIds.size === targetTaskIds.length
   })
 }

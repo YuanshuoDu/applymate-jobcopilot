@@ -51,6 +51,12 @@ describe("recoverPersistedToolCalls", () => {
 describe("executeTools persisted replay", () => {
   const call = { id: "wait-call", name: "agent.wait", arguments: { idempotencyKey: "wait-1", taskIds: ["child-1"], mode: "all", timeoutMs: 30_000 } }
   const waitReceipt = { waitId: "wait-1", status: "waiting", deadlineAt: "2026-09-10T00:00:00.000Z", matchedTaskIds: ["child-1"] }
+  const resolvedInput = { taskIds: ["child-1"], mode: "all" }
+  const resolvedOutput = { waitId: "wait-1", status: "ready", matchedTaskIds: ["child-1"], targetTaskIds: ["child-1"], tasks: [{ taskId: "child-1", status: "completed" }] }
+
+  function projection(output: unknown, input: unknown = resolvedInput, includeInput = true) {
+    return { id: "wait-result:wait-1", content: { toolCallId: "wait:wait-1", toolName: "agent.wait", ...(includeInput ? { input } : {}), status: "completed", output } }
+  }
 
   function replayFixture(output: unknown, persistedCall = call, additionalToolObservations: readonly { id: string; content: unknown }[] = []) {
     const executeTool = vi.fn()
@@ -71,12 +77,12 @@ describe("executeTools persisted replay", () => {
     return { options, executeTool, writer: new TurnExecutionEventWriter(options) }
   }
 
-  async function replay(fixture: ReturnType<typeof replayFixture>) {
+  async function replay(fixture: ReturnType<typeof replayFixture>, modelCall = call) {
     return executeTools(
       fixture.options,
       fixture.writer,
       { id: "step-1", ordinal: 1 },
-      { text: "", reasoningSummary: "", toolCalls: [call], provider: "fixture", model: "fixture-model", finishReason: "tool_calls", usage: null, continuation: null },
+      { text: "", reasoningSummary: "", toolCalls: [modelCall], provider: "fixture", model: "fixture-model", finishReason: "tool_calls", usage: null, continuation: null },
       fixture.options.snapshot,
       new Set(),
       fixture.options.signal!,
@@ -97,18 +103,67 @@ describe("executeTools persisted replay", () => {
   })
 
   it("does not re-handoff a stale wait receipt when its resolved outcome is in the snapshot", async () => {
-    const fixture = replayFixture(waitReceipt, call, [{
-      id: "wait-result:wait-1",
-      content: {
-        toolCallId: "wait:wait-1", toolName: "agent.wait", input: { taskIds: ["child-1"], mode: "all" }, status: "completed",
-        output: { waitId: "wait-1", status: "ready", matchedTaskIds: ["child-1"], targetTaskIds: ["child-1"], tasks: [{ taskId: "child-1", status: "completed" }] },
-      },
-    }])
+    const fixture = replayFixture(waitReceipt, call, [projection(resolvedOutput)])
 
     const result = await replay(fixture)
 
     expect(result.wait).toBeNull()
     expect(result.snapshot).toBe(fixture.options.snapshot)
+    expect(fixture.executeTool).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {
+      label: "ready any with one matched target",
+      modelCall: { ...call, arguments: { ...call.arguments, taskIds: ["child-b", "child-a"], mode: "any" } },
+      input: { taskIds: ["child-a", "child-b"], mode: "any" },
+      output: { waitId: "wait-1", status: "ready", matchedTaskIds: ["child-b"], targetTaskIds: ["child-a", "child-b"], tasks: [{ taskId: "child-a", status: "completed" }, { taskId: "child-b", status: "failed" }] },
+    },
+    {
+      label: "ready all with every target matched",
+      modelCall: { ...call, arguments: { ...call.arguments, taskIds: ["child-b", "child-a"] } },
+      input: { taskIds: ["child-a", "child-b"], mode: "all" },
+      output: { waitId: "wait-1", status: "ready", matchedTaskIds: ["child-a", "child-b"], targetTaskIds: ["child-a", "child-b"], tasks: [{ taskId: "child-a", status: "completed" }, { taskId: "child-b", status: "completed" }] },
+    },
+    {
+      label: "timed out with no matched targets",
+      modelCall: { ...call, arguments: { ...call.arguments, taskIds: ["child-b", "child-a"] } },
+      input: { taskIds: ["child-a", "child-b"], mode: "all" },
+      output: { waitId: "wait-1", status: "timed_out", matchedTaskIds: [], targetTaskIds: ["child-a", "child-b"], tasks: [{ taskId: "child-a", status: "completed" }, { taskId: "child-b", status: "running" }] },
+    },
+  ])("accepts a valid $label projection", async ({ modelCall, input, output }) => {
+    const fixture = replayFixture({ ...waitReceipt, matchedTaskIds: output.matchedTaskIds }, modelCall, [projection(output, input)])
+
+    const result = await replay(fixture, modelCall)
+
+    expect(result.wait).toBeNull()
+    expect(fixture.executeTool).not.toHaveBeenCalled()
+  })
+
+  const multiResolvedOutput = {
+    waitId: "wait-1", status: "ready", matchedTaskIds: ["child-a", "child-b"], targetTaskIds: ["child-a", "child-b"],
+    tasks: [{ taskId: "child-a", status: "completed" }, { taskId: "child-b", status: "completed" }],
+  }
+
+  it.each([
+    { label: "wrong projection input", mode: "all" as const, input: { taskIds: ["child-a"], mode: "all" }, output: multiResolvedOutput },
+    { label: "wrong projection mode", mode: "all" as const, input: { taskIds: ["child-a", "child-b"], mode: "any" }, output: multiResolvedOutput },
+    { label: "missing projection input", mode: "all" as const, input: undefined, includeInput: false, output: multiResolvedOutput },
+    { label: "wrong task rows", mode: "all" as const, input: { taskIds: ["child-a", "child-b"], mode: "all" }, output: { ...multiResolvedOutput, tasks: [{ taskId: "child-a", status: "completed" }, { taskId: "child-c", status: "completed" }] } },
+    { label: "missing task rows", mode: "all" as const, input: { taskIds: ["child-a", "child-b"], mode: "all" }, output: { ...multiResolvedOutput, tasks: [{ taskId: "child-a", status: "completed" }] } },
+    { label: "duplicate task rows", mode: "all" as const, input: { taskIds: ["child-a", "child-b"], mode: "all" }, output: { ...multiResolvedOutput, tasks: [{ taskId: "child-a", status: "completed" }, { taskId: "child-a", status: "completed" }] } },
+    { label: "duplicate targets", mode: "all" as const, input: { taskIds: ["child-a", "child-b"], mode: "all" }, output: { ...multiResolvedOutput, targetTaskIds: ["child-a", "child-a"], matchedTaskIds: ["child-a"], tasks: [{ taskId: "child-a", status: "completed" }, { taskId: "child-a", status: "completed" }] } },
+    { label: "empty targets", mode: "all" as const, input: { taskIds: ["child-a", "child-b"], mode: "all" }, output: { ...multiResolvedOutput, targetTaskIds: [], matchedTaskIds: [], tasks: [] } },
+    { label: "duplicate matches", mode: "any" as const, input: { taskIds: ["child-a", "child-b"], mode: "any" }, output: { ...multiResolvedOutput, matchedTaskIds: ["child-a", "child-a"] } },
+    { label: "ready with empty matches", mode: "any" as const, input: { taskIds: ["child-a", "child-b"], mode: "any" }, output: { ...multiResolvedOutput, matchedTaskIds: [] } },
+    { label: "ready all partial match", mode: "all" as const, input: { taskIds: ["child-a", "child-b"], mode: "all" }, output: { ...multiResolvedOutput, matchedTaskIds: ["child-a"] } },
+  ])("keeps the durable handoff for a $label projection", async ({ mode, input, includeInput, output }) => {
+    const modelCall = { ...call, arguments: { ...call.arguments, taskIds: ["child-b", "child-a"], mode } }
+    const fixture = replayFixture(waitReceipt, modelCall, [projection(output, input, includeInput)])
+
+    const result = await replay(fixture, modelCall)
+
+    expect(result.wait).toEqual({ status: "waiting_for_dependency", waitId: "wait-1", stepCount: 0, toolCallCount: 0 })
     expect(fixture.executeTool).not.toHaveBeenCalled()
   })
 
