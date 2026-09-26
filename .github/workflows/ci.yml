@@ -38,6 +38,77 @@ jobs:
         with: { node-version: 20, cache: pnpm }
       - run: pnpm install --frozen-lockfile
       - run: pnpm test:all
+  agent-runtime-postgres:
+    name: Agent runtime PostgreSQL integration
+    runs-on: ubuntu-latest
+    # This service exists only for this job; migrations and test writes stay in
+    # its throwaway database and never use repository/database secrets.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: applymate_agent_brain_ci
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d applymate_agent_brain_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+      AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - name: Apply existing migrations to the disposable PostgreSQL service
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+        run: pnpm --filter @jobcopilot/web exec prisma migrate deploy --schema prisma/schema.prisma
+      - name: Generate Web Prisma client for the Worker usage-route integration
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+        run: pnpm --filter @jobcopilot/web exec prisma generate --schema prisma/schema.prisma
+      - name: Build Worker workspace before focused test
+        run: pnpm turbo build --filter=@jobcopilot/worker
+      - name: Verify durable tool-result persistence and owner isolation
+        run: pnpm --filter @jobcopilot/worker exec vitest run src/runtime/tools/tool-result-reference-pg.integration.test.ts
+      - name: Verify subagent task leases and attempt fencing on disposable PostgreSQL
+        run: pnpm --filter @jobcopilot/worker exec vitest run src/runtime/subagents/subagent-store-pg.integration.test.ts
+      - name: Verify mailbox task reads under tenant RLS on disposable PostgreSQL
+        run: pnpm --filter @jobcopilot/worker exec vitest run src/runtime/coordination.integration.test.ts
+      - name: Verify production Turn dispatch on disposable Redis/BullMQ
+        env:
+          RUN_AGENT_TURN_REDIS_INTEGRATION: "1"
+          AGENT_TURN_REDIS_TEST_DISPOSABLE: "true"
+          AGENT_TURN_REDIS_TEST_URL: redis://127.0.0.1:6379/15
+        run: pnpm --filter @jobcopilot/worker exec vitest run src/queue/production-bootstrap-redis.integration.test.ts
+      - name: Verify production subagent dispatch and durable parent wake on disposable Redis/BullMQ
+        env:
+          RUN_AGENT_TURN_REDIS_INTEGRATION: "1"
+          AGENT_TURN_REDIS_TEST_DISPOSABLE: "true"
+          AGENT_TURN_REDIS_TEST_URL: redis://127.0.0.1:6379/15
+        run: pnpm --filter @jobcopilot/worker exec vitest run src/queue/production-bootstrap-subagents-redis.integration.test.ts
+      - name: Verify durable parent resume across a Worker process restart
+        env:
+          AGENT_TURN_REDIS_TEST_URL: redis://127.0.0.1:6379/15
+          AGENT_TURN_REDIS_TEST_DISPOSABLE: "true"
+          REDIS_URL: redis://127.0.0.1:6379/15
+        run: pnpm --filter @jobcopilot/worker exec vitest run src/queue/production-bootstrap-process-restart.integration.test.ts
   lockfile:
     name: Lockfile
     runs-on: ubuntu-latest

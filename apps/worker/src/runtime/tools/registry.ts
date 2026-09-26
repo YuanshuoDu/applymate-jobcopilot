@@ -39,6 +39,7 @@ function publicDefinition(definition: RuntimeToolDefinition): PublicToolDefiniti
     timeoutMs: definition.timeoutMs,
     requiredCapabilities: [...definition.requiredCapabilities],
     domain: definition.domain,
+    ...(definition.template === undefined ? {} : { template: definition.template }),
   }
 }
 
@@ -107,7 +108,8 @@ export class ToolRegistry {
     const validIdempotency = ["read_only", "idempotent", "requires_key", "non_repeatable"]
     if (!validRisks.includes(definition.risk) || !validIdempotency.includes(definition.idempotency) ||
       !Number.isInteger(definition.timeoutMs) || definition.timeoutMs < 1 || definition.timeoutMs > 300_000 ||
-      definition.requiredCapabilities.some((capability) => capability.length === 0)) {
+      definition.requiredCapabilities.some((capability) => capability.length === 0) ||
+      (definition.template !== undefined && (typeof definition.template !== "string" || !definition.template.trim() || definition.template.length > 256))) {
       throw new ToolRegistryError("invalid_definition", `Tool ${definition.name}@${definition.version} has invalid runtime metadata`)
     }
     if (definition.risk === "read" && !definition.capabilities.includes("read" as ToolCapability)) {

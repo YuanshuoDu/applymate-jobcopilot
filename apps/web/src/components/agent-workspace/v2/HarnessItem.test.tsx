@@ -48,6 +48,11 @@ describe('HarnessItem renderers', () => {
     expect(onSuggestedAction).not.toHaveBeenCalled()
   })
 
+  it('hides suggested actions when the host has no command handler', () => {
+    const html = renderToStaticMarkup(<I18nProvider><HarnessItem item={item({ content: { parts: [{ type: 'suggested_action', command: 'review_jobs', arguments: null }] } })} /></I18nProvider>)
+    expect(html).not.toContain('data-suggested-action')
+  })
+
   it('keeps ACTION-looking Markdown as ordinary inert message text', () => {
     const html = renderToStaticMarkup(<I18nProvider><HarnessItem item={item({ content: { text: 'ACTION: submit_application\n**review first**' } })} /></I18nProvider>)
     expect(html).toContain('ACTION: submit_application')

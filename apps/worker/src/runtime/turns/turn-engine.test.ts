@@ -5,7 +5,8 @@ import type { StepContext, StepContextSnapshot } from "../context/step-context-b
 import { RootAbortController } from "../interrupt/registry.js"
 import { TurnLeaseError } from "./lease.js"
 import { createToolRouterExecutor, TurnEngine } from "./turn-engine.js"
-import { toRepositoryJson, type TurnEngineOptions, type TurnEngineStore } from "./turn-engine-types.js"
+import { toRepositoryJson, type TurnEngineEvent, type TurnEngineOptions, type TurnEngineStore } from "./turn-engine-types.js"
+import { steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "../context/steering-marker.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "owner-1", userId: "user-1", leaseVersion: 4,
@@ -24,17 +25,30 @@ function profile() {
 
 function fakeStore() {
   const events: Array<{ id: string; type: string; causationId: string | null; itemId: string | null }> = []
+  const batches: string[][] = []
   const items: Array<{ id: string; type: string; phase: string | null; status: string; revision: number }> = []
   const steps: Array<{ id: string; status: string; errorCode: string | null }> = []
   const value: TurnEngineStore = {
-    startStep: async ({ stepId }) => { steps.push({ id: stepId, status: "streaming", errorCode: null }); return { id: stepId } },
+    startStep: async ({ stepId, ordinal }) => { steps.push({ id: stepId, status: "streaming", errorCode: null }); return { id: stepId, ordinal } },
     updateStep: async ({ stepId, status, errorCode }) => { const step = steps.find((entry) => entry.id === stepId)!; step.status = status; step.errorCode = errorCode },
     createItem: async ({ itemId, type, phase, status }) => { items.push({ id: itemId, type, phase, status, revision: 0 }); return { id: itemId, revision: 0 } },
     updateItem: async ({ itemId, expectedRevision, status }) => { const item = items.find((entry) => entry.id === itemId)!; expect(item.revision).toBe(expectedRevision); item.revision += 1; item.status = status; return { id: itemId, revision: item.revision } },
     appendEvent: async ({ id, type, causationId, itemId }) => { events.push({ id, type, causationId, itemId }); return { id } },
-    recordFinalResponse: vi.fn(async () => undefined),
+    appendEvents: async inputs => { batches.push(inputs.map(input => input.id)); for (const input of inputs) events.push({ id: input.id, type: input.type, causationId: input.causationId, itemId: input.itemId }); return inputs.map(input => ({ id: input.id })) },
+    recordFinalResponse: vi.fn(async input => {
+      if (!input.terminal) return
+      items.push({ id: input.terminal.finalItemId, type: "agent_message", phase: "final_answer", status: "completed", revision: 1 })
+      const cause = events.at(-1)?.id ?? null
+      const finalEvents: TurnEngineEvent[] = [
+        { id: "final-started", type: "item.started", itemId: input.terminal.finalItemId, correlationId: "step", causationId: cause, payload: {} },
+        { id: "final-completed", type: "item.completed", itemId: input.terminal.finalItemId, correlationId: input.terminal.finalItemId, causationId: "final-started", payload: {} },
+        { id: "turn-completed", type: "turn.completed", itemId: input.terminal.finalItemId, correlationId: "step", causationId: "final-completed", payload: {} },
+      ]
+      events.push(...finalEvents.map(event => ({ id: event.id, type: event.type, causationId: event.causationId, itemId: event.itemId })))
+      return { status: "completed" as const, finalItemId: input.terminal.finalItemId, events: finalEvents }
+    }),
   }
-  return { value, events, items, steps }
+  return { value, events, batches, items, steps }
 }
 
 function contextBuilder(seen: StepContextSnapshot[]) {
@@ -49,6 +63,20 @@ function contextBuilder(seen: StepContextSnapshot[]) {
       return { schemaVersion: "agent-harness.v2", sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId, inputThroughSequence: BigInt(seen.length), consumedInputIds: seen.length === 1 ? ["steer-1"] : ["steer-1"], blocks, canonicalJson: JSON.stringify(blocks) }
     },
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+}
+
+function hasOnlyStringArgument(input: unknown, key: string): boolean {
+  return isRecord(input) && Object.keys(input).length === 1 && Object.hasOwn(input, key) && typeof input[key] === "string" && input[key].length > 0
+}
+
+function validateFixtureToolArguments(toolName: string, input: unknown): boolean | string {
+  if (toolName === "jobs.search" && hasOnlyStringArgument(input, "location")) return true
+  if (toolName === "jobs.get" && hasOnlyStringArgument(input, "jobId")) return true
+  return "Tool arguments failed fixture schema validation"
 }
 
 function baseOptions(overrides: Partial<TurnEngineOptions> = {}) {
@@ -71,9 +99,10 @@ function baseOptions(overrides: Partial<TurnEngineOptions> = {}) {
     },
   }
   const options: TurnEngineOptions = {
-    lease, scope: { userId: "user-1" }, goal: "Find jobs", snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
+    lease, rootTaskId: "root-1", scope: { userId: "user-1" }, goal: "Find jobs", snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
     contextBuilder: contextBuilder(snapshots), store: fake.value, model, tools: [{ name: "jobs.search", version: "1" }, { name: "jobs.get", version: "1" }],
     executeTool: async ({ call }) => ({ id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed" as const, output: call.toolName === "jobs.search" ? { jobs: [{ id: "job-1" }] } : { job: { id: "job-1", role: "Engineer" } }, errorCode: null }),
+    validateToolArguments: validateFixtureToolArguments,
     now: () => now, maxSteps: 5,
     idFactory: (() => { let id = 0; return (prefix: string) => `${prefix}:${++id}` })(),
     ...overrides,
@@ -82,6 +111,37 @@ function baseOptions(overrides: Partial<TurnEngineOptions> = {}) {
 }
 
 describe("TurnEngine", () => {
+  it("forwards the runtime-owned task identity into context building", async () => {
+    const fixture = baseOptions()
+    const seen: string[] = []
+    const options: TurnEngineOptions = {
+      ...fixture.options,
+      contextBuilder: {
+        build: async (request: Parameters<TurnEngineOptions["contextBuilder"]["build"]>[0]) => {
+        seen.push(request.taskId ?? "")
+        return contextBuilder([]).build(request)
+      },
+      },
+    }
+    await expect(new TurnEngine(options).run()).resolves.toMatchObject({ status: "completed" })
+    expect(seen[0]).toBe("root-1")
+  })
+
+  it("forwards the active steering marker through the bound context builder", async () => {
+    const fixture = baseOptions()
+    const marker: SteeringMarkerPayload = {
+      schemaVersion: "agent-harness.steering-marker.v1", kind: "observed", status: "observed", sessionId: "session-1", turnId: "turn-1", taskId: "root-1",
+      stepId: "old-step", inputId: "steer-1", idempotencyKey: steeringMarkerIdempotencyKey("session-1", "turn-1", "steer-1"), obligationId: "steering:steer-1", goalRevision: 1, planRevision: null, acceptedSequence: "2",
+    }
+    const seen: Array<Parameters<TurnEngineOptions["contextBuilder"]["build"]>[0]> = []
+    const options: TurnEngineOptions = {
+      ...fixture.options, steeringMarkerState: { active: [marker] },
+      contextBuilder: { build: async request => { seen.push(request); return contextBuilder([]).build(request) } },
+    }
+    await new TurnEngine(options).run()
+    expect(seen[0]).toMatchObject({ taskId: "root-1", steeringMarkerState: { active: [marker] } })
+  })
+
   it("runs a durable 3-step loop, feeds tool results into context, and emits one final", async () => {
     const fixture = baseOptions()
     const result = await new TurnEngine(fixture.options).run()
@@ -112,14 +172,19 @@ describe("TurnEngine", () => {
     const root = new RootAbortController({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId })
     const fixture = baseOptions({
       signal: root.signal,
+      budget: { maxToolCalls: 1 },
       executeTool: async ({ call }) => {
         root.stop("user_stop")
         return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, output: {}, errorCode: null }
       },
     })
-    await expect(new TurnEngine(fixture.options).run()).resolves.toMatchObject({ status: "interrupted", stepCount: 1, toolCallCount: 0, errorCode: "interrupt_requested" })
+    await expect(new TurnEngine(fixture.options).run()).resolves.toMatchObject({ status: "interrupted", stepCount: 1, toolCallCount: 1, errorCode: "interrupt_requested" })
     expect(fixture.requests).toHaveLength(1)
     expect(fixture.fake.steps[0].status).toBe("interrupted")
+    expect(fixture.fake.items.filter((item) => item.type === "tool_call")).toMatchObject([{ status: "completed" }])
+    expect(fixture.fake.items.filter((item) => item.type === "tool_result")).toMatchObject([{ status: "completed" }])
+    expect(fixture.fake.events.filter((event) => event.type === "tool_call.started")).toHaveLength(1)
+    expect(fixture.fake.events.filter((event) => event.type === "tool_call.completed")).toHaveLength(1)
     expect(fixture.fake.events.filter((event) => event.type === "turn.completed")).toHaveLength(0)
     expect(fixture.fake.events.filter((event) => event.type === "turn.interrupted")).toHaveLength(1)
   })
@@ -147,11 +212,34 @@ describe("TurnEngine", () => {
         system: [], profile: [], steerHistory: [], businessRefs: [],
         toolObservations: [{ id: "tool-result:call-1", content: { toolCallId: "call-1", toolName: "jobs.search", input: { location: "Dublin" }, status: "completed", output: { jobs: [{ id: "job-1" }] }, errorCode: null } }],
       },
+      budget: { maxToolCalls: 2 },
       executeTool,
     })
-    await expect(new TurnEngine(fixture.options).run()).resolves.toMatchObject({ status: "completed", toolCallCount: 2 })
+    await expect(new TurnEngine(fixture.options).run()).resolves.toMatchObject({ status: "completed", toolCallCount: 1 })
     expect(executeTool).toHaveBeenCalledTimes(1)
     expect(executeTool).toHaveBeenCalledWith(expect.objectContaining({ call: expect.objectContaining({ id: "call-2" }) }))
+    expect(fixture.requests).toHaveLength(3)
+    expect(fixture.fake.items.filter((item) => item.type === "tool_call")).toMatchObject([{ id: expect.stringContaining("call-2"), status: "completed" }])
+    expect(fixture.fake.items.filter((item) => item.type === "tool_result")).toHaveLength(1)
+    expect(fixture.fake.events.filter((event) => event.type === "tool_call.started")).toHaveLength(1)
+    expect(fixture.fake.events.filter((event) => event.type === "tool_call.completed")).toHaveLength(1)
+  })
+
+  it("charges replayed model calls against the tool budget without persisting duplicate calls", async () => {
+    const executeTool = vi.fn()
+    const fixture = baseOptions({
+      snapshot: {
+        system: [], profile: [], steerHistory: [], businessRefs: [],
+        toolObservations: [{ id: "tool-result:call-1", content: { toolCallId: "call-1", toolName: "jobs.search", input: { location: "Dublin" }, status: "completed", output: { jobs: [{ id: "job-1" }] }, errorCode: null } }],
+      },
+      budget: { maxToolCalls: 1 },
+      executeTool,
+    })
+    await expect(new TurnEngine(fixture.options).run()).resolves.toMatchObject({ status: "failed", stepCount: 2, toolCallCount: 0, errorCode: "budget_exhausted" })
+    expect(fixture.requests).toHaveLength(2)
+    expect(executeTool).not.toHaveBeenCalled()
+    expect(fixture.fake.items.filter((item) => item.type === "tool_call")).toHaveLength(0)
+    expect(fixture.fake.events.some((event) => event.type === "turn.budget_exhausted")).toBe(true)
   })
 
   it("fails closed when a replayed call id has different arguments", async () => {
@@ -173,6 +261,17 @@ describe("TurnEngine", () => {
     expect(result).toMatchObject({ status: "failed", errorCode: "budget_exhausted", finalItemId: expect.any(String) })
     expect(fixture.fake.events.some((event) => event.type === "turn.budget_exhausted")).toBe(true)
     expect(fixture.fake.items.filter((item) => item.type === "agent_message" && item.phase === "final_answer")).toHaveLength(1)
+  })
+
+  it("does not invoke the model when a resumed finite model budget has no allowance", async () => {
+    const fixture = baseOptions({
+      budget: { maxInputTokens: 10 },
+      resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 0, inputThroughSequence: 1n, consumedInputIds: [], usage: { inputTokens: 10, outputTokens: 0, estimatedCostUsd: 0 } },
+      model: { id: "must-not-run", profile: profile(), async *stream() { throw new Error("provider invoked") } },
+    })
+    const result = await new TurnEngine(fixture.options).run()
+    expect(result).toMatchObject({ status: "failed", errorCode: "budget_exhausted" })
+    expect(fixture.requests).toHaveLength(0)
   })
 
   it("stops repeated no-op tool results with a reason-coded event", async () => {

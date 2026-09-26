@@ -39,6 +39,22 @@ const mocks = vi.hoisted(() => {
     canUseAtsSource: vi.fn().mockReturnValue(true),
   };
 });
+const approvalMocks = vi.hoisted(() => ({
+  inspectSubmission: vi.fn().mockResolvedValue({
+    type: "submit_application",
+    status: "approved",
+    scope: {
+      userId: "user-1",
+      sessionId: "agent-session-1",
+      turnId: "agent-turn-1",
+      jobId: "job-1",
+      toolCallId: "application-submit:application-task-1",
+      action: "submit_application",
+    },
+    payload: { applicationTaskId: "application-task-1", jobId: "job-1" },
+  }),
+}));
+const submitToolMocks = vi.hoisted(() => ({ create: vi.fn() }));
 
 vi.mock("bullmq", () => ({
   Queue: vi.fn().mockImplementation(() => ({ add: vi.fn(), isPaused: vi.fn().mockResolvedValue(false) })),
@@ -100,6 +116,31 @@ vi.mock("../db/application-task-state.js", () => ({
   pauseForFormInput: mocks.pauseForFormInput,
   needsUserTakeover: vi.fn(() => false),
 }));
+vi.mock("../runtime/approval/pg-store.js", () => ({
+  createPgApprovalStore: vi.fn(() => ({ inspectSubmission: approvalMocks.inspectSubmission })),
+}));
+vi.mock("../runtime/interrupt/application-submission-probe.js", () => ({
+  acquireApplicationSubmissionStartFence: vi.fn(),
+  isApplicationSubmissionStopped: vi.fn().mockResolvedValue(false),
+  startApplicationSubmissionStopProbe: vi.fn(() => ({ stop: vi.fn() })),
+}));
+vi.mock("../runtime/tools/application-submit-tool.js", () => ({
+  createPgApplicationSubmitTool: submitToolMocks.create.mockImplementation((
+    { submit }: { submit: (input: { beforeSubmit: (intent?: unknown) => Promise<boolean> }) => Promise<unknown> },
+  ) => ({
+    execute: async () => {
+      try {
+        await submit({ beforeSubmit: async () => true });
+        return { status: "submitted", confirmationId: "application:application-task-1", postSubmitUrl: null, errorCode: null, output: null };
+      } catch (error) {
+        const errorCode = error && typeof error === "object" && "code" in error && typeof error.code === "string"
+          ? error.code
+          : "browser_failed";
+        return { status: "failed", confirmationId: null, postSubmitUrl: null, errorCode, output: null };
+      }
+    },
+  })),
+}));
 vi.mock("node:fs", () => ({ unlinkSync: vi.fn() }));
 
 const payload = {
@@ -111,6 +152,8 @@ const payload = {
   personaId: "persona-1",
   resumePath: "/resume.pdf",
   dryRun: false,
+  receiptId: "approval-1",
+  constraintHash: "c".repeat(64),
 };
 
 const formPattern = {
@@ -149,6 +192,20 @@ describe("apply-queue Phase 5 pipeline", () => {
     });
     mocks.detectCaptcha.mockResolvedValue(false);
     mocks.detectFlow.mockReturnValue(null);
+    approvalMocks.inspectSubmission.mockResolvedValue({
+      type: "submit_application",
+      status: "approved",
+      scope: {
+        userId: "user-1",
+        sessionId: "agent-session-1",
+        turnId: "agent-turn-1",
+        jobId: "job-1",
+        toolCallId: "application-submit:application-task-1",
+        action: "submit_application",
+      },
+      payload: { applicationTaskId: "application-task-1", jobId: "job-1" },
+    });
+    submitToolMocks.create.mockClear();
     payload.operation = "submit";
     mocks.runtimeFeatureEnabled.mockResolvedValue(true);
     mocks.loadAtsPolicy.mockResolvedValue({ configured: true, version: 1, allowAutoApply: true });
@@ -184,7 +241,7 @@ describe("apply-queue Phase 5 pipeline", () => {
         jobId: "job-1",
         status: "submitted",
         atsType: "unknown",
-        flowUsed: "pattern-cache",
+        flowUsed: "application.submit",
         error: null,
       })
     );
@@ -207,8 +264,8 @@ describe("apply-queue Phase 5 pipeline", () => {
     expect(mocks.insertApplyResult).toHaveBeenCalledWith(
       expect.objectContaining({
         status: "submission_blocked",
-        flowUsed: "pattern-cache",
-        error: expect.stringContaining("Submission blocked"),
+        flowUsed: "application.submit",
+        error: "browser_412",
       }),
     );
     expect(mocks.createNotification).toHaveBeenCalledWith(
@@ -226,7 +283,7 @@ describe("apply-queue Phase 5 pipeline", () => {
       "application-task-1",
       "waiting_for_authorization",
       "submission_blocked",
-      expect.stringContaining("Submission blocked"),
+      "browser_412",
     );
   });
 
@@ -258,7 +315,7 @@ describe("apply-queue Phase 5 pipeline", () => {
     expect(mocks.insertApplyResult).toHaveBeenCalledWith(
       expect.objectContaining({
         status: "submitted",
-        flowUsed: "llm",
+        flowUsed: "application.submit",
         error: null,
       })
     );
@@ -277,8 +334,8 @@ describe("apply-queue Phase 5 pipeline", () => {
     expect(mocks.insertApplyResult).toHaveBeenCalledWith(
       expect.objectContaining({
         status: "manual",
-        flowUsed: null,
-        error: "AI fallback budget exceeded (10/10 this month)",
+        flowUsed: "application.submit",
+        error: "browser_manual",
       })
     );
   });

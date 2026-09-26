@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { Prisma, PrismaClient } from "@prisma/client"
 import { hashApprovalNonce, hashApprovalScope } from "@jobcopilot/agent-protocol"
 
-import { consumeApprovalAndReserve, issueApprovalReceipt, validateApproval, validatePendingApprovalReceipt } from "./store"
+import { consumeApproval, consumeApprovalAndReserve, issueApprovalReceipt, validateApproval, validatePendingApprovalReceipt } from "./store"
 import { reissueApprovalNonce } from "./receipt-rotation"
 import { protocolScope, ApprovalStoreError, type ApprovalScopeInput } from "./types"
 
@@ -29,12 +29,19 @@ async function approvalRow(nonce = "nonce_1"): Promise<Prisma.AgentApprovalGetPa
   }
 }
 
-function mockDb(row: Prisma.AgentApprovalGetPayload<{}>) {
+type FreshnessState = { hasRequest?: boolean; hasGoalRevision?: boolean; sessionPresent?: boolean; turnPresent?: boolean; turnStatus?: string }
+
+function mockDb(row: Prisma.AgentApprovalGetPayload<{}>, freshness: FreshnessState = {}) {
   const tx = {
-    $queryRaw: vi.fn(async () => [{ eventSequence: BigInt(9) }]),
+    $queryRaw: vi.fn(async (query?: { strings?: readonly string[] }) => {
+      const sql = query?.strings?.join(" ") ?? ""
+      if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return freshness.sessionPresent === false ? [] : [{ id: row.sessionId }]
+      if (sql.includes("WITH request")) return [{ hasRequest: freshness.hasRequest !== false, hasGoalRevision: freshness.hasGoalRevision === true }]
+      return [{ eventSequence: BigInt(9) }]
+    }),
     agentSession: { findFirst: vi.fn(async () => ({ id: row.sessionId })) },
     agentTurn: {
-      findFirst: vi.fn(async () => ({ id: row.turnId, status: "in_progress", revision: scopeInput.revision })),
+      findFirst: vi.fn(async () => freshness.turnPresent === false ? null : ({ id: row.turnId, status: freshness.turnStatus ?? "in_progress", revision: scopeInput.revision })),
       updateMany: vi.fn(async () => ({ count: 1 })),
     },
     agentItem: {
@@ -112,6 +119,46 @@ describe("Web approval receipt store", () => {
     expect(tx.agentApproval.updateMany).toHaveBeenCalledWith({ where: expect.objectContaining({ status: "approved", scopeHash: row.scopeHash, nonceHash: row.nonceHash }), data: expect.objectContaining({ status: "consumed" }) })
     expect(tx.agentActionReservation.create).toHaveBeenCalledWith({ data: expect.objectContaining({ approvalId: row.id, idempotencyKey: "submit:task_1", status: "reserved" }) })
     expect(tx.agentEvent.create).toHaveBeenCalledTimes(2)
+  })
+
+  it("does not consume an approval after its Turn has been interrupted", async () => {
+    const row = await approvalRow()
+    const { db, tx } = mockDb(row, { turnStatus: "interrupted" })
+
+    await expect(consumeApprovalAndReserve(db, row.id, { ...scopeInput, nonce: "nonce_1" }, { idempotencyKey: "submit:task_1" }, timeAt(1)))
+      .rejects.toMatchObject({ code: "approval_scope_mismatch", message: "Approval turn is no longer active" })
+    expect(tx.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(tx.agentTurn.findFirst.mock.invocationCallOrder[0])
+    expect(tx.agentApproval.updateMany).not.toHaveBeenCalled()
+    expect(tx.agentActionReservation.create).not.toHaveBeenCalled()
+    expect(tx.agentEvent.create).not.toHaveBeenCalled()
+  })
+
+  it("rejects consumption after a durable goal revision event", async () => {
+    const row = await approvalRow()
+    const { db, tx } = mockDb(row, { hasGoalRevision: true })
+
+    await expect(consumeApprovalAndReserve(db, row.id, { ...scopeInput, nonce: "nonce_1" }, { idempotencyKey: "submit:task_1" }, timeAt(1))).rejects.toMatchObject({ code: "approval_revision_mismatch" })
+    expect(tx.agentApproval.updateMany).not.toHaveBeenCalled()
+    expect(tx.agentActionReservation.create).not.toHaveBeenCalled()
+    expect(tx.agentEvent.create).not.toHaveBeenCalled()
+  })
+
+  it("fails closed when consumption has no durable approval request event", async () => {
+    const row = await approvalRow()
+    const { db, tx } = mockDb(row, { hasRequest: false })
+
+    await expect(consumeApproval(db, row.id, { ...scopeInput, nonce: "nonce_1" }, timeAt(1))).rejects.toMatchObject({ code: "approval_integrity_error" })
+    expect(tx.agentApproval.updateMany).not.toHaveBeenCalled()
+    expect(tx.agentEvent.create).not.toHaveBeenCalled()
+  })
+
+  it("preserves consumed receipt replay semantics without a freshness read", async () => {
+    const row = { ...(await approvalRow()), status: "consumed", consumedAt: timeAt(1) }
+    const { db, tx } = mockDb(row, { hasRequest: false, hasGoalRevision: true })
+
+    await expect(consumeApproval(db, row.id, { ...scopeInput, nonce: "nonce_1" }, timeAt(2))).rejects.toMatchObject({ code: "approval_already_consumed" })
+    expect(tx.$queryRaw).not.toHaveBeenCalled()
+    expect(tx.agentApproval.updateMany).not.toHaveBeenCalled()
   })
 
   it("maps a conditional update race to an already-consumed error", async () => {

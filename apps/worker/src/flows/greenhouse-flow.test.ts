@@ -11,10 +11,12 @@ function mockPage(url: string = "https://boards.greenhouse.io/booking/jobs/123/a
       first: () => ({
         count: () => Promise.resolve(1),
         isVisible: () => Promise.resolve(true),
+        evaluate: vi.fn(async () => ({ url: "https://boards.greenhouse.io/booking/apply", method: "POST" })),
         click: vi.fn().mockResolvedValue(undefined),
       }),
       count: () => Promise.resolve(1),
       isVisible: () => Promise.resolve(true),
+      evaluate: vi.fn(async () => ({ url: "https://boards.greenhouse.io/booking/apply", method: "POST" })),
       click: vi.fn().mockResolvedValue(undefined),
     }),
     fill: vi.fn().mockResolvedValue(undefined),

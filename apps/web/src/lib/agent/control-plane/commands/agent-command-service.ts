@@ -1,16 +1,16 @@
 import type { PrismaClient } from "@prisma/client"
-import type { InputContentPart } from "@jobcopilot/agent-protocol"
-
-import { AgentCommandError, activeTurnChanged, automationCannotSteerUserTurn, invalidCommand, isUniqueViolation } from "./errors"
-import { cancelPendingWaitsInTransaction } from "../../broker/interrupt"
+import { AgentCommandError, activeTurnChanged, automationCannotSteerUserTurn, isUniqueViolation, retryActiveConflict, retryTargetChanged, retryTargetInvalid, turnWaitRequiresDedicatedAction } from "./errors"
+import { assertContent, dispositionFromEvent } from "./command-content"
+import { cancelExecutionInTransaction, interruptActiveTurn, type CancelExecutionCommand } from "./execution-cancellation"
+import { isRetryableTurnStatus, parsePersistedRetryContent } from "./retry-input"
 import {
   acceptInputFacts,
   assertExpectedTurn,
   createRootTurn,
   findActiveTurn,
   findExistingCommand,
+  lockOpenSession,
   fallbackDisposition,
-  lockOwnedSession,
   type CommandTransaction,
 } from "./transaction"
 import type {
@@ -19,26 +19,10 @@ import type {
   InterruptCommand,
   InterruptResult,
   MessageCommand,
+  RetryCommand,
   StartCommand,
   SteerCommand,
 } from "./types"
-
-type CommandEvent = { sequence: bigint; payload: unknown }
-type OriginalDisposition = Exclude<CommandDisposition, "duplicate"> | "interrupted"
-
-function assertContent(content: InputContentPart[]): void {
-  if (content.length === 0) {
-    throw invalidCommand("Agent commands require at least one content part")
-  }
-}
-
-function dispositionFromEvent(event: CommandEvent | null, fallback: OriginalDisposition): OriginalDisposition {
-  if (typeof event?.payload !== "object" || event.payload === null || Array.isArray(event.payload)) return fallback
-  const value = (event.payload as { disposition?: unknown }).disposition
-  return typeof value === "string" && ["started", "steered", "queued_follow_up", "interrupted"].includes(value)
-    ? (value as OriginalDisposition)
-    : fallback
-}
 
 async function duplicateCommandResult(
   tx: CommandTransaction,
@@ -101,6 +85,14 @@ export class AgentCommandService {
     return this.retryUnique(() => this.interruptOnce(command))
   }
 
+  async retry(command: RetryCommand): Promise<CommandResult> {
+    return this.retryUnique(() => this.retryOnce(command))
+  }
+
+  async cancelExecution(command: CancelExecutionCommand): Promise<boolean> {
+    return this.retryUnique(() => this.db.$transaction((tx) => cancelExecutionInTransaction(tx, command)))
+  }
+
   private async retryUnique<T>(work: () => Promise<T>): Promise<T> {
     try {
       return await work()
@@ -112,7 +104,7 @@ export class AgentCommandService {
 
   private startOnce(command: StartCommand): Promise<CommandResult> {
     return this.db.$transaction(async (tx) => {
-      await lockOwnedSession(tx, command.sessionId, command.userId)
+      await lockOpenSession(tx, command.sessionId, command.userId)
       const existing = await findExistingCommand(tx, command.sessionId, command.clientMessageId)
       if (existing) return duplicateCommandResult(tx, command, existing, "follow_up")
 
@@ -127,7 +119,7 @@ export class AgentCommandService {
 
   private messageOnce(command: MessageCommand): Promise<CommandResult> {
     return this.db.$transaction(async (tx) => {
-      await lockOwnedSession(tx, command.sessionId, command.userId)
+      await lockOpenSession(tx, command.sessionId, command.userId)
       const existing = await findExistingCommand(tx, command.sessionId, command.clientMessageId)
       if (existing) return duplicateCommandResult(tx, command, existing, command.delivery)
 
@@ -136,6 +128,9 @@ export class AgentCommandService {
       await assertExpectedTurn(expectedTurnId, command.expectedRevision, active)
       if (command.delivery === "steer" && command.source === "automation" && active?.source === "user") {
         throw automationCannotSteerUserTurn(active.id)
+      }
+      if (active?.status === "waiting_for_user" || active?.status === "waiting_for_approval") {
+        throw turnWaitRequiresDedicatedAction(active.id, active.status)
       }
 
       if (!active) {
@@ -152,29 +147,39 @@ export class AgentCommandService {
 
   private interruptOnce(command: InterruptCommand): Promise<InterruptResult> {
     return this.db.$transaction(async (tx) => {
-      await lockOwnedSession(tx, command.sessionId, command.userId)
+      await lockOpenSession(tx, command.sessionId, command.userId)
       const existing = await findExistingCommand(tx, command.sessionId, command.clientMessageId)
       if (existing) return duplicateInterruptResult(tx, command, existing)
 
       const active = await findActiveTurn(tx, command.sessionId, command.userId)
       await assertExpectedTurn(command.expectedTurnId, command.expectedRevision, active)
       if (!active) throw activeTurnChanged(command.expectedTurnId, null)
-      const interrupted = await tx.agentTurn.updateMany({
-        where: { id: active.id, sessionId: command.sessionId, userId: command.userId, status: { in: ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] }, revision: active.revision },
-        data: { status: "interrupted", revision: { increment: 1 }, completedAt: new Date() },
-      })
-      if (interrupted.count !== 1) throw activeTurnChanged(command.expectedTurnId, active.id)
-
-      await cancelPendingWaitsInTransaction(tx, {
-        sessionId: command.sessionId,
-        userId: command.userId,
-        turnId: active.id,
-        clientMessageId: command.clientMessageId,
-      })
-
-      const content: InputContentPart[] = [{ type: "text", text: "Interrupt requested" }]
-      return acceptInputFacts(tx, command, content, active, "steer", "interrupted", false)
-        .then((facts) => ({ ...facts, disposition: "interrupted" as const }))
+      return interruptActiveTurn(tx, command, active)
     })
   }
+
+  private retryOnce(command: RetryCommand): Promise<CommandResult> {
+    return this.db.$transaction(async (tx) => {
+      await lockOpenSession(tx, command.sessionId, command.userId)
+      const existing = await findExistingCommand(tx, command.sessionId, command.clientMessageId)
+      if (existing) return duplicateCommandResult(tx, command, existing, "follow_up")
+
+      const target = await tx.agentTurn.findFirst({
+        where: { id: command.targetTurnId, sessionId: command.sessionId, userId: command.userId },
+        select: { id: true, status: true, revision: true, input: true },
+      })
+      if (!target || !isRetryableTurnStatus(target.status)) throw retryTargetInvalid(command.targetTurnId, target?.status ?? null)
+      if (command.expectedRevision !== undefined && command.expectedRevision !== null && command.expectedRevision !== target.revision) {
+        throw retryTargetChanged(command.targetTurnId, command.expectedRevision, target.revision)
+      }
+      const active = await findActiveTurn(tx, command.sessionId, command.userId)
+      if (active) throw retryActiveConflict(active.id)
+      const persisted = parsePersistedRetryContent(target.id, target.input)
+
+      const created = await createRootTurn(tx, command, persisted.content, persisted.goal)
+      const facts = await acceptInputFacts(tx, command, persisted.content, created, "follow_up", "started", true)
+      return { ...facts, disposition: "started" as const }
+    })
+  }
+
 }

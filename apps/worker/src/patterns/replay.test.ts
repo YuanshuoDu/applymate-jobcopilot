@@ -43,6 +43,7 @@ function mockPage(options: {
         first: () => ({
           count: vi.fn(async () => (exists ? 1 : 0)),
           isVisible: vi.fn(async () => exists),
+          evaluate: vi.fn(async () => ({ url: "https://jobs.example.com/apply", method: "POST" })),
           click,
         }),
       };
@@ -65,12 +66,13 @@ describe("replayPattern", () => {
       submitVisible: true,
       url: "https://jobs.example.com/confirmation",
     });
+    const beforeSubmit = vi.fn().mockResolvedValue(true);
 
     const result = await replayPattern(
       page,
       pattern({ "#name": "fullName", "#email": "email" }),
       { fullName: "Ada Lovelace", email: "ada@example.com" },
-      vi.fn().mockResolvedValue(true),
+      beforeSubmit,
     );
 
     expect(result.status).toBe("submitted");
@@ -79,6 +81,7 @@ describe("replayPattern", () => {
     expect(page.type).toHaveBeenCalledWith("#name", "A", expect.objectContaining({ delay: expect.any(Number) }));
     expect(page.type).toHaveBeenCalledWith("#email", "a", expect.objectContaining({ delay: expect.any(Number) }));
     expect(page.click).toHaveBeenCalledTimes(1);
+    expect(beforeSubmit).toHaveBeenCalledWith({ url: "https://jobs.example.com/apply", method: "POST" });
     expect(page.waitForLoadState).toHaveBeenCalledWith("networkidle", { timeout: 20_000 });
     expect(result.log).toEqual(
       expect.arrayContaining([

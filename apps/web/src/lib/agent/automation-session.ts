@@ -34,6 +34,15 @@ interface AutomationTurnDb {
 
 const ACTIVE_AUTOMATION_TURN_STATUSES = ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"]
 
+export class AutomationTurnOccupiedError extends Error {
+  readonly code = "automation_turn_occupied"
+
+  constructor(readonly sessionId: string) {
+    super(`Automation session ${sessionId} has an active non-automation Turn`)
+    this.name = "AutomationTurnOccupiedError"
+  }
+}
+
 export const ACTIVE_AUTOMATION_EXECUTION_STATUSES = ["queued", "running", "waiting_for_user", "paused"] as const
 
 export function isActiveAutomationExecution(status: string | null | undefined) {
@@ -50,7 +59,7 @@ export async function ensureAutomationTurn(
   input: { sessionId: string; userId: string; name: string },
 ) {
   const store = db as AutomationTurnDb
-  const where = { sessionId: input.sessionId, userId: input.userId, status: { in: ACTIVE_AUTOMATION_TURN_STATUSES } }
+  const where = { sessionId: input.sessionId, userId: input.userId, source: "automation", status: { in: ACTIVE_AUTOMATION_TURN_STATUSES } }
   const existing = await store.agentTurn.findFirst({ where, orderBy: { createdAt: "desc" }, select: { id: true } })
   if (existing) return { turnId: existing.id, created: false }
 
@@ -66,7 +75,7 @@ export async function ensureAutomationTurn(
   } catch (error: unknown) {
     if (!isUniqueViolation(error)) throw error
     const raced = await store.agentTurn.findFirst({ where, orderBy: { createdAt: "desc" }, select: { id: true } })
-    if (!raced) throw error
+    if (!raced) throw new AutomationTurnOccupiedError(input.sessionId)
     return { turnId: raced.id, created: false }
   }
 }

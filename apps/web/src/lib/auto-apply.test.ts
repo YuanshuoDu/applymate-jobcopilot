@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   approvalFindFirst: vi.fn(),
   transaction: vi.fn(),
+  txTaskUpdateMany: vi.fn(),
   taskUpdate: vi.fn(),
   taskFindFirst: vi.fn(),
   taskEventCreate: vi.fn(),
@@ -62,14 +63,16 @@ describe("auto-apply authorization", () => {
     mocks.transaction.mockImplementation(async (callback: (tx: unknown) => unknown) => {
       if (typeof callback === "function") {
         return callback({
-          applicationTask: { findFirst: mocks.taskFindFirst, updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+          applicationTask: { findFirst: mocks.taskFindFirst, updateMany: mocks.txTaskUpdateMany },
           resume: { findFirst: mocks.resumeFindFirst },
           coverLetter: { findFirst: mocks.coverLetterFindFirst },
-          job: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+          job: { updateMany: mocks.jobUpdateMany },
         });
       }
       return Promise.all(callback);
     });
+    mocks.txTaskUpdateMany.mockReset().mockResolvedValue({ count: 1 })
+    mocks.jobUpdateMany.mockReset().mockResolvedValue({ count: 1 })
     mocks.enqueueApplyTask.mockResolvedValue("worker_1");
     mocks.runtimeFeatureEnabled.mockResolvedValue(true);
     mocks.hasEffectiveEntitlement.mockResolvedValue(true);
@@ -89,6 +92,26 @@ describe("auto-apply authorization", () => {
     });
     expect(mocks.transaction).toHaveBeenCalled();
   });
+
+  it("does not reset task or job state when queue failure cleanup races with Worker progress", async () => {
+    mocks.enqueueApplyTask.mockRejectedValueOnce(new Error("queue response was lost"))
+    mocks.txTaskUpdateMany.mockResolvedValueOnce({ count: 1 }).mockResolvedValueOnce({ count: 0 })
+    const { queueAutonomousApplication } = await import("./auto-apply")
+
+    await expect(queueAutonomousApplication(input)).rejects.toThrow("queue response was lost")
+
+    expect(mocks.txTaskUpdateMany).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      where: {
+        id: "application_1",
+        userId: "user_1",
+        jobId: "job_1",
+        status: "filling",
+        checkpoint: "submission_authorized",
+      },
+    }))
+    // The failed cleanup did not own the task row, so it must not reopen the Job for retry.
+    expect(mocks.jobUpdateMany).toHaveBeenCalledTimes(1)
+  })
 
   it("rejects autonomous submission when the current plan lacks auto-apply", async () => {
     mocks.isFeatureAllowed.mockResolvedValueOnce(false);

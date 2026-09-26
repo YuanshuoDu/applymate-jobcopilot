@@ -1,11 +1,11 @@
 import { describe, expect, it, vi } from "vitest"
-import { ensureAutomationTurn, resolveAutomationSession } from "./automation-session"
+import { AutomationTurnOccupiedError, ensureAutomationTurn, resolveAutomationSession } from "./automation-session"
 
-function session(id: string) {
+function session(id: string, options: { status?: string } = {}) {
   return {
     id,
     goal: "Run automation: Weekday Scout",
-    status: "failed",
+    status: options.status ?? "failed",
     source: "automation",
     memorySummary: "Dispatch failed",
     qualityScore: null,
@@ -28,6 +28,18 @@ describe("resolveAutomationSession", () => {
       automationId: "automation_1", userId: "user_1", sessionId: "session_1", name: "Weekday Scout",
     })).resolves.toEqual({ session: existing, created: false })
     expect(db.agentSession.create).not.toHaveBeenCalled()
+  })
+
+  it("reuses an existing runtime-paused session", async () => {
+    const existing = session("session_1", { status: "paused" })
+    const db = {
+      agentSession: { findFirst: vi.fn().mockResolvedValue(existing), create: vi.fn(), deleteMany: vi.fn() },
+      agentAutomation: { updateMany: vi.fn(), findFirst: vi.fn() },
+    }
+
+    await expect(resolveAutomationSession(db, {
+      automationId: "automation_1", userId: "user_1", sessionId: "session_1", name: "Weekday Scout",
+    })).resolves.toEqual({ session: existing, created: false })
   })
 
   it("creates and links one canonical session when none exists", async () => {
@@ -63,6 +75,9 @@ describe("ensureAutomationTurn", () => {
 
     await expect(ensureAutomationTurn(db, { sessionId: "session_1", userId: "user_1", name: "Weekday Scout" }))
       .resolves.toEqual({ turnId: "turn_active", created: false })
+    expect(db.agentTurn.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ sessionId: "session_1", userId: "user_1", source: "automation" }),
+    }))
     expect(db.agentTurn.create).not.toHaveBeenCalled()
   })
 
@@ -76,5 +91,38 @@ describe("ensureAutomationTurn", () => {
 
     await expect(ensureAutomationTurn(db, { sessionId: "session_1", userId: "user_1", name: "Weekday Scout" }))
       .resolves.toEqual({ turnId: "turn_raced", created: false })
+    expect(db.agentTurn.findFirst).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      where: expect.objectContaining({ sessionId: "session_1", userId: "user_1", source: "automation" }),
+    }))
+  })
+
+  it("fails closed when the create race belongs to a non-automation Turn", async () => {
+    const db = {
+      agentTurn: {
+        findFirst: vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce(null),
+        create: vi.fn().mockRejectedValue({ code: "P2002" }),
+      },
+    }
+
+    await expect(ensureAutomationTurn(db, { sessionId: "session_1", userId: "user_1", name: "Weekday Scout" }))
+      .rejects.toMatchObject({
+        name: "AutomationTurnOccupiedError",
+        code: "automation_turn_occupied",
+        sessionId: "session_1",
+      })
+  })
+
+  it("propagates non-unique database errors", async () => {
+    const databaseError = new Error("database unavailable")
+    const db = {
+      agentTurn: {
+        findFirst: vi.fn().mockResolvedValue(null),
+        create: vi.fn().mockRejectedValue(databaseError),
+      },
+    }
+
+    await expect(ensureAutomationTurn(db, { sessionId: "session_1", userId: "user_1", name: "Weekday Scout" }))
+      .rejects.toBe(databaseError)
+    expect(databaseError).not.toBeInstanceOf(AutomationTurnOccupiedError)
   })
 })

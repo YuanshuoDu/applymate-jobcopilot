@@ -28,12 +28,23 @@ export async function DELETE(req: NextRequest) {
   if (!id) return err("Task id is required", 400)
   const task = await db.applicationTask.findFirst({
     where: { id, userId: auth.userId },
-    select: { id: true, sessionId: true, status: true },
+    select: { id: true, sessionId: true, status: true, checkpoint: true },
   })
   if (!task) return err("Application task not found", 404)
-  if (["submitted", "skipped", "cancelled"].includes(task.status)) return err("This application task cannot be cancelled", 409)
-  await db.$transaction(async tx => {
-    await tx.applicationTask.update({ where: { id }, data: { status: "cancelled", checkpoint: "cancelled_by_user", completedAt: new Date() } })
+  if (["submitted", "skipped", "cancelled"].includes(task.status) || ["submission_request_started", "submission_uncertain"].includes(task.checkpoint ?? "")) {
+    return err("This application task cannot be cancelled", 409)
+  }
+  const cancelled = await db.$transaction(async tx => {
+    const updated = await tx.applicationTask.updateMany({
+      where: {
+        id,
+        userId: auth.userId,
+        status: { notIn: ["submitted", "skipped", "cancelled"] },
+        OR: [{ checkpoint: null }, { checkpoint: { notIn: ["submission_request_started", "submission_uncertain"] } }],
+      },
+      data: { status: "cancelled", checkpoint: "cancelled_by_user", completedAt: new Date() },
+    })
+    if (updated.count !== 1) return false
     await tx.applicationTaskEvent.create({ data: { taskId: id, type: "cancelled", actor: "user", body: "User cancelled the application task." } })
     if (task.sessionId) {
       await tx.agentApproval.updateMany({
@@ -47,7 +58,9 @@ export async function DELETE(req: NextRequest) {
         data: { status: "cancelled", decidedAt: new Date() },
       })
     }
+    return true
   })
+  if (!cancelled) return err("This application task changed and cannot be cancelled", 409)
   return ok({ cancelled: true })
 }
 

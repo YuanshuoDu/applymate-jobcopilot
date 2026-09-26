@@ -1,20 +1,67 @@
 import { describe, expect, it, vi } from "vitest"
 import { createRunSessionRecorder, mapPipelineEventToTranscript } from "./run-recorder"
 
-function mockDb() {
-  return {
-    agentSession: {
-      create: vi.fn(async ({ data }) => ({ id: "session_1", ...data })),
-      update: vi.fn(async ({ data }) => ({ id: "session_1", ...data })),
-    },
-    agentTranscriptEvent: {
-      create: vi.fn(async ({ data }) => ({ id: "event_1", ...data })),
-    },
-    subAgentTask: {
-      create: vi.fn(),
-      update: vi.fn(),
-    },
+interface MockDbOptions {
+  sessionExists?: boolean
+  sessionStatus?: string
+  sessionUserId?: string
+  updateCount?: number
+}
+
+function queryText(query: unknown) {
+  return typeof query === "object" && query !== null && "strings" in query
+    ? ((query as { strings: readonly string[] }).strings ?? []).join(" ")
+    : ""
+}
+
+function mockDb(options: MockDbOptions = {}) {
+  let sessionStatus = options.sessionStatus ?? "running"
+  let rollbackCount = 0
+  const agentSession = {
+    create: vi.fn(async ({ data }) => ({ id: "session_1", ...data })),
+    update: vi.fn(async ({ data }) => ({ id: "session_1", ...data })),
+    findFirst: vi.fn(async ({ where }: { where: { id: string; userId: string } }) => {
+      const owned = options.sessionExists !== false && (options.sessionUserId ?? "user_1") === where.userId
+      return owned ? { id: where.id, status: sessionStatus } : null
+    }),
+    updateMany: vi.fn(async () => ({ count: options.updateCount ?? 1 })),
   }
+  const agentTranscriptEvent = {
+    create: vi.fn(async ({ data }) => ({ id: "event_1", ...data })),
+  }
+  const subAgentTask = {
+    create: vi.fn(async () => ({ id: "task_1", role: "scout", status: "queued" })),
+    update: vi.fn(async () => ({ id: "task_1", status: "completed" })),
+  }
+  const tx = {
+    $queryRaw: vi.fn(async (query: unknown) => {
+      if (!queryText(query).includes('FROM "agent_sessions"')) return []
+      const owned = options.sessionExists !== false && (options.sessionUserId ?? "user_1") === "user_1"
+      const open = !["aborted", "archived"].includes(sessionStatus)
+      return owned && open ? [{ id: "session_1" }] : []
+    }),
+    agentSession,
+    agentTranscriptEvent,
+    subAgentTask,
+  }
+  const db = {
+    agentSession,
+    agentTranscriptEvent,
+    subAgentTask,
+    $transaction: vi.fn(async <T>(work: (transaction: typeof tx) => Promise<T>) => {
+      try {
+        return await work(tx)
+      } catch (error) {
+        rollbackCount += 1
+        throw error
+      }
+    }),
+  }
+  const state = {
+    closeSession() { sessionStatus = "aborted" },
+    get rollbackCount() { return rollbackCount },
+  }
+  return Object.assign(db, { db, tx, state })
 }
 
 describe("run session recorder", () => {
@@ -40,6 +87,7 @@ describe("run session recorder", () => {
 
   it("binds pipeline events to an existing chat session instead of creating another session", async () => {
     const db = mockDb()
+    const { tx } = db
     const recorder = await createRunSessionRecorder(db, {
       userId: "user_1",
       goal: "Chat Agent Pipeline Run",
@@ -48,15 +96,155 @@ describe("run session recorder", () => {
 
     expect(recorder.sessionId).toBe("chat_session_1")
     expect(db.agentSession.create).not.toHaveBeenCalled()
-    expect(db.agentSession.update).toHaveBeenCalledWith({
-      where: { id: "chat_session_1" },
+    expect(db.agentSession.updateMany).toHaveBeenCalledWith({
+      where: { id: "chat_session_1", userId: "user_1", status: { notIn: ["aborted", "archived"] } },
       data: { status: "running", completedAt: null },
     })
 
     await recorder.record("agent_plan", { role: "scout", plan: "Find matching jobs" })
+    expect(db.$transaction).toHaveBeenCalled()
+    expect(tx.$queryRaw).toHaveBeenCalledBefore(tx.agentTranscriptEvent.create)
     expect(db.agentTranscriptEvent.create).toHaveBeenCalledWith({
       data: expect.objectContaining({ sessionId: "chat_session_1" }),
     })
+  })
+
+  it("rejects a legacy transcript after the existing session closes", async () => {
+    const { db, tx, state } = mockDb()
+    const recorder = await createRunSessionRecorder(db, {
+      userId: "user_1",
+      goal: "Close before record",
+      sessionId: "chat_session_1",
+    })
+    state.closeSession()
+
+    await expect(recorder.record("agent_plan", { role: "scout", plan: "Late plan" }))
+      .rejects.toThrow("does not exist for this user")
+    expect(tx.agentTranscriptEvent.create).not.toHaveBeenCalled()
+    expect(db.agentSession.update).not.toHaveBeenCalled()
+    expect(state.rollbackCount).toBe(1)
+  })
+
+  it("rejects role_start after close before creating a task or current-task update", async () => {
+    const { db, tx, state } = mockDb()
+    const recorder = await createRunSessionRecorder(db, {
+      userId: "user_1",
+      goal: "Close before role",
+      sessionId: "chat_session_1",
+    })
+    state.closeSession()
+
+    await expect(recorder.record("role_start", { role: "scout", plan: "Late role" }))
+      .rejects.toThrow("does not exist for this user")
+    expect(tx.subAgentTask.create).not.toHaveBeenCalled()
+    expect(db.agentSession.update).not.toHaveBeenCalled()
+    expect(tx.agentTranscriptEvent.create).not.toHaveBeenCalled()
+    expect(state.rollbackCount).toBe(1)
+  })
+
+  it("rejects role_done after close before completing its task", async () => {
+    const { db, tx, state } = mockDb()
+    const recorder = await createRunSessionRecorder(db, {
+      userId: "user_1",
+      goal: "Close before role done",
+      sessionId: "chat_session_1",
+    })
+    await recorder.record("role_start", { role: "scout", plan: "Start role" })
+    tx.subAgentTask.update.mockClear()
+    tx.agentTranscriptEvent.create.mockClear()
+    state.closeSession()
+
+    await expect(recorder.record("role_done", { role: "scout", summary: "Late role" }))
+      .rejects.toThrow("does not exist for this user")
+    expect(tx.subAgentTask.update).not.toHaveBeenCalled()
+    expect(tx.agentTranscriptEvent.create).not.toHaveBeenCalled()
+    expect(state.rollbackCount).toBe(1)
+  })
+
+  it.each(["paused", "waiting_for_user"])("reopens an existing %s session", async (sessionStatus) => {
+    const db = mockDb({ sessionStatus })
+
+    await expect(createRunSessionRecorder(db, {
+      userId: "user_1",
+      goal: "Resume pipeline",
+      sessionId: "chat_session_1",
+    })).resolves.toMatchObject({ sessionId: "chat_session_1" })
+    expect(db.agentSession.updateMany).toHaveBeenCalled()
+  })
+
+  it.each(["aborted", "archived"])("does not reopen a %s session", async (sessionStatus) => {
+    const db = mockDb({ sessionStatus })
+
+    await expect(createRunSessionRecorder(db, {
+      userId: "user_1",
+      goal: "Closed pipeline",
+      sessionId: "chat_session_1",
+    })).rejects.toThrow("does not exist for this user")
+    expect(db.agentSession.updateMany).not.toHaveBeenCalled()
+    expect(db.agentSession.update).not.toHaveBeenCalled()
+    expect(db.agentTranscriptEvent.create).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ["missing", { sessionExists: false }],
+    ["cross-user", { sessionUserId: "another_user" }],
+  ] as const)("rejects a %s existing session before writes", async (_label, options) => {
+    const db = mockDb(options)
+
+    await expect(createRunSessionRecorder(db, {
+      userId: "user_1",
+      goal: "Unauthorized pipeline",
+      sessionId: "chat_session_1",
+    })).rejects.toThrow("does not exist for this user")
+    expect(db.agentSession.updateMany).not.toHaveBeenCalled()
+    expect(db.agentSession.update).not.toHaveBeenCalled()
+    expect(db.agentTranscriptEvent.create).not.toHaveBeenCalled()
+  })
+
+  it("fails closed when the session closes before the running update", async () => {
+    const db = mockDb({ updateCount: 0 })
+
+    await expect(createRunSessionRecorder(db, {
+      userId: "user_1",
+      goal: "Close race",
+      sessionId: "chat_session_1",
+    })).rejects.toThrow("does not exist for this user")
+    expect(db.agentSession.updateMany).toHaveBeenCalled()
+    expect(db.agentTranscriptEvent.create).not.toHaveBeenCalled()
+  })
+
+  it("rejects finalize after close without overwriting the closed session", async () => {
+    const { db, state } = mockDb()
+    const recorder = await createRunSessionRecorder(db, {
+      userId: "user_1",
+      goal: "Close before finalize",
+      sessionId: "chat_session_1",
+    })
+    state.closeSession()
+
+    await expect(recorder.finalize({ status: "completed", report: null }))
+      .rejects.toThrow("does not exist for this user")
+    expect(db.agentSession.update).not.toHaveBeenCalled()
+    expect(state.rollbackCount).toBe(1)
+  })
+
+  it("rejects pause after close before completing a role task or updating the session", async () => {
+    const { db, tx, state } = mockDb()
+    const recorder = await createRunSessionRecorder(db, {
+      userId: "user_1",
+      goal: "Close before pause",
+      sessionId: "chat_session_1",
+    })
+    await recorder.record("role_start", { role: "scout", plan: "Start role" })
+    tx.subAgentTask.update.mockClear()
+    db.agentSession.update.mockClear()
+    state.closeSession()
+
+    await expect(recorder.pause("Late pause", "scout"))
+      .rejects.toThrow("does not exist for this user")
+    expect(tx.subAgentTask.update).not.toHaveBeenCalled()
+    expect(db.agentSession.update).not.toHaveBeenCalled()
+    expect(state.rollbackCount).toBe(1)
   })
 
   it("maps orchestrator and agent events to transcript event types", () => {
@@ -120,6 +308,7 @@ describe("run session recorder", () => {
 
   it("creates and completes SubAgentTask rows from role lifecycle events", async () => {
     const db = mockDb()
+    const { tx } = db
     db.subAgentTask.create.mockResolvedValueOnce({
       id: "task_1",
       role: "scout",
@@ -155,6 +344,8 @@ describe("run session recorder", () => {
         failureReason: null,
       }),
     })
+    expect(tx.$queryRaw).toHaveBeenCalledBefore(tx.subAgentTask.create)
+    expect(tx.$queryRaw).toHaveBeenCalledBefore(tx.subAgentTask.update)
     expect(db.agentTranscriptEvent.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
         sessionId: "session_1",
@@ -195,5 +386,7 @@ describe("run session recorder", () => {
         memorySummary: "Processed 10 jobs · dispatched 0 · confirmed 4 · pending 2 · skipped 4 · failed 0",
       },
     })
+    expect(db.$transaction).toHaveBeenCalled()
+    expect(db.tx.$queryRaw).toHaveBeenCalledBefore(db.agentSession.update)
   })
 })

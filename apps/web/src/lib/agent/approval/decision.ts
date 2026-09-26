@@ -1,5 +1,6 @@
-import type { Prisma } from "@prisma/client"
+import { Prisma } from "@prisma/client"
 
+import { ACTIVE_TURN_STATUSES } from "../control-plane/commands/transaction"
 import { ApprovalStoreError, type ApprovalDecision } from "./types"
 
 type Tx = Prisma.TransactionClient
@@ -26,6 +27,69 @@ export interface ResolvedApprovalRow {
   expiresAt: Date | null
 }
 
+interface ApprovalFreshnessRow {
+  id: string
+  sessionId: string
+  turnId: string
+  userId: string
+}
+
+export async function assertApprovalTurnActiveInTransaction(
+  tx: Tx,
+  scope: { userId: string; sessionId: string; turnId: string },
+  inactiveMessage = "Approval turn is no longer active",
+): Promise<void> {
+  const turn = await tx.agentTurn.findFirst({
+    where: { id: scope.turnId, sessionId: scope.sessionId, userId: scope.userId },
+    select: { id: true, status: true },
+  })
+  if (!turn || !ACTIVE_TURN_STATUSES.some((status) => status === turn.status)) {
+    throw new ApprovalStoreError("approval_scope_mismatch", inactiveMessage)
+  }
+}
+
+/**
+ * Serializes the decision with session-scoped event writes, then checks the
+ * durable request lineage and goal-revision events before the approval mutates.
+ * Event sequence is session-global, so a later goal revision is stale
+ * even when it belongs to a different Turn in the same session.
+ */
+export async function assertApprovalFreshnessInTransaction(tx: Tx, row: ApprovalFreshnessRow): Promise<void> {
+  const session = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+    SELECT "id" FROM "agent_sessions"
+    WHERE "id" = ${row.sessionId}
+      AND "status" NOT IN ('aborted', 'archived')
+    FOR UPDATE
+  `)
+  if (!session[0]) throw new ApprovalStoreError("approval_not_found", "Approval session is no longer available")
+  await assertApprovalTurnActiveInTransaction(tx, row)
+
+  const state = await tx.$queryRaw<Array<{ hasRequest: boolean; hasGoalRevision: boolean }>>(Prisma.sql`
+    WITH request AS (
+      SELECT "sequence" FROM "agent_events"
+      WHERE "sessionId" = ${row.sessionId}
+        AND "turnId" = ${row.turnId}
+        AND "type" = 'approval.requested'
+        AND "correlationId" = ${row.id}
+        AND "idempotencyKey" = ${`approval:${row.id}:requested`}
+      ORDER BY "sequence" ASC
+      LIMIT 1
+    )
+    SELECT
+      EXISTS (SELECT 1 FROM request) AS "hasRequest",
+      EXISTS (
+        SELECT 1 FROM "agent_events" AS revision
+        JOIN request ON true
+        WHERE revision."sessionId" = ${row.sessionId}
+          AND revision."type" = 'goal.revision'
+          AND revision."sequence" > request."sequence"
+      ) AS "hasGoalRevision"
+  `)
+  const current = state[0]
+  if (!current?.hasRequest) throw new ApprovalStoreError("approval_integrity_error", "Approval receipt request event is unavailable")
+  if (current.hasGoalRevision) throw new ApprovalStoreError("approval_revision_mismatch", "Approval receipt is stale after a goal revision")
+}
+
 /** Shared AH2-019 state transition used by both legacy and broker callers. */
 export async function resolvePendingApprovalInTransaction(
   tx: Tx,
@@ -36,13 +100,15 @@ export async function resolvePendingApprovalInTransaction(
     select: { id: true, sessionId: true, taskId: true, userId: true, turnId: true, toolCallId: true, type: true, status: true, scopeHash: true, revision: true, expiresAt: true },
   })
   if (!row) throw new ApprovalStoreError("approval_not_found", "Approval receipt was not found")
-  if (typeof row.turnId !== "string" || row.turnId.length === 0) throw new ApprovalStoreError("approval_integrity_error", "Legacy approval records cannot become scoped receipts")
+  const turnId = row.turnId
+  if (typeof turnId !== "string" || turnId.length === 0) throw new ApprovalStoreError("approval_integrity_error", "Legacy approval records cannot become scoped receipts")
   if (row.status !== "pending") throw new ApprovalStoreError(row.status === "consumed" ? "approval_already_consumed" : "approval_not_approved", "Approval receipt is no longer pending")
   if (row.expiresAt && row.expiresAt <= input.now) throw new ApprovalStoreError("approval_expired", "Approval receipt has expired")
+  await assertApprovalFreshnessInTransaction(tx, { id: row.id, sessionId: row.sessionId, turnId, userId: input.userId })
   const updated = await tx.agentApproval.updateMany({
-    where: { id: input.id, userId: input.userId, sessionId: input.sessionId, status: "pending", turnId: row.turnId, revision: row.revision },
+    where: { id: input.id, userId: input.userId, sessionId: input.sessionId, status: "pending", turnId, revision: row.revision },
     data: { status: input.decision, decidedAt: input.now },
   })
   if (updated.count !== 1) throw new ApprovalStoreError("approval_not_approved", "Approval receipt resolution raced with another decision")
-  return { ...row, turnId: row.turnId as string }
+  return { ...row, turnId }
 }

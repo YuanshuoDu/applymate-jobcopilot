@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   sessionFindFirst: vi.fn(),
   sessionDeleteMany: vi.fn(),
   sessionUpdate: vi.fn(),
+  sessionUpdateMany: vi.fn(),
   transcriptCreate: vi.fn(),
   enqueueAgentRun: vi.fn(),
   executionFindFirst: vi.fn(),
@@ -34,7 +35,7 @@ vi.mock("@/lib/db", () => ({
       updateMany: mocks.automationUpdateMany,
       update: mocks.automationUpdate,
     },
-    agentSession: { create: mocks.sessionCreate, findFirst: mocks.sessionFindFirst, deleteMany: mocks.sessionDeleteMany, update: mocks.sessionUpdate },
+    agentSession: { create: mocks.sessionCreate, findFirst: mocks.sessionFindFirst, deleteMany: mocks.sessionDeleteMany, update: mocks.sessionUpdate, updateMany: mocks.sessionUpdateMany },
     agentExecution: { findFirst: mocks.executionFindFirst, update: mocks.executionUpdate },
     agentTranscriptEvent: { create: mocks.transcriptCreate },
     agentTurn: { findFirst: mocks.turnFindFirst, create: mocks.turnCreate },
@@ -74,6 +75,7 @@ describe("agent automation due scheduler API", () => {
     mocks.sessionCreate.mockResolvedValue({ id: "session_1" })
     mocks.sessionFindFirst.mockResolvedValue(null)
     mocks.sessionDeleteMany.mockResolvedValue({ count: 1 })
+    mocks.sessionUpdateMany.mockResolvedValue({ count: 1 })
     mocks.transcriptCreate.mockResolvedValue({ id: "event_1" })
     mocks.enqueueAgentRun.mockResolvedValue("task_1")
     mocks.automationUpdateMany.mockResolvedValue({ count: 1 })
@@ -100,7 +102,11 @@ describe("agent automation due scheduler API", () => {
       started: [{ automationId: "automation_1", sessionId: "session_1", taskId: "task_1" }],
     })
     expect(mocks.automationFindMany).toHaveBeenCalledWith({
-      where: { enabled: true, nextRunAt: { lte: expect.any(Date) }, user: { accountStatus: "active" } },
+      where: {
+        enabled: true,
+        nextRunAt: { lte: expect.any(Date) },
+        user: { accountStatus: "active" },
+      },
       orderBy: { nextRunAt: "asc" },
       take: 20,
     })
@@ -165,6 +171,26 @@ describe("agent automation due scheduler API", () => {
     }))
   })
 
+  it("dispatches a runtime-paused linked session", async () => {
+    mocks.automationFindMany.mockResolvedValueOnce([{
+      id: "automation_1", userId: "user_1", name: "Weekday Berlin SWE Scout", cron: "0 9 * * 1-5",
+      timezone: "Europe/Berlin", triggerType: "weekdays", targetRoles: ["SWE"], targetLocations: ["Berlin"],
+      minScore: 85, dailyCap: 8, requireApproval: true, autoApply: true, sessionId: "session_1",
+    }])
+    mocks.sessionFindFirst.mockResolvedValue({ id: "session_1", status: "paused" })
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest() as never)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({ started: [{ sessionId: "session_1", taskId: "task_1" }] })
+    expect(mocks.sessionUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: "session_1", userId: "user_1" },
+      data: expect.objectContaining({ status: "running" }),
+    }))
+    expect(mocks.enqueueAgentRun).toHaveBeenCalled()
+  })
+
   it("requires the configured cron secret", async () => {
     vi.stubEnv("AGENT_AUTOMATION_CRON_SECRET", "cron-secret")
     const { POST } = await import("./route")
@@ -223,5 +249,25 @@ describe("agent automation due scheduler API", () => {
     expect(res.status).toBe(200)
     await expect(res.json()).resolves.toMatchObject({ started: [] })
     expect(mocks.sessionCreate).not.toHaveBeenCalled()
+  })
+
+  it("skips a raced non-automation Turn and makes the automation due again", async () => {
+    mocks.turnFindFirst.mockResolvedValueOnce(null).mockResolvedValueOnce(null)
+    mocks.turnCreate.mockRejectedValueOnce({ code: "P2002" })
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest() as never)
+
+    expect(res.status).toBe(200)
+    await expect(res.json()).resolves.toMatchObject({ started: [] })
+    expect(mocks.ensureExecution).not.toHaveBeenCalled()
+    expect(mocks.enqueueAgentRun).not.toHaveBeenCalled()
+    expect(mocks.automationUpdate).toHaveBeenCalledWith({
+      where: { id: "automation_1", userId: "user_1" },
+      data: { nextRunAt: expect.any(Date) },
+    })
+    expect(mocks.turnFindFirst).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      where: expect.objectContaining({ userId: "user_1", sessionId: "session_1", source: "automation" }),
+    }))
   })
 })

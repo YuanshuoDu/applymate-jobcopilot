@@ -39,6 +39,11 @@ export interface InterruptCommand extends CommandIdentity {
   expectedRevision?: number | null
 }
 
+export interface RetryCommand extends CommandIdentity {
+  targetTurnId: string
+  expectedRevision?: number | null
+}
+
 export interface ForkCommand extends CommandIdentity {
   lastTurnId: string
   editContent?: InputContentPart[]

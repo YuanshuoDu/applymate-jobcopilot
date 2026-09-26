@@ -12,6 +12,7 @@ import { queueApplicationFill, queueAutonomousApplication } from "@/lib/auto-app
 import { clientReceipt, consumeLegacyReceipt, issueLegacyReceipt, resolveLegacyApproval, validateLegacyReceipt, type ScopedApprovalRecord } from "@/lib/agent/approval/legacy-receipt"
 import { ensureV2Turn } from "@/lib/agent/session/v2-turn"
 import { requireLegacyPolicy } from "@/lib/agent/policy/legacy"
+import { resumeLegacyApprovalTurnInTransaction } from "@/lib/agent/approval/legacy-approval-fence"
 
 interface RouteCtx {
   params: Promise<{ id: string }>
@@ -203,12 +204,14 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
         toolName: "automation.mutate", domain: "automation", risk: "internal_write", capabilities: ["read", "write"],
         input: { requiresReceipt: true, receiptValidated: true, unknownSensitiveFacts: false },
       })
-      await validateReceiptForApproval(db, automationApproval, action.receiptNonce, auth.userId, id, { automationName: action.draft.name })
-      await resolveLegacyApproval(db, { approval: automationApproval, userId: auth.userId, sessionId: id, decision: "approved" })
-      if (automationApproval.turnId) await db.agentTurn.update({ where: { id: automationApproval.turnId }, data: { status: "in_progress" } })
+      const resolution = await resolveLegacyApproval(db, { approval: automationApproval, userId: auth.userId, sessionId: id, decision: "approved" }, {
+        beforeResolve: () => validateReceiptForApproval(db, automationApproval, action.receiptNonce!, auth.userId, id, { automationName: action.draft.name }),
+      })
+      if (resolution?.disposition === "canonical_wait") return canonicalApprovalResponse(resolution)
+      if (automationApproval.turnId) await resumeLegacyApprovalTurnInTransaction(db, { sessionId: id, userId: auth.userId, turnId: automationApproval.turnId })
       await consumeReceiptForApproval(db, automationApproval, action.receiptNonce, auth.userId, id, { automationName: action.draft.name })
     } catch (error) {
-      return err(error instanceof Error ? error.message : "Automation approval could not be consumed", 409)
+      return legacyApprovalErrorResponse(error, "Automation approval could not be consumed")
     }
     const existing = await db.agentAutomation.findFirst({
       where: { userId: auth.userId, name: action.draft.name },
@@ -241,7 +244,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
   let approval: ScopedApproval | null = null
   if (action.approvalId) {
     approval = await db.agentApproval.findFirst({
-      where: { id: action.approvalId, sessionId: id, userId: auth.userId, status: 'pending' },
+      where: { id: action.approvalId, sessionId: id, userId: auth.userId, status: "pending" },
       select: {
         id: true, type: true, payload: true, turnId: true, toolCallId: true, jobId: true,
         revision: true, expiresAt: true, resourceHash: true, materialHash: true, answersHash: true,
@@ -258,7 +261,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
         toolCallId: approval.toolCallId ?? `approval:${action.approvalId}`,
         toolName: policy.toolName,
         domain: policy.domain,
-        risk: policy.risk,
+        risk: action.decision === "approved" ? policy.risk : "internal_write",
         capabilities: policy.capabilities,
         input: {
           requiresReceipt: action.decision === "approved",
@@ -277,21 +280,23 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
       if (aiAccess === "exhausted") return err("Monthly AI credits exhausted", 429)
     }
     try {
-      if (action.decision === "approved") await validateReceiptForApproval(db, approval, action.receiptNonce!, auth.userId, id)
-      await resolveLegacyApproval(db, {
+      const resolution = await resolveLegacyApproval(db, {
         approval,
         userId: auth.userId,
         sessionId: id,
         decision: action.decision === "approved" ? "approved" : "rejected",
+      }, {
+        beforeResolve: action.decision === "approved"
+          ? () => validateReceiptForApproval(db, approval!, action.receiptNonce!, auth.userId, id)
+          : undefined,
       })
-      if (approval.turnId) {
-        await db.agentTurn.update({ where: { id: approval.turnId }, data: { status: "in_progress" } })
-      }
+      if (resolution?.disposition === "canonical_wait") return canonicalApprovalResponse(resolution)
+      if (approval.turnId) await resumeLegacyApprovalTurnInTransaction(db, { sessionId: id, userId: auth.userId, turnId: approval.turnId })
       if (action.decision === "approved" && approval.type !== "submit_application") {
         await consumeReceiptForApproval(db, approval, action.receiptNonce!, auth.userId, id)
       }
     } catch (error) {
-      return err(error instanceof Error ? error.message : "Approval could not be resolved", 409)
+      return legacyApprovalErrorResponse(error, "Approval could not be resolved")
     }
   }
 
@@ -385,13 +390,20 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
     const payload = applicationPayload(approval.payload)
     if (!payload) return err("Application review is missing its task.", 400)
     if (action.decision !== "approved") {
-      await db.applicationTask.updateMany({
-        where: { id: payload.applicationTaskId, userId: auth.userId, jobId: payload.jobId },
+      const cancelled = await db.applicationTask.updateMany({
+        where: {
+          id: payload.applicationTaskId,
+          userId: auth.userId,
+          jobId: payload.jobId,
+          OR: [{ checkpoint: null }, { checkpoint: { notIn: ["submission_request_started", "submission_uncertain"] } }],
+        },
         data: { status: "cancelled", checkpoint: "review_declined", completedAt: new Date() },
       })
-      await db.applicationTaskEvent.create({
-        data: { taskId: payload.applicationTaskId, type: "review_declined", actor: "user", body: safeEventFields("review_declined", action.body, {}).body },
-      })
+      if (cancelled.count === 1) {
+        await db.applicationTaskEvent.create({
+          data: { taskId: payload.applicationTaskId, type: "review_declined", actor: "user", body: safeEventFields("review_declined", action.body, {}).body },
+        })
+      }
     } else {
       const job = await db.job.findFirst({ where: { id: payload.jobId, userId: auth.userId }, select: { company: true, role: true, url: true } })
       if (!job) return err("Job not found", 404)
@@ -430,7 +442,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
       return ok({ event: serializeEvent(event) })
     } catch (error) {
       const message = error instanceof Error ? error.message : "Could not queue the approved application."
-      await db.applicationTask.updateMany({ where: { id: payload.applicationTaskId, userId: auth.userId }, data: { status: "waiting_for_authorization", checkpoint: "queue_retry", error: message } })
+      await db.applicationTask.updateMany({ where: { id: payload.applicationTaskId, userId: auth.userId, status: "waiting_for_authorization" }, data: { status: "waiting_for_authorization", checkpoint: "queue_retry", error: message } })
       return err(message, 409)
     }
   }
@@ -438,17 +450,25 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
   if (approval?.type === "submit_application") {
     const payload = applicationPayload(approval.payload)
     if (payload) {
-      await db.applicationTask.updateMany({
-        where: { id: payload.applicationTaskId, userId: auth.userId, jobId: payload.jobId, status: "waiting_for_authorization" },
+      const updated = await db.applicationTask.updateMany({
+        where: {
+          id: payload.applicationTaskId,
+          userId: auth.userId,
+          jobId: payload.jobId,
+          status: "waiting_for_authorization",
+          OR: [{ checkpoint: null }, { checkpoint: { notIn: ["submission_request_started", "submission_uncertain"] } }],
+        },
         data: {
           status: action.decision === "cancelled" ? "cancelled" : "waiting_for_user",
           checkpoint: action.decision === "cancelled" ? "submission_cancelled" : "review_requested",
           completedAt: action.decision === "cancelled" ? new Date() : null,
         },
       })
-      await db.applicationTaskEvent.create({
-        data: { taskId: payload.applicationTaskId, type: `submission_${action.decision}`, actor: "user", body: safeEventFields(`submission_${action.decision}`, action.body, {}).body },
-      })
+      if (updated.count === 1) {
+        await db.applicationTaskEvent.create({
+          data: { taskId: payload.applicationTaskId, type: `submission_${action.decision}`, actor: "user", body: safeEventFields(`submission_${action.decision}`, action.body, {}).body },
+        })
+      }
     }
   }
 
@@ -501,6 +521,23 @@ function policyErrorResponse(error: unknown) {
     ? 422
     : 428
   return err(message, status)
+}
+
+function legacyApprovalErrorResponse(error: unknown, fallback: string) {
+  const code = error && typeof error === "object" && "code" in error
+    ? (error as { code?: unknown }).code
+    : undefined
+  if (code === "approval_wait_active") {
+    return Response.json({ error: error instanceof Error ? error.message : fallback, code }, { status: 409 })
+  }
+  return err(error instanceof Error ? error.message : fallback, 409)
+}
+
+function canonicalApprovalResponse(resolution: Extract<Awaited<ReturnType<typeof resolveLegacyApproval>>, { disposition: "canonical_wait" }>) {
+  return ok({
+    disposition: resolution.decision,
+    duplicate: resolution.result.disposition === "duplicate",
+  }, 202)
 }
 
 async function consumeReceiptForApproval(db: Parameters<typeof consumeLegacyReceipt>[0], approval: ScopedApproval, nonce: string, userId: string, sessionId: string, resource?: unknown) {

@@ -5,7 +5,10 @@ import type { InputContentPart, TurnSource } from "@jobcopilot/agent-protocol"
 
 import { appendAgentEventWithOutboxInTransaction } from "../../session/fact-store"
 import { activeTurnChanged, sessionNotFound } from "./errors"
-import type { CommandIdentity, CommandDisposition, InterruptDisposition } from "./types"
+import type { CommandDisposition, CommandIdentity, InterruptDisposition } from "./types"
+
+export { fallbackDisposition, findExistingCommand } from "./existing-command"
+export type { ExistingCommand } from "./existing-command"
 
 export const ACTIVE_TURN_STATUSES = [
   "queued",
@@ -15,6 +18,13 @@ export const ACTIVE_TURN_STATUSES = [
   "waiting_for_user",
 ] as const
 
+/** Durable topic consumed by the Worker's canonical Turn queue. */
+export const TURN_DISPATCH_TOPIC = "agent.turn.dispatch"
+
+export function turnDispatchKey(turnId: string): string {
+  return `turn-dispatch:${turnId}`
+}
+
 export type CommandTransaction = Prisma.TransactionClient
 
 export interface ActiveTurn {
@@ -22,13 +32,6 @@ export interface ActiveTurn {
   source: string
   status: string
   revision: number
-}
-
-export interface ExistingCommand {
-  id: string
-  targetTurnId: string | null
-  delivery: string
-  acceptedSequence: bigint
 }
 
 export interface AcceptedCommandFacts {
@@ -54,6 +57,17 @@ export async function lockOwnedSession(tx: CommandTransaction, sessionId: string
   if (!rows[0]) throw sessionNotFound(sessionId)
 }
 
+/** Locks a live session owned by the command user before accepting writes. */
+export async function lockOpenSession(tx: CommandTransaction, sessionId: string, userId: string): Promise<void> {
+  const rows = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+    SELECT "id" FROM "agent_sessions"
+    WHERE "id" = ${sessionId} AND "userId" = ${userId}
+      AND "status" NOT IN ('aborted', 'archived')
+    FOR UPDATE
+  `)
+  if (!rows[0]) throw sessionNotFound(sessionId)
+}
+
 export async function findActiveTurn(
   tx: CommandTransaction,
   sessionId: string,
@@ -66,25 +80,6 @@ export async function findActiveTurn(
   })
 }
 
-export async function findExistingCommand(
-  tx: CommandTransaction,
-  sessionId: string,
-  clientMessageId: string,
-): Promise<ExistingCommand | null> {
-  return tx.agentInput.findFirst({
-    where: { sessionId, clientMessageId },
-    select: { id: true, targetTurnId: true, delivery: true, acceptedSequence: true },
-  })
-}
-
-export function fallbackDisposition(
-  existing: ExistingCommand,
-  requestedDelivery: "steer" | "follow_up",
-): Exclude<CommandDisposition, "duplicate"> {
-  if (existing.delivery === "steer" || requestedDelivery === "steer") return "steered"
-  return existing.targetTurnId ? "queued_follow_up" : "started"
-}
-
 function actorFor(source: TurnSource): "user" | "system" {
   return source === "user" ? "user" : "system"
 }
@@ -93,8 +88,9 @@ export async function createRootTurn(
   tx: CommandTransaction,
   command: CommandIdentity,
   content: InputContentPart[],
+  explicitGoal?: string,
 ): Promise<ActiveTurn> {
-  const goal = content.filter((part) => part.type === "text").map((part) => part.text).join("\n").trim() || "Process the provided content"
+  const goal = explicitGoal ?? (content.filter((part) => part.type === "text").map((part) => part.text).join("\n").trim() || "Process the provided content")
   const turn = await tx.agentTurn.create({
     data: {
       id: randomUUID(),
@@ -112,6 +108,22 @@ export async function createRootTurn(
       budgetSnapshot: json({}),
     },
     select: { id: true },
+  })
+  // The command transaction owns both the new root and its first dispatch
+  // intent. A committed command can therefore never strand a queued Turn
+  // waiting for a second, non-atomic publisher operation.
+  await tx.agentOutbox.create({
+    data: {
+      id: randomUUID(),
+      topic: TURN_DISPATCH_TOPIC,
+      aggregateId: command.sessionId,
+      idempotencyKey: turnDispatchKey(turn.id),
+      payload: json({
+        turnId: turn.id,
+        sessionId: command.sessionId,
+        ownerId: `web:${turn.id}`,
+      }),
+    },
   })
   return { id: turn.id, source: command.source, status: "queued", revision: 0 }
 }
@@ -210,7 +222,6 @@ export async function acceptInputFacts(
       outboxTopic: "agent.session.event",
     })
   }
-
   return { inputId, turnId: turn.id, sequence: accepted.event.sequence.toString() }
 }
 

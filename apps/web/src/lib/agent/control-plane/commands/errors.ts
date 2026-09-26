@@ -1,12 +1,18 @@
 export type AgentCommandErrorCode =
   | "agent_session_not_found"
   | "active_turn_changed"
+  | "turn_wait_requires_dedicated_action"
+  | "execution_changed"
   | "automation_cannot_steer_user_turn"
   | "invalid_command"
   | "turn_not_active"
   | "fork_boundary_not_found"
   | "fork_boundary_active"
   | "fork_idempotency_conflict"
+  | "retry_target_invalid"
+  | "retry_active_conflict"
+  | "retry_target_changed"
+  | "retry_input_invalid"
 
 export class AgentCommandError extends Error {
   readonly status: 404 | 409 | 422
@@ -45,6 +51,27 @@ export function activeTurnChanged(expectedTurnId: string | null, actualTurnId: s
   )
 }
 
+export function turnWaitRequiresDedicatedAction(
+  turnId: string,
+  status: "waiting_for_user" | "waiting_for_approval",
+): AgentCommandError {
+  return new AgentCommandError(
+    "turn_wait_requires_dedicated_action",
+    "This Turn is waiting for a required user or approval action",
+    409,
+    { turnId, status },
+  )
+}
+
+export function executionChanged(executionId: string): AgentCommandError {
+  return new AgentCommandError(
+    "execution_changed",
+    "The Agent execution changed before cancellation was accepted",
+    409,
+    { executionId },
+  )
+}
+
 export function automationCannotSteerUserTurn(turnId: string): AgentCommandError {
   return new AgentCommandError(
     "automation_cannot_steer_user_turn",
@@ -77,6 +104,22 @@ export function forkBoundaryActive(turnId: string): AgentCommandError {
 
 export function forkIdempotencyConflict(): AgentCommandError {
   return new AgentCommandError("fork_idempotency_conflict", "The idempotency key was already used for a different fork", 409)
+}
+
+export function retryTargetInvalid(turnId: string, status: string | null = null): AgentCommandError {
+  return new AgentCommandError("retry_target_invalid", "The requested Turn is not retryable", 409, { turnId, status })
+}
+
+export function retryActiveConflict(turnId: string): AgentCommandError {
+  return new AgentCommandError("retry_active_conflict", "Another root Turn is already active in this session", 409, { turnId })
+}
+
+export function retryTargetChanged(turnId: string, expectedRevision: number, actualRevision: number): AgentCommandError {
+  return new AgentCommandError("retry_target_changed", "The retry target changed before the command was accepted", 409, { turnId, expectedRevision, actualRevision })
+}
+
+export function retryInputInvalid(turnId: string): AgentCommandError {
+  return new AgentCommandError("retry_input_invalid", "The retry target has no valid persisted user input", 409, { turnId })
 }
 
 export function isUniqueViolation(error: unknown): boolean {
