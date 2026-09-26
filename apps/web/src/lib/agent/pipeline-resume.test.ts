@@ -181,4 +181,16 @@ describe("pipeline checkpoint recovery", () => {
     expect(mocks.jobUpdate).not.toHaveBeenCalled()
     expect(events).toContain("info")
   })
+
+  it("stops before Analyze when Scout orchestration fails", async () => {
+    const { runPipeline } = await import("./pipeline")
+    mocks.scout.mockResolvedValue({ data: { jobs: [job], discovered: 1 }, metrics: { durationMs: 1, count: 1 } })
+    mocks.evaluate.mockRejectedValue(new Error("orchestrator decision invalid"))
+
+    await expect(runPipeline(pipelineContext(vi.fn(), async () => true)))
+      .rejects.toThrow("orchestrator decision invalid")
+
+    expect(mocks.analyze).not.toHaveBeenCalled()
+    expect(mocks.prepare).not.toHaveBeenCalled()
+  })
 })
