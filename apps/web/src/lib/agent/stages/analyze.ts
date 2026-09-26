@@ -32,6 +32,7 @@ export async function runAnalyze(
 
   const scoredJobs: ScoredJob[] = []
   let failed = 0
+  let fenceSkipped = 0
   const pendingUpdates: Array<{ jobId: string; score: number; recommendation?: string }> = []
   const pendingActivities: Array<{ jobId: string; text: string; color: string }> = []
 
@@ -56,7 +57,7 @@ export async function runAnalyze(
   await forEachConcurrent(jobs, 3, async job => {
     const preflight = assessApplicationPreflight(job)
     const hardPreflightIssues = preflight.issues.filter(issue => issue.code !== "missing_description")
-    await db.$transaction(async tx => {
+    const refreshed = await db.$transaction(async tx => {
       const identity = { userId, jobId: job.id }
       await tx.applicationTask.upsert({
         where: { userId_jobId: identity },
@@ -65,7 +66,7 @@ export async function runAnalyze(
         // crossed the durable request-start boundary.
         update: {},
       })
-      await tx.applicationTask.updateMany({
+      return tx.applicationTask.updateMany({
         where: {
           ...identity,
           OR: [{ checkpoint: null }, { checkpoint: { notIn: ["submission_request_started", "submission_uncertain"] } }],
@@ -73,6 +74,10 @@ export async function runAnalyze(
         data: { sessionId: ctx.sessionId ?? undefined, status: "analyzing", checkpoint: "match_analysis", error: null, completedAt: null },
       })
     })
+    if (refreshed.count !== 1) {
+      fenceSkipped++
+      return
+    }
     emit('job_start', { jobId: job.id, company: job.company, role: job.role })
     emit('agent_action', {
       role:   'analyst',
@@ -180,7 +185,7 @@ export async function runAnalyze(
     ])
   }
 
-  if (scoredJobs.length === 0 && jobs.length > 0) {
+  if (scoredJobs.length === 0 && jobs.length > 0 && fenceSkipped === 0) {
     return stageFail('analyze', 'All jobs failed to score')
   }
 

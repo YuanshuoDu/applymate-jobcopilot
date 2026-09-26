@@ -119,15 +119,13 @@ describe('runAnalyze', () => {
     }))
   })
 
-  it('refreshes an existing task only while neither sticky submission checkpoint is present', async () => {
+  it('returns an empty successful result when a sticky checkpoint blocks refresh, without scoring or persisting', async () => {
     mocks.applicationTaskUpdateMany.mockResolvedValueOnce({ count: 0 })
-    mocks.modelChat.mockResolvedValue({
-      text: '{"score":73,"matchedKeywords":["TypeScript"],"missingKeywords":[],"recommendation":"Good fit."}',
-    })
+    const emit = vi.fn()
 
-    const result = await runAnalyze([job], context())
+    const result = await runAnalyze([job], context(emit))
 
-    expect(result).toMatchObject({ ok: true, data: { scoredJobs: [{ score: 73 }] } })
+    expect(result).toMatchObject({ ok: true, data: { failed: 0, scoredJobs: [] } })
     expect(mocks.applicationTaskUpsert).toHaveBeenCalledWith(expect.objectContaining({
       update: {},
     }))
@@ -142,5 +140,31 @@ describe('runAnalyze', () => {
       },
       data: expect.objectContaining({ status: 'analyzing', checkpoint: 'match_analysis' }),
     })
+    expect(mocks.modelChat).not.toHaveBeenCalled()
+    expect(mocks.update).not.toHaveBeenCalled()
+    expect(mocks.activityCreate).not.toHaveBeenCalled()
+    expect(emit).not.toHaveBeenCalled()
+  })
+
+  it('continues analysis for a legacy task with a NULL checkpoint', async () => {
+    mocks.applicationTaskUpdateMany.mockResolvedValueOnce({ count: 1 })
+    mocks.modelChat.mockResolvedValue({
+      text: '{"score":73,"matchedKeywords":["TypeScript"],"missingKeywords":[],"recommendation":"Good fit."}',
+    })
+
+    const result = await runAnalyze([job], context())
+
+    expect(result).toMatchObject({ ok: true, data: { failed: 0, scoredJobs: [{ score: 73 }] } })
+    expect(mocks.applicationTaskUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        OR: [
+          { checkpoint: null },
+          { checkpoint: { notIn: ['submission_request_started', 'submission_uncertain'] } },
+        ],
+      }),
+    }))
+    expect(mocks.modelChat).toHaveBeenCalledOnce()
+    expect(mocks.update).toHaveBeenCalledWith(expect.objectContaining({ data: { score: 73, analysisNote: 'Good fit.' } }))
+    expect(mocks.activityCreate).toHaveBeenCalledOnce()
   })
 })
