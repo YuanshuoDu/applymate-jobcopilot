@@ -148,6 +148,22 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         throw new Error("Canonical application submission requires both receiptId and constraintHash.");
       }
       if (!(await isUserActive(getPool(), userId))) {
+        let startedSubmissionFound = false;
+        if (applicationTaskId && operation === "submit" && receiptId && constraintHash) {
+          try {
+            const taskState = await getPool().query<{ checkpoint: string | null }>(
+              `SELECT "checkpoint" FROM application_tasks WHERE "id" = $1 AND "userId" = $2 AND "jobId" = $3`,
+              [applicationTaskId, userId, jobId],
+            );
+            if (taskState.rows[0]?.checkpoint === "submission_request_started") {
+              startedSubmissionFound = true;
+              await reconcileStartedSubmission({ applicationTaskId, userId, jobId, startedAt });
+            }
+          } catch (error: unknown) {
+            console.warn("[apply-worker] Could not reconcile a started submission for an inactive account:", error instanceof Error ? error.message : String(error));
+          }
+        }
+        if (startedSubmissionFound) return;
         await finishApplicationTask(getPool(), applicationTaskId, "failed", "account_suspended", "Account suspended by an administrator.");
         console.warn(`[apply-worker] Skipping suspended account for job=${jobId}`);
         return;
@@ -162,14 +178,19 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
       if (!await claimApplicationTask(getPool(), applicationTaskId, userId, jobId)) {
         if (operation === "submit" && receiptId && constraintHash) {
           try {
-            const stoppedScope = await loadApprovedTurnScope(getPool(), { receiptId, constraintHash, userId, jobId, applicationTaskId });
-            const taskState = await getPool().query<{ status: string }>(
-              `SELECT "status" FROM application_tasks WHERE "id" = $1 AND "userId" = $2`,
-              [applicationTaskId, userId],
+            const taskState = await getPool().query<{ status: string; checkpoint: string | null }>(
+              `SELECT "status", "checkpoint" FROM application_tasks WHERE "id" = $1 AND "userId" = $2 AND "jobId" = $3`,
+              [applicationTaskId, userId, jobId],
             );
-            if (taskState.rows[0]?.status === "cancelled" && await isApplicationSubmissionStopped(getPool(), stoppedScope)) {
-              await persistStoppedSubmission({ applicationTaskId, userId, jobId, jobTitle: null, jobCompany: "Application", startedAt });
-              resultWritten = true;
+            const state = taskState.rows[0];
+            if (state?.checkpoint === "submission_request_started") {
+              await reconcileStartedSubmission({ applicationTaskId, userId, jobId, startedAt });
+            } else if (state?.status === "cancelled") {
+              const stoppedScope = await loadApprovedTurnScope(getPool(), { receiptId, constraintHash, userId, jobId, applicationTaskId });
+              if (await isApplicationSubmissionStopped(getPool(), stoppedScope)) {
+                await persistStoppedSubmission({ applicationTaskId, userId, jobId, jobTitle: null, jobCompany: "Application", startedAt });
+                resultWritten = true;
+              }
             }
           } catch (error: unknown) {
             console.warn("[apply-worker] Could not reconcile a stopped queued application:", error instanceof Error ? error.message : String(error));
@@ -483,6 +504,34 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                         return;
                       }
                       const fence = await acquireApplicationSubmissionStartFence(getPool(), approvedTurnScope!);
+                      if (fence.state === "uncertain") {
+                        pendingSubmissionFence = fence;
+                        submissionRequestStarted = true;
+                        submissionFenceUnavailable = true;
+                        await route.abort("failed").catch(() => undefined);
+                        await releaseSubmissionFence(false).catch((releaseError: unknown) => {
+                          console.warn(
+                            "[apply-worker] Could not release ambiguous submission start fence:",
+                            releaseError instanceof Error ? releaseError.message : String(releaseError),
+                          );
+                        });
+                        try {
+                          await finishApplicationTask(
+                            getPool(),
+                            applicationTaskId,
+                            "waiting_for_user",
+                            "submission_uncertain",
+                            UNCONFIRMED_SUBMISSION_MESSAGE,
+                          );
+                          applicationTaskFinalized = true;
+                        } catch (stateError: unknown) {
+                          console.warn(
+                            "[apply-worker] Could not persist ambiguous submission start state:",
+                            stateError instanceof Error ? stateError.message : String(stateError),
+                          );
+                        }
+                        return;
+                      }
                       if (fence.state !== "ready") {
                         if (fence.state === "stopped") await interruptStoppedTurn();
                         else submissionTaskInactive = true;
@@ -528,7 +577,24 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                           console.warn("[apply-worker] Could not release submission request fence:", releaseError instanceof Error ? releaseError.message : String(releaseError));
                         });
                       }
-                      await closeActivePage();
+                      if (continuationAttempted && applicationTaskId && !applicationTaskFinalized) {
+                        try {
+                          await finishApplicationTask(
+                            getPool(),
+                            applicationTaskId,
+                            "waiting_for_user",
+                            "submission_uncertain",
+                            UNCONFIRMED_SUBMISSION_MESSAGE,
+                          );
+                          applicationTaskFinalized = true;
+                        } catch (stateError: unknown) {
+                          console.warn(
+                            "[apply-worker] Could not promptly persist uncertain submission state:",
+                            stateError instanceof Error ? stateError.message : String(stateError),
+                          );
+                        }
+                      }
+                      void closeActivePage().catch(() => undefined);
                     } finally {
                       if (pendingSubmissionFence) {
                         await releaseSubmissionFence(continuationAttempted).catch((error: unknown) => {
@@ -888,7 +954,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
         const stoppedTask = turnStopped && !submissionRequestStarted
           ? await getPool().query<{ status: string }>(`SELECT "status" FROM application_tasks WHERE "id" = $1 AND "userId" = $2`, [applicationTaskId, userId])
           : null;
-        if (!applicationTaskFinalized && stoppedTask?.rows[0]?.status !== "cancelled") {
+        if ((!applicationTaskFinalized || isSubmitted && submissionRequestStarted) && stoppedTask?.rows[0]?.status !== "cancelled") {
           await finishApplicationTask(
             getPool(),
             applicationTaskId,
@@ -1066,6 +1132,37 @@ async function loadApprovedTurnScope(
     applicationTaskId: input.applicationTaskId,
     jobId: input.jobId,
   };
+}
+
+async function reconcileStartedSubmission(input: {
+  applicationTaskId: string;
+  userId: string;
+  jobId: string;
+  startedAt: number;
+}): Promise<void> {
+  const submissionClaim = await claimUnattendedSubmission(getPool(), input.userId, input.jobId);
+  if (submissionClaim === "claimed") await releaseUncertainSubmission(getPool(), input.userId, input.jobId);
+  await finishApplicationTask(
+    getPool(),
+    input.applicationTaskId,
+    "waiting_for_user",
+    "submission_uncertain",
+    UNCONFIRMED_SUBMISSION_MESSAGE,
+  );
+  if (submissionClaim === "uncertain" || submissionClaim === "claimed") {
+    await insertApplyResult({
+      userId: input.userId,
+      jobId: input.jobId,
+      status: "manual",
+      mode: "unattended",
+      atsType: null,
+      flowUsed: "application.submit",
+      error: UNCONFIRMED_SUBMISSION_MESSAGE,
+      durationMs: Date.now() - input.startedAt,
+    });
+    createApplyResultNotification({ userId: input.userId, jobId: input.jobId, jobTitle: null, jobCompany: "Application", status: "manual" })
+      .catch((error: Error) => console.warn("[notify] in-app notification failed:", error.message));
+  }
 }
 
 async function persistStoppedSubmission(input: {

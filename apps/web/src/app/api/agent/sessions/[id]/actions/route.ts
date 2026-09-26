@@ -390,13 +390,20 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
     const payload = applicationPayload(approval.payload)
     if (!payload) return err("Application review is missing its task.", 400)
     if (action.decision !== "approved") {
-      await db.applicationTask.updateMany({
-        where: { id: payload.applicationTaskId, userId: auth.userId, jobId: payload.jobId },
+      const cancelled = await db.applicationTask.updateMany({
+        where: {
+          id: payload.applicationTaskId,
+          userId: auth.userId,
+          jobId: payload.jobId,
+          OR: [{ checkpoint: null }, { checkpoint: { notIn: ["submission_request_started", "submission_uncertain"] } }],
+        },
         data: { status: "cancelled", checkpoint: "review_declined", completedAt: new Date() },
       })
-      await db.applicationTaskEvent.create({
-        data: { taskId: payload.applicationTaskId, type: "review_declined", actor: "user", body: safeEventFields("review_declined", action.body, {}).body },
-      })
+      if (cancelled.count === 1) {
+        await db.applicationTaskEvent.create({
+          data: { taskId: payload.applicationTaskId, type: "review_declined", actor: "user", body: safeEventFields("review_declined", action.body, {}).body },
+        })
+      }
     } else {
       const job = await db.job.findFirst({ where: { id: payload.jobId, userId: auth.userId }, select: { company: true, role: true, url: true } })
       if (!job) return err("Job not found", 404)
@@ -443,17 +450,25 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
   if (approval?.type === "submit_application") {
     const payload = applicationPayload(approval.payload)
     if (payload) {
-      await db.applicationTask.updateMany({
-        where: { id: payload.applicationTaskId, userId: auth.userId, jobId: payload.jobId, status: "waiting_for_authorization" },
+      const updated = await db.applicationTask.updateMany({
+        where: {
+          id: payload.applicationTaskId,
+          userId: auth.userId,
+          jobId: payload.jobId,
+          status: "waiting_for_authorization",
+          OR: [{ checkpoint: null }, { checkpoint: { notIn: ["submission_request_started", "submission_uncertain"] } }],
+        },
         data: {
           status: action.decision === "cancelled" ? "cancelled" : "waiting_for_user",
           checkpoint: action.decision === "cancelled" ? "submission_cancelled" : "review_requested",
           completedAt: action.decision === "cancelled" ? new Date() : null,
         },
       })
-      await db.applicationTaskEvent.create({
-        data: { taskId: payload.applicationTaskId, type: `submission_${action.decision}`, actor: "user", body: safeEventFields(`submission_${action.decision}`, action.body, {}).body },
-      })
+      if (updated.count === 1) {
+        await db.applicationTaskEvent.create({
+          data: { taskId: payload.applicationTaskId, type: `submission_${action.decision}`, actor: "user", body: safeEventFields(`submission_${action.decision}`, action.body, {}).body },
+        })
+      }
     }
   }
 

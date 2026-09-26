@@ -56,10 +56,22 @@ export async function runAnalyze(
   await forEachConcurrent(jobs, 3, async job => {
     const preflight = assessApplicationPreflight(job)
     const hardPreflightIssues = preflight.issues.filter(issue => issue.code !== "missing_description")
-    await db.applicationTask?.upsert({
-      where: { userId_jobId: { userId, jobId: job.id } },
-      create: { userId, jobId: job.id, sessionId: ctx.sessionId ?? null, status: "analyzing", checkpoint: "match_analysis" },
-      update: { sessionId: ctx.sessionId ?? undefined, status: "analyzing", checkpoint: "match_analysis", error: null, completedAt: null },
+    await db.$transaction(async tx => {
+      const identity = { userId, jobId: job.id }
+      await tx.applicationTask.upsert({
+        where: { userId_jobId: identity },
+        create: { ...identity, sessionId: ctx.sessionId ?? null, status: "analyzing", checkpoint: "match_analysis" },
+        // Ensure a task exists, then refresh it only if a submission has not
+        // crossed the durable request-start boundary.
+        update: {},
+      })
+      await tx.applicationTask.updateMany({
+        where: {
+          ...identity,
+          OR: [{ checkpoint: null }, { checkpoint: { notIn: ["submission_request_started", "submission_uncertain"] } }],
+        },
+        data: { sessionId: ctx.sessionId ?? undefined, status: "analyzing", checkpoint: "match_analysis", error: null, completedAt: null },
+      })
     })
     emit('job_start', { jobId: job.id, company: job.company, role: job.role })
     emit('agent_action', {

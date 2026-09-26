@@ -5,15 +5,18 @@ import type { PipelineCtx } from '../types'
 const mocks = vi.hoisted(() => ({
   update: vi.fn(),
   activityCreate: vi.fn(),
+  transaction: vi.fn(),
+  applicationTaskUpsert: vi.fn(),
   applicationTaskUpdateMany: vi.fn(),
   modelChat: vi.fn(),
 }))
 
 vi.mock('@/lib/db', () => ({
   db: {
+    $transaction: mocks.transaction,
     job: { update: mocks.update },
     activity: { create: mocks.activityCreate },
-    applicationTask: { upsert: vi.fn(), updateMany: mocks.applicationTaskUpdateMany },
+    applicationTask: { upsert: mocks.applicationTaskUpsert, updateMany: mocks.applicationTaskUpdateMany },
   },
 }))
 
@@ -58,7 +61,11 @@ describe('runAnalyze', () => {
     vi.resetAllMocks()
     mocks.update.mockResolvedValue({})
     mocks.activityCreate.mockResolvedValue({})
+    mocks.applicationTaskUpsert.mockResolvedValue({ id: 'task_1' })
     mocks.applicationTaskUpdateMany.mockResolvedValue({ count: 1 })
+    mocks.transaction.mockImplementation(async (work: (tx: unknown) => Promise<unknown>) => work({
+      applicationTask: { upsert: mocks.applicationTaskUpsert, updateMany: mocks.applicationTaskUpdateMany },
+    }))
   })
 
   it('persists a structured AI score using a completion budget that supports reasoning models', async () => {
@@ -110,5 +117,30 @@ describe('runAnalyze', () => {
     expect(mocks.applicationTaskUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ status: 'skipped', checkpoint: 'job_preflight_failed' }),
     }))
+  })
+
+  it('refreshes an existing task only while neither sticky submission checkpoint is present', async () => {
+    mocks.applicationTaskUpdateMany.mockResolvedValueOnce({ count: 0 })
+    mocks.modelChat.mockResolvedValue({
+      text: '{"score":73,"matchedKeywords":["TypeScript"],"missingKeywords":[],"recommendation":"Good fit."}',
+    })
+
+    const result = await runAnalyze([job], context())
+
+    expect(result).toMatchObject({ ok: true, data: { scoredJobs: [{ score: 73 }] } })
+    expect(mocks.applicationTaskUpsert).toHaveBeenCalledWith(expect.objectContaining({
+      update: {},
+    }))
+    expect(mocks.applicationTaskUpdateMany).toHaveBeenNthCalledWith(1, {
+      where: {
+        userId: 'user_1',
+        jobId: 'job_1',
+        OR: [
+          { checkpoint: null },
+          { checkpoint: { notIn: ['submission_request_started', 'submission_uncertain'] } },
+        ],
+      },
+      data: expect.objectContaining({ status: 'analyzing', checkpoint: 'match_analysis' }),
+    })
   })
 })

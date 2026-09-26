@@ -6,11 +6,12 @@ const mockIncrementBudget = vi.fn().mockResolvedValue(undefined);
 const mockInsertApplyResult = vi.fn().mockResolvedValue(1);
 const mockCompleteFillForReview = vi.fn().mockResolvedValue(undefined);
 const mockFinishApplicationTask = vi.fn().mockResolvedValue(undefined);
+const mockClaimApplicationTask = vi.fn().mockResolvedValue(true);
 const mockHarnessRun = vi.fn();
 const mockWithCloakContext = vi.fn();
 const mockIsUserActive = vi.fn().mockResolvedValue(true);
 const mockSubmitContext = vi.fn();
-const mockMarkSubmissionRequestStarted = vi.fn().mockResolvedValue(true);
+const mockMarkSubmissionRequestStarted = vi.fn().mockResolvedValue("started");
 const mockProviderSubmitClick = vi.fn();
 const mockPageRouting = vi.hoisted(() => ({
   matcher: undefined as ((url: { href: string }) => boolean) | undefined,
@@ -117,7 +118,7 @@ vi.mock("../cloak/captcha.js", () => ({
 }));
 
 vi.mock("../db/application-task-state.js", () => ({
-  claimApplicationTask: vi.fn().mockResolvedValue(true),
+  claimApplicationTask: mockClaimApplicationTask,
   applicationTaskStillActive: vi.fn().mockResolvedValue(true),
   completeFillForReview: mockCompleteFillForReview,
   finishApplicationTask: mockFinishApplicationTask,
@@ -246,9 +247,13 @@ describe("apply-queue (unit — mocked)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockIsUserActive.mockResolvedValue(true);
+    mockClaimApplicationTask.mockReset().mockResolvedValue(true);
     mockMarkSubmissionRequestStarted.mockReset().mockImplementation(async () =>
       !mockTurnState.interrupted && !["interrupted", "cancelled", "completed", "failed"].includes(mockTurnState.turnStatus)
+        ? "started"
+        : "inactive"
     );
+    mockFinishApplicationTask.mockReset().mockResolvedValue(undefined);
     mockProviderSubmitClick.mockReset();
     mockPageRouting.matcher = undefined;
     mockPageRouting.handler = undefined;
@@ -815,6 +820,210 @@ describe("apply-queue (unit — mocked)", () => {
       status: "manual",
       error: expect.stringContaining("started"),
     }));
+  });
+
+  it("preserves the committed start marker when the lock-holder COMMIT fails after continuation", async () => {
+    const task = { status: "filling", checkpoint: "browser_active" };
+    const order: string[] = [];
+    const baseQuery = mockTurnClient.query.getMockImplementation();
+    let pendingRoute: Promise<MockPageRouteResult | null> | null = null;
+    mockFinishApplicationTask.mockImplementation(async (_pool: unknown, _taskId: string, status: string, checkpoint: string) => {
+      if (checkpoint === "submission_uncertain") {
+        if (task.checkpoint !== "submission_uncertain") {
+          task.status = "waiting_for_user";
+          task.checkpoint = checkpoint;
+          order.push("worker-uncertain");
+        }
+      } else if (task.checkpoint !== "submission_uncertain" || status === "submitted") {
+        task.status = status;
+        task.checkpoint = checkpoint;
+      }
+    });
+    mockMarkSubmissionRequestStarted.mockImplementationOnce(async () => {
+      task.checkpoint = "submission_request_started";
+      order.push("marker-commit");
+      return "started";
+    });
+    mockTurnClient.query.mockImplementation(async (sql: string) => {
+      if (sql === "COMMIT" && order.includes("route.continue")) {
+        expect(order).toEqual(["marker-commit", "route.continue"]);
+        order.push("lock-holder-commit");
+        expect(task.checkpoint).toBe("submission_request_started");
+        throw new Error("injected lock-holder COMMIT failure after request continuation");
+      }
+      if (sql === "ROLLBACK") {
+        // Stop obtains the Session/Turn locks only after the failed lock-holder
+        // transaction rolls back; it must then observe the committed marker.
+        expect(task.checkpoint).toBe("submission_request_started");
+        order.push("stop-preserved-started");
+      }
+      return baseQuery!(sql);
+    });
+    mockProviderSubmitClick.mockImplementationOnce(() => order.push("route.continue"));
+    mockPage.close.mockImplementationOnce(async () => { order.push("page-close"); });
+    submitToolMocks.create.mockImplementation(({ submit }: { submit: (input: unknown) => Promise<unknown> }) => ({
+      execute: async () => submit({ target: {}, artifact: {}, context: {}, beforeSubmit: async () => true }),
+    }));
+    mockHarnessRun.mockImplementation(async (_page: unknown, taskContext: { beforeSubmit?: (intent?: { url: string; method: string }) => Promise<boolean> }) => {
+      const intent = { url: "https://example.com/jobs/123/apply", method: "POST" };
+      if (!await taskContext.beforeSubmit?.(intent)) {
+        return { status: "submission_blocked", error: "Submission guard denied.", durationMs: 123 };
+      }
+      pendingRoute = dispatchPageRequest(intent.url, intent.method);
+      await vi.waitFor(() => expect(task.checkpoint).toBe("submission_uncertain"));
+      const duplicate = await dispatchPageRequest(intent.url, intent.method);
+      expect(duplicate?.abort).toHaveBeenCalledOnce();
+      return { status: "manual", error: "Submission outcome is uncertain.", durationMs: 123 };
+    });
+
+    try {
+      await import("./apply-queue.js");
+      await mockProcessor({
+        data: {
+          applicationTaskId: "application-task-1", operation: "submit", jobId: "job-1", userId: "user-1",
+          applyUrl: "https://example.com/jobs/123/apply", personaId: "persona-1", resumePath: "/resume.pdf", dryRun: false,
+          receiptId: "approval-1", constraintHash: "c".repeat(64),
+        },
+      });
+      if (pendingRoute) await pendingRoute;
+
+      expect(order).toEqual([
+        "marker-commit",
+        "route.continue",
+        "lock-holder-commit",
+        "stop-preserved-started",
+        "worker-uncertain",
+        "page-close",
+      ]);
+      expect(task).toEqual({ status: "waiting_for_user", checkpoint: "submission_uncertain" });
+      expect(mockFinishApplicationTask).toHaveBeenCalledWith(
+        expect.anything(), "application-task-1", "waiting_for_user", "submission_uncertain", expect.any(String),
+      );
+      expect(mockInsertApplyResult).toHaveBeenCalledTimes(1);
+
+      await mockFinishApplicationTask(undefined, "application-task-1", "failed", "execution_failed", "Late cleanup callback");
+      expect(task).toEqual({ status: "waiting_for_user", checkpoint: "submission_uncertain" });
+    } finally {
+      if (baseQuery) mockTurnClient.query.mockImplementation(baseQuery);
+    }
+  });
+
+  it("aborts without continuing when the durable request-start COMMIT is ambiguous", async () => {
+    const order: string[] = [];
+    const baseQuery = mockTurnClient.query.getMockImplementation();
+    mockTurnClient.query.mockImplementation(async (sql: string) => {
+      if (sql === "ROLLBACK") order.push("fence-release");
+      return baseQuery!(sql);
+    });
+    configureMockBrowserSubmitTool();
+    mockMarkSubmissionRequestStarted.mockResolvedValueOnce("uncertain");
+    mockFinishApplicationTask.mockImplementationOnce(async () => { order.push("finish-uncertain"); });
+    mockHarnessRun.mockImplementation(async (_page: unknown, task: { beforeSubmit?: (intent?: { url: string; method: string }) => Promise<boolean> }) => {
+      const intent = { url: "https://example.com/jobs/123/apply", method: "POST" };
+      if (!await task.beforeSubmit?.(intent)) {
+        return { status: "submission_blocked", error: "Submission guard denied.", durationMs: 123 };
+      }
+      const route = await dispatchPageRequest(intent.url, intent.method);
+      expect(route?.abort).toHaveBeenCalledOnce();
+      expect(route?.continue).not.toHaveBeenCalled();
+      return { status: "failed", error: "The request start could not be durably confirmed.", durationMs: 123 };
+    });
+
+    try {
+      await import("./apply-queue.js");
+      await mockProcessor({
+        data: {
+          applicationTaskId: "application-task-1", operation: "submit", jobId: "job-1", userId: "user-1",
+          applyUrl: "https://example.com/jobs/123/apply", personaId: "persona-1", resumePath: "/resume.pdf", dryRun: false,
+          receiptId: "approval-1", constraintHash: "c".repeat(64),
+        },
+      });
+
+      expect(mockMarkSubmissionRequestStarted).toHaveBeenCalledOnce();
+      expect(mockProviderSubmitClick).not.toHaveBeenCalled();
+      expect(mockFinishApplicationTask).toHaveBeenCalledWith(
+        expect.anything(), "application-task-1", "waiting_for_user", "submission_uncertain", expect.any(String),
+      );
+      expect(mockInsertApplyResult).toHaveBeenCalledWith(expect.objectContaining({ status: "manual" }));
+      expect(order).toEqual(["fence-release", "finish-uncertain"]);
+      const rollbackIndex = mockTurnClient.query.mock.calls.findIndex(([sql]) => sql === "ROLLBACK");
+      const rollbackOrder = mockTurnClient.query.mock.invocationCallOrder[rollbackIndex];
+      const finishOrder = mockFinishApplicationTask.mock.invocationCallOrder[0];
+      expect(mockTurnClient.release.mock.invocationCallOrder.some(callOrder => callOrder > rollbackOrder && callOrder < finishOrder)).toBe(true);
+    } finally {
+      if (baseQuery) mockTurnClient.query.mockImplementation(baseQuery);
+    }
+  });
+
+  it("recovers a durable started marker on redelivery without reopening the browser", async () => {
+    const task = { status: "filling", checkpoint: "submission_request_started" };
+    mockClaimApplicationTask.mockResolvedValue(false);
+    mockPoolQuery
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ status: task.status, checkpoint: task.checkpoint }] })
+      .mockResolvedValueOnce({ rowCount: 0, rows: [] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ workflowState: "submitting" }] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] });
+    mockFinishApplicationTask.mockImplementation(async (_pool: unknown, _taskId: string, status: string, checkpoint: string) => {
+      task.status = status;
+      task.checkpoint = checkpoint;
+    });
+
+    await import("./apply-queue.js");
+    const payload = {
+      applicationTaskId: "application-task-1", operation: "submit", jobId: "job-1", userId: "user-1",
+      applyUrl: "https://example.com/jobs/123/apply", personaId: "persona-1", resumePath: "/resume.pdf", dryRun: false,
+      receiptId: "approval-1", constraintHash: "c".repeat(64),
+    };
+    await mockProcessor({ data: payload });
+
+    expect(task).toEqual({ status: "waiting_for_user", checkpoint: "submission_uncertain" });
+    expect(mockWithCloakContext).not.toHaveBeenCalled();
+    expect(mockProviderSubmitClick).not.toHaveBeenCalled();
+    expect(mockMarkSubmissionRequestStarted).not.toHaveBeenCalled();
+    expect(mockInsertApplyResult).toHaveBeenCalledOnce();
+    expect(mockPoolQuery).toHaveBeenCalledWith(expect.stringContaining('"workflowState" = \'ready_to_apply\''), expect.any(Array));
+
+    mockPoolQuery.mockResolvedValueOnce({ rowCount: 1, rows: [{ status: task.status, checkpoint: task.checkpoint }] });
+    await mockProcessor({ data: payload });
+
+    expect(task).toEqual({ status: "waiting_for_user", checkpoint: "submission_uncertain" });
+    expect(mockWithCloakContext).not.toHaveBeenCalled();
+    expect(mockProviderSubmitClick).not.toHaveBeenCalled();
+    expect(mockInsertApplyResult).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a durable started marker uncertain when the account is suspended before redelivery", async () => {
+    const task = { status: "filling", checkpoint: "submission_request_started" };
+    mockIsUserActive.mockResolvedValue(false);
+    mockPoolQuery
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ checkpoint: task.checkpoint }] })
+      .mockResolvedValueOnce({ rowCount: 0, rows: [] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ workflowState: "submitting" }] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] });
+    mockFinishApplicationTask.mockImplementation(async (_pool: unknown, _taskId: string, status: string, checkpoint: string) => {
+      task.status = status;
+      task.checkpoint = checkpoint;
+    });
+
+    await import("./apply-queue.js");
+    await mockProcessor({
+      data: {
+        applicationTaskId: "application-task-1", operation: "submit", jobId: "job-1", userId: "user-1",
+        applyUrl: "https://example.com/jobs/123/apply", personaId: "persona-1", resumePath: "/resume.pdf", dryRun: false,
+        receiptId: "approval-1", constraintHash: "c".repeat(64),
+      },
+    });
+
+    expect(task).toEqual({ status: "waiting_for_user", checkpoint: "submission_uncertain" });
+    expect(mockFinishApplicationTask).toHaveBeenCalledWith(
+      expect.anything(), "application-task-1", "waiting_for_user", "submission_uncertain", expect.any(String),
+    );
+    expect(mockFinishApplicationTask).not.toHaveBeenCalledWith(
+      expect.anything(), "application-task-1", "failed", "account_suspended", expect.any(String),
+    );
+    expect(mockWithCloakContext).not.toHaveBeenCalled();
+    expect(mockProviderSubmitClick).not.toHaveBeenCalled();
+    expect(mockInsertApplyResult).toHaveBeenCalledWith(expect.objectContaining({ status: "manual" }));
   });
 
   it("releases the start fence and finishes uncertain when route continuation never settles", async () => {

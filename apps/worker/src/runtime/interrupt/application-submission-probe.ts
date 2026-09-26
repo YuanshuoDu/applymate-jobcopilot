@@ -1,4 +1,4 @@
-import type { Pool } from "pg"
+import type { Pool, PoolClient } from "pg"
 import { markSubmissionRequestStarted, type ApplicationSubmissionStartScope } from "../../db/application-task-state.js"
 
 export const APPLICATION_SUBMISSION_STOP_POLL_MS = 250
@@ -9,60 +9,116 @@ export type ApplicationSubmissionStopProbe = {
 }
 
 export type ApplicationSubmissionStartFence = {
-  state: "ready" | "stopped" | "inactive"
+  state: "ready" | "stopped" | "inactive" | "uncertain"
   release(commit: boolean): Promise<void>
 }
 
-/** Hold Session -> Turn locks until the browser request boundary is observed. */
+let submissionFenceQueue: Promise<void> = Promise.resolve()
+
+async function acquireSubmissionFencePermit(): Promise<() => void> {
+  let releaseCurrent!: () => void
+  const current = new Promise<void>((resolve) => { releaseCurrent = resolve })
+  const previous = submissionFenceQueue
+  submissionFenceQueue = previous.then(() => current)
+  await previous
+
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    releaseCurrent()
+  }
+}
+
+/** Hold Session -> Turn locks through the durable marker and browser request boundary. */
 export async function acquireApplicationSubmissionStartFence(
   pool: Pool,
   scope: ApplicationSubmissionStartScope,
 ): Promise<ApplicationSubmissionStartFence> {
-  const client = await pool.connect()
+  const releasePermit = await acquireSubmissionFencePermit()
+  let permitReleased = false
+  const releasePermitOnce = (): void => {
+    if (permitReleased) return
+    permitReleased = true
+    releasePermit()
+  }
+  let fenceClient: PoolClient | undefined
+  let markerClient: PoolClient | undefined
   let open = false
   let released = false
-  const release = async (commit: boolean): Promise<void> => {
-    if (released) return
-    released = true
-    try {
-      await client.query(commit ? "COMMIT" : "ROLLBACK")
-      open = false
-    } catch (error: unknown) {
-      if (open) await client.query("ROLLBACK").catch(() => undefined)
-      open = false
-      throw error
-    } finally {
-      client.release()
-    }
-  }
-  const decline = async (state: "stopped" | "inactive"): Promise<ApplicationSubmissionStartFence> => {
-    await release(false)
-    return { state, release: async () => undefined }
+  const releaseReservedMarkerClient = (): void => {
+    const reserved = markerClient
+    markerClient = undefined
+    reserved?.release()
   }
   try {
-    await client.query("BEGIN")
+    fenceClient = await pool.connect()
+    markerClient = await pool.connect()
+    const lockClient = fenceClient
+    const release = async (commit: boolean): Promise<void> => {
+      if (released) return
+      released = true
+      try {
+        await lockClient.query(commit ? "COMMIT" : "ROLLBACK")
+        open = false
+      } catch (error: unknown) {
+        if (open) await lockClient.query("ROLLBACK").catch(() => undefined)
+        open = false
+        throw error
+      } finally {
+        try {
+          lockClient.release()
+        } finally {
+          try {
+            releaseReservedMarkerClient()
+          } finally {
+            releasePermitOnce()
+          }
+        }
+      }
+    }
+    const decline = async (state: "stopped" | "inactive"): Promise<ApplicationSubmissionStartFence> => {
+      await release(false)
+      return { state, release: async () => undefined }
+    }
+
+    await lockClient.query("BEGIN")
     open = true
-    await client.query("SELECT set_config($1, $2, true)", ["app.user_id", scope.userId])
-    const session = await client.query<{ status: string }>(
+    await lockClient.query("SELECT set_config($1, $2, true)", ["app.user_id", scope.userId])
+    const session = await lockClient.query<{ status: string }>(
       `SELECT "status" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 FOR UPDATE`,
       [scope.sessionId, scope.userId],
     )
-    const turn = await client.query<{ status: string }>(
+    const turn = await lockClient.query<{ status: string }>(
       `SELECT "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 FOR UPDATE`,
       [scope.turnId, scope.sessionId, scope.userId],
     )
-    const interrupted = await client.query<{ stopped: boolean }>(
+    const interrupted = await lockClient.query<{ stopped: boolean }>(
       `SELECT EXISTS (SELECT 1 FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'turn.interrupted') AS "stopped"`,
       [scope.sessionId, scope.turnId],
     )
     if (isStopped(session.rows[0]?.status, turn.rows[0]?.status, interrupted.rows[0]?.stopped)) return decline("stopped")
-    if (!await markSubmissionRequestStarted(client, scope)) return decline("inactive")
-    return { state: "ready", release }
+    const markerConnection = markerClient
+    if (!markerConnection) throw new Error("Submission marker connection was not reserved")
+    markerClient = undefined
+    const marker = await markSubmissionRequestStarted(markerConnection, scope)
+    if (marker === "inactive") return decline("inactive")
+    return { state: marker === "uncertain" ? "uncertain" : "ready", release }
   } catch (error: unknown) {
-    if (open) await client.query("ROLLBACK").catch(() => undefined)
-    if (!released) {
-      released = true
-      client.release()
+    try {
+      if (fenceClient) {
+        if (open) await fenceClient.query("ROLLBACK").catch(() => undefined)
+        if (!released) {
+          released = true
+          fenceClient.release()
+        }
+      }
+    } finally {
+      try {
+        releaseReservedMarkerClient()
+      } finally {
+        releasePermitOnce()
+      }
     }
     throw error
   }

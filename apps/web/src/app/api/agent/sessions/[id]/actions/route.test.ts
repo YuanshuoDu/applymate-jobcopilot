@@ -26,6 +26,7 @@ const mocks = vi.hoisted(() => ({
   jobFindFirst: vi.fn(),
   jobUpdate: vi.fn(),
   applicationTaskUpdateMany: vi.fn(),
+  applicationTaskEventCreate: vi.fn(),
   queueApplicationFill: vi.fn(),
   queueAutonomousApplication: vi.fn(),
   tailorResumeForAgent: vi.fn(),
@@ -57,6 +58,7 @@ vi.mock("@/lib/db", () => ({
     resume: { findFirst: mocks.resumeFindFirst },
     job: { findFirst: mocks.jobFindFirst, update: mocks.jobUpdate },
     applicationTask: { updateMany: mocks.applicationTaskUpdateMany },
+    applicationTaskEvent: { create: mocks.applicationTaskEventCreate },
   },
 }))
 
@@ -152,6 +154,7 @@ describe("agent session actions API", () => {
     mocks.jobFindFirst.mockReset()
     mocks.jobUpdate.mockReset()
     mocks.applicationTaskUpdateMany.mockReset()
+    mocks.applicationTaskEventCreate.mockReset()
     mocks.queueApplicationFill.mockReset()
     mocks.queueAutonomousApplication.mockReset()
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
@@ -165,6 +168,7 @@ describe("agent session actions API", () => {
       applicationTaskStatus = args.data.status
       return { count: 1 }
     })
+    mocks.applicationTaskEventCreate.mockResolvedValue({})
     mocks.agentTurnUpdateMany.mockImplementation(async (args: { where: { status: { in: string[] } }; data: { status: string } }) => {
       if (!args.where.status.in.includes(turnStatus)) return { count: 0 }
       turnStatus = args.data.status
@@ -612,6 +616,53 @@ describe("agent session actions API", () => {
     expect(res.status).toBe(409)
     await expect(res.json()).resolves.toEqual({ error: "Approval is no longer pending" })
     expect(mocks.transcriptCreate).not.toHaveBeenCalled()
+  })
+
+  it("keeps a started or uncertain review task when a stale decline loses its conditional update", async () => {
+    mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({
+      type: "review_application",
+      payload: { applicationTaskId: "task_1", jobId: "job_1" },
+    }))
+    mocks.applicationTaskUpdateMany.mockResolvedValueOnce({ count: 0 })
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest({
+      type: "approval_response", approvalId: "approval_1", decision: "rejected", body: "Declined review",
+    }) as never, ctx)
+
+    expect(res.status).toBe(200)
+    expect(mocks.applicationTaskUpdateMany).toHaveBeenCalledWith({
+      where: {
+        id: "task_1",
+        userId: "user_1",
+        jobId: "job_1",
+        OR: [
+          { checkpoint: null },
+          { checkpoint: { notIn: ["submission_request_started", "submission_uncertain"] } },
+        ],
+      },
+      data: { status: "cancelled", checkpoint: "review_declined", completedAt: expect.any(Date) },
+    })
+    expect(mocks.applicationTaskEventCreate).not.toHaveBeenCalled()
+  })
+
+  it.each(["cancelled", "rejected"] as const)("does not overwrite a sticky submission checkpoint on a late %s response", async decision => {
+    mocks.approvalFindFirst.mockResolvedValueOnce(approvalRecord({
+      type: "submit_application",
+      payload: { applicationTaskId: "task_1", jobId: "job_1" },
+    }))
+    mocks.applicationTaskUpdateMany.mockResolvedValueOnce({ count: 0 })
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest({ type: "approval_response", approvalId: "approval_1", decision }) as never, ctx)
+
+    expect(res.status).toBe(200)
+    const update = mocks.applicationTaskUpdateMany.mock.calls[0]?.[0]
+    expect(update.where.OR).toEqual([
+      { checkpoint: null },
+      { checkpoint: { notIn: ["submission_request_started", "submission_uncertain"] } },
+    ])
+    expect(mocks.applicationTaskEventCreate).not.toHaveBeenCalled()
   })
 
   it('turns approved Writer tailoring into a resume artifact and a separate Reviewer gate', async () => {

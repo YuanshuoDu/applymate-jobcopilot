@@ -40,17 +40,18 @@ export async function POST(request: NextRequest) {
     const users = await db.user.findMany({ where: { id: { in: body.ids } }, select: { id: true, accountStatus: true } })
     const targetStatus = body.action === 'suspend' ? 'suspended' : 'active'
     const eligible = users.filter(user => user.accountStatus !== targetStatus)
-    const result = await runAdminMutation({
+    const result = await runAdminMutation<{ affected: number }>({
       actorUserId: actor.userId,
       action: `users.bulk_${body.action}`,
       idempotencyKey: key,
       targetId: `bulk:${body.resource}:${body.action}`,
-      audit: { requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'user', reason: body.reason, outcome: 'success', before: { ids: users.map(user => user.id), statuses: users.map(user => user.accountStatus) }, after: { status: targetStatus, affected: eligible.length } },
+      audit: value => ({ requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'user', reason: body.reason, outcome: 'success', before: { ids: users.map(user => user.id), statuses: users.map(user => user.accountStatus) }, after: { status: targetStatus, affected: value.affected, skipped: body.ids.length - value.affected } }),
       mutate: async tx => {
         if (eligible.length === 0) return { affected: 0 }
         const userIds = eligible.map(user => user.id)
         const suspended = body.action === 'suspend'
-        const updated = await tx.user.updateMany({ where: { id: { in: userIds } }, data: suspended ? { accountStatus: 'suspended', suspendedAt: new Date(), suspendedById: actor.userId, suspensionReason: body.reason, authVersion: { increment: 1 } } : { accountStatus: 'active', suspendedAt: null, suspendedById: null, suspensionReason: null, authVersion: { increment: 1 } } })
+        const updated = await tx.user.updateMany({ where: { id: { in: userIds }, OR: eligible.map(user => ({ id: user.id, accountStatus: user.accountStatus })) }, data: suspended ? { accountStatus: 'suspended', suspendedAt: new Date(), suspendedById: actor.userId, suspensionReason: body.reason, authVersion: { increment: 1 } } : { accountStatus: 'active', suspendedAt: null, suspendedById: null, suspensionReason: null, authVersion: { increment: 1 } } })
+        if (updated.count === 0) return { affected: 0 }
         await tx.adminMembership.updateMany({
           where: { userId: { in: userIds } },
           data: { sessionVersion: { increment: 1 }, ...(suspended ? { status: 'suspended', revokedAt: new Date() } : {}) },
@@ -58,36 +59,48 @@ export async function POST(request: NextRequest) {
         if (suspended) {
           await tx.agentAutomation.updateMany({ where: { userId: { in: userIds } }, data: { enabled: false } })
           await tx.applicationTask.updateMany({
-            where: { userId: { in: userIds }, status: { in: ['filling', 'waiting_for_authorization'] } },
+            where: {
+              userId: { in: userIds },
+              status: { in: ['filling', 'waiting_for_authorization'] },
+              OR: [{ checkpoint: null }, { checkpoint: { notIn: ['submission_request_started', 'submission_uncertain'] } }],
+            },
             data: { status: 'waiting_for_user', checkpoint: 'account_suspended', error: 'Account suspended; external processing was stopped.' },
           })
         }
         return { affected: updated.count }
       },
     })
-    return NextResponse.json(result.duplicate ? { duplicate: true } : { resource: body.resource, action: body.action, affected: result.value.affected }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
+    return NextResponse.json(result.duplicate ? { duplicate: true } : { resource: body.resource, action: body.action, affected: result.value.affected, skipped: body.ids.length - result.value.affected }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
   }
 
-  const tasks = await db.applicationTask.findMany({ where: { id: { in: body.ids } }, select: { id: true, userId: true, jobId: true, status: true } })
-  const eligible = tasks.filter(task => body.action === 'cancel' ? !['submitted', 'skipped', 'cancelled'].includes(task.status) : !['submitted', 'cancelled'].includes(task.status))
+  const tasks = await db.applicationTask.findMany({ where: { id: { in: body.ids } }, select: { id: true, userId: true, jobId: true, status: true, checkpoint: true } })
+  const eligible = tasks.filter(task => !['submission_request_started', 'submission_uncertain'].includes(task.checkpoint ?? '') && (body.action === 'cancel' ? !['submitted', 'skipped', 'cancelled'].includes(task.status) : !['submitted', 'cancelled'].includes(task.status)))
   const next = body.action === 'cancel' ? { status: 'cancelled', checkpoint: 'cancelled_by_admin', error: body.reason } : { status: 'waiting_for_user', checkpoint: 'admin_review', error: 'Manual review requested by an administrator' }
-  const result = await runAdminMutation({
+  const result = await runAdminMutation<{ affected: number; affectedIds: string[]; skippedIds: string[] }>({
     actorUserId: actor.userId,
     action: `applications.bulk_${body.action}`,
     idempotencyKey: key,
     targetId: `bulk:${body.resource}:${body.action}`,
-    audit: { requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'application', reason: body.reason, outcome: 'success', before: { taskIds: eligible.map(task => task.id) }, after: { status: next.status, affected: eligible.length } },
+    audit: value => ({ requestId: actor.requestId, actorRoleKey: actor.roleKey, targetType: 'application', reason: body.reason, outcome: 'success', before: { requestedTaskIds: body.ids }, after: { status: next.status, affected: value.affected, skipped: value.skippedIds.length, affectedTaskIds: value.affectedIds, skippedTaskIds: value.skippedIds } }),
     mutate: async tx => {
-      let affected = 0
+      const affectedIds: string[] = []
       for (const task of eligible) {
-        const updated = await tx.applicationTask.updateMany({ where: { id: task.id, status: task.status }, data: { ...next, completedAt: body.action === 'cancel' ? new Date() : null } })
+        const updated = await tx.applicationTask.updateMany({
+          where: {
+            id: task.id,
+            status: task.status,
+            OR: [{ checkpoint: null }, { checkpoint: { notIn: ['submission_request_started', 'submission_uncertain'] } }],
+          },
+          data: { ...next, completedAt: body.action === 'cancel' ? new Date() : null },
+        })
         if (updated.count === 1) {
-          affected += 1
+          affectedIds.push(task.id)
           await tx.applicationTaskEvent.create({ data: { taskId: task.id, type: body.action === 'cancel' ? 'cancelled_by_admin' : 'manual_review_requested', actor: 'system', body: body.reason } })
         }
       }
-      return { affected }
+      const affectedSet = new Set(affectedIds)
+      return { affected: affectedIds.length, affectedIds, skippedIds: body.ids.filter(id => !affectedSet.has(id)) }
     },
   })
-  return NextResponse.json(result.duplicate ? { duplicate: true } : { resource: body.resource, action: body.action, affected: result.value.affected }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
+  return NextResponse.json(result.duplicate ? { duplicate: true } : { resource: body.resource, action: body.action, affected: result.value.affected, skipped: result.value.skippedIds.length }, { headers: { 'Cache-Control': 'no-store', 'x-request-id': actor.requestId } })
 }
