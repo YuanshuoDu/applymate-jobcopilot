@@ -400,10 +400,11 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                     return;
                   }
                   let requestMethod: string;
-                  let isMainFrameNavigation: boolean;
+                  let isNavigationRequest: boolean;
                   try {
                     requestMethod = request.method().toUpperCase();
-                    isMainFrameNavigation = request.isNavigationRequest();
+                    // Playwright also reports document requests from subframes as navigations.
+                    isNavigationRequest = request.isNavigationRequest();
                   } catch {
                     await route.abort("aborted").catch(() => undefined);
                     return;
@@ -451,7 +452,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                     // a changed URL, or navigate the document while final
                     // submission is armed. Safe non-navigation reads may
                     // continue, and iframe traffic never starts the fence.
-                    if (requestTargetsArmedAction || !isSafeRead || isMainFrameNavigation) {
+                    if (requestTargetsArmedAction || !isSafeRead || isNavigationRequest) {
                       await route.abort("aborted").catch(() => undefined);
                     } else {
                       await route.fallback().catch(() => undefined);
@@ -469,7 +470,7 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                     return;
                   }
                   if (!requestTargetsArmedAction) {
-                    if (isMainFrameNavigation || !isSafeRead) {
+                    if (isNavigationRequest || !isSafeRead) {
                       // A rewritten action URL or a write/navigation that
                       // differs from the declared intent is undeclared.
                       await route.abort("aborted").catch(() => undefined);
