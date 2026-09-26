@@ -1,15 +1,17 @@
 import { describe, expect, it, vi } from "vitest"
 
 import { ensureV2Turn } from "./v2-turn"
+import { AgentExecutionCancelledError } from "../execution-control"
 
 interface MockDbOptions {
-  activeTurn?: { id: string } | null
-  fallbackTurn?: { id: string } | null
+  activeTurn?: { id: string; status?: string } | null
+  fallbackTurn?: { id: string; status?: string } | null
   sessionExists?: boolean
   sessionStatus?: string
   sessionUserId?: string
   createError?: unknown
   closeAfterCreate?: boolean
+  executionUpdateCount?: number
 }
 
 function queryText(query: unknown) {
@@ -23,7 +25,9 @@ function mockDb(options: MockDbOptions = {}) {
   let sessionStatus = options.sessionStatus ?? "running"
   const tx = {
     $queryRaw: vi.fn(async (query: unknown) => {
-      if (!queryText(query).includes('FROM "agent_sessions"')) return []
+      const sql = queryText(query)
+      if (sql.includes('FROM "agent_turns"')) return options.activeTurn ? [{ id: options.activeTurn.id, status: options.activeTurn.status ?? "in_progress" }] : []
+      if (!sql.includes('FROM "agent_sessions"')) return []
       const owned = options.sessionExists !== false && (options.sessionUserId ?? "user_1") === "user_1"
       const closed = ["aborted", "archived"].includes(sessionStatus)
       return owned && !closed ? [{ id: "session_1" }] : []
@@ -39,6 +43,9 @@ function mockDb(options: MockDbOptions = {}) {
         }
         return { id: "turn_new" }
       }),
+    },
+    agentExecution: {
+      updateMany: vi.fn(async () => ({ count: options.executionUpdateCount ?? 1 })),
     },
   }
   const db = {
@@ -101,6 +108,36 @@ describe("ensureV2Turn", () => {
       }),
       select: { id: true },
     })
+  })
+
+  it("does not create a replacement Turn when Stop cancelled the execution first", async () => {
+    const { db, tx } = mockDb({ executionUpdateCount: 0 })
+
+    await expect(ensureV2Turn(db as never, input, {
+      executionAttempt: { id: "execution_1", attemptCount: 9 },
+    })).rejects.toBeInstanceOf(AgentExecutionCancelledError)
+
+    expect(tx.$queryRaw.mock.calls.map(([query]) => queryText(query))).toEqual(expect.arrayContaining([
+      expect.stringContaining('FROM "agent_sessions"'),
+      expect.stringContaining('FROM "agent_turns"'),
+    ]))
+    expect(tx.agentExecution.updateMany).toHaveBeenCalledWith({
+      where: { id: "execution_1", userId: "user_1", status: "running", attemptCount: 9 },
+      data: { updatedAt: expect.any(Date) },
+    })
+    expect(tx.agentTurn.create).not.toHaveBeenCalled()
+  })
+
+  it("locks an existing exact active Turn before refreshing its execution owner", async () => {
+    const { db, tx } = mockDb({ activeTurn: { id: "turn_active" } })
+    await ensureV2Turn(db as never, input, {
+      executionAttempt: { id: "execution_1", attemptCount: 3 },
+    })
+
+    const turnLock = tx.$queryRaw.mock.invocationCallOrder[1]
+    const refresh = tx.agentExecution.updateMany.mock.invocationCallOrder[0]
+    expect(turnLock).toBeLessThan(refresh)
+    expect(tx.agentTurn.create).not.toHaveBeenCalled()
   })
 
   it.each(["aborted", "archived"])("rejects a %s session before reading or creating a Turn", async (sessionStatus) => {

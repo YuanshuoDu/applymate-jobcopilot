@@ -11,6 +11,7 @@ interface MockDbOptions {
   itemFindFirstResults?: Array<Record<string, unknown> | null>
   eventFindFirstResults?: Array<Record<string, unknown> | null>
   turnUpdateCount?: number
+  turnLockMissing?: boolean
 }
 
 function queryText(query: unknown) {
@@ -84,6 +85,11 @@ function mockDb(options: MockDbOptions = {}) {
         const owned = options.sessionExists !== false && (options.sessionUserId ?? "user_1") === "user_1"
         const open = !["aborted", "archived"].includes(sessionStatus)
         return owned && open ? [{ id: "session_1" }] : []
+      }
+      if (sql.includes('FROM "agent_turns"')) {
+        if (options.turnLockMissing) return []
+        const turnId = String((query as { values?: readonly unknown[] }).values?.[0] ?? "turn_1")
+        return [{ id: turnId, status: "in_progress" }]
       }
       return [{ eventSequence: BigInt(1) }]
     }),
@@ -358,13 +364,13 @@ describe("legacy/V2 dual writer", () => {
     expect(foreign.tx.agentTurn.updateMany).not.toHaveBeenCalled()
     expect(foreign.tx.agentItem.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ type: "approval_request" }) }))
 
-    const missing = mockDb({ turnFindFirstResults: [{ id: "turn_1", sessionId: "session_1", userId: "user_1", status: "in_progress", revision: 0 }, null] })
+    const missing = mockDb({ turnFindFirstResults: [{ id: "turn_1", sessionId: "session_1", userId: "user_1", status: "in_progress", revision: 0 }, null], turnLockMissing: true })
     const missingWriter = await createDualWriteSession(missing.db as never, {
       sessionId: "session_1", userId: "user_1", turnId: "turn_1", goal: "Missing", source: "user",
     })
     await expect(missingWriter.record({ sessionId: "session_1", type: "approval_request", speaker: "Orchestrator", title: "Question", body: "Choose", data: {} }, {
       name: "orchestrator_question", payload: { id: "question_6", stage: "prepare", question: "Choose", options: [] },
-    })).rejects.toThrow("unauthorized agent turn")
+    })).rejects.toThrow("Agent execution was cancelled")
     expect(missing.tx.agentTurn.updateMany).not.toHaveBeenCalled()
     expect(missing.tx.agentItem.create).not.toHaveBeenCalled()
   })
@@ -425,8 +431,11 @@ describe("legacy/V2 dual writer", () => {
     await writer.finalize({ status: "completed", finalResponse: "Done" })
 
     expect(tx.$queryRaw).toHaveBeenCalledTimes(2)
-    expect(tx.agentTurn.update).toHaveBeenCalledWith(expect.objectContaining({
-      where: { id: "turn_1" },
+    expect(tx.agentTurn.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        id: "turn_1", sessionId: "session_1", userId: "user_1",
+        status: { in: ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] },
+      }),
       data: expect.objectContaining({ status: "completed", finalResponse: "Done" }),
     }))
     expect(db.agentTurn.findFirst).not.toHaveBeenCalled()

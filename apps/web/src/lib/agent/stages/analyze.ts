@@ -9,9 +9,11 @@ import { stageOk, stageFail } from '../types'
 import { roleAiConfig } from '../role-config'
 import { forEachConcurrent } from '../concurrency'
 import { assessApplicationPreflight } from '../application-preflight'
+import { claimAnalyzeTask, transitionAnalyzeTask } from './analyze-ownership'
+import { AgentExecutionCancelledError } from '../execution-control'
+import { assertAnalyzeSignalActive } from './analyze-ownership'
 
 const SCORE_COLOR = (s: number) => s >= 80 ? '#3B6D11' : s >= 60 ? '#854F0B' : '#6B7280'
-const STICKY_SUBMISSION_CHECKPOINTS = ['submission_request_started', 'submission_uncertain']
 
 export async function runAnalyze(
   jobs: Job[],
@@ -24,10 +26,6 @@ export async function runAnalyze(
   // Use analyst role's configured model; fall back to global aiConfig
   const analystCfg = roleConfigs.analyst
   const scoringConfig = roleAiConfig('analyst', analystCfg, aiConfig)
-  const safeCheckpoint = { OR: [{ checkpoint: null }, { checkpoint: { notIn: STICKY_SUBMISSION_CHECKPOINTS } }] }
-  const sessionFence = ctx.sessionId === undefined
-    ? { sessionId: null }
-    : { OR: [{ sessionId: null }, { sessionId: ctx.sessionId }] }
 
   const scoredJobs: ScoredJob[] = []
   let failed = 0
@@ -52,40 +50,30 @@ export async function runAnalyze(
   await forEachConcurrent(jobs, 3, async job => {
     const preflight = assessApplicationPreflight(job)
     const hardPreflightIssues = preflight.issues.filter(issue => issue.code !== "missing_description")
-    const refreshed = await db.$transaction(async tx => {
-      const identity = { userId, jobId: job.id }
-      await tx.applicationTask.upsert({
-        where: { userId_jobId: identity },
-        create: { ...identity, sessionId: ctx.sessionId ?? null, status: "analyzing", checkpoint: "match_analysis" },
-        // Ensure a task exists, then refresh it only if a submission has not
-        // crossed the durable request-start boundary.
-        update: {},
-      })
-      return tx.applicationTask.updateMany({
-        where: {
-          ...identity,
-          AND: [sessionFence, safeCheckpoint],
-        },
-        data: { sessionId: ctx.sessionId ?? undefined, status: "analyzing", checkpoint: "match_analysis", error: null, completedAt: null },
-      })
-    })
-    if (refreshed.count !== 1) {
+    const analysisFenceAt = await db.$transaction(tx => claimAnalyzeTask(tx, {
+      userId, jobId: job.id, sessionId: ctx.sessionId, executionAttempt: ctx.executionAttempt, signal: ctx.signal,
+    }))
+    if (!analysisFenceAt) {
       fenceSkipped++
       return
     }
-    emit('job_start', { jobId: job.id, company: job.company, role: job.role })
-    emit('agent_action', {
-      role:   'analyst',
-      action: `score ${job.company} · ${job.role}${job.location ? ` (${job.location})` : ''}`,
-    })
+    const emitJobStart = () => {
+      emit('job_start', { jobId: job.id, company: job.company, role: job.role })
+      emit('agent_action', {
+        role:   'analyst',
+        action: `score ${job.company} · ${job.role}${job.location ? ` (${job.location})` : ''}`,
+      })
+    }
 
     // Reject ineligible records before spending model credits.
     if (hardPreflightIssues.length > 0) {
       const reason = hardPreflightIssues.map(issue => issue.message).join(" ")
-      await db.applicationTask?.updateMany({
-        where: { userId, jobId: job.id, status: 'analyzing' },
+      const skipped = await db.$transaction(tx => transitionAnalyzeTask(tx, {
+        userId, jobId: job.id, sessionId: ctx.sessionId, analysisFenceAt, executionAttempt: ctx.executionAttempt, signal: ctx.signal,
         data: { status: 'skipped', checkpoint: 'job_preflight_failed', error: reason, completedAt: new Date() },
-      })
+      }))
+      if (!skipped) { fenceSkipped++; return }
+      emitJobStart()
       emit('job_skip', { jobId: job.id, company: job.company, role: job.role, reason })
       emit('agent_observation', {
         role: 'analyst',
@@ -95,10 +83,12 @@ export async function runAnalyze(
     }
 
     if (!job.description && !job.role) {
-      await db.applicationTask?.updateMany({
-        where: { userId, jobId: job.id, status: 'analyzing' },
+      const skipped = await db.$transaction(tx => transitionAnalyzeTask(tx, {
+        userId, jobId: job.id, sessionId: ctx.sessionId, analysisFenceAt, executionAttempt: ctx.executionAttempt, signal: ctx.signal,
         data: { status: 'skipped', checkpoint: 'job_data_insufficient', error: 'No job title or description available.', completedAt: new Date() },
-      })
+      }))
+      if (!skipped) { fenceSkipped++; return }
+      emitJobStart()
       emit('job_skip', { jobId: job.id, company: job.company, role: job.role, reason: 'No job description available' })
       emit('agent_observation', {
         role:        'analyst',
@@ -108,14 +98,17 @@ export async function runAnalyze(
     }
 
     if (skipNoDescription && !job.description) {
-      await db.applicationTask?.updateMany({
-        where: { userId, jobId: job.id, status: 'analyzing' },
+      const skipped = await db.$transaction(tx => transitionAnalyzeTask(tx, {
+        userId, jobId: job.id, sessionId: ctx.sessionId, analysisFenceAt, executionAttempt: ctx.executionAttempt, signal: ctx.signal,
         data: { status: 'skipped', checkpoint: 'job_description_required', error: 'Candidate chose not to score this job without a description.', completedAt: new Date() },
-      })
+      }))
+      if (!skipped) { fenceSkipped++; return }
+      emitJobStart()
       emit('job_skip', { jobId: job.id, company: job.company, role: job.role, reason: 'Candidate chose to skip jobs without descriptions' })
       return
     }
 
+    emitJobStart()
     try {
       const prompt = buildScorePrompt(resumeText, job)
       const systemPrompt = ctx.roleConfigs.analyst?.systemPrompt ?? undefined
@@ -130,13 +123,15 @@ export async function runAnalyze(
       // This conditional UPDATE locks the task through both writes; NULL is
       // explicit because PostgreSQL NOT IN does not match NULL values.
       const persisted = await db.$transaction(async tx => {
-        const { count } = await tx.applicationTask.updateMany({
-          where: { userId, jobId: job.id, status: 'analyzing', sessionId: ctx.sessionId ?? null, ...safeCheckpoint },
-          data: { status: 'analyzing' },
+        const owned = await transitionAnalyzeTask(tx, {
+          userId, jobId: job.id, sessionId: ctx.sessionId, analysisFenceAt, executionAttempt: ctx.executionAttempt, signal: ctx.signal,
+          data: { status: 'analyzing', updatedAt: analysisFenceAt },
         })
-        if (count !== 1) return false
+        if (!owned) return false
         await tx.job.update({ where: { id: job.id }, data: { score: parsed.score, analysisNote: parsed.recommendation || null } })
+        assertAnalyzeSignalActive(ctx.signal)
         await tx.activity.create({ data: { userId, jobId: job.id, type: 'agent_action', text: `Agent scored ${job.company} · ${job.role}: ${parsed.score}% match`, color } })
+        assertAnalyzeSignalActive(ctx.signal)
         return true
       })
       if (!persisted) {
@@ -144,7 +139,7 @@ export async function runAnalyze(
         return
       }
 
-      scoredJobs.push({ job, ...parsed })
+      scoredJobs.push({ job, ...parsed, analysisFenceAt: analysisFenceAt.toISOString() })
 
       // Emit per-job observation with AI reasoning
       const matchStr  = parsed.matchedKeywords.length  ? `match: ${parsed.matchedKeywords.slice(0, 4).join(', ')}` : ''
@@ -164,16 +159,18 @@ export async function runAnalyze(
 
       await new Promise(r => setTimeout(r, THROTTLE_MS))
     } catch (err) {
-      console.error('[analyze] scoring error:', err)
+      if (err instanceof AgentExecutionCancelledError) throw err
+      assertAnalyzeSignalActive(ctx.signal)
       const message = err instanceof Error ? err.message : 'Unknown AI scoring error'
-      const markedFailed = await db.applicationTask?.updateMany({
-        where: { userId, jobId: job.id, status: 'analyzing', sessionId: ctx.sessionId ?? null, ...safeCheckpoint },
+      const markedFailed = await db.$transaction(tx => transitionAnalyzeTask(tx, {
+        userId, jobId: job.id, sessionId: ctx.sessionId, analysisFenceAt, executionAttempt: ctx.executionAttempt, signal: ctx.signal,
         data: { status: 'failed', checkpoint: 'match_analysis_failed', error: message, completedAt: new Date() },
-      })
-      if (markedFailed && markedFailed.count !== 1) {
+      }))
+      if (!markedFailed) {
         fenceSkipped++
         return
       }
+      console.error('[analyze] scoring error:', err)
       failed++
       emit('agent_observation', {
         role:        'analyst',

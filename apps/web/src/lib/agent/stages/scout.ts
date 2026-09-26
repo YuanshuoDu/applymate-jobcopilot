@@ -1,29 +1,35 @@
-/**
- * Stage 1 — Scout (scout)
- *
- * THREE-PHASE operation:
- *
- *   Phase A — Live Search (NEW JOBS):
- *     Calls job APIs with targetRoles × targetLocations as SEARCH PARAMETERS
- *     (location filter is applied AT SEARCH TIME, not post-fetch).
- *     Saves discovered jobs to DB (status='saved') for the pipeline.
- *     If location-specific search returns 0 results, retries without location.
- *
- *   Phase B — Load Saved Jobs (DB-LEVEL filter):
- *     Prisma WHERE clause filters by location at DB level — NOT post-JS-filter.
- *     Priority companies bypass location filter.
- *     Dedup: skips jobs already scored today.
- *
- *   Phase C — Format & Emit:
- *     Emits a structured list of queued jobs for the UI and Orchestrator.
- *
- * Key principle: location filter is applied BEFORE loading data, not after.
- */
+/** Scout searches for new jobs, persists them, then loads the user's saved queue. */
+import type { Prisma } from '@prisma/client'
 import { db }          from '@/lib/db'
 import { discoverJobs } from '@/lib/agent/discover'
 import { resolveLocations, buildLocationWhere, locationSummary } from '@/lib/agent/location-resolver'
 import type { PipelineCtx, ScoutOutput, StageResult, AcceptResult } from '../types'
 import { stageOk, stageFail } from '../types'
+import { AgentExecutionCancelledError, refreshAgentExecutionAttempt } from '../execution-control'
+
+function assertSignalActive(ctx: PipelineCtx): void {
+  if (ctx.signal?.aborted) throw new AgentExecutionCancelledError()
+}
+
+class OwnershipCheckUnavailableError extends Error {
+  constructor(cause: unknown) { super(`Scout ownership check failed: ${cause instanceof Error ? cause.message : String(cause)}`); this.name = 'OwnershipCheckUnavailableError' }
+}
+
+async function ownedWrite<T>(ctx: PipelineCtx, write: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
+  return db.$transaction(async tx => {
+    assertSignalActive(ctx)
+    if (ctx.executionAttempt) {
+      let current: boolean
+      try { current = await refreshAgentExecutionAttempt(tx, { ...ctx.executionAttempt, userId: ctx.userId }) }
+      catch (error: unknown) { throw new OwnershipCheckUnavailableError(error) }
+      if (!current) throw new AgentExecutionCancelledError()
+      assertSignalActive(ctx)
+    }
+    const result = await write(tx)
+    assertSignalActive(ctx)
+    return result
+  })
+}
 
 export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutput>> {
   const t0 = Date.now()
@@ -37,6 +43,7 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
   const locSummary  = locationSummary(agentCfg.targetLocations)
 
   try {
+    assertSignalActive(ctx)
     // ── Phase A: Live search — location filter applied at API search level ────
     let discovered = 0
 
@@ -52,6 +59,7 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
         (await db.job.findMany({ where: { userId }, select: { url: true } }))
           .map(j => j.url).filter((u): u is string => !!u)
       )
+      assertSignalActive(ctx)
 
       // First attempt: search with location
       let candidates = await discoverJobs({
@@ -61,6 +69,7 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
         existingUrls,
         maxResults:      agentCfg.dailyLimit * 2,
       })
+      assertSignalActive(ctx)
 
       emit('agent_observation', {
         role:        'scout',
@@ -80,6 +89,7 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
           existingUrls,
           maxResults:      agentCfg.dailyLimit * 2,
         })
+        assertSignalActive(ctx)
         emit('agent_observation', {
           role:        'scout',
           observation: `🔍 Search returns regardless of location ${candidates.length} results`,
@@ -99,12 +109,12 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
           source:      j.source      || 'agent',
           status:      'saved' as const,
         }))
-        // External job APIs can return a malformed record among otherwise valid
-        // results. Persist independently so one bad record cannot abort Scout
-        // and make the Orchestrator retry the same successful search.
-        const writes = await Promise.allSettled(
-          rows.map(data => db.job.create({ data })),
-        )
+        // Persist independently so malformed API records do not abort discovery.
+        const writes = await Promise.allSettled(rows.map(data => ownedWrite(ctx, tx => tx.job.create({ data }))))
+        const ownershipLost = writes.find(write => write.status === 'rejected' && write.reason instanceof AgentExecutionCancelledError)
+        if (ownershipLost?.status === 'rejected') throw ownershipLost.reason
+        const ownershipCheckFailed = writes.find(write => write.status === 'rejected' && write.reason instanceof OwnershipCheckUnavailableError)
+        if (ownershipCheckFailed?.status === 'rejected') throw ownershipCheckFailed.reason
         discovered = writes.filter(write => write.status === 'fulfilled').length
         const failedWrites = writes.length - discovered
 
@@ -115,7 +125,6 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
           throw firstFailure?.reason ?? new Error('No discovered jobs could be saved')
         }
 
-        // Format discovered jobs as a list
         const listText = candidates.slice(0, 8).map(j =>
           `- **${j.company}** · ${j.title}${j.location ? ` · 📍${j.location}` : ''}${j.salary ? ` · ${j.salary}` : ''}`
         ).join('\n') + (candidates.length > 8 ? `\n- …and ${candidates.length - 8} more` : '')
@@ -125,14 +134,9 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
           observation: `✓ Found and saved ${discovered} new positions${failedWrites > 0 ? `(${failedWrites} Invalid records have been skipped)` : ''}: \n${listText}`,
         })
 
-        await db.activity.create({
-          data: {
-            userId,
-            type:  'agent_action',
-            text:  `Agent Search found ${discovered} new positions (${agentCfg.targetRoles.slice(0, 2).join(', ')})`,
-            color: '#185FA5',
-          },
-        })
+        await ownedWrite(ctx, tx => tx.activity.create({
+          data: { userId, type: 'agent_action', text: `Agent Search found ${discovered} new positions (${agentCfg.targetRoles.slice(0, 2).join(', ')})`, color: '#185FA5' },
+        }))
       }
     }
 
@@ -174,6 +178,7 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
         { createdAt: 'desc' },
       ],
     })
+    assertSignalActive(ctx)
 
     const todayStart = new Date()
     todayStart.setUTCHours(0, 0, 0, 0)
@@ -210,6 +215,7 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
     } else if (hasLocations) {
       // Zero results — emit a question via orchestrator
       const savedTotal = await db.job.count({ where: { userId, status: 'saved' } })
+      assertSignalActive(ctx)
       if (savedTotal > 0) {
         emit('agent_question', {
           role:       'scout',
@@ -227,6 +233,7 @@ export async function runScout(ctx: PipelineCtx): Promise<StageResult<ScoutOutpu
     return stageOk('scout', { jobs, discovered }, jobs.length, Date.now() - t0)
 
   } catch (error) {
+    if (error instanceof AgentExecutionCancelledError) throw error
     return stageFail('scout', `Scout failed: ${error instanceof Error ? error.message : String(error)}`)
   }
 }

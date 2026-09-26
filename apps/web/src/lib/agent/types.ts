@@ -3,7 +3,6 @@
  * Every stage consumes and produces these typed structures.
  */
 import type { Job }          from '@prisma/client'
-import type { AiConfig }     from '@/lib/model-router'
 import type { ResumeContent } from '@/lib/types'
 import type { AgentRoleType } from '@/lib/agent/role-config'
 import type { ArtifactReview, ArtifactSummary } from '@/lib/agent/artifacts/types'
@@ -43,29 +42,7 @@ export interface AgentConfigFull {
 
 // ── Pipeline context (threaded through every stage) ───────────────────────────
 
-export interface PipelineCtx {
-  userId:        string
-  /** Durable session that owns approvals and resumable application checkpoints. */
-  sessionId?:     string
-  agentCfg:      AgentConfigFull
-  roleConfigs:   RoleConfigMap  // per-role model configs
-  resumeText:    string         // plain-text resume, truncated to 2500 chars
-  resumeContent: ResumeContent  // structured resume for cover-letter generation
-  defaultResume: { id: string; name: string; templateId: string | null; templateOptions: unknown; directionId: string | null; basicsDetached: boolean }
-  aiConfig:      AiConfig       // fallback global config
-  autonomous:    boolean        // may work unattended, but never bypasses a required user decision
-  emit:          (event: string, data: unknown) => void
-  /** Last durable stage snapshot, loaded after a worker/service restart. */
-  resumeState?:  PipelineCheckpointState
-  /** Program-owned persistence hook; models never receive or control it. */
-  checkpoint?:   (state: PipelineCheckpointState) => Promise<void>
-  /** Canonical Turn adapter sink. Legacy callers leave this unset. */
-  onCanonicalEvent?: (event: PipelineCanonicalEvent) => Promise<void> | void
-  /** Abort-aware boundary owned by the canonical Turn executor. */
-  signal?:        AbortSignal
-  /** Durable human-decision boundary supplied by the Orchestrator. */
-  askUser?: (stage: string, question: string, options: AgentQuestionOption[]) => Promise<string>
-}
+export type { PipelineCtx } from './pipeline-context'
 
 export type PipelineCanonicalEvent = {
   event: string
@@ -150,6 +127,8 @@ export interface ScoredJob {
   matchedKeywords: string[]
   missingKeywords: string[]
   recommendation:  string
+  /** ApplicationTask version that owns this score; serialized in checkpoints. */
+  analysisFenceAt?: string
 }
 
 export interface AnalyzeOutput {

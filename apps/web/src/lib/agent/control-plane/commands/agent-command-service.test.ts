@@ -138,7 +138,11 @@ function makeDb(options: {
       findMany: vi.fn(async () => []),
       updateMany: vi.fn(async () => ({ count: 1 })),
     },
-    agentApproval: { updateMany: vi.fn(async () => ({ count: 1 })) },
+    agentApproval: {
+      findMany: vi.fn(async () => []),
+      updateMany: vi.fn(async () => ({ count: 1 })),
+    },
+    agentRunQuestion: { deleteMany: vi.fn(async () => ({ count: 0 })) },
     agentEvent: {
       findFirst: vi.fn(async (args: unknown) => {
         const where = whereOf(args)

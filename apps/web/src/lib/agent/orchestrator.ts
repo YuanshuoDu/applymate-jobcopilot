@@ -20,6 +20,7 @@ import { modelChat }        from '@/lib/model-router'
 import { db }               from '@/lib/db'
 import type { AgentQuestionOption, PipelineCtx } from './types'
 import { agentConfigPatchFrom, applyAgentConfigPatch, prismaAgentConfigPatch } from './orchestrator-config'
+import { findOrCreateOrchestratorQuestion } from './orchestrator-question'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -96,6 +97,7 @@ export class OrchestratorAgent {
   private runId:      string
   private autonomous: boolean
   private history:    string[] = []
+  private resumeQuestionId?: string
 
   constructor(ctx: PipelineCtx, autonomous = false) {
     this.ctx        = ctx
@@ -104,6 +106,7 @@ export class OrchestratorAgent {
     // the same unanswered question instead of creating another one.
     this.runId      = ctx.sessionId ?? `run_${Date.now()}`
     this.autonomous = autonomous
+    this.resumeQuestionId = ctx.resumeQuestionId
   }
 
   // ── Retry tracking (lightweight, used by pipeline retry loops) ──────────────
@@ -251,13 +254,20 @@ Respond ONLY in valid JSON (no markdown):
     question: string,
     options:  QuestionOption[],
   ): Promise<string> {
-    const existing = await db.agentRunQuestion.findFirst({
-      // One stage can legitimately ask several questions (for example a
-      // threshold exception followed by a weak-material review). Reuse only
-      // the exact durable prompt on restart; never apply a prior answer to a
-      // different decision in the same stage.
-      where: { userId: this.ctx.userId, runId: this.runId, stage, question },
-      orderBy: { createdAt: "desc" },
+    const expectedQuestionId = this.resumeQuestionId
+    this.resumeQuestionId = undefined
+    const existing = await findOrCreateOrchestratorQuestion(db, {
+      userId: this.ctx.userId,
+      runId: this.runId,
+      sessionId: this.ctx.sessionId,
+      turnId: this.ctx.turnId,
+      executionAttempt: this.ctx.executionAttempt,
+      signal: this.ctx.signal,
+      questionProjectionMode: this.ctx.questionProjectionMode ?? "canonical",
+      ...(expectedQuestionId ? { expectedQuestionId } : {}),
+      stage,
+      question,
+      options,
     })
     if (existing?.answer) {
       this.emit('orchestrator_answer_received', {
@@ -268,26 +278,15 @@ Respond ONLY in valid JSON (no markdown):
       return existing.answer
     }
 
-    const q = existing ?? await db.agentRunQuestion.create({
-      data: {
-        userId:    this.ctx.userId,
-        runId:     this.runId,
-        stage,
-        question,
-        options:   options as object[],
-        autonomous: false,
-      },
-    })
-
     // Emit the question — frontend will show it prominently and enable the input
     this.emit('orchestrator_question', {
-      id:       q.id,
+      id:       existing.id,
       stage,
       question,
       options,
     })
 
-    throw new AgentPauseError(q.id, stage)
+    throw new AgentPauseError(existing.id, stage)
   }
 
   // ── Apply fix from retry decision ──────────────────────────────────────────

@@ -1,6 +1,4 @@
 import type { RunReport } from "@/lib/agent/types"
-import type { Prisma, PrismaClient } from "@prisma/client"
-import { createDualWriteSession, type DualWriteSession } from "./dual-write"
 import {
   appendTranscriptEvent,
   completeSubAgentTask,
@@ -12,7 +10,9 @@ import {
 import type { AgentSessionStatus, SubAgentRole } from "./types"
 import { mapPipelineEventToTranscript, messageBody, summarizeReport, textField } from "./pipeline-event-transcript"
 export { mapPipelineEventToTranscript } from "./pipeline-event-transcript"
-import { lockOpenSession, type V2TurnSource } from "./v2-turn"
+import type { V2TurnSource } from "./v2-turn"
+import { assertExistingSessionAvailable, createRunSessionActivation } from "./run-recorder-activation"
+import { createRunRecorderWriteContext, withOpenSession, withRunRecorderTerminalOwnership, type RecorderFinalizationOwner } from "./run-recorder-ownership"
 
 interface RunSessionRecorderInput {
   userId: string
@@ -24,64 +24,22 @@ interface RunSessionRecorderInput {
   source?: V2TurnSource
   /** Bind the recorder to the canonical Turn created for this automation run. */
   turnId?: string
+  /** Bind a raw legacy answer to the Turn created for its continuation. */
+  legacyResumeQuestionId?: string
   /** Canonical TurnEngine owns the V2 terminal status for this run. */
   manageV2Lifecycle?: boolean
+  /** Delay existing-session reopen and V2 projection until the execution is claimed. */
+  deferActivation?: boolean
+  /** Create or capture the exact canonical Turn without enabling transcript projection. */
+  ensureTurn?: boolean
 }
-
-interface FinalizeInput {
-  status: Extract<AgentSessionStatus, "completed" | "failed" | "aborted">
-  report: RunReport | null
-}
-
+type FinalizeInput = { status: Extract<AgentSessionStatus, "completed" | "failed" | "aborted">; report: RunReport | null; owner?: RecorderFinalizationOwner }
 type PipelineSubAgentRole = Exclude<SubAgentRole, "orchestrator">
-const CLOSED_SESSION_STATUSES = ["aborted", "archived"] as const
-
-type SessionLifecycleDb = AgentSessionDb & {
-  agentSession: AgentSessionDb["agentSession"] & {
-    findFirst(args: { where: { id: string; userId: string }; select: { id: true; status: true } }): Promise<{ id: string; status: string } | null>
-    updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<{ count: number }>
-  }
-}
-
-type RecorderDb = AgentSessionDb & {
-  $transaction<T>(work: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T>
-}
-
-async function withOpenSession<T>(
-  db: AgentSessionDb,
-  input: { sessionId: string; userId: string },
-  work: (tx: AgentSessionDb) => Promise<T>,
-): Promise<T> {
-  const recorderDb = db as RecorderDb
-  return recorderDb.$transaction(async tx => {
-    await lockOpenSession(tx, input)
-    return work(tx as unknown as AgentSessionDb)
-  })
-}
-
-async function reopenExistingSession(db: AgentSessionDb, input: { sessionId: string; userId: string }): Promise<void> {
-  const sessionDb = db as SessionLifecycleDb
-  const session = await sessionDb.agentSession.findFirst({
-    where: { id: input.sessionId, userId: input.userId },
-    select: { id: true, status: true },
-  })
-  if (!session || CLOSED_SESSION_STATUSES.includes(session.status as (typeof CLOSED_SESSION_STATUSES)[number])) {
-    throw new Error(`Agent session ${input.sessionId} does not exist for this user`)
-  }
-  const updated = await sessionDb.agentSession.updateMany({
-    where: { id: input.sessionId, userId: input.userId, status: { notIn: [...CLOSED_SESSION_STATUSES] } },
-    data: { status: "running", completedAt: null },
-  })
-  if (updated.count !== 1) throw new Error(`Agent session ${input.sessionId} does not exist for this user`)
-}
-
 function roleFrom(data: unknown): PipelineSubAgentRole | null {
   const role = textField(data, "role")
-  if (!role) return null
-  const roles = ["scout", "analyst", "writer", "reviewer", "executor", "auditor"] as const
-  return roles.includes(role as PipelineSubAgentRole) ? role as PipelineSubAgentRole : null
+  return role && ["scout", "analyst", "writer", "reviewer", "executor", "auditor"].includes(role)
+    ? role as PipelineSubAgentRole : null
 }
-
 function qualityScore(report: RunReport | null, status: AgentSessionStatus) {
   if (status !== "completed" || !report) return null
   if (report.processed <= 0) return 100
@@ -95,31 +53,46 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
       userId: input.userId,
       goal: input.goal,
       source: "manual_run",
+      ...(input.deferActivation ? { status: "paused" as const } : {}),
     }) as { id: string }
-  if (input.sessionId) {
-    await reopenExistingSession(db, { sessionId: session.id, userId: input.userId })
+  if (input.sessionId && input.deferActivation) {
+    await assertExistingSessionAvailable(db, { sessionId: session.id, userId: input.userId })
   }
-  const dualWrite: DualWriteSession | null = input.dualWrite
-    ? await createDualWriteSession(db as unknown as PrismaClient, {
-      sessionId: session.id,
-      userId: input.userId,
-      goal: input.goal,
-      source: input.source ?? "system",
-      turnId: input.turnId,
-    })
-    : null
+  const activation = createRunSessionActivation(db, {
+    userId: input.userId,
+    sessionId: session.id,
+    goal: input.goal,
+    source: input.source,
+    turnId: input.turnId,
+    legacyResumeQuestionId: input.legacyResumeQuestionId,
+    dualWrite: Boolean(input.dualWrite),
+    deferActivation: Boolean(input.deferActivation),
+    reopenSession: Boolean(input.sessionId),
+    ensureTurn: Boolean(input.ensureTurn),
+  })
+  if (!input.deferActivation) await activation.activate()
   const taskIdsByRole = new Map<PipelineSubAgentRole, string>()
+
+  const { assertActivated, writeOwned } = createRunRecorderWriteContext({
+    db, sessionId: session.id, userId: input.userId,
+    isActivated: activation.isActivated, getWriteOwner: activation.getWriteOwner,
+  })
 
   return {
     sessionId: session.id,
+    activate: activation.activate,
     async record(event: string, payload: unknown) {
+      assertActivated()
+      const turn = activation.getDualWrite()
+      const dualWrite = input.dualWrite ? turn : null
       const role = roleFrom(payload)
       let taskId: string | null = role ? taskIdsByRole.get(role) ?? null : null
 
       if (event === "role_start" && role) {
-        const task = await withOpenSession(db, { sessionId: session.id, userId: input.userId }, async tx => {
+        const task = await writeOwned(async tx => {
           const created = await createSubAgentTask(tx, {
             sessionId: session.id,
+            turnId: turn?.turnId ?? input.turnId,
             role,
             taskType: "pipeline_stage",
             goal: messageBody(payload, ["plan", "message", "label"], `${role} pipeline stage`),
@@ -143,7 +116,7 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
       }
 
       if (event === "role_done" && role && taskId) {
-        await withOpenSession(db, { sessionId: session.id, userId: input.userId }, tx => completeSubAgentTask(tx, {
+        await writeOwned(tx => completeSubAgentTask(tx, {
           taskId,
           status: "passed",
           result: payload,
@@ -153,7 +126,10 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
 
       const mapped = mapPipelineEventToTranscript(event, payload)
       if (!mapped) {
-        if (!dualWrite) return null
+        if (!dualWrite) {
+          await writeOwned(async () => null)
+          return null
+        }
         return dualWrite.record({
           sessionId: session.id,
           taskId,
@@ -175,15 +151,39 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
       }
       return dualWrite
         ? dualWrite.record(transcript, { name: event, payload })
-        : withOpenSession(db, { sessionId: session.id, userId: input.userId }, tx => appendTranscriptEvent(tx, transcript))
+        : writeOwned(tx => appendTranscriptEvent(tx, transcript))
     },
-    async finalize(finalizeInput: FinalizeInput) {
+    getTurnId: () => activation.getDualWrite()?.turnId ?? input.turnId,
+    async finalize(finalizeInput: FinalizeInput): Promise<boolean> {
+      assertActivated()
+      const dualWrite = activation.getDualWrite()
+      if (finalizeInput.owner) {
+        const owned = await withRunRecorderTerminalOwnership(db, {
+          sessionId: session.id,
+          userId: input.userId,
+          owner: finalizeInput.owner,
+          ...(input.manageV2Lifecycle !== false ? { v2Finalize: {
+            status: finalizeInput.status === "aborted" ? "interrupted" : finalizeInput.status,
+            finalResponse: summarizeReport(finalizeInput.report),
+            error: finalizeInput.status === "failed" ? summarizeReport(finalizeInput.report) : null,
+          } } : {}),
+        }, tx => updateAgentSession(tx, {
+          sessionId: session.id,
+          status: finalizeInput.status,
+          completedAt: new Date(),
+          qualityScore: qualityScore(finalizeInput.report, finalizeInput.status),
+          memorySummary: summarizeReport(finalizeInput.report),
+        }).then(() => undefined))
+        if (!owned) return false
+        return true
+      }
       if (dualWrite && input.manageV2Lifecycle !== false) {
-        await dualWrite.finalize({
+        const terminalized = await dualWrite.finalize({
           status: finalizeInput.status,
           finalResponse: summarizeReport(finalizeInput.report),
           error: finalizeInput.status === "failed" ? summarizeReport(finalizeInput.report) : null,
         })
+        if (!terminalized) return false
       }
       const result = await withOpenSession(db, { sessionId: session.id, userId: input.userId }, tx => updateAgentSession(tx, {
         sessionId: session.id,
@@ -192,10 +192,35 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
         qualityScore: qualityScore(finalizeInput.report, finalizeInput.status),
         memorySummary: summarizeReport(finalizeInput.report),
       }))
-      return result
+      return Boolean(result)
     },
-    async pause(message: string, role?: PipelineSubAgentRole) {
+    async pause(message: string, role?: PipelineSubAgentRole, owner?: RecorderFinalizationOwner): Promise<boolean> {
+      assertActivated()
+      const dualWrite = activation.getDualWrite()
       const taskId = role ? taskIdsByRole.get(role) : undefined
+      if (owner) {
+        const owned = await withRunRecorderTerminalOwnership(db, {
+          sessionId: session.id,
+          userId: input.userId,
+          owner,
+          ...(input.manageV2Lifecycle !== false ? { v2Finalize: { status: "waiting_for_user", finalResponse: message, error: null } } : {}),
+        }, async tx => {
+          if (taskId) await completeSubAgentTask(tx, {
+            taskId,
+            status: "waiting_for_user",
+            failureReason: message,
+          })
+          await updateAgentSession(tx, {
+            sessionId: session.id,
+            status: "waiting_for_user",
+            ...(taskId ? { currentTaskId: taskId } : {}),
+            completedAt: null,
+            memorySummary: message,
+          })
+        })
+        if (!owned) return false
+        return true
+      }
       if (taskId) {
         await withOpenSession(db, { sessionId: session.id, userId: input.userId }, tx => completeSubAgentTask(tx, {
           taskId,
@@ -203,7 +228,10 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
           failureReason: message,
         }))
       }
-      if (dualWrite && input.manageV2Lifecycle !== false) await dualWrite.finalize({ status: "waiting_for_user", finalResponse: message })
+      if (dualWrite && input.manageV2Lifecycle !== false) {
+        const terminalized = await dualWrite.finalize({ status: "waiting_for_user", finalResponse: message })
+        if (!terminalized) return false
+      }
       const result = await withOpenSession(db, { sessionId: session.id, userId: input.userId }, tx => updateAgentSession(tx, {
         sessionId: session.id,
         status: "waiting_for_user",
@@ -211,7 +239,7 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
         completedAt: null,
         memorySummary: message,
       }))
-      return result
+      return Boolean(result)
     },
   }
 

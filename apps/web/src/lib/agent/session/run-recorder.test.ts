@@ -1,4 +1,8 @@
-import { describe, expect, it, vi } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
+
+const dualWriteMocks = vi.hoisted(() => ({ createDualWriteSession: vi.fn() }))
+vi.mock("./dual-write", () => ({ createDualWriteSession: dualWriteMocks.createDualWriteSession }))
+
 import { createRunSessionRecorder, mapPipelineEventToTranscript } from "./run-recorder"
 
 interface MockDbOptions {
@@ -6,6 +10,8 @@ interface MockDbOptions {
   sessionStatus?: string
   sessionUserId?: string
   updateCount?: number
+  executionUpdateCount?: number
+  turnStatus?: string | null
 }
 
 function queryText(query: unknown) {
@@ -16,10 +22,16 @@ function queryText(query: unknown) {
 
 function mockDb(options: MockDbOptions = {}) {
   let sessionStatus = options.sessionStatus ?? "running"
+  let turnStatus = options.turnStatus === undefined ? "in_progress" : options.turnStatus
+  const agentTurnUpdateMany = vi.fn(async ({ where, data }: { where?: { status?: { in?: string[] } }; data: { status?: string } }) => {
+    if (where?.status?.in && !where.status.in.includes(turnStatus ?? "")) return { count: 0 }
+    if (data.status) turnStatus = data.status
+    return { count: 1 }
+  })
   let rollbackCount = 0
   const agentSession = {
     create: vi.fn(async ({ data }) => ({ id: "session_1", ...data })),
-    update: vi.fn(async ({ data }) => ({ id: "session_1", ...data })),
+    update: vi.fn(async ({ data }) => { sessionStatus = data.status ?? sessionStatus; return { id: "session_1", ...data } }),
     findFirst: vi.fn(async ({ where }: { where: { id: string; userId: string } }) => {
       const owned = options.sessionExists !== false && (options.sessionUserId ?? "user_1") === where.userId
       return owned ? { id: where.id, status: sessionStatus } : null
@@ -35,14 +47,25 @@ function mockDb(options: MockDbOptions = {}) {
   }
   const tx = {
     $queryRaw: vi.fn(async (query: unknown) => {
-      if (!queryText(query).includes('FROM "agent_sessions"')) return []
+      const sql = queryText(query)
       const owned = options.sessionExists !== false && (options.sessionUserId ?? "user_1") === "user_1"
-      const open = !["aborted", "archived"].includes(sessionStatus)
-      return owned && open ? [{ id: "session_1" }] : []
+      if (sql.includes('FROM "agent_sessions"')) {
+        const open = !["aborted", "archived"].includes(sessionStatus)
+        return owned && open ? [{ id: "session_1" }] : []
+      }
+      if (sql.includes('FROM "agent_turns"')) {
+        return owned && turnStatus ? [{ id: "turn_1", status: turnStatus }] : []
+      }
+      return []
     }),
     agentSession,
+    agentTurn: { updateMany: agentTurnUpdateMany },
     agentTranscriptEvent,
     subAgentTask,
+    agentExecution: {
+      updateMany: vi.fn(async () => ({ count: options.executionUpdateCount ?? 1 })),
+      findFirst: vi.fn(async () => ({ status: "running" })),
+    },
   }
   const db = {
     agentSession,
@@ -59,12 +82,20 @@ function mockDb(options: MockDbOptions = {}) {
   }
   const state = {
     closeSession() { sessionStatus = "aborted" },
+    interruptTurn() { turnStatus = "interrupted" },
+    async stopTurn() { return agentTurnUpdateMany({ where: { status: { in: ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] } }, data: { status: "interrupted" } }) },
     get rollbackCount() { return rollbackCount },
   }
   return Object.assign(db, { db, tx, state })
 }
 
 describe("run session recorder", () => {
+  beforeEach(() => {
+    dualWriteMocks.createDualWriteSession.mockReset().mockResolvedValue({
+      sessionId: "session_1", userId: "user_1", turnId: "turn_1", record: vi.fn(), finalize: vi.fn().mockResolvedValue(true),
+    })
+  })
+
   it("creates a manual_run session for the current pipeline run", async () => {
     const db = mockDb()
 
@@ -107,6 +138,135 @@ describe("run session recorder", () => {
     expect(db.agentTranscriptEvent.create).toHaveBeenCalledWith({
       data: expect.objectContaining({ sessionId: "chat_session_1" }),
     })
+  })
+
+  it("keeps a deferred manual session paused until its recorder is activated", async () => {
+    const db = mockDb()
+    const recorder = await createRunSessionRecorder(db, {
+      userId: "user_1",
+      goal: "Manual deferred pipeline",
+      deferActivation: true,
+    })
+
+    expect(recorder.sessionId).toBe("session_1")
+    expect(db.agentSession.create).toHaveBeenCalledWith({ data: expect.objectContaining({ status: "paused" }) })
+    expect(db.agentSession.updateMany).not.toHaveBeenCalled()
+    await expect(recorder.record("agent_plan", { role: "scout", plan: "Too early" }))
+      .rejects.toThrow("must be activated after claiming")
+
+    await recorder.activate()
+    expect(db.agentSession.updateMany).toHaveBeenCalledWith({
+      where: { id: "session_1", userId: "user_1", status: { notIn: ["aborted", "archived"] } },
+      data: { status: "running", completedAt: null },
+    })
+  })
+
+  it("finalizes a Turn-owned session only while the exact terminal execution still owns the active Turn", async () => {
+    const db = mockDb()
+    const recorder = await createRunSessionRecorder(db, {
+      userId: "user_1",
+      goal: "Owned terminal write",
+      sessionId: "session_1",
+      turnId: "turn_1",
+      deferActivation: true,
+    })
+    await recorder.activate({
+      executionAttempt: { id: "execution_1", attemptCount: 3 },
+      assertCurrent: async () => true,
+    })
+    db.tx.$queryRaw.mockClear()
+    db.tx.agentExecution.updateMany.mockClear()
+    db.agentSession.update.mockClear()
+
+    await expect(recorder.finalize({
+      status: "completed",
+      report: null,
+      owner: {
+        turnId: "turn_1",
+        executionAttempt: { id: "execution_1", userId: "user_1", attemptCount: 3 },
+        terminalStatus: "completed",
+      },
+    })).resolves.toBe(true)
+
+    const lockSql = db.tx.$queryRaw.mock.calls.map(([query]) => queryText(query))
+    expect(lockSql[0]).toContain('FROM "agent_sessions"')
+    expect(lockSql[1]).toContain('FROM "agent_turns"')
+    expect(db.tx.agentExecution.updateMany).toHaveBeenCalledWith({
+      where: { id: "execution_1", userId: "user_1", sessionId: "session_1", attemptCount: 3, status: "completed" },
+      data: { updatedAt: expect.any(Date) },
+    })
+    expect(db.tx.$queryRaw).toHaveBeenCalledBefore(db.tx.agentExecution.updateMany)
+    expect(db.tx.agentExecution.updateMany).toHaveBeenCalledBefore(db.agentSession.update)
+    expect(db.agentSession.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: "session_1" },
+      data: expect.objectContaining({ status: "completed" }),
+    }))
+  })
+
+  it("skips a pending finalization when Stop interrupted the Turn first", async () => {
+    const db = mockDb()
+    const recorder = await createRunSessionRecorder(db, {
+      userId: "user_1",
+      goal: "Stop before terminal write",
+      sessionId: "session_1",
+      turnId: "turn_1",
+      deferActivation: true,
+    })
+    await recorder.activate({
+      executionAttempt: { id: "execution_1", attemptCount: 3 },
+      assertCurrent: async () => true,
+    })
+    db.state.interruptTurn()
+    db.tx.agentExecution.updateMany.mockClear()
+    db.agentSession.update.mockClear()
+
+    await expect(recorder.finalize({
+      status: "completed",
+      report: null,
+      owner: {
+        turnId: "turn_1",
+        executionAttempt: { id: "execution_1", userId: "user_1", attemptCount: 3 },
+        terminalStatus: "completed",
+      },
+    })).resolves.toBe(false)
+
+    expect(db.tx.agentExecution.updateMany).not.toHaveBeenCalled()
+    expect(db.agentSession.update).not.toHaveBeenCalled()
+  })
+
+  it("atomically terminalizes an implicit V2 Turn and its session before a later Stop", async () => {
+    const db = mockDb()
+    const recorder = await createRunSessionRecorder(db, {
+      userId: "user_1",
+      goal: "Implicit dual-write terminal",
+      sessionId: "session_1",
+      dualWrite: true,
+      deferActivation: true,
+    })
+    await recorder.activate({ executionAttempt: { id: "execution_1", attemptCount: 5 }, assertCurrent: async () => true })
+    expect(recorder.getTurnId()).toBe("turn_1")
+    db.tx.$queryRaw.mockClear()
+    db.tx.agentExecution.updateMany.mockClear()
+    db.tx.agentTurn.updateMany.mockClear()
+    db.agentSession.update.mockClear()
+
+    await expect(recorder.finalize({
+      status: "completed",
+      report: null,
+      owner: { turnId: "turn_1", executionAttempt: { id: "execution_1", userId: "user_1", attemptCount: 5 }, terminalStatus: "completed" },
+    })).resolves.toBe(true)
+
+    const lockSql = db.tx.$queryRaw.mock.calls.map(([query]) => queryText(query))
+    expect(lockSql[0]).toContain('FROM "agent_sessions"')
+    expect(lockSql[1]).toContain('FROM "agent_turns"')
+    expect(db.tx.agentExecution.updateMany).toHaveBeenCalledBefore(db.tx.agentTurn.updateMany)
+    expect(db.tx.agentTurn.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ id: "turn_1", sessionId: "session_1", status: { in: expect.any(Array) } }),
+      data: expect.objectContaining({ status: "completed" }),
+    }))
+    expect(db.tx.agentTurn.updateMany).toHaveBeenCalledBefore(db.agentSession.update)
+    await expect(db.state.stopTurn()).resolves.toEqual({ count: 0 })
+    expect(db.agentSession.update).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: "completed" }) }))
   })
 
   it("rejects a legacy transcript after the existing session closes", async () => {
@@ -363,6 +523,94 @@ describe("run session recorder", () => {
         body: "42 jobs queued",
       }),
     })
+  })
+
+  it("binds stage tasks to the exact Turn and refuses an old role_done after Stop", async () => {
+    const db = mockDb()
+    const dualRecord = vi.fn().mockResolvedValue({})
+    dualWriteMocks.createDualWriteSession.mockResolvedValueOnce({
+      sessionId: "session_1", userId: "user_1", turnId: "turn_1", record: dualRecord, finalize: vi.fn().mockResolvedValue(true),
+    })
+    const recorder = await createRunSessionRecorder(db, {
+      userId: "user_1", goal: "Owned stage task", sessionId: "session_1",
+      turnId: "turn_1", dualWrite: true, deferActivation: true,
+    })
+    await recorder.activate({
+      executionAttempt: { id: "execution_1", attemptCount: 7 },
+      assertCurrent: async () => true,
+    })
+
+    await recorder.record("role_start", { role: "scout", plan: "Find jobs" })
+    expect(db.subAgentTask.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ sessionId: "session_1", turnId: "turn_1", role: "scout" }),
+    })
+    expect(dualRecord).toHaveBeenCalledTimes(1)
+
+    await db.state.stopTurn()
+    db.tx.subAgentTask.update.mockClear()
+    await expect(recorder.record("role_done", { role: "scout", summary: "Late result" })).rejects.toThrow()
+
+    expect(db.tx.subAgentTask.update).not.toHaveBeenCalled()
+    expect(dualRecord).toHaveBeenCalledTimes(1)
+  })
+
+  it("persists a legacy agent question as non-approval content behind the ownership fence", async () => {
+    const db = mockDb()
+    const dualRecord = vi.fn().mockResolvedValue({})
+    dualWriteMocks.createDualWriteSession.mockResolvedValueOnce({
+      sessionId: "session_1", userId: "user_1", turnId: "turn_1", record: dualRecord, finalize: vi.fn().mockResolvedValue(true),
+    })
+    const recorder = await createRunSessionRecorder(db, {
+      userId: "user_1", goal: "Legacy question", sessionId: "session_1", ensureTurn: true, deferActivation: true,
+    })
+    await recorder.activate({
+      executionAttempt: { id: "execution_1", attemptCount: 8 },
+      assertCurrent: async () => true,
+    })
+    db.tx.$queryRaw.mockClear()
+    db.tx.agentExecution.updateMany.mockClear()
+
+    await expect(recorder.record("agent_question", { role: "analyst", questionId: "question_1", question: "Continue?" })).resolves.toMatchObject({
+      type: "subagent_result", title: "Question", body: "Continue?",
+    })
+
+    expect(db.tx.$queryRaw.mock.calls.map(([query]) => queryText(query)))
+      .toEqual(expect.arrayContaining([expect.stringContaining('FROM "agent_turns"')]))
+    expect(db.tx.agentExecution.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ id: "execution_1", userId: "user_1", sessionId: "session_1", attemptCount: 8 }),
+    }))
+    expect(dualRecord).not.toHaveBeenCalled()
+    expect(db.agentTranscriptEvent.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ type: "subagent_result", title: "Question", body: "Continue?" }),
+    })
+    expect(db.agentTranscriptEvent.create).not.toHaveBeenCalledWith({
+      data: expect.objectContaining({ type: "approval_request" }),
+    })
+  })
+
+  it("persists otherwise unmapped legacy events before allowing their SSE publication", async () => {
+    const db = mockDb()
+    const recorder = await createRunSessionRecorder(db, {
+      userId: "user_1", goal: "Generic legacy event", sessionId: "session_1", ensureTurn: true, deferActivation: true,
+    })
+    await recorder.activate({ executionAttempt: { id: "execution_1", attemptCount: 9 }, assertCurrent: async () => true })
+
+    await expect(recorder.record("job_skip", { message: "Below threshold" })).resolves.toMatchObject({
+      type: "subagent_result", title: "job skip", body: "Below threshold",
+    })
+
+    expect(db.agentTranscriptEvent.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ type: "subagent_result", title: "job skip", body: "Below threshold" }),
+    })
+    expect(db.tx.agentExecution.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        id: "execution_1",
+        userId: "user_1",
+        sessionId: "session_1",
+        attemptCount: 9,
+        status: { in: expect.any(Array) },
+      }),
+    }))
   })
 
   it("finalizes the session with completed status and quality score", async () => {

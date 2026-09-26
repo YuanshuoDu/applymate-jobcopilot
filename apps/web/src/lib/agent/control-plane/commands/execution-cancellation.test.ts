@@ -4,7 +4,7 @@ import type { CommandTransaction } from "./transaction"
 import { cancelExecutionInTransaction } from "./execution-cancellation"
 
 type State = {
-  execution: { id: string; sessionId: string; userId: string; status: string } | null
+  execution: { id: string; sessionId: string; userId: string; status: string; attemptCount: number } | null
   sessionSource: string | null
   sessionStatus: string
   active: { id: string; source: string; status: string; revision: number } | null
@@ -55,6 +55,8 @@ function makeTransaction(options: {
   approvals?: State["approvals"]
   inputs?: State["inputs"]
   items?: State["items"]
+  afterSessionLock?: (state: State) => void
+  attemptCount?: number
 }) {
   const state: State = {
     execution: {
@@ -62,6 +64,7 @@ function makeTransaction(options: {
       sessionId: "session_1",
       userId: options.userId ?? "user_1",
       status: options.executionStatus,
+      attemptCount: options.attemptCount ?? 4,
     },
     sessionSource: options.sessionSource,
     sessionStatus: "active",
@@ -79,6 +82,11 @@ function makeTransaction(options: {
   const tx = {
     $queryRaw: vi.fn(async (query: unknown) => {
       const strings = (query as { strings?: readonly string[] }).strings ?? []
+      const sql = strings.join(" ")
+      if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) {
+        options.afterSessionLock?.(state)
+        return [{ id: "session_1" }]
+      }
       if (strings.join(" ").includes("SELECT")) return [{ id: "session_1" }]
       sequence += BigInt(1)
       return [{ eventSequence: sequence }]
@@ -98,7 +106,7 @@ function makeTransaction(options: {
             && approval.sessionId === sessionId && approval.turnId === turnId
             && approval.type === "submit_application" && ["approved", "consumed"].includes(approval.status)
             && approval.payload.applicationTaskId === task.id)
-          const beforeSubmit = (task.status === "filling" && task.checkpoint !== "submission_request_started")
+          const beforeSubmit = (task.status === "filling" && !["submission_request_started", "submission_uncertain"].includes(task.checkpoint ?? ""))
             || (task.status === "waiting_for_authorization" && ["form_filled", "queue_retry"].includes(task.checkpoint ?? ""))
             || (task.status === "waiting_for_user" && task.checkpoint === "user_takeover")
           if (task.userId !== userId || task.sessionId !== sessionId || !beforeSubmit || !authorized) continue
@@ -130,13 +138,17 @@ function makeTransaction(options: {
     agentExecution: {
       findFirst: vi.fn(async (args: unknown) => {
         const where = whereOf(args)
-        if (!state.execution || where.id !== state.execution.id || where.userId !== state.execution.userId || (where.sessionId && where.sessionId !== state.execution.sessionId)) return null
-        return { id: state.execution.id, sessionId: state.execution.sessionId, status: state.execution.status }
+        if (!state.execution || where.id !== state.execution.id || where.userId !== state.execution.userId || (where.sessionId && where.sessionId !== state.execution.sessionId)
+          || (where.attemptCount !== undefined && where.attemptCount !== state.execution.attemptCount)) return null
+        return { id: state.execution.id, sessionId: state.execution.sessionId, status: state.execution.status, attemptCount: state.execution.attemptCount }
       }),
       updateMany: vi.fn(async (args: unknown) => {
         const where = whereOf(args)
         const statuses = (where.status as { in?: unknown[] } | undefined)?.in ?? []
-        if (!state.execution || !statuses.includes(state.execution.status)) return { count: 0 }
+        if (!state.execution || (where.id && where.id !== state.execution.id) || (where.userId && where.userId !== state.execution.userId)
+          || (where.sessionId && where.sessionId !== state.execution.sessionId)
+          || (where.attemptCount !== undefined && where.attemptCount !== state.execution.attemptCount)
+          || !statuses.includes(state.execution.status)) return { count: 0 }
         state.execution.status = "cancelled"
         return { count: 1 }
       }),
@@ -190,7 +202,11 @@ function makeTransaction(options: {
       }),
       updateMany: vi.fn(async () => ({ count: 1 })),
     },
-    agentApproval: { updateMany: vi.fn(async () => ({ count: 1 })) },
+    agentApproval: {
+      findMany: vi.fn(async () => []),
+      updateMany: vi.fn(async () => ({ count: 1 })),
+    },
+    agentRunQuestion: { deleteMany: vi.fn(async () => ({ count: 0 })) },
     agentEvent: {
       findFirst: vi.fn(async (args: unknown) => {
         const where = whereOf(args)
@@ -289,6 +305,40 @@ describe("execution cancellation transaction", () => {
     expect(sql).toContain("'running'")
   })
 
+  it("does not interrupt a Turn when the execution becomes terminal while waiting for the session lock", async () => {
+    const fake = makeTransaction({
+      executionStatus: "running",
+      sessionSource: "automation",
+      activeSource: "automation",
+      afterSessionLock: (state) => { state.execution!.status = "completed" },
+    })
+
+    await expect(cancelExecutionInTransaction(fake.tx, { executionId: "execution_1", userId: "user_1" })).resolves.toBe(false)
+
+    expect(fake.state.active).toMatchObject({ status: "in_progress", revision: 0 })
+    expect(fake.state.sessionStatus).toBe("active")
+    expect(fake.tx.agentTurn.updateMany).not.toHaveBeenCalled()
+    expect(fake.tx.agentExecution.updateMany).not.toHaveBeenCalled()
+    expect(fake.tx.agentSession.updateMany).not.toHaveBeenCalled()
+  })
+
+  it("cancels the exact execution and interrupts its Turn after the attempt is reclaimed while waiting for the session lock", async () => {
+    const fake = makeTransaction({
+      executionStatus: "running",
+      sessionSource: "automation",
+      activeSource: "automation",
+      afterSessionLock: (state) => { state.execution!.attemptCount += 1 },
+    })
+
+    await expect(cancelExecutionInTransaction(fake.tx, { executionId: "execution_1", userId: "user_1" })).resolves.toBe(true)
+
+    expect(fake.state.active).toMatchObject({ status: "interrupted", revision: 1 })
+    expect(fake.state.execution).toMatchObject({ status: "cancelled", attemptCount: 5 })
+    expect(fake.tx.agentTurn.updateMany).toHaveBeenCalledOnce()
+    expect(fake.tx.agentExecution.updateMany).toHaveBeenCalledOnce()
+    expect(fake.tx.agentSession.updateMany).toHaveBeenCalledOnce()
+  })
+
   it("cancels exact-turn follow-ups after interrupting the Turn and preserves timeline items", async () => {
     const previousCancelledAt = new Date("2026-09-15T12:00:00.000Z")
     const inputs: State["inputs"] = [
@@ -368,6 +418,7 @@ describe("execution cancellation transaction", () => {
     const query = (fake.tx.$executeRaw as unknown as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as { strings?: readonly string[] }
     const sql = query.strings?.join(" ") ?? ""
     expect(sql).toContain('application."checkpoint" IS DISTINCT FROM \'submission_request_started\'')
+    expect(sql).toContain('application."checkpoint" IS DISTINCT FROM \'submission_uncertain\'')
     expect(sql).toContain('application."status" = \'waiting_for_authorization\'')
     expect(sql).toContain('application."checkpoint" IN (\'form_filled\', \'queue_retry\')')
     expect(sql).toContain('approval."status" IN (\'approved\', \'consumed\')')
@@ -378,6 +429,7 @@ describe("execution cancellation transaction", () => {
   it("preserves application tasks that crossed the submit checkpoint and terminal tasks", async () => {
     const applicationTasks: State["applicationTasks"] = [
       { id: "application_started", userId: "user_1", sessionId: "session_1", status: "filling", checkpoint: "submission_request_started", completedAt: null },
+      { id: "application_uncertain_fill", userId: "user_1", sessionId: "session_1", status: "filling", checkpoint: "submission_uncertain", completedAt: null },
       { id: "application_submitted", userId: "user_1", sessionId: "session_1", status: "submitted", checkpoint: "submitted", completedAt: new Date("2026-09-16T12:00:00.000Z") },
     ]
     const approvals: State["approvals"] = applicationTasks.map((task) => ({

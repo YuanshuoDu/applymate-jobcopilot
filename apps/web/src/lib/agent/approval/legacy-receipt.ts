@@ -1,8 +1,9 @@
-import type { PrismaClient } from "@prisma/client"
+import type { Prisma, PrismaClient } from "@prisma/client"
 import { type ApprovalType } from "@jobcopilot/agent-protocol"
 import { hashAgentReceiptValue } from "@jobcopilot/shared"
 
 import { consumeApprovalAndReserve, issueApprovalReceipt, validatePendingApprovalReceipt } from "./store"
+import type { PreparedApprovalReceipt } from "./receipt-issue-owner"
 import { reissueApprovalNonce } from "./receipt-rotation"
 import { decideApproval } from "../broker/store"
 import { waitItemId } from "../broker/item-ids"
@@ -26,9 +27,18 @@ export interface LegacyReceiptInput {
   revision?: number
   expiresAt?: Date
   projectWait?: boolean
+  executionAttempt?: { id: string; attemptCount: number }
+  signal?: AbortSignal
+  prepareInTransaction?: (tx: Prisma.TransactionClient) => Promise<{
+    taskId?: string | null
+    payload?: unknown
+    resource?: unknown
+    material?: unknown
+    answers?: unknown
+  }>
 }
 
-export interface LegacyReceiptConsumeInput extends Omit<LegacyReceiptInput, "title" | "body" | "impact" | "payload"> {
+export interface LegacyReceiptConsumeInput extends Omit<LegacyReceiptInput, "title" | "body" | "impact" | "payload" | "prepareInTransaction"> {
   approvalId: string
   nonce: string
   reservationKey?: string
@@ -56,26 +66,29 @@ export type LegacyApprovalResolution =
 export { ApprovalWaitActiveError }
 
 export async function issueLegacyReceipt(db: PrismaClient, input: LegacyReceiptInput): Promise<ApprovalReceiptResult> {
-  const scope: ApprovalScopeInput = {
-    userId: input.userId,
-    sessionId: input.sessionId,
-    turnId: input.turnId,
-    jobId: input.jobId,
-    toolCallId: input.toolCallId,
-    action: input.action,
-    resourceHash: await hashLegacyValue("resource", input.resource),
-    materialHash: await hashLegacyValue("material", input.material),
-    answersHash: await hashLegacyValue("answers", input.answers ?? null),
-    revision: input.revision ?? 0,
-    expiresAt: input.expiresAt ?? new Date(Date.now() + 15 * 60 * 1000),
-  }
+  const effectiveInput = { ...input, expiresAt: input.expiresAt ?? new Date(Date.now() + 15 * 60 * 1000) }
+  const scope = await legacyScope(effectiveInput)
+  const prepareInTransaction = effectiveInput.prepareInTransaction
+    ? async (tx: Prisma.TransactionClient): Promise<PreparedApprovalReceipt> => {
+        const prepared = await effectiveInput.prepareInTransaction!(tx)
+        const preparedScope = await legacyScope({ ...effectiveInput, ...prepared })
+        return {
+          scope: preparedScope,
+          ...(prepared.taskId !== undefined ? { taskId: prepared.taskId } : {}),
+          ...(prepared.payload !== undefined ? { payload: prepared.payload as never } : {}),
+        }
+      }
+    : undefined
   return issueApprovalReceipt(db, {
     scope,
-    title: input.title,
-    body: input.body,
-    impact: input.impact as never,
-    payload: input.payload as never,
-    projectWait: input.projectWait,
+    title: effectiveInput.title,
+    body: effectiveInput.body,
+    impact: effectiveInput.impact as never,
+    payload: effectiveInput.payload as never,
+    projectWait: effectiveInput.projectWait,
+    executionAttempt: effectiveInput.executionAttempt,
+    signal: effectiveInput.signal,
+    prepareInTransaction,
   })
 }
 
@@ -131,7 +144,7 @@ export async function hashLegacyValue(label: string, value: unknown): Promise<st
   return hashAgentReceiptValue(label, value)
 }
 
-async function legacyScope(input: LegacyReceiptConsumeInput): Promise<ApprovalScopeInput> {
+async function legacyScope(input: Pick<LegacyReceiptInput, "userId" | "sessionId" | "turnId" | "jobId" | "toolCallId" | "action" | "resource" | "material" | "answers" | "revision" | "expiresAt">): Promise<ApprovalScopeInput> {
   return {
     userId: input.userId,
     sessionId: input.sessionId,

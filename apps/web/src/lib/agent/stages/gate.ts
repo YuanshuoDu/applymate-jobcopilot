@@ -14,22 +14,20 @@
  *     skipped  — below minMatchScore
  */
 import { modelChat } from '@/lib/model-router'
-import { db } from '@/lib/db'
 import type { AiConfig } from '@/lib/model-router'
 import type {
   PipelineCtx, ApplicationPackage, GateOutput, StageResult,
 } from '../types'
 import { stageOk } from '../types'
+import { skipApplicationForGate } from '../application-control'
+import { AgentExecutionCancelledError } from '../execution-control'
 import { roleAiConfig } from '../role-config'
-import { holdForApplicationReview } from '../application-control'
 import { requireLegacyPolicy } from '../policy/legacy'
-import { clientReceipt, issueLegacyReceipt } from '../approval/legacy-receipt'
-import { ensureV2Turn } from '../session/v2-turn'
-import { randomUUID } from 'node:crypto'
 import { hashArtifactConstraints } from '../artifacts/hash'
 import { preflightArtifact, reviewArtifact } from '../artifacts/review'
 import { artifactItemData } from '../artifacts/item'
 import { tailoringConstraints } from './prepare'
+import { createGateReviewReceipt } from './gate-review-receipt'
 
 // ── AI Quality Review ─────────────────────────────────────────────────────────
 
@@ -38,6 +36,12 @@ interface QualityResult {
   fitGap:        string   // key missing skills / gaps
   recommendation: string  // one-line suggestion
   readyToApply:  boolean  // overall assessment
+}
+
+function gateWriteOwner(ctx: PipelineCtx) {
+  if (!ctx.sessionId) return undefined
+  if (!ctx.turnId || !ctx.executionAttempt) throw new AgentExecutionCancelledError()
+  return { turnId: ctx.turnId, executionAttempt: ctx.executionAttempt, signal: ctx.signal }
 }
 
 async function reviewApplicationQuality(
@@ -141,9 +145,12 @@ export async function runGate(
           : (emit('agent_question', { role: 'reviewer', questionId: `poor_cl_${pkg.job.id}`, question, options }), 'review')
         if (decision === 'skip') {
           skipped.push(pkg)
-          await db.applicationTask?.updateMany({
-            where: { userId: ctx.userId, jobId: pkg.job.id, status: { in: ['analyzing', 'generating_materials'] } },
-            data: { status: 'skipped', checkpoint: 'review_quality_declined', completedAt: new Date() },
+          await skipApplicationForGate({
+            userId: ctx.userId,
+            jobId: pkg.job.id,
+            sessionId: ctx.sessionId,
+            checkpoint: 'review_quality_declined',
+            owner: gateWriteOwner(ctx),
           })
           continue
         }
@@ -152,9 +159,12 @@ export async function runGate(
 
     if (pkg.score < minMatchScore && !includeBorderline) {
       skipped.push(pkg)
-      await db.applicationTask?.updateMany({
-        where: { userId: ctx.userId, jobId: pkg.job.id, status: { in: ["analyzing", "generating_materials"] } },
-        data: { status: "skipped", checkpoint: "below_match_threshold", completedAt: new Date() },
+      await skipApplicationForGate({
+        userId: ctx.userId,
+        jobId: pkg.job.id,
+        sessionId: ctx.sessionId,
+        checkpoint: 'below_match_threshold',
+        owner: gateWriteOwner(ctx),
       })
       emit('agent_observation', {
         role:        'reviewer',
@@ -197,15 +207,8 @@ export async function runGate(
         capabilities: ['read', 'write'], input: { requiresReceipt: false, unknownSensitiveFacts: false, jobId: pkg.job.id },
       })
     }
-    const task = await holdForApplicationReview({
-      userId: ctx.userId,
-      jobId: pkg.job.id,
-      sessionId: ctx.sessionId,
-      resumeId: reviewedPackage.tailoredResumeId ?? ctx.defaultResume.id,
-      coverLetterId: reviewedPackage.coverLetterId,
-    })
     const approval = ctx.sessionId
-      ? await createReviewReceipt(ctx, task.id, reviewedPackage, projectedWaitIssued)
+      ? await createGateReviewReceipt(ctx, reviewedPackage, projectedWaitIssued)
       : null
     if (approval?.projectedWait) projectedWaitIssued = true
     emit('agent_observation', {
@@ -235,56 +238,4 @@ export async function runGate(
     approved.length + pending.length + skipped.length,
     total,
   )
-}
-
-async function createReviewReceipt(
-  ctx: PipelineCtx,
-  applicationTaskId: string,
-  pkg: ApplicationPackage,
-  projectedWaitAlreadyIssued: boolean,
-) {
-  const sessionId = ctx.sessionId
-  if (!sessionId) throw new Error("Application review is missing its Agent session")
-  const turn = await ensureV2Turn(db, {
-    sessionId,
-    userId: ctx.userId,
-    goal: `Review application for ${pkg.job.company} · ${pkg.job.role}`,
-    source: "user",
-  })
-  const currentTurn = await db.agentTurn.findFirst({
-    where: { id: turn.turnId, sessionId, userId: ctx.userId },
-    select: { revision: true, status: true },
-  })
-  const artifactBindings = (pkg.artifactReviews ?? []).map(review => ({
-    artifactId: review.artifactId,
-    artifactHash: review.artifactHash,
-    constraintHash: review.constraintHash,
-    status: review.status,
-  }))
-  const payload = {
-    applicationTaskId,
-    jobId: pkg.job.id,
-    ...(artifactBindings.length ? { artifactBindings } : {}),
-  }
-  const projectedWait = !projectedWaitAlreadyIssued && currentTurn?.status !== "waiting_for_approval"
-  const result = await issueLegacyReceipt(db, {
-    userId: ctx.userId,
-    sessionId,
-    turnId: turn.turnId,
-    toolCallId: `application-review:${randomUUID()}`,
-    jobId: pkg.job.id,
-    action: "review_application",
-    title: `Review application: ${pkg.job.company} · ${pkg.job.role}`,
-    body: "Review the job, tailored materials, and every proposed answer. Approval here only unlocks the form-fill pass; it never submits by itself.",
-    impact: { externalSubmission: false, jobId: pkg.job.id },
-    payload,
-    resource: { jobId: pkg.job.id },
-    material: payload,
-    revision: currentTurn?.revision ?? 0,
-    projectWait: projectedWait,
-  })
-  return {
-    projectedWait,
-    receipt: clientReceipt(result, { externalSubmission: false, jobId: pkg.job.id }),
-  }
 }

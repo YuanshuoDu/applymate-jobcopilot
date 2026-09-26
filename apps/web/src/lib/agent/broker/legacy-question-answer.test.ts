@@ -22,6 +22,7 @@ interface TurnRow extends Json {
   userId: string
   status: string
   revision: number
+  input?: unknown
 }
 
 interface ItemRow extends Json {
@@ -44,6 +45,7 @@ interface FixtureState {
   outbox: Json[]
   sequence: bigint
   failOutbox: boolean
+  execution: { id: string; sessionId: string; userId: string; status: string; attemptCount: number; workerTaskId: string | null }
 }
 
 function value(row: Json, key: string): unknown {
@@ -76,6 +78,7 @@ function baseState(): FixtureState {
       },
     },
     events: [], outbox: [], sequence: BigInt(0), failOutbox: false,
+    execution: { id: "execution_1", sessionId: "session_1", userId: "user_1", status: "waiting_for_user", attemptCount: 4, workerTaskId: null },
   }
 }
 
@@ -84,8 +87,21 @@ function makeFixture() {
   const tx = {
     $queryRaw: vi.fn(async (query: unknown) => {
       const strings = (query as { strings?: readonly string[] }).strings ?? []
-      if (strings.join(" ").includes("SELECT")) {
-        return state.session ? [{ ...state.session }] : []
+      const sql = strings.join(" ")
+      if (sql.includes('FROM "agent_sessions"')) return state.session ? [{ ...state.session }] : []
+      if (sql.includes('FROM "agent_turns"')) {
+        const active = state.turns.filter(row => row.sessionId === "session_1" && row.userId === "user_1"
+          && ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"].includes(row.status))
+        if (sql.includes('SELECT "id", "input" FROM "agent_turns"')) {
+          return active.map(row => ({ id: row.id, input: row.input ?? {} }))
+        }
+        if (sql.includes('SELECT "id" FROM "agent_turns"')) return active.map(row => ({ id: row.id }))
+        const turnId = String((query as { values?: readonly unknown[] }).values?.[0] ?? "")
+        const turn = state.turns.find(row => row.id === turnId && ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"].includes(row.status))
+        return turn ? [{ ...turn }] : []
+      }
+      if (sql.includes('FROM "agent_executions"')) {
+        return [{ id: state.execution.id, status: state.execution.status, attemptCount: state.execution.attemptCount, workerTaskId: state.execution.workerTaskId }]
       }
       state.sequence += BigInt(1)
       return [{ eventSequence: state.sequence }]
@@ -103,6 +119,16 @@ function makeFixture() {
           !matchesString(question, "runId", where.runId) || (where.answer === null && question.answer !== null)) return { count: 0 }
         question.answer = typeof data.answer === "string" ? data.answer : null
         question.answeredAt = data.answeredAt instanceof Date ? data.answeredAt : null
+        return { count: 1 }
+      }),
+    },
+    agentExecution: {
+      updateMany: vi.fn(async ({ where, data }: { where: Json; data: Json }) => {
+        if (where.id !== state.execution.id || where.userId !== state.execution.userId || where.sessionId !== state.execution.sessionId
+          || where.status !== state.execution.status || where.attemptCount !== state.execution.attemptCount
+          || ("workerTaskId" in where && where.workerTaskId !== state.execution.workerTaskId)) return { count: 0 }
+        state.execution.status = String(data.status)
+        if ("workerTaskId" in data) state.execution.workerTaskId = typeof data.workerTaskId === "string" ? data.workerTaskId : null
         return { count: 1 }
       }),
     },
@@ -153,6 +179,7 @@ function makeFixture() {
         state.outbox.push(data)
         return data
       }),
+      findUnique: vi.fn(async ({ where }: { where: Json }) => state.outbox.find(row => row.idempotencyKey === where.idempotencyKey) ?? null),
     },
   }
   const db = {
@@ -170,6 +197,243 @@ function makeFixture() {
 }
 
 describe("answerLegacyQuestion", () => {
+  it("answers a Turn-prefixed question without an AgentItem when transcript dual-write is off", async () => {
+    const fixture = makeFixture()
+    fixture.state.question!.id = "agent-question:turn_1:legacy:q1"
+    fixture.state.item = null
+
+    const result = await answerLegacyQuestion(fixture.db, {
+      questionId: fixture.state.question!.id, userId: "user_1", answer: "yes",
+    })
+
+    expect(result).toMatchObject({
+      disposition: "legacy_dispatch_accepted", sessionId: "session_1", turnId: "turn_1",
+      executionId: "execution_1", attemptCount: 4,
+    })
+    expect(fixture.state.question?.answer).toBe("yes")
+    expect(fixture.state.execution.status).toBe("queued")
+    expect(fixture.state.outbox).toHaveLength(1)
+    expect(fixture.state.outbox[0]).toMatchObject({
+      topic: "agent.execution.dispatch", aggregateId: "session_1",
+      idempotencyKey: `legacy-execution-dispatch:execution_1:4:${fixture.state.question!.id}`,
+      payload: { userId: "user_1", sessionId: "session_1", executionId: "execution_1", attemptCount: 4, questionId: fixture.state.question!.id },
+    })
+    expect(fixture.state.events).toHaveLength(0)
+    const locks = fixture.tx.$queryRaw.mock.calls.map(([query]) => (query as { strings?: readonly string[] }).strings?.join(" ") ?? "")
+    expect(locks[0]).toContain('FROM "agent_sessions"')
+    expect(locks[1]).toContain('FROM "agent_turns"')
+    expect(locks[2]).toContain('FROM "agent_executions"')
+  })
+
+  it("returns already-resuming for the same answered question while its exact Turn is in progress", async () => {
+    const fixture = makeFixture()
+    fixture.state.question!.id = "agent-question:turn_1:legacy:q1"
+    fixture.state.question!.answer = "yes"
+    fixture.state.item = null
+    fixture.state.turns[0]!.status = "in_progress"
+    fixture.state.execution.status = "running"
+
+    const result = await answerLegacyQuestion(fixture.db, {
+      questionId: fixture.state.question!.id, userId: "user_1", answer: "yes",
+    })
+
+    expect(result).toMatchObject({ disposition: "legacy_already_resuming", turnId: "turn_1", executionId: "execution_1" })
+    expect(fixture.state.question?.answer).toBe("yes")
+    expect(fixture.state.execution.status).toBe("running")
+    expect(fixture.tx.agentExecution.updateMany).not.toHaveBeenCalled()
+    expect(fixture.tx.agentItem.findFirst).not.toHaveBeenCalled()
+  })
+  it("returns pending for a duplicate while the exact queued attempt has its durable intent", async () => {
+    const fixture = makeFixture()
+    fixture.state.question!.id = "agent-question:turn_1:legacy:q1"
+    fixture.state.item = null
+
+    const first = await answerLegacyQuestion(fixture.db, {
+      questionId: fixture.state.question!.id, userId: "user_1", answer: "yes",
+    })
+    const duplicate = await answerLegacyQuestion(fixture.db, {
+      questionId: fixture.state.question!.id, userId: "user_1", answer: "yes",
+    })
+
+    expect(first).toMatchObject({ disposition: "legacy_dispatch_accepted" })
+    expect(duplicate).toMatchObject({
+      disposition: "legacy_dispatch_pending",
+      outboxId: fixture.state.outbox[0]?.id,
+      idempotencyKey: fixture.state.outbox[0]?.idempotencyKey,
+    })
+    expect(fixture.tx.agentOutbox.create).toHaveBeenCalledTimes(1)
+    expect(fixture.state.outbox).toHaveLength(1)
+  })
+  it("rolls the legacy answer and queued attempt back when outbox insertion fails", async () => {
+    const fixture = makeFixture()
+    fixture.state.question!.id = "agent-question:turn_1:legacy:q1"
+    fixture.state.item = null
+    fixture.state.failOutbox = true
+
+    await expect(answerLegacyQuestion(fixture.db, {
+      questionId: fixture.state.question!.id, userId: "user_1", answer: "yes",
+    })).rejects.toThrow("outbox write failed")
+
+    expect(fixture.state.question?.answer).toBeNull()
+    expect(fixture.state.execution.status).toBe("waiting_for_user")
+    expect(fixture.state.outbox).toHaveLength(0)
+  })
+  it("keeps canonical-mode questions bridge-pending when their AgentItem is missing", async () => {
+    const fixture = makeFixture()
+    fixture.state.question!.id = "agent-question:turn_1:canonical:q1"
+    fixture.state.item = null
+
+    const result = await answerLegacyQuestion(fixture.db, {
+      questionId: fixture.state.question!.id, userId: "user_1", answer: "yes",
+    })
+
+    expect(result).toMatchObject({ disposition: "bridge_pending", reason: "canonical_item_missing" })
+    expect(fixture.state.question?.answer).toBeNull()
+    expect(fixture.state.execution.status).toBe("waiting_for_user")
+    expect(fixture.tx.agentExecution.updateMany).not.toHaveBeenCalled()
+  })
+
+  it("does not answer or queue when Stop interrupted the exact namespaced Turn first", async () => {
+    const fixture = makeFixture()
+    fixture.state.question!.id = "agent-question:turn_1:legacy:q1"
+    fixture.state.item = null
+    fixture.state.turns[0]!.status = "interrupted"
+
+    const result = await answerLegacyQuestion(fixture.db, {
+      questionId: fixture.state.question!.id, userId: "user_1", answer: "yes",
+    })
+
+    expect(result).toMatchObject({ disposition: "legacy_only", reason: "turn_not_waiting" })
+    expect(fixture.state.question?.answer).toBeNull()
+    expect(fixture.state.execution.status).toBe("waiting_for_user")
+    expect(fixture.tx.agentExecution.updateMany).not.toHaveBeenCalled()
+  })
+
+  it("queues an unnamespaced legacy answer through a durable intent when no Turn exists", async () => {
+    const fixture = makeFixture()
+    fixture.state.question!.id = "legacy_question_1"
+    fixture.state.turns = []
+    fixture.state.item = null
+
+    const result = await answerLegacyQuestion(fixture.db, {
+      questionId: fixture.state.question!.id, userId: "user_1", answer: "yes",
+    })
+
+    expect(result).toMatchObject({
+      disposition: "legacy_dispatch_accepted", questionId: "legacy_question_1", sessionId: "session_1",
+      executionId: "execution_1", attemptCount: 4,
+    })
+    expect(fixture.state.question?.answer).toBe("yes")
+    expect(fixture.state.execution.status).toBe("queued")
+    expect(fixture.state.outbox).toHaveLength(1)
+    expect(fixture.state.outbox[0]).toMatchObject({
+      topic: "agent.execution.dispatch", aggregateId: "session_1",
+      idempotencyKey: "legacy-execution-dispatch:execution_1:4:legacy_question_1",
+      payload: { userId: "user_1", sessionId: "session_1", executionId: "execution_1", attemptCount: 4, questionId: "legacy_question_1" },
+    })
+  })
+
+  it("reuses the outbox intent for an unnamespaced same-answer retry after commit", async () => {
+    const fixture = makeFixture()
+    fixture.state.question!.id = "legacy_question_1"
+    fixture.state.turns = []
+    fixture.state.item = null
+
+    const first = await answerLegacyQuestion(fixture.db, {
+      questionId: fixture.state.question!.id, userId: "user_1", answer: "yes",
+    })
+    const retry = await answerLegacyQuestion(fixture.db, {
+      questionId: fixture.state.question!.id, userId: "user_1", answer: "yes",
+    })
+
+    expect(first).toMatchObject({ disposition: "legacy_dispatch_accepted" })
+    expect(retry).toMatchObject({
+      disposition: "legacy_dispatch_pending", outboxId: fixture.state.outbox[0]?.id,
+      idempotencyKey: fixture.state.outbox[0]?.idempotencyKey,
+    })
+    expect(fixture.tx.agentOutbox.create).toHaveBeenCalledTimes(1)
+    expect(fixture.state.outbox).toHaveLength(1)
+  })
+
+  it("reports an unnamespaced same-answer retry as resuming after the Worker creates its Turn", async () => {
+    const fixture = makeFixture()
+    fixture.state.question!.id = "legacy_question_1"
+    fixture.state.question!.answer = "yes"
+    fixture.state.turns[0]!.input = { legacyResumeQuestionId: "legacy_question_1" }
+    fixture.state.turns[0]!.status = "in_progress"
+    fixture.state.execution.status = "running"
+    fixture.state.execution.workerTaskId = "worker_task_1"
+    fixture.state.item = null
+
+    const result = await answerLegacyQuestion(fixture.db, {
+      questionId: fixture.state.question!.id, userId: "user_1", answer: "yes",
+    })
+
+    expect(result).toMatchObject({ disposition: "legacy_already_resuming", questionId: "legacy_question_1", executionId: "execution_1" })
+    expect(fixture.state.execution.status).toBe("running")
+    expect(fixture.state.outbox).toHaveLength(0)
+    expect(fixture.tx.agentExecution.updateMany).not.toHaveBeenCalled()
+  })
+
+  it("returns legacy_answered for an answered raw duplicate without exact Turn provenance", async () => {
+    const fixture = makeFixture()
+    fixture.state.question!.id = "legacy_question_1"
+    fixture.state.question!.answer = "yes"
+    fixture.state.turns[0]!.status = "in_progress"
+    fixture.state.execution.status = "running"
+    fixture.state.execution.workerTaskId = "later_worker_task"
+    fixture.state.item = null
+
+    const result = await answerLegacyQuestion(fixture.db, {
+      questionId: "legacy_question_1", userId: "user_1", answer: "yes",
+    })
+
+    expect(result).toMatchObject({
+      disposition: "legacy_answered", questionId: "legacy_question_1", sessionId: "session_1", answer: "yes",
+    })
+    expect(fixture.state.question?.answer).toBe("yes")
+    expect(fixture.state.turns[0]?.status).toBe("in_progress")
+    expect(fixture.state.execution).toMatchObject({ status: "running", workerTaskId: "later_worker_task" })
+    expect(fixture.tx.agentRunQuestion.updateMany).not.toHaveBeenCalled()
+    expect(fixture.tx.agentItem.updateMany).not.toHaveBeenCalled()
+    expect(fixture.tx.agentTurn.updateMany).not.toHaveBeenCalled()
+    expect(fixture.tx.agentExecution.updateMany).not.toHaveBeenCalled()
+    expect(fixture.tx.agentOutbox.create).not.toHaveBeenCalled()
+    expect(fixture.state.events).toHaveLength(0)
+    expect(fixture.state.outbox).toHaveLength(0)
+  })
+  it("rolls back an unnamespaced answer and execution claim when outbox insert fails", async () => {
+    const fixture = makeFixture()
+    fixture.state.question!.id = "legacy_question_1"
+    fixture.state.turns = []
+    fixture.state.item = null
+    fixture.state.failOutbox = true
+
+    await expect(answerLegacyQuestion(fixture.db, {
+      questionId: fixture.state.question!.id, userId: "user_1", answer: "yes",
+    })).rejects.toThrow("outbox write failed")
+
+    expect(fixture.state.question?.answer).toBeNull()
+    expect(fixture.state.execution.status).toBe("waiting_for_user")
+    expect(fixture.state.outbox).toHaveLength(0)
+  })
+
+  it("does not project a legacy answer when an active canonical Turn owns the session", async () => {
+    const fixture = makeFixture()
+    fixture.state.question!.id = "legacy_question_1"
+    fixture.state.item = null
+
+    const result = await answerLegacyQuestion(fixture.db, {
+      questionId: fixture.state.question!.id, userId: "user_1", answer: "yes",
+    })
+
+    expect(result).toMatchObject({ disposition: "bridge_pending", reason: "canonical_item_missing" })
+    expect(fixture.state.question?.answer).toBeNull()
+    expect(fixture.state.execution.status).toBe("waiting_for_user")
+    expect(fixture.state.outbox).toHaveLength(0)
+    expect(fixture.tx.agentExecution.updateMany).not.toHaveBeenCalled()
+  })
+
   it("answers a proven question and emits redacted answer and wakeup facts", async () => {
     const fixture = makeFixture()
     const result = await answerLegacyQuestion(fixture.db, { questionId: "question_1", userId: "user_1", answer: "yes", now: new Date("2026-09-21T12:00:00.000Z") })
@@ -198,9 +462,21 @@ describe("answerLegacyQuestion", () => {
     expect(fixture.state.turns[0]?.revision).toBe(6)
   })
 
+  it("does not bridge a namespaced question when its exact Turn is missing", async () => {
+    const fixture = makeFixture()
+    fixture.state.question!.id = "agent-question:turn_missing:legacy:q1"
+    fixture.state.turns = []
+
+    await expect(answerLegacyQuestion(fixture.db, {
+      questionId: fixture.state.question!.id,
+      userId: "user_1",
+      answer: "yes",
+    })).resolves.toMatchObject({ disposition: "legacy_only", reason: "turn_not_waiting" })
+    expect(fixture.state.question?.answer).toBeNull()
+  })
+
   it.each([
     ["missing session", (state: FixtureState) => { state.session = null }, { disposition: "legacy_only", reason: "session_unmapped" }],
-    ["missing active turn", (state: FixtureState) => { state.turns = [] }, { disposition: "legacy_only", reason: "no_active_turn" }],
     ["non-waiting turn", (state: FixtureState) => { state.turns[0]!.status = "in_progress" }, { disposition: "legacy_only", reason: "turn_not_waiting" }],
     ["ambiguous active turns", (state: FixtureState) => { state.turns.push({ ...state.turns[0]!, id: "turn_2" }) }, { disposition: "bridge_pending", reason: "active_turn_ambiguous" }],
     ["missing item", (state: FixtureState) => { state.item = null }, { disposition: "bridge_pending", reason: "canonical_item_missing" }],

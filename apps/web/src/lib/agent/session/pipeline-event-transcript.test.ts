@@ -25,7 +25,14 @@ describe('pipeline event transcript projection', () => {
     })
   })
 
-  it('returns null for events with no legacy transcript projection', () => {
-    expect(mapPipelineEventToTranscript('unknown_event', { message: 'ignore me' })).toBeNull()
+  it('keeps agent questions as non-approval transcript records and preserves unknown events generically', () => {
+    expect(mapPipelineEventToTranscript('agent_question', {
+      questionId: 'missing_description', question: 'Continue?'
+    })).toEqual({
+      type: 'subagent_result', speaker: 'Agent', title: 'Question', body: 'Continue?',
+    })
+    expect(mapPipelineEventToTranscript('unknown_event', { message: 'keep this event' })).toEqual({
+      type: 'subagent_result', speaker: 'Agent', title: 'unknown event', body: 'keep this event',
+    })
   })
 })

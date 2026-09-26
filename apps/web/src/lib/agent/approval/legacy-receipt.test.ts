@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import type { Prisma, PrismaClient } from "@prisma/client"
 
 const mocks = vi.hoisted(() => ({
   consumeApprovalAndReserve: vi.fn(),
@@ -121,5 +122,87 @@ describe("resolveLegacyApproval same-Turn fence", () => {
     await expect(resolveLegacyApproval(fakeDb(), { approval: approvalRecord(), userId: "user_1", sessionId: "session_1", decision: "rejected" })).rejects.toMatchObject({ code: "approval_wait_active" })
     expect(mocks.resolvePendingApprovalInTransaction).not.toHaveBeenCalled()
     expect(mocks.appendAgentEventWithOutboxInTransaction).not.toHaveBeenCalled()
+  })
+})
+
+describe("issueLegacyReceipt transaction preparation", () => {
+  beforeEach(() => {
+    vi.resetModules()
+    Object.values(mocks).forEach((mock) => mock.mockReset())
+  })
+
+  it("recomputes the receipt scope from the task linked inside the owner-fenced transaction", async () => {
+    const { hashLegacyValue, issueLegacyReceipt } = await import("./legacy-receipt")
+    const payload = { jobId: "job_1", applicationTaskId: "application_task_1" }
+    const prepareInTransaction = vi.fn(async () => ({ taskId: "application_task_1", payload, material: payload }))
+
+    await issueLegacyReceipt({} as PrismaClient, {
+      userId: "user_1",
+      sessionId: "session_1",
+      turnId: "turn_1",
+      toolCallId: "review_1",
+      jobId: "job_1",
+      action: "review_application",
+      title: "Review application",
+      body: "Review materials",
+      payload: { jobId: "job_1" },
+      resource: { jobId: "job_1" },
+      material: { jobId: "job_1" },
+      revision: 7,
+      expiresAt: new Date("2026-10-01T00:00:00.000Z"),
+      prepareInTransaction,
+    })
+
+    const storeInput = mocks.issueApprovalReceipt.mock.calls[0]?.[1]
+    const prepared = await storeInput.prepareInTransaction({} as Prisma.TransactionClient)
+
+    expect(prepareInTransaction).toHaveBeenCalledOnce()
+    expect(storeInput.scope).toMatchObject({ turnId: "turn_1", revision: 7 })
+    expect(prepared).toMatchObject({ taskId: "application_task_1", payload })
+    expect(prepared.scope.materialHash).toBe(await hashLegacyValue("material", payload))
+    expect(prepared.scope).toMatchObject({ sessionId: "session_1", turnId: "turn_1", jobId: "job_1", action: "review_application" })
+  })
+})
+
+describe("issueLegacyReceipt transaction preparation", () => {
+  beforeEach(() => {
+    vi.resetModules()
+    Object.values(mocks).forEach((mock) => mock.mockReset())
+  })
+
+  it("recomputes the receipt scope from the task linked inside the owner-fenced transaction", async () => {
+    const { hashLegacyValue, issueLegacyReceipt } = await import("./legacy-receipt")
+    const payload = { jobId: "job_1", applicationTaskId: "application_task_1" }
+    const prepareInTransaction = vi.fn(async () => ({
+      taskId: "application_task_1",
+      payload,
+      material: payload,
+    }))
+
+    await issueLegacyReceipt({} as PrismaClient, {
+      userId: "user_1",
+      sessionId: "session_1",
+      turnId: "turn_1",
+      toolCallId: "review_1",
+      jobId: "job_1",
+      action: "review_application",
+      title: "Review application",
+      body: "Review materials",
+      payload: { jobId: "job_1" },
+      resource: { jobId: "job_1" },
+      material: { jobId: "job_1" },
+      revision: 7,
+      expiresAt: new Date("2026-10-01T00:00:00.000Z"),
+      prepareInTransaction,
+    })
+
+    const storeInput = mocks.issueApprovalReceipt.mock.calls[0]?.[1]
+    const prepared = await storeInput.prepareInTransaction({} as Prisma.TransactionClient)
+
+    expect(prepareInTransaction).toHaveBeenCalledOnce()
+    expect(storeInput.scope).toMatchObject({ turnId: "turn_1", revision: 7 })
+    expect(prepared).toMatchObject({ taskId: "application_task_1", payload })
+    expect(prepared.scope.materialHash).toBe(await hashLegacyValue("material", payload))
+    expect(prepared.scope).toMatchObject({ sessionId: "session_1", turnId: "turn_1", jobId: "job_1", action: "review_application" })
   })
 })

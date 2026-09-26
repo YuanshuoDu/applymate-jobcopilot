@@ -52,6 +52,15 @@ export function mapPipelineEventToTranscript(event: string, data: unknown): Tran
     }
   }
 
+  if (event === "agent_question") {
+    return {
+      type: "subagent_result",
+      speaker: roleSpeaker(data),
+      title: "Question",
+      body: messageBody(data, ["question", "message"], "Agent requested input."),
+    }
+  }
+
   if (event === "application_review_ready") {
     const approval = data && typeof data === "object"
       ? (data as { approval?: { title?: string; body?: string } }).approval
@@ -188,7 +197,12 @@ export function mapPipelineEventToTranscript(event: string, data: unknown): Tran
     }
   }
 
-  return null
+  return {
+    type: event === "job_error" || event === "error" ? "error" : "subagent_result",
+    speaker: roleSpeaker(data),
+    title: event.replace(/_/g, " "),
+    body: messageBody(data, ["message", "summary", "reason", "error", "label"], `Recorded ${event}.`),
+  }
 }
 
 export function summarizeReport(report: Partial<RunReport> | null) {

@@ -13,6 +13,7 @@ import { insertProjectedTranscript } from "./transcript-projector"
 import type { AgentSessionStatus } from "./types"
 import type { AppendTranscriptEventInput } from "./repository"
 import { ensureV2Turn, lockOpenSession, type EnsureV2TurnInput, type V2TurnHandle } from "./v2-turn"
+import { AgentExecutionCancelledError } from "../execution-control"
 
 export interface RawPipelineEvent {
   name: string
@@ -27,8 +28,12 @@ export interface DualWriteFinalizeInput {
 
 export interface DualWriteSession extends V2TurnHandle {
   record(input: AppendTranscriptEventInput, raw?: RawPipelineEvent): Promise<unknown>
-  finalize(input: DualWriteFinalizeInput): Promise<void>
+  finalize(input: DualWriteFinalizeInput): Promise<boolean>
 }
+
+const ACTIVE_TURN_STATUSES = ["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"] as const
+const TERMINAL_DRAIN_STATUSES = ["completed", "failed", "waiting_for_user"] as const
+type DualWriteOwnership = { executionAttempt: { id: string; attemptCount: number }; signal?: AbortSignal }
 
 function json(value: unknown): Prisma.InputJsonValue {
   return (value ?? null) as Prisma.InputJsonValue
@@ -50,6 +55,7 @@ function turnInput(input: EnsureV2TurnInput) {
     goal: input.goal,
     source: input.source,
     turnId: input.turnId,
+    legacyResumeQuestionId: input.legacyResumeQuestionId,
   }
 }
 
@@ -60,8 +66,10 @@ function turnInput(input: EnsureV2TurnInput) {
 export async function createDualWriteSession(
   db: PrismaClient,
   input: EnsureV2TurnInput,
+  ownership?: DualWriteOwnership,
+  precreatedTurn?: V2TurnHandle,
 ): Promise<DualWriteSession> {
-  const turn = await ensureV2Turn(db, turnInput(input))
+  const turn = precreatedTurn ?? await ensureV2Turn(db, turnInput(input), ownership)
   const hasExplicitTurn = typeof input.turnId === "string" && input.turnId.length > 0
 
   return {
@@ -69,6 +77,35 @@ export async function createDualWriteSession(
     async record(legacy, raw) {
       return db.$transaction(async (tx) => {
         await lockOpenSession(tx, turn)
+        const lockedTurn = await tx.$queryRaw<Array<{ id: string; status: string }>>(Prisma.sql`
+          SELECT "id", "status" FROM "agent_turns"
+          WHERE "id" = ${turn.turnId} AND "sessionId" = ${turn.sessionId} AND "userId" = ${turn.userId}
+          FOR UPDATE
+        `)
+        if (!lockedTurn[0] || !ACTIVE_TURN_STATUSES.includes(lockedTurn[0].status as (typeof ACTIVE_TURN_STATUSES)[number])) {
+          throw new AgentExecutionCancelledError()
+        }
+        if (ownership) {
+          const allowedStatuses = ownership.signal?.aborted
+            ? [...TERMINAL_DRAIN_STATUSES]
+            : ["running", ...TERMINAL_DRAIN_STATUSES]
+          const claimed = await tx.agentExecution.updateMany({
+            where: {
+              id: ownership.executionAttempt.id,
+              userId: turn.userId,
+              sessionId: turn.sessionId,
+              attemptCount: ownership.executionAttempt.attemptCount,
+              status: { in: allowedStatuses },
+            },
+            data: { updatedAt: new Date() },
+          })
+          if (claimed.count !== 1) throw new AgentExecutionCancelledError()
+          const current = await tx.agentExecution.findFirst({
+            where: { id: ownership.executionAttempt.id, userId: turn.userId, sessionId: turn.sessionId, attemptCount: ownership.executionAttempt.attemptCount },
+            select: { status: true },
+          })
+          if (!current || (ownership.signal?.aborted && current.status === "running")) throw new AgentExecutionCancelledError()
+        }
         const currentTurn = await tx.agentTurn.findFirst({
           where: { id: turn.turnId, sessionId: turn.sessionId, userId: turn.userId },
           select: { id: true, sessionId: true, userId: true, status: true, revision: true },
@@ -178,15 +215,15 @@ export async function createDualWriteSession(
       })
     },
     async finalize(finalizeInput) {
-      await db.$transaction(async (tx) => {
+      return db.$transaction(async (tx) => {
         await lockOpenSession(tx, turn)
-        const ownedTurn = await tx.agentTurn.findFirst({
-          where: { id: turn.turnId, sessionId: turn.sessionId, userId: turn.userId },
-          select: { id: true },
-        })
-        if (!ownedTurn) throw new Error("Cannot finalize an unauthorized agent turn")
-        await tx.agentTurn.update({
-          where: { id: turn.turnId },
+        const terminalized = await tx.agentTurn.updateMany({
+          where: {
+            id: turn.turnId,
+            sessionId: turn.sessionId,
+            userId: turn.userId,
+            status: { in: [...ACTIVE_TURN_STATUSES] },
+          },
           data: {
             status: v2Status(finalizeInput.status),
             completedAt: finalizeInput.status === "waiting_for_user" ? null : new Date(),
@@ -194,6 +231,7 @@ export async function createDualWriteSession(
             error: finalizeInput.error ?? null,
           },
         })
+        return terminalized.count === 1
       })
     },
   }

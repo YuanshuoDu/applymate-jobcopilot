@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from "vitest"
 
 import type { LeasePool } from "./lease.js"
+import { dispatchPendingTurnOutbox } from "./recovery-scanner-delivery.js"
 import { ensureQueuedTurnDispatches } from "./recovery-scanner-queue-repair.js"
-import { turnJobId, type TurnDispatchQueue } from "./recovery-scanner-common.js"
+import { attachTurnDispatchStateProbe, turnJobId, type TurnDispatchQueue } from "./recovery-scanner-common.js"
 
 type DispatchState = { id: string; attemptCount: number; publishedAt: string | null; payload: unknown }
 
@@ -12,6 +13,20 @@ function fixture(initial: DispatchState | null = {
   const state: { dispatch: DispatchState | null } = { dispatch: initial }
   const client = {
     query: vi.fn(async (sql: string, params?: unknown[]) => {
+      if (sql.includes('SELECT dispatch."id", dispatch."aggregateId"') && sql.includes('FROM "agent_outbox" AS dispatch')) {
+        const dispatch = state.dispatch
+        return dispatch && dispatch.publishedAt === null
+          ? { rows: [{ ...dispatch, aggregateId: "session_1" }], rowCount: 1 }
+          : { rows: [], rowCount: 0 }
+      }
+      if (sql.includes('SELECT dispatch."id" FROM "agent_outbox" AS dispatch')) {
+        const dispatch = state.dispatch
+        return dispatch && dispatch.publishedAt === null ? { rows: [{ id: dispatch.id }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      }
+      if (sql.includes('SELECT turn."id"') && sql.includes('FROM "agent_turns" AS turn') && sql.includes("FOR UPDATE OF turn, turnSession")) {
+        return { rows: [{ id: "turn_1" }], rowCount: 1 }
+      }
+      if (sql.includes('SELECT session."id" FROM "agent_sessions" AS session')) return { rows: [{ id: "session_1" }], rowCount: 1 }
       if (sql.includes('LEFT JOIN "agent_outbox" AS dispatch')) {
         const dispatch = state.dispatch
         return {
@@ -39,7 +54,20 @@ function fixture(initial: DispatchState | null = {
           && dispatch.attemptCount === params?.[5]
           && dispatch.publishedAt === params?.[6]
         if (dispatch && matchesSnapshot) {
-          state.dispatch = { ...dispatch, attemptCount: dispatch.attemptCount + 1, publishedAt: null, payload: params?.[0] }
+          state.dispatch = {
+            ...dispatch,
+            attemptCount: dispatch.attemptCount + 1,
+            publishedAt: null,
+            payload: typeof params?.[0] === "string" ? JSON.parse(params[0]) as unknown : params?.[0],
+          }
+          return { rows: [], rowCount: 1 }
+        }
+        return { rows: [], rowCount: 0 }
+      }
+      if (sql.includes('SET "publishedAt" = CURRENT_TIMESTAMP') && sql.includes('WHERE "id" = $1 AND "publishedAt" IS NULL')) {
+        const dispatch = state.dispatch
+        if (dispatch && dispatch.id === params?.[0] && dispatch.publishedAt === null) {
+          state.dispatch = { ...dispatch, attemptCount: dispatch.attemptCount + 1, publishedAt: "2026-09-24 01:01:00.000000+00" }
           return { rows: [], rowCount: 1 }
         }
         return { rows: [], rowCount: 0 }
@@ -54,18 +82,28 @@ function fixture(initial: DispatchState | null = {
 
 const turnKey = (turnId: string, generation?: number) => turnJobId(turnId, generation)
 
+function queueWithBullMqState(state: string) {
+  const getState = vi.fn().mockResolvedValue(state)
+  const getJob = vi.fn().mockResolvedValue({ getState })
+  const source = { add: vi.fn(), getJob }
+  const queue = attachTurnDispatchStateProbe(source)
+  return { queue, getJob, getState }
+}
+
 describe("queued Turn dispatch repair", () => {
   // BullMQ's getStateV2 maps both the normal wait and global paused Redis lists to "waiting".
   it.each(["waiting", "active", "delayed", "prioritized", "waiting-children"] as const)(
     "preserves the published generation while BullMQ reports %s",
     async state => {
       const fake = fixture()
-      const queue: TurnDispatchQueue = { add: vi.fn(), getJobState: vi.fn().mockResolvedValue(state) }
+      const probe = queueWithBullMqState(state)
+      const queue: TurnDispatchQueue = probe.queue
 
       await expect(ensureQueuedTurnDispatches(fake.pool, queue, "recovery_1", 50)).resolves.toBe(0)
       await expect(ensureQueuedTurnDispatches(fake.pool, queue, "recovery_1", 50)).resolves.toBe(0)
 
-      expect(queue.getJobState).toHaveBeenCalledWith(turnKey("turn_1", 2))
+      expect(probe.getJob).toHaveBeenCalledWith(turnKey("turn_1", 2))
+      expect(probe.getState).toHaveBeenCalledTimes(2)
       expect(fake.state.dispatch).toMatchObject({ attemptCount: 3, publishedAt: "2026-09-24 01:00:00.123456+00" })
       expect(fake.client.query.mock.calls.some(([sql]) => String(sql).includes('UPDATE "agent_outbox" AS dispatch'))).toBe(false)
     },
@@ -75,12 +113,15 @@ describe("queued Turn dispatch repair", () => {
     "re-arms a published generation when BullMQ reports %s and the queued Turn remains eligible",
     async state => {
       const fake = fixture()
-      const queue: TurnDispatchQueue = { add: vi.fn(), getJobState: vi.fn().mockResolvedValue(state) }
+      const probe = queueWithBullMqState(state)
+      const queue: TurnDispatchQueue = probe.queue
 
       await expect(ensureQueuedTurnDispatches(fake.pool, queue, "recovery_2", 50)).resolves.toBe(1)
 
-      expect(queue.getJobState).toHaveBeenCalledWith(turnKey("turn_1", 2))
+      expect(probe.getJob).toHaveBeenCalledWith(turnKey("turn_1", 2))
+      expect(probe.getState).toHaveBeenCalledOnce()
       expect(fake.state.dispatch).toMatchObject({ attemptCount: 4, publishedAt: null })
+      expect(turnKey("turn_1", Number(fake.state.dispatch?.attemptCount))).toBe(turnKey("turn_1", 4))
       const update = fake.client.query.mock.calls.find(([sql]) => String(sql).includes('UPDATE "agent_outbox" AS dispatch'))
       expect(update?.[0]).toContain('dispatch."attemptCount" = $6 AND dispatch."publishedAt" = $7::timestamptz')
       expect(update?.[0]).toContain('turn."status" = \'queued\' AND turn."leaseOwnerId" IS NULL')
@@ -90,6 +131,22 @@ describe("queued Turn dispatch repair", () => {
       expect(turnLock?.[0]).not.toContain('controlGate')
     },
   )
+
+  it("re-arms an exhausted retained job under a new runnable generation", async () => {
+    const fake = fixture()
+    const probe = queueWithBullMqState("failed")
+
+    await expect(ensureQueuedTurnDispatches(fake.pool, probe.queue, "recovery_4", 50)).resolves.toBe(1)
+    await expect(dispatchPendingTurnOutbox(fake.pool, probe.queue)).resolves.toBe(1)
+
+    expect(probe.getJob).toHaveBeenCalledWith(turnKey("turn_1", 2))
+    expect(probe.queue.add).toHaveBeenCalledWith(
+      "turn",
+      { turnId: "turn_1", sessionId: "session_1", ownerId: "recovery_4" },
+      { jobId: turnKey("turn_1", 4), attempts: 5 },
+    )
+    expect(fake.state.dispatch).toMatchObject({ attemptCount: 5, publishedAt: "2026-09-24 01:01:00.000000+00" })
+  })
 
   it("uses the dispatch snapshot CAS so concurrent missing-job scans re-arm only once", async () => {
     const fake = fixture()

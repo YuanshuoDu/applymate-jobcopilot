@@ -4,6 +4,13 @@ import { classifyLegacyQuestionBridge, type LegacyQuestionBridgeItem } from "../
 import { appendAgentEventWithOutboxInTransaction } from "../session/fact-store"
 import { invalidAnswer, waitNotPending, waitRevisionMismatch, waitScopeMismatch, type AgentWaitError } from "./errors"
 import { waitItemId } from "./item-ids"
+import {
+  answerLegacyQuestionWithoutTurnInTransaction,
+  answerLegacyResumableQuestionInTransaction,
+  lockNamespacedQuestionTurn,
+  namespacedQuestionTurnId,
+  type LegacyNoTurnQuestionResult,
+} from "./legacy-turn-question-answer"
 
 type Tx = Prisma.TransactionClient
 type JsonRecord = Record<string, unknown>
@@ -20,6 +27,7 @@ export interface LegacyQuestionAnswerInput {
 
 export type LegacyQuestionAnswerResult =
   | { disposition: "bridged" | "duplicate"; questionId: string; sessionId: string; turnId: string; itemId: string; nextTurnRevision: number; sequence: string }
+  | LegacyNoTurnQuestionResult
   | { disposition: "legacy_only"; reason: "question_not_found" | "session_unmapped" | "no_active_turn" | "turn_not_waiting" }
   | { disposition: "bridge_pending"; reason: "active_turn_ambiguous" | "canonical_item_missing" | "provenance_missing" }
 
@@ -48,6 +56,7 @@ async function lockSession(tx: Tx, sessionId: string, userId: string): Promise<{
   `)
   return rows[0] ?? null
 }
+
 
 function invalidAnswerError(message: string): AgentWaitError {
   return invalidAnswer(message)
@@ -105,15 +114,35 @@ export async function answerLegacyQuestion(
 
     const duplicate = await duplicateResult(tx, key, session.id, question.id)
     if (duplicate) return duplicate
-    if (question.answer !== null) throw waitNotPending()
+    const ownedTurnId = namespacedQuestionTurnId(question.id)
+    const lockedTurn = ownedTurnId
+      ? await lockNamespacedQuestionTurn(tx, { turnId: ownedTurnId, sessionId: session.id, userId: input.userId })
+      : null
+    if (ownedTurnId && !lockedTurn) return { disposition: "legacy_only", reason: "turn_not_waiting" }
+    if (question.answer !== null && question.answer !== answer) throw waitNotPending()
+    if (lockedTurn && lockedTurn.status !== "waiting_for_user") {
+      return await answerLegacyResumableQuestionInTransaction(tx, { question, turn: lockedTurn, answer })
+        ?? { disposition: "legacy_only", reason: "turn_not_waiting" }
+    }
 
-    const turns = await tx.agentTurn.findMany({
+    const turns = lockedTurn ? [lockedTurn] : await tx.agentTurn.findMany({
       where: { sessionId: session.id, userId: input.userId, status: { in: [...ACTIVE_TURN_STATUSES] } },
       orderBy: { createdAt: "asc" },
       take: 2,
       select: { id: true, sessionId: true, userId: true, status: true, revision: true },
     })
-    if (turns.length === 0) return { disposition: "legacy_only", reason: "no_active_turn" }
+    if (turns.length === 0) {
+      if (!ownedTurnId) return answerLegacyQuestionWithoutTurnInTransaction(tx, {
+        question, userId: input.userId, sessionId: session.id, answer,
+      })
+      return { disposition: "legacy_only", reason: "no_active_turn" }
+    }
+    if (!ownedTurnId && question.answer === answer) {
+      const retry = await answerLegacyQuestionWithoutTurnInTransaction(tx, {
+        question, userId: input.userId, sessionId: session.id, answer,
+      })
+      if (retry.disposition === "legacy_already_resuming" || retry.disposition === "legacy_answered") return retry
+    }
     if (turns.length > 1) return { disposition: "bridge_pending", reason: "active_turn_ambiguous" }
     const turn = turns[0]
     if (turn.status !== "waiting_for_user") return { disposition: "legacy_only", reason: "turn_not_waiting" }
@@ -123,7 +152,13 @@ export async function answerLegacyQuestion(
       where: { id: itemId },
       select: { id: true, sessionId: true, turnId: true, type: true, status: true, revision: true, content: true },
     }) as (LegacyQuestionBridgeItem & { revision: number }) | null
+    if (!item && lockedTurn) {
+      return await answerLegacyResumableQuestionInTransaction(tx, {
+        question, turn: lockedTurn, answer,
+      }) ?? { disposition: "legacy_only", reason: "turn_not_waiting" }
+    }
     if (!item) return { disposition: "bridge_pending", reason: "canonical_item_missing" }
+    if (question.answer !== null) throw waitNotPending()
     const content = record(item.content)
     const provenance = content.sourceEvent === undefined && content.sourcePayload === undefined
       ? null

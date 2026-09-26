@@ -6,10 +6,44 @@ export const TURN_DISPATCH_TOPIC = "agent.turn.dispatch"
 export const TURN_DISPATCH_MAX_BATCH = 50
 export const TURN_DISPATCH_LINEAGE_ERROR = "turn_dispatch_lineage_mismatch"
 
+export type TurnDispatchJobState = "completed" | "failed" | "delayed" | "active" | "prioritized" | "waiting" | "waiting-children" | "unknown"
+
 export type TurnDispatchQueue = {
   add(name: string, payload: TurnJobPayload, options?: { jobId?: string; attempts?: number }): Promise<unknown>
   // Optional for focused fakes; a published dispatch is never re-armed without a successful state probe.
-  getJobState?(jobId: string): Promise<"completed" | "failed" | "delayed" | "active" | "prioritized" | "waiting" | "waiting-children" | "unknown">
+  getJobState?(jobId: string): Promise<TurnDispatchJobState>
+}
+
+type BullQueueJob = { getState(): Promise<string> }
+type BullQueueWithJobLookup = TurnDispatchQueue & { getJob?: (jobId: string) => Promise<BullQueueJob | undefined> }
+
+function normalizeTurnDispatchJobState(state: string): TurnDispatchJobState {
+  switch (state) {
+    case "completed":
+    case "failed":
+    case "delayed":
+    case "active":
+    case "prioritized":
+    case "waiting":
+    case "waiting-children":
+    case "unknown":
+      return state
+    default:
+      return "unknown"
+  }
+}
+
+/** Install the recovery probe on BullMQ Queues without guessing when inspection is unavailable. */
+export function attachTurnDispatchStateProbe<T extends TurnDispatchQueue>(queue: T): T {
+  const source = queue as T & BullQueueWithJobLookup
+  if (queue.getJobState || typeof source.getJob !== "function") return queue
+
+  queue.getJobState = async (jobId) => {
+    const job = await source.getJob!.call(queue, jobId)
+    if (!job) return "unknown"
+    return normalizeTurnDispatchJobState(await job.getState())
+  }
+  return queue
 }
 
 export type ReclaimedTurn = { turnId: string; sessionId: string; previousLeaseVersion: number }

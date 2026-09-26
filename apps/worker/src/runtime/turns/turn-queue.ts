@@ -29,6 +29,7 @@ import {
 import { linkAbortSignals } from "../interrupt/bridge.js"
 import { RootAbortController, signalWasInterrupted, type RootAbortControllerRegistry } from "../interrupt/registry.js"
 import { interruptPollInterval, safePersistedInterrupt, startInterruptProbe, TURN_INTERRUPT_POLL_INTERVAL_MS } from "./turn-interrupt-probe.js"
+import { attachTurnDispatchStateProbe } from "./recovery-scanner-common.js"
 
 export { TURN_INTERRUPT_POLL_INTERVAL_MS } from "./turn-interrupt-probe.js"
 
@@ -217,7 +218,7 @@ export function createTurnQueue(options: {
   isInterrupted?: (lease: TurnLease) => Promise<boolean>
   interruptSubagents?: (lease: TurnLease) => Promise<unknown>
 }): { queue: TurnQueueLike; worker: Worker<TurnJobPayload>; active: TurnExecutionRegistry; close: () => Promise<void> } {
-  const queue = options.queue ?? new Queue<TurnJobPayload>(TURN_QUEUE_NAME, { connection: redisConnection, skipVersionCheck: true })
+  const queue = attachTurnDispatchStateProbe(options.queue ?? new Queue<TurnJobPayload>(TURN_QUEUE_NAME, { connection: redisConnection, skipVersionCheck: true }))
   const active = new TurnExecutionRegistry()
   const worker = new Worker<TurnJobPayload>(
     TURN_QUEUE_NAME,
