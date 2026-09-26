@@ -426,11 +426,11 @@ export const applyWorker = new Worker<ApplyTaskPayload>(
                     return;
                   }
                   if (requestFrame !== submissionFrame) {
-                    // Known source-page iframe traffic is unrelated unless it
-                    // targets the armed action URL. Treat every method at that
-                    // URL as an attempted action, but do not advance the
-                    // submission fence from an iframe request.
-                    if (requestTargetsArmedAction) {
+                    // An iframe may not target the armed action URL, submit to
+                    // a changed URL, or navigate the document while final
+                    // submission is armed. Safe non-navigation reads may
+                    // continue, and iframe traffic never starts the fence.
+                    if (requestTargetsArmedAction || !isSafeRead || isMainFrameNavigation) {
                       await route.abort("aborted").catch(() => undefined);
                     } else {
                       await route.fallback().catch(() => undefined);

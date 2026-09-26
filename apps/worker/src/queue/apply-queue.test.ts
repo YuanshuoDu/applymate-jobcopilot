@@ -573,8 +573,8 @@ describe("apply-queue (unit — mocked)", () => {
       const allowed = task.beforeSubmit ? await task.beforeSubmit(intent) : false;
       if (!allowed) return { status: "submission_blocked", error: null, durationMs: 123 };
 
-      // Unrelated writes stay outside the URL matcher. Known source-page
-      // iframe traffic falls through unless it targets the armed action URL.
+      // Main-page writes and source-page iframe writes/navigation are blocked;
+      // safe non-navigation iframe reads remain outside the submission fence.
       const telemetryRequest = await dispatchPageRequest("https://example.com/telemetry", "POST");
       expect(telemetryRequest?.abort).toHaveBeenCalledOnce();
       const safeRead = await dispatchPageRequest("https://example.com/assets/pixel", "GET");
@@ -583,8 +583,13 @@ describe("apply-queue (unit — mocked)", () => {
       expect(iframeRequest?.abort).toHaveBeenCalledOnce();
       const iframeMutatedMethod = await dispatchPageRequest(intent.url, "GET", { frame: "iframe" });
       expect(iframeMutatedMethod?.abort).toHaveBeenCalledOnce();
-      const iframeTelemetryRequest = await dispatchPageRequest("https://example.com/iframe/telemetry", "POST", { frame: "iframe" });
-      expect(iframeTelemetryRequest?.fallback).toHaveBeenCalledOnce();
+      const iframeChangedUrlWrite = await dispatchPageRequest("https://example.com/iframe/alternate-action", "POST", { frame: "iframe" });
+      expect(iframeChangedUrlWrite?.abort).toHaveBeenCalledOnce();
+      const iframeChangedUrlNavigation = await dispatchPageRequest("https://example.com/iframe/next-document", "GET", { frame: "iframe", navigation: true });
+      expect(iframeChangedUrlNavigation?.abort).toHaveBeenCalledOnce();
+      const iframeSafeRead = await dispatchPageRequest("https://example.com/iframe/assets/pixel", "GET", { frame: "iframe" });
+      expect(iframeSafeRead?.fallback).toHaveBeenCalledOnce();
+      expect(mockMarkSubmissionRequestStarted).not.toHaveBeenCalled();
       const otherTabRequest = await dispatchPageRequest(intent.url, intent.method, { frame: "other-tab" });
       expect(otherTabRequest?.abort).toHaveBeenCalledOnce();
       const otherTabMutatedMethod = await dispatchPageRequest(intent.url, "GET", { frame: "other-tab" });
