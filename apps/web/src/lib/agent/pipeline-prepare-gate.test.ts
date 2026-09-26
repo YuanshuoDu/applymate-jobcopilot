@@ -80,6 +80,31 @@ describe('runPrepareGateStages', () => {
     expect(vi.mocked(runtime.persist).mock.calls.map(([stage]) => stage)).toEqual(['prepare', 'gate', 'gate', 'execute'])
     expect(result).toEqual({ preparedPackages: [prepared], gateOutput })
   })
+
+  it.each([
+    { answer: 'apply_ai_changes', allowResumeTailoring: true },
+    { answer: 'keep_resume', allowResumeTailoring: false },
+  ] as const)('passes the resume tailoring choice to Prepare ($answer)', async ({ answer, allowResumeTailoring }) => {
+    const job = { id: 'job-1' } as unknown as Job
+    const scoredJob = { job, score: 82 } as unknown as ScoredJob
+    const prepared = { ...scoredJob } as ApplicationPackage
+    vi.mocked(runPrepare).mockResolvedValue({
+      stage: 'prepare', ok: true, data: { packages: [prepared] }, metrics: { durationMs: 11, count: 1 },
+    })
+    vi.mocked(runGate).mockResolvedValue({
+      stage: 'gate', ok: true, data: { approved: [], pending: [], skipped: [] }, metrics: { durationMs: 12, count: 0 },
+    })
+
+    const runtime = makeRuntime('prepare', { scoutedJobs: [job], scoredJobs: [scoredJob] })
+    runtime.ctx = { ...runtime.ctx, agentCfg: { ...runtime.ctx.agentCfg, requireApproval: true } }
+    vi.mocked(runtime.orchestrator.ask).mockResolvedValue(answer)
+
+    await runPrepareGateStages(runtime, { scoutedJobs: [job], scoredJobs: [scoredJob], analysisFailed: 0 })
+
+    expect(runtime.orchestrator.ask).toHaveBeenCalledOnce()
+    expect(runPrepare).toHaveBeenCalledWith([scoredJob], runtime.controlledCtx, { allowResumeTailoring })
+  })
+
   it('keeps pending-review writes behind the exact execution owner fence', async () => {
     const job = { id: 'job-pending' } as unknown as Job
     const scoredJob = { job, score: 82 } as unknown as ScoredJob

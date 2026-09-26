@@ -148,7 +148,6 @@ export async function runExecuteAuditStages(
     emit('done', report)
     await runtime.persist('completed', { scoutedJobs, scoredJobs, analysisFailed, preparedPackages, gateOutput, executeOutput, report })
     await runtime.assertAlive()
-    await runtime.flushCanonical()
     return { report }
   }
 

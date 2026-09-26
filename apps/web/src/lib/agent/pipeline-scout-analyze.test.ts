@@ -5,10 +5,32 @@ import { acceptScout, runScout } from './stages/scout'
 import type { PipelineScoutAnalyzeResult, PipelineStageRuntimeContext } from './pipeline-context'
 import type { OrchestratorAgent } from './orchestrator'
 import type { PipelineCheckpointState, PipelineCtx, PipelineStage, ScoredJob } from './types'
+import { runPrepareGateStages } from './pipeline-prepare-gate'
+import { runExecuteAuditStages } from './pipeline-execute-audit'
 import { runScoutAnalyzeStages } from './pipeline-scout-analyze'
 
 vi.mock('./stages/scout', () => ({ runScout: vi.fn(), acceptScout: vi.fn(() => ({ ok: true })) }))
 vi.mock('./stages/analyze', () => ({ runAnalyze: vi.fn(), acceptAnalyze: vi.fn(() => ({ ok: true })) }))
+vi.mock('./pipeline-prepare-gate', () => ({ runPrepareGateStages: vi.fn() }))
+vi.mock('./pipeline-execute-audit', () => ({ runExecuteAuditStages: vi.fn() }))
+vi.mock('./role-config', () => ({ ROLE_META: {}, recordRoleRun: vi.fn().mockResolvedValue(undefined) }))
+vi.mock('./stages/custom', () => ({ runCustomAgents: vi.fn().mockResolvedValue([]) }))
+vi.mock('./orchestrator', () => ({
+  OrchestratorAgent: class {
+    plan = vi.fn().mockResolvedValue(undefined)
+    beginStage = vi.fn()
+    nextAttempt = vi.fn(() => 1)
+    emitRetry = vi.fn()
+    recordFailure = vi.fn()
+    isExhausted = vi.fn(() => false)
+    decideOnExhaustion = vi.fn(async () => 'continue')
+    applyFix = vi.fn()
+    evaluate = vi.fn(async () => ({ decision: 'continue' }))
+    ask = vi.fn(async () => 'continue')
+    applyOptionAction = vi.fn()
+    complete = vi.fn()
+  },
+}))
 
 function makeRuntime(startStage: PipelineStage, initial: Partial<PipelineCheckpointState> = {}): PipelineStageRuntimeContext {
   let state: PipelineCheckpointState = { nextStage: startStage, ...initial }
@@ -88,6 +110,33 @@ describe('runScoutAnalyzeStages', () => {
     await expect(runScoutAnalyzeStages(runtime)).rejects.toBe(ownerLost)
 
     expect(runtime.emit).not.toHaveBeenCalledWith('done', expect.anything())
+  })
+
+  it('returns a terminal report for empty Scout results without entering later stages', async () => {
+    vi.mocked(runScout).mockResolvedValue({
+      stage: 'scout', ok: true, data: { jobs: [], discovered: 0 }, metrics: { durationMs: 8, count: 0 },
+    })
+    const emit = vi.fn()
+    const ctx = {
+      userId: 'user-1',
+      agentCfg: { targetRoles: ['engineer'], excludeCompanies: [], dailyLimit: 5, minMatchScore: 60 } as unknown as PipelineCtx['agentCfg'],
+      roleConfigs: {} as PipelineCtx['roleConfigs'],
+      resumeText: '',
+      resumeContent: {} as PipelineCtx['resumeContent'],
+      defaultResume: { id: 'resume-1', name: 'Resume', templateId: null, templateOptions: null, directionId: null, basicsDetached: false },
+      aiConfig: { provider: 'minimax', model: 'test', apiKey: 'key' } as PipelineCtx['aiConfig'],
+      autonomous: false,
+      emit,
+    } satisfies PipelineCtx
+    const { runPipeline } = await import('./pipeline')
+
+    const result = await runPipeline(ctx)
+
+    expect(result).toMatchObject({ processed: 0, applied: 0, queued: 0, pending: 0, skipped: 0, failed: 0 })
+    expect(runAnalyze).not.toHaveBeenCalled()
+    expect(runPrepareGateStages).not.toHaveBeenCalled()
+    expect(runExecuteAuditStages).not.toHaveBeenCalled()
+    expect(emit).toHaveBeenCalledWith('done', result)
   })
 
   it('runs Scout then Analyze and checkpoints each existing stage boundary', async () => {

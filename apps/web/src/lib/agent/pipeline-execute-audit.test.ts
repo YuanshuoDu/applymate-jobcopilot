@@ -126,6 +126,23 @@ describe('runExecuteAuditStages', () => {
     expect(result.report).toMatchObject({ processed: 1, queued: 1, failed: 0 })
   })
 
+  it('returns a saved report without rerunning completed stages', async () => {
+    const { initial, input } = prepareAuditCase()
+    const savedReport = { processed: 2, applied: 0, queued: 1, pending: 1, skipped: 0, failed: 0, durationMs: 42 }
+    const runtime = makeRuntime({
+      ...initial,
+      nextStage: 'completed',
+      report: savedReport,
+      executeOutput: { queued: ['job-1'], failed: [] },
+    })
+
+    const result = await runExecuteAuditStages(runtime, input)
+
+    expect(result).toEqual({ report: savedReport })
+    expect(runExecute).not.toHaveBeenCalled()
+    expect(runAudit).not.toHaveBeenCalled()
+  })
+
   it('does not advance the completed checkpoint when persistence fails after done is queued', async () => {
     const { initial, input } = prepareAuditCase()
     const checkpointError = new Error('completed checkpoint failed')
