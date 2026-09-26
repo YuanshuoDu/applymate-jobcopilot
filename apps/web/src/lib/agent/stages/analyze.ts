@@ -1,10 +1,4 @@
-/**
- * Stage 2 — Analyze
- * Role: analyst
- * Scores each job against the user's resume using AI.
- * Persists score to DB immediately after each call.
- * Emits per-job SSE events: job_start / job_done / job_skip / job_error
- */
+/** Stage 2 — Analyst scores jobs and persists results. */
 import type { Job }     from '@prisma/client'
 import { db }           from '@/lib/db'
 import { modelChat, stripFences } from '@/lib/model-router'
@@ -17,6 +11,7 @@ import { forEachConcurrent } from '../concurrency'
 import { assessApplicationPreflight } from '../application-preflight'
 
 const SCORE_COLOR = (s: number) => s >= 80 ? '#3B6D11' : s >= 60 ? '#854F0B' : '#6B7280'
+const STICKY_SUBMISSION_CHECKPOINTS = ['submission_request_started', 'submission_uncertain']
 
 export async function runAnalyze(
   jobs: Job[],
@@ -29,16 +24,16 @@ export async function runAnalyze(
   // Use analyst role's configured model; fall back to global aiConfig
   const analystCfg = roleConfigs.analyst
   const scoringConfig = roleAiConfig('analyst', analystCfg, aiConfig)
+  const safeCheckpoint = { OR: [{ checkpoint: null }, { checkpoint: { notIn: STICKY_SUBMISSION_CHECKPOINTS } }] }
+  const sessionFence = ctx.sessionId === undefined
+    ? { sessionId: null }
+    : { OR: [{ sessionId: null }, { sessionId: ctx.sessionId }] }
 
   const scoredJobs: ScoredJob[] = []
   let failed = 0
   let fenceSkipped = 0
-  const pendingUpdates: Array<{ jobId: string; score: number; recommendation?: string }> = []
-  const pendingActivities: Array<{ jobId: string; text: string; color: string }> = []
 
-  // A missing description weakens match quality enough that the candidate gets
-  // a durable choice. The program owns the pause; the model never assumes it
-  // may score incomplete evidence on the candidate's behalf.
+  // Ask the candidate before scoring jobs without descriptions.
   const noDescCount = jobs.filter(j => !j.description && !!j.role).length
   let skipNoDescription = false
   if (noDescCount > 0) {
@@ -69,7 +64,7 @@ export async function runAnalyze(
       return tx.applicationTask.updateMany({
         where: {
           ...identity,
-          OR: [{ checkpoint: null }, { checkpoint: { notIn: ["submission_request_started", "submission_uncertain"] } }],
+          AND: [sessionFence, safeCheckpoint],
         },
         data: { sessionId: ctx.sessionId ?? undefined, status: "analyzing", checkpoint: "match_analysis", error: null, completedAt: null },
       })
@@ -84,9 +79,7 @@ export async function runAnalyze(
       action: `score ${job.company} · ${job.role}${job.location ? ` (${job.location})` : ''}`,
     })
 
-    // Reject automation-ineligible records before an LLM scores them or the
-    // writer creates job-specific documents. This avoids spending credits on a
-    // job-board redirect or conflicting employer data.
+    // Reject ineligible records before spending model credits.
     if (hardPreflightIssues.length > 0) {
       const reason = hardPreflightIssues.map(issue => issue.message).join(" ")
       await db.applicationTask?.updateMany({
@@ -129,14 +122,27 @@ export async function runAnalyze(
       const messages = systemPrompt
         ? [{ role: 'system' as const, content: systemPrompt }, { role: 'user' as const, content: prompt }]
         : [{ role: 'user' as const, content: prompt }]
-      // Reasoning models such as MiniMax M3 need enough completion budget to
-      // finish their reasoning and return the required JSON payload.
+      // Reasoning models need enough completion budget to return the JSON.
       const result = await modelChat(messages, scoringConfig, 1600)
       const parsed = parseScoreResult(result.text)
 
       const color = SCORE_COLOR(parsed.score)
-      pendingUpdates.push({ jobId: job.id, score: parsed.score, recommendation: parsed.recommendation })
-      pendingActivities.push({ jobId: job.id, text: `Agent scored ${job.company} · ${job.role}: ${parsed.score}% match`, color })
+      // This conditional UPDATE locks the task through both writes; NULL is
+      // explicit because PostgreSQL NOT IN does not match NULL values.
+      const persisted = await db.$transaction(async tx => {
+        const { count } = await tx.applicationTask.updateMany({
+          where: { userId, jobId: job.id, status: 'analyzing', sessionId: ctx.sessionId ?? null, ...safeCheckpoint },
+          data: { status: 'analyzing' },
+        })
+        if (count !== 1) return false
+        await tx.job.update({ where: { id: job.id }, data: { score: parsed.score, analysisNote: parsed.recommendation || null } })
+        await tx.activity.create({ data: { userId, jobId: job.id, type: 'agent_action', text: `Agent scored ${job.company} · ${job.role}: ${parsed.score}% match`, color } })
+        return true
+      })
+      if (!persisted) {
+        fenceSkipped++
+        return
+      }
 
       scoredJobs.push({ job, ...parsed })
 
@@ -158,13 +164,17 @@ export async function runAnalyze(
 
       await new Promise(r => setTimeout(r, THROTTLE_MS))
     } catch (err) {
-      failed++
       console.error('[analyze] scoring error:', err)
       const message = err instanceof Error ? err.message : 'Unknown AI scoring error'
-      await db.applicationTask?.updateMany({
-        where: { userId, jobId: job.id, status: 'analyzing' },
+      const markedFailed = await db.applicationTask?.updateMany({
+        where: { userId, jobId: job.id, status: 'analyzing', sessionId: ctx.sessionId ?? null, ...safeCheckpoint },
         data: { status: 'failed', checkpoint: 'match_analysis_failed', error: message, completedAt: new Date() },
       })
+      if (markedFailed && markedFailed.count !== 1) {
+        fenceSkipped++
+        return
+      }
+      failed++
       emit('agent_observation', {
         role:        'analyst',
         observation: `✗ ${job.company} · ${job.role} Rating failed: ${message}`,
@@ -172,18 +182,6 @@ export async function runAnalyze(
       emit('job_error', { jobId: job.id, company: job.company, role: job.role, error: message })
     }
   })
-
-  // Batch persist scores and activities
-  if (pendingUpdates.length > 0) {
-    await Promise.all([
-      ...pendingUpdates.map(u =>
-        db.job.update({ where: { id: u.jobId }, data: { score: u.score, analysisNote: u.recommendation || null } as any })
-      ),
-      ...pendingActivities.map(a =>
-        db.activity.create({ data: { userId, jobId: a.jobId, type: 'agent_action' as const, text: a.text, color: a.color } })
-      ),
-    ])
-  }
 
   if (scoredJobs.length === 0 && jobs.length > 0 && fenceSkipped === 0) {
     return stageFail('analyze', 'All jobs failed to score')
@@ -193,21 +191,13 @@ export async function runAnalyze(
 }
 
 export function acceptAnalyze(result: StageResult<AnalyzeOutput>): AcceptResult {
-  if (!result.ok || !result.data) {
-    return { ok: false, reason: result.error ?? 'Analyze returned no data' }
-  }
+  if (!result.ok || !result.data) return { ok: false, reason: result.error ?? 'Analyze returned no data' }
   for (const sj of result.data.scoredJobs) {
-    if (typeof sj.score !== 'number' || sj.score < 0 || sj.score > 100) {
-      return { ok: false, reason: `Job ${sj.job.id} has invalid score: ${sj.score}` }
-    }
-    if (!Array.isArray(sj.matchedKeywords)) {
-      return { ok: false, reason: `Job ${sj.job.id} missing matchedKeywords array` }
-    }
+    if (typeof sj.score !== 'number' || sj.score < 0 || sj.score > 100) return { ok: false, reason: `Job ${sj.job.id} has invalid score: ${sj.score}` }
+    if (!Array.isArray(sj.matchedKeywords)) return { ok: false, reason: `Job ${sj.job.id} missing matchedKeywords array` }
   }
   return { ok: true }
 }
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function buildScorePrompt(resumeText: string, job: Job): string {
   return `You are an expert ATS analyzer. Score this resume-job fit.
@@ -230,21 +220,14 @@ function parseScoreResult(raw: string): Omit<ScoredJob, 'job'> {
   const stripped = stripFences(raw)
   const start = stripped.indexOf('{')
   const end = stripped.lastIndexOf('}')
-  if (start === -1 || end === -1) {
-    throw new Error('AI returned no JSON score')
-  }
+  if (start === -1 || end === -1) throw new Error('AI returned no JSON score')
 
   let result: Record<string, unknown>
-  try {
-    result = JSON.parse(stripped.slice(start, end + 1)) as Record<string, unknown>
-  } catch {
-    throw new Error('AI returned malformed score JSON')
-  }
+  try { result = JSON.parse(stripped.slice(start, end + 1)) as Record<string, unknown> }
+  catch { throw new Error('AI returned malformed score JSON') }
 
   const score = Number(result.score)
-  if (!Number.isFinite(score) || score < 0 || score > 100) {
-    throw new Error('AI returned an invalid match score')
-  }
+  if (!Number.isFinite(score) || score < 0 || score > 100) throw new Error('AI returned an invalid match score')
 
   return {
     score: Math.round(score),

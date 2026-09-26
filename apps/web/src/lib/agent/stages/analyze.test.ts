@@ -56,6 +56,12 @@ function context(emit = vi.fn()): PipelineCtx {
   }
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>(done => { resolve = done })
+  return { promise, resolve }
+}
+
 describe('runAnalyze', () => {
   beforeEach(() => {
     vi.resetAllMocks()
@@ -65,6 +71,8 @@ describe('runAnalyze', () => {
     mocks.applicationTaskUpdateMany.mockResolvedValue({ count: 1 })
     mocks.transaction.mockImplementation(async (work: (tx: unknown) => Promise<unknown>) => work({
       applicationTask: { upsert: mocks.applicationTaskUpsert, updateMany: mocks.applicationTaskUpdateMany },
+      job: { update: mocks.update },
+      activity: { create: mocks.activityCreate },
     }))
   })
 
@@ -133,9 +141,12 @@ describe('runAnalyze', () => {
       where: {
         userId: 'user_1',
         jobId: 'job_1',
-        OR: [
-          { checkpoint: null },
-          { checkpoint: { notIn: ['submission_request_started', 'submission_uncertain'] } },
+        AND: [
+          { sessionId: null },
+          { OR: [
+            { checkpoint: null },
+            { checkpoint: { notIn: ['submission_request_started', 'submission_uncertain'] } },
+          ] },
         ],
       },
       data: expect.objectContaining({ status: 'analyzing', checkpoint: 'match_analysis' }),
@@ -146,7 +157,105 @@ describe('runAnalyze', () => {
     expect(emit).not.toHaveBeenCalled()
   })
 
-  it('continues analysis for a legacy task with a NULL checkpoint', async () => {
+  it('does not let a sessionless Analyze claim a task owned by another V2 session', async () => {
+    mocks.applicationTaskUpdateMany.mockResolvedValueOnce({ count: 0 })
+    const emit = vi.fn()
+
+    const result = await runAnalyze([job], context(emit))
+
+    expect(result).toMatchObject({ ok: true, data: { failed: 0, scoredJobs: [] } })
+    expect(mocks.applicationTaskUpdateMany).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      where: expect.objectContaining({
+        AND: expect.arrayContaining([
+          { sessionId: null },
+          { OR: [
+            { checkpoint: null },
+            { checkpoint: { notIn: ['submission_request_started', 'submission_uncertain'] } },
+          ] },
+        ]),
+      }),
+    }))
+    expect(mocks.modelChat).not.toHaveBeenCalled()
+    expect(mocks.update).not.toHaveBeenCalled()
+    expect(mocks.activityCreate).not.toHaveBeenCalled()
+    expect(emit).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { status: 'filling', checkpoint: 'submission_request_started', sessionId: 'session_1' },
+    { status: 'waiting_for_user', checkpoint: 'submission_uncertain', sessionId: 'session_1' },
+    { status: 'analyzing', checkpoint: 'match_analysis', sessionId: 'session_2' },
+  ])('drops a deferred model result after the task advances to $checkpoint', async nextState => {
+    const task: { status: string; checkpoint: string | null; sessionId: string | null } = {
+      status: 'queued', checkpoint: null, sessionId: 'session_1',
+    }
+    mocks.applicationTaskUpdateMany.mockImplementation(async rawArgs => {
+      const args = rawArgs as {
+        where: { status?: string; sessionId?: string | null }
+        data: { status?: string; checkpoint?: string; sessionId?: string | null }
+      }
+      if (args.data.checkpoint === 'match_analysis') {
+        const sessionMayRefresh = task.sessionId === null
+          || task.sessionId === args.data.sessionId
+          || args.data.sessionId === undefined
+        if (!sessionMayRefresh || task.checkpoint === 'submission_request_started' || task.checkpoint === 'submission_uncertain') {
+          return { count: 0 }
+        }
+        task.status = args.data.status ?? task.status
+        task.checkpoint = args.data.checkpoint
+        task.sessionId = args.data.sessionId ?? task.sessionId
+        return { count: 1 }
+      }
+
+      const remainsWritable = task.status === args.where.status
+        && task.sessionId === args.where.sessionId
+        && task.checkpoint !== 'submission_request_started'
+        && task.checkpoint !== 'submission_uncertain'
+      return { count: remainsWritable ? 1 : 0 }
+    })
+
+    const pendingModel = deferred<{ text: string }>()
+    let markModelStarted!: () => void
+    const modelStarted = new Promise<void>(resolve => { markModelStarted = resolve })
+    mocks.modelChat.mockImplementationOnce(() => {
+      markModelStarted()
+      return pendingModel.promise
+    })
+    const emit = vi.fn()
+    const ctx = context(emit)
+    ctx.sessionId = 'session_1'
+    const resultPromise = runAnalyze([job], ctx)
+
+    await modelStarted
+    expect(mocks.modelChat).toHaveBeenCalledOnce()
+    expect(task).toMatchObject({ status: 'analyzing', checkpoint: 'match_analysis', sessionId: 'session_1' })
+    task.status = nextState.status
+    task.checkpoint = nextState.checkpoint
+    task.sessionId = nextState.sessionId
+    pendingModel.resolve({
+      text: '{"score":91,"matchedKeywords":["TypeScript"],"missingKeywords":[],"recommendation":"Strong fit."}',
+    })
+
+    const result = await resultPromise
+
+    expect(result).toMatchObject({ ok: true, data: { failed: 0, scoredJobs: [] } })
+    expect(mocks.applicationTaskUpdateMany).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      where: expect.objectContaining({
+        userId: 'user_1', jobId: 'job_1', status: 'analyzing', sessionId: 'session_1',
+        OR: [
+          { checkpoint: null },
+          { checkpoint: { notIn: ['submission_request_started', 'submission_uncertain'] } },
+        ],
+      }),
+      data: { status: 'analyzing' },
+    }))
+    expect(mocks.update).not.toHaveBeenCalled()
+    expect(mocks.activityCreate).not.toHaveBeenCalled()
+    expect(emit).not.toHaveBeenCalledWith('job_done', expect.anything())
+    expect(emit).not.toHaveBeenCalledWith('agent_observation', expect.anything())
+  })
+
+  it('continues analysis for a legacy task with NULL sessionId and checkpoint', async () => {
     mocks.applicationTaskUpdateMany.mockResolvedValueOnce({ count: 1 })
     mocks.modelChat.mockResolvedValue({
       text: '{"score":73,"matchedKeywords":["TypeScript"],"missingKeywords":[],"recommendation":"Good fit."}',
@@ -157,11 +266,17 @@ describe('runAnalyze', () => {
     expect(result).toMatchObject({ ok: true, data: { failed: 0, scoredJobs: [{ score: 73 }] } })
     expect(mocks.applicationTaskUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
       where: expect.objectContaining({
-        OR: [
-          { checkpoint: null },
-          { checkpoint: { notIn: ['submission_request_started', 'submission_uncertain'] } },
+        AND: [
+          { sessionId: null },
+          { OR: [
+            { checkpoint: null },
+            { checkpoint: { notIn: ['submission_request_started', 'submission_uncertain'] } },
+          ] },
         ],
       }),
+    }))
+    expect(mocks.applicationTaskUpdateMany).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      where: expect.objectContaining({ status: 'analyzing', sessionId: null }),
     }))
     expect(mocks.modelChat).toHaveBeenCalledOnce()
     expect(mocks.update).toHaveBeenCalledWith(expect.objectContaining({ data: { score: 73, analysisNote: 'Good fit.' } }))
