@@ -1,13 +1,13 @@
 import { Prisma } from "@prisma/client"
-import { db } from "@/lib/db"
-import type { PipelineCheckpointState } from "@/lib/agent/types"
+import { db } from "../db"
+import type { PipelineCheckpointState } from "./types"
 import { appendAgentEventWithOutboxInTransaction } from "./session/fact-store"
 
 export const EXECUTION_STATUSES = ["queued", "running", "waiting_for_user", "paused", "completed", "failed", "cancelled"] as const
 export type ExecutionStatus = (typeof EXECUTION_STATUSES)[number]
 const EXECUTION_STALE_MS = Number(process.env.AGENT_EXECUTION_STALE_MS ?? 15_000)
 
-export type { PipelineCheckpointState } from "@/lib/agent/types"
+export type { PipelineCheckpointState } from "./types"
 
 export type AgentExecutionAttempt = { id: string; attemptCount: number }
 
