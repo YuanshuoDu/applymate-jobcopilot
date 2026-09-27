@@ -29,9 +29,9 @@ export async function runAnalyze(
 
   const scoredJobs: ScoredJob[] = []
   let failed = 0
-  const ownershipSkippedJobIds = new Set<string>()
+  let fenceSkipped = 0
 
-  // Ask before scoring from titles alone; missing descriptions reduce score accuracy.
+  // Ask the candidate before scoring jobs without descriptions.
   const noDescCount = jobs.filter(j => !j.description && !!j.role).length
   let skipNoDescription = false
   if (noDescCount > 0) {
@@ -54,7 +54,7 @@ export async function runAnalyze(
       userId, jobId: job.id, sessionId: ctx.sessionId, executionAttempt: ctx.executionAttempt, signal: ctx.signal,
     }))
     if (!analysisFenceAt) {
-      ownershipSkippedJobIds.add(job.id)
+      fenceSkipped++
       return
     }
     const emitJobStart = () => {
@@ -65,14 +65,14 @@ export async function runAnalyze(
       })
     }
 
-    // Reject automation-ineligible jobs before scoring or downstream document generation.
+    // Reject ineligible records before spending model credits.
     if (hardPreflightIssues.length > 0) {
       const reason = hardPreflightIssues.map(issue => issue.message).join(" ")
       const skipped = await db.$transaction(tx => transitionAnalyzeTask(tx, {
         userId, jobId: job.id, sessionId: ctx.sessionId, analysisFenceAt, executionAttempt: ctx.executionAttempt, signal: ctx.signal,
         data: { status: 'skipped', checkpoint: 'job_preflight_failed', error: reason, completedAt: new Date() },
       }))
-      if (!skipped) { ownershipSkippedJobIds.add(job.id); return }
+      if (!skipped) { fenceSkipped++; return }
       emitJobStart()
       emit('job_skip', { jobId: job.id, company: job.company, role: job.role, reason })
       emit('agent_observation', {
@@ -87,7 +87,7 @@ export async function runAnalyze(
         userId, jobId: job.id, sessionId: ctx.sessionId, analysisFenceAt, executionAttempt: ctx.executionAttempt, signal: ctx.signal,
         data: { status: 'skipped', checkpoint: 'job_data_insufficient', error: 'No job title or description available.', completedAt: new Date() },
       }))
-      if (!skipped) { ownershipSkippedJobIds.add(job.id); return }
+      if (!skipped) { fenceSkipped++; return }
       emitJobStart()
       emit('job_skip', { jobId: job.id, company: job.company, role: job.role, reason: 'No job description available' })
       emit('agent_observation', {
@@ -102,7 +102,7 @@ export async function runAnalyze(
         userId, jobId: job.id, sessionId: ctx.sessionId, analysisFenceAt, executionAttempt: ctx.executionAttempt, signal: ctx.signal,
         data: { status: 'skipped', checkpoint: 'job_description_required', error: 'Candidate chose not to score this job without a description.', completedAt: new Date() },
       }))
-      if (!skipped) { ownershipSkippedJobIds.add(job.id); return }
+      if (!skipped) { fenceSkipped++; return }
       emitJobStart()
       emit('job_skip', { jobId: job.id, company: job.company, role: job.role, reason: 'Candidate chose to skip jobs without descriptions' })
       return
@@ -115,7 +115,7 @@ export async function runAnalyze(
       const messages = systemPrompt
         ? [{ role: 'system' as const, content: systemPrompt }, { role: 'user' as const, content: prompt }]
         : [{ role: 'user' as const, content: prompt }]
-      // Reserve enough completion budget for reasoning models to finish the score JSON.
+      // Reasoning models need enough completion budget to return the JSON.
       const result = await modelChat(messages, scoringConfig, 1600)
       const parsed = parseScoreResult(result.text)
 
@@ -135,7 +135,7 @@ export async function runAnalyze(
         return true
       })
       if (!persisted) {
-        ownershipSkippedJobIds.add(job.id)
+        fenceSkipped++
         return
       }
 
@@ -167,7 +167,7 @@ export async function runAnalyze(
         data: { status: 'failed', checkpoint: 'match_analysis_failed', error: message, completedAt: new Date() },
       }))
       if (!markedFailed) {
-        ownershipSkippedJobIds.add(job.id)
+        fenceSkipped++
         return
       }
       console.error('[analyze] scoring error:', err)
@@ -180,14 +180,11 @@ export async function runAnalyze(
     }
   })
 
-  const everyJobWasOwnershipSkipped = jobs.length > 0 && jobs.every(job => ownershipSkippedJobIds.has(job.id))
-  if (scoredJobs.length === 0 && jobs.length > 0 && !everyJobWasOwnershipSkipped) {
+  if (scoredJobs.length === 0 && jobs.length > 0 && fenceSkipped === 0) {
     return stageFail('analyze', 'All jobs failed to score')
   }
 
-  const scoredJobIds = new Set(scoredJobs.map(scoredJob => scoredJob.job.id))
-  const ownershipSkipped = [...ownershipSkippedJobIds].filter(jobId => !scoredJobIds.has(jobId))
-  return stageOk('analyze', { scoredJobs, failed, ownershipSkippedJobIds: ownershipSkipped }, scoredJobs.length, Date.now() - t0)
+  return stageOk('analyze', { scoredJobs, failed }, scoredJobs.length, Date.now() - t0)
 }
 
 export function acceptAnalyze(result: StageResult<AnalyzeOutput>): AcceptResult {

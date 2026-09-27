@@ -134,8 +134,6 @@ export interface ScoredJob {
 export interface AnalyzeOutput {
   scoredJobs: ScoredJob[]
   failed:     number
-  /** Job IDs this execution could not analyze because an ownership fence blocked its claim or write. */
-  ownershipSkippedJobIds: string[]
 }
 
 // ── Stage 3: Prepare ──────────────────────────────────────────────────────────

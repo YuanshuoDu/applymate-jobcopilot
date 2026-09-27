@@ -161,7 +161,7 @@ describe('runAnalyze', () => {
 
     const result = await runAnalyze([input as Job], ctx)
 
-    expect(result).toMatchObject({ ok: true, data: { failed: 0, scoredJobs: [], ownershipSkippedJobIds: ['job_1'] } })
+    expect(result).toMatchObject({ ok: true, data: { failed: 0, scoredJobs: [] } })
     expect(mocks.modelChat).not.toHaveBeenCalled()
     expect(emit).not.toHaveBeenCalled()
   })
@@ -172,7 +172,7 @@ describe('runAnalyze', () => {
 
     const result = await runAnalyze([job], context(emit))
 
-    expect(result).toMatchObject({ ok: true, data: { failed: 0, scoredJobs: [], ownershipSkippedJobIds: ['job_1'] } })
+    expect(result).toMatchObject({ ok: true, data: { failed: 0, scoredJobs: [] } })
     expect(mocks.applicationTaskUpsert).toHaveBeenCalledWith(expect.objectContaining({
       update: {},
     }))
@@ -207,7 +207,7 @@ describe('runAnalyze', () => {
 
     const result = await runAnalyze([job], context(emit))
 
-    expect(result).toMatchObject({ ok: true, data: { failed: 0, scoredJobs: [], ownershipSkippedJobIds: ['job_1'] } })
+    expect(result).toMatchObject({ ok: true, data: { failed: 0, scoredJobs: [] } })
     expect(mocks.applicationTaskUpdateMany).toHaveBeenNthCalledWith(1, expect.objectContaining({
       where: expect.objectContaining({
         AND: expect.arrayContaining([
@@ -223,43 +223,6 @@ describe('runAnalyze', () => {
     expect(mocks.update).not.toHaveBeenCalled()
     expect(mocks.activityCreate).not.toHaveBeenCalled()
     expect(emit).not.toHaveBeenCalled()
-  })
-
-  it('returns fenced jobs separately when another job is scored', async () => {
-    const scoredJob = { ...job, id: 'job_2' }
-    mocks.applicationTaskUpdateMany.mockImplementation(async rawArgs => {
-      const args = rawArgs as { where: { jobId?: string } }
-      return { count: args.where.jobId === 'job_1' ? 0 : 1 }
-    })
-    mocks.modelChat.mockResolvedValue({
-      text: '{"score":73,"matchedKeywords":["TypeScript"],"missingKeywords":[],"recommendation":"Good fit."}',
-    })
-
-    const result = await runAnalyze([job, scoredJob], context())
-
-    expect(result).toMatchObject({
-      ok: true,
-      data: { failed: 0, ownershipSkippedJobIds: ['job_1'], scoredJobs: [{ job: { id: 'job_2' }, score: 73 }] },
-    })
-    expect(mocks.modelChat).toHaveBeenCalledOnce()
-  })
-
-  it('preserves retryable model failure when another job is ownership-fenced', async () => {
-    const failedJob = { ...job, id: 'job_2' }
-    mocks.applicationTaskUpdateMany.mockImplementation(async rawArgs => {
-      const args = rawArgs as { where: { jobId?: string } }
-      return { count: args.where.jobId === 'job_1' ? 0 : 1 }
-    })
-    mocks.modelChat.mockResolvedValue({ text: 'I cannot score this job.' })
-
-    const result = await runAnalyze([job, failedJob], context())
-
-    expect(result).toMatchObject({ ok: false, error: 'All jobs failed to score' })
-    expect(mocks.modelChat).toHaveBeenCalledOnce()
-    expect(mocks.applicationTaskUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: expect.objectContaining({ jobId: 'job_2' }),
-      data: expect.objectContaining({ status: 'failed', checkpoint: 'match_analysis_failed' }),
-    }))
   })
 
   it.each([

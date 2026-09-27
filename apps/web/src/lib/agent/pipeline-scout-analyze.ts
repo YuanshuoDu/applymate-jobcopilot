@@ -135,26 +135,12 @@ export async function runScoutAnalyzeStages(
         continue
       }
 
-      const ownershipSkippedJobIds = new Set(s2.data.ownershipSkippedJobIds)
-      const currentRunJobs = scoutedJobs.filter(job => !ownershipSkippedJobIds.has(job.id))
-      if (
-        scoutedJobs.length > 0
-        && currentRunJobs.length === 0
-        && s2.data.scoredJobs.length === 0
-        && s2.data.failed === 0
-      ) {
-        emit('info', {
-          message: 'Analysis was not run because every job is fenced by existing task ownership. These jobs were left untouched and are not counted as completed, skipped, or failed.',
-        })
-        return finish([], [], 0)
-      }
-
       const avgScoreEval = s2.data.scoredJobs.length
         ? Math.round(s2.data.scoredJobs.reduce((s, j) => s + j.score, 0) / s2.data.scoredJobs.length)
         : 0
       const aboveEval = s2.data.scoredJobs.filter(j => j.score >= ctx.agentCfg.minMatchScore).length
       const dec2 = await orch.evaluate('analyst',
-        `Scored ${s2.data.scoredJobs.length}/${currentRunJobs.length} jobs, avg ${avgScoreEval}%, ${aboveEval} above threshold, ${s2.data.failed ?? 0} failed`,
+        `Scored ${s2.data.scoredJobs.length}/${scoutedJobs.length} jobs, avg ${avgScoreEval}%, ${aboveEval} above threshold, ${s2.data.failed ?? 0} failed`,
         { scored: s2.data.scoredJobs.length, avgScore: avgScoreEval, aboveThreshold: aboveEval, failed: s2.data.failed ?? 0, threshold: ctx.agentCfg.minMatchScore },
       )
       await runtime.assertAlive()
@@ -174,7 +160,6 @@ export async function runScoutAnalyzeStages(
         continue
       }
 
-      scoutedJobs = currentRunJobs
       scoredJobs = s2.data.scoredJobs
       analysisFailed = s2.data.failed ?? 0
       const avgScore = scoredJobs.length
@@ -190,7 +175,7 @@ export async function runScoutAnalyzeStages(
       emitRole(pipelineCtx, 'analyst', 'done', { count: scoredJobs.length, durationMs: s2.metrics.durationMs, summary: analystSummary, avgScore })
       emit('stage_done', { stage: 'analyze', count: scoredJobs.length, durationMs: s2.metrics.durationMs })
       await runtime.recordRoleRun('analyst', { count: scoredJobs.length, durationMs: s2.metrics.durationMs, summary: analystSummary }).catch(() => {})
-      await runtime.collectCustomResults(currentRunJobs, 'analyst')
+      await runtime.collectCustomResults(scoutedJobs, 'analyst')
       await runtime.persist('prepare', { scoutedJobs, scoredJobs, analysisFailed })
       break analyzeLoop
     }
