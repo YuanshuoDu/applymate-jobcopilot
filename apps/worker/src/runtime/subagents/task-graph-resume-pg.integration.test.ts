@@ -13,6 +13,7 @@ import type { ProductionAgentFlags } from "../production-agent-flags.js"
 import type { ProductionWorkerBootstrap } from "../../queue/production-bootstrap.js"
 import { childContextSnapshot, createChildContextBuilder } from "./child-context.js"
 import { executionOwnerFence } from "../execution-owner.js"
+import { PgCoordinationStore } from "../mailbox/store.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./task-graph-command-port.js"
@@ -346,7 +347,7 @@ async function turnProgressDiagnostics(pool: Pool, turnId: string, diagnosticToo
   const turn = turnResult.rows[0]
   if (!turn) return JSON.stringify({ turnId, missing: true })
 
-  const [tasks, waits, events, dispatches] = await Promise.all([
+  const [tasks, waits, events, dispatches, lifecycleFailure] = await Promise.all([
     pool.query<{
       id: string; goal: string; status: string; failureReason: string | null; attemptCount: number
       leaseOwner: string | null; leaseExpiresAt: Date | null
@@ -365,32 +366,24 @@ async function turnProgressDiagnostics(pool: Pool, turnId: string, diagnosticToo
       topic: string; idempotencyKey: string; publishedAt: Date | null; attemptCount: number; lastError: string | null
     }>(`SELECT "topic", "idempotencyKey", "publishedAt", "attemptCount", "lastError"
       FROM "agent_outbox" WHERE "aggregateId" = $1 ORDER BY "createdAt" DESC LIMIT 30`, [turn.sessionId]),
+    diagnosticToolCallId
+      ? pool.query<{ payload: unknown }>(`SELECT "payload" FROM "agent_events"
+        WHERE "turnId" = $1 AND POSITION($2 IN "idempotencyKey") > 0
+        ORDER BY "sequence" DESC LIMIT 1`, [turnId, `:tool-lifecycle:${diagnosticToolCallId}:failed:`])
+      : Promise.resolve(null),
   ])
-  const toolResults = diagnosticToolCallId
-    ? await pool.query<{ errorCode: string | null; failureDetail: string | null }>(
-      `SELECT "content"->>'errorCode' AS "errorCode", "content"->'output'->>'message' AS "failureDetail"
-        FROM "agent_items"
-        WHERE "turnId" = $1 AND "type" = 'tool_result' AND "content"->>'toolCallId' = $2
-        ORDER BY "createdAt", "id"`,
-      [turnId, diagnosticToolCallId],
-    )
-    : null
-  const toolFailure = toolResults?.rows.find(row => typeof row.failureDetail === "string" && row.failureDetail.length > 0)
-    ?? toolResults?.rows[0]
-  const recentEvents = events.rows.map(({ payload, ...event }) => {
-    const value = record(payload)
-    if (!diagnosticToolCallId || value?.toolCallId !== diagnosticToolCallId || value.status !== "failed") return event
-    return {
-      ...event,
-      failure: {
-        errorCode: typeof toolFailure?.errorCode === "string" ? toolFailure.errorCode.slice(0, 128) : null,
-        failureDetail: typeof toolFailure?.failureDetail === "string" && toolFailure.failureDetail.length > 0
-          ? toolFailure.failureDetail.slice(0, 500)
-          : "not persisted",
-      },
+  const lifecyclePayload = record(lifecycleFailure?.rows[0]?.payload)
+  const lifecycleOutput = record(lifecyclePayload?.output)
+  const diagnosticToolFailure = lifecycleFailure
+    ? {
+      errorCode: typeof lifecyclePayload?.errorCode === "string" ? lifecyclePayload.errorCode.slice(0, 128) : null,
+      failureDetail: typeof lifecycleOutput?.message === "string" && lifecycleOutput.message.length > 0
+        ? lifecycleOutput.message.slice(0, 500)
+        : "not persisted",
     }
-  })
-  return JSON.stringify({ turn, tasks: tasks.rows, waits: waits.rows, recentEvents, recentOutbox: dispatches.rows })
+    : null
+  const recentEvents = events.rows.map(({ payload: _payload, ...event }) => event)
+  return JSON.stringify({ turn, tasks: tasks.rows, waits: waits.rows, recentEvents, diagnosticToolFailure, recentOutbox: dispatches.rows })
 }
 
 async function waitForTurnStatus(pool: Pool, turnId: string, wanted: string, timeoutMs = 50_000, diagnosticToolCallId?: string): Promise<void> {
@@ -673,7 +666,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       pool: pool!,
       runtime,
       ownerId: owner.ownerId,
-      turnRecoveryIntervalMs: 60_000,
+      turnRecoveryIntervalMs: 100,
       waitResolver: { intervalMs: 10, batchSize: 10, ownerId: `p3-wait-resolver-${owner.suffix}` },
       subagents: {
         intervalMs: 10,
@@ -854,7 +847,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     try {
       await activateFixtureTurn(pool!, restartOwner)
       workerOne = startTaskGraphRestartWorker("park-parent", restartOwner)
-      const suspendedLine = await waitForProcessLine(workerOne, "P3_PARENT_SUSPENDED ")
+      const suspendedLine = await waitForProcessLine(workerOne, "P3_PARENT_SUSPENDED ", 45_000)
       if (workerOne.pid === undefined) throw new Error("P3 first Worker has no OS process ID")
       expect(suspendedLine).toContain("p3-process-restart-worker-" + workerOne.pid)
 
@@ -1234,6 +1227,30 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               return
             }
             if (execution === 1 && modelRounds === 2) {
+              const receiptTaskIds = planTaskIds(request, FAILURE_PLAN_CALL_ID)
+              const fixtureTurn = await pool!.query<{ rootTaskId: string | null }>(
+                `SELECT "rootTaskId" FROM "agent_turns"
+                 WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+                [failureOwner.turnId, failureOwner.sessionId, failureOwner.userId],
+              )
+              const fixtureRootTaskId = fixtureTurn.rows[0]?.rootTaskId
+              if (!fixtureRootTaskId) {
+                throw new Error("Failed-prerequisite fixture assertion: current root task is missing from agent_turns")
+              }
+              const coordinationStore = new PgCoordinationStore(pool!)
+              for (const taskId of receiptTaskIds) {
+                const target = await coordinationStore.getTask({
+                  userId: failureOwner.userId, sessionId: failureOwner.sessionId, taskId,
+                })
+                if (!target) {
+                  throw new Error(`Failed-prerequisite fixture assertion: plan receipt target ${taskId} is missing from PgCoordinationStore.getTask`)
+                }
+                expect({
+                  id: target.id, turnId: target.turnId, rootTaskId: target.rootTaskId, parentTaskId: target.parentTaskId,
+                }, `Failed-prerequisite fixture assertion: plan receipt target ${taskId} has unexpected lineage`).toEqual({
+                  id: taskId, turnId: failureOwner.turnId, rootTaskId: fixtureRootTaskId, parentTaskId: fixtureRootTaskId,
+                })
+              }
               expect(request.tools.map(tool => record(tool)?.name)).toContain("agent.wait")
               yield {
                 type: "tool_call_completed", callId: FAILURE_WAIT_CALL_ID, name: "agent.wait",

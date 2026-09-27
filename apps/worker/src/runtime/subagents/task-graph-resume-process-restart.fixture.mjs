@@ -209,14 +209,19 @@ async function waitForStop() {
   await waitForCommand("shutdown"); process.stdin.off("data", onStdinData); process.stdin.pause(); process.stdin.destroy()
 }
 async function runFirstWorker() {
+  say("P3_FIRST_WORKER_START_RUNTIME_BEGIN")
   const ownerId = "p3-process-restart-worker-" + process.pid, runtime = await startRuntime(ownerId, false)
+  say("P3_FIRST_WORKER_START_RUNTIME_DONE")
   bootstrap = await createProductionWorkerBootstrap({ pool, runtime, ownerId, turnRecoveryIntervalMs: 10,
     waitResolver: { intervalMs: 10, ownerId: "p3-process-restart-wait-resolver-" + process.pid },
     subagents: { intervalMs: 10, async execute() { throw new Error("p3_first_worker_must_not_execute_children") } } })
+  say("P3_FIRST_WORKER_BOOTSTRAP_DONE")
   const subagentWorker = bootstrap.subagents?.queue?.worker
   if (typeof subagentWorker?.pause !== "function") throw new Error("p3_first_worker_subagent_pause_unavailable")
   await subagentWorker.pause()
+  say("P3_FIRST_WORKER_PAUSE_DONE")
   await enqueueTurn(pool, bootstrap.turns.queue, { turnId: ids.turnId, sessionId: ids.sessionId, ownerId })
+  say("P3_FIRST_WORKER_ENQUEUE_DONE")
   await waitForParentSuspended(ownerId); await waitForStop()
 }
 async function runSecondWorker() {
