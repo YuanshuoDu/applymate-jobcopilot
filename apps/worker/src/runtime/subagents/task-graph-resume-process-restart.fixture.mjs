@@ -220,6 +220,11 @@ async function runFirstWorker() {
   if (typeof subagentWorker?.pause !== "function") throw new Error("p3_first_worker_subagent_pause_unavailable")
   await subagentWorker.pause()
   say("P3_FIRST_WORKER_PAUSE_DONE")
+  const activated = await pool.query(`UPDATE "agent_turns" SET "status" = 'queued', "completedAt" = NULL,
+      "leaseOwnerId" = NULL, "leaseExpiresAt" = NULL, "leaseStartedAt" = NULL, "updatedAt" = CURRENT_TIMESTAMP
+    WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "status" = 'waiting_for_user'`, [ids.turnId, ids.sessionId, ids.userId])
+  if (activated.rowCount !== 1) throw new Error("p3_first_worker_fixture_turn_not_parked")
+  say("P3_FIRST_WORKER_TURN_ACTIVATED")
   await enqueueTurn(pool, bootstrap.turns.queue, { turnId: ids.turnId, sessionId: ids.sessionId, ownerId })
   say("P3_FIRST_WORKER_ENQUEUE_DONE")
   await waitForParentSuspended(ownerId); await waitForStop()

@@ -367,19 +367,25 @@ async function turnProgressDiagnostics(pool: Pool, turnId: string, diagnosticToo
     }>(`SELECT "topic", "idempotencyKey", "publishedAt", "attemptCount", "lastError"
       FROM "agent_outbox" WHERE "aggregateId" = $1 ORDER BY "createdAt" DESC LIMIT 30`, [turn.sessionId]),
     diagnosticToolCallId
-      ? pool.query<{ payload: unknown }>(`SELECT "payload" FROM "agent_events"
+      ? pool.query<{ type: string; idempotencyKey: string | null; payload: unknown }>(`SELECT "type", "idempotencyKey", "payload" FROM "agent_events"
         WHERE "turnId" = $1 AND POSITION($2 IN "idempotencyKey") > 0
         ORDER BY "sequence" DESC LIMIT 1`, [turnId, `:tool-lifecycle:${diagnosticToolCallId}:failed:`])
       : Promise.resolve(null),
   ])
-  const lifecyclePayload = record(lifecycleFailure?.rows[0]?.payload)
+  const lifecycleEvent = lifecycleFailure?.rows[0]
+  const lifecyclePayload = record(lifecycleEvent?.payload)
   const lifecycleOutput = record(lifecyclePayload?.output)
-  const diagnosticToolFailure = lifecycleFailure
+  const diagnosticToolFailure = lifecycleEvent
     ? {
+      eventType: typeof lifecycleEvent.type === "string" ? lifecycleEvent.type.slice(0, 64) : null,
+      idempotencyKey: typeof lifecycleEvent.idempotencyKey === "string" ? lifecycleEvent.idempotencyKey.slice(0, 256) : null,
+      toolCallId: typeof lifecyclePayload?.toolCallId === "string" ? lifecyclePayload.toolCallId.slice(0, 128) : null,
+      toolName: typeof lifecyclePayload?.toolName === "string" ? lifecyclePayload.toolName.slice(0, 128) : null,
+      status: typeof lifecyclePayload?.status === "string" ? lifecyclePayload.status.slice(0, 32) : null,
       errorCode: typeof lifecyclePayload?.errorCode === "string" ? lifecyclePayload.errorCode.slice(0, 128) : null,
       failureDetail: typeof lifecycleOutput?.message === "string" && lifecycleOutput.message.length > 0
         ? lifecycleOutput.message.slice(0, 500)
-        : "not persisted",
+        : null,
     }
     : null
   const recentEvents = events.rows.map(({ payload: _payload, ...event }) => event)
@@ -575,9 +581,14 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               const waitTasks = waitOutcome.tasks.map(record)
               expect(waitOutcome.status).toBe("ready")
               expect(waitTasks.map(task => task?.status)).toEqual(["completed", "completed", "completed", "cancelled"])
-              expect(waitTasks.slice(0, 2).map(task => record(record(task?.result)?.structuredResult)?.summary)).toEqual([
-                "Read the fixture source", "Summarize the fixture source",
-              ])
+              const sourceTaskId = nodes.find(node => node?.key === "source")?.taskId
+              const summaryTaskId = nodes.find(node => node?.key === "summary")?.taskId
+              const sourceWaitTask = waitTasks.find(task => task?.taskId === sourceTaskId)
+              const summaryWaitTask = waitTasks.find(task => task?.taskId === summaryTaskId)
+              expect(sourceWaitTask).toBeDefined()
+              expect(summaryWaitTask).toBeDefined()
+              expect(record(record(sourceWaitTask?.result)?.structuredResult)?.summary).toBe("Read the fixture source")
+              expect(record(record(summaryWaitTask?.result)?.structuredResult)?.summary).toBe("Summarize the fixture source")
               if (modelRounds === 1) {
                 const revision = graph?.revision
                 if (typeof revision !== "number" || !Number.isSafeInteger(revision)) throw new Error("Resumed current graph revision is invalid")
@@ -845,7 +856,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let workerOne: ProcessFixtureChild | undefined
     let workerTwo: ProcessFixtureChild | undefined
     try {
-      await activateFixtureTurn(pool!, restartOwner)
       workerOne = startTaskGraphRestartWorker("park-parent", restartOwner)
       const suspendedLine = await waitForProcessLine(workerOne, "P3_PARENT_SUSPENDED ", 45_000)
       if (workerOne.pid === undefined) throw new Error("P3 first Worker has no OS process ID")
@@ -1190,6 +1200,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let rootRuntimeExecutions = 0
     let descendantExecuted = false
     let resumedAfterFailure = false
+    let failurePreflightStage = "not_started"
+    let failurePreflightError: string | null = null
     const runtime = await createCanonicalTurnRuntime(pool!, {
       workerId: failureOwner.ownerId,
       productionFlags: flags,
@@ -1227,31 +1239,43 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               return
             }
             if (execution === 1 && modelRounds === 2) {
-              const receiptTaskIds = planTaskIds(request, FAILURE_PLAN_CALL_ID)
-              const fixtureTurn = await pool!.query<{ rootTaskId: string | null }>(
-                `SELECT "rootTaskId" FROM "agent_turns"
-                 WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
-                [failureOwner.turnId, failureOwner.sessionId, failureOwner.userId],
-              )
-              const fixtureRootTaskId = fixtureTurn.rows[0]?.rootTaskId
-              if (!fixtureRootTaskId) {
-                throw new Error("Failed-prerequisite fixture assertion: current root task is missing from agent_turns")
-              }
-              const coordinationStore = new PgCoordinationStore(pool!)
-              for (const taskId of receiptTaskIds) {
-                const target = await coordinationStore.getTask({
-                  userId: failureOwner.userId, sessionId: failureOwner.sessionId, taskId,
-                })
-                if (!target) {
-                  throw new Error(`Failed-prerequisite fixture assertion: plan receipt target ${taskId} is missing from PgCoordinationStore.getTask`)
+              try {
+                failurePreflightStage = "plan_receipt"
+                failurePreflightError = null
+                const receiptTaskIds = planTaskIds(request, FAILURE_PLAN_CALL_ID)
+                failurePreflightStage = "root_task_lookup"
+                const fixtureTurn = await pool!.query<{ rootTaskId: string | null }>(
+                  `SELECT "rootTaskId" FROM "agent_turns"
+                   WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+                  [failureOwner.turnId, failureOwner.sessionId, failureOwner.userId],
+                )
+                const fixtureRootTaskId = fixtureTurn.rows[0]?.rootTaskId
+                if (!fixtureRootTaskId) {
+                  throw new Error("Failed-prerequisite fixture assertion: current root task is missing from agent_turns")
                 }
-                expect({
-                  id: target.id, turnId: target.turnId, rootTaskId: target.rootTaskId, parentTaskId: target.parentTaskId,
-                }, `Failed-prerequisite fixture assertion: plan receipt target ${taskId} has unexpected lineage`).toEqual({
-                  id: taskId, turnId: failureOwner.turnId, rootTaskId: fixtureRootTaskId, parentTaskId: fixtureRootTaskId,
-                })
+                const coordinationStore = new PgCoordinationStore(pool!)
+                for (const [index, taskId] of receiptTaskIds.entries()) {
+                  failurePreflightStage = `lineage_lookup_${index + 1}`
+                  const target = await coordinationStore.getTask({
+                    userId: failureOwner.userId, sessionId: failureOwner.sessionId, taskId,
+                  })
+                  if (!target) {
+                    throw new Error(`Failed-prerequisite fixture assertion: plan receipt target ${taskId} is missing from PgCoordinationStore.getTask`)
+                  }
+                  failurePreflightStage = `lineage_assertion_${index + 1}`
+                  expect({
+                    id: target.id, turnId: target.turnId, rootTaskId: target.rootTaskId, parentTaskId: target.parentTaskId,
+                  }, `Failed-prerequisite fixture assertion: plan receipt target ${taskId} has unexpected lineage`).toEqual({
+                    id: taskId, turnId: failureOwner.turnId, rootTaskId: fixtureRootTaskId, parentTaskId: fixtureRootTaskId,
+                  })
+                }
+                failurePreflightStage = "agent.wait_tool_availability"
+                expect(request.tools.map(tool => record(tool)?.name)).toContain("agent.wait")
+                failurePreflightStage = "preflight_passed"
+              } catch (error: unknown) {
+                failurePreflightError = (error instanceof Error ? error.message : String(error)).slice(0, 500)
+                throw error
               }
-              expect(request.tools.map(tool => record(tool)?.name)).toContain("agent.wait")
               yield {
                 type: "tool_call_completed", callId: FAILURE_WAIT_CALL_ID, name: "agent.wait",
                 arguments: {
@@ -1307,7 +1331,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await enqueueTurn(pool!, bootstrap.turns.queue, {
       turnId: failureOwner.turnId, sessionId: failureOwner.sessionId, ownerId: failureOwner.ownerId,
     })
-    await waitForTurnStatus(pool!, failureOwner.turnId, "completed", 50_000, FAILURE_WAIT_CALL_ID)
+    try {
+      await waitForTurnStatus(pool!, failureOwner.turnId, "completed", 50_000, FAILURE_WAIT_CALL_ID)
+    } catch (error: unknown) {
+      const diagnostic = JSON.stringify({ stage: failurePreflightStage, error: failurePreflightError }).slice(0, 700)
+      throw new Error(`${error instanceof Error ? error.message : String(error)}; failedPrerequisitePreflight=${diagnostic}`)
+    }
 
     const turn = await pool!.query<{ rootTaskId: string; finalResponse: string | null }>(
       `SELECT "rootTaskId", "finalResponse" FROM "agent_turns" WHERE "id" = $1`, [failureOwner.turnId],
