@@ -105,6 +105,9 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
     await expect(recoverExpired(recovery.pool, { now, limit: 10 })).resolves.toMatchObject([
       { id: "task-1", status: "queued", leaseOwner: null, leaseExpiresAt: null, nextAttemptAt: expect.any(Date) },
     ])
+    const recoveryWrite = recovery.calls.find(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))
+    expect(recoveryWrite?.[1]?.[5]).toBe(false)
+    expect(recoveryWrite?.[1]?.[6]).toBe(now)
     const scan = recovery.calls.find(([sql]) => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $2"))?.[0] ?? ""
     expect(scan).toContain(`session."status" IN ('aborted', 'archived')`)
     expect(scan).toContain(`session."status" NOT IN ('aborted', 'archived')`)

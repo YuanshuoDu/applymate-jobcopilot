@@ -128,7 +128,7 @@ async function recoverOne(client: pg.PoolClient, candidate: Candidate, now: Date
     || (lockedRetryAt && lockedRetryAt.getTime() > now.getTime())) return null
   const nextAttemptAt = status === "queued" ? computeSubagentNextAttemptAt(attemptCount, now) : null
   const updated = await client.query(`UPDATE "sub_agent_tasks" SET "status" = $3, "leaseOwner" = NULL, "leaseExpiresAt" = NULL,
-    "nextAttemptAt" = $4, "failureReason" = $5, "completedAt" = CASE WHEN $6 THEN $7 ELSE NULL END, "updatedAt" = $7
+    "nextAttemptAt" = $4, "failureReason" = $5, "completedAt" = CASE WHEN $6 THEN $7::timestamp(3) ELSE NULL::timestamp(3) END, "updatedAt" = $7
     WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running'`,
   [candidate.id, candidate.sessionId, status, nextAttemptAt, failureReason, terminal, now])
   if (updated.rowCount !== 1) return null

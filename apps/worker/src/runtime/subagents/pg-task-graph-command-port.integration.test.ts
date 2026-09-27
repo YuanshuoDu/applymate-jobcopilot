@@ -470,7 +470,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       status: "accepted", revision: 1,
       nodes: [{ key: "task-1", status: "queued" }, ...Array.from({ length: 7 }, (_, index) => ({ key: `task-${index + 2}`, status: "waiting" }))],
     })
-    expect(Buffer.byteLength(JSON.stringify(input.proposal), "utf8")).toBeLessThan(1024)
+    expect(Buffer.byteLength(JSON.stringify(input.proposal), "utf8")).toBeLessThanOrEqual(TASK_GRAPH_LIMITS.maxProposalBytes)
     expect(accepted.nodes).toHaveLength(8)
     expect(accepted.readyTaskIds).toEqual([accepted.nodes[0]!.taskId])
     expect(accepted.nodes[7]!.taskId).not.toBe(accepted.nodes[0]!.taskId)
