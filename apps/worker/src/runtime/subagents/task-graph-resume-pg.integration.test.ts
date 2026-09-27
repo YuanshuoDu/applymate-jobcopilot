@@ -106,6 +106,17 @@ function record(value: unknown): RecordValue | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as RecordValue : null
 }
 
+function diagnosticValueType(value: unknown): string {
+  if (value === null) return "null"
+  if (Array.isArray(value)) return "array"
+  return typeof value
+}
+
+function boundedDiagnostic(value: string, maxCharacters = 4_000): string {
+  if (value.length <= maxCharacters) return value
+  return `${value.slice(0, maxCharacters)}...[truncated ${value.length - maxCharacters} characters]`
+}
+
 function fixture(): Fixture {
   const suffix = randomUUID()
   return {
@@ -347,7 +358,12 @@ async function turnProgressDiagnostics(pool: Pool, turnId: string, diagnosticToo
   const turn = turnResult.rows[0]
   if (!turn) return JSON.stringify({ turnId, missing: true })
 
-  const [tasks, waits, events, dispatches, lifecycleFailure] = await Promise.all([
+  const [toolResultItem, tasks, waits, events, dispatches, lifecycleFailure] = await Promise.all([
+    diagnosticToolCallId
+      ? pool.query<{ status: string; content: unknown }>(`SELECT "status", "content" FROM "agent_items"
+        WHERE "turnId" = $1 AND "type" = 'tool_result' AND "content"->>'toolCallId' = $2
+        ORDER BY "createdAt" DESC LIMIT 1`, [turnId, diagnosticToolCallId])
+      : Promise.resolve(null),
     pool.query<{
       id: string; goal: string; status: string; failureReason: string | null; attemptCount: number
       leaseOwner: string | null; leaseExpiresAt: Date | null
@@ -372,6 +388,41 @@ async function turnProgressDiagnostics(pool: Pool, turnId: string, diagnosticToo
         ORDER BY "sequence" DESC LIMIT 1`, [turnId, `:tool-lifecycle:${diagnosticToolCallId}:failed:`])
       : Promise.resolve(null),
   ])
+  const resultItem = toolResultItem?.rows[0]
+  const resultContent = record(resultItem?.content)
+  const resultOutput = record(resultContent?.output)
+  const resultReference = resultOutput?.$ref ?? resultOutput?.ref
+  const resultTruncated = resultOutput?.$truncated ?? resultOutput?.truncated
+  const resultTasks = Array.isArray(resultOutput?.tasks) ? resultOutput.tasks : null
+  const waitToolResult = resultItem
+    ? {
+      status: resultItem.status.slice(0, 32),
+      errorCode: typeof resultContent?.errorCode === "string" ? resultContent.errorCode.slice(0, 128) : null,
+      outputStatus: typeof resultOutput?.status === "string" ? resultOutput.status.slice(0, 32) : null,
+      waitId: typeof resultOutput?.waitId === "string" ? resultOutput.waitId.slice(0, 128) : null,
+      deadlineAt: {
+        present: Object.prototype.hasOwnProperty.call(resultOutput ?? {}, "deadlineAt"),
+        type: diagnosticValueType(resultOutput?.deadlineAt),
+      },
+      matchedTaskIds: {
+        type: diagnosticValueType(resultOutput?.matchedTaskIds),
+        count: Array.isArray(resultOutput?.matchedTaskIds) ? resultOutput.matchedTaskIds.length : null,
+      },
+      reference: {
+        present: resultReference !== undefined,
+        type: diagnosticValueType(resultReference),
+        sizeBytesType: diagnosticValueType(resultOutput?.sizeBytes),
+        sha256Present: typeof resultOutput?.sha256 === "string",
+      },
+      truncated: {
+        present: resultTruncated !== undefined,
+        type: diagnosticValueType(resultTruncated),
+        value: typeof resultTruncated === "boolean" ? resultTruncated : null,
+        taskResultCount: resultTasks?.length ?? null,
+        truncatedTaskResultCount: resultTasks?.filter(task => record(record(task)?.result)?.$truncated === true).length ?? null,
+      },
+    }
+    : null
   const lifecycleEvent = lifecycleFailure?.rows[0]
   const lifecyclePayload = record(lifecycleEvent?.payload)
   const lifecycleOutput = record(lifecyclePayload?.output)
@@ -389,7 +440,7 @@ async function turnProgressDiagnostics(pool: Pool, turnId: string, diagnosticToo
     }
     : null
   const recentEvents = events.rows.map(({ payload: _payload, ...event }) => event)
-  return JSON.stringify({ turn, tasks: tasks.rows, waits: waits.rows, recentEvents, diagnosticToolFailure, recentOutbox: dispatches.rows })
+  return JSON.stringify({ turn, waitToolResult, tasks: tasks.rows, waits: waits.rows, recentEvents, diagnosticToolFailure, recentOutbox: dispatches.rows })
 }
 
 async function waitForTurnStatus(pool: Pool, turnId: string, wanted: string, timeoutMs = 50_000, diagnosticToolCallId?: string): Promise<void> {
@@ -405,7 +456,7 @@ async function waitForTurnStatus(pool: Pool, turnId: string, wanted: string, tim
     }
     await new Promise(resolve => setTimeout(resolve, 25))
   }
-  throw new Error(`TaskGraph root turn did not reach ${wanted}; progress=${await turnProgressDiagnostics(pool, turnId)}`)
+  throw new Error(`TaskGraph root turn did not reach ${wanted}; progress=${await turnProgressDiagnostics(pool, turnId, diagnosticToolCallId)}`)
 }
 
 async function waitForPersistedTaskWait(pool: Pool, turnId: string, idempotencyKey: string, timeoutMs = 20_000): Promise<{ id: string }> {
@@ -580,13 +631,18 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               const waitOutcome = waitOutcomeFromRequest(request, 4)
               const waitTasks = waitOutcome.tasks.map(record)
               expect(waitOutcome.status).toBe("ready")
-              expect(waitTasks.map(task => task?.status)).toEqual(["completed", "completed", "completed", "cancelled"])
-              const sourceTaskId = nodes.find(node => node?.key === "source")?.taskId
-              const summaryTaskId = nodes.find(node => node?.key === "summary")?.taskId
-              const sourceWaitTask = waitTasks.find(task => task?.taskId === sourceTaskId)
-              const summaryWaitTask = waitTasks.find(task => task?.taskId === summaryTaskId)
-              expect(sourceWaitTask).toBeDefined()
-              expect(summaryWaitTask).toBeDefined()
+              const waitTaskForNode = (key: string) => {
+                const taskId = nodes.find(node => node?.key === key)?.taskId
+                return waitTasks.find(task => task?.taskId === taskId)
+              }
+              const sourceWaitTask = waitTaskForNode("source")
+              const summaryWaitTask = waitTaskForNode("summary")
+              const largeSourceWaitTask = waitTaskForNode("large-source")
+              const rejectedWaitTask = waitTaskForNode("rejected")
+              expect(sourceWaitTask).toMatchObject({ status: "completed" })
+              expect(summaryWaitTask).toMatchObject({ status: "completed" })
+              expect(largeSourceWaitTask).toMatchObject({ status: "completed" })
+              expect(rejectedWaitTask).toMatchObject({ status: "cancelled" })
               expect(record(record(sourceWaitTask?.result)?.structuredResult)?.summary).toBe("Read the fixture source")
               expect(record(record(summaryWaitTask?.result)?.structuredResult)?.summary).toBe("Summarize the fixture source")
               if (modelRounds === 1) {
@@ -943,7 +999,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         )
         throw new Error(`${String(error)}; restartProgress=${await turnProgressDiagnostics(pool!, restartOwner.turnId)}; childContexts=${JSON.stringify(children.rows)}`)
       }
-      await waitForProcessLine(workerTwo, "P3_RESTORED_GRAPH_OK")
+      try {
+        await waitForProcessLine(workerTwo, "P3_RESTORED_GRAPH_OK")
+      } catch (error: unknown) {
+        const progress = await turnProgressDiagnostics(pool!, restartOwner.turnId)
+        throw new Error(`${String(error)}; restoredGraphProgress=${boundedDiagnostic(progress)}`)
+      }
       await waitForProcessLine(workerTwo, "P3_PARENT_RESUME_CONTEXT_OK")
       await waitForProcessLine(workerTwo, "P3_FOLLOW_UP_DEPENDENCY_CONTEXT_OK")
       const persistedFollowUpWait = await waitForPersistedTaskWait(
@@ -1334,8 +1395,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     try {
       await waitForTurnStatus(pool!, failureOwner.turnId, "completed", 50_000, FAILURE_WAIT_CALL_ID)
     } catch (error: unknown) {
-      const diagnostic = JSON.stringify({ stage: failurePreflightStage, error: failurePreflightError }).slice(0, 700)
-      throw new Error(`${error instanceof Error ? error.message : String(error)}; failedPrerequisitePreflight=${diagnostic}`)
+      const diagnostic = boundedDiagnostic(JSON.stringify({ stage: failurePreflightStage, error: failurePreflightError }), 700)
+      throw new Error(`failedPrerequisitePreflight=${diagnostic}; ${error instanceof Error ? error.message : String(error)}`)
     }
 
     const turn = await pool!.query<{ rootTaskId: string; finalResponse: string | null }>(
