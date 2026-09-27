@@ -100,7 +100,7 @@ describe('runScoutAnalyzeStages', () => {
     const job = { id: 'job-1' } as unknown as Job
     const runtime = makeRuntime('analyze', { scoutedJobs: [job] })
     vi.mocked(runAnalyze).mockResolvedValue({
-      stage: 'analyze', ok: true, data: { scoredJobs: [], failed: 1 }, metrics: { durationMs: 9, count: 0 },
+      stage: 'analyze', ok: true, data: { scoredJobs: [], failed: 1, ownershipSkippedJobIds: [] }, metrics: { durationMs: 9, count: 0 },
     })
     vi.mocked(acceptAnalyze).mockReturnValueOnce({ ok: false, reason: 'analysis failed' })
     vi.mocked(runtime.orchestrator.isExhausted).mockReturnValue(true)
@@ -146,7 +146,7 @@ describe('runScoutAnalyzeStages', () => {
       stage: 'scout', ok: true, data: { jobs: [job], discovered: 1 }, metrics: { durationMs: 8, count: 1 },
     })
     vi.mocked(runAnalyze).mockResolvedValue({
-      stage: 'analyze', ok: true, data: { scoredJobs: [scoredJob], failed: 0 }, metrics: { durationMs: 9, count: 1 },
+      stage: 'analyze', ok: true, data: { scoredJobs: [scoredJob], failed: 0, ownershipSkippedJobIds: [] }, metrics: { durationMs: 9, count: 1 },
     })
 
     const runtime = makeRuntime('scout')
@@ -158,5 +158,74 @@ describe('runScoutAnalyzeStages', () => {
     expect(vi.mocked(runtime.persist).mock.calls.map(([stage]) => stage)).toEqual(['scout', 'analyze', 'analyze', 'prepare'])
     expect(result).toEqual({ scoutedJobs: [job], scoredJobs: [scoredJob], analysisFailed: 0 })
     expect(vi.mocked(runtime.collectCustomResults).mock.calls.map(([, stage]) => stage)).toEqual(['scout', 'analyst'])
+  })
+
+  it('ends with an empty safe report when every analyzed job is ownership-fenced', async () => {
+    const job = { id: 'job-1' } as unknown as Job
+    const runtime = makeRuntime('analyze', { scoutedJobs: [job] })
+    vi.mocked(runAnalyze).mockResolvedValue({
+      stage: 'analyze',
+      ok: true,
+      data: { scoredJobs: [], failed: 0, ownershipSkippedJobIds: ['job-1'] },
+      metrics: { durationMs: 9, count: 0 },
+    })
+
+    const result = await runScoutAnalyzeStages(runtime)
+
+    expect(result).toMatchObject({
+      terminalReport: { processed: 0, applied: 0, queued: 0, pending: 0, skipped: 0, failed: 0 },
+      scoutedJobs: [],
+      scoredJobs: [],
+      analysisFailed: 0,
+    })
+    expect(runtime.emit).toHaveBeenCalledWith('info', {
+      message: expect.stringContaining('not counted as completed, skipped, or failed'),
+    })
+    expect(runtime.emit).not.toHaveBeenCalledWith('info', { message: expect.stringContaining('Check AI API keys') })
+    expect(runtime.persist).not.toHaveBeenCalledWith('prepare', expect.anything())
+    expect(runtime.collectCustomResults).not.toHaveBeenCalledWith(expect.any(Array), 'analyst')
+    expect(runtime.orchestrator.evaluate).not.toHaveBeenCalled()
+    expect(runtime.orchestrator.complete).not.toHaveBeenCalled()
+  })
+
+  it('filters ownership-fenced jobs from scoring denominators and downstream stages', async () => {
+    const fencedJob = { id: 'job-1' } as unknown as Job
+    const scoredJobInput = { id: 'job-2' } as unknown as Job
+    const scoredJob = { job: scoredJobInput, score: 82 } as unknown as ScoredJob
+    const runtime = makeRuntime('analyze', { scoutedJobs: [fencedJob, scoredJobInput] })
+    vi.mocked(runAnalyze).mockResolvedValue({
+      stage: 'analyze',
+      ok: true,
+      data: { scoredJobs: [scoredJob], failed: 0, ownershipSkippedJobIds: ['job-1'] },
+      metrics: { durationMs: 9, count: 1 },
+    })
+
+    const result = await runScoutAnalyzeStages(runtime)
+
+    expect(result).toEqual({ scoutedJobs: [scoredJobInput], scoredJobs: [scoredJob], analysisFailed: 0 })
+    expect(runtime.orchestrator.evaluate).toHaveBeenCalledWith(
+      'analyst', expect.stringContaining('Scored 1/1 jobs'), expect.any(Object),
+    )
+    expect(runtime.persist).toHaveBeenCalledWith('prepare', expect.objectContaining({ scoutedJobs: [scoredJobInput] }))
+    expect(runtime.collectCustomResults).toHaveBeenCalledWith([scoredJobInput], 'analyst')
+  })
+
+  it('keeps the execution liveness fence before reporting all-fenced results', async () => {
+    const job = { id: 'job-1' } as unknown as Job
+    const ownerLost = new Error('execution ownership changed')
+    const runtime = makeRuntime('analyze', { scoutedJobs: [job] })
+    vi.mocked(runAnalyze).mockResolvedValue({
+      stage: 'analyze',
+      ok: true,
+      data: { scoredJobs: [], failed: 0, ownershipSkippedJobIds: ['job-1'] },
+      metrics: { durationMs: 9, count: 0 },
+    })
+    vi.mocked(runtime.assertAlive).mockRejectedValueOnce(ownerLost)
+
+    await expect(runScoutAnalyzeStages(runtime)).rejects.toBe(ownerLost)
+
+    expect(runtime.emit).not.toHaveBeenCalledWith('done', expect.anything())
+    expect(runtime.emit).not.toHaveBeenCalledWith('info', expect.objectContaining({ message: expect.stringContaining('not counted') }))
+    expect(runtime.collectCustomResults).not.toHaveBeenCalledWith(expect.any(Array), 'analyst')
   })
 })
