@@ -5,6 +5,7 @@ import { ROLE_RESULT_SCHEMA } from "./role-results.ts"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.ts"
 import { createProductionWorkerBootstrap } from "../../queue/production-bootstrap.ts"
 import { enqueueTurn } from "../turns/turn-queue.ts"
+import { projectTaskGraphResult } from "./task-graph-result-projection.ts"
 import { parsePlanLedger, projectPlanLedger } from "@jobcopilot/agent-protocol"
 
 const [, , mode, rawIds] = process.argv, ids = JSON.parse(rawIds)
@@ -35,6 +36,14 @@ function waitForCommand(command) {
   return new Promise(resolve => { const waiters = commandWaiters.get(command) ?? []; waiters.push(resolve); commandWaiters.set(command, waiters) })
 }
 function record(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : null }
+function isExpectedSourceProjection(value) {
+  const projection = record(value), candidates = Array.isArray(projection?.candidates) ? projection.candidates.map(record) : [], candidate = candidates[0]
+  return projection?.schemaVersion === "agent-harness.v2.task-graph.result-projection" && projection.trust === "untrusted"
+    && projection.availability === "available" && projection.role === "scout" && projection.status === "completed"
+    && projection.candidateCount === 1 && projection.evidenceCount === 1 && candidates.length === 1
+    && candidate?.jobId === "fixture-job-restart" && candidate.source === "other"
+    && Array.isArray(candidate.evidenceKinds) && candidate.evidenceKinds.length === 1 && candidate.evidenceKinds[0] === "job"
+}
 function toolResult(request, callId) {
   const part = request.messages.flatMap(message => message.content).find(value => value.type === "tool_result" && value.toolUseId === callId)
   if (typeof part?.content !== "string") return null
@@ -90,8 +99,12 @@ function assertRestoredGraph(request) {
       throw new Error("p3_task_graph_node_not_restored:" + node.key)
     }
   }
-  waitOutcomeFromRequest(request, outcome => outcome.status === "ready" && outcome.tasks.length === expected.length
-    && outcome.tasks.every(task => record(task)?.status === "completed") && JSON.stringify(outcome).includes(resultMarker))
+  const waitOutcome = waitOutcomeFromRequest(request, outcome => outcome.status === "ready" && outcome.tasks.length === expected.length
+    && outcome.tasks.every(task => record(task)?.status === "completed"))
+  const sourceTask = waitOutcome.tasks.map(record).find(task => task?.taskId === byKey.get("source")?.taskId)
+  if (!sourceTask || !isExpectedSourceProjection(projectTaskGraphResult("scout", sourceTask.status, sourceTask.result))) {
+    throw new Error("p3_restored_wait_source_projection_missing")
+  }
   say("P3_RESTORED_GRAPH_OK " + JSON.stringify({ revision: graph.revision, nodeCount: nodes.length }))
   say("P3_PARENT_RESUME_CONTEXT_OK")
   return graph
@@ -227,7 +240,7 @@ async function runSecondWorker() {
       if (lease.goal === dependentGoal && lease.role === "analyst") {
         const items = Array.isArray(record(record(lease.context)?.taskGraphDependencyResults)?.items)
           ? record(record(lease.context)?.taskGraphDependencyResults).items.map(record) : []
-        if (items[0]?.dependencyKey !== "source" || items[0]?.taskStatus !== "completed" || !JSON.stringify(items[0]?.result).includes(resultMarker)) {
+        if (items[0]?.dependencyKey !== "source" || items[0]?.taskStatus !== "completed" || !isExpectedSourceProjection(items[0]?.result)) {
           throw new Error("p3_dependency_context_not_restored")
         }
         say("P3_DEPENDENCY_CONTEXT_OK"); return { status: "completed", result: structuredResult("analyst", dependentGoal) }

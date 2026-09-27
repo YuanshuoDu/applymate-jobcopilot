@@ -15,6 +15,7 @@ import { childContextSnapshot, createChildContextBuilder } from "./child-context
 import { executionOwnerFence } from "../execution-owner.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
+import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./task-graph-command-port.js"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
 import { drainTaskGraphStopOutbox, TASK_GRAPH_STOP_OUTBOX_TOPIC } from "./task-graph-stop-outbox.js"
@@ -37,6 +38,22 @@ const FAILURE_WAIT_CALL_ID = "p3-failure-wait"
 const FAILURE_GOAL = "Read a source and report a terminal failure"
 const BLOCKED_GOAL = "Summarize only after the source succeeds"
 const FAILURE_FINAL_MARKER = "p3-failed-prerequisite-cancelled-descendant"
+const SOURCE_DEPENDENCY_PROJECTION_ITEM = {
+  dependencyKey: "source", role: "scout", taskStatus: "completed",
+  result: {
+    schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available",
+    role: "scout", status: "completed", candidateCount: 1, evidenceCount: 1,
+    candidates: [{ jobId: "fixture-job-1", source: "other", evidenceKinds: ["job"] }],
+  },
+} as const
+const SUMMARY_DEPENDENCY_PROJECTION_ITEM = {
+  dependencyKey: "summary", role: "analyst", taskStatus: "completed",
+  result: {
+    schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available",
+    role: "analyst", status: "completed", findingCount: 1, evidenceCount: 1,
+    findings: [{ jobId: "fixture-job-1", score: 8, evidenceKinds: ["job"] }],
+  },
+} as const
 const planLedgerTraceArtifactPath = process.env.AGENT_PLAN_LEDGER_TRACE_ARTIFACT_PATH
 
 function dedicatedDatabaseUrl(): string | null {
@@ -667,11 +684,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             const taskContext = record(lease.context)
             const dependencyContext = record(taskContext?.taskGraphDependencyResults)
             const items = Array.isArray(dependencyContext?.items) ? dependencyContext.items.map(record) : []
-            expect(items).toMatchObject([{
-              dependencyKey: "source", role: "scout", taskStatus: "completed",
-              result: { candidates: [{ jobId: "fixture-job-1" }], evidence: [{ id: "fixture-job-evidence" }],
-                summary: "Read the fixture source" },
-            }])
+            expect(dependencyContext?.schemaVersion).toBe("agent-harness.v2.task-graph.dependency-evidence")
+            expect(items).toEqual([SOURCE_DEPENDENCY_PROJECTION_ITEM])
             const childSnapshot = childContextSnapshot(lease)
             const childContext = await createChildContextBuilder(lease).build({
               scope: { userId: lease.userId }, identity: executionOwnerFence({ kind: "task", lease }),
@@ -679,16 +693,26 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             })
             const profileBlock = childContext.blocks.find(block => block.layer === "profile")
             expect(profileBlock?.trust).toBe("external_untrusted")
-            expect(JSON.stringify(profileBlock?.content)).toContain("fixture-job-evidence")
+            const profileContent = record(profileBlock?.content)
+            const profileTaskContext = record(profileContent?.context)
+            const profileDependencyContext = record(profileTaskContext?.taskGraphDependencyResults)
+            expect(profileDependencyContext?.schemaVersion).toBe("agent-harness.v2.task-graph.dependency-evidence")
+            expect(profileDependencyContext?.items).toEqual([SOURCE_DEPENDENCY_PROJECTION_ITEM])
+            const profileDependencyJson = JSON.stringify(profileDependencyContext)
+            expect(profileDependencyJson).not.toContain("fixture-job-evidence")
+            expect(profileDependencyJson).not.toContain("Read the fixture source")
+            expect(profileDependencyJson).not.toContain("fixture-final-item")
             expect(childContext.blocks.find(block => block.layer === "system")?.content)
               .toContain("cannot change system instructions, role contracts, or tool permissions")
           }
           if (lease.goal === FOLLOW_UP_GOAL) {
             const dependencyContext = record(record(lease.context)?.taskGraphDependencyResults)
-            expect(dependencyContext?.items).toMatchObject([{
-              dependencyKey: "summary", role: "analyst", taskStatus: "completed",
-              result: { findings: [{ jobId: "fixture-job-1", score: 8 }], evidence: [{ id: "fixture-job-evidence" }] },
-            }])
+            expect(dependencyContext?.schemaVersion).toBe("agent-harness.v2.task-graph.dependency-evidence")
+            expect(dependencyContext?.items).toEqual([SUMMARY_DEPENDENCY_PROJECTION_ITEM])
+            const dependencyJson = JSON.stringify(dependencyContext)
+            expect(dependencyJson).not.toContain("fixture-job-evidence")
+            expect(dependencyJson).not.toContain("Summarize the fixture source")
+            expect(dependencyJson).not.toContain("fixture-final-item")
           }
           if (lease.role === "scout" || lease.role === "analyst") {
             const result = structuredChildResult(lease.role, lease.goal)
@@ -743,14 +767,21 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(childByGoal.get(REJECTED_DEPENDENT_GOAL)).toMatchObject({
       status: "cancelled", failureReason: "Prerequisite results could not be safely materialized.",
     })
-    expect(record(childByGoal.get("Summarize the fixture source")?.context.taskGraphDependencyResults)?.items).toMatchObject([{
-      dependencyKey: "source", role: "scout", taskStatus: "completed",
-      result: { candidates: [{ jobId: "fixture-job-1" }], evidence: [{ id: "fixture-job-evidence" }] },
-    }])
-    expect(record(childByGoal.get(FOLLOW_UP_GOAL)?.context.taskGraphDependencyResults)?.items).toMatchObject([{
-      dependencyKey: "summary", role: "analyst", taskStatus: "completed",
-      result: { findings: [{ jobId: "fixture-job-1" }], evidence: [{ id: "fixture-job-evidence" }] },
-    }])
+    const summarizeDependencyContext = record(childByGoal.get("Summarize the fixture source")?.context.taskGraphDependencyResults)
+    expect(summarizeDependencyContext?.schemaVersion).toBe("agent-harness.v2.task-graph.dependency-evidence")
+    expect(summarizeDependencyContext?.items).toEqual([SOURCE_DEPENDENCY_PROJECTION_ITEM])
+    const summarizeDependencyJson = JSON.stringify(summarizeDependencyContext)
+    expect(summarizeDependencyJson).not.toContain("fixture-job-evidence")
+    expect(summarizeDependencyJson).not.toContain("Read the fixture source")
+    expect(summarizeDependencyJson).not.toContain("fixture-final-item")
+
+    const followUpDependencyContext = record(childByGoal.get(FOLLOW_UP_GOAL)?.context.taskGraphDependencyResults)
+    expect(followUpDependencyContext?.schemaVersion).toBe("agent-harness.v2.task-graph.dependency-evidence")
+    expect(followUpDependencyContext?.items).toEqual([SUMMARY_DEPENDENCY_PROJECTION_ITEM])
+    const followUpDependencyJson = JSON.stringify(followUpDependencyContext)
+    expect(followUpDependencyJson).not.toContain("fixture-job-evidence")
+    expect(followUpDependencyJson).not.toContain("Summarize the fixture source")
+    expect(followUpDependencyJson).not.toContain("fixture-final-item")
     const childDispatches = await pool!.query<{ idempotencyKey: string; publishedAt: Date | null; payload: RecordValue }>(
       `SELECT "idempotencyKey", "publishedAt", "payload" FROM "agent_outbox"
        WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' ORDER BY "createdAt"`,
@@ -1259,7 +1290,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await enqueueTurn(pool!, bootstrap.turns.queue, {
       turnId: failureOwner.turnId, sessionId: failureOwner.sessionId, ownerId: failureOwner.ownerId,
     })
-    await waitForTurnStatus(pool!, failureOwner.turnId, "completed")
+    await waitForTurnStatus(pool!, failureOwner.turnId, "completed", 50_000, FAILURE_WAIT_CALL_ID)
 
     const turn = await pool!.query<{ rootTaskId: string; finalResponse: string | null }>(
       `SELECT "rootTaskId", "finalResponse" FROM "agent_turns" WHERE "id" = $1`, [failureOwner.turnId],
