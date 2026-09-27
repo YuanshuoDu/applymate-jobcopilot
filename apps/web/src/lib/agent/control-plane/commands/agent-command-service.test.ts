@@ -162,6 +162,13 @@ function makeDb(options: {
         outbox.push(data)
         return data
       }),
+      createMany: vi.fn(async (args: unknown) => {
+        if (options.failOutbox) throw new Error("outbox unavailable")
+        const data = (args as { data: Row[] }).data
+        const inserted = data.filter((entry) => !outbox.some((existing) => existing.idempotencyKey === entry.idempotencyKey))
+        outbox.push(...inserted)
+        return { count: inserted.length }
+      }),
     },
   }
 
@@ -420,15 +427,35 @@ describe("AgentCommandService", () => {
     const service = new AgentCommandService(fake.db)
     const started = await service.start(startCommand("client_start"))
     const followUp = await service.message({ ...startCommand("client_follow_up"), delivery: "follow_up" })
+    const command = { ...startCommand("client_interrupt"), expectedTurnId: started.turnId }
 
-    const result = await service.interrupt({
-      ...startCommand("client_interrupt"),
-      expectedTurnId: started.turnId,
-    })
+    const result = await service.interrupt(command)
+    const duplicate = await service.interrupt(command)
 
     expect(result).toMatchObject({ disposition: "interrupted", turnId: started.turnId })
+    expect(duplicate).toMatchObject({ disposition: "duplicate", originalDisposition: "interrupted", turnId: started.turnId })
     expect(fake.state.active).toMatchObject({ status: "interrupted", revision: 1 })
     expect(fake.state.inputs.find((input) => input.id === followUp.inputId)).toMatchObject({ status: "cancelled", cancelledAt: expect.any(Date) })
+    const stopIntents = fake.state.outbox.filter((entry) => entry.topic === "agent.task-graph.stop")
+    expect(stopIntents).toHaveLength(1)
+    expect(stopIntents[0]).toEqual({
+      id: `task-graph-stop-${started.turnId}`,
+      topic: "agent.task-graph.stop",
+      aggregateId: "session_1",
+      idempotencyKey: `agent-task-graph-stop:session_1:${started.turnId}`,
+      payload: { sessionId: "session_1", turnId: started.turnId },
+    })
+    expect(fake.tx.agentOutbox.createMany).toHaveBeenCalledTimes(1)
+    expect(fake.tx.agentOutbox.createMany).toHaveBeenCalledWith({
+      data: [{
+        id: `task-graph-stop-${started.turnId}`,
+        topic: "agent.task-graph.stop",
+        aggregateId: "session_1",
+        idempotencyKey: `agent-task-graph-stop:session_1:${started.turnId}`,
+        payload: { sessionId: "session_1", turnId: started.turnId },
+      }],
+      skipDuplicates: true,
+    })
   })
 
   it("uses the open session fence before command admission", async () => {

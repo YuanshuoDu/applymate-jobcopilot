@@ -1,6 +1,7 @@
 import type pg from "pg"
 
 import { getPool } from "../../db/apply-results.js"
+import { prepareGraphTransition, reconcileGraphDependents } from "../subagents/task-graph-pg-lifecycle.js"
 
 export const SUBAGENT_MAILBOX_OUTBOX_TOPIC = "agent.subagent.mailbox"
 const DEFAULT_BATCH_SIZE = 10
@@ -94,6 +95,15 @@ function canWakeWaitingTask(lineage: MailboxLineage): boolean {
 
 async function wakeWaitingTask(client: Queryable, payload: MailboxPayload, lineage: MailboxLineage): Promise<void> {
   if (!canWakeWaitingTask(lineage)) return
+  // Mailbox delivery may wake legacy waiters, but TaskGraph dependency waiters stay under graph reconciliation.
+  const graphWake = await prepareGraphTransition(client, {
+    taskId: payload.toTaskId, sessionId: payload.sessionId, type: "task.queued",
+  })
+  if (graphWake && "blocked" in graphWake) return
+  if (graphWake) {
+    await reconcileGraphDependents(client, graphWake.scope, new Date())
+    return
+  }
   const queued = await client.query(`UPDATE "sub_agent_tasks" AS target
     SET "status" = 'queued', "updatedAt" = CURRENT_TIMESTAMP
     WHERE target."id" = $1 AND target."sessionId" = $2 AND target."turnId" = $3

@@ -198,8 +198,8 @@ describe('TaskGraph plan projection', () => {
     const completed = {
       ...task({ id: 'task-a', role: 'scout', status: 'completed', hasResult: true }),
       structuredEvidencePreview: {
-        role: 'scout', summary: 'Found one matching role.', itemCount: 1,
-        evidence: [{ kind: 'job', source: 'greenhouse', reference: 'job-42' }],
+        role: 'scout', summary: 'Scout completed: 1 candidate; 1 linked evidence item.', itemCount: 1,
+        evidence: [{ kind: 'job', source: 'greenhouse', reference: null }],
       },
       result: { finalText: 'RAW_PRIVATE_RESULT', structuredResult: { url: 'PRIVATE_URL' } },
     } as unknown as SupervisorTaskSummary
@@ -210,8 +210,8 @@ describe('TaskGraph plan projection', () => {
 
     const projection = projectCurrentTaskGraph([item], [completed, foreign], sessionId)
     expect(projection?.nodes[0]?.evidencePreview).toEqual({
-      role: 'scout', summary: 'Found one matching role.', itemCount: 1,
-      evidence: [{ kind: 'job', source: 'greenhouse', reference: 'job-42' }],
+      role: 'scout', summary: 'Scout completed: 1 candidate; 1 linked evidence item.', itemCount: 1,
+      evidence: [{ kind: 'job', source: 'greenhouse', reference: null }],
     })
     expect(JSON.stringify(projection)).not.toContain('RAW_PRIVATE_RESULT')
     expect(JSON.stringify(projection)).not.toContain('PRIVATE_URL')

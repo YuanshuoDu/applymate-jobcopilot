@@ -6,7 +6,7 @@ import type { TurnUsage } from "../budget.js"
 import type { BusinessCheck } from "../verifier.js"
 import type { ExecutionOwnerFence, TurnExecutionOwnerFence } from "../execution-owner.js"
 import type { TurnLease } from "./lease.js"
-import type { TurnEngineCompletionGate } from "./turn-execution-types.js"
+import type { TurnEngineCompletionGate, TurnExecutionOptions, TurnExecutionStepBudget } from "./turn-execution-types.js"
 import type { SteeringMarkerContext } from "../context/steering-marker-store.js"
 import type { SteeringMarkerPayload } from "../context/steering-marker.js"
 
@@ -156,7 +156,7 @@ export type TurnEngineToolExecutor = (input: {
   signal: AbortSignal
   capabilities?: readonly string[]
   call: { id: string; toolName: string; toolVersion: string; input: unknown }
-}) => Promise<TurnEngineToolResult>
+} & TurnExecutionStepBudget) => Promise<TurnEngineToolResult>
 
 export type TurnEngineEventSubscriber = (event: TurnEngineEvent) => void | Promise<void>
 
@@ -211,7 +211,7 @@ export type TurnEngineOptions = {
   /** Server-classified restart repair for persisted tool calls, applied before another model request. */
   readonly toolCallRecovery?: readonly ToolCallRecovery[]
   readonly steeringMarkerState?: { readonly active: readonly SteeringMarkerPayload[] }
-}
+} & Pick<TurnExecutionOptions, "refreshTaskGraphAfterReadyWait">
 
 export type TurnResumeState = {
   readonly nextOrdinal: number

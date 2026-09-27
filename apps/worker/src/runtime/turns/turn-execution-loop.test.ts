@@ -3,12 +3,16 @@ import { describe, expect, it, vi } from "vitest"
 import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
 import type { PolicyEngine } from "@jobcopilot/agent-policy"
 import type { StepContext } from "../context/step-context-builder.js"
+import { mergeTaskGraphCurrentObservation } from "../canonical-turn-task-graph-context.js"
 import { runTurnExecutionLoop } from "./turn-execution-loop.js"
 import type { TurnEngineEvent, TurnEngineItem, TurnEngineStore, TurnEngineToolResult } from "./turn-engine-types.js"
 import type { TurnExecutionIdentity, TurnExecutionOptions, TurnExecutionStore } from "./turn-execution-types.js"
 import { steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "../context/steering-marker.js"
 import { COGNITIVE_AGENDA_EVENT_TYPE } from "./cognitive-agenda-receipt.js"
 import { BudgetExceededError } from "../budget.js"
+import { ToolExecutionError, type ToolExecutionContext } from "../tools/types.js"
+import { createTaskGraphPlanningTool } from "../tools/planning-executors.js"
+import type { TaskGraphCommandPort, TaskGraphCurrentState, TaskGraphScheduleReceipt } from "../subagents/task-graph-command-port.js"
 
 const profile = {
   provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false,
@@ -173,6 +177,170 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.requests.at(-1)?.messages.flatMap(message => message.content).some(part => JSON.stringify(part).includes("Also include senior roles"))).toBe(true)
     expect(root.items.filter(item => item.id.includes("item:final:")).map(item => item.revision)).toEqual([1])
     expect(root.notifications.filter(type => type === "turn.completed")).toHaveLength(1)
+  })
+
+  it.each([
+    { maxSteps: 1, expectedRemaining: 0, expectedWrites: 0 },
+    { maxSteps: 3, expectedRemaining: 2, expectedWrites: 1 },
+  ])("keeps TaskGraph scheduling behind the live root step budget (maxSteps=$maxSteps)", async ({ maxSteps, expectedRemaining, expectedWrites }) => {
+    const root = fixture(identity("turn", "root-1"))
+    const receipt: TaskGraphScheduleReceipt = {
+      status: "accepted", revision: 1,
+      nodes: [{ key: "research", taskId: "child-1", status: "queued" }], readyTaskIds: ["child-1"],
+    }
+    const commandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => receipt),
+      readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
+    }
+    const planTool = createTaskGraphPlanningTool({
+      commandPort,
+      templates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+      turnLeaseOwner: "worker-1", turnLeaseVersion: 1, parentLeaseOwner: "worker-1", parentAttemptCount: () => 1,
+    })
+    const proposal = {
+      expectedRevision: 0,
+      nodes: [{ key: "research", templateId: "scout", goal: "Find relevant roles", successCriteria: ["Return role links"], dependsOn: [] }],
+    }
+    const requests: HarnessModelRequest[] = []
+    const remainingAtPlan: number[] = []
+    let modelCalls = 0
+    const baseModel = root.options.model
+    root.options = {
+      ...root.options,
+      budget: { maxSteps },
+      tools: [planTool],
+      model: {
+        ...baseModel,
+        async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+          requests.push(request)
+          modelCalls += 1
+          if (modelCalls === 1) {
+            yield { type: "tool_call_completed", callId: "plan-call", name: "agent.plan", arguments: proposal }
+            yield { type: "completed", finishReason: "tool_calls" }
+            return
+          }
+          yield { type: "text_delta", text: "The graph plan is ready." }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      },
+      executeTool: async input => {
+        const context: ToolExecutionContext = {
+          scope: input.scope, sessionId: input.sessionId, turnId: input.turnId, stepId: input.stepId,
+          toolCallId: input.call.id, taskId: input.taskId, rootTaskId: input.rootTaskId,
+          actorRole: input.actorRole, remainingTurnSteps: input.remainingTurnSteps,
+          signal: input.signal, capabilities: input.capabilities ?? [], reportProgress: async () => undefined,
+        }
+        if (typeof input.remainingTurnSteps === "number") remainingAtPlan.push(input.remainingTurnSteps)
+        try {
+          const output = await planTool.execute(context, input.call.input)
+          return { id: input.call.id, toolName: input.call.toolName, toolVersion: input.call.toolVersion, status: "completed", output, errorCode: null }
+        } catch (error: unknown) {
+          const code = error instanceof ToolExecutionError ? error.code : "tool_execution_failed"
+          const output = error instanceof ToolExecutionError ? error.safeOutput : undefined
+          return { id: input.call.id, toolName: input.call.toolName, toolVersion: input.call.toolVersion, status: "failed", output, errorCode: code }
+        }
+      },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(remainingAtPlan).toEqual([expectedRemaining])
+    expect(commandPort.appendAndSchedule).toHaveBeenCalledTimes(expectedWrites)
+    if (maxSteps === 1) expect(result).toMatchObject({ status: "failed", errorCode: "budget_exhausted", stepCount: 1 })
+    else expect(result.status).toBe("completed")
+    expect(requests[0]?.tools).toEqual(expect.arrayContaining([expect.objectContaining({ name: "agent.plan" })]))
+  })
+
+  it("refreshes persisted TaskGraph evidence after an inline-ready wait before the next plan", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const currentGraph: TaskGraphCurrentState = {
+      revision: 4,
+      nodes: [{
+        key: "child", templateId: "scout", goal: "Find roles", successCriteria: ["Return evidence"], dependsOn: [],
+        taskId: "child-1", status: "completed" as const, readiness: "terminal" as const,
+        resultSummary: "One matching role", failureReason: null,
+        resultProjection: {
+          schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted" as const,
+          availability: "available" as const, role: "scout" as const, status: "completed" as const,
+          candidateCount: 1, evidenceCount: 1,
+          candidates: [{ jobId: "job-42", source: "greenhouse" as const, evidenceKinds: ["job" as const] }],
+        },
+      }],
+    }
+    const refresh = vi.fn(async snapshot => mergeTaskGraphCurrentObservation(snapshot, currentGraph))
+    const appendExpectedRevisions: number[] = []
+    const nextReceipt: TaskGraphScheduleReceipt = {
+      status: "accepted", revision: 5,
+      nodes: [{ key: "next", taskId: "child-2", status: "queued" }], readyTaskIds: ["child-2"],
+    }
+    const commandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async input => {
+        appendExpectedRevisions.push(input.proposal.expectedRevision)
+        return nextReceipt
+      }),
+      readCurrent: vi.fn(async () => currentGraph),
+    }
+    const planTool = createTaskGraphPlanningTool({
+      commandPort,
+      templates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+      turnLeaseOwner: "worker-1", turnLeaseVersion: 1, parentLeaseOwner: "worker-1", parentAttemptCount: () => 1,
+    })
+    const model = root.options.model
+    let modelCalls = 0
+    root.options = {
+      ...root.options,
+      tools: [{ name: "agent.wait", version: "1" }, planTool],
+      refreshTaskGraphAfterReadyWait: refresh,
+      model: {
+        ...model,
+        async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+          root.requests.push(request)
+          modelCalls += 1
+          if (modelCalls === 1) {
+            yield { type: "tool_call_completed", callId: "wait-call", name: "agent.wait", arguments: { taskIds: ["child-1"], mode: "all", timeoutMs: 5000 } }
+            yield { type: "completed", finishReason: "tool_calls" }
+            return
+          }
+          if (modelCalls === 2) {
+            const requestContext = JSON.stringify(request.messages).replaceAll("\\\"", "\"")
+            const hasFreshGraph = requestContext.includes('"revision":4') && requestContext.includes('"jobId":"job-42"')
+            yield {
+              type: "tool_call_completed", callId: "plan-call", name: "agent.plan",
+              arguments: {
+                expectedRevision: hasFreshGraph ? 4 : 0,
+                nodes: [{ key: "next", templateId: "scout", goal: "Find more roles", successCriteria: ["Return evidence"], dependsOn: [] }],
+              },
+            }
+            yield { type: "completed", finishReason: "tool_calls" }
+            return
+          }
+          yield { type: "text_delta", text: "The updated graph plan is ready." }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      },
+      executeTool: async input => {
+        if (input.call.toolName === "agent.wait") {
+          return { id: input.call.id, toolName: input.call.toolName, toolVersion: "1", status: "completed", output: { waitId: "wait-1", status: "ready", matchedTaskIds: ["child-1"] }, errorCode: null }
+        }
+        const context: ToolExecutionContext = {
+          scope: input.scope, sessionId: input.sessionId, turnId: input.turnId, stepId: input.stepId,
+          toolCallId: input.call.id, taskId: input.taskId, rootTaskId: input.rootTaskId,
+          actorRole: input.actorRole, remainingTurnSteps: input.remainingTurnSteps,
+          signal: input.signal, capabilities: input.capabilities ?? [], reportProgress: async () => undefined,
+        }
+        const output = await planTool.execute(context, input.call.input)
+        return { id: input.call.id, toolName: input.call.toolName, toolVersion: "1", status: "completed", output, errorCode: null }
+      },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    const secondRequestContext = JSON.stringify(root.requests[1]?.messages).replaceAll("\\\"", "\"")
+    expect(result).toMatchObject({ status: "completed", stepCount: 3 })
+    expect(refresh).toHaveBeenCalledOnce()
+    expect(secondRequestContext).toContain('"status":"completed"')
+    expect(secondRequestContext).toContain('"jobId":"job-42"')
+    expect(appendExpectedRevisions).toEqual([4])
   })
 
   it("persists one redacted agenda receipt before each model provider call", async () => {

@@ -8,13 +8,14 @@ import { closeSharedRedisConnections, redisConnection } from "./redis.js";
 import { workerHarnessFeatureHealth } from "./admin/harness-health.js";
 import { startSubagentMailboxOutboxConsumer } from "./runtime/mailbox/outbox-consumer.js";
 import { startAgentEventOutboxConsumer } from "./runtime/events/outbox-consumer.js";
+import { startTaskGraphStopOutboxConsumer } from "./runtime/subagents/task-graph-stop-outbox.js";
 import { startAgentWakeupConsumer } from "./runtime/wakeup/consumer.js";
 import { resolveProductionAgentFlags } from "./runtime/production-agent-flags.js";
 import { createCanonicalExecutionProjection } from "./runtime/canonical-execution-projection.js";
 import { createCanonicalSessionProjection } from "./runtime/canonical-session-projection.js";
+import { taskGraphRuntimeOptions } from "./runtime/subagents/task-graph-templates.js";
 
 type ClosableHttpServer = { close(callback: (error?: Error) => void): unknown; listening?: boolean };
-
 async function closeHttpServer(server: ClosableHttpServer | undefined): Promise<void> {
   if (!server || server.listening === false) return;
   await new Promise<void>((resolve, reject) => {
@@ -37,6 +38,7 @@ async function main() {
     productionBootstrapModule,
     productionChildRuntimeModule,
     postBootstrapStartupModule,
+    taskGraphCommandPortModule,
   ] = await Promise.all([
     import("./db/apply-results.js"),
     import("./queue/apply-queue.js"),
@@ -50,6 +52,7 @@ async function main() {
     import("./queue/production-bootstrap.js"),
     import("./runtime/subagents/production-child-runtime.js"),
     import("./queue/post-bootstrap-startup.js"),
+    import("./runtime/subagents/pg-task-graph-command-port.js"),
   ]);
   const { ensureApplyResultsTable, closePool, getPool } = applyResultsModule;
   const { applyWorker, applyQueue, connection } = applyQueueModule;
@@ -90,12 +93,16 @@ async function main() {
 
   const productionFlags = resolveProductionAgentFlags();
   const pool = getPool();
+  const taskGraphCommandPort = productionFlags.taskGraphPlanningEnabled
+    ? taskGraphCommandPortModule.createPgTaskGraphCommandPort(pool)
+    : undefined;
   const waitResolver = productionFlags.consumeWaitOutcomes ? {} : undefined;
   let childExecutor: ReturnType<typeof productionChildRuntimeModule.createOptionalProductionChildExecutor> = undefined;
   let canonicalBootstrap: Awaited<ReturnType<typeof productionBootstrapModule.createProductionWorkerBootstrap>> | undefined;
   let agentWakeupConsumer: ReturnType<typeof startAgentWakeupConsumer> | undefined;
   let agentMailboxOutboxConsumer: ReturnType<typeof startSubagentMailboxOutboxConsumer> | undefined;
   let agentEventOutboxConsumer: ReturnType<typeof startAgentEventOutboxConsumer> | undefined;
+  let agentTaskGraphStopOutboxConsumer: ReturnType<typeof startTaskGraphStopOutboxConsumer> | undefined;
   let automationScheduler: ReturnType<typeof startAutomationScheduler> | undefined;
   let adminServer: ClosableHttpServer | undefined;
   const postBootstrapFence = createPostBootstrapStartupFence(() => [
@@ -107,6 +114,7 @@ async function main() {
     () => automationScheduler?.close(),
     () => closeAllSlots(),
     () => agentEventOutboxConsumer?.close(),
+    () => agentTaskGraphStopOutboxConsumer?.close(),
     () => agentMailboxOutboxConsumer?.close(),
     () => agentWakeupConsumer?.close(),
     () => closeHttpServer(adminServer),
@@ -127,6 +135,7 @@ async function main() {
           productionFlags,
           executionProjection: createCanonicalExecutionProjection(pool),
           sessionProjection: createCanonicalSessionProjection(pool),
+          ...taskGraphRuntimeOptions(taskGraphCommandPort),
         });
       },
       bootstrapOptions: () => ({
@@ -151,6 +160,8 @@ async function main() {
     console.log("[worker] Agent subagent mailbox outbox consumer started");
     agentEventOutboxConsumer = startAgentEventOutboxConsumer(pool, redisConnection);
     console.log("[worker] Agent session event outbox consumer started");
+    agentTaskGraphStopOutboxConsumer = startTaskGraphStopOutboxConsumer(pool);
+    console.log("[worker] Agent TaskGraph stop outbox consumer started");
 
     const workerControls = {
       "apply-tasks": bindWorkerControl(applyQueue, applyWorker),

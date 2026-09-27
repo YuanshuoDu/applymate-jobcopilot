@@ -8,7 +8,9 @@ import { createHarnessModelRuntime, type HarnessModelRuntime } from "./harness-m
 import { createPgContextOwnerFence, StepContextBuilder } from "./context/step-context-builder.js"
 import { createPgInputClaimStore } from "./context/input-claim-store.js"
 import { createWorkerToolRuntime, type ToolLifecycleSink, type ToolRouter } from "./tools/index.js"
-import type { ToolIdempotency } from "./tools/types.js"
+import { registerTaskGraphPlanningTool } from "./tools/planning-executors.js"
+import type { TaskGraphCommandPort, TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
+import type { RuntimeToolDefinition, ToolIdempotency } from "./tools/types.js"
 import { createPgTurnEngineStore } from "./turns/turn-engine-store.js"
 import { createToolRouterExecutor } from "./turns/turn-engine-helpers.js"
 import { TurnEngine } from "./turns/turn-engine.js"
@@ -19,6 +21,7 @@ import type { TurnExecutor, TurnExecutionResult } from "./turns/turn-queue.js"
 import type { TurnLease } from "./turns/lease.js"
 import type { TurnEngineOptions, TurnEngineStore } from "./turns/turn-engine-types.js"
 import { loadCanonicalTurnState, type CanonicalTurnState } from "./canonical-turn-state.js"
+import { loadTaskGraphCurrentObservation } from "./canonical-turn-task-graph-context.js"
 import { AgentTreeManager } from "./subagents/manager.js"
 import { PgSubagentTaskStore } from "./subagents/pg-store.js"
 import { createPgRootTaskStore, type RootTaskStore } from "./subagents/root-task-store.js"
@@ -30,11 +33,9 @@ import type { ProductionAgentFlags } from "./production-agent-flags.js"
 import { assertCanonicalCoordinationSurface, classifyToolCallRecovery, durableLifecycleSink, isResumableRootResult } from "./turns/canonical-runtime-tool-recovery.js"
 
 export { durableLifecycleSink } from "./turns/canonical-runtime-tool-recovery.js"
-
 export type UsageAuthorization = {
   settle(input: { status: "success" | "error"; inputTokens: number; outputTokens: number; estimatedCostUsd: number; errorCode?: string }): Promise<void> | void
 }
-
 export type CanonicalTurnRuntimeOptions = {
   readonly workerId: string
   /** One server-owned activation contract for production route capabilities. */
@@ -45,7 +46,10 @@ export type CanonicalTurnRuntimeOptions = {
   readonly stateLoader?: (pool: Pick<pg.Pool, "connect">, lease: TurnLease, now?: Date) => Promise<CanonicalTurnState>
   readonly modelRuntimeFactory?: (input: { userId: string; config?: AiConfig; state: CanonicalTurnState }) => Promise<HarnessModelRuntime> | HarnessModelRuntime
   readonly authorizeUsage?: (input: { userId: string; sessionId: string; turnId: string; stepId: string; leaseOwnerId: string; leaseVersion: number; featureKey: string; provider: string; model: string }) => Promise<UsageAuthorization> | UsageAuthorization
-  readonly toolRuntimeFactory?: (input: { pool: pg.Pool; policy: PolicyEngine; manager: AgentTreeManager; state: CanonicalTurnState }) => { registry: { list(capabilities?: readonly string[]): readonly unknown[]; resolve(name: string, version: string): { readonly idempotency: ToolIdempotency }; validateArguments(name: string, input: unknown, version?: string): true | string }; router: ToolRouter }
+  /** Server-owned scheduler and trusted template registry; model input never supplies its task/tenant fence. */
+  readonly taskGraphCommandPort?: TaskGraphCommandPort
+  readonly taskGraphTemplates?: Readonly<Record<string, TaskGraphTaskTemplate>>
+  readonly toolRuntimeFactory?: (input: { pool: pg.Pool; policy: PolicyEngine; manager: AgentTreeManager; state: CanonicalTurnState }) => { registry: { list(capabilities?: readonly string[]): readonly unknown[]; resolve(name: string, version: string): { readonly idempotency: ToolIdempotency }; validateArguments(name: string, input: unknown, version?: string): true | string; register?(definition: RuntimeToolDefinition): void }; router: ToolRouter }
   readonly manager?: AgentTreeManager
   readonly rootTaskStore?: RootTaskStore
   readonly turnEngineStoreFactory?: (pool: pg.Pool) => TurnEngineStore
@@ -126,7 +130,6 @@ function defaultAuthorization(): never {
   Object.assign(error, { code: "usage_authorization_unavailable" })
   throw error
 }
-
 export async function createCanonicalTurnRuntime(pool: pg.Pool, options: CanonicalTurnRuntimeOptions): Promise<{
   execute: TurnExecutor
   manager: AgentTreeManager
@@ -173,12 +176,10 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const state = options.stateLoader
       ? await options.stateLoader(pool, lease, now())
       : await loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes })
-    const selectedPolicy = createCanonicalPolicy(state.toolPolicySnapshot, coordinationEnabled)
+    const taskGraphPlanningEnabled = options.productionFlags?.taskGraphPlanningEnabled === true && coordinationEnabled
+    const selectedPolicy = createCanonicalPolicy(state.toolPolicySnapshot, coordinationEnabled, taskGraphPlanningEnabled)
     const configuredCapabilities = capabilities(state.toolPolicySnapshot).filter(capability => capability !== "canManageChildren")
-    const toolCapabilities = [...new Set([
-      ...configuredCapabilities,
-      ...(coordinationEnabled ? ["canManageChildren"] : []),
-    ])]
+    const toolCapabilities = [...new Set([...configuredCapabilities, ...(coordinationEnabled ? ["coordination", "canManageChildren"] : [])])]
     const turnStore = options.turnEngineStoreFactory?.(pool) ?? createPgTurnEngineStore(pool)
     let lifecycleSink: ToolLifecycleSink | null = null
     let lifecycleOwner: ExecutionOwner | null = null
@@ -196,12 +197,16 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       wait: createPgDurableWaitPort(pool),
     } : undefined
     const toolRuntime = options.toolRuntimeFactory?.({ pool, policy: selectedPolicy, manager, state }) ?? createWorkerToolRuntime(pool, { sink: sinkProxy, resolveOwner }, selectedPolicy, coordination)
+    let taskGraphParentAttemptCount: number | null = null
+    registerTaskGraphPlanningTool(toolRuntime.registry, taskGraphPlanningEnabled, { commandPort: options.taskGraphCommandPort, templates: options.taskGraphTemplates, turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: () => taskGraphParentAttemptCount })
     if (coordinationEnabled) assertCanonicalCoordinationSurface(toolRuntime.registry, toolCapabilities)
     const allowedActions = toolRuntime.registry.list(toolCapabilities).flatMap((definition) => {
       const name = definition && typeof definition === "object" && "name" in definition ? (definition as { name?: unknown }).name : undefined
       return typeof name === "string" ? [name] : []
     })
     const root = await rootTasks.ensure({ lease, goal: state.goal, modelProfileSnapshot: state.modelProfileSnapshot, toolPolicySnapshot: state.toolPolicySnapshot, budgetSnapshot: state.budgetSnapshot, allowedActions, now: now() })
+    taskGraphParentAttemptCount = root.attemptCount
+    const modelSnapshot = taskGraphPlanningEnabled ? await loadTaskGraphCurrentObservation(state.snapshot, options.taskGraphCommandPort, lease, root) : state.snapshot
     const owner = executionOwnerFence({ kind: "turn", taskId: root.id, lease })
     lifecycleOwner = { kind: "turn", taskId: root.id, lease }
     lifecycleSink = options.lifecycleSinkFactory?.({ lease, store: turnStore, owner }) ?? durableLifecycleSink(turnStore, owner)
@@ -216,13 +221,13 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     }
     const actorRole = (record(state.toolPolicySnapshot).role as PolicyRole | undefined) ?? "orchestrator"
     const engine = new TurnEngine({
-      lease, scope: state.scope, goal: state.goal, snapshot: state.snapshot, contextBuilder,
+      lease, scope: state.scope, goal: state.goal, snapshot: modelSnapshot, contextBuilder,
       store: turnStore, model, tools: toolRuntime.registry.list(toolCapabilities),
       executeTool: createToolRouterExecutor(toolRuntime.router), rootInputId: state.rootInputId, rootTaskId: root.id, taskId: root.id,
       actorRole, capabilities: toolCapabilities,
       validateToolArguments: (name, input) => toolRuntime.registry.validateArguments(name, input, "1"), signal,
       budget: limits(state.budgetSnapshot), resume: state.resume, now, publishReasoningSummary: false,
-      steeringMarkerState: { active: state.steeringMarkers?.active ?? [] },
+      steeringMarkerState: { active: state.steeringMarkers?.active ?? [] }, ...(taskGraphPlanningEnabled ? { refreshTaskGraphAfterReadyWait: (snapshot: TurnEngineOptions["snapshot"]) => loadTaskGraphCurrentObservation(snapshot, options.taskGraphCommandPort, lease, root) } : {}),
       ...(state.pendingToolCalls?.length ? { toolCallRecovery: classifyToolCallRecovery(state.pendingToolCalls, (name, version) => toolRuntime.registry.resolve(name, version)) } : {}),
       ...(rootTasks.checkCompletion ? { completionGate: async () => rootTasks.checkCompletion!({ lease, rootTaskId: root.id, now: now() }) } : {}),
     })

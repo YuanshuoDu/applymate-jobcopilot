@@ -38,6 +38,7 @@ type State = {
   inputs: Array<Record<string, unknown>>
   items: Array<Record<string, unknown>>
   events: Array<Record<string, unknown>>
+  outbox: Array<Record<string, unknown>>
 }
 
 function whereOf(args: unknown): Record<string, unknown> {
@@ -77,6 +78,7 @@ function makeTransaction(options: {
     inputs: options.inputs ?? [],
     items: options.items ?? [],
     events: [],
+    outbox: [],
   }
   let sequence = BigInt(0)
   const tx = {
@@ -219,7 +221,16 @@ function makeTransaction(options: {
         return event
       }),
     },
-    agentOutbox: { create: vi.fn(async (args: unknown) => (args as { data: Record<string, unknown> }).data) },
+    agentOutbox: {
+      create: vi.fn(async (args: unknown) => (args as { data: Record<string, unknown> }).data),
+      createMany: vi.fn(async (args: unknown) => {
+        const input = args as { data: Array<Record<string, unknown>> }
+        for (const row of input.data) {
+          if (!state.outbox.some(existing => existing.idempotencyKey === row.idempotencyKey)) state.outbox.push(row)
+        }
+        return { count: input.data.length }
+      }),
+    },
   }
   return { tx: tx as unknown as CommandTransaction, state }
 }
@@ -303,6 +314,13 @@ describe("execution cancellation transaction", () => {
     expect(sql).toContain('turn."userId" =')
     expect(sql).toContain('COALESCE(task."interruptRequestedAt"')
     expect(sql).toContain("'running'")
+    expect(fake.state.outbox).toEqual([{
+      id: "task-graph-stop-turn_1",
+      topic: "agent.task-graph.stop",
+      aggregateId: "session_1",
+      idempotencyKey: "agent-task-graph-stop:session_1:turn_1",
+      payload: { sessionId: "session_1", turnId: "turn_1" },
+    }])
   })
 
   it("does not interrupt a Turn when the execution becomes terminal while waiting for the session lock", async () => {
@@ -542,6 +560,7 @@ describe("execution cancellation transaction", () => {
     await expect(cancelExecutionInTransaction(fake.tx, { executionId: "execution_1", userId: "user_1" })).resolves.toBe(true)
 
     expect(fake.state.inputs).toHaveLength(1)
+    expect(fake.state.outbox).toHaveLength(1)
     expect(fake.state.active).toMatchObject({ status: "interrupted", revision: 1 })
   })
 

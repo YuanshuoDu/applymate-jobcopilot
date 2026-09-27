@@ -122,6 +122,7 @@ export class ToolRouter {
       taskId: context.taskId,
       rootTaskId: context.rootTaskId,
       actorRole: context.actorRole,
+      remainingTurnSteps: context.remainingTurnSteps,
       delegateOutputSchemaMarker: context.delegateOutputSchemaMarker,
       signal: controller.signal,
       capabilities: context.capabilities ?? [],

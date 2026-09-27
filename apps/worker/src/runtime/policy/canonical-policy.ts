@@ -22,6 +22,11 @@ const FALLBACK_POLICY: PolicySnapshot = {
       outcome: "allow", reasonCode: "server_coordination_read_gate", reason: "The server enabled scoped root coordination reads",
     },
     {
+      id: "canonical-root-task-graph-plan",
+      roles: ["orchestrator"], tools: ["agent.plan"], risks: ["internal_write"], domains: ["coordination"], requiredCapabilities: ["coordination", "canManageChildren"],
+      outcome: "allow", reasonCode: "server_task_graph_planning_gate", reason: "The server enabled scoped task graph planning",
+    },
+    {
       id: "canonical-root-read",
       roles: ["orchestrator"], risks: ["read"],
       outcome: "allow", reasonCode: "safe_read_baseline", reason: "Read-only tools use the canonical safe baseline",
@@ -29,8 +34,12 @@ const FALLBACK_POLICY: PolicySnapshot = {
   ],
 }
 
-function fallbackPolicy(coordinationEnabled: boolean): PolicySnapshot {
-  const enabled = new Set(["canonical-root-read", ...(coordinationEnabled ? ["canonical-root-coordination", "canonical-root-coordination-read"] : [])])
+function fallbackPolicy(coordinationEnabled: boolean, planningExecutionEnabled: boolean): PolicySnapshot {
+  const enabled = new Set([
+    "canonical-root-read",
+    ...(coordinationEnabled ? ["canonical-root-coordination", "canonical-root-coordination-read"] : []),
+    ...(coordinationEnabled && planningExecutionEnabled ? ["canonical-root-task-graph-plan"] : []),
+  ])
   return { ...FALLBACK_POLICY, rules: FALLBACK_POLICY.rules.filter(rule => enabled.has(rule.id)) }
 }
 
@@ -41,9 +50,9 @@ function missingSnapshot(value: unknown): boolean {
   return keys.length === 0 || !keys.some(key => key === "version" || key === "rules")
 }
 
-export function createCanonicalPolicy(value: unknown, coordinationEnabled = false): PolicyEngine {
+export function createCanonicalPolicy(value: unknown, coordinationEnabled = false, planningExecutionEnabled = false): PolicyEngine {
   if (missingSnapshot(value)) {
-    return new PolicyEngine(coordinationEnabled ? { snapshot: fallbackPolicy(coordinationEnabled) } : {})
+    return new PolicyEngine(coordinationEnabled ? { snapshot: fallbackPolicy(coordinationEnabled, planningExecutionEnabled) } : {})
   }
   if (typeof value !== "object" || Array.isArray(value)) throw new Error("canonical_policy_snapshot_invalid")
   return new PolicyEngine({ snapshot: value as unknown as PolicySnapshot })

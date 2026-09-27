@@ -18,8 +18,9 @@ const KNOWN_EVENT_TYPES = new Set([
   'question.answered', 'question.cancelled', 'external_action.reserved', 'stream.overflow', 'cognitive.agenda', STEERING_MARKER_EVENT_TYPE,
 ])
 
-// Status-only events drive supervisor metadata refreshes. Item deltas are
-// intentionally excluded so streamed text does not refetch turns and tasks.
+// Status-only events drive supervisor metadata refreshes. Ordinary item deltas
+// stay excluded so streamed text does not refetch turns and tasks; TaskGraph
+// deltas are the exception because their status projection lives in task DTOs.
 const LIFECYCLE_EVENT_TYPES = new Set([
   'turn.started', 'turn.wakeup', 'turn.resumed', 'turn.completed', 'turn.failed',
   'task.started', 'task.completed', 'task.interrupted', 'task.failed',
@@ -31,6 +32,15 @@ const LIFECYCLE_EVENT_TYPES = new Set([
 
 function isLifecycleEvent(event: TimelineEvent): boolean {
   return LIFECYCLE_EVENT_TYPES.has(event.type) && (!event.type.startsWith('task.') || event.taskId !== null)
+}
+
+function isTaskGraphDelta(event: TimelineEvent, state: TimelineState): boolean {
+  if (event.type !== 'item.delta' || !event.itemId) return false
+  const existing = state.itemsById[event.itemId]
+  if (existing?.sessionId === event.sessionId && existing.type === 'task_graph') return true
+  const payload = isRecord(event.payload) ? event.payload : null
+  const item = payload && isRecord(payload.item) ? payload.item : null
+  return item?.id === event.itemId && item.sessionId === event.sessionId && item.type === 'task_graph'
 }
 
 export function reduceTimelineEvent(state: TimelineState, value: unknown): TimelineState {
@@ -51,7 +61,9 @@ export function reduceTimelineEvent(state: TimelineState, value: unknown): Timel
     ...next,
     ...appendTimelineEvent(next.events, event),
     lastEventId: event.id,
-    lifecycleRevision: isLifecycleEvent(event) ? state.lifecycleRevision + 1 : state.lifecycleRevision,
+    lifecycleRevision: isLifecycleEvent(event) || isTaskGraphDelta(event, state)
+      ? state.lifecycleRevision + 1
+      : state.lifecycleRevision,
   }
   if (markerState) return { ...next, steeringMarkers: markerState.state, steeringMarkerEvents: markerState.events }
   if (event.type === 'cognitive.agenda') next = { ...next, cognitiveAgenda: reduceCognitiveAgenda(next.cognitiveAgenda, event) }

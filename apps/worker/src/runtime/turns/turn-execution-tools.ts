@@ -51,6 +51,9 @@ export async function executeTools(
     if (result.status === "failed" && result.errorCode === "policy_requires_approval") return { wait: { status: "waiting_for_approval", stepCount: 0, toolCallCount: 0, errorCode: result.errorCode }, snapshot, steeringMarkerState: markerState }
     if (result.status === "failed" && (result.errorCode === "policy_requires_user_input" || result.errorCode === "gmail_oauth_required")) return { wait: { status: "waiting_for_user", stepCount: 0, toolCallCount: 0, errorCode: result.errorCode }, snapshot, steeringMarkerState: markerState }
     snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, { id: `tool-result:${call.id}`, content: toRepositoryJson({ toolCallId: call.id, toolName: call.name, input: call.arguments, status: result.status, output: result.output ?? null, errorCode: result.errorCode }) }] }
+    if (call.name === "agent.wait" && result.status === "completed" && isInlineReadyWait(result.output)) {
+      snapshot = await options.refreshTaskGraphAfterReadyWait?.(snapshot) ?? snapshot
+    }
     const wait = dependencyWaitReceipt(result.status === "completed" ? result.output : null)
     if (wait) return { wait: { status: "waiting_for_dependency", waitId: wait.waitId, stepCount: 0, toolCallCount: 0 }, snapshot, steeringMarkerState: markerState }
   }
@@ -93,6 +96,10 @@ export async function recoverPersistedToolCalls(options: TurnExecutionOptions, w
 }
 
 type DependencyWaitReceipt = { readonly waitId: string; readonly deadlineAt: string; readonly matchedTaskIds: readonly string[] }
+function isInlineReadyWait(value: unknown): boolean {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value) && (value as Record<string, unknown>).status === "ready")
+}
+
 function dependencyWaitReceipt(value: unknown): DependencyWaitReceipt | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null
   const record = value as Record<string, unknown>

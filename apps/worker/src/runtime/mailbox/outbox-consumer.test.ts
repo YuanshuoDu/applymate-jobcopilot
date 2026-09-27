@@ -1,7 +1,10 @@
 import type pg from "pg"
 import { describe, expect, it, vi } from "vitest"
+import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 
 import { drainSubagentMailboxOutbox, startSubagentMailboxOutboxConsumer } from "./outbox-consumer.js"
+import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "../subagents/task-graph-snapshot.js"
+import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 
 type OutboxRow = {
   id: string
@@ -54,9 +57,27 @@ type FakeOptions = {
   dispatchPublishedAt?: Date | null
   dispatchAttemptCount?: number
   dispatchLastError?: string | null
+  taskGraphNodes?: readonly {
+    key: string
+    templateId: string
+    goal: string
+    successCriteria: readonly string[]
+    dependsOn: readonly string[]
+    depth: number
+    taskId: string
+  }[]
+  taskGraphStatuses?: Readonly<Record<string, string>>
 }
 
 const validPayload = { messageId: "message-1", sessionId: "session-1", turnId: "turn-1", toTaskId: "task-1" }
+const completedScoutResult = {
+  status: "completed", stepCount: 1, toolCallCount: 0, finalItemId: null, finalText: "Found one job",
+  structuredResult: {
+    schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+    candidates: [{ jobId: "job-1", source: "greenhouse", url: null, evidenceIds: ["evidence-1"] }],
+    evidence: [{ id: "evidence-1", kind: "job", ref: "job-1", source: "greenhouse" }], summary: "Found one job",
+  },
+}
 
 function makeOutbox(overrides: Partial<OutboxRow> = {}): OutboxRow {
   return {
@@ -77,7 +98,9 @@ class FakeClient {
   readonly outboxRows: OutboxRow[]
   readonly mailboxRows: MailboxRow[]
   readonly task: TaskRow
-  readonly dispatch: DispatchRow | null
+  dispatch: DispatchRow | null
+  readonly graphLifecycleEvents: unknown[] = []
+  graphEventOutboxCount = 0
   private rollbackState: { outbox: OutboxRow[]; mailbox: MailboxRow[]; task: TaskRow; dispatch: DispatchRow | null } | null = null
 
   constructor(private readonly options: FakeOptions = {}, outboxRows: readonly OutboxRow[] = [makeOutbox()]) {
@@ -133,6 +156,78 @@ class FakeClient {
         && !["completed", "failed", "interrupted", "cancelled", "closed"].includes(this.options.turnStatus ?? "in_progress")
       if (eligible) this.task.status = "queued"
       return { rows: [], rowCount: eligible ? 1 : 0 }
+    }
+    if (sql.includes('SELECT task."turnId"')) {
+      return this.options.taskGraphNodes
+        ? { rows: [{ turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", attemptCount: 0, userId: "user-1" } as T], rowCount: 1 }
+        : { rows: [], rowCount: 0 }
+    }
+    if (this.options.taskGraphNodes && sql.includes('task."expectedOutputSchema"')) {
+      const rows = this.options.taskGraphNodes.map(node => {
+        const scout = node.taskId === "dependency-1"
+        return {
+          id: node.taskId,
+          status: node.taskId === this.task.id ? this.task.status : this.options.taskGraphStatuses?.[node.taskId] ?? "queued",
+          role: scout ? "scout" : "analyst",
+          expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: scout ? "scout" : "analyst" },
+          result: scout ? completedScoutResult : null, context: {},
+          sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", userId: "user-1",
+        }
+      })
+      return { rows: rows as T[], rowCount: rows.length }
+    }
+    if (this.options.taskGraphNodes && sql.startsWith('SELECT item."id"')) {
+      return { rows: [{
+        id: taskGraphItemId("root-1"), revision: 1,
+        content: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: this.options.taskGraphNodes },
+        createdAt: new Date("2026-09-14T09:59:00.000Z"),
+      } as T], rowCount: 1 }
+    }
+    if (this.options.taskGraphNodes && sql.startsWith('SELECT task."id", task."status"')) {
+      const rows = this.options.taskGraphNodes.map(node => ({
+        id: node.taskId,
+        status: node.taskId === this.task.id ? this.task.status : this.options.taskGraphStatuses?.[node.taskId] ?? "queued",
+        failureReason: null,
+        result: null,
+      }))
+      return { rows: rows as T[], rowCount: rows.length }
+    }
+    if (this.options.taskGraphNodes && sql.startsWith('SELECT event."type", event."payload"')) return { rows: [], rowCount: 0 }
+    if (this.options.taskGraphNodes && sql.startsWith('SELECT event."payload"')) {
+      const nodes = this.options.taskGraphNodes
+      const created = nodes.map(node => ({ key: node.key, taskId: node.taskId, status: node.dependsOn.length ? "waiting" : "queued" }))
+      return { rows: [{ payload: {
+        kind: "proposal", fingerprint: "fixture-proposal", revision: 1,
+        receipt: { status: "accepted", revision: 1, nodes: created, readyTaskIds: created.filter(node => node.status === "queued").map(node => node.taskId) },
+        item: {
+          schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: taskGraphItemId("root-1"), sessionId: "session-1",
+          turnId: "turn-1", stepId: null, taskId: "root-1", type: "task_graph", status: "streaming", phase: null,
+          revision: 1, content: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes },
+          startedAt: "2026-09-14T09:59:00.000Z", completedAt: null,
+          createdAt: "2026-09-14T09:59:00.000Z", updatedAt: "2026-09-14T09:59:00.000Z",
+        },
+      } } as T], rowCount: 1 }
+    }
+    if (sql.startsWith('UPDATE "agent_items" AS item')) return { rows: [{
+      stepId: null, status: "streaming", phase: null,
+      startedAt: new Date("2026-09-14T09:59:00.000Z"), completedAt: null,
+      createdAt: new Date("2026-09-14T09:59:00.000Z"),
+    } as T], rowCount: 1 }
+    if (sql.startsWith('UPDATE "agent_sessions" AS session')) return { rows: [{ eventSequence: "11" } as T], rowCount: 1 }
+    if (sql.startsWith('INSERT INTO "agent_events"')) {
+      this.graphLifecycleEvents.push(JSON.parse(String(values[10])))
+      return { rows: [], rowCount: 1 }
+    }
+    if (sql.startsWith('INSERT INTO "agent_outbox"') && sql.includes("'agent.subagent.dispatch'")) {
+      if (this.dispatch) return { rows: [], rowCount: 0 }
+      this.dispatch = {
+        id: String(values[0]), aggregateId: String(values[1]), publishedAt: null, attemptCount: 0, lastError: null,
+      }
+      return { rows: [], rowCount: 1 }
+    }
+    if (sql.startsWith('INSERT INTO "agent_outbox"') && sql.includes("'agent.session.event'")) {
+      this.graphEventOutboxCount++
+      return { rows: [], rowCount: 1 }
     }
     if (sql.includes('UPDATE "agent_outbox"') && sql.includes('SET "publishedAt" = NULL')) {
       if (!this.dispatch) return { rows: [], rowCount: 0 }
@@ -258,6 +353,57 @@ describe("subagent mailbox outbox consumer", () => {
     expect(fake.client.calls[taskUpdate]?.sql).toContain('target."leaseExpiresAt" IS NULL')
     expect(fake.client.calls[taskUpdate]?.sql).toContain('target."interruptRequestedAt" IS NULL')
     expect(fake.client.calls[dispatchReset]?.values).toEqual(["subagent-dispatch:task-1", "session-1"])
+  })
+
+  it("keeps a TaskGraph waiter out of dispatch recovery while a prerequisite is still running", async () => {
+    const fake = fakePool({
+      taskStatus: "waiting",
+      dispatchMissing: true,
+      taskGraphNodes: [
+        { key: "prerequisite", templateId: "scout", goal: "Find evidence", successCriteria: ["Evidence found"], dependsOn: [], depth: 1, taskId: "dependency-1" },
+        { key: "target", templateId: "analyst", goal: "Review evidence", successCriteria: ["Review complete"], dependsOn: ["prerequisite"], depth: 2, taskId: "task-1" },
+      ],
+      taskGraphStatuses: { "dependency-1": "running" },
+    })
+
+    await expect(drainSubagentMailboxOutbox(fake.pool)).resolves.toBe(1)
+
+    expect(fake.client.task.status).toBe("waiting")
+    expect(fake.client.dispatch).toBeNull()
+    expect(fake.client.mailboxRows[0]?.deliveredAt).not.toBeNull()
+    expect(fake.client.outboxRows[0]).toMatchObject({ publishedAt: expect.any(Date), lastError: null })
+    expect(fake.client.calls.some(call => call.sql.startsWith('SELECT item."id"'))).toBe(true)
+    expect(fake.client.calls.some(call => call.sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
+    expect(fake.client.calls.some(call => call.sql.includes('SET "publishedAt" = NULL'))).toBe(false)
+  })
+
+  it("reconciles a ready TaskGraph waiter with a lifecycle receipt and durable dispatch", async () => {
+    const fake = fakePool({
+      taskStatus: "waiting",
+      dispatchMissing: true,
+      taskGraphNodes: [
+        { key: "prerequisite", templateId: "scout", goal: "Find evidence", successCriteria: ["Evidence found"], dependsOn: [], depth: 1, taskId: "dependency-1" },
+        { key: "target", templateId: "analyst", goal: "Review evidence", successCriteria: ["Review complete"], dependsOn: ["prerequisite"], depth: 2, taskId: "task-1" },
+      ],
+      taskGraphStatuses: { "dependency-1": "completed" },
+    })
+
+    await expect(drainSubagentMailboxOutbox(fake.pool)).resolves.toBe(1)
+
+    expect(fake.client.task.status).toBe("queued")
+    expect(fake.client.dispatch).toMatchObject({ aggregateId: "session-1", publishedAt: null, attemptCount: 0, lastError: null })
+    expect(fake.client.graphLifecycleEvents).toContainEqual(expect.objectContaining({
+      kind: "lifecycle", event: expect.objectContaining({ type: "task.queued", nodeKey: "target" }),
+    }))
+    expect(fake.client.graphEventOutboxCount).toBe(1)
+    expect(fake.client.calls.some(call => call.sql.startsWith('UPDATE "agent_items" AS item'))).toBe(true)
+    expect(fake.client.calls.some(call => call.sql.startsWith('INSERT INTO "agent_events"'))).toBe(true)
+    const dispatchInsert = fake.client.calls.find(call => call.sql.startsWith('INSERT INTO "agent_outbox"') && call.sql.includes("'agent.subagent.dispatch'"))
+    expect(dispatchInsert?.values[1]).toBe("session-1")
+    expect(dispatchInsert?.values[2]).toBe("subagent-dispatch:task-1")
+    expect(JSON.parse(String(dispatchInsert?.values[3]))).toMatchObject({ taskId: "task-1", sessionId: "session-1", rootTaskId: "root-1" })
+    expect(fake.client.mailboxRows[0]?.deliveredAt).not.toBeNull()
+    expect(fake.client.outboxRows[0]).toMatchObject({ publishedAt: expect.any(Date), lastError: null })
   })
 
   it.each(["queued", "running", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"] as const)(

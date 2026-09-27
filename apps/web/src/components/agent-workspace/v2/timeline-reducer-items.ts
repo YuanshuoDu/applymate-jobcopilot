@@ -1,7 +1,7 @@
 import { parseQuestionInputItem, parseQuestionTerminalEvent } from './question-input-parser'
 import { normalizeTimelineEvent, normalizeTimelineItem } from './timeline-event-normalizer'
 import { appendTimelineEvent, buildIndexes, compareItems, isAfter, isRecord, itemFromTimelineEvent, mergeContent, numberOrUndefined } from './timeline-reducer-utils'
-import type { TimelineItem, TimelineItemSource, TimelineState } from './timeline-reducer'
+import type { TimelineEvent, TimelineItem, TimelineItemSource, TimelineState } from './timeline-reducer'
 
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'interrupted'])
 
@@ -30,6 +30,7 @@ export function reduceTimelineDelta(state: TimelineState, value: unknown, prepro
   }
   if (preprocessedId === undefined) state = { ...state, ...appendTimelineEvent(state.events, delta), lastEventId: delta.id }
   const payload = isRecord(delta.payload) ? delta.payload : {}
+  if (delta.type === 'item.delta' && Object.prototype.hasOwnProperty.call(payload, 'item') && !matchesDeltaItem(payload.item, delta)) return state
   const revision = delta.revision ?? numberOrUndefined(payload.revision)
   if (revision === undefined) return state
   const existing = state.itemsById[delta.itemId]
@@ -41,6 +42,10 @@ export function reduceTimelineDelta(state: TimelineState, value: unknown, prepro
   if (!item) return state
   const next = upsertTimelineItem(state, { ...item, revision, source: 'transient' }, 'transient', delta.kind === 'snapshot')
   return delta.kind === 'snapshot' ? { ...next, snapshotRequired: false } : next
+}
+
+function matchesDeltaItem(value: unknown, delta: TimelineEvent): boolean {
+  return isRecord(value) && value.id === delta.itemId && value.sessionId === delta.sessionId && value.turnId === delta.turnId
 }
 
 export function upsertTimelineItem(state: TimelineState, item: TimelineItem, source: TimelineItemSource, replaceContent = false): TimelineState {

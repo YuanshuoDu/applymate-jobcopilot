@@ -8,6 +8,7 @@ import type { StepContext } from "./context/step-context-builder.js"
 import type { CanonicalTurnState } from "./canonical-turn-state.js"
 import type { TurnEngineEvent, TurnEngineStore } from "./turns/turn-engine-types.js"
 import { createCanonicalTurnRuntime } from "./canonical-turn-runtime.js"
+import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA, type TaskGraphCommandPort, type TaskGraphCurrentState, type TaskGraphReadScope, type TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
 import { TurnEngine } from "./turns/turn-engine.js"
 import { createPgRootTaskStore } from "./subagents/root-task-store.js"
@@ -61,7 +62,7 @@ function model(script: () => ModelStreamEvent[]): ModelAdapter {
 }
 
 function rootStore() {
-  return { ensure: vi.fn(async () => ({ id: "root-1" } as never)), checkCompletion: vi.fn(async () => ({ ok: true as const })), finish: vi.fn(async () => undefined) }
+  return { ensure: vi.fn(async () => ({ id: "root-1", attemptCount: 1 } as never)), checkCompletion: vi.fn(async () => ({ ok: true as const })), finish: vi.fn(async () => undefined) }
 }
 
 function waitBoundary() {
@@ -175,10 +176,17 @@ function setup(overrides: Record<string, unknown> = {}) {
   return { runtime, roots, tool, getModelCalls: () => calls }
 }
 
-async function rootToolNames(coordinationEnabled: boolean, capabilities = ["read"], productionFlags?: ProductionAgentFlags): Promise<string[]> {
+async function rootToolNames(
+  coordinationEnabled: boolean,
+  capabilities = ["read"],
+  productionFlags?: ProductionAgentFlags,
+  taskGraph?: { commandPort: TaskGraphCommandPort; templates: Readonly<Record<string, TaskGraphTaskTemplate>> },
+): Promise<string[]> {
   const requests: HarnessModelRequest[] = []
   const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
-    workerId: "worker-1", coordinationEnabled, ...(productionFlags ? { productionFlags } : {}), stateLoader: async () => ({ ...state(), toolPolicySnapshot: { capabilities } }),
+    workerId: "worker-1", coordinationEnabled, ...(productionFlags ? { productionFlags } : {}),
+    ...(taskGraph ? { taskGraphCommandPort: taskGraph.commandPort, taskGraphTemplates: taskGraph.templates } : {}),
+    stateLoader: async () => ({ ...state(), toolPolicySnapshot: { capabilities } }),
     rootTaskStore: rootStore() as never, turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
     modelRuntimeFactory: async () => ({ adapter: {
       ...model(() => []),
@@ -198,6 +206,118 @@ async function rootToolNames(coordinationEnabled: boolean, capabilities = ["read
 }
 
 describe("createCanonicalTurnRuntime", () => {
+  it("advertises agent.plan through the configured model adapter when server gates are enabled", async () => {
+    const requests: HarnessModelRequest[] = []
+    const modelSnapshots: CanonicalTurnState["snapshot"][] = []
+    let modelContext: StepContext | undefined
+    const currentPlan: TaskGraphCurrentState = {
+      revision: 1, nodes: [{
+        key: "research", templateId: "scout", goal: "Find roles", successCriteria: ["Return links"], dependsOn: [],
+        taskId: "child-1", status: "completed", readiness: "terminal", resultSummary: "Found two roles",
+        resultProjection: {
+          schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available",
+          role: "scout", status: "completed", candidateCount: 1, evidenceCount: 1,
+          candidates: [{ jobId: "job-42", source: "greenhouse", evidenceKinds: ["job"] }],
+        },
+        failureReason: "Jane Doe https://private.example/error",
+      }],
+    }
+    const readCurrent = vi.fn(async (scope: TaskGraphReadScope): Promise<TaskGraphCurrentState> => {
+      expect(scope).toMatchObject({ userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", turnLeaseOwner: "worker-1", turnLeaseVersion: 2, parentLeaseOwner: "worker-1", parentAttemptCount: 1 })
+      return currentPlan
+    })
+    const taskGraphCommandPort: TaskGraphCommandPort = {
+      appendAndSchedule: async () => ({ status: "accepted", revision: 1, nodes: [], readyTaskIds: [] }),
+      readCurrent,
+    }
+    const planningFlags = resolveProductionAgentFlags({
+      ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+    })
+    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+      workerId: "worker-1", productionFlags: planningFlags, taskGraphCommandPort,
+      taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+      stateLoader: async () => ({ ...state(), toolPolicySnapshot: {} }), rootTaskStore: rootStore() as never,
+      turnEngineStoreFactory: () => store(),
+      contextBuilderFactory: () => ({
+        build: async request => {
+          modelSnapshots.push(request.snapshot)
+          const built = await contextBuilder().build(request)
+          modelContext = built
+          return built
+        },
+      }),
+      modelRuntimeFactory: async () => ({ adapter: {
+        ...model(() => []),
+        async *stream(request: HarnessModelRequest) {
+          requests.push(request)
+          yield { type: "text_delta", text: "done" }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      }, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed", summary: "evidence_missing" })
+    const names = requests[0]?.tools.flatMap(tool => tool && typeof tool === "object" && "name" in tool && typeof tool.name === "string" ? [tool.name] : []) ?? []
+    expect(names).toContain("agent.plan")
+    expect(readCurrent).toHaveBeenCalledTimes(1)
+    expect(modelSnapshots[0]?.toolObservations).toContainEqual({
+      id: "task-graph-current",
+      content: {
+        kind: "task_graph_current",
+        revision: 1,
+        nodes: expect.arrayContaining([expect.objectContaining({
+          key: "research",
+          status: "completed",
+          resultSummary: null,
+          failureReason: null,
+          resultProjection: expect.objectContaining({
+            trust: "untrusted",
+            availability: "available",
+            candidates: [{ jobId: "job-42", source: "greenhouse", evidenceKinds: ["job"] }],
+          }),
+        })]),
+      },
+    })
+    const observation = JSON.stringify(modelSnapshots[0]?.toolObservations)
+    expect(observation).not.toContain("Found two roles")
+    expect(observation).not.toContain("Jane Doe")
+    expect(observation).not.toContain("private.example")
+    expect(modelContext?.blocks.find(block => block.id === "task-graph-current")?.trust).toBe("external_untrusted")
+  })
+
+  it("does not advertise agent.plan when the legacy cognitive-loop gate is the only opt-in", async () => {
+    const commandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
+      readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
+    }
+    const names = await rootToolNames(true, ["read"], resolveProductionAgentFlags({ ENABLE_AGENT_COGNITIVE_LOOP: "1" }), {
+      commandPort,
+      templates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+    })
+
+    expect(names).not.toContain("agent.plan")
+    expect(commandPort.readCurrent).not.toHaveBeenCalled()
+  })
+
+  it("fails closed before provider invocation when the scoped current graph read fails", async () => {
+    const provider = vi.fn(async () => ({ adapter: model(() => []), registry: {} as never, candidates: [] }))
+    const taskGraphCommandPort: TaskGraphCommandPort = {
+      appendAndSchedule: async () => ({ status: "accepted", revision: 1, nodes: [], readyTaskIds: [] }),
+      readCurrent: async () => { throw Object.assign(new Error("TaskGraph read unavailable"), { code: "task_graph_read_failed" }) },
+    }
+    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+      workerId: "worker-1", taskGraphCommandPort, taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+      productionFlags: { cognitiveLoopEnabled: false, planningEnabled: true, planningExecutionEnabled: true, taskGraphPlanningEnabled: true, childExecutionEnabled: true, coordinationEnabled: true, consumeWaitOutcomes: false, canonicalAutomationEnabled: false },
+      stateLoader: async () => ({ ...state(), toolPolicySnapshot: {} }), rootTaskStore: rootStore() as never,
+      turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(), modelRuntimeFactory: provider,
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).rejects.toMatchObject({ code: "task_graph_read_failed" })
+    expect(provider).not.toHaveBeenCalled()
+  })
+
   it("replays a persisted read-only call before the first resumed model request", async () => {
     const recoveredCall = { call: { id: "crash-call", name: "jobs.search", arguments: { location: "Dublin" } }, toolVersion: "1", stepId: "step-0", callItem: { id: "persisted-call-item", revision: 0 } }
     const tool = tools()

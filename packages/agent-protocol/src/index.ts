@@ -92,6 +92,8 @@ export {
   ModelToolCallSchema,
   ModelUsageSchema,
 } from './model.js'
+export { PLAN_LEDGER_SCHEMA_VERSION, parsePlanLedger, projectPlanLedger, projectTaskEvidencePreview } from './plan-ledger.js'
+export type { PlanLedger, PlanLedgerEvidencePreview, PlanLedgerReadiness, PlanLedgerStatus } from './plan-ledger.js'
 export type {
   ModelCapabilities,
   ModelContentPart,
