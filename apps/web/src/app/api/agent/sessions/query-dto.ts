@@ -6,9 +6,25 @@ import { toIso, type CursorRow } from "./query-helpers"
 const SENSITIVE_KEY = /(api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|password|secret|private[_-]?key|credential|token|answer|(?:full[_-]?)?resume(?:[_-]?(text|content|data))?|cv(?:[_-]?(text|content|data))?|raw[_-]?(content|text))/i
 const SENSITIVE_TOKEN = /\bBearer\s+[a-z0-9._~+/=-]{8,}/gi
 const SENSITIVE_KEY_TOKEN = /\b(?:sk-|xox[baprs]-)[a-z0-9._~+/=-]{8,}/gi
+const SUPERVISOR_DISPLAY_TEXT_LIMIT = 256
+const TRUNCATION_MARKER = "… [truncated]"
+const TRUNCATION_MARKER_CODE_POINTS = Array.from(TRUNCATION_MARKER).length
 
 function redactString(value: string): string {
   return value.replace(SENSITIVE_TOKEN, "Bearer [REDACTED]").replace(SENSITIVE_KEY_TOKEN, "[REDACTED]")
+}
+
+function supervisorDisplayText(value: string): string {
+  const redacted = redactString(value)
+  const codePoints: string[] = []
+  for (const codePoint of redacted) {
+    codePoints.push(codePoint)
+    if (codePoints.length > SUPERVISOR_DISPLAY_TEXT_LIMIT) {
+      const prefix = codePoints.slice(0, SUPERVISOR_DISPLAY_TEXT_LIMIT - TRUNCATION_MARKER_CODE_POINTS).join("")
+      return `${prefix}${TRUNCATION_MARKER}`
+    }
+  }
+  return redacted
 }
 
 function redactValue(value: unknown, key: string | null = null, depth = 0): unknown {
@@ -145,7 +161,7 @@ export function turnDto(row: TurnQueryRow) {
     id: row.id,
     sessionId: row.sessionId,
     source: row.source,
-    goal: typeof input.goal === "string" ? redactString(input.goal) : "Process agent task",
+    goal: typeof input.goal === "string" ? supervisorDisplayText(input.goal) : "Process agent task",
     status: row.status,
     revision: row.revision,
     activeStepId: row.steps[0]?.id ?? null,
@@ -187,9 +203,9 @@ export function taskDto(row: TaskQueryRow) {
     role: row.role,
     taskType: row.taskType,
     status: legacy.status,
-    goal: redactString(row.goal),
+    goal: supervisorDisplayText(row.goal),
     confidence: row.confidence,
-    failureReason: row.failureReason ? redactString(row.failureReason) : null,
+    failureReason: row.failureReason ? supervisorDisplayText(row.failureReason) : null,
     hasResult: row.result !== null,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),

@@ -43,6 +43,48 @@ describe("agent query DTO redaction", () => {
     }).content).toEqual({ toolCallId: "call_1", toolName: "jobs.search", inputAvailable: true })
   })
 
+  it("preserves short supervision text and caps redacted turn/task display text", () => {
+    const turnBase = {
+      id: "turn_1", sessionId: "session_1", source: "user", status: "completed", revision: 2,
+      input: { goal: "Find Dublin jobs" }, steps: [], items: [],
+      createdAt: date, updatedAt: date, completedAt: null,
+    }
+    expect(turnDto(turnBase).goal).toBe("Find Dublin jobs")
+    expect(turnDto({ ...turnBase, input: { goal: "Turn goal ".repeat(40) } }).goal).toHaveLength(256)
+    expect(turnDto({ ...turnBase, input: { goal: "Turn goal ".repeat(40) } }).goal).toMatch(/… \[truncated\]$/)
+
+    const taskBase = {
+      id: "task_1", sessionId: "session_1", turnId: "turn_1", rootTaskId: "task_1", parentTaskId: null, path: "/task_1",
+      role: "scout", taskType: "jobs", status: "failed", goal: "Search Dublin roles",
+      confidence: null, failureReason: "Bearer child-secret-token", result: null, createdAt: date, updatedAt: date,
+    }
+    const shortTask = taskDto(taskBase)
+    expect(shortTask.goal).toBe("Search Dublin roles")
+    expect(shortTask.failureReason).toBe("Bearer [REDACTED]")
+
+    const longTask = taskDto({
+      ...taskBase,
+      goal: "Task goal ".repeat(40),
+      failureReason: `Bearer child-secret-token ${"failure detail ".repeat(40)}`,
+    })
+    expect(longTask.goal).toHaveLength(256)
+    expect(longTask.goal).toMatch(/… \[truncated\]$/)
+    expect(longTask.failureReason).toHaveLength(256)
+    expect(longTask.failureReason).toMatch(/… \[truncated\]$/)
+    expect(longTask.failureReason).not.toContain("child-secret-token")
+  })
+
+  it("does not split supplementary characters at the display limit", () => {
+    const task = taskDto({
+      id: "task_emoji", sessionId: "session_1", turnId: "turn_1", rootTaskId: "task_emoji", parentTaskId: null, path: "/task_emoji",
+      role: "scout", taskType: "jobs", status: "completed", goal: "😀".repeat(300),
+      confidence: null, failureReason: null, result: null, createdAt: date, updatedAt: date,
+    })
+
+    expect(Array.from(task.goal)).toHaveLength(256)
+    expect(task.goal).toBe(`${"😀".repeat(256 - Array.from("… [truncated]").length)}… [truncated]`)
+  })
+
   it("keeps user-visible text and attachment metadata but drops unknown parts", () => {
     expect(itemDto({
       id: "item_2", sessionId: "session_1", turnId: "turn_1", stepId: null, taskId: null, type: "user_message", status: "accepted", phase: "input", revision: 1,
