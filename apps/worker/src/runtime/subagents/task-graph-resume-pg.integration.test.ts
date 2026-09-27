@@ -313,7 +313,7 @@ async function waitForSuspendedParent(pool: Pool, turnId: string, minimumWaitCou
   throw new Error("TaskGraph parent wait was not durably suspended before child completion")
 }
 
-async function turnProgressDiagnostics(pool: Pool, turnId: string): Promise<string> {
+async function turnProgressDiagnostics(pool: Pool, turnId: string, diagnosticToolCallId?: string): Promise<string> {
   const turnResult = await pool.query<{
     id: string
     sessionId: string
@@ -341,18 +341,42 @@ async function turnProgressDiagnostics(pool: Pool, turnId: string): Promise<stri
     }>(`SELECT "id", "idempotencyKey", "status", "targetTaskIds", "matchedTaskIds", "deadlineAt", "suspendedAt", "resolvedAt", "consumedAt"
       FROM "agent_wait_conditions" WHERE "turnId" = $1 ORDER BY "createdAt"`, [turnId]),
     pool.query<{
-      sequence: string; type: string; actor: string; taskId: string | null; idempotencyKey: string | null
-    }>(`SELECT "sequence"::text, "type", "actor", "taskId", "idempotencyKey"
+      sequence: string; type: string; actor: string; taskId: string | null; idempotencyKey: string | null; payload: unknown
+    }>(`SELECT "sequence"::text, "type", "actor", "taskId", "idempotencyKey", "payload"
       FROM "agent_events" WHERE "turnId" = $1 ORDER BY "sequence" DESC LIMIT 20`, [turnId]),
     pool.query<{
       topic: string; idempotencyKey: string; publishedAt: Date | null; attemptCount: number; lastError: string | null
     }>(`SELECT "topic", "idempotencyKey", "publishedAt", "attemptCount", "lastError"
       FROM "agent_outbox" WHERE "aggregateId" = $1 ORDER BY "createdAt" DESC LIMIT 30`, [turn.sessionId]),
   ])
-  return JSON.stringify({ turn, tasks: tasks.rows, waits: waits.rows, recentEvents: events.rows, recentOutbox: dispatches.rows })
+  const toolResults = diagnosticToolCallId
+    ? await pool.query<{ errorCode: string | null; failureDetail: string | null }>(
+      `SELECT "content"->>'errorCode' AS "errorCode", "content"->'output'->>'message' AS "failureDetail"
+        FROM "agent_items"
+        WHERE "turnId" = $1 AND "type" = 'tool_result' AND "content"->>'toolCallId' = $2
+        ORDER BY "createdAt", "id"`,
+      [turnId, diagnosticToolCallId],
+    )
+    : null
+  const toolFailure = toolResults?.rows.find(row => typeof row.failureDetail === "string" && row.failureDetail.length > 0)
+    ?? toolResults?.rows[0]
+  const recentEvents = events.rows.map(({ payload, ...event }) => {
+    const value = record(payload)
+    if (!diagnosticToolCallId || value?.toolCallId !== diagnosticToolCallId || value.status !== "failed") return event
+    return {
+      ...event,
+      failure: {
+        errorCode: typeof toolFailure?.errorCode === "string" ? toolFailure.errorCode.slice(0, 128) : null,
+        failureDetail: typeof toolFailure?.failureDetail === "string" && toolFailure.failureDetail.length > 0
+          ? toolFailure.failureDetail.slice(0, 500)
+          : "not persisted",
+      },
+    }
+  })
+  return JSON.stringify({ turn, tasks: tasks.rows, waits: waits.rows, recentEvents, recentOutbox: dispatches.rows })
 }
 
-async function waitForTurnStatus(pool: Pool, turnId: string, wanted: string, timeoutMs = 50_000): Promise<void> {
+async function waitForTurnStatus(pool: Pool, turnId: string, wanted: string, timeoutMs = 50_000, diagnosticToolCallId?: string): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const result = await pool.query<{ status: string; error: string | null }>(
@@ -361,7 +385,7 @@ async function waitForTurnStatus(pool: Pool, turnId: string, wanted: string, tim
     const status = result.rows[0]?.status
     if (status === wanted) return
     if (status && ["failed", "interrupted", "cancelled"].includes(status)) {
-      throw new Error(`TaskGraph root turn entered ${status}; error=${result.rows[0]?.error ?? "<none>"}; progress=${await turnProgressDiagnostics(pool, turnId)}`)
+      throw new Error(`TaskGraph root turn entered ${status}; error=${result.rows[0]?.error ?? "<none>"}; progress=${await turnProgressDiagnostics(pool, turnId, diagnosticToolCallId)}`)
     }
     await new Promise(resolve => setTimeout(resolve, 25))
   }
@@ -682,14 +706,14 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await enqueueTurn(pool!, bootstrap.turns.queue, {
       turnId: owner.turnId, sessionId: owner.sessionId, ownerId: owner.ownerId,
     })
-    await waitForTurnStatus(pool!, owner.turnId, "completed")
+    await waitForTurnStatus(pool!, owner.turnId, "completed", 50_000, WAIT_CALL_ID)
     const parkedTurns = await pool!.query<{ id: string; status: string }>(
       `SELECT "id", "status" FROM "agent_turns" WHERE "id" = ANY($1::text[]) ORDER BY "id"`,
       [[failureOwner.turnId, stopOwner.turnId, restartOwner.turnId]],
     )
-    expect(parkedTurns.rows).toEqual([failureOwner.turnId, stopOwner.turnId, restartOwner.turnId].sort().map(id => ({
-      id, status: "waiting_for_user",
-    })))
+    expect(new Map(parkedTurns.rows.map(({ id, status }) => [id, status]))).toEqual(new Map([
+      failureOwner.turnId, stopOwner.turnId, restartOwner.turnId,
+    ].map(id => [id, "waiting_for_user"])))
 
     const turn = await pool!.query<{ rootTaskId: string; leaseVersion: number; finalResponse: string | null }>(
       `SELECT "rootTaskId", "leaseVersion", "finalResponse" FROM "agent_turns" WHERE "id" = $1`, [owner.turnId],
@@ -876,7 +900,15 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(workerTwo.pid).not.toBe(firstWorkerPid)
       const readyLine = await waitForProcessLine(workerTwo, "P3_SECOND_WORKER_READY ")
       expect(readyLine).toContain("p3-process-restart-worker-" + workerTwo.pid)
-      await waitForProcessLine(workerTwo, "P3_DEPENDENCY_CONTEXT_OK")
+      try {
+        await waitForProcessLine(workerTwo, "P3_DEPENDENCY_CONTEXT_OK")
+      } catch (error) {
+        const children = await pool!.query<{ goal: string; status: string; failureReason: string | null; dependencies: unknown }>(
+          `SELECT "goal", "status", "failureReason", "context"->'taskGraphDependencyResults' AS "dependencies"
+           FROM "sub_agent_tasks" WHERE "turnId" = $1 ORDER BY "createdAt"`, [restartOwner.turnId],
+        )
+        throw new Error(`${String(error)}; restartProgress=${await turnProgressDiagnostics(pool!, restartOwner.turnId)}; childContexts=${JSON.stringify(children.rows)}`)
+      }
       await waitForProcessLine(workerTwo, "P3_RESTORED_GRAPH_OK")
       await waitForProcessLine(workerTwo, "P3_PARENT_RESUME_CONTEXT_OK")
       await waitForProcessLine(workerTwo, "P3_FOLLOW_UP_DEPENDENCY_CONTEXT_OK")
@@ -1207,7 +1239,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       pool: pool!,
       runtime,
       ownerId: failureOwner.ownerId,
-      turnRecoveryIntervalMs: 60_000,
+      // The resume intent is durably queued by the wait resolver and delivered
+      // by turn recovery; poll promptly so this acceptance does not outwait it.
+      turnRecoveryIntervalMs: 100,
       waitResolver: { intervalMs: 10, batchSize: 10, ownerId: `p3-failure-wait-resolver-${failureOwner.suffix}` },
       subagents: {
         intervalMs: 10,
@@ -1274,6 +1308,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const stepId = "p3-task-graph-stop-step-" + stopOwner.suffix
     const runningOwnerId = "p3-task-graph-stop-child-owner-" + stopOwner.suffix
     const now = new Date()
+    const unrelatedTurnBefore = await pool!.query<{ status: string; revision: number }>(
+      `SELECT "status", "revision" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+      [owner.turnId, owner.sessionId, owner.userId],
+    )
+    expect(unrelatedTurnBefore.rowCount).toBe(1)
     await activateFixtureTurn(pool!, stopOwner)
 
     await pool!.query(`INSERT INTO "sub_agent_tasks"
@@ -1452,11 +1491,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     )
     expect(rootMarker.rows[0]?.status).toBe("running")
     expect(rootMarker.rows[0]?.interruptRequestedAt).toBeInstanceOf(Date)
-    const untouchedTurn = await pool!.query<{ status: string }>(
-      `SELECT "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+    const unrelatedTurnAfter = await pool!.query<{ status: string; revision: number }>(
+      `SELECT "status", "revision" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
       [owner.turnId, owner.sessionId, owner.userId],
     )
-    expect(untouchedTurn.rows[0]?.status).toBe("queued")
+    expect(unrelatedTurnAfter.rows).toEqual(unrelatedTurnBefore.rows)
 
     const graphItemId = taskGraphItemId(rootTaskId)
     const graphItem = await pool!.query<{ revision: number }>(

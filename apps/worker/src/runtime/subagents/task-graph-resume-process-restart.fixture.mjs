@@ -211,6 +211,18 @@ async function runSecondWorker() {
   bootstrap = await createProductionWorkerBootstrap({ pool, runtime, ownerId, turnRecoveryIntervalMs: 10,
     waitResolver: { intervalMs: 10, ownerId: "p3-process-restart-wait-resolver-" + process.pid },
     subagents: { intervalMs: 10, async execute({ lease }) {
+      const dependencyResults = record(record(lease.context)?.taskGraphDependencyResults)
+      const dependencyItems = Array.isArray(dependencyResults?.items) ? dependencyResults.items.map(record) : []
+      say("P3_CHILD_LEASE " + JSON.stringify({
+        taskId: lease.id,
+        goal: lease.goal,
+        role: lease.role,
+        dependencies: dependencyItems.map(item => ({
+          dependencyKey: item?.dependencyKey,
+          taskStatus: item?.taskStatus,
+          hasSourceResult: (JSON.stringify(item?.result) ?? "").includes(resultMarker),
+        })),
+      }))
       if (lease.goal === sourceGoal && lease.role === "scout") return { status: "completed", result: structuredResult("scout", resultMarker) }
       if (lease.goal === dependentGoal && lease.role === "analyst") {
         const items = Array.isArray(record(record(lease.context)?.taskGraphDependencyResults)?.items)
