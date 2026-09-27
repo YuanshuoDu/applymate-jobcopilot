@@ -29,6 +29,10 @@ function onStdinData(chunk) {
 }
 process.stdin.on("data", onStdinData)
 function say(value) { process.stdout.write(value + "\n") }
+function boundedFailureText(error) {
+  const detail = error instanceof Error ? error.stack ?? `${error.name}: ${error.message}` : String(error)
+  return detail.replace(/\s+/g, " ").slice(0, 1200)
+}
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)) }
 function waitForCommand(command) {
   const index = queuedCommands.indexOf(command)
@@ -173,31 +177,36 @@ async function startRuntime(workerOwnerId, resume) {
             yield { type: "completed", finishReason: "tool_calls" }; return
           }
           if (resume) {
-            const graph = graphFromRequest(request), nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
-            const followUp = nodes.find(item => item?.key === followUpKey)
-            if (!followUp) {
-              const restored = assertRestoredGraph(request)
-              if (!request.tools.some(tool => record(tool)?.name === "agent.plan")) throw new Error("p3_follow_up_plan_tool_missing")
-              yield toolCall(followUpPlanCallId, "agent.plan", { expectedRevision: restored.revision,
-                nodes: [node(followUpKey, "analyst", followUpGoal, ["Verify the restored summary evidence"], ["summary"])] })
-              yield { type: "completed", finishReason: "tool_calls" }; return
+            try {
+              const graph = graphFromRequest(request), nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+              const followUp = nodes.find(item => item?.key === followUpKey)
+              if (!followUp) {
+                const restored = assertRestoredGraph(request)
+                if (!request.tools.some(tool => record(tool)?.name === "agent.plan")) throw new Error("p3_follow_up_plan_tool_missing")
+                yield toolCall(followUpPlanCallId, "agent.plan", { expectedRevision: restored.revision,
+                  nodes: [node(followUpKey, "analyst", followUpGoal, ["Verify the restored summary evidence"], ["summary"])] })
+                yield { type: "completed", finishReason: "tool_calls" }; return
+              }
+              const waitReady = waitOutcomesFromRequest(request).some(outcome => outcome.status === "ready"
+                && outcome.tasks.some(task => record(task)?.taskId === followUp.taskId && record(task)?.status === "completed"))
+              if (!waitReady) {
+                const taskIds = plannedTaskIds(request, followUpPlanCallId, 1)
+                if (followUp.taskId !== taskIds[0]) throw new Error("p3_follow_up_plan_task_mismatch")
+                if (!request.tools.some(tool => record(tool)?.name === "agent.wait")) throw new Error("p3_follow_up_wait_tool_missing")
+                yield toolCall(followUpWaitCallId, "agent.wait", waitArgs("p3-process-restart-follow-up-wait", taskIds))
+                yield { type: "completed", finishReason: "tool_calls" }; return
+              }
+              if (followUp.status !== "completed") throw new Error("p3_follow_up_waited_task_not_completed")
+              const state = assertFollowUpGraph(request)
+              const ledger = await projectPersistedPlanLedger()
+              say("P3_PLAN_LEDGER_PROJECTION " + JSON.stringify(ledger))
+              say("P3_FOLLOW_UP_GRAPH_READY " + JSON.stringify(state)); await waitForCommand("finalize-parent")
+              say("P3_FOLLOW_UP_GRAPH_OK " + JSON.stringify(state))
+              yield { type: "text_delta", text: finalMarker }; yield { type: "completed", finishReason: "stop" }; return
+            } catch (error) {
+              say("P3_PARENT_MODEL_FAILURE " + boundedFailureText(error))
+              throw error
             }
-            const waitReady = waitOutcomesFromRequest(request).some(outcome => outcome.status === "ready"
-              && outcome.tasks.some(task => record(task)?.taskId === followUp.taskId && record(task)?.status === "completed"))
-            if (!waitReady) {
-              const taskIds = plannedTaskIds(request, followUpPlanCallId, 1)
-              if (followUp.taskId !== taskIds[0]) throw new Error("p3_follow_up_plan_task_mismatch")
-              if (!request.tools.some(tool => record(tool)?.name === "agent.wait")) throw new Error("p3_follow_up_wait_tool_missing")
-              yield toolCall(followUpWaitCallId, "agent.wait", waitArgs("p3-process-restart-follow-up-wait", taskIds))
-              yield { type: "completed", finishReason: "tool_calls" }; return
-            }
-            if (followUp.status !== "completed") throw new Error("p3_follow_up_waited_task_not_completed")
-            const state = assertFollowUpGraph(request)
-            const ledger = await projectPersistedPlanLedger()
-            say("P3_PLAN_LEDGER_PROJECTION " + JSON.stringify(ledger))
-            say("P3_FOLLOW_UP_GRAPH_READY " + JSON.stringify(state)); await waitForCommand("finalize-parent")
-            say("P3_FOLLOW_UP_GRAPH_OK " + JSON.stringify(state))
-            yield { type: "text_delta", text: finalMarker }; yield { type: "completed", finishReason: "stop" }; return
           }
           throw new Error("p3_unexpected_parent_model_round")
         },

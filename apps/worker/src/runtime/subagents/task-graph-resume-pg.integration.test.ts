@@ -117,6 +117,27 @@ function boundedDiagnostic(value: string, maxCharacters = 4_000): string {
   return `${value.slice(0, maxCharacters)}...[truncated ${value.length - maxCharacters} characters]`
 }
 
+function captureModelStreamFailure(model: ModelAdapter, onFailure: (error: unknown) => void): ModelAdapter {
+  return {
+    ...model,
+    stream(request: HarnessModelRequest) {
+      return (async function* () {
+        try {
+          for await (const event of model.stream(request)) yield event
+        } catch (error: unknown) {
+          onFailure(error)
+          throw error
+        }
+      })()
+    },
+  }
+}
+
+function boundedErrorText(error: unknown, maxCharacters = 1_000): string {
+  const value = error instanceof Error ? error.stack ?? `${error.name}: ${error.message}` : String(error)
+  return boundedDiagnostic(value, maxCharacters)
+}
+
 function fixture(): Fixture {
   const suffix = randomUUID()
   return {
@@ -419,7 +440,10 @@ async function turnProgressDiagnostics(pool: Pool, turnId: string, diagnosticToo
         type: diagnosticValueType(resultTruncated),
         value: typeof resultTruncated === "boolean" ? resultTruncated : null,
         taskResultCount: resultTasks?.length ?? null,
-        truncatedTaskResultCount: resultTasks?.filter(task => record(record(task)?.result)?.$truncated === true).length ?? null,
+        truncatedTaskResultCount: resultTasks?.filter(task => {
+          const result = record(record(task)?.result)
+          return result?.truncated === true || result?.$truncated === true
+        }).length ?? null,
       },
     }
     : null
@@ -592,6 +616,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let resumedGraphReachedModel = false
     let followUpGraphReachedModel = false
     let followUpExpectedRevision: number | undefined
+    let rootModelStreamFailure: string | null = null
     const runtime = await createCanonicalTurnRuntime(pool!, {
       workerId: owner.ownerId,
       productionFlags: flags,
@@ -726,7 +751,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             throw new Error("Unexpected root model execution or round in the TaskGraph resume fixture")
           },
         }
-        return { adapter: model, registry: {} as never, candidates: [] }
+        return {
+          adapter: captureModelStreamFailure(model, error => { rootModelStreamFailure = boundedErrorText(error) }),
+          registry: {} as never,
+          candidates: [],
+        }
       },
     })
     bootstrap = await createProductionWorkerBootstrap({
@@ -790,7 +819,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await enqueueTurn(pool!, bootstrap.turns.queue, {
       turnId: owner.turnId, sessionId: owner.sessionId, ownerId: owner.ownerId,
     })
-    await waitForTurnStatus(pool!, owner.turnId, "completed", 50_000, WAIT_CALL_ID)
+    try {
+      await waitForTurnStatus(pool!, owner.turnId, "completed", 50_000, WAIT_CALL_ID)
+    } catch (error: unknown) {
+      const failure = error instanceof Error ? error.message : String(error)
+      throw new Error(`rootModelStreamFailure=${rootModelStreamFailure ?? "<not captured>"}; ${failure}`)
+    }
     const parkedTurns = await pool!.query<{ id: string; status: string }>(
       `SELECT "id", "status" FROM "agent_turns" WHERE "id" = ANY($1::text[]) ORDER BY "id"`,
       [[failureOwner.turnId, stopOwner.turnId, restartOwner.turnId]],
@@ -1003,7 +1037,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         await waitForProcessLine(workerTwo, "P3_RESTORED_GRAPH_OK")
       } catch (error: unknown) {
         const progress = await turnProgressDiagnostics(pool!, restartOwner.turnId)
-        throw new Error(`${String(error)}; restoredGraphProgress=${boundedDiagnostic(progress)}`)
+        const processError = boundedDiagnostic(String(error), 600)
+        throw new Error(`${processError}; restoredGraphProgress=${boundedDiagnostic(progress, 4_000)}`)
       }
       await waitForProcessLine(workerTwo, "P3_PARENT_RESUME_CONTEXT_OK")
       await waitForProcessLine(workerTwo, "P3_FOLLOW_UP_DEPENDENCY_CONTEXT_OK")
@@ -1321,7 +1356,22 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                     userId: failureOwner.userId, sessionId: failureOwner.sessionId, taskId,
                   })
                   if (!target) {
-                    throw new Error(`Failed-prerequisite fixture assertion: plan receipt target ${taskId} is missing from PgCoordinationStore.getTask`)
+                    const scopedTask = await pool!.query<{
+                      sessionId: string | null; turnId: string | null; rootTaskId: string | null; sessionUserId: string | null
+                    }>(`SELECT task."sessionId", task."turnId", task."rootTaskId", session."userId" AS "sessionUserId"
+                      FROM "sub_agent_tasks" AS task LEFT JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+                      WHERE task."id" = $1 LIMIT 1`, [taskId])
+                    const observed = scopedTask.rows[0]
+                    const diagnostic = boundedDiagnostic(JSON.stringify({
+                      task: observed ? {
+                        sessionId: observed.sessionId, turnId: observed.turnId,
+                        rootTaskId: observed.rootTaskId, sessionUserId: observed.sessionUserId,
+                      } : null,
+                      expected: {
+                        sessionId: failureOwner.sessionId, turnId: failureOwner.turnId, userId: failureOwner.userId,
+                      },
+                    }), 700)
+                    throw new Error(`Failed-prerequisite fixture assertion: plan receipt target ${taskId} is missing from PgCoordinationStore.getTask; scope=${diagnostic}`)
                   }
                   failurePreflightStage = `lineage_assertion_${index + 1}`
                   expect({
