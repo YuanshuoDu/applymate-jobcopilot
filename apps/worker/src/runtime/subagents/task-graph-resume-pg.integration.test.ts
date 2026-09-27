@@ -99,7 +99,7 @@ function fixture(): Fixture {
   }
 }
 
-async function seed(pool: Pool, value: Fixture): Promise<void> {
+async function seed(pool: Pool, value: Fixture, turnStatus: "queued" | "waiting_for_user" = "queued"): Promise<void> {
   await pool.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`, [
     value.userId, `${value.userId}@example.invalid`,
   ])
@@ -109,14 +109,24 @@ async function seed(pool: Pool, value: Fixture): Promise<void> {
   ])
   await pool.query(`INSERT INTO "agent_turns"
     ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "updatedAt")
-    VALUES ($1, $2, $3, 'queued', 'user', $4::jsonb, $5::jsonb, '{}'::jsonb, $6::jsonb, CURRENT_TIMESTAMP)`, [
+    VALUES ($1, $2, $3, $4, 'user', $5::jsonb, $6::jsonb, '{}'::jsonb, $7::jsonb, CURRENT_TIMESTAMP)`, [
     value.turnId,
     value.sessionId,
     value.userId,
+    turnStatus,
     JSON.stringify({ goal: "Research and summarize the fixture source" }),
     JSON.stringify({ provider: "fixture", model: "fixture-model" }),
     JSON.stringify({ limits: { maxSteps: 8, maxToolCalls: 8 } }),
   ])
+}
+
+async function activateFixtureTurn(pool: Pool, value: Fixture): Promise<void> {
+  const activated = await pool.query(`UPDATE "agent_turns" SET "status" = 'queued', "completedAt" = NULL,
+      "leaseOwnerId" = NULL, "leaseExpiresAt" = NULL, "leaseStartedAt" = NULL, "updatedAt" = CURRENT_TIMESTAMP
+    WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "status" = 'waiting_for_user'`, [
+    value.turnId, value.sessionId, value.userId,
+  ])
+  if (activated.rowCount !== 1) throw new Error("TaskGraph fixture turn was not parked before activation")
 }
 
 function toolResult(request: HarnessModelRequest, callId: string): unknown {
@@ -303,16 +313,59 @@ async function waitForSuspendedParent(pool: Pool, turnId: string, minimumWaitCou
   throw new Error("TaskGraph parent wait was not durably suspended before child completion")
 }
 
+async function turnProgressDiagnostics(pool: Pool, turnId: string): Promise<string> {
+  const turnResult = await pool.query<{
+    id: string
+    sessionId: string
+    status: string
+    error: string | null
+    rootTaskId: string | null
+    revision: number
+    leaseOwnerId: string | null
+    leaseVersion: number
+    leaseExpiresAt: Date | null
+  }>(`SELECT "id", "sessionId", "status", "error", "rootTaskId", "revision", "leaseOwnerId", "leaseVersion", "leaseExpiresAt"
+    FROM "agent_turns" WHERE "id" = $1`, [turnId])
+  const turn = turnResult.rows[0]
+  if (!turn) return JSON.stringify({ turnId, missing: true })
+
+  const [tasks, waits, events, dispatches] = await Promise.all([
+    pool.query<{
+      id: string; goal: string; status: string; failureReason: string | null; attemptCount: number
+      leaseOwner: string | null; leaseExpiresAt: Date | null
+    }>(`SELECT "id", "goal", "status", "failureReason", "attemptCount", "leaseOwner", "leaseExpiresAt"
+      FROM "sub_agent_tasks" WHERE "turnId" = $1 ORDER BY "createdAt"`, [turnId]),
+    pool.query<{
+      id: string; idempotencyKey: string; status: string; targetTaskIds: unknown; matchedTaskIds: unknown
+      deadlineAt: Date; suspendedAt: Date | null; resolvedAt: Date | null; consumedAt: Date | null
+    }>(`SELECT "id", "idempotencyKey", "status", "targetTaskIds", "matchedTaskIds", "deadlineAt", "suspendedAt", "resolvedAt", "consumedAt"
+      FROM "agent_wait_conditions" WHERE "turnId" = $1 ORDER BY "createdAt"`, [turnId]),
+    pool.query<{
+      sequence: string; type: string; actor: string; taskId: string | null; idempotencyKey: string | null
+    }>(`SELECT "sequence"::text, "type", "actor", "taskId", "idempotencyKey"
+      FROM "agent_events" WHERE "turnId" = $1 ORDER BY "sequence" DESC LIMIT 20`, [turnId]),
+    pool.query<{
+      topic: string; idempotencyKey: string; publishedAt: Date | null; attemptCount: number; lastError: string | null
+    }>(`SELECT "topic", "idempotencyKey", "publishedAt", "attemptCount", "lastError"
+      FROM "agent_outbox" WHERE "aggregateId" = $1 ORDER BY "createdAt" DESC LIMIT 30`, [turn.sessionId]),
+  ])
+  return JSON.stringify({ turn, tasks: tasks.rows, waits: waits.rows, recentEvents: events.rows, recentOutbox: dispatches.rows })
+}
+
 async function waitForTurnStatus(pool: Pool, turnId: string, wanted: string, timeoutMs = 50_000): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    const result = await pool.query<{ status: string }>(`SELECT "status" FROM "agent_turns" WHERE "id" = $1`, [turnId])
+    const result = await pool.query<{ status: string; error: string | null }>(
+      `SELECT "status", "error" FROM "agent_turns" WHERE "id" = $1`, [turnId],
+    )
     const status = result.rows[0]?.status
     if (status === wanted) return
-    if (status && ["failed", "interrupted", "cancelled"].includes(status)) throw new Error(`TaskGraph root turn entered ${status}`)
+    if (status && ["failed", "interrupted", "cancelled"].includes(status)) {
+      throw new Error(`TaskGraph root turn entered ${status}; error=${result.rows[0]?.error ?? "<none>"}; progress=${await turnProgressDiagnostics(pool, turnId)}`)
+    }
     await new Promise(resolve => setTimeout(resolve, 25))
   }
-  throw new Error(`TaskGraph root turn did not reach ${wanted}`)
+  throw new Error(`TaskGraph root turn did not reach ${wanted}; progress=${await turnProgressDiagnostics(pool, turnId)}`)
 }
 
 async function waitForPersistedTaskWait(pool: Pool, turnId: string, idempotencyKey: string, timeoutMs = 20_000): Promise<{ id: string }> {
@@ -354,10 +407,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       redisCommandConnection: redis,
       closeSharedRedisConnections: async () => undefined,
     }))
+    // Each production bootstrap runs database-wide turn recovery; keep inactive fixtures out of its queue scan.
     await seed(pool, owner)
-    await seed(pool, failureOwner)
-    await seed(pool, stopOwner)
-    await seed(pool, restartOwner)
+    await seed(pool, failureOwner, "waiting_for_user")
+    await seed(pool, stopOwner, "waiting_for_user")
+    await seed(pool, restartOwner, "waiting_for_user")
   }, 15_000)
 
   afterEach(async () => {
@@ -629,6 +683,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       turnId: owner.turnId, sessionId: owner.sessionId, ownerId: owner.ownerId,
     })
     await waitForTurnStatus(pool!, owner.turnId, "completed")
+    const parkedTurns = await pool!.query<{ id: string; status: string }>(
+      `SELECT "id", "status" FROM "agent_turns" WHERE "id" = ANY($1::text[]) ORDER BY "id"`,
+      [[failureOwner.turnId, stopOwner.turnId, restartOwner.turnId]],
+    )
+    expect(parkedTurns.rows).toEqual([failureOwner.turnId, stopOwner.turnId, restartOwner.turnId].sort().map(id => ({
+      id, status: "waiting_for_user",
+    })))
 
     const turn = await pool!.query<{ rootTaskId: string; leaseVersion: number; finalResponse: string | null }>(
       `SELECT "rootTaskId", "leaseVersion", "finalResponse" FROM "agent_turns" WHERE "id" = $1`, [owner.turnId],
@@ -736,6 +797,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let workerOne: ProcessFixtureChild | undefined
     let workerTwo: ProcessFixtureChild | undefined
     try {
+      await activateFixtureTurn(pool!, restartOwner)
       workerOne = startTaskGraphRestartWorker("park-parent", restartOwner)
       const suspendedLine = await waitForProcessLine(workerOne, "P3_PARENT_SUSPENDED ")
       if (workerOne.pid === undefined) throw new Error("P3 first Worker has no OS process ID")
@@ -1140,6 +1202,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         return { adapter: model, registry: {} as never, candidates: [] }
       },
     })
+    await activateFixtureTurn(pool!, failureOwner)
     bootstrap = await createProductionWorkerBootstrap({
       pool: pool!,
       runtime,
@@ -1211,6 +1274,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const stepId = "p3-task-graph-stop-step-" + stopOwner.suffix
     const runningOwnerId = "p3-task-graph-stop-child-owner-" + stopOwner.suffix
     const now = new Date()
+    await activateFixtureTurn(pool!, stopOwner)
 
     await pool!.query(`INSERT INTO "sub_agent_tasks"
       ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",

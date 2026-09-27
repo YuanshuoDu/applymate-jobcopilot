@@ -200,8 +200,9 @@ async function runFirstWorker() {
   bootstrap = await createProductionWorkerBootstrap({ pool, runtime, ownerId, turnRecoveryIntervalMs: 10,
     waitResolver: { intervalMs: 10, ownerId: "p3-process-restart-wait-resolver-" + process.pid },
     subagents: { intervalMs: 10, async execute() { throw new Error("p3_first_worker_must_not_execute_children") } } })
-  if (!bootstrap.subagents) throw new Error("p3_first_worker_subagent_consumer_missing")
-  await bootstrap.subagents.worker.pause()
+  const subagentWorker = bootstrap.subagents?.queue?.worker
+  if (typeof subagentWorker?.pause !== "function") throw new Error("p3_first_worker_subagent_pause_unavailable")
+  await subagentWorker.pause()
   await enqueueTurn(pool, bootstrap.turns.queue, { turnId: ids.turnId, sessionId: ids.sessionId, ownerId })
   await waitForParentSuspended(ownerId); await waitForStop()
 }
