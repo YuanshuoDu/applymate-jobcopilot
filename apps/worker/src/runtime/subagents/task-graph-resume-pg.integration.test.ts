@@ -10,7 +10,7 @@ import type { HarnessModelRequest, ModelAdapter } from "@jobcopilot/agent-model"
 import { PLAN_LEDGER_SCHEMA_VERSION, parsePlanLedger, projectPlanLedger } from "@jobcopilot/agent-protocol"
 
 import type { ProductionAgentFlags } from "../production-agent-flags.js"
-import type { ProductionWorkerBootstrap } from "../../queue/production-bootstrap.js"
+import type { ProductionWorkerBootstrap, createProductionWorkerBootstrap } from "../../queue/production-bootstrap.js"
 import { childContextSnapshot, createChildContextBuilder } from "./child-context.js"
 import { executionOwnerFence } from "../execution-owner.js"
 import { PgCoordinationStore } from "../mailbox/store.js"
@@ -101,6 +101,7 @@ const describeWithServices = databaseUrl && redisUrl ? describe : describe.skip
 
 type Fixture = { userId: string; sessionId: string; turnId: string; ownerId: string; suffix: string }
 type RecordValue = Record<string, unknown>
+type TurnQueueFactory = NonNullable<Parameters<typeof createProductionWorkerBootstrap>[0]["turnQueueFactory"]>
 
 function record(value: unknown): RecordValue | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as RecordValue : null
@@ -136,6 +137,179 @@ function captureModelStreamFailure(model: ModelAdapter, onFailure: (error: unkno
 function boundedErrorText(error: unknown, maxCharacters = 1_000): string {
   const value = error instanceof Error ? error.stack ?? `${error.name}: ${error.message}` : String(error)
   return boundedDiagnostic(value, maxCharacters)
+}
+
+type FailureDiagnosticField = { label: string; value: string; maxCharacters?: number }
+
+function diagnosticText(value: unknown, maxCharacters = 64): string | null {
+  return typeof value === "string" ? boundedDiagnostic(value, maxCharacters) : null
+}
+
+function diagnosticCount(value: unknown): number | null {
+  if (Array.isArray(value)) return value.length
+  if (typeof value !== "string") return null
+  try {
+    const parsed: unknown = JSON.parse(value)
+    return Array.isArray(parsed) ? parsed.length : null
+  } catch {
+    return null
+  }
+}
+
+function compactTurnProgressDiagnostics(progress: string, maxCharacters = 1_350): string {
+  let parsed: RecordValue | null = null
+  try { parsed = record(JSON.parse(progress) as unknown) } catch { return boundedDiagnostic(progress, maxCharacters) }
+  if (!parsed) return boundedDiagnostic(progress, maxCharacters)
+
+  const turn = record(parsed.turn)
+  const tool = record(parsed.waitToolResult)
+  const toolFailure = record(parsed.diagnosticToolFailure)
+  const tasks = Array.isArray(parsed.tasks) ? parsed.tasks.map(record).filter((item): item is RecordValue => item !== null) : []
+  const waits = Array.isArray(parsed.waits) ? parsed.waits.map(record).filter((item): item is RecordValue => item !== null) : []
+  const snapshot = {
+    turn: turn ? {
+      status: diagnosticText(turn.status, 24),
+      error: diagnosticText(turn.error, 96),
+      revision: typeof turn.revision === "number" ? turn.revision : null,
+      leaseVersion: typeof turn.leaseVersion === "number" ? turn.leaseVersion : null,
+      leaseOwnerPresent: turn.leaseOwnerId !== null,
+    } : null,
+    waitToolResult: tool ? {
+      status: diagnosticText(tool.status, 24),
+      errorCode: diagnosticText(tool.errorCode, 64),
+      outputStatus: diagnosticText(tool.outputStatus, 24),
+      waitId: diagnosticText(tool.waitId, 48),
+      matchedTaskCount: record(tool.matchedTaskIds)?.count ?? null,
+      truncatedTaskResultCount: record(tool.truncated)?.truncatedTaskResultCount ?? null,
+    } : null,
+    toolFailure: toolFailure ? {
+      toolName: diagnosticText(toolFailure.toolName, 40),
+      status: diagnosticText(toolFailure.status, 24),
+      errorCode: diagnosticText(toolFailure.errorCode, 64),
+      failureDetail: diagnosticText(toolFailure.failureDetail, 120),
+    } : null,
+    tasks: tasks.slice(0, 6).map(task => ({
+      goal: diagnosticText(task.goal, 48),
+      status: diagnosticText(task.status, 24),
+      attempts: typeof task.attemptCount === "number" ? task.attemptCount : null,
+      failureReason: diagnosticText(task.failureReason, 72),
+    })),
+    waits: waits.slice(0, 6).map(wait => ({
+      key: diagnosticText(wait.idempotencyKey, 56),
+      status: diagnosticText(wait.status, 24),
+      targetCount: diagnosticCount(wait.targetTaskIds),
+      matchedCount: diagnosticCount(wait.matchedTaskIds),
+      suspended: wait.suspendedAt !== null,
+      resolved: wait.resolvedAt !== null,
+      consumed: wait.consumedAt !== null,
+    })),
+  }
+  return boundedDiagnostic(JSON.stringify(snapshot), maxCharacters)
+}
+
+function combineFailureDiagnostics(fields: readonly FailureDiagnosticField[], progress: string): string {
+  const direct = boundedDiagnostic(fields.map(({ label, value, maxCharacters = 500 }) =>
+    `${label}=${boundedDiagnostic(value, maxCharacters)}`).join("; "), 2_700)
+  const snapshotLabel = "; turnTaskWaitSnapshot="
+  const snapshotBudget = Math.max(0, Math.min(1_050, 3_900 - direct.length - snapshotLabel.length - 64))
+  const snapshot = compactTurnProgressDiagnostics(progress, snapshotBudget)
+  return boundedDiagnostic(`${direct}${snapshotLabel}${snapshot}`, 3_900)
+}
+
+function waitTurnFailureSummary(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error)
+  const progressMarker = message.indexOf("; progress=")
+  return boundedDiagnostic(progressMarker >= 0 ? message.slice(0, progressMarker) : message, 320)
+}
+
+function boundedErrorDetails(error: unknown): RecordValue {
+  const fields = record(error)
+  const errorName = error instanceof Error ? error.name : fields?.name
+  const errorMessage = error instanceof Error
+    ? error.message
+    : typeof fields?.message === "string" ? fields.message : String(error)
+  const errorCode = fields?.code
+  return {
+    name: boundedDiagnostic(typeof errorName === "string" ? errorName : "UnknownError", 120),
+    code: typeof errorCode === "string" || typeof errorCode === "number"
+      ? boundedDiagnostic(String(errorCode), 160)
+      : null,
+    message: boundedDiagnostic(errorMessage, 500),
+  }
+}
+
+async function waitHandoffTurnState(pool: Pool, turnId: string, waitId: string): Promise<RecordValue> {
+  try {
+    const result = await pool.query<{
+      turnStatus: string
+      leaseOwnerId: string | null
+      leaseVersion: number
+      waitId: string | null
+      waitStatus: string | null
+      suspendedAt: Date | null
+      resolvedAt: Date | null
+      consumedAt: Date | null
+    }>(`SELECT turn."status" AS "turnStatus", turn."leaseOwnerId", turn."leaseVersion",
+         wait."id" AS "waitId", wait."status" AS "waitStatus", wait."suspendedAt", wait."resolvedAt", wait."consumedAt"
+       FROM "agent_turns" AS turn LEFT JOIN "agent_wait_conditions" AS wait
+         ON wait."turnId" = turn."id" AND wait."id" = $2
+       WHERE turn."id" = $1`, [turnId, waitId])
+    const row = result.rows[0]
+    return {
+      turn: row ? {
+        status: row.turnStatus,
+        leaseOwnerPresent: row.leaseOwnerId !== null,
+        leaseVersion: row.leaseVersion,
+      } : null,
+      wait: row?.waitId ? {
+        id: row.waitId,
+        status: row.waitStatus,
+        suspendedAt: row.suspendedAt?.toISOString() ?? null,
+        resolvedAt: row.resolvedAt?.toISOString() ?? null,
+        consumedAt: row.consumedAt?.toISOString() ?? null,
+      } : null,
+    }
+  } catch (error: unknown) {
+    return { diagnosticError: boundedErrorDetails(error) }
+  }
+}
+
+function withWaitHandoffDiagnostics(
+  pool: Pool,
+  createQueue: TurnQueueFactory,
+  onFailure: (diagnostic: string) => void,
+): TurnQueueFactory {
+  return options => createQueue({
+    ...options,
+    waitHandoff: async input => {
+      if (!options.waitHandoff) {
+        const before = await waitHandoffTurnState(pool, input.lease.turnId, input.waitId)
+        const unavailable = new Error("Production waitHandoff callback was not provided.")
+        unavailable.name = "WaitHandoffUnavailable"
+        const unavailableWithCode = Object.assign(unavailable, { code: "wait_handoff_unavailable" })
+        onFailure(boundedDiagnostic(JSON.stringify({
+          waitId: input.waitId,
+          error: boundedErrorDetails(unavailableWithCode),
+          before,
+          after: before,
+        }), 1_800))
+        throw unavailableWithCode
+      }
+      const before = await waitHandoffTurnState(pool, input.lease.turnId, input.waitId)
+      try {
+        await options.waitHandoff(input)
+      } catch (error: unknown) {
+        const after = await waitHandoffTurnState(pool, input.lease.turnId, input.waitId)
+        onFailure(boundedDiagnostic(JSON.stringify({
+          waitId: input.waitId,
+          error: boundedErrorDetails(error),
+          before,
+          after,
+        }), 1_800))
+        throw error
+      }
+    },
+  })
 }
 
 function fixture(): Fixture {
@@ -257,8 +431,8 @@ function startTaskGraphRestartWorker(mode: "park-parent" | "resume-parent", valu
 }
 
 function processFixtureDiagnostics(child: ProcessFixtureChild): string {
-  return "pid=" + child.pid + " exitCode=" + child.exitCode + " signalCode=" + child.signalCode
-    + " stdout=" + child.output.join(" | ") + " stderr=" + child.errors.join(" | ")
+  return boundedDiagnostic("pid=" + child.pid + " exitCode=" + child.exitCode + " signalCode=" + child.signalCode
+    + " stdout=" + child.output.join(" | ") + " stderr=" + child.errors.join(" | "), 900)
 }
 
 async function waitForProcessLine(child: ProcessFixtureChild, prefix: string, timeoutMs = 20_000): Promise<string> {
@@ -476,11 +650,14 @@ async function waitForTurnStatus(pool: Pool, turnId: string, wanted: string, tim
     const status = result.rows[0]?.status
     if (status === wanted) return
     if (status && ["failed", "interrupted", "cancelled"].includes(status)) {
-      throw new Error(`TaskGraph root turn entered ${status}; error=${result.rows[0]?.error ?? "<none>"}; progress=${await turnProgressDiagnostics(pool, turnId, diagnosticToolCallId)}`)
+      const progress = await turnProgressDiagnostics(pool, turnId, diagnosticToolCallId)
+      const turnError = boundedDiagnostic(result.rows[0]?.error ?? "<none>", 300)
+      throw new Error(`TaskGraph root turn entered ${status}; error=${turnError}; progress=${compactTurnProgressDiagnostics(progress, 900)}`)
     }
     await new Promise(resolve => setTimeout(resolve, 25))
   }
-  throw new Error(`TaskGraph root turn did not reach ${wanted}; progress=${await turnProgressDiagnostics(pool, turnId, diagnosticToolCallId)}`)
+  const progress = await turnProgressDiagnostics(pool, turnId, diagnosticToolCallId)
+  throw new Error(`TaskGraph root turn did not reach ${wanted}; progress=${compactTurnProgressDiagnostics(progress, 900)}`)
 }
 
 async function waitForPersistedTaskWait(pool: Pool, turnId: string, idempotencyKey: string, timeoutMs = 20_000): Promise<{ id: string }> {
@@ -587,7 +764,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   it("plans, waits, promotes dependencies, resumes with bounded evidence, appends a follow-up plan, and resumes again", async () => {
     const [
       { createProductionWorkerBootstrap },
-      { enqueueTurn, TURN_QUEUE_NAME },
+      { createTurnQueue, enqueueTurn, TURN_QUEUE_NAME },
       subagentQueue,
       { createCanonicalTurnRuntime },
       { createPgTaskGraphCommandPort },
@@ -617,6 +794,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let followUpGraphReachedModel = false
     let followUpExpectedRevision: number | undefined
     let rootModelStreamFailure: string | null = null
+    let rootWaitHandoffFailure: string | null = null
     const runtime = await createCanonicalTurnRuntime(pool!, {
       workerId: owner.ownerId,
       productionFlags: flags,
@@ -762,6 +940,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       pool: pool!,
       runtime,
       ownerId: owner.ownerId,
+      turnQueueFactory: withWaitHandoffDiagnostics(pool!, createTurnQueue, diagnostic => {
+        rootWaitHandoffFailure = diagnostic
+      }),
       turnRecoveryIntervalMs: 100,
       waitResolver: { intervalMs: 10, batchSize: 10, ownerId: `p3-wait-resolver-${owner.suffix}` },
       subagents: {
@@ -822,8 +1003,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     try {
       await waitForTurnStatus(pool!, owner.turnId, "completed", 50_000, WAIT_CALL_ID)
     } catch (error: unknown) {
-      const failure = error instanceof Error ? error.message : String(error)
-      throw new Error(`rootModelStreamFailure=${rootModelStreamFailure ?? "<not captured>"}; ${failure}`)
+      const progress = await turnProgressDiagnostics(pool!, owner.turnId, WAIT_CALL_ID)
+      throw new Error(combineFailureDiagnostics([
+        { label: "rootModelStreamFailure", value: rootModelStreamFailure ?? "<not captured>", maxCharacters: 850 },
+        { label: "waitHandoffFailure", value: rootWaitHandoffFailure ?? "<not captured>", maxCharacters: 1_800 },
+        { label: "turnFailure", value: waitTurnFailureSummary(error), maxCharacters: 320 },
+      ], progress))
     }
     const parkedTurns = await pool!.query<{ id: string; status: string }>(
       `SELECT "id", "status" FROM "agent_turns" WHERE "id" = ANY($1::text[]) ORDER BY "id"`,
@@ -1031,14 +1216,48 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           `SELECT "goal", "status", "failureReason", "context"->'taskGraphDependencyResults' AS "dependencies"
            FROM "sub_agent_tasks" WHERE "turnId" = $1 ORDER BY "createdAt"`, [restartOwner.turnId],
         )
-        throw new Error(`${String(error)}; restartProgress=${await turnProgressDiagnostics(pool!, restartOwner.turnId)}; childContexts=${JSON.stringify(children.rows)}`)
+        const compactChildren = children.rows.map(child => {
+          const dependencyContext = record(child.dependencies)
+          const items = Array.isArray(dependencyContext?.items)
+            ? dependencyContext.items.map(record).filter((item): item is RecordValue => item !== null)
+            : []
+          return {
+            goal: diagnosticText(child.goal, 48),
+            status: diagnosticText(child.status, 24),
+            failureReason: diagnosticText(child.failureReason, 96),
+            dependencies: items.slice(0, 2).map(item => ({
+              key: diagnosticText(item.dependencyKey, 32),
+              status: diagnosticText(item.taskStatus, 24),
+              role: diagnosticText(item.role, 24),
+              availability: diagnosticText(record(item.result)?.availability, 24),
+            })),
+          }
+        })
+        const progress = await turnProgressDiagnostics(pool!, restartOwner.turnId, "p3-process-restart-wait")
+        const parentModelFailure = workerTwo.output.find(line => line.startsWith("P3_PARENT_MODEL_FAILURE")) ?? null
+        const processErrorText = error instanceof Error ? error.message : String(error)
+        const processError = parentModelFailure
+          ? processErrorText.replace(parentModelFailure, "<parent model failure captured separately>")
+          : processErrorText
+        throw new Error(combineFailureDiagnostics([
+          { label: "parentModelFailure", value: parentModelFailure ?? "<not captured>", maxCharacters: 1_200 },
+          { label: "processError", value: processError, maxCharacters: 500 },
+          { label: "childContexts", value: JSON.stringify(compactChildren), maxCharacters: 500 },
+        ], progress))
       }
       try {
         await waitForProcessLine(workerTwo, "P3_RESTORED_GRAPH_OK")
       } catch (error: unknown) {
-        const progress = await turnProgressDiagnostics(pool!, restartOwner.turnId)
-        const processError = boundedDiagnostic(String(error), 600)
-        throw new Error(`${processError}; restoredGraphProgress=${boundedDiagnostic(progress, 4_000)}`)
+        const progress = await turnProgressDiagnostics(pool!, restartOwner.turnId, "p3-process-restart-wait")
+        const processErrorText = error instanceof Error ? error.message : String(error)
+        const parentModelFailure = workerTwo.output.find(line => line.startsWith("P3_PARENT_MODEL_FAILURE")) ?? null
+        const processError = parentModelFailure
+          ? processErrorText.replace(parentModelFailure, "<parent model failure captured separately>")
+          : processErrorText
+        throw new Error(combineFailureDiagnostics([
+          { label: "parentModelFailure", value: parentModelFailure ?? "<not captured>", maxCharacters: 1_200 },
+          { label: "processError", value: processError, maxCharacters: 500 },
+        ], progress))
       }
       await waitForProcessLine(workerTwo, "P3_PARENT_RESUME_CONTEXT_OK")
       await waitForProcessLine(workerTwo, "P3_FOLLOW_UP_DEPENDENCY_CONTEXT_OK")
@@ -1268,7 +1487,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   it("cancels a dependent node after prerequisite failure without dispatching it", async () => {
     const [
       { createProductionWorkerBootstrap },
-      { enqueueTurn, TURN_QUEUE_NAME },
+      { createTurnQueue, enqueueTurn, TURN_QUEUE_NAME },
       subagentQueue,
       { createCanonicalTurnRuntime },
       { createPgTaskGraphCommandPort },
@@ -1298,6 +1517,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let resumedAfterFailure = false
     let failurePreflightStage = "not_started"
     let failurePreflightError: string | null = null
+    let failureWaitHandoffFailure: string | null = null
     const runtime = await createCanonicalTurnRuntime(pool!, {
       workerId: failureOwner.ownerId,
       productionFlags: flags,
@@ -1422,6 +1642,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       pool: pool!,
       runtime,
       ownerId: failureOwner.ownerId,
+      turnQueueFactory: withWaitHandoffDiagnostics(pool!, createTurnQueue, diagnostic => {
+        failureWaitHandoffFailure = diagnostic
+      }),
       // The resume intent is durably queued by the wait resolver and delivered
       // by turn recovery; poll promptly so this acceptance does not outwait it.
       turnRecoveryIntervalMs: 100,
@@ -1446,7 +1669,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       await waitForTurnStatus(pool!, failureOwner.turnId, "completed", 50_000, FAILURE_WAIT_CALL_ID)
     } catch (error: unknown) {
       const diagnostic = boundedDiagnostic(JSON.stringify({ stage: failurePreflightStage, error: failurePreflightError }), 700)
-      throw new Error(`failedPrerequisitePreflight=${diagnostic}; ${error instanceof Error ? error.message : String(error)}`)
+      const progress = await turnProgressDiagnostics(pool!, failureOwner.turnId, FAILURE_WAIT_CALL_ID)
+      throw new Error(combineFailureDiagnostics([
+        { label: "failedPrerequisitePreflight", value: diagnostic, maxCharacters: 700 },
+        { label: "waitHandoffFailure", value: failureWaitHandoffFailure ?? "<not captured>", maxCharacters: 1_800 },
+        { label: "turnFailure", value: waitTurnFailureSummary(error), maxCharacters: 320 },
+      ], progress))
     }
 
     const turn = await pool!.query<{ rootTaskId: string; finalResponse: string | null }>(
