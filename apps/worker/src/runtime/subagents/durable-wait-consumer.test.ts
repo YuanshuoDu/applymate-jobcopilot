@@ -10,7 +10,7 @@ const lease: TurnLease = {
 const turn = { id: "turn-1", sessionId: "session-1", userId: "user-1", status: "in_progress", leaseOwnerId: "worker-1", leaseVersion: 2, leaseExpiresAt: lease.leaseExpiresAt, rootTaskId: "root-1" }
 const now = new Date("2026-09-09T10:30:00.000Z")
 const SESSION_FENCE = 'session."status" NOT IN (\'aborted\', \'archived\')'
-type OutcomeOutput = { waitId: string; status: string; targetTaskIds: string[]; matchedTaskIds: string[]; tasks: Array<{ taskId: string; status: string }> }
+type OutcomeOutput = { waitId: string; status: string; targetTaskIds: string[]; matchedTaskIds: string[]; tasks: Array<{ taskId: string; status: string; result?: unknown; failureReason?: string | null }> }
 function outputOf(content: unknown): OutcomeOutput {
   if (!content || typeof content !== "object" || Array.isArray(content) || !("output" in content)) throw new Error("missing output")
   const output = content.output
@@ -18,10 +18,12 @@ function outputOf(content: unknown): OutcomeOutput {
   return output as OutcomeOutput
 }
 
-function fixture(input: { waitStatus?: string; consumed?: boolean; corruptConsumed?: boolean; missingConsumedOutcome?: boolean; targetStatus?: string; targetRole?: string; foreign?: boolean; failUpdate?: boolean; large?: boolean; targetCount?: number; malformed?: boolean; sessionStatus?: string; sessionSource?: string; closeBeforeUpdate?: boolean } = {}) {
+function fixture(input: { waitStatus?: string; mode?: "any" | "all"; matchedTaskIds?: string[]; consumed?: boolean; corruptConsumed?: boolean; missingConsumedOutcome?: boolean; targetStatus?: string; targetStatuses?: string[]; targetResults?: unknown[]; targetFailureReasons?: Array<string | null>; targetRole?: string; foreign?: boolean; failUpdate?: boolean; large?: boolean; targetCount?: number; malformed?: boolean; sessionStatus?: string; sessionSource?: string; closeBeforeUpdate?: boolean } = {}) {
   const targetIds = Array.from({ length: input.targetCount ?? 1 }, (_, index) => `child-${index + 1}`)
-  const outcome = { waitId: input.corruptConsumed ? "wait-other" : "wait-1", status: "ready", targetTaskIds: targetIds, matchedTaskIds: targetIds, tasks: targetIds.map(taskId => ({ taskId, status: "completed", result: null, failureReason: null })) }
-  const wait = { id: "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "root-1", stepId: "step-1", targetTaskIds: targetIds, mode: "all", status: input.waitStatus ?? "ready", matchedTaskIds: targetIds, result: input.consumed ? { request: { mode: "all" }, ...(input.missingConsumedOutcome ? {} : { outcome }) } : { request: { mode: "all" } }, suspendedAt: now, consumedAt: input.consumed ? now : null }
+  const mode = input.mode ?? "all"
+  const matchedTaskIds = input.matchedTaskIds ?? targetIds
+  const outcome = { waitId: input.corruptConsumed ? "wait-other" : "wait-1", status: "ready", targetTaskIds: targetIds, matchedTaskIds, tasks: targetIds.map(taskId => ({ taskId, status: "completed", result: null, failureReason: null })) }
+  const wait = { id: "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "root-1", stepId: "step-1", targetTaskIds: targetIds, mode, status: input.waitStatus ?? "ready", matchedTaskIds, result: input.consumed ? { request: { mode }, ...(input.missingConsumedOutcome ? {} : { outcome }) } : { request: { mode } }, suspendedAt: now, consumedAt: input.consumed ? now : null }
   const state: { wait: typeof wait; consumedAt: Date | null; result: Record<string, unknown>; updates: number; sessionStatus: string; sessionSource: string } = { wait, consumedAt: wait.consumedAt, result: wait.result, updates: 0, sessionStatus: input.sessionStatus ?? "running", sessionSource: input.sessionSource ?? "automation" }
   const calls: string[] = []
   const client = {
@@ -34,7 +36,11 @@ function fixture(input: { waitStatus?: string; consumed?: boolean; corruptConsum
         }
         return { rows: [state.wait], rowCount: 1 }
       }
-      if (sql.includes('FROM "sub_agent_tasks"') && sql.includes("ANY($1::text[])")) return { rows: input.foreign ? [] : targetIds.map((id) => ({ id, rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1", userId: "user-1", role: input.targetRole ?? "scout", status: input.targetStatus ?? "completed", result: input.malformed ? (() => { const value: Record<string, unknown> = { bigint: BigInt(1) }; value.circular = value; return value })() : { safe: input.large ? "x".repeat(10_000) : true, secret: "hide-me" }, failureReason: input.targetStatus === "failed" ? "provider failed" : null })), rowCount: input.foreign ? 0 : targetIds.length }
+      if (sql.includes('FROM "sub_agent_tasks"') && sql.includes("ANY($1::text[])")) return { rows: input.foreign ? [] : targetIds.map((id, index) => {
+        const status = input.targetStatuses?.[index] ?? input.targetStatus ?? "completed"
+        const defaultResult = input.malformed ? (() => { const value: Record<string, unknown> = { bigint: BigInt(1) }; value.circular = value; return value })() : { safe: input.large ? "x".repeat(10_000) : true, secret: "hide-me" }
+        return { id, rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1", userId: "user-1", role: input.targetRole ?? "scout", status, result: input.targetResults?.[index] ?? defaultResult, failureReason: input.targetFailureReasons?.[index] ?? (status === "failed" ? "provider failed" : null) }
+      }), rowCount: input.foreign ? 0 : targetIds.length }
       if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ id: "root-1", rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1", userId: "user-1" }], rowCount: 1 }
       if (sql.includes('FROM "agent_steps"')) return { rows: [{ id: "step-1", taskId: "root-1", attempt: 1, status: "waiting_for_tool" }], rowCount: 1 }
       if (sql.includes('UPDATE "agent_wait_conditions"')) {
@@ -59,6 +65,18 @@ describe("durable wait outcome consumer", () => {
     expect(fake.state.updates).toBe(1)
     expect(fake.calls.some(sql => sql.includes(SESSION_FENCE))).toBe(true)
     expect(fake.calls.find(sql => sql.includes('UPDATE "agent_wait_conditions"'))).toContain(SESSION_FENCE)
+  })
+
+  it("only includes terminal child details in a ready any receipt", async () => {
+    const fake = fixture({ mode: "any", targetCount: 2, matchedTaskIds: ["child-1"], targetStatuses: ["completed", "queued"], targetResults: [{ current: "completed-result" }, { stale: "prior-attempt-result" }], targetFailureReasons: [null, "prior-attempt-error"] })
+    const projections = await consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now })
+    const output = outputOf(projections[0]!.content)
+    expect(output.tasks).toMatchObject([
+      { taskId: "child-1", status: "completed", result: { current: "completed-result" } },
+      { taskId: "child-2", status: "queued", result: null, failureReason: null },
+    ])
+    expect(JSON.stringify(output)).not.toContain("prior-attempt-result")
+    expect(JSON.stringify(output)).not.toContain("prior-attempt-error")
   })
 
   it("projects the server-owned target role", async () => {

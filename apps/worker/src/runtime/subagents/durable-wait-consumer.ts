@@ -138,15 +138,15 @@ function makeOutcome(waitId: string, status: string, targetIds: string[], matche
   const seen = new Set<string>(); const tasks: OutcomeTask[] = []
   for (const state of states) {
     if (!targetIds.includes(state.taskId) || seen.has(state.taskId) || !taskStatus(state.status)) return null
-    seen.add(state.taskId); tasks.push({ taskId: state.taskId, status: state.status, ...(state.role ? { role: state.role } : {}), result: minimalResult(state.result), failureReason: null })
+    seen.add(state.taskId); tasks.push({ taskId: state.taskId, status: state.status, ...(state.role ? { role: state.role } : {}), result: state.status === "completed" ? minimalResult(state.result) : null, failureReason: null })
   }
   let outcome: Outcome = { waitId, status, matchedTaskIds: matchedIds, targetTaskIds: targetIds, tasks }
   let size = outcomeBytes(outcome)
   if (size === null || size > MAX_OUTCOME_BYTES) return null
   const details: Detail[] = []
   states.forEach((state, index) => {
-    if (state.result.hasValue) details.push({ kind: "result", index, info: state.result })
-    if (state.failureReason !== null) details.push({ kind: "failure", index, value: state.failureReason })
+    if (state.status === "completed" && state.result.hasValue) details.push({ kind: "result", index, info: state.result })
+    if (state.status === "failed" && state.failureReason !== null) details.push({ kind: "failure", index, value: state.failureReason })
   })
   for (let detailIndex = 0; detailIndex < details.length; detailIndex += 1) {
     const detail = details[detailIndex]!
