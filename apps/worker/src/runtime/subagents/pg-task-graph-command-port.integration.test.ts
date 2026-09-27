@@ -12,11 +12,14 @@ import { PgSubagentTaskStore } from "./pg-store.js"
 const DATABASE_NAME = "applymate_agent_brain_ci"
 
 function dedicatedDisposableUrl(): string | null {
-  if (process.env.CI !== "true") return null
-
+  const required = process.env.AGENT_RUNTIME_PG_TEST_REQUIRED === "true"
+  if (process.env.CI !== "true" && !required) return null
   const value = process.env.AGENT_RUNTIME_PG_TEST_URL
   if (!value || process.env.AGENT_RUNTIME_PG_TEST_DISPOSABLE !== "true") {
-    throw new Error("CI TaskGraph PostgreSQL integration tests require AGENT_RUNTIME_PG_TEST_URL and AGENT_RUNTIME_PG_TEST_DISPOSABLE=true")
+    if (required) {
+      throw new Error("Required TaskGraph PostgreSQL integration tests need AGENT_RUNTIME_PG_TEST_URL and AGENT_RUNTIME_PG_TEST_DISPOSABLE=true")
+    }
+    return null
   }
 
   const url = new URL(value)
@@ -313,6 +316,8 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     await installTaskGraphTenantRls(adminPool, policyPrefix, setup)
     await adminPool.query(`GRANT EXECUTE ON FUNCTION public.app_current_user_id() TO "${roleName}"`)
     await adminPool.query(`GRANT SELECT ON "agent_sessions", "agent_turns", "sub_agent_tasks", "agent_steps", "agent_items", "agent_events", "agent_outbox" TO "${roleName}"`)
+    await adminPool.query(`GRANT UPDATE ("id") ON "agent_turns" TO "${roleName}"`)
+    await adminPool.query(`GRANT UPDATE ("id") ON "agent_steps" TO "${roleName}"`)
     await adminPool.query(`GRANT UPDATE ("eventSequence") ON "agent_sessions" TO "${roleName}"`)
     await adminPool.query(`GRANT INSERT ON "sub_agent_tasks" TO "${roleName}"`)
     await adminPool.query(`GRANT UPDATE ("status", "updatedAt") ON "sub_agent_tasks" TO "${roleName}"`)
@@ -392,6 +397,21 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
         tenantScope: owner.userId, roleName, isSuperuser: false, bypassesRls: false, tableName, ownsTable: false,
         tableRlsEnabled: true, rowSecurityActive: true,
       })))
+      const turnLockPrivileges = await roleProbe.query<{ canLockTurn: boolean; canRewriteLease: boolean }>(`SELECT
+          has_column_privilege(current_user, 'public."agent_turns"', 'id', 'UPDATE') AS "canLockTurn",
+          has_column_privilege(current_user, 'public."agent_turns"', 'leaseOwnerId', 'UPDATE') AS "canRewriteLease"`)
+      expect(turnLockPrivileges.rows).toEqual([{ canLockTurn: true, canRewriteLease: false }])
+      const stepLockPrivileges = await roleProbe.query<{
+        canLockStep: boolean
+        canRewriteStepStatus: boolean
+        canRewriteStepSnapshot: boolean
+      }>(`SELECT
+          has_column_privilege(current_user, 'public."agent_steps"', 'id', 'UPDATE') AS "canLockStep",
+          has_column_privilege(current_user, 'public."agent_steps"', 'status', 'UPDATE') AS "canRewriteStepStatus",
+          has_column_privilege(current_user, 'public."agent_steps"', 'modelProfileSnapshot', 'UPDATE') AS "canRewriteStepSnapshot"`)
+      expect(stepLockPrivileges.rows).toEqual([{
+        canLockStep: true, canRewriteStepStatus: false, canRewriteStepSnapshot: false,
+      }])
       const foreignRows: ReadonlyArray<{ table: typeof TENANT_TABLES[number]; id: string }> = [
         { table: "agent_sessions", id: owner.foreignSessionId },
         { table: "agent_turns", id: owner.foreignTurnId },
