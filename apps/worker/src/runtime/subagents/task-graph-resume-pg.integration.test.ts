@@ -7,7 +7,13 @@ import { Pool } from "pg"
 import { Redis } from "ioredis"
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest"
 import type { HarnessModelRequest, ModelAdapter } from "@jobcopilot/agent-model"
-import { PLAN_LEDGER_SCHEMA_VERSION, parsePlanLedger, projectPlanLedger } from "@jobcopilot/agent-protocol"
+import {
+  PLAN_LEDGER_SCHEMA_VERSION,
+  parsePlanLedger,
+  projectPlanLedger,
+  projectTaskEvidencePreview,
+  schemaVersion,
+} from "@jobcopilot/agent-protocol"
 
 import type { ProductionAgentFlags } from "../production-agent-flags.js"
 import type { ProductionWorkerBootstrap, createProductionWorkerBootstrap } from "../../queue/production-bootstrap.js"
@@ -101,6 +107,11 @@ const describeWithServices = databaseUrl && redisUrl ? describe : describe.skip
 
 type Fixture = { userId: string; sessionId: string; turnId: string; ownerId: string; suffix: string }
 type RecordValue = Record<string, unknown>
+type TaskGraphItemRow = {
+  id: string; sessionId: string; turnId: string; stepId: string | null; taskId: string | null
+  type: string; status: string; phase: string | null; revision: number; content: RecordValue
+  startedAt: Date | null; completedAt: Date | null; createdAt: Date; updatedAt: Date
+}
 type TurnQueueFactory = NonNullable<Parameters<typeof createProductionWorkerBootstrap>[0]["turnQueueFactory"]>
 
 function record(value: unknown): RecordValue | null {
@@ -825,9 +836,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               expect(nodes.map(node => node?.readiness)).toEqual(["terminal", "terminal", "terminal", "terminal"])
               const largeSourceProjection = nodes.find(node => node?.key === "large-source")?.resultProjection
               expect(largeSourceProjection).toMatchObject({
-                trust: "untrusted", availability: "available", role: "scout", status: "completed",
-                candidateCount: 1, evidenceCount: 1,
-                candidates: [{ jobId: "fixture-job-1", source: "other", evidenceKinds: ["job"] }],
+                schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA,
+                trust: "untrusted", availability: "unavailable",
               })
               expect(JSON.stringify(largeSourceProjection)).not.toContain("x".repeat(100))
               resumedGraphReachedModel = true
@@ -987,7 +997,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           if (lease.role === "scout" || lease.role === "analyst") {
             const result = structuredChildResult(lease.role, lease.goal)
             if (lease.goal === OVERSIZED_SOURCE_GOAL) {
-              result.structuredResult = { ...(result.structuredResult as RecordValue), summary: "x".repeat(5 * 1024) }
+              result.structuredResult = { ...(result.structuredResult as RecordValue), summary: "x".repeat(20 * 1024) }
               result.finalText = "oversized but otherwise valid structured result"
             }
             return { status: "completed", result }
@@ -1042,7 +1052,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(record(childByGoal.get("Summarize the fixture source")?.result?.structuredResult)?.findings).toMatchObject([{ jobId: "fixture-job-1", score: 8 }])
     expect(childByGoal.get(FOLLOW_UP_GOAL)).toMatchObject({ status: "completed", role: "analyst" })
     expect(childByGoal.get(OVERSIZED_SOURCE_GOAL)).toMatchObject({ status: "completed", role: "scout" })
-    expect(Buffer.byteLength(JSON.stringify(childByGoal.get(OVERSIZED_SOURCE_GOAL)?.result ?? {}), "utf8")).toBeGreaterThan(2 * 1024)
+    expect(Buffer.byteLength(JSON.stringify(childByGoal.get(OVERSIZED_SOURCE_GOAL)?.result ?? {}), "utf8")).toBeGreaterThan(16 * 1024)
     expect(childByGoal.get(REJECTED_DEPENDENT_GOAL)).toMatchObject({
       status: "cancelled", failureReason: "Prerequisite results could not be safely materialized.",
     })
@@ -1146,8 +1156,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const rootTaskId = beforeTurn.rows[0]?.rootTaskId
       expect(rootTaskId).toBeTruthy()
 
-      const graphBefore = await pool!.query<{ id: string; revision: number; content: RecordValue }>(
-        "SELECT \"id\", \"revision\", \"content\" FROM \"agent_items\" WHERE \"sessionId\" = $1 AND \"turnId\" = $2 AND \"taskId\" = $3 AND \"type\" = 'task_graph'",
+      const graphBefore = await pool!.query<TaskGraphItemRow>(
+        "SELECT \"id\", \"sessionId\", \"turnId\", \"stepId\", \"taskId\", \"type\", \"status\", \"phase\", \"revision\", \"content\", \"startedAt\", \"completedAt\", \"createdAt\", \"updatedAt\" FROM \"agent_items\" WHERE \"sessionId\" = $1 AND \"turnId\" = $2 AND \"taskId\" = $3 AND \"type\" = 'task_graph'",
         [restartOwner.sessionId, restartOwner.turnId, rootTaskId],
       )
       expect(graphBefore.rows).toHaveLength(1)
@@ -1190,8 +1200,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         [restartOwner.turnId],
       )
       expect(afterKillTurn.rows[0]).toEqual({ status: "waiting_for_dependency", leaseOwnerId: null, leaseVersion: 1 })
-      const graphAfterKill = await pool!.query<{ id: string; revision: number; content: RecordValue }>(
-        "SELECT \"id\", \"revision\", \"content\" FROM \"agent_items\" WHERE \"sessionId\" = $1 AND \"turnId\" = $2 AND \"taskId\" = $3 AND \"type\" = 'task_graph'",
+      const graphAfterKill = await pool!.query<TaskGraphItemRow>(
+        "SELECT \"id\", \"sessionId\", \"turnId\", \"stepId\", \"taskId\", \"type\", \"status\", \"phase\", \"revision\", \"content\", \"startedAt\", \"completedAt\", \"createdAt\", \"updatedAt\" FROM \"agent_items\" WHERE \"sessionId\" = $1 AND \"turnId\" = $2 AND \"taskId\" = $3 AND \"type\" = 'task_graph'",
         [restartOwner.sessionId, restartOwner.turnId, rootTaskId],
       )
       expect(graphAfterKill.rows).toEqual(graphBefore.rows)
@@ -1329,8 +1339,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(resumedTurn.rows[0]).toMatchObject({ status: "completed", leaseVersion: 3, rootTaskId })
       expect(resumedTurn.rows[0]?.finalResponse).toContain("p3-process-restart-parent-resumed-after-follow-up")
 
-      const graphAfterResume = await pool!.query<{ id: string; revision: number; content: RecordValue }>(
-        "SELECT \"id\", \"revision\", \"content\" FROM \"agent_items\" WHERE \"sessionId\" = $1 AND \"turnId\" = $2 AND \"taskId\" = $3 AND \"type\" = 'task_graph'",
+      const graphAfterResume = await pool!.query<TaskGraphItemRow>(
+        "SELECT \"id\", \"sessionId\", \"turnId\", \"stepId\", \"taskId\", \"type\", \"status\", \"phase\", \"revision\", \"content\", \"startedAt\", \"completedAt\", \"createdAt\", \"updatedAt\" FROM \"agent_items\" WHERE \"sessionId\" = $1 AND \"turnId\" = $2 AND \"taskId\" = $3 AND \"type\" = 'task_graph'",
         [restartOwner.sessionId, restartOwner.turnId, rootTaskId],
       )
       expect(graphAfterResume.rows).toHaveLength(1)
@@ -1380,9 +1390,14 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         [RESTART_FOLLOW_UP_GOAL, "completed"],
       ])
       // Match Worker 2's projection query, including its root row and public goal.
-      const persistedPlanLedgerTasks = await pool!.query<{ id: string; sessionId: string; status: string; role: string; goal: string; result: RecordValue | null; updatedAt: Date }>(
-        `SELECT "id", "sessionId", "status", "role", "goal", "result", "updatedAt" FROM "sub_agent_tasks"
-         WHERE "sessionId" = $1 AND "turnId" = $2 AND ("id" = $3 OR "parentTaskId" = $3)`,
+      const persistedPlanLedgerTasks = await pool!.query<{
+        id: string; sessionId: string; turnId: string | null; rootTaskId: string | null; parentTaskId: string | null
+        path: string; role: string; taskType: string; status: string; goal: string; confidence: number | null
+        failureReason: string | null; result: RecordValue | null; createdAt: Date; updatedAt: Date
+      }>(
+        `SELECT "id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "role", "taskType", "status", "goal", "confidence", "failureReason", "result", "createdAt", "updatedAt" FROM "sub_agent_tasks"
+         WHERE "sessionId" = $1 AND "turnId" = $2 AND ("id" = $3 OR "parentTaskId" = $3)
+         ORDER BY "createdAt" ASC, "id" ASC`,
         [restartOwner.sessionId, restartOwner.turnId, rootTaskId],
       )
       expect(persistedPlanLedgerTasks.rows.map(row => row.id)).toContain(rootTaskId)
@@ -1430,8 +1445,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           findings: [{ jobId: "fixture-job-restart", score: 8, evidenceKinds: ["job"] }],
         },
       })
-      const graphEvents = await pool!.query<{ taskId: string | null; idempotencyKey: string; payload: RecordValue }>(
-        "SELECT \"taskId\", \"idempotencyKey\", \"payload\" FROM \"agent_events\" WHERE \"sessionId\" = $1 AND \"turnId\" = $2 AND \"itemId\" = $3 ORDER BY \"sequence\"",
+      const graphEvents = await pool!.query<{
+        id: string; sessionId: string; turnId: string; itemId: string | null; taskId: string | null
+        sequence: string | bigint; type: string; actor: string; correlationId: string
+        causationId: string | null; idempotencyKey: string | null; payload: RecordValue
+      }>(
+        "SELECT \"id\", \"sessionId\", \"turnId\", \"itemId\", \"taskId\", \"sequence\", \"type\", \"actor\", \"correlationId\", \"causationId\", \"idempotencyKey\", \"payload\" FROM \"agent_events\" WHERE \"sessionId\" = $1 AND \"turnId\" = $2 AND \"itemId\" = $3 ORDER BY \"sequence\"",
         [restartOwner.sessionId, restartOwner.turnId, graphAfterResume.rows[0]!.id],
       )
       const proposalEvents = graphEvents.rows.filter(event => record(event.payload)?.kind === "proposal")
@@ -1445,8 +1464,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         readyTaskIds: [followUpTaskId],
       })
       const proposalKeyPrefix = graphAfterResume.rows[0]!.id + ":proposal:"
-      expect(followUpReceiptEvent.idempotencyKey.startsWith(proposalKeyPrefix)).toBe(true)
-      const expectedRevision = Number(followUpReceiptEvent.idempotencyKey.slice(proposalKeyPrefix.length))
+      const followUpIdempotencyKey = followUpReceiptEvent.idempotencyKey
+      if (!followUpIdempotencyKey) throw new Error("Persisted follow-up proposal event has no idempotency key.")
+      expect(followUpIdempotencyKey.startsWith(proposalKeyPrefix)).toBe(true)
+      const expectedRevision = Number(followUpIdempotencyKey.slice(proposalKeyPrefix.length))
       expect(Number.isSafeInteger(expectedRevision)).toBe(true)
       expect(followUpReceiptPayload?.revision).toBe(expectedRevision + 1)
       expect(expectedRevision).toBeGreaterThan(graphBefore.rows[0]!.revision)
@@ -1458,6 +1479,48 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           && typeof lifecycle.type === "string" ? [lifecycle.type] : []
       })
       expect(followUpLifecycle).toEqual(expect.arrayContaining(["task.started", "task.completed"]))
+      const initialGraphRevision = graphBefore.rows[0]!.revision
+      const persistedGraphDeltas = graphEvents.rows.filter(event => {
+        const payload = record(event.payload)
+        const item = record(payload?.item)
+        return event.type === "item.delta"
+          && typeof item?.revision === "number" && Number.isSafeInteger(item.revision)
+          && item.revision > initialGraphRevision
+      })
+      const persistedGraphRevisions = persistedGraphDeltas.map(event => Number(record(record(event.payload)?.item)?.revision))
+      expect(persistedGraphRevisions).toEqual(Array.from(
+        { length: graphAfterResume.rows[0]!.revision - initialGraphRevision },
+        (_, index) => initialGraphRevision + index + 1,
+      ))
+      expect(persistedGraphDeltas.every(event => {
+        const payload = record(event.payload)
+        return payload !== null && payload.revision === record(payload.item)?.revision
+      })).toBe(true)
+      expect(persistedGraphDeltas.length).toBeGreaterThan(0)
+      const finalGraphDelta = persistedGraphDeltas[persistedGraphDeltas.length - 1]!
+      const finalGraphDeltaPayload = record(finalGraphDelta.payload)
+      const finalGraphDeltaItem = record(finalGraphDeltaPayload?.item)
+      expect(finalGraphDelta).toMatchObject({
+        type: "item.delta",
+        sessionId: restartOwner.sessionId,
+        turnId: restartOwner.turnId,
+        itemId: graphAfterResume.rows[0]!.id,
+        taskId: rootTaskId,
+      })
+      expect(finalGraphDeltaPayload?.revision).toBe(graphAfterResume.rows[0]!.revision)
+      expect(finalGraphDeltaItem).toMatchObject({
+        id: graphAfterResume.rows[0]!.id,
+        sessionId: restartOwner.sessionId,
+        turnId: restartOwner.turnId,
+        taskId: rootTaskId,
+        revision: graphAfterResume.rows[0]!.revision,
+        content: graphAfterResume.rows[0]!.content,
+      })
+      const graphDeltaSequences = persistedGraphDeltas.map(event => event.sequence.toString())
+      expect(graphDeltaSequences.every(sequence => /^(0|[1-9]\d*)$/.test(sequence))).toBe(true)
+      for (let index = 1; index < graphDeltaSequences.length; index += 1) {
+        expect(BigInt(graphDeltaSequences[index]!)).toBeGreaterThan(BigInt(graphDeltaSequences[index - 1]!))
+      }
       const resumedEvents = await pool!.query<{ count: string }>(
         "SELECT COUNT(*)::text AS \"count\" FROM \"agent_events\" WHERE \"sessionId\" = $1 AND \"idempotencyKey\" = $2",
         [restartOwner.sessionId, "agent-wait:" + waitsBefore.rows[0]!.id + ":resumed"],
@@ -1469,8 +1532,88 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       )
       expect(followUpResumedEvents.rows[0]?.count).toBe("1")
       if (planLedgerTraceArtifactPath) {
+        if (!persistedLedger) throw new Error("Cannot export a missing persisted PlanLedger.")
         expect(Buffer.byteLength(publicLedgerJson, "utf8")).toBeLessThanOrEqual(16_000)
-        await writeFile(planLedgerTraceArtifactPath, publicLedgerJson, "utf8")
+        const graphItem = graphAfterResume.rows[0]!
+        const graphSnapshot = record(graphItem.content)
+        const graphNodes = Array.isArray(graphSnapshot?.nodes) ? graphSnapshot.nodes.map(record) : []
+        const taskRouteRows = persistedPlanLedgerTasks.rows.map(row => {
+          const evidencePreview = projectTaskEvidencePreview(row)
+          return {
+            schemaVersion,
+            id: row.id,
+            sessionId: row.sessionId,
+            turnId: row.turnId,
+            rootTaskId: row.rootTaskId,
+            parentTaskId: row.parentTaskId,
+            path: row.path,
+            role: row.role,
+            taskType: row.taskType,
+            status: row.status === "completed" ? "passed" : row.status,
+            goal: row.goal,
+            confidence: row.confidence,
+            failureReason: row.failureReason,
+            hasResult: row.result !== null,
+            ...(evidencePreview ? { structuredEvidencePreview: evidencePreview } : {}),
+            createdAt: row.createdAt.toISOString(),
+            updatedAt: row.updatedAt.toISOString(),
+          }
+        })
+        expect(graphItem.sessionId).toBe(restartOwner.sessionId)
+        expect(graphItem.turnId).toBe(restartOwner.turnId)
+        expect(graphItem.taskId).toBe(rootTaskId)
+        expect(graphItem.revision).toBe(persistedLedger.revision)
+        expect(taskRouteRows.map(row => row.id).sort()).toEqual([
+          rootTaskId,
+          ...graphNodes.map(node => String(node?.taskId)),
+        ].sort())
+        expect(taskRouteRows.every(row => row.sessionId === restartOwner.sessionId
+          && row.turnId === restartOwner.turnId && row.rootTaskId === rootTaskId)).toBe(true)
+        expect(taskRouteRows.find(row => row.id === rootTaskId)?.parentTaskId).toBeNull()
+        expect(taskRouteRows.every(row => !("result" in row))).toBe(true)
+        const toGraphItemDto = (row: TaskGraphItemRow) => ({
+          schemaVersion,
+          id: row.id,
+          sessionId: row.sessionId,
+          turnId: row.turnId,
+          stepId: row.stepId,
+          taskId: row.taskId,
+          type: row.type,
+          status: row.status,
+          phase: row.phase,
+          revision: row.revision,
+          content: row.content,
+          startedAt: row.startedAt?.toISOString() ?? null,
+          completedAt: row.completedAt?.toISOString() ?? null,
+          createdAt: row.createdAt.toISOString(),
+          updatedAt: row.updatedAt.toISOString(),
+        })
+        const traceEnvelope = {
+          schemaVersion: "agent-harness.v2.plan-ledger-trace",
+          planLedger: persistedLedger,
+          rootTaskId,
+          graphItem: toGraphItemDto(graphItem),
+          initialGraphItem: toGraphItemDto(graphBefore.rows[0]!),
+          graphEvents: persistedGraphDeltas.map(durableGraphEvent => ({
+            schemaVersion,
+            id: durableGraphEvent.id,
+            sessionId: durableGraphEvent.sessionId,
+            turnId: durableGraphEvent.turnId,
+            itemId: durableGraphEvent.itemId,
+            taskId: durableGraphEvent.taskId,
+            type: durableGraphEvent.type,
+            actor: durableGraphEvent.actor,
+            correlationId: durableGraphEvent.correlationId,
+            causationId: durableGraphEvent.causationId,
+            idempotencyKey: durableGraphEvent.idempotencyKey,
+            sequence: durableGraphEvent.sequence.toString(),
+            payload: durableGraphEvent.payload,
+          })),
+          tasks: taskRouteRows,
+        }
+        const traceEnvelopeJson = JSON.stringify(traceEnvelope)
+        expect(Buffer.byteLength(traceEnvelopeJson, "utf8")).toBeLessThanOrEqual(64_000)
+        await writeFile(planLedgerTraceArtifactPath, traceEnvelopeJson, "utf8")
       }
     } finally {
       const teardownFailures: string[] = []

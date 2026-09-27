@@ -5,7 +5,6 @@ import { ROLE_RESULT_SCHEMA } from "./role-results.ts"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.ts"
 import { createProductionWorkerBootstrap } from "../../queue/production-bootstrap.ts"
 import { enqueueTurn } from "../turns/turn-queue.ts"
-import { projectTaskGraphResult } from "./task-graph-result-projection.ts"
 import { parsePlanLedger, projectPlanLedger } from "@jobcopilot/agent-protocol"
 
 const [, , mode, rawIds] = process.argv, ids = JSON.parse(rawIds)
@@ -103,11 +102,11 @@ function assertRestoredGraph(request) {
       throw new Error("p3_task_graph_node_not_restored:" + node.key)
     }
   }
-  const waitOutcome = waitOutcomeFromRequest(request, outcome => outcome.status === "ready" && outcome.tasks.length === expected.length
+  waitOutcomeFromRequest(request, outcome => outcome.status === "ready" && outcome.tasks.length === expected.length
     && outcome.tasks.every(task => record(task)?.status === "completed"))
-  const sourceTask = waitOutcome.tasks.map(record).find(task => task?.taskId === byKey.get("source")?.taskId)
-  if (!sourceTask || !isExpectedSourceProjection(projectTaskGraphResult("scout", sourceTask.status, sourceTask.result))) {
-    throw new Error("p3_restored_wait_source_projection_missing")
+  const sourceNode = byKey.get("source")
+  if (!sourceNode || !isExpectedSourceProjection(sourceNode.resultProjection)) {
+    throw new Error("p3_restored_graph_source_projection_missing")
   }
   say("P3_RESTORED_GRAPH_OK " + JSON.stringify({ revision: graph.revision, nodeCount: nodes.length }))
   say("P3_PARENT_RESUME_CONTEXT_OK")
