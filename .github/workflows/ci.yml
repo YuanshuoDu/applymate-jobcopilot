@@ -41,70 +41,13 @@ jobs:
         run: pnpm --filter @jobcopilot/web exec prisma generate
       - name: Run non-Web workspace tests
         run: pnpm turbo test --filter='!@jobcopilot/web'
-      - name: Run Web Vitest shard 1 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=1/32
-      - name: Run Web Vitest shard 2 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=2/32
-      - name: Run Web Vitest shard 3 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=3/32
-      - name: Run Web Vitest shard 4 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=4/32
-      - name: Run Web Vitest shard 5 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=5/32
-      - name: Run Web Vitest shard 6 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=6/32
-      - name: Run Web Vitest shard 7 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=7/32
-      - name: Run Web Vitest shard 8 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=8/32
-      - name: Run Web Vitest shard 9 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=9/32
-      - name: Run Web Vitest shard 10 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=10/32
-      - name: Run Web Vitest shard 11 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=11/32
-      - name: Run Web Vitest shard 12 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=12/32
-      - name: Run Web Vitest shard 13 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=13/32
-      - name: Run Web Vitest shard 14 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=14/32
-      - name: Run Web Vitest shard 15 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=15/32
-      - name: Run Web Vitest shard 16 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=16/32
-      - name: Run Web Vitest shard 17 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=17/32
-      - name: Run Web Vitest shard 18 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=18/32
-      - name: Run Web Vitest shard 19 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=19/32
-      - name: Run Web Vitest shard 20 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=20/32
-      - name: Run Web Vitest shard 21 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=21/32
-      - name: Run Web Vitest shard 22 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=22/32
-      - name: Run Web Vitest shard 23 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=23/32
-      - name: Run Web Vitest shard 24 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=24/32
-      - name: Run Web Vitest shard 25 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=25/32
-      - name: Run Web Vitest shard 26 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=26/32
-      - name: Run Web Vitest shard 27 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=27/32
-      - name: Run Web Vitest shard 28 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=28/32
-      - name: Run Web Vitest shard 29 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=29/32
-      - name: Run Web Vitest shard 30 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=30/32
-      - name: Run Web Vitest shard 31 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=31/32
-      - name: Run Web Vitest shard 32 of 32
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=32/32
+      - name: Run Web Vitest shards (64 sequential)
+        shell: bash
+        run: |
+          for shard in {1..64}; do
+            echo "Running Web Vitest shard ${shard}/64"
+            pnpm --filter @jobcopilot/web exec vitest run --shard="${shard}/64"
+          done
       - name: Run best-effort Playwright tests
         run: pnpm exec playwright test || true
   agent-runtime-postgres:
