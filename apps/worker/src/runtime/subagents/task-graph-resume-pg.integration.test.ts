@@ -155,7 +155,11 @@ type FailureDiagnosticField = { label: string; value: string }
 type RootModelFailureStage =
   | "not_started"
   | "initial_plan_tool"
-  | "initial_wait_ids_alignment"
+  | "initial_wait_plan_receipt"
+  | "initial_wait_plan_uniqueness"
+  | "initial_wait_graph_count"
+  | "initial_wait_graph_uniqueness"
+  | "initial_wait_plan_graph_set_mismatch"
   | "initial_wait_tool"
   | "unexpected_root_model_round"
   | "resumed_graph_kind"
@@ -1687,17 +1691,28 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             if (execution === 1 && modelRounds === 2) {
               rootModelFailureStage = "initial_wait_tool"
               expect(request.tools.map(tool => record(tool)?.name)).toContain("agent.wait")
+              rootModelFailureStage = "initial_wait_plan_receipt"
               const plannedTaskIds = planTaskIds(request, PLAN_CALL_ID, 4)
               const graph = currentGraphFromRequest(request)
               const graphNodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
               const graphTaskIds = graphNodes.flatMap(node => typeof node?.taskId === "string" ? [node.taskId] : [])
               const plannedIdSet = new Set(plannedTaskIds)
               const graphIdSet = new Set(graphTaskIds)
-              rootModelFailureStage = "initial_wait_ids_alignment"
-              if (plannedTaskIds.length !== 4 || plannedIdSet.size !== 4
-                || graphTaskIds.length !== 4 || graphIdSet.size !== 4
-                || plannedIdSet.size !== graphIdSet.size
+              if (plannedIdSet.size !== 4) {
+                rootModelFailureStage = "initial_wait_plan_uniqueness"
+                throw new Error("p3_task_graph_wait_ids_mismatch")
+              }
+              if (graphTaskIds.length !== 4) {
+                rootModelFailureStage = "initial_wait_graph_count"
+                throw new Error("p3_task_graph_wait_ids_mismatch")
+              }
+              if (graphIdSet.size !== 4) {
+                rootModelFailureStage = "initial_wait_graph_uniqueness"
+                throw new Error("p3_task_graph_wait_ids_mismatch")
+              }
+              if (plannedIdSet.size !== graphIdSet.size
                 || [...plannedIdSet].some(taskId => !graphIdSet.has(taskId))) {
+                rootModelFailureStage = "initial_wait_plan_graph_set_mismatch"
                 throw new Error("p3_task_graph_wait_ids_mismatch")
               }
               rootModelFailureStage = "initial_wait_tool"
