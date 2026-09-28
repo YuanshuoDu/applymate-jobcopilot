@@ -212,6 +212,24 @@ const TASK_GRAPH_DIAGNOSTIC_NODE_KEYS = new Set([
 const TASK_DIAGNOSTIC_STATUSES = new Set([
   "queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed",
 ])
+const PROCESS_FIXTURE_TURN_STATUSES = new Set([...TURN_DIAGNOSTIC_STATUSES, "none", "other"])
+const PROCESS_FIXTURE_TASK_STATUSES = new Set([...TASK_DIAGNOSTIC_STATUSES, "none", "other"])
+const PROCESS_FIXTURE_STEP_STATUSES = new Set([
+  "completed", "failed", "interrupted", "waiting_for_tool", "waiting_for_approval", "waiting_for_user", "none", "other",
+])
+const PROCESS_FIXTURE_TOOL_STATUSES = new Set([...ITEM_DIAGNOSTIC_STATUSES, "interrupted", "none", "other"])
+const PROCESS_FIXTURE_WAIT_OUTPUT_STATUSES = new Set(["waiting", "ready", "timed_out", "none", "other"])
+const PROCESS_FIXTURE_FAILURE_CATEGORIES = new Set([
+  "none", "other", "tool_result_missing", "database_deadlock", "database_serialization", "database_lock_wait",
+  "coordination_invalid_input", "coordination_task_not_found", "coordination_scope_error",
+  "coordination_wait_unavailable", "wait_handoff_state", "turn_lease_state", "generic_tool_execution_failed",
+])
+const PROCESS_FIXTURE_CAUSES = new Set([
+  "turn_missing", "model_never_ran", "plan_not_called", "plan_failed_or_incomplete", "graph_shape_mismatch",
+  "wait_call_missing", "wait_result_missing_or_unknown", "wait_target_ids_unreadable", "requested_ids_not_in_graph",
+  "requested_graph_tasks_missing_child_rows", "wait_tool_failed_before_wait_persistence",
+  "wait_row_missing_or_parent_mismatch", "turn_failed", "wait_row_not_suspended", "suspension_predicate_not_met",
+])
 
 function diagnosticText(value: unknown, maxCharacters = 64): string | null {
   return typeof value === "string" ? boundedDiagnostic(value, maxCharacters) : null
@@ -241,6 +259,22 @@ function diagnosticCount(value: unknown): number | null {
   } catch {
     return null
   }
+}
+
+function diagnosticBoundedCount(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= 10_000 ? value : null
+}
+
+function diagnosticStatusCounts(value: unknown): RecordValue {
+  const counts = record(value)
+  if (!counts) return {}
+  const projected: RecordValue = {}
+  for (const [status, count] of Object.entries(counts).slice(0, 10)) {
+    const safeStatus = diagnosticEnum(status, TASK_DIAGNOSTIC_STATUSES)
+    const safeCount = diagnosticBoundedCount(count)
+    if (safeStatus && safeCount !== null) projected[safeStatus] = safeCount
+  }
+  return projected
 }
 
 type DiagnosticIdList = { values: string[]; count: number | null; valid: boolean }
@@ -619,9 +653,85 @@ function startTaskGraphRestartWorker(mode: "park-parent" | "resume-parent", valu
   return child
 }
 
+function processFixtureDiagnosticProjection(value: unknown): RecordValue | null {
+  const source = record(value)
+  if (!source) return null
+
+  const projected: RecordValue = {}
+  const projectEnum = (key: string, allowed: ReadonlySet<string>) => {
+    const safeValue = diagnosticEnum(source[key], allowed)
+    if (safeValue !== null) projected[key] = safeValue
+  }
+  const projectCount = (key: string) => {
+    const safeValue = diagnosticBoundedCount(source[key])
+    if (safeValue !== null) projected[key] = safeValue
+  }
+  const projectCountRecord = (key: string, fields: readonly string[]) => {
+    const input = record(source[key])
+    if (!input) return
+    const counts: RecordValue = {}
+    for (const field of fields) {
+      const safeValue = diagnosticBoundedCount(input[field])
+      if (safeValue !== null) counts[field] = safeValue
+    }
+    if (Object.keys(counts).length > 0) projected[key] = counts
+  }
+  const projectNodeKeys = (key: string, fields: readonly string[]) => {
+    const input = record(source[key])
+    if (!input) return
+    const nodeKeys: RecordValue = {}
+    for (const field of fields) {
+      const safeValues = diagnosticEnumList(input[field], TASK_GRAPH_DIAGNOSTIC_NODE_KEYS)
+      if (safeValues.length > 0) nodeKeys[field] = safeValues
+    }
+    if (Object.keys(nodeKeys).length > 0) projected[key] = nodeKeys
+  }
+
+  projectEnum("turnStatus", PROCESS_FIXTURE_TURN_STATUSES)
+  projectEnum("rootTaskStatus", PROCESS_FIXTURE_TASK_STATUSES)
+  projectEnum("latestModelStepStatus", PROCESS_FIXTURE_STEP_STATUSES)
+  projectEnum("latestModelStepErrorClass", PROCESS_FIXTURE_FAILURE_CATEGORIES)
+  projectEnum("turnErrorCategory", PROCESS_FIXTURE_FAILURE_CATEGORIES)
+  projectEnum("waitToolCallStatus", PROCESS_FIXTURE_TOOL_STATUSES)
+  projectEnum("waitToolCallLifecycleStatus", PROCESS_FIXTURE_TOOL_STATUSES)
+  if (typeof source.planAccepted === "boolean") projected.planAccepted = source.planAccepted
+  projectEnum("waitToolResultLifecycleStatus", PROCESS_FIXTURE_TOOL_STATUSES)
+  projectEnum("waitToolOutputStatus", PROCESS_FIXTURE_WAIT_OUTPUT_STATUSES)
+  projectEnum("waitFailureCategory", PROCESS_FIXTURE_FAILURE_CATEGORIES)
+  projectEnum("likelyCause", PROCESS_FIXTURE_CAUSES)
+
+  projectCount("graphNodeCount")
+  projectCountRecord("waits", ["count", "rootCount", "suspendedRootCount"])
+  projectCountRecord("targetCounts", ["requested", "graphMatches", "taskRows", "graphRows"])
+  projectNodeKeys("missingKeys", ["requestedGraph", "graphTasks"])
+
+  const childStatusCounts = diagnosticStatusCounts(source.childStatusCounts)
+  if (Object.keys(childStatusCounts).length > 0) projected.childStatusCounts = childStatusCounts
+  return projected
+}
+
 function processFixtureDiagnostics(child: ProcessFixtureChild): string {
-  return boundedDiagnostic("pid=" + child.pid + " exitCode=" + child.exitCode + " signalCode=" + child.signalCode
-    + " stdout=" + child.output.join(" | ") + " stderr=" + child.errors.join(" | "), 900)
+  const prefix = "P3_PARENT_SUSPENSION_DIAGNOSTICS "
+  const processState = "pid=" + (Number.isSafeInteger(child.pid) ? child.pid : "unavailable")
+    + " exitCode=" + (child.exitCode === null ? "null"
+      : typeof child.exitCode === "number" && Number.isInteger(child.exitCode) ? child.exitCode : "unavailable")
+    + " signal=" + (child.signalCode === null ? "none" : "received")
+    + " stdoutLineCount=" + child.output.length + " stderrLineCount=" + child.errors.length
+  let safeLine: string | null = null
+  for (const line of child.output) {
+    if (!line.startsWith(prefix)) continue
+    try {
+      const projected = processFixtureDiagnosticProjection(JSON.parse(line.slice(prefix.length)) as unknown)
+      if (projected) {
+        safeLine = prefix + JSON.stringify(projected)
+        break
+      }
+    } catch {
+      // Ignore malformed fixture diagnostics and keep looking for a valid line.
+    }
+  }
+  const diagnostic = processState + (safeLine ? " " + safeLine : " fixtureDiagnostics=unavailable")
+  return boundedDiagnostic(diagnostic, 1_600)
 }
 
 async function waitForProcessLine(child: ProcessFixtureChild, prefix: string, timeoutMs = 20_000): Promise<string> {
@@ -1072,6 +1182,94 @@ async function restartFollowUpWaitDiagnostics(
 }
 
 describe("compact TaskGraph wait failure diagnostics", () => {
+  it("keeps the safe process diagnostics line without raw stdout or stderr", () => {
+    const prefix = "P3_PARENT_SUSPENSION_DIAGNOSTICS "
+    const safeLine = prefix + JSON.stringify({
+      graphNodeCount: 2, missingKeys: { graphTasks: ["summary"] },
+      likelyCause: "wait_row_missing_or_parent_mismatch",
+    })
+    const child = {
+      pid: 42, exitCode: null, signalCode: null,
+      output: ["marker-arbitrary-stdout", safeLine], errors: ["marker-raw-stderr"],
+    } as unknown as ProcessFixtureChild
+
+    const output = processFixtureDiagnostics(child)
+
+    expect(output).toContain("pid=42 exitCode=null signal=none stdoutLineCount=2 stderrLineCount=1")
+    expect(output.slice(output.indexOf(prefix) + prefix.length)).toBe(JSON.stringify({
+      likelyCause: "wait_row_missing_or_parent_mismatch", graphNodeCount: 2,
+      missingKeys: { graphTasks: ["summary"] },
+    }))
+    expect(output).not.toContain("marker-arbitrary-stdout")
+    expect(output).not.toContain("marker-raw-stderr")
+    expect(output.length).toBeLessThanOrEqual(1_600)
+  })
+
+  it("keeps safe statuses and counts while dropping markers from allowed-shaped and unknown fields", () => {
+    const markers = ["marker-task-id", "marker-raw-error", "marker-nested-error", "marker-extra-id"]
+    const safeLine = "P3_PARENT_SUSPENSION_DIAGNOSTICS " + JSON.stringify({
+      turnStatus: "failed", rootTaskStatus: "running", latestModelStepStatus: "failed",
+      latestModelStepErrorClass: markers[1], turnErrorCategory: "database_deadlock",
+      waitToolCallStatus: "completed", waitToolCallLifecycleStatus: "started",
+      planAccepted: true,
+      waitToolResultLifecycleStatus: "completed",
+      waitToolOutputStatus: "ready", waitFailureCategory: "database_serialization",
+      waits: { count: 3, rootCount: 1, suspendedRootCount: 1, markerExtra: markers[2] },
+      graphNodeCount: 2,
+      targetCounts: { requested: 2, graphMatches: 2, taskRows: 2, graphRows: 2, markerExtra: markers[3] },
+      missingKeys: { requestedGraph: ["source", markers[0]], graphTasks: ["summary"] },
+      childStatusCounts: { failed: 1, completed: 2, [markers[0]]: 9 },
+      likelyCause: "wait_row_missing_or_parent_mismatch",
+      unknownNested: { id: markers[3], error: markers[2], deep: { raw: markers[1] } },
+    })
+    const child = {
+      pid: 42, exitCode: null, signalCode: null, output: [safeLine], errors: [],
+    } as unknown as ProcessFixtureChild
+
+    const output = processFixtureDiagnostics(child)
+    const projected = JSON.parse(output.slice(output.indexOf("P3_PARENT_SUSPENSION_DIAGNOSTICS ")
+      + "P3_PARENT_SUSPENSION_DIAGNOSTICS ".length)) as RecordValue
+
+    expect(projected).toMatchObject({
+      turnStatus: "failed", rootTaskStatus: "running", latestModelStepStatus: "failed",
+      turnErrorCategory: "database_deadlock", waitToolCallStatus: "completed",
+      planAccepted: true,
+      waitToolCallLifecycleStatus: "started",
+      waitToolResultLifecycleStatus: "completed", waitToolOutputStatus: "ready",
+      waitFailureCategory: "database_serialization", waits: { count: 3, rootCount: 1, suspendedRootCount: 1 },
+      graphNodeCount: 2, targetCounts: { requested: 2, graphMatches: 2, taskRows: 2, graphRows: 2 },
+      missingKeys: { requestedGraph: ["source"], graphTasks: ["summary"] },
+      childStatusCounts: { failed: 1, completed: 2 },
+      likelyCause: "wait_row_missing_or_parent_mismatch",
+    })
+    expect(projected).not.toHaveProperty("latestModelStepErrorClass")
+    expect(projected).not.toHaveProperty("unknownNested")
+    expect(markers.some(marker => output.includes(marker)), "diagnostic output must omit marker values").toBe(false)
+    expect(output.length).toBeLessThanOrEqual(1_600)
+  })
+
+  it("discards a long unknown JSON payload while keeping bounded safe diagnostics", () => {
+    const longPayload = "marker-long-nested-payload-" + "x".repeat(1_700)
+    const safeLine = "P3_PARENT_SUSPENSION_DIAGNOSTICS " + JSON.stringify({
+      turnStatus: "failed", graphNodeCount: 2, likelyCause: "turn_failed",
+      unknownNested: { payload: longPayload },
+    })
+    const child = {
+      pid: 42, exitCode: null, signalCode: null,
+      output: [safeLine, "marker-arbitrary-stdout"], errors: ["marker-raw-stderr"],
+    } as unknown as ProcessFixtureChild
+
+    const output = processFixtureDiagnostics(child)
+
+    expect(output).toContain('"turnStatus":"failed"')
+    expect(output).toContain('"graphNodeCount":2')
+    expect(output).toContain('"likelyCause":"turn_failed"')
+    expect(output).not.toContain(longPayload)
+    expect(output).not.toContain("marker-arbitrary-stdout")
+    expect(output).not.toContain("marker-raw-stderr")
+    expect(output.length).toBeLessThanOrEqual(1_600)
+  })
+
   it("redacts identifiers and arbitrary text while retaining safe status and counts", () => {
     const markers = [
       "marker-turn-id", "marker-session-id", "marker-task-id", "marker-wait-id", "marker-user-id",

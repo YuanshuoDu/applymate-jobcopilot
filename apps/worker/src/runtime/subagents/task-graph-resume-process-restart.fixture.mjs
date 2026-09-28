@@ -10,6 +10,20 @@ import { parsePlanLedger, projectPlanLedger } from "@jobcopilot/agent-protocol"
 const [, , mode, rawIds] = process.argv, ids = JSON.parse(rawIds)
 const sourceGoal = "Read the durable TaskGraph source", dependentGoal = "Summarize the restored TaskGraph source"
 const followUpGoal = "Verify the restored TaskGraph summary after restart", followUpKey = "verification"
+const TASK_GRAPH_KEY_ALLOWLIST = new Set(["source", "summary", followUpKey])
+const TURN_STATUS_ALLOWLIST = new Set(["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user", "completed", "interrupted", "failed", "cancelled"])
+const STEP_STATUS_ALLOWLIST = new Set(["completed", "failed", "interrupted", "waiting_for_tool", "waiting_for_approval", "waiting_for_user"])
+const ROOT_TASK_STATUS_ALLOWLIST = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
+const ITEM_LIFECYCLE_STATUS_ALLOWLIST = new Set(["started", "completed", "failed", "cancelled"])
+const TOOL_CALL_STATUS_ALLOWLIST = new Set(["started", "completed", "failed", "interrupted"])
+const WAIT_OUTPUT_STATUS_ALLOWLIST = new Set(["waiting", "ready", "timed_out"])
+const STEP_ERROR_CLASS_BY_CODE = new Map([
+  ["40p01", "database_deadlock"], ["40001", "database_serialization"], ["55p03", "database_lock_wait"],
+  ["coordination_invalid_input", "coordination_invalid_input"], ["coordination_task_not_found", "coordination_task_not_found"],
+  ["coordination_scope_error", "coordination_scope_error"], ["coordination_wait_unavailable", "coordination_wait_unavailable"],
+  ["wait_invalid", "wait_handoff_state"], ["wait_scope_error", "wait_handoff_state"], ["lease_lost", "turn_lease_state"],
+  ["tool_execution_failed", "generic_tool_execution_failed"],
+])
 const resultMarker = "p3-process-restart-source-result", finalMarker = "p3-process-restart-parent-resumed-after-follow-up"
 const planCallId = "p3-process-restart-plan", waitCallId = "p3-process-restart-wait"
 const followUpPlanCallId = "p3-process-restart-follow-up-plan", followUpWaitCallId = "p3-process-restart-follow-up-wait"
@@ -40,14 +54,83 @@ function waitForCommand(command) {
 }
 function record(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : null }
 function turnErrorCategory(value) {
-  if (typeof value !== "string" || value.trim().length === 0) return "none"
-  const normalized = value.toLowerCase()
+  if (typeof value !== "string") return "none"
+  const prefix = value.slice(0, 2_000)
+  if (prefix.trim().length === 0) return "none"
+  const normalized = prefix.toLowerCase()
   if (/\b40p01\b|deadlock detected|deadlock found/.test(normalized)) return "database_deadlock"
   if (/\b40001\b|serialization failure/.test(normalized)) return "database_serialization"
   if (/\b55p03\b|\block_not_available\b|lock timeout/.test(normalized)) return "database_lock_wait"
   if (/\bwait_(?:invalid|scope_error)\b|durablewaithandofferror/.test(normalized)) return "wait_handoff_state"
   if (/\blease_lost\b|turnleaseerror/.test(normalized)) return "turn_lease_state"
   return "other"
+}
+function modelStepErrorClass(value) {
+  if (typeof value !== "string") return "none"
+  const code = value.slice(0, 2_000).trim().toLowerCase()
+  return code.length === 0 ? "none" : STEP_ERROR_CLASS_BY_CODE.get(code) ?? "other"
+}
+function fixedEnum(value, allowlist) {
+  return value === null || value === undefined ? "none" : typeof value === "string" && allowlist.has(value) ? value : "other"
+}
+function waitFailureCategory(tool) {
+  if (!tool.hasWaitToolCall) return "none"
+  const errorClass = modelStepErrorClass(tool.waitToolErrorCode ?? tool.waitToolCallErrorCode)
+  if (errorClass !== "none") return errorClass
+  if (tool.waitToolCallStatus === "failed") return "generic_tool_execution_failed"
+  return tool.hasWaitToolResult ? "none" : "tool_result_missing"
+}
+function taskStatusCounts(rows) {
+  return rows.reduce((counts, row) => {
+    const status = fixedEnum(row.status, ROOT_TASK_STATUS_ALLOWLIST)
+    const key = status === "none" ? "other" : status
+    counts[key] = (counts[key] ?? 0) + Number(row.count)
+    return counts
+  }, {})
+}
+function parentSuspensionProjection(snapshot) {
+  if (!snapshot || !Array.isArray(snapshot.waits)) return { diagnosticsAvailable: false }
+  const matchedWaits = snapshot.waits.filter(wait => wait.matchesLatestWaitToolCall)
+  const rootWaits = matchedWaits.filter(wait => wait.parentMatchesRoot)
+  return {
+    turnStatus: fixedEnum(snapshot.turnStatus, TURN_STATUS_ALLOWLIST),
+    rootTaskStatus: snapshot.rootTaskStatus,
+    latestModelStepStatus: fixedEnum(snapshot.latestModelStep?.status, STEP_STATUS_ALLOWLIST),
+    latestModelStepErrorClass: snapshot.latestModelStep?.errorClass ?? "none",
+    turnErrorCategory: snapshot.turnErrorCategory ?? "none",
+    planAccepted: snapshot.planReceiptStatuses.some(status => status === "accepted" || status === "duplicate"),
+    waitToolCallStatus: snapshot.waitToolCallStatus,
+    waitToolCallLifecycleStatus: fixedEnum(snapshot.waitToolCallLifecycleStatus, ITEM_LIFECYCLE_STATUS_ALLOWLIST),
+    waitToolResultLifecycleStatus: fixedEnum(snapshot.waitToolResultLifecycleStatus, ITEM_LIFECYCLE_STATUS_ALLOWLIST),
+    waitToolOutputStatus: snapshot.waitToolOutputStatus,
+    waitFailureCategory: snapshot.waitFailureCategory,
+    waits: {
+      count: snapshot.waits.length,
+      rootCount: rootWaits.length,
+      suspendedRootCount: rootWaits.filter(wait => wait.status === "waiting" && wait.hasSuspendedAt).length,
+    },
+    waitCallIdempotencyKeyPresent: snapshot.waitCallIdempotencyKeyPresent,
+    graphNodeCount: snapshot.graph.nodeCount,
+    targetCounts: {
+      requested: snapshot.requestedTaskCount,
+      graphMatches: snapshot.requestedGraphMatchCount,
+      taskRows: snapshot.requestedTaskRowMatchCount,
+      graphRows: snapshot.graphTaskRowMatchCount,
+    },
+    missingKeys: {
+      requestedGraph: snapshot.missingRequestedGraphTaskKeys,
+      graphTasks: snapshot.missingGraphTaskKeys,
+    },
+    childStatusCounts: snapshot.childStatusCounts,
+    likelyCause: snapshot.likelyCause,
+  }
+}
+function stringArray(value) {
+  let parsed = value
+  if (typeof value === "string") {
+    try { parsed = JSON.parse(value) } catch { return null }
+  }
+  return Array.isArray(parsed) && parsed.every(item => typeof item === "string") ? parsed : null
 }
 function isExpectedSourceProjection(value) {
   const projection = record(value), candidates = Array.isArray(projection?.candidates) ? projection.candidates.map(record) : [], candidate = candidates[0]
@@ -142,53 +225,80 @@ function assertFollowUpGraph(request) {
   return { revision: graph.revision, taskId: followUp.taskId }
 }
 async function waitForParentSuspended(ownerId, timeoutMs = 20_000) {
+  const waitIdempotencyKey = waitArgs("p3-process-restart-wait", []).idempotencyKey
   const deadline = Date.now() + timeoutMs; while (Date.now() < deadline) {
     const result = await pool.query(`SELECT turn."status" AS "turnStatus", wait."status" AS "waitStatus", wait."suspendedAt", item."revision", item."content"
       FROM "agent_turns" AS turn JOIN "agent_wait_conditions" AS wait ON wait."turnId" = turn."id"
       JOIN "agent_items" AS item ON item."turnId" = turn."id" AND item."type" = 'task_graph'
-      WHERE turn."id" = $1 AND wait."parentTaskId" = turn."rootTaskId" ORDER BY wait."createdAt" DESC LIMIT 1`, [ids.turnId])
+      WHERE turn."id" = $1 AND wait."parentTaskId" = turn."rootTaskId" AND wait."idempotencyKey" = $2
+      ORDER BY wait."createdAt" DESC LIMIT 1`, [ids.turnId, waitIdempotencyKey])
     const row = result.rows[0], content = record(row?.content)
     if (row?.turnStatus === "waiting_for_dependency" && row?.waitStatus === "waiting" && row.suspendedAt && Number(row.revision) > 0 && Array.isArray(content?.nodes) && content.nodes.length === 2) { say("P3_PARENT_SUSPENDED " + JSON.stringify({ ownerId, revision: Number(row.revision), snapshot: content })); return }
     await sleep(20)
   }
-  say("P3_PARENT_SUSPENSION_DIAGNOSTICS " + JSON.stringify(await parentSuspensionDiagnostics()))
+  say("P3_PARENT_SUSPENSION_DIAGNOSTICS " + JSON.stringify(parentSuspensionProjection(await parentSuspensionDiagnostics())))
   throw new Error("p3_parent_wait_not_suspended")
 }
 async function parentSuspensionDiagnostics() {
   try {
-    const [turnResult, stepResult, toolResult, waitResult, graphResult, childResult] = await Promise.all([
+    const [turnResult, stepResult, toolResult, waitResult, graphResult, childResult, taskRowResult] = await Promise.all([
       pool.query(`SELECT turn."status" AS "turnStatus", turn."rootTaskId" IS NOT NULL AS "hasRootTask",
-          turn."startedAt" IS NOT NULL AS "hasStartedAt", turn."error" AS "turnError"
-        FROM "agent_turns" AS turn WHERE turn."id" = $1`, [ids.turnId]),
-      pool.query(`SELECT step."ordinal", step."status", step."errorCode" IS NOT NULL AS "hasErrorCode" FROM "agent_steps" AS step
+          root."status" AS "rootTaskStatus", turn."startedAt" IS NOT NULL AS "hasStartedAt", turn."error" AS "turnError"
+        FROM "agent_turns" AS turn LEFT JOIN "sub_agent_tasks" AS root
+          ON root."id" = turn."rootTaskId" AND root."sessionId" = turn."sessionId" AND root."turnId" = turn."id"
+        WHERE turn."id" = $1`, [ids.turnId]),
+      pool.query(`SELECT step."ordinal", step."status", step."errorCode" FROM "agent_steps" AS step
         JOIN "agent_turns" AS turn ON turn."id" = step."turnId"
         WHERE turn."id" = $1 AND (step."taskId" IS NULL OR step."taskId" = turn."rootTaskId")
         ORDER BY step."ordinal"`, [ids.turnId]),
       pool.query(`WITH target_turn AS (
           SELECT "id", "sessionId", "rootTaskId" FROM "agent_turns" WHERE "id" = $1
         ), parent_items AS (
-          SELECT item."type", item."status", item."content"->>'toolName' AS "toolName",
+          SELECT item."type", item."status" AS "lifecycleStatus", item."content"->>'toolName' AS "toolName",
             item."content"->>'toolCallId' AS "toolCallId",
+            item."content"->>'errorCode' AS "errorCode",
+            item."content"->>'status' AS "toolOutcomeStatus",
+            item."content"->'input'->'taskIds' AS "inputTaskIds",
+            item."content"->'input'->>'idempotencyKey' AS "waitIdempotencyKey",
+            item."createdAt" AS "createdAt",
+            item."content"->'output'->>'status' AS "outputStatus",
             item."content"->'output'->>'status' AS "planReceiptStatus"
           FROM "agent_items" AS item JOIN target_turn AS turn ON turn."id" = item."turnId"
           WHERE item."sessionId" = turn."sessionId" AND (item."taskId" IS NULL OR item."taskId" = turn."rootTaskId")
             AND item."type" IN ('tool_call', 'tool_result')
+        ), latest_wait_call AS (
+          SELECT * FROM parent_items WHERE "type" = 'tool_call' AND "toolName" = 'agent.wait'
+          ORDER BY "createdAt" DESC LIMIT 1
         )
         SELECT EXISTS (SELECT 1 FROM parent_items WHERE "type" = 'tool_call' AND "toolName" = 'agent.plan') AS "hasPlanToolCall",
           EXISTS (SELECT 1 FROM parent_items AS call JOIN parent_items AS result ON result."toolCallId" = call."toolCallId"
             WHERE call."type" = 'tool_call' AND call."toolName" = 'agent.plan' AND result."type" = 'tool_result') AS "hasPlanToolResult",
           EXISTS (SELECT 1 FROM parent_items AS call JOIN parent_items AS result ON result."toolCallId" = call."toolCallId"
-            WHERE call."type" = 'tool_call' AND call."toolName" = 'agent.plan' AND result."type" = 'tool_result' AND result."status" = 'failed') AS "hasFailedPlanToolResult",
+            WHERE call."type" = 'tool_call' AND call."toolName" = 'agent.plan' AND result."type" = 'tool_result'
+              AND (call."toolOutcomeStatus" = 'failed' OR call."errorCode" IS NOT NULL OR result."errorCode" IS NOT NULL)) AS "hasFailedPlanToolResult",
           ARRAY(SELECT result."planReceiptStatus" FROM parent_items AS call JOIN parent_items AS result ON result."toolCallId" = call."toolCallId"
             WHERE call."type" = 'tool_call' AND call."toolName" = 'agent.plan' AND result."type" = 'tool_result'
               AND result."planReceiptStatus" IN ('accepted', 'duplicate', 'rejected')
             ORDER BY result."planReceiptStatus") AS "planReceiptStatuses",
-          EXISTS (SELECT 1 FROM parent_items WHERE "type" = 'tool_call' AND "toolName" = 'agent.wait') AS "hasWaitToolCall"`, [ids.turnId]),
-      pool.query(`SELECT wait."status" AS "waitStatus", wait."parentTaskId" = turn."rootTaskId" AS "parentMatchesRoot",
+          EXISTS (SELECT 1 FROM latest_wait_call) AS "hasWaitToolCall",
+          EXISTS (SELECT 1 FROM latest_wait_call AS call JOIN parent_items AS result ON result."toolCallId" = call."toolCallId"
+            WHERE result."type" = 'tool_result') AS "hasWaitToolResult",
+          (SELECT call."toolOutcomeStatus" FROM latest_wait_call AS call) AS "waitToolCallStatus",
+          (SELECT call."lifecycleStatus" FROM latest_wait_call AS call) AS "waitToolCallLifecycleStatus",
+          (SELECT call."waitIdempotencyKey" FROM latest_wait_call AS call) AS "waitCallIdempotencyKey",
+          (SELECT call."inputTaskIds" FROM latest_wait_call AS call) AS "waitCallTaskIds",
+          (SELECT result."lifecycleStatus" FROM latest_wait_call AS call JOIN parent_items AS result ON result."toolCallId" = call."toolCallId"
+            WHERE result."type" = 'tool_result' ORDER BY result."createdAt" DESC LIMIT 1) AS "waitToolResultLifecycleStatus",
+          (SELECT result."outputStatus" FROM latest_wait_call AS call JOIN parent_items AS result ON result."toolCallId" = call."toolCallId"
+            WHERE result."type" = 'tool_result' ORDER BY result."createdAt" DESC LIMIT 1) AS "waitToolOutputStatus",
+          (SELECT result."errorCode" FROM latest_wait_call AS call JOIN parent_items AS result ON result."toolCallId" = call."toolCallId"
+            WHERE result."type" = 'tool_result' ORDER BY result."createdAt" DESC LIMIT 1) AS "waitToolErrorCode",
+          (SELECT call."errorCode" FROM latest_wait_call AS call) AS "waitToolCallErrorCode"`, [ids.turnId]),
+      pool.query(`SELECT wait."idempotencyKey" AS "waitIdempotencyKey", wait."status" AS "waitStatus", wait."targetTaskIds", wait."parentTaskId" = turn."rootTaskId" AS "parentMatchesRoot",
           wait."suspendedAt" IS NOT NULL AS "hasSuspendedAt"
         FROM "agent_wait_conditions" AS wait JOIN "agent_turns" AS turn ON turn."id" = wait."turnId"
         WHERE turn."id" = $1`, [ids.turnId]),
-      pool.query(`SELECT item."revision", jsonb_typeof(item."content"->'nodes') = 'array' AS "hasNodeArray",
+      pool.query(`SELECT item."revision", item."content"->'nodes' AS "nodes", jsonb_typeof(item."content"->'nodes') = 'array' AS "hasNodeArray",
           CASE WHEN jsonb_typeof(item."content"->'nodes') = 'array' THEN jsonb_array_length(item."content"->'nodes') ELSE NULL END AS "nodeCount"
         FROM "agent_items" AS item JOIN "agent_turns" AS turn ON turn."id" = item."turnId"
         WHERE turn."id" = $1 AND item."sessionId" = turn."sessionId" AND item."taskId" = turn."rootTaskId"
@@ -197,47 +307,101 @@ async function parentSuspensionDiagnostics() {
         FROM "sub_agent_tasks" AS child JOIN "agent_turns" AS turn
           ON turn."id" = child."turnId" AND turn."sessionId" = child."sessionId" AND turn."rootTaskId" = child."parentTaskId"
         WHERE turn."id" = $1 GROUP BY child."status"`, [ids.turnId]),
+      pool.query(`SELECT child."id" FROM "sub_agent_tasks" AS child JOIN "agent_turns" AS turn
+        ON turn."id" = child."turnId" AND turn."sessionId" = child."sessionId" AND turn."rootTaskId" = child."parentTaskId"
+        WHERE turn."id" = $1`, [ids.turnId]),
     ])
     const turn = turnResult.rows[0]
     const graph = graphResult.rows[0]
     const tool = toolResult.rows[0] ?? {}
+    const graphNodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+    const graphTaskIds = graphNodes.map(node => node?.taskId).filter(taskId => typeof taskId === "string")
+    const taskIds = taskRowResult.rows.map(row => row.id).filter(taskId => typeof taskId === "string")
+    const requestedTaskIds = stringArray(tool.waitCallTaskIds)
+    const matchingWait = waitResult.rows.find(row => row.parentMatchesRoot
+      && typeof tool.waitCallIdempotencyKey === "string" && row.waitIdempotencyKey === tool.waitCallIdempotencyKey)
+    const persistedWaitTaskIds = stringArray(matchingWait?.targetTaskIds)
+    const latestStep = stepResult.rows[stepResult.rows.length - 1]
+    const taskIdSet = new Set(taskIds)
+    const graphTaskIdSet = new Set(graphTaskIds)
+    const missingGraphTaskKeys = graphNodes.flatMap(node => {
+      const key = typeof node?.key === "string" ? node.key : null
+      return key && TASK_GRAPH_KEY_ALLOWLIST.has(key)
+        && (typeof node.taskId !== "string" || !taskIdSet.has(node.taskId)) ? [key] : []
+    })
+    const missingRequestedGraphTaskKeys = requestedTaskIds ? graphNodes.flatMap(node => {
+      const key = typeof node?.key === "string" ? node.key : null
+      return key && TASK_GRAPH_KEY_ALLOWLIST.has(key)
+        && (typeof node.taskId !== "string" || !requestedTaskIds.includes(node.taskId)) ? [key] : []
+    }) : []
     const snapshot = {
       turnStatus: turn?.turnStatus ?? null,
       hasTurn: Boolean(turn),
       hasRootTask: Boolean(turn?.hasRootTask),
+      rootTaskStatus: fixedEnum(turn?.rootTaskStatus, ROOT_TASK_STATUS_ALLOWLIST),
       hasStartedAt: Boolean(turn?.hasStartedAt),
       hasError: typeof turn?.turnError === "string" && turn.turnError.length > 0,
       turnErrorCategory: turnErrorCategory(turn?.turnError),
       modelStepCount: stepResult.rows.length,
       latestModelStep: stepResult.rows.length ? {
-        ordinal: Number(stepResult.rows[stepResult.rows.length - 1].ordinal),
-        status: stepResult.rows[stepResult.rows.length - 1].status,
-        hasErrorCode: Boolean(stepResult.rows[stepResult.rows.length - 1].hasErrorCode),
+        ordinal: Number(latestStep.ordinal),
+        status: latestStep.status,
+        hasErrorCode: typeof latestStep.errorCode === "string" && latestStep.errorCode.length > 0,
+        errorClass: modelStepErrorClass(latestStep.errorCode),
       } : null,
       hasPlanToolCall: Boolean(tool.hasPlanToolCall),
       hasPlanToolResult: Boolean(tool.hasPlanToolResult),
       hasFailedPlanToolResult: Boolean(tool.hasFailedPlanToolResult),
       planReceiptStatuses: Array.isArray(tool.planReceiptStatuses) ? tool.planReceiptStatuses : [],
       hasWaitToolCall: Boolean(tool.hasWaitToolCall),
+      waitToolCallStatus: fixedEnum(tool.waitToolCallStatus, TOOL_CALL_STATUS_ALLOWLIST),
+      waitToolCallLifecycleStatus: fixedEnum(tool.waitToolCallLifecycleStatus, ITEM_LIFECYCLE_STATUS_ALLOWLIST),
+      waitToolResultLifecycleStatus: fixedEnum(tool.waitToolResultLifecycleStatus, ITEM_LIFECYCLE_STATUS_ALLOWLIST),
+      waitCallIdempotencyKeyPresent: typeof tool.waitCallIdempotencyKey === "string",
+      waitToolOutputStatus: fixedEnum(tool.waitToolOutputStatus, WAIT_OUTPUT_STATUS_ALLOWLIST),
+      waitFailureCategory: waitFailureCategory(tool),
       waits: waitResult.rows.map(row => ({
         status: row.waitStatus,
         parentMatchesRoot: Boolean(row.parentMatchesRoot),
         hasSuspendedAt: Boolean(row.hasSuspendedAt),
+        matchesLatestWaitToolCall: typeof tool.waitCallIdempotencyKey === "string"
+          && row.waitIdempotencyKey === tool.waitCallIdempotencyKey,
       })),
       graph: graph ? { present: true, revision: Number(graph.revision), hasNodeArray: Boolean(graph.hasNodeArray), nodeCount: graph.nodeCount === null ? null : Number(graph.nodeCount) }
         : { present: false, revision: null, hasNodeArray: false, nodeCount: null },
-      childStatusCounts: Object.fromEntries(childResult.rows.map(row => [row.status, Number(row.count)])),
+      graphTaskIdCount: graphNodes.filter(node => typeof node?.taskId === "string").length,
+      taskRowCount: taskIds.length,
+      requestedTaskCount: requestedTaskIds?.length ?? null,
+      requestedGraphMatchCount: requestedTaskIds?.filter(taskId => graphTaskIdSet.has(taskId)).length ?? null,
+      requestedTaskRowMatchCount: requestedTaskIds?.filter(taskId => taskIdSet.has(taskId)).length ?? null,
+      persistedWaitTaskCount: persistedWaitTaskIds?.length ?? null,
+      persistedWaitGraphMatchCount: persistedWaitTaskIds?.filter(taskId => graphTaskIdSet.has(taskId)).length ?? null,
+      persistedWaitTaskRowMatchCount: persistedWaitTaskIds?.filter(taskId => taskIdSet.has(taskId)).length ?? null,
+      graphTaskRowMatchCount: graphTaskIds.filter(taskId => taskIdSet.has(taskId)).length,
+      missingRequestedGraphTaskKeys: [...new Set(missingRequestedGraphTaskKeys)].sort(),
+      missingGraphTaskKeys: [...new Set(missingGraphTaskKeys)].sort(),
+      childStatusCounts: taskStatusCounts(childResult.rows),
     }
     snapshot.likelyCause = !snapshot.hasTurn ? "turn_missing"
-      : snapshot.turnStatus === "failed" ? "turn_failed"
       : snapshot.modelStepCount === 0 ? "model_never_ran"
       : !snapshot.hasPlanToolCall ? "plan_not_called"
       : snapshot.hasFailedPlanToolResult || !snapshot.hasPlanToolResult
         || !snapshot.planReceiptStatuses.some(status => status === "accepted" || status === "duplicate")
         || !snapshot.graph.present ? "plan_failed_or_incomplete"
-      : !snapshot.graph.hasNodeArray || snapshot.graph.nodeCount !== 2 ? "graph_shape_mismatch"
-      : !snapshot.hasWaitToolCall || !snapshot.waits.some(wait => wait.parentMatchesRoot) ? "wait_row_missing_or_parent_mismatch"
-      : !snapshot.waits.some(wait => wait.parentMatchesRoot && wait.status === "waiting" && wait.hasSuspendedAt) ? "wait_row_not_suspended"
+       : !snapshot.graph.hasNodeArray || snapshot.graph.nodeCount !== 2 ? "graph_shape_mismatch"
+        : !snapshot.hasWaitToolCall ? "wait_call_missing"
+        : !snapshot.hasWaitToolResult && snapshot.waitFailureCategory !== "none" && snapshot.waitFailureCategory !== "tool_result_missing"
+          ? "wait_tool_failed_before_wait_persistence"
+        : !snapshot.hasWaitToolResult ? "wait_result_missing_or_unknown"
+       : snapshot.requestedTaskCount === null ? "wait_target_ids_unreadable"
+      : snapshot.requestedGraphMatchCount !== snapshot.requestedTaskCount ? "requested_ids_not_in_graph"
+      : snapshot.requestedTaskRowMatchCount !== snapshot.requestedTaskCount ? "requested_graph_tasks_missing_child_rows"
+       : !snapshot.waits.some(wait => wait.parentMatchesRoot && wait.matchesLatestWaitToolCall)
+         && snapshot.waitFailureCategory !== "none" ? "wait_tool_failed_before_wait_persistence"
+       : !snapshot.waits.some(wait => wait.parentMatchesRoot && wait.matchesLatestWaitToolCall) ? "wait_row_missing_or_parent_mismatch"
+      : snapshot.turnStatus === "failed" ? "turn_failed"
+       : !snapshot.waits.some(wait => wait.parentMatchesRoot && wait.matchesLatestWaitToolCall
+         && wait.status === "waiting" && wait.hasSuspendedAt) ? "wait_row_not_suspended"
       : "suspension_predicate_not_met"
     return snapshot
   } catch {
