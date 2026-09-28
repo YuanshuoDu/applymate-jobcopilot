@@ -44,10 +44,23 @@ jobs:
       - name: Run Web Vitest shards (64 sequential)
         shell: bash
         run: |
+          summary_dir="$(mktemp -d)"
+          trap 'rm -rf "$summary_dir"' EXIT
+          total_tests=0
           for shard in {1..64}; do
+            shard_log="$summary_dir/shard-${shard}.log"
             echo "Running Web Vitest shard ${shard}/64"
-            pnpm --filter @jobcopilot/web exec vitest run --shard="${shard}/64" --passWithNoTests
+            NO_COLOR=1 pnpm --filter @jobcopilot/web exec vitest run --shard="${shard}/64" --passWithNoTests 2>&1 | tee "$shard_log"
+            shard_tests="$(sed -nE 's/^[[:space:]]*Tests[[:space:]].*\(([0-9]+)\)[[:space:]]*$/\1/p' "$shard_log" | tail -n 1)"
+            if [[ -n "$shard_tests" ]]; then
+              total_tests=$((total_tests + shard_tests))
+            fi
           done
+          if (( total_tests == 0 )); then
+            echo "All 64 Web Vitest shards completed without executing any test cases." >&2
+            exit 1
+          fi
+          echo "Web Vitest aggregate: ${total_tests} test cases across 64 shards."
       - name: Run best-effort Playwright tests
         run: pnpm exec playwright test || true
   agent-runtime-postgres:

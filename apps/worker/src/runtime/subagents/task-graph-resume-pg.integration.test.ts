@@ -158,7 +158,21 @@ function boundedErrorText(error: unknown, maxCharacters = 1_000): string {
   return boundedDiagnostic(value, maxCharacters)
 }
 
-type FailureDiagnosticField = { label: string; value: string }
+function safeFailurePreflightErrorClass(error: unknown): FailurePreflightErrorClass {
+  const fields = record(error)
+  const code = fields?.code
+  if (typeof code === "string" && /^[0-9A-Z]{5}$/.test(code)) return "database"
+  if (error instanceof Error && error.name === "AssertionError") return "assertion"
+  if (error instanceof Error && error.name === "CoordinationError") return "coordination"
+  if (error instanceof Error && error.name === "Error") return "generic"
+  return "other"
+}
+
+type FailureDiagnosticField = {
+  label: string
+  value: string
+  safeValue?: FailurePreflightStage | FailurePreflightErrorClass
+}
 
 type RootModelFailureStage =
   | "not_started"
@@ -184,7 +198,8 @@ type RootModelFailureStage =
   | "follow_up_graph_keys"
   | "follow_up_graph_statuses"
   | "follow_up_graph_readiness"
-  | "follow_up_plan_receipt"
+  | "follow_up_plan_receipt_lookup"
+  | "follow_up_graph_task_id"
   | "follow_up_wait_tool"
   | "completed_graph_kind"
   | "completed_graph_keys"
@@ -211,12 +226,25 @@ type ChildFixtureFailureStage =
   | "oversized_result"
   | "unexpected_role"
 
+type FailurePreflightStage =
+  | "not_started"
+  | "plan_receipt"
+  | "root_task_lookup"
+  | "first_target_lookup"
+  | "second_target_lookup"
+  | "first_target_lineage"
+  | "second_target_lineage"
+  | "wait_tool_availability"
+  | "preflight_passed"
+
+type FailurePreflightErrorClass = "none" | "assertion" | "coordination" | "database" | "generic" | "other"
+
 const TURN_DIAGNOSTIC_STATUSES = new Set([
   "queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user",
   "completed", "failed", "interrupted", "cancelled",
 ])
 const ITEM_DIAGNOSTIC_STATUSES = new Set(["started", "completed", "failed", "cancelled"])
-const WAIT_DIAGNOSTIC_STATUSES = new Set(["waiting", "ready", "timed_out", "consumed", "failed", "cancelled", "interrupted"])
+const WAIT_DIAGNOSTIC_STATUSES = new Set(["waiting", "ready", "timed_out", "consumed", "failed", "cancelled", "interrupted", "closed"])
 const WAIT_HANDOFF_ERROR_CODES = new Set([
   "40P01", "40001", "55P03", "57014", "23505", "23503", "wait_handoff_unavailable",
   "wait_invalid", "wait_scope_error", "lease_lost",
@@ -335,6 +363,38 @@ function diagnosticIdListsMatch(left: DiagnosticIdList, right: DiagnosticIdList)
   if (left.values.length !== right.values.length) return false
   const rightValues = new Set(right.values)
   return left.values.every(value => rightValues.has(value))
+}
+
+function diagnosticIdListContainsAll(requested: DiagnosticIdList, available: DiagnosticIdList): boolean | null {
+  if (!requested.valid || !available.valid) return null
+  if (requested.values.length === 0) return false
+  const availableValues = new Set(available.values)
+  return requested.values.every(value => availableValues.has(value))
+}
+
+type WaitProposalCandidate = {
+  payload: RecordValue
+  receipt: RecordValue
+  rawNodes: unknown[]
+  nodes: RecordValue[]
+  taskIds: DiagnosticIdList
+}
+
+function proposalReceiptForWait(requestedIds: DiagnosticIdList, payloads: readonly unknown[]): WaitProposalCandidate | null {
+  const candidates: WaitProposalCandidate[] = []
+  for (const rawPayload of payloads) {
+    const payload = record(rawPayload)
+    const receipt = record(payload?.receipt)
+    if (payload?.kind !== "proposal" || !Array.isArray(receipt?.nodes)) continue
+    const rawNodes = receipt.nodes
+    const nodes = rawNodes.map(record).filter((node): node is RecordValue => node !== null)
+    candidates.push({
+      payload, receipt, rawNodes, nodes,
+      taskIds: diagnosticIdList(rawNodes.map(node => record(node)?.taskId)),
+    })
+  }
+  return candidates.find(candidate => diagnosticIdListsMatch(requestedIds, candidate.taskIds) === true)
+    ?? null
 }
 
 type DiagnosticTaskGraphNodes = Readonly<{
@@ -537,6 +597,9 @@ function compactTurnProgressDiagnostics(progress: string, maxCharacters = 1_600)
       taskIdsMatchCurrentGraph: typeof waitLineage.taskIdsMatchCurrentGraph === "boolean"
         ? waitLineage.taskIdsMatchCurrentGraph
         : null,
+      requestedTaskIdsPresentInCurrentGraph: typeof waitLineage.requestedTaskIdsPresentInCurrentGraph === "boolean"
+        ? waitLineage.requestedTaskIdsPresentInCurrentGraph
+        : null,
       proposalReceiptFound: waitLineage.proposalReceiptFound === true,
       proposalNodeCount: diagnosticBoundedCount(waitLineage.proposalNodeCount),
       requestMatchesReceipt: typeof waitLineage.requestMatchesReceipt === "boolean"
@@ -613,8 +676,8 @@ function compactTurnProgressDiagnostics(progress: string, maxCharacters = 1_600)
 }
 
 function combineFailureDiagnostics(fields: readonly FailureDiagnosticField[], progress: string, firstWaitPlanGraph?: string | null): string {
-  const direct = boundedDiagnostic(fields.map(({ label, value }) =>
-    `${label}=${value.length > 0 && value !== "<not captured>" && value !== "<none>"}`).join("; "), 2_700)
+  const direct = boundedDiagnostic(fields.map(({ label, value, safeValue }) =>
+    `${label}=${safeValue ?? (value.length > 0 && value !== "<not captured>" && value !== "<none>")}`).join("; "), 2_700)
   const planGraphLabel = firstWaitPlanGraph ? "; firstWaitPlanGraph=" : ""
   const planGraph = firstWaitPlanGraph ? boundedDiagnostic(firstWaitPlanGraph, 1_200) : ""
   const snapshotLabel = "; turnTaskWaitSnapshot="
@@ -1165,14 +1228,13 @@ async function initialWaitLineageDiagnostics(
       ? await pool.query<{ payload: unknown }>(`SELECT "payload" FROM "agent_events"
           WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3
             AND "type" IN ('item.started', 'item.delta') AND "payload"->>'kind' = 'proposal'
-          ORDER BY "sequence" DESC LIMIT 1`, [turn.sessionId, turn.id, graphResult.rows[0].id])
+          ORDER BY "sequence" DESC`, [turn.sessionId, turn.id, graphResult.rows[0].id])
       : null
-    const proposalPayload = record(proposalResult?.rows[0]?.payload)
-    const proposalReceipt = record(proposalPayload?.receipt)
-    const rawProposalNodes = Array.isArray(proposalReceipt?.nodes) ? proposalReceipt.nodes : []
-    const proposalNodes = rawProposalNodes.map(record).filter((node): node is RecordValue => node !== null)
-    const proposalTaskIds = diagnosticIdList(proposalNodes.map(node => node.taskId))
-    const proposalReceiptFound = proposalPayload?.kind === "proposal" && Array.isArray(proposalReceipt?.nodes)
+    const proposalCandidate = proposalReceiptForWait(requestedIds, proposalResult?.rows.map(row => row.payload) ?? [])
+    const rawProposalNodes = proposalCandidate?.rawNodes ?? []
+    const proposalNodes = proposalCandidate?.nodes ?? []
+    const proposalTaskIds = proposalCandidate?.taskIds ?? diagnosticIdList(null)
+    const proposalReceiptFound = proposalCandidate !== null
     const requestMatchesReceipt = proposalReceiptFound
       ? diagnosticIdListsMatch(requestedIds, proposalTaskIds)
       : null
@@ -1180,6 +1242,7 @@ async function initialWaitLineageDiagnostics(
     const requestedIdsOutsideReceiptCount = proposalReceiptFound && requestedIds.valid && proposalTaskIds.valid
       ? requestedIds.values.filter(id => !proposalTaskIdSet.has(id)).length
       : null
+    const requestedTaskIdsPresentInCurrentGraph = diagnosticIdListContainsAll(requestedIds, graphIds)
 
     const expectedParentId = toolItem?.taskId ?? turn.rootTaskId
     const parentResult = typeof expectedParentId === "string"
@@ -1259,6 +1322,7 @@ async function initialWaitLineageDiagnostics(
     return {
       available: true,
       taskIdsMatchCurrentGraph,
+      requestedTaskIdsPresentInCurrentGraph,
       proposalReceiptFound,
       proposalNodeCount: rawProposalNodes.length,
       requestMatchesReceipt,
@@ -1523,6 +1587,19 @@ describe("compact TaskGraph wait failure diagnostics", () => {
     })
   })
 
+  it("projects requested wait task containment separately from exact graph equality", () => {
+    const projected = JSON.parse(compactTurnProgressDiagnostics(JSON.stringify({
+      waitLineage: {
+        taskIdsMatchCurrentGraph: false,
+        requestedTaskIdsPresentInCurrentGraph: true,
+      },
+    }))) as RecordValue
+
+    expect(projected).toMatchObject({
+      waitLineage: { taskIdsMatchCurrentGraph: false, requestedTaskIdsPresentInCurrentGraph: true },
+    })
+  })
+
   it("selects the newest exact plan receipt when tool-use IDs repeat", () => {
     const request = {
       messages: [
@@ -1578,6 +1655,68 @@ describe("compact TaskGraph wait failure diagnostics", () => {
       }] }],
     } as unknown as HarnessModelRequest
     expect(() => planTaskIds(malformedDuplicate, "replayed-plan-call", 1)).toThrow("Expected 1 planned task ID(s); received 0")
+  })
+
+  it("matches an initial four-task wait to its receipt after a later one-node proposal", () => {
+    const initialTaskIds = ["private-source", "private-summary", "private-large", "private-rejected"]
+    const nodeRows = (taskIds: readonly string[]) => taskIds.map((taskId, index) => ({
+      key: ["source", "summary", "large-source", "rejected", "verification"][index], taskId,
+    }))
+    const latestFollowUpProposal = {
+      kind: "proposal", receipt: { nodes: [{ key: "verification", taskId: "private-verification" }] },
+    }
+    const earlierInitialProposal = {
+      kind: "proposal", receipt: { nodes: nodeRows(initialTaskIds) },
+    }
+    const requestedIds = diagnosticIdList(initialTaskIds)
+    const selected = proposalReceiptForWait(requestedIds, [latestFollowUpProposal, earlierInitialProposal])
+    const currentGraphIds = diagnosticIdList([...initialTaskIds, "private-verification"])
+    const safeProjection = {
+      proposalNodeCount: selected?.rawNodes.length ?? null,
+      requestMatchesReceipt: selected ? diagnosticIdListsMatch(requestedIds, selected.taskIds) : null,
+      requestedTaskIdsPresentInCurrentGraph: diagnosticIdListContainsAll(requestedIds, currentGraphIds),
+    }
+
+    expect(safeProjection).toEqual({
+      proposalNodeCount: 4, requestMatchesReceipt: true, requestedTaskIdsPresentInCurrentGraph: true,
+    })
+    expect(JSON.stringify(safeProjection)).not.toContain("private-")
+  })
+
+  it("projects an unmatched wait without selecting an unrelated proposal receipt", () => {
+    const requestedIds = diagnosticIdList(["private-source", "private-summary"])
+    const proposals = [
+      { kind: "proposal", receipt: { nodes: [{ key: "verification", taskId: "private-follow-up" }] } },
+      { kind: "proposal", receipt: { nodes: [{ key: "source", taskId: "private-source" }] } },
+    ]
+    const selected = proposalReceiptForWait(requestedIds, proposals)
+    const safeProjection = {
+      proposalReceiptFound: selected !== null,
+      proposalNodeCount: selected?.rawNodes.length ?? 0,
+      requestMatchesReceipt: selected ? diagnosticIdListsMatch(requestedIds, selected.taskIds) : null,
+      requestedIdsOutsideReceiptCount: selected && requestedIds.valid && selected.taskIds.valid
+        ? requestedIds.values.filter(id => !new Set(selected.taskIds.values).has(id)).length
+        : null,
+    }
+
+    expect(selected).toBeNull()
+    expect(safeProjection).toEqual({
+      proposalReceiptFound: false, proposalNodeCount: 0, requestMatchesReceipt: null, requestedIdsOutsideReceiptCount: null,
+    })
+    expect(JSON.stringify(safeProjection)).not.toContain("private-")
+  })
+
+  it("projects only the finite preflight stage and sanitized error class", () => {
+    const marker = "private-task-and-exception-message"
+    const output = combineFailureDiagnostics([
+      { label: "failedPrerequisitePreflight", value: "captured" },
+      { label: "failurePreflightStage", value: marker, safeValue: "first_target_lineage" },
+      { label: "failurePreflightErrorClass", value: marker, safeValue: "assertion" },
+    ], "{}")
+
+    expect(output).toContain("failurePreflightStage=first_target_lineage")
+    expect(output).toContain("failurePreflightErrorClass=assertion")
+    expect(output).not.toContain(marker)
   })
 
   it("distinguishes stale graph context from persisted receipt/snapshot lineage mismatch without exposing IDs", () => {
@@ -1965,6 +2104,20 @@ describe("compact TaskGraph wait failure diagnostics", () => {
     })
   })
 
+  it("projects the terminal closed wait status", () => {
+    const projected = waitHandoffFailureProjection(JSON.stringify({
+      error: { name: "DurableWaitHandoffError", code: "wait_scope_error", message: "private detail" },
+      before: {
+        snapshotReadSucceeded: true, turnFound: true, waitFound: true,
+        turn: { status: "in_progress", leaseOwnerPresent: true, leaseVersion: 1 },
+        wait: { status: "closed", hasSuspendedAt: true, hasResolvedAt: true, hasConsumedAt: true },
+      },
+    }))
+
+    expect(projected).toMatchObject({ before: { waitStatus: "closed", hasResolvedAt: true } })
+    expect(JSON.stringify(projected)).not.toContain("private detail")
+  })
+
   it.each([
     { name: "Error", code: "40P01" }, { name: "Error", code: "40001" },
     { name: "Error", code: "55P03" }, { name: "Error", code: "57014" },
@@ -2260,8 +2413,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 expect(nodes.slice(0, 4).map(node => node?.status)).toEqual(["completed", "completed", "completed", "cancelled"])
                 rootModelFailureStage = "follow_up_graph_readiness"
                 expect(nodes.slice(0, 4).map(node => node?.readiness)).toEqual(["terminal", "terminal", "terminal", "terminal"])
-                rootModelFailureStage = "follow_up_plan_receipt"
+                rootModelFailureStage = "follow_up_plan_receipt_lookup"
                 const plannedTaskIds = planTaskIds(request, FOLLOW_UP_PLAN_CALL_ID, 1)
+                rootModelFailureStage = "follow_up_graph_task_id"
                 expect(nodes.find(node => node?.key === "verification")).toMatchObject({
                   key: "verification", taskId: plannedTaskIds[0],
                 })
@@ -3151,8 +3305,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let rootRuntimeExecutions = 0
     let descendantExecuted = false
     let resumedAfterFailure = false
-    let failurePreflightStage = "not_started"
-    let failurePreflightError: string | null = null
+    let failurePreflightStage: FailurePreflightStage = "not_started"
+    let failurePreflightErrorClass: FailurePreflightErrorClass = "none"
     let failureWaitHandoffFailure: string | null = null
     const runtime = await createCanonicalTurnRuntime(pool!, {
       workerId: failureOwner.ownerId,
@@ -3193,7 +3347,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             if (execution === 1 && modelRounds === 2) {
               try {
                 failurePreflightStage = "plan_receipt"
-                failurePreflightError = null
+                failurePreflightErrorClass = "none"
                 const receiptTaskIds = planTaskIds(request, FAILURE_PLAN_CALL_ID)
                 failurePreflightStage = "root_task_lookup"
                 const fixtureTurn = await pool!.query<{ rootTaskId: string | null }>(
@@ -3207,7 +3361,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 }
                 const coordinationStore = new PgCoordinationStore(pool!)
                 for (const [index, taskId] of receiptTaskIds.entries()) {
-                  failurePreflightStage = `lineage_lookup_${index + 1}`
+                  failurePreflightStage = index === 0 ? "first_target_lookup" : "second_target_lookup"
                   const target = await coordinationStore.getTask({
                     userId: failureOwner.userId, sessionId: failureOwner.sessionId, taskId,
                   })
@@ -3229,18 +3383,18 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                     }), 700)
                     throw new Error(`Failed-prerequisite fixture assertion: plan receipt target ${taskId} is missing from PgCoordinationStore.getTask; scope=${diagnostic}`)
                   }
-                  failurePreflightStage = `lineage_assertion_${index + 1}`
+                  failurePreflightStage = index === 0 ? "first_target_lineage" : "second_target_lineage"
                   expect({
                     id: target.id, turnId: target.turnId, rootTaskId: target.rootTaskId, parentTaskId: target.parentTaskId,
                   }, `Failed-prerequisite fixture assertion: plan receipt target ${taskId} has unexpected lineage`).toEqual({
                     id: taskId, turnId: failureOwner.turnId, rootTaskId: fixtureRootTaskId, parentTaskId: fixtureRootTaskId,
                   })
                 }
-                failurePreflightStage = "agent.wait_tool_availability"
+                failurePreflightStage = "wait_tool_availability"
                 expect(request.tools.map(tool => record(tool)?.name)).toContain("agent.wait")
                 failurePreflightStage = "preflight_passed"
               } catch (error: unknown) {
-                failurePreflightError = (error instanceof Error ? error.message : String(error)).slice(0, 500)
+                failurePreflightErrorClass = safeFailurePreflightErrorClass(error)
                 throw error
               }
               yield {
@@ -3304,10 +3458,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     try {
       await waitForTurnStatus(pool!, failureOwner.turnId, "completed", 50_000, FAILURE_WAIT_CALL_ID)
     } catch (error: unknown) {
-      const diagnostic = boundedDiagnostic(JSON.stringify({ stage: failurePreflightStage, error: failurePreflightError }), 700)
       const progress = await turnProgressDiagnostics(pool!, failureOwner.turnId, FAILURE_WAIT_CALL_ID)
       throw new Error(combineFailureDiagnostics([
-        { label: "failedPrerequisitePreflight", value: diagnostic },
+        { label: "failedPrerequisitePreflight", value: failurePreflightErrorClass === "none" ? "" : "captured" },
+        { label: "failurePreflightStage", value: failurePreflightStage, safeValue: failurePreflightStage },
+        { label: "failurePreflightErrorClass", value: failurePreflightErrorClass, safeValue: failurePreflightErrorClass },
         { label: "waitHandoffFailure", value: failureWaitHandoffFailure ?? "<not captured>" },
         { label: "turnFailure", value: waitTurnFailureSummary(error) },
       ], progress))
