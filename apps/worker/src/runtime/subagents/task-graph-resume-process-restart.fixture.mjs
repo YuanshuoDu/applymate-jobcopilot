@@ -142,6 +142,84 @@ function isExpectedSourceProjection(value) {
     && candidate?.jobId === "fixture-job-restart" && candidate.source === "other"
     && Array.isArray(candidate.evidenceKinds) && candidate.evidenceKinds.length === 1 && candidate.evidenceKinds[0] === "job"
 }
+const SOURCE_PROJECTION_AVAILABILITY = new Set(["available", "unavailable"])
+const SOURCE_PROJECTION_ROLES = new Set(["scout", "analyst"])
+const SOURCE_PROJECTION_STATUSES = new Set(["completed", "partial"])
+const DIAGNOSTIC_COUNT_LIMIT = 99
+function diagnosticEnum(value, allowlist) {
+  if (value === null || value === undefined) return "missing"
+  return typeof value === "string" && allowlist.has(value) ? value : "other"
+}
+function diagnosticCount(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? Math.min(value, DIAGNOSTIC_COUNT_LIMIT) : null
+}
+function sourceProjectionDiagnostic(value) {
+  if (value === null || value === undefined) return { category: "absent" }
+  const projection = record(value)
+  if (!projection) return { category: "invalid", shape: "not_object" }
+  const candidates = Array.isArray(projection.candidates) ? projection.candidates : null
+  const candidate = candidates?.length === 1 ? record(candidates[0]) : null
+  const details = {
+    category: "invalid",
+    schema: projection.schemaVersion === "agent-harness.v2.task-graph.result-projection"
+      ? "expected" : projection.schemaVersion === null || projection.schemaVersion === undefined ? "missing" : "other",
+    availability: diagnosticEnum(projection.availability, SOURCE_PROJECTION_AVAILABILITY),
+    role: diagnosticEnum(projection.role, SOURCE_PROJECTION_ROLES),
+    status: diagnosticEnum(projection.status, SOURCE_PROJECTION_STATUSES),
+    candidateCount: diagnosticCount(projection.candidateCount),
+    evidenceCount: diagnosticCount(projection.evidenceCount),
+    candidateArrayCount: candidates === null ? null : diagnosticCount(candidates.length),
+    candidateIdentity: "unchecked",
+  }
+  if (details.schema !== "expected") return { ...details, category: "wrong_schema" }
+  if (projection.trust !== "untrusted") return { ...details, invalidField: "trust" }
+  if (details.availability === "unavailable") return { ...details, category: "unavailable" }
+  if (details.availability !== "available") return { ...details, invalidField: "availability" }
+  if (projection.role !== "scout") return { ...details, category: "wrong_role" }
+  if (projection.status !== "completed") return { ...details, category: "wrong_status" }
+  if (!candidates || details.candidateCount === null || details.evidenceCount === null) {
+    return { ...details, invalidField: "count_or_candidates" }
+  }
+  if (details.candidateCount !== 1 || details.evidenceCount !== 1 || candidates.length !== 1) {
+    return { ...details, category: "wrong_count" }
+  }
+  if (!candidate || !Array.isArray(candidate.evidenceKinds) || !candidate.evidenceKinds.every(kind => typeof kind === "string")) {
+    return { ...details, invalidField: "candidate_shape" }
+  }
+  const candidateMatches = candidate.jobId === "fixture-job-restart" && candidate.source === "other"
+    && candidate.evidenceKinds.length === 1 && candidate.evidenceKinds[0] === "job"
+  return { ...details, category: candidateMatches ? "valid" : "candidate_identity_mismatch", candidateIdentity: candidateMatches ? "match" : "mismatch" }
+}
+function assertSourceProjectionDiagnostic() {
+  const valid = {
+    schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted", availability: "available",
+    role: "scout", status: "completed", candidateCount: 1, evidenceCount: 1,
+    candidates: [{ jobId: "fixture-job-restart", source: "other", evidenceKinds: ["job"] }],
+  }
+  const cases = [
+    [null, "absent"],
+    ["https://private.example/token", "invalid"],
+    [{ schemaVersion: valid.schemaVersion, trust: "untrusted", availability: "unavailable" }, "unavailable"],
+    [{ ...valid, schemaVersion: "private-projection-schema" }, "wrong_schema"],
+    [{ ...valid, role: "private-role" }, "wrong_role"],
+    [{ ...valid, status: "private-status" }, "wrong_status"],
+    [{ ...valid, candidateCount: 2 }, "wrong_count"],
+    [{ ...valid, candidates: [{ ...valid.candidates[0], jobId: "private-task-id" }] }, "candidate_identity_mismatch"],
+  ]
+  if (!isExpectedSourceProjection(valid) || sourceProjectionDiagnostic(valid).category !== "valid") {
+    throw new Error("p3_source_projection_diagnostic_self_test_failed")
+  }
+  for (const [value, expectedCategory] of cases) {
+    const serialized = JSON.stringify(sourceProjectionDiagnostic(value))
+    if (!serialized.includes(`\"category\":\"${expectedCategory}\"`) || /private|https|token/i.test(serialized)) {
+      throw new Error("p3_source_projection_diagnostic_self_test_failed")
+    }
+    if (isExpectedSourceProjection(value)) throw new Error("p3_source_projection_predicate_self_test_failed")
+  }
+  if (sourceProjectionDiagnostic({ ...valid, candidateCount: Number.MAX_SAFE_INTEGER }).candidateCount !== DIAGNOSTIC_COUNT_LIMIT) {
+    throw new Error("p3_source_projection_count_bound_self_test_failed")
+  }
+}
 function latestToolResult(request, callId) {
   const messages = request.messages
   for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
@@ -464,7 +542,7 @@ function assertRestoredGraph(request) {
     && outcome.tasks.every(task => record(task)?.status === "completed"))
   const sourceNode = byKey.get("source")
   if (!sourceNode || !isExpectedSourceProjection(sourceNode.resultProjection)) {
-    throw new Error("p3_restored_graph_source_projection_missing")
+    throw new Error("p3_restored_graph_source_projection_missing:" + JSON.stringify(sourceProjectionDiagnostic(sourceNode?.resultProjection)))
   }
   say("P3_RESTORED_GRAPH_OK " + JSON.stringify({ revision: graph.revision, nodeCount: nodes.length }))
   say("P3_PARENT_RESUME_CONTEXT_OK")
@@ -821,6 +899,7 @@ try {
   assertLatestToolResultSelection()
   assertPersistedGraphComparator()
   assertInitialPlanToolPair()
+  assertSourceProjectionDiagnostic()
   if (mode === "self-test") say("P3_FIXTURE_SELF_TEST_OK")
   else if (mode === "park-parent") await runFirstWorker()
   else if (mode === "resume-parent") await runSecondWorker()
