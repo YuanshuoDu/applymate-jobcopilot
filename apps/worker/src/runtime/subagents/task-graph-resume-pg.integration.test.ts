@@ -155,6 +155,7 @@ type FailureDiagnosticField = { label: string; value: string }
 type RootModelFailureStage =
   | "not_started"
   | "initial_plan_tool"
+  | "initial_wait_ids_alignment"
   | "initial_wait_tool"
   | "unexpected_root_model_round"
   | "resumed_graph_kind"
@@ -331,9 +332,19 @@ function compactTurnProgressDiagnostics(progress: string, maxCharacters = 1_600)
       taskIdsMatchCurrentGraph: typeof waitLineage.taskIdsMatchCurrentGraph === "boolean"
         ? waitLineage.taskIdsMatchCurrentGraph
         : null,
+      proposalReceiptFound: waitLineage.proposalReceiptFound === true,
+      proposalNodeCount: diagnosticBoundedCount(waitLineage.proposalNodeCount),
+      requestMatchesReceipt: typeof waitLineage.requestMatchesReceipt === "boolean"
+        ? waitLineage.requestMatchesReceipt
+        : null,
+      requestMatchesCurrentGraph: typeof waitLineage.requestMatchesCurrentGraph === "boolean"
+        ? waitLineage.requestMatchesCurrentGraph
+        : null,
+      requestedIdsOutsideReceiptCount: diagnosticBoundedCount(waitLineage.requestedIdsOutsideReceiptCount),
       requestedTaskCount: typeof waitLineage.requestedTaskCount === "number" ? waitLineage.requestedTaskCount : null,
       graphNodeCount: typeof waitLineage.graphNodeCount === "number" ? waitLineage.graphNodeCount : null,
       fixtureNodeKeysMissingRows: diagnosticEnumList(fixtureNodeKeysMissingRows, TASK_GRAPH_DIAGNOSTIC_NODE_KEYS),
+      graphNodeKeysMissingRows: diagnosticEnumList(waitLineage.graphNodeKeysMissingRows, TASK_GRAPH_DIAGNOSTIC_NODE_KEYS),
       waitItemFound: waitLineage.waitItemFound === true,
       waitItemMatchesRoot: waitLineage.waitItemMatchesRoot === true,
       parentTaskFound: waitLineage.parentTaskFound === true,
@@ -867,15 +878,21 @@ async function initialWaitLineageDiagnostics(
       ? await pool.query<{ payload: unknown }>(`SELECT "payload" FROM "agent_events"
           WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3
             AND "type" IN ('item.started', 'item.delta') AND "payload"->>'kind' = 'proposal'
-          ORDER BY "sequence" DESC LIMIT 20`, [turn.sessionId, turn.id, graphResult.rows[0].id])
+          ORDER BY "sequence" DESC LIMIT 1`, [turn.sessionId, turn.id, graphResult.rows[0].id])
       : null
-    const proposalNodes = (proposalResult?.rows ?? []).flatMap(event => {
-      const payload = record(event.payload)
-      const receipt = record(payload?.receipt)
-      return payload?.kind === "proposal" && Array.isArray(receipt?.nodes)
-        ? receipt.nodes.map(record).filter((node): node is RecordValue => node !== null)
-        : []
-    })
+    const proposalPayload = record(proposalResult?.rows[0]?.payload)
+    const proposalReceipt = record(proposalPayload?.receipt)
+    const rawProposalNodes = Array.isArray(proposalReceipt?.nodes) ? proposalReceipt.nodes : []
+    const proposalNodes = rawProposalNodes.map(record).filter((node): node is RecordValue => node !== null)
+    const proposalTaskIds = diagnosticIdList(proposalNodes.map(node => node.taskId))
+    const proposalReceiptFound = proposalPayload?.kind === "proposal" && Array.isArray(proposalReceipt?.nodes)
+    const requestMatchesReceipt = proposalReceiptFound
+      ? diagnosticIdListsMatch(requestedIds, proposalTaskIds)
+      : null
+    const proposalTaskIdSet = new Set(proposalTaskIds.values)
+    const requestedIdsOutsideReceiptCount = proposalReceiptFound && requestedIds.valid && proposalTaskIds.valid
+      ? requestedIds.values.filter(id => !proposalTaskIdSet.has(id)).length
+      : null
 
     const expectedParentId = toolItem?.taskId ?? turn.rootTaskId
     const parentResult = typeof expectedParentId === "string"
@@ -895,13 +912,17 @@ async function initialWaitLineageDiagnostics(
       : null
     const parentLineageMismatchCount = parent ? Number(parent.parentTaskId !== null) : null
     const parentUserMismatchCount = parent ? Number(parent.userId !== turn.userId) : null
-    const targetResult = requestedIds.valid
+    const idsToCheck = [...new Set([
+      ...(requestedIds.valid ? requestedIds.values : []),
+      ...(graphIds.valid ? graphIds.values : []),
+    ])]
+    const targetResult = idsToCheck.length > 0
       ? await pool.query<{
         id: string; sessionId: string; turnId: string | null; rootTaskId: string | null; parentTaskId: string | null
         userId: string | null
       }>(`SELECT task."id", task."sessionId", task."turnId", task."rootTaskId", task."parentTaskId", session."userId" AS "userId"
           FROM "sub_agent_tasks" AS task LEFT JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
-          WHERE task."id" = ANY($1::text[])`, [requestedIds.values])
+          WHERE task."id" = ANY($1::text[])`, [idsToCheck])
       : null
     const targets = targetResult?.rows ?? []
     const requestedIdSet = new Set(requestedIds.values)
@@ -914,23 +935,36 @@ async function initialWaitLineageDiagnostics(
           : []
       ))].slice(0, 8)
       : []
+    const graphNodeKeysMissingRows = graphIds.valid && Array.isArray(graphNodes)
+      ? [...new Set(graphNodes.flatMap(value => {
+        const node = record(value)
+        return node && typeof node.key === "string" && TASK_GRAPH_DIAGNOSTIC_NODE_KEYS.has(node.key)
+          && typeof node.taskId === "string" && !foundTargetIdSet.has(node.taskId)
+          ? [node.key]
+          : []
+      }))].slice(0, 8)
+      : []
+    const requestedTargets = targets.filter(target => requestedIdSet.has(target.id))
+    const requestedFoundCount = requestedIds.valid
+      ? requestedIds.values.filter(id => foundTargetIdSet.has(id)).length
+      : null
     const userMismatchCount = targetResult
-      ? targets.filter(target => target.userId !== turn.userId).length
+      ? requestedTargets.filter(target => target.userId !== turn.userId).length
       : null
     const parentMismatchCount = targetResult
-      ? targets.filter(target => typeof expectedParentId !== "string" || target.parentTaskId !== expectedParentId).length
+      ? requestedTargets.filter(target => typeof expectedParentId !== "string" || target.parentTaskId !== expectedParentId).length
       : null
     const sessionMismatchCount = targetResult
-      ? targets.filter(target => target.sessionId !== turn.sessionId).length
+      ? requestedTargets.filter(target => target.sessionId !== turn.sessionId).length
       : null
     const turnMismatchCount = targetResult
-      ? targets.filter(target => target.turnId !== turn.id).length
+      ? requestedTargets.filter(target => target.turnId !== turn.id).length
       : null
     const rootMismatchCount = targetResult
-      ? targets.filter(target => typeof turn.rootTaskId !== "string" || target.rootTaskId !== turn.rootTaskId).length
+      ? requestedTargets.filter(target => typeof turn.rootTaskId !== "string" || target.rootTaskId !== turn.rootTaskId).length
       : null
-    const missingCount = requestedIds.valid ? Math.max(0, requestedIds.values.length - targets.length) : null
-    const allTargetsFound = requestedIds.valid && targets.length === requestedIds.values.length
+    const missingCount = requestedFoundCount === null ? null : Math.max(0, requestedIds.values.length - requestedFoundCount)
+    const allTargetsFound = requestedFoundCount !== null && requestedFoundCount === requestedIds.values.length
     const allTargetsInExpectedScope = requestedIds.values.length > 0 && allTargetsFound
       && userMismatchCount === 0 && sessionMismatchCount === 0 && turnMismatchCount === 0
       && rootMismatchCount === 0 && parentMismatchCount === 0
@@ -938,9 +972,15 @@ async function initialWaitLineageDiagnostics(
     return {
       available: true,
       taskIdsMatchCurrentGraph,
+      proposalReceiptFound,
+      proposalNodeCount: rawProposalNodes.length,
+      requestMatchesReceipt,
+      requestMatchesCurrentGraph: taskIdsMatchCurrentGraph,
+      requestedIdsOutsideReceiptCount,
       requestedTaskCount: requestedIds.count,
       graphNodeCount: graphIds.count,
       fixtureNodeKeysMissingRows,
+      graphNodeKeysMissingRows,
       waitItemFound: Boolean(toolItem),
       waitItemMatchesRoot: Boolean(toolItem && turn.rootTaskId
         && toolItem.sessionId === turn.sessionId && toolItem.turnId === turn.id && toolItem.taskId === turn.rootTaskId),
@@ -962,7 +1002,7 @@ async function initialWaitLineageDiagnostics(
       parentUserMismatchCount,
       targetRows: {
         requestedCount: requestedIds.count,
-        foundCount: targetResult ? targets.length : null,
+        foundCount: requestedFoundCount,
         allInExpectedScope: allTargetsInExpectedScope,
         allSameUser: Boolean(allTargetsFound && userMismatchCount === 0),
         allSameSession: Boolean(allTargetsFound && sessionMismatchCount === 0),
@@ -1287,6 +1327,10 @@ describe("compact TaskGraph wait failure diagnostics", () => {
       },
       waitLineage: {
         available: true, taskIdsMatchCurrentGraph: false, requestedTaskCount: 2, graphNodeCount: 2,
+        proposalReceiptFound: true, proposalNodeCount: 4,
+        requestMatchesReceipt: false, requestMatchesCurrentGraph: false,
+        requestedIdsOutsideReceiptCount: 1,
+        graphNodeKeysMissingRows: ["source", markers[2], "rejected"],
         fixtureNodeKeysMissingRows: ["source", markers[2], "summary", markers[5], "rejected"],
         waitItemFound: true, waitItemMatchesRoot: true, parentTaskFound: true,
         parentIdIsTurnRoot: true, parentSameSession: true, parentSameTurn: true,
@@ -1315,6 +1359,10 @@ describe("compact TaskGraph wait failure diagnostics", () => {
       waitToolResult: { status: "failed", outputStatus: "waiting", matchedTaskCount: 2, truncatedTaskResultCount: 1 },
       waitLineage: {
         taskIdsMatchCurrentGraph: false, requestedTaskCount: 2, graphNodeCount: 2,
+        proposalReceiptFound: true, proposalNodeCount: 4,
+        requestMatchesReceipt: false, requestMatchesCurrentGraph: false,
+        requestedIdsOutsideReceiptCount: 1,
+        graphNodeKeysMissingRows: ["source", "rejected"],
         fixtureNodeKeysMissingRows: ["source", "summary", "rejected"],
         targetRows: { requestedCount: 2, foundCount: 2, allInExpectedScope: true },
       },
@@ -1623,11 +1671,25 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             if (execution === 1 && modelRounds === 2) {
               rootModelFailureStage = "initial_wait_tool"
               expect(request.tools.map(tool => record(tool)?.name)).toContain("agent.wait")
+              const plannedTaskIds = planTaskIds(request, PLAN_CALL_ID, 4)
+              const graph = currentGraphFromRequest(request)
+              const graphNodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+              const graphTaskIds = graphNodes.flatMap(node => typeof node?.taskId === "string" ? [node.taskId] : [])
+              const plannedIdSet = new Set(plannedTaskIds)
+              const graphIdSet = new Set(graphTaskIds)
+              rootModelFailureStage = "initial_wait_ids_alignment"
+              if (plannedTaskIds.length !== 4 || plannedIdSet.size !== 4
+                || graphTaskIds.length !== 4 || graphIdSet.size !== 4
+                || plannedIdSet.size !== graphIdSet.size
+                || [...plannedIdSet].some(taskId => !graphIdSet.has(taskId))) {
+                throw new Error("p3_task_graph_wait_ids_mismatch")
+              }
+              rootModelFailureStage = "initial_wait_tool"
               yield {
                 type: "tool_call_completed", callId: WAIT_CALL_ID, name: "agent.wait",
                 arguments: {
                   idempotencyKey: `p3-task-graph-wait:${owner.turnId}`,
-                  taskIds: planTaskIds(request, PLAN_CALL_ID, 4), mode: "all", timeoutMs: 20_000,
+                  taskIds: plannedTaskIds, mode: "all", timeoutMs: 20_000,
                 },
               }
               yield { type: "completed", finishReason: "tool_calls" }
@@ -2252,12 +2314,24 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const finalGraphDelta = persistedGraphDeltas[persistedGraphDeltas.length - 1]!
       const finalGraphDeltaPayload = record(finalGraphDelta.payload)
       const finalGraphDeltaItem = record(finalGraphDeltaPayload?.item)
+      if (typeof rootTaskId !== "string") throw new Error("Restarted TaskGraph has no root task ID.")
+      let expectedFinalGraphEventTaskId: string
+      if (finalGraphDeltaPayload?.kind === "proposal") {
+        expectedFinalGraphEventTaskId = rootTaskId
+      } else if (finalGraphDeltaPayload?.kind === "lifecycle") {
+        const lifecycle = record(finalGraphDeltaPayload.event)
+        const lifecycleNode = graphAfterNodes.find(node => node?.key === lifecycle?.nodeKey)
+        if (typeof lifecycleNode?.taskId !== "string") throw new Error("Final TaskGraph lifecycle event has no matching node task.")
+        expectedFinalGraphEventTaskId = lifecycleNode.taskId
+      } else {
+        throw new Error("Final TaskGraph delta has an unknown event kind.")
+      }
       expect(finalGraphDelta).toMatchObject({
         type: "item.delta",
         sessionId: restartOwner.sessionId,
         turnId: restartOwner.turnId,
         itemId: graphAfterResume.rows[0]!.id,
-        taskId: rootTaskId,
+        taskId: expectedFinalGraphEventTaskId,
       })
       expect(finalGraphDeltaPayload?.revision).toBe(graphAfterResume.rows[0]!.revision)
       expect(finalGraphDeltaItem).toMatchObject({
