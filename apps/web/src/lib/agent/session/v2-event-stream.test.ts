@@ -13,7 +13,7 @@ function event(sequence: bigint) {
 
 function taskGraphPayload() {
   return {
-    kind: "lifecycle", event: { type: "task.completed" }, revision: 1, item: {
+    kind: "lifecycle", event: { type: "task.completed", nodeKey: "research" }, revision: 1, item: {
       schemaVersion: "agent-harness.v2", id: "graph_1", sessionId: "session_1", turnId: "turn_1",
       stepId: null, taskId: "root_task_1", type: "task_graph", status: "streaming", phase: null, revision: 1,
       content: { schemaVersion: "agent-harness.v2.task-graph", nodes: [{
@@ -100,7 +100,7 @@ describe("V2 agent event stream", () => {
   it("preserves a valid redacted TaskGraph item in a durable item.delta", async () => {
     const controller = new AbortController()
     const database = db([{
-      id: "graph-event", sessionId: "session_1", turnId: "turn_1", itemId: "graph_1", taskId: "root_task_1",
+      id: "graph-event", sessionId: "session_1", turnId: "turn_1", itemId: "graph_1", taskId: "child_task_1",
       sequence: BigInt(1), type: "item.delta", actor: "system", correlationId: "turn_1", causationId: null,
       idempotencyKey: "graph-revision-1", payload: taskGraphPayload(),
     }])
@@ -109,24 +109,30 @@ describe("V2 agent event stream", () => {
       redisFactory: () => null, dbPollMs: 1, heartbeatMs: 100,
     })
     const reader = stream.getReader()
-    const text = new TextDecoder().decode((await reader.read()).value)
-    expect(goalFromFrame(text)).toBe("Review role; Bearer [REDACTED]")
-    controller.abort()
-    await reader.cancel()
+    try {
+      const text = new TextDecoder().decode((await reader.read()).value)
+      expect(goalFromFrame(text)).toBe("Review role; Bearer [REDACTED]")
+    } finally {
+      controller.abort()
+      await reader.cancel()
+    }
   })
 
   it("preserves a valid redacted TaskGraph item in a transient item.delta", async () => {
     const controller = new AbortController()
     const envelope = {
       schemaVersion: "agent-harness.v2", id: "graph-delta", sessionId: "session_1", turnId: "turn_1",
-      itemId: "graph_1", taskId: "root_task_1", type: "item.delta", actor: "system", correlationId: "turn_1",
+      itemId: "graph_1", taskId: "child_task_1", type: "item.delta", actor: "system", correlationId: "turn_1",
       causationId: null, idempotencyKey: "graph-revision-1", sequence: null, payload: taskGraphPayload(),
       kind: "snapshot", baseRevision: 0, revision: 1,
     }
     const connection: AgentStreamRedis = {
       xread: vi.fn()
         .mockResolvedValueOnce([["agent:session:session_1:deltas", [["1-0", ["payload", JSON.stringify(envelope)]]]]])
-        .mockResolvedValue(null),
+        .mockImplementation(() => new Promise(resolve => {
+          if (controller.signal.aborted) return resolve(null)
+          controller.signal.addEventListener("abort", () => resolve(null), { once: true })
+        })),
       disconnect: vi.fn(),
     }
     const stream = createV2EventStream(db([]) as never, {
@@ -134,10 +140,13 @@ describe("V2 agent event stream", () => {
       redisFactory: () => connection, dbPollMs: 1, heartbeatMs: 100,
     })
     const reader = stream.getReader()
-    const text = new TextDecoder().decode((await reader.read()).value)
-    expect(goalFromFrame(text)).toBe("Review role; Bearer [REDACTED]")
-    controller.abort()
-    await reader.cancel()
+    try {
+      const text = new TextDecoder().decode((await reader.read()).value)
+      expect(goalFromFrame(text)).toBe("Review role; Bearer [REDACTED]")
+    } finally {
+      controller.abort()
+      await reader.cancel()
+    }
   })
 
   it("uses the session event channel as a durable database poll wakeup", async () => {
