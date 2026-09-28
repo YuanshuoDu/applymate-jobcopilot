@@ -150,10 +150,24 @@ function boundedErrorText(error: unknown, maxCharacters = 1_000): string {
   return boundedDiagnostic(value, maxCharacters)
 }
 
-type FailureDiagnosticField = { label: string; value: string; maxCharacters?: number }
+type FailureDiagnosticField = { label: string; value: string }
+
+const TURN_DIAGNOSTIC_STATUSES = new Set([
+  "queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user",
+  "completed", "failed", "interrupted", "cancelled",
+])
+const ITEM_DIAGNOSTIC_STATUSES = new Set(["started", "completed", "failed", "cancelled"])
+const WAIT_DIAGNOSTIC_STATUSES = new Set(["waiting", "ready", "timed_out", "consumed", "failed", "cancelled", "interrupted"])
+const TASK_DIAGNOSTIC_STATUSES = new Set([
+  "queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed",
+])
 
 function diagnosticText(value: unknown, maxCharacters = 64): string | null {
   return typeof value === "string" ? boundedDiagnostic(value, maxCharacters) : null
+}
+
+function diagnosticEnum(value: unknown, allowed: ReadonlySet<string>): string | null {
+  return typeof value === "string" && allowed.has(value) ? value : null
 }
 
 function diagnosticCount(value: unknown): number | null {
@@ -167,47 +181,113 @@ function diagnosticCount(value: unknown): number | null {
   }
 }
 
+type DiagnosticIdList = { values: string[]; count: number | null; valid: boolean }
+
+function diagnosticIdList(value: unknown, maxItems = 50): DiagnosticIdList {
+  if (!Array.isArray(value)) return { values: [], count: null, valid: false }
+  const valid = value.length <= maxItems && value.every(item => typeof item === "string" && item.trim().length > 0 && item.length <= 256)
+    && new Set(value).size === value.length
+  return { values: valid ? value as string[] : [], count: value.length, valid }
+}
+
+function diagnosticIdListsMatch(left: DiagnosticIdList, right: DiagnosticIdList): boolean | null {
+  if (!left.valid || !right.valid) return null
+  if (left.values.length !== right.values.length) return false
+  const rightValues = new Set(right.values)
+  return left.values.every(value => rightValues.has(value))
+}
+
 function compactTurnProgressDiagnostics(progress: string, maxCharacters = 1_350): string {
   let parsed: RecordValue | null = null
-  try { parsed = record(JSON.parse(progress) as unknown) } catch { return boundedDiagnostic(progress, maxCharacters) }
-  if (!parsed) return boundedDiagnostic(progress, maxCharacters)
+  try { parsed = record(JSON.parse(progress) as unknown) } catch { return JSON.stringify({ available: false }) }
+  if (!parsed) return JSON.stringify({ available: false })
 
   const turn = record(parsed.turn)
   const tool = record(parsed.waitToolResult)
+  const waitLineage = record(parsed.waitLineage)
+  const targetRows = record(waitLineage?.targetRows)
+  const targetMismatchCounts = record(targetRows?.mismatchCounts)
+  const parentMismatchCounts = record(waitLineage?.parentMismatchCounts)
   const toolFailure = record(parsed.diagnosticToolFailure)
   const tasks = Array.isArray(parsed.tasks) ? parsed.tasks.map(record).filter((item): item is RecordValue => item !== null) : []
   const waits = Array.isArray(parsed.waits) ? parsed.waits.map(record).filter((item): item is RecordValue => item !== null) : []
   const snapshot = {
     turn: turn ? {
-      status: diagnosticText(turn.status, 24),
-      error: diagnosticText(turn.error, 96),
+      status: diagnosticEnum(turn.status, TURN_DIAGNOSTIC_STATUSES),
+      errorPresent: turn.error !== null && turn.error !== undefined,
       revision: typeof turn.revision === "number" ? turn.revision : null,
       leaseVersion: typeof turn.leaseVersion === "number" ? turn.leaseVersion : null,
       leaseOwnerPresent: turn.leaseOwnerId !== null,
     } : null,
     waitToolResult: tool ? {
-      status: diagnosticText(tool.status, 24),
-      errorCode: diagnosticText(tool.errorCode, 64),
-      outputStatus: diagnosticText(tool.outputStatus, 24),
-      waitId: diagnosticText(tool.waitId, 48),
-      matchedTaskCount: record(tool.matchedTaskIds)?.count ?? null,
-      truncatedTaskResultCount: record(tool.truncated)?.truncatedTaskResultCount ?? null,
+      status: diagnosticEnum(tool.status, ITEM_DIAGNOSTIC_STATUSES),
+      errorCodePresent: typeof tool.errorCode === "string",
+      outputStatus: diagnosticEnum(tool.outputStatus, WAIT_DIAGNOSTIC_STATUSES),
+      waitIdPresent: typeof tool.waitId === "string",
+      matchedTaskCount: typeof record(tool.matchedTaskIds)?.count === "number" ? record(tool.matchedTaskIds)?.count : null,
+      truncatedTaskResultCount: typeof record(tool.truncated)?.truncatedTaskResultCount === "number"
+        ? record(tool.truncated)?.truncatedTaskResultCount
+        : null,
+    } : null,
+    waitLineage: waitLineage ? {
+      available: waitLineage.available !== false,
+      taskIdsMatchCurrentGraph: typeof waitLineage.taskIdsMatchCurrentGraph === "boolean"
+        ? waitLineage.taskIdsMatchCurrentGraph
+        : null,
+      requestedTaskCount: typeof waitLineage.requestedTaskCount === "number" ? waitLineage.requestedTaskCount : null,
+      graphNodeCount: typeof waitLineage.graphNodeCount === "number" ? waitLineage.graphNodeCount : null,
+      waitItemFound: waitLineage.waitItemFound === true,
+      waitItemMatchesRoot: waitLineage.waitItemMatchesRoot === true,
+      parentTaskFound: waitLineage.parentTaskFound === true,
+      parentIdIsTurnRoot: waitLineage.parentIdIsTurnRoot === true,
+      parentSameSession: waitLineage.parentSameSession === true,
+      parentSameTurn: waitLineage.parentSameTurn === true,
+      parentRootIsTurnRoot: waitLineage.parentRootIsTurnRoot === true,
+      parentHasNoParent: waitLineage.parentHasNoParent === true,
+      parentMismatchCounts: parentMismatchCounts ? {
+        id: typeof parentMismatchCounts.id === "number" ? parentMismatchCounts.id : null,
+        session: typeof parentMismatchCounts.session === "number" ? parentMismatchCounts.session : null,
+        turn: typeof parentMismatchCounts.turn === "number" ? parentMismatchCounts.turn : null,
+        root: typeof parentMismatchCounts.root === "number" ? parentMismatchCounts.root : null,
+        parent: typeof parentMismatchCounts.parent === "number" ? parentMismatchCounts.parent : null,
+        user: typeof parentMismatchCounts.user === "number" ? parentMismatchCounts.user : null,
+      } : null,
+      parentTaskMatchesUser: waitLineage.parentTaskMatchesUser === true,
+      parentUserMismatchCount: typeof waitLineage.parentUserMismatchCount === "number" ? waitLineage.parentUserMismatchCount : null,
+      targetRows: targetRows ? {
+        requestedCount: typeof targetRows.requestedCount === "number" ? targetRows.requestedCount : null,
+        foundCount: typeof targetRows.foundCount === "number" ? targetRows.foundCount : null,
+        allInExpectedScope: targetRows.allInExpectedScope === true,
+        allSameUser: targetRows.allSameUser === true,
+        allSameSession: targetRows.allSameSession === true,
+        allSameTurn: targetRows.allSameTurn === true,
+        allSameRoot: targetRows.allSameRoot === true,
+        allSameParent: targetRows.allSameParent === true,
+        mismatchCounts: targetMismatchCounts ? {
+          missing: typeof targetMismatchCounts.missing === "number" ? targetMismatchCounts.missing : null,
+          user: typeof targetMismatchCounts.user === "number" ? targetMismatchCounts.user : null,
+          session: typeof targetMismatchCounts.session === "number" ? targetMismatchCounts.session : null,
+          turn: typeof targetMismatchCounts.turn === "number" ? targetMismatchCounts.turn : null,
+          root: typeof targetMismatchCounts.root === "number" ? targetMismatchCounts.root : null,
+          parent: typeof targetMismatchCounts.parent === "number" ? targetMismatchCounts.parent : null,
+        } : null,
+      } : null,
     } : null,
     toolFailure: toolFailure ? {
-      toolName: diagnosticText(toolFailure.toolName, 40),
-      status: diagnosticText(toolFailure.status, 24),
-      errorCode: diagnosticText(toolFailure.errorCode, 64),
-      failureDetail: diagnosticText(toolFailure.failureDetail, 120),
+      toolNameIsAgentWait: toolFailure.toolName === "agent.wait",
+      status: diagnosticEnum(toolFailure.status, ITEM_DIAGNOSTIC_STATUSES),
+      errorCodePresent: typeof toolFailure.errorCode === "string",
+      failureDetailPresent: typeof toolFailure.failureDetail === "string",
     } : null,
     tasks: tasks.slice(0, 6).map(task => ({
-      goal: diagnosticText(task.goal, 48),
-      status: diagnosticText(task.status, 24),
+      goalPresent: typeof task.goal === "string",
+      status: diagnosticEnum(task.status, TASK_DIAGNOSTIC_STATUSES),
       attempts: typeof task.attemptCount === "number" ? task.attemptCount : null,
-      failureReason: diagnosticText(task.failureReason, 72),
+      failureReasonPresent: typeof task.failureReason === "string",
     })),
     waits: waits.slice(0, 6).map(wait => ({
-      key: diagnosticText(wait.idempotencyKey, 56),
-      status: diagnosticText(wait.status, 24),
+      keyPresent: typeof wait.idempotencyKey === "string",
+      status: diagnosticEnum(wait.status, WAIT_DIAGNOSTIC_STATUSES),
       targetCount: diagnosticCount(wait.targetTaskIds),
       matchedCount: diagnosticCount(wait.matchedTaskIds),
       suspended: wait.suspendedAt !== null,
@@ -219,8 +299,8 @@ function compactTurnProgressDiagnostics(progress: string, maxCharacters = 1_350)
 }
 
 function combineFailureDiagnostics(fields: readonly FailureDiagnosticField[], progress: string): string {
-  const direct = boundedDiagnostic(fields.map(({ label, value, maxCharacters = 500 }) =>
-    `${label}=${boundedDiagnostic(value, maxCharacters)}`).join("; "), 2_700)
+  const direct = boundedDiagnostic(fields.map(({ label, value }) =>
+    `${label}=${value.length > 0 && value !== "<not captured>" && value !== "<none>"}`).join("; "), 2_700)
   const snapshotLabel = "; turnTaskWaitSnapshot="
   const snapshotBudget = Math.max(0, Math.min(1_050, 3_900 - direct.length - snapshotLabel.length - 64))
   const snapshot = compactTurnProgressDiagnostics(progress, snapshotBudget)
@@ -548,10 +628,135 @@ async function waitForSuspendedParent(pool: Pool, turnId: string, minimumWaitCou
   throw new Error("TaskGraph parent wait was not durably suspended before child completion")
 }
 
+async function initialWaitLineageDiagnostics(
+  pool: Pool,
+  turn: { id: string; sessionId: string; userId: string; rootTaskId: string | null },
+  toolCallId: string | undefined,
+): Promise<RecordValue | null> {
+  if (!toolCallId) return null
+  try {
+    const [toolItemResult, graphResult] = await Promise.all([
+      pool.query<{ sessionId: string; turnId: string; taskId: string | null; content: unknown }>(`SELECT "sessionId", "turnId", "taskId", "content"
+        FROM "agent_items" WHERE "type" = 'tool_call' AND "content"->>'toolCallId' = $1
+          AND "content"->>'toolName' = 'agent.wait'
+          AND ("sessionId" = $2 OR "turnId" = $3 OR "taskId" = $4)
+        ORDER BY "createdAt" DESC LIMIT 1`, [toolCallId, turn.sessionId, turn.id, turn.rootTaskId]),
+      turn.rootTaskId
+        ? pool.query<{ content: unknown }>(`SELECT "content" FROM "agent_items"
+            WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "type" = 'task_graph'
+            ORDER BY "revision" DESC, "updatedAt" DESC LIMIT 1`, [turn.sessionId, turn.id, turn.rootTaskId])
+        : Promise.resolve(null),
+    ])
+    const toolItem = toolItemResult.rows[0]
+    const toolContent = record(toolItem?.content)
+    const waitInput = record(toolContent?.input)
+    const requestedIds = diagnosticIdList(waitInput?.taskIds)
+    const graphContent = record(graphResult?.rows[0]?.content)
+    const graphNodes = Array.isArray(graphContent?.nodes) ? graphContent.nodes : null
+    const graphIds = diagnosticIdList(graphNodes?.map(node => record(node)?.taskId))
+    const taskIdsMatchCurrentGraph = diagnosticIdListsMatch(requestedIds, graphIds)
+
+    const expectedParentId = toolItem?.taskId ?? turn.rootTaskId
+    const parentResult = typeof expectedParentId === "string"
+      ? await pool.query<{
+        id: string; sessionId: string; turnId: string | null; rootTaskId: string | null; parentTaskId: string | null
+        userId: string | null
+      }>(`SELECT task."id", task."sessionId", task."turnId", task."rootTaskId", task."parentTaskId", session."userId" AS "userId"
+          FROM "sub_agent_tasks" AS task LEFT JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+          WHERE task."id" = $1 LIMIT 1`, [expectedParentId])
+      : null
+    const parent = parentResult?.rows[0]
+    const parentIdMismatchCount = parent ? Number(typeof turn.rootTaskId !== "string" || parent.id !== turn.rootTaskId) : null
+    const parentSessionMismatchCount = parent ? Number(parent.sessionId !== turn.sessionId) : null
+    const parentTurnMismatchCount = parent ? Number(parent.turnId !== turn.id) : null
+    const parentRootMismatchCount = parent
+      ? Number(typeof turn.rootTaskId !== "string" || parent.rootTaskId !== turn.rootTaskId)
+      : null
+    const parentLineageMismatchCount = parent ? Number(parent.parentTaskId !== null) : null
+    const parentUserMismatchCount = parent ? Number(parent.userId !== turn.userId) : null
+    const targetResult = requestedIds.valid
+      ? await pool.query<{
+        id: string; sessionId: string; turnId: string | null; rootTaskId: string | null; parentTaskId: string | null
+        userId: string | null
+      }>(`SELECT task."id", task."sessionId", task."turnId", task."rootTaskId", task."parentTaskId", session."userId" AS "userId"
+          FROM "sub_agent_tasks" AS task LEFT JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+          WHERE task."id" = ANY($1::text[])`, [requestedIds.values])
+      : null
+    const targets = targetResult?.rows ?? []
+    const userMismatchCount = targetResult
+      ? targets.filter(target => target.userId !== turn.userId).length
+      : null
+    const parentMismatchCount = targetResult
+      ? targets.filter(target => typeof expectedParentId !== "string" || target.parentTaskId !== expectedParentId).length
+      : null
+    const sessionMismatchCount = targetResult
+      ? targets.filter(target => target.sessionId !== turn.sessionId).length
+      : null
+    const turnMismatchCount = targetResult
+      ? targets.filter(target => target.turnId !== turn.id).length
+      : null
+    const rootMismatchCount = targetResult
+      ? targets.filter(target => typeof turn.rootTaskId !== "string" || target.rootTaskId !== turn.rootTaskId).length
+      : null
+    const missingCount = requestedIds.valid ? Math.max(0, requestedIds.values.length - targets.length) : null
+    const allTargetsFound = requestedIds.valid && targets.length === requestedIds.values.length
+    const allTargetsInExpectedScope = requestedIds.values.length > 0 && allTargetsFound
+      && userMismatchCount === 0 && sessionMismatchCount === 0 && turnMismatchCount === 0
+      && rootMismatchCount === 0 && parentMismatchCount === 0
+
+    return {
+      available: true,
+      taskIdsMatchCurrentGraph,
+      requestedTaskCount: requestedIds.count,
+      graphNodeCount: graphIds.count,
+      waitItemFound: Boolean(toolItem),
+      waitItemMatchesRoot: Boolean(toolItem && turn.rootTaskId
+        && toolItem.sessionId === turn.sessionId && toolItem.turnId === turn.id && toolItem.taskId === turn.rootTaskId),
+      parentTaskFound: Boolean(parent),
+      parentIdIsTurnRoot: Boolean(parent && turn.rootTaskId && parent.id === turn.rootTaskId),
+      parentSameSession: Boolean(parent && parent.sessionId === turn.sessionId),
+      parentSameTurn: Boolean(parent && parent.turnId === turn.id),
+      parentRootIsTurnRoot: Boolean(parent && turn.rootTaskId && parent.rootTaskId === turn.rootTaskId),
+      parentHasNoParent: Boolean(parent && parent.parentTaskId === null),
+      parentMismatchCounts: {
+        id: parentIdMismatchCount,
+        session: parentSessionMismatchCount,
+        turn: parentTurnMismatchCount,
+        root: parentRootMismatchCount,
+        parent: parentLineageMismatchCount,
+        user: parentUserMismatchCount,
+      },
+      parentTaskMatchesUser: Boolean(parent && parent.userId === turn.userId),
+      parentUserMismatchCount,
+      targetRows: {
+        requestedCount: requestedIds.count,
+        foundCount: targetResult ? targets.length : null,
+        allInExpectedScope: allTargetsInExpectedScope,
+        allSameUser: Boolean(allTargetsFound && userMismatchCount === 0),
+        allSameSession: Boolean(allTargetsFound && sessionMismatchCount === 0),
+        allSameTurn: Boolean(allTargetsFound && turnMismatchCount === 0),
+        allSameRoot: Boolean(allTargetsFound && rootMismatchCount === 0),
+        allSameParent: Boolean(allTargetsFound && parentMismatchCount === 0),
+        mismatchCounts: {
+          missing: missingCount,
+          user: userMismatchCount,
+          session: sessionMismatchCount,
+          turn: turnMismatchCount,
+          root: rootMismatchCount,
+          parent: parentMismatchCount,
+        },
+      },
+    }
+  } catch {
+    return { available: false }
+  }
+}
+
 async function turnProgressDiagnostics(pool: Pool, turnId: string, diagnosticToolCallId?: string): Promise<string> {
   const turnResult = await pool.query<{
     id: string
     sessionId: string
+    userId: string
     status: string
     error: string | null
     rootTaskId: string | null
@@ -559,7 +764,7 @@ async function turnProgressDiagnostics(pool: Pool, turnId: string, diagnosticToo
     leaseOwnerId: string | null
     leaseVersion: number
     leaseExpiresAt: Date | null
-  }>(`SELECT "id", "sessionId", "status", "error", "rootTaskId", "revision", "leaseOwnerId", "leaseVersion", "leaseExpiresAt"
+  }>(`SELECT "id", "sessionId", "userId", "status", "error", "rootTaskId", "revision", "leaseOwnerId", "leaseVersion", "leaseExpiresAt"
     FROM "agent_turns" WHERE "id" = $1`, [turnId])
   const turn = turnResult.rows[0]
   if (!turn) return JSON.stringify({ turnId, missing: true })
@@ -648,8 +853,9 @@ async function turnProgressDiagnostics(pool: Pool, turnId: string, diagnosticToo
         : null,
     }
     : null
+  const waitLineage = await initialWaitLineageDiagnostics(pool, turn, diagnosticToolCallId)
   const recentEvents = events.rows.map(({ payload: _payload, ...event }) => event)
-  return JSON.stringify({ turn, waitToolResult, tasks: tasks.rows, waits: waits.rows, recentEvents, diagnosticToolFailure, recentOutbox: dispatches.rows })
+  return JSON.stringify({ turn, waitToolResult, waitLineage, tasks: tasks.rows, waits: waits.rows, recentEvents, diagnosticToolFailure, recentOutbox: dispatches.rows })
 }
 
 async function waitForTurnStatus(pool: Pool, turnId: string, wanted: string, timeoutMs = 50_000, diagnosticToolCallId?: string): Promise<void> {
@@ -685,6 +891,59 @@ async function waitForPersistedTaskWait(pool: Pool, turnId: string, idempotencyK
   }
   throw new Error("Follow-up parent wait was not durably suspended")
 }
+
+describe("compact TaskGraph wait failure diagnostics", () => {
+  it("redacts identifiers and arbitrary text while retaining safe status and counts", () => {
+    const markers = [
+      "marker-turn-id", "marker-session-id", "marker-task-id", "marker-wait-id", "marker-user-id",
+      "marker-goal-text", "marker-idempotency-key", "marker-arbitrary-failure-message",
+    ]
+    const output = compactTurnProgressDiagnostics(JSON.stringify({
+      turn: {
+        id: markers[0], sessionId: markers[1], userId: markers[4], rootTaskId: markers[2],
+        status: "failed", error: markers[7], revision: 7, leaseVersion: 3, leaseOwnerId: markers[5],
+      },
+      waitToolResult: {
+        status: "failed", errorCode: markers[7], outputStatus: "waiting", waitId: markers[3],
+        idempotencyKey: markers[6], matchedTaskIds: { count: 2 },
+        truncated: { truncatedTaskResultCount: 1 },
+      },
+      waitLineage: {
+        available: true, taskIdsMatchCurrentGraph: false, requestedTaskCount: 2, graphNodeCount: 2,
+        waitItemFound: true, waitItemMatchesRoot: true, parentTaskFound: true,
+        parentIdIsTurnRoot: true, parentSameSession: true, parentSameTurn: true,
+        parentRootIsTurnRoot: true, parentHasNoParent: true, parentTaskMatchesUser: true,
+        parentMismatchCounts: { id: 0, session: 0, turn: 0, root: 0, parent: 0, user: 0 },
+        parentUserMismatchCount: 0,
+        targetRows: {
+          requestedCount: 2, foundCount: 2, allInExpectedScope: true, allSameUser: true,
+          allSameSession: true, allSameTurn: true, allSameRoot: true, allSameParent: true,
+          mismatchCounts: { missing: 0, user: 0, session: 0, turn: 0, root: 0, parent: 0 },
+        },
+      },
+      diagnosticToolFailure: {
+        toolName: "agent.wait", status: "failed", errorCode: markers[7], failureDetail: markers[7],
+        idempotencyKey: markers[6],
+      },
+      tasks: [{ id: markers[2], goal: markers[5], status: "failed", attemptCount: 2, failureReason: markers[7] }],
+      waits: [{ id: markers[3], idempotencyKey: markers[6], status: "waiting", targetTaskIds: [markers[2]], matchedTaskIds: [] }],
+      recentEvents: [{ taskId: markers[2], idempotencyKey: markers[6], error: markers[7] }],
+      recentOutbox: [{ idempotencyKey: markers[6], lastError: markers[7] }],
+    }))
+
+    expect(markers.some(marker => output.includes(marker)), "diagnostic output must omit marker values").toBe(false)
+    expect(JSON.parse(output)).toMatchObject({
+      turn: { status: "failed", revision: 7, leaseVersion: 3, errorPresent: true },
+      waitToolResult: { status: "failed", outputStatus: "waiting", matchedTaskCount: 2, truncatedTaskResultCount: 1 },
+      waitLineage: {
+        taskIdsMatchCurrentGraph: false, requestedTaskCount: 2, graphNodeCount: 2,
+        targetRows: { requestedCount: 2, foundCount: 2, allInExpectedScope: true },
+      },
+      tasks: [{ goalPresent: true, status: "failed", attempts: 2, failureReasonPresent: true }],
+      waits: [{ keyPresent: true, status: "waiting", targetCount: 1, matchedCount: 0 }],
+    })
+  })
+})
 
 describeWithServices("production TaskGraph lifecycle and root resume (disposable PostgreSQL + Redis)", () => {
   const owner = fixture()
@@ -1015,9 +1274,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     } catch (error: unknown) {
       const progress = await turnProgressDiagnostics(pool!, owner.turnId, WAIT_CALL_ID)
       throw new Error(combineFailureDiagnostics([
-        { label: "rootModelStreamFailure", value: rootModelStreamFailure ?? "<not captured>", maxCharacters: 850 },
-        { label: "waitHandoffFailure", value: rootWaitHandoffFailure ?? "<not captured>", maxCharacters: 1_800 },
-        { label: "turnFailure", value: waitTurnFailureSummary(error), maxCharacters: 320 },
+        { label: "rootModelStreamFailure", value: rootModelStreamFailure ?? "<not captured>" },
+        { label: "waitHandoffFailure", value: rootWaitHandoffFailure ?? "<not captured>" },
+        { label: "turnFailure", value: waitTurnFailureSummary(error) },
       ], progress))
     }
     const parkedTurns = await pool!.query<{ id: string; status: string }>(
@@ -1250,9 +1509,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           ? processErrorText.replace(parentModelFailure, "<parent model failure captured separately>")
           : processErrorText
         throw new Error(combineFailureDiagnostics([
-          { label: "parentModelFailure", value: parentModelFailure ?? "<not captured>", maxCharacters: 1_200 },
-          { label: "processError", value: processError, maxCharacters: 500 },
-          { label: "childContexts", value: JSON.stringify(compactChildren), maxCharacters: 500 },
+          { label: "parentModelFailure", value: parentModelFailure ?? "<not captured>" },
+          { label: "processError", value: processError },
+          { label: "childContexts", value: JSON.stringify(compactChildren) },
         ], progress))
       }
       try {
@@ -1265,8 +1524,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           ? processErrorText.replace(parentModelFailure, "<parent model failure captured separately>")
           : processErrorText
         throw new Error(combineFailureDiagnostics([
-          { label: "parentModelFailure", value: parentModelFailure ?? "<not captured>", maxCharacters: 1_200 },
-          { label: "processError", value: processError, maxCharacters: 500 },
+          { label: "parentModelFailure", value: parentModelFailure ?? "<not captured>" },
+          { label: "processError", value: processError },
         ], progress))
       }
       await waitForProcessLine(workerTwo, "P3_PARENT_RESUME_CONTEXT_OK")
@@ -1814,9 +2073,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const diagnostic = boundedDiagnostic(JSON.stringify({ stage: failurePreflightStage, error: failurePreflightError }), 700)
       const progress = await turnProgressDiagnostics(pool!, failureOwner.turnId, FAILURE_WAIT_CALL_ID)
       throw new Error(combineFailureDiagnostics([
-        { label: "failedPrerequisitePreflight", value: diagnostic, maxCharacters: 700 },
-        { label: "waitHandoffFailure", value: failureWaitHandoffFailure ?? "<not captured>", maxCharacters: 1_800 },
-        { label: "turnFailure", value: waitTurnFailureSummary(error), maxCharacters: 320 },
+        { label: "failedPrerequisitePreflight", value: diagnostic },
+        { label: "waitHandoffFailure", value: failureWaitHandoffFailure ?? "<not captured>" },
+        { label: "turnFailure", value: waitTurnFailureSummary(error) },
       ], progress))
     }
 
