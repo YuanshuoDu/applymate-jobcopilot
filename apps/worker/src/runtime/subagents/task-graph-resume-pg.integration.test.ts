@@ -409,7 +409,7 @@ type WaitProposalCandidate = {
   taskIds: DiagnosticIdList
 }
 
-function proposalReceiptForWait(requestedIds: DiagnosticIdList, payloads: readonly unknown[]): WaitProposalCandidate | null {
+function proposalReceiptCandidates(payloads: readonly unknown[]): WaitProposalCandidate[] {
   const candidates: WaitProposalCandidate[] = []
   for (const rawPayload of payloads) {
     const payload = record(rawPayload)
@@ -422,8 +422,51 @@ function proposalReceiptForWait(requestedIds: DiagnosticIdList, payloads: readon
       taskIds: diagnosticIdList(rawNodes.map(node => record(node)?.taskId)),
     })
   }
+  return candidates
+}
+
+function proposalReceiptForWait(requestedIds: DiagnosticIdList, payloads: readonly unknown[]): WaitProposalCandidate | null {
+  const candidates = proposalReceiptCandidates(payloads)
   return candidates.find(candidate => diagnosticIdListsMatch(requestedIds, candidate.taskIds) === true)
     ?? null
+}
+
+function failedWaitReceiptProjection(requestedIds: DiagnosticIdList, payloads: readonly unknown[]): Readonly<{
+  exactReceiptMatchExists: boolean | null
+  proposalReceiptCandidateCount: number | null
+  closestReceiptNodeCount: number | null
+  closestReceiptNodeKeys: readonly string[]
+  requestedIdsOutsideReceiptCount: number | null
+}> {
+  const candidates = proposalReceiptCandidates(payloads)
+  const exact = candidates.find(candidate => diagnosticIdListsMatch(requestedIds, candidate.taskIds) === true) ?? null
+  let closest: WaitProposalCandidate | null = null
+  let closestOverlap = -1
+  for (const candidate of candidates) {
+    const candidateIds = new Set(candidate.taskIds.values)
+    const overlap = requestedIds.valid && candidate.taskIds.valid
+      ? requestedIds.values.filter(id => candidateIds.has(id)).length
+      : -1
+    // Proposal receipts arrive newest-first; preserve that order for ties.
+    if (!closest || overlap > closestOverlap) {
+      closest = candidate
+      closestOverlap = overlap
+    }
+  }
+  const selected = exact ?? closest
+  const selectedIds = selected?.taskIds
+  const outsideCount = selected && requestedIds.valid && selectedIds?.valid
+    ? requestedIds.values.filter(id => !new Set(selectedIds.values).has(id)).length
+    : null
+  return {
+    exactReceiptMatchExists: requestedIds.valid ? exact !== null : null,
+    proposalReceiptCandidateCount: diagnosticBoundedCount(candidates.length),
+    closestReceiptNodeCount: diagnosticBoundedCount(selected?.rawNodes.length ?? null),
+    closestReceiptNodeKeys: selected
+      ? diagnosticEnumList(selected.nodes.map(node => node.key), TASK_GRAPH_DIAGNOSTIC_NODE_KEYS)
+      : [],
+    requestedIdsOutsideReceiptCount: diagnosticBoundedCount(outsideCount),
+  }
 }
 
 type DiagnosticTaskGraphNodes = Readonly<{
@@ -601,6 +644,11 @@ function compactTurnProgressDiagnostics(progress: string, maxCharacters = 1_600)
   const parentMismatchCounts = record(waitLineage?.parentMismatchCounts)
   const toolFailure = record(parsed.diagnosticToolFailure)
   const fixtureNodeKeysMissingRows = waitLineage?.fixtureNodeKeysMissingRows
+  const exactReceiptMatchExists = typeof waitLineage?.exactReceiptMatchExists === "boolean"
+    ? waitLineage.exactReceiptMatchExists : null
+  const proposalReceiptCandidateCount = diagnosticBoundedCount(waitLineage?.proposalReceiptCandidateCount)
+  const closestReceiptNodeCount = diagnosticBoundedCount(waitLineage?.closestReceiptNodeCount)
+  const closestReceiptNodeKeys = diagnosticEnumList(waitLineage?.closestReceiptNodeKeys, TASK_GRAPH_DIAGNOSTIC_NODE_KEYS)
   const tasks = Array.isArray(parsed.tasks) ? parsed.tasks.map(record).filter((item): item is RecordValue => item !== null) : []
   const waits = Array.isArray(parsed.waits) ? parsed.waits.map(record).filter((item): item is RecordValue => item !== null) : []
   const snapshot = {
@@ -630,6 +678,13 @@ function compactTurnProgressDiagnostics(progress: string, maxCharacters = 1_600)
         ? waitLineage.requestedTaskIdsPresentInCurrentGraph
         : null,
       proposalReceiptFound: waitLineage.proposalReceiptFound === true,
+      ...(exactReceiptMatchExists !== null ? { exactReceiptMatchExists } : {}),
+      ...(proposalReceiptCandidateCount !== null ? { proposalReceiptCandidateCount } : {}),
+      ...(closestReceiptNodeCount !== null ? { closestReceiptNodeCount } : {}),
+      ...(closestReceiptNodeKeys.length > 0 ? { closestReceiptNodeKeys } : {}),
+      ...(typeof waitLineage.proposalReceiptHistoryMayBeTruncated === "boolean"
+        ? { proposalReceiptHistoryMayBeTruncated: waitLineage.proposalReceiptHistoryMayBeTruncated }
+        : {}),
       proposalNodeCount: diagnosticBoundedCount(waitLineage.proposalNodeCount),
       requestMatchesReceipt: typeof waitLineage.requestMatchesReceipt === "boolean"
         ? waitLineage.requestMatchesReceipt
@@ -1506,19 +1561,20 @@ async function initialWaitLineageDiagnostics(
       ? await pool.query<{ payload: unknown }>(`SELECT "payload" FROM "agent_events"
           WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3
             AND "type" IN ('item.started', 'item.delta') AND "payload"->>'kind' = 'proposal'
-          ORDER BY "sequence" DESC`, [turn.sessionId, turn.id, graphResult.rows[0].id])
+          ORDER BY "sequence" DESC LIMIT 40`, [turn.sessionId, turn.id, graphResult.rows[0].id])
       : null
-    const proposalCandidate = proposalReceiptForWait(requestedIds, proposalResult?.rows.map(row => row.payload) ?? [])
+    const proposalPayloads = proposalResult?.rows.map(row => row.payload) ?? []
+    const proposalCandidate = proposalReceiptForWait(requestedIds, proposalPayloads)
+    const failureReceipt = {
+      ...failedWaitReceiptProjection(requestedIds, proposalPayloads),
+      proposalReceiptHistoryMayBeTruncated: proposalPayloads.length === 40,
+    }
     const rawProposalNodes = proposalCandidate?.rawNodes ?? []
     const proposalNodes = proposalCandidate?.nodes ?? []
     const proposalTaskIds = proposalCandidate?.taskIds ?? diagnosticIdList(null)
     const proposalReceiptFound = proposalCandidate !== null
     const requestMatchesReceipt = proposalReceiptFound
       ? diagnosticIdListsMatch(requestedIds, proposalTaskIds)
-      : null
-    const proposalTaskIdSet = new Set(proposalTaskIds.values)
-    const requestedIdsOutsideReceiptCount = proposalReceiptFound && requestedIds.valid && proposalTaskIds.valid
-      ? requestedIds.values.filter(id => !proposalTaskIdSet.has(id)).length
       : null
     const requestedTaskIdsPresentInCurrentGraph = diagnosticIdListContainsAll(requestedIds, graphIds)
 
@@ -1602,10 +1658,10 @@ async function initialWaitLineageDiagnostics(
       taskIdsMatchCurrentGraph,
       requestedTaskIdsPresentInCurrentGraph,
       proposalReceiptFound,
+      ...failureReceipt,
       proposalNodeCount: rawProposalNodes.length,
       requestMatchesReceipt,
       requestMatchesCurrentGraph: taskIdsMatchCurrentGraph,
-      requestedIdsOutsideReceiptCount,
       requestedTaskCount: requestedIds.count,
       graphNodeCount: graphIds.count,
       fixtureNodeKeysMissingRows,
@@ -2038,6 +2094,37 @@ describe("compact TaskGraph wait failure diagnostics", () => {
       proposalReceiptFound: false, proposalNodeCount: 0, requestMatchesReceipt: null, requestedIdsOutsideReceiptCount: null,
     })
     expect(JSON.stringify(safeProjection)).not.toContain("private-")
+  })
+
+  it("projects the closest prior receipt for four unmatched wait IDs without conflating matches", () => {
+    const requestedIds = diagnosticIdList([
+      "private-source", "private-summary", "private-large", "private-rejected",
+    ])
+    const proposals = [{
+      kind: "proposal",
+      receipt: { nodes: [{ key: "verification", taskId: "private-unrelated" }] },
+    }]
+    const projection = failedWaitReceiptProjection(requestedIds, proposals)
+    const waitToolResult = { matchedTaskIds: [] as string[] }
+    const compact = compactTurnProgressDiagnostics(JSON.stringify({
+      waitToolResult: { matchedTaskIds: { count: waitToolResult.matchedTaskIds.length } },
+      waitLineage: { proposalReceiptFound: projection.exactReceiptMatchExists, ...projection },
+    }))
+
+    expect(proposalReceiptForWait(requestedIds, proposals)).toBeNull()
+    expect(JSON.parse(compact)).toMatchObject({
+      waitToolResult: { matchedTaskCount: 0 },
+      waitLineage: {
+        proposalReceiptFound: false,
+        exactReceiptMatchExists: false,
+        proposalReceiptCandidateCount: 1,
+        closestReceiptNodeCount: 1,
+        closestReceiptNodeKeys: ["verification"],
+        requestedIdsOutsideReceiptCount: 4,
+      },
+    })
+    expect(Buffer.byteLength(JSON.stringify(projection), "utf8")).toBeLessThanOrEqual(1_200)
+    expect(JSON.stringify(projection)).not.toContain("private-")
   })
 
   it("projects only the finite preflight stage and sanitized error class", () => {
