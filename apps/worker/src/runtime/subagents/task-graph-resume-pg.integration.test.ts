@@ -1021,9 +1021,9 @@ async function restartFollowUpWaitDiagnostics(
         ? graphRow.revision
         : null,
       graphNodeCount: graphNodes?.length ?? null,
-      followUpWaitCallPresent: toolCall.rowCount > 0,
+      followUpWaitCallPresent: toolCall.rows.length > 0,
       followUpWaitCallStatus: diagnosticEnum(toolCall.rows[0]?.status, ITEM_DIAGNOSTIC_STATUSES),
-      followUpWaitResultPresent: toolResult.rowCount > 0,
+      followUpWaitResultPresent: toolResult.rows.length > 0,
       followUpWaitResultStatus: diagnosticEnum(toolResult.rows[0]?.status, ITEM_DIAGNOSTIC_STATUSES),
     }
   } catch {
