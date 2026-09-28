@@ -1868,7 +1868,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         goal: RESTART_FOLLOW_UP_GOAL,
         successCriteria: ["Verify the restored summary evidence"],
         dependsOn: ["summary"],
-        depth: 2,
+        depth: 3,
       })
       expect(graphAfterResume.rows[0]?.revision).toBeGreaterThan(graphBefore.rows[0]!.revision)
       const resumedWaits = await pool!.query<{ id: string; status: string; consumedAt: Date | null; result: unknown; targetTaskIds: unknown }>(
