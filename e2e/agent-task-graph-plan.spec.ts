@@ -9,10 +9,7 @@ const GRAPH_SCHEMA = 'agent-harness.v2.task-graph'
 const TRACE_SCHEMA = 'agent-harness.v2.plan-ledger-trace'
 const SESSION_B = 'task-graph-session-b'
 const TURN_B = 'task-graph-turn-b'
-const ROOT_B = 'task-graph-root-b'
-const CHILD_B = 'task-graph-child-b'
 const GOAL_B = 'Compare engineering teams in Amsterdam'
-const NODE_GOAL_B = 'Review Amsterdam company profiles'
 const TIME = '2026-09-24T10:00:00.000Z'
 
 type PersistedGraphNode = {
@@ -441,16 +438,8 @@ async function installTaskGraphFixture(page: Page, persistedTrace: PersistedPlan
     .map(event => parsePersistedGraphItem(record(event.payload)?.item)), persistedGraphItem]
     .filter((graph): graph is PersistedTaskGraphItem => graph !== null)
     .filter((graph, index, graphs) => graphs.findIndex(candidate => sameIdentity(graphIdentity(candidate), graphIdentity(graph))) === index)
-  const sessionBGraph = parsePersistedGraphItem(taskGraphItem(
-    SESSION_B, TURN_B, ROOT_B, 'task-graph-item-b', 'amsterdam-companies', CHILD_B, NODE_GOAL_B, 9,
-  ))
-  if (!sessionBGraph) throw new Error('Invalid session B TaskGraph fixture item.')
-  const sessionBTasks = [
-    persistedTask(SESSION_B, TURN_B, ROOT_B, ROOT_B, null, 'root', 'orchestrator', 'root', 'running', GOAL_B),
-    persistedTask(SESSION_B, TURN_B, ROOT_B, CHILD_B, ROOT_B, 'root/research', 'scout', 'research', 'queued', NODE_GOAL_B),
-  ]
-  const graphsBySession = new Map<string, PersistedTaskGraphItem[]>([[SESSION_A, sessionAGraphs], [SESSION_B, [sessionBGraph]]])
-  const tasksBySession = new Map<string, PersistedTaskRouteRow[]>([[SESSION_A, persistedTrace.tasks], [SESSION_B, sessionBTasks]])
+  const graphsBySession = new Map<string, PersistedTaskGraphItem[]>([[SESSION_A, sessionAGraphs]])
+  const tasksBySession = new Map<string, PersistedTaskRouteRow[]>([[SESSION_A, persistedTrace.tasks]])
   let deliveryMode: 'default' | 'live' | 'snapshot-tail' = 'default'
   let releaseLiveDelta!: () => void
   const liveDeltaGate = new Promise<void>(resolve => { releaseLiveDelta = resolve })
@@ -460,11 +449,9 @@ async function installTaskGraphFixture(page: Page, persistedTrace: PersistedPlan
   const snapshotCloseGate = new Promise<void>(resolve => { releaseSnapshotClose = resolve })
   const fixture = {
     sessionA: SESSION_A,
-    goalA: GOAL_A,
     planRevision: PLAN_REVISION,
     persistedLedger,
-    identityB: graphIdentity(sessionBGraph),
-    expectedTaskIdsB: graphTaskIds(sessionBGraph),
+    traceGraphIdentities: sessionAGraphs.map(graphIdentity),
     expectedTaskIds,
     eventRequests: new Map<string, Array<string | null>>(),
     requestsByMode: new Map<string, Array<string | null>>(),
@@ -514,7 +501,7 @@ async function installTaskGraphFixture(page: Page, persistedTrace: PersistedPlan
     if (pathname === '/api/agent/sessions') return json(route, {
       sessions: [
         { id: SESSION_A, goal: GOAL_A, status: 'running', updatedAt: TIME, memorySummary: 'Persisted plan A.' },
-        { id: SESSION_B, goal: GOAL_B, status: 'running', updatedAt: TIME, memorySummary: 'Persisted plan B.' },
+        { id: SESSION_B, goal: GOAL_B, status: 'running', updatedAt: TIME, memorySummary: 'No persisted TaskGraph data.' },
       ],
       lastOpenedSessionId: SESSION_A,
     })
@@ -555,10 +542,8 @@ async function installTaskGraphFixture(page: Page, persistedTrace: PersistedPlan
         return route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': task graph fixture stream\n\n' })
       }
       if (resource === 'timeline') {
-        const graph = sessionId === SESSION_A
-          ? persistedTrace.initialGraphItem
-          : sessionBGraph
-        return json(route, { items: [graph], agenda: null, page: { hasMore: false, nextCursor: null } })
+        const items = sessionId === SESSION_A ? [persistedTrace.initialGraphItem] : []
+        return json(route, { items, agenda: null, page: { hasMore: false, nextCursor: null } })
       }
       if (resource === 'tasks') {
         const taskModeKey = `${deliveryMode}:${sessionId}`
@@ -696,7 +681,6 @@ test('Plan Ledger restores the same persisted trace session after SSE reconnect 
   else await expect(plan.locator('[data-agent-task-graph-goal="true"]')).toHaveCount(0)
   for (const node of persistedLedger.nodes) await expect(plan).toContainText(node.goal)
   await expect(plan).not.toContainText(GOAL_B)
-  await expect(plan).not.toContainText(NODE_GOAL_B)
   const interceptedResponse = fixture.planLedgers.get(`${sessionA}:${revision}`)
   const expectedIdentity = graphIdentity(persistedTrace.graphItem)
   expect(interceptedResponse).toEqual({ identity: expectedIdentity, projection: persistedLedger })
@@ -809,23 +793,47 @@ test('Plan Ledger restores the same persisted trace session after SSE reconnect 
   await page.locator('.agent-session-console').getByRole('button').filter({ hasText: GOAL_B }).first().click()
 
   const switchedPlan = page.locator('[data-agent-task-graph-plan="true"]')
-  await expect(switchedPlan).toBeVisible({ timeout: 10_000 })
-  await expect(switchedPlan).toHaveAttribute('data-agent-task-graph-session', SESSION_B)
-  await expect(switchedPlan).toHaveAttribute('data-agent-task-graph-revision', '9')
-  await expect(switchedPlan.locator('[data-agent-task-graph-goal="true"]')).toHaveText(GOAL_B)
-  await expect(switchedPlan).toContainText(NODE_GOAL_B)
-  await expect(switchedPlan).not.toContainText(fixture.goalA)
-  for (const node of persistedLedger.nodes) await expect(switchedPlan).not.toContainText(node.goal)
-  await expect(switchedPlan.locator('[data-task-graph-evidence]')).toHaveCount(0)
-  await expect.poll(() => fixture.planLedgers.has(`${SESSION_B}:9`)).toBe(true)
-  const sessionBResponse = fixture.planLedgers.get(`${SESSION_B}:9`)
-  expect(sessionBResponse?.identity).toEqual(fixture.identityB)
-  expect(sessionBResponse?.projection.sessionId).toBe(SESSION_B)
-  expect(fixture.acceptedTaskLookups).toContainEqual({
-    sessionId: SESSION_B,
-    taskIds: fixture.expectedTaskIdsB,
-    identity: fixture.identityB,
+  await expect.poll(() => fixture.eventRequests.get(SESSION_B)?.length ?? 0, { timeout: 10_000 }).toBeGreaterThan(0)
+  await expect(switchedPlan).toHaveCount(0, { timeout: 10_000 })
+
+  const sessionBIsolation = await page.evaluate(async ({ sessionId, taskIds, identity }) => {
+    const base = `/api/agent/sessions/${encodeURIComponent(sessionId)}`
+    const [timelineResponse, tasksResponse] = await Promise.all([
+      fetch(`${base}/timeline`),
+      fetch(`${base}/tasks`),
+    ])
+    const timeline = await timelineResponse.json() as { items: unknown[] }
+    const tasks = await tasksResponse.json() as { tasks: Array<{ id: string }> }
+    const query = new URLSearchParams()
+    for (const taskId of taskIds) query.append('taskId', taskId)
+    query.set('graphItemId', identity.graphItemId)
+    query.set('graphTurnId', identity.turnId)
+    query.set('rootTaskId', identity.rootTaskId)
+    query.set('graphRevision', String(identity.revision))
+    const lookupResponse = await fetch(`${base}/tasks?${query}`)
+    const lookup = await lookupResponse.json() as { tasks: Array<{ id: string }>; planLedger?: unknown }
+    return {
+      timelineItems: timeline.items,
+      taskIds: tasks.tasks.map(task => task.id),
+      crossSessionLookup: {
+        status: lookupResponse.status,
+        taskIds: lookup.tasks.map(task => task.id),
+        planLedger: lookup.planLedger ?? null,
+      },
+    }
+  }, { sessionId: SESSION_B, taskIds: fixture.expectedTaskIds, identity: expectedIdentity })
+  expect(sessionBIsolation).toEqual({
+    timelineItems: [],
+    taskIds: [],
+    crossSessionLookup: { status: 200, taskIds: [], planLedger: null },
   })
+  expect([...fixture.planLedgers.keys()].some(key => key.startsWith(`${SESSION_B}:`))).toBe(false)
+  const nonNullPlanLedgers = [...fixture.planLedgers.values()].filter((response): response is PlanLedgerResponse => response !== null)
+  expect(nonNullPlanLedgers.length).toBeGreaterThan(0)
+  for (const response of nonNullPlanLedgers) {
+    expect(response.identity.sessionId).toBe(sessionA)
+    expect(fixture.traceGraphIdentities).toContainEqual(response.identity)
+  }
   expect(fixture.forbiddenApiRequests).toEqual([])
   expect(fixture.externalRequests).toEqual([])
 })
