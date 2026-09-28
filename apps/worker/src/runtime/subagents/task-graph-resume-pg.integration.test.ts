@@ -1090,34 +1090,34 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
               expect(graph?.kind).toBe("task_graph_current")
-              expect(nodes.map(node => node?.key)).toEqual(["source", "summary", "large-source", "rejected"])
-              expect(nodes.map(node => node?.status)).toEqual(["completed", "completed", "completed", "cancelled"])
-              expect(nodes.map(node => node?.readiness)).toEqual(["terminal", "terminal", "terminal", "terminal"])
-              const largeSourceProjection = nodes.find(node => node?.key === "large-source")?.resultProjection
-              expect(largeSourceProjection).toMatchObject({
-                schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA,
-                trust: "untrusted", availability: "unavailable",
-              })
-              expect(JSON.stringify(largeSourceProjection)).not.toContain("x".repeat(100))
-              resumedGraphReachedModel = true
-              const waitOutcome = waitOutcomeFromRequest(request, 4)
-              const waitTasks = waitOutcome.tasks.map(record)
-              expect(waitOutcome.status).toBe("ready")
-              const waitTaskForNode = (key: string) => {
-                const taskId = nodes.find(node => node?.key === key)?.taskId
-                return waitTasks.find(task => task?.taskId === taskId)
-              }
-              const sourceWaitTask = waitTaskForNode("source")
-              const summaryWaitTask = waitTaskForNode("summary")
-              const largeSourceWaitTask = waitTaskForNode("large-source")
-              const rejectedWaitTask = waitTaskForNode("rejected")
-              expect(sourceWaitTask).toMatchObject({ status: "completed" })
-              expect(summaryWaitTask).toMatchObject({ status: "completed" })
-              expect(largeSourceWaitTask).toMatchObject({ status: "completed" })
-              expect(rejectedWaitTask).toMatchObject({ status: "cancelled" })
-              expect(record(record(sourceWaitTask?.result)?.structuredResult)?.summary).toBe("Read the fixture source")
-              expect(record(record(summaryWaitTask?.result)?.structuredResult)?.summary).toBe("Summarize the fixture source")
               if (modelRounds === 1) {
+                expect(nodes.map(node => node?.key)).toEqual(["source", "summary", "large-source", "rejected"])
+                expect(nodes.map(node => node?.status)).toEqual(["completed", "completed", "completed", "cancelled"])
+                expect(nodes.map(node => node?.readiness)).toEqual(["terminal", "terminal", "terminal", "terminal"])
+                const largeSourceProjection = nodes.find(node => node?.key === "large-source")?.resultProjection
+                expect(largeSourceProjection).toMatchObject({
+                  schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA,
+                  trust: "untrusted", availability: "unavailable",
+                })
+                expect(JSON.stringify(largeSourceProjection)).not.toContain("x".repeat(100))
+                resumedGraphReachedModel = true
+                const waitOutcome = waitOutcomeFromRequest(request, 4)
+                const waitTasks = waitOutcome.tasks.map(record)
+                expect(waitOutcome.status).toBe("ready")
+                const waitTaskForNode = (key: string) => {
+                  const taskId = nodes.find(node => node?.key === key)?.taskId
+                  return waitTasks.find(task => task?.taskId === taskId)
+                }
+                const sourceWaitTask = waitTaskForNode("source")
+                const summaryWaitTask = waitTaskForNode("summary")
+                const largeSourceWaitTask = waitTaskForNode("large-source")
+                const rejectedWaitTask = waitTaskForNode("rejected")
+                expect(sourceWaitTask).toMatchObject({ status: "completed" })
+                expect(summaryWaitTask).toMatchObject({ status: "completed" })
+                expect(largeSourceWaitTask).toMatchObject({ status: "completed" })
+                expect(rejectedWaitTask).toMatchObject({ status: "cancelled" })
+                expect(record(record(sourceWaitTask?.result)?.structuredResult)?.summary).toBe("Read the fixture source")
+                expect(record(record(summaryWaitTask?.result)?.structuredResult)?.summary).toBe("Summarize the fixture source")
                 const revision = graph?.revision
                 if (typeof revision !== "number" || !Number.isSafeInteger(revision)) throw new Error("Resumed current graph revision is invalid")
                 followUpExpectedRevision = revision
@@ -1136,12 +1136,19 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 return
               }
               if (modelRounds === 2) {
+                expect(nodes.map(node => node?.key)).toEqual(["source", "summary", "large-source", "rejected", "verification"])
+                expect(nodes.slice(0, 4).map(node => node?.status)).toEqual(["completed", "completed", "completed", "cancelled"])
+                expect(nodes.slice(0, 4).map(node => node?.readiness)).toEqual(["terminal", "terminal", "terminal", "terminal"])
+                const plannedTaskIds = planTaskIds(request, FOLLOW_UP_PLAN_CALL_ID, 1)
+                expect(nodes.find(node => node?.key === "verification")).toMatchObject({
+                  key: "verification", taskId: plannedTaskIds[0],
+                })
                 expect(request.tools.map(tool => record(tool)?.name)).toContain("agent.wait")
                 yield {
                   type: "tool_call_completed", callId: FOLLOW_UP_WAIT_CALL_ID, name: "agent.wait",
                   arguments: {
                     idempotencyKey: `p3-task-graph-follow-up-wait:${owner.turnId}`,
-                    taskIds: planTaskIds(request, FOLLOW_UP_PLAN_CALL_ID, 1), mode: "all", timeoutMs: 20_000,
+                    taskIds: plannedTaskIds, mode: "all", timeoutMs: 20_000,
                   },
                 }
                 yield { type: "completed", finishReason: "tool_calls" }

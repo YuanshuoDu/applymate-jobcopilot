@@ -141,7 +141,97 @@ async function waitForParentSuspended(ownerId, timeoutMs = 20_000) {
     if (row?.turnStatus === "waiting_for_dependency" && row?.waitStatus === "waiting" && row.suspendedAt && Number(row.revision) > 0 && Array.isArray(content?.nodes) && content.nodes.length === 2) { say("P3_PARENT_SUSPENDED " + JSON.stringify({ ownerId, revision: Number(row.revision), snapshot: content })); return }
     await sleep(20)
   }
+  say("P3_PARENT_SUSPENSION_DIAGNOSTICS " + JSON.stringify(await parentSuspensionDiagnostics()))
   throw new Error("p3_parent_wait_not_suspended")
+}
+async function parentSuspensionDiagnostics() {
+  try {
+    const [turnResult, stepResult, toolResult, waitResult, graphResult, childResult] = await Promise.all([
+      pool.query(`SELECT turn."status" AS "turnStatus", turn."rootTaskId" IS NOT NULL AS "hasRootTask",
+          turn."startedAt" IS NOT NULL AS "hasStartedAt", turn."error" IS NOT NULL AS "hasError"
+        FROM "agent_turns" AS turn WHERE turn."id" = $1`, [ids.turnId]),
+      pool.query(`SELECT step."ordinal", step."status", step."errorCode" IS NOT NULL AS "hasErrorCode" FROM "agent_steps" AS step
+        JOIN "agent_turns" AS turn ON turn."id" = step."turnId"
+        WHERE turn."id" = $1 AND (step."taskId" IS NULL OR step."taskId" = turn."rootTaskId")
+        ORDER BY step."ordinal"`, [ids.turnId]),
+      pool.query(`WITH target_turn AS (
+          SELECT "id", "sessionId", "rootTaskId" FROM "agent_turns" WHERE "id" = $1
+        ), parent_items AS (
+          SELECT item."type", item."status", item."content"->>'toolName' AS "toolName",
+            item."content"->>'toolCallId' AS "toolCallId",
+            item."content"->'output'->>'status' AS "planReceiptStatus"
+          FROM "agent_items" AS item JOIN target_turn AS turn ON turn."id" = item."turnId"
+          WHERE item."sessionId" = turn."sessionId" AND (item."taskId" IS NULL OR item."taskId" = turn."rootTaskId")
+            AND item."type" IN ('tool_call', 'tool_result')
+        )
+        SELECT EXISTS (SELECT 1 FROM parent_items WHERE "type" = 'tool_call' AND "toolName" = 'agent.plan') AS "hasPlanToolCall",
+          EXISTS (SELECT 1 FROM parent_items AS call JOIN parent_items AS result ON result."toolCallId" = call."toolCallId"
+            WHERE call."type" = 'tool_call' AND call."toolName" = 'agent.plan' AND result."type" = 'tool_result') AS "hasPlanToolResult",
+          EXISTS (SELECT 1 FROM parent_items AS call JOIN parent_items AS result ON result."toolCallId" = call."toolCallId"
+            WHERE call."type" = 'tool_call' AND call."toolName" = 'agent.plan' AND result."type" = 'tool_result' AND result."status" = 'failed') AS "hasFailedPlanToolResult",
+          ARRAY(SELECT result."planReceiptStatus" FROM parent_items AS call JOIN parent_items AS result ON result."toolCallId" = call."toolCallId"
+            WHERE call."type" = 'tool_call' AND call."toolName" = 'agent.plan' AND result."type" = 'tool_result'
+              AND result."planReceiptStatus" IN ('accepted', 'duplicate', 'rejected')
+            ORDER BY result."planReceiptStatus") AS "planReceiptStatuses",
+          EXISTS (SELECT 1 FROM parent_items WHERE "type" = 'tool_call' AND "toolName" = 'agent.wait') AS "hasWaitToolCall"`, [ids.turnId]),
+      pool.query(`SELECT wait."status" AS "waitStatus", wait."parentTaskId" = turn."rootTaskId" AS "parentMatchesRoot",
+          wait."suspendedAt" IS NOT NULL AS "hasSuspendedAt"
+        FROM "agent_wait_conditions" AS wait JOIN "agent_turns" AS turn ON turn."id" = wait."turnId"
+        WHERE turn."id" = $1`, [ids.turnId]),
+      pool.query(`SELECT item."revision", jsonb_typeof(item."content"->'nodes') = 'array' AS "hasNodeArray",
+          CASE WHEN jsonb_typeof(item."content"->'nodes') = 'array' THEN jsonb_array_length(item."content"->'nodes') ELSE NULL END AS "nodeCount"
+        FROM "agent_items" AS item JOIN "agent_turns" AS turn ON turn."id" = item."turnId"
+        WHERE turn."id" = $1 AND item."sessionId" = turn."sessionId" AND item."taskId" = turn."rootTaskId"
+          AND item."type" = 'task_graph' ORDER BY item."revision" DESC, item."updatedAt" DESC LIMIT 1`, [ids.turnId]),
+      pool.query(`SELECT child."status", COUNT(*)::int AS "count"
+        FROM "sub_agent_tasks" AS child JOIN "agent_turns" AS turn
+          ON turn."id" = child."turnId" AND turn."sessionId" = child."sessionId" AND turn."rootTaskId" = child."parentTaskId"
+        WHERE turn."id" = $1 GROUP BY child."status"`, [ids.turnId]),
+    ])
+    const turn = turnResult.rows[0]
+    const graph = graphResult.rows[0]
+    const tool = toolResult.rows[0] ?? {}
+    const snapshot = {
+      turnStatus: turn?.turnStatus ?? null,
+      hasTurn: Boolean(turn),
+      hasRootTask: Boolean(turn?.hasRootTask),
+      hasStartedAt: Boolean(turn?.hasStartedAt),
+      hasError: Boolean(turn?.hasError),
+      modelStepCount: stepResult.rows.length,
+      latestModelStep: stepResult.rows.length ? {
+        ordinal: Number(stepResult.rows[stepResult.rows.length - 1].ordinal),
+        status: stepResult.rows[stepResult.rows.length - 1].status,
+        hasErrorCode: Boolean(stepResult.rows[stepResult.rows.length - 1].hasErrorCode),
+      } : null,
+      hasPlanToolCall: Boolean(tool.hasPlanToolCall),
+      hasPlanToolResult: Boolean(tool.hasPlanToolResult),
+      hasFailedPlanToolResult: Boolean(tool.hasFailedPlanToolResult),
+      planReceiptStatuses: Array.isArray(tool.planReceiptStatuses) ? tool.planReceiptStatuses : [],
+      hasWaitToolCall: Boolean(tool.hasWaitToolCall),
+      waits: waitResult.rows.map(row => ({
+        status: row.waitStatus,
+        parentMatchesRoot: Boolean(row.parentMatchesRoot),
+        hasSuspendedAt: Boolean(row.hasSuspendedAt),
+      })),
+      graph: graph ? { present: true, revision: Number(graph.revision), hasNodeArray: Boolean(graph.hasNodeArray), nodeCount: graph.nodeCount === null ? null : Number(graph.nodeCount) }
+        : { present: false, revision: null, hasNodeArray: false, nodeCount: null },
+      childStatusCounts: Object.fromEntries(childResult.rows.map(row => [row.status, Number(row.count)])),
+    }
+    snapshot.likelyCause = !snapshot.hasTurn ? "turn_missing"
+      : snapshot.turnStatus === "failed" ? "turn_failed"
+      : snapshot.modelStepCount === 0 ? "model_never_ran"
+      : !snapshot.hasPlanToolCall ? "plan_not_called"
+      : snapshot.hasFailedPlanToolResult || !snapshot.hasPlanToolResult
+        || !snapshot.planReceiptStatuses.some(status => status === "accepted" || status === "duplicate")
+        || !snapshot.graph.present ? "plan_failed_or_incomplete"
+      : !snapshot.graph.hasNodeArray || snapshot.graph.nodeCount !== 2 ? "graph_shape_mismatch"
+      : !snapshot.hasWaitToolCall || !snapshot.waits.some(wait => wait.parentMatchesRoot) ? "wait_row_missing_or_parent_mismatch"
+      : !snapshot.waits.some(wait => wait.parentMatchesRoot && wait.status === "waiting" && wait.hasSuspendedAt) ? "wait_row_not_suspended"
+      : "suspension_predicate_not_met"
+    return snapshot
+  } catch {
+    return { diagnosticsAvailable: false }
+  }
 }
 async function projectPersistedPlanLedger() {
   const { rows: [item] } = await pool.query(`SELECT item."taskId", item."revision", item."content" FROM "agent_items" AS item WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."type" = 'task_graph'`, [ids.sessionId, ids.turnId])
