@@ -331,6 +331,20 @@ const PROCESS_FIXTURE_CAUSES = new Set([
   "requested_graph_tasks_missing_child_rows", "wait_tool_failed_before_wait_persistence",
   "wait_row_missing_or_parent_mismatch", "turn_failed", "wait_row_not_suspended", "suspension_predicate_not_met",
 ])
+const RESTORED_SOURCE_PROJECTION_CATEGORIES = new Set([
+  "absent", "invalid", "wrong_schema", "unavailable", "wrong_role", "wrong_status", "wrong_count",
+  "candidate_identity_mismatch", "valid", "missing", "other",
+])
+const RESTORED_SOURCE_PROJECTION_SCHEMAS = new Set(["expected", "missing", "other"])
+const RESTORED_SOURCE_PROJECTION_AVAILABILITIES = new Set(["available", "unavailable", "missing", "other"])
+const RESTORED_SOURCE_PROJECTION_ROLES = new Set(["scout", "analyst", "missing", "other"])
+const RESTORED_SOURCE_PROJECTION_STATUSES = new Set(["completed", "partial", "missing", "other"])
+const RESTORED_SOURCE_PROJECTION_SHAPES = new Set(["not_object", "other"])
+const RESTORED_SOURCE_PROJECTION_INVALID_FIELDS = new Set([
+  "trust", "availability", "count_or_candidates", "candidate_shape", "other",
+])
+const RESTORED_SOURCE_PROJECTION_IDENTITIES = new Set(["unchecked", "match", "mismatch", "other"])
+const RESTORED_SOURCE_PROJECTION_DIAGNOSTIC_COUNT_LIMIT = 99
 
 function diagnosticText(value: unknown, maxCharacters = 64): string | null {
   return typeof value === "string" ? boundedDiagnostic(value, maxCharacters) : null
@@ -1428,6 +1442,91 @@ function processFixtureDiagnostics(child: ProcessFixtureChild): string {
   return boundedDiagnostic(diagnostic, 1_600)
 }
 
+function jsonObjectEnd(source: string, start: number): number | null {
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let index = start; index < source.length; index += 1) {
+    const character = source[index]
+    if (inString) {
+      if (escaped) escaped = false
+      else if (character === "\\") escaped = true
+      else if (character === '"') inString = false
+      continue
+    }
+    if (character === '"') inString = true
+    else if (character === "{") depth += 1
+    else if (character === "}") {
+      depth -= 1
+      if (depth === 0) return index + 1
+    }
+  }
+  return null
+}
+
+function safeRestoredSourceProjectionEnum(value: unknown, allowed: ReadonlySet<string>): string {
+  if (value === null || value === undefined) return "missing"
+  return typeof value === "string" && allowed.has(value) ? value : "other"
+}
+
+function safeRestoredSourceProjectionCount(value: unknown): number | null {
+  if (value === null || value === undefined) return null
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? Math.min(value, RESTORED_SOURCE_PROJECTION_DIAGNOSTIC_COUNT_LIMIT)
+    : null
+}
+
+function restoredSourceProjectionFailureSafeValue(parentModelFailure: string | null): string {
+  const marker = "p3_restored_graph_source_projection_missing:"
+  const markerIndex = parentModelFailure?.indexOf(marker) ?? -1
+  if (markerIndex < 0 || !parentModelFailure) return "unavailable"
+  const jsonStart = markerIndex + marker.length
+  if (parentModelFailure[jsonStart] !== "{") return "unavailable"
+  const jsonEnd = jsonObjectEnd(parentModelFailure, jsonStart)
+  if (jsonEnd === null) return "unavailable"
+
+  let parsed: unknown
+  try { parsed = JSON.parse(parentModelFailure.slice(jsonStart, jsonEnd)) as unknown } catch { return "unavailable" }
+  const source = record(parsed)
+  if (!source) return "unavailable"
+
+  const projection: RecordValue = {
+    category: safeRestoredSourceProjectionEnum(source.category, RESTORED_SOURCE_PROJECTION_CATEGORIES),
+  }
+  const enumFields: ReadonlyArray<readonly [string, ReadonlySet<string>]> = [
+    ["shape", RESTORED_SOURCE_PROJECTION_SHAPES],
+    ["schema", RESTORED_SOURCE_PROJECTION_SCHEMAS],
+    ["availability", RESTORED_SOURCE_PROJECTION_AVAILABILITIES],
+    ["role", RESTORED_SOURCE_PROJECTION_ROLES],
+    ["status", RESTORED_SOURCE_PROJECTION_STATUSES],
+    ["invalidField", RESTORED_SOURCE_PROJECTION_INVALID_FIELDS],
+    ["candidateIdentity", RESTORED_SOURCE_PROJECTION_IDENTITIES],
+  ]
+  for (const [field, allowed] of enumFields) {
+    if (Object.prototype.hasOwnProperty.call(source, field)) {
+      projection[field] = safeRestoredSourceProjectionEnum(source[field], allowed)
+    }
+  }
+  for (const field of ["candidateCount", "evidenceCount", "candidateArrayCount"]) {
+    if (Object.prototype.hasOwnProperty.call(source, field)) {
+      projection[field] = safeRestoredSourceProjectionCount(source[field])
+    }
+  }
+  return boundedDiagnostic(JSON.stringify(projection), 500)
+}
+
+function parentModelFailureDiagnosticFields(parentModelFailure: string | null): FailureDiagnosticField[] {
+  const value = parentModelFailure ?? "<not captured>"
+  return [
+    { label: "parentModelFailure", value },
+    {
+      label: "restoredSourceProjection",
+      value,
+      safeValue: restoredSourceProjectionFailureSafeValue(parentModelFailure),
+    },
+  ]
+}
+
 async function waitForProcessLine(child: ProcessFixtureChild, prefix: string, timeoutMs = 20_000): Promise<string> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
@@ -2138,6 +2237,69 @@ describe("compact TaskGraph wait failure diagnostics", () => {
     expect(output).toContain("failurePreflightStage=first_target_lineage")
     expect(output).toContain("failurePreflightErrorClass=assertion")
     expect(output).not.toContain(marker)
+  })
+
+  it("surfaces only a valid restored source projection classification", () => {
+    const parentFailure = "P3_PARENT_MODEL_FAILURE Error: p3_restored_graph_source_projection_missing:{"
+      + '"category":"wrong_role","schema":"expected","availability":"available","role":"other",'
+      + '"status":"completed","candidateCount":1,"evidenceCount":1,"candidateArrayCount":1,'
+      + '"candidateIdentity":"unchecked","extra":"private-projection-payload"} at private-fixture-path'
+    const safeValue = restoredSourceProjectionFailureSafeValue(parentFailure)
+    const output = combineFailureDiagnostics(parentModelFailureDiagnosticFields(parentFailure), "{}")
+
+    expect(JSON.parse(safeValue)).toEqual({
+      category: "wrong_role", schema: "expected", availability: "available", role: "other",
+      status: "completed", candidateIdentity: "unchecked", candidateCount: 1,
+      evidenceCount: 1, candidateArrayCount: 1,
+    })
+    expect(output).toContain('restoredSourceProjection={"category":"wrong_role"')
+    expect(output).not.toContain("private-projection-payload")
+    expect(output).not.toContain("private-fixture-path")
+    expect(output).not.toContain("P3_PARENT_MODEL_FAILURE")
+  })
+
+  it("projects a missing source projection category to the whitelisted missing value", () => {
+    const parentFailure = "P3_PARENT_MODEL_FAILURE Error: p3_restored_graph_source_projection_missing:{"
+      + '"role":"scout","candidateCount":1} at fixture'
+
+    expect(JSON.parse(restoredSourceProjectionFailureSafeValue(parentFailure))).toEqual({
+      category: "missing", role: "scout", candidateCount: 1,
+    })
+  })
+
+  it("strips malformed and private restored projection diagnostic content", () => {
+    const canary = "private-role-and-candidate-id"
+    const privateFailure = "P3_PARENT_MODEL_FAILURE Error: p3_restored_graph_source_projection_missing:{"
+      + `"category":"wrong_role","role":"${canary}","candidateIdentity":"${canary}",`
+      + `"candidateCount":"${canary}","extra":"${canary}"} at ${canary}`
+    const safeValue = restoredSourceProjectionFailureSafeValue(privateFailure)
+    const malformed = "P3_PARENT_MODEL_FAILURE Error: p3_restored_graph_source_projection_missing:{\"category\":"
+    const output = combineFailureDiagnostics([
+      { label: "restoredSourceProjection", value: privateFailure, safeValue },
+      { label: "malformedSourceProjection", value: malformed, safeValue: restoredSourceProjectionFailureSafeValue(malformed) },
+    ], "{}")
+
+    expect(JSON.parse(safeValue)).toEqual({ category: "wrong_role", role: "other", candidateIdentity: "other", candidateCount: null })
+    expect(output).toContain("malformedSourceProjection=unavailable")
+    expect(output).not.toContain(canary)
+    expect(output).not.toContain("P3_PARENT_MODEL_FAILURE")
+  })
+
+  it("reports an absent restored projection marker as unavailable", () => {
+    expect(restoredSourceProjectionFailureSafeValue(null)).toBe("unavailable")
+    expect(restoredSourceProjectionFailureSafeValue("P3_PARENT_MODEL_FAILURE Error: p3_other_failure")).toBe("unavailable")
+  })
+
+  it("caps restored source projection diagnostic counts", () => {
+    const parentFailure = "P3_PARENT_MODEL_FAILURE Error: p3_restored_graph_source_projection_missing:{"
+      + `"category":"wrong_count","candidateCount":${Number.MAX_SAFE_INTEGER},`
+      + '"evidenceCount":1000,"candidateArrayCount":-1} at fixture'
+    const safeValue = restoredSourceProjectionFailureSafeValue(parentFailure)
+
+    expect(JSON.parse(safeValue)).toEqual({
+      category: "wrong_count", candidateCount: 99, evidenceCount: 99, candidateArrayCount: null,
+    })
+    expect(safeValue.length).toBeLessThan(500)
   })
 
   it("projects completed graph statuses by fixed node keys without exposing node payloads", () => {
@@ -3438,7 +3600,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           ? processErrorText.replace(parentModelFailure, "<parent model failure captured separately>")
           : processErrorText
         throw new Error(combineFailureDiagnostics([
-          { label: "parentModelFailure", value: parentModelFailure ?? "<not captured>" },
+          ...parentModelFailureDiagnosticFields(parentModelFailure),
           { label: "processError", value: processError },
           { label: "childContexts", value: JSON.stringify(compactChildren) },
         ], progress))
@@ -3453,7 +3615,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           ? processErrorText.replace(parentModelFailure, "<parent model failure captured separately>")
           : processErrorText
         throw new Error(combineFailureDiagnostics([
-          { label: "parentModelFailure", value: parentModelFailure ?? "<not captured>" },
+          ...parentModelFailureDiagnosticFields(parentModelFailure),
           { label: "processError", value: processError },
         ], progress))
       }
