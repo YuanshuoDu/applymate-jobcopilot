@@ -41,10 +41,22 @@ jobs:
         run: pnpm --filter @jobcopilot/web exec prisma generate
       - name: Run non-Web workspace tests
         run: pnpm turbo test --filter='!@jobcopilot/web'
-      - name: Run Web Vitest shard 1 of 2
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=1/2
-      - name: Run Web Vitest shard 2 of 2
-        run: pnpm --filter @jobcopilot/web exec vitest run --shard=2/2
+      - name: Run Web Vitest shard 1 of 8
+        run: pnpm --filter @jobcopilot/web exec vitest run --shard=1/8
+      - name: Run Web Vitest shard 2 of 8
+        run: pnpm --filter @jobcopilot/web exec vitest run --shard=2/8
+      - name: Run Web Vitest shard 3 of 8
+        run: pnpm --filter @jobcopilot/web exec vitest run --shard=3/8
+      - name: Run Web Vitest shard 4 of 8
+        run: pnpm --filter @jobcopilot/web exec vitest run --shard=4/8
+      - name: Run Web Vitest shard 5 of 8
+        run: pnpm --filter @jobcopilot/web exec vitest run --shard=5/8
+      - name: Run Web Vitest shard 6 of 8
+        run: pnpm --filter @jobcopilot/web exec vitest run --shard=6/8
+      - name: Run Web Vitest shard 7 of 8
+        run: pnpm --filter @jobcopilot/web exec vitest run --shard=7/8
+      - name: Run Web Vitest shard 8 of 8
+        run: pnpm --filter @jobcopilot/web exec vitest run --shard=8/8
       - name: Run best-effort Playwright tests
         run: pnpm exec playwright test || true
   agent-runtime-postgres:
