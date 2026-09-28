@@ -206,6 +206,9 @@ const ITEM_DIAGNOSTIC_STATUSES = new Set(["started", "completed", "failed", "can
 const WAIT_DIAGNOSTIC_STATUSES = new Set(["waiting", "ready", "timed_out", "consumed", "failed", "cancelled", "interrupted"])
 const WAIT_HANDOFF_ERROR_CODES = new Set(["40P01", "40001", "55P03", "57014", "23505", "23503", "wait_handoff_unavailable"])
 const WAIT_HANDOFF_ERROR_NAMES = new Set(["Error", "error", "WaitHandoffUnavailable"])
+const TASK_GRAPH_DIAGNOSTIC_NODE_KEYS = new Set([
+  "source", "summary", "large-source", "rejected", "verification", "prerequisite", "dependent",
+])
 const TASK_DIAGNOSTIC_STATUSES = new Set([
   "queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed",
 ])
@@ -216,6 +219,17 @@ function diagnosticText(value: unknown, maxCharacters = 64): string | null {
 
 function diagnosticEnum(value: unknown, allowed: ReadonlySet<string>): string | null {
   return typeof value === "string" && allowed.has(value) ? value : null
+}
+
+function diagnosticEnumList(value: unknown, allowed: ReadonlySet<string>, maxItems = 8): string[] {
+  if (!Array.isArray(value)) return []
+  const projected: string[] = []
+  for (const item of value.slice(0, maxItems * 2)) {
+    const safeValue = diagnosticEnum(item, allowed)
+    if (safeValue && !projected.includes(safeValue)) projected.push(safeValue)
+    if (projected.length >= maxItems) break
+  }
+  return projected
 }
 
 function diagnosticCount(value: unknown): number | null {
@@ -245,7 +259,7 @@ function diagnosticIdListsMatch(left: DiagnosticIdList, right: DiagnosticIdList)
   return left.values.every(value => rightValues.has(value))
 }
 
-function compactTurnProgressDiagnostics(progress: string, maxCharacters = 1_350): string {
+function compactTurnProgressDiagnostics(progress: string, maxCharacters = 1_600): string {
   let parsed: RecordValue | null = null
   try { parsed = record(JSON.parse(progress) as unknown) } catch { return JSON.stringify({ available: false }) }
   if (!parsed) return JSON.stringify({ available: false })
@@ -257,6 +271,7 @@ function compactTurnProgressDiagnostics(progress: string, maxCharacters = 1_350)
   const targetMismatchCounts = record(targetRows?.mismatchCounts)
   const parentMismatchCounts = record(waitLineage?.parentMismatchCounts)
   const toolFailure = record(parsed.diagnosticToolFailure)
+  const fixtureNodeKeysMissingRows = waitLineage?.fixtureNodeKeysMissingRows
   const tasks = Array.isArray(parsed.tasks) ? parsed.tasks.map(record).filter((item): item is RecordValue => item !== null) : []
   const waits = Array.isArray(parsed.waits) ? parsed.waits.map(record).filter((item): item is RecordValue => item !== null) : []
   const snapshot = {
@@ -284,6 +299,7 @@ function compactTurnProgressDiagnostics(progress: string, maxCharacters = 1_350)
         : null,
       requestedTaskCount: typeof waitLineage.requestedTaskCount === "number" ? waitLineage.requestedTaskCount : null,
       graphNodeCount: typeof waitLineage.graphNodeCount === "number" ? waitLineage.graphNodeCount : null,
+      fixtureNodeKeysMissingRows: diagnosticEnumList(fixtureNodeKeysMissingRows, TASK_GRAPH_DIAGNOSTIC_NODE_KEYS),
       waitItemFound: waitLineage.waitItemFound === true,
       waitItemMatchesRoot: waitLineage.waitItemMatchesRoot === true,
       parentTaskFound: waitLineage.parentTaskFound === true,
@@ -724,7 +740,7 @@ async function initialWaitLineageDiagnostics(
           AND ("sessionId" = $2 OR "turnId" = $3 OR "taskId" = $4)
         ORDER BY "createdAt" DESC LIMIT 1`, [toolCallId, turn.sessionId, turn.id, turn.rootTaskId]),
       turn.rootTaskId
-        ? pool.query<{ content: unknown }>(`SELECT "content" FROM "agent_items"
+        ? pool.query<{ id: string; content: unknown }>(`SELECT "id", "content" FROM "agent_items"
             WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "type" = 'task_graph'
             ORDER BY "revision" DESC, "updatedAt" DESC LIMIT 1`, [turn.sessionId, turn.id, turn.rootTaskId])
         : Promise.resolve(null),
@@ -737,6 +753,19 @@ async function initialWaitLineageDiagnostics(
     const graphNodes = Array.isArray(graphContent?.nodes) ? graphContent.nodes : null
     const graphIds = diagnosticIdList(graphNodes?.map(node => record(node)?.taskId))
     const taskIdsMatchCurrentGraph = diagnosticIdListsMatch(requestedIds, graphIds)
+    const proposalResult = graphResult?.rows[0]?.id
+      ? await pool.query<{ payload: unknown }>(`SELECT "payload" FROM "agent_events"
+          WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3
+            AND "type" IN ('item.started', 'item.delta') AND "payload"->>'kind' = 'proposal'
+          ORDER BY "sequence" DESC LIMIT 20`, [turn.sessionId, turn.id, graphResult.rows[0].id])
+      : null
+    const proposalNodes = (proposalResult?.rows ?? []).flatMap(event => {
+      const payload = record(event.payload)
+      const receipt = record(payload?.receipt)
+      return payload?.kind === "proposal" && Array.isArray(receipt?.nodes)
+        ? receipt.nodes.map(record).filter((node): node is RecordValue => node !== null)
+        : []
+    })
 
     const expectedParentId = toolItem?.taskId ?? turn.rootTaskId
     const parentResult = typeof expectedParentId === "string"
@@ -765,6 +794,16 @@ async function initialWaitLineageDiagnostics(
           WHERE task."id" = ANY($1::text[])`, [requestedIds.values])
       : null
     const targets = targetResult?.rows ?? []
+    const requestedIdSet = new Set(requestedIds.values)
+    const foundTargetIdSet = new Set(targets.map(target => target.id))
+    const fixtureNodeKeysMissingRows = requestedIds.valid
+      ? [...new Set(proposalNodes.flatMap(node =>
+        typeof node.key === "string" && TASK_GRAPH_DIAGNOSTIC_NODE_KEYS.has(node.key)
+          && typeof node.taskId === "string" && requestedIdSet.has(node.taskId) && !foundTargetIdSet.has(node.taskId)
+          ? [node.key]
+          : []
+      ))].slice(0, 8)
+      : []
     const userMismatchCount = targetResult
       ? targets.filter(target => target.userId !== turn.userId).length
       : null
@@ -791,6 +830,7 @@ async function initialWaitLineageDiagnostics(
       taskIdsMatchCurrentGraph,
       requestedTaskCount: requestedIds.count,
       graphNodeCount: graphIds.count,
+      fixtureNodeKeysMissingRows,
       waitItemFound: Boolean(toolItem),
       waitItemMatchesRoot: Boolean(toolItem && turn.rootTaskId
         && toolItem.sessionId === turn.sessionId && toolItem.turnId === turn.id && toolItem.taskId === turn.rootTaskId),
@@ -1049,6 +1089,7 @@ describe("compact TaskGraph wait failure diagnostics", () => {
       },
       waitLineage: {
         available: true, taskIdsMatchCurrentGraph: false, requestedTaskCount: 2, graphNodeCount: 2,
+        fixtureNodeKeysMissingRows: ["source", markers[2], "summary", markers[5], "rejected"],
         waitItemFound: true, waitItemMatchesRoot: true, parentTaskFound: true,
         parentIdIsTurnRoot: true, parentSameSession: true, parentSameTurn: true,
         parentRootIsTurnRoot: true, parentHasNoParent: true, parentTaskMatchesUser: true,
@@ -1076,6 +1117,7 @@ describe("compact TaskGraph wait failure diagnostics", () => {
       waitToolResult: { status: "failed", outputStatus: "waiting", matchedTaskCount: 2, truncatedTaskResultCount: 1 },
       waitLineage: {
         taskIdsMatchCurrentGraph: false, requestedTaskCount: 2, graphNodeCount: 2,
+        fixtureNodeKeysMissingRows: ["source", "summary", "rejected"],
         targetRows: { requestedCount: 2, foundCount: 2, allInExpectedScope: true },
       },
       tasks: [{ goalPresent: true, status: "failed", attempts: 2, failureReasonPresent: true }],

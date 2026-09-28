@@ -39,6 +39,16 @@ function waitForCommand(command) {
   return new Promise(resolve => { const waiters = commandWaiters.get(command) ?? []; waiters.push(resolve); commandWaiters.set(command, waiters) })
 }
 function record(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : null }
+function turnErrorCategory(value) {
+  if (typeof value !== "string" || value.trim().length === 0) return "none"
+  const normalized = value.toLowerCase()
+  if (/\b40p01\b|deadlock detected|deadlock found/.test(normalized)) return "database_deadlock"
+  if (/\b40001\b|serialization failure/.test(normalized)) return "database_serialization"
+  if (/\b55p03\b|\block_not_available\b|lock timeout/.test(normalized)) return "database_lock_wait"
+  if (/\bwait_(?:invalid|scope_error)\b|durablewaithandofferror/.test(normalized)) return "wait_handoff_state"
+  if (/\blease_lost\b|turnleaseerror/.test(normalized)) return "turn_lease_state"
+  return "other"
+}
 function isExpectedSourceProjection(value) {
   const projection = record(value), candidates = Array.isArray(projection?.candidates) ? projection.candidates.map(record) : [], candidate = candidates[0]
   return projection?.schemaVersion === "agent-harness.v2.task-graph.result-projection" && projection.trust === "untrusted"
@@ -148,7 +158,7 @@ async function parentSuspensionDiagnostics() {
   try {
     const [turnResult, stepResult, toolResult, waitResult, graphResult, childResult] = await Promise.all([
       pool.query(`SELECT turn."status" AS "turnStatus", turn."rootTaskId" IS NOT NULL AS "hasRootTask",
-          turn."startedAt" IS NOT NULL AS "hasStartedAt", turn."error" IS NOT NULL AS "hasError"
+          turn."startedAt" IS NOT NULL AS "hasStartedAt", turn."error" AS "turnError"
         FROM "agent_turns" AS turn WHERE turn."id" = $1`, [ids.turnId]),
       pool.query(`SELECT step."ordinal", step."status", step."errorCode" IS NOT NULL AS "hasErrorCode" FROM "agent_steps" AS step
         JOIN "agent_turns" AS turn ON turn."id" = step."turnId"
@@ -196,7 +206,8 @@ async function parentSuspensionDiagnostics() {
       hasTurn: Boolean(turn),
       hasRootTask: Boolean(turn?.hasRootTask),
       hasStartedAt: Boolean(turn?.hasStartedAt),
-      hasError: Boolean(turn?.hasError),
+      hasError: typeof turn?.turnError === "string" && turn.turnError.length > 0,
+      turnErrorCategory: turnErrorCategory(turn?.turnError),
       modelStepCount: stepResult.rows.length,
       latestModelStep: stepResult.rows.length ? {
         ordinal: Number(stepResult.rows[stepResult.rows.length - 1].ordinal),
