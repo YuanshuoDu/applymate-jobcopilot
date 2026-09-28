@@ -307,6 +307,168 @@ function diagnosticIdListsMatch(left: DiagnosticIdList, right: DiagnosticIdList)
   return left.values.every(value => rightValues.has(value))
 }
 
+type DiagnosticTaskGraphNodes = Readonly<{
+  count: number | null
+  taskIdCount: number | null
+  valid: boolean
+  keys: readonly string[]
+  byKey: ReadonlyMap<string, string>
+}>
+
+function diagnosticTaskGraphNodes(value: unknown): DiagnosticTaskGraphNodes {
+  if (!Array.isArray(value)) return { count: null, taskIdCount: null, valid: false, keys: [], byKey: new Map() }
+  const nodes = value.map(record)
+  const entries = nodes.flatMap(node => typeof node?.key === "string" && typeof node.taskId === "string"
+    ? [[node.key, node.taskId] as const]
+    : [])
+  const keys = entries.map(([key]) => key)
+  const ids = entries.map(([, taskId]) => taskId)
+  const byKey = new Map(entries)
+  const valid = value.length <= 16 && nodes.every(node => node !== null
+    && typeof node.key === "string" && node.key.trim().length > 0
+    && typeof node.taskId === "string" && node.taskId.trim().length > 0 && node.taskId.length <= 256)
+    && keys.length === nodes.length && byKey.size === nodes.length
+    && new Set(ids).size === ids.length
+  return {
+    count: value.length,
+    taskIdCount: nodes.filter(node => typeof node?.taskId === "string").length,
+    valid,
+    keys: [...new Set(keys.filter(key => TASK_GRAPH_DIAGNOSTIC_NODE_KEYS.has(key)))].sort().slice(0, 8),
+    byKey,
+  }
+}
+
+function diagnosticTaskGraphNodeMapsMatch(left: DiagnosticTaskGraphNodes, right: DiagnosticTaskGraphNodes): boolean | null {
+  if (!left.valid || !right.valid) return null
+  if (left.byKey.size !== right.byKey.size) return false
+  return [...left.byKey].every(([key, taskId]) => right.byKey.get(key) === taskId)
+}
+
+function diagnosticTaskGraphMismatchKeys(left: DiagnosticTaskGraphNodes, right: DiagnosticTaskGraphNodes): string[] {
+  const keys = new Set([...left.byKey.keys(), ...right.byKey.keys()])
+  return [...keys].filter(key => TASK_GRAPH_DIAGNOSTIC_NODE_KEYS.has(key)
+    && left.byKey.get(key) !== right.byKey.get(key)).sort().slice(0, 8)
+}
+
+function diagnosticTaskGraphRevision(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= 2_147_483_646
+    ? value
+    : null
+}
+
+function firstWaitPlanGraphMismatchProjection(input: {
+  requestReceipt: unknown
+  requestGraph: unknown
+  persistedReceipt: unknown
+  persistedSnapshot: unknown
+  persistedItemRevision: unknown
+  persistedReceiptItem: unknown
+}): RecordValue {
+  const requestReceipt = record(input.requestReceipt)
+  const requestGraph = record(input.requestGraph)
+  const persistedReceipt = record(input.persistedReceipt)
+  const persistedSnapshot = record(input.persistedSnapshot)
+  const persistedReceiptItem = record(input.persistedReceiptItem)
+  const embeddedSnapshot = record(persistedReceiptItem?.content)
+  const requestReceiptNodes = diagnosticTaskGraphNodes(requestReceipt?.nodes)
+  const requestGraphNodes = diagnosticTaskGraphNodes(requestGraph?.nodes)
+  const persistedReceiptNodes = diagnosticTaskGraphNodes(persistedReceipt?.nodes)
+  const persistedSnapshotNodes = diagnosticTaskGraphNodes(persistedSnapshot?.nodes)
+  const embeddedSnapshotNodes = diagnosticTaskGraphNodes(embeddedSnapshot?.nodes)
+  const comparisons = {
+    requestReceiptMatchesRequestGraph: diagnosticTaskGraphNodeMapsMatch(requestReceiptNodes, requestGraphNodes),
+    requestReceiptMatchesPersistedReceipt: diagnosticTaskGraphNodeMapsMatch(requestReceiptNodes, persistedReceiptNodes),
+    requestGraphMatchesPersistedSnapshot: diagnosticTaskGraphNodeMapsMatch(requestGraphNodes, persistedSnapshotNodes),
+    persistedReceiptMatchesSnapshot: diagnosticTaskGraphNodeMapsMatch(persistedReceiptNodes, persistedSnapshotNodes),
+    persistedReceiptMatchesEmbeddedSnapshot: diagnosticTaskGraphNodeMapsMatch(persistedReceiptNodes, embeddedSnapshotNodes),
+    embeddedSnapshotMatchesCurrentSnapshot: diagnosticTaskGraphNodeMapsMatch(embeddedSnapshotNodes, persistedSnapshotNodes),
+  }
+  const diagnosis = comparisons.persistedReceiptMatchesSnapshot === false
+    || comparisons.persistedReceiptMatchesEmbeddedSnapshot === false
+    || comparisons.embeddedSnapshotMatchesCurrentSnapshot === false
+    ? "persisted_receipt_snapshot_lineage_mismatch"
+    : comparisons.requestGraphMatchesPersistedSnapshot === false
+      ? "stale_request_graph_context"
+      : comparisons.requestReceiptMatchesPersistedReceipt === false
+        ? "stale_or_wrong_request_receipt"
+        : comparisons.requestReceiptMatchesRequestGraph === false
+          ? "request_receipt_graph_pairing_mismatch"
+          : "request_graph_and_receipt_match_persisted_state"
+  const safeKeys = (keys: string[]) => keys.filter(key => TASK_GRAPH_DIAGNOSTIC_NODE_KEYS.has(key)).slice(0, 8)
+  return {
+    available: true,
+    diagnosis,
+    request: {
+      receiptStatus: requestReceipt?.status === "accepted" || requestReceipt?.status === "duplicate" ? requestReceipt.status : "other",
+      receiptRevision: diagnosticTaskGraphRevision(requestReceipt?.revision),
+      graphRevision: diagnosticTaskGraphRevision(requestGraph?.revision),
+      receiptNodeCount: requestReceiptNodes.count,
+      graphNodeCount: requestGraphNodes.count,
+      receiptTaskIdCount: requestReceiptNodes.taskIdCount,
+      graphTaskIdCount: requestGraphNodes.taskIdCount,
+      receiptNodeKeys: requestReceiptNodes.keys,
+      graphNodeKeys: requestGraphNodes.keys,
+    },
+    persisted: {
+      receiptRevision: diagnosticTaskGraphRevision(persistedReceipt?.revision),
+      receiptItemRevision: diagnosticTaskGraphRevision(persistedReceiptItem?.revision),
+      currentItemRevision: diagnosticTaskGraphRevision(input.persistedItemRevision),
+      receiptNodeCount: persistedReceiptNodes.count,
+      snapshotNodeCount: persistedSnapshotNodes.count,
+      embeddedSnapshotNodeCount: embeddedSnapshotNodes.count,
+      receiptNodeKeys: persistedReceiptNodes.keys,
+      snapshotNodeKeys: persistedSnapshotNodes.keys,
+      embeddedSnapshotNodeKeys: embeddedSnapshotNodes.keys,
+    },
+    comparisons,
+    mismatchKeys: {
+      requestReceiptGraph: safeKeys(diagnosticTaskGraphMismatchKeys(requestReceiptNodes, requestGraphNodes)),
+      requestReceiptPersistedReceipt: safeKeys(diagnosticTaskGraphMismatchKeys(requestReceiptNodes, persistedReceiptNodes)),
+      requestGraphPersistedSnapshot: safeKeys(diagnosticTaskGraphMismatchKeys(requestGraphNodes, persistedSnapshotNodes)),
+      persistedReceiptSnapshot: safeKeys(diagnosticTaskGraphMismatchKeys(persistedReceiptNodes, persistedSnapshotNodes)),
+      persistedReceiptEmbeddedSnapshot: safeKeys(diagnosticTaskGraphMismatchKeys(persistedReceiptNodes, embeddedSnapshotNodes)),
+    },
+  }
+}
+
+async function collectFirstWaitPlanGraphMismatchDiagnostics(
+  pool: Pool,
+  turnId: string,
+  request: HarnessModelRequest,
+  planCallId: string,
+  graph: unknown,
+): Promise<string> {
+  try {
+    const result = await pool.query<{
+      itemRevision: unknown
+      content: unknown
+      proposalPayload: unknown
+    }>(`SELECT item."revision" AS "itemRevision", item."content",
+         (SELECT event."payload" FROM "agent_events" AS event
+          WHERE event."sessionId" = turn."sessionId" AND event."turnId" = turn."id" AND event."itemId" = item."id"
+            AND event."type" IN ('item.started', 'item.delta') AND event."payload"->>'kind' = 'proposal'
+          ORDER BY event."sequence" DESC LIMIT 1) AS "proposalPayload"
+       FROM "agent_turns" AS turn JOIN "agent_items" AS item
+         ON item."sessionId" = turn."sessionId" AND item."turnId" = turn."id"
+          AND item."taskId" = turn."rootTaskId" AND item."type" = 'task_graph'
+       WHERE turn."id" = $1 ORDER BY item."revision" DESC, item."updatedAt" DESC LIMIT 1`, [turnId])
+    const row = result.rows[0]
+    const proposalPayload = record(row?.proposalPayload)
+    const proposalItem = record(proposalPayload?.item)
+    const projection = firstWaitPlanGraphMismatchProjection({
+      requestReceipt: latestToolResult(request, planCallId),
+      requestGraph: graph,
+      persistedReceipt: record(proposalPayload?.receipt),
+      persistedSnapshot: record(row?.content),
+      persistedItemRevision: row?.itemRevision,
+      persistedReceiptItem: proposalItem,
+    })
+    return boundedDiagnostic(JSON.stringify(projection), 1_200)
+  } catch {
+    return JSON.stringify({ available: false })
+  }
+}
+
 function compactTurnProgressDiagnostics(progress: string, maxCharacters = 1_600): string {
   let parsed: RecordValue | null = null
   try { parsed = record(JSON.parse(progress) as unknown) } catch { return JSON.stringify({ available: false }) }
@@ -420,13 +582,15 @@ function compactTurnProgressDiagnostics(progress: string, maxCharacters = 1_600)
   return boundedDiagnostic(JSON.stringify(snapshot), maxCharacters)
 }
 
-function combineFailureDiagnostics(fields: readonly FailureDiagnosticField[], progress: string): string {
+function combineFailureDiagnostics(fields: readonly FailureDiagnosticField[], progress: string, firstWaitPlanGraph?: string | null): string {
   const direct = boundedDiagnostic(fields.map(({ label, value }) =>
     `${label}=${value.length > 0 && value !== "<not captured>" && value !== "<none>"}`).join("; "), 2_700)
+  const planGraphLabel = firstWaitPlanGraph ? "; firstWaitPlanGraph=" : ""
+  const planGraph = firstWaitPlanGraph ? boundedDiagnostic(firstWaitPlanGraph, 1_200) : ""
   const snapshotLabel = "; turnTaskWaitSnapshot="
-  const snapshotBudget = Math.max(0, Math.min(1_050, 3_900 - direct.length - snapshotLabel.length - 64))
+  const snapshotBudget = Math.max(0, Math.min(1_050, 3_900 - direct.length - planGraphLabel.length - planGraph.length - snapshotLabel.length - 64))
   const snapshot = compactTurnProgressDiagnostics(progress, snapshotBudget)
-  return boundedDiagnostic(`${direct}${snapshotLabel}${snapshot}`, 3_900)
+  return boundedDiagnostic(`${direct}${planGraphLabel}${planGraph}${snapshotLabel}${snapshot}`, 3_900)
 }
 
 function waitTurnFailureSummary(error: unknown): string {
@@ -1366,6 +1530,52 @@ describe("compact TaskGraph wait failure diagnostics", () => {
     expect(() => planTaskIds(malformedDuplicate, "replayed-plan-call", 1)).toThrow("Expected 1 planned task ID(s); received 0")
   })
 
+  it("distinguishes stale graph context from persisted receipt/snapshot lineage mismatch without exposing IDs", () => {
+    const privateTaskIds = ["private-task-source", "private-task-summary"]
+    const nodeRows = (ids: readonly string[]) => ids.map((taskId, index) => ({
+      key: index === 0 ? "source" : "summary", taskId,
+    }))
+    const receipt = { status: "duplicate", revision: 1, nodes: nodeRows(privateTaskIds) }
+    const storedSnapshot = { nodes: nodeRows(privateTaskIds) }
+    const staleRequestGraph = { kind: "task_graph_current", revision: 1, nodes: nodeRows([privateTaskIds[0]!, "stale-task-summary"]) }
+    const staleGraph = firstWaitPlanGraphMismatchProjection({
+      requestReceipt: receipt, requestGraph: staleRequestGraph, persistedReceipt: receipt,
+      persistedSnapshot: storedSnapshot, persistedItemRevision: 1,
+      persistedReceiptItem: { revision: 1, content: storedSnapshot },
+    })
+    expect(staleGraph).toMatchObject({
+      diagnosis: "stale_request_graph_context",
+      comparisons: {
+        requestReceiptMatchesRequestGraph: false,
+        requestReceiptMatchesPersistedReceipt: true,
+        requestGraphMatchesPersistedSnapshot: false,
+        persistedReceiptMatchesSnapshot: true,
+      },
+      mismatchKeys: { requestReceiptGraph: ["summary"], requestGraphPersistedSnapshot: ["summary"] },
+    })
+
+    const divergentSnapshot = { nodes: nodeRows([privateTaskIds[0]!, "persisted-task-summary"]) }
+    const persistedLineage = firstWaitPlanGraphMismatchProjection({
+      requestReceipt: receipt,
+      requestGraph: { kind: "task_graph_current", revision: 1, nodes: divergentSnapshot.nodes },
+      persistedReceipt: receipt, persistedSnapshot: divergentSnapshot, persistedItemRevision: 2,
+      persistedReceiptItem: { revision: 1, content: storedSnapshot },
+    })
+    expect(persistedLineage).toMatchObject({
+      diagnosis: "persisted_receipt_snapshot_lineage_mismatch",
+      comparisons: {
+        requestGraphMatchesPersistedSnapshot: true,
+        persistedReceiptMatchesSnapshot: false,
+        persistedReceiptMatchesEmbeddedSnapshot: true,
+        embeddedSnapshotMatchesCurrentSnapshot: false,
+      },
+      mismatchKeys: { persistedReceiptSnapshot: ["summary"] },
+    })
+    expect(JSON.stringify([staleGraph, persistedLineage])).not.toContain("private-task")
+    expect(JSON.stringify([staleGraph, persistedLineage])).not.toContain("stale-task-summary")
+    expect(JSON.stringify([staleGraph, persistedLineage])).not.toContain("persisted-task-summary")
+  })
+
   it("keeps the safe process diagnostics line without raw stdout or stderr", () => {
     const prefix = "P3_PARENT_SUSPENSION_DIAGNOSTICS "
     const safeLine = prefix + JSON.stringify({
@@ -1816,6 +2026,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let followUpGraphReachedModel = false
     let followUpExpectedRevision: number | undefined
     let rootModelStreamFailure: string | null = null
+    let firstWaitPlanGraphDiagnostics: string | null = null
     let rootModelFailureStage: RootModelFailureStage = "not_started"
     let childFixtureFailureStage: ChildFixtureFailureStage | null = null
     let rootWaitHandoffFailure: string | null = null
@@ -1993,6 +2204,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               if (plannedIdSet.size !== graphIdSet.size
                 || [...plannedIdSet].some(taskId => !graphIdSet.has(taskId))) {
                 rootModelFailureStage = "initial_wait_plan_graph_set_mismatch"
+                firstWaitPlanGraphDiagnostics = await collectFirstWaitPlanGraphMismatchDiagnostics(
+                  pool!, owner.turnId, request, PLAN_CALL_ID, graph,
+                )
                 throw new Error("p3_task_graph_wait_ids_mismatch")
               }
               rootModelFailureStage = "initial_wait_tool"
@@ -2120,7 +2334,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         ...rootModelFailureDiagnostic,
         { label: "waitHandoffFailure", value: rootWaitHandoffFailure ?? "<not captured>" },
         { label: "turnFailure", value: waitTurnFailureSummary(error) },
-      ], progress) + handoffSuffix, 4_500))
+      ], progress, firstWaitPlanGraphDiagnostics) + handoffSuffix, 4_500))
     }
     const parkedTurns = await pool!.query<{ id: string; status: string }>(
       `SELECT "id", "status" FROM "agent_turns" WHERE "id" = ANY($1::text[]) ORDER BY "id"`,
