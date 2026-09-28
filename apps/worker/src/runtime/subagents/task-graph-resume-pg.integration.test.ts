@@ -615,7 +615,9 @@ function latestToolResult(request: HarnessModelRequest, callId: string): unknown
 
 function planTaskIds(request: HarnessModelRequest, callId = PLAN_CALL_ID, expectedCount = 2): string[] {
   const output = record(latestToolResult(request, callId))
-  if (!output || output.status !== "accepted" || !Array.isArray(output.nodes)) throw new Error("TaskGraph plan receipt missing from the next root model request")
+  if (!output || (output.status !== "accepted" && output.status !== "duplicate") || !Array.isArray(output.nodes)) {
+    throw new Error("TaskGraph plan receipt missing from the next root model request")
+  }
   const ids = output.nodes.flatMap(value => {
     const node = record(value)
     return node && typeof node.taskId === "string" ? [node.taskId] : []
@@ -1333,6 +1335,35 @@ describe("compact TaskGraph wait failure diagnostics", () => {
       }] }],
     } as unknown as HarnessModelRequest
     expect(() => planTaskIds(invalidLatestReceipt, "reused-plan-call", 1)).toThrow("TaskGraph plan receipt missing")
+  })
+
+  it("accepts a replayed duplicate plan receipt while validating its task IDs", () => {
+    const request = {
+      messages: [{ role: "assistant", content: [{
+        type: "tool_result", toolUseId: "replayed-plan-call",
+        content: JSON.stringify({ status: "duplicate", nodes: [{ key: "verification", taskId: "replayed-task" }] }),
+      }] }],
+    } as unknown as HarnessModelRequest
+
+    expect(planTaskIds(request, "replayed-plan-call", 1)).toEqual(["replayed-task"])
+
+    const invalidStatus = {
+      ...request,
+      messages: [{ role: "assistant", content: [{
+        type: "tool_result", toolUseId: "replayed-plan-call",
+        content: JSON.stringify({ status: "failed", nodes: [{ key: "verification", taskId: "replayed-task" }] }),
+      }] }],
+    } as unknown as HarnessModelRequest
+    expect(() => planTaskIds(invalidStatus, "replayed-plan-call", 1)).toThrow("TaskGraph plan receipt missing")
+
+    const malformedDuplicate = {
+      ...request,
+      messages: [{ role: "assistant", content: [{
+        type: "tool_result", toolUseId: "replayed-plan-call",
+        content: JSON.stringify({ status: "duplicate", nodes: [{ key: "verification" }] }),
+      }] }],
+    } as unknown as HarnessModelRequest
+    expect(() => planTaskIds(malformedDuplicate, "replayed-plan-call", 1)).toThrow("Expected 1 planned task ID(s); received 0")
   })
 
   it("keeps the safe process diagnostics line without raw stdout or stderr", () => {
