@@ -2,7 +2,10 @@ import { describe, expect, it } from 'vitest'
 
 import {
   PLAN_LEDGER_SCHEMA_VERSION,
+  TASK_GRAPH_MAX_IDENTIFIER_LENGTH,
+  TASK_GRAPH_SCHEMA_VERSION,
   parsePlanLedger,
+  parseTaskGraphSnapshot,
   projectPlanLedger,
   projectTaskEvidencePreview,
 } from './plan-ledger.js'
@@ -10,7 +13,7 @@ import {
 const sessionId = 'session-1'
 const rootTaskId = 'root-task'
 const graph = {
-  schemaVersion: 'agent-harness.v2.task-graph',
+  schemaVersion: TASK_GRAPH_SCHEMA_VERSION,
   nodes: [
     { key: 'scout', templateId: 'scout', goal: 'Find Dublin backend jobs', successCriteria: ['Save relevant evidence'], dependsOn: [], depth: 1, taskId: 'child-scout' },
     { key: 'analyse', templateId: 'analyst', goal: 'Score the findings', successCriteria: ['Use the saved evidence'], dependsOn: ['scout'], depth: 2, taskId: 'child-analyst' },
@@ -31,11 +34,47 @@ const rows = [
   { id: 'other-session-task', sessionId: 'session-2', status: 'completed', goal: 'CROSS_SESSION_SECRET', result },
 ]
 
+function sparseArrayWithNamedKey(): unknown[] {
+  const value: unknown[] = []
+  value.length = 1
+  Object.defineProperty(value, 'named', { value: true })
+  return value
+}
+
 function projection() {
   return projectPlanLedger({ sessionId, revision: 4, rootTaskId, graph, tasks: rows })
 }
 
 describe('versioned Plan Ledger contract', () => {
+  it('exposes the shared bounded TaskGraph parser for object and JSON payloads', () => {
+    expect(parseTaskGraphSnapshot(graph)?.nodes).toHaveLength(2)
+    expect(parseTaskGraphSnapshot(JSON.stringify(graph))?.nodes).toHaveLength(2)
+    expect(parseTaskGraphSnapshot({ ...graph, schemaVersion: 'future' })).toBeNull()
+  })
+
+  it('rejects sparse TaskGraph arrays and preserves legacy whitespace identifiers', () => {
+    const first = graph.nodes[0]!
+    expect(parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SCHEMA_VERSION, nodes: sparseArrayWithNamedKey() })).toBeNull()
+    expect(parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SCHEMA_VERSION, nodes: [{ ...first, successCriteria: sparseArrayWithNamedKey() }] })).toBeNull()
+    expect(parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SCHEMA_VERSION, nodes: [{ ...first, dependsOn: sparseArrayWithNamedKey() }] })).toBeNull()
+    expect(parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SCHEMA_VERSION, nodes: [{ ...first, key: ' scout ', taskId: ' child-scout ', templateId: ' template ' }] })?.nodes[0]).toMatchObject({
+      key: ' scout ', taskId: ' child-scout ', templateId: ' template ',
+    })
+    expect(parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SCHEMA_VERSION, nodes: [{ ...first, key: 'k'.repeat(TASK_GRAPH_MAX_IDENTIFIER_LENGTH + 1) }] })).toBeNull()
+  })
+
+  it('keeps the Plan Ledger projection strict about canonical TaskGraph identifiers', () => {
+    const first = graph.nodes[0]!
+    const invalidGraphs = [
+      { ...graph, nodes: [{ ...first, taskId: ' child-scout ' }, graph.nodes[1]!] },
+      { ...graph, nodes: [{ ...first, templateId: ' scout ' }, graph.nodes[1]!] },
+    ]
+
+    for (const invalidGraph of invalidGraphs) {
+      expect(projectPlanLedger({ sessionId, revision: 4, rootTaskId, graph: invalidGraph, tasks: rows })).toBeNull()
+    }
+  })
+
   it('projects persisted graph and task rows into a bounded, redacted contract', () => {
     const ledger = projection()
     expect(ledger).toEqual({

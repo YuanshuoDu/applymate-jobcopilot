@@ -1,7 +1,9 @@
 export const PLAN_LEDGER_SCHEMA_VERSION = 'agent-harness.v2.plan-ledger'
 
-const GRAPH_VERSION = 'agent-harness.v2.task-graph', RESULT_VERSION = 'agent-harness.v2.subagent.result'
-const MAX_NODES = 8, MAX_ID = 128, MAX_LEDGER_BYTES = 16_000
+export const TASK_GRAPH_SCHEMA_VERSION = 'agent-harness.v2.task-graph', TASK_GRAPH_MAX_IDENTIFIER_LENGTH = 128
+const RESULT_VERSION = 'agent-harness.v2.subagent.result'
+const MAX_NODES = 8, MAX_ID = TASK_GRAPH_MAX_IDENTIFIER_LENGTH, MAX_LEDGER_BYTES = 16_000
+const MAX_DEPTH = 8, MAX_SNAPSHOT_BYTES = 40_000, MAX_SUCCESS_CRITERIA = 8, MAX_DEPENDENCIES = 8, MAX_GOAL_LENGTH = 1_200, MAX_CRITERION_LENGTH = 320
 const STATUSES = ['queued', 'running', 'retrying', 'waiting', 'waiting_for_user', 'completed', 'failed', 'interrupted', 'cancelled', 'closed'] as const
 const TERMINAL = new Set(['completed', 'failed', 'interrupted', 'cancelled', 'closed'])
 const BLOCKING = new Set(['failed', 'interrupted', 'cancelled', 'closed'])
@@ -10,16 +12,12 @@ const KINDS = ['job', 'persona', 'resume', 'source'] as const
 
 export type PlanLedgerStatus = typeof STATUSES[number]
 export type PlanLedgerReadiness = 'ready' | 'waiting_for_dependencies' | 'blocked_dependency' | 'active' | 'terminal' | 'unavailable'
-export type PlanLedgerEvidencePreview = Readonly<{
-  role: 'scout' | 'analyst'
-  summary: string
-  itemCount: number
-  evidence: readonly Readonly<{ kind: typeof KINDS[number]; source: string; reference: null }>[]
-}>
-export type PlanLedger = Readonly<{ schemaVersion: typeof PLAN_LEDGER_SCHEMA_VERSION; sessionId: string; revision: number; goal: string | null; nodes: readonly Readonly<{
-  key: string; goal: string; status: PlanLedgerStatus | null; resultAvailable: boolean; evidencePreview: PlanLedgerEvidencePreview | null
-  readiness: PlanLedgerReadiness; dependencies: readonly Readonly<{ key: string; label: string; status: PlanLedgerStatus | null }>[]
-}>[] }>
+export type PlanLedgerEvidencePreview = Readonly<{ role: 'scout' | 'analyst'; summary: string; itemCount: number; evidence: readonly Readonly<{ kind: typeof KINDS[number]; source: string; reference: null }>[] }>
+export type PlanLedger = Readonly<{ schemaVersion: typeof PLAN_LEDGER_SCHEMA_VERSION; sessionId: string; revision: number; goal: string | null;
+  nodes: readonly Readonly<{ key: string; goal: string; status: PlanLedgerStatus | null; resultAvailable: boolean; evidencePreview: PlanLedgerEvidencePreview | null; readiness: PlanLedgerReadiness;
+    dependencies: readonly Readonly<{ key: string; label: string; status: PlanLedgerStatus | null }>[] }>[] }>
+export type TaskGraphSnapshotNode = Readonly<{ key: string; templateId: string; goal: string; successCriteria: readonly string[]; dependsOn: readonly string[]; depth: number; taskId: string }>
+export type TaskGraphSnapshot = Readonly<{ nodes: readonly TaskGraphSnapshotNode[] }>
 interface TextEncoderLike { encode(input: string): Uint8Array }
 const RuntimeTextEncoder = (globalThis as typeof globalThis & { TextEncoder?: new () => TextEncoderLike }).TextEncoder
 
@@ -28,8 +26,10 @@ export function projectPlanLedger(value: unknown): PlanLedger | null {
   try {
     if (!record(value) || !identifier(value.sessionId) || !Number.isSafeInteger(value.revision) || Number(value.revision) < 1
       || (value.rootTaskId !== null && !identifier(value.rootTaskId)) || !dense(value.tasks, MAX_NODES + 1)) return null
-    const graph = parseGraph(value.graph)
-    if (!graph || graph.nodes.length === 0 || value.tasks.length > MAX_NODES + 1) return null
+    const graph = parseTaskGraphSnapshot(value.graph)
+    if (!graph || graph.nodes.length === 0 || value.tasks.length > MAX_NODES + 1
+      || graph.nodes.some(node => !identifier(node.key) || !identifier(node.templateId) || !identifier(node.taskId)
+        || !node.dependsOn.every(identifier))) return null
     const tasks = new Map<string, Record<string, unknown>>()
     for (const row of value.tasks) {
       if (!record(row) || row.sessionId !== value.sessionId || !identifier(row.id)) continue
@@ -162,30 +162,33 @@ function parseEvidencePreview(value: unknown, role: unknown): PlanLedgerEvidence
   return { role, summary: value.summary, itemCount: value.itemCount, evidence }
 }
 
-function safePreview(value: unknown): value is PlanLedgerEvidencePreview | null {
-  if (value === null) return true
-  if (!record(value) || !parseEvidencePreview(value, value.role)) return false
-  return true
+function safePreview(value: unknown): value is PlanLedgerEvidencePreview | null { return value === null || (record(value) && parseEvidencePreview(value, value.role) !== null) }
+
+export function parseTaskGraphSnapshot(value: unknown): TaskGraphSnapshot | null {
+  try {
+    const content = typeof value === 'string' ? JSON.parse(value) as unknown : value
+    if (!record(content) || !exact(content, ['schemaVersion', 'nodes']) || content.schemaVersion !== TASK_GRAPH_SCHEMA_VERSION || !strictDense(content.nodes, MAX_NODES)) return null
+    const nodes: TaskGraphSnapshotNode[] = [], keys = new Set<string>(), ids = new Set<string>()
+    for (const raw of content.nodes) {
+      if (!record(raw) || !exact(raw, ['key', 'templateId', 'goal', 'successCriteria', 'dependsOn', 'depth', 'taskId'])
+        || !text(raw.key, TASK_GRAPH_MAX_IDENTIFIER_LENGTH) || !text(raw.templateId, TASK_GRAPH_MAX_IDENTIFIER_LENGTH)
+        || !text(raw.goal, MAX_GOAL_LENGTH) || !text(raw.taskId, TASK_GRAPH_MAX_IDENTIFIER_LENGTH)
+        || !strictDense(raw.successCriteria, MAX_SUCCESS_CRITERIA) || raw.successCriteria.length === 0
+        || !raw.successCriteria.every(item => text(item, MAX_CRITERION_LENGTH))
+        || !strictDense(raw.dependsOn, MAX_DEPENDENCIES) || !raw.dependsOn.every(item => text(item, TASK_GRAPH_MAX_IDENTIFIER_LENGTH))
+        || new Set(raw.dependsOn).size !== raw.dependsOn.length || !Number.isSafeInteger(raw.depth)
+        || Number(raw.depth) < 1 || Number(raw.depth) > MAX_DEPTH || keys.has(raw.key) || ids.has(raw.taskId)) return null
+      keys.add(raw.key as string); ids.add(raw.taskId as string)
+      nodes.push({ key: raw.key as string, templateId: raw.templateId as string, goal: raw.goal as string,
+        successCriteria: [...raw.successCriteria] as string[], dependsOn: [...raw.dependsOn] as string[], depth: Number(raw.depth), taskId: raw.taskId as string })
+    }
+    if (nodes.some(node => node.dependsOn.some(key => !keys.has(key))) || !acyclic(nodes)) return null
+    return bytes({ schemaVersion: TASK_GRAPH_SCHEMA_VERSION, nodes }) <= MAX_SNAPSHOT_BYTES ? { nodes } : null
+  } catch { return null }
 }
 
-function parseGraph(value: unknown): { nodes: Array<{ key: string; goal: string; taskId: string; dependsOn: string[] }> } | null {
-  if (!record(value) || !exact(value, ['schemaVersion', 'nodes']) || value.schemaVersion !== GRAPH_VERSION || !dense(value.nodes, MAX_NODES)) return null
-  const nodes: Array<{ key: string; goal: string; taskId: string; dependsOn: string[] }> = []
-  const keys = new Set<string>(), ids = new Set<string>()
-  for (const raw of value.nodes) {
-    if (!record(raw) || !exact(raw, ['key', 'templateId', 'goal', 'successCriteria', 'dependsOn', 'depth', 'taskId'])
-      || !identifier(raw.key) || !identifier(raw.templateId) || !text(raw.goal, 1_200) || !identifier(raw.taskId)
-      || !dense(raw.successCriteria, 8) || raw.successCriteria.length === 0 || !raw.successCriteria.every(item => text(item, 320))
-      || !dense(raw.dependsOn, 8) || !raw.dependsOn.every(identifier) || new Set(raw.dependsOn).size !== raw.dependsOn.length
-      || !Number.isSafeInteger(raw.depth) || Number(raw.depth) < 1 || Number(raw.depth) > 8 || keys.has(raw.key) || ids.has(raw.taskId)) return null
-    keys.add(raw.key); ids.add(raw.taskId); nodes.push({ key: raw.key, goal: raw.goal, taskId: raw.taskId, dependsOn: raw.dependsOn })
-  }
-  if (nodes.some(node => node.dependsOn.some(key => !keys.has(key))) || !acyclic(nodes)) return null
-  return bytes(value) <= 40_000 ? { nodes } : null
-}
-
-function readiness(node: { key: string; dependsOn: string[] }, status: PlanLedgerStatus | null,
-  statuses: ReadonlyMap<string, PlanLedgerStatus | null>, nodes: readonly { key: string; dependsOn: string[] }[]): PlanLedgerReadiness {
+function readiness(node: { key: string; dependsOn: readonly string[] }, status: PlanLedgerStatus | null,
+  statuses: ReadonlyMap<string, PlanLedgerStatus | null>, nodes: readonly { key: string; dependsOn: readonly string[] }[]): PlanLedgerReadiness {
   if (!status) return 'unavailable'
   if (TERMINAL.has(status)) return 'terminal'
   if (status !== 'queued' && status !== 'waiting') return 'active'
@@ -201,7 +204,7 @@ function readiness(node: { key: string; dependsOn: string[] }, status: PlanLedge
   return status === 'queued' ? 'ready' : 'active'
 }
 
-function acyclic(nodes: readonly { key: string; dependsOn: string[] }[]): boolean {
+function acyclic(nodes: readonly { key: string; dependsOn: readonly string[] }[]): boolean {
   const visited = new Set<string>(), active = new Set<string>(), byKey = new Map(nodes.map(node => [node.key, node] as const))
   const visit = (key: string): boolean => {
     if (active.has(key)) return false
@@ -226,8 +229,9 @@ function record(value: unknown): value is Record<string, unknown> {
 function exact(value: Record<string, unknown>, keys: readonly string[]): boolean {
   const own = Reflect.ownKeys(value); return own.length === keys.length && own.every(key => typeof key === 'string' && keys.includes(key))
 }
-function dense(value: unknown, maximum: number): value is unknown[] {
-  return Array.isArray(value) && value.length <= maximum && Reflect.ownKeys(value).length === value.length + 1
+function dense(value: unknown, maximum: number): value is unknown[] { return Array.isArray(value) && value.length <= maximum && Reflect.ownKeys(value).length === value.length + 1 }
+function strictDense(value: unknown, maximum: number): value is unknown[] {
+  return dense(value, maximum) && Array.from({ length: value.length }, (_, index) => String(index)).every(key => Object.hasOwn(value, key))
 }
 function parseJsonRecord(value: unknown): Record<string, unknown> | null { const parsed = typeof value === 'string' ? JSON.parse(value) as unknown : value; return record(parsed) ? parsed : null }
 function bytes(value: unknown): number { const encoded = JSON.stringify(value) ?? ''; return RuntimeTextEncoder ? new RuntimeTextEncoder().encode(encoded).byteLength : encoded.length * 3 }

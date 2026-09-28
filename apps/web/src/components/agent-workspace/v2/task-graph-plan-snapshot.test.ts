@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest'
+import { TASK_GRAPH_SCHEMA_VERSION } from '@jobcopilot/agent-protocol'
 
 import { parseTaskGraphSnapshot, TASK_GRAPH_MAX_IDENTIFIER_LENGTH } from './task-graph-plan-snapshot'
 
-const schemaVersion = 'agent-harness.v2.task-graph'
+const schemaVersion = TASK_GRAPH_SCHEMA_VERSION
 
 function graphNode(key: string, taskId: string, dependsOn: string[] = [], depth = dependsOn.length + 1) {
   return { key, templateId: 'scout', goal: `Snapshot ${key}`, successCriteria: [`Evidence for ${key}`], dependsOn, depth, taskId }

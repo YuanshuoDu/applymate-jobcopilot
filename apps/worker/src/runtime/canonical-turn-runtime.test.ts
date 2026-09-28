@@ -286,6 +286,23 @@ describe("createCanonicalTurnRuntime", () => {
     expect(modelContext?.blocks.find(block => block.id === "task-graph-current")?.trust).toBe("external_untrusted")
   })
 
+  it("does not advertise agent.plan in the serving tool list with default production flags", async () => {
+    const commandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
+      readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
+    }
+    const flags = resolveProductionAgentFlags({})
+    const names = await rootToolNames(flags.coordinationEnabled, ["read"], flags, {
+      commandPort,
+      templates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+    })
+
+    expect(flags.taskGraphPlanningEnabled).toBe(false)
+    expect(names).not.toContain("agent.plan")
+    expect(commandPort.readCurrent).not.toHaveBeenCalled()
+    expect(commandPort.appendAndSchedule).not.toHaveBeenCalled()
+  })
+
   it("does not advertise agent.plan when the legacy cognitive-loop gate is the only opt-in", async () => {
     const commandPort: TaskGraphCommandPort = {
       appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),

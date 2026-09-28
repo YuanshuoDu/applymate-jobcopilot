@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest"
+import { TASK_GRAPH_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 
 import { redactStreamEventPayload, redactStreamString, redactStreamValue } from "./stream-redaction"
 
 const identity = { sessionId: "session-1", turnId: "turn-1", itemId: "graph-1", taskId: "root-1" }
 const childIdentity = { ...identity, taskId: "task-1" }
-const graphVersion = "agent-harness.v2.task-graph"
+const graphVersion = TASK_GRAPH_SCHEMA_VERSION
 
 function item(content: unknown, overrides: Record<string, unknown> = {}) {
   return {
@@ -61,6 +62,19 @@ describe("agent stream redaction", () => {
       item: { content: unknown }
     }
     expect(malformedEvent.item.content).toBe("[REDACTED]")
+  })
+
+  it("preserves legacy TaskGraph identifiers with surrounding whitespace", () => {
+    const paddedTaskId = " task-1 "
+    const payload = {
+      kind: "lifecycle", event: { type: "task.completed", nodeKey: " research " }, revision: 1,
+      item: item(content([node(" research ", paddedTaskId)])),
+    }
+    const result = redactStreamEventPayload("item.delta", payload, { ...identity, taskId: paddedTaskId }) as {
+      item: { content: { nodes: Array<{ key: string; taskId: string }> } }
+    }
+
+    expect(result.item.content.nodes[0]).toMatchObject({ key: " research ", taskId: paddedTaskId })
   })
 
   it("keeps proposal snapshots strictly attributed to the root task", () => {

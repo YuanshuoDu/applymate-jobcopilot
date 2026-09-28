@@ -171,7 +171,7 @@ function safeFailurePreflightErrorClass(error: unknown): FailurePreflightErrorCl
 type FailureDiagnosticField = {
   label: string
   value: string
-  safeValue?: FailurePreflightStage | FailurePreflightErrorClass
+  safeValue?: string
 }
 
 type RootModelFailureStage =
@@ -239,6 +239,24 @@ type FailurePreflightStage =
 
 type FailurePreflightErrorClass = "none" | "assertion" | "coordination" | "database" | "generic" | "other"
 
+type FailurePreflightTargetScopeEvidence = Readonly<{
+  lookupCompleted: boolean
+  rowFound: boolean | null
+  sessionMatches: boolean | null
+  userMatches: boolean | null
+  turnMatches: boolean | null
+  rootMatches: boolean | null
+  parentMatches: boolean | null
+}>
+
+type FailurePreflightTargetObservation = null | { found: false; scope: FailurePreflightTargetScopeEvidence } | {
+  found: true
+  taskId: string
+  turnId: string | null
+  rootTaskId: string | null
+  parentTaskId: string | null
+}
+
 const TURN_DIAGNOSTIC_STATUSES = new Set([
   "queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user",
   "completed", "failed", "interrupted", "cancelled",
@@ -280,6 +298,17 @@ const WAIT_HANDOFF_GATE_LABELS = new Map([
 const TASK_GRAPH_DIAGNOSTIC_NODE_KEYS = new Set([
   "source", "summary", "large-source", "rejected", "verification", "prerequisite", "dependent",
 ])
+const COMPLETED_GRAPH_STATUS_EXPECTATIONS = [
+  { key: "source", status: "completed" },
+  { key: "summary", status: "completed" },
+  { key: "large-source", status: "completed" },
+  { key: "rejected", status: "cancelled" },
+  { key: "verification", status: "completed" },
+] as const
+const TASK_GRAPH_READINESS = new Set([
+  "ready", "waiting_for_dependencies", "blocked_dependency", "active", "terminal",
+])
+const FAILURE_PREFLIGHT_TARGET_KEYS = ["prerequisite", "dependent"] as const
 const TASK_GRAPH_DIAGNOSTIC_PROPOSAL_NODE_KEYS = new Set(["source", "summary", "verification"])
 const TASK_DIAGNOSTIC_STATUSES = new Set([
   "queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed",
@@ -901,6 +930,255 @@ function planTaskIds(request: HarnessModelRequest, callId = PLAN_CALL_ID, expect
   })
   if (ids.length !== expectedCount) throw new Error(`Expected ${expectedCount} planned task ID(s); received ${ids.length}`)
   return ids
+}
+
+function completedGraphStatusFailureProjection(graph: unknown): RecordValue {
+  const graphNodes = record(graph)?.nodes
+  const nodes = Array.isArray(graphNodes) ? graphNodes.map(record) : []
+  return {
+    nodes: COMPLETED_GRAPH_STATUS_EXPECTATIONS.map(expected => {
+      const matches = nodes.filter(node => node?.key === expected.key)
+      const node = matches[0]
+      const status = diagnosticEnum(node?.status, TASK_DIAGNOSTIC_STATUSES)
+      const readiness = diagnosticEnum(node?.readiness, TASK_GRAPH_READINESS)
+      return {
+        key: expected.key,
+        status,
+        readiness,
+        expectedMatch: matches.length === 1 && status === expected.status && readiness === "terminal",
+      }
+    }),
+  }
+}
+
+function failurePreflightEvidenceProjection(input: {
+  rootTaskLookupCompleted: boolean
+  rootTaskId: string | null
+  expectedTurnId: string
+  expectedTaskIds: readonly string[]
+  targets: readonly FailurePreflightTargetObservation[]
+}): RecordValue {
+  const rootTaskFound = input.rootTaskLookupCompleted ? Boolean(input.rootTaskId) : null
+  return {
+    rootTaskFound,
+    targets: FAILURE_PREFLIGHT_TARGET_KEYS.map((key, index) => {
+      const target = input.targets[index] ?? null
+      if (!target) {
+        return {
+          key, found: null, targetMatchesReceipt: null,
+          turnMatches: null, rootMatches: null, parentMatches: null,
+        }
+      }
+      if (!target.found) {
+        return {
+          key, found: false, targetMatchesReceipt: null,
+          turnMatches: null, rootMatches: null, parentMatches: null, scope: target.scope,
+        }
+      }
+      return {
+        key,
+        found: true,
+        targetMatchesReceipt: target.taskId === input.expectedTaskIds[index],
+        turnMatches: target.turnId === input.expectedTurnId,
+        rootMatches: rootTaskFound === true ? target.rootTaskId === input.rootTaskId : null,
+        parentMatches: rootTaskFound === true ? target.parentTaskId === input.rootTaskId : null,
+      }
+    }),
+  }
+}
+
+function missingTaskScopeEvidence(input: {
+  lookupCompleted: boolean
+  observed: null | {
+    sessionId: string | null
+    sessionUserId: string | null
+    turnId: string | null
+    rootTaskId: string | null
+    parentTaskId: string | null
+  }
+  expected: { sessionId: string; userId: string; turnId: string; rootTaskId: string }
+}): FailurePreflightTargetScopeEvidence {
+  if (!input.lookupCompleted) {
+    return { lookupCompleted: false, rowFound: null, sessionMatches: null, userMatches: null,
+      turnMatches: null, rootMatches: null, parentMatches: null }
+  }
+  if (!input.observed) {
+    return { lookupCompleted: true, rowFound: false, sessionMatches: null, userMatches: null,
+      turnMatches: null, rootMatches: null, parentMatches: null }
+  }
+  return {
+    lookupCompleted: true, rowFound: true,
+    sessionMatches: input.observed.sessionId === input.expected.sessionId,
+    userMatches: input.observed.sessionUserId === input.expected.userId,
+    turnMatches: input.observed.turnId === input.expected.turnId,
+    rootMatches: input.observed.rootTaskId === input.expected.rootTaskId,
+    parentMatches: input.observed.parentTaskId === input.expected.rootTaskId,
+  }
+}
+
+async function missingTaskScopeFailureDiagnostics(
+  pool: Pool,
+  taskId: string,
+  expected: { sessionId: string; userId: string; turnId: string; rootTaskId: string },
+): Promise<FailurePreflightTargetScopeEvidence> {
+  try {
+    const result = await pool.query<{
+      sessionId: string | null
+      sessionUserId: string | null
+      turnId: string | null
+      rootTaskId: string | null
+      parentTaskId: string | null
+    }>(
+      `SELECT task."sessionId", session."userId" AS "sessionUserId", task."turnId", task."rootTaskId", task."parentTaskId"
+       FROM "sub_agent_tasks" AS task
+       LEFT JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+       WHERE task."id" = $1 LIMIT 1`,
+      [taskId],
+    )
+    return missingTaskScopeEvidence({ lookupCompleted: true, observed: result.rows[0] ?? null, expected })
+  } catch {
+    return missingTaskScopeEvidence({ lookupCompleted: false, observed: null, expected })
+  }
+}
+
+function sameUniqueIds(left: readonly string[], right: readonly string[]): boolean {
+  const leftSet = new Set(left), rightSet = new Set(right)
+  return leftSet.size === left.length && rightSet.size === right.length && leftSet.size === rightSet.size
+    && [...leftSet].every(value => rightSet.has(value))
+}
+
+function planReceiptEvidenceProjection(
+  request: HarnessModelRequest,
+  callId: string,
+  graph: unknown,
+): RecordValue {
+  const parts = request.messages.flatMap(message => Array.isArray(message.content) ? message.content.map(record) : [])
+  const matchingCalls = parts.filter(part => part?.type === "tool_use" && part.id === callId)
+  const matchingResults = parts.filter(part => part?.type === "tool_result" && part.toolUseId === callId)
+  const planCalls = parts.filter(part => part?.type === "tool_use" && part.name === "agent.plan")
+  const planCallIds = new Set(planCalls.flatMap(part => typeof part?.id === "string" ? [part.id] : []))
+  const planResults = parts.filter(part => part?.type === "tool_result"
+    && (planCallIds.has(String(part.toolUseId)) || part.toolUseId === callId))
+  const currentNodes = record(graph)?.nodes
+  const graphTaskIds = Array.isArray(currentNodes)
+    ? currentNodes.map(record).flatMap(node => typeof node?.taskId === "string" ? [node.taskId] : [])
+    : []
+  const parsedResults = matchingResults.map(part => {
+    if (typeof part?.content !== "string") return null
+    try { return record(JSON.parse(part.content) as unknown) } catch { return null }
+  })
+  const output = record(parsedResults.at(-1))
+  const nodes = Array.isArray(output?.nodes) ? output.nodes.map(record).filter((node): node is RecordValue => node !== null) : []
+  const taskIds = nodes.flatMap(node => typeof node.taskId === "string" && node.taskId.trim().length > 0 ? [node.taskId] : [])
+  const planNames = [...new Set(planCalls.map(part => part?.name === "agent.plan" ? "agent.plan" : "other"))].slice(0, 2)
+  const graphTaskIdSet = new Set(graphTaskIds)
+  return {
+    expectedCallMatched: matchingCalls.length > 0 && matchingResults.length > 0,
+    matchingToolUseCount: matchingCalls.length,
+    matchingToolNameIsAgentPlan: matchingCalls.some(part => part?.name === "agent.plan"),
+    planToolUseCount: planCalls.length,
+    planToolNames: planNames,
+    matchingToolResultCount: matchingResults.length,
+    matchingResultIsError: matchingResults.length === 0 ? null : matchingResults.at(-1)?.isError === true,
+    planToolResultCount: planResults.length,
+    resultCallIdMatchesPlanCall: matchingResults.length > 0 && planCallIds.has(callId),
+    resultContentType: matchingResults.at(-1) ? diagnosticValueType(matchingResults.at(-1)?.content) : "missing",
+    resultJsonParsed: parsedResults.at(-1) !== null && parsedResults.at(-1) !== undefined,
+    receiptStatus: output?.status === "accepted" || output?.status === "duplicate" ? output.status : output ? "other" : "missing",
+    resultErrorCodePresent: typeof output?.errorCode === "string",
+    receiptRevision: typeof output?.revision === "number" && Number.isSafeInteger(output.revision) && output.revision >= 0
+      ? output.revision
+      : null,
+    receiptNodeCount: Array.isArray(output?.nodes) ? output.nodes.length : null,
+    receiptTaskIdCount: taskIds.length,
+    graphTaskIdCount: graphTaskIds.length,
+    receiptTaskIdsMatchingGraphCount: taskIds.filter(taskId => graphTaskIdSet.has(taskId)).length,
+    receiptTaskIdsEqualGraphSet: graphTaskIds.length === 0 ? null : sameUniqueIds(taskIds, graphTaskIds),
+  }
+}
+
+async function collectPlanReceiptFailureDiagnostics(
+  pool: Pool,
+  turnId: string,
+  request: HarnessModelRequest,
+  callId: string,
+  graph: unknown,
+): Promise<string> {
+  try {
+    const persisted = await pool.query<{ type: string; status: string; revision: number; content: unknown }>(
+      `SELECT "type", "status", "revision", "content" FROM "agent_items"
+       WHERE "turnId" = $1 AND "type" IN ('tool_call', 'tool_result')
+       ORDER BY "createdAt" DESC LIMIT 40`,
+      [turnId],
+    )
+    const persistedItems = [...persisted.rows].reverse()
+    const callItems = persistedItems.filter(row => row.type === "tool_call" && record(row.content)?.toolName === "agent.plan")
+    const expectedCallItems = callItems.filter(row => record(row.content)?.toolCallId === callId)
+    const planCallIds = new Set(callItems.flatMap(row => {
+      const id = record(row.content)?.toolCallId
+      return typeof id === "string" ? [id] : []
+    }))
+    const resultItems = persistedItems.filter(row => row.type === "tool_result"
+      && (planCallIds.has(String(record(row.content)?.toolCallId)) || record(row.content)?.toolCallId === callId))
+    const expectedResultItems = resultItems.filter(row => record(row.content)?.toolCallId === callId)
+    const expectedResult = record(expectedResultItems.at(-1)?.content)
+    const output = record(expectedResult?.output)
+    const nodes = Array.isArray(output?.nodes) ? output.nodes.map(record).filter((node): node is RecordValue => node !== null) : []
+    const taskIds = nodes.flatMap(node => typeof node.taskId === "string" && node.taskId.trim().length > 0 ? [node.taskId] : [])
+    const graphNodes = record(graph)?.nodes
+    const graphTaskIds = Array.isArray(graphNodes)
+      ? graphNodes.map(record).flatMap(node => typeof node?.taskId === "string" ? [node.taskId] : [])
+      : []
+    const graphTaskIdSet = new Set(graphTaskIds)
+    const requestProjection = planReceiptEvidenceProjection(request, callId, graph)
+    const persistedProjection = {
+      expectedCallMatched: expectedCallItems.length > 0 && expectedResultItems.length > 0,
+      matchingToolUseCount: expectedCallItems.length,
+      matchingToolNameIsAgentPlan: expectedCallItems.some(row => record(row.content)?.toolName === "agent.plan"),
+      callItemStatus: diagnosticEnum(expectedCallItems.at(-1)?.status, ITEM_DIAGNOSTIC_STATUSES),
+      planToolUseCount: callItems.length,
+      planToolNames: [...new Set(callItems.map(row => record(row.content)?.toolName === "agent.plan" ? "agent.plan" : "other"))].slice(0, 2),
+      matchingToolResultCount: expectedResultItems.length,
+      matchingResultIsError: expectedResultItems.length === 0 ? null : expectedResultItems.at(-1)?.status !== "completed",
+      planToolResultCount: resultItems.length,
+      resultItemStatus: diagnosticEnum(expectedResultItems.at(-1)?.status, ITEM_DIAGNOSTIC_STATUSES),
+      resultItemRevision: diagnosticBoundedCount(expectedResultItems.at(-1)?.revision),
+      resultCallIdMatchesPlanCall: typeof expectedResult?.toolCallId === "string" && planCallIds.has(expectedResult.toolCallId),
+      resultErrorCodePresent: typeof expectedResult?.errorCode === "string",
+      receiptStatus: output?.status === "accepted" || output?.status === "duplicate" ? output.status : output ? "other" : "missing",
+      receiptRevision: diagnosticBoundedCount(output?.revision),
+      receiptNodeCount: Array.isArray(output?.nodes) ? output.nodes.length : null,
+      receiptTaskIdCount: taskIds.length,
+      graphTaskIdCount: graphTaskIds.length,
+      receiptTaskIdsMatchingGraphCount: taskIds.filter(taskId => graphTaskIdSet.has(taskId)).length,
+      receiptTaskIdsEqualGraphSet: graphTaskIds.length === 0 ? null : sameUniqueIds(taskIds, graphTaskIds),
+    }
+    const requestResultMatchesPersisted = requestProjection.expectedCallMatched === persistedProjection.expectedCallMatched
+      && requestProjection.matchingToolUseCount === persistedProjection.matchingToolUseCount
+      && requestProjection.matchingToolNameIsAgentPlan === persistedProjection.matchingToolNameIsAgentPlan
+      && requestProjection.planToolUseCount === persistedProjection.planToolUseCount
+      && JSON.stringify(requestProjection.planToolNames) === JSON.stringify(persistedProjection.planToolNames)
+      && requestProjection.matchingToolResultCount === persistedProjection.matchingToolResultCount
+      && requestProjection.matchingResultIsError === persistedProjection.matchingResultIsError
+      && requestProjection.planToolResultCount === persistedProjection.planToolResultCount
+      && requestProjection.resultCallIdMatchesPlanCall === persistedProjection.resultCallIdMatchesPlanCall
+      && requestProjection.receiptStatus === persistedProjection.receiptStatus
+      && requestProjection.resultErrorCodePresent === persistedProjection.resultErrorCodePresent
+      && requestProjection.receiptRevision === persistedProjection.receiptRevision
+      && requestProjection.receiptNodeCount === persistedProjection.receiptNodeCount
+      && requestProjection.receiptTaskIdCount === persistedProjection.receiptTaskIdCount
+      && requestProjection.receiptTaskIdsMatchingGraphCount === persistedProjection.receiptTaskIdsMatchingGraphCount
+      && requestProjection.receiptTaskIdsEqualGraphSet === persistedProjection.receiptTaskIdsEqualGraphSet
+    return boundedDiagnostic(JSON.stringify({
+      available: true,
+      expectedCallMatched: requestProjection.expectedCallMatched === true && persistedProjection.expectedCallMatched === true,
+      request: requestProjection,
+      persisted: persistedProjection,
+      requestResultMatchesPersisted,
+    }), 1_200)
+  } catch {
+    return JSON.stringify({ available: false })
+  }
 }
 
 function waitOutcomeFromRequest(request: HarnessModelRequest, taskCount: number): RecordValue & { tasks: unknown[] } {
@@ -1657,6 +1935,62 @@ describe("compact TaskGraph wait failure diagnostics", () => {
     expect(() => planTaskIds(malformedDuplicate, "replayed-plan-call", 1)).toThrow("Expected 1 planned task ID(s); received 0")
   })
 
+  it("projects plan receipt identifiers and revisions without exposing request payloads", () => {
+    const privateTaskId = "private-task-verification"
+    const privatePrompt = "private-plan-prompt"
+    const request = {
+      messages: [
+        { role: "assistant", content: [{
+          type: "tool_use", id: "follow-up-plan", name: "agent.plan", input: { goal: privatePrompt },
+        }] },
+        { role: "tool", content: [{
+          type: "tool_result", toolUseId: "follow-up-plan",
+          content: JSON.stringify({
+            status: "accepted", revision: 12,
+            nodes: [{ key: "verification", taskId: privateTaskId, goal: privatePrompt }],
+          }),
+        }] },
+      ],
+    } as unknown as HarnessModelRequest
+
+    const evidence = planReceiptEvidenceProjection(request, "follow-up-plan", {
+      nodes: [{ key: "verification", taskId: privateTaskId }],
+    })
+
+    expect(evidence).toMatchObject({
+      expectedCallMatched: true, matchingToolUseCount: 1, matchingToolNameIsAgentPlan: true,
+      planToolUseCount: 1, planToolNames: ["agent.plan"],
+      matchingToolResultCount: 1, matchingResultIsError: false,
+      planToolResultCount: 1, resultContentType: "string", resultJsonParsed: true,
+      receiptStatus: "accepted", receiptRevision: 12, receiptNodeCount: 1, receiptTaskIdCount: 1,
+      graphTaskIdCount: 1, receiptTaskIdsMatchingGraphCount: 1, receiptTaskIdsEqualGraphSet: true,
+    })
+    expect(JSON.stringify(evidence)).not.toContain(privateTaskId)
+    expect(JSON.stringify(evidence)).not.toContain(privatePrompt)
+    expect(JSON.stringify(evidence)).not.toContain("follow-up-plan")
+
+    const duplicateIds = {
+      messages: [
+        { role: "assistant", content: [{ type: "tool_use", id: "duplicate-plan", name: "agent.plan", input: {} }] },
+        { role: "tool", content: [{
+          type: "tool_result", toolUseId: "duplicate-plan",
+          content: JSON.stringify({ status: "accepted", nodes: [
+            { taskId: privateTaskId }, { taskId: privateTaskId },
+          ] }),
+        }] },
+      ],
+    } as unknown as HarnessModelRequest
+    const duplicateEvidence = planReceiptEvidenceProjection(duplicateIds, "duplicate-plan", {
+      nodes: [{ taskId: privateTaskId }, { taskId: "private-graph-other" }],
+    })
+    expect(duplicateEvidence).toMatchObject({
+      receiptTaskIdCount: 2, graphTaskIdCount: 2, receiptTaskIdsMatchingGraphCount: 2,
+      receiptTaskIdsEqualGraphSet: false,
+    })
+    expect(JSON.stringify(duplicateEvidence)).not.toContain(privateTaskId)
+    expect(JSON.stringify(duplicateEvidence)).not.toContain("private-graph-other")
+  })
+
   it("matches an initial four-task wait to its receipt after a later one-node proposal", () => {
     const initialTaskIds = ["private-source", "private-summary", "private-large", "private-rejected"]
     const nodeRows = (taskIds: readonly string[]) => taskIds.map((taskId, index) => ({
@@ -1717,6 +2051,128 @@ describe("compact TaskGraph wait failure diagnostics", () => {
     expect(output).toContain("failurePreflightStage=first_target_lineage")
     expect(output).toContain("failurePreflightErrorClass=assertion")
     expect(output).not.toContain(marker)
+  })
+
+  it("projects completed graph statuses by fixed node keys without exposing node payloads", () => {
+    const privateIds = [
+      "task-0f1d8f13-1d45-4f3d-b719-f2059186a010",
+      "turn-82a86a40-736d-4460-b7b4-d67a69e6c611",
+    ]
+    const projection = completedGraphStatusFailureProjection({
+      kind: "task_graph_current",
+      nodes: [
+        { key: "source", taskId: privateIds[0], goal: "private source goal", status: "completed", readiness: "terminal" },
+        { key: "summary", taskId: privateIds[1], goal: "private summary goal", status: "completed", readiness: "terminal" },
+        { key: "large-source", taskId: "private-large", status: "completed", readiness: "terminal" },
+        { key: "rejected", taskId: "private-rejected", status: "failed", readiness: "terminal" },
+        { key: "verification", taskId: "private-verification", status: "completed", readiness: "active" },
+      ],
+    })
+
+    expect(projection).toEqual({ nodes: [
+      { key: "source", status: "completed", readiness: "terminal", expectedMatch: true },
+      { key: "summary", status: "completed", readiness: "terminal", expectedMatch: true },
+      { key: "large-source", status: "completed", readiness: "terminal", expectedMatch: true },
+      { key: "rejected", status: "failed", readiness: "terminal", expectedMatch: false },
+      { key: "verification", status: "completed", readiness: "active", expectedMatch: false },
+    ] })
+    const serialized = JSON.stringify(projection)
+    expect(serialized.length).toBeLessThanOrEqual(1_200)
+    for (const privateId of privateIds) expect(serialized).not.toContain(privateId)
+    expect(serialized).not.toContain("private-")
+    expect(serialized).not.toContain("private source goal")
+  })
+
+  it("projects failed-prerequisite root and target lineage as booleans only", () => {
+    const privateIds = {
+      root: "root-7034c44b-a4a4-445e-a71a-adb33e095901",
+      turn: "turn-8ee6dc90-f10e-4bc9-a355-0cc9ea73d109",
+      targetOne: "target-32ab89f6-090b-4337-945b-cfab5a85da3b",
+      targetTwo: "target-2b578e50-bdbb-4fb8-85b3-5434651b2b8e",
+      mismatchedParent: "parent-c6b882f7-2af1-4bb6-8f26-b9003c96c3fe",
+    }
+    const projection = failurePreflightEvidenceProjection({
+      rootTaskLookupCompleted: true,
+      rootTaskId: privateIds.root,
+      expectedTurnId: privateIds.turn,
+      expectedTaskIds: [privateIds.targetOne, privateIds.targetTwo],
+      targets: [
+        {
+          found: true, taskId: privateIds.targetOne, turnId: privateIds.turn,
+          rootTaskId: privateIds.root, parentTaskId: privateIds.root,
+        },
+        {
+          found: true, taskId: privateIds.targetTwo, turnId: privateIds.turn,
+          rootTaskId: privateIds.root, parentTaskId: privateIds.mismatchedParent,
+        },
+      ],
+    })
+
+    expect(projection).toEqual({ rootTaskFound: true, targets: [
+      {
+        key: "prerequisite", found: true, targetMatchesReceipt: true,
+        turnMatches: true, rootMatches: true, parentMatches: true,
+      },
+      {
+        key: "dependent", found: true, targetMatchesReceipt: true,
+        turnMatches: true, rootMatches: true, parentMatches: false,
+      },
+    ] })
+    const serialized = JSON.stringify(projection)
+    expect(serialized.length).toBeLessThanOrEqual(1_200)
+    for (const privateId of Object.values(privateIds)) expect(serialized).not.toContain(privateId)
+  })
+
+  it("projects missing-task database scope evidence as bounded booleans only", () => {
+    const privateIds = {
+      session: "private-session-id", user: "private-user-id", turn: "private-turn-id",
+      root: "private-root-id", parent: "private-parent-id",
+    }
+    const expected = {
+      sessionId: privateIds.session, userId: privateIds.user, turnId: privateIds.turn, rootTaskId: privateIds.root,
+    }
+    const mismatch = missingTaskScopeEvidence({
+      lookupCompleted: true,
+      observed: {
+        sessionId: "other-session-id", sessionUserId: "other-user-id", turnId: privateIds.turn,
+        rootTaskId: privateIds.root, parentTaskId: privateIds.parent,
+      },
+      expected,
+    })
+    const projection = failurePreflightEvidenceProjection({
+      rootTaskLookupCompleted: true,
+      rootTaskId: privateIds.root,
+      expectedTurnId: privateIds.turn,
+      expectedTaskIds: ["private-target-id"],
+      targets: [{ found: false, scope: mismatch }, null],
+    })
+
+    expect(projection).toEqual({ rootTaskFound: true, targets: [
+      {
+        key: "prerequisite", found: false, targetMatchesReceipt: null,
+        turnMatches: null, rootMatches: null, parentMatches: null,
+        scope: {
+          lookupCompleted: true, rowFound: true, sessionMatches: false, userMatches: false,
+          turnMatches: true, rootMatches: true, parentMatches: false,
+        },
+      },
+      {
+        key: "dependent", found: null, targetMatchesReceipt: null,
+        turnMatches: null, rootMatches: null, parentMatches: null,
+      },
+    ] })
+    expect(missingTaskScopeEvidence({ lookupCompleted: true, observed: null, expected })).toMatchObject({
+      lookupCompleted: true, rowFound: false,
+    })
+    expect(missingTaskScopeEvidence({ lookupCompleted: false, observed: null, expected })).toMatchObject({
+      lookupCompleted: false, rowFound: null,
+    })
+    const serialized = JSON.stringify(projection)
+    expect(serialized.length).toBeLessThanOrEqual(1_200)
+    for (const privateId of Object.values(privateIds)) expect(serialized).not.toContain(privateId)
+    expect(serialized).not.toContain("other-session-id")
+    expect(serialized).not.toContain("other-user-id")
+    expect(serialized).not.toContain("private-target-id")
   })
 
   it("distinguishes stale graph context from persisted receipt/snapshot lineage mismatch without exposing IDs", () => {
@@ -2322,6 +2778,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let followUpExpectedRevision: number | undefined
     let rootModelStreamFailure: string | null = null
     let firstWaitPlanGraphDiagnostics: string | null = null
+    let followUpPlanReceiptFailureDiagnostics: string | null = null
+    let completedGraphStateFailureDiagnostics: string | null = null
     let rootModelFailureStage: RootModelFailureStage = "not_started"
     let childFixtureFailureStage: ChildFixtureFailureStage | null = null
     let rootWaitHandoffFailure: string | null = null
@@ -2414,11 +2872,26 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 rootModelFailureStage = "follow_up_graph_readiness"
                 expect(nodes.slice(0, 4).map(node => node?.readiness)).toEqual(["terminal", "terminal", "terminal", "terminal"])
                 rootModelFailureStage = "follow_up_plan_receipt_lookup"
-                const plannedTaskIds = planTaskIds(request, FOLLOW_UP_PLAN_CALL_ID, 1)
+                let plannedTaskIds: string[]
+                try {
+                  plannedTaskIds = planTaskIds(request, FOLLOW_UP_PLAN_CALL_ID, 1)
+                } catch (error: unknown) {
+                  followUpPlanReceiptFailureDiagnostics = await collectPlanReceiptFailureDiagnostics(
+                    pool!, owner.turnId, request, FOLLOW_UP_PLAN_CALL_ID, graph,
+                  )
+                  throw error
+                }
                 rootModelFailureStage = "follow_up_graph_task_id"
-                expect(nodes.find(node => node?.key === "verification")).toMatchObject({
-                  key: "verification", taskId: plannedTaskIds[0],
-                })
+                try {
+                  expect(nodes.find(node => node?.key === "verification")).toMatchObject({
+                    key: "verification", taskId: plannedTaskIds[0],
+                  })
+                } catch (error: unknown) {
+                  followUpPlanReceiptFailureDiagnostics = await collectPlanReceiptFailureDiagnostics(
+                    pool!, owner.turnId, request, FOLLOW_UP_PLAN_CALL_ID, graph,
+                  )
+                  throw error
+                }
                 rootModelFailureStage = "follow_up_wait_tool"
                 expect(request.tools.map(tool => record(tool)?.name)).toContain("agent.wait")
                 yield {
@@ -2440,10 +2913,17 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               expect(graph?.kind).toBe("task_graph_current")
               rootModelFailureStage = "completed_graph_keys"
               expect(nodes.map(node => node?.key)).toEqual(["source", "summary", "large-source", "rejected", "verification"])
-              rootModelFailureStage = "completed_graph_statuses"
-              expect(nodes.map(node => node?.status)).toEqual(["completed", "completed", "completed", "cancelled", "completed"])
-              rootModelFailureStage = "completed_graph_readiness"
-              expect(nodes.map(node => node?.readiness)).toEqual(["terminal", "terminal", "terminal", "terminal", "terminal"])
+              try {
+                rootModelFailureStage = "completed_graph_statuses"
+                expect(nodes.map(node => node?.status)).toEqual(["completed", "completed", "completed", "cancelled", "completed"])
+                rootModelFailureStage = "completed_graph_readiness"
+                expect(nodes.map(node => node?.readiness)).toEqual(["terminal", "terminal", "terminal", "terminal", "terminal"])
+              } catch (error: unknown) {
+                completedGraphStateFailureDiagnostics = boundedDiagnostic(
+                  JSON.stringify(completedGraphStatusFailureProjection(graph)), 1_200,
+                )
+                throw error
+              }
               followUpGraphReachedModel = true
               rootModelFailureStage = "completed_wait_outcome"
               const waitOutcome = waitOutcomeFromRequest(request, 1)
@@ -2618,6 +3098,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const rootModelFailureDiagnostic: FailureDiagnosticField[] = rootModelStreamFailure
         ? [{ label: `rootModelFailureAt_${rootModelFailureStage}`, value: "captured" }]
         : []
+      const followUpReceiptDiagnostic: FailureDiagnosticField[] = followUpPlanReceiptFailureDiagnostics
+        ? [{ label: "followUpPlanReceiptEvidence", value: "captured", safeValue: followUpPlanReceiptFailureDiagnostics }]
+        : []
+      const completedGraphStateDiagnostic: FailureDiagnosticField[] = completedGraphStateFailureDiagnostics
+        ? [{ label: "completedGraphStateEvidence", value: "captured", safeValue: completedGraphStateFailureDiagnostics }]
+        : []
       const childFailureDiagnostic: FailureDiagnosticField[] = childFixtureFailureStage
         ? [{ label: `childFixtureFailureAt_${childFixtureFailureStage}`, value: "captured" }]
         : []
@@ -2628,6 +3114,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         ...childFailureDiagnostic,
         { label: "rootModelStreamFailure", value: rootModelStreamFailure ?? "<not captured>" },
         ...rootModelFailureDiagnostic,
+        ...followUpReceiptDiagnostic,
+        ...completedGraphStateDiagnostic,
         { label: "waitHandoffFailure", value: rootWaitHandoffFailure ?? "<not captured>" },
         { label: "turnFailure", value: waitTurnFailureSummary(error) },
       ], progress, firstWaitPlanGraphDiagnostics) + handoffSuffix, 4_500))
@@ -3307,6 +3795,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let resumedAfterFailure = false
     let failurePreflightStage: FailurePreflightStage = "not_started"
     let failurePreflightErrorClass: FailurePreflightErrorClass = "none"
+    let failurePlanReceiptFailureDiagnostics: string | null = null
+    let failurePreflightEvidenceDiagnostics: string | null = null
+    let failurePreflightRootTaskLookupCompleted = false
+    let failurePreflightRootTaskId: string | null = null
+    let failurePreflightTargetIds: string[] = []
+    const failurePreflightTargetObservations: FailurePreflightTargetObservation[] = [null, null]
     let failureWaitHandoffFailure: string | null = null
     const runtime = await createCanonicalTurnRuntime(pool!, {
       workerId: failureOwner.ownerId,
@@ -3349,6 +3843,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 failurePreflightStage = "plan_receipt"
                 failurePreflightErrorClass = "none"
                 const receiptTaskIds = planTaskIds(request, FAILURE_PLAN_CALL_ID)
+                failurePreflightTargetIds = receiptTaskIds
                 failurePreflightStage = "root_task_lookup"
                 const fixtureTurn = await pool!.query<{ rootTaskId: string | null }>(
                   `SELECT "rootTaskId" FROM "agent_turns"
@@ -3356,6 +3851,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                   [failureOwner.turnId, failureOwner.sessionId, failureOwner.userId],
                 )
                 const fixtureRootTaskId = fixtureTurn.rows[0]?.rootTaskId
+                failurePreflightRootTaskLookupCompleted = true
+                failurePreflightRootTaskId = fixtureRootTaskId ?? null
                 if (!fixtureRootTaskId) {
                   throw new Error("Failed-prerequisite fixture assertion: current root task is missing from agent_turns")
                 }
@@ -3366,28 +3863,38 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                     userId: failureOwner.userId, sessionId: failureOwner.sessionId, taskId,
                   })
                   if (!target) {
-                    const scopedTask = await pool!.query<{
-                      sessionId: string | null; turnId: string | null; rootTaskId: string | null; sessionUserId: string | null
-                    }>(`SELECT task."sessionId", task."turnId", task."rootTaskId", session."userId" AS "sessionUserId"
-                      FROM "sub_agent_tasks" AS task LEFT JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
-                      WHERE task."id" = $1 LIMIT 1`, [taskId])
-                    const observed = scopedTask.rows[0]
-                    const diagnostic = boundedDiagnostic(JSON.stringify({
-                      task: observed ? {
-                        sessionId: observed.sessionId, turnId: observed.turnId,
-                        rootTaskId: observed.rootTaskId, sessionUserId: observed.sessionUserId,
-                      } : null,
-                      expected: {
-                        sessionId: failureOwner.sessionId, turnId: failureOwner.turnId, userId: failureOwner.userId,
-                      },
-                    }), 700)
-                    throw new Error(`Failed-prerequisite fixture assertion: plan receipt target ${taskId} is missing from PgCoordinationStore.getTask; scope=${diagnostic}`)
+                    failurePreflightTargetObservations[index] = {
+                      found: false,
+                      scope: await missingTaskScopeFailureDiagnostics(pool!, taskId, {
+                        sessionId: failureOwner.sessionId, userId: failureOwner.userId,
+                        turnId: failureOwner.turnId, rootTaskId: fixtureRootTaskId,
+                      }),
+                    }
+                    throw new Error("Failed-prerequisite fixture assertion: plan receipt target is missing from PgCoordinationStore.getTask")
+                  }
+                  failurePreflightTargetObservations[index] = {
+                    found: true,
+                    taskId: target.id,
+                    turnId: target.turnId,
+                    rootTaskId: target.rootTaskId,
+                    parentTaskId: target.parentTaskId,
                   }
                   failurePreflightStage = index === 0 ? "first_target_lineage" : "second_target_lineage"
+                  const targetLineage = failurePreflightEvidenceProjection({
+                    rootTaskLookupCompleted: failurePreflightRootTaskLookupCompleted,
+                    rootTaskId: failurePreflightRootTaskId,
+                    expectedTurnId: failureOwner.turnId,
+                    expectedTaskIds: failurePreflightTargetIds,
+                    targets: failurePreflightTargetObservations,
+                  }).targets as Array<RecordValue>
+                  const observedLineage = targetLineage[index]
                   expect({
-                    id: target.id, turnId: target.turnId, rootTaskId: target.rootTaskId, parentTaskId: target.parentTaskId,
-                  }, `Failed-prerequisite fixture assertion: plan receipt target ${taskId} has unexpected lineage`).toEqual({
-                    id: taskId, turnId: failureOwner.turnId, rootTaskId: fixtureRootTaskId, parentTaskId: fixtureRootTaskId,
+                    targetMatchesReceipt: observedLineage?.targetMatchesReceipt,
+                    turnMatches: observedLineage?.turnMatches,
+                    rootMatches: observedLineage?.rootMatches,
+                    parentMatches: observedLineage?.parentMatches,
+                  }, "Failed-prerequisite fixture assertion: target lineage does not match expected scope").toEqual({
+                    targetMatchesReceipt: true, turnMatches: true, rootMatches: true, parentMatches: true,
                   })
                 }
                 failurePreflightStage = "wait_tool_availability"
@@ -3395,6 +3902,16 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 failurePreflightStage = "preflight_passed"
               } catch (error: unknown) {
                 failurePreflightErrorClass = safeFailurePreflightErrorClass(error)
+                failurePreflightEvidenceDiagnostics = boundedDiagnostic(JSON.stringify(failurePreflightEvidenceProjection({
+                  rootTaskLookupCompleted: failurePreflightRootTaskLookupCompleted,
+                  rootTaskId: failurePreflightRootTaskId,
+                  expectedTurnId: failureOwner.turnId,
+                  expectedTaskIds: failurePreflightTargetIds,
+                  targets: failurePreflightTargetObservations,
+                })), 1_200)
+                failurePlanReceiptFailureDiagnostics = await collectPlanReceiptFailureDiagnostics(
+                  pool!, failureOwner.turnId, request, FAILURE_PLAN_CALL_ID, currentGraphFromRequest(request),
+                )
                 throw error
               }
               yield {
@@ -3459,10 +3976,18 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       await waitForTurnStatus(pool!, failureOwner.turnId, "completed", 50_000, FAILURE_WAIT_CALL_ID)
     } catch (error: unknown) {
       const progress = await turnProgressDiagnostics(pool!, failureOwner.turnId, FAILURE_WAIT_CALL_ID)
+      const failureReceiptDiagnostic: FailureDiagnosticField[] = failurePlanReceiptFailureDiagnostics
+        ? [{ label: "failurePlanReceiptEvidence", value: "captured", safeValue: failurePlanReceiptFailureDiagnostics }]
+        : []
+      const failurePreflightEvidence: FailureDiagnosticField[] = failurePreflightEvidenceDiagnostics
+        ? [{ label: "failurePreflightEvidence", value: "captured", safeValue: failurePreflightEvidenceDiagnostics }]
+        : []
       throw new Error(combineFailureDiagnostics([
         { label: "failedPrerequisitePreflight", value: failurePreflightErrorClass === "none" ? "" : "captured" },
         { label: "failurePreflightStage", value: failurePreflightStage, safeValue: failurePreflightStage },
         { label: "failurePreflightErrorClass", value: failurePreflightErrorClass, safeValue: failurePreflightErrorClass },
+        ...failurePreflightEvidence,
+        ...failureReceiptDiagnostic,
         { label: "waitHandoffFailure", value: failureWaitHandoffFailure ?? "<not captured>" },
         { label: "turnFailure", value: waitTurnFailureSummary(error) },
       ], progress))
