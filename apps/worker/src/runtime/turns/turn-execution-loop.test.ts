@@ -251,7 +251,7 @@ describe("owner-agnostic turn execution loop", () => {
     expect(requests[0]?.tools).toEqual(expect.arrayContaining([expect.objectContaining({ name: "agent.plan" })]))
   })
 
-  it("refreshes persisted TaskGraph evidence after an inline-ready wait before the next plan", async () => {
+  it.each(["accepted", "duplicate"] as const)("refreshes TaskGraph evidence after an inline-ready wait and %s plan", async planStatus => {
     const root = fixture(identity("turn", "root-1"))
     const currentGraph: TaskGraphCurrentState = {
       revision: 4,
@@ -270,9 +270,17 @@ describe("owner-agnostic turn execution loop", () => {
     const refresh = vi.fn(async snapshot => mergeTaskGraphCurrentObservation(snapshot, currentGraph))
     const appendExpectedRevisions: number[] = []
     const nextReceipt: TaskGraphScheduleReceipt = {
-      status: "accepted", revision: 5,
+      status: planStatus, revision: 5,
       nodes: [{ key: "next", taskId: "child-2", status: "queued" }], readyTaskIds: ["child-2"],
     }
+    const plannedGraph: TaskGraphCurrentState = {
+      revision: 5,
+      nodes: [...currentGraph.nodes, {
+        key: "next", templateId: "scout", goal: "Find more roles", successCriteria: ["Return evidence"], dependsOn: [],
+        taskId: "child-2", status: "queued", readiness: "ready", resultSummary: null, failureReason: null,
+      }],
+    }
+    const refreshAfterPlan = vi.fn(async snapshot => mergeTaskGraphCurrentObservation(snapshot, plannedGraph))
     const commandPort: TaskGraphCommandPort = {
       appendAndSchedule: vi.fn(async input => {
         appendExpectedRevisions.push(input.proposal.expectedRevision)
@@ -291,6 +299,7 @@ describe("owner-agnostic turn execution loop", () => {
       ...root.options,
       tools: [{ name: "agent.wait", version: "1" }, planTool],
       refreshTaskGraphAfterReadyWait: refresh,
+      refreshTaskGraphAfterPlan: refreshAfterPlan,
       model: {
         ...model,
         async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
@@ -336,10 +345,16 @@ describe("owner-agnostic turn execution loop", () => {
     const result = await runTurnExecutionLoop(root.options)
 
     const secondRequestContext = JSON.stringify(root.requests[1]?.messages).replaceAll("\\\"", "\"")
+    const thirdRequestContext = JSON.stringify(root.requests[2]?.messages).replaceAll("\\\"", "\"")
     expect(result).toMatchObject({ status: "completed", stepCount: 3 })
     expect(refresh).toHaveBeenCalledOnce()
+    expect(refreshAfterPlan).toHaveBeenCalledOnce()
     expect(secondRequestContext).toContain('"status":"completed"')
     expect(secondRequestContext).toContain('"jobId":"job-42"')
+    expect(thirdRequestContext).toContain('"revision":5')
+    expect(thirdRequestContext).toContain('"key":"next"')
+    expect(thirdRequestContext).toContain(`"status":"${planStatus}"`)
+    expect(thirdRequestContext).toContain('"taskId":"child-2"')
     expect(appendExpectedRevisions).toEqual([4])
   })
 

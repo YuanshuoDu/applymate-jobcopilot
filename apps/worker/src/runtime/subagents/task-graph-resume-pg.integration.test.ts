@@ -1368,7 +1368,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     )
     expect(wait.rows).toHaveLength(2)
     expect(wait.rows.every(row => row.status === "ready" && row.suspendedAt instanceof Date && row.consumedAt instanceof Date)).toBe(true)
-    expect(wait.rows.map(row => row.matchedTaskIds.length)).toEqual([2, 1])
+    // The first all-mode wait targets four tasks; terminal cancellations count as matched.
+    expect(wait.rows.map(row => row.matchedTaskIds.length)).toEqual([4, 1])
     for (const row of wait.rows) {
       const wakeEvents = await pool!.query<{ count: string }>(
         `SELECT COUNT(*)::text AS "count" FROM "agent_events" WHERE "sessionId" = $1 AND "idempotencyKey" = $2`,

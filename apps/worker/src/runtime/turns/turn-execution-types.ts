@@ -108,6 +108,8 @@ export type TurnExecutionOptions = {
   readonly steeringMarkerState?: { readonly active: readonly SteeringMarkerPayload[] }
   /** Re-read durable TaskGraph state before continuing after an inline-ready agent.wait. */
   readonly refreshTaskGraphAfterReadyWait?: (snapshot: StepContextSnapshot) => Promise<StepContextSnapshot>
+  /** Re-read durable TaskGraph state after an accepted agent.plan receipt. */
+  readonly refreshTaskGraphAfterPlan?: (snapshot: StepContextSnapshot) => Promise<StepContextSnapshot>
 }
 
 export type TurnExecutionOutcome = TurnEngineResult
