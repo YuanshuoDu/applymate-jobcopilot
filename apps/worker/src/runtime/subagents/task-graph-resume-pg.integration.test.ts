@@ -623,8 +623,10 @@ function waitOutcomeFromRequest(request: HarnessModelRequest, taskCount: number)
 }
 
 function currentGraphFromRequest(request: HarnessModelRequest): RecordValue | null {
-  for (const message of request.messages) {
-    for (const part of message.content) {
+  for (let messageIndex = request.messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const content = request.messages[messageIndex]!.content
+    for (let partIndex = content.length - 1; partIndex >= 0; partIndex -= 1) {
+      const part = content[partIndex]!
       if (part.type !== "text" || !part.text.includes('"kind":"task_graph_current"')) continue
       const json = part.text.slice(part.text.indexOf("\n") + 1)
       try { return record(JSON.parse(json) as unknown) } catch { return null }
@@ -1222,6 +1224,20 @@ async function restartFollowUpWaitDiagnostics(
 }
 
 describe("compact TaskGraph wait failure diagnostics", () => {
+  it("selects the latest TaskGraph observation from a multi-step model request", () => {
+    const request = {
+      messages: [
+        { role: "user", content: [{ type: "text", text: '[context]\n{"kind":"task_graph_current","revision":0,"nodes":[]}' }] },
+        { role: "assistant", content: [{ type: "text", text: '[context]\n{"kind":"task_graph_current","revision":1,"nodes":[{"key":"source","taskId":"child-1"}]}' }] },
+      ],
+    } as unknown as HarnessModelRequest
+
+    expect(currentGraphFromRequest(request)).toMatchObject({
+      kind: "task_graph_current", revision: 1,
+      nodes: [{ key: "source", taskId: "child-1" }],
+    })
+  })
+
   it("keeps the safe process diagnostics line without raw stdout or stderr", () => {
     const prefix = "P3_PARENT_SUSPENSION_DIAGNOSTICS "
     const safeLine = prefix + JSON.stringify({
