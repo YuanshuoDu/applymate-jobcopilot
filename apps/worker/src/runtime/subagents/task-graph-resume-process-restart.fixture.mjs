@@ -30,6 +30,7 @@ const followUpPlanCallId = "p3-process-restart-follow-up-plan", followUpWaitCall
 const pool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 5 })
 let bootstrap
 let stdinBuffer = ""
+let initialWaitLineage = null
 const queuedCommands = []
 const commandWaiters = new Map()
 process.stdin.setEncoding("utf8")
@@ -111,6 +112,7 @@ function parentSuspensionProjection(snapshot) {
     },
     waitCallIdempotencyKeyPresent: snapshot.waitCallIdempotencyKeyPresent,
     graphNodeCount: snapshot.graph.nodeCount,
+    initialWaitLineage: snapshot.initialWaitLineage,
     targetCounts: {
       requested: snapshot.requestedTaskCount,
       graphMatches: snapshot.requestedGraphMatchCount,
@@ -153,9 +155,79 @@ function plannedTaskIds(request, callId = planCallId, expectedCount = 2) {
   return taskIds
 }
 function graphFromRequest(request) {
-  const part = request.messages.flatMap(message => message.content).find(value => value.type === "text" && value.text.includes('"kind":"task_graph_current"'))
-  if (part?.type !== "text") return null
-  try { return record(JSON.parse(part.text.slice(part.text.indexOf("\n") + 1))) } catch { return null }
+  const messages = request.messages
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const content = messages[messageIndex]?.content ?? []
+    for (let partIndex = content.length - 1; partIndex >= 0; partIndex -= 1) {
+      const part = content[partIndex]
+      if (part?.type !== "text" || !part.text.includes('"kind":"task_graph_current"')) continue
+      try { return record(JSON.parse(part.text.slice(part.text.indexOf("\n") + 1))) } catch { return null }
+    }
+  }
+  return null
+}
+function nodeTaskMap(nodes) {
+  if (!Array.isArray(nodes)) return null
+  const byKey = new Map()
+  for (const value of nodes) {
+    const taskNode = record(value)
+    if (typeof taskNode?.key !== "string" || typeof taskNode.taskId !== "string" || byKey.has(taskNode.key)) return null
+    byKey.set(taskNode.key, taskNode.taskId)
+  }
+  return byKey
+}
+function sameTaskGraphNodes(left, right) {
+  const leftByKey = nodeTaskMap(left), rightByKey = nodeTaskMap(right)
+  return leftByKey && rightByKey && leftByKey.size === rightByKey.size
+    && [...leftByKey].every(([key, taskId]) => rightByKey.get(key) === taskId)
+}
+function countOutside(source, target) {
+  if (!Array.isArray(source) || !Array.isArray(target)) return null
+  const targetIds = new Set(target)
+  return source.filter(taskId => !targetIds.has(taskId)).length
+}
+function initialWaitLineageFor(request, requestedTaskIds) {
+  const receipt = record(toolResult(request, planCallId))
+  const receiptNodes = Array.isArray(receipt?.nodes) ? receipt.nodes : null
+  const graph = graphFromRequest(request)
+  const graphNodes = Array.isArray(graph?.nodes) ? graph.nodes : null
+  const receiptRevision = Number.isSafeInteger(receipt?.revision) ? receipt.revision : null
+  const graphRevision = Number.isSafeInteger(graph?.revision) ? graph.revision : null
+  const receiptIds = receiptNodes?.map(value => record(value)?.taskId) ?? null
+  const graphIds = graphNodes?.map(value => record(value)?.taskId) ?? null
+  const validIds = values => Array.isArray(values) && values.every(value => typeof value === "string")
+  const sameIds = (left, right) => validIds(left) && validIds(right)
+    && left.length === right.length && new Set(left).size === left.length
+    && new Set(right).size === right.length && left.every(value => right.includes(value))
+  const receiptByKey = nodeTaskMap(receiptNodes)
+  const graphNodeKeysMissingReceipt = receiptNodes && graphNodes
+    ? [...new Set(graphNodes.flatMap(value => {
+      const graphNode = record(value)
+      return graphNode && typeof graphNode.key === "string" && TASK_GRAPH_KEY_ALLOWLIST.has(graphNode.key)
+        && receiptByKey?.get(graphNode.key) !== graphNode.taskId ? [graphNode.key] : []
+    }))].sort()
+    : []
+  return {
+    proposalReceiptFound: receipt?.status === "accepted" && receiptNodes !== null,
+    proposalNodeCount: receiptNodes?.length ?? 0,
+    graphNodeCount: graphNodes?.length ?? 0,
+    receiptRevision,
+    graphRevision,
+    proposalRevisionMatchesGraph: receiptRevision !== null && receiptRevision === graphRevision,
+    requestMatchesReceipt: sameIds(requestedTaskIds, receiptIds),
+    requestMatchesCurrentGraph: sameIds(requestedTaskIds, graphIds),
+    proposalMatchesGraph: Boolean(receiptNodes && graphNodes && sameTaskGraphNodes(receiptNodes, graphNodes)),
+    requestedIdsOutsideReceiptCount: countOutside(requestedTaskIds, receiptIds),
+    requestedIdsOutsideGraphCount: countOutside(requestedTaskIds, graphIds),
+    graphNodeKeysMissingReceipt,
+  }
+}
+function assertLatestGraphObservationSelection() {
+  const request = { messages: [
+    { content: [{ type: "text", text: '[context]\n{"kind":"task_graph_current","revision":1,"nodes":[{"key":"source","taskId":"old"}]}' }] },
+    { content: [{ type: "text", text: '[context]\n{"kind":"task_graph_current","revision":2,"nodes":[{"key":"source","taskId":"latest"}]}' }] },
+  ] }
+  if (graphFromRequest(request)?.revision !== 2) throw new Error("p3_latest_graph_observation_selection_failed")
 }
 function waitOutcomesFromRequest(request) {
   const outcomes = []
@@ -360,6 +432,7 @@ async function parentSuspensionDiagnostics() {
       waitCallIdempotencyKeyPresent: typeof tool.waitCallIdempotencyKey === "string",
       waitToolOutputStatus: fixedEnum(tool.waitToolOutputStatus, WAIT_OUTPUT_STATUS_ALLOWLIST),
       waitFailureCategory: waitFailureCategory(tool),
+      initialWaitLineage,
       waits: waitResult.rows.map(row => ({
         status: row.waitStatus,
         parentMatchesRoot: Boolean(row.parentMatchesRoot),
@@ -437,7 +510,12 @@ async function startRuntime(workerOwnerId, resume) {
             yield { type: "completed", finishReason: "tool_calls" }; return
           }
           if (!resume && modelRounds === 2) {
-            yield toolCall(waitCallId, "agent.wait", waitArgs("p3-process-restart-wait", plannedTaskIds(request)))
+            const taskIds = plannedTaskIds(request)
+            initialWaitLineage = initialWaitLineageFor(request, taskIds)
+            if (!initialWaitLineage.proposalMatchesGraph || !initialWaitLineage.proposalRevisionMatchesGraph) {
+              throw new Error("p3_initial_wait_plan_graph_mismatch")
+            }
+            yield toolCall(waitCallId, "agent.wait", waitArgs("p3-process-restart-wait", taskIds))
             yield { type: "completed", finishReason: "tool_calls" }; return
           }
           if (resume) {
@@ -545,6 +623,7 @@ async function runSecondWorker() {
   say("P3_SECOND_WORKER_READY " + ownerId); await waitForStop()
 }
 try {
+  assertLatestGraphObservationSelection()
   if (mode === "park-parent") await runFirstWorker()
   else if (mode === "resume-parent") await runSecondWorker()
   else throw new Error("p3_unknown_process_restart_mode")

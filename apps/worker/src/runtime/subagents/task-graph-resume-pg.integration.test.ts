@@ -718,6 +718,26 @@ function processFixtureDiagnosticProjection(value: unknown): RecordValue | null 
   projectEnum("likelyCause", PROCESS_FIXTURE_CAUSES)
 
   projectCount("graphNodeCount")
+  const initialWaitLineage = record(source.initialWaitLineage)
+  if (initialWaitLineage) {
+    const lineage: RecordValue = {}
+    for (const key of [
+      "proposalReceiptFound", "requestMatchesReceipt", "requestMatchesCurrentGraph",
+      "proposalMatchesGraph", "proposalRevisionMatchesGraph",
+    ]) {
+      if (typeof initialWaitLineage[key] === "boolean") lineage[key] = initialWaitLineage[key]
+    }
+    for (const key of [
+      "proposalNodeCount", "graphNodeCount", "receiptRevision", "graphRevision",
+      "requestedIdsOutsideReceiptCount", "requestedIdsOutsideGraphCount",
+    ]) {
+      const safeValue = diagnosticBoundedCount(initialWaitLineage[key])
+      if (safeValue !== null) lineage[key] = safeValue
+    }
+    const safeNodeKeys = diagnosticEnumList(initialWaitLineage.graphNodeKeysMissingReceipt, TASK_GRAPH_DIAGNOSTIC_NODE_KEYS)
+    if (safeNodeKeys.length > 0) lineage.graphNodeKeysMissingReceipt = safeNodeKeys
+    if (Object.keys(lineage).length > 0) projected.initialWaitLineage = lineage
+  }
   projectCountRecord("waits", ["count", "rootCount", "suspendedRootCount"])
   projectCountRecord("targetCounts", ["requested", "graphMatches", "taskRows", "graphRows"])
   projectNodeKeys("missingKeys", ["requestedGraph", "graphTasks"])
@@ -1276,6 +1296,14 @@ describe("compact TaskGraph wait failure diagnostics", () => {
       waitToolOutputStatus: "ready", waitFailureCategory: "database_serialization",
       waits: { count: 3, rootCount: 1, suspendedRootCount: 1, markerExtra: markers[2] },
       graphNodeCount: 2,
+      initialWaitLineage: {
+        proposalReceiptFound: true, proposalNodeCount: 2, graphNodeCount: 2,
+        receiptRevision: 3, graphRevision: 4, proposalRevisionMatchesGraph: false,
+        requestMatchesReceipt: true, requestMatchesCurrentGraph: false, proposalMatchesGraph: false,
+        requestedIdsOutsideReceiptCount: 0, requestedIdsOutsideGraphCount: 1,
+        graphNodeKeysMissingReceipt: ["summary", markers[0], "not-allowed"],
+        taskIds: [markers[0]], rawError: markers[1],
+      },
       targetCounts: { requested: 2, graphMatches: 2, taskRows: 2, graphRows: 2, markerExtra: markers[3] },
       missingKeys: { requestedGraph: ["source", markers[0]], graphTasks: ["summary"] },
       childStatusCounts: { failed: 1, completed: 2, [markers[0]]: 9 },
@@ -1298,6 +1326,13 @@ describe("compact TaskGraph wait failure diagnostics", () => {
       waitToolResultLifecycleStatus: "completed", waitToolOutputStatus: "ready",
       waitFailureCategory: "database_serialization", waits: { count: 3, rootCount: 1, suspendedRootCount: 1 },
       graphNodeCount: 2, targetCounts: { requested: 2, graphMatches: 2, taskRows: 2, graphRows: 2 },
+      initialWaitLineage: {
+        proposalReceiptFound: true, proposalNodeCount: 2, graphNodeCount: 2,
+        receiptRevision: 3, graphRevision: 4, proposalRevisionMatchesGraph: false,
+        requestMatchesReceipt: true, requestMatchesCurrentGraph: false, proposalMatchesGraph: false,
+        requestedIdsOutsideReceiptCount: 0, requestedIdsOutsideGraphCount: 1,
+        graphNodeKeysMissingReceipt: ["summary"],
+      },
       missingKeys: { requestedGraph: ["source"], graphTasks: ["summary"] },
       childStatusCounts: { failed: 1, completed: 2 },
       likelyCause: "wait_row_missing_or_parent_mismatch",
