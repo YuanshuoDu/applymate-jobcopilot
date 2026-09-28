@@ -3,7 +3,7 @@ import { rm, writeFile } from "node:fs/promises"
 import { spawn, type ChildProcess } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { Queue } from "bullmq"
-import { Pool } from "pg"
+import { Pool, type PoolClient } from "pg"
 import { Redis } from "ioredis"
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest"
 import type { HarnessModelRequest, ModelAdapter } from "@jobcopilot/agent-model"
@@ -217,8 +217,38 @@ const TURN_DIAGNOSTIC_STATUSES = new Set([
 ])
 const ITEM_DIAGNOSTIC_STATUSES = new Set(["started", "completed", "failed", "cancelled"])
 const WAIT_DIAGNOSTIC_STATUSES = new Set(["waiting", "ready", "timed_out", "consumed", "failed", "cancelled", "interrupted"])
-const WAIT_HANDOFF_ERROR_CODES = new Set(["40P01", "40001", "55P03", "57014", "23505", "23503", "wait_handoff_unavailable"])
-const WAIT_HANDOFF_ERROR_NAMES = new Set(["Error", "error", "WaitHandoffUnavailable"])
+const WAIT_HANDOFF_ERROR_CODES = new Set([
+  "40P01", "40001", "55P03", "57014", "23505", "23503", "wait_handoff_unavailable",
+  "wait_invalid", "wait_scope_error", "lease_lost",
+])
+const WAIT_HANDOFF_ERROR_NAMES = new Set([
+  "Error", "error", "DurableWaitHandoffError", "TurnLeaseError", "WaitHandoffUnavailable",
+])
+const WAIT_HANDOFF_GATE_ERROR_NAMES = new Set([
+  "Error", "error", "DurableWaitHandoffError", "TurnLeaseError", "WaitHandoffUnavailable",
+])
+const WAIT_HANDOFF_GATE_LABELS = new Map([
+  ["waitId is required", "wait_id_required"],
+  ["leaseExpiresAt is invalid", "lease_expiry_invalid"],
+  ["Session is unavailable", "session_unavailable"],
+  ["Session is outside the wait scope", "session_scope_mismatch"],
+  ["Turn is unavailable", "turn_unavailable"],
+  ["Turn is outside the wait scope", "turn_scope_mismatch"],
+  ["Wait condition is unavailable", "wait_unavailable"],
+  ["Wait parent is outside the root Turn scope", "wait_root_scope_mismatch"],
+  ["Wait step is outside the root Turn scope", "wait_step_scope_mismatch"],
+  ["Wait step is not the current attempt", "wait_step_not_current"],
+  ["Wait condition is already closed", "wait_already_closed"],
+  ["Wait changed during handoff", "wait_changed_during_handoff"],
+  ["Session was closed during wait dispatch", "session_closed_during_dispatch"],
+  ["Turn lease was fenced before wait handoff", "lease_fenced_before_handoff"],
+  ["Turn lease was fenced during wait handoff", "lease_fenced_during_handoff"],
+  ["Turn lease was fenced during wait requeue", "lease_fenced_during_requeue"],
+  ["Production waitHandoff callback was not provided.", "handoff_callback_missing"],
+  ["wait_resume_event_conflict", "resume_event_conflict"],
+  ["wait_resume_session_sequence_unavailable", "resume_session_sequence_unavailable"],
+  ["wait_resume_outbox_conflict", "resume_outbox_conflict"],
+])
 const TASK_GRAPH_DIAGNOSTIC_NODE_KEYS = new Set([
   "source", "summary", "large-source", "rejected", "verification", "prerequisite", "dependent",
 ])
@@ -615,9 +645,15 @@ function boundedErrorDetails(error: unknown): RecordValue {
   }
 }
 
-async function waitHandoffTurnState(pool: Pool, turnId: string, waitId: string): Promise<RecordValue> {
+async function waitHandoffTurnState(pool: Pool, userId: string, turnId: string, waitId: string): Promise<RecordValue> {
+  let client: PoolClient | undefined
+  let transactionStarted = false
   try {
-    const result = await pool.query<{
+    client = await pool.connect()
+    await client.query("BEGIN")
+    transactionStarted = true
+    await client.query("SELECT set_config('app.user_id', $1, true)", [userId])
+    const result = await client.query<{
       turnStatus: string
       leaseOwnerId: string | null
       leaseVersion: number
@@ -630,24 +666,31 @@ async function waitHandoffTurnState(pool: Pool, turnId: string, waitId: string):
          wait."id" AS "waitId", wait."status" AS "waitStatus", wait."suspendedAt", wait."resolvedAt", wait."consumedAt"
        FROM "agent_turns" AS turn LEFT JOIN "agent_wait_conditions" AS wait
          ON wait."turnId" = turn."id" AND wait."id" = $2
-       WHERE turn."id" = $1`, [turnId, waitId])
+       WHERE turn."id" = $1 AND turn."userId" = $3`, [turnId, waitId, userId])
+    await client.query("COMMIT")
+    transactionStarted = false
     const row = result.rows[0]
     return {
+      snapshotReadSucceeded: true,
+      turnFound: row !== undefined,
+      waitFound: row?.waitId !== null && row?.waitId !== undefined,
       turn: row ? {
         status: row.turnStatus,
         leaseOwnerPresent: row.leaseOwnerId !== null,
         leaseVersion: row.leaseVersion,
       } : null,
       wait: row?.waitId ? {
-        id: row.waitId,
         status: row.waitStatus,
-        suspendedAt: row.suspendedAt?.toISOString() ?? null,
-        resolvedAt: row.resolvedAt?.toISOString() ?? null,
-        consumedAt: row.consumedAt?.toISOString() ?? null,
+        hasSuspendedAt: row.suspendedAt !== null,
+        hasResolvedAt: row.resolvedAt !== null,
+        hasConsumedAt: row.consumedAt !== null,
       } : null,
     }
   } catch (error: unknown) {
-    return { diagnosticError: boundedErrorDetails(error) }
+    if (client && transactionStarted) await client.query("ROLLBACK").catch(() => undefined)
+    return { snapshotReadSucceeded: false, turnFound: false, waitFound: false, diagnosticError: boundedErrorDetails(error) }
+  } finally {
+    client?.release()
   }
 }
 
@@ -660,7 +703,7 @@ function withWaitHandoffDiagnostics(
     ...options,
     waitHandoff: async input => {
       if (!options.waitHandoff) {
-        const before = await waitHandoffTurnState(pool, input.lease.turnId, input.waitId)
+        const before = await waitHandoffTurnState(pool, input.lease.userId, input.lease.turnId, input.waitId)
         const unavailable = new Error("Production waitHandoff callback was not provided.")
         unavailable.name = "WaitHandoffUnavailable"
         const unavailableWithCode = Object.assign(unavailable, { code: "wait_handoff_unavailable" })
@@ -672,11 +715,11 @@ function withWaitHandoffDiagnostics(
         }), 1_800))
         throw unavailableWithCode
       }
-      const before = await waitHandoffTurnState(pool, input.lease.turnId, input.waitId)
+      const before = await waitHandoffTurnState(pool, input.lease.userId, input.lease.turnId, input.waitId)
       try {
         await options.waitHandoff(input)
       } catch (error: unknown) {
-        const after = await waitHandoffTurnState(pool, input.lease.turnId, input.waitId)
+        const after = await waitHandoffTurnState(pool, input.lease.userId, input.lease.turnId, input.waitId)
         onFailure(boundedDiagnostic(JSON.stringify({
           waitId: input.waitId,
           error: boundedErrorDetails(error),
@@ -700,21 +743,28 @@ function waitHandoffFailureProjection(diagnostic: string | null): RecordValue {
       const turn = record(current.turn)
       const wait = record(current.wait)
       return {
+        snapshotReadSucceeded: current.snapshotReadSucceeded === true,
+        turnFound: current.turnFound === true,
+        waitFound: current.waitFound === true,
         turnStatus: diagnosticEnum(turn?.status, TURN_DIAGNOSTIC_STATUSES),
         turnLeaseOwnerPresent: turn?.leaseOwnerPresent === true,
         turnLeaseVersion: typeof turn?.leaseVersion === "number" && Number.isSafeInteger(turn.leaseVersion)
           ? turn.leaseVersion
           : null,
         waitStatus: diagnosticEnum(wait?.status, WAIT_DIAGNOSTIC_STATUSES),
-        hasSuspendedAt: typeof wait?.suspendedAt === "string",
-        hasResolvedAt: typeof wait?.resolvedAt === "string",
-        hasConsumedAt: typeof wait?.consumedAt === "string",
+        hasSuspendedAt: wait?.hasSuspendedAt === true,
+        hasResolvedAt: wait?.hasResolvedAt === true,
+        hasConsumedAt: wait?.hasConsumedAt === true,
       }
     }
     return {
       captured: true,
       errorName: diagnosticEnum(error?.name, WAIT_HANDOFF_ERROR_NAMES) ?? "other",
       errorCode: diagnosticEnum(error?.code, WAIT_HANDOFF_ERROR_CODES) ?? "other",
+      handoffGate: typeof error?.name === "string" && WAIT_HANDOFF_GATE_ERROR_NAMES.has(error.name)
+        && typeof error.message === "string"
+        ? WAIT_HANDOFF_GATE_LABELS.get(error.message) ?? "other"
+        : "other",
       before: state(value?.before),
       after: state(value?.after),
     }
@@ -1881,28 +1931,120 @@ describe("compact TaskGraph wait failure diagnostics", () => {
     })
   })
 
-  it("projects wait-handoff errors to fixed enums and state flags", () => {
+  it.each(["wait_invalid", "wait_scope_error"])("projects DurableWaitHandoffError code %s and safe state flags", code => {
     const marker = "marker-sensitive-wait-handoff-value"
     const output = JSON.stringify(waitHandoffFailureProjection(JSON.stringify({
       waitId: marker,
-      error: { name: "Error", code: "40P01", message: marker },
+      error: { name: "DurableWaitHandoffError", code, message: marker, sql: marker, details: { id: marker } },
       before: {
+        snapshotReadSucceeded: true, turnFound: true, waitFound: true,
         turn: { status: "waiting_for_user", leaseOwnerPresent: true, leaseVersion: 4 },
-        wait: { id: marker, status: "waiting", suspendedAt: marker, resolvedAt: null, consumedAt: null },
+        wait: { id: marker, status: "waiting", hasSuspendedAt: true, hasResolvedAt: false, hasConsumedAt: false },
       },
       after: {
+        snapshotReadSucceeded: true, turnFound: true, waitFound: true,
         turn: { status: "failed", leaseOwnerPresent: false, leaseVersion: 5 },
-        wait: { id: marker, status: "waiting", suspendedAt: marker, resolvedAt: null, consumedAt: null },
+        wait: { id: marker, status: "waiting", hasSuspendedAt: true, hasResolvedAt: false, hasConsumedAt: false },
       },
     })))
 
     expect(output).not.toContain(marker)
     expect(JSON.parse(output)).toMatchObject({
       captured: true,
-      errorName: "Error",
-      errorCode: "40P01",
-      before: { turnStatus: "waiting_for_user", turnLeaseOwnerPresent: true, waitStatus: "waiting", hasSuspendedAt: true },
-      after: { turnStatus: "failed", turnLeaseOwnerPresent: false, turnLeaseVersion: 5, waitStatus: "waiting" },
+      errorName: "DurableWaitHandoffError",
+      errorCode: code,
+      handoffGate: "other",
+      before: {
+        snapshotReadSucceeded: true, turnFound: true, waitFound: true,
+        turnStatus: "waiting_for_user", turnLeaseOwnerPresent: true, waitStatus: "waiting", hasSuspendedAt: true,
+      },
+      after: {
+        snapshotReadSucceeded: true, turnFound: true, waitFound: true,
+        turnStatus: "failed", turnLeaseOwnerPresent: false, turnLeaseVersion: 5, waitStatus: "waiting",
+      },
+    })
+  })
+
+  it.each([
+    { name: "Error", code: "40P01" }, { name: "Error", code: "40001" },
+    { name: "Error", code: "55P03" }, { name: "Error", code: "57014" },
+    { name: "Error", code: "23505" }, { name: "Error", code: "23503" },
+    { name: "WaitHandoffUnavailable", code: "wait_handoff_unavailable" },
+    { name: "DurableWaitHandoffError", code: "wait_invalid" },
+    { name: "DurableWaitHandoffError", code: "wait_scope_error" },
+    { name: "TurnLeaseError", code: "lease_lost" },
+  ])("preserves known wait-handoff error identifiers $name/$code", ({ name, code }) => {
+    const projected = waitHandoffFailureProjection(JSON.stringify({ error: { name, code, message: "unprojected" } }))
+    expect(projected).toMatchObject({ errorName: name, errorCode: code })
+  })
+
+  it.each([
+    ["DurableWaitHandoffError", "Session is unavailable", "session_unavailable"],
+    ["DurableWaitHandoffError", "Wait parent is outside the root Turn scope", "wait_root_scope_mismatch"],
+    ["DurableWaitHandoffError", "Wait step is not the current attempt", "wait_step_not_current"],
+    ["DurableWaitHandoffError", "Wait condition is already closed", "wait_already_closed"],
+    ["DurableWaitHandoffError", "Wait changed during handoff", "wait_changed_during_handoff"],
+    ["TurnLeaseError", "Turn lease was fenced before wait handoff", "lease_fenced_before_handoff"],
+    ["Error", "wait_resume_event_conflict", "resume_event_conflict"],
+    ["Error", "wait_resume_session_sequence_unavailable", "resume_session_sequence_unavailable"],
+    ["Error", "wait_resume_outbox_conflict", "resume_outbox_conflict"],
+  ])("maps only known handoff gates to labels", (name, message, handoffGate) => {
+    const projected = waitHandoffFailureProjection(JSON.stringify({
+      error: { name, code: name === "TurnLeaseError" ? "lease_lost" : "wait_scope_error", message },
+    }))
+    expect(projected).toMatchObject({ handoffGate })
+    expect(JSON.stringify(projected)).not.toContain(message)
+  })
+
+  it("distinguishes successful empty reads from failed snapshot reads", () => {
+    const marker = "private-diagnostic-read-error"
+    const projected = waitHandoffFailureProjection(JSON.stringify({
+      error: { name: "DurableWaitHandoffError", code: "wait_scope_error", message: "unknown gate" },
+      before: { snapshotReadSucceeded: true, turnFound: false, waitFound: false },
+      after: {
+        snapshotReadSucceeded: false, turnFound: false, waitFound: false,
+        diagnosticError: { message: marker, query: marker },
+      },
+    }))
+    const output = JSON.stringify(projected)
+
+    expect(output).not.toContain(marker)
+    expect(projected).toMatchObject({
+      before: { snapshotReadSucceeded: true, turnFound: false, waitFound: false },
+      after: { snapshotReadSucceeded: false, turnFound: false, waitFound: false },
+    })
+  })
+
+  it("redacts unrecognized wait-handoff errors and arbitrary details", () => {
+    const marker = "unapproved-wait-handoff-error-value"
+    const output = JSON.stringify(waitHandoffFailureProjection(JSON.stringify({
+      waitId: marker,
+      error: { name: "UnrecognizedWaitHandoffError", code: marker, message: marker, sql: marker, details: { id: marker } },
+      before: {
+        snapshotReadSucceeded: false, turnFound: false, waitFound: false,
+        diagnosticError: { message: marker, query: marker },
+      },
+    })))
+
+    expect(output).not.toContain(marker)
+    expect(JSON.parse(output)).toEqual({
+      captured: true,
+      errorName: "other",
+      errorCode: "other",
+      handoffGate: "other",
+      before: {
+        snapshotReadSucceeded: false,
+        turnFound: false,
+        waitFound: false,
+        turnStatus: null,
+        turnLeaseOwnerPresent: false,
+        turnLeaseVersion: null,
+        waitStatus: null,
+        hasSuspendedAt: false,
+        hasResolvedAt: false,
+        hasConsumedAt: false,
+      },
+      after: null,
     })
   })
 })

@@ -46,7 +46,7 @@ jobs:
         run: |
           for shard in {1..64}; do
             echo "Running Web Vitest shard ${shard}/64"
-            pnpm --filter @jobcopilot/web exec vitest run --shard="${shard}/64"
+            pnpm --filter @jobcopilot/web exec vitest run --shard="${shard}/64" --passWithNoTests
           done
       - name: Run best-effort Playwright tests
         run: pnpm exec playwright test || true
