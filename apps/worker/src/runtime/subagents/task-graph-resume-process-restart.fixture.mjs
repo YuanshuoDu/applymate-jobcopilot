@@ -235,27 +235,37 @@ function mismatchedTaskGraphKeys(left, right) {
     .filter(key => leftByKey.get(key) !== rightByKey.get(key) && TASK_GRAPH_KEY_ALLOWLIST.has(key))
     .sort()
 }
+function boundedTaskGraphRevision(value) {
+  return Number.isSafeInteger(value) && value >= 0 && value <= 2_147_483_647 ? value : null
+}
 function persistedTaskGraphSnapshot(item) {
   const row = record(item), content = record(row?.content)
   const nodes = Array.isArray(content?.nodes) ? content.nodes : null
-  const revision = Number(row?.revision)
+  const revision = boundedTaskGraphRevision(Number(row?.revision))
   return {
     found: Boolean(row),
     valid: Boolean(nodes && nodeTaskMap(nodes)),
     nodeCount: nodes?.length ?? 0,
-    revision: Number.isSafeInteger(revision) && revision >= 0 ? revision : null,
+    revision,
     nodes,
   }
 }
 function assertPersistedGraphComparator() {
   const receipt = [{ key: "source", taskId: "task-a" }, { key: "summary", taskId: "task-b" }]
   const sameInDifferentOrder = [{ key: "summary", taskId: "task-b" }, { key: "source", taskId: "task-a" }]
+  const sameIdentityDifferentDetails = [
+    { key: "source", taskId: "task-a", goal: "diagnostic self-test only" },
+    { key: "summary", taskId: "task-b", goal: "diagnostic self-test only" },
+  ]
   const mismatch = [{ key: "source", taskId: "task-c" }, { key: "summary", taskId: "task-d" }]
   const persistedItem = { revision: 1, content: { nodes: sameInDifferentOrder } }
   const malformedItem = { revision: 1, content: { nodes: [{ key: "source" }] } }
   if (!persistedTaskGraphSnapshot(persistedItem).valid
     || compareTaskGraphNodes(receipt, persistedTaskGraphSnapshot(persistedItem).nodes) !== true
+    || compareTaskGraphNodes(receipt, sameIdentityDifferentDetails) !== true
     || compareTaskGraphNodes(receipt, mismatch) !== false
+    || boundedTaskGraphRevision(2_147_483_647) !== 2_147_483_647
+    || boundedTaskGraphRevision(2_147_483_648) !== null
     || persistedTaskGraphSnapshot(null).found
     || compareTaskGraphNodes(receipt, persistedTaskGraphSnapshot(null).nodes) !== null
     || persistedTaskGraphSnapshot(malformedItem).valid
@@ -295,19 +305,45 @@ async function initialWaitLineageFor(request, requestedTaskIds) {
   const receiptNodes = Array.isArray(receipt?.nodes) ? receipt.nodes : null
   const graph = graphFromRequest(request)
   const graphNodes = Array.isArray(graph?.nodes) ? graph.nodes : null
-  const receiptRevision = Number.isSafeInteger(receipt?.revision) ? receipt.revision : null
-  const graphRevision = Number.isSafeInteger(graph?.revision) ? graph.revision : null
-  let persistedItem = null, persistedItemReadSucceeded = false
+  const receiptRevision = boundedTaskGraphRevision(receipt?.revision)
+  const graphRevision = boundedTaskGraphRevision(graph?.revision)
+  let parentTaskId = null, persistedItem = null, persistedItemReadSucceeded = false
   try {
-    const { rows: [item] } = await pool.query(`SELECT item."revision", item."content"
-      FROM "agent_items" AS item JOIN "agent_turns" AS turn
-        ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId" AND turn."rootTaskId" = item."taskId"
-      WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."type" = 'task_graph'
-      ORDER BY item."revision" DESC, item."updatedAt" DESC LIMIT 1`, [ids.sessionId, ids.turnId])
-    persistedItem = item ?? null
+    const { rows: [item] } = await pool.query(`SELECT turn."rootTaskId" AS "parentTaskId", item."id", item."revision", item."content"
+      FROM "agent_turns" AS turn LEFT JOIN "agent_items" AS item
+        ON item."sessionId" = turn."sessionId" AND item."turnId" = turn."id"
+          AND item."taskId" = turn."rootTaskId" AND item."type" = 'task_graph'
+      WHERE turn."sessionId" = $1 AND turn."id" = $2
+      ORDER BY item."revision" DESC NULLS LAST, item."updatedAt" DESC NULLS LAST LIMIT 1`, [ids.sessionId, ids.turnId])
+    parentTaskId = typeof item?.parentTaskId === "string" ? item.parentTaskId : null
+    persistedItem = typeof item?.id === "string" ? item : null
     persistedItemReadSucceeded = true
   } catch {}
+  let proposalEvent = null
+  if (typeof parentTaskId === "string") {
+    try {
+      const { rows: [event] } = await pool.query(`SELECT event."sequence", event."payload"
+        FROM "agent_events" AS event
+        WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."taskId" = $3
+          AND ($4::text IS NULL OR event."itemId" = $4)
+          AND event."type" IN ('item.started', 'item.delta') AND event."payload"->>'kind' = 'proposal'
+        ORDER BY event."sequence" DESC LIMIT 1`, [ids.sessionId, ids.turnId, parentTaskId, persistedItem?.id ?? null])
+      proposalEvent = event ?? null
+    } catch {}
+  }
   const persistedSnapshot = persistedTaskGraphSnapshot(persistedItem)
+  const proposalPayload = record(proposalEvent?.payload)
+  const eventReceipt = record(proposalPayload?.receipt)
+  const eventReceiptNodes = Array.isArray(eventReceipt?.nodes) ? eventReceipt.nodes : null
+  const embeddedItem = record(proposalPayload?.item)
+  const embeddedContent = record(embeddedItem?.content)
+  const embeddedNodes = Array.isArray(embeddedContent?.nodes) ? embeddedContent.nodes : null
+  const payloadContentPresent = proposalPayload !== null && Object.hasOwn(proposalPayload, "content")
+  const payloadContent = record(proposalPayload?.content)
+  const payloadContentNodes = Array.isArray(payloadContent?.nodes) ? payloadContent.nodes : null
+  const proposalEventRevision = boundedTaskGraphRevision(proposalPayload?.revision)
+  const eventReceiptRevision = boundedTaskGraphRevision(eventReceipt?.revision)
+  const embeddedItemRevision = boundedTaskGraphRevision(embeddedItem?.revision)
   const receiptIds = receiptNodes?.map(value => record(value)?.taskId) ?? null
   const graphIds = graphNodes?.map(value => record(value)?.taskId) ?? null
   const validIds = values => Array.isArray(values) && values.every(value => typeof value === "string")
@@ -345,6 +381,23 @@ async function initialWaitLineageFor(request, requestedTaskIds) {
     graphNodeKeysMissingReceipt,
     receiptPersistedMismatchKeys: mismatchedTaskGraphKeys(receiptNodes, persistedSnapshot.nodes),
     persistedGraphMismatchKeys: mismatchedTaskGraphKeys(persistedSnapshot.nodes, graphNodes),
+    proposalEventFound: Boolean(proposalEvent),
+    proposalEventRevision,
+    requestResultTaskIdentityMapMatchesEventReceipt: compareTaskGraphNodes(receiptNodes, eventReceiptNodes),
+    eventReceiptTaskIdentityMapMatchesEmbeddedContent: compareTaskGraphNodes(eventReceiptNodes, embeddedNodes),
+    embeddedContentTaskIdentityMapMatchesCurrentPersistedItem: compareTaskGraphNodes(embeddedNodes, persistedSnapshot.nodes),
+    embeddedContentTaskIdentityMapMatchesPayloadContent: payloadContentPresent
+      ? compareTaskGraphNodes(embeddedNodes, payloadContentNodes) : null,
+    proposalEventRevisionMatchesReceipt: proposalEventRevision !== null && eventReceiptRevision !== null
+      ? proposalEventRevision === eventReceiptRevision : null,
+    proposalEventRevisionMatchesEmbeddedItem: proposalEventRevision !== null && embeddedItemRevision !== null
+      ? proposalEventRevision === embeddedItemRevision : null,
+    proposalEventRevisionMatchesCurrentPersistedItemRow: proposalEventRevision !== null && persistedSnapshot.revision !== null
+      ? proposalEventRevision === persistedSnapshot.revision : null,
+    eventReceiptEmbeddedTaskIdentityMapMismatchKeys: mismatchedTaskGraphKeys(eventReceiptNodes, embeddedNodes),
+    embeddedCurrentPersistedTaskIdentityMapMismatchKeys: mismatchedTaskGraphKeys(embeddedNodes, persistedSnapshot.nodes),
+    embeddedPayloadTaskIdentityMapMismatchKeys: payloadContentPresent
+      ? mismatchedTaskGraphKeys(embeddedNodes, payloadContentNodes) : null,
   }
 }
 function assertLatestGraphObservationSelection() {

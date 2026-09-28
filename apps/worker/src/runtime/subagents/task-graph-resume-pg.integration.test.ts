@@ -126,7 +126,15 @@ function diagnosticValueType(value: unknown): string {
 
 function boundedDiagnostic(value: string, maxCharacters = 4_000): string {
   if (value.length <= maxCharacters) return value
-  return `${value.slice(0, maxCharacters)}...[truncated ${value.length - maxCharacters} characters]`
+  let suffix = `...[truncated ${value.length - maxCharacters} characters]`
+  while (suffix.length < maxCharacters) {
+    const retainedLength = maxCharacters - suffix.length
+    const omittedCharacters = value.length - retainedLength
+    const nextSuffix = `...[truncated ${omittedCharacters} characters]`
+    if (nextSuffix.length === suffix.length) return `${value.slice(0, retainedLength)}${nextSuffix}`
+    suffix = nextSuffix
+  }
+  return suffix.slice(0, maxCharacters)
 }
 
 function captureModelStreamFailure(model: ModelAdapter, onFailure: (error: unknown) => void): ModelAdapter {
@@ -214,6 +222,7 @@ const WAIT_HANDOFF_ERROR_NAMES = new Set(["Error", "error", "WaitHandoffUnavaila
 const TASK_GRAPH_DIAGNOSTIC_NODE_KEYS = new Set([
   "source", "summary", "large-source", "rejected", "verification", "prerequisite", "dependent",
 ])
+const TASK_GRAPH_DIAGNOSTIC_PROPOSAL_NODE_KEYS = new Set(["source", "summary", "verification"])
 const TASK_DIAGNOSTIC_STATUSES = new Set([
   "queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed",
 ])
@@ -725,12 +734,36 @@ function processFixtureDiagnosticProjection(value: unknown): RecordValue | null 
   if (initialWaitLineage) {
     const lineage: RecordValue = {}
     for (const key of [
+      "proposalEventFound", "requestResultTaskIdentityMapMatchesEventReceipt",
+      "eventReceiptTaskIdentityMapMatchesEmbeddedContent",
+      "embeddedContentTaskIdentityMapMatchesCurrentPersistedItem",
+      "embeddedContentTaskIdentityMapMatchesPayloadContent",
+      "proposalEventRevisionMatchesReceipt", "proposalEventRevisionMatchesEmbeddedItem",
+      "proposalEventRevisionMatchesCurrentPersistedItemRow",
+    ]) {
+      const value = initialWaitLineage[key]
+      if (typeof value === "boolean" || value === null) lineage[key] = value
+    }
+    for (const key of [
+      "eventReceiptEmbeddedTaskIdentityMapMismatchKeys", "embeddedCurrentPersistedTaskIdentityMapMismatchKeys",
+      "embeddedPayloadTaskIdentityMapMismatchKeys",
+    ]) {
+      const safeValues = diagnosticEnumList(initialWaitLineage[key], TASK_GRAPH_DIAGNOSTIC_PROPOSAL_NODE_KEYS)
+      if (safeValues.length > 0) lineage[key] = safeValues
+    }
+    for (const key of [
       "proposalReceiptFound", "requestMatchesReceipt", "requestMatchesCurrentGraph",
       "proposalMatchesGraph", "proposalRevisionMatchesGraph", "persistedItemReadSucceeded",
       "persistedItemFound", "persistedItemValid", "proposalMatchesPersistedItem", "persistedItemMatchesGraph",
       "planToolPairMatches", "planExpectedRevisionMatches",
     ]) {
       if (typeof initialWaitLineage[key] === "boolean") lineage[key] = initialWaitLineage[key]
+    }
+    const safeNodeKeys = diagnosticEnumList(initialWaitLineage.graphNodeKeysMissingReceipt, TASK_GRAPH_DIAGNOSTIC_NODE_KEYS)
+    if (safeNodeKeys.length > 0) lineage.graphNodeKeysMissingReceipt = safeNodeKeys
+    for (const key of ["receiptPersistedMismatchKeys", "persistedGraphMismatchKeys"]) {
+      const safeValues = diagnosticEnumList(initialWaitLineage[key], TASK_GRAPH_DIAGNOSTIC_NODE_KEYS)
+      if (safeValues.length > 0) lineage[key] = safeValues
     }
     for (const key of [
       "proposalNodeCount", "graphNodeCount", "receiptRevision", "graphRevision",
@@ -741,11 +774,12 @@ function processFixtureDiagnosticProjection(value: unknown): RecordValue | null 
       const safeValue = diagnosticBoundedCount(initialWaitLineage[key])
       if (safeValue !== null) lineage[key] = safeValue
     }
-    const safeNodeKeys = diagnosticEnumList(initialWaitLineage.graphNodeKeysMissingReceipt, TASK_GRAPH_DIAGNOSTIC_NODE_KEYS)
-    if (safeNodeKeys.length > 0) lineage.graphNodeKeysMissingReceipt = safeNodeKeys
-    for (const key of ["receiptPersistedMismatchKeys", "persistedGraphMismatchKeys"]) {
-      const safeValues = diagnosticEnumList(initialWaitLineage[key], TASK_GRAPH_DIAGNOSTIC_NODE_KEYS)
-      if (safeValues.length > 0) lineage[key] = safeValues
+    const proposalEventRevision = initialWaitLineage.proposalEventRevision
+    if (proposalEventRevision === null) {
+      lineage.proposalEventRevision = null
+    } else {
+      const safeRevision = diagnosticBoundedCount(proposalEventRevision)
+      if (safeRevision !== null) lineage.proposalEventRevision = safeRevision
     }
     if (Object.keys(lineage).length > 0) projected.initialWaitLineage = lineage
   }
@@ -1393,6 +1427,134 @@ describe("compact TaskGraph wait failure diagnostics", () => {
     expect(projected).not.toHaveProperty("unknownNested")
     expect(markers.some(marker => output.includes(marker)), "diagnostic output must omit marker values").toBe(false)
     expect(output.length).toBeLessThanOrEqual(1_600)
+  })
+
+  it("redacts proposal event lineage markers while retaining safe comparisons and mismatch keys", () => {
+    const markers = [
+      "marker-proposal-event-id", "marker-request-result-text", "marker-event-receipt-id", "marker-embedded-content",
+    ]
+    const projectLineage = (initialWaitLineage: RecordValue) => {
+      const prefix = "P3_PARENT_SUSPENSION_DIAGNOSTICS "
+      const child = {
+        pid: 42, exitCode: null, signalCode: null,
+        output: [prefix + JSON.stringify({ initialWaitLineage })], errors: [],
+      } as unknown as ProcessFixtureChild
+      const output = processFixtureDiagnostics(child)
+      const projected = JSON.parse(output.slice(output.indexOf(prefix) + prefix.length)) as RecordValue
+      return { output, lineage: projected.initialWaitLineage }
+    }
+
+    const safe = projectLineage({
+      proposalReceiptFound: true,
+      proposalEventFound: true,
+      requestResultTaskIdentityMapMatchesEventReceipt: false,
+      eventReceiptTaskIdentityMapMatchesEmbeddedContent: null,
+      embeddedContentTaskIdentityMapMatchesCurrentPersistedItem: true,
+      embeddedContentTaskIdentityMapMatchesPayloadContent: false,
+      proposalEventRevisionMatchesReceipt: true,
+      proposalEventRevisionMatchesEmbeddedItem: null,
+      proposalEventRevisionMatchesCurrentPersistedItemRow: false,
+      proposalEventRevision: 17,
+      eventReceiptEmbeddedTaskIdentityMapMismatchKeys: ["source", markers[0], "verification", "not-allowed"],
+      embeddedCurrentPersistedTaskIdentityMapMismatchKeys: ["summary", markers[1]],
+      embeddedPayloadTaskIdentityMapMismatchKeys: ["source", "verification", markers[2]],
+      privateIdentifier: markers[3],
+    })
+    expect(safe.lineage).toEqual({
+      proposalEventFound: true,
+      requestResultTaskIdentityMapMatchesEventReceipt: false,
+      eventReceiptTaskIdentityMapMatchesEmbeddedContent: null,
+      embeddedContentTaskIdentityMapMatchesCurrentPersistedItem: true,
+      embeddedContentTaskIdentityMapMatchesPayloadContent: false,
+      proposalEventRevisionMatchesReceipt: true,
+      proposalEventRevisionMatchesEmbeddedItem: null,
+      proposalEventRevisionMatchesCurrentPersistedItemRow: false,
+      eventReceiptEmbeddedTaskIdentityMapMismatchKeys: ["source", "verification"],
+      embeddedCurrentPersistedTaskIdentityMapMismatchKeys: ["summary"],
+      embeddedPayloadTaskIdentityMapMismatchKeys: ["source", "verification"],
+      proposalReceiptFound: true,
+      proposalEventRevision: 17,
+    })
+    expect(markers.some(marker => safe.output.includes(marker))).toBe(false)
+
+    const nullRevision = projectLineage({ proposalEventRevision: null })
+    expect(nullRevision.lineage).toEqual({ proposalEventRevision: null })
+
+    const unsafe = projectLineage({
+      proposalReceiptFound: true,
+      proposalEventFound: markers[0],
+      requestResultTaskIdentityMapMatchesEventReceipt: markers[1],
+      eventReceiptTaskIdentityMapMatchesEmbeddedContent: markers[2],
+      embeddedContentTaskIdentityMapMatchesCurrentPersistedItem: "yes",
+      embeddedContentTaskIdentityMapMatchesPayloadContent: markers[3],
+      proposalEventRevisionMatchesReceipt: "true",
+      proposalEventRevisionMatchesEmbeddedItem: markers[0],
+      proposalEventRevisionMatchesCurrentPersistedItemRow: markers[1],
+      proposalEventRevision: 10_001,
+      eventReceiptEmbeddedTaskIdentityMapMismatchKeys: [markers[0], "private text"],
+      embeddedCurrentPersistedTaskIdentityMapMismatchKeys: ["not-allowed"],
+      embeddedPayloadTaskIdentityMapMismatchKeys: [{ key: "source" }],
+      privateIdentifier: markers[2],
+    })
+    expect(unsafe.lineage).toEqual({ proposalReceiptFound: true })
+    expect(markers.some(marker => unsafe.output.includes(marker))).toBe(false)
+  })
+
+  it("preserves first-divergence identity diagnostics within the bounded realistic process line", () => {
+    const prefix = "P3_PARENT_SUSPENSION_DIAGNOSTICS "
+    const child = {
+      pid: 42, exitCode: null, signalCode: null, errors: [],
+      output: [prefix + JSON.stringify({
+        turnStatus: "failed", rootTaskStatus: "running", latestModelStepStatus: "failed",
+        latestModelStepErrorClass: "database_deadlock", turnErrorCategory: "database_serialization",
+        waitToolCallStatus: "completed", waitToolCallLifecycleStatus: "completed", planAccepted: true,
+        waitToolResultLifecycleStatus: "completed", waitToolOutputStatus: "ready",
+        waitFailureCategory: "database_serialization", likelyCause: "wait_row_missing_or_parent_mismatch",
+        graphNodeCount: 3,
+        initialWaitLineage: {
+          proposalEventFound: true,
+          requestResultTaskIdentityMapMatchesEventReceipt: true,
+          eventReceiptTaskIdentityMapMatchesEmbeddedContent: false,
+          embeddedContentTaskIdentityMapMatchesCurrentPersistedItem: false,
+          embeddedContentTaskIdentityMapMatchesPayloadContent: true,
+          proposalEventRevisionMatchesReceipt: true,
+          proposalEventRevisionMatchesEmbeddedItem: true,
+          proposalEventRevisionMatchesCurrentPersistedItemRow: false,
+          eventReceiptEmbeddedTaskIdentityMapMismatchKeys: ["source", "summary", "verification"],
+          embeddedCurrentPersistedTaskIdentityMapMismatchKeys: ["verification"],
+          embeddedPayloadTaskIdentityMapMismatchKeys: ["source", "summary"],
+          proposalReceiptFound: true, requestMatchesReceipt: true, requestMatchesCurrentGraph: true,
+          proposalMatchesGraph: false, proposalRevisionMatchesGraph: true, persistedItemReadSucceeded: true,
+          persistedItemFound: true, persistedItemValid: true, proposalMatchesPersistedItem: false,
+          persistedItemMatchesGraph: true, planToolPairMatches: true, planExpectedRevisionMatches: true,
+          proposalNodeCount: 3, graphNodeCount: 3, receiptRevision: 20, graphRevision: 20,
+          persistedItemNodeCount: 3, persistedItemRevision: 20, requestedIdsOutsideReceiptCount: 0,
+          requestedIdsOutsideGraphCount: 0, planToolUseCount: 1, planToolResultCount: 1,
+          planExpectedRevision: 19, proposalEventRevision: 20,
+          graphNodeKeysMissingReceipt: ["verification"],
+          receiptPersistedMismatchKeys: ["source", "summary"], persistedGraphMismatchKeys: ["verification"],
+        },
+        waits: { count: 3, rootCount: 1, suspendedRootCount: 1 },
+        targetCounts: { requested: 3, graphMatches: 3, taskRows: 3, graphRows: 3 },
+        missingKeys: { requestedGraph: ["source"], graphTasks: ["summary"] },
+        childStatusCounts: { failed: 1, completed: 2 },
+      })],
+    } as unknown as ProcessFixtureChild
+
+    const output = processFixtureDiagnostics(child)
+    const truncationMarker = output.indexOf("...[truncated ")
+    const boundedLine = output.slice(0, truncationMarker)
+
+    expect(output.length).toBeLessThanOrEqual(1_600)
+    expect(truncationMarker).toBeGreaterThan(0)
+    expect(boundedLine).toContain('"requestResultTaskIdentityMapMatchesEventReceipt":true')
+    expect(boundedLine).toContain('"eventReceiptTaskIdentityMapMatchesEmbeddedContent":false')
+    expect(boundedLine).toContain('"embeddedContentTaskIdentityMapMatchesCurrentPersistedItem":false')
+    expect(boundedLine).toContain('"embeddedContentTaskIdentityMapMatchesPayloadContent":true')
+    expect(boundedLine).toContain('"proposalEventRevisionMatchesCurrentPersistedItemRow":false')
+    expect(boundedLine).toContain('"eventReceiptEmbeddedTaskIdentityMapMismatchKeys":["source","summary","verification"]')
+    expect(boundedLine).toContain('"embeddedCurrentPersistedTaskIdentityMapMismatchKeys":["verification"]')
+    expect(boundedLine).toContain('"embeddedPayloadTaskIdentityMapMismatchKeys":["source","summary"]')
   })
 
   it("discards a long unknown JSON payload while keeping bounded safe diagnostics", () => {
