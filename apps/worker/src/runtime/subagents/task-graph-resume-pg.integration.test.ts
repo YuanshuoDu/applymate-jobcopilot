@@ -726,12 +726,14 @@ function processFixtureDiagnosticProjection(value: unknown): RecordValue | null 
     const lineage: RecordValue = {}
     for (const key of [
       "proposalReceiptFound", "requestMatchesReceipt", "requestMatchesCurrentGraph",
-      "proposalMatchesGraph", "proposalRevisionMatchesGraph",
+      "proposalMatchesGraph", "proposalRevisionMatchesGraph", "persistedItemReadSucceeded",
+      "persistedItemFound", "persistedItemValid", "proposalMatchesPersistedItem", "persistedItemMatchesGraph",
     ]) {
       if (typeof initialWaitLineage[key] === "boolean") lineage[key] = initialWaitLineage[key]
     }
     for (const key of [
       "proposalNodeCount", "graphNodeCount", "receiptRevision", "graphRevision",
+      "persistedItemNodeCount", "persistedItemRevision",
       "requestedIdsOutsideReceiptCount", "requestedIdsOutsideGraphCount",
     ]) {
       const safeValue = diagnosticBoundedCount(initialWaitLineage[key])
@@ -739,6 +741,10 @@ function processFixtureDiagnosticProjection(value: unknown): RecordValue | null 
     }
     const safeNodeKeys = diagnosticEnumList(initialWaitLineage.graphNodeKeysMissingReceipt, TASK_GRAPH_DIAGNOSTIC_NODE_KEYS)
     if (safeNodeKeys.length > 0) lineage.graphNodeKeysMissingReceipt = safeNodeKeys
+    for (const key of ["receiptPersistedMismatchKeys", "persistedGraphMismatchKeys"]) {
+      const safeValues = diagnosticEnumList(initialWaitLineage[key], TASK_GRAPH_DIAGNOSTIC_NODE_KEYS)
+      if (safeValues.length > 0) lineage[key] = safeValues
+    }
     if (Object.keys(lineage).length > 0) projected.initialWaitLineage = lineage
   }
   projectCountRecord("waits", ["count", "rootCount", "suspendedRootCount"])
@@ -1331,8 +1337,13 @@ describe("compact TaskGraph wait failure diagnostics", () => {
         proposalReceiptFound: true, proposalNodeCount: 2, graphNodeCount: 2,
         receiptRevision: 3, graphRevision: 4, proposalRevisionMatchesGraph: false,
         requestMatchesReceipt: true, requestMatchesCurrentGraph: false, proposalMatchesGraph: false,
+        persistedItemReadSucceeded: true, persistedItemFound: true, persistedItemValid: true,
+        persistedItemNodeCount: 2, persistedItemRevision: 3,
+        proposalMatchesPersistedItem: true, persistedItemMatchesGraph: false,
         requestedIdsOutsideReceiptCount: 0, requestedIdsOutsideGraphCount: 1,
         graphNodeKeysMissingReceipt: ["summary", markers[0], "not-allowed"],
+        receiptPersistedMismatchKeys: ["source", markers[0]],
+        persistedGraphMismatchKeys: ["summary", markers[0]],
         taskIds: [markers[0]], rawError: markers[1],
       },
       targetCounts: { requested: 2, graphMatches: 2, taskRows: 2, graphRows: 2, markerExtra: markers[3] },
@@ -1361,8 +1372,12 @@ describe("compact TaskGraph wait failure diagnostics", () => {
         proposalReceiptFound: true, proposalNodeCount: 2, graphNodeCount: 2,
         receiptRevision: 3, graphRevision: 4, proposalRevisionMatchesGraph: false,
         requestMatchesReceipt: true, requestMatchesCurrentGraph: false, proposalMatchesGraph: false,
+        persistedItemReadSucceeded: true, persistedItemFound: true, persistedItemValid: true,
+        persistedItemNodeCount: 2, persistedItemRevision: 3,
+        proposalMatchesPersistedItem: true, persistedItemMatchesGraph: false,
         requestedIdsOutsideReceiptCount: 0, requestedIdsOutsideGraphCount: 1,
         graphNodeKeysMissingReceipt: ["summary"],
+        receiptPersistedMismatchKeys: ["source"], persistedGraphMismatchKeys: ["summary"],
       },
       missingKeys: { requestedGraph: ["source"], graphTasks: ["summary"] },
       childStatusCounts: { failed: 1, completed: 2 },

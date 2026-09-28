@@ -177,30 +177,84 @@ function graphFromRequest(request) {
 function nodeTaskMap(nodes) {
   if (!Array.isArray(nodes)) return null
   const byKey = new Map()
+  const taskIds = new Set()
   for (const value of nodes) {
     const taskNode = record(value)
-    if (typeof taskNode?.key !== "string" || typeof taskNode.taskId !== "string" || byKey.has(taskNode.key)) return null
+    if (typeof taskNode?.key !== "string" || typeof taskNode.taskId !== "string"
+      || byKey.has(taskNode.key) || taskIds.has(taskNode.taskId)) return null
     byKey.set(taskNode.key, taskNode.taskId)
+    taskIds.add(taskNode.taskId)
   }
   return byKey
 }
-function sameTaskGraphNodes(left, right) {
+function sortedTaskGraphPairs(nodes) {
+  const byKey = nodeTaskMap(nodes)
+  return byKey ? [...byKey].sort(([left], [right]) => left.localeCompare(right)) : null
+}
+function compareTaskGraphNodes(left, right) {
+  const leftPairs = sortedTaskGraphPairs(left), rightPairs = sortedTaskGraphPairs(right)
+  return leftPairs && rightPairs && leftPairs.length === rightPairs.length
+    ? leftPairs.every(([key, taskId], index) => key === rightPairs[index][0] && taskId === rightPairs[index][1])
+    : leftPairs && rightPairs ? false : null
+}
+function mismatchedTaskGraphKeys(left, right) {
   const leftByKey = nodeTaskMap(left), rightByKey = nodeTaskMap(right)
-  return leftByKey && rightByKey && leftByKey.size === rightByKey.size
-    && [...leftByKey].every(([key, taskId]) => rightByKey.get(key) === taskId)
+  if (!leftByKey || !rightByKey) return []
+  return [...new Set([...leftByKey.keys(), ...rightByKey.keys()])]
+    .filter(key => leftByKey.get(key) !== rightByKey.get(key) && TASK_GRAPH_KEY_ALLOWLIST.has(key))
+    .sort()
+}
+function persistedTaskGraphSnapshot(item) {
+  const row = record(item), content = record(row?.content)
+  const nodes = Array.isArray(content?.nodes) ? content.nodes : null
+  const revision = Number(row?.revision)
+  return {
+    found: Boolean(row),
+    valid: Boolean(nodes && nodeTaskMap(nodes)),
+    nodeCount: nodes?.length ?? 0,
+    revision: Number.isSafeInteger(revision) && revision >= 0 ? revision : null,
+    nodes,
+  }
+}
+function assertPersistedGraphComparator() {
+  const receipt = [{ key: "source", taskId: "task-a" }, { key: "summary", taskId: "task-b" }]
+  const sameInDifferentOrder = [{ key: "summary", taskId: "task-b" }, { key: "source", taskId: "task-a" }]
+  const mismatch = [{ key: "source", taskId: "task-c" }, { key: "summary", taskId: "task-d" }]
+  const persistedItem = { revision: 1, content: { nodes: sameInDifferentOrder } }
+  const malformedItem = { revision: 1, content: { nodes: [{ key: "source" }] } }
+  if (!persistedTaskGraphSnapshot(persistedItem).valid
+    || compareTaskGraphNodes(receipt, persistedTaskGraphSnapshot(persistedItem).nodes) !== true
+    || compareTaskGraphNodes(receipt, mismatch) !== false
+    || persistedTaskGraphSnapshot(null).found
+    || compareTaskGraphNodes(receipt, persistedTaskGraphSnapshot(null).nodes) !== null
+    || persistedTaskGraphSnapshot(malformedItem).valid
+    || compareTaskGraphNodes(receipt, persistedTaskGraphSnapshot(malformedItem).nodes) !== null) {
+    throw new Error("p3_persisted_graph_comparator_self_test_failed")
+  }
 }
 function countOutside(source, target) {
   if (!Array.isArray(source) || !Array.isArray(target)) return null
   const targetIds = new Set(target)
   return source.filter(taskId => !targetIds.has(taskId)).length
 }
-function initialWaitLineageFor(request, requestedTaskIds) {
+async function initialWaitLineageFor(request, requestedTaskIds) {
   const receipt = record(latestToolResult(request, planCallId))
   const receiptNodes = Array.isArray(receipt?.nodes) ? receipt.nodes : null
   const graph = graphFromRequest(request)
   const graphNodes = Array.isArray(graph?.nodes) ? graph.nodes : null
   const receiptRevision = Number.isSafeInteger(receipt?.revision) ? receipt.revision : null
   const graphRevision = Number.isSafeInteger(graph?.revision) ? graph.revision : null
+  let persistedItem = null, persistedItemReadSucceeded = false
+  try {
+    const { rows: [item] } = await pool.query(`SELECT item."revision", item."content"
+      FROM "agent_items" AS item JOIN "agent_turns" AS turn
+        ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId" AND turn."rootTaskId" = item."taskId"
+      WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."type" = 'task_graph'
+      ORDER BY item."revision" DESC, item."updatedAt" DESC LIMIT 1`, [ids.sessionId, ids.turnId])
+    persistedItem = item ?? null
+    persistedItemReadSucceeded = true
+  } catch {}
+  const persistedSnapshot = persistedTaskGraphSnapshot(persistedItem)
   const receiptIds = receiptNodes?.map(value => record(value)?.taskId) ?? null
   const graphIds = graphNodes?.map(value => record(value)?.taskId) ?? null
   const validIds = values => Array.isArray(values) && values.every(value => typeof value === "string")
@@ -221,13 +275,22 @@ function initialWaitLineageFor(request, requestedTaskIds) {
     graphNodeCount: graphNodes?.length ?? 0,
     receiptRevision,
     graphRevision,
+    persistedItemReadSucceeded,
+    persistedItemFound: persistedSnapshot.found,
+    persistedItemValid: persistedSnapshot.valid,
+    persistedItemNodeCount: persistedSnapshot.nodeCount,
+    persistedItemRevision: persistedSnapshot.revision,
     proposalRevisionMatchesGraph: receiptRevision !== null && receiptRevision === graphRevision,
     requestMatchesReceipt: sameIds(requestedTaskIds, receiptIds),
     requestMatchesCurrentGraph: sameIds(requestedTaskIds, graphIds),
-    proposalMatchesGraph: Boolean(receiptNodes && graphNodes && sameTaskGraphNodes(receiptNodes, graphNodes)),
+    proposalMatchesGraph: compareTaskGraphNodes(receiptNodes, graphNodes) === true,
+    proposalMatchesPersistedItem: compareTaskGraphNodes(receiptNodes, persistedSnapshot.nodes),
+    persistedItemMatchesGraph: compareTaskGraphNodes(persistedSnapshot.nodes, graphNodes),
     requestedIdsOutsideReceiptCount: countOutside(requestedTaskIds, receiptIds),
     requestedIdsOutsideGraphCount: countOutside(requestedTaskIds, graphIds),
     graphNodeKeysMissingReceipt,
+    receiptPersistedMismatchKeys: mismatchedTaskGraphKeys(receiptNodes, persistedSnapshot.nodes),
+    persistedGraphMismatchKeys: mismatchedTaskGraphKeys(persistedSnapshot.nodes, graphNodes),
   }
 }
 function assertLatestGraphObservationSelection() {
@@ -534,7 +597,7 @@ async function startRuntime(workerOwnerId, resume) {
           }
           if (!resume && modelRounds === 2) {
             const taskIds = plannedTaskIds(request)
-            initialWaitLineage = initialWaitLineageFor(request, taskIds)
+            initialWaitLineage = await initialWaitLineageFor(request, taskIds)
             if (!initialWaitLineage.proposalMatchesGraph || !initialWaitLineage.proposalRevisionMatchesGraph) {
               throw new Error("p3_initial_wait_plan_graph_mismatch")
             }
@@ -648,6 +711,7 @@ async function runSecondWorker() {
 try {
   assertLatestGraphObservationSelection()
   assertLatestToolResultSelection()
+  assertPersistedGraphComparator()
   if (mode === "self-test") say("P3_FIXTURE_SELF_TEST_OK")
   else if (mode === "park-parent") await runFirstWorker()
   else if (mode === "resume-parent") await runSecondWorker()
