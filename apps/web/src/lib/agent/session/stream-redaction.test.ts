@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest"
 import { redactStreamEventPayload, redactStreamString, redactStreamValue } from "./stream-redaction"
 
 const identity = { sessionId: "session-1", turnId: "turn-1", itemId: "graph-1", taskId: "root-1" }
+const childIdentity = { ...identity, taskId: "task-1" }
 const graphVersion = "agent-harness.v2.task-graph"
 
 function item(content: unknown, overrides: Record<string, unknown> = {}) {
@@ -37,37 +38,65 @@ describe("agent stream redaction", () => {
   })
 
   it("preserves only a valid TaskGraph item and still redacts its goal strings", () => {
-    const validPayload = { kind: "lifecycle", event: { type: "task.completed" }, revision: 1, item: item(content([
+    const validPayload = { kind: "lifecycle", event: { type: "task.completed", nodeKey: "research" }, revision: 1, item: item(content([
       node("research", "task-1", [], { goal: "Review this role; Bearer very-secret-token" }),
     ])) }
-    const preserved = redactStreamEventPayload("item.delta", validPayload, identity) as {
-      item: { content: { nodes: Array<{ goal: string }> } }
+    const preserved = redactStreamEventPayload("item.delta", validPayload, childIdentity) as {
+      item: { content: { nodes: Array<{ goal: string; taskId: string }> } }
     }
     expect(preserved.item.content.nodes[0]?.goal).toBe("Review this role; Bearer [REDACTED]")
+    expect(preserved.item.content.nodes[0]?.taskId).toBe("task-1")
 
     const unrelated = redactStreamEventPayload("item.delta", {
       item: item({ text: "private transcript" }, { type: "agent_message" }),
     }, identity) as { item: { content: unknown } }
     expect(unrelated.item.content).toBe("[REDACTED]")
 
-    const wrongEventType = redactStreamEventPayload("task_graph", validPayload, identity) as {
+    const wrongEventType = redactStreamEventPayload("task_graph", validPayload, childIdentity) as {
       item: { content: unknown }
     }
     expect(wrongEventType.item.content).toBe("[REDACTED]")
 
-    const malformedEvent = redactStreamEventPayload("item.delta", { item: item(content([node("research", "task-1")])) }, identity) as {
+    const malformedEvent = redactStreamEventPayload("item.delta", { item: item(content([node("research", "task-1")])) }, childIdentity) as {
       item: { content: unknown }
     }
     expect(malformedEvent.item.content).toBe("[REDACTED]")
   })
 
+  it("keeps proposal snapshots strictly attributed to the root task", () => {
+    const proposal = {
+      kind: "proposal", fingerprint: "task-graph:fingerprint", receipt: { status: "accepted" }, revision: 1,
+      item: item(content([node("research", "task-1")])),
+    }
+    const rootResult = redactStreamEventPayload("item.delta", proposal, identity) as { item: { content: { nodes: unknown[] } } }
+    expect(rootResult.item.content.nodes).toHaveLength(1)
+
+    const childResult = redactStreamEventPayload("item.delta", proposal, childIdentity) as { item: { content: unknown } }
+    expect(childResult.item.content).toBe("[REDACTED]")
+  })
+
   it.each([
-    ["sessionId", { ...identity, sessionId: "other-session" }],
-    ["turnId", { ...identity, turnId: "other-turn" }],
-    ["itemId", { ...identity, itemId: "other-graph" }],
-    ["taskId", { ...identity, taskId: "other-root" }],
+    ["unknown node key", "missing", "task-1"],
+    ["node key owned by a different child", "analyst", "task-1"],
+    ["child node attributed to the root task", "research", "root-1"],
+    ["missing node key", undefined, "task-1"],
+  ])("generically redacts a lifecycle snapshot with %s", (_case, nodeKey, taskId) => {
+    const event = { type: "task.completed", ...(nodeKey === undefined ? {} : { nodeKey }) }
+    const payload = {
+      kind: "lifecycle", event, revision: 1,
+      item: item(content([node("research", "task-1"), node("analyst", "task-2")])),
+    }
+    const result = redactStreamEventPayload("item.delta", payload, { ...identity, taskId }) as { item: { content: unknown } }
+    expect(result.item.content).toBe("[REDACTED]")
+  })
+
+  it.each([
+    ["sessionId", { ...childIdentity, sessionId: "other-session" }],
+    ["turnId", { ...childIdentity, turnId: "other-turn" }],
+    ["itemId", { ...childIdentity, itemId: "other-graph" }],
+    ["taskId", { ...childIdentity, taskId: "other-child" }],
   ])("generically redacts a valid snapshot when its %s differs from the stream envelope", (_field, eventIdentity) => {
-    const validPayload = { kind: "lifecycle", event: { type: "task.completed" }, revision: 1, item: item(content([node("research", "task-1")])) }
+    const validPayload = { kind: "lifecycle", event: { type: "task.completed", nodeKey: "research" }, revision: 1, item: item(content([node("research", "task-1")])) }
     const result = redactStreamEventPayload("item.delta", validPayload, eventIdentity) as { item: { content: unknown } }
     expect(result.item.content).toBe("[REDACTED]")
   })

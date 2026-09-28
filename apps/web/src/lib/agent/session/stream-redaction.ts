@@ -60,8 +60,16 @@ function taskGraphSnapshotFromEvent(eventType: string, payload: unknown, identit
   if ((!proposal && !lifecycle) || !Number.isSafeInteger(payload.revision) || !isExactRecord(payload.item, TASK_GRAPH_ITEM_KEYS)) return null
   const item = payload.item
   if (item.schemaVersion !== AGENT_STREAM_SCHEMA_VERSION || item.id !== identity.itemId || item.sessionId !== identity.sessionId
-    || item.turnId !== identity.turnId || item.taskId !== identity.taskId || item.type !== 'task_graph' || item.revision !== payload.revision) return null
-  return parseTaskGraphSnapshot(item.content)
+    || item.turnId !== identity.turnId || !boundedText(item.taskId, MAX_IDENTIFIER_LENGTH)
+    || item.type !== 'task_graph' || item.revision !== payload.revision) return null
+  const snapshot = parseTaskGraphSnapshot(item.content)
+  if (!snapshot) return null
+  if (proposal) return item.taskId === identity.taskId ? snapshot : null
+
+  const event = payload.event
+  if (!isRecord(event) || !Object.hasOwn(event, 'nodeKey') || typeof event.nodeKey !== 'string') return null
+  const node = snapshot.nodes.find(candidate => candidate.key === event.nodeKey)
+  return node?.taskId === identity.taskId ? snapshot : null
 }
 
 function redactTaskGraphSnapshot(snapshot: TaskGraphSnapshot): Record<string, unknown> {

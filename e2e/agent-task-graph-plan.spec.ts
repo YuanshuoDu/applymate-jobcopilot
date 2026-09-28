@@ -2,7 +2,7 @@ import { expect, test } from './fixtures'
 import type { Page, Route } from '@playwright/test'
 import { readFileSync } from 'node:fs'
 import { parsePlanLedger, projectPlanLedger, type PlanLedger } from '@jobcopilot/agent-protocol'
-import { redactStreamValue } from '../apps/web/src/lib/agent/session/stream-redaction'
+import { redactStreamEventPayload } from '../apps/web/src/lib/agent/session/stream-redaction'
 
 const SCHEMA = 'agent-harness.v2'
 const GRAPH_SCHEMA = 'agent-harness.v2.task-graph'
@@ -502,7 +502,15 @@ function jsonSse(route: Route, events: readonly PersistedGraphEvent[]) {
     status: 200,
     contentType: 'text/event-stream',
     body: events.map(event => {
-      const redactedEvent = { ...event, payload: redactStreamValue(event.payload) }
+      const redactedEvent = {
+        ...event,
+        payload: redactStreamEventPayload(event.type, event.payload, {
+          sessionId: event.sessionId,
+          turnId: event.turnId,
+          itemId: event.itemId,
+          taskId: event.taskId,
+        }),
+      }
       return `event: ${event.type}\nid: ${event.sequence}\ndata: ${JSON.stringify(redactedEvent)}\n\n`
     }).join(''),
   })
@@ -556,6 +564,7 @@ test('Plan Ledger restores the same persisted trace session after SSE reconnect 
   await page.goto(`/agent-preview?supervisor=1&locale=en&sessionId=${sessionA}`)
 
   const plan = page.locator('[data-agent-task-graph-plan="true"]')
+  const sourcePreview = plan.locator('ol > li').first().locator('[data-task-graph-evidence="preview"]')
   await expect(plan).toBeVisible({ timeout: 20_000 })
   await expect.poll(() => fixture.eventRequests.get(sessionA)?.length ?? 0, { timeout: 10_000 }).toBeGreaterThanOrEqual(2)
   await expect(plan).toHaveAttribute('data-agent-task-graph-session', sessionA)
@@ -574,7 +583,7 @@ test('Plan Ledger restores the same persisted trace session after SSE reconnect 
   for (const secret of ['taskId', 'jobId', 'score', 'url', 'evidenceIds', 'finalText', 'task-graph.result-projection', 'fixture-job-restart', 'p3-process-restart-source-result']) {
     expect(serializedLedger).not.toContain(secret)
   }
-  await expect(plan.locator('[data-task-graph-evidence="preview"]')).toContainText(persistedLedger.nodes[0]!.evidencePreview!.summary)
+  await expect(sourcePreview).toContainText(persistedLedger.nodes[0]!.evidencePreview!.summary)
   await expect(plan).not.toContainText('fixture-job-restart')
   await expect(plan).not.toContainText('p3-process-restart-source-result')
   expect(fixture.eventRequests.get(sessionA)?.slice(0, 2)).toEqual([null, persistedTrace.graphEvents.at(-1)!.sequence])
@@ -638,9 +647,10 @@ test('TaskGraph reconnect snapshot plus event tail matches the persisted trace p
   await page.goto(`/agent-preview?supervisor=1&locale=en&sessionId=${sessionA}`)
 
   const plan = page.locator('[data-agent-task-graph-plan="true"]')
+  const sourcePreview = plan.locator('ol > li').first().locator('[data-task-graph-evidence="preview"]')
   await expect(plan).toBeVisible({ timeout: 20_000 })
   await expect.poll(() => fixture.taskRequestsByMode.get(`live:${sessionA}`) ?? 0, { timeout: 10_000 }).toBe(1)
-  await expect(plan.locator('[data-task-graph-evidence="preview"]')).toContainText(persistedLedger.nodes[0]!.evidencePreview!.summary)
+  await expect(sourcePreview).toContainText(persistedLedger.nodes[0]!.evidencePreview!.summary)
   expect(fixture.planLedgers.get(`${sessionA}:${persistedTrace.initialGraphItem.revision}`)).toBeNull()
   fixture.releaseLiveDelta()
   await expect(plan).toHaveAttribute('data-agent-task-graph-revision', String(revision))
@@ -648,7 +658,7 @@ test('TaskGraph reconnect snapshot plus event tail matches the persisted trace p
   await expect.poll(() => fixture.taskRequestsByMode.get(`live:${sessionA}`) ?? 0, { timeout: 10_000 }).toBeGreaterThanOrEqual(2)
   const liveLedger = fixture.planLedgers.get(`${sessionA}:${revision}`)
   expect(liveLedger).toEqual(persistedLedger)
-  await expect(plan.locator('[data-task-graph-evidence="preview"]')).toContainText(persistedLedger.nodes[0]!.evidencePreview!.summary)
+  await expect(sourcePreview).toContainText(persistedLedger.nodes[0]!.evidencePreview!.summary)
   const liveProjection = await readTaskGraphProjection(plan)
   expect(liveProjection.evidence[0]).toContain(persistedLedger.nodes[0]!.evidencePreview!.summary)
   expect(fixture.requestsByMode.get(`live:${sessionA}`)?.slice(0, 2)).toEqual([null, persistedTrace.graphEvents.at(-1)!.sequence])
@@ -657,19 +667,19 @@ test('TaskGraph reconnect snapshot plus event tail matches the persisted trace p
   await page.reload()
   await expect(plan).toBeVisible({ timeout: 20_000 })
   await expect.poll(() => fixture.taskRequestsByMode.get(`snapshot-tail:${sessionA}`) ?? 0, { timeout: 10_000 }).toBe(1)
-  await expect(plan.locator('[data-task-graph-evidence="preview"]')).toContainText(persistedLedger.nodes[0]!.evidencePreview!.summary)
+  await expect(sourcePreview).toContainText(persistedLedger.nodes[0]!.evidencePreview!.summary)
   expect(fixture.planLedgers.get(`${sessionA}:${persistedTrace.initialGraphItem.revision}`)).toBeNull()
   fixture.releaseSnapshotClose()
   await expect.poll(() => fixture.requestsByMode.get(`snapshot-tail:${sessionA}`)?.length ?? 0, { timeout: 10_000 }).toBeGreaterThanOrEqual(2)
   expect(fixture.taskRequestsByMode.get(`snapshot-tail:${sessionA}`)).toBe(1)
-  await expect(plan.locator('[data-task-graph-evidence="preview"]')).toContainText(persistedLedger.nodes[0]!.evidencePreview!.summary)
+  await expect(sourcePreview).toContainText(persistedLedger.nodes[0]!.evidencePreview!.summary)
   fixture.releaseSnapshotTail()
   await expect(plan).toHaveAttribute('data-agent-task-graph-revision', String(revision))
   await expect.poll(() => fixture.requestsByMode.get(`snapshot-tail:${sessionA}`)?.length ?? 0, { timeout: 10_000 }).toBeGreaterThanOrEqual(3)
   await expect.poll(() => fixture.taskRequestsByMode.get(`snapshot-tail:${sessionA}`) ?? 0, { timeout: 10_000 }).toBeGreaterThanOrEqual(3)
   const resumedLedger = fixture.planLedgers.get(`${sessionA}:${revision}`)
   expect(resumedLedger).toEqual(persistedLedger)
-  await expect(plan.locator('[data-task-graph-evidence="preview"]')).toContainText(persistedLedger.nodes[0]!.evidencePreview!.summary)
+  await expect(sourcePreview).toContainText(persistedLedger.nodes[0]!.evidencePreview!.summary)
   const resumedProjection = await readTaskGraphProjection(plan)
 
   expect(fixture.requestsByMode.get(`snapshot-tail:${sessionA}`)?.slice(0, 3)).toEqual([null, '0', persistedTrace.graphEvents.at(-1)!.sequence])
