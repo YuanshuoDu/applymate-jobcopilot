@@ -115,6 +115,20 @@ function parsePersistedGraphItem(value: unknown): PersistedTaskGraphItem | null 
   return { ...item, content: { schemaVersion: GRAPH_SCHEMA, nodes } } as unknown as PersistedTaskGraphItem
 }
 
+function isValidPersistedGraphEventTaskId(
+  event: Record<string, unknown> | null,
+  payload: Record<string, unknown> | null,
+  item: PersistedTaskGraphItem | null,
+  rootTaskId: string,
+): boolean {
+  if (!event || !payload || !item) return false
+  if (payload.kind === 'proposal') return event.taskId === rootTaskId
+  if (payload.kind !== 'lifecycle') return false
+  const nodeKey = record(payload.event)?.nodeKey
+  return typeof nodeKey === 'string'
+    && item.content.nodes.some(node => node.key === nodeKey && node.taskId === event.taskId)
+}
+
 function parsePersistedTrace(value: unknown): PersistedPlanLedgerTrace | null {
   const envelope = record(value)
   const ledger = parsePlanLedger(envelope?.planLedger)
@@ -149,7 +163,8 @@ function parsePersistedTrace(value: unknown): PersistedPlanLedgerTrace | null {
     const expectedRevision = initialGraphItem.revision + index + 1
     if (!event || event.schemaVersion !== SCHEMA || typeof event.id !== 'string'
       || event.sessionId !== graphItem.sessionId || event.turnId !== graphItem.turnId
-      || event.itemId !== graphItem.id || event.taskId !== rootTaskId || event.type !== 'item.delta'
+      || event.itemId !== graphItem.id || !isValidPersistedGraphEventTaskId(event, payload, item, rootTaskId)
+      || event.type !== 'item.delta'
       || typeof event.actor !== 'string' || typeof event.correlationId !== 'string'
       || (event.causationId !== null && typeof event.causationId !== 'string')
       || (event.idempotencyKey !== null && typeof event.idempotencyKey !== 'string')
@@ -157,8 +172,7 @@ function parsePersistedTrace(value: unknown): PersistedPlanLedgerTrace | null {
       || (payload?.kind !== 'lifecycle' && payload?.kind !== 'proposal')
       || payload.revision !== expectedRevision || !item || item.id !== graphItem.id
       || item.sessionId !== graphItem.sessionId || item.turnId !== graphItem.turnId
-      || item.taskId !== rootTaskId || item.revision !== expectedRevision
-      || (payload.kind === 'lifecycle' && !record(payload.event))) return null
+      || item.taskId !== rootTaskId || item.revision !== expectedRevision) return null
     previousSequence = sequence
     graphEvents.push(event as unknown as PersistedGraphEvent)
   }
@@ -226,6 +240,91 @@ function taskGraphItem(sessionId: string, turnId: string, rootTaskId: string, id
     createdAt: TIME,
     updatedAt: TIME,
     sequence: null,
+  }
+}
+
+function persistedTraceParserFixture(): PersistedPlanLedgerTrace {
+  const sessionId = 'trace-parser-session'
+  const turnId = 'trace-parser-turn'
+  const rootTaskId = 'trace-parser-root'
+  const childTaskId = 'trace-parser-child'
+  const itemId = 'trace-parser-item'
+  const nodeKey = 'trace-parser-node'
+  const goal = 'Review employer profiles'
+  const graphItem = parsePersistedGraphItem(taskGraphItem(sessionId, turnId, rootTaskId, itemId, nodeKey, childTaskId, goal, 3))
+  const initialGraphItem = parsePersistedGraphItem(taskGraphItem(sessionId, turnId, rootTaskId, itemId, nodeKey, childTaskId, goal, 1))
+  const proposalItem = parsePersistedGraphItem(taskGraphItem(sessionId, turnId, rootTaskId, itemId, nodeKey, childTaskId, goal, 2))
+  if (!graphItem || !initialGraphItem || !proposalItem) throw new Error('Invalid persisted trace parser fixture item.')
+  const graphEvent = (
+    revision: number,
+    taskId: string,
+    kind: 'proposal' | 'lifecycle',
+    item: PersistedTaskGraphItem,
+    lifecycleEvent?: Record<string, unknown>,
+  ): PersistedGraphEvent => ({
+    schemaVersion: SCHEMA,
+    id: `trace-parser-event-${revision}`,
+    sessionId,
+    turnId,
+    itemId,
+    taskId,
+    type: 'item.delta',
+    actor: 'orchestrator',
+    correlationId: turnId,
+    causationId: null,
+    idempotencyKey: null,
+    sequence: String(revision),
+    payload: { kind, revision, item, ...(lifecycleEvent ? { event: lifecycleEvent } : {}) },
+  })
+
+  const planLedger: PlanLedger = {
+    schemaVersion: 'agent-harness.v2.plan-ledger',
+    sessionId,
+    revision: 3,
+    goal: 'Plan employer research',
+    nodes: [{
+      key: nodeKey,
+      goal,
+      status: 'running',
+      resultAvailable: false,
+      evidencePreview: null,
+      readiness: 'active',
+      dependencies: [],
+    }],
+  }
+  const task = (id: string, parentTaskId: string | null, path: string, role: string, taskType: string, taskGoal: string) => ({
+    schemaVersion: SCHEMA,
+    id,
+    sessionId,
+    turnId,
+    rootTaskId,
+    parentTaskId,
+    path,
+    role,
+    taskType,
+    status: 'running',
+    goal: taskGoal,
+    confidence: null,
+    failureReason: null,
+    hasResult: false,
+    createdAt: TIME,
+    updatedAt: TIME,
+  })
+
+  return {
+    schemaVersion: TRACE_SCHEMA,
+    planLedger,
+    rootTaskId,
+    graphItem,
+    initialGraphItem,
+    graphEvents: [
+      graphEvent(2, rootTaskId, 'proposal', proposalItem),
+      graphEvent(3, childTaskId, 'lifecycle', graphItem, { type: 'task.started', nodeKey }),
+    ],
+    tasks: [
+      task(rootTaskId, null, 'root', 'orchestrator', 'root', 'Plan employer research'),
+      task(childTaskId, rootTaskId, 'root/research', 'scout', 'research', goal),
+    ],
   }
 }
 
@@ -423,6 +522,31 @@ function requireProductionTraceArtifact(): PersistedPlanLedgerTrace {
   if (!traceArtifact) test.skip(true, 'Requires the disposable PostgreSQL Worker process-restart trace artifact.')
   return traceArtifact!
 }
+
+test('persisted Plan Ledger parser validates proposal and lifecycle task attribution', () => {
+  const trace = persistedTraceParserFixture()
+  expect(trace.graphEvents[0]?.taskId).toBe(trace.rootTaskId)
+  expect(trace.graphEvents[1]?.taskId).toBe(trace.graphItem.content.nodes[0]?.taskId)
+  expect(parsePersistedTrace(trace)).not.toBeNull()
+
+  const mismatchedProposal = structuredClone(trace)
+  mismatchedProposal.graphEvents[0] = { ...mismatchedProposal.graphEvents[0]!, taskId: trace.graphItem.content.nodes[0]!.taskId }
+  expect(parsePersistedTrace(mismatchedProposal)).toBeNull()
+
+  for (const taskId of [trace.rootTaskId, 'trace-parser-wrong-child']) {
+    const mismatchedLifecycle = structuredClone(trace)
+    mismatchedLifecycle.graphEvents[1] = { ...mismatchedLifecycle.graphEvents[1]!, taskId }
+    expect(parsePersistedTrace(mismatchedLifecycle)).toBeNull()
+  }
+
+  const unknownLifecycleNode = structuredClone(trace)
+  const lifecycleEvent = unknownLifecycleNode.graphEvents[1]!
+  unknownLifecycleNode.graphEvents[1] = {
+    ...lifecycleEvent,
+    payload: { ...lifecycleEvent.payload, event: { ...lifecycleEvent.payload.event, nodeKey: 'unknown-node' } },
+  }
+  expect(parsePersistedTrace(unknownLifecycleNode)).toBeNull()
+})
 
 test('Plan Ledger restores the same persisted trace session after SSE reconnect without leaking across sessions', async ({ page }) => {
   const persistedTrace = requireProductionTraceArtifact()
