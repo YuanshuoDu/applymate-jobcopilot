@@ -591,10 +591,13 @@ async function activateFixtureTurn(pool: Pool, value: Fixture): Promise<void> {
   if (activated.rowCount !== 1) throw new Error("TaskGraph fixture turn was not parked before activation")
 }
 
-function toolResult(request: HarnessModelRequest, callId: string): unknown {
-  for (const message of request.messages) {
-    for (const part of message.content) {
-      if (part.type !== "tool_result" || part.toolUseId !== callId || typeof part.content !== "string") continue
+function latestToolResult(request: HarnessModelRequest, callId: string): unknown {
+  for (let messageIndex = request.messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const content = request.messages[messageIndex]!.content
+    for (let partIndex = content.length - 1; partIndex >= 0; partIndex -= 1) {
+      const part = content[partIndex]!
+      if (part.type !== "tool_result" || part.toolUseId !== callId) continue
+      if (typeof part.content !== "string") return null
       try { return JSON.parse(part.content) as unknown } catch { return null }
     }
   }
@@ -602,7 +605,7 @@ function toolResult(request: HarnessModelRequest, callId: string): unknown {
 }
 
 function planTaskIds(request: HarnessModelRequest, callId = PLAN_CALL_ID, expectedCount = 2): string[] {
-  const output = record(toolResult(request, callId))
+  const output = record(latestToolResult(request, callId))
   if (!output || output.status !== "accepted" || !Array.isArray(output.nodes)) throw new Error("TaskGraph plan receipt missing from the next root model request")
   const ids = output.nodes.flatMap(value => {
     const node = record(value)
@@ -1260,6 +1263,34 @@ describe("compact TaskGraph wait failure diagnostics", () => {
       kind: "task_graph_current", revision: 1,
       nodes: [{ key: "source", taskId: "child-1" }],
     })
+  })
+
+  it("selects the newest exact plan receipt when tool-use IDs repeat", () => {
+    const request = {
+      messages: [
+        { role: "assistant", content: [{
+          type: "tool_result", toolUseId: "reused-plan-call",
+          content: JSON.stringify({ status: "accepted", nodes: [{ taskId: "stale-task" }] }),
+        }] },
+        { role: "assistant", content: [{
+          type: "tool_result", toolUseId: "another-call",
+          content: JSON.stringify({ status: "accepted", nodes: [{ taskId: "unrelated-task" }] }),
+        }, {
+          type: "tool_result", toolUseId: "reused-plan-call",
+          content: JSON.stringify({ status: "accepted", nodes: [{ taskId: "latest-task" }] }),
+        }] },
+      ],
+    } as unknown as HarnessModelRequest
+
+    expect(planTaskIds(request, "reused-plan-call", 1)).toEqual(["latest-task"])
+
+    const invalidLatestReceipt = {
+      ...request,
+      messages: [...request.messages, { role: "assistant", content: [{
+        type: "tool_result", toolUseId: "reused-plan-call", content: "{invalid json",
+      }] }],
+    } as unknown as HarnessModelRequest
+    expect(() => planTaskIds(invalidLatestReceipt, "reused-plan-call", 1)).toThrow("TaskGraph plan receipt missing")
   })
 
   it("keeps the safe process diagnostics line without raw stdout or stderr", () => {

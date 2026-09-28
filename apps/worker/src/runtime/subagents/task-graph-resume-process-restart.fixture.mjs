@@ -142,13 +142,21 @@ function isExpectedSourceProjection(value) {
     && candidate?.jobId === "fixture-job-restart" && candidate.source === "other"
     && Array.isArray(candidate.evidenceKinds) && candidate.evidenceKinds.length === 1 && candidate.evidenceKinds[0] === "job"
 }
-function toolResult(request, callId) {
-  const part = request.messages.flatMap(message => message.content).find(value => value.type === "tool_result" && value.toolUseId === callId)
-  if (typeof part?.content !== "string") return null
-  try { return JSON.parse(part.content) } catch { return null }
+function latestToolResult(request, callId) {
+  const messages = request.messages
+  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const content = messages[messageIndex]?.content ?? []
+    for (let partIndex = content.length - 1; partIndex >= 0; partIndex -= 1) {
+      const part = content[partIndex]
+      if (part?.type !== "tool_result" || part.toolUseId !== callId) continue
+      if (typeof part.content !== "string") return null
+      try { return JSON.parse(part.content) } catch { return null }
+    }
+  }
+  return null
 }
 function plannedTaskIds(request, callId = planCallId, expectedCount = 2) {
-  const result = record(toolResult(request, callId))
+  const result = record(latestToolResult(request, callId))
   if (result?.status !== "accepted" || !Array.isArray(result.nodes)) throw new Error("p3_plan_receipt_missing")
   const taskIds = result.nodes.map(node => record(node)?.taskId)
   if (taskIds.length !== expectedCount || taskIds.some(taskId => typeof taskId !== "string")) throw new Error("p3_plan_task_ids_missing")
@@ -187,7 +195,7 @@ function countOutside(source, target) {
   return source.filter(taskId => !targetIds.has(taskId)).length
 }
 function initialWaitLineageFor(request, requestedTaskIds) {
-  const receipt = record(toolResult(request, planCallId))
+  const receipt = record(latestToolResult(request, planCallId))
   const receiptNodes = Array.isArray(receipt?.nodes) ? receipt.nodes : null
   const graph = graphFromRequest(request)
   const graphNodes = Array.isArray(graph?.nodes) ? graph.nodes : null
@@ -228,6 +236,21 @@ function assertLatestGraphObservationSelection() {
     { content: [{ type: "text", text: '[context]\n{"kind":"task_graph_current","revision":2,"nodes":[{"key":"source","taskId":"latest"}]}' }] },
   ] }
   if (graphFromRequest(request)?.revision !== 2) throw new Error("p3_latest_graph_observation_selection_failed")
+}
+function assertLatestToolResultSelection() {
+  const request = { messages: [
+    { content: [{ type: "tool_result", toolUseId: planCallId,
+      content: JSON.stringify({ status: "accepted", nodes: [{ taskId: "stale" }] }) }] },
+    { content: [{ type: "tool_result", toolUseId: "unrelated-call",
+      content: JSON.stringify({ status: "accepted", nodes: [{ taskId: "unrelated" }] }) },
+    { type: "tool_result", toolUseId: planCallId,
+      content: JSON.stringify({ status: "accepted", nodes: [{ taskId: "latest" }] }) }] },
+  ] }
+  if (plannedTaskIds(request, planCallId, 1)[0] !== "latest") throw new Error("p3_latest_tool_result_selection_failed")
+  const invalidNewest = { messages: [...request.messages, { content: [
+    { type: "tool_result", toolUseId: planCallId, content: "{invalid json" },
+  ] }] }
+  if (latestToolResult(invalidNewest, planCallId) !== null) throw new Error("p3_latest_invalid_tool_result_fail_closed_failed")
 }
 function waitOutcomesFromRequest(request) {
   const outcomes = []
@@ -624,7 +647,9 @@ async function runSecondWorker() {
 }
 try {
   assertLatestGraphObservationSelection()
-  if (mode === "park-parent") await runFirstWorker()
+  assertLatestToolResultSelection()
+  if (mode === "self-test") say("P3_FIXTURE_SELF_TEST_OK")
+  else if (mode === "park-parent") await runFirstWorker()
   else if (mode === "resume-parent") await runSecondWorker()
   else throw new Error("p3_unknown_process_restart_mode")
 } catch (error) {
