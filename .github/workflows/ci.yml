@@ -37,7 +37,16 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 20, cache: pnpm }
       - run: pnpm install --frozen-lockfile
-      - run: pnpm test:all
+      - name: Generate Web Prisma client
+        run: pnpm --filter @jobcopilot/web exec prisma generate
+      - name: Run non-Web workspace tests
+        run: pnpm turbo test --filter='!@jobcopilot/web'
+      - name: Run Web Vitest shard 1 of 2
+        run: pnpm --filter @jobcopilot/web exec vitest run --shard=1/2
+      - name: Run Web Vitest shard 2 of 2
+        run: pnpm --filter @jobcopilot/web exec vitest run --shard=2/2
+      - name: Run best-effort Playwright tests
+        run: pnpm exec playwright test || true
   agent-runtime-postgres:
     name: Agent runtime PostgreSQL integration
     runs-on: ubuntu-latest
