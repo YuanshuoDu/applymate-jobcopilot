@@ -9,9 +9,9 @@ function graphNode(key: string, taskId: string) {
   return { key, templateId: 'scout', goal: `Snapshot ${key}`, successCriteria: [`Evidence for ${key}`], dependsOn: [], depth: 1, taskId }
 }
 
-function graphItem(nodes: unknown[], updatedAt: string, sessionId: string, id: string, taskId: string | null = 'root-task'): TimelineItem {
+function graphItem(nodes: unknown[], updatedAt: string, sessionId: string, id: string, taskId: string | null = 'root-task', turnId = 'turn-1'): TimelineItem {
   return {
-    schemaVersion: 'agent-harness.v2', id, sessionId, turnId: 'turn-1', stepId: null, taskId,
+    schemaVersion: 'agent-harness.v2', id, sessionId, turnId, stepId: null, taskId,
     type: 'task_graph', status: 'streaming', phase: 'commentary', revision: 1,
     content: { schemaVersion, nodes },
     startedAt: null, completedAt: null, createdAt: updatedAt, updatedAt, source: 'replay', sequence: null,
@@ -26,7 +26,7 @@ describe('TaskGraph query projection', () => {
 
     expect(selectCurrentTaskGraphTaskIds([older, latest, foreign], 'session/1')).toEqual(['root-task', 'task-a', 'task-b'])
     expect(buildTaskGraphTaskLookupUrl('session/1', [older, latest, foreign])).toBe(
-      '/api/agent/sessions/session%2F1/tasks?taskId=root-task&taskId=task-a&taskId=task-b&graphRevision=1',
+      '/api/agent/sessions/session%2F1/tasks?taskId=root-task&taskId=task-a&taskId=task-b&graphItemId=graph-latest&graphTurnId=turn-1&rootTaskId=root-task&graphRevision=1',
     )
   })
 
@@ -37,9 +37,25 @@ describe('TaskGraph query projection', () => {
     const firstUrl = buildTaskGraphTaskLookupUrl('session-1', [revisionOne])
     const nextUrl = buildTaskGraphTaskLookupUrl('session-1', [revisionTwo])
 
-    expect(firstUrl).toBe('/api/agent/sessions/session-1/tasks?taskId=root-task&taskId=task-a&graphRevision=1')
-    expect(nextUrl).toBe('/api/agent/sessions/session-1/tasks?taskId=root-task&taskId=task-a&graphRevision=2')
+    expect(firstUrl).toBe('/api/agent/sessions/session-1/tasks?taskId=root-task&taskId=task-a&graphItemId=graph-latest&graphTurnId=turn-1&rootTaskId=root-task&graphRevision=1')
+    expect(nextUrl).toBe('/api/agent/sessions/session-1/tasks?taskId=root-task&taskId=task-a&graphItemId=graph-latest&graphTurnId=turn-1&rootTaskId=root-task&graphRevision=2')
     expect(nextUrl).not.toBe(firstUrl)
+  })
+
+  it('keeps equal-revision roots distinct so an old query cannot be mistaken for the selected graph', () => {
+    const oldRoot = graphItem([graphNode('old', 'old-child')], '2026-09-23T11:00:00.000Z', 'session-1', 'graph-old', 'old-root', 'turn-old')
+    const newRoot = graphItem([graphNode('new', 'new-child')], '2026-09-23T12:00:00.000Z', 'session-1', 'graph-new', 'new-root', 'turn-new')
+    const staleUrl = buildTaskGraphTaskLookupUrl('session-1', [oldRoot])!
+    const currentUrl = buildTaskGraphTaskLookupUrl('session-1', [oldRoot, newRoot])!
+
+    expect(new URLSearchParams(staleUrl.split('?')[1]).get('graphItemId')).toBe('graph-old')
+    expect(new URLSearchParams(staleUrl.split('?')[1]).get('graphTurnId')).toBe('turn-old')
+    expect(new URLSearchParams(staleUrl.split('?')[1]).get('rootTaskId')).toBe('old-root')
+    expect(new URLSearchParams(staleUrl.split('?')[1]).get('graphRevision')).toBe('1')
+    expect(new URLSearchParams(currentUrl.split('?')[1]).get('graphItemId')).toBe('graph-new')
+    expect(new URLSearchParams(currentUrl.split('?')[1]).get('turnId')).toBeNull()
+    expect(new URLSearchParams(currentUrl.split('?')[1]).get('rootTaskId')).toBe('new-root')
+    expect(new URLSearchParams(currentUrl.split('?')[1]).get('graphRevision')).toBe('1')
   })
 
   it('does not query a stale graph when the latest snapshot is malformed', () => {

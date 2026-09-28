@@ -4,23 +4,24 @@ import { describe, expect, it } from 'vitest'
 
 import { TaskGraphPlanPanel } from './TaskGraphPlanPanel'
 import { projectCurrentTaskGraph } from './task-graph-plan'
+import { selectedTaskGraphIdentity } from './task-graph-plan-query'
 import type { TimelineItem } from './timeline-reducer'
 import type { SupervisorTaskSummary } from './task-tree-projection'
 
-function item(content: unknown, updatedAt = '2026-09-23T12:00:00.000Z', revision = 3, taskId = 'root-task', id = 'task-graph-1'): TimelineItem {
+function item(content: unknown, updatedAt = '2026-09-23T12:00:00.000Z', revision = 3, taskId = 'root-task', id = 'task-graph-1', turnId = 'turn-1'): TimelineItem {
   return {
-    schemaVersion: 'agent-harness.v2', id, sessionId: 'session-1', turnId: 'turn-1', stepId: null, taskId,
+    schemaVersion: 'agent-harness.v2', id, sessionId: 'session-1', turnId, stepId: null, taskId,
     type: 'task_graph', status: 'streaming', phase: 'commentary', revision, content,
     startedAt: null, completedAt: null, createdAt: updatedAt, updatedAt, source: 'replay', sequence: null,
   }
 }
 
 const tasks: SupervisorTaskSummary[] = [{
-  id: 'root-task', sessionId: 'session-1', role: 'orchestrator', taskType: 'root', status: 'running', goal: 'Root plan goal from task record', hasResult: false,
+  id: 'root-task', sessionId: 'session-1', turnId: 'turn-1', rootTaskId: 'root-task', role: 'orchestrator', taskType: 'root', status: 'running', goal: 'Root plan goal from task record', hasResult: false,
 }, {
   // Model an untrusted runtime row; the safe DTO intentionally omits raw results.
   ...({
-    id: 'task-a', sessionId: 'session-1', role: 'researcher', taskType: 'scout', status: 'queued', goal: 'Scoped goal from task record', hasResult: true,
+    id: 'task-a', sessionId: 'session-1', turnId: 'turn-1', rootTaskId: 'root-task', role: 'researcher', taskType: 'scout', status: 'queued', goal: 'Scoped goal from task record', hasResult: true,
     result: 'PRIVATE_RAW_RESULT_PAYLOAD',
   } as unknown as SupervisorTaskSummary & { readonly result: unknown }),
 }]
@@ -35,6 +36,7 @@ describe('TaskGraphPlanPanel', () => {
       { ...tasks[1]!, id: 'foreign-task', sessionId: 'session-2', goal: 'CROSS_SESSION_LEDGER_SECRET' },
     ]
     const foreignLedger = projectCurrentTaskGraph(foreignItems, foreignTasks, 'session-2')
+    const foreignIdentity = selectedTaskGraphIdentity(foreignItems, 'session-2')
     expect(foreignLedger?.sessionId).toBe('session-2')
 
     const currentItems = [item({ schemaVersion: 'agent-harness.v2.task-graph', nodes: [
@@ -44,7 +46,7 @@ describe('TaskGraphPlanPanel', () => {
       sessionId="session-1"
       items={currentItems}
       tasks={tasks}
-      ledger={foreignLedger}
+      ledger={{ identity: foreignIdentity, projection: foreignLedger }}
     />)
 
     expect(html).toContain('Root plan goal from task record')
@@ -63,11 +65,12 @@ describe('TaskGraphPlanPanel', () => {
       ],
     })]
     const ledger = projectCurrentTaskGraph(items, [...tasks, { ...tasks[0]!, id: 'task-from-session-2', sessionId: 'session-2', goal: 'CROSS_SESSION_SECRET', status: 'completed' }], 'session-1')
+    const identity = selectedTaskGraphIdentity(items, 'session-1')
     const html = renderToStaticMarkup(<TaskGraphPlanPanel
       sessionId="session-1"
       items={items}
       tasks={[...tasks, { ...tasks[0]!, id: 'task-from-session-2', sessionId: 'session-2', goal: 'CROSS_SESSION_SECRET', status: 'completed' }]}
-      ledger={JSON.stringify(ledger)}
+      ledger={JSON.stringify({ identity, projection: ledger })}
     />)
 
     expect(html).toContain('aria-label="Current plan"')
@@ -91,7 +94,7 @@ describe('TaskGraphPlanPanel', () => {
 
   it('renders a safe evidence preview as escaped plain text and never renders raw result fields', () => {
     const completedTask = {
-      id: 'task-a', sessionId: 'session-1', role: 'scout', taskType: 'scout', status: 'completed',
+      id: 'task-a', sessionId: 'session-1', turnId: 'turn-1', rootTaskId: 'root-task', role: 'scout', taskType: 'scout', status: 'completed',
       goal: 'Search public jobs', hasResult: true,
       structuredEvidencePreview: {
         role: 'scout', summary: 'Scout completed: 1 candidate; 1 linked evidence item.', itemCount: 1,
@@ -124,10 +127,10 @@ describe('TaskGraphPlanPanel', () => {
       { key: 'latest', templateId: 'scout', goal: 'snapshot goal', successCriteria: ['private criterion'], dependsOn: [], depth: 1, taskId: 'task-outside-first-page' },
     ] }, '2026-09-23T12:00:00.000Z', 4, 'root-task', 'graph-latest')
     const firstHundred: SupervisorTaskSummary[] = [tasks[0]!, ...Array.from({ length: 99 }, (_, index) => ({
-      id: `older-task-${index}`, sessionId: 'session-1', role: 'researcher', taskType: 'scout', status: 'queued', goal: `Older task ${index}`, hasResult: false,
+      id: `older-task-${index}`, sessionId: 'session-1', turnId: 'turn-1', rootTaskId: 'root-task', role: 'researcher', taskType: 'scout', status: 'queued', goal: `Older task ${index}`, hasResult: false,
     }))]
     const outsideTask = {
-      id: 'task-outside-first-page', sessionId: 'session-1', role: 'scout', taskType: 'scout', status: 'completed',
+      id: 'task-outside-first-page', sessionId: 'session-1', turnId: 'turn-1', rootTaskId: 'root-task', role: 'scout', taskType: 'scout', status: 'completed',
       goal: 'Latest task returned by referenced ID lookup', hasResult: true,
       structuredEvidencePreview: {
         role: 'scout', summary: 'Scout completed: 1 candidate; 1 linked evidence item.', itemCount: 1,
@@ -154,5 +157,38 @@ describe('TaskGraphPlanPanel', () => {
     expect(html).not.toContain('task-outside-first-page')
     expect(html).not.toContain('old snapshot')
     expect(html).not.toContain('private criterion')
+  })
+
+  it('rejects a newer root ledger when a stale equal-revision query returns late', () => {
+    const oldGraph = item({ schemaVersion: 'agent-harness.v2.task-graph', nodes: [
+      { key: 'old', templateId: 'scout', goal: 'Old snapshot', successCriteria: ['criterion'], dependsOn: [], depth: 1, taskId: 'old-child' },
+    ] }, '2026-09-23T11:00:00.000Z', 1, 'old-root', 'graph-old', 'turn-old')
+    const newGraph = item({ schemaVersion: 'agent-harness.v2.task-graph', nodes: [
+      { key: 'new', templateId: 'scout', goal: 'New snapshot', successCriteria: ['criterion'], dependsOn: [], depth: 1, taskId: 'new-child' },
+    ] }, '2026-09-23T12:00:00.000Z', 1, 'new-root', 'graph-new', 'turn-new')
+    const newerTasks: SupervisorTaskSummary[] = [
+      { ...tasks[0]!, id: 'new-root', turnId: 'turn-new', rootTaskId: 'new-root', goal: 'NEW_ROOT_PLAN_SECRET' },
+      { ...tasks[1]!, id: 'new-child', turnId: 'turn-new', rootTaskId: 'new-root', goal: 'NEW_CHILD_SECRET' },
+    ]
+    const staleResponse = {
+      identity: selectedTaskGraphIdentity([newGraph], 'session-1'),
+      projection: projectCurrentTaskGraph([newGraph], newerTasks, 'session-1'),
+    }
+    const oldTasks: SupervisorTaskSummary[] = [
+      { ...tasks[0]!, id: 'old-root', turnId: 'turn-old', rootTaskId: 'old-root', goal: 'OLD_ROOT_PLAN' },
+      { ...tasks[1]!, id: 'old-child', turnId: 'turn-old', rootTaskId: 'old-root', goal: 'OLD_CHILD_PLAN' },
+    ]
+    const html = renderToStaticMarkup(<TaskGraphPlanPanel
+      sessionId="session-1"
+      items={[oldGraph]}
+      tasks={oldTasks}
+      ledger={staleResponse}
+    />)
+
+    expect(staleResponse.identity?.revision).toBe(1)
+    expect(html).toContain('OLD_ROOT_PLAN')
+    expect(html).toContain('OLD_CHILD_PLAN')
+    expect(html).not.toContain('NEW_ROOT_PLAN_SECRET')
+    expect(html).not.toContain('NEW_CHILD_SECRET')
   })
 })

@@ -3,6 +3,14 @@ import { parseTaskGraphSnapshot, TASK_GRAPH_MAX_IDENTIFIER_LENGTH } from './task
 
 const MAX_REFERENCED_TASK_IDS = 9
 
+export interface TaskGraphIdentity {
+  readonly sessionId: string
+  readonly graphItemId: string
+  readonly turnId: string
+  readonly rootTaskId: string
+  readonly revision: number
+}
+
 export function latestTaskGraphItem(items: readonly TimelineItem[], sessionId: string): TimelineItem | null {
   let latest: TimelineItem | null = null
   let latestTimestamp = Number.NEGATIVE_INFINITY
@@ -19,29 +27,40 @@ export function latestTaskGraphItem(items: readonly TimelineItem[], sessionId: s
   return latest
 }
 
-export function selectCurrentTaskGraphTaskIds(items: readonly TimelineItem[], sessionId: string): string[] {
-  if (!sessionId.trim()) return []
+export function selectedTaskGraphIdentity(items: readonly TimelineItem[], sessionId: string): TaskGraphIdentity | null {
+  if (!sessionId.trim()) return null
   const item = latestTaskGraphItem(items, sessionId)
   const snapshot = item ? parseTaskGraphSnapshot(item.content) : null
-  if (!item || !snapshot || snapshot.nodes.length === 0 || !Number.isSafeInteger(item.revision) || item.revision < 1) return []
+  if (!item || !snapshot || snapshot.nodes.length === 0 || !Number.isSafeInteger(item.revision) || item.revision < 1
+    || !boundedIdentifier(item.id) || !boundedIdentifier(item.turnId) || !boundedIdentifier(item.taskId)) return null
+  return { sessionId, graphItemId: item.id, turnId: item.turnId, rootTaskId: item.taskId, revision: item.revision }
+}
+
+export function selectCurrentTaskGraphTaskIds(items: readonly TimelineItem[], sessionId: string): string[] {
+  const identity = selectedTaskGraphIdentity(items, sessionId)
+  if (!identity) return []
+  const item = latestTaskGraphItem(items, sessionId)
+  const snapshot = item ? parseTaskGraphSnapshot(item.content) : null
+  if (!snapshot) return []
 
   const ids = new Set<string>()
-  if (boundedIdentifier(item.taskId)) ids.add(item.taskId)
+  ids.add(identity.rootTaskId)
   for (const node of snapshot.nodes) ids.add(node.taskId)
   return ids.size <= MAX_REFERENCED_TASK_IDS ? [...ids] : []
 }
 
 export function buildTaskGraphTaskLookupUrl(sessionId: string | null, items: readonly TimelineItem[]): string | null {
   if (!sessionId) return null
+  const identity = selectedTaskGraphIdentity(items, sessionId)
+  if (!identity) return null
   const ids = selectCurrentTaskGraphTaskIds(items, sessionId)
   if (ids.length === 0) return null
-  const graph = latestTaskGraphItem(items, sessionId)
-  if (!graph || !Number.isSafeInteger(graph.revision) || graph.revision < 1) return null
   const query = new URLSearchParams()
   for (const taskId of ids) query.append('taskId', taskId)
-  // Keep the query/cache key current when the plan advances without changing
-  // its Task IDs; the endpoint ignores this read-only projection discriminator.
-  query.set('graphRevision', String(graph.revision))
+  query.set('graphItemId', identity.graphItemId)
+  query.set('graphTurnId', identity.turnId)
+  query.set('rootTaskId', identity.rootTaskId)
+  query.set('graphRevision', String(identity.revision))
   return `/api/agent/sessions/${encodeURIComponent(sessionId)}/tasks?${query.toString()}`
 }
 

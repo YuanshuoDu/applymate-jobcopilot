@@ -7,6 +7,7 @@ import { useI18n, type Lang } from '@/lib/i18n'
 import { taskGraphPlanLabel, type TaskGraphPlanLabelKey } from '@/lib/task-graph-plan-labels'
 
 import { projectCurrentTaskGraph, type TaskGraphEvidencePreview, type TaskGraphPlan, type TaskGraphPlanReadiness, type TaskGraphPlanStatus } from './task-graph-plan'
+import { selectedTaskGraphIdentity, type TaskGraphIdentity } from './task-graph-plan-query'
 import type { SupervisorTaskSummary } from './task-tree-projection'
 import type { TimelineItem } from './timeline-reducer'
 
@@ -40,13 +41,38 @@ export function TaskGraphPlanPanel({ sessionId, items, tasks, ledger }: {
 }) {
   const { lang, t } = useI18n()
   const plan = useMemo(() => {
-    const parsed = parsePlanLedger(ledger)
-    const current = projectCurrentTaskGraph(items, tasks, sessionId)
-    return parsed?.sessionId === sessionId && parsed.revision === current?.revision ? parsed : current
+    const identity = selectedTaskGraphIdentity(items, sessionId)
+    const scopedTasks = identity ? tasks.filter(task => task.sessionId === identity.sessionId && task.turnId === identity.turnId
+      && task.rootTaskId === identity.rootTaskId) : []
+    const current = projectCurrentTaskGraph(items, scopedTasks, sessionId)
+    const response = parsePlanLedgerResponse(ledger)
+    return response && sameTaskGraphIdentity(response.identity, identity) ? response.projection : current
   }, [items, ledger, sessionId, tasks])
   if (!plan) return null
 
   return <TaskGraphPlanSection plan={plan} sessionId={sessionId} lang={lang} t={t} />
+}
+
+function parsePlanLedgerResponse(value: unknown): { identity: TaskGraphIdentity; projection: TaskGraphPlan } | null {
+  const response = record(value)
+  const identity = response ? record(response.identity) : null
+  if (!response || !identity || Object.keys(response).length !== 2 || Object.keys(identity).length !== 5
+    || typeof identity.sessionId !== 'string' || typeof identity.graphItemId !== 'string'
+    || typeof identity.turnId !== 'string' || typeof identity.rootTaskId !== 'string'
+    || ![identity.sessionId, identity.graphItemId, identity.turnId, identity.rootTaskId].every(value => value.length > 0 && value.length <= 128 && value.trim() === value)
+    || !Number.isSafeInteger(identity.revision) || Number(identity.revision) < 1) return null
+  const projection = parsePlanLedger(response.projection)
+  if (!projection || projection.sessionId !== identity.sessionId || projection.revision !== identity.revision) return null
+  return { identity: identity as unknown as TaskGraphIdentity, projection }
+}
+
+function sameTaskGraphIdentity(left: TaskGraphIdentity, right: TaskGraphIdentity | null): boolean {
+  return Boolean(right && left.sessionId === right.sessionId && left.graphItemId === right.graphItemId
+    && left.turnId === right.turnId && left.rootTaskId === right.rootTaskId && left.revision === right.revision)
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
 }
 
 function TaskGraphPlanSection({ plan, sessionId, lang, t }: {
