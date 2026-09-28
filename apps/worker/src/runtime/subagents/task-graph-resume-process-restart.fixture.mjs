@@ -155,6 +155,37 @@ function latestToolResult(request, callId) {
   }
   return null
 }
+function planToolPairFromRequest(request, callId = planCallId) {
+  const messages = Array.isArray(request?.messages) ? request.messages : []
+  let planToolUseCount = 0, planToolResultCount = 0, expectedRevision = null
+  let planToolUsePosition = null, planToolResultPosition = null, position = 0
+  for (const message of messages) {
+    const content = Array.isArray(message?.content) ? message.content : []
+    for (const part of content) {
+      if (part?.type === "tool_use" && part.id === callId && part.name === "agent.plan") {
+        planToolUseCount += 1
+        if (planToolUseCount === 1) planToolUsePosition = position
+        if (planToolUseCount === 1) {
+          const input = record(part.input)
+          expectedRevision = Number.isSafeInteger(input?.expectedRevision) ? input.expectedRevision : null
+        }
+      }
+      if (part?.type === "tool_result" && part.toolUseId === callId) {
+        planToolResultCount += 1
+        if (planToolResultCount === 1) planToolResultPosition = position
+      }
+      position += 1
+    }
+  }
+  return {
+    planToolUseCount,
+    planToolResultCount,
+    planExpectedRevision: planToolUseCount === 1 ? expectedRevision : null,
+    planToolPairMatches: planToolUseCount === 1 && planToolResultCount === 1
+      && planToolUsePosition !== null && planToolResultPosition !== null && planToolResultPosition > planToolUsePosition,
+    planExpectedRevisionMatches: planToolUseCount === 1 && expectedRevision === 0,
+  }
+}
 function plannedTaskIds(request, callId = planCallId, expectedCount = 2) {
   const result = record(latestToolResult(request, callId))
   if (result?.status !== "accepted" || !Array.isArray(result.nodes)) throw new Error("p3_plan_receipt_missing")
@@ -232,12 +263,34 @@ function assertPersistedGraphComparator() {
     throw new Error("p3_persisted_graph_comparator_self_test_failed")
   }
 }
+function assertInitialPlanToolPair() {
+  const requestFor = (useCount, resultCount, expectedRevision, resultFirst = false) => ({ messages: [{ content: [
+    ...(resultFirst ? Array.from({ length: resultCount }, () => ({ type: "tool_result", toolUseId: planCallId, content: "{}" })) : []),
+    ...Array.from({ length: useCount }, () => ({
+      type: "tool_use", id: planCallId, name: "agent.plan", input: { expectedRevision },
+    })),
+    ...(!resultFirst ? Array.from({ length: resultCount }, () => ({ type: "tool_result", toolUseId: planCallId, content: "{}" })) : []),
+  ] }] })
+  const valid = planToolPairFromRequest(requestFor(1, 1, 0))
+  const duplicate = planToolPairFromRequest(requestFor(2, 2, 0))
+  const missingResult = planToolPairFromRequest(requestFor(1, 0, 0))
+  const wrongRevision = planToolPairFromRequest(requestFor(1, 1, 1))
+  const reversed = planToolPairFromRequest(requestFor(1, 1, 0, true))
+  if (!valid.planToolPairMatches || !valid.planExpectedRevisionMatches || valid.planExpectedRevision !== 0
+    || duplicate.planToolPairMatches || duplicate.planToolUseCount !== 2 || duplicate.planToolResultCount !== 2
+    || missingResult.planToolPairMatches || missingResult.planToolResultCount !== 0
+    || !wrongRevision.planToolPairMatches || wrongRevision.planExpectedRevisionMatches || wrongRevision.planExpectedRevision !== 1
+    || reversed.planToolPairMatches || !reversed.planExpectedRevisionMatches) {
+    throw new Error("p3_initial_plan_tool_pair_self_test_failed")
+  }
+}
 function countOutside(source, target) {
   if (!Array.isArray(source) || !Array.isArray(target)) return null
   const targetIds = new Set(target)
   return source.filter(taskId => !targetIds.has(taskId)).length
 }
 async function initialWaitLineageFor(request, requestedTaskIds) {
+  const planToolPair = planToolPairFromRequest(request, planCallId)
   const receipt = record(latestToolResult(request, planCallId))
   const receiptNodes = Array.isArray(receipt?.nodes) ? receipt.nodes : null
   const graph = graphFromRequest(request)
@@ -270,6 +323,7 @@ async function initialWaitLineageFor(request, requestedTaskIds) {
     }))].sort()
     : []
   return {
+    ...planToolPair,
     proposalReceiptFound: receipt?.status === "accepted" && receiptNodes !== null,
     proposalNodeCount: receiptNodes?.length ?? 0,
     graphNodeCount: graphNodes?.length ?? 0,
@@ -598,7 +652,8 @@ async function startRuntime(workerOwnerId, resume) {
           if (!resume && modelRounds === 2) {
             const taskIds = plannedTaskIds(request)
             initialWaitLineage = await initialWaitLineageFor(request, taskIds)
-            if (!initialWaitLineage.proposalMatchesGraph || !initialWaitLineage.proposalRevisionMatchesGraph) {
+            if (!initialWaitLineage.planToolPairMatches || !initialWaitLineage.planExpectedRevisionMatches
+              || !initialWaitLineage.proposalMatchesGraph || !initialWaitLineage.proposalRevisionMatchesGraph) {
               throw new Error("p3_initial_wait_plan_graph_mismatch")
             }
             yield toolCall(waitCallId, "agent.wait", waitArgs("p3-process-restart-wait", taskIds))
@@ -712,6 +767,7 @@ try {
   assertLatestGraphObservationSelection()
   assertLatestToolResultSelection()
   assertPersistedGraphComparator()
+  assertInitialPlanToolPair()
   if (mode === "self-test") say("P3_FIXTURE_SELF_TEST_OK")
   else if (mode === "park-parent") await runFirstWorker()
   else if (mode === "resume-parent") await runSecondWorker()

@@ -728,6 +728,7 @@ function processFixtureDiagnosticProjection(value: unknown): RecordValue | null 
       "proposalReceiptFound", "requestMatchesReceipt", "requestMatchesCurrentGraph",
       "proposalMatchesGraph", "proposalRevisionMatchesGraph", "persistedItemReadSucceeded",
       "persistedItemFound", "persistedItemValid", "proposalMatchesPersistedItem", "persistedItemMatchesGraph",
+      "planToolPairMatches", "planExpectedRevisionMatches",
     ]) {
       if (typeof initialWaitLineage[key] === "boolean") lineage[key] = initialWaitLineage[key]
     }
@@ -735,6 +736,7 @@ function processFixtureDiagnosticProjection(value: unknown): RecordValue | null 
       "proposalNodeCount", "graphNodeCount", "receiptRevision", "graphRevision",
       "persistedItemNodeCount", "persistedItemRevision",
       "requestedIdsOutsideReceiptCount", "requestedIdsOutsideGraphCount",
+      "planToolUseCount", "planToolResultCount", "planExpectedRevision",
     ]) {
       const safeValue = diagnosticBoundedCount(initialWaitLineage[key])
       if (safeValue !== null) lineage[key] = safeValue
@@ -1341,6 +1343,8 @@ describe("compact TaskGraph wait failure diagnostics", () => {
         persistedItemNodeCount: 2, persistedItemRevision: 3,
         proposalMatchesPersistedItem: true, persistedItemMatchesGraph: false,
         requestedIdsOutsideReceiptCount: 0, requestedIdsOutsideGraphCount: 1,
+        planToolUseCount: 1, planToolResultCount: 1, planExpectedRevision: 0,
+        planToolPairMatches: true, planExpectedRevisionMatches: true, planCallId: markers[0],
         graphNodeKeysMissingReceipt: ["summary", markers[0], "not-allowed"],
         receiptPersistedMismatchKeys: ["source", markers[0]],
         persistedGraphMismatchKeys: ["summary", markers[0]],
@@ -1376,6 +1380,8 @@ describe("compact TaskGraph wait failure diagnostics", () => {
         persistedItemNodeCount: 2, persistedItemRevision: 3,
         proposalMatchesPersistedItem: true, persistedItemMatchesGraph: false,
         requestedIdsOutsideReceiptCount: 0, requestedIdsOutsideGraphCount: 1,
+        planToolUseCount: 1, planToolResultCount: 1, planExpectedRevision: 0,
+        planToolPairMatches: true, planExpectedRevisionMatches: true,
         graphNodeKeysMissingReceipt: ["summary"],
         receiptPersistedMismatchKeys: ["source"], persistedGraphMismatchKeys: ["summary"],
       },
