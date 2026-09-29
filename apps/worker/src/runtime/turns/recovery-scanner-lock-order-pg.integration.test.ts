@@ -82,7 +82,8 @@ describeWithPostgres("Turn dispatch and claim lock order on disposable PostgreSQ
         "status" text NOT NULL DEFAULT 'queued', "leaseOwnerId" text,
         "leaseStartedAt" timestamptz, "leaseExpiresAt" timestamptz,
         "leaseVersion" integer NOT NULL DEFAULT 0, "revision" integer NOT NULL DEFAULT 0,
-        "startedAt" timestamptz, "updatedAt" timestamptz NOT NULL DEFAULT now()
+        "startedAt" timestamptz, "createdAt" timestamptz NOT NULL DEFAULT now(),
+        "updatedAt" timestamptz NOT NULL DEFAULT now()
       )`)
       await client.query(`CREATE TABLE "agent_outbox" (
         "id" text PRIMARY KEY, "topic" text NOT NULL, "aggregateId" text NOT NULL,
