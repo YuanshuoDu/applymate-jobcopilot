@@ -179,7 +179,9 @@ async function makeFirstWorker() {
     productionFlags: {
       childExecutionEnabled: true,
       coordinationEnabled: true,
-      consumeWaitOutcomes: true,
+      // Preserve the pre-composition restart fixture's runtime behavior; it
+      // supplies its wait resolver explicitly below.
+      consumeWaitOutcomes: false,
       canonicalAutomationEnabled: false,
     },
     runtimeOptions: {
