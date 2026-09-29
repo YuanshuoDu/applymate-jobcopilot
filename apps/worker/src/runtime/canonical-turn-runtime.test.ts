@@ -272,6 +272,29 @@ describe("createCanonicalTurnRuntime", () => {
     expect(fixture.getModelCalls()).toBe(0)
   })
 
+  it("preserves Stop interruption when the selected-job selector resolves after abort", async () => {
+    let markStarted!: () => void
+    let resolveSelection!: (selection: { jobId: string }) => void
+    const started = new Promise<void>(resolve => { markStarted = resolve })
+    const pendingSelection = new Promise<{ jobId: string }>(resolve => { resolveSelection = resolve })
+    const selector = vi.fn(() => {
+      markStarted()
+      return pendingSelection
+    })
+    const fixture = setup({ selectedJobPreparationLoader: selector })
+    const controller = new AbortController()
+    const execution = (await fixture.runtime).execute({ lease, signal: controller.signal })
+
+    await started
+    controller.abort(new InterruptRequestedError({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId }))
+    resolveSelection({ jobId: "job-1" })
+
+    await expect(execution).resolves.toMatchObject({ status: "interrupted" })
+    expect(selector).toHaveBeenCalledOnce()
+    expect(fixture.roots.finish).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ status: "interrupted" }) }))
+    expect(fixture.getModelCalls()).toBe(0)
+  })
+
   it("advertises agent.plan through the configured model adapter when server gates are enabled", async () => {
     const requests: HarnessModelRequest[] = []
     const modelSnapshots: CanonicalTurnState["snapshot"][] = []

@@ -180,8 +180,13 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       enabled: options.productionFlags?.taskGraphPlanningEnabled === true && coordinationEnabled, pool, lease, now,
       selectedJobPreparationLoader: options.selectedJobPreparationLoader, taskGraphTemplates: options.taskGraphTemplates,
     })
-    if (!taskGraphPlanningEnabled && !signal.aborted && await (options.selectedJobPreparationLoader ?? loadSelectedJobPreparation)(pool, lease, now())) {
-      return failSelectedJobPreparationUnavailable({ lease, state, rootTasks, executionProjection, sessionProjection, now })
+    if (!taskGraphPlanningEnabled && !signal.aborted) {
+      const selectedJobPreparation = await (options.selectedJobPreparationLoader ?? loadSelectedJobPreparation)(pool, lease, now())
+      // The selector is asynchronous; Stop or lease loss can arrive while it
+      // is reading. Let TurnEngine preserve the canonical interrupted result.
+      if (!signal.aborted && selectedJobPreparation) {
+        return failSelectedJobPreparationUnavailable({ lease, state, rootTasks, executionProjection, sessionProjection, now })
+      }
     }
     const selectedPolicy = createCanonicalPolicy(state.toolPolicySnapshot, coordinationEnabled, taskGraphPlanningEnabled)
     const configuredCapabilities = capabilities(state.toolPolicySnapshot).filter(capability => capability !== "canManageChildren")
