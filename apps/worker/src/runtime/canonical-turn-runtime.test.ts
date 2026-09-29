@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 
 vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnect: vi.fn() })) }))
+vi.mock("./selected-job-preparation.js", () => ({ loadSelectedJobPreparation: vi.fn(async () => undefined) }))
 
 import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
 import type pg from "pg"
@@ -15,6 +16,7 @@ import { createPgRootTaskStore } from "./subagents/root-task-store.js"
 import { reclaimExpiredTurns } from "./turns/recovery-scanner.js"
 import { runTurnJob } from "./turns/turn-queue.js"
 import type { TurnLease } from "./turns/lease.js"
+import { InterruptRequestedError } from "./interrupt/registry.js"
 import { resolveProductionAgentFlags, type ProductionAgentFlags } from "./production-agent-flags.js"
 
 const lease = {
@@ -208,6 +210,68 @@ async function rootToolNames(
 }
 
 describe("createCanonicalTurnRuntime", () => {
+  it("surfaces selected-job preparation as unavailable without planning gates, model calls, or task scheduling", async () => {
+    const roots = rootStore()
+    const modelRuntimeFactory = vi.fn(async () => ({ adapter: model(() => []), registry: {} as never, candidates: [] }))
+    const executionProjection = { start: vi.fn(async () => undefined), finish: vi.fn(async () => undefined) }
+    const sessionProjection = { start: vi.fn(async () => undefined), finish: vi.fn(async () => undefined) }
+    const commandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
+      readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
+    }
+    const selector = vi.fn(async () => ({ jobId: "job-1" }))
+    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+      workerId: "worker-1", stateLoader: async () => state(), rootTaskStore: roots as never,
+      selectedJobPreparationLoader: selector,
+      taskGraphCommandPort: commandPort,
+      taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+      modelRuntimeFactory, executionProjection, sessionProjection,
+    })
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toEqual({
+      status: "failed", summary: "selected_job_preparation_unavailable",
+    })
+    expect(selector).toHaveBeenCalledOnce()
+    expect(modelRuntimeFactory).not.toHaveBeenCalled()
+    expect(commandPort.appendAndSchedule).not.toHaveBeenCalled()
+    expect(commandPort.readCurrent).not.toHaveBeenCalled()
+    expect(roots.finish).toHaveBeenCalledWith(expect.objectContaining({
+      result: expect.objectContaining({ status: "failed", errorCode: "selected_job_preparation_unavailable", stepCount: 0, toolCallCount: 0 }),
+    }))
+    expect(executionProjection.finish).toHaveBeenCalledWith(expect.objectContaining({
+      result: expect.objectContaining({ status: "failed", errorCode: "selected_job_preparation_unavailable" }),
+    }))
+    expect(sessionProjection.finish).toHaveBeenCalledWith(expect.objectContaining({
+      result: expect.objectContaining({ status: "failed", errorCode: "selected_job_preparation_unavailable" }),
+    }))
+  })
+
+  it("keeps ordinary Turns on the existing model path when no selected-job intent is present", async () => {
+    const fixture = setup({
+      selectedJobPreparationLoader: async () => undefined,
+      taskGraphCommandPort: {
+        appendAndSchedule: vi.fn(async () => ({ status: "accepted", revision: 1, nodes: [], readyTaskIds: [] })),
+        readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
+      },
+    })
+
+    await expect((await fixture.runtime).execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "completed" })
+    expect(fixture.getModelCalls()).toBe(2)
+    expect(fixture.tool.execute).toHaveBeenCalledOnce()
+  })
+
+  it("preserves Stop interruption when a selected-job Turn is already aborted", async () => {
+    const selector = vi.fn(async () => ({ jobId: "job-1" }))
+    const fixture = setup({ selectedJobPreparationLoader: selector })
+    const controller = new AbortController()
+    controller.abort(new InterruptRequestedError({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId }))
+
+    await expect((await fixture.runtime).execute({ lease, signal: controller.signal })).resolves.toMatchObject({ status: "interrupted" })
+    expect(selector).not.toHaveBeenCalled()
+    expect(fixture.roots.finish).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ status: "interrupted" }) }))
+    expect(fixture.getModelCalls()).toBe(0)
+  })
+
   it("advertises agent.plan through the configured model adapter when server gates are enabled", async () => {
     const requests: HarnessModelRequest[] = []
     const modelSnapshots: CanonicalTurnState["snapshot"][] = []

@@ -12,7 +12,7 @@ import { AgentApprovalLedgerCard } from './AgentApprovalLedgerCard'
 import { AgentQuestionInputCard } from './AgentQuestionInputCard'
 import { projectSupervisorTree, type SupervisorTaskSummary, type SupervisorTurnSummary } from './task-tree-projection'
 import { TaskGraphPlanPanel } from './TaskGraphPlanPanel'
-import { buildTaskGraphTaskLookupUrl } from './task-graph-plan-query'
+import { buildTaskGraphTaskLookupUrl, selectedTaskGraphIdentity } from './task-graph-plan-query'
 import type { AgentTimelineSnapshot } from './use-agent-timeline'
 import { EvidenceSummary, statusLabel } from './agent-supervisor-evidence'
 import { SelectedJobPreparationCard } from './SelectedJobPreparationCard'
@@ -147,7 +147,11 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
     refetchTasks()
     refetchGraphTasks()
   }, [refetchGraphTasks, refetchTasks, refetchTurns])
-  const draftArtifactRef = useMemo(() => sessionId ? latestWriterArtifact(sessionId, planTasks) : null, [planTasks, sessionId])
+  const draftArtifactRef = useMemo(() => {
+    if (!sessionId) return null
+    const identity = selectedTaskGraphIdentity(timeline.items, sessionId)
+    return latestWriterArtifact(sessionId, graphTasksQuery.data?.tasks ?? [], identity)
+  }, [graphTasksQuery.data, sessionId, timeline.items])
 
   if (!sessionId) return null
 

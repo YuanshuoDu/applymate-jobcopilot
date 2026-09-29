@@ -22,7 +22,8 @@ import type { TurnLease } from "./turns/lease.js"
 import type { TurnEngineOptions, TurnEngineStore } from "./turns/turn-engine-types.js"
 import { loadCanonicalTurnState, type CanonicalTurnState } from "./canonical-turn-state.js"
 import { loadTaskGraphCurrentObservation } from "./canonical-turn-task-graph-context.js"
-import type { SelectedJobPreparation } from "./selected-job-preparation.js"
+import { loadSelectedJobPreparation, type SelectedJobPreparation } from "./selected-job-preparation.js"
+import { failSelectedJobPreparationUnavailable } from "./selected-job-preparation-gate.js"
 import { taskGraphRuntimeForTurn } from "./subagents/task-graph-templates.js"
 import { AgentTreeManager } from "./subagents/manager.js"
 import { PgSubagentTaskStore } from "./subagents/pg-store.js"
@@ -157,11 +158,8 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
   const execute: TurnExecutor = async ({ lease, signal }): Promise<TurnExecutionResult> => {
     if (closed) throw new Error("canonical_runtime_closed")
     const terminal = await reconcileTerminal?.({ lease, now: now() })
-    // A root task is marked waiting before a dependency/user wake releases
-    // the Turn. Once the wake queues and reclaims that Turn, the root still
-    // carries the old waiting result until ensure() rebinds it. Treat those
-    // states as resumable; only durable terminal results may short-circuit
-    // execution or a wake would be mistaken for a second terminal outcome.
+    // A woke Turn may still carry a prior waiting result until ensure() rebinds it.
+    // Only durable terminal results may short-circuit execution.
     if (terminal && !isResumableRootResult(terminal.result)) {
       await executionProjection.finish({
         userId: lease.userId,
@@ -179,10 +177,12 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     }
     const state = await (options.stateLoader?.(pool, lease, now()) ?? loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes }))
     const { enabled: taskGraphPlanningEnabled, templates: taskGraphTemplates } = await taskGraphRuntimeForTurn({
-      enabled: options.productionFlags?.taskGraphPlanningEnabled === true && coordinationEnabled,
-      pool, lease, now, selectedJobPreparationLoader: options.selectedJobPreparationLoader,
-      taskGraphTemplates: options.taskGraphTemplates,
+      enabled: options.productionFlags?.taskGraphPlanningEnabled === true && coordinationEnabled, pool, lease, now,
+      selectedJobPreparationLoader: options.selectedJobPreparationLoader, taskGraphTemplates: options.taskGraphTemplates,
     })
+    if (!taskGraphPlanningEnabled && !signal.aborted && await (options.selectedJobPreparationLoader ?? loadSelectedJobPreparation)(pool, lease, now())) {
+      return failSelectedJobPreparationUnavailable({ lease, state, rootTasks, executionProjection, sessionProjection, now })
+    }
     const selectedPolicy = createCanonicalPolicy(state.toolPolicySnapshot, coordinationEnabled, taskGraphPlanningEnabled)
     const configuredCapabilities = capabilities(state.toolPolicySnapshot).filter(capability => capability !== "canManageChildren")
     const toolCapabilities = [...new Set([...configuredCapabilities, ...(coordinationEnabled ? ["coordination", "canManageChildren"] : [])])]

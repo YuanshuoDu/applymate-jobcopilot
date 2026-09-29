@@ -1,4 +1,5 @@
 import type { SupervisorTaskSummary } from './task-tree-projection'
+import type { TaskGraphIdentity } from './task-graph-plan-query'
 
 export interface DraftArtifactRef {
   readonly artifactId: string
@@ -27,8 +28,15 @@ export interface DraftArtifactPayload {
 const DIGEST = /^sha256:[a-f0-9]{64}$/
 const REVIEW_STATUSES = new Set(['passed', 'needs_revision', 'rejected', 'stale'])
 
-export function latestWriterArtifact(sessionId: string, tasks: readonly SupervisorTaskSummary[]): DraftArtifactRef | null {
-  const candidates = tasks.filter(task => task.sessionId === sessionId && task.role === 'writer'
+export function latestWriterArtifact(
+  sessionId: string,
+  tasks: readonly SupervisorTaskSummary[],
+  activeGraph: TaskGraphIdentity | null,
+): DraftArtifactRef | null {
+  if (!activeGraph || activeGraph.sessionId !== sessionId) return null
+  const candidates = tasks.filter(task => task.sessionId === sessionId
+    && task.turnId === activeGraph.turnId && task.rootTaskId === activeGraph.rootTaskId
+    && task.role === 'writer'
     && task.taskType === 'cover_letter_draft' && validArtifactRef(task.artifactRef))
     .sort((left, right) => Date.parse(right.updatedAt ?? '') - Date.parse(left.updatedAt ?? ''))
   const selected = candidates[0]?.artifactRef
