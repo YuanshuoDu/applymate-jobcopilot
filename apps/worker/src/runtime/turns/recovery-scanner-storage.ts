@@ -58,6 +58,7 @@ export async function persistTurnDispatchInTransaction(
   resetPublished = false,
   requireRunnableSession = resetPublished,
 ): Promise<void> {
+  // Dispatch and claim serialize in agent_sessions -> agent_turns order.
   if (requireRunnableSession) {
     const session = await client.query<{ id: string }>(
       `SELECT session."id" FROM "agent_sessions" AS session
@@ -67,6 +68,13 @@ export async function persistTurnDispatchInTransaction(
       [payload.sessionId],
     )
     if (!session.rows[0]) return
+  } else {
+    await client.query(
+      `SELECT session."id" FROM "agent_sessions" AS session
+       WHERE session."id" = $1
+       FOR UPDATE`,
+      [payload.sessionId],
+    )
   }
   const lineage = await client.query<{ id: string }>(
     `SELECT turn."id"

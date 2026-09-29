@@ -38,6 +38,31 @@ describe("recovery scanner persistence helpers", () => {
     expect(fake.calls.some(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"'))).toBe(false)
   })
 
+  it("locks the session before checking Turn lineage on an ordinary dispatch", async () => {
+    const fake = fakePool(sql => sql.includes('FROM "agent_turns" AS turn')
+      ? { rows: [{ id: "turn-1" }], rowCount: 1 }
+      : { rows: [{ id: "session-1" }], rowCount: 1 })
+    await persistTurnDispatch(fake.pool, payload)
+
+    const sessionLock = fake.calls.findIndex(([sql]) => sql.includes('FROM "agent_sessions" AS session') && sql.includes("FOR UPDATE"))
+    const turnLineage = fake.calls.findIndex(([sql]) => sql.includes('FROM "agent_turns" AS turn'))
+    expect(sessionLock).toBeGreaterThan(-1)
+    expect(sessionLock).toBeLessThan(turnLineage)
+    expect(fake.calls[sessionLock]?.[0]).not.toContain("status")
+  })
+
+  it("keeps a non-runnable reset session as a quiet skip", async () => {
+    const fake = fakePool(sql => sql.includes('FROM "agent_sessions" AS session')
+      ? { rows: [], rowCount: 0 }
+      : { rows: [{ id: "turn-1" }], rowCount: 1 })
+
+    await expect(persistTurnDispatch(fake.pool, payload, true)).resolves.toBeUndefined()
+    expect(fake.calls.some(([sql]) => sql.includes('FROM "agent_sessions" AS session'))).toBe(true)
+    expect(fake.calls.some(([sql]) => sql.includes('FROM "agent_turns" AS turn'))).toBe(false)
+    expect(fake.calls.some(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"'))).toBe(false)
+    expect(fake.calls.at(-1)?.[0]).toBe("COMMIT")
+  })
+
   it("maps reclaimed leases to their prior fencing version", async () => {
     const fake = fakePool(sql => sql.includes("WITH stale")
       ? { rows: [{ id: "turn-1", sessionId: "session-1", leaseVersion: 8 }], rowCount: 1 }

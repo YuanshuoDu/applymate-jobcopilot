@@ -44,7 +44,7 @@ export interface PipelineCtx {
   onCanonicalEvent?: (event: PipelineCanonicalEvent) => Promise<void> | void
   /** Abort-aware boundary owned by the canonical Turn executor. */
   signal?: AbortSignal
-  /** Current durable execution generation; absent only for direct legacy callers. */
+  /** Current durable execution generation. Direct ownerless legacy callers may run, but pending Gate state writes require this attempt plus sessionId and turnId and fail closed before the database write. */
   executionAttempt?: { id: string; attemptCount: number }
   /** Read-only check used after awaited stages to stop a reclaimed runner. */
   assertExecutionCurrent?: () => Promise<boolean>

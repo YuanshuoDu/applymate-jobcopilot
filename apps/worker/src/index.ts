@@ -39,6 +39,7 @@ async function main() {
     productionChildRuntimeModule,
     postBootstrapStartupModule,
     taskGraphCommandPortModule,
+    productionWorkerRuntimeModule,
   ] = await Promise.all([
     import("./db/apply-results.js"),
     import("./queue/apply-queue.js"),
@@ -53,6 +54,7 @@ async function main() {
     import("./runtime/subagents/production-child-runtime.js"),
     import("./queue/post-bootstrap-startup.js"),
     import("./runtime/subagents/pg-task-graph-command-port.js"),
+    import("./queue/production-worker-runtime.js"),
   ]);
   const { ensureApplyResultsTable, closePool, getPool } = applyResultsModule;
   const { applyWorker, applyQueue, connection } = applyQueueModule;
@@ -96,8 +98,6 @@ async function main() {
   const taskGraphCommandPort = productionFlags.taskGraphPlanningEnabled
     ? taskGraphCommandPortModule.createPgTaskGraphCommandPort(pool)
     : undefined;
-  const waitResolver = productionFlags.consumeWaitOutcomes ? {} : undefined;
-  let childExecutor: ReturnType<typeof productionChildRuntimeModule.createOptionalProductionChildExecutor> = undefined;
   let canonicalBootstrap: Awaited<ReturnType<typeof productionBootstrapModule.createProductionWorkerBootstrap>> | undefined;
   let agentWakeupConsumer: ReturnType<typeof startAgentWakeupConsumer> | undefined;
   let agentMailboxOutboxConsumer: ReturnType<typeof startSubagentMailboxOutboxConsumer> | undefined;
@@ -122,26 +122,10 @@ async function main() {
     () => closeSharedRedisConnections(),
   ]);
   try {
-    canonicalBootstrap = await productionBootstrapModule.startProductionAgentRuntime({
+    canonicalBootstrap = await productionWorkerRuntimeModule.startProductionWorkerRuntime({
       pool,
-      createRuntime: async () => {
-        childExecutor = productionChildRuntimeModule.createOptionalProductionChildExecutor({
-          enabled: productionFlags.childExecutionEnabled,
-          pool,
-        });
-        return canonicalRuntimeModule.createCanonicalTurnRuntime(pool, {
-          workerId: process.env.WORKER_ID ?? `worker-${process.pid}`,
-          authorizeUsage: aiUsageBridgeModule.createWorkerUsageAuthorizer(),
-          productionFlags,
-          executionProjection: createCanonicalExecutionProjection(pool),
-          sessionProjection: createCanonicalSessionProjection(pool),
-          ...taskGraphRuntimeOptions(taskGraphCommandPort),
-        });
-      },
-      bootstrapOptions: () => ({
-        ...(childExecutor ? { subagents: { execute: childExecutor } } : {}),
-        ...(waitResolver ? { waitResolver } : {}),
-      }),
+      workerId: process.env.WORKER_ID ?? `worker-${process.pid}`,
+      productionFlags,
       onBootstrapReady: bootstrap => {
         canonicalBootstrap = bootstrap;
         console.log("[worker] Canonical Turn consumer and recovery scanner started");
@@ -152,6 +136,16 @@ async function main() {
         startAgentRunWorker();
         console.log("[worker] Agent run router started");
       },
+    }, {
+      createOptionalProductionChildExecutor: productionChildRuntimeModule.createOptionalProductionChildExecutor,
+      createCanonicalTurnRuntime: (runtimePool, options) => canonicalRuntimeModule.createCanonicalTurnRuntime(runtimePool, {
+        ...options,
+        ...taskGraphRuntimeOptions(taskGraphCommandPort),
+      }),
+      createWorkerUsageAuthorizer: aiUsageBridgeModule.createWorkerUsageAuthorizer,
+      createCanonicalExecutionProjection,
+      createCanonicalSessionProjection,
+      startProductionAgentRuntime: productionBootstrapModule.startProductionAgentRuntime,
     });
 
     agentWakeupConsumer = startAgentWakeupConsumer();

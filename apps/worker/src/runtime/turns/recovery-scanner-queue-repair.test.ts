@@ -38,7 +38,7 @@ function fixture(initial: DispatchState | null = {
           rowCount: 1,
         }
       }
-      if (sql.includes('SELECT turn."id" FROM "agent_turns" AS turn') && sql.includes("FOR UPDATE OF turn, session")) {
+      if (sql.includes('SELECT turn."id" FROM "agent_turns" AS turn') && sql.includes("FOR UPDATE OF session, turn")) {
         return { rows: [{ id: "turn_1" }], rowCount: 1 }
       }
       if (sql.includes('INSERT INTO "agent_outbox"')) {
@@ -126,7 +126,7 @@ describe("queued Turn dispatch repair", () => {
       expect(update?.[0]).toContain('dispatch."attemptCount" = $6 AND dispatch."publishedAt" = $7::timestamptz')
       expect(update?.[0]).toContain('turn."status" = \'queued\' AND turn."leaseOwnerId" IS NULL')
       expect(update?.[1]).toEqual(expect.arrayContaining(["dispatch_1", 3, "2026-09-24 01:00:00.123456+00"]))
-      const turnLock = fake.client.query.mock.calls.find(([sql]) => String(sql).includes("FOR UPDATE OF turn, session"))
+      const turnLock = fake.client.query.mock.calls.find(([sql]) => String(sql).includes("FOR UPDATE OF session, turn"))
       expect(turnLock?.[0]).toContain('turn."status" = \'queued\' AND turn."leaseOwnerId" IS NULL')
       expect(turnLock?.[0]).not.toContain('controlGate')
     },
@@ -179,7 +179,7 @@ describe("queued Turn dispatch repair", () => {
       if (sql.includes('LEFT JOIN "agent_outbox" AS dispatch')) {
         return { rows: [{ id: "turn_1", sessionId: "session_1", dispatchId: "dispatch_1", dispatchAttemptCount: 3, dispatchPublishedAt: "2026-09-24 01:00:00.123456+00" }], rowCount: 1 }
       }
-      if (sql.includes("FOR UPDATE OF turn, session")) return { rows: [], rowCount: 0 }
+      if (sql.includes("FOR UPDATE OF session, turn")) return { rows: [], rowCount: 0 }
       if (sql.includes('UPDATE "agent_outbox" AS dispatch')) return { rows: [], rowCount: 1 }
       return { rows: [], rowCount: 1 }
     })

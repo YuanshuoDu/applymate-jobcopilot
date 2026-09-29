@@ -137,4 +137,31 @@ describe('runPrepareGateStages', () => {
       expect.any(Function),
     )
   })
+
+  it('interrupts before pending-job status writes when run ownership identity is missing', async () => {
+    const job = { id: 'job-pending' } as unknown as Job
+    const scoredJob = { job, score: 82 } as unknown as ScoredJob
+    const prepared = { ...scoredJob } as ApplicationPackage
+    vi.mocked(runPrepare).mockResolvedValue({
+      stage: 'prepare', ok: true, data: { packages: [prepared] }, metrics: { durationMs: 11, count: 1 },
+    })
+    vi.mocked(runGate).mockResolvedValue({
+      stage: 'gate', ok: true, data: { approved: [], pending: [prepared], skipped: [] }, metrics: { durationMs: 12, count: 1 },
+    })
+
+    const scoutedJobs = [job]
+    const input: PipelineScoutAnalyzeResult = { scoutedJobs, scoredJobs: [scoredJob], analysisFailed: 0 }
+    const runtime = makeRuntime('prepare', { scoutedJobs, scoredJobs: [scoredJob] })
+    const interrupted = new Error('pipeline interrupted')
+    const throwInterrupted = vi.fn((): never => { throw interrupted })
+    runtime.throwInterrupted = throwInterrupted
+
+    expect(runtime.ctx).not.toHaveProperty('executionAttempt')
+    expect(runtime.ctx).not.toHaveProperty('sessionId')
+    expect(runtime.ctx).not.toHaveProperty('turnId')
+    await expect(runPrepareGateStages(runtime, input)).rejects.toBe(interrupted)
+
+    expect(throwInterrupted).toHaveBeenCalledOnce()
+    expect(withRunRecorderWriteOwnership).not.toHaveBeenCalled()
+  })
 })
