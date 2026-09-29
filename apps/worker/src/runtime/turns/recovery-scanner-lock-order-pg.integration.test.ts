@@ -4,6 +4,8 @@ import { Pool as PgPool, type PoolClient } from "pg"
 
 import type { LeasePool, TurnJobPayload } from "./lease.js"
 import { claimTurnLease } from "./lease.js"
+import { ensureQueuedTurnDispatches } from "./recovery-scanner-queue-repair.js"
+import { TURN_DISPATCH_TOPIC, turnDispatchKey, type TurnDispatchQueue } from "./recovery-scanner-common.js"
 import { persistTurnDispatch } from "./recovery-scanner-storage.js"
 
 function disposableTestUrl(): string | null {
@@ -100,21 +102,28 @@ describeWithPostgres("Turn dispatch and claim lock order on disposable PostgreSQ
     }
   })
 
-  function scopedPool(applicationName: string, holdClaim?: { locked: ReturnType<typeof deferred>; release: ReturnType<typeof deferred> }): LeasePool {
+  function scopedPool(
+    applicationName: string,
+    holdClaim?: { locked: ReturnType<typeof deferred>; release: ReturnType<typeof deferred> },
+    afterSessionLock?: () => Promise<void>,
+  ): LeasePool {
     return {
       connect: async () => {
         const client = await pool.connect()
         await client.query(`SET search_path TO "${schema}"`)
         await client.query("SELECT set_config('application_name', $1, false)", [applicationName])
-        if (!holdClaim) return client
+        if (!holdClaim && !afterSessionLock) return client
         const originalQuery = client.query.bind(client) as (query: string, values?: unknown[]) => Promise<unknown>
         return {
           query: async (query: string, values?: unknown[]) => {
             const result = await originalQuery(query, values)
             if (query.includes('SELECT session."userId"') && query.includes("FOR UPDATE")) {
-              holdClaim.locked.resolve()
-              await holdClaim.release.promise
+              if (holdClaim) {
+                holdClaim.locked.resolve()
+                await holdClaim.release.promise
+              }
             }
+            if (afterSessionLock && query.includes('SELECT session."id" FROM "agent_sessions"') && query.includes("FOR UPDATE")) await afterSessionLock()
             return result
           },
           release: () => client.release(),
@@ -123,7 +132,7 @@ describeWithPostgres("Turn dispatch and claim lock order on disposable PostgreSQ
     } as unknown as LeasePool
   }
 
-  async function waitUntilDispatchIsLockBlocked(applicationName: string): Promise<void> {
+  async function waitUntilApplicationIsLockBlocked(applicationName: string, label: string): Promise<void> {
     const deadline = Date.now() + 5_000
     while (Date.now() < deadline) {
       const result = await pool.query<{ wait_event_type: string | null; state: string }>(
@@ -133,7 +142,7 @@ describeWithPostgres("Turn dispatch and claim lock order on disposable PostgreSQ
       if (result.rows[0]?.state === "active" && result.rows[0]?.wait_event_type === "Lock") return
       await new Promise(resolve => setTimeout(resolve, 10))
     }
-    throw new Error("Dispatch did not reach the claim-held session lock within five seconds")
+    throw new Error(`${label} did not reach its expected PostgreSQL lock wait within five seconds`)
   }
 
   it(`serializes ${repeats} forced dispatch/claim interleavings without deadlocks`, async () => {
@@ -157,7 +166,7 @@ describeWithPostgres("Turn dispatch and claim lock order on disposable PostgreSQ
       try {
         await withinFiveSeconds(locked.promise, "Lease claim did not acquire its session lock within five seconds")
         dispatchPromise = persistTurnDispatch(scopedPool(`${app}_dispatch`), payload)
-        await waitUntilDispatchIsLockBlocked(`${app}_dispatch`)
+        await waitUntilApplicationIsLockBlocked(`${app}_dispatch`, "Dispatch")
 
         try {
           await pool.query(`SELECT "id" FROM "${schema}"."agent_turns" WHERE "id" = $1 FOR UPDATE NOWAIT`, [turnId])
@@ -189,4 +198,71 @@ describeWithPostgres("Turn dispatch and claim lock order on disposable PostgreSQ
       unexpectedFailures: [],
     })
   }, 60_000)
+
+  it("re-arms a published queued Turn behind the Session-first dispatch lock without taking the Turn lock first", async () => {
+    const sessionId = `repair-session-${randomUUID()}`
+    const turnId = `repair-turn-${randomUUID()}`
+    const userId = `repair-user-${randomUUID()}`
+    const dispatchId = `dispatch-${randomUUID()}`
+    const payload: TurnJobPayload = { turnId, sessionId, ownerId: "recovery" }
+    const repairApp = `${appPrefix}_repair`
+    const dispatchApp = `${appPrefix}_persist`
+    await pool.query(`INSERT INTO "${schema}"."agent_sessions" ("id", "userId", "status") VALUES ($1, $2, 'running')`, [sessionId, userId])
+    await pool.query(`INSERT INTO "${schema}"."agent_turns" ("id", "sessionId", "userId", "status") VALUES ($1, $2, $3, 'queued')`, [turnId, sessionId, userId])
+    await pool.query(
+      `INSERT INTO "${schema}"."agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload", "publishedAt", "attemptCount")
+       VALUES ($1, $2, $3, $4, $5::jsonb, now(), 3)`,
+      [dispatchId, TURN_DISPATCH_TOPIC, sessionId, turnDispatchKey(turnId), JSON.stringify(payload)],
+    )
+
+    const repairProbeStarted = deferred()
+    const continueRepair = deferred()
+    const queue: TurnDispatchQueue = {
+      add: async () => undefined,
+      getJobState: async () => {
+        repairProbeStarted.resolve()
+        await continueRepair.promise
+        return "unknown"
+      },
+    }
+    const repairPromise = ensureQueuedTurnDispatches(scopedPool(repairApp), queue, "recovery", 1)
+    const dispatchHasSessionLock = deferred()
+    const continueDispatch = deferred()
+    let dispatchPromise: Promise<void> | undefined
+
+    try {
+      await withinFiveSeconds(repairProbeStarted.promise, "Repair scan did not reach its queue-state probe")
+      dispatchPromise = persistTurnDispatch(
+        scopedPool(dispatchApp, undefined, async () => {
+          dispatchHasSessionLock.resolve()
+          await continueDispatch.promise
+        }),
+        payload,
+      )
+      await withinFiveSeconds(dispatchHasSessionLock.promise, "Dispatch did not hold the Session lock")
+      continueRepair.resolve()
+      await waitUntilApplicationIsLockBlocked(repairApp, "Queue repair")
+
+      let turnAvailable = true
+      try {
+        await pool.query(`SELECT "id" FROM "${schema}"."agent_turns" WHERE "id" = $1 FOR UPDATE NOWAIT`, [turnId])
+      } catch (error) {
+        if (codeOf(error) === "55P03") turnAvailable = false
+        else throw error
+      }
+      expect(turnAvailable, "queue repair must wait for Session before locking the queued Turn").toBe(true)
+    } finally {
+      continueDispatch.resolve()
+      continueRepair.resolve()
+    }
+
+    if (!dispatchPromise) throw new Error("Dispatch did not start")
+    await expect(dispatchPromise).resolves.toBeUndefined()
+    await expect(repairPromise).resolves.toBe(1)
+    const repaired = await pool.query<{ attemptCount: number; publishedAt: string | null }>(
+      `SELECT "attemptCount", "publishedAt"::text AS "publishedAt" FROM "${schema}"."agent_outbox" WHERE "id" = $1`,
+      [dispatchId],
+    )
+    expect(repaired.rows[0]).toMatchObject({ attemptCount: 4, publishedAt: null })
+  }, 15_000)
 })

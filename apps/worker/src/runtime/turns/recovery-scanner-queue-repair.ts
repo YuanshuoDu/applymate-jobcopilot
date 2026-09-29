@@ -103,7 +103,7 @@ async function rearmMissingPublishedDispatch(
        WHERE turn."id" = $1 AND turn."sessionId" = $2
          AND turn."status" = 'queued' AND turn."leaseOwnerId" IS NULL
          AND ${RUNNABLE_SESSION}
-       FOR UPDATE OF turn, session`,
+       FOR UPDATE OF session, turn`,
       [payload.turnId, payload.sessionId],
     )
     if (!eligibleTurn.rows[0]) return 0

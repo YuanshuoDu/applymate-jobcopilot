@@ -1,6 +1,7 @@
 import { Pool } from "pg"
 import { createCanonicalTurnRuntime } from "../runtime/canonical-turn-runtime.ts"
-import { createProductionWorkerBootstrap } from "./production-bootstrap.ts"
+import { startProductionAgentRuntime as startProductionAgentRuntimeHelper } from "./production-bootstrap.ts"
+import { startProductionWorkerRuntime } from "./production-worker-runtime.ts"
 
 const [, , mode, rawIds] = process.argv
 const ids = JSON.parse(rawIds)
@@ -12,6 +13,53 @@ let stopping = false
 let stdinBuffer = ""
 const queuedCommands = []
 const commandWaiters = new Map()
+const noOpProjection = { start: async () => undefined, finish: async () => undefined }
+
+async function startFixtureProductionRuntime({
+  workerId,
+  productionFlags,
+  runtimeOptions = {},
+  childExecutor,
+  bootstrapOptions = {},
+}) {
+  return startProductionWorkerRuntime({
+    pool,
+    workerId,
+    productionFlags,
+    onBootstrapReady(ready) { bootstrap = ready },
+    startAgentRunWorker() {},
+  }, {
+    createOptionalProductionChildExecutor({ enabled }) {
+      return enabled ? childExecutor : undefined
+    },
+    createCanonicalTurnRuntime(runtimePool, productionOptions) {
+      return createCanonicalTurnRuntime(runtimePool, { ...runtimeOptions, ...productionOptions })
+    },
+    createWorkerUsageAuthorizer() {
+      return async () => ({ settle() {} })
+    },
+    createCanonicalExecutionProjection() { return noOpProjection },
+    createCanonicalSessionProjection() { return noOpProjection },
+    startProductionAgentRuntime(startupOptions) {
+      return startProductionAgentRuntimeHelper({
+        ...startupOptions,
+        bootstrapOptions: runtime => {
+          const composed = typeof startupOptions.bootstrapOptions === "function"
+            ? startupOptions.bootstrapOptions(runtime)
+            : startupOptions.bootstrapOptions
+          const merged = { ...composed, ...bootstrapOptions }
+          if (composed?.subagents || bootstrapOptions.subagents) {
+            merged.subagents = { ...composed?.subagents, ...bootstrapOptions.subagents }
+          }
+          if (composed?.waitResolver || bootstrapOptions.waitResolver) {
+            merged.waitResolver = { ...composed?.waitResolver, ...bootstrapOptions.waitResolver }
+          }
+          return merged
+        },
+      })
+    },
+  })
+}
 
 process.stdin.setEncoding("utf8")
 function onStdinData(chunk) {
@@ -126,65 +174,70 @@ function assertCoordinationToolsVisible(request) {
 }
 
 async function makeFirstWorker() {
-  const runtime = await createCanonicalTurnRuntime(pool, {
+  await startFixtureProductionRuntime({
     workerId: `restart-worker-${process.pid}`,
-    coordinationEnabled: true,
-    authorizeUsage: async () => ({ settle() {} }),
-    modelRuntimeFactory() {
-      let modelCalls = 0
-      const spawnCallId = `restart-spawn-${ids.suffix}`
-      return {
-        adapter: {
-          id: "worker-restart-parent-fixture-model",
-          profile: modelProfile(),
-          async *stream(request) {
-            assertCoordinationToolsVisible(request)
-            modelCalls += 1
-            if (modelCalls === 1) {
-              yield {
-                type: "tool_call_completed", callId: spawnCallId, name: "agent.spawn",
-                arguments: {
-                  idempotencyKey: `process-restart-spawn:${ids.turnId}`,
-                  role: "analyst", taskType: "research",
-                  goal: "Produce a deterministic result for process-restart acceptance",
-                  successCriteria: ["Persist the fixture result before the Worker is stopped"],
-                  context: { fixture: "process-restart" },
-                },
-              }
-              yield { type: "completed", finishReason: "tool_calls" }
-              return
-            }
-            if (modelCalls === 2) {
-              const taskId = spawnedTaskId(request, spawnCallId)
-              yield {
-                type: "tool_call_completed", callId: `restart-wait-${ids.suffix}`, name: "agent.wait",
-                arguments: {
-                  idempotencyKey: `process-restart-wait:${ids.turnId}`,
-                  taskIds: [taskId], mode: "all", timeoutMs: 30_000,
-                },
-              }
-              yield { type: "completed", finishReason: "tool_calls" }
-              return
-            }
-            throw new Error("unexpected_parent_model_round_before_restart")
-          },
-        },
-        registry: {}, candidates: [],
-      }
+    productionFlags: {
+      childExecutionEnabled: true,
+      coordinationEnabled: true,
+      consumeWaitOutcomes: true,
+      canonicalAutomationEnabled: false,
     },
-  })
-  bootstrap = await createProductionWorkerBootstrap({
-    pool, runtime, ownerId: `restart-worker-${process.pid}`, turnRecoveryIntervalMs: 10,
-    waitResolver: { intervalMs: 10, ownerId: `restart-wait-resolver-${process.pid}` },
-    subagents: {
-      intervalMs: 10,
-      async execute({ lease }) {
-        say("CHILD_EXECUTOR_STARTED")
-        await waitForSuspendedParent(lease.turnId)
-        say("PARENT_SUSPENDED")
-        await waitForCommand("persist-child-result")
-        return { status: "completed", result: { proof: resultMarker, taskId: lease.id } }
+    runtimeOptions: {
+      modelRuntimeFactory() {
+        let modelCalls = 0
+        const spawnCallId = `restart-spawn-${ids.suffix}`
+        return {
+          adapter: {
+            id: "worker-restart-parent-fixture-model",
+            profile: modelProfile(),
+            async *stream(request) {
+              assertCoordinationToolsVisible(request)
+              modelCalls += 1
+              if (modelCalls === 1) {
+                yield {
+                  type: "tool_call_completed", callId: spawnCallId, name: "agent.spawn",
+                  arguments: {
+                    idempotencyKey: `process-restart-spawn:${ids.turnId}`,
+                    role: "analyst", taskType: "research",
+                    goal: "Produce a deterministic result for process-restart acceptance",
+                    successCriteria: ["Persist the fixture result before the Worker is stopped"],
+                    context: { fixture: "process-restart" },
+                  },
+                }
+                yield { type: "completed", finishReason: "tool_calls" }
+                return
+              }
+              if (modelCalls === 2) {
+                const taskId = spawnedTaskId(request, spawnCallId)
+                yield {
+                  type: "tool_call_completed", callId: `restart-wait-${ids.suffix}`, name: "agent.wait",
+                  arguments: {
+                    idempotencyKey: `process-restart-wait:${ids.turnId}`,
+                    taskIds: [taskId], mode: "all", timeoutMs: 30_000,
+                  },
+                }
+                yield { type: "completed", finishReason: "tool_calls" }
+                return
+              }
+              throw new Error("unexpected_parent_model_round_before_restart")
+            },
+          },
+          registry: {}, candidates: [],
+        }
       },
+    },
+    childExecutor: async ({ lease }) => {
+      say("CHILD_EXECUTOR_STARTED")
+      await waitForSuspendedParent(lease.turnId)
+      say("PARENT_SUSPENDED")
+      await waitForCommand("persist-child-result")
+      return { status: "completed", result: { proof: resultMarker, taskId: lease.id } }
+    },
+    bootstrapOptions: {
+      ownerId: `restart-worker-${process.pid}`,
+      turnRecoveryIntervalMs: 10,
+      waitResolver: { intervalMs: 10, ownerId: `restart-wait-resolver-${process.pid}` },
+      subagents: { intervalMs: 10 },
     },
   })
   const deadline = Date.now() + 15_000
@@ -237,84 +290,91 @@ async function acceptActiveFollowUp() {
 
 async function makeActiveFollowUpWorker() {
   const followUpText = "Durable active-Turn follow-up " + ids.suffix
-  const runtime = await createCanonicalTurnRuntime(pool, {
+  await startFixtureProductionRuntime({
     workerId: "active-follow-up-worker-" + process.pid,
-    coordinationEnabled: false,
-    authorizeUsage: async () => ({ settle() {} }),
-    toolRuntimeFactory() {
-      return {
-        registry: {
-          list: () => [{ name: "jobs.search", version: "1" }],
-          resolve: () => ({ idempotency: "read_only" }),
-          validateArguments: () => true,
-        },
-        router: {
-          async execute(_context, call) {
-            return {
-              id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed",
-              output: { jobs: [{
-                id: "active-follow-up-fixture-job-" + ids.suffix, company: "Fixture Employer", role: "Software Engineer", location: "Dublin",
-                status: "active", score: null, url: null, source: "fixture", salary: null, description: null, keywords: null,
-              }], page: 1, hasMore: false }, errorCode: null,
-            }
-          },
-        },
-      }
+    productionFlags: {
+      childExecutionEnabled: false,
+      coordinationEnabled: false,
+      consumeWaitOutcomes: false,
+      canonicalAutomationEnabled: false,
     },
-    modelRuntimeFactory() {
-      let modelCalls = 0
-      return {
-        adapter: {
-          id: "active-follow-up-first-worker-fixture-model",
-          profile: modelProfile(),
-          async *stream(request) {
-            modelCalls += 1
-            if (modelCalls === 1) {
-              say("FIRST_PROVIDER_ACTIVE")
-              await Promise.race([
-                waitForCommand("release-first-provider"),
-                new Promise((_, reject) => request.signal.addEventListener("abort", () => reject(new Error("fixture_provider_aborted")), { once: true })),
-              ])
-              yield { type: "tool_call_completed", callId: "active-follow-up-search-" + ids.suffix, name: "jobs.search", arguments: { location: "Dublin" } }
-              yield { type: "completed", finishReason: "tool_calls" }
-              return
-            }
-            if (modelCalls === 2) {
+    runtimeOptions: {
+      toolRuntimeFactory() {
+        return {
+          registry: {
+            list: () => [{ name: "jobs.search", version: "1" }],
+            resolve: () => ({ idempotency: "read_only" }),
+            validateArguments: () => true,
+          },
+          router: {
+            async execute(_context, call) {
+              return {
+                id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed",
+                output: { jobs: [{
+                  id: "active-follow-up-fixture-job-" + ids.suffix, company: "Fixture Employer", role: "Software Engineer", location: "Dublin",
+                  status: "active", score: null, url: null, source: "fixture", salary: null, description: null, keywords: null,
+                }], page: 1, hasMore: false }, errorCode: null,
+              }
+            },
+          },
+        }
+      },
+      modelRuntimeFactory() {
+        let modelCalls = 0
+        return {
+          adapter: {
+            id: "active-follow-up-first-worker-fixture-model",
+            profile: modelProfile(),
+            async *stream(request) {
+              modelCalls += 1
+              if (modelCalls === 1) {
+                say("FIRST_PROVIDER_ACTIVE")
+                await Promise.race([
+                  waitForCommand("release-first-provider"),
+                  new Promise((_, reject) => request.signal.addEventListener("abort", () => reject(new Error("fixture_provider_aborted")), { once: true })),
+                ])
+                yield { type: "tool_call_completed", callId: "active-follow-up-search-" + ids.suffix, name: "jobs.search", arguments: { location: "Dublin" } }
+                yield { type: "completed", finishReason: "tool_calls" }
+                return
+              }
+              if (modelCalls === 2) {
+                const followUpParts = request.messages
+                  .filter(message => message.role === "user" && Array.isArray(message.content))
+                  .flatMap(message => message.content)
+                  .filter(part => part.type === "text" && part.text.includes(followUpText))
+                if (followUpParts.length !== 0) throw new Error("follow_up_present_before_final_provider_started")
+                say("FINAL_PROVIDER_ACTIVE")
+                await Promise.race([
+                  waitForCommand("release-pending-follow-up-provider"),
+                  new Promise((_, reject) => request.signal.addEventListener("abort", () => reject(new Error("fixture_provider_aborted")), { once: true })),
+                ])
+                yield { type: "text_delta", text: finalMarker }
+                yield { type: "completed", finishReason: "stop" }
+                return
+              }
+              if (modelCalls !== 3) throw new Error("unexpected_active_follow_up_provider_round")
               const followUpParts = request.messages
                 .filter(message => message.role === "user" && Array.isArray(message.content))
                 .flatMap(message => message.content)
                 .filter(part => part.type === "text" && part.text.includes(followUpText))
-              if (followUpParts.length !== 0) throw new Error("follow_up_present_before_final_provider_started")
-              say("FINAL_PROVIDER_ACTIVE")
+              if (followUpParts.length !== 1) throw new Error("follow_up_missing_or_duplicated_in_final_provider_request")
+              say("FOLLOW_UP_CONTEXT_OK")
               await Promise.race([
-                waitForCommand("release-pending-follow-up-provider"),
+                waitForCommand("release-final-provider"),
                 new Promise((_, reject) => request.signal.addEventListener("abort", () => reject(new Error("fixture_provider_aborted")), { once: true })),
               ])
               yield { type: "text_delta", text: finalMarker }
               yield { type: "completed", finishReason: "stop" }
-              return
-            }
-            if (modelCalls !== 3) throw new Error("unexpected_active_follow_up_provider_round")
-            const followUpParts = request.messages
-              .filter(message => message.role === "user" && Array.isArray(message.content))
-              .flatMap(message => message.content)
-              .filter(part => part.type === "text" && part.text.includes(followUpText))
-            if (followUpParts.length !== 1) throw new Error("follow_up_missing_or_duplicated_in_final_provider_request")
-            say("FOLLOW_UP_CONTEXT_OK")
-            await Promise.race([
-              waitForCommand("release-final-provider"),
-              new Promise((_, reject) => request.signal.addEventListener("abort", () => reject(new Error("fixture_provider_aborted")), { once: true })),
-            ])
-            yield { type: "text_delta", text: finalMarker }
-            yield { type: "completed", finishReason: "stop" }
+            },
           },
-        },
-        registry: {}, candidates: [],
-      }
+          registry: {}, candidates: [],
+        }
+      },
     },
-  })
-  bootstrap = await createProductionWorkerBootstrap({
-    pool, runtime, ownerId: "active-follow-up-worker-" + process.pid, turnRecoveryIntervalMs: 10,
+    bootstrapOptions: {
+      ownerId: "active-follow-up-worker-" + process.pid,
+      turnRecoveryIntervalMs: 10,
+    },
   })
   say("FIRST_WORKER_READY")
   await waitForStop()
@@ -323,60 +383,67 @@ async function makeActiveFollowUpWorker() {
 async function makeFollowUpResumeWorker() {
   if (typeof ids.followUpInputId !== "string" || !ids.followUpInputId) throw new Error("follow_up_input_id_missing")
   const followUpText = "Durable active-Turn follow-up " + ids.suffix
-  const runtime = await createCanonicalTurnRuntime(pool, {
+  await startFixtureProductionRuntime({
     workerId: "active-follow-up-recovery-" + process.pid,
-    coordinationEnabled: false,
-    authorizeUsage: async () => ({ settle() {} }),
-    toolRuntimeFactory() {
-      return {
-        registry: {
-          list: () => [{ name: "jobs.search", version: "1" }],
-          resolve: () => ({ idempotency: "read_only" }),
-          validateArguments: () => true,
-        },
-        router: {
-          async execute(_context, call) {
-            return {
-              id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed",
-              output: { jobs: [{
-                id: "fixture-job-" + ids.suffix, company: "Fixture Employer", role: "Software Engineer", location: "Dublin",
-                status: "active", score: null, url: null, source: "fixture", salary: null, description: null, keywords: null,
-              }], page: 1, hasMore: false }, errorCode: null,
-            }
-          },
-        },
-      }
+    productionFlags: {
+      childExecutionEnabled: false,
+      coordinationEnabled: false,
+      consumeWaitOutcomes: false,
+      canonicalAutomationEnabled: false,
     },
-    modelRuntimeFactory() {
-      let modelCalls = 0
-      return {
-        adapter: {
-          id: "active-follow-up-recovery-fixture-model",
-          profile: modelProfile(),
-          async *stream(request) {
-            modelCalls += 1
-            if (modelCalls === 1) {
-              const matchingParts = request.messages
-                .filter(message => message.role === "user" && Array.isArray(message.content))
-                .flatMap(message => message.content)
-                .filter(part => part.type === "text" && part.text.includes(ids.followUpInputId) && part.text.includes(followUpText))
-              if (matchingParts.length !== 1) throw new Error("recovered_provider_request_did_not_contain_exactly_one_original_follow_up_id_text_in_user_role")
-              say("FOLLOW_UP_CONTEXT_OK")
-              yield { type: "tool_call_completed", callId: "follow-up-evidence-" + ids.suffix, name: "jobs.search", arguments: { location: "Dublin" } }
-              yield { type: "completed", finishReason: "tool_calls" }
-              return
-            }
-            if (modelCalls !== 2) throw new Error("unexpected_follow_up_provider_round")
-            yield { type: "text_delta", text: finalMarker }
-            yield { type: "completed", finishReason: "stop" }
+    runtimeOptions: {
+      toolRuntimeFactory() {
+        return {
+          registry: {
+            list: () => [{ name: "jobs.search", version: "1" }],
+            resolve: () => ({ idempotency: "read_only" }),
+            validateArguments: () => true,
           },
-        },
-        registry: {}, candidates: [],
-      }
+          router: {
+            async execute(_context, call) {
+              return {
+                id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed",
+                output: { jobs: [{
+                  id: "fixture-job-" + ids.suffix, company: "Fixture Employer", role: "Software Engineer", location: "Dublin",
+                  status: "active", score: null, url: null, source: "fixture", salary: null, description: null, keywords: null,
+                }], page: 1, hasMore: false }, errorCode: null,
+              }
+            },
+          },
+        }
+      },
+      modelRuntimeFactory() {
+        let modelCalls = 0
+        return {
+          adapter: {
+            id: "active-follow-up-recovery-fixture-model",
+            profile: modelProfile(),
+            async *stream(request) {
+              modelCalls += 1
+              if (modelCalls === 1) {
+                const matchingParts = request.messages
+                  .filter(message => message.role === "user" && Array.isArray(message.content))
+                  .flatMap(message => message.content)
+                  .filter(part => part.type === "text" && part.text.includes(ids.followUpInputId) && part.text.includes(followUpText))
+                if (matchingParts.length !== 1) throw new Error("recovered_provider_request_did_not_contain_exactly_one_original_follow_up_id_text_in_user_role")
+                say("FOLLOW_UP_CONTEXT_OK")
+                yield { type: "tool_call_completed", callId: "follow-up-evidence-" + ids.suffix, name: "jobs.search", arguments: { location: "Dublin" } }
+                yield { type: "completed", finishReason: "tool_calls" }
+                return
+              }
+              if (modelCalls !== 2) throw new Error("unexpected_follow_up_provider_round")
+              yield { type: "text_delta", text: finalMarker }
+              yield { type: "completed", finishReason: "stop" }
+            },
+          },
+          registry: {}, candidates: [],
+        }
+      },
     },
-  })
-  bootstrap = await createProductionWorkerBootstrap({
-    pool, runtime, ownerId: "active-follow-up-recovery-" + process.pid, turnRecoveryIntervalMs: 10,
+    bootstrapOptions: {
+      ownerId: "active-follow-up-recovery-" + process.pid,
+      turnRecoveryIntervalMs: 10,
+    },
   })
   say("RECOVERY_WORKER_READY")
   await waitForStop()
@@ -418,31 +485,37 @@ async function acceptMessage() {
 }
 
 async function makeSecondWorker() {
-  const runtime = await createCanonicalTurnRuntime(pool, {
+  await startFixtureProductionRuntime({
     workerId: `restart-worker-${process.pid}`,
-    consumeWaitOutcomes: true,
-    coordinationEnabled: false,
-    authorizeUsage: async () => ({ settle() {} }),
-    modelRuntimeFactory({ state }) {
-      const observations = JSON.stringify(state.snapshot.toolObservations)
-      if (!observations.includes(resultMarker)) throw new Error("restart_resume_missing_persisted_child_result")
-      say("RESUME_CONTEXT_OK")
-      return {
-        adapter: {
-          id: "worker-restart-fixture-model",
-          profile: modelProfile(),
-          async *stream() {
-            yield { type: "text_delta", text: finalMarker }
-            yield { type: "completed", finishReason: "stop" }
-          },
-        },
-        registry: {}, candidates: [],
-      }
+    productionFlags: {
+      childExecutionEnabled: false,
+      coordinationEnabled: false,
+      consumeWaitOutcomes: true,
+      canonicalAutomationEnabled: false,
     },
-  })
-  bootstrap = await createProductionWorkerBootstrap({
-    pool, runtime, ownerId: `restart-worker-${process.pid}`, turnRecoveryIntervalMs: 10,
-    waitResolver: { intervalMs: 10, ownerId: `restart-wait-resolver-${process.pid}` },
+    runtimeOptions: {
+      modelRuntimeFactory({ state }) {
+        const observations = JSON.stringify(state.snapshot.toolObservations)
+        if (!observations.includes(resultMarker)) throw new Error("restart_resume_missing_persisted_child_result")
+        say("RESUME_CONTEXT_OK")
+        return {
+          adapter: {
+            id: "worker-restart-fixture-model",
+            profile: modelProfile(),
+            async *stream() {
+              yield { type: "text_delta", text: finalMarker }
+              yield { type: "completed", finishReason: "stop" }
+            },
+          },
+          registry: {}, candidates: [],
+        }
+      },
+    },
+    bootstrapOptions: {
+      ownerId: `restart-worker-${process.pid}`,
+      turnRecoveryIntervalMs: 10,
+      waitResolver: { intervalMs: 10, ownerId: `restart-wait-resolver-${process.pid}` },
+    },
   })
   say("SECOND_WORKER_READY")
   await waitForStop()
