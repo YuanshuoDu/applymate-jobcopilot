@@ -4313,6 +4313,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const failurePreflightEvidence: FailureDiagnosticField[] = failurePreflightEvidenceDiagnostics
         ? [{ label: "failurePreflightEvidence", value: "captured", safeValue: failurePreflightEvidenceDiagnostics }]
         : []
+      const waitHandoffFailureState = JSON.stringify(waitHandoffFailureProjection(failureWaitHandoffFailure))
       throw new Error(combineFailureDiagnostics([
         { label: "failedPrerequisitePreflight", value: failurePreflightErrorClass === "none" ? "" : "captured" },
         { label: "failurePreflightStage", value: failurePreflightStage, safeValue: failurePreflightStage },
@@ -4320,6 +4321,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         ...failurePreflightEvidence,
         ...failureReceiptDiagnostic,
         { label: "waitHandoffFailure", value: failureWaitHandoffFailure ?? "<not captured>" },
+        { label: "waitHandoffState", value: waitHandoffFailureState, safeValue: waitHandoffFailureState },
         { label: "turnFailure", value: waitTurnFailureSummary(error) },
       ], progress))
     }
