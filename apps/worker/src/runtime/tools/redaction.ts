@@ -51,6 +51,7 @@ const MAX_TASK_GRAPH_KEY_LENGTH = 128
 const SPAWN_RECEIPT_FIELDS = ["taskId", "rootTaskId", "parentTaskId", "path", "depth", "status", "replay"] as const
 const SPAWN_STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
 const MAX_SUBAGENT_DEPTH = 8
+const DURABLE_WAIT_ID = /^wait-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 
 /**
  * TaskGraph and spawn receipts preserve generated structural IDs used by
@@ -132,6 +133,22 @@ export function prepareSubagentSpawnReceipt(
   return prepareSafeValue({ taskId, rootTaskId, parentTaskId, path, depth, status, replay })
 }
 
+/** Preserves only a durable wait ID in an otherwise generically redacted result. */
+export function prepareDurableWaitOutput(value: unknown): PreparedLifecycleValue {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return prepareLifecycleValue(value)
+  const prototype = Object.getPrototypeOf(value)
+  const waitId = Object.getOwnPropertyDescriptor(value, "waitId")
+  if (!waitId) return prepareLifecycleValue(value)
+  if ((prototype !== Object.prototype && prototype !== null) || !waitId.enumerable || !("value" in waitId)) {
+    throw invalidWaitReceipt()
+  }
+
+  const prepared = prepareLifecycleValue(value)
+  if (prepared.safe === null || typeof prepared.safe !== "object" || Array.isArray(prepared.safe)) throw invalidWaitReceipt()
+  const safeWaitId = typeof waitId.value === "string" && DURABLE_WAIT_ID.test(waitId.value) ? waitId.value : "[REDACTED]"
+  return prepareSafeValue({ ...prepared.safe, waitId: safeWaitId })
+}
+
 export function sanitizeLifecyclePreview(value: unknown, maxBytes = DEFAULT_MAX_LIFECYCLE_BYTES): RepositoryJsonValue {
   const prepared = prepareLifecycleValue(value)
   if (prepared.sizeBytes <= maxBytes) return prepared.safe
@@ -201,6 +218,10 @@ function isGeneratedTaskId(value: unknown, turnId: string): value is string {
 
 function invalidSpawnReceipt(): Error {
   return new Error("subagent_spawn_receipt_invalid")
+}
+
+function invalidWaitReceipt(): Error {
+  return new Error("durable_wait_receipt_invalid")
 }
 
 function invalidPlanReceipt(): Error {

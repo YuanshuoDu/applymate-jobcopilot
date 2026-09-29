@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { InMemoryToolResultReferenceStore, prepareLifecycleValue, prepareSubagentSpawnReceipt, sanitizeForLifecycle } from "./redaction.js"
+import { InMemoryToolResultReferenceStore, prepareDurableWaitOutput, prepareLifecycleValue, prepareSubagentSpawnReceipt, sanitizeForLifecycle } from "./redaction.js"
 
 const turnId = "c123456789012345678901234"
 const rootTaskId = `root-${turnId}`
@@ -16,6 +16,31 @@ const spawnReceipt = {
 } as const
 
 describe("tool lifecycle redaction", () => {
+  it("preserves only a canonical generated durable wait ID", () => {
+    const waitId = "wait-12345678-1234-4234-9234-123456789012"
+    const output = { waitId, status: "ready", detail: "Contact candidate@example.com at 202-555-0199" }
+
+    expect(prepareLifecycleValue(output).safe).not.toEqual(output)
+    expect(prepareDurableWaitOutput(output).safe).toEqual({
+      waitId,
+      status: "ready",
+      detail: "Contact [REDACTED_EMAIL] at [REDACTED_PHONE]",
+    })
+  })
+
+  it("redacts malformed wait IDs and rejects accessor-shaped wait receipts", () => {
+    expect(prepareDurableWaitOutput({ waitId: "wait-123", status: "ready" }).safe).toEqual({
+      waitId: "[REDACTED]",
+      status: "ready",
+    })
+
+    const accessorReceipt = Object.defineProperty({ status: "ready" }, "waitId", {
+      enumerable: true,
+      get: () => "wait-12345678-1234-4234-9234-123456789012",
+    })
+    expect(() => prepareDurableWaitOutput(accessorReceipt)).toThrow("durable_wait_receipt_invalid")
+  })
+
   it("preserves generated spawn lineage after generic redaction would alter a phone-like UUID", () => {
     expect(prepareLifecycleValue(spawnReceipt).safe).not.toEqual(spawnReceipt)
     expect(prepareSubagentSpawnReceipt(spawnReceipt, { turnId, taskId: rootTaskId, rootTaskId }).safe).toEqual(spawnReceipt)

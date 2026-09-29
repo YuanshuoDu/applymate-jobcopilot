@@ -28,6 +28,14 @@ const spawnReceipt = {
   taskId: spawnTaskId, rootTaskId: spawnRootTaskId, parentTaskId: spawnRootTaskId,
   path: `/${spawnRootTaskId}/${spawnTaskId}`, depth: 1, status: "queued", replay: false,
 } as const
+const durableWaitReceipt = {
+  waitId: "wait-12345678-1234-4234-9234-123456789012",
+  status: "ready",
+  taskIds: [spawnTaskId],
+  deadlineAt: "2026-09-29T12:00:00.000Z",
+  matchedTaskIds: [spawnTaskId],
+  tasks: [{ taskId: spawnTaskId, result: { email: "candidate@example.com" } }],
+}
 const owner: ExecutionOwner = {
   kind: "turn", taskId: "root-1", lease: {
     turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 1,
@@ -123,6 +131,43 @@ describe("ToolLifecycle", () => {
     const lifecycle = new ToolLifecycle({ sink: new InMemoryToolLifecycleSink() })
     const output = await lifecycle.completed({ ...spawnCall, id: "call-spawn-alias", toolName: "spawn_subagent" }, spawnReceipt)
     expect(output).toEqual(spawnReceipt)
+  })
+
+  it.each(["agent.wait", "wait_subagents"])("preserves a generated wait ID and redacts other fields for %s", async toolName => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    const output = await lifecycle.completed({ ...call, id: `call-${toolName}`, toolName }, {
+      ...durableWaitReceipt,
+      detail: "Contact candidate@example.com at 202-555-0199",
+    })
+
+    expect(output).toMatchObject({
+      waitId: durableWaitReceipt.waitId,
+      status: "ready",
+      detail: "Contact [REDACTED_EMAIL] at [REDACTED_PHONE]",
+      tasks: [{ result: { email: "[REDACTED]" } }],
+    })
+    expect(sink.events[0]?.item).toMatchObject({ type: "tool_result", output })
+    expect(sink.events[0]?.payload.output).toEqual(output)
+  })
+
+  it.each(["agent.wait", "wait_subagents"])("redacts malformed wait IDs for %s", async toolName => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    const output = await lifecycle.completed({ ...call, id: `call-${toolName}-malformed`, toolName }, {
+      waitId: "wait-123",
+      status: "ready",
+      email: "candidate@example.com",
+    })
+
+    expect(output).toEqual({ waitId: "[REDACTED]", status: "ready", email: "[REDACTED]" })
+    expect(sink.events[0]?.payload.output).toEqual(output)
+  })
+
+  it("keeps generic redaction for canonical wait-shaped IDs on unrelated tools", async () => {
+    const lifecycle = new ToolLifecycle({ sink: new InMemoryToolLifecycleSink() })
+    const output = await lifecycle.completed(call, { waitId: durableWaitReceipt.waitId })
+    expect(output).toEqual({ waitId: "wait-[REDACTED_PHONE]" })
   })
 
   it("fails closed for malformed or extra-field agent.spawn receipts", async () => {
