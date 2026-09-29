@@ -325,7 +325,7 @@ describe("createCanonicalTurnRuntime", () => {
     }
     const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
       workerId: "worker-1", taskGraphCommandPort, taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
-      productionFlags: { cognitiveLoopEnabled: false, planningEnabled: true, planningExecutionEnabled: true, taskGraphPlanningEnabled: true, childExecutionEnabled: true, coordinationEnabled: true, consumeWaitOutcomes: false, canonicalAutomationEnabled: false },
+      productionFlags: { taskGraphPlanningEnabled: true, childExecutionEnabled: true, coordinationEnabled: true, consumeWaitOutcomes: false, canonicalAutomationEnabled: false },
       stateLoader: async () => ({ ...state(), toolPolicySnapshot: {} }), rootTaskStore: rootStore() as never,
       turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(), modelRuntimeFactory: provider,
       authorizeUsage: async () => ({ settle: async () => undefined }),

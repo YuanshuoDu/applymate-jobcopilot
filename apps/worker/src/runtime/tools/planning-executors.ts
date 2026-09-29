@@ -1,5 +1,6 @@
 import { Type, type Static, type TSchema } from "@sinclair/typebox"
 import { schemaVersion } from "@jobcopilot/agent-protocol"
+import { redactSensitiveText } from "@jobcopilot/shared"
 import { TASK_GRAPH_LIMITS, type TaskGraphProposal } from "../planning/task-graph.js"
 import type {
   TaskGraphCommandPort,
@@ -122,6 +123,9 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
     const encoded = JSON.stringify(input)
     if (!encoded || Buffer.byteLength(encoded, "utf8") > MAX_PROPOSAL_BYTES) {
       throw new ToolExecutionError("task_graph_proposal_too_large", "TaskGraph proposal exceeds the bounded request size", { code: "task_graph_proposal_too_large", maxBytes: MAX_PROPOSAL_BYTES })
+    }
+    if (input.nodes.some(node => redactSensitiveText(node.key) !== node.key)) {
+      throw new ToolExecutionError("task_graph_sensitive_key_rejected", "TaskGraph keys cannot contain contact or credential data")
     }
     const scope = executionScope(context, options)
     try {

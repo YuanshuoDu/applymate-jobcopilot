@@ -535,6 +535,9 @@ function diagnosticTaskGraphRevision(value: unknown): number | null {
 function firstWaitPlanGraphMismatchProjection(input: {
   requestReceipt: unknown
   requestGraph: unknown
+  persistedToolReceipt: unknown
+  persistedToolResultItemRevision: unknown
+  persistedToolResultItemStatus: unknown
   persistedReceipt: unknown
   persistedSnapshot: unknown
   persistedItemRevision: unknown
@@ -542,18 +545,23 @@ function firstWaitPlanGraphMismatchProjection(input: {
 }): RecordValue {
   const requestReceipt = record(input.requestReceipt)
   const requestGraph = record(input.requestGraph)
+  const persistedToolReceipt = record(input.persistedToolReceipt)
   const persistedReceipt = record(input.persistedReceipt)
   const persistedSnapshot = record(input.persistedSnapshot)
   const persistedReceiptItem = record(input.persistedReceiptItem)
   const embeddedSnapshot = record(persistedReceiptItem?.content)
   const requestReceiptNodes = diagnosticTaskGraphNodes(requestReceipt?.nodes)
   const requestGraphNodes = diagnosticTaskGraphNodes(requestGraph?.nodes)
+  const persistedToolReceiptNodes = diagnosticTaskGraphNodes(persistedToolReceipt?.nodes)
   const persistedReceiptNodes = diagnosticTaskGraphNodes(persistedReceipt?.nodes)
   const persistedSnapshotNodes = diagnosticTaskGraphNodes(persistedSnapshot?.nodes)
   const embeddedSnapshotNodes = diagnosticTaskGraphNodes(embeddedSnapshot?.nodes)
+  const requestReceiptMatchesPersistedReceipt = diagnosticTaskGraphNodeMapsMatch(requestReceiptNodes, persistedReceiptNodes)
   const comparisons = {
+    requestReceiptMatchesPersistedToolReceipt: diagnosticTaskGraphNodeMapsMatch(requestReceiptNodes, persistedToolReceiptNodes),
+    persistedToolReceiptMatchesPersistedReceipt: diagnosticTaskGraphNodeMapsMatch(persistedToolReceiptNodes, persistedReceiptNodes),
+    persistedToolReceiptMatchesSnapshot: diagnosticTaskGraphNodeMapsMatch(persistedToolReceiptNodes, persistedSnapshotNodes),
     requestReceiptMatchesRequestGraph: diagnosticTaskGraphNodeMapsMatch(requestReceiptNodes, requestGraphNodes),
-    requestReceiptMatchesPersistedReceipt: diagnosticTaskGraphNodeMapsMatch(requestReceiptNodes, persistedReceiptNodes),
     requestGraphMatchesPersistedSnapshot: diagnosticTaskGraphNodeMapsMatch(requestGraphNodes, persistedSnapshotNodes),
     persistedReceiptMatchesSnapshot: diagnosticTaskGraphNodeMapsMatch(persistedReceiptNodes, persistedSnapshotNodes),
     persistedReceiptMatchesEmbeddedSnapshot: diagnosticTaskGraphNodeMapsMatch(persistedReceiptNodes, embeddedSnapshotNodes),
@@ -563,13 +571,19 @@ function firstWaitPlanGraphMismatchProjection(input: {
     || comparisons.persistedReceiptMatchesEmbeddedSnapshot === false
     || comparisons.embeddedSnapshotMatchesCurrentSnapshot === false
     ? "persisted_receipt_snapshot_lineage_mismatch"
-    : comparisons.requestGraphMatchesPersistedSnapshot === false
-      ? "stale_request_graph_context"
-      : comparisons.requestReceiptMatchesPersistedReceipt === false
-        ? "stale_or_wrong_request_receipt"
-        : comparisons.requestReceiptMatchesRequestGraph === false
-          ? "request_receipt_graph_pairing_mismatch"
-          : "request_graph_and_receipt_match_persisted_state"
+    : comparisons.persistedToolReceiptMatchesPersistedReceipt === false
+      ? "persisted_tool_receipt_proposal_mismatch"
+      : comparisons.persistedToolReceiptMatchesSnapshot === false
+        ? "persisted_tool_receipt_snapshot_mismatch"
+        : comparisons.requestReceiptMatchesPersistedToolReceipt === false
+          ? "request_persisted_tool_receipt_mismatch"
+          : comparisons.requestGraphMatchesPersistedSnapshot === false
+            ? "stale_request_graph_context"
+            : requestReceiptMatchesPersistedReceipt === false
+              ? "stale_or_wrong_request_receipt"
+              : comparisons.requestReceiptMatchesRequestGraph === false
+                ? "request_receipt_graph_pairing_mismatch"
+                : "request_graph_and_receipt_match_persisted_state"
   const safeKeys = (keys: string[]) => keys.filter(key => TASK_GRAPH_DIAGNOSTIC_NODE_KEYS.has(key)).slice(0, 8)
   return {
     available: true,
@@ -578,31 +592,32 @@ function firstWaitPlanGraphMismatchProjection(input: {
       receiptStatus: requestReceipt?.status === "accepted" || requestReceipt?.status === "duplicate" ? requestReceipt.status : "other",
       receiptRevision: diagnosticTaskGraphRevision(requestReceipt?.revision),
       graphRevision: diagnosticTaskGraphRevision(requestGraph?.revision),
-      receiptNodeCount: requestReceiptNodes.count,
-      graphNodeCount: requestGraphNodes.count,
-      receiptTaskIdCount: requestReceiptNodes.taskIdCount,
-      graphTaskIdCount: requestGraphNodes.taskIdCount,
-      receiptNodeKeys: requestReceiptNodes.keys,
-      graphNodeKeys: requestGraphNodes.keys,
+      receiptNodeCount: diagnosticBoundedCount(requestReceiptNodes.count),
+      graphNodeCount: diagnosticBoundedCount(requestGraphNodes.count),
+      receiptTaskIdCount: diagnosticBoundedCount(requestReceiptNodes.taskIdCount),
+      graphTaskIdCount: diagnosticBoundedCount(requestGraphNodes.taskIdCount),
     },
     persisted: {
+      toolResultItemRevision: diagnosticTaskGraphRevision(input.persistedToolResultItemRevision),
+      toolResultItemStatus: diagnosticEnum(input.persistedToolResultItemStatus, ITEM_DIAGNOSTIC_STATUSES),
+      toolReceiptRevision: diagnosticTaskGraphRevision(persistedToolReceipt?.revision),
+      toolReceiptNodeCount: diagnosticBoundedCount(persistedToolReceiptNodes.count),
+      toolReceiptTaskIdCount: diagnosticBoundedCount(persistedToolReceiptNodes.taskIdCount),
       receiptRevision: diagnosticTaskGraphRevision(persistedReceipt?.revision),
-      receiptItemRevision: diagnosticTaskGraphRevision(persistedReceiptItem?.revision),
       currentItemRevision: diagnosticTaskGraphRevision(input.persistedItemRevision),
-      receiptNodeCount: persistedReceiptNodes.count,
-      snapshotNodeCount: persistedSnapshotNodes.count,
-      embeddedSnapshotNodeCount: embeddedSnapshotNodes.count,
-      receiptNodeKeys: persistedReceiptNodes.keys,
-      snapshotNodeKeys: persistedSnapshotNodes.keys,
-      embeddedSnapshotNodeKeys: embeddedSnapshotNodes.keys,
+      receiptNodeCount: diagnosticBoundedCount(persistedReceiptNodes.count),
+      receiptTaskIdCount: diagnosticBoundedCount(persistedReceiptNodes.taskIdCount),
+      snapshotNodeCount: diagnosticBoundedCount(persistedSnapshotNodes.count),
+      snapshotTaskIdCount: diagnosticBoundedCount(persistedSnapshotNodes.taskIdCount),
     },
     comparisons,
     mismatchKeys: {
+      requestReceiptPersistedToolReceipt: safeKeys(diagnosticTaskGraphMismatchKeys(requestReceiptNodes, persistedToolReceiptNodes)),
+      persistedToolReceiptProposal: safeKeys(diagnosticTaskGraphMismatchKeys(persistedToolReceiptNodes, persistedReceiptNodes)),
+      persistedToolReceiptSnapshot: safeKeys(diagnosticTaskGraphMismatchKeys(persistedToolReceiptNodes, persistedSnapshotNodes)),
       requestReceiptGraph: safeKeys(diagnosticTaskGraphMismatchKeys(requestReceiptNodes, requestGraphNodes)),
-      requestReceiptPersistedReceipt: safeKeys(diagnosticTaskGraphMismatchKeys(requestReceiptNodes, persistedReceiptNodes)),
       requestGraphPersistedSnapshot: safeKeys(diagnosticTaskGraphMismatchKeys(requestGraphNodes, persistedSnapshotNodes)),
       persistedReceiptSnapshot: safeKeys(diagnosticTaskGraphMismatchKeys(persistedReceiptNodes, persistedSnapshotNodes)),
-      persistedReceiptEmbeddedSnapshot: safeKeys(diagnosticTaskGraphMismatchKeys(persistedReceiptNodes, embeddedSnapshotNodes)),
     },
   }
 }
@@ -619,21 +634,40 @@ async function collectFirstWaitPlanGraphMismatchDiagnostics(
       itemRevision: unknown
       content: unknown
       proposalPayload: unknown
+      toolResultItemRevision: unknown
+      toolResultItemStatus: unknown
+      toolResultContent: unknown
     }>(`SELECT item."revision" AS "itemRevision", item."content",
          (SELECT event."payload" FROM "agent_events" AS event
           WHERE event."sessionId" = turn."sessionId" AND event."turnId" = turn."id" AND event."itemId" = item."id"
             AND event."type" IN ('item.started', 'item.delta') AND event."payload"->>'kind' = 'proposal'
-          ORDER BY event."sequence" DESC LIMIT 1) AS "proposalPayload"
+            AND event."payload"->'receipt'->>'revision' = toolResult."content"->'output'->>'revision'
+          ORDER BY event."sequence" DESC LIMIT 1) AS "proposalPayload",
+         toolResult."revision" AS "toolResultItemRevision",
+         toolResult."status" AS "toolResultItemStatus",
+         toolResult."content" AS "toolResultContent"
        FROM "agent_turns" AS turn JOIN "agent_items" AS item
          ON item."sessionId" = turn."sessionId" AND item."turnId" = turn."id"
           AND item."taskId" = turn."rootTaskId" AND item."type" = 'task_graph'
-       WHERE turn."id" = $1 ORDER BY item."revision" DESC, item."updatedAt" DESC LIMIT 1`, [turnId])
+       LEFT JOIN LATERAL (
+         SELECT resultItem."revision", resultItem."status", resultItem."content"
+         FROM "agent_items" AS resultItem
+         WHERE resultItem."sessionId" = turn."sessionId" AND resultItem."turnId" = turn."id"
+           AND resultItem."taskId" = turn."rootTaskId" AND resultItem."type" = 'tool_result'
+           AND resultItem."content"->>'toolCallId' = $2
+         ORDER BY resultItem."revision" DESC, resultItem."updatedAt" DESC LIMIT 1
+       ) AS toolResult ON TRUE
+       WHERE turn."id" = $1 ORDER BY item."revision" DESC, item."updatedAt" DESC LIMIT 1`, [turnId, planCallId])
     const row = result.rows[0]
     const proposalPayload = record(row?.proposalPayload)
     const proposalItem = record(proposalPayload?.item)
+    const toolResultContent = record(row?.toolResultContent)
     const projection = firstWaitPlanGraphMismatchProjection({
       requestReceipt: latestToolResult(request, planCallId),
       requestGraph: graph,
+      persistedToolReceipt: toolResultContent?.output,
+      persistedToolResultItemRevision: row?.toolResultItemRevision,
+      persistedToolResultItemStatus: row?.toolResultItemStatus,
       persistedReceipt: record(proposalPayload?.receipt),
       persistedSnapshot: record(row?.content),
       persistedItemRevision: row?.itemRevision,
@@ -2433,7 +2467,8 @@ describe("compact TaskGraph wait failure diagnostics", () => {
     const storedSnapshot = { nodes: nodeRows(privateTaskIds) }
     const staleRequestGraph = { kind: "task_graph_current", revision: 1, nodes: nodeRows([privateTaskIds[0]!, "stale-task-summary"]) }
     const staleGraph = firstWaitPlanGraphMismatchProjection({
-      requestReceipt: receipt, requestGraph: staleRequestGraph, persistedReceipt: receipt,
+      requestReceipt: receipt, requestGraph: staleRequestGraph, persistedToolReceipt: receipt,
+      persistedToolResultItemRevision: 1, persistedToolResultItemStatus: "completed", persistedReceipt: receipt,
       persistedSnapshot: storedSnapshot, persistedItemRevision: 1,
       persistedReceiptItem: { revision: 1, content: storedSnapshot },
     })
@@ -2441,7 +2476,6 @@ describe("compact TaskGraph wait failure diagnostics", () => {
       diagnosis: "stale_request_graph_context",
       comparisons: {
         requestReceiptMatchesRequestGraph: false,
-        requestReceiptMatchesPersistedReceipt: true,
         requestGraphMatchesPersistedSnapshot: false,
         persistedReceiptMatchesSnapshot: true,
       },
@@ -2452,6 +2486,7 @@ describe("compact TaskGraph wait failure diagnostics", () => {
     const persistedLineage = firstWaitPlanGraphMismatchProjection({
       requestReceipt: receipt,
       requestGraph: { kind: "task_graph_current", revision: 1, nodes: divergentSnapshot.nodes },
+      persistedToolReceipt: receipt, persistedToolResultItemRevision: 1, persistedToolResultItemStatus: "completed",
       persistedReceipt: receipt, persistedSnapshot: divergentSnapshot, persistedItemRevision: 2,
       persistedReceiptItem: { revision: 1, content: storedSnapshot },
     })
@@ -2468,6 +2503,59 @@ describe("compact TaskGraph wait failure diagnostics", () => {
     expect(JSON.stringify([staleGraph, persistedLineage])).not.toContain("private-task")
     expect(JSON.stringify([staleGraph, persistedLineage])).not.toContain("stale-task-summary")
     expect(JSON.stringify([staleGraph, persistedLineage])).not.toContain("persisted-task-summary")
+  })
+
+  it("locates initial plan receipt divergence at the persisted tool result without exposing task IDs", () => {
+    const keys = ["source", "summary", "large-source", "rejected"] as const
+    const nodes = (prefix: string) => keys.map(key => ({ key, taskId: `${prefix}-${key}` }))
+    const requestReceipt = { status: "accepted", revision: 1, nodes: nodes("request-task") }
+    const durableNodes = nodes("durable-task").map(node => ({
+      ...node, taskId: node.key === "source" || node.key === "summary"
+        ? `request-task-${node.key}` : node.taskId,
+    }))
+    const durableReceipt = { status: "accepted", revision: 1, nodes: durableNodes }
+    const persistedSnapshot = { nodes: durableNodes }
+    const request = {
+      messages: [{ role: "tool", content: [{
+        type: "tool_result", toolUseId: "private-plan-call",
+        content: JSON.stringify(requestReceipt),
+      }] }],
+    } as unknown as HarnessModelRequest
+
+    const projection = firstWaitPlanGraphMismatchProjection({
+      requestReceipt: latestToolResult(request, "private-plan-call"),
+      requestGraph: { kind: "task_graph_current", revision: 3, nodes: durableNodes },
+      persistedToolReceipt: requestReceipt,
+      persistedToolResultItemRevision: 1,
+      persistedToolResultItemStatus: "completed",
+      persistedReceipt: durableReceipt,
+      persistedSnapshot,
+      persistedItemRevision: 3,
+      persistedReceiptItem: { revision: 1, content: persistedSnapshot },
+    })
+    const serialized = JSON.stringify(projection)
+
+    expect(projection).toMatchObject({
+      diagnosis: "persisted_tool_receipt_proposal_mismatch",
+      persisted: { toolResultItemRevision: 1, toolResultItemStatus: "completed", toolReceiptNodeCount: 4 },
+      comparisons: {
+        requestReceiptMatchesPersistedToolReceipt: true,
+        persistedToolReceiptMatchesPersistedReceipt: false,
+        persistedToolReceiptMatchesSnapshot: false,
+        requestGraphMatchesPersistedSnapshot: true,
+        persistedReceiptMatchesSnapshot: true,
+      },
+      mismatchKeys: {
+        requestReceiptPersistedToolReceipt: [],
+        persistedToolReceiptProposal: ["large-source", "rejected"],
+        persistedToolReceiptSnapshot: ["large-source", "rejected"],
+      },
+    })
+    for (const node of [...requestReceipt.nodes, ...durableReceipt.nodes]) expect(serialized).not.toContain(node.taskId)
+    expect(serialized).not.toContain("private-plan-call")
+    expect(serialized).not.toContain("request-task")
+    expect(serialized).not.toContain("durable-task")
+    expect(serialized.length).toBeLessThanOrEqual(1_200)
   })
 
   it("keeps the safe process diagnostics line without raw stdout or stderr", () => {
@@ -3012,9 +3100,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     turnQueueName = TURN_QUEUE_NAME
     childQueueName = subagentQueue.SUBAGENT_QUEUE_NAME
     const flags: ProductionAgentFlags = {
-      cognitiveLoopEnabled: false,
-      planningEnabled: true,
-      planningExecutionEnabled: true,
       taskGraphPlanningEnabled: true,
       childExecutionEnabled: true,
       coordinationEnabled: true,
@@ -4030,9 +4115,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     turnQueueName = TURN_QUEUE_NAME
     childQueueName = subagentQueue.SUBAGENT_QUEUE_NAME
     const flags: ProductionAgentFlags = {
-      cognitiveLoopEnabled: false,
-      planningEnabled: true,
-      planningExecutionEnabled: true,
       taskGraphPlanningEnabled: true,
       childExecutionEnabled: true,
       coordinationEnabled: true,

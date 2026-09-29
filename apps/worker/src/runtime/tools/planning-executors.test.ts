@@ -56,6 +56,31 @@ describe("agent.plan tool executor", () => {
     expect(commandPort.appendAndSchedule).not.toHaveBeenCalled()
   })
 
+  it("rejects contact and credential text in keys before scheduling", async () => {
+    const sensitiveKeys = [
+      "candidate@example.com",
+      "+1 (415) 555-0132",
+      "password=private-token-value",
+    ]
+
+    for (const key of sensitiveKeys) {
+      const { tool, commandPort } = setup()
+      const input = { ...proposal, nodes: [{ ...proposal.nodes[0], key }] }
+
+      await expect(tool.execute(context(), input)).rejects.toMatchObject({ code: "task_graph_sensitive_key_rejected" })
+      expect(commandPort.appendAndSchedule).not.toHaveBeenCalled()
+    }
+  })
+
+  it("accepts text-safe punctuation and Unicode in TaskGraph keys", async () => {
+    const { tool, getReceived } = setup()
+    const key = "source / résumé:💼"
+    const input = { ...proposal, nodes: [{ ...proposal.nodes[0], key }] }
+
+    await expect(tool.execute(context(), input)).resolves.toEqual(receipt)
+    expect(getReceived()?.proposal.nodes[0]?.key).toBe(key)
+  })
+
   it("publishes only registered template IDs and their allowed catalog details", () => {
     const { tool } = setup({
       analyst: {

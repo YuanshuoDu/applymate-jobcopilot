@@ -6,7 +6,7 @@ import {
 
 import type { ExecutionOwner } from "../execution-owner.js"
 import { MAX_TOOL_RESULT_BYTES, type ToolResultReferenceRepository } from "./tool-result-reference-types.js"
-import { prepareLifecycleValue, sanitizeLifecyclePreview, type ToolResultReferenceStore } from "./redaction.js"
+import { prepareLifecycleValue, prepareTaskGraphPlanReceipt, sanitizeLifecyclePreview, type ToolResultReferenceStore } from "./redaction.js"
 import { ToolExecutionError, type ToolLifecyclePayload } from "./types.js"
 
 export type ToolLifecyclePhase = "started" | "progress" | "completed" | "failed" | "cancelled"
@@ -139,11 +139,23 @@ export class ToolLifecycle {
   }
 
   private async persistCompletedOutput(call: LifecycleCall, output: unknown): Promise<unknown> {
-    const prepared = prepareLifecycleValue(output)
+    let prepared: ReturnType<typeof prepareLifecycleValue>
+    if (call.toolName === "agent.plan") {
+      try {
+        prepared = prepareTaskGraphPlanReceipt(output)
+      } catch {
+        throw new ToolExecutionError("task_graph_receipt_invalid", "TaskGraph receipt is invalid")
+      }
+    } else {
+      prepared = prepareLifecycleValue(output)
+    }
     if (prepared.sizeBytes > MAX_TOOL_RESULT_BYTES) {
       throw new ToolExecutionError("tool_result_too_large", "Tool result exceeds the 1 MiB limit")
     }
     if (prepared.sizeBytes <= this.maxEventBytes) return prepared.safe
+    if (call.toolName === "agent.plan") {
+      throw new ToolExecutionError("tool_result_too_large", "TaskGraph receipt exceeds the lifecycle event limit")
+    }
     if (!this.options.durableResults || !this.options.resolveOwner) {
       throw new ToolExecutionError("tool_result_storage_unavailable", "Durable tool result storage is unavailable")
     }

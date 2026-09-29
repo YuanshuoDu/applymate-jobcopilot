@@ -3,10 +3,20 @@ import { describe, expect, it, vi } from "vitest"
 
 import type { ExecutionOwner } from "../execution-owner.js"
 import { InMemoryToolLifecycleSink, ToolLifecycle, type LifecycleCall } from "./lifecycle.js"
-import { InMemoryToolResultReferenceStore } from "./redaction.js"
+import { InMemoryToolResultReferenceStore, prepareLifecycleValue } from "./redaction.js"
 import type { ToolResultReferenceRepository } from "./tool-result-reference-types.js"
 
 const call: LifecycleCall = { id: "call-1", toolName: "jobs.search", toolVersion: "1", sessionId: "session-1", turnId: "turn-1", stepId: "step-1" }
+const planCall: LifecycleCall = { ...call, toolName: "agent.plan" }
+const planReceipt = {
+  status: "accepted",
+  revision: 1,
+  nodes: [
+    { key: "source / résumé:💼", taskId: "subagent-12345678-1234-4abc-8def-123456789012", status: "queued" },
+    { key: "dependent-b", taskId: "subagent-87654321-4321-4abc-8def-210987654321", status: "waiting" },
+  ],
+  readyTaskIds: ["subagent-12345678-1234-4abc-8def-123456789012"],
+} as const
 const owner: ExecutionOwner = {
   kind: "turn", taskId: "root-1", lease: {
     turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 1,
@@ -69,5 +79,42 @@ describe("ToolLifecycle", () => {
     await expect(lifecycle.completed(call, { result: "x".repeat(9_000) })).rejects.toMatchObject({
       code: "tool_result_storage_unavailable",
     })
+  })
+
+  it("preserves bounded TaskGraph IDs and valid punctuation/Unicode keys in the receipt and lifecycle event", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    expect(prepareLifecycleValue(planReceipt).safe).not.toEqual(planReceipt)
+
+    const output = await lifecycle.completed(planCall, planReceipt)
+
+    expect(output).toEqual(planReceipt)
+    expect(sink.events).toHaveLength(1)
+    expect(sink.events[0]?.item).toMatchObject({ type: "tool_result", output: planReceipt })
+    expect(sink.events[0]?.payload.output).toEqual(planReceipt)
+  })
+
+  it("keeps generic phone and email redaction and rejects malformed TaskGraph receipts", async () => {
+    const ordinarySink = new InMemoryToolLifecycleSink()
+    const ordinaryLifecycle = new ToolLifecycle({ sink: ordinarySink })
+    const ordinary = await ordinaryLifecycle.completed(call, {
+      message: "Email candidate@example.com or call 202-555-0199",
+    })
+    expect(ordinary).toEqual({ message: "Email [REDACTED_EMAIL] or call [REDACTED_PHONE]" })
+
+    const malformedReceipts = [
+      { ...planReceipt, extra: "candidate@example.com" },
+      { ...planReceipt, nodes: [{ ...planReceipt.nodes[0], extra: "202-555-0199" }, planReceipt.nodes[1]] },
+      { ...planReceipt, readyTaskIds: ["subagent-00000000-0000-4000-8000-000000000000"] },
+      { ...planReceipt, nodes: [{ ...planReceipt.nodes[0], key: "candidate@example.com" }, planReceipt.nodes[1]] },
+      { ...planReceipt, nodes: [{ ...planReceipt.nodes[0], key: "+1 (415) 555-0132" }, planReceipt.nodes[1]] },
+      { ...planReceipt, nodes: [{ ...planReceipt.nodes[0], key: "password=private-token-value" }, planReceipt.nodes[1]] },
+    ]
+    for (const receipt of malformedReceipts) {
+      const sink = new InMemoryToolLifecycleSink()
+      const lifecycle = new ToolLifecycle({ sink })
+      await expect(lifecycle.completed(planCall, receipt)).rejects.toMatchObject({ code: "task_graph_receipt_invalid" })
+      expect(sink.events).toHaveLength(0)
+    }
   })
 })
