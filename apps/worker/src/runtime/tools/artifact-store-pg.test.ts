@@ -62,6 +62,21 @@ describe("PgArtifactToolStore immutable persistence", () => {
       .rejects.toMatchObject({ code: "task_fence_denied" })
     expect(pool.reviewReceipts.size).toBe(0)
   })
+
+  it("rejects a passed review when its selected-source digest changed", async () => {
+    const pool = new FakeArtifactPool()
+    const store = new PgArtifactToolStore(pool as unknown as Pool)
+    const base = await store.registerBase({ id: "base-a", type: "cover_letter", userId: scope.userId, jobId: scope.jobId, content: "base" })
+    const version = await store.writeDraft(scope, { baseArtifactId: base.id, baseHash: base.hash, content: "draft", constraints: {}, requestHash: hashArtifactContent("review draft") })
+
+    await expect(store.saveReview({
+      userId: scope.userId, sessionId: scope.sessionId, jobId: scope.jobId, artifactId: version.artifactId, version: 1,
+      contentHash: version.contentHash, sourceDigest: version.sourceDigest, currentSourceDigest: hashArtifactContent("changed source"),
+      status: "passed", findings: [], evidenceRefs: [...scope.evidenceRefs], taskId: scope.taskId, toolCallId: "review-call",
+      requestHash: hashArtifactContent("changed review"), reviewHash: hashArtifactContent("review result"), taskFence: scope.taskFence,
+    })).rejects.toMatchObject({ code: "stale_source" })
+    expect(pool.reviewReceipts.size).toBe(0)
+  })
 })
 
 type Row = Record<string, unknown>

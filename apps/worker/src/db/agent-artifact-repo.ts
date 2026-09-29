@@ -119,6 +119,14 @@ function assertReviewReplay(existing: AgentArtifactReviewRow, input: AgentArtifa
   return existing
 }
 
+function assertReviewSourceBinding(input: AgentArtifactReviewWrite): void {
+  const sourceChanged = input.sourceDigest !== input.currentSourceDigest
+  const staleDetails = input.status === "stale" && (!Array.isArray(input.findings) || input.findings.length > 0 || input.evidenceRefs.length > 0)
+  if (sourceChanged !== (input.status === "stale") || staleDetails) {
+    throw new AgentArtifactRepositoryError("stale_source", "Review status and findings must match the selected-source digest.")
+  }
+}
+
 export function createAgentArtifactRepository(pool: Pool) {
   return {
     async find(userId: string, artifactId: string): Promise<AgentArtifactRow | null> {
@@ -198,6 +206,7 @@ export function createAgentArtifactRepository(pool: Pool) {
 
     async saveReview(input: AgentArtifactReviewWrite): Promise<AgentArtifactReviewRow> {
       return withArtifactTransaction(pool, input.userId, async client => {
+        assertReviewSourceBinding(input)
         if (input.taskFence.taskId !== input.taskId || input.taskFence.userId !== input.userId || input.taskFence.sessionId !== input.sessionId) throw new AgentArtifactRepositoryError("task_fence_denied", "The selected-job artifact task fence does not match its receipt scope.")
         const earlyReceipt = await findTaskReview(client, input.taskId, input.toolCallId)
         if (earlyReceipt) return assertReviewReplay(earlyReceipt, input)
