@@ -14,6 +14,8 @@ const TASK_GRAPH_ITEM_KEYS = [
   'schemaVersion', 'id', 'sessionId', 'turnId', 'stepId', 'taskId', 'type', 'status', 'phase', 'revision',
   'content', 'startedAt', 'completedAt', 'createdAt', 'updatedAt',
 ] as const
+// Worker task IDs use root-${turnId} for leased roots and subagent-${randomUUID()} otherwise.
+const SUBAGENT_TASK_ID = /^subagent-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 
 type StreamItemIdentity = Readonly<{
   sessionId: string
@@ -35,7 +37,24 @@ export function redactStreamEventPayload(eventType: string, payload: unknown, id
 
   const snapshot = taskGraphSnapshotFromEvent(eventType, payload, identity)
   if (!snapshot || !isRecord(redacted) || !isRecord(redacted.item)) return redacted
-  return { ...redacted, item: { ...redacted.item, content: redactTaskGraphSnapshot(snapshot) } }
+  const item = (payload as Record<string, unknown>).item as Record<string, unknown>
+  const generatedTaskIds = isGeneratedRootTaskId(item.taskId, item.turnId)
+    && snapshot.nodes.every(node => SUBAGENT_TASK_ID.test(node.taskId))
+  // Noncanonical IDs may still be shown only when the ordinary redactor leaves them unchanged.
+  if (!generatedTaskIds && [item.taskId, ...snapshot.nodes.map(node => node.taskId)]
+    .some(taskId => typeof taskId !== 'string' || redactSensitiveText(taskId) !== taskId)) return redacted
+
+  return {
+    ...redacted,
+    item: {
+      ...redacted.item,
+      id: identity.itemId,
+      sessionId: identity.sessionId,
+      turnId: identity.turnId,
+      ...(generatedTaskIds ? { taskId: item.taskId } : {}),
+      content: redactTaskGraphSnapshot(snapshot, generatedTaskIds),
+    },
+  }
 }
 
 function taskGraphSnapshotFromEvent(eventType: string, payload: unknown, identity: StreamItemIdentity): TaskGraphSnapshot | null {
@@ -58,7 +77,7 @@ function taskGraphSnapshotFromEvent(eventType: string, payload: unknown, identit
   return node?.taskId === identity.taskId ? snapshot : null
 }
 
-function redactTaskGraphSnapshot(snapshot: TaskGraphSnapshot): Record<string, unknown> {
+function redactTaskGraphSnapshot(snapshot: TaskGraphSnapshot, preserveGeneratedTaskIds: boolean): Record<string, unknown> {
   return {
     schemaVersion: redactSensitiveText(TASK_GRAPH_SCHEMA_VERSION),
     nodes: snapshot.nodes.map(node => ({
@@ -68,9 +87,17 @@ function redactTaskGraphSnapshot(snapshot: TaskGraphSnapshot): Record<string, un
       successCriteria: node.successCriteria.map(redactSensitiveText),
       dependsOn: node.dependsOn.map(redactSensitiveText),
       depth: node.depth,
-      taskId: redactSensitiveText(node.taskId),
+      taskId: preserveGeneratedTaskIds ? node.taskId : redactSensitiveText(node.taskId),
     })),
   }
+}
+
+function isGeneratedRootTaskId(taskId: unknown, turnId: unknown): boolean {
+  const boundedTaskId = boundedText(taskId, TASK_GRAPH_MAX_IDENTIFIER_LENGTH)
+  const boundedTurnId = boundedText(turnId, TASK_GRAPH_MAX_IDENTIFIER_LENGTH)
+  if (boundedTaskId === null) return false
+  if (SUBAGENT_TASK_ID.test(boundedTaskId)) return true
+  return boundedTurnId !== null && boundedTaskId === `root-${boundedTurnId}`
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

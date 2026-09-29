@@ -1,5 +1,5 @@
 import { expect, test } from './fixtures'
-import type { Page, Route } from '@playwright/test'
+import type { Page, Response, Route } from '@playwright/test'
 import { readFileSync } from 'node:fs'
 import { parsePlanLedger, projectPlanLedger, type PlanLedger } from '@jobcopilot/agent-protocol'
 import { redactStreamEventPayload } from '../apps/web/src/lib/agent/session/stream-redaction'
@@ -103,6 +103,17 @@ type AcceptedTaskLookup = {
   sessionId: string
   taskIds: string[]
   identity: TaskGraphIdentity
+}
+
+type TaskLookupDiagnostic = {
+  mode: 'default' | 'live' | 'snapshot-tail'
+  session: 'trace' | 'other'
+  selectors: TaskGraphSelectorResult['kind']
+  revision: number | null
+  identityMatchesFinalTrace: boolean | null
+  taskIdCount: number
+  taskIdsMatchFinalTrace: boolean
+  outcome: 'pending' | 'task_list' | 'invalid_task_ids' | 'invalid_selectors' | 'missing_task_ids' | 'unversioned' | 'identity_or_task_ids_mismatch' | 'ledger_unavailable' | 'ledger_returned'
 }
 
 type TaskGraphSelectorResult =
@@ -272,6 +283,20 @@ function graphIdentity(graph: PersistedTaskGraphItem): TaskGraphIdentity {
     turnId: graph.turnId,
     rootTaskId: graph.taskId,
     revision: graph.revision,
+  }
+}
+
+function parseTaskGraphIdentity(value: unknown): TaskGraphIdentity | null {
+  const identity = record(value)
+  if (!identity || typeof identity.sessionId !== 'string' || typeof identity.graphItemId !== 'string'
+    || typeof identity.turnId !== 'string' || typeof identity.rootTaskId !== 'string'
+    || !Number.isSafeInteger(identity.revision)) return null
+  return {
+    sessionId: identity.sessionId,
+    graphItemId: identity.graphItemId,
+    turnId: identity.turnId,
+    rootTaskId: identity.rootTaskId,
+    revision: identity.revision as number,
   }
 }
 
@@ -455,9 +480,9 @@ async function installTaskGraphFixture(page: Page, persistedTrace: PersistedPlan
     expectedTaskIds,
     eventRequests: new Map<string, Array<string | null>>(),
     requestsByMode: new Map<string, Array<string | null>>(),
-    taskRequestsByMode: new Map<string, number>(),
     planLedgers: new Map<string, PlanLedgerResponse | null>(),
     acceptedTaskLookups: [] as AcceptedTaskLookup[],
+    taskLookupDiagnostics: [] as TaskLookupDiagnostic[],
     forbiddenApiRequests: [] as string[],
     externalRequests: [] as string[],
     setDeliveryMode(mode: 'live' | 'snapshot-tail') {
@@ -546,28 +571,44 @@ async function installTaskGraphFixture(page: Page, persistedTrace: PersistedPlan
         return json(route, { items, agenda: null, page: { hasMore: false, nextCursor: null } })
       }
       if (resource === 'tasks') {
-        const taskModeKey = `${deliveryMode}:${sessionId}`
         const requestedTaskIds = url.searchParams.getAll('taskId')
         const isTaskLookup = requestedTaskIds.length > 0
-        const taskRequestCount = fixture.taskRequestsByMode.get(taskModeKey) ?? 0
-        if (isTaskLookup) fixture.taskRequestsByMode.set(taskModeKey, taskRequestCount + 1)
         const selectors = parseTaskGraphSelectors(url, sessionId)
+        const diagnostic: TaskLookupDiagnostic = {
+          mode: deliveryMode,
+          session: sessionId === SESSION_A ? 'trace' : 'other',
+          selectors: selectors.kind,
+          revision: selectors.kind === 'complete' ? selectors.identity.revision : selectors.kind === 'legacy' ? selectors.revision : null,
+          identityMatchesFinalTrace: selectors.kind === 'complete' ? sameIdentity(selectors.identity, graphIdentity(persistedGraphItem)) : null,
+          taskIdCount: requestedTaskIds.length,
+          taskIdsMatchFinalTrace: sameTaskIdSet(requestedTaskIds, expectedTaskIds),
+          outcome: 'pending',
+        }
+        fixture.taskLookupDiagnostics.push(diagnostic)
+        if (fixture.taskLookupDiagnostics.length > 8) fixture.taskLookupDiagnostics.shift()
         const invalidTaskIds = requestedTaskIds.length > 9
           || new Set(requestedTaskIds).size !== requestedTaskIds.length
           || requestedTaskIds.some(taskId => taskId.length < 1 || taskId.length > 128 || taskId.trim() !== taskId)
         if (invalidTaskIds) {
+          diagnostic.outcome = 'invalid_task_ids'
           return json(route, { error: { code: 'invalid_task_ids', message: 'taskId values must be unique and bounded', details: {} } }, 400)
         }
         if (selectors.kind === 'invalid') {
+          diagnostic.outcome = 'invalid_selectors'
           return json(route, { error: { code: 'invalid_task_graph_identity', message: 'TaskGraph selectors must be supplied once as a complete set', details: {} } }, 400)
         }
         if (selectors.kind !== 'none' && !isTaskLookup) {
+          diagnostic.outcome = 'missing_task_ids'
           return json(route, { error: { code: 'task_graph_ids_required', message: 'TaskGraph lookup requires referenced task IDs', details: {} } }, 400)
         }
 
         const sessionTasks = tasksBySession.get(sessionId) ?? []
-        if (!isTaskLookup) return json(route, { tasks: sessionTasks, page: { hasMore: false, nextCursor: null } })
+        if (!isTaskLookup) {
+          diagnostic.outcome = 'task_list'
+          return json(route, { tasks: sessionTasks, page: { hasMore: false, nextCursor: null } })
+        }
         if (selectors.kind === 'none') {
+          diagnostic.outcome = 'unversioned'
           const tasks = sessionTasks.filter(task => requestedTaskIds.includes(task.id))
           return json(route, { tasks, page: { hasMore: false, nextCursor: null } })
         }
@@ -578,6 +619,7 @@ async function installTaskGraphFixture(page: Page, persistedTrace: PersistedPlan
           : graphCandidates.filter(candidate => sameIdentity(graphIdentity(candidate), selectors.identity))
         const graph = selectedGraphs.length === 1 ? selectedGraphs[0] : undefined
         if (!graph || !sameTaskIdSet(requestedTaskIds, graphTaskIds(graph))) {
+          diagnostic.outcome = 'identity_or_task_ids_mismatch'
           return json(route, { tasks: [], planLedger: null, page: { hasMore: false, nextCursor: null } })
         }
 
@@ -587,6 +629,7 @@ async function installTaskGraphFixture(page: Page, persistedTrace: PersistedPlan
         const planLedger: PlanLedgerResponse | null = projection
           ? { identity: graphIdentity(graph), projection }
           : null
+        diagnostic.outcome = planLedger ? 'ledger_returned' : 'ledger_unavailable'
         fixture.acceptedTaskLookups.push({ sessionId, taskIds: requestedTaskIds, identity: graphIdentity(graph) })
         fixture.planLedgers.set(`${sessionId}:${graph.revision}`, planLedger)
         return json(route, { tasks, planLedger, page: { hasMore: false, nextCursor: null } })
@@ -603,6 +646,67 @@ async function installTaskGraphFixture(page: Page, persistedTrace: PersistedPlan
   })
 
   return fixture
+}
+
+function isPlanLedgerResponseFor(response: Response, identity: TaskGraphIdentity): boolean {
+  const request = response.request()
+  if (request.method() !== 'GET') return false
+  const url = new URL(response.url())
+  const prefix = '/api/agent/sessions/'
+  const suffix = '/tasks'
+  if (!url.pathname.startsWith(prefix) || !url.pathname.endsWith(suffix)) return false
+  let sessionId: string
+  try {
+    sessionId = decodeURIComponent(url.pathname.slice(prefix.length, -suffix.length))
+  } catch {
+    return false
+  }
+  if (sessionId !== identity.sessionId) return false
+  const selectors = parseTaskGraphSelectors(url, sessionId)
+  return selectors.kind === 'complete' && sameIdentity(selectors.identity, identity)
+}
+
+function recentTaskLookupDiagnostics(
+  fixture: Awaited<ReturnType<typeof installTaskGraphFixture>>,
+  mode: 'default' | 'live' | 'snapshot-tail',
+): TaskLookupDiagnostic[] {
+  return fixture.taskLookupDiagnostics
+    .filter(lookup => lookup.mode === mode && lookup.session === 'trace')
+    .slice(-8)
+}
+
+async function waitForPlanLedgerResponse(
+  page: Page,
+  identity: TaskGraphIdentity,
+  fixture: Awaited<ReturnType<typeof installTaskGraphFixture>>,
+  mode: 'default' | 'live' | 'snapshot-tail',
+  label: string,
+): Promise<PlanLedgerResponse> {
+  let response: Response
+  try {
+    response = await page.waitForResponse(candidate => isPlanLedgerResponseFor(candidate, identity), { timeout: 10_000 })
+  } catch (error) {
+    const recentLookups = recentTaskLookupDiagnostics(fixture, mode)
+    const errorText = (error instanceof Error ? error.message : 'Unknown Playwright response wait error')
+      .replace(/https?:\/\/\S+|\/api\/agent\/\S+/gi, '[request]')
+      .slice(0, 240)
+    throw new Error(`${label}: no browser response for the expected session/revision ledger identity; recent sanitized lookups=${JSON.stringify(recentLookups)}; ${errorText}`)
+  }
+
+  if (response.status() !== 200) {
+    const recentLookups = recentTaskLookupDiagnostics(fixture, mode)
+    throw new Error(`${label}: matching task lookup returned HTTP ${response.status()}; recent sanitized lookups=${JSON.stringify(recentLookups)}`)
+  }
+  const body = record(await response.json())
+  const rawLedger = record(body?.planLedger)
+  const responseIdentity = parseTaskGraphIdentity(rawLedger?.identity)
+  const projection = parsePlanLedger(rawLedger?.projection)
+  if (!responseIdentity || !projection || !sameIdentity(responseIdentity, identity)
+    || projection.sessionId !== identity.sessionId || projection.revision !== identity.revision) {
+    const recentLookups = recentTaskLookupDiagnostics(fixture, mode)
+    throw new Error(`${label}: browser received the exact selector request but it did not return the expected session/revision ledger; recent sanitized lookups=${JSON.stringify(recentLookups)}`)
+  }
+  return { identity: responseIdentity, projection }
 }
 
 function jsonSse(route: Route, events: readonly PersistedGraphEvent[]) {
@@ -669,6 +773,8 @@ test('Plan Ledger restores the same persisted trace session after SSE reconnect 
   const persistedLedger = persistedTrace.planLedger
   const fixture = await installTaskGraphFixture(page, persistedTrace)
   const sessionA = fixture.sessionA, revision = fixture.planRevision
+  const expectedIdentity = graphIdentity(persistedTrace.graphItem)
+  const ledgerResponsePromise = waitForPlanLedgerResponse(page, expectedIdentity, fixture, 'default', 'persisted trace')
   await page.goto(`/agent-preview?supervisor=1&locale=en&sessionId=${sessionA}`)
 
   const plan = page.locator('[data-agent-task-graph-plan="true"]')
@@ -681,12 +787,12 @@ test('Plan Ledger restores the same persisted trace session after SSE reconnect 
   else await expect(plan.locator('[data-agent-task-graph-goal="true"]')).toHaveCount(0)
   for (const node of persistedLedger.nodes) await expect(plan).toContainText(node.goal)
   await expect(plan).not.toContainText(GOAL_B)
-  const interceptedResponse = fixture.planLedgers.get(`${sessionA}:${revision}`)
-  const expectedIdentity = graphIdentity(persistedTrace.graphItem)
+  const interceptedResponse = await ledgerResponsePromise
   expect(interceptedResponse).toEqual({ identity: expectedIdentity, projection: persistedLedger })
+  expect(fixture.planLedgers.get(`${sessionA}:${revision}`)).toEqual(interceptedResponse)
   expect(fixture.acceptedTaskLookups).toContainEqual({ sessionId: sessionA, taskIds: fixture.expectedTaskIds, identity: expectedIdentity })
-  const interceptedLedger = interceptedResponse?.projection ?? null
-  expect(interceptedLedger?.schemaVersion).toBe('agent-harness.v2.plan-ledger')
+  const interceptedLedger = interceptedResponse.projection
+  expect(interceptedLedger.schemaVersion).toBe('agent-harness.v2.plan-ledger')
   expect(parsePlanLedger(JSON.stringify(interceptedLedger))).toEqual(persistedLedger)
   const serializedLedger = JSON.stringify(interceptedResponse)
   for (const secret of ['taskId', 'jobId', 'score', 'url', 'evidenceIds', 'finalText', 'task-graph.result-projection', 'fixture-job-restart', 'p3-process-restart-source-result']) {
@@ -844,52 +950,55 @@ test('TaskGraph reconnect snapshot plus event tail matches the persisted trace p
   const fixture = await installTaskGraphFixture(page, persistedTrace)
   const sessionA = fixture.sessionA, revision = fixture.planRevision
   fixture.setDeliveryMode('live')
+  const initialIdentity = graphIdentity(persistedTrace.initialGraphItem)
+  const initialResponsePromise = waitForPlanLedgerResponse(page, initialIdentity, fixture, 'live', 'live initial snapshot')
   await page.goto(`/agent-preview?supervisor=1&locale=en&sessionId=${sessionA}`)
 
   const plan = page.locator('[data-agent-task-graph-plan="true"]')
   const sourcePreview = plan.locator('ol > li').first().locator('[data-task-graph-evidence="preview"]')
   await expect(plan).toBeVisible({ timeout: 20_000 })
-  await expect.poll(() => fixture.taskRequestsByMode.get(`live:${sessionA}`) ?? 0, { timeout: 10_000 }).toBe(1)
+  const initialResponse = await initialResponsePromise
   await expect(sourcePreview).toContainText(persistedLedger.nodes[0]!.evidencePreview!.summary)
-  const initialIdentity = graphIdentity(persistedTrace.initialGraphItem)
-  await expect.poll(() => fixture.planLedgers.has(`${sessionA}:${initialIdentity.revision}`)).toBe(true)
-  const initialResponse = fixture.planLedgers.get(`${sessionA}:${initialIdentity.revision}`)
-  expect(initialResponse?.identity).toEqual(initialIdentity)
-  expect(initialResponse?.projection.revision).toBe(initialIdentity.revision)
+  expect(initialResponse.identity).toEqual(initialIdentity)
+  expect(initialResponse.projection.revision).toBe(initialIdentity.revision)
+  expect(fixture.planLedgers.get(`${sessionA}:${initialIdentity.revision}`)).toEqual(initialResponse)
   expect(fixture.acceptedTaskLookups).toContainEqual({
     sessionId: sessionA,
     taskIds: graphTaskIds(persistedTrace.initialGraphItem),
     identity: initialIdentity,
   })
+  const liveIdentity = graphIdentity(persistedTrace.graphItem)
+  const liveResponsePromise = waitForPlanLedgerResponse(page, liveIdentity, fixture, 'live', 'live event-tail ledger')
   fixture.releaseLiveDelta()
   await expect(plan).toHaveAttribute('data-agent-task-graph-revision', String(revision))
   await expect.poll(() => fixture.requestsByMode.get(`live:${sessionA}`)?.length ?? 0, { timeout: 10_000 }).toBeGreaterThanOrEqual(2)
-  await expect.poll(() => fixture.taskRequestsByMode.get(`live:${sessionA}`) ?? 0, { timeout: 10_000 }).toBeGreaterThanOrEqual(2)
-  const liveLedger = fixture.planLedgers.get(`${sessionA}:${revision}`)
-  expect(liveLedger).toEqual({ identity: graphIdentity(persistedTrace.graphItem), projection: persistedLedger })
+  const liveLedger = await liveResponsePromise
+  expect(liveLedger).toEqual({ identity: liveIdentity, projection: persistedLedger })
+  expect(fixture.planLedgers.get(`${sessionA}:${revision}`)).toEqual(liveLedger)
   await expect(sourcePreview).toContainText(persistedLedger.nodes[0]!.evidencePreview!.summary)
   const liveProjection = await readTaskGraphProjection(plan)
   expect(liveProjection.evidence[0]).toContain(persistedLedger.nodes[0]!.evidencePreview!.summary)
   expect(fixture.requestsByMode.get(`live:${sessionA}`)?.slice(0, 2)).toEqual([null, persistedTrace.graphEvents.at(-1)!.sequence])
 
   fixture.setDeliveryMode('snapshot-tail')
+  const snapshotInitialResponsePromise = waitForPlanLedgerResponse(page, initialIdentity, fixture, 'snapshot-tail', 'snapshot initial response')
   await page.reload()
   await expect(plan).toBeVisible({ timeout: 20_000 })
-  await expect.poll(() => fixture.taskRequestsByMode.get(`snapshot-tail:${sessionA}`) ?? 0, { timeout: 10_000 }).toBe(1)
+  const snapshotInitialResponse = await snapshotInitialResponsePromise
   await expect(sourcePreview).toContainText(persistedLedger.nodes[0]!.evidencePreview!.summary)
-  await expect.poll(() => fixture.planLedgers.has(`${sessionA}:${initialIdentity.revision}`)).toBe(true)
-  const snapshotInitialResponse = fixture.planLedgers.get(`${sessionA}:${initialIdentity.revision}`)
   expect(snapshotInitialResponse?.identity).toEqual(initialIdentity)
+  expect(fixture.planLedgers.get(`${sessionA}:${initialIdentity.revision}`)).toEqual(snapshotInitialResponse)
   fixture.releaseSnapshotClose()
   await expect.poll(() => fixture.requestsByMode.get(`snapshot-tail:${sessionA}`)?.length ?? 0, { timeout: 10_000 }).toBeGreaterThanOrEqual(2)
-  expect(fixture.taskRequestsByMode.get(`snapshot-tail:${sessionA}`)).toBe(1)
   await expect(sourcePreview).toContainText(persistedLedger.nodes[0]!.evidencePreview!.summary)
+  const resumedIdentity = graphIdentity(persistedTrace.graphItem)
+  const resumedResponsePromise = waitForPlanLedgerResponse(page, resumedIdentity, fixture, 'snapshot-tail', 'resumed event-tail ledger')
   fixture.releaseSnapshotTail()
   await expect(plan).toHaveAttribute('data-agent-task-graph-revision', String(revision))
   await expect.poll(() => fixture.requestsByMode.get(`snapshot-tail:${sessionA}`)?.length ?? 0, { timeout: 10_000 }).toBeGreaterThanOrEqual(3)
-  await expect.poll(() => fixture.taskRequestsByMode.get(`snapshot-tail:${sessionA}`) ?? 0, { timeout: 10_000 }).toBeGreaterThanOrEqual(3)
-  const resumedLedger = fixture.planLedgers.get(`${sessionA}:${revision}`)
-  expect(resumedLedger).toEqual({ identity: graphIdentity(persistedTrace.graphItem), projection: persistedLedger })
+  const resumedLedger = await resumedResponsePromise
+  expect(resumedLedger).toEqual({ identity: resumedIdentity, projection: persistedLedger })
+  expect(fixture.planLedgers.get(`${sessionA}:${revision}`)).toEqual(resumedLedger)
   await expect(sourcePreview).toContainText(persistedLedger.nodes[0]!.evidencePreview!.summary)
   const resumedProjection = await readTaskGraphProjection(plan)
 
