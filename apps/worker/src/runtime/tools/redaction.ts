@@ -48,11 +48,13 @@ const PLAN_NODE_FIELDS = ["key", "taskId", "status"] as const
 const SUBAGENT_TASK_ID = /^subagent-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const MAX_TASK_GRAPH_NODES = 8
 const MAX_TASK_GRAPH_KEY_LENGTH = 128
+const SPAWN_RECEIPT_FIELDS = ["taskId", "rootTaskId", "parentTaskId", "path", "depth", "status", "replay"] as const
+const SPAWN_STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
+const MAX_SUBAGENT_DEPTH = 8
 
 /**
- * TaskGraph receipts are the one lifecycle result whose structural IDs must
- * survive text redaction: the model uses them to wait on the durable tasks.
- * Rebuild the exact receipt shape before returning it so no arbitrary fields
+ * TaskGraph and spawn receipts preserve generated structural IDs used by
+ * later tool calls. Rebuild each exact receipt shape so arbitrary fields never
  * bypass the generic redactor.
  */
 export function prepareTaskGraphPlanReceipt(value: unknown): PreparedLifecycleValue {
@@ -94,6 +96,42 @@ export function prepareTaskGraphPlanReceipt(value: unknown): PreparedLifecycleVa
   })
 }
 
+/**
+ * Keeps only the runtime-generated lineage needed to wait for a spawned task.
+ * The receipt must match the exact tool schema and the caller's trusted task
+ * context before any identifier bypasses the generic phone redactor.
+ */
+export function prepareSubagentSpawnReceipt(
+  value: unknown,
+  identity: { readonly turnId: string; readonly taskId?: string; readonly rootTaskId?: string },
+): PreparedLifecycleValue {
+  const receipt = exactObject(value, SPAWN_RECEIPT_FIELDS, invalidSpawnReceipt)
+  const { taskId, rootTaskId, parentTaskId, path, depth, status, replay } = receipt
+  if (typeof identity.turnId !== "string" || !identity.turnId.trim() || identity.turnId.length > 256
+    || (identity.taskId !== undefined && !isGeneratedTaskId(identity.taskId, identity.turnId))
+    || (identity.rootTaskId !== undefined && !isGeneratedRootTaskId(identity.rootTaskId, identity.turnId))) throw invalidSpawnReceipt()
+  if (!isSubagentTaskId(taskId)
+    || typeof rootTaskId !== "string" || !isGeneratedRootTaskId(rootTaskId, identity.turnId)
+    || (parentTaskId !== null && (typeof parentTaskId !== "string" || !isGeneratedTaskId(parentTaskId, identity.turnId)))
+    || typeof path !== "string" || path.length === 0 || path.length > 2_048
+    || typeof depth !== "number" || !Number.isSafeInteger(depth) || depth < 0 || depth > MAX_SUBAGENT_DEPTH
+    || typeof status !== "string" || !SPAWN_STATUSES.has(status) || typeof replay !== "boolean") throw invalidSpawnReceipt()
+
+  const ownRoot = parentTaskId === null
+  if (parentTaskId !== (identity.taskId ?? null)
+    || (identity.rootTaskId !== undefined ? rootTaskId !== identity.rootTaskId : !ownRoot || rootTaskId !== taskId)
+    || (ownRoot ? depth !== 0 || taskId !== rootTaskId : depth === 0)) throw invalidSpawnReceipt()
+
+  const segments = path.startsWith("/") ? path.slice(1).split("/") : []
+  if (segments.length !== depth + 1 || segments.some(segment => !segment)
+    || segments[0] !== rootTaskId || segments.at(-1) !== taskId
+    || (segments.length > 1 && segments.at(-2) !== parentTaskId)
+    || (segments.length > 1 && segments.slice(1).some(segment => !isSubagentTaskId(segment)))
+    || path !== `/${segments.join("/")}`) throw invalidSpawnReceipt()
+
+  return prepareSafeValue({ taskId, rootTaskId, parentTaskId, path, depth, status, replay })
+}
+
 export function sanitizeLifecyclePreview(value: unknown, maxBytes = DEFAULT_MAX_LIFECYCLE_BYTES): RepositoryJsonValue {
   const prepared = prepareLifecycleValue(value)
   if (prepared.sizeBytes <= maxBytes) return prepared.safe
@@ -123,15 +161,15 @@ function prepareSafeValue(safe: RepositoryJsonValue): PreparedLifecycleValue {
   }
 }
 
-function exactObject(value: unknown, fields: readonly string[]): Record<string, unknown> {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) throw invalidPlanReceipt()
+function exactObject(value: unknown, fields: readonly string[], invalid = invalidPlanReceipt): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) throw invalid()
   const prototype = Object.getPrototypeOf(value)
-  if (prototype !== Object.prototype && prototype !== null) throw invalidPlanReceipt()
+  if (prototype !== Object.prototype && prototype !== null) throw invalid()
   const keys = Reflect.ownKeys(value)
-  if (keys.length !== fields.length || keys.some(key => typeof key !== "string" || !fields.includes(key))) throw invalidPlanReceipt()
+  if (keys.length !== fields.length || keys.some(key => typeof key !== "string" || !fields.includes(key))) throw invalid()
   for (const field of fields) {
     const descriptor = Object.getOwnPropertyDescriptor(value, field)
-    if (!descriptor?.enumerable || !("value" in descriptor)) throw invalidPlanReceipt()
+    if (!descriptor?.enumerable || !("value" in descriptor)) throw invalid()
   }
   return value as Record<string, unknown>
 }
@@ -147,6 +185,22 @@ function denseArray(value: unknown, minLength: number, maxLength: number): unkno
     if (!descriptor?.enumerable || !("value" in descriptor)) throw invalidPlanReceipt()
   }
   return value
+}
+
+function isSubagentTaskId(value: unknown): value is string {
+  return typeof value === "string" && SUBAGENT_TASK_ID.test(value)
+}
+
+function isGeneratedRootTaskId(value: unknown, turnId: string): value is string {
+  return isSubagentTaskId(value) || value === `root-${turnId}`
+}
+
+function isGeneratedTaskId(value: unknown, turnId: string): value is string {
+  return isGeneratedRootTaskId(value, turnId)
+}
+
+function invalidSpawnReceipt(): Error {
+  return new Error("subagent_spawn_receipt_invalid")
 }
 
 function invalidPlanReceipt(): Error {

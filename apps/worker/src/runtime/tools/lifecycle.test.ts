@@ -17,6 +17,17 @@ const planReceipt = {
   ],
   readyTaskIds: ["subagent-12345678-1234-4abc-8def-123456789012"],
 } as const
+const spawnTurnId = "c123456789012345678901234"
+const spawnRootTaskId = `root-${spawnTurnId}`
+const spawnTaskId = "subagent-0e34de21-c5e7-4db7-8e75-904732813337"
+const spawnCall: LifecycleCall = {
+  ...call, id: "call-spawn", toolName: "agent.spawn", turnId: spawnTurnId,
+  taskId: spawnRootTaskId, rootTaskId: spawnRootTaskId,
+}
+const spawnReceipt = {
+  taskId: spawnTaskId, rootTaskId: spawnRootTaskId, parentTaskId: spawnRootTaskId,
+  path: `/${spawnRootTaskId}/${spawnTaskId}`, depth: 1, status: "queued", replay: false,
+} as const
 const owner: ExecutionOwner = {
   kind: "turn", taskId: "root-1", lease: {
     turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 1,
@@ -92,6 +103,36 @@ describe("ToolLifecycle", () => {
     expect(sink.events).toHaveLength(1)
     expect(sink.events[0]?.item).toMatchObject({ type: "tool_result", output: planReceipt })
     expect(sink.events[0]?.payload.output).toEqual(planReceipt)
+  })
+
+  it("returns phone-like generated spawn IDs intact for the following agent.wait call", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+    expect(prepareLifecycleValue(spawnReceipt).safe).not.toEqual(spawnReceipt)
+
+    const output = await lifecycle.completed(spawnCall, spawnReceipt) as typeof spawnReceipt
+    const followingWaitInput = { taskIds: [output.taskId] }
+
+    expect(output).toEqual(spawnReceipt)
+    expect(followingWaitInput).toEqual({ taskIds: [spawnTaskId] })
+    expect(sink.events[0]?.item).toMatchObject({ type: "tool_result", output: spawnReceipt })
+    expect(sink.events[0]?.payload.output).toEqual(spawnReceipt)
+  })
+
+  it("preserves the legacy spawn_subagent alias through lifecycle redaction", async () => {
+    const lifecycle = new ToolLifecycle({ sink: new InMemoryToolLifecycleSink() })
+    const output = await lifecycle.completed({ ...spawnCall, id: "call-spawn-alias", toolName: "spawn_subagent" }, spawnReceipt)
+    expect(output).toEqual(spawnReceipt)
+  })
+
+  it("fails closed for malformed or extra-field agent.spawn receipts", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+
+    await expect(lifecycle.completed(spawnCall, { ...spawnReceipt, email: "candidate@example.com" })).rejects.toMatchObject({
+      code: "subagent_spawn_receipt_invalid",
+    })
+    expect(sink.events).toHaveLength(0)
   })
 
   it("keeps generic phone and email redaction and rejects malformed TaskGraph receipts", async () => {
