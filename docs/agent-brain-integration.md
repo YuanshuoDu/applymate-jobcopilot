@@ -71,7 +71,7 @@ The CI disposable PostgreSQL/RLS test runs under a dedicated non-owner role with
 
 ## Evidence map: #497 / #515 / PR #520 to #522
 
-The selected-job feature baseline began at `8a1098fd`; this evidence map was refreshed on 2026-09-30. The vertical path combines the canonical execution and supervision foundation (#497), durable model-authored TaskGraph planning (issue #515 / PR #520), and selected-job preparation (#522). As checked on 2026-09-30, PR #497 is OPEN with review required; PR #520 is OPEN with all listed checks successful and approval pending; issue #522 is OPEN with Draft PR #523 at `5dc886f0`, based on #520 head `5b07f2dd`.
+The selected-job feature baseline began at `8a1098fd`; this evidence map was refreshed on 2026-09-30. The vertical path combines the canonical execution and supervision foundation (#497), durable model-authored TaskGraph planning (issue #515 / PR #520), and selected-job preparation (#522). As checked on 2026-09-30, PR #497 is OPEN with review required; PR #520 is OPEN with all listed checks successful and approval pending; issue #522 is OPEN with Draft PR #523 stacked on #520 head `5b07f2dd`, including the Stop-during-selection repair at `1a0683d3`.
 
 | Path | Repository evidence | What it establishes |
 |---|---|---|
