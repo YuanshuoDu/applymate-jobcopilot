@@ -1,4 +1,4 @@
-import { validateRoleResult, type AnalystResult, type RoleEvidence, type ScoutResult, type StructuredRoleResult } from "./role-results.js"
+import { validateRoleResult, type AnalystResult, type RoleEvidence, type ScoutResult } from "./role-results.js"
 import { MIGRATED_ROLES, type MigratedRole } from "./scout-analyst-contracts.js"
 
 export type RoleExecutionOutcome = {
@@ -9,11 +9,13 @@ export type RoleExecutionOutcome = {
   readonly failureReason?: string
 }
 
+type MigratedRoleResult = ScoutResult | AnalystResult
+
 export type ScoutAnalystAggregate = {
   readonly status: "completed" | "partial" | "failed"
   readonly successfulRoles: readonly MigratedRole[]
   readonly failedRoles: readonly MigratedRole[]
-  readonly results: Readonly<Partial<Record<MigratedRole, StructuredRoleResult>>>
+  readonly results: Readonly<Partial<Record<MigratedRole, MigratedRoleResult>>>
   readonly evidence: readonly RoleEvidence[]
   readonly jobIds: readonly string[]
   readonly failures: readonly { readonly role: MigratedRole; readonly taskId: string; readonly reason: string }[]
@@ -30,7 +32,7 @@ export function reduceScoutAnalystOutcomes(outcomes: readonly RoleExecutionOutco
     }
   }
 
-  const results: Partial<Record<MigratedRole, StructuredRoleResult>> = {}
+  const results: Partial<Record<MigratedRole, MigratedRoleResult>> = {}
   const failures: Array<{ role: MigratedRole; taskId: string; reason: string }> = []
 
   // Duplicate role rule: the last occurrence in the supplied sequence wins. The
@@ -66,7 +68,7 @@ export function reduceScoutAnalystOutcomes(outcomes: readonly RoleExecutionOutco
 }
 
 function reduceOutcome(role: MigratedRole, outcome: RoleExecutionOutcome): {
-  readonly result?: StructuredRoleResult
+  readonly result?: MigratedRoleResult
   readonly failure?: { readonly role: MigratedRole; readonly taskId: string; readonly reason: string }
 } {
   try {
@@ -112,7 +114,7 @@ function uniqueEvidence(evidence: readonly RoleEvidence[]): RoleEvidence[] {
   return unique
 }
 
-function conflictingEvidenceRoles(results: Partial<Record<MigratedRole, StructuredRoleResult>>): Set<MigratedRole> {
+function conflictingEvidenceRoles(results: Partial<Record<MigratedRole, MigratedRoleResult>>): Set<MigratedRole> {
   const byId = new Map<string, { readonly evidence: RoleEvidence; readonly roles: Set<MigratedRole> }>()
   const conflictingIds = new Set<string>()
   for (const role of MIGRATED_ROLES) {
@@ -152,6 +154,6 @@ function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0
 }
 
-function resultJobIds(result: StructuredRoleResult): readonly string[] {
-  return result.role === "scout" ? (result as ScoutResult).candidates.map(item => item.jobId) : (result as AnalystResult).findings.map(item => item.jobId)
+function resultJobIds(result: MigratedRoleResult): readonly string[] {
+  return result.role === "scout" ? result.candidates.map(item => item.jobId) : result.findings.map(item => item.jobId)
 }

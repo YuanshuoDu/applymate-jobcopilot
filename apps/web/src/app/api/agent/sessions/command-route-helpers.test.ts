@@ -17,6 +17,29 @@ describe("agent command route boundaries", () => {
     expect(parsed).toMatchObject({ content: [{ type: "text", text: "Find Dublin jobs" }] })
   })
 
+  it("parses selected-job preparation as a typed follow-up scope, separate from model content", () => {
+    const parsed = parseMessageBody({
+      clientMessageId: "prepare_1",
+      delivery: "follow_up",
+      selectedJobPreparation: { jobId: "job_1" },
+      content: [{ type: "text", text: "Prepare a cover letter draft for the selected job." }],
+    }, request({}), "session_1")
+
+    expect(parsed).toMatchObject({ selectedJobPreparation: { jobId: "job_1" }, delivery: "follow_up" })
+    expect((parsed as { content: Array<{ text?: string }> }).content[0]?.text).not.toContain("job_1")
+  })
+
+  it("rejects malformed selected-job scope and steer delivery", async () => {
+    for (const body of [
+      { clientMessageId: "prepare_bad", delivery: "follow_up", selectedJobPreparation: { jobId: "job_1", userId: "other" }, content: [{ type: "text", text: "Prepare" }] },
+      { clientMessageId: "prepare_steer", delivery: "steer", selectedJobPreparation: { jobId: "job_1" }, content: [{ type: "text", text: "Prepare" }] },
+    ]) {
+      const parsed = parseMessageBody(body, request({}), "session_1")
+      expect(parsed).toBeInstanceOf(Response)
+      await expect((parsed as Response).json()).resolves.toMatchObject({ error: { code: "invalid_command" } })
+    }
+  })
+
   it("accepts an explicit null expected turn and rejects unknown content fields", async () => {
     const parsed = parseMessageBody({ clientMessageId: "client_1", expectedTurnId: null, content: [{ type: "text", text: "Start", extra: true }] }, request({}), "session_1")
     expect(parsed).toBeInstanceOf(Response)

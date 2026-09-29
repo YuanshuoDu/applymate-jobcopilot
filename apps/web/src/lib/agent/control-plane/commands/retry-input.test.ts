@@ -23,6 +23,17 @@ describe('persisted retry input', () => {
     expect(isRetryableTurnStatus('completed')).toBe(false)
   })
 
+  it('preserves the typed selected-job context when retrying a failed preparation Turn', () => {
+    const result = parsePersistedRetryContent('turn-2', {
+      goal: 'Prepare a cover letter draft for the selected job',
+      clientMessageId: 'message-2',
+      content: [{ type: 'text', text: 'Prepare a cover letter draft for the selected job.' }],
+      selectedJobPreparation: { jobId: 'job_1' },
+    })
+
+    expect(result.selectedJobPreparation).toEqual({ jobId: 'job_1' })
+  })
+
   it('rejects extra fields, empty text, and unsupported persisted content parts', () => {
     expect(() => parsePersistedRetryContent('turn-1', {
       goal: 'Retry', content: [{ type: 'text', text: 'Retry', secret: 'unexpected' }],

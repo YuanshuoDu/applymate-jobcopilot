@@ -59,11 +59,11 @@ export function createPostgresReadToolDataSource(pool: pg.Pool): ReadToolDataSou
 
     async retrievePersona(userId: string, input: PersonaRetrieveInput): Promise<{ facts: PersonaFactRecord[] }> {
       const result = await pool.query<PersonaRow>(
-        `SELECT "id", "key", "category", "value", "source", "source_ref" AS "sourceRef", "confidence", "allowed_uses" AS "allowedUses"
+        `SELECT "id", "key", "category", "value", "source", "source_ref" AS "sourceRef", "confidence", "allowedUses"
          FROM persona_facts
          WHERE "userId" = $1 AND "status" = 'confirmed' AND ("expires_at" IS NULL OR "expires_at" > NOW())
            AND ($2::text[] IS NULL OR "key" = ANY($2::text[]))
-           AND ($3::text IS NULL OR $3 = ANY("allowed_uses"))
+           AND ($3::text IS NULL OR $3 = ANY("allowedUses"))
          ORDER BY "updated_at" DESC LIMIT 50`,
         [userId, input.keys?.length ? input.keys : null, input.useCase ?? null],
       )

@@ -1,8 +1,9 @@
 import { Buffer } from "node:buffer"
-import { validateRoleResult, type AnalystResult, type ScoutResult, type StructuredRoleResult } from "./role-results.js"
+import { validateRoleResult, type AnalystResult, type ReviewerResult, type ScoutResult, type StructuredRoleResult, type WriterResult } from "./role-results.js"
 import {
   TASK_GRAPH_RESULT_PROJECTION_SCHEMA,
   type TaskGraphAnalystProjectionItem,
+  type TaskGraphArtifactProjectionReference,
   type TaskGraphProjectionEvidenceKind,
   type TaskGraphProjectionSource,
   type TaskGraphResultProjection,
@@ -31,7 +32,7 @@ type CompletedResultEnvelope = Readonly<{ structuredResult: unknown }>
  * URLs, evidence IDs, refs, or execution metadata.
  */
 export function projectTaskGraphResult(role: string, taskStatus: string, value: unknown): TaskGraphResultProjection {
-  if (taskStatus !== "completed" || (role !== "scout" && role !== "analyst")) return UNAVAILABLE
+  if (taskStatus !== "completed" || !isProjectedRole(role)) return UNAVAILABLE
   try {
     const envelope = parseCompletedEnvelope(value)
     const result = validateRoleResult(envelope.structuredResult, role)
@@ -43,7 +44,9 @@ export function projectTaskGraphResult(role: string, taskStatus: string, value: 
 
 export function projectValidatedRoleResult(value: StructuredRoleResult): TaskGraphResultProjection {
   try {
-    const projection = value.role === "scout" ? projectScout(value) : projectAnalyst(value)
+    const projection = value.role === "scout" ? projectScout(value)
+      : value.role === "analyst" ? projectAnalyst(value)
+        : value.role === "writer" ? projectWriter(value) : projectReviewer(value)
     return encodedBytes(projection) <= TASK_GRAPH_RESULT_PROJECTION_NODE_BYTE_LIMIT ? projection : UNAVAILABLE
   } catch {
     return UNAVAILABLE
@@ -52,7 +55,9 @@ export function projectValidatedRoleResult(value: StructuredRoleResult): TaskGra
 
 export function taskGraphResultProjectionItemCount(value: TaskGraphResultProjection): number {
   if (value.availability !== "available") return 0
-  return value.role === "scout" ? value.candidates.length : value.findings.length
+  if (value.role === "scout") return value.candidates.length
+  if (value.role === "analyst") return value.findings.length
+  return 1
 }
 
 export function taskGraphResultProjectionBytes(value: TaskGraphResultProjection): number {
@@ -93,7 +98,31 @@ function projectAnalyst(value: AnalystResult): Extract<TaskGraphResultProjection
   }
 }
 
-function linkedEvidenceKinds(ids: readonly string[], result: StructuredRoleResult): TaskGraphProjectionEvidenceKind[] {
+function projectWriter(value: WriterResult): Extract<TaskGraphResultProjection, { availability: "available"; role: "writer" }> {
+  return {
+    schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available",
+    role: "writer", status: "completed", artifactRef: projectArtifactReference(value.artifactRef),
+  }
+}
+
+function projectReviewer(value: ReviewerResult): Extract<TaskGraphResultProjection, { availability: "available"; role: "reviewer" }> {
+  return {
+    schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available",
+    role: "reviewer", status: "completed", artifactRef: projectArtifactReference(value.artifactRef),
+    reviewStatus: value.reviewStatus, reviewHash: value.reviewHash,
+  }
+}
+
+function projectArtifactReference(value: WriterResult["artifactRef"]): TaskGraphArtifactProjectionReference {
+  if (!SAFE_JOB_ID.test(value.artifactId)) throw new Error("task_graph_result_projection_artifact_id_invalid")
+  return { artifactId: value.artifactId, version: value.version, contentHash: value.contentHash, sourceDigest: value.sourceDigest }
+}
+
+function isProjectedRole(value: string): value is StructuredRoleResult["role"] {
+  return value === "scout" || value === "analyst" || value === "writer" || value === "reviewer"
+}
+
+function linkedEvidenceKinds(ids: readonly string[], result: ScoutResult | AnalystResult): TaskGraphProjectionEvidenceKind[] {
   const evidenceById = new Map(result.evidence.map(item => [item.id, item.kind] as const))
   const kinds = new Set<TaskGraphProjectionEvidenceKind>()
   for (const id of ids) {

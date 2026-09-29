@@ -133,6 +133,32 @@ describe("agent query DTO redaction", () => {
     }).content).toEqual({ toolCallId: "call_1", toolName: "jobs.search", inputAvailable: true })
   })
 
+  it("projects only an immutable artifact reference from the persisted result envelope", () => {
+    const ref = { artifactId: "draft-1", version: 2, contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: `sha256:${"b".repeat(64)}` }
+    const dto = taskDto({
+      id: "writer-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", path: "0",
+      role: "writer", taskType: "cover_letter_draft", status: "completed", goal: "Prepare selected job", confidence: 1,
+      failureReason: null, result: {
+        status: "completed", stepCount: 2, toolCallCount: 1, finalItemId: "writer-final",
+        finalText: "{\"schemaVersion\":\"agent-role-result.v1\",\"role\":\"writer\",\"status\":\"completed\"}",
+        structuredResult: { schemaVersion: "agent-role-result.v1", role: "writer", status: "completed", artifactRef: ref },
+        content: "PRIVATE_DRAFT_BODY",
+      }, createdAt: date, updatedAt: date,
+    })
+    expect(dto.artifactRef).toEqual(ref)
+    expect(JSON.stringify(dto)).not.toContain("PRIVATE_DRAFT_BODY")
+    expect(taskDto({
+      id: "legacy-writer", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", path: "1",
+      role: "writer", taskType: "cover_letter_draft", status: "completed", goal: "Prepare selected job", confidence: 1,
+      failureReason: null, result: { artifactRef: ref, content: "PRIVATE_DRAFT_BODY" }, createdAt: date, updatedAt: date,
+    }).artifactRef).toEqual(ref)
+    expect(taskDto({
+      id: "writer-2", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", path: "1",
+      role: "writer", taskType: "cover_letter_draft", status: "completed", goal: "Prepare selected job", confidence: 1,
+      failureReason: null, result: { artifactRef: { ...ref, userId: "foreign-user" } }, createdAt: date, updatedAt: date,
+    })).not.toHaveProperty("artifactRef")
+  })
+
   it("keeps user-visible text and attachment metadata but drops unknown parts", () => {
     expect(itemDto({
       id: "item_2", sessionId: "session_1", turnId: "turn_1", stepId: null, taskId: null, type: "user_message", status: "accepted", phase: "input", revision: 1,

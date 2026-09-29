@@ -1,6 +1,7 @@
 export type AgentCommandErrorCode =
   | "agent_session_not_found"
   | "active_turn_changed"
+  | "selected_job_turn_active"
   | "turn_wait_requires_dedicated_action"
   | "execution_changed"
   | "automation_cannot_steer_user_turn"

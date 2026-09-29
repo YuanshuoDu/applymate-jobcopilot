@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer"
 
-import { validateRoleResult, type RoleEvidence, type StructuredRoleResult } from "./role-results.js"
+import { parseArtifactReference, ROLE_RESULT_SCHEMA, validateRoleResult, type ArtifactVersionReference, type RoleEvidence, type StructuredRole, type StructuredRoleResult } from "./role-results.js"
 import type { ContextSeedBlock } from "../context/step-context-builder.js"
 
 const MAX_EVIDENCE_BYTES = 8 * 1024
@@ -8,12 +8,14 @@ const MAX_EVIDENCE_ENTRIES = 50
 const MAX_EVIDENCE_FIELD_LENGTH = 256
 const MAX_RESTORED_OBSERVATIONS = 256
 const RESTORED_TOOL_KEYS = ["toolCallId", "toolName", "input", "status", "output", "errorCode"] as const
-const RESTORED_READ_TOOLS = new Set(["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base", "application.get_state", "tool_results.read"])
+const RESTORED_READ_TOOLS = new Set(["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base", "application.get_state", "tool_results.read", "cover_letter.draft", "artifact.version.read", "artifact.review"])
 type ObservedEvidenceKind = "job" | "persona" | "resume"
 
 export type ObservedEvidenceIndex = {
   readonly entries: Map<string, RoleEvidence>
   readonly conflicts: Set<string>
+  readonly artifactResults: Map<string, StructuredRoleResult>
+  readonly artifactReads: Set<string>
 }
 
 function plainRecord(value: unknown): Record<string, unknown> | undefined {
@@ -34,7 +36,7 @@ function boundedText(value: unknown): string | undefined {
 
 function evidenceKey(kind: string, ref: string): string { return `${kind}\u0000${ref}` }
 
-export function createObservedEvidenceIndex(): ObservedEvidenceIndex { return { entries: new Map(), conflicts: new Set() } }
+export function createObservedEvidenceIndex(): ObservedEvidenceIndex { return { entries: new Map(), conflicts: new Set(), artifactResults: new Map(), artifactReads: new Set() } }
 
 function plainJson(value: unknown, seen = new Set<object>(), depth = 0): boolean {
   if (value === null || typeof value === "string" || typeof value === "boolean") return true
@@ -94,6 +96,24 @@ export function recordReadToolOutput(index: ObservedEvidenceIndex, toolName: str
   try {
     const value = plainRecord(output)
     if (!value) return
+    if (toolName === "cover_letter.draft") {
+      recordArtifactToolResult(index, {
+        schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef: value.artifactRef,
+      })
+      return
+    }
+    if (toolName === "artifact.review") {
+      recordArtifactToolResult(index, {
+        schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed", artifactRef: value.artifactRef,
+        reviewStatus: value.status, reviewHash: value.reviewHash,
+      })
+      return
+    }
+    if (toolName === "artifact.version.read") {
+      if (!Object.prototype.hasOwnProperty.call(value, "content")) return
+      try { index.artifactReads.add(artifactReferenceKey(parseArtifactReference(value.artifactRef))) } catch { return }
+      return
+    }
     if (toolName === "jobs.search") {
       if (!Array.isArray(value.jobs)) return
       for (const item of value.jobs) {
@@ -128,7 +148,34 @@ export function recordReadToolOutput(index: ObservedEvidenceIndex, toolName: str
   }
 }
 
+function artifactResultKey(value: StructuredRoleResult): string {
+  if (value.role === "writer") return `writer:${value.artifactRef.artifactId}:${value.artifactRef.version}:${value.artifactRef.contentHash}:${value.artifactRef.sourceDigest}`
+  if (value.role === "reviewer") return `reviewer:${value.artifactRef.artifactId}:${value.artifactRef.version}:${value.artifactRef.contentHash}:${value.artifactRef.sourceDigest}:${value.reviewStatus}:${value.reviewHash}`
+  return ""
+}
+
+export function artifactReferenceKey(value: ArtifactVersionReference): string {
+  return `${value.artifactId}:${value.version}:${value.contentHash}:${value.sourceDigest}`
+}
+
+function recordArtifactToolResult(index: ObservedEvidenceIndex, value: unknown): void {
+  const validated = validateRoleResult(value)
+  if (validated.role !== "writer" && validated.role !== "reviewer") return
+  const key = artifactResultKey(validated)
+  const previous = index.artifactResults.get(key)
+  if (previous && JSON.stringify(previous) !== JSON.stringify(validated)) {
+    index.artifactResults.delete(key)
+    return
+  }
+  index.artifactResults.set(key, validated)
+}
+
 function normalizeStructuredResult(value: StructuredRoleResult, index: ObservedEvidenceIndex): StructuredRoleResult | undefined {
+  if (value.role === "writer") return index.artifactResults.get(artifactResultKey(value))
+  if (value.role === "reviewer") {
+    if (!index.artifactReads.has(artifactReferenceKey(value.artifactRef))) return undefined
+    return index.artifactResults.get(artifactResultKey(value))
+  }
   const canonicalByModelId = new Map<string, string>()
   const seenCanonical = new Set<string>()
   const evidence: RoleEvidence[] = []
@@ -162,7 +209,7 @@ function normalizeStructuredResult(value: StructuredRoleResult, index: ObservedE
   return { ...value, findings, evidence }
 }
 
-export function parseAndBindStructuredResult(value: string, role: "scout" | "analyst", index: ObservedEvidenceIndex): StructuredRoleResult | undefined {
+export function parseAndBindStructuredResult<T extends StructuredRole>(value: string, role: T, index: ObservedEvidenceIndex): Extract<StructuredRoleResult, { role: T }> | undefined {
   if (Buffer.byteLength(value, "utf8") > MAX_EVIDENCE_BYTES) return undefined
   let parsed: unknown
   try {

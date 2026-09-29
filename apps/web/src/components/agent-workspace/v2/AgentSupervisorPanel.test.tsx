@@ -1,9 +1,12 @@
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+
+vi.mock('@/lib/hooks', () => ({ useApi: () => ({ data: null, loading: false, error: null, refetch: () => undefined }) }))
 
 import { translate } from '@/lib/i18n'
-import { EvidenceSummary, projectSelectedEvidence } from './AgentSupervisorPanel'
+import { AgentSupervisorPanel, EvidenceSummary, projectSelectedEvidence } from './AgentSupervisorPanel'
+import type { AgentTimelineSnapshot } from './use-agent-timeline'
 import type { TimelineItem } from './timeline-reducer'
 
 function item(overrides: Partial<TimelineItem> = {}): TimelineItem {
@@ -17,6 +20,23 @@ function item(overrides: Partial<TimelineItem> = {}): TimelineItem {
 const t = (key: string) => translate('en', key)
 
 describe('AgentSupervisorPanel selected evidence', () => {
+  it('keeps the supervisor hidden when no session is selected', () => {
+    const timeline = {
+      sessionId: null,
+      items: [],
+      lastEventId: null,
+      lifecycleRevision: 0,
+      cognitiveAgenda: null,
+      cognitiveAgendas: [],
+      approvalLedger: { sessionId: 'draft', approvals: [], pending: [], pendingActions: [], currentPending: null, pendingCount: 0 },
+      connection: 'idle',
+      restoring: false,
+      error: null,
+    } satisfies AgentTimelineSnapshot
+
+    expect(renderToStaticMarkup(<AgentSupervisorPanel sessionId={null} timeline={timeline} />)).toBe('')
+  })
+
   it('projects bounded audit metadata and renders only safe references', () => {
     const selected = item({ content: {
       toolName: 'jobs.search', toolCallId: 'call-safe', input: { query: 'private input' }, status: 'completed', output: { evidenceRefs: ['read:job:job-2'], raw: 'RAW_OUTPUT_SHOULD_NOT_RENDER' }, errorCode: null, outputAvailable: true,

@@ -22,6 +22,8 @@ import type { TurnLease } from "./turns/lease.js"
 import type { TurnEngineOptions, TurnEngineStore } from "./turns/turn-engine-types.js"
 import { loadCanonicalTurnState, type CanonicalTurnState } from "./canonical-turn-state.js"
 import { loadTaskGraphCurrentObservation } from "./canonical-turn-task-graph-context.js"
+import type { SelectedJobPreparation } from "./selected-job-preparation.js"
+import { taskGraphRuntimeForTurn } from "./subagents/task-graph-templates.js"
 import { AgentTreeManager } from "./subagents/manager.js"
 import { PgSubagentTaskStore } from "./subagents/pg-store.js"
 import { createPgRootTaskStore, type RootTaskStore } from "./subagents/root-task-store.js"
@@ -44,6 +46,8 @@ export type CanonicalTurnRuntimeOptions = {
   /** Server-derived production gate; user policy cannot enable coordination. */
   readonly coordinationEnabled?: boolean
   readonly stateLoader?: (pool: Pick<pg.Pool, "connect">, lease: TurnLease, now?: Date) => Promise<CanonicalTurnState>
+  /** Test seam for the server-owned Turn input selector; production uses the lease-fenced database loader. */
+  readonly selectedJobPreparationLoader?: (pool: Pick<pg.Pool, "connect">, lease: TurnLease, now: Date) => Promise<SelectedJobPreparation | undefined>
   readonly modelRuntimeFactory?: (input: { userId: string; config?: AiConfig; state: CanonicalTurnState }) => Promise<HarnessModelRuntime> | HarnessModelRuntime
   readonly authorizeUsage?: (input: { userId: string; sessionId: string; turnId: string; stepId: string; leaseOwnerId: string; leaseVersion: number; featureKey: string; provider: string; model: string }) => Promise<UsageAuthorization> | UsageAuthorization
   /** Server-owned scheduler and trusted template registry; model input never supplies its task/tenant fence. */
@@ -173,10 +177,12 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       })
       return terminal.result
     }
-    const state = options.stateLoader
-      ? await options.stateLoader(pool, lease, now())
-      : await loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes })
-    const taskGraphPlanningEnabled = options.productionFlags?.taskGraphPlanningEnabled === true && coordinationEnabled
+    const state = await (options.stateLoader?.(pool, lease, now()) ?? loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes }))
+    const { enabled: taskGraphPlanningEnabled, templates: taskGraphTemplates } = await taskGraphRuntimeForTurn({
+      enabled: options.productionFlags?.taskGraphPlanningEnabled === true && coordinationEnabled,
+      pool, lease, now, selectedJobPreparationLoader: options.selectedJobPreparationLoader,
+      taskGraphTemplates: options.taskGraphTemplates,
+    })
     const selectedPolicy = createCanonicalPolicy(state.toolPolicySnapshot, coordinationEnabled, taskGraphPlanningEnabled)
     const configuredCapabilities = capabilities(state.toolPolicySnapshot).filter(capability => capability !== "canManageChildren")
     const toolCapabilities = [...new Set([...configuredCapabilities, ...(coordinationEnabled ? ["coordination", "canManageChildren"] : [])])]
@@ -198,7 +204,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     } : undefined
     const toolRuntime = options.toolRuntimeFactory?.({ pool, policy: selectedPolicy, manager, state }) ?? createWorkerToolRuntime(pool, { sink: sinkProxy, resolveOwner }, selectedPolicy, coordination)
     let taskGraphParentAttemptCount: number | null = null
-    registerTaskGraphPlanningTool(toolRuntime.registry, taskGraphPlanningEnabled, { commandPort: options.taskGraphCommandPort, templates: options.taskGraphTemplates, turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: () => taskGraphParentAttemptCount })
+    registerTaskGraphPlanningTool(toolRuntime.registry, taskGraphPlanningEnabled, { commandPort: options.taskGraphCommandPort, templates: taskGraphTemplates, turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: () => taskGraphParentAttemptCount })
     if (coordinationEnabled) assertCanonicalCoordinationSurface(toolRuntime.registry, toolCapabilities)
     const allowedActions = toolRuntime.registry.list(toolCapabilities).flatMap((definition) => {
       const name = definition && typeof definition === "object" && "name" in definition ? (definition as { name?: unknown }).name : undefined
@@ -240,11 +246,5 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     await sessionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, result })
     return { status: result.status, summary: result.errorCode, ...(result.waitId ? { waitId: result.waitId } : {}) }
   }
-  return {
-    execute,
-    manager,
-    childExecutionEnabled,
-    coordinationEnabled,
-    async close() { closed = true },
-  }
+  return { execute, manager, childExecutionEnabled, coordinationEnabled, async close() { closed = true } }
 }

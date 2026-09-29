@@ -23,6 +23,7 @@ export type ApprovalReceiptHint = {
 
 export type ToolVisibilityReason =
   | "role_allowed"
+  | "bounded_review_receipt_allowed"
   | "role_risk_denied"
   | "role_domain_denied"
   | "role_capability_denied"
@@ -36,7 +37,7 @@ export type ToolVisibility = {
   readonly reason: ToolVisibilityReason
 }
 
-type RoleToolMetadata = Pick<RuntimeToolDefinition, "name" | "risk" | "domain" | "requiredCapabilities"> & {
+type RoleToolMetadata = Pick<RuntimeToolDefinition, "name" | "version" | "risk" | "domain" | "requiredCapabilities"> & {
   readonly capabilities?: readonly string[]
 }
 
@@ -80,10 +81,15 @@ export function visibleToolPolicy(
     if (!receipt) return { visible: false, reason: "external_write_receipt_missing" }
     if (receipt.consumed || Date.parse(receipt.expiresAt) <= Date.now()) return { visible: false, reason: "external_write_receipt_invalid" }
   }
-  if (!policy.allowedRisks.includes(tool.risk)) return { visible: false, reason: "role_risk_denied" }
+  const boundedReviewReceipt = role === "reviewer" && tool.name === "artifact.review" && tool.version === "1"
+    && tool.risk === "draft_write" && tool.domain === "resume"
+    && exactCapabilities(tool.capabilities, ["read", "write"])
+    && tool.requiredCapabilities.length === 0
+  if (tool.name === "artifact.review" && !boundedReviewReceipt) return { visible: false, reason: "role_risk_denied" }
+  if (!policy.allowedRisks.includes(tool.risk) && !boundedReviewReceipt) return { visible: false, reason: "role_risk_denied" }
   if (!policy.allowedDomains.includes(tool.domain)) return { visible: false, reason: "role_domain_denied" }
   if (tool.requiredCapabilities.some(capability => !policy.capabilities.includes(capability))) return { visible: false, reason: "role_capability_denied" }
-  return { visible: true, reason: "role_allowed" }
+  return { visible: true, reason: boundedReviewReceipt ? "bounded_review_receipt_allowed" : "role_allowed" }
 }
 
 export function visibleSubagentTools(
@@ -125,4 +131,8 @@ export function preflightSubagentTool(
 
 function looksLikeExternalAction(name: string): boolean {
   return /(?:^|[._-])(submit|send|publish|delete|mutate|execute)(?:$|[._-])/i.test(name)
+}
+
+function exactCapabilities(actual: readonly string[] | undefined, expected: readonly string[]): boolean {
+  return Boolean(actual && actual.length === expected.length && expected.every(capability => actual.includes(capability)))
 }

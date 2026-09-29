@@ -181,11 +181,13 @@ async function rootToolNames(
   capabilities = ["read"],
   productionFlags?: ProductionAgentFlags,
   taskGraph?: { commandPort: TaskGraphCommandPort; templates: Readonly<Record<string, TaskGraphTaskTemplate>> },
+  selectedJobPreparation?: { readonly jobId: string },
 ): Promise<string[]> {
   const requests: HarnessModelRequest[] = []
   const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
     workerId: "worker-1", coordinationEnabled, ...(productionFlags ? { productionFlags } : {}),
     ...(taskGraph ? { taskGraphCommandPort: taskGraph.commandPort, taskGraphTemplates: taskGraph.templates } : {}),
+    ...(selectedJobPreparation ? { selectedJobPreparationLoader: async () => selectedJobPreparation } : {}),
     stateLoader: async () => ({ ...state(), toolPolicySnapshot: { capabilities } }),
     rootTaskStore: rootStore() as never, turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
     modelRuntimeFactory: async () => ({ adapter: {
@@ -236,6 +238,7 @@ describe("createCanonicalTurnRuntime", () => {
     const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
       workerId: "worker-1", productionFlags: planningFlags, taskGraphCommandPort,
       taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+      selectedJobPreparationLoader: async () => undefined,
       stateLoader: async () => ({ ...state(), toolPolicySnapshot: {} }), rootTaskStore: rootStore() as never,
       turnEngineStoreFactory: () => store(),
       contextBuilderFactory: () => ({
@@ -317,6 +320,41 @@ describe("createCanonicalTurnRuntime", () => {
     expect(commandPort.readCurrent).not.toHaveBeenCalled()
   })
 
+  it("advertises selected-job templates only when the persisted server selector is present", async () => {
+    const commandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
+      readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
+    }
+    const flags = resolveProductionAgentFlags({
+      ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+    })
+    const request = async (selection?: { readonly jobId: string }) => {
+      const requests: HarnessModelRequest[] = []
+      const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+        workerId: "worker-1", productionFlags: flags, taskGraphCommandPort: commandPort,
+        taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+        ...(selection ? { selectedJobPreparationLoader: async () => selection } : { selectedJobPreparationLoader: async () => undefined }),
+        stateLoader: async () => ({ ...state(), toolPolicySnapshot: {} }), rootTaskStore: rootStore() as never,
+        turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
+        modelRuntimeFactory: async () => ({ adapter: {
+          ...model(() => []),
+          async *stream(value: HarnessModelRequest) { requests.push(value); yield { type: "text_delta", text: "done" }; yield { type: "completed", finishReason: "stop" } },
+        }, registry: {} as never, candidates: [] }),
+        authorizeUsage: async () => ({ settle: async () => undefined }),
+      })
+      await runtime.execute({ lease, signal: new AbortController().signal })
+      return requests[0]?.tools.find(tool => tool && typeof tool === "object" && "name" in tool && tool.name === "agent.plan")
+    }
+    const ordinaryPlanTool = await request()
+    const selectedPlanTool = await request({ jobId: "job-52" })
+    expect(ordinaryPlanTool && typeof ordinaryPlanTool === "object" && "description" in ordinaryPlanTool ? ordinaryPlanTool.description : "")
+      .not.toContain("cover_letter_writer")
+    expect(selectedPlanTool && typeof selectedPlanTool === "object" && "description" in selectedPlanTool ? selectedPlanTool.description : "")
+      .toContain('"cover_letter_writer"')
+    expect(selectedPlanTool && typeof selectedPlanTool === "object" && "description" in selectedPlanTool ? selectedPlanTool.description : "")
+      .toContain('"artifact.version.read"')
+  })
+
   it("fails closed before provider invocation when the scoped current graph read fails", async () => {
     const provider = vi.fn(async () => ({ adapter: model(() => []), registry: {} as never, candidates: [] }))
     const taskGraphCommandPort: TaskGraphCommandPort = {
@@ -326,6 +364,7 @@ describe("createCanonicalTurnRuntime", () => {
     const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
       workerId: "worker-1", taskGraphCommandPort, taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
       productionFlags: { taskGraphPlanningEnabled: true, childExecutionEnabled: true, coordinationEnabled: true, consumeWaitOutcomes: false, canonicalAutomationEnabled: false },
+      selectedJobPreparationLoader: async () => undefined,
       stateLoader: async () => ({ ...state(), toolPolicySnapshot: {} }), rootTaskStore: rootStore() as never,
       turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(), modelRuntimeFactory: provider,
       authorizeUsage: async () => ({ settle: async () => undefined }),

@@ -25,18 +25,24 @@ function mailboxMessage(payload: unknown, overrides: Partial<CoordinationMailbox
 }
 
 describe("child context", () => {
-  it("adds the fixed structured result contract only for an exact Scout/Analyst marker", () => {
-    const snapshot = childContextSnapshot({ ...task, role: "scout", expectedOutputSchema: { schemaVersion: "agent-harness.v2.subagent.result", role: "scout" } })
+  it.each([
+    ["scout", "candidates (scout) or findings (analyst)"],
+    ["analyst", "candidates (scout) or findings (analyst)"],
+    ["writer", "artifactRef"],
+    ["reviewer", "reviewStatus, and reviewHash"],
+  ] as const)("adds the structured result contract for an exact %s marker", (role, guidance) => {
+    const snapshot = childContextSnapshot({ ...task, role, expectedOutputSchema: { schemaVersion: "agent-harness.v2.subagent.result", role } })
     expect(snapshot.system).toHaveLength(2)
     expect(snapshot.system[1]?.content).toContain("one JSON object")
-    expect(snapshot.system[1]?.content).toContain("candidates (scout) or findings (analyst)")
-    expect(snapshot.system[1]?.content).toContain("evidenceIds must reference evidence")
+    expect(snapshot.system[1]?.content).toContain(guidance)
+    if (role === "scout" || role === "analyst") expect(snapshot.system[1]?.content).toContain("evidenceIds must reference evidence")
   })
 
   it.each([
     ["mismatched role", { role: "analyst", expectedOutputSchema: { schemaVersion: "agent-harness.v2.subagent.result", role: "scout" } }],
     ["extra marker field", { role: "scout", expectedOutputSchema: { schemaVersion: "agent-harness.v2.subagent.result", role: "scout", extra: true } }],
-    ["reviewer", { role: "reviewer", expectedOutputSchema: { schemaVersion: "agent-harness.v2.subagent.result", role: "reviewer" } }],
+    ["reviewer marker mismatch", { role: "reviewer", expectedOutputSchema: { schemaVersion: "agent-harness.v2.subagent.result", role: "writer" } }],
+    ["writer extra marker field", { role: "writer", expectedOutputSchema: { schemaVersion: "agent-harness.v2.subagent.result", role: "writer", extra: true } }],
     ["auditor", { role: "auditor", expectedOutputSchema: { schemaVersion: "agent-harness.v2.subagent.result", role: "auditor" } }],
     ["legacy prose", { role: "analyst", expectedOutputSchema: { type: "object" } }],
   ] as const)("leaves the prose path unchanged for %s", (_label, overrides) => {

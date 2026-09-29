@@ -1,7 +1,12 @@
+import { Worker } from "bullmq"
 import { Pool } from "pg"
+import { redisConnection } from "../../redis.ts"
 import { createCanonicalTurnRuntime } from "../canonical-turn-runtime.ts"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.ts"
 import { ROLE_RESULT_SCHEMA } from "./role-results.ts"
+import { createProductionChildExecutor } from "./production-child-runtime.ts"
+import { hashArtifactContent } from "./artifact-adapters.ts"
+import { parseSubagentJobPayload } from "./types.ts"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.ts"
 import { createProductionWorkerBootstrap } from "../../queue/production-bootstrap.ts"
 import { enqueueTurn } from "../turns/turn-queue.ts"
@@ -29,6 +34,7 @@ const planCallId = "p3-process-restart-plan", waitCallId = "p3-process-restart-w
 const followUpPlanCallId = "p3-process-restart-follow-up-plan", followUpWaitCallId = "p3-process-restart-follow-up-wait"
 const pool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 5 })
 let bootstrap
+let selectedJobWorker
 let stdinBuffer = ""
 let initialWaitLineage = null
 const queuedCommands = []
@@ -523,6 +529,144 @@ function modelProfile() {
     continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false, supportsReasoningSummary: false,
     supportsResponseContinuation: false, supportsProviderConversation: false, supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low" }
 }
+function selectedJobDraftModel(selected, task) {
+  const callId = `ac6-selected-job-draft-receipt:attempt:${task.attemptCount}`
+  const baseArtifactId = `cover-letter-base:${hashArtifactContent({ userId: selected.userId, jobId: selected.jobId }).slice(7)}`
+  const baseHash = hashArtifactContent({ kind: "cover_letter_base", jobId: selected.jobId })
+  let rounds = 0
+  return {
+    id: "ac6-disposable-pg-selected-job-model", profile: modelProfile(),
+    async *stream(request) {
+      rounds++
+      if (rounds === 1) {
+        yield { type: "tool_call_completed", callId, name: "cover_letter.draft", arguments: {
+          baseArtifactId, baseHash, content: selected.body, constraints: { maxWords: 160 },
+        } }
+        yield { type: "completed", finishReason: "tool_calls" }
+        return
+      }
+      const receipt = record(latestToolResult(request, callId))
+      const artifactRef = record(receipt?.artifactRef)
+      if (!artifactRef) throw new Error("p3_selected_job_draft_receipt_missing")
+      yield { type: "text_delta", text: JSON.stringify({
+        schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef,
+      }) }
+      yield { type: "completed", finishReason: "stop" }
+    },
+  }
+}
+function selectedJobReviewerModel(selected, task, observations) {
+  const artifactRef = record(selected.artifactRef)
+  if (!artifactRef) throw new Error("p3_selected_job_artifact_reference_missing")
+  const readCallId = `ac6-selected-job-review-read:attempt:${task.attemptCount}`
+  const reviewCallId = `ac6-selected-job-review-receipt:attempt:${task.attemptCount}`
+  const stopBeforeReview = task.id === selected.stopReviewerTaskId
+  let rounds = 0
+  return {
+    id: "ac6-disposable-pg-selected-job-model", profile: modelProfile(),
+    async *stream(request) {
+      rounds++
+      if (rounds === 1) {
+        observations.advertisedTools = request.tools.map(tool => record(tool)?.name).filter(name => typeof name === "string")
+        yield { type: "tool_call_completed", callId: readCallId, name: "artifact.version.read", arguments: { artifactRef } }
+        yield { type: "completed", finishReason: "tool_calls" }
+        return
+      }
+      if (rounds === 2) {
+        observations.sawBody = JSON.stringify(request.messages).includes(selected.body)
+        if (!observations.sawBody) throw new Error("p3_selected_job_reviewer_did_not_receive_artifact_body")
+        if (stopBeforeReview) {
+          say("P3_SELECTED_JOB_STOP_REVIEW_READY " + task.id)
+          await waitForCommand("release-selected-job-review:" + task.id)
+        }
+        yield { type: "tool_call_completed", callId: reviewCallId, name: "artifact.review", arguments: {
+          artifactRef, decision: "passed", findings: [],
+        } }
+        yield { type: "completed", finishReason: "tool_calls" }
+        return
+      }
+      const receipt = record(latestToolResult(request, reviewCallId))
+      if (stopBeforeReview) {
+        observations.reviewWriteError = receipt?.error ?? null
+        if (observations.reviewWriteError !== "private_artifact_review_failed") {
+          throw new Error("p3_selected_job_stopped_review_write_not_rejected")
+        }
+        say("P3_SELECTED_JOB_STOP_REVIEW_REJECTED " + task.id)
+        const reviewHash = hashArtifactContent({ status: "stale", stoppedTaskId: task.id, artifactRef })
+        yield { type: "text_delta", text: JSON.stringify({
+          schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed", artifactRef,
+          reviewStatus: "stale", reviewHash,
+        }) }
+        yield { type: "completed", finishReason: "stop" }
+        return
+      }
+      if (receipt?.status !== "stale" || typeof receipt.reviewHash !== "string") {
+        throw new Error("p3_selected_job_stale_review_receipt_missing")
+      }
+      observations.reviewStatus = receipt.status
+      yield { type: "text_delta", text: JSON.stringify({
+        schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed", artifactRef,
+        reviewStatus: receipt.status, reviewHash: receipt.reviewHash,
+      }) }
+      yield { type: "completed", finishReason: "stop" }
+    },
+  }
+}
+async function startSelectedJobQueueWorker(runtime) {
+  const selected = record(ids.selectedJob)
+  if (!selected || typeof selected.queueName !== "string" || selected.queueName.length === 0) return null
+  const worker = new Worker(selected.queueName, async job => {
+    const payload = parseSubagentJobPayload(job.data)
+    if (!payload || payload.sessionId !== selected.sessionId || payload.rootTaskId !== selected.rootTaskId) {
+      throw new Error("p3_selected_job_queue_payload_scope_invalid")
+    }
+    let leaseIdentity = null
+    let childResult = null
+    const observations = {}
+    const outcome = await runtime.manager.run(payload, async ({ lease }) => {
+      if (lease.turnId !== selected.turnId || lease.rootTaskId !== selected.rootTaskId
+        || lease.parentTaskId !== selected.rootTaskId || lease.userId !== selected.userId) {
+        throw new Error("p3_selected_job_child_lease_scope_invalid")
+      }
+      const taskSelection = record(record(lease.context)?.selectedJobPreparation)
+      const selectedTaskIds = [selected.writerTaskId, selected.reviewerTaskId, selected.stopReviewerTaskId]
+        .filter(taskId => typeof taskId === "string")
+      if (taskSelection?.jobId !== selected.jobId || !selectedTaskIds.includes(lease.id)) {
+        throw new Error("p3_selected_job_task_lineage_invalid")
+      }
+      leaseIdentity = {
+        role: lease.role, ownerId: lease.ownerId, attemptCount: lease.attemptCount,
+        taskId: lease.id, path: lease.path,
+      }
+      const executor = createProductionChildExecutor({
+        pool,
+        authorizeUsage: async () => ({ settle: async () => undefined }),
+        modelRuntimeFactory: ({ task }) => {
+          if (task.role === "writer") return selectedJobDraftModel(selected, task)
+          if (task.role === "reviewer") return selectedJobReviewerModel(selected, task, observations)
+          throw new Error("p3_unexpected_selected_job_child_role")
+        },
+      })
+      childResult = await executor({ lease })
+      return childResult
+    })
+    const structured = record(record(childResult?.result)?.structuredResult)
+    say("P3_SELECTED_JOB_CHILD_SETTLED " + payload.taskId + " " + JSON.stringify({
+      ...leaseIdentity,
+      managerStatus: outcome.status,
+      childStatus: childResult?.status ?? null,
+      artifactRef: structured?.artifactRef ?? null,
+      reviewStatus: structured?.reviewStatus ?? null,
+      reviewHash: structured?.reviewHash ?? null,
+      observations,
+    }))
+    return outcome
+  }, { connection: redisConnection, skipVersionCheck: true, concurrency: 1 })
+  selectedJobWorker = worker
+  await worker.waitUntilReady()
+  say("P3_SELECTED_JOB_QUEUE_READY " + selected.queueName)
+  return worker
+}
 function flags() {
   return { cognitiveLoopEnabled: false, planningEnabled: true, planningExecutionEnabled: true, taskGraphPlanningEnabled: true,
     childExecutionEnabled: true, coordinationEnabled: true, consumeWaitOutcomes: true, canonicalAutomationEnabled: false }
@@ -843,6 +987,7 @@ async function runFirstWorker() {
   if (typeof subagentWorker?.pause !== "function") throw new Error("p3_first_worker_subagent_pause_unavailable")
   await subagentWorker.pause()
   say("P3_FIRST_WORKER_PAUSE_DONE")
+  await startSelectedJobQueueWorker(runtime)
   const activated = await pool.query(`UPDATE "agent_turns" SET "status" = 'queued', "completedAt" = NULL,
       "leaseOwnerId" = NULL, "leaseExpiresAt" = NULL, "leaseStartedAt" = NULL, "updatedAt" = CURRENT_TIMESTAMP
     WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "status" = 'waiting_for_user'`, [ids.turnId, ids.sessionId, ids.userId])
@@ -892,6 +1037,7 @@ async function runSecondWorker() {
       }
       throw new Error("p3_unexpected_child:" + lease.goal)
     } } })
+  await startSelectedJobQueueWorker(runtime)
   say("P3_SECOND_WORKER_READY " + ownerId); await waitForStop()
 }
 try {
@@ -907,6 +1053,7 @@ try {
 } catch (error) {
   process.stderr.write((error instanceof Error ? error.stack ?? error.message : String(error)) + "\n"); process.exitCode = 1
 } finally {
+  try { if (selectedJobWorker) await selectedJobWorker.close() } catch (error) { process.stderr.write("p3_selected_job_worker_close_failed:" + String(error) + "\n"); process.exitCode = 1 }
   try { if (bootstrap) await bootstrap.close() } catch (error) { process.stderr.write("p3_bootstrap_close_failed:" + String(error) + "\n"); process.exitCode = 1 }
   try { await pool.end() } catch (error) { process.stderr.write("p3_pool_end_failed:" + String(error) + "\n"); process.exitCode = 1 }
   try { const { closeSharedRedisConnections } = await import("../../redis.ts"); await closeSharedRedisConnections() }

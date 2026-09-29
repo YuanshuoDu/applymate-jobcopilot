@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { TASK_GRAPH_TEMPLATES, taskGraphRuntimeOptions } from "./task-graph-templates.js"
+import { TASK_GRAPH_TEMPLATES, taskGraphRuntimeOptions, taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import type { TaskGraphCommandPort } from "./task-graph-command-port.js"
 
@@ -30,5 +30,28 @@ describe("TaskGraph server-owned templates", () => {
     expect(runtimeOptions.taskGraphTemplates.analyst.expectedOutputSchema).toEqual({
       schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst",
     })
+  })
+
+  it("adds scoped Writer and Reviewer templates only for a server-selected job", () => {
+    expect(Object.keys(taskGraphTemplatesForSelectedJob(undefined))).toEqual(["scout", "analyst"])
+    const templates = taskGraphTemplatesForSelectedJob({ jobId: "job-1" })
+    expect(templates.cover_letter_writer).toMatchObject({
+      role: "writer", taskType: "cover_letter_draft",
+      allowedActions: ["jobs.get", "persona.retrieve", "resume.get_base", "cover_letter.draft"],
+      context: { selectedJobPreparation: { jobId: "job-1" } },
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "writer" },
+    })
+    expect(templates.cover_letter_reviewer).toMatchObject({
+      role: "reviewer", taskType: "cover_letter_review",
+      allowedActions: ["artifact.version.read", "artifact.review"],
+      context: { selectedJobPreparation: { jobId: "job-1" } },
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer" },
+    })
+    for (const id of ["cover_letter_writer", "cover_letter_reviewer"]) {
+      const template = templates[id]!
+      expect(template.allowedActions).not.toContain("agent.plan")
+      expect(template.allowedActions).not.toContain("application.submit")
+      expect(template.allowedActions.some(action => /send|gmail|browser|submit/i.test(action))).toBe(false)
+    }
   })
 })

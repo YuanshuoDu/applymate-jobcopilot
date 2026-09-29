@@ -13,17 +13,22 @@ const mocks = vi.hoisted(() => {
       this.details = details
     }
   }
-  return { requireAuth: vi.fn(), message: vi.fn(), resumeFindMany: vi.fn(), MockAgentCommandError }
+  return { requireAuth: vi.fn(), message: vi.fn(), resumeFindMany: vi.fn(), sessionFindFirst: vi.fn(), jobFindFirst: vi.fn(), err: vi.fn(), MockAgentCommandError }
 })
 
 vi.mock("@/lib/api-helpers", () => ({
   requireAuth: mocks.requireAuth,
   isErrorResponse: (value: unknown) => value instanceof Response,
+  err: (message: string, status = 400) => Response.json({ error: { message } }, { status }),
   ok: (data: unknown, status = 200) => Response.json(data, { status }),
 }))
 
 vi.mock("@/lib/db", () => ({
-  db: { resume: { findMany: mocks.resumeFindMany } },
+  db: {
+    resume: { findMany: mocks.resumeFindMany },
+    agentSession: { findFirst: mocks.sessionFindFirst },
+    job: { findFirst: mocks.jobFindFirst },
+  },
 }))
 
 vi.mock("@/lib/agent/control-plane/commands", () => ({
@@ -49,8 +54,13 @@ describe("agent message command API", () => {
     mocks.requireAuth.mockReset()
     mocks.message.mockReset()
     mocks.resumeFindMany.mockReset()
+    mocks.sessionFindFirst.mockReset()
+    mocks.jobFindFirst.mockReset()
+    mocks.err.mockReset()
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
     mocks.resumeFindMany.mockResolvedValue([])
+    mocks.sessionFindFirst.mockResolvedValue({ id: "session_1" })
+    mocks.jobFindFirst.mockResolvedValue({ id: "job_1" })
     mocks.message.mockResolvedValue({ inputId: "input_1", turnId: "turn_1", disposition: "started", sequence: "1" })
   })
 
@@ -72,6 +82,38 @@ describe("agent message command API", () => {
     await expect(response.json()).resolves.toMatchObject({ disposition: "duplicate", originalDisposition: "started" })
   })
 
+  it("owner-checks the selected job and passes only typed scope to the canonical command", async () => {
+    const { POST } = await import("./route")
+    const response = await POST(request({
+      clientMessageId: "prepare_1",
+      delivery: "follow_up",
+      selectedJobPreparation: { jobId: "job_1" },
+      content: [{ type: "text", text: "Prepare a cover letter draft for the selected job." }],
+    }) as never, params)
+
+    expect(response.status).toBe(202)
+    expect(mocks.sessionFindFirst).toHaveBeenCalledWith({ where: { id: "session_1", userId: "user_1" }, select: { id: true } })
+    expect(mocks.jobFindFirst).toHaveBeenCalledWith({ where: { id: "job_1", userId: "user_1" }, select: { id: true } })
+    expect(mocks.message).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: "session_1", userId: "user_1", selectedJobPreparation: { jobId: "job_1" },
+      content: [{ type: "text", text: "Prepare a cover letter draft for the selected job." }],
+    }))
+  })
+
+  it("rejects a job outside the authenticated user's scope without starting a Turn", async () => {
+    mocks.jobFindFirst.mockResolvedValueOnce(null)
+    const { POST } = await import("./route")
+    const response = await POST(request({
+      clientMessageId: "prepare_foreign",
+      delivery: "follow_up",
+      selectedJobPreparation: { jobId: "job_other" },
+      content: [{ type: "text", text: "Prepare a cover letter draft for the selected job." }],
+    }) as never, params)
+
+    expect(response.status).toBe(404)
+    expect(mocks.message).not.toHaveBeenCalled()
+  })
+
   it("maps the service's typed 409 conflict", async () => {
     mocks.message.mockRejectedValueOnce(new mocks.MockAgentCommandError("active_turn_changed", "stale", 409, { actualTurnId: "turn_2" }))
     const { POST } = await import("./route")
@@ -79,6 +121,20 @@ describe("agent message command API", () => {
 
     expect(response.status).toBe(409)
     await expect(response.json()).resolves.toMatchObject({ error: { code: "active_turn_changed", details: { actualTurnId: "turn_2" } } })
+  })
+
+  it("maps an active-Turn selected-job conflict to 409", async () => {
+    mocks.message.mockRejectedValueOnce(new mocks.MockAgentCommandError("selected_job_turn_active", "Stop or finish the active Turn", 409, { turnId: "turn_1" }))
+    const { POST } = await import("./route")
+    const response = await POST(request({
+      clientMessageId: "prepare_active",
+      delivery: "follow_up",
+      selectedJobPreparation: { jobId: "job_1" },
+      content: [{ type: "text", text: "Prepare a cover letter draft for the selected job." }],
+    }) as never, params)
+
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "selected_job_turn_active", details: { turnId: "turn_1" } } })
   })
 
   it("maps a parked Turn to a safe dedicated-action 409", async () => {

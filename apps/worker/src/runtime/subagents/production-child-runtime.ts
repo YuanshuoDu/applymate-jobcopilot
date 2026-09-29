@@ -1,10 +1,12 @@
 import type pg from "pg"
-import type { PolicySnapshot } from "@jobcopilot/agent-protocol"
+import type { PolicyRule, PolicySnapshot } from "@jobcopilot/agent-protocol"
 import { PolicyEngine } from "@jobcopilot/agent-policy"
 
 import { createWorkerUsageAuthorizer } from "../../queue/ai-usage-bridge.js"
 import type { SubagentExecutor } from "../../queue/subagent-queue.js"
 import { createWorkerToolRuntime } from "../tools/index.js"
+import { createArtifactToolStore } from "../tools/artifact-tools.js"
+import type { ToolExecutionContext } from "../tools/types.js"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
 import type { TurnExecutionStore } from "../turns/turn-execution-types.js"
 import type { TurnEngineStore } from "../turns/turn-engine-types.js"
@@ -13,6 +15,7 @@ import { createPgTreeBudgetReservationStore } from "./tree-budget-store.js"
 import type { TreeBudgetReservationStore } from "./tree-budget-types.js"
 import { createChildExecutor, type ChildExecutorOptions, type ChildToolRuntime } from "./child-executor.js"
 import { loadChildAttemptResume } from "./child-resume.js"
+import { loadSelectedJobArtifactContext, resolveCoverLetterBase } from "./selected-job-artifact-context.js"
 import { PgCoordinationStore } from "../mailbox/store.js"
 import type { ExecutionOwner, ExecutionOwnerFence } from "../execution-owner.js"
 import type { SubagentLease, SubagentTaskRecord } from "./types.js"
@@ -30,9 +33,45 @@ export type ProductionChildRuntimeOptions = {
 
 function record(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {} }
 
-function policy(value: unknown): PolicyEngine {
+const SUBAGENT_READ_RULE = {
+  id: "canonical-subagent-read",
+  roles: ["subagent"], risks: ["read"], requiredCapabilities: ["read"],
+  outcome: "allow", reasonCode: "server_subagent_read_gate", reason: "The server enabled scoped child read tools",
+} satisfies PolicyRule
+
+function selectedJobId(task: SubagentTaskRecord): string | undefined {
+  const selection = record(record(task.context).selectedJobPreparation)
+  return Object.keys(selection).sort().join(",") === "jobId"
+    && typeof selection.jobId === "string" && selection.jobId.trim().length > 0 && selection.jobId.length <= 256
+    ? selection.jobId
+    : undefined
+}
+
+function selectedJobPolicyRule(role: string, selectedJob: boolean): PolicyRule | undefined {
+  if (!selectedJob) return undefined
+  if (role === "writer") return {
+    id: "canonical-selected-job-cover-letter-draft",
+    roles: ["subagent"], tools: ["cover_letter.draft"], toolVersions: ["1"], risks: ["draft_write"], domains: ["resume"], requiredCapabilities: ["draft"],
+    outcome: "allow", reasonCode: "server_selected_job_draft_gate", reason: "The server enabled the selected-job cover-letter draft tool",
+  }
+  if (role === "reviewer") return {
+    id: "canonical-selected-job-artifact-review",
+    roles: ["subagent"], tools: ["artifact.review"], toolVersions: ["1"], risks: ["draft_write"], domains: ["resume"], requiredCapabilities: ["review"],
+    outcome: "allow", reasonCode: "server_selected_job_review_gate", reason: "The server enabled the bounded selected-job review receipt",
+  }
+  return undefined
+}
+
+function policy(value: unknown, task: SubagentTaskRecord, selectedJob: boolean): PolicyEngine {
   const snapshot = record(value)
-  return new PolicyEngine({ snapshot: typeof snapshot.version === "string" && Array.isArray(snapshot.rules) ? snapshot as unknown as PolicySnapshot : undefined })
+  const hasMatrixField = Object.prototype.hasOwnProperty.call(snapshot, "version") || Object.prototype.hasOwnProperty.call(snapshot, "rules")
+  const configured = typeof snapshot.version === "string" && Array.isArray(snapshot.rules)
+    ? snapshot as unknown as PolicySnapshot
+    : undefined
+  if (hasMatrixField && !configured) return new PolicyEngine()
+  const taskRule = selectedJobPolicyRule(task.role, selectedJob)
+  const rules: PolicyRule[] = [...(configured?.rules ?? []), SUBAGENT_READ_RULE, ...(taskRule ? [taskRule] : [])]
+  return new PolicyEngine({ snapshot: { version: configured?.version ?? "policy.v1", rules } })
 }
 
 function bindStore(store: TurnEngineStore): TurnExecutionStore {
@@ -51,13 +90,90 @@ function withoutIdentity<T extends { identity: ExecutionOwnerFence }>(input: T):
   return rest
 }
 
-function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: SubagentTaskRecord, lease: SubagentLease, owner: ExecutionOwnerFence): ChildToolRuntime {
+async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: SubagentTaskRecord, lease: SubagentLease, owner: ExecutionOwnerFence): Promise<ChildToolRuntime> {
   const executionOwner: ExecutionOwner = { kind: "task", lease }
+  const selectedJob = task.role === "writer" || task.role === "reviewer" ? selectedJobId(task) : undefined
+  const selectedJobPreparation = selectedJob
+    ? await loadSelectedJobArtifactContext(pool, task.userId, selectedJob)
+    : undefined
+  const artifacts = selectedJobPreparation ? createArtifactToolStore(pool) : undefined
+  const coverLetterBase = task.role === "writer" && selectedJobPreparation && artifacts
+    ? await resolveCoverLetterBase(artifacts, task.userId, selectedJobPreparation.jobId)
+    : undefined
+  const serverContext = selectedJobPreparation ? {
+    selectedJobPreparation,
+    ...(coverLetterBase ? { coverLetterBase } : {}),
+  } : undefined
+  const toolPolicy = policy(task.toolPolicySnapshot, task, Boolean(selectedJobPreparation))
   const runtime = createWorkerToolRuntime(pool, {
     sink: durableLifecycleSink(store, owner),
     resolveOwner: () => executionOwner,
-  }, policy(task.toolPolicySnapshot))
-  return { definitions: runtime.registry.list(), router: runtime.router, validateArguments: (name, input, version) => runtime.registry.validateArguments(name, input, version) }
+  }, toolPolicy, undefined, undefined, artifacts ? { store: artifacts } : undefined)
+  return {
+    definitions: runtime.registry.list(), router: runtime.router,
+    ...(selectedJobPreparation ? { selectedJobPreparation } : {}),
+    ...(serverContext ? { serverContext } : {}),
+    ...(selectedJobPreparation ? {
+      executePrivateTool: async (context, request) => {
+        const privateRead = task.role === "reviewer" && request.toolName === "artifact.version.read"
+        const privateDraft = task.role === "writer" && request.toolName === "cover_letter.draft"
+        const privateReview = task.role === "reviewer" && request.toolName === "artifact.review"
+        if ((!privateRead && !privateDraft && !privateReview) || request.toolVersion !== "1" || context.actorRole !== "subagent") {
+          throw new Error("private_artifact_read_unavailable")
+        }
+        const definition = runtime.registry.resolve(request.toolName, request.toolVersion)
+        const validRead = definition.risk === "read" && definition.domain === "resume" && definition.idempotency === "read_only"
+          && definition.capabilities.length === 1 && definition.capabilities[0] === "read" && definition.requiredCapabilities.length === 0
+        const validDraft = definition.risk === "draft_write" && definition.domain === "resume" && definition.idempotency === "requires_key"
+          && definition.capabilities.length === 2 && definition.capabilities.includes("read") && definition.capabilities.includes("write")
+          && definition.requiredCapabilities.length === 0
+        const validReview = validDraft && definition.name === "artifact.review" && definition.requiredCapabilities.length === 0
+        if ((privateRead && !validRead) || ((privateDraft || privateReview) && !validDraft) || (privateReview && !validReview)) {
+          throw new Error("private_artifact_read_unavailable")
+        }
+        const policyDecision = toolPolicy.evaluate({
+          scope: context.scope, sessionId: context.sessionId, turnId: context.turnId, stepId: context.stepId,
+          toolCallId: request.id, actorRole: context.actorRole, capabilities: context.capabilities ?? [],
+          tool: {
+            name: definition.name, version: definition.version, risk: definition.risk, domain: definition.domain,
+            capabilities: definition.capabilities, requiredCapabilities: definition.requiredCapabilities,
+          },
+          input: request.input,
+        })
+        if (policyDecision.outcome !== "allow") throw new Error("private_artifact_tool_policy_denied")
+        const effectiveInput = policyDecision.safeInput === undefined ? request.input : policyDecision.safeInput
+        const validation = runtime.registry.validateArguments(request.toolName, effectiveInput, request.toolVersion)
+        if (validation !== true) throw new Error("private_artifact_read_input_invalid")
+        const parentSignal = context.signal
+        const controller = new AbortController()
+        let timedOut = false
+        const onAbort = () => controller.abort()
+        if (parentSignal?.aborted) controller.abort()
+        else parentSignal?.addEventListener("abort", onAbort, { once: true })
+        const timer = setTimeout(() => { timedOut = true; controller.abort() }, definition.timeoutMs)
+        const executionContext: ToolExecutionContext = {
+          scope: context.scope, sessionId: context.sessionId, turnId: context.turnId, stepId: context.stepId,
+          toolCallId: request.id, taskId: context.taskId, rootTaskId: context.rootTaskId, actorRole: context.actorRole,
+          remainingTurnSteps: context.remainingTurnSteps, selectedJobPreparation, taskFence: context.taskFence,
+          signal: controller.signal, capabilities: context.capabilities ?? [],
+          reportProgress: async () => {
+            if (controller.signal.aborted) throw new Error(timedOut ? "timeout" : "cancelled")
+          },
+        }
+        try {
+          if (controller.signal.aborted) throw new Error(timedOut ? "timeout" : "cancelled")
+          const output = await definition.execute(executionContext, effectiveInput)
+          if (controller.signal.aborted) throw new Error(timedOut ? "timeout" : "cancelled")
+          runtime.registry.validators.validate(definition.outputSchema, output, `${request.toolName} output`)
+          return { id: request.id, toolName: request.toolName, toolVersion: request.toolVersion, status: "completed" as const, output, errorCode: null }
+        } finally {
+          clearTimeout(timer)
+          parentSignal?.removeEventListener("abort", onAbort)
+        }
+      },
+    } : {}),
+    validateArguments: (name, input, version) => runtime.registry.validateArguments(name, input, version),
+  }
 }
 
 export function childExecutionEnabled(value = process.env.ENABLE_AGENT_CHILD_EXECUTION): boolean {

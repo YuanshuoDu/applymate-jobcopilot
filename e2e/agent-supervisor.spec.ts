@@ -76,7 +76,7 @@ function event(sessionId: string, turnId: string, id: string, sequence: string, 
   }
 }
 
-async function installSupervisorFixture(page: Page) {
+async function installSupervisorFixture(page: Page, selectedJobEnabled = false) {
   const fixture = {
     aStreamCount: 0,
     eventSequence: 0,
@@ -105,6 +105,11 @@ async function installSupervisorFixture(page: Page) {
       body: Record<string, unknown>
       idempotencyKey: string | undefined
     }>,
+    selectedJobStarted: false,
+    selectedJobRequests: [] as Array<Record<string, unknown>>,
+    selectedJobDisconnectArmed: false,
+    selectedJobStreamSequences: [] as Array<string | null>,
+    selectedJobReconnectSequence: null as string | null,
   }
   const stageStatus = () => {
     if (fixture.retryTurnStatus) return fixture.retryTurnStatus
@@ -122,7 +127,10 @@ async function installSupervisorFixture(page: Page) {
     expires: '2099-01-01T00:00:00.000Z',
   }))
   await page.route('**/api/me', route => json(route, { id: 'agent-supervisor-fixture', email: 'fixture@applymate.local', name: 'Fixture', plan: 'pro', onboardedAt: times.created }))
-  await page.route('**/api/jobs**', route => json(route, { jobs: [], total: 0, page: 1, pageSize: 100, statusCounts: {} }))
+  await page.route('**/api/jobs**', route => json(route, {
+    jobs: selectedJobEnabled ? [{ id: 'fixture-selected-job', company: 'Fixture Systems', role: 'Systems Engineer', status: 'saved' }] : [],
+    total: selectedJobEnabled ? 1 : 0, page: 1, pageSize: 100, statusCounts: {},
+  }))
   await page.route('**/api/resume', route => json(route, []))
   await page.route('**/api/agent', route => json(route, { autoApply: false, requireApproval: true, isRunning: false }))
   await page.route('**/api/agent/roles', route => json(route, []))
@@ -137,6 +145,12 @@ async function installSupervisorFixture(page: Page) {
   })
   await page.route('**/__agent_fixture__/replay', async route => {
     fixture.replayArmed = true
+    return json(route, { ok: true })
+  })
+  await page.route('**/__agent_fixture__/selected-job-disconnect', async route => {
+    fixture.selectedJobDisconnectArmed = true
+    fixture.selectedJobStreamSequences = []
+    fixture.selectedJobReconnectSequence = null
     return json(route, { ok: true })
   })
   await page.route('**/__agent_fixture__/retryable', async route => {
@@ -157,6 +171,29 @@ async function installSupervisorFixture(page: Page) {
     const parts = url.pathname.split('/').filter(Boolean)
     const sessionId = parts[3]
     const resource = parts[4] ?? ''
+    if (resource === 'messages' && route.request().method() === 'POST') {
+      fixture.selectedJobRequests.push(route.request().postDataJSON() as Record<string, unknown>)
+      fixture.selectedJobStarted = true
+      return json(route, { inputId: 'fixture-preparation-input', turnId: 'fixture-preparation-turn', disposition: 'started', sequence: '99' }, 202)
+    }
+    if (resource === 'artifacts' && route.request().method() === 'GET') {
+      const url = new URL(route.request().url())
+      const validRef = url.searchParams.get('contentHash') === `sha256:${'a'.repeat(64)}`
+        && url.searchParams.get('sourceDigest') === `sha256:${'b'.repeat(64)}`
+      if (sessionId !== SESSION_A || parts[5] !== 'fixture-cover-letter' || parts[7] !== '1' || !fixture.selectedJobStarted || !validRef) {
+        return json(route, { error: 'Not found' }, 404)
+      }
+      return json(route, {
+        job: { company: 'Fixture Systems', role: 'Systems Engineer' },
+        artifact: {
+          artifactId: 'fixture-cover-letter', version: 1, contentHash: `sha256:${'a'.repeat(64)}`, sourceDigest: `sha256:${'b'.repeat(64)}`,
+          content: { text: 'Persisted cover-letter fixture body.' }, provenanceRefs: ['persona:fixture-fact'], evidenceRefs: ['job:fixture-selected-job'],
+        },
+        review: { status: 'passed', reviewHash: 'fixture-review-hash', evidenceRefs: ['resume:fixture-fact'], findings: [
+          { code: 'unsupported_claim', severity: 'warning', message: 'Confirm this claim against your resume.', evidenceRefs: ['resume:fixture-fact'] },
+        ] },
+      })
+    }
     if (resource === 'approvals' && route.request().method() === 'POST') {
       fixture.approvalDecisions.push({
         sessionId,
@@ -187,6 +224,18 @@ async function installSupervisorFixture(page: Page) {
       const selected = sessionId === SESSION_A ? stageStatus() : 'completed'
       const tasks = [{ id: `task-${sessionId}`, sessionId, turnId: sessionId === SESSION_A ? TURN_A : TURN_B, parentTaskId: null, role: 'Scout', taskType: 'read', status: selected, goal: sessionId === SESSION_A ? 'Inspect saved roles' : 'B session evidence', hasResult: selected === 'completed' }]
       if (sessionId === SESSION_A) tasks.push({ id: CHILD_TASK_A, sessionId, turnId: TURN_A, parentTaskId: `task-${SESSION_A}`, role: 'Scout', taskType: 'research', status: childStatus(), goal: 'Check child evidence', hasResult: childStatus() === 'completed' })
+      if (sessionId === SESSION_A) {
+        tasks.push({
+          id: 'selected-job-plan-root', sessionId, turnId: 'fixture-preparation-turn', rootTaskId: 'selected-job-plan-root', parentTaskId: null,
+          role: 'orchestrator', taskType: 'root', status: 'running', goal: 'Prepare the selected saved job', hasResult: false,
+        })
+        tasks.push({
+          id: 'writer-fixture-draft', sessionId, turnId: 'fixture-preparation-turn', rootTaskId: 'selected-job-plan-root', parentTaskId: 'selected-job-plan-root',
+          role: 'writer', taskType: 'cover_letter_draft', status: fixture.selectedJobStarted ? 'completed' : 'queued', goal: 'Prepare the selected saved job', hasResult: fixture.selectedJobStarted,
+          ...(fixture.selectedJobStarted ? { artifactRef: { artifactId: 'fixture-cover-letter', version: 1, contentHash: `sha256:${'a'.repeat(64)}`, sourceDigest: `sha256:${'b'.repeat(64)}` } } : {}),
+          updatedAt: times.updated,
+        })
+      }
       return json(route, { tasks })
     }
     if (resource === 'timeline') {
@@ -195,6 +244,12 @@ async function installSupervisorFixture(page: Page) {
             item(SESSION_A, TURN_A, 'fixture-plan-a', 'Read the current session plan.', { type: 'plan', phase: 'commentary', content: { steps: [{ id: 'step-a', label: 'Inspect saved roles', status: 'queued' }] } }),
             item(SESSION_A, TURN_A, 'fixture-tool-a', 'Read the saved roles.', { type: 'tool_call', phase: 'commentary', content: { toolCallId: 'call-a', toolName: 'jobs.search', input: { scope: 'saved roles' } } }),
             item(SESSION_A, TURN_A, ITEM_A, 'The agent is executing the saved roles check.', { status: stageStatus() === 'completed' ? 'completed' : 'queued' }),
+            item(SESSION_A, 'fixture-preparation-turn', 'fixture-selected-job-task-graph', 'Prepare the selected saved job.', {
+              type: 'task_graph', taskId: 'selected-job-plan-root', revision: 4,
+              content: { schemaVersion: 'agent-harness.v2.task-graph', nodes: [
+                { key: 'cover-letter', templateId: 'writer', goal: 'Prepare the selected saved job', successCriteria: ['Save a reviewable draft'], dependsOn: [], depth: 1, taskId: 'writer-fixture-draft' },
+              ] },
+            }),
           ]
         : [item(SESSION_B, TURN_B, ITEM_B, 'B session evidence is isolated from session A.', { status: 'completed', phase: 'final_answer', completedAt: times.updated })],
         approvalEvents: sessionId === SESSION_A
@@ -205,6 +260,19 @@ async function installSupervisorFixture(page: Page) {
     if (resource === 'events') {
       if (sessionId !== SESSION_A) {
         return route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': fixture B stream\n\n' })
+      }
+      if (fixture.selectedJobDisconnectArmed) {
+        const afterSequence = url.searchParams.get('afterSequence')
+        fixture.selectedJobStreamSequences.push(afterSequence)
+        if (fixture.selectedJobStreamSequences.length === 1) {
+          fixture.selectedJobReconnectSequence = (BigInt(afterSequence ?? '0') + BigInt(1)).toString()
+          const disconnectEvent = event(SESSION_A, TURN_A, 'fixture-selected-job-disconnect', fixture.selectedJobReconnectSequence, 'turn.started', { status: 'in_progress' }, { itemId: null })
+          return route.fulfill({ status: 200, contentType: 'text/event-stream', body: `event: timeline\ndata: ${JSON.stringify(disconnectEvent)}\n\n` })
+        }
+        if (fixture.selectedJobStreamSequences.length === 2) {
+          fixture.selectedJobDisconnectArmed = false
+          return route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': selected-job stream reconnected\n\n' })
+        }
       }
       if (!fixture.lifecycleStarted) {
         return route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': waiting for lifecycle assertions\n\n' })
@@ -414,4 +482,65 @@ test('real page mounts the shared timeline, supervisor tree, and isolated sessio
   await expect(retryPanel.locator('[data-agent-turn-retry-status="accepted"]')).toBeVisible()
   expect(submissionRequests).toEqual([])
   expect(consoleErrors).toEqual([])
+})
+
+test('selected-job preparation sends typed scope and restores the persisted draft after stream reconnect', async ({ page }, testInfo) => {
+  const fixture = await installSupervisorFixture(page, true)
+  const isZh = testInfo.project.name.includes('zh')
+  await page.goto(`/agent-preview?supervisor=1&locale=${isZh ? 'zh' : 'en'}&sessionId=${SESSION_A}`)
+
+  const preparation = page.locator('[data-selected-job-preparation="true"]')
+  await expect(preparation).toBeVisible({ timeout: 20_000 })
+  await preparation.getByLabel(isZh ? '已保存的职位' : 'Saved job').selectOption('fixture-selected-job')
+  await preparation.getByRole('button', { name: isZh ? '准备草稿' : 'Prepare draft' }).click()
+  await expect.poll(() => fixture.selectedJobRequests.length).toBe(1)
+  const command = fixture.selectedJobRequests[0]
+  expect(command).toMatchObject({ delivery: 'follow_up', selectedJobPreparation: { jobId: 'fixture-selected-job' } })
+  expect(command?.content).toEqual([{ type: 'text', text: 'Prepare a cover letter draft for the selected job.' }])
+  expect(JSON.stringify(command?.content)).not.toContain('fixture-selected-job')
+
+  const draft = page.locator('[data-selected-job-draft="true"]')
+  await expect(draft).toBeVisible({ timeout: 10_000 })
+  await expect(draft).toContainText('Persisted cover-letter fixture body.')
+  await expect(draft).toContainText(isZh ? '通过' : 'passed')
+  await expect(draft).toHaveAttribute('data-draft-version', '1')
+  await expect(draft).toContainText('unsupported_claim')
+  await expect(draft).toContainText('Confirm this claim against your resume.')
+
+  const plan = page.locator('[data-agent-task-graph-plan="true"]')
+  await expect(plan).toBeVisible({ timeout: 10_000 })
+  await expect(plan).toHaveAttribute('data-agent-task-graph-session', SESSION_A)
+  await expect(plan).toHaveAttribute('data-agent-task-graph-revision', '4')
+  await expect(plan).toContainText('Prepare the selected saved job')
+  const planBeforeReconnect = await plan.evaluate(element => ({
+    session: element.getAttribute('data-agent-task-graph-session'),
+    revision: element.getAttribute('data-agent-task-graph-revision'),
+    text: element.textContent?.replace(/\s+/g, ' ').trim() ?? '',
+  }))
+
+  await page.evaluate(async () => {
+    const response = await fetch('/__agent_fixture__/selected-job-disconnect', { method: 'POST' })
+    if (!response.ok) throw new Error('Could not arm the selected-job stream disconnect fixture.')
+  })
+  await expect.poll(() => fixture.selectedJobStreamSequences.length, { timeout: 10_000 }).toBeGreaterThanOrEqual(2)
+  expect(fixture.selectedJobReconnectSequence).not.toBeNull()
+  expect(fixture.selectedJobStreamSequences[1]).toBe(fixture.selectedJobReconnectSequence)
+
+  await expect(draft).toBeVisible()
+  await expect(draft).toContainText('Persisted cover-letter fixture body.')
+  await expect(draft).toHaveAttribute('data-draft-version', '1')
+  await expect(draft).toContainText('unsupported_claim')
+  await expect(draft).toContainText('Confirm this claim against your resume.')
+  await expect(plan).toBeVisible()
+  expect(await plan.evaluate(element => ({
+    session: element.getAttribute('data-agent-task-graph-session'),
+    revision: element.getAttribute('data-agent-task-graph-revision'),
+    text: element.textContent?.replace(/\s+/g, ' ').trim() ?? '',
+  }))).toEqual(planBeforeReconnect)
+
+  if ((await page.evaluate(() => window.innerWidth)) <= 900) await page.getByRole('button', { name: isZh ? '对话' : 'Conversations', exact: true }).click()
+  await page.getByText('B session evidence', { exact: true }).click()
+  await expect(page.locator('[data-selected-job-draft="true"]')).toHaveCount(0, { timeout: 10_000 })
+  await expect(page.locator('body')).not.toContainText('Persisted cover-letter fixture body.')
+  await expect(page.locator('[data-agent-task-graph-plan="true"]')).toHaveCount(0)
 })

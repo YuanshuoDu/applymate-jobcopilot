@@ -387,10 +387,74 @@ model AgentArtifact {
   version        Int                    @default(1)
   createdAt      DateTime               @default(now())
   updatedAt      DateTime               @updatedAt
+  versions       AgentArtifactVersion[]
 
   @@unique([userId, jobId, lifecycle, artifactType])
+  @@unique([id, userId, jobId])
   @@index([userId, jobId, lifecycle])
   @@map("agent_artifact")
+}
+
+// Immutable snapshots and task-call receipts for internal draft artifacts.
+model AgentArtifactVersion {
+  id             String   @id
+  artifactId     String
+  version        Int
+  userId         String
+  sessionId      String
+  jobId          String
+  artifactType   String
+  content        Json
+  contentHash    String
+  sourceDigest   String
+  constraintHash String
+  provenanceRefs String[] @default([])
+  evidenceRefs   String[] @default([])
+  baseId         String
+  baseHash       String
+  previousHash   String?
+  taskId         String
+  toolCallId     String
+  requestHash    String
+  createdAt      DateTime @default(now())
+
+  artifact AgentArtifact @relation(fields: [artifactId, userId, jobId], references: [id, userId, jobId], onDelete: Cascade, map: "agent_artifact_versions_artifact_scope_fkey")
+  session  AgentSession  @relation(fields: [sessionId, userId], references: [id, userId], onDelete: Cascade, map: "agent_artifact_versions_session_user_fkey")
+  reviews  AgentArtifactReview[]
+
+  @@unique([artifactId, version], map: "agent_artifact_version_artifact_version_key")
+  @@unique([taskId, toolCallId], map: "agent_artifact_version_task_tool_key")
+  @@unique([id, userId, sessionId, jobId, artifactId, version, contentHash, sourceDigest], map: "agent_artifact_version_review_ref_key")
+  @@index([userId, sessionId, jobId, artifactId, version], map: "agent_artifact_version_scope_lookup_idx")
+  @@map("agent_artifact_version")
+}
+
+// Reviewer decisions stay tied to one exact version and source digest.
+model AgentArtifactReview {
+  id                String   @id
+  artifactVersionId String
+  userId            String
+  sessionId         String
+  jobId             String
+  artifactId        String
+  version           Int
+  contentHash       String
+  sourceDigest      String
+  currentSourceDigest String
+  status            String
+  findings          Json     @default("[]")
+  evidenceRefs      String[] @default([])
+  taskId            String
+  toolCallId        String
+  requestHash       String
+  reviewHash        String
+  createdAt         DateTime @default(now())
+
+  artifactVersion AgentArtifactVersion @relation(fields: [artifactVersionId, userId, sessionId, jobId, artifactId, version, contentHash, sourceDigest], references: [id, userId, sessionId, jobId, artifactId, version, contentHash, sourceDigest], onDelete: Cascade, map: "agent_artifact_reviews_version_scope_fkey")
+
+  @@unique([taskId, toolCallId], map: "agent_artifact_review_task_tool_key")
+  @@index([userId, sessionId, jobId, artifactId, version, contentHash, sourceDigest], map: "agent_artifact_review_scope_lookup_idx")
+  @@map("agent_artifact_review")
 }
 
 // Durable idempotency ledger for the single external application-submit path.
@@ -1873,6 +1937,7 @@ model AgentSession {
   items              AgentItem[]
   events             AgentEvent[]
   toolResultReferences AgentToolResultReference[]
+  artifactVersions     AgentArtifactVersion[]
   waitConditions     AgentWaitCondition[]
   treeBudgetReservations AgentTreeBudgetReservation[]
   mailboxHydrationCheckpoints AgentMailboxHydrationCheckpoint[]
