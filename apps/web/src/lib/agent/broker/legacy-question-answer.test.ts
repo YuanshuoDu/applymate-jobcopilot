@@ -309,6 +309,33 @@ describe("answerLegacyQuestion", () => {
     expect(fixture.tx.agentExecution.updateMany).not.toHaveBeenCalled()
   })
 
+  it("does not attach a stopped Turn question to a newer active Turn in the same session", async () => {
+    const fixture = makeFixture()
+    fixture.state.question!.id = "agent-question:turn_1:legacy:q1"
+    fixture.state.item = null
+    fixture.state.turns[0]!.status = "interrupted"
+    fixture.state.turns.push({
+      id: "turn_2", sessionId: "session_1", userId: "user_1", status: "waiting_for_user", revision: 1,
+    })
+
+    const result = await answerLegacyQuestion(fixture.db, {
+      questionId: fixture.state.question!.id, userId: "user_1", answer: "yes",
+    })
+
+    expect(result).toMatchObject({ disposition: "legacy_only", reason: "turn_not_waiting" })
+    expect(fixture.state.question?.answer).toBeNull()
+    expect(fixture.state.turns).toEqual([
+      { id: "turn_1", sessionId: "session_1", userId: "user_1", status: "interrupted", revision: 5 },
+      { id: "turn_2", sessionId: "session_1", userId: "user_1", status: "waiting_for_user", revision: 1 },
+    ])
+    expect(fixture.state.execution.status).toBe("waiting_for_user")
+    expect(fixture.tx.agentRunQuestion.updateMany).not.toHaveBeenCalled()
+    expect(fixture.tx.agentTurn.updateMany).not.toHaveBeenCalled()
+    expect(fixture.tx.agentExecution.updateMany).not.toHaveBeenCalled()
+    expect(fixture.state.events).toHaveLength(0)
+    expect(fixture.state.outbox).toHaveLength(0)
+  })
+
   it("queues an unnamespaced legacy answer through a durable intent when no Turn exists", async () => {
     const fixture = makeFixture()
     fixture.state.question!.id = "legacy_question_1"
