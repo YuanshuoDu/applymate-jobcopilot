@@ -577,10 +577,10 @@ describe("owner-agnostic turn execution loop", () => {
   it("persists a waiting tool result before returning a dependency wait", async () => {
     const child = fixture(identity("task", "child-wait", 2), {
       id: "wait-call", toolName: "wait_subagents", toolVersion: "1", status: "completed",
-      output: { waitId: "wait-1", status: "waiting", deadlineAt: "2026-09-09T13:00:00.000Z", matchedTaskIds: [], taskIds: ["child-a"] }, errorCode: null,
+      output: { waitId: "wait-12345678-1234-4234-9234-123456789012", status: "waiting", deadlineAt: "2026-09-09T13:00:00.000Z", matchedTaskIds: [], taskIds: ["child-a"] }, errorCode: null,
     })
     const result = await runTurnExecutionLoop(child.options)
-    expect(result).toMatchObject({ status: "waiting_for_dependency", waitId: "wait-1", stepCount: 1, toolCallCount: 1 })
+    expect(result).toMatchObject({ status: "waiting_for_dependency", waitId: "wait-12345678-1234-4234-9234-123456789012", stepCount: 1, toolCallCount: 1 })
     expect(result.finalText).toBeUndefined()
     expect(child.requests).toHaveLength(1)
     expect(child.stepStatuses).toContain("waiting_for_tool")
@@ -589,15 +589,26 @@ describe("owner-agnostic turn execution loop", () => {
     expect(child.events.some(event => event.type === "turn.completed" || event.type === "turn.failed")).toBe(false)
   })
 
-  it.each([
-    { label: "ready", output: { waitId: "wait-ready", status: "ready", deadlineAt: "2026-09-09T13:00:00.000Z", matchedTaskIds: ["child-a"] } },
-    { label: "malformed", output: { waitId: "wait-invalid", status: "waiting", deadlineAt: 123, matchedTaskIds: "child-a" } },
-  ])("continues to the next model step for $label wait output", async ({ output }) => {
+  it("continues to the next model step for ready wait output", async () => {
+    const output = { waitId: "wait-ready", status: "ready", deadlineAt: "2026-09-09T13:00:00.000Z", matchedTaskIds: ["child-a"] }
     const root = fixture(identity("turn", "root-1"), { id: "wait-call", toolName: "wait_subagents", toolVersion: "1", status: "completed", output, errorCode: null })
     const result = await runTurnExecutionLoop(root.options)
     expect(result.status).toBe("completed")
     expect(root.requests).toHaveLength(2)
     expect(root.stepStatuses).toEqual(["completed", "completed"])
+  })
+
+  it.each([
+    { label: "malformed ID", output: { waitId: "wait-invalid", status: "waiting", deadlineAt: "2026-09-09T13:00:00.000Z", matchedTaskIds: [], taskIds: ["child-a"] } },
+    { label: "missing ID", output: { status: "waiting", deadlineAt: "2026-09-09T13:00:00.000Z", matchedTaskIds: [], taskIds: ["child-a"] } },
+  ])("fails the Turn visibly for a waiting receipt with a $label", async ({ output }) => {
+    const root = fixture(identity("turn", "root-1"), { id: "wait-call", toolName: "wait_subagents", toolVersion: "1", status: "completed", output, errorCode: null })
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "failed", errorCode: "invalid_output" })
+    expect(root.requests).toHaveLength(1)
+    expect(root.stepStatuses).toEqual(["failed"])
+    expect(root.events.some(event => event.type === "turn.failed")).toBe(true)
   })
 
 

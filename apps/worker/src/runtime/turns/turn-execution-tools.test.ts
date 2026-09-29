@@ -5,13 +5,13 @@ import { TurnExecutionEventWriter } from "./turn-execution-events.js"
 import type { TurnExecutionOptions } from "./turn-execution-types.js"
 import type { ToolCallRecovery } from "./turn-engine-types.js"
 
-function execution(recovery: ToolCallRecovery, executeTool: TurnExecutionOptions["executeTool"]) {
+function execution(recovery: ToolCallRecovery, executeTool: TurnExecutionOptions["executeTool"], validateToolArguments?: TurnExecutionOptions["validateToolArguments"]) {
   const updates: Array<{ itemId: string; status: string; content: unknown }> = []
   const events: Array<{ type: string; payload: unknown }> = []
   const options = {
     identity: { kind: "turn", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "root-1", rootTaskId: "root-1", ownerId: "worker-2", leaseVersion: 2, leaseExpiresAt: new Date("2026-09-10T00:00:00.000Z") },
     scope: { userId: "user-1" }, goal: "Find jobs", snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
-    toolCallRecovery: [recovery], executeTool, signal: new AbortController().signal,
+    toolCallRecovery: [recovery], executeTool, validateToolArguments, signal: new AbortController().signal,
     store: {
       updateItem: async (input: { itemId: string; expectedRevision: number; status: string; content: unknown }) => { updates.push(input); return { id: input.itemId, revision: input.expectedRevision + 1 } },
       createItem: async (input: { itemId: string }) => ({ id: input.itemId, revision: 0 }),
@@ -49,13 +49,14 @@ describe("recoverPersistedToolCalls", () => {
 })
 
 describe("executeTools persisted replay", () => {
+  const durableWaitId = "wait-12345678-1234-4234-9234-123456789012"
   const call = { id: "wait-call", name: "agent.wait", arguments: { idempotencyKey: "wait-1", taskIds: ["child-1"], mode: "all", timeoutMs: 30_000 } }
-  const waitReceipt = { waitId: "wait-1", status: "waiting", deadlineAt: "2026-09-10T00:00:00.000Z", matchedTaskIds: ["child-1"] }
+  const waitReceipt = { waitId: durableWaitId, status: "waiting", deadlineAt: "2026-09-10T00:00:00.000Z", matchedTaskIds: ["child-1"] }
   const resolvedInput = { taskIds: ["child-1"], mode: "all" }
-  const resolvedOutput = { waitId: "wait-1", status: "ready", matchedTaskIds: ["child-1"], targetTaskIds: ["child-1"], tasks: [{ taskId: "child-1", status: "completed" }] }
+  const resolvedOutput = { waitId: durableWaitId, status: "ready", matchedTaskIds: ["child-1"], targetTaskIds: ["child-1"], tasks: [{ taskId: "child-1", status: "completed" }] }
 
   function projection(output: unknown, input: unknown = resolvedInput, includeInput = true) {
-    return { id: "wait-result:wait-1", content: { toolCallId: "wait:wait-1", toolName: "agent.wait", ...(includeInput ? { input } : {}), status: "completed", output } }
+    return { id: `wait-result:${durableWaitId}`, content: { toolCallId: `wait:${durableWaitId}`, toolName: "agent.wait", ...(includeInput ? { input } : {}), status: "completed", output } }
   }
 
   function replayFixture(output: unknown, persistedCall = call, additionalToolObservations: readonly { id: string; content: unknown }[] = []) {
@@ -97,9 +98,63 @@ describe("executeTools persisted replay", () => {
 
     const result = await replay(fixture)
 
-    expect(result.wait).toEqual({ status: "waiting_for_dependency", waitId: "wait-1", stepCount: 0, toolCallCount: 0 })
+    expect(result.wait).toEqual({ status: "waiting_for_dependency", waitId: durableWaitId, stepCount: 0, toolCallCount: 0 })
     expect(result.snapshot).toBe(fixture.options.snapshot)
     expect(fixture.executeTool).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ["redaction marker", { ...waitReceipt, waitId: "[REDACTED]" }],
+    ["missing", { status: "waiting", deadlineAt: "2026-09-10T00:00:00.000Z", matchedTaskIds: [] }],
+  ] as const)("fails persisted waiting receipts with a %s ID instead of handing them off", async (_label, output) => {
+    const fixture = replayFixture(output)
+
+    await expect(replay(fixture)).rejects.toMatchObject({ code: "invalid_output" })
+    expect(fixture.executeTool).not.toHaveBeenCalled()
+  })
+
+  it.each(["durable_wait_receipt_invalid", "schema_error"] as const)("surfaces failed agent.wait receipt validation as terminal for %s", async errorCode => {
+    const executeTool = vi.fn(async () => ({
+      id: call.id, toolName: call.name, toolVersion: "1", status: "failed" as const, errorCode,
+    }))
+    const fixture = execution(pending, executeTool as never, () => true)
+
+    await expect(executeTools(
+      fixture.options,
+      fixture.writer,
+      { id: "step-1", ordinal: 1 },
+      { text: "", reasoningSummary: "", toolCalls: [call], provider: "fixture", model: "fixture-model", finishReason: "tool_calls", usage: null, continuation: null },
+      fixture.options.snapshot,
+      new Set(),
+      fixture.options.signal!,
+      () => new Date("2026-09-09T00:00:00.000Z"),
+      undefined,
+      vi.fn(),
+    )).rejects.toMatchObject({ code: "invalid_output" })
+    expect(executeTool).toHaveBeenCalledTimes(1)
+  })
+
+  it("keeps an invalid wait input schema error recoverable", async () => {
+    const executeTool = vi.fn(async () => ({
+      id: call.id, toolName: call.name, toolVersion: "1", status: "failed" as const, errorCode: "schema_error",
+    }))
+    const fixture = execution(pending, executeTool as never, () => "invalid wait arguments")
+
+    const result = await executeTools(
+      fixture.options,
+      fixture.writer,
+      { id: "step-1", ordinal: 1 },
+      { text: "", reasoningSummary: "", toolCalls: [call], provider: "fixture", model: "fixture-model", finishReason: "tool_calls", usage: null, continuation: null },
+      fixture.options.snapshot,
+      new Set(),
+      fixture.options.signal!,
+      () => new Date("2026-09-09T00:00:00.000Z"),
+      undefined,
+      vi.fn(),
+    )
+
+    expect(result.wait).toBeNull()
+    expect(executeTool).toHaveBeenCalledTimes(1)
   })
 
   it("does not re-handoff a stale wait receipt when its resolved outcome is in the snapshot", async () => {
@@ -117,19 +172,19 @@ describe("executeTools persisted replay", () => {
       label: "ready any with one matched target",
       modelCall: { ...call, arguments: { ...call.arguments, taskIds: ["child-b", "child-a"], mode: "any" } },
       input: { taskIds: ["child-a", "child-b"], mode: "any" },
-      output: { waitId: "wait-1", status: "ready", matchedTaskIds: ["child-b"], targetTaskIds: ["child-a", "child-b"], tasks: [{ taskId: "child-a", status: "completed" }, { taskId: "child-b", status: "failed" }] },
+      output: { waitId: durableWaitId, status: "ready", matchedTaskIds: ["child-b"], targetTaskIds: ["child-a", "child-b"], tasks: [{ taskId: "child-a", status: "completed" }, { taskId: "child-b", status: "failed" }] },
     },
     {
       label: "ready all with every target matched",
       modelCall: { ...call, arguments: { ...call.arguments, taskIds: ["child-b", "child-a"] } },
       input: { taskIds: ["child-a", "child-b"], mode: "all" },
-      output: { waitId: "wait-1", status: "ready", matchedTaskIds: ["child-a", "child-b"], targetTaskIds: ["child-a", "child-b"], tasks: [{ taskId: "child-a", status: "completed" }, { taskId: "child-b", status: "completed" }] },
+      output: { waitId: durableWaitId, status: "ready", matchedTaskIds: ["child-a", "child-b"], targetTaskIds: ["child-a", "child-b"], tasks: [{ taskId: "child-a", status: "completed" }, { taskId: "child-b", status: "completed" }] },
     },
     {
       label: "timed out with no matched targets",
       modelCall: { ...call, arguments: { ...call.arguments, taskIds: ["child-b", "child-a"] } },
       input: { taskIds: ["child-a", "child-b"], mode: "all" },
-      output: { waitId: "wait-1", status: "timed_out", matchedTaskIds: [], targetTaskIds: ["child-a", "child-b"], tasks: [{ taskId: "child-a", status: "completed" }, { taskId: "child-b", status: "running" }] },
+      output: { waitId: durableWaitId, status: "timed_out", matchedTaskIds: [], targetTaskIds: ["child-a", "child-b"], tasks: [{ taskId: "child-a", status: "completed" }, { taskId: "child-b", status: "running" }] },
     },
   ])("accepts a valid $label projection", async ({ modelCall, input, output }) => {
     const fixture = replayFixture({ ...waitReceipt, matchedTaskIds: output.matchedTaskIds }, modelCall, [projection(output, input)])
@@ -141,7 +196,7 @@ describe("executeTools persisted replay", () => {
   })
 
   const multiResolvedOutput = {
-    waitId: "wait-1", status: "ready", matchedTaskIds: ["child-a", "child-b"], targetTaskIds: ["child-a", "child-b"],
+    waitId: durableWaitId, status: "ready", matchedTaskIds: ["child-a", "child-b"], targetTaskIds: ["child-a", "child-b"],
     tasks: [{ taskId: "child-a", status: "completed" }, { taskId: "child-b", status: "completed" }],
   }
 
@@ -163,7 +218,7 @@ describe("executeTools persisted replay", () => {
 
     const result = await replay(fixture, modelCall)
 
-    expect(result.wait).toEqual({ status: "waiting_for_dependency", waitId: "wait-1", stepCount: 0, toolCallCount: 0 })
+    expect(result.wait).toEqual({ status: "waiting_for_dependency", waitId: durableWaitId, stepCount: 0, toolCallCount: 0 })
     expect(fixture.executeTool).not.toHaveBeenCalled()
   })
 

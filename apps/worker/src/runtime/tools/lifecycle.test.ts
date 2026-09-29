@@ -164,6 +164,19 @@ describe("ToolLifecycle", () => {
     expect(sink.events[0]?.payload.output).toEqual(output)
   })
 
+  it.each([
+    { label: "malformed", output: { ...durableWaitReceipt, waitId: "wait-123", status: "waiting" } },
+    { label: "missing", output: { status: "waiting", deadlineAt: "2026-09-29T12:00:00.000Z", matchedTaskIds: [] } },
+  ])("rejects a $label wait ID before persisting a waiting receipt", async ({ output }) => {
+    const sink = new InMemoryToolLifecycleSink()
+    const lifecycle = new ToolLifecycle({ sink })
+
+    await expect(lifecycle.completed({ ...call, toolName: "agent.wait" }, output)).rejects.toMatchObject({
+      code: "durable_wait_receipt_invalid",
+    })
+    expect(sink.events).toHaveLength(0)
+  })
+
   it("keeps generic redaction for canonical wait-shaped IDs on unrelated tools", async () => {
     const lifecycle = new ToolLifecycle({ sink: new InMemoryToolLifecycleSink() })
     const output = await lifecycle.completed(call, { waitId: durableWaitReceipt.waitId })

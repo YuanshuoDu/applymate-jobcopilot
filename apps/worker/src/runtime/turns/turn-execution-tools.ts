@@ -6,6 +6,7 @@ import type { TurnExecutionOptions } from "./turn-execution-types.js"
 import { assertExecutionAlive } from "./turn-engine-helpers.js"
 import type { StepContext } from "../context/step-context-builder.js"
 import type { SteeringMarkerPayload } from "../context/steering-marker.js"
+import { isDurableWaitId } from "../tools/redaction.js"
 
 type MarkerState = { readonly active: readonly SteeringMarkerPayload[] } | undefined
 type ToolOutcome = { readonly wait: TurnEngineResult | null; readonly snapshot: TurnExecutionOptions["snapshot"]; readonly steeringMarkerState: MarkerState }
@@ -50,6 +51,12 @@ export async function executeTools(
     assertExecutionAlive(options, signal)
     if (result.status === "failed" && result.errorCode === "policy_requires_approval") return { wait: { status: "waiting_for_approval", stepCount: 0, toolCallCount: 0, errorCode: result.errorCode }, snapshot, steeringMarkerState: markerState }
     if (result.status === "failed" && (result.errorCode === "policy_requires_user_input" || result.errorCode === "gmail_oauth_required")) return { wait: { status: "waiting_for_user", stepCount: 0, toolCallCount: 0, errorCode: result.errorCode }, snapshot, steeringMarkerState: markerState }
+    const failedWaitCall = result.status === "failed" && (call.name === "agent.wait" || call.name === "wait_subagents")
+    const invalidWaitOutput = failedWaitCall && (result.errorCode === "durable_wait_receipt_invalid"
+      || (result.errorCode === "schema_error" && options.validateToolArguments?.(call.name, call.arguments) === true))
+    if (invalidWaitOutput) {
+      throw new TurnEngineError("invalid_output", "Durable wait receipt is invalid")
+    }
     snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, { id: `tool-result:${call.id}`, content: toRepositoryJson({ toolCallId: call.id, toolName: call.name, input: call.arguments, status: result.status, output: result.output ?? null, errorCode: result.errorCode }) }] }
     if (call.name === "agent.plan" && result.status === "completed" && hasAcceptedTaskGraphPlan(result.output)) snapshot = await options.refreshTaskGraphAfterPlan?.(snapshot) ?? snapshot
     else if (call.name === "agent.wait" && result.status === "completed" && isInlineReadyWait(result.output)) snapshot = await options.refreshTaskGraphAfterReadyWait?.(snapshot) ?? snapshot
@@ -104,8 +111,11 @@ function isInlineReadyWait(value: unknown): boolean { return Boolean(value && ty
 function dependencyWaitReceipt(value: unknown): DependencyWaitReceipt | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null
   const record = value as Record<string, unknown>
-  if (record.status !== "waiting" || typeof record.waitId !== "string" || !record.waitId.trim() || typeof record.deadlineAt !== "string" || !record.deadlineAt.trim() || !Array.isArray(record.matchedTaskIds)) return null
-  if (!record.matchedTaskIds.every(item => typeof item === "string" && item.trim().length > 0)) return null
+  if (record.status !== "waiting") return null
+  if (!isDurableWaitId(record.waitId) || typeof record.deadlineAt !== "string" || !record.deadlineAt.trim()
+    || !Array.isArray(record.matchedTaskIds) || !record.matchedTaskIds.every(item => typeof item === "string" && item.trim().length > 0)) {
+    throw new TurnEngineError("invalid_output", "Durable wait receipt is invalid")
+  }
   return { waitId: record.waitId, deadlineAt: record.deadlineAt, matchedTaskIds: record.matchedTaskIds }
 }
 

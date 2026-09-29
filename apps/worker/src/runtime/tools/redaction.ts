@@ -53,6 +53,10 @@ const SPAWN_STATUSES = new Set(["queued", "running", "retrying", "waiting", "wai
 const MAX_SUBAGENT_DEPTH = 8
 const DURABLE_WAIT_ID = /^wait-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 
+export function isDurableWaitId(value: unknown): value is string {
+  return typeof value === "string" && DURABLE_WAIT_ID.test(value)
+}
+
 /**
  * TaskGraph and spawn receipts preserve generated structural IDs used by
  * later tool calls. Rebuild each exact receipt shape so arbitrary fields never
@@ -138,14 +142,18 @@ export function prepareDurableWaitOutput(value: unknown): PreparedLifecycleValue
   if (value === null || typeof value !== "object" || Array.isArray(value)) return prepareLifecycleValue(value)
   const prototype = Object.getPrototypeOf(value)
   const waitId = Object.getOwnPropertyDescriptor(value, "waitId")
-  if (!waitId) return prepareLifecycleValue(value)
-  if ((prototype !== Object.prototype && prototype !== null) || !waitId.enumerable || !("value" in waitId)) {
+  if (waitId && ((prototype !== Object.prototype && prototype !== null) || !waitId.enumerable || !("value" in waitId))) {
     throw invalidWaitReceipt()
   }
 
   const prepared = prepareLifecycleValue(value)
-  if (prepared.safe === null || typeof prepared.safe !== "object" || Array.isArray(prepared.safe)) throw invalidWaitReceipt()
-  const safeWaitId = typeof waitId.value === "string" && DURABLE_WAIT_ID.test(waitId.value) ? waitId.value : "[REDACTED]"
+  if (prepared.safe === null || typeof prepared.safe !== "object" || Array.isArray(prepared.safe)) {
+    if (waitId) throw invalidWaitReceipt()
+    return prepared
+  }
+  const safeWaitId = waitId && isDurableWaitId(waitId.value) ? waitId.value : "[REDACTED]"
+  if (prepared.safe.status === "waiting" && safeWaitId === "[REDACTED]") throw invalidWaitReceipt()
+  if (!waitId) return prepared
   return prepareSafeValue({ ...prepared.safe, waitId: safeWaitId })
 }
 
