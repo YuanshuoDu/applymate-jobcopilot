@@ -109,6 +109,10 @@ jobs:
           AGENT_TURN_REDIS_TEST_DISPOSABLE: "true"
           REDIS_URL: redis://127.0.0.1:6379/15
         run: pnpm --filter @jobcopilot/worker exec vitest run src/queue/production-bootstrap-process-restart.integration.test.ts
+      - name: Verify dispatch and claim lock order on disposable PostgreSQL
+        env:
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+        run: pnpm --filter @jobcopilot/worker exec vitest run src/runtime/turns/recovery-scanner-lock-order-pg.integration.test.ts
   lockfile:
     name: Lockfile
     runs-on: ubuntu-latest
