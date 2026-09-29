@@ -27,6 +27,7 @@ import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
 import { drainTaskGraphStopOutbox, TASK_GRAPH_STOP_OUTBOX_TOPIC } from "./task-graph-stop-outbox.js"
 import { taskGraphLifecycleKey } from "./task-graph-snapshot.js"
+import type { SubagentExecutionResult } from "./types.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const PLAN_CALL_ID = "p3-resume-plan"
@@ -3000,6 +3001,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   const failureOwner = fixture()
   const stopOwner = fixture()
   const restartOwner = fixture()
+  const cancelledOwner = fixture()
   let pool: Pool | undefined
   let redis: Redis | undefined
   let bootstrap: ProductionWorkerBootstrap | undefined
@@ -3024,6 +3026,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await seed(pool, failureOwner, "waiting_for_user")
     await seed(pool, stopOwner, "waiting_for_user")
     await seed(pool, restartOwner, "waiting_for_user")
+    await seed(pool, cancelledOwner, "waiting_for_user")
   }, 15_000)
 
   afterEach(async () => {
@@ -3039,7 +3042,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       }
     }
     await attempt("bootstrap close", async () => { await bootstrap?.close() })
-    if (pool) for (const current of [owner, failureOwner, stopOwner, restartOwner]) {
+    if (pool) for (const current of [owner, failureOwner, stopOwner, restartOwner, cancelledOwner]) {
       await attempt("delete outbox for " + current.sessionId, () => pool!.query(
         "DELETE FROM \"agent_outbox\" WHERE \"aggregateId\" = $1", [current.sessionId],
       ))
@@ -3066,7 +3069,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           jobs = await queue.getJobs(["completed", "failed", "waiting", "delayed", "paused", "waiting-children", "active"])
         })
         for (const job of jobs) {
-          if ([owner, failureOwner, stopOwner, restartOwner].some(current => job.data?.turnId === current.turnId || job.data?.sessionId === current.sessionId)) {
+          if ([owner, failureOwner, stopOwner, restartOwner, cancelledOwner].some(current => job.data?.turnId === current.turnId || job.data?.sessionId === current.sessionId)) {
             await attempt("remove " + label + " job " + job.id, () => job.remove())
           }
         }
@@ -4365,6 +4368,183 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       [failureOwner.sessionId, `subagent-dispatch:${dependent?.id}`],
     )
     expect(descendantDispatch.rowCount).toBe(0)
+  }, 90_000)
+
+  it("cancels dependent descendants when a running child independently completes as cancelled", async () => {
+    const [
+      { createProductionWorkerBootstrap },
+      { createTurnQueue, enqueueTurn, TURN_QUEUE_NAME },
+      subagentQueue,
+      { createCanonicalTurnRuntime },
+      { createPgTaskGraphCommandPort },
+    ] = await Promise.all([
+      import("../../queue/production-bootstrap.js"),
+      import("../turns/turn-queue.js"),
+      import("../../queue/subagent-queue.js"),
+      import("../canonical-turn-runtime.js"),
+      import("./pg-task-graph-command-port.js"),
+    ])
+    const owner = cancelledOwner
+    turnQueueName = TURN_QUEUE_NAME
+    childQueueName = subagentQueue.SUBAGENT_QUEUE_NAME
+    const flags: ProductionAgentFlags = {
+      taskGraphPlanningEnabled: true,
+      childExecutionEnabled: true,
+      coordinationEnabled: true,
+      consumeWaitOutcomes: true,
+      canonicalAutomationEnabled: false,
+    }
+    const cancellationCallId = "p3-cancelled-child-plan"
+    const cancellationWaitCallId = "p3-cancelled-child-wait"
+    const sourceGoal = "Run and independently cancel the source task"
+    const dependentGoal = "Must not run after its source is cancelled"
+    const transitiveGoal = "Must not run after its ancestor is cancelled"
+    const finalMarker = "p3-cancelled-child-descendants-terminated"
+    let rootRuntimeExecutions = 0
+    const dispatchedGoals: string[] = []
+    const runtime = await createCanonicalTurnRuntime(pool!, {
+      workerId: owner.ownerId,
+      productionFlags: flags,
+      taskGraphCommandPort: createPgTaskGraphCommandPort(pool!),
+      taskGraphTemplates: {
+        analyst: { role: "analyst", taskType: "research", allowedActions: ["jobs.search"] },
+      },
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => {
+        const execution = ++rootRuntimeExecutions
+        let modelRounds = 0
+        const model: ModelAdapter = {
+          id: "p3-task-graph-cancelled-child-fixture-model",
+          profile: {
+            provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true,
+            continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false,
+            supportsReasoningSummary: false, supportsResponseContinuation: false, supportsProviderConversation: false,
+            supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low",
+          },
+          async *stream(request) {
+            modelRounds += 1
+            if (execution === 1 && modelRounds === 1) {
+              yield {
+                type: "tool_call_completed", callId: cancellationCallId, name: "agent.plan",
+                arguments: {
+                  expectedRevision: 0,
+                  nodes: [
+                    { key: "source", templateId: "analyst", goal: sourceGoal, successCriteria: ["Finish with cancelled status"], dependsOn: [] },
+                    { key: "dependent", templateId: "analyst", goal: dependentGoal, successCriteria: ["Remain undispatched"], dependsOn: ["source"] },
+                    { key: "transitive", templateId: "analyst", goal: transitiveGoal, successCriteria: ["Remain undispatched"], dependsOn: ["dependent"] },
+                  ],
+                },
+              }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if (execution === 1 && modelRounds === 2) {
+              expect(request.tools.map(tool => record(tool)?.name)).toContain("agent.wait")
+              yield {
+                type: "tool_call_completed", callId: cancellationWaitCallId, name: "agent.wait",
+                arguments: {
+                  idempotencyKey: `p3-task-graph-cancelled-child-wait:${owner.turnId}`,
+                  taskIds: planTaskIds(request, cancellationCallId, 3), mode: "all", timeoutMs: 20_000,
+                },
+              }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if (execution === 2 && modelRounds === 1) {
+              const graph = currentGraphFromRequest(request)
+              const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+              expect(nodes.map(node => [node?.key, node?.status])).toEqual([
+                ["source", "cancelled"], ["dependent", "cancelled"], ["transitive", "cancelled"],
+              ])
+              const outcome = waitOutcomeFromRequest(request, 3)
+              expect(outcome.status).toBe("ready")
+              expect(outcome.tasks.map(task => record(task)?.status).sort()).toEqual(["cancelled", "cancelled", "cancelled"])
+              yield { type: "text_delta", text: finalMarker }
+              yield { type: "completed", finishReason: "stop" }
+              return
+            }
+            throw new Error("Unexpected model execution or round in the cancelled-child fixture")
+          },
+        }
+        return { adapter: model, registry: {} as never, candidates: [] }
+      },
+    })
+    await activateFixtureTurn(pool!, owner)
+    bootstrap = await createProductionWorkerBootstrap({
+      pool: pool!,
+      runtime,
+      ownerId: owner.ownerId,
+      turnQueueFactory: createTurnQueue,
+      turnRecoveryIntervalMs: 100,
+      waitResolver: { intervalMs: 10, batchSize: 10, ownerId: `p3-cancelled-child-wait-resolver-${owner.suffix}` },
+      subagents: {
+        intervalMs: 10,
+        async execute({ lease }) {
+          await waitForSuspendedParent(pool!, owner.turnId)
+          dispatchedGoals.push(lease.goal)
+          if (lease.goal === sourceGoal) {
+            const running = await pool!.query<{ status: string }>(
+              `SELECT "status" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`,
+              [lease.id, owner.sessionId],
+            )
+            expect(running.rows[0]?.status).toBe("running")
+            // The persisted lifecycle supports child cancellation even though
+            // the current executor result type does not yet name this status.
+            return { status: "cancelled", failureReason: "The fixture cancelled its own active child." } as unknown as SubagentExecutionResult
+          }
+          return { status: "completed", result: { proof: `unexpected execution: ${lease.goal}` } }
+        },
+      },
+    })
+
+    await enqueueTurn(pool!, bootstrap.turns.queue, {
+      turnId: owner.turnId, sessionId: owner.sessionId, ownerId: owner.ownerId,
+    })
+    try {
+      await waitForTurnStatus(pool!, owner.turnId, "completed", 50_000, cancellationWaitCallId)
+    } catch (error: unknown) {
+      const progress = await turnProgressDiagnostics(pool!, owner.turnId, cancellationWaitCallId)
+      throw new Error(combineFailureDiagnostics([
+        { label: "cancelledChildFixture", value: "failed" },
+        { label: "turnFailure", value: waitTurnFailureSummary(error) },
+      ], progress))
+    }
+
+    expect(rootRuntimeExecutions).toBe(2)
+    expect(dispatchedGoals).toEqual([sourceGoal])
+    const turn = await pool!.query<{ rootTaskId: string; finalResponse: string | null }>(
+      `SELECT "rootTaskId", "finalResponse" FROM "agent_turns" WHERE "id" = $1`, [owner.turnId],
+    )
+    const rootTaskId = turn.rows[0]?.rootTaskId
+    expect(rootTaskId).toBeTruthy()
+    expect(turn.rows[0]?.finalResponse).toContain(finalMarker)
+
+    const children = await pool!.query<{ id: string; goal: string; status: string }>(
+      `SELECT "id", "goal", "status" FROM "sub_agent_tasks"
+       WHERE "sessionId" = $1 AND "turnId" = $2 AND "parentTaskId" = $3 ORDER BY "goal"`,
+      [owner.sessionId, owner.turnId, rootTaskId],
+    )
+    expect(Object.fromEntries(children.rows.map(child => [child.goal, child.status]))).toEqual({
+      [dependentGoal]: "cancelled",
+      [sourceGoal]: "cancelled",
+      [transitiveGoal]: "cancelled",
+    })
+
+    for (const child of children.rows) {
+      const cancellationEvent = await pool!.query<{ payload: RecordValue }>(
+        `SELECT "payload" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
+          AND "taskId" = $3 AND "payload"->>'kind' = 'lifecycle'`,
+        [owner.sessionId, owner.turnId, child.id],
+      )
+      expect(cancellationEvent.rows.map(event => record(record(event.payload)?.event)?.type)).toContain("task.cancelled")
+      if (child.goal === sourceGoal) continue
+      const dispatch = await pool!.query(
+        `SELECT 1 FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch'
+          AND "idempotencyKey" = $2`,
+        [owner.sessionId, `subagent-dispatch:${child.id}`],
+      )
+      expect(dispatch.rowCount).toBe(0)
+    }
   }, 90_000)
 
   it("stops an exact TaskGraph Turn, projects interrupted receipts, and removes every unpublished graph dispatch", async () => {
