@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import { canonicalJson, redactSensitiveText, redactSensitiveValue } from "@jobcopilot/shared"
+import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
 export const DEFAULT_MAX_LIFECYCLE_BYTES = 8 * 1024
 
 export interface ToolResultReference {
@@ -46,8 +47,6 @@ export function prepareLifecycleValue(value: unknown): PreparedLifecycleValue {
 const PLAN_RECEIPT_FIELDS = ["status", "revision", "nodes", "readyTaskIds"] as const
 const PLAN_NODE_FIELDS = ["key", "taskId", "status"] as const
 const SUBAGENT_TASK_ID = /^subagent-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
-const MAX_TASK_GRAPH_NODES = 8
-const MAX_TASK_GRAPH_KEY_LENGTH = 128
 const SPAWN_RECEIPT_FIELDS = ["taskId", "rootTaskId", "parentTaskId", "path", "depth", "status", "replay"] as const
 const SPAWN_STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
 const MAX_SUBAGENT_DEPTH = 8
@@ -67,13 +66,13 @@ export function prepareTaskGraphPlanReceipt(value: unknown): PreparedLifecycleVa
   if (receipt.status !== "accepted" && receipt.status !== "duplicate") throw invalidPlanReceipt()
   if (typeof receipt.revision !== "number" || !Number.isSafeInteger(receipt.revision) || receipt.revision < 1) throw invalidPlanReceipt()
 
-  const inputNodes = denseArray(receipt.nodes, 1, MAX_TASK_GRAPH_NODES)
+  const inputNodes = denseArray(receipt.nodes, 1, TASK_GRAPH_LIMITS.maxNodes)
   const nodes: Array<{ key: string; taskId: string; status: "queued" | "waiting" }> = []
   const keys = new Set<string>()
   const taskIds = new Set<string>()
   for (const value of inputNodes) {
     const node = exactObject(value, PLAN_NODE_FIELDS)
-    if (typeof node.key !== "string" || node.key.trim().length === 0 || node.key.length > MAX_TASK_GRAPH_KEY_LENGTH
+    if (typeof node.key !== "string" || node.key.trim().length === 0 || node.key.length > TASK_GRAPH_LIMITS.maxKeyLength
       || redactSensitiveText(node.key) !== node.key) throw invalidPlanReceipt()
     if (typeof node.taskId !== "string" || !SUBAGENT_TASK_ID.test(node.taskId)) throw invalidPlanReceipt()
     if (node.status !== "queued" && node.status !== "waiting") throw invalidPlanReceipt()
@@ -83,7 +82,7 @@ export function prepareTaskGraphPlanReceipt(value: unknown): PreparedLifecycleVa
     nodes.push({ key: node.key, taskId: node.taskId, status: node.status })
   }
 
-  const inputReadyTaskIds = denseArray(receipt.readyTaskIds, 0, MAX_TASK_GRAPH_NODES)
+  const inputReadyTaskIds = denseArray(receipt.readyTaskIds, 0, TASK_GRAPH_LIMITS.maxNodes)
   const readyTaskIds = inputReadyTaskIds.map(value => {
     if (typeof value !== "string" || !SUBAGENT_TASK_ID.test(value)) throw invalidPlanReceipt()
     return value

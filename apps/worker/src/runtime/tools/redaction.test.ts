@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 
-import { InMemoryToolResultReferenceStore, prepareDurableWaitOutput, prepareLifecycleValue, prepareSubagentSpawnReceipt, sanitizeForLifecycle } from "./redaction.js"
+import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
+import { InMemoryToolResultReferenceStore, prepareDurableWaitOutput, prepareLifecycleValue, prepareSubagentSpawnReceipt, prepareTaskGraphPlanReceipt, sanitizeForLifecycle } from "./redaction.js"
 
 const turnId = "c123456789012345678901234"
 const rootTaskId = `root-${turnId}`
@@ -16,6 +17,30 @@ const spawnReceipt = {
 } as const
 
 describe("tool lifecycle redaction", () => {
+  it("uses the shared TaskGraph limits for plan receipts", () => {
+    const node = (index: number, key: string) => ({
+      key,
+      taskId: `subagent-00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+      status: "queued" as const,
+    })
+    const receipt = (nodes: ReturnType<typeof node>[]) => ({
+      status: "accepted" as const,
+      revision: 1,
+      nodes,
+      readyTaskIds: nodes.map(item => item.taskId),
+    })
+    const atNodeLimit = Array.from({ length: TASK_GRAPH_LIMITS.maxNodes }, (_, index) => node(index, `task-${index}`))
+    expect(() => prepareTaskGraphPlanReceipt(receipt(atNodeLimit))).not.toThrow()
+    expect(() => prepareTaskGraphPlanReceipt(receipt([...atNodeLimit, node(atNodeLimit.length, "overflow")]))).toThrow("task_graph_receipt_invalid")
+
+    const atKeyLimit = receipt([node(0, "k".repeat(TASK_GRAPH_LIMITS.maxKeyLength))])
+    expect(() => prepareTaskGraphPlanReceipt(atKeyLimit)).not.toThrow()
+    expect(() => prepareTaskGraphPlanReceipt({
+      ...atKeyLimit,
+      nodes: [node(0, `${"k".repeat(TASK_GRAPH_LIMITS.maxKeyLength)}k`)],
+    })).toThrow("task_graph_receipt_invalid")
+  })
+
   it("preserves only a canonical generated durable wait ID", () => {
     const waitId = "wait-12345678-1234-4234-9234-123456789012"
     const output = { waitId, status: "ready", detail: "Contact candidate@example.com at 202-555-0199" }
