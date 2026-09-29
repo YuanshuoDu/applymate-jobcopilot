@@ -25,7 +25,6 @@ import type { RuntimeToolDefinition, SelectedJobPreparationContext, ToolRouterCo
 
 /** Public metadata keeps the runtime's readonly tool contracts without exposing execution functions to the model. */
 export type ChildPublicDefinition = Omit<RuntimeToolDefinition, "execute">
-
 export type ChildToolRuntime = {
   readonly definitions: readonly ChildPublicDefinition[]
   readonly router: { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> }
