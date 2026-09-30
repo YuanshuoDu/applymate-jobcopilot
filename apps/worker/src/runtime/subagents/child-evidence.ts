@@ -171,7 +171,21 @@ function recordArtifactToolResult(index: ObservedEvidenceIndex, value: unknown):
 }
 
 function normalizeStructuredResult(value: StructuredRoleResult, index: ObservedEvidenceIndex): StructuredRoleResult | undefined {
-  if (value.role === "writer") return index.artifactResults.get(artifactResultKey(value))
+  if (value.role === "writer") {
+    let latestVersion = 0
+    let hasConflictingReference = false
+    const referencesByVersion = new Map<number, string>()
+    for (const observed of index.artifactResults.values()) {
+      if (observed.role !== "writer" || observed.artifactRef.artifactId !== value.artifactRef.artifactId) continue
+      const reference = artifactReferenceKey(observed.artifactRef)
+      const previous = referencesByVersion.get(observed.artifactRef.version)
+      if (previous !== undefined && previous !== reference) hasConflictingReference = true
+      else referencesByVersion.set(observed.artifactRef.version, reference)
+      latestVersion = Math.max(latestVersion, observed.artifactRef.version)
+    }
+    if (hasConflictingReference || latestVersion !== value.artifactRef.version) return undefined
+    return index.artifactResults.get(artifactResultKey(value))
+  }
   if (value.role === "reviewer") {
     if (!index.artifactReads.has(artifactReferenceKey(value.artifactRef))) return undefined
     return index.artifactResults.get(artifactResultKey(value))

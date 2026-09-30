@@ -35,6 +35,34 @@ describe('selected job draft artifact projection', () => {
     expect(latestWriterArtifact('session-1', [olderDraft, currentDraft], activeGraph)).toEqual(ref)
   })
 
+  it('selects the highest artifact version even when an older Writer task updated later', () => {
+    const activeGraph = { sessionId: 'session-1', graphItemId: 'graph-1', turnId: 'turn-1', rootTaskId: 'root-1', revision: 2 }
+    const olderRef = { ...ref, version: 1, contentHash: `sha256:${'c'.repeat(64)}` }
+    const olderTask = task({ id: 'writer-old', rootTaskId: 'root-1', artifactRef: olderRef, updatedAt: '2026-09-30T00:02:00Z' })
+    const newerTask = task({ id: 'writer-new', rootTaskId: 'root-1', updatedAt: '2026-09-30T00:01:00Z' })
+
+    expect(latestWriterArtifact('session-1', [olderTask, newerTask], activeGraph)).toEqual(ref)
+  })
+
+  it('fails closed when the highest version has conflicting immutable refs', () => {
+    const activeGraph = { sessionId: 'session-1', graphItemId: 'graph-1', turnId: 'turn-1', rootTaskId: 'root-1', revision: 2 }
+    const conflictingRef = { ...ref, contentHash: `sha256:${'c'.repeat(64)}` }
+    const olderTask = task({ id: 'writer-old', rootTaskId: 'root-1', artifactRef: { ...ref, version: 1 } })
+    const highestTask = task({ id: 'writer-new', rootTaskId: 'root-1' })
+    const conflictingTask = task({ id: 'writer-conflict', rootTaskId: 'root-1', artifactRef: conflictingRef })
+
+    expect(latestWriterArtifact('session-1', [olderTask, highestTask, conflictingTask], activeGraph)).toBeNull()
+  })
+
+  it('deduplicates identical refs independently of task order', () => {
+    const activeGraph = { sessionId: 'session-1', graphItemId: 'graph-1', turnId: 'turn-1', rootTaskId: 'root-1', revision: 2 }
+    const duplicate = task({ id: 'writer-duplicate', rootTaskId: 'root-1', updatedAt: '2026-09-30T00:01:00Z' })
+    const original = task({ rootTaskId: 'root-1', updatedAt: '2026-09-30T00:02:00Z' })
+
+    expect(latestWriterArtifact('session-1', [duplicate, original], activeGraph)).toEqual(ref)
+    expect(latestWriterArtifact('session-1', [original, duplicate], activeGraph)).toEqual(ref)
+  })
+
   it('builds a URL bound to the full immutable ref', () => {
     expect(selectedDraftArtifactUrl('session/1', ref)).toBe(`/api/agent/sessions/session%2F1/artifacts/draft%2F1/versions/2?contentHash=${encodeURIComponent(ref.contentHash)}&sourceDigest=${encodeURIComponent(ref.sourceDigest)}`)
   })

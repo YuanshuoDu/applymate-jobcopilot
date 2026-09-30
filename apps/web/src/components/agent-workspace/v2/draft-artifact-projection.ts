@@ -55,9 +55,16 @@ export function latestWriterArtifact(
     && task.turnId === activeGraph.turnId && task.rootTaskId === activeGraph.rootTaskId
     && task.role === 'writer'
     && task.taskType === 'cover_letter_draft' && validArtifactRef(task.artifactRef))
-    .sort((left, right) => Date.parse(right.updatedAt ?? '') - Date.parse(left.updatedAt ?? ''))
-  const selected = candidates[0]?.artifactRef
-  return validArtifactRef(selected) ? selected : null
+  const uniqueRefs = new Map<string, DraftArtifactRef>()
+  for (const task of candidates) {
+    const ref = task.artifactRef
+    if (!validArtifactRef(ref)) continue
+    uniqueRefs.set(JSON.stringify([ref.artifactId, ref.version, ref.contentHash, ref.sourceDigest]), ref)
+  }
+  const refs = [...uniqueRefs.values()]
+  const highestVersion = Math.max(0, ...refs.map(candidate => candidate.version))
+  const latest = refs.filter(candidate => candidate.version === highestVersion)
+  return latest.length === 1 ? latest[0] : null
 }
 
 export function selectedDraftArtifactUrl(sessionId: string, ref: DraftArtifactRef): string {
