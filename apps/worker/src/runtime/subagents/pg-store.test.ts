@@ -24,6 +24,12 @@ function fakePool(handler: (sql: string, params?: unknown[]) => { rows?: unknown
     query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push([sql, params])
       const result = handler(sql, params)
+      if (sql.startsWith('SELECT "leaseExpiresAt" FROM "sub_agent_tasks"') && result.rows === undefined) {
+        return { rows: [{ leaseExpiresAt: new Date(now.getTime() + 60_000) }], rowCount: 1, ...result }
+      }
+      if (sql.startsWith("SELECT clock_timestamp()") && result.rows === undefined) {
+        return { rows: [{ checkedAt: now }], rowCount: 1, ...result }
+      }
       if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE") && result.rows === undefined) {
         return { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1, ...result }
       }
@@ -31,7 +37,7 @@ function fakePool(handler: (sql: string, params?: unknown[]) => { rows?: unknown
         const count = sql.includes('task."turnId" = $2') ? 2 : 3
         return { rows: Array.from({ length: count }, (_, index) => ({ id: `task-${index + 1}`, status: index === 0 ? "running" : "waiting", attemptCount: 1 })), rowCount: count, ...result }
       }
-      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $2") && result.rows === undefined) {
+      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1") && result.rows === undefined) {
         return { rows: [{ id: "task-1", sessionId: "session-1", rootTaskId: "task-1", userId: "user-1" }], rowCount: 1, ...result }
       }
       if (sql.includes('session."status" AS "sessionStatus"') && result.rows === undefined) {
@@ -198,6 +204,8 @@ describe("PgSubagentTaskStore", () => {
     const update = fake.calls.find(([sql]) => sql.startsWith("UPDATE"))?.[0] ?? ""
     expect(update).toContain("attemptCount")
     expect(update).toContain('"interruptRequestedAt" IS NULL')
+    expect(update).toContain('"leaseExpiresAt" = clock_timestamp()')
+    expect(update).toContain('"nextAttemptAt" <= clock_timestamp()')
     expect(fake.calls.find(([sql]) => sql.includes('FROM "agent_sessions"'))?.[0]).not.toContain("controlGate")
     expect(update).not.toContain("controlGate")
   })
@@ -343,7 +351,7 @@ describe("PgSubagentTaskStore", () => {
     const update = fake.calls.find(([sql]) => sql.startsWith("UPDATE"))
     expect(update?.[0]).toContain('"attemptCount" = $9')
     expect(update?.[0]).toContain('"nextAttemptAt" = $10')
-    expect(update?.[0]).toContain('"leaseExpiresAt" > CURRENT_TIMESTAMP')
+    expect(update?.[0]).toContain('"leaseExpiresAt" > clock_timestamp()')
     expect(update?.[1]).toContain(1)
     expect(update?.[1]?.[9]).toEqual(new Date(now.getTime() + 1_000))
     const dispatchReset = fake.calls.find(([sql]) => sql.startsWith('UPDATE "agent_outbox"'))
@@ -491,6 +499,24 @@ describe("PgSubagentTaskStore", () => {
     expect(fake.calls.some(([sql]) => sql.includes('UPDATE "agent_mailbox_messages"'))).toBe(false)
   })
 
+  it("rejects finish when a lease expires while waiting for its task lock", async () => {
+    const leaseExpiresAt = new Date(now.getTime() + 1_000)
+    const checkedAt = new Date(leaseExpiresAt.getTime() + 1)
+    const fake = fakePool(sql => {
+      if (sql.startsWith("SELECT task.*, session.")) return { rows: [taskRow({ status: "running", leaseOwner: "worker-1", attemptCount: 1, leaseExpiresAt })], rowCount: 1 }
+      if (sql.startsWith('SELECT clock_timestamp() AS "checkedAt"')) return { rows: [{ checkedAt }], rowCount: 1 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    expect(now.getTime()).toBeLessThan(leaseExpiresAt.getTime())
+    await expect(store.finish({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, status: "completed", now })).resolves.toBeNull()
+    const taskLock = fake.calls.findIndex(([sql]) => sql.includes("FOR UPDATE OF task"))
+    const leaseClock = fake.calls.findIndex(([sql]) => sql.startsWith('SELECT clock_timestamp() AS "checkedAt"'))
+    expect(leaseClock).toBeGreaterThan(taskLock)
+    expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
+  })
+
   it("rolls back when the task update loses its fence", async () => {
     const fake = fakePool(sql => {
       if (sql.includes('FROM "sub_agent_tasks" task')) return { rows: [taskRow({ status: "running", leaseOwner: "worker-1", attemptCount: 1, leaseExpiresAt: new Date(now.getTime() + 60_000) })], rowCount: 1 }
@@ -550,12 +576,29 @@ describe("PgSubagentTaskStore", () => {
     expect(updates[0]?.[0]).toContain('"attemptCount" = $4')
     expect(updates[0]?.[0]).toContain('"updatedAt" = $5')
     expect(updates[0]?.[0]).toContain('"interruptRequestedAt" IS NULL')
+    expect(updates[0]?.[0]).toContain('"leaseExpiresAt" > clock_timestamp()')
     expect(updates[0]?.[0]).toContain('session."status" NOT IN (\'aborted\', \'archived\')')
     expect(updates[1]?.[0]).toContain("publishedAt")
     expect(updates[1]?.[0]).toContain('"topic" = \'agent.subagent.dispatch\'')
     expect(updates[1]?.[0]).toContain('"idempotencyKey" = $1')
     expect(updates[1]?.[0]).toContain('"aggregateId" = $2')
     expect(updates[1]?.[1]).toEqual(["subagent-dispatch:task-1", "session-1"])
+  })
+
+  it("does not release or redispatch a lease that expires while waiting for its task lock", async () => {
+    const leaseExpiresAt = new Date(now.getTime() + 1_000)
+    const checkedAt = new Date(leaseExpiresAt.getTime() + 1)
+    const fake = fakePool(sql => {
+      if (sql.startsWith('SELECT "leaseExpiresAt" FROM "sub_agent_tasks"')) return { rows: [{ leaseExpiresAt }], rowCount: 1 }
+      if (sql.startsWith("SELECT clock_timestamp()")) return { rows: [{ checkedAt }], rowCount: 1 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    expect(now.getTime()).toBeLessThan(leaseExpiresAt.getTime())
+    await expect(store.release({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, now })).resolves.toBe(false)
+    expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
+    expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "agent_outbox"'))).toBe(false)
   })
 
   it.each(["aborted", "archived"] as const)("does not release a child in a %s session", async status => {
@@ -578,7 +621,27 @@ describe("PgSubagentTaskStore", () => {
     await expect(store.heartbeat({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, now })).resolves.toBe("interrupted")
     const update = fake.calls.find(([sql]) => sql.startsWith("UPDATE"))?.[0] ?? ""
     expect(update).toContain('"attemptCount" = $5')
+    expect(update).toContain('"leaseExpiresAt" > clock_timestamp()')
+    expect(update).toContain('LEAST(clock_timestamp()')
     expect(update).toContain('session."status" NOT IN (\'aborted\', \'archived\')')
+  })
+
+  it("rejects heartbeat when its task lock wait outlives the lease", async () => {
+    const leaseExpiresAt = new Date(now.getTime() + 1_000)
+    const checkedAt = new Date(leaseExpiresAt.getTime() + 1)
+    const fake = fakePool(sql => {
+      if (sql.startsWith('SELECT "leaseExpiresAt" FROM "sub_agent_tasks"')) return { rows: [{ leaseExpiresAt }], rowCount: 1 }
+      if (sql.startsWith("SELECT clock_timestamp()")) return { rows: [{ checkedAt }], rowCount: 1 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    expect(now.getTime()).toBeLessThan(leaseExpiresAt.getTime())
+    await expect(store.heartbeat({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, now })).resolves.toBe("lost")
+    const taskLock = fake.calls.findIndex(([sql]) => sql.startsWith('SELECT "leaseExpiresAt" FROM "sub_agent_tasks"'))
+    const leaseClock = fake.calls.findIndex(([sql]) => sql.startsWith("SELECT clock_timestamp()"))
+    expect(leaseClock).toBeGreaterThan(taskLock)
+    expect(fake.calls.some(([sql]) => sql.startsWith("UPDATE"))).toBe(false)
   })
 
   it("finishes a marker-backed interrupted Turn through canonical TaskGraph receipts", async () => {
@@ -590,7 +653,7 @@ describe("PgSubagentTaskStore", () => {
     expect(fallback).toContain('turn."status" AS "turnStatus"')
     expect(fallback).toContain('task."leaseOwner" = $3')
     expect(fallback).toContain('task."attemptCount" = $4')
-    expect(fallback).toContain('task."leaseExpiresAt" > CURRENT_TIMESTAMP')
+    expect(fallback).toContain('task."leaseExpiresAt" > clock_timestamp()')
 
     await expect(store.finish({
       taskId: "child-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1,
@@ -716,7 +779,7 @@ describe("PgSubagentTaskStore", () => {
 
   it.each(["running", "paused", "waiting_for_user"] as const)("reclaims stale leases from an open %s session", async sessionStatus => {
     const fake = fakePool(sql => {
-      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $2")) return { rows: [{ id: "task-1", sessionId: "session-1", rootTaskId: "task-1", userId: "user-1" }], rowCount: 1 }
+      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1")) return { rows: [{ id: "task-1", sessionId: "session-1", rootTaskId: "task-1", userId: "user-1" }], rowCount: 1 }
       if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "session-1", userId: "user-1", status: sessionStatus }], rowCount: 1 }
       if (sql.includes('session."status" AS "sessionStatus"')) return { rows: [taskRow({ status: "running", sessionStatus, leaseOwner: "dead-worker", leaseExpiresAt: new Date(now.getTime() - 1), attemptCount: 1 })], rowCount: 1 }
       if (sql.includes("leaseExpiresAt") && sql.includes("FOR UPDATE OF task")) return { rows: [taskRow({ status: "running", sessionStatus, leaseOwner: "dead-worker", leaseExpiresAt: new Date(now.getTime() - 1), attemptCount: 1 })], rowCount: 1 }
@@ -727,9 +790,9 @@ describe("PgSubagentTaskStore", () => {
     const result = await store.recoverExpired({ now, limit: 10 })
     expect(result).toHaveLength(1)
     expect(result[0].status).toBe("queued")
-    const scan = fake.calls.find(([sql]) => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $2"))?.[0] ?? ""
+    const scan = fake.calls.find(([sql]) => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1"))?.[0] ?? ""
     const taskLock = fake.calls.find(([sql]) => sql.includes("FOR UPDATE OF task"))?.[0] ?? ""
-    expect(scan).toContain("LIMIT $2")
+    expect(scan).toContain("LIMIT $1")
     expect(scan).not.toContain("FOR UPDATE")
     expect(taskLock).toContain("FOR UPDATE OF task")
   })

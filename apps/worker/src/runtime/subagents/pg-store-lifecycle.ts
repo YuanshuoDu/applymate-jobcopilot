@@ -81,19 +81,19 @@ export async function recoverExpired(pool: PgSubagentPool, input: { now: Date; l
     const candidates = await client.query(`SELECT task."id", task."sessionId", task."rootTaskId", session."userId"
       FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
       WHERE task."status" = 'running' AND (session."status" IN ('aborted', 'archived') OR ${RUNNABLE_SESSION})
-        AND (task."leaseExpiresAt" IS NULL OR task."leaseExpiresAt" <= $1)
-        AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)
-      ORDER BY task."sessionId", task."rootTaskId", task."id" LIMIT $2`, [input.now, input.limit])
+        AND (task."leaseExpiresAt" IS NULL OR task."leaseExpiresAt" <= clock_timestamp())
+        AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= clock_timestamp())
+      ORDER BY task."sessionId", task."rootTaskId", task."id" LIMIT $1`, [input.limit])
     const recovered: SubagentTaskRecord[] = []
     for (const candidate of candidates.rows as Candidate[]) {
-      const outcome = await recoverOne(client, candidate, input.now)
+      const outcome = await recoverOne(client, candidate)
       if (outcome) recovered.push(outcome)
     }
     return recovered
   })
 }
 
-async function recoverOne(client: pg.PoolClient, candidate: Candidate, now: Date): Promise<SubagentTaskRecord | null> {
+async function recoverOne(client: pg.PoolClient, candidate: Candidate): Promise<SubagentTaskRecord | null> {
   const session = await client.query(`SELECT "id", "userId", "status" FROM "agent_sessions" WHERE "id" = $1 FOR UPDATE`, [candidate.sessionId])
   const sessionRow = session.rows[0] as Record<string, unknown> | undefined
   if (!sessionRow || sessionRow.userId !== candidate.userId) return null
@@ -101,9 +101,9 @@ async function recoverOne(client: pg.PoolClient, candidate: Candidate, now: Date
   const sql = `SELECT task.*, session."userId" AS "userId", session."status" AS "sessionStatus"
     FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
     WHERE task."id" = $1 AND task."sessionId" = $2 AND session."userId" = $3 AND task."status" = 'running'
-      AND (session."status" IN ('aborted', 'archived') OR task."leaseExpiresAt" IS NULL OR task."leaseExpiresAt" <= $4)
-      AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)`
-  const preview = await client.query(sql, [candidate.id, candidate.sessionId, candidate.userId, now])
+      AND (session."status" IN ('aborted', 'archived') OR task."leaseExpiresAt" IS NULL OR task."leaseExpiresAt" <= clock_timestamp())
+      AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= clock_timestamp())`
+  const preview = await client.query(sql, [candidate.id, candidate.sessionId, candidate.userId])
   const old = preview.rows[0] as Record<string, unknown> | undefined
   if (!old) return null
   const attemptCount = Number(old.attemptCount)
@@ -118,23 +118,29 @@ async function recoverOne(client: pg.PoolClient, candidate: Candidate, now: Date
     attemptCount, ...(eventType === "task.failed" ? { failureReason: String(failureReason) } : {}),
   })
   if (graph && "blocked" in graph) return null
-  const locked = await client.query(`${sql} FOR UPDATE OF task`, [candidate.id, candidate.sessionId, candidate.userId, now])
+  const locked = await client.query(`${sql} FOR UPDATE OF task`, [candidate.id, candidate.sessionId, candidate.userId])
   const row = locked.rows[0] as Record<string, unknown> | undefined
   if (!row || Number(row.attemptCount) !== attemptCount) return null
+  const leaseClock = await client.query<{ checkedAt: Date }>(`SELECT clock_timestamp() AS "checkedAt"`)
+  const checkedAt = leaseClock.rows[0]?.checkedAt
+  if (!checkedAt) return null
   const lockedSessionClosed = row.sessionStatus === "aborted" || row.sessionStatus === "archived"
   const lockedExpiry = dateValue(row.leaseExpiresAt)
   const lockedRetryAt = dateValue(row.nextAttemptAt)
-  if ((!lockedSessionClosed && lockedExpiry && lockedExpiry.getTime() > now.getTime())
-    || (lockedRetryAt && lockedRetryAt.getTime() > now.getTime())) return null
-  const nextAttemptAt = status === "queued" ? computeSubagentNextAttemptAt(attemptCount, now) : null
+  if ((!lockedSessionClosed && lockedExpiry && lockedExpiry > checkedAt) || (lockedRetryAt && lockedRetryAt > checkedAt)) return null
+  const nextAttemptAt = status === "queued" ? computeSubagentNextAttemptAt(attemptCount, checkedAt) : null
   const updated = await client.query(`UPDATE "sub_agent_tasks" SET "status" = $3, "leaseOwner" = NULL, "leaseExpiresAt" = NULL,
     "nextAttemptAt" = $4, "failureReason" = $5, "completedAt" = CASE WHEN $6 THEN $7::timestamp(3) ELSE NULL::timestamp(3) END, "updatedAt" = $7
-    WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running'`,
-  [candidate.id, candidate.sessionId, status, nextAttemptAt, failureReason, terminal, now])
+    WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running'
+      AND EXISTS (SELECT 1 FROM "agent_sessions" AS session
+        WHERE session."id" = "sub_agent_tasks"."sessionId" AND session."userId" = $8 AND session."status" = $9::text)
+      AND ($9::text IN ('aborted', 'archived') OR "leaseExpiresAt" IS NULL OR "leaseExpiresAt" <= clock_timestamp())
+      AND ("nextAttemptAt" IS NULL OR "nextAttemptAt" <= clock_timestamp())`,
+  [candidate.id, candidate.sessionId, status, nextAttemptAt, failureReason, terminal, checkedAt, candidate.userId, row.sessionStatus])
   if (updated.rowCount !== 1) return null
   if (graph) {
-    await persistGraphTransition(client, graph, now, { stream: !closedSession, allowClosedSession: closedSession })
-    if (terminal) await reconcileGraphDependents(client, graph.scope, now, { stream: !closedSession, allowClosedSession: closedSession })
+    await persistGraphTransition(client, graph, checkedAt, { stream: !closedSession, allowClosedSession: closedSession })
+    if (terminal) await reconcileGraphDependents(client, graph.scope, checkedAt, { stream: !closedSession, allowClosedSession: closedSession })
   }
   if (status === "queued") await resetDispatch(client, candidate.sessionId, candidate.id)
   else await removePendingDispatch(client, candidate.sessionId, candidate.id)

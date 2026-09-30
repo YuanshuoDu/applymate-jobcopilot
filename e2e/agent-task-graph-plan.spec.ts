@@ -3,6 +3,7 @@ import type { Page, Response, Route } from '@playwright/test'
 import { readFileSync } from 'node:fs'
 import { parsePlanLedger, projectPlanLedger, type PlanLedger } from '@jobcopilot/agent-protocol'
 import { redactStreamEventPayload } from '../apps/web/src/lib/agent/session/stream-redaction'
+import { taskGraphPlanLabel, type TaskGraphPlanLabelKey } from '../apps/web/src/lib/task-graph-plan-labels'
 
 const SCHEMA = 'agent-harness.v2'
 const GRAPH_SCHEMA = 'agent-harness.v2.task-graph'
@@ -124,6 +125,11 @@ type TaskGraphSelectorResult =
 
 function record(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null
+}
+
+function planLedgerEnumLabel(locale: 'en' | 'zh', group: 'readiness' | 'status', value: string): string {
+  const suffix = value.replace(/_([a-z])/g, (_match, letter: string) => letter.toUpperCase())
+  return taskGraphPlanLabel(locale, `agent.taskGraph.${group}.${suffix}` as TaskGraphPlanLabelKey)
 }
 
 function isPersistedGraphNode(value: unknown): value is PersistedGraphNode {
@@ -768,16 +774,27 @@ test('persisted Plan Ledger parser validates proposal and lifecycle task attribu
   expect(parsePersistedTrace(unknownLifecycleNode)).toBeNull()
 })
 
-test('Plan Ledger restores the same persisted trace session after SSE reconnect without leaking across sessions', async ({ page }) => {
+test('Plan Ledger restores the same persisted trace session after SSE reconnect without leaking across sessions', async ({ page }, testInfo) => {
   const persistedTrace = requireProductionTraceArtifact()
   const persistedLedger = persistedTrace.planLedger
+  const locale = testInfo.project.name.endsWith('-zh') ? 'zh' : 'en'
+  const dependentNode = persistedLedger.nodes.find(node => node.dependencies.length > 0)
+  if (!dependentNode) throw new Error('Persisted Worker trace has no dependent Plan Ledger node.')
+  const dependency = dependentNode.dependencies[0]
+  if (!dependency || !dependency.status || !dependentNode.status) throw new Error('Persisted Worker trace dependency/status is incomplete.')
+  const graphNode = persistedTrace.graphItem.content.nodes.find(node => node.key === dependentNode.key)
+  expect(graphNode?.dependsOn).toEqual(dependentNode.dependencies.map(item => item.key))
+  expect(dependency.label.trim().length).toBeGreaterThan(0)
+  expect(dependentNode.readiness).not.toBe('unavailable')
   const fixture = await installTaskGraphFixture(page, persistedTrace)
   const sessionA = fixture.sessionA, revision = fixture.planRevision
   const expectedIdentity = graphIdentity(persistedTrace.graphItem)
   const ledgerResponsePromise = waitForPlanLedgerResponse(page, expectedIdentity, fixture, 'default', 'persisted trace')
-  await page.goto(`/agent-preview?supervisor=1&locale=en&sessionId=${sessionA}`)
+  await page.goto(`/agent-preview?supervisor=1&locale=${locale}&sessionId=${sessionA}`)
 
   const plan = page.locator('[data-agent-task-graph-plan="true"]')
+  const dependentRow = plan.locator('ol > li').nth(persistedLedger.nodes.indexOf(dependentNode))
+  const renderedDependency = dependentRow.locator('ul > li').filter({ hasText: dependency.label })
   const sourcePreview = plan.locator('ol > li').first().locator('[data-task-graph-evidence="preview"]')
   await expect(plan).toBeVisible({ timeout: 20_000 })
   await expect.poll(() => fixture.eventRequests.get(sessionA)?.length ?? 0, { timeout: 10_000 }).toBeGreaterThanOrEqual(2)
@@ -786,6 +803,12 @@ test('Plan Ledger restores the same persisted trace session after SSE reconnect 
   if (persistedLedger.goal) await expect(plan.locator('[data-agent-task-graph-goal="true"]')).toHaveText(persistedLedger.goal)
   else await expect(plan.locator('[data-agent-task-graph-goal="true"]')).toHaveCount(0)
   for (const node of persistedLedger.nodes) await expect(plan).toContainText(node.goal)
+  await expect(dependentRow.locator('div').first()).toContainText(planLedgerEnumLabel(locale, 'status', dependentNode.status))
+  await expect(dependentRow).toContainText(taskGraphPlanLabel(locale, 'agent.taskGraph.readiness'))
+  await expect(dependentRow).toContainText(planLedgerEnumLabel(locale, 'readiness', dependentNode.readiness))
+  await expect(renderedDependency).toHaveCount(1)
+  await expect(renderedDependency).toContainText(dependency.label)
+  await expect(renderedDependency).toContainText(planLedgerEnumLabel(locale, 'status', dependency.status))
   await expect(plan).not.toContainText(GOAL_B)
   const interceptedResponse = await ledgerResponsePromise
   expect(interceptedResponse).toEqual({ identity: expectedIdentity, projection: persistedLedger })

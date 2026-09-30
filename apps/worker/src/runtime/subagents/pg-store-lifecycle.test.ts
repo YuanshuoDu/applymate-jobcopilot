@@ -18,6 +18,9 @@ function fakePool(handler?: (sql: string, params?: unknown[]) => { rows?: unknow
   const client = { query: vi.fn(async (sql: string, params?: unknown[]) => {
     calls.push([sql, params])
     const result = handler?.(sql, params) ?? {}
+    if (sql.startsWith("SELECT clock_timestamp()") && !result.rows?.length) {
+      return { rows: [{ checkedAt: new Date("2026-09-23T12:00:00Z") }], rowCount: 1, ...result }
+    }
     if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE") && !result.rows?.length) {
       return { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1, ...result }
     }
@@ -25,7 +28,7 @@ function fakePool(handler?: (sql: string, params?: unknown[]) => { rows?: unknow
       const count = sql.includes('task."turnId" = $2') ? 2 : 3
       return { rows: Array.from({ length: count }, (_, index) => ({ id: `task-${index + 1}`, status: index === 0 ? "running" : "waiting", attemptCount: 1 })), rowCount: count, ...result }
     }
-    if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $2") && !result.rows?.length) {
+    if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1") && !result.rows?.length) {
       return { rows: [{ id: "task-1", sessionId: "session-1", rootTaskId: "task-1", userId: "user-1" }], rowCount: 1, ...result }
     }
     if (sql.includes('session."status" AS "sessionStatus"') && !result.rows?.length) return { rows: [taskRow({ sessionStatus: "running" })], rowCount: 1, ...result }
@@ -107,8 +110,10 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
     ])
     const recoveryWrite = recovery.calls.find(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))
     expect(recoveryWrite?.[1]?.[5]).toBe(false)
-    expect(recoveryWrite?.[1]?.[6]).toBe(now)
-    const scan = recovery.calls.find(([sql]) => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $2"))?.[0] ?? ""
+    expect(recoveryWrite?.[1]?.[6]).toEqual(now)
+    const scan = recovery.calls.find(([sql]) => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1"))?.[0] ?? ""
+    expect(scan).toContain('task."leaseExpiresAt" <= clock_timestamp()')
+    expect(scan).toContain('task."nextAttemptAt" <= clock_timestamp()')
     expect(scan).toContain(`session."status" IN ('aborted', 'archived')`)
     expect(scan).toContain(`session."status" NOT IN ('aborted', 'archived')`)
     expect(scan).not.toContain("FOR UPDATE")
@@ -116,9 +121,55 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
     const taskLock = recovery.calls.findIndex(([sql]) => sql.includes("FOR UPDATE OF task"))
     expect(sessionLock).toBeGreaterThan(-1)
     expect(taskLock).toBeGreaterThan(sessionLock)
+    const clockCheck = recovery.calls.findIndex(([sql]) => sql.startsWith("SELECT clock_timestamp()"))
+    const recoveryWriteIndex = recovery.calls.findIndex(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))
+    expect(clockCheck).toBeGreaterThan(taskLock)
+    expect(recoveryWriteIndex).toBeGreaterThan(clockCheck)
+    expect(recoveryWrite?.[0]).toContain('session."userId" = $8 AND session."status" = $9::text')
+    expect(recoveryWrite?.[0]).toContain('$9::text IN (\'aborted\', \'archived\') OR "leaseExpiresAt" IS NULL')
+    expect(recoveryWrite?.[0]).toContain('"nextAttemptAt" <= clock_timestamp()')
     expect(recovery.calls.map(([sql]) => sql)).toContain("COMMIT")
     await expect(recoverExpired(recovery.pool, { now, limit: 0 })).rejects.toThrow("Recovery limit must be positive")
   })
+
+  it("uses the post-lock database clock when caller time is skewed", async () => {
+    const databaseNow = new Date("2026-09-23T12:00:00.000Z")
+    const recovery = fakePool(sql => sql.startsWith("SELECT clock_timestamp()")
+      ? { rows: [{ checkedAt: databaseNow }], rowCount: 1 }
+      : {})
+
+    const recovered = await recoverExpired(recovery.pool, { now: new Date("2030-01-01T00:00:00.000Z"), limit: 10 })
+
+    expect(recovered[0]?.nextAttemptAt).toEqual(new Date(databaseNow.getTime() + 1_000))
+    const recoveryWrite = recovery.calls.find(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))
+    expect(recoveryWrite?.[1]?.[6]).toBe(databaseNow)
+  })
+
+  it.each(["leaseExpiresAt", "nextAttemptAt"] as const)(
+    "does not recover when %s changes while waiting for the task lock",
+    async field => {
+      const databaseNow = new Date("2026-09-23T12:00:00.000Z")
+      const freshValue = new Date(databaseNow.getTime() + 5_000)
+      const staleValue = new Date(databaseNow.getTime() - 5_000)
+      const recovery = fakePool(sql => {
+        if (sql.startsWith("SELECT clock_timestamp()")) return { rows: [{ checkedAt: databaseNow }], rowCount: 1 }
+        if (sql.includes("FOR UPDATE OF task")) {
+          return { rows: [taskRow({ sessionStatus: "running", [field]: freshValue })], rowCount: 1 }
+        }
+        if (sql.includes('session."status" AS "sessionStatus"')) {
+          return { rows: [taskRow({ sessionStatus: "running", [field]: staleValue })], rowCount: 1 }
+        }
+        return {}
+      })
+
+      await expect(recoverExpired(recovery.pool, { now: new Date("2020-01-01T00:00:00.000Z"), limit: 10 })).resolves.toEqual([])
+
+      const taskLock = recovery.calls.findIndex(([sql]) => sql.includes("FOR UPDATE OF task"))
+      const clockCheck = recovery.calls.findIndex(([sql]) => sql.startsWith("SELECT clock_timestamp()"))
+      expect(clockCheck).toBeGreaterThan(taskLock)
+      expect(recovery.calls.some(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))).toBe(false)
+    },
+  )
 
   it.each(["aborted", "archived"] as const)("records graph recovery after an expired task in a %s session without publishing to its closed stream", async status => {
     const calls: Array<[string, unknown[]?]> = []
@@ -131,8 +182,9 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
     const row = taskRow({ id: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", status: taskStatus, maxAttempts: 3, sessionStatus: status })
     const client = { query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push([sql, params])
-      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $2")) return { rows: [{ id: "child-1", sessionId: "session-1", rootTaskId: "root-1", userId: "user-1" }], rowCount: 1 }
+      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1")) return { rows: [{ id: "child-1", sessionId: "session-1", rootTaskId: "root-1", userId: "user-1" }], rowCount: 1 }
       if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "session-1", userId: "user-1", status }], rowCount: 1 }
+      if (sql.startsWith("SELECT clock_timestamp()")) return { rows: [{ checkedAt: new Date("2026-09-23T12:00:00Z") }], rowCount: 1 }
       if (sql.includes('SELECT task."turnId"')) return { rows: [{ turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", attemptCount: 1, userId: "user-1" }], rowCount: 1 }
       if (sql.includes("event.\"payload\"->>'kind' = 'proposal'")) return { rows: [{ payload: { kind: "proposal", receipt: {
         revision: 1, nodes: [{ key: "child", taskId: "child-1", status: "queued" }], readyTaskIds: ["child-1"],
@@ -149,9 +201,14 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
     }), release: vi.fn() }
     const pool = { connect: vi.fn().mockResolvedValue(client) } as unknown as PgSubagentPool
 
-    await expect(recoverExpired(pool, { now: new Date("2026-09-23T12:00:00Z"), limit: 10 })).resolves.toMatchObject([
+    const databaseNow = new Date("2026-09-23T12:00:00Z")
+    await expect(recoverExpired(pool, { now: new Date("2030-01-01T00:00:00Z"), limit: 10 })).resolves.toMatchObject([
       { id: "child-1", status: "interrupted" },
     ])
+    const taskUpdate = calls.find(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))
+    const graphItemUpdate = calls.find(([sql]) => sql.startsWith('UPDATE "agent_items"'))
+    expect(taskUpdate?.[1]?.[6]).toEqual(databaseNow)
+    expect(graphItemUpdate?.[1]?.[6]).toEqual(databaseNow)
     const eventWrite = calls.find(([sql]) => sql.includes('INSERT INTO "agent_events"'))
     expect(eventWrite?.[0]).toContain('"taskId"')
     expect(eventWrite?.[1]?.[4]).toBe("child-1")
@@ -173,8 +230,9 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
     ] }
     const client = { query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push([sql, params])
-      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $2")) return { rows: [{ id: "child-1", sessionId: "session-1", rootTaskId: "root-1", userId: "user-1" }], rowCount: 1 }
+      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1")) return { rows: [{ id: "child-1", sessionId: "session-1", rootTaskId: "root-1", userId: "user-1" }], rowCount: 1 }
       if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "session-1", userId: "user-1", status: "aborted" }], rowCount: 1 }
+      if (sql.startsWith("SELECT clock_timestamp()")) return { rows: [{ checkedAt: new Date("2026-09-23T12:00:00Z") }], rowCount: 1 }
       if (sql.includes('SELECT task."turnId"')) return { rows: [{ turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", attemptCount: 1, userId: "user-1" }], rowCount: 1 }
       if (sql.includes("event.\"payload\"->>'kind' = 'proposal'")) return { rows: [{ payload: { kind: "proposal", receipt: {
         revision: 1,
