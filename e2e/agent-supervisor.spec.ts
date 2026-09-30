@@ -12,6 +12,10 @@ const ITEM_A = 'fixture-item-a'
 const ITEM_B = 'fixture-item-b'
 const CHILD_TASK_A = 'task-child-a'
 const APPROVAL_ID = 'fixture-approval-a'
+const SELECTED_JOB_TURN_A = 'fixture-preparation-turn'
+const SELECTED_JOB_TURN_B = 'fixture-preparation-turn-next'
+const ORDINARY_CHAT_TURN = 'fixture-ordinary-chat-turn'
+const SELECTED_JOB_TEXT = 'Prepare a cover letter draft for the selected job.'
 
 const times = {
   created: '2026-09-07T10:00:00.000Z',
@@ -76,7 +80,7 @@ function event(sessionId: string, turnId: string, id: string, sequence: string, 
   }
 }
 
-async function installSupervisorFixture(page: Page, selectedJobEnabled = false) {
+async function installSupervisorFixture(page: Page, selectedJobEnabled = false, selectedJobTurnGateRegression = false) {
   const fixture = {
     aStreamCount: 0,
     eventSequence: 0,
@@ -105,11 +109,15 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false) 
       body: Record<string, unknown>
       idempotencyKey: string | undefined
     }>,
-    selectedJobStarted: false,
+    selectedJobStarted: selectedJobTurnGateRegression,
     selectedJobRequests: [] as Array<Record<string, unknown>>,
     selectedJobDisconnectArmed: false,
     selectedJobStreamSequences: [] as Array<string | null>,
     selectedJobReconnectSequence: null as string | null,
+    selectedJobGraphReleaseArmed: false,
+    selectedJobGraphEventSent: false,
+    ordinaryChatRequests: [] as Array<Record<string, unknown>>,
+    ordinaryChatEventSent: false,
   }
   const stageStatus = () => {
     if (fixture.retryTurnStatus) return fixture.retryTurnStatus
@@ -128,8 +136,11 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false) 
   }))
   await page.route('**/api/me', route => json(route, { id: 'agent-supervisor-fixture', email: 'fixture@applymate.local', name: 'Fixture', plan: 'pro', onboardedAt: times.created }))
   await page.route('**/api/jobs**', route => json(route, {
-    jobs: selectedJobEnabled ? [{ id: 'fixture-selected-job', company: 'Fixture Systems', role: 'Systems Engineer', status: 'saved' }] : [],
-    total: selectedJobEnabled ? 1 : 0, page: 1, pageSize: 100, statusCounts: {},
+    jobs: selectedJobEnabled ? [
+      { id: 'fixture-selected-job', company: 'Fixture Systems', role: 'Systems Engineer', status: 'saved' },
+      ...(selectedJobTurnGateRegression ? [{ id: 'fixture-selected-job-next', company: 'Northstar Robotics', role: 'Principal Engineer', status: 'saved' }] : []),
+    ] : [],
+    total: selectedJobEnabled ? (selectedJobTurnGateRegression ? 2 : 1) : 0, page: 1, pageSize: 100, statusCounts: {},
   }))
   await page.route('**/api/resume', route => json(route, []))
   await page.route('**/api/agent', route => json(route, { autoApply: false, requireApproval: true, isRunning: false }))
@@ -153,6 +164,10 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false) 
     fixture.selectedJobReconnectSequence = null
     return json(route, { ok: true })
   })
+  await page.route('**/__agent_fixture__/selected-job-graph', async route => {
+    fixture.selectedJobGraphReleaseArmed = true
+    return json(route, { ok: true })
+  })
   await page.route('**/__agent_fixture__/retryable', async route => {
     fixture.retryTurnStatus = 'failed'
     fixture.lifecycleStarted = false
@@ -172,12 +187,37 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false) 
     const sessionId = parts[3]
     const resource = parts[4] ?? ''
     if (resource === 'messages' && route.request().method() === 'POST') {
-      fixture.selectedJobRequests.push(route.request().postDataJSON() as Record<string, unknown>)
+      const body = route.request().postDataJSON() as Record<string, unknown>
+      if (selectedJobTurnGateRegression && !('selectedJobPreparation' in body)) {
+        fixture.ordinaryChatRequests.push(body)
+        return json(route, { inputId: 'fixture-ordinary-chat-input', turnId: ORDINARY_CHAT_TURN, disposition: 'started', sequence: '102' }, 202)
+      }
+      fixture.selectedJobRequests.push(body)
       fixture.selectedJobStarted = true
-      return json(route, { inputId: 'fixture-preparation-input', turnId: 'fixture-preparation-turn', disposition: 'started', sequence: '99' }, 202)
+      return json(route, {
+        inputId: 'fixture-preparation-input',
+        turnId: selectedJobTurnGateRegression ? SELECTED_JOB_TURN_B : SELECTED_JOB_TURN_A,
+        disposition: 'started',
+        sequence: '99',
+      }, 202)
     }
     if (resource === 'artifacts' && route.request().method() === 'GET') {
       const url = new URL(route.request().url())
+      if (selectedJobTurnGateRegression && parts[5] === 'fixture-cover-letter-next') {
+        const validNextRef = url.searchParams.get('contentHash') === `sha256:${'c'.repeat(64)}`
+          && url.searchParams.get('sourceDigest') === `sha256:${'d'.repeat(64)}`
+        if (sessionId !== SESSION_A || parts[7] !== '1' || !fixture.selectedJobGraphEventSent || !validNextRef) {
+          return json(route, { error: 'Not found' }, 404)
+        }
+        return json(route, {
+          job: { company: 'Northstar Robotics', role: 'Principal Engineer' },
+          artifact: {
+            artifactId: 'fixture-cover-letter-next', version: 1, contentHash: `sha256:${'c'.repeat(64)}`, sourceDigest: `sha256:${'d'.repeat(64)}`,
+            content: { text: 'Second selected-job cover-letter fixture body.' }, provenanceRefs: ['persona:fixture-fact-next'], evidenceRefs: ['job:fixture-selected-job-next'],
+          },
+          review: null,
+        })
+      }
       const validRef = url.searchParams.get('contentHash') === `sha256:${'a'.repeat(64)}`
         && url.searchParams.get('sourceDigest') === `sha256:${'b'.repeat(64)}`
       if (sessionId !== SESSION_A || parts[5] !== 'fixture-cover-letter' || parts[7] !== '1' || !fixture.selectedJobStarted || !validRef) {
@@ -224,7 +264,30 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false) 
       const selected = sessionId === SESSION_A ? stageStatus() : 'completed'
       const tasks = [{ id: `task-${sessionId}`, sessionId, turnId: sessionId === SESSION_A ? TURN_A : TURN_B, parentTaskId: null, role: 'Scout', taskType: 'read', status: selected, goal: sessionId === SESSION_A ? 'Inspect saved roles' : 'B session evidence', hasResult: selected === 'completed' }]
       if (sessionId === SESSION_A) tasks.push({ id: CHILD_TASK_A, sessionId, turnId: TURN_A, parentTaskId: `task-${SESSION_A}`, role: 'Scout', taskType: 'research', status: childStatus(), goal: 'Check child evidence', hasResult: childStatus() === 'completed' })
-      if (sessionId === SESSION_A) {
+      if (sessionId === SESSION_A && selectedJobTurnGateRegression) {
+        tasks.push({
+          id: 'selected-job-plan-root', sessionId, turnId: SELECTED_JOB_TURN_A, rootTaskId: 'selected-job-plan-root', parentTaskId: null,
+          role: 'orchestrator', taskType: 'root', status: 'completed', goal: 'Prepare Systems Engineer at Fixture Systems', hasResult: true,
+        })
+        tasks.push({
+          id: 'writer-fixture-draft', sessionId, turnId: SELECTED_JOB_TURN_A, rootTaskId: 'selected-job-plan-root', parentTaskId: 'selected-job-plan-root',
+          role: 'writer', taskType: 'cover_letter_draft', status: 'completed', goal: 'Prepare Systems Engineer at Fixture Systems', hasResult: true,
+          artifactRef: { artifactId: 'fixture-cover-letter', version: 1, contentHash: `sha256:${'a'.repeat(64)}`, sourceDigest: `sha256:${'b'.repeat(64)}` },
+          updatedAt: times.updated,
+        })
+        if (fixture.selectedJobGraphEventSent) {
+          tasks.push({
+            id: 'selected-job-plan-root-next', sessionId, turnId: SELECTED_JOB_TURN_B, rootTaskId: 'selected-job-plan-root-next', parentTaskId: null,
+            role: 'orchestrator', taskType: 'root', status: 'completed', goal: 'Prepare Principal Engineer at Northstar Robotics', hasResult: true,
+          })
+          tasks.push({
+            id: 'writer-fixture-draft-next', sessionId, turnId: SELECTED_JOB_TURN_B, rootTaskId: 'selected-job-plan-root-next', parentTaskId: 'selected-job-plan-root-next',
+            role: 'writer', taskType: 'cover_letter_draft', status: 'completed', goal: 'Prepare Principal Engineer at Northstar Robotics', hasResult: true,
+            artifactRef: { artifactId: 'fixture-cover-letter-next', version: 1, contentHash: `sha256:${'c'.repeat(64)}`, sourceDigest: `sha256:${'d'.repeat(64)}` },
+            updatedAt: times.updated,
+          })
+        }
+      } else if (sessionId === SESSION_A) {
         tasks.push({
           id: 'selected-job-plan-root', sessionId, turnId: 'fixture-preparation-turn', rootTaskId: 'selected-job-plan-root', parentTaskId: null,
           role: 'orchestrator', taskType: 'root', status: 'running', goal: 'Prepare the selected saved job', hasResult: false,
@@ -239,6 +302,29 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false) 
       return json(route, { tasks })
     }
     if (resource === 'timeline') {
+      if (sessionId === SESSION_A && selectedJobTurnGateRegression) {
+        const items = [
+          item(SESSION_A, TURN_A, 'fixture-plan-a', 'Read the current session plan.', { type: 'plan', phase: 'commentary', content: { steps: [{ id: 'step-a', label: 'Inspect saved roles', status: 'queued' }] } }),
+          item(SESSION_A, TURN_A, 'fixture-tool-a', 'Read the saved roles.', { type: 'tool_call', phase: 'commentary', content: { toolCallId: 'call-a', toolName: 'jobs.search', input: { scope: 'saved roles' } } }),
+          item(SESSION_A, TURN_A, ITEM_A, 'The agent is executing the saved roles check.', { status: stageStatus() === 'completed' ? 'completed' : 'queued' }),
+          item(SESSION_A, SELECTED_JOB_TURN_A, 'fixture-selected-job-request-first', SELECTED_JOB_TEXT, {
+            stepId: null, type: 'user_message', sequence: '10', content: { parts: [{ type: 'text', text: SELECTED_JOB_TEXT }] },
+          }),
+          item(SESSION_A, SELECTED_JOB_TURN_A, 'fixture-selected-job-task-graph-first', 'Prepare Systems Engineer at Fixture Systems.', {
+            stepId: null, type: 'task_graph', taskId: 'selected-job-plan-root', revision: 4,
+            content: { schemaVersion: 'agent-harness.v2.task-graph', nodes: [
+              { key: 'cover-letter-first', templateId: 'writer', goal: 'Prepare Systems Engineer at Fixture Systems', successCriteria: ['Save a reviewable draft'], dependsOn: [], depth: 1, taskId: 'writer-fixture-draft' },
+            ] },
+          }),
+        ]
+        if (fixture.selectedJobGraphEventSent) items.push(item(SESSION_A, SELECTED_JOB_TURN_B, 'fixture-selected-job-task-graph-next', 'Prepare Principal Engineer at Northstar Robotics.', {
+          stepId: null, type: 'task_graph', taskId: 'selected-job-plan-root-next', revision: 5,
+          content: { schemaVersion: 'agent-harness.v2.task-graph', nodes: [
+            { key: 'cover-letter-next', templateId: 'writer', goal: 'Prepare Principal Engineer at Northstar Robotics', successCriteria: ['Save a reviewable draft'], dependsOn: [], depth: 1, taskId: 'writer-fixture-draft-next' },
+          ] },
+        }))
+        return json(route, { items, approvalEvents: [] })
+      }
       return json(route, { items: sessionId === SESSION_A
         ? [
             item(SESSION_A, TURN_A, 'fixture-plan-a', 'Read the current session plan.', { type: 'plan', phase: 'commentary', content: { steps: [{ id: 'step-a', label: 'Inspect saved roles', status: 'queued' }] } }),
@@ -273,6 +359,27 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false) 
           fixture.selectedJobDisconnectArmed = false
           return route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': selected-job stream reconnected\n\n' })
         }
+      }
+      if (selectedJobTurnGateRegression && fixture.selectedJobGraphReleaseArmed && !fixture.selectedJobGraphEventSent) {
+        fixture.selectedJobGraphEventSent = true
+        fixture.eventSequence = 101
+        const graphItem = item(SESSION_A, SELECTED_JOB_TURN_B, 'fixture-selected-job-task-graph-next', 'Prepare Principal Engineer at Northstar Robotics.', {
+          stepId: null, type: 'task_graph', taskId: 'selected-job-plan-root-next', revision: 5,
+          content: { schemaVersion: 'agent-harness.v2.task-graph', nodes: [
+            { key: 'cover-letter-next', templateId: 'writer', goal: 'Prepare Principal Engineer at Northstar Robotics', successCriteria: ['Save a reviewable draft'], dependsOn: [], depth: 1, taskId: 'writer-fixture-draft-next' },
+          ] },
+        })
+        const graphEvent = event(SESSION_A, SELECTED_JOB_TURN_B, 'fixture-event-selected-job-task-graph-next', '101', 'item.started', { item: graphItem }, { itemId: graphItem.id, taskId: graphItem.taskId })
+        return route.fulfill({ status: 200, contentType: 'text/event-stream', body: `event: timeline\ndata: ${JSON.stringify(graphEvent)}\n\n` })
+      }
+      if (selectedJobTurnGateRegression && fixture.ordinaryChatRequests.length > 0 && !fixture.ordinaryChatEventSent) {
+        fixture.ordinaryChatEventSent = true
+        fixture.eventSequence = 103
+        const chatItem = item(SESSION_A, ORDINARY_CHAT_TURN, 'fixture-ordinary-chat-message', 'Keep the current draft visible.', {
+          stepId: null, type: 'user_message', sequence: '103', content: { parts: [{ type: 'text', text: 'Keep the current draft visible.' }] },
+        })
+        const chatEvent = event(SESSION_A, ORDINARY_CHAT_TURN, 'fixture-event-ordinary-chat-message', '103', 'item.started', { item: chatItem }, { itemId: chatItem.id })
+        return route.fulfill({ status: 200, contentType: 'text/event-stream', body: `event: timeline\ndata: ${JSON.stringify(chatEvent)}\n\n` })
       }
       if (!fixture.lifecycleStarted) {
         return route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': waiting for lifecycle assertions\n\n' })
@@ -574,4 +681,59 @@ test('selected-job preparation sends typed scope and restores the persisted draf
   await expect(page.locator('[data-selected-job-draft="true"]')).toHaveCount(0, { timeout: 10_000 })
   await expect(page.locator('body')).not.toContainText('Persisted cover-letter fixture body.')
   await expect(page.locator('[data-agent-task-graph-plan="true"]')).toHaveCount(0)
+})
+
+test('a newer selected-job Turn hides the prior plan and draft until its graph arrives, while ordinary chat keeps them visible', async ({ page }, testInfo) => {
+  const fixture = await installSupervisorFixture(page, true, true)
+  const isZh = testInfo.project.name.includes('zh')
+  await page.goto(`/agent-preview?supervisor=1&locale=${isZh ? 'zh' : 'en'}&sessionId=${SESSION_A}`)
+
+  const preparation = page.locator('[data-selected-job-preparation="true"]')
+  const plan = page.locator('[data-agent-task-graph-plan="true"]')
+  const draft = page.locator('[data-selected-job-draft="true"]')
+  await expect(preparation).toBeVisible({ timeout: 20_000 })
+  await expect(plan).toBeVisible({ timeout: 10_000 })
+  await expect(plan).toContainText('Prepare Systems Engineer at Fixture Systems')
+  await expect(draft).toBeVisible({ timeout: 10_000 })
+  await expect(draft).toHaveAttribute('aria-label', 'Systems Engineer · Fixture Systems v1')
+  await expect(draft).toContainText('Persisted cover-letter fixture body.')
+
+  await preparation.getByLabel(isZh ? '已保存的职位' : 'Saved job').selectOption('fixture-selected-job-next')
+  await preparation.getByRole('button', { name: isZh ? '准备草稿' : 'Prepare draft' }).click()
+  await expect.poll(() => fixture.selectedJobRequests.length).toBe(1)
+  expect(fixture.selectedJobRequests[0]).toMatchObject({
+    delivery: 'follow_up',
+    selectedJobPreparation: { jobId: 'fixture-selected-job-next' },
+  })
+  await expect(preparation.getByRole('status')).toBeVisible()
+  await expect(plan).toHaveCount(0)
+  await expect(draft).toHaveCount(0)
+  await expect(page.locator('body')).not.toContainText('Persisted cover-letter fixture body.')
+
+  await page.evaluate(async () => {
+    const response = await fetch('/__agent_fixture__/selected-job-graph', { method: 'POST' })
+    if (!response.ok) throw new Error('Could not release the second selected-job TaskGraph fixture.')
+  })
+  await expect.poll(() => fixture.selectedJobGraphEventSent, { timeout: 10_000 }).toBe(true)
+  await expect(plan).toBeVisible({ timeout: 10_000 })
+  await expect(plan).toHaveAttribute('data-agent-task-graph-revision', '5')
+  await expect(plan).toContainText('Prepare Principal Engineer at Northstar Robotics')
+  await expect(draft).toBeVisible({ timeout: 10_000 })
+  await expect(draft).toHaveAttribute('aria-label', 'Principal Engineer · Northstar Robotics v1')
+  await expect(draft).toContainText('Second selected-job cover-letter fixture body.')
+  await expect(draft).toContainText('job:fixture-selected-job-next')
+  await expect(page.locator('body')).not.toContainText('Persisted cover-letter fixture body.')
+
+  const composer = page.locator('.agent-composer textarea')
+  await expect(composer).toBeVisible()
+  await composer.fill('Keep the current draft visible.')
+  await composer.press('Enter')
+  await expect.poll(() => fixture.ordinaryChatRequests.length).toBe(1)
+  expect(fixture.ordinaryChatRequests[0]?.content).toEqual([{ type: 'text', text: 'Keep the current draft visible.' }])
+  await expect.poll(() => fixture.ordinaryChatEventSent, { timeout: 10_000 }).toBe(true)
+  await expect(plan).toBeVisible()
+  await expect(plan).toContainText('Prepare Principal Engineer at Northstar Robotics')
+  await expect(draft).toBeVisible()
+  await expect(draft).toHaveAttribute('aria-label', 'Principal Engineer · Northstar Robotics v1')
+  await expect(draft).toContainText('Second selected-job cover-letter fixture body.')
 })
