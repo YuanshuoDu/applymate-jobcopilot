@@ -15,6 +15,9 @@ const PRIVATE_MODEL_TEXT_KEYS = new Set([
   "text", "body", "response", "final", "finalText", "finalResponse", "finalContent", "commentary", "reasoning", "summary", "narrative", "message", "content", "blocker", "feedback",
 ])
 const SAFE_PRIVATE_STATUS = new Set(["completed", "failed", "passed", "needs_revision", "rejected", "stale"])
+const PRIVATE_REVIEW_IDENTIFIER = /^[a-z][a-z0-9_-]{0,39}$/
+const PRIVATE_REVIEW_PATHS = new Set(["text", "$.text", "opening", "$.opening", "body", "$.body", "closing", "$.closing", "signature", "$.signature"])
+const PRIVATE_REVIEW_INDEX_PATH = /^(?:\$\.)?(?:paragraphs|sentences)\[(?:0|[1-9]\d{0,2})\]$/
 
 export function selectedJobId(task: SubagentTaskRecord): string | undefined {
   const context = record(task.context)
@@ -24,20 +27,63 @@ export function selectedJobId(task: SubagentTaskRecord): string | undefined {
     ? selected.jobId
     : undefined
 }
-
 export function validSelectedJobContext(value: SelectedJobPreparationContext | undefined, jobId: string): value is SelectedJobPreparationContext {
   return Boolean(value && value.jobId === jobId && /^sha256:[a-f0-9]{64}$/.test(value.sourceDigest)
     && Array.isArray(value.evidenceRefs) && value.evidenceRefs.length > 0
     && value.evidenceRefs.every(ref => typeof ref === "string" && ref.trim().length > 0 && ref.length <= 256)
     && new Set(value.evidenceRefs).size === value.evidenceRefs.length)
 }
-
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
 }
 
 function privateArtifactReceipt(value: unknown): RepositoryJsonValue {
   try { return { artifactRef: parseArtifactReference(record(value).artifactRef) } } catch { return { privateArtifact: true } }
+}
+
+function validPrivateReviewInput(value: unknown): boolean {
+  const input = record(value)
+  if (!Array.isArray(input.findings)) return false
+  return input.findings.every(item => {
+    const finding = record(item)
+    if (typeof finding.id !== "string" || !PRIVATE_REVIEW_IDENTIFIER.test(finding.id)
+      || typeof finding.code !== "string" || !PRIVATE_REVIEW_IDENTIFIER.test(finding.code)
+      || !Array.isArray(finding.evidence)) return false
+    return finding.evidence.every(source => {
+      const evidence = record(source)
+      return typeof evidence.path === "string"
+        && (PRIVATE_REVIEW_PATHS.has(evidence.path) || PRIVATE_REVIEW_INDEX_PATH.test(evidence.path))
+    })
+  })
+}
+
+function safePrivateReviewInput(value: unknown): RepositoryJsonValue {
+  const input = record(value)
+  const artifactRef = (() => { try { return parseArtifactReference(input.artifactRef) } catch { return null } })()
+  const decision = input.decision === "passed" || input.decision === "needs_revision" || input.decision === "rejected"
+    ? input.decision : PRIVATE_MODEL_TEXT_PLACEHOLDER
+  const findings = Array.isArray(input.findings) ? input.findings.map(item => {
+    const finding = record(item)
+    const evidence = Array.isArray(finding.evidence) ? finding.evidence.map(source => {
+      const row = record(source)
+      const path = typeof row.path === "string" && (PRIVATE_REVIEW_PATHS.has(row.path) || PRIVATE_REVIEW_INDEX_PATH.test(row.path))
+        ? row.path : PRIVATE_MODEL_TEXT_PLACEHOLDER
+      return {
+        artifactHash: typeof row.artifactHash === "string" && /^sha256:[a-f0-9]{64}$/.test(row.artifactHash) ? row.artifactHash : PRIVATE_MODEL_TEXT_PLACEHOLDER,
+        path,
+        summary: PRIVATE_MODEL_TEXT_PLACEHOLDER,
+      }
+    }) : []
+    return {
+      id: PRIVATE_MODEL_TEXT_PLACEHOLDER,
+      code: PRIVATE_MODEL_TEXT_PLACEHOLDER,
+      severity: finding.severity === "info" || finding.severity === "warning" || finding.severity === "error" ? finding.severity : PRIVATE_MODEL_TEXT_PLACEHOLDER,
+      message: PRIVATE_MODEL_TEXT_PLACEHOLDER,
+      artifactHash: typeof finding.artifactHash === "string" && /^sha256:[a-f0-9]{64}$/.test(finding.artifactHash) ? finding.artifactHash : PRIVATE_MODEL_TEXT_PLACEHOLDER,
+      evidence,
+    }
+  }) : []
+  return { artifactRef, decision, findings }
 }
 
 function redactPrivateArtifactData(value: unknown, ids: ReadonlySet<string>, depth = 0): RepositoryJsonValue {
@@ -49,15 +95,17 @@ function redactPrivateArtifactData(value: unknown, ids: ReadonlySet<string>, dep
   if (!row) return null
   const privateToolCall = typeof row.toolCallId === "string" && ids.has(row.toolCallId)
   const privateDraftInput = row.toolName === "cover_letter.draft" && Object.prototype.hasOwnProperty.call(row, "input")
-  if (privateToolCall || privateDraftInput) {
+  const privateReviewInput = row.toolName === "artifact.review" && Object.prototype.hasOwnProperty.call(row, "input")
+  if (privateToolCall || privateDraftInput || privateReviewInput) {
     const result: Record<string, RepositoryJsonValue> = {}
     for (const [key, child] of Object.entries(row)) {
       if (key === "output" && privateToolCall) result[key] = privateArtifactReceipt(child)
+      else if (key === "input" && row.toolName === "artifact.review") result[key] = safePrivateReviewInput(child)
       else if (key === "input" && row.toolName === "cover_letter.draft") {
         const input = record(child)
         const safeInput: Record<string, RepositoryJsonValue> = {}
         for (const [inputKey, inputValue] of Object.entries(input)) {
-          if (inputKey !== "content") safeInput[inputKey] = redactPrivateArtifactData(inputValue, ids, depth + 1)
+          if (inputKey !== "content" && inputKey !== "constraints") safeInput[inputKey] = redactPrivateArtifactData(inputValue, ids, depth + 1)
         }
         result[key] = safeInput
       } else result[key] = redactPrivateArtifactData(child, ids, depth + 1)
@@ -195,6 +243,7 @@ export function createChildPrivateArtifactDispatcher(options: {
       || !options.observedEvidence.artifactReads.has(artifactReferenceKey(options.reviewerArtifactRef))) {
       return resultFor(request, "review_requires_private_read")
     }
+    if (!validPrivateReviewInput(request.input)) return resultFor(request, "private_artifact_review_input_invalid")
     try { return await options.executePrivateTool(toolContext, request) }
     catch { return resultFor(request, "private_artifact_review_failed") }
   }

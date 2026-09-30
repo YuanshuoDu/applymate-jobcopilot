@@ -55,10 +55,10 @@ describe("private child artifact boundary", () => {
     const writes: unknown[] = []
     const store = createPrivateArtifactSafeStore(persistenceStore(writes), new Set(["draft-call", "read-call", "review-call"]))
     await store.createItem({
-      content: { toolCallId: "draft-call", toolName: "cover_letter.draft", input: { content: body, baseArtifactId: "base" } },
+      content: { toolCallId: "draft-call", toolName: "cover_letter.draft", input: { content: body, baseArtifactId: "base", constraints: { nested: [{ note: body }] } } },
     } as never)
     await store.updateItem({
-      content: { toolCallId: "draft-call", toolName: "cover_letter.draft", output: { artifactRef: ref }, input: { content: body } },
+      content: { toolCallId: "draft-call", toolName: "cover_letter.draft", output: { artifactRef: ref }, input: { content: body, constraints: { nested: body } } },
     } as never)
     await store.createItem({
       content: { toolCallId: "read-call", toolName: "artifact.version.read", output: { artifactRef: ref, content: body } },
@@ -73,10 +73,59 @@ describe("private child artifact boundary", () => {
     const serialized = JSON.stringify(writes)
     expect(serialized).not.toContain(body)
     expect(writes[0]).toMatchObject({ toolCallId: "draft-call", toolName: "cover_letter.draft", input: { baseArtifactId: "base" } })
+    expect(writes[0]).not.toHaveProperty("input.constraints")
     expect(writes[1]).toMatchObject({ output: { artifactRef: ref } })
     expect(writes[2]).toMatchObject({ output: { artifactRef: ref } })
     expect(writes[3]).toMatchObject({ content: { output: { artifactRef: ref } } })
     expect(writes[4]).toMatchObject({ output: { artifactRef: ref } })
+  })
+
+  it("suppresses nested draft constraints and unsafe review fields in in-progress and terminal projections", async () => {
+    const secret = "PRIVATE source excerpt that must never persist in an event or item"
+    const writes: unknown[] = []
+    const store = createPrivateArtifactSafeStore(persistenceStore(writes), new Set(["review-call"]), { redactModelText: true })
+    const draftInput = { content: secret, baseArtifactId: "base", baseHash: ref.contentHash, constraints: { nested: [{ note: secret }] } }
+    const reviewInput = {
+      artifactRef: ref,
+      decision: "passed",
+      findings: [{
+        id: "john-smith", code: "john-smith", severity: "warning", message: secret, artifactHash: ref.contentHash,
+        evidence: [{ artifactHash: ref.contentHash, path: secret, summary: secret }],
+      }],
+    }
+
+    await store.createItem({
+      type: "tool_call", status: "started", content: { toolCallId: "draft-call", toolName: "cover_letter.draft", input: draftInput },
+    } as never)
+    await store.appendEvent({
+      type: "tool_call.started", payload: { toolCallId: "draft-call", toolName: "cover_letter.draft", input: draftInput },
+    } as never)
+    await store.updateItem({
+      type: "tool_call", status: "completed", content: { toolCallId: "draft-call", toolName: "cover_letter.draft", input: draftInput, output: { artifactRef: ref } },
+    } as never)
+    await store.appendEvent({
+      type: "tool_call.completed", payload: { toolCallId: "draft-call", toolName: "cover_letter.draft", input: draftInput, output: { artifactRef: ref } },
+    } as never)
+
+    await store.createItem({
+      type: "tool_call", status: "started", content: { toolCallId: "review-call", toolName: "artifact.review", input: reviewInput },
+    } as never)
+    await store.appendEvents?.([{
+      type: "tool_call.started", payload: { toolCallId: "review-call", toolName: "artifact.review", input: reviewInput },
+    } as never])
+    await store.updateItem({
+      type: "tool_call", status: "completed", content: { toolCallId: "review-call", toolName: "artifact.review", input: reviewInput, output: { artifactRef: ref, status: "passed" } },
+    } as never)
+    await store.appendEvent({
+      type: "tool_call.completed", payload: { toolCallId: "review-call", toolName: "artifact.review", input: reviewInput, output: { artifactRef: ref, status: "passed" } },
+    } as never)
+
+    const serialized = JSON.stringify(writes)
+    expect(serialized).not.toContain(secret)
+    expect(serialized).not.toContain("john-smith")
+    expect(serialized).not.toContain("constraints")
+    expect(serialized).toContain(JSON.stringify({ artifactRef: ref }))
+    expect(serialized).toContain("[Private selected-job response withheld]")
   })
 
   it("withholds selected-job Writer and Reviewer model text from items and events while preserving safe projections", async () => {
@@ -156,23 +205,40 @@ describe("private child artifact boundary", () => {
     const read = await reviewer(executionInput(call("artifact.version.read", "read-call", { artifactRef: ref })))
     expect(read).toMatchObject({ status: "completed", output: { artifactRef: ref, content: "full body" } })
     recordReadToolOutput(observedEvidence, "artifact.version.read", read.output)
-    const review = await reviewer(executionInput(call("artifact.review", "review-call", { artifactRef: ref, decision: "passed", findings: [] })))
+    const secret = "private reviewer excerpt must not reach artifact storage"
+    const unsafeReview = await reviewer(executionInput(call("artifact.review", "unsafe-review-call", {
+      artifactRef: ref, decision: "passed", findings: [{
+        id: secret, code: secret, severity: "warning", message: secret, artifactHash: ref.contentHash,
+        evidence: [{ artifactHash: ref.contentHash, path: secret, summary: secret }],
+      }],
+    })))
+    expect(unsafeReview).toMatchObject({ status: "failed", errorCode: "private_artifact_review_input_invalid" })
+    const reviewInput = {
+      artifactRef: ref, decision: "passed", findings: [{
+        id: "john-smith", code: "john-smith", severity: "info", message: "Clear", artifactHash: ref.contentHash,
+        evidence: [{ artifactHash: ref.contentHash, path: "$.text", summary: "Opening is clear" }],
+      }],
+    }
+    const review = await reviewer(executionInput(call("artifact.review", "review-call", reviewInput)))
     expect(review).toMatchObject({ status: "completed", output: { artifactRef: ref } })
+    expect(executePrivateTool.mock.calls.at(-1)?.[1].input).toEqual(reviewInput)
     expect(executePrivateTool).toHaveBeenCalledTimes(2)
     expect(executePrivateTool.mock.calls[0]?.[0]).toMatchObject({
       scope: { userId: reviewerLease.userId }, sessionId: reviewerLease.sessionId, turnId: reviewerLease.turnId,
       taskId: reviewerLease.id, rootTaskId: reviewerLease.rootTaskId, taskFence: taskFence(reviewerLease),
     })
-    expect(privateCallIds).toEqual(new Set(["wrong-ref", "read-call", "review-call"]))
+    expect(privateCallIds).toEqual(new Set(["wrong-ref", "read-call", "unsafe-review-call", "review-call"]))
 
     const writerLease = lease("writer")
     const writer = createChildPrivateArtifactDispatcher({
       lease: writerLease, definitions: [{ name: "cover_letter.draft", version: "1" }],
       executeRoutedTool, executePrivateTool, selectedJobPreparation, taskFence: taskFence(writerLease), observedEvidence, privateCallIds: new Set(),
     })
-    const writerCall = await writer(executionInput(call("cover_letter.draft", "draft-call", { content: "letter" })))
+    const writerInput = { content: "letter", constraints: { nested: [{ note: "transient private constraint" }] } }
+    const writerCall = await writer(executionInput(call("cover_letter.draft", "draft-call", writerInput)))
     expect(writerCall.status).toBe("completed")
     expect(executePrivateTool.mock.calls.at(-1)?.[0]).toMatchObject({ taskId: writerLease.id, taskFence: taskFence(writerLease) })
+    expect(executePrivateTool.mock.calls.at(-1)?.[1].input).toEqual(writerInput)
 
     const noFence = createChildPrivateArtifactDispatcher({
       lease: writerLease, definitions: [{ name: "cover_letter.draft", version: "1" }],

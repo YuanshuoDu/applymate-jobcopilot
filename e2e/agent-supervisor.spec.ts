@@ -245,7 +245,7 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false) 
             item(SESSION_A, TURN_A, 'fixture-tool-a', 'Read the saved roles.', { type: 'tool_call', phase: 'commentary', content: { toolCallId: 'call-a', toolName: 'jobs.search', input: { scope: 'saved roles' } } }),
             item(SESSION_A, TURN_A, ITEM_A, 'The agent is executing the saved roles check.', { status: stageStatus() === 'completed' ? 'completed' : 'queued' }),
             item(SESSION_A, 'fixture-preparation-turn', 'fixture-selected-job-task-graph', 'Prepare the selected saved job.', {
-              type: 'task_graph', taskId: 'selected-job-plan-root', revision: 4,
+              stepId: null, type: 'task_graph', taskId: 'selected-job-plan-root', revision: 4,
               content: { schemaVersion: 'agent-harness.v2.task-graph', nodes: [
                 { key: 'cover-letter', templateId: 'writer', goal: 'Prepare the selected saved job', successCriteria: ['Save a reviewable draft'], dependsOn: [], depth: 1, taskId: 'writer-fixture-draft' },
               ] },
@@ -367,9 +367,10 @@ test('real page mounts the shared timeline, supervisor tree, and isolated sessio
     : { queued: /Queued Tasks/, running: /Running/, waiting: /Waiting/, done: /Done/, connection: /Live connection|Reconnecting/ }
   const taskNode = page.locator('[data-task-node-id="task:task-fixture-session-a"]')
   const childTaskNode = page.locator(`[data-task-node-id="task:${CHILD_TASK_A}"]`)
-  const stepNode = page.locator('[data-task-node-id="step:fixture-step-a"]')
+  const stepNode = supervisor.locator('[data-task-node-id="step:fixture-step-a"]')
   await expect(taskNode).toContainText(labels.queued)
   await expect(childTaskNode).toContainText(labels.queued)
+  await expect(stepNode).toHaveCount(1)
   await expect(stepNode).toContainText(labels.queued)
   await expect(page.locator('[data-agent-supervisor-connection]')).toContainText(labels.connection)
 
