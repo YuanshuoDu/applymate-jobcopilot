@@ -3895,6 +3895,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       await expect(selectedJobArtifactCompletionGate({
         commandPort, lease, root: { id: root.id, attemptCount: rootLease.attemptCount },
         selectedJobId: sources.jobId, readCurrentDraftHead: scope => artifactRepository.findCurrentDraftHead(scope),
+        readCurrentReviewReceipt: scope => artifactRepository.findReviewReceipt(scope),
         readCurrentSourceDigest: async () => (await loadSelectedJobArtifactContext(pool!, value.userId, sources.jobId)).preparation.sourceDigest,
       })).resolves.toEqual({
         ok: false, blocker: "selected_job_draft_review_required",

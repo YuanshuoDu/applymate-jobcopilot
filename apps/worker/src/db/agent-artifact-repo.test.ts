@@ -79,6 +79,40 @@ describe("agent artifact repository", () => {
     await expect(repository.findCurrentDraftHead(scope)).resolves.toBeNull()
   })
 
+  it("reads only receipt metadata for the selected-job completion gate", async () => {
+    const scope = {
+      userId: "user-a", sessionId: "session-a", jobId: "job-a", artifactId: "draft-a", version: 2,
+      contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: `sha256:${"b".repeat(64)}`,
+      currentSourceDigest: `sha256:${"b".repeat(64)}`, status: "passed" as const, taskId: "reviewer-task-a",
+      reviewHash: `sha256:${"c".repeat(64)}`,
+    }
+    const row = { ...scope, toolCallId: "review-call-a", findings: ["PRIVATE_REVIEW_CANARY"], evidenceRefs: ["private-evidence"], requestHash: "private-request" }
+    const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
+    let rows: Record<string, unknown>[] = [row]
+    const client = {
+      query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+        calls.push({ sql, values })
+        return sql.includes('FROM "agent_artifact_review"') ? { rows, rowCount: rows.length } : { rows: [], rowCount: 0 }
+      }),
+      release: vi.fn(),
+    }
+    const repository = createAgentArtifactRepository({ connect: vi.fn(async () => client) } as never)
+
+    const receipt = await repository.findReviewReceipt(scope)
+    const read = calls.find(call => call.sql.includes('FROM "agent_artifact_review"'))!
+
+    expect(receipt).toEqual({ ...scope, toolCallId: row.toolCallId })
+    expect(JSON.stringify(receipt)).not.toContain("PRIVATE_REVIEW_CANARY")
+    expect(read.sql).toContain('"currentSourceDigest"=$8 AND "status"=$9 AND "taskId"=$10 AND "reviewHash"=$11')
+    expect(read.sql).toContain('SELECT "userId", "sessionId", "jobId", "artifactId", "version", "contentHash", "sourceDigest", "currentSourceDigest", "status", "taskId", "toolCallId", "reviewHash"')
+    expect(read.sql).not.toMatch(/"(findings|evidenceRefs|requestHash)"/)
+    expect(read.sql).toContain("LIMIT 2")
+    expect(read.values).toEqual([scope.userId, scope.sessionId, scope.jobId, scope.artifactId, scope.version,
+      scope.contentHash, scope.sourceDigest, scope.currentSourceDigest, scope.status, scope.taskId, scope.reviewHash])
+    rows = [row, { ...row, toolCallId: "second-review-call" }]
+    await expect(repository.findReviewReceipt(scope)).resolves.toBeNull()
+  })
+
   it("stores selected-job cover-letter text only in immutable versions", async () => {
     const body1 = "PRIVATE_DRAFT_BODY_ONE"
     const body2 = "PRIVATE_DRAFT_BODY_TWO"

@@ -968,12 +968,24 @@ describe("createCanonicalTurnRuntime", () => {
     const artifactHeadReader = vi.fn(async (scope: { userId: string; sessionId: string; jobId: string; artifactId: string }) => ({
       ...artifactRef, artifactId: scope.artifactId,
     }))
+    const reviewRow = {
+      id: "review-1", artifactVersionId: "version-1", userId: lease.userId, sessionId: lease.sessionId, jobId: "job-1",
+      artifactId: artifactRef.artifactId, version: artifactRef.version, contentHash: artifactRef.contentHash,
+      sourceDigest: artifactRef.sourceDigest, currentSourceDigest: artifactRef.sourceDigest, status: "needs_revision",
+      findings: [{ private: "review details" }], evidenceRefs: [], taskId: "reviewer-1", toolCallId: "review-call-1",
+      requestHash: "request-1", reviewHash: `sha256:${"c".repeat(64)}`, createdAt: new Date(),
+    }
+    const artifactClient = {
+      query: vi.fn(async (sql: string, _values?: readonly unknown[]) => sql.includes('FROM "agent_artifact_review"')
+        ? { rows: [reviewRow], rowCount: 1 } : { rows: [], rowCount: 0 }),
+      release: vi.fn(),
+    }
     const roots = rootStore()
     const sourceDigestLoader = vi.fn(async () => sourceDigest)
     const productionFlags = resolveProductionAgentFlags({
       ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
     })
-    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn(async () => artifactClient) } as never, {
       workerId: "worker-1", productionFlags, taskGraphCommandPort,
       selectedJobPreparationLoader: async () => ({ jobId: "job-1" }),
       selectedJobArtifactHeadReader: artifactHeadReader,
@@ -998,6 +1010,14 @@ describe("createCanonicalTurnRuntime", () => {
       turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: 1,
     })
     if (status === "completed") {
+      const reviewRead = artifactClient.query.mock.calls.find(([sql]) => String(sql).includes('FROM "agent_artifact_review"'))
+      expect(reviewRead?.[0]).toContain('AND "currentSourceDigest"=$8 AND "status"=$9 AND "taskId"=$10 AND "reviewHash"=$11')
+      expect(reviewRead?.[0]).toContain('"toolCallId", "reviewHash"')
+      expect(reviewRead?.[0]).not.toMatch(/"(findings|evidenceRefs|requestHash)"/)
+      expect(reviewRead?.[1]).toEqual([
+        lease.userId, lease.sessionId, "job-1", "draft-1", 2, artifactRef.contentHash, artifactRef.sourceDigest,
+        artifactRef.sourceDigest, "needs_revision", "reviewer-1", reviewRow.reviewHash,
+      ])
       expect(artifactHeadReader).toHaveBeenCalledOnce()
       expect(artifactHeadReader).toHaveBeenCalledWith({ userId: lease.userId, sessionId: lease.sessionId, jobId: "job-1", artifactId: "draft-1" })
     } else {

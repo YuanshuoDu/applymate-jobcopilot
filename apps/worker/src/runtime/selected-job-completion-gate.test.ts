@@ -8,6 +8,7 @@ import {
   type TaskGraphResultProjection,
 } from "./subagents/task-graph-command-port.js"
 import type { TurnLease } from "./turns/lease.js"
+import type { AgentArtifactReviewReceipt, AgentArtifactReviewReceiptScope } from "../db/agent-artifact-repo.js"
 
 const lease: TurnLease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 4,
@@ -59,6 +60,30 @@ function current(nodes: readonly TaskGraphCurrentNode[]): TaskGraphCurrentState 
   return { revision: 8, nodes }
 }
 
+function persistedReview(scope: AgentArtifactReviewReceiptScope): AgentArtifactReviewReceipt {
+  return { ...scope, toolCallId: "review-call-1" }
+}
+
+const readPersistedReview = async (scope: AgentArtifactReviewReceiptScope) => persistedReview(scope)
+
+type ReviewReceiptReader = (scope: AgentArtifactReviewReceiptScope) => Promise<AgentArtifactReviewReceipt | null>
+const failingReviewReaders: Array<[string, ReviewReceiptReader]> = [
+  ["missing", async () => null],
+  ["owner mismatch", async scope => ({ ...persistedReview(scope), userId: "other-user" })],
+  ["session mismatch", async scope => ({ ...persistedReview(scope), sessionId: "other-session" })],
+  ["job mismatch", async scope => ({ ...persistedReview(scope), jobId: "other-job" })],
+  ["artifact mismatch", async scope => ({ ...persistedReview(scope), artifactId: "cover-letter:other-draft" })],
+  ["version mismatch", async scope => ({ ...persistedReview(scope), version: 1 })],
+  ["content hash mismatch", async scope => ({ ...persistedReview(scope), contentHash: `sha256:${"d".repeat(64)}` })],
+  ["artifact source digest mismatch", async scope => ({ ...persistedReview(scope), sourceDigest: `sha256:${"e".repeat(64)}` })],
+  ["reviewer task mismatch", async scope => ({ ...persistedReview(scope), taskId: "other-reviewer-task" })],
+  ["invalid tool-call identity", async scope => ({ ...persistedReview(scope), toolCallId: " " })],
+  ["current source digest mismatch", async scope => ({ ...persistedReview(scope), currentSourceDigest: `sha256:${"f".repeat(64)}` })],
+  ["review hash mismatch", async scope => ({ ...persistedReview(scope), reviewHash: `sha256:${"d".repeat(64)}` })],
+  ["review status mismatch", async scope => ({ ...persistedReview(scope), status: "rejected" })],
+  ["stale review status", async scope => ({ ...persistedReview(scope), status: "stale" })],
+]
+
 function commandPort(value: unknown) {
   return {
     appendAndSchedule: async () => ({ status: "accepted" as const, revision: 8, nodes: [], readyTaskIds: [] }),
@@ -71,6 +96,7 @@ async function check(value: unknown) {
     commandPort: commandPort(value), lease, root, selectedJobId: "job-1",
     readCurrentDraftHead: async scope => ({ ...reference(), artifactId: scope.artifactId }),
     readCurrentSourceDigest: async () => reference().sourceDigest,
+    readCurrentReviewReceipt: readPersistedReview,
   })
 }
 
@@ -80,8 +106,9 @@ describe("selected-job artifact completion gate", () => {
     const port = commandPort(state)
     const readCurrentDraftHead = vi.fn(async (scope: { artifactId: string }) => ({ ...reference(), artifactId: scope.artifactId }))
 
+    const readCurrentReviewReceipt = vi.fn(readPersistedReview)
     await expect(selectedJobArtifactCompletionGate({
-      commandPort: port, lease, root, selectedJobId: "job-1", readCurrentDraftHead,
+      commandPort: port, lease, root, selectedJobId: "job-1", readCurrentDraftHead, readCurrentReviewReceipt,
       readCurrentSourceDigest: async () => reference().sourceDigest,
     })).resolves.toEqual({ ok: true })
     expect(port.readCurrent).toHaveBeenCalledWith({
@@ -91,6 +118,22 @@ describe("selected-job artifact completion gate", () => {
     expect(readCurrentDraftHead).toHaveBeenCalledWith({
       userId: lease.userId, sessionId: lease.sessionId, jobId: "job-1", artifactId: "draft-1",
     })
+    expect(readCurrentReviewReceipt).toHaveBeenCalledWith({
+      userId: lease.userId, sessionId: lease.sessionId, jobId: "job-1", artifactId: "draft-1",
+      version: 2, contentHash: reference().contentHash, sourceDigest: reference().sourceDigest,
+      currentSourceDigest: reference().sourceDigest, taskId: "task-reviewer", status: reviewStatus,
+      reviewHash: `sha256:${"c".repeat(64)}`,
+    })
+  })
+
+  it.each(failingReviewReaders)("fails closed when the durable review receipt is %s", async (_label, readCurrentReviewReceipt) => {
+    const graph = current([writer(), reviewer()])
+    await expect(selectedJobArtifactCompletionGate({
+      commandPort: commandPort(graph), lease, root, selectedJobId: "job-1",
+      readCurrentDraftHead: async scope => ({ ...reference(), artifactId: scope.artifactId }),
+      readCurrentSourceDigest: async () => reference().sourceDigest,
+      readCurrentReviewReceipt,
+    })).resolves.toMatchObject({ ok: false, blocker: "selected_job_draft_review_required" })
   })
 
   const scout = node({ key: "scout", templateId: "scout", status: "completed", resultProjection: {
@@ -141,6 +184,7 @@ describe("selected-job artifact completion gate", () => {
       commandPort: port, lease, root, selectedJobId: "job-1",
       readCurrentDraftHead: async scope => ({ ...reference(), artifactId: scope.artifactId }),
       readCurrentSourceDigest: async () => reference().sourceDigest,
+      readCurrentReviewReceipt: readPersistedReview,
     })).resolves.toEqual({
       ok: false,
       blocker: "selected_job_draft_review_required",
@@ -151,10 +195,18 @@ describe("selected-job artifact completion gate", () => {
   it("fails closed when the command port is unavailable", async () => {
     await expect(selectedJobArtifactCompletionGate({
       commandPort: undefined, lease, root, selectedJobId: undefined, readCurrentDraftHead: undefined,
-      readCurrentSourceDigest: undefined,
+      readCurrentSourceDigest: undefined, readCurrentReviewReceipt: undefined,
     })).resolves.toMatchObject({
       ok: false, blocker: "selected_job_draft_review_required",
     })
+  })
+
+  it("fails closed when a durable review receipt reader is unavailable", async () => {
+    await expect(selectedJobArtifactCompletionGate({
+      commandPort: commandPort(current([writer(), reviewer()])), lease, root, selectedJobId: "job-1",
+      readCurrentDraftHead: async scope => ({ ...reference(), artifactId: scope.artifactId }),
+      readCurrentSourceDigest: async () => reference().sourceDigest, readCurrentReviewReceipt: undefined,
+    })).resolves.toMatchObject({ ok: false, blocker: "selected_job_draft_review_required" })
   })
 
   it.each(failingHeadReaders)("fails closed when the persisted draft head is %s", async (_label, readCurrentDraftHead) => {
@@ -162,6 +214,7 @@ describe("selected-job artifact completion gate", () => {
     await expect(selectedJobArtifactCompletionGate({
       commandPort: commandPort(graph), lease, root, selectedJobId: "job-1", readCurrentDraftHead,
       readCurrentSourceDigest: async () => reference().sourceDigest,
+      readCurrentReviewReceipt: readPersistedReview,
     })).resolves.toMatchObject({ ok: false, blocker: "selected_job_draft_review_required" })
   })
 
@@ -170,6 +223,7 @@ describe("selected-job artifact completion gate", () => {
     await expect(selectedJobArtifactCompletionGate({
       commandPort: commandPort(graph), lease, root, selectedJobId: "job-1",
       readCurrentDraftHead: async scope => ({ ...reference(), artifactId: scope.artifactId }), readCurrentSourceDigest: undefined,
+      readCurrentReviewReceipt: readPersistedReview,
     })).resolves.toMatchObject({ ok: false, blocker: "selected_job_draft_review_required" })
   })
 
@@ -179,6 +233,7 @@ describe("selected-job artifact completion gate", () => {
       commandPort: commandPort(graph), lease, root, selectedJobId: "job-1",
       readCurrentDraftHead: async scope => ({ ...reference(), artifactId: scope.artifactId }),
       readCurrentSourceDigest: async () => `sha256:${"e".repeat(64)}`,
+      readCurrentReviewReceipt: readPersistedReview,
     })).resolves.toMatchObject({ ok: false, blocker: "selected_job_draft_review_required" })
   })
 
@@ -188,6 +243,7 @@ describe("selected-job artifact completion gate", () => {
       commandPort: commandPort(graph), lease, root, selectedJobId: "job-1",
       readCurrentDraftHead: async scope => ({ ...reference(), artifactId: scope.artifactId }),
       readCurrentSourceDigest: async () => { throw new Error("private source detail") },
+      readCurrentReviewReceipt: readPersistedReview,
     })).resolves.toMatchObject({ ok: false, blocker: "selected_job_draft_review_required" })
   })
 
@@ -200,6 +256,7 @@ describe("selected-job artifact completion gate", () => {
     await expect(selectedJobArtifactCompletionGate({
       commandPort: port, lease, root, selectedJobId: "job-1", readCurrentDraftHead,
       readCurrentSourceDigest: async () => reference().sourceDigest,
+      readCurrentReviewReceipt: readPersistedReview,
     })).resolves.toEqual({ ok: true })
     expect(readCurrentDraftHead).toHaveBeenCalledTimes(2)
     expect(readCurrentDraftHead).toHaveBeenNthCalledWith(1, { userId: lease.userId, sessionId: lease.sessionId, jobId: "job-1", artifactId: "draft-1" })

@@ -222,6 +222,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
         return selectedJobArtifactCompletionGate({
           commandPort: options.taskGraphCommandPort, lease, root, selectedJobId: selectedJobPreparation?.jobId,
           readCurrentDraftHead: options.selectedJobArtifactHeadReader ?? (scope => artifactRepository.findCurrentDraftHead(scope)),
+          readCurrentReviewReceipt: scope => artifactRepository.findReviewReceipt(scope),
           readCurrentSourceDigest: async () => {
             const jobId = selectedJobPreparation?.jobId
             if (!jobId) return null

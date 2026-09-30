@@ -8,10 +8,8 @@ import {
 } from "./agent-artifact-repo-helpers.js"
 
 export { AgentArtifactRepositoryError } from "./agent-artifact-repo-helpers.js"
-export type {
-  AgentArtifactBaseInsert, AgentArtifactDraftWrite, AgentArtifactLifecycle, AgentArtifactReviewRow,
-  AgentArtifactReviewWrite, AgentArtifactRow, AgentArtifactTaskFence, AgentArtifactVersionRow,
-} from "./agent-artifact-repo-helpers.js"
+export type { AgentArtifactBaseInsert, AgentArtifactDraftWrite, AgentArtifactLifecycle, AgentArtifactReviewRow,
+  AgentArtifactReviewWrite, AgentArtifactRow, AgentArtifactTaskFence, AgentArtifactVersionRow } from "./agent-artifact-repo-helpers.js"
 
 export type AgentArtifactDraftHead = Readonly<{
   artifactId: string
@@ -27,9 +25,13 @@ export type AgentArtifactDraftHeadScope = Readonly<{
   artifactId: string
 }>
 
+export type AgentArtifactReviewReceipt = Readonly<Pick<AgentArtifactReviewRow, "userId" | "sessionId" | "jobId" | "artifactId" | "version" | "contentHash" | "sourceDigest" | "currentSourceDigest" | "status" | "taskId" | "toolCallId" | "reviewHash">>
+export type AgentArtifactReviewReceiptScope = Readonly<Pick<AgentArtifactReviewReceipt, "userId" | "sessionId" | "jobId" | "artifactId" | "version" | "contentHash" | "sourceDigest" | "currentSourceDigest" | "status" | "taskId" | "reviewHash">>
+
 const columns = `"id", "userId", "jobId", "artifactType", "lifecycle", "baseId", "baseHash", "content", "hash", "constraintHash", "provenanceRefs", "evidenceRefs", "previousHash", "version", "createdAt", "updatedAt"`
 const versionColumns = `"id", "artifactId", "version", "userId", "sessionId", "jobId", "artifactType", "content", "contentHash", "sourceDigest", "constraintHash", "provenanceRefs", "evidenceRefs", "baseId", "baseHash", "previousHash", "taskId", "toolCallId", "requestHash", "createdAt"`
 const reviewColumns = `"id", "artifactVersionId", "userId", "sessionId", "jobId", "artifactId", "version", "contentHash", "sourceDigest", "currentSourceDigest", "status", "findings", "evidenceRefs", "taskId", "toolCallId", "requestHash", "reviewHash", "createdAt"`
+const reviewReceiptColumns = `"userId", "sessionId", "jobId", "artifactId", "version", "contentHash", "sourceDigest", "currentSourceDigest", "status", "taskId", "toolCallId", "reviewHash"`
 function draftParentContent(input: AgentArtifactDraftWrite, version: number): unknown {
   return input.artifactType === "cover_letter" ? { kind: "agent_artifact_version", artifactId: input.id, version, contentHash: input.hash } : input.content
 }
@@ -223,6 +225,19 @@ export function createAgentArtifactRepository(pool: Pool) {
           [scope.userId, scope.sessionId, scope.jobId, scope.artifactId, scope.version, scope.contentHash, scope.sourceDigest],
         )
         return result.rows[0] ? toAgentArtifactReviewRow(result.rows[0]) : null
+      })
+    },
+
+    async findReviewReceipt(scope: AgentArtifactReviewReceiptScope): Promise<AgentArtifactReviewReceipt | null> {
+      return withArtifactTransaction(pool, scope.userId, async client => {
+        const result = await client.query<Record<string, unknown>>(
+          `SELECT ${reviewReceiptColumns} FROM "agent_artifact_review" WHERE "userId"=$1 AND "sessionId"=$2 AND "jobId"=$3 AND "artifactId"=$4 AND "version"=$5 AND "contentHash"=$6 AND "sourceDigest"=$7 AND "currentSourceDigest"=$8 AND "status"=$9 AND "taskId"=$10 AND "reviewHash"=$11 LIMIT 2`,
+          [scope.userId, scope.sessionId, scope.jobId, scope.artifactId, scope.version, scope.contentHash, scope.sourceDigest, scope.currentSourceDigest, scope.status, scope.taskId, scope.reviewHash],
+        )
+        if (result.rows.length !== 1) return null
+        const row = result.rows[0]
+        if (!row || typeof row.toolCallId !== "string" || !row.toolCallId.trim()) return null
+        return { userId: row.userId as string, sessionId: row.sessionId as string, jobId: row.jobId as string, artifactId: row.artifactId as string, version: Number(row.version), contentHash: row.contentHash as string, sourceDigest: row.sourceDigest as string, currentSourceDigest: row.currentSourceDigest as string, status: row.status as AgentArtifactReviewReceipt["status"], taskId: row.taskId as string, toolCallId: row.toolCallId, reviewHash: row.reviewHash as string }
       })
     },
 

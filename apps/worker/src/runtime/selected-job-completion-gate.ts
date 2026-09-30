@@ -3,7 +3,9 @@ import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./subagents/task-graph-comm
 import type { SubagentTaskRecord } from "./subagents/types.js"
 import type { TurnLease } from "./turns/lease.js"
 import type { TurnEngineCompletionGateResult } from "./turns/turn-execution-types.js"
-import type { AgentArtifactDraftHead, AgentArtifactDraftHeadScope } from "../db/agent-artifact-repo.js"
+import type {
+  AgentArtifactDraftHead, AgentArtifactDraftHeadScope, AgentArtifactReviewReceipt, AgentArtifactReviewReceiptScope,
+} from "../db/agent-artifact-repo.js"
 
 const WRITER_TEMPLATE_ID = "cover_letter_writer"
 const REVIEWER_TEMPLATE_ID = "cover_letter_reviewer"
@@ -18,13 +20,22 @@ const BLOCKED: TurnEngineCompletionGateResult = Object.freeze({
 type ArtifactReference = TaskGraphArtifactProjectionReference
 type GraphNode = Readonly<{
   key: string
+  taskId: string
   templateId: string
   status: string
   dependsOn: readonly string[]
   resultProjection?: unknown
 }>
 type WriterNode = Readonly<{ key: string; artifactRef: ArtifactReference }>
-type ReviewerNode = Readonly<{ dependsOn: readonly string[]; artifactRef: ArtifactReference; reviewStatus: string }>
+type ReviewerNode = Readonly<{
+  key: string
+  taskId: string
+  dependsOn: readonly string[]
+  artifactRef: ArtifactReference
+  reviewStatus: AgentArtifactReviewReceipt["status"]
+  reviewHash: string
+}>
+type ReviewedDraftState = Readonly<{ references: readonly ArtifactReference[]; reviewers: readonly ReviewerNode[] }>
 
 function plainRecord(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
@@ -62,15 +73,18 @@ function graphNodes(value: unknown): GraphNode[] | undefined {
     || !Array.isArray(state.nodes) || state.nodes.length > 16) return undefined
   const nodes: GraphNode[] = []
   const keys = new Set<string>()
+  const taskIds = new Set<string>()
   for (const item of state.nodes) {
     const row = plainRecord(item)
     if (!row || typeof row.key !== "string" || !row.key.trim() || row.key.length > 128
+      || typeof row.taskId !== "string" || !row.taskId.trim() || row.taskId.length > 256
       || typeof row.templateId !== "string" || !row.templateId.trim() || row.templateId.length > 128
       || typeof row.status !== "string" || !Array.isArray(row.dependsOn)
       || row.dependsOn.some(key => typeof key !== "string" || !key.trim() || key.length > 128)
-      || keys.has(row.key)) return undefined
+      || keys.has(row.key) || taskIds.has(row.taskId)) return undefined
     keys.add(row.key)
-    nodes.push({ key: row.key, templateId: row.templateId, status: row.status, dependsOn: row.dependsOn as string[], resultProjection: row.resultProjection })
+    taskIds.add(row.taskId)
+    nodes.push({ key: row.key, taskId: row.taskId, templateId: row.templateId, status: row.status, dependsOn: row.dependsOn as string[], resultProjection: row.resultProjection })
   }
   if (nodes.some(node => node.dependsOn.some(key => !keys.has(key)))) return undefined
   return nodes
@@ -90,12 +104,18 @@ function reviewerProjection(node: GraphNode): Omit<ReviewerNode, "dependsOn"> | 
     || row.schemaVersion !== TASK_GRAPH_RESULT_PROJECTION_SCHEMA || row.trust !== "untrusted"
     || row.availability !== "available" || row.role !== "reviewer" || row.status !== "completed"
     || typeof row.reviewHash !== "string" || !SHA256.test(row.reviewHash)
-    || !["passed", "needs_revision", "rejected", "stale"].includes(String(row.reviewStatus))) return undefined
+    || !["passed", "needs_revision", "rejected"].includes(String(row.reviewStatus))) return undefined
   const artifactRef = artifactReference(row.artifactRef)
-  return artifactRef ? { artifactRef, reviewStatus: String(row.reviewStatus) } : undefined
+  return artifactRef ? {
+    key: node.key,
+    taskId: node.taskId,
+    artifactRef,
+    reviewStatus: String(row.reviewStatus) as AgentArtifactReviewReceipt["status"],
+    reviewHash: row.reviewHash,
+  } : undefined
 }
 
-function latestReviewedDraftReferences(value: unknown): ArtifactReference[] | undefined {
+function latestReviewedDraftState(value: unknown): ReviewedDraftState | undefined {
   const nodes = graphNodes(value)
   if (!nodes) return undefined
   const writers: WriterNode[] = []
@@ -133,8 +153,13 @@ function latestReviewedDraftReferences(value: unknown): ArtifactReference[] | un
   }
 
   const latestWriters = [...latestByArtifact.values()].flat()
-  if (!latestWriters.every(writer => reviewers.some(reviewer =>
-    reviewer.dependsOn.includes(writer.key) && sameArtifact(reviewer.artifactRef, writer.artifactRef)))) return undefined
+  const requiredReviewers = new Map<string, ReviewerNode>()
+  for (const writer of latestWriters) {
+    const matches = reviewers.filter(reviewer =>
+      reviewer.dependsOn.includes(writer.key) && sameArtifact(reviewer.artifactRef, writer.artifactRef))
+    if (matches.length === 0) return undefined
+    for (const reviewer of matches) requiredReviewers.set(reviewer.taskId, reviewer)
+  }
 
   const latestGraphReferenceByArtifact = new Map<string, ArtifactReference>()
   for (const reference of [...writers.map(writer => writer.artifactRef), ...reviewers.map(reviewer => reviewer.artifactRef)]) {
@@ -142,10 +167,31 @@ function latestReviewedDraftReferences(value: unknown): ArtifactReference[] | un
     if (!current || reference.version > current.version) latestGraphReferenceByArtifact.set(reference.artifactId, reference)
     else if (reference.version === current.version && !sameArtifact(reference, current)) return undefined
   }
-  return [...latestGraphReferenceByArtifact.values()]
+  return { references: [...latestGraphReferenceByArtifact.values()], reviewers: [...requiredReviewers.values()] }
 }
 
-/** Requires every latest selected-job draft to match its persisted head and current source digest. */
+function parsedReviewReceipt(value: unknown): AgentArtifactReviewReceipt | undefined {
+  const row = plainRecord(value)
+  if (!row || !exactKeys(row, "artifactId,contentHash,currentSourceDigest,jobId,reviewHash,sessionId,sourceDigest,status,taskId,toolCallId,userId,version")
+    || typeof row.userId !== "string" || !row.userId.trim() || typeof row.sessionId !== "string" || !row.sessionId.trim()
+    || typeof row.jobId !== "string" || !row.jobId.trim() || typeof row.artifactId !== "string" || !ARTIFACT_ID.test(row.artifactId)
+    || !Number.isSafeInteger(row.version) || Number(row.version) < 1
+    || typeof row.contentHash !== "string" || !SHA256.test(row.contentHash)
+    || typeof row.sourceDigest !== "string" || !SHA256.test(row.sourceDigest)
+    || typeof row.currentSourceDigest !== "string" || !SHA256.test(row.currentSourceDigest)
+    || typeof row.reviewHash !== "string" || !SHA256.test(row.reviewHash)
+    || typeof row.taskId !== "string" || !row.taskId.trim()
+    || typeof row.toolCallId !== "string" || !row.toolCallId.trim()
+    || !["passed", "needs_revision", "rejected"].includes(String(row.status))) return undefined
+  return {
+    userId: row.userId, sessionId: row.sessionId, jobId: row.jobId, artifactId: row.artifactId,
+    version: Number(row.version), contentHash: row.contentHash, sourceDigest: row.sourceDigest,
+    currentSourceDigest: row.currentSourceDigest, status: String(row.status) as AgentArtifactReviewReceipt["status"],
+    taskId: row.taskId, toolCallId: row.toolCallId, reviewHash: row.reviewHash,
+  }
+}
+
+/** Requires every latest selected-job draft, current source digest, and exact persisted review receipt to match. */
 export async function selectedJobArtifactCompletionGate(input: {
   readonly commandPort: TaskGraphCommandPort | undefined
   readonly lease: TurnLease
@@ -153,9 +199,10 @@ export async function selectedJobArtifactCompletionGate(input: {
   readonly selectedJobId: string | undefined
   readonly readCurrentDraftHead: ((scope: AgentArtifactDraftHeadScope) => Promise<AgentArtifactDraftHead | null>) | undefined
   readonly readCurrentSourceDigest: (() => Promise<string | null>) | undefined
+  readonly readCurrentReviewReceipt: ((scope: AgentArtifactReviewReceiptScope) => Promise<AgentArtifactReviewReceipt | null>) | undefined
 }): Promise<TurnEngineCompletionGateResult> {
   if (!input.commandPort || typeof input.selectedJobId !== "string" || !input.selectedJobId.trim()
-    || input.selectedJobId.length > 256 || !input.readCurrentDraftHead || !input.readCurrentSourceDigest) return BLOCKED
+    || input.selectedJobId.length > 256 || !input.readCurrentDraftHead || !input.readCurrentSourceDigest || !input.readCurrentReviewReceipt) return BLOCKED
   const scope: TaskGraphReadScope = {
     userId: input.lease.userId,
     sessionId: input.lease.sessionId,
@@ -168,12 +215,12 @@ export async function selectedJobArtifactCompletionGate(input: {
     parentAttemptCount: input.root.attemptCount,
   }
   try {
-    const latestReferences = latestReviewedDraftReferences(await input.commandPort.readCurrent(scope))
-    if (!latestReferences) return BLOCKED
+    const latestState = latestReviewedDraftState(await input.commandPort.readCurrent(scope))
+    if (!latestState) return BLOCKED
     const currentSourceDigest = await input.readCurrentSourceDigest()
     if (typeof currentSourceDigest !== "string" || !SHA256.test(currentSourceDigest)
-      || latestReferences.some(reference => reference.sourceDigest !== currentSourceDigest)) return BLOCKED
-    for (const reference of latestReferences) {
+      || latestState.references.some(reference => reference.sourceDigest !== currentSourceDigest)) return BLOCKED
+    for (const reference of latestState.references) {
       const persistedHead = await input.readCurrentDraftHead({
         userId: input.lease.userId,
         sessionId: input.lease.sessionId,
@@ -182,6 +229,19 @@ export async function selectedJobArtifactCompletionGate(input: {
       })
       const parsedHead = artifactReference(persistedHead)
       if (!parsedHead || !sameArtifact(reference, parsedHead)) return BLOCKED
+    }
+    for (const reviewer of latestState.reviewers) {
+      const expected: AgentArtifactReviewReceiptScope = {
+        userId: input.lease.userId, sessionId: input.lease.sessionId, jobId: input.selectedJobId,
+        artifactId: reviewer.artifactRef.artifactId, version: reviewer.artifactRef.version,
+        contentHash: reviewer.artifactRef.contentHash, sourceDigest: reviewer.artifactRef.sourceDigest,
+        currentSourceDigest, status: reviewer.reviewStatus, taskId: reviewer.taskId, reviewHash: reviewer.reviewHash,
+      }
+      const receipt = parsedReviewReceipt(await input.readCurrentReviewReceipt(expected))
+      if (!receipt || receipt.userId !== expected.userId || receipt.sessionId !== expected.sessionId || receipt.jobId !== expected.jobId
+        || receipt.artifactId !== expected.artifactId || receipt.version !== expected.version || receipt.contentHash !== expected.contentHash
+        || receipt.sourceDigest !== expected.sourceDigest || receipt.currentSourceDigest !== expected.currentSourceDigest
+        || receipt.status !== expected.status || receipt.taskId !== expected.taskId || receipt.reviewHash !== expected.reviewHash) return BLOCKED
     }
     return { ok: true }
   } catch {
