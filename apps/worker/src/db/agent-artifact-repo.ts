@@ -77,9 +77,13 @@ export function createAgentArtifactRepository(pool: Pool) {
         if (!input.sessionId.trim() || !input.taskId.trim() || !input.toolCallId.trim()) throw new AgentArtifactRepositoryError("precondition_failed", "Artifact Task receipt scope is required.")
         if (input.taskFence.taskId !== input.taskId || input.taskFence.userId !== input.userId || input.taskFence.sessionId !== input.sessionId) throw new AgentArtifactRepositoryError("task_fence_denied", "The selected-job artifact task fence does not match its receipt scope.")
         await client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [input.userId, input.jobId])
-        const earlyReceipt = await findTaskVersion(client, input.taskId, input.toolCallId)
-        if (earlyReceipt) return assertVersionReplay(earlyReceipt, input)
         if (!await artifactTaskFenceIsCurrent(client, input.taskFence, input.jobId)) throw new AgentArtifactRepositoryError("task_fence_denied", "The selected-job artifact task lease or lineage is stale, stopped, expired, or mismatched.")
+        const earlyReceipt = await findTaskVersion(client, input.taskId, input.toolCallId)
+        if (earlyReceipt) {
+          const replay = assertVersionReplay(earlyReceipt, input)
+          if (!await artifactTaskLeaseIsLive(client, input.taskFence)) throw new AgentArtifactRepositoryError("task_fence_denied", "The selected-job artifact task lease expired before commit.")
+          return replay
+        }
         const base = await selectOne(client, input.userId, input.baseId, true)
         if (!base) throw new AgentArtifactRepositoryError("not_found", "Artifact is not available in the current tenant.")
         if (base.lifecycle !== "base" || base.hash !== input.baseHash || base.artifactType !== input.artifactType || base.jobId !== input.jobId) {
@@ -110,7 +114,9 @@ export function createAgentArtifactRepository(pool: Pool) {
         if (!inserted.rows[0]) {
           const winner = await findTaskVersion(client, input.taskId, input.toolCallId)
           if (!winner) throw new AgentArtifactRepositoryError("receipt_conflict", "Task tool receipt could not be resolved.")
-          return assertVersionReplay(winner, input)
+          const replay = assertVersionReplay(winner, input)
+          if (!await artifactTaskLeaseIsLive(client, input.taskFence)) throw new AgentArtifactRepositoryError("task_fence_denied", "The selected-job artifact task lease expired before commit.")
+          return replay
         }
         const version = toAgentArtifactVersionRow(inserted.rows[0])
         if (previous) {
@@ -138,9 +144,13 @@ export function createAgentArtifactRepository(pool: Pool) {
       return withArtifactTransaction(pool, input.userId, async client => {
         assertReviewSourceBinding(input)
         if (input.taskFence.taskId !== input.taskId || input.taskFence.userId !== input.userId || input.taskFence.sessionId !== input.sessionId) throw new AgentArtifactRepositoryError("task_fence_denied", "The selected-job artifact task fence does not match its receipt scope.")
-        const earlyReceipt = await findTaskReview(client, input.taskId, input.toolCallId)
-        if (earlyReceipt) return assertReviewReplay(earlyReceipt, input)
         if (!await artifactTaskFenceIsCurrent(client, input.taskFence, input.jobId)) throw new AgentArtifactRepositoryError("task_fence_denied", "The selected-job artifact task lease or lineage is stale, stopped, expired, or mismatched.")
+        const earlyReceipt = await findTaskReview(client, input.taskId, input.toolCallId)
+        if (earlyReceipt) {
+          const replay = assertReviewReplay(earlyReceipt, input)
+          if (!await artifactTaskLeaseIsLive(client, input.taskFence)) throw new AgentArtifactRepositoryError("task_fence_denied", "The selected-job artifact task lease expired before commit.")
+          return replay
+        }
         const versionResult = await client.query<Record<string, unknown>>(
           `SELECT ${versionColumns} FROM "agent_artifact_version" WHERE "userId"=$1 AND "sessionId"=$2 AND "jobId"=$3 AND "artifactId"=$4 AND "version"=$5 AND "contentHash"=$6 AND "sourceDigest"=$7 FOR UPDATE`,
           [input.userId, input.sessionId, input.jobId, input.artifactId, input.version, input.contentHash, input.sourceDigest],

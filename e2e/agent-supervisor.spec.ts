@@ -502,7 +502,11 @@ test('selected-job preparation sends typed scope and restores the persisted draf
 
   const draft = page.locator('[data-selected-job-draft="true"]')
   await expect(draft).toBeVisible({ timeout: 10_000 })
+  await expect(draft).toHaveAttribute('aria-label', 'Systems Engineer · Fixture Systems v1')
   await expect(draft).toContainText('Persisted cover-letter fixture body.')
+  await expect(draft).toContainText('persona:fixture-fact')
+  await expect(draft).toContainText('job:fixture-selected-job')
+  await expect(draft).toContainText('resume:fixture-fact')
   await expect(draft).toContainText(isZh ? '通过' : 'passed')
   await expect(draft).toHaveAttribute('data-draft-version', '1')
   await expect(draft).toContainText('unsupported_claim')
@@ -513,6 +517,7 @@ test('selected-job preparation sends typed scope and restores the persisted draf
   await expect(plan).toHaveAttribute('data-agent-task-graph-session', SESSION_A)
   await expect(plan).toHaveAttribute('data-agent-task-graph-revision', '4')
   await expect(plan).toContainText('Prepare the selected saved job')
+  await expect(plan.locator('ol li').first()).toContainText(isZh ? '已完成' : 'Completed')
   const planBeforeReconnect = await plan.evaluate(element => ({
     session: element.getAttribute('data-agent-task-graph-session'),
     revision: element.getAttribute('data-agent-task-graph-revision'),
@@ -529,10 +534,15 @@ test('selected-job preparation sends typed scope and restores the persisted draf
 
   await expect(draft).toBeVisible()
   await expect(draft).toContainText('Persisted cover-letter fixture body.')
+  await expect(draft).toHaveAttribute('aria-label', 'Systems Engineer · Fixture Systems v1')
+  await expect(draft).toContainText('persona:fixture-fact')
+  await expect(draft).toContainText('job:fixture-selected-job')
+  await expect(draft).toContainText('resume:fixture-fact')
   await expect(draft).toHaveAttribute('data-draft-version', '1')
   await expect(draft).toContainText('unsupported_claim')
   await expect(draft).toContainText('Confirm this claim against your resume.')
   await expect(plan).toBeVisible()
+  await expect(plan.locator('ol li').first()).toContainText(isZh ? '已完成' : 'Completed')
   expect(await plan.evaluate(element => ({
     session: element.getAttribute('data-agent-task-graph-session'),
     revision: element.getAttribute('data-agent-task-graph-revision'),

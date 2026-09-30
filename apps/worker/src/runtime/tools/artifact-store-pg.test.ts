@@ -34,6 +34,61 @@ describe("PgArtifactToolStore immutable persistence", () => {
     expect((await store.listForUser(scope.userId, scope.jobId)).find(row => row.lifecycle === "draft")).toMatchObject({ version: 1, hash: first.contentHash })
   })
 
+  it("denies draft and review receipt replays after a task Stop request", async () => {
+    const pool = new FakeArtifactPool()
+    const store = new PgArtifactToolStore(pool as unknown as Pool)
+    const base = await store.registerBase({ id: "base-a", type: "cover_letter", userId: scope.userId, jobId: scope.jobId, content: "base" })
+    const draftInput = { baseArtifactId: base.id, baseHash: base.hash, content: "draft", constraints: {}, requestHash: hashArtifactContent("same draft") }
+    const version = await store.writeDraft(scope, draftInput)
+    const reviewInput = {
+      userId: scope.userId, sessionId: scope.sessionId, jobId: scope.jobId, artifactId: version.artifactId, version: version.version,
+      contentHash: version.contentHash, sourceDigest: version.sourceDigest, currentSourceDigest: version.sourceDigest,
+      status: "passed" as const, findings: [], evidenceRefs: [...scope.evidenceRefs], taskId: scope.taskId, toolCallId: "review-call",
+      requestHash: hashArtifactContent("same review"), reviewHash: hashArtifactContent("review result"), taskFence: scope.taskFence,
+    }
+    await store.saveReview(reviewInput)
+    pool.fence.interruptRequestedAt = new Date()
+
+    await expect(store.writeDraft(scope, draftInput)).rejects.toMatchObject({ code: "task_fence_denied" })
+    await expect(store.saveReview(reviewInput)).rejects.toMatchObject({ code: "task_fence_denied" })
+    await expect(store.listForUser(scope.userId, scope.jobId)).resolves.toHaveLength(2)
+    expect(pool.reviewReceipts).toHaveLength(1)
+  })
+
+  it("rechecks lease expiry after a matching draft or review receipt is loaded", async () => {
+    const pool = new FakeArtifactPool()
+    const store = new PgArtifactToolStore(pool as unknown as Pool)
+    const base = await store.registerBase({ id: "base-a", type: "cover_letter", userId: scope.userId, jobId: scope.jobId, content: "base" })
+    const draftInput = { baseArtifactId: base.id, baseHash: base.hash, content: "draft", constraints: {}, requestHash: hashArtifactContent("same draft") }
+    const version = await store.writeDraft(scope, draftInput)
+    const reviewInput = {
+      userId: scope.userId, sessionId: scope.sessionId, jobId: scope.jobId, artifactId: version.artifactId, version: version.version,
+      contentHash: version.contentHash, sourceDigest: version.sourceDigest, currentSourceDigest: version.sourceDigest,
+      status: "passed" as const, findings: [], evidenceRefs: [...scope.evidenceRefs], taskId: scope.taskId, toolCallId: "review-call",
+      requestHash: hashArtifactContent("same review"), reviewHash: hashArtifactContent("review result"), taskFence: scope.taskFence,
+    }
+    await store.saveReview(reviewInput)
+
+    pool.expireLeaseAfterReceiptRead = true
+    await expect(store.writeDraft(scope, draftInput)).rejects.toMatchObject({ code: "task_fence_denied" })
+    pool.fence.leaseExpiresAt = new Date("2099-01-01T00:00:00Z")
+    pool.expireLeaseAfterReceiptRead = true
+    await expect(store.saveReview(reviewInput)).rejects.toMatchObject({ code: "task_fence_denied" })
+  })
+
+  it("rechecks lease expiry after resolving an ON CONFLICT draft receipt", async () => {
+    const pool = new FakeArtifactPool()
+    const store = new PgArtifactToolStore(pool as unknown as Pool)
+    const base = await store.registerBase({ id: "base-a", type: "cover_letter", userId: scope.userId, jobId: scope.jobId, content: "base" })
+    const input = { baseArtifactId: base.id, baseHash: base.hash, content: "draft", constraints: {}, requestHash: hashArtifactContent("same") }
+    await store.writeDraft(scope, input)
+
+    pool.skipNextVersionReceiptRead = true
+    pool.expireLeaseAfterReceiptRead = true
+    await expect(store.writeDraft(scope, input)).rejects.toMatchObject({ code: "task_fence_denied" })
+    expect(pool.conflictWinnerReads).toBe(1)
+  })
+
   it.each([
     ["stale owner", (pool: FakeArtifactPool) => { pool.fence.leaseOwner = "worker-b" }],
     ["stale attempt", (pool: FakeArtifactPool) => { pool.fence.attemptCount = 2 }],
@@ -87,6 +142,10 @@ class FakeArtifactPool {
   private readonly versionReceipts = new Map<string, Row>()
   private readonly reviews = new Map<string, Row>()
   readonly reviewReceipts = new Map<string, Row>()
+  expireLeaseAfterReceiptRead = false
+  skipNextVersionReceiptRead = false
+  conflictWinnerReads = 0
+  private resolvingVersionConflict = false
   readonly fence = {
     leaseOwner: "worker-a", attemptCount: 1, status: "running", interruptRequestedAt: null as Date | null,
     leaseExpiresAt: new Date("2099-01-01T00:00:00Z"), sessionStatus: "active", turnStatus: "waiting",
@@ -117,8 +176,24 @@ class FakeArtifactPool {
         && values[3] === this.fence.attemptCount && this.fence.leaseExpiresAt.getTime() > Date.now()
       return this.one({ live })
     }
-    if (sql.includes('FROM "agent_artifact_version"') && sql.includes('WHERE "taskId" = $1')) return this.one(this.versionReceipts.get(`${values[0]}:${values[1]}`))
-    if (sql.includes('FROM "agent_artifact_review"') && sql.includes('WHERE "taskId" = $1')) return this.one(this.reviewReceipts.get(`${values[0]}:${values[1]}`))
+    if (sql.includes('FROM "agent_artifact_version"') && sql.includes('WHERE "taskId" = $1')) {
+      if (this.skipNextVersionReceiptRead) {
+        this.skipNextVersionReceiptRead = false
+        return this.empty()
+      }
+      const receipt = this.versionReceipts.get(`${values[0]}:${values[1]}`)
+      if (this.resolvingVersionConflict) {
+        this.resolvingVersionConflict = false
+        this.conflictWinnerReads += 1
+      }
+      this.expireLeaseAfterReceiptQuery()
+      return this.one(receipt)
+    }
+    if (sql.includes('FROM "agent_artifact_review"') && sql.includes('WHERE "taskId" = $1')) {
+      const receipt = this.reviewReceipts.get(`${values[0]}:${values[1]}`)
+      this.expireLeaseAfterReceiptQuery()
+      return this.one(receipt)
+    }
     if (sql.startsWith("SELECT") && sql.includes('FROM "agent_artifact_version"')) {
       const row = [...this.versions.values()].find(value => value.userId === values[0] && value.sessionId === values[1] && value.jobId === values[2] && value.artifactId === values[3] && value.version === values[4] && (values[5] === undefined || value.contentHash === values[5]) && (values[6] === undefined || value.sourceDigest === values[6]))
       return this.one(row)
@@ -134,7 +209,10 @@ class FakeArtifactPool {
     }
     if (sql.startsWith("INSERT INTO \"agent_artifact_version\"")) {
       const receipt = `${values[16]}:${values[17]}`
-      if (this.versionReceipts.has(receipt)) return this.empty()
+      if (this.versionReceipts.has(receipt)) {
+        this.resolvingVersionConflict = true
+        return this.empty()
+      }
       const row: Row = { id: values[0], artifactId: values[1], version: values[2], userId: values[3], sessionId: values[4], jobId: values[5], artifactType: values[6], content: JSON.parse(String(values[7])), contentHash: values[8], sourceDigest: values[9], constraintHash: values[10], provenanceRefs: values[11], evidenceRefs: values[12], baseId: values[13], baseHash: values[14], previousHash: values[15], taskId: values[16], toolCallId: values[17], requestHash: values[18], createdAt: new Date() }
       this.versions.set(`${row.artifactId}:${row.version}`, row); this.versionReceipts.set(receipt, row)
       return this.one(row)
@@ -159,6 +237,11 @@ class FakeArtifactPool {
       return this.one(row)
     }
     throw new Error(`Unexpected artifact SQL: ${sql}`)
+  }
+  private expireLeaseAfterReceiptQuery() {
+    if (!this.expireLeaseAfterReceiptRead) return
+    this.expireLeaseAfterReceiptRead = false
+    this.fence.leaseExpiresAt = new Date(0)
   }
   private empty(): Result { return { rows: [], rowCount: 0 } }
   private one(row?: Row): Result { return { rows: row ? [row] : [], rowCount: row ? 1 : 0 } }
