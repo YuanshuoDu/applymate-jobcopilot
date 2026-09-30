@@ -133,9 +133,9 @@ describe("agent query DTO redaction", () => {
     }).content).toEqual({ toolCallId: "call_1", toolName: "jobs.search", inputAvailable: true })
   })
 
-  it("projects only an immutable artifact reference from the persisted result envelope", () => {
+  it("projects only completed Writer and Reviewer artifact references from persisted results", () => {
     const ref = { artifactId: "draft-1", version: 2, contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: `sha256:${"b".repeat(64)}` }
-    const dto = taskDto({
+    const writerRow = {
       id: "writer-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", path: "0",
       role: "writer", taskType: "cover_letter_draft", status: "completed", goal: "Prepare selected job", confidence: 1,
       failureReason: null, result: {
@@ -144,9 +144,23 @@ describe("agent query DTO redaction", () => {
         structuredResult: { schemaVersion: "agent-role-result.v1", role: "writer", status: "completed", artifactRef: ref },
         content: "PRIVATE_DRAFT_BODY",
       }, createdAt: date, updatedAt: date,
-    })
+    }
+    const dto = taskDto(writerRow)
     expect(dto.artifactRef).toEqual(ref)
     expect(JSON.stringify(dto)).not.toContain("PRIVATE_DRAFT_BODY")
+    expect(taskDto({
+      ...writerRow, id: "reviewer-1", role: "reviewer", taskType: "cover_letter_review",
+      result: { ...writerRow.result, structuredResult: { ...writerRow.result.structuredResult, role: "reviewer" } },
+    }).artifactRef).toEqual(ref)
+    expect(taskDto({ ...writerRow, role: "analyst" })).not.toHaveProperty("artifactRef")
+    expect(taskDto({ ...writerRow, taskType: "scout" })).not.toHaveProperty("artifactRef")
+    expect(taskDto({ ...writerRow, role: "reviewer", taskType: "scout" })).not.toHaveProperty("artifactRef")
+    expect(taskDto({ ...writerRow, status: "running" })).not.toHaveProperty("artifactRef")
+    expect(taskDto({ ...writerRow, result: { ...writerRow.result, status: "failed" } })).not.toHaveProperty("artifactRef")
+    expect(taskDto({
+      ...writerRow,
+      result: { ...writerRow.result, structuredResult: { ...writerRow.result.structuredResult, role: "reviewer" } },
+    })).not.toHaveProperty("artifactRef")
     expect(taskDto({
       id: "legacy-writer", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", path: "1",
       role: "writer", taskType: "cover_letter_draft", status: "completed", goal: "Prepare selected job", confidence: 1,

@@ -182,12 +182,19 @@ export interface SafeArtifactRef {
   readonly sourceDigest: string
 }
 
-function projectArtifactRef(value: unknown): SafeArtifactRef | null {
+function projectArtifactRef(value: unknown, role: string, taskType: string, status: string): SafeArtifactRef | null {
+  if (status !== "completed"
+    || (role === "writer" && taskType !== "cover_letter_draft")
+    || (role === "reviewer" && taskType !== "cover_letter_review")
+    || (role !== "writer" && role !== "reviewer")) return null
   const result = record(value)
   // Current child results persist a completed-result envelope whose role-specific
   // receipt lives under structuredResult. Keep accepting the earlier flat shape
   // for sessions written before that envelope was introduced.
   const structured = record(result.structuredResult)
+  if (Object.hasOwn(result, "structuredResult")) {
+    if (result.status !== "completed" || structured.role !== role || structured.status !== "completed") return null
+  } else if (result.status !== undefined && result.status !== "completed") return null
   const ref = record(structured.artifactRef ?? result.artifactRef)
   if (Object.keys(ref).sort().join(",") !== "artifactId,contentHash,sourceDigest,version"
     || !boundedIdentifier(ref.artifactId) || !Number.isSafeInteger(ref.version) || Number(ref.version) < 1
@@ -206,7 +213,7 @@ function isDigest(value: unknown): value is string {
 export function taskDto(row: TaskQueryRow) {
   const legacy = projectLegacySubAgentTask(row)
   const evidencePreview = projectTaskEvidencePreview(row)
-  const artifactRef = projectArtifactRef(row.result)
+  const artifactRef = projectArtifactRef(row.result, row.role, row.taskType, row.status)
   return {
     schemaVersion,
     id: row.id,
