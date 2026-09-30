@@ -3,19 +3,21 @@ import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import { matchesAgentOutboxIdentity, type AgentOutboxIdentity } from "../outbox-identity.js"
 import { toRepositoryJson, type AtomicTurnCompletionInput, type AtomicTurnCompletionResult, type TurnEngineEvent, type TurnEngineEventInput } from "./turn-engine-types.js"
+import type { TurnEngineCompletionGateResult } from "./turn-execution-types.js"
 
 type Pool = Pick<pg.Pool, "connect">
-type Client = Pick<pg.PoolClient, "query" | "release">
+type Client = pg.PoolClient
 type Row = Record<string, unknown>
 type TerminalInput = AtomicTurnCompletionInput & { readonly owner: TurnExecutionOwnerFence; readonly response: string; readonly now: Date }
+export type TurnEngineTerminalGuard = (client: pg.PoolClient) => Promise<TurnEngineCompletionGateResult>
 const json = (value: unknown) => JSON.stringify(value)
 const sameJson = (left: unknown, right: unknown) => json(toRepositoryJson(left)) === json(toRepositoryJson(right))
 function conflict(resource: string): Error { return Object.assign(new Error(`TurnEngine persistence conflict: ${resource}`), { name: "TurnEnginePersistenceConflict" }) }
 
-async function transaction<T>(pool: Pool, userId: string, work: (client: Client) => Promise<T>): Promise<T> {
+async function transaction<T>(pool: Pool, userId: string, work: (client: Client) => Promise<T>, guarded = false): Promise<T> {
   const client = await pool.connect(); let committed = false
   try {
-    await client.query("BEGIN")
+    await client.query(guarded ? "BEGIN ISOLATION LEVEL READ COMMITTED" : "BEGIN")
     await client.query("SELECT set_config($1, $2, true)", ["app.user_id", userId])
     const value = await work(client)
     await client.query("COMMIT"); committed = true
@@ -79,7 +81,7 @@ function events(input: TerminalInput, startedBy: string): TurnEngineEventInput[]
   }))
 }
 
-export async function commitTurnTerminal(pool: Pool, input: TerminalInput): Promise<AtomicTurnCompletionResult> {
+export async function commitTurnTerminal(pool: Pool, input: TerminalInput, finalizationGuard?: TurnEngineTerminalGuard): Promise<AtomicTurnCompletionResult> {
   if (input.owner.kind !== "turn") throw conflict(`child final response ${input.owner.taskId}`)
   const owner = input.owner
   return transaction(pool, owner.userId, async client => {
@@ -109,6 +111,12 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput): Prom
     const prior = await client.query<Row>(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "idempotencyKey" = $3 FOR UPDATE`,
       [owner.sessionId, owner.turnId, `turn:${owner.turnId}:event:step-completed:${input.stepId}`])
     if (!prior.rows[0]) throw conflict(`completed step event ${input.stepId}`)
+    if (!committed && finalizationGuard) {
+      const decision = await finalizationGuard(client)
+      if (!decision || typeof decision !== "object" || decision.ok !== true) {
+        throw conflict(`selected-job finalization${decision && "blocker" in decision ? ` ${decision.blocker}` : ""}`)
+      }
+    }
     const content = input.finalContent
     const insertedItem = await client.query<{ id: string; revision: number }>(`INSERT INTO "agent_items"
       ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "revision", "content", "startedAt", "completedAt", "updatedAt")
@@ -130,17 +138,17 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput): Prom
     if (!committed) {
       const updatedRoot = await client.query(`UPDATE "sub_agent_tasks" SET "status" = 'completed', "result" = $1::jsonb, "failureReason" = NULL,
         "leaseOwner" = NULL, "leaseExpiresAt" = NULL, "completedAt" = $2, "updatedAt" = $2
-        WHERE "id" = $3 AND "sessionId" = $4 AND "turnId" = $5 AND "rootTaskId" = $3 AND "status" = 'running' AND "leaseOwner" = $6 AND "attemptCount" = 1`,
+        WHERE "id" = $3 AND "sessionId" = $4 AND "turnId" = $5 AND "rootTaskId" = $3 AND "status" = 'running' AND "leaseOwner" = $6 AND "attemptCount" = 1${finalizationGuard ? ` AND "leaseExpiresAt" > clock_timestamp() AND "interruptRequestedAt" IS NULL` : ""}`,
       [json(result), input.now, owner.taskId, owner.sessionId, owner.turnId, owner.ownerId])
       if (updatedRoot.rowCount !== 1) throw conflict(`root task ${owner.taskId} completion`)
       const updatedTurn = await client.query(`UPDATE "agent_turns" SET "status" = 'completed', "finalResponse" = $1, "error" = NULL,
         "inputTokens" = $2, "outputTokens" = $3, "estimatedCostUsd" = $4, "durationMs" = CASE WHEN "startedAt" IS NULL THEN "durationMs" ELSE GREATEST(0, FLOOR(EXTRACT(EPOCH FROM ($5::timestamp(3) - "startedAt")) * 1000)::int) END,
         "leaseOwnerId" = NULL, "leaseExpiresAt" = NULL, "leaseStartedAt" = NULL, "completedAt" = $5, "revision" = "revision" + 1, "updatedAt" = $5
         WHERE "id" = $6 AND "sessionId" = $7 AND "userId" = $8 AND "rootTaskId" = $9 AND "status" = 'in_progress'
-          AND "leaseOwnerId" = $10 AND "leaseVersion" = $11 AND "leaseExpiresAt" > $5`,
+          AND "leaseOwnerId" = $10 AND "leaseVersion" = $11 AND "leaseExpiresAt" > ${finalizationGuard ? "clock_timestamp()" : "$5"}`,
       [input.response, input.usage.inputTokens, input.usage.outputTokens, input.usage.estimatedCostUsd, input.now, owner.turnId, owner.sessionId, owner.userId, owner.taskId, owner.ownerId, owner.leaseVersion])
       if (updatedTurn.rowCount !== 1) throw conflict(`turn ${owner.turnId} completion`)
     }
     return { status: "completed", finalItemId: input.finalItemId, events: saved }
-  })
+  }, Boolean(finalizationGuard))
 }

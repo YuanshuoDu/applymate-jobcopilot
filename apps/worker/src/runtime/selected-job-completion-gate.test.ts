@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest"
-import { selectedJobArtifactCompletionGate } from "./selected-job-completion-gate.js"
+import { selectedJobArtifactCompletionGate, selectedJobArtifactCompletionGateWithWitness } from "./selected-job-completion-gate.js"
 import {
   TASK_GRAPH_RESULT_PROJECTION_SCHEMA,
   type TaskGraphCommandPort,
@@ -126,6 +126,17 @@ describe("selected-job artifact completion gate", () => {
     })
   })
 
+  it("returns a graph witness only after all persisted selected-job checks pass", async () => {
+    const graph = current([writer(), reviewer()])
+
+    await expect(selectedJobArtifactCompletionGateWithWitness({
+      commandPort: commandPort(graph), lease, root, selectedJobId: "job-1",
+      readCurrentDraftHead: async scope => ({ ...reference(), artifactId: scope.artifactId }),
+      readCurrentSourceDigest: async () => reference().sourceDigest,
+      readCurrentReviewReceipt: readPersistedReview,
+    })).resolves.toEqual({ ok: true, witness: { revision: graph.revision, nodes: graph.nodes } })
+  })
+
   it.each(failingReviewReaders)("fails closed when the durable review receipt is %s", async (_label, readCurrentReviewReceipt) => {
     const graph = current([writer(), reviewer()])
     await expect(selectedJobArtifactCompletionGate({
@@ -164,6 +175,8 @@ describe("selected-job artifact completion gate", () => {
     { name: "source digest mismatch", graph: current([writer(), reviewer(reference({ sourceDigest: `sha256:${"e".repeat(64)}` }))]) },
     { name: "stale review status", graph: current([writer(), reviewer(reference(), "stale")]) },
     { name: "latest Writer version lacks its exact review", graph: current([writer(versionOne, "writer-old"), reviewer(versionOne, "passed", ["writer-old"], "reviewer-old"), latestWriter]) },
+    { name: "queued Writer can invalidate the accepted review", graph: current([node({ key: "writer-next", templateId: "cover_letter_writer", status: "queued" }), writer(), reviewer()]) },
+    { name: "running Reviewer can invalidate the accepted review", graph: current([writer(), node({ key: "reviewer-next", templateId: "cover_letter_reviewer", status: "running" }), reviewer()]) },
   ]
 
   it.each(invalidGraphs)("blocks $name", async ({ graph }) => {
@@ -227,7 +240,7 @@ describe("selected-job artifact completion gate", () => {
     })).resolves.toMatchObject({ ok: false, blocker: "selected_job_draft_review_required" })
   })
 
-  it("blocks completion when selected-job sources change after the Reviewer receipt", async () => {
+  it("blocks completion when the initial source digest differs from the reviewed artifacts", async () => {
     const graph = current([writer(), reviewer()])
     await expect(selectedJobArtifactCompletionGate({
       commandPort: commandPort(graph), lease, root, selectedJobId: "job-1",
@@ -235,6 +248,30 @@ describe("selected-job artifact completion gate", () => {
       readCurrentSourceDigest: async () => `sha256:${"e".repeat(64)}`,
       readCurrentReviewReceipt: readPersistedReview,
     })).resolves.toMatchObject({ ok: false, blocker: "selected_job_draft_review_required" })
+  })
+
+  it("rechecks the source digest after graph, draft-head and review-receipt reads", async () => {
+    const graph = current([writer(), reviewer()])
+    const order: string[] = []
+    let sourceReadCount = 0
+    const port = {
+      appendAndSchedule: async () => ({ status: "accepted" as const, revision: 8, nodes: [], readyTaskIds: [] }),
+      readCurrent: vi.fn(async () => { order.push("graph"); return graph }),
+    } satisfies TaskGraphCommandPort
+    const readCurrentSourceDigest = vi.fn(async () => {
+      order.push("source")
+      sourceReadCount += 1
+      return sourceReadCount === 1 ? reference().sourceDigest : `sha256:${"e".repeat(64)}`
+    })
+
+    await expect(selectedJobArtifactCompletionGateWithWitness({
+      commandPort: port, lease, root, selectedJobId: "job-1",
+      readCurrentDraftHead: async scope => { order.push("head"); return { ...reference(), artifactId: scope.artifactId } },
+      readCurrentSourceDigest,
+      readCurrentReviewReceipt: async scope => { order.push("receipt"); return persistedReview(scope) },
+    })).resolves.toMatchObject({ ok: false, blocker: "selected_job_draft_review_required" })
+    expect(readCurrentSourceDigest).toHaveBeenCalledTimes(2)
+    expect(order).toEqual(["graph", "source", "head", "receipt", "source"])
   })
 
   it("fails closed when current selected-job sources are unavailable", async () => {

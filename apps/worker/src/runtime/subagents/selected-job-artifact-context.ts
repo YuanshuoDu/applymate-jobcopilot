@@ -133,7 +133,7 @@ export async function loadSelectedJobArtifactContext(
   jobId: string,
 ): Promise<SelectedJobArtifactContextBundle> {
   if (!userId.trim() || !jobId.trim()) throw new Error("selected_job_scope_invalid")
-  const source = createPostgresReadToolDataSource(pool as pg.Pool)
+  const source = createPostgresReadToolDataSource(pool)
   const job = await source.getJob(userId, jobId)
   if (!job) throw new Error("selected_job_not_found")
   const [resumeResult, personaResult] = await Promise.all([
@@ -156,6 +156,16 @@ export async function loadSelectedJobArtifactContext(
     baseResumeId: resume.id,
     transientSources: materials,
   }
+}
+
+/** Recomputes only the selected-source digest from client-bound reads for terminal finalization. */
+export async function readSelectedJobSourceDigestWithClient(
+  client: Pick<pg.PoolClient, "query">,
+  userId: string,
+  jobId: string,
+): Promise<string | null> {
+  try { return (await loadSelectedJobArtifactContext(client, userId, jobId)).preparation.sourceDigest }
+  catch { return null }
 }
 
 /** Resolve or create one immutable, content-free base for the selected job. */

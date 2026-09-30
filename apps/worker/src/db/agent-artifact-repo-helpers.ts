@@ -1,4 +1,5 @@
 import type { Pool, PoolClient } from "pg"
+import type { AgentArtifactDraftHead, AgentArtifactDraftHeadScope, AgentArtifactReviewReceipt, AgentArtifactReviewReceiptScope } from "./agent-artifact-repo.js"
 import { RUNNABLE_SESSION } from "../runtime/session-gate.js"
 
 export type AgentArtifactTaskFence = {
@@ -117,6 +118,42 @@ export async function withArtifactTransaction<T>(pool: Pool, userId: string, wor
   } finally {
     client.release()
   }
+}
+
+/** Reads only the persisted current draft reference through a caller-owned transaction. */
+export async function findCurrentDraftHeadWithClient(client: Pick<PoolClient, "query">, scope: AgentArtifactDraftHeadScope): Promise<AgentArtifactDraftHead | null> {
+  if (![scope.userId, scope.sessionId, scope.jobId, scope.artifactId].every(value => typeof value === "string" && value.trim().length > 0)) return null
+  const result = await client.query<Record<string, unknown>>(
+    `SELECT version_row."artifactId" AS "artifactId", version_row."version" AS "version",
+            version_row."contentHash" AS "contentHash", version_row."sourceDigest" AS "sourceDigest"
+     FROM "agent_artifact" AS artifact JOIN "agent_artifact_version" AS version_row
+       ON version_row."artifactId" = artifact."id" AND version_row."version" = artifact."version"
+       AND version_row."userId" = artifact."userId" AND version_row."jobId" = artifact."jobId"
+       AND version_row."artifactType" = artifact."artifactType" AND version_row."contentHash" = artifact."hash"
+     WHERE artifact."id" = $1 AND artifact."userId" = $2 AND artifact."jobId" = $3
+       AND artifact."artifactType" = 'cover_letter' AND artifact."lifecycle" = 'draft'
+       AND version_row."sessionId" = $4 AND version_row."userId" = $2
+       AND version_row."jobId" = $3 AND version_row."artifactType" = 'cover_letter'`,
+    [scope.artifactId, scope.userId, scope.jobId, scope.sessionId],
+  )
+  if (result.rows.length !== 1) return null
+  const row = result.rows[0]
+  if (!row || row.artifactId !== scope.artifactId || !Number.isSafeInteger(row.version) || Number(row.version) < 1
+    || typeof row.contentHash !== "string" || typeof row.sourceDigest !== "string") return null
+  return { artifactId: row.artifactId, version: Number(row.version), contentHash: row.contentHash, sourceDigest: row.sourceDigest }
+}
+
+/** Reads an exact persisted review receipt through a caller-owned transaction. */
+export async function findReviewReceiptWithClient(client: Pick<PoolClient, "query">, scope: AgentArtifactReviewReceiptScope): Promise<AgentArtifactReviewReceipt | null> {
+  const result = await client.query<Record<string, unknown>>(
+    `SELECT "userId", "sessionId", "jobId", "artifactId", "version", "contentHash", "sourceDigest", "currentSourceDigest", "status", "taskId", "toolCallId", "reviewHash"
+     FROM "agent_artifact_review" WHERE "userId"=$1 AND "sessionId"=$2 AND "jobId"=$3 AND "artifactId"=$4 AND "version"=$5 AND "contentHash"=$6 AND "sourceDigest"=$7 AND "currentSourceDigest"=$8 AND "status"=$9 AND "taskId"=$10 AND "reviewHash"=$11 LIMIT 2`,
+    [scope.userId, scope.sessionId, scope.jobId, scope.artifactId, scope.version, scope.contentHash, scope.sourceDigest, scope.currentSourceDigest, scope.status, scope.taskId, scope.reviewHash],
+  )
+  if (result.rows.length !== 1) return null
+  const row = result.rows[0]
+  if (!row || typeof row.toolCallId !== "string" || !row.toolCallId.trim()) return null
+  return { userId: row.userId as string, sessionId: row.sessionId as string, jobId: row.jobId as string, artifactId: row.artifactId as string, version: Number(row.version), contentHash: row.contentHash as string, sourceDigest: row.sourceDigest as string, currentSourceDigest: row.currentSourceDigest as string, status: row.status as AgentArtifactReviewReceipt["status"], taskId: row.taskId as string, toolCallId: row.toolCallId, reviewHash: row.reviewHash as string }
 }
 
 /** Locks every authority row until the artifact transaction commits or rolls back. */

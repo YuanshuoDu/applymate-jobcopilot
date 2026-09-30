@@ -17,13 +17,16 @@ import {
 
 import type { ProductionAgentFlags } from "../production-agent-flags.js"
 import type { ProductionWorkerBootstrap, createProductionWorkerBootstrap } from "../../queue/production-bootstrap.js"
-import { createAgentArtifactRepository, type AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
+import { createAgentArtifactRepository, findCurrentDraftHeadWithClient, findReviewReceiptWithClient, type AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
 import { createArtifactToolStore } from "../tools/artifact-tools.js"
 import { childContextSnapshot, createChildContextBuilder } from "./child-context.js"
 import { hashArtifactContent } from "./artifact-adapters.js"
-import { loadSelectedJobArtifactContext, resolveCoverLetterBase } from "./selected-job-artifact-context.js"
+import { loadSelectedJobArtifactContext, readSelectedJobSourceDigestWithClient, resolveCoverLetterBase } from "./selected-job-artifact-context.js"
 import { materializeTaskGraphDependencyContext } from "./task-graph-dependency-context.js"
-import { selectedJobArtifactCompletionGate } from "../selected-job-completion-gate.js"
+import { selectedJobArtifactCompletionGate, selectedJobArtifactCompletionGateWithWitness } from "../selected-job-completion-gate.js"
+import { selectedJobArtifactFinalizationGuard } from "../selected-job-finalization-guard.js"
+import { commitTurnTerminal } from "../turns/turn-engine-terminal-commit.js"
+import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
 import { claimTurnLease } from "../turns/lease.js"
 import { executionOwnerFence } from "../execution-owner.js"
 import { PgCoordinationStore } from "../mailbox/store.js"
@@ -1173,6 +1176,135 @@ async function createSelectedJobTaskGraph(
     body: `AC6_PRIVATE_COVER_LETTER_${value.suffix}`,
     originalPreparation: await loadSelectedJobArtifactContext(pool, value.userId, sources.jobId),
   }
+}
+
+async function prepareSelectedJobTerminalCase(pool: Pool, value: Fixture) {
+  await seed(pool, value, "waiting_for_user")
+  const sources = await seedSelectedJobSources(pool, value)
+  const preparation = await loadSelectedJobArtifactContext(pool, value.userId, sources.jobId)
+  const tasks = new PgSubagentTaskStore(pool, 300_000)
+  const root = await tasks.create({
+    userId: value.userId, sessionId: value.sessionId, turnId: value.turnId, role: "supervisor", taskType: "task_graph",
+    goal: "Complete the selected-job draft review before finalizing",
+    allowedActions: ["jobs.get", "persona.retrieve", "resume.get_base", "cover_letter.draft", "artifact.version.read", "artifact.review"],
+    expectedOutputSchema: {}, toolPolicySnapshot: {}, budgetSnapshot: { limits: { maxSteps: 16, maxToolCalls: 16 } }, policy: defaultSubagentPolicy(),
+  })
+  const linked = await pool.query(`UPDATE "agent_turns" SET "rootTaskId" = $2, "updatedAt" = CURRENT_TIMESTAMP
+    WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4 AND "status" = 'waiting_for_user' AND "rootTaskId" IS NULL`, [
+    value.turnId, root.id, value.sessionId, value.userId,
+  ])
+  if (linked.rowCount !== 1) throw new Error("Finalization fixture root could not be linked")
+  await activateFixtureTurn(pool, value)
+  const lease = await claimTurnLease(pool, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
+  const rootLease = await tasks.claim({ taskId: root.id, sessionId: value.sessionId, ownerId: value.ownerId, policy: defaultSubagentPolicy(), now: new Date() })
+  if (!rootLease?.leaseOwner) throw new Error("Finalization fixture root did not acquire a live lease")
+  const stepId = `p3-finalization-step-${value.suffix}`
+  await pool.query(`INSERT INTO "agent_steps"
+    ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
+    VALUES ($1, $2, $3, $4, 0, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`, [stepId, value.sessionId, value.turnId, root.id])
+  const commandPort = createPgTaskGraphCommandPort(pool)
+  const graphScope = {
+    userId: value.userId, sessionId: value.sessionId, turnId: value.turnId, rootTaskId: root.id, parentTaskId: root.id, stepId,
+    turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: value.ownerId, parentAttemptCount: rootLease.attemptCount,
+  }
+  const plan = await commandPort.appendAndSchedule({
+    scope: graphScope,
+    proposal: { expectedRevision: 0, nodes: [
+      { key: "writer", templateId: "cover_letter_writer", goal: "Persist one selected-job draft", successCriteria: ["Save the draft"], dependsOn: [] },
+      { key: "reviewer", templateId: "cover_letter_reviewer", goal: "Review the selected-job draft", successCriteria: ["Persist a passed review"], dependsOn: ["writer"] },
+    ] },
+    templates: taskGraphTemplatesForSelectedJob(preparation.preparation),
+  })
+  const taskId = (key: string) => {
+    const found = plan.nodes.find(node => node.key === key)?.taskId
+    if (!found) throw new Error(`Finalization fixture graph is missing ${key}`)
+    return found
+  }
+  const writerOwner = `p3-finalization-writer-${value.suffix}`
+  const writer = await tasks.claim({ taskId: taskId("writer"), sessionId: value.sessionId, ownerId: writerOwner, policy: defaultSubagentPolicy(), now: new Date() })
+  if (!writer?.leaseOwner) throw new Error("Finalization fixture Writer did not acquire a live lease")
+  const artifacts = createArtifactToolStore(pool)
+  const base = await resolveCoverLetterBase(artifacts, value.userId, sources.jobId)
+  const draftInput = { baseArtifactId: base.artifactId, baseHash: base.baseHash, content: `AC6_PRIVATE_FINALIZATION_DRAFT_${value.suffix}`, constraints: { maxWords: 160 } }
+  const writerScope = {
+    ...preparation.preparation, userId: value.userId, sessionId: value.sessionId, taskId: writer.id,
+    toolCallId: `p3-finalization-writer:${writer.attemptCount}`, taskFence: selectedJobTaskFence(writer, writerOwner, writer.attemptCount),
+  }
+  const draft = await artifacts.writeDraft(writerScope, { ...draftInput, requestHash: selectedJobDraftRequestHash(writerScope, draftInput) })
+  const artifactRef = { artifactId: draft.artifactId, version: draft.version, contentHash: draft.contentHash, sourceDigest: draft.sourceDigest }
+  await tasks.finish({ taskId: writer.id, sessionId: value.sessionId, ownerId: writerOwner, attemptCount: writer.attemptCount, status: "completed",
+    result: { status: "completed", finalText: "Draft saved", finalItemId: null, stepCount: 1, toolCallCount: 1,
+      structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef } }, now: new Date() })
+  const reviewerOwner = `p3-finalization-reviewer-${value.suffix}`
+  const reviewer = await tasks.claim({ taskId: taskId("reviewer"), sessionId: value.sessionId, ownerId: reviewerOwner, policy: defaultSubagentPolicy(), now: new Date() })
+  if (!reviewer?.leaseOwner) throw new Error("Finalization fixture Reviewer did not acquire a live lease")
+  const reviewInput = { artifactRef, decision: "passed", findings: [] }
+  const reviewerScope = {
+    ...preparation.preparation, userId: value.userId, sessionId: value.sessionId, taskId: reviewer.id,
+    toolCallId: `p3-finalization-reviewer:${reviewer.attemptCount}`, taskFence: selectedJobTaskFence(reviewer, reviewerOwner, reviewer.attemptCount),
+  }
+  const reviewHash = hashArtifactContent({ artifactRef, currentSourceDigest: preparation.preparation.sourceDigest, status: "passed", findings: [], evidenceRefs: preparation.preparation.evidenceRefs })
+  await artifacts.saveReview({
+    userId: value.userId, sessionId: value.sessionId, jobId: sources.jobId, artifactId: artifactRef.artifactId, version: artifactRef.version,
+    contentHash: artifactRef.contentHash, sourceDigest: artifactRef.sourceDigest, currentSourceDigest: preparation.preparation.sourceDigest,
+    status: "passed", findings: [], evidenceRefs: [...preparation.preparation.evidenceRefs], taskId: reviewer.id, toolCallId: reviewerScope.toolCallId,
+    requestHash: selectedJobTaskReceiptRequestHash("artifact.review", reviewerScope, reviewInput), reviewHash, taskFence: reviewerScope.taskFence,
+  })
+  await tasks.finish({ taskId: reviewer.id, sessionId: value.sessionId, ownerId: reviewerOwner, attemptCount: reviewer.attemptCount, status: "completed",
+    result: { status: "completed", finalText: "Review passed", finalItemId: null, stepCount: 1, toolCallCount: 1,
+      structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed", artifactRef, reviewStatus: "passed", reviewHash } }, now: new Date() })
+  const artifactRepository = createAgentArtifactRepository(pool)
+  const gate = await selectedJobArtifactCompletionGateWithWitness({
+    commandPort, lease, root: { id: root.id, attemptCount: rootLease.attemptCount }, selectedJobId: sources.jobId,
+    readCurrentDraftHead: scope => artifactRepository.findCurrentDraftHead(scope),
+    readCurrentSourceDigest: async () => (await loadSelectedJobArtifactContext(pool, value.userId, sources.jobId)).preparation.sourceDigest,
+    readCurrentReviewReceipt: scope => artifactRepository.findReviewReceipt(scope),
+  })
+  if (!gate.ok) throw new Error("Finalization fixture did not produce a successful selected-job gate")
+  const ownerFence = executionOwnerFence({ kind: "turn", taskId: root.id, lease })
+  if (ownerFence.kind !== "turn") throw new Error("Finalization fixture owner is not a Turn lease")
+  const owner = ownerFence
+  const engineStore = createPgTurnEngineStore(pool)
+  await engineStore.updateStep({ owner, stepId, status: "completed", finishReason: "stop", errorCode: null, inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0, now: new Date() })
+  await engineStore.appendEvent({
+    owner, id: `p3-finalization-step-event-${value.suffix}`, itemId: null, type: "step.completed", correlationId: stepId, causationId: null,
+    idempotencyKey: `turn:${value.turnId}:event:step-completed:${stepId}`, payload: { stepId, status: "completed" },
+  })
+  return {
+    value, sources, preparation, tasks, root, rootLease, lease, commandPort, artifacts, artifactRef, graphScope,
+    acceptedGraphWitness: gate.witness, stepId,
+    terminalInput: {
+      owner, response: "Selected-job draft review complete", now: new Date(), stepId,
+      finalItemId: `p3-finalization-item-${value.suffix}`, finalContent: { parts: [{ type: "text", text: "Selected-job draft review complete" }] },
+      stepCount: 1, toolCallCount: 0, usage: { inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0 },
+    },
+  }
+}
+
+function selectedJobFinalizationGuardForCase(prepared: Awaited<ReturnType<typeof prepareSelectedJobTerminalCase>>) {
+  return (client: PoolClient) => selectedJobArtifactFinalizationGuard({
+    client, commandPort: prepared.commandPort, lease: prepared.lease,
+    root: { id: prepared.root.id, attemptCount: prepared.rootLease.attemptCount }, selectedJobId: prepared.sources.jobId,
+    acceptedGraphWitness: prepared.acceptedGraphWitness,
+    readCurrentDraftHead: findCurrentDraftHeadWithClient,
+    readCurrentSourceDigest: (current, scope) => readSelectedJobSourceDigestWithClient(current, scope.userId, scope.jobId),
+    readCurrentReviewReceipt: findReviewReceiptWithClient,
+  })
+}
+
+async function expectNoTerminalRecords(pool: Pool, prepared: Awaited<ReturnType<typeof prepareSelectedJobTerminalCase>>): Promise<void> {
+  const [turn, root, item, events, outboxes] = await Promise.all([
+    pool.query<{ status: string; finalResponse: string | null }>(`SELECT "status", "finalResponse" FROM "agent_turns" WHERE "id" = $1`, [prepared.value.turnId]),
+    pool.query<{ status: string }>(`SELECT "status" FROM "sub_agent_tasks" WHERE "id" = $1`, [prepared.root.id]),
+    pool.query(`SELECT "id" FROM "agent_items" WHERE "id" = $1`, [prepared.terminalInput.finalItemId]),
+    pool.query(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3`, [prepared.value.sessionId, prepared.value.turnId, prepared.terminalInput.finalItemId]),
+    pool.query(`SELECT "id" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "payload"->>'itemId' = $2`, [prepared.value.sessionId, prepared.terminalInput.finalItemId]),
+  ])
+  expect(turn.rows[0]).toEqual({ status: "in_progress", finalResponse: null })
+  expect(root.rows[0]?.status).toBe("running")
+  expect(item.rows).toHaveLength(0)
+  expect(events.rows).toHaveLength(0)
+  expect(outboxes.rows).toHaveLength(0)
 }
 
 function selectedJobSettlement(line: string, taskId: string): RecordValue {
@@ -3610,6 +3742,125 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     vi.doUnmock("../../redis.js")
     if (cleanupFailures.length > 0) throw new Error("TaskGraph integration cleanup failed:\n" + cleanupFailures.join("\n"))
   })
+
+  it.each([
+    ["selected Job source edit", "job"],
+    ["new eligible Persona fact", "persona"],
+    ["new selected-job draft head", "draft"],
+    ["TaskGraph revision advance", "graph"],
+    ["Turn lease expiry after the guard", "lease"],
+    ["root Stop after the guard", "stop"],
+  ] as const)("rolls back terminal writes after a gate-approved race: %s", async (_label, race) => {
+    const value = fixture()
+    try {
+      const prepared = await prepareSelectedJobTerminalCase(pool!, value)
+      let guard = selectedJobFinalizationGuardForCase(prepared)
+      if (race === "job") {
+        await pool!.query(`UPDATE "Job" SET "description" = $3, "updatedAt" = CURRENT_TIMESTAMP WHERE "id" = $1 AND "userId" = $2`,
+          [prepared.sources.jobId, value.userId, `AC6_CHANGED_JOB_SOURCE_${value.suffix}`])
+      } else if (race === "persona") {
+        await pool!.query(`INSERT INTO persona_facts
+          ("id", "userId", "key", "category", "value", "normalized_value", "source", "source_ref", "confidence", "status", "allowedUses", "updated_at")
+          VALUES ($1, $2, 'new-confirmed-fact', 'experience', $3, $4, 'manual', 'resume:new-fact', 0.95, 'confirmed', ARRAY['cover_letter']::text[], CURRENT_TIMESTAMP)`,
+          [`p3-finalization-persona-${value.suffix}`, value.userId, `AC6_NEW_PERSONA_FACT_${value.suffix}`, value.suffix])
+      } else if (race === "draft") {
+        const task = await prepared.tasks.create({
+          userId: value.userId, sessionId: value.sessionId, turnId: value.turnId, parentTaskId: prepared.root.id,
+          role: "writer", taskType: "cover_letter_draft", goal: "Commit an unprojected newer draft",
+          allowedActions: ["cover_letter.draft"], context: { selectedJobPreparation: { jobId: prepared.sources.jobId } },
+          expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "writer" }, toolPolicySnapshot: {}, policy: defaultSubagentPolicy(),
+        })
+        const writerOwner = `p3-finalization-race-writer-${value.suffix}`
+        const writer = await prepared.tasks.claim({ taskId: task.id, sessionId: value.sessionId, ownerId: writerOwner, policy: defaultSubagentPolicy(), now: new Date() })
+        if (!writer?.leaseOwner) throw new Error("Newer-draft race Writer did not acquire a lease")
+        const draftInput = {
+          baseArtifactId: `cover-letter-base:${hashArtifactContent({ userId: value.userId, jobId: prepared.sources.jobId }).slice(7)}`,
+          baseHash: hashArtifactContent({ kind: "cover_letter_base", jobId: prepared.sources.jobId }),
+          content: `AC6_PRIVATE_NEWER_DRAFT_${value.suffix}`, constraints: { maxWords: 160 },
+        }
+        const scope = {
+          ...prepared.preparation.preparation, userId: value.userId, sessionId: value.sessionId, taskId: writer.id,
+          toolCallId: `p3-finalization-race-writer:${writer.attemptCount}`,
+          taskFence: selectedJobTaskFence(writer, writerOwner, writer.attemptCount),
+        }
+        const newer = await prepared.artifacts.writeDraft(scope, { ...draftInput, requestHash: selectedJobDraftRequestHash(scope, draftInput) })
+        expect(newer.version).toBe(prepared.artifactRef.version + 1)
+      } else if (race === "graph") {
+        const advanced = await pool!.query(`UPDATE "agent_items" SET "revision" = "revision" + 1 WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 RETURNING "revision"`,
+          [taskGraphItemId(prepared.root.id), value.sessionId, value.turnId])
+        expect(advanced.rowCount).toBe(1)
+      } else {
+        const realGuard = guard
+        guard = async client => {
+          const decision = await realGuard(client)
+          if (!decision.ok) return decision
+          const update = race === "lease"
+            ? `UPDATE "agent_turns" SET "leaseExpiresAt" = clock_timestamp() - INTERVAL '1 second' WHERE "id" = $1 AND "sessionId" = $2`
+            : `UPDATE "sub_agent_tasks" SET "interruptRequestedAt" = clock_timestamp() WHERE "id" = $1 AND "sessionId" = $2`
+          const changed = await client.query(update, [race === "lease" ? value.turnId : prepared.root.id, value.sessionId])
+          if (changed.rowCount !== 1) throw new Error(`Could not inject terminal ${race} race`)
+          return decision
+        }
+      }
+
+      await expect(commitTurnTerminal(pool!, prepared.terminalInput, guard)).rejects.toMatchObject({ name: "TurnEnginePersistenceConflict" })
+      await expectNoTerminalRecords(pool!, prepared)
+    } finally {
+      await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [value.sessionId])
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
+    }
+  }, 45_000)
+
+  it("waits for authority locks, then reads a newer committed Job source before finalizing", async () => {
+    const value = fixture()
+    let writer: PoolClient | undefined
+    let writerActive = false
+    let terminalOutcome: Promise<{ value: unknown } | { error: unknown }> | undefined
+    try {
+      const prepared = await prepareSelectedJobTerminalCase(pool!, value)
+      writer = await pool!.connect()
+      await writer.query("BEGIN")
+      writerActive = true
+      const backend = await writer.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")
+      const writerPid = Number(backend.rows[0]?.pid)
+      if (!Number.isSafeInteger(writerPid)) throw new Error("Could not identify the disposable authority-lock writer")
+      await writer.query("SELECT set_config($1, $2, true)", ["app.user_id", value.userId])
+      const sessionLock = await writer.query(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 FOR UPDATE`, [value.sessionId, value.userId])
+      const turnLock = await writer.query(`SELECT "id" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "rootTaskId" = $4 FOR UPDATE`, [value.turnId, value.sessionId, value.userId, prepared.root.id])
+      const rootLock = await writer.query(`SELECT "id" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $1 AND "status" = 'running' FOR UPDATE`, [prepared.root.id, value.sessionId, value.turnId])
+      expect(sessionLock.rowCount).toBe(1)
+      expect(turnLock.rowCount).toBe(1)
+      expect(rootLock.rowCount).toBe(1)
+
+      terminalOutcome = commitTurnTerminal(pool!, prepared.terminalInput, selectedJobFinalizationGuardForCase(prepared))
+        .then(result => ({ value: result }), error => ({ error }))
+      let waiting = false
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const activity = await pool!.query<{ waiting: boolean }>(`SELECT EXISTS (
+          SELECT 1 FROM pg_stat_activity AS waiter WHERE waiter.pid <> pg_backend_pid() AND waiter.state = 'active'
+            AND waiter.wait_event_type = 'Lock' AND waiter.query LIKE '%FROM "agent_sessions"%' AND waiter.query LIKE '%FOR UPDATE%'
+            AND $1::int = ANY(pg_blocking_pids(waiter.pid))
+        ) AS "waiting"`, [writerPid])
+        if (activity.rows[0]?.waiting === true) { waiting = true; break }
+        await writer.query("SELECT pg_sleep(0.05)")
+      }
+      expect(waiting).toBe(true)
+      await writer.query(`UPDATE "Job" SET "description" = $3, "updatedAt" = CURRENT_TIMESTAMP WHERE "id" = $1 AND "userId" = $2`,
+        [prepared.sources.jobId, value.userId, `AC6_WAITED_SOURCE_COMMIT_${value.suffix}`])
+      await writer.query("COMMIT")
+      writerActive = false
+      const outcome = await terminalOutcome
+      expect("error" in outcome).toBe(true)
+      if ("error" in outcome) expect(outcome.error).toMatchObject({ name: "TurnEnginePersistenceConflict" })
+      await expectNoTerminalRecords(pool!, prepared)
+    } finally {
+      if (writerActive) await writer?.query("ROLLBACK").catch(() => undefined)
+      writer?.release()
+      if (terminalOutcome) await terminalOutcome
+      await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [value.sessionId])
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
+    }
+  }, 45_000)
 
   it("replays one selected-job draft receipt under a reclaimed lease without duplicating its version", async () => {
     const value = fixture()

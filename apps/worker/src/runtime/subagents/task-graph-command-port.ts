@@ -1,3 +1,4 @@
+import type { PoolClient } from "pg"
 import type { TaskGraphProposal, TaskGraphReadiness } from "../planning/task-graph.js"
 import type { SubagentTaskStatus } from "./types.js"
 
@@ -137,4 +138,6 @@ export class TaskGraphCommandError extends Error {
 export type TaskGraphCommandPort = Readonly<{
   appendAndSchedule(input: TaskGraphScheduleInput): Promise<TaskGraphScheduleReceipt>
   readCurrent(scope: TaskGraphReadScope): Promise<TaskGraphCurrentState>
+  /** Reads current graph state using a caller-owned transaction and client. */
+  readCurrentWithClient?(client: PoolClient, scope: TaskGraphReadScope): Promise<TaskGraphCurrentState>
 }>

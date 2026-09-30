@@ -31,7 +31,7 @@ function job(row: JobRow): JobRecord {
   return { id: row.id, company: row.company, role: row.role, location: row.location ?? null, status: row.status, score: row.score ?? null, url: row.url ?? null, source: row.source ?? null, salary: row.salary ?? null, description: row.description ?? null, keywords: row.keywords ?? null }
 }
 
-export function createPostgresReadToolDataSource(pool: pg.Pool): ReadToolDataSource {
+export function createPostgresReadToolDataSource(pool: Pick<pg.Pool, "query">): ReadToolDataSource {
   return {
     async searchJobs(userId: string, input: JobSearchInput): Promise<JobSearchResult> {
       const page = input.page ?? 1

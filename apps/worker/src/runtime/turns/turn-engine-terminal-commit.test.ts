@@ -28,7 +28,7 @@ function makePool(pending: readonly { sessionId: string; userId: string; turnId:
   const client = {
     query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
       calls.push({ sql, values })
-      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+      if (/^BEGIN(?: ISOLATION LEVEL READ COMMITTED)?$/.test(sql) || ["COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 0 }
       if (sql.includes('SELECT "eventSequence" FROM "agent_sessions"')) return { rows: [{ eventSequence: sequence }], rowCount: 1 }
       if (sql.includes('FROM "agent_sessions"')) return { rows: values?.[0] === owner.sessionId && values?.[1] === owner.userId ? [{ id: owner.sessionId }] : [], rowCount: 1 }
       if (sql.includes('FROM "agent_turns" AS turn')) {
@@ -97,7 +97,7 @@ function makePool(pending: readonly { sessionId: string; userId: string; turnId:
   }
   return {
     pool: { connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">,
-    calls, events, outboxes, items,
+    calls, events, outboxes, items, client,
     get state() { return { turn: { ...turn }, root: { ...root } } },
   }
 }
@@ -105,8 +105,10 @@ function makePool(pending: readonly { sessionId: string; userId: string; turnId:
 describe("atomic Turn terminal commit", () => {
   it("leaves all terminal records untouched when an accepted follow-up wins the session lock", async () => {
     const fake = makePool([{ id: "input-1", sessionId: owner.sessionId, userId: owner.userId, turnId: owner.turnId }])
+    const guard = vi.fn(async () => ({ ok: true as const }))
 
-    await expect(commitTurnTerminal(fake.pool, input)).resolves.toEqual({ status: "pending_follow_up" })
+    await expect(commitTurnTerminal(fake.pool, input, guard)).resolves.toEqual({ status: "pending_follow_up" })
+    expect(guard).not.toHaveBeenCalled()
 
     const lockOrder = [
       fake.calls.findIndex(({ sql }) => sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")),
@@ -140,6 +142,58 @@ describe("atomic Turn terminal commit", () => {
     expect(fake.calls.filter(({ sql }) => sql.includes('INSERT INTO "agent_events"'))).toHaveLength(3)
     expect(fake.calls.filter(({ sql }) => sql.includes('UPDATE "agent_turns"'))).toHaveLength(1)
     expect(fake.calls.filter(({ sql }) => sql.includes('UPDATE "sub_agent_tasks"'))).toHaveLength(1)
+    expect(fake.calls.filter(({ sql }) => sql.startsWith("BEGIN"))).toEqual([{ sql: "BEGIN" }, { sql: "BEGIN" }])
+    const rootUpdate = fake.calls.find(({ sql }) => sql.includes('UPDATE "sub_agent_tasks"'))?.sql ?? ""
+    const turnUpdate = fake.calls.find(({ sql }) => sql.includes('UPDATE "agent_turns"'))?.sql ?? ""
+    expect(rootUpdate).not.toMatch(/clock_timestamp|interruptRequestedAt/)
+    expect(turnUpdate).toContain('AND "leaseExpiresAt" > $5')
+    expect(turnUpdate).not.toContain("clock_timestamp")
+  })
+
+  it("validates before terminal writes and bypasses the guard on committed replay after source changes", async () => {
+    const fake = makePool()
+    let sourceCurrent = true
+    const guard = vi.fn(async (client: pg.PoolClient) => {
+      fake.calls.push({ sql: "GUARD" })
+      expect(client).toBe(fake.client)
+      return sourceCurrent ? { ok: true as const } : {
+        ok: false as const,
+        blocker: "selected_job_draft_review_required",
+        feedback: "Complete and review the selected job's latest cover-letter draft before finishing.",
+      }
+    })
+
+    await expect(commitTurnTerminal(fake.pool, input, guard)).resolves.toMatchObject({ status: "completed" })
+    expect(guard).toHaveBeenCalledTimes(1)
+    sourceCurrent = false
+
+    await expect(commitTurnTerminal(fake.pool, input, guard)).resolves.toMatchObject({ status: "completed" })
+    expect(guard).toHaveBeenCalledTimes(1)
+    expect(fake.items.size).toBe(1)
+    expect(fake.events.size).toBe(3)
+    expect(fake.outboxes.size).toBe(3)
+    const guardIndex = fake.calls.findIndex(({ sql }) => sql === "GUARD")
+    const itemIndex = fake.calls.findIndex(({ sql }) => sql.includes('INSERT INTO "agent_items"'))
+    expect(guardIndex).toBeLessThan(itemIndex)
+  })
+
+  it("rolls back a blocked finalization before creating any terminal record", async () => {
+    const fake = makePool()
+    const guard = vi.fn(async () => ({
+      ok: false as const,
+      blocker: "selected_job_draft_review_required",
+      feedback: "Complete and review the selected job's latest cover-letter draft before finishing.",
+    }))
+
+    await expect(commitTurnTerminal(fake.pool, input, guard)).rejects.toMatchObject({ name: "TurnEnginePersistenceConflict" })
+
+    expect(guard).toHaveBeenCalledTimes(1)
+    expect(fake.calls[0]?.sql).toBe("BEGIN ISOLATION LEVEL READ COMMITTED")
+    expect(fake.calls.some(({ sql }) => /INSERT INTO "agent_(items|events|outbox)"|UPDATE "(sub_agent_tasks|agent_turns)"/.test(sql))).toBe(false)
+    expect(fake.items.size).toBe(0)
+    expect(fake.events.size).toBe(0)
+    expect(fake.outboxes.size).toBe(0)
+    expect(fake.calls.some(({ sql }) => sql === "ROLLBACK")).toBe(true)
   })
 
   it("does not let another user's session follow-up gate or cross the owner fence", async () => {

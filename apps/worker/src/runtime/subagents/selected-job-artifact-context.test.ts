@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 
 import { computeArtifactSourceDigest, InMemoryArtifactToolStore } from "../tools/artifact-tools.js"
-import { bindSelectedJobReadInput, loadSelectedJobArtifactContext } from "./selected-job-artifact-context.js"
+import { bindSelectedJobReadInput, loadSelectedJobArtifactContext, readSelectedJobSourceDigestWithClient } from "./selected-job-artifact-context.js"
 import { resolveCoverLetterBase } from "./selected-job-artifact-context.js"
 
 type PersonaFactFixture = {
@@ -40,6 +40,16 @@ function pool(options: { job?: boolean; resume?: boolean; personaFacts?: Persona
 }
 
 describe("loadSelectedJobArtifactContext", () => {
+  it("returns only a source digest when reading selected-job evidence through a caller-owned client", async () => {
+    const client = pool()
+
+    const digest = await readSelectedJobSourceDigestWithClient(client as never, "user-1", "job-1")
+
+    expect(digest).toMatch(/^sha256:[a-f0-9]{64}$/)
+    expect(JSON.stringify(digest)).not.toContain("Engineer with TypeScript experience")
+    expect(client.calls).toHaveLength(3)
+  })
+
   it("loads only owner-scoped job, base resume and cover-letter-approved persona evidence", async () => {
     const fakePool = pool()
     const bundle = await loadSelectedJobArtifactContext(fakePool as never, "user-1", "job-1")

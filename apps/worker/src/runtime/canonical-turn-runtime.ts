@@ -24,7 +24,7 @@ import { loadTaskGraphCurrentObservation } from "./canonical-turn-task-graph-con
 import { loadSelectedJobPreparation, type SelectedJobPreparation } from "./selected-job-preparation.js"
 import { failSelectedJobPreparationUnavailable } from "./selected-job-preparation-gate.js"
 import { taskGraphRuntimeForTurn } from "./subagents/task-graph-templates.js"
-import { loadSelectedJobArtifactContext } from "./subagents/selected-job-artifact-context.js"
+import { loadSelectedJobArtifactContext, readSelectedJobSourceDigestWithClient } from "./subagents/selected-job-artifact-context.js"
 import { AgentTreeManager } from "./subagents/manager.js"
 import { PgSubagentTaskStore } from "./subagents/pg-store.js"
 import { createPgRootTaskStore, type RootTaskStore } from "./subagents/root-task-store.js"
@@ -35,8 +35,9 @@ import { noopCanonicalSessionProjection, type CanonicalSessionProjection } from 
 import type { ProductionAgentFlags } from "./production-agent-flags.js"
 import { assertCanonicalCoordinationSurface, classifyToolCallRecovery, durableLifecycleSink, isResumableRootResult } from "./turns/canonical-runtime-tool-recovery.js"
 import { defaultAuthorization, modelWithUsage, type UsageAuthorizer } from "./canonical-turn-runtime-model.js"
-import { selectedJobArtifactCompletionGate } from "./selected-job-completion-gate.js"
-import { createAgentArtifactRepository, type AgentArtifactDraftHead, type AgentArtifactDraftHeadScope } from "../db/agent-artifact-repo.js"
+import { selectedJobArtifactCompletionGateWithWitness } from "./selected-job-completion-gate.js"
+import { selectedJobArtifactFinalizationGuard } from "./selected-job-finalization-guard.js"
+import { createAgentArtifactRepository, findCurrentDraftHeadWithClient, findReviewReceiptWithClient, type AgentArtifactDraftHead, type AgentArtifactDraftHeadScope } from "../db/agent-artifact-repo.js"
 
 export { durableLifecycleSink } from "./turns/canonical-runtime-tool-recovery.js"
 export type { UsageAuthorization } from "./canonical-turn-runtime-model.js"
@@ -62,7 +63,7 @@ export type CanonicalTurnRuntimeOptions = {
   readonly toolRuntimeFactory?: (input: { pool: pg.Pool; policy: PolicyEngine; manager: AgentTreeManager; state: CanonicalTurnState }) => { registry: { list(capabilities?: readonly string[]): readonly unknown[]; resolve(name: string, version: string): { readonly idempotency: ToolIdempotency }; validateArguments(name: string, input: unknown, version?: string): true | string; register?(definition: RuntimeToolDefinition): void }; router: ToolRouter }
   readonly manager?: AgentTreeManager
   readonly rootTaskStore?: RootTaskStore
-  readonly turnEngineStoreFactory?: (pool: pg.Pool) => TurnEngineStore
+  readonly turnEngineStoreFactory?: (pool: pg.Pool, terminalGuard?: Parameters<typeof createPgTurnEngineStore>[1]) => TurnEngineStore
   readonly contextBuilderFactory?: (input: { pool: pg.Pool; scope: { userId: string } }) => TurnEngineOptions["contextBuilder"]
   readonly lifecycleSinkFactory?: (input: { lease: TurnLease; store: TurnEngineStore; owner: ExecutionOwnerFence }) => ToolLifecycleSink
   /** Optional server-owned automation control projection; ordinary sessions are ignored by its SQL scope. */
@@ -154,9 +155,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const selectedPolicy = createCanonicalPolicy(state.toolPolicySnapshot, coordinationEnabled, taskGraphPlanningEnabled)
     const configuredCapabilities = capabilities(state.toolPolicySnapshot).filter(capability => capability !== "canManageChildren")
     const toolCapabilities = [...new Set([...configuredCapabilities, ...(coordinationEnabled ? ["coordination", "canManageChildren"] : [])])]
-    const turnStore = options.turnEngineStoreFactory?.(pool) ?? createPgTurnEngineStore(pool)
-    let lifecycleSink: ToolLifecycleSink | null = null
-    let lifecycleOwner: ExecutionOwner | null = null
+    let lifecycleSink: ToolLifecycleSink | null = null; let lifecycleOwner: ExecutionOwner | null = null
     const sinkProxy: ToolLifecycleSink = { append: async (event) => {
       if (!lifecycleSink) throw new Error("root_task_not_bound")
       await lifecycleSink.append(event)
@@ -180,9 +179,12 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       return typeof name === "string" ? [name] : []
     })
     const root = await rootTasks.ensure({ lease, goal: state.goal, modelProfileSnapshot: state.modelProfileSnapshot, toolPolicySnapshot: state.toolPolicySnapshot, budgetSnapshot: state.budgetSnapshot, allowedActions, now: now() })
-    taskGraphParentAttemptCount = root.attemptCount
-    const rootSnapshot = selectedJobMode ? selectedJobSnapshot(state.snapshot) : state.snapshot
-    const modelSnapshot = taskGraphPlanningEnabled ? await loadTaskGraphCurrentObservation(rootSnapshot, options.taskGraphCommandPort, lease, root) : rootSnapshot
+    taskGraphParentAttemptCount = root.attemptCount; let acceptedGraphWitness: Extract<Awaited<ReturnType<typeof selectedJobArtifactCompletionGateWithWitness>>, { ok: true }>["witness"] | undefined
+    const terminalGuard: Parameters<typeof createPgTurnEngineStore>[1] = selectedJobMode ? client => selectedJobArtifactFinalizationGuard({ client, commandPort: options.taskGraphCommandPort, lease, root, selectedJobId: selectedJobPreparation?.jobId, acceptedGraphWitness,
+      readCurrentDraftHead: findCurrentDraftHeadWithClient, readCurrentSourceDigest: (queryClient, scope) => readSelectedJobSourceDigestWithClient(queryClient, scope.userId, scope.jobId), readCurrentReviewReceipt: findReviewReceiptWithClient,
+    }) : undefined
+    const turnStore = options.turnEngineStoreFactory?.(pool, terminalGuard) ?? createPgTurnEngineStore(pool, terminalGuard)
+    const rootSnapshot = selectedJobMode ? selectedJobSnapshot(state.snapshot) : state.snapshot; const modelSnapshot = taskGraphPlanningEnabled ? await loadTaskGraphCurrentObservation(rootSnapshot, options.taskGraphCommandPort, lease, root) : rootSnapshot
     const owner = executionOwnerFence({ kind: "turn", taskId: root.id, lease })
     lifecycleOwner = { kind: "turn", taskId: root.id, lease }
     lifecycleSink = options.lifecycleSinkFactory?.({ lease, store: turnStore, owner }) ?? durableLifecycleSink(turnStore, owner)
@@ -216,10 +218,11 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       steeringMarkerState: { active: state.steeringMarkers?.active ?? [] }, ...(taskGraphPlanningEnabled ? { refreshTaskGraphAfterReadyWait: (snapshot: TurnEngineOptions["snapshot"]) => loadTaskGraphCurrentObservation(snapshot, options.taskGraphCommandPort, lease, root), refreshTaskGraphAfterPlan: (snapshot: TurnEngineOptions["snapshot"]) => loadTaskGraphCurrentObservation(snapshot, options.taskGraphCommandPort, lease, root) } : {}),
       ...(state.pendingToolCalls?.length ? { toolCallRecovery: classifyToolCallRecovery(state.pendingToolCalls, (name, version) => toolRuntime.registry.resolve(name, version)) } : {}),
       ...(rootTasks.checkCompletion || selectedJobMode ? { completionGate: async () => {
+        acceptedGraphWitness = undefined
         const children = await rootTasks.checkCompletion?.({ lease, rootTaskId: root.id, now: now() })
         if (children && !children.ok) return children
         if (!selectedJobMode) return children ?? { ok: true as const }
-        return selectedJobArtifactCompletionGate({
+        const result = await selectedJobArtifactCompletionGateWithWitness({
           commandPort: options.taskGraphCommandPort, lease, root, selectedJobId: selectedJobPreparation?.jobId,
           readCurrentDraftHead: options.selectedJobArtifactHeadReader ?? (scope => artifactRepository.findCurrentDraftHead(scope)),
           readCurrentReviewReceipt: scope => artifactRepository.findReviewReceipt(scope),
@@ -231,6 +234,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
             return currentSources.preparation.sourceDigest
           },
         })
+        if (result.ok) acceptedGraphWitness = result.witness; return result
       } } : {}),
     })
     await executionProjection.start({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId })

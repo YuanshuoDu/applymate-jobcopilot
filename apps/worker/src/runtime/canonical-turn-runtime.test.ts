@@ -8,7 +8,7 @@ import type pg from "pg"
 import type { StepContext } from "./context/step-context-builder.js"
 import type { CanonicalTurnState } from "./canonical-turn-state.js"
 import type { TurnEngineEvent, TurnEngineStore } from "./turns/turn-engine-types.js"
-import { createCanonicalTurnRuntime } from "./canonical-turn-runtime.js"
+import { createCanonicalTurnRuntime, type CanonicalTurnRuntimeOptions } from "./canonical-turn-runtime.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA, type TaskGraphCommandPort, type TaskGraphCurrentState, type TaskGraphReadScope, type TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
 import { TurnEngine } from "./turns/turn-engine.js"
@@ -23,6 +23,7 @@ const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 2,
   leaseStartedAt: new Date("2026-09-07T00:00:00.000Z"), leaseExpiresAt: new Date("2026-09-07T00:01:00.000Z"),
 }
+type TurnEngineStoreFactory = NonNullable<CanonicalTurnRuntimeOptions["turnEngineStoreFactory"]>
 const recoveredPlanHash = `sha256:${"a".repeat(64)}`
 type RuntimeEvent = { id?: string; type: string; payload: unknown; correlationId?: string; idempotencyKey?: string; owner?: unknown }
 
@@ -982,6 +983,11 @@ describe("createCanonicalTurnRuntime", () => {
     }
     const roots = rootStore()
     const sourceDigestLoader = vi.fn(async () => sourceDigest)
+    let selectedTerminalGuard: Parameters<TurnEngineStoreFactory>[1] | "not-created" = "not-created"
+    const selectedStoreFactory: TurnEngineStoreFactory = (_pool, guard) => {
+      selectedTerminalGuard = guard
+      return store()
+    }
     const productionFlags = resolveProductionAgentFlags({
       ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
     })
@@ -991,7 +997,7 @@ describe("createCanonicalTurnRuntime", () => {
       selectedJobArtifactHeadReader: artifactHeadReader,
       selectedJobSourceDigestLoader: sourceDigestLoader,
       stateLoader: async () => ({ ...selectedJobState(), toolPolicySnapshot: {} }), rootTaskStore: roots as never,
-      turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
+      turnEngineStoreFactory: selectedStoreFactory, contextBuilderFactory: () => contextBuilder(),
       modelRuntimeFactory: async () => ({ adapter: {
         ...model(() => []),
         async *stream() {
@@ -1003,6 +1009,7 @@ describe("createCanonicalTurnRuntime", () => {
     })
 
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status })
+    expect(selectedTerminalGuard).toEqual(expect.any(Function))
     expect(roots.checkCompletion).toHaveBeenCalledOnce()
     expect(taskGraphCommandPort.readCurrent).toHaveBeenCalledTimes(2)
     expect(taskGraphCommandPort.readCurrent).toHaveBeenLastCalledWith({
@@ -1023,8 +1030,21 @@ describe("createCanonicalTurnRuntime", () => {
     } else {
       expect(artifactHeadReader).not.toHaveBeenCalled()
     }
-    expect(sourceDigestLoader).toHaveBeenCalledOnce()
+    expect(sourceDigestLoader).toHaveBeenCalledTimes(status === "completed" ? 2 : 1)
     expect(sourceDigestLoader).toHaveBeenCalledWith(lease.userId, "job-1")
+  })
+
+  it("keeps the optional terminal guard absent for an ordinary Turn", async () => {
+    let ordinaryTerminalGuard: Parameters<TurnEngineStoreFactory>[1] | "not-created" = "not-created"
+    const ordinaryStoreFactory: TurnEngineStoreFactory = (_pool, guard) => {
+      ordinaryTerminalGuard = guard
+      return store()
+    }
+    const fixture = setup({ turnEngineStoreFactory: ordinaryStoreFactory })
+
+    await expect((await fixture.runtime).execute({ lease, signal: new AbortController().signal }))
+      .resolves.toMatchObject({ status: "completed" })
+    expect(ordinaryTerminalGuard).toBeUndefined()
   })
 
   it("keeps selected-job completion behind the pending-child check", async () => {

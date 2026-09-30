@@ -1,4 +1,4 @@
-import type { TaskGraphArtifactProjectionReference, TaskGraphCommandPort, TaskGraphReadScope } from "./subagents/task-graph-command-port.js"
+import type { TaskGraphArtifactProjectionReference, TaskGraphCommandPort, TaskGraphCurrentState, TaskGraphReadScope } from "./subagents/task-graph-command-port.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./subagents/task-graph-command-port.js"
 import type { SubagentTaskRecord } from "./subagents/types.js"
 import type { TurnLease } from "./turns/lease.js"
@@ -11,31 +11,26 @@ const WRITER_TEMPLATE_ID = "cover_letter_writer"
 const REVIEWER_TEMPLATE_ID = "cover_letter_reviewer"
 const ARTIFACT_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const SHA256 = /^sha256:[a-f0-9]{64}$/
-const BLOCKED: TurnEngineCompletionGateResult = Object.freeze({
+const BLOCKED: Extract<TurnEngineCompletionGateResult, { ok: false }> = Object.freeze({
   ok: false,
   blocker: "selected_job_draft_review_required",
   feedback: "Complete and review the selected job's latest cover-letter draft before finishing.",
 })
 
 type ArtifactReference = TaskGraphArtifactProjectionReference
+export type SelectedJobCompletionGraphWitness = Readonly<Pick<TaskGraphCurrentState, "revision" | "nodes">>
 type GraphNode = Readonly<{
-  key: string
-  taskId: string
-  templateId: string
-  status: string
-  dependsOn: readonly string[]
-  resultProjection?: unknown
+  key: string; taskId: string; templateId: string; status: string
+  dependsOn: readonly string[]; resultProjection?: unknown
 }>
 type WriterNode = Readonly<{ key: string; artifactRef: ArtifactReference }>
 type ReviewerNode = Readonly<{
-  key: string
-  taskId: string
-  dependsOn: readonly string[]
-  artifactRef: ArtifactReference
-  reviewStatus: AgentArtifactReviewReceipt["status"]
-  reviewHash: string
+  key: string; taskId: string; dependsOn: readonly string[]; artifactRef: ArtifactReference
+  reviewStatus: AgentArtifactReviewReceipt["status"]; reviewHash: string
 }>
 type ReviewedDraftState = Readonly<{ references: readonly ArtifactReference[]; reviewers: readonly ReviewerNode[] }>
+
+export type SelectedJobArtifactCompletionGateWithWitnessResult = Readonly<{ ok: true; witness: SelectedJobCompletionGraphWitness }> | Extract<TurnEngineCompletionGateResult, { ok: false }>
 
 function plainRecord(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
@@ -46,12 +41,10 @@ function plainRecord(value: unknown): Record<string, unknown> | undefined {
       : undefined
   } catch { return undefined }
 }
-
 function exactKeys(value: Record<string, unknown>, expected: string): boolean {
   const keys = Reflect.ownKeys(value)
   return keys.every((key): key is string => typeof key === "string") && keys.sort().join(",") === expected
 }
-
 function artifactReference(value: unknown): ArtifactReference | undefined {
   const row = plainRecord(value)
   if (!row || !exactKeys(row, "artifactId,contentHash,sourceDigest,version")
@@ -61,12 +54,10 @@ function artifactReference(value: unknown): ArtifactReference | undefined {
     || typeof row.sourceDigest !== "string" || !SHA256.test(row.sourceDigest)) return undefined
   return { artifactId: row.artifactId, version: Number(row.version), contentHash: row.contentHash, sourceDigest: row.sourceDigest }
 }
-
 function sameArtifact(left: ArtifactReference, right: ArtifactReference): boolean {
   return left.artifactId === right.artifactId && left.version === right.version
     && left.contentHash === right.contentHash && left.sourceDigest === right.sourceDigest
 }
-
 function graphNodes(value: unknown): GraphNode[] | undefined {
   const state = plainRecord(value)
   if (!state || !Number.isSafeInteger(state.revision) || Number(state.revision) < 0
@@ -126,7 +117,7 @@ function latestReviewedDraftState(value: unknown): ReviewedDraftState | undefine
     const writerCandidate = node.templateId === WRITER_TEMPLATE_ID || projectionRole === "writer"
     const reviewerCandidate = node.templateId === REVIEWER_TEMPLATE_ID || projectionRole === "reviewer"
     if (writerCandidate && reviewerCandidate) return undefined
-    if (node.status !== "completed") continue
+    if (node.status !== "completed") { if (writerCandidate || reviewerCandidate) return undefined; continue }
     if (writerCandidate) {
       const artifactRef = writerProjection(node)
       if (node.templateId !== WRITER_TEMPLATE_ID || !artifactRef) return undefined
@@ -192,15 +183,15 @@ function parsedReviewReceipt(value: unknown): AgentArtifactReviewReceipt | undef
 }
 
 /** Requires every latest selected-job draft, current source digest, and exact persisted review receipt to match. */
-export async function selectedJobArtifactCompletionGate(input: {
-  readonly commandPort: TaskGraphCommandPort | undefined
+export async function selectedJobArtifactCompletionGateWithWitness(input: {
+  readonly commandPort: Pick<TaskGraphCommandPort, "readCurrent"> | undefined
   readonly lease: TurnLease
   readonly root: Pick<SubagentTaskRecord, "id" | "attemptCount">
   readonly selectedJobId: string | undefined
   readonly readCurrentDraftHead: ((scope: AgentArtifactDraftHeadScope) => Promise<AgentArtifactDraftHead | null>) | undefined
   readonly readCurrentSourceDigest: (() => Promise<string | null>) | undefined
   readonly readCurrentReviewReceipt: ((scope: AgentArtifactReviewReceiptScope) => Promise<AgentArtifactReviewReceipt | null>) | undefined
-}): Promise<TurnEngineCompletionGateResult> {
+}): Promise<SelectedJobArtifactCompletionGateWithWitnessResult> {
   if (!input.commandPort || typeof input.selectedJobId !== "string" || !input.selectedJobId.trim()
     || input.selectedJobId.length > 256 || !input.readCurrentDraftHead || !input.readCurrentSourceDigest || !input.readCurrentReviewReceipt) return BLOCKED
   const scope: TaskGraphReadScope = {
@@ -215,7 +206,8 @@ export async function selectedJobArtifactCompletionGate(input: {
     parentAttemptCount: input.root.attemptCount,
   }
   try {
-    const latestState = latestReviewedDraftState(await input.commandPort.readCurrent(scope))
+    const graph = await input.commandPort.readCurrent(scope)
+    const latestState = latestReviewedDraftState(graph)
     if (!latestState) return BLOCKED
     const currentSourceDigest = await input.readCurrentSourceDigest()
     if (typeof currentSourceDigest !== "string" || !SHA256.test(currentSourceDigest)
@@ -243,8 +235,16 @@ export async function selectedJobArtifactCompletionGate(input: {
         || receipt.sourceDigest !== expected.sourceDigest || receipt.currentSourceDigest !== expected.currentSourceDigest
         || receipt.status !== expected.status || receipt.taskId !== expected.taskId || receipt.reviewHash !== expected.reviewHash) return BLOCKED
     }
-    return { ok: true }
+    if (await input.readCurrentSourceDigest() !== currentSourceDigest) return BLOCKED
+    return { ok: true, witness: { revision: graph.revision, nodes: graph.nodes } }
   } catch {
     return BLOCKED
   }
+}
+
+export async function selectedJobArtifactCompletionGate(
+  input: Parameters<typeof selectedJobArtifactCompletionGateWithWitness>[0],
+): Promise<TurnEngineCompletionGateResult> {
+  const result = await selectedJobArtifactCompletionGateWithWitness(input)
+  return result.ok ? { ok: true } : result
 }
