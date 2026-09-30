@@ -81,6 +81,40 @@ describe("immutable selected-job artifact tools", () => {
   })
 
   it.each([
+    ["private free text", { note: "PRIVATE_SOURCE_EXCERPT" }],
+    ["unknown constraint fields", { maxWords: 300, sourceExcerpt: "PRIVATE_SOURCE_EXCERPT" }],
+    ["out-of-range word count", { maxWords: 1001 }],
+  ])("rejects %s constraints before writing a draft", async (_label, constraints) => {
+    const store = new InMemoryArtifactToolStore()
+    const baseRow = base(store)
+    await expect(tool(store, "cover_letter.draft").execute(context(), {
+      ...draftInput(baseRow.id, baseRow.hash), constraints,
+    })).rejects.toMatchObject({ code: "precondition_failed" })
+    await expect(store.listForUser("user-a", "job-a")).resolves.toHaveLength(1)
+  })
+
+  it("rejects private excerpts in review identifiers and evidence paths before saving the review", async () => {
+    const store = new InMemoryArtifactToolStore()
+    const baseRow = base(store)
+    const draft = await tool(store, "cover_letter.draft").execute(context(), draftInput(baseRow.id, baseRow.hash)) as { artifactRef: ArtifactVersionRef }
+    const safeFinding = {
+      id: "grammar", code: "grammar", severity: "info", message: "Clear", artifactHash: draft.artifactRef.contentHash,
+      evidence: [{ artifactHash: draft.artifactRef.contentHash, path: "text", summary: "Clear" }],
+    }
+    const unsafeFindings = [
+      { ...safeFinding, id: "the candidate worked at Acme" },
+      { ...safeFinding, code: "source excerpt copied verbatim" },
+      { ...safeFinding, evidence: [{ ...safeFinding.evidence[0], path: "the candidate worked at Acme" }] },
+    ]
+    for (const [index, finding] of unsafeFindings.entries()) {
+      await expect(tool(store, "artifact.review").execute(context({ taskId: `review-task-${index}`, toolCallId: `review-call-${index}` }), {
+        artifactRef: draft.artifactRef, decision: "passed", findings: [finding],
+      })).rejects.toMatchObject({ code: "precondition_failed" })
+      await expect(store.findReview({ userId: "user-a", sessionId: "session-a", jobId: "job-a" }, draft.artifactRef)).resolves.toBeNull()
+    }
+  })
+
+  it.each([
     ["object", { text: "letter" }],
     ["empty", ""],
     ["whitespace", " \n "],

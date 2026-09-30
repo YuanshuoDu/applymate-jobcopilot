@@ -31,22 +31,32 @@ function pool(options: { job?: boolean; resume?: boolean } = {}) {
 describe("loadSelectedJobArtifactContext", () => {
   it("loads only owner-scoped job, base resume and cover-letter-approved persona evidence", async () => {
     const fakePool = pool()
-    const context = await loadSelectedJobArtifactContext(fakePool as never, "user-1", "job-1")
-    const expectedDigest = computeArtifactSourceDigest("job-1", [
+    const bundle = await loadSelectedJobArtifactContext(fakePool as never, "user-1", "job-1")
+    const expectedSources = [
       { sourceRef: "job:job-1", content: {
         id: "job-1", company: "Example GmbH", role: "Engineer", location: "Berlin", status: "open", score: 8,
         url: "https://jobs.example/1", source: "greenhouse", salary: "EUR 80k", description: "Build systems", keywords: "TypeScript",
       } },
       { sourceRef: "resume:resume-1", content: { text: "Engineer with TypeScript experience" } },
       { sourceRef: "persona:resume:language", content: { id: "fact-1", key: "language", value: "English C1", confidence: 0.98 } },
-    ])
-    expect(context).toEqual({
+    ]
+    const expectedDigest = computeArtifactSourceDigest("job-1", expectedSources)
+    expect(bundle.preparation).toEqual({
       jobId: "job-1", sourceDigest: expectedDigest,
       evidenceRefs: ["job:job-1", "persona:resume:language", "resume:resume-1"],
     })
+    expect(bundle.transientSources).toEqual(expectedSources)
+    expect(bundle.preparation).not.toHaveProperty("transientSources")
+    expect(JSON.stringify(bundle.preparation)).not.toContain("Engineer with TypeScript experience")
+    expect(JSON.stringify(bundle.preparation)).not.toContain("English C1")
     expect(fakePool.calls.find(call => call.sql.includes('FROM "Job"'))?.values).toEqual(["job-1", "user-1"])
     expect(fakePool.calls.find(call => call.sql.includes('FROM "Resume"'))?.values).toEqual(["user-1", null])
-    expect(fakePool.calls.find(call => call.sql.includes("FROM persona_facts"))?.values).toEqual(["user-1", null, "cover_letter"])
+    const personaCalls = fakePool.calls.filter(call => call.sql.includes("FROM persona_facts"))
+    expect(personaCalls).toHaveLength(1)
+    expect(personaCalls[0]?.values).toEqual(["user-1", null, "cover_letter"])
+    expect(personaCalls[0]?.sql).toContain(`"status" = 'confirmed'`)
+    expect(personaCalls[0]?.sql).toContain(`"expires_at" IS NULL OR "expires_at" > NOW()`)
+    expect(personaCalls[0]?.sql).toContain(`$3 = ANY("allowedUses")`)
   })
 
   it.each([

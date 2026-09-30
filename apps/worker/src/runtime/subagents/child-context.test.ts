@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 
-import { childContextSnapshot, createChildContextBuilder, CHILD_MAILBOX_PAYLOAD_BYTE_LIMIT, type ChildMailboxHydrationInput, type ChildMailboxReader } from "./child-context.js"
+import { childContextSnapshot, createChildContextBuilder, CHILD_MAILBOX_PAYLOAD_BYTE_LIMIT, CHILD_SELECTED_JOB_EVIDENCE_BYTE_LIMIT, type ChildMailboxHydrationInput, type ChildMailboxReader } from "./child-context.js"
 import type { SubagentTaskRecord } from "./types.js"
 import type { ExecutionOwnerFence } from "../execution-owner.js"
 import type { CoordinationMailboxMessage } from "../tools/coordination-types.js"
@@ -68,6 +68,36 @@ describe("child context", () => {
     })
     expect(context.canonicalJson).toContain("Find matching jobs")
     expect(context.canonicalJson).toContain("job-1")
+  })
+
+  it("keeps selected-job source material transient, untrusted, role-scoped, and bounded", async () => {
+    const canary = "TRANSIENT_SELECTED_JOB_SOURCE_CANARY"
+    const sources = [{ sourceRef: "resume:resume-1", content: { text: canary } }]
+    for (const role of ["writer", "reviewer"] as const) {
+      const selectedTask = { ...task, role }
+      const snapshot = childContextSnapshot(selectedTask, { selectedJobPreparation: { jobId: "job-1", sourceDigest: "sha256:digest", evidenceRefs: ["resume:resume-1"] } })
+      expect(JSON.stringify(snapshot)).not.toContain(canary)
+      const context = await createChildContextBuilder(selectedTask, snapshot, undefined, sources).build({ scope: { userId: task.userId }, identity, stepId: `step-${role}`, snapshot })
+      const sourceBlock = context.blocks.find(block => block.source === "selected-job-source")
+      expect(sourceBlock).toMatchObject({ layer: "profile", role: "data", trust: "external_untrusted" })
+      expect(context.canonicalJson).toContain(canary)
+      expect(context.blocks.find(block => block.layer === "system")?.content).not.toContain(canary)
+    }
+    const analystSnapshot = childContextSnapshot({ ...task, role: "analyst" })
+    const analystContext = await createChildContextBuilder({ ...task, role: "analyst" }, analystSnapshot, undefined, sources).build({ scope: { userId: task.userId }, identity, stepId: "step-analyst", snapshot: analystSnapshot })
+    expect(analystContext.canonicalJson).not.toContain(canary)
+
+    const largeSources = [{ sourceRef: "resume:resume-1", content: { text: "é".repeat(CHILD_SELECTED_JOB_EVIDENCE_BYTE_LIMIT) } }]
+    const boundedContext = await createChildContextBuilder({ ...task, role: "writer" }, undefined, undefined, largeSources).build({ scope: { userId: task.userId }, identity, stepId: "step-bounded", snapshot: childContextSnapshot({ ...task, role: "writer" }) })
+    const boundedBlock = boundedContext.blocks.find(block => block.source === "selected-job-source")
+    expect(boundedBlock?.content).toMatchObject({ truncated: true })
+    expect(Buffer.byteLength(JSON.stringify(boundedBlock), "utf8")).toBeLessThanOrEqual(CHILD_SELECTED_JOB_EVIDENCE_BYTE_LIMIT)
+
+    const escapeHeavySources = [{ sourceRef: "resume:resume-escaped", content: { text: `"\\\u0000\u0001\t\n\r`.repeat(CHILD_SELECTED_JOB_EVIDENCE_BYTE_LIMIT) } }]
+    const escapeHeavyContext = await createChildContextBuilder({ ...task, role: "writer" }, undefined, undefined, escapeHeavySources).build({ scope: { userId: task.userId }, identity, stepId: "step-escape-heavy", snapshot: childContextSnapshot({ ...task, role: "writer" }) })
+    const escapeHeavyBlock = escapeHeavyContext.blocks.find(block => block.source === "selected-job-source")
+    expect(escapeHeavyBlock?.content).toMatchObject({ truncated: true })
+    expect(Buffer.byteLength(JSON.stringify(escapeHeavyBlock), "utf8")).toBeLessThanOrEqual(CHILD_SELECTED_JOB_EVIDENCE_BYTE_LIMIT)
   })
 
   it("presents persisted TaskGraph dependency projections as untrusted evidence", async () => {

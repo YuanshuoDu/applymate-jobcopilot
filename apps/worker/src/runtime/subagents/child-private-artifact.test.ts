@@ -184,11 +184,12 @@ describe("private child artifact boundary", () => {
     const privateCallIds = new Set<string>()
     const privateCalls: ToolCallRequest[] = []
     const reviewerLease = lease("reviewer")
+    const exactDraftBody = "PRIVATE_EXACT_DRAFT_BODY_for_reviewer_only"
     const executePrivateTool = vi.fn(async (_context, request): Promise<ToolExecutionResult> => {
       privateCalls.push(request)
       return {
         ...request, status: "completed", errorCode: null,
-        output: request.toolName === "artifact.version.read" ? { artifactRef: ref, content: "full body" } : { artifactRef: ref },
+        output: request.toolName === "artifact.version.read" ? { artifactRef: ref, content: exactDraftBody } : { artifactRef: ref },
       }
     })
     const executeRoutedTool = vi.fn(async (input: Parameters<TurnEngineToolExecutor>[0]) => ({ ...input.call, status: "completed" as const, errorCode: null }))
@@ -203,7 +204,15 @@ describe("private child artifact boundary", () => {
     expect(executePrivateTool).not.toHaveBeenCalled()
 
     const read = await reviewer(executionInput(call("artifact.version.read", "read-call", { artifactRef: ref })))
-    expect(read).toMatchObject({ status: "completed", output: { artifactRef: ref, content: "full body" } })
+    expect(read).toMatchObject({ status: "completed", output: { artifactRef: ref, content: exactDraftBody } })
+    const writes: unknown[] = []
+    const safeStore = createPrivateArtifactSafeStore(persistenceStore(writes), privateCallIds)
+    await safeStore.createItem({
+      type: "tool_call", status: "completed", content: { toolCallId: "read-call", toolName: "artifact.version.read", output: read.output },
+    } as never)
+    expect(JSON.stringify(writes)).not.toContain(exactDraftBody)
+    expect(writes[0]).toMatchObject({ toolCallId: "read-call", toolName: "artifact.version.read", output: { artifactRef: ref } })
+    expect(writes[0]).not.toHaveProperty("output.content")
     recordReadToolOutput(observedEvidence, "artifact.version.read", read.output)
     const secret = "private reviewer excerpt must not reach artifact storage"
     const unsafeReview = await reviewer(executionInput(call("artifact.review", "unsafe-review-call", {

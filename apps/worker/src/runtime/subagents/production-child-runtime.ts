@@ -93,9 +93,10 @@ function withoutIdentity<T extends { identity: ExecutionOwnerFence }>(input: T):
 async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: SubagentTaskRecord, lease: SubagentLease, owner: ExecutionOwnerFence): Promise<ChildToolRuntime> {
   const executionOwner: ExecutionOwner = { kind: "task", lease }
   const selectedJob = task.role === "writer" || task.role === "reviewer" ? selectedJobId(task) : undefined
-  const selectedJobPreparation = selectedJob
+  const selectedJobArtifactContext = selectedJob
     ? await loadSelectedJobArtifactContext(pool, task.userId, selectedJob)
     : undefined
+  const selectedJobPreparation = selectedJobArtifactContext?.preparation
   const artifacts = selectedJobPreparation ? createArtifactToolStore(pool) : undefined
   const coverLetterBase = task.role === "writer" && selectedJobPreparation && artifacts
     ? await resolveCoverLetterBase(artifacts, task.userId, selectedJobPreparation.jobId)
@@ -111,7 +112,7 @@ async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: Subagen
   }, toolPolicy, undefined, undefined, artifacts ? { store: artifacts } : undefined)
   return {
     definitions: runtime.registry.list(), router: runtime.router,
-    ...(selectedJobPreparation ? { selectedJobPreparation } : {}),
+    ...(selectedJobArtifactContext ? { selectedJobArtifactContext } : {}),
     ...(serverContext ? { serverContext } : {}),
     ...(selectedJobPreparation ? {
       executePrivateTool: async (context, request) => {

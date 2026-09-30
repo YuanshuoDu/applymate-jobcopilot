@@ -8,12 +8,16 @@ import { PgArtifactToolStore } from "./artifact-store-pg.js"
 const Id = Type.String({ minLength: 1, maxLength: 256 })
 const Digest = Type.String({ pattern: "^sha256:[a-f0-9]{64}$" })
 const ArtifactRefSchema = Type.Object({ artifactId: Id, version: Type.Integer({ minimum: 1 }), contentHash: Digest, sourceDigest: Digest }, { additionalProperties: false })
-const Evidence = Type.Object({ artifactHash: Digest, path: Type.String({ minLength: 1, maxLength: 256 }), summary: Type.String({ minLength: 1, maxLength: 512 }) }, { additionalProperties: false })
-const Finding = Type.Object({ id: Id, code: Id, severity: Type.Union([Type.Literal("info"), Type.Literal("warning"), Type.Literal("error")]), message: Type.String({ minLength: 1, maxLength: 1000 }), artifactHash: Digest, evidence: Type.Array(Evidence, { minItems: 1, maxItems: 16 }) }, { additionalProperties: false })
+const ReviewIdentifier = Type.String({ pattern: "^[a-z][a-z0-9_-]{0,39}$" })
+const ReviewPathPattern = "^(?:\\$\\.)?(?:paragraphs|sentences)\\[(?:0|[1-9]\\d{0,2})\\]$"
+const ReviewPath = Type.Union([Type.Literal("text"), Type.Literal("$.text"), Type.Literal("opening"), Type.Literal("$.opening"), Type.Literal("body"), Type.Literal("$.body"), Type.Literal("closing"), Type.Literal("$.closing"), Type.Literal("signature"), Type.Literal("$.signature"), Type.String({ pattern: ReviewPathPattern })])
+const Evidence = Type.Object({ artifactHash: Digest, path: ReviewPath, summary: Type.String({ minLength: 1, maxLength: 512 }) }, { additionalProperties: false })
+const Finding = Type.Object({ id: ReviewIdentifier, code: ReviewIdentifier, severity: Type.Union([Type.Literal("info"), Type.Literal("warning"), Type.Literal("error")]), message: Type.String({ minLength: 1, maxLength: 1000 }), artifactHash: Digest, evidence: Type.Array(Evidence, { minItems: 1, maxItems: 16 }) }, { additionalProperties: false })
 const Findings = Type.Array(Finding, { maxItems: 64 })
 const MAX_DRAFT_CONTENT_LENGTH = 20_000
 const DraftContent = Type.String({ minLength: 1, maxLength: MAX_DRAFT_CONTENT_LENGTH, pattern: "\\S" })
-const DraftInput = Type.Object({ baseArtifactId: Id, baseHash: Digest, content: DraftContent, constraints: Type.Unknown(), expectedPreviousHash: Type.Optional(Type.Union([Digest, Type.Null()])) }, { additionalProperties: false })
+const DraftConstraints = Type.Object({ maxWords: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000 })) }, { additionalProperties: false })
+const DraftInput = Type.Object({ baseArtifactId: Id, baseHash: Digest, content: DraftContent, constraints: DraftConstraints, expectedPreviousHash: Type.Optional(Type.Union([Digest, Type.Null()])) }, { additionalProperties: false })
 const VersionReadInput = Type.Object({ artifactRef: ArtifactRefSchema }, { additionalProperties: false })
 const ReviewInput = Type.Object({ artifactRef: ArtifactRefSchema, decision: Type.Union([Type.Literal("passed"), Type.Literal("needs_revision"), Type.Literal("rejected")]), findings: Findings }, { additionalProperties: false })
 
@@ -76,6 +80,32 @@ function assertDraftContent(value: unknown): asserts value is string {
   }
 }
 
+function assertDraftConstraints(value: unknown): asserts value is Static<typeof DraftConstraints> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new ArtifactToolError("precondition_failed", "Draft constraints must contain bounded metadata only.")
+  const constraints = value as Record<string, unknown>
+  if (Object.keys(constraints).some(key => key !== "maxWords")
+    || ("maxWords" in constraints && (!Number.isSafeInteger(constraints.maxWords) || Number(constraints.maxWords) < 1 || Number(constraints.maxWords) > 1000))) {
+    throw new ArtifactToolError("precondition_failed", "Draft constraints must contain bounded metadata only.")
+  }
+}
+
+const SAFE_REVIEW_PATHS = new Set(["text", "$.text", "opening", "$.opening", "body", "$.body", "closing", "$.closing", "signature", "$.signature"])
+const SAFE_REVIEW_INDEX_PATH = /^(?:\$\.)?(?:paragraphs|sentences)\[(?:0|[1-9]\d{0,2})\]$/
+const SAFE_REVIEW_IDENTIFIER = /^[a-z][a-z0-9_-]{0,39}$/
+
+function assertSafeReviewMetadata(value: unknown): asserts value is ArtifactToolReviewInput {
+  const input = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
+  if (!Array.isArray(input.findings) || input.findings.length > 64 || input.findings.some(item => {
+    const finding = item && typeof item === "object" && !Array.isArray(item) ? item as Record<string, unknown> : {}
+    return typeof finding.id !== "string" || !SAFE_REVIEW_IDENTIFIER.test(finding.id)
+      || typeof finding.code !== "string" || !SAFE_REVIEW_IDENTIFIER.test(finding.code)
+      || !Array.isArray(finding.evidence) || finding.evidence.length > 16 || finding.evidence.some(source => {
+        const evidence = source && typeof source === "object" && !Array.isArray(source) ? source as Record<string, unknown> : {}
+        return typeof evidence.path !== "string" || (!SAFE_REVIEW_PATHS.has(evidence.path) && !SAFE_REVIEW_INDEX_PATH.test(evidence.path))
+      })
+  })) throw new ArtifactToolError("precondition_failed", "Review identifiers and evidence paths must use bounded metadata values.")
+}
+
 function versionRef(row: AgentArtifactVersionRow): ArtifactVersionRef {
   return { artifactId: row.artifactId, version: row.version, contentHash: row.contentHash, sourceDigest: row.sourceDigest }
 }
@@ -96,6 +126,7 @@ export function createArtifactTools(store: ArtifactToolStore): RuntimeToolDefini
         const scope = scopeOf(context)
         assertDraftContent(value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>).content : undefined)
         const input = value as ArtifactToolDraftInput
+        assertDraftConstraints(input.constraints)
         const base = await store.read(scope.userId, input.baseArtifactId)
         if (!base || base.jobId !== scope.jobId || base.type !== "cover_letter" || base.lifecycle !== "base" || base.hash !== input.baseHash) throw new ArtifactToolError("stale_hash", "Selected-job cover-letter base is stale or unavailable.")
         const requestHash = hashArtifactContent({ op: "cover_letter.draft", ...scope, input })
@@ -120,6 +151,7 @@ export function createArtifactTools(store: ArtifactToolStore): RuntimeToolDefini
       execute: async (rawContext: ToolExecutionContext, value: unknown) => {
         const scope = scopeOf(rawContext as ArtifactToolExecutionContext)
         const input = value as ArtifactToolReviewInput
+        assertSafeReviewMetadata(input)
         const version = await store.readVersion(scope, input.artifactRef)
         if (!version || version.contentHash !== input.artifactRef.contentHash || version.sourceDigest !== input.artifactRef.sourceDigest) throw new ArtifactToolError("stale_hash", "Reviewed artifact version is unavailable or stale.")
         const stale = scope.sourceDigest !== input.artifactRef.sourceDigest

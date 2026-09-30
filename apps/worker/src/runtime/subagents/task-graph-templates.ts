@@ -33,7 +33,7 @@ export function taskGraphTemplatesForSelectedJob(
     cover_letter_writer: Object.freeze({
       role: "writer",
       taskType: "cover_letter_draft",
-      allowedActions: Object.freeze(["jobs.get", "persona.retrieve", "resume.get_base", "cover_letter.draft"]),
+      allowedActions: Object.freeze(["cover_letter.draft"]),
       constraints: Object.freeze([
         "Use the server-selected job in selectedJobPreparation; do not substitute a job from goal text.",
         "Use confirmed resume and profile evidence. Save the draft with cover_letter.draft and return only its artifact reference.",

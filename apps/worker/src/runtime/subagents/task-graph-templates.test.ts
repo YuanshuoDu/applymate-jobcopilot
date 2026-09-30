@@ -37,7 +37,7 @@ describe("TaskGraph server-owned templates", () => {
     const templates = taskGraphTemplatesForSelectedJob({ jobId: "job-1" })
     expect(templates.cover_letter_writer).toMatchObject({
       role: "writer", taskType: "cover_letter_draft",
-      allowedActions: ["jobs.get", "persona.retrieve", "resume.get_base", "cover_letter.draft"],
+      allowedActions: ["cover_letter.draft"],
       context: { selectedJobPreparation: { jobId: "job-1" } },
       expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "writer" },
     })
@@ -49,6 +49,9 @@ describe("TaskGraph server-owned templates", () => {
     })
     for (const id of ["cover_letter_writer", "cover_letter_reviewer"]) {
       const template = templates[id]!
+      expect(template.allowedActions).not.toContain("jobs.get")
+      expect(template.allowedActions).not.toContain("persona.retrieve")
+      expect(template.allowedActions).not.toContain("resume.get_base")
       expect(template.allowedActions).not.toContain("agent.plan")
       expect(template.allowedActions).not.toContain("application.submit")
       expect(template.allowedActions.some(action => /send|gmail|browser|submit/i.test(action))).toBe(false)

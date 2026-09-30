@@ -185,6 +185,59 @@ function budgetStore(failConsumed = false, rootLimits?: TreeBudgetExecutionLimit
 }
 
 describe("child executor composition", () => {
+  it("fails closed when a selected-job Writer has no transient source bundle", async () => {
+    const child = { ...lease(), role: "writer", context: { selectedJobPreparation: { jobId: "job-1" } } }
+    const modelRuntimeFactory = vi.fn(() => textOnlyModel("must not run"))
+    const executor = createChildExecutor({
+      store: executionStore([], []), treeBudget: budgetStore().store,
+      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory,
+      toolRuntimeFactory: () => childToolRuntime([tool("cover_letter.draft", "resume")]),
+    })
+    await expect(executor({ lease: child })).resolves.toMatchObject({ status: "failed", failureReason: "selected_job_sources_unavailable", retryDisposition: "terminal" })
+    expect(modelRuntimeFactory).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { role: "writer" as const, expectedTools: ["cover_letter.draft"] },
+    { role: "reviewer" as const, expectedTools: ["artifact.version.read", "artifact.review"] },
+  ])("clamps stale generic reads for a selected-job $role", async ({ role, expectedTools }) => {
+    const artifactRef = { artifactId: "artifact-1", version: 1, contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: `sha256:${"b".repeat(64)}` }
+    const context = {
+      selectedJobPreparation: { jobId: "job-1" },
+      ...(role === "reviewer" ? { taskGraphDependencyResults: {
+        schemaVersion: "agent-harness.v2.task-graph.dependency-evidence",
+        items: [{ role: "writer", taskStatus: "completed", result: {
+          schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted", availability: "available",
+          role: "writer", status: "completed", artifactRef,
+        } }],
+      } } : {}),
+    }
+    const child = { ...lease(), role, taskType: `cover_letter_${role}`, context, expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role },
+      allowedActions: role === "writer"
+        ? ["jobs.get", "persona.retrieve", "resume.get_base", "cover_letter.draft"]
+        : ["jobs.get", "persona.retrieve", "resume.get_base", "artifact.version.read", "artifact.review"] }
+    const definitions = [tool("jobs.get", "jobs"), tool("persona.retrieve", "persona"), tool("resume.get_base", "resume"),
+      ...(role === "writer" ? [{ ...tool("cover_letter.draft", "resume"), risk: "draft_write" as const, capabilities: ["read", "write"] as const, idempotency: "requires_key" as const, requiredCapabilities: [] }]
+        : [tool("artifact.version.read", "resume"), { ...tool("artifact.review", "resume"), risk: "draft_write" as const, capabilities: ["read", "write"] as const, idempotency: "requires_key" as const, requiredCapabilities: [] }])]
+    const requests: HarnessModelRequest[] = []
+    const executor = createChildExecutor({
+      store: executionStore([], []), treeBudget: budgetStore().store,
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => textOnlyModel("invalid structured result", request => requests.push(request)),
+      toolRuntimeFactory: () => ({
+        ...childToolRuntime(definitions),
+        selectedJobArtifactContext: {
+          preparation: { jobId: "job-1", sourceDigest: artifactRef.sourceDigest, evidenceRefs: ["resume:resume-1"] },
+          transientSources: [{ sourceRef: "resume:resume-1", content: { summary: "selected-job evidence" } }],
+        },
+      }),
+    })
+
+    await executor({ lease: child })
+    expect(requests).toHaveLength(1)
+    expect(requests[0]?.tools?.map(value => (value as { name: string }).name)).toEqual(expectedTools)
+  })
+
   it("applies root step limits before starting child model work", async () => {
     const child = lease(); let providerCalls = 0
     const modelRuntimeFactory = vi.fn(() => ({

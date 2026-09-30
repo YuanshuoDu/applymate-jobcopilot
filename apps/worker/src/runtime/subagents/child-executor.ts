@@ -20,15 +20,16 @@ import type { TurnResumeState } from "../turns/turn-engine-types.js"
 import { createToolRouterExecutor } from "../turns/turn-engine-helpers.js"
 import { runTurnExecutionLoop } from "../turns/turn-execution-loop.js"
 import { createUsageAwareModelAdapter, type UsageAwareModelOptions } from "../turns/usage-aware-model.js"
+import type { SelectedJobArtifactContextBundle } from "./selected-job-artifact-context.js"
 import type { TreeBudgetReservationStore } from "./tree-budget-types.js"
-import type { RuntimeToolDefinition, SelectedJobPreparationContext, ToolRouterContext, ToolExecutionResult, ToolCallRequest } from "../tools/types.js"
+import type { RuntimeToolDefinition, ToolRouterContext, ToolExecutionResult, ToolCallRequest } from "../tools/types.js"
 
 /** Public metadata keeps the runtime's readonly tool contracts without exposing execution functions to the model. */
 export type ChildPublicDefinition = Omit<RuntimeToolDefinition, "execute">
 export type ChildToolRuntime = {
   readonly definitions: readonly ChildPublicDefinition[]
   readonly router: { execute(context: ToolRouterContext, request: ToolCallRequest): Promise<ToolExecutionResult> }
-  readonly selectedJobPreparation?: SelectedJobPreparationContext
+  readonly selectedJobArtifactContext?: SelectedJobArtifactContextBundle
   readonly serverContext?: unknown
   /** Private scoped tools bypass normal lifecycle persistence; only their ref receipt is persisted. */
   readonly executePrivateTool?: (context: ToolRouterContext, request: ToolCallRequest) => Promise<ToolExecutionResult>
@@ -100,12 +101,12 @@ async function defaultModel(task: SubagentTaskRecord): Promise<ModelAdapter> {
   return (await createHarnessModelRuntime({ primary: config, fallbacks: [], allowEnvironmentFallbacks: false })).adapter
 }
 
-function visibleDefinitions(task: SubagentTaskRecord, definitions: readonly ChildPublicDefinition[]): ChildPublicDefinition[] {
+function visibleDefinitions(task: SubagentTaskRecord, definitions: readonly ChildPublicDefinition[], selectedJob?: string): ChildPublicDefinition[] {
   const policy = getSubagentRolePolicy(task.role)
   if (!policy) throw new Error("subagent_role_unknown")
   const allowedActions = new Set(Array.isArray(task.allowedActions) ? task.allowedActions.filter((action): action is string => typeof action === "string") : [])
   return definitions.filter(definition => {
-    if (!allowedActions.has(definition.name)) return false
+    if (!allowedActions.has(definition.name) || (selectedJob && ((task.role === "writer" && definition.name !== "cover_letter.draft") || (task.role === "reviewer" && definition.name !== "artifact.version.read" && definition.name !== "artifact.review")))) return false
     if (definition.name === "tool_results.read") {
       return definition.risk === "read"
         && definition.idempotency === "read_only"
@@ -137,7 +138,6 @@ function isDeterministicChildResumeError(error: unknown): boolean {
     || code.endsWith("_tool_result_conflict")
     || code === "child_resume_usage_overflow"
 }
-
 export function createChildExecutor(options: ChildExecutorOptions): (input: { lease: SubagentLease }) => Promise<SubagentExecutionResult> {
   if (!options.treeBudget) throw new TypeError("treeBudget is required for child execution")
   return async ({ lease }) => {
@@ -153,11 +153,11 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       catch { return { status: "failed", failureReason: "writer_dependency_unavailable", retryDisposition: "terminal" } }
     }
     const runtime = await options.toolRuntimeFactory({ task: lease, owner, lease })
-    const selectedJobPreparation = runtime.selectedJobPreparation
-    if (selectedJob && !validSelectedJobContext(selectedJobPreparation, selectedJob)) {
+    const selectedJobPreparation = runtime.selectedJobArtifactContext?.preparation
+    if (selectedJob && (!validSelectedJobContext(selectedJobPreparation, selectedJob) || !Array.isArray(runtime.selectedJobArtifactContext?.transientSources) || runtime.selectedJobArtifactContext?.transientSources.length === 0)) {
       return { status: "failed", failureReason: "selected_job_sources_unavailable", retryDisposition: "terminal" }
     }
-    const definitions = visibleDefinitions(lease, runtime.definitions)
+    const definitions = visibleDefinitions(lease, runtime.definitions, selectedJob)
     const policy = getSubagentRolePolicy(lease.role)
     if (!policy) return { status: "failed", failureReason: "subagent_role_unknown" }
     const observedEvidence = createObservedEvidenceIndex()
@@ -212,7 +212,7 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       if (toolResult.status === "completed" && toolResult.errorCode === null) recordReadToolOutput(observedEvidence, input.call.toolName, toolResult.output)
       return toolResult
     }
-    const contextBuilder = createChildContextBuilder(lease, snapshot, options.mailboxReader)
+    const contextBuilder = createChildContextBuilder(lease, snapshot, options.mailboxReader, lease.role === "writer" || lease.role === "reviewer" ? runtime.selectedJobArtifactContext?.transientSources : undefined)
     const result = await runTurnExecutionLoop({
       identity: owner, scope: { userId: lease.userId }, goal: lease.goal, snapshot,
       contextBuilder, store: safeStore, model, tools: definitions,

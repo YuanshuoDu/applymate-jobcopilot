@@ -16,6 +16,7 @@ import { materializeTaskGraphDependencyContext } from "./task-graph-dependency-c
 import type { GraphIdentityScope } from "./task-graph-pg-state.js"
 
 const artifactStoreMock = vi.hoisted(() => ({ current: null as unknown }))
+const selectedJobSourceCanary = "APPLYMATE_TRANSIENT_SELECTED_JOB_CANARY"
 vi.mock("../tools/artifact-tools.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../tools/artifact-tools.js")>()
   return {
@@ -68,18 +69,18 @@ function recordingStore() {
 function selectedJobPool() {
   const job = {
     id: "job-1", company: "Example GmbH", role: "Engineer", location: "Berlin", status: "open", score: 8,
-    url: "https://jobs.example/1", source: "greenhouse", salary: "EUR 80k", description: "Build systems", keywords: "TypeScript",
+    url: "https://jobs.example/1", source: "greenhouse", salary: "EUR 80k", description: `${selectedJobSourceCanary} job description`, keywords: "TypeScript",
     createdAt: new Date("2026-01-01T00:00:00Z"), updatedAt: new Date("2026-01-02T00:00:00Z"),
   }
   const resume = {
     id: "resume-1", name: "Base", kind: "base", origin: "manual", isDefault: true,
-    content: { text: "Engineer with TypeScript experience" }, createdAt: new Date("2026-01-01T00:00:00Z"), updatedAt: new Date("2026-01-02T00:00:00Z"),
+    content: { text: `${selectedJobSourceCanary} resume evidence` }, createdAt: new Date("2026-01-01T00:00:00Z"), updatedAt: new Date("2026-01-02T00:00:00Z"),
   }
   const query = vi.fn(async (sql: string) => {
     if (sql.includes('FROM "Job"')) return { rows: [job] }
     if (sql.includes('FROM "Resume"')) return { rows: [resume] }
     if (sql.includes("FROM persona_facts")) return { rows: [{
-      id: "fact-1", key: "language", category: "language", value: "English C1", source: "resume", sourceRef: "resume:language",
+      id: "fact-1", key: "language", category: "language", value: `${selectedJobSourceCanary} persona evidence`, source: "resume", sourceRef: "resume:language",
       confidence: 0.98, allowedUses: ["cover_letter"],
     }] }
     throw new Error(`unexpected production child query: ${sql}`)
@@ -92,7 +93,7 @@ function jobTask(role: "writer" | "reviewer", context: unknown = { selectedJobPr
     ...lease(), role, taskType: role === "writer" ? "cover_letter_draft" : "cover_letter_review",
     goal: role === "writer" ? "Draft a cover letter" : "Review the cover letter",
     allowedActions: role === "writer"
-      ? ["jobs.get", "persona.retrieve", "resume.get_base", "cover_letter.draft"]
+      ? ["cover_letter.draft"]
       : ["artifact.version.read", "artifact.review"],
     context, expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role },
     toolPolicySnapshot: {},
@@ -269,7 +270,7 @@ describe("production child runtime", () => {
 
   it("composes the selected-job Writer and Reviewer tools with a private exact-reference read receipt", async () => {
     const body = "Private cover letter body: production composition fixture."
-    const preparation = await selectedJobSourceDigest()
+    const preparation = (await selectedJobSourceDigest()).preparation
     const baseArtifactId = `cover-letter-base:${hashArtifactContent({ userId: "user-1", jobId: "job-1" }).slice(7)}`
     const baseHash = hashArtifactContent({ kind: "cover_letter_base", jobId: "job-1" })
     const artifactRef = {
@@ -282,6 +283,7 @@ describe("production child runtime", () => {
       async *stream(request) {
         writerRequests.push(request)
         if (writerRequests.length === 1) {
+          yield { type: "text_delta", text: selectedJobSourceCanary }
           yield { type: "tool_call_completed", callId: "draft-call", name: "cover_letter.draft", arguments: {
             baseArtifactId, baseHash, content: body, constraints: { maxWords: 160 },
           } }
@@ -301,6 +303,7 @@ describe("production child runtime", () => {
     expect(writer, JSON.stringify({ writer, writes: writerPersistence.writes })).toMatchObject({ status: "completed" })
     expect(emittedTool(writerRequests[0]!, "cover_letter.draft")).toBe(true)
     assertNoExternalTools(writerRequests[0]!)
+    expect(stringsDeep(writerRequests[0]).join("\n")).toContain(selectedJobSourceCanary)
     const writerResult = completedResult(writer.result)
     expect(writerResult.structuredResult).toMatchObject({ role: "writer", artifactRef })
     expect(draftSpy.mock.calls[0]?.[0]).toMatchObject({ taskFence: {
@@ -308,6 +311,7 @@ describe("production child runtime", () => {
       parentTaskId: "root-1", leaseOwner: "worker-1", attemptCount: 1,
     } })
     expect(stringsDeep(writerPersistence.writes).join("\n")).not.toContain(body)
+    expect(stringsDeep(writerPersistence.writes).join("\n")).not.toContain(selectedJobSourceCanary)
     const draftReceipts = writerPersistence.writes.flatMap(write => rowsForToolCall(write.value, "draft-call"))
       .filter(row => Object.prototype.hasOwnProperty.call(row, "output"))
     expect(draftReceipts.length).toBeGreaterThan(0)
@@ -352,6 +356,7 @@ describe("production child runtime", () => {
     expect(emittedTool(reviewerRequests[0]!, "artifact.review")).toBe(true)
     expect(emittedTool(reviewerRequests[0]!, "cover_letter.draft")).toBe(false)
     assertNoExternalTools(reviewerRequests[0]!)
+    expect(stringsDeep(reviewerRequests[0]).join("\n")).toContain(selectedJobSourceCanary)
     expect(stringsDeep(reviewerRequests[1]).join("\n")).toContain(body)
     expect(completedResult(reviewer.result).structuredResult).toMatchObject({ role: "reviewer", artifactRef, reviewStatus: "passed", reviewHash })
     expect(reviewSpy.mock.calls[0]?.[0]).toMatchObject({ taskFence: {
@@ -362,6 +367,7 @@ describe("production child runtime", () => {
     const persisted = reviewerPersistence.writes
     expect(persisted.map(write => write.method)).toEqual(expect.arrayContaining(["createItem", "updateItem", "appendEvent"]))
     expect(stringsDeep(persisted).join("\n")).not.toContain(body)
+    expect(stringsDeep(persisted).join("\n")).not.toContain(selectedJobSourceCanary)
     const readReceipts = persisted.flatMap(write => rowsForToolCall(write.value, "read-call"))
     expect(readReceipts.length).toBeGreaterThan(0)
     expect(readReceipts.some(row => JSON.stringify(row).includes(artifactRef.artifactId))).toBe(true)
@@ -379,7 +385,7 @@ describe("production child runtime", () => {
 
   it("refuses a Reviewer read whose reference differs from the direct Writer dependency", async () => {
     const body = "Only the exact direct Writer reference is readable."
-    const preparation = await selectedJobSourceDigest()
+    const preparation = (await selectedJobSourceDigest()).preparation
     const baseArtifactId = `cover-letter-base:${hashArtifactContent({ userId: "user-1", jobId: "job-1" }).slice(7)}`
     const baseHash = hashArtifactContent({ kind: "cover_letter_base", jobId: "job-1" })
     const artifactRef = {

@@ -1024,6 +1024,17 @@ async function activateFixtureTurn(pool: Pool, value: Fixture): Promise<void> {
 
 type SelectedJobFixtureSources = { readonly jobId: string; readonly otherJobId: string; readonly resumeId: string }
 
+function selectedJobSourceCanaries(jobId: string, worker: 1 | 2): readonly string[] {
+  const prefix = "p3-selected-job-"
+  if (!jobId.startsWith(prefix) || jobId.length <= prefix.length) throw new Error("Selected-job source canaries are unavailable")
+  const suffix = jobId.slice(prefix.length)
+  return [
+    `AC6_TRANSIENT_JOB_SOURCE_W${worker}_${suffix}`,
+    `AC6_TRANSIENT_RESUME_SOURCE_W${worker}_${suffix}`,
+    `AC6_TRANSIENT_PERSONA_SOURCE_W${worker}_${suffix}`,
+  ]
+}
+
 function selectedJobFixtureSources(value: Fixture): SelectedJobFixtureSources {
   return {
     jobId: `p3-selected-job-${value.suffix}`,
@@ -1035,16 +1046,18 @@ function selectedJobFixtureSources(value: Fixture): SelectedJobFixtureSources {
 async function seedSelectedJobSources(pool: Pool, value: Fixture): Promise<SelectedJobFixtureSources> {
   const ids = selectedJobFixtureSources(value)
   await pool.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "location", "status", "url", "description", "source", "updatedAt")
-    VALUES ($1, $2, 'Fixture GmbH', 'Software Engineer', 'Berlin', 'saved', 'https://jobs.example.invalid/selected', 'Build reliable systems', 'test', CURRENT_TIMESTAMP),
-      ($3, $2, 'Other Fixture GmbH', 'Designer', 'Dublin', 'saved', 'https://jobs.example.invalid/other', 'Design clear products', 'test', CURRENT_TIMESTAMP)`, [ids.jobId, value.userId, ids.otherJobId])
+    VALUES ($1, $2, 'Fixture GmbH', 'Software Engineer', 'Berlin', 'saved', 'https://jobs.example.invalid/selected', $3, 'test', CURRENT_TIMESTAMP),
+      ($4, $2, 'Other Fixture GmbH', 'Designer', 'Dublin', 'saved', 'https://jobs.example.invalid/other', 'Design clear products', 'test', CURRENT_TIMESTAMP)`, [
+    ids.jobId, value.userId, `AC6_TRANSIENT_JOB_SOURCE_W1_${value.suffix}`, ids.otherJobId,
+  ])
   await pool.query(`INSERT INTO "Resume" ("id", "userId", "name", "content", "kind", "origin", "isDefault", "updatedAt")
     VALUES ($1, $2, 'Selected-job integration base', $3::jsonb, 'base', 'manual', TRUE, CURRENT_TIMESTAMP)`, [
-    ids.resumeId, value.userId, JSON.stringify({ text: "Experienced engineer with distributed systems skills." }),
+    ids.resumeId, value.userId, JSON.stringify({ text: `AC6_TRANSIENT_RESUME_SOURCE_W1_${value.suffix}` }),
   ])
   await pool.query(`INSERT INTO persona_facts
     ("id", "userId", "key", "category", "value", "normalized_value", "source", "source_ref", "confidence", "status", "allowedUses", "updated_at")
-    VALUES ($1, $2, 'language', 'language', 'English C1', 'english-c1', 'resume', $3, 0.98, 'confirmed', ARRAY['cover_letter']::text[], CURRENT_TIMESTAMP)`, [
-    `p3-selected-job-fact-${value.suffix}`, value.userId, `resume:${ids.resumeId}:language`,
+    VALUES ($1, $2, 'language', 'language', $3, 'english-c1', 'resume', $4, 0.98, 'confirmed', ARRAY['cover_letter']::text[], CURRENT_TIMESTAMP)`, [
+    `p3-selected-job-fact-${value.suffix}`, value.userId, `AC6_TRANSIENT_PERSONA_SOURCE_W1_${value.suffix}`, `resume:${ids.resumeId}:language`,
   ])
   return ids
 }
@@ -1150,7 +1163,10 @@ async function traceSelectedJobWriterFromWorker(
   line: string,
 ): Promise<SelectedJobArtifactRestartTrace> {
   const settlement = selectedJobSettlement(line, plan.writerTask.id)
-  expect(settlement).toMatchObject({ role: "writer", taskId: plan.writerTask.id, managerStatus: "completed", childStatus: "completed" })
+  expect(settlement).toMatchObject({
+    role: "writer", taskId: plan.writerTask.id, managerStatus: "completed", childStatus: "completed",
+    observations: { sourceCanariesReloaded: { job: true, resume: true, persona: true } },
+  })
   if (typeof settlement.ownerId !== "string" || !Number.isSafeInteger(settlement.attemptCount)) {
     throw new Error("Selected-job Worker did not report a valid lease identity")
   }
@@ -1158,7 +1174,7 @@ async function traceSelectedJobWriterFromWorker(
   const writerDraftCallId = selectedJobDraftCallId(writerAttemptCount)
   const artifactRef = selectedJobArtifactReference(settlement.artifactRef)
   expect(artifactRef.version).toBe(1)
-  expect(artifactRef.sourceDigest).toBe(plan.originalPreparation.sourceDigest)
+  expect(artifactRef.sourceDigest).toBe(plan.originalPreparation.preparation.sourceDigest)
   const writerFence = selectedJobTaskFence(plan.writerTask, settlement.ownerId, writerAttemptCount)
   const version = await plan.store.get(plan.writerTask.id, plan.writerTask.sessionId)
   expect(version).toMatchObject({ status: "completed", role: "writer", attemptCount: writerAttemptCount })
@@ -1193,7 +1209,7 @@ async function prepareSelectedJobReviewAfterRestart(
     constraints: { maxWords: 160 },
   }
   const originalDraftScope = {
-    ...trace.originalPreparation, userId: value.userId, sessionId: value.sessionId,
+    ...trace.originalPreparation.preparation, userId: value.userId, sessionId: value.sessionId,
     taskId: trace.writerTask.id, toolCallId: trace.writerDraftCallId, taskFence: trace.writerFence,
   }
   const requestHash = hashArtifactContent({ op: "cover_letter.draft", ...originalDraftScope, input: originalDraftInput })
@@ -1219,10 +1235,20 @@ async function prepareSelectedJobReviewAfterRestart(
   const completedWriter = await trace.store.get(trace.writerTask.id, value.sessionId)
   expect(completedWriter).toMatchObject({ status: "completed", role: "writer", rootTaskId: trace.rootTaskId, parentTaskId: trace.rootTaskId })
   if (!completedWriter) throw new Error("Completed selected-job Writer task disappeared")
-  await pool.query(`UPDATE "Job" SET "description" = 'Changed after the Worker-persisted Writer draft', "updatedAt" = CURRENT_TIMESTAMP
-    WHERE "id" = $1 AND "userId" = $2`, [trace.jobId, value.userId])
+  const workerTwoSources = selectedJobSourceCanaries(trace.jobId, 2)
+  const updatedSources = await Promise.all([
+    pool.query(`UPDATE "Job" SET "description" = $3, "updatedAt" = CURRENT_TIMESTAMP
+      WHERE "id" = $1 AND "userId" = $2`, [trace.jobId, value.userId, workerTwoSources[0]]),
+    pool.query(`UPDATE "Resume" SET "content" = $3::jsonb, "updatedAt" = CURRENT_TIMESTAMP
+      WHERE "id" = $1 AND "userId" = $2`, [
+      selectedJobFixtureSources(value).resumeId, value.userId, JSON.stringify({ text: workerTwoSources[1] }),
+    ]),
+    pool.query(`UPDATE persona_facts SET "value" = $3, "updated_at" = CURRENT_TIMESTAMP
+      WHERE "id" = $1 AND "userId" = $2`, [`p3-selected-job-fact-${value.suffix}`, value.userId, workerTwoSources[2]]),
+  ])
+  if (updatedSources.some(result => result.rowCount !== 1)) throw new Error("Selected-job transient source fixture update failed")
   const currentPreparation = await loadSelectedJobArtifactContext(pool, value.userId, trace.jobId)
-  expect(currentPreparation.sourceDigest).not.toBe(trace.artifactRef.sourceDigest)
+  expect(currentPreparation.preparation.sourceDigest).not.toBe(trace.artifactRef.sourceDigest)
   const dependencyScope = {
     userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
     rootTaskId: trace.rootTaskId, parentTaskId: trace.rootTaskId,
@@ -1270,6 +1296,7 @@ async function reviewSelectedJobThroughRestartedWorker(
   connection: Redis,
   value: Fixture,
   trace: SelectedJobArtifactReviewTrace,
+  firstWorker: ProcessFixtureChild,
   worker: ProcessFixtureChild,
 ): Promise<void> {
   const artifactStore = createArtifactToolStore(pool)
@@ -1281,6 +1308,8 @@ async function reviewSelectedJobThroughRestartedWorker(
     artifactRef: trace.artifactRef, reviewStatus: "stale",
     observations: {
       sawBody: true, privateBodyAbsentBeforeRead: true,
+      sourceCanariesReloaded: { job: true, resume: true, persona: true },
+      previousSourceCanariesAbsent: { job: true, resume: true, persona: true },
       preReadContextHash: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
       reviewStatus: "stale", writerReceiptReferenceRecovered: true,
     },
@@ -1295,7 +1324,7 @@ async function reviewSelectedJobThroughRestartedWorker(
   expect(persistedReview.rows).toHaveLength(1)
   expect(persistedReview.rows[0]).toMatchObject({
     status: "stale", sourceDigest: trace.artifactRef.sourceDigest,
-    currentSourceDigest: trace.currentPreparation.sourceDigest, findings: [],
+    currentSourceDigest: trace.currentPreparation.preparation.sourceDigest, findings: [],
   })
   expect(reviewSettlement.reviewHash).toBe(persistedReview.rows[0]?.reviewHash)
 
@@ -1323,7 +1352,7 @@ async function reviewSelectedJobThroughRestartedWorker(
     userId: value.userId, sessionId: value.sessionId, jobId: trace.jobId,
     artifactId: trace.artifactRef.artifactId, version: trace.artifactRef.version,
     contentHash: trace.artifactRef.contentHash, sourceDigest: trace.artifactRef.sourceDigest,
-    currentSourceDigest: trace.currentPreparation.sourceDigest, status: "stale" as const,
+    currentSourceDigest: trace.currentPreparation.preparation.sourceDigest, status: "stale" as const,
     findings: [], evidenceRefs: [], taskId: trace.stopReviewerTask.id,
     toolCallId: `ac6-stop-review-write:${trace.stopReviewerTask.id}`,
     requestHash: hashArtifactContent({ op: "artifact.review", call: trace.stopReviewerTask.id, artifactRef: trace.artifactRef }),
@@ -1343,11 +1372,13 @@ async function reviewSelectedJobThroughRestartedWorker(
     managerStatus: "interrupted",
     observations: {
       sawBody: true, privateBodyAbsentBeforeRead: true,
+      sourceCanariesReloaded: { job: true, resume: true, persona: true },
+      previousSourceCanariesAbsent: { job: true, resume: true, persona: true },
       preReadContextHash: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
       reviewWriteError: "private_artifact_review_failed",
     },
   })
-  const [persistedItems, persistedEvents, persistedOutbox] = await Promise.all([
+  const [persistedItems, persistedEvents, persistedOutbox, persistedTasks] = await Promise.all([
     pool.query<{ content: unknown }>(`SELECT "content" FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = ANY($3::text[])`, [
       value.sessionId, value.turnId, [trace.writerTask.id, trace.reviewerTask.id, trace.stopReviewerTask.id],
     ]),
@@ -1355,15 +1386,23 @@ async function reviewSelectedJobThroughRestartedWorker(
       value.sessionId, value.turnId, [trace.writerTask.id, trace.reviewerTask.id, trace.stopReviewerTask.id],
     ]),
     pool.query<{ payload: unknown }>(`SELECT "payload" FROM "agent_outbox" WHERE "topic" = 'agent.events' AND "aggregateId" = $1`, [value.sessionId]),
+    pool.query<{ context: unknown; result: unknown }>(`SELECT "context", "result" FROM "sub_agent_tasks"
+      WHERE "sessionId" = $1 AND ("id" = $2 OR "rootTaskId" = $2)`, [value.sessionId, trace.rootTaskId]),
   ])
   expect(persistedItems.rows.length).toBeGreaterThan(0)
   expect(persistedEvents.rows.length).toBeGreaterThan(0)
+  expect(persistedTasks.rows.length).toBeGreaterThanOrEqual(3)
   const publicPersistence = JSON.stringify({
     items: persistedItems.rows.map(row => row.content),
     events: persistedEvents.rows.map(row => row.payload),
     outbox: persistedOutbox.rows.map(row => row.payload),
+    tasks: persistedTasks.rows,
   })
   expect(publicPersistence).not.toContain(trace.body)
+  const sourceCanaries = [...selectedJobSourceCanaries(trace.jobId, 1), ...selectedJobSourceCanaries(trace.jobId, 2)]
+  for (const canary of sourceCanaries) expect(publicPersistence).not.toContain(canary)
+  const processLogs = [...firstWorker.output, ...firstWorker.errors, ...worker.output, ...worker.errors].join("\n")
+  for (const canary of sourceCanaries) expect(processLogs).not.toContain(canary)
   const draftReceipts = persistedItems.rows.flatMap(row => rowsForToolCall(row.content, trace.writerDraftCallId))
     .filter(row => Object.prototype.hasOwnProperty.call(row, "output"))
   expect(draftReceipts.length).toBeGreaterThan(0)
@@ -4189,7 +4228,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(followUpReadyLine).toContain(String(preFinalFollowUpId))
 
       if (!artifactReviewTrace || !redis) throw new Error("Selected-job review fixture was not prepared for Worker 2")
-      await reviewSelectedJobThroughRestartedWorker(pool!, redis, artifactOwner, artifactReviewTrace, workerTwo!)
+      await reviewSelectedJobThroughRestartedWorker(pool!, redis, artifactOwner, artifactReviewTrace, workerOne!, workerTwo!)
 
       const preFinalChildResult = await pool!.query<{ status: string; role: string; result: RecordValue | null; context: RecordValue | null }>(
         "SELECT \"status\", \"role\", \"result\", \"context\" FROM \"sub_agent_tasks\" WHERE \"id\" = $1 AND \"sessionId\" = $2 AND \"turnId\" = $3 AND \"rootTaskId\" = $4 AND \"parentTaskId\" = $4",

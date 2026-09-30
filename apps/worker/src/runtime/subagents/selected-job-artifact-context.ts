@@ -7,13 +7,17 @@ import type { SelectedJobPreparationContext } from "../tools/types.js"
 import { hashArtifactContent } from "./artifact-adapters.js"
 
 export type CoverLetterBaseReference = Readonly<{ artifactId: string; baseHash: string }>
+export type SelectedJobArtifactContextBundle = Readonly<{
+  preparation: SelectedJobPreparationContext
+  transientSources: readonly ArtifactSourceMaterial[]
+}>
 
 /** Re-load the selected job and approved profile sources under the current Worker tenant fence. */
 export async function loadSelectedJobArtifactContext(
   pool: Pick<pg.Pool, "query">,
   userId: string,
   jobId: string,
-): Promise<SelectedJobPreparationContext> {
+): Promise<SelectedJobArtifactContextBundle> {
   if (!userId.trim() || !jobId.trim()) throw new Error("selected_job_scope_invalid")
   const source = createPostgresReadToolDataSource(pool as pg.Pool)
   const job = await source.getJob(userId, jobId)
@@ -33,7 +37,10 @@ export async function loadSelectedJobArtifactContext(
       content: { id: fact.id, key: fact.key, value: fact.value, confidence: fact.confidence },
     })),
   ]
-  return createSelectedJobPreparation(jobId, materials)
+  return {
+    preparation: createSelectedJobPreparation(job.id, materials),
+    transientSources: materials,
+  }
 }
 
 /** Resolve or create one immutable, content-free base for the selected job. */

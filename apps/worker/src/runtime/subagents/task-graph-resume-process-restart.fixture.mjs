@@ -64,11 +64,11 @@ function record(value) { return value && typeof value === "object" && !Array.isA
 function assertNoPrivateArtifactFixtureData(value, serializedValue = rawIds) {
   const serialized = typeof serializedValue === "string" ? serializedValue : ""
   if (/(?:^|[,{])\s*"(?:body|draftBody|artifactRef|artifactReference)"\s*:/i.test(serialized)
-    || serialized.includes("AC6_PRIVATE_COVER_LETTER_")) {
+    || /AC6_(?:PRIVATE_COVER_LETTER_|TRANSIENT_(?:JOB|RESUME|PERSONA)_SOURCE_)/.test(serialized)) {
     throw new Error("p3_second_worker_fixture_input_contains_private_artifact_data")
   }
   const visit = current => {
-    if (typeof current === "string") return current.includes("AC6_PRIVATE_COVER_LETTER_")
+    if (typeof current === "string") return /AC6_(?:PRIVATE_COVER_LETTER_|TRANSIENT_(?:JOB|RESUME|PERSONA)_SOURCE_)/.test(current)
     if (Array.isArray(current)) return current.some(visit)
     const row = record(current)
     if (!row) return false
@@ -88,6 +88,9 @@ function assertPrivateArtifactFixtureGuardSelfTest() {
     { value: { fixturePayload: { draft_body: "AC6_PRIVATE_COVER_LETTER_fixture" } } },
     { value: { nested: { safe: true } }, serialized: '{"nested":{"body":"AC6_PRIVATE_COVER_LETTER_fixture"},"nested":{"safe":true}}' },
     { value: { nested: { privateText: "AC6_PRIVATE_COVER_LETTER_fixture" } } },
+    { value: { selectedJob: { source: "AC6_TRANSIENT_JOB_SOURCE_W2_fixture" } } },
+    { value: { selectedJob: { source: "AC6_TRANSIENT_RESUME_SOURCE_W2_fixture" } } },
+    { value: { selectedJob: { source: "AC6_TRANSIENT_PERSONA_SOURCE_W2_fixture" } } },
   ]
   for (const item of rejectedInputs) {
     let rejected = false
@@ -565,7 +568,7 @@ function modelProfile() {
     continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false, supportsReasoningSummary: false,
     supportsResponseContinuation: false, supportsProviderConversation: false, supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low" }
 }
-function selectedJobDraftModel(selected, task) {
+function selectedJobDraftModel(selected, task, observations) {
   const callId = `ac6-selected-job-draft-receipt:attempt:${task.attemptCount}`
   const baseArtifactId = `cover-letter-base:${hashArtifactContent({ userId: selected.userId, jobId: selected.jobId }).slice(7)}`
   const baseHash = hashArtifactContent({ kind: "cover_letter_base", jobId: selected.jobId })
@@ -575,6 +578,7 @@ function selectedJobDraftModel(selected, task) {
     async *stream(request) {
       rounds++
       if (rounds === 1) {
+        observeSelectedJobSourceCanaries(request, selected, 1, observations)
         yield { type: "tool_call_completed", callId, name: "cover_letter.draft", arguments: {
           baseArtifactId, baseHash, content: selected.body, constraints: { maxWords: 160 },
         } }
@@ -589,6 +593,36 @@ function selectedJobDraftModel(selected, task) {
       }) }
       yield { type: "completed", finishReason: "stop" }
     },
+  }
+}
+function selectedJobSourceCanaries(selected, worker) {
+  const suffix = typeof selected.jobId === "string" && selected.jobId.startsWith("p3-selected-job-")
+    ? selected.jobId.slice("p3-selected-job-".length) : ""
+  if (!suffix) throw new Error("p3_selected_job_source_canary_unavailable")
+  return {
+    job: `AC6_TRANSIENT_JOB_SOURCE_W${worker}_${suffix}`,
+    resume: `AC6_TRANSIENT_RESUME_SOURCE_W${worker}_${suffix}`,
+    persona: `AC6_TRANSIENT_PERSONA_SOURCE_W${worker}_${suffix}`,
+  }
+}
+function observeSelectedJobSourceCanaries(request, selected, worker, observations) {
+  const requestText = JSON.stringify(request)
+  const current = selectedJobSourceCanaries(selected, worker)
+  const sourceCanariesReloaded = {
+    job: requestText.includes(current.job),
+    resume: requestText.includes(current.resume),
+    persona: requestText.includes(current.persona),
+  }
+  observations.sourceCanariesReloaded = sourceCanariesReloaded
+  const old = worker === 2 ? selectedJobSourceCanaries(selected, 1) : null
+  if (old) observations.previousSourceCanariesAbsent = {
+    job: !requestText.includes(old.job),
+    resume: !requestText.includes(old.resume),
+    persona: !requestText.includes(old.persona),
+  }
+  if (Object.values(sourceCanariesReloaded).some(value => !value)
+    || (old && Object.values(observations.previousSourceCanariesAbsent).some(value => !value))) {
+    throw new Error("p3_selected_job_transient_source_canaries_invalid")
   }
 }
 function selectedJobReviewerModel(selected, task, observations) {
@@ -608,6 +642,7 @@ function selectedJobReviewerModel(selected, task, observations) {
     async *stream(request) {
       rounds++
       if (rounds === 1) {
+        observeSelectedJobSourceCanaries(request, selected, 2, observations)
         observations.advertisedTools = request.tools.map(tool => record(tool)?.name).filter(name => typeof name === "string")
         // Audit every model-visible request field, while excluding the opaque AbortSignal.
         const modelVisibleRequest = Object.fromEntries(Object.entries(request).filter(([key]) => key !== "signal"))
@@ -696,7 +731,7 @@ async function startSelectedJobQueueWorker(runtime) {
         pool,
         authorizeUsage: async () => ({ settle: async () => undefined }),
         modelRuntimeFactory: ({ task }) => {
-          if (task.role === "writer") return selectedJobDraftModel(selected, task)
+          if (task.role === "writer") return selectedJobDraftModel(selected, task, observations)
           if (task.role === "reviewer") return selectedJobReviewerModel(selected, task, observations)
           throw new Error("p3_unexpected_selected_job_child_role")
         },
