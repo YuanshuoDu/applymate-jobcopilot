@@ -2,13 +2,23 @@ import { describe, expect, it } from "vitest"
 import type { Pool } from "pg"
 import { hashArtifactContent } from "../subagents/artifact-adapters.js"
 import { PgArtifactToolStore } from "./artifact-store-pg.js"
-import { createSelectedJobPreparation, type ArtifactToolScope } from "./artifact-tools.js"
+import { createArtifactTools, createSelectedJobPreparation, type ArtifactToolExecutionContext, type ArtifactToolScope } from "./artifact-tools.js"
 
 const prep = createSelectedJobPreparation("job-a", [{ sourceRef: "resume:r-1", content: { skills: ["TypeScript"] } }])
 function scopeFor(taskId = "task-a", toolCallId = "call-a"): ArtifactToolScope {
   return { userId: "user-a", sessionId: "session-a", taskId, toolCallId, taskFence: { taskId, userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "root-a", parentTaskId: "root-a", leaseOwner: "worker-a", attemptCount: 1 }, ...prep }
 }
 const scope = scopeFor()
+
+function executionContext(taskId = "task-a", toolCallId = "call-a", leaseOwner = "worker-a", attemptCount = 1): ArtifactToolExecutionContext {
+  const scoped = scopeFor(taskId, toolCallId)
+  return {
+    scope: { userId: scoped.userId }, sessionId: scoped.sessionId, turnId: "turn-a", stepId: "step-a", taskId,
+    rootTaskId: "root-a", toolCallId, selectedJobPreparation: prep,
+    taskFence: { ...scoped.taskFence, leaseOwner, attemptCount }, signal: new AbortController().signal,
+    capabilities: [], reportProgress: async () => undefined,
+  }
+}
 
 describe("PgArtifactToolStore immutable persistence", () => {
   it("persists, reads exact versions and reviews across store instances", async () => {
@@ -32,6 +42,32 @@ describe("PgArtifactToolStore immutable persistence", () => {
     await expect(store.writeDraft(scope, input)).resolves.toEqual(first)
     await expect(store.writeDraft(scope, { ...input, content: "changed", requestHash: hashArtifactContent("changed") })).rejects.toMatchObject({ code: "receipt_conflict" })
     expect((await store.listForUser(scope.userId, scope.jobId)).find(row => row.lifecycle === "draft")).toMatchObject({ version: 1, hash: first.contentHash })
+  })
+
+  it("replays draft and review receipts through the PG store after a live lease reclaim", async () => {
+    const pool = new FakeArtifactPool()
+    const store = new PgArtifactToolStore(pool as unknown as Pool)
+    const base = await store.registerBase({ id: "base-a", type: "cover_letter", userId: scope.userId, jobId: scope.jobId, content: "base" })
+    const draftTool = createArtifactTools(store).find(definition => definition.name === "cover_letter.draft")!
+    const draftInput = { baseArtifactId: base.id, baseHash: base.hash, content: "draft", constraints: { maxWords: 300 } }
+    const draft = await draftTool.execute(executionContext(), draftInput)
+
+    pool.fence.leaseOwner = "worker-b"
+    pool.fence.attemptCount = 2
+    const retriedDraft = await draftTool.execute(executionContext("task-a", "call-a", "worker-b", 2), draftInput)
+    expect(retriedDraft).toEqual(draft)
+
+    pool.fence.leaseOwner = "worker-a"
+    pool.fence.attemptCount = 1
+    const reviewTool = createArtifactTools(store).find(definition => definition.name === "artifact.review")!
+    const reviewContext = executionContext("task-a", "review-call")
+    const reviewInput = { artifactRef: (draft as { artifactRef: { artifactId: string; version: number; contentHash: string; sourceDigest: string } }).artifactRef, decision: "passed", findings: [] }
+    const review = await reviewTool.execute(reviewContext, reviewInput)
+
+    pool.fence.leaseOwner = "worker-b"
+    pool.fence.attemptCount = 2
+    const retriedReview = await reviewTool.execute(executionContext("task-a", "review-call", "worker-b", 2), reviewInput)
+    expect(retriedReview).toEqual(review)
   })
 
   it("denies draft and review receipt replays after a task Stop request", async () => {

@@ -36,6 +36,29 @@ describe("immutable selected-job artifact tools", () => {
     await expect(writer.execute(context({ toolCallId: "call-a" }), draftInput(baseRow.id, baseRow.hash, "different retry"))).rejects.toMatchObject({ code: "receipt_conflict" })
   })
 
+  it("replays draft and review receipts after a task lease is reclaimed", async () => {
+    const store = new InMemoryArtifactToolStore()
+    const baseRow = base(store)
+    const draftTool = tool(store, "cover_letter.draft")
+    const draftContext = context()
+    const draftInputValue = draftInput(baseRow.id, baseRow.hash)
+    const draft = await draftTool.execute(draftContext, draftInputValue)
+    const retryDraftContext = context({ taskFence: { ...draftContext.taskFence!, leaseOwner: "worker-b", attemptCount: 2 } })
+
+    await expect(draftTool.execute(retryDraftContext, draftInputValue)).resolves.toEqual(draft)
+
+    const reviewTool = tool(store, "artifact.review")
+    const reviewContext = context({ taskId: "review-task", toolCallId: "review-call" })
+    const reviewInput = { artifactRef: (draft as { artifactRef: ArtifactVersionRef }).artifactRef, decision: "passed", findings: [] }
+    const review = await reviewTool.execute(reviewContext, reviewInput)
+    const retryReviewContext = context({
+      taskId: "review-task", toolCallId: "review-call",
+      taskFence: { ...reviewContext.taskFence!, leaseOwner: "worker-b", attemptCount: 2 },
+    })
+
+    await expect(reviewTool.execute(retryReviewContext, reviewInput)).resolves.toEqual(review)
+  })
+
   it("keeps old version content immutable when a new task creates the next version", async () => {
     const store = new InMemoryArtifactToolStore()
     const baseRow = base(store)

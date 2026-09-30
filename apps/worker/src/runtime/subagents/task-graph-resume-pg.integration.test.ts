@@ -21,7 +21,7 @@ import type { AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
 import { createArtifactToolStore } from "../tools/artifact-tools.js"
 import { childContextSnapshot, createChildContextBuilder } from "./child-context.js"
 import { hashArtifactContent } from "./artifact-adapters.js"
-import { loadSelectedJobArtifactContext } from "./selected-job-artifact-context.js"
+import { loadSelectedJobArtifactContext, resolveCoverLetterBase } from "./selected-job-artifact-context.js"
 import { materializeTaskGraphDependencyContext } from "./task-graph-dependency-context.js"
 import { executionOwnerFence } from "../execution-owner.js"
 import { PgCoordinationStore } from "../mailbox/store.js"
@@ -1084,6 +1084,7 @@ type SelectedJobArtifactRestartTrace = SelectedJobArtifactRestartPlan & {
   readonly writerOwnerId: string
   readonly writerAttemptCount: number
   readonly writerDraftCallId: string
+  readonly writerRequestHash: string
   readonly writerFence: AgentArtifactTaskFence
   readonly artifactRef: SelectedJobArtifactReference
 }
@@ -1112,6 +1113,28 @@ function selectedJobTaskFence(task: SubagentTaskRecord, leaseOwner: string, atte
     taskId: task.id, userId: task.userId, sessionId: task.sessionId, turnId: task.turnId,
     rootTaskId: task.rootTaskId, parentTaskId: task.parentTaskId, leaseOwner, attemptCount,
   }
+}
+
+function selectedJobTaskReceiptRequestHash(
+  op: string,
+  scope: {
+    readonly taskFence: AgentArtifactTaskFence
+    readonly [key: string]: unknown
+  },
+  input: unknown,
+): string {
+  const { taskFence, ...stableScope } = scope
+  return hashArtifactContent({
+    op, ...stableScope,
+    turnId: taskFence.turnId, rootTaskId: taskFence.rootTaskId, parentTaskId: taskFence.parentTaskId, input,
+  })
+}
+
+function selectedJobDraftRequestHash(
+  scope: { readonly taskFence: AgentArtifactTaskFence; readonly [key: string]: unknown },
+  input: unknown,
+): string {
+  return selectedJobTaskReceiptRequestHash("cover_letter.draft", scope, input)
 }
 
 async function createSelectedJobTaskGraph(
@@ -1172,13 +1195,31 @@ async function traceSelectedJobWriterFromWorker(
   }
   const writerAttemptCount = Number(settlement.attemptCount)
   const writerDraftCallId = selectedJobDraftCallId(writerAttemptCount)
+  const draftInput = {
+    baseArtifactId: `cover-letter-base:${hashArtifactContent({ userId: plan.writerTask.userId, jobId: plan.jobId }).slice(7)}`,
+    baseHash: hashArtifactContent({ kind: "cover_letter_base", jobId: plan.jobId }),
+    content: plan.body,
+    constraints: { maxWords: 160 },
+  }
+  const writerFence = selectedJobTaskFence(plan.writerTask, settlement.ownerId, writerAttemptCount)
+  const writerScope = {
+    ...plan.originalPreparation.preparation,
+    userId: plan.writerTask.userId,
+    sessionId: plan.writerTask.sessionId,
+    taskId: plan.writerTask.id,
+    toolCallId: writerDraftCallId,
+    taskFence: writerFence,
+  }
+  const writerRequestHash = selectedJobDraftRequestHash(writerScope, draftInput)
   const artifactRef = selectedJobArtifactReference(settlement.artifactRef)
   expect(artifactRef.version).toBe(1)
   expect(artifactRef.sourceDigest).toBe(plan.originalPreparation.preparation.sourceDigest)
-  const writerFence = selectedJobTaskFence(plan.writerTask, settlement.ownerId, writerAttemptCount)
   const version = await plan.store.get(plan.writerTask.id, plan.writerTask.sessionId)
   expect(version).toMatchObject({ status: "completed", role: "writer", attemptCount: writerAttemptCount })
-  return { ...plan, writerOwnerId: settlement.ownerId, writerAttemptCount, writerDraftCallId, writerFence, artifactRef }
+  return {
+    ...plan, writerOwnerId: settlement.ownerId, writerAttemptCount, writerDraftCallId,
+    writerRequestHash, writerFence, artifactRef,
+  }
 }
 
 async function enqueueSelectedJobTask(
@@ -1202,35 +1243,15 @@ async function prepareSelectedJobReviewAfterRestart(
   trace: SelectedJobArtifactRestartTrace,
 ): Promise<SelectedJobArtifactReviewTrace> {
   const artifactStore = createArtifactToolStore(pool)
-  const originalDraftInput = {
-    baseArtifactId: `cover-letter-base:${hashArtifactContent({ userId: value.userId, jobId: trace.jobId }).slice(7)}`,
-    baseHash: hashArtifactContent({ kind: "cover_letter_base", jobId: trace.jobId }),
-    content: trace.body,
-    constraints: { maxWords: 160 },
-  }
-  const originalDraftScope = {
-    ...trace.originalPreparation.preparation, userId: value.userId, sessionId: value.sessionId,
-    taskId: trace.writerTask.id, toolCallId: trace.writerDraftCallId, taskFence: trace.writerFence,
-  }
-  const requestHash = hashArtifactContent({ op: "cover_letter.draft", ...originalDraftScope, input: originalDraftInput })
   const durableVersion = await artifactStore.readVersion({ userId: value.userId, sessionId: value.sessionId, jobId: trace.jobId }, trace.artifactRef)
-  expect(durableVersion).toMatchObject({ version: 1, content: trace.body, contentHash: trace.artifactRef.contentHash })
-  await expect(artifactStore.writeDraft(originalDraftScope, { ...originalDraftInput, requestHash }))
-    .resolves.toMatchObject({ artifactId: trace.artifactRef.artifactId, version: 1, contentHash: trace.artifactRef.contentHash })
-  const conflictInput = { ...originalDraftInput, content: `${trace.body}_conflict` }
-  const conflictHash = hashArtifactContent({ op: "cover_letter.draft", ...originalDraftScope, input: conflictInput })
-  await expect(artifactStore.writeDraft(originalDraftScope, { ...conflictInput, requestHash: conflictHash }))
-    .rejects.toMatchObject({ code: "receipt_conflict" })
-  const staleAttemptScope = {
-    ...originalDraftScope, toolCallId: `${SELECTED_JOB_DRAFT_CALL_ID}:lost-attempt:${value.suffix}`,
-  }
-  const staleAttemptHash = hashArtifactContent({ op: "cover_letter.draft", ...staleAttemptScope, input: originalDraftInput })
-  await expect(artifactStore.writeDraft(staleAttemptScope, { ...originalDraftInput, requestHash: staleAttemptHash }))
-    .rejects.toMatchObject({ code: "task_fence_denied" })
-  const countAfterLostAttempt = await pool.query<{ count: number }>(
-    `SELECT COUNT(*)::int AS "count" FROM "agent_artifact_version" WHERE "taskId" = $1`, [trace.writerTask.id],
-  )
-  expect(countAfterLostAttempt.rows[0]?.count).toBe(1)
+  expect(durableVersion).toMatchObject({
+    version: 1, content: trace.body, contentHash: trace.artifactRef.contentHash,
+    userId: value.userId, sessionId: value.sessionId, jobId: trace.jobId,
+    sourceDigest: trace.originalPreparation.preparation.sourceDigest,
+    provenanceRefs: trace.originalPreparation.preparation.evidenceRefs,
+    evidenceRefs: trace.originalPreparation.preparation.evidenceRefs,
+    taskId: trace.writerTask.id, toolCallId: trace.writerDraftCallId, requestHash: trace.writerRequestHash,
+  })
 
   const completedWriter = await trace.store.get(trace.writerTask.id, value.sessionId)
   expect(completedWriter).toMatchObject({ status: "completed", role: "writer", rootTaskId: trace.rootTaskId, parentTaskId: trace.rootTaskId })
@@ -1317,15 +1338,33 @@ async function reviewSelectedJobThroughRestartedWorker(
   const reviewAttempt = Number(reviewSettlement.attemptCount)
   const readCallId = `${SELECTED_JOB_REVIEW_READ_CALL_ID}:attempt:${reviewAttempt}`
   const reviewCallId = `${SELECTED_JOB_REVIEW_CALL_ID}:attempt:${reviewAttempt}`
+  if (typeof reviewSettlement.ownerId !== "string") throw new Error("Selected-job reviewer did not report its lease owner")
+  const reviewInput = { artifactRef: trace.artifactRef, decision: "passed", findings: [] }
+  const reviewScope = {
+    ...trace.currentPreparation.preparation,
+    userId: value.userId, sessionId: value.sessionId, taskId: trace.reviewerTask.id,
+    toolCallId: reviewCallId,
+    taskFence: selectedJobTaskFence(trace.reviewerTask, reviewSettlement.ownerId, reviewAttempt),
+  }
+  const expectedReviewRequestHash = selectedJobTaskReceiptRequestHash("artifact.review", reviewScope, reviewInput)
   const persistedReview = await pool.query<{
-    status: string; sourceDigest: string; currentSourceDigest: string; findings: unknown; reviewHash: string
-  }>(`SELECT "status", "sourceDigest", "currentSourceDigest", "findings", "reviewHash" FROM "agent_artifact_review"
+    userId: string; sessionId: string; jobId: string; artifactId: string; version: number; contentHash: string;
+    sourceDigest: string; currentSourceDigest: string; status: string; findings: unknown; evidenceRefs: unknown;
+    taskId: string; toolCallId: string; requestHash: string; reviewHash: string
+  }>(`SELECT "userId", "sessionId", "jobId", "artifactId", "version", "contentHash", "sourceDigest", "currentSourceDigest",
+      "status", "findings", "evidenceRefs", "taskId", "toolCallId", "requestHash", "reviewHash" FROM "agent_artifact_review"
       WHERE "taskId" = $1 AND "toolCallId" = $2`, [trace.reviewerTask.id, reviewCallId])
   expect(persistedReview.rows).toHaveLength(1)
   expect(persistedReview.rows[0]).toMatchObject({
+    userId: value.userId, sessionId: value.sessionId, jobId: trace.jobId,
+    artifactId: trace.artifactRef.artifactId, version: trace.artifactRef.version,
+    contentHash: trace.artifactRef.contentHash,
     status: "stale", sourceDigest: trace.artifactRef.sourceDigest,
-    currentSourceDigest: trace.currentPreparation.preparation.sourceDigest, findings: [],
+    currentSourceDigest: trace.currentPreparation.preparation.sourceDigest,
+    findings: [], evidenceRefs: [], taskId: trace.reviewerTask.id, toolCallId: reviewCallId,
+    requestHash: expectedReviewRequestHash,
   })
+  expect(persistedReview.rows[0]?.sourceDigest).not.toBe(persistedReview.rows[0]?.currentSourceDigest)
   expect(reviewSettlement.reviewHash).toBe(persistedReview.rows[0]?.reviewHash)
 
   const wrongUserRead = await artifactStore.readVersion({
@@ -1334,10 +1373,24 @@ async function reviewSelectedJobThroughRestartedWorker(
   const wrongJobRead = await artifactStore.readVersion({
     userId: value.userId, sessionId: value.sessionId, jobId: trace.otherJobId,
   }, trace.artifactRef)
+  const wrongSessionRead = await artifactStore.readVersion({
+    userId: value.userId, sessionId: `foreign-session-${value.suffix}`, jobId: trace.jobId,
+  }, trace.artifactRef)
   expect(wrongUserRead).toBeNull()
   expect(wrongJobRead).toBeNull()
-  expect(await artifactStore.findReview({ userId: value.userId, sessionId: value.sessionId, jobId: trace.jobId }, trace.artifactRef))
-    .toMatchObject({ status: "stale", taskId: trace.reviewerTask.id, toolCallId: reviewCallId })
+  expect(wrongSessionRead).toBeNull()
+  const reviewRef = trace.artifactRef
+  const scopedReview = await artifactStore.findReview({ userId: value.userId, sessionId: value.sessionId, jobId: trace.jobId }, reviewRef)
+  expect(scopedReview).toMatchObject({ status: "stale", taskId: trace.reviewerTask.id, toolCallId: reviewCallId })
+  await expect(artifactStore.findReview({
+    userId: `foreign-user-${value.suffix}`, sessionId: value.sessionId, jobId: trace.jobId,
+  }, reviewRef)).resolves.toBeNull()
+  await expect(artifactStore.findReview({
+    userId: value.userId, sessionId: `foreign-session-${value.suffix}`, jobId: trace.jobId,
+  }, reviewRef)).resolves.toBeNull()
+  await expect(artifactStore.findReview({
+    userId: value.userId, sessionId: value.sessionId, jobId: trace.otherJobId,
+  }, reviewRef)).resolves.toBeNull()
 
   await enqueueSelectedJobTask(trace.queueName, connection, trace.stopReviewerTask, `ac6-stop-reviewer-worker-two-${value.suffix}`)
   await waitForProcessLine(worker, `P3_SELECTED_JOB_STOP_REVIEW_READY ${trace.stopReviewerTask.id}`, 30_000)
@@ -1402,6 +1455,7 @@ async function reviewSelectedJobThroughRestartedWorker(
   const sourceCanaries = [...selectedJobSourceCanaries(trace.jobId, 1), ...selectedJobSourceCanaries(trace.jobId, 2)]
   for (const canary of sourceCanaries) expect(publicPersistence).not.toContain(canary)
   const processLogs = [...firstWorker.output, ...firstWorker.errors, ...worker.output, ...worker.errors].join("\n")
+  expect(processLogs).not.toContain(trace.body)
   for (const canary of sourceCanaries) expect(processLogs).not.toContain(canary)
   const draftReceipts = persistedItems.rows.flatMap(row => rowsForToolCall(row.content, trace.writerDraftCallId))
     .filter(row => Object.prototype.hasOwnProperty.call(row, "output"))
@@ -3555,6 +3609,107 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     if (cleanupFailures.length > 0) throw new Error("TaskGraph integration cleanup failed:\n" + cleanupFailures.join("\n"))
   })
 
+  it("replays one selected-job draft receipt under a reclaimed lease without duplicating its version", async () => {
+    const value = fixture()
+    let userSeeded = false
+    try {
+      await seed(pool!, value, "waiting_for_user")
+      userSeeded = true
+      const sources = await seedSelectedJobSources(pool!, value)
+      const plan = await createSelectedJobTaskGraph(pool!, value, sources, `agent-subagents-ac6-receipt-${value.suffix}`)
+      const firstOwner = `ac6-receipt-owner-one-${value.suffix}`
+      const secondOwner = `ac6-receipt-owner-two-${value.suffix}`
+      const firstLease = await plan.store.claim({
+        taskId: plan.writerTask.id, sessionId: value.sessionId, ownerId: firstOwner,
+        policy: defaultSubagentPolicy(), now: new Date(),
+      })
+      if (!firstLease?.leaseOwner) throw new Error("Selected-job receipt task did not acquire its first disposable lease")
+      expect(firstLease).toMatchObject({ status: "running", leaseOwner: firstOwner, attemptCount: 1 })
+
+      const toolCallId = SELECTED_JOB_DRAFT_CALL_ID
+      const input = {
+        baseArtifactId: `cover-letter-base:${hashArtifactContent({ userId: value.userId, jobId: sources.jobId }).slice(7)}`,
+        baseHash: hashArtifactContent({ kind: "cover_letter_base", jobId: sources.jobId }),
+        content: `AC6_PRIVATE_COVER_LETTER_${value.suffix}`,
+        constraints: { maxWords: 160 },
+      }
+      const artifactStore = createArtifactToolStore(pool!)
+      const base = await resolveCoverLetterBase(artifactStore, value.userId, sources.jobId)
+      expect(base).toMatchObject({ artifactId: input.baseArtifactId, baseHash: input.baseHash })
+      const originalScope = {
+        ...plan.originalPreparation.preparation,
+        userId: value.userId,
+        sessionId: value.sessionId,
+        taskId: firstLease.id,
+        toolCallId,
+        taskFence: selectedJobTaskFence(firstLease, firstOwner, firstLease.attemptCount),
+      }
+      const requestHash = selectedJobDraftRequestHash(originalScope, input)
+      const committed = await artifactStore.writeDraft(originalScope, { ...input, requestHash })
+      expect(committed).toMatchObject({
+        version: 1, userId: value.userId, sessionId: value.sessionId, jobId: sources.jobId,
+        sourceDigest: plan.originalPreparation.preparation.sourceDigest,
+        provenanceRefs: plan.originalPreparation.preparation.evidenceRefs,
+        evidenceRefs: plan.originalPreparation.preparation.evidenceRefs,
+        taskId: firstLease.id, toolCallId, requestHash,
+      })
+
+      const expired = await pool!.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = CURRENT_TIMESTAMP - INTERVAL '1 second'
+        WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4
+          AND "status" = 'running' AND "leaseOwner" = $5 AND "attemptCount" = $6`, [
+        firstLease.id, value.sessionId, value.turnId, plan.rootTaskId, firstOwner, firstLease.attemptCount,
+      ])
+      expect(expired.rowCount).toBe(1)
+      // Model the recovered task's new live lease on this fixture-owned row. The Worker restart trace separately exercises production recovery and claim.
+      const reclaimed = await pool!.query(`UPDATE "sub_agent_tasks" SET "status" = 'running', "leaseOwner" = $5,
+          "attemptCount" = "attemptCount" + 1, "leaseExpiresAt" = CURRENT_TIMESTAMP + INTERVAL '1 minute',
+          "nextAttemptAt" = NULL, "updatedAt" = CURRENT_TIMESTAMP
+        WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4
+          AND "status" = 'running' AND "leaseOwner" = $6 AND "attemptCount" = $7
+          AND "leaseExpiresAt" <= CURRENT_TIMESTAMP`, [
+        firstLease.id, value.sessionId, value.turnId, plan.rootTaskId, secondOwner, firstOwner, firstLease.attemptCount,
+      ])
+      expect(reclaimed.rowCount).toBe(1)
+      const secondLease = await plan.store.get(firstLease.id, value.sessionId)
+      if (!secondLease?.leaseOwner) throw new Error("Selected-job receipt task did not receive its modeled reclaimed lease")
+      expect(secondLease).toMatchObject({ status: "running", leaseOwner: secondOwner, attemptCount: 2 })
+
+      await expect(artifactStore.writeDraft(originalScope, { ...input, requestHash }))
+        .rejects.toMatchObject({ code: "task_fence_denied" })
+      const reclaimedScope = {
+        ...originalScope,
+        taskFence: selectedJobTaskFence(secondLease, secondOwner, secondLease.attemptCount),
+      }
+      const [firstReplay, secondReplay] = await Promise.all([
+        artifactStore.writeDraft(reclaimedScope, { ...input, requestHash }),
+        artifactStore.writeDraft(reclaimedScope, { ...input, requestHash }),
+      ])
+      expect(firstReplay).toEqual(committed)
+      expect(secondReplay).toEqual(committed)
+
+      const conflictingInput = { ...input, content: `${input.content}_conflict` }
+      const conflictingHash = selectedJobDraftRequestHash(reclaimedScope, conflictingInput)
+      await expect(artifactStore.writeDraft(reclaimedScope, { ...conflictingInput, requestHash: conflictingHash }))
+        .rejects.toMatchObject({ code: "receipt_conflict" })
+      const completed = await plan.store.finish({
+        taskId: secondLease.id, sessionId: value.sessionId, ownerId: secondOwner,
+        attemptCount: secondLease.attemptCount, status: "completed", result: { status: "completed" }, now: new Date(),
+      })
+      expect(completed).toBe("completed")
+      await expect(artifactStore.writeDraft(reclaimedScope, { ...input, requestHash }))
+        .rejects.toMatchObject({ code: "task_fence_denied" })
+      const versions = await pool!.query<{ count: number }>(
+        `SELECT COUNT(*)::int AS "count" FROM "agent_artifact_version" WHERE "taskId" = $1`, [firstLease.id],
+      )
+      expect(versions.rows[0]?.count).toBe(1)
+    } finally {
+      if (userSeeded) {
+        await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [value.sessionId])
+        await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
+      }
+    }
+  }, 30_000)
+
   it("plans, waits, promotes dependencies, resumes with bounded evidence, appends a follow-up plan, and resumes again", async () => {
     const [
       { createProductionWorkerBootstrap },
@@ -4121,8 +4276,16 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       )
       expect(writerVersion.rows).toHaveLength(1)
       expect(writerVersion.rows[0]).toMatchObject({
+        userId: artifactOwner.userId,
+        sessionId: artifactOwner.sessionId,
+        jobId: artifactPlan.jobId,
         version: 1, contentHash: artifactTrace.artifactRef.contentHash,
         sourceDigest: artifactTrace.artifactRef.sourceDigest, content: artifactTrace.body,
+        provenanceRefs: artifactPlan.originalPreparation.preparation.evidenceRefs,
+        evidenceRefs: artifactPlan.originalPreparation.preparation.evidenceRefs,
+        taskId: artifactPlan.writerTask.id,
+        toolCallId: artifactTrace.writerDraftCallId,
+        requestHash: artifactTrace.writerRequestHash,
       })
 
       const firstWorkerPid = workerOne.pid

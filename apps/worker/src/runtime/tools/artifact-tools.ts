@@ -109,6 +109,10 @@ function assertSafeReviewMetadata(value: unknown): asserts value is ArtifactTool
 function versionRef(row: AgentArtifactVersionRow): ArtifactVersionRef {
   return { artifactId: row.artifactId, version: row.version, contentHash: row.contentHash, sourceDigest: row.sourceDigest }
 }
+function taskReceiptRequestHash(op: string, scope: ArtifactToolScope, input: unknown): string {
+  const { taskFence, ...stableScope } = scope
+  return hashArtifactContent({ op, ...stableScope, turnId: taskFence.turnId, rootTaskId: taskFence.rootTaskId, parentTaskId: taskFence.parentTaskId, input })
+}
 
 function artifactId(userId: string, jobId: string): string { return `cover-letter:${hashArtifactContent({ userId, jobId }).slice(7)}` }
 
@@ -129,7 +133,7 @@ export function createArtifactTools(store: ArtifactToolStore): RuntimeToolDefini
         assertDraftConstraints(input.constraints)
         const base = await store.read(scope.userId, input.baseArtifactId)
         if (!base || base.jobId !== scope.jobId || base.type !== "cover_letter" || base.lifecycle !== "base" || base.hash !== input.baseHash) throw new ArtifactToolError("stale_hash", "Selected-job cover-letter base is stale or unavailable.")
-        const requestHash = hashArtifactContent({ op: "cover_letter.draft", ...scope, input })
+        const requestHash = taskReceiptRequestHash("cover_letter.draft", scope, input)
         const row = await store.writeDraft(scope, { ...input, requestHash })
         return { artifactRef: versionRef(row) }
       },
@@ -160,7 +164,7 @@ export function createArtifactTools(store: ArtifactToolStore): RuntimeToolDefini
         if (!stale && findings.some(item => item.artifactHash !== version.contentHash || item.evidence.some(evidence => evidence.artifactHash !== version.contentHash))) throw new ArtifactToolError("stale_hash", "Review findings must cite the exact artifact content hash.")
         const evidenceRefs = stale ? [] : [...scope.evidenceRefs]
         const reviewHash = hashArtifactContent({ artifactRef: input.artifactRef, currentSourceDigest: scope.sourceDigest, status, findings, evidenceRefs })
-        const requestHash = hashArtifactContent({ op: "artifact.review", ...scope, artifactRef: input.artifactRef, decision: input.decision, findings: input.findings })
+        const requestHash = taskReceiptRequestHash("artifact.review", scope, { artifactRef: input.artifactRef, decision: input.decision, findings: input.findings })
         const row = await store.saveReview({ userId: scope.userId, sessionId: scope.sessionId, jobId: scope.jobId, artifactId: version.artifactId, version: version.version, contentHash: version.contentHash, sourceDigest: version.sourceDigest, currentSourceDigest: scope.sourceDigest, status, findings, evidenceRefs, taskId: scope.taskId, toolCallId: scope.toolCallId, requestHash, reviewHash, taskFence: scope.taskFence })
         return { artifactRef: input.artifactRef, status: row.status, reviewHash: row.reviewHash }
       },
