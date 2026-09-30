@@ -6,6 +6,7 @@ import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.ts"
 import { ROLE_RESULT_SCHEMA } from "./role-results.ts"
 import { createProductionChildExecutor } from "./production-child-runtime.ts"
 import { hashArtifactContent } from "./artifact-adapters.ts"
+import { writerArtifactReferenceFromTaskContext } from "./task-graph-dependency-context.ts"
 import { parseSubagentJobPayload } from "./types.ts"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.ts"
 import { createProductionWorkerBootstrap } from "../../queue/production-bootstrap.ts"
@@ -556,8 +557,8 @@ function selectedJobDraftModel(selected, task) {
   }
 }
 function selectedJobReviewerModel(selected, task, observations) {
-  const artifactRef = record(selected.artifactRef)
-  if (!artifactRef) throw new Error("p3_selected_job_artifact_reference_missing")
+  const artifactRef = writerArtifactReferenceFromTaskContext(task.context, selected.jobId)
+  observations.writerReceiptReferenceRecovered = true
   const readCallId = `ac6-selected-job-review-read:attempt:${task.attemptCount}`
   const reviewCallId = `ac6-selected-job-review-receipt:attempt:${task.attemptCount}`
   const stopBeforeReview = task.id === selected.stopReviewerTaskId

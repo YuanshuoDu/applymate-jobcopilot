@@ -1254,6 +1254,13 @@ async function prepareSelectedJobReviewAfterRestart(
     const items = Array.isArray(dependency?.items) ? dependency.items.map(record).filter((item): item is RecordValue => item !== null) : []
     expect(items).toHaveLength(1)
     expect(items[0]).toMatchObject({ dependencyKey: "writer", taskId: completedWriter.id, role: "writer", taskStatus: "completed" })
+    expect(items[0]).toMatchObject({
+      result: {
+        schemaVersion: "agent-harness.v2.task-graph.result-projection",
+        trust: "untrusted", availability: "available", role: "writer", status: "completed",
+        artifactRef: trace.artifactRef,
+      },
+    })
   }
   return { ...trace, currentPreparation, reviewerTask, stopReviewerTask }
 }
@@ -1272,7 +1279,7 @@ async function reviewSelectedJobThroughRestartedWorker(
   expect(reviewSettlement).toMatchObject({
     role: "reviewer", taskId: trace.reviewerTask.id, managerStatus: "completed", childStatus: "completed",
     artifactRef: trace.artifactRef, reviewStatus: "stale",
-    observations: { sawBody: true, reviewStatus: "stale" },
+    observations: { sawBody: true, reviewStatus: "stale", writerReceiptReferenceRecovered: true },
   })
   const reviewAttempt = Number(reviewSettlement.attemptCount)
   const readCallId = `${SELECTED_JOB_REVIEW_READ_CALL_ID}:attempt:${reviewAttempt}`
@@ -4059,7 +4066,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           turnId: artifactOwner.turnId, rootTaskId: artifactReviewTrace.rootTaskId, jobId: artifactReviewTrace.jobId,
           body: artifactReviewTrace.body, writerTaskId: artifactReviewTrace.writerTask.id,
           reviewerTaskId: artifactReviewTrace.reviewerTask.id,
-          artifactRef: artifactReviewTrace.artifactRef, stopReviewerTaskId: artifactReviewTrace.stopReviewerTask.id,
+          stopReviewerTaskId: artifactReviewTrace.stopReviewerTask.id,
         },
       })
       expect(workerTwo.pid).not.toBe(firstWorkerPid)
