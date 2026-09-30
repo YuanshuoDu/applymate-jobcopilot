@@ -1434,7 +1434,8 @@ async function prepareSelectedJobReviewAfterRestart(
     const dependency = record(record(child.context)?.taskGraphDependencyResults)
     const items = Array.isArray(dependency?.items) ? dependency.items.map(record).filter((item): item is RecordValue => item !== null) : []
     expect(items).toHaveLength(1)
-    expect(items[0]).toMatchObject({ dependencyKey: "writer", taskId: completedWriter.id, role: "writer", taskStatus: "completed" })
+    expect(items[0]).toMatchObject({ dependencyKey: "writer", role: "writer", taskStatus: "completed" })
+    expect(items[0]).not.toHaveProperty("taskId")
     expect(items[0]).toMatchObject({
       result: {
         schemaVersion: "agent-harness.v2.task-graph.result-projection",
