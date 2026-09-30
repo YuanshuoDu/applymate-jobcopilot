@@ -68,13 +68,13 @@ describe('selected job draft artifact projection', () => {
   })
 
   it('accepts content only when every immutable reference field matches', () => {
-    const payload = { job: { company: 'N26', role: 'Engineer' }, artifact: { ...ref, content: { text: 'Draft body' }, provenanceRefs: ['persona:fact-1'], evidenceRefs: ['job:job-1'] }, review: { status: 'needs_revision', reviewHash: 'review-hash', evidenceRefs: ['resume:fact-2'], findings: [{ code: 'claim', severity: 'warning', message: 'Check this claim.', evidenceRefs: ['resume:fact-2'] }] }, sourceEvidence: currentSourceEvidence }
-    expect(parseDraftArtifactPayload(payload, ref)).toMatchObject({ artifact: { content: { text: 'Draft body' }, evidenceRefs: ['job:job-1'] }, review: { status: 'needs_revision' }, sourceEvidence: currentSourceEvidence })
+    const payload = { job: { company: 'N26', role: 'Engineer' }, isCurrentVersion: true, artifact: { ...ref, content: { text: 'Draft body' }, provenanceRefs: ['persona:fact-1'], evidenceRefs: ['job:job-1'] }, review: { status: 'needs_revision', reviewHash: 'review-hash', evidenceRefs: ['resume:fact-2'], findings: [{ code: 'claim', severity: 'warning', message: 'Check this claim.', evidenceRefs: ['resume:fact-2'] }] }, sourceEvidence: currentSourceEvidence }
+    expect(parseDraftArtifactPayload(payload, ref)).toMatchObject({ isCurrentVersion: true, artifact: { content: { text: 'Draft body' }, evidenceRefs: ['job:job-1'] }, review: { status: 'needs_revision' }, sourceEvidence: currentSourceEvidence })
     expect(parseDraftArtifactPayload({ ...payload, artifact: { ...payload.artifact, contentHash: `sha256:${'c'.repeat(64)}` } }, ref)).toBeNull()
   })
 
   it('drops source text whenever evidence is stale or unavailable', () => {
-    const payload = { job: { company: 'N26', role: 'Engineer' }, artifact: { ...ref, content: { text: 'Draft body' }, provenanceRefs: [], evidenceRefs: [] }, review: null }
+    const payload = { job: { company: 'N26', role: 'Engineer' }, isCurrentVersion: true, artifact: { ...ref, content: { text: 'Draft body' }, provenanceRefs: [], evidenceRefs: [] }, review: null }
     const stale = parseDraftArtifactPayload({ ...payload, sourceEvidence: { freshness: 'stale', items: [{ reference: 'job:old', kind: 'job', label: 'Old role', text: 'STALE_SOURCE_SECRET' }] } }, ref)
     const unavailable = parseDraftArtifactPayload({ ...payload, sourceEvidence: { freshness: 'unavailable', items: [{ reference: 'persona:private', kind: 'persona', label: 'Profile', text: 'UNAVAILABLE_SOURCE_SECRET' }] } }, ref)
 
@@ -83,8 +83,25 @@ describe('selected job draft artifact projection', () => {
     expect(JSON.stringify([stale, unavailable])).not.toMatch(/STALE_SOURCE_SECRET|UNAVAILABLE_SOURCE_SECRET/)
   })
 
+  it('keeps an older passed review from appearing current when the artifact head advanced', () => {
+    const historical = parseDraftArtifactPayload({
+      job: { company: 'N26', role: 'Engineer' },
+      isCurrentVersion: false,
+      artifact: { ...ref, content: { text: 'Historical v1 body' }, provenanceRefs: ['job:job-1'], evidenceRefs: ['job:job-1'] },
+      review: { status: 'passed', reviewHash: 'old-review', evidenceRefs: ['job:job-1'], findings: [{ code: 'old', severity: 'info', message: 'Old finding.', evidenceRefs: ['job:job-1'] }] },
+      sourceEvidence: currentSourceEvidence,
+    }, ref)
+
+    expect(historical).toMatchObject({
+      isCurrentVersion: false,
+      artifact: { content: { text: 'Historical v1 body' } },
+      review: { status: 'stale', evidenceRefs: [], findings: [] },
+      sourceEvidence: { freshness: 'stale', items: [] },
+    })
+  })
+
   it('rejects malformed and over-budget current source evidence', () => {
-    const payload = { job: { company: 'N26', role: 'Engineer' }, artifact: { ...ref, content: { text: 'Draft body' }, provenanceRefs: [], evidenceRefs: [] }, review: null, sourceEvidence: currentSourceEvidence }
+    const payload = { job: { company: 'N26', role: 'Engineer' }, isCurrentVersion: true, artifact: { ...ref, content: { text: 'Draft body' }, provenanceRefs: [], evidenceRefs: [] }, review: null, sourceEvidence: currentSourceEvidence }
     const tooMany = Array.from({ length: 9 }, (_, index) => ({ ...currentSourceEvidence.items[0], reference: `job:${index}` }))
     const tooMuchText = Array.from({ length: 6 }, (_, index) => ({ ...currentSourceEvidence.items[0], reference: `job:${index}`, text: 'x'.repeat(index === 5 ? 1 : 600) }))
 
@@ -97,6 +114,6 @@ describe('selected job draft artifact projection', () => {
   it('rejects malformed refs and never accepts draft text from arbitrary fields', () => {
     const activeGraph = { sessionId: 'session-1', graphItemId: 'graph-1', turnId: 'turn-1', rootTaskId: 'root-1', revision: 2 }
     expect(latestWriterArtifact('session-1', [task({ rootTaskId: 'root-1', artifactRef: { ...ref, userId: 'foreign' } })], activeGraph)).toBeNull()
-    expect(parseDraftArtifactPayload({ job: { company: 'N26', role: 'Engineer' }, artifact: { ...ref, content: { text: 'wrong' } }, content: { text: 'private' }, review: null, sourceEvidence: currentSourceEvidence }, { ...ref, version: 3 })).toBeNull()
+    expect(parseDraftArtifactPayload({ job: { company: 'N26', role: 'Engineer' }, isCurrentVersion: true, artifact: { ...ref, content: { text: 'wrong' } }, content: { text: 'private' }, review: null, sourceEvidence: currentSourceEvidence }, { ...ref, version: 3 })).toBeNull()
   })
 })

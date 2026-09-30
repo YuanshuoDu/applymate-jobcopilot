@@ -13,6 +13,20 @@ export type {
   AgentArtifactReviewWrite, AgentArtifactRow, AgentArtifactTaskFence, AgentArtifactVersionRow,
 } from "./agent-artifact-repo-helpers.js"
 
+export type AgentArtifactDraftHead = Readonly<{
+  artifactId: string
+  version: number
+  contentHash: string
+  sourceDigest: string
+}>
+
+export type AgentArtifactDraftHeadScope = Readonly<{
+  userId: string
+  sessionId: string
+  jobId: string
+  artifactId: string
+}>
+
 const columns = `"id", "userId", "jobId", "artifactType", "lifecycle", "baseId", "baseHash", "content", "hash", "constraintHash", "provenanceRefs", "evidenceRefs", "previousHash", "version", "createdAt", "updatedAt"`
 const versionColumns = `"id", "artifactId", "version", "userId", "sessionId", "jobId", "artifactType", "content", "contentHash", "sourceDigest", "constraintHash", "provenanceRefs", "evidenceRefs", "baseId", "baseHash", "previousHash", "taskId", "toolCallId", "requestHash", "createdAt"`
 const reviewColumns = `"id", "artifactVersionId", "userId", "sessionId", "jobId", "artifactId", "version", "contentHash", "sourceDigest", "currentSourceDigest", "status", "findings", "evidenceRefs", "taskId", "toolCallId", "requestHash", "reviewHash", "createdAt"`
@@ -137,6 +151,35 @@ export function createAgentArtifactRepository(pool: Pool) {
           [scope.userId, scope.sessionId, scope.jobId, scope.artifactId, scope.version],
         )
         return result.rows[0] ? toAgentArtifactVersionRow(result.rows[0]) : null
+      })
+    },
+
+    /** Reads only the current draft reference and requires its head version to belong to this session. */
+    async findCurrentDraftHead(scope: AgentArtifactDraftHeadScope): Promise<AgentArtifactDraftHead | null> {
+      if (![scope.userId, scope.sessionId, scope.jobId, scope.artifactId].every(value => typeof value === "string" && value.trim().length > 0)) return null
+      return withArtifactTransaction(pool, scope.userId, async client => {
+        const result = await client.query<Record<string, unknown>>(
+          `SELECT version_row."artifactId" AS "artifactId", version_row."version" AS "version",
+                  version_row."contentHash" AS "contentHash", version_row."sourceDigest" AS "sourceDigest"
+           FROM "agent_artifact" AS artifact
+           JOIN "agent_artifact_version" AS version_row
+             ON version_row."artifactId" = artifact."id"
+             AND version_row."version" = artifact."version"
+             AND version_row."userId" = artifact."userId"
+             AND version_row."jobId" = artifact."jobId"
+             AND version_row."artifactType" = artifact."artifactType"
+             AND version_row."contentHash" = artifact."hash"
+           WHERE artifact."id" = $1 AND artifact."userId" = $2 AND artifact."jobId" = $3
+             AND artifact."artifactType" = 'cover_letter' AND artifact."lifecycle" = 'draft'
+             AND version_row."sessionId" = $4 AND version_row."userId" = $2
+             AND version_row."jobId" = $3 AND version_row."artifactType" = 'cover_letter'`,
+          [scope.artifactId, scope.userId, scope.jobId, scope.sessionId],
+        )
+        if (result.rows.length !== 1) return null
+        const row = result.rows[0]
+        if (row?.artifactId !== scope.artifactId || !Number.isSafeInteger(row.version) || Number(row.version) < 1
+          || typeof row.contentHash !== "string" || typeof row.sourceDigest !== "string") return null
+        return { artifactId: row.artifactId, version: Number(row.version), contentHash: row.contentHash, sourceDigest: row.sourceDigest }
       })
     },
 

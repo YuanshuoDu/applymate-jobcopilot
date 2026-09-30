@@ -34,6 +34,51 @@ describe("agent artifact repository", () => {
     await expect(repository.find("user-a", "artifact-a")).resolves.toMatchObject(row)
   })
 
+  it("reads only a current draft head joined to the exact tenant, session, job, and artifact", async () => {
+    const canary = "PRIVATE_DRAFT_BODY_CANARY"
+    const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
+    const client = {
+      query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+        calls.push({ sql, values })
+        if (sql.includes('FROM "agent_artifact" AS artifact')) return { rows: [{
+          artifactId: "draft-a", version: 3, contentHash: `sha256:${"a".repeat(64)}`,
+          sourceDigest: `sha256:${"b".repeat(64)}`, content: canary,
+        }], rowCount: 1 }
+        return { rows: [], rowCount: 0 }
+      }),
+      release: vi.fn(),
+    }
+    const repository = createAgentArtifactRepository({ connect: vi.fn(async () => client) } as never)
+
+    const head = await repository.findCurrentDraftHead({ userId: "user-a", sessionId: "session-a", jobId: "job-a", artifactId: "draft-a" })
+    const read = calls.find(call => call.sql.includes('FROM "agent_artifact" AS artifact'))!
+
+    expect(head).toEqual({ artifactId: "draft-a", version: 3, contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: `sha256:${"b".repeat(64)}` })
+    expect(JSON.stringify(head)).not.toContain(canary)
+    expect(read.sql).toContain('artifact."lifecycle" = \'draft\'')
+    expect(read.sql).toContain('version_row."sessionId" = $4')
+    expect(read.sql).toContain('version_row."contentHash" = artifact."hash"')
+    expect(read.sql).not.toContain('artifact."content"')
+    expect(read.values).toEqual(["draft-a", "user-a", "job-a", "session-a"])
+  })
+
+  it("returns no current head when the exact session version is absent or ambiguous", async () => {
+    let rows: Record<string, unknown>[] = []
+    const client = {
+      query: vi.fn(async (sql: string) => sql.includes('FROM "agent_artifact" AS artifact') ? { rows, rowCount: rows.length } : { rows: [], rowCount: 0 }),
+      release: vi.fn(),
+    }
+    const repository = createAgentArtifactRepository({ connect: vi.fn(async () => client) } as never)
+    const scope = { userId: "user-a", sessionId: "session-a", jobId: "job-a", artifactId: "draft-a" }
+
+    await expect(repository.findCurrentDraftHead(scope)).resolves.toBeNull()
+    rows = [
+      { artifactId: "draft-a", version: 3, contentHash: "hash-a", sourceDigest: "source-a" },
+      { artifactId: "draft-a", version: 3, contentHash: "hash-a", sourceDigest: "source-a" },
+    ]
+    await expect(repository.findCurrentDraftHead(scope)).resolves.toBeNull()
+  })
+
   it("stores selected-job cover-letter text only in immutable versions", async () => {
     const body1 = "PRIVATE_DRAFT_BODY_ONE"
     const body2 = "PRIVATE_DRAFT_BODY_TWO"

@@ -80,7 +80,7 @@ function event(sessionId: string, turnId: string, id: string, sequence: string, 
   }
 }
 
-async function installSupervisorFixture(page: Page, selectedJobEnabled = false, selectedJobTurnGateRegression = false, selectedJobPendingWriter = false) {
+async function installSupervisorFixture(page: Page, selectedJobEnabled = false, selectedJobTurnGateRegression = false, selectedJobPendingWriter = false, selectedJobHistoricalArtifact = false) {
   const fixture = {
     aStreamCount: 0,
     eventSequence: 0,
@@ -220,6 +220,7 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false, 
         }
         return json(route, {
           job: { company: 'Northstar Robotics', role: 'Principal Engineer' },
+          isCurrentVersion: true,
           artifact: {
             artifactId: 'fixture-cover-letter-next', version: 1, contentHash: `sha256:${'c'.repeat(64)}`, sourceDigest: `sha256:${'d'.repeat(64)}`,
             content: { text: 'Second selected-job cover-letter fixture body.' }, provenanceRefs: ['persona:fixture-fact-next'], evidenceRefs: ['job:fixture-selected-job-next'],
@@ -238,6 +239,7 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false, 
       }
       return json(route, {
         job: { company: 'Fixture Systems', role: 'Systems Engineer' },
+        isCurrentVersion: !selectedJobHistoricalArtifact,
         artifact: {
           artifactId: 'fixture-cover-letter', version: 1, contentHash: `sha256:${'a'.repeat(64)}`, sourceDigest: `sha256:${'b'.repeat(64)}`,
           content: { text: 'Persisted cover-letter fixture body.' }, provenanceRefs: ['persona:fixture-fact'], evidenceRefs: ['job:fixture-selected-job'],
@@ -245,11 +247,15 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false, 
         review: { status: 'passed', reviewHash: 'fixture-review-hash', evidenceRefs: ['resume:fixture-fact'], findings: [
           { code: 'unsupported_claim', severity: 'warning', message: 'Confirm this claim against your resume.', evidenceRefs: ['resume:fixture-fact'] },
         ] },
-        sourceEvidence: { freshness: 'current', items: [
-          { reference: 'job:fixture-selected-job', kind: 'job', label: 'Job description', text: 'Build reliable cloud systems with TypeScript.' },
-          { reference: 'resume:fixture-fact', kind: 'resume', label: 'Base resume', text: 'Delivered production services using TypeScript.' },
-          { reference: 'persona:fixture-fact', kind: 'persona', label: 'Profile fact · experience', text: 'Led backend reliability work.' },
-        ] },
+        sourceEvidence: selectedJobHistoricalArtifact
+          ? { freshness: 'current', items: [
+            { reference: 'resume:historical-private-source', kind: 'resume', label: 'Private source', text: 'PRIVATE_HISTORICAL_SOURCE_SHOULD_NOT_RENDER' },
+          ] }
+          : { freshness: 'current', items: [
+            { reference: 'job:fixture-selected-job', kind: 'job', label: 'Job description', text: 'Build reliable cloud systems with TypeScript.' },
+            { reference: 'resume:fixture-fact', kind: 'resume', label: 'Base resume', text: 'Delivered production services using TypeScript.' },
+            { reference: 'persona:fixture-fact', kind: 'persona', label: 'Profile fact · experience', text: 'Led backend reliability work.' },
+          ] },
       })
     }
     if (resource === 'approvals' && route.request().method() === 'POST') {
@@ -727,6 +733,33 @@ test('selected-job preparation sends typed scope and restores the persisted draf
   await expect(page.locator('[data-selected-job-draft="true"]')).toHaveCount(0, { timeout: 10_000 })
   await expect(page.locator('body')).not.toContainText('Persisted cover-letter fixture body.')
   await expect(page.locator('[data-agent-task-graph-plan="true"]')).toHaveCount(0)
+})
+
+test('historical selected-job artifact warns, hides source text, and drops its prior passing review', async ({ page }, testInfo) => {
+  const fixture = await installSupervisorFixture(page, true, false, false, true)
+  const isZh = testInfo.project.name.includes('zh')
+  await page.goto(`/agent-preview?supervisor=1&locale=${isZh ? 'zh' : 'en'}&sessionId=${SESSION_A}`)
+
+  const preparation = page.locator('[data-selected-job-preparation="true"]')
+  await expect(preparation).toBeVisible({ timeout: 20_000 })
+  await preparation.getByLabel(isZh ? '已保存的职位' : 'Saved job').selectOption('fixture-selected-job')
+  await preparation.getByRole('button', { name: isZh ? '准备草稿' : 'Prepare draft' }).click()
+  await expect.poll(() => fixture.selectedJobRequests.length).toBe(1)
+
+  const draft = page.locator('[data-selected-job-draft="true"]')
+  await expect(draft).toBeVisible({ timeout: 10_000 })
+  await expect(draft.locator('[data-draft-version-state="historical"]')).toContainText(
+    isZh ? '此版本不是已确认的当前草稿；此前的审核结果已过期。' : 'This is not the confirmed current draft; any prior review is stale.',
+  )
+  const sourceEvidence = draft.locator('[data-draft-source-evidence="stale"]')
+  await expect(sourceEvidence).toContainText(
+    isZh ? '来源内容已变化；为避免误导，来源文本已隐藏。' : 'Sources changed after this draft; source text is hidden.',
+  )
+  await expect(sourceEvidence.locator('[data-source-evidence-item]')).toHaveCount(0)
+  await expect(page.locator('body')).not.toContainText('PRIVATE_HISTORICAL_SOURCE_SHOULD_NOT_RENDER')
+  await expect(draft).toContainText(isZh ? '审核: 已过期' : 'Review: stale')
+  await expect(draft).not.toContainText(isZh ? '通过' : 'passed')
+  await expect(draft).not.toContainText('Confirm this claim against your resume.')
 })
 
 test('refresh restores the selected saved job and its graph before the Writer artifact exists without leaking across sessions', async ({ page }, testInfo) => {

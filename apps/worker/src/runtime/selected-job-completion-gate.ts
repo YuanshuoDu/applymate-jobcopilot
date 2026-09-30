@@ -3,6 +3,7 @@ import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./subagents/task-graph-comm
 import type { SubagentTaskRecord } from "./subagents/types.js"
 import type { TurnLease } from "./turns/lease.js"
 import type { TurnEngineCompletionGateResult } from "./turns/turn-execution-types.js"
+import type { AgentArtifactDraftHead, AgentArtifactDraftHeadScope } from "../db/agent-artifact-repo.js"
 
 const WRITER_TEMPLATE_ID = "cover_letter_writer"
 const REVIEWER_TEMPLATE_ID = "cover_letter_reviewer"
@@ -94,9 +95,9 @@ function reviewerProjection(node: GraphNode): Omit<ReviewerNode, "dependsOn"> | 
   return artifactRef ? { artifactRef, reviewStatus: String(row.reviewStatus) } : undefined
 }
 
-function hasLatestReviewedDraft(value: unknown): boolean {
+function latestReviewedDraftReferences(value: unknown): ArtifactReference[] | undefined {
   const nodes = graphNodes(value)
-  if (!nodes) return false
+  if (!nodes) return undefined
   const writers: WriterNode[] = []
   const reviewers: ReviewerNode[] = []
 
@@ -104,20 +105,20 @@ function hasLatestReviewedDraft(value: unknown): boolean {
     const projectionRole = plainRecord(node.resultProjection)?.role
     const writerCandidate = node.templateId === WRITER_TEMPLATE_ID || projectionRole === "writer"
     const reviewerCandidate = node.templateId === REVIEWER_TEMPLATE_ID || projectionRole === "reviewer"
-    if (writerCandidate && reviewerCandidate) return false
+    if (writerCandidate && reviewerCandidate) return undefined
     if (node.status !== "completed") continue
     if (writerCandidate) {
       const artifactRef = writerProjection(node)
-      if (node.templateId !== WRITER_TEMPLATE_ID || !artifactRef) return false
+      if (node.templateId !== WRITER_TEMPLATE_ID || !artifactRef) return undefined
       writers.push({ key: node.key, artifactRef })
     }
     if (reviewerCandidate) {
       const projection = reviewerProjection(node)
-      if (node.templateId !== REVIEWER_TEMPLATE_ID || !projection || projection.reviewStatus === "stale") return false
+      if (node.templateId !== REVIEWER_TEMPLATE_ID || !projection || projection.reviewStatus === "stale") return undefined
       reviewers.push({ ...projection, dependsOn: node.dependsOn })
     }
   }
-  if (writers.length === 0 || reviewers.length === 0) return false
+  if (writers.length === 0 || reviewers.length === 0) return undefined
 
   const latestByArtifact = new Map<string, WriterNode[]>()
   for (const writer of writers) {
@@ -125,23 +126,35 @@ function hasLatestReviewedDraft(value: unknown): boolean {
     const maxVersion = current[0]?.artifactRef.version ?? 0
     if (writer.artifactRef.version > maxVersion) latestByArtifact.set(writer.artifactRef.artifactId, [writer])
     else if (writer.artifactRef.version === maxVersion) {
-      if (current.some(existing => !sameArtifact(existing.artifactRef, writer.artifactRef))) return false
+      if (current.some(existing => !sameArtifact(existing.artifactRef, writer.artifactRef))) return undefined
       current.push(writer)
       latestByArtifact.set(writer.artifactRef.artifactId, current)
     }
   }
 
-  return [...latestByArtifact.values()].flat().every(writer => reviewers.some(reviewer =>
-    reviewer.dependsOn.includes(writer.key) && sameArtifact(reviewer.artifactRef, writer.artifactRef)))
+  const latestWriters = [...latestByArtifact.values()].flat()
+  if (!latestWriters.every(writer => reviewers.some(reviewer =>
+    reviewer.dependsOn.includes(writer.key) && sameArtifact(reviewer.artifactRef, writer.artifactRef)))) return undefined
+
+  const latestGraphReferenceByArtifact = new Map<string, ArtifactReference>()
+  for (const reference of [...writers.map(writer => writer.artifactRef), ...reviewers.map(reviewer => reviewer.artifactRef)]) {
+    const current = latestGraphReferenceByArtifact.get(reference.artifactId)
+    if (!current || reference.version > current.version) latestGraphReferenceByArtifact.set(reference.artifactId, reference)
+    else if (reference.version === current.version && !sameArtifact(reference, current)) return undefined
+  }
+  return [...latestGraphReferenceByArtifact.values()]
 }
 
-/** Requires a persisted, exact-version review for every latest selected-job draft. */
+/** Requires every latest selected-job draft to match its current session-scoped persisted head and review. */
 export async function selectedJobArtifactCompletionGate(input: {
   readonly commandPort: TaskGraphCommandPort | undefined
   readonly lease: TurnLease
   readonly root: Pick<SubagentTaskRecord, "id" | "attemptCount">
+  readonly selectedJobId: string | undefined
+  readonly readCurrentDraftHead: ((scope: AgentArtifactDraftHeadScope) => Promise<AgentArtifactDraftHead | null>) | undefined
 }): Promise<TurnEngineCompletionGateResult> {
-  if (!input.commandPort) return BLOCKED
+  if (!input.commandPort || typeof input.selectedJobId !== "string" || !input.selectedJobId.trim()
+    || input.selectedJobId.length > 256 || !input.readCurrentDraftHead) return BLOCKED
   const scope: TaskGraphReadScope = {
     userId: input.lease.userId,
     sessionId: input.lease.sessionId,
@@ -154,7 +167,19 @@ export async function selectedJobArtifactCompletionGate(input: {
     parentAttemptCount: input.root.attemptCount,
   }
   try {
-    return hasLatestReviewedDraft(await input.commandPort.readCurrent(scope)) ? { ok: true } : BLOCKED
+    const latestReferences = latestReviewedDraftReferences(await input.commandPort.readCurrent(scope))
+    if (!latestReferences) return BLOCKED
+    for (const reference of latestReferences) {
+      const persistedHead = await input.readCurrentDraftHead({
+        userId: input.lease.userId,
+        sessionId: input.lease.sessionId,
+        jobId: input.selectedJobId,
+        artifactId: reference.artifactId,
+      })
+      const parsedHead = artifactReference(persistedHead)
+      if (!parsedHead || !sameArtifact(reference, parsedHead)) return BLOCKED
+    }
+    return { ok: true }
   } catch {
     return BLOCKED
   }

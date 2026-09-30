@@ -35,6 +35,7 @@ import type { ProductionAgentFlags } from "./production-agent-flags.js"
 import { assertCanonicalCoordinationSurface, classifyToolCallRecovery, durableLifecycleSink, isResumableRootResult } from "./turns/canonical-runtime-tool-recovery.js"
 import { defaultAuthorization, modelWithUsage, type UsageAuthorizer } from "./canonical-turn-runtime-model.js"
 import { selectedJobArtifactCompletionGate } from "./selected-job-completion-gate.js"
+import { createAgentArtifactRepository, type AgentArtifactDraftHead, type AgentArtifactDraftHeadScope } from "../db/agent-artifact-repo.js"
 
 export { durableLifecycleSink } from "./turns/canonical-runtime-tool-recovery.js"
 export type { UsageAuthorization } from "./canonical-turn-runtime-model.js"
@@ -48,6 +49,8 @@ export type CanonicalTurnRuntimeOptions = {
   readonly stateLoader?: (pool: Pick<pg.Pool, "connect">, lease: TurnLease, now?: Date) => Promise<CanonicalTurnState>
   /** Test seam for the server-owned Turn input selector; production uses the lease-fenced database loader. */
   readonly selectedJobPreparationLoader?: (pool: Pick<pg.Pool, "connect">, lease: TurnLease, now: Date) => Promise<SelectedJobPreparation | undefined>
+  /** Test seam for the persisted artifact-head read; production uses the artifact repository. */
+  readonly selectedJobArtifactHeadReader?: (scope: AgentArtifactDraftHeadScope) => Promise<AgentArtifactDraftHead | null>
   readonly modelRuntimeFactory?: (input: { userId: string; config?: AiConfig; state: CanonicalTurnState }) => Promise<HarnessModelRuntime> | HarnessModelRuntime
   readonly authorizeUsage?: UsageAuthorizer
   /** Server-owned scheduler and trusted template registry; model input never supplies its task/tenant fence. */
@@ -102,6 +105,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
   const now = options.now ?? (() => new Date())
   const manager = options.manager ?? new AgentTreeManager(new PgSubagentTaskStore(pool), { now })
   const rootTasks = options.rootTaskStore ?? createPgRootTaskStore(pool)
+  const artifactRepository = createAgentArtifactRepository(pool)
   const executionProjection = options.executionProjection ?? noopCanonicalExecutionProjection
   const sessionProjection = options.sessionProjection ?? noopCanonicalSessionProjection
   const reconcileTerminal = options.executionProjection || options.sessionProjection ? rootTasks.reconcileTerminal : undefined
@@ -132,7 +136,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       return terminal.result
     }
     const state = await (options.stateLoader?.(pool, lease, now()) ?? loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes }))
-    const { enabled: taskGraphPlanningEnabled, selectedJobMode, templates: taskGraphTemplates } = await taskGraphRuntimeForTurn({
+    const { enabled: taskGraphPlanningEnabled, selectedJobMode, selectedJobPreparation, templates: taskGraphTemplates } = await taskGraphRuntimeForTurn({
       enabled: options.productionFlags?.taskGraphPlanningEnabled === true && coordinationEnabled, pool, lease, now,
       selectedJobPreparationLoader: options.selectedJobPreparationLoader, taskGraphTemplates: options.taskGraphTemplates,
     })
@@ -212,7 +216,10 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
         const children = await rootTasks.checkCompletion?.({ lease, rootTaskId: root.id, now: now() })
         if (children && !children.ok) return children
         if (!selectedJobMode) return children ?? { ok: true as const }
-        return selectedJobArtifactCompletionGate({ commandPort: options.taskGraphCommandPort, lease, root })
+        return selectedJobArtifactCompletionGate({
+          commandPort: options.taskGraphCommandPort, lease, root, selectedJobId: selectedJobPreparation?.jobId,
+          readCurrentDraftHead: options.selectedJobArtifactHeadReader ?? (scope => artifactRepository.findCurrentDraftHead(scope)),
+        })
       } } : {}),
     })
     await executionProjection.start({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId })

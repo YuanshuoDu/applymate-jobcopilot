@@ -962,6 +962,9 @@ describe("createCanonicalTurnRuntime", () => {
       appendAndSchedule: async () => ({ status: "accepted", revision: 1, nodes: [], readyTaskIds: [] }),
       readCurrent: vi.fn(async () => reads.shift() ?? reviewedGraph),
     }
+    const artifactHeadReader = vi.fn(async (scope: { userId: string; sessionId: string; jobId: string; artifactId: string }) => ({
+      ...artifactRef, artifactId: scope.artifactId,
+    }))
     const roots = rootStore()
     const productionFlags = resolveProductionAgentFlags({
       ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
@@ -969,6 +972,7 @@ describe("createCanonicalTurnRuntime", () => {
     const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
       workerId: "worker-1", productionFlags, taskGraphCommandPort,
       selectedJobPreparationLoader: async () => ({ jobId: "job-1" }),
+      selectedJobArtifactHeadReader: artifactHeadReader,
       stateLoader: async () => ({ ...selectedJobState(), toolPolicySnapshot: {} }), rootTaskStore: roots as never,
       turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
       modelRuntimeFactory: async () => ({ adapter: {
@@ -988,6 +992,8 @@ describe("createCanonicalTurnRuntime", () => {
       userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-1", parentTaskId: "root-1",
       turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: 1,
     })
+    expect(artifactHeadReader).toHaveBeenCalledOnce()
+    expect(artifactHeadReader).toHaveBeenCalledWith({ userId: lease.userId, sessionId: lease.sessionId, jobId: "job-1", artifactId: "draft-1" })
   })
 
   it("keeps selected-job completion behind the pending-child check", async () => {
@@ -999,12 +1005,14 @@ describe("createCanonicalTurnRuntime", () => {
       appendAndSchedule: async () => ({ status: "accepted", revision: 0, nodes: [], readyTaskIds: [] }),
       readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
     }
+    const artifactHeadReader = vi.fn(async () => null)
     const productionFlags = resolveProductionAgentFlags({
       ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
     })
     const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
       workerId: "worker-1", productionFlags, taskGraphCommandPort,
       selectedJobPreparationLoader: async () => ({ jobId: "job-1" }),
+      selectedJobArtifactHeadReader: artifactHeadReader,
       stateLoader: async () => ({ ...selectedJobState(), toolPolicySnapshot: {} }), rootTaskStore: roots as never,
       turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
       modelRuntimeFactory: async () => ({ adapter: {
@@ -1017,6 +1025,7 @@ describe("createCanonicalTurnRuntime", () => {
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed" })
     expect(roots.checkCompletion).toHaveBeenCalledOnce()
     expect(taskGraphCommandPort.readCurrent).toHaveBeenCalledOnce()
+    expect(artifactHeadReader).not.toHaveBeenCalled()
   })
 
   it("fails closed before provider invocation when usage authorization is unavailable", async () => {

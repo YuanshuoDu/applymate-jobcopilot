@@ -77,7 +77,7 @@ describe("TaskGraph server-owned templates", () => {
     const selected = await taskGraphRuntimeForTurn({ ...base, selectedJobPreparationLoader: async () => ({ jobId: "job-1" }) })
     const generic = await taskGraphRuntimeForTurn({ ...base, selectedJobPreparationLoader: async () => undefined })
 
-    expect(selected).toMatchObject({ enabled: true, selectedJobMode: true })
-    expect(generic).toMatchObject({ enabled: true, selectedJobMode: false })
+    expect(selected).toMatchObject({ enabled: true, selectedJobMode: true, selectedJobPreparation: { jobId: "job-1" } })
+    expect(generic).toMatchObject({ enabled: true, selectedJobMode: false, selectedJobPreparation: undefined })
   })
 })

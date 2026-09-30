@@ -42,8 +42,8 @@ export function SelectedJobDraftArtifact({ sessionId, artifactRef }: { readonly 
 
   const payload = visible?.payload
   const copy = lang === 'zh'
-    ? { title: `${payload?.job.role ?? '求职信草稿'} · ${payload?.job.company ?? ''} v${ref.version}`, loading: '正在加载已保存的草稿…', unavailable: '此会话中无法读取该草稿。', evidence: '引用', sourceEvidence: '来源证据', review: '审核', noReview: '尚无审核结果' }
-    : { title: `${payload ? `${payload.job.role} · ${payload.job.company}` : 'Cover letter draft'} v${ref.version}`, loading: 'Loading persisted draft…', unavailable: 'This draft is unavailable in this session.', evidence: 'References', sourceEvidence: 'Source evidence', review: 'Review', noReview: 'No review receipt yet' }
+    ? { title: `${payload?.job.role ?? '求职信草稿'} · ${payload?.job.company ?? ''} v${ref.version}`, loading: '正在加载已保存的草稿…', unavailable: '此会话中无法读取该草稿。', historical: '此版本不是已确认的当前草稿；此前的审核结果已过期。', evidence: '引用', sourceEvidence: '来源证据', review: '审核', noReview: '尚无审核结果' }
+    : { title: `${payload ? `${payload.job.role} · ${payload.job.company}` : 'Cover letter draft'} v${ref.version}`, loading: 'Loading persisted draft…', unavailable: 'This draft is unavailable in this session.', historical: 'This is not the confirmed current draft; any prior review is stale.', evidence: 'References', sourceEvidence: 'Source evidence', review: 'Review', noReview: 'No review receipt yet' }
 
   return (
     <article aria-label={copy.title} data-selected-job-draft="true" data-draft-version={ref.version} style={cardStyle}>
@@ -51,6 +51,7 @@ export function SelectedJobDraftArtifact({ sessionId, artifactRef }: { readonly 
       {visible?.loading && <p role="status" style={hintStyle}>{copy.loading}</p>}
       {visible?.error && <p role="alert" style={hintStyle}>{copy.unavailable}</p>}
       {payload && <>
+        {!payload.isCurrentVersion && <p role="alert" data-draft-version-state="historical" style={hintStyle}>{copy.historical}</p>}
         <pre data-draft-body="true" style={draftStyle}>{payload.artifact.content.text}</pre>
         <div style={metadataStyle}><strong>{copy.evidence}</strong>{renderRefs([...payload.artifact.provenanceRefs, ...payload.artifact.evidenceRefs, ...(payload.review?.evidenceRefs ?? [])])}</div>
         <SourceEvidence evidence={payload.sourceEvidence} lang={lang} title={copy.sourceEvidence} />

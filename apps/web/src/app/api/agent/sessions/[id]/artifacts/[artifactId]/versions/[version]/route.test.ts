@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { hashContent } from '@jobcopilot/shared'
 
-const mocks = vi.hoisted(() => ({ auth: vi.fn(), session: vi.fn(), version: vi.fn(), job: vi.fn(), resume: vi.fn(), persona: vi.fn(), review: vi.fn() }))
+const mocks = vi.hoisted(() => ({ auth: vi.fn(), session: vi.fn(), version: vi.fn(), head: vi.fn(), job: vi.fn(), resume: vi.fn(), persona: vi.fn(), review: vi.fn() }))
 
 vi.mock('@/lib/api-helpers', () => ({
   requireAuth: mocks.auth,
@@ -11,7 +11,7 @@ vi.mock('@/lib/api-helpers', () => ({
 }))
 
 vi.mock('@/lib/db', () => ({ db: {
-  agentSession: { findFirst: mocks.session }, agentArtifactVersion: { findFirst: mocks.version },
+  agentSession: { findFirst: mocks.session }, agentArtifactVersion: { findFirst: mocks.version }, agentArtifact: { findFirst: mocks.head },
   job: { findFirst: mocks.job }, resume: { findFirst: mocks.resume }, personaFact: { findMany: mocks.persona },
   agentArtifactReview: { findFirst: mocks.review },
 } }))
@@ -39,6 +39,7 @@ const refQuery = `?contentHash=${contentHash}&sourceDigest=${sourceDigest}`
 const context = { params: Promise.resolve({ id: 'session-1', artifactId: 'artifact-1', version: '2' }) }
 
 function request(query = refQuery) { return new Request(`http://localhost/api/agent/sessions/session-1/artifacts/artifact-1/versions/2${query}`) }
+function requestAtVersion(version: string, query: string) { return new Request(`http://localhost/api/agent/sessions/session-1/artifacts/artifact-1/versions/${version}${query}`) }
 function artifact(overrides: Record<string, unknown> = {}) {
   return { id: 'version-row-1', userId: 'user-1', sessionId: 'session-1', jobId: 'job-1', artifactId: 'artifact-1', version: 2, artifactType: 'cover_letter', content: 'PRIVATE_DRAFT_BODY', contentHash, sourceDigest, provenanceRefs: ['job:job-1', 'resume:resume-1', 'persona:fact-1'], evidenceRefs: ['job:job-1', 'resume:resume-1', 'persona:fact-1'], ...overrides }
 }
@@ -46,10 +47,11 @@ function artifact(overrides: Record<string, unknown> = {}) {
 describe('session-scoped immutable cover-letter version read', () => {
   beforeEach(() => {
     vi.resetModules()
-    mocks.auth.mockReset(); mocks.session.mockReset(); mocks.version.mockReset(); mocks.job.mockReset(); mocks.resume.mockReset(); mocks.persona.mockReset(); mocks.review.mockReset()
+    mocks.auth.mockReset(); mocks.session.mockReset(); mocks.version.mockReset(); mocks.head.mockReset(); mocks.job.mockReset(); mocks.resume.mockReset(); mocks.persona.mockReset(); mocks.review.mockReset()
     mocks.auth.mockResolvedValue({ userId: 'user-1' })
     mocks.session.mockResolvedValue({ id: 'session-1' })
     mocks.version.mockResolvedValue(artifact())
+    mocks.head.mockResolvedValue({ version: 2, hash: contentHash })
     mocks.job.mockResolvedValue(jobSource)
     mocks.resume.mockResolvedValue(resumeSource)
     mocks.persona.mockResolvedValue(personaSources)
@@ -81,6 +83,10 @@ describe('session-scoped immutable cover-letter version read', () => {
       userId: 'user-1', sessionId: 'session-1', jobId: 'job-1', artifactId: 'artifact-1', version: 2, contentHash, sourceDigest,
     }) }))
     expect(body.job).toEqual({ company: 'N26', role: 'Backend Engineer' })
+    expect(body.isCurrentVersion).toBe(true)
+    expect(mocks.head).toHaveBeenCalledWith({ where: {
+      id: 'artifact-1', userId: 'user-1', jobId: 'job-1', lifecycle: 'draft', artifactType: 'cover_letter',
+    }, select: { version: true, hash: true } })
     expect(body.artifact).toMatchObject({ content: { text: 'PRIVATE_DRAFT_BODY' }, provenanceRefs: ['job:job-1', 'resume:resume-1', 'persona:fact-1'], evidenceRefs: ['job:job-1', 'resume:resume-1', 'persona:fact-1'] })
     expect(body.sourceEvidence).toEqual({ freshness: 'current', items: [
       { reference: 'job:job-1', kind: 'job', label: 'Job description', text: 'Build reliable systems' },
@@ -256,6 +262,40 @@ describe('session-scoped immutable cover-letter version read', () => {
     expect(response.status).toBe(200)
     expect(body.review).toEqual({ status: 'stale', reviewHash: 'review-hash', evidenceRefs: [], findings: [] })
     expect(body.sourceEvidence).toEqual({ freshness: 'unavailable', items: [] })
+  })
+
+  it('returns an older exact version but marks its passed review stale when the draft head is newer', async () => {
+    const version1Hash = `sha256:${'c'.repeat(64)}`
+    mocks.version.mockResolvedValueOnce(artifact({ version: 1, contentHash: version1Hash, content: 'HISTORICAL_V1_BODY' }))
+    mocks.head.mockResolvedValueOnce({ version: 2, hash: contentHash })
+    mocks.review.mockResolvedValueOnce({ status: 'passed', reviewHash: 'old-review', evidenceRefs: ['job:job-1'], findings: [{ code: 'claim', severity: 'info', message: 'Old finding.', evidenceRefs: ['job:job-1'] }] })
+    const { GET } = await import('./route')
+    const response = await GET(
+      requestAtVersion('1', `?contentHash=${version1Hash}&sourceDigest=${sourceDigest}`) as never,
+      { params: Promise.resolve({ id: 'session-1', artifactId: 'artifact-1', version: '1' }) },
+    )
+    const body = await response.json()
+
+    expect(response.status).toBe(200)
+    expect(mocks.version).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ version: 1, contentHash: version1Hash }) }))
+    expect(body.isCurrentVersion).toBe(false)
+    expect(body.artifact.content.text).toBe('HISTORICAL_V1_BODY')
+    expect(body.sourceEvidence).toEqual({ freshness: 'stale', items: [] })
+    expect(body.review).toEqual({ status: 'stale', reviewHash: 'old-review', evidenceRefs: [], findings: [] })
+  })
+
+  it('keeps reading the exact version when its current draft head is missing, but marks it stale', async () => {
+    mocks.head.mockResolvedValueOnce(null)
+    mocks.review.mockResolvedValueOnce({ status: 'passed', reviewHash: 'old-review', evidenceRefs: ['job:job-1'], findings: [{ code: 'claim', severity: 'info', message: 'Old finding.', evidenceRefs: ['job:job-1'] }] })
+    const { GET } = await import('./route')
+    const response = await GET(request() as never, context)
+    const body = await response.json()
+
+    expect(response.status).toBe(200)
+    expect(body.isCurrentVersion).toBe(false)
+    expect(body.artifact.content.text).toBe('PRIVATE_DRAFT_BODY')
+    expect(body.sourceEvidence).toEqual({ freshness: 'stale', items: [] })
+    expect(body.review).toEqual({ status: 'stale', reviewHash: 'old-review', evidenceRefs: [], findings: [] })
   })
 
   it('rejects malformed version and digest values before querying private artifacts', async () => {

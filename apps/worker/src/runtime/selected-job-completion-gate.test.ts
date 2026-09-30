@@ -47,6 +47,14 @@ function reviewer(
   } })
 }
 
+type DraftHeadReader = (scope: { artifactId: string }) => Promise<ReturnType<typeof reference> | null>
+const failingHeadReaders: Array<[string, DraftHeadReader]> = [
+  ["missing", async () => null],
+  ["stale version", async () => ({ ...reference({ version: 1 }) })],
+  ["conflicting content hash", async () => ({ ...reference({ contentHash: `sha256:${"d".repeat(64)}` }) })],
+  ["unreadable", async (): Promise<ReturnType<typeof reference> | null> => { throw new Error("private repository detail") }],
+]
+
 function current(nodes: readonly TaskGraphCurrentNode[]): TaskGraphCurrentState {
   return { revision: 8, nodes }
 }
@@ -59,18 +67,25 @@ function commandPort(value: unknown) {
 }
 
 async function check(value: unknown) {
-  return selectedJobArtifactCompletionGate({ commandPort: commandPort(value), lease, root })
+  return selectedJobArtifactCompletionGate({
+    commandPort: commandPort(value), lease, root, selectedJobId: "job-1",
+    readCurrentDraftHead: async scope => ({ ...reference(), artifactId: scope.artifactId }),
+  })
 }
 
 describe("selected-job artifact completion gate", () => {
   it.each(["passed", "needs_revision", "rejected"] as const)("accepts the exact latest Writer and Reviewer pair with %s status", async reviewStatus => {
     const state = current([writer(), reviewer(reference(), reviewStatus)])
     const port = commandPort(state)
+    const readCurrentDraftHead = vi.fn(async (scope: { artifactId: string }) => ({ ...reference(), artifactId: scope.artifactId }))
 
-    await expect(selectedJobArtifactCompletionGate({ commandPort: port, lease, root })).resolves.toEqual({ ok: true })
+    await expect(selectedJobArtifactCompletionGate({ commandPort: port, lease, root, selectedJobId: "job-1", readCurrentDraftHead })).resolves.toEqual({ ok: true })
     expect(port.readCurrent).toHaveBeenCalledWith({
       userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: root.id, parentTaskId: root.id,
       turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: root.attemptCount,
+    })
+    expect(readCurrentDraftHead).toHaveBeenCalledWith({
+      userId: lease.userId, sessionId: lease.sessionId, jobId: "job-1", artifactId: "draft-1",
     })
   })
 
@@ -96,6 +111,7 @@ describe("selected-job artifact completion gate", () => {
     { name: "unavailable completed Reviewer projection", graph: current([writer(), node({ key: "reviewer", templateId: "cover_letter_reviewer", status: "completed", dependsOn: ["writer"], resultProjection: unavailable })]) },
     { name: "no direct Reviewer-to-Writer dependency", graph: current([writer(), analyst, reviewer(reference(), "passed", ["analyst"])]) },
     { name: "artifact ID mismatch", graph: current([writer(), reviewer(reference({ artifactId: "draft-2" }))]) },
+    { name: "conflicting latest Reviewer reference", graph: current([writer(), reviewer(), reviewer(reference({ contentHash: `sha256:${"d".repeat(64)}` }), "passed", ["writer"], "reviewer-conflict")]) },
     { name: "version mismatch", graph: current([writer(), reviewer(reference({ version: 1 }))]) },
     { name: "content hash mismatch", graph: current([writer(), reviewer(reference({ contentHash: `sha256:${"d".repeat(64)}` }))]) },
     { name: "source digest mismatch", graph: current([writer(), reviewer(reference({ sourceDigest: `sha256:${"e".repeat(64)}` }))]) },
@@ -117,7 +133,10 @@ describe("selected-job artifact completion gate", () => {
       readCurrent: async () => { throw new Error("private store detail") },
     } satisfies TaskGraphCommandPort
 
-    await expect(selectedJobArtifactCompletionGate({ commandPort: port, lease, root })).resolves.toEqual({
+    await expect(selectedJobArtifactCompletionGate({
+      commandPort: port, lease, root, selectedJobId: "job-1",
+      readCurrentDraftHead: async scope => ({ ...reference(), artifactId: scope.artifactId }),
+    })).resolves.toEqual({
       ok: false,
       blocker: "selected_job_draft_review_required",
       feedback: "Complete and review the selected job's latest cover-letter draft before finishing.",
@@ -125,8 +144,38 @@ describe("selected-job artifact completion gate", () => {
   })
 
   it("fails closed when the command port is unavailable", async () => {
-    await expect(selectedJobArtifactCompletionGate({ commandPort: undefined, lease, root })).resolves.toMatchObject({
+    await expect(selectedJobArtifactCompletionGate({
+      commandPort: undefined, lease, root, selectedJobId: undefined, readCurrentDraftHead: undefined,
+    })).resolves.toMatchObject({
       ok: false, blocker: "selected_job_draft_review_required",
     })
+  })
+
+  it.each(failingHeadReaders)("fails closed when the persisted draft head is %s", async (_label, readCurrentDraftHead) => {
+    const graph = current([writer(), reviewer()])
+    await expect(selectedJobArtifactCompletionGate({
+      commandPort: commandPort(graph), lease, root, selectedJobId: "job-1", readCurrentDraftHead,
+    })).resolves.toMatchObject({ ok: false, blocker: "selected_job_draft_review_required" })
+  })
+
+  it("fails closed without a server-selected job identity or head reader", async () => {
+    const graph = current([writer(), reviewer()])
+    await expect(selectedJobArtifactCompletionGate({
+      commandPort: commandPort(graph), lease, root, selectedJobId: undefined, readCurrentDraftHead: undefined,
+    })).resolves.toMatchObject({ ok: false, blocker: "selected_job_draft_review_required" })
+  })
+
+  it("checks the latest artifact reference from every Writer and Reviewer node", async () => {
+    const secondArtifact = reference({ artifactId: "draft-2" })
+    const graph = current([writer(), reviewer(), reviewer(secondArtifact, "passed", ["writer"], "reviewer-second")])
+    const port = commandPort(graph)
+    const readCurrentDraftHead = vi.fn(async (scope: { artifactId: string }) => ({ ...reference(), artifactId: scope.artifactId }))
+
+    await expect(selectedJobArtifactCompletionGate({
+      commandPort: port, lease, root, selectedJobId: "job-1", readCurrentDraftHead,
+    })).resolves.toEqual({ ok: true })
+    expect(readCurrentDraftHead).toHaveBeenCalledTimes(2)
+    expect(readCurrentDraftHead).toHaveBeenNthCalledWith(1, { userId: lease.userId, sessionId: lease.sessionId, jobId: "job-1", artifactId: "draft-1" })
+    expect(readCurrentDraftHead).toHaveBeenNthCalledWith(2, { userId: lease.userId, sessionId: lease.sessionId, jobId: "job-1", artifactId: "draft-2" })
   })
 })

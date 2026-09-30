@@ -32,6 +32,7 @@ export interface DraftSourceEvidence {
 
 export interface DraftArtifactPayload {
   readonly job: { readonly company: string; readonly role: string }
+  readonly isCurrentVersion: boolean
   readonly artifact: DraftArtifactRef & {
     readonly content: { readonly text: string }
     readonly provenanceRefs: readonly string[]
@@ -78,13 +79,19 @@ export function parseDraftArtifactPayload(value: unknown, expected: DraftArtifac
   const artifact = record(root.artifact)
   const ref = parseArtifactRef(artifact)
   const content = record(artifact.content)
-  const sourceEvidence = parseSourceEvidence(root.sourceEvidence)
+  const isCurrentVersion = root.isCurrentVersion
+  const parsedSourceEvidence = parseSourceEvidence(root.sourceEvidence)
   if (!ref || !sameRef(ref, expected) || typeof content.text !== 'string' || content.text.length > 20_000
-    || !boundedText(job.company, 160) || !boundedText(job.role, 160) || !sourceEvidence) return null
-  const review = root.review === null ? null : parseReview(root.review)
-  if (root.review !== null && !review) return null
+    || typeof isCurrentVersion !== 'boolean' || !boundedText(job.company, 160) || !boundedText(job.role, 160) || !parsedSourceEvidence) return null
+  const parsedReview = root.review === null ? null : parseReview(root.review)
+  if (root.review !== null && !parsedReview) return null
+  const sourceEvidence = isCurrentVersion ? parsedSourceEvidence : { freshness: 'stale' as const, items: [] }
+  const review = !isCurrentVersion && parsedReview
+    ? { ...parsedReview, status: 'stale' as const, evidenceRefs: [], findings: [] }
+    : parsedReview
   return {
     job: { company: job.company, role: job.role },
+    isCurrentVersion,
     artifact: {
       ...ref,
       content: { text: content.text },
