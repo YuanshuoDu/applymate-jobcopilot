@@ -30,6 +30,23 @@ function writerResult(version: number, contentDigest: string, sourceDigest = "b"
   }
 }
 
+function reviewerResult(overrides: Record<string, unknown> = {}) {
+  return {
+    schemaVersion: ROLE_RESULT_SCHEMA,
+    role: "reviewer",
+    status: "completed",
+    artifactRef: {
+      artifactId: "cover-letter-1",
+      version: 2,
+      contentHash: `sha256:${"a".repeat(64)}`,
+      sourceDigest: `sha256:${"b".repeat(64)}`,
+    },
+    reviewStatus: "passed",
+    reviewHash: `sha256:${"c".repeat(64)}`,
+    ...overrides,
+  }
+}
+
 function recordWriterResult(index: ReturnType<typeof createObservedEvidenceIndex>, result: ReturnType<typeof writerResult>) {
   recordReadToolOutput(index, "cover_letter.draft", { artifactRef: result.artifactRef })
 }
@@ -142,6 +159,45 @@ describe("child evidence binding", () => {
 
     expect(parseAndBindStructuredResult(JSON.stringify(first), "writer", index)).toBeUndefined()
     expect(parseAndBindStructuredResult(JSON.stringify(conflicting), "writer", index)).toBeUndefined()
+  })
+
+  it.each([
+    ["missing", undefined],
+    ["malformed", { artifactRef: reviewerResult().artifactRef }],
+    ["for a different artifact version", { artifactRef: { ...(reviewerResult().artifactRef as Record<string, unknown>), contentHash: `sha256:${"d".repeat(64)}` }, content: "draft" }],
+    ["with a different numeric version", { artifactRef: { ...(reviewerResult().artifactRef as Record<string, unknown>), version: 1 }, content: "draft" }],
+  ] as const)("rejects a Reviewer result without the exact observed artifact version read (%s)", (_name, readOutput) => {
+    const index = createObservedEvidenceIndex()
+    if (readOutput) recordReadToolOutput(index, "artifact.version.read", readOutput)
+    recordReadToolOutput(index, "artifact.review", {
+      artifactRef: reviewerResult().artifactRef, status: "passed", reviewHash: reviewerResult().reviewHash,
+    })
+
+    expect(parseAndBindStructuredResult(JSON.stringify(reviewerResult()), "reviewer", index)).toBeUndefined()
+  })
+
+  it.each([
+    ["missing", undefined],
+    ["malformed", { artifactRef: reviewerResult().artifactRef, status: "passed", reviewHash: "not-a-digest" }],
+    ["with a mismatched hash", { artifactRef: reviewerResult().artifactRef, status: "passed", reviewHash: `sha256:${"d".repeat(64)}` }],
+    ["with a mismatched artifact reference", { artifactRef: { ...(reviewerResult().artifactRef as Record<string, unknown>), version: 1 }, status: "passed", reviewHash: reviewerResult().reviewHash }],
+  ] as const)("rejects a Reviewer result without the exact observed artifact.review receipt (%s)", (_name, reviewOutput) => {
+    const index = createObservedEvidenceIndex()
+    recordReadToolOutput(index, "artifact.version.read", { artifactRef: reviewerResult().artifactRef, content: "draft" })
+    if (reviewOutput) recordReadToolOutput(index, "artifact.review", reviewOutput)
+
+    expect(parseAndBindStructuredResult(JSON.stringify(reviewerResult()), "reviewer", index)).toBeUndefined()
+  })
+
+  it("binds a Reviewer result to the exact successful artifact read and review receipt", () => {
+    const result = reviewerResult()
+    const index = createObservedEvidenceIndex()
+    recordReadToolOutput(index, "artifact.version.read", { artifactRef: result.artifactRef, content: "draft" })
+    recordReadToolOutput(index, "artifact.review", {
+      artifactRef: result.artifactRef, status: result.reviewStatus, reviewHash: result.reviewHash,
+    })
+
+    expect(parseAndBindStructuredResult(JSON.stringify(result), "reviewer", index)).toEqual(result)
   })
 
   it("keeps observed evidence bounded by entries and serialized bytes", () => {
