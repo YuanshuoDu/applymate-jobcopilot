@@ -21,7 +21,7 @@ const jobSource = {
   id: 'job-1', company: 'N26', role: 'Backend Engineer', location: 'Berlin', status: 'saved', score: 88,
   url: 'https://jobs.example.test/1', source: 'greenhouse', salary: '€80k', description: 'Build reliable systems', keywords: 'TypeScript, PostgreSQL',
 }
-const resumeSource = { id: 'resume-1', content: { basics: { name: 'Candidate' }, experience: [{ company: 'Example' }] } }
+const resumeSource = { id: 'resume-1', content: { contact: { name: 'Private Candidate', email: 'private@example.test', phone: '+353000000000' }, summary: 'Designed secure cloud services', skills: ['TypeScript', 'PostgreSQL', 'Kubernetes', 'AWS', 'Private fifth skill'], experience: [{ role: 'Senior Engineer', company: 'Example', bullets: ['Built high-availability APIs'] }] } }
 const personaSources = [{ id: 'fact-1', key: 'experience', value: 'Built reliable systems', sourceRef: 'fact-1', confidence: 0.9 }]
 function digestFor(job = jobSource, resume = resumeSource, facts = personaSources) {
   const sources = [
@@ -40,7 +40,7 @@ const context = { params: Promise.resolve({ id: 'session-1', artifactId: 'artifa
 
 function request(query = refQuery) { return new Request(`http://localhost/api/agent/sessions/session-1/artifacts/artifact-1/versions/2${query}`) }
 function artifact(overrides: Record<string, unknown> = {}) {
-  return { id: 'version-row-1', userId: 'user-1', sessionId: 'session-1', jobId: 'job-1', artifactId: 'artifact-1', version: 2, artifactType: 'cover_letter', content: 'PRIVATE_DRAFT_BODY', contentHash, sourceDigest, provenanceRefs: ['persona:fact-1'], evidenceRefs: ['job:job-1'], ...overrides }
+  return { id: 'version-row-1', userId: 'user-1', sessionId: 'session-1', jobId: 'job-1', artifactId: 'artifact-1', version: 2, artifactType: 'cover_letter', content: 'PRIVATE_DRAFT_BODY', contentHash, sourceDigest, provenanceRefs: ['job:job-1', 'resume:resume-1', 'persona:fact-1'], evidenceRefs: ['job:job-1', 'resume:resume-1', 'persona:fact-1'], ...overrides }
 }
 
 describe('session-scoped immutable cover-letter version read', () => {
@@ -81,7 +81,14 @@ describe('session-scoped immutable cover-letter version read', () => {
       userId: 'user-1', sessionId: 'session-1', jobId: 'job-1', artifactId: 'artifact-1', version: 2, contentHash, sourceDigest,
     }) }))
     expect(body.job).toEqual({ company: 'N26', role: 'Backend Engineer' })
-    expect(body.artifact).toMatchObject({ content: { text: 'PRIVATE_DRAFT_BODY' }, provenanceRefs: ['persona:fact-1'], evidenceRefs: ['job:job-1'] })
+    expect(body.artifact).toMatchObject({ content: { text: 'PRIVATE_DRAFT_BODY' }, provenanceRefs: ['job:job-1', 'resume:resume-1', 'persona:fact-1'], evidenceRefs: ['job:job-1', 'resume:resume-1', 'persona:fact-1'] })
+    expect(body.sourceEvidence).toEqual({ freshness: 'current', items: [
+      { reference: 'job:job-1', kind: 'job', label: 'Job description', text: 'Build reliable systems' },
+      { reference: 'resume:resume-1', kind: 'resume', label: 'Base resume', text: 'Designed secure cloud services · Skills: TypeScript, PostgreSQL, Kubernetes, AWS · Senior Engineer at Example: Built high-availability APIs' },
+      { reference: 'persona:fact-1', kind: 'persona', label: 'Profile fact · experience', text: 'Built reliable systems' },
+    ] })
+    expect(JSON.stringify(body.sourceEvidence)).not.toContain('private@example.test')
+    expect(JSON.stringify(body.sourceEvidence)).not.toContain('Private Candidate')
     expect(response.headers.get('cache-control')).toBe('private, no-store, max-age=0')
     expect(body.review).toMatchObject({ status: 'needs_revision', findings: [{ code: 'claim', severity: 'warning', message: 'Check this claim.' }] })
     expect(JSON.stringify(body)).not.toContain('MUST_NOT_PROJECT')
@@ -108,9 +115,95 @@ describe('session-scoped immutable cover-letter version read', () => {
     mocks.job.mockResolvedValueOnce(null)
     expect((await GET(request() as never, context)).status).toBe(404)
     expect(mocks.review).not.toHaveBeenCalled()
+    expect(mocks.resume).not.toHaveBeenCalled()
+    expect(mocks.persona).not.toHaveBeenCalled()
 
     expect((await GET(request(`?contentHash=sha256:${'c'.repeat(64)}&sourceDigest=${sourceDigest}`) as never, context)).status).toBe(404)
     expect(mocks.version).toHaveBeenLastCalledWith(expect.objectContaining({ where: expect.objectContaining({ contentHash: `sha256:${'c'.repeat(64)}` }) }))
+  })
+
+  it('bounds source evidence and ignores caller-supplied evidence references', async () => {
+    const facts = Array.from({ length: 20 }, (_, index) => ({ id: `fact-${index + 1}`, key: `skill-${index + 1}`, value: 'x'.repeat(900), sourceRef: `resume:source-${index + 1}`, confidence: 0.9 }))
+    const digest = digestFor(jobSource, resumeSource, facts)
+    const persistedRefs = ['job:job-1', 'resume:resume-1', ...facts.map(fact => `persona:${fact.id}`)]
+    mocks.persona.mockResolvedValueOnce(facts)
+    mocks.version.mockResolvedValueOnce(artifact({ sourceDigest: digest, provenanceRefs: persistedRefs, evidenceRefs: persistedRefs }))
+    const { GET } = await import('./route')
+    const response = await GET(request(`?contentHash=${contentHash}&sourceDigest=${digest}&evidenceRef=persona:caller-controlled`) as never, context)
+    const body = await response.json()
+    const items = body.sourceEvidence.items as Array<{ reference: string; label: string; text: string }>
+
+    expect(response.status).toBe(200)
+    expect(body.sourceEvidence.freshness).toBe('current')
+    expect(items.length).toBeLessThanOrEqual(8)
+    expect(items.every(item => persistedRefs.includes(item.reference))).toBe(true)
+    expect(items.some(item => item.reference === 'persona:caller-controlled')).toBe(false)
+    expect(items.every(item => item.reference.length <= 256 && item.label.length <= 80 && item.text.length <= 600)).toBe(true)
+    expect(items.reduce((sum, item) => sum + item.text.length, 0)).toBeLessThanOrEqual(3_000)
+    expect(mocks.resume).toHaveBeenCalledWith(expect.objectContaining({ where: { userId: 'user-1', kind: 'base' } }))
+    expect(mocks.persona).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ userId: 'user-1', status: 'confirmed', allowedUses: { has: 'cover_letter' } }) }))
+  })
+
+  it('withholds evidence when a persisted reference cannot resolve in the owner-scoped source set', async () => {
+    mocks.version.mockResolvedValueOnce(artifact({ evidenceRefs: ['persona:foreign-fact'], provenanceRefs: ['persona:foreign-fact'] }))
+    const { GET } = await import('./route')
+    const response = await GET(request() as never, context)
+    const body = await response.json()
+
+    expect(response.status).toBe(200)
+    expect(body.sourceEvidence).toEqual({ freshness: 'unavailable', items: [] })
+    expect(mocks.persona).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ userId: 'user-1' }) }))
+  })
+
+  it('validates references after the display limit before marking evidence current', async () => {
+    const facts = Array.from({ length: 6 }, (_, index) => ({ id: `fact-${index + 1}`, key: `skill-${index + 1}`, value: `Skill ${index + 1}`, sourceRef: `resume:source-${index + 1}`, confidence: 0.9 }))
+    const digest = digestFor(jobSource, resumeSource, facts)
+    const refs = ['job:job-1', 'resume:resume-1', ...facts.map(fact => `persona:${fact.id}`), 'persona:unresolved-ninth-ref']
+    mocks.persona.mockResolvedValueOnce(facts)
+    mocks.version.mockResolvedValueOnce(artifact({ sourceDigest: digest, evidenceRefs: refs, provenanceRefs: refs }))
+    const { GET } = await import('./route')
+    const response = await GET(request(`?contentHash=${contentHash}&sourceDigest=${digest}`) as never, context)
+
+    expect(response.status).toBe(200)
+    expect((await response.json()).sourceEvidence).toEqual({ freshness: 'unavailable', items: [] })
+  })
+
+  it('redacts contact details in source evidence while preserving benign context', async () => {
+    const email = 'candidate.private@example.test'
+    const phone = '+353 87 123 4567'
+    const job = { ...jobSource, description: `Build dependable systems. Contact ${email} or ${phone}.` }
+    const resume = { id: 'resume-1', content: { ...resumeSource.content, summary: `Experienced engineer. Contact ${email} or ${phone}.` } }
+    const facts = [
+      { id: 'email-fact', key: 'contactEmail', value: email, sourceRef: 'resume:contact', confidence: 0.9 },
+      { id: 'name-fact', key: 'firstName', value: 'Private Candidate', sourceRef: 'resume:name', confidence: 0.9 },
+      { id: 'summary-fact', key: 'profileSummary', value: `Built secure systems. Contact ${email} or ${phone}.`, sourceRef: 'resume:summary', confidence: 0.9 },
+    ]
+    const digest = digestFor(job, resume, facts)
+    const refs = ['job:job-1', 'resume:resume-1', 'persona:email-fact', 'persona:name-fact', 'persona:summary-fact']
+    mocks.job.mockResolvedValueOnce(job)
+    mocks.resume.mockResolvedValueOnce(resume)
+    mocks.persona.mockResolvedValueOnce(facts)
+    mocks.version.mockResolvedValueOnce(artifact({ sourceDigest: digest, evidenceRefs: refs, provenanceRefs: refs }))
+    const { GET } = await import('./route')
+    const response = await GET(request(`?contentHash=${contentHash}&sourceDigest=${digest}`) as never, context)
+    const body = await response.json()
+    const items = body.sourceEvidence.items as Array<{ reference: string; text: string }>
+    const serializedEvidence = JSON.stringify(body.sourceEvidence)
+
+    expect(response.status).toBe(200)
+    expect(body.sourceEvidence.freshness).toBe('current')
+    expect(serializedEvidence).not.toContain(email)
+    expect(serializedEvidence).not.toContain(phone)
+    expect(items.find(item => item.reference === 'job:job-1')?.text).toContain('Build dependable systems')
+    expect(items.find(item => item.reference === 'job:job-1')?.text).toContain('[redacted email]')
+    expect(items.find(item => item.reference === 'job:job-1')?.text).toContain('[redacted phone]')
+    expect(items.find(item => item.reference === 'resume:resume-1')?.text).toContain('Experienced engineer')
+    expect(items.find(item => item.reference === 'resume:resume-1')?.text).toContain('[redacted email]')
+    expect(items.find(item => item.reference === 'persona:email-fact')?.text).toBe('Contact detail withheld')
+    expect(items.find(item => item.reference === 'persona:name-fact')?.text).toBe('Contact detail withheld')
+    expect(serializedEvidence).not.toContain('Private Candidate')
+    expect(items.find(item => item.reference === 'persona:summary-fact')?.text).toContain('Built secure systems')
+    expect(items.find(item => item.reference === 'persona:summary-fact')?.text).toContain('[redacted phone]')
   })
 
   it('keeps the stored review status when current selected-job sources are unchanged', async () => {
@@ -151,6 +244,7 @@ describe('session-scoped immutable cover-letter version read', () => {
     const body = await response.json()
     expect(response.status).toBe(200)
     expect(body.review).toEqual({ status: 'stale', reviewHash: 'review-hash', evidenceRefs: [], findings: [] })
+    expect(body.sourceEvidence).toEqual({ freshness: 'stale', items: [] })
   })
 
   it('fails closed to a stale review when current source material cannot be loaded', async () => {
@@ -161,6 +255,7 @@ describe('session-scoped immutable cover-letter version read', () => {
     const body = await response.json()
     expect(response.status).toBe(200)
     expect(body.review).toEqual({ status: 'stale', reviewHash: 'review-hash', evidenceRefs: [], findings: [] })
+    expect(body.sourceEvidence).toEqual({ freshness: 'unavailable', items: [] })
   })
 
   it('rejects malformed version and digest values before querying private artifacts', async () => {

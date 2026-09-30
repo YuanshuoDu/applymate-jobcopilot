@@ -15,6 +15,21 @@ export interface DraftReview {
   readonly findings: readonly { code: string; severity: string; message: string; evidenceRefs: readonly string[] }[]
 }
 
+export type DraftEvidenceFreshness = 'current' | 'stale' | 'unavailable'
+export type DraftEvidenceKind = 'job' | 'resume' | 'persona'
+
+export interface DraftSourceEvidenceItem {
+  readonly reference: string
+  readonly kind: DraftEvidenceKind
+  readonly label: string
+  readonly text: string
+}
+
+export interface DraftSourceEvidence {
+  readonly freshness: DraftEvidenceFreshness
+  readonly items: readonly DraftSourceEvidenceItem[]
+}
+
 export interface DraftArtifactPayload {
   readonly job: { readonly company: string; readonly role: string }
   readonly artifact: DraftArtifactRef & {
@@ -23,10 +38,12 @@ export interface DraftArtifactPayload {
     readonly evidenceRefs: readonly string[]
   }
   readonly review: DraftReview | null
+  readonly sourceEvidence: DraftSourceEvidence
 }
 
 const DIGEST = /^sha256:[a-f0-9]{64}$/
 const REVIEW_STATUSES = new Set(['passed', 'needs_revision', 'rejected', 'stale'])
+const EVIDENCE_KINDS = new Set<DraftEvidenceKind>(['job', 'resume', 'persona'])
 
 export function latestWriterArtifact(
   sessionId: string,
@@ -54,8 +71,9 @@ export function parseDraftArtifactPayload(value: unknown, expected: DraftArtifac
   const artifact = record(root.artifact)
   const ref = parseArtifactRef(artifact)
   const content = record(artifact.content)
+  const sourceEvidence = parseSourceEvidence(root.sourceEvidence)
   if (!ref || !sameRef(ref, expected) || typeof content.text !== 'string' || content.text.length > 20_000
-    || !boundedText(job.company, 160) || !boundedText(job.role, 160)) return null
+    || !boundedText(job.company, 160) || !boundedText(job.role, 160) || !sourceEvidence) return null
   const review = root.review === null ? null : parseReview(root.review)
   if (root.review !== null && !review) return null
   return {
@@ -67,7 +85,34 @@ export function parseDraftArtifactPayload(value: unknown, expected: DraftArtifac
       evidenceRefs: strings(artifact.evidenceRefs),
     },
     review,
+    sourceEvidence,
   }
+}
+
+function parseSourceEvidence(value: unknown): DraftSourceEvidence | null {
+  const row = record(value)
+  const freshness = row.freshness
+  if (freshness === 'stale' || freshness === 'unavailable') return { freshness, items: [] }
+  if (freshness !== 'current' || !Array.isArray(row.items) || row.items.length > 8) return null
+
+  const items: DraftSourceEvidenceItem[] = []
+  let totalTextLength = 0
+  for (const entry of row.items) {
+    const item = record(entry)
+    if (Object.keys(item).sort().join(',') !== 'kind,label,reference,text'
+      || !EVIDENCE_KINDS.has(item.kind as DraftEvidenceKind)
+      || !boundedText(item.reference, 256) || !boundedText(item.label, 80)
+      || !boundedText(item.text, 600)) return null
+    totalTextLength += item.text.length
+    if (totalTextLength > 3_000) return null
+    items.push({
+      reference: item.reference,
+      kind: item.kind as DraftEvidenceKind,
+      label: item.label,
+      text: item.text,
+    })
+  }
+  return { freshness, items }
 }
 
 export function validArtifactRef(value: unknown): value is DraftArtifactRef {

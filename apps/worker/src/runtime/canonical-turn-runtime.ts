@@ -34,6 +34,7 @@ import { noopCanonicalSessionProjection, type CanonicalSessionProjection } from 
 import type { ProductionAgentFlags } from "./production-agent-flags.js"
 import { assertCanonicalCoordinationSurface, classifyToolCallRecovery, durableLifecycleSink, isResumableRootResult } from "./turns/canonical-runtime-tool-recovery.js"
 import { defaultAuthorization, modelWithUsage, type UsageAuthorizer } from "./canonical-turn-runtime-model.js"
+import { selectedJobArtifactCompletionGate } from "./selected-job-completion-gate.js"
 
 export { durableLifecycleSink } from "./turns/canonical-runtime-tool-recovery.js"
 export type { UsageAuthorization } from "./canonical-turn-runtime-model.js"
@@ -207,7 +208,12 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       budget: limits(state.budgetSnapshot), resume: state.resume, now, publishReasoningSummary: false,
       steeringMarkerState: { active: state.steeringMarkers?.active ?? [] }, ...(taskGraphPlanningEnabled ? { refreshTaskGraphAfterReadyWait: (snapshot: TurnEngineOptions["snapshot"]) => loadTaskGraphCurrentObservation(snapshot, options.taskGraphCommandPort, lease, root), refreshTaskGraphAfterPlan: (snapshot: TurnEngineOptions["snapshot"]) => loadTaskGraphCurrentObservation(snapshot, options.taskGraphCommandPort, lease, root) } : {}),
       ...(state.pendingToolCalls?.length ? { toolCallRecovery: classifyToolCallRecovery(state.pendingToolCalls, (name, version) => toolRuntime.registry.resolve(name, version)) } : {}),
-      ...(rootTasks.checkCompletion ? { completionGate: async () => rootTasks.checkCompletion!({ lease, rootTaskId: root.id, now: now() }) } : {}),
+      ...(rootTasks.checkCompletion || selectedJobMode ? { completionGate: async () => {
+        const children = await rootTasks.checkCompletion?.({ lease, rootTaskId: root.id, now: now() })
+        if (children && !children.ok) return children
+        if (!selectedJobMode) return children ?? { ok: true as const }
+        return selectedJobArtifactCompletionGate({ commandPort: options.taskGraphCommandPort, lease, root })
+      } } : {}),
     })
     await executionProjection.start({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId })
     await sessionProjection.start({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId })

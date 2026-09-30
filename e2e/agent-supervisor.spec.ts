@@ -225,6 +225,10 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false, 
             content: { text: 'Second selected-job cover-letter fixture body.' }, provenanceRefs: ['persona:fixture-fact-next'], evidenceRefs: ['job:fixture-selected-job-next'],
           },
           review: null,
+          sourceEvidence: { freshness: 'current', items: [
+            { reference: 'job:fixture-selected-job-next', kind: 'job', label: 'Job description', text: 'Build principal robotics systems.' },
+            { reference: 'persona:fixture-fact-next', kind: 'persona', label: 'Profile fact · experience', text: 'Led reliable backend projects.' },
+          ] },
         })
       }
       const validRef = url.searchParams.get('contentHash') === `sha256:${'a'.repeat(64)}`
@@ -240,6 +244,11 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false, 
         },
         review: { status: 'passed', reviewHash: 'fixture-review-hash', evidenceRefs: ['resume:fixture-fact'], findings: [
           { code: 'unsupported_claim', severity: 'warning', message: 'Confirm this claim against your resume.', evidenceRefs: ['resume:fixture-fact'] },
+        ] },
+        sourceEvidence: { freshness: 'current', items: [
+          { reference: 'job:fixture-selected-job', kind: 'job', label: 'Job description', text: 'Build reliable cloud systems with TypeScript.' },
+          { reference: 'resume:fixture-fact', kind: 'resume', label: 'Base resume', text: 'Delivered production services using TypeScript.' },
+          { reference: 'persona:fixture-fact', kind: 'persona', label: 'Profile fact · experience', text: 'Led backend reliability work.' },
         ] },
       })
     }
@@ -649,6 +658,11 @@ test('selected-job preparation sends typed scope and restores the persisted draf
   await expect(draft).toHaveAttribute('data-draft-version', '1')
   await expect(draft).toContainText('unsupported_claim')
   await expect(draft).toContainText('Confirm this claim against your resume.')
+  await expect(draft.locator('[data-draft-source-evidence="current"]')).toContainText(isZh ? '来源版本与草稿一致。' : 'References match the current source versions.')
+  const jobEvidence = draft.locator('[data-source-evidence-item="job:fixture-selected-job"]')
+  await expect(jobEvidence).toContainText(isZh ? '职位 · Job description' : 'Job · Job description')
+  await expect(jobEvidence).toContainText('Build reliable cloud systems with TypeScript.')
+  await expect(draft.locator('[data-source-evidence-item="resume:fixture-fact"]')).toContainText('Delivered production services using TypeScript.')
 
   const plan = page.locator('[data-agent-task-graph-plan="true"]')
   await expect(plan).toBeVisible({ timeout: 10_000 })
@@ -699,6 +713,7 @@ test('selected-job preparation sends typed scope and restores the persisted draf
   await expect(restoredDraft).toContainText('resume:fixture-fact')
   await expect(restoredDraft).toContainText(isZh ? '通过' : 'passed')
   await expect(restoredDraft).toContainText('unsupported_claim')
+  await expect(restoredDraft.locator('[data-source-evidence-item="persona:fixture-fact"]')).toContainText('Led backend reliability work.')
   const restoredPlan = page.locator('[data-agent-task-graph-plan="true"]')
   await expect(restoredPlan).toBeVisible({ timeout: 10_000 })
   expect(await restoredPlan.evaluate(element => ({
@@ -795,6 +810,8 @@ test('a newer selected-job Turn hides the prior plan and draft until its graph a
   await expect(draft).toHaveAttribute('aria-label', 'Principal Engineer · Northstar Robotics v1')
   await expect(draft).toContainText('Second selected-job cover-letter fixture body.')
   await expect(draft).toContainText('job:fixture-selected-job-next')
+  await expect(draft.locator('[data-draft-source-evidence="current"]')).toContainText(isZh ? '来源版本与草稿一致。' : 'References match the current source versions.')
+  await expect(draft.locator('[data-source-evidence-item="job:fixture-selected-job-next"]')).toContainText('Build principal robotics systems.')
   await expect(page.locator('body')).not.toContainText('Persisted cover-letter fixture body.')
 
   const composer = page.locator('.agent-composer textarea')

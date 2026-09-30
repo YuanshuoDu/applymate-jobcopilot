@@ -30,6 +30,11 @@ function state(): CanonicalTurnState {
   return { scope: { userId: "user-1" }, goal: "Find jobs", modelProfileSnapshot: { provider: "fixture", model: "fixture" }, toolPolicySnapshot: {}, budgetSnapshot: { limits: { maxSteps: 4 } }, snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] } }
 }
 
+function selectedJobState(): CanonicalTurnState {
+  const current = state()
+  return { ...current, snapshot: { ...current.snapshot, businessRefs: [{ id: "job-1", kind: "job", ownerId: "user-1", label: "Selected role" }] } }
+}
+
 function store(events: RuntimeEvent[] = [], batches: RuntimeEvent[][] = [], itemUpdates: unknown[] = []): TurnEngineStore {
   return {
     startStep: async ({ stepId, ordinal }) => ({ id: stepId, ordinal }), updateStep: async () => undefined,
@@ -554,7 +559,7 @@ describe("createCanonicalTurnRuntime", () => {
     }))
     expect(modelContext?.blocks.map(block => block.id)).not.toContain("tool-result:forged-job-read")
     expect(modelContext?.blocks.find(block => block.id === "task-graph-current")?.trust).toBe("external_untrusted")
-    expect(readCurrent).toHaveBeenCalledOnce()
+    expect(readCurrent).toHaveBeenCalledTimes(2)
   })
 
   it("does not advertise agent.plan in the serving tool list with default production flags", async () => {
@@ -912,8 +917,106 @@ describe("createCanonicalTurnRuntime", () => {
 
   it("passes the server-owned completion gate for the canonical root", async () => {
     const fixture = setup()
-    await fixture.runtime.then(runtime => runtime.execute({ lease, signal: new AbortController().signal }))
+    await expect(fixture.runtime.then(runtime => runtime.execute({ lease, signal: new AbortController().signal })))
+      .resolves.toMatchObject({ status: "completed" })
     expect(fixture.roots.checkCompletion).toHaveBeenCalledWith(expect.objectContaining({ rootTaskId: "root-1", lease }))
+  })
+
+  it("keeps generic Turns blocked while child tasks are pending", async () => {
+    const roots = {
+      ...rootStore(),
+      checkCompletion: vi.fn(async () => ({ ok: false as const, blocker: "child_tasks_pending", feedback: "Child tasks are still running" })),
+    }
+    const fixture = setup({ rootTaskStore: roots })
+    const runtime = await fixture.runtime
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed" })
+    expect(roots.checkCompletion).toHaveBeenCalledOnce()
+    expect(roots.finish).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ errorCode: "business_precondition_failed" }) }))
+  })
+
+  it("requires a fresh exact selected-job draft review after the pending-child check", async () => {
+    const artifactRef = {
+      artifactId: "draft-1", version: 2, contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: `sha256:${"b".repeat(64)}`,
+    }
+    const reviewedGraph: TaskGraphCurrentState = {
+      revision: 2,
+      nodes: [
+        {
+          key: "writer", templateId: "cover_letter_writer", goal: "Draft", successCriteria: ["Save"], dependsOn: [], taskId: "writer-1",
+          status: "completed", readiness: "terminal", resultSummary: null, failureReason: null,
+          resultProjection: { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available", role: "writer", status: "completed", artifactRef },
+        },
+        {
+          key: "reviewer", templateId: "cover_letter_reviewer", goal: "Review", successCriteria: ["Review"], dependsOn: ["writer"], taskId: "reviewer-1",
+          status: "completed", readiness: "terminal", resultSummary: null, failureReason: null,
+          resultProjection: {
+            schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available", role: "reviewer", status: "completed",
+            artifactRef, reviewStatus: "needs_revision", reviewHash: `sha256:${"c".repeat(64)}`,
+          },
+        },
+      ],
+    }
+    const reads: TaskGraphCurrentState[] = [{ revision: 1, nodes: [] }, reviewedGraph]
+    const taskGraphCommandPort: TaskGraphCommandPort = {
+      appendAndSchedule: async () => ({ status: "accepted", revision: 1, nodes: [], readyTaskIds: [] }),
+      readCurrent: vi.fn(async () => reads.shift() ?? reviewedGraph),
+    }
+    const roots = rootStore()
+    const productionFlags = resolveProductionAgentFlags({
+      ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+    })
+    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+      workerId: "worker-1", productionFlags, taskGraphCommandPort,
+      selectedJobPreparationLoader: async () => ({ jobId: "job-1" }),
+      stateLoader: async () => ({ ...selectedJobState(), toolPolicySnapshot: {} }), rootTaskStore: roots as never,
+      turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
+      modelRuntimeFactory: async () => ({ adapter: {
+        ...model(() => []),
+        async *stream() {
+          yield { type: "text_delta", text: "The cover-letter draft is ready for review." }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      }, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "completed" })
+    expect(roots.checkCompletion).toHaveBeenCalledOnce()
+    expect(taskGraphCommandPort.readCurrent).toHaveBeenCalledTimes(2)
+    expect(taskGraphCommandPort.readCurrent).toHaveBeenLastCalledWith({
+      userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-1", parentTaskId: "root-1",
+      turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: 1,
+    })
+  })
+
+  it("keeps selected-job completion behind the pending-child check", async () => {
+    const roots = {
+      ...rootStore(),
+      checkCompletion: vi.fn(async () => ({ ok: false as const, blocker: "child_tasks_pending", feedback: "Child tasks are still running" })),
+    }
+    const taskGraphCommandPort: TaskGraphCommandPort = {
+      appendAndSchedule: async () => ({ status: "accepted", revision: 0, nodes: [], readyTaskIds: [] }),
+      readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
+    }
+    const productionFlags = resolveProductionAgentFlags({
+      ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+    })
+    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+      workerId: "worker-1", productionFlags, taskGraphCommandPort,
+      selectedJobPreparationLoader: async () => ({ jobId: "job-1" }),
+      stateLoader: async () => ({ ...selectedJobState(), toolPolicySnapshot: {} }), rootTaskStore: roots as never,
+      turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
+      modelRuntimeFactory: async () => ({ adapter: {
+        ...model(() => []),
+        async *stream() { yield { type: "text_delta", text: "Done." }; yield { type: "completed", finishReason: "stop" } },
+      }, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed" })
+    expect(roots.checkCompletion).toHaveBeenCalledOnce()
+    expect(taskGraphCommandPort.readCurrent).toHaveBeenCalledOnce()
   })
 
   it("fails closed before provider invocation when usage authorization is unavailable", async () => {
