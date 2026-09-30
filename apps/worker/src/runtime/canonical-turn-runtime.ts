@@ -78,6 +78,18 @@ function isSelectedJobRootTool(definition: unknown): boolean {
   return typeof name === "string" && SELECTED_JOB_ROOT_TOOLS.has(name)
 }
 
+function selectedJobSnapshot(snapshot: TurnEngineOptions["snapshot"]): TurnEngineOptions["snapshot"] {
+  return {
+    ...snapshot,
+    toolObservations: snapshot.toolObservations.filter(observation => {
+      const content = record(observation.content)
+      const toolName = content.toolName
+      return (typeof toolName === "string" && SELECTED_JOB_ROOT_TOOLS.has(toolName))
+        || (observation.id === "task-graph-current" && content.kind === "task_graph_current")
+    }),
+  }
+}
+
 export async function createCanonicalTurnRuntime(pool: pg.Pool, options: CanonicalTurnRuntimeOptions): Promise<{
   execute: TurnExecutor
   manager: AgentTreeManager
@@ -161,7 +173,8 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     })
     const root = await rootTasks.ensure({ lease, goal: state.goal, modelProfileSnapshot: state.modelProfileSnapshot, toolPolicySnapshot: state.toolPolicySnapshot, budgetSnapshot: state.budgetSnapshot, allowedActions, now: now() })
     taskGraphParentAttemptCount = root.attemptCount
-    const modelSnapshot = taskGraphPlanningEnabled ? await loadTaskGraphCurrentObservation(state.snapshot, options.taskGraphCommandPort, lease, root) : state.snapshot
+    const rootSnapshot = selectedJobMode ? selectedJobSnapshot(state.snapshot) : state.snapshot
+    const modelSnapshot = taskGraphPlanningEnabled ? await loadTaskGraphCurrentObservation(rootSnapshot, options.taskGraphCommandPort, lease, root) : rootSnapshot
     const owner = executionOwnerFence({ kind: "turn", taskId: root.id, lease })
     lifecycleOwner = { kind: "turn", taskId: root.id, lease }
     lifecycleSink = options.lifecycleSinkFactory?.({ lease, store: turnStore, owner }) ?? durableLifecycleSink(turnStore, owner)
@@ -173,7 +186,11 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const inputStore = createPgInputClaimStore(pool, state.scope)
     const baseContextBuilder = options.contextBuilderFactory?.({ pool, scope: state.scope }) ?? new StepContextBuilder(inputStore, createPgContextOwnerFence(pool))
     const contextBuilder: TurnEngineOptions["contextBuilder"] = {
-      build: request => baseContextBuilder.build({ ...request, taskId: root.id }),
+      build: request => baseContextBuilder.build({
+        ...request,
+        snapshot: selectedJobMode ? selectedJobSnapshot(request.snapshot) : request.snapshot,
+        taskId: root.id,
+      }),
     }
     const actorRole = (record(state.toolPolicySnapshot).role as PolicyRole | undefined) ?? "orchestrator"
     const engine = new TurnEngine({

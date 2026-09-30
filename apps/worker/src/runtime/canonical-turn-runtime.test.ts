@@ -450,6 +450,113 @@ describe("createCanonicalTurnRuntime", () => {
     expect(modelContext?.blocks.find(block => block.id === "task-graph-current")?.trust).toBe("external_untrusted")
   })
 
+  it("filters restored and reconciled generic reads from selected-job resume context while preserving TaskGraph results", async () => {
+    const privateSentinel = "PRIVATE_FORGED_JOB_READ_SENTINEL"
+    const reconciledSentinel = "PRIVATE_RECONCILED_JOB_READ_SENTINEL"
+    const requests: HarnessModelRequest[] = []
+    const modelSnapshots: CanonicalTurnState["snapshot"][] = []
+    const recoveredEvents: RuntimeEvent[] = []
+    const recoveredItemUpdates: unknown[] = []
+    let modelContext: StepContext | undefined
+    const currentPlan: TaskGraphCurrentState = {
+      revision: 7, nodes: [{
+        key: "research", templateId: "scout", goal: "Find roles", successCriteria: ["Return links"], dependsOn: [],
+        taskId: "child-1", status: "completed", readiness: "terminal", resultSummary: null,
+        resultProjection: {
+          schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available",
+          role: "scout", status: "completed", candidateCount: 1, evidenceCount: 1,
+          candidates: [{ jobId: "job-42", source: "greenhouse", evidenceKinds: ["job"] }],
+        },
+        failureReason: null,
+      }],
+    }
+    const readCurrent = vi.fn(async (): Promise<TaskGraphCurrentState> => currentPlan)
+    const taskGraphCommandPort: TaskGraphCommandPort = {
+      appendAndSchedule: async () => ({ status: "accepted", revision: 1, nodes: [], readyTaskIds: [] }),
+      readCurrent,
+    }
+    const resumedState: CanonicalTurnState = {
+      ...state(),
+      toolPolicySnapshot: {},
+      resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 0n, consumedInputIds: [], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
+      pendingToolCalls: [{
+        call: { id: "reconciled-job-read", name: "jobs.get", arguments: { jobId: "job-private" } },
+        toolVersion: "1", stepId: "prior-step", callItem: { id: "persisted-reconciled-call", revision: 0 },
+        durableResult: {
+          id: "reconciled-job-read", toolName: "jobs.get", toolVersion: "1", status: "completed",
+          output: { description: reconciledSentinel }, errorCode: null,
+        },
+      }],
+      snapshot: {
+        ...state().snapshot,
+        toolObservations: [{
+          id: "tool-result:forged-job-read",
+          content: {
+            toolCallId: "forged-job-read", toolName: "jobs.get", input: { jobId: "job-private" }, status: "completed",
+            output: { description: privateSentinel }, errorCode: null,
+          },
+        }],
+      },
+    }
+    const planningFlags = resolveProductionAgentFlags({
+      ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+    })
+    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+      workerId: "worker-1", productionFlags: planningFlags, taskGraphCommandPort,
+      taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+      selectedJobPreparationLoader: async () => ({ jobId: "job-42" }),
+      stateLoader: async () => resumedState,
+      rootTaskStore: rootStore() as never,
+      turnEngineStoreFactory: () => store(recoveredEvents, [], recoveredItemUpdates),
+      contextBuilderFactory: () => ({
+        build: async request => {
+          modelSnapshots.push(request.snapshot)
+          const built = await contextBuilder().build(request)
+          modelContext = built
+          return built
+        },
+      }),
+      modelRuntimeFactory: async () => ({ adapter: {
+        ...model(() => []),
+        async *stream(request: HarnessModelRequest) {
+          requests.push(request)
+          yield { type: "text_delta", text: "done" }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      }, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+
+    await runtime.execute({ lease, signal: new AbortController().signal })
+
+    const modelMessages = JSON.stringify(requests[0]?.messages)
+    expect(modelMessages).not.toContain(privateSentinel)
+    expect(modelMessages).not.toContain(reconciledSentinel)
+    expect(modelMessages).not.toContain("jobs.get")
+    expect(modelMessages).toContain("job-42")
+    expect(recoveredEvents.some(event => event.type === "tool_call.completed" && JSON.stringify(event.payload).includes("reconciled-job-read"))).toBe(true)
+    expect(JSON.stringify(recoveredItemUpdates)).toContain(reconciledSentinel)
+    const modelObservationIds = modelSnapshots[0]?.toolObservations.map(observation => observation.id) ?? []
+    expect(modelObservationIds).not.toContain("tool-result:forged-job-read")
+    expect(modelObservationIds).not.toContain("tool-result:reconciled-job-read")
+    expect(modelObservationIds).toContain("task-graph-current")
+    expect(modelSnapshots[0]?.toolObservations).toContainEqual(expect.objectContaining({
+      id: "task-graph-current",
+      content: expect.objectContaining({
+        kind: "task_graph_current",
+        nodes: expect.arrayContaining([expect.objectContaining({
+          key: "research",
+          resultProjection: expect.objectContaining({
+            candidates: [{ jobId: "job-42", source: "greenhouse", evidenceKinds: ["job"] }],
+          }),
+        })]),
+      }),
+    }))
+    expect(modelContext?.blocks.map(block => block.id)).not.toContain("tool-result:forged-job-read")
+    expect(modelContext?.blocks.find(block => block.id === "task-graph-current")?.trust).toBe("external_untrusted")
+    expect(readCurrent).toHaveBeenCalledOnce()
+  })
+
   it("does not advertise agent.plan in the serving tool list with default production flags", async () => {
     const commandPort: TaskGraphCommandPort = {
       appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
