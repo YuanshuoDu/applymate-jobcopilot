@@ -4064,7 +4064,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         selectedJob: {
           queueName: artifactReviewTrace.queueName, userId: artifactOwner.userId, sessionId: artifactOwner.sessionId,
           turnId: artifactOwner.turnId, rootTaskId: artifactReviewTrace.rootTaskId, jobId: artifactReviewTrace.jobId,
-          body: artifactReviewTrace.body, writerTaskId: artifactReviewTrace.writerTask.id,
+          expectedBodyHash: hashArtifactContent(artifactReviewTrace.body), writerTaskId: artifactReviewTrace.writerTask.id,
           reviewerTaskId: artifactReviewTrace.reviewerTask.id,
           stopReviewerTaskId: artifactReviewTrace.stopReviewerTask.id,
         },

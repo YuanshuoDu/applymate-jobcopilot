@@ -574,7 +574,14 @@ function selectedJobReviewerModel(selected, task, observations) {
         return
       }
       if (rounds === 2) {
-        observations.sawBody = JSON.stringify(request.messages).includes(selected.body)
+        const readResult = record(latestToolResult(request, readCallId))
+        const readArtifactRef = record(readResult?.artifactRef)
+        observations.sawBody = readArtifactRef?.artifactId === artifactRef.artifactId
+          && readArtifactRef?.version === artifactRef.version
+          && readArtifactRef?.contentHash === artifactRef.contentHash
+          && readArtifactRef?.sourceDigest === artifactRef.sourceDigest
+          && typeof readResult?.content === "string"
+          && hashArtifactContent(readResult.content) === selected.expectedBodyHash
         if (!observations.sawBody) throw new Error("p3_selected_job_reviewer_did_not_receive_artifact_body")
         if (stopBeforeReview) {
           say("P3_SELECTED_JOB_STOP_REVIEW_READY " + task.id)
@@ -999,6 +1006,11 @@ async function runFirstWorker() {
   await waitForParentSuspended(ownerId); await waitForStop()
 }
 async function runSecondWorker() {
+  const selectedJob = record(ids.selectedJob)
+  if (selectedJob && (Object.prototype.hasOwnProperty.call(selectedJob, "artifactRef")
+    || Object.prototype.hasOwnProperty.call(selectedJob, "body"))) {
+    throw new Error("p3_second_worker_fixture_input_contains_private_artifact_data")
+  }
   const ownerId = "p3-process-restart-worker-" + process.pid, runtime = await startRuntime(ownerId, true)
   bootstrap = await createProductionWorkerBootstrap({ pool, runtime, ownerId, turnRecoveryIntervalMs: 10,
     waitResolver: { intervalMs: 10, ownerId: "p3-process-restart-wait-resolver-" + process.pid },
