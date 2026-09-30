@@ -32,8 +32,8 @@ function selectedJobSourceDigest(job: WorkerJobRecord, resume: { readonly id: st
     { sourceRef: `job:${job.id}`, content: job },
     { sourceRef: `resume:${resume.id}`, content: resume.content },
     ...facts.map(fact => ({
-      sourceRef: `persona:${fact.sourceRef ?? fact.id}`,
-      content: { id: fact.id, key: fact.key, value: fact.value, confidence: Number(fact.confidence) },
+      sourceRef: `persona:${fact.id}`,
+      content: { id: fact.id, key: fact.key, value: fact.value, confidence: Number(fact.confidence), sourceRef: fact.sourceRef },
     })),
   ]
   const sources = materials.map(item => ({ sourceRef: item.sourceRef, contentHash: hashContent(item.content) }))

@@ -4,7 +4,18 @@ import { computeArtifactSourceDigest, InMemoryArtifactToolStore } from "../tools
 import { bindSelectedJobReadInput, loadSelectedJobArtifactContext } from "./selected-job-artifact-context.js"
 import { resolveCoverLetterBase } from "./selected-job-artifact-context.js"
 
-function pool(options: { job?: boolean; resume?: boolean } = {}) {
+type PersonaFactFixture = {
+  id: string
+  key: string
+  category: string
+  value: string
+  source: string
+  sourceRef: string | null
+  confidence: number
+  allowedUses: string[]
+}
+
+function pool(options: { job?: boolean; resume?: boolean; personaFacts?: PersonaFactFixture[] } = {}) {
   const calls: Array<{ sql: string; values: readonly unknown[] }> = []
   const client = {
     query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
@@ -18,7 +29,7 @@ function pool(options: { job?: boolean; resume?: boolean } = {}) {
         id: "resume-1", name: "Base", kind: "base", origin: "manual", isDefault: true, content: { text: "Engineer with TypeScript experience" },
         createdAt: new Date("2026-01-01T00:00:00Z"), updatedAt: new Date("2026-01-02T00:00:00Z"),
       }] }
-      if (sql.includes("FROM persona_facts")) return { rows: [{
+      if (sql.includes("FROM persona_facts")) return { rows: options.personaFacts ?? [{
         id: "fact-1", key: "language", category: "language", value: "English C1", source: "resume", sourceRef: "resume:language",
         confidence: 0.98, allowedUses: ["cover_letter"],
       }] }
@@ -38,12 +49,12 @@ describe("loadSelectedJobArtifactContext", () => {
         url: "https://jobs.example/1", source: "greenhouse", salary: "EUR 80k", description: "Build systems", keywords: "TypeScript",
       } },
       { sourceRef: "resume:resume-1", content: { text: "Engineer with TypeScript experience" } },
-      { sourceRef: "persona:resume:language", content: { id: "fact-1", key: "language", value: "English C1", confidence: 0.98 } },
+      { sourceRef: "persona:fact-1", content: { id: "fact-1", key: "language", value: "English C1", confidence: 0.98, sourceRef: "resume:language" } },
     ]
     const expectedDigest = computeArtifactSourceDigest("job-1", expectedSources)
     expect(bundle.preparation).toEqual({
       jobId: "job-1", sourceDigest: expectedDigest,
-      evidenceRefs: ["job:job-1", "persona:resume:language", "resume:resume-1"],
+      evidenceRefs: ["job:job-1", "persona:fact-1", "resume:resume-1"],
     })
     expect(bundle.transientSources).toEqual(expectedSources)
     expect(bundle.preparation).not.toHaveProperty("transientSources")
@@ -57,6 +68,25 @@ describe("loadSelectedJobArtifactContext", () => {
     expect(personaCalls[0]?.sql).toContain(`"status" = 'confirmed'`)
     expect(personaCalls[0]?.sql).toContain(`"expires_at" IS NULL OR "expires_at" > NOW()`)
     expect(personaCalls[0]?.sql).toContain(`$3 = ANY("allowedUses")`)
+  })
+
+  it("keeps Persona evidence refs unique when facts share a source and hashes that source", async () => {
+    const sharedSource = "resume:source-42"
+    const facts: PersonaFactFixture[] = [
+      { id: "fact-1", key: "language", category: "language", value: "English C1", source: "resume", sourceRef: sharedSource, confidence: 0.98, allowedUses: ["cover_letter"] },
+      { id: "fact-2", key: "experience", category: "experience", value: "Built reliable systems", source: "resume", sourceRef: sharedSource, confidence: 0.91, allowedUses: ["cover_letter"] },
+    ]
+    const bundle = await loadSelectedJobArtifactContext(pool({ personaFacts: facts }) as never, "user-1", "job-1")
+    const personaSources = bundle.transientSources.filter(source => source.sourceRef.startsWith("persona:"))
+
+    expect(personaSources.map(source => source.sourceRef)).toEqual(["persona:fact-1", "persona:fact-2"])
+    expect(personaSources.map(source => (source.content as { sourceRef: string }).sourceRef)).toEqual([sharedSource, sharedSource])
+    expect(bundle.preparation.evidenceRefs).toEqual(["job:job-1", "persona:fact-1", "persona:fact-2", "resume:resume-1"])
+    expect(bundle.preparation.sourceDigest).toBe(computeArtifactSourceDigest("job-1", bundle.transientSources))
+
+    const changedFacts = facts.map(fact => ({ ...fact, sourceRef: "resume:source-43" }))
+    const changed = await loadSelectedJobArtifactContext(pool({ personaFacts: changedFacts }) as never, "user-1", "job-1")
+    expect(changed.preparation.sourceDigest).not.toBe(bundle.preparation.sourceDigest)
   })
 
   it("binds selected read identity and use case to server-loaded values", async () => {

@@ -28,8 +28,8 @@ function digestFor(job = jobSource, resume = resumeSource, facts = personaSource
     { sourceRef: `job:${job.id}`, contentHash: hashContent(job) },
     { sourceRef: `resume:${resume.id}`, contentHash: hashContent(resume.content) },
     ...facts.map(fact => ({
-      sourceRef: `persona:${fact.sourceRef ?? fact.id}`,
-      contentHash: hashContent({ id: fact.id, key: fact.key, value: fact.value, confidence: Number(fact.confidence) }),
+      sourceRef: `persona:${fact.id}`,
+      contentHash: hashContent({ id: fact.id, key: fact.key, value: fact.value, confidence: Number(fact.confidence), sourceRef: fact.sourceRef }),
     })),
   ].sort((left, right) => left.sourceRef.localeCompare(right.sourceRef))
   return hashContent({ jobId: job.id, sources })
@@ -120,6 +120,23 @@ describe('session-scoped immutable cover-letter version read', () => {
     const body = await response.json()
     expect(response.status).toBe(200)
     expect(body.review).toMatchObject({ status: 'passed', evidenceRefs: ['job:job-1'], findings: [{ message: 'Supported claim.' }] })
+  })
+
+  it('keeps a review current when multiple Persona facts share one sourceRef', async () => {
+    const sharedSourceFacts = [
+      { id: 'fact-1', key: 'language', value: 'English C1', sourceRef: 'resume:source-42', confidence: 0.98 },
+      { id: 'fact-2', key: 'experience', value: 'Built reliable systems', sourceRef: 'resume:source-42', confidence: 0.91 },
+    ]
+    const matchingDigest = digestFor(jobSource, resumeSource, sharedSourceFacts)
+    mocks.persona.mockResolvedValueOnce(sharedSourceFacts)
+    mocks.version.mockResolvedValueOnce(artifact({ sourceDigest: matchingDigest }))
+    mocks.review.mockResolvedValueOnce({ status: 'passed', reviewHash: 'review-hash', evidenceRefs: ['persona:fact-1'], findings: [] })
+    const { GET } = await import('./route')
+    const response = await GET(request(`?contentHash=${contentHash}&sourceDigest=${matchingDigest}`) as never, context)
+    const body = await response.json()
+
+    expect(response.status).toBe(200)
+    expect(body.review).toEqual({ status: 'passed', reviewHash: 'review-hash', evidenceRefs: ['persona:fact-1'], findings: [] })
   })
 
   it.each([

@@ -146,8 +146,8 @@ export async function loadSelectedJobArtifactContext(
     { sourceRef: `job:${job.id}`, content: job },
     { sourceRef: `resume:${resume.id}`, content: resume.content },
     ...personaResult.facts.map(fact => ({
-      sourceRef: `persona:${fact.sourceRef ?? fact.id}`,
-      content: { id: fact.id, key: fact.key, value: fact.value, confidence: fact.confidence },
+      sourceRef: `persona:${fact.id}`,
+      content: { id: fact.id, key: fact.key, value: fact.value, confidence: fact.confidence, sourceRef: fact.sourceRef },
     })),
   ]
   return {
