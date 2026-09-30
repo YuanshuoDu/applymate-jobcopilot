@@ -918,7 +918,7 @@ test('Plan Ledger restores the same persisted trace session after SSE reconnect 
   expect(unversionedLookup.planLedger).toBeNull()
 
   const viewportWidth = await page.evaluate(() => window.innerWidth)
-  if (viewportWidth <= 900) await page.getByRole('button', { name: /conversations/i }).first().click()
+  if (viewportWidth <= 900) await page.getByRole('button', { name: locale === 'zh' ? '打开对话' : 'Open conversations', exact: true }).click()
   await page.locator('.agent-session-console').getByRole('button').filter({ hasText: GOAL_B }).first().click()
 
   const switchedPlan = page.locator('[data-agent-task-graph-plan="true"]')
