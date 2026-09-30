@@ -2,7 +2,7 @@ name: Agent Workspace E2E
 
 on:
   pull_request:
-    branches: [master, codex/ah2-495-agent-brain-supervisor]
+    branches: [master]
   push:
     branches: [master]
 

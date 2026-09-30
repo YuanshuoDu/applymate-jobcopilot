@@ -1,7 +1,7 @@
 name: CI
 on:
   pull_request:
-    branches: [master, codex/ah2-495-agent-brain-supervisor]
+    branches: [master]
   push:
     branches: [master]
 concurrency:
