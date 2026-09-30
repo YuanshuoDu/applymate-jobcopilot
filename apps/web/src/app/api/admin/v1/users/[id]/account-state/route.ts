@@ -54,7 +54,16 @@ export async function PATCH(request: NextRequest, { params }: Params) {
       if (status === UserAccountStatus.suspended) {
         await tx.agentAutomation.updateMany({ where: { userId: id }, data: { enabled: false } })
         await tx.applicationTask.updateMany({
-          where: { userId: id, status: { in: ['filling', 'waiting_for_authorization'] } },
+          where: {
+            userId: id,
+            status: { in: ['filling', 'waiting_for_authorization'] },
+            // Evaluate the submission fence in the UPDATE predicate itself so
+            // a concurrent request-start checkpoint cannot be overwritten.
+            OR: [
+              { checkpoint: null },
+              { checkpoint: { notIn: ['submission_request_started', 'submission_uncertain'] } },
+            ],
+          },
           data: { status: 'waiting_for_user', checkpoint: 'account_suspended', error: 'Account suspended; external processing was stopped.' },
         })
       }

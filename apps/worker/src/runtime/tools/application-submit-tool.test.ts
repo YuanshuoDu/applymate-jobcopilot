@@ -4,6 +4,7 @@ import type { AgentApproval } from "@jobcopilot/agent-protocol"
 import { InMemoryArtifactToolStore } from "./artifact-tools.js"
 import { createApplicationSubmitTool, type SubmissionApprovalStore, type SubmissionAttemptStore } from "./application-submit-tool.js"
 import type { ApplicationTarget, SubmissionAttempt } from "../../db/application-submit-repo.js"
+import type { SubmissionRequestIntent } from "../../flows/submission-intent.js"
 
 const userId = "user-a"
 const jobId = "job-a"
@@ -62,7 +63,7 @@ function harness(options: { resourceHash?: string; approvalError?: string; targe
     }),
     consumeSubmission: vi.fn(async () => approval(options.resourceHash ?? base.hash, "consumed")),
   }
-  const submit = vi.fn(async () => ({ confirmationId: "confirmation-1", postSubmitUrl: "https://jobs.example/confirmation" }))
+  const submit = vi.fn(async (_input: { beforeSubmit: (intent?: SubmissionRequestIntent) => Promise<boolean> }) => ({ confirmationId: "confirmation-1", postSubmitUrl: "https://jobs.example/confirmation" }))
   const tool = createApplicationSubmitTool({
     targets: { findTarget: vi.fn(async () => options.target === undefined ? target() : options.target) }, attempts, approvals, artifacts, submit,
   })
@@ -79,6 +80,18 @@ describe("application.submit typed tool", () => {
     await expect(tested.tool.execute(context(), input())).resolves.toMatchObject({ status: "submitted", confirmationId: "confirmation-1" })
     expect(tested.submit).toHaveBeenCalledOnce()
     expect(tested.attempts.rows.get("receipt-a")).toMatchObject({ state: "submitted", responseRef: "confirmation-1" })
+  })
+
+  it("preserves the exact request intent through the tool's final provider guard", async () => {
+    const tested = harness()
+    const intent: SubmissionRequestIntent = { url: "https://jobs.example/api/applications", method: "POST" }
+    tested.submit.mockImplementation(async ({ beforeSubmit }) => {
+      await expect(beforeSubmit(intent)).resolves.toBe(true)
+      return { confirmationId: "confirmation-1", postSubmitUrl: "https://jobs.example/confirmation" }
+    })
+
+    await expect(tested.tool.execute(context(), input())).resolves.toMatchObject({ status: "submitted" })
+    expect(tested.submit).toHaveBeenCalledOnce()
   })
 
   it("returns the durable confirmation on a duplicate without calling the provider", async () => {

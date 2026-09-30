@@ -37,6 +37,7 @@ export class InMemoryTerminalEventPort implements TerminalEventPort {
 }
 
 export type TerminalEventPool = Pick<pg.Pool, "connect">
+type SessionRow = { status: string }
 
 /** Durable terminal event adapter. The existing Web interrupt event is recognized as the same terminal. */
 export function createPgTerminalEventPort(pool: TerminalEventPool, now: () => Date = () => new Date()): TerminalEventPort {
@@ -51,6 +52,11 @@ async function appendTerminalEvent(pool: TerminalEventPool, input: TerminalEvent
   try {
     await client.query("BEGIN")
     await client.query("SELECT set_config($1, $2, true)", ["app.user_id", input.userId])
+    const session = await client.query<SessionRow>(
+      `SELECT "status" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 FOR UPDATE`,
+      [input.sessionId, input.userId],
+    )
+    if (!session.rows[0]) throw new TerminalEventConflictError("Terminal event session was not found")
     const turn = await client.query<{ status: string }>(
       `SELECT "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 FOR UPDATE`,
       [input.turnId, input.sessionId, input.userId],
@@ -70,6 +76,9 @@ async function appendTerminalEvent(pool: TerminalEventPool, input: TerminalEvent
         return "duplicate"
       }
       throw new TerminalEventConflictError(`Turn already has terminal event ${existing.rows[0].type}`)
+    }
+    if (["aborted", "archived"].includes(session.rows[0].status)) {
+      throw new TerminalEventConflictError("Terminal event session is closed")
     }
     if (turn.rows[0].status !== "interrupted") {
       const updated = await client.query(

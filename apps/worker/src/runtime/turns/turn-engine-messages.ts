@@ -87,7 +87,9 @@ export function buildModelRequest(input: {
   taskId: string
   signal: AbortSignal
   maxOutputTokens?: number
+  outputSchema?: unknown
   continuation?: ModelContinuation
+  freshSteering?: boolean
 }): HarnessModelRequest {
   return {
     schemaVersion: "agent-harness.v2",
@@ -96,6 +98,7 @@ export function buildModelRequest(input: {
     messages: contextToModelMessages(input.context),
     tools: [...input.tools],
     capabilities: capabilities(input.model.profile),
+    ...(input.outputSchema === undefined ? {} : { outputSchema: input.outputSchema }),
     ...(input.model.profile.nativeTools && input.tools.length > 0 ? { toolChoice: "auto" as const } : {}),
     ...(input.model.profile.continuationCursor && input.continuation ? { continuation: input.continuation } : {}),
     ...(input.maxOutputTokens === undefined ? {} : { maxOutputTokens: input.maxOutputTokens }),

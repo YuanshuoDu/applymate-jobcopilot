@@ -28,6 +28,22 @@ const mocks = vi.hoisted(() => ({
   loadAtsPolicy: vi.fn(),
   canUseAtsSource: vi.fn().mockReturnValue(true),
 }));
+const approvalMocks = vi.hoisted(() => ({
+  inspectSubmission: vi.fn().mockResolvedValue({
+    type: "submit_application",
+    status: "approved",
+    scope: {
+      userId: "user-1",
+      sessionId: "agent-session-1",
+      turnId: "agent-turn-1",
+      jobId: "job-1",
+      toolCallId: "application-submit:application-task-1",
+      action: "submit_application",
+    },
+    payload: { applicationTaskId: "application-task-1", jobId: "job-1" },
+  }),
+}));
+const submitToolMocks = vi.hoisted(() => ({ create: vi.fn() }));
 
 vi.mock("bullmq", () => ({
   Queue: vi.fn().mockImplementation(() => ({ add: vi.fn() })),
@@ -105,6 +121,31 @@ vi.mock("../db/application-task-state.js", () => ({
   applicationTaskStillActive: mocks.applicationTaskStillActive,
   needsUserTakeover: vi.fn(() => false),
 }));
+vi.mock("../runtime/approval/pg-store.js", () => ({
+  createPgApprovalStore: vi.fn(() => ({ inspectSubmission: approvalMocks.inspectSubmission })),
+}));
+vi.mock("../runtime/interrupt/application-submission-probe.js", () => ({
+  acquireApplicationSubmissionStartFence: vi.fn(),
+  isApplicationSubmissionStopped: vi.fn().mockResolvedValue(false),
+  startApplicationSubmissionStopProbe: vi.fn(() => ({ stop: vi.fn() })),
+}));
+vi.mock("../runtime/tools/application-submit-tool.js", () => ({
+  createPgApplicationSubmitTool: submitToolMocks.create.mockImplementation((
+    { submit }: { submit: (input: { beforeSubmit: (intent?: unknown) => Promise<boolean> }) => Promise<unknown> },
+  ) => ({
+    execute: async () => {
+      try {
+        await submit({ beforeSubmit: async () => true });
+        return { status: "submitted", confirmationId: "application:application-task-1", postSubmitUrl: null, errorCode: null, output: null };
+      } catch (error) {
+        const errorCode = error && typeof error === "object" && "code" in error && typeof error.code === "string"
+          ? error.code
+          : "browser_failed";
+        return { status: "failed", confirmationId: null, postSubmitUrl: null, errorCode, output: null };
+      }
+    },
+  })),
+}));
 vi.mock("node:fs", () => ({ unlinkSync: vi.fn() }));
 
 const payload = {
@@ -116,6 +157,8 @@ const payload = {
   personaId: "persona-1",
   resumePath: "/resume.pdf",
   dryRun: true,
+  receiptId: "approval-1",
+  constraintHash: "c".repeat(64),
 };
 
 describe("apply-queue CAPTCHA handling", () => {
@@ -145,6 +188,20 @@ describe("apply-queue CAPTCHA handling", () => {
     mocks.runGreenhouseFlow.mockResolvedValue({ status: "submitted", durationMs: 1 });
     mocks.runSmartRecruitersFlow.mockResolvedValue({ status: "submitted", durationMs: 1 });
     mocks.agentRun.mockResolvedValue({ status: "submitted", durationMs: 1 });
+    approvalMocks.inspectSubmission.mockResolvedValue({
+      type: "submit_application",
+      status: "approved",
+      scope: {
+        userId: "user-1",
+        sessionId: "agent-session-1",
+        turnId: "agent-turn-1",
+        jobId: "job-1",
+        toolCallId: "application-submit:application-task-1",
+        action: "submit_application",
+      },
+      payload: { applicationTaskId: "application-task-1", jobId: "job-1" },
+    });
+    submitToolMocks.create.mockClear();
     await import("./apply-queue.js");
   });
 
@@ -215,8 +272,8 @@ describe("apply-queue CAPTCHA handling", () => {
 
   it("stops before submit when a challenge appears during the browser pass", async () => {
     mocks.detectCaptcha.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
-    mocks.agentRun.mockImplementationOnce(async (_page: unknown, task: { beforeSubmit?: () => Promise<boolean> }) => {
-      const allowed = await task.beforeSubmit?.();
+    mocks.agentRun.mockImplementationOnce(async (_page: unknown, task: { beforeSubmit?: (intent?: { url: string; method: string }) => Promise<boolean> }) => {
+      const allowed = await task.beforeSubmit?.({ url: "https://jobs.example/apply", method: "POST" });
       return allowed
         ? { status: "submitted", durationMs: 1 }
         : { status: "submission_blocked", durationMs: 1, error: "Submission blocked: runtime authorization guard denied the submit." };
@@ -245,7 +302,7 @@ describe("apply-queue CAPTCHA handling", () => {
       expect.objectContaining({ jobId: "job-1" })
     );
     expect(mocks.insertApplyResult).toHaveBeenCalledWith(
-      expect.objectContaining({ atsType: "smartrecruiters", flowUsed: "programmatic" })
+      expect.objectContaining({ atsType: "smartrecruiters", flowUsed: "application.submit" })
     );
   });
 });

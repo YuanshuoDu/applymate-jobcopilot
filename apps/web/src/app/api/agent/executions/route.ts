@@ -1,7 +1,7 @@
 import { NextRequest } from "next/server"
+import { AgentCommandError, AgentCommandService } from "@/lib/agent/control-plane/commands"
 import { db } from "@/lib/db"
 import { err, isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
-import { cancelAgentExecution } from "@/lib/agent/execution-control"
 
 export async function GET(req: NextRequest) {
   const auth = await requireAuth(req)
@@ -33,18 +33,23 @@ export async function DELETE(req: NextRequest) {
       where: {
         userId: auth.userId,
         sessionId,
-        status: { notIn: ["completed", "failed", "cancelled"] },
+        status: { notIn: ["completed", "failed"] },
       },
       select: { id: true },
     })
     id = execution?.id ?? null
   }
   if (!id) return err(sessionId ? "No active execution found for this session" : "Execution id is required", 404)
-  const cancelled = await cancelAgentExecution({ id, userId: auth.userId })
-  if (!cancelled) return err("Execution cannot be cancelled", 409)
-  await db.agentSession.updateMany({
-    where: { userId: auth.userId, execution: { is: { id } } },
-    data: { status: "aborted", completedAt: new Date(), memorySummary: "Agent execution cancelled by user." },
-  })
-  return ok({ cancelled: true })
+  try {
+    const cancelled = await new AgentCommandService(db).cancelExecution({
+      executionId: id,
+      userId: auth.userId,
+      sessionId,
+    })
+    if (!cancelled) return err("Execution cannot be cancelled", 409)
+    return ok({ cancelled: true })
+  } catch (error: unknown) {
+    if (error instanceof AgentCommandError) return err(error.message, error.status)
+    throw error
+  }
 }

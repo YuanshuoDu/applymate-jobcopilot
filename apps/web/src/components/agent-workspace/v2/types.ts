@@ -1,4 +1,4 @@
-export type TaskNodeKind = "turn" | "step" | "tool"
+export type TaskNodeKind = "turn" | "step" | "tool" | "task"
 
 export type TaskTreeNode = {
   readonly id: string
@@ -6,6 +6,8 @@ export type TaskTreeNode = {
   readonly label: string
   readonly status: string
   readonly itemId?: string
+  readonly detail?: string
+  readonly resultAvailable?: boolean
   readonly children?: readonly TaskTreeNode[]
 }
 

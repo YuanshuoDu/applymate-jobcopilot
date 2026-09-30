@@ -14,6 +14,7 @@ export type InterruptPersistenceClient = Pick<pg.PoolClient, "query" | "release"
 export type InterruptPersistencePool = Pick<pg.Pool, "connect">
 
 export type InterruptPersistenceErrorCode = "turn_not_found" | "turn_not_active" | "persistence_conflict"
+type SessionRow = { status: string }
 
 export class InterruptPersistenceError extends Error {
   constructor(readonly code: InterruptPersistenceErrorCode, message: string) {
@@ -38,6 +39,15 @@ function validateInput(input: InterruptRequestInput): void {
   assertInterruptTarget(input)
   if (input.requestId.trim().length === 0) throw new TypeError("Interrupt requestId must be a non-empty string")
   if (input.requestedAt && Number.isNaN(input.requestedAt.getTime())) throw new TypeError("Interrupt requestedAt must be a valid Date")
+}
+
+async function lockSession(client: InterruptPersistenceClient, input: InterruptRequestInput): Promise<SessionRow> {
+  const result = await client.query<SessionRow>(
+    `SELECT "status" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 FOR UPDATE`,
+    [input.sessionId, input.userId],
+  )
+  if (!result.rows[0]) throw new InterruptPersistenceError("persistence_conflict", "Interrupt session was not found")
+  return result.rows[0]
 }
 
 export class InMemoryInterruptPersistence implements InterruptPersistencePort {
@@ -77,6 +87,7 @@ async function persistInterrupt(pool: InterruptPersistencePool, input: Interrupt
   try {
     await client.query("BEGIN")
     await client.query("SELECT set_config($1, $2, true)", ["app.user_id", input.userId])
+    const session = await lockSession(client, input)
     const turn = await client.query<{ status: string }>(
       `SELECT "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 FOR UPDATE`,
       [input.turnId, input.sessionId, input.userId],
@@ -93,6 +104,9 @@ async function persistInterrupt(pool: InterruptPersistencePool, input: Interrupt
       await client.query("COMMIT")
       committed = true
       return { ...input, reason: interruptReason(input.reason), persistedAt: toDate(existing.rows[0]?.createdAt) ?? timestamp, disposition: "duplicate" }
+    }
+    if (["aborted", "archived"].includes(session.status)) {
+      throw new InterruptPersistenceError("persistence_conflict", "Interrupt session is closed")
     }
     if (!ACTIVE_TURN_STATUSES.includes(turn.rows[0].status as typeof ACTIVE_TURN_STATUSES[number])) {
       throw new InterruptPersistenceError("turn_not_active", "Interrupt target Turn is no longer active")

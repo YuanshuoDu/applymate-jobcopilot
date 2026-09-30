@@ -10,11 +10,13 @@ function mockLeverPage(url = "https://jobs.lever.co/spotify/abc123/apply"): Page
       first: () => ({
         count: () => Promise.resolve(1),
         isVisible: () => Promise.resolve(true),
+        evaluate: vi.fn(async () => ({ url: "https://jobs.lever.co/spotify/apply", method: "POST" })),
         click: vi.fn().mockResolvedValue(undefined),
         setInputFiles: vi.fn().mockResolvedValue(undefined),
       }),
       count: () => Promise.resolve(1),
       isVisible: () => Promise.resolve(true),
+      evaluate: vi.fn(async () => ({ url: "https://jobs.lever.co/spotify/apply", method: "POST" })),
       click: vi.fn().mockResolvedValue(undefined),
       setInputFiles: vi.fn().mockResolvedValue(undefined),
     }),

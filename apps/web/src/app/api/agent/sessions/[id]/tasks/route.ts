@@ -30,7 +30,8 @@ export async function GET(request: NextRequest, context: RouteContext) {
     orderBy: [{ createdAt: "asc" }, { id: "asc" }],
     take: page.limit + 1,
     select: {
-      id: true, sessionId: true, role: true, taskType: true, status: true, goal: true, confidence: true,
+      id: true, sessionId: true, turnId: true, rootTaskId: true, parentTaskId: true, path: true,
+      role: true, taskType: true, status: true, goal: true, confidence: true,
       failureReason: true, result: true, createdAt: true, updatedAt: true,
     },
   })

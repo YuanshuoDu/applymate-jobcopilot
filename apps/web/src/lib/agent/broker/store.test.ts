@@ -20,7 +20,10 @@ function fakeDb() {
   const tx = {
     $queryRaw: vi.fn(async (query: unknown) => {
       const strings = (query as { strings?: readonly string[] }).strings ?? []
-      return strings.join(" ").includes("SELECT") ? [{ id: "session_1" }] : [{ eventSequence: BigInt(9) }]
+      const sql = strings.join(" ")
+      if (sql.includes('FROM "agent_sessions"')) return [{ id: "session_1" }]
+      if (sql.includes('FROM "agent_events"')) return [{ hasRequest: true, hasRevision: false }]
+      return [{ eventSequence: BigInt(9) }]
     }),
     agentTurn: {
       findFirst: vi.fn(async () => ({ ...turn })),

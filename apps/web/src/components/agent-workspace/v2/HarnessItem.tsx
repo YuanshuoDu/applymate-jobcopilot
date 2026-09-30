@@ -46,7 +46,7 @@ export function HarnessItem({ item, highlightedFinal = false, onSuggestedAction 
       </div>
       {renderItemBody(item, t, onSuggestedAction)}
       <div style={{ marginTop: 11, paddingTop: 8, borderTop: '1px solid var(--border)', color: 'var(--text-muted)', fontSize: 10 }}>
-        {t('agent.itemStatus')}: {item.status}
+        {t('agent.itemStatus')}: {itemStatusLabel(item.status, t)}
       </div>
     </article>
   )
@@ -79,7 +79,7 @@ function PlanBody({ item, t }: { item: TimelineItem; t: (key: string) => string 
   if (steps.length === 0) return <Fallback label={t('agent.planUnavailable')} />
   return (
     <div data-agent-plan="true" style={{ display: 'grid', gap: 7 }}>
-      {steps.map(step => <div key={step.id} style={{ display: 'flex', gap: 8, alignItems: 'flex-start', fontSize: 12 }}><span aria-hidden="true" style={{ color: step.status === 'completed' || step.status === 'passed' ? 'var(--c-success)' : 'var(--text-muted)' }}>{step.status === 'completed' || step.status === 'passed' ? '✓' : '○'}</span><span style={{ flex: 1 }}>{step.label}</span><span style={{ color: 'var(--text-muted)', fontSize: 10 }}>{step.status}</span></div>)}
+      {steps.map(step => <div key={step.id} style={{ display: 'flex', gap: 8, alignItems: 'flex-start', fontSize: 12 }}><span aria-hidden="true" style={{ color: step.status === 'completed' || step.status === 'passed' ? 'var(--c-success)' : 'var(--text-muted)' }}>{step.status === 'completed' || step.status === 'passed' ? '✓' : '○'}</span><span style={{ flex: 1 }}>{step.label}</span><span style={{ color: 'var(--text-muted)', fontSize: 10 }}>{itemStatusLabel(step.status, t)}</span></div>)}
     </div>
   )
 }
@@ -88,7 +88,7 @@ export function ToolLifecycleCard({ item, t }: { item: TimelineItem; t?: (key: s
   const translate = t ?? ((key: string) => key)
   const data = isRecord(item.content) ? item.content : {}
   const toolName = stringValue(data.toolName) ?? stringValue(data.name) ?? (item.type === 'tool_result' ? translate('agent.toolResult') : translate('agent.toolCall'))
-  const output = data.output ?? data.result ?? data.errorCode
+  const output = data.outputSummary ?? data.output ?? data.result ?? data.errorCode
   return (
     <div data-tool-lifecycle="true" data-tool-status={item.status} style={{ border: '1px solid var(--border)', borderRadius: 7, padding: '9px 10px', display: 'grid', gap: 6 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, fontSize: 11 }}><strong>{toolName}</strong><span style={{ color: item.status === 'failed' ? 'var(--c-danger)' : item.status === 'completed' ? 'var(--c-success)' : 'var(--primary)' }}>{toolStatus(item.status, translate)}</span></div>
@@ -102,7 +102,10 @@ function ContentPart({ part, t, onSuggestedAction }: { part: HarnessContentPart;
   if (part.type === 'text') return <HarnessMarkdown markdown={part.text} />
   if (part.type === 'redacted') return <Fallback label={t('agent.redactedContent')} />
   if (part.type === 'unknown') return <Fallback label={t('agent.unknownContentPart')} />
-  if (part.type === 'suggested_action') return <button type="button" data-suggested-action={part.command} onClick={() => onSuggestedAction?.({ command: part.command, arguments: part.arguments })} style={{ justifySelf: 'start', border: '1px solid var(--primary)', borderRadius: 7, padding: '7px 10px', background: 'var(--bg-secondary)', color: 'var(--primary)', cursor: 'pointer', font: 'inherit', fontSize: 11 }}>{t('agent.suggestedAction')}: {part.command}</button>
+  if (part.type === 'suggested_action') {
+    if (!onSuggestedAction) return null
+    return <button type="button" data-suggested-action={part.command} onClick={() => onSuggestedAction({ command: part.command, arguments: part.arguments })} style={{ justifySelf: 'start', border: '1px solid var(--primary)', borderRadius: 7, padding: '7px 10px', background: 'var(--bg-secondary)', color: 'var(--primary)', cursor: 'pointer', font: 'inherit', fontSize: 11 }}>{t('agent.suggestedAction')}: {part.command}</button>
+  }
   if (part.type === 'attachment_ref') return <InfoRow label={t('agent.attachment')} value={`${part.artifactId} · ${part.hash}`} />
   if (part.type === 'artifact_card') return <InfoRow label={t('agent.artifact')} value={`${part.label} · ${part.artifactId}`} />
   if (part.type === 'citation') return <InfoRow label={t('agent.citation')} value={`${part.label} · ${part.evidenceId}`} />
@@ -115,7 +118,17 @@ function Fallback({ label }: { label: string }) { return <div data-agent-fallbac
 
 function itemTitle(type: string, t: (key: string) => string) { return ({ agent_message: t('agent.messageTitle'), plan: t('agent.plan'), tool_call: t('agent.toolCall'), tool_result: t('agent.toolResult'), reasoning_summary: t('agent.reasoningSummary'), unknown: t('agent.unknownItem') } as Record<string, string>)[type] ?? t('agent.harnessItem') }
 function itemActor(item: TimelineItem, t: (key: string) => string) { return item.type === 'tool_call' || item.type === 'tool_result' ? t('agent.toolActor') : item.type === 'user_message' ? t('agent.you') : item.type === 'reasoning_summary' ? t('agent.agentActor') : t('agent.orchestratorActor') }
-function toolStatus(status: string, t: (key: string) => string) { return ({ started: t('agent.toolStarted'), running: t('agent.toolRunning'), streaming: t('agent.toolRunning'), completed: t('agent.toolCompleted'), failed: t('agent.toolFailed'), interrupted: t('agent.toolCancelled') } as Record<string, string>)[status] ?? status }
+function toolStatus(status: string, t: (key: string) => string) { return ({ started: t('agent.toolStarted'), running: t('agent.toolRunning'), streaming: t('agent.toolRunning'), completed: t('agent.toolCompleted'), failed: t('agent.toolFailed'), interrupted: t('agent.toolCancelled') } as Record<string, string>)[status] ?? itemStatusLabel(status, t) }
+function itemStatusLabel(status: string, t: (key: string) => string) {
+  if (status === 'queued' || status === 'retrying') return t('agent.queuedTasks')
+  if (status === 'running' || status === 'in_progress' || status === 'started' || status === 'streaming') return t('agent.running')
+  if (status.startsWith('waiting')) return t('agent.waiting')
+  if (status === 'completed' || status === 'passed') return t('agent.done')
+  if (status === 'failed' || status === 'error') return t('agent.errorTitle')
+  if (status === 'interrupted' || status === 'cancelled') return t('agent.toolCancelled')
+  if (status === 'paused') return t('agent.paused')
+  return t('agent.unknownItem')
+}
 function safeJson(value: unknown) { try { const redacted = redactSensitiveValue(value, null, 0, 4); const serialized = JSON.stringify(redacted) ?? String(redacted); return serialized.length > 600 ? `${serialized.slice(0, 597)}...` : serialized } catch { return '[unavailable]' } }
 function stringValue(value: unknown): string | null { return typeof value === 'string' && value.trim() ? value : null }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value) }

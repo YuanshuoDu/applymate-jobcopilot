@@ -5,6 +5,8 @@ import { runTurnJob, type TurnExecutionResult } from "../runtime/turns/turn-queu
 import { TurnEngine } from "../runtime/turns/turn-engine.js"
 import { toRepositoryJson, type TurnEngineOptions } from "../runtime/turns/turn-engine-types.js"
 import type { LeasePool } from "../runtime/turns/lease.js"
+import { createPgRootTaskStore } from "../runtime/subagents/root-task-store.js"
+import { createPgDurableWaitPort } from "../runtime/subagents/durable-wait-store.js"
 import type { AgentRunTaskPayload } from "./agent-run-queue.js"
 import { pinnedFetch } from "@jobcopilot/shared"
 
@@ -23,6 +25,66 @@ const PIPELINE_TOOL = {
 const PIPELINE_SNAPSHOT: TurnEngineOptions["snapshot"] = {
   system: [{ id: "pipeline-adapter", content: "Execute the pipeline tool exactly once, then report its result." }],
   profile: [], steerHistory: [], businessRefs: [], toolObservations: [],
+}
+
+function pipelineToolInput(value: unknown): Record<string, unknown> | null {
+  return isPlainJsonObject(value) ? value : null
+}
+
+function isPlainJsonObject(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false
+  const prototype = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
+}
+
+function validatePipelineToolArguments(toolName: string, input: unknown): boolean | string {
+  if (toolName !== PIPELINE_TOOL.name) return "Unsupported pipeline tool"
+  const callInput = pipelineToolInput(input)
+  if (!callInput) return "pipeline.run arguments must be an object"
+  if (Object.keys(callInput).some(key => key !== "mode")) return "pipeline.run arguments contain unsupported fields"
+  if (Object.hasOwn(callInput, "mode") && callInput.mode !== "resume" && callInput.mode !== "start") return "pipeline.run mode is invalid"
+  return true
+}
+
+type PipelineToolResult = {
+  status: "completed" | "failed"
+  errorCode: string | null
+  output?: unknown
+}
+
+const LEGACY_WAIT_ERROR = "legacy_wait_unsupported"
+
+function normalizedMarker(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "")
+}
+
+function isLegacyWaitValue(value: unknown, depth = 0): boolean {
+  if (typeof value === "string") {
+    const marker = normalizedMarker(value)
+    return marker === "waitingforuser" || marker.includes("agentpauseerror")
+  }
+  if (depth >= 3 || !isPlainJsonObject(value)) return false
+  return Object.values(value).some(child => isLegacyWaitValue(child, depth + 1))
+}
+
+function hasLegacyWaitMarker(value: Record<string, unknown>): boolean {
+  const markerFields = ["status", "errorCode", "code", "name", "type", "error", "reason", "message", "details", "failureReason"]
+  return markerFields.some(field => isLegacyWaitValue(value[field]))
+}
+
+function classifyPipelineResponse(value: unknown): PipelineToolResult {
+  if (!isPlainJsonObject(value)) return { status: "failed", errorCode: "pipeline_malformed_response", output: value }
+  if (hasLegacyWaitMarker(value) || (value.status === "failed" && value.report === null)) {
+    return { status: "failed", errorCode: LEGACY_WAIT_ERROR, output: value }
+  }
+  if (value.status === "completed" && isPlainJsonObject(value.report)) {
+    return { status: "completed", errorCode: null, output: value }
+  }
+  if (value.status === "failed") {
+    const errorCode = typeof value.errorCode === "string" && value.errorCode.length > 0 ? value.errorCode : "pipeline_failed"
+    return { status: "failed", errorCode, output: value }
+  }
+  return { status: "failed", errorCode: "pipeline_malformed_response", output: value }
 }
 
 function contextBuilder() {
@@ -69,6 +131,8 @@ function adapter(): ModelAdapter {
 }
 
 async function executePipelineTool(task: AgentRunTaskPayload, input: { signal: AbortSignal; callInput: unknown }) {
+  const callInput = pipelineToolInput(input.callInput)
+  if (!callInput) return { status: "failed" as const, errorCode: "invalid_tool_input" }
   const url = process.env.AGENT_WEB_URL?.replace(/\/$/, "")
   const secret = process.env.AGENT_WORKER_SECRET
   if (!url) throw new Error("AGENT_WEB_URL is required for canonical agent runs")
@@ -77,15 +141,15 @@ async function executePipelineTool(task: AgentRunTaskPayload, input: { signal: A
     method: "POST",
     headers: { "Content-Type": "application/json", "x-agent-worker-secret": secret },
     body: JSON.stringify({
+      ...callInput,
       userId: task.userId, sessionId: task.sessionId, turnId: task.turnId, executionId: task.executionId,
-      ...(input.callInput && typeof input.callInput === "object" ? input.callInput : {}),
     }),
     signal: input.signal,
   })
   const result = await response.json().catch(() => null) as unknown
   if (response.status === 403) return { status: "failed" as const, errorCode: "authorization_revoked", output: result }
   if (!response.ok) return { status: "failed" as const, errorCode: `pipeline_http_${response.status}`, output: result }
-  return { status: "completed" as const, errorCode: null, output: result }
+  return classifyPipelineResponse(result)
 }
 
 export async function runCanonicalAgentTurn(
@@ -94,9 +158,10 @@ export async function runCanonicalAgentTurn(
 ) {
   const payload = task.data
   if (!payload.turnId) throw new Error("Canonical agent run requires turnId")
-  const base: Omit<TurnEngineOptions, "lease" | "signal"> = {
+  const base: Omit<TurnEngineOptions, "lease" | "signal" | "rootTaskId" | "taskId"> = {
     scope: { userId: payload.userId }, goal: "Run the Agent job pipeline", snapshot: PIPELINE_SNAPSHOT,
     contextBuilder: contextBuilder(), store: createPgTurnEngineStore(pool), model: adapter(), tools: [PIPELINE_TOOL],
+    validateToolArguments: validatePipelineToolArguments,
     maxSteps: 2, capabilities: ["read", "write", "coordination"],
     executeTool: async ({ signal, call }) => {
       if (call.toolName !== "pipeline.run") return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "failed", errorCode: "unknown_tool" }
@@ -105,8 +170,16 @@ export async function runCanonicalAgentTurn(
     },
   }
   const result = await runTurnJob(
-    { data: { turnId: payload.turnId, sessionId: payload.sessionId, ownerId: `agent-run:${payload.executionId ?? payload.turnId}` }, attemptsMade: task.attemptsMade },
-    { pool, execute: ({ lease, signal }): Promise<TurnExecutionResult> => new TurnEngine({ ...base, lease, signal }).run() },
+    { data: { turnId: payload.turnId, sessionId: payload.sessionId, ownerId: `agent-run:${payload.turnId}` }, attemptsMade: task.attemptsMade },
+    { pool, waitHandoff: async ({ lease, waitId, now }) => {
+      await createPgDurableWaitPort(pool).suspendAndRelease({ lease, waitId, now })
+    }, execute: async ({ lease, signal }): Promise<TurnExecutionResult> => {
+      const rootTaskStore = createPgRootTaskStore(pool)
+      const root = await rootTaskStore.ensure({ lease, goal: base.goal, allowedActions: [PIPELINE_TOOL.name], now: new Date() })
+      const result = await new TurnEngine({ ...base, lease, signal, rootTaskId: root.id, taskId: root.id, completionGate: async () => rootTaskStore.checkCompletion!({ lease, rootTaskId: root.id, now: new Date() }) }).run()
+      await rootTaskStore.finish({ lease, rootTaskId: root.id, result, now: new Date() })
+      return result
+    } },
   )
   return result
 }

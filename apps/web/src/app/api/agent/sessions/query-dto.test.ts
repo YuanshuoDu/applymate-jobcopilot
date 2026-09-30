@@ -23,9 +23,20 @@ describe("agent query DTO redaction", () => {
       createdAt: date, updatedAt: new Date("2026-08-31T00:01:00Z"), completedAt: null,
     })).not.toHaveProperty("input")
     expect(taskDto({
-      id: "task_1", sessionId: "session_1", role: "scout", taskType: "jobs", status: "passed", goal: "Find jobs",
+      id: "task_1", sessionId: "session_1", turnId: "turn_1", rootTaskId: "task_1", parentTaskId: null, path: "/task_1",
+      role: "scout", taskType: "jobs", status: "passed", goal: "Find jobs",
       confidence: 0.9, failureReason: null, result: { resumeText: "private" }, createdAt: date, updatedAt: date,
-    })).toMatchObject({ hasResult: true })
+    })).toMatchObject({ hasResult: true, turnId: "turn_1", rootTaskId: "task_1", parentTaskId: null, path: "/task_1" })
+    expect(taskDto({
+      id: "task_child", sessionId: "session_1", turnId: "turn_1", rootTaskId: "task_1", parentTaskId: "task_1", path: "/task_1/task_child",
+      role: "worker", taskType: "search", status: "running", goal: "Search jobs",
+      confidence: null, failureReason: null, result: null, createdAt: date, updatedAt: date,
+    })).toEqual(expect.objectContaining({ turnId: "turn_1", parentTaskId: "task_1" }))
+    expect(taskDto({
+      id: "task_cross", sessionId: "session_2", turnId: "turn_other", rootTaskId: "task_cross", parentTaskId: null, path: "/task_cross",
+      role: "worker", taskType: "search", status: "queued", goal: "Other session", confidence: null,
+      failureReason: null, result: null, createdAt: date, updatedAt: date,
+    })).not.toHaveProperty("result")
     expect(itemDto({
       id: "tool_1", sessionId: "session_1", turnId: "turn_1", stepId: null, taskId: null, type: "tool_call", status: "completed", phase: "commentary", revision: 0,
       content: { toolCallId: "call_1", toolName: "jobs.search", input: { apiKey: "private" } }, startedAt: null, completedAt: null, createdAt: date, updatedAt: date,

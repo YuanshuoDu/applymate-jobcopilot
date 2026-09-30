@@ -4,11 +4,11 @@ import type { TimelineItem } from './timeline-reducer'
 export interface ReadOnlySessionProjection {
   sessionId: string
   writable: false
-  items: TimelineItem[]
+  items: readonly TimelineItem[]
 }
 
 /** Projects canonical timeline items for the existing transcript renderer. */
-export function createReadOnlySessionProjection(sessionId: string, items: TimelineItem[]): ReadOnlySessionProjection {
+export function createReadOnlySessionProjection(sessionId: string, items: readonly TimelineItem[]): ReadOnlySessionProjection {
   return { sessionId, writable: false, items: [...items] }
 }
 

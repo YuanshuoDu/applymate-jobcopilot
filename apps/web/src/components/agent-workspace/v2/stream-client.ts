@@ -1,10 +1,16 @@
 /** CANONICAL Phase 9 timeline state root — do not duplicate. See #459. */
 
 import { normalizeTimelineEvent, type TimelineAction } from './timeline-reducer'
+import { createQuestionHydrationPump, filterQuestionHydrationValues } from './question-hydration'
+import { hasAllTimelineTargetItems, sortTimelineTailEvents } from './timeline-hydration-order'
 
 interface TimelinePageResponse {
   items?: unknown[]
   page?: { hasMore?: boolean; nextCursor?: string | null }
+  agenda?: unknown
+  agendas?: unknown[]
+  steeringMarkers?: unknown[]
+  approvalEvents?: unknown[]
 }
 
 export interface TimelineStreamClientOptions {
@@ -20,12 +26,20 @@ export interface TimelineStreamClientOptions {
 
 const DEFAULT_RETRY_DELAY_MS = 250
 const DEFAULT_PAGE_SIZE = 100
+type TimelineHydrationOptions = Pick<TimelineStreamClientOptions, 'sessionId' | 'dispatch' | 'signal' | 'fetcher' | 'pageSize'> & {
+  targetItemIds?: readonly string[]
+}
 
 /** Hydrates the canonical item projection before a live stream is attached. */
-export async function hydrateTimeline(options: Pick<TimelineStreamClientOptions, 'sessionId' | 'dispatch' | 'signal' | 'fetcher' | 'pageSize'>): Promise<void> {
+export async function hydrateTimeline(options: TimelineHydrationOptions): Promise<void> {
   const fetcher = options.fetcher ?? fetch
   const items: unknown[] = []
+  let agenda: unknown = undefined
+  let agendas: unknown[] | undefined
+  let steeringMarkers: unknown[] | undefined
+  let approvalEvents: unknown[] | undefined
   let cursor: string | null = null
+  const targetItemIds = options.targetItemIds?.length ? new Set(options.targetItemIds) : null
   do {
     const query = new URLSearchParams({ limit: String(options.pageSize ?? DEFAULT_PAGE_SIZE) })
     if (cursor) query.set('cursor', cursor)
@@ -33,9 +47,23 @@ export async function hydrateTimeline(options: Pick<TimelineStreamClientOptions,
     if (!response.ok) throw new Error(`Timeline restore failed (${response.status})`)
     const page = await response.json() as TimelinePageResponse
     if (Array.isArray(page.items)) items.push(...page.items)
-    cursor = page.page?.hasMore === true && typeof page.page.nextCursor === 'string' ? page.page.nextCursor : null
+    if (cursor === null && page.agenda !== undefined && page.agenda !== null) agenda = page.agenda
+    if (cursor === null && Array.isArray(page.agendas)) agendas = page.agendas
+    if (cursor === null && Array.isArray(page.steeringMarkers)) steeringMarkers = page.steeringMarkers
+    if (cursor === null && Array.isArray(page.approvalEvents)) approvalEvents = page.approvalEvents
+    const sessionItems = filterQuestionHydrationValues(items, options.sessionId)
+    const targetFound = targetItemIds !== null && hasAllTimelineTargetItems(sessionItems, targetItemIds)
+    cursor = !targetFound && page.page?.hasMore === true && typeof page.page.nextCursor === 'string' ? page.page.nextCursor : null
   } while (cursor && !options.signal?.aborted)
-  options.dispatch({ type: 'hydrate', items })
+  if (options.signal?.aborted) return
+  const agendaTail = agendas ?? (agenda === undefined || agenda === null ? [] : [agenda])
+  const tail = [...agendaTail, ...(steeringMarkers ?? [])]
+    .concat(approvalEvents ?? [])
+    .filter(value => filterQuestionHydrationValues([value], options.sessionId).length > 0)
+    .filter((value): value is unknown => value !== undefined && value !== null)
+    .sort(sortTimelineTailEvents)
+  const sessionItems = filterQuestionHydrationValues(items, options.sessionId)
+  options.dispatch(tail.length === 0 ? { type: 'hydrate', items: sessionItems } : { type: 'hydrate', items: sessionItems, tail })
 }
 
 /** Attaches one reconnecting V2 SSE consumer to the same reducer used by replay. */
@@ -45,10 +73,16 @@ export async function streamAgentTimeline(options: TimelineStreamClientOptions):
   let afterSequence = BigInt(0)
   let selectedV2 = false
   let connected = false
+  const questionHydration = createQuestionHydrationPump({
+    sessionId: options.sessionId,
+    signal: options.signal,
+    hydrate: targetItemIds => hydrateTimeline({ ...options, targetItemIds }),
+  })
 
   await hydrateTimeline(options)
 
   while (!options.signal?.aborted) {
+    questionHydration.pump()
     const path = `/api/agent/sessions/${encodeURIComponent(options.sessionId)}/events`
     const url = selectedV2 ? `${path}?afterSequence=${afterSequence.toString()}` : path
     let response: Response
@@ -101,11 +135,13 @@ export async function streamAgentTimeline(options: TimelineStreamClientOptions):
           options.dispatch({ type: 'snapshot-required' })
         } else {
           options.dispatch(event.kind ? { type: 'delta', delta: event } : { type: 'event', event })
+          questionHydration.request(frame.data)
         }
       }, options.signal)
     } finally {
       ended = true
     }
+    while (questionHydration.current()) await questionHydration.current()
     if (snapshotRequired && !options.signal?.aborted) await hydrateTimeline(options)
     if (ended && !options.signal?.aborted) {
       connected = false

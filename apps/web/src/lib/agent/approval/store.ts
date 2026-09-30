@@ -13,7 +13,8 @@ import {
 
 import { appendAgentEventWithOutboxInTransaction } from "../session/fact-store"
 import { projectApprovalWaitInTransaction } from "../broker/item-projector"
-import { resolvePendingApprovalInTransaction } from "./decision"
+import { assertApprovalFreshnessInTransaction, resolvePendingApprovalInTransaction } from "./decision"
+import { prepareReceiptIssueInTransaction, type ReceiptIssueOwnerInput } from "./receipt-issue-owner"
 import {
   ApprovalStoreError,
   assertScopeInput,
@@ -29,7 +30,6 @@ import {
 
 type ApprovalRow = Prisma.AgentApprovalGetPayload<{}>
 type ApprovalReader = { agentApproval: { findFirst(args: Prisma.AgentApprovalFindFirstArgs): Promise<ApprovalRow | null> } }
-
 function isUniqueViolation(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === "P2002"
 }
@@ -119,51 +119,50 @@ async function assertPendingScope(row: ApprovalRow, expected: ApprovalScopeMatch
   return actual
 }
 
-export async function issueApprovalReceipt(db: PrismaClient, input: IssueApprovalReceiptInput): Promise<ApprovalReceiptResult> {
+export async function issueApprovalReceipt(db: PrismaClient, input: IssueApprovalReceiptInput & ReceiptIssueOwnerInput): Promise<ApprovalReceiptResult> {
   assertScopeInput(input.scope)
   const nonce = input.nonce ?? createApprovalNonce()
   const nonceHash = await hashApprovalNonce(nonce)
-  const scope = protocolScope(input.scope, nonceHash)
-  const scopeHash = await hashApprovalScope(scope)
   const approvalId = input.approvalId ?? randomUUID()
 
   try {
     const row = await db.$transaction(async (tx) => {
-      const session = await tx.agentSession.findFirst({ where: { id: input.scope.sessionId, userId: input.scope.userId }, select: { id: true } })
-      if (!session) throw new ApprovalStoreError("approval_scope_mismatch", "Approval session is not owned by the user")
-      const turn = await tx.agentTurn.findFirst({ where: { id: input.scope.turnId, sessionId: input.scope.sessionId, userId: input.scope.userId }, select: { id: true } })
-      if (!turn) throw new ApprovalStoreError("approval_scope_mismatch", "Approval turn is not owned by the user session")
-      const job = await tx.job.findFirst({ where: { id: input.scope.jobId, userId: input.scope.userId }, select: { id: true } })
+      const { prepared, receiptScope } = await prepareReceiptIssueInTransaction(tx, input)
+      const scope = protocolScope(receiptScope, nonceHash)
+      const scopeHash = await hashApprovalScope(scope)
+      const taskId = prepared?.taskId ?? input.taskId ?? null
+      const payload = prepared?.payload ?? input.payload
+      const job = await tx.job.findFirst({ where: { id: receiptScope.jobId, userId: receiptScope.userId }, select: { id: true } })
       if (!job) throw new ApprovalStoreError("approval_scope_mismatch", "Approval job is not owned by the user")
       const created = await tx.agentApproval.create({
         data: {
-          id: approvalId, sessionId: input.scope.sessionId, taskId: input.taskId ?? null, userId: input.scope.userId,
-          turnId: input.scope.turnId, toolCallId: input.scope.toolCallId, jobId: input.scope.jobId, type: input.scope.action,
+          id: approvalId, sessionId: receiptScope.sessionId, taskId, userId: receiptScope.userId,
+          turnId: receiptScope.turnId, toolCallId: receiptScope.toolCallId, jobId: receiptScope.jobId, type: receiptScope.action,
           status: "pending", title: input.title, body: input.body,
           impact: input.impact === undefined ? undefined : input.impact === null ? Prisma.JsonNull : input.impact,
-          payload: input.payload,
-          resourceHash: input.scope.resourceHash, materialHash: input.scope.materialHash, answersHash: input.scope.answersHash,
-          scopeHash, nonceHash, revision: input.scope.revision, expiresAt: input.scope.expiresAt,
+          payload,
+          resourceHash: receiptScope.resourceHash, materialHash: receiptScope.materialHash, answersHash: receiptScope.answersHash,
+          scopeHash, nonceHash, revision: receiptScope.revision, expiresAt: receiptScope.expiresAt,
         },
       })
       if (input.projectWait !== false) await projectApprovalWaitInTransaction(tx, {
-        sessionId: input.scope.sessionId,
-        userId: input.scope.userId,
+        sessionId: receiptScope.sessionId,
+        userId: receiptScope.userId,
         approvalId,
-        turnId: input.scope.turnId,
-        toolCallId: input.scope.toolCallId,
-        action: input.scope.action,
+        turnId: receiptScope.turnId,
+        toolCallId: receiptScope.toolCallId,
+        action: receiptScope.action,
         title: input.title,
         body: input.body,
         impact: input.impact,
         scopeHash,
-        receiptRevision: input.scope.revision,
-        expiresAt: input.scope.expiresAt,
+        receiptRevision: receiptScope.revision,
+        expiresAt: receiptScope.expiresAt,
       })
       await appendAgentEventWithOutboxInTransaction(tx, {
-        sessionId: input.scope.sessionId, turnId: input.scope.turnId, itemId: null, taskId: input.taskId ?? null,
+        sessionId: receiptScope.sessionId, turnId: receiptScope.turnId, itemId: null, taskId,
         type: "approval.requested", actor: "orchestrator", correlationId: approvalId, causationId: null,
-        idempotencyKey: `approval:${approvalId}:requested`, payload: auditPayload(approvalId, input.scope.action, scopeHash, input.scope.revision),
+        idempotencyKey: `approval:${approvalId}:requested`, payload: auditPayload(approvalId, receiptScope.action, scopeHash, receiptScope.revision),
         outboxTopic: "agent.session.event",
       })
       return created
@@ -218,6 +217,7 @@ export async function consumeApprovalAndReserve(
     return await db.$transaction(async (tx) => {
       const row = await loadApproval(tx, id, expected.userId)
       const scope = await assertScope(row, expected, now)
+      await assertApprovalFreshnessInTransaction(tx, { id: row.id, sessionId: row.sessionId, turnId: scope.turnId, userId: expected.userId })
       const updated = await tx.agentApproval.updateMany({
         where: { id, userId: expected.userId, status: "approved", revision: expected.revision, scopeHash: row.scopeHash, nonceHash: row.nonceHash, expiresAt: { gt: now } },
         data: { status: "consumed", consumedAt: now },

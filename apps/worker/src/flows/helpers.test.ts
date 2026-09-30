@@ -30,6 +30,14 @@ describe("submission authorization guard", () => {
     });
   });
 
+  it("forwards the derived request intent into the runtime guard", async () => {
+    const intent = { url: "https://apply.example.com/submit", method: "POST" };
+    const guard = vi.fn().mockResolvedValue(true);
+
+    await expect(assertSubmissionAuthorized(guard, intent)).resolves.toEqual({ authorized: true });
+    expect(guard).toHaveBeenCalledWith(intent);
+  });
+
   it("blocks when the runtime guard throws", async () => {
     await expect(assertSubmissionAuthorized(() => {
       throw new Error("revoked");
@@ -64,10 +72,12 @@ describe("submission authorization guard", () => {
   it("does not click a visible submit button when the guard is missing", async () => {
     const click = vi.fn();
     const page = {
+      url: vi.fn(() => "https://apply.example.com/form"),
       locator: vi.fn(() => ({
         first: () => ({
           count: vi.fn(async () => 1),
           isVisible: vi.fn(async () => true),
+          evaluate: vi.fn(async () => ({ url: "https://apply.example.com/submit", method: "POST" })),
           click,
         }),
       })),
@@ -77,6 +87,30 @@ describe("submission authorization guard", () => {
     const result = await clickSubmit(page as never, ["button[type='submit']"]);
 
     expect(result).toMatchObject({ outcome: "blocked", reason: "missing_guard" });
+    expect(click).not.toHaveBeenCalled();
+  });
+
+  it("fails closed before authorization when no precise submit request intent exists", async () => {
+    const click = vi.fn();
+    const guard = vi.fn().mockResolvedValue(true);
+    const page = {
+      url: vi.fn(() => "https://apply.example.com/form"),
+      locator: vi.fn(() => ({
+        first: () => ({
+          count: vi.fn(async () => 1),
+          isVisible: vi.fn(async () => true),
+          evaluate: vi.fn(async () => null),
+          click,
+        }),
+      })),
+      waitForLoadState: vi.fn(),
+    };
+
+    await expect(clickSubmit(page as never, ["button[type='submit']"], guard)).resolves.toMatchObject({
+      outcome: "blocked",
+      reason: "missing_intent",
+    });
+    expect(guard).not.toHaveBeenCalled();
     expect(click).not.toHaveBeenCalled();
   });
 });

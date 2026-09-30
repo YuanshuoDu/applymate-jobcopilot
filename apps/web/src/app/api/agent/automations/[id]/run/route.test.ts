@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   sessionFindFirst: vi.fn(),
   sessionDeleteMany: vi.fn(),
   sessionUpdate: vi.fn(),
+  sessionUpdateMany: vi.fn(),
   executionFindFirst: vi.fn(),
   transcriptCreate: vi.fn(),
   executionUpdate: vi.fn(),
@@ -35,7 +36,7 @@ vi.mock("@/lib/db", () => ({
       findFirst: mocks.automationFindFirst,
       updateMany: mocks.automationUpdateMany,
     },
-    agentSession: { create: mocks.sessionCreate, findFirst: mocks.sessionFindFirst, deleteMany: mocks.sessionDeleteMany, update: mocks.sessionUpdate },
+    agentSession: { create: mocks.sessionCreate, findFirst: mocks.sessionFindFirst, deleteMany: mocks.sessionDeleteMany, update: mocks.sessionUpdate, updateMany: mocks.sessionUpdateMany },
     agentExecution: { findFirst: mocks.executionFindFirst, update: mocks.executionUpdate },
     agentTranscriptEvent: { create: mocks.transcriptCreate },
     agentTurn: { findFirst: mocks.turnFindFirst, create: mocks.turnCreate },
@@ -87,6 +88,7 @@ describe("agent automation run API", () => {
     })
     mocks.sessionFindFirst.mockResolvedValue(null)
     mocks.sessionDeleteMany.mockResolvedValue({ count: 1 })
+    mocks.sessionUpdateMany.mockResolvedValue({ count: 1 })
     mocks.transcriptCreate.mockResolvedValue({
       id: "event_1",
       sessionId: "session_1",
@@ -198,7 +200,7 @@ describe("agent automation run API", () => {
       autoApply: true,
       sessionId: "session_1",
     })
-    mocks.sessionFindFirst.mockResolvedValueOnce(existing)
+    mocks.sessionFindFirst.mockResolvedValue(existing)
     mocks.transcriptCreate.mockResolvedValueOnce({
       id: "event_2", sessionId: "session_1", type: "automation_started", speaker: "Orchestrator",
       title: "Automation started", body: "Started automation: Weekday Berlin SWE Scout", data: {}, durationMs: null,
@@ -210,8 +212,8 @@ describe("agent automation run API", () => {
 
     expect(res.status).toBe(201)
     expect(mocks.sessionCreate).not.toHaveBeenCalled()
-    expect(mocks.sessionUpdate).toHaveBeenCalledWith({
-      where: { id: "session_1" },
+    expect(mocks.sessionUpdateMany).toHaveBeenCalledWith({
+      where: { id: "session_1", userId: "user_1" },
       data: { status: "running", completedAt: null, memorySummary: "Automation queued for execution." },
     })
     expect(mocks.ensureExecution).toHaveBeenCalledWith({
@@ -272,5 +274,21 @@ describe("agent automation run API", () => {
     await expect(res.json()).resolves.toEqual({ error: "Automation is paused" })
     expect(mocks.sessionCreate).not.toHaveBeenCalled()
     expect(mocks.transcriptCreate).not.toHaveBeenCalled()
+  })
+
+  it("returns 409 and does not queue when a raced Turn is not automation-owned", async () => {
+    mocks.turnFindFirst.mockResolvedValueOnce(null).mockResolvedValueOnce(null)
+    mocks.turnCreate.mockRejectedValueOnce({ code: "P2002" })
+    const { POST } = await import("./route")
+
+    const res = await POST(postRequest() as never, ctx())
+
+    expect(res.status).toBe(409)
+    await expect(res.json()).resolves.toMatchObject({ error: expect.stringContaining("active non-automation Turn") })
+    expect(mocks.ensureExecution).not.toHaveBeenCalled()
+    expect(mocks.enqueueAgentRun).not.toHaveBeenCalled()
+    expect(mocks.turnFindFirst).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      where: expect.objectContaining({ userId: "user_1", sessionId: "session_1", source: "automation" }),
+    }))
   })
 })

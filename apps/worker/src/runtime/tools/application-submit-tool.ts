@@ -3,6 +3,7 @@ import type { Pool } from "pg"
 import type { AgentApproval } from "@jobcopilot/agent-protocol"
 
 import { assertSubmissionAuthorized } from "../../flows/helpers.js"
+import type { SubmissionRequestIntent } from "../../flows/submission-intent.js"
 import { createApplicationSubmitRepository, type ApplicationTarget, type SubmissionAttempt } from "../../db/application-submit-repo.js"
 import { createPgApprovalStore } from "../approval/pg-store.js"
 import { PgArtifactToolStore } from "./artifact-store-pg.js"
@@ -47,7 +48,7 @@ export type ApplicationSubmitProvider = (input: {
   readonly target: ApplicationTarget
   readonly artifact: ArtifactToolRecord
   readonly context: ToolExecutionContext
-  readonly beforeSubmit: () => Promise<boolean>
+  readonly beforeSubmit: (intent?: SubmissionRequestIntent) => Promise<boolean>
 }) => Promise<ApplicationSubmitProviderResult>
 
 export type ApplicationSubmitToolDependencies = {
@@ -163,7 +164,7 @@ export function createApplicationSubmitTool(deps: ApplicationSubmitToolDependenc
           await deps.attempts.markFailed(userId, value.receiptId, "stale_artifact")
           return failed("stale_artifact")
         }
-        const beforeSubmit = async (): Promise<boolean> => !context.signal.aborted
+        const beforeSubmit = async (_intent?: SubmissionRequestIntent): Promise<boolean> => !context.signal.aborted
         const authorization = await assertSubmissionAuthorized(beforeSubmit)
         if (!authorization.authorized) {
           await deps.attempts.markFailed(userId, value.receiptId, "submission_guard_denied")

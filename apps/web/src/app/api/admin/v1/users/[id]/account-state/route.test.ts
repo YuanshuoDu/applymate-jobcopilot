@@ -22,14 +22,59 @@ describe('PATCH /api/admin/v1/users/:id/account-state', () => {
     })
   })
 
-  it('suspends an account with an optimistic timestamp and audit', async () => {
+  async function suspendAccount(idempotencyKey: string) {
     const { PATCH } = await import('./route')
-    const response = await PATCH(new Request('http://localhost/api/admin/v1/users/user_1/account-state', {
-      method: 'PATCH', headers: { Origin: 'http://localhost', 'Idempotency-Key': 'state-update-1', 'Content-Type': 'application/json' },
+    return PATCH(new Request('http://localhost/api/admin/v1/users/user_1/account-state', {
+      method: 'PATCH', headers: { Origin: 'http://localhost', 'Idempotency-Key': idempotencyKey, 'Content-Type': 'application/json' },
       body: JSON.stringify({ status: 'suspended', reason: 'Policy review requires a pause' }),
     }) as never, { params: Promise.resolve({ id: 'user_1' }) })
+  }
+
+  it('suspends an account with an optimistic timestamp and audit', async () => {
+    const response = await suspendAccount('state-update-1')
     expect(response.status).toBe(200)
     expect(mocks.update).toHaveBeenCalledWith(expect.objectContaining({ where: { id: 'user_1' }, data: expect.objectContaining({ accountStatus: 'suspended', authVersion: { increment: 1 } }) }))
     expect(mocks.audit).toHaveBeenCalled()
+  })
+
+  it('preserves started and uncertain submissions through an atomic checkpoint predicate', async () => {
+    const response = await suspendAccount('state-update-started')
+
+    expect(response.status).toBe(200)
+    expect(mocks.taskUpdateMany).toHaveBeenCalledOnce()
+    expect(mocks.taskUpdateMany).toHaveBeenCalledWith({
+      where: {
+        userId: 'user_1',
+        status: { in: ['filling', 'waiting_for_authorization'] },
+        OR: [
+          { checkpoint: null },
+          { checkpoint: { notIn: ['submission_request_started', 'submission_uncertain'] } },
+        ],
+      },
+      data: {
+        status: 'waiting_for_user',
+        checkpoint: 'account_suspended',
+        error: 'Account suspended; external processing was stopped.',
+      },
+    })
+  })
+
+  it('still suspends ordinary eligible tasks and updates the user account', async () => {
+    const response = await suspendAccount('state-update-ordinary')
+
+    expect(response.status).toBe(200)
+    expect(mocks.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'user_1' },
+      data: expect.objectContaining({ accountStatus: 'suspended', authVersion: { increment: 1 } }),
+    }))
+    expect(mocks.automationUpdateMany).toHaveBeenCalledWith({ where: { userId: 'user_1' }, data: { enabled: false } })
+    expect(mocks.taskUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        userId: 'user_1',
+        status: { in: ['filling', 'waiting_for_authorization'] },
+        OR: expect.arrayContaining([{ checkpoint: null }]),
+      }),
+      data: expect.objectContaining({ status: 'waiting_for_user', checkpoint: 'account_suspended' }),
+    }))
   })
 })

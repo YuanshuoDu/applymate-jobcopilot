@@ -159,6 +159,10 @@ export function turnDto(row: TurnQueryRow) {
 export interface TaskQueryRow extends CursorRow {
   id: string
   sessionId: string
+  turnId: string | null
+  rootTaskId: string | null
+  parentTaskId: string | null
+  path: string
   role: string
   taskType: string
   status: string
@@ -176,6 +180,10 @@ export function taskDto(row: TaskQueryRow) {
     schemaVersion,
     id: row.id,
     sessionId: row.sessionId,
+    turnId: row.turnId,
+    rootTaskId: row.rootTaskId,
+    parentTaskId: row.parentTaskId,
+    path: row.path,
     role: row.role,
     taskType: row.taskType,
     status: legacy.status,

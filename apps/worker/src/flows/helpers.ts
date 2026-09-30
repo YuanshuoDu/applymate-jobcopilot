@@ -1,4 +1,5 @@
 import type { Page } from "playwright-core";
+import { readSubmissionRequestIntent, type SubmissionRequestIntent } from "./submission-intent.js";
 
 export type FlowLogEntry = { field?: string; selector?: string; action: string };
 
@@ -143,6 +144,7 @@ export async function fillCustomQuestions(
 
 export type SubmissionBlockedReason =
   | "missing_guard"
+  | "missing_intent"
   | "guard_false"
   | "guard_error"
   | "guard_timeout"
@@ -151,7 +153,7 @@ export type SubmissionAuthorization =
   | { authorized: true }
   | { authorized: false; reason: SubmissionBlockedReason; message: string };
 
-export type SubmissionGuard = () => Promise<unknown> | unknown;
+export type SubmissionGuard = (intent?: SubmissionRequestIntent) => Promise<unknown> | unknown;
 
 export type SubmitAttempt =
   | { outcome: "submitted" }
@@ -161,9 +163,12 @@ export type SubmitAttempt =
 const SUBMISSION_AUTH_TIMEOUT_MS = 5_000;
 const SUBMISSION_AUTH_TIMEOUT = Symbol("submission-authorization-timeout");
 
-function blocked(reason: SubmissionBlockedReason): SubmissionAuthorization {
+function blocked(
+  reason: SubmissionBlockedReason,
+): Extract<SubmissionAuthorization, { authorized: false }> {
   const messages: Record<SubmissionBlockedReason, string> = {
     missing_guard: "Submission blocked: no runtime authorization guard was provided.",
+    missing_intent: "Submission blocked: the submit button has no reliable form request target.",
     guard_false: "Submission blocked: runtime authorization guard denied the submit.",
     guard_error: "Submission blocked: runtime authorization guard failed.",
     guard_timeout: "Submission blocked: runtime authorization guard timed out.",
@@ -174,6 +179,7 @@ function blocked(reason: SubmissionBlockedReason): SubmissionAuthorization {
 
 export async function assertSubmissionAuthorized(
   beforeSubmit?: SubmissionGuard,
+  intent?: SubmissionRequestIntent,
 ): Promise<SubmissionAuthorization> {
   if (!beforeSubmit) return blocked("missing_guard");
 
@@ -183,7 +189,7 @@ export async function assertSubmissionAuthorized(
       timeoutHandle = setTimeout(() => resolve(SUBMISSION_AUTH_TIMEOUT), SUBMISSION_AUTH_TIMEOUT_MS);
     });
     const result = await Promise.race([
-      Promise.resolve().then(() => beforeSubmit()),
+      Promise.resolve().then(() => beforeSubmit(intent)),
       timeout,
     ]);
     if (result === SUBMISSION_AUTH_TIMEOUT) return blocked("guard_timeout");
@@ -201,13 +207,19 @@ export async function clickSubmit(
   selectors: string[],
   beforeSubmit?: SubmissionGuard,
 ): Promise<SubmitAttempt> {
+  let visibleWithoutIntent = false;
   for (const selector of selectors) {
     try {
       const button = page.locator(selector).first();
       if (!(await button.count())) continue;
       if (!(await button.isVisible().catch(() => false))) continue;
-      const authorization = await assertSubmissionAuthorized(beforeSubmit);
-      if (!authorization.authorized) {
+      const intent = await readSubmissionRequestIntent(page, button);
+      if (!intent) {
+        visibleWithoutIntent = true;
+        continue;
+      }
+      const authorization = await assertSubmissionAuthorized(beforeSubmit, intent);
+      if (authorization.authorized === false) {
         console.warn("[submission-guard] blocked", authorization.reason);
         return {
           outcome: "blocked",
@@ -221,6 +233,14 @@ export async function clickSubmit(
     } catch {
       continue;
     }
+  }
+  if (visibleWithoutIntent) {
+    const authorization = blocked("missing_intent");
+    return {
+      outcome: "blocked",
+      reason: authorization.reason,
+      message: authorization.message,
+    };
   }
   return { outcome: "missing" };
 }

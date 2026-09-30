@@ -12,6 +12,7 @@ export type {
   ForkCommand,
   ForkResult,
   MessageCommand,
+  RetryCommand,
   StartCommand,
   SteerCommand,
 } from "./types"

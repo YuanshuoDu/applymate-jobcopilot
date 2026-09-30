@@ -6,7 +6,7 @@ import { PolicyEngine } from "../policy/engine.js"
 import { ToolRegistry } from "./registry.js"
 import { InMemoryToolResultReferenceStore } from "./redaction.js"
 import { ToolRouter } from "./router.js"
-import type { RuntimeToolDefinition } from "./types.js"
+import { ToolExecutionError, type RuntimeToolDefinition } from "./types.js"
 
 const context = { scope: { userId: "user-a" }, sessionId: "session-a", turnId: "turn-a", stepId: "step-a" }
 
@@ -79,6 +79,28 @@ describe("ToolRouter", () => {
     }
     const badOutput = makeRouter(async () => ({ result: 42 }))
     await expect(badOutput.router.execute(context, { ...request, id: "bad-output" })).resolves.toMatchObject({ status: "failed", errorCode: "schema_error" })
+  })
+
+  it("sanitizes structured thrown results while preserving small shapes and bounding large ones", async () => {
+    const small = makeRouter(async () => {
+      throw new ToolExecutionError("tool_failed", "raw failure detail", { result: "safe", password: "secret" })
+    })
+    await expect(small.router.execute(context, { ...request, id: "structured-small" })).resolves.toMatchObject({
+      status: "failed",
+      errorCode: "tool_failed",
+      output: { result: "safe", password: "[REDACTED]" },
+    })
+    expect(JSON.stringify(small.sink.events)).not.toContain("secret")
+
+    const large = makeRouter(async () => {
+      throw new ToolExecutionError("tool_failed", "raw failure detail", { result: "x".repeat(9000), password: "secret" })
+    })
+    await expect(large.router.execute(context, { ...request, id: "structured-large" })).resolves.toMatchObject({
+      status: "failed",
+      errorCode: "tool_failed",
+      output: { $truncated: true, sizeBytes: expect.any(Number) },
+    })
+    expect(JSON.stringify(large.sink.events)).not.toContain("secret")
   })
 
   it("forces every executable read call through the deterministic policy hook", async () => {

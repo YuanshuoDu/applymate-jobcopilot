@@ -10,8 +10,10 @@ const mocks = vi.hoisted(() => ({
   adminMembershipUpdateMany: vi.fn(),
   agentAutomationUpdateMany: vi.fn(),
   taskUpdateMany: vi.fn(),
+  taskEventCreate: vi.fn(),
   applyResultFindMany: vi.fn(),
   taskFindMany: vi.fn(),
+  auditInput: vi.fn(),
 }))
 
 vi.mock('@/lib/admin/csrf', () => ({ validateAdminWrite: mocks.validateAdminWrite }))
@@ -32,13 +34,18 @@ describe('POST /api/admin/v1/bulk', () => {
     vi.clearAllMocks()
     mocks.validateAdminWrite.mockReturnValue(null)
     mocks.requireAdmin.mockResolvedValue({ userId: 'admin_1', roleKey: 'ops', requestId: 'req_1' })
-    mocks.runAdminMutation.mockImplementation(async (input: { mutate: (tx: unknown) => Promise<unknown> }) => ({ duplicate: false, value: await input.mutate({
-      user: { updateMany: mocks.userUpdateMany },
-      adminMembership: { updateMany: mocks.adminMembershipUpdateMany },
-      agentAutomation: { updateMany: mocks.agentAutomationUpdateMany },
-      applicationTask: { updateMany: mocks.taskUpdateMany },
-      applicationTaskEvent: { create: vi.fn().mockResolvedValue({}) },
-    }) }))
+    mocks.taskEventCreate.mockResolvedValue({})
+    mocks.runAdminMutation.mockImplementation(async (input: { mutate: (tx: unknown) => Promise<unknown>; audit: unknown }) => {
+      const value = await input.mutate({
+        user: { updateMany: mocks.userUpdateMany },
+        adminMembership: { updateMany: mocks.adminMembershipUpdateMany },
+        agentAutomation: { updateMany: mocks.agentAutomationUpdateMany },
+        applicationTask: { updateMany: mocks.taskUpdateMany },
+        applicationTaskEvent: { create: mocks.taskEventCreate },
+      })
+      mocks.auditInput(typeof input.audit === 'function' ? input.audit(value) : input.audit)
+      return { duplicate: false, value }
+    })
   })
 
   it('suspends only selected users and records the requested reason', async () => {
@@ -55,18 +62,23 @@ describe('POST /api/admin/v1/bulk', () => {
     }))
 
     expect(response.status).toBe(200)
-    await expect(response.json()).resolves.toMatchObject({ resource: 'users', action: 'suspend', affected: 1 })
+    await expect(response.json()).resolves.toMatchObject({ resource: 'users', action: 'suspend', affected: 1, skipped: 1 })
     expect(mocks.requireAdmin).toHaveBeenCalledWith('users.suspend', expect.any(NextRequest))
-    expect(mocks.userUpdateMany).toHaveBeenCalledWith(expect.objectContaining({ where: { id: { in: ['user_1'] } }, data: expect.objectContaining({ accountStatus: 'suspended', suspendedById: 'admin_1', authVersion: { increment: 1 } }) }))
+    expect(mocks.userUpdateMany).toHaveBeenCalledWith(expect.objectContaining({ where: { id: { in: ['user_1'] }, OR: [{ id: 'user_1', accountStatus: 'active' }] }, data: expect.objectContaining({ accountStatus: 'suspended', suspendedById: 'admin_1', authVersion: { increment: 1 } }) }))
     expect(mocks.adminMembershipUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
       where: { userId: { in: ['user_1'] } },
       data: expect.objectContaining({ sessionVersion: { increment: 1 }, status: 'suspended', revokedAt: expect.any(Date) }),
     }))
     expect(mocks.agentAutomationUpdateMany).toHaveBeenCalledWith({ where: { userId: { in: ['user_1'] } }, data: { enabled: false } })
     expect(mocks.taskUpdateMany).toHaveBeenCalledWith({
-      where: { userId: { in: ['user_1'] }, status: { in: ['filling', 'waiting_for_authorization'] } },
+      where: {
+        userId: { in: ['user_1'] },
+        status: { in: ['filling', 'waiting_for_authorization'] },
+        OR: [{ checkpoint: null }, { checkpoint: { notIn: ['submission_request_started', 'submission_uncertain'] } }],
+      },
       data: { status: 'waiting_for_user', checkpoint: 'account_suspended', error: 'Account suspended; external processing was stopped.' },
     })
+    expect(mocks.auditInput).toHaveBeenCalledWith(expect.objectContaining({ after: expect.objectContaining({ affected: 1, skipped: 1 }) }))
   })
 
   it('restores the account without automatically restoring a revoked administrator membership', async () => {
@@ -103,7 +115,7 @@ describe('POST /api/admin/v1/bulk', () => {
   })
 
   it('updates selected application tasks directly, including tasks without results', async () => {
-    mocks.taskFindMany.mockResolvedValue([{ id: 'task-only', userId: 'user_1', jobId: 'job_1', status: 'waiting_for_user' }])
+    mocks.taskFindMany.mockResolvedValue([{ id: 'task-only', userId: 'user_1', jobId: 'job_1', status: 'waiting_for_user', checkpoint: 'form_answer_required' }])
     mocks.taskUpdateMany.mockResolvedValue({ count: 1 })
     const { POST } = await import('./route')
     const response = await POST(new NextRequest('http://localhost/api/admin/v1/bulk', {
@@ -111,8 +123,46 @@ describe('POST /api/admin/v1/bulk', () => {
       body: JSON.stringify({ resource: 'applications', action: 'cancel', ids: ['task-only'], reason: 'Stop this application task after an operator review' }),
     }))
     expect(response.status).toBe(200)
-    await expect(response.json()).resolves.toMatchObject({ resource: 'applications', action: 'cancel', affected: 1 })
-    expect(mocks.taskFindMany).toHaveBeenCalledWith({ where: { id: { in: ['task-only'] } }, select: { id: true, userId: true, jobId: true, status: true } })
-    expect(mocks.taskUpdateMany).toHaveBeenCalledWith(expect.objectContaining({ where: { id: 'task-only', status: 'waiting_for_user' } }))
+    await expect(response.json()).resolves.toMatchObject({ resource: 'applications', action: 'cancel', affected: 1, skipped: 0 })
+    expect(mocks.taskFindMany).toHaveBeenCalledWith({ where: { id: { in: ['task-only'] } }, select: { id: true, userId: true, jobId: true, status: true, checkpoint: true } })
+    expect(mocks.taskUpdateMany).toHaveBeenCalledWith(expect.objectContaining({ where: {
+      id: 'task-only', status: 'waiting_for_user',
+      OR: [{ checkpoint: null }, { checkpoint: { notIn: ['submission_request_started', 'submission_uncertain'] } }],
+    } }))
+    expect(mocks.taskEventCreate).toHaveBeenCalledOnce()
+  })
+
+  it.each(['cancel', 'manual_review'] as const)('skips a concurrent submission-started task during bulk %s without an event', async action => {
+    mocks.taskFindMany.mockResolvedValue([{ id: 'task-only', userId: 'user_1', jobId: 'job_1', status: 'filling', checkpoint: 'browser_active' }])
+    mocks.taskUpdateMany.mockResolvedValueOnce({ count: 0 })
+    const { POST } = await import('./route')
+    const response = await POST(new NextRequest('http://localhost/api/admin/v1/bulk', {
+      method: 'POST', headers: { Origin: 'http://localhost', 'Idempotency-Key': `bulk-app-${action}-race`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ resource: 'applications', action, ids: ['task-only'], reason: 'Stop or review this application after checking its current state' }),
+    }))
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({ resource: 'applications', action, affected: 0, skipped: 1 })
+    expect(mocks.taskUpdateMany).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({
+      id: 'task-only',
+      OR: [{ checkpoint: null }, { checkpoint: { notIn: ['submission_request_started', 'submission_uncertain'] } }],
+    }) }))
+    expect(mocks.taskEventCreate).not.toHaveBeenCalled()
+    expect(mocks.auditInput).toHaveBeenCalledWith(expect.objectContaining({ after: expect.objectContaining({ affected: 0, skipped: 1, affectedTaskIds: [], skippedTaskIds: ['task-only'] }) }))
+  })
+
+  it.each(['submission_request_started', 'submission_uncertain'] as const)('excludes %s tasks from bulk application mutation', async checkpoint => {
+    mocks.taskFindMany.mockResolvedValue([{ id: 'task-only', userId: 'user_1', jobId: 'job_1', status: 'filling', checkpoint }])
+    const { POST } = await import('./route')
+    const response = await POST(new NextRequest('http://localhost/api/admin/v1/bulk', {
+      method: 'POST', headers: { Origin: 'http://localhost', 'Idempotency-Key': `bulk-sticky-${checkpoint}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ resource: 'applications', action: 'manual_review', ids: ['task-only'], reason: 'Review this application after checking its current state' }),
+    }))
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({ affected: 0, skipped: 1 })
+    expect(mocks.taskUpdateMany).not.toHaveBeenCalled()
+    expect(mocks.taskEventCreate).not.toHaveBeenCalled()
+    expect(mocks.auditInput).toHaveBeenCalledWith(expect.objectContaining({ after: expect.objectContaining({ affected: 0, skipped: 1, skippedTaskIds: ['task-only'] }) }))
   })
 })

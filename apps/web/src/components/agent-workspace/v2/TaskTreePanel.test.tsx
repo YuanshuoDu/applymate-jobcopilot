@@ -2,6 +2,7 @@ import React from "react"
 import { renderToStaticMarkup } from "react-dom/server"
 import { describe, expect, it, vi } from "vitest"
 
+import { translate } from "@/lib/i18n"
 import { TaskTreePanel, flattenTaskTree } from "./TaskTreePanel"
 import type { TaskTreeNode } from "./types"
 
@@ -13,6 +14,8 @@ describe("TaskTreePanel", () => {
     expect(html).toContain('data-agent-task-tree="true"')
     expect(html).toContain('data-task-tree-depth="2"')
     expect(html).toContain("jobs.search")
+    expect(html).toContain(translate("en", "agent.step"))
+    expect(html).not.toContain(translate("en", "agent.plan"))
   })
 
   it("bounds the visible tree at five levels", () => {

@@ -114,7 +114,7 @@ export class AgentForkService {
       const turnMap = new Map(selectedTurns.map((turn) => [turn.id, randomUUID()]))
       const sourceItems = source.items.filter((item) => selectedTurnIds.has(item.turnId) && !SIDE_EFFECT_TYPES.test(item.type) && !["pending", "in_progress"].includes(item.status))
       const itemMap = new Map(sourceItems.map((item) => [item.id, randomUUID()]))
-      const sourceEvents = source.events.filter((event) => selectedTurnIds.has(event.turnId) && !SIDE_EFFECT_TYPES.test(event.type) && (!event.itemId || itemMap.has(event.itemId)))
+      const sourceEvents = source.events.filter((event): event is typeof event & { turnId: string } => event.turnId !== null && selectedTurnIds.has(event.turnId) && !SIDE_EFFECT_TYPES.test(event.type) && (!event.itemId || itemMap.has(event.itemId)))
       const eventMap = new Map(sourceEvents.map((event) => [event.id, randomUUID()]))
       const copiedEvents = sourceEvents.map((event, index) => ({
         id: eventMap.get(event.id) as string, sessionId: id, turnId: turnMap.get(event.turnId) as string,

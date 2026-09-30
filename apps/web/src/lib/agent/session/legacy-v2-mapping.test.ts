@@ -8,6 +8,7 @@ describe("legacy to Harness 2.0 mapping", () => {
 
     expect(table.user_message).toMatchObject({ eventType: "input.accepted", actor: "user", itemType: "user_message" })
     expect(table.approval_request).toMatchObject({ eventType: "approval.requested", itemType: "approval_request" })
+    expect(table.session_memory).toMatchObject({ eventType: "item.completed", actor: "system", itemType: "context_compaction" })
     expect(table.final_report).toMatchObject({ eventType: "turn.completed", phase: "final_answer" })
   })
 

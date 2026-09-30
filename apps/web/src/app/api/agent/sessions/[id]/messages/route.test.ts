@@ -81,6 +81,26 @@ describe("agent message command API", () => {
     await expect(response.json()).resolves.toMatchObject({ error: { code: "active_turn_changed", details: { actualTurnId: "turn_2" } } })
   })
 
+  it("maps a parked Turn to a safe dedicated-action 409", async () => {
+    mocks.message.mockRejectedValueOnce(new mocks.MockAgentCommandError(
+      "turn_wait_requires_dedicated_action",
+      "This Turn is waiting for a required user or approval action",
+      409,
+      { turnId: "turn_1", status: "waiting_for_approval" },
+    ))
+    const { POST } = await import("./route")
+    const response = await POST(request({ clientMessageId: "client_parked", expectedTurnId: "turn_1", content: [{ type: "text", text: "Proceed" }] }) as never, params)
+
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({
+      error: {
+        code: "turn_wait_requires_dedicated_action",
+        message: "This Turn is waiting for a required user or approval action",
+        details: { turnId: "turn_1", status: "waiting_for_approval" },
+      },
+    })
+  })
+
   it("rejects forbidden userId and tool payloads before calling the service", async () => {
     const { POST } = await import("./route")
     const response = await POST(request({ clientMessageId: "client_unsafe", userId: "other", tool: { name: "submit_application" }, content: [{ type: "text", text: "send" }] }) as never, params)

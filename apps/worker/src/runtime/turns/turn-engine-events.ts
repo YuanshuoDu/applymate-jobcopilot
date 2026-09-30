@@ -9,6 +9,7 @@ import {
   type TurnEngineItemType,
   type TurnEngineOptions,
 } from "./turn-engine-types.js"
+import { executionOwnerFence } from "../execution-owner.js"
 
 export type TurnItemHandle = {
   readonly id: string
@@ -19,14 +20,17 @@ export type TurnItemHandle = {
 
 export class TurnEventWriter {
   private causationId: string | null = null
+  private readonly owner
 
-  constructor(private readonly options: TurnEngineOptions) {}
+  constructor(private readonly options: TurnEngineOptions) {
+    this.owner = executionOwnerFence({ kind: "turn", taskId: options.rootTaskId, lease: options.lease })
+  }
 
   async append(type: string, correlationId: string, itemId: string | null, payload: unknown, key: string): Promise<string> {
     const id = this.id(`event:${key}`)
     const causationId = this.causationId
     const event = await this.options.store.appendEvent({
-      lease: this.options.lease,
+      owner: this.owner,
       id,
       itemId,
       type,
@@ -56,7 +60,7 @@ export class TurnEventWriter {
     now: Date
   }): Promise<TurnItemHandle> {
     const item = await this.options.store.createItem({
-      lease: this.options.lease,
+      owner: this.owner,
       itemId: input.id,
       stepId: input.stepId,
       type: input.type,
@@ -71,7 +75,7 @@ export class TurnEventWriter {
 
   async updateItem(handle: TurnItemHandle, status: TurnEngineItemStatus, content: unknown, now: Date, key: string): Promise<void> {
     const item = await this.options.store.updateItem({
-      lease: this.options.lease,
+      owner: this.owner,
       itemId: handle.id,
       expectedRevision: handle.revision,
       status,
@@ -91,7 +95,7 @@ export class TurnEventWriter {
 
   async failItem(handle: TurnItemHandle, errorCode: string, now: Date, key: string): Promise<void> {
     const item = await this.options.store.updateItem({
-      lease: this.options.lease,
+      owner: this.owner,
       itemId: handle.id,
       expectedRevision: handle.revision,
       status: "failed",

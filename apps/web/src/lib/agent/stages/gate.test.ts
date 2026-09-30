@@ -1,10 +1,11 @@
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ApplicationPackage, PipelineCtx } from '../types'
 
+const mocks = vi.hoisted(() => ({ createGateReviewReceipt: vi.fn(), skipApplicationForGate: vi.fn(), modelChat: vi.fn() }))
 vi.mock('@/lib/db', () => ({ db: {} }))
-vi.mock('../application-control', () => ({
-  holdForApplicationReview: vi.fn().mockResolvedValue({ id: 'application_task_1' }),
-}))
+vi.mock('@/lib/model-router', () => ({ modelChat: mocks.modelChat }))
+vi.mock('../application-control', () => ({ skipApplicationForGate: mocks.skipApplicationForGate }))
+vi.mock('./gate-review-receipt', () => ({ createGateReviewReceipt: mocks.createGateReviewReceipt }))
 
 import { runGate } from './gate'
 
@@ -41,6 +42,14 @@ function draftArtifact(constraintHash: string) {
   }
 }
 
+beforeEach(() => {
+  mocks.createGateReviewReceipt.mockReset()
+  mocks.createGateReviewReceipt.mockResolvedValue({ projectedWait: true, receipt: { id: 'approval_1' } })
+  mocks.skipApplicationForGate.mockReset()
+  mocks.skipApplicationForGate.mockResolvedValue(true)
+  mocks.modelChat.mockReset()
+})
+
 describe('runGate', () => {
   it('keeps a threshold-matching tailored resume in review even when autopilot is configured', async () => {
     const result = await runGate([packageFor(75, 'tailored_1')], context())
@@ -53,6 +62,19 @@ describe('runGate', () => {
     expect(result.data?.approved).toHaveLength(0)
     expect(result.data?.pending).toHaveLength(0)
     expect(result.data?.skipped).toHaveLength(1)
+  })
+
+  it('fences below-threshold task updates to the exact pipeline owner', async () => {
+    const ctx = context()
+    Object.assign(ctx, { sessionId: 'session_1', turnId: 'turn_1', executionAttempt: { id: 'execution_1', attemptCount: 2 } })
+
+    await runGate([packageFor(49, 'tailored_1')], ctx)
+
+    expect(mocks.skipApplicationForGate).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: 'session_1',
+      checkpoint: 'below_match_threshold',
+      owner: expect.objectContaining({ turnId: 'turn_1', executionAttempt: { id: 'execution_1', attemptCount: 2 } }),
+    }))
   })
 
   it('pauses for a candidate-approved borderline exception before holding it for review', async () => {
@@ -70,5 +92,60 @@ describe('runGate', () => {
     expect(result.data?.pending).toHaveLength(0)
     expect(result.data?.skipped).toHaveLength(1)
     expect(ctx.emit).toHaveBeenCalledWith('artifact_reviewed', expect.objectContaining({ status: 'stale' }))
+  })
+
+  it('routes review receipts through the exact pipeline Turn', async () => {
+    const ctx = context()
+    Object.assign(ctx, { sessionId: 'session_1', turnId: 'turn_1', executionAttempt: { id: 'execution_1', attemptCount: 3 } })
+
+    await runGate([packageFor(75, 'tailored_1')], ctx)
+
+    expect(mocks.createGateReviewReceipt).toHaveBeenCalledWith(ctx, expect.objectContaining({ job: expect.objectContaining({ id: 'job_1' }) }), false)
+    expect(ctx.emit).toHaveBeenCalledWith('application_review_ready', { approval: { id: 'approval_1' } })
+  })
+
+  it('emits no review wait or approval-ready event when Stop wins the receipt fence', async () => {
+    const ctx = context()
+    Object.assign(ctx, { sessionId: 'session_1', turnId: 'turn_1', executionAttempt: { id: 'execution_1', attemptCount: 3 } })
+    mocks.createGateReviewReceipt.mockRejectedValueOnce(Object.assign(new Error('Agent execution was cancelled'), { name: 'AgentExecutionCancelledError' }))
+
+    await expect(runGate([packageFor(75, 'tailored_1')], ctx)).rejects.toMatchObject({ name: 'AgentExecutionCancelledError' })
+
+    expect(ctx.emit).not.toHaveBeenCalledWith('application_review_ready', expect.anything())
+    expect(ctx.emit).not.toHaveBeenCalledWith('agent_question', expect.objectContaining({ questionId: 'application_review_job_1' }))
+  })
+
+  it('does not skip a task or emit follow-up state when Stop wins during the reviewer decision', async () => {
+    const abortController = new AbortController()
+    const ctx = context()
+    Object.assign(ctx, {
+      sessionId: 'session_1',
+      turnId: 'turn_1',
+      executionAttempt: { id: 'execution_1', attemptCount: 3 },
+      signal: abortController.signal,
+    })
+    let resolveDecision!: (decision: string) => void
+    const decision = new Promise<string>(resolve => { resolveDecision = resolve })
+    ctx.askUser = vi.fn(() => decision)
+    mocks.modelChat.mockResolvedValue({ text: JSON.stringify({ clScore: 4, fitGap: 'missing evidence', recommendation: 'add evidence', readyToApply: false }) })
+    mocks.skipApplicationForGate.mockImplementation(async input => {
+      if (input.owner?.signal?.aborted) throw Object.assign(new Error('Agent execution was cancelled'), { name: 'AgentExecutionCancelledError' })
+      return true
+    })
+
+    const run = runGate([{ ...packageFor(75), coverLetter: 'A short draft' }], ctx)
+    await vi.waitFor(() => expect(ctx.askUser).toHaveBeenCalled())
+    abortController.abort()
+    resolveDecision('skip')
+
+    await expect(run).rejects.toMatchObject({ name: 'AgentExecutionCancelledError' })
+    expect(mocks.skipApplicationForGate).toHaveBeenCalledWith(expect.objectContaining({
+      userId: 'user_1',
+      jobId: 'job_1',
+      checkpoint: 'review_quality_declined',
+      owner: expect.objectContaining({ turnId: 'turn_1', executionAttempt: { id: 'execution_1', attemptCount: 3 }, signal: abortController.signal }),
+    }))
+    expect(ctx.emit).not.toHaveBeenCalledWith('application_review_ready', expect.anything())
+    expect(ctx.emit).not.toHaveBeenCalledWith('agent_observation', expect.objectContaining({ observation: expect.stringContaining('✕ jump over') }))
   })
 })

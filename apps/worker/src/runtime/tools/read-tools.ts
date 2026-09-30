@@ -33,6 +33,15 @@ export const ApplicationStateInputSchema = Type.Object({
 }, { additionalProperties: false })
 export type ApplicationStateInput = Static<typeof ApplicationStateInputSchema>
 
+/** Read tools available to the canonical planner when their registry entries are present. */
+export const READ_ONLY_TOOL_NAMES = [
+  "jobs.search",
+  "jobs.get",
+  "persona.retrieve",
+  "resume.get_base",
+  "application.get_state",
+] as const
+
 export interface JobRecord {
   id: string
   company: string
