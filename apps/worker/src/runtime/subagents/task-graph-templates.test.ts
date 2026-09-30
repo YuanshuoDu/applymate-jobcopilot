@@ -32,9 +32,23 @@ describe("TaskGraph server-owned templates", () => {
     })
   })
 
-  it("adds scoped Writer and Reviewer templates only for a server-selected job", () => {
+  it("keeps selected-job evidence roles plannable without search and adds scoped Writer and Reviewer roles", () => {
     expect(Object.keys(taskGraphTemplatesForSelectedJob(undefined))).toEqual(["scout", "analyst"])
     const templates = taskGraphTemplatesForSelectedJob({ jobId: "job-1" })
+    expect(templates.scout).toMatchObject({
+      role: "scout", taskType: "job_discovery", allowedActions: ["jobs.get"],
+      context: { selectedJobPreparation: { jobId: "job-1" } },
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
+    })
+    expect(templates.analyst).toMatchObject({
+      role: "analyst", taskType: "job_analysis",
+      allowedActions: ["jobs.get", "persona.retrieve", "resume.get_base"],
+      context: { selectedJobPreparation: { jobId: "job-1" } },
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" },
+    })
+    expect(Object.keys(templates)).toEqual(["scout", "analyst", "cover_letter_writer", "cover_letter_reviewer"])
+    expect(templates.scout.allowedActions).not.toContain("jobs.search")
+    expect(templates.analyst.allowedActions).not.toContain("jobs.search")
     expect(templates.cover_letter_writer).toMatchObject({
       role: "writer", taskType: "cover_letter_draft",
       allowedActions: ["cover_letter.draft"],

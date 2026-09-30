@@ -11,7 +11,8 @@ import { childContextSnapshot, createChildContextBuilder, type ChildMailboxReade
 import { ROLE_RESULT_SCHEMA, roleResultOutputSchema, type ArtifactVersionReference, type StructuredRole } from "./role-results.js"
 import { writerArtifactReferenceFromTaskContext } from "./task-graph-dependency-context.js"
 import { createObservedEvidenceIndex, hydrateObservedEvidence, parseAndBindStructuredResult, recordReadToolOutput } from "./child-evidence.js"
-import { createChildPrivateArtifactDispatcher, createPrivateArtifactSafeStore, selectedJobId, validSelectedJobContext } from "./child-private-artifact.js"
+import { createChildPrivateArtifactDispatcher, createPrivateArtifactSafeStore, selectedJobId } from "./child-private-artifact.js"
+import { createSelectedJobReadRouter, hasSelectedJobReadContext, isSelectedJobReadTool, redactSelectedEvidenceResult, selectedJobToolAllowed, withSelectedJobInputRedaction } from "./selected-job-artifact-context.js"
 import type { AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
 import type { ChildResumeLoader } from "./child-resume.js"
 import { SubagentLeaseError, type SubagentExecutionResult, type SubagentLease, type SubagentTaskRecord } from "./types.js"
@@ -106,7 +107,7 @@ function visibleDefinitions(task: SubagentTaskRecord, definitions: readonly Chil
   if (!policy) throw new Error("subagent_role_unknown")
   const allowedActions = new Set(Array.isArray(task.allowedActions) ? task.allowedActions.filter((action): action is string => typeof action === "string") : [])
   return definitions.filter(definition => {
-    if (!allowedActions.has(definition.name) || (selectedJob && ((task.role === "writer" && definition.name !== "cover_letter.draft") || (task.role === "reviewer" && definition.name !== "artifact.version.read" && definition.name !== "artifact.review")))) return false
+    if (!allowedActions.has(definition.name) || (selectedJob && !selectedJobToolAllowed(task.role, definition.name))) return false
     if (definition.name === "tool_results.read") {
       return definition.risk === "read"
         && definition.idempotency === "read_only"
@@ -143,7 +144,8 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
   return async ({ lease }) => {
     if (!lease.turnId) return { status: "failed", failureReason: "child_turn_missing" }
     const owner = executionOwnerFence({ kind: "task", lease })
-    const selectedJob = lease.role === "writer" || lease.role === "reviewer" ? selectedJobId(lease) : undefined
+    const selectedJob = selectedJobId(lease)
+    const selectedEvidenceTask = Boolean(selectedJob && (lease.role === "scout" || lease.role === "analyst"))
     let reviewerArtifactRef: ArtifactVersionReference | undefined
     if ((lease.role === "writer" || lease.role === "reviewer") && !selectedJob) {
       return { status: "failed", failureReason: "selected_job_context_unavailable", retryDisposition: "terminal" }
@@ -154,9 +156,7 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
     }
     const runtime = await options.toolRuntimeFactory({ task: lease, owner, lease })
     const selectedJobPreparation = runtime.selectedJobArtifactContext?.preparation
-    if (selectedJob && (!validSelectedJobContext(selectedJobPreparation, selectedJob) || !Array.isArray(runtime.selectedJobArtifactContext?.transientSources) || runtime.selectedJobArtifactContext?.transientSources.length === 0)) {
-      return { status: "failed", failureReason: "selected_job_sources_unavailable", retryDisposition: "terminal" }
-    }
+    if (selectedJob && !hasSelectedJobReadContext(runtime.selectedJobArtifactContext, selectedJob)) return { status: "failed", failureReason: "selected_job_sources_unavailable", retryDisposition: "terminal" }
     const definitions = visibleDefinitions(lease, runtime.definitions, selectedJob)
     const policy = getSubagentRolePolicy(lease.role)
     if (!policy) return { status: "failed", failureReason: "subagent_role_unknown" }
@@ -167,9 +167,11 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       try {
         const restored = await options.resumeLoader(lease)
         if (restored) {
-          try { hydrateObservedEvidence(observedEvidence, restored.observations) } catch { return { status: "failed", failureReason: "child_resume_evidence_unavailable", retryDisposition: "terminal" } }
+          if (!selectedEvidenceTask) {
+            try { hydrateObservedEvidence(observedEvidence, restored.observations) } catch { return { status: "failed", failureReason: "child_resume_evidence_unavailable", retryDisposition: "terminal" } }
+            snapshot = { ...snapshot, toolObservations: [...restored.observations] }
+          }
           resume = restored.resume
-          snapshot = { ...snapshot, toolObservations: [...restored.observations] }
         }
       } catch (error: unknown) {
         if (isDeterministicChildResumeError(error)) return { status: "failed", failureReason: "child_resume_unavailable", retryDisposition: "terminal" }
@@ -185,16 +187,10 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
     }
     const adapter = await (options.modelRuntimeFactory?.({ task: lease }) ?? defaultModel(lease))
     const model = createUsageAwareModelAdapter(adapter, { owner, authorize: options.authorizeUsage, treeBudget: options.treeBudget })
-    const router = {
-      execute: (context: ToolRouterContext, request: ToolCallRequest) => runtime.router.execute({
-        ...context,
-        ...(selectedJobPreparation ? { selectedJobPreparation } : {}),
-      }, request),
-    }
+    const router = createSelectedJobReadRouter(runtime.router, runtime.selectedJobArtifactContext)
     const routedTool = createToolRouterExecutor(router)
     const privateCallIds = new Set<string>()
-    const redactModelText = Boolean(selectedJobPreparation && (lease.role === "writer" || lease.role === "reviewer"))
-    const safeStore = createPrivateArtifactSafeStore(options.store, privateCallIds, { redactModelText })
+    const safeStore = withSelectedJobInputRedaction(createPrivateArtifactSafeStore(options.store, privateCallIds, { redactModelText: Boolean(selectedJobPreparation) }), Boolean(selectedJobPreparation))
     const taskFence: AgentArtifactTaskFence | undefined = lease.turnId && lease.leaseOwner === lease.ownerId
       && lease.status === "running" && lease.interruptRequestedAt === null && Number.isSafeInteger(lease.attemptCount) && lease.attemptCount > 0
       ? {
@@ -208,6 +204,7 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       selectedJobPreparation, taskFence, reviewerArtifactRef, observedEvidence, privateCallIds,
     })
     const executeTool: typeof routedTool = async input => {
+      if (selectedJobPreparation && isSelectedJobReadTool(input.call.toolName)) privateCallIds.add(input.call.id)
       const toolResult = await dispatchTool(input)
       if (toolResult.status === "completed" && toolResult.errorCode === null) recordReadToolOutput(observedEvidence, input.call.toolName, toolResult.output)
       return toolResult
@@ -237,7 +234,10 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       if (typeof result.finalText !== "string") return { status: "failed", result: { ...childResult, status: "failed" as const }, failureReason: "invalid_structured_result" }
       const structuredResult = parseAndBindStructuredResult(result.finalText, structuredRole, observedEvidence)
       if (!structuredResult) return { status: "failed", result: { ...childResult, status: "failed" as const }, failureReason: "invalid_structured_result" }
-      return { status: "completed", mailboxMessageIds: contextBuilder.getMailboxMessageIds(), result: { ...childResult, finalText: projectChildFinalText(result.finalText), structuredResult }, failureReason: result.errorCode }
+      const selectedEvidenceRole = Boolean(selectedJobPreparation && (structuredRole === "scout" || structuredRole === "analyst"))
+      const safeStructuredResult = selectedEvidenceRole ? redactSelectedEvidenceResult(structuredResult, runtime.selectedJobArtifactContext!) : structuredResult
+      const safeFinalText = selectedEvidenceRole ? JSON.stringify(safeStructuredResult) : result.finalText
+      return { status: "completed", mailboxMessageIds: contextBuilder.getMailboxMessageIds(), result: { ...childResult, finalText: projectChildFinalText(safeFinalText), structuredResult: safeStructuredResult }, failureReason: result.errorCode }
     }
     const status = resultStatus(result.status)
     return {

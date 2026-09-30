@@ -76,7 +76,7 @@ function selectedJobPool() {
     id: "resume-1", name: "Base", kind: "base", origin: "manual", isDefault: true,
     content: { text: `${selectedJobSourceCanary} resume evidence` }, createdAt: new Date("2026-01-01T00:00:00Z"), updatedAt: new Date("2026-01-02T00:00:00Z"),
   }
-  const query = vi.fn(async (sql: string) => {
+  const query = vi.fn(async (sql: string, _values: readonly unknown[] = []) => {
     if (sql.includes('FROM "Job"')) return { rows: [job] }
     if (sql.includes('FROM "Resume"')) return { rows: [resume] }
     if (sql.includes("FROM persona_facts")) return { rows: [{
@@ -85,7 +85,7 @@ function selectedJobPool() {
     }] }
     throw new Error(`unexpected production child query: ${sql}`)
   })
-  return { query } as never
+  return { query }
 }
 
 function jobTask(role: "writer" | "reviewer", context: unknown = { selectedJobPreparation: { jobId: "job-1" } }): SubagentLease {
@@ -131,10 +131,12 @@ function selectedJobExecutor(input: {
   readonly artifactStore: InMemoryArtifactToolStore
   readonly persistence: ReturnType<typeof recordingStore>
   readonly model: ModelAdapter
+  readonly pool?: ReturnType<typeof selectedJobPool>
 }) {
   artifactStoreMock.current = input.artifactStore
+  const pool = input.pool ?? selectedJobPool()
   const executor = createOptionalProductionChildExecutor({
-    enabled: true, pool: selectedJobPool(), turnStore: input.persistence.engineStore, treeBudget: budget(),
+    enabled: true, pool: pool as never, turnStore: input.persistence.engineStore, treeBudget: budget(),
     authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => input.model,
   })
   if (!executor) throw new Error("production selected-job child executor was not created")
@@ -177,7 +179,7 @@ function taskScope(): GraphIdentityScope {
 }
 
 function selectedJobSourceDigest(): Promise<Awaited<ReturnType<typeof loadSelectedJobArtifactContext>>> {
-  return loadSelectedJobArtifactContext(selectedJobPool(), "user-1", "job-1")
+  return loadSelectedJobArtifactContext(selectedJobPool() as never, "user-1", "job-1")
 }
 
 describe("production child runtime", () => {
@@ -266,6 +268,60 @@ describe("production child runtime", () => {
     await expect(executor({ lease: child })).resolves.toMatchObject({ status: "completed" })
     expect(poolWithConnect.connect).toHaveBeenCalledOnce()
     expect(client.query.mock.calls.map(([sql]) => sql)).toContain("SELECT set_config($1, $2, true)")
+  })
+
+  it("pins selected evidence reads to the server job, base resume, and cover-letter persona scope", async () => {
+    const selectedPool = selectedJobPool()
+    const requests: HarnessModelRequest[] = []
+    const calls = [
+      { name: "jobs.get", arguments: { jobId: "attacker-job" } },
+      { name: "resume.get_base", arguments: { resumeId: "attacker-resume" } },
+      { name: "persona.retrieve", arguments: { keys: ["language"], useCase: "form_fill", jobId: "attacker-job" } },
+    ]
+    let callIndex = 0
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) {
+        requests.push(request)
+        const call = calls[callIndex++]
+        if (call) {
+          yield { type: "tool_call_completed", callId: `selected-evidence-${callIndex}`, name: call.name, arguments: call.arguments }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        yield { type: "text_delta", text: JSON.stringify({
+          schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [], evidence: [], summary: "Selected evidence verified",
+        }) }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+    const persistence = recordingStore()
+    const executor = selectedJobExecutor({
+      artifactStore: new InMemoryArtifactToolStore(), persistence, model, pool: selectedPool,
+    })
+    const analyst = {
+      ...lease(), id: "selected-analyst", role: "analyst", taskType: "job_analysis",
+      allowedActions: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"],
+      context: { selectedJobPreparation: { jobId: "job-1" } },
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" },
+    } satisfies SubagentLease
+
+    await expect(executor({ lease: analyst })).resolves.toMatchObject({ status: "completed" })
+    expect(advertisedTools(requests[0]!).map(tool => tool.name)).toEqual([
+      "jobs.get", "persona.retrieve", "resume.get_base",
+    ])
+    expect(advertisedTools(requests[0]!).map(tool => tool.name)).not.toContain("jobs.search")
+
+    const queryCalls = selectedPool.query.mock.calls.map(([sql, values]) => ({ sql, values }))
+    const jobReads = queryCalls.filter(call => call.sql.includes('FROM "Job"') && call.sql.includes('"id" = $1 AND "userId" = $2'))
+    expect(jobReads.map(call => call.values)).toEqual([["job-1", "user-1"], ["job-1", "user-1"]])
+    expect(queryCalls.filter(call => call.sql.includes('FROM "Job"') && !call.sql.includes('"id" = $1 AND "userId" = $2'))).toEqual([])
+    expect(queryCalls.filter(call => call.sql.includes('FROM "Resume"')).map(call => call.values)).toEqual([
+      ["user-1", null], ["user-1", "resume-1"],
+    ])
+    expect(queryCalls.filter(call => call.sql.includes("FROM persona_facts")).map(call => call.values)).toEqual([
+      ["user-1", null, "cover_letter"], ["user-1", ["language"], "cover_letter"],
+    ])
   })
 
   it("composes the selected-job Writer and Reviewer tools with a private exact-reference read receipt", async () => {

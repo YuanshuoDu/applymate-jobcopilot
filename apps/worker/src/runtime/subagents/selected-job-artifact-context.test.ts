@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 
 import { computeArtifactSourceDigest, InMemoryArtifactToolStore } from "../tools/artifact-tools.js"
-import { loadSelectedJobArtifactContext } from "./selected-job-artifact-context.js"
+import { bindSelectedJobReadInput, loadSelectedJobArtifactContext } from "./selected-job-artifact-context.js"
 import { resolveCoverLetterBase } from "./selected-job-artifact-context.js"
 
 function pool(options: { job?: boolean; resume?: boolean } = {}) {
@@ -57,6 +57,17 @@ describe("loadSelectedJobArtifactContext", () => {
     expect(personaCalls[0]?.sql).toContain(`"status" = 'confirmed'`)
     expect(personaCalls[0]?.sql).toContain(`"expires_at" IS NULL OR "expires_at" > NOW()`)
     expect(personaCalls[0]?.sql).toContain(`$3 = ANY("allowedUses")`)
+  })
+
+  it("binds selected read identity and use case to server-loaded values", async () => {
+    const bundle = await loadSelectedJobArtifactContext(pool() as never, "user-1", "job-1")
+
+    expect(bundle.baseResumeId).toBe("resume-1")
+    expect(bindSelectedJobReadInput("jobs.get", { jobId: "attacker-job" }, bundle)).toEqual({ jobId: "job-1" })
+    expect(bindSelectedJobReadInput("resume.get_base", { resumeId: "attacker-resume" }, bundle)).toEqual({ resumeId: "resume-1" })
+    expect(bindSelectedJobReadInput("persona.retrieve", {
+      keys: ["language"], useCase: "form_fill", jobId: "attacker-job",
+    }, bundle)).toEqual({ keys: ["language"], useCase: "cover_letter", jobId: "job-1" })
   })
 
   it.each([

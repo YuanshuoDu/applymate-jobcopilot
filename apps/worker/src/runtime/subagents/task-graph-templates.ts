@@ -29,7 +29,24 @@ export function taskGraphTemplatesForSelectedJob(
   if (!selectedJobPreparation) return TASK_GRAPH_TEMPLATES
   const context = Object.freeze({ selectedJobPreparation: Object.freeze({ jobId: selectedJobPreparation.jobId }) })
   return Object.freeze({
-    ...TASK_GRAPH_TEMPLATES,
+    scout: Object.freeze({
+      ...TASK_GRAPH_TEMPLATES.scout,
+      allowedActions: Object.freeze(["jobs.get"]),
+      constraints: Object.freeze([
+        "Read evidence only for the server-selected job in selectedJobPreparation; do not search or substitute another job.",
+        "Do not submit applications or message employers.",
+      ]),
+      context,
+    }),
+    analyst: Object.freeze({
+      ...TASK_GRAPH_TEMPLATES.analyst,
+      allowedActions: Object.freeze(["jobs.get", "persona.retrieve", "resume.get_base"]),
+      constraints: Object.freeze([
+        "Read evidence only for the server-selected job in selectedJobPreparation, the server-selected base resume, and cover-letter-approved persona facts.",
+        "Do not search or substitute another job, resume, or persona use case; do not write, submit, send, or message employers.",
+      ]),
+      context,
+    }),
     cover_letter_writer: Object.freeze({
       role: "writer",
       taskType: "cover_letter_draft",

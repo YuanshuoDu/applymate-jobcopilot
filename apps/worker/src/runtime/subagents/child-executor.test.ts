@@ -228,6 +228,7 @@ describe("child executor composition", () => {
         ...childToolRuntime(definitions),
         selectedJobArtifactContext: {
           preparation: { jobId: "job-1", sourceDigest: artifactRef.sourceDigest, evidenceRefs: ["resume:resume-1"] },
+          baseResumeId: "resume-1",
           transientSources: [{ sourceRef: "resume:resume-1", content: { summary: "selected-job evidence" } }],
         },
       }),
@@ -236,6 +237,184 @@ describe("child executor composition", () => {
     await executor({ lease: child })
     expect(requests).toHaveLength(1)
     expect(requests[0]?.tools?.map(value => (value as { name: string }).name)).toEqual(expectedTools)
+  })
+
+  it("clamps a selected Analyst to evidence reads and binds model-supplied read identity", async () => {
+    const child = {
+      ...structuredLease("analyst"),
+      context: { selectedJobPreparation: { jobId: "job-1" } },
+      // Simulate a stale/overbroad stored action snapshot; selected mode must narrow it.
+      allowedActions: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"],
+    }
+    const requests: HarnessModelRequest[] = []
+    const routed: Array<{ name: string; input: unknown }> = []
+    const durableWrites: Array<{ kind: string; value: unknown }> = []
+    const privateCanaries = [
+      "SELECTED_JOB_PRIVATE_CANARY", "SELECTED_PERSONA_PRIVATE_CANARY", "SELECTED_RESUME_PRIVATE_CANARY", "MODEL_SUMMARY_PRIVATE_CANARY",
+    ]
+    const calls = [
+      { name: "jobs.get", arguments: { jobId: "attacker-job" } },
+      { name: "resume.get_base", arguments: { resumeId: "attacker-resume" } },
+      { name: "persona.retrieve", arguments: { keys: ["language"], useCase: "form_fill", jobId: "attacker-job" } },
+    ]
+    let callIndex = 0
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) {
+        requests.push(request)
+        const call = calls[callIndex++]
+        if (call) {
+          yield { type: "tool_call_completed", callId: `selected-read-${callIndex}`, name: call.name, arguments: call.arguments }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        yield { type: "text_delta", text: JSON.stringify({
+          schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
+          findings: [{ jobId: "job-1", score: 8, evidenceIds: ["job", "persona", "resume"] }],
+          evidence: [
+            { id: "job", kind: "job", ref: "job-1", source: "greenhouse" },
+            { id: "persona", kind: "persona", ref: "fact-1", source: "persona.database" },
+            { id: "resume", kind: "resume", ref: "resume-1", source: "resume.get_base" },
+          ],
+          summary: `Selected evidence checked: ${privateCanaries[3]}`,
+        }) }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+    const definitions = [tool("jobs.search", "jobs"), tool("jobs.get", "jobs"), tool("persona.retrieve", "persona"), tool("resume.get_base", "resume")]
+    const backingStore = executionStore([], requests)
+    const store: TurnExecutionStore = {
+      ...backingStore,
+      createItem: async input => { durableWrites.push({ kind: "createItem", value: input.content }); return backingStore.createItem(input) },
+      updateItem: async input => { durableWrites.push({ kind: "updateItem", value: input.content }); return backingStore.updateItem(input) },
+      appendEvent: async input => { durableWrites.push({ kind: "appendEvent", value: input.payload }); return backingStore.appendEvent(input) },
+    }
+    const executor = createChildExecutor({
+      store, treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => model,
+      toolRuntimeFactory: () => ({
+        ...childToolRuntime(definitions, async (_context, request) => {
+          routed.push({ name: request.toolName, input: request.input })
+          const output = request.toolName === "jobs.get" ? { job: { id: "job-1", source: "greenhouse", summary: privateCanaries[0] } }
+            : request.toolName === "persona.retrieve" ? { facts: [{ id: "fact-1", source: "persona.database", summary: privateCanaries[1] }] }
+              : request.toolName === "resume.get_base" ? { resume: { id: "resume-1", content: { summary: privateCanaries[2] } } } : {}
+          return { ...request, status: "completed", output, errorCode: null }
+        }),
+        selectedJobArtifactContext: {
+          preparation: { jobId: "job-1", sourceDigest: `sha256:${"a".repeat(64)}`, evidenceRefs: ["job:job-1"] },
+          baseResumeId: "resume-1",
+          transientSources: [{ sourceRef: "job:job-1", content: { role: "Engineer" } }],
+        },
+      }),
+    })
+
+    const result = await executor({ lease: child })
+    expect(result, JSON.stringify(result)).toMatchObject({ status: "completed" })
+    expect(requests[0]?.tools?.map(value => (value as { name: string }).name)).toEqual([
+      "jobs.get", "persona.retrieve", "resume.get_base",
+    ])
+    expect(routed).toEqual([
+      { name: "jobs.get", input: { jobId: "job-1" } },
+      { name: "resume.get_base", input: { resumeId: "resume-1" } },
+      { name: "persona.retrieve", input: { keys: ["language"], useCase: "cover_letter", jobId: "job-1" } },
+    ])
+    expect(durableWrites.map(write => write.kind)).toEqual(expect.arrayContaining(["createItem", "updateItem", "appendEvent"]))
+    const durable = JSON.stringify(durableWrites)
+    for (const canary of privateCanaries) expect(durable).not.toContain(canary)
+    for (const selector of ["attacker-job", "attacker-resume", "form_fill"]) expect(durable).not.toContain(selector)
+    const structuredResult = (result.result as { readonly structuredResult: { readonly summary: string } }).structuredResult
+    expect(structuredResult.summary).toBe("[Private selected-job response withheld]")
+    expect(JSON.stringify(result)).not.toContain("MODEL_SUMMARY_PRIVATE_CANARY")
+  })
+
+  it("drops stale broad read history on selected-job retry while consuming resume counters", async () => {
+    const child = {
+      ...structuredLease("analyst"),
+      context: { selectedJobPreparation: { jobId: "job-1" } },
+      allowedActions: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"],
+    }
+    const requests: HarnessModelRequest[] = []
+    const routed: Array<{ name: string; input: unknown }> = []
+    const startedOrdinals: number[] = []
+    const readCalls = [
+      { name: "jobs.get", arguments: { jobId: "attacker-job" } },
+      { name: "resume.get_base", arguments: { resumeId: "attacker-resume" } },
+      { name: "persona.retrieve", arguments: { useCase: "form_fill", jobId: "attacker-job" } },
+    ]
+    let callIndex = 0
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) {
+        requests.push(request)
+        const call = readCalls[callIndex++]
+        if (call) {
+          yield { type: "tool_call_completed", callId: `retry-read-${callIndex}`, name: call.name, arguments: call.arguments }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        // A stale result from the prior broad search must not be accepted as selected evidence.
+        yield { type: "text_delta", text: JSON.stringify({
+          schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
+          findings: [{ jobId: "legacy-job", score: 8, evidenceIds: ["legacy-job-evidence"] }],
+          evidence: [{ id: "legacy-job-evidence", kind: "job", ref: "legacy-job", source: "legacy-search" }],
+          summary: "Legacy search result",
+        }) }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+    const baseStore = executionStore([], requests)
+    const store: TurnExecutionStore = {
+      ...baseStore,
+      startStep: async ({ stepId, ordinal }) => { startedOrdinals.push(ordinal); return { id: stepId, ordinal } },
+    }
+    const outputs: Readonly<Record<string, unknown>> = {
+      "jobs.get": { job: { id: "job-1", source: "greenhouse" } },
+      "resume.get_base": { resume: { id: "resume-1" } },
+      "persona.retrieve": { facts: [{ id: "fact-1", source: "persona.database" }] },
+    }
+    const executor = createChildExecutor({
+      store, treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => model,
+      toolRuntimeFactory: () => ({
+        ...childToolRuntime(
+          [tool("jobs.search", "jobs"), tool("jobs.get", "jobs"), tool("persona.retrieve", "persona"), tool("resume.get_base", "resume")],
+          async (_context, request) => {
+            routed.push({ name: request.toolName, input: request.input })
+            return { ...request, status: "completed", output: outputs[request.toolName], errorCode: null }
+          },
+        ),
+        selectedJobArtifactContext: {
+          preparation: { jobId: "job-1", sourceDigest: `sha256:${"c".repeat(64)}`, evidenceRefs: ["job:job-1"] },
+          baseResumeId: "resume-1",
+          transientSources: [{ sourceRef: "job:job-1", content: { role: "Engineer" } }],
+        },
+      }),
+      resumeLoader: async () => ({
+        resume: { nextOrdinal: 5, stepCount: 4, toolCallCount: 4, inputThroughSequence: 8n, consumedInputIds: ["input-1"], usage: { inputTokens: 10, outputTokens: 4, estimatedCostUsd: 0.2 } },
+        observations: [
+          restoredRead("legacy-search", "jobs.search", { jobs: [{ id: "legacy-job", source: "legacy-search" }] }),
+          restoredRead("legacy-persona", "persona.retrieve", { facts: [{ id: "legacy-fact", source: "legacy-persona" }] }, { input: { useCase: "form_fill", jobId: "legacy-job" } }),
+          restoredRead("legacy-resume", "resume.get_base", { resume: { id: "legacy-resume" } }, { input: { resumeId: "legacy-resume" } }),
+        ],
+      }),
+    })
+
+    const result = await executor({ lease: child })
+    expect(result.status).toBe("failed")
+    expect(requests).toHaveLength(4)
+    expect(startedOrdinals).toEqual([5, 6, 7, 8])
+    expect(JSON.stringify(requests[0]?.messages)).not.toContain("legacy-job")
+    expect(JSON.stringify(requests[0]?.messages)).not.toContain("legacy-fact")
+    expect(JSON.stringify(requests[0]?.messages)).not.toContain("legacy-resume")
+    expect(requests[0]?.tools?.map(value => (value as { name: string }).name)).toEqual([
+      "jobs.get", "persona.retrieve", "resume.get_base",
+    ])
+    expect(routed).toEqual([
+      { name: "jobs.get", input: { jobId: "job-1" } },
+      { name: "resume.get_base", input: { resumeId: "resume-1" } },
+      { name: "persona.retrieve", input: { useCase: "cover_letter", jobId: "job-1" } },
+    ])
+    expect(JSON.stringify(result)).not.toContain("legacy-job")
   })
 
   it("applies root step limits before starting child model work", async () => {
