@@ -124,8 +124,6 @@ export class ToolRouter {
       actorRole: context.actorRole,
       remainingTurnSteps: context.remainingTurnSteps,
       delegateOutputSchemaMarker: context.delegateOutputSchemaMarker,
-      selectedJobPreparation: context.selectedJobPreparation,
-      taskFence: context.taskFence,
       signal: controller.signal,
       capabilities: context.capabilities ?? [],
       reportProgress: async (progress) => {

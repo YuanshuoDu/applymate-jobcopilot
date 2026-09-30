@@ -139,6 +139,7 @@ async function compositionRuntime(): Promise<{ runtime: CanonicalTurnRuntime; to
   }
   const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
     workerId: "worker_fixture", manager, stateLoader: async () => state,
+    selectedJobPreparationLoader: async () => undefined,
     modelRuntimeFactory: async () => ({ adapter: model, registry: {} as never, candidates: [] }),
     toolRuntimeFactory: () => ({ registry, router }),
     rootTaskStore: {
@@ -172,6 +173,7 @@ async function coordinationRuntime(input: { workerId?: string; manager: AgentTre
   const state: CanonicalTurnState = { scope: { userId: "user_fixture" }, goal: "Read fixture state", modelProfileSnapshot: {} as never, toolPolicySnapshot: { role: "orchestrator", capabilities: ["read", "coordination"] }, budgetSnapshot: { limits: { maxSteps: 5 } }, snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] } }
   const runtimeOptions: Parameters<typeof createCanonicalTurnRuntime>[1] = {
     workerId: input.workerId ?? "worker_fixture", manager: input.manager, coordinationEnabled: true,
+    selectedJobPreparationLoader: async () => undefined,
     ...(input.now ? { now: input.now } : {}),
     ...(input.consumeWaitOutcomes ? { consumeWaitOutcomes: true } : {}),
     ...(input.stateLoader ? { stateLoader: async (_pool, lease) => input.stateLoader!(state, lease) } : {}),

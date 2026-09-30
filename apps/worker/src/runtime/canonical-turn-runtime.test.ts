@@ -935,7 +935,10 @@ describe("createCanonicalTurnRuntime", () => {
     expect(roots.finish).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ errorCode: "business_precondition_failed" }) }))
   })
 
-  it("requires a fresh exact selected-job draft review after the pending-child check", async () => {
+  it.each([
+    { name: "unchanged source", sourceDigest: `sha256:${"b".repeat(64)}`, status: "completed" },
+    { name: "source changed after review", sourceDigest: `sha256:${"e".repeat(64)}`, status: "failed" },
+  ])("revalidates current selected-job sources at completion ($name)", async ({ sourceDigest, status }) => {
     const artifactRef = {
       artifactId: "draft-1", version: 2, contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: `sha256:${"b".repeat(64)}`,
     }
@@ -966,6 +969,7 @@ describe("createCanonicalTurnRuntime", () => {
       ...artifactRef, artifactId: scope.artifactId,
     }))
     const roots = rootStore()
+    const sourceDigestLoader = vi.fn(async () => sourceDigest)
     const productionFlags = resolveProductionAgentFlags({
       ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
     })
@@ -973,6 +977,7 @@ describe("createCanonicalTurnRuntime", () => {
       workerId: "worker-1", productionFlags, taskGraphCommandPort,
       selectedJobPreparationLoader: async () => ({ jobId: "job-1" }),
       selectedJobArtifactHeadReader: artifactHeadReader,
+      selectedJobSourceDigestLoader: sourceDigestLoader,
       stateLoader: async () => ({ ...selectedJobState(), toolPolicySnapshot: {} }), rootTaskStore: roots as never,
       turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
       modelRuntimeFactory: async () => ({ adapter: {
@@ -985,15 +990,21 @@ describe("createCanonicalTurnRuntime", () => {
       authorizeUsage: async () => ({ settle: async () => undefined }),
     })
 
-    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "completed" })
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status })
     expect(roots.checkCompletion).toHaveBeenCalledOnce()
     expect(taskGraphCommandPort.readCurrent).toHaveBeenCalledTimes(2)
     expect(taskGraphCommandPort.readCurrent).toHaveBeenLastCalledWith({
       userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-1", parentTaskId: "root-1",
       turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: 1,
     })
-    expect(artifactHeadReader).toHaveBeenCalledOnce()
-    expect(artifactHeadReader).toHaveBeenCalledWith({ userId: lease.userId, sessionId: lease.sessionId, jobId: "job-1", artifactId: "draft-1" })
+    if (status === "completed") {
+      expect(artifactHeadReader).toHaveBeenCalledOnce()
+      expect(artifactHeadReader).toHaveBeenCalledWith({ userId: lease.userId, sessionId: lease.sessionId, jobId: "job-1", artifactId: "draft-1" })
+    } else {
+      expect(artifactHeadReader).not.toHaveBeenCalled()
+    }
+    expect(sourceDigestLoader).toHaveBeenCalledOnce()
+    expect(sourceDigestLoader).toHaveBeenCalledWith(lease.userId, "job-1")
   })
 
   it("keeps selected-job completion behind the pending-child check", async () => {

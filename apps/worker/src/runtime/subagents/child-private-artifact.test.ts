@@ -15,7 +15,7 @@ function lease(role: "writer" | "reviewer"): SubagentLease {
   return {
     id: `${role}-task`, userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
     path: `/root-1/${role}-task`, depth: 1, role, taskType: role === "writer" ? "cover_letter_draft" : "cover_letter_review",
-    status: "running", goal: "Prepare selected job artifact", constraints: [], successCriteria: [], allowedActions: [], context: {},
+    status: "running", goal: "Prepare selected job artifact", constraints: [], successCriteria: [], allowedActions: [], context: { selectedJobPreparation: { jobId: "job-1" } },
     expectedOutputSchema: {}, modelProfileSnapshot: {}, result: null, failureReason: null, attemptCount: 1, maxAttempts: 3,
     leaseOwner: "worker-1", leaseExpiresAt: new Date("2099-01-01T00:00:00Z"), interruptRequestedAt: null,
     budgetSnapshot: {}, toolPolicySnapshot: {}, ownerId: "worker-1", signal: new AbortController().signal,
@@ -234,7 +234,7 @@ describe("private child artifact boundary", () => {
     expect(executePrivateTool).toHaveBeenCalledTimes(2)
     expect(executePrivateTool.mock.calls[0]?.[0]).toMatchObject({
       scope: { userId: reviewerLease.userId }, sessionId: reviewerLease.sessionId, turnId: reviewerLease.turnId,
-      taskId: reviewerLease.id, rootTaskId: reviewerLease.rootTaskId, taskFence: taskFence(reviewerLease),
+      taskId: reviewerLease.id, rootTaskId: reviewerLease.rootTaskId, selectedJobPreparation, taskFence: taskFence(reviewerLease),
     })
     expect(privateCallIds).toEqual(new Set(["wrong-ref", "read-call", "unsafe-review-call", "review-call"]))
 
@@ -258,5 +258,44 @@ describe("private child artifact boundary", () => {
     const denied = await reviewer(executionInput(call("application.submit", "submit-call")))
     expect(denied).toMatchObject({ status: "failed", errorCode: "child_action_denied" })
     expect(executeRoutedTool).not.toHaveBeenCalled()
+  })
+
+  it("fails closed when private selected-job scope does not match the server-selected task", async () => {
+    const writerLease = { ...lease("writer"), context: { selectedJobPreparation: { jobId: "job-1" } } }
+    const executePrivateTool = vi.fn(async (_context, request): Promise<ToolExecutionResult> => ({
+      ...request, status: "completed", errorCode: null,
+    }))
+    const dispatcher = createChildPrivateArtifactDispatcher({
+      lease: writerLease, definitions: [{ name: "cover_letter.draft", version: "1" }],
+      executeRoutedTool: vi.fn() as unknown as TurnEngineToolExecutor,
+      executePrivateTool,
+      selectedJobPreparation: { jobId: "attacker-job", sourceDigest: ref.sourceDigest, evidenceRefs: ["job:attacker-job"] },
+      taskFence: taskFence(writerLease), observedEvidence: createObservedEvidenceIndex(), privateCallIds: new Set(),
+    })
+
+    await expect(dispatcher(executionInput(call("cover_letter.draft", "mismatched-scope", { content: "letter" }))))
+      .resolves.toMatchObject({ status: "failed", errorCode: "selected_job_context_unavailable" })
+    expect(executePrivateTool).not.toHaveBeenCalled()
+  })
+
+  it("keeps private scope and task fencing out of generic child tool calls", async () => {
+    const writerLease = lease("writer")
+    const executeRoutedTool = vi.fn(async (input: Parameters<TurnEngineToolExecutor>[0]): Promise<ToolExecutionResult> => ({
+      ...input.call, status: "completed", errorCode: null,
+    }))
+    const executePrivateTool = vi.fn()
+    const dispatcher = createChildPrivateArtifactDispatcher({
+      lease: writerLease, definitions: [{ name: "jobs.search", version: "1" }],
+      executeRoutedTool, executePrivateTool,
+      selectedJobPreparation: { jobId: "job-1", sourceDigest: ref.sourceDigest, evidenceRefs: ["job:job-1"] },
+      taskFence: taskFence(writerLease), observedEvidence: createObservedEvidenceIndex(), privateCallIds: new Set(),
+    })
+    const input = executionInput(call("jobs.search", "generic-call"))
+
+    await expect(dispatcher(input)).resolves.toMatchObject({ status: "completed" })
+    expect(executeRoutedTool).toHaveBeenCalledWith(input)
+    expect(executeRoutedTool.mock.calls[0]?.[0]).not.toHaveProperty("selectedJobPreparation")
+    expect(executeRoutedTool.mock.calls[0]?.[0]).not.toHaveProperty("taskFence")
+    expect(executePrivateTool).not.toHaveBeenCalled()
   })
 })

@@ -4,9 +4,13 @@ import { artifactReferenceKey, type ObservedEvidenceIndex } from "./child-eviden
 import type { SubagentLease, SubagentTaskRecord } from "./types.js"
 import type { TurnExecutionStore } from "../turns/turn-execution-types.js"
 import type { TurnEngineToolExecutor } from "../turns/turn-engine-types.js"
-import type { RuntimeToolDefinition, SelectedJobArtifactTaskFence, SelectedJobPreparationContext, ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
+import type { AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
+import type { SelectedJobPreparation } from "../tools/artifact-tools.js"
+import type { RuntimeToolDefinition, ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
+import { validSelectedJobContext } from "./selected-job-artifact-context.js"
 
-type PrivateToolExecutor = (context: ToolRouterContext, request: ToolCallRequest) => Promise<ToolExecutionResult>
+export type PrivateArtifactToolContext = Omit<ToolRouterContext, "taskId" | "rootTaskId"> & { readonly taskId: string; readonly rootTaskId: string; readonly selectedJobPreparation: SelectedJobPreparation; readonly taskFence: AgentArtifactTaskFence }
+type PrivateToolExecutor = (context: PrivateArtifactToolContext, request: ToolCallRequest) => Promise<ToolExecutionResult>
 type PublicDefinition = Pick<RuntimeToolDefinition, "name" | "version">
 type PrivateArtifactSafeStoreOptions = { readonly redactModelText?: boolean }
 
@@ -27,19 +31,11 @@ export function selectedJobId(task: SubagentTaskRecord): string | undefined {
     ? selected.jobId
     : undefined
 }
-export function validSelectedJobContext(value: SelectedJobPreparationContext | undefined, jobId: string): value is SelectedJobPreparationContext {
-  return Boolean(value && value.jobId === jobId && /^sha256:[a-f0-9]{64}$/.test(value.sourceDigest)
-    && Array.isArray(value.evidenceRefs) && value.evidenceRefs.length > 0
-    && value.evidenceRefs.every(ref => typeof ref === "string" && ref.trim().length > 0 && ref.length <= 256)
-    && new Set(value.evidenceRefs).size === value.evidenceRefs.length)
-}
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
 }
 
-function privateArtifactReceipt(value: unknown): RepositoryJsonValue {
-  try { return { artifactRef: parseArtifactReference(record(value).artifactRef) } } catch { return { privateArtifact: true } }
-}
+function privateArtifactReceipt(value: unknown): RepositoryJsonValue { try { return { artifactRef: parseArtifactReference(record(value).artifactRef) } } catch { return { privateArtifact: true } } }
 
 function validPrivateReviewInput(value: unknown): boolean {
   const input = record(value)
@@ -179,7 +175,7 @@ function exactReference(value: unknown): ArtifactVersionReference | undefined {
   try { return parseArtifactReference(record(value).artifactRef) } catch { return undefined }
 }
 
-function privateContext(input: Parameters<TurnEngineToolExecutor>[0], selectedJobPreparation: SelectedJobPreparationContext | undefined, taskFence: SelectedJobArtifactTaskFence | undefined, lease: SubagentLease): ToolRouterContext {
+function privateContext(input: Parameters<TurnEngineToolExecutor>[0], selectedJobPreparation: SelectedJobPreparation, taskFence: AgentArtifactTaskFence, lease: SubagentLease): PrivateArtifactToolContext {
   return {
     scope: { ...input.scope, userId: lease.userId }, sessionId: lease.sessionId,
     turnId: lease.turnId ?? input.turnId, stepId: input.stepId,
@@ -194,8 +190,8 @@ export function createChildPrivateArtifactDispatcher(options: {
   readonly definitions: readonly PublicDefinition[]
   readonly executeRoutedTool: TurnEngineToolExecutor
   readonly executePrivateTool?: PrivateToolExecutor
-  readonly selectedJobPreparation?: SelectedJobPreparationContext
-  readonly taskFence?: SelectedJobArtifactTaskFence
+  readonly selectedJobPreparation?: SelectedJobPreparation
+  readonly taskFence?: AgentArtifactTaskFence
   readonly reviewerArtifactRef?: ArtifactVersionReference
   readonly observedEvidence: ObservedEvidenceIndex
   readonly privateCallIds: Set<string>
@@ -210,6 +206,10 @@ export function createChildPrivateArtifactDispatcher(options: {
       || request.toolName === "artifact.review"
     if (!privateTool) return options.executeRoutedTool(input)
     options.privateCallIds.add(request.id)
+    const selectedJob = selectedJobId(options.lease)
+    if (!selectedJob || !validSelectedJobContext(options.selectedJobPreparation, selectedJob)) {
+      return resultFor(request, "selected_job_context_unavailable")
+    }
     const fence = options.taskFence
     if (!fence || options.lease.status !== "running" || options.lease.interruptRequestedAt !== null
       || options.lease.leaseOwner !== options.lease.ownerId || !options.lease.turnId
@@ -221,7 +221,7 @@ export function createChildPrivateArtifactDispatcher(options: {
     }
     if (!options.executePrivateTool) return resultFor(request, "private_artifact_tool_unavailable")
 
-    const toolContext = privateContext(input, options.selectedJobPreparation, options.taskFence, options.lease)
+    const toolContext = privateContext(input, options.selectedJobPreparation, fence, options.lease)
     if (request.toolName === "artifact.version.read") {
       const reference = exactReference(request.input)
       if (options.lease.role !== "reviewer" || !reference || !options.reviewerArtifactRef

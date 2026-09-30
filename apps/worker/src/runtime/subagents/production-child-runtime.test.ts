@@ -362,7 +362,10 @@ describe("production child runtime", () => {
     expect(stringsDeep(writerRequests[0]).join("\n")).toContain(selectedJobSourceCanary)
     const writerResult = completedResult(writer.result)
     expect(writerResult.structuredResult).toMatchObject({ role: "writer", artifactRef })
-    expect(draftSpy.mock.calls[0]?.[0]).toMatchObject({ taskFence: {
+    expect(draftSpy.mock.calls[0]?.[0]).toMatchObject({
+      userId: "user-1", sessionId: "session-1", jobId: "job-1",
+      sourceDigest: preparation.sourceDigest, evidenceRefs: preparation.evidenceRefs,
+      taskFence: {
       taskId: "writer-task", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
       parentTaskId: "root-1", leaseOwner: "worker-1", attemptCount: 1,
     } })
@@ -415,7 +418,10 @@ describe("production child runtime", () => {
     expect(stringsDeep(reviewerRequests[0]).join("\n")).toContain(selectedJobSourceCanary)
     expect(stringsDeep(reviewerRequests[1]).join("\n")).toContain(body)
     expect(completedResult(reviewer.result).structuredResult).toMatchObject({ role: "reviewer", artifactRef, reviewStatus: "passed", reviewHash })
-    expect(reviewSpy.mock.calls[0]?.[0]).toMatchObject({ taskFence: {
+    expect(reviewSpy.mock.calls[0]?.[0]).toMatchObject({
+      userId: "user-1", sessionId: "session-1", jobId: "job-1",
+      sourceDigest: preparation.sourceDigest, evidenceRefs: preparation.evidenceRefs,
+      taskFence: {
       taskId: "reviewer-task", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
       parentTaskId: "root-1", leaseOwner: "worker-1", attemptCount: 1,
     } })

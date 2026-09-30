@@ -118,6 +118,7 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false, 
     selectedJobReconnectSequence: null as string | null,
     selectedJobGraphReleaseArmed: false,
     selectedJobGraphEventSent: false,
+    selectedJobPlanEventSent: false,
     ordinaryChatRequests: [] as Array<Record<string, unknown>>,
     ordinaryChatEventSent: false,
   }
@@ -290,6 +291,7 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false, 
       fixture.tasksQueryCount += 1
       const selected = sessionId === SESSION_A ? stageStatus() : 'completed'
       const tasks = [{ id: `task-${sessionId}`, sessionId, turnId: sessionId === SESSION_A ? TURN_A : TURN_B, parentTaskId: null, role: 'Scout', taskType: 'read', status: selected, goal: sessionId === SESSION_A ? 'Inspect saved roles' : 'B session evidence', hasResult: selected === 'completed' }]
+      const selectedJobTaskGoal = selectedJobPendingWriter ? 'Prepare Systems Engineer at Fixture Systems' : 'Prepare the selected saved job'
       if (sessionId === SESSION_A) tasks.push({ id: CHILD_TASK_A, sessionId, turnId: TURN_A, parentTaskId: `task-${SESSION_A}`, role: 'Scout', taskType: 'research', status: childStatus(), goal: 'Check child evidence', hasResult: childStatus() === 'completed' })
       if (sessionId === SESSION_A && selectedJobTurnGateRegression) {
         tasks.push({
@@ -317,11 +319,11 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false, 
       } else if (sessionId === SESSION_A) {
         tasks.push({
           id: 'selected-job-plan-root', sessionId, turnId: 'fixture-preparation-turn', rootTaskId: 'selected-job-plan-root', parentTaskId: null,
-          role: 'orchestrator', taskType: 'root', status: 'running', goal: 'Prepare the selected saved job', hasResult: false,
+          role: 'orchestrator', taskType: 'root', status: 'running', goal: selectedJobTaskGoal, hasResult: false,
         })
         tasks.push({
           id: 'writer-fixture-draft', sessionId, turnId: 'fixture-preparation-turn', rootTaskId: 'selected-job-plan-root', parentTaskId: 'selected-job-plan-root',
-          role: 'writer', taskType: 'cover_letter_draft', status: fixture.selectedJobStarted && !selectedJobPendingWriter ? 'completed' : 'queued', goal: 'Prepare the selected saved job', hasResult: fixture.selectedJobStarted && !selectedJobPendingWriter,
+          role: 'writer', taskType: 'cover_letter_draft', status: fixture.selectedJobStarted && !selectedJobPendingWriter ? 'completed' : 'queued', goal: selectedJobTaskGoal, hasResult: fixture.selectedJobStarted && !selectedJobPendingWriter,
           ...(fixture.selectedJobStarted && !selectedJobPendingWriter ? { artifactRef: { artifactId: 'fixture-cover-letter', version: 1, contentHash: `sha256:${'a'.repeat(64)}`, sourceDigest: `sha256:${'b'.repeat(64)}` } } : {}),
           updatedAt: times.updated,
         })
@@ -416,6 +418,18 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false, 
           ] },
         })
         const graphEvent = event(SESSION_A, SELECTED_JOB_TURN_B, 'fixture-event-selected-job-task-graph-next', '101', 'item.started', { item: graphItem }, { itemId: graphItem.id, taskId: graphItem.taskId })
+        return route.fulfill({ status: 200, contentType: 'text/event-stream', body: `event: timeline\ndata: ${JSON.stringify(graphEvent)}\n\n` })
+      }
+      if (selectedJobPendingWriter && fixture.selectedJobStarted && !fixture.selectedJobPlanEventSent) {
+        fixture.selectedJobPlanEventSent = true
+        fixture.eventSequence = 100
+        const graphItem = item(SESSION_A, SELECTED_JOB_TURN_A, 'fixture-selected-job-task-graph', 'Prepare Systems Engineer at Fixture Systems.', {
+          stepId: null, type: 'task_graph', taskId: 'selected-job-plan-root', revision: 4,
+          content: { schemaVersion: 'agent-harness.v2.task-graph', nodes: [
+            { key: 'cover-letter', templateId: 'writer', goal: 'Prepare Systems Engineer at Fixture Systems', successCriteria: ['Save a reviewable draft'], dependsOn: [], depth: 1, taskId: 'writer-fixture-draft' },
+          ] },
+        })
+        const graphEvent = event(SESSION_A, SELECTED_JOB_TURN_A, 'fixture-event-selected-job-task-graph', '100', 'item.started', { item: graphItem }, { itemId: graphItem.id, taskId: graphItem.taskId })
         return route.fulfill({ status: 200, contentType: 'text/event-stream', body: `event: timeline\ndata: ${JSON.stringify(graphEvent)}\n\n` })
       }
       if (selectedJobTurnGateRegression && fixture.ordinaryChatRequests.length > 0 && !fixture.ordinaryChatEventSent) {

@@ -24,6 +24,7 @@ import { loadTaskGraphCurrentObservation } from "./canonical-turn-task-graph-con
 import { loadSelectedJobPreparation, type SelectedJobPreparation } from "./selected-job-preparation.js"
 import { failSelectedJobPreparationUnavailable } from "./selected-job-preparation-gate.js"
 import { taskGraphRuntimeForTurn } from "./subagents/task-graph-templates.js"
+import { loadSelectedJobArtifactContext } from "./subagents/selected-job-artifact-context.js"
 import { AgentTreeManager } from "./subagents/manager.js"
 import { PgSubagentTaskStore } from "./subagents/pg-store.js"
 import { createPgRootTaskStore, type RootTaskStore } from "./subagents/root-task-store.js"
@@ -51,6 +52,8 @@ export type CanonicalTurnRuntimeOptions = {
   readonly selectedJobPreparationLoader?: (pool: Pick<pg.Pool, "connect">, lease: TurnLease, now: Date) => Promise<SelectedJobPreparation | undefined>
   /** Test seam for the persisted artifact-head read; production uses the artifact repository. */
   readonly selectedJobArtifactHeadReader?: (scope: AgentArtifactDraftHeadScope) => Promise<AgentArtifactDraftHead | null>
+  /** Test seam for reloading the server-selected source digest at Turn completion. */
+  readonly selectedJobSourceDigestLoader?: (userId: string, jobId: string) => Promise<string | null>
   readonly modelRuntimeFactory?: (input: { userId: string; config?: AiConfig; state: CanonicalTurnState }) => Promise<HarnessModelRuntime> | HarnessModelRuntime
   readonly authorizeUsage?: UsageAuthorizer
   /** Server-owned scheduler and trusted template registry; model input never supplies its task/tenant fence. */
@@ -219,6 +222,13 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
         return selectedJobArtifactCompletionGate({
           commandPort: options.taskGraphCommandPort, lease, root, selectedJobId: selectedJobPreparation?.jobId,
           readCurrentDraftHead: options.selectedJobArtifactHeadReader ?? (scope => artifactRepository.findCurrentDraftHead(scope)),
+          readCurrentSourceDigest: async () => {
+            const jobId = selectedJobPreparation?.jobId
+            if (!jobId) return null
+            if (options.selectedJobSourceDigestLoader) return options.selectedJobSourceDigestLoader(lease.userId, jobId)
+            const currentSources = await loadSelectedJobArtifactContext(pool, lease.userId, jobId)
+            return currentSources.preparation.sourceDigest
+          },
         })
       } } : {}),
     })

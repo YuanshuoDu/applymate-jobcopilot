@@ -145,16 +145,17 @@ function latestReviewedDraftReferences(value: unknown): ArtifactReference[] | un
   return [...latestGraphReferenceByArtifact.values()]
 }
 
-/** Requires every latest selected-job draft to match its current session-scoped persisted head and review. */
+/** Requires every latest selected-job draft to match its persisted head and current source digest. */
 export async function selectedJobArtifactCompletionGate(input: {
   readonly commandPort: TaskGraphCommandPort | undefined
   readonly lease: TurnLease
   readonly root: Pick<SubagentTaskRecord, "id" | "attemptCount">
   readonly selectedJobId: string | undefined
   readonly readCurrentDraftHead: ((scope: AgentArtifactDraftHeadScope) => Promise<AgentArtifactDraftHead | null>) | undefined
+  readonly readCurrentSourceDigest: (() => Promise<string | null>) | undefined
 }): Promise<TurnEngineCompletionGateResult> {
   if (!input.commandPort || typeof input.selectedJobId !== "string" || !input.selectedJobId.trim()
-    || input.selectedJobId.length > 256 || !input.readCurrentDraftHead) return BLOCKED
+    || input.selectedJobId.length > 256 || !input.readCurrentDraftHead || !input.readCurrentSourceDigest) return BLOCKED
   const scope: TaskGraphReadScope = {
     userId: input.lease.userId,
     sessionId: input.lease.sessionId,
@@ -169,6 +170,9 @@ export async function selectedJobArtifactCompletionGate(input: {
   try {
     const latestReferences = latestReviewedDraftReferences(await input.commandPort.readCurrent(scope))
     if (!latestReferences) return BLOCKED
+    const currentSourceDigest = await input.readCurrentSourceDigest()
+    if (typeof currentSourceDigest !== "string" || !SHA256.test(currentSourceDigest)
+      || latestReferences.some(reference => reference.sourceDigest !== currentSourceDigest)) return BLOCKED
     for (const reference of latestReferences) {
       const persistedHead = await input.readCurrentDraftHead({
         userId: input.lease.userId,

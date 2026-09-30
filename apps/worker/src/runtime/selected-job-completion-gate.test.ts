@@ -70,6 +70,7 @@ async function check(value: unknown) {
   return selectedJobArtifactCompletionGate({
     commandPort: commandPort(value), lease, root, selectedJobId: "job-1",
     readCurrentDraftHead: async scope => ({ ...reference(), artifactId: scope.artifactId }),
+    readCurrentSourceDigest: async () => reference().sourceDigest,
   })
 }
 
@@ -79,7 +80,10 @@ describe("selected-job artifact completion gate", () => {
     const port = commandPort(state)
     const readCurrentDraftHead = vi.fn(async (scope: { artifactId: string }) => ({ ...reference(), artifactId: scope.artifactId }))
 
-    await expect(selectedJobArtifactCompletionGate({ commandPort: port, lease, root, selectedJobId: "job-1", readCurrentDraftHead })).resolves.toEqual({ ok: true })
+    await expect(selectedJobArtifactCompletionGate({
+      commandPort: port, lease, root, selectedJobId: "job-1", readCurrentDraftHead,
+      readCurrentSourceDigest: async () => reference().sourceDigest,
+    })).resolves.toEqual({ ok: true })
     expect(port.readCurrent).toHaveBeenCalledWith({
       userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: root.id, parentTaskId: root.id,
       turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: root.attemptCount,
@@ -136,6 +140,7 @@ describe("selected-job artifact completion gate", () => {
     await expect(selectedJobArtifactCompletionGate({
       commandPort: port, lease, root, selectedJobId: "job-1",
       readCurrentDraftHead: async scope => ({ ...reference(), artifactId: scope.artifactId }),
+      readCurrentSourceDigest: async () => reference().sourceDigest,
     })).resolves.toEqual({
       ok: false,
       blocker: "selected_job_draft_review_required",
@@ -146,6 +151,7 @@ describe("selected-job artifact completion gate", () => {
   it("fails closed when the command port is unavailable", async () => {
     await expect(selectedJobArtifactCompletionGate({
       commandPort: undefined, lease, root, selectedJobId: undefined, readCurrentDraftHead: undefined,
+      readCurrentSourceDigest: undefined,
     })).resolves.toMatchObject({
       ok: false, blocker: "selected_job_draft_review_required",
     })
@@ -155,13 +161,33 @@ describe("selected-job artifact completion gate", () => {
     const graph = current([writer(), reviewer()])
     await expect(selectedJobArtifactCompletionGate({
       commandPort: commandPort(graph), lease, root, selectedJobId: "job-1", readCurrentDraftHead,
+      readCurrentSourceDigest: async () => reference().sourceDigest,
     })).resolves.toMatchObject({ ok: false, blocker: "selected_job_draft_review_required" })
   })
 
-  it("fails closed without a server-selected job identity or head reader", async () => {
+  it("fails closed without a server-selected job identity or current-source reader", async () => {
     const graph = current([writer(), reviewer()])
     await expect(selectedJobArtifactCompletionGate({
-      commandPort: commandPort(graph), lease, root, selectedJobId: undefined, readCurrentDraftHead: undefined,
+      commandPort: commandPort(graph), lease, root, selectedJobId: "job-1",
+      readCurrentDraftHead: async scope => ({ ...reference(), artifactId: scope.artifactId }), readCurrentSourceDigest: undefined,
+    })).resolves.toMatchObject({ ok: false, blocker: "selected_job_draft_review_required" })
+  })
+
+  it("blocks completion when selected-job sources change after the Reviewer receipt", async () => {
+    const graph = current([writer(), reviewer()])
+    await expect(selectedJobArtifactCompletionGate({
+      commandPort: commandPort(graph), lease, root, selectedJobId: "job-1",
+      readCurrentDraftHead: async scope => ({ ...reference(), artifactId: scope.artifactId }),
+      readCurrentSourceDigest: async () => `sha256:${"e".repeat(64)}`,
+    })).resolves.toMatchObject({ ok: false, blocker: "selected_job_draft_review_required" })
+  })
+
+  it("fails closed when current selected-job sources are unavailable", async () => {
+    const graph = current([writer(), reviewer()])
+    await expect(selectedJobArtifactCompletionGate({
+      commandPort: commandPort(graph), lease, root, selectedJobId: "job-1",
+      readCurrentDraftHead: async scope => ({ ...reference(), artifactId: scope.artifactId }),
+      readCurrentSourceDigest: async () => { throw new Error("private source detail") },
     })).resolves.toMatchObject({ ok: false, blocker: "selected_job_draft_review_required" })
   })
 
@@ -173,6 +199,7 @@ describe("selected-job artifact completion gate", () => {
 
     await expect(selectedJobArtifactCompletionGate({
       commandPort: port, lease, root, selectedJobId: "job-1", readCurrentDraftHead,
+      readCurrentSourceDigest: async () => reference().sourceDigest,
     })).resolves.toEqual({ ok: true })
     expect(readCurrentDraftHead).toHaveBeenCalledTimes(2)
     expect(readCurrentDraftHead).toHaveBeenNthCalledWith(1, { userId: lease.userId, sessionId: lease.sessionId, jobId: "job-1", artifactId: "draft-1" })

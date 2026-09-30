@@ -35,29 +35,6 @@ describe("ToolRouter", () => {
     expect(sink.events.map((event) => event.phase)).toEqual(["started", "completed"])
   })
 
-  it("passes server-owned selected-job scope and task fencing into capability-checked tools", async () => {
-    const execute = vi.fn(async () => ({ result: "ok" }))
-    const { router } = makeRouter(execute)
-    const serverContext = {
-      ...context,
-      taskId: "child-1",
-      rootTaskId: "root-1",
-      selectedJobPreparation: { jobId: "job-1", sourceDigest: `sha256:${"a".repeat(64)}`, evidenceRefs: ["job:job-1"] },
-      taskFence: {
-        taskId: "child-1", userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "root-1",
-        parentTaskId: "root-1", leaseOwner: "worker-a", attemptCount: 2,
-      },
-    }
-
-    await expect(router.execute(serverContext, request)).resolves.toMatchObject({ status: "completed" })
-    expect(execute).toHaveBeenCalledWith(expect.objectContaining({
-      selectedJobPreparation: serverContext.selectedJobPreparation,
-      taskFence: serverContext.taskFence,
-      taskId: "child-1",
-      rootTaskId: "root-1",
-    }), request.input)
-  })
-
   it("rejects unknown/version/schema and model-supplied tenant scope before execution", async () => {
     const execute = vi.fn(async () => ({ result: "ok" }))
     const { router } = makeRouter(execute)

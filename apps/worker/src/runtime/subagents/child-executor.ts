@@ -11,7 +11,7 @@ import { childContextSnapshot, createChildContextBuilder, type ChildMailboxReade
 import { ROLE_RESULT_SCHEMA, roleResultOutputSchema, type ArtifactVersionReference, type StructuredRole } from "./role-results.js"
 import { writerArtifactReferenceFromTaskContext } from "./task-graph-dependency-context.js"
 import { createObservedEvidenceIndex, hydrateObservedEvidence, parseAndBindStructuredResult, recordReadToolOutput } from "./child-evidence.js"
-import { createChildPrivateArtifactDispatcher, createPrivateArtifactSafeStore, selectedJobId } from "./child-private-artifact.js"
+import { createChildPrivateArtifactDispatcher, createPrivateArtifactSafeStore, selectedJobId, type PrivateArtifactToolContext } from "./child-private-artifact.js"
 import { createSelectedJobReadRouter, hasSelectedJobReadContext, isSelectedJobReadTool, redactSelectedEvidenceResult, selectedJobToolAllowed, withSelectedJobInputRedaction } from "./selected-job-artifact-context.js"
 import type { AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
 import type { ChildResumeLoader } from "./child-resume.js"
@@ -33,7 +33,7 @@ export type ChildToolRuntime = {
   readonly selectedJobArtifactContext?: SelectedJobArtifactContextBundle
   readonly serverContext?: unknown
   /** Private scoped tools bypass normal lifecycle persistence; only their ref receipt is persisted. */
-  readonly executePrivateTool?: (context: ToolRouterContext, request: ToolCallRequest) => Promise<ToolExecutionResult>
+  readonly executePrivateTool?: (context: PrivateArtifactToolContext, request: ToolCallRequest) => Promise<ToolExecutionResult>
   readonly validateArguments?: (name: string, input: unknown, version?: string) => true | string
 }
 

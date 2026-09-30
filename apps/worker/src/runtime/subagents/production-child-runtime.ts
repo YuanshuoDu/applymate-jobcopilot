@@ -6,7 +6,7 @@ import { createWorkerUsageAuthorizer } from "../../queue/ai-usage-bridge.js"
 import type { SubagentExecutor } from "../../queue/subagent-queue.js"
 import { createWorkerToolRuntime } from "../tools/index.js"
 import { createArtifactToolStore } from "../tools/artifact-tools.js"
-import type { ToolExecutionContext } from "../tools/types.js"
+import type { ArtifactToolExecutionContext } from "../tools/artifact-tools.js"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
 import type { TurnExecutionStore } from "../turns/turn-execution-types.js"
 import type { TurnEngineStore } from "../turns/turn-engine-types.js"
@@ -155,10 +155,10 @@ async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: Subagen
         if (parentSignal?.aborted) controller.abort()
         else parentSignal?.addEventListener("abort", onAbort, { once: true })
         const timer = setTimeout(() => { timedOut = true; controller.abort() }, definition.timeoutMs)
-        const executionContext: ToolExecutionContext = {
+        const executionContext: ArtifactToolExecutionContext = {
           scope: context.scope, sessionId: context.sessionId, turnId: context.turnId, stepId: context.stepId,
           toolCallId: request.id, taskId: context.taskId, rootTaskId: context.rootTaskId, actorRole: context.actorRole,
-          remainingTurnSteps: context.remainingTurnSteps, selectedJobPreparation, taskFence: context.taskFence,
+          remainingTurnSteps: context.remainingTurnSteps, selectedJobPreparation: context.selectedJobPreparation, taskFence: context.taskFence,
           signal: controller.signal, capabilities: context.capabilities ?? [],
           reportProgress: async () => {
             if (controller.signal.aborted) throw new Error(timedOut ? "timeout" : "cancelled")

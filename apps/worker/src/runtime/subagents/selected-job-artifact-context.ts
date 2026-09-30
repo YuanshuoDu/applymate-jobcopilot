@@ -3,7 +3,7 @@ import type pg from "pg"
 import { createSelectedJobPreparation, type ArtifactSourceMaterial } from "../tools/artifact-tools.js"
 import type { ArtifactToolRecord, ArtifactToolStore } from "../tools/artifact-tools.js"
 import { createPostgresReadToolDataSource } from "../tools/read-data-source.js"
-import type { SelectedJobPreparationContext } from "../tools/types.js"
+import type { SelectedJobPreparation } from "../tools/artifact-tools.js"
 import type { ToolCallRequest, ToolExecutionResult, ToolRouterContext } from "../tools/types.js"
 import type { TurnExecutionStore } from "../turns/turn-execution-types.js"
 import { hashArtifactContent } from "./artifact-adapters.js"
@@ -11,7 +11,7 @@ import type { StructuredRoleResult } from "./role-results.js"
 
 export type CoverLetterBaseReference = Readonly<{ artifactId: string; baseHash: string }>
 export type SelectedJobArtifactContextBundle = Readonly<{
-  preparation: SelectedJobPreparationContext
+  preparation: SelectedJobPreparation
   baseResumeId: string
   transientSources: readonly ArtifactSourceMaterial[]
 }>
@@ -31,12 +31,16 @@ export function selectedJobToolAllowed(role: string, toolName: string): boolean 
 export function hasSelectedJobReadContext(context: SelectedJobArtifactContextBundle | undefined, jobId: string): boolean {
   if (!context) return false
   const preparation = context.preparation
-  return Boolean(preparation.jobId === jobId && /^sha256:[a-f0-9]{64}$/.test(preparation.sourceDigest)
-    && Array.isArray(preparation.evidenceRefs) && preparation.evidenceRefs.length > 0
-    && preparation.evidenceRefs.every(ref => typeof ref === "string" && ref.trim().length > 0 && ref.length <= 256)
-    && new Set(preparation.evidenceRefs).size === preparation.evidenceRefs.length
+  return Boolean(validSelectedJobContext(preparation, jobId)
     && typeof context.baseResumeId === "string" && context.baseResumeId.trim().length > 0
     && Array.isArray(context.transientSources) && context.transientSources.length > 0)
+}
+
+export function validSelectedJobContext(value: SelectedJobPreparation | undefined, jobId: string): value is SelectedJobPreparation {
+  return Boolean(value && value.jobId === jobId && /^sha256:[a-f0-9]{64}$/.test(value.sourceDigest)
+    && Array.isArray(value.evidenceRefs) && value.evidenceRefs.length > 0
+    && value.evidenceRefs.every(ref => typeof ref === "string" && ref.trim().length > 0 && ref.length <= 256)
+    && new Set(value.evidenceRefs).size === value.evidenceRefs.length)
 }
 
 /** Bind selected-mode read inputs to the server-loaded job, base resume, and use case. */
@@ -73,10 +77,7 @@ export function createSelectedJobReadRouter(
           ...request, status: "failed", output: { error: "selected_job_input_unavailable" }, errorCode: "selected_job_input_unavailable",
         })
       }
-      return router.execute({
-        ...context,
-        ...(selectedContext ? { selectedJobPreparation: selectedContext.preparation } : {}),
-      }, isSelectedRead ? { ...request, input } : request)
+      return router.execute({ ...context }, isSelectedRead ? { ...request, input } : request)
     },
   }
 }

@@ -9,7 +9,6 @@ import {
   type ToolCapability,
   type ToolDefinition,
 } from "@jobcopilot/agent-protocol"
-import type { AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
 
 export type ToolRisk = ProtocolToolRisk
 export type ToolDomain = PolicyDomain
@@ -19,16 +18,6 @@ export type DelegateOutputSchemaMarker = {
   readonly schemaVersion: string
   readonly role: string
 }
-
-/** Server-derived selected-job scope passed only to the cover-letter artifact tools. */
-export type SelectedJobPreparationContext = Readonly<{
-  jobId: string
-  sourceDigest: string
-  evidenceRefs: readonly string[]
-}>
-
-/** Server-owned child attempt identity used only at selected-job artifact writes. */
-export type SelectedJobArtifactTaskFence = AgentArtifactTaskFence
 
 export interface ToolExecutionContext {
   readonly scope: TenantScope
@@ -44,10 +33,6 @@ export interface ToolExecutionContext {
   readonly remainingTurnSteps?: number
   /** Runtime-owned delegate metadata; never accepted from tool input. */
   readonly delegateOutputSchemaMarker?: DelegateOutputSchemaMarker
-  /** Server-owned selected-job evidence scope; never sourced from tool arguments. */
-  readonly selectedJobPreparation?: SelectedJobPreparationContext
-  /** Never supplied through tool arguments or model-visible context. */
-  readonly taskFence?: SelectedJobArtifactTaskFence
   readonly signal: AbortSignal
   readonly capabilities: readonly string[]
   reportProgress(progress: unknown): Promise<void>
@@ -105,10 +90,6 @@ export interface ToolRouterContext {
   readonly remainingTurnSteps?: number
   /** Runtime-owned delegate metadata; never accepted from tool input. */
   readonly delegateOutputSchemaMarker?: DelegateOutputSchemaMarker
-  /** Server-owned selected-job evidence scope; never sourced from tool arguments. */
-  readonly selectedJobPreparation?: SelectedJobPreparationContext
-  /** Server-owned live child lease identity for private artifact persistence. */
-  readonly taskFence?: SelectedJobArtifactTaskFence
 }
 
 export class ToolExecutionError extends Error {
