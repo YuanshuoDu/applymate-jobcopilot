@@ -1,6 +1,5 @@
 import { Worker } from "bullmq"
 import { Pool } from "pg"
-import { redisConnection } from "../../redis.ts"
 import { createCanonicalTurnRuntime } from "../canonical-turn-runtime.ts"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.ts"
 import { ROLE_RESULT_SCHEMA } from "./role-results.ts"
@@ -9,8 +8,6 @@ import { hashArtifactContent } from "./artifact-adapters.ts"
 import { writerArtifactReferenceFromTaskContext } from "./task-graph-dependency-context.ts"
 import { parseSubagentJobPayload } from "./types.ts"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.ts"
-import { createProductionWorkerBootstrap } from "../../queue/production-bootstrap.ts"
-import { enqueueTurn } from "../turns/turn-queue.ts"
 import { parsePlanLedger, projectPlanLedger } from "@jobcopilot/agent-protocol"
 
 const [, , mode, rawIds] = process.argv, ids = JSON.parse(rawIds)
@@ -36,6 +33,7 @@ const followUpPlanCallId = "p3-process-restart-follow-up-plan", followUpWaitCall
 const pool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 5 })
 let bootstrap
 let selectedJobWorker
+let sharedRedisModule
 let stdinBuffer = ""
 let initialWaitLineage = null
 const queuedCommands = []
@@ -98,6 +96,34 @@ function assertPrivateArtifactFixtureGuardSelfTest() {
     catch (error) { rejected = error instanceof Error && error.message === "p3_second_worker_fixture_input_contains_private_artifact_data" }
     if (!rejected) throw new Error("p3_private_artifact_fixture_guard_self_test_failed")
   }
+}
+function assertDisposableServiceUrls() {
+  const databaseValue = process.env.AGENT_RUNTIME_PG_TEST_URL
+  const redisTestValue = process.env.AGENT_TURN_REDIS_TEST_URL
+  const redisConfiguredValue = process.env.REDIS_URL
+  if (process.env.CI !== "true" || process.env.AGENT_RUNTIME_PG_TEST_DISPOSABLE !== "true"
+    || process.env.AGENT_TURN_REDIS_TEST_DISPOSABLE !== "true" || !databaseValue || !redisTestValue || !redisConfiguredValue) {
+    throw new Error("p3_restart_fixture_requires_dedicated_disposable_ci_services")
+  }
+  try {
+    const database = new URL(databaseValue)
+    const redisTest = new URL(redisTestValue)
+    const redisConfigured = new URL(redisConfiguredValue)
+    if (database.protocol !== "postgresql:" || database.hostname !== "127.0.0.1" || database.port !== "5432"
+      || database.username !== "postgres" || database.password !== "postgres"
+      || database.pathname !== "/applymate_agent_brain_ci" || database.search || database.hash
+      || redisTest.protocol !== "redis:" || !["127.0.0.1", "localhost", "::1", "[::1]"].includes(redisTest.hostname)
+      || redisTest.port !== "6379" || redisTest.pathname !== "/15" || redisTest.username || redisTest.password
+      || redisTest.search || redisTest.hash || redisConfigured.href !== redisTest.href) {
+      throw new Error("invalid")
+    }
+  } catch {
+    throw new Error("p3_restart_fixture_rejects_non_disposable_service_urls")
+  }
+}
+async function loadSharedRedisModule() {
+  sharedRedisModule ??= await import("../../redis.ts")
+  return sharedRedisModule
 }
 function turnErrorCategory(value) {
   if (typeof value !== "string") return "none"
@@ -702,6 +728,7 @@ function selectedJobReviewerModel(selected, task, observations) {
   }
 }
 async function startSelectedJobQueueWorker(runtime) {
+  const { redisConnection } = await loadSharedRedisModule()
   const selected = record(ids.selectedJob)
   if (!selected || typeof selected.queueName !== "string" || selected.queueName.length === 0) return null
   const worker = new Worker(selected.queueName, async job => {
@@ -1068,6 +1095,7 @@ async function runFirstWorker() {
   say("P3_FIRST_WORKER_START_RUNTIME_BEGIN")
   const ownerId = "p3-process-restart-worker-" + process.pid, runtime = await startRuntime(ownerId, false)
   say("P3_FIRST_WORKER_START_RUNTIME_DONE")
+  const { createProductionWorkerBootstrap } = await import("../../queue/production-bootstrap.ts")
   bootstrap = await createProductionWorkerBootstrap({ pool, runtime, ownerId, turnRecoveryIntervalMs: 10,
     waitResolver: { intervalMs: 10, ownerId: "p3-process-restart-wait-resolver-" + process.pid },
     subagents: { intervalMs: 10, async execute() { throw new Error("p3_first_worker_must_not_execute_children") } } })
@@ -1082,6 +1110,7 @@ async function runFirstWorker() {
     WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "status" = 'waiting_for_user'`, [ids.turnId, ids.sessionId, ids.userId])
   if (activated.rowCount !== 1) throw new Error("p3_first_worker_fixture_turn_not_parked")
   say("P3_FIRST_WORKER_TURN_ACTIVATED")
+  const { enqueueTurn } = await import("../turns/turn-queue.ts")
   await enqueueTurn(pool, bootstrap.turns.queue, { turnId: ids.turnId, sessionId: ids.sessionId, ownerId })
   say("P3_FIRST_WORKER_ENQUEUE_DONE")
   await waitForParentSuspended(ownerId); await waitForStop()
@@ -1089,6 +1118,7 @@ async function runFirstWorker() {
 async function runSecondWorker() {
   assertNoPrivateArtifactFixtureData(ids)
   const ownerId = "p3-process-restart-worker-" + process.pid, runtime = await startRuntime(ownerId, true)
+  const { createProductionWorkerBootstrap } = await import("../../queue/production-bootstrap.ts")
   bootstrap = await createProductionWorkerBootstrap({ pool, runtime, ownerId, turnRecoveryIntervalMs: 10,
     waitResolver: { intervalMs: 10, ownerId: "p3-process-restart-wait-resolver-" + process.pid },
     subagents: { intervalMs: 10, async execute({ lease }) {
@@ -1142,15 +1172,20 @@ try {
     say("P3_PRIVATE_FIXTURE_GUARD_OK")
     process.stdin.off("data", onStdinData); process.stdin.pause(); process.stdin.destroy()
   }
-  else if (mode === "park-parent") await runFirstWorker()
-  else if (mode === "resume-parent") await runSecondWorker()
+  else if (mode === "park-parent" || mode === "resume-parent") {
+    assertDisposableServiceUrls()
+    await loadSharedRedisModule()
+    if (mode === "park-parent") await runFirstWorker()
+    else await runSecondWorker()
+  }
   else throw new Error("p3_unknown_process_restart_mode")
 } catch (error) {
   process.stderr.write((error instanceof Error ? error.stack ?? error.message : String(error)) + "\n"); process.exitCode = 1
+  process.stdin.off("data", onStdinData); process.stdin.pause(); process.stdin.destroy()
 } finally {
   try { if (selectedJobWorker) await selectedJobWorker.close() } catch (error) { process.stderr.write("p3_selected_job_worker_close_failed:" + String(error) + "\n"); process.exitCode = 1 }
   try { if (bootstrap) await bootstrap.close() } catch (error) { process.stderr.write("p3_bootstrap_close_failed:" + String(error) + "\n"); process.exitCode = 1 }
   try { await pool.end() } catch (error) { process.stderr.write("p3_pool_end_failed:" + String(error) + "\n"); process.exitCode = 1 }
-  try { const { closeSharedRedisConnections } = await import("../../redis.ts"); await closeSharedRedisConnections() }
+  try { if (sharedRedisModule) await sharedRedisModule.closeSharedRedisConnections() }
   catch (error) { process.stderr.write("p3_redis_close_failed:" + String(error) + "\n"); process.exitCode = 1 }
 }

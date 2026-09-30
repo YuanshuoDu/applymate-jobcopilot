@@ -549,6 +549,26 @@ test('selected-job preparation sends typed scope and restores the persisted draf
     text: element.textContent?.replace(/\s+/g, ' ').trim() ?? '',
   }))).toEqual(planBeforeReconnect)
 
+  // A full page refresh must rebuild the same Workbench view from persisted
+  // session/task/artifact reads, rather than relying on the pre-disconnect UI.
+  await page.reload()
+  await expect(page.locator('[data-selected-job-draft="true"]')).toBeVisible({ timeout: 20_000 })
+  const restoredDraft = page.locator('[data-selected-job-draft="true"]')
+  await expect(restoredDraft).toHaveAttribute('aria-label', 'Systems Engineer · Fixture Systems v1')
+  await expect(restoredDraft).toContainText('Persisted cover-letter fixture body.')
+  await expect(restoredDraft).toContainText('persona:fixture-fact')
+  await expect(restoredDraft).toContainText('job:fixture-selected-job')
+  await expect(restoredDraft).toContainText('resume:fixture-fact')
+  await expect(restoredDraft).toContainText(isZh ? '通过' : 'passed')
+  await expect(restoredDraft).toContainText('unsupported_claim')
+  const restoredPlan = page.locator('[data-agent-task-graph-plan="true"]')
+  await expect(restoredPlan).toBeVisible({ timeout: 10_000 })
+  expect(await restoredPlan.evaluate(element => ({
+    session: element.getAttribute('data-agent-task-graph-session'),
+    revision: element.getAttribute('data-agent-task-graph-revision'),
+    text: element.textContent?.replace(/\s+/g, ' ').trim() ?? '',
+  }))).toEqual(planBeforeReconnect)
+
   if ((await page.evaluate(() => window.innerWidth)) <= 900) await page.getByRole('button', { name: isZh ? '对话' : 'Conversations', exact: true }).click()
   await page.getByText('B session evidence', { exact: true }).click()
   await expect(page.locator('[data-selected-job-draft="true"]')).toHaveCount(0, { timeout: 10_000 })

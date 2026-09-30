@@ -1733,13 +1733,18 @@ type ProcessFixtureChild = ChildProcess & { output: string[]; errors: string[] }
 const processRestartFixturePath = fileURLToPath(new URL("./task-graph-resume-process-restart.fixture.mjs", import.meta.url))
 const processRestartWorkerCwd = fileURLToPath(new URL("../../../", import.meta.url))
 
-function startTaskGraphRestartWorker(mode: "park-parent" | "resume-parent" | "worker2-input-guard-self-test", value: Record<string, unknown>): ProcessFixtureChild {
+function startTaskGraphRestartWorker(
+  mode: "park-parent" | "resume-parent" | "worker2-input-guard-self-test",
+  value: Record<string, unknown>,
+  envOverrides: Record<string, string> = {},
+): ProcessFixtureChild {
   const child = spawn(process.execPath, ["--import", "tsx", processRestartFixturePath, mode, JSON.stringify(value)], {
     cwd: processRestartWorkerCwd,
     env: {
       ...process.env,
       ...(redisUrl ? { REDIS_URL: redisUrl } : {}),
       ...(databaseUrl ? { AGENT_RUNTIME_PG_TEST_URL: databaseUrl } : {}),
+      ...envOverrides,
     },
     stdio: ["pipe", "pipe", "pipe"],
   }) as ProcessFixtureChild
@@ -3424,6 +3429,35 @@ describe("Worker 2 private artifact fixture boundary", () => {
     expect(worker.exitCode).toBe(0)
     expect(worker.output).toContain("P3_PRIVATE_FIXTURE_GUARD_OK")
     expect(worker.errors).toEqual([])
+  }, 15_000)
+})
+
+describe("TaskGraph restart fixture service boundary", () => {
+  it("rejects unsafe PostgreSQL or Redis endpoints before production startup", async () => {
+    const unsafeEnvironmentCases = [
+      {
+        AGENT_RUNTIME_PG_TEST_URL: "not-a-postgres-url",
+        AGENT_TURN_REDIS_TEST_URL: "http://127.0.0.1:6379/14",
+        REDIS_URL: "http://127.0.0.1:6379/14",
+      },
+      {
+        AGENT_RUNTIME_PG_TEST_URL: "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci",
+        AGENT_TURN_REDIS_TEST_URL: "http://127.0.0.1:6379/14",
+        REDIS_URL: "http://127.0.0.1:6379/14",
+      },
+    ]
+    for (const envOverrides of unsafeEnvironmentCases) {
+      const worker = startTaskGraphRestartWorker("park-parent", {}, {
+        CI: "true",
+        AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true",
+        AGENT_TURN_REDIS_TEST_DISPOSABLE: "true",
+        ...envOverrides,
+      })
+      await waitForProcessExit(worker)
+      expect(worker.exitCode).toBe(1)
+      expect(worker.errors.join("\n")).toContain("p3_restart_fixture_rejects_non_disposable_service_urls")
+      expect(worker.output).not.toContain("P3_FIRST_WORKER_START_RUNTIME_BEGIN")
+    }
   }, 15_000)
 })
 
