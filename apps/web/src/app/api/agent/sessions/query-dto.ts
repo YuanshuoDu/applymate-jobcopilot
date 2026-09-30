@@ -2,6 +2,7 @@ import { schemaVersion } from "@jobcopilot/agent-protocol"
 import { projectLegacySubAgentTask } from "@/lib/agent/session/subagent-task-compat"
 
 import { toIso, type CursorRow } from "./query-helpers"
+import { projectTaskEvidencePreview } from "./task-evidence-preview"
 
 const SENSITIVE_KEY = /(api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|password|secret|private[_-]?key|credential|token|answer|(?:full[_-]?)?resume(?:[_-]?(text|content|data))?|cv(?:[_-]?(text|content|data))?|raw[_-]?(content|text))/i
 const SENSITIVE_TOKEN = /\bBearer\s+[a-z0-9._~+/=-]{8,}/gi
@@ -176,6 +177,7 @@ export interface TaskQueryRow extends CursorRow {
 
 export function taskDto(row: TaskQueryRow) {
   const legacy = projectLegacySubAgentTask(row)
+  const evidencePreview = projectTaskEvidencePreview(row)
   return {
     schemaVersion,
     id: row.id,
@@ -191,6 +193,7 @@ export function taskDto(row: TaskQueryRow) {
     confidence: row.confidence,
     failureReason: row.failureReason ? redactString(row.failureReason) : null,
     hasResult: row.result !== null,
+    ...(evidencePreview ? { structuredEvidencePreview: evidencePreview } : {}),
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   }

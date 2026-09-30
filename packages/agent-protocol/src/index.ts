@@ -92,6 +92,16 @@ export {
   ModelToolCallSchema,
   ModelUsageSchema,
 } from './model.js'
+export {
+  PLAN_LEDGER_SCHEMA_VERSION,
+  TASK_GRAPH_SCHEMA_VERSION,
+  TASK_GRAPH_MAX_IDENTIFIER_LENGTH,
+  parsePlanLedger,
+  parseTaskGraphSnapshot,
+  projectPlanLedger,
+  projectTaskEvidencePreview,
+} from './plan-ledger.js'
+export type { PlanLedger, PlanLedgerEvidencePreview, PlanLedgerReadiness, PlanLedgerStatus, TaskGraphSnapshot, TaskGraphSnapshotNode } from './plan-ledger.js'
 export type {
   ModelCapabilities,
   ModelContentPart,

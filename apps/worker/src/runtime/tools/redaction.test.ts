@@ -1,8 +1,95 @@
 import { describe, expect, it } from "vitest"
 
-import { InMemoryToolResultReferenceStore, sanitizeForLifecycle } from "./redaction.js"
+import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
+import { InMemoryToolResultReferenceStore, prepareDurableWaitOutput, prepareLifecycleValue, prepareSubagentSpawnReceipt, prepareTaskGraphPlanReceipt, sanitizeForLifecycle } from "./redaction.js"
+
+const turnId = "c123456789012345678901234"
+const rootTaskId = `root-${turnId}`
+const taskId = "subagent-0e34de21-c5e7-4db7-8e75-904732813337"
+const spawnReceipt = {
+  taskId,
+  rootTaskId,
+  parentTaskId: rootTaskId,
+  path: `/${rootTaskId}/${taskId}`,
+  depth: 1,
+  status: "queued",
+  replay: false,
+} as const
 
 describe("tool lifecycle redaction", () => {
+  it("uses the shared TaskGraph limits for plan receipts", () => {
+    const node = (index: number, key: string) => ({
+      key,
+      taskId: `subagent-00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+      status: "queued" as const,
+    })
+    const receipt = (nodes: ReturnType<typeof node>[]) => ({
+      status: "accepted" as const,
+      revision: 1,
+      nodes,
+      readyTaskIds: nodes.map(item => item.taskId),
+    })
+    const atNodeLimit = Array.from({ length: TASK_GRAPH_LIMITS.maxNodes }, (_, index) => node(index, `task-${index}`))
+    expect(() => prepareTaskGraphPlanReceipt(receipt(atNodeLimit))).not.toThrow()
+    expect(() => prepareTaskGraphPlanReceipt(receipt([...atNodeLimit, node(atNodeLimit.length, "overflow")]))).toThrow("task_graph_receipt_invalid")
+
+    const atKeyLimit = receipt([node(0, "k".repeat(TASK_GRAPH_LIMITS.maxKeyLength))])
+    expect(() => prepareTaskGraphPlanReceipt(atKeyLimit)).not.toThrow()
+    expect(() => prepareTaskGraphPlanReceipt({
+      ...atKeyLimit,
+      nodes: [node(0, `${"k".repeat(TASK_GRAPH_LIMITS.maxKeyLength)}k`)],
+    })).toThrow("task_graph_receipt_invalid")
+  })
+
+  it("preserves only a canonical generated durable wait ID", () => {
+    const waitId = "wait-12345678-1234-4234-9234-123456789012"
+    const output = { waitId, status: "ready", detail: "Contact candidate@example.com at 202-555-0199" }
+
+    expect(prepareLifecycleValue(output).safe).not.toEqual(output)
+    expect(prepareDurableWaitOutput(output).safe).toEqual({
+      waitId,
+      status: "ready",
+      detail: "Contact [REDACTED_EMAIL] at [REDACTED_PHONE]",
+    })
+  })
+
+  it("redacts malformed wait IDs and rejects accessor-shaped wait receipts", () => {
+    expect(prepareDurableWaitOutput({ waitId: "wait-123", status: "ready" }).safe).toEqual({
+      waitId: "[REDACTED]",
+      status: "ready",
+    })
+
+    const accessorReceipt = Object.defineProperty({ status: "ready" }, "waitId", {
+      enumerable: true,
+      get: () => "wait-12345678-1234-4234-9234-123456789012",
+    })
+    expect(() => prepareDurableWaitOutput(accessorReceipt)).toThrow("durable_wait_receipt_invalid")
+  })
+
+  it("preserves generated spawn lineage after generic redaction would alter a phone-like UUID", () => {
+    expect(prepareLifecycleValue(spawnReceipt).safe).not.toEqual(spawnReceipt)
+    expect(prepareSubagentSpawnReceipt(spawnReceipt, { turnId, taskId: rootTaskId, rootTaskId }).safe).toEqual(spawnReceipt)
+  })
+
+  it("accepts a depth-zero self-root spawn and rejects malformed lineage or extra fields", () => {
+    const ownRoot = { ...spawnReceipt, rootTaskId: taskId, parentTaskId: null, path: `/${taskId}`, depth: 0 }
+    expect(prepareSubagentSpawnReceipt(ownRoot, { turnId }).safe).toEqual(ownRoot)
+
+    const rootAsNewTask = { ...ownRoot, taskId: rootTaskId, rootTaskId, path: `/${rootTaskId}` }
+    expect(() => prepareSubagentSpawnReceipt(rootAsNewTask, { turnId })).toThrow("subagent_spawn_receipt_invalid")
+
+    const malformed = [
+      { ...spawnReceipt, extra: "candidate@example.com" },
+      { ...spawnReceipt, parentTaskId: "root-other" },
+      { ...spawnReceipt, rootTaskId: "root-other" },
+      { ...spawnReceipt, path: `/${rootTaskId}/${taskId}/extra` },
+      { ...spawnReceipt, depth: 2 },
+      { ...spawnReceipt, taskId: "subagent-12345678-1234-3123-8def-123456789012", path: `/${rootTaskId}/subagent-12345678-1234-3123-8def-123456789012` },
+    ]
+    for (const receipt of malformed) {
+      expect(() => prepareSubagentSpawnReceipt(receipt, { turnId, taskId: rootTaskId, rootTaskId })).toThrow("subagent_spawn_receipt_invalid")
+    }
+  })
   it("redacts secrets and personal contact keys", async () => {
     const references = new InMemoryToolResultReferenceStore()
     const safe = await sanitizeForLifecycle({ email: "candidate@example.com", password: "secret", bearer: "Bearer abcdefghijk", value: "private fact", content: "resume body", role: "Engineer", message: "token=should-not-leak" }, references)

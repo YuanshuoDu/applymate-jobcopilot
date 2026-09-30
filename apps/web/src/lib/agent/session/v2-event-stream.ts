@@ -8,7 +8,7 @@ import {
 } from "@jobcopilot/agent-protocol"
 
 import { BoundedStreamBuffer, type StreamFrame } from "./stream-buffer"
-import { redactStreamValue } from "./stream-redaction"
+import { redactStreamEventPayload } from "./stream-redaction"
 import { createDurablePollWakeup, startAgentEventWakeup, waitForDuration, type AgentEventPubSubFactory } from "./event-wakeup"
 const DEFAULT_DB_POLL_MS = 750
 const DEFAULT_HEARTBEAT_MS = 15_000
@@ -192,12 +192,20 @@ function durableFrame(row: DurableEventRow): string {
     schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: row.id, sessionId: row.sessionId, turnId: row.turnId,
     itemId: row.itemId, taskId: row.taskId, type: row.type, actor: row.actor,
     correlationId: row.correlationId, causationId: row.causationId, idempotencyKey: row.idempotencyKey,
-    sequence: row.sequence.toString(), payload: redactStreamValue(row.payload),
+    sequence: row.sequence.toString(), payload: redactStreamEventPayload(row.type, row.payload, {
+      sessionId: row.sessionId, turnId: row.turnId, itemId: row.itemId, taskId: row.taskId,
+    }),
   }
   return sseFrame(row.type, row.sequence.toString(), payload)
 }
 function deltaFrame(streamId: string, envelope: AgentDeltaEnvelope): string {
-  return sseFrame(envelope.type, null, { ...envelope, payload: redactStreamValue(envelope.payload), streamId })
+  return sseFrame(envelope.type, null, {
+    ...envelope,
+    payload: redactStreamEventPayload(envelope.type, envelope.payload, {
+      sessionId: envelope.sessionId, turnId: envelope.turnId, itemId: envelope.itemId, taskId: envelope.taskId,
+    }),
+    streamId,
+  })
 }
 function sseFrame(event: string, id: string | null, data: unknown): string {
   return `${event ? `event: ${event}\n` : ""}${id ? `id: ${id}\n` : ""}data: ${JSON.stringify(data)}\n\n`

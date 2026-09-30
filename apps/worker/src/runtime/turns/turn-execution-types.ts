@@ -34,6 +34,8 @@ export type TurnEngineCompletionGate = (input: {
   readonly now: Date
 }) => Promise<TurnEngineCompletionGateResult> | TurnEngineCompletionGateResult
 
+export type TurnExecutionStepBudget = { readonly remainingTurnSteps?: number }
+
 /** Identity is owner normalized; the loop never receives a raw lease. */
 export type TurnExecutionIdentity = ExecutionOwnerFence
 
@@ -104,6 +106,10 @@ export type TurnExecutionOptions = {
   readonly completionGate?: TurnEngineCompletionGate
   /** Canonical replay state used only for server-side marker hydration. */
   readonly steeringMarkerState?: { readonly active: readonly SteeringMarkerPayload[] }
+  /** Re-read durable TaskGraph state before continuing after an inline-ready agent.wait. */
+  readonly refreshTaskGraphAfterReadyWait?: (snapshot: StepContextSnapshot) => Promise<StepContextSnapshot>
+  /** Re-read durable TaskGraph state after an accepted agent.plan receipt. */
+  readonly refreshTaskGraphAfterPlan?: (snapshot: StepContextSnapshot) => Promise<StepContextSnapshot>
 }
 
 export type TurnExecutionOutcome = TurnEngineResult

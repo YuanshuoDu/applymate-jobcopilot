@@ -29,6 +29,8 @@ export interface ToolExecutionContext {
   readonly taskId?: string
   readonly rootTaskId?: string
   readonly actorRole?: PolicyRole
+  /** Runtime-owned remaining root evaluations after the current step; never model supplied. */
+  readonly remainingTurnSteps?: number
   /** Runtime-owned delegate metadata; never accepted from tool input. */
   readonly delegateOutputSchemaMarker?: DelegateOutputSchemaMarker
   readonly signal: AbortSignal
@@ -84,6 +86,8 @@ export interface ToolRouterContext {
   readonly capabilities?: readonly string[]
   /** Runtime-owned actor role; the model cannot supply or override this value. */
   readonly actorRole?: PolicyRole
+  /** Runtime-owned remaining root evaluations after the current step; never model supplied. */
+  readonly remainingTurnSteps?: number
   /** Runtime-owned delegate metadata; never accepted from tool input. */
   readonly delegateOutputSchemaMarker?: DelegateOutputSchemaMarker
 }

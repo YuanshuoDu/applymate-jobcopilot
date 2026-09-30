@@ -37,7 +37,8 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 20, cache: pnpm }
       - run: pnpm install --frozen-lockfile
-      - run: pnpm test:all
+      - name: Run all tests
+        run: pnpm test:all
   agent-runtime-postgres:
     name: Agent runtime PostgreSQL integration
     runs-on: ubuntu-latest
@@ -69,6 +70,7 @@ jobs:
     env:
       AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
       AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+      AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -91,6 +93,25 @@ jobs:
         run: pnpm --filter @jobcopilot/worker exec vitest run src/runtime/subagents/subagent-store-pg.integration.test.ts
       - name: Verify mailbox task reads under tenant RLS on disposable PostgreSQL
         run: pnpm --filter @jobcopilot/worker exec vitest run src/runtime/coordination.integration.test.ts
+      - name: Verify TaskGraph command writes, replay, and tenant lease fencing on disposable PostgreSQL
+        run: |
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          test -n "$AGENT_RUNTIME_PG_TEST_URL"
+          pnpm --filter @jobcopilot/worker exec vitest run src/runtime/subagents/pg-task-graph-command-port.integration.test.ts
+      - name: Verify TaskGraph proposal, dependency promotion, and parent resume on disposable PostgreSQL/Redis
+        env:
+          AGENT_TURN_REDIS_TEST_URL: redis://127.0.0.1:6379/15
+          AGENT_TURN_REDIS_TEST_DISPOSABLE: "true"
+          REDIS_URL: redis://127.0.0.1:6379/15
+          AGENT_PLAN_LEDGER_TRACE_ARTIFACT_PATH: ${{ runner.temp }}/task-graph-plan-ledger.json
+        run: pnpm --filter @jobcopilot/worker exec vitest run src/runtime/subagents/task-graph-resume-pg.integration.test.ts
+      - name: Install Chromium for the persisted Plan Ledger browser fixture
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Verify the Workbench consumes the persisted Worker Plan Ledger trace
+        env:
+          AGENT_PLAN_LEDGER_TRACE_ARTIFACT_PATH: ${{ runner.temp }}/task-graph-plan-ledger.json
+        run: pnpm exec playwright test e2e/agent-task-graph-plan.spec.ts
       - name: Verify production Turn dispatch on disposable Redis/BullMQ
         env:
           RUN_AGENT_TURN_REDIS_INTEGRATION: "1"

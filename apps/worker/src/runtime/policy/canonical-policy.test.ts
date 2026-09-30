@@ -9,6 +9,10 @@ const coordinationWriteToolNames = [
   "interrupt_subagent", "agent.interrupt", "close_subagent", "agent.close",
 ] as const
 const coordinationReadToolNames = ["list_subagents", "agent.list"] as const
+const planningTool: PolicyToolDescriptor = {
+  name: "agent.plan", version: "1", risk: "internal_write", domain: "coordination",
+  capabilities: ["coordination"], requiredCapabilities: ["coordination", "canManageChildren"],
+}
 
 function coordinationTool(name: string, risk: "read" | "internal_write"): PolicyToolDescriptor {
   return {
@@ -42,11 +46,25 @@ describe("canonical root policy", () => {
     expect(createCanonicalPolicy({}, true).evaluate(context(writeTool))).toMatchObject({ outcome: "deny" })
   })
 
+  it("allows planning only when both server gates are enabled", () => {
+    const policy = createCanonicalPolicy({}, true, true)
+    expect(policy.evaluate(context(planningTool, ["coordination", "canManageChildren"]))).toMatchObject({ outcome: "allow", reasonCode: "server_task_graph_planning_gate" })
+    for (const policyWithoutBothGates of [createCanonicalPolicy({}, false, true), createCanonicalPolicy({}, true, false)]) {
+      expect(policyWithoutBothGates.evaluate(context(planningTool, ["coordination", "canManageChildren"]))).toMatchObject({ outcome: "deny" })
+    }
+  })
+
   it("preserves an explicit policy denial and does not fallback over it", () => {
     const explicit: PolicySnapshot = { version: "policy.v1", rules: [{ id: "deny-coordination", roles: ["orchestrator"], domains: ["coordination"], outcome: "deny", reasonCode: "explicit_deny", reason: "Coordination is disabled by policy" }] }
     const policy = createCanonicalPolicy(explicit, true)
     expect(policy.evaluate(context(coordinationTool("agent.spawn", "internal_write")))).toMatchObject({ outcome: "deny", reasonCode: "explicit_deny" })
     expect(policy.evaluate(context(coordinationTool("agent.list", "read")))).toMatchObject({ outcome: "deny", reasonCode: "explicit_deny" })
+  })
+
+  it("preserves an explicit agent.plan denial when both server gates are enabled", () => {
+    const explicit: PolicySnapshot = { version: "policy.v1", rules: [{ id: "deny-plan", roles: ["orchestrator"], tools: ["agent.plan"], outcome: "deny", reasonCode: "explicit_deny", reason: "Planning is disabled by policy" }] }
+    const policy = createCanonicalPolicy(explicit, true, true)
+    expect(policy.evaluate(context(planningTool, ["coordination", "canManageChildren"]))).toMatchObject({ outcome: "deny", reasonCode: "explicit_deny" })
   })
 
   it("keeps coordination writes denied when the server gate is off", () => {

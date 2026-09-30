@@ -2,6 +2,7 @@ import { Prisma } from "@prisma/client"
 
 import { cancelPendingWaitsInTransaction } from "../../broker/interrupt"
 import { activeTurnChanged, executionChanged, sessionNotFound } from "./errors"
+import { enqueueTaskGraphStopIntent } from "./task-graph-stop-intent"
 import {
   acceptInputFacts,
   findActiveTurn,
@@ -164,6 +165,7 @@ export async function interruptActiveTurn(tx: CommandTransaction, command: Inter
     turnId: active.id,
     requestedAt,
   })
+  await enqueueTaskGraphStopIntent(tx, { sessionId: command.sessionId, turnId: active.id })
 
   await cancelPendingWaitsInTransaction(tx, {
     sessionId: command.sessionId,

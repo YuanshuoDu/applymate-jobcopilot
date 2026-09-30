@@ -51,6 +51,7 @@ function dependencies() {
 describe("production Worker runtime composition", () => {
   it("passes canonical runtime inputs and registers enabled child and wait consumers before the run router", async () => {
     const flags: ProductionAgentFlags = {
+      taskGraphPlanningEnabled: true,
       childExecutionEnabled: true,
       coordinationEnabled: true,
       consumeWaitOutcomes: true,
@@ -96,6 +97,7 @@ describe("production Worker runtime composition", () => {
 
   it("omits disabled child and wait consumers while preserving the resolved flags", async () => {
     const flags: ProductionAgentFlags = {
+      taskGraphPlanningEnabled: false,
       childExecutionEnabled: false,
       coordinationEnabled: false,
       consumeWaitOutcomes: false,

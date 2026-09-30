@@ -5,6 +5,96 @@ import { itemDto, taskDto, turnDto } from "./query-dto"
 const date = new Date("2026-08-31T00:00:00Z")
 
 describe("agent query DTO redaction", () => {
+  it("projects only referenced, redacted Scout evidence from an exact completed result envelope", () => {
+    const result = {
+      status: "completed", stepCount: 2, toolCallCount: 1, finalItemId: "final-item",
+      finalText: "RAW_FINAL_TEXT https://private.example/apply?email=a@example.test",
+      structuredResult: {
+        schemaVersion: "agent-harness.v2.subagent.result", role: "scout", status: "completed",
+        summary: "Found 1 role for Steven Du. Contact: alex@example.test, +1 (415) 555-0133.",
+        candidates: Array.from({ length: 6 }, (_, index) => {
+          const jobId = `job-${index + 1}`
+          return { jobId, source: "greenhouse", url: "https://private.example/apply?token=raw", evidenceIds: [`job-evidence-${index + 1}`, ...(index === 0 ? ["source-evidence"] : [])] }
+        }),
+        evidence: [
+          { id: "job-evidence-1", kind: "job", ref: "job-1", source: "greenhouse" },
+          { id: "source-evidence", kind: "source", ref: "jobs.search:run-1", source: "jobs.search" },
+          ...Array.from({ length: 5 }, (_, index) => ({ id: `job-evidence-${index + 2}`, kind: "job", ref: `job-${index + 2}`, source: "greenhouse" })),
+          { id: "unreferenced", kind: "source", ref: "unreferenced-secret", source: "private-source" },
+        ],
+      },
+    }
+    const dto = taskDto({
+      id: "task-scout", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: null, path: "/root/scout",
+      role: "scout", taskType: "scout", status: "completed", goal: "Find roles", confidence: null, failureReason: null,
+      result, createdAt: date, updatedAt: date,
+    })
+
+    expect(dto.structuredEvidencePreview).toEqual({
+      role: "scout", summary: "Scout completed: 6 candidates; 7 linked evidence items.", itemCount: 6,
+      evidence: [
+        { kind: "job", source: "greenhouse", reference: null },
+        { kind: "source", source: "jobs.search", reference: null },
+        { kind: "job", source: "greenhouse", reference: null },
+        { kind: "job", source: "greenhouse", reference: null },
+        { kind: "job", source: "greenhouse", reference: null },
+      ],
+    })
+    expect(JSON.stringify(dto)).not.toContain("RAW_FINAL_TEXT")
+    expect(JSON.stringify(dto)).not.toContain("private.example")
+    expect(JSON.stringify(dto)).not.toContain("unreferenced-secret")
+    expect(JSON.stringify(dto)).not.toContain("job-5")
+    expect(JSON.stringify(dto)).not.toContain("job-6")
+    expect(JSON.stringify(dto)).not.toContain("jobs.search:run-1")
+    expect(JSON.stringify(dto)).not.toContain("alex@example.test")
+    expect(JSON.stringify(dto)).not.toContain("415")
+    expect(JSON.stringify(dto)).not.toContain("Steven Du")
+  })
+
+  it("validates the Analyst schema against the task role before projecting its finding evidence", () => {
+    const dto = taskDto({
+      id: "task-analyst", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: null, path: "/root/analyst",
+      role: "analyst", taskType: "analyst", status: "completed", goal: "Score roles", confidence: null, failureReason: null,
+      result: {
+        status: "completed", stepCount: 2, toolCallCount: 1, finalItemId: "final-item", finalText: "PRIVATE_ANALYST_TEXT",
+        structuredResult: {
+          schemaVersion: "agent-harness.v2.subagent.result", role: "analyst", status: "partial", summary: "Scored one public job.",
+          findings: [{ jobId: "job-42", score: 8, evidenceIds: ["job-evidence"] }],
+          evidence: [{ id: "job-evidence", kind: "job", ref: "job-42", source: "greenhouse" }],
+        },
+      },
+      createdAt: date, updatedAt: date,
+    })
+    expect(dto.structuredEvidencePreview).toEqual({
+      role: "analyst", summary: "Analyst partially completed: 1 finding; 1 linked evidence item.", itemCount: 1,
+      evidence: [{ kind: "job", source: "greenhouse", reference: null }],
+    })
+    expect(JSON.stringify(dto)).not.toContain("PRIVATE_ANALYST_TEXT")
+  })
+
+  it("fails closed for incomplete, wrong-role, malformed, and oversized structured results", () => {
+    const valid = {
+      status: "completed", stepCount: 1, toolCallCount: 0, finalItemId: null, finalText: "private",
+      structuredResult: {
+        schemaVersion: "agent-harness.v2.subagent.result", role: "scout", status: "completed", summary: "Safe summary",
+        candidates: [{ jobId: "job-42", source: "greenhouse", url: null, evidenceIds: ["job-evidence"] }],
+        evidence: [{ id: "job-evidence", kind: "job", ref: "job-42", source: "greenhouse" }],
+      },
+    }
+    const row = (result: unknown, role = "scout", status = "completed") => taskDto({
+      id: "task-scout", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: null, path: "/root/scout",
+      role, taskType: "scout", status, goal: "Find roles", confidence: null, failureReason: null, result,
+      createdAt: date, updatedAt: date,
+    })
+
+    expect(row(valid, "analyst")).not.toHaveProperty("structuredEvidencePreview")
+    expect(row({ ...valid, status: "failed" })).not.toHaveProperty("structuredEvidencePreview")
+    expect(row({ ...valid, extra: "lease metadata" })).not.toHaveProperty("structuredEvidencePreview")
+    expect(row({ ...valid, structuredResult: { ...valid.structuredResult, schemaVersion: "unknown" } })).not.toHaveProperty("structuredEvidencePreview")
+    expect(row({ ...valid, structuredResult: { ...valid.structuredResult, summary: "x".repeat(8_193) } })).not.toHaveProperty("structuredEvidencePreview")
+    expect(row(valid, "scout", "running")).not.toHaveProperty("structuredEvidencePreview")
+  })
+
   it("redacts sensitive item content while preserving display-safe milestones", () => {
     const dto = itemDto({
       id: "item_1", sessionId: "session_1", turnId: "turn_1", stepId: null, taskId: null,

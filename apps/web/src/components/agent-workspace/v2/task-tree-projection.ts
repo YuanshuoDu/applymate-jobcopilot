@@ -19,6 +19,7 @@ export interface SupervisorTaskSummary {
   readonly id: string
   readonly sessionId: string
   readonly turnId?: string | null
+  readonly rootTaskId?: string | null
   readonly parentTaskId?: string | null
   readonly role: string
   readonly taskType: string

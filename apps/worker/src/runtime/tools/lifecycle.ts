@@ -6,7 +6,7 @@ import {
 
 import type { ExecutionOwner } from "../execution-owner.js"
 import { MAX_TOOL_RESULT_BYTES, type ToolResultReferenceRepository } from "./tool-result-reference-types.js"
-import { prepareLifecycleValue, sanitizeLifecyclePreview, type ToolResultReferenceStore } from "./redaction.js"
+import { prepareDurableWaitOutput, prepareLifecycleValue, prepareSubagentSpawnReceipt, prepareTaskGraphPlanReceipt, sanitizeLifecyclePreview, type ToolResultReferenceStore } from "./redaction.js"
 import { ToolExecutionError, type ToolLifecyclePayload } from "./types.js"
 
 export type ToolLifecyclePhase = "started" | "progress" | "completed" | "failed" | "cancelled"
@@ -139,11 +139,35 @@ export class ToolLifecycle {
   }
 
   private async persistCompletedOutput(call: LifecycleCall, output: unknown): Promise<unknown> {
-    const prepared = prepareLifecycleValue(output)
+    let prepared: ReturnType<typeof prepareLifecycleValue>
+    if (call.toolName === "agent.plan") {
+      try {
+        prepared = prepareTaskGraphPlanReceipt(output)
+      } catch {
+        throw new ToolExecutionError("task_graph_receipt_invalid", "TaskGraph receipt is invalid")
+      }
+    } else if (call.toolName === "agent.spawn" || call.toolName === "spawn_subagent") {
+      try {
+        prepared = prepareSubagentSpawnReceipt(output, call)
+      } catch {
+        throw new ToolExecutionError("subagent_spawn_receipt_invalid", "Subagent spawn receipt is invalid")
+      }
+    } else if (call.toolName === "agent.wait" || call.toolName === "wait_subagents") {
+      try {
+        prepared = prepareDurableWaitOutput(output)
+      } catch {
+        throw new ToolExecutionError("durable_wait_receipt_invalid", "Durable wait receipt is invalid")
+      }
+    } else {
+      prepared = prepareLifecycleValue(output)
+    }
     if (prepared.sizeBytes > MAX_TOOL_RESULT_BYTES) {
       throw new ToolExecutionError("tool_result_too_large", "Tool result exceeds the 1 MiB limit")
     }
     if (prepared.sizeBytes <= this.maxEventBytes) return prepared.safe
+    if (call.toolName === "agent.plan" || call.toolName === "agent.spawn" || call.toolName === "spawn_subagent") {
+      throw new ToolExecutionError("tool_result_too_large", "Agent receipt exceeds the lifecycle event limit")
+    }
     if (!this.options.durableResults || !this.options.resolveOwner) {
       throw new ToolExecutionError("tool_result_storage_unavailable", "Durable tool result storage is unavailable")
     }

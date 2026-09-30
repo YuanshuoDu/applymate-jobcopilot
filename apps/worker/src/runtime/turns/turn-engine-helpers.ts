@@ -30,7 +30,26 @@ export function createToolRouterExecutor(router: {
     scope: input.scope, sessionId: input.sessionId, turnId: input.turnId, stepId: input.stepId,
     taskId: input.taskId, rootTaskId: input.rootTaskId,
     signal: input.signal, capabilities: input.capabilities, actorRole: input.actorRole ?? "orchestrator",
+    remainingTurnSteps: input.remainingTurnSteps,
   }, input.call)
+}
+
+export function withRemainingTurnStepBudget(options: TurnExecutionOptions, budget: ReturnType<typeof createTurnBudgetLedger>): TurnExecutionOptions {
+  return {
+    ...options,
+    executeTool: input => options.executeTool({
+      ...input,
+      remainingTurnSteps: options.identity.kind === "turn" ? remainingTurnSteps(budget) : undefined,
+    }),
+  }
+}
+
+function remainingTurnSteps(budget: ReturnType<typeof createTurnBudgetLedger>): number | undefined {
+  const snapshot = budget.snapshot()
+  const limit = snapshot.limits.maxSteps
+  if (limit === undefined) return undefined
+  const remaining = limit - snapshot.used.steps - snapshot.reserved.steps
+  return Number.isFinite(remaining) ? Math.max(0, Math.floor(remaining)) : 0
 }
 
 /** Keep durable usage and step ceilings in force after a lease recovery. */

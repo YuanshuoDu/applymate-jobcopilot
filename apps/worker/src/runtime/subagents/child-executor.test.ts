@@ -656,7 +656,7 @@ describe("child executor composition", () => {
       store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
       modelRuntimeFactory: () => model,
       toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")], async (_context, request) => ({
-        ...request, status: "completed", output: { status: "waiting", waitId: "wait-1", deadlineAt: "2026-09-12T12:00:00.000Z", matchedTaskIds: [] }, errorCode: null,
+        ...request, status: "completed", output: { status: "waiting", waitId: "wait-12345678-1234-4234-9234-123456789012", deadlineAt: "2026-09-12T12:00:00.000Z", matchedTaskIds: [] }, errorCode: null,
       })),
     })
 

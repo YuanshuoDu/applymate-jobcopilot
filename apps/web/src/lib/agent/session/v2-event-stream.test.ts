@@ -11,6 +11,28 @@ function event(sequence: bigint) {
   }
 }
 
+function taskGraphPayload() {
+  return {
+    kind: "lifecycle", event: { type: "task.completed", nodeKey: "research" }, revision: 1, item: {
+      schemaVersion: "agent-harness.v2", id: "graph_1", sessionId: "session_1", turnId: "turn_1",
+      stepId: null, taskId: "root_task_1", type: "task_graph", status: "streaming", phase: null, revision: 1,
+      content: { schemaVersion: "agent-harness.v2.task-graph", nodes: [{
+        key: "research", templateId: "jobs.search", goal: "Review role; Bearer very-secret-token",
+        successCriteria: ["Summarize fit"], dependsOn: [], depth: 1, taskId: "child_task_1",
+      }] },
+      startedAt: "2026-09-28T00:00:00.000Z", completedAt: null,
+      createdAt: "2026-09-28T00:00:00.000Z", updatedAt: "2026-09-28T00:00:00.000Z",
+    },
+  }
+}
+
+function goalFromFrame(text: string): unknown {
+  const data = text.split("data: ")[1]?.split("\n")[0]
+  if (!data) throw new Error("Stream frame is missing its data payload")
+  const frame = JSON.parse(data) as { payload?: { item?: { content?: { nodes?: Array<{ goal?: unknown }> } } } }
+  return frame.payload?.item?.content?.nodes?.[0]?.goal
+}
+
 function db(rows: unknown[]) {
   return { agentEvent: { findMany: vi.fn().mockResolvedValue(rows) } }
 }
@@ -73,6 +95,58 @@ describe("V2 agent event stream", () => {
     expect(database.agentEvent.findMany).toHaveBeenCalledWith(expect.objectContaining({ where: { sessionId: "session_1", sequence: { gt: BigInt(1) } } }))
     controller.abort()
     await reader.cancel()
+  })
+
+  it("preserves a valid redacted TaskGraph item in a durable item.delta", async () => {
+    const controller = new AbortController()
+    const database = db([{
+      id: "graph-event", sessionId: "session_1", turnId: "turn_1", itemId: "graph_1", taskId: "child_task_1",
+      sequence: BigInt(1), type: "item.delta", actor: "system", correlationId: "turn_1", causationId: null,
+      idempotencyKey: "graph-revision-1", payload: taskGraphPayload(),
+    }])
+    const stream = createV2EventStream(database as never, {
+      sessionId: "session_1", afterSequence: BigInt(0), signal: controller.signal,
+      redisFactory: () => null, dbPollMs: 1, heartbeatMs: 100,
+    })
+    const reader = stream.getReader()
+    try {
+      const text = new TextDecoder().decode((await reader.read()).value)
+      expect(goalFromFrame(text)).toBe("Review role; Bearer [REDACTED]")
+    } finally {
+      controller.abort()
+      await reader.cancel()
+    }
+  })
+
+  it("preserves a valid redacted TaskGraph item in a transient item.delta", async () => {
+    const controller = new AbortController()
+    const envelope = {
+      schemaVersion: "agent-harness.v2", id: "graph-delta", sessionId: "session_1", turnId: "turn_1",
+      itemId: "graph_1", taskId: "child_task_1", type: "item.delta", actor: "system", correlationId: "turn_1",
+      causationId: null, idempotencyKey: "graph-revision-1", sequence: null, payload: taskGraphPayload(),
+      kind: "snapshot", baseRevision: 0, revision: 1,
+    }
+    const connection: AgentStreamRedis = {
+      xread: vi.fn()
+        .mockResolvedValueOnce([["agent:session:session_1:deltas", [["1-0", ["payload", JSON.stringify(envelope)]]]]])
+        .mockImplementation(() => new Promise(resolve => {
+          if (controller.signal.aborted) return resolve(null)
+          controller.signal.addEventListener("abort", () => resolve(null), { once: true })
+        })),
+      disconnect: vi.fn(),
+    }
+    const stream = createV2EventStream(db([]) as never, {
+      sessionId: "session_1", afterSequence: BigInt(0), signal: controller.signal,
+      redisFactory: () => connection, dbPollMs: 1, heartbeatMs: 100,
+    })
+    const reader = stream.getReader()
+    try {
+      const text = new TextDecoder().decode((await reader.read()).value)
+      expect(goalFromFrame(text)).toBe("Review role; Bearer [REDACTED]")
+    } finally {
+      controller.abort()
+      await reader.cancel()
+    }
   })
 
   it("uses the session event channel as a durable database poll wakeup", async () => {

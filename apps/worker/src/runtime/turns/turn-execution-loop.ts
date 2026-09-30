@@ -11,7 +11,7 @@ import { TurnEngineError, toRepositoryJson, type TurnEngineResult, type TurnEngi
 import { publishCommentary, publishFinalResponse, publishReasoningSummary, TurnExecutionEventWriter } from "./turn-execution-events.js"
 import { executionId, type TurnExecutionOptions } from "./turn-execution-types.js"
 import { assertCompletionAllowed } from "./turn-execution-completion-gate.js"
-import { assertExecutionAlive, assertModelAllowance, canEmitTurnCompleted, canPersistFinalResponse, makeExecutionId, resumedBudgetLimits, totalTurnUsage, turnErrorCode, updateExecutionStep } from "./turn-engine-helpers.js"
+import { assertExecutionAlive, assertModelAllowance, canEmitTurnCompleted, canPersistFinalResponse, makeExecutionId, resumedBudgetLimits, totalTurnUsage, turnErrorCode, updateExecutionStep, withRemainingTurnStepBudget } from "./turn-engine-helpers.js"
 import { STEERING_MARKER_EVENT_TYPE } from "../context/steering-marker.js"
 import { buildCognitiveActionAgenda } from "./cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE, cognitiveAgendaReceiptIdempotencyKey } from "./cognitive-agenda-receipt.js"
@@ -25,7 +25,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
   const writer = new TurnExecutionEventWriter({ ...options, signal, now })
   const baseBudget: TurnBudgetLimits = { ...options.budget, maxSteps: options.budget?.maxSteps ?? options.maxSteps ?? DEFAULT_MAX_STEPS }
   const budget = createTurnBudgetLedger(resumedBudgetLimits(baseBudget, options.resume) ?? {})
-  const executionOptions = options
+  const executionOptions = withRemainingTurnStepBudget(options, budget)
   const progress = createProgressDetector(options.noProgressRepeatLimit ?? 2)
   let snapshot = options.snapshot
   let inputThroughSequence = options.resume?.inputThroughSequence ?? 0n
@@ -42,7 +42,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
       { goal: options.goal, taskId: options.identity.taskId, rootTaskId: options.identity.rootTaskId },
       "turn-started",
     )
-    const recoveredToolObservations = await recoverPersistedToolCalls(options, writer, now)
+    const recoveredToolObservations = await recoverPersistedToolCalls(executionOptions, writer, now)
     if (recoveredToolObservations.length > 0) snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, ...recoveredToolObservations] }
     for (let ordinal = options.resume?.nextOrdinal ?? 0; ; ordinal += 1) {
       assertExecutionAlive(options, signal)
