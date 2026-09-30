@@ -1279,7 +1279,11 @@ async function reviewSelectedJobThroughRestartedWorker(
   expect(reviewSettlement).toMatchObject({
     role: "reviewer", taskId: trace.reviewerTask.id, managerStatus: "completed", childStatus: "completed",
     artifactRef: trace.artifactRef, reviewStatus: "stale",
-    observations: { sawBody: true, reviewStatus: "stale", writerReceiptReferenceRecovered: true },
+    observations: {
+      sawBody: true, privateBodyAbsentBeforeRead: true,
+      preReadContextHash: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+      reviewStatus: "stale", writerReceiptReferenceRecovered: true,
+    },
   })
   const reviewAttempt = Number(reviewSettlement.attemptCount)
   const readCallId = `${SELECTED_JOB_REVIEW_READ_CALL_ID}:attempt:${reviewAttempt}`
@@ -1337,7 +1341,11 @@ async function reviewSelectedJobThroughRestartedWorker(
   const stoppedSettlement = selectedJobSettlement(stoppedLine, trace.stopReviewerTask.id)
   expect(stoppedSettlement).toMatchObject({
     managerStatus: "interrupted",
-    observations: { sawBody: true, reviewWriteError: "private_artifact_review_failed" },
+    observations: {
+      sawBody: true, privateBodyAbsentBeforeRead: true,
+      preReadContextHash: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+      reviewWriteError: "private_artifact_review_failed",
+    },
   })
   const [persistedItems, persistedEvents, persistedOutbox] = await Promise.all([
     pool.query<{ content: unknown }>(`SELECT "content" FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = ANY($3::text[])`, [
@@ -1686,10 +1694,14 @@ type ProcessFixtureChild = ChildProcess & { output: string[]; errors: string[] }
 const processRestartFixturePath = fileURLToPath(new URL("./task-graph-resume-process-restart.fixture.mjs", import.meta.url))
 const processRestartWorkerCwd = fileURLToPath(new URL("../../../", import.meta.url))
 
-function startTaskGraphRestartWorker(mode: "park-parent" | "resume-parent", value: Record<string, unknown>): ProcessFixtureChild {
+function startTaskGraphRestartWorker(mode: "park-parent" | "resume-parent" | "worker2-input-guard-self-test", value: Record<string, unknown>): ProcessFixtureChild {
   const child = spawn(process.execPath, ["--import", "tsx", processRestartFixturePath, mode, JSON.stringify(value)], {
     cwd: processRestartWorkerCwd,
-    env: { ...process.env, REDIS_URL: redisUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl! },
+    env: {
+      ...process.env,
+      ...(redisUrl ? { REDIS_URL: redisUrl } : {}),
+      ...(databaseUrl ? { AGENT_RUNTIME_PG_TEST_URL: databaseUrl } : {}),
+    },
     stdio: ["pipe", "pipe", "pipe"],
   }) as ProcessFixtureChild
   child.output = []
@@ -3364,6 +3376,16 @@ describe("compact TaskGraph wait failure diagnostics", () => {
       after: null,
     })
   })
+})
+
+describe("Worker 2 private artifact fixture boundary", () => {
+  it("rejects private body and artifact references at any fixture input depth", async () => {
+    const worker = startTaskGraphRestartWorker("worker2-input-guard-self-test", {})
+    await waitForProcessExit(worker)
+    expect(worker.exitCode).toBe(0)
+    expect(worker.output).toContain("P3_PRIVATE_FIXTURE_GUARD_OK")
+    expect(worker.errors).toEqual([])
+  }, 15_000)
 })
 
 describeWithServices("production TaskGraph lifecycle and root resume (disposable PostgreSQL + Redis)", () => {

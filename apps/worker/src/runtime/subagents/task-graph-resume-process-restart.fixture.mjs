@@ -61,6 +61,41 @@ function waitForCommand(command) {
   return new Promise(resolve => { const waiters = commandWaiters.get(command) ?? []; waiters.push(resolve); commandWaiters.set(command, waiters) })
 }
 function record(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : null }
+function assertNoPrivateArtifactFixtureData(value, serializedValue = rawIds) {
+  const serialized = typeof serializedValue === "string" ? serializedValue : ""
+  if (/(?:^|[,{])\s*"(?:body|draftBody|artifactRef|artifactReference)"\s*:/i.test(serialized)
+    || serialized.includes("AC6_PRIVATE_COVER_LETTER_")) {
+    throw new Error("p3_second_worker_fixture_input_contains_private_artifact_data")
+  }
+  const visit = current => {
+    if (typeof current === "string") return current.includes("AC6_PRIVATE_COVER_LETTER_")
+    if (Array.isArray(current)) return current.some(visit)
+    const row = record(current)
+    if (!row) return false
+    return Object.entries(row).some(([key, child]) => {
+      const normalized = key.replace(/[-_]/g, "").toLowerCase()
+      return ["body", "draftbody", "artifactref", "artifactreference"].includes(normalized) || visit(child)
+    })
+  }
+  if (visit(value)) throw new Error("p3_second_worker_fixture_input_contains_private_artifact_data")
+}
+function assertPrivateArtifactFixtureGuardSelfTest() {
+  const safeInput = { selectedJob: { jobId: "p3-selected-job-fixture", expectedBodyHash: "sha256:fixture" } }
+  assertNoPrivateArtifactFixtureData(safeInput, JSON.stringify(safeInput))
+  const rejectedInputs = [
+    { value: { nested: { selectedJob: { body: "AC6_PRIVATE_COVER_LETTER_fixture" } } } },
+    { value: { runtime: { task: { context: { artifactRef: { artifactId: "private-ref" } } } } } },
+    { value: { fixturePayload: { draft_body: "AC6_PRIVATE_COVER_LETTER_fixture" } } },
+    { value: { nested: { safe: true } }, serialized: '{"nested":{"body":"AC6_PRIVATE_COVER_LETTER_fixture"},"nested":{"safe":true}}' },
+    { value: { nested: { privateText: "AC6_PRIVATE_COVER_LETTER_fixture" } } },
+  ]
+  for (const item of rejectedInputs) {
+    let rejected = false
+    try { assertNoPrivateArtifactFixtureData(item.value, item.serialized ?? JSON.stringify(item.value)) }
+    catch (error) { rejected = error instanceof Error && error.message === "p3_second_worker_fixture_input_contains_private_artifact_data" }
+    if (!rejected) throw new Error("p3_private_artifact_fixture_guard_self_test_failed")
+  }
+}
 function turnErrorCategory(value) {
   if (typeof value !== "string") return "none"
   const prefix = value.slice(0, 2_000)
@@ -558,6 +593,11 @@ function selectedJobDraftModel(selected, task) {
 }
 function selectedJobReviewerModel(selected, task, observations) {
   const artifactRef = writerArtifactReferenceFromTaskContext(task.context, selected.jobId)
+  const bodyPrefix = "p3-selected-job-"
+  if (typeof selected.jobId !== "string" || !selected.jobId.startsWith(bodyPrefix) || selected.jobId.length <= bodyPrefix.length) {
+    throw new Error("p3_selected_job_fixture_body_canary_unavailable")
+  }
+  const privateBodyCanary = `AC6_PRIVATE_COVER_LETTER_${selected.jobId.slice(bodyPrefix.length)}`
   observations.writerReceiptReferenceRecovered = true
   const readCallId = `ac6-selected-job-review-read:attempt:${task.attemptCount}`
   const reviewCallId = `ac6-selected-job-review-receipt:attempt:${task.attemptCount}`
@@ -569,6 +609,12 @@ function selectedJobReviewerModel(selected, task, observations) {
       rounds++
       if (rounds === 1) {
         observations.advertisedTools = request.tools.map(tool => record(tool)?.name).filter(name => typeof name === "string")
+        // Audit every model-visible request field, while excluding the opaque AbortSignal.
+        const modelVisibleRequest = Object.fromEntries(Object.entries(request).filter(([key]) => key !== "signal"))
+        const preReadContext = JSON.stringify({ request: modelVisibleRequest, taskContext: task.context })
+        observations.preReadContextHash = hashArtifactContent(preReadContext)
+        observations.privateBodyAbsentBeforeRead = !preReadContext.includes(privateBodyCanary)
+        if (!observations.privateBodyAbsentBeforeRead) throw new Error("p3_selected_job_reviewer_received_body_before_persisted_read")
         yield { type: "tool_call_completed", callId: readCallId, name: "artifact.version.read", arguments: { artifactRef } }
         yield { type: "completed", finishReason: "tool_calls" }
         return
@@ -580,7 +626,7 @@ function selectedJobReviewerModel(selected, task, observations) {
           && readArtifactRef?.version === artifactRef.version
           && readArtifactRef?.contentHash === artifactRef.contentHash
           && readArtifactRef?.sourceDigest === artifactRef.sourceDigest
-          && typeof readResult?.content === "string"
+          && readResult?.content === privateBodyCanary
           && hashArtifactContent(readResult.content) === selected.expectedBodyHash
         if (!observations.sawBody) throw new Error("p3_selected_job_reviewer_did_not_receive_artifact_body")
         if (stopBeforeReview) {
@@ -1006,11 +1052,7 @@ async function runFirstWorker() {
   await waitForParentSuspended(ownerId); await waitForStop()
 }
 async function runSecondWorker() {
-  const selectedJob = record(ids.selectedJob)
-  if (selectedJob && (Object.prototype.hasOwnProperty.call(selectedJob, "artifactRef")
-    || Object.prototype.hasOwnProperty.call(selectedJob, "body"))) {
-    throw new Error("p3_second_worker_fixture_input_contains_private_artifact_data")
-  }
+  assertNoPrivateArtifactFixtureData(ids)
   const ownerId = "p3-process-restart-worker-" + process.pid, runtime = await startRuntime(ownerId, true)
   bootstrap = await createProductionWorkerBootstrap({ pool, runtime, ownerId, turnRecoveryIntervalMs: 10,
     waitResolver: { intervalMs: 10, ownerId: "p3-process-restart-wait-resolver-" + process.pid },
@@ -1060,6 +1102,11 @@ try {
   assertInitialPlanToolPair()
   assertSourceProjectionDiagnostic()
   if (mode === "self-test") say("P3_FIXTURE_SELF_TEST_OK")
+  else if (mode === "worker2-input-guard-self-test") {
+    assertPrivateArtifactFixtureGuardSelfTest()
+    say("P3_PRIVATE_FIXTURE_GUARD_OK")
+    process.stdin.off("data", onStdinData); process.stdin.pause(); process.stdin.destroy()
+  }
   else if (mode === "park-parent") await runFirstWorker()
   else if (mode === "resume-parent") await runSecondWorker()
   else throw new Error("p3_unknown_process_restart_mode")
