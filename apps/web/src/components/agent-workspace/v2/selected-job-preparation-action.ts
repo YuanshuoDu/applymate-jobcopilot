@@ -11,6 +11,8 @@ export interface SelectedJobPreparationResponse {
   readonly sequence: string
 }
 
+export const SELECTED_JOB_PREPARATION_MESSAGE_TEXT = "Prepare a cover letter draft for the selected job."
+
 let sequence = 0
 
 export function createSelectedJobPreparationMessageId(): string {
@@ -33,7 +35,7 @@ export async function postSelectedJobPreparation(
       clientMessageId: request.clientMessageId,
       delivery: "follow_up",
       selectedJobPreparation: { jobId: request.jobId },
-      content: [{ type: "text", text: "Prepare a cover letter draft for the selected job." }],
+      content: [{ type: "text", text: SELECTED_JOB_PREPARATION_MESSAGE_TEXT }],
     }),
   })
   const body = await response.json().catch(() => null) as unknown

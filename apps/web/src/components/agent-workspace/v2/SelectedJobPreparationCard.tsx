@@ -11,7 +11,7 @@ interface SavedJob { readonly id: string; readonly company: string; readonly rol
 interface JobsResponse { readonly jobs?: unknown }
 interface ScopedValue<T> { readonly scope: string; readonly value: T }
 
-export function SelectedJobPreparationCard({ sessionId, onAccepted }: { readonly sessionId: string; readonly onAccepted: () => void }) {
+export function SelectedJobPreparationCard({ sessionId, onAccepted }: { readonly sessionId: string; readonly onAccepted: (turnId: string, sequence: string) => void }) {
   const { data: authSession, status: authStatus } = useSession()
   const { lang } = useI18n()
   const userId = authStatus === 'authenticated' ? authSession?.user?.id ?? null : null
@@ -62,11 +62,11 @@ export function SelectedJobPreparationCard({ sessionId, onAccepted }: { readonly
     idsRef.current.set(target, clientMessageId)
     setPending({ scope, value: true })
     setFeedback(null)
-    void postSelectedJobPreparation({ sessionId, jobId: selectedJobId, clientMessageId }).then(() => {
+    void postSelectedJobPreparation({ sessionId, jobId: selectedJobId, clientMessageId }).then(response => {
       if (epoch !== epochRef.current) return
       idsRef.current.delete(target)
       setFeedback({ scope, value: 'accepted' })
-      onAccepted()
+      onAccepted(response.turnId, response.sequence)
     }).catch(error => {
       if (epoch !== epochRef.current) return
       setFeedback({ scope, value: error instanceof Error && 'status' in error && error.status === 409 ? 'conflict' : 'failed' })

@@ -33,21 +33,23 @@ const STATUS_LABELS: Record<TaskGraphPlanStatus, TaskGraphPlanLabelKey> = {
   closed: 'agent.taskGraph.status.closed',
 }
 
-export function TaskGraphPlanPanel({ sessionId, items, tasks, ledger }: {
+export function TaskGraphPlanPanel({ sessionId, items, tasks, ledger, selectedPreparationTurnId }: {
   readonly sessionId: string
   readonly items: readonly TimelineItem[]
   readonly tasks: readonly SupervisorTaskSummary[]
   readonly ledger?: unknown
+  readonly selectedPreparationTurnId?: string | null
 }) {
   const { lang, t } = useI18n()
   const plan = useMemo(() => {
-    const identity = selectedTaskGraphIdentity(items, sessionId)
+    const identity = selectedTaskGraphIdentity(items, sessionId, selectedPreparationTurnId)
     const scopedTasks = identity ? tasks.filter(task => task.sessionId === identity.sessionId && task.turnId === identity.turnId
       && task.rootTaskId === identity.rootTaskId) : []
-    const current = projectCurrentTaskGraph(items, scopedTasks, sessionId)
+    const graphItems = identity ? items.filter(item => item.id === identity.graphItemId) : []
+    const current = projectCurrentTaskGraph(graphItems, scopedTasks, sessionId)
     const response = parsePlanLedgerResponse(ledger)
     return response && sameTaskGraphIdentity(response.identity, identity) ? response.projection : current
-  }, [items, ledger, sessionId, tasks])
+  }, [items, ledger, selectedPreparationTurnId, sessionId, tasks])
   if (!plan) return null
 
   return <TaskGraphPlanSection plan={plan} sessionId={sessionId} lang={lang} t={t} />

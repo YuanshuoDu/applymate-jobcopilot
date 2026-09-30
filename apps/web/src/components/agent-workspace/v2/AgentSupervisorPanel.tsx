@@ -12,7 +12,7 @@ import { AgentApprovalLedgerCard } from './AgentApprovalLedgerCard'
 import { AgentQuestionInputCard } from './AgentQuestionInputCard'
 import { projectSupervisorTree, type SupervisorTaskSummary, type SupervisorTurnSummary } from './task-tree-projection'
 import { TaskGraphPlanPanel } from './TaskGraphPlanPanel'
-import { buildTaskGraphTaskLookupUrl, selectedTaskGraphIdentity } from './task-graph-plan-query'
+import { buildTaskGraphTaskLookupUrl, selectedJobPreparationTurnId, selectedTaskGraphIdentity } from './task-graph-plan-query'
 import type { AgentTimelineSnapshot } from './use-agent-timeline'
 import { EvidenceSummary, statusLabel } from './agent-supervisor-evidence'
 import { SelectedJobPreparationCard } from './SelectedJobPreparationCard'
@@ -39,6 +39,7 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
   const [extraTasks, setExtraTasks] = useState<SupervisorTaskSummary[]>([])
   const [loadingMore, setLoadingMore] = useState(false)
   const [loadMoreError, setLoadMoreError] = useState<string | null>(null)
+  const [acceptedPreparation, setAcceptedPreparation] = useState<{ sessionId: string; turnId: string; sequence: string } | null>(null)
   const encodedSessionId = sessionId ? encodeURIComponent(sessionId) : ''
   const turnsQuery = useApi<TurnsResponse>(
     sessionId ? `/api/agent/sessions/${encodedSessionId}/turns?limit=100` : '',
@@ -48,7 +49,8 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
     sessionId ? `/api/agent/sessions/${encodedSessionId}/tasks?limit=100` : '',
     { enabled: Boolean(sessionId) },
   )
-  const graphTasksUrl = useMemo(() => buildTaskGraphTaskLookupUrl(sessionId, timeline.items), [sessionId, timeline.items])
+  const selectedPreparationTurnId = useMemo(() => sessionId ? selectedJobPreparationTurnId(timeline.items, sessionId, acceptedPreparation?.sessionId === sessionId ? acceptedPreparation : null) : null, [acceptedPreparation, sessionId, timeline.items])
+  const graphTasksUrl = useMemo(() => buildTaskGraphTaskLookupUrl(sessionId, timeline.items, selectedPreparationTurnId), [sessionId, selectedPreparationTurnId, timeline.items])
   const graphTasksQuery = useApi<TasksResponse>(graphTasksUrl ?? '', { enabled: Boolean(graphTasksUrl) })
   const previousLifecycleKey = useRef<string | null>(null)
   const sessionEpochRef = useRef(0)
@@ -149,9 +151,11 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
   }, [refetchGraphTasks, refetchTasks, refetchTurns])
   const draftArtifactRef = useMemo(() => {
     if (!sessionId) return null
-    const identity = selectedTaskGraphIdentity(timeline.items, sessionId)
+    const identity = selectedTaskGraphIdentity(timeline.items, sessionId, selectedPreparationTurnId)
     return latestWriterArtifact(sessionId, graphTasksQuery.data?.tasks ?? [], identity)
-  }, [graphTasksQuery.data, sessionId, timeline.items])
+  }, [graphTasksQuery.data, selectedPreparationTurnId, sessionId, timeline.items])
+
+  const handlePreparationAccepted = useCallback((turnId: string, sequence: string) => { if (sessionId) setAcceptedPreparation({ sessionId, turnId, sequence }); refetchSupervisorRecords() }, [refetchSupervisorRecords, sessionId])
 
   if (!sessionId) return null
 
@@ -194,8 +198,8 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
       {error && <p role="alert" style={{ ...messageStyle, color: 'var(--c-danger)' }}>{t('agent.supervisorUnavailable')}</p>}
       <AgentApprovalLedgerCard ledger={timeline.approvalLedger} sessionId={sessionId} turns={turns} onAccepted={refetchSupervisorRecords} selectionKey={selectedId ?? ''} />
       <AgentQuestionInputCard sessionId={sessionId} items={timeline.items} turns={turns} onAccepted={refetchSupervisorRecords} selectionKey={selectedId ?? ''} />
-      <SelectedJobPreparationCard sessionId={sessionId} onAccepted={refetchSupervisorRecords} />
-      <TaskGraphPlanPanel sessionId={sessionId} items={timeline.items} tasks={planTasks} ledger={graphTasksQuery.data?.planLedger} />
+      <SelectedJobPreparationCard sessionId={sessionId} onAccepted={handlePreparationAccepted} />
+      <TaskGraphPlanPanel sessionId={sessionId} items={timeline.items} tasks={planTasks} ledger={graphTasksQuery.data?.planLedger} selectedPreparationTurnId={selectedPreparationTurnId} />
       <SelectedJobDraftArtifact sessionId={sessionId} artifactRef={draftArtifactRef} />
       {timeline.cognitiveAgenda && <CognitiveAgendaCard agenda={timeline.cognitiveAgenda} agendas={timeline.cognitiveAgendas} taskLabels={agendaTaskLabels} />}
       {!loading && !nodes.length && !error && <p style={messageStyle}>{t('agent.noTaskRecords')}</p>}
