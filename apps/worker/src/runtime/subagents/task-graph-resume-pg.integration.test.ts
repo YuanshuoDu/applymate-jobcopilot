@@ -4270,8 +4270,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         workerOne, `P3_SELECTED_JOB_CHILD_SETTLED ${artifactPlan.writerTask.id} `, 30_000,
       )
       artifactTrace = await traceSelectedJobWriterFromWorker(artifactPlan, writerLine)
-      const writerVersion = await pool!.query<{ version: number; contentHash: string; sourceDigest: string; content: unknown }>(
-        `SELECT "version", "contentHash", "sourceDigest", "content" FROM "agent_artifact_version"
+      const writerVersion = await pool!.query<{
+        version: number; contentHash: string; sourceDigest: string; content: unknown; userId: string; sessionId: string;
+        jobId: string; provenanceRefs: string[]; evidenceRefs: string[]; taskId: string; toolCallId: string; requestHash: string;
+      }>(
+        `SELECT "version", "contentHash", "sourceDigest", "content", "userId", "sessionId", "jobId",
+          "provenanceRefs", "evidenceRefs", "taskId", "toolCallId", "requestHash" FROM "agent_artifact_version"
           WHERE "taskId" = $1 AND "toolCallId" = $2`, [artifactTrace.writerTask.id, artifactTrace.writerDraftCallId],
       )
       expect(writerVersion.rows).toHaveLength(1)
