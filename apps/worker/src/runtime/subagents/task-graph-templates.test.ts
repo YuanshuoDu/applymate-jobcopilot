@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { TASK_GRAPH_TEMPLATES, taskGraphRuntimeOptions, taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
+import { TASK_GRAPH_TEMPLATES, taskGraphRuntimeForTurn, taskGraphRuntimeOptions, taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import type { TaskGraphCommandPort } from "./task-graph-command-port.js"
 
@@ -70,5 +70,14 @@ describe("TaskGraph server-owned templates", () => {
       expect(template.allowedActions).not.toContain("application.submit")
       expect(template.allowedActions.some(action => /send|gmail|browser|submit/i.test(action))).toBe(false)
     }
+  })
+
+  it("returns selected-job mode only when the server-side preparation loader finds a selection", async () => {
+    const base = { pool: {} as never, lease: {} as never, now: () => new Date(), enabled: true }
+    const selected = await taskGraphRuntimeForTurn({ ...base, selectedJobPreparationLoader: async () => ({ jobId: "job-1" }) })
+    const generic = await taskGraphRuntimeForTurn({ ...base, selectedJobPreparationLoader: async () => undefined })
+
+    expect(selected).toMatchObject({ enabled: true, selectedJobMode: true })
+    expect(generic).toMatchObject({ enabled: true, selectedJobMode: false })
   })
 })

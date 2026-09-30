@@ -82,10 +82,10 @@ export async function taskGraphRuntimeForTurn(input: {
   now: () => Date
   selectedJobPreparationLoader?: (pool: Pick<pg.Pool, "connect">, lease: TurnLease, now: Date) => Promise<SelectedJobPreparation | undefined>
   taskGraphTemplates?: Readonly<Record<string, TaskGraphTaskTemplate>>
-}): Promise<{ enabled: boolean; templates: Readonly<Record<string, TaskGraphTaskTemplate>> | undefined }> {
-  if (!input.enabled) return { enabled: false, templates: input.taskGraphTemplates }
+}): Promise<{ enabled: boolean; selectedJobMode: boolean; templates: Readonly<Record<string, TaskGraphTaskTemplate>> | undefined }> {
+  if (!input.enabled) return { enabled: false, selectedJobMode: false, templates: input.taskGraphTemplates }
   const preparation = await (input.selectedJobPreparationLoader ?? loadSelectedJobPreparation)(input.pool, input.lease, input.now())
-  return { enabled: true, templates: preparation ? taskGraphTemplatesForSelectedJob(preparation) : input.taskGraphTemplates }
+  return { enabled: true, selectedJobMode: Boolean(preparation), templates: preparation ? taskGraphTemplatesForSelectedJob(preparation) : input.taskGraphTemplates }
 }
 
 /** Options passed by production composition to the canonical TaskGraph runtime. */

@@ -209,6 +209,74 @@ async function rootToolNames(
   }) ?? []
 }
 
+async function taskGraphRootSurface(selectedJob: boolean, recoverHiddenMutation = false) {
+  const requests: HarnessModelRequest[] = []
+  const events: RuntimeEvent[] = []
+  let allowedActions: readonly string[] = []
+  const roots = {
+    ensure: vi.fn(async (input: { allowedActions: readonly string[] }) => {
+      allowedActions = [...input.allowedActions]
+      return { id: "root-1", attemptCount: 1 } as never
+    }),
+    checkCompletion: vi.fn(async () => ({ ok: true as const })), finish: vi.fn(async () => undefined),
+  }
+  const names = [...CANONICAL_COORDINATION_TOOL_NAMES,
+    "spawn_subagent", "send_message", "wait_subagents", "list_subagents", "interrupt_subagent", "close_subagent"]
+  const definitions = ["jobs.search", ...names].map(name => ({ name, version: "1" }))
+  const route = vi.fn(async (_context: unknown, call: { id: string; toolName: string; toolVersion: string }) => ({
+    id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed" as const, output: { ok: true }, errorCode: null,
+  }))
+  const taskGraphCommandPort = {
+    appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
+    readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
+  }
+  const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+    workerId: "worker-1", productionFlags: resolveProductionAgentFlags({
+      ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+    }),
+    taskGraphCommandPort: taskGraphCommandPort as never,
+    taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+    selectedJobPreparationLoader: async () => selectedJob ? { jobId: "job-1" } : undefined,
+    stateLoader: async () => ({
+      ...state(), toolPolicySnapshot: { capabilities: ["read"] },
+      ...(recoverHiddenMutation ? {
+        pendingToolCalls: [{ call: { id: "persisted-interrupt-call", name: "agent.interrupt", arguments: {} }, toolVersion: "1", stepId: "prior-step", callItem: { id: "persisted-call-item", revision: 0 } }],
+        resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 0n, consumedInputIds: [], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
+      } : {}),
+    }),
+    rootTaskStore: roots as never, turnEngineStoreFactory: () => store(events), contextBuilderFactory: () => contextBuilder(),
+    toolRuntimeFactory: () => ({
+      registry: {
+        list: () => definitions,
+        resolve: (name: string) => ({ idempotency: name === "agent.interrupt" ? "idempotent" as const : name === "agent.spawn" ? "requires_key" as const : "read_only" as const }),
+        validateArguments: () => true as const,
+        register: (definition: { name: string; version: string }) => { definitions.push(definition) },
+      },
+      router: { execute: route },
+    }) as never,
+    modelRuntimeFactory: async () => ({ adapter: {
+      ...model(() => []),
+      async *stream(request: HarnessModelRequest) {
+        requests.push(request)
+        if (requests.length === 1 && !recoverHiddenMutation) {
+          yield { type: "tool_call_completed", callId: "spawn-call", name: "agent.spawn", arguments: {} }
+          yield { type: "completed", finishReason: "tool_calls" }
+        } else {
+          yield { type: "text_delta", text: "done" }
+          yield { type: "completed", finishReason: "stop" }
+        }
+      },
+    }, registry: {} as never, candidates: [] }),
+    authorizeUsage: async () => ({ settle: async () => undefined }),
+  })
+  await runtime.execute({ lease, signal: new AbortController().signal })
+  const toolNames = requests[0]?.tools.flatMap(tool => {
+    if (!tool || typeof tool !== "object" || !("name" in tool) || typeof tool.name !== "string") return []
+    return [tool.name]
+  }) ?? []
+  return { toolNames, allowedActions, route, events }
+}
+
 describe("createCanonicalTurnRuntime", () => {
   it("surfaces selected-job preparation as unavailable without planning gates, model calls, or task scheduling", async () => {
     const roots = rootStore()
@@ -558,6 +626,29 @@ describe("createCanonicalTurnRuntime", () => {
     expect(disabled).not.toEqual(expect.arrayContaining(["spawn_subagent", "wait_subagents", "list_subagents", "send_message", "interrupt_subagent", "close_subagent"]))
     const enabled = await rootToolNames(true)
     expect(enabled).toEqual(expect.arrayContaining(["spawn_subagent", "wait_subagents", "list_subagents", "send_message", "interrupt_subagent", "close_subagent"]))
+  })
+
+  it("hides selected-job generic coordination mutations, retains TaskGraph observation, and blocks forged execution", async () => {
+    const selectedJobDenied = ["spawn_subagent", "agent.spawn", "agent.followup", "send_message", "agent.send", "interrupt_subagent", "agent.interrupt", "close_subagent", "agent.close", "wait_subagents"]
+    const genericCoordination = [...selectedJobDenied, "agent.wait"]
+    const retained = ["agent.plan", "agent.wait", "agent.list", "list_subagents"]
+    const selected = await taskGraphRootSurface(true)
+    const generic = await taskGraphRootSurface(false)
+
+    expect(selected.toolNames).not.toEqual(expect.arrayContaining(selectedJobDenied))
+    expect(selected.allowedActions).not.toEqual(expect.arrayContaining(selectedJobDenied))
+    expect(selected.toolNames).toEqual(expect.arrayContaining(retained))
+    expect(selected.allowedActions).toEqual(expect.arrayContaining(retained))
+    expect(selected.route).not.toHaveBeenCalled()
+    expect(JSON.stringify(selected.events)).not.toContain("spawn-call")
+
+    expect(generic.toolNames).toEqual(expect.arrayContaining([...genericCoordination, ...retained]))
+    expect(generic.allowedActions).toEqual(expect.arrayContaining([...genericCoordination, ...retained]))
+    expect(generic.route).toHaveBeenCalledOnce()
+
+    const recovered = await taskGraphRootSurface(true, true)
+    expect(recovered.route).not.toHaveBeenCalled()
+    expect(JSON.stringify(recovered.events)).toContain("selected_job_coordination_mutation_disabled")
   })
 
   it("settles the root after the real wait transition and releases its task lease", async () => {

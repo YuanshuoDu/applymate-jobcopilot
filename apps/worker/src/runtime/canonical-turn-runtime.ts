@@ -69,6 +69,16 @@ function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
 }
 
+const SELECTED_JOB_ROOT_COORDINATION_MUTATORS = new Set([
+  "spawn_subagent", "agent.spawn", "agent.followup", "send_message", "agent.send",
+  "interrupt_subagent", "agent.interrupt", "close_subagent", "agent.close", "wait_subagents",
+])
+
+function isSelectedJobRootCoordinationMutation(definition: unknown): boolean {
+  const name = record(definition).name
+  return typeof name === "string" && SELECTED_JOB_ROOT_COORDINATION_MUTATORS.has(name)
+}
+
 export async function createCanonicalTurnRuntime(pool: pg.Pool, options: CanonicalTurnRuntimeOptions): Promise<{
   execute: TurnExecutor
   manager: AgentTreeManager
@@ -110,7 +120,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       return terminal.result
     }
     const state = await (options.stateLoader?.(pool, lease, now()) ?? loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes }))
-    const { enabled: taskGraphPlanningEnabled, templates: taskGraphTemplates } = await taskGraphRuntimeForTurn({
+    const { enabled: taskGraphPlanningEnabled, selectedJobMode, templates: taskGraphTemplates } = await taskGraphRuntimeForTurn({
       enabled: options.productionFlags?.taskGraphPlanningEnabled === true && coordinationEnabled, pool, lease, now,
       selectedJobPreparationLoader: options.selectedJobPreparationLoader, taskGraphTemplates: options.taskGraphTemplates,
     })
@@ -145,7 +155,8 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     let taskGraphParentAttemptCount: number | null = null
     registerTaskGraphPlanningTool(toolRuntime.registry, taskGraphPlanningEnabled, { commandPort: options.taskGraphCommandPort, templates: taskGraphTemplates, turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: () => taskGraphParentAttemptCount })
     if (coordinationEnabled) assertCanonicalCoordinationSurface(toolRuntime.registry, toolCapabilities)
-    const allowedActions = toolRuntime.registry.list(toolCapabilities).flatMap((definition) => {
+    const rootTools = toolRuntime.registry.list(toolCapabilities).filter(definition => !selectedJobMode || !isSelectedJobRootCoordinationMutation(definition))
+    const allowedActions = rootTools.flatMap((definition) => {
       const name = definition && typeof definition === "object" && "name" in definition ? (definition as { name?: unknown }).name : undefined
       return typeof name === "string" ? [name] : []
     })
@@ -159,6 +170,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const modelRuntime = await (options.modelRuntimeFactory?.({ userId: lease.userId, config, state }) ?? createHarnessModelRuntime({ primary: config, fallbacks: [], allowEnvironmentFallbacks: false }))
     const authorize = options.authorizeUsage ?? defaultAuthorization
     const model = modelWithUsage(modelRuntime, lease, authorize)
+    const routeTool = createToolRouterExecutor(toolRuntime.router)
     const inputStore = createPgInputClaimStore(pool, state.scope)
     const baseContextBuilder = options.contextBuilderFactory?.({ pool, scope: state.scope }) ?? new StepContextBuilder(inputStore, createPgContextOwnerFence(pool))
     const contextBuilder: TurnEngineOptions["contextBuilder"] = {
@@ -167,10 +179,15 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const actorRole = (record(state.toolPolicySnapshot).role as PolicyRole | undefined) ?? "orchestrator"
     const engine = new TurnEngine({
       lease, scope: state.scope, goal: state.goal, snapshot: modelSnapshot, contextBuilder,
-      store: turnStore, model, tools: toolRuntime.registry.list(toolCapabilities),
-      executeTool: createToolRouterExecutor(toolRuntime.router), rootInputId: state.rootInputId, rootTaskId: root.id, taskId: root.id,
+      store: turnStore, model, tools: rootTools,
+      executeTool: input => selectedJobMode && SELECTED_JOB_ROOT_COORDINATION_MUTATORS.has(input.call.toolName)
+        ? Promise.resolve({ id: input.call.id, toolName: input.call.toolName, toolVersion: input.call.toolVersion, status: "failed" as const, errorCode: "selected_job_coordination_mutation_disabled" })
+        : routeTool(input),
+      rootInputId: state.rootInputId, rootTaskId: root.id, taskId: root.id,
       actorRole, capabilities: toolCapabilities,
-      validateToolArguments: (name, input) => toolRuntime.registry.validateArguments(name, input, "1"), signal,
+      validateToolArguments: (name, input) => selectedJobMode && SELECTED_JOB_ROOT_COORDINATION_MUTATORS.has(name)
+        ? "selected_job_coordination_mutation_disabled"
+        : toolRuntime.registry.validateArguments(name, input, "1"), signal,
       budget: limits(state.budgetSnapshot), resume: state.resume, now, publishReasoningSummary: false,
       steeringMarkerState: { active: state.steeringMarkers?.active ?? [] }, ...(taskGraphPlanningEnabled ? { refreshTaskGraphAfterReadyWait: (snapshot: TurnEngineOptions["snapshot"]) => loadTaskGraphCurrentObservation(snapshot, options.taskGraphCommandPort, lease, root), refreshTaskGraphAfterPlan: (snapshot: TurnEngineOptions["snapshot"]) => loadTaskGraphCurrentObservation(snapshot, options.taskGraphCommandPort, lease, root) } : {}),
       ...(state.pendingToolCalls?.length ? { toolCallRecovery: classifyToolCallRecovery(state.pendingToolCalls, (name, version) => toolRuntime.registry.resolve(name, version)) } : {}),
