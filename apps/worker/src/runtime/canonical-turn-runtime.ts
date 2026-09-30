@@ -69,14 +69,13 @@ function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
 }
 
-const SELECTED_JOB_ROOT_COORDINATION_MUTATORS = new Set([
-  "spawn_subagent", "agent.spawn", "agent.followup", "send_message", "agent.send",
-  "interrupt_subagent", "agent.interrupt", "close_subagent", "agent.close", "wait_subagents",
+const SELECTED_JOB_ROOT_TOOLS = new Set([
+  "agent.plan", "agent.wait", "agent.list", "list_subagents",
 ])
 
-function isSelectedJobRootCoordinationMutation(definition: unknown): boolean {
+function isSelectedJobRootTool(definition: unknown): boolean {
   const name = record(definition).name
-  return typeof name === "string" && SELECTED_JOB_ROOT_COORDINATION_MUTATORS.has(name)
+  return typeof name === "string" && SELECTED_JOB_ROOT_TOOLS.has(name)
 }
 
 export async function createCanonicalTurnRuntime(pool: pg.Pool, options: CanonicalTurnRuntimeOptions): Promise<{
@@ -155,7 +154,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     let taskGraphParentAttemptCount: number | null = null
     registerTaskGraphPlanningTool(toolRuntime.registry, taskGraphPlanningEnabled, { commandPort: options.taskGraphCommandPort, templates: taskGraphTemplates, turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: () => taskGraphParentAttemptCount })
     if (coordinationEnabled) assertCanonicalCoordinationSurface(toolRuntime.registry, toolCapabilities)
-    const rootTools = toolRuntime.registry.list(toolCapabilities).filter(definition => !selectedJobMode || !isSelectedJobRootCoordinationMutation(definition))
+    const rootTools = toolRuntime.registry.list(toolCapabilities).filter(definition => !selectedJobMode || isSelectedJobRootTool(definition))
     const allowedActions = rootTools.flatMap((definition) => {
       const name = definition && typeof definition === "object" && "name" in definition ? (definition as { name?: unknown }).name : undefined
       return typeof name === "string" ? [name] : []
@@ -180,13 +179,13 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const engine = new TurnEngine({
       lease, scope: state.scope, goal: state.goal, snapshot: modelSnapshot, contextBuilder,
       store: turnStore, model, tools: rootTools,
-      executeTool: input => selectedJobMode && SELECTED_JOB_ROOT_COORDINATION_MUTATORS.has(input.call.toolName)
-        ? Promise.resolve({ id: input.call.id, toolName: input.call.toolName, toolVersion: input.call.toolVersion, status: "failed" as const, errorCode: "selected_job_coordination_mutation_disabled" })
+      executeTool: input => selectedJobMode && !SELECTED_JOB_ROOT_TOOLS.has(input.call.toolName)
+        ? Promise.resolve({ id: input.call.id, toolName: input.call.toolName, toolVersion: input.call.toolVersion, status: "failed" as const, errorCode: "selected_job_root_tool_disabled" })
         : routeTool(input),
       rootInputId: state.rootInputId, rootTaskId: root.id, taskId: root.id,
       actorRole, capabilities: toolCapabilities,
-      validateToolArguments: (name, input) => selectedJobMode && SELECTED_JOB_ROOT_COORDINATION_MUTATORS.has(name)
-        ? "selected_job_coordination_mutation_disabled"
+      validateToolArguments: (name, input) => selectedJobMode && !SELECTED_JOB_ROOT_TOOLS.has(name)
+        ? "selected_job_root_tool_disabled"
         : toolRuntime.registry.validateArguments(name, input, "1"), signal,
       budget: limits(state.budgetSnapshot), resume: state.resume, now, publishReasoningSummary: false,
       steeringMarkerState: { active: state.steeringMarkers?.active ?? [] }, ...(taskGraphPlanningEnabled ? { refreshTaskGraphAfterReadyWait: (snapshot: TurnEngineOptions["snapshot"]) => loadTaskGraphCurrentObservation(snapshot, options.taskGraphCommandPort, lease, root), refreshTaskGraphAfterPlan: (snapshot: TurnEngineOptions["snapshot"]) => loadTaskGraphCurrentObservation(snapshot, options.taskGraphCommandPort, lease, root) } : {}),

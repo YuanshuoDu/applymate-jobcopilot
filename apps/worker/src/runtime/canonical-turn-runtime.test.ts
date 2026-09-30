@@ -209,7 +209,12 @@ async function rootToolNames(
   }) ?? []
 }
 
-async function taskGraphRootSurface(selectedJob: boolean, recoverHiddenMutation = false) {
+async function taskGraphRootSurface(
+  selectedJob: boolean,
+  recoverHiddenMutation = false,
+  forgedToolName = "agent.spawn",
+  recoveredToolName = "agent.interrupt",
+) {
   const requests: HarnessModelRequest[] = []
   const events: RuntimeEvent[] = []
   let allowedActions: readonly string[] = []
@@ -222,9 +227,10 @@ async function taskGraphRootSurface(selectedJob: boolean, recoverHiddenMutation 
   }
   const names = [...CANONICAL_COORDINATION_TOOL_NAMES,
     "spawn_subagent", "send_message", "wait_subagents", "list_subagents", "interrupt_subagent", "close_subagent"]
-  const definitions = ["jobs.search", ...names].map(name => ({ name, version: "1" }))
+  const definitions = ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base", ...names].map(name => ({ name, version: "1" }))
   const route = vi.fn(async (_context: unknown, call: { id: string; toolName: string; toolVersion: string }) => ({
-    id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed" as const, output: { ok: true }, errorCode: null,
+    id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed" as const,
+    output: { ok: true, privateSource: "PRIVATE_SOURCE_SENTINEL" }, errorCode: null,
   }))
   const taskGraphCommandPort = {
     appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
@@ -240,7 +246,7 @@ async function taskGraphRootSurface(selectedJob: boolean, recoverHiddenMutation 
     stateLoader: async () => ({
       ...state(), toolPolicySnapshot: { capabilities: ["read"] },
       ...(recoverHiddenMutation ? {
-        pendingToolCalls: [{ call: { id: "persisted-interrupt-call", name: "agent.interrupt", arguments: {} }, toolVersion: "1", stepId: "prior-step", callItem: { id: "persisted-call-item", revision: 0 } }],
+        pendingToolCalls: [{ call: { id: "persisted-hidden-call", name: recoveredToolName, arguments: recoveredToolName === "jobs.get" ? { jobId: "job-other" } : {} }, toolVersion: "1", stepId: "prior-step", callItem: { id: "persisted-call-item", revision: 0 } }],
         resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 0n, consumedInputIds: [], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
       } : {}),
     }),
@@ -259,7 +265,7 @@ async function taskGraphRootSurface(selectedJob: boolean, recoverHiddenMutation 
       async *stream(request: HarnessModelRequest) {
         requests.push(request)
         if (requests.length === 1 && !recoverHiddenMutation) {
-          yield { type: "tool_call_completed", callId: "spawn-call", name: "agent.spawn", arguments: {} }
+          yield { type: "tool_call_completed", callId: "forged-call", name: forgedToolName, arguments: { jobId: "job-other" } }
           yield { type: "completed", finishReason: "tool_calls" }
         } else {
           yield { type: "text_delta", text: "done" }
@@ -628,27 +634,42 @@ describe("createCanonicalTurnRuntime", () => {
     expect(enabled).toEqual(expect.arrayContaining(["spawn_subagent", "wait_subagents", "list_subagents", "send_message", "interrupt_subagent", "close_subagent"]))
   })
 
-  it("hides selected-job generic coordination mutations, retains TaskGraph observation, and blocks forged execution", async () => {
+  it("restricts selected-job root tools to TaskGraph supervision and blocks forged execution", async () => {
     const selectedJobDenied = ["spawn_subagent", "agent.spawn", "agent.followup", "send_message", "agent.send", "interrupt_subagent", "agent.interrupt", "close_subagent", "agent.close", "wait_subagents"]
     const genericCoordination = [...selectedJobDenied, "agent.wait"]
     const retained = ["agent.plan", "agent.wait", "agent.list", "list_subagents"]
+    const genericReads = ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"]
     const selected = await taskGraphRootSurface(true)
     const generic = await taskGraphRootSurface(false)
 
     expect(selected.toolNames).not.toEqual(expect.arrayContaining(selectedJobDenied))
     expect(selected.allowedActions).not.toEqual(expect.arrayContaining(selectedJobDenied))
+    expect(selected.toolNames).not.toEqual(expect.arrayContaining(genericReads))
+    expect(selected.allowedActions).not.toEqual(expect.arrayContaining(genericReads))
     expect(selected.toolNames).toEqual(expect.arrayContaining(retained))
     expect(selected.allowedActions).toEqual(expect.arrayContaining(retained))
     expect(selected.route).not.toHaveBeenCalled()
-    expect(JSON.stringify(selected.events)).not.toContain("spawn-call")
+    expect(JSON.stringify(selected.events)).not.toContain("forged-call")
+    expect(JSON.stringify(selected.events)).not.toContain("PRIVATE_SOURCE_SENTINEL")
 
     expect(generic.toolNames).toEqual(expect.arrayContaining([...genericCoordination, ...retained]))
+    expect(generic.toolNames).toEqual(expect.arrayContaining(genericReads))
     expect(generic.allowedActions).toEqual(expect.arrayContaining([...genericCoordination, ...retained]))
+    expect(generic.allowedActions).toEqual(expect.arrayContaining(genericReads))
     expect(generic.route).toHaveBeenCalledOnce()
+
+    const forgedRead = await taskGraphRootSurface(true, false, "jobs.get")
+    expect(forgedRead.route).not.toHaveBeenCalled()
+    expect(JSON.stringify(forgedRead.events)).not.toContain("PRIVATE_SOURCE_SENTINEL")
 
     const recovered = await taskGraphRootSurface(true, true)
     expect(recovered.route).not.toHaveBeenCalled()
-    expect(JSON.stringify(recovered.events)).toContain("selected_job_coordination_mutation_disabled")
+    expect(JSON.stringify(recovered.events)).toContain("selected_job_root_tool_disabled")
+    expect(JSON.stringify(recovered.events)).not.toContain("PRIVATE_SOURCE_SENTINEL")
+
+    const recoveredRead = await taskGraphRootSurface(true, true, "agent.spawn", "jobs.get")
+    expect(recoveredRead.route).not.toHaveBeenCalled()
+    expect(JSON.stringify(recoveredRead.events)).not.toContain("PRIVATE_SOURCE_SENTINEL")
   })
 
   it("settles the root after the real wait transition and releases its task lease", async () => {
