@@ -105,6 +105,33 @@ describe("agent query DTO redaction", () => {
     expect(dto.content).toEqual({ title: "Resume ready", body: "Bearer [REDACTED]", data: { apiKey: "[REDACTED]", resume: "[REDACTED]", resumeText: "[REDACTED]" } })
   })
 
+  it("projects only a strictly validated selected saved-job ID from Turn input", () => {
+    const row = {
+      id: "turn_1", sessionId: "session_1", source: "user", status: "completed", revision: 2,
+      input: { goal: "Prepare a saved job", content: [{ type: "text", text: "private prompt" }], clientMessageId: "message_1" },
+      steps: [{ id: "step_1" }], items: [{ id: "item_final" }],
+      createdAt: date, updatedAt: date, completedAt: null,
+    }
+    const dto = turnDto({ ...row, input: { ...row.input, selectedJobPreparation: { jobId: "job_1" } } })
+    expect(dto.selectedJobId).toBe("job_1")
+    expect(dto).not.toHaveProperty("input")
+    expect(JSON.stringify(dto)).not.toContain("private prompt")
+
+    const invalidSelections: unknown[] = [
+      null,
+      "job_1",
+      { jobId: " job_1 " },
+      { jobId: "j".repeat(257) },
+      { jobId: "job_1", company: "Private employer context" },
+      { jobId: "job_1", answer: "private answer" },
+    ]
+    for (const selectedJobPreparation of invalidSelections) {
+      const invalid = turnDto({ ...row, input: { ...row.input, selectedJobPreparation } })
+      expect(invalid).not.toHaveProperty("selectedJobId")
+      expect(JSON.stringify(invalid)).not.toContain("private employer context")
+      expect(JSON.stringify(invalid)).not.toContain("private answer")
+    }
+  })
   it("does not expose turn input, task result, or tool arguments", () => {
     expect(turnDto({
       id: "turn_1", sessionId: "session_1", source: "user", status: "completed", revision: 2,

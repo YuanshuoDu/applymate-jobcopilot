@@ -141,12 +141,14 @@ export interface TurnQueryRow extends CursorRow {
 
 export function turnDto(row: TurnQueryRow) {
   const input = record(row.input)
+  const selectedJobId = projectSelectedJobId(input.selectedJobPreparation)
   return {
     schemaVersion,
     id: row.id,
     sessionId: row.sessionId,
     source: row.source,
     goal: typeof input.goal === "string" ? redactString(input.goal) : "Process agent task",
+    ...(selectedJobId ? { selectedJobId } : {}),
     status: row.status,
     revision: row.revision,
     activeStepId: row.steps[0]?.id ?? null,
@@ -200,6 +202,12 @@ function projectArtifactRef(value: unknown, role: string, taskType: string, stat
     || !boundedIdentifier(ref.artifactId) || !Number.isSafeInteger(ref.version) || Number(ref.version) < 1
     || !isDigest(ref.contentHash) || !isDigest(ref.sourceDigest)) return null
   return { artifactId: ref.artifactId, version: Number(ref.version), contentHash: ref.contentHash, sourceDigest: ref.sourceDigest }
+}
+
+function projectSelectedJobId(value: unknown): string | null {
+  const selectedJobPreparation = record(value)
+  if (Object.keys(selectedJobPreparation).length !== 1 || !boundedIdentifier(selectedJobPreparation.jobId)) return null
+  return selectedJobPreparation.jobId
 }
 
 function boundedIdentifier(value: unknown): value is string {

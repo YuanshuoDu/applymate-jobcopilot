@@ -6,6 +6,7 @@ export interface SupervisorTurnSummary {
   readonly sessionId: string
   readonly source: string
   readonly goal: string
+  readonly selectedJobId?: string
   readonly status: string
   readonly revision: number
   readonly activeStepId: string | null

@@ -49,6 +49,17 @@ export function latestSelectedJobPreparationTurnId(items: readonly TimelineItem[
   return latestSelectedJobPreparationIntent(items, sessionId)?.turnId ?? null
 }
 
+/** Resolves a selected saved-job ID only from the matching session and preparation Turn. */
+export function selectedJobIdForTurn(
+  turns: readonly { readonly id: string; readonly sessionId: string; readonly selectedJobId?: string }[],
+  sessionId: string,
+  turnId: string | null,
+): string | null {
+  if (!sessionId.trim() || !boundedIdentifier(turnId)) return null
+  const turn = turns.find(candidate => candidate.sessionId === sessionId && candidate.id === turnId && boundedIdentifier(candidate.selectedJobId))
+  return turn?.selectedJobId ?? null
+}
+
 /** Keeps an accepted request visible before its durable timeline item arrives; later replay wins by sequence. */
 export function selectedJobPreparationTurnId(
   items: readonly TimelineItem[],

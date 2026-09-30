@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest'
 import type { TimelineItem } from './timeline-reducer'
 import { latestWriterArtifact } from './draft-artifact-projection'
 import { projectCurrentTaskGraph } from './task-graph-plan'
-import { buildTaskGraphTaskLookupUrl, latestSelectedJobPreparationTurnId, selectCurrentTaskGraphTaskIds, selectedJobPreparationTurnId, selectedTaskGraphIdentity } from './task-graph-plan-query'
+import { buildTaskGraphTaskLookupUrl, latestSelectedJobPreparationTurnId, selectCurrentTaskGraphTaskIds, selectedJobIdForTurn, selectedJobPreparationTurnId, selectedTaskGraphIdentity } from './task-graph-plan-query'
 import { SELECTED_JOB_PREPARATION_MESSAGE_TEXT } from './selected-job-preparation-action'
 
 const schemaVersion = 'agent-harness.v2.task-graph'
@@ -39,6 +39,19 @@ function writerTask(turnId: string, rootTaskId: string, artifactId: string) {
 }
 
 describe('TaskGraph query projection', () => {
+  it('restores only the selected job on the matching preparation Turn and session', () => {
+    const turns = [
+      { id: 'prepare-a', sessionId: 'session-a', selectedJobId: 'job-a' },
+      { id: 'prepare-b', sessionId: 'session-b', selectedJobId: 'job-b' },
+      { id: 'chat-a', sessionId: 'session-a', selectedJobId: 'job-chat' },
+      { id: 'invalid', sessionId: 'session-a', selectedJobId: ' job-invalid ' },
+    ]
+    expect(selectedJobIdForTurn(turns, 'session-a', 'prepare-a')).toBe('job-a')
+    expect(selectedJobIdForTurn(turns, 'session-a', 'prepare-b')).toBeNull()
+    expect(selectedJobIdForTurn(turns, 'session-b', 'prepare-a')).toBeNull()
+    expect(selectedJobIdForTurn(turns, 'session-a', null)).toBeNull()
+    expect(selectedJobIdForTurn(turns, 'session-a', 'invalid')).toBeNull()
+  })
   it('builds a URL from only the latest valid graph in the target session', () => {
     const older = graphItem([graphNode('old', 'old-task')], '2026-09-23T11:00:00.000Z', 'session/1', 'graph-old', 'old-root')
     const latest = graphItem([graphNode('a', 'task-a'), graphNode('b', 'task-b')], '2026-09-23T12:00:00.000Z', 'session/1', 'graph-latest')

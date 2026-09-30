@@ -80,7 +80,7 @@ function event(sessionId: string, turnId: string, id: string, sequence: string, 
   }
 }
 
-async function installSupervisorFixture(page: Page, selectedJobEnabled = false, selectedJobTurnGateRegression = false) {
+async function installSupervisorFixture(page: Page, selectedJobEnabled = false, selectedJobTurnGateRegression = false, selectedJobPendingWriter = false) {
   const fixture = {
     aStreamCount: 0,
     eventSequence: 0,
@@ -111,6 +111,8 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false, 
     }>,
     selectedJobStarted: selectedJobTurnGateRegression,
     selectedJobRequests: [] as Array<Record<string, unknown>>,
+    selectedJobDetailRequests: [] as string[],
+    selectedJobListResponses: [] as string[][],
     selectedJobDisconnectArmed: false,
     selectedJobStreamSequences: [] as Array<string | null>,
     selectedJobReconnectSequence: null as string | null,
@@ -135,13 +137,20 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false, 
     expires: '2099-01-01T00:00:00.000Z',
   }))
   await page.route('**/api/me', route => json(route, { id: 'agent-supervisor-fixture', email: 'fixture@applymate.local', name: 'Fixture', plan: 'pro', onboardedAt: times.created }))
-  await page.route('**/api/jobs**', route => json(route, {
-    jobs: selectedJobEnabled ? [
-      { id: 'fixture-selected-job', company: 'Fixture Systems', role: 'Systems Engineer', status: 'saved' },
+  await page.route('**/api/jobs**', route => {
+    const url = new URL(route.request().url())
+    if (selectedJobPendingWriter && fixture.selectedJobStarted && route.request().method() === 'GET' && url.pathname === '/api/jobs/fixture-selected-job') {
+      fixture.selectedJobDetailRequests.push(url.pathname)
+      return json(route, { id: 'fixture-selected-job', company: 'Fixture Systems', role: 'Systems Engineer', status: 'saved', description: 'Private detail fixture.' })
+    }
+    const hideRestoredJobFromList = selectedJobPendingWriter && fixture.selectedJobStarted
+    const jobs = selectedJobEnabled ? [
+      ...(!hideRestoredJobFromList ? [{ id: 'fixture-selected-job', company: 'Fixture Systems', role: 'Systems Engineer', status: 'saved' }] : []),
       ...(selectedJobTurnGateRegression ? [{ id: 'fixture-selected-job-next', company: 'Northstar Robotics', role: 'Principal Engineer', status: 'saved' }] : []),
-    ] : [],
-    total: selectedJobEnabled ? (selectedJobTurnGateRegression ? 2 : 1) : 0, page: 1, pageSize: 100, statusCounts: {},
-  }))
+    ] : []
+    if (url.searchParams.get('status') === 'saved') fixture.selectedJobListResponses.push(jobs.map(job => job.id))
+    return json(route, { jobs, total: jobs.length, page: 1, pageSize: 100, statusCounts: {} })
+  })
   await page.route('**/api/resume', route => json(route, []))
   await page.route('**/api/agent', route => json(route, { autoApply: false, requireApproval: true, isRunning: false }))
   await page.route('**/api/agent/roles', route => json(route, []))
@@ -257,7 +266,10 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false, 
       const selected = sessionId === SESSION_A
         ? turn(SESSION_A, TURN_A, selectedStatus, selectedStatus === 'completed' || selectedStatus === 'failed' ? null : STEP_A)
         : turn(SESSION_B, TURN_B, 'completed', null)
-      return json(route, { turns: [selected], projection: { activeTurnId: selected.status === 'completed' ? null : selected.id, activeTurn: selected.status === 'completed' ? null : { id: selected.id, status: selected.status, revision: selected.revision }, queuedInputCount: 0 } })
+      const preparationTurn = selectedJobPendingWriter && sessionId === SESSION_A && fixture.selectedJobStarted
+        ? { ...turn(SESSION_A, SELECTED_JOB_TURN_A, 'in_progress', null), selectedJobId: 'fixture-selected-job' }
+        : null
+      return json(route, { turns: preparationTurn ? [selected, preparationTurn] : [selected], projection: { activeTurnId: selected.status === 'completed' ? null : selected.id, activeTurn: selected.status === 'completed' ? null : { id: selected.id, status: selected.status, revision: selected.revision }, queuedInputCount: 0 } })
     }
     if (resource === 'tasks') {
       fixture.tasksQueryCount += 1
@@ -294,14 +306,33 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false, 
         })
         tasks.push({
           id: 'writer-fixture-draft', sessionId, turnId: 'fixture-preparation-turn', rootTaskId: 'selected-job-plan-root', parentTaskId: 'selected-job-plan-root',
-          role: 'writer', taskType: 'cover_letter_draft', status: fixture.selectedJobStarted ? 'completed' : 'queued', goal: 'Prepare the selected saved job', hasResult: fixture.selectedJobStarted,
-          ...(fixture.selectedJobStarted ? { artifactRef: { artifactId: 'fixture-cover-letter', version: 1, contentHash: `sha256:${'a'.repeat(64)}`, sourceDigest: `sha256:${'b'.repeat(64)}` } } : {}),
+          role: 'writer', taskType: 'cover_letter_draft', status: fixture.selectedJobStarted && !selectedJobPendingWriter ? 'completed' : 'queued', goal: 'Prepare the selected saved job', hasResult: fixture.selectedJobStarted && !selectedJobPendingWriter,
+          ...(fixture.selectedJobStarted && !selectedJobPendingWriter ? { artifactRef: { artifactId: 'fixture-cover-letter', version: 1, contentHash: `sha256:${'a'.repeat(64)}`, sourceDigest: `sha256:${'b'.repeat(64)}` } } : {}),
           updatedAt: times.updated,
         })
       }
       return json(route, { tasks })
     }
     if (resource === 'timeline') {
+      if (sessionId === SESSION_A && selectedJobPendingWriter) {
+        const items = [
+          item(SESSION_A, TURN_A, 'fixture-plan-a', 'Read the current session plan.', { type: 'plan', phase: 'commentary', content: { steps: [{ id: 'step-a', label: 'Inspect saved roles', status: 'queued' }] } }),
+          item(SESSION_A, TURN_A, 'fixture-tool-a', 'Read the saved roles.', { type: 'tool_call', phase: 'commentary', content: { toolCallId: 'call-a', toolName: 'jobs.search', input: { scope: 'saved roles' } } }),
+          item(SESSION_A, TURN_A, ITEM_A, 'The agent is executing the saved roles check.', { status: stageStatus() === 'completed' ? 'completed' : 'queued' }),
+        ]
+        if (fixture.selectedJobStarted) {
+          items.push(item(SESSION_A, SELECTED_JOB_TURN_A, 'fixture-selected-job-request', SELECTED_JOB_TEXT, {
+            stepId: null, type: 'user_message', sequence: '99', content: { parts: [{ type: 'text', text: SELECTED_JOB_TEXT }] },
+          }))
+          items.push(item(SESSION_A, SELECTED_JOB_TURN_A, 'fixture-selected-job-task-graph', 'Prepare Systems Engineer at Fixture Systems.', {
+            stepId: null, type: 'task_graph', taskId: 'selected-job-plan-root', revision: 4,
+            content: { schemaVersion: 'agent-harness.v2.task-graph', nodes: [
+              { key: 'cover-letter', templateId: 'writer', goal: 'Prepare Systems Engineer at Fixture Systems', successCriteria: ['Save a reviewable draft'], dependsOn: [], depth: 1, taskId: 'writer-fixture-draft' },
+            ] },
+          }))
+        }
+        return json(route, { items, approvalEvents: [] })
+      }
       if (sessionId === SESSION_A && selectedJobTurnGateRegression) {
         const items = [
           item(SESSION_A, TURN_A, 'fixture-plan-a', 'Read the current session plan.', { type: 'plan', phase: 'commentary', content: { steps: [{ id: 'step-a', label: 'Inspect saved roles', status: 'queued' }] } }),
@@ -683,6 +714,48 @@ test('selected-job preparation sends typed scope and restores the persisted draf
   await expect(page.locator('[data-agent-task-graph-plan="true"]')).toHaveCount(0)
 })
 
+test('refresh restores the selected saved job and its graph before the Writer artifact exists without leaking across sessions', async ({ page }, testInfo) => {
+  const fixture = await installSupervisorFixture(page, true, false, true)
+  const isZh = testInfo.project.name.includes('zh')
+  await page.goto('/agent-preview?supervisor=1&locale=' + (isZh ? 'zh' : 'en') + '&sessionId=' + SESSION_A)
+
+  const preparation = page.locator('[data-selected-job-preparation="true"]')
+  const savedJob = preparation.getByLabel(isZh ? '已保存的职位' : 'Saved job')
+  await expect(preparation).toBeVisible({ timeout: 20_000 })
+  await savedJob.selectOption('fixture-selected-job')
+  await expect.poll(() => fixture.selectedJobListResponses.length).toBeGreaterThan(0)
+  expect(fixture.selectedJobListResponses[0]).toContain('fixture-selected-job')
+  await preparation.getByRole('button', { name: isZh ? '准备草稿' : 'Prepare draft' }).click()
+  await expect.poll(() => fixture.selectedJobRequests.length).toBe(1)
+  await expect(page.locator('[data-agent-task-graph-plan="true"]')).toBeVisible({ timeout: 10_000 })
+  await expect(page.locator('[data-agent-task-graph-plan="true"]')).toContainText('Prepare Systems Engineer at Fixture Systems')
+  await expect(page.locator('[data-selected-job-draft="true"]')).toHaveCount(0)
+
+  await page.reload()
+  await expect.poll(() => fixture.selectedJobDetailRequests.length, { timeout: 20_000 }).toBe(1)
+  expect(fixture.selectedJobDetailRequests).toEqual(['/api/jobs/fixture-selected-job'])
+  await expect.poll(() => fixture.selectedJobListResponses.length).toBeGreaterThan(1)
+  expect(fixture.selectedJobListResponses[fixture.selectedJobListResponses.length - 1]).not.toContain('fixture-selected-job')
+  const restoredPreparation = page.locator('[data-selected-job-preparation="true"]')
+  const restoredSavedJob = restoredPreparation.getByLabel(isZh ? '已保存的职位' : 'Saved job')
+  await expect(restoredSavedJob).toHaveValue('fixture-selected-job', { timeout: 20_000 })
+  await expect(restoredSavedJob.locator('option:checked')).toContainText('Fixture Systems · Systems Engineer')
+  const restoredPlan = page.locator('[data-agent-task-graph-plan="true"]')
+  await expect(restoredPlan).toBeVisible({ timeout: 10_000 })
+  await expect(restoredPlan).toContainText('Prepare Systems Engineer at Fixture Systems')
+  await expect(page.locator('[data-selected-job-draft="true"]')).toHaveCount(0)
+
+  if ((await page.evaluate(() => window.innerWidth)) <= 900) await page.getByRole('button', { name: isZh ? '对话' : 'Conversations', exact: true }).click()
+  await page.getByText('B session evidence', { exact: true }).click()
+  await expect(restoredSavedJob).toHaveValue('', { timeout: 10_000 })
+  await expect(page.locator('[data-agent-task-graph-plan="true"]')).toHaveCount(0)
+  await expect(page.locator('[data-selected-job-draft="true"]')).toHaveCount(0)
+
+  if ((await page.evaluate(() => window.innerWidth)) <= 900) await page.getByRole('button', { name: isZh ? '对话' : 'Conversations', exact: true }).click()
+  await page.getByText('Inspect saved roles', { exact: true }).click()
+  await expect(page.locator('[data-selected-job-preparation="true"]').getByLabel(isZh ? '已保存的职位' : 'Saved job')).toHaveValue('fixture-selected-job', { timeout: 10_000 })
+  await expect(page.locator('[data-agent-task-graph-plan="true"]')).toContainText('Prepare Systems Engineer at Fixture Systems')
+})
 test('a newer selected-job Turn hides the prior plan and draft until its graph arrives, while ordinary chat keeps them visible', async ({ page }, testInfo) => {
   const fixture = await installSupervisorFixture(page, true, true)
   const isZh = testInfo.project.name.includes('zh')

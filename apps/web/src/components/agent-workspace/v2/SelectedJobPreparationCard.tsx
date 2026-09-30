@@ -7,20 +7,23 @@ import { useI18n } from '@/lib/i18n'
 
 import { createSelectedJobPreparationMessageId, postSelectedJobPreparation } from './selected-job-preparation-action'
 
-interface SavedJob { readonly id: string; readonly company: string; readonly role: string }
+interface SavedJob { readonly id: string; readonly company: string; readonly role: string; readonly eligibleForPreparation: boolean }
 interface JobsResponse { readonly jobs?: unknown }
 interface ScopedValue<T> { readonly scope: string; readonly value: T }
+interface RestoredJobLookup { readonly job: SavedJob | null; readonly loading: boolean }
 
-export function SelectedJobPreparationCard({ sessionId, onAccepted }: { readonly sessionId: string; readonly onAccepted: (turnId: string, sequence: string) => void }) {
+export function SelectedJobPreparationCard({ sessionId, restoredJobId, onAccepted }: { readonly sessionId: string; readonly restoredJobId?: string | null; readonly onAccepted: (turnId: string, sequence: string) => void }) {
   const { data: authSession, status: authStatus } = useSession()
   const { lang } = useI18n()
   const userId = authStatus === 'authenticated' ? authSession?.user?.id ?? null : null
   const scope = `${userId ?? 'anonymous'}:${sessionId}`
   const [jobsState, setJobsState] = useState<ScopedValue<{ jobs: SavedJob[]; error: boolean; loading: boolean }> | null>(null)
   const [selection, setSelection] = useState<ScopedValue<string> | null>(null)
+  const [restoredJobState, setRestoredJobState] = useState<ScopedValue<RestoredJobLookup> | null>(null)
   const [pending, setPending] = useState<ScopedValue<boolean> | null>(null)
   const [feedback, setFeedback] = useState<ScopedValue<'accepted' | 'failed' | 'conflict'> | null>(null)
   const idsRef = useRef(new Map<string, string>())
+  const restoredLookupsRef = useRef(new Set<string>())
   const epochRef = useRef(0)
   const previousScopeRef = useRef(scope)
   if (previousScopeRef.current !== scope) {
@@ -46,16 +49,48 @@ export function SelectedJobPreparationCard({ sessionId, onAccepted }: { readonly
     return () => controller.abort()
   }, [scope, sessionId, userId])
 
-  const jobs = jobsState?.scope === scope ? jobsState.value.jobs : []
-  const loadingJobs = jobsState?.scope !== scope || jobsState.value.loading
-  const jobsError = jobsState?.scope === scope && jobsState.value.error
-  const selectedJobId = selection?.scope === scope ? selection.value : ''
+  const jobListState = scopedValueForKey(jobsState, scope)
+  const pageJobs = jobListState?.jobs ?? []
+  const restoredJobKey = restoredJobScopeKey(userId, sessionId, restoredJobId)
+  const restoredJobLookup = scopedValueForKey(restoredJobState, restoredJobKey)
+  const restoredJob = restoredJobLookup?.job ?? null
+  const shouldRestoreSelectedJob = Boolean(userId && sessionId && jobListState && !jobListState.loading && !jobListState.error
+    && shouldLoadRestoredJob(pageJobs, restoredJobId))
+  const restoreRequestPending = shouldRestoreSelectedJob && (!restoredJobLookup || restoredJobLookup.loading)
+  const jobs = restoredJob && !pageJobs.some(job => job.id === restoredJob.id) ? [...pageJobs, restoredJob] : pageJobs
+  const loadingJobs = !jobListState || jobListState.loading || restoreRequestPending
+  const jobsError = jobListState?.error ?? false
+  const candidateJobId = selection?.scope === scope ? selection.value : restoredJobId ?? ''
+  const selectedJob = jobs.find(job => job.id === candidateJobId) ?? null
+  const selectedJobId = selectedJob?.id ?? ''
   const isPending = pending?.scope === scope && pending.value
   const currentFeedback = feedback?.scope === scope ? feedback.value : null
+  useEffect(() => {
+    if (!shouldRestoreSelectedJob || !restoredJobId || !restoredJobKey || restoredLookupsRef.current.has(restoredJobKey)) return
+    const controller = new AbortController()
+    let settled = false
+    restoredLookupsRef.current.add(restoredJobKey)
+    setRestoredJobState({ scope: restoredJobKey, value: { job: null, loading: true } })
+    void fetchRestoredSavedJob(restoredJobId, controller.signal)
+      .then(job => {
+        if (controller.signal.aborted) return
+        settled = true
+        setRestoredJobState({ scope: restoredJobKey, value: { job, loading: false } })
+      })
+      .catch(() => {
+        if (controller.signal.aborted) return
+        settled = true
+        setRestoredJobState({ scope: restoredJobKey, value: { job: null, loading: false } })
+      })
+    return () => {
+      controller.abort()
+      if (!settled) restoredLookupsRef.current.delete(restoredJobKey)
+    }
+  }, [restoredJobId, restoredJobKey, shouldRestoreSelectedJob, userId, sessionId])
   const copy = localized(lang)
 
   const startPreparation = useCallback(() => {
-    if (!selectedJobId || isPending) return
+    if (!selectedJob?.eligibleForPreparation || isPending) return
     const epoch = epochRef.current
     const target = `${scope}:${selectedJobId}`
     const clientMessageId = idsRef.current.get(target) ?? createSelectedJobPreparationMessageId()
@@ -73,7 +108,7 @@ export function SelectedJobPreparationCard({ sessionId, onAccepted }: { readonly
     }).finally(() => {
       if (epoch === epochRef.current) setPending({ scope, value: false })
     })
-  }, [isPending, onAccepted, scope, selectedJobId, sessionId])
+  }, [isPending, onAccepted, scope, selectedJob, selectedJobId, sessionId])
 
   return (
     <section aria-label={copy.title} data-selected-job-preparation="true" style={sectionStyle}>
@@ -86,7 +121,7 @@ export function SelectedJobPreparationCard({ sessionId, onAccepted }: { readonly
           {jobs.map(job => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}
         </select>
       </label>
-      <button type="button" onClick={startPreparation} disabled={!selectedJobId || loadingJobs || jobsError || isPending} style={buttonStyle}>
+      <button type="button" onClick={startPreparation} disabled={!selectedJob?.eligibleForPreparation || loadingJobs || jobsError || isPending} style={buttonStyle}>
         {isPending ? copy.starting : copy.start}
       </button>
       {currentFeedback === 'accepted' && <p role="status" style={hintStyle}>{copy.accepted}</p>}
@@ -96,12 +131,34 @@ export function SelectedJobPreparationCard({ sessionId, onAccepted }: { readonly
   )
 }
 
+export function shouldLoadRestoredJob(pageJobs: readonly SavedJob[], restoredJobId: string | null | undefined): boolean {
+  return safeText(restoredJobId, 256) && !pageJobs.some(job => job.id === restoredJobId)
+}
+
+export function restoredJobScopeKey(userId: string | null, sessionId: string, jobId: string | null | undefined): string | null {
+  if (!userId || !sessionId || !safeText(jobId, 256)) return null
+  return JSON.stringify([userId, sessionId, jobId])
+}
+
+export function scopedValueForKey<T>(state: { readonly scope: string; readonly value: T } | null, key: string | null): T | null {
+  return key && state?.scope === key ? state.value : null
+}
+
+export async function fetchRestoredSavedJob(jobId: string, signal: AbortSignal): Promise<SavedJob | null> {
+  const response = await fetch('/api/jobs/' + encodeURIComponent(jobId), { signal, cache: 'no-store' })
+  const body = await response.json().catch(() => null) as unknown
+  if (!response.ok) return null
+  const row = record(body)
+  if (row.id !== jobId || !safeText(row.company, 160) || !safeText(row.role, 160)) return null
+  return { id: jobId, company: row.company, role: row.role, eligibleForPreparation: row.status === 'saved' }
+}
+
 function parseSavedJobs(value: unknown): SavedJob[] {
   if (!Array.isArray(value)) return []
   return value.slice(0, 100).flatMap(entry => {
     const row = record(entry)
     if (row.status !== 'saved' || !safeText(row.id, 256) || !safeText(row.company, 160) || !safeText(row.role, 160)) return []
-    return [{ id: row.id, company: row.company, role: row.role }]
+    return [{ id: row.id, company: row.company, role: row.role, eligibleForPreparation: true }]
   })
 }
 
