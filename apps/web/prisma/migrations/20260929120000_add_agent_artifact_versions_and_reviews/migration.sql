@@ -101,6 +101,12 @@ CREATE TRIGGER "agent_artifact_review_immutable"
 
 ALTER TABLE "agent_artifact_version" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "agent_artifact_review" ENABLE ROW LEVEL SECURITY;
+CREATE OR REPLACE FUNCTION app_current_user_id()
+RETURNS text
+LANGUAGE sql
+STABLE
+AS $$ SELECT NULLIF(current_setting('app.user_id', true), '') $$;
+
 CREATE POLICY "candidate_agent_artifact_version_isolation" ON "agent_artifact_version"
   USING ("userId" = app_current_user_id())
   WITH CHECK ("userId" = app_current_user_id());
