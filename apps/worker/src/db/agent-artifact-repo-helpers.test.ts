@@ -1,7 +1,10 @@
 import { describe, expect, it, vi } from "vitest"
 import type { Pool } from "pg"
 
-import { artifactTaskFenceIsCurrent, artifactTaskLeaseIsLive, type AgentArtifactTaskFence } from "./agent-artifact-repo-helpers.js"
+import {
+  artifactTaskFenceIsCurrent, artifactTaskLeaseIsLive, AgentArtifactRepositoryError,
+  toAgentArtifactReviewRow, toAgentArtifactRow, toAgentArtifactVersionRow, type AgentArtifactTaskFence,
+} from "./agent-artifact-repo-helpers.js"
 
 const fence: AgentArtifactTaskFence = {
   taskId: "task-a", userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "root-a",
@@ -17,6 +20,43 @@ function clientWith(rows: Array<{ readonly id: string } | { readonly live: boole
 }
 
 describe("selected-job artifact task fence helpers", () => {
+  it("maps artifact rows and rejects invalid database lifecycle records", () => {
+    const createdAt = new Date("2026-09-30T00:00:00.000Z")
+    expect(toAgentArtifactRow({
+      id: "artifact-1", userId: "user-1", jobId: "job-1", artifactType: "cover_letter", lifecycle: "draft",
+      baseId: "base-1", baseHash: "base-hash", content: { private: true }, hash: "draft-hash", constraintHash: "constraints",
+      provenanceRefs: ["source-1", 3], evidenceRefs: ["evidence-1"], previousHash: null, version: "2",
+      createdAt, updatedAt: createdAt,
+    })).toMatchObject({
+      id: "artifact-1", lifecycle: "draft", version: 2, provenanceRefs: ["source-1"], evidenceRefs: ["evidence-1"],
+      createdAt, updatedAt: createdAt,
+    })
+    let invalidArtifact: unknown
+    try { toAgentArtifactRow({ lifecycle: "unknown" }) } catch (error: unknown) { invalidArtifact = error }
+    expect(invalidArtifact).toBeInstanceOf(AgentArtifactRepositoryError)
+    expect(invalidArtifact).toMatchObject({ code: "precondition_failed" })
+  })
+
+  it("maps version and review persistence rows while validating review status", () => {
+    const createdAt = new Date("2026-09-30T00:00:00.000Z")
+    expect(toAgentArtifactVersionRow({
+      id: "version-1", artifactId: "artifact-1", version: "3", userId: "user-1", sessionId: "session-1", jobId: "job-1",
+      artifactType: "cover_letter", content: "draft", contentHash: "content-hash", sourceDigest: "source-digest",
+      constraintHash: "constraints", provenanceRefs: ["source-1"], evidenceRefs: ["evidence-1"], baseId: "base-1",
+      baseHash: "base-hash", previousHash: null, taskId: "task-1", toolCallId: "call-1", requestHash: "request-hash", createdAt,
+    })).toMatchObject({ artifactId: "artifact-1", version: 3, taskId: "task-1", createdAt })
+    expect(toAgentArtifactReviewRow({
+      id: "review-1", artifactVersionId: "version-1", userId: "user-1", sessionId: "session-1", jobId: "job-1",
+      artifactId: "artifact-1", version: "3", contentHash: "content-hash", sourceDigest: "source-digest",
+      currentSourceDigest: "source-digest", status: "stale", findings: [], evidenceRefs: [], taskId: "task-2",
+      toolCallId: "review-call", requestHash: "request-hash", reviewHash: "review-hash", createdAt,
+    })).toMatchObject({ status: "stale", version: 3, findings: [], evidenceRefs: [], createdAt })
+    let invalidReview: unknown
+    try { toAgentArtifactReviewRow({ status: "unknown" }) } catch (error: unknown) { invalidReview = error }
+    expect(invalidReview).toBeInstanceOf(AgentArtifactRepositoryError)
+    expect(invalidReview).toMatchObject({ code: "precondition_failed" })
+  })
+
   it("locks the task lineage and permits legitimate waiting Turn and parent states", async () => {
     const client = clientWith([{ id: "task-a" }, { id: "parent-a" }])
     await expect(artifactTaskFenceIsCurrent(client as unknown as Pick<Pool, "query">, fence, "job-a")).resolves.toBe(true)

@@ -4,6 +4,7 @@ import {
   materializeTaskGraphDependencyContext,
   TASK_GRAPH_DEPENDENCY_CONTEXT_BYTE_LIMIT,
   TASK_GRAPH_DEPENDENCY_RESULT_BYTE_LIMIT,
+  writerArtifactReferenceFromTaskContext,
   type ScopedDependencyResult,
 } from "./task-graph-dependency-context.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./task-graph-command-port.js"
@@ -37,7 +38,54 @@ function manyScoutResult(count: number): Record<string, unknown> {
   return { ...scoutResult, candidates, evidence }
 }
 
+const writerArtifactRef = {
+  artifactId: "artifact-1",
+  version: 2,
+  contentHash: `sha256:${"a".repeat(64)}`,
+  sourceDigest: `sha256:${"b".repeat(64)}`,
+}
+
+function writerProjection(artifactRef: unknown = writerArtifactRef): Record<string, unknown> {
+  return {
+    schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA,
+    trust: "untrusted",
+    availability: "available",
+    role: "writer",
+    status: "completed",
+    artifactRef,
+  }
+}
+
+function reviewerTaskContext(items: unknown[]): Record<string, unknown> {
+  return {
+    selectedJobPreparation: { jobId: "job-1" },
+    taskGraphDependencyResults: {
+      schemaVersion: "agent-harness.v2.task-graph.dependency-evidence",
+      items,
+    },
+  }
+}
+
+function writerDependency(result: unknown = writerProjection()): Record<string, unknown> {
+  return { dependencyKey: "writer-task", role: "writer", taskStatus: "completed", result }
+}
+
 describe("TaskGraph dependency result context", () => {
+  it("resolves the exact completed Writer artifact reference for the selected job", () => {
+    expect(writerArtifactReferenceFromTaskContext(reviewerTaskContext([writerDependency()]), "job-1"))
+      .toEqual(writerArtifactRef)
+  })
+
+  it.each([
+    ["missing graph context", { selectedJobPreparation: { jobId: "job-1" } }, "job-1", "task_graph_reviewer_writer_dependency_missing"],
+    ["missing Writer item", reviewerTaskContext([]), "job-1", "task_graph_reviewer_writer_dependency_missing"],
+    ["duplicate Writer items", reviewerTaskContext([writerDependency(), writerDependency()]), "job-1", "task_graph_reviewer_writer_dependency_missing"],
+    ["selected job mismatch", reviewerTaskContext([writerDependency()]), "job-2", "task_graph_reviewer_writer_dependency_missing"],
+    ["malformed artifact digest", reviewerTaskContext([writerDependency({ ...writerProjection(), artifactRef: { ...writerArtifactRef, contentHash: "sha256:invalid" } })]), "job-1", "task_graph_reviewer_writer_dependency_invalid"],
+  ])("fails closed for %s", (_label, context, expectedJobId, error) => {
+    expect(() => writerArtifactReferenceFromTaskContext(context, expectedJobId as string)).toThrow(error as string)
+  })
+
   it("projects only a scoped completed direct result, keeps deterministic counts, and removes URLs and freeform names", () => {
     const context = materializeTaskGraphDependencyContext({ query: "Dublin" }, scope, ["source"], [dependency()]) as Record<string, unknown>
     const evidence = context.taskGraphDependencyResults as Record<string, unknown>

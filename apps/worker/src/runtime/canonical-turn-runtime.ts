@@ -1,5 +1,4 @@
 import type pg from "pg"
-import type { ModelAdapter } from "@jobcopilot/agent-model"
 import type { PolicyRole } from "@jobcopilot/agent-protocol"
 import type { PolicyEngine } from "@jobcopilot/agent-policy"
 import { loadWorkerAiConfig, type AiConfig } from "@jobcopilot/shared/llm"
@@ -34,11 +33,10 @@ import { noopCanonicalExecutionProjection, type CanonicalExecutionProjection } f
 import { noopCanonicalSessionProjection, type CanonicalSessionProjection } from "./canonical-session-projection.js"
 import type { ProductionAgentFlags } from "./production-agent-flags.js"
 import { assertCanonicalCoordinationSurface, classifyToolCallRecovery, durableLifecycleSink, isResumableRootResult } from "./turns/canonical-runtime-tool-recovery.js"
+import { defaultAuthorization, modelWithUsage, type UsageAuthorizer } from "./canonical-turn-runtime-model.js"
 
 export { durableLifecycleSink } from "./turns/canonical-runtime-tool-recovery.js"
-export type UsageAuthorization = {
-  settle(input: { status: "success" | "error"; inputTokens: number; outputTokens: number; estimatedCostUsd: number; errorCode?: string }): Promise<void> | void
-}
+export type { UsageAuthorization } from "./canonical-turn-runtime-model.js"
 export type CanonicalTurnRuntimeOptions = {
   readonly workerId: string
   /** One server-owned activation contract for production route capabilities. */
@@ -50,7 +48,7 @@ export type CanonicalTurnRuntimeOptions = {
   /** Test seam for the server-owned Turn input selector; production uses the lease-fenced database loader. */
   readonly selectedJobPreparationLoader?: (pool: Pick<pg.Pool, "connect">, lease: TurnLease, now: Date) => Promise<SelectedJobPreparation | undefined>
   readonly modelRuntimeFactory?: (input: { userId: string; config?: AiConfig; state: CanonicalTurnState }) => Promise<HarnessModelRuntime> | HarnessModelRuntime
-  readonly authorizeUsage?: (input: { userId: string; sessionId: string; turnId: string; stepId: string; leaseOwnerId: string; leaseVersion: number; featureKey: string; provider: string; model: string }) => Promise<UsageAuthorization> | UsageAuthorization
+  readonly authorizeUsage?: UsageAuthorizer
   /** Server-owned scheduler and trusted template registry; model input never supplies its task/tenant fence. */
   readonly taskGraphCommandPort?: TaskGraphCommandPort
   readonly taskGraphTemplates?: Readonly<Record<string, TaskGraphTaskTemplate>>
@@ -71,70 +69,6 @@ function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
 }
 
-function modelWithUsage(runtime: HarnessModelRuntime, lease: TurnLease, authorize: NonNullable<CanonicalTurnRuntimeOptions["authorizeUsage"]>): ModelAdapter {
-  const adapter = runtime.adapter
-  return {
-    ...adapter,
-    async *stream(request) {
-      const stepId = typeof request.metadata.stepId === "string" ? request.metadata.stepId : "unknown-step"
-      const reservation = await authorize({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, stepId, leaseOwnerId: lease.ownerId, leaseVersion: lease.leaseVersion, featureKey: "autoApply", provider: adapter.profile.provider, model: adapter.profile.model })
-      let settled = false
-      const settle = async (input: Parameters<UsageAuthorization["settle"]>[0]): Promise<void> => {
-        if (settled) return
-        settled = true
-        await reservation.settle(input)
-      }
-      let inputTokens = 0
-      let outputTokens = 0
-      let estimatedCostUsd = 0
-      try {
-        for await (const event of adapter.stream(request)) {
-          if (event.type === "usage") {
-            inputTokens = event.inputTokens
-            outputTokens = event.outputTokens
-            estimatedCostUsd = event.estimatedCostUsd ?? 0
-          }
-          yield event
-        }
-        await settle({ status: "success", inputTokens, outputTokens, estimatedCostUsd })
-      } catch (error: unknown) {
-        await Promise.resolve(settle({ status: "error", inputTokens, outputTokens, estimatedCostUsd, errorCode: modelErrorCode(error) })).catch(() => undefined)
-        throw error
-      }
-    },
-    ...(adapter.complete ? {
-      async complete(request: Parameters<NonNullable<ModelAdapter["complete"]>>[0]) {
-        const stepId = typeof request.metadata.stepId === "string" ? request.metadata.stepId : "unknown-step"
-        const reservation = await authorize({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, stepId, leaseOwnerId: lease.ownerId, leaseVersion: lease.leaseVersion, featureKey: "autoApply", provider: adapter.profile.provider, model: adapter.profile.model })
-        let settled = false
-        const settle = async (input: Parameters<UsageAuthorization["settle"]>[0]): Promise<void> => {
-          if (settled) return
-          settled = true
-          await reservation.settle(input)
-        }
-        try {
-          const result = await adapter.complete!(request)
-          await settle({ status: "success", inputTokens: result.usage?.inputTokens ?? 0, outputTokens: result.usage?.outputTokens ?? 0, estimatedCostUsd: result.usage?.estimatedCostUsd ?? 0 })
-          return result
-        } catch (error: unknown) {
-          await Promise.resolve(settle({ status: "error", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, errorCode: modelErrorCode(error) })).catch(() => undefined)
-          throw error
-        }
-      },
-    } : {}),
-  }
-}
-
-function modelErrorCode(error: unknown): string {
-  if (error && typeof error === "object" && "code" in error && typeof error.code === "string" && error.code.trim()) return error.code
-  return "model_error"
-}
-
-function defaultAuthorization(): never {
-  const error = new Error("usage_authorization_unavailable")
-  Object.assign(error, { code: "usage_authorization_unavailable" })
-  throw error
-}
 export async function createCanonicalTurnRuntime(pool: pg.Pool, options: CanonicalTurnRuntimeOptions): Promise<{
   execute: TurnExecutor
   manager: AgentTreeManager

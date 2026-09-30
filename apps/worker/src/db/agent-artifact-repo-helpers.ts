@@ -12,6 +12,79 @@ export type AgentArtifactTaskFence = {
   readonly attemptCount: number
 }
 
+export type AgentArtifactLifecycle = "base" | "draft"
+
+export type AgentArtifactRow = { readonly id: string; readonly userId: string; readonly jobId: string; readonly artifactType: string; readonly lifecycle: AgentArtifactLifecycle; readonly baseId: string | null; readonly baseHash: string | null; readonly content: unknown; readonly hash: string; readonly constraintHash: string; readonly provenanceRefs: string[]; readonly evidenceRefs: string[]; readonly previousHash: string | null; readonly version: number; readonly createdAt: Date; readonly updatedAt: Date }
+
+export type AgentArtifactVersionRow = {
+  readonly id: string; readonly artifactId: string; readonly version: number; readonly userId: string; readonly sessionId: string; readonly jobId: string; readonly artifactType: string; readonly content: unknown
+  readonly contentHash: string; readonly sourceDigest: string; readonly constraintHash: string; readonly provenanceRefs: string[]; readonly evidenceRefs: string[]; readonly baseId: string; readonly baseHash: string
+  readonly previousHash: string | null; readonly taskId: string; readonly toolCallId: string; readonly requestHash: string; readonly createdAt: Date
+}
+
+export type AgentArtifactReviewRow = {
+  readonly id: string; readonly artifactVersionId: string; readonly userId: string; readonly sessionId: string; readonly jobId: string; readonly artifactId: string; readonly version: number
+  readonly contentHash: string; readonly sourceDigest: string; readonly currentSourceDigest: string; readonly status: "passed" | "needs_revision" | "rejected" | "stale"; readonly findings: unknown; readonly evidenceRefs: string[]
+  readonly taskId: string; readonly toolCallId: string; readonly requestHash: string; readonly reviewHash: string; readonly createdAt: Date
+}
+
+export type AgentArtifactBaseInsert = { readonly id: string; readonly userId: string; readonly jobId: string; readonly artifactType: string; readonly content: unknown; readonly hash: string; readonly constraintHash: string; readonly provenanceRefs: readonly string[]; readonly evidenceRefs: readonly string[] }
+
+export type AgentArtifactDraftWrite = AgentArtifactBaseInsert & { readonly sessionId: string; readonly baseId: string; readonly baseHash: string; readonly previousHash: string | null; readonly sourceDigest: string; readonly taskId: string; readonly toolCallId: string; readonly requestHash: string; readonly taskFence: AgentArtifactTaskFence; readonly expectedPreviousHash?: string | null }
+
+export type AgentArtifactReviewWrite = { readonly userId: string; readonly sessionId: string; readonly jobId: string; readonly artifactId: string; readonly version: number; readonly contentHash: string; readonly sourceDigest: string; readonly currentSourceDigest: string; readonly status: AgentArtifactReviewRow["status"]; readonly findings: unknown; readonly evidenceRefs: readonly string[]; readonly taskId: string; readonly toolCallId: string; readonly requestHash: string; readonly reviewHash: string; readonly taskFence: AgentArtifactTaskFence }
+
+export class AgentArtifactRepositoryError extends Error {
+  constructor(readonly code: "not_found" | "stale_hash" | "invalid_provenance" | "precondition_failed" | "receipt_conflict" | "stale_source" | "task_fence_denied", message: string) {
+    super(message)
+    this.name = "AgentArtifactRepositoryError"
+  }
+}
+
+function strings(value: unknown): string[] { return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [] }
+function date(value: unknown): Date { return value instanceof Date ? value : new Date(String(value)) }
+
+export function toAgentArtifactRow(row: Record<string, unknown>): AgentArtifactRow {
+  const lifecycle = row.lifecycle === "base" || row.lifecycle === "draft" ? row.lifecycle : null
+  if (!lifecycle || typeof row.id !== "string" || typeof row.userId !== "string" || typeof row.jobId !== "string" || typeof row.artifactType !== "string" || typeof row.hash !== "string" || typeof row.constraintHash !== "string") {
+    throw new AgentArtifactRepositoryError("precondition_failed", "The database returned an invalid artifact record.")
+  }
+  return {
+    id: row.id, userId: row.userId, jobId: row.jobId, artifactType: row.artifactType, lifecycle,
+    baseId: typeof row.baseId === "string" ? row.baseId : null,
+    baseHash: typeof row.baseHash === "string" ? row.baseHash : null,
+    content: row.content, hash: row.hash, constraintHash: row.constraintHash,
+    provenanceRefs: strings(row.provenanceRefs), evidenceRefs: strings(row.evidenceRefs),
+    previousHash: typeof row.previousHash === "string" ? row.previousHash : null,
+    version: typeof row.version === "number" ? row.version : Number(row.version),
+    createdAt: date(row.createdAt), updatedAt: date(row.updatedAt),
+  }
+}
+
+export function toAgentArtifactVersionRow(row: Record<string, unknown>): AgentArtifactVersionRow {
+  return {
+    id: String(row.id), artifactId: String(row.artifactId), version: Number(row.version), userId: String(row.userId),
+    sessionId: String(row.sessionId), jobId: String(row.jobId), artifactType: String(row.artifactType), content: row.content,
+    contentHash: String(row.contentHash), sourceDigest: String(row.sourceDigest), constraintHash: String(row.constraintHash),
+    provenanceRefs: strings(row.provenanceRefs), evidenceRefs: strings(row.evidenceRefs), baseId: String(row.baseId),
+    baseHash: String(row.baseHash), previousHash: typeof row.previousHash === "string" ? row.previousHash : null,
+    taskId: String(row.taskId), toolCallId: String(row.toolCallId), requestHash: String(row.requestHash), createdAt: date(row.createdAt),
+  }
+}
+
+export function toAgentArtifactReviewRow(row: Record<string, unknown>): AgentArtifactReviewRow {
+  if (row.status !== "passed" && row.status !== "needs_revision" && row.status !== "rejected" && row.status !== "stale") {
+    throw new AgentArtifactRepositoryError("precondition_failed", "The database returned an invalid artifact review.")
+  }
+  return {
+    id: String(row.id), artifactVersionId: String(row.artifactVersionId), userId: String(row.userId), sessionId: String(row.sessionId),
+    jobId: String(row.jobId), artifactId: String(row.artifactId), version: Number(row.version), contentHash: String(row.contentHash),
+    sourceDigest: String(row.sourceDigest), currentSourceDigest: String(row.currentSourceDigest), status: row.status, findings: row.findings, evidenceRefs: strings(row.evidenceRefs),
+    taskId: String(row.taskId), toolCallId: String(row.toolCallId), requestHash: String(row.requestHash),
+    reviewHash: String(row.reviewHash), createdAt: date(row.createdAt),
+  }
+}
+
 const TERMINAL_TURN = "('completed', 'failed', 'interrupted', 'cancelled')"
 const TERMINAL_TASK = "('completed', 'failed', 'interrupted', 'cancelled', 'closed')"
 const CURRENT_TASK = `SELECT task."id" FROM "sub_agent_tasks" AS task
