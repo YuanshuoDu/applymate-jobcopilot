@@ -142,6 +142,26 @@ jobs:
           AGENT_TURN_REDIS_TEST_DISPOSABLE: "true"
           REDIS_URL: redis://127.0.0.1:6379/15
         run: pnpm --filter @jobcopilot/worker exec vitest run src/queue/production-bootstrap-process-restart.integration.test.ts
+      - name: Verify disconnected Worker event replay through the authenticated SSE route
+        env:
+          CI: "true"
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+          PLATFORM_ENV: development
+          AGENT_TURN_REDIS_TEST_URL: redis://127.0.0.1:6379/15
+          AGENT_TURN_REDIS_TEST_DISPOSABLE: "true"
+          REDIS_URL: redis://127.0.0.1:6379/15
+          AGENT_WORKER_SSE_TRACE_ARTIFACT_PATH: ${{ runner.temp }}/phase5-worker-sse-reconnect.json
+        run: pnpm --filter @jobcopilot/web exec vitest run "src/app/api/agent/sessions/[id]/events/route.worker-reconnect.integration.test.ts"
+      - name: Upload redacted Worker-to-SSE reconnect trace
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase5-worker-sse-reconnect
+          path: ${{ runner.temp }}/phase5-worker-sse-reconnect.json
+          if-no-files-found: warn
       - name: Verify dispatch and claim lock order on disposable PostgreSQL
         env:
           AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
