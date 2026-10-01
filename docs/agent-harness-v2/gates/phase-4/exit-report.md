@@ -1,4 +1,4 @@
-# Phase 4 Exit Report — Owner-Waiver Activation
+# Phase 4 Exit Report — Requested Phase 5 Decision
 
 **Report status:** Draft for Claude/PM §1.8 review; #387 and Phase 5 activation remain blocked until the PM decision is recorded.
 
