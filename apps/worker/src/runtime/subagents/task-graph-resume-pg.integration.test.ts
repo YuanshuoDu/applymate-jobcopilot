@@ -4394,6 +4394,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       coordinationEnabled: true,
       consumeWaitOutcomes: true,
       canonicalAutomationEnabled: false,
+      turnBoundaryCompactionEnabled: false,
     }
     let rootRuntimeExecutions = 0
     let resumedGraphReachedModel = false
@@ -5468,6 +5469,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       coordinationEnabled: true,
       consumeWaitOutcomes: true,
       canonicalAutomationEnabled: false,
+      turnBoundaryCompactionEnabled: false,
     }
     let rootRuntimeExecutions = 0
     let descendantExecuted = false
@@ -5741,6 +5743,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       coordinationEnabled: true,
       consumeWaitOutcomes: true,
       canonicalAutomationEnabled: false,
+      turnBoundaryCompactionEnabled: false,
     }
     const closePlanCallId = "p3-closed-source-plan"
     const closeWaitCallId = "p3-closed-source-wait"

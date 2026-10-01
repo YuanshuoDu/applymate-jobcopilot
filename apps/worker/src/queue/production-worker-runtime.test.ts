@@ -56,6 +56,7 @@ describe("production Worker runtime composition", () => {
       coordinationEnabled: true,
       consumeWaitOutcomes: true,
       canonicalAutomationEnabled: true,
+      turnBoundaryCompactionEnabled: false,
     }
     const fixture = dependencies()
     const workerId = "worker_fixture"
@@ -102,6 +103,7 @@ describe("production Worker runtime composition", () => {
       coordinationEnabled: false,
       consumeWaitOutcomes: false,
       canonicalAutomationEnabled: false,
+      turnBoundaryCompactionEnabled: false,
     }
     const fixture = dependencies()
 

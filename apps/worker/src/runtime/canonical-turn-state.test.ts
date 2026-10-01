@@ -35,7 +35,13 @@ function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unk
       const filtered = sql.includes('item_task') ? (rows.items ?? []).filter(item => item.taskId === undefined || item.taskId === null || item.taskId === "root-1") : (rows.items ?? []).filter(item => item.taskId === undefined || item.taskId === null || item.taskId === values?.[2])
       return { rows: filtered, rowCount: filtered.length }
     }
-    if (sql.includes('FROM "agent_context_snapshots"')) return { rows: rows.snapshots ?? [], rowCount: rows.snapshots?.length ?? 0 }
+    if (sql.includes('FROM "agent_context_snapshots"')) {
+      const snapshots = rows.snapshots ?? []
+      const selected = sql.includes('WHERE snapshot."id" = $1')
+        ? snapshots.filter(snapshot => snapshot.id === values?.[0])
+        : snapshots
+      return { rows: selected, rowCount: selected.length }
+    }
     if (sql.includes('FROM "agent_inputs"')) return { rows: rows.inputs ?? [], rowCount: rows.inputs?.length ?? 0 }
     return { rows: [], rowCount: 0 }
   }), release: vi.fn() }
@@ -184,11 +190,43 @@ describe("loadCanonicalTurnState", () => {
       } }],
     })
     const value = await loadCanonicalTurnState(fake, lease)
+    expect(value.contextSnapshotPinned).toBe(false)
     expect(value.snapshot.steerHistory).toEqual([
       { id: "snapshot-history", content: "Compacted history" },
       { id: "history:user:new-input", content: { role: "user", text: "Use Dublin" } },
       { id: "history:assistant:new-agent", content: { role: "assistant", text: "Current reply" } },
     ])
+  })
+
+  it("keeps an explicitly pinned snapshot and reports its pin without changing cursor-tail restore", async () => {
+    const pinnedContent = {
+      schemaVersion: "agent-harness.context.v1", ownerId: "user-1", sessionId: "session-1", throughSequence: "4", goal: "Continue",
+      userConstraints: [], confirmedDecisions: [], completedWork: [], openWork: [], pendingApprovals: [], artifacts: [], facts: [], failedAttempts: [], references: [], consumedInputIds: [],
+      context: { system: [], profile: [], steerHistory: [{ id: "pinned-history", content: "Pinned summary" }], toolObservations: [] },
+      tokenAccounting: { profiles: [], totalInputTokens: 0, totalOutputTokens: 0, totalCostUsd: 0 },
+    }
+    const latestContent = { ...pinnedContent, throughSequence: "8", context: { ...pinnedContent.context, steerHistory: [{ id: "latest-history", content: "Newer summary" }] } }
+    const fake = pool({
+      turn: { input: { goal: "Continue" }, rootTaskId: null, contextSnapshotId: "snapshot-pinned", modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      inputs: [
+        { id: "before-cursor", targetTurnId: "old-turn", content: [{ type: "text", text: "Summarized already" }], acceptedSequence: "3" },
+        { id: "after-cursor", targetTurnId: "old-turn", content: [{ type: "text", text: "Keep this" }], acceptedSequence: "5" },
+      ],
+      snapshots: [
+        { id: "snapshot-pinned", throughSequence: "4", version: 1, content: pinnedContent },
+        { id: "snapshot-latest", throughSequence: "8", version: 2, content: latestContent },
+      ],
+    })
+
+    const value = await loadCanonicalTurnState(fake, lease)
+    expect(value.contextSnapshotPinned).toBe(true)
+    expect(value.snapshot.steerHistory).toEqual([
+      { id: "pinned-history", content: "Pinned summary" },
+      { id: "history:user:after-cursor", content: { role: "user", text: "Keep this" } },
+    ])
+    const snapshotQuery = fake.client.query.mock.calls.find(([sql]) => typeof sql === "string" && sql.includes('FROM "agent_context_snapshots"'))
+    expect(snapshotQuery?.[0]).toContain('WHERE snapshot."id" = $1')
+    expect(snapshotQuery?.[1]).toEqual(["snapshot-pinned", "session-1", "user-1"])
   })
 
   it("restores root rows while excluding child-private records and keeps legacy null rows", async () => {

@@ -4,6 +4,7 @@ export type ProductionAgentFlags = {
   readonly coordinationEnabled: boolean
   readonly consumeWaitOutcomes: boolean
   readonly canonicalAutomationEnabled: boolean
+  readonly turnBoundaryCompactionEnabled: boolean
 }
 
 /** Resolve server-owned production gates; model input and policy snapshots cannot change them. */
@@ -21,5 +22,6 @@ export function resolveProductionAgentFlags(env: Record<string, string | undefin
     coordinationEnabled,
     consumeWaitOutcomes: coordinationEnabled,
     canonicalAutomationEnabled: env.ENABLE_AGENT_CANONICAL_AUTOMATION === "1",
+    turnBoundaryCompactionEnabled: env.ENABLE_AGENT_TURN_BOUNDARY_COMPACTION === "1",
   }
 }
