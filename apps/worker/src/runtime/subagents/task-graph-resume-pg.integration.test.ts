@@ -3854,6 +3854,40 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     }
   }, 45_000)
 
+  it("rolls back finalization while an eligible source insert holds the User foreign-key lock", async () => {
+    const value = fixture()
+    let inserter: PoolClient | undefined
+    let insertActive = false
+    try {
+      const prepared = await prepareSelectedJobTerminalCase(pool!, value)
+
+      inserter = await pool!.connect()
+      await inserter.query("BEGIN")
+      insertActive = true
+      await inserter.query(`INSERT INTO persona_facts
+        ("id", "userId", "key", "category", "value", "normalized_value", "source", "source_ref", "confidence", "status", "allowedUses", "updated_at")
+        VALUES ($1, $2, 'pending-fact', 'experience', $3, $4, 'manual', 'resume:pending-fact', 0.95, 'confirmed', ARRAY['cover_letter']::text[], CURRENT_TIMESTAMP)`, [
+        `p3-finalization-fk-lock-${value.suffix}`, value.userId, `AC6_PENDING_FK_FACT_${value.suffix}`, value.suffix,
+      ])
+
+      const guard = selectedJobFinalizationGuardForCase(prepared)
+      await expect(commitTurnTerminal(pool!, prepared.terminalInput, guard)).rejects.toMatchObject({ name: "TurnEnginePersistenceConflict" })
+      await expectNoTerminalRecords(pool!, prepared)
+
+      await inserter.query("COMMIT")
+      insertActive = false
+      const after = await loadSelectedJobArtifactContext(pool!, value.userId, prepared.sources.jobId)
+      expect(after.preparation.sourceDigest).not.toBe(prepared.preparation.preparation.sourceDigest)
+      await expect(commitTurnTerminal(pool!, prepared.terminalInput, guard)).rejects.toMatchObject({ name: "TurnEnginePersistenceConflict" })
+      await expectNoTerminalRecords(pool!, prepared)
+    } finally {
+      if (insertActive) await inserter?.query("ROLLBACK").catch(() => undefined)
+      inserter?.release()
+      await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [value.sessionId])
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
+    }
+  }, 45_000)
+
   it("waits for authority locks, then reads a newer committed Job source before finalizing", async () => {
     const value = fixture()
     let writer: PoolClient | undefined
@@ -3900,6 +3934,139 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       if (writerActive) await writer?.query("ROLLBACK").catch(() => undefined)
       writer?.release()
       if (terminalOutcome) await terminalOutcome
+      await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [value.sessionId])
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
+    }
+  }, 45_000)
+
+  it("holds selected sources stable from the final digest read through terminal commit", async () => {
+    const value = fixture()
+    const writers: PoolClient[] = []
+    const mutationOutcomes: Array<Promise<{ label: string; rowCount: number | null } | { label: string; error: unknown }>> = []
+    let terminalOutcome: Promise<{ value: unknown } | { error: unknown }> | undefined
+    let releaseGuard: () => void = () => {}
+    let resolveGuardPassed: (pid: number) => void = () => undefined
+    const guardPassed = new Promise<number>(resolve => { resolveGuardPassed = resolve })
+    const guardBarrier = new Promise<void>(resolve => { releaseGuard = resolve })
+    try {
+      const prepared = await prepareSelectedJobTerminalCase(pool!, value)
+      const adaptedResumeId = `p3-finalization-adapted-resume-${value.suffix}`
+      await pool!.query(`INSERT INTO "Resume" ("id", "userId", "name", "content", "kind", "origin", "isDefault", "updatedAt")
+        VALUES ($1, $2, 'Unrelated adapted resume', '{"text":"before"}'::jsonb, 'adapted', 'ai-adapted', FALSE, CURRENT_TIMESTAMP)`, [adaptedResumeId, value.userId])
+      const realGuard = selectedJobFinalizationGuardForCase(prepared)
+      const guarded = async (client: PoolClient) => {
+        const decision = await realGuard(client)
+        if (!decision.ok) return decision
+        const backend = await client.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")
+        const pid = Number(backend.rows[0]?.pid)
+        if (!Number.isSafeInteger(pid)) throw new Error("Could not identify terminal finalization backend")
+        resolveGuardPassed(pid)
+        await guardBarrier
+        return decision
+      }
+      terminalOutcome = commitTurnTerminal(pool!, prepared.terminalInput, guarded)
+        .then(result => ({ value: result }), error => ({ error }))
+      const terminalPid = await guardPassed
+      let adaptedTimeout: NodeJS.Timeout | undefined
+      try {
+        const adaptedUpdate = await Promise.race([
+          pool!.query(`UPDATE "Resume" SET "content" = '{"text":"after"}'::jsonb, "updatedAt" = CURRENT_TIMESTAMP WHERE "id" = $1 AND "userId" = $2`, [adaptedResumeId, value.userId]),
+          new Promise<never>((_, reject) => { adaptedTimeout = setTimeout(() => reject(new Error("Unselected adapted Resume update was blocked by finalization")), 3_000) }),
+        ])
+        expect(adaptedUpdate.rowCount).toBe(1)
+      } finally { if (adaptedTimeout) clearTimeout(adaptedTimeout) }
+      const newFactId = `p3-finalization-post-guard-fact-${value.suffix}`
+      const changes = [
+        { label: "Job update", sql: `UPDATE "Job" SET "description" = $3, "updatedAt" = CURRENT_TIMESTAMP WHERE "id" = $1 AND "userId" = $2`, values: [prepared.sources.jobId, value.userId, `AC6_POST_GUARD_JOB_${value.suffix}`] },
+        { label: "Resume update", sql: `UPDATE "Resume" SET "content" = jsonb_build_object('text', $3::text), "updatedAt" = CURRENT_TIMESTAMP WHERE "id" = $1 AND "userId" = $2`, values: [prepared.sources.resumeId, value.userId, `AC6_POST_GUARD_RESUME_${value.suffix}`] },
+        { label: "PersonaFact update", sql: `UPDATE persona_facts SET "value" = $3, "updated_at" = CURRENT_TIMESTAMP WHERE "id" = $1 AND "userId" = $2`, values: [`p3-selected-job-fact-${value.suffix}`, value.userId, `AC6_POST_GUARD_PERSONA_${value.suffix}`] },
+        { label: "PersonaFact insert", sql: `INSERT INTO persona_facts
+          ("id", "userId", "key", "category", "value", "normalized_value", "source", "source_ref", "confidence", "status", "allowedUses", "updated_at")
+          VALUES ($1, $2, 'post-guard-fact', 'experience', $3, $4, 'manual', 'resume:post-guard', 0.95, 'confirmed', ARRAY['cover_letter']::text[], CURRENT_TIMESTAMP)`,
+        values: [newFactId, value.userId, `AC6_POST_GUARD_INSERT_${value.suffix}`, value.suffix] },
+      ]
+      const writerPids: number[] = []
+      for (const change of changes) {
+        const writer = await pool!.connect()
+        writers.push(writer)
+        const backend = await writer.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")
+        writerPids.push(Number(backend.rows[0]?.pid))
+        mutationOutcomes.push(writer.query(change.sql, change.values)
+          .then(result => ({ label: change.label, rowCount: result.rowCount }), error => ({ label: change.label, error })))
+      }
+
+      let allBlocked = false
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const waiting = await pool!.query<{ pid: number }>(`SELECT waiter.pid::int AS pid FROM pg_stat_activity AS waiter
+          WHERE waiter.pid = ANY($1::int[]) AND waiter.state = 'active' AND waiter.wait_event_type = 'Lock'
+            AND $2::int = ANY(pg_blocking_pids(waiter.pid))`, [writerPids, terminalPid])
+        if (new Set(waiting.rows.map(row => Number(row.pid))).size === changes.length) { allBlocked = true; break }
+        await new Promise(resolve => setTimeout(resolve, 25))
+      }
+      expect(allBlocked).toBe(true)
+
+      const observer = await pool!.connect()
+      try {
+        const [job, resume, fact, inserted] = await Promise.all([
+          observer.query<{ description: string }>(`SELECT "description" FROM "Job" WHERE "id" = $1`, [prepared.sources.jobId]),
+          observer.query<{ content: { text: string } }>(`SELECT "content" FROM "Resume" WHERE "id" = $1`, [prepared.sources.resumeId]),
+          observer.query<{ value: string }>(`SELECT "value" FROM persona_facts WHERE "id" = $1`, [`p3-selected-job-fact-${value.suffix}`]),
+          observer.query(`SELECT "id" FROM persona_facts WHERE "id" = $1`, [newFactId]),
+        ])
+        expect(job.rows[0]?.description).toBe(`AC6_TRANSIENT_JOB_SOURCE_W1_${value.suffix}`)
+        expect(resume.rows[0]?.content.text).toBe(`AC6_TRANSIENT_RESUME_SOURCE_W1_${value.suffix}`)
+        expect(fact.rows[0]?.value).toBe(`AC6_TRANSIENT_PERSONA_SOURCE_W1_${value.suffix}`)
+        expect(inserted.rows).toHaveLength(0)
+      } finally { observer.release() }
+
+      releaseGuard()
+      const terminal = await terminalOutcome
+      expect(terminal && "value" in terminal).toBe(true)
+      const applied = await Promise.all(mutationOutcomes)
+      expect(applied.every(result => "rowCount" in result && result.rowCount === 1)).toBe(true)
+      const after = await loadSelectedJobArtifactContext(pool!, value.userId, prepared.sources.jobId)
+      expect(after.preparation.sourceDigest).not.toBe(prepared.preparation.preparation.sourceDigest)
+    } finally {
+      releaseGuard()
+      if (terminalOutcome) await terminalOutcome
+      await Promise.all(mutationOutcomes)
+      for (const writer of writers) writer.release()
+      await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [value.sessionId])
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
+    }
+  }, 45_000)
+
+  it("rechecks PersonaFact expiry using the wall clock after the terminal transaction starts", async () => {
+    const value = fixture()
+    try {
+      const prepared = await prepareSelectedJobTerminalCase(pool!, value)
+      const expires = await pool!.query<{ expiresAt: Date }>(`UPDATE persona_facts
+        SET "expires_at" = clock_timestamp() + INTERVAL '3 seconds'
+        WHERE "id" = $1 AND "userId" = $2 RETURNING "expires_at" AS "expiresAt"`, [
+        `p3-selected-job-fact-${value.suffix}`, value.userId,
+      ])
+      const expiresAt = expires.rows[0]?.expiresAt
+      if (!(expiresAt instanceof Date)) throw new Error("Could not set the PersonaFact expiry boundary")
+      const realGuard = selectedJobFinalizationGuardForCase(prepared)
+      const delayedGuard = async (client: PoolClient) => {
+        const transaction = await client.query<{ startedAt: Date }>("SELECT transaction_timestamp() AS \"startedAt\"")
+        const startedAt = transaction.rows[0]?.startedAt
+        if (!(startedAt instanceof Date) || startedAt.getTime() >= expiresAt.getTime()) {
+          throw new Error("Terminal transaction did not start before PersonaFact expiry")
+        }
+        const delay = await client.query<{ seconds: number }>(`SELECT GREATEST(0.05,
+          EXTRACT(EPOCH FROM $1::timestamptz - clock_timestamp()) + 0.1)::float8 AS "seconds"`, [expiresAt])
+        await client.query("SELECT pg_sleep($1::float8)", [Number(delay.rows[0]?.seconds)])
+        const expired = await client.query<{ expired: boolean }>(`SELECT statement_timestamp() > $1::timestamptz AS "expired"`, [expiresAt])
+        expect(expired.rows[0]?.expired).toBe(true)
+        return realGuard(client)
+      }
+
+      await expect(commitTurnTerminal(pool!, prepared.terminalInput, delayedGuard)).rejects.toMatchObject({ name: "TurnEnginePersistenceConflict" })
+      await expectNoTerminalRecords(pool!, prepared)
+      const afterExpiry = await loadSelectedJobArtifactContext(pool!, value.userId, prepared.sources.jobId)
+      expect(afterExpiry.preparation.sourceDigest).not.toBe(prepared.preparation.preparation.sourceDigest)
+    } finally {
       await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [value.sessionId])
       await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
     }

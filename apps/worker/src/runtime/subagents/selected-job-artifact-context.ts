@@ -143,7 +143,7 @@ export async function loadSelectedJobArtifactContext(
   const resume = resumeResult.resume
   if (!resume) throw new Error("selected_job_base_resume_missing")
 
-  const materials: ArtifactSourceMaterial[] = [
+  const transientSources: ArtifactSourceMaterial[] = [
     { sourceRef: `job:${job.id}`, content: job },
     { sourceRef: `resume:${resume.id}`, content: resume.content },
     ...personaResult.facts.map(fact => ({
@@ -151,10 +151,18 @@ export async function loadSelectedJobArtifactContext(
       content: { id: fact.id, key: fact.key, value: fact.value, confidence: fact.confidence, sourceRef: fact.sourceRef },
     })),
   ]
+  const digestMaterials: ArtifactSourceMaterial[] = [
+    { sourceRef: `job:${job.id}`, content: job },
+    { sourceRef: `resume:${resume.id}`, content: resume },
+    ...personaResult.facts.map((fact, index) => ({
+      sourceRef: `persona:${fact.id}`,
+      content: { ...fact, rank: index + 1 },
+    })),
+  ]
   return {
-    preparation: createSelectedJobPreparation(job.id, materials),
+    preparation: createSelectedJobPreparation(job.id, digestMaterials),
     baseResumeId: resume.id,
-    transientSources: materials,
+    transientSources,
   }
 }
 
@@ -164,8 +172,34 @@ export async function readSelectedJobSourceDigestWithClient(
   userId: string,
   jobId: string,
 ): Promise<string | null> {
-  try { return (await loadSelectedJobArtifactContext(client, userId, jobId)).preparation.sourceDigest }
+  try {
+    if (!await lockSelectedJobSourceRows(client, userId, jobId)) return null
+    return (await loadSelectedJobArtifactContext(client, userId, jobId)).preparation.sourceDigest
+  }
   catch { return null }
+}
+
+async function lockSelectedJobSourceRows(
+  client: Pick<pg.PoolClient, "query">,
+  userId: string,
+  jobId: string,
+): Promise<boolean> {
+  // The parent lock closes insert phantoms; child NOWAIT locks fail fast against reverse writer order.
+  const user = await client.query<{ id: string }>(
+    `SELECT "id" FROM "User" WHERE "id" = $1 FOR UPDATE NOWAIT`, [userId],
+  )
+  if (user.rows.length !== 1) return false
+  const job = await client.query<{ id: string }>(
+    `SELECT "id" FROM "Job" WHERE "id" = $1 AND "userId" = $2 FOR SHARE NOWAIT`, [jobId, userId],
+  )
+  if (job.rows.length !== 1) return false
+  await client.query<{ id: string }>(
+    `SELECT "id" FROM "Resume" WHERE "userId" = $1 AND "kind" = 'base' ORDER BY "id" FOR SHARE NOWAIT`, [userId],
+  )
+  await client.query<{ id: string }>(
+    `SELECT "id" FROM persona_facts WHERE "userId" = $1 ORDER BY "id" FOR SHARE NOWAIT`, [userId],
+  )
+  return true
 }
 
 /** Resolve or create one immutable, content-free base for the selected job. */

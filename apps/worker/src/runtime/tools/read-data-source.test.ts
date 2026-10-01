@@ -31,8 +31,13 @@ describe("Postgres read tool data source", () => {
     const personaQuery = queries.find((query) => query.sql.includes("FROM persona_facts"))
     expect(personaQuery?.sql).toContain('"confidence", "allowedUses"')
     expect(personaQuery?.sql).toContain('AND ($3::text IS NULL OR $3 = ANY("allowedUses"))')
+    expect(personaQuery?.sql).toContain('"expires_at" > statement_timestamp()')
+    expect(personaQuery?.sql).toContain('ORDER BY "updated_at" DESC, "id" DESC LIMIT 50')
     expect(personaQuery?.values).toEqual(["owner-a", ["work_authorization"], "cover_letter"])
     expect(persona.facts[0]?.allowedUses).toEqual(["cover_letter"])
+    expect(queries.find((query) => query.sql.includes('FROM "Resume"'))?.sql).toContain(
+      'ORDER BY "isDefault" DESC, "updatedAt" DESC, "id" DESC LIMIT 1',
+    )
     for (const query of queries) {
       expect(query.sql.trimStart().toUpperCase()).toMatch(/^SELECT/)
       expect(query.sql).not.toMatch(/\b(INSERT|UPDATE|DELETE)\b/i)

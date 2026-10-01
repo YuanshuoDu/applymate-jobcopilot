@@ -61,10 +61,10 @@ export function createPostgresReadToolDataSource(pool: Pick<pg.Pool, "query">): 
       const result = await pool.query<PersonaRow>(
         `SELECT "id", "key", "category", "value", "source", "source_ref" AS "sourceRef", "confidence", "allowedUses"
          FROM persona_facts
-         WHERE "userId" = $1 AND "status" = 'confirmed' AND ("expires_at" IS NULL OR "expires_at" > NOW())
+         WHERE "userId" = $1 AND "status" = 'confirmed' AND ("expires_at" IS NULL OR "expires_at" > statement_timestamp())
            AND ($2::text[] IS NULL OR "key" = ANY($2::text[]))
            AND ($3::text IS NULL OR $3 = ANY("allowedUses"))
-         ORDER BY "updated_at" DESC LIMIT 50`,
+         ORDER BY "updated_at" DESC, "id" DESC LIMIT 50`,
         [userId, input.keys?.length ? input.keys : null, input.useCase ?? null],
       )
       return { facts: result.rows.map((row) => ({ ...row, confidence: Number(row.confidence), allowedUses: [...row.allowedUses] })) }
@@ -75,7 +75,7 @@ export function createPostgresReadToolDataSource(pool: Pick<pg.Pool, "query">): 
         `SELECT "id", "name", "kind", "origin", "isDefault", "content", "createdAt", "updatedAt"
          FROM "Resume" WHERE "userId" = $1 AND "kind" = 'base'
            AND ($2::text IS NULL OR "id" = $2)
-         ORDER BY "isDefault" DESC, "updatedAt" DESC LIMIT 1`, [userId, input.resumeId ?? null],
+           ORDER BY "isDefault" DESC, "updatedAt" DESC, "id" DESC LIMIT 1`, [userId, input.resumeId ?? null],
       )
       const row = result.rows[0]
       return { resume: row ? { ...row, createdAt: iso(row.createdAt) as string, updatedAt: iso(row.updatedAt) as string } : null }
