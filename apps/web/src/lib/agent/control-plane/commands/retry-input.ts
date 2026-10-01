@@ -12,8 +12,8 @@ export function isRetryableTurnStatus(status: string): boolean {
   return RETRYABLE_STATUSES.has(status)
 }
 
-export function parsePersistedRetryContent(turnId: string, value: unknown): { goal: string; content: InputContentPart[] } {
-  if (!isRecord(value) || !exactKeys(value, ['goal', 'content', 'clientMessageId']) ||
+export function parsePersistedRetryContent(turnId: string, value: unknown): { goal: string; content: InputContentPart[]; selectedJobPreparation?: { jobId: string } } {
+  if (!isRecord(value) || !exactKeys(value, ['goal', 'content', 'clientMessageId', 'selectedJobPreparation']) ||
     !boundedGoal(value.goal) || (value.clientMessageId !== undefined && !boundedString(value.clientMessageId, 256)) ||
     !Array.isArray(value.content) || value.content.length < 1 || value.content.length > MAX_RETRY_PARTS) throw retryInputInvalid(turnId)
   const content: InputContentPart[] = []
@@ -31,7 +31,16 @@ export function parsePersistedRetryContent(turnId: string, value: unknown): { go
     } else throw retryInputInvalid(turnId)
   }
   if (new TextEncoder().encode(JSON.stringify(content)).byteLength > MAX_RETRY_CONTENT_BYTES) throw retryInputInvalid(turnId)
-  return { goal: value.goal, content }
+  const selectedJobPreparation = value.selectedJobPreparation === undefined
+    ? undefined
+    : parseSelectedJobPreparation(value.selectedJobPreparation)
+  if (value.selectedJobPreparation !== undefined && !selectedJobPreparation) throw retryInputInvalid(turnId)
+  return { goal: value.goal, content, ...(selectedJobPreparation ? { selectedJobPreparation } : {}) }
+}
+
+function parseSelectedJobPreparation(value: unknown): { jobId: string } | null {
+  if (!isRecord(value) || !exactKeys(value, ['jobId']) || !boundedString(value.jobId, 256)) return null
+  return { jobId: value.jobId }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

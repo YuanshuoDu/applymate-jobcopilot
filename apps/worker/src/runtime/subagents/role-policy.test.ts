@@ -58,4 +58,45 @@ describe("subagent role policy", () => {
     expect(visibleToolPolicy("reviewer", tool("spawn_subagent", "internal_write", "coordination")).reason).toBe("coordination_disabled")
     expect(visibleToolPolicy("reviewer", tool("wait_subagents", "read", "coordination")).visible).toBe(false)
   })
+
+  it("allows only the versioned Reviewer artifact.review receipt through draft_write", () => {
+    const review = {
+      ...tool("artifact.review", "draft_write", "resume"),
+      version: "1",
+      capabilities: ["read", "write"] as const,
+      idempotency: "requires_key" as const,
+      requiredCapabilities: [],
+    }
+    expect(visibleToolPolicy("reviewer", review)).toEqual({ visible: true, reason: "bounded_review_receipt_allowed" })
+    expect(preflightSubagentTool("reviewer", review)).toMatchObject({
+      allowed: true, execute: false, externalWriteBlocked: false, reasonCode: "bounded_review_receipt_allowed",
+    })
+
+    for (const other of [
+      { ...review, name: "cover_letter.draft" },
+      { ...review, version: "2" },
+      { ...review, domain: "application" as const },
+      { ...review, capabilities: ["read", "write", "external_write"] },
+    ]) {
+      expect(visibleToolPolicy("reviewer", other).visible).toBe(false)
+    }
+    expect(visibleToolPolicy("writer", review).visible).toBe(false)
+  })
+
+  it("keeps Reviewer actions limited to reads and the internal review receipt", () => {
+    const review = {
+      ...tool("artifact.review", "draft_write", "resume"),
+      version: "1", capabilities: ["read", "write"] as const, idempotency: "requires_key" as const, requiredCapabilities: [],
+    }
+    const definitions = [
+      review,
+      tool("artifact.version.read", "read", "resume"),
+      { ...review, name: "cover_letter.draft" },
+      tool("application.submit", "external_write", "application"),
+      tool("gmail.send", "external_write", "unknown"),
+    ]
+    expect(visibleSubagentTools("reviewer", definitions).map(item => item.name)).toEqual([
+      "artifact.review", "artifact.version.read",
+    ])
+  })
 })

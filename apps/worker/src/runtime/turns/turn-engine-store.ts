@@ -6,9 +6,8 @@ import { enforceRootStepBudget, enforceRootToolCallBudget } from "./turn-engine-
 import { toRepositoryJson, type TurnEngineEventInput, type TurnEngineItem, type TurnEngineStore, type TurnEngineStep } from "./turn-engine-types.js"
 import { STEERING_MARKER_EVENT_TYPE, parseSteeringMarkerPayload, type SteeringMarkerPayload } from "../context/steering-marker.js"
 import { matchesAgentOutboxIdentity, type AgentOutboxIdentity, type AgentOutboxPayload } from "../outbox-identity.js"
-import { commitTurnTerminal } from "./turn-engine-terminal-commit.js"
-type TurnEnginePool = Pick<pg.Pool, "connect">
-type QueryClient = Pick<pg.PoolClient, "query" | "release">
+import { commitTurnTerminal, type TurnEngineTerminalGuard } from "./turn-engine-terminal-commit.js"
+type TurnEnginePool = Pick<pg.Pool, "connect">; type QueryClient = Pick<pg.PoolClient, "query" | "release">
 type Row = Record<string, unknown>
 const OPEN_SESSION = `"status" NOT IN ('aborted', 'archived')`
 function json(value: RepositoryJsonValue): string { return JSON.stringify(value) }
@@ -131,7 +130,7 @@ async function appendEventBatch(pool: TurnEnginePool, inputs: readonly TurnEngin
   })
 }
 
-export function createPgTurnEngineStore(pool: TurnEnginePool): TurnEngineStore {
+export function createPgTurnEngineStore(pool: TurnEnginePool, terminalGuard?: TurnEngineTerminalGuard): TurnEngineStore {
   return {
     async startStep(input): Promise<TurnEngineStep> {
       const actualAttempt = input.owner.kind === "task" ? input.owner.attemptCount : 1
@@ -239,7 +238,7 @@ export function createPgTurnEngineStore(pool: TurnEnginePool): TurnEngineStore {
     async appendEvents(inputs): Promise<readonly { id: string }[]> { return appendEventBatch(pool, inputs) },
     async recordFinalResponse(input) {
       if (input.owner.kind !== "turn") throw conflict(`child final response ${input.owner.taskId}`)
-      if (input.terminal) return commitTurnTerminal(pool, { ...input.terminal, owner: input.owner, response: input.response, now: input.now })
+      if (input.terminal) return commitTurnTerminal(pool, { ...input.terminal, owner: input.owner, response: input.response, now: input.now }, terminalGuard)
       return tenantTransaction(pool, input.owner.userId, async (client: QueryClient) => {
         if (!await lockOpenSession(client, input.owner)) throw conflict(`turn ${input.owner.turnId}`)
         const guard = ownerFenceSql(input.owner, 5, true)

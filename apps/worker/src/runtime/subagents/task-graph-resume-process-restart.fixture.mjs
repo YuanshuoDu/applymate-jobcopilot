@@ -1,10 +1,13 @@
+import { Worker } from "bullmq"
 import { Pool } from "pg"
 import { createCanonicalTurnRuntime } from "../canonical-turn-runtime.ts"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.ts"
 import { ROLE_RESULT_SCHEMA } from "./role-results.ts"
+import { createProductionChildExecutor } from "./production-child-runtime.ts"
+import { hashArtifactContent } from "./artifact-adapters.ts"
+import { writerArtifactReferenceFromTaskContext } from "./task-graph-dependency-context.ts"
+import { parseSubagentJobPayload } from "./types.ts"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.ts"
-import { createProductionWorkerBootstrap } from "../../queue/production-bootstrap.ts"
-import { enqueueTurn } from "../turns/turn-queue.ts"
 import { parsePlanLedger, projectPlanLedger } from "@jobcopilot/agent-protocol"
 
 const [, , mode, rawIds] = process.argv, ids = JSON.parse(rawIds)
@@ -29,6 +32,8 @@ const planCallId = "p3-process-restart-plan", waitCallId = "p3-process-restart-w
 const followUpPlanCallId = "p3-process-restart-follow-up-plan", followUpWaitCallId = "p3-process-restart-follow-up-wait"
 const pool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 5 })
 let bootstrap
+let selectedJobWorker
+let sharedRedisModule
 let stdinBuffer = ""
 let initialWaitLineage = null
 const queuedCommands = []
@@ -54,6 +59,72 @@ function waitForCommand(command) {
   return new Promise(resolve => { const waiters = commandWaiters.get(command) ?? []; waiters.push(resolve); commandWaiters.set(command, waiters) })
 }
 function record(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : null }
+function assertNoPrivateArtifactFixtureData(value, serializedValue = rawIds) {
+  const serialized = typeof serializedValue === "string" ? serializedValue : ""
+  if (/(?:^|[,{])\s*"(?:body|draftBody|artifactRef|artifactReference)"\s*:/i.test(serialized)
+    || /AC6_(?:PRIVATE_COVER_LETTER_|TRANSIENT_(?:JOB|RESUME|PERSONA)_SOURCE_)/.test(serialized)) {
+    throw new Error("p3_second_worker_fixture_input_contains_private_artifact_data")
+  }
+  const visit = current => {
+    if (typeof current === "string") return /AC6_(?:PRIVATE_COVER_LETTER_|TRANSIENT_(?:JOB|RESUME|PERSONA)_SOURCE_)/.test(current)
+    if (Array.isArray(current)) return current.some(visit)
+    const row = record(current)
+    if (!row) return false
+    return Object.entries(row).some(([key, child]) => {
+      const normalized = key.replace(/[-_]/g, "").toLowerCase()
+      return ["body", "draftbody", "artifactref", "artifactreference"].includes(normalized) || visit(child)
+    })
+  }
+  if (visit(value)) throw new Error("p3_second_worker_fixture_input_contains_private_artifact_data")
+}
+function assertPrivateArtifactFixtureGuardSelfTest() {
+  const safeInput = { selectedJob: { jobId: "p3-selected-job-fixture", expectedBodyHash: "sha256:fixture" } }
+  assertNoPrivateArtifactFixtureData(safeInput, JSON.stringify(safeInput))
+  const rejectedInputs = [
+    { value: { nested: { selectedJob: { body: "AC6_PRIVATE_COVER_LETTER_fixture" } } } },
+    { value: { runtime: { task: { context: { artifactRef: { artifactId: "private-ref" } } } } } },
+    { value: { fixturePayload: { draft_body: "AC6_PRIVATE_COVER_LETTER_fixture" } } },
+    { value: { nested: { safe: true } }, serialized: '{"nested":{"body":"AC6_PRIVATE_COVER_LETTER_fixture"},"nested":{"safe":true}}' },
+    { value: { nested: { privateText: "AC6_PRIVATE_COVER_LETTER_fixture" } } },
+    { value: { selectedJob: { source: "AC6_TRANSIENT_JOB_SOURCE_W2_fixture" } } },
+    { value: { selectedJob: { source: "AC6_TRANSIENT_RESUME_SOURCE_W2_fixture" } } },
+    { value: { selectedJob: { source: "AC6_TRANSIENT_PERSONA_SOURCE_W2_fixture" } } },
+  ]
+  for (const item of rejectedInputs) {
+    let rejected = false
+    try { assertNoPrivateArtifactFixtureData(item.value, item.serialized ?? JSON.stringify(item.value)) }
+    catch (error) { rejected = error instanceof Error && error.message === "p3_second_worker_fixture_input_contains_private_artifact_data" }
+    if (!rejected) throw new Error("p3_private_artifact_fixture_guard_self_test_failed")
+  }
+}
+function assertDisposableServiceUrls() {
+  const databaseValue = process.env.AGENT_RUNTIME_PG_TEST_URL
+  const redisTestValue = process.env.AGENT_TURN_REDIS_TEST_URL
+  const redisConfiguredValue = process.env.REDIS_URL
+  if (process.env.CI !== "true" || process.env.AGENT_RUNTIME_PG_TEST_DISPOSABLE !== "true"
+    || process.env.AGENT_TURN_REDIS_TEST_DISPOSABLE !== "true" || !databaseValue || !redisTestValue || !redisConfiguredValue) {
+    throw new Error("p3_restart_fixture_requires_dedicated_disposable_ci_services")
+  }
+  try {
+    const database = new URL(databaseValue)
+    const redisTest = new URL(redisTestValue)
+    const redisConfigured = new URL(redisConfiguredValue)
+    if (database.protocol !== "postgresql:" || database.hostname !== "127.0.0.1" || database.port !== "5432"
+      || database.username !== "postgres" || database.password !== "postgres"
+      || database.pathname !== "/applymate_agent_brain_ci" || database.search || database.hash
+      || redisTest.protocol !== "redis:" || !["127.0.0.1", "localhost", "::1", "[::1]"].includes(redisTest.hostname)
+      || redisTest.port !== "6379" || redisTest.pathname !== "/15" || redisTest.username || redisTest.password
+      || redisTest.search || redisTest.hash || redisConfigured.href !== redisTest.href) {
+      throw new Error("invalid")
+    }
+  } catch {
+    throw new Error("p3_restart_fixture_rejects_non_disposable_service_urls")
+  }
+}
+async function loadSharedRedisModule() {
+  sharedRedisModule ??= await import("../../redis.ts")
+  return sharedRedisModule
+}
 function turnErrorCategory(value) {
   if (typeof value !== "string") return "none"
   const prefix = value.slice(0, 2_000)
@@ -523,6 +594,199 @@ function modelProfile() {
     continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false, supportsReasoningSummary: false,
     supportsResponseContinuation: false, supportsProviderConversation: false, supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low" }
 }
+function selectedJobDraftModel(selected, task, observations) {
+  const callId = `ac6-selected-job-draft-receipt:attempt:${task.attemptCount}`
+  const baseArtifactId = `cover-letter-base:${hashArtifactContent({ userId: selected.userId, jobId: selected.jobId }).slice(7)}`
+  const baseHash = hashArtifactContent({ kind: "cover_letter_base", jobId: selected.jobId })
+  let rounds = 0
+  return {
+    id: "ac6-disposable-pg-selected-job-model", profile: modelProfile(),
+    async *stream(request) {
+      rounds++
+      if (rounds === 1) {
+        observeSelectedJobSourceCanaries(request, selected, 1, observations)
+        yield { type: "tool_call_completed", callId, name: "cover_letter.draft", arguments: {
+          baseArtifactId, baseHash, content: selected.body, constraints: { maxWords: 160 },
+        } }
+        yield { type: "completed", finishReason: "tool_calls" }
+        return
+      }
+      const receipt = record(latestToolResult(request, callId))
+      const artifactRef = record(receipt?.artifactRef)
+      if (!artifactRef) throw new Error("p3_selected_job_draft_receipt_missing")
+      yield { type: "text_delta", text: JSON.stringify({
+        schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef,
+      }) }
+      yield { type: "completed", finishReason: "stop" }
+    },
+  }
+}
+function selectedJobSourceCanaries(selected, worker) {
+  const suffix = typeof selected.jobId === "string" && selected.jobId.startsWith("p3-selected-job-")
+    ? selected.jobId.slice("p3-selected-job-".length) : ""
+  if (!suffix) throw new Error("p3_selected_job_source_canary_unavailable")
+  return {
+    job: `AC6_TRANSIENT_JOB_SOURCE_W${worker}_${suffix}`,
+    resume: `AC6_TRANSIENT_RESUME_SOURCE_W${worker}_${suffix}`,
+    persona: `AC6_TRANSIENT_PERSONA_SOURCE_W${worker}_${suffix}`,
+  }
+}
+function observeSelectedJobSourceCanaries(request, selected, worker, observations) {
+  const requestText = JSON.stringify(request)
+  const current = selectedJobSourceCanaries(selected, worker)
+  const sourceCanariesReloaded = {
+    job: requestText.includes(current.job),
+    resume: requestText.includes(current.resume),
+    persona: requestText.includes(current.persona),
+  }
+  observations.sourceCanariesReloaded = sourceCanariesReloaded
+  const old = worker === 2 ? selectedJobSourceCanaries(selected, 1) : null
+  if (old) observations.previousSourceCanariesAbsent = {
+    job: !requestText.includes(old.job),
+    resume: !requestText.includes(old.resume),
+    persona: !requestText.includes(old.persona),
+  }
+  if (Object.values(sourceCanariesReloaded).some(value => !value)
+    || (old && Object.values(observations.previousSourceCanariesAbsent).some(value => !value))) {
+    throw new Error("p3_selected_job_transient_source_canaries_invalid")
+  }
+}
+function selectedJobReviewerModel(selected, task, observations) {
+  const artifactRef = writerArtifactReferenceFromTaskContext(task.context, selected.jobId)
+  const bodyPrefix = "p3-selected-job-"
+  if (typeof selected.jobId !== "string" || !selected.jobId.startsWith(bodyPrefix) || selected.jobId.length <= bodyPrefix.length) {
+    throw new Error("p3_selected_job_fixture_body_canary_unavailable")
+  }
+  const privateBodyCanary = `AC6_PRIVATE_COVER_LETTER_${selected.jobId.slice(bodyPrefix.length)}`
+  observations.writerReceiptReferenceRecovered = true
+  const readCallId = `ac6-selected-job-review-read:attempt:${task.attemptCount}`
+  const reviewCallId = `ac6-selected-job-review-receipt:attempt:${task.attemptCount}`
+  const stopBeforeReview = task.id === selected.stopReviewerTaskId
+  let rounds = 0
+  return {
+    id: "ac6-disposable-pg-selected-job-model", profile: modelProfile(),
+    async *stream(request) {
+      rounds++
+      if (rounds === 1) {
+        observeSelectedJobSourceCanaries(request, selected, 2, observations)
+        observations.advertisedTools = request.tools.map(tool => record(tool)?.name).filter(name => typeof name === "string")
+        // Audit every model-visible request field, while excluding the opaque AbortSignal.
+        const modelVisibleRequest = Object.fromEntries(Object.entries(request).filter(([key]) => key !== "signal"))
+        const preReadContext = JSON.stringify({ request: modelVisibleRequest, taskContext: task.context })
+        observations.preReadContextHash = hashArtifactContent(preReadContext)
+        observations.privateBodyAbsentBeforeRead = !preReadContext.includes(privateBodyCanary)
+        if (!observations.privateBodyAbsentBeforeRead) throw new Error("p3_selected_job_reviewer_received_body_before_persisted_read")
+        yield { type: "tool_call_completed", callId: readCallId, name: "artifact.version.read", arguments: { artifactRef } }
+        yield { type: "completed", finishReason: "tool_calls" }
+        return
+      }
+      if (rounds === 2) {
+        const readResult = record(latestToolResult(request, readCallId))
+        const readArtifactRef = record(readResult?.artifactRef)
+        observations.sawBody = readArtifactRef?.artifactId === artifactRef.artifactId
+          && readArtifactRef?.version === artifactRef.version
+          && readArtifactRef?.contentHash === artifactRef.contentHash
+          && readArtifactRef?.sourceDigest === artifactRef.sourceDigest
+          && readResult?.content === privateBodyCanary
+          && hashArtifactContent(readResult.content) === selected.expectedBodyHash
+        if (!observations.sawBody) throw new Error("p3_selected_job_reviewer_did_not_receive_artifact_body")
+        if (stopBeforeReview) {
+          say("P3_SELECTED_JOB_STOP_REVIEW_READY " + task.id)
+          await waitForCommand("release-selected-job-review:" + task.id)
+        }
+        yield { type: "tool_call_completed", callId: reviewCallId, name: "artifact.review", arguments: {
+          artifactRef, decision: "passed", findings: [],
+        } }
+        yield { type: "completed", finishReason: "tool_calls" }
+        return
+      }
+      const receipt = record(latestToolResult(request, reviewCallId))
+      if (stopBeforeReview) {
+        observations.reviewWriteError = receipt?.error ?? null
+        if (observations.reviewWriteError !== "private_artifact_review_failed") {
+          throw new Error("p3_selected_job_stopped_review_write_not_rejected")
+        }
+        say("P3_SELECTED_JOB_STOP_REVIEW_REJECTED " + task.id)
+        const reviewHash = hashArtifactContent({ status: "stale", stoppedTaskId: task.id, artifactRef })
+        yield { type: "text_delta", text: JSON.stringify({
+          schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed", artifactRef,
+          reviewStatus: "stale", reviewHash,
+        }) }
+        yield { type: "completed", finishReason: "stop" }
+        return
+      }
+      if (receipt?.status !== "stale" || typeof receipt.reviewHash !== "string") {
+        throw new Error("p3_selected_job_stale_review_receipt_missing")
+      }
+      observations.reviewStatus = receipt.status
+      yield { type: "text_delta", text: JSON.stringify({
+        schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed", artifactRef,
+        reviewStatus: receipt.status, reviewHash: receipt.reviewHash,
+      }) }
+      yield { type: "completed", finishReason: "stop" }
+    },
+  }
+}
+async function startSelectedJobQueueWorker(runtime) {
+  const { redisConnection } = await loadSharedRedisModule()
+  const selected = record(ids.selectedJob)
+  if (!selected || typeof selected.queueName !== "string" || selected.queueName.length === 0) return null
+  const worker = new Worker(selected.queueName, async job => {
+    const payload = parseSubagentJobPayload(job.data)
+    if (!payload || payload.sessionId !== selected.sessionId || payload.rootTaskId !== selected.rootTaskId) {
+      throw new Error("p3_selected_job_queue_payload_scope_invalid")
+    }
+    if (payload.taskId === selected.stopReviewerTaskId) {
+      say("P3_SELECTED_JOB_STOP_REVIEW_QUEUED " + payload.taskId)
+      await waitForCommand("start-selected-job-review:" + payload.taskId)
+    }
+    let leaseIdentity = null
+    let childResult = null
+    const observations = {}
+    const outcome = await runtime.manager.run(payload, async ({ lease }) => {
+      if (lease.turnId !== selected.turnId || lease.rootTaskId !== selected.rootTaskId
+        || lease.parentTaskId !== selected.rootTaskId || lease.userId !== selected.userId) {
+        throw new Error("p3_selected_job_child_lease_scope_invalid")
+      }
+      const taskSelection = record(record(lease.context)?.selectedJobPreparation)
+      const selectedTaskIds = [selected.writerTaskId, selected.reviewerTaskId, selected.stopReviewerTaskId]
+        .filter(taskId => typeof taskId === "string")
+      if (taskSelection?.jobId !== selected.jobId || !selectedTaskIds.includes(lease.id)) {
+        throw new Error("p3_selected_job_task_lineage_invalid")
+      }
+      leaseIdentity = {
+        role: lease.role, ownerId: lease.ownerId, attemptCount: lease.attemptCount,
+        taskId: lease.id, path: lease.path,
+      }
+      const executor = createProductionChildExecutor({
+        pool,
+        authorizeUsage: async () => ({ settle: async () => undefined }),
+        modelRuntimeFactory: ({ task }) => {
+          if (task.role === "writer") return selectedJobDraftModel(selected, task, observations)
+          if (task.role === "reviewer") return selectedJobReviewerModel(selected, task, observations)
+          throw new Error("p3_unexpected_selected_job_child_role")
+        },
+      })
+      childResult = await executor({ lease })
+      return childResult
+    })
+    const structured = record(record(childResult?.result)?.structuredResult)
+    say("P3_SELECTED_JOB_CHILD_SETTLED " + payload.taskId + " " + JSON.stringify({
+      ...leaseIdentity,
+      managerStatus: outcome.status,
+      childStatus: childResult?.status ?? null,
+      artifactRef: structured?.artifactRef ?? null,
+      reviewStatus: structured?.reviewStatus ?? null,
+      reviewHash: structured?.reviewHash ?? null,
+      observations,
+    }))
+    return outcome
+  }, { connection: redisConnection, skipVersionCheck: true, concurrency: 1 })
+  selectedJobWorker = worker
+  await worker.waitUntilReady()
+  say("P3_SELECTED_JOB_QUEUE_READY " + selected.queueName)
+  return worker
+}
 function flags() {
   return { cognitiveLoopEnabled: false, planningEnabled: true, planningExecutionEnabled: true, taskGraphPlanningEnabled: true,
     childExecutionEnabled: true, coordinationEnabled: true, consumeWaitOutcomes: true, canonicalAutomationEnabled: false }
@@ -835,6 +1099,7 @@ async function runFirstWorker() {
   say("P3_FIRST_WORKER_START_RUNTIME_BEGIN")
   const ownerId = "p3-process-restart-worker-" + process.pid, runtime = await startRuntime(ownerId, false)
   say("P3_FIRST_WORKER_START_RUNTIME_DONE")
+  const { createProductionWorkerBootstrap } = await import("../../queue/production-bootstrap.ts")
   bootstrap = await createProductionWorkerBootstrap({ pool, runtime, ownerId, turnRecoveryIntervalMs: 10,
     waitResolver: { intervalMs: 10, ownerId: "p3-process-restart-wait-resolver-" + process.pid },
     subagents: { intervalMs: 10, async execute() { throw new Error("p3_first_worker_must_not_execute_children") } } })
@@ -843,17 +1108,21 @@ async function runFirstWorker() {
   if (typeof subagentWorker?.pause !== "function") throw new Error("p3_first_worker_subagent_pause_unavailable")
   await subagentWorker.pause()
   say("P3_FIRST_WORKER_PAUSE_DONE")
+  await startSelectedJobQueueWorker(runtime)
   const activated = await pool.query(`UPDATE "agent_turns" SET "status" = 'queued', "completedAt" = NULL,
       "leaseOwnerId" = NULL, "leaseExpiresAt" = NULL, "leaseStartedAt" = NULL, "updatedAt" = CURRENT_TIMESTAMP
     WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "status" = 'waiting_for_user'`, [ids.turnId, ids.sessionId, ids.userId])
   if (activated.rowCount !== 1) throw new Error("p3_first_worker_fixture_turn_not_parked")
   say("P3_FIRST_WORKER_TURN_ACTIVATED")
+  const { enqueueTurn } = await import("../turns/turn-queue.ts")
   await enqueueTurn(pool, bootstrap.turns.queue, { turnId: ids.turnId, sessionId: ids.sessionId, ownerId })
   say("P3_FIRST_WORKER_ENQUEUE_DONE")
   await waitForParentSuspended(ownerId); await waitForStop()
 }
 async function runSecondWorker() {
+  assertNoPrivateArtifactFixtureData(ids)
   const ownerId = "p3-process-restart-worker-" + process.pid, runtime = await startRuntime(ownerId, true)
+  const { createProductionWorkerBootstrap } = await import("../../queue/production-bootstrap.ts")
   bootstrap = await createProductionWorkerBootstrap({ pool, runtime, ownerId, turnRecoveryIntervalMs: 10,
     waitResolver: { intervalMs: 10, ownerId: "p3-process-restart-wait-resolver-" + process.pid },
     subagents: { intervalMs: 10, async execute({ lease }) {
@@ -892,6 +1161,7 @@ async function runSecondWorker() {
       }
       throw new Error("p3_unexpected_child:" + lease.goal)
     } } })
+  await startSelectedJobQueueWorker(runtime)
   say("P3_SECOND_WORKER_READY " + ownerId); await waitForStop()
 }
 try {
@@ -901,14 +1171,25 @@ try {
   assertInitialPlanToolPair()
   assertSourceProjectionDiagnostic()
   if (mode === "self-test") say("P3_FIXTURE_SELF_TEST_OK")
-  else if (mode === "park-parent") await runFirstWorker()
-  else if (mode === "resume-parent") await runSecondWorker()
+  else if (mode === "worker2-input-guard-self-test") {
+    assertPrivateArtifactFixtureGuardSelfTest()
+    say("P3_PRIVATE_FIXTURE_GUARD_OK")
+    process.stdin.off("data", onStdinData); process.stdin.pause(); process.stdin.destroy()
+  }
+  else if (mode === "park-parent" || mode === "resume-parent") {
+    assertDisposableServiceUrls()
+    await loadSharedRedisModule()
+    if (mode === "park-parent") await runFirstWorker()
+    else await runSecondWorker()
+  }
   else throw new Error("p3_unknown_process_restart_mode")
 } catch (error) {
   process.stderr.write((error instanceof Error ? error.stack ?? error.message : String(error)) + "\n"); process.exitCode = 1
+  process.stdin.off("data", onStdinData); process.stdin.pause(); process.stdin.destroy()
 } finally {
+  try { if (selectedJobWorker) await selectedJobWorker.close() } catch (error) { process.stderr.write("p3_selected_job_worker_close_failed:" + String(error) + "\n"); process.exitCode = 1 }
   try { if (bootstrap) await bootstrap.close() } catch (error) { process.stderr.write("p3_bootstrap_close_failed:" + String(error) + "\n"); process.exitCode = 1 }
   try { await pool.end() } catch (error) { process.stderr.write("p3_pool_end_failed:" + String(error) + "\n"); process.exitCode = 1 }
-  try { const { closeSharedRedisConnections } = await import("../../redis.ts"); await closeSharedRedisConnections() }
+  try { if (sharedRedisModule) await sharedRedisModule.closeSharedRedisConnections() }
   catch (error) { process.stderr.write("p3_redis_close_failed:" + String(error) + "\n"); process.exitCode = 1 }
 }

@@ -17,14 +17,25 @@ import {
 
 import type { ProductionAgentFlags } from "../production-agent-flags.js"
 import type { ProductionWorkerBootstrap, createProductionWorkerBootstrap } from "../../queue/production-bootstrap.js"
+import { createAgentArtifactRepository, findCurrentDraftHeadWithClient, findReviewReceiptWithClient, type AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
+import { createArtifactToolStore } from "../tools/artifact-tools.js"
 import { childContextSnapshot, createChildContextBuilder } from "./child-context.js"
+import { hashArtifactContent } from "./artifact-adapters.js"
+import { loadSelectedJobArtifactContext, readSelectedJobSourceDigestWithClient, resolveCoverLetterBase } from "./selected-job-artifact-context.js"
+import { materializeTaskGraphDependencyContext } from "./task-graph-dependency-context.js"
+import { selectedJobArtifactCompletionGate, selectedJobArtifactCompletionGateWithWitness } from "../selected-job-completion-gate.js"
+import { selectedJobArtifactFinalizationGuard } from "../selected-job-finalization-guard.js"
+import { commitTurnTerminal } from "../turns/turn-engine-terminal-commit.js"
+import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
+import { claimTurnLease } from "../turns/lease.js"
 import { executionOwnerFence } from "../execution-owner.js"
 import { PgCoordinationStore } from "../mailbox/store.js"
-import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
+import { TASK_GRAPH_TEMPLATES, taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./task-graph-command-port.js"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
+import { defaultSubagentPolicy, type SubagentTaskRecord } from "./types.js"
 import { drainTaskGraphStopOutbox, TASK_GRAPH_STOP_OUTBOX_TOPIC } from "./task-graph-stop-outbox.js"
 import { taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 
@@ -62,6 +73,13 @@ const SUMMARY_DEPENDENCY_PROJECTION_ITEM = {
   },
 } as const
 const planLedgerTraceArtifactPath = process.env.AGENT_PLAN_LEDGER_TRACE_ARTIFACT_PATH
+const SELECTED_JOB_DRAFT_CALL_ID = "ac6-selected-job-draft-receipt"
+const SELECTED_JOB_REVIEW_READ_CALL_ID = "ac6-selected-job-review-read"
+const SELECTED_JOB_REVIEW_CALL_ID = "ac6-selected-job-review-receipt"
+
+function selectedJobDraftCallId(attemptCount: number): string {
+  return `${SELECTED_JOB_DRAFT_CALL_ID}:attempt:${attemptCount}`
+}
 
 function dedicatedDatabaseUrl(): string | null {
   const value = process.env.AGENT_RUNTIME_PG_TEST_URL
@@ -1009,6 +1027,637 @@ async function activateFixtureTurn(pool: Pool, value: Fixture): Promise<void> {
   if (activated.rowCount !== 1) throw new Error("TaskGraph fixture turn was not parked before activation")
 }
 
+type SelectedJobFixtureSources = { readonly jobId: string; readonly otherJobId: string; readonly resumeId: string }
+
+function selectedJobSourceCanaries(jobId: string, worker: 1 | 2): readonly string[] {
+  const prefix = "p3-selected-job-"
+  if (!jobId.startsWith(prefix) || jobId.length <= prefix.length) throw new Error("Selected-job source canaries are unavailable")
+  const suffix = jobId.slice(prefix.length)
+  return [
+    `AC6_TRANSIENT_JOB_SOURCE_W${worker}_${suffix}`,
+    `AC6_TRANSIENT_RESUME_SOURCE_W${worker}_${suffix}`,
+    `AC6_TRANSIENT_PERSONA_SOURCE_W${worker}_${suffix}`,
+  ]
+}
+
+function selectedJobFixtureSources(value: Fixture): SelectedJobFixtureSources {
+  return {
+    jobId: `p3-selected-job-${value.suffix}`,
+    otherJobId: `p3-other-job-${value.suffix}`,
+    resumeId: `p3-selected-job-resume-${value.suffix}`,
+  }
+}
+
+async function seedSelectedJobSources(pool: Pool, value: Fixture): Promise<SelectedJobFixtureSources> {
+  const ids = selectedJobFixtureSources(value)
+  await pool.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "location", "status", "url", "description", "source", "updatedAt")
+    VALUES ($1, $2, 'Fixture GmbH', 'Software Engineer', 'Berlin', 'saved', 'https://jobs.example.invalid/selected', $3, 'test', CURRENT_TIMESTAMP),
+      ($4, $2, 'Other Fixture GmbH', 'Designer', 'Dublin', 'saved', 'https://jobs.example.invalid/other', 'Design clear products', 'test', CURRENT_TIMESTAMP)`, [
+    ids.jobId, value.userId, `AC6_TRANSIENT_JOB_SOURCE_W1_${value.suffix}`, ids.otherJobId,
+  ])
+  await pool.query(`INSERT INTO "Resume" ("id", "userId", "name", "content", "kind", "origin", "isDefault", "updatedAt")
+    VALUES ($1, $2, 'Selected-job integration base', $3::jsonb, 'base', 'manual', TRUE, CURRENT_TIMESTAMP)`, [
+    ids.resumeId, value.userId, JSON.stringify({ text: `AC6_TRANSIENT_RESUME_SOURCE_W1_${value.suffix}` }),
+  ])
+  await pool.query(`INSERT INTO persona_facts
+    ("id", "userId", "key", "category", "value", "normalized_value", "source", "source_ref", "confidence", "status", "allowedUses", "updated_at")
+    VALUES ($1, $2, 'language', 'language', $3, 'english-c1', 'resume', $4, 0.98, 'confirmed', ARRAY['cover_letter']::text[], CURRENT_TIMESTAMP)`, [
+    `p3-selected-job-fact-${value.suffix}`, value.userId, `AC6_TRANSIENT_PERSONA_SOURCE_W1_${value.suffix}`, `resume:${ids.resumeId}:language`,
+  ])
+  return ids
+}
+
+type SelectedJobArtifactReference = {
+  readonly artifactId: string
+  readonly version: number
+  readonly contentHash: string
+  readonly sourceDigest: string
+}
+
+type SelectedJobArtifactRestartPlan = {
+  readonly store: PgSubagentTaskStore
+  readonly rootTaskId: string
+  readonly writerTask: SubagentTaskRecord
+  readonly queueName: string
+  readonly jobId: string
+  readonly otherJobId: string
+  readonly body: string
+  readonly originalPreparation: Awaited<ReturnType<typeof loadSelectedJobArtifactContext>>
+}
+
+type SelectedJobArtifactRestartTrace = SelectedJobArtifactRestartPlan & {
+  readonly writerOwnerId: string
+  readonly writerAttemptCount: number
+  readonly writerDraftCallId: string
+  readonly writerRequestHash: string
+  readonly writerFence: AgentArtifactTaskFence
+  readonly artifactRef: SelectedJobArtifactReference
+}
+
+type SelectedJobArtifactReviewTrace = SelectedJobArtifactRestartTrace & {
+  readonly currentPreparation: Awaited<ReturnType<typeof loadSelectedJobArtifactContext>>
+  readonly reviewerTask: SubagentTaskRecord
+  readonly stopReviewerTask: SubagentTaskRecord
+}
+
+function selectedJobArtifactReference(value: unknown): SelectedJobArtifactReference {
+  const row = record(value)
+  const ref = record(row?.artifactRef) ?? record(record(row?.structuredResult)?.artifactRef) ?? row
+  if (!ref || typeof ref.artifactId !== "string" || !Number.isSafeInteger(ref.version)
+    || typeof ref.contentHash !== "string" || typeof ref.sourceDigest !== "string") {
+    throw new Error("Selected-job Worker did not return a valid artifact reference")
+  }
+  return { artifactId: ref.artifactId, version: Number(ref.version), contentHash: ref.contentHash, sourceDigest: ref.sourceDigest }
+}
+
+function selectedJobTaskFence(task: SubagentTaskRecord, leaseOwner: string, attemptCount: number): AgentArtifactTaskFence {
+  if (!task.turnId || !task.parentTaskId || !leaseOwner || !Number.isSafeInteger(attemptCount)) {
+    throw new Error("Selected-job task is missing its durable lease fence identity")
+  }
+  return {
+    taskId: task.id, userId: task.userId, sessionId: task.sessionId, turnId: task.turnId,
+    rootTaskId: task.rootTaskId, parentTaskId: task.parentTaskId, leaseOwner, attemptCount,
+  }
+}
+
+function selectedJobTaskReceiptRequestHash(
+  op: string,
+  scope: {
+    readonly taskFence: AgentArtifactTaskFence
+    readonly [key: string]: unknown
+  },
+  input: unknown,
+): string {
+  const { taskFence, ...stableScope } = scope
+  return hashArtifactContent({
+    op, ...stableScope,
+    turnId: taskFence.turnId, rootTaskId: taskFence.rootTaskId, parentTaskId: taskFence.parentTaskId, input,
+  })
+}
+
+function selectedJobDraftRequestHash(
+  scope: { readonly taskFence: AgentArtifactTaskFence; readonly [key: string]: unknown },
+  input: unknown,
+): string {
+  return selectedJobTaskReceiptRequestHash("cover_letter.draft", scope, input)
+}
+
+async function createSelectedJobTaskGraph(
+  pool: Pool,
+  value: Fixture,
+  sources: SelectedJobFixtureSources,
+  queueName: string,
+): Promise<SelectedJobArtifactRestartPlan> {
+  const store = new PgSubagentTaskStore(pool, 300_000)
+  const root = await store.create({
+    userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+    role: "supervisor", taskType: "task_graph", goal: "Coordinate a selected-job artifact fixture",
+    allowedActions: ["jobs.get", "persona.retrieve", "resume.get_base", "cover_letter.draft", "artifact.version.read", "artifact.review"],
+    expectedOutputSchema: {}, toolPolicySnapshot: {}, budgetSnapshot: { limits: { maxSteps: 32, maxToolCalls: 16 } },
+    policy: defaultSubagentPolicy(),
+  })
+  const linkedTurn = await pool.query(`UPDATE "agent_turns" SET "rootTaskId" = $2, "updatedAt" = CURRENT_TIMESTAMP
+    WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4 AND "status" = 'waiting_for_user' AND "rootTaskId" IS NULL`, [
+    value.turnId, root.id, value.sessionId, value.userId,
+  ])
+  if (linkedTurn.rowCount !== 1) throw new Error("Selected-job fixture turn was not available for its root task")
+  const writerTask = await store.create({
+    userId: value.userId, sessionId: value.sessionId, turnId: value.turnId, parentTaskId: root.id,
+    role: "writer", taskType: "cover_letter_draft", goal: "Draft a cover letter for the selected job",
+    successCriteria: ["Persist one selected-job artifact version"],
+    allowedActions: ["jobs.get", "persona.retrieve", "resume.get_base", "cover_letter.draft"],
+    context: { selectedJobPreparation: { jobId: sources.jobId } },
+    expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "writer" },
+    toolPolicySnapshot: {}, policy: defaultSubagentPolicy(),
+  })
+  return {
+    store, rootTaskId: root.id, writerTask, queueName,
+    jobId: sources.jobId, otherJobId: sources.otherJobId,
+    body: `AC6_PRIVATE_COVER_LETTER_${value.suffix}`,
+    originalPreparation: await loadSelectedJobArtifactContext(pool, value.userId, sources.jobId),
+  }
+}
+
+async function prepareSelectedJobTerminalCase(pool: Pool, value: Fixture) {
+  await seed(pool, value, "waiting_for_user")
+  const sources = await seedSelectedJobSources(pool, value)
+  const preparation = await loadSelectedJobArtifactContext(pool, value.userId, sources.jobId)
+  const tasks = new PgSubagentTaskStore(pool, 300_000)
+  const root = await tasks.create({
+    userId: value.userId, sessionId: value.sessionId, turnId: value.turnId, role: "supervisor", taskType: "task_graph",
+    goal: "Complete the selected-job draft review before finalizing",
+    allowedActions: ["jobs.get", "persona.retrieve", "resume.get_base", "cover_letter.draft", "artifact.version.read", "artifact.review"],
+    expectedOutputSchema: {}, toolPolicySnapshot: {}, budgetSnapshot: { limits: { maxSteps: 16, maxToolCalls: 16 } }, policy: defaultSubagentPolicy(),
+  })
+  const linked = await pool.query(`UPDATE "agent_turns" SET "rootTaskId" = $2, "updatedAt" = CURRENT_TIMESTAMP
+    WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4 AND "status" = 'waiting_for_user' AND "rootTaskId" IS NULL`, [
+    value.turnId, root.id, value.sessionId, value.userId,
+  ])
+  if (linked.rowCount !== 1) throw new Error("Finalization fixture root could not be linked")
+  await activateFixtureTurn(pool, value)
+  const lease = await claimTurnLease(pool, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
+  const rootLease = await tasks.claim({ taskId: root.id, sessionId: value.sessionId, ownerId: value.ownerId, policy: defaultSubagentPolicy(), now: new Date() })
+  if (!rootLease?.leaseOwner) throw new Error("Finalization fixture root did not acquire a live lease")
+  const stepId = `p3-finalization-step-${value.suffix}`
+  await pool.query(`INSERT INTO "agent_steps"
+    ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
+    VALUES ($1, $2, $3, $4, 0, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`, [stepId, value.sessionId, value.turnId, root.id])
+  const commandPort = createPgTaskGraphCommandPort(pool)
+  const graphScope = {
+    userId: value.userId, sessionId: value.sessionId, turnId: value.turnId, rootTaskId: root.id, parentTaskId: root.id, stepId,
+    turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: value.ownerId, parentAttemptCount: rootLease.attemptCount,
+  }
+  const plan = await commandPort.appendAndSchedule({
+    scope: graphScope,
+    proposal: { expectedRevision: 0, nodes: [
+      { key: "writer", templateId: "cover_letter_writer", goal: "Persist one selected-job draft", successCriteria: ["Save the draft"], dependsOn: [] },
+      { key: "reviewer", templateId: "cover_letter_reviewer", goal: "Review the selected-job draft", successCriteria: ["Persist a passed review"], dependsOn: ["writer"] },
+    ] },
+    templates: taskGraphTemplatesForSelectedJob(preparation.preparation),
+  })
+  const taskId = (key: string) => {
+    const found = plan.nodes.find(node => node.key === key)?.taskId
+    if (!found) throw new Error(`Finalization fixture graph is missing ${key}`)
+    return found
+  }
+  const writerOwner = `p3-finalization-writer-${value.suffix}`
+  const writer = await tasks.claim({ taskId: taskId("writer"), sessionId: value.sessionId, ownerId: writerOwner, policy: defaultSubagentPolicy(), now: new Date() })
+  if (!writer?.leaseOwner) throw new Error("Finalization fixture Writer did not acquire a live lease")
+  const artifacts = createArtifactToolStore(pool)
+  const base = await resolveCoverLetterBase(artifacts, value.userId, sources.jobId)
+  const draftInput = { baseArtifactId: base.artifactId, baseHash: base.baseHash, content: `AC6_PRIVATE_FINALIZATION_DRAFT_${value.suffix}`, constraints: { maxWords: 160 } }
+  const writerScope = {
+    ...preparation.preparation, userId: value.userId, sessionId: value.sessionId, taskId: writer.id,
+    toolCallId: `p3-finalization-writer:${writer.attemptCount}`, taskFence: selectedJobTaskFence(writer, writerOwner, writer.attemptCount),
+  }
+  const draft = await artifacts.writeDraft(writerScope, { ...draftInput, requestHash: selectedJobDraftRequestHash(writerScope, draftInput) })
+  const artifactRef = { artifactId: draft.artifactId, version: draft.version, contentHash: draft.contentHash, sourceDigest: draft.sourceDigest }
+  await tasks.finish({ taskId: writer.id, sessionId: value.sessionId, ownerId: writerOwner, attemptCount: writer.attemptCount, status: "completed",
+    result: { status: "completed", finalText: "Draft saved", finalItemId: null, stepCount: 1, toolCallCount: 1,
+      structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef } }, now: new Date() })
+  const reviewerOwner = `p3-finalization-reviewer-${value.suffix}`
+  const reviewer = await tasks.claim({ taskId: taskId("reviewer"), sessionId: value.sessionId, ownerId: reviewerOwner, policy: defaultSubagentPolicy(), now: new Date() })
+  if (!reviewer?.leaseOwner) throw new Error("Finalization fixture Reviewer did not acquire a live lease")
+  const reviewInput = { artifactRef, decision: "passed", findings: [] }
+  const reviewerScope = {
+    ...preparation.preparation, userId: value.userId, sessionId: value.sessionId, taskId: reviewer.id,
+    toolCallId: `p3-finalization-reviewer:${reviewer.attemptCount}`, taskFence: selectedJobTaskFence(reviewer, reviewerOwner, reviewer.attemptCount),
+  }
+  const reviewHash = hashArtifactContent({ artifactRef, currentSourceDigest: preparation.preparation.sourceDigest, status: "passed", findings: [], evidenceRefs: preparation.preparation.evidenceRefs })
+  await artifacts.saveReview({
+    userId: value.userId, sessionId: value.sessionId, jobId: sources.jobId, artifactId: artifactRef.artifactId, version: artifactRef.version,
+    contentHash: artifactRef.contentHash, sourceDigest: artifactRef.sourceDigest, currentSourceDigest: preparation.preparation.sourceDigest,
+    status: "passed", findings: [], evidenceRefs: [...preparation.preparation.evidenceRefs], taskId: reviewer.id, toolCallId: reviewerScope.toolCallId,
+    requestHash: selectedJobTaskReceiptRequestHash("artifact.review", reviewerScope, reviewInput), reviewHash, taskFence: reviewerScope.taskFence,
+  })
+  await tasks.finish({ taskId: reviewer.id, sessionId: value.sessionId, ownerId: reviewerOwner, attemptCount: reviewer.attemptCount, status: "completed",
+    result: { status: "completed", finalText: "Review passed", finalItemId: null, stepCount: 1, toolCallCount: 1,
+      structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed", artifactRef, reviewStatus: "passed", reviewHash } }, now: new Date() })
+  const artifactRepository = createAgentArtifactRepository(pool)
+  const gate = await selectedJobArtifactCompletionGateWithWitness({
+    commandPort, lease, root: { id: root.id, attemptCount: rootLease.attemptCount }, selectedJobId: sources.jobId,
+    readCurrentDraftHead: scope => artifactRepository.findCurrentDraftHead(scope),
+    readCurrentSourceDigest: async () => (await loadSelectedJobArtifactContext(pool, value.userId, sources.jobId)).preparation.sourceDigest,
+    readCurrentReviewReceipt: scope => artifactRepository.findReviewReceipt(scope),
+  })
+  if (!gate.ok) throw new Error("Finalization fixture did not produce a successful selected-job gate")
+  const ownerFence = executionOwnerFence({ kind: "turn", taskId: root.id, lease })
+  if (ownerFence.kind !== "turn") throw new Error("Finalization fixture owner is not a Turn lease")
+  const owner = ownerFence
+  const engineStore = createPgTurnEngineStore(pool)
+  await engineStore.updateStep({ owner, stepId, status: "completed", finishReason: "stop", errorCode: null, inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0, now: new Date() })
+  await engineStore.appendEvent({
+    owner, id: `p3-finalization-step-event-${value.suffix}`, itemId: null, type: "step.completed", correlationId: stepId, causationId: null,
+    idempotencyKey: `turn:${value.turnId}:event:step-completed:${stepId}`, payload: { stepId, status: "completed" },
+  })
+  return {
+    value, sources, preparation, tasks, root, rootLease, lease, commandPort, artifacts, artifactRef, graphScope,
+    acceptedGraphWitness: gate.witness, stepId,
+    terminalInput: {
+      owner, response: "Selected-job draft review complete", now: new Date(), stepId,
+      finalItemId: `p3-finalization-item-${value.suffix}`, finalContent: { parts: [{ type: "text", text: "Selected-job draft review complete" }] },
+      stepCount: 1, toolCallCount: 0, usage: { inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0 },
+    },
+  }
+}
+
+function selectedJobFinalizationGuardForCase(prepared: Awaited<ReturnType<typeof prepareSelectedJobTerminalCase>>) {
+  return (client: PoolClient) => selectedJobArtifactFinalizationGuard({
+    client, commandPort: prepared.commandPort, lease: prepared.lease,
+    root: { id: prepared.root.id, attemptCount: prepared.rootLease.attemptCount }, selectedJobId: prepared.sources.jobId,
+    acceptedGraphWitness: prepared.acceptedGraphWitness,
+    readCurrentDraftHead: findCurrentDraftHeadWithClient,
+    readCurrentSourceDigest: (current, scope) => readSelectedJobSourceDigestWithClient(current, scope.userId, scope.jobId),
+    readCurrentReviewReceipt: findReviewReceiptWithClient,
+  })
+}
+
+async function expectNoTerminalRecords(pool: Pool, prepared: Awaited<ReturnType<typeof prepareSelectedJobTerminalCase>>): Promise<void> {
+  const [turn, root, item, events, outboxes] = await Promise.all([
+    pool.query<{ status: string; finalResponse: string | null }>(`SELECT "status", "finalResponse" FROM "agent_turns" WHERE "id" = $1`, [prepared.value.turnId]),
+    pool.query<{ status: string }>(`SELECT "status" FROM "sub_agent_tasks" WHERE "id" = $1`, [prepared.root.id]),
+    pool.query(`SELECT "id" FROM "agent_items" WHERE "id" = $1`, [prepared.terminalInput.finalItemId]),
+    pool.query(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3`, [prepared.value.sessionId, prepared.value.turnId, prepared.terminalInput.finalItemId]),
+    pool.query(`SELECT "id" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "payload"->>'itemId' = $2`, [prepared.value.sessionId, prepared.terminalInput.finalItemId]),
+  ])
+  expect(turn.rows[0]).toEqual({ status: "in_progress", finalResponse: null })
+  expect(root.rows[0]?.status).toBe("running")
+  expect(item.rows).toHaveLength(0)
+  expect(events.rows).toHaveLength(0)
+  expect(outboxes.rows).toHaveLength(0)
+}
+
+function selectedJobSettlement(line: string, taskId: string): RecordValue {
+  const prefix = `P3_SELECTED_JOB_CHILD_SETTLED ${taskId} `
+  if (!line.startsWith(prefix)) throw new Error("Selected-job Worker settlement marker did not match its task")
+  const value = record(JSON.parse(line.slice(prefix.length)) as unknown)
+  if (!value) throw new Error("Selected-job Worker settlement marker was not an object")
+  return value
+}
+
+async function traceSelectedJobWriterFromWorker(
+  plan: SelectedJobArtifactRestartPlan,
+  line: string,
+): Promise<SelectedJobArtifactRestartTrace> {
+  const settlement = selectedJobSettlement(line, plan.writerTask.id)
+  expect(settlement).toMatchObject({
+    role: "writer", taskId: plan.writerTask.id, managerStatus: "completed", childStatus: "completed",
+    observations: { sourceCanariesReloaded: { job: true, resume: true, persona: true } },
+  })
+  if (typeof settlement.ownerId !== "string" || !Number.isSafeInteger(settlement.attemptCount)) {
+    throw new Error("Selected-job Worker did not report a valid lease identity")
+  }
+  const writerAttemptCount = Number(settlement.attemptCount)
+  const writerDraftCallId = selectedJobDraftCallId(writerAttemptCount)
+  const draftInput = {
+    baseArtifactId: `cover-letter-base:${hashArtifactContent({ userId: plan.writerTask.userId, jobId: plan.jobId }).slice(7)}`,
+    baseHash: hashArtifactContent({ kind: "cover_letter_base", jobId: plan.jobId }),
+    content: plan.body,
+    constraints: { maxWords: 160 },
+  }
+  const writerFence = selectedJobTaskFence(plan.writerTask, settlement.ownerId, writerAttemptCount)
+  const writerScope = {
+    ...plan.originalPreparation.preparation,
+    userId: plan.writerTask.userId,
+    sessionId: plan.writerTask.sessionId,
+    taskId: plan.writerTask.id,
+    toolCallId: writerDraftCallId,
+    taskFence: writerFence,
+  }
+  const writerRequestHash = selectedJobDraftRequestHash(writerScope, draftInput)
+  const artifactRef = selectedJobArtifactReference(settlement.artifactRef)
+  expect(artifactRef.version).toBe(1)
+  expect(artifactRef.sourceDigest).toBe(plan.originalPreparation.preparation.sourceDigest)
+  const version = await plan.store.get(plan.writerTask.id, plan.writerTask.sessionId)
+  expect(version).toMatchObject({ status: "completed", role: "writer", attemptCount: writerAttemptCount })
+  return {
+    ...plan, writerOwnerId: settlement.ownerId, writerAttemptCount, writerDraftCallId,
+    writerRequestHash, writerFence, artifactRef,
+  }
+}
+
+async function enqueueSelectedJobTask(
+  queueName: string,
+  connection: Redis,
+  task: SubagentTaskRecord,
+  ownerId: string,
+): Promise<void> {
+  const { enqueueSubagentTask } = await import("../../queue/subagent-queue.js")
+  const queue = new Queue(queueName, { connection, skipVersionCheck: true })
+  try {
+    await enqueueSubagentTask(queue, { taskId: task.id, sessionId: task.sessionId, rootTaskId: task.rootTaskId, ownerId }, 1)
+  } finally {
+    await queue.close()
+  }
+}
+
+async function enqueueSelectedJobReviewTasksBeforeWorkerTwo(
+  pool: Pool,
+  connection: Redis,
+  value: Fixture,
+  trace: SelectedJobArtifactReviewTrace,
+): Promise<void> {
+  const { SUBAGENT_DISPATCH_TOPIC, subagentDispatchKey } = await import("../../queue/subagent-queue.js")
+  const tasks = [
+    { task: trace.reviewerTask, ownerId: `ac6-reviewer-worker-two-${value.suffix}` },
+    { task: trace.stopReviewerTask, ownerId: `ac6-stop-reviewer-worker-two-${value.suffix}` },
+  ]
+  for (const { task, ownerId } of tasks) {
+    const payload = { taskId: task.id, sessionId: task.sessionId, rootTaskId: task.rootTaskId, ownerId }
+    const inserted = await pool.query<{ id: string }>(
+      `INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
+       VALUES ($1, $2, $3, $4, $5::jsonb)
+       ON CONFLICT ("idempotencyKey") DO NOTHING
+       RETURNING "id"`,
+      [randomUUID(), SUBAGENT_DISPATCH_TOPIC, task.sessionId, subagentDispatchKey(task.id), JSON.stringify(payload)],
+    )
+    const dispatchId = inserted.rows[0]?.id
+    if (inserted.rowCount !== 1 || !dispatchId) {
+      throw new Error("Selected-job fixture dispatch marker already exists or could not be persisted")
+    }
+    await enqueueSelectedJobTask(trace.queueName, connection, task, ownerId)
+    const published = await pool.query<{ id: string }>(
+      `UPDATE "agent_outbox" SET "publishedAt" = CURRENT_TIMESTAMP
+       WHERE "id" = $1 AND "topic" = $2 AND "aggregateId" = $3 AND "publishedAt" IS NULL
+       RETURNING "id"`,
+      [dispatchId, SUBAGENT_DISPATCH_TOPIC, task.sessionId],
+    )
+    if (published.rowCount !== 1 || published.rows[0]?.id !== dispatchId) {
+      throw new Error("Selected-job fixture dispatch marker could not be marked published after enqueue")
+    }
+  }
+}
+
+async function prepareSelectedJobReviewAfterRestart(
+  pool: Pool,
+  value: Fixture,
+  trace: SelectedJobArtifactRestartTrace,
+): Promise<SelectedJobArtifactReviewTrace> {
+  const artifactStore = createArtifactToolStore(pool)
+  const durableVersion = await artifactStore.readVersion({ userId: value.userId, sessionId: value.sessionId, jobId: trace.jobId }, trace.artifactRef)
+  expect(durableVersion).toMatchObject({
+    version: 1, content: trace.body, contentHash: trace.artifactRef.contentHash,
+    userId: value.userId, sessionId: value.sessionId, jobId: trace.jobId,
+    sourceDigest: trace.originalPreparation.preparation.sourceDigest,
+    provenanceRefs: trace.originalPreparation.preparation.evidenceRefs,
+    evidenceRefs: trace.originalPreparation.preparation.evidenceRefs,
+    taskId: trace.writerTask.id, toolCallId: trace.writerDraftCallId, requestHash: trace.writerRequestHash,
+  })
+
+  const completedWriter = await trace.store.get(trace.writerTask.id, value.sessionId)
+  expect(completedWriter).toMatchObject({ status: "completed", role: "writer", rootTaskId: trace.rootTaskId, parentTaskId: trace.rootTaskId })
+  if (!completedWriter) throw new Error("Completed selected-job Writer task disappeared")
+  const workerTwoSources = selectedJobSourceCanaries(trace.jobId, 2)
+  const updatedSources = await Promise.all([
+    pool.query(`UPDATE "Job" SET "description" = $3, "updatedAt" = CURRENT_TIMESTAMP
+      WHERE "id" = $1 AND "userId" = $2`, [trace.jobId, value.userId, workerTwoSources[0]]),
+    pool.query(`UPDATE "Resume" SET "content" = $3::jsonb, "updatedAt" = CURRENT_TIMESTAMP
+      WHERE "id" = $1 AND "userId" = $2`, [
+      selectedJobFixtureSources(value).resumeId, value.userId, JSON.stringify({ text: workerTwoSources[1] }),
+    ]),
+    pool.query(`UPDATE persona_facts SET "value" = $3, "updated_at" = CURRENT_TIMESTAMP
+      WHERE "id" = $1 AND "userId" = $2`, [`p3-selected-job-fact-${value.suffix}`, value.userId, workerTwoSources[2]]),
+  ])
+  if (updatedSources.some(result => result.rowCount !== 1)) throw new Error("Selected-job transient source fixture update failed")
+  const currentPreparation = await loadSelectedJobArtifactContext(pool, value.userId, trace.jobId)
+  expect(currentPreparation.preparation.sourceDigest).not.toBe(trace.artifactRef.sourceDigest)
+  const dependencyScope = {
+    userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+    rootTaskId: trace.rootTaskId, parentTaskId: trace.rootTaskId,
+  }
+  const reviewerContext = materializeTaskGraphDependencyContext(
+    { selectedJobPreparation: { jobId: trace.jobId } }, dependencyScope, ["writer"], [{
+      ...dependencyScope, key: "writer", taskId: completedWriter.id, status: completedWriter.status,
+      role: completedWriter.role, expectedOutputSchema: completedWriter.expectedOutputSchema, result: completedWriter.result,
+    }],
+  )
+  const createReviewer = (goal: string) => trace.store.create({
+    userId: value.userId, sessionId: value.sessionId, turnId: value.turnId, parentTaskId: trace.rootTaskId,
+    role: "reviewer", taskType: "cover_letter_review", goal,
+    successCriteria: ["Read the exact Writer artifact and persist its review result"],
+    allowedActions: ["artifact.version.read", "artifact.review"], context: reviewerContext,
+    expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer" },
+    toolPolicySnapshot: {}, policy: defaultSubagentPolicy(),
+  })
+  const [reviewerTask, stopReviewerTask] = await Promise.all([
+    createReviewer("Review the changed-source selected-job artifact"),
+    createReviewer("Attempt selected-job review while Stop fences the write"),
+  ])
+  for (const child of [reviewerTask, stopReviewerTask]) {
+    expect(child).toMatchObject({
+      userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+      rootTaskId: trace.rootTaskId, parentTaskId: trace.rootTaskId, role: "reviewer",
+    })
+    const dependency = record(record(child.context)?.taskGraphDependencyResults)
+    const items = Array.isArray(dependency?.items) ? dependency.items.map(record).filter((item): item is RecordValue => item !== null) : []
+    expect(items).toHaveLength(1)
+    expect(items[0]).toMatchObject({ dependencyKey: "writer", role: "writer", taskStatus: "completed" })
+    expect(items[0]).not.toHaveProperty("taskId")
+    expect(items[0]).toMatchObject({
+      result: {
+        schemaVersion: "agent-harness.v2.task-graph.result-projection",
+        trust: "untrusted", availability: "available", role: "writer", status: "completed",
+        artifactRef: trace.artifactRef,
+      },
+    })
+  }
+  return { ...trace, currentPreparation, reviewerTask, stopReviewerTask }
+}
+
+async function reviewSelectedJobThroughRestartedWorker(
+  pool: Pool,
+  value: Fixture,
+  trace: SelectedJobArtifactReviewTrace,
+  firstWorker: ProcessFixtureChild,
+  worker: ProcessFixtureChild,
+): Promise<void> {
+  const artifactStore = createArtifactToolStore(pool)
+  const reviewLine = await waitForProcessLine(worker, `P3_SELECTED_JOB_CHILD_SETTLED ${trace.reviewerTask.id} `, 30_000)
+  const reviewSettlement = selectedJobSettlement(reviewLine, trace.reviewerTask.id)
+  expect(reviewSettlement).toMatchObject({
+    role: "reviewer", taskId: trace.reviewerTask.id, managerStatus: "completed", childStatus: "completed",
+    artifactRef: trace.artifactRef, reviewStatus: "stale",
+    observations: {
+      sawBody: true, privateBodyAbsentBeforeRead: true,
+      sourceCanariesReloaded: { job: true, resume: true, persona: true },
+      previousSourceCanariesAbsent: { job: true, resume: true, persona: true },
+      preReadContextHash: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+      reviewStatus: "stale", writerReceiptReferenceRecovered: true,
+    },
+  })
+  const reviewAttempt = Number(reviewSettlement.attemptCount)
+  const readCallId = `${SELECTED_JOB_REVIEW_READ_CALL_ID}:attempt:${reviewAttempt}`
+  const reviewCallId = `${SELECTED_JOB_REVIEW_CALL_ID}:attempt:${reviewAttempt}`
+  if (typeof reviewSettlement.ownerId !== "string") throw new Error("Selected-job reviewer did not report its lease owner")
+  const reviewInput = { artifactRef: trace.artifactRef, decision: "passed", findings: [] }
+  const reviewScope = {
+    ...trace.currentPreparation.preparation,
+    userId: value.userId, sessionId: value.sessionId, taskId: trace.reviewerTask.id,
+    toolCallId: reviewCallId,
+    taskFence: selectedJobTaskFence(trace.reviewerTask, reviewSettlement.ownerId, reviewAttempt),
+  }
+  const expectedReviewRequestHash = selectedJobTaskReceiptRequestHash("artifact.review", reviewScope, reviewInput)
+  const persistedReview = await pool.query<{
+    userId: string; sessionId: string; jobId: string; artifactId: string; version: number; contentHash: string;
+    sourceDigest: string; currentSourceDigest: string; status: string; findings: unknown; evidenceRefs: unknown;
+    taskId: string; toolCallId: string; requestHash: string; reviewHash: string
+  }>(`SELECT "userId", "sessionId", "jobId", "artifactId", "version", "contentHash", "sourceDigest", "currentSourceDigest",
+      "status", "findings", "evidenceRefs", "taskId", "toolCallId", "requestHash", "reviewHash" FROM "agent_artifact_review"
+      WHERE "taskId" = $1 AND "toolCallId" = $2`, [trace.reviewerTask.id, reviewCallId])
+  expect(persistedReview.rows).toHaveLength(1)
+  expect(persistedReview.rows[0]).toMatchObject({
+    userId: value.userId, sessionId: value.sessionId, jobId: trace.jobId,
+    artifactId: trace.artifactRef.artifactId, version: trace.artifactRef.version,
+    contentHash: trace.artifactRef.contentHash,
+    status: "stale", sourceDigest: trace.artifactRef.sourceDigest,
+    currentSourceDigest: trace.currentPreparation.preparation.sourceDigest,
+    findings: [], evidenceRefs: [], taskId: trace.reviewerTask.id, toolCallId: reviewCallId,
+    requestHash: expectedReviewRequestHash,
+  })
+  expect(persistedReview.rows[0]?.sourceDigest).not.toBe(persistedReview.rows[0]?.currentSourceDigest)
+  expect(reviewSettlement.reviewHash).toBe(persistedReview.rows[0]?.reviewHash)
+
+  const wrongUserRead = await artifactStore.readVersion({
+    userId: `foreign-${value.suffix}`, sessionId: value.sessionId, jobId: trace.jobId,
+  }, trace.artifactRef)
+  const wrongJobRead = await artifactStore.readVersion({
+    userId: value.userId, sessionId: value.sessionId, jobId: trace.otherJobId,
+  }, trace.artifactRef)
+  const wrongSessionRead = await artifactStore.readVersion({
+    userId: value.userId, sessionId: `foreign-session-${value.suffix}`, jobId: trace.jobId,
+  }, trace.artifactRef)
+  expect(wrongUserRead).toBeNull()
+  expect(wrongJobRead).toBeNull()
+  expect(wrongSessionRead).toBeNull()
+  const reviewRef = trace.artifactRef
+  const scopedReview = await artifactStore.findReview({ userId: value.userId, sessionId: value.sessionId, jobId: trace.jobId }, reviewRef)
+  expect(scopedReview).toMatchObject({ status: "stale", taskId: trace.reviewerTask.id, toolCallId: reviewCallId })
+  await expect(artifactStore.findReview({
+    userId: `foreign-user-${value.suffix}`, sessionId: value.sessionId, jobId: trace.jobId,
+  }, reviewRef)).resolves.toBeNull()
+  await expect(artifactStore.findReview({
+    userId: value.userId, sessionId: `foreign-session-${value.suffix}`, jobId: trace.jobId,
+  }, reviewRef)).resolves.toBeNull()
+  await expect(artifactStore.findReview({
+    userId: value.userId, sessionId: value.sessionId, jobId: trace.otherJobId,
+  }, reviewRef)).resolves.toBeNull()
+
+  await waitForProcessLine(worker, `P3_SELECTED_JOB_STOP_REVIEW_QUEUED ${trace.stopReviewerTask.id}`, 30_000)
+  worker.stdin?.write(`start-selected-job-review:${trace.stopReviewerTask.id}\n`)
+  await waitForProcessLine(worker, `P3_SELECTED_JOB_STOP_REVIEW_READY ${trace.stopReviewerTask.id}`, 30_000)
+  const liveStopTask = await trace.store.get(trace.stopReviewerTask.id, value.sessionId)
+  if (!liveStopTask?.leaseOwner || liveStopTask.status !== "running") throw new Error("Stop-review fixture did not hold a live Worker lease")
+  const stopFence = selectedJobTaskFence(liveStopTask, liveStopTask.leaseOwner, liveStopTask.attemptCount)
+  const interrupted = await trace.store.interruptSubtree({
+    sessionId: value.sessionId, rootTaskId: trace.rootTaskId, targetPath: liveStopTask.path, now: new Date(),
+  })
+  expect(interrupted).toBe(1)
+  const stoppedReviewInput = {
+    userId: value.userId, sessionId: value.sessionId, jobId: trace.jobId,
+    artifactId: trace.artifactRef.artifactId, version: trace.artifactRef.version,
+    contentHash: trace.artifactRef.contentHash, sourceDigest: trace.artifactRef.sourceDigest,
+    currentSourceDigest: trace.currentPreparation.preparation.sourceDigest, status: "stale" as const,
+    findings: [], evidenceRefs: [], taskId: trace.stopReviewerTask.id,
+    toolCallId: `ac6-stop-review-write:${trace.stopReviewerTask.id}`,
+    requestHash: hashArtifactContent({ op: "artifact.review", call: trace.stopReviewerTask.id, artifactRef: trace.artifactRef }),
+    reviewHash: hashArtifactContent({ status: "stale", artifactRef: trace.artifactRef }), taskFence: stopFence,
+  }
+  await expect(artifactStore.saveReview(stoppedReviewInput)).rejects.toMatchObject({ code: "task_fence_denied" })
+  const countAfterStop = await pool.query<{ count: number }>(
+    `SELECT COUNT(*)::int AS "count" FROM "agent_artifact_review" WHERE "taskId" = $1`, [trace.stopReviewerTask.id],
+  )
+  expect(countAfterStop.rows[0]?.count).toBe(0)
+
+  worker.stdin?.write(`release-selected-job-review:${trace.stopReviewerTask.id}\n`)
+  const stoppedLine = await waitForProcessLine(worker, `P3_SELECTED_JOB_CHILD_SETTLED ${trace.stopReviewerTask.id} `, 30_000)
+  const stoppedSettlement = selectedJobSettlement(stoppedLine, trace.stopReviewerTask.id)
+  expect(stoppedSettlement).toMatchObject({
+    managerStatus: "interrupted",
+    observations: {
+      sawBody: true, privateBodyAbsentBeforeRead: true, writerReceiptReferenceRecovered: true,
+      sourceCanariesReloaded: { job: true, resume: true, persona: true },
+      previousSourceCanariesAbsent: { job: true, resume: true, persona: true },
+      preReadContextHash: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
+    },
+  })
+  const stoppedObservations = record(stoppedSettlement.observations)
+  if (stoppedObservations?.reviewWriteError !== undefined && stoppedObservations.reviewWriteError !== null) {
+    expect(stoppedObservations.reviewWriteError).toBe("private_artifact_review_failed")
+  }
+  const countAfterInterruptedSettlement = await pool.query<{ count: number }>(
+    `SELECT COUNT(*)::int AS "count" FROM "agent_artifact_review" WHERE "taskId" = $1`, [trace.stopReviewerTask.id],
+  )
+  expect(countAfterInterruptedSettlement.rows[0]?.count).toBe(0)
+  const [persistedItems, persistedEvents, persistedOutbox, persistedTasks] = await Promise.all([
+    pool.query<{ content: unknown }>(`SELECT "content" FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = ANY($3::text[])`, [
+      value.sessionId, value.turnId, [trace.writerTask.id, trace.reviewerTask.id, trace.stopReviewerTask.id],
+    ]),
+    pool.query<{ payload: unknown }>(`SELECT "payload" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = ANY($3::text[])`, [
+      value.sessionId, value.turnId, [trace.writerTask.id, trace.reviewerTask.id, trace.stopReviewerTask.id],
+    ]),
+    pool.query<{ payload: unknown }>(`SELECT "payload" FROM "agent_outbox" WHERE "topic" = 'agent.events' AND "aggregateId" = $1`, [value.sessionId]),
+    pool.query<{ context: unknown; result: unknown }>(`SELECT "context", "result" FROM "sub_agent_tasks"
+      WHERE "sessionId" = $1 AND ("id" = $2 OR "rootTaskId" = $2)`, [value.sessionId, trace.rootTaskId]),
+  ])
+  expect(persistedItems.rows.length).toBeGreaterThan(0)
+  expect(persistedEvents.rows.length).toBeGreaterThan(0)
+  expect(persistedTasks.rows.length).toBeGreaterThanOrEqual(3)
+  const publicPersistence = JSON.stringify({
+    items: persistedItems.rows.map(row => row.content),
+    events: persistedEvents.rows.map(row => row.payload),
+    outbox: persistedOutbox.rows.map(row => row.payload),
+    tasks: persistedTasks.rows,
+  })
+  expect(publicPersistence).not.toContain(trace.body)
+  const sourceCanaries = [...selectedJobSourceCanaries(trace.jobId, 1), ...selectedJobSourceCanaries(trace.jobId, 2)]
+  for (const canary of sourceCanaries) expect(publicPersistence).not.toContain(canary)
+  const processLogs = [...firstWorker.output, ...firstWorker.errors, ...worker.output, ...worker.errors].join("\n")
+  expect(processLogs).not.toContain(trace.body)
+  for (const canary of sourceCanaries) expect(processLogs).not.toContain(canary)
+  const draftReceipts = persistedItems.rows.flatMap(row => rowsForToolCall(row.content, trace.writerDraftCallId))
+    .filter(row => Object.prototype.hasOwnProperty.call(row, "output"))
+  expect(draftReceipts.length).toBeGreaterThan(0)
+  const readReceipts = persistedItems.rows.flatMap(row => rowsForToolCall(row.content, readCallId))
+    .filter(row => Object.prototype.hasOwnProperty.call(row, "output"))
+  const reviewReceipts = persistedItems.rows.flatMap(row => rowsForToolCall(row.content, reviewCallId))
+    .filter(row => Object.prototype.hasOwnProperty.call(row, "output"))
+  expect(readReceipts.length).toBeGreaterThan(0)
+  expect(reviewReceipts.length).toBeGreaterThan(0)
+  for (const receipt of draftReceipts) {
+    const output = record(receipt.output)
+    expect(output).not.toBeNull()
+    expect(Object.keys(output ?? {}).sort()).toEqual(["artifactRef"])
+  }
+}
+
+function rowsForToolCall(value: unknown, callId: string): Record<string, unknown>[] {
+  if (Array.isArray(value)) return value.flatMap(item => rowsForToolCall(item, callId))
+  if (!value || typeof value !== "object") return []
+  const row = value as Record<string, unknown>
+  const matched = row.toolCallId === callId ? [row] : []
+  return [...matched, ...Object.values(row).flatMap(child => rowsForToolCall(child, callId))]
+}
+
 function latestToolResult(request: HarnessModelRequest, callId: string): unknown {
   for (let messageIndex = request.messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
     const content = request.messages[messageIndex]!.content
@@ -1315,10 +1964,19 @@ type ProcessFixtureChild = ChildProcess & { output: string[]; errors: string[] }
 const processRestartFixturePath = fileURLToPath(new URL("./task-graph-resume-process-restart.fixture.mjs", import.meta.url))
 const processRestartWorkerCwd = fileURLToPath(new URL("../../../", import.meta.url))
 
-function startTaskGraphRestartWorker(mode: "park-parent" | "resume-parent", value: Record<string, unknown>): ProcessFixtureChild {
+function startTaskGraphRestartWorker(
+  mode: "park-parent" | "resume-parent" | "worker2-input-guard-self-test",
+  value: Record<string, unknown>,
+  envOverrides: Record<string, string> = {},
+): ProcessFixtureChild {
   const child = spawn(process.execPath, ["--import", "tsx", processRestartFixturePath, mode, JSON.stringify(value)], {
     cwd: processRestartWorkerCwd,
-    env: { ...process.env, REDIS_URL: redisUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl! },
+    env: {
+      ...process.env,
+      ...(redisUrl ? { REDIS_URL: redisUrl } : {}),
+      ...(databaseUrl ? { AGENT_RUNTIME_PG_TEST_URL: databaseUrl } : {}),
+      ...envOverrides,
+    },
     stdio: ["pipe", "pipe", "pipe"],
   }) as ProcessFixtureChild
   child.output = []
@@ -2995,17 +3653,59 @@ describe("compact TaskGraph wait failure diagnostics", () => {
   })
 })
 
+describe("Worker 2 private artifact fixture boundary", () => {
+  it("rejects private body and artifact references at any fixture input depth", async () => {
+    const worker = startTaskGraphRestartWorker("worker2-input-guard-self-test", {})
+    await waitForProcessExit(worker, 45_000)
+    expect(worker.exitCode).toBe(0)
+    expect(worker.output).toContain("P3_PRIVATE_FIXTURE_GUARD_OK")
+    expect(worker.errors).toEqual([])
+  }, 60_000)
+})
+
+describe("TaskGraph restart fixture service boundary", () => {
+  it("rejects unsafe PostgreSQL or Redis endpoints before production startup", async () => {
+    const unsafeEnvironmentCases = [
+      {
+        AGENT_RUNTIME_PG_TEST_URL: "not-a-postgres-url",
+        AGENT_TURN_REDIS_TEST_URL: "http://127.0.0.1:6379/14",
+        REDIS_URL: "http://127.0.0.1:6379/14",
+      },
+      {
+        AGENT_RUNTIME_PG_TEST_URL: "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci",
+        AGENT_TURN_REDIS_TEST_URL: "http://127.0.0.1:6379/14",
+        REDIS_URL: "http://127.0.0.1:6379/14",
+      },
+    ]
+    for (const envOverrides of unsafeEnvironmentCases) {
+      const worker = startTaskGraphRestartWorker("park-parent", {}, {
+        CI: "true",
+        AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true",
+        AGENT_TURN_REDIS_TEST_DISPOSABLE: "true",
+        ...envOverrides,
+      })
+      await waitForProcessExit(worker, 45_000)
+      expect(worker.exitCode).toBe(1)
+      expect(worker.errors.join("\n")).toContain("p3_restart_fixture_rejects_non_disposable_service_urls")
+      expect(worker.output).not.toContain("P3_FIRST_WORKER_START_RUNTIME_BEGIN")
+    }
+  }, 120_000)
+})
+
 describeWithServices("production TaskGraph lifecycle and root resume (disposable PostgreSQL + Redis)", () => {
   const owner = fixture()
   const failureOwner = fixture()
   const stopOwner = fixture()
   const restartOwner = fixture()
+  const artifactOwner = fixture()
   const cancelledOwner = fixture()
+  let artifactOwnerSources: SelectedJobFixtureSources | undefined
   let pool: Pool | undefined
   let redis: Redis | undefined
   let bootstrap: ProductionWorkerBootstrap | undefined
   let turnQueueName: string | undefined
   let childQueueName: string | undefined
+  let selectedJobQueueName: string | undefined
 
   beforeAll(async () => {
     pool = new Pool({ connectionString: databaseUrl!, max: 6 })
@@ -3025,6 +3725,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await seed(pool, failureOwner, "waiting_for_user")
     await seed(pool, stopOwner, "waiting_for_user")
     await seed(pool, restartOwner, "waiting_for_user")
+    await seed(pool, artifactOwner, "waiting_for_user")
+    artifactOwnerSources = await seedSelectedJobSources(pool, artifactOwner)
     await seed(pool, cancelledOwner, "waiting_for_user")
   }, 15_000)
 
@@ -3041,7 +3743,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       }
     }
     await attempt("bootstrap close", async () => { await bootstrap?.close() })
-    if (pool) for (const current of [owner, failureOwner, stopOwner, restartOwner, cancelledOwner]) {
+    if (pool) for (const current of [owner, failureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner]) {
       await attempt("delete outbox for " + current.sessionId, () => pool!.query(
         "DELETE FROM \"agent_outbox\" WHERE \"aggregateId\" = $1", [current.sessionId],
       ))
@@ -3053,6 +3755,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const queueSpecs = [
         { name: turnQueueName, label: "turn queue" },
         { name: childQueueName, label: "subagent queue" },
+        ...(selectedJobQueueName ? [{ name: selectedJobQueueName, label: "selected-job subagent queue" }] : []),
       ]
       const queues: Array<{ name: string; label: string; queue: Queue }> = []
       for (const spec of queueSpecs) {
@@ -3068,7 +3771,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           jobs = await queue.getJobs(["completed", "failed", "waiting", "delayed", "paused", "waiting-children", "active"])
         })
         for (const job of jobs) {
-          if ([owner, failureOwner, stopOwner, restartOwner, cancelledOwner].some(current => job.data?.turnId === current.turnId || job.data?.sessionId === current.sessionId)) {
+          if ([owner, failureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner].some(current => job.data?.turnId === current.turnId || job.data?.sessionId === current.sessionId)) {
             await attempt("remove " + label + " job " + job.id, () => job.remove())
           }
         }
@@ -3082,6 +3785,590 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     vi.doUnmock("../../redis.js")
     if (cleanupFailures.length > 0) throw new Error("TaskGraph integration cleanup failed:\n" + cleanupFailures.join("\n"))
   })
+
+  it.each([
+    ["selected Job source edit", "job"],
+    ["new eligible Persona fact", "persona"],
+    ["new selected-job draft head", "draft"],
+    ["TaskGraph revision advance", "graph"],
+    ["Turn lease expiry after the guard", "lease"],
+    ["root Stop after the guard", "stop"],
+  ] as const)("rolls back terminal writes after a gate-approved race: %s", async (_label, race) => {
+    const value = fixture()
+    try {
+      const prepared = await prepareSelectedJobTerminalCase(pool!, value)
+      let guard = selectedJobFinalizationGuardForCase(prepared)
+      if (race === "job") {
+        await pool!.query(`UPDATE "Job" SET "description" = $3, "updatedAt" = CURRENT_TIMESTAMP WHERE "id" = $1 AND "userId" = $2`,
+          [prepared.sources.jobId, value.userId, `AC6_CHANGED_JOB_SOURCE_${value.suffix}`])
+      } else if (race === "persona") {
+        await pool!.query(`INSERT INTO persona_facts
+          ("id", "userId", "key", "category", "value", "normalized_value", "source", "source_ref", "confidence", "status", "allowedUses", "updated_at")
+          VALUES ($1, $2, 'new-confirmed-fact', 'experience', $3, $4, 'manual', 'resume:new-fact', 0.95, 'confirmed', ARRAY['cover_letter']::text[], CURRENT_TIMESTAMP)`,
+          [`p3-finalization-persona-${value.suffix}`, value.userId, `AC6_NEW_PERSONA_FACT_${value.suffix}`, value.suffix])
+      } else if (race === "draft") {
+        const task = await prepared.tasks.create({
+          userId: value.userId, sessionId: value.sessionId, turnId: value.turnId, parentTaskId: prepared.root.id,
+          role: "writer", taskType: "cover_letter_draft", goal: "Commit an unprojected newer draft",
+          allowedActions: ["cover_letter.draft"], context: { selectedJobPreparation: { jobId: prepared.sources.jobId } },
+          expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "writer" }, toolPolicySnapshot: {}, policy: defaultSubagentPolicy(),
+        })
+        const writerOwner = `p3-finalization-race-writer-${value.suffix}`
+        const writer = await prepared.tasks.claim({ taskId: task.id, sessionId: value.sessionId, ownerId: writerOwner, policy: defaultSubagentPolicy(), now: new Date() })
+        if (!writer?.leaseOwner) throw new Error("Newer-draft race Writer did not acquire a lease")
+        const draftInput = {
+          baseArtifactId: `cover-letter-base:${hashArtifactContent({ userId: value.userId, jobId: prepared.sources.jobId }).slice(7)}`,
+          baseHash: hashArtifactContent({ kind: "cover_letter_base", jobId: prepared.sources.jobId }),
+          content: `AC6_PRIVATE_NEWER_DRAFT_${value.suffix}`, constraints: { maxWords: 160 },
+        }
+        const scope = {
+          ...prepared.preparation.preparation, userId: value.userId, sessionId: value.sessionId, taskId: writer.id,
+          toolCallId: `p3-finalization-race-writer:${writer.attemptCount}`,
+          taskFence: selectedJobTaskFence(writer, writerOwner, writer.attemptCount),
+        }
+        const newer = await prepared.artifacts.writeDraft(scope, { ...draftInput, requestHash: selectedJobDraftRequestHash(scope, draftInput) })
+        expect(newer.version).toBe(prepared.artifactRef.version + 1)
+      } else if (race === "graph") {
+        const advanced = await pool!.query(`UPDATE "agent_items" SET "revision" = "revision" + 1 WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 RETURNING "revision"`,
+          [taskGraphItemId(prepared.root.id), value.sessionId, value.turnId])
+        expect(advanced.rowCount).toBe(1)
+      } else {
+        const realGuard = guard
+        guard = async client => {
+          const decision = await realGuard(client)
+          if (!decision.ok) return decision
+          const update = race === "lease"
+            ? `UPDATE "agent_turns" SET "leaseExpiresAt" = clock_timestamp() - INTERVAL '1 second' WHERE "id" = $1 AND "sessionId" = $2`
+            : `UPDATE "sub_agent_tasks" SET "interruptRequestedAt" = clock_timestamp() WHERE "id" = $1 AND "sessionId" = $2`
+          const changed = await client.query(update, [race === "lease" ? value.turnId : prepared.root.id, value.sessionId])
+          if (changed.rowCount !== 1) throw new Error(`Could not inject terminal ${race} race`)
+          return decision
+        }
+      }
+
+      await expect(commitTurnTerminal(pool!, prepared.terminalInput, guard)).rejects.toMatchObject({ name: "TurnEnginePersistenceConflict" })
+      await expectNoTerminalRecords(pool!, prepared)
+    } finally {
+      await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [value.sessionId])
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
+    }
+  }, 45_000)
+
+  it("rolls back finalization while an eligible source insert holds the User foreign-key lock", async () => {
+    const value = fixture()
+    let inserter: PoolClient | undefined
+    let insertActive = false
+    try {
+      const prepared = await prepareSelectedJobTerminalCase(pool!, value)
+
+      inserter = await pool!.connect()
+      await inserter.query("BEGIN")
+      insertActive = true
+      await inserter.query(`INSERT INTO persona_facts
+        ("id", "userId", "key", "category", "value", "normalized_value", "source", "source_ref", "confidence", "status", "allowedUses", "updated_at")
+        VALUES ($1, $2, 'pending-fact', 'experience', $3, $4, 'manual', 'resume:pending-fact', 0.95, 'confirmed', ARRAY['cover_letter']::text[], CURRENT_TIMESTAMP)`, [
+        `p3-finalization-fk-lock-${value.suffix}`, value.userId, `AC6_PENDING_FK_FACT_${value.suffix}`, value.suffix,
+      ])
+
+      const guard = selectedJobFinalizationGuardForCase(prepared)
+      await expect(commitTurnTerminal(pool!, prepared.terminalInput, guard)).rejects.toMatchObject({ name: "TurnEnginePersistenceConflict" })
+      await expectNoTerminalRecords(pool!, prepared)
+
+      await inserter.query("COMMIT")
+      insertActive = false
+      const after = await loadSelectedJobArtifactContext(pool!, value.userId, prepared.sources.jobId)
+      expect(after.preparation.sourceDigest).not.toBe(prepared.preparation.preparation.sourceDigest)
+      await expect(commitTurnTerminal(pool!, prepared.terminalInput, guard)).rejects.toMatchObject({ name: "TurnEnginePersistenceConflict" })
+      await expectNoTerminalRecords(pool!, prepared)
+    } finally {
+      if (insertActive) await inserter?.query("ROLLBACK").catch(() => undefined)
+      inserter?.release()
+      await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [value.sessionId])
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
+    }
+  }, 45_000)
+
+  it("waits for authority locks, then reads a newer committed Job source before finalizing", async () => {
+    const value = fixture()
+    let writer: PoolClient | undefined
+    let writerActive = false
+    let terminalOutcome: Promise<{ value: unknown } | { error: unknown }> | undefined
+    try {
+      const prepared = await prepareSelectedJobTerminalCase(pool!, value)
+      writer = await pool!.connect()
+      await writer.query("BEGIN")
+      writerActive = true
+      const backend = await writer.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")
+      const writerPid = Number(backend.rows[0]?.pid)
+      if (!Number.isSafeInteger(writerPid)) throw new Error("Could not identify the disposable authority-lock writer")
+      await writer.query("SELECT set_config($1, $2, true)", ["app.user_id", value.userId])
+      const sessionLock = await writer.query(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 FOR UPDATE`, [value.sessionId, value.userId])
+      const turnLock = await writer.query(`SELECT "id" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "rootTaskId" = $4 FOR UPDATE`, [value.turnId, value.sessionId, value.userId, prepared.root.id])
+      const rootLock = await writer.query(`SELECT "id" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $1 AND "status" = 'running' FOR UPDATE`, [prepared.root.id, value.sessionId, value.turnId])
+      expect(sessionLock.rowCount).toBe(1)
+      expect(turnLock.rowCount).toBe(1)
+      expect(rootLock.rowCount).toBe(1)
+
+      terminalOutcome = commitTurnTerminal(pool!, prepared.terminalInput, selectedJobFinalizationGuardForCase(prepared))
+        .then(result => ({ value: result }), error => ({ error }))
+      let waiting = false
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const activity = await pool!.query<{ waiting: boolean }>(`SELECT EXISTS (
+          SELECT 1 FROM pg_stat_activity AS waiter WHERE waiter.pid <> pg_backend_pid() AND waiter.state = 'active'
+            AND waiter.wait_event_type = 'Lock' AND waiter.query LIKE '%FROM "agent_sessions"%' AND waiter.query LIKE '%FOR UPDATE%'
+            AND $1::int = ANY(pg_blocking_pids(waiter.pid))
+        ) AS "waiting"`, [writerPid])
+        if (activity.rows[0]?.waiting === true) { waiting = true; break }
+        await writer.query("SELECT pg_sleep(0.05)")
+      }
+      expect(waiting).toBe(true)
+      await writer.query(`UPDATE "Job" SET "description" = $3, "updatedAt" = CURRENT_TIMESTAMP WHERE "id" = $1 AND "userId" = $2`,
+        [prepared.sources.jobId, value.userId, `AC6_WAITED_SOURCE_COMMIT_${value.suffix}`])
+      await writer.query("COMMIT")
+      writerActive = false
+      const outcome = await terminalOutcome
+      expect("error" in outcome).toBe(true)
+      if ("error" in outcome) expect(outcome.error).toMatchObject({ name: "TurnEnginePersistenceConflict" })
+      await expectNoTerminalRecords(pool!, prepared)
+    } finally {
+      if (writerActive) await writer?.query("ROLLBACK").catch(() => undefined)
+      writer?.release()
+      if (terminalOutcome) await terminalOutcome
+      await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [value.sessionId])
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
+    }
+  }, 45_000)
+
+  it("holds selected sources stable from the final digest read through terminal commit", async () => {
+    const value = fixture()
+    const writers: PoolClient[] = []
+    const mutationOutcomes: Array<Promise<{ label: string; rowCount: number | null } | { label: string; error: unknown }>> = []
+    let terminalOutcome: Promise<{ value: unknown } | { error: unknown }> | undefined
+    let releaseGuard: () => void = () => {}
+    let resolveGuardPassed: (pid: number) => void = () => undefined
+    const guardPassed = new Promise<number>(resolve => { resolveGuardPassed = resolve })
+    const guardBarrier = new Promise<void>(resolve => { releaseGuard = resolve })
+    try {
+      const prepared = await prepareSelectedJobTerminalCase(pool!, value)
+      const adaptedResumeId = `p3-finalization-adapted-resume-${value.suffix}`
+      await pool!.query(`INSERT INTO "Resume" ("id", "userId", "name", "content", "kind", "origin", "isDefault", "updatedAt")
+        VALUES ($1, $2, 'Unrelated adapted resume', '{"text":"before"}'::jsonb, 'adapted', 'ai-adapted', FALSE, CURRENT_TIMESTAMP)`, [adaptedResumeId, value.userId])
+      const realGuard = selectedJobFinalizationGuardForCase(prepared)
+      const guarded = async (client: PoolClient) => {
+        const decision = await realGuard(client)
+        if (!decision.ok) return decision
+        const backend = await client.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")
+        const pid = Number(backend.rows[0]?.pid)
+        if (!Number.isSafeInteger(pid)) throw new Error("Could not identify terminal finalization backend")
+        resolveGuardPassed(pid)
+        await guardBarrier
+        return decision
+      }
+      terminalOutcome = commitTurnTerminal(pool!, prepared.terminalInput, guarded)
+        .then(result => ({ value: result }), error => ({ error }))
+      const terminalPid = await guardPassed
+      let adaptedTimeout: NodeJS.Timeout | undefined
+      try {
+        const adaptedUpdate = await Promise.race([
+          pool!.query(`UPDATE "Resume" SET "content" = '{"text":"after"}'::jsonb, "updatedAt" = CURRENT_TIMESTAMP WHERE "id" = $1 AND "userId" = $2`, [adaptedResumeId, value.userId]),
+          new Promise<never>((_, reject) => { adaptedTimeout = setTimeout(() => reject(new Error("Unselected adapted Resume update was blocked by finalization")), 3_000) }),
+        ])
+        expect(adaptedUpdate.rowCount).toBe(1)
+      } finally { if (adaptedTimeout) clearTimeout(adaptedTimeout) }
+      const newFactId = `p3-finalization-post-guard-fact-${value.suffix}`
+      const changes = [
+        { label: "Job update", sql: `UPDATE "Job" SET "description" = $3, "updatedAt" = CURRENT_TIMESTAMP WHERE "id" = $1 AND "userId" = $2`, values: [prepared.sources.jobId, value.userId, `AC6_POST_GUARD_JOB_${value.suffix}`] },
+        { label: "Resume update", sql: `UPDATE "Resume" SET "content" = jsonb_build_object('text', $3::text), "updatedAt" = CURRENT_TIMESTAMP WHERE "id" = $1 AND "userId" = $2`, values: [prepared.sources.resumeId, value.userId, `AC6_POST_GUARD_RESUME_${value.suffix}`] },
+        { label: "PersonaFact update", sql: `UPDATE persona_facts SET "value" = $3, "updated_at" = CURRENT_TIMESTAMP WHERE "id" = $1 AND "userId" = $2`, values: [`p3-selected-job-fact-${value.suffix}`, value.userId, `AC6_POST_GUARD_PERSONA_${value.suffix}`] },
+        { label: "PersonaFact insert", sql: `INSERT INTO persona_facts
+          ("id", "userId", "key", "category", "value", "normalized_value", "source", "source_ref", "confidence", "status", "allowedUses", "updated_at")
+          VALUES ($1, $2, 'post-guard-fact', 'experience', $3, $4, 'manual', 'resume:post-guard', 0.95, 'confirmed', ARRAY['cover_letter']::text[], CURRENT_TIMESTAMP)`,
+        values: [newFactId, value.userId, `AC6_POST_GUARD_INSERT_${value.suffix}`, value.suffix] },
+      ]
+      const writerPids: number[] = []
+      for (const change of changes) {
+        const writer = await pool!.connect()
+        writers.push(writer)
+        const backend = await writer.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")
+        writerPids.push(Number(backend.rows[0]?.pid))
+        mutationOutcomes.push(writer.query(change.sql, change.values)
+          .then(result => ({ label: change.label, rowCount: result.rowCount }), error => ({ label: change.label, error })))
+      }
+
+      let allBlocked = false
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const waiting = await pool!.query<{ pid: number }>(`SELECT waiter.pid::int AS pid FROM pg_stat_activity AS waiter
+          WHERE waiter.pid = ANY($1::int[]) AND waiter.state = 'active' AND waiter.wait_event_type = 'Lock'
+            AND $2::int = ANY(pg_blocking_pids(waiter.pid))`, [writerPids, terminalPid])
+        if (new Set(waiting.rows.map(row => Number(row.pid))).size === changes.length) { allBlocked = true; break }
+        await new Promise(resolve => setTimeout(resolve, 25))
+      }
+      expect(allBlocked).toBe(true)
+
+      const observer = await pool!.connect()
+      try {
+        const [job, resume, fact, inserted] = await Promise.all([
+          observer.query<{ description: string }>(`SELECT "description" FROM "Job" WHERE "id" = $1`, [prepared.sources.jobId]),
+          observer.query<{ content: { text: string } }>(`SELECT "content" FROM "Resume" WHERE "id" = $1`, [prepared.sources.resumeId]),
+          observer.query<{ value: string }>(`SELECT "value" FROM persona_facts WHERE "id" = $1`, [`p3-selected-job-fact-${value.suffix}`]),
+          observer.query(`SELECT "id" FROM persona_facts WHERE "id" = $1`, [newFactId]),
+        ])
+        expect(job.rows[0]?.description).toBe(`AC6_TRANSIENT_JOB_SOURCE_W1_${value.suffix}`)
+        expect(resume.rows[0]?.content.text).toBe(`AC6_TRANSIENT_RESUME_SOURCE_W1_${value.suffix}`)
+        expect(fact.rows[0]?.value).toBe(`AC6_TRANSIENT_PERSONA_SOURCE_W1_${value.suffix}`)
+        expect(inserted.rows).toHaveLength(0)
+      } finally { observer.release() }
+
+      releaseGuard()
+      const terminal = await terminalOutcome
+      expect(terminal && "value" in terminal).toBe(true)
+      const applied = await Promise.all(mutationOutcomes)
+      expect(applied.every(result => "rowCount" in result && result.rowCount === 1)).toBe(true)
+      const after = await loadSelectedJobArtifactContext(pool!, value.userId, prepared.sources.jobId)
+      expect(after.preparation.sourceDigest).not.toBe(prepared.preparation.preparation.sourceDigest)
+    } finally {
+      releaseGuard()
+      if (terminalOutcome) await terminalOutcome
+      await Promise.all(mutationOutcomes)
+      for (const writer of writers) writer.release()
+      await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [value.sessionId])
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
+    }
+  }, 45_000)
+
+  it("rechecks PersonaFact expiry using the wall clock after the terminal transaction starts", async () => {
+    const value = fixture()
+    try {
+      const prepared = await prepareSelectedJobTerminalCase(pool!, value)
+      const expires = await pool!.query<{ expiresAt: Date }>(`UPDATE persona_facts
+        SET "expires_at" = clock_timestamp() + INTERVAL '3 seconds'
+        WHERE "id" = $1 AND "userId" = $2 RETURNING "expires_at" AS "expiresAt"`, [
+        `p3-selected-job-fact-${value.suffix}`, value.userId,
+      ])
+      const expiresAt = expires.rows[0]?.expiresAt
+      if (!(expiresAt instanceof Date)) throw new Error("Could not set the PersonaFact expiry boundary")
+      const realGuard = selectedJobFinalizationGuardForCase(prepared)
+      const delayedGuard = async (client: PoolClient) => {
+        const transaction = await client.query<{ startedAt: Date }>("SELECT transaction_timestamp() AS \"startedAt\"")
+        const startedAt = transaction.rows[0]?.startedAt
+        if (!(startedAt instanceof Date) || startedAt.getTime() >= expiresAt.getTime()) {
+          throw new Error("Terminal transaction did not start before PersonaFact expiry")
+        }
+        const delay = await client.query<{ seconds: number }>(`SELECT GREATEST(0.05,
+          EXTRACT(EPOCH FROM $1::timestamptz - clock_timestamp()) + 0.1)::float8 AS "seconds"`, [expiresAt])
+        await client.query("SELECT pg_sleep($1::float8)", [Number(delay.rows[0]?.seconds)])
+        const expired = await client.query<{ expired: boolean }>(`SELECT statement_timestamp() > $1::timestamptz AS "expired"`, [expiresAt])
+        expect(expired.rows[0]?.expired).toBe(true)
+        return realGuard(client)
+      }
+
+      await expect(commitTurnTerminal(pool!, prepared.terminalInput, delayedGuard)).rejects.toMatchObject({ name: "TurnEnginePersistenceConflict" })
+      await expectNoTerminalRecords(pool!, prepared)
+      const afterExpiry = await loadSelectedJobArtifactContext(pool!, value.userId, prepared.sources.jobId)
+      expect(afterExpiry.preparation.sourceDigest).not.toBe(prepared.preparation.preparation.sourceDigest)
+    } finally {
+      await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [value.sessionId])
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
+    }
+  }, 45_000)
+
+  it("replays one selected-job draft receipt under a reclaimed lease without duplicating its version", async () => {
+    const value = fixture()
+    let userSeeded = false
+    try {
+      await seed(pool!, value, "waiting_for_user")
+      userSeeded = true
+      const sources = await seedSelectedJobSources(pool!, value)
+      const plan = await createSelectedJobTaskGraph(pool!, value, sources, `agent-subagents-ac6-receipt-${value.suffix}`)
+      const firstOwner = `ac6-receipt-owner-one-${value.suffix}`
+      const secondOwner = `ac6-receipt-owner-two-${value.suffix}`
+      const firstLease = await plan.store.claim({
+        taskId: plan.writerTask.id, sessionId: value.sessionId, ownerId: firstOwner,
+        policy: defaultSubagentPolicy(), now: new Date(),
+      })
+      if (!firstLease?.leaseOwner) throw new Error("Selected-job receipt task did not acquire its first disposable lease")
+      expect(firstLease).toMatchObject({ status: "running", leaseOwner: firstOwner, attemptCount: 1 })
+
+      const toolCallId = SELECTED_JOB_DRAFT_CALL_ID
+      const input = {
+        baseArtifactId: `cover-letter-base:${hashArtifactContent({ userId: value.userId, jobId: sources.jobId }).slice(7)}`,
+        baseHash: hashArtifactContent({ kind: "cover_letter_base", jobId: sources.jobId }),
+        content: `AC6_PRIVATE_COVER_LETTER_${value.suffix}`,
+        constraints: { maxWords: 160 },
+      }
+      const artifactStore = createArtifactToolStore(pool!)
+      const base = await resolveCoverLetterBase(artifactStore, value.userId, sources.jobId)
+      expect(base).toMatchObject({ artifactId: input.baseArtifactId, baseHash: input.baseHash })
+      const originalScope = {
+        ...plan.originalPreparation.preparation,
+        userId: value.userId,
+        sessionId: value.sessionId,
+        taskId: firstLease.id,
+        toolCallId,
+        taskFence: selectedJobTaskFence(firstLease, firstOwner, firstLease.attemptCount),
+      }
+      const requestHash = selectedJobDraftRequestHash(originalScope, input)
+      const committed = await artifactStore.writeDraft(originalScope, { ...input, requestHash })
+      expect(committed).toMatchObject({
+        version: 1, userId: value.userId, sessionId: value.sessionId, jobId: sources.jobId,
+        sourceDigest: plan.originalPreparation.preparation.sourceDigest,
+        provenanceRefs: plan.originalPreparation.preparation.evidenceRefs,
+        evidenceRefs: plan.originalPreparation.preparation.evidenceRefs,
+        taskId: firstLease.id, toolCallId, requestHash,
+      })
+
+      const expired = await pool!.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = CURRENT_TIMESTAMP - INTERVAL '1 second'
+        WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4
+          AND "status" = 'running' AND "leaseOwner" = $5 AND "attemptCount" = $6`, [
+        firstLease.id, value.sessionId, value.turnId, plan.rootTaskId, firstOwner, firstLease.attemptCount,
+      ])
+      expect(expired.rowCount).toBe(1)
+      // Model the recovered task's new live lease on this fixture-owned row. The Worker restart trace separately exercises production recovery and claim.
+      const reclaimed = await pool!.query(`UPDATE "sub_agent_tasks" SET "status" = 'running', "leaseOwner" = $5,
+          "attemptCount" = "attemptCount" + 1, "leaseExpiresAt" = CURRENT_TIMESTAMP + INTERVAL '1 minute',
+          "nextAttemptAt" = NULL, "updatedAt" = CURRENT_TIMESTAMP
+        WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4
+          AND "status" = 'running' AND "leaseOwner" = $6 AND "attemptCount" = $7
+          AND "leaseExpiresAt" <= CURRENT_TIMESTAMP`, [
+        firstLease.id, value.sessionId, value.turnId, plan.rootTaskId, secondOwner, firstOwner, firstLease.attemptCount,
+      ])
+      expect(reclaimed.rowCount).toBe(1)
+      const secondLease = await plan.store.get(firstLease.id, value.sessionId)
+      if (!secondLease?.leaseOwner) throw new Error("Selected-job receipt task did not receive its modeled reclaimed lease")
+      expect(secondLease).toMatchObject({ status: "running", leaseOwner: secondOwner, attemptCount: 2 })
+
+      await expect(artifactStore.writeDraft(originalScope, { ...input, requestHash }))
+        .rejects.toMatchObject({ code: "task_fence_denied" })
+      const reclaimedScope = {
+        ...originalScope,
+        taskFence: selectedJobTaskFence(secondLease, secondOwner, secondLease.attemptCount),
+      }
+      const [firstReplay, secondReplay] = await Promise.all([
+        artifactStore.writeDraft(reclaimedScope, { ...input, requestHash }),
+        artifactStore.writeDraft(reclaimedScope, { ...input, requestHash }),
+      ])
+      expect(firstReplay).toEqual(committed)
+      expect(secondReplay).toEqual(committed)
+
+      const conflictingInput = { ...input, content: `${input.content}_conflict` }
+      const conflictingHash = selectedJobDraftRequestHash(reclaimedScope, conflictingInput)
+      await expect(artifactStore.writeDraft(reclaimedScope, { ...conflictingInput, requestHash: conflictingHash }))
+        .rejects.toMatchObject({ code: "receipt_conflict" })
+      const completed = await plan.store.finish({
+        taskId: secondLease.id, sessionId: value.sessionId, ownerId: secondOwner,
+        attemptCount: secondLease.attemptCount, status: "completed", result: { status: "completed" }, now: new Date(),
+      })
+      expect(completed).toBe("completed")
+      await expect(artifactStore.writeDraft(reclaimedScope, { ...input, requestHash }))
+        .rejects.toMatchObject({ code: "task_fence_denied" })
+      const versions = await pool!.query<{ count: number }>(
+        `SELECT COUNT(*)::int AS "count" FROM "agent_artifact_version" WHERE "taskId" = $1`, [firstLease.id],
+      )
+      expect(versions.rows[0]?.count).toBe(1)
+    } finally {
+      if (userSeeded) {
+        await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [value.sessionId])
+        await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
+      }
+    }
+  }, 30_000)
+
+  it("blocks completion when an unprojected failed Writer committed a newer draft head", async () => {
+    const value = fixture()
+    let userSeeded = false
+    try {
+      await seed(pool!, value, "waiting_for_user")
+      userSeeded = true
+      const sources = await seedSelectedJobSources(pool!, value)
+      const preparation = await loadSelectedJobArtifactContext(pool!, value.userId, sources.jobId)
+      const store = new PgSubagentTaskStore(pool!)
+      const root = await store.create({
+        userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+        role: "supervisor", taskType: "task_graph", goal: "Complete the selected-job draft review",
+        allowedActions: ["jobs.get", "persona.retrieve", "resume.get_base", "cover_letter.draft", "artifact.version.read", "artifact.review"],
+        expectedOutputSchema: {}, toolPolicySnapshot: {}, budgetSnapshot: { limits: { maxSteps: 8, maxToolCalls: 8 } },
+        policy: defaultSubagentPolicy(),
+      })
+      const linkedTurn = await pool!.query(`UPDATE "agent_turns" SET "rootTaskId" = $2, "updatedAt" = CURRENT_TIMESTAMP
+        WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4 AND "status" = 'waiting_for_user' AND "rootTaskId" IS NULL`, [
+        value.turnId, root.id, value.sessionId, value.userId,
+      ])
+      expect(linkedTurn.rowCount).toBe(1)
+      await activateFixtureTurn(pool!, value)
+      const lease = await claimTurnLease(pool!, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
+      const rootLease = await store.claim({
+        taskId: root.id, sessionId: value.sessionId, ownerId: value.ownerId,
+        policy: defaultSubagentPolicy(), now: new Date(),
+      })
+      if (!rootLease?.leaseOwner) throw new Error("Stale-head fixture root did not acquire a live lease")
+      expect(rootLease).toMatchObject({ status: "running", leaseOwner: lease.ownerId, attemptCount: 1 })
+
+      const stepId = `p3-stale-head-step-${value.suffix}`
+      await pool!.query(`INSERT INTO "agent_steps"
+        ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
+        VALUES ($1, $2, $3, $4, 1, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`, [
+        stepId, value.sessionId, value.turnId, root.id,
+      ])
+      const commandPort = createPgTaskGraphCommandPort(pool!)
+      const graphScope = {
+        userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+        rootTaskId: root.id, parentTaskId: root.id, stepId,
+        turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion,
+        parentLeaseOwner: lease.ownerId, parentAttemptCount: rootLease.attemptCount,
+      }
+      const graph = await commandPort.appendAndSchedule({
+        scope: graphScope,
+        proposal: {
+          expectedRevision: 0,
+          nodes: [
+            { key: "writer-v1", templateId: "cover_letter_writer", goal: "Persist the original draft", successCriteria: ["Save draft v1"], dependsOn: [] },
+            { key: "reviewer-v1", templateId: "cover_letter_reviewer", goal: "Review the original draft", successCriteria: ["Persist a passed review for v1"], dependsOn: ["writer-v1"] },
+            { key: "writer-v2", templateId: "cover_letter_writer", goal: "Commit a newer draft then fail", successCriteria: ["Commit draft v2 before failure"], dependsOn: ["reviewer-v1"] },
+          ],
+        },
+        templates: taskGraphTemplatesForSelectedJob(preparation.preparation),
+      })
+      const taskIds = new Map(graph.nodes.map(node => [node.key, node.taskId] as const))
+      const claimGraphChild = async (key: string, ownerId: string): Promise<SubagentTaskRecord> => {
+        const taskId = taskIds.get(key)
+        if (!taskId) throw new Error(`Stale-head fixture is missing TaskGraph node ${key}`)
+        const task = await store.claim({ taskId, sessionId: value.sessionId, ownerId, policy: defaultSubagentPolicy(), now: new Date() })
+        if (!task?.leaseOwner) throw new Error(`Stale-head fixture child ${key} did not acquire a live lease`)
+        return task
+      }
+      const finishCompletedGraphChild = async (task: SubagentTaskRecord, ownerId: string, structuredResult: RecordValue) => {
+        await expect(store.finish({
+          taskId: task.id, sessionId: value.sessionId, ownerId, attemptCount: task.attemptCount, status: "completed",
+          result: { status: "completed", finalText: "fixture receipt", finalItemId: null, stepCount: 1, toolCallCount: 1, structuredResult },
+          now: new Date(),
+        })).resolves.toBe("completed")
+      }
+      const artifactStore = createArtifactToolStore(pool!)
+      const base = await resolveCoverLetterBase(artifactStore, value.userId, sources.jobId)
+      const draftInput = (content: string) => ({
+        baseArtifactId: `cover-letter-base:${hashArtifactContent({ userId: value.userId, jobId: sources.jobId }).slice(7)}`,
+        baseHash: hashArtifactContent({ kind: "cover_letter_base", jobId: sources.jobId }),
+        content, constraints: { maxWords: 160 },
+      })
+      expect(base).toMatchObject({ artifactId: draftInput("unused").baseArtifactId, baseHash: draftInput("unused").baseHash })
+      const artifactReference = (version: Awaited<ReturnType<typeof artifactStore.writeDraft>>) => ({
+        artifactId: version.artifactId, version: version.version,
+        contentHash: version.contentHash, sourceDigest: version.sourceDigest,
+      })
+
+      const writerV1Owner = `p3-stale-head-writer-v1-${value.suffix}`
+      const writerV1 = await claimGraphChild("writer-v1", writerV1Owner)
+      const writerV1Input = draftInput(`AC6_STALE_HEAD_DRAFT_V1_${value.suffix}`)
+      const writerV1Scope = {
+        ...preparation.preparation, userId: value.userId, sessionId: value.sessionId,
+        taskId: writerV1.id, toolCallId: `ac6-stale-head-writer-v1:${writerV1.attemptCount}`,
+        taskFence: selectedJobTaskFence(writerV1, writerV1Owner, writerV1.attemptCount),
+      }
+      const writerV1Version = await artifactStore.writeDraft(writerV1Scope, {
+        ...writerV1Input, requestHash: selectedJobDraftRequestHash(writerV1Scope, writerV1Input),
+      })
+      const writerV1Ref = artifactReference(writerV1Version)
+      await finishCompletedGraphChild(writerV1, writerV1Owner, {
+        schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef: writerV1Ref,
+      })
+
+      const reviewerV1Owner = `p3-stale-head-reviewer-v1-${value.suffix}`
+      const reviewerV1 = await claimGraphChild("reviewer-v1", reviewerV1Owner)
+      const reviewerV1CallId = `ac6-stale-head-reviewer-v1:${reviewerV1.attemptCount}`
+      const reviewInput = { artifactRef: writerV1Ref, decision: "passed", findings: [] }
+      const reviewerV1Scope = {
+        ...preparation.preparation, userId: value.userId, sessionId: value.sessionId,
+        taskId: reviewerV1.id, toolCallId: reviewerV1CallId,
+        taskFence: selectedJobTaskFence(reviewerV1, reviewerV1Owner, reviewerV1.attemptCount),
+      }
+      const reviewHash = hashArtifactContent({
+        artifactRef: writerV1Ref, currentSourceDigest: preparation.preparation.sourceDigest,
+        status: "passed", findings: [], evidenceRefs: preparation.preparation.evidenceRefs,
+      })
+      await artifactStore.saveReview({
+        userId: value.userId, sessionId: value.sessionId, jobId: sources.jobId,
+        artifactId: writerV1Ref.artifactId, version: writerV1Ref.version,
+        contentHash: writerV1Ref.contentHash, sourceDigest: writerV1Ref.sourceDigest,
+        currentSourceDigest: preparation.preparation.sourceDigest, status: "passed", findings: [],
+        evidenceRefs: [...preparation.preparation.evidenceRefs], taskId: reviewerV1.id, toolCallId: reviewerV1CallId,
+        requestHash: selectedJobTaskReceiptRequestHash("artifact.review", reviewerV1Scope, reviewInput),
+        reviewHash, taskFence: reviewerV1Scope.taskFence,
+      })
+      await finishCompletedGraphChild(reviewerV1, reviewerV1Owner, {
+        schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed",
+        artifactRef: writerV1Ref, reviewStatus: "passed", reviewHash,
+      })
+
+      const writerV2Owner = `p3-stale-head-writer-v2-${value.suffix}`
+      const writerV2 = await claimGraphChild("writer-v2", writerV2Owner)
+      const writerV2Input = draftInput(`AC6_STALE_HEAD_DRAFT_V2_${value.suffix}`)
+      const writerV2Scope = {
+        ...preparation.preparation, userId: value.userId, sessionId: value.sessionId,
+        taskId: writerV2.id, toolCallId: `ac6-stale-head-writer-v2:${writerV2.attemptCount}`,
+        taskFence: selectedJobTaskFence(writerV2, writerV2Owner, writerV2.attemptCount),
+      }
+      const writerV2Version = await artifactStore.writeDraft(writerV2Scope, {
+        ...writerV2Input, requestHash: selectedJobDraftRequestHash(writerV2Scope, writerV2Input),
+      })
+      const writerV2Ref = artifactReference(writerV2Version)
+      expect(writerV2Ref.version).toBe(2)
+      expect(writerV2Ref.artifactId).toBe(writerV1Ref.artifactId)
+      expect(writerV2Ref.contentHash).not.toBe(writerV1Ref.contentHash)
+      await expect(store.finish({
+        taskId: writerV2.id, sessionId: value.sessionId, ownerId: writerV2Owner,
+        attemptCount: writerV2.attemptCount, status: "failed", retryDisposition: "terminal",
+        failureReason: "fixture_writer_failed_after_draft_commit", now: new Date(),
+      })).resolves.toBe("failed")
+      await expect(store.get(writerV2.id, value.sessionId)).resolves.toMatchObject({
+        status: "failed", result: null, failureReason: "fixture_writer_failed_after_draft_commit",
+      })
+
+      const artifactRepository = createAgentArtifactRepository(pool!)
+      await expect(artifactRepository.findCurrentDraftHead({
+        userId: value.userId, sessionId: value.sessionId, jobId: sources.jobId, artifactId: writerV1Ref.artifactId,
+      })).resolves.toEqual(writerV2Ref)
+      const committedVersions = await pool!.query<{ version: number }>(
+        `SELECT "version" FROM "agent_artifact_version" WHERE "artifactId" = $1 ORDER BY "version" ASC`,
+        [writerV1Ref.artifactId],
+      )
+      expect(committedVersions.rows.map(row => row.version)).toEqual([1, 2])
+      const graphState = await commandPort.readCurrent({
+        userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+        rootTaskId: root.id, parentTaskId: root.id,
+        turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion,
+        parentLeaseOwner: lease.ownerId, parentAttemptCount: rootLease.attemptCount,
+      })
+      expect(graphState.nodes.map(node => [node.key, node.status])).toEqual([
+        ["writer-v1", "completed"], ["reviewer-v1", "completed"], ["writer-v2", "failed"],
+      ])
+      expect(graphState.nodes.find(node => node.key === "writer-v1")?.resultProjection).toMatchObject({
+        schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted",
+        availability: "available", role: "writer", status: "completed", artifactRef: writerV1Ref,
+      })
+      expect(graphState.nodes.find(node => node.key === "reviewer-v1")?.resultProjection).toMatchObject({
+        schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted",
+        availability: "available", role: "reviewer", status: "completed", reviewStatus: "passed", artifactRef: writerV1Ref,
+      })
+      expect(graphState.nodes.find(node => node.key === "writer-v2")?.resultProjection).toMatchObject({
+        schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "unavailable",
+      })
+
+      await expect(selectedJobArtifactCompletionGate({
+        commandPort, lease, root: { id: root.id, attemptCount: rootLease.attemptCount },
+        selectedJobId: sources.jobId, readCurrentDraftHead: scope => artifactRepository.findCurrentDraftHead(scope),
+        readCurrentReviewReceipt: scope => artifactRepository.findReviewReceipt(scope),
+        readCurrentSourceDigest: async () => (await loadSelectedJobArtifactContext(pool!, value.userId, sources.jobId)).preparation.sourceDigest,
+      })).resolves.toEqual({
+        ok: false, blocker: "selected_job_draft_review_required",
+        feedback: "Complete and review the selected job's latest cover-letter draft before finishing.",
+      })
+    } finally {
+      if (userSeeded) {
+        await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [value.sessionId])
+        await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
+      }
+    }
+  }, 30_000)
 
   it("plans, waits, promotes dependencies, resumes with bounded evidence, appends a follow-up plan, and resumes again", async () => {
     const [
@@ -3577,11 +4864,23 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     childQueueName = subagentModule.SUBAGENT_QUEUE_NAME
     let workerOne: ProcessFixtureChild | undefined
     let workerTwo: ProcessFixtureChild | undefined
+    let artifactPlan: SelectedJobArtifactRestartPlan | undefined
+    let artifactTrace: SelectedJobArtifactRestartTrace | undefined
+    let artifactReviewTrace: SelectedJobArtifactReviewTrace | undefined
     try {
-      workerOne = startTaskGraphRestartWorker("park-parent", restartOwner)
+      if (!artifactOwnerSources || !redis) throw new Error("Selected-job fixture sources or Redis were not initialized")
+      selectedJobQueueName = `agent-subagents-ac6-${artifactOwner.suffix}`
+      artifactPlan = await createSelectedJobTaskGraph(pool!, artifactOwner, artifactOwnerSources, selectedJobQueueName)
+      const selectedJobForWorkerOne = {
+        queueName: artifactPlan.queueName, userId: artifactOwner.userId, sessionId: artifactOwner.sessionId,
+        turnId: artifactOwner.turnId, rootTaskId: artifactPlan.rootTaskId, jobId: artifactPlan.jobId,
+        body: artifactPlan.body, writerTaskId: artifactPlan.writerTask.id,
+      }
+      workerOne = startTaskGraphRestartWorker("park-parent", { ...restartOwner, selectedJob: selectedJobForWorkerOne })
       const suspendedLine = await waitForProcessLine(workerOne, "P3_PARENT_SUSPENDED ", 45_000)
       if (workerOne.pid === undefined) throw new Error("P3 first Worker has no OS process ID")
       expect(suspendedLine).toContain("p3-process-restart-worker-" + workerOne.pid)
+      await waitForProcessLine(workerOne, `P3_SELECTED_JOB_QUEUE_READY ${selectedJobQueueName}`)
 
       const beforeTurn = await pool!.query<{ status: string; leaseOwnerId: string | null; leaseVersion: number; rootTaskId: string | null }>(
         "SELECT \"status\", \"leaseOwnerId\", \"leaseVersion\", \"rootTaskId\" FROM \"agent_turns\" WHERE \"id\" = $1",
@@ -3624,6 +4923,35 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         { goal: "Summarize the restored TaskGraph source", status: "waiting" },
       ])
 
+      await enqueueSelectedJobTask(
+        artifactPlan.queueName, redis!, artifactPlan.writerTask, `ac6-writer-worker-one-${artifactOwner.suffix}`,
+      )
+      const writerLine = await waitForProcessLine(
+        workerOne, `P3_SELECTED_JOB_CHILD_SETTLED ${artifactPlan.writerTask.id} `, 30_000,
+      )
+      artifactTrace = await traceSelectedJobWriterFromWorker(artifactPlan, writerLine)
+      const writerVersion = await pool!.query<{
+        version: number; contentHash: string; sourceDigest: string; content: unknown; userId: string; sessionId: string;
+        jobId: string; provenanceRefs: string[]; evidenceRefs: string[]; taskId: string; toolCallId: string; requestHash: string;
+      }>(
+        `SELECT "version", "contentHash", "sourceDigest", "content", "userId", "sessionId", "jobId",
+          "provenanceRefs", "evidenceRefs", "taskId", "toolCallId", "requestHash" FROM "agent_artifact_version"
+          WHERE "taskId" = $1 AND "toolCallId" = $2`, [artifactTrace.writerTask.id, artifactTrace.writerDraftCallId],
+      )
+      expect(writerVersion.rows).toHaveLength(1)
+      expect(writerVersion.rows[0]).toMatchObject({
+        userId: artifactOwner.userId,
+        sessionId: artifactOwner.sessionId,
+        jobId: artifactPlan.jobId,
+        version: 1, contentHash: artifactTrace.artifactRef.contentHash,
+        sourceDigest: artifactTrace.artifactRef.sourceDigest, content: artifactTrace.body,
+        provenanceRefs: artifactPlan.originalPreparation.preparation.evidenceRefs,
+        evidenceRefs: artifactPlan.originalPreparation.preparation.evidenceRefs,
+        taskId: artifactPlan.writerTask.id,
+        toolCallId: artifactTrace.writerDraftCallId,
+        requestHash: artifactTrace.writerRequestHash,
+      })
+
       const firstWorkerPid = workerOne.pid
       const firstExit = waitForProcessExit(workerOne)
       const killAccepted = workerOne.kill("SIGKILL")
@@ -3648,14 +4976,29 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       )
       expect(waitAfterKill.rows).toEqual(waitsBefore.rows)
 
+      if (!artifactTrace) throw new Error("Selected-job Writer did not settle in Worker 1")
+      artifactReviewTrace = await prepareSelectedJobReviewAfterRestart(pool!, artifactOwner, artifactTrace)
+      // Worker 2 also starts database-wide default-queue recovery. Publish and
+      // enqueue these direct-store fixture tasks on their dedicated queue first
+      // so recovery does not misroute them to the generic subagent executor.
+      await enqueueSelectedJobReviewTasksBeforeWorkerTwo(pool!, redis, artifactOwner, artifactReviewTrace)
+
       workerTwo = startTaskGraphRestartWorker("resume-parent", {
         ...restartOwner,
         expectedRevision: graphBefore.rows[0]!.revision,
         expectedSnapshot: graphSnapshot,
+        selectedJob: {
+          queueName: artifactReviewTrace.queueName, userId: artifactOwner.userId, sessionId: artifactOwner.sessionId,
+          turnId: artifactOwner.turnId, rootTaskId: artifactReviewTrace.rootTaskId, jobId: artifactReviewTrace.jobId,
+          expectedBodyHash: hashArtifactContent(artifactReviewTrace.body), writerTaskId: artifactReviewTrace.writerTask.id,
+          reviewerTaskId: artifactReviewTrace.reviewerTask.id,
+          stopReviewerTaskId: artifactReviewTrace.stopReviewerTask.id,
+        },
       })
       expect(workerTwo.pid).not.toBe(firstWorkerPid)
       const readyLine = await waitForProcessLine(workerTwo, "P3_SECOND_WORKER_READY ")
       expect(readyLine).toContain("p3-process-restart-worker-" + workerTwo.pid)
+      await waitForProcessLine(workerTwo, `P3_SELECTED_JOB_QUEUE_READY ${selectedJobQueueName}`)
       try {
         await waitForProcessLine(workerTwo, "P3_DEPENDENCY_CONTEXT_OK")
       } catch (error) {
@@ -3748,6 +5091,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const preFinalFollowUpId = preFinalNodes[2]?.taskId
       expect(typeof preFinalFollowUpId).toBe("string")
       expect(followUpReadyLine).toContain(String(preFinalFollowUpId))
+
+      if (!artifactReviewTrace || !redis) throw new Error("Selected-job review fixture was not prepared for Worker 2")
+      await reviewSelectedJobThroughRestartedWorker(pool!, artifactOwner, artifactReviewTrace, workerOne!, workerTwo!)
 
       const preFinalChildResult = await pool!.query<{ status: string; role: string; result: RecordValue | null; context: RecordValue | null }>(
         "SELECT \"status\", \"role\", \"result\", \"context\" FROM \"sub_agent_tasks\" WHERE \"id\" = $1 AND \"sessionId\" = $2 AND \"turnId\" = $3 AND \"rootTaskId\" = $4 AND \"parentTaskId\" = $4",

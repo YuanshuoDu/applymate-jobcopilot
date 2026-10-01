@@ -1,3 +1,4 @@
+import type { PoolClient } from "pg"
 import type { TaskGraphCommandPort, TaskGraphScheduleInput, TaskGraphScheduleReceipt, TaskGraphReadScope, TaskGraphCurrentState } from "./task-graph-command-port.js"
 import { TaskGraphCommandError } from "./task-graph-command-port.js"
 import type { PgSubagentPool } from "./types.js"
@@ -40,17 +41,20 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
       })
     },
     async readCurrent(scope: TaskGraphReadScope): Promise<TaskGraphCurrentState> {
-      return transaction(pool, async client => {
-        await client.query(`SELECT set_config('app.user_id', $1, true)`, [scope.userId])
-        await lockTaskGraphScope(client, scope)
-        const loaded = await loadTaskGraph(client, scope, false)
-        if (!loaded.item && await hasPersistedPlanReceipt(client, scope)) {
-          throw new TaskGraphCommandError("task_graph_state_missing", "Persisted TaskGraph state is unavailable")
-        }
-        return currentTaskGraph(loaded)
-      })
+      return transaction(pool, client => readCurrentWithClient(client, scope))
     },
+    readCurrentWithClient(client, scope) { return readCurrentWithClient(client, scope) },
   }
+}
+
+async function readCurrentWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope): Promise<TaskGraphCurrentState> {
+  await client.query(`SELECT set_config('app.user_id', $1, true)`, [scope.userId])
+  await lockTaskGraphScope(client, scope)
+  const loaded = await loadTaskGraph(client, scope, false)
+  if (!loaded.item && await hasPersistedPlanReceipt(client, scope)) {
+    throw new TaskGraphCommandError("task_graph_state_missing", "Persisted TaskGraph state is unavailable")
+  }
+  return currentTaskGraph(loaded)
 }
 
 async function hasPersistedPlanReceipt(client: Queryable, scope: TaskGraphReadScope): Promise<boolean> {

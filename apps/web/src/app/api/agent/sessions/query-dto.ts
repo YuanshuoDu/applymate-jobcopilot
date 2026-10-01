@@ -141,12 +141,14 @@ export interface TurnQueryRow extends CursorRow {
 
 export function turnDto(row: TurnQueryRow) {
   const input = record(row.input)
+  const selectedJobId = projectSelectedJobId(input.selectedJobPreparation)
   return {
     schemaVersion,
     id: row.id,
     sessionId: row.sessionId,
     source: row.source,
     goal: typeof input.goal === "string" ? redactString(input.goal) : "Process agent task",
+    ...(selectedJobId ? { selectedJobId } : {}),
     status: row.status,
     revision: row.revision,
     activeStepId: row.steps[0]?.id ?? null,
@@ -175,9 +177,51 @@ export interface TaskQueryRow extends CursorRow {
   updatedAt: Date
 }
 
+export interface SafeArtifactRef {
+  readonly artifactId: string
+  readonly version: number
+  readonly contentHash: string
+  readonly sourceDigest: string
+}
+
+function projectArtifactRef(value: unknown, role: string, taskType: string, status: string): SafeArtifactRef | null {
+  if (status !== "completed"
+    || (role === "writer" && taskType !== "cover_letter_draft")
+    || (role === "reviewer" && taskType !== "cover_letter_review")
+    || (role !== "writer" && role !== "reviewer")) return null
+  const result = record(value)
+  // Current child results persist a completed-result envelope whose role-specific
+  // receipt lives under structuredResult. Keep accepting the earlier flat shape
+  // for sessions written before that envelope was introduced.
+  const structured = record(result.structuredResult)
+  if (Object.hasOwn(result, "structuredResult")) {
+    if (result.status !== "completed" || structured.role !== role || structured.status !== "completed") return null
+  } else if (result.status !== undefined && result.status !== "completed") return null
+  const ref = record(structured.artifactRef ?? result.artifactRef)
+  if (Object.keys(ref).sort().join(",") !== "artifactId,contentHash,sourceDigest,version"
+    || !boundedIdentifier(ref.artifactId) || !Number.isSafeInteger(ref.version) || Number(ref.version) < 1
+    || !isDigest(ref.contentHash) || !isDigest(ref.sourceDigest)) return null
+  return { artifactId: ref.artifactId, version: Number(ref.version), contentHash: ref.contentHash, sourceDigest: ref.sourceDigest }
+}
+
+function projectSelectedJobId(value: unknown): string | null {
+  const selectedJobPreparation = record(value)
+  if (Object.keys(selectedJobPreparation).length !== 1 || !boundedIdentifier(selectedJobPreparation.jobId)) return null
+  return selectedJobPreparation.jobId
+}
+
+function boundedIdentifier(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value
+}
+
+function isDigest(value: unknown): value is string {
+  return typeof value === "string" && /^sha256:[a-f0-9]{64}$/.test(value)
+}
+
 export function taskDto(row: TaskQueryRow) {
   const legacy = projectLegacySubAgentTask(row)
   const evidencePreview = projectTaskEvidencePreview(row)
+  const artifactRef = projectArtifactRef(row.result, row.role, row.taskType, row.status)
   return {
     schemaVersion,
     id: row.id,
@@ -193,6 +237,7 @@ export function taskDto(row: TaskQueryRow) {
     confidence: row.confidence,
     failureReason: row.failureReason ? redactString(row.failureReason) : null,
     hasResult: row.result !== null,
+    ...(artifactRef ? { artifactRef } : {}),
     ...(evidencePreview ? { structuredEvidencePreview: evidencePreview } : {}),
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),

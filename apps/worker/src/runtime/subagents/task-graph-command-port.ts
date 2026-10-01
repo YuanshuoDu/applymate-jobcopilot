@@ -1,3 +1,4 @@
+import type { PoolClient } from "pg"
 import type { TaskGraphProposal, TaskGraphReadiness } from "../planning/task-graph.js"
 import type { SubagentTaskStatus } from "./types.js"
 
@@ -61,6 +62,12 @@ export type TaskGraphAnalystProjectionItem = Readonly<{
   score: number
   evidenceKinds: readonly TaskGraphProjectionEvidenceKind[]
 }>
+export type TaskGraphArtifactProjectionReference = Readonly<{
+  artifactId: string
+  version: number
+  contentHash: string
+  sourceDigest: string
+}>
 export type TaskGraphResultProjection =
   | Readonly<{ schemaVersion: typeof TASK_GRAPH_RESULT_PROJECTION_SCHEMA; trust: "untrusted"; availability: "unavailable" }>
   | Readonly<{
@@ -82,6 +89,24 @@ export type TaskGraphResultProjection =
     findingCount: number
     evidenceCount: number
     findings: readonly TaskGraphAnalystProjectionItem[]
+  }>
+  | Readonly<{
+    schemaVersion: typeof TASK_GRAPH_RESULT_PROJECTION_SCHEMA
+    trust: "untrusted"
+    availability: "available"
+    role: "writer"
+    status: "completed"
+    artifactRef: TaskGraphArtifactProjectionReference
+  }>
+  | Readonly<{
+    schemaVersion: typeof TASK_GRAPH_RESULT_PROJECTION_SCHEMA
+    trust: "untrusted"
+    availability: "available"
+    role: "reviewer"
+    status: "completed"
+    artifactRef: TaskGraphArtifactProjectionReference
+    reviewStatus: "passed" | "needs_revision" | "rejected" | "stale"
+    reviewHash: string
   }>
 
 export type TaskGraphCurrentNode = Readonly<{
@@ -113,4 +138,6 @@ export class TaskGraphCommandError extends Error {
 export type TaskGraphCommandPort = Readonly<{
   appendAndSchedule(input: TaskGraphScheduleInput): Promise<TaskGraphScheduleReceipt>
   readCurrent(scope: TaskGraphReadScope): Promise<TaskGraphCurrentState>
+  /** Reads current graph state using a caller-owned transaction and client. */
+  readCurrentWithClient?(client: PoolClient, scope: TaskGraphReadScope): Promise<TaskGraphCurrentState>
 }>

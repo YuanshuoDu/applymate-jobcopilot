@@ -3,6 +3,7 @@ import { AgentInputCommandSchema, assertValid, schemaVersion, type InputContentP
 import { NextResponse } from "next/server"
 
 import { AgentCommandError } from "@/lib/agent/control-plane/commands"
+import type { SelectedJobPreparationScope } from "@/lib/agent/control-plane/commands/types"
 
 export const MAX_COMMAND_BODY_BYTES = 256 * 1024
 export const MAX_CONTENT_PARTS = 32
@@ -15,6 +16,7 @@ export type ParsedMessageCommand = {
   expectedTurnId: string | null
   expectedRevision: number | null
   content: InputContentPart[]
+  selectedJobPreparation?: SelectedJobPreparationScope
 }
 
 export type ParsedInterruptCommand = {
@@ -109,6 +111,12 @@ function parseContent(value: unknown): InputContentPart[] | null {
   return parts
 }
 
+function parseSelectedJobPreparation(value: unknown): SelectedJobPreparationScope | null {
+  if (!isRecord(value) || !isAllowedKeys(value, ["jobId"])) return null
+  const jobId = stringValue(value.jobId)
+  return jobId ? { jobId } : null
+}
+
 function validateProtocolCommand(command: unknown): boolean {
   try {
     assertValid(AgentInputCommandSchema, command, "agent message command")
@@ -119,7 +127,7 @@ function validateProtocolCommand(command: unknown): boolean {
 }
 
 export function parseMessageBody(body: unknown, request: Request, sessionId: string): ParsedMessageCommand | NextResponse {
-  if (!isRecord(body) || !isAllowedKeys(body, ["schemaVersion", "clientMessageId", "delivery", "expectedTurnId", "expectedRevision", "content"])) {
+  if (!isRecord(body) || !isAllowedKeys(body, ["schemaVersion", "clientMessageId", "delivery", "expectedTurnId", "expectedRevision", "content", "selectedJobPreparation"])) {
     return invalid("Unsupported or forbidden command field")
   }
   const clientMessageId = commandId(body, request)
@@ -127,7 +135,8 @@ export function parseMessageBody(body: unknown, request: Request, sessionId: str
   const expectedTurnId = body.expectedTurnId === undefined || body.expectedTurnId === null ? null : stringValue(body.expectedTurnId)
   const expectedRevision = optionalRevision(body.expectedRevision)
   const content = parseContent(body.content)
-  if (!clientMessageId || (delivery !== "steer" && delivery !== "follow_up") || (body.expectedTurnId !== undefined && body.expectedTurnId !== null && expectedTurnId === null) || expectedRevision === undefined || !content) {
+  const selectedJobPreparation = body.selectedJobPreparation === undefined ? undefined : parseSelectedJobPreparation(body.selectedJobPreparation)
+  if (!clientMessageId || (delivery !== "steer" && delivery !== "follow_up") || (selectedJobPreparation && delivery !== "follow_up") || (body.selectedJobPreparation !== undefined && !selectedJobPreparation) || (body.expectedTurnId !== undefined && body.expectedTurnId !== null && expectedTurnId === null) || expectedRevision === undefined || !content) {
     return invalid("Invalid message command payload")
   }
   const protocolCommand = {
@@ -139,7 +148,7 @@ export function parseMessageBody(body: unknown, request: Request, sessionId: str
     content,
   }
   if (!validateProtocolCommand(protocolCommand)) return invalid("Message command failed protocol validation")
-  return { clientMessageId, delivery, expectedTurnId, expectedRevision, content }
+  return { clientMessageId, delivery, expectedTurnId, expectedRevision, content, ...(selectedJobPreparation ? { selectedJobPreparation } : {}) }
 }
 
 export function parseInterruptBody(body: unknown, request: Request): ParsedInterruptCommand | NextResponse {

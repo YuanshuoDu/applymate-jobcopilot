@@ -1,13 +1,14 @@
 import { describe, expect, it, vi } from "vitest"
 
 vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnect: vi.fn() })) }))
+vi.mock("./selected-job-preparation.js", () => ({ loadSelectedJobPreparation: vi.fn(async () => undefined) }))
 
 import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
 import type pg from "pg"
 import type { StepContext } from "./context/step-context-builder.js"
 import type { CanonicalTurnState } from "./canonical-turn-state.js"
 import type { TurnEngineEvent, TurnEngineStore } from "./turns/turn-engine-types.js"
-import { createCanonicalTurnRuntime } from "./canonical-turn-runtime.js"
+import { createCanonicalTurnRuntime, type CanonicalTurnRuntimeOptions } from "./canonical-turn-runtime.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA, type TaskGraphCommandPort, type TaskGraphCurrentState, type TaskGraphReadScope, type TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
 import { TurnEngine } from "./turns/turn-engine.js"
@@ -15,17 +16,24 @@ import { createPgRootTaskStore } from "./subagents/root-task-store.js"
 import { reclaimExpiredTurns } from "./turns/recovery-scanner.js"
 import { runTurnJob } from "./turns/turn-queue.js"
 import type { TurnLease } from "./turns/lease.js"
+import { InterruptRequestedError } from "./interrupt/registry.js"
 import { resolveProductionAgentFlags, type ProductionAgentFlags } from "./production-agent-flags.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 2,
   leaseStartedAt: new Date("2026-09-07T00:00:00.000Z"), leaseExpiresAt: new Date("2026-09-07T00:01:00.000Z"),
 }
+type TurnEngineStoreFactory = NonNullable<CanonicalTurnRuntimeOptions["turnEngineStoreFactory"]>
 const recoveredPlanHash = `sha256:${"a".repeat(64)}`
 type RuntimeEvent = { id?: string; type: string; payload: unknown; correlationId?: string; idempotencyKey?: string; owner?: unknown }
 
 function state(): CanonicalTurnState {
   return { scope: { userId: "user-1" }, goal: "Find jobs", modelProfileSnapshot: { provider: "fixture", model: "fixture" }, toolPolicySnapshot: {}, budgetSnapshot: { limits: { maxSteps: 4 } }, snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] } }
+}
+
+function selectedJobState(): CanonicalTurnState {
+  const current = state()
+  return { ...current, snapshot: { ...current.snapshot, businessRefs: [{ id: "job-1", kind: "job", ownerId: "user-1", label: "Selected role" }] } }
 }
 
 function store(events: RuntimeEvent[] = [], batches: RuntimeEvent[][] = [], itemUpdates: unknown[] = []): TurnEngineStore {
@@ -181,11 +189,13 @@ async function rootToolNames(
   capabilities = ["read"],
   productionFlags?: ProductionAgentFlags,
   taskGraph?: { commandPort: TaskGraphCommandPort; templates: Readonly<Record<string, TaskGraphTaskTemplate>> },
+  selectedJobPreparation?: { readonly jobId: string },
 ): Promise<string[]> {
   const requests: HarnessModelRequest[] = []
   const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
     workerId: "worker-1", coordinationEnabled, ...(productionFlags ? { productionFlags } : {}),
     ...(taskGraph ? { taskGraphCommandPort: taskGraph.commandPort, taskGraphTemplates: taskGraph.templates } : {}),
+    ...(selectedJobPreparation ? { selectedJobPreparationLoader: async () => selectedJobPreparation } : {}),
     stateLoader: async () => ({ ...state(), toolPolicySnapshot: { capabilities } }),
     rootTaskStore: rootStore() as never, turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
     modelRuntimeFactory: async () => ({ adapter: {
@@ -205,7 +215,166 @@ async function rootToolNames(
   }) ?? []
 }
 
+async function taskGraphRootSurface(
+  selectedJob: boolean,
+  recoverHiddenMutation = false,
+  forgedToolName = "agent.spawn",
+  recoveredToolName = "agent.interrupt",
+) {
+  const requests: HarnessModelRequest[] = []
+  const events: RuntimeEvent[] = []
+  let allowedActions: readonly string[] = []
+  const roots = {
+    ensure: vi.fn(async (input: { allowedActions: readonly string[] }) => {
+      allowedActions = [...input.allowedActions]
+      return { id: "root-1", attemptCount: 1 } as never
+    }),
+    checkCompletion: vi.fn(async () => ({ ok: true as const })), finish: vi.fn(async () => undefined),
+  }
+  const names = [...CANONICAL_COORDINATION_TOOL_NAMES,
+    "spawn_subagent", "send_message", "wait_subagents", "list_subagents", "interrupt_subagent", "close_subagent"]
+  const definitions = ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base", ...names].map(name => ({ name, version: "1" }))
+  const route = vi.fn(async (_context: unknown, call: { id: string; toolName: string; toolVersion: string }) => ({
+    id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed" as const,
+    output: { ok: true, privateSource: "PRIVATE_SOURCE_SENTINEL" }, errorCode: null,
+  }))
+  const taskGraphCommandPort = {
+    appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
+    readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
+  }
+  const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+    workerId: "worker-1", productionFlags: resolveProductionAgentFlags({
+      ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+    }),
+    taskGraphCommandPort: taskGraphCommandPort as never,
+    taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+    selectedJobPreparationLoader: async () => selectedJob ? { jobId: "job-1" } : undefined,
+    stateLoader: async () => ({
+      ...state(), toolPolicySnapshot: { capabilities: ["read"] },
+      ...(recoverHiddenMutation ? {
+        pendingToolCalls: [{ call: { id: "persisted-hidden-call", name: recoveredToolName, arguments: recoveredToolName === "jobs.get" ? { jobId: "job-other" } : {} }, toolVersion: "1", stepId: "prior-step", callItem: { id: "persisted-call-item", revision: 0 } }],
+        resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 0n, consumedInputIds: [], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
+      } : {}),
+    }),
+    rootTaskStore: roots as never, turnEngineStoreFactory: () => store(events), contextBuilderFactory: () => contextBuilder(),
+    toolRuntimeFactory: () => ({
+      registry: {
+        list: () => definitions,
+        resolve: (name: string) => ({ idempotency: name === "agent.interrupt" ? "idempotent" as const : name === "agent.spawn" ? "requires_key" as const : "read_only" as const }),
+        validateArguments: () => true as const,
+        register: (definition: { name: string; version: string }) => { definitions.push(definition) },
+      },
+      router: { execute: route },
+    }) as never,
+    modelRuntimeFactory: async () => ({ adapter: {
+      ...model(() => []),
+      async *stream(request: HarnessModelRequest) {
+        requests.push(request)
+        if (requests.length === 1 && !recoverHiddenMutation) {
+          yield { type: "tool_call_completed", callId: "forged-call", name: forgedToolName, arguments: { jobId: "job-other" } }
+          yield { type: "completed", finishReason: "tool_calls" }
+        } else {
+          yield { type: "text_delta", text: "done" }
+          yield { type: "completed", finishReason: "stop" }
+        }
+      },
+    }, registry: {} as never, candidates: [] }),
+    authorizeUsage: async () => ({ settle: async () => undefined }),
+  })
+  await runtime.execute({ lease, signal: new AbortController().signal })
+  const toolNames = requests[0]?.tools.flatMap(tool => {
+    if (!tool || typeof tool !== "object" || !("name" in tool) || typeof tool.name !== "string") return []
+    return [tool.name]
+  }) ?? []
+  return { toolNames, allowedActions, route, events }
+}
+
 describe("createCanonicalTurnRuntime", () => {
+  it("surfaces selected-job preparation as unavailable without planning gates, model calls, or task scheduling", async () => {
+    const roots = rootStore()
+    const modelRuntimeFactory = vi.fn(async () => ({ adapter: model(() => []), registry: {} as never, candidates: [] }))
+    const executionProjection = { start: vi.fn(async () => undefined), finish: vi.fn(async () => undefined) }
+    const sessionProjection = { start: vi.fn(async () => undefined), finish: vi.fn(async () => undefined) }
+    const commandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
+      readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
+    }
+    const selector = vi.fn(async () => ({ jobId: "job-1" }))
+    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+      workerId: "worker-1", stateLoader: async () => state(), rootTaskStore: roots as never,
+      selectedJobPreparationLoader: selector,
+      taskGraphCommandPort: commandPort,
+      taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+      modelRuntimeFactory, executionProjection, sessionProjection,
+    })
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toEqual({
+      status: "failed", summary: "selected_job_preparation_unavailable",
+    })
+    expect(selector).toHaveBeenCalledOnce()
+    expect(modelRuntimeFactory).not.toHaveBeenCalled()
+    expect(commandPort.appendAndSchedule).not.toHaveBeenCalled()
+    expect(commandPort.readCurrent).not.toHaveBeenCalled()
+    expect(roots.finish).toHaveBeenCalledWith(expect.objectContaining({
+      result: expect.objectContaining({ status: "failed", errorCode: "selected_job_preparation_unavailable", stepCount: 0, toolCallCount: 0 }),
+    }))
+    expect(executionProjection.finish).toHaveBeenCalledWith(expect.objectContaining({
+      result: expect.objectContaining({ status: "failed", errorCode: "selected_job_preparation_unavailable" }),
+    }))
+    expect(sessionProjection.finish).toHaveBeenCalledWith(expect.objectContaining({
+      result: expect.objectContaining({ status: "failed", errorCode: "selected_job_preparation_unavailable" }),
+    }))
+  })
+
+  it("keeps ordinary Turns on the existing model path when no selected-job intent is present", async () => {
+    const fixture = setup({
+      selectedJobPreparationLoader: async () => undefined,
+      taskGraphCommandPort: {
+        appendAndSchedule: vi.fn(async () => ({ status: "accepted", revision: 1, nodes: [], readyTaskIds: [] })),
+        readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
+      },
+    })
+
+    await expect((await fixture.runtime).execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "completed" })
+    expect(fixture.getModelCalls()).toBe(2)
+    expect(fixture.tool.execute).toHaveBeenCalledOnce()
+  })
+
+  it("preserves Stop interruption when a selected-job Turn is already aborted", async () => {
+    const selector = vi.fn(async () => ({ jobId: "job-1" }))
+    const fixture = setup({ selectedJobPreparationLoader: selector })
+    const controller = new AbortController()
+    controller.abort(new InterruptRequestedError({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId }))
+
+    await expect((await fixture.runtime).execute({ lease, signal: controller.signal })).resolves.toMatchObject({ status: "interrupted" })
+    expect(selector).not.toHaveBeenCalled()
+    expect(fixture.roots.finish).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ status: "interrupted" }) }))
+    expect(fixture.getModelCalls()).toBe(0)
+  })
+
+  it("preserves Stop interruption when the selected-job selector resolves after abort", async () => {
+    let markStarted!: () => void
+    let resolveSelection!: (selection: { jobId: string }) => void
+    const started = new Promise<void>(resolve => { markStarted = resolve })
+    const pendingSelection = new Promise<{ jobId: string }>(resolve => { resolveSelection = resolve })
+    const selector = vi.fn(() => {
+      markStarted()
+      return pendingSelection
+    })
+    const fixture = setup({ selectedJobPreparationLoader: selector })
+    const controller = new AbortController()
+    const execution = (await fixture.runtime).execute({ lease, signal: controller.signal })
+
+    await started
+    controller.abort(new InterruptRequestedError({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId }))
+    resolveSelection({ jobId: "job-1" })
+
+    await expect(execution).resolves.toMatchObject({ status: "interrupted" })
+    expect(selector).toHaveBeenCalledOnce()
+    expect(fixture.roots.finish).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ status: "interrupted" }) }))
+    expect(fixture.getModelCalls()).toBe(0)
+  })
+
   it("advertises agent.plan through the configured model adapter when server gates are enabled", async () => {
     const requests: HarnessModelRequest[] = []
     const modelSnapshots: CanonicalTurnState["snapshot"][] = []
@@ -236,6 +405,7 @@ describe("createCanonicalTurnRuntime", () => {
     const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
       workerId: "worker-1", productionFlags: planningFlags, taskGraphCommandPort,
       taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+      selectedJobPreparationLoader: async () => undefined,
       stateLoader: async () => ({ ...state(), toolPolicySnapshot: {} }), rootTaskStore: rootStore() as never,
       turnEngineStoreFactory: () => store(),
       contextBuilderFactory: () => ({
@@ -286,6 +456,113 @@ describe("createCanonicalTurnRuntime", () => {
     expect(modelContext?.blocks.find(block => block.id === "task-graph-current")?.trust).toBe("external_untrusted")
   })
 
+  it("filters restored and reconciled generic reads from selected-job resume context while preserving TaskGraph results", async () => {
+    const privateSentinel = "PRIVATE_FORGED_JOB_READ_SENTINEL"
+    const reconciledSentinel = "PRIVATE_RECONCILED_JOB_READ_SENTINEL"
+    const requests: HarnessModelRequest[] = []
+    const modelSnapshots: CanonicalTurnState["snapshot"][] = []
+    const recoveredEvents: RuntimeEvent[] = []
+    const recoveredItemUpdates: unknown[] = []
+    let modelContext: StepContext | undefined
+    const currentPlan: TaskGraphCurrentState = {
+      revision: 7, nodes: [{
+        key: "research", templateId: "scout", goal: "Find roles", successCriteria: ["Return links"], dependsOn: [],
+        taskId: "child-1", status: "completed", readiness: "terminal", resultSummary: null,
+        resultProjection: {
+          schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available",
+          role: "scout", status: "completed", candidateCount: 1, evidenceCount: 1,
+          candidates: [{ jobId: "job-42", source: "greenhouse", evidenceKinds: ["job"] }],
+        },
+        failureReason: null,
+      }],
+    }
+    const readCurrent = vi.fn(async (): Promise<TaskGraphCurrentState> => currentPlan)
+    const taskGraphCommandPort: TaskGraphCommandPort = {
+      appendAndSchedule: async () => ({ status: "accepted", revision: 1, nodes: [], readyTaskIds: [] }),
+      readCurrent,
+    }
+    const resumedState: CanonicalTurnState = {
+      ...state(),
+      toolPolicySnapshot: {},
+      resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 0n, consumedInputIds: [], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
+      pendingToolCalls: [{
+        call: { id: "reconciled-job-read", name: "jobs.get", arguments: { jobId: "job-private" } },
+        toolVersion: "1", stepId: "prior-step", callItem: { id: "persisted-reconciled-call", revision: 0 },
+        durableResult: {
+          id: "reconciled-job-read", toolName: "jobs.get", toolVersion: "1", status: "completed",
+          output: { description: reconciledSentinel }, errorCode: null,
+        },
+      }],
+      snapshot: {
+        ...state().snapshot,
+        toolObservations: [{
+          id: "tool-result:forged-job-read",
+          content: {
+            toolCallId: "forged-job-read", toolName: "jobs.get", input: { jobId: "job-private" }, status: "completed",
+            output: { description: privateSentinel }, errorCode: null,
+          },
+        }],
+      },
+    }
+    const planningFlags = resolveProductionAgentFlags({
+      ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+    })
+    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+      workerId: "worker-1", productionFlags: planningFlags, taskGraphCommandPort,
+      taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+      selectedJobPreparationLoader: async () => ({ jobId: "job-42" }),
+      stateLoader: async () => resumedState,
+      rootTaskStore: rootStore() as never,
+      turnEngineStoreFactory: () => store(recoveredEvents, [], recoveredItemUpdates),
+      contextBuilderFactory: () => ({
+        build: async request => {
+          modelSnapshots.push(request.snapshot)
+          const built = await contextBuilder().build(request)
+          modelContext = built
+          return built
+        },
+      }),
+      modelRuntimeFactory: async () => ({ adapter: {
+        ...model(() => []),
+        async *stream(request: HarnessModelRequest) {
+          requests.push(request)
+          yield { type: "text_delta", text: "done" }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      }, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+
+    await runtime.execute({ lease, signal: new AbortController().signal })
+
+    const modelMessages = JSON.stringify(requests[0]?.messages)
+    expect(modelMessages).not.toContain(privateSentinel)
+    expect(modelMessages).not.toContain(reconciledSentinel)
+    expect(modelMessages).not.toContain("jobs.get")
+    expect(modelMessages).toContain("job-42")
+    expect(recoveredEvents.some(event => event.type === "tool_call.completed" && JSON.stringify(event.payload).includes("reconciled-job-read"))).toBe(true)
+    expect(JSON.stringify(recoveredItemUpdates)).toContain(reconciledSentinel)
+    const modelObservationIds = modelSnapshots[0]?.toolObservations.map(observation => observation.id) ?? []
+    expect(modelObservationIds).not.toContain("tool-result:forged-job-read")
+    expect(modelObservationIds).not.toContain("tool-result:reconciled-job-read")
+    expect(modelObservationIds).toContain("task-graph-current")
+    expect(modelSnapshots[0]?.toolObservations).toContainEqual(expect.objectContaining({
+      id: "task-graph-current",
+      content: expect.objectContaining({
+        kind: "task_graph_current",
+        nodes: expect.arrayContaining([expect.objectContaining({
+          key: "research",
+          resultProjection: expect.objectContaining({
+            candidates: [{ jobId: "job-42", source: "greenhouse", evidenceKinds: ["job"] }],
+          }),
+        })]),
+      }),
+    }))
+    expect(modelContext?.blocks.map(block => block.id)).not.toContain("tool-result:forged-job-read")
+    expect(modelContext?.blocks.find(block => block.id === "task-graph-current")?.trust).toBe("external_untrusted")
+    expect(readCurrent).toHaveBeenCalledTimes(2)
+  })
+
   it("does not advertise agent.plan in the serving tool list with default production flags", async () => {
     const commandPort: TaskGraphCommandPort = {
       appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
@@ -317,6 +594,41 @@ describe("createCanonicalTurnRuntime", () => {
     expect(commandPort.readCurrent).not.toHaveBeenCalled()
   })
 
+  it("advertises selected-job templates only when the persisted server selector is present", async () => {
+    const commandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
+      readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
+    }
+    const flags = resolveProductionAgentFlags({
+      ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+    })
+    const request = async (selection?: { readonly jobId: string }) => {
+      const requests: HarnessModelRequest[] = []
+      const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+        workerId: "worker-1", productionFlags: flags, taskGraphCommandPort: commandPort,
+        taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+        ...(selection ? { selectedJobPreparationLoader: async () => selection } : { selectedJobPreparationLoader: async () => undefined }),
+        stateLoader: async () => ({ ...state(), toolPolicySnapshot: {} }), rootTaskStore: rootStore() as never,
+        turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
+        modelRuntimeFactory: async () => ({ adapter: {
+          ...model(() => []),
+          async *stream(value: HarnessModelRequest) { requests.push(value); yield { type: "text_delta", text: "done" }; yield { type: "completed", finishReason: "stop" } },
+        }, registry: {} as never, candidates: [] }),
+        authorizeUsage: async () => ({ settle: async () => undefined }),
+      })
+      await runtime.execute({ lease, signal: new AbortController().signal })
+      return requests[0]?.tools.find(tool => tool && typeof tool === "object" && "name" in tool && tool.name === "agent.plan")
+    }
+    const ordinaryPlanTool = await request()
+    const selectedPlanTool = await request({ jobId: "job-52" })
+    expect(ordinaryPlanTool && typeof ordinaryPlanTool === "object" && "description" in ordinaryPlanTool ? ordinaryPlanTool.description : "")
+      .not.toContain("cover_letter_writer")
+    expect(selectedPlanTool && typeof selectedPlanTool === "object" && "description" in selectedPlanTool ? selectedPlanTool.description : "")
+      .toContain('"cover_letter_writer"')
+    expect(selectedPlanTool && typeof selectedPlanTool === "object" && "description" in selectedPlanTool ? selectedPlanTool.description : "")
+      .toContain('"artifact.version.read"')
+  })
+
   it("fails closed before provider invocation when the scoped current graph read fails", async () => {
     const provider = vi.fn(async () => ({ adapter: model(() => []), registry: {} as never, candidates: [] }))
     const taskGraphCommandPort: TaskGraphCommandPort = {
@@ -326,6 +638,7 @@ describe("createCanonicalTurnRuntime", () => {
     const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
       workerId: "worker-1", taskGraphCommandPort, taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
       productionFlags: { taskGraphPlanningEnabled: true, childExecutionEnabled: true, coordinationEnabled: true, consumeWaitOutcomes: false, canonicalAutomationEnabled: false },
+      selectedJobPreparationLoader: async () => undefined,
       stateLoader: async () => ({ ...state(), toolPolicySnapshot: {} }), rootTaskStore: rootStore() as never,
       turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(), modelRuntimeFactory: provider,
       authorizeUsage: async () => ({ settle: async () => undefined }),
@@ -432,6 +745,44 @@ describe("createCanonicalTurnRuntime", () => {
     expect(disabled).not.toEqual(expect.arrayContaining(["spawn_subagent", "wait_subagents", "list_subagents", "send_message", "interrupt_subagent", "close_subagent"]))
     const enabled = await rootToolNames(true)
     expect(enabled).toEqual(expect.arrayContaining(["spawn_subagent", "wait_subagents", "list_subagents", "send_message", "interrupt_subagent", "close_subagent"]))
+  })
+
+  it("restricts selected-job root tools to TaskGraph supervision and blocks forged execution", async () => {
+    const selectedJobDenied = ["spawn_subagent", "agent.spawn", "agent.followup", "send_message", "agent.send", "interrupt_subagent", "agent.interrupt", "close_subagent", "agent.close", "wait_subagents"]
+    const genericCoordination = [...selectedJobDenied, "agent.wait"]
+    const retained = ["agent.plan", "agent.wait", "agent.list", "list_subagents"]
+    const genericReads = ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"]
+    const selected = await taskGraphRootSurface(true)
+    const generic = await taskGraphRootSurface(false)
+
+    expect(selected.toolNames).not.toEqual(expect.arrayContaining(selectedJobDenied))
+    expect(selected.allowedActions).not.toEqual(expect.arrayContaining(selectedJobDenied))
+    expect(selected.toolNames).not.toEqual(expect.arrayContaining(genericReads))
+    expect(selected.allowedActions).not.toEqual(expect.arrayContaining(genericReads))
+    expect(selected.toolNames).toEqual(expect.arrayContaining(retained))
+    expect(selected.allowedActions).toEqual(expect.arrayContaining(retained))
+    expect(selected.route).not.toHaveBeenCalled()
+    expect(JSON.stringify(selected.events)).not.toContain("forged-call")
+    expect(JSON.stringify(selected.events)).not.toContain("PRIVATE_SOURCE_SENTINEL")
+
+    expect(generic.toolNames).toEqual(expect.arrayContaining([...genericCoordination, ...retained]))
+    expect(generic.toolNames).toEqual(expect.arrayContaining(genericReads))
+    expect(generic.allowedActions).toEqual(expect.arrayContaining([...genericCoordination, ...retained]))
+    expect(generic.allowedActions).toEqual(expect.arrayContaining(genericReads))
+    expect(generic.route).toHaveBeenCalledOnce()
+
+    const forgedRead = await taskGraphRootSurface(true, false, "jobs.get")
+    expect(forgedRead.route).not.toHaveBeenCalled()
+    expect(JSON.stringify(forgedRead.events)).not.toContain("PRIVATE_SOURCE_SENTINEL")
+
+    const recovered = await taskGraphRootSurface(true, true)
+    expect(recovered.route).not.toHaveBeenCalled()
+    expect(JSON.stringify(recovered.events)).toContain("selected_job_root_tool_disabled")
+    expect(JSON.stringify(recovered.events)).not.toContain("PRIVATE_SOURCE_SENTINEL")
+
+    const recoveredRead = await taskGraphRootSurface(true, true, "agent.spawn", "jobs.get")
+    expect(recoveredRead.route).not.toHaveBeenCalled()
+    expect(JSON.stringify(recoveredRead.events)).not.toContain("PRIVATE_SOURCE_SENTINEL")
   })
 
   it("settles the root after the real wait transition and releases its task lease", async () => {
@@ -567,8 +918,165 @@ describe("createCanonicalTurnRuntime", () => {
 
   it("passes the server-owned completion gate for the canonical root", async () => {
     const fixture = setup()
-    await fixture.runtime.then(runtime => runtime.execute({ lease, signal: new AbortController().signal }))
+    await expect(fixture.runtime.then(runtime => runtime.execute({ lease, signal: new AbortController().signal })))
+      .resolves.toMatchObject({ status: "completed" })
     expect(fixture.roots.checkCompletion).toHaveBeenCalledWith(expect.objectContaining({ rootTaskId: "root-1", lease }))
+  })
+
+  it("keeps generic Turns blocked while child tasks are pending", async () => {
+    const roots = {
+      ...rootStore(),
+      checkCompletion: vi.fn(async () => ({ ok: false as const, blocker: "child_tasks_pending", feedback: "Child tasks are still running" })),
+    }
+    const fixture = setup({ rootTaskStore: roots })
+    const runtime = await fixture.runtime
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed" })
+    expect(roots.checkCompletion).toHaveBeenCalledOnce()
+    expect(roots.finish).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ errorCode: "business_precondition_failed" }) }))
+  })
+
+  it.each([
+    { name: "unchanged source", sourceDigest: `sha256:${"b".repeat(64)}`, status: "completed" },
+    { name: "source changed after review", sourceDigest: `sha256:${"e".repeat(64)}`, status: "failed" },
+  ])("revalidates current selected-job sources at completion ($name)", async ({ sourceDigest, status }) => {
+    const artifactRef = {
+      artifactId: "draft-1", version: 2, contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: `sha256:${"b".repeat(64)}`,
+    }
+    const reviewedGraph: TaskGraphCurrentState = {
+      revision: 2,
+      nodes: [
+        {
+          key: "writer", templateId: "cover_letter_writer", goal: "Draft", successCriteria: ["Save"], dependsOn: [], taskId: "writer-1",
+          status: "completed", readiness: "terminal", resultSummary: null, failureReason: null,
+          resultProjection: { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available", role: "writer", status: "completed", artifactRef },
+        },
+        {
+          key: "reviewer", templateId: "cover_letter_reviewer", goal: "Review", successCriteria: ["Review"], dependsOn: ["writer"], taskId: "reviewer-1",
+          status: "completed", readiness: "terminal", resultSummary: null, failureReason: null,
+          resultProjection: {
+            schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available", role: "reviewer", status: "completed",
+            artifactRef, reviewStatus: "needs_revision", reviewHash: `sha256:${"c".repeat(64)}`,
+          },
+        },
+      ],
+    }
+    const reads: TaskGraphCurrentState[] = [{ revision: 1, nodes: [] }, reviewedGraph]
+    const taskGraphCommandPort: TaskGraphCommandPort = {
+      appendAndSchedule: async () => ({ status: "accepted", revision: 1, nodes: [], readyTaskIds: [] }),
+      readCurrent: vi.fn(async () => reads.shift() ?? reviewedGraph),
+    }
+    const artifactHeadReader = vi.fn(async (scope: { userId: string; sessionId: string; jobId: string; artifactId: string }) => ({
+      ...artifactRef, artifactId: scope.artifactId,
+    }))
+    const reviewRow = {
+      id: "review-1", artifactVersionId: "version-1", userId: lease.userId, sessionId: lease.sessionId, jobId: "job-1",
+      artifactId: artifactRef.artifactId, version: artifactRef.version, contentHash: artifactRef.contentHash,
+      sourceDigest: artifactRef.sourceDigest, currentSourceDigest: artifactRef.sourceDigest, status: "needs_revision",
+      findings: [{ private: "review details" }], evidenceRefs: [], taskId: "reviewer-1", toolCallId: "review-call-1",
+      requestHash: "request-1", reviewHash: `sha256:${"c".repeat(64)}`, createdAt: new Date(),
+    }
+    const artifactClient = {
+      query: vi.fn(async (sql: string, _values?: readonly unknown[]) => sql.includes('FROM "agent_artifact_review"')
+        ? { rows: [reviewRow], rowCount: 1 } : { rows: [], rowCount: 0 }),
+      release: vi.fn(),
+    }
+    const roots = rootStore()
+    const sourceDigestLoader = vi.fn(async () => sourceDigest)
+    let selectedTerminalGuard: Parameters<TurnEngineStoreFactory>[1] | "not-created" = "not-created"
+    const selectedStoreFactory: TurnEngineStoreFactory = (_pool, guard) => {
+      selectedTerminalGuard = guard
+      return store()
+    }
+    const productionFlags = resolveProductionAgentFlags({
+      ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+    })
+    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn(async () => artifactClient) } as never, {
+      workerId: "worker-1", productionFlags, taskGraphCommandPort,
+      selectedJobPreparationLoader: async () => ({ jobId: "job-1" }),
+      selectedJobArtifactHeadReader: artifactHeadReader,
+      selectedJobSourceDigestLoader: sourceDigestLoader,
+      stateLoader: async () => ({ ...selectedJobState(), toolPolicySnapshot: {} }), rootTaskStore: roots as never,
+      turnEngineStoreFactory: selectedStoreFactory, contextBuilderFactory: () => contextBuilder(),
+      modelRuntimeFactory: async () => ({ adapter: {
+        ...model(() => []),
+        async *stream() {
+          yield { type: "text_delta", text: "The cover-letter draft is ready for review." }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      }, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status })
+    expect(selectedTerminalGuard).toEqual(expect.any(Function))
+    expect(roots.checkCompletion).toHaveBeenCalledOnce()
+    expect(taskGraphCommandPort.readCurrent).toHaveBeenCalledTimes(2)
+    expect(taskGraphCommandPort.readCurrent).toHaveBeenLastCalledWith({
+      userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-1", parentTaskId: "root-1",
+      turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: 1,
+    })
+    if (status === "completed") {
+      const reviewRead = artifactClient.query.mock.calls.find(([sql]) => String(sql).includes('FROM "agent_artifact_review"'))
+      expect(reviewRead?.[0]).toContain('AND "currentSourceDigest"=$8 AND "status"=$9 AND "taskId"=$10 AND "reviewHash"=$11')
+      expect(reviewRead?.[0]).toContain('"toolCallId", "reviewHash"')
+      expect(reviewRead?.[0]).not.toMatch(/"(findings|evidenceRefs|requestHash)"/)
+      expect(reviewRead?.[1]).toEqual([
+        lease.userId, lease.sessionId, "job-1", "draft-1", 2, artifactRef.contentHash, artifactRef.sourceDigest,
+        artifactRef.sourceDigest, "needs_revision", "reviewer-1", reviewRow.reviewHash,
+      ])
+      expect(artifactHeadReader).toHaveBeenCalledOnce()
+      expect(artifactHeadReader).toHaveBeenCalledWith({ userId: lease.userId, sessionId: lease.sessionId, jobId: "job-1", artifactId: "draft-1" })
+    } else {
+      expect(artifactHeadReader).not.toHaveBeenCalled()
+    }
+    expect(sourceDigestLoader).toHaveBeenCalledTimes(status === "completed" ? 2 : 1)
+    expect(sourceDigestLoader).toHaveBeenCalledWith(lease.userId, "job-1")
+  })
+
+  it("keeps the optional terminal guard absent for an ordinary Turn", async () => {
+    let ordinaryTerminalGuard: Parameters<TurnEngineStoreFactory>[1] | "not-created" = "not-created"
+    const ordinaryStoreFactory: TurnEngineStoreFactory = (_pool, guard) => {
+      ordinaryTerminalGuard = guard
+      return store()
+    }
+    const fixture = setup({ turnEngineStoreFactory: ordinaryStoreFactory })
+
+    await expect((await fixture.runtime).execute({ lease, signal: new AbortController().signal }))
+      .resolves.toMatchObject({ status: "completed" })
+    expect(ordinaryTerminalGuard).toBeUndefined()
+  })
+
+  it("keeps selected-job completion behind the pending-child check", async () => {
+    const roots = {
+      ...rootStore(),
+      checkCompletion: vi.fn(async () => ({ ok: false as const, blocker: "child_tasks_pending", feedback: "Child tasks are still running" })),
+    }
+    const taskGraphCommandPort: TaskGraphCommandPort = {
+      appendAndSchedule: async () => ({ status: "accepted", revision: 0, nodes: [], readyTaskIds: [] }),
+      readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
+    }
+    const artifactHeadReader = vi.fn(async () => null)
+    const productionFlags = resolveProductionAgentFlags({
+      ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+    })
+    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+      workerId: "worker-1", productionFlags, taskGraphCommandPort,
+      selectedJobPreparationLoader: async () => ({ jobId: "job-1" }),
+      selectedJobArtifactHeadReader: artifactHeadReader,
+      stateLoader: async () => ({ ...selectedJobState(), toolPolicySnapshot: {} }), rootTaskStore: roots as never,
+      turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
+      modelRuntimeFactory: async () => ({ adapter: {
+        ...model(() => []),
+        async *stream() { yield { type: "text_delta", text: "Done." }; yield { type: "completed", finishReason: "stop" } },
+      }, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed" })
+    expect(roots.checkCompletion).toHaveBeenCalledOnce()
+    expect(taskGraphCommandPort.readCurrent).toHaveBeenCalledOnce()
+    expect(artifactHeadReader).not.toHaveBeenCalled()
   })
 
   it("fails closed before provider invocation when usage authorization is unavailable", async () => {

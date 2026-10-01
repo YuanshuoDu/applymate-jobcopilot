@@ -6,6 +6,7 @@ export interface SupervisorTurnSummary {
   readonly sessionId: string
   readonly source: string
   readonly goal: string
+  readonly selectedJobId?: string
   readonly status: string
   readonly revision: number
   readonly activeStepId: string | null
@@ -26,6 +27,12 @@ export interface SupervisorTaskSummary {
   readonly status: string
   readonly goal: string
   readonly hasResult: boolean
+  readonly artifactRef?: {
+    readonly artifactId: string
+    readonly version: number
+    readonly contentHash: string
+    readonly sourceDigest: string
+  }
   readonly failureReason?: string | null
   readonly createdAt?: string
   readonly updatedAt?: string

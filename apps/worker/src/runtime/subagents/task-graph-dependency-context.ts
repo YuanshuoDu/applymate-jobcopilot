@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer"
-import { ROLE_RESULT_SCHEMA, validateRoleResult, type StructuredRoleResult } from "./role-results.js"
+import { parseArtifactReference, ROLE_RESULT_SCHEMA, validateRoleResult, type ArtifactVersionReference, type StructuredRole, type StructuredRoleResult } from "./role-results.js"
 import { projectValidatedRoleResult } from "./task-graph-result-projection.js"
 import type { GraphIdentityScope } from "./task-graph-pg-state.js"
 
@@ -21,6 +21,31 @@ export type ScopedDependencyResult = GraphIdentityScope & Readonly<{
   expectedOutputSchema: unknown
   result: unknown
 }>
+
+/** Resolve the one direct Writer dependency from server-materialized Reviewer context. */
+export function writerArtifactReferenceFromTaskContext(value: unknown, expectedJobId: string): ArtifactVersionReference {
+  const context = isPlainRecord(value) ? value : null
+  const selected = context && isPlainRecord(context.selectedJobPreparation) ? context.selectedJobPreparation : null
+  const dependencyContext = context && isPlainRecord(context[DEPENDENCY_CONTEXT_KEY]) ? context[DEPENDENCY_CONTEXT_KEY] : null
+  if (!selected || Object.keys(selected).sort().join(",") !== "jobId" || selected.jobId !== expectedJobId
+    || !dependencyContext || dependencyContext.schemaVersion !== "agent-harness.v2.task-graph.dependency-evidence"
+    || !Array.isArray(dependencyContext.items) || dependencyContext.items.length > 8) {
+    throw new Error("task_graph_reviewer_writer_dependency_missing")
+  }
+  const writers = dependencyContext.items.filter(item => isPlainRecord(item) && item.role === "writer")
+  if (writers.length !== 1) throw new Error("task_graph_reviewer_writer_dependency_missing")
+  const item = writers[0]
+  if (!isPlainRecord(item) || item.taskStatus !== "completed" || !isPlainRecord(item.result)) {
+    throw new Error("task_graph_reviewer_writer_dependency_invalid")
+  }
+  const result = item.result
+  if (result.schemaVersion !== "agent-harness.v2.task-graph.result-projection" || result.trust !== "untrusted"
+    || result.availability !== "available" || result.role !== "writer" || result.status !== "completed"
+    || Object.keys(result).sort().join(",") !== "artifactRef,availability,role,schemaVersion,status,trust") {
+    throw new Error("task_graph_reviewer_writer_dependency_invalid")
+  }
+  try { return parseArtifactReference(result.artifactRef) } catch { throw new Error("task_graph_reviewer_writer_dependency_invalid") }
+}
 
 /**
  * Produces a small, server-owned evidence projection for a child task. The
@@ -51,7 +76,7 @@ export function materializeTaskGraphDependencyContext(
       throw new Error("task_graph_dependency_scope_mismatch")
     }
     if (dependency.status !== "completed") throw new Error("task_graph_dependency_not_completed")
-    if ((dependency.role !== "scout" && dependency.role !== "analyst") || !expectedSchema(dependency.expectedOutputSchema, dependency.role)) {
+    if (!isStructuredRole(dependency.role) || !expectedSchema(dependency.expectedOutputSchema, dependency.role)) {
       throw new Error("task_graph_dependency_result_contract_invalid")
     }
     const sourceBytes = encodedBytes(dependency.result)
@@ -83,10 +108,14 @@ export function materializeTaskGraphDependencyContext(
   return { ...base, [DEPENDENCY_CONTEXT_KEY]: evidence }
 }
 
-function expectedSchema(value: unknown, role: "scout" | "analyst"): boolean {
+function expectedSchema(value: unknown, role: StructuredRole): boolean {
   if (!isPlainRecord(value)) return false
   return Object.keys(value).sort().join(",") === "role,schemaVersion"
     && value.schemaVersion === ROLE_RESULT_SCHEMA && value.role === role
+}
+
+function isStructuredRole(value: string): value is StructuredRole {
+  return value === "scout" || value === "analyst" || value === "writer" || value === "reviewer"
 }
 
 function parseResult(value: unknown): unknown {

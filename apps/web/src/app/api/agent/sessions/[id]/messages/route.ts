@@ -2,7 +2,7 @@ import { NextRequest } from "next/server"
 
 import { AgentCommandService } from "@/lib/agent/control-plane/commands"
 import { db } from "@/lib/db"
-import { isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
+import { err, isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 
 import {
   commandErrorResponse,
@@ -29,6 +29,16 @@ export async function POST(request: NextRequest, context: RouteContext) {
   const attachmentError = await verifyAttachmentOwnership(db, auth.userId, command.content)
   if (attachmentError) return attachmentError
 
+  if (command.selectedJobPreparation) {
+    const session = await db.agentSession.findFirst({ where: { id: sessionId, userId: auth.userId }, select: { id: true } })
+    if (!session) return err("Session not found", 404)
+    const job = await db.job.findFirst({
+      where: { id: command.selectedJobPreparation.jobId, userId: auth.userId },
+      select: { id: true },
+    })
+    if (!job) return err("Job not found", 404)
+  }
+
   try {
     const result = await new AgentCommandService(db).message({
       sessionId,
@@ -39,6 +49,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
       expectedTurnId: command.expectedTurnId,
       expectedRevision: command.expectedRevision,
       content: command.content,
+      selectedJobPreparation: command.selectedJobPreparation,
     })
     return ok(result, 202)
   } catch (error: unknown) {

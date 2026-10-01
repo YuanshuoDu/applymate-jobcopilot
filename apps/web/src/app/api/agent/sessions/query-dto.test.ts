@@ -105,6 +105,33 @@ describe("agent query DTO redaction", () => {
     expect(dto.content).toEqual({ title: "Resume ready", body: "Bearer [REDACTED]", data: { apiKey: "[REDACTED]", resume: "[REDACTED]", resumeText: "[REDACTED]" } })
   })
 
+  it("projects only a strictly validated selected saved-job ID from Turn input", () => {
+    const row = {
+      id: "turn_1", sessionId: "session_1", source: "user", status: "completed", revision: 2,
+      input: { goal: "Prepare a saved job", content: [{ type: "text", text: "private prompt" }], clientMessageId: "message_1" },
+      steps: [{ id: "step_1" }], items: [{ id: "item_final" }],
+      createdAt: date, updatedAt: date, completedAt: null,
+    }
+    const dto = turnDto({ ...row, input: { ...row.input, selectedJobPreparation: { jobId: "job_1" } } })
+    expect(dto.selectedJobId).toBe("job_1")
+    expect(dto).not.toHaveProperty("input")
+    expect(JSON.stringify(dto)).not.toContain("private prompt")
+
+    const invalidSelections: unknown[] = [
+      null,
+      "job_1",
+      { jobId: " job_1 " },
+      { jobId: "j".repeat(257) },
+      { jobId: "job_1", company: "Private employer context" },
+      { jobId: "job_1", answer: "private answer" },
+    ]
+    for (const selectedJobPreparation of invalidSelections) {
+      const invalid = turnDto({ ...row, input: { ...row.input, selectedJobPreparation } })
+      expect(invalid).not.toHaveProperty("selectedJobId")
+      expect(JSON.stringify(invalid)).not.toContain("private employer context")
+      expect(JSON.stringify(invalid)).not.toContain("private answer")
+    }
+  })
   it("does not expose turn input, task result, or tool arguments", () => {
     expect(turnDto({
       id: "turn_1", sessionId: "session_1", source: "user", status: "completed", revision: 2,
@@ -131,6 +158,46 @@ describe("agent query DTO redaction", () => {
       id: "tool_1", sessionId: "session_1", turnId: "turn_1", stepId: null, taskId: null, type: "tool_call", status: "completed", phase: "commentary", revision: 0,
       content: { toolCallId: "call_1", toolName: "jobs.search", input: { apiKey: "private" } }, startedAt: null, completedAt: null, createdAt: date, updatedAt: date,
     }).content).toEqual({ toolCallId: "call_1", toolName: "jobs.search", inputAvailable: true })
+  })
+
+  it("projects only completed Writer and Reviewer artifact references from persisted results", () => {
+    const ref = { artifactId: "draft-1", version: 2, contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: `sha256:${"b".repeat(64)}` }
+    const writerRow = {
+      id: "writer-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", path: "0",
+      role: "writer", taskType: "cover_letter_draft", status: "completed", goal: "Prepare selected job", confidence: 1,
+      failureReason: null, result: {
+        status: "completed", stepCount: 2, toolCallCount: 1, finalItemId: "writer-final",
+        finalText: "{\"schemaVersion\":\"agent-role-result.v1\",\"role\":\"writer\",\"status\":\"completed\"}",
+        structuredResult: { schemaVersion: "agent-role-result.v1", role: "writer", status: "completed", artifactRef: ref },
+        content: "PRIVATE_DRAFT_BODY",
+      }, createdAt: date, updatedAt: date,
+    }
+    const dto = taskDto(writerRow)
+    expect(dto.artifactRef).toEqual(ref)
+    expect(JSON.stringify(dto)).not.toContain("PRIVATE_DRAFT_BODY")
+    expect(taskDto({
+      ...writerRow, id: "reviewer-1", role: "reviewer", taskType: "cover_letter_review",
+      result: { ...writerRow.result, structuredResult: { ...writerRow.result.structuredResult, role: "reviewer" } },
+    }).artifactRef).toEqual(ref)
+    expect(taskDto({ ...writerRow, role: "analyst" })).not.toHaveProperty("artifactRef")
+    expect(taskDto({ ...writerRow, taskType: "scout" })).not.toHaveProperty("artifactRef")
+    expect(taskDto({ ...writerRow, role: "reviewer", taskType: "scout" })).not.toHaveProperty("artifactRef")
+    expect(taskDto({ ...writerRow, status: "running" })).not.toHaveProperty("artifactRef")
+    expect(taskDto({ ...writerRow, result: { ...writerRow.result, status: "failed" } })).not.toHaveProperty("artifactRef")
+    expect(taskDto({
+      ...writerRow,
+      result: { ...writerRow.result, structuredResult: { ...writerRow.result.structuredResult, role: "reviewer" } },
+    })).not.toHaveProperty("artifactRef")
+    expect(taskDto({
+      id: "legacy-writer", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", path: "1",
+      role: "writer", taskType: "cover_letter_draft", status: "completed", goal: "Prepare selected job", confidence: 1,
+      failureReason: null, result: { artifactRef: ref, content: "PRIVATE_DRAFT_BODY" }, createdAt: date, updatedAt: date,
+    }).artifactRef).toEqual(ref)
+    expect(taskDto({
+      id: "writer-2", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", path: "1",
+      role: "writer", taskType: "cover_letter_draft", status: "completed", goal: "Prepare selected job", confidence: 1,
+      failureReason: null, result: { artifactRef: { ...ref, userId: "foreign-user" } }, createdAt: date, updatedAt: date,
+    })).not.toHaveProperty("artifactRef")
   })
 
   it("keeps user-visible text and attachment metadata but drops unknown parts", () => {

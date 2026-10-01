@@ -327,6 +327,34 @@ describe("AgentCommandService", () => {
     expect(result).toMatchObject({ disposition: "queued_follow_up", turnId: started.turnId })
   })
 
+  it("starts selected-job preparation as a new root Turn and keeps scope out of user content", async () => {
+    const fake = makeDb()
+    const service = new AgentCommandService(fake.db)
+    const result = await service.message({
+      ...startCommand("client_prepare_job"),
+      content: [{ type: "text", text: "Prepare a cover letter draft for the selected job." }],
+      delivery: "follow_up",
+      selectedJobPreparation: { jobId: "job_1" },
+    })
+
+    expect(result.disposition).toBe("started")
+    expect(fake.state.active?.input).toMatchObject({ selectedJobPreparation: { jobId: "job_1" } })
+    expect(JSON.stringify(fake.state.items[0]?.content)).not.toContain("job_1")
+  })
+
+  it("rejects selected-job preparation when a root Turn is active", async () => {
+    const fake = makeDb({ activeSource: "user", activeStatus: "in_progress" })
+    const service = new AgentCommandService(fake.db)
+
+    await expect(service.message({
+      ...startCommand("client_prepare_busy"),
+      delivery: "follow_up",
+      selectedJobPreparation: { jobId: "job_1" },
+    })).rejects.toMatchObject({ code: "selected_job_turn_active", status: 409 })
+    expect(fake.state.inputs).toHaveLength(0)
+    expect(fake.state.items).toHaveLength(0)
+  })
+
   it("starts a successor Turn when terminal completion won before follow-up acceptance", async () => {
     const fake = makeDb({ activeSource: "user", activeTurnId: "turn_completed", activeStatus: "completed" })
     const service = new AgentCommandService(fake.db)

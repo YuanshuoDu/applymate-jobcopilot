@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { TASK_GRAPH_TEMPLATES, taskGraphRuntimeOptions } from "./task-graph-templates.js"
+import { TASK_GRAPH_TEMPLATES, taskGraphRuntimeForTurn, taskGraphRuntimeOptions, taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import type { TaskGraphCommandPort } from "./task-graph-command-port.js"
 
@@ -30,5 +30,54 @@ describe("TaskGraph server-owned templates", () => {
     expect(runtimeOptions.taskGraphTemplates.analyst.expectedOutputSchema).toEqual({
       schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst",
     })
+  })
+
+  it("keeps selected-job evidence roles plannable without search and adds scoped Writer and Reviewer roles", () => {
+    expect(Object.keys(taskGraphTemplatesForSelectedJob(undefined))).toEqual(["scout", "analyst"])
+    const templates = taskGraphTemplatesForSelectedJob({ jobId: "job-1" })
+    expect(templates.scout).toMatchObject({
+      role: "scout", taskType: "job_discovery", allowedActions: ["jobs.get"],
+      context: { selectedJobPreparation: { jobId: "job-1" } },
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
+    })
+    expect(templates.analyst).toMatchObject({
+      role: "analyst", taskType: "job_analysis",
+      allowedActions: ["jobs.get", "persona.retrieve", "resume.get_base"],
+      context: { selectedJobPreparation: { jobId: "job-1" } },
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" },
+    })
+    expect(Object.keys(templates)).toEqual(["scout", "analyst", "cover_letter_writer", "cover_letter_reviewer"])
+    expect(templates.scout.allowedActions).not.toContain("jobs.search")
+    expect(templates.analyst.allowedActions).not.toContain("jobs.search")
+    expect(templates.cover_letter_writer).toMatchObject({
+      role: "writer", taskType: "cover_letter_draft",
+      allowedActions: ["cover_letter.draft"],
+      context: { selectedJobPreparation: { jobId: "job-1" } },
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "writer" },
+    })
+    expect(templates.cover_letter_reviewer).toMatchObject({
+      role: "reviewer", taskType: "cover_letter_review",
+      allowedActions: ["artifact.version.read", "artifact.review"],
+      context: { selectedJobPreparation: { jobId: "job-1" } },
+      expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer" },
+    })
+    for (const id of ["cover_letter_writer", "cover_letter_reviewer"]) {
+      const template = templates[id]!
+      expect(template.allowedActions).not.toContain("jobs.get")
+      expect(template.allowedActions).not.toContain("persona.retrieve")
+      expect(template.allowedActions).not.toContain("resume.get_base")
+      expect(template.allowedActions).not.toContain("agent.plan")
+      expect(template.allowedActions).not.toContain("application.submit")
+      expect(template.allowedActions.some(action => /send|gmail|browser|submit/i.test(action))).toBe(false)
+    }
+  })
+
+  it("returns selected-job mode only when the server-side preparation loader finds a selection", async () => {
+    const base = { pool: {} as never, lease: {} as never, now: () => new Date(), enabled: true }
+    const selected = await taskGraphRuntimeForTurn({ ...base, selectedJobPreparationLoader: async () => ({ jobId: "job-1" }) })
+    const generic = await taskGraphRuntimeForTurn({ ...base, selectedJobPreparationLoader: async () => undefined })
+
+    expect(selected).toMatchObject({ enabled: true, selectedJobMode: true, selectedJobPreparation: { jobId: "job-1" } })
+    expect(generic).toMatchObject({ enabled: true, selectedJobMode: false, selectedJobPreparation: undefined })
   })
 })

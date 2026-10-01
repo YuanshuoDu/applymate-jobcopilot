@@ -17,6 +17,11 @@ export interface CommandIdentity {
   source: TurnSource
 }
 
+/** Server-validated scope for the one-job preparation entry point. */
+export interface SelectedJobPreparationScope {
+  jobId: string
+}
+
 export interface StartCommand extends CommandIdentity {
   content: InputContentPart[]
 }
@@ -26,6 +31,7 @@ export interface MessageCommand extends CommandIdentity {
   delivery: "steer" | "follow_up"
   expectedTurnId?: string | null
   expectedRevision?: number | null
+  selectedJobPreparation?: SelectedJobPreparationScope
 }
 
 export interface SteerCommand extends CommandIdentity {

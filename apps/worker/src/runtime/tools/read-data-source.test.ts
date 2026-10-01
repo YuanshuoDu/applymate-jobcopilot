@@ -11,7 +11,10 @@ describe("Postgres read tool data source", () => {
       const text = String(sql)
       if (text.includes('FROM "Job"') && text.includes('LIMIT $5')) return { rows: [] }
       if (text.includes('FROM "Job"')) return { rows: [] }
-      if (text.includes("FROM persona_facts")) return { rows: [] }
+      if (text.includes("FROM persona_facts")) return { rows: [{
+        id: "fact-1", key: "work_authorization", category: "eligibility", value: "EU citizen",
+        source: "resume", sourceRef: "resume-1", confidence: "0.92", allowedUses: ["cover_letter"],
+      }] }
       if (text.includes('FROM "Resume"')) return { rows: [] }
       if (text.includes("FROM application_tasks")) return { rows: [] }
       return { rows: [] }
@@ -20,11 +23,21 @@ describe("Postgres read tool data source", () => {
 
     await dataSource.searchJobs("owner-a", { target: "engineer" })
     await dataSource.getJob("owner-a", "job-1")
-    await dataSource.retrievePersona("owner-a", { keys: ["work_authorization"] })
+    const persona = await dataSource.retrievePersona("owner-a", { keys: ["work_authorization"], useCase: "cover_letter" })
     await dataSource.getBaseResume("owner-a", {})
     await dataSource.getApplicationState("owner-a", { jobId: "job-1" })
 
     expect(queries).toHaveLength(6)
+    const personaQuery = queries.find((query) => query.sql.includes("FROM persona_facts"))
+    expect(personaQuery?.sql).toContain('"confidence", "allowedUses"')
+    expect(personaQuery?.sql).toContain('AND ($3::text IS NULL OR $3 = ANY("allowedUses"))')
+    expect(personaQuery?.sql).toContain('"expires_at" > statement_timestamp()')
+    expect(personaQuery?.sql).toContain('ORDER BY "updated_at" DESC, "id" DESC LIMIT 50')
+    expect(personaQuery?.values).toEqual(["owner-a", ["work_authorization"], "cover_letter"])
+    expect(persona.facts[0]?.allowedUses).toEqual(["cover_letter"])
+    expect(queries.find((query) => query.sql.includes('FROM "Resume"'))?.sql).toContain(
+      'ORDER BY "isDefault" DESC, "updatedAt" DESC, "id" DESC LIMIT 1',
+    )
     for (const query of queries) {
       expect(query.sql.trimStart().toUpperCase()).toMatch(/^SELECT/)
       expect(query.sql).not.toMatch(/\b(INSERT|UPDATE|DELETE)\b/i)

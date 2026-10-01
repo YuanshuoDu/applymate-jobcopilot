@@ -124,6 +124,9 @@ export class AgentCommandService {
       if (existing) return duplicateCommandResult(tx, command, existing, command.delivery)
 
       const active = await findActiveTurn(tx, command.sessionId, command.userId)
+      if (command.selectedJobPreparation && active) {
+        throw new AgentCommandError("selected_job_turn_active", "Stop or finish the active Turn before preparing a selected job", 409, { turnId: active.id })
+      }
       const expectedTurnId = command.delivery === "steer" || command.expectedTurnId ? command.expectedTurnId : undefined
       await assertExpectedTurn(expectedTurnId, command.expectedRevision, active)
       if (command.delivery === "steer" && command.source === "automation" && active?.source === "user") {
@@ -134,7 +137,7 @@ export class AgentCommandService {
       }
 
       if (!active) {
-        const turn = await createRootTurn(tx, command, command.content)
+        const turn = await createRootTurn(tx, command, command.content, undefined, command.selectedJobPreparation)
         return acceptInputFacts(tx, command, command.content, turn, command.delivery, "started", true)
           .then((facts) => ({ ...facts, disposition: "started" as const }))
       }
@@ -176,7 +179,7 @@ export class AgentCommandService {
       if (active) throw retryActiveConflict(active.id)
       const persisted = parsePersistedRetryContent(target.id, target.input)
 
-      const created = await createRootTurn(tx, command, persisted.content, persisted.goal)
+      const created = await createRootTurn(tx, command, persisted.content, persisted.goal, persisted.selectedJobPreparation)
       const facts = await acceptInputFacts(tx, command, persisted.content, created, "follow_up", "started", true)
       return { ...facts, disposition: "started" as const }
     })

@@ -118,3 +118,25 @@ describe("structured Scout and Analyst results", () => {
     expect(validateRoleResult(adaptLegacyRoleResult("analyst", { analyses: [{ jobId: "job-1", score: 7 }] }), "analyst").role).toBe("analyst")
   })
 })
+
+describe("structured cover letter artifact results", () => {
+  const artifactRef = { artifactId: "artifact-1", version: 2, contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: `sha256:${"b".repeat(64)}` }
+
+  it("accepts only a persisted Writer artifact reference", () => {
+    expect(validateRoleResult({ schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef }, "writer"))
+      .toEqual({ schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef })
+  })
+
+  it("accepts a hash-bound Reviewer receipt without body or findings", () => {
+    expect(validateRoleResult({ schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed", artifactRef, reviewStatus: "passed", reviewHash: `sha256:${"c".repeat(64)}` }, "reviewer"))
+      .toMatchObject({ role: "reviewer", artifactRef, reviewStatus: "passed" })
+  })
+
+  it.each([
+    { name: "unbound artifact hash", value: { schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef: { ...artifactRef, contentHash: "arbitrary" } } },
+    { name: "draft content", value: { schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef, content: "Dear Hiring Manager" } },
+    { name: "tenant identity", value: { schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef, userId: "user-1" } },
+    { name: "unbounded review findings", value: { schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed", artifactRef, reviewStatus: "passed", reviewHash: `sha256:${"c".repeat(64)}`, findings: ["details"] } },
+    { name: "unknown review status", value: { schemaVersion: ROLE_RESULT_SCHEMA, role: "reviewer", status: "completed", artifactRef, reviewStatus: "invented", reviewHash: `sha256:${"c".repeat(64)}` } },
+  ])("rejects $name", ({ value }) => expectInvalidShape(value))
+})

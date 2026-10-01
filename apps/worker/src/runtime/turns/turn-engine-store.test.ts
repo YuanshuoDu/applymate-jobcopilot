@@ -273,6 +273,38 @@ describe("PostgreSQL TurnEngine store", () => {
     assertDenseBindings(calls)
   })
 
+  it("forwards the optional terminal guard only for atomic terminal completion", async () => {
+    const calls: string[] = []
+    const client = { query: vi.fn(async (sql: string) => {
+      calls.push(sql)
+      if (sql === "BEGIN" || sql.startsWith("BEGIN ISOLATION LEVEL") || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: owner.sessionId }], rowCount: 1 }
+      if (sql.includes('FROM "agent_turns" AS turn')) return { rows: [{ id: owner.turnId, status: "in_progress", finalResponse: null }], rowCount: 1 }
+      if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ id: owner.taskId, status: "running", leaseOwner: owner.ownerId, attemptCount: 1, result: null }], rowCount: 1 }
+      if (sql.includes('FROM "agent_inputs"')) return { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "agent_events"')) return { rows: [{ id: "step-completed-event" }], rowCount: 1 }
+      return { rows: [], rowCount: 1 }
+    }), release: vi.fn() }
+    const guard = vi.fn(async (seen: pg.PoolClient) => {
+      expect(seen).toBe(client)
+      return { ok: false as const, blocker: "selected_job_draft_review_required", feedback: "Review the latest draft." }
+    })
+    const pool = { connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">
+    const store = createPgTurnEngineStore(pool, guard)
+
+    await expect(store.recordFinalResponse({ owner, response: "done", now, terminal: {
+      stepId: "step-final", finalItemId: "final-item", finalContent: { text: "done" }, stepCount: 1, toolCallCount: 0,
+      usage: { inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0 },
+    } })).rejects.toMatchObject({ name: "TurnEnginePersistenceConflict" })
+    expect(guard).toHaveBeenCalledOnce()
+    expect(calls[0]).toBe("BEGIN ISOLATION LEVEL READ COMMITTED")
+
+    calls.length = 0
+    await expect(store.recordFinalResponse({ owner, response: "intermediate", now })).resolves.toBeUndefined()
+    expect(guard).toHaveBeenCalledOnce()
+    expect(calls[0]).toBe("BEGIN")
+  })
+
   it("locks the owner before updating a Step or Item", async () => {
     const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
     const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {

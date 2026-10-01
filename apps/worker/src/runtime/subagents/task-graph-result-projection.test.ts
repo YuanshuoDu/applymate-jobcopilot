@@ -44,6 +44,22 @@ function analystResult(): Record<string, unknown> {
   }
 }
 
+function reviewerResult(): Record<string, unknown> {
+  return {
+    schemaVersion: ROLE_RESULT_SCHEMA,
+    role: "reviewer",
+    status: "completed",
+    artifactRef: {
+      artifactId: "artifact-1",
+      version: 2,
+      contentHash: `sha256:${"a".repeat(64)}`,
+      sourceDigest: `sha256:${"b".repeat(64)}`,
+    },
+    reviewStatus: "passed",
+    reviewHash: `sha256:${"c".repeat(64)}`,
+  }
+}
+
 function completedEnvelope(structuredResult: unknown, extra: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     finalItemId: "internal-final-item-id",
@@ -113,6 +129,26 @@ describe("task graph result projection", () => {
     })
     expect(JSON.stringify(projection)).not.toContain("private-evidence-id")
     expect(JSON.stringify(projection)).not.toContain("private.example")
+  })
+
+  it("projects the validated Reviewer artifact reference and review receipt", () => {
+    const projection = projectTaskGraphResult("reviewer", "completed", completedEnvelope(reviewerResult()))
+
+    expect(projection).toEqual({
+      schemaVersion: "agent-harness.v2.task-graph.result-projection",
+      trust: "untrusted",
+      availability: "available",
+      role: "reviewer",
+      status: "completed",
+      artifactRef: {
+        artifactId: "artifact-1",
+        version: 2,
+        contentHash: `sha256:${"a".repeat(64)}`,
+        sourceDigest: `sha256:${"b".repeat(64)}`,
+      },
+      reviewStatus: "passed",
+      reviewHash: `sha256:${"c".repeat(64)}`,
+    })
   })
 
   it.each([

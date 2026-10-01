@@ -90,6 +90,20 @@ describe("createPgTaskGraphCommandPort", () => {
     expect(fake.calls.some(call => call.sql.startsWith("SELECT EXISTS ("))).toBe(true)
   })
 
+  it("reloads graph state through the caller-owned client without opening another transaction", async () => {
+    const input = scheduleInput()
+    const fake = fakePool(input, { includeReplay: false })
+    const { stepId: _stepId, ...scope } = input.scope
+    const port = createPgTaskGraphCommandPort(fake.pool)
+
+    await expect(port.readCurrentWithClient!(fake.client as unknown as pg.PoolClient, scope)).resolves.toMatchObject({ revision: 2 })
+    expect(fake.pool.connect).not.toHaveBeenCalled()
+    expect(fake.calls.some(call => ["BEGIN", "COMMIT", "ROLLBACK"].includes(call.sql))).toBe(false)
+    expect(fake.calls.find(call => call.sql.startsWith("SELECT set_config"))?.values).toEqual([input.scope.userId])
+    expect(fake.calls.some(call => call.sql.startsWith('SELECT "id" FROM "agent_sessions"'))).toBe(true)
+    expect(fake.calls.some(call => call.sql.startsWith('SELECT item."id"'))).toBe(true)
+  })
+
   it("fails closed when the graph item is missing after a durable proposal receipt", async () => {
     const input = scheduleInput()
     const fake = fakePool(input, { missingGraph: true, persistedPlanReceipt: true })
