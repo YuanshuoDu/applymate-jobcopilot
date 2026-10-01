@@ -42,7 +42,18 @@ function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unk
         : snapshots
       return { rows: selected, rowCount: selected.length }
     }
-    if (sql.includes('FROM "agent_inputs"')) return { rows: rows.inputs ?? [], rowCount: rows.inputs?.length ?? 0 }
+    if (sql.includes('FROM "agent_inputs"')) {
+      if (sql.includes('AS "historyRole"')) {
+        const history = (rows.inputs ?? []).filter(input => {
+          const isPriorTarget = typeof input.targetTurnId === "string" && input.targetTurnId !== values?.[2]
+          const pendingFollowUp = input.delivery === "follow_up" && (input.status === "accepted" || input.status === "queued")
+            && input.consumedByStepId == null && input.consumedAt == null && input.cancelledAt == null
+          return isPriorTarget && !pendingFollowUp
+        }).map(input => ({ ...input, historyRole: "user", historySequence: input.acceptedSequence }))
+        return { rows: history, rowCount: history.length }
+      }
+      return { rows: rows.inputs ?? [], rowCount: rows.inputs?.length ?? 0 }
+    }
     return { rows: [], rowCount: 0 }
   }), release: vi.fn() }
   return { connect: vi.fn(async () => client), client } as unknown as Pick<import("pg").Pool, "connect"> & { client: typeof client }
@@ -196,6 +207,35 @@ describe("loadCanonicalTurnState", () => {
       { id: "history:user:new-input", content: { role: "user", text: "Use Dublin" } },
       { id: "history:assistant:new-agent", content: { role: "assistant", text: "Current reply" } },
     ])
+  })
+
+  it("excludes pending follow-ups from prior history and preserves consumed, cancelled, rejected, and steering inputs", async () => {
+    const fake = pool({
+      turn: { input: { goal: "Continue with the first follow-up" }, rootTaskId: null, contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      inputs: [
+        { id: "successor-root", targetTurnId: "turn-1", content: [{ type: "text", text: "Current successor goal" }], acceptedSequence: "1", delivery: "follow_up", status: "accepted" },
+        { id: "pending-accepted", targetTurnId: "old-turn", content: [{ type: "text", text: "Later accepted request" }], acceptedSequence: "2", delivery: "follow_up", status: "accepted" },
+        { id: "pending-queued", targetTurnId: "old-turn", content: [{ type: "text", text: "Later queued request" }], acceptedSequence: "3", delivery: "follow_up", status: "queued" },
+        { id: "consumed-follow-up", targetTurnId: "old-turn", content: [{ type: "text", text: "Earlier consumed request" }], acceptedSequence: "4", delivery: "follow_up", status: "consumed", consumedAt: new Date("2026-09-09T00:00:00.000Z") },
+        { id: "cancelled-follow-up", targetTurnId: "old-turn", content: [{ type: "text", text: "Cancelled request" }], acceptedSequence: "5", delivery: "follow_up", status: "cancelled", cancelledAt: new Date("2026-09-09T00:00:00.000Z") },
+        { id: "rejected-follow-up", targetTurnId: "old-turn", content: [{ type: "text", text: "Rejected request" }], acceptedSequence: "6", delivery: "follow_up", status: "rejected" },
+        { id: "pending-steer", targetTurnId: "old-turn", content: [{ type: "text", text: "Existing steering input" }], acceptedSequence: "7", delivery: "steer", status: "accepted" },
+      ],
+    })
+
+    const value = await loadCanonicalTurnState(fake, lease)
+
+    expect(value.rootInputId).toBe("successor-root")
+    expect(value.snapshot.goal).toEqual({ id: "turn-goal:turn-1", content: "Continue with the first follow-up" })
+    expect(value.snapshot.steerHistory).toEqual([
+      { id: "history:user:consumed-follow-up", content: { role: "user", text: "Earlier consumed request" } },
+      { id: "history:user:cancelled-follow-up", content: { role: "user", text: "Cancelled request" } },
+      { id: "history:user:rejected-follow-up", content: { role: "user", text: "Rejected request" } },
+      { id: "history:user:pending-steer", content: { role: "user", text: "Existing steering input" } },
+    ])
+    const priorInputQuery = fake.client.query.mock.calls.find(([sql]) => typeof sql === "string" && sql.includes('AS "historyRole"'))?.[0]
+    expect(priorInputQuery).toContain(`AND NOT ("delivery" = 'follow_up' AND "status" IN ('accepted', 'queued')`)
+    expect(priorInputQuery).toContain('AND "consumedByStepId" IS NULL AND "consumedAt" IS NULL AND "cancelledAt" IS NULL)')
   })
 
   it("keeps an explicitly pinned snapshot and reports its pin without changing cursor-tail restore", async () => {
