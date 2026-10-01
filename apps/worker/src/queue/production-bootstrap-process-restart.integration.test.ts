@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url"
 import { Queue } from "bullmq"
 import { Pool } from "pg"
 import { Redis } from "ioredis"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const RESULT_MARKER = "durable-child-result-after-process-restart"
@@ -118,6 +118,31 @@ async function waitForLine(child: WorkerChild, prefix: string, timeoutMs = 20_00
     await new Promise(resolve => setTimeout(resolve, 20))
   }
   throw new Error(`Timed out waiting for ${prefix}; stdout=${child.output.join(" | ")}; stderr=${child.errors.join(" | ")}`)
+}
+
+async function waitForSuccessorProvider(pool: Pool, queue: Queue, child: WorkerChild, turnId: string, successorIndex: number, jobId: string): Promise<string> {
+  try {
+    return await waitForLine(child, `SUCCESSOR_PROVIDER_ACTIVE ${successorIndex}`)
+  } catch (error: unknown) {
+    const [turn, root, steps, inputs, dispatch, job, queueCounts, queuePaused] = await Promise.all([
+      pool.query(`SELECT "status", "leaseOwnerId", "leaseVersion", "rootTaskId", "error" FROM "agent_turns" WHERE "id" = $1`, [turnId]),
+      pool.query(`SELECT task."status", task."leaseOwner", task."failureReason" FROM "agent_turns" AS turn
+        JOIN "sub_agent_tasks" AS task ON task."id" = turn."rootTaskId" WHERE turn."id" = $1`, [turnId]),
+      pool.query(`SELECT "ordinal", "status", "errorCode", "finishReason" FROM "agent_steps" WHERE "turnId" = $1 ORDER BY "ordinal"`, [turnId]),
+      pool.query(`SELECT "id", "targetTurnId", "status", "consumedByStepId" FROM "agent_inputs" WHERE "targetTurnId" = $1 ORDER BY "acceptedSequence", "id"`, [turnId]),
+      pool.query(`SELECT "id", "attemptCount", "publishedAt", "lastError", "payload" FROM "agent_outbox"
+        WHERE "topic" = 'agent.turn.dispatch' AND "idempotencyKey" = $1`, [`turn-dispatch:${turnId}`]),
+      queue.getJob(jobId).then(async found => found ? { state: await found.getState(), data: found.data } : { state: "missing" }),
+      queue.getJobCounts("wait", "active", "delayed", "completed", "failed", "paused"),
+      queue.isPaused(),
+    ])
+    const events = await pool.query(`SELECT "type", "payload" FROM "agent_events" WHERE "turnId" = $1 AND "type" IN ('turn.failed', 'step.completed') ORDER BY "sequence" DESC LIMIT 5`, [turnId])
+    throw new Error(`${error instanceof Error ? error.message : String(error)}; successorRuntime=${JSON.stringify({
+      worker: { pid: child.pid, exited: workerHasExited(child), stdout: child.output, stderr: child.errors },
+      turn: turn.rows[0] ?? null, root: root.rows[0] ?? null, steps: steps.rows, inputs: inputs.rows,
+      dispatch: dispatch.rows[0] ?? null, job, queueCounts, queuePaused, events: events.rows,
+    })}`)
+  }
 }
 
 function exitWaitDiagnostics(child: WorkerChild, context: ExitWaitContext): string {
@@ -398,6 +423,43 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     })
     if (pool) await attemptCleanup(cleanupFailures, "PostgreSQL pool cleanup", async () => { await pool!.end() })
     if (cleanupFailures.length > 0) throw new Error(`Process-restart fixture cleanup failed:\n${cleanupFailures.join("\n")}`)
+  })
+
+  afterEach(async () => {
+    const cleanupFailures: string[] = []
+    const children = [...new Set([commandAcceptance, workerOne, workerTwo].filter((child): child is WorkerChild => child !== undefined))]
+    for (const [index, child] of children.entries()) {
+      if (workerHasExited(child)) continue
+      const failure = await stopWorkerForCleanup(child, `process-restart-after-test-${index + 1}`)
+      if (failure) cleanupFailures.push(failure)
+    }
+    const workersStopped = children.every(workerHasExited)
+    if (turnQueuePaused && turnQueue) {
+      if (workersStopped) {
+        await attemptCleanup(cleanupFailures, "after-test Turn queue resume", async () => {
+          await turnQueue!.resume()
+          turnQueuePaused = false
+        })
+      } else cleanupFailures.push("after-test Turn queue remains paused because a child Worker is still alive")
+    }
+    if (pool && workersStopped) for (const sessionId of fixtureSessionIds) await attemptCleanup(cleanupFailures, `after-test Turn discovery for ${sessionId}`, async () => {
+      const turns = await pool!.query<{ id: string }>(`SELECT "id" FROM "agent_turns" WHERE "sessionId" = $1`, [sessionId])
+      for (const turn of turns.rows) turnFixtureIds.add(turn.id)
+    })
+    if (turnQueue && turnJobKey && redis && workersStopped) for (const turnId of turnFixtureIds) {
+      for (let generation = 0; generation <= Math.max(8, wakeupGeneration ?? 0); generation += 1) {
+        await attemptCleanup(cleanupFailures, `after-test Turn job ${generation} cleanup`, async () => {
+          await removeTurnFixtureJobAfterWorkersExit(turnQueue!, redis!, turnJobKey!(turnId, generation))
+        })
+      }
+    }
+    if (pool && workersStopped && fixtureSessionIds.size > 0) await attemptCleanup(cleanupFailures, "after-test fixture session cleanup", async () => {
+      await pool!.query(`DELETE FROM "agent_sessions" WHERE "id" = ANY($1::text[])`, [[...fixtureSessionIds]])
+    })
+    if (pool && workersStopped) for (const userId of auxiliaryUserIds) await attemptCleanup(cleanupFailures, `after-test auxiliary user ${userId} cleanup`, async () => {
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [userId])
+    })
+    if (cleanupFailures.length > 0) throw new Error(`Process-restart per-test cleanup failed:\n${cleanupFailures.join("\n")}`)
   })
 
   it("persists a child result, kills its Worker, and resumes the parent from PostgreSQL under a new lease", async () => {
@@ -805,9 +867,10 @@ describeWithServices("production bootstrap recovery across a Worker process rest
 
     await turnQueue!.resume()
     turnQueuePaused = false
+    expect(await turnQueue!.isPaused()).toBe(false)
     let activeSuccessorId = firstSuccessorId
     for (let index = 0; index < acceptedInputs.length; index += 1) {
-      await waitForLine(workerTwo, `SUCCESSOR_PROVIDER_ACTIVE ${index + 1}`)
+      await waitForSuccessorProvider(pool!, turnQueue!, workerTwo, activeSuccessorId, index + 1, turnJobKey!(activeSuccessorId, 0))
       await turnQueue!.pause()
       turnQueuePaused = true
       workerTwo.stdin?.write(`release-successor-${index + 1}\n`)
@@ -908,6 +971,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
       sessionId: `terminal-follow-up-race-session-${suffix}`,
       turnId: `terminal-follow-up-race-pending-${suffix}`,
     }
+    fixtureSessionIds.add(raceIds.sessionId)
     await pool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
       VALUES ($1, $2, 'Resume and report persisted child result', 'running', 'test', CURRENT_TIMESTAMP)`, [raceIds.sessionId, raceIds.userId])
 
@@ -1047,6 +1111,8 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     const generationJobIds = Array.from({ length: retryGeneration + 1 }, (_, generation) => turnJobKey!(turnId, generation))
     const recoveryQueue = new Queue(`agent-turn-recovery-${suffix}`, { connection: redis!, skipVersionCheck: true })
     const recovery = await import("../runtime/turns/recovery-scanner.js")
+    fixtureSessionIds.add(sessionId)
+    auxiliaryUserIds.add(foreignUserId)
 
     try {
       await recoveryQueue.waitUntilReady()
