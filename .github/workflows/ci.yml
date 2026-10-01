@@ -143,6 +143,7 @@ jobs:
           REDIS_URL: redis://127.0.0.1:6379/15
         run: pnpm --filter @jobcopilot/worker exec vitest run src/queue/production-bootstrap-process-restart.integration.test.ts
       - name: Verify disconnected Worker event replay through the authenticated SSE route
+        if: ${{ !cancelled() }}
         env:
           CI: "true"
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci

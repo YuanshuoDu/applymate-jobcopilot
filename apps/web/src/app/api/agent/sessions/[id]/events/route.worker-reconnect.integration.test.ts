@@ -4,9 +4,13 @@ import { resolve } from "node:path"
 import { writeFile } from "node:fs/promises"
 import { SignJWT } from "jose"
 import { NextRequest } from "next/server"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 
 import { EXTENSION_TOKEN_AUDIENCE, EXTENSION_TOKEN_ISSUER, getAuthJwtSecret } from "@/lib/auth-secret"
+
+// This suite exercises the real bearer-token auth path. Avoid initializing
+// NextAuth's framework-only cookie/session integration in Vitest's Node runtime.
+vi.mock("@/lib/safe-auth", () => ({ safeAuth: async () => null }))
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const FLAG_ENVIRONMENT = "development"
