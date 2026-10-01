@@ -79,7 +79,8 @@ export async function runTurnBoundaryContextCompaction(input: {
     turnId: input.lease.turnId,
     source,
     policy: DEFAULT_COMPACTION_POLICY,
-    atTurnBoundary: true,
+    // This preflight runs at the boundary; the boundary itself is not a trigger.
+    atTurnBoundary: false,
     requested: false,
     itemId: `context-compaction:${input.lease.turnId}:${input.lease.leaseVersion}:${source.state.throughSequence}`,
   })

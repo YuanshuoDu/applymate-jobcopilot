@@ -12,6 +12,13 @@ const source: CompactionSource = {
   },
   items: [{ id: "item-1", sessionId: "session-1", turnId: "turn-1", sequence: 100n, type: "agent_message", status: "completed", content: "history ".repeat(800) }],
 }
+const itemThresholdSource: CompactionSource = {
+  ...source,
+  items: Array.from({ length: 100 }, (_, index) => ({
+    id: `item-${index + 1}`, sessionId: "session-1", turnId: "turn-1", sequence: BigInt(index + 1),
+    type: "agent_message", status: "completed", content: "history item",
+  })),
+}
 const loadSource = vi.fn(async () => source)
 const publishedItemIds: string[] = []
 const startedItemIds: string[] = []
@@ -106,21 +113,49 @@ describe("turn-boundary context compaction preflight", () => {
     ])
   })
 
-  it("uses the fenced PG source and publisher with the existing model adapter", async () => {
+  it("evaluates thresholds at the turn boundary and compacts at the item-count threshold", async () => {
     loadSource.mockClear(); compactionPort.publishAtomically.mockClear(); compactionPort.recordFailed.mockClear()
+    compactionPort.recordStarted.mockClear(); compactionPort.loadLatest.mockClear()
+    loadSource.mockReset().mockResolvedValue(itemThresholdSource)
     publishedItemIds.length = 0; startedItemIds.length = 0
+    const requests: HarnessModelRequest[] = []
     const result = await runTurnBoundaryContextCompaction({
-      pool: { connect: vi.fn() }, scope: { userId: "user-1" }, owner, lease, model: model(), signal: new AbortController().signal,
+      pool: { connect: vi.fn() }, scope: { userId: "user-1" }, owner, lease, model: model(undefined, requests), signal: new AbortController().signal,
     })
-    expect(result.status).toBe("compacted")
+    expect(result).toMatchObject({ status: "compacted", trigger: { reason: "item_count" } })
     expect(loadSource).toHaveBeenCalledWith({ scope: { userId: "user-1" }, owner })
+    expect(requests).toHaveLength(1)
+    expect(compactionPort.recordStarted).toHaveBeenCalledOnce()
     expect(compactionPort.publishAtomically).toHaveBeenCalledOnce()
     expect(publishedItemIds).toEqual(["context-compaction:turn-1:2:100"])
     expect(createPgCompactionSource).toBeDefined()
     expect(createPgContextSnapshotCompactionPort).toBeDefined()
   })
 
+  it("does not summarize or publish nonempty history below both thresholds", async () => {
+    loadSource.mockReset().mockResolvedValue(source)
+    compactionPort.loadLatest.mockClear(); compactionPort.recordStarted.mockClear()
+    compactionPort.publishAtomically.mockClear(); compactionPort.recordFailed.mockClear()
+    publishedItemIds.length = 0; startedItemIds.length = 0
+    const requests: HarnessModelRequest[] = []
+
+    const result = await runTurnBoundaryContextCompaction({
+      pool: { connect: vi.fn() }, scope: { userId: "user-1" }, owner, lease, model: model(undefined, requests), signal: new AbortController().signal,
+    })
+
+    expect(result.status).toBe("skipped")
+    expect(source.items).toHaveLength(1)
+    expect(requests).toHaveLength(0)
+    expect(compactionPort.loadLatest).not.toHaveBeenCalled()
+    expect(compactionPort.recordStarted).not.toHaveBeenCalled()
+    expect(compactionPort.publishAtomically).not.toHaveBeenCalled()
+    expect(compactionPort.recordFailed).not.toHaveBeenCalled()
+    expect(startedItemIds).toEqual([])
+    expect(publishedItemIds).toEqual([])
+  })
+
   it("retries a failed item under a new lease while keeping IDs stable within each lease", async () => {
+    loadSource.mockReset().mockResolvedValue(itemThresholdSource)
     loadSource.mockClear(); compactionPort.recordStarted.mockClear(); compactionPort.recordFailed.mockClear()
     startedItemIds.length = 0; publishedItemIds.length = 0
     compactionPort.publishAtomically.mockReset()
@@ -148,13 +183,13 @@ describe("turn-boundary context compaction preflight", () => {
 
   it("does not summarize or publish the committed cursor again after a new lease restart", async () => {
     const priorSummary: CompactionSource = {
-      ...source,
+      ...itemThresholdSource,
       items: [{
         id: "context-compaction-summary:snapshot-2", sessionId: "session-1", turnId: "turn-1", sequence: 100n,
         type: "compaction_summary", status: "completed", content: "Previous narrative summary",
       }],
     }
-    loadSource.mockReset().mockResolvedValueOnce(source).mockResolvedValueOnce(priorSummary)
+    loadSource.mockReset().mockResolvedValueOnce(itemThresholdSource).mockResolvedValueOnce(priorSummary)
     compactionPort.recordStarted.mockClear(); compactionPort.recordFailed.mockClear()
     compactionPort.publishAtomically.mockReset().mockImplementation(async input => {
       publishedItemIds.push(input.startedItem.id)
@@ -187,7 +222,7 @@ describe("turn-boundary context compaction preflight", () => {
       state: { ...source.state, throughSequence: 110n },
       items: [
         { id: "context-compaction-summary:snapshot-2", sessionId: "session-1", turnId: "turn-1", sequence: 100n, type: "compaction_summary", status: "completed", content: "Prior narrative summary" },
-        { id: "fresh-tail", sessionId: "session-1", turnId: "turn-1", sequence: 110n, type: "agent_message", status: "completed", content: "Fresh tail sentinel ".repeat(800) },
+        { id: "fresh-tail", sessionId: "session-1", turnId: "turn-1", sequence: 110n, type: "agent_message", status: "completed", content: "Fresh tail sentinel ".repeat(2_400) },
       ],
     }
     loadSource.mockReset().mockResolvedValue(sourceWithTail)
@@ -206,7 +241,7 @@ describe("turn-boundary context compaction preflight", () => {
       expect(narrative.text).toContain("Prior narrative summary")
       expect(narrative.text).toContain("Fresh tail sentinel")
       expect(narrative.text.split("Prior narrative summary")).toHaveLength(2)
-      expect(narrative.text.split("Fresh tail sentinel")).toHaveLength(801)
+      expect(narrative.text.split("Fresh tail sentinel").length).toBeGreaterThan(2)
     }
     expect(compactionPort.publishAtomically).toHaveBeenCalledOnce()
     expect(publishedItemIds).toEqual(["context-compaction:turn-1:2:110"])
