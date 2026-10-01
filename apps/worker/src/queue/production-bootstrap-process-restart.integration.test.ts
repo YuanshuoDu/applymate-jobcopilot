@@ -771,8 +771,8 @@ describeWithServices("production bootstrap recovery across a Worker process rest
       [foreignInputs.map(input => input.id)],
     )
     expect(untouchedForeign.rows).toEqual([
-      expect.objectContaining({ id: foreignInputs[0]!.id, sessionId: followUpIds.sessionId, userId: foreignUserId, targetTurnId: followUpIds.turnId, status: "accepted" }),
       expect.objectContaining({ id: foreignInputs[1]!.id, sessionId: foreignSessionId, userId: followUpIds.userId, targetTurnId: followUpIds.turnId, status: "accepted" }),
+      expect.objectContaining({ id: foreignInputs[0]!.id, sessionId: followUpIds.sessionId, userId: foreignUserId, targetTurnId: followUpIds.turnId, status: "accepted" }),
     ])
 
     commandAcceptance = startWorker("replay-active-terminal", followUpIds)
