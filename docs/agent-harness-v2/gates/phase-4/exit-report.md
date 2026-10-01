@@ -1,6 +1,6 @@
 # Phase 4 Exit Report — Owner-Waiver Activation
 
-**Report status:** Draft for Claude/PM §1.8 review
+**Report status:** Draft for Claude/PM §1.8 review; #387 and Phase 5 activation remain blocked until the PM decision is recorded.
 
 **Decision date:** 2026-10-01
 
@@ -18,12 +18,12 @@
 ## Goal result
 
 - **Planned outcome:** Verify the Phase 4 policy, approval, resume, and redaction controls, then decide whether Phase 5 implementation may proceed.
-- **Actual outcome:** Code-level policy, scope/expiry/race rejection, broker wakeup, and allow-list redaction changes are merged. The owner authorizes Phase 5 implementation under the named waiver below.
+- **Actual outcome:** Code-level policy, scope/expiry/race rejection, broker wakeup, and allow-list redaction changes are merged. The owner approved the two named waivers below; the latest issue ruling still requires Claude/PM to record the §1.8 decision before Phase 5 is unblocked.
 - **Partial/unverified items:**
   - V3 staging approval/decline/expiry browser smoke: **WAIVED / NOT VERIFIED** by the [owner decision](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/387#issuecomment-5931612168). It was not run for this decision and is not a PASS.
   - V5 48-hour dual-write integrity report: **WAIVED / NOT VERIFIED** by the same decision. No empirical 48-hour counts or parity result are claimed.
   - SSE disconnect/reconnect replay: **OBSERVED / ACCEPTED for the named route-replay requirement**. The attached [PR #392 trace](https://github.com/YuanshuoDu/applymate-jobcopilot/blob/d3de94f/docs/agent-harness-v2/gates/phase-4/sse-drill.trace.jsonl) records a real authenticated staging Preview route, a 32-second disconnect, durable sequence 6 inserted during the disconnect, resume after sequence 5, returned sequence `[6]`, zero duplicates, and zero missed durable events. The event was synthetic/operator-inserted; no Worker/Redis automation ran. The owner ruled that this meets the #387 SSE replay item and said not to rerun it ([ruling](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/387#issuecomment-5929863153)).
-  - Worker-produced event publication and original-Turn wake/resume have no new end-to-end staging evidence in the SSE trace. Existing code-level review remains in PR #384; the runtime gap is retained as unverified rather than inferred from route replay.
+  - Worker-produced event publication and original-Turn wake/resume have no new end-to-end staging evidence in the SSE trace. Existing code-level review remains in PR #384; the runtime gap is retained as unverified rather than inferred from route replay. The 2026-10-01 owner waiver explicitly names the staging approval/decline/expiry browser smoke; this report does not assume it separately waives this original-Turn runtime item. PM must classify it before deciding GO/NO-GO.
   - Staging control-plane/database/deployment binding and post-#519 audit migration/checkpoint health remain unverified; neither production rollout nor flag activation is authorized by this decision.
 
 ## Verification
@@ -50,6 +50,6 @@
 
 ## Decision
 
-- **GO / NO-GO:** **GO BY OWNER WAIVER for Phase 5 implementation only.** Do not mark Phase 4 `completed`; approval smoke and the 48-hour report remain `WAIVED / NOT VERIFIED`, and production rollout remains NO-GO pending its own evidence and approval.
+- **GO / NO-GO:** **PENDING Claude/PM decision.** Requested disposition: GO by owner waiver for Phase 5 implementation only, if PM accepts the unverified original-Turn runtime item under the named approval-smoke waiver. Otherwise keep #387 blocked and specify the smallest follow-up evidence. Do not mark Phase 4 `completed`; approval smoke and the 48-hour report remain `WAIVED / NOT VERIFIED`; production rollout remains NO-GO pending its own evidence and approval.
 - **Reviewer:** Claude/PM must review this report against roadmap §1.8 and record the final #387 disposition.
-- **Next Phase activation date:** 2026-10-01, conditional on the recorded owner waiver and PM's §1.8 review. Phase 5's own Exit Gate remains mandatory.
+- **Next Phase activation date:** TBD; only after Claude/PM records GO in #387. The prior owner waiver remains the decision basis, but Phase 5's own Exit Gate remains mandatory.
