@@ -1562,6 +1562,8 @@ async function reviewSelectedJobThroughRestartedWorker(
     userId: value.userId, sessionId: value.sessionId, jobId: trace.otherJobId,
   }, reviewRef)).resolves.toBeNull()
 
+  await waitForProcessLine(worker, `P3_SELECTED_JOB_STOP_REVIEW_QUEUED ${trace.stopReviewerTask.id}`, 30_000)
+  worker.stdin?.write(`start-selected-job-review:${trace.stopReviewerTask.id}\n`)
   await waitForProcessLine(worker, `P3_SELECTED_JOB_STOP_REVIEW_READY ${trace.stopReviewerTask.id}`, 30_000)
   const liveStopTask = await trace.store.get(trace.stopReviewerTask.id, value.sessionId)
   if (!liveStopTask?.leaseOwner || liveStopTask.status !== "running") throw new Error("Stop-review fixture did not hold a live Worker lease")
@@ -1600,6 +1602,10 @@ async function reviewSelectedJobThroughRestartedWorker(
       reviewWriteError: "private_artifact_review_failed",
     },
   })
+  const countAfterRejectedAttempt = await pool.query<{ count: number }>(
+    `SELECT COUNT(*)::int AS "count" FROM "agent_artifact_review" WHERE "taskId" = $1`, [trace.stopReviewerTask.id],
+  )
+  expect(countAfterRejectedAttempt.rows[0]?.count).toBe(0)
   const [persistedItems, persistedEvents, persistedOutbox, persistedTasks] = await Promise.all([
     pool.query<{ content: unknown }>(`SELECT "content" FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = ANY($3::text[])`, [
       value.sessionId, value.turnId, [trace.writerTask.id, trace.reviewerTask.id, trace.stopReviewerTask.id],

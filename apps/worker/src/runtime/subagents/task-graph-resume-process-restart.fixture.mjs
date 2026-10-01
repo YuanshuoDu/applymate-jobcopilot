@@ -736,6 +736,10 @@ async function startSelectedJobQueueWorker(runtime) {
     if (!payload || payload.sessionId !== selected.sessionId || payload.rootTaskId !== selected.rootTaskId) {
       throw new Error("p3_selected_job_queue_payload_scope_invalid")
     }
+    if (payload.taskId === selected.stopReviewerTaskId) {
+      say("P3_SELECTED_JOB_STOP_REVIEW_QUEUED " + payload.taskId)
+      await waitForCommand("start-selected-job-review:" + payload.taskId)
+    }
     let leaseIdentity = null
     let childResult = null
     const observations = {}
