@@ -116,65 +116,14 @@ function addSteeringInput(root: Fixture, alreadyConsumed = false): void {
 }
 
 describe("owner-agnostic turn execution loop", () => {
-  it("keeps an accepted follow-up in every provider context across tool continuation", async () => {
+  it("finishes the Turn once after atomic terminal commit without a same-Turn follow-up step", async () => {
     const root = fixture(identity("turn", "root-1"))
-    const baseBuilder = root.options.contextBuilder
-    const followUp: StepContext["blocks"][number] = {
-      id: "follow-up-1:part:0", layer: "pending_input", role: "data", trust: "external_untrusted", source: "user_input",
-      content: { inputId: "follow-up-1", partIndex: 0, text: "Keep senior roles in scope" },
-    }
-    root.options = {
-      ...root.options,
-      contextBuilder: { build: async request => {
-        const context = await baseBuilder.build(request)
-        return { ...context, consumedInputIds: ["follow-up-1"], blocks: [...context.blocks.filter(block => block.id !== followUp.id), followUp] }
-      } },
-    }
 
     const result = await runTurnExecutionLoop(root.options)
 
-    expect(result.status).toBe("completed")
+    expect(result).toMatchObject({ status: "completed", stepCount: 2, toolCallCount: 1 })
     expect(root.requests).toHaveLength(2)
-    for (const request of root.requests) {
-      expect(JSON.stringify(request.messages)).toContain("follow-up-1")
-      expect(JSON.stringify(request.messages)).toContain("Keep senior roles in scope")
-    }
-  })
-
-  it("keeps a root Turn open and starts a fresh step when terminal commit finds an accepted follow-up", async () => {
-    const root = fixture(identity("turn", "root-1"))
-    let terminalAttempts = 0
-    const persist = root.options.store.recordFinalResponse!
-    const baseContextBuilder = root.options.contextBuilder
-    const contexts: StepContext[] = []
-    root.options = {
-      ...root.options,
-      store: { ...root.options.store, recordFinalResponse: async input => {
-        terminalAttempts += 1
-        if (terminalAttempts === 1) return { status: "pending_follow_up" }
-        return persist(input)
-      } },
-      contextBuilder: {
-        build: async request => {
-          const context = await baseContextBuilder.build(request)
-          const next = request.stepId.endsWith("step:2")
-            ? { ...context, inputThroughSequence: 8n, consumedInputIds: ["follow-up-1"], blocks: [...context.blocks, {
-              id: "follow-up-1:part:0", layer: "pending_input" as const, role: "data" as const, trust: "external_untrusted" as const, source: "user_input",
-              content: { inputId: "follow-up-1", partIndex: 0, text: "Also include senior roles" },
-            }] }
-            : context
-          contexts.push(next)
-          return next
-        },
-      },
-    }
-
-    const result = await runTurnExecutionLoop(root.options)
-
-    expect(result).toMatchObject({ status: "completed", stepCount: 3, toolCallCount: 1 })
-    expect(terminalAttempts).toBe(2)
-    expect(contexts.map(context => context.stepId)).toEqual(expect.arrayContaining(["turn:turn-1:step:2"]))
-    expect(root.requests.at(-1)?.messages.flatMap(message => message.content).some(part => JSON.stringify(part).includes("Also include senior roles"))).toBe(true)
+    expect(root.finalResponses).toHaveLength(1)
     expect(root.items.filter(item => item.id.includes("item:final:")).map(item => item.revision)).toEqual([1])
     expect(root.notifications.filter(type => type === "turn.completed")).toHaveLength(1)
   })

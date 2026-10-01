@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto"
 import type pg from "pg"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
@@ -13,6 +14,37 @@ export type TurnEngineTerminalGuard = (client: pg.PoolClient) => Promise<TurnEng
 const json = (value: unknown) => JSON.stringify(value)
 const sameJson = (left: unknown, right: unknown) => json(toRepositoryJson(left)) === json(toRepositoryJson(right))
 function conflict(resource: string): Error { return Object.assign(new Error(`TurnEngine persistence conflict: ${resource}`), { name: "TurnEnginePersistenceConflict" }) }
+
+async function promoteFollowUp(client: Client, owner: TurnExecutionOwnerFence, source: unknown, row: Row, now: Date): Promise<void> {
+  const content = row.content
+  const clientMessageId = row.clientMessageId
+  if (!Array.isArray(content) || typeof clientMessageId !== "string" || !clientMessageId.trim() || typeof source !== "string" || !source.trim()) throw conflict("follow-up root input")
+  const text = content.flatMap((part: unknown) => {
+    if (!part || typeof part !== "object" || Array.isArray(part)) return []
+    const candidate = part as Row
+    return candidate.type === "text" && typeof candidate.text === "string" ? [candidate.text] : []
+  }).join("\n").trim()
+  const successorId = randomUUID()
+  const root = { goal: text || "Process the provided content", content, clientMessageId }
+  await client.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "updatedAt")
+    VALUES ($1, $2, $3, 'queued', $4, $5::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $6)`,
+  [successorId, owner.sessionId, owner.userId, source, json(root), now])
+  const moved = await client.query(`UPDATE "agent_inputs" SET "targetTurnId" = $1
+    WHERE "id" = $2 AND "sessionId" = $3 AND "userId" = $4 AND "targetTurnId" IS NOT DISTINCT FROM $5
+      AND "delivery" = 'follow_up' AND "status" IN ('accepted', 'queued') AND "consumedByStepId" IS NULL AND "consumedAt" IS NULL AND "cancelledAt" IS NULL`,
+  [successorId, row.id, owner.sessionId, owner.userId, row.targetTurnId])
+  if (moved.rowCount !== 1) throw conflict(`follow-up input ${String(row.id)} promotion`)
+  const key = `turn-dispatch:${successorId}`
+  const payload = { turnId: successorId, sessionId: owner.sessionId, ownerId: `web:${successorId}` }
+  const outbox = await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
+    VALUES ($1, 'agent.turn.dispatch', $2, $3, $4::jsonb) ON CONFLICT ("idempotencyKey") DO NOTHING RETURNING "id"`,
+  [randomUUID(), owner.sessionId, key, json(payload)])
+  if (outbox.rowCount !== 1) {
+    const existing = await client.query<Row>(`SELECT "topic", "aggregateId", "payload" FROM "agent_outbox" WHERE "idempotencyKey" = $1 FOR UPDATE`, [key])
+    const saved = existing.rows[0]
+    if (!saved || saved.topic !== "agent.turn.dispatch" || saved.aggregateId !== owner.sessionId || !sameJson(saved.payload, payload)) throw conflict(`dispatch ${key} identity`)
+  }
+}
 
 async function transaction<T>(pool: Pool, userId: string, work: (client: Client) => Promise<T>, guarded = false): Promise<T> {
   const client = await pool.connect(); let committed = false
@@ -87,7 +119,7 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
   return transaction(pool, owner.userId, async client => {
     const session = await client.query<Row>(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 AND "status" NOT IN ('aborted', 'archived') FOR UPDATE`, [owner.sessionId, owner.userId])
     if (!session.rows[0]) throw conflict(`session ${owner.sessionId}`)
-    const turn = await client.query<Row>(`SELECT turn."id", turn."status", turn."finalResponse" FROM "agent_turns" AS turn
+    const turn = await client.query<Row>(`SELECT turn."id", turn."status", turn."finalResponse", turn."source" FROM "agent_turns" AS turn
       WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND turn."rootTaskId" = $6 AND (
         (turn."status" = 'in_progress' AND turn."leaseOwnerId" = $4 AND turn."leaseVersion" = $5 AND turn."leaseExpiresAt" > CURRENT_TIMESTAMP)
         OR (turn."status" = 'completed' AND turn."leaseOwnerId" IS NULL AND turn."leaseExpiresAt" IS NULL AND turn."leaseVersion" = $5)) FOR UPDATE`,
@@ -102,12 +134,11 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
     const committed = turnRow.status === "completed"
     if (committed && (turnRow.finalResponse !== input.response || task.status !== "completed" || task.leaseOwner !== null || Number(task.attemptCount) !== 1 || !sameJson(task.result, result))) throw conflict(`terminal receipt ${owner.turnId}`)
     if (!committed && (turnRow.status !== "in_progress" || task.status !== "running" || task.leaseOwner !== owner.ownerId || Number(task.attemptCount) !== 1)) throw conflict(`root task ${owner.taskId} fence`)
-    if (!committed) {
-      const pending = await client.query<Row>(`SELECT "id" FROM "agent_inputs" WHERE "sessionId" = $1 AND "userId" = $2 AND "targetTurnId" = $3
-        AND "delivery" = 'follow_up' AND "status" IN ('accepted', 'queued') AND "consumedByStepId" IS NULL AND "consumedAt" IS NULL AND "cancelledAt" IS NULL
-        ORDER BY "acceptedSequence" ASC FOR UPDATE`, [owner.sessionId, owner.userId, owner.turnId])
-      if (pending.rows.length > 0) return { status: "pending_follow_up" }
-    }
+    let pendingFollowUp: Row | undefined
+    if (!committed) pendingFollowUp = (await client.query<Row>(`SELECT "id", "targetTurnId", "clientMessageId", "content" FROM "agent_inputs"
+      WHERE "sessionId" = $1 AND "userId" = $2 AND "targetTurnId" IS NOT NULL AND "delivery" = 'follow_up'
+        AND "status" IN ('accepted', 'queued') AND "consumedByStepId" IS NULL AND "consumedAt" IS NULL AND "cancelledAt" IS NULL
+      ORDER BY "acceptedSequence" ASC, "id" ASC LIMIT 1 FOR UPDATE`, [owner.sessionId, owner.userId])).rows[0]
     const prior = await client.query<Row>(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "idempotencyKey" = $3 FOR UPDATE`,
       [owner.sessionId, owner.turnId, `turn:${owner.turnId}:event:step-completed:${input.stepId}`])
     if (!prior.rows[0]) throw conflict(`completed step event ${input.stepId}`)
@@ -148,6 +179,7 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
           AND "leaseOwnerId" = $10 AND "leaseVersion" = $11 AND "leaseExpiresAt" > ${finalizationGuard ? "clock_timestamp()" : "$5"}`,
       [input.response, input.usage.inputTokens, input.usage.outputTokens, input.usage.estimatedCostUsd, input.now, owner.turnId, owner.sessionId, owner.userId, owner.taskId, owner.ownerId, owner.leaseVersion])
       if (updatedTurn.rowCount !== 1) throw conflict(`turn ${owner.turnId} completion`)
+      if (pendingFollowUp) await promoteFollowUp(client, owner, turnRow.source, pendingFollowUp, input.now)
     }
     return { status: "completed", finalItemId: input.finalItemId, events: saved }
   }, Boolean(finalizationGuard))
