@@ -395,6 +395,15 @@ async function makeFollowUpResumeWorker() {
     const matches = matchingFollowUps(request)
     if (matches.length !== 0) throw new Error(`${phase}_exposed_pending_follow_ups:${JSON.stringify(matches)}`)
   }
+  function assertCurrentFollowUpOnly(request, currentIndex, phase) {
+    const matches = matchingFollowUps(request)
+    const current = matches.find(match => match.index === currentIndex)
+    const later = matches.filter(match => match.index > currentIndex)
+    if (!current || current.occurrences !== 1 || later.length > 0) {
+      throw new Error(`${phase}_successor_follow_up_context_invalid:${JSON.stringify({ currentIndex, matches, later })}`)
+    }
+    return current
+  }
   await startFixtureProductionRuntime({
     workerId: "active-follow-up-recovery-" + process.pid,
     productionFlags: {
@@ -424,35 +433,30 @@ async function makeFollowUpResumeWorker() {
           },
         }
       },
-      modelRuntimeFactory() {
+      modelRuntimeFactory({ state }) {
         let modelCalls = 0
-        let successorFollowUpIndex = null
+        const successorFollowUpIndex = followUps.findIndex(followUp => followUp.text === state.goal)
         return {
           adapter: {
             id: "active-follow-up-recovery-fixture-model",
             profile: modelProfile(),
             async *stream(request) {
               modelCalls += 1
-              const matches = matchingFollowUps(request)
-              if (matches.length > 1) throw new Error("successor_provider_received_multiple_pending_follow_ups")
-              if (modelCalls === 1 && matches.length === 1) {
-                const match = matches[0]
-                if (match.occurrences !== 1) throw new Error("successor_provider_did_not_receive_exactly_one_promoted_follow_up")
-                successorFollowUpIndex = match.index
-                say("SUCCESSOR_PROVIDER_ACTIVE " + (match.index + 1))
-                await waitForCommand("release-successor-" + (match.index + 1))
-                yield { type: "tool_call_completed", callId: "successor-evidence-" + ids.suffix + "-" + (match.index + 1), name: "jobs.search", arguments: { location: "Dublin" } }
-                yield { type: "completed", finishReason: "tool_calls" }
-                return
-              }
-              if (successorFollowUpIndex !== null && modelCalls === 2) {
-                const match = matches[0]
-                if (matches.length !== 1 || match.index !== successorFollowUpIndex || match.occurrences !== 1) {
-                  throw new Error("successor_provider_did_not_preserve_exactly_one_promoted_follow_up")
+              if (successorFollowUpIndex >= 0) {
+                const match = assertCurrentFollowUpOnly(request, successorFollowUpIndex, `successor_provider_round_${modelCalls}`)
+                if (modelCalls === 1) {
+                  say("SUCCESSOR_PROVIDER_ACTIVE " + (match.index + 1))
+                  await waitForCommand("release-successor-" + (match.index + 1))
+                  yield { type: "tool_call_completed", callId: "successor-evidence-" + ids.suffix + "-" + (match.index + 1), name: "jobs.search", arguments: { location: "Dublin" } }
+                  yield { type: "completed", finishReason: "tool_calls" }
+                  return
                 }
-                yield { type: "text_delta", text: finalMarker + " successor-" + (match.index + 1) }
-                yield { type: "completed", finishReason: "stop" }
-                return
+                if (modelCalls === 2) {
+                  yield { type: "text_delta", text: finalMarker + " successor-" + (match.index + 1) }
+                  yield { type: "completed", finishReason: "stop" }
+                  return
+                }
+                throw new Error("unexpected_successor_provider_round")
               }
               if (modelCalls === 1) {
                 assertNoFollowUps(request, "active_turn_recovery")
