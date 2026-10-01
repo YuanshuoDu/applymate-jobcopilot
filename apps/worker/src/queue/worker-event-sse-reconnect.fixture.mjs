@@ -79,12 +79,24 @@ try {
       return createCanonicalTurnRuntime(runtimePool, {
         ...productionOptions,
         modelRuntimeFactory() {
+          let modelCalls = 0
           return {
             adapter: {
               id: "worker-sse-reconnect-fixture-model",
               profile: modelProfile(),
               async *stream() {
                 say("FIXTURE_MODEL_USED")
+                modelCalls += 1
+                if (modelCalls === 1) {
+                  yield {
+                    type: "tool_call_completed",
+                    callId: "fixture-jobs-search",
+                    name: "jobs.search",
+                    arguments: { target: "Worker event replay fixture", limit: 5 },
+                  }
+                  yield { type: "completed", finishReason: "tool_calls" }
+                  return
+                }
                 yield { type: "text_delta", text: "Deterministic disposable Worker SSE proof." }
                 yield { type: "completed", finishReason: "stop" }
               },

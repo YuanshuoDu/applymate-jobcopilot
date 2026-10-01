@@ -118,6 +118,14 @@ function workerExited(child: FixtureChild): boolean {
     || (child.signalCode !== null && child.signalCode !== undefined)
 }
 
+async function waitForWorkerExit(child: FixtureChild, timeoutMs: number): Promise<boolean> {
+  if (workerExited(child)) return true
+  return new Promise(resolveExit => {
+    const timer = setTimeout(() => resolveExit(false), timeoutMs)
+    child.once("exit", () => { clearTimeout(timer); resolveExit(true) })
+  })
+}
+
 async function waitForWorkerLine(child: FixtureChild, expected: string, timeoutMs = 15_000): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
@@ -131,16 +139,14 @@ async function waitForWorkerLine(child: FixtureChild, expected: string, timeoutM
 async function stopWorker(child: FixtureChild): Promise<void> {
   if (workerExited(child)) return
   child.stdin?.write("shutdown\n")
-  await new Promise<void>((resolveExit, rejectExit) => {
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM")
-      const killTimer = setTimeout(() => child.kill("SIGKILL"), 1_000)
-      child.once("exit", () => clearTimeout(killTimer))
-      rejectExit(new Error(`Worker did not stop after shutdown; stdout=${child.output.join(" | ")}; stderr=${child.errors.join(" | ")}`))
-    }, 8_000)
-    child.once("exit", () => { clearTimeout(timer); resolveExit() })
-    child.once("error", error => { clearTimeout(timer); rejectExit(error) })
-  })
+  if (!await waitForWorkerExit(child, 8_000)) {
+    child.kill("SIGTERM")
+    if (!await waitForWorkerExit(child, 1_000)) {
+      child.kill("SIGKILL")
+      if (!await waitForWorkerExit(child, 1_000)) throw new Error("Worker did not exit after forced termination")
+    }
+    throw new Error(`Worker did not stop after shutdown; stdout=${child.output.join(" | ")}; stderr=${child.errors.join(" | ")}`)
+  }
   if (child.exitCode !== 0) throw new Error(`Worker exited with ${child.exitCode}; stderr=${child.errors.join(" | ")}`)
 }
 
@@ -205,6 +211,7 @@ describeWithServices("agent events route replays a disconnected Worker event", (
   const ownerId = `worker-sse-owner-${suffix}`
   const otherOwnerId = `worker-sse-other-${suffix}`
   const sessionId = `worker-sse-session-${suffix}`
+  const jobId = `worker-sse-job-${suffix}`
   const featureFlagId = `worker-sse-flag-${suffix}`
   const emailFor = (userId: string) => `${userId}@example.invalid`
   const previousAuthSecret = process.env.AUTH_SECRET
@@ -222,6 +229,16 @@ describeWithServices("agent events route replays a disconnected Worker event", (
 
     await testDb.user.create({ data: { id: ownerId, email: emailFor(ownerId) } })
     await testDb.user.create({ data: { id: otherOwnerId, email: emailFor(otherOwnerId) } })
+    await testDb.job.create({
+      data: {
+        id: jobId,
+        userId: ownerId,
+        company: "Worker SSE Fixture",
+        role: "Worker event replay fixture",
+        location: "Dublin",
+        source: "test",
+      },
+    })
     await testDb.platformFeatureFlag.create({
       data: {
         id: featureFlagId,
@@ -337,11 +354,18 @@ describeWithServices("agent events route replays a disconnected Worker event", (
           WHERE "sessionId" = ${sessionId} AND "turnId" = ${turnId}
           ORDER BY "ordinal" DESC LIMIT 1
         `
+        const failures = await testDatabase.$queryRaw<Array<{ errorCode: string | null }>>`
+          SELECT payload ->> 'errorCode' AS "errorCode"
+          FROM "agent_events"
+          WHERE "sessionId" = ${sessionId} AND "turnId" = ${turnId} AND "type" = 'turn.failed'
+          ORDER BY "sequence" DESC LIMIT 1
+        `
         const failure = diagnostics[0]
         const lastStep = steps[0]
         throw new Error(
           `Worker turn ${turnStatus}: ${turn?.error ?? "no error"}; `
           + `dlq=${failure ? `${failure.reasonCode ?? "unknown"}/${failure.errorCode ?? "unknown"}/attempt-${failure.attemptsMade ?? "unknown"}` : "missing"}; `
+          + `turnError=${failures[0]?.errorCode ?? "missing"}; `
           + `step=${lastStep ? `${lastStep.status}/${lastStep.errorCode ?? "no-error-code"}/${lastStep.finishReason ?? "no-finish-reason"}` : "missing"}; `
           + `stdout=${worker?.output.filter(line => line === "WORKER_READY" || line === "FIXTURE_MODEL_USED").join("|") ?? "missing"}; `
           + `stderr=${worker?.errors.join("|") ?? "missing"}`,
