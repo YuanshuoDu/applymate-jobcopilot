@@ -130,7 +130,7 @@ describeWithPostgres("PostgreSQL context compaction atomic publisher", () => {
       WHERE snapshot."id" = $1 GROUP BY snapshot."version", snapshot."throughSequence", item."status", turn."contextSnapshotId"`, [
       firstResult.snapshot.id, firstResult.item.id, owner.turnId, `agent-event:${firstResult.item.id}:started`, `agent-event:${firstResult.item.id}:completed`,
     ])
-    expect(rows.rows[0]).toMatchObject({ version: 1, throughSequence: "1", itemStatus: "completed", contextSnapshotId: null, eventCount: 2, outboxCount: 2 })
+    expect(rows.rows[0]).toMatchObject({ version: 1, throughSequence: "1", itemStatus: "completed", contextSnapshotId: null, eventCount: "2", outboxCount: "2" })
 
     await pool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "taskId", "type", "status", "content", "completedAt", "updatedAt") VALUES ($1, $2, $3, $4, 'agent_message', 'completed', $5::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, [
       `fresh-tail-${suffix}`, ownerIds.sessionId, ownerIds.turnId, ownerIds.taskId, JSON.stringify({ text: "Fresh tail ".repeat(500) }),
