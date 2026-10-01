@@ -11,6 +11,7 @@ import { getGoogleAccessToken }                  from '@/lib/gmail-helpers'
 import { db }                                    from '@/lib/db'
 import { createAgentSession, appendTranscriptEvent } from '@/lib/agent/session/repository'
 import { ensureV2Turn }                           from '@/lib/agent/session/v2-turn'
+import { resumeLegacyApprovalTurnInTransaction } from '@/lib/agent/approval/legacy-approval-fence'
 import { clientReceipt, consumeLegacyReceipt, issueLegacyReceipt, resolveLegacyApproval, validateLegacyReceipt } from '@/lib/agent/approval/legacy-receipt'
 import { requireLegacyPolicy }                    from '@/lib/agent/policy/legacy'
 
@@ -59,7 +60,9 @@ export async function POST(req: NextRequest) {
       material: { to: to.trim(), subject: normalizedSubject, draft }, answers: null, revision: approval.revision, expiresAt: approval.expiresAt,
     })
     await resolveLegacyApproval(db, { approval, userId: auth.userId, sessionId, decision: 'approved' })
-    await db.agentTurn.update({ where: { id: approval.turnId }, data: { status: 'in_progress' } })
+    // This is the continuation/Stop linearization point: if this fence commits first,
+    // the approved handler proceeds. It cannot cancel a Gmail request after provider handoff.
+    await resumeLegacyApprovalTurnInTransaction(db, { sessionId, userId: auth.userId, turnId: approval.turnId })
     await consumeLegacyReceipt(db, {
       approvalId: approval.id, userId: auth.userId, sessionId, turnId: approval.turnId, toolCallId: approval.toolCallId, jobId: matchedJob.id,
       action: 'send_gmail', nonce: receiptNonce, resource: { jobId: matchedJob.id, gmailMessageId: normalizedMessageId, threadId: normalizedThreadId },
