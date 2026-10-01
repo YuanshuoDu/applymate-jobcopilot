@@ -2,7 +2,7 @@
 
 **Report status:** Draft for Claude/PM §1.8 review; #387 and Phase 5 activation remain blocked until the PM decision is recorded.
 
-**Decision date:** 2026-10-01
+**Report date:** 2026-10-01
 
 **Requested decision:** GO by owner waiver for Phase 5 implementation only
 
