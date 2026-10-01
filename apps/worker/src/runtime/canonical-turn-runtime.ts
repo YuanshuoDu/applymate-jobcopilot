@@ -19,8 +19,8 @@ import { capabilities, limits } from "./canonical-turn-config.js"
 import type { TurnExecutor, TurnExecutionResult } from "./turns/turn-queue.js"
 import type { TurnLease } from "./turns/lease.js"
 import type { TurnEngineOptions, TurnEngineStore } from "./turns/turn-engine-types.js"
-import { loadCanonicalTurnState, type CanonicalTurnState } from "./canonical-turn-state.js"
-import { loadTaskGraphCurrentObservation } from "./canonical-turn-task-graph-context.js"
+import { loadCanonicalTurnState, type CanonicalTurnState, type CanonicalTurnStateLoadOptions } from "./canonical-turn-state.js"
+import { isSelectedJobRootTool, loadTaskGraphCurrentObservation, selectedJobSnapshot, selectedJobToolAllowed } from "./canonical-turn-task-graph-context.js"
 import { loadSelectedJobPreparation, type SelectedJobPreparation } from "./selected-job-preparation.js"
 import { failSelectedJobPreparationUnavailable } from "./selected-job-preparation-gate.js"
 import { taskGraphRuntimeForTurn } from "./subagents/task-graph-templates.js"
@@ -38,6 +38,7 @@ import { defaultAuthorization, modelWithUsage, type UsageAuthorizer } from "./ca
 import { selectedJobArtifactCompletionGateWithWitness } from "./selected-job-completion-gate.js"
 import { selectedJobArtifactFinalizationGuard } from "./selected-job-finalization-guard.js"
 import { createAgentArtifactRepository, findCurrentDraftHeadWithClient, findReviewReceiptWithClient, type AgentArtifactDraftHead, type AgentArtifactDraftHeadScope } from "../db/agent-artifact-repo.js"
+import { runTurnBoundaryCompactionPreflight, runTurnBoundaryContextCompaction } from "./context/turn-boundary-compaction-preflight.js"
 
 export { durableLifecycleSink } from "./turns/canonical-runtime-tool-recovery.js"
 export type { UsageAuthorization } from "./canonical-turn-runtime-model.js"
@@ -48,7 +49,7 @@ export type CanonicalTurnRuntimeOptions = {
   readonly consumeWaitOutcomes?: boolean
   /** Server-derived production gate; user policy cannot enable coordination. */
   readonly coordinationEnabled?: boolean
-  readonly stateLoader?: (pool: Pick<pg.Pool, "connect">, lease: TurnLease, now?: Date) => Promise<CanonicalTurnState>
+  readonly stateLoader?: (pool: Pick<pg.Pool, "connect">, lease: TurnLease, now?: Date, options?: CanonicalTurnStateLoadOptions) => Promise<CanonicalTurnState>
   /** Test seam for the server-owned Turn input selector; production uses the lease-fenced database loader. */
   readonly selectedJobPreparationLoader?: (pool: Pick<pg.Pool, "connect">, lease: TurnLease, now: Date) => Promise<SelectedJobPreparation | undefined>
   /** Test seam for the persisted artifact-head read; production uses the artifact repository. */
@@ -64,6 +65,7 @@ export type CanonicalTurnRuntimeOptions = {
   readonly manager?: AgentTreeManager
   readonly rootTaskStore?: RootTaskStore
   readonly turnEngineStoreFactory?: (pool: pg.Pool, terminalGuard?: Parameters<typeof createPgTurnEngineStore>[1]) => TurnEngineStore
+  readonly turnBoundaryCompactionRunner?: (input: Parameters<typeof runTurnBoundaryContextCompaction>[0]) => Promise<{ readonly status: string }>
   readonly contextBuilderFactory?: (input: { pool: pg.Pool; scope: { userId: string } }) => TurnEngineOptions["contextBuilder"]
   readonly lifecycleSinkFactory?: (input: { lease: TurnLease; store: TurnEngineStore; owner: ExecutionOwnerFence }) => ToolLifecycleSink
   /** Optional server-owned automation control projection; ordinary sessions are ignored by its SQL scope. */
@@ -75,27 +77,6 @@ export type CanonicalTurnRuntimeOptions = {
 
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
-}
-
-const SELECTED_JOB_ROOT_TOOLS = new Set([
-  "agent.plan", "agent.wait", "agent.list", "list_subagents",
-])
-
-function isSelectedJobRootTool(definition: unknown): boolean {
-  const name = record(definition).name
-  return typeof name === "string" && SELECTED_JOB_ROOT_TOOLS.has(name)
-}
-
-function selectedJobSnapshot(snapshot: TurnEngineOptions["snapshot"]): TurnEngineOptions["snapshot"] {
-  return {
-    ...snapshot,
-    toolObservations: snapshot.toolObservations.filter(observation => {
-      const content = record(observation.content)
-      const toolName = content.toolName
-      return (typeof toolName === "string" && SELECTED_JOB_ROOT_TOOLS.has(toolName))
-        || (observation.id === "task-graph-current" && content.kind === "task_graph_current")
-    }),
-  }
 }
 
 export async function createCanonicalTurnRuntime(pool: pg.Pool, options: CanonicalTurnRuntimeOptions): Promise<{
@@ -139,7 +120,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       })
       return terminal.result
     }
-    const state = await (options.stateLoader?.(pool, lease, now()) ?? loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes }))
+    let state = await (options.stateLoader?.(pool, lease, now(), { consumeWaitOutcomes }) ?? loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes }))
     const { enabled: taskGraphPlanningEnabled, selectedJobMode, selectedJobPreparation, templates: taskGraphTemplates } = await taskGraphRuntimeForTurn({
       enabled: options.productionFlags?.taskGraphPlanningEnabled === true && coordinationEnabled, pool, lease, now,
       selectedJobPreparationLoader: options.selectedJobPreparationLoader, taskGraphTemplates: options.taskGraphTemplates,
@@ -184,14 +165,29 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       readCurrentDraftHead: findCurrentDraftHeadWithClient, readCurrentSourceDigest: (queryClient, scope) => readSelectedJobSourceDigestWithClient(queryClient, scope.userId, scope.jobId), readCurrentReviewReceipt: findReviewReceiptWithClient,
     }) : undefined
     const turnStore = options.turnEngineStoreFactory?.(pool, terminalGuard) ?? createPgTurnEngineStore(pool, terminalGuard)
-    const rootSnapshot = selectedJobMode ? selectedJobSnapshot(state.snapshot) : state.snapshot; const modelSnapshot = taskGraphPlanningEnabled ? await loadTaskGraphCurrentObservation(rootSnapshot, options.taskGraphCommandPort, lease, root) : rootSnapshot
+    const initialRootSnapshot = selectedJobMode ? selectedJobSnapshot(state.snapshot) : state.snapshot
+    const initialModelSnapshot = taskGraphPlanningEnabled ? await loadTaskGraphCurrentObservation(initialRootSnapshot, options.taskGraphCommandPort, lease, root) : initialRootSnapshot
     const owner = executionOwnerFence({ kind: "turn", taskId: root.id, lease })
+    if (owner.kind !== "turn") throw new Error("turn_owner_fence_invalid")
     lifecycleOwner = { kind: "turn", taskId: root.id, lease }
     lifecycleSink = options.lifecycleSinkFactory?.({ lease, store: turnStore, owner }) ?? durableLifecycleSink(turnStore, owner)
     const config = options.modelRuntimeFactory ? undefined : await loadWorkerAiConfig(lease.userId)
     const modelRuntime = await (options.modelRuntimeFactory?.({ userId: lease.userId, config, state }) ?? createHarnessModelRuntime({ primary: config, fallbacks: [], allowEnvironmentFallbacks: false }))
     const authorize = options.authorizeUsage ?? defaultAuthorization
     const model = modelWithUsage(modelRuntime, lease, authorize)
+    const preflight = await runTurnBoundaryCompactionPreflight({
+      enabled: productionFlags?.turnBoundaryCompactionEnabled === true,
+      state,
+      signal,
+      compact: () => (options.turnBoundaryCompactionRunner ?? runTurnBoundaryContextCompaction)({ pool, scope: state.scope, owner, lease, model, signal }),
+      reload: () => options.stateLoader?.(pool, lease, now(), { consumeWaitOutcomes: false })
+        ?? loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes: false }),
+    })
+    state = preflight.state
+    const rootSnapshot = selectedJobMode ? selectedJobSnapshot(state.snapshot) : state.snapshot
+    const modelSnapshot = preflight.compacted && taskGraphPlanningEnabled
+      ? await loadTaskGraphCurrentObservation(rootSnapshot, options.taskGraphCommandPort, lease, root)
+      : preflight.compacted ? rootSnapshot : initialModelSnapshot
     const routeTool = createToolRouterExecutor(toolRuntime.router)
     const inputStore = createPgInputClaimStore(pool, state.scope)
     const baseContextBuilder = options.contextBuilderFactory?.({ pool, scope: state.scope }) ?? new StepContextBuilder(inputStore, createPgContextOwnerFence(pool))
@@ -206,12 +202,12 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const engine = new TurnEngine({
       lease, scope: state.scope, goal: state.goal, snapshot: modelSnapshot, contextBuilder,
       store: turnStore, model, tools: rootTools,
-      executeTool: input => selectedJobMode && !SELECTED_JOB_ROOT_TOOLS.has(input.call.toolName)
+      executeTool: input => selectedJobMode && !selectedJobToolAllowed(input.call.toolName)
         ? Promise.resolve({ id: input.call.id, toolName: input.call.toolName, toolVersion: input.call.toolVersion, status: "failed" as const, errorCode: "selected_job_root_tool_disabled" })
         : routeTool(input),
       rootInputId: state.rootInputId, rootTaskId: root.id, taskId: root.id,
       actorRole, capabilities: toolCapabilities,
-      validateToolArguments: (name, input) => selectedJobMode && !SELECTED_JOB_ROOT_TOOLS.has(name)
+      validateToolArguments: (name, input) => selectedJobMode && !selectedJobToolAllowed(name)
         ? "selected_job_root_tool_disabled"
         : toolRuntime.registry.validateArguments(name, input, "1"), signal,
       budget: limits(state.budgetSnapshot), resume: state.resume, now, publishReasoningSummary: false,

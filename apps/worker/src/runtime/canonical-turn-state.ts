@@ -20,6 +20,8 @@ export type CanonicalTurnState = {
   readonly budgetSnapshot: unknown
   readonly rootTaskId?: string
   readonly rootInputId?: string
+  /** Loaded Turns always provide this; optional for existing injected stateLoader fixtures. */
+  readonly contextSnapshotPinned?: boolean
   readonly snapshot: StepContextSnapshot
   readonly steeringMarkers?: SteeringMarkerState
   readonly pendingToolCalls?: readonly PersistedToolCallRecovery[]
@@ -219,6 +221,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     validateAgendaResumeFence(restoredAgenda, steps)
     const result = {
       scope, goal, modelProfileSnapshot: json(turn.modelProfileSnapshot), toolPolicySnapshot: turn.toolPolicySnapshot ?? {}, budgetSnapshot: turn.budgetSnapshot ?? {},
+      contextSnapshotPinned: turn.contextSnapshotId !== null && turn.contextSnapshotId !== undefined,
       steeringMarkers, ...(restoredAgenda ? { cognitiveAgendaReceipt: restoredAgenda } : {}), ...(restored.pending.length ? { pendingToolCalls: restored.pending } : {}), ...(rootTaskId ? { rootTaskId } : {}),
       ...(rootInput.rows[0] ? { rootInputId: rootInput.rows[0].id } : {}), snapshot, ...(resume ? { resume } : {}),
     }

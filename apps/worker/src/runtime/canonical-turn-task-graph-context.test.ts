@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { loadTaskGraphCurrentObservation, mergeTaskGraphCurrentObservation } from "./canonical-turn-task-graph-context.js"
+import { isSelectedJobRootTool, loadTaskGraphCurrentObservation, mergeTaskGraphCurrentObservation, selectedJobSnapshot, selectedJobToolAllowed } from "./canonical-turn-task-graph-context.js"
 import type { TaskGraphCommandPort } from "./subagents/task-graph-command-port.js"
 import type { TaskGraphCurrentState } from "./subagents/task-graph-command-port.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./subagents/task-graph-command-port.js"
@@ -31,6 +31,20 @@ function snapshot(): StepContextSnapshot {
 }
 
 describe("TaskGraph turn observation", () => {
+  it("keeps selected-job root observations scoped to coordination and the current graph", () => {
+    const original = {
+      ...snapshot(),
+      toolObservations: [
+        { id: "search-result", content: { toolName: "jobs.search" } },
+        { id: "wait-result:wait-1", content: { toolName: "agent.wait", output: { status: "ready" } } },
+        { id: "task-graph-current", content: { kind: "task_graph_current", revision: 1 } },
+      ],
+    }
+    expect(selectedJobSnapshot(original).toolObservations.map(item => item.id)).toEqual(["wait-result:wait-1", "task-graph-current"])
+    expect(isSelectedJobRootTool({ name: "agent.plan" })).toBe(true)
+    expect(selectedJobToolAllowed("jobs.search")).toBe(false)
+  })
+
   it("refreshes the old graph observation while preserving other observations and live outcomes", () => {
     const result = mergeTaskGraphCurrentObservation(snapshot(), state)
 

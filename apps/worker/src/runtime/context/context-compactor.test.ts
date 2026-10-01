@@ -15,7 +15,7 @@ const source: CompactionSource = {
 }
 
 function request(overrides: Partial<CompactionRequest> = {}): CompactionRequest {
-  return { scope: { userId: "user-a" }, turnId: "turn-a", source, policy: { inputTokenThreshold: 10, itemCountThreshold: 100, compactAtTurnBoundary: true }, atTurnBoundary: false, requested: false, version: 1, ...overrides }
+  return { scope: { userId: "user-a" }, turnId: "turn-a", source, policy: { inputTokenThreshold: 10, itemCountThreshold: 100, compactAtTurnBoundary: true }, atTurnBoundary: false, requested: false, ...overrides }
 }
 
 function port(overrides: Partial<ContextSnapshotCompactionPort> = {}): ContextSnapshotCompactionPort {

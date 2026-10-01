@@ -6,7 +6,7 @@ vi.mock("./selected-job-preparation.js", () => ({ loadSelectedJobPreparation: vi
 import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
 import type pg from "pg"
 import type { StepContext } from "./context/step-context-builder.js"
-import type { CanonicalTurnState } from "./canonical-turn-state.js"
+import type { CanonicalTurnState, CanonicalTurnStateLoadOptions } from "./canonical-turn-state.js"
 import type { TurnEngineEvent, TurnEngineStore } from "./turns/turn-engine-types.js"
 import { createCanonicalTurnRuntime, type CanonicalTurnRuntimeOptions } from "./canonical-turn-runtime.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA, type TaskGraphCommandPort, type TaskGraphCurrentState, type TaskGraphReadScope, type TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
@@ -27,8 +27,8 @@ type TurnEngineStoreFactory = NonNullable<CanonicalTurnRuntimeOptions["turnEngin
 const recoveredPlanHash = `sha256:${"a".repeat(64)}`
 type RuntimeEvent = { id?: string; type: string; payload: unknown; correlationId?: string; idempotencyKey?: string; owner?: unknown }
 
-function state(): CanonicalTurnState {
-  return { scope: { userId: "user-1" }, goal: "Find jobs", modelProfileSnapshot: { provider: "fixture", model: "fixture" }, toolPolicySnapshot: {}, budgetSnapshot: { limits: { maxSteps: 4 } }, snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] } }
+function state(overrides: Partial<CanonicalTurnState> = {}): CanonicalTurnState {
+  return { scope: { userId: "user-1" }, goal: "Find jobs", modelProfileSnapshot: { provider: "fixture", model: "fixture" }, toolPolicySnapshot: {}, budgetSnapshot: { limits: { maxSteps: 4 } }, snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }, ...overrides }
 }
 
 function selectedJobState(): CanonicalTurnState {
@@ -340,6 +340,91 @@ describe("createCanonicalTurnRuntime", () => {
     expect(fixture.tool.execute).toHaveBeenCalledOnce()
   })
 
+  it("reloads compacted context before the first request without consuming waits twice", async () => {
+    const initial = state({
+      contextSnapshotPinned: false,
+      snapshot: {
+        ...state().snapshot,
+        goal: { id: "turn-goal:turn-1", content: "Find jobs" },
+        toolObservations: [
+          { id: "stale-search", content: { toolName: "jobs.search" } },
+          { id: "wait-result:wait-1", content: { toolName: "agent.wait", output: { status: "ready" } } },
+          { id: "task-graph-current", content: { kind: "task_graph_current", revision: 1 } },
+        ],
+      },
+    })
+    const refreshed = state({
+      contextSnapshotPinned: false,
+      snapshot: {
+        ...state().snapshot,
+        goal: { id: "turn-goal:turn-1", content: "stale snapshot goal" },
+        steerHistory: [{ id: "cursor-tail:9", content: "recent turn history" }],
+        businessRefs: [{ id: "selected-job", kind: "job", ownerId: "user-1", label: "Selected role" }],
+        toolObservations: [
+          { id: "new-search", content: { toolName: "jobs.search" } },
+          { id: "task-graph-current", content: { kind: "task_graph_current", revision: 2 } },
+        ],
+      },
+    })
+    let loadCount = 0
+    const loadOptions: CanonicalTurnStateLoadOptions[] = []
+    const stateLoader = vi.fn(async (_pool: unknown, _lease: TurnLease, _now: Date | undefined, options?: CanonicalTurnStateLoadOptions) => {
+      loadOptions.push(options ?? {})
+      loadCount += 1
+      return loadCount === 1 ? initial : refreshed
+    })
+    const observedSnapshots: CanonicalTurnState["snapshot"][] = []
+    const modelRequests: HarnessModelRequest[] = []
+    const adapter = {
+      ...model(() => []),
+      async *stream(request: HarnessModelRequest): AsyncIterable<ModelStreamEvent> {
+        modelRequests.push(request)
+        yield { type: "text_delta", text: "done" }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+    const graph = {
+      appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
+      readCurrent: vi.fn(async () => ({ revision: 9, nodes: [] })),
+    }
+    const runtimeTools = tools(true)
+    const runner = vi.fn(async () => ({ status: "compacted" as const }))
+    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+      workerId: "worker-1",
+      productionFlags: resolveProductionAgentFlags({
+        ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+        ENABLE_AGENT_TURN_BOUNDARY_COMPACTION: "1",
+      }),
+      stateLoader,
+      selectedJobPreparationLoader: async () => ({ jobId: "job-1" }),
+      taskGraphCommandPort: graph,
+      taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+      rootTaskStore: rootStore() as never,
+      toolRuntimeFactory: () => ({ ...runtimeTools, registry: { ...runtimeTools.registry, register: () => undefined } }) as never,
+      turnEngineStoreFactory: () => store(),
+      contextBuilderFactory: () => ({ build: async request => {
+        observedSnapshots.push(request.snapshot)
+        return await contextBuilder().build(request)
+      } }),
+      modelRuntimeFactory: async () => ({ adapter, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+      turnBoundaryCompactionRunner: runner,
+    })
+
+    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed" })
+    expect(runner).toHaveBeenCalledOnce()
+    expect(loadOptions).toEqual([{ consumeWaitOutcomes: true }, { consumeWaitOutcomes: false }])
+    expect(graph.readCurrent).toHaveBeenCalledTimes(3)
+    expect(observedSnapshots[0]?.goal).toEqual(initial.snapshot.goal)
+    expect(observedSnapshots[0]?.steerHistory).toContainEqual({ id: "cursor-tail:9", content: "recent turn history" })
+    expect(observedSnapshots[0]?.businessRefs).toEqual(refreshed.snapshot.businessRefs)
+    expect(observedSnapshots[0]?.toolObservations).toEqual([
+      { id: "wait-result:wait-1", content: { toolName: "agent.wait", output: { status: "ready" } } },
+      { id: "task-graph-current", content: { kind: "task_graph_current", revision: 9, nodes: [] } },
+    ])
+    expect(modelRequests).toHaveLength(1)
+  })
+
   it("preserves Stop interruption when a selected-job Turn is already aborted", async () => {
     const selector = vi.fn(async () => ({ jobId: "job-1" }))
     const fixture = setup({ selectedJobPreparationLoader: selector })
@@ -637,7 +722,7 @@ describe("createCanonicalTurnRuntime", () => {
     }
     const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
       workerId: "worker-1", taskGraphCommandPort, taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
-      productionFlags: { taskGraphPlanningEnabled: true, childExecutionEnabled: true, coordinationEnabled: true, consumeWaitOutcomes: false, canonicalAutomationEnabled: false },
+      productionFlags: { taskGraphPlanningEnabled: true, childExecutionEnabled: true, coordinationEnabled: true, consumeWaitOutcomes: false, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false },
       selectedJobPreparationLoader: async () => undefined,
       stateLoader: async () => ({ ...state(), toolPolicySnapshot: {} }), rootTaskStore: rootStore() as never,
       turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(), modelRuntimeFactory: provider,

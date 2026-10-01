@@ -173,7 +173,6 @@ export type CompactionRequest = {
   readonly policy: CompactionTriggerPolicy
   readonly atTurnBoundary: boolean
   readonly requested: boolean
-  readonly version: number
   readonly itemId?: string
   readonly bounds?: Partial<CompactionBounds>
 }

@@ -16,6 +16,30 @@ import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./subagents/task-graph-comm
 import type { TurnLease } from "./turns/lease.js"
 import type { SubagentTaskRecord } from "./subagents/types.js"
 
+const SELECTED_JOB_ROOT_TOOLS = new Set(["agent.plan", "agent.wait", "agent.list", "list_subagents"])
+
+export function isSelectedJobRootTool(definition: unknown): boolean {
+  const name = record(definition)?.name
+  return typeof name === "string" && SELECTED_JOB_ROOT_TOOLS.has(name)
+}
+
+export function selectedJobToolAllowed(name: string): boolean {
+  return SELECTED_JOB_ROOT_TOOLS.has(name)
+}
+
+/** Restrict selected-job root context to coordination tools and the current graph observation. */
+export function selectedJobSnapshot(snapshot: StepContextSnapshot): StepContextSnapshot {
+  return {
+    ...snapshot,
+    toolObservations: snapshot.toolObservations.filter(observation => {
+      const content = record(observation.content)
+      const toolName = content?.toolName
+      return (typeof toolName === "string" && SELECTED_JOB_ROOT_TOOLS.has(toolName))
+        || (observation.id === "task-graph-current" && content?.kind === "task_graph_current")
+    }),
+  }
+}
+
 const OBSERVATION_ID = "task-graph-current"
 const MAX_NODES = 16
 const MAX_TEXT = 160_000
