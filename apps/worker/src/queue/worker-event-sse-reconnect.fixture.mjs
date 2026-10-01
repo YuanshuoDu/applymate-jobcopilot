@@ -53,12 +53,19 @@ function modelProfile() {
 }
 
 process.stdin.setEncoding("utf8")
-process.stdin.on("data", chunk => {
+function onStdinData(chunk) {
   inputBuffer += chunk
   const lines = inputBuffer.split("\n")
   inputBuffer = lines.pop() ?? ""
   if (lines.some(line => line.trim() === "shutdown")) resolveShutdown()
-})
+}
+process.stdin.on("data", onStdinData)
+
+function closeInput() {
+  process.stdin.off("data", onStdinData)
+  process.stdin.pause()
+  process.stdin.destroy()
+}
 
 try {
   bootstrap = await startProductionWorkerRuntime({
@@ -124,12 +131,14 @@ try {
   })
   say("WORKER_READY")
   await shutdown
+  closeInput()
   say("WORKER_SHUTDOWN_RECEIVED")
 } catch (error) {
   const message = error instanceof Error ? error.stack ?? error.message : String(error)
   process.stderr.write(`${message}\n`)
   process.exitCode = 1
 } finally {
+  closeInput()
   try { if (bootstrap) { say("BOOTSTRAP_CLOSE_BEGIN"); await bootstrap.close(); say("BOOTSTRAP_CLOSE_DONE") } } catch (error) {
     process.stderr.write(`bootstrap_close: ${error instanceof Error ? error.message : String(error)}\n`)
     process.exitCode = 1
