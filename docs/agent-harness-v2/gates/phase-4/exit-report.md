@@ -6,7 +6,7 @@
 
 **Requested decision:** GO by owner waiver for Phase 5 implementation only
 
-**Evidence-complete Phase 4 status:** Not claimed (`accepted_by_owner_waiver`, not `completed`)
+**Evidence-complete Phase 4 status:** Not claimed. Owner waivers are recorded, but #387 and Phase 5 activation remain blocked pending Claude/PM's §1.8 Exit decision.
 
 ## Scope
 

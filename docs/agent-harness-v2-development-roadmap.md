@@ -3,7 +3,7 @@
 > **状态（2026-10-01）：** Phase 0–3 implementation remains complete. Phase 4 已有 `accepted_by_owner_waiver` 例外，但 **#387 与 Phase 5 activation 目前仍 blocked，直至 Claude/PM 按 §1.8 记录最终 Exit decision**；这与 evidence-complete `completed` 是不同状态。AH2-018–021 已合并（PR #382–#385）；runbook/evidence 包含在 PR #389/#390，SSE trace 在 PR #392。Owner 于 2026-10-01 明确豁免 staging approval/decline/expiry browser smoke 与 48h dual-write integrity report；两者均为 `WAIVED / NOT VERIFIED`，不得表述为 PASS。仍要求的 >30s durable SSE reconnect 已由 owner 裁定满足，具体边界与待 PM 决策的 original-Turn runtime residual 见 [Phase 4 Exit Report](agent-harness-v2/gates/phase-4/exit-report.md)。Phase 4 普通完成、staging control-plane/DB 绑定、生产审计链部署后读回和任何 production rollout 均未因此获准。最新可用 flag 观察是历史数据，不能当作当前值。Phase 5 自身 Exit Gate 仍强制。
 
 > **Phase 10 / GA reconciliation (2026-09-07):** AH2-048–053 implementation PRs are merged and their code/CI evidence is recorded. The GA checklist is now reconciled into `PASS`, `WAIVED / NOT VERIFIED`, and `PENDING` instead of treating every item as unsigned. This is a documentation/evidence correction, not a GA approval: staging/production observation, rollback evidence, zero-legacy-traffic measurement, and owner sign-off remain explicit blockers until recorded. See [`docs/ga/agent-harness-2.0-checklist.md`](ga/agent-harness-2.0-checklist.md) and AH2-054 ([#490](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/490)).
-> **日期：** 2026-08-30（状态头更新于 2026-08-31）
+> **路线图初稿日期：** 2026-08-30；**状态头最近更新：** 2026-10-01。
 > **上游设计：** [Agent Harness 2.0 Technical Design](./agent-harness-v2-technical-design.md)
 > **适用代码：** `packages/agent-protocol`、`packages/agent-model`、`apps/web`、`apps/worker`
 > **目标：** 将架构设计拆成可直接创建 GitHub Issue、逐 PR 实施、逐 Gate 验收的开发计划

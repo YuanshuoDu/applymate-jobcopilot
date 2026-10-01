@@ -42,7 +42,7 @@ The 2026-10-01 decision adds the named staging approval-smoke waiver to the 2026
 The following items are waived for Phase 5 implementation activation:
 
 - **V3 staging approval/decline/expiry browser smoke:** owner-waived on 2026-10-01; `WAIVED / NOT VERIFIED`. It was not run for the current Gate decision.
-- **AC2 / §1.7:** a 48h staging dual-write integrity observation and report.
+- **48-hour dual-write integrity observation/report (§1.7).**
 
 No claim is made that either item passed. No claim is made about parity over the 48-hour period. In particular, the project has no empirical 48-hour trend for event counts, projection counts, orphan records, duplicate records, lag, or error rate under this decision.
 
@@ -78,4 +78,4 @@ This exception does not waive any of the following:
 
 ## Reviewer handoff
 
-`@claude` should review the linked §1.8 Exit Report and record the formal Gate decision. Until then, #387 and Phase 5 activation stay blocked. The report requests a conditional GO only for Phase 5 implementation; the staging approval smoke and AC2 remain not verified, the SSE replay item is observed and owner-accepted, and Phase 4 is not evidence-complete. Production enablement remains separately gated.
+`@claude` should review the linked §1.8 Exit Report and record the formal Gate decision. Until then, #387 and Phase 5 activation stay blocked. The report requests a conditional GO only for Phase 5 implementation; the staging approval smoke and 48-hour integrity report remain not verified, the SSE replay item is observed and owner-accepted, and Phase 4 is not evidence-complete. Production enablement remains separately gated.
