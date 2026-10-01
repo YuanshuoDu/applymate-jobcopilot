@@ -78,7 +78,7 @@ async function readState(client: CompactionPgClient, owner: TurnExecutionOwnerFe
   const [approvalRows, artifactRows, taskRows, inputRows] = await Promise.all([
     client.query<CompactionPgRow>(`SELECT "id", "status", "scopeHash", "answersHash" FROM "agent_approvals" WHERE "sessionId" = $1 AND "userId" = $2 ORDER BY "id"`, [owner.sessionId, owner.userId]),
     client.query<CompactionPgRow>(`SELECT "id", "artifactType" AS "type", "contentHash" AS "hash"
-      FROM "agent_artifact_versions" WHERE "sessionId" = $1 AND "userId" = $2 ORDER BY "createdAt", "id"`, [owner.sessionId, owner.userId]),
+      FROM "agent_artifact_version" WHERE "sessionId" = $1 AND "userId" = $2 ORDER BY "createdAt", "id"`, [owner.sessionId, owner.userId]),
     client.query<CompactionPgRow>(`SELECT "id", "status", "failureReason" FROM "sub_agent_tasks" WHERE "sessionId" = $1
       AND "status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed') ORDER BY "id"`, [owner.sessionId]),
     client.query<InputRow>(`SELECT "id", "targetTurnId", "acceptedSequence", "content" FROM "agent_inputs" WHERE "sessionId" = $1 AND "userId" = $2

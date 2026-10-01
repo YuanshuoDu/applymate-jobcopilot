@@ -25,7 +25,7 @@ function fakePool(options: { readonly contextSnapshotId?: string | null } = {}) 
     if (sql.includes('FROM "agent_sessions" WHERE')) return { rows: [{ goal: "Find a role" }], rowCount: 1 }
     if (sql.includes('FROM "agent_context_snapshots"')) return { rows: [{ id: "snapshot-7", sessionId: owner.sessionId, throughSequence: "7", version: 2, content: priorContent, checksum: "checksum" }], rowCount: 1 }
     if (sql.includes('FROM "agent_approvals"')) return { rows: [{ id: "approval-1", status: "approved", scopeHash: "scope", answersHash: "answers" }], rowCount: 1 }
-    if (sql.includes('FROM "agent_artifact_versions"')) return { rows: [{ id: "artifact-v2", type: "resume", hash: "hash-v2" }], rowCount: 1 }
+    if (sql.includes('FROM "agent_artifact_version"')) return { rows: [{ id: "artifact-v2", type: "resume", hash: "hash-v2" }], rowCount: 1 }
     if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ id: "task-open", status: "running", failureReason: null }], rowCount: 1 }
     if (sql.includes('FROM "agent_inputs"')) return { rows: [
       { id: "input-old", targetTurnId: "turn-old", acceptedSequence: "4", content: { text: "old input" } },
@@ -67,6 +67,9 @@ describe("PostgreSQL context compaction source", () => {
       { id: "input:input-new", sessionId: owner.sessionId, turnId: owner.turnId, sequence: 8n, type: "user_input", status: "completed", content: { text: "new input" } },
       { id: "item-new", sessionId: owner.sessionId, turnId: owner.turnId, sequence: 9n, type: "agent_message", status: "completed", content: { text: "tail item" } },
     ])
+    const artifactQuery = fake.calls.find(call => call.sql.includes('FROM "agent_artifact_version"'))
+    expect(artifactQuery?.sql).toContain('SELECT "id", "artifactType" AS "type", "contentHash" AS "hash"')
+    expect(artifactQuery?.values).toEqual([owner.sessionId, owner.userId])
     const ownerQuery = fake.calls.find(call => call.sql.includes('FROM "agent_turns" AS turn'))
     expect(ownerQuery?.sql).toContain('"leaseVersion"')
     expect(ownerQuery?.sql).toContain('"leaseExpiresAt" > CURRENT_TIMESTAMP')
