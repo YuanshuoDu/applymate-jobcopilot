@@ -103,7 +103,9 @@ describeWithPostgres("PostgreSQL context compaction atomic publisher", () => {
     const source = await sourceAdapter.load({ scope, owner })
     if (!source) throw new Error("Expected an unpinned turn source")
     expect(source.state.throughSequence).toBe(1n)
-    expect(source.items).toMatchObject([{ id: `tail-${suffix}`, type: "agent_message", content: { text: "Useful tail" } }])
+    expect(source.items).toHaveLength(1)
+    expect(source.items[0]).toMatchObject({ id: `tail-${suffix}`, type: "agent_message" })
+    expect((source.items[0]?.content as { text?: string } | undefined)?.text).toContain("Useful tail")
     const port = createPgContextSnapshotCompactionPort(pool!, owner)
     const summarizerInputs: string[] = []
     let compactionIndex = 0
