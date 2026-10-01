@@ -1371,6 +1371,43 @@ async function enqueueSelectedJobTask(
   }
 }
 
+async function enqueueSelectedJobReviewTasksBeforeWorkerTwo(
+  pool: Pool,
+  connection: Redis,
+  value: Fixture,
+  trace: SelectedJobArtifactReviewTrace,
+): Promise<void> {
+  const { SUBAGENT_DISPATCH_TOPIC, subagentDispatchKey } = await import("../../queue/subagent-queue.js")
+  const tasks = [
+    { task: trace.reviewerTask, ownerId: `ac6-reviewer-worker-two-${value.suffix}` },
+    { task: trace.stopReviewerTask, ownerId: `ac6-stop-reviewer-worker-two-${value.suffix}` },
+  ]
+  for (const { task, ownerId } of tasks) {
+    const payload = { taskId: task.id, sessionId: task.sessionId, rootTaskId: task.rootTaskId, ownerId }
+    const inserted = await pool.query<{ id: string }>(
+      `INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
+       VALUES ($1, $2, $3, $4, $5::jsonb)
+       ON CONFLICT ("idempotencyKey") DO NOTHING
+       RETURNING "id"`,
+      [randomUUID(), SUBAGENT_DISPATCH_TOPIC, task.sessionId, subagentDispatchKey(task.id), JSON.stringify(payload)],
+    )
+    const dispatchId = inserted.rows[0]?.id
+    if (inserted.rowCount !== 1 || !dispatchId) {
+      throw new Error("Selected-job fixture dispatch marker already exists or could not be persisted")
+    }
+    await enqueueSelectedJobTask(trace.queueName, connection, task, ownerId)
+    const published = await pool.query<{ id: string }>(
+      `UPDATE "agent_outbox" SET "publishedAt" = CURRENT_TIMESTAMP
+       WHERE "id" = $1 AND "topic" = $2 AND "aggregateId" = $3 AND "publishedAt" IS NULL
+       RETURNING "id"`,
+      [dispatchId, SUBAGENT_DISPATCH_TOPIC, task.sessionId],
+    )
+    if (published.rowCount !== 1 || published.rows[0]?.id !== dispatchId) {
+      throw new Error("Selected-job fixture dispatch marker could not be marked published after enqueue")
+    }
+  }
+}
+
 async function prepareSelectedJobReviewAfterRestart(
   pool: Pool,
   value: Fixture,
@@ -1449,14 +1486,12 @@ async function prepareSelectedJobReviewAfterRestart(
 
 async function reviewSelectedJobThroughRestartedWorker(
   pool: Pool,
-  connection: Redis,
   value: Fixture,
   trace: SelectedJobArtifactReviewTrace,
   firstWorker: ProcessFixtureChild,
   worker: ProcessFixtureChild,
 ): Promise<void> {
   const artifactStore = createArtifactToolStore(pool)
-  await enqueueSelectedJobTask(trace.queueName, connection, trace.reviewerTask, `ac6-reviewer-worker-two-${value.suffix}`)
   const reviewLine = await waitForProcessLine(worker, `P3_SELECTED_JOB_CHILD_SETTLED ${trace.reviewerTask.id} `, 30_000)
   const reviewSettlement = selectedJobSettlement(reviewLine, trace.reviewerTask.id)
   expect(reviewSettlement).toMatchObject({
@@ -1527,7 +1562,6 @@ async function reviewSelectedJobThroughRestartedWorker(
     userId: value.userId, sessionId: value.sessionId, jobId: trace.otherJobId,
   }, reviewRef)).resolves.toBeNull()
 
-  await enqueueSelectedJobTask(trace.queueName, connection, trace.stopReviewerTask, `ac6-stop-reviewer-worker-two-${value.suffix}`)
   await waitForProcessLine(worker, `P3_SELECTED_JOB_STOP_REVIEW_READY ${trace.stopReviewerTask.id}`, 30_000)
   const liveStopTask = await trace.store.get(trace.stopReviewerTask.id, value.sessionId)
   if (!liveStopTask?.leaseOwner || liveStopTask.status !== "running") throw new Error("Stop-review fixture did not hold a live Worker lease")
@@ -4769,6 +4803,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
 
       if (!artifactTrace) throw new Error("Selected-job Writer did not settle in Worker 1")
       artifactReviewTrace = await prepareSelectedJobReviewAfterRestart(pool!, artifactOwner, artifactTrace)
+      // Worker 2 also starts database-wide default-queue recovery. Publish and
+      // enqueue these direct-store fixture tasks on their dedicated queue first
+      // so recovery does not misroute them to the generic subagent executor.
+      await enqueueSelectedJobReviewTasksBeforeWorkerTwo(pool!, redis, artifactOwner, artifactReviewTrace)
 
       workerTwo = startTaskGraphRestartWorker("resume-parent", {
         ...restartOwner,
@@ -4880,7 +4918,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(followUpReadyLine).toContain(String(preFinalFollowUpId))
 
       if (!artifactReviewTrace || !redis) throw new Error("Selected-job review fixture was not prepared for Worker 2")
-      await reviewSelectedJobThroughRestartedWorker(pool!, redis, artifactOwner, artifactReviewTrace, workerOne!, workerTwo!)
+      await reviewSelectedJobThroughRestartedWorker(pool!, artifactOwner, artifactReviewTrace, workerOne!, workerTwo!)
 
       const preFinalChildResult = await pool!.query<{ status: string; role: string; result: RecordValue | null; context: RecordValue | null }>(
         "SELECT \"status\", \"role\", \"result\", \"context\" FROM \"sub_agent_tasks\" WHERE \"id\" = $1 AND \"sessionId\" = $2 AND \"turnId\" = $3 AND \"rootTaskId\" = $4 AND \"parentTaskId\" = $4",
