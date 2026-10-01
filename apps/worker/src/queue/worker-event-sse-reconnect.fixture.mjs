@@ -112,12 +112,13 @@ try {
   })
   say("WORKER_READY")
   await shutdown
+  say("WORKER_SHUTDOWN_RECEIVED")
 } catch (error) {
   const message = error instanceof Error ? error.stack ?? error.message : String(error)
   process.stderr.write(`${message}\n`)
   process.exitCode = 1
 } finally {
-  try { if (bootstrap) await bootstrap.close() } catch (error) {
+  try { if (bootstrap) { say("BOOTSTRAP_CLOSE_BEGIN"); await bootstrap.close(); say("BOOTSTRAP_CLOSE_DONE") } } catch (error) {
     process.stderr.write(`bootstrap_close: ${error instanceof Error ? error.message : String(error)}\n`)
     process.exitCode = 1
   }

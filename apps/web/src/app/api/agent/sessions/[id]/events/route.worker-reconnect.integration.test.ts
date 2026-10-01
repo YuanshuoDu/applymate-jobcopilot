@@ -134,7 +134,9 @@ async function stopWorker(child: FixtureChild): Promise<void> {
   await new Promise<void>((resolveExit, rejectExit) => {
     const timer = setTimeout(() => {
       child.kill("SIGTERM")
-      rejectExit(new Error(`Worker did not stop after shutdown; stderr=${child.errors.join(" | ")}`))
+      const killTimer = setTimeout(() => child.kill("SIGKILL"), 1_000)
+      child.once("exit", () => clearTimeout(killTimer))
+      rejectExit(new Error(`Worker did not stop after shutdown; stdout=${child.output.join(" | ")}; stderr=${child.errors.join(" | ")}`))
     }, 8_000)
     child.once("exit", () => { clearTimeout(timer); resolveExit() })
     child.once("error", error => { clearTimeout(timer); rejectExit(error) })
@@ -312,7 +314,39 @@ describeWithServices("agent events route replays a disconnected Worker event", (
       const turn = await testDatabase.agentTurn.findUnique({ where: { id: turnId }, select: { status: true, error: true } })
       turnStatus = turn?.status ?? "missing"
       if (turnStatus === "completed") break
-      if (["failed", "cancelled", "interrupted"].includes(turnStatus)) throw new Error(`Worker turn ${turnStatus}: ${turn?.error ?? "no error"}`)
+      if (["failed", "cancelled", "interrupted"].includes(turnStatus)) {
+        const diagnostics = await testDatabase.$queryRaw<Array<{
+          reasonCode: string | null
+          errorCode: string | null
+          attemptsMade: number | null
+        }>>`
+          SELECT payload ->> 'reason_code' AS "reasonCode",
+                 payload ->> 'error_code' AS "errorCode",
+                 (payload ->> 'attemptsMade')::integer AS "attemptsMade"
+          FROM "agent_outbox"
+          WHERE "topic" = 'agent.turn.dlq' AND "aggregateId" = ${turnId}
+          ORDER BY "createdAt" DESC LIMIT 1
+        `
+        const steps = await testDatabase.$queryRaw<Array<{
+          status: string
+          errorCode: string | null
+          finishReason: string | null
+        }>>`
+          SELECT "status", "errorCode", "finishReason"
+          FROM "agent_steps"
+          WHERE "sessionId" = ${sessionId} AND "turnId" = ${turnId}
+          ORDER BY "ordinal" DESC LIMIT 1
+        `
+        const failure = diagnostics[0]
+        const lastStep = steps[0]
+        throw new Error(
+          `Worker turn ${turnStatus}: ${turn?.error ?? "no error"}; `
+          + `dlq=${failure ? `${failure.reasonCode ?? "unknown"}/${failure.errorCode ?? "unknown"}/attempt-${failure.attemptsMade ?? "unknown"}` : "missing"}; `
+          + `step=${lastStep ? `${lastStep.status}/${lastStep.errorCode ?? "no-error-code"}/${lastStep.finishReason ?? "no-finish-reason"}` : "missing"}; `
+          + `stdout=${worker?.output.filter(line => line === "WORKER_READY" || line === "FIXTURE_MODEL_USED").join("|") ?? "missing"}; `
+          + `stderr=${worker?.errors.join("|") ?? "missing"}`,
+        )
+      }
       await new Promise(resolveWait => setTimeout(resolveWait, 50))
     }
     expect(turnStatus).toBe("completed")
