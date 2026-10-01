@@ -426,6 +426,7 @@ async function makeFollowUpResumeWorker() {
       },
       modelRuntimeFactory() {
         let modelCalls = 0
+        let successorFollowUpIndex = null
         return {
           adapter: {
             id: "active-follow-up-recovery-fixture-model",
@@ -433,16 +434,26 @@ async function makeFollowUpResumeWorker() {
             async *stream(request) {
               modelCalls += 1
               const matches = matchingFollowUps(request)
-              if (matches.length === 1) {
+              if (matches.length > 1) throw new Error("successor_provider_received_multiple_pending_follow_ups")
+              if (modelCalls === 1 && matches.length === 1) {
                 const match = matches[0]
-                if (modelCalls !== 1 || match.occurrences !== 1) throw new Error("successor_provider_did_not_receive_exactly_one_promoted_follow_up")
+                if (match.occurrences !== 1) throw new Error("successor_provider_did_not_receive_exactly_one_promoted_follow_up")
+                successorFollowUpIndex = match.index
                 say("SUCCESSOR_PROVIDER_ACTIVE " + (match.index + 1))
                 await waitForCommand("release-successor-" + (match.index + 1))
+                yield { type: "tool_call_completed", callId: "successor-evidence-" + ids.suffix + "-" + (match.index + 1), name: "jobs.search", arguments: { location: "Dublin" } }
+                yield { type: "completed", finishReason: "tool_calls" }
+                return
+              }
+              if (successorFollowUpIndex !== null && modelCalls === 2) {
+                const match = matches[0]
+                if (matches.length !== 1 || match.index !== successorFollowUpIndex || match.occurrences !== 1) {
+                  throw new Error("successor_provider_did_not_preserve_exactly_one_promoted_follow_up")
+                }
                 yield { type: "text_delta", text: finalMarker + " successor-" + (match.index + 1) }
                 yield { type: "completed", finishReason: "stop" }
                 return
               }
-              if (matches.length > 1) throw new Error("successor_provider_received_multiple_pending_follow_ups")
               if (modelCalls === 1) {
                 assertNoFollowUps(request, "active_turn_recovery")
                 say("ACTIVE_TURN_CONTEXT_CLEAN")
