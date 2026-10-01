@@ -19,15 +19,32 @@ type WorkerJobRecord = {
   readonly status: string; readonly score: number | null; readonly url: string | null; readonly source: string | null
   readonly salary: string | null; readonly description: string | null; readonly keywords: string | null
 }
-type WorkerPersonaFact = { readonly id: string; readonly key: string; readonly value: string; readonly sourceRef: string | null; readonly confidence: number }
+type WorkerResumeRecord = {
+  readonly id: string; readonly name: string; readonly kind: string; readonly origin: string; readonly isDefault: boolean
+  readonly content: unknown; readonly createdAt: Date | string; readonly updatedAt: Date | string
+}
+type WorkerPersonaFact = {
+  readonly id: string; readonly key: string; readonly category: string; readonly value: string; readonly source: string
+  readonly sourceRef: string | null; readonly confidence: number; readonly allowedUses: readonly string[]
+}
 
-function selectedJobSourceDigest(job: WorkerJobRecord, resume: { readonly id: string; readonly content: unknown }, facts: readonly WorkerPersonaFact[]): string {
+function iso(value: Date | string): string {
+  return (value instanceof Date ? value : new Date(value)).toISOString()
+}
+
+function selectedJobSourceDigest(job: WorkerJobRecord, resume: WorkerResumeRecord, facts: readonly WorkerPersonaFact[]): string {
   const materials = [
     { sourceRef: `job:${job.id}`, content: job },
-    { sourceRef: `resume:${resume.id}`, content: resume.content },
-    ...facts.map(fact => ({
+    { sourceRef: `resume:${resume.id}`, content: {
+      id: resume.id, name: resume.name, kind: resume.kind, origin: resume.origin, isDefault: resume.isDefault,
+      content: resume.content, createdAt: iso(resume.createdAt), updatedAt: iso(resume.updatedAt),
+    } },
+    ...facts.map((fact, index) => ({
       sourceRef: `persona:${fact.id}`,
-      content: { id: fact.id, key: fact.key, value: fact.value, confidence: Number(fact.confidence), sourceRef: fact.sourceRef },
+      content: {
+        id: fact.id, key: fact.key, category: fact.category, value: fact.value, source: fact.source,
+        sourceRef: fact.sourceRef, confidence: Number(fact.confidence), allowedUses: [...fact.allowedUses], rank: index + 1,
+      },
     })),
   ]
   const sources = materials.map(item => ({ sourceRef: item.sourceRef, contentHash: hashContent(item.content) }))
@@ -41,8 +58,8 @@ async function currentSelectedJobSources(userId: string, job: WorkerJobRecord): 
     const [resume, facts] = await Promise.all([
       db.resume.findFirst({
         where: { userId, kind: "base" },
-        orderBy: [{ isDefault: "desc" }, { updatedAt: "desc" }],
-        select: { id: true, content: true },
+        orderBy: [{ isDefault: "desc" }, { updatedAt: "desc" }, { id: "desc" }],
+        select: { id: true, name: true, kind: true, origin: true, isDefault: true, content: true, createdAt: true, updatedAt: true },
       }),
       db.personaFact.findMany({
         where: {
@@ -51,9 +68,9 @@ async function currentSelectedJobSources(userId: string, job: WorkerJobRecord): 
           OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
           allowedUses: { has: "cover_letter" },
         },
-        orderBy: { updatedAt: "desc" },
+        orderBy: [{ updatedAt: "desc" }, { id: "desc" }],
         take: 50,
-        select: { id: true, key: true, value: true, sourceRef: true, confidence: true },
+        select: { id: true, key: true, category: true, value: true, source: true, sourceRef: true, confidence: true, allowedUses: true },
       }),
     ])
     if (!resume) return null
@@ -67,7 +84,10 @@ async function currentSelectedJobSources(userId: string, job: WorkerJobRecord): 
         text: isContactKey(fact.key) ? "Contact detail withheld" : safeEvidencePreview(fact.value, MAX_SOURCE_EVIDENCE_ITEM_CHARS),
       }] as const),
     ])
-    return { digest: selectedJobSourceDigest(job, resume, facts), byRef }
+    return { digest: selectedJobSourceDigest(job, {
+      id: resume.id, name: resume.name, kind: resume.kind, origin: resume.origin, isDefault: resume.isDefault,
+      content: resume.content, createdAt: resume.createdAt, updatedAt: resume.updatedAt,
+    }, facts), byRef }
   } catch {
     // A partial source snapshot must never keep an old review looking current.
     return null

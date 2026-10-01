@@ -21,15 +21,32 @@ const jobSource = {
   id: 'job-1', company: 'N26', role: 'Backend Engineer', location: 'Berlin', status: 'saved', score: 88,
   url: 'https://jobs.example.test/1', source: 'greenhouse', salary: '€80k', description: 'Build reliable systems', keywords: 'TypeScript, PostgreSQL',
 }
-const resumeSource = { id: 'resume-1', content: { contact: { name: 'Private Candidate', email: 'private@example.test', phone: '+353000000000' }, summary: 'Designed secure cloud services', skills: ['TypeScript', 'PostgreSQL', 'Kubernetes', 'AWS', 'Private fifth skill'], experience: [{ role: 'Senior Engineer', company: 'Example', bullets: ['Built high-availability APIs'] }] } }
-const personaSources = [{ id: 'fact-1', key: 'experience', value: 'Built reliable systems', sourceRef: 'fact-1', confidence: 0.9 }]
-function digestFor(job = jobSource, resume = resumeSource, facts = personaSources) {
+const resumeSource = {
+  id: 'resume-1', name: 'Base resume', kind: 'base', origin: 'manual', isDefault: true,
+  content: { contact: { name: 'Private Candidate', email: 'private@example.test', phone: '+353000000000' }, summary: 'Designed secure cloud services', skills: ['TypeScript', 'PostgreSQL', 'Kubernetes', 'AWS', 'Private fifth skill'], experience: [{ role: 'Senior Engineer', company: 'Example', bullets: ['Built high-availability APIs'] }] },
+  createdAt: new Date('2026-01-01T00:00:00.000Z'), updatedAt: new Date('2026-01-02T00:00:00.000Z'),
+}
+type PersonaFactFixture = { id: string; key: string; value: string; sourceRef: string | null; confidence: number; category?: string; source?: string; allowedUses?: readonly string[] }
+function workerPersonaFacts(facts: readonly PersonaFactFixture[]) {
+  return facts.map(fact => ({
+    id: fact.id, key: fact.key, category: fact.category ?? 'experience', value: fact.value,
+    source: fact.source ?? 'resume', sourceRef: fact.sourceRef, confidence: Number(fact.confidence),
+    allowedUses: [...(fact.allowedUses ?? ['cover_letter'])],
+  }))
+}
+const personaSources = workerPersonaFacts([{ id: 'fact-1', key: 'experience', value: 'Built reliable systems', sourceRef: 'fact-1', confidence: 0.9 }])
+// Mirrors Worker computeArtifactSourceDigest: complete ResumeRecord and ranked PersonaFactRecord material.
+function digestFor(job = jobSource, resume = resumeSource, facts: readonly PersonaFactFixture[] = personaSources) {
+  const resumeMaterial = {
+    id: resume.id, name: resume.name, kind: resume.kind, origin: resume.origin, isDefault: resume.isDefault,
+    content: resume.content, createdAt: resume.createdAt.toISOString(), updatedAt: resume.updatedAt.toISOString(),
+  }
   const sources = [
     { sourceRef: `job:${job.id}`, contentHash: hashContent(job) },
-    { sourceRef: `resume:${resume.id}`, contentHash: hashContent(resume.content) },
-    ...facts.map(fact => ({
+    { sourceRef: `resume:${resume.id}`, contentHash: hashContent(resumeMaterial) },
+    ...workerPersonaFacts(facts).map((fact, index) => ({
       sourceRef: `persona:${fact.id}`,
-      contentHash: hashContent({ id: fact.id, key: fact.key, value: fact.value, confidence: Number(fact.confidence), sourceRef: fact.sourceRef }),
+      contentHash: hashContent({ ...fact, rank: index + 1 }),
     })),
   ].sort((left, right) => left.sourceRef.localeCompare(right.sourceRef))
   return hashContent({ jobId: job.id, sources })
@@ -72,12 +89,14 @@ describe('session-scoped immutable cover-letter version read', () => {
       source: true, salary: true, description: true, keywords: true,
     } })
     expect(mocks.resume).toHaveBeenCalledWith({
-      where: { userId: 'user-1', kind: 'base' }, orderBy: [{ isDefault: 'desc' }, { updatedAt: 'desc' }], select: { id: true, content: true },
+      where: { userId: 'user-1', kind: 'base' },
+      orderBy: [{ isDefault: 'desc' }, { updatedAt: 'desc' }, { id: 'desc' }],
+      select: { id: true, name: true, kind: true, origin: true, isDefault: true, content: true, createdAt: true, updatedAt: true },
     })
     expect(mocks.persona).toHaveBeenCalledWith(expect.objectContaining({
       where: expect.objectContaining({ userId: 'user-1', status: 'confirmed', allowedUses: { has: 'cover_letter' } }),
-      orderBy: { updatedAt: 'desc' }, take: 50,
-      select: { id: true, key: true, value: true, sourceRef: true, confidence: true },
+      orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }], take: 50,
+      select: { id: true, key: true, category: true, value: true, source: true, sourceRef: true, confidence: true, allowedUses: true },
     }))
     expect(mocks.review).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({
       userId: 'user-1', sessionId: 'session-1', jobId: 'job-1', artifactId: 'artifact-1', version: 2, contentHash, sourceDigest,
@@ -132,7 +151,7 @@ describe('session-scoped immutable cover-letter version read', () => {
     const facts = Array.from({ length: 20 }, (_, index) => ({ id: `fact-${index + 1}`, key: `skill-${index + 1}`, value: 'x'.repeat(900), sourceRef: `resume:source-${index + 1}`, confidence: 0.9 }))
     const digest = digestFor(jobSource, resumeSource, facts)
     const persistedRefs = ['job:job-1', 'resume:resume-1', ...facts.map(fact => `persona:${fact.id}`)]
-    mocks.persona.mockResolvedValueOnce(facts)
+    mocks.persona.mockResolvedValueOnce(workerPersonaFacts(facts))
     mocks.version.mockResolvedValueOnce(artifact({ sourceDigest: digest, provenanceRefs: persistedRefs, evidenceRefs: persistedRefs }))
     const { GET } = await import('./route')
     const response = await GET(request(`?contentHash=${contentHash}&sourceDigest=${digest}&evidenceRef=persona:caller-controlled`) as never, context)
@@ -165,7 +184,7 @@ describe('session-scoped immutable cover-letter version read', () => {
     const facts = Array.from({ length: 6 }, (_, index) => ({ id: `fact-${index + 1}`, key: `skill-${index + 1}`, value: `Skill ${index + 1}`, sourceRef: `resume:source-${index + 1}`, confidence: 0.9 }))
     const digest = digestFor(jobSource, resumeSource, facts)
     const refs = ['job:job-1', 'resume:resume-1', ...facts.map(fact => `persona:${fact.id}`), 'persona:unresolved-ninth-ref']
-    mocks.persona.mockResolvedValueOnce(facts)
+    mocks.persona.mockResolvedValueOnce(workerPersonaFacts(facts))
     mocks.version.mockResolvedValueOnce(artifact({ sourceDigest: digest, evidenceRefs: refs, provenanceRefs: refs }))
     const { GET } = await import('./route')
     const response = await GET(request(`?contentHash=${contentHash}&sourceDigest=${digest}`) as never, context)
@@ -178,7 +197,7 @@ describe('session-scoped immutable cover-letter version read', () => {
     const email = 'candidate.private@example.test'
     const phone = '+353 87 123 4567'
     const job = { ...jobSource, description: `Build dependable systems. Contact ${email} or ${phone}.` }
-    const resume = { id: 'resume-1', content: { ...resumeSource.content, summary: `Experienced engineer. Contact ${email} or ${phone}.` } }
+    const resume = { ...resumeSource, content: { ...resumeSource.content, summary: `Experienced engineer. Contact ${email} or ${phone}.` } }
     const facts = [
       { id: 'email-fact', key: 'contactEmail', value: email, sourceRef: 'resume:contact', confidence: 0.9 },
       { id: 'name-fact', key: 'firstName', value: 'Private Candidate', sourceRef: 'resume:name', confidence: 0.9 },
@@ -188,7 +207,7 @@ describe('session-scoped immutable cover-letter version read', () => {
     const refs = ['job:job-1', 'resume:resume-1', 'persona:email-fact', 'persona:name-fact', 'persona:summary-fact']
     mocks.job.mockResolvedValueOnce(job)
     mocks.resume.mockResolvedValueOnce(resume)
-    mocks.persona.mockResolvedValueOnce(facts)
+    mocks.persona.mockResolvedValueOnce(workerPersonaFacts(facts))
     mocks.version.mockResolvedValueOnce(artifact({ sourceDigest: digest, evidenceRefs: refs, provenanceRefs: refs }))
     const { GET } = await import('./route')
     const response = await GET(request(`?contentHash=${contentHash}&sourceDigest=${digest}`) as never, context)
@@ -222,10 +241,10 @@ describe('session-scoped immutable cover-letter version read', () => {
   })
 
   it('keeps a review current when multiple Persona facts share one sourceRef', async () => {
-    const sharedSourceFacts = [
+    const sharedSourceFacts = workerPersonaFacts([
       { id: 'fact-1', key: 'language', value: 'English C1', sourceRef: 'resume:source-42', confidence: 0.98 },
       { id: 'fact-2', key: 'experience', value: 'Built reliable systems', sourceRef: 'resume:source-42', confidence: 0.91 },
-    ]
+    ])
     const matchingDigest = digestFor(jobSource, resumeSource, sharedSourceFacts)
     mocks.persona.mockResolvedValueOnce(sharedSourceFacts)
     mocks.version.mockResolvedValueOnce(artifact({ sourceDigest: matchingDigest }))
@@ -236,6 +255,27 @@ describe('session-scoped immutable cover-letter version read', () => {
 
     expect(response.status).toBe(200)
     expect(body.review).toEqual({ status: 'passed', reviewHash: 'review-hash', evidenceRefs: ['persona:fact-1'], findings: [] })
+  })
+
+  it('withholds source text and review findings when Worker-ranked Persona evidence changes order', async () => {
+    const workerOrderedFacts = workerPersonaFacts([
+      { id: 'fact-a', key: 'experience', value: 'Built reliable systems', sourceRef: 'resume:a', confidence: 0.98 },
+      { id: 'fact-b', key: 'language', value: 'English C1', sourceRef: 'resume:b', confidence: 0.91 },
+    ])
+    const persistedDigest = digestFor(jobSource, resumeSource, workerOrderedFacts)
+    const refs = ['job:job-1', 'resume:resume-1', 'persona:fact-a', 'persona:fact-b']
+    mocks.persona.mockResolvedValueOnce([...workerOrderedFacts].reverse())
+    mocks.version.mockResolvedValueOnce(artifact({ sourceDigest: persistedDigest, evidenceRefs: refs, provenanceRefs: refs }))
+    mocks.review.mockResolvedValueOnce({ status: 'passed', reviewHash: 'review-hash', evidenceRefs: refs, findings: [{ code: 'claim', severity: 'info', message: 'Private prior finding.', evidenceRefs: refs }] })
+    const { GET } = await import('./route')
+    const response = await GET(request(`?contentHash=${contentHash}&sourceDigest=${persistedDigest}`) as never, context)
+    const body = await response.json()
+
+    expect(response.status).toBe(200)
+    expect(body.sourceEvidence).toEqual({ freshness: 'stale', items: [] })
+    expect(body.review).toEqual({ status: 'stale', reviewHash: 'review-hash', evidenceRefs: [], findings: [] })
+    expect(JSON.stringify(body)).not.toContain('Built reliable systems')
+    expect(JSON.stringify(body)).not.toContain('Private prior finding.')
   })
 
   it.each([
