@@ -16,10 +16,10 @@ function events(startPatch: Record<string, unknown> = {}, answerPatch: Record<st
   return [
     { id: "started", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null,
       itemId: "question-item", type: "item.started", actor: "orchestrator", sequence: "10", correlationId: "question-item", causationId: "wait-1",
-      payload: { itemId: "question-item", waitKind: "question", questionId: "wait-1", toolCallId: "call-1" }, ...startPatch },
+      payload: { itemId: "question-item", waitKind: "question", questionId: "[REDACTED]", toolCallId: "call-1" }, ...startPatch },
     { id: "answered", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null,
       itemId: "question-item", type: "question.answered", actor: "user", sequence: "11", correlationId: "wait-1", causationId: "question-item",
-      payload: { waitKind: "question", waitId: "wait-1", itemId: "question-item", turnId: "turn-1", toolCallId: "call-1", status: "answered", answerAvailable: true }, ...answerPatch },
+      payload: { waitKind: "question", waitId: "wait-1", itemId: "question-item", turnId: "turn-1", toolCallId: "call-1", status: "answered", answerAvailable: "[REDACTED]" }, ...answerPatch },
   ]
 }
 function client(itemRows: Record<string, unknown>[] = [item()], eventRows: Record<string, unknown>[] = events()) {
@@ -33,12 +33,26 @@ function input(patch: Record<string, unknown> = {}) {
 }
 
 describe("recoverAnsweredQuestionHistory", () => {
-  it("projects separate, ordered question/options and answer entries using the unique tool-call step", async () => {
-    const history = await recoverAnsweredQuestionHistory(client(), input())
+  it("accepts broker-redacted event fields when the durable item and exact event lineage prove the answer", async () => {
+    const redactedEvents = events()
+    expect(redactedEvents[0].payload.questionId).toBe("[REDACTED]")
+    expect(redactedEvents[1].payload.answerAvailable).toBe("[REDACTED]")
+    const history = await recoverAnsweredQuestionHistory(client([item()], redactedEvents), input())
     expect(history).toEqual([
       { id: "agent-question:question-item:question", content: { role: "assistant", type: "question", question: "Continue?", options: [{ label: "Yes", value: "yes" }] } },
       { id: "agent-question:question-item:answer", content: { role: "user", type: "answer", questionId: "wait-1", text: "yes" } },
     ])
+  })
+
+  it("rejects a start event whose causation does not exactly match the durable question ID", async () => {
+    await expect(recoverAnsweredQuestionHistory(client([item()], events({ causationId: "other-wait" })), input()))
+      .rejects.toThrow("question_recovery_start_lineage_invalid")
+  })
+
+  it("still requires answer availability in the durable question item", async () => {
+    const unavailable = item({ content: { ...item().content as object, answerAvailable: false } })
+    await expect(recoverAnsweredQuestionHistory(client([unavailable], events()), input()))
+      .rejects.toThrow("question_recovery_item_malformed")
   })
 
   it("accepts a directly fenced step and deduplicates a complete snapshot pair", async () => {

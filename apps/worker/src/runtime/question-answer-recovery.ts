@@ -113,7 +113,7 @@ function appendIfNew(entries: readonly ContextHistoryEntry[], existing: readonly
 function validateStart(event: Row, item: Row, questionId: string, callId: string | null): bigint {
   const payload = record(event.payload)
   if (event.actor !== "orchestrator" || event.itemId !== item.id || event.correlationId !== item.id || event.causationId !== questionId
-    || payload.itemId !== item.id || payload.waitKind !== "question" || payload.questionId !== questionId
+    || payload.itemId !== item.id || payload.waitKind !== "question"
     || (payload.toolCallId ?? null) !== callId) throw new Error("question_recovery_start_lineage_invalid")
   return sequence(event.sequence)
 }
@@ -123,7 +123,7 @@ function validateAnswer(event: Row, item: Row, questionId: string, callId: strin
   if (event.actor !== "user" || event.itemId !== item.id || event.correlationId !== questionId || event.causationId !== item.id
     || payload.waitKind !== "question" || payload.waitId !== questionId || payload.itemId !== item.id
     || payload.turnId !== lease.turnId || (payload.toolCallId ?? null) !== callId
-    || payload.status !== "answered" || payload.answerAvailable !== true) throw new Error("question_recovery_answer_lineage_invalid")
+    || payload.status !== "answered") throw new Error("question_recovery_answer_lineage_invalid")
   return sequence(event.sequence)
 }
 
