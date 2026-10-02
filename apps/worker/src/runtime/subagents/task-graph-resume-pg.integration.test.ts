@@ -6207,9 +6207,16 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(children.rows.map(child => [child.role, child.status])).toEqual([["analyst", "completed"], ["scout", "completed"]])
       expect(workerTwo.output.filter(line => line.startsWith(`P3_DISCOVERY_CHILD_SETTLED ${source.rows[0]!.id} scout `))).toHaveLength(1)
       const persistedSearchReceipts = await pool!.query<{ taskId: string; toolName: string }>(
-        `SELECT "taskId", "content"->>'toolName' AS "toolName" FROM "agent_items"
-         WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = ANY($3::text[]) AND "type" = 'tool_result'
-           AND "content"->>'toolName' = 'jobs.search' ORDER BY "taskId"`,
+        `SELECT tool_result."taskId", tool_call."content"->>'toolName' AS "toolName"
+         FROM "agent_items" AS tool_result
+         JOIN "agent_items" AS tool_call
+           ON tool_call."sessionId" = tool_result."sessionId" AND tool_call."turnId" = tool_result."turnId"
+          AND tool_call."taskId" = tool_result."taskId" AND tool_call."type" = 'tool_call'
+          AND tool_call."content"->>'toolCallId' = tool_result."content"->>'toolCallId'
+         WHERE tool_result."sessionId" = $1 AND tool_result."turnId" = $2
+           AND tool_result."taskId" = ANY($3::text[]) AND tool_result."type" = 'tool_result'
+           AND tool_call."content"->>'toolName' = 'jobs.search'
+         ORDER BY tool_result."taskId"`,
         [value.sessionId, value.turnId, children.rows.map(child => child.id)],
       )
       expect(persistedSearchReceipts.rows).toHaveLength(2)
