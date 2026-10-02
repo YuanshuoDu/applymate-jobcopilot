@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from "vitest"
 
+import type { TenantScope } from "@jobcopilot/agent-protocol"
 import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
 import type { PolicyEngine } from "@jobcopilot/agent-policy"
-import type { StepContext } from "../context/step-context-builder.js"
+import { StepContextBuilder, type StepContext } from "../context/step-context-builder.js"
+import type { InputClaimStore, InputClaimTransaction, StepCheckpoint, StoredAgentInput } from "../context/input-claim-store.js"
 import { mergeTaskGraphCurrentObservation } from "../canonical-turn-task-graph-context.js"
 import { runTurnExecutionLoop } from "./turn-execution-loop.js"
 import type { TurnEngineEvent, TurnEngineItem, TurnEngineStore, TurnEngineToolResult } from "./turn-engine-types.js"
@@ -19,6 +21,7 @@ const profile = {
   supportsParallelTools: false, supportsStreamingToolArgs: true, supportsReasoningSummary: true, supportsResponseContinuation: false,
   supportsProviderConversation: false, supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: null, costClass: "low" as const,
 }
+const lateSteerText = "Prioritize senior engineering roles in Dublin."
 
 function identity(kind: TurnExecutionIdentity["kind"], taskId: string, attemptCount = 1): TurnExecutionIdentity {
   const common = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId, rootTaskId: "root-1", ownerId: "worker-1", leaseExpiresAt: new Date("2026-09-08T03:00:00.000Z") }
@@ -92,6 +95,51 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
     ...(completionGate ? { completionGate } : {}),
   }
   return { options, events, notifications, items, finalResponses, stepTasks, stepAttempts, stepStatuses, stepInputs, requests }
+}
+
+class LateSteerInputClaimStore implements InputClaimStore {
+  readonly scope: TenantScope = { userId: "user-1" }
+  readonly inputs: StoredAgentInput[] = []
+  private readonly checkpoints = new Map<string, StepCheckpoint>()
+
+  startStep(stepId: string, inputThroughSequence: bigint, consumedInputIds: readonly string[]): void {
+    this.checkpoints.set(stepId, { inputThroughSequence, consumedInputIds: [...consumedInputIds] })
+  }
+
+  acceptSteer(): void {
+    this.inputs.push({
+      id: "steer-539", sessionId: "session-1", targetTurnId: "turn-1", userId: "user-1", clientMessageId: "client-steer-539",
+      delivery: "steer", status: "accepted", content: [{ type: "text", text: lateSteerText }],
+      acceptedSequence: 1n, consumedByStepId: null, consumedAt: null, createdAt: new Date("2026-10-02T12:00:00.000Z"),
+    })
+  }
+
+  async withTransaction<T>(work: (transaction: InputClaimTransaction) => Promise<T>): Promise<T> {
+    return work({
+      getCheckpoint: async ({ stepId }) => {
+        const checkpoint = this.checkpoints.get(stepId)
+        if (!checkpoint) throw new Error(`missing step checkpoint: ${stepId}`)
+        return { inputThroughSequence: checkpoint.inputThroughSequence, consumedInputIds: [...checkpoint.consumedInputIds] }
+      },
+      claimInputs: async request => {
+        const candidates = this.inputs.filter(input =>
+          input.sessionId === request.sessionId && input.targetTurnId === request.turnId && input.userId === this.scope.userId &&
+          input.delivery === "steer" && (input.status === "accepted" || input.status === "queued") &&
+          input.consumedByStepId === null && input.consumedAt === null && input.acceptedSequence > request.checkpoint.inputThroughSequence,
+        )
+        for (const input of candidates) {
+          const mutable = input as unknown as { status: StoredAgentInput["status"]; consumedByStepId: string | null; consumedAt: Date | null }
+          mutable.status = "consumed"
+          mutable.consumedByStepId = request.stepId
+          mutable.consumedAt = request.now
+        }
+        return { inputs: candidates, newlyClaimedInputIds: candidates.map(input => input.id) }
+      },
+      persistCheckpoint: async ({ stepId, checkpoint }) => {
+        this.checkpoints.set(stepId, { inputThroughSequence: checkpoint.inputThroughSequence, consumedInputIds: [...checkpoint.consumedInputIds] })
+      },
+    })
+  }
 }
 
 function addSteeringInput(root: Fixture, alreadyConsumed = false): void {
@@ -393,6 +441,72 @@ describe("owner-agnostic turn execution loop", () => {
       { role: "assistant", content: [{ type: "tool_use", id: "call:root-1", name: "jobs.search", input: { location: "Dublin" } }] },
       { role: "tool", content: [{ type: "tool_result", toolUseId: "call:root-1", content: '{"job":"job-1"}' }] },
     ]))
+  })
+
+  it("serializes a steer accepted after Step 1 context into the next model request", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const inputStore = new LateSteerInputClaimStore()
+    const turnStore = root.options.store
+    const contextBuilder = new StepContextBuilder(inputStore)
+    let acceptedAfterFirstContext = false
+    root.options = {
+      ...root.options,
+      store: {
+        ...turnStore,
+        startStep: async input => {
+          inputStore.startStep(input.stepId, input.inputThroughSequence, input.consumedInputIds)
+          return turnStore.startStep(input)
+        },
+      },
+      contextBuilder: {
+        build: async request => {
+          const context = await contextBuilder.build({
+            scope: request.scope, sessionId: request.identity.sessionId, turnId: request.identity.turnId,
+            stepId: request.stepId, snapshot: request.snapshot, taskId: request.taskId, now: request.now,
+            steeringMarkerState: request.steeringMarkerState,
+          })
+          if (!acceptedAfterFirstContext) {
+            acceptedAfterFirstContext = true
+            inputStore.acceptSteer()
+          }
+          return context
+        },
+      },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    const firstRequest = root.requests[0]
+    const secondRequest = root.requests[1]
+    expect(acceptedAfterFirstContext).toBe(true)
+    expect(result).toMatchObject({ status: "completed", stepCount: 2, toolCallCount: 1, finalText: "done:root-1" })
+    expect(root.requests).toHaveLength(2)
+    expect(root.finalResponses).toHaveLength(1)
+    expect(root.notifications.filter(type => type === "turn.completed")).toHaveLength(1)
+    expect(inputStore.inputs).toMatchObject([{ id: "steer-539", status: "consumed", consumedByStepId: "turn:turn-1:step:1" }])
+
+    expect(firstRequest?.metadata).toMatchObject({
+      sessionId: "session-1", turnId: "turn-1", stepId: "turn:turn-1:step:0", taskId: "root-1", userId: "user-1",
+      featureId: "agent-harness.turn", traceId: "turn-1:turn:turn-1:step:0",
+    })
+    expect(JSON.stringify(firstRequest?.messages)).not.toContain(lateSteerText)
+    expect(secondRequest?.metadata).toMatchObject({
+      sessionId: "session-1", turnId: "turn-1", stepId: "turn:turn-1:step:1", taskId: "root-1", userId: "user-1",
+      featureId: "agent-harness.turn", traceId: "turn-1:turn:turn-1:step:1",
+    })
+    expect(secondRequest?.messages).toEqual(expect.arrayContaining([
+      {
+        role: "user",
+        content: [{
+          type: "text",
+          text: `[harness context layer=pending_input trust=UNTRUSTED_DATA source=user_input]\n{"inputId":"steer-539","partIndex":0,"text":"${lateSteerText}"}`,
+        }],
+      },
+      { role: "assistant", content: [{ type: "tool_use", id: "call:root-1", name: "jobs.search", input: { location: "Dublin" } }] },
+      { role: "tool", content: [{ type: "tool_result", toolUseId: "call:root-1", content: '{"job":"job-1"}' }] },
+    ]))
+    expect(JSON.stringify(secondRequest?.messages).split(lateSteerText)).toHaveLength(2)
+    expect(JSON.stringify(secondRequest?.messages).match(/"type":"tool_result"/g)).toHaveLength(1)
   })
 
   it("preserves the count of persisted calls when a later call in the batch exceeds budget", async () => {
