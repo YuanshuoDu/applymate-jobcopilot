@@ -168,6 +168,66 @@ async function duplicateRedeliveryFailureSnapshot(
   })
 }
 
+async function duplicateRedeliveryReceipt(pool: Pool, turnId: string, sessionId: string, toolCallId: string) {
+  return pool.query<{
+    status: string
+    leaseOwnerId: string | null
+    leaseVersion: number
+    finalResponse: string | null
+    finalItemCount: string
+    toolCallStartedEventCount: string
+    toolCallCompletedEventCount: string
+    durableItemCount: string
+    durableEventCount: string
+    completionEventCount: string
+    toolCallStarted: unknown
+    toolResult: unknown
+    durableItems: unknown
+    durableEvents: unknown
+  }>(
+    `SELECT turn."status", turn."leaseOwnerId", turn."leaseVersion", turn."finalResponse",
+       (SELECT COUNT(*)::text FROM "agent_items" AS item
+        WHERE item."turnId" = turn."id" AND item."sessionId" = turn."sessionId" AND item."type" = 'agent_message') AS "finalItemCount",
+       (SELECT COUNT(*)::text FROM "agent_events" AS event
+        WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId"
+          AND event."type" = 'tool_call.started' AND event."correlationId" = $3
+          AND event."idempotencyKey" LIKE 'turn:' || turn."rootTaskId" || ':tool-lifecycle:' || $3 || ':started:%') AS "toolCallStartedEventCount",
+       (SELECT COUNT(*)::text FROM "agent_events" AS event
+        WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId"
+          AND event."type" = 'tool_call.completed' AND event."correlationId" = $3
+          AND event."idempotencyKey" LIKE 'turn:' || turn."rootTaskId" || ':tool-lifecycle:' || $3 || ':completed:%') AS "toolCallCompletedEventCount",
+       (SELECT COUNT(*)::text FROM "agent_items" AS item
+        WHERE item."turnId" = turn."id" AND item."sessionId" = turn."sessionId") AS "durableItemCount",
+       (SELECT COUNT(*)::text FROM "agent_events" AS event
+        WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId") AS "durableEventCount",
+       (SELECT COUNT(*)::text FROM "agent_events" AS event
+        WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId"
+          AND event."idempotencyKey" = 'turn:' || turn."id" || ':event:turn-completed') AS "completionEventCount",
+       (SELECT event."payload" FROM "agent_events" AS event
+        WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId"
+          AND event."type" = 'tool_call.started' AND event."correlationId" = $3
+          AND event."idempotencyKey" LIKE 'turn:' || turn."rootTaskId" || ':tool-lifecycle:' || $3 || ':started:%'
+        ORDER BY event."sequence" DESC LIMIT 1) AS "toolCallStarted",
+       (SELECT event."payload" FROM "agent_events" AS event
+        WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId"
+          AND event."type" = 'tool_call.completed' AND event."correlationId" = $3
+          AND event."idempotencyKey" LIKE 'turn:' || turn."rootTaskId" || ':tool-lifecycle:' || $3 || ':completed:%'
+        ORDER BY event."sequence" DESC LIMIT 1) AS "toolResult",
+       COALESCE((SELECT jsonb_agg(jsonb_build_object(
+          'id', item."id", 'type', item."type", 'status', item."status", 'revision', item."revision", 'content', item."content"
+        ) ORDER BY item."revision", item."id")
+        FROM "agent_items" AS item
+        WHERE item."turnId" = turn."id" AND item."sessionId" = turn."sessionId"), '[]'::jsonb) AS "durableItems",
+       COALESCE((SELECT jsonb_agg(jsonb_build_object(
+          'id', event."id", 'sequence', event."sequence", 'type', event."type", 'idempotencyKey', event."idempotencyKey", 'payload', event."payload"
+        ) ORDER BY event."sequence", event."id")
+        FROM "agent_events" AS event
+        WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId"), '[]'::jsonb) AS "durableEvents"
+     FROM "agent_turns" AS turn WHERE turn."id" = $1 AND turn."sessionId" = $2`,
+    [turnId, sessionId, toolCallId],
+  )
+}
+
 type CheckpointResumeDiagnostics = {
   pool: Pool
   queue: Queue
@@ -660,7 +720,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
   const turnFixtureIds = new Set<string>()
   const fixtureSessionIds = new Set<string>()
   const auxiliaryUserIds = new Set<string>()
-  const checkpointJobIds = new Set<string>()
+  const fixtureJobIds = new Set<string>()
 
   beforeAll(async () => {
     process.env.REDIS_URL = redisUrl!
@@ -729,9 +789,9 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     } else if (turnQueue && typeof ids !== "undefined") {
       cleanupFailures.push("Turn fixture job cleanup skipped because a child Worker may still be running")
     }
-    if (pool && checkpointJobIds.size > 0) await attemptCleanup(cleanupFailures, "checkpoint fixture job cleanup", async () => {
-      await pool!.query(`DELETE FROM "Job" WHERE "id" = ANY($1::text[])`, [[...checkpointJobIds]])
-      checkpointJobIds.clear()
+    if (pool && fixtureJobIds.size > 0) await attemptCleanup(cleanupFailures, "fixture job cleanup", async () => {
+      await pool!.query(`DELETE FROM "Job" WHERE "id" = ANY($1::text[])`, [[...fixtureJobIds]])
+      fixtureJobIds.clear()
     })
     if (pool && typeof ids !== "undefined") await attemptCleanup(cleanupFailures, "fixture database cleanup", async () => {
       await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [ids.userId])
@@ -785,9 +845,9 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     if (pool && workersStopped && fixtureSessionIds.size > 0) await attemptCleanup(cleanupFailures, "after-test fixture session cleanup", async () => {
       await pool!.query(`DELETE FROM "agent_sessions" WHERE "id" = ANY($1::text[])`, [[...fixtureSessionIds]])
     })
-    if (pool && workersStopped && checkpointJobIds.size > 0) await attemptCleanup(cleanupFailures, "after-test checkpoint fixture job cleanup", async () => {
-      await pool!.query(`DELETE FROM "Job" WHERE "id" = ANY($1::text[])`, [[...checkpointJobIds]])
-      checkpointJobIds.clear()
+    if (pool && workersStopped && fixtureJobIds.size > 0) await attemptCleanup(cleanupFailures, "after-test fixture job cleanup", async () => {
+      await pool!.query(`DELETE FROM "Job" WHERE "id" = ANY($1::text[])`, [[...fixtureJobIds]])
+      fixtureJobIds.clear()
     })
     if (pool && workersStopped) for (const userId of auxiliaryUserIds) await attemptCleanup(cleanupFailures, `after-test auxiliary user ${userId} cleanup`, async () => {
       await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [userId])
@@ -812,7 +872,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     await pool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
       VALUES ($1, $2, 'Recover the same Turn after a durable checkpoint', 'running', 'test', CURRENT_TIMESTAMP)`, [sessionId, userId])
     if (kind === "approval") {
-      checkpointJobIds.add(jobId)
+      fixtureJobIds.add(jobId)
       await pool!.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "updatedAt")
         VALUES ($1, $2, 'Fixture Employer', 'Fixture Engineer', CURRENT_TIMESTAMP)`, [jobId, userId])
     }
@@ -1005,7 +1065,15 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     const suffix = randomUUID()
     ids.suffix = suffix
     ids.sessionId = `duplicate-redelivery-session-${suffix}`
+    const readCallId = `duplicate-read:${suffix}`
+    const readJobId = `duplicate-job:${suffix}`
     fixtureSessionIds.add(ids.sessionId)
+    fixtureJobIds.add(readJobId)
+    await pool!.query(
+      `INSERT INTO "Job" ("id", "userId", "company", "role", "description", "updatedAt")
+       VALUES ($1, $2, $3, 'Fixture Engineer', $4, CURRENT_TIMESTAMP)`,
+      [readJobId, ids.userId, `Fixture Employer ${suffix}`, `Persisted read evidence ${suffix}`],
+    )
     await pool!.query(
       `INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
        VALUES ($1, $2, 'Exercise same-ID Turn redelivery', 'running', 'test', CURRENT_TIMESTAMP)`,
@@ -1050,31 +1118,46 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     expect(completedJob.id).toBe(jobId)
     expect(await completedJob.getState()).toBe("completed")
     const originalTimestamp = completedJob.timestamp
-    const firstReceipt = await pool!.query<{
-      status: string
-      leaseOwnerId: string | null
-      leaseVersion: number
-      finalResponse: string | null
-      finalItemCount: string
-      completionEventCount: string
-    }>(
-      `SELECT turn."status", turn."leaseOwnerId", turn."leaseVersion", turn."finalResponse",
-         (SELECT COUNT(*)::text FROM "agent_items" AS item
-          WHERE item."turnId" = turn."id" AND item."sessionId" = turn."sessionId" AND item."type" = 'agent_message') AS "finalItemCount",
-         (SELECT COUNT(*)::text FROM "agent_events" AS event
-          WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId"
-            AND event."idempotencyKey" = 'turn:' || turn."id" || ':event:turn-completed') AS "completionEventCount"
-       FROM "agent_turns" AS turn WHERE turn."id" = $1 AND turn."sessionId" = $2`,
-      [ids.turnId, ids.sessionId],
-    )
+    const firstReceipt = await duplicateRedeliveryReceipt(pool!, ids.turnId, ids.sessionId, readCallId)
     expect(firstReceipt.rows[0]).toMatchObject({
       status: "completed",
       leaseOwnerId: null,
       leaseVersion: 1,
       finalItemCount: "1",
+      toolCallStartedEventCount: "1",
+      toolCallCompletedEventCount: "1",
       completionEventCount: "1",
+      toolCallStarted: {
+        toolCallId: readCallId,
+        toolName: "jobs.search",
+        status: "started",
+        input: { target: suffix, limit: 1 },
+      },
+      toolResult: {
+        toolCallId: readCallId,
+        toolName: "jobs.search",
+        status: "completed",
+        errorCode: null,
+        output: {
+          jobs: [expect.objectContaining({
+            id: readJobId,
+            company: `Fixture Employer ${suffix}`,
+            role: "Fixture Engineer",
+            description: `Persisted read evidence ${suffix}`,
+          })],
+          page: 1,
+          hasMore: false,
+        },
+      },
     })
     expect(firstReceipt.rows[0]?.finalResponse).toContain(`single-side-effect-${suffix}`)
+    const verifiedFinal = JSON.parse(firstReceipt.rows[0]?.finalResponse ?? "null") as { completed?: boolean; evidenceRefs?: string[] }
+    expect(verifiedFinal).toMatchObject({ completed: true })
+    expect(verifiedFinal.evidenceRefs).toEqual(expect.arrayContaining([readCallId, `read:job:${readJobId}`]))
+    expect(Number(firstReceipt.rows[0]?.durableItemCount)).toBeGreaterThan(0)
+    expect(Number(firstReceipt.rows[0]?.durableEventCount)).toBeGreaterThan(0)
+    const firstModelCalls = workerOne.output.filter(line => line.startsWith("DUPLICATE_MODEL_CALL "))
+    expect(firstModelCalls).toEqual(["DUPLICATE_MODEL_CALL 1", "DUPLICATE_MODEL_CALL 2"])
 
     // BullMQ's retry script requeues this retained completed record in place.
     // Pausing the queue keeps the same job hash observable before redelivery.
@@ -1091,25 +1174,9 @@ describeWithServices("production bootstrap recovery across a Worker process rest
 
     const replayDelivery = await waitForLine(workerOne, "DUPLICATE_DELIVERY_FINISHED_2 ")
     expect(replayDelivery).toBe(`DUPLICATE_DELIVERY_FINISHED_2 ${jobId} skipped lease_not_available`)
-    const finalReceipt = await pool!.query<{
-      status: string
-      leaseOwnerId: string | null
-      leaseVersion: number
-      finalResponse: string | null
-      finalItemCount: string
-      completionEventCount: string
-    }>(
-      `SELECT turn."status", turn."leaseOwnerId", turn."leaseVersion", turn."finalResponse",
-         (SELECT COUNT(*)::text FROM "agent_items" AS item
-          WHERE item."turnId" = turn."id" AND item."sessionId" = turn."sessionId" AND item."type" = 'agent_message') AS "finalItemCount",
-         (SELECT COUNT(*)::text FROM "agent_events" AS event
-          WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId"
-            AND event."idempotencyKey" = 'turn:' || turn."id" || ':event:turn-completed') AS "completionEventCount"
-       FROM "agent_turns" AS turn WHERE turn."id" = $1 AND turn."sessionId" = $2`,
-      [ids.turnId, ids.sessionId],
-    )
+    const finalReceipt = await duplicateRedeliveryReceipt(pool!, ids.turnId, ids.sessionId, readCallId)
     expect(finalReceipt.rows[0]).toEqual(firstReceipt.rows[0])
-    expect(workerOne.output.filter(line => line.startsWith("DUPLICATE_MODEL_CALL "))).toEqual(["DUPLICATE_MODEL_CALL 1"])
+    expect(workerOne.output.filter(line => line.startsWith("DUPLICATE_MODEL_CALL "))).toEqual(firstModelCalls)
     expect(workerOne.output.filter(line => line.startsWith("DUPLICATE_DELIVERY_FINISHED_")).map(line => line.split(" ").slice(2))).toEqual([
       [jobId, "completed", "none"],
       [jobId, "skipped", "lease_not_available"],
