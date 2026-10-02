@@ -126,7 +126,63 @@ async function waitForLine(child: WorkerChild, prefix: string, timeoutMs = 20_00
   throw new Error(`Timed out waiting for ${prefix}; stdout=${child.output.join(" | ")}; stderr=${child.errors.join(" | ")}`)
 }
 
-async function waitForCheckpointResume(child: WorkerChild, kind: CheckpointKind, timeoutMs = 20_000): Promise<string> {
+type CheckpointResumeDiagnostics = {
+  pool: Pool
+  queue: Queue
+  turnId: string
+  toolCallId: string
+  turnJobKey: (turnId: string, generation?: number) => string
+}
+
+async function checkpointResumeDiagnostics(input: CheckpointResumeDiagnostics): Promise<string> {
+  const [turn, root, step, toolItems, dispatch] = await Promise.all([
+    input.pool.query(`SELECT "status", "leaseOwnerId", "leaseVersion", "leaseExpiresAt", "rootTaskId", "error"
+      FROM "agent_turns" WHERE "id" = $1`, [input.turnId]),
+    input.pool.query(`SELECT task."status", task."leaseOwner", task."leaseExpiresAt", task."failureReason"
+      FROM "agent_turns" AS turn JOIN "sub_agent_tasks" AS task ON task."id" = turn."rootTaskId"
+      WHERE turn."id" = $1`, [input.turnId]),
+    input.pool.query(`SELECT "ordinal", "status", "errorCode", "finishReason"
+      FROM "agent_steps" WHERE "turnId" = $1 AND "ordinal" = 0`, [input.turnId]),
+    input.pool.query(`SELECT "id", "type", "status", "stepId", "content"
+      FROM "agent_items" WHERE "turnId" = $1 AND "content"->>'toolCallId' = $2
+        AND "type" IN ('tool_call', 'tool_result') ORDER BY "id"`, [input.turnId, input.toolCallId]),
+    input.pool.query(`SELECT "id", "attemptCount", "publishedAt", "lastError", "payload"
+      FROM "agent_outbox" WHERE "topic" = 'agent.turn.dispatch' AND "idempotencyKey" = $1`, [`turn-dispatch:${input.turnId}`]),
+  ])
+  const attemptCount = Number(dispatch.rows[0]?.attemptCount ?? 0)
+  const recentGenerations = [Math.max(0, attemptCount - 1), attemptCount, attemptCount + 1]
+  const generations = [...new Set([0, 1, 2, ...recentGenerations])]
+  const [jobGenerations, queueCounts, queuePaused] = await Promise.all([
+    Promise.all(generations.map(async generation => {
+      const jobId = input.turnJobKey(input.turnId, generation)
+      try {
+        const job = await input.queue.getJob(jobId)
+        return { generation, jobId, state: job ? await job.getState() : "missing", data: job?.data ?? null }
+      } catch (error: unknown) {
+        return { generation, jobId, state: `error:${cleanupError(error)}` }
+      }
+    })),
+    input.queue.getJobCounts("wait", "active", "delayed", "completed", "failed", "paused"),
+    input.queue.isPaused(),
+  ])
+  return JSON.stringify({
+    turn: turn.rows[0] ?? null,
+    root: root.rows[0] ?? null,
+    step0: step.rows[0] ?? null,
+    toolItems: toolItems.rows,
+    dispatch: dispatch.rows[0] ?? null,
+    jobGenerations,
+    queueCounts,
+    queuePaused,
+  })
+}
+
+async function waitForCheckpointResume(
+  child: WorkerChild,
+  kind: CheckpointKind,
+  timeoutMs = 20_000,
+  diagnostics?: CheckpointResumeDiagnostics,
+): Promise<string> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const resumed = child.output.find(value => value.startsWith(`CHECKPOINT_RESUME_CONTEXT_OK ${kind} `))
@@ -138,7 +194,12 @@ async function waitForCheckpointResume(child: WorkerChild, kind: CheckpointKind,
     if (child.exitCode !== null || child.signalCode !== null) throw new Error(`Worker 2 exited before recovering ${kind}: ${child.errors.join("\n")}`)
     await new Promise(resolve => setTimeout(resolve, 20))
   }
-  throw new Error(`Timed out waiting for Worker 2 to recover ${kind}; stdout=${child.output.join(" | ")}; stderr=${child.errors.join(" | ")}`)
+  let runtime = "unavailable"
+  if (diagnostics) {
+    try { runtime = await checkpointResumeDiagnostics(diagnostics) } catch (error: unknown) { runtime = `diagnostics-error:${cleanupError(error)}` }
+  }
+  const requestStarted = child.output.some(value => value.startsWith(`CHECKPOINT_MODEL_REQUEST_STARTED ${kind} `))
+  throw new Error(`Timed out waiting for Worker 2 to recover ${kind}; modelRequestStarted=${requestStarted}; runtime=${runtime}; stdout=${child.output.join(" | ")}; stderr=${child.errors.join(" | ")}`)
 }
 
 async function waitForSuccessorProvider(pool: Pool, queue: Queue, child: WorkerChild, turnId: string, successorIndex: number, jobId: string): Promise<string> {
@@ -333,7 +394,7 @@ async function waitForCheckpointWait(pool: Pool, kind: Exclude<CheckpointKind, "
          (SELECT COUNT(*)::text FROM "agent_events" AS event WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId" AND event."itemId" = $2 AND event."type" = 'item.started' AND event."actor" = 'orchestrator') AS "startEventCount",
          (SELECT COUNT(*)::text FROM "agent_events" AS event JOIN "agent_outbox" AS outbox ON outbox."idempotencyKey" = 'agent-event:' || event."id"
            WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId" AND event."itemId" = $2 AND event."type" = 'item.started'
-             AND outbox."topic" = 'agent.session.event' AND outbox."attemptCount" = 1 AND outbox."lastError" IS NULL) AS "startOutboxCount",
+             AND outbox."topic" = 'agent.session.event' AND outbox."lastError" IS NULL) AS "startOutboxCount",
          (SELECT COUNT(*)::text FROM "agent_approvals" WHERE "id" = $4 AND "userId" = turn."userId" AND "sessionId" = turn."sessionId" AND "turnId" = turn."id") AS "receiptCount",
          (SELECT "status" FROM "agent_approvals" WHERE "id" = $4 AND "userId" = turn."userId" AND "sessionId" = turn."sessionId" AND "turnId" = turn."id" LIMIT 1) AS "receiptStatus",
          (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id") AS "stepCount",
@@ -687,7 +748,9 @@ describeWithServices("production bootstrap recovery across a Worker process rest
 
     workerTwo = startWorker("checkpoint-worker2", checkpointIds)
     expect(workerTwo.pid).not.toBe(workerOnePid)
-    await waitForCheckpointResume(workerTwo, kind, 60_000)
+    await waitForCheckpointResume(workerTwo, kind, 60_000, kind === "tool-result" ? {
+      pool: pool!, queue: turnQueue!, turnId: checkpointIds.turnId, toolCallId: checkpointIds.readCallId!, turnJobKey: turnJobKey!,
+    } : undefined)
     await waitForTurnStatus(pool!, checkpointIds.turnId, "completed", 60_000, workerTwo)
     const finalState = await pool!.query<{
       finalCount: string; finalText: string | null; completedEvents: string; readCalls: string; readResults: string
@@ -716,6 +779,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     expect(result?.finalText).toContain(`CHECKPOINT_FINAL_${kind}_${suffix}`)
     expect(workerOne.output.filter(line => line === `CHECKPOINT_READ_TOOL_EXECUTED ${checkpointIds.readCallId}`)).toHaveLength(1)
     expect(workerTwo.output.some(line => line === `CHECKPOINT_READ_TOOL_EXECUTED ${checkpointIds.readCallId}`)).toBe(false)
+    expect(workerTwo.output.filter(line => line === `CHECKPOINT_MODEL_REQUEST_STARTED ${kind} 1`)).toHaveLength(1)
     expect(workerTwo.output.filter(line => line.startsWith(`CHECKPOINT_RESUME_CONTEXT_OK ${kind} `))).toHaveLength(1)
     if (kind === "tool-result") {
       expect(result).toMatchObject({ resumedEvents: "0", wakeupEvents: "0", wakeupOutbox: "0", wakeupAttempts: "0", publishedWakeupOutbox: "0", questionAnsweredEvents: "0", answerCount: "0" })

@@ -681,10 +681,35 @@ function checkpointToolRuntime() {
 
 async function checkpointResumeEvidence(state, request) {
   const checkpoint = checkpointInputs()
-  const observations = JSON.stringify(state.snapshot.toolObservations)
-  if (observations.split(checkpoint.readCallId).length - 1 !== 1
-    || observations.split("durable-read-result:" + ids.suffix).length - 1 !== 1) {
+  const expectedProof = "durable-read-result:" + ids.suffix
+  const matchingObservations = state.snapshot.toolObservations.filter(observation =>
+    observation.id === "tool-result:" + checkpoint.readCallId
+    && observation.content?.toolCallId === checkpoint.readCallId
+    && observation.content?.toolName === "jobs.search"
+    && observation.content?.status === "completed"
+    && observation.content?.output?.proof === expectedProof)
+  const callObservations = state.snapshot.toolObservations.filter(observation => observation.content?.toolCallId === checkpoint.readCallId)
+  const proofObservations = state.snapshot.toolObservations.filter(observation => observation.content?.output?.proof === expectedProof)
+  if (matchingObservations.length !== 1 || callObservations.length !== 1 || proofObservations.length !== 1) {
     throw new Error("checkpoint_resume_missing_unique_durable_read_result")
+  }
+  if (checkpoint.checkpointKind === "tool-result") {
+    const requestParts = request.messages.flatMap((message, messageIndex) => Array.isArray(message.content)
+      ? message.content.map((part, partIndex) => ({ message, messageIndex, partIndex, part })) : [])
+    const toolUses = requestParts.filter(entry => entry.part?.type === "tool_use" && entry.part.id === checkpoint.readCallId)
+    const toolResults = requestParts.filter(entry => entry.part?.type === "tool_result" && entry.part.toolUseId === checkpoint.readCallId)
+    const toolUse = toolUses[0]
+    const toolResult = toolResults[0]
+    const input = toolUse?.part.input
+    const inputMatches = input && typeof input === "object" && !Array.isArray(input)
+      && Object.keys(input).length === 1 && input.fixture === ids.suffix
+    if (toolUses.length !== 1 || toolUse.message.role !== "assistant"
+      || toolUse.part.name !== "jobs.search" || !inputMatches
+      || toolResults.length !== 1 || toolResult.message.role !== "tool"
+      || toolUse.messageIndex >= toolResult.messageIndex
+      || toolResult.part.content !== JSON.stringify({ proof: expectedProof })) {
+      throw new Error("checkpoint_tool_result_model_request_not_unique_restored")
+    }
   }
   if (checkpoint.checkpointKind === "question") {
     const item = await pool.query(`SELECT "status", "content" FROM "agent_items" WHERE "id" = $1 AND "turnId" = $2 AND "type" = 'question'`, ["agent-wait:question:" + checkpoint.checkpointWaitId, ids.turnId])
@@ -780,6 +805,7 @@ async function makeCheckpointWorker(firstWorker) {
               async *stream(request) {
                 modelCalls += 1
                 if (modelCalls !== 1) throw new Error("unexpected_checkpoint_worker2_model_round")
+                say("CHECKPOINT_MODEL_REQUEST_STARTED " + checkpoint.checkpointKind + " " + modelCalls)
                 const proof = await checkpointResumeEvidence(state, request)
                 say("CHECKPOINT_RESUME_CONTEXT_OK " + checkpoint.checkpointKind + " " + proof)
                 yield { type: "text_delta", text: "Recovered durable checkpoint after Worker restart for request: Resume and report the persisted child result. CHECKPOINT_FINAL_" + checkpoint.checkpointKind + "_" + ids.suffix + "_" + proof }
