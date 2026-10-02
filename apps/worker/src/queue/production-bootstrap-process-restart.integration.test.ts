@@ -130,22 +130,35 @@ type CheckpointResumeDiagnostics = {
   pool: Pool
   queue: Queue
   turnId: string
+  sessionId: string
+  checkpointKind: CheckpointKind
+  waitId: string
   toolCallId: string
   turnJobKey: (turnId: string, generation?: number) => string
 }
 
 async function checkpointResumeDiagnostics(input: CheckpointResumeDiagnostics): Promise<string> {
-  const [turn, root, step, toolItems, dispatch] = await Promise.all([
-    input.pool.query(`SELECT "status", "leaseOwnerId", "leaseVersion", "leaseExpiresAt", "rootTaskId", "error"
+  const waitItemId = `agent-wait:${input.checkpointKind}:${input.waitId}`
+  const [turn, root, steps, toolItems, waitItem, wakeupEvent, wakeupOutbox, dispatch] = await Promise.all([
+    input.pool.query(`SELECT "status", "revision", "leaseOwnerId", "leaseVersion", "leaseExpiresAt", "rootTaskId", "error"
       FROM "agent_turns" WHERE "id" = $1`, [input.turnId]),
     input.pool.query(`SELECT task."status", task."leaseOwner", task."leaseExpiresAt", task."failureReason"
-      FROM "agent_turns" AS turn JOIN "sub_agent_tasks" AS task ON task."id" = turn."rootTaskId"
+      FROM "agent_turns" AS turn LEFT JOIN "sub_agent_tasks" AS task ON task."id" = turn."rootTaskId"
       WHERE turn."id" = $1`, [input.turnId]),
     input.pool.query(`SELECT "ordinal", "status", "errorCode", "finishReason"
-      FROM "agent_steps" WHERE "turnId" = $1 AND "ordinal" = 0`, [input.turnId]),
+      FROM "agent_steps" WHERE "turnId" = $1 ORDER BY "ordinal"`, [input.turnId]),
     input.pool.query(`SELECT "id", "type", "status", "stepId", "content"
       FROM "agent_items" WHERE "turnId" = $1 AND "content"->>'toolCallId' = $2
         AND "type" IN ('tool_call', 'tool_result') ORDER BY "id"`, [input.turnId, input.toolCallId]),
+    input.pool.query(`SELECT "id", "type", "status", "content"
+      FROM "agent_items" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`, [waitItemId, input.sessionId, input.turnId]),
+    input.pool.query(`SELECT "id", "sequence", "itemId", "idempotencyKey", "payload"
+      FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3
+        AND "type" = 'turn.wakeup' AND "payload"->>'waitId' = $4 ORDER BY "sequence"`,
+    [input.sessionId, input.turnId, waitItemId, input.waitId]),
+    input.pool.query(`SELECT "id", "idempotencyKey", "attemptCount", "publishedAt", "lastError", "payload"
+      FROM "agent_outbox" WHERE "topic" = 'agent.turn.wakeup' AND "aggregateId" = $1
+        AND "payload"->>'turnId' = $2 ORDER BY "createdAt", "id"`, [input.sessionId, input.turnId]),
     input.pool.query(`SELECT "id", "attemptCount", "publishedAt", "lastError", "payload"
       FROM "agent_outbox" WHERE "topic" = 'agent.turn.dispatch' AND "idempotencyKey" = $1`, [`turn-dispatch:${input.turnId}`]),
   ])
@@ -168,8 +181,11 @@ async function checkpointResumeDiagnostics(input: CheckpointResumeDiagnostics): 
   return JSON.stringify({
     turn: turn.rows[0] ?? null,
     root: root.rows[0] ?? null,
-    step0: step.rows[0] ?? null,
+    steps: steps.rows,
     toolItems: toolItems.rows,
+    waitItem: waitItem.rows[0] ?? null,
+    scopedWakeupEvents: wakeupEvent.rows,
+    wakeupOutboxRows: wakeupOutbox.rows,
     dispatch: dispatch.rows[0] ?? null,
     jobGenerations,
     queueCounts,
@@ -748,14 +764,16 @@ describeWithServices("production bootstrap recovery across a Worker process rest
 
     workerTwo = startWorker("checkpoint-worker2", checkpointIds)
     expect(workerTwo.pid).not.toBe(workerOnePid)
-    await waitForCheckpointResume(workerTwo, kind, 60_000, kind === "tool-result" ? {
-      pool: pool!, queue: turnQueue!, turnId: checkpointIds.turnId, toolCallId: checkpointIds.readCallId!, turnJobKey: turnJobKey!,
-    } : undefined)
+    await waitForCheckpointResume(workerTwo, kind, 60_000, {
+      pool: pool!, queue: turnQueue!, turnId: checkpointIds.turnId, sessionId: checkpointIds.sessionId,
+      checkpointKind: kind, waitId: checkpointIds.checkpointWaitId!, toolCallId: checkpointIds.readCallId!, turnJobKey: turnJobKey!,
+    })
     await waitForTurnStatus(pool!, checkpointIds.turnId, "completed", 60_000, workerTwo)
     const finalState = await pool!.query<{
       finalCount: string; finalText: string | null; completedEvents: string; readCalls: string; readResults: string
       initialReadSteps: string; resumedEvents: string; wakeupEvents: string; wakeupOutbox: string; wakeupAttempts: string
-      wakeupPublishedAt: string | null; publishedWakeupOutbox: string; questionAnsweredEvents: string; answerCount: string
+      wakeupEventIdempotencyKey: string | null; wakeupPublishedAt: string | null; publishedWakeupOutbox: string
+      questionAnsweredEvents: string; answerCount: string
     }>(`SELECT
         (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'agent_message' AND "phase" = 'final_answer') AS "finalCount",
         (SELECT "content"->>'text' FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'agent_message' AND "phase" = 'final_answer' LIMIT 1) AS "finalText",
@@ -764,16 +782,29 @@ describeWithServices("production bootstrap recovery across a Worker process rest
         (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_result' AND "content"->>'toolCallId' = $2) AS "readResults",
         (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" = 0) AS "initialReadSteps",
         (SELECT COUNT(*)::text FROM "agent_events" WHERE "turnId" = turn."id" AND "type" = 'turn.resumed') AS "resumedEvents",
-        (SELECT COUNT(*)::text FROM "agent_events" WHERE "turnId" = turn."id" AND "type" = 'turn.wakeup') AS "wakeupEvents",
-        (SELECT COUNT(*)::text FROM "agent_outbox" WHERE "topic" = 'agent.turn.wakeup' AND "idempotencyKey" = $3) AS "wakeupOutbox",
-        (SELECT COALESCE(MAX("attemptCount"), 0)::text FROM "agent_outbox" WHERE "topic" = 'agent.turn.wakeup' AND "idempotencyKey" = $3) AS "wakeupAttempts",
-        (SELECT MAX("publishedAt")::text FROM "agent_outbox" WHERE "topic" = 'agent.turn.wakeup' AND "idempotencyKey" = $3) AS "wakeupPublishedAt",
-        (SELECT COUNT(*)::text FROM "agent_outbox" WHERE "topic" = 'agent.turn.wakeup' AND "idempotencyKey" = $3
-          AND "publishedAt" IS NOT NULL AND "attemptCount" = 1 AND "lastError" IS NULL) AS "publishedWakeupOutbox",
+        (SELECT COUNT(*)::text FROM "agent_events" AS event WHERE event."sessionId" = turn."sessionId" AND event."turnId" = turn."id"
+          AND event."itemId" = $7 AND event."type" = 'turn.wakeup' AND event."payload"->>'waitId' = $6) AS "wakeupEvents",
+        (SELECT MAX(event."idempotencyKey") FROM "agent_events" AS event WHERE event."sessionId" = turn."sessionId" AND event."turnId" = turn."id"
+          AND event."itemId" = $7 AND event."type" = 'turn.wakeup' AND event."payload"->>'waitId' = $6) AS "wakeupEventIdempotencyKey",
         (SELECT COUNT(*)::text FROM "agent_events" WHERE "turnId" = turn."id" AND "type" = 'question.answered') AS "questionAnsweredEvents",
-        (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'question' AND "content"->>'answer' = $4) AS "answerCount"
-      FROM "agent_turns" AS turn WHERE turn."id" = $1 AND turn."sessionId" = $5 AND turn."userId" = $6`,
-    [checkpointIds.turnId, checkpointIds.readCallId, `agent-wait-command:checkpoint-command:${suffix}:wakeup`, checkpointIds.checkpointAnswer, sessionId, userId])
+        (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'question' AND "content"->>'answer' = $3) AS "answerCount",
+        wakeup."outboxCount" AS "wakeupOutbox", wakeup."attempts" AS "wakeupAttempts",
+        wakeup."publishedAt" AS "wakeupPublishedAt", wakeup."publishedCount" AS "publishedWakeupOutbox"
+      FROM "agent_turns" AS turn
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*)::text AS "outboxCount", COALESCE(MAX(outbox."attemptCount"), 0)::text AS "attempts",
+          MAX(outbox."publishedAt")::text AS "publishedAt",
+          COUNT(*) FILTER (WHERE outbox."publishedAt" IS NOT NULL AND outbox."attemptCount" = 1 AND outbox."lastError" IS NULL)::text AS "publishedCount"
+        FROM "agent_events" AS event
+        JOIN "agent_outbox" AS outbox ON outbox."idempotencyKey" = 'agent-event:' || event."id"
+          AND outbox."payload"->>'eventId' = event."id" AND outbox."aggregateId" = turn."sessionId"
+          AND outbox."topic" = 'agent.turn.wakeup'
+        WHERE event."sessionId" = turn."sessionId" AND event."turnId" = turn."id"
+          AND event."itemId" = $7 AND event."type" = 'turn.wakeup' AND event."payload"->>'waitId' = $6
+      ) AS wakeup ON TRUE
+      WHERE turn."id" = $1 AND turn."sessionId" = $4 AND turn."userId" = $5`,
+    [checkpointIds.turnId, checkpointIds.readCallId, checkpointIds.checkpointAnswer, sessionId, userId,
+      checkpointIds.checkpointWaitId, `agent-wait:${kind}:${checkpointIds.checkpointWaitId}`])
     const result = finalState.rows[0]
     expect(result).toMatchObject({ finalCount: "1", completedEvents: "1", readCalls: "1", readResults: "1", initialReadSteps: "1" })
     expect(result?.finalText).toContain(`CHECKPOINT_FINAL_${kind}_${suffix}`)
@@ -783,8 +814,10 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     expect(workerTwo.output.filter(line => line.startsWith(`CHECKPOINT_RESUME_CONTEXT_OK ${kind} `))).toHaveLength(1)
     if (kind === "tool-result") {
       expect(result).toMatchObject({ resumedEvents: "0", wakeupEvents: "0", wakeupOutbox: "0", wakeupAttempts: "0", publishedWakeupOutbox: "0", questionAnsweredEvents: "0", answerCount: "0" })
+      expect(result?.wakeupEventIdempotencyKey).toBeNull()
     } else {
       expect(result).toMatchObject({ resumedEvents: "1", wakeupEvents: "1", wakeupOutbox: "1", wakeupAttempts: "1", publishedWakeupOutbox: "1" })
+      expect(result?.wakeupEventIdempotencyKey).toBe(`agent-wait-command:checkpoint-command:${suffix}:wakeup`)
       expect(result?.wakeupPublishedAt).toBeTruthy()
     }
     if (kind === "question") {
