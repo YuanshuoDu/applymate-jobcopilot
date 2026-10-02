@@ -1177,7 +1177,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     const finalReceipt = await duplicateRedeliveryReceipt(pool!, ids.turnId, ids.sessionId, readCallId)
     expect(finalReceipt.rows[0]).toEqual(firstReceipt.rows[0])
     expect(workerOne.output.filter(line => line.startsWith("DUPLICATE_MODEL_CALL "))).toEqual(firstModelCalls)
-    expect(workerOne.output.filter(line => line.startsWith("DUPLICATE_DELIVERY_FINISHED_")).map(line => line.split(" ").slice(2))).toEqual([
+    expect(workerOne.output.filter(line => line.startsWith("DUPLICATE_DELIVERY_FINISHED_")).map(line => line.split(" ").slice(1))).toEqual([
       [jobId, "completed", "none"],
       [jobId, "skipped", "lease_not_available"],
     ])
