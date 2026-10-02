@@ -17,7 +17,7 @@
 | V3 staging approval/decline/expiry browser smoke | **WAIVED / NOT VERIFIED** |
 | 48h dual-write integrity observation | **WAIVED / NOT VERIFIED** |
 | V3 SSE disconnect/reconnect replay item | **OBSERVED / OWNER-ACCEPTED** |
-| Current #387 / Phase 5 activation state | **BLOCKED pending Claude/PM §1.8 Exit decision** |
+| Current #387 / Phase 5 activation state | **GO by owner waiver for Phase 5 implementation only; recorded 2026-10-01 in #387 comment 5932720327** |
 | Production rollout or flag promotion | **Not authorized by this waiver** |
 
 This document records an explicit owner exception. It does not manufacture a 48h measurement, convert a missing report into a PASS, or remove the two-person approval control for high-risk configuration changes.
@@ -35,7 +35,7 @@ This document records an explicit owner exception. It does not manufacture a 48h
 
 The owner explicitly [waived the V3 staging approval/decline/expiry browser smoke and the V5 48-hour dual-write report](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/387#issuecomment-5931612168). Both checks were not run for this gate decision and must remain `WAIVED / NOT VERIFIED`; neither may be shown as PASS. The owner retained the staging SSE disconnect/reconnect item. The already attached PR #392 trace meets that item as [ruled by the owner](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/387#issuecomment-5929863153), so it must not be rerun merely to duplicate evidence.
 
-The 2026-10-01 decision adds the named staging approval-smoke waiver to the 2026-09-01 48-hour waiver. These waivers do not themselves satisfy the latest #387 requirement to record a §1.8 Exit decision; the issue and Phase 5 activation remain **BLOCKED pending Claude/PM review**. The linked §1.8 Exit Report asks the PM to decide whether the separate Worker-originated original-Turn wakeup runtime gap is included in the staging smoke waiver or requires follow-up. The worker/Redis producer path was not exercised by the SSE replay trace. No waiver authorizes staging flag mutation, production rollout, evidence-complete Phase 4 `completed`, or bypass of later Phase 5 gates.
+The 2026-10-01 §1.8 decision recorded in #387 comment 5932720327 is **GO under the owner waiver for Phase 5 implementation only**. The staging approval/decline/expiry browser smoke and 48-hour dual-write report remain `WAIVED / NOT VERIFIED`. The separate Worker-originated original-Turn wakeup runtime gap remains **UNVERIFIED** and is accepted under the named approval-smoke waiver for Phase 5 implementation only; the worker/Redis producer path was not exercised by the SSE replay trace, and this runtime item must be re-verified before any staging or production activation. Phase 4 is not evidence-complete `completed`; staging control-plane/database binding and the #519 audit-chain deployment readback remain unverified. Production rollout and flag promotion remain **NO-GO**; this decision does not authorize staging flag mutation or bypass later Phase 5 gates.
 
 ## Explicitly waived items
 
@@ -78,4 +78,4 @@ This exception does not waive any of the following:
 
 ## Reviewer handoff
 
-`@claude` should review the linked §1.8 Exit Report and record the formal Gate decision. Until then, #387 and Phase 5 activation stay blocked. The report requests a conditional GO only for Phase 5 implementation; the staging approval smoke and 48-hour integrity report remain not verified, the SSE replay item is observed and owner-accepted, and Phase 4 is not evidence-complete. Production enablement remains separately gated.
+`@claude` should review the linked §1.8 Exit Report, which records the formal decision as **GO by owner waiver for Phase 5 implementation only** in #387 comment 5932720327 on 2026-10-01. The staging approval smoke and 48-hour integrity report remain `WAIVED / NOT VERIFIED`, the SSE replay item is observed and owner-accepted, and Phase 4 is not evidence-complete `completed`. Production rollout and flag promotion remain **NO-GO** pending their own evidence and approval.
