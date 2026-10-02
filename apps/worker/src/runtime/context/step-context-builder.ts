@@ -144,6 +144,8 @@ function block(layer: ContextLayer, role: ContextRole, trust: ContextTrust, sour
   return { id: id(blockId, "block id"), layer, role, trust, source, content: json(content) }
 }
 
+function isAttachmentBlock(item: ContextBlock): boolean { return item.content !== null && typeof item.content === "object" && !Array.isArray(item.content) && "attachmentId" in item.content }
+
 function referenceContent(reference: BusinessReference): Record<string, JsonValue> {
   const result: Record<string, JsonValue> = { referenceId: reference.id, kind: reference.kind }
   if (reference.label !== undefined) result.label = reference.label
@@ -197,7 +199,7 @@ export class StepContextBuilder {
     const persisted = await transaction.getCheckpoint({ ...request, lease: request.lease })
     const claimed = await transaction.claimInputs({
       sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId, checkpoint: persisted,
-      mode, lease: request.lease, now: request.now ?? this.clock(),
+      mode, lease: request.lease, now: request.now ?? this.clock(), rootInputId: request.rootInputId,
     })
     ensureTurnInputs(claimed.inputs, request)
     const activeIds = activeMarkerInputIds(request.steeringMarkerState?.active, request.rootInputId, request.steeringMarkerState?.active.length ? {
@@ -236,7 +238,7 @@ export class StepContextBuilder {
     for (const entry of request.snapshot.steerHistory) blocks.push(block("steer_history", "data", "external_untrusted", "steer_history", `history:${entry.id}`, entry.content))
     for (const reference of [...request.snapshot.businessRefs].sort((left, right) => left.kind.localeCompare(right.kind) || left.id.localeCompare(right.id))) blocks.push(block("business", "data", referenceTrust(reference.kind), "business_reference", `business:${reference.kind}:${reference.id}`, referenceContent(reference)))
     for (const observation of request.snapshot.toolObservations) blocks.push(block("tool_observation", "data", "external_untrusted", "tool_or_subagent", `observation:${observation.id}`, observation.content))
-    for (const input of contextInputs) if (input.id !== request.rootInputId) blocks.push(...await pendingInputBlocks(input, this.ownerFence, request.scope, block, message => new ContextOwnershipError("reference_owner_mismatch", message)))
+    for (const input of contextInputs) blocks.push(...(await pendingInputBlocks(input, this.ownerFence, request.scope, block, message => new ContextOwnershipError("reference_owner_mismatch", message))).filter(item => input.id !== request.rootInputId || isAttachmentBlock(item)))
     const ordered = blocks.sort((left, right) => layerOrder.indexOf(left.layer) - layerOrder.indexOf(right.layer))
     const result = {
       schemaVersion: "agent-harness.v2" as const, sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId,

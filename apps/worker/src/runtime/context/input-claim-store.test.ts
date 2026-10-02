@@ -9,7 +9,7 @@ import { buildObservedSteeringMarker } from "./steering-marker-store.js"
 const scope = { userId: "user-a" }
 const createdAt = new Date("2026-09-01T16:00:00.000Z")
 
-type FakeOptions = { sessionStatus?: string; sessionVisible?: boolean; sessionUserId?: string; turnVisible?: boolean; leaseValid?: boolean; failOn?: string; activeRow?: Record<string, unknown> | null; candidateDelivery?: "steer" | "follow_up"; followUpRows?: Record<string, unknown>[] }
+type FakeOptions = { sessionStatus?: string; sessionVisible?: boolean; sessionUserId?: string; turnVisible?: boolean; leaseValid?: boolean; failOn?: string; activeRow?: Record<string, unknown> | null; candidateDelivery?: "steer" | "follow_up"; followUpRows?: Record<string, unknown>[]; existingRows?: Record<string, unknown>[] }
 
 function row(overrides: Record<string, unknown> = {}) {
   return {
@@ -39,14 +39,14 @@ function makeClient(options: FakeOptions = {}) {
       }
       if (text.includes('FROM "sub_agent_tasks"')) return { rows: values[0] === "task-a" ? [{ id: "task-a" }] : [] }
       if (text.startsWith('SELECT "id", "turnId", "taskId", "type", "actor", "correlationId", "payload", "sequence" FROM "agent_events"')) return { rows: [] }
-      if (text.includes("WITH candidates")) return { rows: [row({ id: "input-2", delivery: options.candidateDelivery ?? "steer", acceptedSequence: "5" })] }
-      if (text.includes('FROM "agent_inputs"') && text.includes('"delivery" = \'follow_up\'')) return { rows: options.followUpRows ?? [] }
+      if (text.includes("WITH candidates")) return { rows: (options.candidateDelivery !== "follow_up" || values[6] === "input-2") ? [row({ id: "input-2", delivery: options.candidateDelivery ?? "steer", acceptedSequence: "5" })] : [] }
+      if (text.includes('FROM "agent_inputs"') && text.includes('"delivery" = \'follow_up\'')) return { rows: (options.followUpRows ?? []).filter(input => input.id === values[3]) }
       if (text.includes('FROM "agent_inputs"') && text.includes("FOR SHARE")) return { rows: options.activeRow === null ? [] : [row(options.activeRow ?? {})] }
       if (text.startsWith("UPDATE \"agent_sessions\"")) return { rows: [{ eventSequence: "9" }] }
       if (text.startsWith('INSERT INTO "agent_events"')) return { rowCount: 1, rows: [] }
       if (text.startsWith('INSERT INTO "agent_outbox"')) return { rowCount: 1, rows: [] }
       if (text.includes('FROM "agent_steps"')) return { rows: [{ inputThroughSequence: "0", consumedInputIds: [] }] }
-      if (text.includes('FROM "agent_inputs"') && text.includes("FOR UPDATE")) return { rows: [] }
+      if (text.includes('FROM "agent_inputs"') && text.includes("FOR UPDATE")) return { rows: options.existingRows ?? [] }
       if (text.includes('UPDATE "agent_steps"')) return { rowCount: 1, rows: [] }
       throw new Error(`unexpected SQL: ${text}`)
     }),
@@ -146,32 +146,60 @@ describe("PostgreSQL AgentInput claim store", () => {
     expect(fake.client.query).not.toHaveBeenCalledWith(expect.stringContaining("ROLLBACK"))
   })
 
-  it("claims accepted follow-ups through the same FIFO, fenced checkpoint path", async () => {
+  it("claims only the promoted root follow-up through the same FIFO, fenced checkpoint path", async () => {
     const fake = makeClient({ candidateDelivery: "follow_up" })
     let result: Awaited<ReturnType<InputClaimTransaction["claimInputs"]>> | undefined
     await createPgInputClaimStore(fake.pool, scope).withTransaction(async tx => {
-      result = await tx.claimInputs({ sessionId: "session-a", turnId: "turn-a", stepId: "step-a", checkpoint: { inputThroughSequence: 0n, consumedInputIds: [] }, now: createdAt })
+      result = await tx.claimInputs({ sessionId: "session-a", turnId: "turn-a", stepId: "step-a", checkpoint: { inputThroughSequence: 0n, consumedInputIds: [] }, now: createdAt, rootInputId: "input-2" })
     })
 
     const query = fake.calls.find(call => call.text.includes("WITH candidates"))
     expect(query?.text).toContain('"delivery" IN (\'steer\', \'follow_up\')')
     expect(result?.inputs.map(input => input.delivery)).toEqual(["follow_up"])
     expect(result?.newlyClaimedInputIds).toEqual(["input-2"])
+    expect(query?.values?.[6]).toBe("input-2")
   })
 
-  it("rehydrates previously consumed follow-ups for a later Turn step regardless of its cursor", async () => {
-    const priorFollowUp = row({ id: "follow-up-1", delivery: "follow_up", status: "consumed", consumedByStepId: "step-0", acceptedSequence: "4" })
-    const fake = makeClient({ followUpRows: [priorFollowUp] })
+  it("does not claim a pending follow-up that is not the Turn root input", async () => {
+    const fake = makeClient({ candidateDelivery: "follow_up" })
     let result: Awaited<ReturnType<InputClaimTransaction["claimInputs"]>> | undefined
     await createPgInputClaimStore(fake.pool, scope).withTransaction(async tx => {
-      result = await tx.claimInputs({ sessionId: "session-a", turnId: "turn-a", stepId: "step-2", checkpoint: { inputThroughSequence: 99n, consumedInputIds: [] }, now: createdAt })
+      result = await tx.claimInputs({ sessionId: "session-a", turnId: "turn-a", stepId: "step-a", checkpoint: { inputThroughSequence: 0n, consumedInputIds: [] }, now: createdAt })
+    })
+
+    expect(result?.inputs).toEqual([])
+    expect(result?.newlyClaimedInputIds).toEqual([])
+    expect(fake.calls.find(call => call.text.includes("WITH candidates"))?.values?.[6]).toBeNull()
+  })
+
+  it("rehydrates only the promoted root follow-up for a later Turn step", async () => {
+    const priorFollowUp = row({ id: "follow-up-1", delivery: "follow_up", status: "consumed", consumedByStepId: "step-0", acceptedSequence: "4" })
+    const laterFollowUp = row({ id: "follow-up-2", delivery: "follow_up", status: "consumed", consumedByStepId: "step-1", acceptedSequence: "5" })
+    const fake = makeClient({ followUpRows: [priorFollowUp, laterFollowUp] })
+    let result: Awaited<ReturnType<InputClaimTransaction["claimInputs"]>> | undefined
+    await createPgInputClaimStore(fake.pool, scope).withTransaction(async tx => {
+      result = await tx.claimInputs({ sessionId: "session-a", turnId: "turn-a", stepId: "step-2", checkpoint: { inputThroughSequence: 99n, consumedInputIds: [] }, now: createdAt, rootInputId: "follow-up-1" })
     })
 
     expect(result?.inputs.filter(input => input.delivery === "follow_up").map(input => [input.id, input.acceptedSequence])).toEqual([["follow-up-1", 4n]])
     expect(result?.inputs.find(input => input.id === "follow-up-1")?.consumedByStepId).toBe("step-0")
     const replay = fake.calls.find(call => call.text.includes('"delivery" = \'follow_up\'') && call.text.includes("FOR SHARE"))
     expect(replay?.text).not.toContain('"acceptedSequence" >')
-    expect(replay?.values).toEqual(["session-a", "turn-a", "user-a"])
+    expect(replay?.text).toContain('"id" = $4')
+    expect(replay?.values).toEqual(["session-a", "turn-a", "user-a", "follow-up-1"])
+  })
+
+  it("replays a consumed checkpoint ID even when the root-input fence is absent", async () => {
+    const consumed = row({ id: "follow-up-1", delivery: "follow_up", status: "consumed", consumedByStepId: "step-old" })
+    const fake = makeClient({ existingRows: [consumed] })
+    let result: Awaited<ReturnType<InputClaimTransaction["claimInputs"]>> | undefined
+    await createPgInputClaimStore(fake.pool, scope).withTransaction(async tx => {
+      result = await tx.claimInputs({ sessionId: "session-a", turnId: "turn-a", stepId: "step-new", checkpoint: { inputThroughSequence: 4n, consumedInputIds: ["follow-up-1"] }, now: createdAt, mode: "rebuild" })
+    })
+
+    expect(result?.inputs.map(input => input.id)).toEqual(["follow-up-1"])
+    expect(result?.newlyClaimedInputIds).toEqual([])
+    expect(fake.calls.find(call => call.text.includes("WITH candidates"))).toBeUndefined()
   })
 
   it("hydrates active steering inputs with a tenant, Turn, and steer delivery fence", async () => {

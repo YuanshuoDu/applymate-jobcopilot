@@ -133,6 +133,17 @@ type TaskGraphItemRow = {
 }
 type TurnQueueFactory = NonNullable<Parameters<typeof createProductionWorkerBootstrap>[0]["turnQueueFactory"]>
 
+function recordTaskGraphFixtureLease(
+  lease: Pick<SubagentTaskRecord, "sessionId" | "turnId" | "goal">,
+  owner: Fixture,
+  dispatchedGoals: string[],
+): void {
+  if (lease.sessionId !== owner.sessionId || lease.turnId !== owner.turnId) {
+    throw new Error("Foreign subagent lease rejected by TaskGraph fixture")
+  }
+  dispatchedGoals.push(lease.goal)
+}
+
 function record(value: unknown): RecordValue | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as RecordValue : null
 }
@@ -3693,6 +3704,25 @@ describe("TaskGraph restart fixture service boundary", () => {
   }, 120_000)
 })
 
+describe("TaskGraph fixture lease guard unit", () => {
+  it("rejects a mismatched lease identity before recording its goal", () => {
+    const owner = fixture()
+    const foreignLease = {
+      sessionId: `foreign-${owner.sessionId}`,
+      turnId: `foreign-${owner.turnId}`,
+      goal: "Foreign lease fixture",
+    }
+    const dispatchedGoals: string[] = []
+    expect(() => recordTaskGraphFixtureLease(foreignLease, owner, dispatchedGoals))
+      .toThrow("Foreign subagent lease rejected by TaskGraph fixture")
+    expect(dispatchedGoals).toEqual([])
+
+    const unguardedGoals: string[] = []
+    unguardedGoals.push(foreignLease.goal)
+    expect(unguardedGoals).toEqual([foreignLease.goal])
+  })
+})
+
 describeWithServices("production TaskGraph lifecycle and root resume (disposable PostgreSQL + Redis)", () => {
   const owner = fixture()
   const failureOwner = fixture()
@@ -5448,9 +5478,76 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       if (workerTwo) {
         try { await stopProcessFixture(workerTwo) } catch (error) { teardownFailures.push("Worker 2: " + String(error)) }
       }
+      // artifactOwner is suite-scoped; retire its task rows and unlinked outbox before the next fixture runs.
+      try {
+        await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [artifactOwner.sessionId])
+      } catch (error: unknown) {
+        teardownFailures.push("Selected-job outbox cleanup: " + String(error))
+      }
+      try {
+        await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [artifactOwner.userId])
+      } catch (error: unknown) {
+        teardownFailures.push("Selected-job User cleanup: " + String(error))
+      }
       if (teardownFailures.length > 0) throw new Error("P3 Worker process teardown failed:\n" + teardownFailures.join("\n"))
     }
   }, 240_000)
+
+  it("rejects a claimed foreign runnable lease before recording its goal", async () => {
+    const foreignOwner = fixture()
+    const expectedOwner = fixture()
+    const foreignGoal = `AC4_FOREIGN_RUNNABLE_${foreignOwner.suffix}`
+    const dispatchedGoals: string[] = []
+    let cleanupFixture = false
+    try {
+      cleanupFixture = true
+      await seed(pool!, foreignOwner, "waiting_for_user")
+      const store = new PgSubagentTaskStore(pool!, 300_000)
+      const policy = { ...defaultSubagentPolicy(), maxAttempts: 1 }
+      const task = await store.create({
+        userId: foreignOwner.userId,
+        sessionId: foreignOwner.sessionId,
+        turnId: foreignOwner.turnId,
+        role: "supervisor",
+        taskType: "task_graph",
+        goal: foreignGoal,
+        allowedActions: [],
+        expectedOutputSchema: {},
+        toolPolicySnapshot: {},
+        budgetSnapshot: { limits: { maxSteps: 1, maxToolCalls: 1 } },
+        policy,
+      })
+      // This creates a real PostgreSQL lease without claiming that a Worker dispatched it.
+      const lease = await store.claim({
+        taskId: task.id,
+        sessionId: task.sessionId,
+        ownerId: foreignOwner.ownerId,
+        policy,
+        now: new Date(),
+      })
+      if (!lease) throw new Error("Foreign runnable task did not acquire a disposable lease")
+      expect(lease).toMatchObject({
+        sessionId: foreignOwner.sessionId,
+        turnId: foreignOwner.turnId,
+        goal: foreignGoal,
+        status: "running",
+        leaseOwner: foreignOwner.ownerId,
+      })
+
+      expect(() => recordTaskGraphFixtureLease(lease, expectedOwner, dispatchedGoals))
+        .toThrow("Foreign subagent lease rejected by TaskGraph fixture")
+      expect(dispatchedGoals).toEqual([])
+
+      const unguardedGoals: string[] = []
+      unguardedGoals.push(lease.goal)
+      expect(unguardedGoals).toEqual([foreignGoal])
+    } finally {
+      if (cleanupFixture) {
+        await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [foreignOwner.sessionId])
+        await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [foreignOwner.userId])
+      }
+    }
+  })
 
   it("cancels a dependent node after prerequisite failure without dispatching it", async () => {
     const [
@@ -5840,7 +5937,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         intervalMs: 10,
         async execute({ lease }) {
           await waitForSuspendedParent(pool!, owner.turnId)
-          dispatchedGoals.push(lease.goal)
+          recordTaskGraphFixtureLease(lease, owner, dispatchedGoals)
           if (lease.goal === sourceGoal) {
             const running = await pool!.query<{ status: string }>(
               `SELECT "status" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`,

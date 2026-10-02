@@ -11,6 +11,7 @@ import { consumeDurableWaitOutcomes } from "./subagents/durable-wait-consumer.js
 import { restoreCanonicalSteeringMarkers, priorConversation, type SteeringMarkerState } from "./canonical-steering-markers.js"
 import { STEERING_MARKER_EVENT_TYPE } from "./context/steering-marker.js"
 import { COGNITIVE_AGENDA_EVENT_TYPE, parseCognitiveAgendaReceipt, type CognitiveAgendaReceipt } from "./turns/cognitive-agenda-receipt.js"
+import { recoverAnsweredQuestionHistory } from "./question-answer-recovery.js"
 
 export type CanonicalTurnState = {
   readonly scope: TenantScope
@@ -130,12 +131,12 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     if (!turn) throw new Error("turn_not_owned")
     const consumedWaits = options.consumeWaitOutcomes ? await consumeDurableWaitOutcomes({ client, lease, turn, now }) : []
     const stepsResult = await client.query<Row>(
-      `SELECT "id", "ordinal", "attempt", "inputThroughSequence", "consumedInputIds", "inputTokens", "outputTokens", "estimatedCostUsd"
+      `SELECT "id", "taskId", "ordinal", "attempt", "inputThroughSequence", "consumedInputIds", "inputTokens", "outputTokens", "estimatedCostUsd"
        FROM "agent_steps" WHERE "turnId" = $1 AND "sessionId" = $2 AND ("taskId" IS NULL OR "taskId" = $3)
        ORDER BY "ordinal" ASC, "attempt" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId],
     )
     const itemsResult = await client.query<Row>(
-      `SELECT "id", "stepId", "type", "status", "revision", "content" FROM "agent_items" WHERE "turnId" = $1 AND "sessionId" = $2
+      `SELECT "id", "stepId", "taskId", "type", "status", "revision", "content" FROM "agent_items" WHERE "turnId" = $1 AND "sessionId" = $2
        AND ("taskId" IS NULL OR "taskId" = $3) AND "type" IN ('tool_call', 'tool_result') ORDER BY "createdAt" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId],
     )
     const eventsResult = await client.query<Row>(
@@ -150,6 +151,8 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     const priorInputs = await client.query<Row>(
       `SELECT "id", "targetTurnId", "content", "acceptedSequence", 'user' AS "historyRole", "acceptedSequence" AS "historySequence" FROM "agent_inputs"
        WHERE "sessionId" = $1 AND "userId" = $2 AND "targetTurnId" IS NOT NULL AND "targetTurnId" <> $3
+         AND NOT ("delivery" = 'follow_up' AND "status" IN ('accepted', 'queued')
+           AND "consumedByStepId" IS NULL AND "consumedAt" IS NULL AND "cancelledAt" IS NULL)
        ORDER BY "acceptedSequence" ASC`, [lease.sessionId, lease.userId, lease.turnId],
     )
     const priorItems = await client.query<Row>(
@@ -204,11 +207,12 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
         if (right.sequence === null) return -1
         return left.sequence < right.sequence ? -1 : left.sequence > right.sequence ? 1 : left.id.localeCompare(right.id)
       })
+    const questionHistory = await recoverAnsweredQuestionHistory(client, { lease, rootTaskId, steps: stepsResult.rows, toolItems: itemsResult.rows, existingHistory: snapshot.steerHistory })
     const seenHistory = new Set(snapshot.steerHistory.map(item => item.id))
     snapshot = {
       ...snapshot,
       goal: { id: `turn-goal:${lease.turnId}`, content: goal },
-      steerHistory: [...snapshot.steerHistory, ...history.filter(item => !seenHistory.has(item.id)).map(({ sequence: _sequence, ...item }) => item)],
+      steerHistory: [...snapshot.steerHistory, ...history.filter(item => !seenHistory.has(item.id)).map(({ sequence: _sequence, ...item }) => item), ...questionHistory],
       toolObservations: [...snapshot.toolObservations, ...restoredNew, ...consumedWaits.filter(item => !seenWithRestored.has(item.id))],
     }
     const steps = stepsResult.rows

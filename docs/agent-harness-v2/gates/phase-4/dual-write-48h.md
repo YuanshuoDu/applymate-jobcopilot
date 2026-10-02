@@ -22,7 +22,7 @@ completion block would make the Gate ambiguous.
 | Report status | `WAIVED_NOT_VERIFIED` |
 | Gate decision | **GO BY OWNER WAIVER FOR PHASE 5; AC2 NOT VERIFIED** |
 | Evidence authority | Owner-approved exception; ordinary completion still requires an authorized staging operator |
-| Phase sequencing | Phase 5 is unlocked by the named waiver; production remains separately gated |
+| Phase sequencing | #387's recorded §1.8 decision (2026-10-01) authorizes Phase 5 implementation under the owner waiver; production rollout and flag promotion remain separately NO-GO |
 
 ## Run metadata
 
@@ -913,6 +913,8 @@ Gate:
    snapshot/retention metadata to the restricted staging evidence location;
    link only the approved aggregate evidence from this report or the issue.
 
-Until an authorized operator completes that in-place update from staging,
-AC2 remains blocked and the Phase 4 Exit Gate remains `NOT PASSED`; this report
-does not unlock Phase 5.
+AC2 remains `WAIVED / NOT VERIFIED`, and Phase 4 is still not evidence-complete or
+marked `completed`. The separate §1.8 GO recorded in #387 authorizes Phase 5
+implementation under the owner waiver only. This measurement report does not
+itself grant that authorization. Staging or production activation remains
+unauthorized.

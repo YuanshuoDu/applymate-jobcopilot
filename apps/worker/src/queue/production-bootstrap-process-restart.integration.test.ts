@@ -2,9 +2,9 @@ import { randomUUID } from "node:crypto"
 import { spawn, type ChildProcess } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { Queue } from "bullmq"
-import { Pool } from "pg"
+import { Pool, type PoolClient } from "pg"
 import { Redis } from "ioredis"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const RESULT_MARKER = "durable-child-result-after-process-restart"
@@ -52,7 +52,21 @@ const databaseUrl = dedicatedDatabaseUrl()
 const redisUrl = dedicatedRedisUrl()
 const describeWithServices = databaseUrl && redisUrl ? describe : describe.skip
 
-type FixtureIds = { suffix: string; userId: string; sessionId: string; turnId: string; followUpInputId?: string }
+type FixtureFollowUp = { clientMessageId: string; text: string }
+type CheckpointKind = "approval" | "question" | "tool-result"
+type FixtureIds = {
+  suffix: string
+  userId: string
+  sessionId: string
+  turnId: string
+  followUps?: FixtureFollowUp[]
+  followUpCommand?: FixtureFollowUp & { userId?: string; sessionId?: string }
+  checkpointKind?: CheckpointKind
+  checkpointWaitId?: string
+  checkpointJobId?: string
+  checkpointAnswer?: string
+  readCallId?: string
+}
 type WorkerChild = ChildProcess & { output: string[]; errors: string[] }
 type ExitWaitContext = { stage: string; pid?: number; requestedSignal?: string; signalAccepted?: boolean; timeoutMs?: number }
 type CommandAcceptanceResult = {
@@ -66,7 +80,7 @@ type CommandAcceptance = { accepted: CommandAcceptanceResult; duplicate: Command
 const fixturePath = fileURLToPath(new URL("./production-bootstrap-process-restart.fixture.mjs", import.meta.url))
 const workerCwd = fileURLToPath(new URL("../..", import.meta.url))
 
-function startWorker(mode: "accept-message" | "park-parent" | "resume-parent" | "park-active-follow-up" | "accept-active-follow-up" | "resume-active-follow-up", ids: FixtureIds): WorkerChild {
+function startWorker(mode: "accept-message" | "park-parent" | "resume-parent" | "park-active-follow-up" | "accept-active-follow-up" | "resume-active-follow-up" | "replay-active-terminal" | "checkpoint-worker1" | "checkpoint-worker2" | "resolve-checkpoint", ids: FixtureIds): WorkerChild {
   const child = spawn(process.execPath, ["--import", "tsx", fixturePath, mode, JSON.stringify(ids)], {
     cwd: workerCwd,
     env: { ...process.env, DATABASE_URL: databaseUrl!, REDIS_URL: redisUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl! },
@@ -110,6 +124,230 @@ async function waitForLine(child: WorkerChild, prefix: string, timeoutMs = 20_00
     await new Promise(resolve => setTimeout(resolve, 20))
   }
   throw new Error(`Timed out waiting for ${prefix}; stdout=${child.output.join(" | ")}; stderr=${child.errors.join(" | ")}`)
+}
+
+type CheckpointResumeDiagnostics = {
+  pool: Pool
+  queue: Queue
+  turnId: string
+  sessionId: string
+  checkpointKind: CheckpointKind
+  waitId: string
+  toolCallId: string
+  turnJobKey: (turnId: string, generation?: number) => string
+}
+
+// These diagnostic tokens come from TurnEngineError, turnErrorCode/DLQ, and
+// the persisted status/finish-reason enums; unknown values are never echoed.
+const SAFE_DIAGNOSTIC_CODES = new Set([
+  "started", "streaming", "completed", "failed", "interrupted", "cancelled",
+  "waiting_for_tool", "waiting_for_approval", "waiting_for_user", "waiting_for_dependency",
+  "stop", "tool_calls",
+  "business_precondition_failed", "budget_exhausted", "cognitive_agenda_resume_fence_invalid",
+  "complete_provider_error", "durable_wait_receipt_invalid", "error", "evidence_conflict",
+  "evidence_missing", "execution_failed", "execution_lost", "final_unverified", "invalid_output",
+  "invalid_payload", "lease_lost", "lease_not_available", "max_retries_exhausted", "model_incomplete",
+  "no_progress", "persistence_conflict", "provider_error", "provider_unavailable", "schema_error",
+  "schema_invalid_payload", "step_limit", "tool_execution_failed", "tool_recovery_aborted",
+  "tool_result_replay_uncertain", "turn_execution_error", "turn_execution_failed",
+  "event_lineage_mismatch", "item_lineage_mismatch", "outbox_scope_mismatch", "processing_error", "tool_lineage_mismatch",
+  "turn_revision_conflict", "wait_scope_mismatch",
+  "question_recovery_answer_event_ambiguous", "question_recovery_answer_lineage_invalid",
+  "question_recovery_event_scope_invalid", "question_recovery_history_collision",
+  "question_recovery_history_duplicate", "question_recovery_history_order_invalid",
+  "question_recovery_history_pair_incomplete", "question_recovery_item_id_invalid",
+  "question_recovery_item_malformed", "question_recovery_item_scope_invalid",
+  "question_recovery_sequence_invalid", "question_recovery_start_event_ambiguous",
+  "question_recovery_start_lineage_invalid", "question_recovery_step_invalid",
+  "question_recovery_step_missing", "question_recovery_tool_lineage_invalid",
+  "wait_resume_session_sequence_unavailable", "wait_session_closed", "wait_turn_wake_fenced",
+])
+
+// Mirror the fixed event vocabulary in packages/agent-protocol/src/event.ts,
+// plus the two turn-loop events emitted locally.
+const SAFE_DIAGNOSTIC_EVENT_TYPES = new Set([
+  "turn.started", "turn.wakeup", "turn.resumed", "turn.completed", "turn.failed", "turn.interrupted",
+  "turn.no_progress", "turn.budget_exhausted", "step.started", "step.completed",
+  "item.started", "item.delta", "item.completed", "item.failed", "input.accepted", "input.consumed",
+  "tool_call.started", "tool_call.completed", "tool_call.failed", "policy.decision",
+  "approval.requested", "approval.resolved", "approval.consumed", "approval.expired",
+  "question.answered", "question.cancelled", "external_action.reserved",
+])
+
+function safeDiagnosticCode(value: unknown): string | null {
+  if (typeof value !== "string" || value.length === 0) return null
+  return SAFE_DIAGNOSTIC_CODES.has(value) ? value : "present"
+}
+
+function safeDiagnosticEventType(value: unknown): string {
+  return typeof value === "string" && SAFE_DIAGNOSTIC_EVENT_TYPES.has(value) ? value : "other"
+}
+
+async function checkpointResumeDiagnostics(input: CheckpointResumeDiagnostics): Promise<string> {
+  const waitItemId = `agent-wait:${input.checkpointKind}:${input.waitId}`
+  const [turn, root, steps, toolItems, waitItem, events, wakeupOutbox, dispatch] = await Promise.all([
+    input.pool.query(`SELECT "status", "revision", "leaseOwnerId" IS NOT NULL AS "hasLease",
+        "leaseVersion", "leaseExpiresAt" > NOW() AS "leaseActive", "rootTaskId"
+      FROM "agent_turns" WHERE "id" = $1`, [input.turnId]),
+    input.pool.query(`SELECT task."status", task."leaseOwner" IS NOT NULL AS "hasLease",
+        task."leaseExpiresAt" > NOW() AS "leaseActive"
+      FROM "agent_turns" AS turn LEFT JOIN "sub_agent_tasks" AS task ON task."id" = turn."rootTaskId"
+      WHERE turn."id" = $1`, [input.turnId]),
+    input.pool.query(`SELECT "ordinal", "status", "errorCode", "finishReason"
+      FROM "agent_steps" WHERE "turnId" = $1 ORDER BY "ordinal" DESC LIMIT 6`, [input.turnId]),
+    input.pool.query(`SELECT "type", "status", "stepId",
+        "content"->>'status' AS "contentStatus", "content"->>'errorCode' AS "errorCode"
+      FROM "agent_items" WHERE "turnId" = $1 AND "content"->>'toolCallId' = $2
+        AND "type" IN ('tool_call', 'tool_result') ORDER BY "id"`, [input.turnId, input.toolCallId]),
+    input.pool.query(`SELECT "type", "status", "content"->>'answerAvailable' AS "answerAvailable"
+      FROM "agent_items" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`, [waitItemId, input.sessionId, input.turnId]),
+    input.pool.query(`SELECT "sequence", "type", "payload"->>'reasonCode' AS "reasonCode",
+        "payload"->>'reason_code' AS "reasonCodeSnake", "payload"->>'errorCode' AS "errorCode",
+        "payload"->>'error_code' AS "errorCodeSnake"
+      FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
+      ORDER BY "sequence" DESC LIMIT 6`, [input.sessionId, input.turnId]),
+    input.pool.query(`SELECT "attemptCount", "publishedAt" IS NOT NULL AS "published", "lastError"
+      FROM "agent_outbox" WHERE "topic" = 'agent.turn.wakeup' AND "aggregateId" = $1
+        AND "payload"->>'turnId' = $2 ORDER BY "createdAt" DESC LIMIT 4`, [input.sessionId, input.turnId]),
+    input.pool.query(`SELECT "attemptCount", "publishedAt" IS NOT NULL AS "published", "lastError" IS NOT NULL AS "hasError"
+      FROM "agent_outbox" WHERE "topic" = 'agent.turn.dispatch' AND "idempotencyKey" = $1`, [`turn-dispatch:${input.turnId}`]),
+  ])
+  const attemptCount = Number(dispatch.rows[0]?.attemptCount ?? 0)
+  const recentGenerations = [Math.max(0, attemptCount - 1), attemptCount, attemptCount + 1]
+  const generations = [...new Set([0, 1, 2, ...recentGenerations])]
+  const [jobGenerations, queueCounts, queuePaused] = await Promise.all([
+    Promise.all(generations.map(async generation => {
+      const jobId = input.turnJobKey(input.turnId, generation)
+      try {
+        const job = await input.queue.getJob(jobId)
+        return { generation, state: job ? await job.getState() : "missing" }
+      } catch {
+        return { generation, state: "error" }
+      }
+    })),
+    input.queue.getJobCounts("wait", "active", "delayed", "completed", "failed", "paused")
+      .then(counts => ({ status: "ok" as const, counts }))
+      .catch(() => ({ status: "error" as const })),
+    input.queue.isPaused()
+      .then(paused => ({ status: "ok" as const, paused }))
+      .catch(() => ({ status: "error" as const })),
+  ])
+  const safeCode = (camel: unknown, snake?: unknown) => safeDiagnosticCode(camel) ?? safeDiagnosticCode(snake)
+  const snapshot = {
+    turn: turn.rows[0] ?? null,
+    root: root.rows[0] ?? null,
+    steps: steps.rows.map(row => ({ ...row, errorCode: safeDiagnosticCode(row.errorCode), finishReason: safeDiagnosticCode(row.finishReason) })),
+    toolItems: toolItems.rows.map(row => ({
+      type: row.type,
+      status: row.status,
+      stepId: row.stepId,
+      contentStatus: safeDiagnosticCode(row.contentStatus),
+      errorCode: safeDiagnosticCode(row.errorCode),
+    })),
+    waitItem: waitItem.rows[0] ? {
+      type: waitItem.rows[0].type,
+      status: waitItem.rows[0].status,
+      answerAvailable: waitItem.rows[0].answerAvailable === "true",
+    } : null,
+    events: events.rows.map(row => ({
+      sequence: row.sequence,
+      type: safeDiagnosticEventType(row.type),
+      reasonCode: safeCode(row.reasonCode, row.reasonCodeSnake),
+      errorCode: safeCode(row.errorCode, row.errorCodeSnake),
+    })),
+    wakeupOutbox: wakeupOutbox.rows.map(row => ({
+      attemptCount: row.attemptCount,
+      published: row.published,
+      lastError: safeDiagnosticCode(row.lastError),
+    })),
+    dispatch: dispatch.rows[0] ?? null,
+    jobs: jobGenerations,
+    queue: queueCounts,
+    queuePaused,
+  }
+  const serialized = JSON.stringify(snapshot)
+  if (serialized.length <= 1_400) return serialized
+
+  const compact = JSON.stringify({
+    diagnosticTruncated: true,
+    turn: snapshot.turn ? {
+      status: snapshot.turn.status,
+      revision: snapshot.turn.revision,
+      hasLease: snapshot.turn.hasLease,
+      leaseActive: snapshot.turn.leaseActive,
+    } : null,
+    root: snapshot.root ? {
+      status: snapshot.root.status,
+      hasLease: snapshot.root.hasLease,
+      leaseActive: snapshot.root.leaseActive,
+    } : null,
+    steps: snapshot.steps.slice(0, 3),
+    events: snapshot.events.slice(0, 4),
+    wakeupOutbox: snapshot.wakeupOutbox.slice(0, 2),
+    dispatch: snapshot.dispatch,
+    jobs: snapshot.jobs.slice(0, 3),
+    queue: snapshot.queue,
+  })
+  if (compact.length <= 1_400) return compact
+
+  const tinyFallback = JSON.stringify({ diagnosticTruncated: true })
+  return tinyFallback.length <= 1_400 ? tinyFallback : "{}"
+}
+
+async function waitForCheckpointResume(
+  child: WorkerChild,
+  kind: CheckpointKind,
+  timeoutMs = 20_000,
+  diagnostics?: CheckpointResumeDiagnostics,
+): Promise<string> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const resumed = child.output.find(value => value.startsWith(`CHECKPOINT_RESUME_CONTEXT_OK ${kind} `))
+    if (resumed) return resumed
+    if (kind === "question") {
+      const answerCount = child.output.find(value => value.startsWith("CHECKPOINT_QUESTION_CONTEXT_COUNT "))
+      if (answerCount) throw new Error(`Worker 2 did not receive exactly one durable question answer in its model request: ${answerCount}`)
+    }
+    if (child.exitCode !== null || child.signalCode !== null) throw new Error(`Worker 2 exited before recovering ${kind}: ${child.errors.join("\n")}`)
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  let runtime = "unavailable"
+  if (diagnostics) {
+    try { runtime = await checkpointResumeDiagnostics(diagnostics) } catch { runtime = "diagnostics-error" }
+  }
+  const requestStarted = child.output.some(value => value.startsWith(`CHECKPOINT_MODEL_REQUEST_STARTED ${kind} `))
+  const markers = {
+    workerReady: child.output.some(value => value.startsWith("CHECKPOINT_WORKER_READY worker2")),
+    modelRequestStarted: requestStarted,
+    resumeContextOk: child.output.some(value => value.startsWith(`CHECKPOINT_RESUME_CONTEXT_OK ${kind} `)),
+    questionContextCountSeen: child.output.some(value => value.startsWith("CHECKPOINT_QUESTION_CONTEXT_COUNT ")),
+  }
+  throw new Error(`Timed out waiting for Worker 2 to recover ${kind}; runtime=${runtime}; markers=${JSON.stringify(markers)}`)
+}
+
+async function waitForSuccessorProvider(pool: Pool, queue: Queue, child: WorkerChild, turnId: string, successorIndex: number, jobId: string): Promise<string> {
+  try {
+    return await waitForLine(child, `SUCCESSOR_PROVIDER_ACTIVE ${successorIndex}`)
+  } catch (error: unknown) {
+    const [turn, root, steps, inputs, dispatch, job, queueCounts, queuePaused] = await Promise.all([
+      pool.query(`SELECT "status", "leaseOwnerId", "leaseVersion", "rootTaskId", "error" FROM "agent_turns" WHERE "id" = $1`, [turnId]),
+      pool.query(`SELECT task."status", task."leaseOwner", task."failureReason" FROM "agent_turns" AS turn
+        JOIN "sub_agent_tasks" AS task ON task."id" = turn."rootTaskId" WHERE turn."id" = $1`, [turnId]),
+      pool.query(`SELECT "ordinal", "status", "errorCode", "finishReason" FROM "agent_steps" WHERE "turnId" = $1 ORDER BY "ordinal"`, [turnId]),
+      pool.query(`SELECT "id", "targetTurnId", "status", "consumedByStepId" FROM "agent_inputs" WHERE "targetTurnId" = $1 ORDER BY "acceptedSequence", "id"`, [turnId]),
+      pool.query(`SELECT "id", "attemptCount", "publishedAt", "lastError", "payload" FROM "agent_outbox"
+        WHERE "topic" = 'agent.turn.dispatch' AND "idempotencyKey" = $1`, [`turn-dispatch:${turnId}`]),
+      queue.getJob(jobId).then(async found => found ? { state: await found.getState(), data: found.data } : { state: "missing" }),
+      queue.getJobCounts("wait", "active", "delayed", "completed", "failed", "paused"),
+      queue.isPaused(),
+    ])
+    const events = await pool.query(`SELECT "type", "payload" FROM "agent_events" WHERE "turnId" = $1 AND "type" IN ('turn.failed', 'step.completed') ORDER BY "sequence" DESC LIMIT 5`, [turnId])
+    throw new Error(`${error instanceof Error ? error.message : String(error)}; successorRuntime=${JSON.stringify({
+      worker: { pid: child.pid, exited: workerHasExited(child), stdout: child.output, stderr: child.errors },
+      turn: turn.rows[0] ?? null, root: root.rows[0] ?? null, steps: steps.rows, inputs: inputs.rows,
+      dispatch: dispatch.rows[0] ?? null, job, queueCounts, queuePaused, events: events.rows,
+    })}`)
+  }
 }
 
 function exitWaitDiagnostics(child: WorkerChild, context: ExitWaitContext): string {
@@ -230,6 +468,82 @@ type WakeupDispatchRow = {
   payload: unknown
 }
 
+async function waitForCheckpointToolResult(pool: Pool, turnId: string, toolCallId: string): Promise<void> {
+  const deadline = Date.now() + 30_000
+  while (Date.now() < deadline) {
+    const result = await pool.query<{
+      calls: string; completedCalls: string; results: string; completedResults: string
+      resultStepId: string | null; callStepId: string | null; turnStatus: string; leaseOwnerId: string | null
+      leaseActive: boolean; rootTaskId: string | null; stepCount: string; readStepStatus: string | null; laterStepCount: string
+    }>(
+      `SELECT turn."status" AS "turnStatus", turn."leaseOwnerId", turn."rootTaskId",
+         turn."leaseExpiresAt" > CURRENT_TIMESTAMP AS "leaseActive",
+         (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_call' AND "content"->>'toolCallId' = $2) AS "calls",
+         (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_call' AND "status" = 'completed' AND "content"->>'toolCallId' = $2 AND "content"->>'status' = 'completed') AS "completedCalls",
+         (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_result' AND "content"->>'toolCallId' = $2) AS "results",
+         (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_result' AND "status" = 'completed' AND "content"->>'toolCallId' = $2) AS "completedResults",
+         (SELECT "stepId" FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_result' AND "content"->>'toolCallId' = $2 LIMIT 1) AS "resultStepId",
+         (SELECT "stepId" FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_call' AND "content"->>'toolCallId' = $2 LIMIT 1) AS "callStepId",
+         (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id") AS "stepCount",
+         (SELECT "status" FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" = 0 LIMIT 1) AS "readStepStatus",
+         (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" > 0) AS "laterStepCount"
+       FROM "agent_turns" AS turn WHERE turn."id" = $1`,
+      [turnId, toolCallId],
+    )
+    const row = result.rows[0]
+    if (row?.calls === "1" && row.completedCalls === "1" && row.results === "1" && row.completedResults === "1"
+      && row.turnStatus === "in_progress" && row.leaseOwnerId && row.leaseActive && row.rootTaskId
+      && row.stepCount === "1" && row.readStepStatus === "streaming" && row.laterStepCount === "0"
+      && row.resultStepId === row.callStepId) return
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  throw new Error(`Timed out waiting for a durable completed checkpoint tool result with its active lease and no downstream step for ${toolCallId}`)
+}
+
+async function waitForCheckpointWait(pool: Pool, kind: Exclude<CheckpointKind, "tool-result">, ids: FixtureIds): Promise<void> {
+  const itemId = `agent-wait:${kind}:${ids.checkpointWaitId}`
+  const deadline = Date.now() + 20_000
+  while (Date.now() < deadline) {
+    const result = await pool.query<{
+      turnStatus: string; leaseOwnerId: string | null; rootTaskId: string | null; leaseActive: boolean
+      itemCount: string; itemStatus: string | null; itemContent: Record<string, unknown> | null
+      startEventCount: string; startOutboxCount: string; receiptStatus: string | null; receiptCount: string
+      stepCount: string; readStepStatus: string | null; waitStepStatus: string | null; postWaitStepCount: string
+    }>(
+      `SELECT turn."status" AS "turnStatus", turn."leaseOwnerId", turn."rootTaskId", turn."leaseExpiresAt" > CURRENT_TIMESTAMP AS "leaseActive",
+         (SELECT COUNT(*)::text FROM "agent_items" AS item WHERE item."id" = $2 AND item."sessionId" = turn."sessionId" AND item."turnId" = turn."id" AND item."type" = $3) AS "itemCount",
+         (SELECT item."status" FROM "agent_items" AS item WHERE item."id" = $2 AND item."sessionId" = turn."sessionId" AND item."turnId" = turn."id" AND item."type" = $3 LIMIT 1) AS "itemStatus",
+         (SELECT item."content" FROM "agent_items" AS item WHERE item."id" = $2 AND item."sessionId" = turn."sessionId" AND item."turnId" = turn."id" AND item."type" = $3 LIMIT 1) AS "itemContent",
+         (SELECT COUNT(*)::text FROM "agent_events" AS event WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId" AND event."itemId" = $2 AND event."type" = 'item.started' AND event."actor" = 'orchestrator') AS "startEventCount",
+         (SELECT COUNT(*)::text FROM "agent_events" AS event JOIN "agent_outbox" AS outbox ON outbox."idempotencyKey" = 'agent-event:' || event."id"
+           WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId" AND event."itemId" = $2 AND event."type" = 'item.started'
+             AND outbox."topic" = 'agent.session.event' AND outbox."lastError" IS NULL) AS "startOutboxCount",
+         (SELECT COUNT(*)::text FROM "agent_approvals" WHERE "id" = $4 AND "userId" = turn."userId" AND "sessionId" = turn."sessionId" AND "turnId" = turn."id") AS "receiptCount",
+         (SELECT "status" FROM "agent_approvals" WHERE "id" = $4 AND "userId" = turn."userId" AND "sessionId" = turn."sessionId" AND "turnId" = turn."id" LIMIT 1) AS "receiptStatus",
+         (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id") AS "stepCount",
+         (SELECT "status" FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" = 0 LIMIT 1) AS "readStepStatus",
+         (SELECT "status" FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" = 1 LIMIT 1) AS "waitStepStatus",
+         (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" > 1) AS "postWaitStepCount"
+       FROM "agent_turns" AS turn WHERE turn."id" = $1 AND turn."sessionId" = $5 AND turn."userId" = $6`,
+      [ids.turnId, itemId, kind === "approval" ? "approval_request" : "question", ids.checkpointWaitId, ids.sessionId, ids.userId],
+    )
+    const row = result.rows[0]
+    const expectedTurnStatus = kind === "approval" ? "waiting_for_approval" : "waiting_for_user"
+    const content = row?.itemContent
+    const contentMatches = kind === "approval"
+      ? content?.waitKind === "approval" && content.approvalId === ids.checkpointWaitId && content.toolCallId === ids.readCallId
+      : content?.waitKind === "question" && content.questionId === ids.checkpointWaitId && content.toolCallId === ids.readCallId
+        && typeof content.question === "string" && Array.isArray(content.options) && content.answer === null && content.answerAvailable === false
+    if (row?.turnStatus === expectedTurnStatus && row.leaseOwnerId && row.rootTaskId && row.leaseActive
+      && row.itemCount === "1" && row.itemStatus === "started" && contentMatches
+      && row.startEventCount === "1" && row.startOutboxCount === "1"
+      && (kind === "question" || (row.receiptCount === "1" && row.receiptStatus === "pending"))
+      && row.stepCount === "2" && row.readStepStatus === "completed" && row.waitStepStatus === "streaming" && row.postWaitStepCount === "0") return
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  throw new Error(`Timed out waiting for durable ${kind} wait rows and the actual waiting model-step boundary for ${ids.checkpointWaitId}`)
+}
+
 type WakeupDispatchSnapshot = {
   dispatchBeforeRestart: { rows: WakeupDispatchRow[] }
   wakeupJob: Awaited<ReturnType<Queue["getJob"]>>
@@ -302,9 +616,13 @@ describeWithServices("production bootstrap recovery across a Worker process rest
   let childTaskId: string | undefined
   let wakeupGeneration: number | undefined
   const turnFixtureIds = new Set<string>()
+  const fixtureSessionIds = new Set<string>()
+  const auxiliaryUserIds = new Set<string>()
+  const checkpointJobIds = new Set<string>()
 
   beforeAll(async () => {
     process.env.REDIS_URL = redisUrl!
+    process.env.DATABASE_URL = databaseUrl!
     const [turnModule, turnQueueModule, childModule] = await Promise.all([
       import("../runtime/turns/recovery-scanner.js"),
       import("../runtime/turns/turn-queue.js"),
@@ -327,6 +645,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
       turnId: `process-restart-turn-pending-${suffix}`,
     }
     turnFixtureIds.add(ids.turnId)
+    fixtureSessionIds.add(ids.sessionId)
     await pool.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`, [ids.userId, `${ids.userId}@example.invalid`])
     await pool.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
       VALUES ($1, $2, 'Resume a parent Turn after its child completes', 'running', 'test', CURRENT_TIMESTAMP)`, [ids.sessionId, ids.userId])
@@ -352,6 +671,10 @@ describeWithServices("production bootstrap recovery across a Worker process rest
         })
       } else cleanupFailures.push("Turn queue remains paused in disposable Redis DB 15 because a child Worker is still alive")
     }
+    if (pool && workersStopped) for (const sessionId of fixtureSessionIds) await attemptCleanup(cleanupFailures, `turn fixture discovery for ${sessionId}`, async () => {
+      const turns = await pool!.query<{ id: string }>(`SELECT "id" FROM "agent_turns" WHERE "sessionId" = $1`, [sessionId])
+      for (const turn of turns.rows) turnFixtureIds.add(turn.id)
+    })
     if (turnQueue && turnJobKey && redis && workersStopped && typeof ids !== "undefined") {
       turnFixtureIds.add(ids.turnId)
       for (const turnId of turnFixtureIds) {
@@ -364,8 +687,15 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     } else if (turnQueue && typeof ids !== "undefined") {
       cleanupFailures.push("Turn fixture job cleanup skipped because a child Worker may still be running")
     }
+    if (pool && checkpointJobIds.size > 0) await attemptCleanup(cleanupFailures, "checkpoint fixture job cleanup", async () => {
+      await pool!.query(`DELETE FROM "Job" WHERE "id" = ANY($1::text[])`, [[...checkpointJobIds]])
+      checkpointJobIds.clear()
+    })
     if (pool && typeof ids !== "undefined") await attemptCleanup(cleanupFailures, "fixture database cleanup", async () => {
       await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [ids.userId])
+    })
+    if (pool) for (const userId of auxiliaryUserIds) await attemptCleanup(cleanupFailures, `auxiliary user ${userId} cleanup`, async () => {
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [userId])
     })
     if (childTaskId && childQueue && childJobKey) await attemptCleanup(cleanupFailures, "subagent job cleanup", async () => {
       await childQueue!.getJob(childJobKey!(childTaskId!))?.then(job => job?.remove())
@@ -382,10 +712,262 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     if (cleanupFailures.length > 0) throw new Error(`Process-restart fixture cleanup failed:\n${cleanupFailures.join("\n")}`)
   })
 
+  afterEach(async () => {
+    const cleanupFailures: string[] = []
+    const children = [...new Set([commandAcceptance, workerOne, workerTwo].filter((child): child is WorkerChild => child !== undefined))]
+    for (const [index, child] of children.entries()) {
+      if (workerHasExited(child)) continue
+      const failure = await stopWorkerForCleanup(child, `process-restart-after-test-${index + 1}`)
+      if (failure) cleanupFailures.push(failure)
+    }
+    const workersStopped = children.every(workerHasExited)
+    if (turnQueuePaused && turnQueue) {
+      if (workersStopped) {
+        await attemptCleanup(cleanupFailures, "after-test Turn queue resume", async () => {
+          await turnQueue!.resume()
+          turnQueuePaused = false
+        })
+      } else cleanupFailures.push("after-test Turn queue remains paused because a child Worker is still alive")
+    }
+    if (pool && workersStopped) for (const sessionId of fixtureSessionIds) await attemptCleanup(cleanupFailures, `after-test Turn discovery for ${sessionId}`, async () => {
+      const turns = await pool!.query<{ id: string }>(`SELECT "id" FROM "agent_turns" WHERE "sessionId" = $1`, [sessionId])
+      for (const turn of turns.rows) turnFixtureIds.add(turn.id)
+    })
+    if (turnQueue && turnJobKey && redis && workersStopped) for (const turnId of turnFixtureIds) {
+      for (let generation = 0; generation <= Math.max(8, wakeupGeneration ?? 0); generation += 1) {
+        await attemptCleanup(cleanupFailures, `after-test Turn job ${generation} cleanup`, async () => {
+          await removeTurnFixtureJobAfterWorkersExit(turnQueue!, redis!, turnJobKey!(turnId, generation))
+        })
+      }
+    }
+    if (pool && workersStopped && fixtureSessionIds.size > 0) await attemptCleanup(cleanupFailures, "after-test fixture session cleanup", async () => {
+      await pool!.query(`DELETE FROM "agent_sessions" WHERE "id" = ANY($1::text[])`, [[...fixtureSessionIds]])
+    })
+    if (pool && workersStopped && checkpointJobIds.size > 0) await attemptCleanup(cleanupFailures, "after-test checkpoint fixture job cleanup", async () => {
+      await pool!.query(`DELETE FROM "Job" WHERE "id" = ANY($1::text[])`, [[...checkpointJobIds]])
+      checkpointJobIds.clear()
+    })
+    if (pool && workersStopped) for (const userId of auxiliaryUserIds) await attemptCleanup(cleanupFailures, `after-test auxiliary user ${userId} cleanup`, async () => {
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [userId])
+    })
+    if (cleanupFailures.length > 0) throw new Error(`Process-restart per-test cleanup failed:\n${cleanupFailures.join("\n")}`)
+  })
+
+  async function resumeAtDurableCheckpoint(kind: CheckpointKind): Promise<void> {
+    const suffix = randomUUID()
+    const userId = `checkpoint-user-${suffix}`
+    const sessionId = `checkpoint-session-${suffix}`
+    const jobId = `checkpoint-job-${suffix}`
+    const waitId = `checkpoint-wait-${suffix}`
+    const checkpointIds: FixtureIds = {
+      suffix, userId, sessionId, turnId: `checkpoint-turn-pending-${suffix}`,
+      checkpointKind: kind, checkpointWaitId: waitId, checkpointJobId: jobId,
+      checkpointAnswer: `checkpoint-answer-${suffix}`, readCallId: `checkpoint-read-${suffix}`,
+    }
+    fixtureSessionIds.add(sessionId)
+    auxiliaryUserIds.add(userId)
+    await pool!.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`, [userId, `${userId}@example.invalid`])
+    await pool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+      VALUES ($1, $2, 'Recover the same Turn after a durable checkpoint', 'running', 'test', CURRENT_TIMESTAMP)`, [sessionId, userId])
+    if (kind === "approval") {
+      checkpointJobIds.add(jobId)
+      await pool!.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "updatedAt")
+        VALUES ($1, $2, 'Fixture Employer', 'Fixture Engineer', CURRENT_TIMESTAMP)`, [jobId, userId])
+    }
+
+    commandAcceptance = startWorker("accept-message", checkpointIds)
+    const acceptedLine = await waitForLine(commandAcceptance, "COMMAND_ACCEPTED ")
+    await waitForExit(commandAcceptance, { stage: `checkpoint-${kind}-acceptance`, pid: commandAcceptance.pid })
+    expect(commandAcceptance.exitCode).toBe(0)
+    const acceptance = parseCommandAcceptance(acceptedLine)
+    expect(acceptance.accepted.disposition).toBe("started")
+    expect(acceptance.duplicate.disposition).toBe("duplicate")
+    checkpointIds.turnId = acceptance.accepted.turnId
+    turnFixtureIds.add(checkpointIds.turnId)
+
+    workerOne = startWorker("checkpoint-worker1", checkpointIds)
+    let checkpointStepBlocker: PoolClient | undefined
+    let workerOnePid: number | undefined
+    let beforeKill: {
+      status: string; leaseOwnerId: string | null; rootTaskId: string | null; rootStatus: string | null; rootLeaseOwner: string | null
+      readCalls: string; readResults: string; stepCount: string; readStepCount: string; readStepStatus: string | null
+      waitStepCount: string; waitStepStatus: string | null; postCheckpointStepCount: string
+    } | undefined
+    try {
+      if (kind === "tool-result") {
+        await waitForLine(workerOne, `CHECKPOINT_TOOL_STEP_READY ${checkpointIds.readCallId}`)
+        const initialStep = await pool!.query(`SELECT 1 FROM "agent_steps" WHERE "turnId" = $1 AND "ordinal" = 0`, [checkpointIds.turnId])
+        expect(initialStep.rowCount).toBe(1)
+        checkpointStepBlocker = await pool!.connect()
+        await checkpointStepBlocker.query("BEGIN")
+        await checkpointStepBlocker.query('LOCK TABLE "agent_steps" IN SHARE MODE')
+        workerOne.stdin?.write("release-checkpoint-tool-call\n")
+        await waitForLine(workerOne, `CHECKPOINT_READ_TOOL_EXECUTED ${checkpointIds.readCallId}`)
+        await waitForCheckpointToolResult(pool!, checkpointIds.turnId, checkpointIds.readCallId!)
+        expect(workerOne.output.filter(line => line.startsWith("CHECKPOINT_MODEL_REQUEST "))).toEqual(["CHECKPOINT_MODEL_REQUEST 1"])
+        expect(workerOne.output).not.toContain("CHECKPOINT_NEXT_MODEL_REQUEST_STARTED")
+      } else {
+        await waitForLine(workerOne, `CHECKPOINT_WAIT_DURABLE ${kind}`)
+        await waitForCheckpointWait(pool!, kind, checkpointIds)
+        checkpointStepBlocker = await pool!.connect()
+        await checkpointStepBlocker.query("BEGIN")
+        await checkpointStepBlocker.query('LOCK TABLE "agent_steps" IN SHARE MODE')
+        expect(workerOne.output.filter(line => line.startsWith("CHECKPOINT_MODEL_REQUEST "))).toEqual(["CHECKPOINT_MODEL_REQUEST 1", "CHECKPOINT_MODEL_REQUEST 2"])
+        expect(workerOne.output).not.toContain("CHECKPOINT_POST_WAIT_MODEL_PROGRESS")
+      }
+      beforeKill = (await pool!.query<{
+        status: string; leaseOwnerId: string | null; rootTaskId: string | null; rootStatus: string | null; rootLeaseOwner: string | null
+        readCalls: string; readResults: string; stepCount: string; readStepCount: string; readStepStatus: string | null
+        waitStepCount: string; waitStepStatus: string | null; postCheckpointStepCount: string
+      }>(`SELECT turn."status", turn."leaseOwnerId", turn."rootTaskId", root."status" AS "rootStatus", root."leaseOwner" AS "rootLeaseOwner",
+          (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_call' AND "content"->>'toolCallId' = $2) AS "readCalls",
+          (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_result' AND "content"->>'toolCallId' = $2) AS "readResults",
+          (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id") AS "stepCount",
+          (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" = 0) AS "readStepCount",
+          (SELECT "status" FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" = 0 LIMIT 1) AS "readStepStatus",
+          (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" = 1) AS "waitStepCount",
+          (SELECT "status" FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" = 1 LIMIT 1) AS "waitStepStatus",
+          (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" > $3) AS "postCheckpointStepCount"
+        FROM "agent_turns" AS turn JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."turnId" = turn."id"
+        WHERE turn."id" = $1`, [checkpointIds.turnId, checkpointIds.readCallId, kind === "tool-result" ? 0 : 1])).rows[0]
+      expect(beforeKill).toMatchObject({
+        status: kind === "approval" ? "waiting_for_approval" : kind === "question" ? "waiting_for_user" : "in_progress",
+        rootStatus: "running", readCalls: "1", readResults: "1", stepCount: kind === "tool-result" ? "1" : "2", readStepCount: "1",
+        readStepStatus: kind === "tool-result" ? "streaming" : "completed",
+        waitStepCount: kind === "tool-result" ? "0" : "1", waitStepStatus: kind === "tool-result" ? null : "streaming",
+        postCheckpointStepCount: "0",
+      })
+      expect(beforeKill.leaseOwnerId).toBeTruthy()
+      expect(beforeKill.rootTaskId).toBeTruthy()
+      expect(beforeKill.rootLeaseOwner).toBe(beforeKill.leaseOwnerId)
+
+      if (!workerOne.pid) throw new Error("Checkpoint Worker 1 has no PID at the restart boundary")
+      workerOnePid = workerOne.pid
+      const killContext: ExitWaitContext = { stage: `checkpoint-${kind}-worker1-after-SIGKILL`, pid: workerOnePid, requestedSignal: "SIGKILL" }
+      const killed = waitForExit(workerOne, killContext)
+      killContext.signalAccepted = workerOne.kill("SIGKILL")
+      await killed
+      expect(killContext.signalAccepted, exitWaitDiagnostics(workerOne, killContext)).toBe(true)
+      expect({ pid: workerOne.pid, signalCode: workerOne.signalCode }).toEqual({ pid: workerOnePid, signalCode: "SIGKILL" })
+    } finally {
+      if (checkpointStepBlocker) {
+        await checkpointStepBlocker.query("ROLLBACK").catch(() => undefined)
+        checkpointStepBlocker.release()
+      }
+    }
+    if (!beforeKill) throw new Error("Checkpoint Worker 1 did not reach a verified durable restart boundary")
+    if (!workerOnePid) throw new Error("Checkpoint Worker 1 PID was unavailable after its restart boundary")
+    await pool!.query(`UPDATE "agent_turns" SET "leaseExpiresAt" = CURRENT_TIMESTAMP - INTERVAL '1 second'
+      WHERE "id" = $1 AND "leaseOwnerId" = $2 AND "status" IN ('in_progress', 'waiting_for_approval', 'waiting_for_user')`, [checkpointIds.turnId, beforeKill.leaseOwnerId])
+    await pool!.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = CURRENT_TIMESTAMP - INTERVAL '1 second'
+      WHERE "id" = $1 AND "status" = 'running' AND "leaseOwner" = $2`, [beforeKill.rootTaskId, beforeKill.leaseOwnerId])
+
+    if (kind !== "tool-result") {
+      commandAcceptance = startWorker("resolve-checkpoint", checkpointIds)
+      await waitForLine(commandAcceptance, `CHECKPOINT_WAIT_RESOLVED ${kind}`)
+      await waitForExit(commandAcceptance, { stage: `checkpoint-${kind}-wait-resolution`, pid: commandAcceptance.pid })
+      expect(commandAcceptance.exitCode).toBe(0)
+    }
+
+    workerTwo = startWorker("checkpoint-worker2", checkpointIds)
+    expect(workerTwo.pid).not.toBe(workerOnePid)
+    await waitForCheckpointResume(workerTwo, kind, 60_000, {
+      pool: pool!, queue: turnQueue!, turnId: checkpointIds.turnId, sessionId: checkpointIds.sessionId,
+      checkpointKind: kind, waitId: checkpointIds.checkpointWaitId!, toolCallId: checkpointIds.readCallId!, turnJobKey: turnJobKey!,
+    })
+    await waitForTurnStatus(pool!, checkpointIds.turnId, "completed", 60_000, workerTwo)
+    const finalState = await pool!.query<{
+      finalCount: string; finalText: string | null; completedEvents: string; readCalls: string; readResults: string
+      initialReadSteps: string; resumedEvents: string; wakeupEvents: string; wakeupOutbox: string; wakeupAttempts: string
+      wakeupEventIdempotencyKey: string | null; wakeupPublishedAt: string | null; publishedWakeupOutbox: string
+      questionAnsweredEvents: string; answerCount: string
+    }>(`SELECT
+        (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'agent_message' AND "phase" = 'final_answer') AS "finalCount",
+        (SELECT "content"->>'text' FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'agent_message' AND "phase" = 'final_answer' LIMIT 1) AS "finalText",
+        (SELECT COUNT(*)::text FROM "agent_events" WHERE "turnId" = turn."id" AND "type" = 'turn.completed') AS "completedEvents",
+        (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_call' AND "content"->>'toolCallId' = $2) AS "readCalls",
+        (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_result' AND "content"->>'toolCallId' = $2) AS "readResults",
+        (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" = 0) AS "initialReadSteps",
+        (SELECT COUNT(*)::text FROM "agent_events" WHERE "turnId" = turn."id" AND "type" = 'turn.resumed') AS "resumedEvents",
+        (SELECT COUNT(*)::text FROM "agent_events" AS event WHERE event."sessionId" = turn."sessionId" AND event."turnId" = turn."id"
+          AND event."itemId" = $7 AND event."type" = 'turn.wakeup' AND event."payload"->>'waitId' = $6) AS "wakeupEvents",
+        (SELECT MAX(event."idempotencyKey") FROM "agent_events" AS event WHERE event."sessionId" = turn."sessionId" AND event."turnId" = turn."id"
+          AND event."itemId" = $7 AND event."type" = 'turn.wakeup' AND event."payload"->>'waitId' = $6) AS "wakeupEventIdempotencyKey",
+        (SELECT COUNT(*)::text FROM "agent_events" WHERE "turnId" = turn."id" AND "type" = 'question.answered') AS "questionAnsweredEvents",
+        (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'question' AND "content"->>'answer' = $3) AS "answerCount",
+        wakeup."outboxCount" AS "wakeupOutbox", wakeup."attempts" AS "wakeupAttempts",
+        wakeup."publishedAt" AS "wakeupPublishedAt", wakeup."publishedCount" AS "publishedWakeupOutbox"
+      FROM "agent_turns" AS turn
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*)::text AS "outboxCount", COALESCE(MAX(outbox."attemptCount"), 0)::text AS "attempts",
+          MAX(outbox."publishedAt")::text AS "publishedAt",
+          COUNT(*) FILTER (WHERE outbox."publishedAt" IS NOT NULL AND outbox."attemptCount" = 1 AND outbox."lastError" IS NULL)::text AS "publishedCount"
+        FROM "agent_events" AS event
+        JOIN "agent_outbox" AS outbox ON outbox."idempotencyKey" = 'agent-event:' || event."id"
+          AND outbox."payload"->>'eventId' = event."id" AND outbox."aggregateId" = turn."sessionId"
+          AND outbox."topic" = 'agent.turn.wakeup'
+        WHERE event."sessionId" = turn."sessionId" AND event."turnId" = turn."id"
+          AND event."itemId" = $7 AND event."type" = 'turn.wakeup' AND event."payload"->>'waitId' = $6
+      ) AS wakeup ON TRUE
+      WHERE turn."id" = $1 AND turn."sessionId" = $4 AND turn."userId" = $5`,
+    [checkpointIds.turnId, checkpointIds.readCallId, checkpointIds.checkpointAnswer, sessionId, userId,
+      checkpointIds.checkpointWaitId, `agent-wait:${kind}:${checkpointIds.checkpointWaitId}`])
+    const result = finalState.rows[0]
+    expect(result).toMatchObject({ finalCount: "1", completedEvents: "1", readCalls: "1", readResults: "1", initialReadSteps: "1" })
+    expect(result?.finalText).toContain(`CHECKPOINT_FINAL_${kind}_${suffix}`)
+    expect(workerOne.output.filter(line => line === `CHECKPOINT_READ_TOOL_EXECUTED ${checkpointIds.readCallId}`)).toHaveLength(1)
+    expect(workerTwo.output.some(line => line === `CHECKPOINT_READ_TOOL_EXECUTED ${checkpointIds.readCallId}`)).toBe(false)
+    expect(workerTwo.output.filter(line => line === `CHECKPOINT_MODEL_REQUEST_STARTED ${kind} 1`)).toHaveLength(1)
+    expect(workerTwo.output.filter(line => line.startsWith(`CHECKPOINT_RESUME_CONTEXT_OK ${kind} `))).toHaveLength(1)
+    if (kind === "tool-result") {
+      expect(result).toMatchObject({ resumedEvents: "0", wakeupEvents: "0", wakeupOutbox: "0", wakeupAttempts: "0", publishedWakeupOutbox: "0", questionAnsweredEvents: "0", answerCount: "0" })
+      expect(result?.wakeupEventIdempotencyKey).toBeNull()
+    } else {
+      expect(result).toMatchObject({ resumedEvents: "1", wakeupEvents: "1", wakeupOutbox: "1", wakeupAttempts: "1", publishedWakeupOutbox: "1" })
+      expect(result?.wakeupEventIdempotencyKey).toBe(`agent-wait-command:checkpoint-command:${suffix}:wakeup`)
+      expect(result?.wakeupPublishedAt).toBeTruthy()
+    }
+    if (kind === "question") {
+      expect(result).toMatchObject({ answerCount: "1", questionAnsweredEvents: "1" })
+      expect(result?.finalText).toContain(checkpointIds.checkpointAnswer)
+    } else {
+      expect(result?.questionAnsweredEvents).toBe("0")
+    }
+    if (kind === "approval") {
+      const item = await pool!.query<{
+        count: string; status: string | null; userId: string | null; turnUserId: string | null; sessionId: string | null
+        turnId: string | null; taskId: string | null; toolCallId: string | null
+      }>(`SELECT COUNT(*)::text AS "count", MAX(item."status") AS "status", MAX(session."userId") AS "userId",
+          MAX(turn."userId") AS "turnUserId", MAX(item."sessionId") AS "sessionId", MAX(item."turnId") AS "turnId",
+          MAX(item."taskId") AS "taskId", MAX(item."content"->>'toolCallId') AS "toolCallId"
+        FROM "agent_items" AS item
+        JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
+        JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+        WHERE item."turnId" = $1 AND item."type" = 'approval_request' AND item."content"->>'approvalId' = $2`, [checkpointIds.turnId, waitId])
+      const receipt = await pool!.query<{
+        status: string; scopeHash: string | null; userId: string; sessionId: string; turnId: string; taskId: string | null; jobId: string; toolCallId: string
+      }>(`SELECT "status", "scopeHash", "userId", "sessionId", "turnId", "taskId", "jobId", "toolCallId" FROM "agent_approvals" WHERE "id" = $1`, [waitId])
+      expect(item.rows[0]).toEqual({ count: "1", status: "completed", userId, turnUserId: userId, sessionId, turnId: checkpointIds.turnId, taskId: null, toolCallId: checkpointIds.readCallId })
+      expect(receipt.rows[0]).toMatchObject({ status: "approved", userId, sessionId, turnId: checkpointIds.turnId, taskId: null, jobId, toolCallId: checkpointIds.readCallId })
+      expect(receipt.rows[0]?.scopeHash).toMatch(/^[a-f0-9]{64}$/)
+    }
+  }
+
+  it.each(["approval", "question", "tool-result"] as const)(
+    "recovers the same Turn after Worker 1 is killed at the durable %s checkpoint without replaying completed work",
+    async kind => resumeAtDurableCheckpoint(kind),
+    90_000,
+  )
+
   it("persists a child result, kills its Worker, and resumes the parent from PostgreSQL under a new lease", async () => {
     // Exercise the Web command service against the migrated disposable database.
     // The fixture calls message() twice with the same clientMessageId, then
-    // exits before any Worker consumer is started.
+    // exits before any Worker consumer is started. afterEach removes fixture
+    // sessions, so this case owns a fresh Session instead of reusing beforeAll's.
+    ids.sessionId = `process-restart-child-result-session-${randomUUID()}`
+    fixtureSessionIds.add(ids.sessionId)
+    await pool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+      VALUES ($1, $2, 'Resume a parent Turn after its child completes', 'running', 'test', CURRENT_TIMESTAMP)`, [ids.sessionId, ids.userId])
     commandAcceptance = startWorker("accept-message", ids)
     const acceptedLine = await waitForLine(commandAcceptance, "COMMAND_ACCEPTED ")
     await waitForExit(commandAcceptance, { stage: "command-acceptance-after-result", pid: commandAcceptance.pid })
@@ -598,19 +1180,26 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     expect(workerTwo.signalCode).toBeNull()
   }, 60_000)
 
-  it("recovers an accepted active-Turn follow-up after a Worker process restart", async () => {
+  it("recovers an active Turn cleanly and promotes pending follow-ups FIFO into one successor at a time", async () => {
     const suffix = randomUUID()
+    const followUps: FixtureFollowUp[] = [1, 2, 3].map(index => ({
+      clientMessageId: `active-follow-up:${suffix}:${index}`,
+      text: `Durable active-Turn follow-up ${index} ${suffix}`,
+    }))
     const followUpIds: FixtureIds = {
       suffix,
       userId: ids.userId,
-      sessionId: "active-follow-up-session-" + suffix,
-      turnId: "active-follow-up-pending-" + suffix,
+      sessionId: `active-follow-up-session-${suffix}`,
+      turnId: `active-follow-up-pending-${suffix}`,
+      followUps,
     }
     await pool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
-      VALUES ($1, $2, 'Recover an accepted active-Turn follow-up', 'running', 'test', CURRENT_TIMESTAMP)`, [followUpIds.sessionId, followUpIds.userId])
+      VALUES ($1, $2, 'Recover an active Turn before processing accepted follow-ups', 'running', 'test', CURRENT_TIMESTAMP)`, [followUpIds.sessionId, followUpIds.userId])
+    fixtureSessionIds.add(followUpIds.sessionId)
+
     commandAcceptance = startWorker("accept-message", followUpIds)
     const startedLine = await waitForLine(commandAcceptance, "COMMAND_ACCEPTED ")
-    await waitForExit(commandAcceptance, { stage: "active-follow-up-root-acceptance", pid: commandAcceptance.pid })
+    await waitForExit(commandAcceptance, { stage: "active-follow-up-start-turn", pid: commandAcceptance.pid })
     expect(commandAcceptance.exitCode).toBe(0)
     const started = parseCommandAcceptance(startedLine)
     expect(started.accepted.disposition).toBe("started")
@@ -622,15 +1211,14 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     await waitForLine(workerOne, "FIRST_PROVIDER_ACTIVE")
     const active = await pool!.query<{
       status: string; leaseOwnerId: string | null; rootTaskId: string | null; rootStatus: string | null
-      rootLeaseOwner: string | null; stepId: string | null; stepStatus: string | null; consumedInputIds: string[] | null
+      rootLeaseOwner: string | null; stepStatus: string | null; consumedInputIds: string[] | null
     }>(
       `SELECT turn."status", turn."leaseOwnerId", turn."rootTaskId", root."status" AS "rootStatus", root."leaseOwner" AS "rootLeaseOwner",
-         step."id" AS "stepId", step."status" AS "stepStatus", step."consumedInputIds"
+         step."status" AS "stepStatus", step."consumedInputIds"
        FROM "agent_turns" AS turn
        JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."turnId" = turn."id"
        JOIN "agent_steps" AS step ON step."turnId" = turn."id" AND step."taskId" = root."id"
-       WHERE turn."id" = $1 ORDER BY step."ordinal" DESC LIMIT 1`,
-      [followUpIds.turnId],
+       WHERE turn."id" = $1 ORDER BY step."ordinal" DESC LIMIT 1`, [followUpIds.turnId],
     )
     expect(active.rows[0]).toMatchObject({ status: "in_progress", rootStatus: "running", stepStatus: "streaming" })
     expect(active.rows[0]?.leaseOwnerId).toBeTruthy()
@@ -638,30 +1226,53 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     expect(active.rows[0]?.rootLeaseOwner).toBe(active.rows[0]?.leaseOwnerId)
     expect(active.rows[0]?.consumedInputIds).toContain(started.accepted.inputId)
 
-    commandAcceptance = startWorker("accept-active-follow-up", followUpIds)
-    const followUpLine = await waitForLine(commandAcceptance, "COMMAND_ACCEPTED ")
-    await waitForExit(commandAcceptance, { stage: "active-follow-up-accepted-before-restart", pid: commandAcceptance.pid })
-    expect(commandAcceptance.exitCode).toBe(0)
-    const accepted = parseCommandAcceptance(followUpLine)
-    expect(accepted.accepted.disposition).toBe("queued_follow_up")
-    expect(accepted.duplicate).toMatchObject({ inputId: accepted.accepted.inputId, turnId: followUpIds.turnId, disposition: "duplicate", originalDisposition: "queued_follow_up" })
-    followUpIds.followUpInputId = accepted.accepted.inputId
-    const pending = await pool!.query<{
-      id: string; sessionId: string; targetTurnId: string; userId: string; status: string; delivery: string
-      consumedByStepId: string | null; inputCount: string; itemCount: string
-    }>(
-      `SELECT input."id", input."sessionId", input."targetTurnId", input."userId", input."status", input."delivery", input."consumedByStepId",
-         (SELECT COUNT(*)::text FROM "agent_inputs" AS duplicate WHERE duplicate."sessionId" = input."sessionId" AND duplicate."clientMessageId" = input."clientMessageId") AS "inputCount",
-         (SELECT COUNT(*)::text FROM "agent_items" AS item WHERE item."turnId" = input."targetTurnId" AND item."sessionId" = input."sessionId"
-           AND item."type" = 'user_message' AND item."content"->>'clientMessageId' = input."clientMessageId") AS "itemCount"
-       FROM "agent_inputs" AS input WHERE input."id" = $1`,
-      [accepted.accepted.inputId],
+    const acceptedInputs: CommandAcceptanceResult[] = []
+    for (const followUp of followUps) {
+      commandAcceptance = startWorker("accept-active-follow-up", { ...followUpIds, followUpCommand: followUp })
+      const acceptedLine = await waitForLine(commandAcceptance, "COMMAND_ACCEPTED ")
+      await waitForExit(commandAcceptance, { stage: `accepted-${followUp.clientMessageId}`, pid: commandAcceptance.pid })
+      expect(commandAcceptance.exitCode).toBe(0)
+      const acceptance = parseCommandAcceptance(acceptedLine)
+      expect(acceptance.accepted.disposition).toBe("queued_follow_up")
+      expect(acceptance.duplicate).toMatchObject({
+        inputId: acceptance.accepted.inputId, turnId: followUpIds.turnId,
+        disposition: "duplicate", originalDisposition: "queued_follow_up",
+      })
+      acceptedInputs.push(acceptance.accepted)
+    }
+    const acceptedBeforeRestart = await pool!.query<{
+      id: string; targetTurnId: string; userId: string; status: string; delivery: string; consumedByStepId: string | null
+    }>(`SELECT "id", "targetTurnId", "userId", "status", "delivery", "consumedByStepId"
+        FROM "agent_inputs" WHERE "id" = ANY($1::text[]) ORDER BY "acceptedSequence", "id"`,
+    [acceptedInputs.map(input => input.inputId)])
+    expect(acceptedBeforeRestart.rows.map(row => row.id)).toEqual(acceptedInputs.map(input => input.inputId))
+    expect(acceptedBeforeRestart.rows).toEqual(acceptedInputs.map(input => expect.objectContaining({
+      targetTurnId: followUpIds.turnId, userId: followUpIds.userId, status: "accepted", delivery: "follow_up", consumedByStepId: null,
+    })))
+    expect(acceptedInputs.every(input => !active.rows[0]?.consumedInputIds?.includes(input.inputId))).toBe(true)
+
+    const foreignUserId = `active-follow-up-foreign-user-${suffix}`
+    const foreignSessionId = `active-follow-up-foreign-session-${suffix}`
+    auxiliaryUserIds.add(foreignUserId)
+    fixtureSessionIds.add(foreignSessionId)
+    await pool!.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`, [foreignUserId, `${foreignUserId}@example.invalid`])
+    await pool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+      VALUES ($1, $2, 'Foreign session follow-up fixture', 'running', 'test', CURRENT_TIMESTAMP)`, [foreignSessionId, followUpIds.userId])
+    const foreignInputSequence = await pool!.query<{ sequence: string }>(
+      `SELECT (COALESCE(MAX("acceptedSequence"), 0) + 100)::text AS "sequence" FROM "agent_inputs" WHERE "sessionId" = $1`, [followUpIds.sessionId],
     )
-    expect(pending.rows[0]).toMatchObject({
-      id: accepted.accepted.inputId, sessionId: followUpIds.sessionId, targetTurnId: followUpIds.turnId, userId: followUpIds.userId,
-      status: "accepted", delivery: "follow_up", consumedByStepId: null, inputCount: "1", itemCount: "1",
-    })
-    expect(active.rows[0]?.consumedInputIds).not.toContain(accepted.accepted.inputId)
+    const foreignInputSequenceStart = BigInt(foreignInputSequence.rows[0]?.sequence ?? "100")
+    const foreignInputs = [
+      { id: `foreign-user-input-${suffix}`, sessionId: followUpIds.sessionId, userId: foreignUserId, clientMessageId: `foreign-user:${suffix}`, text: "Foreign user must not gate this Turn" },
+      { id: `foreign-session-input-${suffix}`, sessionId: foreignSessionId, userId: followUpIds.userId, clientMessageId: `foreign-session:${suffix}`, text: "Foreign session must not gate this Turn" },
+    ]
+    for (const [index, foreign] of foreignInputs.entries()) {
+      await pool!.query(`INSERT INTO "agent_inputs" ("id", "sessionId", "targetTurnId", "userId", "clientMessageId", "delivery", "status", "content", "acceptedSequence")
+        VALUES ($1, $2, $3, $4, $5, 'follow_up', 'accepted', $6::jsonb, $7)`, [
+        foreign.id, foreign.sessionId, followUpIds.turnId, foreign.userId, foreign.clientMessageId,
+        JSON.stringify([{ type: "text", text: foreign.text }]), (foreignInputSequenceStart + BigInt(index)).toString(),
+      ])
+    }
 
     if (!workerOne.pid) throw new Error("Active Worker 1 has no PID at the restart boundary")
     const workerOnePid = workerOne.pid
@@ -670,6 +1281,8 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     killContext.signalAccepted = workerOne.kill("SIGKILL")
     await killed
     expect(killContext.signalAccepted, exitWaitDiagnostics(workerOne, killContext)).toBe(true)
+    expect({ pid: workerOne.pid, killed: workerOne.killed, exitCode: workerOne.exitCode, signalCode: workerOne.signalCode })
+      .toEqual({ pid: workerOnePid, killed: true, exitCode: null, signalCode: "SIGKILL" })
     await pool!.query(`UPDATE "agent_turns" SET "leaseExpiresAt" = CURRENT_TIMESTAMP - INTERVAL '1 second'
       WHERE "id" = $1 AND "status" = 'in_progress' AND "leaseOwnerId" = $2`, [followUpIds.turnId, active.rows[0]?.leaseOwnerId])
     await pool!.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = CURRENT_TIMESTAMP - INTERVAL '1 second'
@@ -677,119 +1290,179 @@ describeWithServices("production bootstrap recovery across a Worker process rest
 
     workerTwo = startWorker("resume-active-follow-up", followUpIds)
     expect(workerTwo.pid).not.toBe(workerOnePid)
-    await waitForLine(workerTwo, "FOLLOW_UP_CONTEXT_OK")
+    await waitForLine(workerTwo, "ACTIVE_TURN_CONTEXT_CLEAN")
+    await waitForLine(workerTwo, "ACTIVE_FINAL_CONTEXT_CLEAN")
+    await turnQueue!.pause()
+    turnQueuePaused = true
+    workerTwo.stdin?.write("release-active-final\n")
     await waitForTurnStatus(pool!, followUpIds.turnId, "completed", 20_000, workerTwo)
-    const consumed = await pool!.query<{
-      status: string; consumedByStepId: string | null; delivery: string; targetTurnId: string; sessionId: string; userId: string
-    }>(`SELECT "status", "consumedByStepId", "delivery", "targetTurnId", "sessionId", "userId" FROM "agent_inputs" WHERE "id" = $1`, [accepted.accepted.inputId])
-    expect(consumed.rows[0]).toMatchObject({
-      status: "consumed", delivery: "follow_up", targetTurnId: followUpIds.turnId, sessionId: followUpIds.sessionId, userId: followUpIds.userId,
-    })
-    expect(consumed.rows[0]?.consumedByStepId).toBeTruthy()
-    const terminal = await pool!.query<{
-      status: string; finalResponse: string | null; rootStatus: string; completedEventCount: string; finalItemCount: string
-    }>(
-      `SELECT turn."status", turn."finalResponse"::text AS "finalResponse", root."status" AS "rootStatus",
-         (SELECT COUNT(*)::text FROM "agent_events" AS event WHERE event."sessionId" = turn."sessionId" AND event."turnId" = turn."id" AND event."idempotencyKey" = $2) AS "completedEventCount",
-         (SELECT COUNT(*)::text FROM "agent_items" AS item WHERE item."sessionId" = turn."sessionId" AND item."turnId" = turn."id" AND item."type" = 'agent_message') AS "finalItemCount"
-       FROM "agent_turns" AS turn JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" WHERE turn."id" = $1`,
-      [followUpIds.turnId, "turn:" + followUpIds.turnId + ":event:turn-completed"],
+
+    const oldTurnSteps = await pool!.query<{ consumedInputIds: string[] }>(
+      `SELECT "consumedInputIds" FROM "agent_steps" WHERE "turnId" = $1 ORDER BY "ordinal"`, [followUpIds.turnId],
     )
-    expect(terminal.rows[0]).toMatchObject({ status: "completed", rootStatus: "completed", completedEventCount: "1", finalItemCount: "1" })
-    expect(terminal.rows[0]?.finalResponse).toContain(FINAL_MARKER)
+    const oldTurnConsumed = oldTurnSteps.rows.flatMap(row => row.consumedInputIds ?? [])
+    expect(acceptedInputs.every(input => !oldTurnConsumed.includes(input.inputId))).toBe(true)
+    const promoted = await pool!.query<{ id: string; targetTurnId: string; status: string; consumedByStepId: string | null }>(
+      `SELECT "id", "targetTurnId", "status", "consumedByStepId" FROM "agent_inputs" WHERE "id" = ANY($1::text[]) ORDER BY "acceptedSequence", "id"`,
+      [acceptedInputs.map(input => input.inputId)],
+    )
+    expect(promoted.rows).toHaveLength(3)
+    const firstSuccessorId = promoted.rows[0]?.targetTurnId
+    if (!firstSuccessorId || firstSuccessorId === followUpIds.turnId) throw new Error("Oldest follow-up was not promoted to a successor")
+    turnFixtureIds.add(firstSuccessorId)
+    expect(promoted.rows.map(row => row.id)).toEqual(acceptedInputs.map(input => input.inputId))
+    expect(promoted.rows.map(row => row.targetTurnId)).toEqual([firstSuccessorId, followUpIds.turnId, followUpIds.turnId])
+    expect(promoted.rows.map(row => row.status)).toEqual(["accepted", "accepted", "accepted"])
+    expect(promoted.rows.every(row => row.consumedByStepId === null)).toBe(true)
+
+    const initialSuccessors = await pool!.query<{ id: string; status: string; source: string }>(
+      `SELECT "id", "status", "source" FROM "agent_turns" WHERE "sessionId" = $1 ORDER BY "createdAt", "id"`, [followUpIds.sessionId],
+    )
+    expect(initialSuccessors.rows).toHaveLength(2)
+    expect(initialSuccessors.rows.find(turn => turn.id === followUpIds.turnId)).toMatchObject({ status: "completed" })
+    expect(initialSuccessors.rows.find(turn => turn.id === firstSuccessorId)).toMatchObject({ status: "queued", source: "user" })
+    const firstDispatch = await pool!.query<{ id: string; aggregateId: string; attemptCount: number; publishedAt: Date | null; payload: unknown }>(
+      `SELECT "id", "aggregateId", "attemptCount", "publishedAt", "payload"
+       FROM "agent_outbox" WHERE "topic" = 'agent.turn.dispatch' AND "idempotencyKey" = $1`,
+      [`turn-dispatch:${firstSuccessorId}`],
+    )
+    expect(firstDispatch.rows).toHaveLength(1)
+    expect(firstDispatch.rows[0]).toMatchObject({ aggregateId: followUpIds.sessionId, payload: {
+      turnId: firstSuccessorId, sessionId: followUpIds.sessionId, ownerId: `web:${firstSuccessorId}`,
+    } })
+    const untouchedForeign = await pool!.query<{ id: string; sessionId: string; userId: string; targetTurnId: string; status: string }>(
+      `SELECT "id", "sessionId", "userId", "targetTurnId", "status" FROM "agent_inputs" WHERE "id" = ANY($1::text[]) ORDER BY "id"`,
+      [foreignInputs.map(input => input.id)],
+    )
+    expect(untouchedForeign.rows).toEqual([
+      expect.objectContaining({ id: foreignInputs[1]!.id, sessionId: foreignSessionId, userId: followUpIds.userId, targetTurnId: followUpIds.turnId, status: "accepted" }),
+      expect.objectContaining({ id: foreignInputs[0]!.id, sessionId: followUpIds.sessionId, userId: foreignUserId, targetTurnId: followUpIds.turnId, status: "accepted" }),
+    ])
+
+    commandAcceptance = startWorker("replay-active-terminal", followUpIds)
+    await waitForLine(commandAcceptance, "TERMINAL_REPLAY_OK")
+    await waitForExit(commandAcceptance, { stage: "active-follow-up-terminal-replay", pid: commandAcceptance.pid })
+    expect(commandAcceptance.exitCode).toBe(0)
+    const terminalReplayState = await pool!.query<{ turnCount: string; dispatchCount: string; completedEventCount: string }>(
+      `SELECT (SELECT COUNT(*)::text FROM "agent_turns" WHERE "sessionId" = $1) AS "turnCount",
+         (SELECT COUNT(*)::text FROM "agent_outbox" WHERE "topic" = 'agent.turn.dispatch' AND "idempotencyKey" = $2) AS "dispatchCount",
+         (SELECT COUNT(*)::text FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $3 AND "idempotencyKey" = $4) AS "completedEventCount"`,
+      [followUpIds.sessionId, `turn-dispatch:${firstSuccessorId}`, followUpIds.turnId, `turn:${followUpIds.turnId}:event:turn-completed`],
+    )
+    expect(terminalReplayState.rows[0]).toEqual({ turnCount: "2", dispatchCount: "1", completedEventCount: "1" })
+
+    const { recoverTurnQueue } = await import("../runtime/turns/recovery-scanner.js")
+    await recoverTurnQueue(pool!, turnQueue!, `fixture-follow-up-recovery-${suffix}`)
+    await recoverTurnQueue(pool!, turnQueue!, `fixture-follow-up-recovery-replay-${suffix}`)
+    const firstWakeup = await waitForWakeupDispatch(pool!, turnQueue!, { ...followUpIds, turnId: firstSuccessorId }, turnJobKey!)
+    expect(firstWakeup.dispatchBeforeRestart.rows).toHaveLength(1)
+    expect(firstWakeup.dispatchBeforeRestart.rows[0]).toMatchObject({ attemptCount: 1, publishedAt: expect.any(Date) })
+    expect(firstWakeup.wakeupJob?.id).toBe(turnJobKey!(firstSuccessorId, 0))
+    const firstGenerationJobs = await Promise.all([0, 1, 2].map(generation => turnQueue!.getJob(turnJobKey!(firstSuccessorId, generation))))
+    expect(firstGenerationJobs.filter(Boolean)).toHaveLength(1)
+    const afterDispatchRecovery = await pool!.query<{ turnCount: string; dispatchCount: string }>(
+      `SELECT (SELECT COUNT(*)::text FROM "agent_turns" WHERE "sessionId" = $1) AS "turnCount",
+         (SELECT COUNT(*)::text FROM "agent_outbox" WHERE "topic" = 'agent.turn.dispatch' AND "idempotencyKey" = $2) AS "dispatchCount"`,
+      [followUpIds.sessionId, `turn-dispatch:${firstSuccessorId}`],
+    )
+    expect(afterDispatchRecovery.rows[0]).toEqual({ turnCount: "2", dispatchCount: "1" })
+
+    await turnQueue!.resume()
+    turnQueuePaused = false
+    expect(await turnQueue!.isPaused()).toBe(false)
+    let activeSuccessorId = firstSuccessorId
+    for (let index = 0; index < acceptedInputs.length; index += 1) {
+      await waitForSuccessorProvider(pool!, turnQueue!, workerTwo, activeSuccessorId, index + 1, turnJobKey!(activeSuccessorId, 0))
+      await turnQueue!.pause()
+      turnQueuePaused = true
+      workerTwo.stdin?.write(`release-successor-${index + 1}\n`)
+      await waitForTurnStatus(pool!, activeSuccessorId, "completed", 20_000, workerTwo)
+
+      const consumedInput = acceptedInputs[index]!
+      const consumed = await pool!.query<{ status: string; consumedByStepId: string | null; targetTurnId: string }>(
+        `SELECT "status", "consumedByStepId", "targetTurnId" FROM "agent_inputs" WHERE "id" = $1`, [consumedInput.inputId],
+      )
+      expect(consumed.rows[0]).toMatchObject({ status: "consumed", targetTurnId: activeSuccessorId })
+      expect(consumed.rows[0]?.consumedByStepId).toBeTruthy()
+      const claimingSteps = await pool!.query<{ id: string; consumedInputIds: string[] }>(
+        `SELECT "id", "consumedInputIds" FROM "agent_steps" WHERE "turnId" = $1 ORDER BY "ordinal"`, [activeSuccessorId],
+      )
+      const claimingStepsForInput = claimingSteps.rows.filter(step => (step.consumedInputIds ?? []).includes(consumedInput.inputId))
+      const claimCount = claimingSteps.rows.reduce((total, step) => total + (step.consumedInputIds ?? []).filter(inputId => inputId === consumedInput.inputId).length, 0)
+      expect(claimCount).toBe(1)
+      expect(claimingStepsForInput).toHaveLength(1)
+      expect(consumed.rows[0]?.consumedByStepId).toBe(claimingStepsForInput[0]?.id)
+      const currentDispatch = await pool!.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS "count" FROM "agent_outbox" WHERE "topic" = 'agent.turn.dispatch' AND "idempotencyKey" = $1`,
+        [`turn-dispatch:${activeSuccessorId}`],
+      )
+      expect(currentDispatch.rows[0]?.count).toBe("1")
+
+      const nextInput = acceptedInputs[index + 1]
+      if (nextInput) {
+        const next = await pool!.query<{ targetTurnId: string; status: string }>(
+          `SELECT "targetTurnId", "status" FROM "agent_inputs" WHERE "id" = $1`, [nextInput.inputId],
+        )
+        const nextSuccessorId = next.rows[0]?.targetTurnId
+        if (!nextSuccessorId || nextSuccessorId === followUpIds.turnId || nextSuccessorId === activeSuccessorId) {
+          throw new Error(`Next FIFO follow-up ${nextInput.inputId} was not assigned its own successor`)
+        }
+        turnFixtureIds.add(nextSuccessorId)
+        expect(next.rows[0]).toMatchObject({ status: "accepted", targetTurnId: nextSuccessorId })
+        const successorRow = await pool!.query<{ status: string; count: string }>(
+          `SELECT turn."status", (SELECT COUNT(*)::text FROM "agent_turns" WHERE "sessionId" = turn."sessionId" AND "status" = 'queued') AS "count"
+           FROM "agent_turns" AS turn WHERE turn."id" = $1 AND turn."sessionId" = $2`, [nextSuccessorId, followUpIds.sessionId],
+        )
+        expect(successorRow.rows[0]).toMatchObject({ status: "queued", count: "1" })
+        const remaining = await pool!.query<{ id: string; targetTurnId: string; status: string }>(
+          `SELECT "id", "targetTurnId", "status" FROM "agent_inputs" WHERE "id" = ANY($1::text[]) ORDER BY "acceptedSequence", "id"`,
+          [acceptedInputs.slice(index + 1).map(input => input.inputId)],
+        )
+        expect(remaining.rows[0]).toMatchObject({ id: nextInput.inputId, targetTurnId: nextSuccessorId, status: "accepted" })
+        expect(remaining.rows.slice(1).map(row => row.targetTurnId)).toEqual(remaining.rows.slice(1).map(() => followUpIds.turnId))
+        await recoverTurnQueue(pool!, turnQueue!, `fixture-follow-up-recovery-${suffix}-${index}`)
+        await recoverTurnQueue(pool!, turnQueue!, `fixture-follow-up-recovery-replay-${suffix}-${index}`)
+        const nextWakeup = await waitForWakeupDispatch(pool!, turnQueue!, { ...followUpIds, turnId: nextSuccessorId }, turnJobKey!)
+        expect(nextWakeup.dispatchBeforeRestart.rows).toHaveLength(1)
+        expect(nextWakeup.dispatchBeforeRestart.rows[0]).toMatchObject({ attemptCount: 1, publishedAt: expect.any(Date) })
+        const nextGenerationJobs = await Promise.all([0, 1, 2].map(generation => turnQueue!.getJob(turnJobKey!(nextSuccessorId, generation))))
+        expect(nextGenerationJobs.filter(Boolean)).toHaveLength(1)
+        activeSuccessorId = nextSuccessorId
+        await turnQueue!.resume()
+        turnQueuePaused = false
+      }
+    }
+
+    const finalInputs = await pool!.query<{ id: string; status: string; targetTurnId: string; consumedByStepId: string | null }>(
+      `SELECT "id", "status", "targetTurnId", "consumedByStepId" FROM "agent_inputs" WHERE "id" = ANY($1::text[]) ORDER BY "acceptedSequence", "id"`,
+      [acceptedInputs.map(input => input.inputId)],
+    )
+    expect(finalInputs.rows).toHaveLength(3)
+    expect(finalInputs.rows.map(input => input.status)).toEqual(["consumed", "consumed", "consumed"])
+    expect(finalInputs.rows.map(input => input.targetTurnId)).not.toContain(followUpIds.turnId)
+    expect(finalInputs.rows.every(input => Boolean(input.consumedByStepId))).toBe(true)
+    const completedSession = await pool!.query<{ turnCount: string; queuedCount: string; completedCount: string }>(
+      `SELECT COUNT(*)::text AS "turnCount", COUNT(*) FILTER (WHERE "status" = 'queued')::text AS "queuedCount",
+         COUNT(*) FILTER (WHERE "status" = 'completed')::text AS "completedCount" FROM "agent_turns" WHERE "sessionId" = $1`,
+      [followUpIds.sessionId],
+    )
+    expect(completedSession.rows[0]).toEqual({ turnCount: "4", queuedCount: "0", completedCount: "4" })
+    const finalForeign = await pool!.query<{ id: string; targetTurnId: string; status: string }>(
+      `SELECT "id", "targetTurnId", "status" FROM "agent_inputs" WHERE "id" = ANY($1::text[]) ORDER BY "id"`,
+      [foreignInputs.map(input => input.id)],
+    )
+    expect(finalForeign.rows.every(input => input.targetTurnId === followUpIds.turnId && input.status === "accepted")).toBe(true)
+
     workerTwo.stdin?.write("shutdown\n")
     await waitForLine(workerTwo, "SHUTDOWN_STAGE bootstrap_close:complete", 10_000)
-    await waitForExit(workerTwo, { stage: "active-worker2-after-shutdown", pid: workerTwo.pid })
+    await waitForExit(workerTwo, { stage: "active-follow-up-worker2-after-shutdown", pid: workerTwo.pid })
     expect(workerTwo.exitCode).toBe(0)
-    await pool!.query(`DELETE FROM "agent_sessions" WHERE "id" = $1`, [followUpIds.sessionId])
-  }, 60_000)
-
-  it("includes an accepted follow-up in the next provider context and consumes it before completion", async () => {
-    const suffix = randomUUID()
-    const followUpIds: FixtureIds = {
-      suffix,
-      userId: ids.userId,
-      sessionId: `accepted-follow-up-session-${suffix}`,
-      turnId: `accepted-follow-up-pending-${suffix}`,
+    if (turnQueuePaused) {
+      await turnQueue!.resume()
+      turnQueuePaused = false
     }
-    await pool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
-      VALUES ($1, $2, 'Resume and report persisted child result', 'running', 'test', CURRENT_TIMESTAMP)`, [followUpIds.sessionId, followUpIds.userId])
-
-    commandAcceptance = startWorker("accept-message", followUpIds)
-    const startedLine = await waitForLine(commandAcceptance, "COMMAND_ACCEPTED ")
-    await waitForExit(commandAcceptance, { stage: "accepted-first-start-turn", pid: commandAcceptance.pid })
-    expect(commandAcceptance.exitCode).toBe(0)
-    const started = parseCommandAcceptance(startedLine)
-    expect(started.accepted.disposition).toBe("started")
-    followUpIds.turnId = started.accepted.turnId
-    turnFixtureIds.add(followUpIds.turnId)
-
-    workerOne = startWorker("park-active-follow-up", followUpIds)
-    await waitForLine(workerOne, "FIRST_PROVIDER_ACTIVE")
-    workerOne.stdin?.write("release-first-provider\n")
-    await waitForLine(workerOne, "FINAL_PROVIDER_ACTIVE")
-
-    commandAcceptance = startWorker("accept-active-follow-up", followUpIds)
-    const acceptedLine = await waitForLine(commandAcceptance, "COMMAND_ACCEPTED ")
-    await waitForExit(commandAcceptance, { stage: "accepted-first-follow-up", pid: commandAcceptance.pid })
-    expect(commandAcceptance.exitCode).toBe(0)
-    const accepted = parseCommandAcceptance(acceptedLine)
-    expect(accepted.accepted.disposition).toBe("queued_follow_up")
-    expect(accepted.duplicate).toMatchObject({
-      inputId: accepted.accepted.inputId,
-      turnId: followUpIds.turnId,
-      disposition: "duplicate",
-      originalDisposition: "queued_follow_up",
-    })
-
-    workerOne.stdin?.write("release-pending-follow-up-provider\n")
-    await waitForLine(workerOne, "FOLLOW_UP_CONTEXT_OK")
-    const deferred = await pool!.query<{
-      turnStatus: string; completedEventCount: string; finalItemCount: string
-    }>(`SELECT turn."status" AS "turnStatus",
-        (SELECT COUNT(*)::text FROM "agent_events" AS event WHERE event."sessionId" = turn."sessionId" AND event."turnId" = turn."id" AND event."idempotencyKey" = $2) AS "completedEventCount",
-        (SELECT COUNT(*)::text FROM "agent_items" AS item WHERE item."sessionId" = turn."sessionId" AND item."turnId" = turn."id" AND item."type" = 'agent_message') AS "finalItemCount"
-      FROM "agent_turns" AS turn WHERE turn."id" = $1`,
-    [followUpIds.turnId, `turn:${followUpIds.turnId}:event:turn-completed`])
-    expect(deferred.rows[0]).toMatchObject({ turnStatus: "in_progress", completedEventCount: "0", finalItemCount: "0" })
-    const consumed = await pool!.query<{ targetTurnId: string; status: string }>(
-      `SELECT "targetTurnId", "status" FROM "agent_inputs" WHERE "id" = $1`, [accepted.accepted.inputId],
-    )
-    expect(consumed.rows[0]).toMatchObject({ targetTurnId: followUpIds.turnId, status: "consumed" })
-    const deferredStep = await pool!.query<{ consumedInputIds: string[] }>(
-      `SELECT "consumedInputIds" FROM "agent_steps" WHERE "turnId" = $1 AND "ordinal" = 2`, [followUpIds.turnId],
-    )
-    expect(deferredStep.rows[0]?.consumedInputIds).toContain(accepted.accepted.inputId)
-
-    workerOne.stdin?.write("release-final-provider\n")
-    await waitForTurnStatus(pool!, followUpIds.turnId, "completed", 20_000, workerOne)
-
-    const step = await pool!.query<{ id: string; status: string; consumedInputIds: string[] }>(
-      `SELECT "id", "status", "consumedInputIds" FROM "agent_steps" WHERE "turnId" = $1 AND "ordinal" = 2`,
-      [followUpIds.turnId],
-    )
-    expect(step.rows[0]?.status).toBe("completed")
-    expect(step.rows[0]?.consumedInputIds).toContain(accepted.accepted.inputId)
-    const input = await pool!.query<{ status: string; consumedByStepId: string | null; targetTurnId: string }>(
-      `SELECT "status", "consumedByStepId", "targetTurnId" FROM "agent_inputs" WHERE "id" = $1`,
-      [accepted.accepted.inputId],
-    )
-    expect(input.rows[0]).toMatchObject({ status: "consumed", consumedByStepId: step.rows[0]?.id, targetTurnId: followUpIds.turnId })
-    const terminal = await pool!.query<{ finalResponse: string | null; completedEventCount: string; finalItemCount: string }>(
-      `SELECT turn."finalResponse"::text AS "finalResponse",
-         (SELECT COUNT(*)::text FROM "agent_events" AS event WHERE event."sessionId" = turn."sessionId" AND event."turnId" = turn."id" AND event."idempotencyKey" = $2) AS "completedEventCount",
-         (SELECT COUNT(*)::text FROM "agent_items" AS item WHERE item."sessionId" = turn."sessionId" AND item."turnId" = turn."id" AND item."type" = 'agent_message') AS "finalItemCount"
-       FROM "agent_turns" AS turn WHERE turn."id" = $1`,
-      [followUpIds.turnId, `turn:${followUpIds.turnId}:event:turn-completed`],
-    )
-    expect(terminal.rows[0]).toMatchObject({ completedEventCount: "1", finalItemCount: "1" })
-    expect(terminal.rows[0]?.finalResponse).toContain(FINAL_MARKER)
-
-    workerOne.stdin?.write("shutdown\n")
-    await waitForLine(workerOne, "SHUTDOWN_STAGE bootstrap_close:complete", 10_000)
-    await waitForExit(workerOne, { stage: "accepted-first-worker-shutdown", pid: workerOne.pid })
-    expect(workerOne.exitCode).toBe(0)
-    await pool!.query(`DELETE FROM "agent_sessions" WHERE "id" = $1`, [followUpIds.sessionId])
+    await pool!.query(`DELETE FROM "agent_sessions" WHERE "id" = ANY($1::text[])`, [[followUpIds.sessionId, foreignSessionId]])
+    await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [foreignUserId])
   }, 60_000)
 
   it("starts a successor when terminal commit owns the Session lock before follow-up acceptance", async () => {
@@ -800,6 +1473,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
       sessionId: `terminal-follow-up-race-session-${suffix}`,
       turnId: `terminal-follow-up-race-pending-${suffix}`,
     }
+    fixtureSessionIds.add(raceIds.sessionId)
     await pool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
       VALUES ($1, $2, 'Resume and report persisted child result', 'running', 'test', CURRENT_TIMESTAMP)`, [raceIds.sessionId, raceIds.userId])
 
@@ -939,6 +1613,8 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     const generationJobIds = Array.from({ length: retryGeneration + 1 }, (_, generation) => turnJobKey!(turnId, generation))
     const recoveryQueue = new Queue(`agent-turn-recovery-${suffix}`, { connection: redis!, skipVersionCheck: true })
     const recovery = await import("../runtime/turns/recovery-scanner.js")
+    fixtureSessionIds.add(sessionId)
+    auxiliaryUserIds.add(foreignUserId)
 
     try {
       await recoveryQueue.waitUntilReady()

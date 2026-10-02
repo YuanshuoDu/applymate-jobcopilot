@@ -1,12 +1,12 @@
-# Phase 4 Exit Report — Requested Phase 5 Decision
+# Phase 4 Exit Report — Recorded Phase 5 Decision
 
-**Report status:** Draft for Claude/PM §1.8 review; #387 and Phase 5 activation remain blocked until the PM decision is recorded.
+**Report status:** §1.8 decision recorded on 2026-10-01 as **GO by owner waiver for Phase 5 implementation only**; see #387 comment `5932720327`. Phase 4 remains not evidence-complete, and production rollout / flag promotion remain NO-GO.
 
 **Report date:** 2026-10-01
 
-**Requested decision:** GO by owner waiver for Phase 5 implementation only
+**Recorded decision:** GO by owner waiver for Phase 5 implementation only
 
-**Evidence-complete Phase 4 status:** Not claimed. Owner waivers are recorded, but #387 and Phase 5 activation remain blocked pending Claude/PM's §1.8 Exit decision.
+**Evidence-complete Phase 4 status:** Not claimed. The #387 GO authorizes Phase 5 implementation only; Phase 4 remains not evidence-complete `completed`, and the two named owner-waived items remain `WAIVED / NOT VERIFIED`.
 
 ## Scope
 
@@ -18,12 +18,12 @@
 ## Goal result
 
 - **Planned outcome:** Verify the Phase 4 policy, approval, resume, and redaction controls, then decide whether Phase 5 implementation may proceed.
-- **Actual outcome:** Code-level policy, scope/expiry/race rejection, broker wakeup, and allow-list redaction changes are merged. The owner approved the two named waivers below; the latest issue ruling still requires Claude/PM to record the §1.8 decision before Phase 5 is unblocked.
+- **Actual outcome:** Code-level policy, scope/expiry/race rejection, broker wakeup, and allow-list redaction changes are merged. The owner approved the two named waivers below; #387 records the §1.8 GO under the owner waiver for Phase 5 implementation only. This does not upgrade unverified evidence or authorize staging or production activation.
 - **Partial/unverified items:**
   - V3 staging approval/decline/expiry browser smoke: **WAIVED / NOT VERIFIED** by the [owner decision](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/387#issuecomment-5931612168). It was not run for this decision and is not a PASS.
   - V5 48-hour dual-write integrity report: **WAIVED / NOT VERIFIED** by the same decision. No empirical 48-hour counts or parity result are claimed.
   - SSE disconnect/reconnect replay: **OBSERVED / ACCEPTED for the named route-replay requirement**. The attached [PR #392 trace](https://github.com/YuanshuoDu/applymate-jobcopilot/blob/d3de94f/docs/agent-harness-v2/gates/phase-4/sse-drill.trace.jsonl) records a real authenticated staging Preview route, a 32-second disconnect, durable sequence 6 inserted during the disconnect, resume after sequence 5, returned sequence `[6]`, zero duplicates, and zero missed durable events. The event was synthetic/operator-inserted; no Worker/Redis automation ran. The owner ruled that this meets the #387 SSE replay item and said not to rerun it ([ruling](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/387#issuecomment-5929863153)).
-  - Worker-produced event publication and original-Turn wake/resume have no new end-to-end staging evidence in the SSE trace. Existing code-level review remains in PR #384; the runtime gap is retained as unverified rather than inferred from route replay. The 2026-10-01 owner waiver explicitly names the staging approval/decline/expiry browser smoke; this report does not assume it separately waives this original-Turn runtime item. PM must classify it before deciding GO/NO-GO.
+  - Worker-produced event publication and original-Turn wake/resume have no new end-to-end staging evidence in the SSE trace. Existing code-level review remains in PR #384; the runtime gap remains **UNVERIFIED** rather than inferred from route replay. The #387 ruling recorded on 2026-10-01 accepts it under the named approval-smoke waiver for Phase 5 implementation only; it must be re-verified before any staging or production activation.
   - Staging control-plane/database/deployment binding and post-#519 audit migration/checkpoint health remain unverified; neither production rollout nor flag activation is authorized by this decision.
 
 ## Verification
@@ -50,6 +50,6 @@
 
 ## Decision
 
-- **GO / NO-GO:** **PENDING Claude/PM decision.** Requested disposition: GO by owner waiver for Phase 5 implementation only, if PM accepts the unverified original-Turn runtime item under the named approval-smoke waiver. Otherwise keep #387 blocked and specify the smallest follow-up evidence. Do not mark Phase 4 `completed`; approval smoke and the 48-hour report remain `WAIVED / NOT VERIFIED`; production rollout remains NO-GO pending its own evidence and approval.
-- **Reviewer:** Claude/PM must review this report against roadmap §1.8 and record the final #387 disposition.
-- **Next Phase activation date:** TBD; only after Claude/PM records GO in #387. The prior owner waiver remains the decision basis, but Phase 5's own Exit Gate remains mandatory.
+- **GO / NO-GO:** **GO by owner waiver for Phase 5 implementation only**, recorded by PM (Claude) on 2026-10-01 in #387 comment `5932720327`. Do not mark Phase 4 `completed`; approval smoke and the 48-hour report remain `WAIVED / NOT VERIFIED`; production rollout and flag promotion remain NO-GO pending their own evidence and approval.
+- **Reviewer:** PM (Claude), recording the decision in #387 comment `5932720327` on 2026-10-01.
+- **Next Phase activation date:** 2026-10-01 for Phase 5 implementation only, as recorded in #387 comment `5932720327`. Phase 5's own Exit Gate remains mandatory.
