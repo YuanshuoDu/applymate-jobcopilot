@@ -1047,7 +1047,18 @@ function fixture(): Fixture {
   }
 }
 
-async function seed(pool: Pool, value: Fixture, turnStatus: "queued" | "waiting_for_user" = "queued"): Promise<void> {
+type FixtureTurnLimits = { readonly maxSteps: number; readonly maxToolCalls: number }
+
+const DEFAULT_FIXTURE_TURN_LIMITS: FixtureTurnLimits = { maxSteps: 8, maxToolCalls: 8 }
+// The discovery fixtures execute root planning/replanning and child turns under the same root-scoped ceiling.
+const DISCOVERY_FIXTURE_TURN_LIMITS: FixtureTurnLimits = { maxSteps: 16, maxToolCalls: 8 }
+
+async function seed(
+  pool: Pool,
+  value: Fixture,
+  turnStatus: "queued" | "waiting_for_user" = "queued",
+  limits: FixtureTurnLimits = DEFAULT_FIXTURE_TURN_LIMITS,
+): Promise<void> {
   await pool.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`, [
     value.userId, `${value.userId}@example.invalid`,
   ])
@@ -1064,7 +1075,7 @@ async function seed(pool: Pool, value: Fixture, turnStatus: "queued" | "waiting_
     turnStatus,
     JSON.stringify({ goal: "Research and summarize the fixture source" }),
     JSON.stringify({ provider: "fixture", model: "fixture-model" }),
-    JSON.stringify({ limits: { maxSteps: 8, maxToolCalls: 8 } }),
+    JSON.stringify({ limits }),
   ])
 }
 
@@ -3833,9 +3844,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await seed(pool, artifactOwner, "waiting_for_user")
     artifactOwnerSources = await seedSelectedJobSources(pool, artifactOwner)
     await seed(pool, cancelledOwner, "waiting_for_user")
-    await seed(pool, discoveryOwner, "waiting_for_user")
-    await seed(pool, discoveryFailureOwner, "waiting_for_user")
-    await seed(pool, discoveryRestartOwner, "waiting_for_user")
+    await seed(pool, discoveryOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
+    await seed(pool, discoveryFailureOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
+    await seed(pool, discoveryRestartOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
   }, 15_000)
 
   afterEach(async () => {
