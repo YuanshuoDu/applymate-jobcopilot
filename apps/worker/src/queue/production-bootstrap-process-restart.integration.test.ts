@@ -150,7 +150,7 @@ const SAFE_DIAGNOSTIC_CODES = new Set([
   "no_progress", "persistence_conflict", "provider_error", "provider_unavailable", "schema_error",
   "schema_invalid_payload", "step_limit", "tool_execution_failed", "tool_recovery_aborted",
   "tool_result_replay_uncertain", "turn_execution_error", "turn_execution_failed",
-  "event_lineage_mismatch", "item_lineage_mismatch", "outbox_scope_mismatch", "tool_lineage_mismatch",
+  "event_lineage_mismatch", "item_lineage_mismatch", "outbox_scope_mismatch", "processing_error", "tool_lineage_mismatch",
   "turn_revision_conflict", "wait_scope_mismatch",
   "question_recovery_answer_event_ambiguous", "question_recovery_answer_lineage_invalid",
   "question_recovery_event_scope_invalid", "question_recovery_history_collision",
@@ -206,7 +206,7 @@ async function checkpointResumeDiagnostics(input: CheckpointResumeDiagnostics): 
         "payload"->>'error_code' AS "errorCodeSnake"
       FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
       ORDER BY "sequence" DESC LIMIT 6`, [input.sessionId, input.turnId]),
-    input.pool.query(`SELECT "attemptCount", "publishedAt" IS NOT NULL AS "published", "lastError" IS NOT NULL AS "hasError"
+    input.pool.query(`SELECT "attemptCount", "publishedAt" IS NOT NULL AS "published", "lastError"
       FROM "agent_outbox" WHERE "topic" = 'agent.turn.wakeup' AND "aggregateId" = $1
         AND "payload"->>'turnId' = $2 ORDER BY "createdAt" DESC LIMIT 4`, [input.sessionId, input.turnId]),
     input.pool.query(`SELECT "attemptCount", "publishedAt" IS NOT NULL AS "published", "lastError" IS NOT NULL AS "hasError"
@@ -255,7 +255,11 @@ async function checkpointResumeDiagnostics(input: CheckpointResumeDiagnostics): 
       reasonCode: safeCode(row.reasonCode, row.reasonCodeSnake),
       errorCode: safeCode(row.errorCode, row.errorCodeSnake),
     })),
-    wakeupOutbox: wakeupOutbox.rows,
+    wakeupOutbox: wakeupOutbox.rows.map(row => ({
+      attemptCount: row.attemptCount,
+      published: row.published,
+      lastError: safeDiagnosticCode(row.lastError),
+    })),
     dispatch: dispatch.rows[0] ?? null,
     jobs: jobGenerations,
     queue: queueCounts,
