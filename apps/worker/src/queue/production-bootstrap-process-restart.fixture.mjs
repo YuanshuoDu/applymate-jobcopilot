@@ -852,7 +852,7 @@ try {
   process.stderr.write(`${message}\n`)
   process.exitCode = 1
 } finally {
-  if (mode === "accept-message" || mode === "accept-active-follow-up" || mode === "replay-active-terminal") {
+  if (mode === "accept-message" || mode === "accept-active-follow-up" || mode === "replay-active-terminal" || mode === "resolve-checkpoint") {
     process.stdin.off("data", onStdinData)
     process.stdin.pause()
     process.stdin.destroy()
