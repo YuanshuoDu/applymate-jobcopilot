@@ -9,6 +9,7 @@ const resultMarker = "durable-child-result-after-process-restart"
 const finalMarker = "parent-resumed-from-durable-child-result"
 const pool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 5 })
 let bootstrap
+let wakeupConsumer
 let stopping = false
 let stdinBuffer = ""
 const queuedCommands = []
@@ -591,6 +592,213 @@ async function makeSecondWorker() {
   await waitForStop()
 }
 
+function checkpointInputs() {
+  if (!ids.checkpointKind || !ids.checkpointWaitId || !ids.readCallId) throw new Error("checkpoint_fixture_ids_missing")
+  return ids
+}
+
+async function persistCheckpointWait() {
+  const checkpoint = checkpointInputs()
+  const turnResult = await pool.query(`SELECT "revision" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`, [ids.turnId, ids.sessionId, ids.userId])
+  const revision = Number(turnResult.rows[0]?.revision)
+  if (!Number.isInteger(revision)) throw new Error("checkpoint_turn_revision_missing")
+  process.env.DATABASE_URL = process.env.AGENT_RUNTIME_PG_TEST_URL
+  if (checkpoint.checkpointKind === "approval") {
+    if (!checkpoint.checkpointJobId) throw new Error("checkpoint_approval_job_missing")
+    const { createPgApprovalStore } = await import("../runtime/approval/pg-store.ts")
+    await createPgApprovalStore(pool, { userId: ids.userId }).issue({
+      approvalId: checkpoint.checkpointWaitId,
+      scope: {
+        userId: ids.userId, sessionId: ids.sessionId, turnId: ids.turnId, jobId: checkpoint.checkpointJobId,
+        toolCallId: checkpoint.readCallId, action: "submit_application",
+        resourceHash: "a".repeat(64), materialHash: "b".repeat(64), answersHash: "c".repeat(64),
+        revision, expiresAt: new Date(Date.now() + 60_000),
+      },
+      title: "Fixture approval checkpoint", body: "No application is submitted by this fixture.",
+      payload: { fixture: true }, projectWait: true,
+    })
+    return
+  }
+  if (checkpoint.checkpointKind === "question") {
+    const [{ db }, broker] = await Promise.all([
+      import("../../../web/src/lib/db.ts"),
+      import("../../../web/src/lib/agent/broker/store.ts"),
+    ])
+    try {
+      await broker.createQuestionWait(db, {
+        questionId: checkpoint.checkpointWaitId, sessionId: ids.sessionId, userId: ids.userId, turnId: ids.turnId,
+        toolCallId: checkpoint.readCallId, stage: "fixture_checkpoint", question: "Provide the deterministic recovery answer.",
+        options: [{ label: "Use the fixture answer", value: checkpoint.checkpointAnswer }], expectedTurnRevision: revision,
+      })
+    } finally { await db.$disconnect() }
+  }
+}
+
+async function resolveCheckpointWait() {
+  const checkpoint = checkpointInputs()
+  if (checkpoint.checkpointKind === "tool-result") throw new Error("tool_result_checkpoint_has_no_wait_to_resolve")
+  const [{ db }, broker] = await Promise.all([
+    import("../../../web/src/lib/db.ts"),
+    import("../../../web/src/lib/agent/broker/store.ts"),
+  ])
+  try {
+    const turn = await db.agentTurn.findUniqueOrThrow({ where: { id: ids.turnId }, select: { revision: true } })
+    const command = {
+      sessionId: ids.sessionId, userId: ids.userId, waitId: checkpoint.checkpointWaitId,
+      clientMessageId: "checkpoint-command:" + ids.suffix, expectedTurnId: ids.turnId, expectedRevision: turn.revision,
+    }
+    const resolved = checkpoint.checkpointKind === "approval"
+      ? await broker.decideApproval(db, { ...command, decision: "approved" })
+      : await broker.answerQuestion(db, { ...command, answer: checkpoint.checkpointAnswer })
+    const expectedStatus = checkpoint.checkpointKind === "approval" ? "approved" : "answered"
+    if (resolved.disposition !== "resolved" || resolved.status !== expectedStatus || resolved.turnId !== ids.turnId) {
+      throw new Error("checkpoint_wait_resolution_scope_invalid")
+    }
+    say("CHECKPOINT_WAIT_RESOLVED " + checkpoint.checkpointKind)
+  } finally { await db.$disconnect() }
+}
+
+function checkpointToolRuntime() {
+  return {
+    registry: {
+      list: () => [{ name: "jobs.search", version: "1" }],
+      resolve: () => ({ idempotency: "read_only" }),
+      validateArguments: () => true,
+    },
+    router: {
+      async execute(_context, call) {
+        if (call.toolName !== "jobs.search") throw new Error("unexpected_checkpoint_fixture_tool")
+        if (mode === "checkpoint-worker2") throw new Error("persisted_fixture_read_tool_was_executed_twice")
+        say("CHECKPOINT_READ_TOOL_EXECUTED " + ids.readCallId)
+        return {
+          id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed",
+          output: { proof: "durable-read-result:" + ids.suffix }, errorCode: null,
+        }
+      },
+    },
+  }
+}
+
+async function checkpointResumeEvidence(state, request) {
+  const checkpoint = checkpointInputs()
+  const observations = JSON.stringify(state.snapshot.toolObservations)
+  if (observations.split(checkpoint.readCallId).length - 1 !== 1
+    || observations.split("durable-read-result:" + ids.suffix).length - 1 !== 1) {
+    throw new Error("checkpoint_resume_missing_unique_durable_read_result")
+  }
+  if (checkpoint.checkpointKind === "question") {
+    const item = await pool.query(`SELECT "status", "content" FROM "agent_items" WHERE "id" = $1 AND "turnId" = $2 AND "type" = 'question'`, ["agent-wait:question:" + checkpoint.checkpointWaitId, ids.turnId])
+    const content = item.rows[0]?.content
+    if (item.rows[0]?.status !== "completed" || content?.answer !== checkpoint.checkpointAnswer) throw new Error("checkpoint_question_answer_not_restored")
+    const history = state.snapshot.steerHistory.filter(entry => entry.id.startsWith("agent-question:agent-wait:question:" + checkpoint.checkpointWaitId + ":"))
+    if (history.length !== 2 || !history[0].id.endsWith(":question") || !history[1].id.endsWith(":answer")) {
+      throw new Error("checkpoint_question_history_pair_missing_or_unordered")
+    }
+    const texts = request.messages.flatMap(message => Array.isArray(message.content)
+      ? message.content.filter(part => part.type === "text").map(part => part.text) : [])
+    const questionText = "Provide the deterministic recovery answer."
+    const option = content.options?.[0]
+    const optionMarker = option ? JSON.stringify({ label: option.label, value: option.value }) : ""
+    const questionEntries = texts.filter(text => text.includes('"type":"question"') && text.includes(questionText) && text.includes(optionMarker))
+    const answerEntries = texts.filter(text => text.includes('"type":"answer"')
+      && text.includes('"questionId":"' + checkpoint.checkpointWaitId + '"')
+      && text.includes('"text":"' + checkpoint.checkpointAnswer + '"'))
+    if (!optionMarker || questionEntries.length !== 1 || answerEntries.length !== 1 || questionEntries[0] === answerEntries[0]
+      || !questionEntries[0].includes("trust=UNTRUSTED_DATA") || !answerEntries[0].includes("trust=UNTRUSTED_DATA")
+      || texts.indexOf(questionEntries[0]) >= texts.indexOf(answerEntries[0])) {
+      throw new Error("checkpoint_question_answer_model_context_not_unique_ordered_untrusted")
+    }
+    say("CHECKPOINT_QUESTION_CONTEXT_COUNT 1 OPTION_COUNT 1 ANSWER_COUNT 1")
+    return "answer:" + checkpoint.checkpointAnswer
+  }
+  if (checkpoint.checkpointKind === "approval") {
+    const approval = await pool.query(`SELECT "status", "userId", "sessionId", "turnId", "taskId", "jobId", "toolCallId" FROM "agent_approvals" WHERE "id" = $1 AND "userId" = $2`, [checkpoint.checkpointWaitId, ids.userId])
+    if (approval.rows[0]?.status !== "approved" || approval.rows[0]?.turnId !== ids.turnId
+      || approval.rows[0]?.userId !== ids.userId || approval.rows[0]?.sessionId !== ids.sessionId
+      || approval.rows[0]?.taskId !== null || approval.rows[0]?.jobId !== checkpoint.checkpointJobId
+      || approval.rows[0]?.toolCallId !== checkpoint.readCallId) {
+      throw new Error("checkpoint_approval_receipt_scope_not_restored")
+    }
+    return "approval:approved"
+  }
+  return "tool-result:restored"
+}
+
+async function makeCheckpointWorker(firstWorker) {
+  const checkpoint = checkpointInputs()
+  await startFixtureProductionRuntime({
+    workerId: `checkpoint-${firstWorker ? "worker1" : "worker2"}-${process.pid}`,
+    productionFlags: {
+      childExecutionEnabled: false, coordinationEnabled: false, consumeWaitOutcomes: false, canonicalAutomationEnabled: false,
+    },
+    runtimeOptions: {
+      toolRuntimeFactory: checkpointToolRuntime,
+      ...(firstWorker ? {
+        modelRuntimeFactory() {
+          let modelCalls = 0
+          return {
+            adapter: {
+              id: "checkpoint-worker1-fixture-model", profile: modelProfile(),
+              async *stream() {
+                modelCalls += 1
+                if (modelCalls === 1) {
+                  if (checkpoint.checkpointKind === "tool-result") {
+                    say("CHECKPOINT_TOOL_STEP_READY " + checkpoint.readCallId)
+                    await waitForCommand("release-checkpoint-tool-call")
+                  }
+                  yield { type: "tool_call_completed", callId: checkpoint.readCallId, name: "jobs.search", arguments: { fixture: ids.suffix } }
+                  yield { type: "completed", finishReason: "tool_calls" }
+                  return
+                }
+                if (modelCalls === 2) {
+                  if (checkpoint.checkpointKind !== "tool-result") await persistCheckpointWait()
+                  say("CHECKPOINT_PROVIDER_ACTIVE " + checkpoint.checkpointKind)
+                  await waitForCommand("release-checkpoint-provider")
+                  yield { type: "text_delta", text: "must-not-be-observed-after-worker1-kill" }
+                  yield { type: "completed", finishReason: "stop" }
+                  return
+                }
+                throw new Error("unexpected_checkpoint_worker1_model_round")
+              },
+            },
+            registry: {}, candidates: [],
+          }
+        },
+      } : {}),
+      ...(!firstWorker ? {
+        modelRuntimeFactory({ state }) {
+          let modelCalls = 0
+          return {
+            adapter: {
+              id: "checkpoint-worker2-fixture-model", profile: modelProfile(),
+              async *stream(request) {
+                modelCalls += 1
+                if (modelCalls !== 1) throw new Error("unexpected_checkpoint_worker2_model_round")
+                const proof = await checkpointResumeEvidence(state, request)
+                say("CHECKPOINT_RESUME_CONTEXT_OK " + checkpoint.checkpointKind + " " + proof)
+                yield { type: "text_delta", text: "Recovered durable checkpoint after Worker restart for request: Resume and report the persisted child result. CHECKPOINT_FINAL_" + checkpoint.checkpointKind + "_" + ids.suffix + "_" + proof }
+                yield { type: "completed", finishReason: "stop" }
+              },
+            },
+            registry: {}, candidates: [],
+          }
+        },
+      } : {}),
+    },
+    bootstrapOptions: {
+      ownerId: `checkpoint-${firstWorker ? "worker1" : "worker2"}-${process.pid}`,
+      turnRecoveryIntervalMs: 10,
+      waitResolver: { intervalMs: 10, ownerId: `checkpoint-wait-resolver-${process.pid}` },
+    },
+  })
+  if (!firstWorker) {
+    const { startAgentWakeupConsumer } = await import("../runtime/wakeup/consumer.ts")
+    wakeupConsumer = startAgentWakeupConsumer(pool)
+  }
+  say(`CHECKPOINT_WORKER_READY ${firstWorker ? "worker1" : "worker2"}`)
+  await waitForStop()
+}
+
 async function run() {
   if (mode === "accept-message") await acceptMessage()
   else if (mode === "park-parent") await makeFirstWorker()
@@ -599,6 +807,9 @@ async function run() {
   else if (mode === "accept-active-follow-up") await acceptActiveFollowUp()
   else if (mode === "resume-active-follow-up") await makeFollowUpResumeWorker()
   else if (mode === "replay-active-terminal") await replayActiveTerminal()
+  else if (mode === "checkpoint-worker1") await makeCheckpointWorker(true)
+  else if (mode === "checkpoint-worker2") await makeCheckpointWorker(false)
+  else if (mode === "resolve-checkpoint") await resolveCheckpointWait()
   else throw new Error("unknown_restart_fixture_mode")
 }
 
@@ -614,6 +825,7 @@ try {
     process.stdin.pause()
     process.stdin.destroy()
   }
+  if (wakeupConsumer) await runShutdownStage("wakeup_consumer_close", async () => { await wakeupConsumer.close(); wakeupConsumer = undefined })
   await runShutdownStage("bootstrap_close", async () => { if (bootstrap) await bootstrap.close() })
   await runShutdownStage("pool_end", async () => { await pool.end() })
   await runShutdownStage("shared_redis_connections_close", async () => {
