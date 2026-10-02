@@ -9,6 +9,7 @@ import type { TurnLease } from "./lease.js"
 import type { TurnEngineCompletionGate, TurnExecutionOptions, TurnExecutionStepBudget } from "./turn-execution-types.js"
 import type { SteeringMarkerContext } from "../context/steering-marker-store.js"
 import type { SteeringMarkerPayload } from "../context/steering-marker.js"
+import type { ToolCallRecovery, TurnEngineToolResult } from "./turn-engine-tool-types.js"
 
 export type TurnEngineItemType = "agent_message" | "reasoning_summary" | "tool_call" | "tool_result" | "question" | "error"
 export type TurnEngineItemPhase = "commentary" | "final_answer" | null
@@ -54,39 +55,15 @@ export type AtomicTurnCompletionInput = {
   readonly stepCount: number
   readonly toolCallCount: number
   readonly usage: TurnUsage
+  /** Validated discovery output persisted in the root task's terminal receipt. */
+  readonly interactiveDiscoveryShortlist?: RepositoryJsonValue
 }
 
 export type AtomicTurnCompletionResult =
   | { readonly status: "pending_follow_up" }
   | { readonly status: "completed"; readonly finalItemId: string; readonly events: readonly TurnEngineEvent[] }
 
-export type TurnEngineToolCall = {
-  readonly id: string
-  readonly name: string
-  readonly arguments: unknown
-}
-
-export type TurnEngineToolResult = {
-  readonly id: string
-  readonly toolName: string
-  readonly toolVersion: string
-  readonly status: "completed" | "failed" | "cancelled"
-  readonly output?: unknown
-  readonly errorCode: string | null
-}
-
-export type PersistedToolCallRecovery = {
-  readonly call: TurnEngineToolCall
-  readonly toolVersion: string
-  readonly stepId: string
-  readonly callItem: { readonly id: string; readonly revision: number }
-  readonly resultItem?: { readonly id: string; readonly revision: number }
-  readonly durableResult?: TurnEngineToolResult
-}
-
-export type ToolCallRecovery = PersistedToolCallRecovery & {
-  readonly action: "replay" | "reconcile" | "fail" | "terminal"
-}
+export type { PersistedToolCallRecovery, ToolCallRecovery, TurnEngineToolCall, TurnEngineToolResult } from "./turn-engine-tool-types.js"
 
 export type TurnEngineStore = {
   startStep(input: {

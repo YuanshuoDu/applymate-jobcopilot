@@ -19,8 +19,8 @@ import { capabilities, limits } from "./canonical-turn-config.js"
 import type { TurnExecutor, TurnExecutionResult } from "./turns/turn-queue.js"
 import type { TurnLease } from "./turns/lease.js"
 import type { TurnEngineOptions, TurnEngineStore } from "./turns/turn-engine-types.js"
-import { loadCanonicalTurnState, type CanonicalTurnState, type CanonicalTurnStateLoadOptions } from "./canonical-turn-state.js"
-import { isSelectedJobRootTool, loadTaskGraphCurrentObservation, selectedJobSnapshot, selectedJobToolAllowed } from "./canonical-turn-task-graph-context.js"
+import { INTERACTIVE_DISCOVERY_INTENT, loadCanonicalTurnState, type CanonicalTurnState, type CanonicalTurnStateLoadOptions } from "./canonical-turn-state.js"
+import { isSelectedJobRootTool, loadTaskGraphCurrentObservation, selectedJobSnapshot } from "./canonical-turn-task-graph-context.js"
 import { loadSelectedJobPreparation, type SelectedJobPreparation } from "./selected-job-preparation.js"
 import { failSelectedJobPreparationUnavailable } from "./selected-job-preparation-gate.js"
 import { taskGraphRuntimeForTurn } from "./subagents/task-graph-templates.js"
@@ -39,6 +39,9 @@ import { selectedJobArtifactCompletionGateWithWitness } from "./selected-job-com
 import { selectedJobArtifactFinalizationGuard } from "./selected-job-finalization-guard.js"
 import { createAgentArtifactRepository, findCurrentDraftHeadWithClient, findReviewReceiptWithClient, type AgentArtifactDraftHead, type AgentArtifactDraftHeadScope } from "../db/agent-artifact-repo.js"
 import { runTurnBoundaryCompactionPreflight, runTurnBoundaryContextCompaction } from "./context/turn-boundary-compaction-preflight.js"
+import { createCanonicalRootToolGuards, failInteractiveDiscoveryUnavailable, interactiveDiscoveryCompletionGate, withInteractiveDiscoveryFinalResponse } from "./interactive-discovery-runtime.js"
+import { INTERACTIVE_DISCOVERY_TEMPLATES, rootToolNames, rootToolSurface, terminalInteractiveDiscoveryShortlist, type InteractiveDiscoveryShortlistProjection } from "./interactive-discovery-contract.js"
+import type { SubagentTaskRecord } from "./subagents/types.js"
 
 export { durableLifecycleSink } from "./turns/canonical-runtime-tool-recovery.js"
 export type { UsageAuthorization } from "./canonical-turn-runtime-model.js"
@@ -56,6 +59,8 @@ export type CanonicalTurnRuntimeOptions = {
   readonly selectedJobArtifactHeadReader?: (scope: AgentArtifactDraftHeadScope) => Promise<AgentArtifactDraftHead | null>
   /** Test seam for reloading the server-selected source digest at Turn completion. */
   readonly selectedJobSourceDigestLoader?: (userId: string, jobId: string) => Promise<string | null>
+  /** Test seam for rebuilding the shortlist from persisted owner-scoped child results and observations. */
+  readonly interactiveDiscoveryShortlistLoader?: (input: { readonly pool: Pick<pg.Pool, "connect">; readonly lease: TurnLease; readonly root: Pick<SubagentTaskRecord, "id" | "attemptCount"> }) => Promise<InteractiveDiscoveryShortlistProjection | undefined>
   readonly modelRuntimeFactory?: (input: { userId: string; config?: AiConfig; state: CanonicalTurnState }) => Promise<HarnessModelRuntime> | HarnessModelRuntime
   readonly authorizeUsage?: UsageAuthorizer
   /** Server-owned scheduler and trusted template registry; model input never supplies its task/tenant fence. */
@@ -103,8 +108,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
   const execute: TurnExecutor = async ({ lease, signal }): Promise<TurnExecutionResult> => {
     if (closed) throw new Error("canonical_runtime_closed")
     const terminal = await reconcileTerminal?.({ lease, now: now() })
-    // A woke Turn may still carry a prior waiting result until ensure() rebinds it.
-    // Only durable terminal results may short-circuit execution.
+    // A woke Turn may carry a prior waiting result until ensure() rebinds it; only durable terminal results short-circuit.
     if (terminal && !isResumableRootResult(terminal.result)) {
       await executionProjection.finish({
         userId: lease.userId,
@@ -127,12 +131,13 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     })
     if (!taskGraphPlanningEnabled && !signal.aborted) {
       const selectedJobPreparation = await (options.selectedJobPreparationLoader ?? loadSelectedJobPreparation)(pool, lease, now())
-      // The selector is asynchronous; Stop or lease loss can arrive while it
-      // is reading. Let TurnEngine preserve the canonical interrupted result.
+      // Let TurnEngine preserve interruption if Stop or lease loss arrives during this async read.
       if (!signal.aborted && selectedJobPreparation) {
         return failSelectedJobPreparationUnavailable({ lease, state, rootTasks, executionProjection, sessionProjection, now })
       }
     }
+    const interactiveDiscoveryMode = state.intent?.kind === INTERACTIVE_DISCOVERY_INTENT.kind && state.intent.version === INTERACTIVE_DISCOVERY_INTENT.version && !selectedJobMode
+    if (interactiveDiscoveryMode && !taskGraphPlanningEnabled && !signal.aborted) return failInteractiveDiscoveryUnavailable({ lease, state, rootTasks, executionProjection, sessionProjection, now })
     const selectedPolicy = createCanonicalPolicy(state.toolPolicySnapshot, coordinationEnabled, taskGraphPlanningEnabled)
     const configuredCapabilities = capabilities(state.toolPolicySnapshot).filter(capability => capability !== "canManageChildren")
     const toolCapabilities = [...new Set([...configuredCapabilities, ...(coordinationEnabled ? ["coordination", "canManageChildren"] : [])])]
@@ -152,19 +157,19 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     } : undefined
     const toolRuntime = options.toolRuntimeFactory?.({ pool, policy: selectedPolicy, manager, state }) ?? createWorkerToolRuntime(pool, { sink: sinkProxy, resolveOwner }, selectedPolicy, coordination)
     let taskGraphParentAttemptCount: number | null = null
-    registerTaskGraphPlanningTool(toolRuntime.registry, taskGraphPlanningEnabled, { commandPort: options.taskGraphCommandPort, templates: taskGraphTemplates, turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: () => taskGraphParentAttemptCount })
+    registerTaskGraphPlanningTool(toolRuntime.registry, taskGraphPlanningEnabled, { commandPort: options.taskGraphCommandPort, templates: interactiveDiscoveryMode ? INTERACTIVE_DISCOVERY_TEMPLATES : taskGraphTemplates, turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: () => taskGraphParentAttemptCount })
     if (coordinationEnabled) assertCanonicalCoordinationSurface(toolRuntime.registry, toolCapabilities)
-    const rootTools = toolRuntime.registry.list(toolCapabilities).filter(definition => !selectedJobMode || isSelectedJobRootTool(definition))
-    const allowedActions = rootTools.flatMap((definition) => {
-      const name = definition && typeof definition === "object" && "name" in definition ? (definition as { name?: unknown }).name : undefined
-      return typeof name === "string" ? [name] : []
-    })
+    const rootTools = rootToolSurface(toolRuntime.registry.list(toolCapabilities), selectedJobMode, interactiveDiscoveryMode, isSelectedJobRootTool)
+    const allowedActions = rootToolNames(rootTools)
     const root = await rootTasks.ensure({ lease, goal: state.goal, modelProfileSnapshot: state.modelProfileSnapshot, toolPolicySnapshot: state.toolPolicySnapshot, budgetSnapshot: state.budgetSnapshot, allowedActions, now: now() })
     taskGraphParentAttemptCount = root.attemptCount; let acceptedGraphWitness: Extract<Awaited<ReturnType<typeof selectedJobArtifactCompletionGateWithWitness>>, { ok: true }>["witness"] | undefined
     const terminalGuard: Parameters<typeof createPgTurnEngineStore>[1] = selectedJobMode ? client => selectedJobArtifactFinalizationGuard({ client, commandPort: options.taskGraphCommandPort, lease, root, selectedJobId: selectedJobPreparation?.jobId, acceptedGraphWitness,
       readCurrentDraftHead: findCurrentDraftHeadWithClient, readCurrentSourceDigest: (queryClient, scope) => readSelectedJobSourceDigestWithClient(queryClient, scope.userId, scope.jobId), readCurrentReviewReceipt: findReviewReceiptWithClient,
     }) : undefined
-    const turnStore = options.turnEngineStoreFactory?.(pool, terminalGuard) ?? createPgTurnEngineStore(pool, terminalGuard)
+    const baseTurnStore = options.turnEngineStoreFactory?.(pool, terminalGuard) ?? createPgTurnEngineStore(pool, terminalGuard)
+    let acceptedDiscoveryShortlist: InteractiveDiscoveryShortlistProjection | undefined
+    let discoveryFailureCode: "discovery_runtime_unavailable" | "discovery_runtime_failed" = "discovery_runtime_failed"
+    const turnStore = interactiveDiscoveryMode ? withInteractiveDiscoveryFinalResponse(baseTurnStore, () => acceptedDiscoveryShortlist) : baseTurnStore
     const initialRootSnapshot = selectedJobMode ? selectedJobSnapshot(state.snapshot) : state.snapshot
     const initialModelSnapshot = taskGraphPlanningEnabled ? await loadTaskGraphCurrentObservation(initialRootSnapshot, options.taskGraphCommandPort, lease, root) : initialRootSnapshot
     const owner = executionOwnerFence({ kind: "turn", taskId: root.id, lease })
@@ -189,6 +194,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       ? await loadTaskGraphCurrentObservation(rootSnapshot, options.taskGraphCommandPort, lease, root)
       : preflight.compacted ? rootSnapshot : initialModelSnapshot
     const routeTool = createToolRouterExecutor(toolRuntime.router)
+    const rootToolGuards = createCanonicalRootToolGuards({ interactiveDiscoveryMode, selectedJobMode, routeTool, validateArguments: (name, args) => toolRuntime.registry.validateArguments(name, args, "1") })
     const inputStore = createPgInputClaimStore(pool, state.scope)
     const baseContextBuilder = options.contextBuilderFactory?.({ pool, scope: state.scope }) ?? new StepContextBuilder(inputStore, createPgContextOwnerFence(pool))
     const contextBuilder: TurnEngineOptions["contextBuilder"] = {
@@ -201,22 +207,18 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const actorRole = (record(state.toolPolicySnapshot).role as PolicyRole | undefined) ?? "orchestrator"
     const engine = new TurnEngine({
       lease, scope: state.scope, goal: state.goal, snapshot: modelSnapshot, contextBuilder,
-      store: turnStore, model, tools: rootTools,
-      executeTool: input => selectedJobMode && !selectedJobToolAllowed(input.call.toolName)
-        ? Promise.resolve({ id: input.call.id, toolName: input.call.toolName, toolVersion: input.call.toolVersion, status: "failed" as const, errorCode: "selected_job_root_tool_disabled" })
-        : routeTool(input),
+      store: turnStore, model, tools: rootTools, ...rootToolGuards,
       rootInputId: state.rootInputId, rootTaskId: root.id, taskId: root.id,
       actorRole, capabilities: toolCapabilities,
-      validateToolArguments: (name, input) => selectedJobMode && !selectedJobToolAllowed(name)
-        ? "selected_job_root_tool_disabled"
-        : toolRuntime.registry.validateArguments(name, input, "1"), signal,
+      signal,
       budget: limits(state.budgetSnapshot), resume: state.resume, now, publishReasoningSummary: false,
       steeringMarkerState: { active: state.steeringMarkers?.active ?? [] }, ...(taskGraphPlanningEnabled ? { refreshTaskGraphAfterReadyWait: (snapshot: TurnEngineOptions["snapshot"]) => loadTaskGraphCurrentObservation(snapshot, options.taskGraphCommandPort, lease, root), refreshTaskGraphAfterPlan: (snapshot: TurnEngineOptions["snapshot"]) => loadTaskGraphCurrentObservation(snapshot, options.taskGraphCommandPort, lease, root) } : {}),
       ...(state.pendingToolCalls?.length ? { toolCallRecovery: classifyToolCallRecovery(state.pendingToolCalls, (name, version) => toolRuntime.registry.resolve(name, version)) } : {}),
-      ...(rootTasks.checkCompletion || selectedJobMode ? { completionGate: async () => {
+      ...(rootTasks.checkCompletion || selectedJobMode || interactiveDiscoveryMode ? { completionGate: async () => {
         acceptedGraphWitness = undefined
         const children = await rootTasks.checkCompletion?.({ lease, rootTaskId: root.id, now: now() })
         if (children && !children.ok) return children
+        if (interactiveDiscoveryMode) return interactiveDiscoveryCompletionGate({ pool, lease, root, load: options.interactiveDiscoveryShortlistLoader, accept: shortlist => { acceptedDiscoveryShortlist = shortlist }, markUnavailable: () => { discoveryFailureCode = "discovery_runtime_unavailable" } })
         if (!selectedJobMode) return children ?? { ok: true as const }
         const result = await selectedJobArtifactCompletionGateWithWitness({
           commandPort: options.taskGraphCommandPort, lease, root, selectedJobId: selectedJobPreparation?.jobId,
@@ -236,7 +238,8 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     await executionProjection.start({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId })
     await sessionProjection.start({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId })
     const result = await engine.run()
-    await rootTasks.finish({ lease, rootTaskId: root.id, result, now: now() })
+    const discoveryShortlist = interactiveDiscoveryMode ? terminalInteractiveDiscoveryShortlist(result.status, acceptedDiscoveryShortlist, discoveryFailureCode) : undefined
+    await rootTasks.finish({ lease, rootTaskId: root.id, result, ...(discoveryShortlist ? { metadata: { interactiveDiscoveryShortlist: discoveryShortlist } } : {}), now: now() })
     // The durable root is finalized first; a projection failure remains surfaced so queue retry can reconcile it.
     await executionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, result })
     await sessionProjection.finish({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, result })

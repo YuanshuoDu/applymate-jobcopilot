@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
-import { drainTaskGraphStopOutbox, TASK_GRAPH_STOP_OUTBOX_TOPIC } from "./task-graph-stop-outbox.js"
+import { drainTaskGraphStopOutbox, startTaskGraphStopOutboxConsumer, TASK_GRAPH_STOP_OUTBOX_TOPIC } from "./task-graph-stop-outbox.js"
 import { taskGraphLifecycleKey, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import type { PgSubagentPool } from "./types.js"
 
@@ -196,5 +196,18 @@ describe("TaskGraph stop outbox projection", () => {
     expectDispatchDeletions(fake, ["child-1"])
     expect(fake.deletedDispatches).toEqual([["session-1", "subagent-dispatch:child-1"]])
     expect(fake.dispatchRows.map(row => row.id)).toEqual(["unrelated-task", "unrelated-session", "unrelated-topic", "published-task"])
+  })
+
+  it("runs stopped-root recovery from the always-on consumer without a child executor", async () => {
+    const fake = new FakeStopPool({ nodes: [] })
+    const recoverStoppedRoots = vi.fn(async () => 0)
+    const consumer = startTaskGraphStopOutboxConsumer(pool(fake), {
+      pollMs: 30_000,
+      drain: vi.fn(async () => 0),
+      recoverStoppedRoots,
+    })
+
+    expect(recoverStoppedRoots).toHaveBeenCalledOnce()
+    await consumer.close()
   })
 })

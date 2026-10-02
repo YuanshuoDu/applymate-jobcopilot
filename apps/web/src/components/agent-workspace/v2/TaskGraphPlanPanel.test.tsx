@@ -191,4 +191,48 @@ describe('TaskGraphPlanPanel', () => {
     expect(html).not.toContain('NEW_ROOT_PLAN_SECRET')
     expect(html).not.toContain('NEW_CHILD_SECRET')
   })
+
+  it('restores completed, partial, and failed shortlists only for the selected persisted graph', () => {
+    const graphItems = [item({ schemaVersion: 'agent-harness.v2.task-graph', nodes: [
+      { key: 'scout', templateId: 'scout', goal: 'Find jobs', successCriteria: ['Collect evidence'], dependsOn: [], depth: 1, taskId: 'task-a' },
+    ] })]
+    const identity = selectedTaskGraphIdentity(graphItems, 'session-1')!
+    const states = [
+      { status: 'completed', items: [{ jobId: 'job-42', score: 8.5, evidenceIds: ['read:job:job-42'] }], failures: [] },
+      { status: 'partial', items: [{ jobId: 'job-42', score: 8.5, evidenceIds: ['read:job:job-42'] }], failures: [
+        'discovery_runtime_failed', 'scout_task_missing', 'analyst_task_missing', 'scout_task_failed',
+        'analyst_task_failed', 'scout_task_incomplete', 'analyst_task_incomplete',
+      ] },
+      { status: 'failed', items: [], failures: ['discovery_runtime_unavailable'] },
+    ] as const
+
+    for (const state of states) {
+      const html = renderToStaticMarkup(<TaskGraphPlanPanel
+        sessionId="session-1"
+        items={graphItems}
+        tasks={tasks}
+        discoveryShortlist={{ identity, result: { schemaVersion: 1, ...state } }}
+      />)
+      expect(html).toContain(`data-discovery-shortlist-status="${state.status}"`)
+      expect(html).toContain(state.status === 'completed' ? 'Completed:' : state.status === 'partial' ? 'Partial results:' : 'Failed:')
+      for (const code of state.failures) expect(html).toContain(`data-discovery-failure-code="${code}"`)
+      if (state.items.length) {
+        expect(html).toContain('job-42')
+        expect(html).toContain('8.5 / 10')
+        expect(html).toContain('read:job:job-42')
+      } else expect(html).not.toContain('job-42')
+      expect(html).not.toContain('PRIVATE_TOOL_OUTPUT')
+    }
+
+    const staleHtml = renderToStaticMarkup(<TaskGraphPlanPanel
+      sessionId="session-1"
+      items={graphItems}
+      tasks={tasks}
+      discoveryShortlist={{
+        identity: { ...identity, turnId: 'older-turn' },
+        result: { schemaVersion: 1, status: 'completed', items: [{ jobId: 'stale-job', score: 9, evidenceIds: ['read:job:stale-job'] }], failures: [] },
+      }}
+    />)
+    expect(staleHtml).not.toContain('stale-job')
+  })
 })

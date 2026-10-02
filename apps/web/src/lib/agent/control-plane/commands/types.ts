@@ -24,6 +24,13 @@ export interface SelectedJobPreparationScope {
 
 export interface StartCommand extends CommandIdentity {
   content: InputContentPart[]
+  intent?: ServerAgentTurnIntent
+}
+
+/** Server-owned intent metadata persisted with the root Turn input envelope. */
+export interface ServerAgentTurnIntent {
+  kind: "interactive_discovery_shortlist"
+  version: 1
 }
 
 export interface MessageCommand extends CommandIdentity {

@@ -6,6 +6,8 @@ const mocks = vi.hoisted(() => ({
   prepareAiRoute: vi.fn(),
   sessionFindFirst: vi.fn(),
   turnFindFirst: vi.fn(),
+  discoveryFeatureEnabled: vi.fn(),
+  hasEffectiveEntitlement: vi.fn(),
   sseResponse: vi.fn(),
   runAgentPipeline: vi.fn(),
 }))
@@ -22,8 +24,9 @@ vi.mock('@/lib/db', () => ({
     agentTurn: { findFirst: mocks.turnFindFirst },
   },
 }))
-vi.mock('@/lib/entitlements', () => ({ hasEffectiveEntitlement: vi.fn().mockResolvedValue(true) }))
+vi.mock('@/lib/entitlements', () => ({ hasEffectiveEntitlement: mocks.hasEffectiveEntitlement }))
 vi.mock('@/lib/agent/run-service', () => ({ runAgentPipeline: mocks.runAgentPipeline }))
+vi.mock('@/lib/runtime-feature-flags', () => ({ isRuntimeAgentHarnessFeatureEnabled: mocks.discoveryFeatureEnabled }))
 
 // This test exits before the SSE callback runs. Mock its heavy dependencies so
 // the session-ownership assertion stays isolated when the full suite is busy.
@@ -39,9 +42,13 @@ describe('agent run API session binding', () => {
     mocks.prepareAiRoute.mockReset()
     mocks.sessionFindFirst.mockReset()
     mocks.turnFindFirst.mockReset()
+    mocks.discoveryFeatureEnabled.mockReset()
+    mocks.hasEffectiveEntitlement.mockReset()
     mocks.sseResponse.mockReset()
     mocks.runAgentPipeline.mockReset()
     mocks.prepareAiRoute.mockResolvedValue({ userId: 'user_1', cfg: { provider: 'test', model: 'm1' } })
+    mocks.discoveryFeatureEnabled.mockResolvedValue(false)
+    mocks.hasEffectiveEntitlement.mockResolvedValue(true)
   })
 
   it('refuses to start a pipeline for a deleted or foreign requested session', async () => {
@@ -109,7 +116,7 @@ describe('agent run API session binding', () => {
     expect(mocks.runAgentPipeline).not.toHaveBeenCalled()
   })
 
-  it('preserves the legacy SSE path when no session is supplied', async () => {
+  it('preserves the legacy SSE path when no session is supplied and the discovery gate is off', async () => {
     mocks.sseResponse.mockReturnValueOnce(new Response('legacy-sse', { status: 200 }))
     const { GET } = await import('./route')
 
@@ -117,9 +124,44 @@ describe('agent run API session binding', () => {
     if (!response) throw new Error('Expected a response')
 
     expect(response.status).toBe(200)
+    expect(mocks.discoveryFeatureEnabled).toHaveBeenCalledWith('AGENT_INTERACTIVE_DISCOVERY_TASK_GRAPH', 'user_1')
     expect(mocks.sessionFindFirst).not.toHaveBeenCalled()
     expect(mocks.turnFindFirst).not.toHaveBeenCalled()
     expect(mocks.sseResponse).toHaveBeenCalledTimes(1)
     expect(mocks.runAgentPipeline).not.toHaveBeenCalled()
+  })
+
+  it('fences a no-session legacy SSE request while interactive TaskGraph discovery is enabled', async () => {
+    mocks.discoveryFeatureEnabled.mockResolvedValueOnce(true)
+    const { GET } = await import('./route')
+
+    const response = await GET(new NextRequest('http://localhost/api/agent/run?autonomous=true') as never)
+    if (!response) throw new Error('Expected a response')
+
+    expect(response.status).toBe(409)
+    await expect(response.json()).resolves.toEqual({
+      error: 'A canonical Agent discovery session is required while TaskGraph discovery is enabled.',
+      code: 'legacy_agent_run_blocked_by_interactive_discovery',
+    })
+    expect(mocks.discoveryFeatureEnabled).toHaveBeenCalledWith('AGENT_INTERACTIVE_DISCOVERY_TASK_GRAPH', 'user_1')
+    expect(mocks.sessionFindFirst).not.toHaveBeenCalled()
+    expect(mocks.turnFindFirst).not.toHaveBeenCalled()
+    expect(mocks.sseResponse).not.toHaveBeenCalled()
+    expect(mocks.runAgentPipeline).not.toHaveBeenCalled()
+  })
+
+  it('preserves the entitlement rejection before checking the interactive discovery fence', async () => {
+    mocks.hasEffectiveEntitlement.mockResolvedValueOnce(false)
+    mocks.discoveryFeatureEnabled.mockResolvedValueOnce(true)
+    const { GET } = await import('./route')
+
+    const response = await GET(new NextRequest('http://localhost/api/agent/run') as never)
+    if (!response) throw new Error('Expected a response')
+
+    expect(response.status).toBe(403)
+    await expect(response.json()).resolves.toEqual({ error: 'Your current plan does not include autonomous applications.' })
+    expect(mocks.hasEffectiveEntitlement).toHaveBeenCalledWith('user_1', 'auto_apply')
+    expect(mocks.discoveryFeatureEnabled).not.toHaveBeenCalled()
+    expect(mocks.sseResponse).not.toHaveBeenCalled()
   })
 })

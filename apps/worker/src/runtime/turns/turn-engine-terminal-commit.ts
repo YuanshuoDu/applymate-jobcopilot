@@ -98,7 +98,10 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
       WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $1 FOR UPDATE`, [owner.taskId, owner.sessionId, owner.turnId])
     const task = root.rows[0]
     if (!task) throw conflict(`root task ${owner.taskId}`)
-    const result = { status: "completed", stepCount: input.stepCount, toolCallCount: input.toolCallCount, finalItemId: input.finalItemId, waitId: null }
+    const result = {
+      status: "completed", stepCount: input.stepCount, toolCallCount: input.toolCallCount, finalItemId: input.finalItemId, waitId: null,
+      ...(input.interactiveDiscoveryShortlist === undefined ? {} : { structuredResult: { interactiveDiscoveryShortlist: input.interactiveDiscoveryShortlist } }),
+    }
     const committed = turnRow.status === "completed"
     if (committed && (turnRow.finalResponse !== input.response || task.status !== "completed" || task.leaseOwner !== null || Number(task.attemptCount) !== 1 || !sameJson(task.result, result))) throw conflict(`terminal receipt ${owner.turnId}`)
     if (!committed && (turnRow.status !== "in_progress" || task.status !== "running" || task.leaseOwner !== owner.ownerId || Number(task.attemptCount) !== 1)) throw conflict(`root task ${owner.taskId} fence`)

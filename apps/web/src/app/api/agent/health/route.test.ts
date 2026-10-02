@@ -51,7 +51,7 @@ describe("agent health API", () => {
       last24hRuns: 2,
     })
     expect(body.agentHarnessFlags).toMatchObject({ environment: 'development', source: 'safe_defaults', allDefaultOff: true })
-    expect(Object.values(body.agentHarnessFlags.flags)).toHaveLength(11)
+    expect(Object.values(body.agentHarnessFlags.flags)).toHaveLength(12)
     expect(mocks.findMany).toHaveBeenCalledWith({
       where: { userId: "user_1" },
       orderBy: { createdAt: "desc" },

@@ -5,7 +5,7 @@ import type { InputContentPart, TurnSource } from "@jobcopilot/agent-protocol"
 
 import { appendAgentEventWithOutboxInTransaction } from "../../session/fact-store"
 import { activeTurnChanged, sessionNotFound } from "./errors"
-import type { CommandDisposition, CommandIdentity, InterruptDisposition, SelectedJobPreparationScope } from "./types"
+import type { CommandDisposition, CommandIdentity, InterruptDisposition, SelectedJobPreparationScope, ServerAgentTurnIntent } from "./types"
 
 export { fallbackDisposition, findExistingCommand } from "./existing-command"
 export type { ExistingCommand } from "./existing-command"
@@ -32,6 +32,7 @@ export interface ActiveTurn {
   source: string
   status: string
   revision: number
+  input?: unknown
 }
 
 export interface AcceptedCommandFacts {
@@ -76,7 +77,7 @@ export async function findActiveTurn(
   return tx.agentTurn.findFirst({
     where: { sessionId, userId, status: { in: [...ACTIVE_TURN_STATUSES] } },
     orderBy: { createdAt: "asc" },
-    select: { id: true, source: true, status: true, revision: true },
+    select: { id: true, source: true, status: true, revision: true, input: true },
   })
 }
 
@@ -90,6 +91,7 @@ export async function createRootTurn(
   content: InputContentPart[],
   explicitGoal?: string,
   selectedJobPreparation?: SelectedJobPreparationScope,
+  intent?: ServerAgentTurnIntent,
 ): Promise<ActiveTurn> {
   const goal = explicitGoal ?? (content.filter((part) => part.type === "text").map((part) => part.text).join("\n").trim() || "Process the provided content")
   const turn = await tx.agentTurn.create({
@@ -104,6 +106,7 @@ export async function createRootTurn(
         content,
         clientMessageId: command.clientMessageId,
         ...(selectedJobPreparation ? { selectedJobPreparation } : {}),
+        ...(intent ? { intent } : {}),
       }),
       modelProfileSnapshot: json({}),
       toolPolicySnapshot: json({}),

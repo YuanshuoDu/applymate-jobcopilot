@@ -11,9 +11,11 @@ import {
   sessionNotFound,
 } from "../../query-helpers"
 import { taskDto, type TaskQueryRow } from "../../query-dto"
+import { projectInteractiveDiscoveryShortlist } from "./interactive-discovery-shortlist"
 
 const MAX_REFERENCED_TASK_IDS = 9
 const MAX_TASK_ID_LENGTH = 128
+const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "interrupted", "cancelled", "closed"])
 
 const TASK_SELECT = {
   id: true, sessionId: true, turnId: true, rootTaskId: true, parentTaskId: true, path: true,
@@ -166,11 +168,18 @@ export async function GET(request: NextRequest, context: RouteContext) {
         && row.rootTaskId === graph.taskId && graphTaskIds.includes(row.id))
       const tasks = scopedRows.map(taskDto)
       const projection = projectPlanLedger({ sessionId, revision: graph.revision, rootTaskId: graph.taskId, graph: graph.content, tasks })
+      const identity = { sessionId, graphItemId: graph.id, turnId: graph.turnId, rootTaskId: graph.taskId, revision: graph.revision }
       const planLedger = projection ? {
-        identity: { sessionId, graphItemId: graph.id, turnId: graph.turnId, rootTaskId: graph.taskId, revision: graph.revision },
+        identity,
         projection,
       } : null
-      return ok({ tasks, planLedger, page: { hasMore: false, nextCursor: null } })
+      const rootTask = scopedRows.find((row) => row.id === graph!.taskId && row.sessionId === sessionId
+        && row.turnId === graph!.turnId && row.rootTaskId === graph!.taskId && row.parentTaskId === null
+        && row.role === "orchestrator" && row.taskType === "root")
+      const shortlist = rootTask && TERMINAL_TASK_STATUSES.has(rootTask.status)
+        ? projectInteractiveDiscoveryShortlist(rootTask.result)
+        : null
+      return ok({ tasks, planLedger, ...(shortlist ? { discoveryShortlist: { identity, result: shortlist } } : {}), page: { hasMore: false, nextCursor: null } })
     }
 
     const rows = await db.subAgentTask.findMany({

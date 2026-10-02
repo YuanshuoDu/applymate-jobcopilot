@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
+import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 
 import { commitTurnTerminal } from "./turn-engine-terminal-commit.js"
 
@@ -148,6 +149,36 @@ describe("atomic Turn terminal commit", () => {
     expect(rootUpdate).not.toMatch(/clock_timestamp|interruptRequestedAt/)
     expect(turnUpdate).toContain('AND "leaseExpiresAt" > $5')
     expect(turnUpdate).not.toContain("clock_timestamp")
+  })
+
+  it("commits the validated discovery shortlist in the root receipt and accepts only identical replay", async () => {
+    const fake = makePool()
+    const shortlist: RepositoryJsonValue = {
+      schemaVersion: 1,
+      status: "completed",
+      items: [{ jobId: "job-1", score: 8.5, evidenceIds: ["read:job:job-1"] }],
+      failures: [],
+    }
+    const discoveryInput = { ...input, interactiveDiscoveryShortlist: shortlist }
+
+    await expect(commitTurnTerminal(fake.pool, discoveryInput)).resolves.toMatchObject({ status: "completed", finalItemId: input.finalItemId })
+    await expect(commitTurnTerminal(fake.pool, discoveryInput)).resolves.toMatchObject({ status: "completed", finalItemId: input.finalItemId })
+
+    expect(fake.state.root.result).toEqual({
+      status: "completed", stepCount: 2, toolCallCount: 1, finalItemId: input.finalItemId, waitId: null,
+      structuredResult: { interactiveDiscoveryShortlist: shortlist },
+    })
+    expect(fake.calls.filter(({ sql }) => sql.includes('UPDATE "sub_agent_tasks"'))).toHaveLength(1)
+    const changedShortlist: RepositoryJsonValue = {
+      schemaVersion: 1,
+      status: "completed",
+      items: [{ jobId: "job-1", score: 9, evidenceIds: ["read:job:job-1"] }],
+      failures: [],
+    }
+    await expect(commitTurnTerminal(fake.pool, {
+      ...discoveryInput,
+      interactiveDiscoveryShortlist: changedShortlist,
+    })).rejects.toMatchObject({ name: "TurnEnginePersistenceConflict" })
   })
 
   it("validates before terminal writes and bypasses the guard on committed replay after source changes", async () => {

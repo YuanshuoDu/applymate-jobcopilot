@@ -220,6 +220,7 @@ async function taskGraphRootSurface(
   recoverHiddenMutation = false,
   forgedToolName = "agent.spawn",
   recoveredToolName = "agent.interrupt",
+  interactiveDiscovery = false,
 ) {
   const requests: HarnessModelRequest[] = []
   const events: RuntimeEvent[] = []
@@ -247,16 +248,23 @@ async function taskGraphRootSurface(
       ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
     }),
     taskGraphCommandPort: taskGraphCommandPort as never,
-    taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+    taskGraphTemplates: interactiveDiscovery ? {
+      scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
+      analyst: { role: "analyst", taskType: "job_analysis", allowedActions: ["jobs.get"] },
+      writer: { role: "writer", taskType: "cover_letter_draft", allowedActions: ["cover_letter.draft"] },
+      reviewer: { role: "reviewer", taskType: "cover_letter_review", allowedActions: ["artifact.review"] },
+    } : { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
     selectedJobPreparationLoader: async () => selectedJob ? { jobId: "job-1" } : undefined,
     stateLoader: async () => ({
       ...state(), toolPolicySnapshot: { capabilities: ["read"] },
+      ...(interactiveDiscovery ? { intent: { kind: "interactive_discovery_shortlist" as const, version: 1 as const } } : {}),
       ...(recoverHiddenMutation ? {
         pendingToolCalls: [{ call: { id: "persisted-hidden-call", name: recoveredToolName, arguments: recoveredToolName === "jobs.get" ? { jobId: "job-other" } : {} }, toolVersion: "1", stepId: "prior-step", callItem: { id: "persisted-call-item", revision: 0 } }],
         resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 0n, consumedInputIds: [], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
       } : {}),
     }),
     rootTaskStore: roots as never, turnEngineStoreFactory: () => store(events), contextBuilderFactory: () => contextBuilder(),
+    ...(interactiveDiscovery ? { interactiveDiscoveryShortlistLoader: async () => undefined } : {}),
     toolRuntimeFactory: () => ({
       registry: {
         list: () => definitions,
@@ -286,7 +294,7 @@ async function taskGraphRootSurface(
     if (!tool || typeof tool !== "object" || !("name" in tool) || typeof tool.name !== "string") return []
     return [tool.name]
   }) ?? []
-  return { toolNames, allowedActions, route, events }
+  return { toolNames, allowedActions, route, events, roots, requests }
 }
 
 describe("createCanonicalTurnRuntime", () => {
@@ -868,6 +876,30 @@ describe("createCanonicalTurnRuntime", () => {
     const recoveredRead = await taskGraphRootSurface(true, true, "agent.spawn", "jobs.get")
     expect(recoveredRead.route).not.toHaveBeenCalled()
     expect(JSON.stringify(recoveredRead.events)).not.toContain("PRIVATE_SOURCE_SENTINEL")
+  })
+
+  it("activates discovery restrictions only for the trusted intent and persists a failed root marker without a validated shortlist", async () => {
+    const discovery = await taskGraphRootSurface(false, false, "jobs.get", "jobs.get", true)
+    const safeRootTools = ["agent.plan", "agent.wait", "agent.list", "list_subagents"]
+    expect(discovery.toolNames).toEqual(expect.arrayContaining(safeRootTools))
+    expect(discovery.toolNames).not.toEqual(expect.arrayContaining(["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base", "agent.spawn", "agent.send", "agent.interrupt", "agent.close", "writer", "reviewer"]))
+    expect(discovery.allowedActions).toEqual(expect.arrayContaining(safeRootTools))
+    expect(discovery.allowedActions).not.toEqual(expect.arrayContaining(["jobs.search", "jobs.get", "cover_letter.draft", "artifact.review"]))
+    expect(JSON.stringify(discovery.requests[0]?.tools.find(tool => tool && typeof tool === "object" && "name" in tool && tool.name === "agent.plan"))).toContain("analyst")
+    expect(JSON.stringify(discovery.requests[0]?.tools.find(tool => tool && typeof tool === "object" && "name" in tool && tool.name === "agent.plan"))).not.toContain("writer")
+    expect(discovery.route).not.toHaveBeenCalled()
+    expect(JSON.stringify(discovery.events)).toContain("interactive_discovery_root_tool_disabled")
+    expect(discovery.roots.finish).toHaveBeenCalledWith(expect.objectContaining({
+      result: expect.objectContaining({ status: "failed" }),
+      metadata: { interactiveDiscoveryShortlist: { schemaVersion: 1, status: "failed", items: [], failures: ["discovery_runtime_failed"] } },
+    }))
+
+    const legacy = await taskGraphRootSurface(false)
+    expect(legacy.toolNames).toEqual(expect.arrayContaining(["jobs.search", "jobs.get", "agent.spawn", "agent.send"]))
+
+    const recovered = await taskGraphRootSurface(false, true, "agent.spawn", "jobs.get", true)
+    expect(recovered.route).not.toHaveBeenCalled()
+    expect(JSON.stringify(recovered.events)).toContain("interactive_discovery_root_tool_disabled")
   })
 
   it("settles the root after the real wait transition and releases its task lease", async () => {

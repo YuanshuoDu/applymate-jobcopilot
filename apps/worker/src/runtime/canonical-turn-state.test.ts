@@ -49,6 +49,18 @@ function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unk
 }
 
 describe("loadCanonicalTurnState", () => {
+  it("restores only the exact server-owned interactive-discovery intent", async () => {
+    const exact = pool({ turn: { input: { goal: "Find jobs", intent: { kind: "interactive_discovery_shortlist", version: 1 } }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} } })
+    await expect(loadCanonicalTurnState(exact, lease)).resolves.toMatchObject({
+      intent: { kind: "interactive_discovery_shortlist", version: 1 },
+    })
+
+    for (const intent of [undefined, { kind: "interactive_discovery_shortlist", version: 2 }, { kind: "interactive_discovery_shortlist", version: 1, userControlled: true }, { kind: "other", version: 1 }]) {
+      const value = pool({ turn: { input: { goal: "Find jobs", ...(intent ? { intent } : {}) }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} } })
+      await expect(loadCanonicalTurnState(value, lease)).resolves.not.toHaveProperty("intent")
+    }
+  })
+
   it("restores the latest scoped cognitive agenda receipt as audit state", async () => {
     const fake = pool({ turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} }, events: [agendaEvent("20"), agendaEvent("21", { stepId: "step-2" })] })
     const value = await loadCanonicalTurnState(fake, lease)

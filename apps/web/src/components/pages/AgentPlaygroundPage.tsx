@@ -17,6 +17,8 @@ import type { SubmissionPolicySettings } from '@/components/agent-workspace/auto
 import { useAgentSessionState, useAgentSessionUrl, type ActiveTurnStatus } from '@/components/agent-workspace/agent-session-state'
 import { AgentTurnComposerProvider, useAgentTurnComposer } from '@/components/agent-workspace/agent-turn-commands'
 import { useAgentTimeline } from '@/components/agent-workspace/v2/use-agent-timeline'
+import { useI18n } from '@/lib/i18n'
+import { AgentDiscoveryLauncher } from './AgentDiscoveryLauncher'
 
 // ── Role metadata ─────────────────────────────────────────────────────────────
 
@@ -44,6 +46,7 @@ const previewApplicationReviewJob: ApplyReadyJob = {
 
 export function AgentPlaygroundPage({ seedApplicationReviewQueue = false }: { seedApplicationReviewQueue?: boolean }) {
   const toast = useToast()
+  const { t } = useI18n()
 
   const { data: jobsData }                               = useApi<{ jobs: Array<{ status: string; workflowState: string }> }>('/api/jobs?pageSize=100')
   const { data: agentConfig } = useApi<AgentConfig>('/api/agent')
@@ -65,7 +68,7 @@ export function AgentPlaygroundPage({ seedApplicationReviewQueue = false }: { se
 
   const initialSessionRestoredRef = useRef(false)
   const {
-    currentRole, runLog, setRunLog, runDone, runSummary, addLog, startRun, stopRun, resetRun,
+    currentRole, runLog, setRunLog, runDone, runSummary, addLog, resetRun,
   } = useAgentPlaygroundRun({
     agentConfig,
     toast,
@@ -183,6 +186,14 @@ export function AgentPlaygroundPage({ seedApplicationReviewQueue = false }: { se
       setMobileSessionDrawerOpen={setMobileSessionDrawerOpen}
       sessionProps={sessionProps}
     >
+        <AgentDiscoveryLauncher
+          onTaskGraphStarted={result => {
+            selectSession(result.sessionId, 'Discover and shortlist relevant jobs using my saved job-search preferences.', 'Interactive discovery shortlist')
+            setSessionsRefreshVersion(v => v + 1)
+            window.dispatchEvent(new Event('applymate:sessions-changed'))
+          }}
+          t={t}
+        />
         <AgentTurnComposerProvider value={turnComposer}>
           <AgentUnifiedStream
             log={runLog}

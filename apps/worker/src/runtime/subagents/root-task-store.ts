@@ -1,18 +1,19 @@
 import type pg from "pg"
 import type { TurnEngineResult } from "../turns/turn-engine-types.js"
 import type { TurnEngineCompletionGateResult } from "../turns/turn-execution-types.js"
-import type { TurnExecutionResult } from "../turns/turn-queue.js"
 import type { TurnLease } from "../turns/lease.js"
 import type { PgSubagentPool, SubagentTaskRecord, SubagentTaskStatus } from "./types.js"
 import { rootTaskStatusFromTurnResult } from "./root-task-status.js"
+import { parseInteractiveDiscoveryShortlist, type InteractiveDiscoveryShortlistProjection } from "../interactive-discovery-contract.js"
+import { parseTerminalRootResult, type RootTaskTerminalReconciliation } from "./root-task-terminal-result.js"
 
-type ReconciledTurnStatus = Exclude<TurnExecutionResult["status"], "queued">
-export type RootTaskReconciliation = { readonly rootTaskId: string; readonly result: Omit<TurnExecutionResult, "status"> & { readonly status: ReconciledTurnStatus } }
+export type RootTaskReconciliation = RootTaskTerminalReconciliation
+export type RootTaskFinishMetadata = Readonly<{ interactiveDiscoveryShortlist: InteractiveDiscoveryShortlistProjection }>
 export type RootTaskStore = {
   ensure(input: { lease: TurnLease; goal: string; modelProfileSnapshot?: unknown; toolPolicySnapshot?: unknown; budgetSnapshot?: unknown; allowedActions?: readonly string[]; now?: Date }): Promise<SubagentTaskRecord>
   reconcileTerminal?(input: { lease: TurnLease; now?: Date }): Promise<RootTaskReconciliation | null>
   checkCompletion?(input: { lease: TurnLease; rootTaskId: string; now?: Date }): Promise<TurnEngineCompletionGateResult>
-  finish(input: { lease: TurnLease; rootTaskId: string; result: TurnEngineResult; now?: Date }): Promise<void>
+  finish(input: { lease: TurnLease; rootTaskId: string; result: TurnEngineResult; metadata?: RootTaskFinishMetadata; now?: Date }): Promise<void>
 }
 type Row = Record<string, unknown>
 
@@ -77,36 +78,6 @@ const SELECT_ROOT = `SELECT task.*, session."userId" AS "userId"
   WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3`
 
 const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "interrupted", "cancelled", "closed"])
-const TERMINAL_ROOT_STATUSES = new Set(["completed", "failed", "interrupted", "waiting", "waiting_for_user"])
-const TURN_RESULT_STATUSES = new Set(["completed", "failed", "interrupted", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"])
-type TerminalRootRow = { id: unknown; status: unknown; result: unknown; failureReason: unknown }
-
-function boundedText(value: unknown, name: string): string | undefined {
-  if (value === null || value === undefined) return undefined
-  if (typeof value !== "string" || value.trim().length === 0 || Buffer.byteLength(value, "utf8") > 256) throw new Error(`root_terminal_${name}_invalid`)
-  return value
-}
-
-function resultCount(value: unknown, name: string): number {
-  if (!Number.isSafeInteger(value) || Number(value) < 0 || Number(value) > 2_147_483_647) throw new Error(`root_terminal_${name}_invalid`)
-  return Number(value)
-}
-
-function terminalResult(row: TerminalRootRow): RootTaskReconciliation {
-  const rootTaskId = boundedText(row.id, "id")
-  const rootStatus = boundedText(row.status, "status")
-  const payload = record(row.result)
-  const turnStatus = boundedText(payload.status, "result")
-  if (!rootTaskId || !rootStatus || !TERMINAL_ROOT_STATUSES.has(rootStatus) || !turnStatus || !TURN_RESULT_STATUSES.has(turnStatus)) throw new Error("root_terminal_result_invalid")
-  const expectedRootStatus = turnStatus === "waiting_for_dependency" ? "waiting" : turnStatus === "waiting_for_approval" ? "waiting_for_user" : turnStatus
-  if (expectedRootStatus !== rootStatus) throw new Error("root_terminal_status_mismatch")
-  resultCount(payload.stepCount, "step_count")
-  resultCount(payload.toolCallCount, "tool_call_count")
-  const waitId = boundedText(payload.waitId, "wait_id")
-  if (turnStatus === "waiting_for_dependency" && !waitId) throw new Error("root_terminal_wait_id_missing")
-  const summary = boundedText(row.failureReason, "failure_reason")
-  return { rootTaskId, result: { status: turnStatus as ReconciledTurnStatus, ...(summary ? { summary } : {}), ...(waitId ? { waitId } : {}) } }
-}
 
 function completionBlocker(rows: readonly Row[]): TurnEngineCompletionGateResult {
   const pending = rows.filter(row => !TERMINAL_TASK_STATUSES.has(String(row.status)))
@@ -196,10 +167,19 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
     async finish(input): Promise<void> {
       const now = input.now ?? new Date()
       const next = rootTaskStatusFromTurnResult(input.result)
+      const discoveryShortlist = input.metadata ? parseInteractiveDiscoveryShortlist(input.metadata.interactiveDiscoveryShortlist) : undefined
+      if (input.metadata && !discoveryShortlist) throw new Error("root_terminal_discovery_shortlist_invalid")
+      if (discoveryShortlist && (input.result.status === "waiting_for_dependency" || input.result.status === "waiting_for_approval" || input.result.status === "waiting_for_user"
+        || (input.result.status === "completed" && discoveryShortlist.status === "failed")
+        || ((input.result.status === "failed" || input.result.status === "interrupted") && discoveryShortlist.status !== "failed"
+          && !(discoveryShortlist.status === "partial" && discoveryShortlist.failures.includes("discovery_runtime_failed"))))) {
+        throw new Error("root_terminal_discovery_status_mismatch")
+      }
       // A user wait transitions the Turn before this root settlement runs.
       // Keep every other result fenced to the active in-progress state.
       const waitState = input.result.status === "waiting_for_user"
-      const result = JSON.stringify({ status: input.result.status, stepCount: input.result.stepCount, toolCallCount: input.result.toolCallCount, finalItemId: input.result.finalItemId ?? null, waitId: input.result.waitId ?? null })
+      const result = JSON.stringify({ status: input.result.status, stepCount: input.result.stepCount, toolCallCount: input.result.toolCallCount, finalItemId: input.result.finalItemId ?? null, waitId: input.result.waitId ?? null,
+        ...(discoveryShortlist ? { structuredResult: { interactiveDiscoveryShortlist: discoveryShortlist } } : {}) })
       await transaction(pool, input.lease.userId, async (client) => {
         await lockOpenSession(client, input.lease)
         const ownedTurn = await client.query(
@@ -217,9 +197,13 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
           const settled = await client.query<Row>(`SELECT "status", "result", "failureReason" FROM "sub_agent_tasks"
             WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $1 FOR UPDATE`, [input.rootTaskId, input.lease.sessionId, input.lease.turnId])
           const saved = record(settled.rows[0]?.result)
+          const savedShortlist = discoveryShortlist
+            ? parseInteractiveDiscoveryShortlist(record(saved.structuredResult).interactiveDiscoveryShortlist)
+            : undefined
           if (settled.rows[0]?.status !== next || settled.rows[0]?.failureReason !== null || saved.status !== "completed"
             || Number(saved.stepCount) !== input.result.stepCount || Number(saved.toolCallCount) !== input.result.toolCallCount
-            || (saved.finalItemId ?? null) !== (input.result.finalItemId ?? null) || (saved.waitId ?? null) !== null) throw new Error("root_task_terminal_receipt_conflict")
+            || (saved.finalItemId ?? null) !== (input.result.finalItemId ?? null) || (saved.waitId ?? null) !== null
+            || (discoveryShortlist && JSON.stringify(savedShortlist) !== JSON.stringify(discoveryShortlist))) throw new Error("root_task_terminal_receipt_conflict")
           return
         }
         const updated = await client.query(
@@ -237,7 +221,7 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
     async reconcileTerminal(input): Promise<RootTaskReconciliation | null> {
       const now = input.now ?? new Date()
       return transaction(pool, input.lease.userId, async (client) => {
-        const result = await client.query<TerminalRootRow>(
+        const result = await client.query<Row>(
           `SELECT task."id", task."status", task."result", task."failureReason"
            FROM "sub_agent_tasks" AS task
            JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
@@ -250,7 +234,7 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
            FOR UPDATE OF task`,
           [input.lease.sessionId, input.lease.turnId, input.lease.userId, input.lease.ownerId, input.lease.leaseVersion, now],
         )
-        return result.rows[0] ? terminalResult(result.rows[0]) : null
+        return result.rows[0] ? parseTerminalRootResult(result.rows[0]) : null
       })
     },
   }

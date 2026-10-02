@@ -20,6 +20,7 @@ function makeDb(options: {
   sessionSource?: string
   activeSource?: string
   activeTurnId?: string
+  activeInput?: unknown
   activeRootTaskId?: string | null
   activeStatus?: string
   retryTarget?: Row & { revision: number }
@@ -28,7 +29,7 @@ function makeDb(options: {
   const sessionExists = options.sessionExists ?? true
   const sessionOwnerId = options.sessionOwnerId ?? ownerId
   let active: (Row & { revision: number }) | null = options.activeSource
-    ? { id: options.activeTurnId ?? "turn_1", source: options.activeSource, status: options.activeStatus ?? "in_progress", revision: 0, rootTaskId: options.activeRootTaskId ?? null }
+    ? { id: options.activeTurnId ?? "turn_1", source: options.activeSource, status: options.activeStatus ?? "in_progress", revision: 0, input: options.activeInput, rootTaskId: options.activeRootTaskId ?? null }
     : null
   let execution: { id: string; sessionId: string; status: string } | null = options.executionStatus
     ? { id: "execution_1", sessionId: "session_1", status: options.executionStatus }
@@ -295,6 +296,43 @@ describe("AgentCommandService", () => {
     })
     expect(dispatches[0]?.aggregateId).toBe("session_1")
     expect(dispatches[0]?.aggregateId).not.toBe(first.turnId)
+  })
+
+  it("persists the trusted discovery intent in the root Turn before its dispatch is committed", async () => {
+    const fake = makeDb()
+    const service = new AgentCommandService(fake.db)
+
+    const result = await service.start({
+      ...startCommand("client_task_graph_discovery"),
+      intent: { kind: "interactive_discovery_shortlist", version: 1 },
+    })
+
+    expect(fake.state.active?.input).toMatchObject({
+      goal: "Find backend roles",
+      intent: { kind: "interactive_discovery_shortlist", version: 1 },
+    })
+    expect(fake.state.outbox).toContainEqual(expect.objectContaining({
+      topic: "agent.turn.dispatch",
+      idempotencyKey: `turn-dispatch:${result.turnId}`,
+    }))
+  })
+
+  it("only continues an active Turn when its persisted intent matches the trusted command intent", async () => {
+    const mismatched = makeDb({ activeSource: "user", activeInput: { goal: "ordinary chat" } })
+    await expect(new AgentCommandService(mismatched.db).start({
+      ...startCommand("client_mismatched_intent"),
+      intent: { kind: "interactive_discovery_shortlist", version: 1 },
+    })).rejects.toMatchObject({ code: "turn_intent_mismatch", status: 409 })
+    expect(mismatched.state.inputs).toHaveLength(0)
+
+    const matching = makeDb({
+      activeSource: "user",
+      activeInput: { intent: { kind: "interactive_discovery_shortlist", version: 1 } },
+    })
+    await expect(new AgentCommandService(matching.db).start({
+      ...startCommand("client_matching_intent"),
+      intent: { kind: "interactive_discovery_shortlist", version: 1 },
+    })).resolves.toMatchObject({ disposition: "queued_follow_up", turnId: "turn_1" })
   })
 
   it("rejects stale expected Turn before writing a steer", async () => {
@@ -602,10 +640,21 @@ describe("AgentCommandService", () => {
     expect(result.turnId).not.toBe("turn_failed")
     expect(fake.state.active).toMatchObject({ status: "queued", source: "user" })
     expect(fake.state.active).toMatchObject({ input: { goal: "Canonical persisted retry objective", content } })
+    expect(fake.state.active?.input).not.toHaveProperty("intent")
     expect(fake.state.inputs).toHaveLength(1)
     expect(fake.state.inputs[0]).toMatchObject({ delivery: "follow_up", content })
     expect(fake.state.events.map(event => event.type)).toEqual(["turn.started", "input.accepted"])
     expect(fake.state.outbox.filter(entry => entry.topic === "agent.turn.dispatch")).toHaveLength(1)
+  })
+
+  it("preserves server-owned discovery intent when retrying a failed Turn", async () => {
+    const intent = { kind: "interactive_discovery_shortlist", version: 1 } as const
+    const input = { goal: "Retry discovery", content: [...content], intent }
+    const fake = makeDb({ retryTarget: retryTarget("failed", input) })
+
+    await new AgentCommandService(fake.db).retry(retryCommand("retry_discovery"))
+
+    expect(fake.state.active?.input).toMatchObject({ goal: "Retry discovery", content, intent })
   })
 
   it("returns the original result for a duplicate retry without new durable facts", async () => {

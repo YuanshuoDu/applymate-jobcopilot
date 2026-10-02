@@ -1,6 +1,7 @@
 import type { InputContentPart } from '@jobcopilot/agent-protocol'
 
 import { retryInputInvalid } from './errors'
+import type { ServerAgentTurnIntent } from './types'
 
 const RETRYABLE_STATUSES = new Set(['failed', 'interrupted', 'cancelled'])
 const MAX_RETRY_PARTS = 32
@@ -12,8 +13,8 @@ export function isRetryableTurnStatus(status: string): boolean {
   return RETRYABLE_STATUSES.has(status)
 }
 
-export function parsePersistedRetryContent(turnId: string, value: unknown): { goal: string; content: InputContentPart[]; selectedJobPreparation?: { jobId: string } } {
-  if (!isRecord(value) || !exactKeys(value, ['goal', 'content', 'clientMessageId', 'selectedJobPreparation']) ||
+export function parsePersistedRetryContent(turnId: string, value: unknown): { goal: string; content: InputContentPart[]; selectedJobPreparation?: { jobId: string }; intent?: ServerAgentTurnIntent } {
+  if (!isRecord(value) || !exactKeys(value, ['goal', 'content', 'clientMessageId', 'selectedJobPreparation', 'intent']) ||
     !boundedGoal(value.goal) || (value.clientMessageId !== undefined && !boundedString(value.clientMessageId, 256)) ||
     !Array.isArray(value.content) || value.content.length < 1 || value.content.length > MAX_RETRY_PARTS) throw retryInputInvalid(turnId)
   const content: InputContentPart[] = []
@@ -35,12 +36,20 @@ export function parsePersistedRetryContent(turnId: string, value: unknown): { go
     ? undefined
     : parseSelectedJobPreparation(value.selectedJobPreparation)
   if (value.selectedJobPreparation !== undefined && !selectedJobPreparation) throw retryInputInvalid(turnId)
-  return { goal: value.goal, content, ...(selectedJobPreparation ? { selectedJobPreparation } : {}) }
+  const intent = value.intent === undefined ? undefined : parseServerAgentTurnIntent(value.intent)
+  if (value.intent !== undefined && !intent) throw retryInputInvalid(turnId)
+  return { goal: value.goal, content, ...(selectedJobPreparation ? { selectedJobPreparation } : {}), ...(intent ? { intent } : {}) }
 }
 
 function parseSelectedJobPreparation(value: unknown): { jobId: string } | null {
   if (!isRecord(value) || !exactKeys(value, ['jobId']) || !boundedString(value.jobId, 256)) return null
   return { jobId: value.jobId }
+}
+
+function parseServerAgentTurnIntent(value: unknown): ServerAgentTurnIntent | null {
+  if (!isRecord(value) || !exactKeys(value, ['kind', 'version']) ||
+    value.kind !== 'interactive_discovery_shortlist' || value.version !== 1) return null
+  return { kind: 'interactive_discovery_shortlist', version: 1 }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

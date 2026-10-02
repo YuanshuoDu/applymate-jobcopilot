@@ -3,6 +3,7 @@ import { transaction, type Queryable } from "./pg-store-persistence.js"
 import { writeTaskLifecycleReceipt } from "./task-graph-pg-events.js"
 import { loadTaskGraph, type GraphIdentityScope } from "./task-graph-pg-state.js"
 import { parseTaskGraphEvent, taskGraphLifecycleKey, taskGraphState } from "./task-graph-snapshot.js"
+import { recoverExpiredStoppedRoots } from "./root-task-stop-recovery.js"
 import type { PgSubagentPool, SubagentTaskStatus } from "./types.js"
 
 export const TASK_GRAPH_STOP_OUTBOX_TOPIC = "agent.task-graph.stop"
@@ -17,6 +18,7 @@ type StopTaskRow = Readonly<{ id: string; status: string; attemptCount: number; 
 type StartOptions = {
   pollMs?: number
   drain?: (pool: PgSubagentPool, batchSize?: number) => Promise<number>
+  recoverStoppedRoots?: (pool: PgSubagentPool) => Promise<number>
 }
 
 function object(value: unknown): Record<string, unknown> | null {
@@ -215,13 +217,15 @@ export async function drainTaskGraphStopOutbox(pool: PgSubagentPool, batchSize?:
 export function startTaskGraphStopOutboxConsumer(pool: PgSubagentPool, options: StartOptions = {}) {
   const pollMs = Number(options.pollMs ?? process.env.AGENT_TASK_GRAPH_STOP_OUTBOX_POLL_MS ?? DEFAULT_POLL_MS)
   const drain = options.drain ?? drainTaskGraphStopOutbox
+  const recoverStoppedRoots = options.recoverStoppedRoots ?? recoverExpiredStoppedRoots
   let closed = false
   let inFlight: Promise<void> | null = null
   const run = () => {
     if (closed || inFlight) return
-    const current = drain(pool).then(() => undefined).catch(error => {
-      console.error("[agent-task-graph-stop-outbox] drain failed:", error)
-    }).finally(() => { if (inFlight === current) inFlight = null })
+    const current = Promise.all([
+      drain(pool).catch(error => { console.error("[agent-task-graph-stop-outbox] drain failed:", error) }),
+      recoverStoppedRoots(pool).catch(error => { console.error("[agent-task-graph-stop-outbox] stopped root recovery failed:", error) }),
+    ]).then(() => undefined).finally(() => { if (inFlight === current) inFlight = null })
     inFlight = current
   }
   const timer = setInterval(run, Number.isFinite(pollMs) && pollMs >= 250 && pollMs <= 30_000 ? pollMs : DEFAULT_POLL_MS)

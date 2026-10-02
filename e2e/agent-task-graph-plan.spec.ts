@@ -1,13 +1,14 @@
 import { expect, test } from './fixtures'
 import type { Page, Response, Route } from '@playwright/test'
 import { readFileSync } from 'node:fs'
-import { parsePlanLedger, projectPlanLedger, type PlanLedger } from '@jobcopilot/agent-protocol'
+import { parsePlanLedger, parseTaskGraphSnapshot, projectPlanLedger, type PlanLedger } from '@jobcopilot/agent-protocol'
 import { redactStreamEventPayload } from '../apps/web/src/lib/agent/session/stream-redaction'
 import { taskGraphPlanLabel, type TaskGraphPlanLabelKey } from '../apps/web/src/lib/task-graph-plan-labels'
 
 const SCHEMA = 'agent-harness.v2'
 const GRAPH_SCHEMA = 'agent-harness.v2.task-graph'
 const TRACE_SCHEMA = 'agent-harness.v2.plan-ledger-trace'
+const DISCOVERY_TRACE_SCHEMA = 'agent-harness.v2.interactive-discovery-trace'
 const SESSION_B = 'task-graph-session-b'
 const TURN_B = 'task-graph-turn-b'
 const GOAL_B = 'Compare engineering teams in Amsterdam'
@@ -85,6 +86,7 @@ type PersistedPlanLedgerTrace = {
   initialGraphItem: PersistedTaskGraphItem
   graphEvents: PersistedGraphEvent[]
   tasks: PersistedTaskRouteRow[]
+  interactiveDiscoveryShortlist?: PersistedInteractiveDiscoveryShortlist
 }
 
 type TaskGraphIdentity = {
@@ -93,6 +95,18 @@ type TaskGraphIdentity = {
   turnId: string
   rootTaskId: string
   revision: number
+}
+
+type PersistedInteractiveDiscoveryShortlist = {
+  schemaVersion: 1
+  status: 'completed'
+  items: Array<{ jobId: string; score: number; evidenceIds: string[] }>
+  failures: []
+}
+
+type InteractiveDiscoveryShortlistResponse = {
+  identity: TaskGraphIdentity
+  result: PersistedInteractiveDiscoveryShortlist
 }
 
 type PlanLedgerResponse = {
@@ -247,11 +261,120 @@ function parsePersistedTrace(value: unknown): PersistedPlanLedgerTrace | null {
   }
 }
 
+function parsePersistedDiscoveryShortlist(value: unknown): PersistedInteractiveDiscoveryShortlist | null {
+  const result = record(value)
+  if (!result || Object.keys(result).sort().join(',') !== 'failures,items,schemaVersion,status'
+    || result.schemaVersion !== 1 || result.status !== 'completed' || !Array.isArray(result.failures)
+    || result.failures.length !== 0 || !Array.isArray(result.items) || result.items.length < 1 || result.items.length > 3) return null
+  const items: PersistedInteractiveDiscoveryShortlist['items'] = []
+  for (const value of result.items) {
+    const item = record(value)
+    if (!item || Object.keys(item).sort().join(',') !== 'evidenceIds,jobId,score'
+      || typeof item.jobId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/.test(item.jobId)
+      || typeof item.score !== 'number' || !Number.isFinite(item.score) || item.score < 0 || item.score > 10
+      || !Array.isArray(item.evidenceIds) || item.evidenceIds.length < 1 || item.evidenceIds.length > 50
+      || item.evidenceIds.some(id => typeof id !== 'string' || id.length < 1 || id.length > 256)
+      || new Set(item.evidenceIds).size !== item.evidenceIds.length) return null
+    items.push({ jobId: item.jobId, score: item.score, evidenceIds: [...item.evidenceIds] as string[] })
+  }
+  if (new Set(items.map(item => item.jobId)).size !== items.length
+    || items.some((item, index) => index > 0 && (items[index - 1]!.score < item.score
+      || (items[index - 1]!.score === item.score && items[index - 1]!.jobId >= item.jobId)))) return null
+  return { schemaVersion: 1, status: 'completed', items, failures: [] }
+}
+
+function parsePersistedDiscoveryTrace(value: unknown): PersistedPlanLedgerTrace | null {
+  const envelope = record(value)
+  if (!envelope || Object.keys(envelope).sort().join(',') !== 'finalOutcome,graph,graphItemId,graphRevision,interactiveDiscoveryShortlist,planLedger,rootTaskId,schemaVersion,sessionId,tasks,turnId') return null
+  const sessionId = envelope?.sessionId, turnId = envelope?.turnId, rootTaskId = envelope?.rootTaskId
+  const graphItemId = envelope?.graphItemId, graphRevision = envelope?.graphRevision
+  const graphSnapshot = parseTaskGraphSnapshot(envelope?.graph)
+  const ledger = parsePlanLedger(envelope?.planLedger)
+  const shortlist = parsePersistedDiscoveryShortlist(envelope?.interactiveDiscoveryShortlist)
+  const rawTasks = Array.isArray(envelope?.tasks) ? envelope.tasks.map(record) : null
+  const outcome = record(envelope?.finalOutcome)
+  if (envelope?.schemaVersion !== DISCOVERY_TRACE_SCHEMA || typeof sessionId !== 'string' || typeof turnId !== 'string'
+    || typeof rootTaskId !== 'string' || typeof graphItemId !== 'string' || !Number.isSafeInteger(graphRevision)
+    || !graphSnapshot || !ledger || !shortlist || !rawTasks || outcome?.turnStatus !== 'completed'
+    || Object.keys(outcome).sort().join(',') !== 'response,turnStatus' || typeof outcome.response !== 'string'
+    || ledger.sessionId !== sessionId || ledger.revision !== graphRevision || graphSnapshot.nodes.length !== ledger.nodes.length) return null
+  let finalShortlist: PersistedInteractiveDiscoveryShortlist | null = null
+  try { finalShortlist = parsePersistedDiscoveryShortlist(JSON.parse(outcome.response) as unknown) } catch { return null }
+  if (!finalShortlist || JSON.stringify(finalShortlist) !== JSON.stringify(shortlist)) return null
+
+  const graphContent = { schemaVersion: GRAPH_SCHEMA, nodes: graphSnapshot.nodes }
+  const graphItem = parsePersistedGraphItem({
+    schemaVersion: SCHEMA,
+    id: graphItemId,
+    sessionId,
+    turnId,
+    stepId: null,
+    taskId: rootTaskId,
+    type: 'task_graph',
+    status: 'completed',
+    phase: null,
+    revision: graphRevision,
+    content: graphContent,
+    startedAt: null,
+    completedAt: null,
+    createdAt: TIME,
+    updatedAt: TIME,
+  })
+  if (!graphItem) return null
+
+  const tasks: PersistedTaskRouteRow[] = []
+  for (const task of rawTasks) {
+    const taskKeys = task ? Object.keys(task).sort().join(',') : ''
+    if (!task || (taskKeys !== 'confidence,failureReason,goal,hasResult,id,parentTaskId,path,role,rootTaskId,sessionId,status,taskType,turnId'
+      && taskKeys !== 'confidence,failureReason,goal,hasResult,id,parentTaskId,path,role,rootTaskId,sessionId,status,structuredEvidencePreview,taskType,turnId')
+      || typeof task.id !== 'string' || task.sessionId !== sessionId
+      || task.turnId !== turnId || task.rootTaskId !== rootTaskId
+      || (task.parentTaskId !== null && typeof task.parentTaskId !== 'string')
+      || typeof task.path !== 'string' || typeof task.role !== 'string' || typeof task.taskType !== 'string'
+      || typeof task.status !== 'string' || typeof task.goal !== 'string' || typeof task.hasResult !== 'boolean'
+      || (task.confidence !== null && typeof task.confidence !== 'number')
+      || (task.failureReason !== null && typeof task.failureReason !== 'string')
+      || Object.hasOwn(task, 'result')) return null
+    tasks.push({
+      ...task,
+      schemaVersion: SCHEMA,
+      createdAt: TIME,
+      updatedAt: TIME,
+    } as unknown as PersistedTaskRouteRow)
+  }
+  const taskIds = new Set(tasks.map(task => task.id))
+  const root = tasks.find(task => task.id === rootTaskId)
+  if (taskIds.size !== tasks.length || tasks.length !== graphSnapshot.nodes.length + 1 || !root
+    || root.parentTaskId !== null || root.role !== 'orchestrator' || root.taskType !== 'root'
+    || graphSnapshot.nodes.some(node => !taskIds.has(node.taskId)
+      || tasks.find(task => task.id === node.taskId)?.parentTaskId !== rootTaskId)) return null
+
+  const projected = projectPlanLedger({ sessionId, revision: graphRevision, rootTaskId, graph: graphContent, tasks })
+  if (!projected || JSON.stringify(projected) !== JSON.stringify(ledger)) return null
+  return {
+    schemaVersion: TRACE_SCHEMA,
+    planLedger: ledger,
+    rootTaskId,
+    graphItem,
+    initialGraphItem: graphItem,
+    graphEvents: [],
+    tasks,
+    interactiveDiscoveryShortlist: shortlist,
+  }
+}
+
 // CI wraps the public ledger with persisted TaskGraph/task identities for this browser-only handoff.
 const traceArtifactPath = process.env.AGENT_PLAN_LEDGER_TRACE_ARTIFACT_PATH
 const traceArtifact = traceArtifactPath ? parsePersistedTrace(JSON.parse(readFileSync(traceArtifactPath, 'utf8')) as unknown) : null
 if (traceArtifactPath && (!traceArtifact || traceArtifact.planLedger.revision < 2 || traceArtifact.planLedger.nodes.length < 2)) {
   throw new Error('The Worker process-restart trace artifact or its persisted identity envelope is missing or invalid.')
+}
+const discoveryTraceArtifactPath = process.env.AGENT_INTERACTIVE_DISCOVERY_TRACE_ARTIFACT_PATH
+const discoveryTraceArtifact = discoveryTraceArtifactPath
+  ? parsePersistedDiscoveryTrace(JSON.parse(readFileSync(discoveryTraceArtifactPath, 'utf8')) as unknown)
+  : null
+if (discoveryTraceArtifactPath && !discoveryTraceArtifact) {
+  throw new Error('The Worker interactive-discovery trace artifact or its persisted Plan Ledger/shortlist identity is missing or invalid.')
 }
 
 function json(route: Route, data: unknown, status = 200) {
@@ -471,6 +594,9 @@ async function installTaskGraphFixture(page: Page, persistedTrace: PersistedPlan
     .filter((graph, index, graphs) => graphs.findIndex(candidate => sameIdentity(graphIdentity(candidate), graphIdentity(graph))) === index)
   const graphsBySession = new Map<string, PersistedTaskGraphItem[]>([[SESSION_A, sessionAGraphs]])
   const tasksBySession = new Map<string, PersistedTaskRouteRow[]>([[SESSION_A, persistedTrace.tasks]])
+  const persistedShortlist: InteractiveDiscoveryShortlistResponse | null = persistedTrace.interactiveDiscoveryShortlist
+    ? { identity: graphIdentity(persistedGraphItem), result: persistedTrace.interactiveDiscoveryShortlist }
+    : null
   let deliveryMode: 'default' | 'live' | 'snapshot-tail' = 'default'
   let releaseLiveDelta!: () => void
   const liveDeltaGate = new Promise<void>(resolve => { releaseLiveDelta = resolve })
@@ -487,6 +613,7 @@ async function installTaskGraphFixture(page: Page, persistedTrace: PersistedPlan
     eventRequests: new Map<string, Array<string | null>>(),
     requestsByMode: new Map<string, Array<string | null>>(),
     planLedgers: new Map<string, PlanLedgerResponse | null>(),
+    discoveryShortlistResponses: [] as InteractiveDiscoveryShortlistResponse[],
     acceptedTaskLookups: [] as AcceptedTaskLookup[],
     taskLookupDiagnostics: [] as TaskLookupDiagnostic[],
     forbiddenApiRequests: [] as string[],
@@ -638,7 +765,16 @@ async function installTaskGraphFixture(page: Page, persistedTrace: PersistedPlan
         diagnostic.outcome = planLedger ? 'ledger_returned' : 'ledger_unavailable'
         fixture.acceptedTaskLookups.push({ sessionId, taskIds: requestedTaskIds, identity: graphIdentity(graph) })
         fixture.planLedgers.set(`${sessionId}:${graph.revision}`, planLedger)
-        return json(route, { tasks, planLedger, page: { hasMore: false, nextCursor: null } })
+        const discoveryShortlist = persistedShortlist && sameIdentity(persistedShortlist.identity, graphIdentity(graph))
+          ? persistedShortlist
+          : null
+        if (discoveryShortlist) fixture.discoveryShortlistResponses.push(discoveryShortlist)
+        return json(route, {
+          tasks,
+          planLedger,
+          ...(discoveryShortlist ? { discoveryShortlist } : {}),
+          page: { hasMore: false, nextCursor: null },
+        })
       }
       if (resource === 'turns') return json(route, {
         turns: [{ id: turnId, sessionId, source: 'message', goal, status: 'in_progress', revision: 1, activeStepId: null, createdAt: TIME, updatedAt: TIME }],
@@ -747,6 +883,11 @@ async function readTaskGraphProjection(plan: ReturnType<Page['locator']>) {
 function requireProductionTraceArtifact(): PersistedPlanLedgerTrace {
   if (!traceArtifact) test.skip(true, 'Requires the disposable PostgreSQL Worker process-restart trace artifact.')
   return traceArtifact!
+}
+
+function requireInteractiveDiscoveryTraceArtifact(): PersistedPlanLedgerTrace {
+  if (!discoveryTraceArtifact) test.skip(true, 'Requires the disposable Worker interactive-discovery restart trace artifact.')
+  return discoveryTraceArtifact!
 }
 
 test('persisted Plan Ledger parser validates proposal and lifecycle task attribution', () => {
@@ -1029,6 +1170,81 @@ test('TaskGraph reconnect snapshot plus event tail matches the persisted trace p
   expect(resumedProjection).toEqual(liveProjection)
   await expect(plan).not.toContainText('fixture-job-restart')
   await expect(plan).not.toContainText('p3-process-restart-source-result')
+  expect(fixture.forbiddenApiRequests).toEqual([])
+  expect(fixture.externalRequests).toEqual([])
+})
+
+test('persisted Plan Ledger and discovery shortlist survive SSE disconnect, reconnect, and reload', async ({ page }) => {
+  const persistedTrace = requireInteractiveDiscoveryTraceArtifact()
+  const fixture = await installTaskGraphFixture(page, persistedTrace)
+  const sessionId = fixture.sessionA
+  const identity = graphIdentity(persistedTrace.graphItem)
+  const expectedShortlist: InteractiveDiscoveryShortlistResponse = {
+    identity,
+    result: persistedTrace.interactiveDiscoveryShortlist!,
+  }
+  fixture.setDeliveryMode('snapshot-tail')
+  const firstLedgerResponse = waitForPlanLedgerResponse(page, identity, fixture, 'snapshot-tail', 'discovery restart trace')
+  await page.goto(`/agent-preview?supervisor=1&locale=en&sessionId=${encodeURIComponent(sessionId)}`)
+
+  const plan = page.locator('[data-agent-task-graph-plan="true"]')
+  const shortlist = page.locator('[data-agent-discovery-shortlist="true"]')
+  await expect(plan).toBeVisible({ timeout: 20_000 })
+  await expect(plan).toHaveAttribute('data-agent-task-graph-session', identity.sessionId)
+  await expect(plan).toHaveAttribute('data-agent-task-graph-revision', String(identity.revision))
+  const firstLedger = await firstLedgerResponse
+  expect(firstLedger).toEqual({ identity, projection: persistedTrace.planLedger })
+  await expect(shortlist).toBeVisible()
+  await expect(shortlist).toHaveAttribute('data-discovery-shortlist-status', 'completed')
+
+  const assertPersistedShortlist = async () => {
+    const rows = shortlist.locator('[data-discovery-job-id]')
+    await expect(rows).toHaveCount(expectedShortlist.result.items.length)
+    const renderedJobIds = await rows.evaluateAll(elements => elements.map(element => element.getAttribute('data-discovery-job-id')))
+    expect(renderedJobIds).toEqual(expectedShortlist.result.items.map(item => item.jobId))
+    for (const item of expectedShortlist.result.items) {
+      const row = shortlist.locator(`[data-discovery-job-id="${item.jobId}"]`)
+      await expect(row).toContainText(item.jobId)
+      await expect(row).toContainText(`Score: ${item.score} / 10`)
+      for (const evidenceId of item.evidenceIds) await expect(row).toContainText(evidenceId)
+    }
+  }
+
+  await assertPersistedShortlist()
+  expect(fixture.discoveryShortlistResponses.length).toBeGreaterThan(0)
+  expect(fixture.discoveryShortlistResponses.every(response => JSON.stringify(response) === JSON.stringify(expectedShortlist))).toBe(true)
+  expect(fixture.acceptedTaskLookups).toContainEqual({ sessionId, taskIds: fixture.expectedTaskIds, identity })
+  const staleRevisionLookup = await page.evaluate(async ({ sessionId, taskIds, identity }) => {
+    const query = new URLSearchParams()
+    for (const taskId of taskIds) query.append('taskId', taskId)
+    query.set('graphItemId', identity.graphItemId)
+    query.set('graphTurnId', identity.turnId)
+    query.set('rootTaskId', identity.rootTaskId)
+    query.set('graphRevision', String(identity.revision + 1))
+    const response = await fetch(`/api/agent/sessions/${encodeURIComponent(sessionId)}/tasks?${query}`)
+    const body = await response.json() as { tasks: Array<{ id: string }>; planLedger?: unknown; discoveryShortlist?: unknown }
+    return { status: response.status, taskIds: body.tasks.map(task => task.id), planLedger: body.planLedger ?? null, discoveryShortlist: body.discoveryShortlist ?? null }
+  }, { sessionId, taskIds: fixture.expectedTaskIds, identity })
+  expect(staleRevisionLookup).toEqual({ status: 200, taskIds: [], planLedger: null, discoveryShortlist: null })
+
+  await expect.poll(() => fixture.requestsByMode.get(`snapshot-tail:${sessionId}`)?.length ?? 0, { timeout: 10_000 }).toBeGreaterThan(0)
+  fixture.releaseSnapshotClose()
+  await expect.poll(() => fixture.requestsByMode.get(`snapshot-tail:${sessionId}`)?.length ?? 0, { timeout: 10_000 }).toBeGreaterThanOrEqual(2)
+  fixture.releaseSnapshotTail()
+  await expect.poll(() => fixture.requestsByMode.get(`snapshot-tail:${sessionId}`)?.length ?? 0, { timeout: 10_000 }).toBeGreaterThanOrEqual(3)
+  await expect(plan).toHaveAttribute('data-agent-task-graph-revision', String(identity.revision))
+  await expect(shortlist).toHaveCount(1)
+  await assertPersistedShortlist()
+
+  const reloadLedgerResponse = waitForPlanLedgerResponse(page, identity, fixture, 'snapshot-tail', 'reloaded discovery trace')
+  await page.reload()
+  await expect(plan).toBeVisible({ timeout: 20_000 })
+  expect(await reloadLedgerResponse).toEqual({ identity, projection: persistedTrace.planLedger })
+  await expect(plan).toHaveAttribute('data-agent-task-graph-session', identity.sessionId)
+  await expect(plan).toHaveAttribute('data-agent-task-graph-revision', String(identity.revision))
+  await expect(shortlist).toHaveCount(1)
+  await assertPersistedShortlist()
+  expect(fixture.discoveryShortlistResponses.every(response => JSON.stringify(response) === JSON.stringify(expectedShortlist))).toBe(true)
   expect(fixture.forbiddenApiRequests).toEqual([])
   expect(fixture.externalRequests).toEqual([])
 })

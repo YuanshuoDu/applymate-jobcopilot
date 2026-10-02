@@ -123,6 +123,63 @@ describe("agent task query API", () => {
     }
   })
 
+  it("projects only the durable owner-scoped discovery shortlist in completed, partial, and failed states", async () => {
+    const graph = {
+      id: "graph_discovery", sessionId: "session_1", turnId: "turn_discovery", taskId: "root_discovery", revision: 1,
+      content: { schemaVersion: "agent-harness.v2.task-graph", nodes: [
+        { key: "scout", templateId: "scout", goal: "Find jobs", successCriteria: ["Collect evidence"], dependsOn: [], depth: 1, taskId: "child_discovery" },
+      ] },
+    }
+    const states = [
+      { status: "completed", rootStatus: "completed", items: [{ jobId: "job-42", score: 8.5, evidenceIds: ["read:job:job-42"] }], failures: [] },
+      { status: "partial", rootStatus: "completed", items: [{ jobId: "job-42", score: 8.5, evidenceIds: ["read:job:job-42"] }], failures: ["scout_result_partial"] },
+      { status: "failed", rootStatus: "failed", items: [], failures: ["no_common_candidates"] },
+    ] as const
+
+    for (const state of states) {
+      mocks.graphFindFirst.mockResolvedValueOnce(graph)
+      mocks.taskFindMany.mockResolvedValueOnce([{
+        id: "root_discovery", sessionId: "session_1", turnId: "turn_discovery", rootTaskId: "root_discovery", parentTaskId: null, path: "root",
+        role: "orchestrator", taskType: "root", status: state.rootStatus, goal: "Discover jobs", confidence: null, failureReason: null,
+        result: { structuredResult: { interactiveDiscoveryShortlist: { schemaVersion: 1, status: state.status, items: state.items, failures: state.failures }, privateToolOutput: "PRIVATE_TOOL_OUTPUT" }, finalText: "PRIVATE_MODEL_TEXT" },
+        createdAt: new Date("2026-08-31T00:00:00Z"), updatedAt: new Date("2026-08-31T00:01:00Z"),
+      }, {
+        id: "child_discovery", sessionId: "session_1", turnId: "turn_discovery", rootTaskId: "root_discovery", parentTaskId: "root_discovery", path: "0",
+        role: "scout", taskType: "scout", status: "completed", goal: "Find jobs", confidence: null, failureReason: null, result: { candidates: ["PRIVATE_CHILD_RESULT"] },
+        createdAt: new Date("2026-08-31T00:00:00Z"), updatedAt: new Date("2026-08-31T00:01:00Z"),
+      }])
+      const { GET } = await import("./route")
+      const response = await GET(request("?taskId=root_discovery&taskId=child_discovery&graphItemId=graph_discovery&graphTurnId=turn_discovery&rootTaskId=root_discovery&graphRevision=1") as never, params)
+      const body = await response.json()
+
+      expect(body.discoveryShortlist).toEqual({
+        identity: { sessionId: "session_1", graphItemId: "graph_discovery", turnId: "turn_discovery", rootTaskId: "root_discovery", revision: 1 },
+        result: { schemaVersion: 1, status: state.status, items: state.items, failures: state.failures },
+      })
+      const serialized = JSON.stringify(body)
+      for (const secret of ["PRIVATE_TOOL_OUTPUT", "PRIVATE_MODEL_TEXT", "PRIVATE_CHILD_RESULT"]) expect(serialized).not.toContain(secret)
+    }
+  })
+
+  it("does not project a shortlist from a nonterminal or non-root task result", async () => {
+    mocks.graphFindFirst.mockResolvedValueOnce({
+      id: "graph_1", sessionId: "session_1", turnId: "turn_1", taskId: "root_1", revision: 1,
+      content: { schemaVersion: "agent-harness.v2.task-graph", nodes: [
+        { key: "scout", templateId: "scout", goal: "Find jobs", successCriteria: ["Collect evidence"], dependsOn: [], depth: 1, taskId: "child_1" },
+      ] },
+    })
+    mocks.taskFindMany.mockResolvedValueOnce([{
+      id: "root_1", sessionId: "session_1", turnId: "turn_1", rootTaskId: "root_1", parentTaskId: null, path: "root",
+      role: "orchestrator", taskType: "root", status: "running", goal: "Discover jobs", confidence: null, failureReason: null,
+      result: { structuredResult: { interactiveDiscoveryShortlist: { schemaVersion: 1, status: "failed", items: [], failures: ["no_common_candidates"] } } },
+      createdAt: new Date("2026-08-31T00:00:00Z"), updatedAt: new Date("2026-08-31T00:01:00Z"),
+    }])
+    const { GET } = await import("./route")
+    const response = await GET(request("?taskId=root_1&taskId=child_1&graphItemId=graph_1&graphTurnId=turn_1&rootTaskId=root_1&graphRevision=1") as never, params)
+
+    expect(await response.json()).not.toHaveProperty("discoveryShortlist")
+  })
+
   it("selects the requested persisted root when two same-session graphs share a revision", async () => {
     const persistedGraphs = [
       {
