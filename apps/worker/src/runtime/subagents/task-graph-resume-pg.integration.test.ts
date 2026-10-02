@@ -2695,7 +2695,7 @@ async function waitForTurnStatus(
     if (status && ["failed", "interrupted", "cancelled"].includes(status)) {
       const progress = await turnProgressDiagnostics(pool, turnId, diagnosticToolCallId, additionalDiagnosticToolCallIds)
       const turnError = boundedDiagnostic(result.rows[0]?.error ?? "<none>", 300)
-      throw new Error(`TaskGraph root turn entered ${status}; error=${turnError}; progress=${compactTurnProgressDiagnostics(progress, 900)}`)
+      throw new Error(`TaskGraph root turn entered ${status}; error=${turnError}; progress=${compactTurnProgressDiagnostics(progress, 3_000)}`)
     }
     await new Promise(resolve => setTimeout(resolve, 25))
   }
