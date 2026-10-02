@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto"
 import { spawn, type ChildProcess } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { Queue } from "bullmq"
-import { Pool } from "pg"
+import { Pool, type PoolClient } from "pg"
 import { Redis } from "ioredis"
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest"
 
@@ -53,6 +53,7 @@ const redisUrl = dedicatedRedisUrl()
 const describeWithServices = databaseUrl && redisUrl ? describe : describe.skip
 
 type FixtureFollowUp = { clientMessageId: string; text: string }
+type CheckpointKind = "approval" | "question" | "tool-result"
 type FixtureIds = {
   suffix: string
   userId: string
@@ -60,6 +61,11 @@ type FixtureIds = {
   turnId: string
   followUps?: FixtureFollowUp[]
   followUpCommand?: FixtureFollowUp & { userId?: string; sessionId?: string }
+  checkpointKind?: CheckpointKind
+  checkpointWaitId?: string
+  checkpointJobId?: string
+  checkpointAnswer?: string
+  readCallId?: string
 }
 type WorkerChild = ChildProcess & { output: string[]; errors: string[] }
 type ExitWaitContext = { stage: string; pid?: number; requestedSignal?: string; signalAccepted?: boolean; timeoutMs?: number }
@@ -74,7 +80,7 @@ type CommandAcceptance = { accepted: CommandAcceptanceResult; duplicate: Command
 const fixturePath = fileURLToPath(new URL("./production-bootstrap-process-restart.fixture.mjs", import.meta.url))
 const workerCwd = fileURLToPath(new URL("../..", import.meta.url))
 
-function startWorker(mode: "accept-message" | "park-parent" | "resume-parent" | "park-active-follow-up" | "accept-active-follow-up" | "resume-active-follow-up" | "replay-active-terminal", ids: FixtureIds): WorkerChild {
+function startWorker(mode: "accept-message" | "park-parent" | "resume-parent" | "park-active-follow-up" | "accept-active-follow-up" | "resume-active-follow-up" | "replay-active-terminal" | "checkpoint-worker1" | "checkpoint-worker2" | "resolve-checkpoint", ids: FixtureIds): WorkerChild {
   const child = spawn(process.execPath, ["--import", "tsx", fixturePath, mode, JSON.stringify(ids)], {
     cwd: workerCwd,
     env: { ...process.env, DATABASE_URL: databaseUrl!, REDIS_URL: redisUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl! },
@@ -118,6 +124,205 @@ async function waitForLine(child: WorkerChild, prefix: string, timeoutMs = 20_00
     await new Promise(resolve => setTimeout(resolve, 20))
   }
   throw new Error(`Timed out waiting for ${prefix}; stdout=${child.output.join(" | ")}; stderr=${child.errors.join(" | ")}`)
+}
+
+type CheckpointResumeDiagnostics = {
+  pool: Pool
+  queue: Queue
+  turnId: string
+  sessionId: string
+  checkpointKind: CheckpointKind
+  waitId: string
+  toolCallId: string
+  turnJobKey: (turnId: string, generation?: number) => string
+}
+
+// These diagnostic tokens come from TurnEngineError, turnErrorCode/DLQ, and
+// the persisted status/finish-reason enums; unknown values are never echoed.
+const SAFE_DIAGNOSTIC_CODES = new Set([
+  "started", "streaming", "completed", "failed", "interrupted", "cancelled",
+  "waiting_for_tool", "waiting_for_approval", "waiting_for_user", "waiting_for_dependency",
+  "stop", "tool_calls",
+  "business_precondition_failed", "budget_exhausted", "cognitive_agenda_resume_fence_invalid",
+  "complete_provider_error", "durable_wait_receipt_invalid", "error", "evidence_conflict",
+  "evidence_missing", "execution_failed", "execution_lost", "final_unverified", "invalid_output",
+  "invalid_payload", "lease_lost", "lease_not_available", "max_retries_exhausted", "model_incomplete",
+  "no_progress", "persistence_conflict", "provider_error", "provider_unavailable", "schema_error",
+  "schema_invalid_payload", "step_limit", "tool_execution_failed", "tool_recovery_aborted",
+  "tool_result_replay_uncertain", "turn_execution_error", "turn_execution_failed",
+  "event_lineage_mismatch", "item_lineage_mismatch", "outbox_scope_mismatch", "processing_error", "tool_lineage_mismatch",
+  "turn_revision_conflict", "wait_scope_mismatch",
+  "question_recovery_answer_event_ambiguous", "question_recovery_answer_lineage_invalid",
+  "question_recovery_event_scope_invalid", "question_recovery_history_collision",
+  "question_recovery_history_duplicate", "question_recovery_history_order_invalid",
+  "question_recovery_history_pair_incomplete", "question_recovery_item_id_invalid",
+  "question_recovery_item_malformed", "question_recovery_item_scope_invalid",
+  "question_recovery_sequence_invalid", "question_recovery_start_event_ambiguous",
+  "question_recovery_start_lineage_invalid", "question_recovery_step_invalid",
+  "question_recovery_step_missing", "question_recovery_tool_lineage_invalid",
+  "wait_resume_session_sequence_unavailable", "wait_session_closed", "wait_turn_wake_fenced",
+])
+
+// Mirror the fixed event vocabulary in packages/agent-protocol/src/event.ts,
+// plus the two turn-loop events emitted locally.
+const SAFE_DIAGNOSTIC_EVENT_TYPES = new Set([
+  "turn.started", "turn.wakeup", "turn.resumed", "turn.completed", "turn.failed", "turn.interrupted",
+  "turn.no_progress", "turn.budget_exhausted", "step.started", "step.completed",
+  "item.started", "item.delta", "item.completed", "item.failed", "input.accepted", "input.consumed",
+  "tool_call.started", "tool_call.completed", "tool_call.failed", "policy.decision",
+  "approval.requested", "approval.resolved", "approval.consumed", "approval.expired",
+  "question.answered", "question.cancelled", "external_action.reserved",
+])
+
+function safeDiagnosticCode(value: unknown): string | null {
+  if (typeof value !== "string" || value.length === 0) return null
+  return SAFE_DIAGNOSTIC_CODES.has(value) ? value : "present"
+}
+
+function safeDiagnosticEventType(value: unknown): string {
+  return typeof value === "string" && SAFE_DIAGNOSTIC_EVENT_TYPES.has(value) ? value : "other"
+}
+
+async function checkpointResumeDiagnostics(input: CheckpointResumeDiagnostics): Promise<string> {
+  const waitItemId = `agent-wait:${input.checkpointKind}:${input.waitId}`
+  const [turn, root, steps, toolItems, waitItem, events, wakeupOutbox, dispatch] = await Promise.all([
+    input.pool.query(`SELECT "status", "revision", "leaseOwnerId" IS NOT NULL AS "hasLease",
+        "leaseVersion", "leaseExpiresAt" > NOW() AS "leaseActive", "rootTaskId"
+      FROM "agent_turns" WHERE "id" = $1`, [input.turnId]),
+    input.pool.query(`SELECT task."status", task."leaseOwner" IS NOT NULL AS "hasLease",
+        task."leaseExpiresAt" > NOW() AS "leaseActive"
+      FROM "agent_turns" AS turn LEFT JOIN "sub_agent_tasks" AS task ON task."id" = turn."rootTaskId"
+      WHERE turn."id" = $1`, [input.turnId]),
+    input.pool.query(`SELECT "ordinal", "status", "errorCode", "finishReason"
+      FROM "agent_steps" WHERE "turnId" = $1 ORDER BY "ordinal" DESC LIMIT 6`, [input.turnId]),
+    input.pool.query(`SELECT "type", "status", "stepId",
+        "content"->>'status' AS "contentStatus", "content"->>'errorCode' AS "errorCode"
+      FROM "agent_items" WHERE "turnId" = $1 AND "content"->>'toolCallId' = $2
+        AND "type" IN ('tool_call', 'tool_result') ORDER BY "id"`, [input.turnId, input.toolCallId]),
+    input.pool.query(`SELECT "type", "status", "content"->>'answerAvailable' AS "answerAvailable"
+      FROM "agent_items" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`, [waitItemId, input.sessionId, input.turnId]),
+    input.pool.query(`SELECT "sequence", "type", "payload"->>'reasonCode' AS "reasonCode",
+        "payload"->>'reason_code' AS "reasonCodeSnake", "payload"->>'errorCode' AS "errorCode",
+        "payload"->>'error_code' AS "errorCodeSnake"
+      FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
+      ORDER BY "sequence" DESC LIMIT 6`, [input.sessionId, input.turnId]),
+    input.pool.query(`SELECT "attemptCount", "publishedAt" IS NOT NULL AS "published", "lastError"
+      FROM "agent_outbox" WHERE "topic" = 'agent.turn.wakeup' AND "aggregateId" = $1
+        AND "payload"->>'turnId' = $2 ORDER BY "createdAt" DESC LIMIT 4`, [input.sessionId, input.turnId]),
+    input.pool.query(`SELECT "attemptCount", "publishedAt" IS NOT NULL AS "published", "lastError" IS NOT NULL AS "hasError"
+      FROM "agent_outbox" WHERE "topic" = 'agent.turn.dispatch' AND "idempotencyKey" = $1`, [`turn-dispatch:${input.turnId}`]),
+  ])
+  const attemptCount = Number(dispatch.rows[0]?.attemptCount ?? 0)
+  const recentGenerations = [Math.max(0, attemptCount - 1), attemptCount, attemptCount + 1]
+  const generations = [...new Set([0, 1, 2, ...recentGenerations])]
+  const [jobGenerations, queueCounts, queuePaused] = await Promise.all([
+    Promise.all(generations.map(async generation => {
+      const jobId = input.turnJobKey(input.turnId, generation)
+      try {
+        const job = await input.queue.getJob(jobId)
+        return { generation, state: job ? await job.getState() : "missing" }
+      } catch {
+        return { generation, state: "error" }
+      }
+    })),
+    input.queue.getJobCounts("wait", "active", "delayed", "completed", "failed", "paused")
+      .then(counts => ({ status: "ok" as const, counts }))
+      .catch(() => ({ status: "error" as const })),
+    input.queue.isPaused()
+      .then(paused => ({ status: "ok" as const, paused }))
+      .catch(() => ({ status: "error" as const })),
+  ])
+  const safeCode = (camel: unknown, snake?: unknown) => safeDiagnosticCode(camel) ?? safeDiagnosticCode(snake)
+  const snapshot = {
+    turn: turn.rows[0] ?? null,
+    root: root.rows[0] ?? null,
+    steps: steps.rows.map(row => ({ ...row, errorCode: safeDiagnosticCode(row.errorCode), finishReason: safeDiagnosticCode(row.finishReason) })),
+    toolItems: toolItems.rows.map(row => ({
+      type: row.type,
+      status: row.status,
+      stepId: row.stepId,
+      contentStatus: safeDiagnosticCode(row.contentStatus),
+      errorCode: safeDiagnosticCode(row.errorCode),
+    })),
+    waitItem: waitItem.rows[0] ? {
+      type: waitItem.rows[0].type,
+      status: waitItem.rows[0].status,
+      answerAvailable: waitItem.rows[0].answerAvailable === "true",
+    } : null,
+    events: events.rows.map(row => ({
+      sequence: row.sequence,
+      type: safeDiagnosticEventType(row.type),
+      reasonCode: safeCode(row.reasonCode, row.reasonCodeSnake),
+      errorCode: safeCode(row.errorCode, row.errorCodeSnake),
+    })),
+    wakeupOutbox: wakeupOutbox.rows.map(row => ({
+      attemptCount: row.attemptCount,
+      published: row.published,
+      lastError: safeDiagnosticCode(row.lastError),
+    })),
+    dispatch: dispatch.rows[0] ?? null,
+    jobs: jobGenerations,
+    queue: queueCounts,
+    queuePaused,
+  }
+  const serialized = JSON.stringify(snapshot)
+  if (serialized.length <= 1_400) return serialized
+
+  const compact = JSON.stringify({
+    diagnosticTruncated: true,
+    turn: snapshot.turn ? {
+      status: snapshot.turn.status,
+      revision: snapshot.turn.revision,
+      hasLease: snapshot.turn.hasLease,
+      leaseActive: snapshot.turn.leaseActive,
+    } : null,
+    root: snapshot.root ? {
+      status: snapshot.root.status,
+      hasLease: snapshot.root.hasLease,
+      leaseActive: snapshot.root.leaseActive,
+    } : null,
+    steps: snapshot.steps.slice(0, 3),
+    events: snapshot.events.slice(0, 4),
+    wakeupOutbox: snapshot.wakeupOutbox.slice(0, 2),
+    dispatch: snapshot.dispatch,
+    jobs: snapshot.jobs.slice(0, 3),
+    queue: snapshot.queue,
+  })
+  if (compact.length <= 1_400) return compact
+
+  const tinyFallback = JSON.stringify({ diagnosticTruncated: true })
+  return tinyFallback.length <= 1_400 ? tinyFallback : "{}"
+}
+
+async function waitForCheckpointResume(
+  child: WorkerChild,
+  kind: CheckpointKind,
+  timeoutMs = 20_000,
+  diagnostics?: CheckpointResumeDiagnostics,
+): Promise<string> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const resumed = child.output.find(value => value.startsWith(`CHECKPOINT_RESUME_CONTEXT_OK ${kind} `))
+    if (resumed) return resumed
+    if (kind === "question") {
+      const answerCount = child.output.find(value => value.startsWith("CHECKPOINT_QUESTION_CONTEXT_COUNT "))
+      if (answerCount) throw new Error(`Worker 2 did not receive exactly one durable question answer in its model request: ${answerCount}`)
+    }
+    if (child.exitCode !== null || child.signalCode !== null) throw new Error(`Worker 2 exited before recovering ${kind}: ${child.errors.join("\n")}`)
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  let runtime = "unavailable"
+  if (diagnostics) {
+    try { runtime = await checkpointResumeDiagnostics(diagnostics) } catch { runtime = "diagnostics-error" }
+  }
+  const requestStarted = child.output.some(value => value.startsWith(`CHECKPOINT_MODEL_REQUEST_STARTED ${kind} `))
+  const markers = {
+    workerReady: child.output.some(value => value.startsWith("CHECKPOINT_WORKER_READY worker2")),
+    modelRequestStarted: requestStarted,
+    resumeContextOk: child.output.some(value => value.startsWith(`CHECKPOINT_RESUME_CONTEXT_OK ${kind} `)),
+    questionContextCountSeen: child.output.some(value => value.startsWith("CHECKPOINT_QUESTION_CONTEXT_COUNT ")),
+  }
+  throw new Error(`Timed out waiting for Worker 2 to recover ${kind}; runtime=${runtime}; markers=${JSON.stringify(markers)}`)
 }
 
 async function waitForSuccessorProvider(pool: Pool, queue: Queue, child: WorkerChild, turnId: string, successorIndex: number, jobId: string): Promise<string> {
@@ -263,6 +468,82 @@ type WakeupDispatchRow = {
   payload: unknown
 }
 
+async function waitForCheckpointToolResult(pool: Pool, turnId: string, toolCallId: string): Promise<void> {
+  const deadline = Date.now() + 30_000
+  while (Date.now() < deadline) {
+    const result = await pool.query<{
+      calls: string; completedCalls: string; results: string; completedResults: string
+      resultStepId: string | null; callStepId: string | null; turnStatus: string; leaseOwnerId: string | null
+      leaseActive: boolean; rootTaskId: string | null; stepCount: string; readStepStatus: string | null; laterStepCount: string
+    }>(
+      `SELECT turn."status" AS "turnStatus", turn."leaseOwnerId", turn."rootTaskId",
+         turn."leaseExpiresAt" > CURRENT_TIMESTAMP AS "leaseActive",
+         (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_call' AND "content"->>'toolCallId' = $2) AS "calls",
+         (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_call' AND "status" = 'completed' AND "content"->>'toolCallId' = $2 AND "content"->>'status' = 'completed') AS "completedCalls",
+         (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_result' AND "content"->>'toolCallId' = $2) AS "results",
+         (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_result' AND "status" = 'completed' AND "content"->>'toolCallId' = $2) AS "completedResults",
+         (SELECT "stepId" FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_result' AND "content"->>'toolCallId' = $2 LIMIT 1) AS "resultStepId",
+         (SELECT "stepId" FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_call' AND "content"->>'toolCallId' = $2 LIMIT 1) AS "callStepId",
+         (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id") AS "stepCount",
+         (SELECT "status" FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" = 0 LIMIT 1) AS "readStepStatus",
+         (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" > 0) AS "laterStepCount"
+       FROM "agent_turns" AS turn WHERE turn."id" = $1`,
+      [turnId, toolCallId],
+    )
+    const row = result.rows[0]
+    if (row?.calls === "1" && row.completedCalls === "1" && row.results === "1" && row.completedResults === "1"
+      && row.turnStatus === "in_progress" && row.leaseOwnerId && row.leaseActive && row.rootTaskId
+      && row.stepCount === "1" && row.readStepStatus === "streaming" && row.laterStepCount === "0"
+      && row.resultStepId === row.callStepId) return
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  throw new Error(`Timed out waiting for a durable completed checkpoint tool result with its active lease and no downstream step for ${toolCallId}`)
+}
+
+async function waitForCheckpointWait(pool: Pool, kind: Exclude<CheckpointKind, "tool-result">, ids: FixtureIds): Promise<void> {
+  const itemId = `agent-wait:${kind}:${ids.checkpointWaitId}`
+  const deadline = Date.now() + 20_000
+  while (Date.now() < deadline) {
+    const result = await pool.query<{
+      turnStatus: string; leaseOwnerId: string | null; rootTaskId: string | null; leaseActive: boolean
+      itemCount: string; itemStatus: string | null; itemContent: Record<string, unknown> | null
+      startEventCount: string; startOutboxCount: string; receiptStatus: string | null; receiptCount: string
+      stepCount: string; readStepStatus: string | null; waitStepStatus: string | null; postWaitStepCount: string
+    }>(
+      `SELECT turn."status" AS "turnStatus", turn."leaseOwnerId", turn."rootTaskId", turn."leaseExpiresAt" > CURRENT_TIMESTAMP AS "leaseActive",
+         (SELECT COUNT(*)::text FROM "agent_items" AS item WHERE item."id" = $2 AND item."sessionId" = turn."sessionId" AND item."turnId" = turn."id" AND item."type" = $3) AS "itemCount",
+         (SELECT item."status" FROM "agent_items" AS item WHERE item."id" = $2 AND item."sessionId" = turn."sessionId" AND item."turnId" = turn."id" AND item."type" = $3 LIMIT 1) AS "itemStatus",
+         (SELECT item."content" FROM "agent_items" AS item WHERE item."id" = $2 AND item."sessionId" = turn."sessionId" AND item."turnId" = turn."id" AND item."type" = $3 LIMIT 1) AS "itemContent",
+         (SELECT COUNT(*)::text FROM "agent_events" AS event WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId" AND event."itemId" = $2 AND event."type" = 'item.started' AND event."actor" = 'orchestrator') AS "startEventCount",
+         (SELECT COUNT(*)::text FROM "agent_events" AS event JOIN "agent_outbox" AS outbox ON outbox."idempotencyKey" = 'agent-event:' || event."id"
+           WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId" AND event."itemId" = $2 AND event."type" = 'item.started'
+             AND outbox."topic" = 'agent.session.event' AND outbox."lastError" IS NULL) AS "startOutboxCount",
+         (SELECT COUNT(*)::text FROM "agent_approvals" WHERE "id" = $4 AND "userId" = turn."userId" AND "sessionId" = turn."sessionId" AND "turnId" = turn."id") AS "receiptCount",
+         (SELECT "status" FROM "agent_approvals" WHERE "id" = $4 AND "userId" = turn."userId" AND "sessionId" = turn."sessionId" AND "turnId" = turn."id" LIMIT 1) AS "receiptStatus",
+         (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id") AS "stepCount",
+         (SELECT "status" FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" = 0 LIMIT 1) AS "readStepStatus",
+         (SELECT "status" FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" = 1 LIMIT 1) AS "waitStepStatus",
+         (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" > 1) AS "postWaitStepCount"
+       FROM "agent_turns" AS turn WHERE turn."id" = $1 AND turn."sessionId" = $5 AND turn."userId" = $6`,
+      [ids.turnId, itemId, kind === "approval" ? "approval_request" : "question", ids.checkpointWaitId, ids.sessionId, ids.userId],
+    )
+    const row = result.rows[0]
+    const expectedTurnStatus = kind === "approval" ? "waiting_for_approval" : "waiting_for_user"
+    const content = row?.itemContent
+    const contentMatches = kind === "approval"
+      ? content?.waitKind === "approval" && content.approvalId === ids.checkpointWaitId && content.toolCallId === ids.readCallId
+      : content?.waitKind === "question" && content.questionId === ids.checkpointWaitId && content.toolCallId === ids.readCallId
+        && typeof content.question === "string" && Array.isArray(content.options) && content.answer === null && content.answerAvailable === false
+    if (row?.turnStatus === expectedTurnStatus && row.leaseOwnerId && row.rootTaskId && row.leaseActive
+      && row.itemCount === "1" && row.itemStatus === "started" && contentMatches
+      && row.startEventCount === "1" && row.startOutboxCount === "1"
+      && (kind === "question" || (row.receiptCount === "1" && row.receiptStatus === "pending"))
+      && row.stepCount === "2" && row.readStepStatus === "completed" && row.waitStepStatus === "streaming" && row.postWaitStepCount === "0") return
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  throw new Error(`Timed out waiting for durable ${kind} wait rows and the actual waiting model-step boundary for ${ids.checkpointWaitId}`)
+}
+
 type WakeupDispatchSnapshot = {
   dispatchBeforeRestart: { rows: WakeupDispatchRow[] }
   wakeupJob: Awaited<ReturnType<Queue["getJob"]>>
@@ -337,9 +618,11 @@ describeWithServices("production bootstrap recovery across a Worker process rest
   const turnFixtureIds = new Set<string>()
   const fixtureSessionIds = new Set<string>()
   const auxiliaryUserIds = new Set<string>()
+  const checkpointJobIds = new Set<string>()
 
   beforeAll(async () => {
     process.env.REDIS_URL = redisUrl!
+    process.env.DATABASE_URL = databaseUrl!
     const [turnModule, turnQueueModule, childModule] = await Promise.all([
       import("../runtime/turns/recovery-scanner.js"),
       import("../runtime/turns/turn-queue.js"),
@@ -404,6 +687,10 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     } else if (turnQueue && typeof ids !== "undefined") {
       cleanupFailures.push("Turn fixture job cleanup skipped because a child Worker may still be running")
     }
+    if (pool && checkpointJobIds.size > 0) await attemptCleanup(cleanupFailures, "checkpoint fixture job cleanup", async () => {
+      await pool!.query(`DELETE FROM "Job" WHERE "id" = ANY($1::text[])`, [[...checkpointJobIds]])
+      checkpointJobIds.clear()
+    })
     if (pool && typeof ids !== "undefined") await attemptCleanup(cleanupFailures, "fixture database cleanup", async () => {
       await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [ids.userId])
     })
@@ -456,16 +743,231 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     if (pool && workersStopped && fixtureSessionIds.size > 0) await attemptCleanup(cleanupFailures, "after-test fixture session cleanup", async () => {
       await pool!.query(`DELETE FROM "agent_sessions" WHERE "id" = ANY($1::text[])`, [[...fixtureSessionIds]])
     })
+    if (pool && workersStopped && checkpointJobIds.size > 0) await attemptCleanup(cleanupFailures, "after-test checkpoint fixture job cleanup", async () => {
+      await pool!.query(`DELETE FROM "Job" WHERE "id" = ANY($1::text[])`, [[...checkpointJobIds]])
+      checkpointJobIds.clear()
+    })
     if (pool && workersStopped) for (const userId of auxiliaryUserIds) await attemptCleanup(cleanupFailures, `after-test auxiliary user ${userId} cleanup`, async () => {
       await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [userId])
     })
     if (cleanupFailures.length > 0) throw new Error(`Process-restart per-test cleanup failed:\n${cleanupFailures.join("\n")}`)
   })
 
+  async function resumeAtDurableCheckpoint(kind: CheckpointKind): Promise<void> {
+    const suffix = randomUUID()
+    const userId = `checkpoint-user-${suffix}`
+    const sessionId = `checkpoint-session-${suffix}`
+    const jobId = `checkpoint-job-${suffix}`
+    const waitId = `checkpoint-wait-${suffix}`
+    const checkpointIds: FixtureIds = {
+      suffix, userId, sessionId, turnId: `checkpoint-turn-pending-${suffix}`,
+      checkpointKind: kind, checkpointWaitId: waitId, checkpointJobId: jobId,
+      checkpointAnswer: `checkpoint-answer-${suffix}`, readCallId: `checkpoint-read-${suffix}`,
+    }
+    fixtureSessionIds.add(sessionId)
+    auxiliaryUserIds.add(userId)
+    await pool!.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`, [userId, `${userId}@example.invalid`])
+    await pool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+      VALUES ($1, $2, 'Recover the same Turn after a durable checkpoint', 'running', 'test', CURRENT_TIMESTAMP)`, [sessionId, userId])
+    if (kind === "approval") {
+      checkpointJobIds.add(jobId)
+      await pool!.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "updatedAt")
+        VALUES ($1, $2, 'Fixture Employer', 'Fixture Engineer', CURRENT_TIMESTAMP)`, [jobId, userId])
+    }
+
+    commandAcceptance = startWorker("accept-message", checkpointIds)
+    const acceptedLine = await waitForLine(commandAcceptance, "COMMAND_ACCEPTED ")
+    await waitForExit(commandAcceptance, { stage: `checkpoint-${kind}-acceptance`, pid: commandAcceptance.pid })
+    expect(commandAcceptance.exitCode).toBe(0)
+    const acceptance = parseCommandAcceptance(acceptedLine)
+    expect(acceptance.accepted.disposition).toBe("started")
+    expect(acceptance.duplicate.disposition).toBe("duplicate")
+    checkpointIds.turnId = acceptance.accepted.turnId
+    turnFixtureIds.add(checkpointIds.turnId)
+
+    workerOne = startWorker("checkpoint-worker1", checkpointIds)
+    let checkpointStepBlocker: PoolClient | undefined
+    let workerOnePid: number | undefined
+    let beforeKill: {
+      status: string; leaseOwnerId: string | null; rootTaskId: string | null; rootStatus: string | null; rootLeaseOwner: string | null
+      readCalls: string; readResults: string; stepCount: string; readStepCount: string; readStepStatus: string | null
+      waitStepCount: string; waitStepStatus: string | null; postCheckpointStepCount: string
+    } | undefined
+    try {
+      if (kind === "tool-result") {
+        await waitForLine(workerOne, `CHECKPOINT_TOOL_STEP_READY ${checkpointIds.readCallId}`)
+        const initialStep = await pool!.query(`SELECT 1 FROM "agent_steps" WHERE "turnId" = $1 AND "ordinal" = 0`, [checkpointIds.turnId])
+        expect(initialStep.rowCount).toBe(1)
+        checkpointStepBlocker = await pool!.connect()
+        await checkpointStepBlocker.query("BEGIN")
+        await checkpointStepBlocker.query('LOCK TABLE "agent_steps" IN SHARE MODE')
+        workerOne.stdin?.write("release-checkpoint-tool-call\n")
+        await waitForLine(workerOne, `CHECKPOINT_READ_TOOL_EXECUTED ${checkpointIds.readCallId}`)
+        await waitForCheckpointToolResult(pool!, checkpointIds.turnId, checkpointIds.readCallId!)
+        expect(workerOne.output.filter(line => line.startsWith("CHECKPOINT_MODEL_REQUEST "))).toEqual(["CHECKPOINT_MODEL_REQUEST 1"])
+        expect(workerOne.output).not.toContain("CHECKPOINT_NEXT_MODEL_REQUEST_STARTED")
+      } else {
+        await waitForLine(workerOne, `CHECKPOINT_WAIT_DURABLE ${kind}`)
+        await waitForCheckpointWait(pool!, kind, checkpointIds)
+        checkpointStepBlocker = await pool!.connect()
+        await checkpointStepBlocker.query("BEGIN")
+        await checkpointStepBlocker.query('LOCK TABLE "agent_steps" IN SHARE MODE')
+        expect(workerOne.output.filter(line => line.startsWith("CHECKPOINT_MODEL_REQUEST "))).toEqual(["CHECKPOINT_MODEL_REQUEST 1", "CHECKPOINT_MODEL_REQUEST 2"])
+        expect(workerOne.output).not.toContain("CHECKPOINT_POST_WAIT_MODEL_PROGRESS")
+      }
+      beforeKill = (await pool!.query<{
+        status: string; leaseOwnerId: string | null; rootTaskId: string | null; rootStatus: string | null; rootLeaseOwner: string | null
+        readCalls: string; readResults: string; stepCount: string; readStepCount: string; readStepStatus: string | null
+        waitStepCount: string; waitStepStatus: string | null; postCheckpointStepCount: string
+      }>(`SELECT turn."status", turn."leaseOwnerId", turn."rootTaskId", root."status" AS "rootStatus", root."leaseOwner" AS "rootLeaseOwner",
+          (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_call' AND "content"->>'toolCallId' = $2) AS "readCalls",
+          (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_result' AND "content"->>'toolCallId' = $2) AS "readResults",
+          (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id") AS "stepCount",
+          (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" = 0) AS "readStepCount",
+          (SELECT "status" FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" = 0 LIMIT 1) AS "readStepStatus",
+          (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" = 1) AS "waitStepCount",
+          (SELECT "status" FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" = 1 LIMIT 1) AS "waitStepStatus",
+          (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" > $3) AS "postCheckpointStepCount"
+        FROM "agent_turns" AS turn JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."turnId" = turn."id"
+        WHERE turn."id" = $1`, [checkpointIds.turnId, checkpointIds.readCallId, kind === "tool-result" ? 0 : 1])).rows[0]
+      expect(beforeKill).toMatchObject({
+        status: kind === "approval" ? "waiting_for_approval" : kind === "question" ? "waiting_for_user" : "in_progress",
+        rootStatus: "running", readCalls: "1", readResults: "1", stepCount: kind === "tool-result" ? "1" : "2", readStepCount: "1",
+        readStepStatus: kind === "tool-result" ? "streaming" : "completed",
+        waitStepCount: kind === "tool-result" ? "0" : "1", waitStepStatus: kind === "tool-result" ? null : "streaming",
+        postCheckpointStepCount: "0",
+      })
+      expect(beforeKill.leaseOwnerId).toBeTruthy()
+      expect(beforeKill.rootTaskId).toBeTruthy()
+      expect(beforeKill.rootLeaseOwner).toBe(beforeKill.leaseOwnerId)
+
+      if (!workerOne.pid) throw new Error("Checkpoint Worker 1 has no PID at the restart boundary")
+      workerOnePid = workerOne.pid
+      const killContext: ExitWaitContext = { stage: `checkpoint-${kind}-worker1-after-SIGKILL`, pid: workerOnePid, requestedSignal: "SIGKILL" }
+      const killed = waitForExit(workerOne, killContext)
+      killContext.signalAccepted = workerOne.kill("SIGKILL")
+      await killed
+      expect(killContext.signalAccepted, exitWaitDiagnostics(workerOne, killContext)).toBe(true)
+      expect({ pid: workerOne.pid, signalCode: workerOne.signalCode }).toEqual({ pid: workerOnePid, signalCode: "SIGKILL" })
+    } finally {
+      if (checkpointStepBlocker) {
+        await checkpointStepBlocker.query("ROLLBACK").catch(() => undefined)
+        checkpointStepBlocker.release()
+      }
+    }
+    if (!beforeKill) throw new Error("Checkpoint Worker 1 did not reach a verified durable restart boundary")
+    if (!workerOnePid) throw new Error("Checkpoint Worker 1 PID was unavailable after its restart boundary")
+    await pool!.query(`UPDATE "agent_turns" SET "leaseExpiresAt" = CURRENT_TIMESTAMP - INTERVAL '1 second'
+      WHERE "id" = $1 AND "leaseOwnerId" = $2 AND "status" IN ('in_progress', 'waiting_for_approval', 'waiting_for_user')`, [checkpointIds.turnId, beforeKill.leaseOwnerId])
+    await pool!.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = CURRENT_TIMESTAMP - INTERVAL '1 second'
+      WHERE "id" = $1 AND "status" = 'running' AND "leaseOwner" = $2`, [beforeKill.rootTaskId, beforeKill.leaseOwnerId])
+
+    if (kind !== "tool-result") {
+      commandAcceptance = startWorker("resolve-checkpoint", checkpointIds)
+      await waitForLine(commandAcceptance, `CHECKPOINT_WAIT_RESOLVED ${kind}`)
+      await waitForExit(commandAcceptance, { stage: `checkpoint-${kind}-wait-resolution`, pid: commandAcceptance.pid })
+      expect(commandAcceptance.exitCode).toBe(0)
+    }
+
+    workerTwo = startWorker("checkpoint-worker2", checkpointIds)
+    expect(workerTwo.pid).not.toBe(workerOnePid)
+    await waitForCheckpointResume(workerTwo, kind, 60_000, {
+      pool: pool!, queue: turnQueue!, turnId: checkpointIds.turnId, sessionId: checkpointIds.sessionId,
+      checkpointKind: kind, waitId: checkpointIds.checkpointWaitId!, toolCallId: checkpointIds.readCallId!, turnJobKey: turnJobKey!,
+    })
+    await waitForTurnStatus(pool!, checkpointIds.turnId, "completed", 60_000, workerTwo)
+    const finalState = await pool!.query<{
+      finalCount: string; finalText: string | null; completedEvents: string; readCalls: string; readResults: string
+      initialReadSteps: string; resumedEvents: string; wakeupEvents: string; wakeupOutbox: string; wakeupAttempts: string
+      wakeupEventIdempotencyKey: string | null; wakeupPublishedAt: string | null; publishedWakeupOutbox: string
+      questionAnsweredEvents: string; answerCount: string
+    }>(`SELECT
+        (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'agent_message' AND "phase" = 'final_answer') AS "finalCount",
+        (SELECT "content"->>'text' FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'agent_message' AND "phase" = 'final_answer' LIMIT 1) AS "finalText",
+        (SELECT COUNT(*)::text FROM "agent_events" WHERE "turnId" = turn."id" AND "type" = 'turn.completed') AS "completedEvents",
+        (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_call' AND "content"->>'toolCallId' = $2) AS "readCalls",
+        (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_result' AND "content"->>'toolCallId' = $2) AS "readResults",
+        (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" = 0) AS "initialReadSteps",
+        (SELECT COUNT(*)::text FROM "agent_events" WHERE "turnId" = turn."id" AND "type" = 'turn.resumed') AS "resumedEvents",
+        (SELECT COUNT(*)::text FROM "agent_events" AS event WHERE event."sessionId" = turn."sessionId" AND event."turnId" = turn."id"
+          AND event."itemId" = $7 AND event."type" = 'turn.wakeup' AND event."payload"->>'waitId' = $6) AS "wakeupEvents",
+        (SELECT MAX(event."idempotencyKey") FROM "agent_events" AS event WHERE event."sessionId" = turn."sessionId" AND event."turnId" = turn."id"
+          AND event."itemId" = $7 AND event."type" = 'turn.wakeup' AND event."payload"->>'waitId' = $6) AS "wakeupEventIdempotencyKey",
+        (SELECT COUNT(*)::text FROM "agent_events" WHERE "turnId" = turn."id" AND "type" = 'question.answered') AS "questionAnsweredEvents",
+        (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'question' AND "content"->>'answer' = $3) AS "answerCount",
+        wakeup."outboxCount" AS "wakeupOutbox", wakeup."attempts" AS "wakeupAttempts",
+        wakeup."publishedAt" AS "wakeupPublishedAt", wakeup."publishedCount" AS "publishedWakeupOutbox"
+      FROM "agent_turns" AS turn
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*)::text AS "outboxCount", COALESCE(MAX(outbox."attemptCount"), 0)::text AS "attempts",
+          MAX(outbox."publishedAt")::text AS "publishedAt",
+          COUNT(*) FILTER (WHERE outbox."publishedAt" IS NOT NULL AND outbox."attemptCount" = 1 AND outbox."lastError" IS NULL)::text AS "publishedCount"
+        FROM "agent_events" AS event
+        JOIN "agent_outbox" AS outbox ON outbox."idempotencyKey" = 'agent-event:' || event."id"
+          AND outbox."payload"->>'eventId' = event."id" AND outbox."aggregateId" = turn."sessionId"
+          AND outbox."topic" = 'agent.turn.wakeup'
+        WHERE event."sessionId" = turn."sessionId" AND event."turnId" = turn."id"
+          AND event."itemId" = $7 AND event."type" = 'turn.wakeup' AND event."payload"->>'waitId' = $6
+      ) AS wakeup ON TRUE
+      WHERE turn."id" = $1 AND turn."sessionId" = $4 AND turn."userId" = $5`,
+    [checkpointIds.turnId, checkpointIds.readCallId, checkpointIds.checkpointAnswer, sessionId, userId,
+      checkpointIds.checkpointWaitId, `agent-wait:${kind}:${checkpointIds.checkpointWaitId}`])
+    const result = finalState.rows[0]
+    expect(result).toMatchObject({ finalCount: "1", completedEvents: "1", readCalls: "1", readResults: "1", initialReadSteps: "1" })
+    expect(result?.finalText).toContain(`CHECKPOINT_FINAL_${kind}_${suffix}`)
+    expect(workerOne.output.filter(line => line === `CHECKPOINT_READ_TOOL_EXECUTED ${checkpointIds.readCallId}`)).toHaveLength(1)
+    expect(workerTwo.output.some(line => line === `CHECKPOINT_READ_TOOL_EXECUTED ${checkpointIds.readCallId}`)).toBe(false)
+    expect(workerTwo.output.filter(line => line === `CHECKPOINT_MODEL_REQUEST_STARTED ${kind} 1`)).toHaveLength(1)
+    expect(workerTwo.output.filter(line => line.startsWith(`CHECKPOINT_RESUME_CONTEXT_OK ${kind} `))).toHaveLength(1)
+    if (kind === "tool-result") {
+      expect(result).toMatchObject({ resumedEvents: "0", wakeupEvents: "0", wakeupOutbox: "0", wakeupAttempts: "0", publishedWakeupOutbox: "0", questionAnsweredEvents: "0", answerCount: "0" })
+      expect(result?.wakeupEventIdempotencyKey).toBeNull()
+    } else {
+      expect(result).toMatchObject({ resumedEvents: "1", wakeupEvents: "1", wakeupOutbox: "1", wakeupAttempts: "1", publishedWakeupOutbox: "1" })
+      expect(result?.wakeupEventIdempotencyKey).toBe(`agent-wait-command:checkpoint-command:${suffix}:wakeup`)
+      expect(result?.wakeupPublishedAt).toBeTruthy()
+    }
+    if (kind === "question") {
+      expect(result).toMatchObject({ answerCount: "1", questionAnsweredEvents: "1" })
+      expect(result?.finalText).toContain(checkpointIds.checkpointAnswer)
+    } else {
+      expect(result?.questionAnsweredEvents).toBe("0")
+    }
+    if (kind === "approval") {
+      const item = await pool!.query<{
+        count: string; status: string | null; userId: string | null; turnUserId: string | null; sessionId: string | null
+        turnId: string | null; taskId: string | null; toolCallId: string | null
+      }>(`SELECT COUNT(*)::text AS "count", MAX(item."status") AS "status", MAX(session."userId") AS "userId",
+          MAX(turn."userId") AS "turnUserId", MAX(item."sessionId") AS "sessionId", MAX(item."turnId") AS "turnId",
+          MAX(item."taskId") AS "taskId", MAX(item."content"->>'toolCallId') AS "toolCallId"
+        FROM "agent_items" AS item
+        JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
+        JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+        WHERE item."turnId" = $1 AND item."type" = 'approval_request' AND item."content"->>'approvalId' = $2`, [checkpointIds.turnId, waitId])
+      const receipt = await pool!.query<{
+        status: string; scopeHash: string | null; userId: string; sessionId: string; turnId: string; taskId: string | null; jobId: string; toolCallId: string
+      }>(`SELECT "status", "scopeHash", "userId", "sessionId", "turnId", "taskId", "jobId", "toolCallId" FROM "agent_approvals" WHERE "id" = $1`, [waitId])
+      expect(item.rows[0]).toEqual({ count: "1", status: "completed", userId, turnUserId: userId, sessionId, turnId: checkpointIds.turnId, taskId: null, toolCallId: checkpointIds.readCallId })
+      expect(receipt.rows[0]).toMatchObject({ status: "approved", userId, sessionId, turnId: checkpointIds.turnId, taskId: null, jobId, toolCallId: checkpointIds.readCallId })
+      expect(receipt.rows[0]?.scopeHash).toMatch(/^[a-f0-9]{64}$/)
+    }
+  }
+
+  it.each(["approval", "question", "tool-result"] as const)(
+    "recovers the same Turn after Worker 1 is killed at the durable %s checkpoint without replaying completed work",
+    async kind => resumeAtDurableCheckpoint(kind),
+    90_000,
+  )
+
   it("persists a child result, kills its Worker, and resumes the parent from PostgreSQL under a new lease", async () => {
     // Exercise the Web command service against the migrated disposable database.
     // The fixture calls message() twice with the same clientMessageId, then
-    // exits before any Worker consumer is started.
+    // exits before any Worker consumer is started. afterEach removes fixture
+    // sessions, so this case owns a fresh Session instead of reusing beforeAll's.
+    ids.sessionId = `process-restart-child-result-session-${randomUUID()}`
+    fixtureSessionIds.add(ids.sessionId)
+    await pool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+      VALUES ($1, $2, 'Resume a parent Turn after its child completes', 'running', 'test', CURRENT_TIMESTAMP)`, [ids.sessionId, ids.userId])
     commandAcceptance = startWorker("accept-message", ids)
     const acceptedLine = await waitForLine(commandAcceptance, "COMMAND_ACCEPTED ")
     await waitForExit(commandAcceptance, { stage: "command-acceptance-after-result", pid: commandAcceptance.pid })

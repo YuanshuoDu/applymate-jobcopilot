@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
+import { contextToModelMessages } from "./turns/turn-engine-messages.js"
 import { STEERING_MARKER_EVENT_TYPE, steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "./context/steering-marker.js"
 import { buildCognitiveActionAgenda } from "./turns/cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE } from "./turns/cognitive-agenda-receipt.js"
@@ -25,13 +26,15 @@ function agendaEvent(sequence = "20", patch: Record<string, unknown> = {}, fence
   return { id: `agenda-${sequence}`, type: COGNITIVE_AGENDA_EVENT_TYPE, actor: "system", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null, sequence, payload: { ...value, ...patch } }
 }
 
-function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unknown>[]; items?: Record<string, unknown>[]; inputs?: Record<string, unknown>[]; events?: Record<string, unknown>[]; snapshots?: Record<string, unknown>[] }) {
+function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unknown>[]; items?: Record<string, unknown>[]; questionItems?: Record<string, unknown>[]; inputs?: Record<string, unknown>[]; events?: Record<string, unknown>[]; questionEvents?: Record<string, unknown>[]; snapshots?: Record<string, unknown>[] }) {
   const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
     if (sql.includes('"input"') && sql.includes('FROM "agent_turns"')) return { rows: rows.turn ? [{ id: "turn-1", sessionId: "session-1", userId: "user-1", status: "in_progress", leaseOwnerId: lease.ownerId, leaseVersion: lease.leaseVersion, leaseExpiresAt: lease.leaseExpiresAt, ...rows.turn }] : [], rowCount: rows.turn ? 1 : 0 }
     if (sql.includes('MAX("ordinal")')) return { rows: [{ maxOrdinal: Math.max(...(rows.steps ?? []).map(step => Number(step.ordinal ?? -1)), -1) }], rowCount: 1 }
     if (sql.includes('FROM "agent_steps"')) return { rows: (rows.steps ?? []).filter(step => step.taskId === undefined || step.taskId === null || step.taskId === values?.[2]), rowCount: rows.steps?.length ?? 0 }
+    if (sql.includes('FROM "agent_events"') && sql.includes('event."itemId" = ANY')) return { rows: rows.questionEvents ?? [], rowCount: rows.questionEvents?.length ?? 0 }
     if (sql.includes('FROM "agent_events"')) return { rows: (rows.events ?? []).filter(event => event.taskId === undefined || event.taskId === null || event.taskId === values?.[2]), rowCount: rows.events?.length ?? 0 }
     if (sql.includes('FROM "agent_items"')) {
+      if (sql.includes('item."type" = \'question\'')) return { rows: rows.questionItems ?? [], rowCount: rows.questionItems?.length ?? 0 }
       const filtered = sql.includes('item_task') ? (rows.items ?? []).filter(item => item.taskId === undefined || item.taskId === null || item.taskId === "root-1") : (rows.items ?? []).filter(item => item.taskId === undefined || item.taskId === null || item.taskId === values?.[2])
       return { rows: filtered, rowCount: filtered.length }
     }
@@ -60,6 +63,84 @@ function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unk
 }
 
 describe("loadCanonicalTurnState", () => {
+  it("projects a fenced answered question once into recovered steer history", async () => {
+    const question = { id: "question-item", type: "question", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null,
+      stepId: null, status: "completed", content: { waitKind: "question", questionId: "question-1", toolCallId: "question-call-1", question: "Continue?", options: [{ label: "Yes", value: "yes" }], answer: "yes", answerAvailable: true } }
+    const events = [
+      { id: "started", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null, itemId: "question-item",
+        type: "item.started", actor: "orchestrator", sequence: "10", correlationId: "question-item", causationId: "question-1",
+        payload: { itemId: "question-item", waitKind: "question", questionId: "[REDACTED]", toolCallId: "question-call-1" } },
+      { id: "answered", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null, itemId: "question-item",
+        type: "question.answered", actor: "user", sequence: "11", correlationId: "question-1", causationId: "question-item",
+        payload: { waitKind: "question", waitId: "question-1", itemId: "question-item", turnId: "turn-1", toolCallId: "question-call-1", status: "answered", answerAvailable: "[REDACTED]" } },
+    ]
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      steps: [{ id: "step-1", taskId: "root-1", ordinal: 0, inputThroughSequence: "0", consumedInputIds: [], inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }],
+      items: [{ id: "tool-call-item", sessionId: "session-1", turnId: "turn-1", taskId: "root-1", stepId: "step-1", type: "tool_call", status: "started", revision: 0,
+        content: { toolCallId: "question-call-1", toolName: "jobs.search", input: { query: "engineer" }, status: "completed" } }],
+      questionItems: [question], questionEvents: events,
+    })
+    const value = await loadCanonicalTurnState(fake, lease)
+    expect(value.snapshot.steerHistory).toEqual([
+      { id: "agent-question:question-item:question", content: { role: "assistant", type: "question", question: "Continue?", options: [{ label: "Yes", value: "yes" }] } },
+      { id: "agent-question:question-item:answer", content: { role: "user", type: "answer", questionId: "question-1", text: "yes" } },
+    ])
+    const [questionQuery, eventQuery] = fake.client.query.mock.calls.filter(([sql]) => typeof sql === "string" && (sql.includes('item."type" = \'question\'') || sql.includes('event."itemId" = ANY'))).map(([sql]) => sql)
+    expect(questionQuery).toContain('session."userId" = $3')
+    expect(questionQuery).toContain('turn."userId" = $3')
+    expect(questionQuery).toContain('(item."taskId" IS NULL OR item."taskId" = $4)')
+    expect(eventQuery).toContain('(event."taskId" IS NULL OR event."taskId" = $4)')
+    expect(eventQuery).toContain("'question.answered'")
+  })
+
+  it("keeps canonical model history unchanged when no persisted answer event matches", async () => {
+    const history = [{ id: "snapshot-history", content: { role: "user", text: "Existing baseline context" } }]
+    const pending = { id: "pending-question", type: "question", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null,
+      stepId: null, status: "started", content: { waitKind: "question", questionId: "question-pending", toolCallId: "call-1",
+        question: "Continue?", options: [{ label: "Yes", value: "yes" }], answer: null, answerAvailable: false } }
+    const snapshot = {
+      schemaVersion: "agent-harness.context.v1", ownerId: "user-1", sessionId: "session-1", throughSequence: "4", goal: "Continue",
+      userConstraints: [], confirmedDecisions: [], completedWork: [], openWork: [], pendingApprovals: [], artifacts: [], facts: [], failedAttempts: [], references: [], consumedInputIds: [],
+      context: { system: [], profile: [], steerHistory: history, toolObservations: [] },
+      tokenAccounting: { profiles: [], totalInputTokens: 0, totalOutputTokens: 0, totalCostUsd: 0 },
+    }
+    const fake = pool({
+      turn: { input: { goal: "Continue" }, rootTaskId: "root-1", contextSnapshotId: "snapshot-1", modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      questionItems: [pending], questionEvents: [], snapshots: [{ id: "snapshot-1", throughSequence: "4", content: snapshot }],
+    })
+    const value = await loadCanonicalTurnState(fake, lease)
+    expect(value.snapshot.steerHistory).toEqual(history)
+    expect(value.snapshot.toolObservations).toEqual([])
+    const messages = contextToModelMessages({ blocks: value.snapshot.steerHistory.map(entry => ({
+      id: `history:${entry.id}`, layer: "steer_history", role: "data", trust: "external_untrusted", source: "steer_history", content: entry.content,
+    })) } as never)
+    expect(messages).toEqual([{ role: "user", content: [{ type: "text", text: '[harness context layer=steer_history trust=UNTRUSTED_DATA source=steer_history]\n{"role":"user","text":"Existing baseline context"}' }] }])
+  })
+
+  it("keeps ordinary canonical bootstrap alive when the fake repository returns a neighboring Turn row", async () => {
+    const neighboringTurnRow = { id: "turn-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", status: "in_progress" }
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      questionItems: [neighboringTurnRow],
+    })
+
+    await expect(loadCanonicalTurnState(fake, lease)).resolves.toMatchObject({ snapshot: { steerHistory: [] } })
+    const questionQuery = fake.client.query.mock.calls.find(([sql]) => typeof sql === "string" && sql.includes('item."type" = \'question\''))?.[0]
+    expect(questionQuery).toContain('item."type"')
+  })
+
+  it("fails canonical resume closed for an answered question outside the task fence", async () => {
+    const malformedQuestion = { id: "foreign-task-question", type: "question", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "child-task",
+      stepId: "step-1", status: "completed", content: { waitKind: "question", questionId: "question-1", toolCallId: null,
+        question: "Continue?", options: [{ label: "Yes", value: "yes" }], answer: "yes", answerAvailable: true } }
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      questionItems: [malformedQuestion],
+    })
+    await expect(loadCanonicalTurnState(fake, lease)).rejects.toThrow("question_recovery_item_scope_invalid")
+  })
+
   it("restores the latest scoped cognitive agenda receipt as audit state", async () => {
     const fake = pool({ turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} }, events: [agendaEvent("20"), agendaEvent("21", { stepId: "step-2" })] })
     const value = await loadCanonicalTurnState(fake, lease)
