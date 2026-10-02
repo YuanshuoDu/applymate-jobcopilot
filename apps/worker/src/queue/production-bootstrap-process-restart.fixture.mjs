@@ -272,13 +272,17 @@ async function acceptActiveFollowUp() {
     import("../../../web/src/lib/db.ts"),
     import("../../../web/src/lib/agent/control-plane/commands/agent-command-service.ts"),
   ])
-  const command = {
-    sessionId: ids.sessionId,
-    userId: ids.userId,
+  const input = ids.followUpCommand ?? {
     clientMessageId: "active-follow-up:" + ids.suffix,
+    text: "Durable active-Turn follow-up " + ids.suffix,
+  }
+  const command = {
+    sessionId: input.sessionId ?? ids.sessionId,
+    userId: input.userId ?? ids.userId,
+    clientMessageId: input.clientMessageId,
     source: "user",
     delivery: "follow_up",
-    content: [{ type: "text", text: "Durable active-Turn follow-up " + ids.suffix }],
+    content: [{ type: "text", text: input.text }],
   }
   try {
     const service = new AgentCommandService(db)
@@ -291,7 +295,14 @@ async function acceptActiveFollowUp() {
 }
 
 async function makeActiveFollowUpWorker() {
-  const followUpText = "Durable active-Turn follow-up " + ids.suffix
+  const followUps = Array.isArray(ids.followUps) ? ids.followUps : []
+  function assertPendingFollowUpsHidden(request) {
+    const pending = followUps.filter(followUp => request.messages
+      .filter(message => message.role === "user" && Array.isArray(message.content))
+      .flatMap(message => message.content)
+      .some(part => part.type === "text" && part.text.includes(followUp.text)))
+    if (pending.length !== 0) throw new Error("pending_follow_up_exposed_during_active_turn")
+  }
   await startFixtureProductionRuntime({
     workerId: "active-follow-up-worker-" + process.pid,
     productionFlags: {
@@ -340,11 +351,7 @@ async function makeActiveFollowUpWorker() {
                 return
               }
               if (modelCalls === 2) {
-                const followUpParts = request.messages
-                  .filter(message => message.role === "user" && Array.isArray(message.content))
-                  .flatMap(message => message.content)
-                  .filter(part => part.type === "text" && part.text.includes(followUpText))
-                if (followUpParts.length !== 0) throw new Error("follow_up_present_before_final_provider_started")
+                assertPendingFollowUpsHidden(request)
                 say("FINAL_PROVIDER_ACTIVE")
                 await Promise.race([
                   waitForCommand("release-pending-follow-up-provider"),
@@ -354,19 +361,7 @@ async function makeActiveFollowUpWorker() {
                 yield { type: "completed", finishReason: "stop" }
                 return
               }
-              if (modelCalls !== 3) throw new Error("unexpected_active_follow_up_provider_round")
-              const followUpParts = request.messages
-                .filter(message => message.role === "user" && Array.isArray(message.content))
-                .flatMap(message => message.content)
-                .filter(part => part.type === "text" && part.text.includes(followUpText))
-              if (followUpParts.length !== 1) throw new Error("follow_up_missing_or_duplicated_in_final_provider_request")
-              say("FOLLOW_UP_CONTEXT_OK")
-              await Promise.race([
-                waitForCommand("release-final-provider"),
-                new Promise((_, reject) => request.signal.addEventListener("abort", () => reject(new Error("fixture_provider_aborted")), { once: true })),
-              ])
-              yield { type: "text_delta", text: finalMarker }
-              yield { type: "completed", finishReason: "stop" }
+              throw new Error("unexpected_active_follow_up_provider_round")
             },
           },
           registry: {}, candidates: [],
@@ -383,8 +378,32 @@ async function makeActiveFollowUpWorker() {
 }
 
 async function makeFollowUpResumeWorker() {
-  if (typeof ids.followUpInputId !== "string" || !ids.followUpInputId) throw new Error("follow_up_input_id_missing")
-  const followUpText = "Durable active-Turn follow-up " + ids.suffix
+  const followUps = Array.isArray(ids.followUps) ? ids.followUps : []
+  if (followUps.length === 0) throw new Error("follow_up_inputs_missing")
+  function matchingFollowUps(request) {
+    const userTexts = request.messages
+      .filter(message => message.role === "user" && Array.isArray(message.content))
+      .flatMap(message => message.content)
+      .filter(part => part.type === "text" && typeof part.text === "string")
+      .map(part => part.text)
+    return followUps.flatMap((followUp, index) => {
+      const occurrences = userTexts.filter(text => text.includes(followUp.text)).length
+      return occurrences ? [{ followUp, index, occurrences }] : []
+    })
+  }
+  function assertNoFollowUps(request, phase) {
+    const matches = matchingFollowUps(request)
+    if (matches.length !== 0) throw new Error(`${phase}_exposed_pending_follow_ups:${JSON.stringify(matches)}`)
+  }
+  function assertCurrentFollowUpOnly(request, currentIndex, phase) {
+    const matches = matchingFollowUps(request)
+    const current = matches.find(match => match.index === currentIndex)
+    const later = matches.filter(match => match.index > currentIndex)
+    if (!current || current.occurrences !== 1 || later.length > 0) {
+      throw new Error(`${phase}_successor_follow_up_context_invalid:${JSON.stringify({ currentIndex, matches, later })}`)
+    }
+    return current
+  }
   await startFixtureProductionRuntime({
     workerId: "active-follow-up-recovery-" + process.pid,
     productionFlags: {
@@ -414,26 +433,42 @@ async function makeFollowUpResumeWorker() {
           },
         }
       },
-      modelRuntimeFactory() {
+      modelRuntimeFactory({ state }) {
         let modelCalls = 0
+        const successorFollowUpIndex = followUps.findIndex(followUp => followUp.text === state.goal)
         return {
           adapter: {
             id: "active-follow-up-recovery-fixture-model",
             profile: modelProfile(),
             async *stream(request) {
               modelCalls += 1
+              if (successorFollowUpIndex >= 0) {
+                const match = assertCurrentFollowUpOnly(request, successorFollowUpIndex, `successor_provider_round_${modelCalls}`)
+                if (modelCalls === 1) {
+                  say("SUCCESSOR_PROVIDER_ACTIVE " + (match.index + 1))
+                  await waitForCommand("release-successor-" + (match.index + 1))
+                  yield { type: "tool_call_completed", callId: "successor-evidence-" + ids.suffix + "-" + (match.index + 1), name: "jobs.search", arguments: { location: "Dublin" } }
+                  yield { type: "completed", finishReason: "tool_calls" }
+                  return
+                }
+                if (modelCalls === 2) {
+                  yield { type: "text_delta", text: finalMarker + " successor-" + (match.index + 1) }
+                  yield { type: "completed", finishReason: "stop" }
+                  return
+                }
+                throw new Error("unexpected_successor_provider_round")
+              }
               if (modelCalls === 1) {
-                const matchingParts = request.messages
-                  .filter(message => message.role === "user" && Array.isArray(message.content))
-                  .flatMap(message => message.content)
-                  .filter(part => part.type === "text" && part.text.includes(ids.followUpInputId) && part.text.includes(followUpText))
-                if (matchingParts.length !== 1) throw new Error("recovered_provider_request_did_not_contain_exactly_one_original_follow_up_id_text_in_user_role")
-                say("FOLLOW_UP_CONTEXT_OK")
+                assertNoFollowUps(request, "active_turn_recovery")
+                say("ACTIVE_TURN_CONTEXT_CLEAN")
                 yield { type: "tool_call_completed", callId: "follow-up-evidence-" + ids.suffix, name: "jobs.search", arguments: { location: "Dublin" } }
                 yield { type: "completed", finishReason: "tool_calls" }
                 return
               }
-              if (modelCalls !== 2) throw new Error("unexpected_follow_up_provider_round")
+              if (modelCalls !== 2) throw new Error("unexpected_active_turn_provider_round")
+              assertNoFollowUps(request, "active_turn_finalization")
+              say("ACTIVE_FINAL_CONTEXT_CLEAN")
+              await waitForCommand("release-active-final")
               yield { type: "text_delta", text: finalMarker }
               yield { type: "completed", finishReason: "stop" }
             },
@@ -449,6 +484,39 @@ async function makeFollowUpResumeWorker() {
   })
   say("RECOVERY_WORKER_READY")
   await waitForStop()
+}
+
+async function replayActiveTerminal() {
+  const { commitTurnTerminal } = await import("../runtime/turns/turn-engine-terminal-commit.ts")
+  const result = await pool.query(`SELECT turn."id" AS "turnId", turn."sessionId", turn."userId", turn."leaseVersion", turn."finalResponse",
+      root."id" AS "taskId", root."result" AS "rootResult", item."id" AS "finalItemId", item."stepId", item."content" AS "finalContent",
+      completed."payload"->'usage' AS "usage"
+    FROM "agent_turns" AS turn
+    JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."turnId" = turn."id"
+    JOIN "agent_items" AS item ON item."turnId" = turn."id" AND item."sessionId" = turn."sessionId" AND item."type" = 'agent_message'
+    JOIN "agent_events" AS completed ON completed."turnId" = turn."id" AND completed."sessionId" = turn."sessionId"
+      AND completed."idempotencyKey" = 'turn:' || turn."id" || ':event:turn-completed'
+    WHERE turn."id" = $1 AND turn."status" = 'completed'`, [ids.turnId])
+  const row = result.rows[0]
+  if (!row || !row.stepId || !row.finalItemId || !row.finalResponse || !row.usage || !row.rootResult) {
+    throw new Error("completed_turn_receipt_missing_for_idempotency_replay")
+  }
+  await commitTurnTerminal(pool, {
+    owner: {
+      kind: "turn", userId: row.userId, sessionId: row.sessionId, turnId: row.turnId,
+      taskId: row.taskId, rootTaskId: row.taskId, ownerId: "terminal-replay-" + process.pid,
+      leaseVersion: Number(row.leaseVersion), leaseExpiresAt: new Date(Date.now() + 60_000),
+    },
+    response: row.finalResponse,
+    now: new Date(),
+    stepId: row.stepId,
+    finalItemId: row.finalItemId,
+    finalContent: row.finalContent,
+    stepCount: Number(row.rootResult.stepCount),
+    toolCallCount: Number(row.rootResult.toolCallCount),
+    usage: row.usage,
+  })
+  say("TERMINAL_REPLAY_OK")
 }
 
 function modelProfile() {
@@ -530,6 +598,7 @@ async function run() {
   else if (mode === "park-active-follow-up") await makeActiveFollowUpWorker()
   else if (mode === "accept-active-follow-up") await acceptActiveFollowUp()
   else if (mode === "resume-active-follow-up") await makeFollowUpResumeWorker()
+  else if (mode === "replay-active-terminal") await replayActiveTerminal()
   else throw new Error("unknown_restart_fixture_mode")
 }
 
@@ -540,7 +609,7 @@ try {
   process.stderr.write(`${message}\n`)
   process.exitCode = 1
 } finally {
-  if (mode === "accept-message" || mode === "accept-active-follow-up") {
+  if (mode === "accept-message" || mode === "accept-active-follow-up" || mode === "replay-active-terminal") {
     process.stdin.off("data", onStdinData)
     process.stdin.pause()
     process.stdin.destroy()

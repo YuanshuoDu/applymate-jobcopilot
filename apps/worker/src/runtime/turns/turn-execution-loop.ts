@@ -176,10 +176,6 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
             },
           })
           if (!terminal) throw new TurnEngineError("persistence_conflict", "Atomic Turn completion returned no receipt")
-          if (terminal.status === "pending_follow_up") {
-            continuation = undefined
-            continue
-          }
           for (const event of terminal.events) await Promise.resolve(options.subscribe?.(event)).catch(() => undefined)
           return { status: "completed", stepCount: steps, toolCallCount: toolCalls, finalItemId: terminal.finalItemId, finalText: output.text }
         }

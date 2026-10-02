@@ -137,6 +137,8 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     const priorInputs = await client.query<Row>(
       `SELECT "id", "targetTurnId", "content", "acceptedSequence", 'user' AS "historyRole", "acceptedSequence" AS "historySequence" FROM "agent_inputs"
        WHERE "sessionId" = $1 AND "userId" = $2 AND "targetTurnId" IS NOT NULL AND "targetTurnId" <> $3
+         AND NOT ("delivery" = 'follow_up' AND "status" IN ('accepted', 'queued')
+           AND "consumedByStepId" IS NULL AND "consumedAt" IS NULL AND "cancelledAt" IS NULL)
        ORDER BY "acceptedSequence" ASC`, [lease.sessionId, lease.userId, lease.turnId],
     )
     const priorItems = await client.query<Row>(

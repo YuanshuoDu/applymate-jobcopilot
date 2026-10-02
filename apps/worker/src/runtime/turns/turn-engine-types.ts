@@ -57,8 +57,7 @@ export type AtomicTurnCompletionInput = {
 }
 
 export type AtomicTurnCompletionResult =
-  | { readonly status: "pending_follow_up" }
-  | { readonly status: "completed"; readonly finalItemId: string; readonly events: readonly TurnEngineEvent[] }
+  { readonly status: "completed"; readonly finalItemId: string; readonly events: readonly TurnEngineEvent[] }
 
 export type TurnEngineToolCall = {
   readonly id: string

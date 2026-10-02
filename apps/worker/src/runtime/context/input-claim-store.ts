@@ -4,7 +4,7 @@ import { persistObservedSteeringMarker, type SteeringMarkerWrite } from "./steer
 import type { ClaimInputsRequest, ClaimedInputs, StepCheckpoint, StoredAgentInput, TurnExecutionFence } from "./input-claim-types.js"
 export type { ClaimInputsRequest, ClaimedInputs, StepCheckpoint, StoredAgentInput, TurnExecutionFence } from "./input-claim-types.js"
 export interface InputClaimTransaction {
-  getCheckpoint(input: { sessionId: string; turnId: string; stepId: string; lease?: TurnExecutionFence }): Promise<StepCheckpoint>; claimInputs(input: ClaimInputsRequest): Promise<ClaimedInputs>
+  getCheckpoint(input: { sessionId: string; turnId: string; stepId: string; lease?: TurnExecutionFence }): Promise<StepCheckpoint>; claimInputs(input: ClaimInputsRequest & { readonly rootInputId?: string }): Promise<ClaimedInputs>
   loadActiveSteeringInputs?(input: { sessionId: string; turnId: string; inputIds: readonly string[]; lease?: TurnExecutionFence }): Promise<readonly StoredAgentInput[]>; persistCheckpoint(input: { sessionId: string; turnId: string; stepId: string; checkpoint: StepCheckpoint; lease?: TurnExecutionFence }): Promise<void>
   appendObservedSteeringMarker?(input: SteeringMarkerWrite): Promise<void>
 }
@@ -120,7 +120,7 @@ function inputSql(): string {
 function followUpSql(includeUnclaimed: boolean): string {
   return `SELECT "id", "sessionId", "targetTurnId", "userId", "clientMessageId", "delivery", "status", "content", "acceptedSequence", "consumedByStepId", "consumedAt", "createdAt"
           FROM "agent_inputs" WHERE "sessionId" = $1 AND "targetTurnId" = $2 AND "userId" = $3 AND "delivery" = 'follow_up'
-            AND "status" IN (${includeUnclaimed ? "'accepted', 'queued', 'consumed'" : "'consumed'"}) ORDER BY "acceptedSequence" ASC, "id" ASC FOR SHARE`
+            AND "status" IN (${includeUnclaimed ? "'accepted', 'queued', 'consumed'" : "'consumed'"}) AND "id" = $4 ORDER BY "acceptedSequence" ASC, "id" ASC FOR SHARE`
 }
 function sortInputs(inputs: StoredAgentInput[]): StoredAgentInput[] {
   return inputs.sort((left, right) => left.acceptedSequence < right.acceptedSequence ? -1 : left.acceptedSequence > right.acceptedSequence ? 1 : left.id.localeCompare(right.id))
@@ -150,7 +150,7 @@ function createTransaction(client: QueryClient, scope: TenantScope): InputClaimT
       if (existingInputs.some((item) => item.status !== "consumed" || (item.delivery === "steer" && item.consumedByStepId !== input.stepId) || (item.delivery === "follow_up" && !item.consumedByStepId))) throw new InputClaimStoreError("checkpoint_conflict", "Checkpoint input is not durably consumed by this Step")
       const mode = input.mode ?? (input.rebuild ? "rebuild" : "new")
       if (mode !== "new") {
-        const durableFollowUps = await client.query<InputRow>(followUpSql(false), [input.sessionId, input.turnId, scope.userId])
+        const durableFollowUps = await client.query<InputRow>(followUpSql(false), [input.sessionId, input.turnId, scope.userId, input.rootInputId ?? null])
         const byId = new Map([...existingInputs, ...durableFollowUps.rows.map(mapInput)].map(item => [item.id, item]))
         return { inputs: sortInputs([...byId.values()]), newlyClaimedInputIds: [] }
       }
@@ -161,7 +161,7 @@ function createTransaction(client: QueryClient, scope: TenantScope): InputClaimT
            WHERE "sessionId" = $1 AND "targetTurnId" = $2 AND "userId" = $3
              AND "delivery" IN ('steer', 'follow_up') AND "status" IN ('accepted', 'queued')
              AND "consumedByStepId" IS NULL AND "consumedAt" IS NULL
-             AND ("delivery" = 'follow_up' OR "acceptedSequence" > $4)
+             AND (("delivery" = 'follow_up' AND "id" = $7) OR ("delivery" = 'steer' AND "acceptedSequence" > $4))
            ORDER BY "acceptedSequence" ASC, "id" ASC
            FOR UPDATE
          )
@@ -172,10 +172,10 @@ function createTransaction(client: QueryClient, scope: TenantScope): InputClaimT
          RETURNING input."id", input."sessionId", input."targetTurnId", input."userId",
                    input."clientMessageId", input."delivery", input."status", input."content",
                    input."acceptedSequence", input."consumedByStepId", input."consumedAt", input."createdAt"`,
-        [input.sessionId, input.turnId, scope.userId, input.checkpoint.inputThroughSequence.toString(), input.stepId, input.now],
+        [input.sessionId, input.turnId, scope.userId, input.checkpoint.inputThroughSequence.toString(), input.stepId, input.now, input.rootInputId ?? null],
       )
       const newlyClaimed = sortInputs(claimed.rows.map(mapInput))
-      const activeFollowUps = await client.query<InputRow>(followUpSql(true), [input.sessionId, input.turnId, scope.userId])
+      const activeFollowUps = await client.query<InputRow>(followUpSql(true), [input.sessionId, input.turnId, scope.userId, input.rootInputId ?? null])
       const durableFollowUps = sortInputs(activeFollowUps.rows.map(mapInput))
       if (durableFollowUps.some((item) => item.status !== "consumed" || !item.consumedByStepId || !item.consumedAt)) throw new InputClaimStoreError("checkpoint_conflict", "Follow-up was not durably claimed")
       const byId = new Map([...existingInputs, ...durableFollowUps].map((item) => [item.id, item]))
