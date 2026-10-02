@@ -137,29 +137,79 @@ type CheckpointResumeDiagnostics = {
   turnJobKey: (turnId: string, generation?: number) => string
 }
 
+// These diagnostic tokens come from TurnEngineError, turnErrorCode/DLQ, and
+// the persisted status/finish-reason enums; unknown values are never echoed.
+const SAFE_DIAGNOSTIC_CODES = new Set([
+  "started", "streaming", "completed", "failed", "interrupted", "cancelled",
+  "waiting_for_tool", "waiting_for_approval", "waiting_for_user", "waiting_for_dependency",
+  "stop", "tool_calls",
+  "business_precondition_failed", "budget_exhausted", "cognitive_agenda_resume_fence_invalid",
+  "complete_provider_error", "durable_wait_receipt_invalid", "error", "evidence_conflict",
+  "evidence_missing", "execution_failed", "execution_lost", "final_unverified", "invalid_output",
+  "invalid_payload", "lease_lost", "lease_not_available", "max_retries_exhausted", "model_incomplete",
+  "no_progress", "persistence_conflict", "provider_error", "provider_unavailable", "schema_error",
+  "schema_invalid_payload", "step_limit", "tool_execution_failed", "tool_recovery_aborted",
+  "tool_result_replay_uncertain", "turn_execution_error", "turn_execution_failed",
+  "event_lineage_mismatch", "item_lineage_mismatch", "outbox_scope_mismatch", "tool_lineage_mismatch",
+  "turn_revision_conflict", "wait_scope_mismatch",
+  "question_recovery_answer_event_ambiguous", "question_recovery_answer_lineage_invalid",
+  "question_recovery_event_scope_invalid", "question_recovery_history_collision",
+  "question_recovery_history_duplicate", "question_recovery_history_order_invalid",
+  "question_recovery_history_pair_incomplete", "question_recovery_item_id_invalid",
+  "question_recovery_item_malformed", "question_recovery_item_scope_invalid",
+  "question_recovery_sequence_invalid", "question_recovery_start_event_ambiguous",
+  "question_recovery_start_lineage_invalid", "question_recovery_step_invalid",
+  "question_recovery_step_missing", "question_recovery_tool_lineage_invalid",
+  "wait_resume_session_sequence_unavailable", "wait_session_closed", "wait_turn_wake_fenced",
+])
+
+// Mirror the fixed event vocabulary in packages/agent-protocol/src/event.ts,
+// plus the two turn-loop events emitted locally.
+const SAFE_DIAGNOSTIC_EVENT_TYPES = new Set([
+  "turn.started", "turn.wakeup", "turn.resumed", "turn.completed", "turn.failed", "turn.interrupted",
+  "turn.no_progress", "turn.budget_exhausted", "step.started", "step.completed",
+  "item.started", "item.delta", "item.completed", "item.failed", "input.accepted", "input.consumed",
+  "tool_call.started", "tool_call.completed", "tool_call.failed", "policy.decision",
+  "approval.requested", "approval.resolved", "approval.consumed", "approval.expired",
+  "question.answered", "question.cancelled", "external_action.reserved",
+])
+
+function safeDiagnosticCode(value: unknown): string | null {
+  if (typeof value !== "string" || value.length === 0) return null
+  return SAFE_DIAGNOSTIC_CODES.has(value) ? value : "present"
+}
+
+function safeDiagnosticEventType(value: unknown): string {
+  return typeof value === "string" && SAFE_DIAGNOSTIC_EVENT_TYPES.has(value) ? value : "other"
+}
+
 async function checkpointResumeDiagnostics(input: CheckpointResumeDiagnostics): Promise<string> {
   const waitItemId = `agent-wait:${input.checkpointKind}:${input.waitId}`
-  const [turn, root, steps, toolItems, waitItem, wakeupEvent, wakeupOutbox, dispatch] = await Promise.all([
-    input.pool.query(`SELECT "status", "revision", "leaseOwnerId", "leaseVersion", "leaseExpiresAt", "rootTaskId", "error"
+  const [turn, root, steps, toolItems, waitItem, events, wakeupOutbox, dispatch] = await Promise.all([
+    input.pool.query(`SELECT "status", "revision", "leaseOwnerId" IS NOT NULL AS "hasLease",
+        "leaseVersion", "leaseExpiresAt" > NOW() AS "leaseActive", "rootTaskId"
       FROM "agent_turns" WHERE "id" = $1`, [input.turnId]),
-    input.pool.query(`SELECT task."status", task."leaseOwner", task."leaseExpiresAt", task."failureReason"
+    input.pool.query(`SELECT task."status", task."leaseOwner" IS NOT NULL AS "hasLease",
+        task."leaseExpiresAt" > NOW() AS "leaseActive"
       FROM "agent_turns" AS turn LEFT JOIN "sub_agent_tasks" AS task ON task."id" = turn."rootTaskId"
       WHERE turn."id" = $1`, [input.turnId]),
     input.pool.query(`SELECT "ordinal", "status", "errorCode", "finishReason"
-      FROM "agent_steps" WHERE "turnId" = $1 ORDER BY "ordinal"`, [input.turnId]),
-    input.pool.query(`SELECT "id", "type", "status", "stepId", "content"
+      FROM "agent_steps" WHERE "turnId" = $1 ORDER BY "ordinal" DESC LIMIT 6`, [input.turnId]),
+    input.pool.query(`SELECT "type", "status", "stepId",
+        "content"->>'status' AS "contentStatus", "content"->>'errorCode' AS "errorCode"
       FROM "agent_items" WHERE "turnId" = $1 AND "content"->>'toolCallId' = $2
         AND "type" IN ('tool_call', 'tool_result') ORDER BY "id"`, [input.turnId, input.toolCallId]),
-    input.pool.query(`SELECT "id", "type", "status", "content"
+    input.pool.query(`SELECT "type", "status", "content"->>'answerAvailable' AS "answerAvailable"
       FROM "agent_items" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`, [waitItemId, input.sessionId, input.turnId]),
-    input.pool.query(`SELECT "id", "sequence", "itemId", "idempotencyKey", "payload"
-      FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3
-        AND "type" = 'turn.wakeup' AND "payload"->>'waitId' = $4 ORDER BY "sequence"`,
-    [input.sessionId, input.turnId, waitItemId, input.waitId]),
-    input.pool.query(`SELECT "id", "idempotencyKey", "attemptCount", "publishedAt", "lastError", "payload"
+    input.pool.query(`SELECT "sequence", "type", "payload"->>'reasonCode' AS "reasonCode",
+        "payload"->>'reason_code' AS "reasonCodeSnake", "payload"->>'errorCode' AS "errorCode",
+        "payload"->>'error_code' AS "errorCodeSnake"
+      FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
+      ORDER BY "sequence" DESC LIMIT 6`, [input.sessionId, input.turnId]),
+    input.pool.query(`SELECT "attemptCount", "publishedAt" IS NOT NULL AS "published", "lastError" IS NOT NULL AS "hasError"
       FROM "agent_outbox" WHERE "topic" = 'agent.turn.wakeup' AND "aggregateId" = $1
-        AND "payload"->>'turnId' = $2 ORDER BY "createdAt", "id"`, [input.sessionId, input.turnId]),
-    input.pool.query(`SELECT "id", "attemptCount", "publishedAt", "lastError", "payload"
+        AND "payload"->>'turnId' = $2 ORDER BY "createdAt" DESC LIMIT 4`, [input.sessionId, input.turnId]),
+    input.pool.query(`SELECT "attemptCount", "publishedAt" IS NOT NULL AS "published", "lastError" IS NOT NULL AS "hasError"
       FROM "agent_outbox" WHERE "topic" = 'agent.turn.dispatch' AND "idempotencyKey" = $1`, [`turn-dispatch:${input.turnId}`]),
   ])
   const attemptCount = Number(dispatch.rows[0]?.attemptCount ?? 0)
@@ -170,27 +220,74 @@ async function checkpointResumeDiagnostics(input: CheckpointResumeDiagnostics): 
       const jobId = input.turnJobKey(input.turnId, generation)
       try {
         const job = await input.queue.getJob(jobId)
-        return { generation, jobId, state: job ? await job.getState() : "missing", data: job?.data ?? null }
-      } catch (error: unknown) {
-        return { generation, jobId, state: `error:${cleanupError(error)}` }
+        return { generation, state: job ? await job.getState() : "missing" }
+      } catch {
+        return { generation, state: "error" }
       }
     })),
-    input.queue.getJobCounts("wait", "active", "delayed", "completed", "failed", "paused"),
-    input.queue.isPaused(),
+    input.queue.getJobCounts("wait", "active", "delayed", "completed", "failed", "paused")
+      .then(counts => ({ status: "ok" as const, counts }))
+      .catch(() => ({ status: "error" as const })),
+    input.queue.isPaused()
+      .then(paused => ({ status: "ok" as const, paused }))
+      .catch(() => ({ status: "error" as const })),
   ])
-  return JSON.stringify({
+  const safeCode = (camel: unknown, snake?: unknown) => safeDiagnosticCode(camel) ?? safeDiagnosticCode(snake)
+  const snapshot = {
     turn: turn.rows[0] ?? null,
     root: root.rows[0] ?? null,
-    steps: steps.rows,
-    toolItems: toolItems.rows,
-    waitItem: waitItem.rows[0] ?? null,
-    scopedWakeupEvents: wakeupEvent.rows,
-    wakeupOutboxRows: wakeupOutbox.rows,
+    steps: steps.rows.map(row => ({ ...row, errorCode: safeDiagnosticCode(row.errorCode), finishReason: safeDiagnosticCode(row.finishReason) })),
+    toolItems: toolItems.rows.map(row => ({
+      type: row.type,
+      status: row.status,
+      stepId: row.stepId,
+      contentStatus: safeDiagnosticCode(row.contentStatus),
+      errorCode: safeDiagnosticCode(row.errorCode),
+    })),
+    waitItem: waitItem.rows[0] ? {
+      type: waitItem.rows[0].type,
+      status: waitItem.rows[0].status,
+      answerAvailable: waitItem.rows[0].answerAvailable === "true",
+    } : null,
+    events: events.rows.map(row => ({
+      sequence: row.sequence,
+      type: safeDiagnosticEventType(row.type),
+      reasonCode: safeCode(row.reasonCode, row.reasonCodeSnake),
+      errorCode: safeCode(row.errorCode, row.errorCodeSnake),
+    })),
+    wakeupOutbox: wakeupOutbox.rows,
     dispatch: dispatch.rows[0] ?? null,
-    jobGenerations,
-    queueCounts,
+    jobs: jobGenerations,
+    queue: queueCounts,
     queuePaused,
+  }
+  const serialized = JSON.stringify(snapshot)
+  if (serialized.length <= 1_400) return serialized
+
+  const compact = JSON.stringify({
+    diagnosticTruncated: true,
+    turn: snapshot.turn ? {
+      status: snapshot.turn.status,
+      revision: snapshot.turn.revision,
+      hasLease: snapshot.turn.hasLease,
+      leaseActive: snapshot.turn.leaseActive,
+    } : null,
+    root: snapshot.root ? {
+      status: snapshot.root.status,
+      hasLease: snapshot.root.hasLease,
+      leaseActive: snapshot.root.leaseActive,
+    } : null,
+    steps: snapshot.steps.slice(0, 3),
+    events: snapshot.events.slice(0, 4),
+    wakeupOutbox: snapshot.wakeupOutbox.slice(0, 2),
+    dispatch: snapshot.dispatch,
+    jobs: snapshot.jobs.slice(0, 3),
+    queue: snapshot.queue,
   })
+  if (compact.length <= 1_400) return compact
+
+  const tinyFallback = JSON.stringify({ diagnosticTruncated: true })
+  return tinyFallback.length <= 1_400 ? tinyFallback : "{}"
 }
 
 async function waitForCheckpointResume(
@@ -212,10 +309,16 @@ async function waitForCheckpointResume(
   }
   let runtime = "unavailable"
   if (diagnostics) {
-    try { runtime = await checkpointResumeDiagnostics(diagnostics) } catch (error: unknown) { runtime = `diagnostics-error:${cleanupError(error)}` }
+    try { runtime = await checkpointResumeDiagnostics(diagnostics) } catch { runtime = "diagnostics-error" }
   }
   const requestStarted = child.output.some(value => value.startsWith(`CHECKPOINT_MODEL_REQUEST_STARTED ${kind} `))
-  throw new Error(`Timed out waiting for Worker 2 to recover ${kind}; modelRequestStarted=${requestStarted}; runtime=${runtime}; stdout=${child.output.join(" | ")}; stderr=${child.errors.join(" | ")}`)
+  const markers = {
+    workerReady: child.output.some(value => value.startsWith("CHECKPOINT_WORKER_READY worker2")),
+    modelRequestStarted: requestStarted,
+    resumeContextOk: child.output.some(value => value.startsWith(`CHECKPOINT_RESUME_CONTEXT_OK ${kind} `)),
+    questionContextCountSeen: child.output.some(value => value.startsWith("CHECKPOINT_QUESTION_CONTEXT_COUNT ")),
+  }
+  throw new Error(`Timed out waiting for Worker 2 to recover ${kind}; runtime=${runtime}; markers=${JSON.stringify(markers)}`)
 }
 
 async function waitForSuccessorProvider(pool: Pool, queue: Queue, child: WorkerChild, turnId: string, successorIndex: number, jobId: string): Promise<string> {
