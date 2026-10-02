@@ -24,7 +24,7 @@ export type { SelectedEvidenceProjection } from './agent-supervisor-evidence'
 
 interface PageInfo { hasMore?: boolean; nextCursor?: string | null }
 interface TurnsResponse { turns?: SupervisorTurnSummary[]; page?: PageInfo }
-interface TasksResponse { tasks?: SupervisorTaskSummary[]; planLedger?: unknown; page?: PageInfo }
+interface TasksResponse { tasks?: SupervisorTaskSummary[]; planLedger?: unknown; discoveryShortlist?: unknown; page?: PageInfo }
 
 export interface AgentSupervisorPanelProps {
   readonly sessionId: string | null
@@ -200,7 +200,7 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
       <AgentApprovalLedgerCard ledger={timeline.approvalLedger} sessionId={sessionId} turns={turns} onAccepted={refetchSupervisorRecords} selectionKey={selectedId ?? ''} />
       <AgentQuestionInputCard sessionId={sessionId} items={timeline.items} turns={turns} onAccepted={refetchSupervisorRecords} selectionKey={selectedId ?? ''} />
       <SelectedJobPreparationCard sessionId={sessionId} restoredJobId={restoredSelectedJobId} onAccepted={handlePreparationAccepted} />
-      <TaskGraphPlanPanel sessionId={sessionId} items={timeline.items} tasks={planTasks} ledger={graphTasksQuery.data?.planLedger} selectedPreparationTurnId={selectedPreparationTurnId} />
+      <TaskGraphPlanPanel sessionId={sessionId} items={timeline.items} tasks={planTasks} ledger={graphTasksQuery.data?.planLedger} discoveryShortlist={graphTasksQuery.data?.discoveryShortlist} selectedPreparationTurnId={selectedPreparationTurnId} />
       <SelectedJobDraftArtifact sessionId={sessionId} artifactRef={draftArtifactRef} />
       {timeline.cognitiveAgenda && <CognitiveAgendaCard agenda={timeline.cognitiveAgenda} agendas={timeline.cognitiveAgendas} taskLabels={agendaTaskLabels} />}
       {!loading && !nodes.length && !error && <p style={messageStyle}>{t('agent.noTaskRecords')}</p>}

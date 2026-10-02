@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
+import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 
 import { commitTurnTerminal } from "./turn-engine-terminal-commit.js"
 
@@ -17,7 +18,7 @@ const input = {
 type Row = Record<string, unknown>
 type Call = { sql: string; values?: readonly unknown[] }
 
-function makePool(pending: readonly Row[] = []) {
+function makePool(pending: readonly Row[] = [], currentTurnInput?: unknown) {
   const calls: Call[] = []
   const events = new Map<string, Row>()
   const outboxes = new Map<string, Row>()
@@ -30,7 +31,7 @@ function makePool(pending: readonly Row[] = []) {
     consumedAt: row.consumedAt ?? null, cancelledAt: row.cancelledAt ?? null,
   }))
   let sequence = 10n
-  let turn: Row = { id: owner.turnId, status: "in_progress", finalResponse: null, source: "user" }
+  let turn: Row = { id: owner.turnId, status: "in_progress", finalResponse: null, source: "user", ...(currentTurnInput === undefined ? {} : { input: currentTurnInput }) }
   let root: Row = { id: owner.taskId, status: "running", leaseOwner: owner.ownerId, attemptCount: 1, result: null }
   const client = {
     query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
@@ -163,6 +164,7 @@ describe("atomic Turn terminal commit", () => {
     expect(successor?.updatedAt).toEqual(input.now)
     expect(successor?.updatedAt).toBeInstanceOf(Date)
     expect(successor).toMatchObject({ status: "queued", sessionId: owner.sessionId, userId: owner.userId, source: "user", input: { goal: "First request", clientMessageId: "message-first" } })
+    expect(successor?.input).not.toHaveProperty("intent")
     expect(fake.followUps.find(row => row.id === "first")).toMatchObject({ targetTurnId: successorId, status: "accepted", consumedByStepId: null })
     expect(fake.followUps.find(row => row.id === "later")).toMatchObject({ targetTurnId: owner.turnId, status: "accepted", consumedByStepId: null })
     expect(fake.outboxes.get(`turn-dispatch:${successorId}`)).toMatchObject({ topic: "agent.turn.dispatch", aggregateId: owner.sessionId, payload: { turnId: successorId, sessionId: owner.sessionId, ownerId: `web:${successorId}` } })
@@ -174,6 +176,20 @@ describe("atomic Turn terminal commit", () => {
     expect(fake.calls.filter(({ sql }) => sql.includes('INSERT INTO "agent_turns"'))).toHaveLength(1)
     expect(fake.calls.filter(({ sql }) => sql.includes('UPDATE "agent_inputs"'))).toHaveLength(1)
     expect(fake.calls.some(({ sql }) => /(?:UPDATE|DELETE) "(?:agent_items|agent_events)"/.test(sql))).toBe(false)
+  })
+
+  it("retains the exact server discovery intent on an atomically promoted follow-up Turn", async () => {
+    const fake = makePool([{
+      id: "discovery-follow-up", sessionId: owner.sessionId, userId: owner.userId, turnId: owner.turnId,
+      content: [{ type: "text", text: "Continue discovery" }],
+    }], { goal: "Discover jobs", intent: { kind: "interactive_discovery_shortlist", version: 1 } })
+
+    await commitTurnTerminal(fake.pool, input)
+
+    expect([...fake.successors.values()][0]?.input).toMatchObject({
+      goal: "Continue discovery", clientMessageId: "client-discovery-follow-up",
+      intent: { kind: "interactive_discovery_shortlist", version: 1 },
+    })
   })
 
   it("commits the final item, event outboxes, root Task and Turn as one idempotent receipt", async () => {
@@ -198,6 +214,52 @@ describe("atomic Turn terminal commit", () => {
     expect(rootUpdate).not.toMatch(/clock_timestamp|interruptRequestedAt/)
     expect(turnUpdate).toContain('AND "leaseExpiresAt" > $5')
     expect(turnUpdate).not.toContain("clock_timestamp")
+  })
+
+  it("does not promote malformed or unknown server intent fields", async () => {
+    for (const intent of [
+      { kind: "interactive_discovery_shortlist", version: 2 },
+      { kind: "interactive_discovery_shortlist", version: 1, userControlled: true },
+    ]) {
+      const fake = makePool([{
+        id: "follow-up", sessionId: owner.sessionId, userId: owner.userId, turnId: owner.turnId,
+        content: [{ type: "text", text: "Continue" }],
+      }], { goal: "Discover jobs", intent })
+
+      await commitTurnTerminal(fake.pool, input)
+
+      expect([...fake.successors.values()][0]?.input).not.toHaveProperty("intent")
+    }
+  })
+
+  it("commits the validated discovery shortlist in the root receipt and accepts only identical replay", async () => {
+    const fake = makePool()
+    const shortlist: RepositoryJsonValue = {
+      schemaVersion: 1,
+      status: "completed",
+      items: [{ jobId: "job-1", score: 8.5, evidenceIds: ["read:job:job-1"] }],
+      failures: [],
+    }
+    const discoveryInput = { ...input, interactiveDiscoveryShortlist: shortlist }
+
+    await expect(commitTurnTerminal(fake.pool, discoveryInput)).resolves.toMatchObject({ status: "completed", finalItemId: input.finalItemId })
+    await expect(commitTurnTerminal(fake.pool, discoveryInput)).resolves.toMatchObject({ status: "completed", finalItemId: input.finalItemId })
+
+    expect(fake.state.root.result).toEqual({
+      status: "completed", stepCount: 2, toolCallCount: 1, finalItemId: input.finalItemId, waitId: null,
+      structuredResult: { interactiveDiscoveryShortlist: shortlist },
+    })
+    expect(fake.calls.filter(({ sql }) => sql.includes('UPDATE "sub_agent_tasks"'))).toHaveLength(1)
+    const changedShortlist: RepositoryJsonValue = {
+      schemaVersion: 1,
+      status: "completed",
+      items: [{ jobId: "job-1", score: 9, evidenceIds: ["read:job:job-1"] }],
+      failures: [],
+    }
+    await expect(commitTurnTerminal(fake.pool, {
+      ...discoveryInput,
+      interactiveDiscoveryShortlist: changedShortlist,
+    })).rejects.toMatchObject({ name: "TurnEnginePersistenceConflict" })
   })
 
   it("validates before terminal writes and bypasses the guard on committed replay after source changes", async () => {

@@ -63,6 +63,18 @@ function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unk
 }
 
 describe("loadCanonicalTurnState", () => {
+  it("restores only the exact server-owned interactive-discovery intent", async () => {
+    const exact = pool({ turn: { input: { goal: "Find jobs", intent: { kind: "interactive_discovery_shortlist", version: 1 } }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} } })
+    await expect(loadCanonicalTurnState(exact, lease)).resolves.toMatchObject({
+      intent: { kind: "interactive_discovery_shortlist", version: 1 },
+    })
+
+    for (const intent of [undefined, { kind: "interactive_discovery_shortlist", version: 2 }, { kind: "interactive_discovery_shortlist", version: 1, userControlled: true }, { kind: "other", version: 1 }]) {
+      const value = pool({ turn: { input: { goal: "Find jobs", ...(intent ? { intent } : {}) }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} } })
+      await expect(loadCanonicalTurnState(value, lease)).resolves.not.toHaveProperty("intent")
+    }
+  })
+
   it("projects a fenced answered question once into recovered steer history", async () => {
     const question = { id: "question-item", type: "question", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null,
       stepId: null, status: "completed", content: { waitKind: "question", questionId: "question-1", toolCallId: "question-call-1", question: "Continue?", options: [{ label: "Yes", value: "yes" }], answer: "yes", answerAvailable: true } }

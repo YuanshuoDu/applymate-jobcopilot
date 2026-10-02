@@ -80,7 +80,7 @@ type CommandAcceptance = { accepted: CommandAcceptanceResult; duplicate: Command
 const fixturePath = fileURLToPath(new URL("./production-bootstrap-process-restart.fixture.mjs", import.meta.url))
 const workerCwd = fileURLToPath(new URL("../..", import.meta.url))
 
-function startWorker(mode: "accept-message" | "park-parent" | "resume-parent" | "park-active-follow-up" | "accept-active-follow-up" | "resume-active-follow-up" | "replay-active-terminal" | "checkpoint-worker1" | "checkpoint-worker2" | "resolve-checkpoint", ids: FixtureIds): WorkerChild {
+function startWorker(mode: "accept-message" | "park-parent" | "resume-parent" | "duplicate-turn-redelivery" | "park-active-follow-up" | "accept-active-follow-up" | "resume-active-follow-up" | "replay-active-terminal" | "checkpoint-worker1" | "checkpoint-worker2" | "resolve-checkpoint", ids: FixtureIds): WorkerChild {
   const child = spawn(process.execPath, ["--import", "tsx", fixturePath, mode, JSON.stringify(ids)], {
     cwd: workerCwd,
     env: { ...process.env, DATABASE_URL: databaseUrl!, REDIS_URL: redisUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl! },
@@ -124,6 +124,108 @@ async function waitForLine(child: WorkerChild, prefix: string, timeoutMs = 20_00
     await new Promise(resolve => setTimeout(resolve, 20))
   }
   throw new Error(`Timed out waiting for ${prefix}; stdout=${child.output.join(" | ")}; stderr=${child.errors.join(" | ")}`)
+}
+
+async function waitForQueueJob(queue: Queue, jobId: string, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const job = await queue.getJob(jobId)
+    if (job) return job
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  throw new Error(`Timed out waiting for BullMQ job ${jobId}`)
+}
+
+async function duplicateRedeliveryFailureSnapshot(
+  pool: Pool,
+  queue: Queue,
+  turnId: string,
+  sessionId: string,
+  jobId: string,
+  worker: WorkerChild,
+): Promise<string> {
+  const [turn, latestStep, failureEvent, job] = await Promise.all([
+    pool.query(`SELECT turn."status", turn."error", turn."leaseOwnerId", turn."leaseVersion", turn."rootTaskId",
+        root."status" AS "rootStatus", root."failureReason"
+      FROM "agent_turns" AS turn
+      LEFT JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."turnId" = turn."id"
+      WHERE turn."id" = $1 AND turn."sessionId" = $2`, [turnId, sessionId]),
+    pool.query(`SELECT "ordinal", "status", "errorCode", "finishReason"
+      FROM "agent_steps" WHERE "turnId" = $1 AND "sessionId" = $2 ORDER BY "ordinal" DESC LIMIT 1`, [turnId, sessionId]),
+    pool.query(`SELECT "type", "payload" FROM "agent_events"
+      WHERE "turnId" = $1 AND "sessionId" = $2 AND "type" = 'turn.failed'
+      ORDER BY "sequence" DESC LIMIT 1`, [turnId, sessionId]),
+    queue.getJob(jobId).then(async found => found
+      ? { id: found.id, state: await found.getState(), failedReason: found.failedReason }
+      : { id: null, state: "missing", failedReason: null }),
+  ])
+  return JSON.stringify({
+    turn: turn.rows[0] ?? null,
+    latestStep: latestStep.rows[0] ?? null,
+    failureEvent: failureEvent.rows[0] ?? null,
+    job,
+    workerStderr: worker.errors.slice(-20),
+  })
+}
+
+async function duplicateRedeliveryReceipt(pool: Pool, turnId: string, sessionId: string, toolCallId: string) {
+  return pool.query<{
+    status: string
+    leaseOwnerId: string | null
+    leaseVersion: number
+    finalResponse: string | null
+    finalItemCount: string
+    toolCallStartedEventCount: string
+    toolCallCompletedEventCount: string
+    durableItemCount: string
+    durableEventCount: string
+    completionEventCount: string
+    toolCallStarted: unknown
+    toolResult: unknown
+    durableItems: unknown
+    durableEvents: unknown
+  }>(
+    `SELECT turn."status", turn."leaseOwnerId", turn."leaseVersion", turn."finalResponse",
+       (SELECT COUNT(*)::text FROM "agent_items" AS item
+        WHERE item."turnId" = turn."id" AND item."sessionId" = turn."sessionId" AND item."type" = 'agent_message') AS "finalItemCount",
+       (SELECT COUNT(*)::text FROM "agent_events" AS event
+        WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId"
+          AND event."type" = 'tool_call.started' AND event."correlationId" = $3
+          AND event."idempotencyKey" LIKE 'turn:' || turn."rootTaskId" || ':tool-lifecycle:' || $3 || ':started:%') AS "toolCallStartedEventCount",
+       (SELECT COUNT(*)::text FROM "agent_events" AS event
+        WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId"
+          AND event."type" = 'tool_call.completed' AND event."correlationId" = $3
+          AND event."idempotencyKey" LIKE 'turn:' || turn."rootTaskId" || ':tool-lifecycle:' || $3 || ':completed:%') AS "toolCallCompletedEventCount",
+       (SELECT COUNT(*)::text FROM "agent_items" AS item
+        WHERE item."turnId" = turn."id" AND item."sessionId" = turn."sessionId") AS "durableItemCount",
+       (SELECT COUNT(*)::text FROM "agent_events" AS event
+        WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId") AS "durableEventCount",
+       (SELECT COUNT(*)::text FROM "agent_events" AS event
+        WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId"
+          AND event."idempotencyKey" = 'turn:' || turn."id" || ':event:turn-completed') AS "completionEventCount",
+       (SELECT event."payload" FROM "agent_events" AS event
+        WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId"
+          AND event."type" = 'tool_call.started' AND event."correlationId" = $3
+          AND event."idempotencyKey" LIKE 'turn:' || turn."rootTaskId" || ':tool-lifecycle:' || $3 || ':started:%'
+        ORDER BY event."sequence" DESC LIMIT 1) AS "toolCallStarted",
+       (SELECT event."payload" FROM "agent_events" AS event
+        WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId"
+          AND event."type" = 'tool_call.completed' AND event."correlationId" = $3
+          AND event."idempotencyKey" LIKE 'turn:' || turn."rootTaskId" || ':tool-lifecycle:' || $3 || ':completed:%'
+        ORDER BY event."sequence" DESC LIMIT 1) AS "toolResult",
+       COALESCE((SELECT jsonb_agg(jsonb_build_object(
+          'id', item."id", 'type', item."type", 'status', item."status", 'revision', item."revision", 'content', item."content"
+        ) ORDER BY item."revision", item."id")
+        FROM "agent_items" AS item
+        WHERE item."turnId" = turn."id" AND item."sessionId" = turn."sessionId"), '[]'::jsonb) AS "durableItems",
+       COALESCE((SELECT jsonb_agg(jsonb_build_object(
+          'id', event."id", 'sequence', event."sequence", 'type', event."type", 'idempotencyKey', event."idempotencyKey", 'payload', event."payload"
+        ) ORDER BY event."sequence", event."id")
+        FROM "agent_events" AS event
+        WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId"), '[]'::jsonb) AS "durableEvents"
+     FROM "agent_turns" AS turn WHERE turn."id" = $1 AND turn."sessionId" = $2`,
+    [turnId, sessionId, toolCallId],
+  )
 }
 
 type CheckpointResumeDiagnostics = {
@@ -618,7 +720,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
   const turnFixtureIds = new Set<string>()
   const fixtureSessionIds = new Set<string>()
   const auxiliaryUserIds = new Set<string>()
-  const checkpointJobIds = new Set<string>()
+  const fixtureJobIds = new Set<string>()
 
   beforeAll(async () => {
     process.env.REDIS_URL = redisUrl!
@@ -687,9 +789,9 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     } else if (turnQueue && typeof ids !== "undefined") {
       cleanupFailures.push("Turn fixture job cleanup skipped because a child Worker may still be running")
     }
-    if (pool && checkpointJobIds.size > 0) await attemptCleanup(cleanupFailures, "checkpoint fixture job cleanup", async () => {
-      await pool!.query(`DELETE FROM "Job" WHERE "id" = ANY($1::text[])`, [[...checkpointJobIds]])
-      checkpointJobIds.clear()
+    if (pool && fixtureJobIds.size > 0) await attemptCleanup(cleanupFailures, "fixture job cleanup", async () => {
+      await pool!.query(`DELETE FROM "Job" WHERE "id" = ANY($1::text[])`, [[...fixtureJobIds]])
+      fixtureJobIds.clear()
     })
     if (pool && typeof ids !== "undefined") await attemptCleanup(cleanupFailures, "fixture database cleanup", async () => {
       await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [ids.userId])
@@ -743,9 +845,9 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     if (pool && workersStopped && fixtureSessionIds.size > 0) await attemptCleanup(cleanupFailures, "after-test fixture session cleanup", async () => {
       await pool!.query(`DELETE FROM "agent_sessions" WHERE "id" = ANY($1::text[])`, [[...fixtureSessionIds]])
     })
-    if (pool && workersStopped && checkpointJobIds.size > 0) await attemptCleanup(cleanupFailures, "after-test checkpoint fixture job cleanup", async () => {
-      await pool!.query(`DELETE FROM "Job" WHERE "id" = ANY($1::text[])`, [[...checkpointJobIds]])
-      checkpointJobIds.clear()
+    if (pool && workersStopped && fixtureJobIds.size > 0) await attemptCleanup(cleanupFailures, "after-test fixture job cleanup", async () => {
+      await pool!.query(`DELETE FROM "Job" WHERE "id" = ANY($1::text[])`, [[...fixtureJobIds]])
+      fixtureJobIds.clear()
     })
     if (pool && workersStopped) for (const userId of auxiliaryUserIds) await attemptCleanup(cleanupFailures, `after-test auxiliary user ${userId} cleanup`, async () => {
       await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [userId])
@@ -770,7 +872,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     await pool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
       VALUES ($1, $2, 'Recover the same Turn after a durable checkpoint', 'running', 'test', CURRENT_TIMESTAMP)`, [sessionId, userId])
     if (kind === "approval") {
-      checkpointJobIds.add(jobId)
+      fixtureJobIds.add(jobId)
       await pool!.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "updatedAt")
         VALUES ($1, $2, 'Fixture Employer', 'Fixture Engineer', CURRENT_TIMESTAMP)`, [jobId, userId])
     }
@@ -958,6 +1060,133 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     async kind => resumeAtDurableCheckpoint(kind),
     90_000,
   )
+
+  it("redelivers the retained completed BullMQ job ID without repeating persisted Turn work", async () => {
+    const suffix = randomUUID()
+    ids.suffix = suffix
+    ids.sessionId = `duplicate-redelivery-session-${suffix}`
+    const readCallId = `duplicate-read:${suffix}`
+    const readJobId = `duplicate-job:${suffix}`
+    fixtureSessionIds.add(ids.sessionId)
+    fixtureJobIds.add(readJobId)
+    await pool!.query(
+      `INSERT INTO "Job" ("id", "userId", "company", "role", "description", "updatedAt")
+       VALUES ($1, $2, $3, 'Fixture Engineer', $4, CURRENT_TIMESTAMP)`,
+      [readJobId, ids.userId, `Fixture Employer ${suffix}`, `Persisted read evidence ${suffix}`],
+    )
+    await pool!.query(
+      `INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+       VALUES ($1, $2, 'Exercise same-ID Turn redelivery', 'running', 'test', CURRENT_TIMESTAMP)`,
+      [ids.sessionId, ids.userId],
+    )
+
+    commandAcceptance = startWorker("accept-message", ids)
+    const acceptedLine = await waitForLine(commandAcceptance, "COMMAND_ACCEPTED ")
+    await waitForExit(commandAcceptance, { stage: "duplicate-redelivery-command-acceptance", pid: commandAcceptance.pid })
+    expect(commandAcceptance.exitCode).toBe(0)
+    const accepted = parseCommandAcceptance(acceptedLine)
+    expect(accepted.accepted.disposition).toBe("started")
+    expect(accepted.duplicate).toMatchObject({
+      inputId: accepted.accepted.inputId,
+      turnId: accepted.accepted.turnId,
+      disposition: "duplicate",
+      originalDisposition: "started",
+    })
+    ids.turnId = accepted.accepted.turnId
+    turnFixtureIds.add(ids.turnId)
+
+    // Hold recovery's real BullMQ dispatch until the production Worker has
+    // attached its completion observer, so the first delivery is deterministic.
+    await turnQueue!.pause()
+    turnQueuePaused = true
+    workerOne = startWorker("duplicate-turn-redelivery", ids)
+    await waitForLine(workerOne, "DUPLICATE_WORKER_READY")
+    const jobId = turnJobKey!(ids.turnId)
+    const pendingJob = await waitForQueueJob(turnQueue!, jobId)
+    expect(pendingJob.id).toBe(jobId)
+    expect(pendingJob.data).toMatchObject({ turnId: ids.turnId, sessionId: ids.sessionId })
+    await turnQueue!.resume()
+    turnQueuePaused = false
+
+    const firstDelivery = await waitForLine(workerOne, "DUPLICATE_DELIVERY_FINISHED_1 ")
+    if (firstDelivery !== `DUPLICATE_DELIVERY_FINISHED_1 ${jobId} completed none`) {
+      const runtime = await duplicateRedeliveryFailureSnapshot(pool!, turnQueue!, ids.turnId, ids.sessionId, jobId, workerOne)
+      throw new Error(`First production Turn delivery did not complete: ${firstDelivery}; runtime=${runtime}`)
+    }
+    await waitForTurnStatus(pool!, ids.turnId, "completed", 20_000, workerOne)
+    const completedJob = await waitForQueueJob(turnQueue!, jobId)
+    expect(completedJob.id).toBe(jobId)
+    expect(await completedJob.getState()).toBe("completed")
+    const originalTimestamp = completedJob.timestamp
+    const firstReceipt = await duplicateRedeliveryReceipt(pool!, ids.turnId, ids.sessionId, readCallId)
+    expect(firstReceipt.rows[0]).toMatchObject({
+      status: "completed",
+      leaseOwnerId: null,
+      leaseVersion: 1,
+      finalItemCount: "1",
+      toolCallStartedEventCount: "1",
+      toolCallCompletedEventCount: "1",
+      completionEventCount: "1",
+      toolCallStarted: {
+        toolCallId: readCallId,
+        toolName: "jobs.search",
+        status: "started",
+        input: { target: suffix, limit: 1 },
+      },
+      toolResult: {
+        toolCallId: readCallId,
+        toolName: "jobs.search",
+        status: "completed",
+        errorCode: null,
+        output: {
+          jobs: [expect.objectContaining({
+            id: readJobId,
+            company: `Fixture Employer ${suffix}`,
+            role: "Fixture Engineer",
+            description: `Persisted read evidence ${suffix}`,
+          })],
+          page: 1,
+          hasMore: false,
+        },
+      },
+    })
+    expect(firstReceipt.rows[0]?.finalResponse).toContain(`single-side-effect-${suffix}`)
+    const verifiedFinal = JSON.parse(firstReceipt.rows[0]?.finalResponse ?? "null") as { completed?: boolean; evidenceRefs?: string[] }
+    expect(verifiedFinal).toMatchObject({ completed: true })
+    expect(verifiedFinal.evidenceRefs).toEqual(expect.arrayContaining([readCallId, `read:job:${readJobId}`]))
+    expect(Number(firstReceipt.rows[0]?.durableItemCount)).toBeGreaterThan(0)
+    expect(Number(firstReceipt.rows[0]?.durableEventCount)).toBeGreaterThan(0)
+    const firstModelCalls = workerOne.output.filter(line => line.startsWith("DUPLICATE_MODEL_CALL "))
+    expect(firstModelCalls).toEqual(["DUPLICATE_MODEL_CALL 1", "DUPLICATE_MODEL_CALL 2"])
+
+    // BullMQ's retry script requeues this retained completed record in place.
+    // Pausing the queue keeps the same job hash observable before redelivery.
+    await turnQueue!.pause()
+    turnQueuePaused = true
+    await completedJob.retry("completed")
+    const replayJob = await waitForQueueJob(turnQueue!, jobId)
+    expect(replayJob.id).toBe(jobId)
+    expect(replayJob.timestamp).toBe(originalTimestamp)
+    expect(replayJob.data).toEqual(completedJob.data)
+    expect(["paused", "wait", "waiting"]).toContain(await replayJob.getState())
+    await turnQueue!.resume()
+    turnQueuePaused = false
+
+    const replayDelivery = await waitForLine(workerOne, "DUPLICATE_DELIVERY_FINISHED_2 ")
+    expect(replayDelivery).toBe(`DUPLICATE_DELIVERY_FINISHED_2 ${jobId} skipped lease_not_available`)
+    const finalReceipt = await duplicateRedeliveryReceipt(pool!, ids.turnId, ids.sessionId, readCallId)
+    expect(finalReceipt.rows[0]).toEqual(firstReceipt.rows[0])
+    expect(workerOne.output.filter(line => line.startsWith("DUPLICATE_MODEL_CALL "))).toEqual(firstModelCalls)
+    expect(workerOne.output.filter(line => line.startsWith("DUPLICATE_DELIVERY_FINISHED_")).map(line => line.split(" ").slice(1))).toEqual([
+      [jobId, "completed", "none"],
+      [jobId, "skipped", "lease_not_available"],
+    ])
+
+    workerOne.stdin?.write("shutdown\n")
+    await waitForLine(workerOne, "SHUTDOWN_STAGE bootstrap_close:complete", 10_000)
+    await waitForExit(workerOne, { stage: "duplicate-redelivery-worker-shutdown", pid: workerOne.pid })
+    expect(workerOne.exitCode).toBe(0)
+  }, 60_000)
 
   it("persists a child result, kills its Worker, and resumes the parent from PostgreSQL under a new lease", async () => {
     // Exercise the Web command service against the migrated disposable database.

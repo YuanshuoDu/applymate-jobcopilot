@@ -50,9 +50,10 @@ describe('managed platform feature flags', () => {
   })
 
   it('declares the complete V2 catalog with every default disabled', () => {
-    expect(Object.keys(AGENT_HARNESS_FEATURES)).toHaveLength(11)
+    expect(Object.keys(AGENT_HARNESS_FEATURES)).toHaveLength(12)
     expect(Object.values(AGENT_HARNESS_FEATURES).every((feature) => feature.defaultEnabled === false)).toBe(true)
     expect(isAgentHarnessFeatureKey('AGENT_SUBAGENTS_V2')).toBe(true)
+    expect(isAgentHarnessFeatureKey('AGENT_INTERACTIVE_DISCOVERY_TASK_GRAPH')).toBe(true)
     expect(isAgentHarnessFeatureKey('AGENT_UNKNOWN_V2')).toBe(false)
   })
 
@@ -83,7 +84,7 @@ describe('managed platform feature flags', () => {
   it('publishes a non-sensitive health snapshot with safe defaults', () => {
     const snapshot = getAgentHarnessFeatureHealth('staging')
     expect(snapshot).toMatchObject({ environment: 'staging', source: 'safe_defaults', allDefaultOff: true })
-    expect(Object.values(snapshot.flags)).toHaveLength(11)
+    expect(Object.values(snapshot.flags)).toHaveLength(12)
     expect(Object.values(snapshot.flags).every((flag) => flag.enabled === false && flag.defaultEnabled === false)).toBe(true)
   })
 })

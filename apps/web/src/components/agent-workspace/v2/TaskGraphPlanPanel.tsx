@@ -33,26 +33,42 @@ const STATUS_LABELS: Record<TaskGraphPlanStatus, TaskGraphPlanLabelKey> = {
   closed: 'agent.taskGraph.status.closed',
 }
 
-export function TaskGraphPlanPanel({ sessionId, items, tasks, ledger, selectedPreparationTurnId }: {
+export function TaskGraphPlanPanel({ sessionId, items, tasks, ledger, discoveryShortlist, selectedPreparationTurnId }: {
   readonly sessionId: string
   readonly items: readonly TimelineItem[]
   readonly tasks: readonly SupervisorTaskSummary[]
   readonly ledger?: unknown
+  readonly discoveryShortlist?: unknown
   readonly selectedPreparationTurnId?: string | null
 }) {
   const { lang, t } = useI18n()
-  const plan = useMemo(() => {
+  const view = useMemo(() => {
     const identity = selectedTaskGraphIdentity(items, sessionId, selectedPreparationTurnId)
     const scopedTasks = identity ? tasks.filter(task => task.sessionId === identity.sessionId && task.turnId === identity.turnId
       && task.rootTaskId === identity.rootTaskId) : []
     const graphItems = identity ? items.filter(item => item.id === identity.graphItemId) : []
     const current = projectCurrentTaskGraph(graphItems, scopedTasks, sessionId)
     const response = parsePlanLedgerResponse(ledger)
-    return response && sameTaskGraphIdentity(response.identity, identity) ? response.projection : current
-  }, [items, ledger, selectedPreparationTurnId, sessionId, tasks])
-  if (!plan) return null
+    const shortlist = parseDiscoveryShortlistResponse(discoveryShortlist)
+    return {
+      plan: response && sameTaskGraphIdentity(response.identity, identity) ? response.projection : current,
+      shortlist: shortlist && sameTaskGraphIdentity(shortlist.identity, identity) ? shortlist.result : null,
+    }
+  }, [discoveryShortlist, items, ledger, selectedPreparationTurnId, sessionId, tasks])
+  if (!view.plan && !view.shortlist) return null
 
-  return <TaskGraphPlanSection plan={plan} sessionId={sessionId} lang={lang} t={t} />
+  return <>
+    {view.plan && <TaskGraphPlanSection plan={view.plan} sessionId={sessionId} lang={lang} t={t} />}
+    {view.shortlist && <DiscoveryShortlistSection result={view.shortlist} lang={lang} />}
+  </>
+}
+
+interface DiscoveryShortlistItem { readonly jobId: string; readonly score: number; readonly evidenceIds: readonly string[] }
+interface DiscoveryShortlistResult {
+  readonly schemaVersion: 1
+  readonly status: 'completed' | 'partial' | 'failed'
+  readonly items: readonly DiscoveryShortlistItem[]
+  readonly failures: readonly string[]
 }
 
 function parsePlanLedgerResponse(value: unknown): { identity: TaskGraphIdentity; projection: TaskGraphPlan } | null {
@@ -66,6 +82,47 @@ function parsePlanLedgerResponse(value: unknown): { identity: TaskGraphIdentity;
   const projection = parsePlanLedger(response.projection)
   if (!projection || projection.sessionId !== identity.sessionId || projection.revision !== identity.revision) return null
   return { identity: identity as unknown as TaskGraphIdentity, projection }
+}
+
+const DISCOVERY_FAILURE_CODES = new Set([
+  'owner_scope_missing', 'observed_evidence_invalid', 'invalid_scout_result', 'invalid_analyst_result',
+  'scout_task_missing', 'analyst_task_missing', 'scout_task_failed', 'analyst_task_failed', 'scout_task_incomplete', 'analyst_task_incomplete',
+  'scout_result_partial', 'analyst_result_partial', 'evidence_conflict', 'evidence_unverified',
+  'invalid_job_id', 'duplicate_scout_job', 'duplicate_analyst_finding', 'conflicting_analyst_score', 'no_common_candidates',
+  'discovery_runtime_unavailable', 'discovery_runtime_failed',
+])
+
+function parseDiscoveryShortlistResponse(value: unknown): { identity: TaskGraphIdentity; result: DiscoveryShortlistResult } | null {
+  const response = record(value)
+  const identity = response ? record(response.identity) : null
+  const result = response ? record(response.result) : null
+  if (!response || Object.keys(response).length !== 2 || !identity || Object.keys(identity).length !== 5
+    || typeof identity.sessionId !== 'string' || typeof identity.graphItemId !== 'string'
+    || typeof identity.turnId !== 'string' || typeof identity.rootTaskId !== 'string'
+    || ![identity.sessionId, identity.graphItemId, identity.turnId, identity.rootTaskId].every(value => value.length > 0 && value.length <= 128 && value.trim() === value)
+    || !Number.isSafeInteger(identity.revision) || Number(identity.revision) < 1 || !result
+    || Object.keys(result).length !== 4 || result.schemaVersion !== 1
+    || (result.status !== 'completed' && result.status !== 'partial' && result.status !== 'failed')
+    || !Array.isArray(result.items) || result.items.length > 3 || !Array.isArray(result.failures) || result.failures.length > DISCOVERY_FAILURE_CODES.size) return null
+
+  const items: DiscoveryShortlistItem[] = []
+  const jobIds = new Set<string>()
+  for (const value of result.items) {
+    const item = record(value)
+    if (!item || Object.keys(item).length !== 3 || typeof item.jobId !== 'string'
+      || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/.test(item.jobId) || jobIds.has(item.jobId)
+      || typeof item.score !== 'number' || !Number.isFinite(item.score) || item.score < 0 || item.score > 10
+      || !Array.isArray(item.evidenceIds) || item.evidenceIds.length !== 1 || item.evidenceIds[0] !== `read:job:${item.jobId}`) return null
+    jobIds.add(item.jobId)
+    items.push({ jobId: item.jobId, score: item.score, evidenceIds: [`read:job:${item.jobId}`] })
+  }
+  const failures = result.failures
+  if (failures.some(code => typeof code !== 'string' || !DISCOVERY_FAILURE_CODES.has(code))
+    || new Set(failures).size !== failures.length) return null
+  const validState = result.status === 'completed' ? items.length > 0 && failures.length === 0
+    : result.status === 'partial' ? items.length > 0 && failures.length > 0
+      : items.length === 0 && failures.length > 0
+  return validState ? { identity: identity as unknown as TaskGraphIdentity, result: { schemaVersion: 1, status: result.status, items, failures } } : null
 }
 
 function sameTaskGraphIdentity(left: TaskGraphIdentity, right: TaskGraphIdentity | null): boolean {
@@ -116,6 +173,31 @@ function TaskGraphPlanSection({ plan, sessionId, lang, t }: {
           </li>
         ))}
       </ol>
+    </section>
+  )
+}
+
+function DiscoveryShortlistSection({ result, lang }: { readonly result: DiscoveryShortlistResult; readonly lang: Lang }) {
+  const copy = lang === 'zh'
+    ? { title: '职位候选清单', completed: '已完成', partial: '部分结果', failed: '失败', completedDetail: '已从此会话恢复已验证的职位。', partialDetail: '部分发现检查未完成。', failedDetail: '没有可恢复的已验证匹配。', score: '匹配分', evidence: '证据来源', checks: '检查状态' }
+    : { title: 'Discovery shortlist', completed: 'Completed', partial: 'Partial results', failed: 'Failed', completedDetail: 'Validated matches recovered from this session.', partialDetail: 'Some discovery checks were incomplete.', failedDetail: 'No validated matches were recovered.', score: 'Score', evidence: 'Evidence references', checks: 'Checks' }
+  const statusLabel = result.status === 'completed' ? copy.completed : result.status === 'partial' ? copy.partial : copy.failed
+  const detail = result.status === 'completed' ? copy.completedDetail : result.status === 'partial' ? copy.partialDetail : copy.failedDetail
+  return (
+    <section aria-label={copy.title} data-agent-discovery-shortlist="true" data-discovery-shortlist-status={result.status} style={sectionStyle}>
+      <h3 style={headingStyle}>{copy.title}</h3>
+      <p role={result.status === 'failed' ? 'alert' : 'status'} style={planGoalStyle}><strong>{statusLabel}:</strong> {detail}</p>
+      {result.failures.length > 0 && <div data-discovery-failures="true" style={evidenceStyle}>
+        <strong>{copy.checks}</strong>
+        <ul style={evidenceListStyle}>{result.failures.map(code => <li key={code} data-discovery-failure-code={code}><code>{code}</code></li>)}</ul>
+      </div>}
+      {result.items.length > 0 && <ol style={listStyle}>{result.items.map(item => (
+        <li key={item.jobId} data-discovery-job-id={item.jobId} style={nodeStyle}>
+          <strong style={goalStyle}><code>{item.jobId}</code></strong>
+          <span>{copy.score}: {item.score} / 10</span>
+          <span>{copy.evidence}: {item.evidenceIds.map(id => <code key={id}>{id}</code>)}</span>
+        </li>
+      ))}</ol>}
     </section>
   )
 }

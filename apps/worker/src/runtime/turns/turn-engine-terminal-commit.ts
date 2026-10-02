@@ -15,7 +15,20 @@ const json = (value: unknown) => JSON.stringify(value)
 const sameJson = (left: unknown, right: unknown) => json(toRepositoryJson(left)) === json(toRepositoryJson(right))
 function conflict(resource: string): Error { return Object.assign(new Error(`TurnEngine persistence conflict: ${resource}`), { name: "TurnEnginePersistenceConflict" }) }
 
-async function promoteFollowUp(client: Client, owner: TurnExecutionOwnerFence, source: unknown, row: Row, now: Date): Promise<void> {
+function record(value: unknown): Row {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Row : {}
+}
+
+function discoveryIntent(turnInput: unknown): { kind: "interactive_discovery_shortlist"; version: 1 } | undefined {
+  const envelope = record(turnInput)
+  const nested = record(envelope.input)
+  const intent = record((Object.keys(nested).length > 0 ? nested : envelope).intent)
+  if (Object.keys(intent).sort().join(",") !== "kind,version"
+    || intent.kind !== "interactive_discovery_shortlist" || intent.version !== 1) return undefined
+  return { kind: "interactive_discovery_shortlist", version: 1 }
+}
+
+async function promoteFollowUp(client: Client, owner: TurnExecutionOwnerFence, source: unknown, turnInput: unknown, row: Row, now: Date): Promise<void> {
   const content = row.content
   const clientMessageId = row.clientMessageId
   if (!Array.isArray(content) || typeof clientMessageId !== "string" || !clientMessageId.trim() || typeof source !== "string" || !source.trim()) throw conflict("follow-up root input")
@@ -25,7 +38,8 @@ async function promoteFollowUp(client: Client, owner: TurnExecutionOwnerFence, s
     return candidate.type === "text" && typeof candidate.text === "string" ? [candidate.text] : []
   }).join("\n").trim()
   const successorId = randomUUID()
-  const root = { goal: text || "Process the provided content", content, clientMessageId }
+  const intent = discoveryIntent(turnInput)
+  const root = { goal: text || "Process the provided content", content, clientMessageId, ...(intent ? { intent } : {}) }
   await client.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "updatedAt")
     VALUES ($1, $2, $3, 'queued', $4, $5::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $6)`,
   [successorId, owner.sessionId, owner.userId, source, json(root), now])
@@ -119,7 +133,7 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
   return transaction(pool, owner.userId, async client => {
     const session = await client.query<Row>(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 AND "status" NOT IN ('aborted', 'archived') FOR UPDATE`, [owner.sessionId, owner.userId])
     if (!session.rows[0]) throw conflict(`session ${owner.sessionId}`)
-    const turn = await client.query<Row>(`SELECT turn."id", turn."status", turn."finalResponse", turn."source" FROM "agent_turns" AS turn
+    const turn = await client.query<Row>(`SELECT turn."id", turn."status", turn."finalResponse", turn."source", turn."input" FROM "agent_turns" AS turn
       WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND turn."rootTaskId" = $6 AND (
         (turn."status" = 'in_progress' AND turn."leaseOwnerId" = $4 AND turn."leaseVersion" = $5 AND turn."leaseExpiresAt" > CURRENT_TIMESTAMP)
         OR (turn."status" = 'completed' AND turn."leaseOwnerId" IS NULL AND turn."leaseExpiresAt" IS NULL AND turn."leaseVersion" = $5)) FOR UPDATE`,
@@ -130,7 +144,10 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
       WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $1 FOR UPDATE`, [owner.taskId, owner.sessionId, owner.turnId])
     const task = root.rows[0]
     if (!task) throw conflict(`root task ${owner.taskId}`)
-    const result = { status: "completed", stepCount: input.stepCount, toolCallCount: input.toolCallCount, finalItemId: input.finalItemId, waitId: null }
+    const result = {
+      status: "completed", stepCount: input.stepCount, toolCallCount: input.toolCallCount, finalItemId: input.finalItemId, waitId: null,
+      ...(input.interactiveDiscoveryShortlist === undefined ? {} : { structuredResult: { interactiveDiscoveryShortlist: input.interactiveDiscoveryShortlist } }),
+    }
     const committed = turnRow.status === "completed"
     if (committed && (turnRow.finalResponse !== input.response || task.status !== "completed" || task.leaseOwner !== null || Number(task.attemptCount) !== 1 || !sameJson(task.result, result))) throw conflict(`terminal receipt ${owner.turnId}`)
     if (!committed && (turnRow.status !== "in_progress" || task.status !== "running" || task.leaseOwner !== owner.ownerId || Number(task.attemptCount) !== 1)) throw conflict(`root task ${owner.taskId} fence`)
@@ -179,7 +196,7 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
           AND "leaseOwnerId" = $10 AND "leaseVersion" = $11 AND "leaseExpiresAt" > ${finalizationGuard ? "clock_timestamp()" : "$5"}`,
       [input.response, input.usage.inputTokens, input.usage.outputTokens, input.usage.estimatedCostUsd, input.now, owner.turnId, owner.sessionId, owner.userId, owner.taskId, owner.ownerId, owner.leaseVersion])
       if (updatedTurn.rowCount !== 1) throw conflict(`turn ${owner.turnId} completion`)
-      if (pendingFollowUp) await promoteFollowUp(client, owner, turnRow.source, pendingFollowUp, input.now)
+      if (pendingFollowUp) await promoteFollowUp(client, owner, turnRow.source, turnRow.input, pendingFollowUp, input.now)
     }
     return { status: "completed", finalItemId: input.finalItemId, events: saved }
   }, Boolean(finalizationGuard))

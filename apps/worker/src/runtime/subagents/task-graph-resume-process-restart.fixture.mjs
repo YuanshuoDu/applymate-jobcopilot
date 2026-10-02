@@ -13,6 +13,13 @@ import { parsePlanLedger, projectPlanLedger } from "@jobcopilot/agent-protocol"
 const [, , mode, rawIds] = process.argv, ids = JSON.parse(rawIds)
 const sourceGoal = "Read the durable TaskGraph source", dependentGoal = "Summarize the restored TaskGraph source"
 const followUpGoal = "Verify the restored TaskGraph summary after restart", followUpKey = "verification"
+const discoveryScoutGoal = "Find the owner-scoped fixture job"
+const discoveryAnalystGoal = "Score the restored owner-scoped fixture job"
+const discoveryPlanCallId = "p3-process-restart-discovery-plan"
+const discoveryWaitCallId = "p3-process-restart-discovery-wait-call"
+const discoveryAnalystPlanCallId = "p3-process-restart-discovery-analyst-plan"
+const discoveryAnalystWaitCallId = "p3-process-restart-discovery-analyst-wait"
+const discoveryFinalMarker = "p3-process-restart-discovery-shortlist-ready"
 const TASK_GRAPH_KEY_ALLOWLIST = new Set(["source", "summary", followUpKey])
 const TURN_STATUS_ALLOWLIST = new Set(["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user", "completed", "interrupted", "failed", "cancelled"])
 const STEP_STATUS_ALLOWLIST = new Set(["completed", "failed", "interrupted", "waiting_for_tool", "waiting_for_approval", "waiting_for_user"])
@@ -25,7 +32,8 @@ const STEP_ERROR_CLASS_BY_CODE = new Map([
   ["coordination_invalid_input", "coordination_invalid_input"], ["coordination_task_not_found", "coordination_task_not_found"],
   ["coordination_scope_error", "coordination_scope_error"], ["coordination_wait_unavailable", "coordination_wait_unavailable"],
   ["wait_invalid", "wait_handoff_state"], ["wait_scope_error", "wait_handoff_state"], ["lease_lost", "turn_lease_state"],
-  ["tool_execution_failed", "generic_tool_execution_failed"],
+  ["tool_execution_failed", "generic_tool_execution_failed"], ["business_precondition_failed", "business_precondition_failed"],
+  ["invalid_output", "turn_output_invalid"], ["budget_exhausted", "turn_budget_exhausted"],
 ])
 const resultMarker = "p3-process-restart-source-result", finalMarker = "p3-process-restart-parent-resumed-after-follow-up"
 const planCallId = "p3-process-restart-plan", waitCallId = "p3-process-restart-wait"
@@ -140,7 +148,9 @@ function turnErrorCategory(value) {
 function modelStepErrorClass(value) {
   if (typeof value !== "string") return "none"
   const code = value.slice(0, 2_000).trim().toLowerCase()
-  return code.length === 0 ? "none" : STEP_ERROR_CLASS_BY_CODE.get(code) ?? "other"
+  if (code.length === 0) return "none"
+  if (/^task_graph_[a-z0-9_]{1,80}$/.test(code)) return "task_graph_failure"
+  return STEP_ERROR_CLASS_BY_CODE.get(code) ?? "other"
 }
 function fixedEnum(value, allowlist) {
   return value === null || value === undefined ? "none" : typeof value === "string" && allowlist.has(value) ? value : "other"
@@ -169,6 +179,7 @@ function parentSuspensionProjection(snapshot) {
     rootTaskStatus: snapshot.rootTaskStatus,
     latestModelStepStatus: fixedEnum(snapshot.latestModelStep?.status, STEP_STATUS_ALLOWLIST),
     latestModelStepErrorClass: snapshot.latestModelStep?.errorClass ?? "none",
+    planFailureCategory: snapshot.planFailureCategory ?? "none",
     turnErrorCategory: snapshot.turnErrorCategory ?? "none",
     planAccepted: snapshot.planReceiptStatuses.some(status => status === "accepted" || status === "duplicate"),
     waitToolCallStatus: snapshot.waitToolCallStatus,
@@ -846,7 +857,28 @@ async function waitForParentSuspended(ownerId, timeoutMs = 20_000) {
   say("P3_PARENT_SUSPENSION_DIAGNOSTICS " + JSON.stringify(parentSuspensionProjection(await parentSuspensionDiagnostics())))
   throw new Error("p3_parent_wait_not_suspended")
 }
-async function parentSuspensionDiagnostics() {
+async function waitForDiscoveryParentSuspended(ownerId, timeoutMs = 20_000) {
+  const waitIdempotencyKey = waitArgs("p3-process-restart-discovery-wait", []).idempotencyKey
+  const deadline = Date.now() + timeoutMs; while (Date.now() < deadline) {
+    const result = await pool.query(`SELECT turn."status" AS "turnStatus", wait."status" AS "waitStatus", wait."suspendedAt", item."revision", item."content"
+      FROM "agent_turns" AS turn JOIN "agent_wait_conditions" AS wait ON wait."turnId" = turn."id"
+      JOIN "agent_items" AS item ON item."turnId" = turn."id" AND item."type" = 'task_graph'
+      WHERE turn."id" = $1 AND wait."parentTaskId" = turn."rootTaskId" AND wait."idempotencyKey" = $2
+      ORDER BY wait."createdAt" DESC LIMIT 1`, [ids.turnId, waitIdempotencyKey])
+    const row = result.rows[0], content = record(row?.content)
+    if (row?.turnStatus === "waiting_for_dependency" && row?.waitStatus === "waiting" && row.suspendedAt
+      && Number(row.revision) > 0 && Array.isArray(content?.nodes) && content.nodes.length === 1
+      && record(content.nodes[0])?.key === "scout") {
+      say("P3_DISCOVERY_PARENT_SUSPENDED " + JSON.stringify({ ownerId, revision: Number(row.revision), snapshot: content })); return
+    }
+    await sleep(20)
+  }
+  say("P3_PARENT_SUSPENSION_DIAGNOSTICS " + JSON.stringify(parentSuspensionProjection(
+    await parentSuspensionDiagnostics(waitIdempotencyKey, 1),
+  )))
+  throw new Error("p3_discovery_parent_wait_not_suspended")
+}
+async function parentSuspensionDiagnostics(expectedWaitIdempotencyKey = null, expectedGraphNodeCount = 2) {
   try {
     const [turnResult, stepResult, toolResult, waitResult, graphResult, childResult, taskRowResult] = await Promise.all([
       pool.query(`SELECT turn."status" AS "turnStatus", turn."rootTaskId" IS NOT NULL AS "hasRootTask",
@@ -875,6 +907,7 @@ async function parentSuspensionDiagnostics() {
             AND item."type" IN ('tool_call', 'tool_result')
         ), latest_wait_call AS (
           SELECT * FROM parent_items WHERE "type" = 'tool_call' AND "toolName" = 'agent.wait'
+            AND ($2::text IS NULL OR "waitIdempotencyKey" = $2)
           ORDER BY "createdAt" DESC LIMIT 1
         )
         SELECT EXISTS (SELECT 1 FROM parent_items WHERE "type" = 'tool_call' AND "toolName" = 'agent.plan') AS "hasPlanToolCall",
@@ -887,6 +920,11 @@ async function parentSuspensionDiagnostics() {
             WHERE call."type" = 'tool_call' AND call."toolName" = 'agent.plan' AND result."type" = 'tool_result'
               AND result."planReceiptStatus" IN ('accepted', 'duplicate', 'rejected')
             ORDER BY result."planReceiptStatus") AS "planReceiptStatuses",
+          (SELECT COALESCE(call."errorCode", result."errorCode") FROM parent_items AS call
+            JOIN parent_items AS result ON result."toolCallId" = call."toolCallId"
+            WHERE call."type" = 'tool_call' AND call."toolName" = 'agent.plan' AND result."type" = 'tool_result'
+              AND (call."toolOutcomeStatus" = 'failed' OR call."errorCode" IS NOT NULL OR result."errorCode" IS NOT NULL)
+            ORDER BY result."createdAt" DESC LIMIT 1) AS "planErrorCode",
           EXISTS (SELECT 1 FROM latest_wait_call) AS "hasWaitToolCall",
           EXISTS (SELECT 1 FROM latest_wait_call AS call JOIN parent_items AS result ON result."toolCallId" = call."toolCallId"
             WHERE result."type" = 'tool_result') AS "hasWaitToolResult",
@@ -900,7 +938,7 @@ async function parentSuspensionDiagnostics() {
             WHERE result."type" = 'tool_result' ORDER BY result."createdAt" DESC LIMIT 1) AS "waitToolOutputStatus",
           (SELECT result."errorCode" FROM latest_wait_call AS call JOIN parent_items AS result ON result."toolCallId" = call."toolCallId"
             WHERE result."type" = 'tool_result' ORDER BY result."createdAt" DESC LIMIT 1) AS "waitToolErrorCode",
-          (SELECT call."errorCode" FROM latest_wait_call AS call) AS "waitToolCallErrorCode"`, [ids.turnId]),
+          (SELECT call."errorCode" FROM latest_wait_call AS call) AS "waitToolCallErrorCode"`, [ids.turnId, expectedWaitIdempotencyKey]),
       pool.query(`SELECT wait."idempotencyKey" AS "waitIdempotencyKey", wait."status" AS "waitStatus", wait."targetTaskIds", wait."parentTaskId" = turn."rootTaskId" AS "parentMatchesRoot",
           wait."suspendedAt" IS NOT NULL AS "hasSuspendedAt"
         FROM "agent_wait_conditions" AS wait JOIN "agent_turns" AS turn ON turn."id" = wait."turnId"
@@ -959,6 +997,7 @@ async function parentSuspensionDiagnostics() {
       hasPlanToolCall: Boolean(tool.hasPlanToolCall),
       hasPlanToolResult: Boolean(tool.hasPlanToolResult),
       hasFailedPlanToolResult: Boolean(tool.hasFailedPlanToolResult),
+      planFailureCategory: modelStepErrorClass(tool.planErrorCode),
       planReceiptStatuses: Array.isArray(tool.planReceiptStatuses) ? tool.planReceiptStatuses : [],
       hasWaitToolCall: Boolean(tool.hasWaitToolCall),
       waitToolCallStatus: fixedEnum(tool.waitToolCallStatus, TOOL_CALL_STATUS_ALLOWLIST),
@@ -996,7 +1035,7 @@ async function parentSuspensionDiagnostics() {
       : snapshot.hasFailedPlanToolResult || !snapshot.hasPlanToolResult
         || !snapshot.planReceiptStatuses.some(status => status === "accepted" || status === "duplicate")
         || !snapshot.graph.present ? "plan_failed_or_incomplete"
-       : !snapshot.graph.hasNodeArray || snapshot.graph.nodeCount !== 2 ? "graph_shape_mismatch"
+       : !snapshot.graph.hasNodeArray || snapshot.graph.nodeCount !== expectedGraphNodeCount ? "graph_shape_mismatch"
         : !snapshot.hasWaitToolCall ? "wait_call_missing"
         : !snapshot.hasWaitToolResult && snapshot.waitFailureCategory !== "none" && snapshot.waitFailureCategory !== "tool_result_missing"
           ? "wait_tool_failed_before_wait_persistence"
@@ -1092,6 +1131,64 @@ async function startRuntime(workerOwnerId, resume) {
     },
   })
 }
+async function startDiscoveryRuntime(workerOwnerId, resume) {
+  return createCanonicalTurnRuntime(pool, {
+    workerId: workerOwnerId, productionFlags: flags(), taskGraphCommandPort: createPgTaskGraphCommandPort(pool),
+    taskGraphTemplates: TASK_GRAPH_TEMPLATES, authorizeUsage: async () => ({ settle: async () => undefined }),
+    modelRuntimeFactory() {
+      let modelRounds = 0
+      return { adapter: {
+        id: resume ? "p3-process-restart-discovery-resume-model" : "p3-process-restart-discovery-plan-model", profile: modelProfile(),
+        async *stream(request) {
+          modelRounds++
+          const graph = graphFromRequest(request), nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+          if (!resume && modelRounds === 1) {
+            if (!request.tools.some(tool => record(tool)?.name === "agent.plan")) throw new Error("p3_discovery_initial_plan_tool_missing")
+            yield toolCall(discoveryPlanCallId, "agent.plan", { expectedRevision: 0, nodes: [
+              node("scout", "scout", discoveryScoutGoal, ["Read one owner-scoped job"], []),
+            ] })
+            yield { type: "completed", finishReason: "tool_calls" }; return
+          }
+          if (!resume && modelRounds === 2) {
+            const taskIds = plannedTaskIds(request, discoveryPlanCallId, 1)
+            yield toolCall(discoveryWaitCallId, "agent.wait", waitArgs("p3-process-restart-discovery-wait", taskIds))
+            yield { type: "completed", finishReason: "tool_calls" }; return
+          }
+          if (!resume) throw new Error("p3_unexpected_discovery_first_worker_model_round")
+
+          const scout = nodes.find(item => item?.key === "scout")
+          const analyst = nodes.find(item => item?.key === "analyst")
+          if (!scout || scout.status !== "completed" || typeof scout.taskId !== "string") {
+            throw new Error("p3_discovery_restored_scout_not_completed")
+          }
+          if (!analyst) {
+            waitOutcomeFromRequest(request, outcome => outcome.status === "ready"
+              && outcome.tasks.some(task => record(task)?.taskId === scout.taskId && record(task)?.status === "completed"))
+            if (!request.tools.some(tool => record(tool)?.name === "agent.plan")) throw new Error("p3_discovery_replan_tool_missing")
+            yield toolCall(discoveryAnalystPlanCallId, "agent.plan", { expectedRevision: graph.revision, nodes: [
+              node("analyst", "analyst", discoveryAnalystGoal, ["Return an evidence-bound score"], ["scout"]),
+            ] })
+            yield { type: "completed", finishReason: "tool_calls" }; return
+          }
+          if (analyst.status !== "completed") {
+            const taskIds = plannedTaskIds(request, discoveryAnalystPlanCallId, 1)
+            if (analyst.taskId !== taskIds[0]) throw new Error("p3_discovery_analyst_plan_task_mismatch")
+            if (!request.tools.some(tool => record(tool)?.name === "agent.wait")) throw new Error("p3_discovery_analyst_wait_tool_missing")
+            yield toolCall(discoveryAnalystWaitCallId, "agent.wait", waitArgs("p3-process-restart-discovery-analyst-wait", taskIds))
+            yield { type: "completed", finishReason: "tool_calls" }; return
+          }
+          if (typeof analyst.taskId !== "string") throw new Error("p3_discovery_analyst_task_missing")
+          waitOutcomeFromRequest(request, outcome => outcome.status === "ready"
+            && outcome.tasks.some(task => record(task)?.taskId === analyst.taskId && record(task)?.status === "completed"))
+          if (nodes.length !== 2 || nodes.some(item => item?.status !== "completed")) throw new Error("p3_discovery_final_graph_incomplete")
+          say("P3_DISCOVERY_RESTORED_FINAL_GRAPH " + JSON.stringify({ revision: graph.revision, nodeCount: nodes.length }))
+          yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: discoveryFinalMarker }) }
+          yield { type: "completed", finishReason: "stop" }; return
+        },
+      }, registry: {}, candidates: [] }
+    },
+  })
+}
 async function waitForStop() {
   await waitForCommand("shutdown"); process.stdin.off("data", onStdinData); process.stdin.pause(); process.stdin.destroy()
 }
@@ -1164,6 +1261,64 @@ async function runSecondWorker() {
   await startSelectedJobQueueWorker(runtime)
   say("P3_SECOND_WORKER_READY " + ownerId); await waitForStop()
 }
+async function runDiscoveryFirstWorker() {
+  const ownerId = "p3-process-restart-discovery-worker-" + process.pid
+  const runtime = await startDiscoveryRuntime(ownerId, false)
+  const { createProductionWorkerBootstrap } = await import("../../queue/production-bootstrap.ts")
+  bootstrap = await createProductionWorkerBootstrap({ pool, runtime, ownerId, turnRecoveryIntervalMs: 10,
+    waitResolver: { intervalMs: 10, ownerId: "p3-process-restart-discovery-wait-resolver-" + process.pid },
+    subagents: { intervalMs: 10, async execute() { throw new Error("p3_discovery_first_worker_must_not_execute_children") } } })
+  const subagentWorker = bootstrap.subagents?.queue?.worker
+  if (typeof subagentWorker?.pause !== "function") throw new Error("p3_discovery_first_worker_subagent_pause_unavailable")
+  await subagentWorker.pause()
+  const activated = await pool.query(`UPDATE "agent_turns" SET "status" = 'queued', "completedAt" = NULL,
+      "leaseOwnerId" = NULL, "leaseExpiresAt" = NULL, "leaseStartedAt" = NULL, "updatedAt" = CURRENT_TIMESTAMP
+    WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "status" = 'waiting_for_user'`, [ids.turnId, ids.sessionId, ids.userId])
+  if (activated.rowCount !== 1) throw new Error("p3_discovery_first_worker_fixture_turn_not_parked")
+  const { enqueueTurn } = await import("../turns/turn-queue.ts")
+  await enqueueTurn(pool, bootstrap.turns.queue, { turnId: ids.turnId, sessionId: ids.sessionId, ownerId })
+  await waitForDiscoveryParentSuspended(ownerId)
+  await waitForStop()
+}
+async function runDiscoverySecondWorker() {
+  assertNoPrivateArtifactFixtureData(ids)
+  const ownerId = "p3-process-restart-discovery-worker-" + process.pid
+  const runtime = await startDiscoveryRuntime(ownerId, true)
+  const { createProductionChildExecutor } = await import("./production-child-runtime.ts")
+  const executeChild = createProductionChildExecutor({
+    pool, authorizeUsage: async () => ({ settle: async () => undefined }),
+    modelRuntimeFactory({ task }) {
+      let rounds = 0
+      const callId = `p3-process-restart-discovery-read:${task.id}:${task.attemptCount}`
+      return { id: `p3-process-restart-discovery-${task.role}-model`, profile: modelProfile(), async *stream(request) {
+        rounds++
+        if (rounds === 1) {
+          if (!request.tools.some(tool => record(tool)?.name === "jobs.search")) throw new Error("p3_discovery_child_search_tool_missing")
+          yield toolCall(callId, "jobs.search", { target: "Software Engineer", location: "Dublin", limit: 10 })
+          yield { type: "completed", finishReason: "tool_calls" }; return
+        }
+        if (task.role !== "scout" && task.role !== "analyst") throw new Error("p3_unexpected_discovery_child_role")
+        const evidence = [{ id: `read:job:${ids.jobId}`, kind: "job", ref: ids.jobId, source: "greenhouse" }]
+        const result = task.role === "scout"
+          ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [{ jobId: ids.jobId, source: "fixture", url: null, evidenceIds: [evidence[0].id] }], evidence, summary: "Found the persisted fixture role" }
+          : { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [{ jobId: ids.jobId, score: 8.5, evidenceIds: [evidence[0].id] }], evidence, summary: "Scored the persisted fixture role" }
+        yield { type: "text_delta", text: JSON.stringify(result) }
+        yield { type: "completed", finishReason: "stop" }
+      } }
+    },
+  })
+  const { createProductionWorkerBootstrap } = await import("../../queue/production-bootstrap.ts")
+  bootstrap = await createProductionWorkerBootstrap({ pool, runtime, ownerId, turnRecoveryIntervalMs: 10,
+    waitResolver: { intervalMs: 10, ownerId: "p3-process-restart-discovery-wait-resolver-" + process.pid },
+    subagents: { intervalMs: 10, async execute({ lease }) {
+      say("P3_DISCOVERY_CHILD_STARTED " + lease.id + " " + lease.role)
+      const outcome = await executeChild({ lease })
+      say("P3_DISCOVERY_CHILD_SETTLED " + lease.id + " " + lease.role + " " + outcome.status)
+      return outcome
+    } } })
+  say("P3_DISCOVERY_SECOND_WORKER_READY " + ownerId)
+  await waitForStop()
+}
 try {
   assertLatestGraphObservationSelection()
   assertLatestToolResultSelection()
@@ -1176,11 +1331,13 @@ try {
     say("P3_PRIVATE_FIXTURE_GUARD_OK")
     process.stdin.off("data", onStdinData); process.stdin.pause(); process.stdin.destroy()
   }
-  else if (mode === "park-parent" || mode === "resume-parent") {
+  else if (mode === "park-parent" || mode === "resume-parent" || mode === "park-discovery" || mode === "resume-discovery") {
     assertDisposableServiceUrls()
     await loadSharedRedisModule()
     if (mode === "park-parent") await runFirstWorker()
-    else await runSecondWorker()
+    else if (mode === "resume-parent") await runSecondWorker()
+    else if (mode === "park-discovery") await runDiscoveryFirstWorker()
+    else await runDiscoverySecondWorker()
   }
   else throw new Error("p3_unknown_process_restart_mode")
 } catch (error) {

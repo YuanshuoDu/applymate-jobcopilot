@@ -592,6 +592,118 @@ async function makeSecondWorker() {
   await waitForStop()
 }
 
+async function makeDuplicateRedeliveryWorker() {
+  let modelCalls = 0
+  let deliveryCount = 0
+  const readCallId = "duplicate-read:" + ids.suffix
+  const readJobId = "duplicate-job:" + ids.suffix
+  await startFixtureProductionRuntime({
+    workerId: `duplicate-redelivery-worker-${process.pid}`,
+    productionFlags: {
+      childExecutionEnabled: false,
+      coordinationEnabled: false,
+      consumeWaitOutcomes: false,
+      canonicalAutomationEnabled: false,
+    },
+    runtimeOptions: {
+      modelRuntimeFactory() {
+        return {
+          adapter: {
+            id: "duplicate-redelivery-fixture-model",
+            profile: modelProfile(),
+            async *stream(request) {
+              modelCalls += 1
+              say(`DUPLICATE_MODEL_CALL ${modelCalls}`)
+              if (modelCalls === 1) {
+                yield { type: "tool_call_completed", callId: readCallId, name: "jobs.search", arguments: { target: ids.suffix, limit: 1 } }
+                yield { type: "completed", finishReason: "tool_calls" }
+                return
+              }
+              if (modelCalls !== 2) throw new Error("duplicate_redelivery_unexpected_model_reexecution")
+              await requireDuplicateRedeliveryEvidence(request, { readCallId, readJobId })
+              yield { type: "text_delta", text: `single-side-effect-${ids.suffix}` }
+              yield { type: "completed", finishReason: "stop" }
+            },
+          },
+          registry: {}, candidates: [],
+        }
+      },
+    },
+    bootstrapOptions: {
+      ownerId: `duplicate-redelivery-worker-${process.pid}`,
+      turnRecoveryIntervalMs: 10,
+    },
+  })
+  bootstrap.turns.worker.on("completed", (job, result) => {
+    if (job.data.turnId !== ids.turnId) return
+    deliveryCount += 1
+    const status = result && typeof result === "object" ? result.status ?? "unknown" : "unknown"
+    const reason = result && typeof result === "object" ? result.reasonCode ?? "none" : "none"
+    say(`DUPLICATE_DELIVERY_FINISHED_${deliveryCount} ${job.id} ${status} ${reason}`)
+  })
+  say("DUPLICATE_WORKER_READY")
+  await waitForStop()
+}
+
+function stableJson(value) {
+  if (Array.isArray(value)) return "[" + value.map(stableJson).join(",") + "]"
+  if (value && typeof value === "object") {
+    return "{" + Object.keys(value).sort().map(key => JSON.stringify(key) + ":" + stableJson(value[key])).join(",") + "}"
+  }
+  return JSON.stringify(value)
+}
+
+async function requireDuplicateRedeliveryEvidence(request, { readCallId, readJobId }) {
+  const requestParts = request.messages.flatMap(message => Array.isArray(message.content)
+    ? message.content.map(part => ({ message, part })) : [])
+  const toolUses = requestParts.filter(entry => entry.part?.type === "tool_use" && entry.part.id === readCallId)
+  const toolResults = requestParts.filter(entry => entry.part?.type === "tool_result" && entry.part.toolUseId === readCallId)
+  const input = toolUses[0]?.part.input
+  const inputMatches = input && typeof input === "object" && !Array.isArray(input)
+    && Object.keys(input).length === 2 && input.target === ids.suffix && input.limit === 1
+  if (toolUses.length !== 1 || toolUses[0].message.role !== "assistant"
+    || toolUses[0].part.name !== "jobs.search" || !inputMatches
+    || toolResults.length !== 1 || toolResults[0].message.role !== "tool") {
+    throw new Error("duplicate_redelivery_model_missing_read_tool_result")
+  }
+  let resultOutput
+  try { resultOutput = JSON.parse(toolResults[0].part.content) } catch { throw new Error("duplicate_redelivery_model_read_result_invalid_json") }
+  const [persisted, ownedJob] = await Promise.all([
+    pool.query(
+    `SELECT event."type", event."payload" FROM "agent_events" AS event
+     JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
+     WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."correlationId" = $3
+       AND event."idempotencyKey" LIKE 'turn:' || turn."rootTaskId" || ':tool-lifecycle:' || $3 || ':%'
+       AND event."type" IN ('tool_call.started', 'tool_call.completed') ORDER BY event."sequence"`,
+    [ids.sessionId, ids.turnId, readCallId],
+    ),
+    pool.query(
+      `SELECT "id", "company", "role", "location", "status", "score", "url", "source", "salary", "description", "keywords"
+       FROM "Job" WHERE "id" = $1 AND "userId" = $2`,
+      [readJobId, ids.userId],
+    ),
+  ])
+  if (persisted.rows.length !== 2) throw new Error("duplicate_redelivery_read_result_not_persisted_once")
+  if (ownedJob.rows.length !== 1 || stableJson(resultOutput?.jobs?.[0]) !== stableJson(ownedJob.rows[0])) {
+    throw new Error("duplicate_redelivery_search_result_not_owned_job_row")
+  }
+  const started = persisted.rows.find(row => row.type === "tool_call.started")?.payload
+  const completed = persisted.rows.find(row => row.type === "tool_call.completed")?.payload
+  if (started?.toolName !== "jobs.search" || started?.toolCallId !== readCallId || started?.status !== "started"
+    || stableJson(started?.input) !== stableJson({ target: ids.suffix, limit: 1 })
+    || completed?.toolName !== "jobs.search" || completed?.toolCallId !== readCallId
+    || completed?.status !== "completed" || completed?.errorCode !== null
+    || stableJson(completed?.output) !== stableJson(resultOutput)
+    || resultOutput?.jobs?.length !== 1 || resultOutput.jobs[0]?.id !== readJobId
+    || resultOutput.jobs[0]?.company !== `Fixture Employer ${ids.suffix}`
+    || resultOutput.jobs[0]?.role !== "Fixture Engineer"
+    || resultOutput.jobs[0]?.description !== `Persisted read evidence ${ids.suffix}`
+    || resultOutput.page !== 1 || resultOutput.hasMore !== false) {
+    throw new Error("duplicate_redelivery_persisted_read_result_invalid")
+  }
+  say(`DUPLICATE_READ_EVIDENCE_PERSISTED ${readCallId} read:job:${readJobId}`)
+}
+
 function checkpointInputs() {
   if (!ids.checkpointKind || !ids.checkpointWaitId || !ids.readCallId) throw new Error("checkpoint_fixture_ids_missing")
   return ids
@@ -835,6 +947,7 @@ async function run() {
   if (mode === "accept-message") await acceptMessage()
   else if (mode === "park-parent") await makeFirstWorker()
   else if (mode === "resume-parent") await makeSecondWorker()
+  else if (mode === "duplicate-turn-redelivery") await makeDuplicateRedeliveryWorker()
   else if (mode === "park-active-follow-up") await makeActiveFollowUpWorker()
   else if (mode === "accept-active-follow-up") await acceptActiveFollowUp()
   else if (mode === "resume-active-follow-up") await makeFollowUpResumeWorker()

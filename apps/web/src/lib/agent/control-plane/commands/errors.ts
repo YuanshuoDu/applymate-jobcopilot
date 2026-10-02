@@ -14,6 +14,7 @@ export type AgentCommandErrorCode =
   | "retry_active_conflict"
   | "retry_target_changed"
   | "retry_input_invalid"
+  | "turn_intent_mismatch"
 
 export class AgentCommandError extends Error {
   readonly status: 404 | 409 | 422

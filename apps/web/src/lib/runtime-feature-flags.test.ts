@@ -37,6 +37,21 @@ describe('Web runtime feature flags', () => {
     await expect(isRuntimeAgentHarnessFeatureEnabled('AGENT_CHAT_LOOP_V2', 'user-1', 'staging')).resolves.toBe(false)
   })
 
+  it('keeps interactive task graph discovery disabled unless an active server override enables it', async () => {
+    mocks.findFlag.mockResolvedValue(null)
+    await expect(isRuntimeAgentHarnessFeatureEnabled('AGENT_INTERACTIVE_DISCOVERY_TASK_GRAPH', 'user-1', 'production')).resolves.toBe(false)
+
+    mocks.findFlag.mockResolvedValue({
+      enabled: true,
+      rolloutPercent: 100,
+      targetPlans: [],
+      targetUserIds: [],
+      status: 'active',
+      rollbackAt: null,
+    })
+    await expect(isRuntimeAgentHarnessFeatureEnabled('AGENT_INTERACTIVE_DISCOVERY_TASK_GRAPH', 'user-1', 'production')).resolves.toBe(true)
+  })
+
   it('uses the shared resolver for an active V2 override', async () => {
     mocks.findFlag.mockResolvedValue({
       enabled: true,

@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import { isDurableTurnRunning } from './AgentPlaygroundPage'
 
-const source = readFileSync(new URL('./AgentPlaygroundPage.tsx', import.meta.url), 'utf8')
+const source = readFileSync(new URL('./AgentPlaygroundPage.tsx', import.meta.url), 'utf8').replace(/\r\n/g, '\n')
 const streamSource = readFileSync(new URL('../agent-workspace/AgentUnifiedStream.tsx', import.meta.url), 'utf8')
 const appShellSource = readFileSync(new URL('../layout/AppShell.tsx', import.meta.url), 'utf8')
 const automationSource = readFileSync(new URL('../agent-workspace/AutomationList.tsx', import.meta.url), 'utf8')
@@ -54,6 +54,17 @@ describe('Agent workspace responsive layout', () => {
     expect(source).toContain('<AgentTurnComposerProvider value={turnComposer}>')
     expect(source).toContain('resumeSessionId={sessionId}')
     expect(source).not.toContain('liveSessionId')
+  })
+
+  it('mounts the discovery trigger on the live Agent page without wiring it to legacy execution', () => {
+    expect(appShellSource).toMatch(/agent:\s*AgentPlaygroundPage/)
+    expect(source).toContain('<AgentDiscoveryLauncher')
+    expect(source).not.toContain('onLegacyStart')
+    expect(source).not.toContain('onLegacyStop')
+    expect(source).not.toContain('startRun')
+    expect(source).not.toContain('stopRun')
+    expect(source).toContain('onTaskGraphStarted={result =>')
+    expect(source).toContain('selectSession(result.sessionId')
   })
 
   it('keeps canonical active Turn controls and running status in sync with lifecycle events', () => {

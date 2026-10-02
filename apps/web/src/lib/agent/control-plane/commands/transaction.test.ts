@@ -40,11 +40,25 @@ describe("Agent command transaction helpers", () => {
 
     const turnData = agentTurn.create.mock.calls[0]?.[0]?.data
     expect(turnData.input).toEqual(expect.objectContaining({ goal: "Canonical goal", selectedJobPreparation: { jobId: "job_1" } }))
+    expect(turnData.input).not.toHaveProperty("intent")
     const outboxData = agentOutbox.create.mock.calls[0]?.[0]?.data
     expect(outboxData).toEqual(expect.objectContaining({
       aggregateId: command.sessionId,
       idempotencyKey: "turn-dispatch:turn_1",
     }))
     expect(outboxData.aggregateId).not.toBe("turn_1")
+  })
+
+  it("persists a server-owned intent only when the caller explicitly supplies one", async () => {
+    const agentTurn = { create: vi.fn().mockResolvedValue({ id: "turn_intent" }) }
+    const agentOutbox = { create: vi.fn().mockResolvedValue({}) }
+    const tx = { agentTurn, agentOutbox } as unknown as CommandTransaction
+    const command = { sessionId: "session_1", userId: "user_1", clientMessageId: "client_intent", source: "user" as const }
+    const intent = { kind: "interactive_discovery_shortlist", version: 1 } as const
+
+    await createRootTurn(tx, command, [{ type: "text", text: "Discover roles" }], "Discovery goal", undefined, intent)
+
+    const input = agentTurn.create.mock.calls[0]?.[0]?.data.input
+    expect(input).toEqual(expect.objectContaining({ goal: "Discovery goal", intent }))
   })
 })

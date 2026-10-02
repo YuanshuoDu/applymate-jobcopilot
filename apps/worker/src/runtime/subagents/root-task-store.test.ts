@@ -105,6 +105,57 @@ describe("createPgRootTaskStore", () => {
     const taskUpdate = fake.calls.find(sql => sql.includes('UPDATE "sub_agent_tasks" SET'))
     expect(taskUpdate).toContain('"attemptCount" = 1')
     expect(taskUpdate).not.toContain('"leaseExpiresAt" > CURRENT_TIMESTAMP')
+    const serialized = fake.client.query.mock.calls.find(([sql]) => sql.includes('UPDATE "sub_agent_tasks" SET'))?.[1]?.[1]
+    expect(serialized).toBe(JSON.stringify({ status: "completed", stepCount: 1, toolCallCount: 0, finalItemId: null, waitId: null }))
+  })
+
+  it("atomically persists only a bounded validated discovery shortlist under structuredResult", async () => {
+    const fake = fakePool()
+    const shortlist = { schemaVersion: 1 as const, status: "partial" as const, items: [{ jobId: "job-1", score: 8.5, evidenceIds: ["read:job:job-1"] }], failures: ["scout_result_partial" as const] }
+    await createPgRootTaskStore(fake.pool).finish({
+      lease, rootTaskId: "root-turn-1", result: { status: "completed", stepCount: 2, toolCallCount: 1 },
+      metadata: { interactiveDiscoveryShortlist: shortlist },
+    })
+    const update = fake.client.query.mock.calls.find(([sql]) => sql.includes('UPDATE "sub_agent_tasks" SET'))
+    const saved = JSON.parse(String(update?.[1]?.[1])) as unknown
+    expect(saved).toEqual({
+      status: "completed", stepCount: 2, toolCallCount: 1, finalItemId: null, waitId: null,
+      structuredResult: { interactiveDiscoveryShortlist: shortlist },
+    })
+  })
+
+  it.each([
+    { schemaVersion: 1, status: "completed", items: [], failures: [] },
+    { schemaVersion: 1, status: "failed", items: [{ jobId: "job-1", score: 8, evidenceIds: ["read:job:job-1"] }], failures: ["no_common_candidates"] },
+    { schemaVersion: 1, status: "completed", items: [{ jobId: "job-1", score: 8, evidenceIds: ["read:job:job-1"], url: "https://model.test" }], failures: [] },
+  ])("rejects invalid or model-shaped discovery metadata before root settlement", async shortlist => {
+    const fake = fakePool()
+    await expect(createPgRootTaskStore(fake.pool).finish({
+      lease, rootTaskId: "root-turn-1", result: { status: "completed", stepCount: 1, toolCallCount: 0 },
+      metadata: { interactiveDiscoveryShortlist: shortlist as never },
+    })).rejects.toThrow("root_terminal_discovery_shortlist_invalid")
+    expect(fake.client.query.mock.calls.some(([sql]) => sql.includes('UPDATE "sub_agent_tasks" SET'))).toBe(false)
+  })
+
+  it("requires a failed shortlist marker for terminal discovery failure", async () => {
+    const fake = fakePool()
+    await expect(createPgRootTaskStore(fake.pool).finish({
+      lease, rootTaskId: "root-turn-1", result: { status: "failed", errorCode: "turn_failed", stepCount: 1, toolCallCount: 0 },
+      metadata: { interactiveDiscoveryShortlist: { schemaVersion: 1, status: "partial", items: [{ jobId: "job-1", score: 8, evidenceIds: ["read:job:job-1"] }], failures: ["scout_result_partial"] } },
+    })).rejects.toThrow("root_terminal_discovery_status_mismatch")
+  })
+
+  it("preserves a verified shortlist as partial when the root fails after ranking", async () => {
+    const fake = fakePool()
+    const shortlist = { schemaVersion: 1 as const, status: "partial" as const, items: [{ jobId: "job-1", score: 8, evidenceIds: ["read:job:job-1"] }], failures: ["discovery_runtime_failed" as const] }
+    await createPgRootTaskStore(fake.pool).finish({
+      lease, rootTaskId: "root-turn-1", result: { status: "failed", errorCode: "turn_failed", stepCount: 2, toolCallCount: 1 },
+      metadata: { interactiveDiscoveryShortlist: shortlist },
+    })
+    const update = fake.client.query.mock.calls.find(([sql]) => sql.includes('UPDATE "sub_agent_tasks" SET'))
+    expect(JSON.parse(String(update?.[1]?.[1]))).toMatchObject({
+      status: "failed", structuredResult: { interactiveDiscoveryShortlist: shortlist },
+    })
   })
 
   it("accepts an already-committed matching root receipt without rewriting terminal identity", async () => {

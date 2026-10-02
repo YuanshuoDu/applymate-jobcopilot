@@ -21,6 +21,7 @@ export const AGENT_HARNESS_FEATURES = {
   AGENT_CONTEXT_COMPACTION_V2: { defaultEnabled: false, fallback: 'legacy' },
   AGENT_BROWSER_TOOL_V2: { defaultEnabled: false, fallback: 'deny-risk' },
   AGENT_UI_TIMELINE_V2: { defaultEnabled: false, fallback: 'legacy' },
+  AGENT_INTERACTIVE_DISCOVERY_TASK_GRAPH: { defaultEnabled: false, fallback: 'legacy' },
 } as const
 
 export type ManagedFeatureKey = keyof typeof MANAGED_FEATURES

@@ -73,6 +73,7 @@ const SUMMARY_DEPENDENCY_PROJECTION_ITEM = {
   },
 } as const
 const planLedgerTraceArtifactPath = process.env.AGENT_PLAN_LEDGER_TRACE_ARTIFACT_PATH
+const interactiveDiscoveryTraceArtifactPath = process.env.AGENT_INTERACTIVE_DISCOVERY_TRACE_ARTIFACT_PATH
 const SELECTED_JOB_DRAFT_CALL_ID = "ac6-selected-job-draft-receipt"
 const SELECTED_JOB_REVIEW_READ_CALL_ID = "ac6-selected-job-review-read"
 const SELECTED_JOB_REVIEW_CALL_ID = "ac6-selected-job-review-receipt"
@@ -292,6 +293,18 @@ const TURN_DIAGNOSTIC_STATUSES = new Set([
 ])
 const ITEM_DIAGNOSTIC_STATUSES = new Set(["started", "completed", "failed", "cancelled"])
 const WAIT_DIAGNOSTIC_STATUSES = new Set(["waiting", "ready", "timed_out", "consumed", "failed", "cancelled", "interrupted", "closed"])
+const TOOL_DIAGNOSTIC_NAMES = new Set(["agent.plan", "agent.wait", "jobs.search"])
+const ERROR_DIAGNOSTIC_CODES = new Set([
+  "final_unverified", "step_limit", "model_incomplete", "persistence_conflict", "invalid_output",
+  "budget_exhausted", "no_progress", "evidence_missing", "evidence_conflict", "business_precondition_failed",
+  "tool_execution_failed", "tool_not_found", "schema_error", "capability_denied", "policy_denied",
+  "policy_version_unknown", "timeout", "cancelled", "tool_result_replay_uncertain", "tool_recovery_aborted",
+  "task_graph_scope_unavailable", "task_graph_continuation_budget_required", "task_graph_proposal_too_large",
+  "task_graph_sensitive_key_rejected", "task_graph_state_missing", "task_graph_receipt_invalid",
+  "task_graph_schedule_failed", "task_graph_dispatch_conflict", "task_graph_dependency_blocked",
+  "task_graph_dependency_task_missing", "task_graph_child_wait_state_failed", "revision_mismatch",
+  "task_graph_revision_mismatch", "revision_limit", "idempotency_conflict",
+])
 const WAIT_HANDOFF_ERROR_CODES = new Set([
   "40P01", "40001", "55P03", "57014", "23505", "23503", "wait_handoff_unavailable",
   "wait_invalid", "wait_scope_error", "lease_lost",
@@ -353,6 +366,7 @@ const PROCESS_FIXTURE_FAILURE_CATEGORIES = new Set([
   "none", "other", "tool_result_missing", "database_deadlock", "database_serialization", "database_lock_wait",
   "coordination_invalid_input", "coordination_task_not_found", "coordination_scope_error",
   "coordination_wait_unavailable", "wait_handoff_state", "turn_lease_state", "generic_tool_execution_failed",
+  "task_graph_failure", "business_precondition_failed", "turn_output_invalid", "turn_budget_exhausted",
 ])
 const PROCESS_FIXTURE_CAUSES = new Set([
   "turn_missing", "model_never_ran", "plan_not_called", "plan_failed_or_incomplete", "graph_shape_mismatch",
@@ -381,6 +395,12 @@ function diagnosticText(value: unknown, maxCharacters = 64): string | null {
 
 function diagnosticEnum(value: unknown, allowed: ReadonlySet<string>): string | null {
   return typeof value === "string" && allowed.has(value) ? value : null
+}
+
+function diagnosticErrorCode(value: unknown): string | null {
+  if (typeof value !== "string") return null
+  if (ERROR_DIAGNOSTIC_CODES.has(value)) return value
+  return /^task_graph_[a-z0-9_]{1,80}$/.test(value) ? "task_graph_other" : "other"
 }
 
 function diagnosticEnumList(value: unknown, allowed: ReadonlySet<string>, maxItems = 8): string[] {
@@ -720,6 +740,12 @@ function compactTurnProgressDiagnostics(progress: string, maxCharacters = 1_600)
   const targetMismatchCounts = record(targetRows?.mismatchCounts)
   const parentMismatchCounts = record(waitLineage?.parentMismatchCounts)
   const toolFailure = record(parsed.diagnosticToolFailure)
+  const toolFailures = Array.isArray(parsed.diagnosticToolFailures)
+    ? parsed.diagnosticToolFailures.map(record).filter((item): item is RecordValue => item !== null)
+    : toolFailure ? [toolFailure] : []
+  const executionFailures = Array.isArray(parsed.executionFailures)
+    ? parsed.executionFailures.map(record).filter((item): item is RecordValue => item !== null)
+    : []
   const fixtureNodeKeysMissingRows = waitLineage?.fixtureNodeKeysMissingRows
   const exactReceiptMatchExists = typeof waitLineage?.exactReceiptMatchExists === "boolean"
     ? waitLineage.exactReceiptMatchExists : null
@@ -732,6 +758,7 @@ function compactTurnProgressDiagnostics(progress: string, maxCharacters = 1_600)
     turn: turn ? {
       status: diagnosticEnum(turn.status, TURN_DIAGNOSTIC_STATUSES),
       errorPresent: turn.error !== null && turn.error !== undefined,
+      errorCode: diagnosticErrorCode(turn.error),
       revision: typeof turn.revision === "number" ? turn.revision : null,
       leaseVersion: typeof turn.leaseVersion === "number" ? turn.leaseVersion : null,
       leaseOwnerPresent: turn.leaseOwnerId !== null,
@@ -746,6 +773,16 @@ function compactTurnProgressDiagnostics(progress: string, maxCharacters = 1_600)
         ? record(tool.truncated)?.truncatedTaskResultCount
         : null,
     } : null,
+    executionFailures: executionFailures.slice(0, 4).map(failure => ({
+      eventType: diagnosticEnum(failure.eventType, new Set(["step.completed", "turn.failed"])),
+      status: diagnosticEnum(failure.status, new Set(["failed", "interrupted"])),
+      errorCode: diagnosticErrorCode(failure.errorCode),
+    })),
+    toolFailures: toolFailures.slice(0, 4).map(failure => ({
+      toolName: diagnosticEnum(failure.toolName, TOOL_DIAGNOSTIC_NAMES),
+      status: diagnosticEnum(failure.status, ITEM_DIAGNOSTIC_STATUSES),
+      errorCode: diagnosticErrorCode(failure.errorCode),
+    })),
     waitLineage: waitLineage ? {
       available: waitLineage.available !== false,
       taskIdsMatchCurrentGraph: typeof waitLineage.taskIdsMatchCurrentGraph === "boolean"
@@ -814,6 +851,7 @@ function compactTurnProgressDiagnostics(progress: string, maxCharacters = 1_600)
     toolFailure: toolFailure ? {
       toolNameIsAgentWait: toolFailure.toolName === "agent.wait",
       status: diagnosticEnum(toolFailure.status, ITEM_DIAGNOSTIC_STATUSES),
+      errorCode: diagnosticErrorCode(toolFailure.errorCode),
       errorCodePresent: typeof toolFailure.errorCode === "string",
       failureDetailPresent: typeof toolFailure.failureDetail === "string",
     } : null,
@@ -822,6 +860,7 @@ function compactTurnProgressDiagnostics(progress: string, maxCharacters = 1_600)
       status: diagnosticEnum(task.status, TASK_DIAGNOSTIC_STATUSES),
       attempts: typeof task.attemptCount === "number" ? task.attemptCount : null,
       failureReasonPresent: typeof task.failureReason === "string",
+      failureReasonCode: diagnosticErrorCode(task.failureReason),
     })),
     waits: waits.slice(0, 6).map(wait => ({
       keyPresent: typeof wait.idempotencyKey === "string",
@@ -1008,7 +1047,18 @@ function fixture(): Fixture {
   }
 }
 
-async function seed(pool: Pool, value: Fixture, turnStatus: "queued" | "waiting_for_user" = "queued"): Promise<void> {
+type FixtureTurnLimits = { readonly maxSteps: number; readonly maxToolCalls: number }
+
+const DEFAULT_FIXTURE_TURN_LIMITS: FixtureTurnLimits = { maxSteps: 8, maxToolCalls: 8 }
+// The discovery fixtures execute root planning/replanning and child turns under the same root-scoped ceiling.
+const DISCOVERY_FIXTURE_TURN_LIMITS: FixtureTurnLimits = { maxSteps: 16, maxToolCalls: 8 }
+
+async function seed(
+  pool: Pool,
+  value: Fixture,
+  turnStatus: "queued" | "waiting_for_user" = "queued",
+  limits: FixtureTurnLimits = DEFAULT_FIXTURE_TURN_LIMITS,
+): Promise<void> {
   await pool.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`, [
     value.userId, `${value.userId}@example.invalid`,
   ])
@@ -1025,7 +1075,7 @@ async function seed(pool: Pool, value: Fixture, turnStatus: "queued" | "waiting_
     turnStatus,
     JSON.stringify({ goal: "Research and summarize the fixture source" }),
     JSON.stringify({ provider: "fixture", model: "fixture-model" }),
-    JSON.stringify({ limits: { maxSteps: 8, maxToolCalls: 8 } }),
+    JSON.stringify({ limits }),
   ])
 }
 
@@ -1976,7 +2026,7 @@ const processRestartFixturePath = fileURLToPath(new URL("./task-graph-resume-pro
 const processRestartWorkerCwd = fileURLToPath(new URL("../../../", import.meta.url))
 
 function startTaskGraphRestartWorker(
-  mode: "park-parent" | "resume-parent" | "worker2-input-guard-self-test",
+  mode: "park-parent" | "resume-parent" | "park-discovery" | "resume-discovery" | "worker2-input-guard-self-test",
   value: Record<string, unknown>,
   envOverrides: Record<string, string> = {},
 ): ProcessFixtureChild {
@@ -2049,6 +2099,7 @@ function processFixtureDiagnosticProjection(value: unknown): RecordValue | null 
   projectEnum("rootTaskStatus", PROCESS_FIXTURE_TASK_STATUSES)
   projectEnum("latestModelStepStatus", PROCESS_FIXTURE_STEP_STATUSES)
   projectEnum("latestModelStepErrorClass", PROCESS_FIXTURE_FAILURE_CATEGORIES)
+  projectEnum("planFailureCategory", PROCESS_FIXTURE_FAILURE_CATEGORIES)
   projectEnum("turnErrorCategory", PROCESS_FIXTURE_FAILURE_CATEGORIES)
   projectEnum("waitToolCallStatus", PROCESS_FIXTURE_TOOL_STATUSES)
   projectEnum("waitToolCallLifecycleStatus", PROCESS_FIXTURE_TOOL_STATUSES)
@@ -2511,7 +2562,15 @@ async function initialWaitLineageDiagnostics(
   }
 }
 
-async function turnProgressDiagnostics(pool: Pool, turnId: string, diagnosticToolCallId?: string): Promise<string> {
+async function turnProgressDiagnostics(
+  pool: Pool,
+  turnId: string,
+  diagnosticToolCallId?: string,
+  additionalDiagnosticToolCallIds: readonly string[] = [],
+): Promise<string> {
+  const diagnosticToolCallIds = [...new Set([
+    ...(diagnosticToolCallId ? [diagnosticToolCallId] : []), ...additionalDiagnosticToolCallIds,
+  ])].slice(0, 6)
   const turnResult = await pool.query<{
     id: string
     sessionId: string
@@ -2528,7 +2587,7 @@ async function turnProgressDiagnostics(pool: Pool, turnId: string, diagnosticToo
   const turn = turnResult.rows[0]
   if (!turn) return JSON.stringify({ turnId, missing: true })
 
-  const [toolResultItem, tasks, waits, events, dispatches, lifecycleFailure] = await Promise.all([
+  const [toolResultItem, tasks, waits, events, dispatches, lifecycleFailures] = await Promise.all([
     diagnosticToolCallId
       ? pool.query<{ status: string; content: unknown }>(`SELECT "status", "content" FROM "agent_items"
         WHERE "turnId" = $1 AND "type" = 'tool_result' AND "content"->>'toolCallId' = $2
@@ -2545,17 +2604,20 @@ async function turnProgressDiagnostics(pool: Pool, turnId: string, diagnosticToo
     }>(`SELECT "id", "idempotencyKey", "status", "targetTaskIds", "matchedTaskIds", "deadlineAt", "suspendedAt", "resolvedAt", "consumedAt"
       FROM "agent_wait_conditions" WHERE "turnId" = $1 ORDER BY "createdAt"`, [turnId]),
     pool.query<{
-      sequence: string; type: string; actor: string; taskId: string | null; idempotencyKey: string | null; payload: unknown
-    }>(`SELECT "sequence"::text, "type", "actor", "taskId", "idempotencyKey", "payload"
+      sequence: string; type: string; actor: string; taskId: string | null; idempotencyKey: string | null
+      diagnosticStatus: string | null; diagnosticErrorCode: string | null
+    }>(`SELECT "sequence"::text, "type", "actor", "taskId", "idempotencyKey",
+        "payload"->>'status' AS "diagnosticStatus", "payload"->>'errorCode' AS "diagnosticErrorCode"
       FROM "agent_events" WHERE "turnId" = $1 ORDER BY "sequence" DESC LIMIT 20`, [turnId]),
     pool.query<{
       topic: string; idempotencyKey: string; publishedAt: Date | null; attemptCount: number; lastError: string | null
     }>(`SELECT "topic", "idempotencyKey", "publishedAt", "attemptCount", "lastError"
       FROM "agent_outbox" WHERE "aggregateId" = $1 ORDER BY "createdAt" DESC LIMIT 30`, [turn.sessionId]),
-    diagnosticToolCallId
-      ? pool.query<{ type: string; idempotencyKey: string | null; payload: unknown }>(`SELECT "type", "idempotencyKey", "payload" FROM "agent_events"
-        WHERE "turnId" = $1 AND POSITION($2 IN "idempotencyKey") > 0
-        ORDER BY "sequence" DESC LIMIT 1`, [turnId, `:tool-lifecycle:${diagnosticToolCallId}:failed:`])
+    diagnosticToolCallIds.length > 0
+      ? pool.query<{ type: string; toolName: string | null; status: string | null; errorCode: string | null }>(`SELECT "type",
+          "payload"->>'toolName' AS "toolName", "payload"->>'status' AS "status", "payload"->>'errorCode' AS "errorCode"
+        FROM "agent_events" WHERE "turnId" = $1 AND "type" = 'tool_call.failed' AND "payload"->>'toolCallId' = ANY($2::text[])
+        ORDER BY "sequence" DESC LIMIT 4`, [turnId, diagnosticToolCallIds])
       : Promise.resolve(null),
   ])
   const resultItem = toolResultItem?.rows[0]
@@ -2596,28 +2658,33 @@ async function turnProgressDiagnostics(pool: Pool, turnId: string, diagnosticToo
       },
     }
     : null
-  const lifecycleEvent = lifecycleFailure?.rows[0]
-  const lifecyclePayload = record(lifecycleEvent?.payload)
-  const lifecycleOutput = record(lifecyclePayload?.output)
-  const diagnosticToolFailure = lifecycleEvent
-    ? {
-      eventType: typeof lifecycleEvent.type === "string" ? lifecycleEvent.type.slice(0, 64) : null,
-      idempotencyKey: typeof lifecycleEvent.idempotencyKey === "string" ? lifecycleEvent.idempotencyKey.slice(0, 256) : null,
-      toolCallId: typeof lifecyclePayload?.toolCallId === "string" ? lifecyclePayload.toolCallId.slice(0, 128) : null,
-      toolName: typeof lifecyclePayload?.toolName === "string" ? lifecyclePayload.toolName.slice(0, 128) : null,
-      status: typeof lifecyclePayload?.status === "string" ? lifecyclePayload.status.slice(0, 32) : null,
-      errorCode: typeof lifecyclePayload?.errorCode === "string" ? lifecyclePayload.errorCode.slice(0, 128) : null,
-      failureDetail: typeof lifecycleOutput?.message === "string" && lifecycleOutput.message.length > 0
-        ? lifecycleOutput.message.slice(0, 500)
-        : null,
-    }
-    : null
+  const diagnosticToolFailures = lifecycleFailures?.rows.map(event => ({
+    eventType: event.type,
+    toolName: event.toolName,
+    status: event.status,
+    errorCode: event.errorCode,
+  })) ?? []
+  const executionFailures = events.rows.flatMap(event => {
+    if (event.type !== "step.completed" && event.type !== "turn.failed") return []
+    if (event.diagnosticStatus !== "failed" && event.type !== "turn.failed") return []
+    return [{ eventType: event.type, status: event.diagnosticStatus, errorCode: event.diagnosticErrorCode }]
+  })
   const waitLineage = await initialWaitLineageDiagnostics(pool, turn, diagnosticToolCallId)
-  const recentEvents = events.rows.map(({ payload: _payload, ...event }) => event)
-  return JSON.stringify({ turn, waitToolResult, waitLineage, tasks: tasks.rows, waits: waits.rows, recentEvents, diagnosticToolFailure, recentOutbox: dispatches.rows })
+  const recentEvents = events.rows.map(({ diagnosticStatus: _status, diagnosticErrorCode: _errorCode, ...event }) => event)
+  return JSON.stringify({
+    turn, waitToolResult, waitLineage, tasks: tasks.rows, waits: waits.rows, recentEvents,
+    diagnosticToolFailures, executionFailures, recentOutbox: dispatches.rows,
+  })
 }
 
-async function waitForTurnStatus(pool: Pool, turnId: string, wanted: string, timeoutMs = 50_000, diagnosticToolCallId?: string): Promise<void> {
+async function waitForTurnStatus(
+  pool: Pool,
+  turnId: string,
+  wanted: string,
+  timeoutMs = 50_000,
+  diagnosticToolCallId?: string,
+  additionalDiagnosticToolCallIds: readonly string[] = [],
+): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const result = await pool.query<{ status: string; error: string | null }>(
@@ -2626,13 +2693,13 @@ async function waitForTurnStatus(pool: Pool, turnId: string, wanted: string, tim
     const status = result.rows[0]?.status
     if (status === wanted) return
     if (status && ["failed", "interrupted", "cancelled"].includes(status)) {
-      const progress = await turnProgressDiagnostics(pool, turnId, diagnosticToolCallId)
+      const progress = await turnProgressDiagnostics(pool, turnId, diagnosticToolCallId, additionalDiagnosticToolCallIds)
       const turnError = boundedDiagnostic(result.rows[0]?.error ?? "<none>", 300)
-      throw new Error(`TaskGraph root turn entered ${status}; error=${turnError}; progress=${compactTurnProgressDiagnostics(progress, 900)}`)
+      throw new Error(`TaskGraph root turn entered ${status}; error=${turnError}; progress=${compactTurnProgressDiagnostics(progress, 3_000)}`)
     }
     await new Promise(resolve => setTimeout(resolve, 25))
   }
-  const progress = await turnProgressDiagnostics(pool, turnId, diagnosticToolCallId)
+  const progress = await turnProgressDiagnostics(pool, turnId, diagnosticToolCallId, additionalDiagnosticToolCallIds)
   throw new Error(`TaskGraph root turn did not reach ${wanted}; progress=${compactTurnProgressDiagnostics(progress, 900)}`)
 }
 
@@ -3254,7 +3321,7 @@ describe("compact TaskGraph wait failure diagnostics", () => {
     const markers = ["marker-task-id", "marker-raw-error", "marker-nested-error", "marker-extra-id"]
     const safeLine = "P3_PARENT_SUSPENSION_DIAGNOSTICS " + JSON.stringify({
       turnStatus: "failed", rootTaskStatus: "running", latestModelStepStatus: "failed",
-      latestModelStepErrorClass: markers[1], turnErrorCategory: "database_deadlock",
+      latestModelStepErrorClass: markers[1], planFailureCategory: "task_graph_failure", turnErrorCategory: "database_deadlock",
       waitToolCallStatus: "completed", waitToolCallLifecycleStatus: "started",
       planAccepted: true,
       waitToolResultLifecycleStatus: "completed",
@@ -3292,7 +3359,7 @@ describe("compact TaskGraph wait failure diagnostics", () => {
 
     expect(projected).toMatchObject({
       turnStatus: "failed", rootTaskStatus: "running", latestModelStepStatus: "failed",
-      turnErrorCategory: "database_deadlock", waitToolCallStatus: "completed",
+      planFailureCategory: "task_graph_failure", turnErrorCategory: "database_deadlock", waitToolCallStatus: "completed",
       planAccepted: true,
       waitToolCallLifecycleStatus: "started",
       waitToolResultLifecycleStatus: "completed", waitToolOutputStatus: "ready",
@@ -3508,15 +3575,23 @@ describe("compact TaskGraph wait failure diagnostics", () => {
         toolName: "agent.wait", status: "failed", errorCode: markers[7], failureDetail: markers[7],
         idempotencyKey: markers[6],
       },
+      diagnosticToolFailures: [
+        { toolName: "agent.plan", status: "failed", errorCode: "task_graph_schedule_failed" },
+        { toolName: "agent.wait", status: "failed", errorCode: markers[7] },
+      ],
+      executionFailures: [
+        { eventType: "step.completed", status: "failed", errorCode: "business_precondition_failed" },
+        { eventType: "turn.failed", errorCode: markers[7] },
+      ],
       tasks: [{ id: markers[2], goal: markers[5], status: "failed", attemptCount: 2, failureReason: markers[7] }],
       waits: [{ id: markers[3], idempotencyKey: markers[6], status: "waiting", targetTaskIds: [markers[2]], matchedTaskIds: [] }],
       recentEvents: [{ taskId: markers[2], idempotencyKey: markers[6], error: markers[7] }],
       recentOutbox: [{ idempotencyKey: markers[6], lastError: markers[7] }],
-    }))
+    }), 3_000)
 
     expect(markers.some(marker => output.includes(marker)), "diagnostic output must omit marker values").toBe(false)
     expect(JSON.parse(output)).toMatchObject({
-      turn: { status: "failed", revision: 7, leaseVersion: 3, errorPresent: true },
+      turn: { status: "failed", errorCode: "other", revision: 7, leaseVersion: 3, errorPresent: true },
       waitToolResult: { status: "failed", outputStatus: "waiting", matchedTaskCount: 2, truncatedTaskResultCount: 1 },
       waitLineage: {
         taskIdsMatchCurrentGraph: false, requestedTaskCount: 2, graphNodeCount: 2,
@@ -3527,7 +3602,15 @@ describe("compact TaskGraph wait failure diagnostics", () => {
         fixtureNodeKeysMissingRows: ["source", "summary", "rejected"],
         targetRows: { requestedCount: 2, foundCount: 2, allInExpectedScope: true },
       },
-      tasks: [{ goalPresent: true, status: "failed", attempts: 2, failureReasonPresent: true }],
+      toolFailures: [
+        { toolName: "agent.plan", status: "failed", errorCode: "task_graph_schedule_failed" },
+        { toolName: "agent.wait", status: "failed", errorCode: "other" },
+      ],
+      executionFailures: [
+        { eventType: "step.completed", status: "failed", errorCode: "business_precondition_failed" },
+        { eventType: "turn.failed", status: null, errorCode: "other" },
+      ],
+      tasks: [{ goalPresent: true, status: "failed", attempts: 2, failureReasonPresent: true, failureReasonCode: "other" }],
       waits: [{ keyPresent: true, status: "waiting", targetCount: 1, matchedCount: 0 }],
     })
   })
@@ -3729,6 +3812,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   const restartOwner = fixture()
   const artifactOwner = fixture()
   const cancelledOwner = fixture()
+  const discoveryOwner = fixture()
+  const discoveryFailureOwner = fixture()
+  const discoveryRestartOwner = fixture()
   let artifactOwnerSources: SelectedJobFixtureSources | undefined
   let pool: Pool | undefined
   let redis: Redis | undefined
@@ -3758,6 +3844,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await seed(pool, artifactOwner, "waiting_for_user")
     artifactOwnerSources = await seedSelectedJobSources(pool, artifactOwner)
     await seed(pool, cancelledOwner, "waiting_for_user")
+    await seed(pool, discoveryOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
+    await seed(pool, discoveryFailureOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
+    await seed(pool, discoveryRestartOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
   }, 15_000)
 
   afterEach(async () => {
@@ -3773,7 +3862,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       }
     }
     await attempt("bootstrap close", async () => { await bootstrap?.close() })
-    if (pool) for (const current of [owner, failureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner]) {
+    if (pool) for (const current of [owner, failureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner, discoveryFailureOwner, discoveryRestartOwner]) {
       await attempt("delete outbox for " + current.sessionId, () => pool!.query(
         "DELETE FROM \"agent_outbox\" WHERE \"aggregateId\" = $1", [current.sessionId],
       ))
@@ -3801,7 +3890,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           jobs = await queue.getJobs(["completed", "failed", "waiting", "delayed", "paused", "waiting-children", "active"])
         })
         for (const job of jobs) {
-          if ([owner, failureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner].some(current => job.data?.turnId === current.turnId || job.data?.sessionId === current.sessionId)) {
+          if ([owner, failureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner, discoveryFailureOwner, discoveryRestartOwner].some(current => job.data?.turnId === current.turnId || job.data?.sessionId === current.sessionId)) {
             await attempt("remove " + label + " job " + job.id, () => job.remove())
           }
         }
@@ -6031,6 +6120,545 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       [owner.sessionId, [dependent.id, transitive.id].map(taskId => `subagent-dispatch:${taskId}`)],
     )
     expect(blockedDispatches.rowCount).toBe(0)
+  }, 90_000)
+
+  it("restores interactive discovery across a real Worker restart and replays its child dispatch once", async () => {
+    if (interactiveDiscoveryTraceArtifactPath) await rm(interactiveDiscoveryTraceArtifactPath, { force: true })
+    const [{ TURN_QUEUE_NAME }, subagentQueue] = await Promise.all([
+      import("../turns/turn-queue.js"), import("../../queue/subagent-queue.js"),
+    ])
+    turnQueueName = TURN_QUEUE_NAME
+    childQueueName = subagentQueue.SUBAGENT_QUEUE_NAME
+    const value = discoveryRestartOwner
+    const jobId = `p3-discovery-restart-job-${value.suffix}`
+    let workerOne: ProcessFixtureChild | undefined
+    let workerTwo: ProcessFixtureChild | undefined
+    try {
+      await pool!.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4`, [
+        value.turnId,
+        JSON.stringify({ goal: "Find and rank a software engineering role in Dublin", intent: { kind: "interactive_discovery_shortlist", version: 1 } }),
+        value.sessionId, value.userId,
+      ])
+      await pool!.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "location", "status", "url", "description", "source", "updatedAt")
+        VALUES ($1, $2, 'Restart Fixture Labs', 'Software Engineer', 'Dublin', 'saved', 'https://jobs.example.invalid/restart-discovery', 'Build durable systems', 'greenhouse', CURRENT_TIMESTAMP)`, [
+        jobId, value.userId,
+      ])
+
+      workerOne = startTaskGraphRestartWorker("park-discovery", { ...value, jobId })
+      await waitForProcessLine(workerOne, "P3_DISCOVERY_PARENT_SUSPENDED ", 45_000)
+      const waitingTurn = await pool!.query<{ status: string; leaseVersion: number; rootTaskId: string | null }>(
+        `SELECT "status", "leaseVersion", "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+        [value.turnId, value.sessionId, value.userId],
+      )
+      expect(waitingTurn.rows[0]).toMatchObject({ status: "waiting_for_dependency", leaseVersion: 1 })
+      const rootTaskId = waitingTurn.rows[0]?.rootTaskId
+      expect(rootTaskId).toBeTruthy()
+      const source = await pool!.query<{ id: string; status: string }>(
+        `SELECT "id", "status" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "parentTaskId" = $3 AND "role" = 'scout'`,
+        [value.turnId, value.sessionId, rootTaskId],
+      )
+      expect(source.rows).toHaveLength(1)
+      expect(source.rows[0]?.status).toBe("queued")
+      const initialDispatch = await pool!.query<{ id: string; publishedAt: Date | null }>(
+        `SELECT "id", "publishedAt" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2`,
+        [value.sessionId, `subagent-dispatch:${source.rows[0]!.id}`],
+      )
+      expect(initialDispatch.rows).toHaveLength(1)
+      expect(initialDispatch.rows[0]?.publishedAt).toBeInstanceOf(Date)
+
+      const foreignTask = await new PgCoordinationStore(pool!).getTask({
+        userId: `p3-foreign-user-${value.suffix}`, sessionId: value.sessionId, taskId: source.rows[0]!.id,
+      })
+      expect(foreignTask).toBeNull()
+      const { requireCurrentOwnerJobs } = await import("../interactive-discovery-persistence.js")
+      const foreignShortlist = await requireCurrentOwnerJobs(pool!, `p3-foreign-user-${value.suffix}`, {
+        schemaVersion: 1, status: "completed", items: [{ jobId, score: 8.5, evidenceIds: [`read:job:${jobId}`] }], failures: [],
+      })
+      expect(foreignShortlist).toMatchObject({ status: "failed", items: [], failures: ["evidence_unverified"] })
+
+      const firstExit = waitForProcessExit(workerOne)
+      expect(workerOne.kill("SIGKILL")).toBe(true)
+      await firstExit
+      expect(workerOne.signalCode).toBe("SIGKILL")
+      // Replay a published outbox row to model a crash between queue acceptance and publish acknowledgement.
+      const resetDispatch = await pool!.query(
+        `UPDATE "agent_outbox" SET "publishedAt" = NULL WHERE "id" = $1 AND "publishedAt" IS NOT NULL RETURNING "id"`,
+        [initialDispatch.rows[0]!.id],
+      )
+      expect(resetDispatch.rowCount).toBe(1)
+
+      workerTwo = startTaskGraphRestartWorker("resume-discovery", { ...value, jobId })
+      await waitForProcessLine(workerTwo, "P3_DISCOVERY_SECOND_WORKER_READY ", 45_000)
+      await waitForTurnStatus(pool!, value.turnId, "completed", 90_000)
+
+      const root = await pool!.query<{ id: string; status: string; result: unknown }>(
+        `SELECT "id", "status", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "role" = 'orchestrator'`,
+        [value.turnId, value.sessionId],
+      )
+      expect(root.rows).toHaveLength(1)
+      expect(root.rows[0]?.status).toBe("completed")
+      expect(record(record(root.rows[0]?.result)?.structuredResult)?.interactiveDiscoveryShortlist).toEqual({
+        schemaVersion: 1, status: "completed", items: [{ jobId, score: 8.5, evidenceIds: [`read:job:${jobId}`] }], failures: [],
+      })
+      const children = await pool!.query<{ id: string; role: string; status: string; result: unknown }>(
+        `SELECT "id", "role", "status", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "parentTaskId" = $3 AND "role" = ANY($4::text[]) ORDER BY "role"`,
+        [value.turnId, value.sessionId, root.rows[0]!.id, ["analyst", "scout"]],
+      )
+      expect(children.rows.map(child => [child.role, child.status])).toEqual([["analyst", "completed"], ["scout", "completed"]])
+      expect(workerTwo.output.filter(line => line.startsWith(`P3_DISCOVERY_CHILD_SETTLED ${source.rows[0]!.id} scout `))).toHaveLength(1)
+      const persistedSearchReceipts = await pool!.query<{ taskId: string; toolName: string }>(
+        `SELECT tool_result."taskId", tool_call."content"->>'toolName' AS "toolName"
+         FROM "agent_items" AS tool_result
+         JOIN "agent_items" AS tool_call
+           ON tool_call."sessionId" = tool_result."sessionId" AND tool_call."turnId" = tool_result."turnId"
+          AND tool_call."taskId" = tool_result."taskId" AND tool_call."type" = 'tool_call'
+          AND tool_call."content"->>'toolCallId' = tool_result."content"->>'toolCallId'
+         WHERE tool_result."sessionId" = $1 AND tool_result."turnId" = $2
+           AND tool_result."taskId" = ANY($3::text[]) AND tool_result."type" = 'tool_result'
+           AND tool_call."content"->>'toolName' = 'jobs.search'
+         ORDER BY tool_result."taskId"`,
+        [value.sessionId, value.turnId, children.rows.map(child => child.id)],
+      )
+      expect(persistedSearchReceipts.rows).toHaveLength(2)
+      expect(persistedSearchReceipts.rows.map(receipt => receipt.taskId).sort()).toEqual(children.rows.map(child => child.id).sort())
+      const dispatches = await pool!.query<{ idempotencyKey: string; publishedAt: Date | null }>(
+        `SELECT "idempotencyKey", "publishedAt" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = ANY($2::text[]) ORDER BY "idempotencyKey"`,
+        [value.sessionId, children.rows.map(child => `subagent-dispatch:${child.id}`)],
+      )
+      expect(dispatches.rows).toHaveLength(2)
+      expect(dispatches.rows.every(dispatch => dispatch.publishedAt instanceof Date)).toBe(true)
+      expect(new Set(dispatches.rows.map(dispatch => dispatch.idempotencyKey)).size).toBe(2)
+      const waits = await pool!.query<{ consumedAt: Date | null }>(
+        `SELECT "consumedAt" FROM "agent_wait_conditions" WHERE "turnId" = $1 AND "sessionId" = $2 ORDER BY "createdAt"`,
+        [value.turnId, value.sessionId],
+      )
+      expect(waits.rows).toHaveLength(2)
+      expect(waits.rows.every(wait => wait.consumedAt instanceof Date)).toBe(true)
+      const turn = await pool!.query<{ status: string; finalResponse: string | null }>(`SELECT "status", "finalResponse" FROM "agent_turns" WHERE "id" = $1`, [value.turnId])
+      expect(turn.rows[0]?.finalResponse).toContain(jobId)
+      expect(workerTwo.output.some(line => line.startsWith("P3_DISCOVERY_RESTORED_FINAL_GRAPH "))).toBe(true)
+
+      if (interactiveDiscoveryTraceArtifactPath) {
+        const graphRows = await pool!.query<TaskGraphItemRow>(
+          `SELECT "id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "revision", "content", "startedAt", "completedAt", "createdAt", "updatedAt"
+           FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "type" = 'task_graph'`,
+          [value.sessionId, value.turnId, root.rows[0]!.id],
+        )
+        expect(graphRows.rows).toHaveLength(1)
+        const graph = graphRows.rows[0]!
+        const ledgerTasks = await pool!.query<{
+          id: string; sessionId: string; turnId: string | null; rootTaskId: string | null; parentTaskId: string | null
+          path: string; role: string; taskType: string; status: string; goal: string; confidence: number | null
+          failureReason: string | null; result: RecordValue | null; createdAt: Date; updatedAt: Date
+        }>(
+          `SELECT "id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "role", "taskType", "status", "goal", "confidence", "failureReason", "result", "createdAt", "updatedAt"
+           FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2 AND ("id" = $3 OR "parentTaskId" = $3)
+           ORDER BY "createdAt" ASC, "id" ASC`,
+          [value.sessionId, value.turnId, root.rows[0]!.id],
+        )
+        const safeTasks = ledgerTasks.rows.map(row => {
+          const evidencePreview = projectTaskEvidencePreview(row)
+          return {
+            id: row.id, sessionId: row.sessionId, turnId: row.turnId, rootTaskId: row.rootTaskId,
+            parentTaskId: row.parentTaskId, path: row.path, role: row.role, taskType: row.taskType,
+            status: row.status, goal: row.goal, confidence: row.confidence, failureReason: row.failureReason,
+            hasResult: row.result !== null,
+            ...(evidencePreview ? { structuredEvidencePreview: evidencePreview } : {}),
+          }
+        })
+        const planLedger = projectPlanLedger({
+          sessionId: value.sessionId, revision: graph.revision, rootTaskId: root.rows[0]!.id,
+          graph: graph.content, tasks: safeTasks,
+        })
+        if (!planLedger) throw new Error("Interactive discovery restart did not project its persisted Plan Ledger")
+        const shortlistValue = record(record(root.rows[0]?.result)?.structuredResult)?.interactiveDiscoveryShortlist
+        const shortlist = record(shortlistValue)
+        const rawItems = Array.isArray(shortlist?.items) ? shortlist.items.map(record) : []
+        const safeShortlist = {
+          schemaVersion: 1,
+          status: shortlist?.status === "completed" || shortlist?.status === "partial" || shortlist?.status === "failed" ? shortlist.status : "failed",
+          items: rawItems.flatMap(item => {
+            if (typeof item?.jobId !== "string" || typeof item.score !== "number" || !Number.isFinite(item.score)) return []
+            const evidenceIds = Array.isArray(item.evidenceIds) ? item.evidenceIds.filter((id): id is string => typeof id === "string") : []
+            return [{ jobId: item.jobId, score: item.score, evidenceIds }]
+          }).slice(0, 3),
+          failures: Array.isArray(shortlist?.failures) ? shortlist.failures.filter((failure): failure is string => typeof failure === "string").slice(0, 12) : [],
+        }
+        const finalResponse = JSON.parse(turn.rows[0]?.finalResponse ?? "null") as RecordValue | null
+        const finalShortlistText = typeof finalResponse?.response === "string" ? finalResponse.response : ""
+        if (turn.rows[0]?.status !== "completed" || !finalShortlistText || JSON.stringify(JSON.parse(finalShortlistText)) !== JSON.stringify(safeShortlist)) {
+          throw new Error("Interactive discovery trace final outcome does not match its persisted shortlist")
+        }
+        await writeFile(interactiveDiscoveryTraceArtifactPath, JSON.stringify({
+          schemaVersion: "agent-harness.v2.interactive-discovery-trace",
+          sessionId: value.sessionId,
+          turnId: value.turnId,
+          rootTaskId: root.rows[0]!.id,
+          graphItemId: graph.id,
+          graphRevision: graph.revision,
+          graph: graph.content,
+          tasks: safeTasks,
+          planLedger,
+          interactiveDiscoveryShortlist: safeShortlist,
+          finalOutcome: { turnStatus: turn.rows[0].status, response: finalShortlistText },
+        }), "utf8")
+      }
+    } finally {
+      if (workerOne && !processFixtureExited(workerOne)) await killProcessFixture(workerOne)
+      if (workerTwo) await stopProcessFixture(workerTwo)
+    }
+  }, 240_000)
+
+  it("replans a canonical discovery Turn from durable child evidence and persists the owner-scoped shortlist", async () => {
+    const [workerQueue, canonical, commandPortModule, subagentQueue] = await Promise.all([
+      import("../../queue/production-bootstrap.js"),
+      import("../canonical-turn-runtime.js"),
+      import("./pg-task-graph-command-port.js"),
+      import("../../queue/subagent-queue.js"),
+    ])
+    const { createProductionChildExecutor } = await import("./production-child-runtime.js")
+    const { createTurnQueue, enqueueTurn, TURN_QUEUE_NAME } = await import("../turns/turn-queue.js")
+    turnQueueName = TURN_QUEUE_NAME
+    childQueueName = subagentQueue.SUBAGENT_QUEUE_NAME
+    await activateFixtureTurn(pool!, discoveryOwner)
+
+    const jobId = `p3-discovery-job-${discoveryOwner.suffix}`
+    await pool!.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4`, [
+      discoveryOwner.turnId,
+      JSON.stringify({ goal: "Find a strong software engineering role in Dublin", intent: { kind: "interactive_discovery_shortlist", version: 1 } }),
+      discoveryOwner.sessionId, discoveryOwner.userId,
+    ])
+    await pool!.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "location", "status", "url", "description", "source", "updatedAt")
+      VALUES ($1, $2, 'Fixture Labs', 'Software Engineer', 'Dublin', 'saved', 'https://jobs.example.invalid/discovery', 'Build reliable services', 'greenhouse', CURRENT_TIMESTAMP)`, [
+      jobId, discoveryOwner.userId,
+    ])
+
+    const flags: ProductionAgentFlags = {
+      taskGraphPlanningEnabled: true, childExecutionEnabled: true, coordinationEnabled: true,
+      consumeWaitOutcomes: true, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false,
+    }
+    const profile = {
+      provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true,
+      continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false,
+      supportsReasoningSummary: false, supportsResponseContinuation: false, supportsProviderConversation: false,
+      supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low" as const,
+    }
+    let rootExecution = 0
+    const rootRuntime = await canonical.createCanonicalTurnRuntime(pool!, {
+      workerId: discoveryOwner.ownerId, productionFlags: flags,
+      taskGraphCommandPort: commandPortModule.createPgTaskGraphCommandPort(pool!),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => {
+        const execution = ++rootExecution
+        let round = 0
+        const adapter: ModelAdapter = {
+          id: "p3-interactive-discovery-root-fixture", profile,
+          async *stream(request) {
+            round += 1
+            if (execution === 1 && round === 1) {
+              expect(request.tools.map(tool => record(tool)?.name)).toContain("agent.plan")
+              yield { type: "tool_call_completed", callId: "p3-discovery-plan-scout", name: "agent.plan", arguments: {
+                expectedRevision: 0,
+                nodes: [{ key: "scout", templateId: "scout", goal: "Find matching fixture roles", successCriteria: ["Read one owner job"], dependsOn: [] }],
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if (execution === 1 && round === 2) {
+              const taskIds = planTaskIds(request, "p3-discovery-plan-scout", 1)
+              yield { type: "tool_call_completed", callId: "p3-discovery-wait-scout", name: "agent.wait", arguments: {
+                idempotencyKey: `p3-discovery-wait-scout:${discoveryOwner.turnId}`, taskIds, mode: "all", timeoutMs: 20_000,
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if (execution === 2 && round === 1) {
+              const graph = currentGraphFromRequest(request)
+              const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+              expect(nodes.map(node => node?.key)).toEqual(["scout"])
+              expect(nodes[0]?.status).toBe("completed")
+              const revision = graph?.revision
+              if (typeof revision !== "number") throw new Error("Discovery replan did not receive the durable graph revision")
+              yield { type: "tool_call_completed", callId: "p3-discovery-plan-analyst", name: "agent.plan", arguments: {
+                expectedRevision: revision,
+                nodes: [{ key: "analyst", templateId: "analyst", goal: "Score the discovered role", successCriteria: ["Return an evidence-bound score"], dependsOn: ["scout"] }],
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if (execution === 2 && round === 2) {
+              const taskIds = planTaskIds(request, "p3-discovery-plan-analyst", 1)
+              yield { type: "tool_call_completed", callId: "p3-discovery-wait-analyst", name: "agent.wait", arguments: {
+                idempotencyKey: `p3-discovery-wait-analyst:${discoveryOwner.turnId}`, taskIds, mode: "all", timeoutMs: 20_000,
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if (execution === 3 && round === 1) {
+              const graph = currentGraphFromRequest(request)
+              const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+              expect(nodes.map(node => node?.key)).toEqual(["scout", "analyst"])
+              expect(nodes.map(node => node?.status)).toEqual(["completed", "completed"])
+              const wait = waitOutcomeFromRequest(request, 1)
+              expect(wait.status).toBe("ready")
+              yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: "Shortlist ready" }) }
+              yield { type: "completed", finishReason: "stop" }
+              return
+            }
+            throw new Error(`Unexpected discovery root model turn ${execution}/${round}`)
+          },
+        }
+        return { adapter, registry: {} as never, candidates: [] }
+      },
+    })
+    const childExecutor = createProductionChildExecutor({
+      pool: pool!, authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: ({ task }) => {
+        let round = 0
+        const adapter: ModelAdapter = {
+          id: `p3-interactive-discovery-${task.role}-fixture`, profile,
+          async *stream(request) {
+            round += 1
+            if (round === 1) {
+              expect(request.tools.map(tool => record(tool)?.name)).toContain("jobs.search")
+              yield { type: "tool_call_completed", callId: `p3-discovery-read-${task.role}`, name: "jobs.search", arguments: { target: "Software Engineer", location: "Dublin", limit: 10 } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            const waitKey = task.role === "scout"
+              ? `p3-discovery-wait-scout:${discoveryOwner.turnId}`
+              : `p3-discovery-wait-analyst:${discoveryOwner.turnId}`
+            await waitForPersistedTaskWait(pool!, discoveryOwner.turnId, waitKey)
+            const evidence = { id: `read:job:${jobId}`, kind: "job", ref: jobId, source: "greenhouse" }
+            const result = task.role === "scout"
+              ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [{ jobId, source: "fixture", url: null, evidenceIds: [evidence.id] }], evidence: [evidence], summary: "Found the fixture role" }
+              : { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [{ jobId, score: 8.5, evidenceIds: [evidence.id] }], evidence: [evidence], summary: "Strong match" }
+            yield { type: "text_delta", text: JSON.stringify(result) }
+            yield { type: "completed", finishReason: "stop" }
+          },
+        }
+        return adapter
+      },
+    })
+    bootstrap = await workerQueue.createProductionWorkerBootstrap({
+      pool: pool!, runtime: rootRuntime, ownerId: discoveryOwner.ownerId,
+      turnQueueFactory: createTurnQueue, turnRecoveryIntervalMs: 100,
+      waitResolver: { intervalMs: 10, batchSize: 10, ownerId: `p3-discovery-wait-resolver-${discoveryOwner.suffix}` },
+      subagents: { execute: childExecutor, intervalMs: 10 },
+    })
+
+    await enqueueTurn(pool!, bootstrap.turns.queue, { turnId: discoveryOwner.turnId, sessionId: discoveryOwner.sessionId, ownerId: discoveryOwner.ownerId })
+    await waitForTurnStatus(pool!, discoveryOwner.turnId, "completed", 50_000, "p3-discovery-wait-analyst", [
+      "p3-discovery-plan-scout", "p3-discovery-wait-scout", "p3-discovery-plan-analyst",
+    ])
+
+    const root = await pool!.query<{ status: string; result: unknown }>(
+      `SELECT "status", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "role" = 'orchestrator'`,
+      [discoveryOwner.turnId, discoveryOwner.sessionId],
+    )
+    expect(root.rows).toHaveLength(1)
+    expect(root.rows[0]?.status).toBe("completed")
+    expect(record(record(root.rows[0]?.result)?.structuredResult)?.interactiveDiscoveryShortlist).toEqual({
+      schemaVersion: 1, status: "completed", items: [{ jobId, score: 8.5, evidenceIds: [`read:job:${jobId}`] }], failures: [],
+    })
+    const children = await pool!.query<{ id: string; role: string; status: string; result: unknown }>(
+      `SELECT "id", "role", "status", "result" FROM "sub_agent_tasks"
+       WHERE "turnId" = $1 AND "sessionId" = $2 AND "role" = ANY($3::text[]) ORDER BY "role"`,
+      [discoveryOwner.turnId, discoveryOwner.sessionId, ["analyst", "scout"]],
+    )
+    expect(children.rows.map(child => [child.role, child.status])).toEqual([["analyst", "completed"], ["scout", "completed"]])
+    expect(children.rows.map(child => record(record(child.result)?.structuredResult)?.role)).toEqual(["analyst", "scout"])
+    const dispatches = await pool!.query<{ idempotencyKey: string; publishedAt: Date | null }>(
+      `SELECT "idempotencyKey", "publishedAt" FROM "agent_outbox"
+       WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = ANY($2::text[]) ORDER BY "idempotencyKey"`,
+      [discoveryOwner.sessionId, children.rows.map(child => `subagent-dispatch:${child.id}`)],
+    )
+    expect(dispatches.rows).toHaveLength(2)
+    expect(dispatches.rows.every(dispatch => dispatch.publishedAt instanceof Date)).toBe(true)
+    const waits = await pool!.query<{ id: string; consumedAt: Date | null }>(
+      `SELECT "id", "consumedAt" FROM "agent_wait_conditions" WHERE "turnId" = $1 AND "sessionId" = $2 ORDER BY "createdAt"`,
+      [discoveryOwner.turnId, discoveryOwner.sessionId],
+    )
+    expect(waits.rows).toHaveLength(2)
+    expect(waits.rows.every(wait => wait.consumedAt instanceof Date)).toBe(true)
+    const final = await pool!.query<{ finalResponse: string | null }>(`SELECT "finalResponse" FROM "agent_turns" WHERE "id" = $1`, [discoveryOwner.turnId])
+    const finalResponse = JSON.parse(final.rows[0]?.finalResponse ?? "null") as RecordValue
+    expect(finalResponse.response).toContain('"jobId":"' + jobId + '"')
+  }, 90_000)
+
+  it("fails an interactive shortlist when its Scout prerequisite fails and cancels dependent work", async () => {
+    const [workerQueue, canonical, commandPortModule, subagentQueue] = await Promise.all([
+      import("../../queue/production-bootstrap.js"),
+      import("../canonical-turn-runtime.js"),
+      import("./pg-task-graph-command-port.js"),
+      import("../../queue/subagent-queue.js"),
+    ])
+    const { createProductionChildExecutor } = await import("./production-child-runtime.js")
+    const { createTurnQueue, enqueueTurn, TURN_QUEUE_NAME } = await import("../turns/turn-queue.js")
+    turnQueueName = TURN_QUEUE_NAME
+    childQueueName = subagentQueue.SUBAGENT_QUEUE_NAME
+    const value = discoveryFailureOwner
+    await activateFixtureTurn(pool!, value)
+    const jobId = `p3-discovery-failure-job-${value.suffix}`
+    await pool!.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4`, [
+      value.turnId,
+      JSON.stringify({ goal: "Find and rank an engineering role in Dublin", intent: { kind: "interactive_discovery_shortlist", version: 1 } }),
+      value.sessionId, value.userId,
+    ])
+    await pool!.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "location", "status", "url", "description", "source", "updatedAt")
+      VALUES ($1, $2, 'Failure Fixture Labs', 'Software Engineer', 'Dublin', 'saved', 'https://jobs.example.invalid/discovery-failure', 'Build durable services', 'greenhouse', CURRENT_TIMESTAMP)`, [
+      jobId, value.userId,
+    ])
+
+    const flags: ProductionAgentFlags = {
+      taskGraphPlanningEnabled: true, childExecutionEnabled: true, coordinationEnabled: true,
+      consumeWaitOutcomes: true, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false,
+    }
+    const profile = {
+      provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true,
+      continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false,
+      supportsReasoningSummary: false, supportsResponseContinuation: false, supportsProviderConversation: false,
+      supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low" as const,
+    }
+    let rootExecution = 0
+    let optimisticFinalAttempted = false
+    const rootRuntime = await canonical.createCanonicalTurnRuntime(pool!, {
+      workerId: value.ownerId, productionFlags: flags,
+      taskGraphCommandPort: commandPortModule.createPgTaskGraphCommandPort(pool!),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => {
+        const execution = ++rootExecution
+        let round = 0
+        const adapter: ModelAdapter = {
+          id: "p3-interactive-discovery-dependency-failure-root-fixture", profile,
+          async *stream(request) {
+            round += 1
+            if (execution === 1 && round === 1) {
+              yield { type: "tool_call_completed", callId: "p3-discovery-failure-plan", name: "agent.plan", arguments: {
+                expectedRevision: 0,
+                nodes: [
+                  { key: "scout", templateId: "scout", goal: "Find matching fixture roles", successCriteria: ["Read one owner job"], dependsOn: [] },
+                  { key: "analyst", templateId: "analyst", goal: "Score the discovered fixture role", successCriteria: ["Return an evidence-bound score"], dependsOn: ["scout"] },
+                ],
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if (execution === 1 && round === 2) {
+              const taskIds = planTaskIds(request, "p3-discovery-failure-plan")
+              yield { type: "tool_call_completed", callId: "p3-discovery-failure-wait", name: "agent.wait", arguments: {
+                idempotencyKey: `p3-discovery-failure-wait:${value.turnId}`, taskIds, mode: "all", timeoutMs: 20_000,
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if ((execution === 2 && round === 1) || (execution === 1 && round === 3)) {
+              const graph = currentGraphFromRequest(request)
+              const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+              const graphStates = nodes.map(node => `${String(node?.key)}:${String(node?.status)}`).sort()
+              expect(graphStates).toEqual(["analyst:cancelled", "scout:failed"])
+              const outcome = waitOutcomeFromRequest(request, 2)
+              expect(outcome.status).toBe("ready")
+              const tasks = outcome.tasks.map(record)
+              const taskStates = tasks.map(task => `${String(task?.role)}:${String(task?.status)}`).sort()
+              expect(taskStates).toEqual(["analyst:cancelled", "scout:failed"])
+              const failedScout = tasks.find(task => task?.role === "scout")
+              expect(typeof failedScout?.failureReason).toBe("string")
+              expect(String(failedScout?.failureReason).length).toBeGreaterThan(0)
+              optimisticFinalAttempted = true
+              yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: `Shortlist ready: ${jobId}` }) }
+              yield { type: "completed", finishReason: "stop" }
+              return
+            }
+            throw new Error(`Unexpected discovery failure root model turn ${execution}/${round}`)
+          },
+        }
+        return { adapter, registry: {} as never, candidates: [] }
+      },
+    })
+    const childExecutor = createProductionChildExecutor({
+      pool: pool!, authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: ({ task }) => {
+        if (task.role !== "scout") throw new Error(`Dependent discovery role executed unexpectedly: ${task.role}`)
+        let round = 0
+        const adapter: ModelAdapter = {
+          id: "p3-interactive-discovery-invalid-scout-fixture", profile,
+          async *stream(request) {
+            round += 1
+            if (round === 1) {
+              expect(request.tools.map(tool => record(tool)?.name)).toContain("jobs.search")
+              yield { type: "tool_call_completed", callId: "p3-discovery-failure-read", name: "jobs.search", arguments: { target: "Software Engineer", location: "Dublin", limit: 10 } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            const searchResult = record(latestToolResult(request, "p3-discovery-failure-read"))
+            const observedJobIds = Array.isArray(searchResult?.jobs)
+              ? searchResult.jobs.map(record).flatMap(job => typeof job?.id === "string" ? [job.id] : [])
+              : []
+            expect(observedJobIds).toContain(jobId)
+            await waitForPersistedTaskWait(pool!, value.turnId, `p3-discovery-failure-wait:${value.turnId}`)
+            // Exercise the production structured-result validator with a deterministic invalid Scout receipt.
+            yield { type: "text_delta", text: "{}" }
+            yield { type: "completed", finishReason: "stop" }
+          },
+        }
+        return adapter
+      },
+    })
+    bootstrap = await workerQueue.createProductionWorkerBootstrap({
+      pool: pool!, runtime: rootRuntime, ownerId: value.ownerId,
+      turnQueueFactory: createTurnQueue, turnRecoveryIntervalMs: 100,
+      waitResolver: { intervalMs: 10, batchSize: 10, ownerId: `p3-discovery-failure-wait-resolver-${value.suffix}` },
+      subagents: { execute: childExecutor, intervalMs: 10 },
+    })
+
+    await enqueueTurn(pool!, bootstrap.turns.queue, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
+    await waitForTurnStatus(pool!, value.turnId, "failed", 50_000, "p3-discovery-failure-wait", [
+      "p3-discovery-failure-plan",
+    ])
+
+    const turn = await pool!.query<{ status: string; finalResponse: string | null }>(
+      `SELECT "status", "finalResponse" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+      [value.turnId, value.sessionId, value.userId],
+    )
+    expect(turn.rows[0]?.status).toBe("failed")
+    expect(optimisticFinalAttempted).toBe(true)
+    expect(turn.rows[0]?.finalResponse ?? "").not.toContain(jobId)
+
+    const root = await pool!.query<{ id: string; status: string; failureReason: string | null; result: unknown }>(
+      `SELECT "id", "status", "failureReason", "result" FROM "sub_agent_tasks"
+       WHERE "turnId" = $1 AND "sessionId" = $2 AND "role" = 'orchestrator'`, [value.turnId, value.sessionId],
+    )
+    expect(root.rows).toHaveLength(1)
+    expect(root.rows[0]).toMatchObject({ status: "failed", failureReason: "business_precondition_failed" })
+    expect(record(root.rows[0]?.result)?.status).toBe("failed")
+    expect(record(record(root.rows[0]?.result)?.structuredResult)?.interactiveDiscoveryShortlist).toEqual({
+      schemaVersion: 1, status: "failed", items: [], failures: ["scout_task_failed", "analyst_task_failed"],
+    })
+    const rejection = await pool!.query<{ payload: unknown }>(
+      `SELECT "payload" FROM "agent_events" WHERE "turnId" = $1 AND "sessionId" = $2 AND "type" = 'final.rejected'
+       ORDER BY "sequence" DESC LIMIT 1`, [value.turnId, value.sessionId],
+    )
+    expect(record(rejection.rows[0]?.payload)).toMatchObject({ blocker: "interactive_discovery_shortlist_required" })
+    const children = await pool!.query<{ id: string; role: string; status: string; failureReason: string | null }>(
+      `SELECT "id", "role", "status", "failureReason" FROM "sub_agent_tasks"
+       WHERE "turnId" = $1 AND "sessionId" = $2 AND "parentTaskId" = $3 ORDER BY "role"`,
+      [value.turnId, value.sessionId, root.rows[0]!.id],
+    )
+    expect(children.rows.map(child => [child.role, child.status])).toEqual([["analyst", "cancelled"], ["scout", "failed"]])
+    expect(children.rows.find(child => child.role === "scout")?.failureReason).toBe("invalid_structured_result")
+    expect(children.rows.find(child => child.role === "analyst")?.failureReason).toContain("prerequisite")
+    const dependentDispatches = await pool!.query(
+      `SELECT "id" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch'
+       AND "idempotencyKey" = $2`, [value.sessionId, `subagent-dispatch:${children.rows.find(child => child.role === "analyst")?.id}`],
+    )
+    expect(dependentDispatches.rowCount).toBe(0)
+    const wait = await pool!.query<{ status: string; consumedAt: Date | null }>(
+      `SELECT "status", "consumedAt" FROM "agent_wait_conditions" WHERE "turnId" = $1 AND "sessionId" = $2`,
+      [value.turnId, value.sessionId],
+    )
+    expect(wait.rows).toHaveLength(1)
+    expect(wait.rows[0]).toMatchObject({ status: "ready", consumedAt: expect.any(Date) })
   }, 90_000)
 
   it("stops an exact TaskGraph Turn, projects interrupted receipts, and removes every unpublished graph dispatch", async () => {

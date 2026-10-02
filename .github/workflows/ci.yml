@@ -111,18 +111,32 @@ jobs:
           test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
           test -n "$AGENT_RUNTIME_PG_TEST_URL"
           pnpm --filter @jobcopilot/worker exec vitest run src/runtime/subagents/pg-task-graph-command-port.integration.test.ts
+      - name: Verify interactive discovery Stop recovery without subagent execution
+        env:
+          CI: "true"
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+        run: |
+          test "$CI" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          pnpm --filter @jobcopilot/worker exec vitest run src/runtime/subagents/interactive-discovery-stop-pg.integration.test.ts
       - name: Verify TaskGraph proposal, dependency promotion, and parent resume on disposable PostgreSQL/Redis
         env:
           AGENT_TURN_REDIS_TEST_URL: redis://127.0.0.1:6379/15
           AGENT_TURN_REDIS_TEST_DISPOSABLE: "true"
           REDIS_URL: redis://127.0.0.1:6379/15
           AGENT_PLAN_LEDGER_TRACE_ARTIFACT_PATH: ${{ runner.temp }}/task-graph-plan-ledger.json
+          AGENT_INTERACTIVE_DISCOVERY_TRACE_ARTIFACT_PATH: ${{ runner.temp }}/interactive-discovery-trace.json
         run: pnpm --filter @jobcopilot/worker exec vitest run src/runtime/subagents/task-graph-resume-pg.integration.test.ts
       - name: Install Chromium for the persisted Plan Ledger browser fixture
         run: pnpm exec playwright install --with-deps chromium
       - name: Verify the Workbench consumes the persisted Worker Plan Ledger trace
         env:
           AGENT_PLAN_LEDGER_TRACE_ARTIFACT_PATH: ${{ runner.temp }}/task-graph-plan-ledger.json
+          AGENT_INTERACTIVE_DISCOVERY_TRACE_ARTIFACT_PATH: ${{ runner.temp }}/interactive-discovery-trace.json
         run: pnpm exec playwright test e2e/agent-task-graph-plan.spec.ts
       - name: Verify production Turn dispatch on disposable Redis/BullMQ
         env:

@@ -24,6 +24,14 @@ import type {
   SteerCommand,
 } from "./types"
 
+function activeTurnHasIntent(input: unknown, expected: NonNullable<StartCommand["intent"]>): boolean {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return false
+  const intent = (input as Record<string, unknown>).intent
+  return Boolean(intent && typeof intent === "object" && !Array.isArray(intent) &&
+    (intent as Record<string, unknown>).kind === expected.kind &&
+    (intent as Record<string, unknown>).version === expected.version)
+}
+
 async function duplicateCommandResult(
   tx: CommandTransaction,
   command: { sessionId: string; clientMessageId: string },
@@ -109,8 +117,11 @@ export class AgentCommandService {
       if (existing) return duplicateCommandResult(tx, command, existing, "follow_up")
 
       const existingActive = await findActiveTurn(tx, command.sessionId, command.userId)
+      if (command.intent && existingActive && !activeTurnHasIntent(existingActive.input, command.intent)) {
+        throw new AgentCommandError("turn_intent_mismatch", "The active Turn has a different server-owned intent", 409, { turnId: existingActive.id })
+      }
       const created = !existingActive
-      const active = existingActive ?? await createRootTurn(tx, command, command.content)
+      const active = existingActive ?? await createRootTurn(tx, command, command.content, undefined, undefined, command.intent)
       const disposition: CommandDisposition = created ? "started" : "queued_follow_up"
       return acceptInputFacts(tx, command, command.content, active, "follow_up", disposition, disposition === "started")
         .then((facts) => ({ ...facts, disposition }))
@@ -179,7 +190,7 @@ export class AgentCommandService {
       if (active) throw retryActiveConflict(active.id)
       const persisted = parsePersistedRetryContent(target.id, target.input)
 
-      const created = await createRootTurn(tx, command, persisted.content, persisted.goal, persisted.selectedJobPreparation)
+      const created = await createRootTurn(tx, command, persisted.content, persisted.goal, persisted.selectedJobPreparation, persisted.intent)
       const facts = await acceptInputFacts(tx, command, persisted.content, created, "follow_up", "started", true)
       return { ...facts, disposition: "started" as const }
     })

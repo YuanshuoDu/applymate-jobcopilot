@@ -21,6 +21,8 @@ export type CanonicalTurnState = {
   readonly budgetSnapshot: unknown
   readonly rootTaskId?: string
   readonly rootInputId?: string
+  /** Exact server-owned interactive-discovery intent restored from the Turn envelope. */
+  readonly intent?: CanonicalTurnIntent
   /** Loaded Turns always provide this; optional for existing injected stateLoader fixtures. */
   readonly contextSnapshotPinned?: boolean
   readonly snapshot: StepContextSnapshot
@@ -31,12 +33,13 @@ export type CanonicalTurnState = {
   readonly resume?: TurnResumeState
 }
 
-type Row = Record<string, unknown>
+export type CanonicalTurnIntent = Readonly<{ kind: "interactive_discovery_shortlist"; version: 1 }>
+export const INTERACTIVE_DISCOVERY_INTENT: CanonicalTurnIntent = Object.freeze({ kind: "interactive_discovery_shortlist", version: 1 })
 
+type Row = Record<string, unknown>
 function object(value: unknown): Row {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Row : {}
 }
-
 function json(value: unknown): RepositoryJsonValue {
   if (value === null || typeof value === "string" || typeof value === "boolean") return value
   if (typeof value === "number" && Number.isFinite(value)) return value
@@ -59,7 +62,6 @@ function snapshotFromContent(value: unknown, scope: TenantScope, sessionId: stri
 }
 
 function eventPayload(value: unknown): Row { const payload = object(value); return object(payload.payload ?? payload) }
-
 function turnGoal(value: unknown): string {
   const root = object(value)
   const input = object(root.input)
@@ -67,6 +69,17 @@ function turnGoal(value: unknown): string {
   const goal = source.goal ?? source.content
   if (typeof goal !== "string" || !goal.trim()) throw new Error("turn_goal_missing")
   return goal.trim()
+}
+
+function turnIntent(value: unknown): CanonicalTurnIntent | undefined {
+  const root = object(value)
+  const input = object(root.input)
+  const source = Object.keys(input).length > 0 ? input : root
+  const intent = object(source.intent)
+  if (Object.keys(intent).sort().join(",") !== "kind,version"
+    || intent.kind !== INTERACTIVE_DISCOVERY_INTENT.kind
+    || intent.version !== INTERACTIVE_DISCOVERY_INTENT.version) return undefined
+  return INTERACTIVE_DISCOVERY_INTENT
 }
 
 function cognitiveAgendaReceipt(events: readonly Row[], lease: TurnLease, rootTaskId: unknown): CognitiveAgendaReceipt | undefined {
@@ -223,8 +236,10 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
       usage,
     } satisfies TurnResumeState : undefined
     validateAgendaResumeFence(restoredAgenda, steps)
+    const intent = turnIntent(turn.input)
     const result = {
       scope, goal, modelProfileSnapshot: json(turn.modelProfileSnapshot), toolPolicySnapshot: turn.toolPolicySnapshot ?? {}, budgetSnapshot: turn.budgetSnapshot ?? {},
+      ...(intent ? { intent } : {}),
       contextSnapshotPinned: turn.contextSnapshotId !== null && turn.contextSnapshotId !== undefined,
       steeringMarkers, ...(restoredAgenda ? { cognitiveAgendaReceipt: restoredAgenda } : {}), ...(restored.pending.length ? { pendingToolCalls: restored.pending } : {}), ...(rootTaskId ? { rootTaskId } : {}),
       ...(rootInput.rows[0] ? { rootInputId: rootInput.rows[0].id } : {}), snapshot, ...(resume ? { resume } : {}),
