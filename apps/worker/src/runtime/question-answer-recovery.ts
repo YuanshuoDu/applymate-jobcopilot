@@ -50,12 +50,20 @@ function assertItemFence(item: Row, input: RecoveryInput): void {
     || (item.taskId !== null && item.taskId !== input.rootTaskId)) throw new Error("question_recovery_item_scope_invalid")
 }
 
-function assertStepLineage(item: Row, content: Row, input: RecoveryInput): void {
-  const taskId = item.taskId ?? null
+function requireQuestionToolCall(item: Row, content: Row, rootTaskId: string | null): string {
+  const callId = text(content.toolCallId)
+  if (!callId) throw new Error("question_recovery_tool_lineage_invalid")
+  if (item.taskId == null && !text(rootTaskId)) throw new Error("question_recovery_tool_lineage_invalid")
+  return callId
+}
+
+function assertStepLineage(item: Row, callId: string, input: RecoveryInput): void {
+  // Broker wait rows stay turn-scoped; use the root task only when resolving
+  // their tool-call lineage to worker-owned records.
+  const taskId = item.taskId ?? input.rootTaskId ?? null
   const stepsFor = (id: string) => input.steps.filter(step => text(step.id) === id)
   const callMatchesTask = (call: Row) => (call.taskId ?? null) === taskId
   const direct = text(item.stepId)
-  const callId = text(content.toolCallId)
   if (direct) {
     const directSteps = stepsFor(direct)
     if (directSteps.length !== 1 || (directSteps[0].taskId ?? null) !== taskId) throw new Error("question_recovery_step_invalid")
@@ -69,10 +77,14 @@ function assertStepLineage(item: Row, content: Row, input: RecoveryInput): void 
   if (!callId) throw new Error("question_recovery_step_missing")
   const calls = input.toolItems.filter(candidate => candidate.type === "tool_call"
     && record(candidate.content).toolCallId === callId)
-  const callSteps = calls.length === 1 ? stepsFor(text(calls[0].stepId) ?? "") : []
-  if (calls.length !== 1 || !callMatchesTask(calls[0]) || callSteps.length !== 1 || (callSteps[0].taskId ?? null) !== taskId) {
+  if (calls.length !== 1 || !callMatchesTask(calls[0])) {
     throw new Error("question_recovery_tool_lineage_invalid")
   }
+  const callStepId = text(calls[0].stepId)
+  if (!callStepId) throw new Error("question_recovery_step_missing")
+  const callSteps = stepsFor(callStepId)
+  if (callSteps.length !== 1) throw new Error("question_recovery_step_missing")
+  if ((callSteps[0].taskId ?? null) !== taskId) throw new Error("question_recovery_tool_lineage_invalid")
 }
 
 function validOptions(value: unknown): boolean {
@@ -160,6 +172,13 @@ export async function recoverAnsweredQuestionHistory(
     return id
   }).filter((id): id is string => id !== null)
   if (itemIds.length === 0) return []
+  for (const item of questions) {
+    const content = record(item.content)
+    if (claimsPersistedAnswer(item, content)) {
+      assertItemFence(item, input)
+      requireQuestionToolCall(item, content, rootTaskId)
+    }
+  }
   const events = await client.query<Row>(
     `SELECT event."id", event."sessionId", event."turnId", event."taskId", event."itemId", event."actor", event."sequence",
             event."type", event."correlationId", event."causationId", event."payload",
@@ -188,12 +207,13 @@ export async function recoverAnsweredQuestionHistory(
     assertItemFence(item, input)
     const content = record(item.content)
     const questionId = text(content.questionId)
+    const callId = requireQuestionToolCall(item, content, rootTaskId)
     const itemEvents = events.rows.filter(event => event.itemId === item.id)
     if (item.status !== "completed" || content.waitKind !== "question" || content.answerAvailable !== true || !questionId || !text(content.question)
       || !validOptions(content.options) || !text(content.answer) || allByQuestion.get(questionId) !== 1) {
       throw new Error("question_recovery_item_malformed")
     }
-    assertStepLineage(item, content, input)
+    assertStepLineage(item, callId, input)
     const answers = itemEvents.filter(event => event.type === "question.answered")
     if (answers.length !== 1) throw new Error("question_recovery_answer_event_ambiguous")
     const starts = itemEvents.filter(event => event.type === "item.started")
@@ -203,7 +223,6 @@ export async function recoverAnsweredQuestionHistory(
         || event.turnId !== lease.turnId || event.taskId !== item.taskId
         || (event.taskId !== null && event.taskId !== rootTaskId)) throw new Error("question_recovery_event_scope_invalid")
     }
-    const callId = text(content.toolCallId)
     const startedAt = validateStart(starts[0], item, questionId, callId)
     const answeredAt = validateAnswer(answers[0], item, questionId, callId, lease)
     if (answeredAt <= startedAt) throw new Error("question_recovery_sequence_invalid")

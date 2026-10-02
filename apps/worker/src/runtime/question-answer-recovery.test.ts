@@ -22,13 +22,16 @@ function events(startPatch: Record<string, unknown> = {}, answerPatch: Record<st
       payload: { waitKind: "question", waitId: "wait-1", itemId: "question-item", turnId: "turn-1", toolCallId: "call-1", status: "answered", answerAvailable: "[REDACTED]" }, ...answerPatch },
   ]
 }
-function client(itemRows: Record<string, unknown>[] = [item()], eventRows: Record<string, unknown>[] = events()) {
-  const value = { query: async (sql: string) => ({ rows: sql.includes('FROM "agent_items"') ? itemRows : eventRows }) }
+function client(itemRows: Record<string, unknown>[] = [item()], eventRows: Record<string, unknown>[] = events(), queryLog: string[] = []) {
+  const value = { query: async (sql: string) => {
+    queryLog.push(sql)
+    return { rows: sql.includes('FROM "agent_items"') ? itemRows : eventRows }
+  } }
   return value as never
 }
 function input(patch: Record<string, unknown> = {}) {
-  return { lease, rootTaskId: "root-1", steps: [{ id: "step-1" }],
-    toolItems: [{ id: "call-item", stepId: "step-1", type: "tool_call", content: { toolCallId: "call-1" } }],
+  return { lease, rootTaskId: "root-1", steps: [{ id: "step-1", taskId: "root-1" }],
+    toolItems: [{ id: "call-item", stepId: "step-1", taskId: "root-1", type: "tool_call", content: { toolCallId: "call-1" } }],
     existingHistory: [], ...patch } as never
 }
 
@@ -90,11 +93,53 @@ describe("recoverAnsweredQuestionHistory", () => {
       steps: [{ id: "step-1", taskId: "root-1" }],
       toolItems: [{ id: "call-item", stepId: "step-1", taskId: "root-1", type: "tool_call", content: { toolCallId: "call-1" } }],
     }))).resolves.toHaveLength(2)
-    await expect(recoverAnsweredQuestionHistory(client([item({ stepId: "step-1" })]), input({ steps: [{ id: "step-1", taskId: "root-1" }] })))
-      .rejects.toThrow("question_recovery_step_invalid")
+    await expect(recoverAnsweredQuestionHistory(client([item({ stepId: "step-1" })]), input()))
+      .resolves.toHaveLength(2)
     await expect(recoverAnsweredQuestionHistory(client(), input({
-      toolItems: [{ id: "call-item", stepId: "step-1", taskId: "root-1", type: "tool_call", content: { toolCallId: "call-1" } }],
+      toolItems: [{ id: "call-item", stepId: "other-step", taskId: "root-1", type: "tool_call", content: { toolCallId: "call-1" } }],
+    }))).rejects.toThrow("question_recovery_step_missing")
+  })
+
+  it("attaches a turn-scoped null-task wait only to the unique matching root-task call and step", async () => {
+    const directQuestion = item({ stepId: "step-1" })
+    const matchingCall = { id: "call-item", stepId: "step-1", taskId: "root-1", type: "tool_call", content: { toolCallId: "call-1" } }
+    await expect(recoverAnsweredQuestionHistory(client([directQuestion]), input())).resolves.toHaveLength(2)
+    await expect(recoverAnsweredQuestionHistory(client([directQuestion]), input({
+      toolItems: [{ ...matchingCall, taskId: "foreign-root" }],
     }))).rejects.toThrow("question_recovery_tool_lineage_invalid")
+    await expect(recoverAnsweredQuestionHistory(client([directQuestion]), input({
+      toolItems: [{ ...matchingCall, stepId: "other-step" }],
+    }))).rejects.toThrow("question_recovery_tool_lineage_invalid")
+    await expect(recoverAnsweredQuestionHistory(client([directQuestion]), input({
+      steps: [{ id: "step-1", taskId: "foreign-root" }],
+    }))).rejects.toThrow("question_recovery_step_invalid")
+    await expect(recoverAnsweredQuestionHistory(client([directQuestion]), input({
+      toolItems: [matchingCall, { ...matchingCall, id: "duplicate-call-item" }],
+    }))).rejects.toThrow("question_recovery_tool_lineage_invalid")
+    await expect(recoverAnsweredQuestionHistory(client([directQuestion]), input({ steps: [] })))
+      .rejects.toThrow("question_recovery_step_invalid")
+    await expect(recoverAnsweredQuestionHistory(client([directQuestion]), input({ toolItems: [] })))
+      .rejects.toThrow("question_recovery_tool_lineage_invalid")
+  })
+
+  it("rejects a task-root direct-step question without a tool-call ID before reading events", async () => {
+    const queryLog: string[] = []
+    const missingCall = item({ taskId: "root-1", stepId: "step-1", content: { ...item().content as object, toolCallId: null } })
+    await expect(recoverAnsweredQuestionHistory(client([missingCall], events(), queryLog), input()))
+      .rejects.toThrow("question_recovery_tool_lineage_invalid")
+    expect(queryLog).toHaveLength(1)
+    expect(queryLog[0]).toContain('FROM "agent_items"')
+  })
+
+  it("rejects null-task tool lineage when the canonical root task is missing", async () => {
+    const queryLog: string[] = []
+    const nullTaskCall = { id: "call-item", stepId: "step-1", taskId: null, type: "tool_call", content: { toolCallId: "call-1" } }
+    await expect(recoverAnsweredQuestionHistory(client([item()], events(), queryLog), input({
+      rootTaskId: null,
+      steps: [{ id: "step-1", taskId: null }],
+      toolItems: [nullTaskCall],
+    }))).rejects.toThrow("question_recovery_tool_lineage_invalid")
+    expect(queryLog).toHaveLength(1)
   })
 
   it("adds only the missing answer when the matching question is already in snapshot history", async () => {
@@ -189,6 +234,9 @@ describe("recoverAnsweredQuestionHistory", () => {
       { type: "tool_call", stepId: "step-1", content: { toolCallId: "call-1" } },
       { type: "tool_call", stepId: "step-1", content: { toolCallId: "call-1" } },
     ] }))).rejects.toThrow("question_recovery_tool_lineage_invalid")
+    await expect(recoverAnsweredQuestionHistory(client(), input({ steps: [], toolItems: [
+      { type: "tool_call", stepId: null, taskId: "root-1", content: { toolCallId: "call-1" } },
+    ] }))).rejects.toThrow("question_recovery_step_missing")
   })
 
   it("fails closed for a conflicting stable ID or an answer-only snapshot entry", async () => {

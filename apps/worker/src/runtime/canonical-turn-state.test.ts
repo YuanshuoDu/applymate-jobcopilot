@@ -65,19 +65,20 @@ function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unk
 describe("loadCanonicalTurnState", () => {
   it("projects a fenced answered question once into recovered steer history", async () => {
     const question = { id: "question-item", type: "question", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null,
-      stepId: "step-1", status: "completed", content: { waitKind: "question", questionId: "question-1", toolCallId: null, question: "Continue?", options: [{ label: "Yes", value: "yes" }], answer: "yes", answerAvailable: true } }
+      stepId: null, status: "completed", content: { waitKind: "question", questionId: "question-1", toolCallId: "question-call-1", question: "Continue?", options: [{ label: "Yes", value: "yes" }], answer: "yes", answerAvailable: true } }
     const events = [
       { id: "started", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null, itemId: "question-item",
         type: "item.started", actor: "orchestrator", sequence: "10", correlationId: "question-item", causationId: "question-1",
-        payload: { itemId: "question-item", waitKind: "question", questionId: "question-1", toolCallId: null } },
+        payload: { itemId: "question-item", waitKind: "question", questionId: "[REDACTED]", toolCallId: "question-call-1" } },
       { id: "answered", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null, itemId: "question-item",
         type: "question.answered", actor: "user", sequence: "11", correlationId: "question-1", causationId: "question-item",
-        payload: { waitKind: "question", waitId: "question-1", itemId: "question-item", turnId: "turn-1", toolCallId: null, status: "answered", answerAvailable: true } },
+        payload: { waitKind: "question", waitId: "question-1", itemId: "question-item", turnId: "turn-1", toolCallId: "question-call-1", status: "answered", answerAvailable: "[REDACTED]" } },
     ]
     const fake = pool({
       turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
-      steps: [{ id: "step-1", taskId: null, ordinal: 0, inputThroughSequence: "0", consumedInputIds: [], inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }],
-      items: [],
+      steps: [{ id: "step-1", taskId: "root-1", ordinal: 0, inputThroughSequence: "0", consumedInputIds: [], inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }],
+      items: [{ id: "tool-call-item", sessionId: "session-1", turnId: "turn-1", taskId: "root-1", stepId: "step-1", type: "tool_call", status: "started", revision: 0,
+        content: { toolCallId: "question-call-1", toolName: "jobs.search", input: { query: "engineer" }, status: "completed" } }],
       questionItems: [question], questionEvents: events,
     })
     const value = await loadCanonicalTurnState(fake, lease)
