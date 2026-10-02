@@ -291,7 +291,7 @@ describeWithDisposablePostgres("interactive discovery Stop recovery without suba
         `agent-root-stop:${rootTaskId}:attempt:1:task.interrupted`])
       const lifecycleOutbox = await db.query<{ id: string; topic: string; aggregateId: string; idempotencyKey: string; payload: Record<string, unknown> }>(`SELECT "id", "topic", "aggregateId", "idempotencyKey", "payload"
         FROM "agent_outbox" WHERE "topic" = 'agent.session.event' AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [
-        value.sessionId, `agent-event-agent-root-stop-${rootTaskId}-attempt-1`,
+        value.sessionId, `agent-event:agent-root-stop-${rootTaskId}-attempt-1`,
       ])
       const finalItems = await db.query<{ count: number }>(`SELECT COUNT(*)::int AS "count" FROM "agent_items"
         WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "type" = 'agent_message' AND "phase" = 'final_answer'`, [value.sessionId, value.turnId, rootTaskId])
@@ -308,7 +308,7 @@ describeWithDisposablePostgres("interactive discovery Stop recovery without suba
       expect(lifecycleOutbox.rowCount).toBe(1)
       expect(lifecycleOutbox.rows[0]).toMatchObject({
         topic: "agent.session.event", aggregateId: value.sessionId,
-        idempotencyKey: `agent-event-agent-root-stop-${rootTaskId}-attempt-1`,
+        idempotencyKey: `agent-event:agent-root-stop-${rootTaskId}-attempt-1`,
         payload: {
           eventId: `agent-root-stop-${rootTaskId}-attempt-1`, sessionId: value.sessionId,
           turnId: value.turnId, itemId: null, taskId: rootTaskId, type: "task.interrupted",
