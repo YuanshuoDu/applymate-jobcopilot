@@ -81,6 +81,15 @@ export function rootToolNames(definitions: readonly unknown[]): string[] {
   return definitions.flatMap(value => typeof object(value).name === "string" ? [object(value).name as string] : [])
 }
 
+export function rootTaskAllowedActions(
+  rootTools: readonly unknown[],
+  templates: Readonly<Record<string, { readonly allowedActions: readonly string[] }>> | undefined,
+  taskGraphPlanningEnabled: boolean,
+): string[] {
+  const templateActions = taskGraphPlanningEnabled ? Object.values(templates ?? {}).flatMap(template => template.allowedActions) : []
+  return [...new Set([...rootToolNames(rootTools), ...templateActions])]
+}
+
 export function failedInteractiveDiscoveryShortlist(code: "discovery_runtime_unavailable" | "discovery_runtime_failed"): InteractiveDiscoveryShortlistProjection {
   return { schemaVersion: 1, status: "failed", items: [], failures: [code] }
 }

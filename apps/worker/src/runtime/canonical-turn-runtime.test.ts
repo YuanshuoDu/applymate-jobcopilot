@@ -845,15 +845,15 @@ describe("createCanonicalTurnRuntime", () => {
     const genericCoordination = [...selectedJobDenied, "agent.wait"]
     const retained = ["agent.plan", "agent.wait", "agent.list", "list_subagents"]
     const genericReads = ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"]
+    const selectedTemplateActions = ["jobs.get", "persona.retrieve", "resume.get_base", "cover_letter.draft", "artifact.version.read", "artifact.review"]
     const selected = await taskGraphRootSurface(true)
     const generic = await taskGraphRootSurface(false)
 
     expect(selected.toolNames).not.toEqual(expect.arrayContaining(selectedJobDenied))
     expect(selected.allowedActions).not.toEqual(expect.arrayContaining(selectedJobDenied))
     expect(selected.toolNames).not.toEqual(expect.arrayContaining(genericReads))
-    expect(selected.allowedActions).not.toEqual(expect.arrayContaining(genericReads))
-    expect(selected.toolNames).toEqual(expect.arrayContaining(retained))
-    expect(selected.allowedActions).toEqual(expect.arrayContaining(retained))
+    expect(selected.toolNames.slice().sort()).toEqual([...retained].sort())
+    expect(selected.allowedActions.slice().sort()).toEqual([...retained, ...selectedTemplateActions].sort())
     expect(selected.route).not.toHaveBeenCalled()
     expect(JSON.stringify(selected.events)).not.toContain("forged-call")
     expect(JSON.stringify(selected.events)).not.toContain("PRIVATE_SOURCE_SENTINEL")
@@ -881,10 +881,11 @@ describe("createCanonicalTurnRuntime", () => {
   it("activates discovery restrictions only for the trusted intent and persists a failed root marker without a validated shortlist", async () => {
     const discovery = await taskGraphRootSurface(false, false, "jobs.get", "jobs.get", true)
     const safeRootTools = ["agent.plan", "agent.wait", "agent.list", "list_subagents"]
-    expect(discovery.toolNames).toEqual(expect.arrayContaining(safeRootTools))
-    expect(discovery.toolNames).not.toEqual(expect.arrayContaining(["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base", "agent.spawn", "agent.send", "agent.interrupt", "agent.close", "writer", "reviewer"]))
-    expect(discovery.allowedActions).toEqual(expect.arrayContaining(safeRootTools))
-    expect(discovery.allowedActions).not.toEqual(expect.arrayContaining(["jobs.search", "jobs.get", "cover_letter.draft", "artifact.review"]))
+    const discoveryTemplateActions = ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"]
+    expect(discovery.toolNames.slice().sort()).toEqual([...safeRootTools].sort())
+    expect(discovery.toolNames).not.toEqual(expect.arrayContaining([...discoveryTemplateActions, "agent.spawn", "agent.send", "agent.interrupt", "agent.close", "writer", "reviewer"]))
+    expect(discovery.allowedActions.slice().sort()).toEqual([...safeRootTools, ...discoveryTemplateActions].sort())
+    expect(discovery.allowedActions).not.toEqual(expect.arrayContaining(["cover_letter.draft", "artifact.review"]))
     expect(JSON.stringify(discovery.requests[0]?.tools.find(tool => tool && typeof tool === "object" && "name" in tool && tool.name === "agent.plan"))).toContain("analyst")
     expect(JSON.stringify(discovery.requests[0]?.tools.find(tool => tool && typeof tool === "object" && "name" in tool && tool.name === "agent.plan"))).not.toContain("writer")
     expect(discovery.route).not.toHaveBeenCalled()

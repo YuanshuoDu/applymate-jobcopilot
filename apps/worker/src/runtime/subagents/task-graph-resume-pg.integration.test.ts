@@ -6123,7 +6123,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let workerOne: ProcessFixtureChild | undefined
     let workerTwo: ProcessFixtureChild | undefined
     try {
-      await activateFixtureTurn(pool!, value)
       await pool!.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4`, [
         value.turnId,
         JSON.stringify({ goal: "Find and rank a software engineering role in Dublin", intent: { kind: "interactive_discovery_shortlist", version: 1 } }),
