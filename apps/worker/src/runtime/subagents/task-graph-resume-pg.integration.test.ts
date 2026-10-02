@@ -293,6 +293,18 @@ const TURN_DIAGNOSTIC_STATUSES = new Set([
 ])
 const ITEM_DIAGNOSTIC_STATUSES = new Set(["started", "completed", "failed", "cancelled"])
 const WAIT_DIAGNOSTIC_STATUSES = new Set(["waiting", "ready", "timed_out", "consumed", "failed", "cancelled", "interrupted", "closed"])
+const TOOL_DIAGNOSTIC_NAMES = new Set(["agent.plan", "agent.wait", "jobs.search"])
+const ERROR_DIAGNOSTIC_CODES = new Set([
+  "final_unverified", "step_limit", "model_incomplete", "persistence_conflict", "invalid_output",
+  "budget_exhausted", "no_progress", "evidence_missing", "evidence_conflict", "business_precondition_failed",
+  "tool_execution_failed", "tool_not_found", "schema_error", "capability_denied", "policy_denied",
+  "policy_version_unknown", "timeout", "cancelled", "tool_result_replay_uncertain", "tool_recovery_aborted",
+  "task_graph_scope_unavailable", "task_graph_continuation_budget_required", "task_graph_proposal_too_large",
+  "task_graph_sensitive_key_rejected", "task_graph_state_missing", "task_graph_receipt_invalid",
+  "task_graph_schedule_failed", "task_graph_dispatch_conflict", "task_graph_dependency_blocked",
+  "task_graph_dependency_task_missing", "task_graph_child_wait_state_failed", "revision_mismatch",
+  "task_graph_revision_mismatch", "revision_limit", "idempotency_conflict",
+])
 const WAIT_HANDOFF_ERROR_CODES = new Set([
   "40P01", "40001", "55P03", "57014", "23505", "23503", "wait_handoff_unavailable",
   "wait_invalid", "wait_scope_error", "lease_lost",
@@ -354,6 +366,7 @@ const PROCESS_FIXTURE_FAILURE_CATEGORIES = new Set([
   "none", "other", "tool_result_missing", "database_deadlock", "database_serialization", "database_lock_wait",
   "coordination_invalid_input", "coordination_task_not_found", "coordination_scope_error",
   "coordination_wait_unavailable", "wait_handoff_state", "turn_lease_state", "generic_tool_execution_failed",
+  "task_graph_failure", "business_precondition_failed", "turn_output_invalid", "turn_budget_exhausted",
 ])
 const PROCESS_FIXTURE_CAUSES = new Set([
   "turn_missing", "model_never_ran", "plan_not_called", "plan_failed_or_incomplete", "graph_shape_mismatch",
@@ -382,6 +395,12 @@ function diagnosticText(value: unknown, maxCharacters = 64): string | null {
 
 function diagnosticEnum(value: unknown, allowed: ReadonlySet<string>): string | null {
   return typeof value === "string" && allowed.has(value) ? value : null
+}
+
+function diagnosticErrorCode(value: unknown): string | null {
+  if (typeof value !== "string") return null
+  if (ERROR_DIAGNOSTIC_CODES.has(value)) return value
+  return /^task_graph_[a-z0-9_]{1,80}$/.test(value) ? "task_graph_other" : "other"
 }
 
 function diagnosticEnumList(value: unknown, allowed: ReadonlySet<string>, maxItems = 8): string[] {
@@ -721,6 +740,12 @@ function compactTurnProgressDiagnostics(progress: string, maxCharacters = 1_600)
   const targetMismatchCounts = record(targetRows?.mismatchCounts)
   const parentMismatchCounts = record(waitLineage?.parentMismatchCounts)
   const toolFailure = record(parsed.diagnosticToolFailure)
+  const toolFailures = Array.isArray(parsed.diagnosticToolFailures)
+    ? parsed.diagnosticToolFailures.map(record).filter((item): item is RecordValue => item !== null)
+    : toolFailure ? [toolFailure] : []
+  const executionFailures = Array.isArray(parsed.executionFailures)
+    ? parsed.executionFailures.map(record).filter((item): item is RecordValue => item !== null)
+    : []
   const fixtureNodeKeysMissingRows = waitLineage?.fixtureNodeKeysMissingRows
   const exactReceiptMatchExists = typeof waitLineage?.exactReceiptMatchExists === "boolean"
     ? waitLineage.exactReceiptMatchExists : null
@@ -733,6 +758,7 @@ function compactTurnProgressDiagnostics(progress: string, maxCharacters = 1_600)
     turn: turn ? {
       status: diagnosticEnum(turn.status, TURN_DIAGNOSTIC_STATUSES),
       errorPresent: turn.error !== null && turn.error !== undefined,
+      errorCode: diagnosticErrorCode(turn.error),
       revision: typeof turn.revision === "number" ? turn.revision : null,
       leaseVersion: typeof turn.leaseVersion === "number" ? turn.leaseVersion : null,
       leaseOwnerPresent: turn.leaseOwnerId !== null,
@@ -747,6 +773,16 @@ function compactTurnProgressDiagnostics(progress: string, maxCharacters = 1_600)
         ? record(tool.truncated)?.truncatedTaskResultCount
         : null,
     } : null,
+    executionFailures: executionFailures.slice(0, 4).map(failure => ({
+      eventType: diagnosticEnum(failure.eventType, new Set(["step.completed", "turn.failed"])),
+      status: diagnosticEnum(failure.status, new Set(["failed", "interrupted"])),
+      errorCode: diagnosticErrorCode(failure.errorCode),
+    })),
+    toolFailures: toolFailures.slice(0, 4).map(failure => ({
+      toolName: diagnosticEnum(failure.toolName, TOOL_DIAGNOSTIC_NAMES),
+      status: diagnosticEnum(failure.status, ITEM_DIAGNOSTIC_STATUSES),
+      errorCode: diagnosticErrorCode(failure.errorCode),
+    })),
     waitLineage: waitLineage ? {
       available: waitLineage.available !== false,
       taskIdsMatchCurrentGraph: typeof waitLineage.taskIdsMatchCurrentGraph === "boolean"
@@ -815,6 +851,7 @@ function compactTurnProgressDiagnostics(progress: string, maxCharacters = 1_600)
     toolFailure: toolFailure ? {
       toolNameIsAgentWait: toolFailure.toolName === "agent.wait",
       status: diagnosticEnum(toolFailure.status, ITEM_DIAGNOSTIC_STATUSES),
+      errorCode: diagnosticErrorCode(toolFailure.errorCode),
       errorCodePresent: typeof toolFailure.errorCode === "string",
       failureDetailPresent: typeof toolFailure.failureDetail === "string",
     } : null,
@@ -823,6 +860,7 @@ function compactTurnProgressDiagnostics(progress: string, maxCharacters = 1_600)
       status: diagnosticEnum(task.status, TASK_DIAGNOSTIC_STATUSES),
       attempts: typeof task.attemptCount === "number" ? task.attemptCount : null,
       failureReasonPresent: typeof task.failureReason === "string",
+      failureReasonCode: diagnosticErrorCode(task.failureReason),
     })),
     waits: waits.slice(0, 6).map(wait => ({
       keyPresent: typeof wait.idempotencyKey === "string",
@@ -2050,6 +2088,7 @@ function processFixtureDiagnosticProjection(value: unknown): RecordValue | null 
   projectEnum("rootTaskStatus", PROCESS_FIXTURE_TASK_STATUSES)
   projectEnum("latestModelStepStatus", PROCESS_FIXTURE_STEP_STATUSES)
   projectEnum("latestModelStepErrorClass", PROCESS_FIXTURE_FAILURE_CATEGORIES)
+  projectEnum("planFailureCategory", PROCESS_FIXTURE_FAILURE_CATEGORIES)
   projectEnum("turnErrorCategory", PROCESS_FIXTURE_FAILURE_CATEGORIES)
   projectEnum("waitToolCallStatus", PROCESS_FIXTURE_TOOL_STATUSES)
   projectEnum("waitToolCallLifecycleStatus", PROCESS_FIXTURE_TOOL_STATUSES)
@@ -2512,7 +2551,15 @@ async function initialWaitLineageDiagnostics(
   }
 }
 
-async function turnProgressDiagnostics(pool: Pool, turnId: string, diagnosticToolCallId?: string): Promise<string> {
+async function turnProgressDiagnostics(
+  pool: Pool,
+  turnId: string,
+  diagnosticToolCallId?: string,
+  additionalDiagnosticToolCallIds: readonly string[] = [],
+): Promise<string> {
+  const diagnosticToolCallIds = [...new Set([
+    ...(diagnosticToolCallId ? [diagnosticToolCallId] : []), ...additionalDiagnosticToolCallIds,
+  ])].slice(0, 6)
   const turnResult = await pool.query<{
     id: string
     sessionId: string
@@ -2529,7 +2576,7 @@ async function turnProgressDiagnostics(pool: Pool, turnId: string, diagnosticToo
   const turn = turnResult.rows[0]
   if (!turn) return JSON.stringify({ turnId, missing: true })
 
-  const [toolResultItem, tasks, waits, events, dispatches, lifecycleFailure] = await Promise.all([
+  const [toolResultItem, tasks, waits, events, dispatches, lifecycleFailures] = await Promise.all([
     diagnosticToolCallId
       ? pool.query<{ status: string; content: unknown }>(`SELECT "status", "content" FROM "agent_items"
         WHERE "turnId" = $1 AND "type" = 'tool_result' AND "content"->>'toolCallId' = $2
@@ -2546,17 +2593,20 @@ async function turnProgressDiagnostics(pool: Pool, turnId: string, diagnosticToo
     }>(`SELECT "id", "idempotencyKey", "status", "targetTaskIds", "matchedTaskIds", "deadlineAt", "suspendedAt", "resolvedAt", "consumedAt"
       FROM "agent_wait_conditions" WHERE "turnId" = $1 ORDER BY "createdAt"`, [turnId]),
     pool.query<{
-      sequence: string; type: string; actor: string; taskId: string | null; idempotencyKey: string | null; payload: unknown
-    }>(`SELECT "sequence"::text, "type", "actor", "taskId", "idempotencyKey", "payload"
+      sequence: string; type: string; actor: string; taskId: string | null; idempotencyKey: string | null
+      diagnosticStatus: string | null; diagnosticErrorCode: string | null
+    }>(`SELECT "sequence"::text, "type", "actor", "taskId", "idempotencyKey",
+        "payload"->>'status' AS "diagnosticStatus", "payload"->>'errorCode' AS "diagnosticErrorCode"
       FROM "agent_events" WHERE "turnId" = $1 ORDER BY "sequence" DESC LIMIT 20`, [turnId]),
     pool.query<{
       topic: string; idempotencyKey: string; publishedAt: Date | null; attemptCount: number; lastError: string | null
     }>(`SELECT "topic", "idempotencyKey", "publishedAt", "attemptCount", "lastError"
       FROM "agent_outbox" WHERE "aggregateId" = $1 ORDER BY "createdAt" DESC LIMIT 30`, [turn.sessionId]),
-    diagnosticToolCallId
-      ? pool.query<{ type: string; idempotencyKey: string | null; payload: unknown }>(`SELECT "type", "idempotencyKey", "payload" FROM "agent_events"
-        WHERE "turnId" = $1 AND POSITION($2 IN "idempotencyKey") > 0
-        ORDER BY "sequence" DESC LIMIT 1`, [turnId, `:tool-lifecycle:${diagnosticToolCallId}:failed:`])
+    diagnosticToolCallIds.length > 0
+      ? pool.query<{ type: string; toolName: string | null; status: string | null; errorCode: string | null }>(`SELECT "type",
+          "payload"->>'toolName' AS "toolName", "payload"->>'status' AS "status", "payload"->>'errorCode' AS "errorCode"
+        FROM "agent_events" WHERE "turnId" = $1 AND "type" = 'tool_call.failed' AND "payload"->>'toolCallId' = ANY($2::text[])
+        ORDER BY "sequence" DESC LIMIT 4`, [turnId, diagnosticToolCallIds])
       : Promise.resolve(null),
   ])
   const resultItem = toolResultItem?.rows[0]
@@ -2597,28 +2647,33 @@ async function turnProgressDiagnostics(pool: Pool, turnId: string, diagnosticToo
       },
     }
     : null
-  const lifecycleEvent = lifecycleFailure?.rows[0]
-  const lifecyclePayload = record(lifecycleEvent?.payload)
-  const lifecycleOutput = record(lifecyclePayload?.output)
-  const diagnosticToolFailure = lifecycleEvent
-    ? {
-      eventType: typeof lifecycleEvent.type === "string" ? lifecycleEvent.type.slice(0, 64) : null,
-      idempotencyKey: typeof lifecycleEvent.idempotencyKey === "string" ? lifecycleEvent.idempotencyKey.slice(0, 256) : null,
-      toolCallId: typeof lifecyclePayload?.toolCallId === "string" ? lifecyclePayload.toolCallId.slice(0, 128) : null,
-      toolName: typeof lifecyclePayload?.toolName === "string" ? lifecyclePayload.toolName.slice(0, 128) : null,
-      status: typeof lifecyclePayload?.status === "string" ? lifecyclePayload.status.slice(0, 32) : null,
-      errorCode: typeof lifecyclePayload?.errorCode === "string" ? lifecyclePayload.errorCode.slice(0, 128) : null,
-      failureDetail: typeof lifecycleOutput?.message === "string" && lifecycleOutput.message.length > 0
-        ? lifecycleOutput.message.slice(0, 500)
-        : null,
-    }
-    : null
+  const diagnosticToolFailures = lifecycleFailures?.rows.map(event => ({
+    eventType: event.type,
+    toolName: event.toolName,
+    status: event.status,
+    errorCode: event.errorCode,
+  })) ?? []
+  const executionFailures = events.rows.flatMap(event => {
+    if (event.type !== "step.completed" && event.type !== "turn.failed") return []
+    if (event.diagnosticStatus !== "failed" && event.type !== "turn.failed") return []
+    return [{ eventType: event.type, status: event.diagnosticStatus, errorCode: event.diagnosticErrorCode }]
+  })
   const waitLineage = await initialWaitLineageDiagnostics(pool, turn, diagnosticToolCallId)
-  const recentEvents = events.rows.map(({ payload: _payload, ...event }) => event)
-  return JSON.stringify({ turn, waitToolResult, waitLineage, tasks: tasks.rows, waits: waits.rows, recentEvents, diagnosticToolFailure, recentOutbox: dispatches.rows })
+  const recentEvents = events.rows.map(({ diagnosticStatus: _status, diagnosticErrorCode: _errorCode, ...event }) => event)
+  return JSON.stringify({
+    turn, waitToolResult, waitLineage, tasks: tasks.rows, waits: waits.rows, recentEvents,
+    diagnosticToolFailures, executionFailures, recentOutbox: dispatches.rows,
+  })
 }
 
-async function waitForTurnStatus(pool: Pool, turnId: string, wanted: string, timeoutMs = 50_000, diagnosticToolCallId?: string): Promise<void> {
+async function waitForTurnStatus(
+  pool: Pool,
+  turnId: string,
+  wanted: string,
+  timeoutMs = 50_000,
+  diagnosticToolCallId?: string,
+  additionalDiagnosticToolCallIds: readonly string[] = [],
+): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const result = await pool.query<{ status: string; error: string | null }>(
@@ -2627,13 +2682,13 @@ async function waitForTurnStatus(pool: Pool, turnId: string, wanted: string, tim
     const status = result.rows[0]?.status
     if (status === wanted) return
     if (status && ["failed", "interrupted", "cancelled"].includes(status)) {
-      const progress = await turnProgressDiagnostics(pool, turnId, diagnosticToolCallId)
+      const progress = await turnProgressDiagnostics(pool, turnId, diagnosticToolCallId, additionalDiagnosticToolCallIds)
       const turnError = boundedDiagnostic(result.rows[0]?.error ?? "<none>", 300)
       throw new Error(`TaskGraph root turn entered ${status}; error=${turnError}; progress=${compactTurnProgressDiagnostics(progress, 900)}`)
     }
     await new Promise(resolve => setTimeout(resolve, 25))
   }
-  const progress = await turnProgressDiagnostics(pool, turnId, diagnosticToolCallId)
+  const progress = await turnProgressDiagnostics(pool, turnId, diagnosticToolCallId, additionalDiagnosticToolCallIds)
   throw new Error(`TaskGraph root turn did not reach ${wanted}; progress=${compactTurnProgressDiagnostics(progress, 900)}`)
 }
 
@@ -3255,7 +3310,7 @@ describe("compact TaskGraph wait failure diagnostics", () => {
     const markers = ["marker-task-id", "marker-raw-error", "marker-nested-error", "marker-extra-id"]
     const safeLine = "P3_PARENT_SUSPENSION_DIAGNOSTICS " + JSON.stringify({
       turnStatus: "failed", rootTaskStatus: "running", latestModelStepStatus: "failed",
-      latestModelStepErrorClass: markers[1], turnErrorCategory: "database_deadlock",
+      latestModelStepErrorClass: markers[1], planFailureCategory: "task_graph_failure", turnErrorCategory: "database_deadlock",
       waitToolCallStatus: "completed", waitToolCallLifecycleStatus: "started",
       planAccepted: true,
       waitToolResultLifecycleStatus: "completed",
@@ -3293,7 +3348,7 @@ describe("compact TaskGraph wait failure diagnostics", () => {
 
     expect(projected).toMatchObject({
       turnStatus: "failed", rootTaskStatus: "running", latestModelStepStatus: "failed",
-      turnErrorCategory: "database_deadlock", waitToolCallStatus: "completed",
+      planFailureCategory: "task_graph_failure", turnErrorCategory: "database_deadlock", waitToolCallStatus: "completed",
       planAccepted: true,
       waitToolCallLifecycleStatus: "started",
       waitToolResultLifecycleStatus: "completed", waitToolOutputStatus: "ready",
@@ -3509,15 +3564,23 @@ describe("compact TaskGraph wait failure diagnostics", () => {
         toolName: "agent.wait", status: "failed", errorCode: markers[7], failureDetail: markers[7],
         idempotencyKey: markers[6],
       },
+      diagnosticToolFailures: [
+        { toolName: "agent.plan", status: "failed", errorCode: "task_graph_schedule_failed" },
+        { toolName: "agent.wait", status: "failed", errorCode: markers[7] },
+      ],
+      executionFailures: [
+        { eventType: "step.completed", status: "failed", errorCode: "business_precondition_failed" },
+        { eventType: "turn.failed", errorCode: markers[7] },
+      ],
       tasks: [{ id: markers[2], goal: markers[5], status: "failed", attemptCount: 2, failureReason: markers[7] }],
       waits: [{ id: markers[3], idempotencyKey: markers[6], status: "waiting", targetTaskIds: [markers[2]], matchedTaskIds: [] }],
       recentEvents: [{ taskId: markers[2], idempotencyKey: markers[6], error: markers[7] }],
       recentOutbox: [{ idempotencyKey: markers[6], lastError: markers[7] }],
-    }))
+    }), 3_000)
 
     expect(markers.some(marker => output.includes(marker)), "diagnostic output must omit marker values").toBe(false)
     expect(JSON.parse(output)).toMatchObject({
-      turn: { status: "failed", revision: 7, leaseVersion: 3, errorPresent: true },
+      turn: { status: "failed", errorCode: "other", revision: 7, leaseVersion: 3, errorPresent: true },
       waitToolResult: { status: "failed", outputStatus: "waiting", matchedTaskCount: 2, truncatedTaskResultCount: 1 },
       waitLineage: {
         taskIdsMatchCurrentGraph: false, requestedTaskCount: 2, graphNodeCount: 2,
@@ -3528,7 +3591,15 @@ describe("compact TaskGraph wait failure diagnostics", () => {
         fixtureNodeKeysMissingRows: ["source", "summary", "rejected"],
         targetRows: { requestedCount: 2, foundCount: 2, allInExpectedScope: true },
       },
-      tasks: [{ goalPresent: true, status: "failed", attempts: 2, failureReasonPresent: true }],
+      toolFailures: [
+        { toolName: "agent.plan", status: "failed", errorCode: "task_graph_schedule_failed" },
+        { toolName: "agent.wait", status: "failed", errorCode: "other" },
+      ],
+      executionFailures: [
+        { eventType: "step.completed", status: "failed", errorCode: "business_precondition_failed" },
+        { eventType: "turn.failed", status: null, errorCode: "other" },
+      ],
+      tasks: [{ goalPresent: true, status: "failed", attempts: 2, failureReasonPresent: true, failureReasonCode: "other" }],
       waits: [{ keyPresent: true, status: "waiting", targetCount: 1, matchedCount: 0 }],
     })
   })
@@ -6356,7 +6427,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     })
 
     await enqueueTurn(pool!, bootstrap.turns.queue, { turnId: discoveryOwner.turnId, sessionId: discoveryOwner.sessionId, ownerId: discoveryOwner.ownerId })
-    await waitForTurnStatus(pool!, discoveryOwner.turnId, "completed", 50_000, "p3-discovery-wait-analyst")
+    await waitForTurnStatus(pool!, discoveryOwner.turnId, "completed", 50_000, "p3-discovery-wait-analyst", [
+      "p3-discovery-plan-scout", "p3-discovery-wait-scout", "p3-discovery-plan-analyst",
+    ])
 
     const root = await pool!.query<{ status: string; result: unknown }>(
       `SELECT "status", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "role" = 'orchestrator'`,
@@ -6458,7 +6531,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               yield { type: "completed", finishReason: "tool_calls" }
               return
             }
-            if (execution === 2 && round === 1) {
+            if ((execution === 2 && round === 1) || (execution === 1 && round === 3)) {
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
               const graphStates = nodes.map(node => `${String(node?.key)}:${String(node?.status)}`).sort()
@@ -6518,7 +6591,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     })
 
     await enqueueTurn(pool!, bootstrap.turns.queue, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
-    await waitForTurnStatus(pool!, value.turnId, "failed", 50_000, "p3-discovery-failure-wait")
+    await waitForTurnStatus(pool!, value.turnId, "failed", 50_000, "p3-discovery-failure-wait", [
+      "p3-discovery-failure-plan",
+    ])
 
     const turn = await pool!.query<{ status: string; finalResponse: string | null }>(
       `SELECT "status", "finalResponse" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,

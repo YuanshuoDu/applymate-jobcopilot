@@ -32,7 +32,8 @@ const STEP_ERROR_CLASS_BY_CODE = new Map([
   ["coordination_invalid_input", "coordination_invalid_input"], ["coordination_task_not_found", "coordination_task_not_found"],
   ["coordination_scope_error", "coordination_scope_error"], ["coordination_wait_unavailable", "coordination_wait_unavailable"],
   ["wait_invalid", "wait_handoff_state"], ["wait_scope_error", "wait_handoff_state"], ["lease_lost", "turn_lease_state"],
-  ["tool_execution_failed", "generic_tool_execution_failed"],
+  ["tool_execution_failed", "generic_tool_execution_failed"], ["business_precondition_failed", "business_precondition_failed"],
+  ["invalid_output", "turn_output_invalid"], ["budget_exhausted", "turn_budget_exhausted"],
 ])
 const resultMarker = "p3-process-restart-source-result", finalMarker = "p3-process-restart-parent-resumed-after-follow-up"
 const planCallId = "p3-process-restart-plan", waitCallId = "p3-process-restart-wait"
@@ -147,7 +148,9 @@ function turnErrorCategory(value) {
 function modelStepErrorClass(value) {
   if (typeof value !== "string") return "none"
   const code = value.slice(0, 2_000).trim().toLowerCase()
-  return code.length === 0 ? "none" : STEP_ERROR_CLASS_BY_CODE.get(code) ?? "other"
+  if (code.length === 0) return "none"
+  if (/^task_graph_[a-z0-9_]{1,80}$/.test(code)) return "task_graph_failure"
+  return STEP_ERROR_CLASS_BY_CODE.get(code) ?? "other"
 }
 function fixedEnum(value, allowlist) {
   return value === null || value === undefined ? "none" : typeof value === "string" && allowlist.has(value) ? value : "other"
@@ -176,6 +179,7 @@ function parentSuspensionProjection(snapshot) {
     rootTaskStatus: snapshot.rootTaskStatus,
     latestModelStepStatus: fixedEnum(snapshot.latestModelStep?.status, STEP_STATUS_ALLOWLIST),
     latestModelStepErrorClass: snapshot.latestModelStep?.errorClass ?? "none",
+    planFailureCategory: snapshot.planFailureCategory ?? "none",
     turnErrorCategory: snapshot.turnErrorCategory ?? "none",
     planAccepted: snapshot.planReceiptStatuses.some(status => status === "accepted" || status === "duplicate"),
     waitToolCallStatus: snapshot.waitToolCallStatus,
@@ -869,9 +873,12 @@ async function waitForDiscoveryParentSuspended(ownerId, timeoutMs = 20_000) {
     }
     await sleep(20)
   }
+  say("P3_PARENT_SUSPENSION_DIAGNOSTICS " + JSON.stringify(parentSuspensionProjection(
+    await parentSuspensionDiagnostics(waitIdempotencyKey, 1),
+  )))
   throw new Error("p3_discovery_parent_wait_not_suspended")
 }
-async function parentSuspensionDiagnostics() {
+async function parentSuspensionDiagnostics(expectedWaitIdempotencyKey = null, expectedGraphNodeCount = 2) {
   try {
     const [turnResult, stepResult, toolResult, waitResult, graphResult, childResult, taskRowResult] = await Promise.all([
       pool.query(`SELECT turn."status" AS "turnStatus", turn."rootTaskId" IS NOT NULL AS "hasRootTask",
@@ -900,6 +907,7 @@ async function parentSuspensionDiagnostics() {
             AND item."type" IN ('tool_call', 'tool_result')
         ), latest_wait_call AS (
           SELECT * FROM parent_items WHERE "type" = 'tool_call' AND "toolName" = 'agent.wait'
+            AND ($2::text IS NULL OR "waitIdempotencyKey" = $2)
           ORDER BY "createdAt" DESC LIMIT 1
         )
         SELECT EXISTS (SELECT 1 FROM parent_items WHERE "type" = 'tool_call' AND "toolName" = 'agent.plan') AS "hasPlanToolCall",
@@ -912,6 +920,11 @@ async function parentSuspensionDiagnostics() {
             WHERE call."type" = 'tool_call' AND call."toolName" = 'agent.plan' AND result."type" = 'tool_result'
               AND result."planReceiptStatus" IN ('accepted', 'duplicate', 'rejected')
             ORDER BY result."planReceiptStatus") AS "planReceiptStatuses",
+          (SELECT COALESCE(call."errorCode", result."errorCode") FROM parent_items AS call
+            JOIN parent_items AS result ON result."toolCallId" = call."toolCallId"
+            WHERE call."type" = 'tool_call' AND call."toolName" = 'agent.plan' AND result."type" = 'tool_result'
+              AND (call."toolOutcomeStatus" = 'failed' OR call."errorCode" IS NOT NULL OR result."errorCode" IS NOT NULL)
+            ORDER BY result."createdAt" DESC LIMIT 1) AS "planErrorCode",
           EXISTS (SELECT 1 FROM latest_wait_call) AS "hasWaitToolCall",
           EXISTS (SELECT 1 FROM latest_wait_call AS call JOIN parent_items AS result ON result."toolCallId" = call."toolCallId"
             WHERE result."type" = 'tool_result') AS "hasWaitToolResult",
@@ -925,7 +938,7 @@ async function parentSuspensionDiagnostics() {
             WHERE result."type" = 'tool_result' ORDER BY result."createdAt" DESC LIMIT 1) AS "waitToolOutputStatus",
           (SELECT result."errorCode" FROM latest_wait_call AS call JOIN parent_items AS result ON result."toolCallId" = call."toolCallId"
             WHERE result."type" = 'tool_result' ORDER BY result."createdAt" DESC LIMIT 1) AS "waitToolErrorCode",
-          (SELECT call."errorCode" FROM latest_wait_call AS call) AS "waitToolCallErrorCode"`, [ids.turnId]),
+          (SELECT call."errorCode" FROM latest_wait_call AS call) AS "waitToolCallErrorCode"`, [ids.turnId, expectedWaitIdempotencyKey]),
       pool.query(`SELECT wait."idempotencyKey" AS "waitIdempotencyKey", wait."status" AS "waitStatus", wait."targetTaskIds", wait."parentTaskId" = turn."rootTaskId" AS "parentMatchesRoot",
           wait."suspendedAt" IS NOT NULL AS "hasSuspendedAt"
         FROM "agent_wait_conditions" AS wait JOIN "agent_turns" AS turn ON turn."id" = wait."turnId"
@@ -984,6 +997,7 @@ async function parentSuspensionDiagnostics() {
       hasPlanToolCall: Boolean(tool.hasPlanToolCall),
       hasPlanToolResult: Boolean(tool.hasPlanToolResult),
       hasFailedPlanToolResult: Boolean(tool.hasFailedPlanToolResult),
+      planFailureCategory: modelStepErrorClass(tool.planErrorCode),
       planReceiptStatuses: Array.isArray(tool.planReceiptStatuses) ? tool.planReceiptStatuses : [],
       hasWaitToolCall: Boolean(tool.hasWaitToolCall),
       waitToolCallStatus: fixedEnum(tool.waitToolCallStatus, TOOL_CALL_STATUS_ALLOWLIST),
@@ -1021,7 +1035,7 @@ async function parentSuspensionDiagnostics() {
       : snapshot.hasFailedPlanToolResult || !snapshot.hasPlanToolResult
         || !snapshot.planReceiptStatuses.some(status => status === "accepted" || status === "duplicate")
         || !snapshot.graph.present ? "plan_failed_or_incomplete"
-       : !snapshot.graph.hasNodeArray || snapshot.graph.nodeCount !== 2 ? "graph_shape_mismatch"
+       : !snapshot.graph.hasNodeArray || snapshot.graph.nodeCount !== expectedGraphNodeCount ? "graph_shape_mismatch"
         : !snapshot.hasWaitToolCall ? "wait_call_missing"
         : !snapshot.hasWaitToolResult && snapshot.waitFailureCategory !== "none" && snapshot.waitFailureCategory !== "tool_result_missing"
           ? "wait_tool_failed_before_wait_persistence"
