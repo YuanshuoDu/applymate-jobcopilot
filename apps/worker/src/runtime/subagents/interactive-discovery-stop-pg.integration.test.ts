@@ -204,7 +204,7 @@ describeWithDisposablePostgres("interactive discovery Stop recovery without suba
         ensureCount += 1
         oldLease = input.lease
         const root = await persistedRoots.ensure(input)
-        if (ensureCount === 2) {
+        if (ensureCount === 1) {
           rootTaskId = root.id
           fallbackEnsureEntered.resolve(undefined)
           await releaseFallback.promise
@@ -261,7 +261,7 @@ describeWithDisposablePostgres("interactive discovery Stop recovery without suba
       })
 
       await within(fallbackEnsureEntered.promise, "interactive discovery fallback root ensure")
-      expect(ensureCount).toBe(2)
+      expect(ensureCount).toBe(1)
       expect(rootTaskId).toBe(`root-${value.turnId}`)
       if (!oldLease) throw new Error("Worker-1 did not capture its canonical Turn lease")
       await persistStop(db, value, oldLease, rootTaskId)
