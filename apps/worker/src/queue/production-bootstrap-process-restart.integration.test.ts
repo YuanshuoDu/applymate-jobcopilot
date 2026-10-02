@@ -1168,7 +1168,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     expect(replayJob.id).toBe(jobId)
     expect(replayJob.timestamp).toBe(originalTimestamp)
     expect(replayJob.data).toEqual(completedJob.data)
-    expect(["paused", "wait"]).toContain(await replayJob.getState())
+    expect(["paused", "wait", "waiting"]).toContain(await replayJob.getState())
     await turnQueue!.resume()
     turnQueuePaused = false
 
