@@ -10,7 +10,11 @@ describe('worker harness health', () => {
       source: 'safe_defaults',
       allDefaultOff: true,
     })
-    expect(Object.values(health.flags)).toHaveLength(11)
+    expect(health.flags.AGENT_INTERACTIVE_DISCOVERY_TASK_GRAPH).toMatchObject({
+      enabled: false,
+      defaultEnabled: false,
+      fallback: 'legacy',
+    })
     expect(Object.values(health.flags).every((flag) => flag.enabled === false)).toBe(true)
   })
 })
