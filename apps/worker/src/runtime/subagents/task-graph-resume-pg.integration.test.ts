@@ -6425,6 +6425,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               yield { type: "completed", finishReason: "tool_calls" }
               return
             }
+            const waitKey = task.role === "scout"
+              ? `p3-discovery-wait-scout:${discoveryOwner.turnId}`
+              : `p3-discovery-wait-analyst:${discoveryOwner.turnId}`
+            await waitForPersistedTaskWait(pool!, discoveryOwner.turnId, waitKey)
             const evidence = { id: `read:job:${jobId}`, kind: "job", ref: jobId, source: "greenhouse" }
             const result = task.role === "scout"
               ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [{ jobId, source: "fixture", url: null, evidenceIds: [evidence.id] }], evidence: [evidence], summary: "Found the fixture role" }
@@ -6592,6 +6596,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               ? searchResult.jobs.map(record).flatMap(job => typeof job?.id === "string" ? [job.id] : [])
               : []
             expect(observedJobIds).toContain(jobId)
+            await waitForPersistedTaskWait(pool!, value.turnId, `p3-discovery-failure-wait:${value.turnId}`)
             // Exercise the production structured-result validator with a deterministic invalid Scout receipt.
             yield { type: "text_delta", text: "{}" }
             yield { type: "completed", finishReason: "stop" }
