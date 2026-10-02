@@ -92,9 +92,19 @@ function historyPair(item: Row, content: Row): ContextHistoryEntry[] {
 }
 
 function appendIfNew(entries: readonly ContextHistoryEntry[], existing: readonly ContextHistoryEntry[]): ContextHistoryEntry[] {
+  for (const entry of entries) {
+    if (existing.filter(candidate => candidate.id === entry.id).length > 1) {
+      throw new Error("question_recovery_history_duplicate")
+    }
+  }
   const known = new Map(existing.map(entry => [entry.id, entry.content]))
   for (const entry of entries) {
     if (known.has(entry.id) && !same(known.get(entry.id), entry.content)) throw new Error("question_recovery_history_collision")
+  }
+  const questionIndex = existing.findIndex(entry => entry.id === entries[0].id)
+  const answerIndex = existing.findIndex(entry => entry.id === entries[1].id)
+  if (questionIndex >= 0 && answerIndex >= 0 && questionIndex > answerIndex) {
+    throw new Error("question_recovery_history_order_invalid")
   }
   if (known.has(entries[1].id) && !known.has(entries[0].id)) throw new Error("question_recovery_history_pair_incomplete")
   return entries.filter(entry => !known.has(entry.id))
@@ -117,6 +127,10 @@ function validateAnswer(event: Row, item: Row, questionId: string, callId: strin
   return sequence(event.sequence)
 }
 
+function claimsPersistedAnswer(item: Row, content: Row): boolean {
+  return item.status === "completed" || content.answerAvailable === true || text(content.answer) !== null
+}
+
 /** Projects only broker-answered questions with a complete durable scope and step lineage. */
 export async function recoverAnsweredQuestionHistory(
   client: RecoveryClient,
@@ -124,7 +138,7 @@ export async function recoverAnsweredQuestionHistory(
 ): Promise<ContextHistoryEntry[]> {
   const { lease, rootTaskId } = input
   const items = await client.query<Row>(
-    `SELECT item."id", item."sessionId", item."turnId", item."stepId", item."taskId", item."status", item."content",
+    `SELECT item."id", item."sessionId", item."turnId", item."stepId", item."taskId", item."type", item."status", item."content",
             session."userId" AS "userId", turn."userId" AS "turnUserId"
        FROM "agent_items" AS item
        JOIN "agent_sessions" AS session ON session."id" = item."sessionId" AND session."userId" = $3
@@ -134,8 +148,18 @@ export async function recoverAnsweredQuestionHistory(
     [lease.sessionId, lease.turnId, lease.userId, rootTaskId],
   )
   if (items.rows.length === 0) return []
-  const itemIds = items.rows.map(item => text(item.id) ?? "")
-  if (itemIds.some(id => !id)) throw new Error("question_recovery_item_id_invalid")
+  // Some test repositories return a neighboring Turn row for this query.
+  // Classify the actual item type before treating it as recovery evidence.
+  const questions = items.rows.filter(item => item.type === "question")
+  const itemIds = questions.map(item => {
+    const id = text(item.id)
+    if (!id) {
+      if (claimsPersistedAnswer(item, record(item.content))) throw new Error("question_recovery_item_id_invalid")
+      return null
+    }
+    return id
+  }).filter((id): id is string => id !== null)
+  if (itemIds.length === 0) return []
   const events = await client.query<Row>(
     `SELECT event."id", event."sessionId", event."turnId", event."taskId", event."itemId", event."actor", event."sequence",
             event."type", event."correlationId", event."causationId", event."payload",
@@ -148,25 +172,29 @@ export async function recoverAnsweredQuestionHistory(
       ORDER BY event."sequence" ASC`,
     [lease.sessionId, lease.turnId, lease.userId, rootTaskId, itemIds],
   )
+  const candidates = questions.filter(item => {
+    const id = text(item.id)
+    return claimsPersistedAnswer(item, record(item.content))
+      || (!!id && events.rows.some(event => event.itemId === id && event.type === "question.answered"))
+  })
+  if (candidates.length === 0) return []
   const allByQuestion = new Map<string, number>()
-  for (const item of items.rows) {
+  for (const item of questions) {
     const id = text(record(item.content).questionId)
     if (id) allByQuestion.set(id, (allByQuestion.get(id) ?? 0) + 1)
   }
   const result: { order: bigint; entries: ContextHistoryEntry[] }[] = []
-  for (const item of items.rows) {
+  for (const item of candidates) {
     assertItemFence(item, input)
     const content = record(item.content)
     const questionId = text(content.questionId)
     const itemEvents = events.rows.filter(event => event.itemId === item.id)
-    const answers = itemEvents.filter(event => event.type === "question.answered")
-    const claimed = content.answerAvailable === true || text(content.answer) !== null
-    if (answers.length === 0 && !claimed) continue
     if (item.status !== "completed" || content.waitKind !== "question" || content.answerAvailable !== true || !questionId || !text(content.question)
       || !validOptions(content.options) || !text(content.answer) || allByQuestion.get(questionId) !== 1) {
       throw new Error("question_recovery_item_malformed")
     }
     assertStepLineage(item, content, input)
+    const answers = itemEvents.filter(event => event.type === "question.answered")
     if (answers.length !== 1) throw new Error("question_recovery_answer_event_ambiguous")
     const starts = itemEvents.filter(event => event.type === "item.started")
     if (starts.length !== 1) throw new Error("question_recovery_start_event_ambiguous")

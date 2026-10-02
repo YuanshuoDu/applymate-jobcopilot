@@ -741,6 +741,7 @@ async function makeCheckpointWorker(firstWorker) {
               id: "checkpoint-worker1-fixture-model", profile: modelProfile(),
               async *stream() {
                 modelCalls += 1
+                say("CHECKPOINT_MODEL_REQUEST " + modelCalls)
                 if (modelCalls === 1) {
                   if (checkpoint.checkpointKind === "tool-result") {
                     say("CHECKPOINT_TOOL_STEP_READY " + checkpoint.readCallId)
@@ -751,9 +752,14 @@ async function makeCheckpointWorker(firstWorker) {
                   return
                 }
                 if (modelCalls === 2) {
-                  if (checkpoint.checkpointKind !== "tool-result") await persistCheckpointWait()
-                  say("CHECKPOINT_PROVIDER_ACTIVE " + checkpoint.checkpointKind)
+                  if (checkpoint.checkpointKind === "tool-result") {
+                    say("CHECKPOINT_NEXT_MODEL_REQUEST_STARTED")
+                    throw new Error("tool-result checkpoint advanced to another provider request before restart")
+                  }
+                  await persistCheckpointWait()
+                  say("CHECKPOINT_WAIT_DURABLE " + checkpoint.checkpointKind)
                   await waitForCommand("release-checkpoint-provider")
+                  say("CHECKPOINT_POST_WAIT_MODEL_PROGRESS")
                   yield { type: "text_delta", text: "must-not-be-observed-after-worker1-kill" }
                   yield { type: "completed", finishReason: "stop" }
                   return

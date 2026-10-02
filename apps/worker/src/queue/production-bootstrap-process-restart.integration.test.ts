@@ -287,20 +287,77 @@ type WakeupDispatchRow = {
 async function waitForCheckpointToolResult(pool: Pool, turnId: string, toolCallId: string): Promise<void> {
   const deadline = Date.now() + 30_000
   while (Date.now() < deadline) {
-    const result = await pool.query<{ calls: string; completedCalls: string; results: string; completedResults: string }>(
-      `SELECT
-         COUNT(*) FILTER (WHERE "type" = 'tool_call')::text AS "calls",
-         COUNT(*) FILTER (WHERE "type" = 'tool_call' AND "status" = 'completed' AND "content"->>'status' = 'completed')::text AS "completedCalls",
-         COUNT(*) FILTER (WHERE "type" = 'tool_result')::text AS "results",
-         COUNT(*) FILTER (WHERE "type" = 'tool_result' AND "status" = 'completed')::text AS "completedResults"
-       FROM "agent_items" WHERE "turnId" = $1 AND "content"->>'toolCallId' = $2`,
+    const result = await pool.query<{
+      calls: string; completedCalls: string; results: string; completedResults: string
+      resultStepId: string | null; callStepId: string | null; turnStatus: string; leaseOwnerId: string | null
+      leaseActive: boolean; rootTaskId: string | null; stepCount: string; readStepStatus: string | null; laterStepCount: string
+    }>(
+      `SELECT turn."status" AS "turnStatus", turn."leaseOwnerId", turn."rootTaskId",
+         turn."leaseExpiresAt" > CURRENT_TIMESTAMP AS "leaseActive",
+         (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_call' AND "content"->>'toolCallId' = $2) AS "calls",
+         (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_call' AND "status" = 'completed' AND "content"->>'toolCallId' = $2 AND "content"->>'status' = 'completed') AS "completedCalls",
+         (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_result' AND "content"->>'toolCallId' = $2) AS "results",
+         (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_result' AND "status" = 'completed' AND "content"->>'toolCallId' = $2) AS "completedResults",
+         (SELECT "stepId" FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_result' AND "content"->>'toolCallId' = $2 LIMIT 1) AS "resultStepId",
+         (SELECT "stepId" FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_call' AND "content"->>'toolCallId' = $2 LIMIT 1) AS "callStepId",
+         (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id") AS "stepCount",
+         (SELECT "status" FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" = 0 LIMIT 1) AS "readStepStatus",
+         (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" > 0) AS "laterStepCount"
+       FROM "agent_turns" AS turn WHERE turn."id" = $1`,
       [turnId, toolCallId],
     )
-    if (result.rows[0]?.calls === "1" && result.rows[0]?.completedCalls === "1"
-      && result.rows[0]?.results === "1" && result.rows[0]?.completedResults === "1") return
+    const row = result.rows[0]
+    if (row?.calls === "1" && row.completedCalls === "1" && row.results === "1" && row.completedResults === "1"
+      && row.turnStatus === "in_progress" && row.leaseOwnerId && row.leaseActive && row.rootTaskId
+      && row.stepCount === "1" && row.readStepStatus === "streaming" && row.laterStepCount === "0"
+      && row.resultStepId === row.callStepId) return
     await new Promise(resolve => setTimeout(resolve, 10))
   }
-  throw new Error(`Timed out waiting for the durable completed checkpoint tool result for ${toolCallId}`)
+  throw new Error(`Timed out waiting for a durable completed checkpoint tool result with its active lease and no downstream step for ${toolCallId}`)
+}
+
+async function waitForCheckpointWait(pool: Pool, kind: Exclude<CheckpointKind, "tool-result">, ids: FixtureIds): Promise<void> {
+  const itemId = `agent-wait:${kind}:${ids.checkpointWaitId}`
+  const deadline = Date.now() + 20_000
+  while (Date.now() < deadline) {
+    const result = await pool.query<{
+      turnStatus: string; leaseOwnerId: string | null; rootTaskId: string | null; leaseActive: boolean
+      itemCount: string; itemStatus: string | null; itemContent: Record<string, unknown> | null
+      startEventCount: string; startOutboxCount: string; receiptStatus: string | null; receiptCount: string
+      stepCount: string; readStepStatus: string | null; waitStepStatus: string | null; postWaitStepCount: string
+    }>(
+      `SELECT turn."status" AS "turnStatus", turn."leaseOwnerId", turn."rootTaskId", turn."leaseExpiresAt" > CURRENT_TIMESTAMP AS "leaseActive",
+         (SELECT COUNT(*)::text FROM "agent_items" AS item WHERE item."id" = $2 AND item."sessionId" = turn."sessionId" AND item."turnId" = turn."id" AND item."type" = $3) AS "itemCount",
+         (SELECT item."status" FROM "agent_items" AS item WHERE item."id" = $2 AND item."sessionId" = turn."sessionId" AND item."turnId" = turn."id" AND item."type" = $3 LIMIT 1) AS "itemStatus",
+         (SELECT item."content" FROM "agent_items" AS item WHERE item."id" = $2 AND item."sessionId" = turn."sessionId" AND item."turnId" = turn."id" AND item."type" = $3 LIMIT 1) AS "itemContent",
+         (SELECT COUNT(*)::text FROM "agent_events" AS event WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId" AND event."itemId" = $2 AND event."type" = 'item.started' AND event."actor" = 'orchestrator') AS "startEventCount",
+         (SELECT COUNT(*)::text FROM "agent_events" AS event JOIN "agent_outbox" AS outbox ON outbox."idempotencyKey" = 'agent-event:' || event."id"
+           WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId" AND event."itemId" = $2 AND event."type" = 'item.started'
+             AND outbox."topic" = 'agent.session.event' AND outbox."attemptCount" = 1 AND outbox."lastError" IS NULL) AS "startOutboxCount",
+         (SELECT COUNT(*)::text FROM "agent_approvals" WHERE "id" = $4 AND "userId" = turn."userId" AND "sessionId" = turn."sessionId" AND "turnId" = turn."id") AS "receiptCount",
+         (SELECT "status" FROM "agent_approvals" WHERE "id" = $4 AND "userId" = turn."userId" AND "sessionId" = turn."sessionId" AND "turnId" = turn."id" LIMIT 1) AS "receiptStatus",
+         (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id") AS "stepCount",
+         (SELECT "status" FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" = 0 LIMIT 1) AS "readStepStatus",
+         (SELECT "status" FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" = 1 LIMIT 1) AS "waitStepStatus",
+         (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" > 1) AS "postWaitStepCount"
+       FROM "agent_turns" AS turn WHERE turn."id" = $1 AND turn."sessionId" = $5 AND turn."userId" = $6`,
+      [ids.turnId, itemId, kind === "approval" ? "approval_request" : "question", ids.checkpointWaitId, ids.sessionId, ids.userId],
+    )
+    const row = result.rows[0]
+    const expectedTurnStatus = kind === "approval" ? "waiting_for_approval" : "waiting_for_user"
+    const content = row?.itemContent
+    const contentMatches = kind === "approval"
+      ? content?.waitKind === "approval" && content.approvalId === ids.checkpointWaitId && content.toolCallId === ids.readCallId
+      : content?.waitKind === "question" && content.questionId === ids.checkpointWaitId && content.toolCallId === ids.readCallId
+        && typeof content.question === "string" && Array.isArray(content.options) && content.answer === null && content.answerAvailable === false
+    if (row?.turnStatus === expectedTurnStatus && row.leaseOwnerId && row.rootTaskId && row.leaseActive
+      && row.itemCount === "1" && row.itemStatus === "started" && contentMatches
+      && row.startEventCount === "1" && row.startOutboxCount === "1"
+      && (kind === "question" || (row.receiptCount === "1" && row.receiptStatus === "pending"))
+      && row.stepCount === "2" && row.readStepStatus === "completed" && row.waitStepStatus === "streaming" && row.postWaitStepCount === "0") return
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  throw new Error(`Timed out waiting for durable ${kind} wait rows and the actual waiting model-step boundary for ${ids.checkpointWaitId}`)
 }
 
 type WakeupDispatchSnapshot = {
@@ -549,7 +606,8 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     let workerOnePid: number | undefined
     let beforeKill: {
       status: string; leaseOwnerId: string | null; rootTaskId: string | null; rootStatus: string | null; rootLeaseOwner: string | null
-      readCalls: string; readResults: string; readStepCount: string; readStepStatus: string | null; laterStepCount: string
+      readCalls: string; readResults: string; stepCount: string; readStepCount: string; readStepStatus: string | null
+      waitStepCount: string; waitStepStatus: string | null; postCheckpointStepCount: string
     } | undefined
     try {
       if (kind === "tool-result") {
@@ -562,26 +620,38 @@ describeWithServices("production bootstrap recovery across a Worker process rest
         workerOne.stdin?.write("release-checkpoint-tool-call\n")
         await waitForLine(workerOne, `CHECKPOINT_READ_TOOL_EXECUTED ${checkpointIds.readCallId}`)
         await waitForCheckpointToolResult(pool!, checkpointIds.turnId, checkpointIds.readCallId!)
+        expect(workerOne.output.filter(line => line.startsWith("CHECKPOINT_MODEL_REQUEST "))).toEqual(["CHECKPOINT_MODEL_REQUEST 1"])
+        expect(workerOne.output).not.toContain("CHECKPOINT_NEXT_MODEL_REQUEST_STARTED")
       } else {
-        await waitForLine(workerOne, "CHECKPOINT_READ_TOOL_EXECUTED ")
-        await waitForLine(workerOne, `CHECKPOINT_PROVIDER_ACTIVE ${kind}`)
+        await waitForLine(workerOne, `CHECKPOINT_WAIT_DURABLE ${kind}`)
+        await waitForCheckpointWait(pool!, kind, checkpointIds)
+        checkpointStepBlocker = await pool!.connect()
+        await checkpointStepBlocker.query("BEGIN")
+        await checkpointStepBlocker.query('LOCK TABLE "agent_steps" IN SHARE MODE')
+        expect(workerOne.output.filter(line => line.startsWith("CHECKPOINT_MODEL_REQUEST "))).toEqual(["CHECKPOINT_MODEL_REQUEST 1", "CHECKPOINT_MODEL_REQUEST 2"])
+        expect(workerOne.output).not.toContain("CHECKPOINT_POST_WAIT_MODEL_PROGRESS")
       }
       beforeKill = (await pool!.query<{
         status: string; leaseOwnerId: string | null; rootTaskId: string | null; rootStatus: string | null; rootLeaseOwner: string | null
-        readCalls: string; readResults: string; readStepCount: string; readStepStatus: string | null; laterStepCount: string
+        readCalls: string; readResults: string; stepCount: string; readStepCount: string; readStepStatus: string | null
+        waitStepCount: string; waitStepStatus: string | null; postCheckpointStepCount: string
       }>(`SELECT turn."status", turn."leaseOwnerId", turn."rootTaskId", root."status" AS "rootStatus", root."leaseOwner" AS "rootLeaseOwner",
           (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_call' AND "content"->>'toolCallId' = $2) AS "readCalls",
           (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = turn."id" AND "type" = 'tool_result' AND "content"->>'toolCallId' = $2) AS "readResults",
-          (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" = 0 AND "status" = 'completed') AS "readStepCount",
+          (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id") AS "stepCount",
+          (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" = 0) AS "readStepCount",
           (SELECT "status" FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" = 0 LIMIT 1) AS "readStepStatus",
-          (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" > 0) AS "laterStepCount"
+          (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" = 1) AS "waitStepCount",
+          (SELECT "status" FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" = 1 LIMIT 1) AS "waitStepStatus",
+          (SELECT COUNT(*)::text FROM "agent_steps" WHERE "turnId" = turn."id" AND "ordinal" > $3) AS "postCheckpointStepCount"
         FROM "agent_turns" AS turn JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."turnId" = turn."id"
-        WHERE turn."id" = $1`, [checkpointIds.turnId, checkpointIds.readCallId])).rows[0]
+        WHERE turn."id" = $1`, [checkpointIds.turnId, checkpointIds.readCallId, kind === "tool-result" ? 0 : 1])).rows[0]
       expect(beforeKill).toMatchObject({
         status: kind === "approval" ? "waiting_for_approval" : kind === "question" ? "waiting_for_user" : "in_progress",
-        rootStatus: "running", readCalls: "1", readResults: "1", readStepCount: kind === "tool-result" ? "0" : "1",
-        readStepStatus: kind === "tool-result" ? "in_progress" : kind === "approval" ? "waiting_for_approval" : "waiting_for_user",
-        laterStepCount: "0",
+        rootStatus: "running", readCalls: "1", readResults: "1", stepCount: kind === "tool-result" ? "1" : "2", readStepCount: "1",
+        readStepStatus: kind === "tool-result" ? "streaming" : "completed",
+        waitStepCount: kind === "tool-result" ? "0" : "1", waitStepStatus: kind === "tool-result" ? null : "streaming",
+        postCheckpointStepCount: "0",
       })
       expect(beforeKill.leaseOwnerId).toBeTruthy()
       expect(beforeKill.rootTaskId).toBeTruthy()
@@ -688,7 +758,12 @@ describeWithServices("production bootstrap recovery across a Worker process rest
   it("persists a child result, kills its Worker, and resumes the parent from PostgreSQL under a new lease", async () => {
     // Exercise the Web command service against the migrated disposable database.
     // The fixture calls message() twice with the same clientMessageId, then
-    // exits before any Worker consumer is started.
+    // exits before any Worker consumer is started. afterEach removes fixture
+    // sessions, so this case owns a fresh Session instead of reusing beforeAll's.
+    ids.sessionId = `process-restart-child-result-session-${randomUUID()}`
+    fixtureSessionIds.add(ids.sessionId)
+    await pool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+      VALUES ($1, $2, 'Resume a parent Turn after its child completes', 'running', 'test', CURRENT_TIMESTAMP)`, [ids.sessionId, ids.userId])
     commandAcceptance = startWorker("accept-message", ids)
     const acceptedLine = await waitForLine(commandAcceptance, "COMMAND_ACCEPTED ")
     await waitForExit(commandAcceptance, { stage: "command-acceptance-after-result", pid: commandAcceptance.pid })

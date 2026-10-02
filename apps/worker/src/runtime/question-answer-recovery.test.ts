@@ -7,7 +7,7 @@ const lease = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", owne
 
 function item(patch: Record<string, unknown> = {}) {
   return {
-    id: "question-item", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null,
+    id: "question-item", type: "question", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null,
     stepId: null, status: "completed", content: { waitKind: "question", questionId: "wait-1", toolCallId: "call-1",
       question: "Continue?", options: [{ label: "Yes", value: "yes" }], answer: "yes", answerAvailable: true }, ...patch,
   }
@@ -49,7 +49,27 @@ describe("recoverAnsweredQuestionHistory", () => {
     expect(entries).toEqual([])
   })
 
-  it("requires the question, direct step, and tool-call lineage to share exact task scope", async () => {
+  it("rejects an existing stable-ID pair when the answer precedes the question", async () => {
+    await expect(recoverAnsweredQuestionHistory(client(), input({ existingHistory: [
+      { id: "agent-question:question-item:answer", content: { role: "user", type: "answer", questionId: "wait-1", text: "yes" } },
+      { id: "agent-question:question-item:question", content: { role: "assistant", type: "question", question: "Continue?", options: [{ label: "Yes", value: "yes" }] } },
+    ] }))).rejects.toThrow("question_recovery_history_order_invalid")
+  })
+
+  it("rejects repeated existing question or answer stable IDs even when the entries match", async () => {
+    const question = { id: "agent-question:question-item:question", content: {
+      role: "assistant", type: "question", question: "Continue?", options: [{ label: "Yes", value: "yes" }],
+    } }
+    const answer = { id: "agent-question:question-item:answer", content: {
+      role: "user", type: "answer", questionId: "wait-1", text: "yes",
+    } }
+    await expect(recoverAnsweredQuestionHistory(client(), input({ existingHistory: [question, question, answer] })))
+      .rejects.toThrow("question_recovery_history_duplicate")
+    await expect(recoverAnsweredQuestionHistory(client(), input({ existingHistory: [question, answer, answer] })))
+      .rejects.toThrow("question_recovery_history_duplicate")
+  })
+
+  it("projects only question, direct step, and tool-call lineage with exact task scope", async () => {
     const rootQuestion = item({ taskId: "root-1", stepId: "step-1" })
     const rootEvents = events().map(event => ({ ...event, taskId: "root-1" })) as Record<string, unknown>[]
     await expect(recoverAnsweredQuestionHistory(client([rootQuestion], rootEvents), input({
@@ -78,7 +98,7 @@ describe("recoverAnsweredQuestionHistory", () => {
     expect(entries).toEqual([])
   })
 
-  it("rejects a root-task event paired with a root-task question item whose task scope differs", async () => {
+  it("fails closed when question events have a different task scope", async () => {
     const rootScopedEvents = events().map(event => ({ ...event, taskId: "root-1" })) as Record<string, unknown>[]
     await expect(recoverAnsweredQuestionHistory(
       client([item({ taskId: null })], rootScopedEvents), input(),
@@ -97,6 +117,25 @@ describe("recoverAnsweredQuestionHistory", () => {
     await expect(recoverAnsweredQuestionHistory(client([pending], []), input())).resolves.toEqual([])
   })
 
+  it("fails closed when an unanswered question row has a durable answered-event claim", async () => {
+    const pending = item({ status: "started", content: { waitKind: "question", questionId: "wait-1", toolCallId: "call-1",
+      question: "Continue?", options: [{ label: "Yes", value: "yes" }], answer: null, answerAvailable: false } })
+    await expect(recoverAnsweredQuestionHistory(client([pending], events()), input()))
+      .rejects.toThrow("question_recovery_item_malformed")
+  })
+
+  it("is inert for rows that are not question items and normal unanswered rows", async () => {
+    const neighboringTurn = { id: "turn-1", sessionId: "session-1", turnId: "turn-1", status: "in_progress", rootTaskId: "root-1" }
+    const unanswered = item({ status: "started", content: { ...item().content as object, answer: null, answerAvailable: false } })
+    await expect(recoverAnsweredQuestionHistory(client([neighboringTurn], []), input())).resolves.toEqual([])
+    await expect(recoverAnsweredQuestionHistory(client([unanswered], []), input())).resolves.toEqual([])
+  })
+
+  it("rejects an answered question candidate without its durable item ID", async () => {
+    await expect(recoverAnsweredQuestionHistory(client([item({ id: null })]), input()))
+      .rejects.toThrow("question_recovery_item_id_invalid")
+  })
+
   it.each([
     ["foreign user", { userId: "other-user" }, events()],
     ["foreign session", { sessionId: "other-session" }, events()],
@@ -106,8 +145,10 @@ describe("recoverAnsweredQuestionHistory", () => {
     ["mismatched question event", {}, events({}, { correlationId: "other-wait" })],
     ["wrong answer actor", {}, events({}, { actor: "system" })],
     ["answer before start", {}, events()],
-  ])("fails closed for %s", async (label, itemPatch, eventRows) => {
+    ["missing answer text", {}, events()],
+  ])("fails closed for answered candidate with %s", async (label, itemPatch, eventRows) => {
     if (label === "answer before start") eventRows[1].sequence = "9"
+    if (label === "missing answer text") itemPatch = { content: { ...item().content as object, answer: null } }
     await expect(recoverAnsweredQuestionHistory(client([item(itemPatch)], eventRows), input({
       ...(label === "missing step" ? { toolItems: [] } : {}),
     }))).rejects.toThrow()
@@ -119,15 +160,16 @@ describe("recoverAnsweredQuestionHistory", () => {
     ["missing start event", item(), [events()[1]]],
     ["mismatched answer causation", item(), events({}, { causationId: "other-item" })],
     ["empty answer", item({ content: { ...item().content as object, answer: " " } }), events()],
+    ["malformed options", item({ content: { ...item().content as object, options: [{ label: "Yes" }] } }), events()],
     ["wrong item wait kind", item({ content: { ...item().content as object, waitKind: "approval" } }), events()],
     ["unavailable answer", item({ content: { ...item().content as object, answerAvailable: false } }), events()],
     ["duplicate question item", item(), events()],
-  ])("rejects %s", async (label, question, eventRows) => {
+  ])("fails closed for answered candidate with %s", async (label, question, eventRows) => {
     const questionRows = label === "duplicate question item" ? [question, item({ id: "question-item-2" })] : [question]
     await expect(recoverAnsweredQuestionHistory(client(questionRows, eventRows), input())).rejects.toThrow()
   })
 
-  it("rejects absent and ambiguous tool-call-to-step lineage", async () => {
+  it("fails closed for absent and ambiguous tool-call-to-step lineage", async () => {
     await expect(recoverAnsweredQuestionHistory(client(), input({ toolItems: [] }))).rejects.toThrow("question_recovery_tool_lineage_invalid")
     await expect(recoverAnsweredQuestionHistory(client(), input({ toolItems: [
       { type: "tool_call", stepId: "step-1", content: { toolCallId: "call-1" } },
@@ -135,7 +177,7 @@ describe("recoverAnsweredQuestionHistory", () => {
     ] }))).rejects.toThrow("question_recovery_tool_lineage_invalid")
   })
 
-  it("rejects a conflicting stable ID or an answer-only snapshot entry", async () => {
+  it("fails closed for a conflicting stable ID or an answer-only snapshot entry", async () => {
     await expect(recoverAnsweredQuestionHistory(client(), input({ existingHistory: [
       { id: "agent-question:question-item:question", content: "different" },
     ] }))).rejects.toThrow("question_recovery_history_collision")

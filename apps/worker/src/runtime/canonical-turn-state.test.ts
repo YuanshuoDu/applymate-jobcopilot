@@ -64,7 +64,7 @@ function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unk
 
 describe("loadCanonicalTurnState", () => {
   it("projects a fenced answered question once into recovered steer history", async () => {
-    const question = { id: "question-item", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null,
+    const question = { id: "question-item", type: "question", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null,
       stepId: "step-1", status: "completed", content: { waitKind: "question", questionId: "question-1", toolCallId: null, question: "Continue?", options: [{ label: "Yes", value: "yes" }], answer: "yes", answerAvailable: true } }
     const events = [
       { id: "started", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null, itemId: "question-item",
@@ -95,7 +95,7 @@ describe("loadCanonicalTurnState", () => {
 
   it("keeps canonical model history unchanged when no persisted answer event matches", async () => {
     const history = [{ id: "snapshot-history", content: { role: "user", text: "Existing baseline context" } }]
-    const pending = { id: "pending-question", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null,
+    const pending = { id: "pending-question", type: "question", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null,
       stepId: null, status: "started", content: { waitKind: "question", questionId: "question-pending", toolCallId: "call-1",
         question: "Continue?", options: [{ label: "Yes", value: "yes" }], answer: null, answerAvailable: false } }
     const snapshot = {
@@ -115,6 +115,29 @@ describe("loadCanonicalTurnState", () => {
       id: `history:${entry.id}`, layer: "steer_history", role: "data", trust: "external_untrusted", source: "steer_history", content: entry.content,
     })) } as never)
     expect(messages).toEqual([{ role: "user", content: [{ type: "text", text: '[harness context layer=steer_history trust=UNTRUSTED_DATA source=steer_history]\n{"role":"user","text":"Existing baseline context"}' }] }])
+  })
+
+  it("keeps ordinary canonical bootstrap alive when the fake repository returns a neighboring Turn row", async () => {
+    const neighboringTurnRow = { id: "turn-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", status: "in_progress" }
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      questionItems: [neighboringTurnRow],
+    })
+
+    await expect(loadCanonicalTurnState(fake, lease)).resolves.toMatchObject({ snapshot: { steerHistory: [] } })
+    const questionQuery = fake.client.query.mock.calls.find(([sql]) => typeof sql === "string" && sql.includes('item."type" = \'question\''))?.[0]
+    expect(questionQuery).toContain('item."type"')
+  })
+
+  it("fails canonical resume closed for an answered question outside the task fence", async () => {
+    const malformedQuestion = { id: "foreign-task-question", type: "question", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "child-task",
+      stepId: "step-1", status: "completed", content: { waitKind: "question", questionId: "question-1", toolCallId: null,
+        question: "Continue?", options: [{ label: "Yes", value: "yes" }], answer: "yes", answerAvailable: true } }
+    const fake = pool({
+      turn: { input: { goal: "Find jobs" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      questionItems: [malformedQuestion],
+    })
+    await expect(loadCanonicalTurnState(fake, lease)).rejects.toThrow("question_recovery_item_scope_invalid")
   })
 
   it("restores the latest scoped cognitive agenda receipt as audit state", async () => {
