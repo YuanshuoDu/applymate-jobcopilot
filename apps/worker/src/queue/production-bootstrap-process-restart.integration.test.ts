@@ -136,6 +136,38 @@ async function waitForQueueJob(queue: Queue, jobId: string, timeoutMs = 20_000) 
   throw new Error(`Timed out waiting for BullMQ job ${jobId}`)
 }
 
+async function duplicateRedeliveryFailureSnapshot(
+  pool: Pool,
+  queue: Queue,
+  turnId: string,
+  sessionId: string,
+  jobId: string,
+  worker: WorkerChild,
+): Promise<string> {
+  const [turn, latestStep, failureEvent, job] = await Promise.all([
+    pool.query(`SELECT turn."status", turn."error", turn."leaseOwnerId", turn."leaseVersion", turn."rootTaskId",
+        root."status" AS "rootStatus", root."failureReason"
+      FROM "agent_turns" AS turn
+      LEFT JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."turnId" = turn."id"
+      WHERE turn."id" = $1 AND turn."sessionId" = $2`, [turnId, sessionId]),
+    pool.query(`SELECT "ordinal", "status", "errorCode", "finishReason"
+      FROM "agent_steps" WHERE "turnId" = $1 AND "sessionId" = $2 ORDER BY "ordinal" DESC LIMIT 1`, [turnId, sessionId]),
+    pool.query(`SELECT "type", "payload" FROM "agent_events"
+      WHERE "turnId" = $1 AND "sessionId" = $2 AND "type" = 'turn.failed'
+      ORDER BY "sequence" DESC LIMIT 1`, [turnId, sessionId]),
+    queue.getJob(jobId).then(async found => found
+      ? { id: found.id, state: await found.getState(), failedReason: found.failedReason }
+      : { id: null, state: "missing", failedReason: null }),
+  ])
+  return JSON.stringify({
+    turn: turn.rows[0] ?? null,
+    latestStep: latestStep.rows[0] ?? null,
+    failureEvent: failureEvent.rows[0] ?? null,
+    job,
+    workerStderr: worker.errors.slice(-20),
+  })
+}
+
 type CheckpointResumeDiagnostics = {
   pool: Pool
   queue: Queue
@@ -1009,7 +1041,10 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     turnQueuePaused = false
 
     const firstDelivery = await waitForLine(workerOne, "DUPLICATE_DELIVERY_FINISHED_1 ")
-    expect(firstDelivery).toContain(`${jobId} completed`)
+    if (firstDelivery !== `DUPLICATE_DELIVERY_FINISHED_1 ${jobId} completed none`) {
+      const runtime = await duplicateRedeliveryFailureSnapshot(pool!, turnQueue!, ids.turnId, ids.sessionId, jobId, workerOne)
+      throw new Error(`First production Turn delivery did not complete: ${firstDelivery}; runtime=${runtime}`)
+    }
     await waitForTurnStatus(pool!, ids.turnId, "completed", 20_000, workerOne)
     const completedJob = await waitForQueueJob(turnQueue!, jobId)
     expect(completedJob.id).toBe(jobId)
