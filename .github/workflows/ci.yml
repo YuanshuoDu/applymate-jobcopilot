@@ -1,7 +1,7 @@
 name: CI
 on:
   pull_request:
-    branches: [master, fix/533-follow-up-successor-turn]
+    branches: [master]
   push:
     branches: [master]
 concurrency:
