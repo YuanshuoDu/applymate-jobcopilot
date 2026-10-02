@@ -80,7 +80,7 @@ type CommandAcceptance = { accepted: CommandAcceptanceResult; duplicate: Command
 const fixturePath = fileURLToPath(new URL("./production-bootstrap-process-restart.fixture.mjs", import.meta.url))
 const workerCwd = fileURLToPath(new URL("../..", import.meta.url))
 
-function startWorker(mode: "accept-message" | "park-parent" | "resume-parent" | "park-active-follow-up" | "accept-active-follow-up" | "resume-active-follow-up" | "replay-active-terminal" | "checkpoint-worker1" | "checkpoint-worker2" | "resolve-checkpoint", ids: FixtureIds): WorkerChild {
+function startWorker(mode: "accept-message" | "park-parent" | "resume-parent" | "duplicate-turn-redelivery" | "park-active-follow-up" | "accept-active-follow-up" | "resume-active-follow-up" | "replay-active-terminal" | "checkpoint-worker1" | "checkpoint-worker2" | "resolve-checkpoint", ids: FixtureIds): WorkerChild {
   const child = spawn(process.execPath, ["--import", "tsx", fixturePath, mode, JSON.stringify(ids)], {
     cwd: workerCwd,
     env: { ...process.env, DATABASE_URL: databaseUrl!, REDIS_URL: redisUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl! },
@@ -124,6 +124,16 @@ async function waitForLine(child: WorkerChild, prefix: string, timeoutMs = 20_00
     await new Promise(resolve => setTimeout(resolve, 20))
   }
   throw new Error(`Timed out waiting for ${prefix}; stdout=${child.output.join(" | ")}; stderr=${child.errors.join(" | ")}`)
+}
+
+async function waitForQueueJob(queue: Queue, jobId: string, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const job = await queue.getJob(jobId)
+    if (job) return job
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  throw new Error(`Timed out waiting for BullMQ job ${jobId}`)
 }
 
 type CheckpointResumeDiagnostics = {
@@ -958,6 +968,123 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     async kind => resumeAtDurableCheckpoint(kind),
     90_000,
   )
+
+  it("redelivers the retained completed BullMQ job ID without repeating persisted Turn work", async () => {
+    const suffix = randomUUID()
+    ids.suffix = suffix
+    ids.sessionId = `duplicate-redelivery-session-${suffix}`
+    fixtureSessionIds.add(ids.sessionId)
+    await pool!.query(
+      `INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+       VALUES ($1, $2, 'Exercise same-ID Turn redelivery', 'running', 'test', CURRENT_TIMESTAMP)`,
+      [ids.sessionId, ids.userId],
+    )
+
+    commandAcceptance = startWorker("accept-message", ids)
+    const acceptedLine = await waitForLine(commandAcceptance, "COMMAND_ACCEPTED ")
+    await waitForExit(commandAcceptance, { stage: "duplicate-redelivery-command-acceptance", pid: commandAcceptance.pid })
+    expect(commandAcceptance.exitCode).toBe(0)
+    const accepted = parseCommandAcceptance(acceptedLine)
+    expect(accepted.accepted.disposition).toBe("started")
+    expect(accepted.duplicate).toMatchObject({
+      inputId: accepted.accepted.inputId,
+      turnId: accepted.accepted.turnId,
+      disposition: "duplicate",
+      originalDisposition: "started",
+    })
+    ids.turnId = accepted.accepted.turnId
+    turnFixtureIds.add(ids.turnId)
+
+    // Hold recovery's real BullMQ dispatch until the production Worker has
+    // attached its completion observer, so the first delivery is deterministic.
+    await turnQueue!.pause()
+    turnQueuePaused = true
+    workerOne = startWorker("duplicate-turn-redelivery", ids)
+    await waitForLine(workerOne, "DUPLICATE_WORKER_READY")
+    const jobId = turnJobKey!(ids.turnId)
+    const pendingJob = await waitForQueueJob(turnQueue!, jobId)
+    expect(pendingJob.id).toBe(jobId)
+    expect(pendingJob.data).toMatchObject({ turnId: ids.turnId, sessionId: ids.sessionId })
+    await turnQueue!.resume()
+    turnQueuePaused = false
+
+    const firstDelivery = await waitForLine(workerOne, "DUPLICATE_DELIVERY_FINISHED_1 ")
+    expect(firstDelivery).toContain(`${jobId} completed`)
+    await waitForTurnStatus(pool!, ids.turnId, "completed", 20_000, workerOne)
+    const completedJob = await waitForQueueJob(turnQueue!, jobId)
+    expect(completedJob.id).toBe(jobId)
+    expect(await completedJob.getState()).toBe("completed")
+    const originalTimestamp = completedJob.timestamp
+    const firstReceipt = await pool!.query<{
+      status: string
+      leaseOwnerId: string | null
+      leaseVersion: number
+      finalResponse: string | null
+      finalItemCount: string
+      completionEventCount: string
+    }>(
+      `SELECT turn."status", turn."leaseOwnerId", turn."leaseVersion", turn."finalResponse",
+         (SELECT COUNT(*)::text FROM "agent_items" AS item
+          WHERE item."turnId" = turn."id" AND item."sessionId" = turn."sessionId" AND item."type" = 'agent_message') AS "finalItemCount",
+         (SELECT COUNT(*)::text FROM "agent_events" AS event
+          WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId"
+            AND event."idempotencyKey" = 'turn:' || turn."id" || ':event:turn-completed') AS "completionEventCount"
+       FROM "agent_turns" AS turn WHERE turn."id" = $1 AND turn."sessionId" = $2`,
+      [ids.turnId, ids.sessionId],
+    )
+    expect(firstReceipt.rows[0]).toMatchObject({
+      status: "completed",
+      leaseOwnerId: null,
+      leaseVersion: 1,
+      finalItemCount: "1",
+      completionEventCount: "1",
+    })
+    expect(firstReceipt.rows[0]?.finalResponse).toContain(`single-side-effect-${suffix}`)
+
+    // BullMQ's retry script requeues this retained completed record in place.
+    // Pausing the queue keeps the same job hash observable before redelivery.
+    await turnQueue!.pause()
+    turnQueuePaused = true
+    await completedJob.retry("completed")
+    const replayJob = await waitForQueueJob(turnQueue!, jobId)
+    expect(replayJob.id).toBe(jobId)
+    expect(replayJob.timestamp).toBe(originalTimestamp)
+    expect(replayJob.data).toEqual(completedJob.data)
+    expect(["paused", "wait"]).toContain(await replayJob.getState())
+    await turnQueue!.resume()
+    turnQueuePaused = false
+
+    const replayDelivery = await waitForLine(workerOne, "DUPLICATE_DELIVERY_FINISHED_2 ")
+    expect(replayDelivery).toBe(`DUPLICATE_DELIVERY_FINISHED_2 ${jobId} skipped lease_not_available`)
+    const finalReceipt = await pool!.query<{
+      status: string
+      leaseOwnerId: string | null
+      leaseVersion: number
+      finalResponse: string | null
+      finalItemCount: string
+      completionEventCount: string
+    }>(
+      `SELECT turn."status", turn."leaseOwnerId", turn."leaseVersion", turn."finalResponse",
+         (SELECT COUNT(*)::text FROM "agent_items" AS item
+          WHERE item."turnId" = turn."id" AND item."sessionId" = turn."sessionId" AND item."type" = 'agent_message') AS "finalItemCount",
+         (SELECT COUNT(*)::text FROM "agent_events" AS event
+          WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId"
+            AND event."idempotencyKey" = 'turn:' || turn."id" || ':event:turn-completed') AS "completionEventCount"
+       FROM "agent_turns" AS turn WHERE turn."id" = $1 AND turn."sessionId" = $2`,
+      [ids.turnId, ids.sessionId],
+    )
+    expect(finalReceipt.rows[0]).toEqual(firstReceipt.rows[0])
+    expect(workerOne.output.filter(line => line.startsWith("DUPLICATE_MODEL_CALL "))).toEqual(["DUPLICATE_MODEL_CALL 1"])
+    expect(workerOne.output.filter(line => line.startsWith("DUPLICATE_DELIVERY_FINISHED_")).map(line => line.split(" ").slice(2))).toEqual([
+      [jobId, "completed", "none"],
+      [jobId, "skipped", "lease_not_available"],
+    ])
+
+    workerOne.stdin?.write("shutdown\n")
+    await waitForLine(workerOne, "SHUTDOWN_STAGE bootstrap_close:complete", 10_000)
+    await waitForExit(workerOne, { stage: "duplicate-redelivery-worker-shutdown", pid: workerOne.pid })
+    expect(workerOne.exitCode).toBe(0)
+  }, 60_000)
 
   it("persists a child result, kills its Worker, and resumes the parent from PostgreSQL under a new lease", async () => {
     // Exercise the Web command service against the migrated disposable database.

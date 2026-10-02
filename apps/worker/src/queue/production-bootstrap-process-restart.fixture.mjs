@@ -592,6 +592,50 @@ async function makeSecondWorker() {
   await waitForStop()
 }
 
+async function makeDuplicateRedeliveryWorker() {
+  let modelCalls = 0
+  let deliveryCount = 0
+  await startFixtureProductionRuntime({
+    workerId: `duplicate-redelivery-worker-${process.pid}`,
+    productionFlags: {
+      childExecutionEnabled: false,
+      coordinationEnabled: false,
+      consumeWaitOutcomes: false,
+      canonicalAutomationEnabled: false,
+    },
+    runtimeOptions: {
+      modelRuntimeFactory() {
+        return {
+          adapter: {
+            id: "duplicate-redelivery-fixture-model",
+            profile: modelProfile(),
+            async *stream() {
+              modelCalls += 1
+              say(`DUPLICATE_MODEL_CALL ${modelCalls}`)
+              yield { type: "text_delta", text: `single-side-effect-${ids.suffix}` }
+              yield { type: "completed", finishReason: "stop" }
+            },
+          },
+          registry: {}, candidates: [],
+        }
+      },
+    },
+    bootstrapOptions: {
+      ownerId: `duplicate-redelivery-worker-${process.pid}`,
+      turnRecoveryIntervalMs: 10,
+    },
+  })
+  bootstrap.turns.worker.on("completed", (job, result) => {
+    if (job.data.turnId !== ids.turnId) return
+    deliveryCount += 1
+    const status = result && typeof result === "object" ? result.status ?? "unknown" : "unknown"
+    const reason = result && typeof result === "object" ? result.reasonCode ?? "none" : "none"
+    say(`DUPLICATE_DELIVERY_FINISHED_${deliveryCount} ${job.id} ${status} ${reason}`)
+  })
+  say("DUPLICATE_WORKER_READY")
+  await waitForStop()
+}
+
 function checkpointInputs() {
   if (!ids.checkpointKind || !ids.checkpointWaitId || !ids.readCallId) throw new Error("checkpoint_fixture_ids_missing")
   return ids
@@ -835,6 +879,7 @@ async function run() {
   if (mode === "accept-message") await acceptMessage()
   else if (mode === "park-parent") await makeFirstWorker()
   else if (mode === "resume-parent") await makeSecondWorker()
+  else if (mode === "duplicate-turn-redelivery") await makeDuplicateRedeliveryWorker()
   else if (mode === "park-active-follow-up") await makeActiveFollowUpWorker()
   else if (mode === "accept-active-follow-up") await acceptActiveFollowUp()
   else if (mode === "resume-active-follow-up") await makeFollowUpResumeWorker()
