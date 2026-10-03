@@ -1,4 +1,4 @@
-import { reduceTaskGraphEvent, type TaskGraphEvent, type TaskGraphEventType, type TaskGraphState } from "../planning/task-graph.js"
+import { deriveTaskGraphReadModel, reduceTaskGraphEvent, type TaskGraphEvent, type TaskGraphEventType, type TaskGraphState } from "../planning/task-graph.js"
 import type { Queryable } from "./pg-store-persistence.js"
 import { hasPersistedTaskGraphMembership, loadTaskGraph, type GraphIdentityScope } from "./task-graph-pg-state.js"
 import { sanitizeTaskGraphLifecycleEvent, writeTaskLifecycleReceipt } from "./task-graph-pg-events.js"
@@ -92,15 +92,12 @@ export async function reconcileGraphDependents(
     if (!loaded.item || !loaded.snapshot || !loaded.state) throw new Error("task_graph_state_missing")
     const taskByKey = new Map(loaded.snapshot.nodes.map(node => [node.key, loaded.tasks.get(node.taskId)!] as const))
     const nodes = [...loaded.state.nodes].sort((left, right) => left.depth - right.depth)
+    const repairSatisfied = new Set(loaded.state.repairSatisfiedNodeKeys ?? [])
+    const readinessState = { ...loaded.state, nodes: loaded.state.nodes.map(node => repairSatisfied.has(node.key) ? { ...node, status: "completed" as const } : node) }
+    const readinessByKey = new Map(deriveTaskGraphReadModel(readinessState).map(node => [node.key, node.readiness] as const))
     let changed = false
-    const blockedKeys = new Set<string>()
     for (const node of nodes) {
-      const dependencyStatuses = node.dependsOn.map(key => taskByKey.get(key)?.status)
-      const blocked = node.dependsOn.some((key, index) => {
-        const status = dependencyStatuses[index]
-        return status === "failed" || status === "interrupted" || status === "cancelled" || status === "closed" || blockedKeys.has(key)
-      })
-      if (blocked) blockedKeys.add(node.key)
+      const blocked = readinessByKey.get(node.key) === "blocked_dependency"
       const row = taskByKey.get(node.key)
       if (!row) continue
       if (options.allowClosedSession && isActiveGraphStatus(row.status)) {
@@ -149,7 +146,7 @@ export async function reconcileGraphDependents(
         continue
       }
       if (options.allowClosedSession) continue
-      if (!node.dependsOn.every(key => taskByKey.get(key)?.status === "completed")) continue
+      if (!node.dependsOn.every(key => taskByKey.get(key)?.status === "completed" || repairSatisfied.has(key))) continue
       const transition = await prepareGraphTransition(client, { taskId: row.id, sessionId: scope.sessionId, type: "task.queued" })
       if (!transition) throw new Error("task_graph_child_missing")
       if ("blocked" in transition) continue

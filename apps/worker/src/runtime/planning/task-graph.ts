@@ -1,21 +1,18 @@
 import type { SubagentTaskStatus } from "../subagents/types.js"
-
+import { taskGraphVerificationRole, validateTaskGraphVerificationContract, type TaskGraphVerificationContract } from "./task-graph-verification.js"
 export type TaskGraphNodeStatus = SubagentTaskStatus
+export type TaskGraphVerificationDisposition = "typed" | "legacy_unverified" | "specialized"
+export type TaskGraphRepairOf = Readonly<{ graphRootTaskId: string; nodeKey: string; taskId: string; criterionIds: string[] }>
 export type TaskGraphNodeProposal = Readonly<{
-  key: string
-  templateId: string
-  goal: string
-  successCriteria: readonly string[]
-  dependsOn: readonly string[]
+  key: string; templateId: string; goal: string
+  /** Explanatory instructions only; these strings are never treated as verification proof. */
+  successCriteria: readonly string[]; dependsOn: readonly string[]
+  verification?: TaskGraphVerificationContract; repairOf?: TaskGraphRepairOf
 }>
 export type TaskGraphProposal = Readonly<{ expectedRevision: number; nodes: readonly TaskGraphNodeProposal[] }>
-export type TaskGraphNode = TaskGraphNodeProposal & Readonly<{ depth: number; status: TaskGraphNodeStatus; failureReason?: string }>
-export type TaskGraphState = Readonly<{ revision: number; nodes: readonly TaskGraphNode[]; appliedEvents: readonly TaskGraphEvent[] }>
-export type TaskGraphValidationOptions = Readonly<{
-  registeredTemplateIds: ReadonlySet<string>
-  maxNodes: number
-  maxDepth: number
-}>
+export type TaskGraphNode = TaskGraphNodeProposal & Readonly<{ depth: number; status: TaskGraphNodeStatus; taskId?: string; failureReason?: string; verificationDisposition?: TaskGraphVerificationDisposition }>
+export type TaskGraphState = Readonly<{ revision: number; nodes: readonly TaskGraphNode[]; appliedEvents: readonly TaskGraphEvent[]; repairSatisfiedNodeKeys?: readonly string[]; repairPendingNodeKeys?: readonly string[] }>
+export type TaskGraphValidationOptions = Readonly<{ registeredTemplateIds: ReadonlySet<string>; maxNodes: number; maxDepth: number }>
 
 /** Hard persisted-shape limits shared by model validation and snapshot parsing. */
 export const TASK_GRAPH_LIMITS = {
@@ -31,35 +28,22 @@ export const TASK_GRAPH_LIMITS = {
   maxDependencies: 8,
 } as const
 
-export type TaskGraphEventType =
-  | "task.started" | "task.queued" | "task.waiting" | "task.waiting_for_user" | "task.retrying"
-  | "task.completed" | "task.failed" | "task.interrupted" | "task.cancelled" | "task.closed"
+export type TaskGraphEventType = "task.started" | "task.queued" | "task.waiting" | "task.waiting_for_user" | "task.retrying" | "task.completed" | "task.failed" | "task.interrupted" | "task.cancelled" | "task.closed"
 type TaskGraphEventBase = Readonly<{ idempotencyKey: string; expectedRevision: number; nodeKey: string }>
-export type TaskGraphEvent = TaskGraphEventBase & (
-  | Readonly<{ type: Exclude<TaskGraphEventType, "task.failed"> }>
-  | Readonly<{ type: "task.failed"; failureReason: string }>
-)
+export type TaskGraphEvent = TaskGraphEventBase & (Readonly<{ type: Exclude<TaskGraphEventType, "task.failed"> }> | Readonly<{ type: "task.failed"; failureReason: string }>)
 
-export type TaskGraphErrorCode =
-  | "invalid_shape" | "invalid_options" | "invalid_state" | "revision_mismatch" | "empty_proposal"
-  | "duplicate_key" | "unknown_template" | "missing_dependency" | "dependency_cycle" | "node_limit"
-  | "depth_limit" | "node_not_found" | "invalid_transition" | "dependencies_incomplete"
-  | "blocked_dependency" | "idempotency_conflict"
+export type TaskGraphErrorCode = "invalid_shape" | "invalid_options" | "invalid_state" | "revision_mismatch" | "empty_proposal" | "duplicate_key" | "unknown_template" | "missing_dependency" | "dependency_cycle" | "node_limit" | "depth_limit" | "node_not_found" | "invalid_transition" | "dependencies_incomplete" | "blocked_dependency" | "idempotency_conflict" | "verification_required" | "verification_invalid" | "unsupported_verification_template" | "repair_invalid"
 export type TaskGraphError = Readonly<{ code: TaskGraphErrorCode; path: string; message: string }>
 export type TaskGraphFailure = Readonly<{ ok: false; error: TaskGraphError }>
-export type TaskGraphValidationResult = TaskGraphFailure | Readonly<{
-  ok: true; proposal: TaskGraphProposal; addedNodes: readonly TaskGraphNode[]
-}>
-export type TaskGraphAppendResult = TaskGraphFailure | Readonly<{
-  ok: true; state: TaskGraphState; addedNodes: readonly TaskGraphNode[]
-}>
-export type TaskGraphTransitionResult = TaskGraphFailure | Readonly<{
-  ok: true; state: TaskGraphState; duplicate: boolean
-}>
+export type TaskGraphValidationResult = TaskGraphFailure | Readonly<{ ok: true; proposal: TaskGraphProposal; addedNodes: readonly TaskGraphNode[] }>
+export type TaskGraphAppendResult = TaskGraphFailure | Readonly<{ ok: true; state: TaskGraphState; addedNodes: readonly TaskGraphNode[] }>
+export type TaskGraphTransitionResult = TaskGraphFailure | Readonly<{ ok: true; state: TaskGraphState; duplicate: boolean }>
 export type TaskGraphReadiness = "ready" | "waiting_for_dependencies" | "blocked_dependency" | "active" | "terminal"
 export type TaskGraphReadNode = TaskGraphNode & Readonly<{ readiness: TaskGraphReadiness }>
 
 const NODE_KEYS = "dependsOn,goal,key,successCriteria,templateId"
+const NODE_KEYS_WITH_VERIFICATION = `${NODE_KEYS},verification`
+const NODE_KEYS_WITH_REPAIR = "dependsOn,goal,key,repairOf,successCriteria,templateId,verification"
 const TERMINAL = new Set<TaskGraphNodeStatus>(["completed", "failed", "interrupted", "cancelled", "closed"])
 const BLOCKING = new Set<TaskGraphNodeStatus>(["failed", "interrupted", "cancelled", "closed"])
 const ACTIVE_FROM: Readonly<Record<TaskGraphEventType, readonly TaskGraphNodeStatus[]>> = {
@@ -103,15 +87,47 @@ function textArray(value: unknown, allowEmpty: boolean, maxItems: number, maxLen
   }
   return true
 }
+function parseRepairOf(value: unknown, index: number): TaskGraphRepairOf | TaskGraphFailure {
+  const path = `nodes[${index}].repairOf`
+  if (!plainRecord(value, "criterionIds,graphRootTaskId,nodeKey,taskId") || !text(value.graphRootTaskId, 128)
+    || !text(value.nodeKey, TASK_GRAPH_LIMITS.maxKeyLength) || !text(value.taskId, TASK_GRAPH_LIMITS.maxKeyLength)
+    || !textArray(value.criterionIds, false, TASK_GRAPH_LIMITS.maxSuccessCriteria, 64)
+    || new Set(value.criterionIds).size !== value.criterionIds.length) return fail("invalid_shape", path, "repairOf must name a root, prior node, task, and unique criteria")
+  return { graphRootTaskId: value.graphRootTaskId, nodeKey: value.nodeKey, taskId: value.taskId, criterionIds: [...value.criterionIds] }
+}
 function parseNode(value: unknown, index: number): TaskGraphNodeProposal | TaskGraphFailure {
   const path = `nodes[${index}]`
-  if (!plainRecord(value, NODE_KEYS)) return fail("invalid_shape", path, "Node must contain exactly key, templateId, goal, successCriteria, and dependsOn")
+  if (!plainRecord(value, NODE_KEYS) && !plainRecord(value, NODE_KEYS_WITH_VERIFICATION) && !plainRecord(value, NODE_KEYS_WITH_REPAIR)) return fail("invalid_shape", path, "Node must contain the exact TaskGraph fields and optional typed verification or repair relation")
   if (!text(value.key, TASK_GRAPH_LIMITS.maxKeyLength) || !text(value.templateId, TASK_GRAPH_LIMITS.maxTemplateIdLength)
     || !text(value.goal, TASK_GRAPH_LIMITS.maxGoalLength)) return fail("invalid_shape", path, "key, templateId, and goal must be non-empty and within their length limits")
   if (!textArray(value.successCriteria, false, TASK_GRAPH_LIMITS.maxSuccessCriteria, TASK_GRAPH_LIMITS.maxCriterionLength)) return fail("invalid_shape", `${path}.successCriteria`, "Success criteria must contain one to eight non-empty strings of at most 320 characters")
   if (!textArray(value.dependsOn, true, TASK_GRAPH_LIMITS.maxDependencies, TASK_GRAPH_LIMITS.maxKeyLength)) return fail("invalid_shape", `${path}.dependsOn`, "dependsOn must contain at most eight non-empty local keys of at most 128 characters")
   if (new Set(value.dependsOn).size !== value.dependsOn.length) return fail("invalid_shape", `${path}.dependsOn`, "Dependencies must be unique")
-  return { key: value.key as string, templateId: value.templateId as string, goal: value.goal as string, successCriteria: [...value.successCriteria] as string[], dependsOn: [...value.dependsOn] as string[] }
+  const node = value as Record<string, unknown>
+  let repairOf: TaskGraphRepairOf | undefined
+  if (Object.hasOwn(node, "repairOf")) { const parsed = parseRepairOf(node.repairOf, index); if ("ok" in parsed) return parsed; repairOf = parsed }
+  return { key: value.key as string, templateId: value.templateId as string, goal: value.goal as string, successCriteria: [...value.successCriteria] as string[], dependsOn: [...value.dependsOn] as string[], ...(Object.hasOwn(node, "verification") ? { verification: node.verification as TaskGraphVerificationContract } : {}), ...(repairOf ? { repairOf } : {}) }
+}
+export function isValidTaskGraphRepairRelation(node: TaskGraphNodeProposal, target: TaskGraphNodeProposal & Readonly<{ taskId?: string; verificationDisposition?: TaskGraphVerificationDisposition }>): boolean {
+  const relation = node.repairOf, role = taskGraphVerificationRole(node.templateId)
+  const targetContract = validateTaskGraphVerificationContract(target.verification, target.templateId)
+  const repairContract = validateTaskGraphVerificationContract(node.verification, node.templateId)
+  if (!relation || !role || node.templateId !== target.templateId || relation.nodeKey !== target.key || relation.taskId !== target.taskId
+    || !relation.graphRootTaskId.trim() || target.verificationDisposition === "legacy_unverified" || target.verificationDisposition === "specialized"
+    || node.dependsOn.includes(target.key) || !targetContract.ok || !repairContract.ok
+    || new Set(relation.criterionIds).size !== relation.criterionIds.length || repairContract.contract.criteria.length !== relation.criterionIds.length) return false
+  const criteria = new Map(targetContract.contract.criteria.map(item => [item.id, item.check] as const))
+  return relation.criterionIds.every(id => criteria.has(id)) && repairContract.contract.criteria.every(item => relation.criterionIds.includes(item.id) && JSON.stringify(item.check) === JSON.stringify(criteria.get(item.id)))
+}
+function validateNodeVerification(node: TaskGraphNodeProposal, index: number, state: TaskGraphState): TaskGraphNodeProposal | TaskGraphFailure {
+  const supported = taskGraphVerificationRole(node.templateId) !== undefined
+  if (node.repairOf && !supported) return fail("repair_invalid", `nodes[${index}].repairOf`, "Only typed Scout and Analyst nodes can repair criteria")
+  if (!supported && node.verification === undefined) return node
+  if (node.verification === undefined) return fail("verification_required", `nodes[${index}].verification`, "Scout and Analyst nodes require typed verification criteria")
+  const result = validateTaskGraphVerificationContract(node.verification, node.templateId)
+  if (!result.ok) return fail(result.error.code === "unsupported_template" ? "unsupported_verification_template" : "verification_invalid", `nodes[${index}].${result.error.path}`, "Typed verification contract is not valid for the registered template")
+  if (node.repairOf) { const target = state.nodes.find(item => item.key === node.repairOf!.nodeKey); if (!target || !isValidTaskGraphRepairRelation(node, target)) return fail("repair_invalid", `nodes[${index}].repairOf`, "Repair must match criteria on an existing typed node without adding a dependency edge") }
+  return { ...node, verification: result.contract }
 }
 
 export function createInitialTaskGraphState(): TaskGraphState {
@@ -134,7 +150,9 @@ export function validateTaskGraphProposal(value: unknown, state: TaskGraphState,
     if ("ok" in parsed) return parsed
     if (keys.has(parsed.key)) return fail("duplicate_key", `nodes[${index}].key`, "Node keys must be unique across the graph")
     if (!options.registeredTemplateIds.has(parsed.templateId)) return fail("unknown_template", `nodes[${index}].templateId`, "Template ID is not registered")
-    keys.add(parsed.key); nodes.push(parsed)
+    const verified = validateNodeVerification(parsed, index, state)
+    if ("ok" in verified) return verified
+    keys.add(verified.key); nodes.push(verified)
   }
   const all: readonly (TaskGraphNode | TaskGraphNodeProposal)[] = [...state.nodes, ...nodes]
   const byKey = new Map<string, TaskGraphNode | TaskGraphNodeProposal>(all.map(node => [node.key, node] as const))
@@ -158,43 +176,43 @@ export function validateTaskGraphProposal(value: unknown, state: TaskGraphState,
   }
   if (processed !== all.length) return fail("dependency_cycle", "nodes", "Dependencies must form a directed acyclic graph")
   const proposal: TaskGraphProposal = { expectedRevision: value.expectedRevision, nodes }
-  const addedNodes = nodes.map(node => ({ ...node, depth: depths.get(node.key)!, status: "queued" as const }))
+  const addedNodes = nodes.map(node => ({
+    ...node, depth: depths.get(node.key)!, status: "queued" as const,
+  }))
   return { ok: true, proposal, addedNodes }
 }
 
 export function appendTaskGraphProposal(state: TaskGraphState, value: unknown, options: TaskGraphValidationOptions): TaskGraphAppendResult {
   const validation = validateTaskGraphProposal(value, state, options)
   if (!validation.ok) return validation
-  return { ok: true, state: { revision: state.revision + 1, nodes: [...state.nodes, ...validation.addedNodes], appliedEvents: state.appliedEvents }, addedNodes: validation.addedNodes }
+  return { ok: true, state: { revision: state.revision + 1, nodes: [...state.nodes, ...validation.addedNodes], appliedEvents: state.appliedEvents, repairSatisfiedNodeKeys: state.repairSatisfiedNodeKeys, repairPendingNodeKeys: state.repairPendingNodeKeys }, addedNodes: validation.addedNodes }
 }
 
-function blockedByDependency(node: TaskGraphNode, byKey: ReadonlyMap<string, TaskGraphNode>, memo: Map<string, boolean>): boolean {
+function blockedByDependency(node: TaskGraphNode, byKey: ReadonlyMap<string, TaskGraphNode>, memo: Map<string, boolean>, repaired: ReadonlySet<string>, pending: ReadonlySet<string>): boolean {
   const known = memo.get(node.key)
   if (known !== undefined) return known
   const blocked = node.dependsOn.some(key => {
     const dependency = byKey.get(key)
-    return !dependency || BLOCKING.has(dependency.status) || blockedByDependency(dependency, byKey, memo)
+    return !dependency || ((BLOCKING.has(dependency.status) && !repaired.has(key) && !pending.has(key))
+      || blockedByDependency(dependency, byKey, memo, repaired, pending))
   })
   memo.set(node.key, blocked); return blocked
 }
-
 export function deriveTaskGraphReadModel(state: TaskGraphState): readonly TaskGraphReadNode[] {
-  const byKey = new Map<string, TaskGraphNode>(state.nodes.map(node => [node.key, node] as const)), blocked = new Map<string, boolean>()
+  const byKey = new Map<string, TaskGraphNode>(state.nodes.map(node => [node.key, node] as const)), blocked = new Map<string, boolean>(), repaired = new Set(state.repairSatisfiedNodeKeys ?? []), pending = new Set(state.repairPendingNodeKeys ?? [])
   return state.nodes.map(node => {
     let readiness: TaskGraphReadiness
     if (node.status === "queued" || node.status === "waiting") {
-      if (blockedByDependency(node, byKey, blocked)) readiness = "blocked_dependency"
-      else readiness = node.dependsOn.every(key => byKey.get(key)?.status === "completed") ? "ready" : "waiting_for_dependencies"
+      if (blockedByDependency(node, byKey, blocked, repaired, pending)) readiness = "blocked_dependency"
+      else readiness = node.dependsOn.every(key => byKey.get(key)?.status === "completed" || repaired.has(key)) ? "ready" : "waiting_for_dependencies"
     }
     else readiness = TERMINAL.has(node.status) ? "terminal" : "active"
     return { ...node, readiness }
   })
 }
-
 export function deriveReadyTaskGraphNodes(state: TaskGraphState): readonly TaskGraphNode[] {
   return deriveTaskGraphReadModel(state).filter(node => node.status === "queued" && node.readiness === "ready")
 }
-
 function parseEvent(value: unknown): TaskGraphEvent | TaskGraphFailure {
   if (!value || typeof value !== "object" || Array.isArray(value)) return fail("invalid_shape", "event", "Event must be an object")
   const row = value as Record<string, unknown>
@@ -211,7 +229,6 @@ function sameEvent(left: TaskGraphEvent, right: TaskGraphEvent): boolean {
   return left.type === right.type && left.idempotencyKey === right.idempotencyKey && left.expectedRevision === right.expectedRevision
     && left.nodeKey === right.nodeKey && (left.type !== "task.failed" || (right.type === "task.failed" && left.failureReason === right.failureReason))
 }
-
 export function reduceTaskGraphEvent(state: TaskGraphState, value: unknown): TaskGraphTransitionResult {
   const event = parseEvent(value)
   if ("ok" in event) return event
@@ -222,12 +239,12 @@ export function reduceTaskGraphEvent(state: TaskGraphState, value: unknown): Tas
   if (!node) return fail("node_not_found", "event.nodeKey", "TaskGraph node does not exist")
   if (!ACTIVE_FROM[event.type].includes(node.status)) return fail("invalid_transition", "event.type", `Cannot apply ${event.type} to ${node.status}`)
   if (event.type === "task.started" || event.type === "task.queued") {
-    const byKey = new Map<string, TaskGraphNode>(state.nodes.map(item => [item.key, item] as const))
-    if (blockedByDependency(node, byKey, new Map())) return fail("blocked_dependency", "event.nodeKey", "A blocking dependency prevents this node from becoming ready")
-    if (!node.dependsOn.every(key => byKey.get(key)?.status === "completed")) return fail("dependencies_incomplete", "event.nodeKey", "All dependencies must be completed before a node can be queued or started")
+    const byKey = new Map<string, TaskGraphNode>(state.nodes.map(item => [item.key, item] as const)), repaired = new Set(state.repairSatisfiedNodeKeys ?? []), pending = new Set(state.repairPendingNodeKeys ?? [])
+    if (blockedByDependency(node, byKey, new Map(), repaired, pending)) return fail("blocked_dependency", "event.nodeKey", "A blocking dependency prevents this node from becoming ready")
+    if (!node.dependsOn.every(key => byKey.get(key)?.status === "completed" || repaired.has(key))) return fail("dependencies_incomplete", "event.nodeKey", "All dependencies must be completed before a node can be queued or started")
   }
   const updated = state.nodes.map(item => item.key !== node.key ? item : {
     ...item, status: NEXT_STATUS[event.type], ...(event.type === "task.failed" ? { failureReason: event.failureReason } : {}),
   })
-  return { ok: true, state: { revision: state.revision + 1, nodes: updated, appliedEvents: [...state.appliedEvents, event] }, duplicate: false }
+  return { ok: true, state: { revision: state.revision + 1, nodes: updated, appliedEvents: [...state.appliedEvents, event], repairSatisfiedNodeKeys: state.repairSatisfiedNodeKeys, repairPendingNodeKeys: state.repairPendingNodeKeys }, duplicate: false }
 }

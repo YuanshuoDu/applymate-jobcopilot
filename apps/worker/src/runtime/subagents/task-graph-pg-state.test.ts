@@ -3,8 +3,9 @@ import type pg from "pg"
 
 import { currentTaskGraph, loadTaskGraph, lockTaskGraphScope } from "./task-graph-pg-state.js"
 import type { GraphIdentityScope, GraphScope } from "./task-graph-pg-state.js"
-import { taskGraphItemId, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
-import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./task-graph-command-port.js"
+import { canonicalTaskGraphJson, taskGraphItemId, taskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION, TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./task-graph-command-port.js"
 
 type QueryResult = { rows: Array<Record<string, unknown>>; rowCount: number }
 type QueryCall = { sql: string; values: readonly unknown[] }
@@ -39,6 +40,23 @@ function validSnapshot(nodeCount = 1) {
 
 function validTaskRow(overrides: Record<string, unknown> = {}) {
   return { id: "child-1", status: "queued", role: "analyst", failureReason: null, result: null, ...overrides }
+}
+
+const analystVerification = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
+  criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }],
+} as const
+const findingReport = {
+  verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status: "failed", reasonCode: "criterion_not_met",
+  criteria: [{ criterionId: "finding-count", status: "failed", reasonCode: "criterion_not_met" }], evidenceDigest: "a".repeat(64), resultDigest: "e".repeat(64),
+} as const
+
+function typedSnapshot() {
+  const snapshot = validSnapshot()
+  return {
+    ...snapshot,
+    nodes: snapshot.nodes.map(node => ({ ...node, verification: analystVerification, verificationDisposition: "typed" as const })),
+  }
 }
 
 function completedEnvelope(structuredResult: unknown, finalText = "persisted child text") {
@@ -102,6 +120,95 @@ function fakeClient(options: ClientOptions = {}) {
 }
 
 describe("TaskGraph PostgreSQL state loading", () => {
+  it("restores a typed contract from persisted canonical content across a Worker restart", async () => {
+    const persisted = canonicalTaskGraphJson(typedSnapshot())
+    const firstWorker = await loadTaskGraph(fakeClient({ itemContent: persisted }).client, identity)
+
+    expect(firstWorker.snapshot?.nodes[0]).toMatchObject({ verificationDisposition: "typed", verification: analystVerification })
+    expect(firstWorker.state?.nodes[0]?.verification).toEqual(analystVerification)
+    const rewritten = taskGraphSnapshot(firstWorker.state!, new Map([["child", "child-1"]]))
+    const restartedWorker = await loadTaskGraph(fakeClient({ itemContent: canonicalTaskGraphJson(rewritten) }).client, identity)
+    expect(restartedWorker.snapshot?.nodes[0]).toMatchObject({ verificationDisposition: "typed", verification: analystVerification })
+    expect(restartedWorker.state?.nodes[0]?.verification).toEqual(analystVerification)
+  })
+
+  it("projects only the exact server-authored verification report for snapshot criteria", async () => {
+    const report = { ...findingReport, privateOutput: "person@example.com" }
+    const fake = fakeClient({ itemContent: typedSnapshot(), taskRows: [validTaskRow({
+      status: "failed", role: "analyst", result: { taskGraphVerificationReport: findingReport, raw: "private raw output" },
+    })] })
+    const node = currentTaskGraph(await loadTaskGraph(fake.client, identity)).nodes[0]!
+    expect(node).toMatchObject({ verificationCriterionIds: ["finding-count"], verificationReport: findingReport })
+    expect(JSON.stringify(node)).not.toContain("private raw output")
+    const malformed = fakeClient({ itemContent: typedSnapshot(), taskRows: [validTaskRow({
+      status: "failed", role: "analyst", result: { taskGraphVerificationReport: report },
+    })] })
+    await expect(loadTaskGraph(malformed.client, identity).then(currentTaskGraph)).rejects.toThrow("task_graph_verification_report_invalid")
+    const wrongCriterion = fakeClient({ itemContent: typedSnapshot(), taskRows: [validTaskRow({
+      status: "failed", role: "analyst", result: { taskGraphVerificationReport: { ...findingReport, criteria: [{ ...findingReport.criteria[0], criterionId: "other" }] } },
+    })] })
+    await expect(loadTaskGraph(wrongCriterion.client, identity).then(currentTaskGraph)).rejects.toThrow("task_graph_verification_report_invalid")
+    const missing = fakeClient({ itemContent: typedSnapshot(), taskRows: [validTaskRow({ status: "completed", role: "analyst" })] })
+    await expect(loadTaskGraph(missing.client, identity).then(currentTaskGraph)).rejects.toThrow("task_graph_verification_report_invalid")
+    const incoherent = fakeClient({ itemContent: typedSnapshot(), taskRows: [validTaskRow({
+      status: "completed", role: "analyst", result: { taskGraphVerificationReport: { ...findingReport, status: "passed", reasonCode: "criteria_met" } },
+    })] })
+    await expect(loadTaskGraph(incoherent.client, identity).then(currentTaskGraph)).rejects.toThrow("task_graph_verification_report_invalid")
+  })
+
+  it("projects repair receipts separately and preserves the original failed target report", async () => {
+    const snapshot = typedSnapshot()
+    const source = snapshot.nodes[0]!
+    const repair = {
+      ...source, key: "repair", taskId: "child-2", repairOf: {
+        graphRootTaskId: "root-1", nodeKey: source.key, taskId: source.taskId, criterionIds: ["finding-count"],
+      },
+    }
+    const itemContent = { ...snapshot, nodes: [source, repair] }
+    const passed = { ...findingReport, status: "passed", reasonCode: "criteria_met", criteria: [{ criterionId: "finding-count", status: "passed", reasonCode: "criteria_met" }], evidenceDigest: "b".repeat(64) }
+    const receipt = {
+      schemaVersion: TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION, graphRootTaskId: "root-1", targetNodeKey: "child", targetTaskId: "child-1", criterionIds: ["finding-count"],
+      repairNodeKey: "repair", repairTaskId: "child-2", verifierVersion: "agent-harness.v2.task-graph-verifier.v1", evidenceDigest: passed.evidenceDigest,
+    }
+    const fake = fakeClient({ itemContent, taskRows: [
+      validTaskRow({ status: "failed", role: "analyst", result: { taskGraphVerificationReport: findingReport } }),
+      validTaskRow({ id: "child-2", status: "completed", role: "analyst", result: { taskGraphVerificationReport: passed, taskGraphRepairReceipt: receipt } }),
+    ] })
+    const nodes = currentTaskGraph(await loadTaskGraph(fake.client, identity)).nodes
+    expect(nodes[0]).toMatchObject({ verificationReport: findingReport })
+    expect(nodes[0]).not.toHaveProperty("repairReceipt")
+    expect(nodes[1]).toMatchObject({ verificationReport: passed, repairReceipt: receipt, repairOf: repair.repairOf })
+    const missingReceipt = fakeClient({ itemContent, taskRows: [
+      validTaskRow({ status: "failed", role: "analyst", result: { taskGraphVerificationReport: findingReport } }),
+      validTaskRow({ id: "child-2", status: "completed", role: "analyst", result: { taskGraphVerificationReport: passed } }),
+    ] })
+    await expect(loadTaskGraph(missingReceipt.client, identity).then(currentTaskGraph)).rejects.toThrow("task_graph_verification_report_invalid")
+  })
+
+  it("retains legacy_unverified on pre-verifier snapshots through load, rewrite, and restart", async () => {
+    const oldSnapshot = validSnapshot()
+    const firstWorker = await loadTaskGraph(fakeClient({ itemContent: oldSnapshot }).client, identity)
+
+    expect(firstWorker.snapshot?.nodes[0]).toMatchObject({ verificationDisposition: "legacy_unverified" })
+    expect(firstWorker.snapshot?.nodes[0]).not.toHaveProperty("verification")
+    expect(firstWorker.state?.nodes[0]?.verification).toBeUndefined()
+    const rewritten = taskGraphSnapshot(firstWorker.state!, new Map([["child", "child-1"]]))
+    const restartedWorker = await loadTaskGraph(fakeClient({ itemContent: canonicalTaskGraphJson(rewritten) }).client, identity)
+    expect(restartedWorker.snapshot?.nodes[0]).toMatchObject({ verificationDisposition: "legacy_unverified" })
+    expect(restartedWorker.snapshot?.nodes[0]).not.toHaveProperty("verification")
+  })
+
+  it("keeps legacy and specialized terminal nodes compatible without generic reports", async () => {
+    const legacy = fakeClient({ itemContent: validSnapshot(), taskRows: [validTaskRow({ status: "completed" })] })
+    expect(currentTaskGraph(await loadTaskGraph(legacy.client, identity)).nodes[0]).not.toHaveProperty("verificationReport")
+    const specialized = {
+      schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
+      nodes: [{ key: "child", taskId: "child-1", templateId: "cover_letter_writer", goal: "Write", successCriteria: ["Save"], dependsOn: [], depth: 1, verificationDisposition: "specialized" }],
+    }
+    const writer = fakeClient({ itemContent: specialized, taskRows: [validTaskRow({ status: "completed", role: "writer" })] })
+    expect(currentTaskGraph(await loadTaskGraph(writer.client, identity)).nodes[0]).not.toHaveProperty("verificationReport")
+  })
+
   it("binds tenant, session, turn, root, parent, and lease identities on scoped reads", async () => {
     const fake = fakeClient()
 

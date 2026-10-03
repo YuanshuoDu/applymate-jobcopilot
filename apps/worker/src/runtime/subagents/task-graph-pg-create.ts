@@ -7,8 +7,10 @@ import { inheritSubagentPolicy, type SubagentTaskRecord } from "./types.js"
 import { policyFromTask } from "./manager-task-scope.js"
 import type { TaskGraphScheduleInput, TaskGraphTaskTemplate } from "./task-graph-command-port.js"
 import type { GraphParent } from "./task-graph-pg-state.js"
-import { taskGraphSnapshot, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
+import { canonicalTaskGraphJson, parseTaskGraphSnapshot, taskGraphItemId, taskGraphSnapshot, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { materializeTaskGraphDependencyContext, type ScopedDependencyResult } from "./task-graph-dependency-context.js"
+import { parseTaskGraphRepairReceipt, parseTaskGraphVerificationReport, taskGraphVerificationReportMatchesStatus } from "./task-graph-command-port.js"
+import { loadTaskGraphDependencyResults } from "./task-graph-pg-dependency-context-loader.js"
 
 const EXTERNAL_ACTION = /(?:^|[._-])(submit|send|publish|delete|mutate|execute)(?:$|[._-])/i
 
@@ -50,36 +52,26 @@ export async function createGraphTasks(client: Queryable, input: TaskGraphSchedu
   if (!appended.ok) throw Object.assign(new Error(appended.error.message), { code: appended.error.code })
   const existingIds = new Map(priorTaskIds)
   const statuses = new Map(current.nodes.map(node => [node.key, node.status] as const))
+  const logicalStatuses = new Map(statuses)
+  for (const key of current.repairSatisfiedNodeKeys ?? []) logicalStatuses.set(key, "completed")
   const dependencies = new Map([...current.nodes, ...input.proposal.nodes].map(node => [node.key, node] as const))
-  const previewStatuses = new Map(statuses)
-  const previewTaskIds = new Map(existingIds)
+  const previewStatuses = new Map(statuses), previewTaskIds = new Map(existingIds)
   input.proposal.nodes.forEach((node, index) => {
-    const dependenciesDone = node.dependsOn.every(key => previewStatuses.get(key) === "completed")
-    previewStatuses.set(node.key, dependenciesDone ? "queued" : "waiting")
-    // Child IDs are generated as `subagent-<UUID>`; fixed-width placeholders
-    // let the 40 KB snapshot guard run before any child task is written.
+    const status = node.dependsOn.every(key => logicalStatuses.get(key) === "completed") ? "queued" : "waiting"
+    previewStatuses.set(node.key, status); logicalStatuses.set(node.key, status)
     previewTaskIds.set(node.key, `subagent-${String(index).padStart(36, "0")}`)
   })
-  taskGraphSnapshot({
-    ...appended.state,
-    nodes: appended.state.nodes.map(node => ({ ...node, status: previewStatuses.get(node.key)! })),
-  }, previewTaskIds)
-  const readyDependencyKeys = new Set(input.proposal.nodes.flatMap(node =>
-    previewStatuses.get(node.key) === "queued" ? node.dependsOn : []))
-  const dependencyTaskIds = new Map<string, string>()
-  for (const key of readyDependencyKeys) {
-    const taskId = existingIds.get(key)
-    if (!taskId) throw new Error("task_graph_dependency_task_missing")
-    dependencyTaskIds.set(key, taskId)
-  }
-  const completedDependencies = await readCompletedDependencies(client, input.scope, dependencyTaskIds)
+  taskGraphSnapshot({ ...appended.state, nodes: appended.state.nodes.map(node => ({ ...node, status: previewStatuses.get(node.key)! })) }, previewTaskIds)
+  await validateRepairTargets(client, input, current, priorTaskIds)
+  const readyDependencyKeys = [...new Set(input.proposal.nodes.flatMap(node => previewStatuses.get(node.key) === "queued" ? node.dependsOn : []))]
+  const completedDependencies = new Map((await loadTaskGraphDependencyResults(client, input.scope, readyDependencyKeys, taskGraphSnapshot(current, priorTaskIds).nodes)).map(item => [item.key, item] as const))
   const taskIds = new Map(existingIds)
   const created: Array<{ key: string; taskId: string; status: "queued" | "waiting" }> = []
   const readyTaskIds: string[] = []
   for (const node of input.proposal.nodes) {
-    if (node.dependsOn.some(key => hasFailedAncestor(key, dependencies, statuses, new Set()))) throw new Error("task_graph_dependency_blocked")
+    if (node.dependsOn.some(key => hasFailedAncestor(key, dependencies, logicalStatuses, new Set()))) throw new Error("task_graph_dependency_blocked")
     const template = input.templates[node.templateId]!
-    const dependenciesDone = node.dependsOn.every(key => statuses.get(key) === "completed")
+    const dependenciesDone = node.dependsOn.every(key => logicalStatuses.get(key) === "completed")
     const status = dependenciesDone ? "queued" : "waiting"
     const childPolicy = inheritSubagentPolicy(policy, template.maxAttempts === undefined ? {} : { maxAttempts: template.maxAttempts })
     const context = status === "queued" && node.dependsOn.length > 0
@@ -104,6 +96,7 @@ export async function createGraphTasks(client: Queryable, input: TaskGraphSchedu
     }
     taskIds.set(node.key, child.id)
     statuses.set(node.key, status)
+    logicalStatuses.set(node.key, status)
     created.push({ key: node.key, taskId: child.id, status })
   }
   const state = {
@@ -113,36 +106,74 @@ export async function createGraphTasks(client: Queryable, input: TaskGraphSchedu
   return { state, snapshot: taskGraphSnapshot(state, taskIds), taskIds, created, readyTaskIds }
 }
 
-async function readCompletedDependencies(
-  client: Queryable,
-  scope: TaskGraphScheduleInput["scope"],
-  taskIds: ReadonlyMap<string, string>,
-): Promise<Map<string, ScopedDependencyResult>> {
-  if (taskIds.size === 0) return new Map()
-  const result = await client.query(`SELECT task."id", task."status", task."role", task."expectedOutputSchema", task."result",
-      session."userId" AS "userId", task."sessionId", task."turnId", task."rootTaskId", task."parentTaskId"
-    FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+async function validateRepairTargets(client: Queryable, input: TaskGraphScheduleInput, current: TaskGraphState, priorTaskIds: ReadonlyMap<string, string>): Promise<void> {
+  const proposals = input.proposal.nodes.filter(node => node.repairOf)
+  if (!proposals.length) return
+  const scope = input.scope
+  const stored = await client.query(`SELECT item."content" FROM "agent_items" AS item
+    JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
+    JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+    WHERE item."id" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4
+      AND item."type" = 'task_graph' AND session."userId" = $5 AND turn."userId" = $5 FOR UPDATE OF item`,
+  [taskGraphItemId(scope.parentTaskId), scope.sessionId, scope.turnId, scope.parentTaskId, scope.userId])
+  const snapshot = stored.rows[0] ? parseTaskGraphSnapshot((stored.rows[0] as Record<string, unknown>).content) : undefined
+  if (!snapshot || canonicalTaskGraphJson(snapshot) !== canonicalTaskGraphJson(taskGraphSnapshot(current, priorTaskIds))) throw new Error("task_graph_repair_snapshot_invalid")
+  for (const proposal of proposals) {
+    const relation = proposal.repairOf!
+    const target = snapshot.nodes.find(node => node.key === relation.nodeKey)
+    const ids = target?.verification?.criteria.map(item => item.id) ?? []
+    if (relation.graphRootTaskId !== scope.rootTaskId || !target || target.taskId !== relation.taskId
+      || target.verificationDisposition !== "typed" || !target.verification || !ids.length) throw new Error("task_graph_repair_target_unresolved")
+    const result = await client.query(`SELECT task."id", task."status", task."role", task."failureReason", task."result",
+        task."rootTaskId", task."parentTaskId", task."sessionId", task."turnId"
+      FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+      JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+      WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4
+        AND task."parentTaskId" = $5 AND session."userId" = $6 AND turn."userId" = $6 FOR UPDATE OF task`,
+    [target.taskId, scope.sessionId, scope.turnId, scope.rootTaskId, scope.parentTaskId, scope.userId])
+    const row = result.rows[0] as Record<string, unknown> | undefined
+    const report = parseTaskGraphVerificationReport(object(row?.result)?.taskGraphVerificationReport, ids)
+    if (!row || row.id !== relation.taskId || row.status !== "failed" || row.role !== input.templates[proposal.templateId]?.role
+      || row.rootTaskId !== scope.rootTaskId || row.parentTaskId !== scope.parentTaskId || row.sessionId !== scope.sessionId
+      || row.turnId !== scope.turnId || !report || !taskGraphVerificationReportMatchesStatus(report, "failed")
+      || row.failureReason !== `task_graph_verification_${report.status}`) throw new Error("task_graph_repair_target_unresolved")
+    const statuses = new Map(report.criteria.map(item => [item.criterionId, item.status] as const))
+    if (!relation.criterionIds.every(id => statuses.get(id) === "failed" || statuses.get(id) === "unverified")) throw new Error("task_graph_repair_criteria_resolved")
+    const priorRepairs = snapshot.nodes.filter(node => node.repairOf?.graphRootTaskId === relation.graphRootTaskId
+      && node.repairOf.nodeKey === relation.nodeKey && node.repairOf.taskId === relation.taskId)
+    if (priorRepairs.length && await hasResolvingRepairReceipt(client, scope, priorRepairs, relation.criterionIds)) {
+      throw new Error("task_graph_repair_criteria_resolved")
+    }
+  }
+}
+
+async function hasResolvingRepairReceipt(
+  client: Queryable, scope: TaskGraphScheduleInput["scope"], repairs: TaskGraphSnapshot["nodes"], criterionIds: readonly string[],
+): Promise<boolean> {
+  const result = await client.query(`SELECT task."id", task."status", task."result" FROM "sub_agent_tasks" AS task
+    JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
     JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
     WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3
-      AND task."rootTaskId" = $4 AND task."parentTaskId" = $5 AND session."userId" = $6 AND turn."userId" = $6
-      AND task."status" = 'completed'`,
-  [[...taskIds.values()], scope.sessionId, scope.turnId, scope.rootTaskId, scope.parentTaskId, scope.userId])
-  const byId = new Map(result.rows.map(raw => {
-    const row = raw as Record<string, unknown>
-    return [String(row.id), row] as const
-  }))
-  const output = new Map<string, ScopedDependencyResult>()
-  for (const [key, taskId] of taskIds) {
-    const row = byId.get(taskId)
-    if (!row) continue
-    output.set(key, {
-      key, taskId, status: String(row.status), role: String(row.role),
-      expectedOutputSchema: row.expectedOutputSchema, result: row.result,
-      userId: String(row.userId), sessionId: String(row.sessionId), turnId: String(row.turnId),
-      rootTaskId: String(row.rootTaskId), parentTaskId: String(row.parentTaskId),
+      AND task."rootTaskId" = $4 AND task."parentTaskId" = $5 AND session."userId" = $6 AND turn."userId" = $6`,
+  [repairs.map(node => node.taskId), scope.sessionId, scope.turnId, scope.rootTaskId, scope.parentTaskId, scope.userId])
+  const byId = new Map(result.rows.map(value => { const row = value as Record<string, unknown>; return [String(row.id), row] as const }))
+  if (byId.size !== repairs.length) throw new Error("task_graph_repair_target_scope_invalid")
+  for (const repair of repairs) {
+    const row = byId.get(repair.taskId)!, ids = repair.verification?.criteria.map(item => item.id) ?? []
+    const resultValue = object(row.result)
+    const report = parseTaskGraphVerificationReport(resultValue?.taskGraphVerificationReport, ids)
+    const receipt = parseTaskGraphRepairReceipt(resultValue?.taskGraphRepairReceipt, {
+      repairOf: repair.repairOf, repairNodeKey: repair.key, repairTaskId: repair.taskId, report,
     })
+    if (row.status === "completed" && report?.status === "passed" && taskGraphVerificationReportMatchesStatus(report, "completed")
+      && receipt?.criterionIds.some(id => criterionIds.includes(id))) return true
   }
-  return output
+  return false
+}
+
+function object(value: unknown): Record<string, unknown> | null {
+  const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
+  return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null
 }
 
 function hasFailedAncestor(key: string, dependencies: ReadonlyMap<string, { readonly dependsOn: readonly string[] }>, statuses: ReadonlyMap<string, string>, visited: Set<string>): boolean {

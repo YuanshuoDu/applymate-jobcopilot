@@ -50,7 +50,7 @@ function completionPool(descendants: Array<Record<string, unknown>>, owned = tru
     }),
     release: vi.fn(),
   }
-  return { pool: { connect: vi.fn(async () => client) } as never, calls }
+  return { pool: { connect: vi.fn(async () => client) } as never, calls, client }
 }
 
 function terminalPool(root: Record<string, unknown> | null) {
@@ -259,6 +259,16 @@ describe("createPgRootTaskStore", () => {
   it("allows completion when every descendant is terminal", async () => {
     const fake = completionPool(["completed", "failed", "interrupted", "cancelled", "closed"].map((status, index) => ({ id: `child-${index}`, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-turn-1", userId: lease.userId, status })))
     await expect(createPgRootTaskStore(fake.pool).checkCompletion!({ lease, rootTaskId: "root-turn-1" })).resolves.toEqual({ ok: true })
+  })
+
+  it("checks durable graph proof on the caller transaction without opening a nested transaction", async () => {
+    const fake = completionPool([])
+    const store = createPgRootTaskStore(fake.pool)
+    await expect(store.checkCompletion!({ lease, rootTaskId: "root-turn-1", taskGraphVerification: true, client: fake.client as never })).resolves.toEqual({ ok: true })
+    expect(fake.calls).not.toContain("BEGIN")
+    expect(fake.calls).not.toContain("COMMIT")
+    expect(fake.client.query.mock.calls.some(([sql]) => sql.includes('FROM "agent_items" AS item'))).toBe(true)
+    expect(fake.client.query.mock.calls.some(([sql]) => sql.includes("payload"))).toBe(true)
   })
 
   it("fails closed for a stale owner or foreign descendant row", async () => {

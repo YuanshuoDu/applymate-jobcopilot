@@ -8,6 +8,8 @@ import { hashArtifactContent } from "./artifact-adapters.ts"
 import { writerArtifactReferenceFromTaskContext } from "./task-graph-dependency-context.ts"
 import { parseSubagentJobPayload } from "./types.ts"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.ts"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.ts"
+import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-pg-verification.ts"
 import { parsePlanLedger, projectPlanLedger } from "@jobcopilot/agent-protocol"
 
 const [, , mode, rawIds] = process.argv, ids = JSON.parse(rawIds)
@@ -216,12 +218,12 @@ function stringArray(value) {
   }
   return Array.isArray(parsed) && parsed.every(item => typeof item === "string") ? parsed : null
 }
-function isExpectedSourceProjection(value) {
+function isExpectedSourceProjection(value, jobId = "fixture-job-restart") {
   const projection = record(value), candidates = Array.isArray(projection?.candidates) ? projection.candidates.map(record) : [], candidate = candidates[0]
   return projection?.schemaVersion === "agent-harness.v2.task-graph.result-projection" && projection.trust === "untrusted"
     && projection.availability === "available" && projection.role === "scout" && projection.status === "completed"
     && projection.candidateCount === 1 && projection.evidenceCount === 1 && candidates.length === 1
-    && candidate?.jobId === "fixture-job-restart" && candidate.source === "other"
+    && candidate?.jobId === jobId && candidate.source === "other"
     && Array.isArray(candidate.evidenceKinds) && candidate.evidenceKinds.length === 1 && candidate.evidenceKinds[0] === "job"
 }
 const SOURCE_PROJECTION_AVAILABILITY = new Set(["available", "unavailable"])
@@ -594,11 +596,15 @@ function waitOutcomeFromRequest(request, predicate) {
   const outcome = waitOutcomesFromRequest(request).find(predicate ?? (() => true))
   if (!outcome) throw new Error("p3_durable_wait_result_missing"); return outcome
 }
-function structuredResult(role, summary) {
-  const evidence = [{ id: "p3-process-restart-evidence", kind: "job", ref: "fixture-job-restart", source: "fixture" }]
-  const data = role === "scout" ? { schemaVersion: ROLE_RESULT_SCHEMA, role, status: "completed", candidates: [{ jobId: "fixture-job-restart", source: "fixture", url: null, evidenceIds: [evidence[0].id] }], evidence, summary }
-    : { schemaVersion: ROLE_RESULT_SCHEMA, role, status: "completed", findings: [{ jobId: "fixture-job-restart", score: 8, evidenceIds: [evidence[0].id] }], evidence, summary }
-  return { status: "completed", stepCount: 2, toolCallCount: 1, finalItemId: "p3-process-restart-final", finalText: summary, structuredResult: data }
+function assertPassedVerificationReport(value, criterionId) {
+  const report = record(value), criteria = Array.isArray(report?.criteria) ? report.criteria.map(record) : []
+  const criterion = criteria.find(item => item?.criterionId === criterionId)
+  if (report?.verifierVersion !== TASK_GRAPH_VERIFIER_VERSION || report.status !== "passed" || report.reasonCode !== "criteria_met"
+    || !/^[a-f0-9]{64}$/.test(report.evidenceDigest ?? "") || criteria.length !== 1
+    || criterion?.status !== "passed" || criterion.reasonCode !== "criteria_met") {
+    throw new Error("p3_typed_verification_report_not_restored:" + criterionId)
+  }
+  return report
 }
 function modelProfile() {
   return { provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true,
@@ -815,8 +821,15 @@ function assertRestoredGraph(request) {
   }
   waitOutcomeFromRequest(request, outcome => outcome.status === "ready" && outcome.tasks.length === expected.length
     && outcome.tasks.every(task => record(task)?.status === "completed"))
+  assertPassedVerificationReport(byKey.get("source")?.verificationReport, "candidate-count")
+  assertPassedVerificationReport(byKey.get("summary")?.verificationReport, "finding-count")
+  const wait = waitOutcomeFromRequest(request, outcome => outcome.status === "ready" && outcome.tasks.length === expected.length)
+  for (const task of wait.tasks.map(record)) {
+    const criterionId = task?.role === "scout" ? "candidate-count" : task?.role === "analyst" ? "finding-count" : ""
+    assertPassedVerificationReport(task?.verificationReport, criterionId)
+  }
   const sourceNode = byKey.get("source")
-  if (!sourceNode || !isExpectedSourceProjection(sourceNode.resultProjection)) {
+  if (!sourceNode || !isExpectedSourceProjection(sourceNode.resultProjection, ids.jobId)) {
     throw new Error("p3_restored_graph_source_projection_missing:" + JSON.stringify(sourceProjectionDiagnostic(sourceNode?.resultProjection)))
   }
   say("P3_RESTORED_GRAPH_OK " + JSON.stringify({ revision: graph.revision, nodeCount: nodes.length }))
@@ -1064,7 +1077,15 @@ async function projectPersistedPlanLedger() {
   return ledger
 }
 function toolCall(callId, name, args) { return { type: "tool_call_completed", callId, name, arguments: args } }
-function node(key, templateId, goal, successCriteria, dependsOn) { return { key, templateId, goal, successCriteria, dependsOn } }
+const fixtureVerifications = {
+  scout: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }] },
+  analyst: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }] },
+}
+function node(key, templateId, goal, successCriteria, dependsOn) {
+  const verification = fixtureVerifications[templateId]
+  if (!verification) throw new Error("p3_fixture_verification_template_unsupported")
+  return { key, templateId, goal, successCriteria, dependsOn, verification }
+}
 function waitArgs(key, taskIds) { return { idempotencyKey: key + ":" + ids.turnId, taskIds, mode: "all", timeoutMs: 30_000 } }
 async function startRuntime(workerOwnerId, resume) {
   return createCanonicalTurnRuntime(pool, {
@@ -1219,6 +1240,33 @@ async function runFirstWorker() {
 async function runSecondWorker() {
   assertNoPrivateArtifactFixtureData(ids)
   const ownerId = "p3-process-restart-worker-" + process.pid, runtime = await startRuntime(ownerId, true)
+  const { createProductionChildExecutor } = await import("./production-child-runtime.ts")
+  const executeChild = createProductionChildExecutor({
+    pool, authorizeUsage: async () => ({ settle: async () => undefined }),
+    modelRuntimeFactory({ task }) {
+      let rounds = 0
+      const callId = `p3-process-restart-read:${task.id}:${task.attemptCount}`
+      return { id: `p3-process-restart-${task.role}-model`, profile: modelProfile(), async *stream(request) {
+        rounds++
+        if (rounds === 1) {
+          if (!request.tools.some(tool => record(tool)?.name === "jobs.search")) throw new Error("p3_restart_child_search_tool_missing")
+          yield toolCall(callId, "jobs.search", { target: "Software Engineer", location: "Dublin", limit: 10 })
+          yield { type: "completed", finishReason: "tool_calls" }; return
+        }
+        const search = record(latestToolResult(request, callId)), jobs = Array.isArray(search?.jobs) ? search.jobs.map(record) : []
+        const job = jobs.find(item => item?.id === ids.jobId)
+        if (!job || !["scout", "analyst"].includes(task.role)) throw new Error("p3_restart_child_search_receipt_missing")
+        const evidence = [{ id: `read:job:${ids.jobId}`, kind: "job", ref: ids.jobId, source: job.source ?? "greenhouse" }]
+        const summary = task.goal === sourceGoal ? resultMarker : task.goal === dependentGoal ? dependentGoal : followUpGoal
+        const result = task.role === "scout"
+          ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [{ jobId: ids.jobId, source: "fixture", url: null, evidenceIds: [evidence[0].id] }], evidence, summary }
+          : { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [{ jobId: ids.jobId, score: 8, evidenceIds: [evidence[0].id] }], evidence, summary }
+        if (task.goal === followUpGoal) await waitForCommand("complete-follow-up-child")
+        yield { type: "text_delta", text: JSON.stringify(result) }
+        yield { type: "completed", finishReason: "stop" }
+      } }
+    },
+  })
   const { createProductionWorkerBootstrap } = await import("../../queue/production-bootstrap.ts")
   bootstrap = await createProductionWorkerBootstrap({ pool, runtime, ownerId, turnRecoveryIntervalMs: 10,
     waitResolver: { intervalMs: 10, ownerId: "p3-process-restart-wait-resolver-" + process.pid },
@@ -1235,14 +1283,29 @@ async function runSecondWorker() {
           hasSourceResult: (JSON.stringify(item?.result) ?? "").includes(resultMarker),
         })),
       }))
-      if (lease.goal === sourceGoal && lease.role === "scout") return { status: "completed", result: structuredResult("scout", resultMarker) }
+      if (lease.goal === sourceGoal && lease.role === "scout") {
+        const dependent = await pool.query(`SELECT task."id", task."status" FROM "sub_agent_tasks" task WHERE task."turnId" = $1 AND task."goal" = $2`, [ids.turnId, dependentGoal])
+        if (dependent.rows.length !== 1 || dependent.rows[0].status !== "waiting") throw new Error("p3_dependent_not_waiting_before_source_proof")
+        const dispatch = await pool.query(`SELECT 1 FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${dependent.rows[0].id}`])
+        if (dispatch.rowCount !== 0) throw new Error("p3_dependent_dispatched_before_source_proof")
+        say("P3_DEPENDENT_WAITING_BEFORE_SOURCE_PROOF")
+        return executeChild({ lease })
+      }
       if (lease.goal === dependentGoal && lease.role === "analyst") {
+        const source = await pool.query(`SELECT task."id", task."status", task."result" FROM "sub_agent_tasks" task WHERE task."turnId" = $1 AND task."goal" = $2`, [ids.turnId, sourceGoal])
+        const sourceResult = record(source.rows[0]?.result), report = record(sourceResult?.taskGraphVerificationReport)
+        assertPassedVerificationReport(report, "candidate-count")
+        if (source.rows.length !== 1 || source.rows[0].status !== "completed") throw new Error("p3_source_not_complete_before_dependent_dispatch")
+        const dispatch = await pool.query(`SELECT "id" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${lease.id}`])
+        if (dispatch.rows.length !== 1) throw new Error("p3_dependent_dispatch_missing_after_source_proof")
         const items = Array.isArray(record(record(lease.context)?.taskGraphDependencyResults)?.items)
           ? record(record(lease.context)?.taskGraphDependencyResults).items.map(record) : []
         if (items[0]?.dependencyKey !== "source" || items[0]?.taskStatus !== "completed" || !isExpectedSourceProjection(items[0]?.result)) {
           throw new Error("p3_dependency_context_not_restored")
         }
-        say("P3_DEPENDENCY_CONTEXT_OK"); return { status: "completed", result: structuredResult("analyst", dependentGoal) }
+        say("P3_SOURCE_PROOF_UNLOCKED_DEPENDENT")
+        say("P3_DEPENDENCY_CONTEXT_OK")
+        return executeChild({ lease })
       }
       if (lease.goal === followUpGoal && lease.role === "analyst") {
         const items = Array.isArray(record(record(lease.context)?.taskGraphDependencyResults)?.items)
@@ -1250,11 +1313,11 @@ async function runSecondWorker() {
         const projection = record(items[0]?.result), findings = Array.isArray(projection?.findings) ? projection.findings.map(record) : []
         if (items[0]?.dependencyKey !== "summary" || items[0]?.taskStatus !== "completed"
           || projection?.role !== "analyst" || projection?.availability !== "available"
-          || !findings.some(finding => finding?.jobId === "fixture-job-restart" && finding.score === 8)) {
+          || !findings.some(finding => finding?.jobId === ids.jobId && finding.score === 8)) {
           throw new Error("p3_follow_up_dependency_context_missing")
         }
-        say("P3_FOLLOW_UP_DEPENDENCY_CONTEXT_OK"); await waitForCommand("complete-follow-up-child")
-        return { status: "completed", result: structuredResult("analyst", followUpGoal) }
+        say("P3_FOLLOW_UP_DEPENDENCY_CONTEXT_OK")
+        return executeChild({ lease })
       }
       throw new Error("p3_unexpected_child:" + lease.goal)
     } } })

@@ -1,10 +1,22 @@
 import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import { createGraphTasks } from "./task-graph-pg-create.js"
-import type { TaskGraphScheduleInput } from "./task-graph-command-port.js"
+import { TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION, type TaskGraphScheduleInput } from "./task-graph-command-port.js"
 import { createInitialTaskGraphState, TASK_GRAPH_LIMITS, type TaskGraphNodeProposal, type TaskGraphState } from "../planning/task-graph.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { parseTaskGraphSnapshot, taskGraphSnapshot } from "./task-graph-snapshot.js"
+import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-pg-verification.js"
+import { taskGraphResultDigest } from "./task-graph-pg-verification.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
+
+const analystVerification = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
+  criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }],
+} as const
+
+function plannedNode(node: Omit<TaskGraphNodeProposal, "verification">): TaskGraphNodeProposal {
+  return { ...node, verification: analystVerification }
+}
 
 describe("createGraphTasks", () => {
   it("persists scoped completed direct prerequisite evidence before dispatching a ready child", async () => {
@@ -41,7 +53,7 @@ describe("createGraphTasks", () => {
         userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
         stepId: "step-2", turnLeaseOwner: "turn-owner", turnLeaseVersion: 1, parentLeaseOwner: "parent-owner", parentAttemptCount: 1,
       },
-      proposal: { expectedRevision: 1, nodes: [{ key: "analysis", templateId: "analyst", goal: "Analyze source", successCriteria: ["done"], dependsOn: ["source"] }] },
+      proposal: { expectedRevision: 1, nodes: [plannedNode({ key: "analysis", templateId: "analyst", goal: "Analyze source", successCriteria: ["done"], dependsOn: ["source"] })] },
       templates: { analyst: {
         role: "analyst", taskType: "job_analysis", allowedActions: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"],
         expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" },
@@ -93,7 +105,7 @@ describe("createGraphTasks", () => {
         userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
         stepId: "step-2", turnLeaseOwner: "turn-owner", turnLeaseVersion: 1, parentLeaseOwner: "parent-owner", parentAttemptCount: 1,
       },
-      proposal: { expectedRevision: 1, nodes: [{ key: "second", templateId: "analyst", goal: "Continue after prior result", successCriteria: ["done"], dependsOn: [] }] },
+      proposal: { expectedRevision: 1, nodes: [plannedNode({ key: "second", templateId: "analyst", goal: "Continue after prior result", successCriteria: ["done"], dependsOn: [] })] },
       templates: { analyst: { role: "analyst", taskType: "research", allowedActions: [] } },
     }
 
@@ -101,6 +113,10 @@ describe("createGraphTasks", () => {
 
     expect(result.state.nodes).toHaveLength(2)
     expect(result.created).toMatchObject([{ key: "second", taskId: "child-2", status: "queued" }])
+    expect(result.snapshot.nodes).toMatchObject([
+      { key: "first", verificationDisposition: "legacy_unverified" },
+      { key: "second", verificationDisposition: "typed", verification: analystVerification },
+    ])
     expect(calls.filter(call => call.sql.startsWith('INSERT INTO "agent_outbox"'))).toHaveLength(1)
     expect(calls.find(call => call.sql.includes("COUNT(*)::int"))?.sql).toContain("NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')")
   })
@@ -111,8 +127,8 @@ describe("createGraphTasks", () => {
     const input = {
       scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", stepId: "step", turnLeaseOwner: "turn", turnLeaseVersion: 1, parentLeaseOwner: "parent", parentAttemptCount: 1 },
       proposal: { expectedRevision: 1, nodes: [
-        { key: "second", templateId: "analyst", goal: "one", successCriteria: ["done"], dependsOn: [] },
-        { key: "third", templateId: "analyst", goal: "two", successCriteria: ["done"], dependsOn: [] },
+        plannedNode({ key: "second", templateId: "analyst", goal: "one", successCriteria: ["done"], dependsOn: [] }),
+        plannedNode({ key: "third", templateId: "analyst", goal: "two", successCriteria: ["done"], dependsOn: [] }),
       ] },
       templates: { analyst: { role: "analyst", taskType: "research", allowedActions: [] } },
     } satisfies TaskGraphScheduleInput
@@ -133,7 +149,7 @@ describe("createGraphTasks", () => {
         goal: "😀".repeat(600),
         successCriteria: Array.from({ length: 8 }, () => "😀".repeat(160)),
         dependsOn: index === 0 ? [] : [`node-${index - 1}`],
-      })),
+      })).map(node => plannedNode(node)),
     }
     expect(Buffer.byteLength(JSON.stringify(proposal), "utf8")).toBeGreaterThan(TASK_GRAPH_LIMITS.maxProposalBytes)
     const input = {
@@ -168,10 +184,10 @@ describe("createGraphTasks", () => {
     expect(() => taskGraphSnapshot(current, priorIds)).not.toThrow()
     const input: TaskGraphScheduleInput = {
       scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", stepId: "step", turnLeaseOwner: "turn", turnLeaseVersion: 1, parentLeaseOwner: "parent", parentAttemptCount: 1 },
-      proposal: { expectedRevision: 7, nodes: [{
+      proposal: { expectedRevision: 7, nodes: [plannedNode({
         key: "next", templateId: "analyst", goal: "g".repeat(1200),
         successCriteria: Array.from({ length: 8 }, () => "c".repeat(320)), dependsOn: [keys[6]!],
-      }] },
+      })] },
       templates: { analyst: { role: "analyst", taskType: "research", allowedActions: [] } },
     }
 
@@ -180,12 +196,33 @@ describe("createGraphTasks", () => {
     expect(query).not.toHaveBeenCalled()
   })
 
+  it("rejects a registered unsupported template before creating or scheduling a child", async () => {
+    const query = vi.fn(async () => ({ rows: [], rowCount: 0 }))
+    const client = { query } as unknown as Pick<pg.PoolClient, "query">
+    const input: TaskGraphScheduleInput = {
+      scope: {
+        userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
+        stepId: "step", turnLeaseOwner: "turn", turnLeaseVersion: 1, parentLeaseOwner: "parent", parentAttemptCount: 1,
+      },
+      proposal: { expectedRevision: 0, nodes: [{
+        key: "custom", templateId: "custom_agent", goal: "Do custom work", successCriteria: ["Complete custom work"], dependsOn: [],
+      }] },
+      templates: { custom_agent: { role: "analyst", taskType: "research", allowedActions: [] } },
+    }
+
+    await expect(createGraphTasks(client, input, {
+      budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 4, maxFanOut: 1, maxAttempts: 2 } },
+    }, createInitialTaskGraphState(), new Map()))
+      .rejects.toThrow("task_graph_snapshot_template_unsupported")
+    expect(query).not.toHaveBeenCalled()
+  })
+
   it("rejects a new node whose prerequisite already failed", async () => {
     const query = vi.fn(async () => ({ rows: [], rowCount: 0 }))
     const client = { query } as unknown as Pick<pg.PoolClient, "query">
     const input: TaskGraphScheduleInput = {
       scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", stepId: "step", turnLeaseOwner: "turn", turnLeaseVersion: 1, parentLeaseOwner: "parent", parentAttemptCount: 1 },
-      proposal: { expectedRevision: 2, nodes: [{ key: "next", templateId: "analyst", goal: "continue", successCriteria: ["done"], dependsOn: ["failed"] }] },
+      proposal: { expectedRevision: 2, nodes: [plannedNode({ key: "next", templateId: "analyst", goal: "continue", successCriteria: ["done"], dependsOn: ["failed"] })] },
       templates: { analyst: { role: "analyst", taskType: "research", allowedActions: [] } },
     }
     const current: TaskGraphState = {
@@ -205,7 +242,7 @@ describe("createGraphTasks", () => {
       analyst: { role: "analyst", taskType: "research", allowedActions: [] },
       [oversizedTemplateId]: { role: "analyst", taskType: "research", allowedActions: [] },
     }
-    const valid: TaskGraphNodeProposal = { key: "bounded", templateId: "analyst", goal: "valid", successCriteria: ["valid"], dependsOn: [] }
+    const valid: TaskGraphNodeProposal = plannedNode({ key: "bounded", templateId: "analyst", goal: "valid", successCriteria: ["valid"], dependsOn: [] })
     const invalidNodes: TaskGraphNodeProposal[] = [
       { ...valid, goal: "g".repeat(1201) },
       { ...valid, successCriteria: ["c".repeat(321)] },
@@ -244,10 +281,10 @@ describe("createGraphTasks", () => {
       return { rows: [], rowCount: 1 }
     })
     const client = { query } as unknown as Pick<pg.PoolClient, "query">
-    const node: TaskGraphNodeProposal = {
+    const node: TaskGraphNodeProposal = plannedNode({
       key: "k".repeat(128), templateId: "analyst", goal: "g".repeat(1200),
       successCriteria: Array.from({ length: 8 }, () => "c".repeat(320)), dependsOn: [],
-    }
+    })
     const input: TaskGraphScheduleInput = {
       scope: {
         userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
@@ -261,8 +298,125 @@ describe("createGraphTasks", () => {
     }, createInitialTaskGraphState(), new Map())
 
     expect(parseTaskGraphSnapshot(result.snapshot)).toEqual(result.snapshot)
+    expect(result.snapshot.nodes[0]).toMatchObject({ verificationDisposition: "typed", verification: analystVerification })
+    expect(result.state.nodes[0]?.verification).toEqual(analystVerification)
+  })
+
+  it("locks the exact failed target and schedules a repair only for unresolved criteria", async () => {
+    const fixture = repairFixture()
+    const result = await createGraphTasks(fixture.client, fixture.input, fixture.parent, fixture.current, fixture.taskIds)
+    const targetLock = fixture.query.mock.calls.findIndex(([sql]) => sql.includes('task."failureReason"') && sql.includes("FOR UPDATE OF task"))
+    const insert = fixture.query.mock.calls.findIndex(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))
+    expect(result.created).toMatchObject([{ key: "repair-next", status: "queued" }])
+    expect(targetLock).toBeGreaterThan(-1)
+    expect(insert).toBeGreaterThan(targetLock)
+  })
+
+  it("rejects a criterion already passed by the failed target report", async () => {
+    const fixture = repairFixture({ resolved: true })
+    await expect(createGraphTasks(fixture.client, fixture.input, fixture.parent, fixture.current, fixture.taskIds))
+      .rejects.toThrow("task_graph_repair_criteria_resolved")
+    expect(fixture.query.mock.calls.some(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
+  })
+
+  it("rejects a target row outside the exact user/session/turn/root scope", async () => {
+    const fixture = repairFixture({ targetMissing: true })
+    await expect(createGraphTasks(fixture.client, fixture.input, fixture.parent, fixture.current, fixture.taskIds))
+      .rejects.toThrow("task_graph_repair_target_unresolved")
+    expect(fixture.query.mock.calls.some(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
+  })
+
+  it("rejects a stale graph-root relation before child writes", async () => {
+    const fixture = repairFixture({ rootId: "root-foreign" })
+    await expect(createGraphTasks(fixture.client, fixture.input, fixture.parent, fixture.current, fixture.taskIds))
+      .rejects.toThrow("task_graph_repair_target_unresolved")
+    expect(fixture.query.mock.calls.some(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
+  })
+
+  it("rejects criteria already resolved by a prior server-authored repair receipt", async () => {
+    const fixture = repairFixture({ priorReceipt: true })
+    await expect(createGraphTasks(fixture.client, fixture.input, fixture.parent, fixture.current, fixture.taskIds))
+      .rejects.toThrow("task_graph_repair_criteria_resolved")
+    expect(fixture.query.mock.calls.some(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
+  })
+
+  it("queues a newly planned dependent with the receipt-backed composite while the original row stays failed", async () => {
+    const fixture = repairFixture({ priorReceipt: true, scheduleDependent: true })
+    const result = await createGraphTasks(fixture.client, fixture.input, fixture.parent, fixture.current, fixture.taskIds)
+    expect(result.created).toMatchObject([{ key: "after-target", status: "queued" }])
+    expect(result.state.nodes.find(node => node.key === "target")?.status).toBe("failed")
+    const insert = fixture.query.mock.calls.find(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))
+    const context = JSON.parse(String(insert?.[1]?.[13])) as Record<string, unknown>
+    const evidence = context.taskGraphDependencyResults as { items: Array<Record<string, unknown>> }
+    expect(evidence.items[0]).toMatchObject({ dependencyKey: "target", taskStatus: "completed", repairLineage: [{ criterionIds: ["finding-count"] }] })
+    expect(evidence.items[0]?.result).toMatchObject({ role: "analyst", findingCount: 1, evidenceCount: 1 })
   })
 })
+
+const repairVerification = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
+  criteria: [
+    { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
+    { id: "evidence-count", check: { kind: "evidence_count_gte", minimum: 1 } },
+  ],
+} as const
+type RepairFixtureOptions = { resolved?: boolean; targetMissing?: boolean; rootId?: string; priorReceipt?: boolean; scheduleDependent?: boolean }
+function repairFixture(options: RepairFixtureOptions = {}) {
+  const relation = { graphRootTaskId: options.rootId ?? "root-1", nodeKey: "target", taskId: "target-1", criterionIds: ["finding-count"] }
+  const report = {
+    verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met",
+    criteria: [
+      { criterionId: "finding-count", status: options.resolved ? "passed" : "failed", reasonCode: options.resolved ? "criteria_met" : "criterion_not_met" },
+      { criterionId: "evidence-count", status: "failed", reasonCode: "criterion_not_met" },
+    ], evidenceDigest: "a".repeat(64), resultDigest: "e".repeat(64),
+  }
+  const target = { key: "target", templateId: "analyst", goal: "Find evidence", successCriteria: ["find evidence"], dependsOn: [], depth: 1, status: "failed" as const, taskId: "target-1", verificationDisposition: "typed" as const, verification: repairVerification }
+  const priorRepair = { key: "repair-old", templateId: "analyst", goal: "Repair finding", successCriteria: ["repair"], dependsOn: [], depth: 1, status: "completed" as const, taskId: "repair-old-1", verificationDisposition: "typed" as const, verification: analystVerification, repairOf: { ...relation, graphRootTaskId: "root-1" } }
+  const current: TaskGraphState = { revision: options.priorReceipt ? 2 : 1, nodes: options.priorReceipt ? [target, priorRepair] : [target], appliedEvents: [], repairSatisfiedNodeKeys: options.priorReceipt ? ["target"] : [] }
+  const taskIds = new Map<string, string>([["target", "target-1"], ...(options.priorReceipt ? [["repair-old", "repair-old-1"] as [string, string]] : [])])
+  const snapshot = taskGraphSnapshot(current, taskIds)
+  const repairNode = { key: "repair-next", templateId: "analyst", goal: "Repair the missing finding", successCriteria: ["Resolve the finding"], dependsOn: [], verification: analystVerification, repairOf: relation }
+  const input: TaskGraphScheduleInput = {
+    scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", stepId: "step", turnLeaseOwner: "turn", turnLeaseVersion: 1, parentLeaseOwner: "parent", parentAttemptCount: 1 },
+    proposal: { expectedRevision: current.revision, nodes: [options.scheduleDependent
+      ? plannedNode({ key: "after-target", templateId: "analyst", goal: "Continue from repaired evidence", successCriteria: ["done"], dependsOn: ["target"] })
+      : repairNode] },
+    templates: { analyst: { role: "analyst", taskType: "research", allowedActions: [] } },
+  }
+  const evidence = [{ id: "read:job:job-1", kind: "job", ref: "job-1", source: "greenhouse" }]
+  const targetStructured = { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [], evidence, summary: "Original incomplete result" }
+  const repairStructured = { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [{ jobId: "job-1", score: 7, evidenceIds: ["read:job:job-1"] }], evidence, summary: "Repair result" }
+  const receipt = { schemaVersion: TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION, graphRootTaskId: "root-1", targetNodeKey: "target", targetTaskId: "target-1", criterionIds: ["finding-count"], repairNodeKey: "repair-old", repairTaskId: "repair-old-1", verifierVersion: TASK_GRAPH_VERIFIER_VERSION, evidenceDigest: "b".repeat(64) }
+  const priorResult = {
+    finalItemId: "repair-item", finalText: "Repair result", status: "completed", stepCount: 1, toolCallCount: 1,
+    structuredResult: repairStructured,
+    taskGraphVerificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met", criteria: analystVerification.criteria.map(item => ({ criterionId: item.id, status: "passed", reasonCode: "criteria_met" })), evidenceDigest: "b".repeat(64), resultDigest: taskGraphResultDigest(repairStructured) },
+    taskGraphRepairReceipt: receipt,
+  }
+  const targetResult = {
+    finalItemId: "target-item", finalText: "Incomplete", status: "completed", stepCount: 1, toolCallCount: 1, structuredResult: targetStructured,
+    taskGraphVerificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met", criteria: [
+      { criterionId: "finding-count", status: "failed", reasonCode: "criterion_not_met" }, { criterionId: "evidence-count", status: "passed", reasonCode: "criteria_met" },
+    ], evidenceDigest: "a".repeat(64), resultDigest: taskGraphResultDigest(targetStructured) },
+  }
+  const query = vi.fn(async (sql: string, _values?: unknown[]) => {
+    if (sql.includes('SELECT item."content"')) return { rows: [{ content: snapshot }], rowCount: 1 }
+    if (sql.includes("ANY($1::text[])")) return options.scheduleDependent
+      ? { rows: [
+        { id: "target-1", status: "failed", failureReason: "task_graph_verification_failed", role: "analyst", expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" }, result: targetResult, ...input.scope, userId: "user-1" },
+        { id: "repair-old-1", status: "completed", failureReason: null, role: "analyst", expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" }, result: priorResult, ...input.scope, userId: "user-1" },
+      ], rowCount: 2 }
+      : { rows: [{ id: "repair-old-1", status: "completed", result: priorResult }], rowCount: 1 }
+    if (sql.includes('task."failureReason"')) return { rows: options.targetMissing ? [] : [{ id: "target-1", status: "failed", role: "analyst", failureReason: "task_graph_verification_failed", result: { taskGraphVerificationReport: report }, rootTaskId: "root-1", parentTaskId: "root-1", sessionId: "session-1", turnId: "turn-1" }], rowCount: options.targetMissing ? 0 : 1 }
+    if (sql.includes("COUNT(*)::int")) return { rows: [{ count: 0 }], rowCount: 1 }
+    if (sql.startsWith('INSERT INTO "sub_agent_tasks"')) return { rows: [{ id: "repair-next-1" }], rowCount: 1 }
+    if (sql.startsWith('SELECT task.*, session."userId"')) return { rows: [{ ...taskRow(), id: "repair-next-1", goal: repairNode.goal }], rowCount: 1 }
+    if (sql.startsWith('INSERT INTO "agent_outbox"')) return { rows: [{ id: "outbox-1" }], rowCount: 1 }
+    if (sql.includes('SELECT "id", "rootTaskId", "path"')) return { rows: [{ id: "root-1", rootTaskId: "root-1", path: "/root-1", depth: 0, status: "running", allowedActions: [], modelProfileSnapshot: {}, budgetSnapshot: {}, toolPolicySnapshot: {} }], rowCount: 1 }
+    return { rows: [], rowCount: 1 }
+  })
+  return { client: { query } as unknown as Pick<pg.PoolClient, "query">, query, input, current, taskIds, parent: { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 4, maxFanOut: 4, maxAttempts: 2 } } } }
+}
 
 function taskRow() {
   return {
