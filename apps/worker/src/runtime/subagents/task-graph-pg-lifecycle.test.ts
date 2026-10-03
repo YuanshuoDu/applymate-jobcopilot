@@ -126,6 +126,22 @@ describe("prepareGraphTransition", () => {
 })
 
 describe("reconcileGraphDependents", () => {
+  it("does not queue an already queued node again when its dependency is healthy", async () => {
+    const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" }
+    const snapshot = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
+      { key: "source", templateId: "cover_letter_writer", goal: "Write", successCriteria: ["done"], dependsOn: [], depth: 1, taskId: "source-1", verificationDisposition: "specialized" },
+      { key: "child", templateId: "cover_letter_writer", goal: "Review", successCriteria: ["done"], dependsOn: ["source"], depth: 2, taskId: "child-1", verificationDisposition: "specialized" },
+    ] }
+    const proposalPayloads = [{ kind: "proposal", receipt: {
+      revision: 2, nodes: [{ key: "source", taskId: "source-1", status: "queued" }, { key: "child", taskId: "child-1", status: "waiting" }], readyTaskIds: ["source-1"],
+    } }]
+    const client = fakeGraphClient("queued", { snapshot, proposalPayloads, taskStatuses: { "source-1": "completed", "child-1": "queued" } })
+
+    await expect(reconcileGraphDependents(client as unknown as Pick<pg.PoolClient, "query">, scope, new Date("2026-09-02T00:00:00.000Z"))).resolves.toBeUndefined()
+
+    expect(client.query.mock.calls.every(([sql]) => sql.trimStart().startsWith("SELECT"))).toBe(true)
+  })
+
   it.each([
     ["legacy-unverified completion", "legacy_unverified", { status: "completed", stepCount: 1, toolCallCount: 1, finalItemId: "item-source", finalText: "done", structuredResult: { schemaVersion: "agent-harness.v2.role-result.v1", role: "analyst", status: "completed", findings: [], evidence: [], summary: "done" } }, "waiting", "waiting", false],
     ["typed completion without verifier proof", "typed", { status: "completed", stepCount: 1, toolCallCount: 1, finalItemId: "item-source", finalText: "done", structuredResult: { schemaVersion: "agent-harness.v2.role-result.v1", role: "analyst", status: "completed", findings: [], evidence: [], summary: "done" } }, "waiting", "waiting", false],

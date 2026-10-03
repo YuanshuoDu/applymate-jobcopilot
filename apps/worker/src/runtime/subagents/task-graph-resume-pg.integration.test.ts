@@ -1567,7 +1567,7 @@ async function prepareSelectedJobReviewAfterRestart(
       { selectedJobPreparation: { jobId: trace.jobId } }, dependencyScope, ["writer"], [{
         ...dependencyScope, key: "writer", taskId: completedWriter.id, status: completedWriter.status,
         role: completedWriter.role, expectedOutputSchema: completedWriter.expectedOutputSchema, result: completedWriter.result,
-        verificationDisposition: "legacy_unverified",
+        verificationDisposition: "specialized",
       }],
     )
   } catch {

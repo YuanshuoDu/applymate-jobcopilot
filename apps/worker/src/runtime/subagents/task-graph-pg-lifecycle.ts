@@ -153,6 +153,7 @@ export async function reconcileGraphDependents(
         }
         continue
       }
+      if (row.status === "queued") continue
       if (options.allowClosedSession) continue
       if (!node.dependsOn.every(key => taskByKey.get(key)?.status === "completed" || repairSatisfied.has(key))) continue
       const transition = await prepareGraphTransition(client, { taskId: row.id, sessionId: scope.sessionId, type: "task.queued" })

@@ -419,7 +419,7 @@ describe("PgSubagentTaskStore", () => {
 
     expect(fake.statuses.get(fake.childId)).toBe("failed")
     expect((fake.taskResults.get(fake.childId) as Record<string, unknown>).taskGraphRepairReceipt).toBeUndefined()
-    expect(fake.calls.some(([sql]) => sql.includes("'agent.subagent.dispatch'"))).toBe(false)
+    expect(fake.calls.some(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"') && sql.includes("'agent.subagent.dispatch'"))).toBe(false)
   })
 
   it("rejects a repair when the target verification report is malformed", async () => {
@@ -1032,7 +1032,7 @@ describe("PgSubagentTaskStore", () => {
     expect(events.filter(value => value.kind === "lifecycle").map(value => value.event?.type)).toEqual(["task.interrupted", "task.cancelled"])
     expect(fake.revision()).toBe(4)
     expect(fake.pendingDispatches.has("subagent-dispatch:child-1")).toBe(false)
-    const deletion = fake.calls.find(([sql]) => sql.startsWith('DELETE FROM "agent_outbox"'))
+    const deletion = fake.calls.find(([sql, params]) => sql.startsWith('DELETE FROM "agent_outbox"') && params?.[1] === "subagent-dispatch:child-1")
     expect(deletion?.[0]).toContain('"topic" = \'agent.subagent.dispatch\'')
     expect(deletion?.[0]).toContain('"publishedAt" IS NULL')
     expect(deletion?.[1]).toEqual(["session-1", "subagent-dispatch:child-1"])

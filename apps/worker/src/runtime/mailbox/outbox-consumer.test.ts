@@ -4,6 +4,8 @@ import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 
 import { drainSubagentMailboxOutbox, startSubagentMailboxOutboxConsumer } from "./outbox-consumer.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "../subagents/task-graph-snapshot.js"
+import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "../subagents/task-graph-pg-verification.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 
 type OutboxRow = {
@@ -65,17 +67,29 @@ type FakeOptions = {
     dependsOn: readonly string[]
     depth: number
     taskId: string
+    verificationDisposition?: string
+    verification?: unknown
   }[]
   taskGraphStatuses?: Readonly<Record<string, string>>
 }
 
 const validPayload = { messageId: "message-1", sessionId: "session-1", turnId: "turn-1", toTaskId: "task-1" }
+const completedScoutStructuredResult = {
+  schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+  candidates: [{ jobId: "job-1", source: "greenhouse", url: null, evidenceIds: ["evidence-1"] }],
+  evidence: [{ id: "evidence-1", kind: "job", ref: "job-1", source: "greenhouse" }], summary: "Found one job",
+}
+const completedScoutVerification = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+  criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }],
+}
 const completedScoutResult = {
   status: "completed", stepCount: 1, toolCallCount: 0, finalItemId: null, finalText: "Found one job",
-  structuredResult: {
-    schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
-    candidates: [{ jobId: "job-1", source: "greenhouse", url: null, evidenceIds: ["evidence-1"] }],
-    evidence: [{ id: "evidence-1", kind: "job", ref: "job-1", source: "greenhouse" }], summary: "Found one job",
+  structuredResult: completedScoutStructuredResult,
+  taskGraphVerificationReport: {
+    verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
+    criteria: [{ criterionId: "candidate-count", status: "passed", reasonCode: "criteria_met" }],
+    evidenceDigest: "a".repeat(64), resultDigest: taskGraphResultDigest(completedScoutStructuredResult),
   },
 }
 
@@ -165,12 +179,13 @@ class FakeClient {
     if (this.options.taskGraphNodes && sql.includes('task."expectedOutputSchema"')) {
       const rows = this.options.taskGraphNodes.map(node => {
         const scout = node.taskId === "dependency-1"
+        const status = node.taskId === this.task.id ? this.task.status : this.options.taskGraphStatuses?.[node.taskId] ?? "queued"
         return {
           id: node.taskId,
-          status: node.taskId === this.task.id ? this.task.status : this.options.taskGraphStatuses?.[node.taskId] ?? "queued",
+          status,
           role: scout ? "scout" : "analyst",
           expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: scout ? "scout" : "analyst" },
-          result: scout ? completedScoutResult : null, context: {},
+          result: scout && status === "completed" ? completedScoutResult : null, context: {},
           sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", userId: "user-1",
         }
       })
@@ -184,12 +199,10 @@ class FakeClient {
       } as T], rowCount: 1 }
     }
     if (this.options.taskGraphNodes && sql.startsWith('SELECT task."id", task."status"')) {
-      const rows = this.options.taskGraphNodes.map(node => ({
-        id: node.taskId,
-        status: node.taskId === this.task.id ? this.task.status : this.options.taskGraphStatuses?.[node.taskId] ?? "queued",
-        failureReason: null,
-        result: null,
-      }))
+      const rows = this.options.taskGraphNodes.map(node => {
+        const status = node.taskId === this.task.id ? this.task.status : this.options.taskGraphStatuses?.[node.taskId] ?? "queued"
+        return { id: node.taskId, status, failureReason: null, result: node.taskId === "dependency-1" && status === "completed" ? completedScoutResult : null }
+      })
       return { rows: rows as T[], rowCount: rows.length }
     }
     if (this.options.taskGraphNodes && sql.startsWith('SELECT event."type", event."payload"')) return { rows: [], rowCount: 0 }
@@ -382,7 +395,7 @@ describe("subagent mailbox outbox consumer", () => {
       taskStatus: "waiting",
       dispatchMissing: true,
       taskGraphNodes: [
-        { key: "prerequisite", templateId: "scout", goal: "Find evidence", successCriteria: ["Evidence found"], dependsOn: [], depth: 1, taskId: "dependency-1" },
+        { key: "prerequisite", templateId: "scout", goal: "Find evidence", successCriteria: ["Evidence found"], dependsOn: [], depth: 1, taskId: "dependency-1", verificationDisposition: "typed", verification: completedScoutVerification },
         { key: "target", templateId: "analyst", goal: "Review evidence", successCriteria: ["Review complete"], dependsOn: ["prerequisite"], depth: 2, taskId: "task-1" },
       ],
       taskGraphStatuses: { "dependency-1": "completed" },
