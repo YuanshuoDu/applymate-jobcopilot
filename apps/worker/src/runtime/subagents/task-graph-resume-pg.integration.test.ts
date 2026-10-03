@@ -525,6 +525,7 @@ function discoveryScheduleFailureDiagnostic(error: unknown): { errorName: string
   const row = record(error)
   const errorName = diagnosticEnum(error instanceof Error ? error.name : row?.name, DISCOVERY_SCHEDULE_ERROR_NAMES) ?? "other"
   const rawCode = typeof row?.code === "string" ? row.code : error instanceof Error ? error.message : null
+  const taskGraphCode = typeof rawCode === "string" && /^task_graph_[a-z0-9_]{1,80}$/.test(rawCode) ? rawCode : null
   const code = rawCode === "Child allowed actions exceed parent policy" ? "child_allowed_actions_exceed_parent_policy"
     : rawCode === "Subagent depth limit reached" ? "subagent_depth_limit"
       : rawCode === "Subagent fan-out limit reached" ? "subagent_fan_out_limit"
@@ -533,7 +534,7 @@ function discoveryScheduleFailureDiagnostic(error: unknown): { errorName: string
             : rawCode === "Parent task is terminal" ? "parent_task_terminal"
               : rawCode === "Subagent task disappeared" ? "subagent_task_disappeared"
                 : rawCode === "Subagent task insert failed" ? "subagent_task_insert_failed" : rawCode
-  return { errorName, errorCode: diagnosticEnum(code, DISCOVERY_SCHEDULE_ERROR_CODES) ?? "other" }
+  return { errorName, errorCode: taskGraphCode ?? diagnosticEnum(code, DISCOVERY_SCHEDULE_ERROR_CODES) ?? "other" }
 }
 
 function diagnosticDiscoveryTasks(values: readonly unknown[]): RecordValue[] {
