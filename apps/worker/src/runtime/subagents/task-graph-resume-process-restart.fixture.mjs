@@ -62,6 +62,31 @@ function boundedFailureText(error) {
   const detail = error instanceof Error ? error.stack ?? `${error.name}: ${error.message}` : String(error)
   return detail.replace(/\s+/g, " ").slice(0, 1200)
 }
+function safeFailureCategory(error) {
+  const code = record(error)?.code
+  if (typeof code === "string") {
+    const category = STEP_ERROR_CLASS_BY_CODE.get(code.toLowerCase())
+    if (category) return category
+  }
+  if (error instanceof Error && error.name === "CoordinationError") return "coordination_scope_error"
+  if (error instanceof Error && error.name === "AssertionError") return "task_graph_failure"
+  return "other"
+}
+function captureModelStreamFailure(model, onFailure) {
+  return {
+    ...model,
+    stream(request) {
+      return (async function* () {
+        try {
+          for await (const event of model.stream(request)) yield event
+        } catch (error) {
+          onFailure(error)
+          throw error
+        }
+      })()
+    },
+  }
+}
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)) }
 function waitForCommand(command) {
   const index = queuedCommands.indexOf(command)
@@ -1147,6 +1172,7 @@ async function startRuntime(workerOwnerId, resume) {
               say("P3_FOLLOW_UP_GRAPH_OK " + JSON.stringify(state))
               yield { type: "text_delta", text: finalMarker }; yield { type: "completed", finishReason: "stop" }; return
             } catch (error) {
+              say("P3_PARENT_MODEL_FAILURE_CLASS " + safeFailureCategory(error))
               say("P3_PARENT_MODEL_FAILURE " + boundedFailureText(error))
               throw error
             }
@@ -1163,7 +1189,7 @@ async function startDiscoveryRuntime(workerOwnerId, resume) {
     taskGraphTemplates: TASK_GRAPH_TEMPLATES, authorizeUsage: async () => ({ settle: async () => undefined }),
     modelRuntimeFactory() {
       let modelRounds = 0
-      return { adapter: {
+      const adapter = {
         id: resume ? "p3-process-restart-discovery-resume-model" : "p3-process-restart-discovery-plan-model", profile: modelProfile(),
         async *stream(request) {
           modelRounds++
@@ -1211,7 +1237,13 @@ async function startDiscoveryRuntime(workerOwnerId, resume) {
           yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: discoveryFinalMarker }) }
           yield { type: "completed", finishReason: "stop" }; return
         },
-      }, registry: {}, candidates: [] }
+      }
+      return {
+        adapter: captureModelStreamFailure(adapter, error => {
+          if (resume) say("P3_DISCOVERY_PARENT_MODEL_FAILURE " + safeFailureCategory(error))
+        }),
+        registry: {}, candidates: [],
+      }
     },
   })
 }

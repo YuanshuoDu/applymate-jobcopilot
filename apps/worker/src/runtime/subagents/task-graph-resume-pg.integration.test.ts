@@ -475,6 +475,29 @@ function diagnosticEnum(value: unknown, allowed: ReadonlySet<string>): string | 
   return typeof value === "string" && allowed.has(value) ? value : null
 }
 
+function processFixtureFailureCategory(output: readonly string[], prefix: string): string {
+  const marker = output.find(line => line.startsWith(prefix))
+  return diagnosticEnum(marker?.slice(prefix.length), PROCESS_FIXTURE_FAILURE_CATEGORIES) ?? "none"
+}
+
+function processLineWaitFailureKind(error: unknown, prefix: string): string {
+  const message = error instanceof Error ? error.message : ""
+  if (message.startsWith(`Worker exited before ${prefix}`)) return "exited_before_marker"
+  if (message.startsWith(`Timed out waiting for ${prefix}`)) return "timeout"
+  return "other"
+}
+
+function processCleanupFailureCategory(error: unknown): string {
+  const message = error instanceof Error ? error.message : ""
+  if (message.startsWith("Worker exited unsuccessfully during cleanup")) return "worker_exited"
+  if (message.startsWith("Worker process did not exit")) return "worker_shutdown_timeout"
+  if (message.startsWith("Worker required forced termination")) return "forced_termination"
+  if (message.startsWith("Worker process kill was rejected")) return "kill_rejected"
+  const code = record(error)?.code
+  if (typeof code === "string" && /^[0-9A-Z]{5}$/.test(code)) return "database_error"
+  return "other"
+}
+
 function diagnosticErrorCode(value: unknown): string | null {
   if (typeof value !== "string") return null
   if (ERROR_DIAGNOSTIC_CODES.has(value)) return value
@@ -1317,7 +1340,7 @@ type FixtureTurnLimits = { readonly maxSteps: number; readonly maxToolCalls: num
 const DEFAULT_FIXTURE_TURN_LIMITS: FixtureTurnLimits = { maxSteps: 8, maxToolCalls: 8 }
 // The discovery fixtures execute root planning/replanning and child turns under the same root-scoped ceiling.
 const DISCOVERY_FIXTURE_TURN_LIMITS: FixtureTurnLimits = { maxSteps: 16, maxToolCalls: 8 }
-// The main TaskGraph fixture needs 10 steps: five root rounds and five child evidence steps; retain bounded headroom.
+// TaskGraph multi-round fixtures need 10-11 root and child model steps; retain bounded headroom.
 const TASK_GRAPH_FIXTURE_TURN_LIMITS: FixtureTurnLimits = { maxSteps: 12, maxToolCalls: 12 }
 
 async function seed(
@@ -4422,7 +4445,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await seed(pool, owner)
     await seed(pool, failureOwner, "waiting_for_user")
     await seed(pool, stopOwner, "waiting_for_user")
-    await seed(pool, restartOwner, "waiting_for_user")
+    await seed(pool, restartOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
     await seed(pool, artifactOwner, "waiting_for_user")
     artifactOwnerSources = await seedSelectedJobSources(pool, artifactOwner)
     await seed(pool, cancelledOwner, "waiting_for_user")
@@ -5074,6 +5097,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   }, 30_000)
 
   it("plans, waits, promotes dependencies, resumes with bounded evidence, appends a follow-up plan, and resumes again", async () => {
+    const budgetUpdate = await pool!.query(`UPDATE "agent_turns" SET "budgetSnapshot" = $2::jsonb
+      WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4`, [
+      owner.turnId, JSON.stringify({ limits: TASK_GRAPH_FIXTURE_TURN_LIMITS }), owner.sessionId, owner.userId,
+    ])
+    if (budgetUpdate.rowCount !== 1) throw new Error("Main TaskGraph fixture could not apply its test-specific turn budget")
+
     const [
       { createProductionWorkerBootstrap },
       { createTurnQueue, enqueueTurn, TURN_QUEUE_NAME },
@@ -5318,19 +5347,18 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               rootModelFailureStage = "completed_wait_summary"
               const taskIdForNode = (key: string) => nodes.find(node => node?.key === key)?.taskId
               const completedTaskForNode = (key: string) => waitTasks.find(task => task?.taskId === taskIdForNode(key))
-              expect(record(record(completedTaskForNode("large-source-repair")?.result)?.structuredResult)?.summary)
-                .toBe(LARGE_SOURCE_REPAIR_GOAL)
-              expectPassedVerificationReport(
-                record(completedTaskForNode("large-source-repair")?.result)?.taskGraphVerificationReport,
-                "candidate-count",
-              )
-              expect(record(completedTaskForNode("large-source-repair")?.result)?.taskGraphRepairReceipt).toMatchObject({
+              const completedRepairTask = completedTaskForNode("large-source-repair")
+              expect(completedRepairTask?.result).toMatchObject({ truncated: true })
+              expectPassedVerificationReport(completedRepairTask?.verificationReport, "candidate-count")
+              expect(completedRepairTask?.repairReceipt).toMatchObject({
                 graphRootTaskId: repairTarget.graphRootTaskId,
                 targetNodeKey: "large-source", targetTaskId: repairTarget.taskId,
                 criterionIds: ["candidate-count"], repairNodeKey: "large-source-repair",
                 repairTaskId: taskIdForNode("large-source-repair"),
               })
-              expect(record(record(completedTaskForNode("verification")?.result)?.structuredResult)?.summary).toBe(FOLLOW_UP_GOAL)
+              const completedVerificationTask = completedTaskForNode("verification")
+              expect(completedVerificationTask?.result).toMatchObject({ truncated: true })
+              expectPassedVerificationReport(completedVerificationTask?.verificationReport, "finding-count")
               yield { type: "text_delta", text: FINAL_MARKER }
               yield { type: "completed", finishReason: "stop" }
               return
@@ -5492,11 +5520,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       },
     })
 
-    const budgetUpdate = await pool!.query(`UPDATE "agent_turns" SET "budgetSnapshot" = $2::jsonb
-      WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4`, [
-      owner.turnId, JSON.stringify({ limits: TASK_GRAPH_FIXTURE_TURN_LIMITS }), owner.sessionId, owner.userId,
-    ])
-    if (budgetUpdate.rowCount !== 1) throw new Error("Main TaskGraph fixture could not apply its test-specific turn budget")
     await enqueueTurn(pool!, bootstrap.turns.queue, {
       turnId: owner.turnId, sessionId: owner.sessionId, ownerId: owner.ownerId,
     })
@@ -5566,8 +5589,16 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expectPassedVerificationReport(record(childByGoal.get("Summarize the fixture source")?.result)?.taskGraphVerificationReport, "finding-count")
     expect(childByGoal.get(FOLLOW_UP_GOAL)).toMatchObject({ status: "completed", role: "analyst" })
     expectPassedVerificationReport(record(childByGoal.get(FOLLOW_UP_GOAL)?.result)?.taskGraphVerificationReport, "finding-count")
+    expect(record(record(childByGoal.get(FOLLOW_UP_GOAL)?.result)?.structuredResult)).toMatchObject({
+      summary: FOLLOW_UP_GOAL,
+      evidence: [{ id: "fixture-job-evidence", kind: "job", ref: "fixture-job-1", source: "fixture" }],
+    })
     expect(childByGoal.get(LARGE_SOURCE_REPAIR_GOAL)).toMatchObject({ status: "completed", role: "scout" })
     expectPassedVerificationReport(record(childByGoal.get(LARGE_SOURCE_REPAIR_GOAL)?.result)?.taskGraphVerificationReport, "candidate-count")
+    expect(record(record(childByGoal.get(LARGE_SOURCE_REPAIR_GOAL)?.result)?.structuredResult)).toMatchObject({
+      summary: LARGE_SOURCE_REPAIR_GOAL,
+      evidence: [{ id: "fixture-job-evidence", kind: "job", ref: "fixture-job-1", source: "fixture" }],
+    })
     const repairTarget = largeSourceRepairTarget.current
     if (!repairTarget) throw new Error("Final assertions lost the oversized source repair target identity")
     expect(record(childByGoal.get(LARGE_SOURCE_REPAIR_GOAL)?.result)?.taskGraphRepairReceipt).toMatchObject({
@@ -5673,6 +5704,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let artifactPlan: SelectedJobArtifactRestartPlan | undefined
     let artifactTrace: SelectedJobArtifactRestartTrace | undefined
     let artifactReviewTrace: SelectedJobArtifactReviewTrace | undefined
+    const followUpReadyFailure: { occurred: boolean; diagnosticError: Error | null } = {
+      occurred: false, diagnosticError: null,
+    }
     try {
       if (!artifactOwnerSources || !redis) throw new Error("Selected-job fixture sources or Redis were not initialized")
       const restartJobId = `p3-process-restart-job-${restartOwner.suffix}`
@@ -5894,7 +5928,27 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       }
       expect(persistedFollowUpWait.id).toBeTruthy()
       workerTwo.stdin?.write("complete-follow-up-child\n")
-      const followUpReadyLine = await waitForProcessLine(workerTwo, "P3_FOLLOW_UP_GRAPH_READY ")
+      let followUpReadyLine: string
+      try {
+        followUpReadyLine = await waitForProcessLine(workerTwo, "P3_FOLLOW_UP_GRAPH_READY ")
+      } catch (error: unknown) {
+        followUpReadyFailure.occurred = true
+        let progress = JSON.stringify({ available: false })
+        try {
+          progress = await turnProgressDiagnostics(pool!, restartOwner.turnId, "p3-process-restart-follow-up-wait")
+        } catch {
+          // Keep the marker-wait failure primary if database diagnostics are unavailable.
+        }
+        followUpReadyFailure.diagnosticError = new Error(combineFailureDiagnostics([
+          { label: "followUpGraphReadyMarker", value: "missing" },
+          { label: "followUpMarkerWaitFailure", value: processLineWaitFailureKind(error, "P3_FOLLOW_UP_GRAPH_READY ") },
+          { label: "workerProcessState", value: workerTwo.signalCode !== null ? "signaled" : workerTwo.exitCode !== null ? "exited" : "running" },
+          { label: "parentModelFailureClass", value: processFixtureFailureCategory(
+            workerTwo.output, "P3_PARENT_MODEL_FAILURE_CLASS ",
+          ) },
+        ], progress))
+        throw followUpReadyFailure.diagnosticError
+      }
 
       const preFinalGraph = await pool!.query<{ id: string; revision: number; content: RecordValue }>(
         "SELECT \"id\", \"revision\", \"content\" FROM \"agent_items\" WHERE \"sessionId\" = $1 AND \"turnId\" = $2 AND \"taskId\" = $3 AND \"type\" = 'task_graph'",
@@ -6252,11 +6306,18 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       }
     } finally {
       const teardownFailures: string[] = []
+      const teardownFailureCategories: string[] = []
       if (workerOne && !processFixtureExited(workerOne)) {
-        try { await killProcessFixture(workerOne) } catch (error) { teardownFailures.push("Worker 1: " + String(error)) }
+        try { await killProcessFixture(workerOne) } catch (error) {
+          teardownFailures.push("Worker 1: " + String(error))
+          teardownFailureCategories.push("worker1_" + processCleanupFailureCategory(error))
+        }
       }
       if (workerTwo) {
-        try { await stopProcessFixture(workerTwo) } catch (error) { teardownFailures.push("Worker 2: " + String(error)) }
+        try { await stopProcessFixture(workerTwo) } catch (error) {
+          teardownFailures.push("Worker 2: " + String(error))
+          teardownFailureCategories.push("worker2_" + processCleanupFailureCategory(error))
+        }
       }
       // artifactOwner is suite-scoped; retire its task rows and unlinked outbox before the next fixture runs.
       try {
@@ -6269,7 +6330,18 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       } catch (error: unknown) {
         teardownFailures.push("Selected-job User cleanup: " + String(error))
       }
-      if (teardownFailures.length > 0) throw new Error("P3 Worker process teardown failed:\n" + teardownFailures.join("\n"))
+      if (teardownFailures.length > 0) {
+        if (followUpReadyFailure.diagnosticError) {
+          followUpReadyFailure.diagnosticError.message = boundedDiagnostic(
+            `${followUpReadyFailure.diagnosticError.message}; cleanupFailureCategories=${teardownFailureCategories.slice(0, 4).join(",")}`, 3_900,
+          )
+        } else if (!followUpReadyFailure.occurred) {
+          throw new Error("P3 Worker process teardown failed:\n" + teardownFailures.join("\n"))
+        } else {
+          throw new Error("P3 follow-up marker diagnostics unavailable; cleanupFailureCategories="
+            + teardownFailureCategories.slice(0, 4).join(","))
+        }
+      }
     }
   }, 240_000)
 
@@ -6966,6 +7038,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             ? "second_worker_ready" : "second_worker_pending"
         return {
           processStage,
+          parentModelFailureClass: processFixtureFailureCategory(
+            workerTwo?.output ?? [], "P3_DISCOVERY_PARENT_MODEL_FAILURE ",
+          ),
           jobsSearchAppeared: searchObservation,
           jobsSearchCallEmitted: searchObservation,
           jobsSearchResultPersisted: resultCount > 0,
@@ -7137,7 +7212,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low" as const,
     }
     let rootExecution = 0
-    let discoveryRootStage: "not_started" | "initial_plan" | "scout_wait" | "replan" | "analyst_wait" | "final" = "not_started"
+    let discoveryRootModelFailure: string | null = null
+    let discoveryRootStage: "not_started" | "initial_plan" | "scout_wait" | "replan" | "analyst_plan_receipt" | "analyst_wait" | "final" = "not_started"
     let discoveryChildStage: "not_started" | "search_visibility" | "search_call_emitted" | "parent_wait" | "result_emitted" = "not_started"
     let discoveryJobsSearchAppeared = false
     let discoveryJobsSearchCallEmitted = false
@@ -7188,8 +7264,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               return
             }
             if (execution === 2 && round === 2) {
-              discoveryRootStage = "analyst_wait"
+              discoveryRootStage = "analyst_plan_receipt"
               const taskIds = planTaskIds(request, "p3-discovery-plan-analyst", 1)
+              discoveryRootStage = "analyst_wait"
               yield { type: "tool_call_completed", callId: "p3-discovery-wait-analyst", name: "agent.wait", arguments: {
                 idempotencyKey: `p3-discovery-wait-analyst:${discoveryOwner.turnId}`, taskIds, mode: "all", timeoutMs: 20_000,
               } }
@@ -7213,7 +7290,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             throw new Error(`Unexpected discovery root model turn ${execution}/${round}`)
           },
         }
-        return { adapter, registry: {} as never, candidates: [] }
+        return {
+          adapter: captureModelStreamFailure(adapter, error => {
+            discoveryRootModelFailure = childFixtureErrorSummary(error)
+          }),
+          registry: {} as never,
+          candidates: [],
+        }
       },
     })
     const childExecutor = createProductionChildExecutor({
@@ -7258,7 +7341,54 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       subagents: { execute: childExecutor, intervalMs: 10 },
     })
 
+    const collectRootToolCallProjection = async (callId: string) => {
+      const result = await pool!.query<{
+        itemType: string; itemStatus: string; itemContent: unknown; eventType: string | null; eventPayload: unknown
+      }>(
+        `SELECT item."type" AS "itemType", item."status" AS "itemStatus", item."content" AS "itemContent",
+                event."type" AS "eventType", event."payload" AS "eventPayload"
+         FROM "agent_items" AS item
+         LEFT JOIN "agent_events" AS event
+           ON event."sessionId" = item."sessionId" AND event."turnId" = item."turnId" AND event."itemId" = item."id"
+         WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."type" IN ('tool_call', 'tool_result')
+           AND item."content"->>'toolCallId' = $3
+         ORDER BY item."type", event."sequence"`,
+        [discoveryOwner.sessionId, discoveryOwner.turnId, callId],
+      )
+      const call = result.rows.find(row => row.itemType === "tool_call")
+      const toolResult = result.rows.find(row => row.itemType === "tool_result")
+      const callContent = record(call?.itemContent)
+      const resultContent = record(toolResult?.itemContent)
+      const output = record(resultContent?.output)
+      const planNodes = Array.isArray(output?.nodes) ? output.nodes.map(record) : []
+      const eventTypes = new Set([
+        "tool_call.started", "tool_call.completed", "tool_call.failed", "item.started", "item.completed", "item.failed",
+      ])
+      return {
+        callPresent: Boolean(call),
+        callStatus: diagnosticEnum(callContent?.status, ITEM_DIAGNOSTIC_STATUSES) ?? "none",
+        resultPresent: Boolean(toolResult),
+        resultItemStatus: diagnosticEnum(toolResult?.itemStatus, ITEM_DIAGNOSTIC_STATUSES) ?? "none",
+        outputStatus: diagnosticEnum(output?.status, new Set(["accepted", "duplicate", "rejected", "ready", "waiting", "timed_out", "failed"])) ?? "none",
+        errorCode: diagnosticErrorCode(resultContent?.errorCode),
+        nodeCount: diagnosticBoundedCount(Array.isArray(output?.nodes) ? output.nodes.length : null),
+        taskIdCount: diagnosticBoundedCount(planNodes.filter(node => typeof node?.taskId === "string").length),
+        events: result.rows.filter(row => row.eventType).slice(0, 6).map(row => {
+          const payload = record(row.eventPayload)
+          return {
+            type: diagnosticEnum(row.eventType, eventTypes) ?? "other",
+            status: diagnosticEnum(payload?.status, EVENT_DIAGNOSTIC_STATUSES) ?? "none",
+            errorCode: diagnosticErrorCode(payload?.errorCode),
+          }
+        }),
+      }
+    }
+
     const collectCanonicalDiscoveryDiagnostics = async () => {
+      const [analystPlan, analystWait] = await Promise.all([
+        collectRootToolCallProjection("p3-discovery-plan-analyst"),
+        collectRootToolCallProjection("p3-discovery-wait-analyst"),
+      ])
       const tasks = await pool!.query<DiscoveryVerifierTask & { failureReason: string | null; result: unknown }>(
         `SELECT "id", "role", "status", "attemptCount", "rootTaskId", "parentTaskId", "failureReason", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2`,
         [discoveryOwner.turnId, discoveryOwner.sessionId],
@@ -7284,6 +7414,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const verifierEvidence = await collectDiscoveryVerifierDiagnostics(pool!, discoveryOwner, tasks.rows)
       return {
         rootStage: discoveryRootStage,
+        rootModelFailure: discoveryRootModelFailure ?? "not_captured",
+        analystPlan,
+        analystWait,
         childStage: discoveryChildStage,
         jobsSearchAppeared: discoveryJobsSearchAppeared || searchCalls > 0,
         jobsSearchCallEmitted: discoveryJobsSearchCallEmitted || searchCalls > 0,
@@ -7690,7 +7823,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               if (!initialPlanTaskIds?.[1]) throw new Error("repair fixture lost the original dependent task ID")
               const taskIds = [...repairTaskIds, initialPlanTaskIds[1]]
               yield { type: "tool_call_completed", callId: "p3-verifier-repair-wait", name: "agent.wait", arguments: {
-                idempotencyKey: `p3-verifier-repair-wait:${value.turnId}`, taskIds, mode: "all", timeoutMs: 45_000,
+                idempotencyKey: `p3-verifier-repair-wait:${value.turnId}`, taskIds, mode: "all", timeoutMs: 30_000,
               } }
               yield { type: "completed", finishReason: "tool_calls" }
               return
