@@ -2776,13 +2776,24 @@ async function waitForTurnStatus(
   throw new Error(`TaskGraph root turn did not reach ${wanted}; progress=${compactTurnProgressDiagnostics(progress, 900)}`)
 }
 
+type LeaseRecoveryStartupStage =
+  | "not_started" | "state_loading" | "state_loaded" | "selected_job_loading" | "selected_job_loaded"
+  | "root_ensure_entered" | "root_ensure_returned" | "root_ensure_failed" | "model_factory"
+type LeaseRecoveryFixtureDiagnostics = {
+  modelRuntimeFactoryInvocations: number
+  adapterStreamInvocations: number
+  runtimeExecuteInvocations: number
+  runtimeExecuteFailureClass: FailurePreflightErrorClass
+  startupStage: LeaseRecoveryStartupStage
+}
+
 async function waitForPersistedTaskWait(
   pool: Pool,
   turnId: string,
   idempotencyKey: string,
   timeoutMs = 20_000,
   diagnosticToolCallId?: string,
-  diagnosticFixtureCounters?: { modelRuntimeFactoryInvocations: number; adapterStreamInvocations: number },
+  diagnosticFixtureCounters?: LeaseRecoveryFixtureDiagnostics,
 ): Promise<{ id: string }> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
@@ -2806,7 +2817,7 @@ async function persistedWaitTimeoutDiagnostics(
   turnId: string,
   idempotencyKey: string,
   toolCallId: string,
-  fixtureCounters?: { modelRuntimeFactoryInvocations: number; adapterStreamInvocations: number },
+  fixtureCounters?: LeaseRecoveryFixtureDiagnostics,
 ): Promise<string> {
   try {
     const [turn, wait, tools, toolEvents, recentTurnEvents, tasks, steps] = await Promise.all([
@@ -2853,7 +2864,11 @@ async function persistedWaitTimeoutDiagnostics(
         suspended: waitRow.suspendedAt !== null, resolved: waitRow.resolvedAt !== null, consumed: waitRow.consumedAt !== null,
         targetCount: diagnosticCount(waitRow.targetTaskIds), matchedCount: diagnosticCount(waitRow.matchedTaskIds),
       } : { found: false },
-      fixtureCounters: fixtureCounters ?? null,
+      fixtureCounters: fixtureCounters ? {
+        ...fixtureCounters,
+        runtimeExecuteFailureClass: fixtureCounters.runtimeExecuteFailureClass,
+        startupStage: fixtureCounters.startupStage,
+      } : null,
       tools: tools.rows.map(item => ({
         id: item.id.slice(-12), type: item.type, status: diagnosticEnum(item.status, ITEM_DIAGNOSTIC_STATUSES),
         errorCode: diagnosticErrorCode(item.errorCode),
@@ -7132,11 +7147,14 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   }, 120_000)
 
   it("recovers an exhausted typed TaskGraph lease into a wait-consumable report and admits its exact repair", async () => {
-    const [workerQueue, canonical, commandPortModule, turnQueue] = await Promise.all([
+    const [workerQueue, canonical, commandPortModule, turnQueue, turnState, selectedJobPreparation, rootTaskStoreModule] = await Promise.all([
       import("../../queue/production-bootstrap.js"),
       import("../canonical-turn-runtime.js"),
       import("./pg-task-graph-command-port.js"),
       import("../turns/turn-queue.js"),
+      import("../canonical-turn-state.js"),
+      import("../selected-job-preparation.js"),
+      import("./root-task-store.js"),
     ])
     const value = leaseRecoveryOwner
     turnQueueName = turnQueue.TURN_QUEUE_NAME
@@ -7155,14 +7173,45 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const initialWaitKey = `p3-lease-recovery-wait:${value.turnId}`
     const repairPlanCallId = `p3-lease-recovery-repair-plan:${value.turnId}`
     const repairWaitKey = `p3-lease-recovery-repair-wait:${value.turnId}`
-    const fixtureInvocationCounters = { modelRuntimeFactoryInvocations: 0, adapterStreamInvocations: 0 }
+    const fixtureInvocationCounters: LeaseRecoveryFixtureDiagnostics = {
+      modelRuntimeFactoryInvocations: 0, adapterStreamInvocations: 0,
+      runtimeExecuteInvocations: 0, runtimeExecuteFailureClass: "none", startupStage: "not_started",
+    }
     let initialWaitReportSeen = false
     let repairPlanAccepted = false
-    const runtime = await canonical.createCanonicalTurnRuntime(pool!, {
+    const productionRootTaskStore = rootTaskStoreModule.createPgRootTaskStore(pool!)
+    const runtimeResult = await canonical.createCanonicalTurnRuntime(pool!, {
       workerId: value.ownerId, productionFlags: flags,
       taskGraphCommandPort: commandPortModule.createPgTaskGraphCommandPort(pool!),
       authorizeUsage: async () => ({ settle: async () => undefined }),
+      stateLoader: async (statePool, lease, now, loaderOptions) => {
+        fixtureInvocationCounters.startupStage = "state_loading"
+        const state = await turnState.loadCanonicalTurnState(statePool, lease, now, loaderOptions)
+        fixtureInvocationCounters.startupStage = "state_loaded"
+        return state
+      },
+      selectedJobPreparationLoader: async (statePool, lease, now) => {
+        fixtureInvocationCounters.startupStage = "selected_job_loading"
+        const preparation = await selectedJobPreparation.loadSelectedJobPreparation(statePool, lease, now)
+        fixtureInvocationCounters.startupStage = "selected_job_loaded"
+        return preparation
+      },
+      rootTaskStore: {
+        ...productionRootTaskStore,
+        async ensure(input) {
+          fixtureInvocationCounters.startupStage = "root_ensure_entered"
+          try {
+            const root = await productionRootTaskStore.ensure(input)
+            fixtureInvocationCounters.startupStage = "root_ensure_returned"
+            return root
+          } catch (error: unknown) {
+            fixtureInvocationCounters.startupStage = "root_ensure_failed"
+            throw error
+          }
+        },
+      },
       modelRuntimeFactory: () => {
+        fixtureInvocationCounters.startupStage = "model_factory"
         const execution = ++fixtureInvocationCounters.modelRuntimeFactoryInvocations
         let round = 0
         const adapter: ModelAdapter = {
@@ -7232,6 +7281,18 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         return { adapter, registry: {} as never, candidates: [] }
       },
     })
+    const runtime = {
+      ...runtimeResult,
+      execute: async (input: Parameters<typeof runtimeResult.execute>[0]) => {
+        fixtureInvocationCounters.runtimeExecuteInvocations += 1
+        try {
+          return await runtimeResult.execute(input)
+        } catch (error: unknown) {
+          fixtureInvocationCounters.runtimeExecuteFailureClass = safeFailurePreflightErrorClass(error)
+          throw error
+        }
+      },
+    }
     bootstrap = await workerQueue.createProductionWorkerBootstrap({
       pool: pool!, runtime, ownerId: value.ownerId,
       turnQueueFactory: turnQueue.createTurnQueue, turnRecoveryIntervalMs: 100,
