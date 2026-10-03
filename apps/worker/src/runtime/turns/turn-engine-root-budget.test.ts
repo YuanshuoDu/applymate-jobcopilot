@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 
-import { enforceRootStepBudget, enforceRootToolCallBudget, enforceRootUsageBudget } from "./turn-engine-root-budget.js"
+import { enforceRootStepAndUsageBudgets, enforceRootStepBudget, enforceRootToolCallBudget, enforceRootUsageBudget } from "./turn-engine-root-budget.js"
 
 const owner = {
   kind: "task" as const, userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "child-1",
@@ -61,6 +61,34 @@ describe("root budget persistence guards", () => {
     await expect(enforceRootUsageBudget(db as never, owner)).resolves.toBeUndefined()
     expect(db.query).toHaveBeenCalledOnce()
     expect(String(db.query.mock.calls[0]?.[0])).not.toContain("SUM(")
+  })
+
+  it("checks step and absent usage limits from one root snapshot", async () => {
+    const db = client([
+      { rows: [{ budgetSnapshot: { limits: { maxSteps: 4, maxToolCalls: 2 } } }] },
+      { rows: [{ used: "0" }] },
+    ])
+
+    await expect(enforceRootStepAndUsageBudgets(db as never, owner)).resolves.toBeUndefined()
+    expect(db.query).toHaveBeenCalledTimes(2)
+    expect(String(db.query.mock.calls[0]?.[0])).toContain('SELECT root_task."budgetSnapshot"')
+    expect(String(db.query.mock.calls[1]?.[0])).toContain('COUNT(*)::bigint AS "used"')
+    expect(db.query.mock.calls.map(([sql]) => String(sql)).some(sql => sql.includes("SUM("))).toBe(false)
+  })
+
+  it("blocks the next step at the maxSteps boundary before usage aggregation", async () => {
+    const db = client([
+      { rows: [{ budgetSnapshot: { limits: { maxSteps: 1, maxCostUsd: 0 } } }] },
+      { rows: [{ used: "1" }] },
+    ])
+
+    await expect(enforceRootStepAndUsageBudgets(db as never, owner)).rejects.toMatchObject({
+      code: "budget_exhausted", metric: "steps", limit: 1, used: 1, attempted: 2,
+    })
+    expect(db.query).toHaveBeenCalledTimes(2)
+    expect(String(db.query.mock.calls[0]?.[0])).toContain('SELECT root_task."budgetSnapshot"')
+    expect(String(db.query.mock.calls[1]?.[0])).toContain('COUNT(*)::bigint AS "used"')
+    expect(db.query.mock.calls.map(([sql]) => String(sql)).some(sql => sql.includes("SUM("))).toBe(false)
   })
 
   it.each([

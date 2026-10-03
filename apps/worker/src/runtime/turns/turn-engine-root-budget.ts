@@ -35,13 +35,11 @@ async function rootSnapshot(client: QueryClient, owner: ExecutionOwnerFence): Pr
   return record(result.rows[0]?.budgetSnapshot)
 }
 
-async function rootLimits(client: QueryClient, owner: ExecutionOwnerFence): Promise<Row> {
-  const snapshot = await rootSnapshot(client, owner)
+function rootLimits(snapshot: Row): Row {
   return record(snapshot.limits ?? snapshot)
 }
 
-async function rootUsageLimits(client: QueryClient, owner: ExecutionOwnerFence): Promise<Row> {
-  const snapshot = await rootSnapshot(client, owner)
+function rootUsageLimits(snapshot: Row): Row {
   if (!Object.prototype.hasOwnProperty.call(snapshot, "limits") || snapshot.limits === null) return record(snapshot)
   if (typeof snapshot.limits !== "object" || Array.isArray(snapshot.limits)) {
     throw new Error("turn_budget_limit_invalid")
@@ -49,8 +47,7 @@ async function rootUsageLimits(client: QueryClient, owner: ExecutionOwnerFence):
   return record(snapshot.limits)
 }
 
-async function rootLimit(client: QueryClient, owner: ExecutionOwnerFence, metric: BudgetMetric): Promise<number | undefined> {
-  const limits = await rootLimits(client, owner)
+function rootLimit(limits: Row, metric: BudgetMetric): number | undefined {
   const value = limits[metric]
   if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value
   return metric === "maxSteps" ? DEFAULT_ROOT_MAX_STEPS : undefined
@@ -125,24 +122,19 @@ async function usageCount(client: QueryClient, owner: ExecutionOwnerFence, metri
 }
 
 export async function enforceRootStepBudget(client: QueryClient, owner: ExecutionOwnerFence): Promise<void> {
-  const limit = await rootLimit(client, owner, "maxSteps")
+  const snapshot = await rootSnapshot(client, owner)
+  const limit = rootLimit(rootLimits(snapshot), "maxSteps")
   if (limit === undefined) return
   const used = await usageCount(client, owner, "steps")
   if (used + 1 > limit) throw new BudgetExceededError("steps", limit, used + 1, used)
 }
 
-export async function enforceRootToolCallBudget(client: QueryClient, owner: ExecutionOwnerFence, itemId: string): Promise<void> {
-  const existing = await client.query<{ id: string }>(`SELECT "id" FROM "agent_items"
-    WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`, [itemId, owner.sessionId, owner.turnId])
-  if (existing.rows[0]) return
-  const limit = await rootLimit(client, owner, "maxToolCalls")
-  if (limit === undefined) return
-  const used = await usageCount(client, owner, "tool_calls")
-  if (used + 1 > limit) throw new BudgetExceededError("tool_calls", limit, used + 1, used)
-}
-
-export async function enforceRootUsageBudget(client: QueryClient, owner: ExecutionOwnerFence): Promise<void> {
-  const limits = await rootUsageLimits(client, owner)
+async function enforceRootUsageBudgetForSnapshot(
+  client: QueryClient,
+  owner: ExecutionOwnerFence,
+  snapshot: Row,
+): Promise<void> {
+  const limits = rootUsageLimits(snapshot)
   const configured: ConfiguredUsageBudgetMetric[] = []
   for (const metric of USAGE_BUDGET_METRICS) {
     const limit = usageLimit(limits, metric.limit)
@@ -157,4 +149,28 @@ export async function enforceRootUsageBudget(client: QueryClient, owner: Executi
     // It cannot prevent the just-committed step from crossing the limit, so this is not a strict cap.
     if (used >= threshold) throw new BudgetExceededError(metric, threshold, used, used)
   }
+}
+
+export async function enforceRootStepAndUsageBudgets(client: QueryClient, owner: ExecutionOwnerFence): Promise<void> {
+  const snapshot = await rootSnapshot(client, owner)
+  const stepLimit = rootLimit(rootLimits(snapshot), "maxSteps")
+  if (stepLimit !== undefined) {
+    const used = await usageCount(client, owner, "steps")
+    if (used + 1 > stepLimit) throw new BudgetExceededError("steps", stepLimit, used + 1, used)
+  }
+  await enforceRootUsageBudgetForSnapshot(client, owner, snapshot)
+}
+
+export async function enforceRootToolCallBudget(client: QueryClient, owner: ExecutionOwnerFence, itemId: string): Promise<void> {
+  const existing = await client.query<{ id: string }>(`SELECT "id" FROM "agent_items"
+    WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`, [itemId, owner.sessionId, owner.turnId])
+  if (existing.rows[0]) return
+  const limit = rootLimit(rootLimits(await rootSnapshot(client, owner)), "maxToolCalls")
+  if (limit === undefined) return
+  const used = await usageCount(client, owner, "tool_calls")
+  if (used + 1 > limit) throw new BudgetExceededError("tool_calls", limit, used + 1, used)
+}
+
+export async function enforceRootUsageBudget(client: QueryClient, owner: ExecutionOwnerFence): Promise<void> {
+  await enforceRootUsageBudgetForSnapshot(client, owner, await rootSnapshot(client, owner))
 }

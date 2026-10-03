@@ -2,7 +2,7 @@ import type pg from "pg"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import type { ExecutionOwnerFence } from "../execution-owner.js"
 import { ownerFenceSql } from "./turn-engine-owner-sql.js"
-import { enforceRootStepBudget, enforceRootToolCallBudget, enforceRootUsageBudget } from "./turn-engine-root-budget.js"
+import { enforceRootStepAndUsageBudgets, enforceRootToolCallBudget } from "./turn-engine-root-budget.js"
 import { toRepositoryJson, type TurnEngineEventInput, type TurnEngineItem, type TurnEngineStore, type TurnEngineStep } from "./turn-engine-types.js"
 import { STEERING_MARKER_EVENT_TYPE, parseSteeringMarkerPayload, type SteeringMarkerPayload } from "../context/steering-marker.js"
 import { matchesAgentOutboxIdentity, type AgentOutboxIdentity, type AgentOutboxPayload } from "../outbox-identity.js"
@@ -153,8 +153,7 @@ export function createPgTurnEngineStore(pool: TurnEnginePool, terminalGuard?: Tu
           await client.query("COMMIT"); committed = true
           return { id: String(row.id), ordinal: Number(row.ordinal) }
         }
-        await enforceRootStepBudget(client, input.owner)
-        await enforceRootUsageBudget(client, input.owner)
+        await enforceRootStepAndUsageBudgets(client, input.owner)
         const ordinalResult = await client.query<{ ordinal: number | string }>(`SELECT COALESCE(MAX("ordinal"), -1) + 1 AS "ordinal" FROM "agent_steps" WHERE "turnId" = $1 AND "sessionId" = $2`, [input.owner.turnId, input.owner.sessionId])
         const ordinal = Number(ordinalResult.rows[0]?.ordinal ?? 0)
         const result = await client.query<{ id: string }>(`INSERT INTO "agent_steps"

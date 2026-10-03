@@ -109,6 +109,19 @@ describe("PostgreSQL TurnEngine store", () => {
     expect(calls.some(({ sql }) => sql === "ROLLBACK")).toBe(false)
   })
 
+  it("reads the root snapshot once and skips usage aggregation when usage limits are absent", async () => {
+    const { calls, pool } = turnStartBudgetFixture({
+      budgetSnapshot: { limits: { maxSteps: 32, maxToolCalls: 4 } },
+    })
+    const store = createPgTurnEngineStore(pool)
+
+    await expect(store.startStep({ owner, stepId: "unbudgeted-usage-step", ordinal: 0, attempt: 1, inputThroughSequence: 0n, consumedInputIds: [], modelProfileSnapshot: {}, now }))
+      .resolves.toEqual({ id: "new-step", ordinal: 0 })
+
+    expect(calls.filter(({ sql }) => sql.includes('SELECT root_task."budgetSnapshot"'))).toHaveLength(1)
+    expect(calls.some(({ sql }) => sql.includes("SUM(usage_row."))).toBe(false)
+  })
+
   it.each([
     { metric: "input_tokens", budgetSnapshot: { limits: { maxSteps: 32, maxInputTokens: 10 } }, usage: { inputTokens: "10", outputTokens: "0", estimatedCostUsd: "0" } },
     { metric: "cost_usd", budgetSnapshot: { limits: { maxSteps: 32, maxCostUsd: 0.25 } }, usage: { inputTokens: "0", outputTokens: "0", estimatedCostUsd: "0.25" } },
