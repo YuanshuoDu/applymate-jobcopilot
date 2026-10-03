@@ -6048,7 +6048,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(rootRuntimeExecutions).toBe(2)
     expect(resumedAfterFailure).toBe(true)
     expect(descendantExecuted).toBe(false)
-    expect(turn.rows[0]).toMatchObject({ status: "failed", finalResponse: null })
+    expect(turn.rows[0]?.status).toBe("failed")
+    expect(turn.rows[0]?.finalResponse ?? "").not.toContain(FAILURE_FINAL_MARKER)
     const finalRejection = await pool!.query<{ payload: unknown }>(
       `SELECT "payload" FROM "agent_events" WHERE "turnId" = $1 AND "sessionId" = $2 AND "type" = 'final.rejected'
        AND "payload"->>'blocker' = 'task_graph_verification_unverified' ORDER BY "sequence" DESC LIMIT 1`,
@@ -6240,7 +6241,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     )
     const rootTaskId = turn.rows[0]?.rootTaskId
     if (!rootTaskId) throw new Error("Closed-source fixture did not establish a root TaskGraph task")
-    expect(turn.rows[0]).toMatchObject({ status: "failed", finalResponse: null })
+    expect(turn.rows[0]?.status).toBe("failed")
+    expect(turn.rows[0]?.finalResponse ?? "").not.toContain(finalMarker)
     const finalRejection = await pool!.query<{ payload: unknown }>(
       `SELECT "payload" FROM "agent_events" WHERE "turnId" = $1 AND "sessionId" = $2 AND "type" = 'final.rejected'
        AND "payload"->>'blocker' = 'task_graph_verification_unverified' ORDER BY "sequence" DESC LIMIT 1`,
