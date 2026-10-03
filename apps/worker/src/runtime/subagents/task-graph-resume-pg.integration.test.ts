@@ -3377,6 +3377,8 @@ async function processRestartFailureDiagnostic(
     restartRuntimeStateDiagnostics(pool, turnId),
     agentPlanLifecycleDiagnostics(pool, turnId, "p3-process-restart-follow-up-plan"),
   ])
+  const childOutcome = latestProcessFixtureJsonDiagnostic(workerOutput, "P3_CHILD_OUTCOME ", PROCESS_RESTART_CHILD_OUTCOME_DIAGNOSTIC_FIELDS)
+  const childException = latestProcessFixtureJsonDiagnostic(workerOutput, "P3_CHILD_EXCEPTION ", PROCESS_RESTART_CHILD_EXCEPTION_DIAGNOSTIC_FIELDS)
   return {
     rootStage: latestProcessFixtureStage(workerOutput, [
       ["P3_SECOND_WORKER_READY ", "worker_ready"],
@@ -3396,11 +3398,38 @@ async function processRestartFailureDiagnostic(
     ], PROCESS_RESTART_CHILD_STAGES),
     parentModelFailureCategory: processFixtureFailureCategory(workerOutput, "P3_PARENT_MODEL_FAILURE_CLASS "),
     parentModelFailureGuard: processRestartGuardMarker(workerOutput),
+    childOutcome,
+    childException,
     taskGraph,
     waitResults: { initial: initialWait, followUp: followUpWait },
     runtimeState,
     analystPlan,
   }
+}
+
+const PROCESS_RESTART_CHILD_OUTCOME_DIAGNOSTIC_FIELDS = {
+  role: new Set(["scout", "analyst", "other"]), status: new Set(["completed", "failed", "other"]),
+  failureCode: new Set(["invalid_structured_result", "model_incomplete", "invalid_output", "tool_execution_failed", "timeout", "cancelled", "step_limit", "budget_exhausted", "no_progress", "evidence_missing", "evidence_conflict", "final_unverified", "child_turn_missing", "child_resume_unavailable", "child_resume_evidence_unavailable", "selected_job_sources_unavailable", "selected_job_context_unavailable", "subagent_role_unknown", "none", "other"]),
+  resultStatus: new Set(["completed", "failed", "missing", "other"]),
+}
+const PROCESS_RESTART_CHILD_EXCEPTION_DIAGNOSTIC_FIELDS = {
+  role: new Set(["scout", "analyst", "other"]),
+  stage: new Set(["dispatch_guard", "execute_child", "other"]),
+  errorName: new Set(["Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "AbortError", "TimeoutError", "other"]),
+  failureCode: new Set(["invalid_structured_result", "model_incomplete", "invalid_output", "tool_execution_failed", "timeout", "cancelled", "step_limit", "budget_exhausted", "no_progress", "evidence_missing", "evidence_conflict", "final_unverified", "database_deadlock", "database_serialization", "fixture_error", "other"]),
+}
+
+function latestProcessFixtureJsonDiagnostic(
+  output: readonly string[], prefix: string, fields: Readonly<Record<string, ReadonlySet<string>>>,
+): RecordValue | null {
+  const line = [...output].reverse().find(value => value.startsWith(prefix))
+  const raw = line ? diagnosticJsonRecord(line.slice(prefix.length)) : null
+  if (!raw) return null
+  const result: RecordValue = {}
+  for (const [field, allowed] of Object.entries(fields)) result[field] = diagnosticEnum(raw[field], allowed) ?? "other"
+  if (Object.hasOwn(raw, "hasResult")) result.hasResult = raw.hasResult === true
+  if (Object.hasOwn(raw, "hasStructuredResult")) result.hasStructuredResult = raw.hasStructuredResult === true
+  return result
 }
 
 function processRestartGuardMarker(workerOutput: readonly string[]): string {
@@ -3756,6 +3785,22 @@ async function restartFollowUpWaitDiagnostics(
 }
 
 describe("compact TaskGraph wait failure diagnostics", () => {
+  it("projects restart child markers through the safe diagnostic allowlists", () => {
+    const outcome = latestProcessFixtureJsonDiagnostic([
+      `P3_CHILD_OUTCOME ${JSON.stringify({ role: "analyst", status: "failed", failureCode: "invalid_output", resultStatus: "missing", hasResult: false, hasStructuredResult: false, prompt: "private" })}`,
+    ], "P3_CHILD_OUTCOME ", PROCESS_RESTART_CHILD_OUTCOME_DIAGNOSTIC_FIELDS)
+    const exception = latestProcessFixtureJsonDiagnostic([
+      `P3_CHILD_EXCEPTION ${JSON.stringify({ role: "analyst", stage: "execute_child", errorName: "TypeError", failureCode: "other", message: "private provider response" })}`,
+    ], "P3_CHILD_EXCEPTION ", PROCESS_RESTART_CHILD_EXCEPTION_DIAGNOSTIC_FIELDS)
+
+    expect(outcome).toEqual({
+      role: "analyst", status: "failed", failureCode: "invalid_output", resultStatus: "missing",
+      hasResult: false, hasStructuredResult: false,
+    })
+    expect(exception).toEqual({ role: "analyst", stage: "execute_child", errorName: "TypeError", failureCode: "other" })
+    expect(JSON.stringify({ outcome, exception })).not.toContain("private")
+  })
+
   it("selects the latest TaskGraph observation from a multi-step model request", () => {
     const request = {
       messages: [
