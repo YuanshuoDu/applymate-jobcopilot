@@ -7113,6 +7113,18 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       pool: pool!, runtime, ownerId: value.ownerId,
       turnQueueFactory: turnQueue.createTurnQueue, turnRecoveryIntervalMs: 100,
       waitResolver: { intervalMs: 10, batchSize: 10, ownerId: `p3-lease-recovery-wait-resolver-${value.suffix}` },
+      // This test claims and expires the child lease itself. Keep the canonical
+      // child-execution wiring present without starting a worker that could race it.
+      subagents: {
+        execute: async () => { throw new Error("Lease recovery fixture must not auto-execute child tasks") },
+        intervalMs: 10,
+        queueFactory: () => ({
+          queue: { add: async () => undefined, close: async () => undefined },
+          worker: { pause: async () => undefined, close: async () => undefined },
+          close: async () => undefined,
+        }) as never,
+        recoveryFactory: () => ({ close: async () => undefined }) as never,
+      },
     })
     await turnQueue.enqueueTurn(pool!, bootstrap.turns.queue, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
     const persistedWait = await waitForPersistedTaskWait(pool!, value.turnId, initialWaitKey)
