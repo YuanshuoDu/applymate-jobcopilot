@@ -37,6 +37,11 @@ const STEP_ERROR_CLASS_BY_CODE = new Map([
   ["tool_execution_failed", "generic_tool_execution_failed"], ["business_precondition_failed", "business_precondition_failed"],
   ["invalid_output", "turn_output_invalid"], ["budget_exhausted", "turn_budget_exhausted"],
 ])
+const RESTORED_GRAPH_GUARD_MARKERS = new Set([
+  "snapshot_not_restored", "source_node_not_restored", "summary_node_not_restored", "other_node_not_restored",
+  "wait_result_missing", "source_verification_not_restored", "summary_verification_not_restored",
+  "source_projection_missing", "other",
+])
 const resultMarker = "p3-process-restart-source-result", finalMarker = "p3-process-restart-parent-resumed-after-follow-up"
 const planCallId = "p3-process-restart-plan", waitCallId = "p3-process-restart-wait"
 const followUpPlanCallId = "p3-process-restart-follow-up-plan", followUpWaitCallId = "p3-process-restart-follow-up-wait"
@@ -58,9 +63,19 @@ function onStdinData(chunk) {
 }
 process.stdin.on("data", onStdinData)
 function say(value) { process.stdout.write(value + "\n") }
-function boundedFailureText(error) {
-  const detail = error instanceof Error ? error.stack ?? `${error.name}: ${error.message}` : String(error)
-  return detail.replace(/\s+/g, " ").slice(0, 1200)
+function restoredGraphGuardMarker(error) {
+  const message = error instanceof Error ? error.message : ""
+  let marker = "other"
+  if (message === "p3_task_graph_revision_or_snapshot_not_restored") marker = "snapshot_not_restored"
+  else if (message.startsWith("p3_task_graph_node_not_restored:")) {
+    const key = message.slice("p3_task_graph_node_not_restored:".length)
+    marker = key === "source" ? "source_node_not_restored"
+      : key === "summary" ? "summary_node_not_restored" : "other_node_not_restored"
+  } else if (message === "p3_durable_wait_result_missing") marker = "wait_result_missing"
+  else if (message === "p3_typed_verification_report_not_restored:candidate-count") marker = "source_verification_not_restored"
+  else if (message === "p3_typed_verification_report_not_restored:finding-count") marker = "summary_verification_not_restored"
+  else if (message.startsWith("p3_restored_graph_source_projection_missing:")) marker = "source_projection_missing"
+  return RESTORED_GRAPH_GUARD_MARKERS.has(marker) ? marker : "other"
 }
 function safeFailureCategory(error) {
   const code = record(error)?.code
@@ -1173,7 +1188,7 @@ async function startRuntime(workerOwnerId, resume) {
               yield { type: "text_delta", text: finalMarker }; yield { type: "completed", finishReason: "stop" }; return
             } catch (error) {
               say("P3_PARENT_MODEL_FAILURE_CLASS " + safeFailureCategory(error))
-              say("P3_PARENT_MODEL_FAILURE " + boundedFailureText(error))
+              say("P3_PARENT_MODEL_FAILURE_GUARD " + restoredGraphGuardMarker(error))
               throw error
             }
           }

@@ -4,6 +4,7 @@ import { evaluateTaskGraphVerification, taskGraphVerificationRole, TASK_GRAPH_VE
 import { parseTaskGraphSnapshot, canonicalTaskGraphJson, type StoredTaskGraphNode, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { createObservedEvidenceIndex, hydrateObservedEvidence, parseAndBindStructuredResult } from "./child-evidence.js"
 import { restoreToolCallState } from "../turns/persisted-tool-call-state.js"
+import { validateTaskGraphReplaySources, validateTaskGraphToolEvents, type TaskGraphReplayReceipt } from "./task-graph-pg-event-validation.js"
 type Queryable = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
 const MAX_ITEMS = 1024
@@ -58,7 +59,7 @@ export async function verifyTaskGraphNodeEvidence(client: Queryable, input: Read
     ORDER BY step."attempt" ASC, step."ordinal" ASC, item."createdAt" ASC, item."id" ASC LIMIT ${MAX_ITEMS + 1}`,
   [input.scope.taskId, input.scope.sessionId, input.scope.turnId, input.scope.rootTaskId, input.scope.parentTaskId, input.scope.userId, input.scope.attemptCount])
   if (itemsResult.rows.length > MAX_ITEMS) return unavailable(contract, "canonical_evidence_invalid")
-  let items: Row[], events: Row[]
+  let items: Row[], events: Row[], replayReceipts: readonly TaskGraphReplayReceipt[] = []
   try {
     items = validateItems(itemsResult.rows, input.scope)
     const callItems = items.filter(item => item.type === "tool_call"), callItemIds = callItems.map(item => String(item.id))
@@ -73,8 +74,47 @@ export async function verifyTaskGraphNodeEvidence(client: Queryable, input: Read
       ORDER BY event."sequence" ASC LIMIT ${MAX_ITEMS * 3 + 1}`,
     [input.scope.sessionId, input.scope.turnId, input.scope.userId, callItemIds])
     if (eventResult.rows.length > MAX_ITEMS * 3) return unavailable(contract, "canonical_evidence_invalid")
-    const outcomes = validateEvents(eventResult.rows, items, input.scope)
+    const validation = validateTaskGraphToolEvents(eventResult.rows, items, input.scope), outcomes = validation.outcomes
     events = eventResult.rows
+    if (validation.replays.length > 0) {
+      const resultIds = validation.replays.map(replay => replay.source.resultItemId)
+      const sourceRows = await client.query(`SELECT result."sessionId" AS "sourceSessionId", result."turnId" AS "sourceTurnId", result."taskId" AS "sourceTaskId",
+          task."rootTaskId" AS "sourceRootTaskId", task."parentTaskId" AS "sourceParentTaskId", turn."rootTaskId" AS "sourceTurnRootTaskId", session."userId" AS "sourceUserId",
+          call."id" AS "sourceCallItemId", call."stepId" AS "sourceCallStepId", call."type" AS "sourceCallType",
+          call."status" AS "sourceCallStatus", call."revision" AS "sourceCallRevision", call."content" AS "sourceCallContent",
+          callStep."attempt" AS "sourceCallAttempt", callStep."ordinal" AS "sourceCallOrdinal",
+          result."id" AS "sourceResultItemId", result."stepId" AS "sourceResultStepId", result."type" AS "sourceResultType",
+          result."status" AS "sourceResultStatus", result."revision" AS "sourceResultRevision", result."content" AS "sourceResultContent",
+          resultStep."attempt" AS "sourceResultAttempt", resultStep."ordinal" AS "sourceResultOrdinal"
+        FROM "agent_items" AS result
+        JOIN "agent_steps" AS resultStep ON resultStep."id" = result."stepId" AND resultStep."sessionId" = result."sessionId"
+          AND resultStep."turnId" = result."turnId" AND resultStep."taskId" = result."taskId"
+        JOIN "agent_items" AS call ON call."stepId" = result."stepId" AND call."sessionId" = result."sessionId"
+          AND call."turnId" = result."turnId" AND call."taskId" = result."taskId" AND call."type" = 'tool_call'
+          AND call."content"->>'toolCallId' = result."content"->>'toolCallId'
+        JOIN "agent_steps" AS callStep ON callStep."id" = call."stepId" AND callStep."sessionId" = call."sessionId"
+          AND callStep."turnId" = call."turnId" AND callStep."taskId" = call."taskId"
+        JOIN "sub_agent_tasks" AS task ON task."id" = result."taskId" AND task."sessionId" = result."sessionId" AND task."turnId" = result."turnId"
+        JOIN "agent_sessions" AS session ON session."id" = result."sessionId"
+        JOIN "agent_turns" AS turn ON turn."id" = result."turnId" AND turn."sessionId" = result."sessionId"
+        WHERE result."id" = ANY($7::text[]) AND result."type" = 'tool_result' AND result."taskId" = $1 AND result."sessionId" = $2
+          AND result."turnId" = $3 AND task."rootTaskId" = $4 AND turn."rootTaskId" = $4 AND task."parentTaskId" = $5
+          AND session."userId" = $6 AND turn."userId" = $6 AND resultStep."attempt" >= 1 AND resultStep."attempt" < $8
+        ORDER BY result."id" LIMIT ${MAX_ITEMS + 1}`,
+      [input.scope.taskId, input.scope.sessionId, input.scope.turnId, input.scope.rootTaskId, input.scope.parentTaskId, input.scope.userId, resultIds, input.scope.attemptCount])
+      if (sourceRows.rows.length > MAX_ITEMS) return unavailable(contract, "canonical_evidence_invalid")
+      const sourceCallIds = sourceRows.rows.map(row => String((row as Row).sourceCallItemId))
+      const sourceEvents = sourceCallIds.length === 0 ? { rows: [] as Row[] } : await client.query(`SELECT event."id", session."userId" AS "userId", event."sessionId", event."turnId", event."itemId", event."taskId", event."correlationId", event."type", event."payload", event."sequence"
+        FROM "agent_events" AS event JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
+        JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
+        WHERE event."sessionId" = $1 AND event."turnId" = $2 AND session."userId" = $3 AND turn."userId" = $3
+          AND event."itemId" = ANY($4::text[]) AND event."taskId" = $5
+          AND event."type" IN ('tool_call.started', 'tool_call.completed', 'tool_call.failed')
+        ORDER BY event."sequence" ASC LIMIT ${MAX_ITEMS * 3 + 1}`,
+      [input.scope.sessionId, input.scope.turnId, input.scope.userId, sourceCallIds, input.scope.taskId])
+      if (sourceEvents.rows.length > MAX_ITEMS * 3) return unavailable(contract, "canonical_evidence_invalid")
+      replayReceipts = validateTaskGraphReplaySources(validation.replays, sourceRows.rows, sourceEvents.rows, items, input.scope)
+    }
     const restored = restoreToolCallState(items, events)
     if (restored.pending.length > 0 || restored.observations.length > MAX_OBSERVATIONS) return unavailable(contract, "canonical_evidence_invalid")
     const encoded = JSON.stringify(restored.observations)
@@ -94,7 +134,7 @@ export async function verifyTaskGraphNodeEvidence(client: Queryable, input: Read
       : { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role, findings: bound.role === "analyst" ? bound.findings.map(({ jobId, score, evidenceIds }) => ({ jobId, score, evidenceIds })) : [], evidenceIds: [...index.entries.values()].map(item => item.id) }
     const evaluation = evaluateTaskGraphVerification(contract, projection)
     const resultDigest = taskGraphResultDigest(bound)
-    const digest = evidenceDigest(items, outcomes, projection.evidenceIds, resultDigest)
+    const digest = evidenceDigest(items, outcomes, projection.evidenceIds, resultDigest, replayReceipts)
     return { verified: evaluation.status === "passed", report: report(evaluation, digest, resultDigest), evaluation, projection, structuredResult: bound }
   } catch (error) {
     const reason = error instanceof Error && /ambiguous|duplicate|conflict|replay_uncertain/.test(error.message)
@@ -133,31 +173,6 @@ function validateItems(values: readonly unknown[], scope: TaskGraphVerificationS
   }
   return items
 }
-function validateEvents(values: readonly unknown[], items: readonly Row[], scope: TaskGraphVerificationScope): Map<string, "completed" | "failed"> {
-  const calls = new Map(items.filter(item => item.type === "tool_call").map(item => [String((item.content as Row).toolCallId), item] as const)), byItem = new Map([...calls.values()].map(item => [String(item.id), String((item.content as Row).toolCallId)] as const))
-  const grouped = new Map<string, Row[]>()
-  for (const value of values) {
-    const event = record(value), payload = record(event?.payload)
-    const byCorrelation = event && calls.has(String(event.correlationId)) ? String(event.correlationId) : undefined, callId = event ? byItem.get(String(event.itemId)) ?? byCorrelation ?? String(payload?.toolCallId) : undefined
-    const call = callId ? calls.get(callId) : undefined
-    if (!event || !payload || !call || event.taskId !== scope.taskId || event.itemId !== call.id || event.correlationId !== (call.content as Row).toolCallId
-      || !["tool_call.started", "tool_call.completed", "tool_call.failed"].includes(String(event.type)) || payload.taskId !== scope.taskId || payload.toolCallId !== (call.content as Row).toolCallId
-      || payload.toolName !== (call.content as Row).toolName || !Number.isSafeInteger(Number(event.sequence))) throw new Error("task_graph_verification_event_invalid")
-    const list = grouped.get(callId!) ?? []; list.push(event); grouped.set(callId!, list)
-  }
-  const outcomes = new Map<string, "completed" | "failed">()
-  for (const [callId, call] of calls) {
-    const list = grouped.get(callId) ?? [], started = list.filter(event => event.type === "tool_call.started"), terminal = list.filter(event => event.type !== "tool_call.started")
-    const payload = record(terminal[0]?.payload), content = call.content as Row
-    const outcome = content.status
-    if (started.length !== 1 || terminal.length !== 1 || !payload || Number(started[0]?.sequence) >= Number(terminal[0]?.sequence) || payload.toolVersion !== undefined && payload.toolVersion !== content.toolVersion
-      || payload.errorCode !== content.errorCode
-      || (outcome === "completed" ? terminal[0]?.type !== "tool_call.completed" || payload.status !== "completed" || payload.errorCode !== null
-        : terminal[0]?.type !== "tool_call.failed" || payload.status !== "failed" || !text(payload.errorCode))) throw new Error("task_graph_verification_event_ambiguous")
-    outcomes.set(callId, payload.status as "completed" | "failed")
-  }
-  return outcomes
-}
 function canonicalReadObservations(items: readonly Row[], outcomes: ReadonlyMap<string, "completed" | "failed">): Array<{ id: string; content: Row }> {
   const results = new Map(items.filter(item => item.type === "tool_result").map(item => [String((item.content as Row).toolCallId), item] as const)), observations: Array<{ id: string; content: Row }> = []
   let totalBytes = 0
@@ -183,13 +198,14 @@ function canonicalReadObservations(items: readonly Row[], outcomes: ReadonlyMap<
   }
   return observations
 }
-function evidenceDigest(items: readonly Row[], outcomes: ReadonlyMap<string, "completed" | "failed">, evidenceIds: readonly string[], resultDigest: string): string {
+function evidenceDigest(items: readonly Row[], outcomes: ReadonlyMap<string, "completed" | "failed">, evidenceIds: readonly string[], resultDigest: string, replayReceipts: readonly TaskGraphReplayReceipt[]): string {
   const byCall = new Map(items.filter(item => item.type === "tool_result").map(item => [String((item.content as Row).toolCallId), item] as const))
+  const replayByCall = new Map(replayReceipts.map(receipt => [receipt.currentCallId, receipt] as const))
   const receipts = items.filter(item => item.type === "tool_call" && EVIDENCE_TOOLS.has(String((item.content as Row).toolName))
     && outcomes.get(String((item.content as Row).toolCallId)) === "completed").map(call => {
       const content = call.content as Row, result = byCall.get(String(content.toolCallId))!, output = JSON.stringify((result.content as Row).output)
       return { attempt: Number(call.attempt), callId: content.toolCallId, toolName: content.toolName, toolVersion: content.toolVersion,
-        callItem: [call.id, Number(call.revision)], resultItem: [result.id, Number(result.revision)], outputHash: createHash("sha256").update(output).digest("hex") }
+        callItem: [call.id, Number(call.revision)], resultItem: [result.id, Number(result.revision)], replaySource: replayByCall.get(String(content.toolCallId)) ?? null, outputHash: createHash("sha256").update(output).digest("hex") }
     }).sort((a, b) => a.attempt - b.attempt || String(a.callId).localeCompare(String(b.callId)))
   return createHash("sha256").update(JSON.stringify({ evidenceIds: [...evidenceIds].sort(), receipts, resultDigest })).digest("hex")
 }
