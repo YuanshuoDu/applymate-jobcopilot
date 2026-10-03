@@ -851,8 +851,13 @@ function assertFollowUpGraph(request) {
   const followUp = byKey.get(followUpKey)
   if (!followUp || followUp.goal !== followUpGoal || followUp.dependsOn?.length !== 1 || followUp.dependsOn[0] !== "summary"
     || followUp.status !== "completed" || followUp.readiness !== "terminal") throw new Error("p3_follow_up_graph_node_not_completed")
-  waitOutcomeFromRequest(request, outcome => outcome.status === "ready" && outcome.tasks.length === 1
-    && record(outcome.tasks[0])?.taskId === followUp.taskId && record(outcome.tasks[0])?.status === "completed" && JSON.stringify(outcome).includes(followUpGoal))
+  const wait = waitOutcomeFromRequest(request, outcome => outcome.status === "ready" && outcome.tasks.length === 1
+    && record(outcome.tasks[0])?.taskId === followUp.taskId && record(outcome.tasks[0])?.status === "completed")
+  const waitedFollowUp = record(wait.tasks[0])
+  if (JSON.stringify(wait).includes(followUpGoal) || record(waitedFollowUp?.result)?.truncated !== true) {
+    throw new Error("p3_follow_up_wait_redaction_invalid")
+  }
+  assertPassedVerificationReport(waitedFollowUp?.verificationReport, "finding-count")
   return { revision: graph.revision, taskId: followUp.taskId }
 }
 async function waitForParentSuspended(ownerId, timeoutMs = 20_000) {

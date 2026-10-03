@@ -118,7 +118,7 @@ function validAnalystResult() {
 }
 
 function fakeGraphFinishPool(options: {
-  legacy?: boolean; includeDependent?: boolean; repair?: boolean; priorReceipt?: boolean; fenceTaskUpdate?: boolean;
+  legacy?: boolean; includeDependent?: boolean; repair?: boolean; plannedRepair?: boolean; priorReceipt?: boolean; fenceTaskUpdate?: boolean;
   targetReport?: Record<string, unknown> | null;
 } = {}) {
   const childId = options.repair ? "repair-1" : "child-1"
@@ -131,6 +131,9 @@ function fakeGraphFinishPool(options: {
       ...(options.legacy ? { verificationDisposition: "legacy_unverified" } : { verificationDisposition: "typed", verification: analystContract }),
       ...(options.repair ? { repairOf: { graphRootTaskId: "root-1", nodeKey: "target", taskId: "target-1", criterionIds: ["finding-count"] } } : {}),
     },
+    ...(options.plannedRepair ? [{ key: "child-repair", templateId: "analyst", goal: "Repair the inspected result", successCriteria: ["Find one"],
+      dependsOn: [], depth: 2, taskId: "repair-child-1", verificationDisposition: "typed", verification: analystContract,
+      repairOf: { graphRootTaskId: "root-1", nodeKey: "child", taskId: "child-1", criterionIds: ["finding-count"] } }] : []),
     ...(options.includeDependent || options.repair ? [{ key: "dependent", templateId: "analyst", goal: "Continue", successCriteria: ["Continue"], dependsOn: [options.repair ? "target" : "child"], depth: 2, taskId: "dependent-1", verificationDisposition: "typed", verification: analystContract }] : []),
   ]
   const snapshot = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes })
@@ -138,6 +141,7 @@ function fakeGraphFinishPool(options: {
     ...(options.repair ? [["target-1", "failed"] as const] : []),
     ...(options.priorReceipt ? [["prior-repair-1", "completed"] as const] : []),
     [childId, "running"],
+    ...(options.plannedRepair ? [["repair-child-1", "queued"] as const] : []),
     ...(options.includeDependent || options.repair ? [["dependent-1", options.priorReceipt ? "queued" : "waiting"] as const] : []),
   ])
   const targetReport = options.targetReport ?? {
@@ -274,7 +278,7 @@ describe("PgSubagentTaskStore", () => {
     ["failed", "task_graph_verification_failed"],
     ["unverified", "task_graph_verification_unverified"],
   ] as const)("terminalizes a %s verification without releasing dependents", async (verificationStatus, failureReason) => {
-    const fake = fakeGraphFinishPool({ includeDependent: true })
+    const fake = fakeGraphFinishPool({ includeDependent: true, plannedRepair: true })
     setVerifierResult(verificationStatus)
     const store = new PgSubagentTaskStore(fake.pool)
 
@@ -283,6 +287,7 @@ describe("PgSubagentTaskStore", () => {
 
     expect(fake.statuses.get(fake.childId)).toBe("failed")
     expect(fake.statuses.get("dependent-1")).toBe("waiting")
+    expect(fake.statuses.get("repair-child-1")).toBe("queued")
     expect(fake.calls.some(([sql]) => sql.includes("'agent.subagent.dispatch'"))).toBe(false)
     const update = fake.calls.find(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))
     expect(update?.[1]?.[2]).toBe("failed")

@@ -268,8 +268,8 @@ type RootModelFailureStage =
   | "large_source_projection"
   | "wait_outcome_status"
   | "wait_task_statuses"
-  | "source_wait_summary"
-  | "summary_wait_summary"
+  | "source_wait_verification"
+  | "summary_wait_verification"
   | "resumed_graph_revision"
   | "follow_up_plan_tool"
   | "follow_up_graph_keys"
@@ -494,6 +494,162 @@ function diagnosticDiscoveryTasks(values: readonly unknown[]): RecordValue[] {
       } : null,
     }
   })
+}
+
+type DiscoveryVerifierTask = { id: string; role: string; status: string; attemptCount: number; rootTaskId: string | null; parentTaskId: string | null }
+function diagnosticJsonRecord(value: unknown): RecordValue | null {
+  if (typeof value === "string") { try { return record(JSON.parse(value) as unknown) } catch { return null } }
+  return record(value)
+}
+function diagnosticHasTruncation(value: unknown, depth = 0, seen = new Set<object>()): boolean {
+  if (depth > 32 || value === "[TRUNCATED]" || typeof value === "string" && value.includes("...[TRUNCATED]")) return true
+  if (!value || typeof value !== "object") return false
+  if (seen.has(value)) return true
+  seen.add(value)
+  try {
+    const row = record(value)
+    if (row && row.truncated === true && typeof row.preview === "string" && Number.isSafeInteger(row.byteLength)) return true
+    return (Array.isArray(value) ? value : Object.values(value)).some(child => diagnosticHasTruncation(child, depth + 1, seen))
+  } finally { seen.delete(value) }
+}
+function diagnosticByteBand(value: unknown): string {
+  try {
+    const encoded = JSON.stringify(value)
+    if (encoded === undefined) return "unserializable"
+    const bytes = Buffer.byteLength(encoded, "utf8")
+    return bytes <= 8 * 1024 ? "le_8k" : bytes <= 512 * 1024 ? "le_512k" : bytes <= 2 * 1024 * 1024 ? "le_2m" : "over_2m"
+  } catch { return "unserializable" }
+}
+function projectDiscoveryVerifierDiagnostics(
+  tasks: readonly DiscoveryVerifierTask[], items: readonly RecordValue[], events: readonly RecordValue[], scope: Fixture,
+): RecordValue[] {
+  return tasks.filter(task => diagnosticEnum(task.role, DISCOVERY_DIAGNOSTIC_ROLES) !== null).slice(0, 4).map(task => {
+    const taskItems = items.filter(item => item.taskId === task.id)
+    const calls = taskItems.filter(item => item.type === "tool_call"), results = taskItems.filter(item => item.type === "tool_result")
+    const callsById = new Map<string, RecordValue>(), resultsById = new Map<string, RecordValue>(), callItemIds = new Map<string, string>()
+    let duplicateCallIds = 0, itemScopeValid = true, itemAttemptValid = true, itemShapeValid = true
+    for (const item of taskItems) {
+      const content = diagnosticJsonRecord(item.content), callId = typeof content?.toolCallId === "string" ? content.toolCallId : undefined
+      const target = item.type === "tool_call" ? callsById : item.type === "tool_result" ? resultsById : undefined
+      if (!content || !target || !callId) { itemShapeValid = false; continue }
+      if (target.has(callId)) duplicateCallIds += 1
+      target.set(callId, item)
+      if (item.type === "tool_call") callItemIds.set(String(item.id), callId)
+      itemScopeValid &&= item.sessionId === scope.sessionId && item.turnId === scope.turnId && item.userId === scope.userId
+        && item.turnUserId === scope.userId && item.rootTaskId === task.rootTaskId && item.turnRootTaskId === task.rootTaskId
+        && item.joinedStepId === item.stepId && typeof item.stepId === "string"
+      itemAttemptValid &&= Number(item.attempt) === task.attemptCount
+      itemShapeValid &&= item.status === "completed" && Number.isSafeInteger(Number(item.ordinal)) && Number(item.ordinal) >= 0
+        && Number.isSafeInteger(Number(item.revision)) && Number(item.revision) >= 0
+        && diagnosticEnum(item.stepStatus, STEP_DIAGNOSTIC_STATUSES) !== null
+    }
+    const paired = [...callsById.entries()].filter(([id]) => resultsById.has(id))
+    const pairShapeValid = duplicateCallIds === 0 && calls.length === results.length && callsById.size === calls.length
+      && resultsById.size === results.length && paired.length === calls.length && calls.length > 0
+    let contentPairValid = pairShapeValid
+    const searchOutputs: unknown[] = []
+    for (const [id, call] of callsById) {
+      const callContent = diagnosticJsonRecord(call.content), result = resultsById.get(id), resultContent = diagnosticJsonRecord(result?.content)
+      contentPairValid &&= Boolean(result && result.stepId === call.stepId && Number(result.attempt) === Number(call.attempt)
+        && Number(result.ordinal) === Number(call.ordinal) && typeof callContent?.toolName === "string" && callContent.toolName.trim() === callContent.toolName
+        && typeof callContent.toolVersion === "string" && callContent.toolVersion.trim() === callContent.toolVersion
+        && Object.hasOwn(callContent ?? {}, "input") && resultContent && Object.hasOwn(resultContent, "output") && result.status === "completed"
+        && (callContent?.status === "completed" || callContent?.status === "failed")
+        && callContent?.errorCode === resultContent?.errorCode
+        && (callContent?.status === "completed" ? callContent?.errorCode === null : typeof callContent?.errorCode === "string" && callContent.errorCode.trim().length > 0))
+      if (callContent?.toolName === "jobs.search" && resultContent && Object.hasOwn(resultContent, "output")) searchOutputs.push(resultContent.output)
+    }
+    const relevantEvents = events.filter(event => event.taskId === task.id && (callItemIds.has(String(event.itemId)) || callsById.has(String(event.correlationId))))
+    const groups = new Map<string, RecordValue[]>()
+    let eventIdentityValid = true, eventSequenceValid = true, unmatchedEvents = 0
+    for (const event of relevantEvents) {
+      const payload = diagnosticJsonRecord(event.payload)
+      const callId = callItemIds.get(String(event.itemId)) ?? (callsById.has(String(event.correlationId)) ? String(event.correlationId) : undefined)
+      const call = callId ? callsById.get(callId) : undefined, content = diagnosticJsonRecord(call?.content)
+      if (!callId || !call || !payload) { unmatchedEvents += 1; eventIdentityValid = false; continue }
+      const matching = event.taskId === task.id && event.itemId === call.id && event.correlationId === callId
+        && ["tool_call.started", "tool_call.completed", "tool_call.failed"].includes(String(event.type))
+        && payload.taskId === task.id && payload.toolCallId === callId && payload.toolName === content?.toolName
+        && Number.isSafeInteger(Number(event.sequence))
+      eventIdentityValid &&= matching
+      eventSequenceValid &&= Number.isSafeInteger(Number(event.sequence))
+      const list = groups.get(callId) ?? []; list.push(event); groups.set(callId, list)
+    }
+    let eventPairsValid = eventIdentityValid && eventSequenceValid
+    let startedCount = 0, terminalCount = 0
+    for (const [id, call] of callsById) {
+      const list = groups.get(id) ?? [], started = list.filter(event => event.type === "tool_call.started")
+      const terminal = list.filter(event => event.type === "tool_call.completed" || event.type === "tool_call.failed")
+      startedCount += started.length; terminalCount += terminal.length
+      const content = diagnosticJsonRecord(call.content), payload = diagnosticJsonRecord(terminal[0]?.payload)
+      const orderValid = Number(started[0]?.sequence) < Number(terminal[0]?.sequence)
+      const outcomeValid = content?.status === "completed"
+        ? terminal[0]?.type === "tool_call.completed" && payload?.status === "completed" && payload.errorCode === null
+        : terminal[0]?.type === "tool_call.failed" && payload?.status === "failed" && typeof payload.errorCode === "string"
+      eventPairsValid &&= started.length === 1 && terminal.length === 1 && orderValid && outcomeValid
+        && payload?.errorCode === content?.errorCode
+        && (payload?.toolVersion === undefined || payload.toolVersion === content?.toolVersion)
+    }
+    const outputs = searchOutputs.slice(0, 4).map(output => {
+      const row = diagnosticJsonRecord(output), jobs = row?.jobs
+      const list = Array.isArray(jobs) ? jobs : []
+      const ids = list.map(value => diagnosticJsonRecord(value)?.id)
+      const validIds = ids.every(id => typeof id === "string" && id.length > 0 && id.trim() === id)
+      const sourcesValid = list.every(value => {
+        const source = diagnosticJsonRecord(value)?.source
+        return source === undefined || source === null || typeof source === "string" && source.length > 0 && source.length <= 256 && source.trim() === source
+      })
+      return {
+        outputKind: row ? "object" : diagnosticValueType(output),
+        jobsArray: Array.isArray(jobs), jobsCount: Array.isArray(jobs) ? diagnosticBoundedCount(jobs.length) : null,
+        jobsCountWithinVerifierCap: Array.isArray(jobs) && jobs.length <= 50,
+        jobsDense: Array.isArray(jobs) && Reflect.ownKeys(jobs).length === jobs.length + 1,
+        jobIdsValid: validIds && new Set(ids).size === ids.length, sourcesValid,
+        truncatedMarker: diagnosticHasTruncation(output), byteBand: diagnosticByteBand(output),
+      }
+    })
+    return {
+      role: diagnosticEnum(task.role, DISCOVERY_DIAGNOSTIC_ROLES) ?? "other",
+      taskStatus: diagnosticEnum(task.status, TASK_DIAGNOSTIC_STATUSES) ?? "other",
+      taskAttempt: diagnosticBoundedCount(task.attemptCount),
+      taskRootMatchesParent: typeof task.rootTaskId === "string" && task.rootTaskId === task.parentTaskId,
+      itemCount: diagnosticBoundedCount(taskItems.length), callCount: diagnosticBoundedCount(calls.length),
+      resultCount: diagnosticBoundedCount(results.length), pairCount: diagnosticBoundedCount(paired.length), duplicateCallIds: diagnosticBoundedCount(duplicateCallIds),
+      itemScopeValid, itemAttemptValid, itemShapeValid, pairShapeValid, contentPairValid,
+      itemStatuses: diagnosticEnumList(taskItems.map(item => item.status), ITEM_DIAGNOSTIC_STATUSES),
+      stepStatuses: diagnosticEnumList(taskItems.map(item => item.stepStatus), STEP_DIAGNOSTIC_STATUSES),
+      eventCount: diagnosticBoundedCount(relevantEvents.length), startedEventCount: diagnosticBoundedCount(startedCount),
+      terminalEventCount: diagnosticBoundedCount(terminalCount), unmatchedEvents: diagnosticBoundedCount(unmatchedEvents), eventIdentityValid, eventSequenceValid, eventPairsValid,
+      jobsSearchOutputCount: diagnosticBoundedCount(searchOutputs.length), jobsSearchOutputs: outputs,
+    }
+  })
+}
+async function collectDiscoveryVerifierDiagnostics(pool: Pool, scope: Fixture, tasks: readonly DiscoveryVerifierTask[]): Promise<RecordValue[]> {
+  const relevantTasks = tasks.filter(task => diagnosticEnum(task.role, DISCOVERY_DIAGNOSTIC_ROLES) !== null).slice(0, 4)
+  if (relevantTasks.length === 0) return []
+  try {
+    const ids = relevantTasks.map(task => task.id)
+    const [items, events] = await Promise.all([
+      pool.query<RecordValue>(`SELECT item."id", item."sessionId", item."turnId", item."taskId", item."stepId", item."type", item."status", item."revision", item."content",
+          step."id" AS "joinedStepId", step."status" AS "stepStatus", step."attempt", step."ordinal", task."rootTaskId", turn."rootTaskId" AS "turnRootTaskId",
+          session."userId" AS "userId", turn."userId" AS "turnUserId"
+        FROM "agent_items" AS item JOIN "agent_steps" AS step ON step."id" = item."stepId" AND step."sessionId" = item."sessionId" AND step."turnId" = item."turnId" AND step."taskId" = item."taskId"
+        JOIN "sub_agent_tasks" AS task ON task."id" = item."taskId" AND task."sessionId" = item."sessionId" AND task."turnId" = item."turnId"
+        JOIN "agent_sessions" AS session ON session."id" = item."sessionId" JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+        WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = ANY($3::text[]) AND item."type" IN ('tool_call', 'tool_result')
+        ORDER BY step."attempt", step."ordinal", item."createdAt", item."id" LIMIT 1025`, [scope.sessionId, scope.turnId, ids]),
+      pool.query<RecordValue>(`SELECT event."taskId", event."itemId", event."correlationId", event."type", event."payload", event."sequence"
+        FROM "agent_events" AS event WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."taskId" = ANY($3::text[])
+          AND event."type" IN ('tool_call.started', 'tool_call.completed', 'tool_call.failed') ORDER BY event."sequence" LIMIT 3073`,
+      [scope.sessionId, scope.turnId, ids]),
+    ])
+    const projected = projectDiscoveryVerifierDiagnostics(relevantTasks, items.rows, events.rows, scope)
+    return projected.map(entry => ({
+      ...entry,
+      itemQueryLimitExceeded: items.rows.length > 1024,
+      eventQueryLimitExceeded: events.rows.length > 3072,
+    }))
+  } catch { return [{ diagnosticAvailable: false }] }
 }
 
 function diagnosticEnumList(value: unknown, allowed: ReadonlySet<string>, maxItems = 8): string[] {
@@ -4104,6 +4260,45 @@ describe("compact TaskGraph wait failure diagnostics", () => {
   })
 })
 
+describe("canonical verifier receipt diagnostics", () => {
+  it("projects only allowlisted shape metadata and never emits receipt identifiers or content", () => {
+    const scope = { userId: "private-user-id", sessionId: "private-session-id", turnId: "private-turn-id", ownerId: "private-owner-id", suffix: "fixture" }
+    const tasks: DiscoveryVerifierTask[] = [{
+      id: "private-task-id", role: "scout", status: "failed", attemptCount: 1,
+      rootTaskId: "private-root-id", parentTaskId: "private-root-id",
+    }]
+    const items: RecordValue[] = [
+      { id: "private-call-item", sessionId: scope.sessionId, turnId: scope.turnId, userId: scope.userId, turnUserId: scope.userId,
+        taskId: tasks[0]!.id, rootTaskId: tasks[0]!.rootTaskId, turnRootTaskId: tasks[0]!.rootTaskId,
+        joinedStepId: "private-step-id", stepId: "private-step-id", type: "tool_call", status: "completed", revision: 1,
+        stepStatus: "completed", attempt: 1, ordinal: 0,
+        content: { toolCallId: "private-call-id", toolName: "jobs.search", toolVersion: "1", input: {}, status: "completed", errorCode: null } },
+      { id: "private-result-item", sessionId: scope.sessionId, turnId: scope.turnId, userId: scope.userId, turnUserId: scope.userId,
+        taskId: tasks[0]!.id, rootTaskId: tasks[0]!.rootTaskId, turnRootTaskId: tasks[0]!.rootTaskId,
+        joinedStepId: "private-step-id", stepId: "private-step-id", type: "tool_result", status: "completed", revision: 1,
+        stepStatus: "completed", attempt: 1, ordinal: 0,
+        content: { toolCallId: "private-call-id", output: { jobs: [{ id: "private-job-id", source: "fixture" }], summary: "private-result-text" }, errorCode: null } },
+    ]
+    const events: RecordValue[] = [
+      { taskId: tasks[0]!.id, itemId: "private-call-item", correlationId: "private-call-id", type: "tool_call.started", sequence: 1,
+        payload: { taskId: tasks[0]!.id, toolCallId: "private-call-id", toolName: "jobs.search" } },
+      { taskId: tasks[0]!.id, itemId: "private-call-item", correlationId: "private-call-id", type: "tool_call.completed", sequence: 2,
+        payload: { taskId: tasks[0]!.id, toolCallId: "private-call-id", toolName: "jobs.search", status: "completed", errorCode: null } },
+    ]
+    const projected = projectDiscoveryVerifierDiagnostics(tasks, items, events, scope)
+    const encoded = JSON.stringify(projected)
+
+    expect(projected).toMatchObject([{
+      role: "scout", itemScopeValid: true, itemAttemptValid: true, itemShapeValid: true,
+      pairShapeValid: true, contentPairValid: true, eventIdentityValid: true, eventPairsValid: true,
+      jobsSearchOutputs: [{ jobsArray: true, jobsCount: 1, jobsCountWithinVerifierCap: true, jobsDense: true, jobIdsValid: true, sourcesValid: true }],
+    }])
+    for (const secret of [scope.userId, scope.sessionId, scope.turnId, scope.ownerId, tasks[0]!.id, tasks[0]!.rootTaskId!, "private-step-id", "private-call-id", "private-job-id", "private-result-text"]) {
+      expect(encoded).not.toContain(secret)
+    }
+  })
+})
+
 describe("Worker 2 private artifact fixture boundary", () => {
   it("rejects private body and artifact references at any fixture input depth", async () => {
     const worker = startTaskGraphRestartWorker("worker2-input-guard-self-test", {})
@@ -4947,10 +5142,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 expect(summaryWaitTask).toMatchObject({ status: "completed" })
                 expect(largeSourceWaitTask).toMatchObject({ status: "failed" })
                 expect(rejectedWaitTask).toMatchObject({ status: "cancelled" })
-                rootModelFailureStage = "source_wait_summary"
-                expect(record(record(sourceWaitTask?.result)?.structuredResult)?.summary).toBe("Read the fixture source")
-                rootModelFailureStage = "summary_wait_summary"
-                expect(record(record(summaryWaitTask?.result)?.structuredResult)?.summary).toBe("Summarize the fixture source")
+                rootModelFailureStage = "source_wait_verification"
+                expect(sourceWaitTask?.result).toMatchObject({ truncated: true })
+                expectPassedVerificationReport(sourceWaitTask?.verificationReport, "candidate-count")
+                rootModelFailureStage = "summary_wait_verification"
+                expect(summaryWaitTask?.result).toMatchObject({ truncated: true })
+                expectPassedVerificationReport(summaryWaitTask?.verificationReport, "finding-count")
                 const revision = graph?.revision
                 rootModelFailureStage = "resumed_graph_revision"
                 if (typeof revision !== "number" || !Number.isSafeInteger(revision)) throw new Error("Resumed current graph revision is invalid")
@@ -6692,8 +6889,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       workerTwo = startTaskGraphRestartWorker("resume-discovery", { ...value, jobId })
       await waitForProcessLine(workerTwo, "P3_DISCOVERY_SECOND_WORKER_READY ", 45_000)
       const collectRestartDiscoveryDiagnostics = async () => {
-        const tasks = await pool!.query<{ id: string; role: string; status: string; failureReason: string | null; result: unknown }>(
-          `SELECT "id", "role", "status", "failureReason", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2`,
+        const tasks = await pool!.query<DiscoveryVerifierTask & { failureReason: string | null; result: unknown }>(
+          `SELECT "id", "role", "status", "attemptCount", "rootTaskId", "parentTaskId", "failureReason", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2`,
           [value.turnId, value.sessionId],
         )
         const toolReceipts = await pool!.query<{ callCount: number; resultCount: number }>(
@@ -6721,6 +6918,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         const callCount = diagnosticBoundedCount(toolReceipts.rows[0]?.callCount) ?? 0
         const resultCount = diagnosticBoundedCount(toolReceipts.rows[0]?.resultCount) ?? 0
         const missingSearchMarker = workerTwo?.errors.some(line => line.includes("p3_discovery_child_search_tool_missing")) ?? false
+        const verifierEvidence = await collectDiscoveryVerifierDiagnostics(pool!, value, tasks.rows)
         const searchObservation = callCount > 0 ? "yes" : missingSearchMarker ? "no" : "unknown"
         const processStage = workerTwo?.output.some(line => line.startsWith("P3_DISCOVERY_RESTORED_FINAL_GRAPH "))
           ? "restored_final_graph"
@@ -6735,6 +6933,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           jobsSearchResultCount: resultCount,
           taskStatusCounts: diagnosticStatusCounts(taskStatusCounts),
           childTasks: diagnosticDiscoveryTasks(tasks.rows),
+          verifierEvidence,
           waitStatuses,
           waitTargetCounts: waits.rows.map(wait => diagnosticBoundedCount(wait.targetCount)),
         }
@@ -7020,8 +7219,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     })
 
     const collectCanonicalDiscoveryDiagnostics = async () => {
-      const tasks = await pool!.query<{ id: string; role: string; status: string; failureReason: string | null; result: unknown }>(
-        `SELECT "id", "role", "status", "failureReason", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2`,
+      const tasks = await pool!.query<DiscoveryVerifierTask & { failureReason: string | null; result: unknown }>(
+        `SELECT "id", "role", "status", "attemptCount", "rootTaskId", "parentTaskId", "failureReason", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2`,
         [discoveryOwner.turnId, discoveryOwner.sessionId],
       )
       const toolReceipts = await pool!.query<{ callCount: number; resultCount: number }>(
@@ -7042,6 +7241,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       }
       const searchCalls = diagnosticBoundedCount(toolReceipts.rows[0]?.callCount) ?? 0
       const searchResults = diagnosticBoundedCount(toolReceipts.rows[0]?.resultCount) ?? 0
+      const verifierEvidence = await collectDiscoveryVerifierDiagnostics(pool!, discoveryOwner, tasks.rows)
       return {
         rootStage: discoveryRootStage,
         childStage: discoveryChildStage,
@@ -7052,6 +7252,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         jobsSearchResultCount: searchResults,
         taskStatusCounts: diagnosticStatusCounts(taskStatusCounts),
         childTasks: diagnosticDiscoveryTasks(tasks.rows),
+        verifierEvidence,
       }
     }
     await enqueueTurn(pool!, bootstrap.turns.queue, { turnId: discoveryOwner.turnId, sessionId: discoveryOwner.sessionId, ownerId: discoveryOwner.ownerId })
@@ -7112,6 +7313,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     childQueueName = subagentQueue.SUBAGENT_QUEUE_NAME
     const value = discoveryFailureOwner
     await activateFixtureTurn(pool!, value)
+    await pool!.query(`UPDATE "agent_turns" SET "budgetSnapshot" = $2::jsonb
+      WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4`, [
+      value.turnId, JSON.stringify({ limits: { maxSteps: 7, maxToolCalls: 8 } }), value.sessionId, value.userId,
+    ])
     const jobId = `p3-discovery-failure-job-${value.suffix}`
     await pool!.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4`, [
       value.turnId,
@@ -7134,7 +7339,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low" as const,
     }
     let rootExecution = 0
-    let optimisticFinalAttempted = false
+    let optimisticFinalAttempts = 0
     let dependentWasWaitingBeforeProof = false
     let interactiveFailureIntentRestored = false
     let interactiveFailureRootPlanStage: "not_started" | "initial_plan" | "initial_wait" | "resumed_root" | "graph_status" | "hydrated_wait" | "optimistic_final" = "not_started"
@@ -7145,6 +7350,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const interactiveFailureDiagnostic = () => JSON.stringify({
       intentRestored: interactiveFailureIntentRestored,
       rootPlanStage: interactiveFailureRootPlanStage,
+      optimisticFinalAttempts,
       graphStatusReached: interactiveFailureGraphStatusReached,
       graphStatuses: interactiveFailureGraphStatuses,
       hydratedWaitStatus: interactiveFailureHydratedWaitStatus,
@@ -7183,35 +7389,39 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               yield { type: "completed", finishReason: "tool_calls" }
               return
             }
-            if ((execution === 2 && round === 1) || (execution === 1 && round === 3)) {
-              interactiveFailureRootPlanStage = "resumed_root"
-              const rootToolNames = request.tools.map(tool => record(tool)?.name)
-              interactiveFailureIntentRestored = rootToolNames.includes("agent.plan") && !rootToolNames.includes("jobs.search")
-              const graph = currentGraphFromRequest(request)
-              const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
-              interactiveFailureGraphStatusReached = graph?.kind === "task_graph_current" && nodes.length > 0
-              interactiveFailureGraphStatuses = nodes.flatMap(node => {
-                const key = node?.key
-                const status = diagnosticEnum(node?.status, TASK_DIAGNOSTIC_STATUSES)
-                return (key === "scout" || key === "analyst") && status ? [{ key, status }] : []
-              })
-              interactiveFailureRootPlanStage = "graph_status"
-              const graphStates = nodes.map(node => `${String(node?.key)}:${String(node?.status)}`).sort()
-              expect(graphStates, interactiveFailureDiagnostic()).toEqual(["analyst:cancelled", "scout:failed"])
-              const outcome = waitOutcomeFromRequest(request, 2)
-              interactiveFailureRootPlanStage = "hydrated_wait"
-              interactiveFailureHydratedWaitStatus = diagnosticEnum(outcome.status, WAIT_DIAGNOSTIC_STATUSES)
-              interactiveFailureHydratedWaitCount = diagnosticBoundedCount(outcome.tasks.length)
-              expect(outcome.status, interactiveFailureDiagnostic()).toBe("ready")
-              const tasks = outcome.tasks.map(record)
-              const taskStates = tasks.map(task => `${String(task?.role)}:${String(task?.status)}`).sort()
-              expect(taskStates).toEqual(["analyst:cancelled", "scout:failed"])
-              const failedScout = tasks.find(task => task?.role === "scout")
-              expect(typeof failedScout?.failureReason).toBe("string")
-              expect(String(failedScout?.failureReason).length).toBeGreaterThan(0)
-              expectUnverifiedVerificationReport(failedScout?.verificationReport, "candidate-count")
-              expectUnverifiedVerificationReport(nodes.find(node => node?.key === "scout")?.verificationReport, "candidate-count")
-              optimisticFinalAttempted = true
+            const firstResumedRound = (execution === 2 && round === 1) || (execution === 1 && round === 3)
+            const recoveryRound = (execution === 2 && round > 1) || (execution === 1 && round > 3)
+            if (firstResumedRound || recoveryRound) {
+              if (firstResumedRound) {
+                interactiveFailureRootPlanStage = "resumed_root"
+                const rootToolNames = request.tools.map(tool => record(tool)?.name)
+                interactiveFailureIntentRestored = rootToolNames.includes("agent.plan") && !rootToolNames.includes("jobs.search")
+                const graph = currentGraphFromRequest(request)
+                const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+                interactiveFailureGraphStatusReached = graph?.kind === "task_graph_current" && nodes.length > 0
+                interactiveFailureGraphStatuses = nodes.flatMap(node => {
+                  const key = node?.key
+                  const status = diagnosticEnum(node?.status, TASK_DIAGNOSTIC_STATUSES)
+                  return (key === "scout" || key === "analyst") && status ? [{ key, status }] : []
+                })
+                interactiveFailureRootPlanStage = "graph_status"
+                const graphStates = nodes.map(node => `${String(node?.key)}:${String(node?.status)}`).sort()
+                expect(graphStates, interactiveFailureDiagnostic()).toEqual(["analyst:cancelled", "scout:failed"])
+                const outcome = waitOutcomeFromRequest(request, 2)
+                interactiveFailureRootPlanStage = "hydrated_wait"
+                interactiveFailureHydratedWaitStatus = diagnosticEnum(outcome.status, WAIT_DIAGNOSTIC_STATUSES)
+                interactiveFailureHydratedWaitCount = diagnosticBoundedCount(outcome.tasks.length)
+                expect(outcome.status, interactiveFailureDiagnostic()).toBe("ready")
+                const tasks = outcome.tasks.map(record)
+                const taskStates = tasks.map(task => `${String(task?.role)}:${String(task?.status)}`).sort()
+                expect(taskStates).toEqual(["analyst:cancelled", "scout:failed"])
+                const failedScout = tasks.find(task => task?.role === "scout")
+                expect(typeof failedScout?.failureReason).toBe("string")
+                expect(String(failedScout?.failureReason).length).toBeGreaterThan(0)
+                expectUnverifiedVerificationReport(failedScout?.verificationReport, "candidate-count")
+                expectUnverifiedVerificationReport(nodes.find(node => node?.key === "scout")?.verificationReport, "candidate-count")
+              }
+              optimisticFinalAttempts += 1
               interactiveFailureRootPlanStage = "optimistic_final"
               yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: `Shortlist ready: ${jobId}` }) }
               yield { type: "completed", finishReason: "stop" }
@@ -7286,30 +7496,45 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       throw new Error(`Interactive shortlist failure diagnostics=${interactiveFailureDiagnostic()}`)
     }
 
-    const turn = await pool!.query<{ status: string; finalResponse: string | null }>(
-      `SELECT "status", "finalResponse" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+    const turn = await pool!.query<{ status: string }>(
+      `SELECT "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
       [value.turnId, value.sessionId, value.userId],
     )
     expect(turn.rows[0]?.status, interactiveFailureDiagnostic()).toBe("failed")
-    expect(optimisticFinalAttempted, interactiveFailureDiagnostic()).toBe(true)
+    expect(optimisticFinalAttempts, interactiveFailureDiagnostic()).toBeGreaterThan(1)
     expect(dependentWasWaitingBeforeProof, interactiveFailureDiagnostic()).toBe(true)
-    expect(turn.rows[0]?.finalResponse ?? "").not.toContain(jobId)
+    const turnFailure = await pool!.query<{ payload: unknown }>(
+      `SELECT "payload" FROM "agent_events" WHERE "turnId" = $1 AND "sessionId" = $2 AND "type" = 'turn.failed' ORDER BY "sequence" DESC LIMIT 1`,
+      [value.turnId, value.sessionId],
+    )
+    expect(turnFailure.rows).toHaveLength(1)
+    const turnFailurePayload = record(turnFailure.rows[0]?.payload) ?? {}
+    const turnFinal = record(turnFailurePayload.final) ?? {}
+    expect(turnFinal).toMatchObject({ completed: false, terminalReason: "budget_exhausted" })
+    expect(JSON.stringify(turnFinal)).not.toContain(jobId)
 
     const root = await pool!.query<{ id: string; status: string; failureReason: string | null; result: unknown }>(
       `SELECT "id", "status", "failureReason", "result" FROM "sub_agent_tasks"
        WHERE "turnId" = $1 AND "sessionId" = $2 AND "role" = 'orchestrator'`, [value.turnId, value.sessionId],
     )
     expect(root.rows).toHaveLength(1)
-    expect(root.rows[0]).toMatchObject({ status: "failed", failureReason: "business_precondition_failed" })
+    expect(root.rows[0]).toMatchObject({ status: "failed", failureReason: "budget_exhausted" })
     expect(record(root.rows[0]?.result)?.status).toBe("failed")
     expect(record(record(root.rows[0]?.result)?.structuredResult)?.interactiveDiscoveryShortlist).toEqual({
-      schemaVersion: 1, status: "failed", items: [], failures: ["scout_task_failed", "analyst_task_failed"],
+      schemaVersion: 1, status: "failed", items: [], failures: ["discovery_runtime_failed"],
     })
-    const rejection = await pool!.query<{ payload: unknown }>(
+    const rejections = await pool!.query<{ payload: unknown }>(
       `SELECT "payload" FROM "agent_events" WHERE "turnId" = $1 AND "sessionId" = $2 AND "type" = 'final.rejected'
-       ORDER BY "sequence" DESC LIMIT 1`, [value.turnId, value.sessionId],
+       ORDER BY "sequence" ASC`, [value.turnId, value.sessionId],
     )
-    expect(record(rejection.rows[0]?.payload)).toMatchObject({ blocker: "interactive_discovery_shortlist_required" })
+    expect(rejections.rows).toHaveLength(optimisticFinalAttempts)
+    for (const rejection of rejections.rows) expect(record(rejection.payload)).toMatchObject({ blocker: "task_graph_verification_unverified" })
+    const budgetExhausted = await pool!.query<{ payload: unknown }>(
+      `SELECT "payload" FROM "agent_events" WHERE "turnId" = $1 AND "sessionId" = $2 AND "type" = 'turn.budget_exhausted'`,
+      [value.turnId, value.sessionId],
+    )
+    expect(budgetExhausted.rows).toHaveLength(1)
+    expect(record(budgetExhausted.rows[0]?.payload)).toMatchObject({ reasonCode: "budget_exhausted", metric: "steps", limit: 7 })
     const children = await pool!.query<{ id: string; role: string; status: string; failureReason: string | null; result: unknown }>(
       `SELECT "id", "role", "status", "failureReason", "result" FROM "sub_agent_tasks"
        WHERE "turnId" = $1 AND "sessionId" = $2 AND "parentTaskId" = $3 ORDER BY "role"`,
