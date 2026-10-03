@@ -5620,13 +5620,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expectPassedVerificationReport(record(childByGoal.get(FOLLOW_UP_GOAL)?.result)?.taskGraphVerificationReport, "finding-count")
     expect(record(record(childByGoal.get(FOLLOW_UP_GOAL)?.result)?.structuredResult)).toMatchObject({
       summary: FOLLOW_UP_GOAL,
-      evidence: [{ id: "fixture-job-evidence", kind: "job", ref: "fixture-job-1", source: "fixture" }],
+      evidence: [{ id: "read:job:fixture-job-1", kind: "job", ref: "fixture-job-1", source: "fixture" }],
     })
     expect(childByGoal.get(LARGE_SOURCE_REPAIR_GOAL)).toMatchObject({ status: "completed", role: "scout" })
     expectPassedVerificationReport(record(childByGoal.get(LARGE_SOURCE_REPAIR_GOAL)?.result)?.taskGraphVerificationReport, "candidate-count")
     expect(record(record(childByGoal.get(LARGE_SOURCE_REPAIR_GOAL)?.result)?.structuredResult)).toMatchObject({
       summary: LARGE_SOURCE_REPAIR_GOAL,
-      evidence: [{ id: "fixture-job-evidence", kind: "job", ref: "fixture-job-1", source: "fixture" }],
+      evidence: [{ id: "read:job:fixture-job-1", kind: "job", ref: "fixture-job-1", source: "fixture" }],
     })
     const repairTarget = largeSourceRepairTarget.current
     if (!repairTarget) throw new Error("Final assertions lost the oversized source repair target identity")
