@@ -830,6 +830,8 @@ draft
 - Worker crash、duplicate job、SSE disconnect 不丢状态；
 - interrupt、budget 和 no-progress guard 全部可观测。
 
+**Gate disposition (2026-10-03):** **GO for code merges / implementation acceptance** under the owner decision recorded in [#545](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/545). The five code criteria have merged implementation/test evidence. The listed staging exercises are **DEFERRED / NOT VERIFIED** until total acceptance; Phase 5 operational acceptance remains pending. See the [Phase 5 Exit Report](agent-harness-v2/gates/phase-5/exit-report.md). This disposition does not change Phase 4 status or authorize staging or production activation.
+
 ---
 
 ## 10. Phase 6 — Subagent Runtime
