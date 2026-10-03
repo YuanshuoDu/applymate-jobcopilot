@@ -31,6 +31,31 @@ function assertDenseBindings(calls: Array<{ sql: string; values?: readonly unkno
   }
 }
 
+function turnStartBudgetFixture(input: {
+  readonly budgetSnapshot: unknown
+  readonly usage?: Record<string, unknown>
+  readonly existingStep?: boolean
+}) {
+  const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
+  const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+    calls.push({ sql, values })
+    if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 1 }
+    if (sql.includes('SELECT root_task."budgetSnapshot"')) return { rows: [{ budgetSnapshot: input.budgetSnapshot }], rowCount: 1 }
+    if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: owner.sessionId }], rowCount: 1 }
+    if (sql.includes('SELECT turn."id"')) return { rows: [{ id: owner.turnId }], rowCount: 1 }
+    if (sql.includes('SELECT "id", "ordinal", "taskId"')) return input.existingStep
+      ? { rows: [{ id: "replayed-step", ordinal: 4, taskId: owner.taskId, attempt: 1, inputThroughSequence: "0", consumedInputIds: [], modelProfileSnapshot: {} }], rowCount: 1 }
+      : { rows: [], rowCount: 0 }
+    if (sql.includes('COUNT(*)::bigint AS "used"')) return { rows: [{ used: "0" }], rowCount: 1 }
+    if (sql.includes('SUM(usage_row.')) return { rows: [input.usage ?? { inputTokens: "0", outputTokens: "0", estimatedCostUsd: "0" }], rowCount: 1 }
+    if (sql.includes('MAX("ordinal")')) return { rows: [{ ordinal: 0 }], rowCount: 1 }
+    if (sql.includes('INSERT INTO "agent_steps"')) return { rows: [{ id: "new-step" }], rowCount: 1 }
+    return { rows: [], rowCount: 1 }
+  }), release: vi.fn() }
+  const pool = { connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">
+  return { calls, client, pool }
+}
+
 describe("PostgreSQL TurnEngine store", () => {
   it("fences new Steps and Items with the active lease and current time", async () => {
     const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
@@ -60,6 +85,76 @@ describe("PostgreSQL TurnEngine store", () => {
     expect(calls.some(({ sql }) => sql.includes("owner_task") && sql.includes("leaseVersion"))).toBe(true)
     expect(calls.some(({ values }) => values?.includes(owner.taskId))).toBe(true)
     assertDenseBindings(calls)
+  })
+
+  it("checks the root step and usage budgets before allocating a new Step", async () => {
+    const { calls, pool } = turnStartBudgetFixture({
+      budgetSnapshot: { limits: { maxSteps: 32, maxInputTokens: 100, maxOutputTokens: 200, maxCostUsd: 1 } },
+      usage: { inputTokens: "10", outputTokens: "20", estimatedCostUsd: "0.2" },
+    })
+    const store = createPgTurnEngineStore(pool)
+
+    await expect(store.startStep({ owner, stepId: "budgeted-step", ordinal: 0, attempt: 1, inputThroughSequence: 0n, consumedInputIds: [], modelProfileSnapshot: {}, now }))
+      .resolves.toEqual({ id: "new-step", ordinal: 0 })
+
+    const stepUsage = calls.findIndex(({ sql }) => sql.includes('COUNT(*)::bigint AS "used"') && sql.includes('FROM "agent_steps"'))
+    const aggregateUsage = calls.findIndex(({ sql }) => sql.includes('SUM(usage_row."inputTokens")'))
+    const ordinal = calls.findIndex(({ sql }) => sql.includes('MAX("ordinal")'))
+    const insert = calls.findIndex(({ sql }) => sql.includes('INSERT INTO "agent_steps"'))
+    expect(stepUsage).toBeGreaterThan(-1)
+    expect(aggregateUsage).toBeGreaterThan(stepUsage)
+    expect(ordinal).toBeGreaterThan(aggregateUsage)
+    expect(insert).toBeGreaterThan(ordinal)
+    expect(calls.some(({ sql }) => sql === "COMMIT")).toBe(true)
+    expect(calls.some(({ sql }) => sql === "ROLLBACK")).toBe(false)
+  })
+
+  it.each([
+    { metric: "input_tokens", budgetSnapshot: { limits: { maxSteps: 32, maxInputTokens: 10 } }, usage: { inputTokens: "10", outputTokens: "0", estimatedCostUsd: "0" } },
+    { metric: "cost_usd", budgetSnapshot: { limits: { maxSteps: 32, maxCostUsd: 0.25 } }, usage: { inputTokens: "0", outputTokens: "0", estimatedCostUsd: "0.25" } },
+  ])("rolls back a new Step when committed root usage reaches the $metric budget", async ({ metric, budgetSnapshot, usage }) => {
+    const { calls, pool } = turnStartBudgetFixture({ budgetSnapshot, usage })
+    const store = createPgTurnEngineStore(pool)
+
+    await expect(store.startStep({ owner, stepId: `denied-${metric}`, ordinal: 0, attempt: 1, inputThroughSequence: 0n, consumedInputIds: [], modelProfileSnapshot: {}, now }))
+      .rejects.toMatchObject({ name: "BudgetExceededError", metric })
+
+    expect(calls.some(({ sql }) => sql.includes('INSERT INTO "agent_steps"'))).toBe(false)
+    expect(calls.filter(({ sql }) => sql === "ROLLBACK")).toHaveLength(1)
+    expect(calls.some(({ sql }) => sql === "COMMIT")).toBe(false)
+  })
+
+  it("returns an existing Step idempotently before either root budget guard", async () => {
+    const { calls, pool } = turnStartBudgetFixture({
+      budgetSnapshot: { limits: { maxSteps: 0, maxInputTokens: 0, maxCostUsd: 0 } },
+      existingStep: true,
+    })
+    const store = createPgTurnEngineStore(pool)
+
+    await expect(store.startStep({ owner, stepId: "replayed-step", ordinal: 0, attempt: 1, inputThroughSequence: 0n, consumedInputIds: [], modelProfileSnapshot: {}, now }))
+      .resolves.toEqual({ id: "replayed-step", ordinal: 4 })
+
+    expect(calls.some(({ sql }) => sql.includes('SELECT root_task."budgetSnapshot"'))).toBe(false)
+    expect(calls.some(({ sql }) => sql.includes('COUNT(*)::bigint AS "used"') || sql.includes("SUM(usage_row."))).toBe(false)
+    expect(calls.some(({ sql }) => sql.includes('INSERT INTO "agent_steps"'))).toBe(false)
+    expect(calls.some(({ sql }) => sql === "COMMIT")).toBe(true)
+  })
+
+  it("persists Step usage updates without rechecking the root budget", async () => {
+    const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
+    const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+      calls.push({ sql, values })
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: owner.sessionId }], rowCount: 1 }
+      if (sql.includes('SELECT turn."id"')) return { rows: [{ id: owner.turnId }], rowCount: 1 }
+      return { rows: [], rowCount: 1 }
+    }), release: vi.fn() }
+    const store = createPgTurnEngineStore({ connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">)
+
+    await expect(store.updateStep({ owner, stepId: "step-usage", status: "completed", finishReason: "done", errorCode: null, inputTokens: 11, outputTokens: 7, estimatedCostUsd: 0.03, now })).resolves.toBeUndefined()
+
+    const update = calls.find(({ sql }) => sql.includes('UPDATE "agent_steps"'))
+    expect(update?.values?.slice(3, 6)).toEqual([11, 7, 0.03])
+    expect(calls.some(({ sql }) => sql.includes('SELECT root_task."budgetSnapshot"') || sql.includes('COUNT(*)::bigint AS "used"') || sql.includes("SUM(usage_row."))).toBe(false)
   })
 
   it("writes an event and its outbox record in one transaction", async () => {
