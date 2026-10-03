@@ -371,6 +371,10 @@ const TASK_DIAGNOSTIC_STATUSES = new Set([
 const STEP_DIAGNOSTIC_STATUSES = new Set([
   "queued", "running", "completed", "failed", "interrupted", "waiting_for_tool", "waiting_for_approval", "waiting_for_user",
 ])
+const EVENT_DIAGNOSTIC_STATUSES = new Set([
+  ...TURN_DIAGNOSTIC_STATUSES, ...ITEM_DIAGNOSTIC_STATUSES, ...WAIT_DIAGNOSTIC_STATUSES,
+  ...TASK_DIAGNOSTIC_STATUSES, ...STEP_DIAGNOSTIC_STATUSES,
+])
 const PROCESS_FIXTURE_TURN_STATUSES = new Set([...TURN_DIAGNOSTIC_STATUSES, "none", "other"])
 const PROCESS_FIXTURE_TASK_STATUSES = new Set([...TASK_DIAGNOSTIC_STATUSES, "none", "other"])
 const PROCESS_FIXTURE_STEP_STATUSES = new Set([
@@ -2778,6 +2782,7 @@ async function waitForPersistedTaskWait(
   idempotencyKey: string,
   timeoutMs = 20_000,
   diagnosticToolCallId?: string,
+  diagnosticFixtureCounters?: { modelRuntimeFactoryInvocations: number; adapterStreamInvocations: number },
 ): Promise<{ id: string }> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
@@ -2791,7 +2796,7 @@ async function waitForPersistedTaskWait(
     await new Promise(resolve => setTimeout(resolve, 20))
   }
   const diagnostics = diagnosticToolCallId
-    ? `; state=${await persistedWaitTimeoutDiagnostics(pool, turnId, idempotencyKey, diagnosticToolCallId)}`
+    ? `; state=${await persistedWaitTimeoutDiagnostics(pool, turnId, idempotencyKey, diagnosticToolCallId, diagnosticFixtureCounters)}`
     : ""
   throw new Error(`Follow-up parent wait was not durably suspended${diagnostics}`)
 }
@@ -2801,9 +2806,10 @@ async function persistedWaitTimeoutDiagnostics(
   turnId: string,
   idempotencyKey: string,
   toolCallId: string,
+  fixtureCounters?: { modelRuntimeFactoryInvocations: number; adapterStreamInvocations: number },
 ): Promise<string> {
   try {
-    const [turn, wait, tools, events, tasks, steps] = await Promise.all([
+    const [turn, wait, tools, toolEvents, recentTurnEvents, tasks, steps] = await Promise.all([
       pool.query<{ status: string; rootTaskId: string | null; revision: number; leaseOwnerId: string | null; error: string | null }>(
         `SELECT "status", "rootTaskId", "revision", "leaseOwnerId", "error" FROM "agent_turns" WHERE "id" = $1 LIMIT 1`, [turnId],
       ),
@@ -2820,6 +2826,10 @@ async function persistedWaitTimeoutDiagnostics(
         `SELECT "type", "payload"->>'status' AS "status", "payload"->>'errorCode' AS "errorCode"
          FROM "agent_events" WHERE "turnId" = $1 AND "payload"->>'toolCallId' = $2
          ORDER BY "sequence" DESC LIMIT 4`, [turnId, toolCallId],
+      ),
+      pool.query<{ type: string; status: string | null; errorCode: string | null }>(
+        `SELECT "type", "payload"->>'status' AS "status", "payload"->>'errorCode' AS "errorCode"
+         FROM "agent_events" WHERE "turnId" = $1 ORDER BY "sequence" DESC LIMIT 6`, [turnId],
       ),
       pool.query<{ id: string; status: string; attemptCount: number; failureReason: string | null }>(
         `SELECT "id", "status", "attemptCount", "failureReason" FROM "sub_agent_tasks"
@@ -2843,12 +2853,17 @@ async function persistedWaitTimeoutDiagnostics(
         suspended: waitRow.suspendedAt !== null, resolved: waitRow.resolvedAt !== null, consumed: waitRow.consumedAt !== null,
         targetCount: diagnosticCount(waitRow.targetTaskIds), matchedCount: diagnosticCount(waitRow.matchedTaskIds),
       } : { found: false },
+      fixtureCounters: fixtureCounters ?? null,
       tools: tools.rows.map(item => ({
         id: item.id.slice(-12), type: item.type, status: diagnosticEnum(item.status, ITEM_DIAGNOSTIC_STATUSES),
         errorCode: diagnosticErrorCode(item.errorCode),
       })),
-      events: events.rows.map(event => ({
+      toolEvents: toolEvents.rows.map(event => ({
         type: event.type, status: diagnosticEnum(event.status, ITEM_DIAGNOSTIC_STATUSES), errorCode: diagnosticErrorCode(event.errorCode),
+      })),
+      recentTurnEvents: recentTurnEvents.rows.map(event => ({
+        type: diagnosticText(event.type, 80), status: diagnosticEnum(event.status, EVENT_DIAGNOSTIC_STATUSES),
+        errorCode: diagnosticErrorCode(event.errorCode),
       })),
       tasks: tasks.rows.map(task => ({
         id: task.id.slice(-12), status: diagnosticEnum(task.status, TASK_DIAGNOSTIC_STATUSES),
@@ -6003,7 +6018,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       turnId: failureOwner.turnId, sessionId: failureOwner.sessionId, ownerId: failureOwner.ownerId,
     })
     try {
-      await waitForTurnStatus(pool!, failureOwner.turnId, "completed", 50_000, FAILURE_WAIT_CALL_ID)
+      await waitForTurnStatus(pool!, failureOwner.turnId, "failed", 50_000, FAILURE_WAIT_CALL_ID)
     } catch (error: unknown) {
       const progress = await turnProgressDiagnostics(pool!, failureOwner.turnId, FAILURE_WAIT_CALL_ID)
       const failureReceiptDiagnostic: FailureDiagnosticField[] = failurePlanReceiptFailureDiagnostics
@@ -6025,15 +6040,21 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       ], progress))
     }
 
-    const turn = await pool!.query<{ rootTaskId: string; finalResponse: string | null }>(
-      `SELECT "rootTaskId", "finalResponse" FROM "agent_turns" WHERE "id" = $1`, [failureOwner.turnId],
+    const turn = await pool!.query<{ status: string; rootTaskId: string; finalResponse: string | null }>(
+      `SELECT "status", "rootTaskId", "finalResponse" FROM "agent_turns" WHERE "id" = $1`, [failureOwner.turnId],
     )
     const rootTaskId = turn.rows[0]?.rootTaskId
     expect(rootTaskId).toBeTruthy()
     expect(rootRuntimeExecutions).toBe(2)
     expect(resumedAfterFailure).toBe(true)
     expect(descendantExecuted).toBe(false)
-    expect(turn.rows[0]?.finalResponse).toContain(FAILURE_FINAL_MARKER)
+    expect(turn.rows[0]).toMatchObject({ status: "failed", finalResponse: null })
+    const finalRejection = await pool!.query<{ payload: unknown }>(
+      `SELECT "payload" FROM "agent_events" WHERE "turnId" = $1 AND "sessionId" = $2 AND "type" = 'final.rejected'
+       AND "payload"->>'blocker' = 'task_graph_verification_unverified' ORDER BY "sequence" DESC LIMIT 1`,
+      [failureOwner.turnId, failureOwner.sessionId],
+    )
+    expect(record(finalRejection.rows[0]?.payload)).toMatchObject({ blocker: "task_graph_verification_unverified" })
 
     const children = await pool!.query<{ id: string; goal: string; status: string }>(
       `SELECT "id", "goal", "status" FROM "sub_agent_tasks"
@@ -6202,7 +6223,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       turnId: owner.turnId, sessionId: owner.sessionId, ownerId: owner.ownerId,
     })
     try {
-      await waitForTurnStatus(pool!, owner.turnId, "completed", 50_000, closeWaitCallId)
+      await waitForTurnStatus(pool!, owner.turnId, "failed", 50_000, closeWaitCallId)
     } catch (error: unknown) {
       const progress = await turnProgressDiagnostics(pool!, owner.turnId, closeWaitCallId)
       throw new Error(combineFailureDiagnostics([
@@ -6214,12 +6235,18 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(rootRuntimeExecutions).toBe(2)
     expect(sourceCloseAccepted).toBe(true)
     expect(dispatchedGoals).toEqual([sourceGoal])
-    const turn = await pool!.query<{ rootTaskId: string; finalResponse: string | null }>(
-      `SELECT "rootTaskId", "finalResponse" FROM "agent_turns" WHERE "id" = $1`, [owner.turnId],
+    const turn = await pool!.query<{ status: string; rootTaskId: string; finalResponse: string | null }>(
+      `SELECT "status", "rootTaskId", "finalResponse" FROM "agent_turns" WHERE "id" = $1`, [owner.turnId],
     )
     const rootTaskId = turn.rows[0]?.rootTaskId
     if (!rootTaskId) throw new Error("Closed-source fixture did not establish a root TaskGraph task")
-    expect(turn.rows[0]?.finalResponse).toContain(finalMarker)
+    expect(turn.rows[0]).toMatchObject({ status: "failed", finalResponse: null })
+    const finalRejection = await pool!.query<{ payload: unknown }>(
+      `SELECT "payload" FROM "agent_events" WHERE "turnId" = $1 AND "sessionId" = $2 AND "type" = 'final.rejected'
+       AND "payload"->>'blocker' = 'task_graph_verification_unverified' ORDER BY "sequence" DESC LIMIT 1`,
+      [owner.turnId, owner.sessionId],
+    )
+    expect(record(finalRejection.rows[0]?.payload)).toMatchObject({ blocker: "task_graph_verification_unverified" })
 
     const children = await pool!.query<{ id: string; goal: string; status: string }>(
       `SELECT "id", "goal", "status" FROM "sub_agent_tasks"
@@ -7126,7 +7153,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const initialWaitKey = `p3-lease-recovery-wait:${value.turnId}`
     const repairPlanCallId = `p3-lease-recovery-repair-plan:${value.turnId}`
     const repairWaitKey = `p3-lease-recovery-repair-wait:${value.turnId}`
-    let executions = 0
+    const fixtureInvocationCounters = { modelRuntimeFactoryInvocations: 0, adapterStreamInvocations: 0 }
     let initialWaitReportSeen = false
     let repairPlanAccepted = false
     const runtime = await canonical.createCanonicalTurnRuntime(pool!, {
@@ -7134,11 +7161,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       taskGraphCommandPort: commandPortModule.createPgTaskGraphCommandPort(pool!),
       authorizeUsage: async () => ({ settle: async () => undefined }),
       modelRuntimeFactory: () => {
-        const execution = ++executions
+        const execution = ++fixtureInvocationCounters.modelRuntimeFactoryInvocations
         let round = 0
         const adapter: ModelAdapter = {
           id: "p3-taskgraph-lease-recovery-root-fixture", profile,
           async *stream(request) {
+            fixtureInvocationCounters.adapterStreamInvocations += 1
             round += 1
             if (execution === 1 && round === 1) {
               yield { type: "tool_call_completed", callId: planCallId, name: "agent.plan", arguments: {
@@ -7226,6 +7254,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await turnQueue.enqueueTurn(pool!, bootstrap.turns.queue, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
     const persistedWait = await waitForPersistedTaskWait(
       pool!, value.turnId, initialWaitKey, 20_000, `p3-lease-recovery-initial-wait:${value.turnId}`,
+      fixtureInvocationCounters,
     )
     const root = await pool!.query<{ rootTaskId: string | null }>(
       `SELECT "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
