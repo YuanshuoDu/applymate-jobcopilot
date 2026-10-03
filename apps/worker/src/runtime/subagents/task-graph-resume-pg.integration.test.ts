@@ -552,7 +552,7 @@ const PROCESS_FIXTURE_FAILURE_CATEGORIES = new Set([
   "none", "other", "tool_result_missing", "database_deadlock", "database_serialization", "database_lock_wait",
   "coordination_invalid_input", "coordination_task_not_found", "coordination_scope_error",
   "coordination_wait_unavailable", "wait_handoff_state", "turn_lease_state", "generic_tool_execution_failed",
-  "task_graph_failure", "business_precondition_failed", "turn_output_invalid", "turn_budget_exhausted",
+  "task_graph_failure", "plan_ledger_projection_invalid", "business_precondition_failed", "turn_output_invalid", "turn_budget_exhausted",
 ])
 const PROCESS_RESTART_ROOT_STAGES = new Set([
   "not_started", "worker_ready", "model_failed", "graph_restored", "resume_context_ready",
@@ -3561,6 +3561,7 @@ async function processRestartFailureDiagnostic(
     parentModelFailureGuard: processRestartGuardMarker(workerOutput),
     childOutcome,
     childException,
+    restartVerifierEvidence: processRestartVerifierEvidenceDiagnostics(workerOutput),
     taskGraph,
     waitResults: { initial: initialWait, followUp: followUpWait },
     runtimeState,
@@ -3578,6 +3579,98 @@ const PROCESS_RESTART_CHILD_EXCEPTION_DIAGNOSTIC_FIELDS = {
   stage: new Set(["dispatch_context", "source_wait_state", "source_dispatch_state", "source_lookup", "source_verification", "source_completion", "dependent_dispatch", "dependency_context", "follow_up_context", "execute_child", "other"]),
   errorName: new Set(["Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "AbortError", "TimeoutError", "other"]),
   failureCode: new Set(["invalid_structured_result", "model_incomplete", "invalid_output", "tool_execution_failed", "timeout", "cancelled", "step_limit", "budget_exhausted", "no_progress", "evidence_missing", "evidence_conflict", "final_unverified", "child_turn_missing", "child_resume_unavailable", "child_resume_evidence_unavailable", "selected_job_sources_unavailable", "selected_job_context_unavailable", "subagent_role_unknown", "database_deadlock", "database_serialization", "fixture_error", "other"]),
+}
+
+const PROCESS_RESTART_VERIFIER_EVIDENCE_PREFIX = "P3_RESTART_VERIFIER_EVIDENCE_DIAGNOSTIC "
+const PROCESS_RESTART_VERIFIER_EVIDENCE_ROLES = new Set(["scout", "analyst", "other"])
+const PROCESS_RESTART_VERIFIER_EVIDENCE_STATUSES = new Set(["completed", "partial", "failed", "missing", "other"])
+const PROCESS_RESTART_VERIFIER_EVIDENCE_ITEM_STATUSES = new Set(["started", "completed", "failed", "cancelled", "interrupted", "queued", "missing", "other"])
+const PROCESS_RESTART_VERIFIER_EVIDENCE_CALL_STATUSES = new Set(["started", "completed", "failed", "interrupted", "cancelled", "missing", "other"])
+const PROCESS_RESTART_VERIFIER_EVIDENCE_SOURCES = new Set(["greenhouse", "lever", "workday", "smartrecruiters", "personio", "jobs.read", "missing", "invalid", "other"])
+const PROCESS_RESTART_VERIFIER_EVIDENCE_JOBS_TYPES = new Set(["array", "missing", "other"])
+const PROCESS_RESTART_VERIFIER_EVIDENCE_MARKER_LIMIT = 4
+const PROCESS_RESTART_VERIFIER_EVIDENCE_MAX_BYTES = 8_192
+const PROCESS_RESTART_VERIFIER_EVIDENCE_ARRAY_LIMIT = 5
+const PROCESS_RESTART_VERIFIER_EVIDENCE_COUNT_LIMIT = 99
+
+function boundedRestartEvidenceCount(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? Math.min(value, PROCESS_RESTART_VERIFIER_EVIDENCE_COUNT_LIMIT) : null
+}
+
+function safeRestartEvidenceEnum(value: unknown, allowed: ReadonlySet<string>): string {
+  return diagnosticEnum(value, allowed) ?? (value === null || value === undefined ? "missing" : "other")
+}
+
+function safeRestartEvidenceBooleans(value: unknown): Array<boolean | null> {
+  return Array.isArray(value)
+    ? value.slice(0, PROCESS_RESTART_VERIFIER_EVIDENCE_ARRAY_LIMIT).map(item => typeof item === "boolean" ? item : null)
+    : []
+}
+
+function safeRestartEvidenceSources(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return [...new Set(value.slice(0, PROCESS_RESTART_VERIFIER_EVIDENCE_ARRAY_LIMIT * 2)
+    .map(item => safeRestartEvidenceEnum(item, PROCESS_RESTART_VERIFIER_EVIDENCE_SOURCES)))]
+    .slice(0, PROCESS_RESTART_VERIFIER_EVIDENCE_ARRAY_LIMIT)
+}
+
+function projectRestartVerifierEvidenceRead(value: unknown): RecordValue {
+  const row = record(value)
+  if (!row) return { diagnosticUnavailable: true }
+  return {
+    itemStatus: safeRestartEvidenceEnum(row.itemStatus, PROCESS_RESTART_VERIFIER_EVIDENCE_ITEM_STATUSES),
+    callStatus: safeRestartEvidenceEnum(row.callStatus, PROCESS_RESTART_VERIFIER_EVIDENCE_CALL_STATUSES),
+    hasErrorCode: row.hasErrorCode === true,
+    jobsType: safeRestartEvidenceEnum(row.jobsType, PROCESS_RESTART_VERIFIER_EVIDENCE_JOBS_TYPES),
+    jobCount: boundedRestartEvidenceCount(row.jobCount),
+    jobsValidShape: row.jobsValidShape === true,
+    matchingJobCount: boundedRestartEvidenceCount(row.matchingJobCount),
+    matchingJobSources: safeRestartEvidenceSources(row.matchingJobSources),
+    evidenceSourceMatches: typeof row.evidenceSourceMatches === "boolean" ? row.evidenceSourceMatches : null,
+  }
+}
+
+function projectRestartVerifierEvidenceMarker(line: string): RecordValue {
+  if (line.length > PROCESS_RESTART_VERIFIER_EVIDENCE_MAX_BYTES) return { diagnosticUnavailable: true }
+  const raw = diagnosticJsonRecord(line.slice(PROCESS_RESTART_VERIFIER_EVIDENCE_PREFIX.length))
+  if (!raw) return { diagnosticUnavailable: true }
+  const jobEvidence = Array.isArray(raw.jobEvidence) ? raw.jobEvidence.slice(0, PROCESS_RESTART_VERIFIER_EVIDENCE_ARRAY_LIMIT) : []
+  const persistedReads = Array.isArray(raw.persistedReads) ? raw.persistedReads.slice(0, PROCESS_RESTART_VERIFIER_EVIDENCE_ARRAY_LIMIT) : []
+  return {
+    diagnosticUnavailable: raw.diagnosticUnavailable === true,
+    role: safeRestartEvidenceEnum(raw.role, PROCESS_RESTART_VERIFIER_EVIDENCE_ROLES),
+    attempt: boundedRestartEvidenceCount(raw.attempt),
+    childStatus: safeRestartEvidenceEnum(raw.childStatus, PROCESS_RESTART_VERIFIER_EVIDENCE_STATUSES),
+    resultStatus: safeRestartEvidenceEnum(raw.resultStatus, PROCESS_RESTART_VERIFIER_EVIDENCE_STATUSES),
+    structuredResultStatus: safeRestartEvidenceEnum(raw.structuredResultStatus, PROCESS_RESTART_VERIFIER_EVIDENCE_STATUSES),
+    claimCount: boundedRestartEvidenceCount(raw.claimCount),
+    claimJobIdMatches: safeRestartEvidenceBooleans(raw.claimJobIdMatches),
+    structuredEvidenceCount: boundedRestartEvidenceCount(raw.structuredEvidenceCount),
+    jobEvidenceCount: boundedRestartEvidenceCount(raw.jobEvidenceCount),
+    jobEvidence: jobEvidence.map(item => {
+      const evidence = record(item)
+      return {
+        refMatchesRequestedJob: typeof evidence?.refMatchesRequestedJob === "boolean" ? evidence.refMatchesRequestedJob : null,
+        source: safeRestartEvidenceEnum(evidence?.source, PROCESS_RESTART_VERIFIER_EVIDENCE_SOURCES),
+      }
+    }),
+    persistedSearchOutputCount: boundedRestartEvidenceCount(raw.persistedSearchOutputCount),
+    persistedSearchOutputLimitReached: raw.persistedSearchOutputLimitReached === true,
+    persistedReads: persistedReads.map(projectRestartVerifierEvidenceRead),
+  }
+}
+
+function processRestartVerifierEvidenceDiagnostics(output: readonly string[]): RecordValue {
+  const latest: string[] = []
+  for (let index = output.length - 1; index >= 0 && latest.length <= PROCESS_RESTART_VERIFIER_EVIDENCE_MARKER_LIMIT; index -= 1) {
+    const line = output[index]
+    if (line?.startsWith(PROCESS_RESTART_VERIFIER_EVIDENCE_PREFIX)) latest.push(line)
+  }
+  const markerLimitReached = latest.length > PROCESS_RESTART_VERIFIER_EVIDENCE_MARKER_LIMIT
+  const markers = latest.slice(0, PROCESS_RESTART_VERIFIER_EVIDENCE_MARKER_LIMIT).reverse()
+    .map(projectRestartVerifierEvidenceMarker)
+  return { markerCount: markers.length, markerLimitReached, markers }
 }
 
 function latestProcessFixtureJsonDiagnostic(
@@ -4218,6 +4311,21 @@ describe("compact TaskGraph wait failure diagnostics", () => {
     })
     expect(projected).not.toContain(privateFailure)
     expect(Buffer.byteLength(projected, "utf8")).toBeLessThanOrEqual(300)
+  })
+
+  it("surfaces the fixed Plan Ledger projection failure category without fixture error text", () => {
+    const privateError = "p3_persisted_plan_ledger_projection_invalid:private-detail"
+    const failureCategory = processFixtureFailureCategory(
+      ["P3_PARENT_MODEL_FAILURE_CLASS plan_ledger_projection_invalid"], "P3_PARENT_MODEL_FAILURE_CLASS ",
+    )
+    const output = combineFailureDiagnostics([
+      { label: "parentModelFailureClass", value: privateError, safeValue: diagnosticEnum(
+        failureCategory, PROCESS_FIXTURE_FAILURE_CATEGORIES,
+      ) ?? "other" },
+    ], "{}")
+
+    expect(output).toContain("parentModelFailureClass=plan_ledger_projection_invalid")
+    expect(output).not.toContain(privateError)
   })
 
   it("surfaces only a valid restored source projection classification", () => {
@@ -5006,6 +5114,48 @@ describe("canonical verifier receipt diagnostics", () => {
     for (const secret of [scope.userId, scope.sessionId, scope.turnId, scope.ownerId, tasks[0]!.id, tasks[0]!.rootTaskId!, "private-step-id", "private-call-id", "private-job-id", "private-result-text"]) {
       expect(encoded).not.toContain(secret)
     }
+  })
+})
+
+describe("process-restart verifier evidence diagnostics", () => {
+  it("keeps only bounded enums, counts, booleans, and the latest markers", () => {
+    const marker = (attempt: number, overrides: RecordValue = {}) =>
+      `${PROCESS_RESTART_VERIFIER_EVIDENCE_PREFIX}${JSON.stringify({
+        role: "analyst", attempt, childStatus: "completed", resultStatus: "completed",
+        structuredResultStatus: "completed", claimCount: 1234, claimJobIdMatches: [true, false],
+        structuredEvidenceCount: 1, jobEvidenceCount: 1,
+        jobEvidence: [{ refMatchesRequestedJob: true, source: "greenhouse", id: "private-id", content: "private-job" }],
+        persistedSearchOutputCount: 1, persistedSearchOutputLimitReached: false,
+        persistedReads: [{ itemStatus: "completed", callStatus: "completed", hasErrorCode: false,
+          jobsType: "array", jobCount: 500, jobsValidShape: true, matchingJobCount: 1,
+          matchingJobSources: ["greenhouse", "private-source"], evidenceSourceMatches: true,
+          rawSql: "private-sql" }], privateField: "private-value", ...overrides,
+      })}`
+    const output = [marker(1), marker(2), marker(3), marker(4), marker(5), marker(6)]
+    const projected = processRestartVerifierEvidenceDiagnostics(output)
+    const encoded = JSON.stringify(projected)
+
+    expect(projected).toMatchObject({
+      markerCount: 4, markerLimitReached: true,
+      markers: [{ attempt: 3 }, { attempt: 4 }, { attempt: 5 }, {
+        attempt: 6, role: "analyst", childStatus: "completed", claimCount: 99,
+        claimJobIdMatches: [true, false], jobEvidence: [{ refMatchesRequestedJob: true, source: "greenhouse" }],
+        persistedReads: [{ jobCount: 99, matchingJobSources: ["greenhouse", "other"], evidenceSourceMatches: true }],
+      }],
+    })
+    for (const secret of ["private-id", "private-job", "private-source", "private-sql", "private-value"]) {
+      expect(encoded).not.toContain(secret)
+    }
+  })
+
+  it("rejects malformed or oversized marker lines", () => {
+    const malformed = `${PROCESS_RESTART_VERIFIER_EVIDENCE_PREFIX}{not-json}`
+    const oversized = `${PROCESS_RESTART_VERIFIER_EVIDENCE_PREFIX}${"x".repeat(PROCESS_RESTART_VERIFIER_EVIDENCE_MAX_BYTES)}`
+    expect(processRestartVerifierEvidenceDiagnostics([malformed, oversized])).toEqual({
+      markerCount: 2,
+      markerLimitReached: false,
+      markers: [{ diagnosticUnavailable: true }, { diagnosticUnavailable: true }],
+    })
   })
 })
 
@@ -6677,6 +6827,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         followUpReadyLine = await waitForProcessLine(workerTwo, "P3_FOLLOW_UP_GRAPH_READY ")
       } catch (error: unknown) {
         let progress = JSON.stringify({ available: false })
+        const parentModelFailureClass = processFixtureFailureCategory(
+          workerTwo.output, "P3_PARENT_MODEL_FAILURE_CLASS ",
+        )
+        const parentModelFailureGuard = processRestartGuardMarker(workerTwo.output)
         try {
           progress = await turnProgressDiagnostics(pool!, restartOwner.turnId, "p3-process-restart-follow-up-wait")
         } catch {
@@ -6686,9 +6840,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           { label: "followUpGraphReadyMarker", value: "missing" },
           { label: "followUpMarkerWaitFailure", value: processLineWaitFailureKind(error, "P3_FOLLOW_UP_GRAPH_READY ") },
           { label: "workerProcessState", value: workerTwo.signalCode !== null ? "signaled" : workerTwo.exitCode !== null ? "exited" : "running" },
-          { label: "parentModelFailureClass", value: processFixtureFailureCategory(
-            workerTwo.output, "P3_PARENT_MODEL_FAILURE_CLASS ",
-          ) },
+          { label: "parentModelFailureClass", value: "", safeValue: diagnosticEnum(
+            parentModelFailureClass, PROCESS_FIXTURE_FAILURE_CATEGORIES,
+          ) ?? "other" },
+          { label: "parentModelFailureGuard", value: "", safeValue: diagnosticEnum(
+            parentModelFailureGuard, PROCESS_RESTART_GUARD_MARKERS,
+          ) ?? "other" },
         ], progress))
       }
 
@@ -7798,6 +7955,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           taskStatusCounts: diagnosticStatusCounts(taskStatusCounts),
           childTasks: diagnosticDiscoveryTasks(tasks.rows),
           verifierEvidence,
+          restartVerifierEvidence: processRestartVerifierEvidenceDiagnostics(workerTwo?.output ?? []),
           waitStatuses,
           waitTargetCounts: waits.rows.map(wait => diagnosticBoundedCount(wait.targetCount)),
           runtimeState,

@@ -85,9 +85,19 @@ function safeFailureCategory(error) {
     const category = STEP_ERROR_CLASS_BY_CODE.get(code.toLowerCase())
     if (category) return category
   }
+  if (error instanceof Error && error.message === "p3_persisted_plan_ledger_projection_invalid") {
+    return "plan_ledger_projection_invalid"
+  }
   if (error instanceof Error && error.name === "CoordinationError") return "coordination_scope_error"
   if (error instanceof Error && error.name === "AssertionError") return "task_graph_failure"
   return "other"
+}
+function assertSafeFailureCategoryProjection() {
+  const known = safeFailureCategory(new Error("p3_persisted_plan_ledger_projection_invalid"))
+  const unknown = safeFailureCategory(new Error("p3_persisted_plan_ledger_projection_invalid:private-detail"))
+  if (known !== "plan_ledger_projection_invalid" || unknown !== "other") {
+    throw new Error("p3_failure_category_projection_self_test_failed")
+  }
 }
 function captureModelStreamFailure(model, onFailure) {
   return {
@@ -1556,6 +1566,11 @@ async function runDiscoverySecondWorker() {
     subagents: { intervalMs: 10, async execute({ lease }) {
       say("P3_DISCOVERY_CHILD_STARTED " + lease.id + " " + lease.role)
       const outcome = await executeChild({ lease })
+      try { await processRestartVerifierDiagnostic(lease, outcome) }
+      catch { say("P3_RESTART_VERIFIER_EVIDENCE_DIAGNOSTIC " + JSON.stringify({
+        role: lease.role === "scout" || lease.role === "analyst" ? lease.role : "other",
+        diagnosticUnavailable: true,
+      })) }
       say("P3_DISCOVERY_CHILD_SETTLED " + lease.id + " " + lease.role + " " + outcome.status)
       return outcome
     } } })
@@ -1567,6 +1582,7 @@ try {
   assertLatestToolResultSelection()
   assertPersistedGraphComparator()
   assertInitialPlanToolPair()
+  assertSafeFailureCategoryProjection()
   assertSourceProjectionDiagnostic()
   if (mode === "self-test") say("P3_FIXTURE_SELF_TEST_OK")
   else if (mode === "worker2-input-guard-self-test") {
