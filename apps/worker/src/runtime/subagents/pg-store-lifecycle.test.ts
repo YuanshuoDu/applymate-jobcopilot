@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
-import { interruptSubtree, interruptTree, interruptTurn, recoverExpired } from "./pg-store-lifecycle.js"
+import { interruptSubtree, interruptTree, interruptTurn, prepareTaskGraphFinish, recoverExpired } from "./pg-store-lifecycle.js"
+import * as taskGraphLifecycle from "./task-graph-pg-lifecycle.js"
+import * as taskGraphVerification from "./task-graph-pg-verification.js"
 import type { PgSubagentPool } from "./types.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
@@ -41,6 +43,49 @@ function fakePool(handler?: (sql: string, params?: unknown[]) => { rows?: unknow
 }
 
 describe("subagent PostgreSQL lifecycle helpers", () => {
+  it("preserves JSON-text finalText when persisting a completed typed TaskGraph result", async () => {
+    const structuredResult = {
+      schemaVersion: "agent-harness.v2.subagent.result", role: "scout", status: "completed",
+      candidates: [{ jobId: "job-1", source: "greenhouse", url: null, evidenceIds: ["job-evidence-1"] }],
+      evidence: [{ id: "job-evidence-1", kind: "job", ref: "job-1", source: "greenhouse" }], summary: "Found one job",
+    }
+    const finalText = JSON.stringify(structuredResult)
+    const verification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }] }
+    const report = {
+      verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status: "passed", reasonCode: "criteria_met",
+      criteria: [{ criterionId: "candidate-count", status: "passed", reasonCode: "criteria_met" }],
+      evidenceDigest: "a".repeat(64), resultDigest: taskGraphVerification.taskGraphResultDigest(structuredResult),
+    }
+    const graph = {
+      scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" },
+      snapshot: { nodes: [{ key: "scout", taskId: "child-1", templateId: "scout", verificationDisposition: "typed", verification }] },
+    }
+    const prepare = vi.spyOn(taskGraphLifecycle, "prepareGraphTransition").mockResolvedValue(graph as never)
+    const verify = vi.spyOn(taskGraphVerification, "verifyTaskGraphNodeEvidence").mockResolvedValue({
+      verified: true, report, structuredResult,
+    } as never)
+    try {
+      const result = await prepareTaskGraphFinish({ query: vi.fn() } as never, {
+        taskId: "child-1", sessionId: "session-1", attemptCount: 1, status: "completed", retry: false,
+        result: JSON.stringify({
+          status: "completed", stepCount: 2, toolCallCount: 1, finalItemId: "final-item", finalText, structuredResult,
+          taskGraphVerificationReport: { forged: true }, verificationReport: { forged: true }, taskGraphRepairReceipt: { forged: true },
+        }),
+      })
+      const persisted = result.result as Record<string, unknown>
+      expect(result.status).toBe("completed")
+      expect(persisted.finalText).toBe(finalText)
+      expect(typeof persisted.finalText).toBe("string")
+      expect(persisted.structuredResult).toEqual(structuredResult)
+      expect(persisted.taskGraphVerificationReport).toEqual(report)
+      expect(persisted.verificationReport).toBeUndefined()
+      expect(persisted.taskGraphRepairReceipt).toBeUndefined()
+    } finally {
+      prepare.mockRestore()
+      verify.mockRestore()
+    }
+  })
+
   it("keeps a running TaskGraph child running and records only its cooperative interrupt request", async () => {
     const now = new Date("2026-09-27T12:00:00.000Z")
     const calls: Array<[string, unknown[]?]> = []

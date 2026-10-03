@@ -53,6 +53,7 @@ function plainObject(value: unknown): Record<string, unknown> | null {
 }
 function stripTaskGraphMetadata(value: unknown, active = new Set<object>(), depth = 0): unknown {
   if (depth > 32) return null
+  if (typeof value === "string" && depth > 0) return value
   if (Array.isArray(value)) {
     if (active.has(value)) return null; active.add(value)
     try { return value.map(item => stripTaskGraphMetadata(item, active, depth + 1)) } finally { active.delete(value) }
