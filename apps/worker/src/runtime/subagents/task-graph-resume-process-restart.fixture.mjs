@@ -1334,7 +1334,7 @@ async function runSecondWorker() {
       }))
       return outcome
     } catch (error) {
-      const row = record(error), rawCode = typeof row.code === "string" ? row.code : error instanceof Error ? error.message : ""
+      const row = record(error), rawCode = typeof row?.code === "string" ? row.code : error instanceof Error ? error.message : ""
       const failureCode = CHILD_FAILURE_DIAGNOSTIC_CODES.has(rawCode) ? rawCode
         : rawCode === "40P01" ? "database_deadlock" : rawCode === "40001" ? "database_serialization"
           : rawCode.startsWith("p3_") ? "fixture_error" : "other"
@@ -1348,6 +1348,7 @@ async function runSecondWorker() {
     waitResolver: { intervalMs: 10, ownerId: "p3-process-restart-wait-resolver-" + process.pid },
     subagents: { intervalMs: 10, async execute({ lease }) {
       const role = lease.role === "scout" || lease.role === "analyst" ? lease.role : "other"
+      let stage = "dispatch_context"
       try {
         const dependencyResults = record(record(lease.context)?.taskGraphDependencyResults)
         const dependencyItems = Array.isArray(dependencyResults?.items) ? dependencyResults.items.map(record) : []
@@ -1362,18 +1363,25 @@ async function runSecondWorker() {
           })),
         }))
         if (lease.goal === sourceGoal && lease.role === "scout") {
+          stage = "source_wait_state"
           const dependent = await pool.query(`SELECT task."id", task."status" FROM "sub_agent_tasks" task WHERE task."turnId" = $1 AND task."goal" = $2`, [ids.turnId, dependentGoal])
           if (dependent.rows.length !== 1 || dependent.rows[0].status !== "waiting") throw new Error("p3_dependent_not_waiting_before_source_proof")
+          stage = "source_dispatch_state"
           const dispatch = await pool.query(`SELECT 1 FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${dependent.rows[0].id}`])
           if (dispatch.rowCount !== 0) throw new Error("p3_dependent_dispatched_before_source_proof")
           say("P3_DEPENDENT_WAITING_BEFORE_SOURCE_PROOF")
         } else if (lease.goal === dependentGoal && lease.role === "analyst") {
+          stage = "source_lookup"
           const source = await pool.query(`SELECT task."id", task."status", task."result" FROM "sub_agent_tasks" task WHERE task."turnId" = $1 AND task."goal" = $2`, [ids.turnId, sourceGoal])
           const sourceResult = record(source.rows[0]?.result), report = record(sourceResult?.taskGraphVerificationReport)
+          stage = "source_verification"
           assertPassedVerificationReport(report, "candidate-count")
+          stage = "source_completion"
           if (source.rows.length !== 1 || source.rows[0].status !== "completed") throw new Error("p3_source_not_complete_before_dependent_dispatch")
+          stage = "dependent_dispatch"
           const dispatch = await pool.query(`SELECT "id" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${lease.id}`])
           if (dispatch.rows.length !== 1) throw new Error("p3_dependent_dispatch_missing_after_source_proof")
+          stage = "dependency_context"
           const items = Array.isArray(record(record(lease.context)?.taskGraphDependencyResults)?.items)
             ? record(record(lease.context)?.taskGraphDependencyResults).items.map(record) : []
           if (items[0]?.dependencyKey !== "source" || items[0]?.taskStatus !== "completed" || !isExpectedSourceProjection(items[0]?.result)) {
@@ -1382,6 +1390,7 @@ async function runSecondWorker() {
           say("P3_SOURCE_PROOF_UNLOCKED_DEPENDENT")
           say("P3_DEPENDENCY_CONTEXT_OK")
         } else if (lease.goal === followUpGoal && lease.role === "analyst") {
+          stage = "follow_up_context"
           const items = Array.isArray(record(record(lease.context)?.taskGraphDependencyResults)?.items)
             ? record(record(lease.context)?.taskGraphDependencyResults).items.map(record) : []
           const projection = record(items[0]?.result), findings = Array.isArray(projection?.findings) ? projection.findings.map(record) : []
@@ -1393,11 +1402,12 @@ async function runSecondWorker() {
           say("P3_FOLLOW_UP_DEPENDENCY_CONTEXT_OK")
         } else throw new Error("p3_unexpected_child:" + lease.goal)
       } catch (error) {
-        const row = record(error), rawCode = typeof row.code === "string" ? row.code : error instanceof Error ? error.message : ""
-        const failureCode = rawCode === "40P01" ? "database_deadlock" : rawCode === "40001" ? "database_serialization"
+        const row = record(error), rawCode = typeof row?.code === "string" ? row.code : error instanceof Error ? error.message : ""
+        const failureCode = CHILD_FAILURE_DIAGNOSTIC_CODES.has(rawCode) ? rawCode
+          : rawCode === "40P01" ? "database_deadlock" : rawCode === "40001" ? "database_serialization"
           : rawCode.startsWith("p3_") ? "fixture_error" : "other"
         const errorName = error instanceof Error && CHILD_EXCEPTION_DIAGNOSTIC_NAMES.has(error.name) ? error.name : "other"
-        say("P3_CHILD_EXCEPTION " + JSON.stringify({ role, stage: "dispatch_guard", errorName, failureCode }))
+        say("P3_CHILD_EXCEPTION " + JSON.stringify({ role, stage, errorName, failureCode }))
         throw error
       }
       return executeRestartChild(lease)

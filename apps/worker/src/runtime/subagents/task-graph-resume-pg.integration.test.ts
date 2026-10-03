@@ -3414,9 +3414,9 @@ const PROCESS_RESTART_CHILD_OUTCOME_DIAGNOSTIC_FIELDS = {
 }
 const PROCESS_RESTART_CHILD_EXCEPTION_DIAGNOSTIC_FIELDS = {
   role: new Set(["scout", "analyst", "other"]),
-  stage: new Set(["dispatch_guard", "execute_child", "other"]),
+  stage: new Set(["dispatch_context", "source_wait_state", "source_dispatch_state", "source_lookup", "source_verification", "source_completion", "dependent_dispatch", "dependency_context", "follow_up_context", "execute_child", "other"]),
   errorName: new Set(["Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "AbortError", "TimeoutError", "other"]),
-  failureCode: new Set(["invalid_structured_result", "model_incomplete", "invalid_output", "tool_execution_failed", "timeout", "cancelled", "step_limit", "budget_exhausted", "no_progress", "evidence_missing", "evidence_conflict", "final_unverified", "database_deadlock", "database_serialization", "fixture_error", "other"]),
+  failureCode: new Set(["invalid_structured_result", "model_incomplete", "invalid_output", "tool_execution_failed", "timeout", "cancelled", "step_limit", "budget_exhausted", "no_progress", "evidence_missing", "evidence_conflict", "final_unverified", "child_turn_missing", "child_resume_unavailable", "child_resume_evidence_unavailable", "selected_job_sources_unavailable", "selected_job_context_unavailable", "subagent_role_unknown", "database_deadlock", "database_serialization", "fixture_error", "other"]),
 }
 
 function latestProcessFixtureJsonDiagnostic(
@@ -3792,13 +3792,17 @@ describe("compact TaskGraph wait failure diagnostics", () => {
     const exception = latestProcessFixtureJsonDiagnostic([
       `P3_CHILD_EXCEPTION ${JSON.stringify({ role: "analyst", stage: "execute_child", errorName: "TypeError", failureCode: "other", message: "private provider response" })}`,
     ], "P3_CHILD_EXCEPTION ", PROCESS_RESTART_CHILD_EXCEPTION_DIAGNOSTIC_FIELDS)
+    const knownFailure = latestProcessFixtureJsonDiagnostic([
+      `P3_CHILD_EXCEPTION ${JSON.stringify({ role: "analyst", stage: "execute_child", errorName: "Error", failureCode: "child_resume_unavailable" })}`,
+    ], "P3_CHILD_EXCEPTION ", PROCESS_RESTART_CHILD_EXCEPTION_DIAGNOSTIC_FIELDS)
 
     expect(outcome).toEqual({
       role: "analyst", status: "failed", failureCode: "invalid_output", resultStatus: "missing",
       hasResult: false, hasStructuredResult: false,
     })
     expect(exception).toEqual({ role: "analyst", stage: "execute_child", errorName: "TypeError", failureCode: "other" })
-    expect(JSON.stringify({ outcome, exception })).not.toContain("private")
+    expect(knownFailure).toEqual({ role: "analyst", stage: "execute_child", errorName: "Error", failureCode: "child_resume_unavailable" })
+    expect(JSON.stringify({ outcome, exception, knownFailure })).not.toContain("private")
   })
 
   it("selects the latest TaskGraph observation from a multi-step model request", () => {
