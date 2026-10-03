@@ -272,12 +272,97 @@ const SOURCE_PROJECTION_AVAILABILITY = new Set(["available", "unavailable"])
 const SOURCE_PROJECTION_ROLES = new Set(["scout", "analyst"])
 const SOURCE_PROJECTION_STATUSES = new Set(["completed", "partial"])
 const DIAGNOSTIC_COUNT_LIMIT = 99
+const RESTART_JOB_SOURCE_ENUMS = new Set(["greenhouse", "lever", "workday", "smartrecruiters", "personio", "jobs.read"])
+const RESTART_RESULT_STATUSES = new Set(["completed", "partial", "failed"])
 function diagnosticEnum(value, allowlist) {
   if (value === null || value === undefined) return "missing"
   return typeof value === "string" && allowlist.has(value) ? value : "other"
 }
 function diagnosticCount(value) {
   return Number.isSafeInteger(value) && value >= 0 ? Math.min(value, DIAGNOSTIC_COUNT_LIMIT) : null
+}
+async function processRestartVerifierDiagnostic(lease, outcome) {
+  const childResult = record(outcome?.result), structured = record(childResult?.structuredResult)
+  const evidence = Array.isArray(structured?.evidence) ? structured.evidence.map(record).filter(Boolean) : []
+  const jobEvidence = evidence.filter(item => item.kind === "job")
+  const firstEvidence = jobEvidence[0]
+  const evidenceSource = typeof firstEvidence?.source === "string" ? firstEvidence.source : null
+  const rows = await pool.query(`SELECT result."status" AS "itemStatus", call."content"->>'status' AS "callStatus",
+      result."content"->>'errorCode' AS "errorCode", jsonb_typeof(result."content"->'output'->'jobs') AS "jobsType",
+      CASE WHEN jsonb_typeof(result."content"->'output'->'jobs') = 'array'
+        THEN LEAST(jsonb_array_length(result."content"->'output'->'jobs'), ${DIAGNOSTIC_COUNT_LIMIT})::int ELSE NULL END AS "jobCount",
+      COALESCE(jsonb_typeof(result."content"->'output'->'jobs') = 'array' AND stats."jobsValidShape", false) AS "jobsValidShape",
+      LEAST(COALESCE(stats."matchingJobCount", 0), ${DIAGNOSTIC_COUNT_LIMIT})::int AS "matchingJobCount",
+      COALESCE(stats."matchingJobSources", ARRAY[]::text[]) AS "matchingJobSources",
+      CASE WHEN $6::text IS NULL THEN NULL ELSE stats."evidenceSourceMatches" END AS "evidenceSourceMatches"
+    FROM "agent_items" AS result
+    JOIN "agent_steps" AS resultStep ON resultStep."id" = result."stepId" AND resultStep."sessionId" = result."sessionId"
+      AND resultStep."turnId" = result."turnId" AND resultStep."taskId" = result."taskId"
+    JOIN "agent_items" AS call ON call."stepId" = result."stepId" AND call."sessionId" = result."sessionId"
+      AND call."turnId" = result."turnId" AND call."taskId" = result."taskId" AND call."type" = 'tool_call'
+      AND call."content"->>'toolCallId' = result."content"->>'toolCallId'
+    JOIN "agent_steps" AS callStep ON callStep."id" = call."stepId" AND callStep."sessionId" = call."sessionId"
+      AND callStep."turnId" = call."turnId" AND callStep."taskId" = call."taskId"
+    LEFT JOIN LATERAL (
+      SELECT
+        count(*) FILTER (WHERE entry.job->>'id' = $5)::int AS "matchingJobCount",
+        COALESCE(bool_and(
+          jsonb_typeof(entry.job) = 'object' AND jsonb_typeof(entry.job->'id') = 'string'
+          AND length(entry.job->>'id') > 0 AND btrim(entry.job->>'id') = entry.job->>'id'
+        ) AND count(DISTINCT entry.job->>'id') = count(*), true) AS "jobsValidShape",
+        array_agg(DISTINCT CASE
+          WHEN entry.job->'source' IS NULL OR jsonb_typeof(entry.job->'source') = 'null' THEN 'jobs.read'
+          WHEN jsonb_typeof(entry.job->'source') = 'string' AND length(entry.job->>'source') BETWEEN 1 AND 256
+            AND btrim(entry.job->>'source') = entry.job->>'source'
+            THEN CASE WHEN entry.job->>'source' = ANY(ARRAY['greenhouse','lever','workday','smartrecruiters','personio','jobs.read'])
+              THEN entry.job->>'source' ELSE 'other' END
+          ELSE 'invalid'
+        END) FILTER (WHERE entry.job->>'id' = $5) AS "matchingJobSources",
+        COALESCE(bool_and(CASE
+          WHEN entry.job->'source' IS NULL OR jsonb_typeof(entry.job->'source') = 'null' THEN 'jobs.read' = $6::text
+          WHEN jsonb_typeof(entry.job->'source') = 'string' AND length(entry.job->>'source') BETWEEN 1 AND 256
+            AND btrim(entry.job->>'source') = entry.job->>'source' THEN entry.job->>'source' = $6::text
+          ELSE false
+        END) FILTER (WHERE entry.job->>'id' = $5), false) AS "evidenceSourceMatches"
+      FROM jsonb_array_elements(CASE WHEN jsonb_typeof(result."content"->'output'->'jobs') = 'array'
+        THEN result."content"->'output'->'jobs' ELSE '[]'::jsonb END) AS entry(job)
+    ) AS stats ON true
+    WHERE result."taskId" = $1 AND result."sessionId" = $2 AND result."turnId" = $3 AND resultStep."attempt" = $4
+      AND callStep."attempt" = $4 AND result."type" = 'tool_result' AND call."content"->>'toolName' = 'jobs.search'
+    ORDER BY resultStep."ordinal" ASC, result."createdAt" ASC, result."id" ASC LIMIT 9`,
+  [lease.id, lease.sessionId, lease.turnId, lease.attemptCount, ids.jobId, evidenceSource])
+  const persistedReads = rows.rows.slice(0, 8).map(raw => ({
+    itemStatus: diagnosticEnum(raw.itemStatus, ITEM_LIFECYCLE_STATUS_ALLOWLIST),
+    callStatus: diagnosticEnum(raw.callStatus, TOOL_CALL_STATUS_ALLOWLIST),
+    hasErrorCode: typeof raw.errorCode === "string" && raw.errorCode.length > 0,
+    jobsType: diagnosticEnum(raw.jobsType, new Set(["array"])),
+    jobCount: diagnosticCount(raw.jobCount),
+    jobsValidShape: raw.jobsValidShape === true,
+    matchingJobCount: diagnosticCount(raw.matchingJobCount),
+    matchingJobSources: Array.isArray(raw.matchingJobSources)
+      ? [...new Set(raw.matchingJobSources.map(value => diagnosticEnum(value, RESTART_JOB_SOURCE_ENUMS)))].slice(0, 5) : [],
+    evidenceSourceMatches: typeof raw.evidenceSourceMatches === "boolean" ? raw.evidenceSourceMatches : null,
+  }))
+  const claims = Array.isArray(structured?.candidates) ? structured.candidates.map(record).filter(Boolean)
+    : Array.isArray(structured?.findings) ? structured.findings.map(record).filter(Boolean) : []
+  say("P3_RESTART_VERIFIER_EVIDENCE_DIAGNOSTIC " + JSON.stringify({
+    role: lease.role === "scout" || lease.role === "analyst" ? lease.role : "other",
+    attempt: diagnosticCount(lease.attemptCount),
+    childStatus: diagnosticEnum(outcome?.status, RESTART_RESULT_STATUSES),
+    resultStatus: diagnosticEnum(childResult?.status, RESTART_RESULT_STATUSES),
+    structuredResultStatus: diagnosticEnum(structured?.status, RESTART_RESULT_STATUSES),
+    claimCount: diagnosticCount(claims.length),
+    claimJobIdMatches: claims.slice(0, 5).map(item => item.jobId === ids.jobId),
+    structuredEvidenceCount: diagnosticCount(evidence.length),
+    jobEvidenceCount: diagnosticCount(jobEvidence.length),
+    jobEvidence: jobEvidence.slice(0, 5).map(item => ({
+      refMatchesRequestedJob: item.ref === ids.jobId,
+      source: diagnosticEnum(item.source, RESTART_JOB_SOURCE_ENUMS),
+    })),
+    persistedSearchOutputCount: diagnosticCount(rows.rows.length),
+    persistedSearchOutputLimitReached: rows.rows.length > 8,
+    persistedReads,
+  }))
 }
 function sourceProjectionDiagnostic(value) {
   if (value === null || value === undefined) return { category: "absent" }
@@ -1325,6 +1410,10 @@ async function runSecondWorker() {
     const role = lease.role === "scout" || lease.role === "analyst" ? lease.role : "other"
     try {
       const outcome = await executeChild({ lease }), result = record(outcome.result), rawFailure = outcome.failureReason
+      if (role === "scout" || role === "analyst") {
+        try { await processRestartVerifierDiagnostic(lease, outcome) }
+        catch { say("P3_RESTART_VERIFIER_EVIDENCE_DIAGNOSTIC " + JSON.stringify({ role, diagnosticUnavailable: true })) }
+      }
       say("P3_CHILD_OUTCOME " + JSON.stringify({
         role, status: outcome.status === "completed" || outcome.status === "failed" ? outcome.status : "other",
         failureCode: typeof rawFailure === "string" && CHILD_FAILURE_DIAGNOSTIC_CODES.has(rawFailure) ? rawFailure : rawFailure ? "other" : "none",

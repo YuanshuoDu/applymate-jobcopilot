@@ -442,7 +442,7 @@ const ITEM_DIAGNOSTIC_STATUSES = new Set(["started", "completed", "failed", "can
 const WAIT_DIAGNOSTIC_STATUSES = new Set(["waiting", "ready", "timed_out", "consumed", "failed", "cancelled", "interrupted", "closed"])
 const TOOL_DIAGNOSTIC_NAMES = new Set(["agent.plan", "agent.wait", "jobs.search"])
 const ERROR_DIAGNOSTIC_CODES = new Set([
-  "final_unverified", "step_limit", "model_incomplete", "persistence_conflict", "invalid_output",
+  "final_unverified", "step_limit", "model_incomplete", "persistence_conflict", "invalid_output", "turn_execution_failed",
   "budget_exhausted", "no_progress", "evidence_missing", "evidence_conflict", "business_precondition_failed",
   "tool_execution_failed", "tool_not_found", "schema_error", "capability_denied", "policy_denied",
   "policy_version_unknown", "timeout", "cancelled", "tool_result_replay_uncertain", "tool_recovery_aborted",
@@ -452,6 +452,10 @@ const ERROR_DIAGNOSTIC_CODES = new Set([
   "task_graph_dependency_task_missing", "task_graph_child_wait_state_failed", "revision_mismatch",
   "task_graph_revision_mismatch", "task_graph_verification_failed", "task_graph_verification_unverified",
   "revision_limit", "idempotency_conflict",
+])
+const ROOT_FAILURE_SQLSTATE_CODES = new Set(["40P01", "40001", "55P03", "57014", "23505", "23503", "23502", "23514", "22P02", "42P01", "42703", "42501"])
+const FINAL_TERMINAL_REASONS = new Set([
+  "goal_satisfied", "partial_result", "budget_exhausted", "no_progress", "unrecoverable_error", "final_unverified",
 ])
 const DISCOVERY_DIAGNOSTIC_ROLES = new Set(["scout", "analyst"])
 const TASK_GRAPH_VERIFICATION_STATUSES = new Set(["passed", "failed", "unverified"])
@@ -641,6 +645,77 @@ function diagnosticErrorCode(value: unknown): string | null {
   if (typeof value !== "string") return null
   if (ERROR_DIAGNOSTIC_CODES.has(value)) return value
   return /^task_graph_[a-z0-9_]{1,80}$/.test(value) ? "task_graph_other" : "other"
+}
+
+function diagnosticRootFailureCode(value: unknown): string {
+  const code = diagnosticErrorCode(value)
+  return code && code !== "other" ? code : diagnosticEnum(value, ROOT_FAILURE_SQLSTATE_CODES) ?? "other"
+}
+
+async function rootFailureDiagnostic(pool: Pool, turnId: string): Promise<RecordValue> {
+  try {
+    const result = await pool.query<{ errorCode: string | null; final: unknown }>(
+      `SELECT event."payload"->>'errorCode' AS "errorCode", event."payload"->'final' AS "final"
+       FROM "agent_events" AS event JOIN "agent_turns" AS turn
+         ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
+       WHERE event."turnId" = $1 AND event."type" = 'turn.failed' AND event."taskId" = turn."rootTaskId"
+       ORDER BY event."sequence" DESC LIMIT 1`,
+      [turnId],
+    )
+    const row = result.rows[0]
+    const final = record(row?.final)
+    return {
+      available: true,
+      eventFound: Boolean(row),
+      errorCode: typeof row?.errorCode === "string" ? diagnosticRootFailureCode(row.errorCode) : "missing",
+      terminalReason: final
+        ? diagnosticEnum(final.terminalReason, FINAL_TERMINAL_REASONS) ?? "other"
+        : "missing",
+      blockerPresent: typeof final?.blocker === "string",
+      blockerCode: typeof final?.blocker === "string" ? diagnosticRootFailureCode(final.blocker) : "missing",
+    }
+  } catch {
+    return { available: false }
+  }
+}
+
+async function repairCycleVerificationDiagnostic(pool: Pool, turnId: string): Promise<RecordValue> {
+  try {
+    const result = await pool.query<{
+      role: string; status: string; failureReason: string | null; result: unknown
+    }>(`SELECT "role", "status", "failureReason", "result" FROM "sub_agent_tasks"
+        WHERE "turnId" = $1 ORDER BY "createdAt" LIMIT 6`, [turnId])
+    const tasks = diagnosticDiscoveryTasks(result.rows).map(task => {
+      const report = record(task.taskGraphVerificationReport)
+      const criteria = Array.isArray(report?.criteria)
+        ? report.criteria.slice(0, 4).map(value => {
+          const criterion = record(value)
+          return {
+            criterionId: diagnosticEnum(criterion?.criterionId, DISCOVERY_DIAGNOSTIC_CRITERIA) ?? "other",
+            status: diagnosticEnum(criterion?.status, TASK_GRAPH_VERIFICATION_STATUSES) ?? "other",
+            reasonCode: diagnosticEnum(criterion?.reasonCode, TASK_GRAPH_VERIFICATION_REASONS) ?? "other",
+          }
+        })
+        : []
+      const unresolvedCriterionIds = criteria
+        .filter(criterion => criterion.status !== "passed")
+        .map(criterion => criterion.criterionId)
+        .filter((criterionId): criterionId is string => criterionId !== "other")
+        .slice(0, 4)
+      return {
+        role: task.role,
+        status: task.status,
+        failureReasonCode: task.failureReasonCode,
+        verificationStatus: report ? report.status : "missing",
+        verificationReasonCode: report ? report.reasonCode : "missing",
+        criteria,
+        unresolvedCriterionIds,
+      }
+    })
+    return { available: true, taskCount: diagnosticBoundedCount(result.rows.length), tasks }
+  } catch {
+    return { available: false }
+  }
 }
 
 function discoveryScheduleFailureDiagnostic(error: unknown): { errorName: string; errorCode: string } {
@@ -8653,12 +8728,20 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     } catch (error) {
       let progress = JSON.stringify({ available: false })
       let waitResults: RecordValue = { available: false }
+      let rootFailure: RecordValue = { available: false }
+      let verification: RecordValue = { available: false }
       try {
         const [initialWait, repairWait] = await Promise.all([
           waitToolResultDiagnostic(pool!, value.turnId, "p3-verifier-repair-initial-wait"),
           waitToolResultDiagnostic(pool!, value.turnId, "p3-verifier-repair-wait"),
         ])
         waitResults = { initial: initialWait, repair: repairWait }
+        const [failure, verdict] = await Promise.all([
+          rootFailureDiagnostic(pool!, value.turnId),
+          repairCycleVerificationDiagnostic(pool!, value.turnId),
+        ])
+        rootFailure = failure
+        verification = verdict
         progress = await turnProgressDiagnostics(
           pool!, value.turnId, "p3-verifier-repair-initial-wait", ["p3-verifier-repair-wait"],
         )
@@ -8671,11 +8754,16 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         : failureMessage.startsWith("TaskGraph root turn did not reach") ? "turn_timeout" : "other"
       const repairStage = repairWaitSent ? "repair_wait_sent"
         : repairPlanSent ? "repair_plan_sent"
-          : initialWaitSent ? "initial_wait_sent" : "initial_plan_sent"
+          : optimisticFinalAttempted ? "optimistic_final_attempted"
+            : terminalGateLease ? "terminal_gate_preflight" : initialWaitSent ? "initial_wait_sent" : "initial_plan_sent"
       throw new Error(combineFailureDiagnostics([
         { label: "repairStage", value: repairStage, safeValue: repairStage },
+        { label: "terminalGateLeaseCaptured", value: "", safeValue: String(Boolean(terminalGateLease)) },
+        { label: "optimisticFinalAttempted", value: "", safeValue: String(optimisticFinalAttempted) },
         { label: "waitFailureKind", value: failureKind, safeValue: failureKind },
         { label: "waitToolResults", value: "", safeValue: JSON.stringify(waitResults) },
+        { label: "rootFailureEvidence", value: "", safeValue: JSON.stringify(rootFailure) },
+        { label: "taskGraphVerdictEvidence", value: "", safeValue: JSON.stringify(verification) },
       ], progress))
     }
 
