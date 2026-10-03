@@ -13,6 +13,7 @@ const base: Parameters<DurableWaitPort["wait"]>[0] = {
 const SESSION_FENCE = 'session."status" NOT IN (\'aborted\', \'archived\')'
 
 function parent(status = "running"): Row { return { id: "parent-a", rootTaskId: "root-a", turnId: "turn-a", sessionId: "session-a", status, userId: "user-a" } }
+function session(status = "running", userId = "user-a"): Row { return { id: "session-a", userId, status } }
 function turn(status = "in_progress"): Row { return { id: "turn-a", sessionId: "session-a", userId: "user-a", rootTaskId: "root-a", status } }
 function step(taskId = "parent-a"): Row { return { id: "step-a", taskId } }
 function targets(statuses: readonly string[], rootTaskId = "root-a"): Row[] { return statuses.map((status, index) => ({ id: `child-${String.fromCharCode(97 + index)}`, rootTaskId, turnId: "turn-a", sessionId: "session-a", status, userId: "user-a" })) }
@@ -24,7 +25,7 @@ function waitRow(status: string, matchedTaskIds: readonly string[] = [], options
     targetTaskIds: [...targetTaskIds], mode, status, deadlineAt, matchedTaskIds: [...matchedTaskIds], createdAt,
     result: { request: { targetTaskIds: [...targetTaskIds], mode, timeoutMs: base.timeoutMs } } }
 }
-function fixture(responses: Response[], options: { sessionStatus?: string } = {}) {
+function fixture(responses: Response[], options: { sessionStatus?: string; sessionUserId?: string } = {}) {
   const calls: Array<{ sql: string; params: readonly unknown[] }> = []
   const client = {
     query: vi.fn(async (sql: string, params: readonly unknown[] = []): Promise<Response> => {
@@ -35,6 +36,8 @@ function fixture(responses: Response[], options: { sessionStatus?: string } = {}
         if (!sql.includes(SESSION_FENCE)) throw new Error("missing session-state fence")
         return { rows: [], rowCount: 0 }
       }
+      if (sql.includes('FROM "agent_sessions" AS session') && sql.includes("FOR UPDATE")
+        && options.sessionUserId && options.sessionUserId !== base.userId) return { rows: [], rowCount: 0 }
       const response = responses.shift()
       if (!response) throw new Error(`Unexpected query: ${sql}`)
       return response
@@ -44,7 +47,7 @@ function fixture(responses: Response[], options: { sessionStatus?: string } = {}
   return { calls, pool: { connect: vi.fn(async () => client) } }
 }
 function validation(targetRows: Row[], existing?: Row): Response[] {
-  return [{ rows: [parent()] }, { rows: [turn()] }, { rows: [step()] }, { rows: targetRows }, ...(existing ? [{ rows: [existing] }] : [])]
+  return [{ rows: [session()] }, { rows: [parent()] }, { rows: [turn()] }, { rows: [step()] }, { rows: targetRows }, ...(existing ? [{ rows: [existing] }] : [])]
 }
 function inserted(row: Row): Response { return { rows: [row] } }
 
@@ -59,6 +62,11 @@ describe("durable PostgreSQL wait port", () => {
     expect(test.calls.some(call => call.sql.includes("set_config('app.user_id'"))).toBe(true)
     expect(test.calls.some(call => call.sql.includes("ON CONFLICT"))).toBe(true)
     expect(test.calls.some(call => call.sql.includes('session."status" NOT IN (\'aborted\', \'archived\')'))).toBe(true)
+    const sessionLock = test.calls.findIndex(call => call.sql.includes('FROM "agent_sessions" AS session') && call.sql.includes("FOR UPDATE"))
+    const parentLock = test.calls.findIndex(call => call.sql.includes('FROM "sub_agent_tasks" AS task') && call.sql.includes("FOR UPDATE OF task"))
+    expect(sessionLock).toBeGreaterThanOrEqual(0)
+    expect(parentLock).toBeGreaterThan(sessionLock)
+    expect(test.calls[parentLock]?.sql).toContain("FOR UPDATE OF task")
     const insert = test.calls.find(call => call.sql.includes('INSERT INTO "agent_wait_conditions"'))
     expect(insert?.sql).toMatch(/"matchedTaskIds", "result", "createdAt", "updatedAt"\)\s+SELECT \$1, \$2, \$3, \$4, \$5, \$6, \$7, \$8::jsonb, \$9, \$10, \$11, \$12::jsonb, \$13::jsonb, \$14, \$14/)
     vi.useRealTimers()
@@ -118,10 +126,19 @@ describe("durable PostgreSQL wait port", () => {
   })
 
   it.each(["aborted", "archived"])("rejects wait creation for a %s session before inserting", async sessionStatus => {
-    const test = fixture([{ rows: [parent()] }], { sessionStatus })
+    const test = fixture([], { sessionStatus })
     await expect(createPgDurableWaitPort(test.pool as never).wait(base)).rejects.toMatchObject({ code: "wait_scope_error" })
     expect(test.calls.some(call => call.sql.includes('INSERT INTO "agent_wait_conditions"'))).toBe(false)
-    expect(test.calls.find(call => call.sql.includes('JOIN "agent_sessions"'))?.sql).toContain(SESSION_FENCE)
+    expect(test.calls.find(call => call.sql.includes('FROM "agent_sessions" AS session'))?.sql).toContain(SESSION_FENCE)
+    expect(test.calls.some(call => call.sql.includes('FROM "sub_agent_tasks" AS task') && call.sql.includes("FOR UPDATE OF task"))).toBe(false)
+  })
+
+  it("rejects a foreign session before locking its parent task", async () => {
+    const test = fixture([], { sessionUserId: "user-b" })
+    await expect(createPgDurableWaitPort(test.pool as never).wait(base)).rejects.toMatchObject({ code: "wait_scope_error" })
+    const sessionLock = test.calls.find(call => call.sql.includes('FROM "agent_sessions" AS session') && call.sql.includes("FOR UPDATE"))
+    expect(sessionLock?.params).toEqual([base.sessionId, base.userId])
+    expect(test.calls.some(call => call.sql.includes('FROM "sub_agent_tasks" AS task') && call.sql.includes("FOR UPDATE OF task"))).toBe(false)
   })
 
   it.each(["aborted", "archived"])("returns no resolution for a %s session", async sessionStatus => {

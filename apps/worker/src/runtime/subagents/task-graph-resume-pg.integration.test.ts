@@ -464,6 +464,15 @@ const PROCESS_FIXTURE_FAILURE_CATEGORIES = new Set([
   "coordination_wait_unavailable", "wait_handoff_state", "turn_lease_state", "generic_tool_execution_failed",
   "task_graph_failure", "business_precondition_failed", "turn_output_invalid", "turn_budget_exhausted",
 ])
+const PROCESS_RESTART_ROOT_STAGES = new Set([
+  "not_started", "worker_ready", "model_failed", "graph_restored", "resume_context_ready",
+  "follow_up_dependency_context_ready", "follow_up_graph_ready", "follow_up_graph_completed",
+])
+const PROCESS_RESTART_CHILD_STAGES = new Set([
+  "not_started", "lease_acquired", "source_wait_checked", "source_unlocked", "dependency_context_ready",
+  "follow_up_dependency_context_ready",
+])
+const PROCESS_RESTART_TASK_ROLES = new Set(["orchestrator", "scout", "analyst"])
 const PROCESS_FIXTURE_CAUSES = new Set([
   "turn_missing", "model_never_ran", "plan_not_called", "plan_failed_or_incomplete", "graph_shape_mismatch",
   "wait_call_missing", "wait_result_missing_or_unknown", "wait_target_ids_unreadable", "requested_ids_not_in_graph",
@@ -496,6 +505,19 @@ function diagnosticEnum(value: unknown, allowed: ReadonlySet<string>): string | 
 function processFixtureFailureCategory(output: readonly string[], prefix: string): string {
   const marker = output.find(line => line.startsWith(prefix))
   return diagnosticEnum(marker?.slice(prefix.length), PROCESS_FIXTURE_FAILURE_CATEGORIES) ?? "none"
+}
+
+function latestProcessFixtureStage(
+  output: readonly string[],
+  markers: readonly (readonly [prefix: string, stage: string])[],
+  allowed: ReadonlySet<string>,
+): string {
+  let stage = "not_started"
+  for (const line of output) {
+    const match = markers.find(([prefix]) => line.startsWith(prefix))
+    if (match) stage = diagnosticEnum(match[1], allowed) ?? "other"
+  }
+  return stage
 }
 
 function processLineWaitFailureKind(error: unknown, prefix: string): string {
@@ -634,7 +656,9 @@ async function collectCanonicalDiscoveryScoutResultDiagnostic(pool: Pool, owner:
     envelopeFinalItemIdKind: envelope && Object.hasOwn(envelope, "finalItemId")
       ? envelope.finalItemId === null ? "null" : typeof envelope.finalItemId === "string" ? "string" : "other"
       : "missing",
-    envelopeFinalTextIsString: typeof envelope?.finalText === "string",
+    envelopeFinalTextKind: envelope && Object.hasOwn(envelope, "finalText")
+      ? envelope.finalText === null ? "null" : typeof envelope.finalText === "string" ? "string" : "other"
+      : "missing",
     roleResultValidity,
     roleResultValidationCode,
     verificationReportValid: Boolean(report),
@@ -2762,10 +2786,15 @@ function restoredSourceProjectionFailureSafeValue(parentModelFailure: string | n
   return boundedDiagnostic(JSON.stringify(projection), 500)
 }
 
-function parentModelFailureDiagnosticFields(parentModelFailure: string | null): FailureDiagnosticField[] {
+function parentModelFailureDiagnosticFields(parentModelFailure: string | null, failureCategory = "none"): FailureDiagnosticField[] {
   const value = parentModelFailure ?? "<not captured>"
   return [
     { label: "parentModelFailure", value },
+    {
+      label: "parentModelFailureCategory",
+      value: failureCategory,
+      safeValue: diagnosticEnum(failureCategory, PROCESS_FIXTURE_FAILURE_CATEGORIES) ?? "other",
+    },
     {
       label: "restoredSourceProjection",
       value,
@@ -3230,6 +3259,122 @@ async function turnProgressDiagnostics(
     turn, waitToolResult, waitLineage, tasks: tasks.rows, waits: waits.rows, recentEvents,
     diagnosticToolFailures, executionFailures, recentOutbox: dispatches.rows,
   })
+}
+
+async function waitToolResultDiagnostic(pool: Pool, turnId: string, toolCallId: string): Promise<RecordValue> {
+  const result = await pool.query<{ status: string; content: unknown }>(
+    `SELECT "status", "content" FROM "agent_items"
+     WHERE "turnId" = $1 AND "type" = 'tool_result' AND "content"->>'toolCallId' = $2
+     ORDER BY "createdAt" DESC LIMIT 1`, [turnId, toolCallId],
+  )
+  const row = result.rows[0]
+  const content = record(row?.content)
+  const output = record(content?.output)
+  const errorCode = content?.errorCode
+  const outputStatus = output?.status
+  return {
+    resultPresent: Boolean(row),
+    resultStatus: row ? diagnosticEnum(row.status, ITEM_DIAGNOSTIC_STATUSES) ?? "other" : "missing",
+    errorCodePresent: typeof errorCode === "string",
+    errorCode: typeof errorCode === "string" ? diagnosticErrorCode(errorCode) ?? "other" : "none",
+    outputStatus: output
+      ? typeof outputStatus === "string" ? diagnosticEnum(outputStatus, PROCESS_FIXTURE_WAIT_OUTPUT_STATUSES) ?? "other" : "none"
+      : "missing",
+    matchedTaskCount: Array.isArray(output?.matchedTaskIds)
+      ? diagnosticBoundedCount(output.matchedTaskIds.length)
+      : null,
+    truncatedTaskResultCount: Array.isArray(output?.tasks)
+      ? diagnosticBoundedCount(output.tasks.filter(value => {
+        const taskResult = record(record(value)?.result)
+        return taskResult?.truncated === true || taskResult?.$truncated === true
+      }).length)
+      : null,
+  }
+}
+
+async function processRestartTaskGraphDiagnostic(pool: Pool, turnId: string): Promise<RecordValue> {
+  const [graphResult, taskResult] = await Promise.all([
+    pool.query<{ taskId: string; revision: number; content: unknown }>(
+      `SELECT "taskId", "revision", "content" FROM "agent_items"
+       WHERE "turnId" = $1 AND "type" = 'task_graph'
+       ORDER BY "revision" DESC, "updatedAt" DESC LIMIT 1`, [turnId],
+    ),
+    pool.query<{ id: string; role: string; status: string; failureReason: string | null; result: unknown }>(
+      `SELECT "id", "role", "status", "failureReason", "result" FROM "sub_agent_tasks"
+       WHERE "turnId" = $1 ORDER BY "createdAt" LIMIT 6`, [turnId],
+    ),
+  ])
+  const graphRow = graphResult.rows[0]
+  const graph = diagnosticJsonRecord(graphRow?.content)
+  const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record).filter((node): node is RecordValue => node !== null) : []
+  const tasksById = new Map(taskResult.rows.map(task => [task.id, task]))
+  return {
+    graphPresent: Boolean(graph),
+    graphRevision: diagnosticBoundedCount(graphRow?.revision),
+    graphNodeCount: diagnosticBoundedCount(nodes.length),
+    nodes: nodes.slice(0, 4).map(node => {
+      const key = diagnosticEnum(node.key, TASK_GRAPH_DIAGNOSTIC_NODE_KEYS) ?? "other"
+      const taskId = typeof node.taskId === "string" ? node.taskId : null
+      const task = taskId ? tasksById.get(taskId) : undefined
+      const taskResult = diagnosticJsonRecord(task?.result)
+      const report = record(taskResult?.taskGraphVerificationReport)
+      return {
+        nodeKey: key,
+        nodeStatus: diagnosticEnum(node.status, TASK_DIAGNOSTIC_STATUSES) ?? "other",
+        readiness: diagnosticEnum(node.readiness, TASK_GRAPH_READINESS) ?? "other",
+        taskRole: task ? diagnosticEnum(task.role, PROCESS_RESTART_TASK_ROLES) ?? "other" : "missing",
+        taskStatus: task ? diagnosticEnum(task.status, TASK_DIAGNOSTIC_STATUSES) ?? "other" : "missing",
+        failureReasonCode: task?.failureReason
+          ? diagnosticErrorCode(task.failureReason) ?? "other"
+          : "none",
+        verificationStatus: report
+          ? diagnosticEnum(report.status, TASK_GRAPH_VERIFICATION_STATUSES) ?? "other"
+          : "missing",
+      }
+    }),
+    tasks: taskResult.rows.map(task => ({
+      role: diagnosticEnum(task.role, PROCESS_RESTART_TASK_ROLES) ?? "other",
+      status: diagnosticEnum(task.status, TASK_DIAGNOSTIC_STATUSES) ?? "other",
+      failureReasonCode: task.failureReason ? diagnosticErrorCode(task.failureReason) ?? "other" : "none",
+      verificationStatus: (() => {
+        const report = record(diagnosticJsonRecord(task.result)?.taskGraphVerificationReport)
+        return report ? diagnosticEnum(report.status, TASK_GRAPH_VERIFICATION_STATUSES) ?? "other" : "missing"
+      })(),
+    })),
+  }
+}
+
+async function processRestartFailureDiagnostic(
+  pool: Pool,
+  turnId: string,
+  workerOutput: readonly string[],
+): Promise<RecordValue> {
+  const [taskGraph, initialWait, followUpWait] = await Promise.all([
+    processRestartTaskGraphDiagnostic(pool, turnId),
+    waitToolResultDiagnostic(pool, turnId, "p3-process-restart-wait"),
+    waitToolResultDiagnostic(pool, turnId, "p3-process-restart-follow-up-wait"),
+  ])
+  return {
+    rootStage: latestProcessFixtureStage(workerOutput, [
+      ["P3_SECOND_WORKER_READY ", "worker_ready"],
+      ["P3_PARENT_MODEL_FAILURE_CLASS ", "model_failed"],
+      ["P3_RESTORED_GRAPH_OK ", "graph_restored"],
+      ["P3_PARENT_RESUME_CONTEXT_OK", "resume_context_ready"],
+      ["P3_FOLLOW_UP_DEPENDENCY_CONTEXT_OK", "follow_up_dependency_context_ready"],
+      ["P3_FOLLOW_UP_GRAPH_READY ", "follow_up_graph_ready"],
+      ["P3_FOLLOW_UP_GRAPH_OK ", "follow_up_graph_completed"],
+    ], PROCESS_RESTART_ROOT_STAGES),
+    childStage: latestProcessFixtureStage(workerOutput, [
+      ["P3_CHILD_LEASE ", "lease_acquired"],
+      ["P3_DEPENDENT_WAITING_BEFORE_SOURCE_PROOF", "source_wait_checked"],
+      ["P3_SOURCE_PROOF_UNLOCKED_DEPENDENT", "source_unlocked"],
+      ["P3_DEPENDENCY_CONTEXT_OK", "dependency_context_ready"],
+      ["P3_FOLLOW_UP_DEPENDENCY_CONTEXT_OK", "follow_up_dependency_context_ready"],
+    ], PROCESS_RESTART_CHILD_STAGES),
+    parentModelFailureCategory: processFixtureFailureCategory(workerOutput, "P3_PARENT_MODEL_FAILURE_CLASS "),
+    taskGraph,
+    waitResults: { initial: initialWait, followUp: followUpWait },
+  }
 }
 
 async function waitForTurnStatus(
@@ -5947,51 +6092,39 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         await waitForProcessLine(workerTwo, "P3_SOURCE_PROOF_UNLOCKED_DEPENDENT")
         await waitForProcessLine(workerTwo, "P3_DEPENDENCY_CONTEXT_OK")
       } catch (error) {
-        const children = await pool!.query<{ goal: string; status: string; failureReason: string | null; dependencies: unknown }>(
-          `SELECT "goal", "status", "failureReason", "context"->'taskGraphDependencyResults' AS "dependencies"
-           FROM "sub_agent_tasks" WHERE "turnId" = $1 ORDER BY "createdAt"`, [restartOwner.turnId],
-        )
-        const compactChildren = children.rows.map(child => {
-          const dependencyContext = record(child.dependencies)
-          const items = Array.isArray(dependencyContext?.items)
-            ? dependencyContext.items.map(record).filter((item): item is RecordValue => item !== null)
-            : []
-          return {
-            goal: diagnosticText(child.goal, 48),
-            status: diagnosticText(child.status, 24),
-            failureReason: diagnosticText(child.failureReason, 96),
-            dependencies: items.slice(0, 2).map(item => ({
-              key: diagnosticText(item.dependencyKey, 32),
-              status: diagnosticText(item.taskStatus, 24),
-              role: diagnosticText(item.role, 24),
-              availability: diagnosticText(record(item.result)?.availability, 24),
-            })),
-          }
-        })
         const progress = await turnProgressDiagnostics(pool!, restartOwner.turnId, "p3-process-restart-wait")
         const parentModelFailure = workerTwo.output.find(line => line.startsWith("P3_PARENT_MODEL_FAILURE")) ?? null
+        const restartEvidence = await processRestartFailureDiagnostic(pool!, restartOwner.turnId, workerTwo.output)
         const processErrorText = error instanceof Error ? error.message : String(error)
         const processError = parentModelFailure
           ? processErrorText.replace(parentModelFailure, "<parent model failure captured separately>")
           : processErrorText
         throw new Error(combineFailureDiagnostics([
-          ...parentModelFailureDiagnosticFields(parentModelFailure),
+          ...parentModelFailureDiagnosticFields(
+            parentModelFailure,
+            processFixtureFailureCategory(workerTwo.output, "P3_PARENT_MODEL_FAILURE_CLASS "),
+          ),
           { label: "processError", value: processError },
-          { label: "childContexts", value: JSON.stringify(compactChildren) },
+          { label: "restartEvidence", value: "", safeValue: JSON.stringify(restartEvidence) },
         ], progress))
       }
       try {
         await waitForProcessLine(workerTwo, "P3_RESTORED_GRAPH_OK")
       } catch (error: unknown) {
         const progress = await turnProgressDiagnostics(pool!, restartOwner.turnId, "p3-process-restart-wait")
-        const processErrorText = error instanceof Error ? error.message : String(error)
         const parentModelFailure = workerTwo.output.find(line => line.startsWith("P3_PARENT_MODEL_FAILURE")) ?? null
+        const restartEvidence = await processRestartFailureDiagnostic(pool!, restartOwner.turnId, workerTwo.output)
+        const processErrorText = error instanceof Error ? error.message : String(error)
         const processError = parentModelFailure
           ? processErrorText.replace(parentModelFailure, "<parent model failure captured separately>")
           : processErrorText
         throw new Error(combineFailureDiagnostics([
-          ...parentModelFailureDiagnosticFields(parentModelFailure),
+          ...parentModelFailureDiagnosticFields(
+            parentModelFailure,
+            processFixtureFailureCategory(workerTwo.output, "P3_PARENT_MODEL_FAILURE_CLASS "),
+          ),
           { label: "processError", value: processError },
+          { label: "restartEvidence", value: "", safeValue: JSON.stringify(restartEvidence) },
         ], progress))
       }
       await waitForProcessLine(workerTwo, "P3_PARENT_RESUME_CONTEXT_OK")
@@ -8060,7 +8193,38 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       }, intervalMs: 10 },
     })
     await enqueueTurn(pool!, bootstrap.turns.queue, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
-    await waitForTurnStatus(pool!, value.turnId, "completed", 90_000, "p3-verifier-repair-wait", ["p3-verifier-repair-initial-plan"])
+    try {
+      await waitForTurnStatus(
+        pool!, value.turnId, "completed", 90_000, "p3-verifier-repair-initial-wait", ["p3-verifier-repair-wait"],
+      )
+    } catch (error) {
+      let progress = JSON.stringify({ available: false })
+      let waitResults: RecordValue = { available: false }
+      try {
+        const [initialWait, repairWait] = await Promise.all([
+          waitToolResultDiagnostic(pool!, value.turnId, "p3-verifier-repair-initial-wait"),
+          waitToolResultDiagnostic(pool!, value.turnId, "p3-verifier-repair-wait"),
+        ])
+        waitResults = { initial: initialWait, repair: repairWait }
+        progress = await turnProgressDiagnostics(
+          pool!, value.turnId, "p3-verifier-repair-initial-wait", ["p3-verifier-repair-wait"],
+        )
+      } catch {
+        // Keep only the fixed failure class if durable wait diagnostics are unavailable.
+      }
+      const failureMessage = error instanceof Error ? error.message : ""
+      const failureKind = failureMessage.startsWith("TaskGraph root turn entered failed")
+        ? "turn_failed"
+        : failureMessage.startsWith("TaskGraph root turn did not reach") ? "turn_timeout" : "other"
+      const repairStage = repairWaitSent ? "repair_wait_sent"
+        : repairPlanSent ? "repair_plan_sent"
+          : initialWaitSent ? "initial_wait_sent" : "initial_plan_sent"
+      throw new Error(combineFailureDiagnostics([
+        { label: "repairStage", value: repairStage, safeValue: repairStage },
+        { label: "waitFailureKind", value: failureKind, safeValue: failureKind },
+        { label: "waitToolResults", value: "", safeValue: JSON.stringify(waitResults) },
+      ], progress))
+    }
 
     expect(optimisticFinalAttempted).toBe(true)
     expect(repairPlanSent).toBe(true)

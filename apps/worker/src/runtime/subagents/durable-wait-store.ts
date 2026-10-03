@@ -101,9 +101,13 @@ export function createPgDurableWaitPort(pool: Pool): DurableWaitStore {
   async function wait(input: Parameters<DurableWaitPort["wait"]>[0]): Promise<DurableWaitResult> {
     const normalized = validateInput(input)
     return transaction(pool, input.userId, async client => {
+      const session = (await client.query<Row>(`SELECT session."id", session."userId", session."status"
+        FROM "agent_sessions" AS session WHERE session."id" = $1 AND session."userId" = $2 AND ${OPEN_SESSION} FOR UPDATE`,
+      [input.sessionId, input.userId])).rows[0]
+      if (!session) throw new DurableWaitStoreError("wait_scope_error", "Parent task is unavailable")
       const parent = ensureScope((await client.query<Row>(`SELECT task."id", task."rootTaskId", task."turnId", task."sessionId", task."status", session."userId" AS "userId"
         FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
-        WHERE task."id" = $1 AND task."sessionId" = $2 AND session."userId" = $3 AND ${OPEN_SESSION} FOR UPDATE`, [normalized.parentTaskId, input.sessionId, input.userId])).rows[0], "Parent task is unavailable")
+        WHERE task."id" = $1 AND task."sessionId" = $2 AND session."userId" = $3 AND ${OPEN_SESSION} FOR UPDATE OF task`, [normalized.parentTaskId, input.sessionId, input.userId])).rows[0], "Parent task is unavailable")
       if (String(parent.rootTaskId ?? parent.id) !== normalized.rootTaskId || String(parent.turnId ?? "") !== input.turnId) throw new DurableWaitStoreError("wait_scope_error", "Parent task is outside the wait scope")
       const turn = ensureScope((await client.query<Row>(`SELECT turn."id", turn."sessionId", turn."userId", turn."status", turn."rootTaskId"
         FROM "agent_turns" AS turn WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3
