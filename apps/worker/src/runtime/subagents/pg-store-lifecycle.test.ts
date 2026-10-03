@@ -3,6 +3,8 @@ import type pg from "pg"
 import { interruptSubtree, interruptTree, interruptTurn, recoverExpired } from "./pg-store-lifecycle.js"
 import type { PgSubagentPool } from "./types.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { parseTaskGraphVerificationReport, taskGraphVerificationReportMatchesStatus } from "./task-graph-command-port.js"
 
 function taskRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -170,6 +172,55 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
       expect(recovery.calls.some(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))).toBe(false)
     },
   )
+
+  it("persists an unverified typed report when an expired TaskGraph child exhausts attempts", async () => {
+    const calls: Array<[string, unknown[]?]> = []
+    const checkedAt = new Date("2026-09-23T12:00:00Z")
+    let taskStatus = "running", taskFailureReason: string | null = null, taskResult: unknown = null, revision = 1, lifecyclePayload: string | null = null
+    const verification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }] }
+    const snapshot = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{
+      key: "child", templateId: "analyst", goal: "Inspect", successCriteria: ["Find evidence"], dependsOn: [], depth: 1, taskId: "child-1",
+      verificationDisposition: "typed", verification,
+    }] }
+    const row = taskRow({ id: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", maxAttempts: 1, role: "analyst", taskType: "analysis" })
+    const client = { query: vi.fn(async (sql: string, params?: unknown[]) => {
+      calls.push([sql, params])
+      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1")) return { rows: [{ id: "child-1", sessionId: "session-1", rootTaskId: "root-1", userId: "user-1" }], rowCount: 1 }
+      if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1 }
+      if (sql.startsWith("SELECT clock_timestamp()")) return { rows: [{ checkedAt }], rowCount: 1 }
+      if (sql.includes('SELECT task."turnId"')) return { rows: [{ turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", attemptCount: 1, userId: "user-1" }], rowCount: 1 }
+      if (sql.includes("event.\"payload\"->>'kind' = 'proposal'")) return { rows: [{ payload: { kind: "proposal", receipt: {
+        revision: 1, nodes: [{ key: "child", taskId: "child-1", status: "queued" }], readyTaskIds: ["child-1"],
+      } } }], rowCount: 1 }
+      if (sql.includes('SELECT item."id"')) return { rows: [{ id: "graph-item", revision, content: snapshot, createdAt: checkedAt }], rowCount: 1 }
+      if (sql.includes('SELECT task."id", task."status", task."role", task."failureReason"')) return { rows: [{ id: "child-1", status: taskStatus, role: "analyst", failureReason: taskFailureReason, result: taskResult }], rowCount: 1 }
+      if (sql.includes('SELECT event."payload"')) return { rows: lifecyclePayload ? [{ type: "task_graph.lifecycle", payload: JSON.parse(lifecyclePayload) }] : [], rowCount: lifecyclePayload ? 1 : 0 }
+      if (sql.includes('session."status" AS "sessionStatus"')) return { rows: [{ ...row, status: taskStatus, sessionStatus: "running", result: taskResult }] , rowCount: 1 }
+      if (sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3')) {
+        taskStatus = String(params?.[2]); taskFailureReason = String(params?.[4]); taskResult = params?.[9] === true ? JSON.parse(String(params?.[10])) as unknown : taskResult
+        return { rows: [], rowCount: 1 }
+      }
+      if (sql.startsWith('UPDATE "agent_items"')) { revision = Number(params?.[5]); return { rows: [{ stepId: "step-1", status: "streaming", phase: null, startedAt: checkedAt, completedAt: null, createdAt: checkedAt }], rowCount: 1 } }
+      if (sql.includes('UPDATE "agent_sessions" AS session') && sql.includes('RETURNING "eventSequence"')) return { rows: [{ eventSequence: "9" }], rowCount: 1 }
+      if (sql.includes('INSERT INTO "agent_events"')) { lifecyclePayload = String(params?.[10]); return { rows: [], rowCount: 1 } }
+      return { rows: [], rowCount: 1 }
+    }), release: vi.fn() }
+    const pool = { connect: vi.fn().mockResolvedValue(client) } as unknown as PgSubagentPool
+
+    const recovered = await recoverExpired(pool, { now: checkedAt, limit: 10 })
+
+    expect(recovered).toMatchObject([{ id: "child-1", status: "failed", failureReason: "task_graph_verification_unverified" }])
+    const storedResult = recovered[0]?.result as Record<string, unknown>
+    expect(taskResult).toEqual(storedResult)
+    const report = parseTaskGraphVerificationReport(storedResult.taskGraphVerificationReport, ["finding-count"])
+    expect(report).toMatchObject({ status: "unverified", reasonCode: "result_invalid", criteria: [{ criterionId: "finding-count", status: "unverified", reasonCode: "result_invalid" }] })
+    expect(report && taskGraphVerificationReportMatchesStatus(report, "failed")).toBe(true)
+    const taskUpdate = calls.find(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))
+    expect(taskUpdate?.[0]).toContain('"result" = CASE WHEN $10 THEN $11::jsonb')
+    expect(taskUpdate?.[1]?.[4]).toBe("task_graph_verification_unverified")
+    expect(taskUpdate?.[1]?.[9]).toBe(true)
+    expect(revision).toBe(2)
+  })
 
   it.each(["aborted", "archived"] as const)("records graph recovery after an expired task in a %s session without publishing to its closed stream", async status => {
     const calls: Array<[string, unknown[]?]> = []

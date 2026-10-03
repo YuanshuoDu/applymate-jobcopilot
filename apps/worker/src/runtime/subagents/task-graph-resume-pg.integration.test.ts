@@ -3869,6 +3869,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   const discoveryFailureOwner = fixture()
   const discoveryRestartOwner = fixture()
   const verificationRepairOwner = fixture()
+  const leaseRecoveryOwner = fixture()
   let artifactOwnerSources: SelectedJobFixtureSources | undefined
   let pool: Pool | undefined
   let redis: Redis | undefined
@@ -3902,6 +3903,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await seed(pool, discoveryFailureOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
     await seed(pool, discoveryRestartOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
     await seed(pool, verificationRepairOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
+    await seed(pool, leaseRecoveryOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
   }, 15_000)
 
   afterEach(async () => {
@@ -3917,7 +3919,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       }
     }
     await attempt("bootstrap close", async () => { await bootstrap?.close() })
-    if (pool) for (const current of [owner, failureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner, discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner]) {
+    if (pool) for (const current of [owner, failureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner, discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, leaseRecoveryOwner]) {
       await attempt("delete outbox for " + current.sessionId, () => pool!.query(
         "DELETE FROM \"agent_outbox\" WHERE \"aggregateId\" = $1", [current.sessionId],
       ))
@@ -7006,6 +7008,153 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     if (!terminalGateLease || !rootTaskId) throw new Error("repair fixture lost its terminal-gate identity")
     expect(await checkTerminalTaskGraph(pool!, terminalGateLease, rootTaskId)).toEqual({ ok: true })
   }, 120_000)
+
+  it("recovers an exhausted typed TaskGraph lease into a wait-consumable report and admits its exact repair", async () => {
+    const [workerQueue, canonical, commandPortModule, turnQueue] = await Promise.all([
+      import("../../queue/production-bootstrap.js"),
+      import("../canonical-turn-runtime.js"),
+      import("./pg-task-graph-command-port.js"),
+      import("../turns/turn-queue.js"),
+    ])
+    const value = leaseRecoveryOwner
+    turnQueueName = turnQueue.TURN_QUEUE_NAME
+    await activateFixtureTurn(pool!, value)
+    const flags: ProductionAgentFlags = {
+      taskGraphPlanningEnabled: true, childExecutionEnabled: true, coordinationEnabled: true,
+      consumeWaitOutcomes: true, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false,
+    }
+    const profile = {
+      provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true,
+      continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false,
+      supportsReasoningSummary: false, supportsResponseContinuation: false, supportsProviderConversation: false,
+      supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low" as const,
+    }
+    const planCallId = `p3-lease-recovery-plan:${value.turnId}`
+    const initialWaitKey = `p3-lease-recovery-wait:${value.turnId}`
+    const repairPlanCallId = `p3-lease-recovery-repair-plan:${value.turnId}`
+    const repairWaitKey = `p3-lease-recovery-repair-wait:${value.turnId}`
+    let executions = 0
+    let initialWaitReportSeen = false
+    let repairPlanAccepted = false
+    const runtime = await canonical.createCanonicalTurnRuntime(pool!, {
+      workerId: value.ownerId, productionFlags: flags,
+      taskGraphCommandPort: commandPortModule.createPgTaskGraphCommandPort(pool!),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => {
+        const execution = ++executions
+        let round = 0
+        const adapter: ModelAdapter = {
+          id: "p3-taskgraph-lease-recovery-root-fixture", profile,
+          async *stream(request) {
+            round += 1
+            if (execution === 1 && round === 1) {
+              yield { type: "tool_call_completed", callId: planCallId, name: "agent.plan", arguments: {
+                expectedRevision: 0,
+                nodes: [{ key: "scout", templateId: "scout", goal: "Read the fixture source before lease recovery", successCriteria: ["Return one evidence-bound candidate"], dependsOn: [], verification: SCOUT_VERIFICATION }],
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if (execution === 1 && round === 2) {
+              const taskIds = planTaskIds(request, planCallId, 1)
+              yield { type: "tool_call_completed", callId: `p3-lease-recovery-initial-wait:${value.turnId}`, name: "agent.wait", arguments: {
+                idempotencyKey: initialWaitKey, taskIds, mode: "all", timeoutMs: 30_000,
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if (execution === 2 && round === 1) {
+              const graph = currentGraphFromRequest(request)
+              const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+              const scout = nodes.find(node => node?.key === "scout")
+              expect(scout?.status).toBe("failed")
+              expectUnverifiedVerificationReport(scout?.verificationReport, "candidate-count")
+              const outcome = waitOutcomeFromRequest(request, 1)
+              expect(outcome.status).toBe("ready")
+              const waitedScout = outcome.tasks.map(record).find(task => task?.role === "scout")
+              expect(waitedScout?.status).toBe("failed")
+              expectUnverifiedVerificationReport(waitedScout?.verificationReport, "candidate-count")
+              initialWaitReportSeen = true
+              const root = await pool!.query<{ rootTaskId: string | null }>(
+                `SELECT "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+                [value.turnId, value.sessionId, value.userId],
+              )
+              const graphRootTaskId = root.rows[0]?.rootTaskId
+              if (!graphRootTaskId || !scout?.taskId || typeof graph?.revision !== "number") throw new Error("Lease recovery fixture lost its graph identity")
+              yield { type: "tool_call_completed", callId: repairPlanCallId, name: "agent.plan", arguments: {
+                expectedRevision: graph.revision,
+                nodes: [{ key: "scout-repair", templateId: "scout", goal: "Repair the exact unverified candidate count", successCriteria: ["Return one evidence-bound candidate"], dependsOn: [], verification: SCOUT_VERIFICATION,
+                  repairOf: { graphRootTaskId, nodeKey: "scout", taskId: scout.taskId, criterionIds: ["candidate-count"] } }],
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if (execution === 2 && round === 2) {
+              const repairTaskIds = planTaskIds(request, repairPlanCallId, 1)
+              const graph = currentGraphFromRequest(request)
+              const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+              const repair = nodes.find(node => node?.key === "scout-repair")
+              expect(repairTaskIds).toHaveLength(1)
+              expect(repair).toMatchObject({ status: "queued", repairOf: { nodeKey: "scout", criterionIds: ["candidate-count"] } })
+              repairPlanAccepted = true
+              yield { type: "tool_call_completed", callId: `p3-lease-recovery-repair-wait:${value.turnId}`, name: "agent.wait", arguments: {
+                idempotencyKey: repairWaitKey, taskIds: repairTaskIds, mode: "all", timeoutMs: 30_000,
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            throw new Error(`Unexpected lease recovery root turn ${execution}/${round}`)
+          },
+        }
+        return { adapter, registry: {} as never, candidates: [] }
+      },
+    })
+    bootstrap = await workerQueue.createProductionWorkerBootstrap({
+      pool: pool!, runtime, ownerId: value.ownerId,
+      turnQueueFactory: turnQueue.createTurnQueue, turnRecoveryIntervalMs: 100,
+      waitResolver: { intervalMs: 10, batchSize: 10, ownerId: `p3-lease-recovery-wait-resolver-${value.suffix}` },
+    })
+    await turnQueue.enqueueTurn(pool!, bootstrap.turns.queue, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
+    const persistedWait = await waitForPersistedTaskWait(pool!, value.turnId, initialWaitKey)
+    const root = await pool!.query<{ rootTaskId: string | null }>(
+      `SELECT "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+      [value.turnId, value.sessionId, value.userId],
+    )
+    const rootTaskId = root.rows[0]?.rootTaskId
+    if (!rootTaskId) throw new Error("Lease recovery fixture root task was not persisted")
+    const target = await pool!.query<{ id: string; maxAttempts: number }>(
+      `SELECT "id", "maxAttempts" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "rootTaskId" = $3 AND "goal" = $4`,
+      [value.turnId, value.sessionId, rootTaskId, "Read the fixture source before lease recovery"],
+    )
+    expect(target.rows).toHaveLength(1)
+    const targetTaskId = target.rows[0]!.id
+    const store = new PgSubagentTaskStore(pool!)
+    const claimed = await store.claim({ taskId: targetTaskId, sessionId: value.sessionId, ownerId: `p3-lease-recovery-child-${value.suffix}`, policy: defaultSubagentPolicy(), now: new Date() })
+    expect(claimed).toMatchObject({ id: targetTaskId, status: "running" })
+    const expired = await pool!.query<{ attemptCount: number; maxAttempts: number }>(
+      `UPDATE "sub_agent_tasks" SET "attemptCount" = "maxAttempts", "leaseExpiresAt" = clock_timestamp() - INTERVAL '1 second'
+       WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running' RETURNING "attemptCount", "maxAttempts"`,
+      [targetTaskId, value.sessionId],
+    )
+    expect(expired.rows[0]?.attemptCount).toBe(expired.rows[0]?.maxAttempts)
+    expect(expired.rows[0]?.maxAttempts).toBe(target.rows[0]!.maxAttempts)
+    const recovered = await store.recoverExpired({ now: new Date(), limit: 10 })
+    const recoveredTarget = recovered.find(task => task.id === targetTaskId)
+    expect(recoveredTarget).toMatchObject({ status: "failed", failureReason: "task_graph_verification_unverified" })
+    expectUnverifiedVerificationReport(record(recoveredTarget?.result)?.taskGraphVerificationReport, "candidate-count")
+
+    await waitForPersistedTaskWait(pool!, value.turnId, repairWaitKey, 45_000)
+    expect(initialWaitReportSeen).toBe(true)
+    expect(repairPlanAccepted).toBe(true)
+    const consumedWait = await pool!.query<{ consumedAt: Date | null; result: unknown }>(
+      `SELECT "consumedAt", "result" FROM "agent_wait_conditions" WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "turnId" = $4`,
+      [persistedWait.id, value.userId, value.sessionId, value.turnId],
+    )
+    expect(consumedWait.rows[0]?.consumedAt).toEqual(expect.any(Date))
+    const consumedOutcome = record(record(consumedWait.rows[0]?.result)?.outcome)
+    const consumedScout = Array.isArray(consumedOutcome?.tasks) ? consumedOutcome.tasks.map(record).find(task => task?.role === "scout") : null
+    expectUnverifiedVerificationReport(consumedScout?.verificationReport, "candidate-count")
+  }, 90_000)
 
   it("stops an exact TaskGraph Turn, projects interrupted receipts, and removes every unpublished graph dispatch", async () => {
     const { taskGraphItemId } = await import("./task-graph-snapshot.js")
