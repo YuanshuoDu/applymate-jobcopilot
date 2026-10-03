@@ -350,8 +350,17 @@ const ERROR_DIAGNOSTIC_CODES = new Set([
   "task_graph_sensitive_key_rejected", "task_graph_state_missing", "task_graph_receipt_invalid",
   "task_graph_schedule_failed", "task_graph_dispatch_conflict", "task_graph_dependency_blocked",
   "task_graph_dependency_task_missing", "task_graph_child_wait_state_failed", "revision_mismatch",
-  "task_graph_revision_mismatch", "revision_limit", "idempotency_conflict",
+  "task_graph_revision_mismatch", "task_graph_verification_failed", "task_graph_verification_unverified",
+  "revision_limit", "idempotency_conflict",
 ])
+const DISCOVERY_DIAGNOSTIC_ROLES = new Set(["scout", "analyst"])
+const TASK_GRAPH_VERIFICATION_STATUSES = new Set(["passed", "failed", "unverified"])
+const TASK_GRAPH_VERIFICATION_REASONS = new Set([
+  "criteria_met", "criterion_not_met", "reported_score_below_minimum", "contract_invalid", "projection_invalid",
+  "role_mismatch", "canonical_evidence_missing", "canonical_evidence_invalid", "canonical_evidence_ambiguous",
+  "result_invalid", "result_ambiguous", "result_evidence_unbound", "repair_target_unresolved",
+])
+const DISCOVERY_DIAGNOSTIC_CRITERIA = new Set(["candidate-count", "finding-count"])
 const WAIT_HANDOFF_ERROR_CODES = new Set([
   "40P01", "40001", "55P03", "57014", "23505", "23503", "wait_handoff_unavailable",
   "wait_invalid", "wait_scope_error", "lease_lost",
@@ -456,6 +465,35 @@ function diagnosticErrorCode(value: unknown): string | null {
   if (typeof value !== "string") return null
   if (ERROR_DIAGNOSTIC_CODES.has(value)) return value
   return /^task_graph_[a-z0-9_]{1,80}$/.test(value) ? "task_graph_other" : "other"
+}
+
+function diagnosticDiscoveryTasks(values: readonly unknown[]): RecordValue[] {
+  return values.filter(value => {
+    const task = record(value)
+    return diagnosticEnum(task?.role, DISCOVERY_DIAGNOSTIC_ROLES) !== null
+  }).slice(0, 4).map(value => {
+    const task = record(value)
+    const result = record(task?.result)
+    const report = record(result?.taskGraphVerificationReport)
+    const criteria = Array.isArray(report?.criteria) ? report.criteria.slice(0, 4).map(value => {
+      const criterion = record(value)
+      return {
+        criterionId: diagnosticEnum(criterion?.criterionId, DISCOVERY_DIAGNOSTIC_CRITERIA) ?? "other",
+        status: diagnosticEnum(criterion?.status, TASK_GRAPH_VERIFICATION_STATUSES) ?? "other",
+        reasonCode: diagnosticEnum(criterion?.reasonCode, TASK_GRAPH_VERIFICATION_REASONS) ?? "other",
+      }
+    }) : []
+    return {
+      role: diagnosticEnum(task?.role, DISCOVERY_DIAGNOSTIC_ROLES) ?? "other",
+      status: diagnosticEnum(task?.status, TASK_DIAGNOSTIC_STATUSES) ?? "other",
+      failureReasonCode: diagnosticErrorCode(task?.failureReason),
+      taskGraphVerificationReport: report ? {
+        status: diagnosticEnum(report.status, TASK_GRAPH_VERIFICATION_STATUSES) ?? "other",
+        reasonCode: diagnosticEnum(report.reasonCode, TASK_GRAPH_VERIFICATION_REASONS) ?? "other",
+        criteria,
+      } : null,
+    }
+  })
 }
 
 function diagnosticEnumList(value: unknown, allowed: ReadonlySet<string>, maxItems = 8): string[] {
@@ -1543,6 +1581,17 @@ async function prepareSelectedJobReviewAfterRestart(
   const completedWriter = await trace.store.get(trace.writerTask.id, value.sessionId)
   expect(completedWriter).toMatchObject({ status: "completed", role: "writer", rootTaskId: trace.rootTaskId, parentTaskId: trace.rootTaskId })
   if (!completedWriter) throw new Error("Completed selected-job Writer task disappeared")
+  const completedWriterResult = record(completedWriter.result)
+  const expectedWriterResult = {
+    schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef: trace.artifactRef,
+  }
+  expect(completedWriterResult?.structuredResult).toEqual(expectedWriterResult)
+  // The specialized dependency contract requires the public result envelope's
+  // finalText. Rebuild its safe canonical JSON from the verified artifact ref
+  // when this fixture row omits it; never synthesize verifier metadata.
+  const writerDependencyResult = typeof completedWriterResult?.finalText === "string"
+    ? completedWriter.result
+    : { ...(completedWriterResult ?? {}), finalText: JSON.stringify(expectedWriterResult) }
   const workerTwoSources = selectedJobSourceCanaries(trace.jobId, 2)
   const updatedSources = await Promise.all([
     pool.query(`UPDATE "Job" SET "description" = $3, "updatedAt" = CURRENT_TIMESTAMP
@@ -1566,7 +1615,7 @@ async function prepareSelectedJobReviewAfterRestart(
     reviewerContext = materializeTaskGraphDependencyContext(
       { selectedJobPreparation: { jobId: trace.jobId } }, dependencyScope, ["writer"], [{
         ...dependencyScope, key: "writer", taskId: completedWriter.id, status: completedWriter.status,
-        role: completedWriter.role, expectedOutputSchema: completedWriter.expectedOutputSchema, result: completedWriter.result,
+        role: completedWriter.role, expectedOutputSchema: completedWriter.expectedOutputSchema, result: writerDependencyResult,
         verificationDisposition: "specialized",
       }],
     )
@@ -6643,8 +6692,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       workerTwo = startTaskGraphRestartWorker("resume-discovery", { ...value, jobId })
       await waitForProcessLine(workerTwo, "P3_DISCOVERY_SECOND_WORKER_READY ", 45_000)
       const collectRestartDiscoveryDiagnostics = async () => {
-        const tasks = await pool!.query<{ id: string; status: string }>(
-          `SELECT "id", "status" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2`,
+        const tasks = await pool!.query<{ id: string; role: string; status: string; failureReason: string | null; result: unknown }>(
+          `SELECT "id", "role", "status", "failureReason", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2`,
           [value.turnId, value.sessionId],
         )
         const toolReceipts = await pool!.query<{ callCount: number; resultCount: number }>(
@@ -6685,6 +6734,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           jobsSearchCallCount: callCount,
           jobsSearchResultCount: resultCount,
           taskStatusCounts: diagnosticStatusCounts(taskStatusCounts),
+          childTasks: diagnosticDiscoveryTasks(tasks.rows),
           waitStatuses,
           waitTargetCounts: waits.rows.map(wait => diagnosticBoundedCount(wait.targetCount)),
         }
@@ -6970,8 +7020,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     })
 
     const collectCanonicalDiscoveryDiagnostics = async () => {
-      const tasks = await pool!.query<{ id: string; status: string }>(
-        `SELECT "id", "status" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2`,
+      const tasks = await pool!.query<{ id: string; role: string; status: string; failureReason: string | null; result: unknown }>(
+        `SELECT "id", "role", "status", "failureReason", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2`,
         [discoveryOwner.turnId, discoveryOwner.sessionId],
       )
       const toolReceipts = await pool!.query<{ callCount: number; resultCount: number }>(
@@ -7001,6 +7051,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         jobsSearchCallCount: searchCalls,
         jobsSearchResultCount: searchResults,
         taskStatusCounts: diagnosticStatusCounts(taskStatusCounts),
+        childTasks: diagnosticDiscoveryTasks(tasks.rows),
       }
     }
     await enqueueTurn(pool!, bootstrap.turns.queue, { turnId: discoveryOwner.turnId, sessionId: discoveryOwner.sessionId, ownerId: discoveryOwner.ownerId })

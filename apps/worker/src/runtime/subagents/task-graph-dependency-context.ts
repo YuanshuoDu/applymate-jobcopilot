@@ -18,9 +18,16 @@ export function resolveTaskGraphRepairDependencies(snapshot: TaskGraphSnapshot, 
   for (const node of snapshot.nodes) {
     const task = tasks.get(node.taskId), ids = node.verification?.criteria.map(item => item.id) ?? [], result = parseResult(task?.result)
     const report = node.verificationDisposition === "typed" ? parseTaskGraphVerificationReport(isPlainRecord(result) ? result.taskGraphVerificationReport : undefined, ids) : undefined
-    if (task?.status === "failed" && report && taskGraphVerificationReportMatchesStatus(report, task.status) && task.failureReason === `task_graph_verification_${report.status}`) {
-      const failed = report.criteria.filter(item => item.status !== "passed").map(item => item.criterionId)
-      if (failed.length) { unresolved.set(node.key, new Set(failed)); coverage.set(node.key, new Map()) }
+    const evidenceBound = typeof report?.evidenceDigest === "string" && /^[a-f0-9]{64}$/.test(report.evidenceDigest)
+    const unresolvedCriteria = report?.criteria.filter(item => item.status !== "passed").map(item => item.criterionId) ?? []
+    const explicitRepair = report?.status === "unverified" && report.evidenceDigest === null && snapshot.nodes.some(repair => {
+      const relation = repair.repairOf
+      return relation?.graphRootTaskId === rootTaskId && relation.nodeKey === node.key && relation.taskId === node.taskId
+        && relation.criterionIds.every(id => unresolvedCriteria.includes(id))
+    })
+    if (task?.status === "failed" && report && (evidenceBound || explicitRepair)
+      && taskGraphVerificationReportMatchesStatus(report, task.status) && task.failureReason === `task_graph_verification_${report.status}`) {
+      if (unresolvedCriteria.length) { unresolved.set(node.key, new Set(unresolvedCriteria)); coverage.set(node.key, new Map()) }
     }
   }
   for (const repair of snapshot.nodes) {

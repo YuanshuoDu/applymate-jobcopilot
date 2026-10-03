@@ -4,6 +4,7 @@ import type pg from "pg"
 import { prepareGraphTransition, reconcileGraphDependents } from "./task-graph-pg-lifecycle.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-pg-verification.js"
 
 function fakeGraphClient(status: string, options: { proposalPayloads?: unknown[]; snapshot?: unknown; missingItem?: boolean; taskStatuses?: Record<string, string> } = {}) {
   const snapshot = options.snapshot ?? { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{
@@ -140,6 +141,78 @@ describe("reconcileGraphDependents", () => {
     await expect(reconcileGraphDependents(client as unknown as Pick<pg.PoolClient, "query">, scope, new Date("2026-09-02T00:00:00.000Z"))).resolves.toBeUndefined()
 
     expect(client.query.mock.calls.every(([sql]) => sql.trimStart().startsWith("SELECT"))).toBe(true)
+  })
+
+  it.each(["waiting", "queued"] as const)("cancels a %s dependent after an unverified typed prerequisite failure", async dependentStatus => {
+    const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" }
+    const verification = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
+      criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }],
+    }
+    const snapshot = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
+      { key: "prerequisite", templateId: "analyst", goal: "Analyze", successCriteria: ["done"], dependsOn: [], depth: 1, taskId: "prerequisite-1", verificationDisposition: "typed", verification },
+      { key: "dependent", templateId: "analyst", goal: "Continue", successCriteria: ["done"], dependsOn: ["prerequisite"], depth: 2, taskId: "dependent-1", verificationDisposition: "typed", verification },
+    ] }
+    const report = {
+      verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "result_invalid",
+      criteria: [{ criterionId: "finding-count", status: "unverified", reasonCode: "result_invalid" }],
+      evidenceDigest: null, resultDigest: null,
+    }
+    const tasks = new Map([
+      ["prerequisite-1", { id: "prerequisite-1", status: "failed", role: "analyst", failureReason: "task_graph_verification_unverified", result: { taskGraphVerificationReport: report }, turnId: scope.turnId, rootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId, userId: scope.userId, attemptCount: 1 }],
+      ["dependent-1", { id: "dependent-1", status: dependentStatus, role: "analyst", failureReason: null, result: null, turnId: scope.turnId, rootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId, userId: scope.userId, attemptCount: 0 }],
+    ])
+    const itemId = taskGraphItemId(scope.rootTaskId)
+    const proposalPayload = { kind: "proposal", fingerprint: "fixture-proposal", revision: 2, receipt: {
+      status: "accepted", revision: 2,
+      nodes: [
+        { key: "prerequisite", taskId: "prerequisite-1", status: "queued" },
+        { key: "dependent", taskId: "dependent-1", status: dependentStatus },
+      ],
+      readyTaskIds: ["prerequisite-1", ...(dependentStatus === "queued" ? ["dependent-1"] : [])],
+    } }
+    const events: Array<{ type: string; payload: unknown }> = []
+    let revision = 2
+    const client = {
+      query: vi.fn(async (sql: string, values?: unknown[]) => {
+        if (sql.includes('SELECT task."turnId"')) {
+          const row = tasks.get(String(values?.[0]))
+          return { rows: row ? [{ turnId: row.turnId, rootTaskId: row.rootTaskId, parentTaskId: row.parentTaskId, attemptCount: row.attemptCount, userId: row.userId }] : [], rowCount: row ? 1 : 0 }
+        }
+        if (sql.includes("event.\"payload\"->>'kind' = 'proposal'")) return { rows: [{ payload: proposalPayload }], rowCount: 1 }
+        if (sql.includes('SELECT item."id"')) return { rows: [{
+          id: itemId, revision, content: snapshot, createdAt: new Date("2026-09-01T00:00:00.000Z"),
+        }], rowCount: 1 }
+        if (sql.includes('SELECT task."id", task."status"')) {
+          const ids = values?.[0] as string[]
+          return { rows: ids.map(id => tasks.get(id)).filter(Boolean), rowCount: ids.length }
+        }
+        if (sql.includes('SELECT event."type", event."payload"')) return { rows: events, rowCount: events.length }
+        if (sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = \'cancelled\'')) {
+          const row = tasks.get(String(values?.[0]))
+          if (row) row.status = "cancelled"
+          return { rows: [], rowCount: row ? 1 : 0 }
+        }
+        if (sql.startsWith('UPDATE "agent_items" AS item')) {
+          revision = Number(values?.[5])
+          return { rows: [{ stepId: null, status: "streaming", phase: null, startedAt: new Date("2026-09-01T00:00:00.000Z"), completedAt: null, createdAt: new Date("2026-09-01T00:00:00.000Z") }], rowCount: 1 }
+        }
+        if (sql.startsWith('UPDATE "agent_sessions" AS session')) return { rows: [{ eventSequence: "11" }], rowCount: 1 }
+        if (sql.startsWith('INSERT INTO "agent_events"')) {
+          events.push({ type: String(values?.[6]), payload: JSON.parse(String(values?.[10])) as unknown })
+          return { rows: [], rowCount: 1 }
+        }
+        if (sql.startsWith('INSERT INTO "agent_outbox"') || sql.startsWith('DELETE FROM "agent_outbox"')) return { rows: [], rowCount: 1 }
+        return { rows: [], rowCount: 0 }
+      }),
+    }
+
+    await reconcileGraphDependents(client as unknown as Pick<pg.PoolClient, "query">, scope, new Date("2026-09-02T00:00:00.000Z"))
+
+    expect(tasks.get("dependent-1")?.status).toBe("cancelled")
+    expect(events).toContainEqual(expect.objectContaining({ type: "item.delta", payload: expect.objectContaining({ kind: "lifecycle", event: expect.objectContaining({ type: "task.cancelled", nodeKey: "dependent" }) }) }))
+    expect(client.query.mock.calls.some(([sql, params]) => sql.startsWith('DELETE FROM "agent_outbox"') && params?.[1] === "subagent-dispatch:dependent-1")).toBe(true)
+    expect(client.query.mock.calls.some(([sql, params]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = \'cancelled\'') && params?.[0] === "dependent-1" && params?.[7] === dependentStatus)).toBe(true)
   })
 
   it.each([

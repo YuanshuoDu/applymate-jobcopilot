@@ -81,7 +81,6 @@ const SELECT_ROOT = `SELECT task.*, session."userId" AS "userId"
   WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3`
 
 const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "interrupted", "cancelled", "closed"])
-
 function completionBlocker(rows: readonly Row[]): TurnEngineCompletionGateResult {
   const pending = rows.filter(row => !TERMINAL_TASK_STATUSES.has(String(row.status)))
   if (pending.length === 0) return { ok: true }
@@ -166,7 +165,11 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
         )
         for (const row of descendants.rows) if (String(row.sessionId) !== input.lease.sessionId || String(row.turnId) !== input.lease.turnId || String(row.rootTaskId) !== input.rootTaskId || String(row.userId) !== input.lease.userId) throw new Error("root_task_fenced")
         const children = completionBlocker(descendants.rows)
-        return !children.ok || !input.taskGraphVerification ? children : checkTaskGraphTerminalVerification(client, input.lease, input.rootTaskId)
+        if (input.taskGraphVerification && (children.ok || descendants.rows.every(row => row.status === "waiting"))) {
+          const graph = await checkTaskGraphTerminalVerification(client, input.lease, input.rootTaskId)
+          if (!graph.ok) return graph
+        }
+        return children
       }
       return input.client ? work(input.client) : transaction(pool, input.lease.userId, work)
     },
