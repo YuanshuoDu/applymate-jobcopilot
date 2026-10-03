@@ -20,6 +20,7 @@ import type { ProductionAgentFlags } from "../production-agent-flags.js"
 import type { ProductionWorkerBootstrap, createProductionWorkerBootstrap } from "../../queue/production-bootstrap.js"
 import { createAgentArtifactRepository, findCurrentDraftHeadWithClient, findReviewReceiptWithClient, type AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
 import { createArtifactToolStore } from "../tools/artifact-tools.js"
+import { createPgDurableWaitPort } from "./durable-wait-store.js"
 import { childContextSnapshot, createChildContextBuilder } from "./child-context.js"
 import { hashArtifactContent } from "./artifact-adapters.js"
 import { loadSelectedJobArtifactContext, readSelectedJobSourceDigestWithClient, resolveCoverLetterBase } from "./selected-job-artifact-context.js"
@@ -193,6 +194,91 @@ function recordTaskGraphFixtureLease(
 
 function record(value: unknown): RecordValue | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as RecordValue : null
+}
+
+function deferredSignal<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>(resolvePromise => { resolve = resolvePromise })
+  return { promise, resolve }
+}
+
+async function withinIntegrationDeadline<T>(promise: Promise<T>, message: string, timeoutMs = 5_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+function sessionLockBarrierPool(pool: Pool) {
+  const connected = deferredSignal<number>()
+  const sessionLockReturned = deferredSignal<number>()
+  const releaseQuery = deferredSignal<void>()
+  let paused = false
+  const barrierPool = {
+    connect: async () => {
+      const client = await pool.connect()
+      let backendPid: number
+      try {
+        const result = await client.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")
+        backendPid = Number(result.rows[0]?.pid)
+        if (!Number.isSafeInteger(backendPid)) throw new Error("Disposable PostgreSQL backend PID is unavailable")
+        connected.resolve(backendPid)
+      } catch (error) {
+        client.release()
+        throw error
+      }
+
+      const query = client.query.bind(client) as unknown as (...args: unknown[]) => Promise<unknown>
+      return new Proxy(client, {
+        get(target, property, receiver) {
+          if (property === "query") {
+            return async (...args: unknown[]) => {
+              const queryInput = args[0]
+              const sql = typeof queryInput === "string" ? queryInput : String(record(queryInput)?.text ?? "")
+              const result = await query(...args)
+              if (!paused && sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) {
+                paused = true
+                sessionLockReturned.resolve(backendPid)
+                await releaseQuery.promise
+              }
+              return result
+            }
+          }
+          if (property === "release") return target.release.bind(target)
+          return Reflect.get(target, property, receiver)
+        },
+      })
+    },
+  } as unknown as Pick<Pool, "connect">
+
+  return {
+    pool: barrierPool,
+    connected: connected.promise,
+    sessionLockReturned: sessionLockReturned.promise,
+    release: () => releaseQuery.resolve(undefined),
+  }
+}
+
+async function waitForSessionTupleBlock(pool: Pool, blockerPid: number, blockedPid: number): Promise<void> {
+  const deadline = Date.now() + 5_000
+  while (Date.now() < deadline) {
+    const activity = await pool.query<{ waiting: boolean }>(`SELECT EXISTS (
+      SELECT 1 FROM pg_stat_activity AS waiter
+      WHERE waiter.pid = $2 AND waiter.state = 'active' AND waiter.wait_event_type = 'Lock'
+        AND $1::int = ANY(pg_blocking_pids(waiter.pid))
+        AND waiter.query LIKE '%FROM "agent_sessions"%' AND waiter.query LIKE '%FOR UPDATE%'
+    ) AS "waiting"`, [blockerPid, blockedPid])
+    if (activity.rows[0]?.waiting === true) return
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+  throw new Error(`Backend ${blockedPid} did not wait on the session row held by backend ${blockerPid}`)
 }
 
 function diagnosticValueType(value: unknown): string {
@@ -5077,6 +5163,112 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
     }
   }, 45_000)
+
+  it.each(["durable wait", "TurnEngine updateStep"] as const)(
+    "serializes DurableWait.wait and TurnEngine.updateStep when %s wins the session lock",
+    async lockWinner => {
+      const value = fixture()
+      let waitBarrier: ReturnType<typeof sessionLockBarrierPool> | undefined
+      let stepBarrier: ReturnType<typeof sessionLockBarrierPool> | undefined
+      let waitOperation: Promise<unknown> | undefined
+      let stepOperation: Promise<unknown> | undefined
+      const pendingOperations = () => [waitOperation, stepOperation].filter((operation): operation is Promise<unknown> => operation !== undefined)
+      try {
+        const prepared = await prepareSelectedJobTerminalCase(pool!, value)
+        const targetRows = await pool!.query<{ id: string }>(`SELECT "id" FROM "sub_agent_tasks"
+          WHERE "sessionId" = $1 AND "turnId" = $2 AND "parentTaskId" = $3 AND "status" = 'completed'
+          ORDER BY "id" LIMIT 2`, [value.sessionId, value.turnId, prepared.root.id])
+        const targetTaskIds = targetRows.rows.map(row => row.id)
+        expect(targetTaskIds).toHaveLength(2)
+
+        waitBarrier = sessionLockBarrierPool(pool!)
+        stepBarrier = sessionLockBarrierPool(pool!)
+        const waitStore = createPgDurableWaitPort(waitBarrier.pool)
+        const turnEngine = createPgTurnEngineStore(stepBarrier.pool)
+        const waitKey = `p3-session-first-wait-${value.suffix}`
+        const waitInput = {
+          userId: value.userId, sessionId: value.sessionId, turnId: value.turnId, stepId: prepared.stepId,
+          taskId: prepared.root.id, rootTaskId: prepared.root.id, targetTaskIds, mode: "all" as const,
+          timeoutMs: 30_000, idempotencyKey: waitKey,
+        }
+        const updateStep = () => turnEngine.updateStep({
+          owner: prepared.terminalInput.owner, stepId: prepared.stepId, status: "completed", finishReason: "stop",
+          errorCode: null, inputTokens: 7, outputTokens: 11, estimatedCostUsd: 0.123, now: new Date(Date.now() + 1_000),
+        })
+        const createWait = () => waitStore.wait(waitInput)
+        const winnerBarrier = lockWinner === "durable wait" ? waitBarrier : stepBarrier
+        const loserBarrier = lockWinner === "durable wait" ? stepBarrier : waitBarrier
+
+        try {
+          if (lockWinner === "durable wait") {
+            waitOperation = createWait()
+            void waitOperation.catch(() => undefined)
+          } else {
+            stepOperation = updateStep()
+            void stepOperation.catch(() => undefined)
+          }
+          const winnerPid = await withinIntegrationDeadline(winnerBarrier.connected, "Session-lock winner did not connect")
+          expect(await withinIntegrationDeadline(winnerBarrier.sessionLockReturned, "Winner did not return from its session FOR UPDATE")).toBe(winnerPid)
+
+          if (lockWinner === "durable wait") {
+            stepOperation = updateStep()
+            void stepOperation.catch(() => undefined)
+          } else {
+            waitOperation = createWait()
+            void waitOperation.catch(() => undefined)
+          }
+          const loserPid = await withinIntegrationDeadline(loserBarrier.connected, "Session-lock competitor did not connect")
+          expect(loserPid).not.toBe(winnerPid)
+          await waitForSessionTupleBlock(pool!, winnerPid, loserPid)
+        } finally {
+          waitBarrier.release()
+          stepBarrier.release()
+        }
+
+        if (!waitOperation || !stepOperation) throw new Error("Both session-lock operations must start")
+        const settled = await withinIntegrationDeadline(
+          Promise.allSettled([waitOperation, stepOperation]),
+          "Durable wait and TurnEngine operations did not settle after releasing the session lock",
+          10_000,
+        )
+        const deadlockCodes = settled.flatMap(outcome => outcome.status === "rejected"
+          ? [record(outcome.reason)?.code]
+          : [])
+        expect(deadlockCodes).not.toContain("40P01")
+        const [waitResult, stepResult] = settled
+        expect(waitResult.status).toBe("fulfilled")
+        expect(stepResult.status).toBe("fulfilled")
+        if (waitResult.status === "rejected") throw waitResult.reason
+        if (stepResult.status === "rejected") throw stepResult.reason
+        expect(waitResult.value).toMatchObject({ status: "ready", matchedTaskIds: targetTaskIds })
+
+        const persistedWait = await pool!.query<{ status: string; matchedTaskIds: string[] }>(
+          `SELECT "status", "matchedTaskIds" FROM "agent_wait_conditions"
+           WHERE "parentTaskId" = $1 AND "idempotencyKey" = $2`, [prepared.root.id, waitKey],
+        )
+        expect(persistedWait.rows).toHaveLength(1)
+        expect(persistedWait.rows[0]?.status).toBe("ready")
+        expect(new Set(persistedWait.rows[0]?.matchedTaskIds)).toEqual(new Set(targetTaskIds))
+        const persistedStep = await pool!.query<{
+          status: string; inputTokens: number; outputTokens: number; estimatedCostUsd: string | number
+        }>(`SELECT "status", "inputTokens", "outputTokens", "estimatedCostUsd" FROM "agent_steps"
+          WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`, [prepared.stepId, value.sessionId, value.turnId])
+        expect(persistedStep.rows).toHaveLength(1)
+        expect(persistedStep.rows[0]).toMatchObject({ status: "completed", inputTokens: 7, outputTokens: 11 })
+        expect(Number(persistedStep.rows[0]?.estimatedCostUsd)).toBeCloseTo(0.123)
+      } finally {
+        waitBarrier?.release()
+        stepBarrier?.release()
+        const operations = pendingOperations()
+        if (operations.length > 0) {
+          await withinIntegrationDeadline(Promise.allSettled(operations), "Session-lock operations did not settle during cleanup", 10_000)
+            .catch(() => undefined)
+        }
+        await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [value.sessionId])
+        await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
+      }
+    },
+  )
 
   it("rolls back finalization while an eligible source insert holds the User foreign-key lock", async () => {
     const value = fixture()
