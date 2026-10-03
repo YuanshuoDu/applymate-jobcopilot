@@ -42,6 +42,7 @@ import { taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const PLAN_CALL_ID = "p3-resume-plan"
 const WAIT_CALL_ID = "p3-resume-wait"
+const DISCOVERY_RESTART_WAIT_CALL_ID = "p3-process-restart-discovery-wait-call"
 const FOLLOW_UP_PLAN_CALL_ID = "p3-resume-follow-up-plan"
 const FOLLOW_UP_WAIT_CALL_ID = "p3-resume-follow-up-wait"
 const RESTART_FOLLOW_UP_GOAL = "Verify the restored TaskGraph summary after restart"
@@ -6189,7 +6190,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
 
       workerTwo = startTaskGraphRestartWorker("resume-discovery", { ...value, jobId })
       await waitForProcessLine(workerTwo, "P3_DISCOVERY_SECOND_WORKER_READY ", 45_000)
-      await waitForTurnStatus(pool!, value.turnId, "completed", 90_000)
+      await waitForTurnStatus(pool!, value.turnId, "completed", 90_000, DISCOVERY_RESTART_WAIT_CALL_ID)
 
       const root = await pool!.query<{ id: string; status: string; result: unknown }>(
         `SELECT "id", "status", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "role" = 'orchestrator'`,
