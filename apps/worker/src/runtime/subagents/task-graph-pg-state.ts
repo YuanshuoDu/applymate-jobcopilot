@@ -190,7 +190,8 @@ export function currentTaskGraph(loaded: LoadedGraph): TaskGraphCurrentState {
       || stored.verificationDisposition === "typed" && (task.status === "completed" || task.status === "failed") && !verificationReport
       || hasReceipt && !repairReceipt
       || stored.repairOf && task.status === "completed" && verificationReport?.status === "passed" && !repairReceipt) throw new Error("task_graph_verification_report_invalid")
-    const proposedProjection = projectTaskGraphResult(task.role, task.status, task.result)
+    const projectionSource = taskGraphProjectionSource(task.result, taskResult, Boolean(verificationReport), Boolean(repairReceipt))
+    const proposedProjection = projectTaskGraphResult(task.role, task.status, projectionSource)
     const bytes = taskGraphResultProjectionBytes(proposedProjection)
     const items = taskGraphResultProjectionItemCount(proposedProjection)
     const projectionFits = projectionBytes + bytes <= TASK_GRAPH_RESULT_PROJECTION_TOTAL_BYTE_LIMIT
@@ -212,6 +213,21 @@ export function currentTaskGraph(loaded: LoadedGraph): TaskGraphCurrentState {
     }
   })
   return { revision: loaded.state.revision, nodes }
+}
+
+function taskGraphProjectionSource(
+  original: unknown,
+  result: Record<string, unknown> | null,
+  hasValidatedReport: boolean,
+  hasValidatedReceipt: boolean,
+): unknown {
+  if (!result || (!hasValidatedReport && !hasValidatedReceipt)) return original
+  const copy = Object.create(Object.getPrototypeOf(result)) as Record<PropertyKey, unknown>
+  for (const key of Reflect.ownKeys(result)) {
+    if ((hasValidatedReport && key === "taskGraphVerificationReport") || (hasValidatedReceipt && key === "taskGraphRepairReceipt")) continue
+    Object.defineProperty(copy, key, Object.getOwnPropertyDescriptor(result, key)!)
+  }
+  return copy
 }
 
 function resultSummary(value: unknown): string | null {

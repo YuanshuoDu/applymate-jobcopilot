@@ -46,9 +46,17 @@ const analystVerification = {
   schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
   criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }],
 } as const
+const scoutVerification = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+  criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }],
+} as const
 const findingReport = {
   verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status: "failed", reasonCode: "criterion_not_met",
   criteria: [{ criterionId: "finding-count", status: "failed", reasonCode: "criterion_not_met" }], evidenceDigest: "a".repeat(64), resultDigest: "e".repeat(64),
+} as const
+const passedFindingReport = {
+  verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status: "passed", reasonCode: "criteria_met",
+  criteria: [{ criterionId: "finding-count", status: "passed", reasonCode: "criteria_met" }], evidenceDigest: "b".repeat(64), resultDigest: "f".repeat(64),
 } as const
 
 function typedSnapshot() {
@@ -309,6 +317,69 @@ describe("TaskGraph PostgreSQL state loading", () => {
     expect(JSON.stringify(projection)).not.toContain("Jane Doe")
     expect(JSON.stringify(projection)).not.toContain("private.example")
     expect(JSON.stringify(projection)).not.toContain("private-evidence-id")
+  })
+
+  it("projects valid typed verification wrappers while leaving unrelated envelope keys invalid", async () => {
+    const snapshot = {
+      ...validSnapshot(),
+      nodes: validSnapshot().nodes.map(node => ({
+        ...node, templateId: "scout", verificationDisposition: "typed" as const, verification: scoutVerification,
+      })),
+    }
+    const verifiedResult = {
+      ...completedEnvelope(scoutResult()),
+      taskGraphVerificationReport: {
+        verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status: "passed", reasonCode: "criteria_met",
+        criteria: [{ criterionId: "candidate-count", status: "passed", reasonCode: "criteria_met" }],
+        evidenceDigest: "c".repeat(64), resultDigest: "d".repeat(64),
+      },
+    }
+    const valid = fakeClient({ itemContent: snapshot, taskRows: [validTaskRow({ status: "completed", role: "scout", result: verifiedResult })] })
+    expect(currentTaskGraph(await loadTaskGraph(valid.client, identity)).nodes[0]?.resultProjection).toMatchObject({
+      availability: "available", role: "scout", candidateCount: 1,
+      candidates: [{ jobId: "job-42", evidenceKinds: ["job"] }],
+    })
+
+    const extra = fakeClient({
+      itemContent: snapshot,
+      taskRows: [validTaskRow({ status: "completed", role: "scout", result: { ...verifiedResult, unexpected: true } })],
+    })
+    expect(currentTaskGraph(await loadTaskGraph(extra.client, identity)).nodes[0]?.resultProjection).toEqual({
+      schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "unavailable",
+    })
+  })
+
+  it("projects a valid repair wrapper after checking its report and receipt", async () => {
+    const snapshot = typedSnapshot()
+    const target = snapshot.nodes[0]!
+    const repair = {
+      ...target, key: "repair", taskId: "child-2", repairOf: {
+        graphRootTaskId: "root-1", nodeKey: target.key, taskId: target.taskId, criterionIds: ["finding-count"],
+      },
+    }
+    const receipt = {
+      schemaVersion: TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION, graphRootTaskId: "root-1",
+      targetNodeKey: target.key, targetTaskId: target.taskId, criterionIds: ["finding-count"],
+      repairNodeKey: "repair", repairTaskId: "child-2", verifierVersion: "agent-harness.v2.task-graph-verifier.v1",
+      evidenceDigest: passedFindingReport.evidenceDigest,
+    }
+    const structuredResult = {
+      schemaVersion: "agent-harness.v2.subagent.result", role: "analyst", status: "completed",
+      findings: [{ jobId: "job-42", score: 8, evidenceIds: ["private-evidence-id"] }],
+      evidence: [{ id: "private-evidence-id", kind: "job", ref: "job-42", source: "greenhouse" }], summary: "Scored the fixture role",
+    }
+    const fake = fakeClient({ itemContent: { ...snapshot, nodes: [target, repair] }, taskRows: [
+      validTaskRow({ status: "failed", role: "analyst", result: { taskGraphVerificationReport: findingReport } }),
+      validTaskRow({ id: "child-2", status: "completed", role: "analyst", result: {
+        ...completedEnvelope(structuredResult), taskGraphVerificationReport: passedFindingReport, taskGraphRepairReceipt: receipt,
+      } }),
+    ] })
+    const nodes = currentTaskGraph(await loadTaskGraph(fake.client, identity)).nodes
+    expect(nodes[1]?.resultProjection).toMatchObject({
+      availability: "available", role: "analyst", findingCount: 1,
+      findings: [{ jobId: "job-42", score: 8, evidenceKinds: ["job"] }],
+    })
+    expect(nodes[1]?.repairReceipt).toEqual(receipt)
   })
 
   it("uses an unavailable marker for an invalid role schema or an oversized persisted envelope", async () => {
