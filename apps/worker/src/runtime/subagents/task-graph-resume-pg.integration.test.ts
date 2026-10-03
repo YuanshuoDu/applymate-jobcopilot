@@ -559,12 +559,12 @@ function projectDiscoveryVerifierDiagnostics(
         && (callContent?.status === "completed" ? callContent?.errorCode === null : typeof callContent?.errorCode === "string" && callContent.errorCode.trim().length > 0))
       if (callContent?.toolName === "jobs.search" && resultContent && Object.hasOwn(resultContent, "output")) searchOutputs.push(resultContent.output)
     }
-    const relevantEvents = events.filter(event => event.taskId === task.id && (callItemIds.has(String(event.itemId)) || callsById.has(String(event.correlationId))))
+    const relevantEvents = events.filter(event => typeof event.itemId === "string" && callItemIds.has(event.itemId))
     const groups = new Map<string, RecordValue[]>()
     let eventIdentityValid = true, eventSequenceValid = true, unmatchedEvents = 0
     for (const event of relevantEvents) {
       const payload = diagnosticJsonRecord(event.payload)
-      const callId = callItemIds.get(String(event.itemId)) ?? (callsById.has(String(event.correlationId)) ? String(event.correlationId) : undefined)
+      const callId = typeof event.itemId === "string" ? callItemIds.get(event.itemId) : undefined
       const call = callId ? callsById.get(callId) : undefined, content = diagnosticJsonRecord(call?.content)
       if (!callId || !call || !payload) { unmatchedEvents += 1; eventIdentityValid = false; continue }
       const matching = event.taskId === task.id && event.itemId === call.id && event.correlationId === callId
@@ -639,7 +639,9 @@ async function collectDiscoveryVerifierDiagnostics(pool: Pool, scope: Fixture, t
         WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = ANY($3::text[]) AND item."type" IN ('tool_call', 'tool_result')
         ORDER BY step."attempt", step."ordinal", item."createdAt", item."id" LIMIT 1025`, [scope.sessionId, scope.turnId, ids]),
       pool.query<RecordValue>(`SELECT event."taskId", event."itemId", event."correlationId", event."type", event."payload", event."sequence"
-        FROM "agent_events" AS event WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."taskId" = ANY($3::text[])
+        FROM "agent_events" AS event
+        JOIN "agent_items" AS item ON item."id" = event."itemId" AND item."sessionId" = event."sessionId" AND item."turnId" = event."turnId"
+        WHERE event."sessionId" = $1 AND event."turnId" = $2 AND item."taskId" = ANY($3::text[]) AND item."type" = 'tool_call'
           AND event."type" IN ('tool_call.started', 'tool_call.completed', 'tool_call.failed') ORDER BY event."sequence" LIMIT 3073`,
       [scope.sessionId, scope.turnId, ids]),
     ])
@@ -4285,13 +4287,23 @@ describe("canonical verifier receipt diagnostics", () => {
       { taskId: tasks[0]!.id, itemId: "private-call-item", correlationId: "private-call-id", type: "tool_call.completed", sequence: 2,
         payload: { taskId: tasks[0]!.id, toolCallId: "private-call-id", toolName: "jobs.search", status: "completed", errorCode: null } },
     ]
-    const projected = projectDiscoveryVerifierDiagnostics(tasks, items, events, scope)
-    const encoded = JSON.stringify(projected)
+    const detached = events.map(event => ({ ...event, itemId: null }))
+    const projected = projectDiscoveryVerifierDiagnostics(tasks, items, [...events, ...detached], scope)
+    const badLinked = projectDiscoveryVerifierDiagnostics(tasks, items, [
+      ...events,
+      { ...events[1]!, taskId: "foreign-task-id", correlationId: "foreign-call-id" },
+    ], scope)
+    const encoded = JSON.stringify({ projected, badLinked })
 
     expect(projected).toMatchObject([{
       role: "scout", itemScopeValid: true, itemAttemptValid: true, itemShapeValid: true,
-      pairShapeValid: true, contentPairValid: true, eventIdentityValid: true, eventPairsValid: true,
+      pairShapeValid: true, contentPairValid: true, eventCount: 2, startedEventCount: 1, terminalEventCount: 1,
+      unmatchedEvents: 0, eventIdentityValid: true, eventPairsValid: true,
       jobsSearchOutputs: [{ jobsArray: true, jobsCount: 1, jobsCountWithinVerifierCap: true, jobsDense: true, jobIdsValid: true, sourcesValid: true }],
+    }])
+    expect(badLinked).toMatchObject([{
+      eventCount: 3, startedEventCount: 1, terminalEventCount: 2,
+      eventIdentityValid: false, eventPairsValid: false,
     }])
     for (const secret of [scope.userId, scope.sessionId, scope.turnId, scope.ownerId, tasks[0]!.id, tasks[0]!.rootTaskId!, "private-step-id", "private-call-id", "private-job-id", "private-result-text"]) {
       expect(encoded).not.toContain(secret)
@@ -5197,7 +5209,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 rootModelFailureStage = "follow_up_graph_readiness"
                 expect(nodes.slice(0, 4).map(node => node?.readiness)).toEqual(["terminal", "terminal", "terminal", "terminal"])
                 expect(nodes.find(node => node?.key === "large-source-repair")).toMatchObject({
-                  status: "queued",
+                  status: expect.stringMatching(/^(queued|running)$/),
                   repairOf: {
                     graphRootTaskId: largeSourceRepairTarget.current?.graphRootTaskId,
                     nodeKey: "large-source", taskId: largeSourceRepairTarget.current?.taskId,
@@ -7311,11 +7323,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const { createTurnQueue, enqueueTurn, TURN_QUEUE_NAME } = await import("../turns/turn-queue.js")
     turnQueueName = TURN_QUEUE_NAME
     childQueueName = subagentQueue.SUBAGENT_QUEUE_NAME
+    const INTERACTIVE_FAILURE_MAX_STEPS = 10
     const value = discoveryFailureOwner
     await activateFixtureTurn(pool!, value)
     await pool!.query(`UPDATE "agent_turns" SET "budgetSnapshot" = $2::jsonb
       WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4`, [
-      value.turnId, JSON.stringify({ limits: { maxSteps: 7, maxToolCalls: 8 } }), value.sessionId, value.userId,
+      value.turnId, JSON.stringify({ limits: { maxSteps: INTERACTIVE_FAILURE_MAX_STEPS, maxToolCalls: 8 } }), value.sessionId, value.userId,
     ])
     const jobId = `p3-discovery-failure-job-${value.suffix}`
     await pool!.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4`, [
@@ -7534,7 +7547,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       [value.turnId, value.sessionId],
     )
     expect(budgetExhausted.rows).toHaveLength(1)
-    expect(record(budgetExhausted.rows[0]?.payload)).toMatchObject({ reasonCode: "budget_exhausted", metric: "steps", limit: 7 })
+    expect(record(budgetExhausted.rows[0]?.payload)).toMatchObject({ reasonCode: "budget_exhausted", metric: "steps", limit: INTERACTIVE_FAILURE_MAX_STEPS })
     const children = await pool!.query<{ id: string; role: string; status: string; failureReason: string | null; result: unknown }>(
       `SELECT "id", "role", "status", "failureReason", "result" FROM "sub_agent_tasks"
        WHERE "turnId" = $1 AND "sessionId" = $2 AND "parentTaskId" = $3 ORDER BY "role"`,

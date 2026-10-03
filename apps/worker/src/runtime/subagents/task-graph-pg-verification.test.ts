@@ -42,10 +42,14 @@ function durableRows(overrides: { items?: Record<string, unknown>[]; events?: Re
     { id: "completed", ...common, type: "tool_call.completed", sequence: 2, payload: { taskId: scope.taskId, toolCallId: "call-1", toolName: "jobs.search", status: "completed", errorCode: null } },
   ]
   const task = overrides.task ?? { id: scope.taskId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, turnRootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId, attemptCount: 1, status: "running", role: "scout", userId: scope.userId }
-  const query = vi.fn(async (sql: string, _values?: unknown[]) => {
+  const query = vi.fn(async (sql: string, values?: unknown[]) => {
     if (sql.includes('SELECT task."id"')) return { rows: [task], rowCount: 1 }
     if (sql.includes('SELECT item."id"')) return { rows: items, rowCount: items.length }
-    if (sql.includes('SELECT event."id"')) return { rows: events, rowCount: events.length }
+    if (sql.includes('SELECT event."id"')) {
+      const itemIds = Array.isArray(values?.[3]) ? (values[3] as unknown[]).filter((value): value is string => typeof value === "string") : []
+      const linkedEvents = events.filter(event => typeof event.itemId === "string" && itemIds.includes(event.itemId))
+      return { rows: linkedEvents, rowCount: linkedEvents.length }
+    }
     throw new Error("unexpected_verification_query")
   })
   return { client: { query } as unknown as Pick<pg.PoolClient, "query">, query, items, events }
@@ -83,6 +87,19 @@ describe("TaskGraph PostgreSQL verification evidence", () => {
     expect(rejected.report.status).toBe("unverified")
     expect(rejected.report.reasonCode).toBe("canonical_evidence_ambiguous")
     expect(rejected.report.evidenceDigest).toBeNull()
+  })
+
+  it("ignores detached lifecycle copies while verifying canonical item-linked receipts", async () => {
+    const canonical = durableRows()
+    const detached = canonical.events.map(event => ({ ...event, id: `detached-${String(event.id)}`, itemId: null }))
+    const data = durableRows({ events: [...canonical.events, ...detached] })
+
+    await expect(verifyTaskGraphNodeEvidence(data.client, { scope, snapshot, node, structuredResult })).resolves.toMatchObject({ verified: true })
+
+    const eventQuery = data.query.mock.calls.find(([sql]) => sql.includes('SELECT event."id"'))
+    expect(eventQuery?.[0]).toContain('event."itemId" = ANY($4::text[])')
+    expect(eventQuery?.[0]).not.toContain('event."correlationId" = ANY')
+    expect(eventQuery?.[1]).toEqual([scope.sessionId, scope.turnId, scope.userId, ["call-item"]])
   })
 
   it("does not count model-only evidence claims", async () => {
@@ -142,7 +159,7 @@ describe("TaskGraph PostgreSQL verification evidence", () => {
     expect(changed.report.evidenceDigest).not.toBe(first.report.evidenceDigest)
   })
 
-  it("rejects duplicate and over-cap canonical output and mismatched event correlation", async () => {
+  it("rejects duplicate and over-cap canonical output and mismatched linked event correlation", async () => {
     const duplicate = durableRows()
     duplicate.items[1]!.content = { toolCallId: "call-1", output: { jobs: [{ id: "job-1", source: "greenhouse" }, { id: "job-1", source: "greenhouse" }] }, errorCode: null }
     expect((await verifyTaskGraphNodeEvidence(duplicate.client, { scope, snapshot, node, structuredResult })).verified).toBe(false)
@@ -152,7 +169,16 @@ describe("TaskGraph PostgreSQL verification evidence", () => {
     expect((await verifyTaskGraphNodeEvidence(overCap.client, { scope, snapshot, node, structuredResult })).verified).toBe(false)
 
     const mismatched = durableRows()
-    mismatched.events[1] = { ...mismatched.events[1]!, itemId: "foreign-call-item" }
+    mismatched.events[1] = { ...mismatched.events[1]!, correlationId: "foreign-call-id" }
     expect((await verifyTaskGraphNodeEvidence(mismatched.client, { scope, snapshot, node, structuredResult })).verified).toBe(false)
+  })
+
+  it("rejects a duplicate item-linked event with the wrong task", async () => {
+    const data = durableRows()
+    data.events.push({ ...data.events[1]!, id: "wrong-task-completion", taskId: "foreign-task" })
+
+    const result = await verifyTaskGraphNodeEvidence(data.client, { scope, snapshot, node, structuredResult })
+    expect(result.verified).toBe(false)
+    expect(result.report.reasonCode).toBe("canonical_evidence_invalid")
   })
 })

@@ -62,17 +62,16 @@ export async function verifyTaskGraphNodeEvidence(client: Queryable, input: Read
   try {
     items = validateItems(itemsResult.rows, input.scope)
     const callItems = items.filter(item => item.type === "tool_call"), callItemIds = callItems.map(item => String(item.id))
-    const callIds = callItems.map(item => String((item.content as Row).toolCallId))
     const eventResult = callItemIds.length === 0 ? { rows: [] as Row[] } : await client.query(`SELECT event."id", event."itemId", event."taskId", event."correlationId", event."type", event."payload", event."sequence"
       FROM "agent_events" AS event
       JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
       JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
-      WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."taskId" = $3
-        AND session."userId" = $4 AND turn."userId" = $4
-        AND (event."itemId" = ANY($5::text[]) OR event."correlationId" = ANY($6::text[]))
+      WHERE event."sessionId" = $1 AND event."turnId" = $2
+        AND session."userId" = $3 AND turn."userId" = $3
+        AND event."itemId" = ANY($4::text[])
         AND event."type" IN ('tool_call.started', 'tool_call.completed', 'tool_call.failed')
       ORDER BY event."sequence" ASC LIMIT ${MAX_ITEMS * 3 + 1}`,
-    [input.scope.sessionId, input.scope.turnId, input.scope.taskId, input.scope.userId, callItemIds, callIds])
+    [input.scope.sessionId, input.scope.turnId, input.scope.userId, callItemIds])
     if (eventResult.rows.length > MAX_ITEMS * 3) return unavailable(contract, "canonical_evidence_invalid")
     const outcomes = validateEvents(eventResult.rows, items, input.scope)
     events = eventResult.rows
