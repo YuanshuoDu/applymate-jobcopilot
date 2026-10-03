@@ -50,6 +50,7 @@ import { RUNNABLE_SESSION } from "../session-gate.js"
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const PLAN_CALL_ID = "p3-resume-plan"
 const WAIT_CALL_ID = "p3-resume-wait"
+const DISCOVERY_RESTART_WAIT_CALL_ID = "p3-process-restart-discovery-wait-call"
 const FOLLOW_UP_PLAN_CALL_ID = "p3-resume-follow-up-plan"
 const FOLLOW_UP_WAIT_CALL_ID = "p3-resume-follow-up-wait"
 const RESTART_FOLLOW_UP_GOAL = "Verify the restored TaskGraph summary after restart"
@@ -8106,7 +8107,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         }
       }
       try {
-        await waitForTurnStatus(pool!, value.turnId, "completed", 90_000)
+        await waitForTurnStatus(pool!, value.turnId, "completed", 90_000, DISCOVERY_RESTART_WAIT_CALL_ID)
       } catch (error) {
         throw new Error(`Interactive discovery restart diagnostics=${JSON.stringify({
           ...(await collectRestartDiscoveryDiagnostics()),
