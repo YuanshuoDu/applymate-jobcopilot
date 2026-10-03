@@ -3331,6 +3331,7 @@ async function processRestartTaskGraphDiagnostic(pool: Pool, turnId: string): Pr
       const task = taskId ? tasksById.get(taskId) : undefined
       const taskResult = diagnosticJsonRecord(task?.result)
       const report = record(taskResult?.taskGraphVerificationReport)
+      const safeReport = diagnosticDiscoveryTasks(task ? [task] : [])[0]?.taskGraphVerificationReport
       return {
         nodeKey: key,
         nodeStatus: diagnosticEnum(node.status, TASK_DIAGNOSTIC_STATUSES) ?? "other",
@@ -3343,17 +3344,24 @@ async function processRestartTaskGraphDiagnostic(pool: Pool, turnId: string): Pr
         verificationStatus: report
           ? diagnosticEnum(report.status, TASK_GRAPH_VERIFICATION_STATUSES) ?? "other"
           : "missing",
+        verification: safeReport ?? null,
       }
     }),
-    tasks: taskResult.rows.map(task => ({
-      role: diagnosticEnum(task.role, PROCESS_RESTART_TASK_ROLES) ?? "other",
-      status: diagnosticEnum(task.status, TASK_DIAGNOSTIC_STATUSES) ?? "other",
-      failureReasonCode: task.failureReason ? diagnosticErrorCode(task.failureReason) ?? "other" : "none",
-      verificationStatus: (() => {
-        const report = record(diagnosticJsonRecord(task.result)?.taskGraphVerificationReport)
-        return report ? diagnosticEnum(report.status, TASK_GRAPH_VERIFICATION_STATUSES) ?? "other" : "missing"
-      })(),
-    })),
+    tasks: taskResult.rows.map(task => {
+      const taskResult = diagnosticJsonRecord(task.result)
+      const report = record(taskResult?.taskGraphVerificationReport)
+      const safeReport = diagnosticDiscoveryTasks([task])[0]?.taskGraphVerificationReport
+      return {
+        role: diagnosticEnum(task.role, PROCESS_RESTART_TASK_ROLES) ?? "other",
+        status: diagnosticEnum(task.status, TASK_DIAGNOSTIC_STATUSES) ?? "other",
+        failureReasonCode: task.failureReason ? diagnosticErrorCode(task.failureReason) ?? "other" : "none",
+        resultStatus: taskResult ? diagnosticEnum(taskResult.status, ITEM_DIAGNOSTIC_STATUSES) ?? "other" : "missing",
+        verificationStatus: report
+          ? diagnosticEnum(report.status, TASK_GRAPH_VERIFICATION_STATUSES) ?? "other"
+          : "missing",
+        verification: safeReport ?? null,
+      }
+    }),
   }
 }
 
