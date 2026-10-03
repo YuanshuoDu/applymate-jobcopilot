@@ -7,6 +7,7 @@ import { Pool, type PoolClient } from "pg"
 import { Redis } from "ioredis"
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest"
 import type { HarnessModelRequest, ModelAdapter } from "@jobcopilot/agent-model"
+import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import {
   PLAN_LEDGER_SCHEMA_VERSION,
   parsePlanLedger,
@@ -38,9 +39,9 @@ import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-v
 import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-pg-verification.js"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
-import { defaultSubagentPolicy, type SubagentTaskRecord } from "./types.js"
+import { defaultSubagentPolicy, type SubagentLease, type SubagentTaskRecord } from "./types.js"
 import { drainTaskGraphStopOutbox, TASK_GRAPH_STOP_OUTBOX_TOPIC } from "./task-graph-stop-outbox.js"
-import { parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
+import { taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const PLAN_CALL_ID = "p3-resume-plan"
@@ -51,6 +52,7 @@ const RESTART_FOLLOW_UP_GOAL = "Verify the restored TaskGraph summary after rest
 const RESTART_FOLLOW_UP_KEY = "verification"
 const RESULT_PREFIX = "p3-task-graph-child-result"
 const FOLLOW_UP_GOAL = "Verify the completed summary with a follow-up check"
+const LARGE_SOURCE_REPAIR_GOAL = "Repair the oversized source proof with bounded evidence"
 const OVERSIZED_SOURCE_GOAL = "Complete with an oversized structured summary"
 const REJECTED_DEPENDENT_GOAL = "Must be cancelled when dependency evidence is oversized"
 const FINAL_MARKER = "p3-task-graph-resumed-with-current-graph"
@@ -356,8 +358,9 @@ const TASK_GRAPH_DIAGNOSTIC_NODE_KEYS = new Set([
 const COMPLETED_GRAPH_STATUS_EXPECTATIONS = [
   { key: "source", status: "completed" },
   { key: "summary", status: "completed" },
-  { key: "large-source", status: "completed" },
+  { key: "large-source", status: "failed" },
   { key: "rejected", status: "cancelled" },
+  { key: "large-source-repair", status: "completed" },
   { key: "verification", status: "completed" },
 ] as const
 const TASK_GRAPH_READINESS = new Set([
@@ -1526,23 +1529,11 @@ async function prepareSelectedJobReviewAfterRestart(
     userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
     rootTaskId: trace.rootTaskId, parentTaskId: trace.rootTaskId,
   }
-  const graphRow = await pool.query<{ content: unknown }>(
-    `SELECT item."content" FROM "agent_items" AS item
-     JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
-     JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
-     WHERE item."id" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4
-       AND item."type" = 'task_graph' AND turn."userId" = $5 AND session."userId" = $5`,
-    [taskGraphItemId(trace.rootTaskId), value.sessionId, value.turnId, trace.rootTaskId, value.userId],
-  )
-  const graph = parseTaskGraphSnapshot(graphRow.rows[0]?.content)
-  const writerNode = graph.nodes.find(node => node.taskId === completedWriter.id)
-  if (!writerNode) throw new Error("Completed selected-job Writer has no persisted TaskGraph verifier metadata")
   const reviewerContext = materializeTaskGraphDependencyContext(
     { selectedJobPreparation: { jobId: trace.jobId } }, dependencyScope, ["writer"], [{
       ...dependencyScope, key: "writer", taskId: completedWriter.id, status: completedWriter.status,
       role: completedWriter.role, expectedOutputSchema: completedWriter.expectedOutputSchema, result: completedWriter.result,
-      verificationDisposition: writerNode.verificationDisposition, verification: writerNode.verification,
-      repairOf: writerNode.repairOf,
+      verificationDisposition: "legacy_unverified",
     }],
   )
   const createReviewer = (goal: string) => trace.store.create({
@@ -2436,6 +2427,68 @@ function structuredChildResult(role: "scout" | "analyst", summary: string): Reco
   return { status: "completed", stepCount: 2, toolCallCount: 1, finalItemId: "fixture-final-item", finalText: summary, structuredResult }
 }
 
+async function persistTaskGraphChildReadEvidence(pool: Pool, lease: SubagentLease): Promise<void> {
+  if (!lease.turnId || lease.parentTaskId !== lease.rootTaskId) {
+    throw new Error("TaskGraph child evidence fixture is missing its parent/root scope")
+  }
+  const owner = executionOwnerFence({ kind: "task", lease })
+  const store = createPgTurnEngineStore(pool)
+  const now = new Date()
+  const callId = `${RESULT_PREFIX}:${lease.id}:attempt:${lease.attemptCount}`
+  const stepId = `${callId}:step`
+  const toolCallItemId = `${callId}:tool-call`
+  const toolResultItemId = `${callId}:tool-result`
+  const input = { target: "fixture", location: "Dublin", limit: 1 }
+  const output = { jobs: [{ id: "fixture-job-1", source: "fixture" }] }
+  const step = await store.startStep({
+    owner, stepId, ordinal: 0, attempt: lease.attemptCount, inputThroughSequence: 0n,
+    consumedInputIds: [], modelProfileSnapshot: { provider: "fixture", model: "fixture-model" }, now,
+  })
+  const callItem = await store.createItem({
+    owner, itemId: toolCallItemId, stepId: step.id, type: "tool_call", status: "started", phase: null,
+    content: { toolCallId: callId, toolName: "jobs.search", toolVersion: "1", input }, now,
+  })
+  let causationId: string | null = null
+  const appendEvent = async (type: string, correlationId: string, itemId: string, payload: RepositoryJsonValue, key: string) => {
+    const event = await store.appendEvent({
+      owner, id: randomUUID(), itemId, type, correlationId, causationId,
+      idempotencyKey: `task:${lease.id}:event:${callId}:${key}`, payload,
+    })
+    causationId = event.id
+  }
+  await appendEvent("item.started", step.id, callItem.id, { itemId: callItem.id, type: "tool_call", phase: null }, "call-item-started")
+  await appendEvent("tool_call.started", callId, callItem.id, { toolCallId: callId, toolName: "jobs.search", taskId: lease.id }, "tool-started")
+  const completedCall = await store.updateItem({
+    owner, itemId: callItem.id, expectedRevision: callItem.revision, status: "completed", phase: null,
+    content: { toolCallId: callId, toolName: "jobs.search", toolVersion: "1", status: "completed", errorCode: null, input },
+    startedAt: now, completedAt: now, now,
+  })
+  await appendEvent("item.completed", callItem.id, callItem.id, {
+    itemId: callItem.id, status: "completed",
+    content: { toolCallId: callId, toolName: "jobs.search", toolVersion: "1", status: "completed", errorCode: null, input },
+  }, "call-item-completed")
+  await appendEvent("tool_call.completed", callId, callItem.id, {
+    toolCallId: callId, toolName: "jobs.search", status: "completed", errorCode: null, taskId: lease.id,
+  }, "tool-completed")
+  const resultItem = await store.createItem({
+    owner, itemId: toolResultItemId, stepId: step.id, type: "tool_result", status: "started", phase: null,
+    content: { toolCallId: callId, output, errorCode: null }, now,
+  })
+  await appendEvent("item.started", step.id, resultItem.id, { itemId: resultItem.id, type: "tool_result", phase: null }, "result-item-started")
+  await store.updateItem({
+    owner, itemId: resultItem.id, expectedRevision: resultItem.revision, status: "completed", phase: null,
+    content: { toolCallId: callId, output, errorCode: null }, startedAt: now, completedAt: now, now,
+  })
+  await appendEvent("item.completed", resultItem.id, resultItem.id, {
+    itemId: resultItem.id, status: "completed", content: { toolCallId: callId, output, errorCode: null },
+  }, "result-item-completed")
+  await store.updateStep({
+    owner, stepId: step.id, status: "completed", finishReason: "tool_calls", errorCode: null,
+    inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0, now,
+  })
+  if (completedCall.revision !== callItem.revision + 1) throw new Error("TaskGraph evidence fixture call item did not advance")
+}
+
 async function waitForSuspendedParent(pool: Pool, turnId: string, minimumWaitCount = 1, timeoutMs = 20_000): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
@@ -3258,7 +3311,7 @@ describe("compact TaskGraph wait failure diagnostics", () => {
       nodes: [
         { key: "source", taskId: privateIds[0], goal: "private source goal", status: "completed", readiness: "terminal" },
         { key: "summary", taskId: privateIds[1], goal: "private summary goal", status: "completed", readiness: "terminal" },
-        { key: "large-source", taskId: "private-large", status: "completed", readiness: "terminal" },
+        { key: "large-source", taskId: "private-large", status: "failed", readiness: "terminal" },
         { key: "rejected", taskId: "private-rejected", status: "failed", readiness: "terminal" },
         { key: "verification", taskId: "private-verification", status: "completed", readiness: "active" },
       ],
@@ -3267,7 +3320,7 @@ describe("compact TaskGraph wait failure diagnostics", () => {
     expect(projection).toEqual({ nodes: [
       { key: "source", status: "completed", readiness: "terminal", expectedMatch: true },
       { key: "summary", status: "completed", readiness: "terminal", expectedMatch: true },
-      { key: "large-source", status: "completed", readiness: "terminal", expectedMatch: true },
+      { key: "large-source", status: "failed", readiness: "terminal", expectedMatch: true },
       { key: "rejected", status: "failed", readiness: "terminal", expectedMatch: false },
       { key: "verification", status: "completed", readiness: "active", expectedMatch: false },
     ] })
@@ -4699,6 +4752,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let resumedGraphReachedModel = false
     let followUpGraphReachedModel = false
     let followUpExpectedRevision: number | undefined
+    const largeSourceRepairTarget: { current: { graphRootTaskId: string; taskId: string } | null } = { current: null }
+    let oversizedStructuredInputBytes = 0
     let rootModelStreamFailure: string | null = null
     let firstWaitPlanGraphDiagnostics: string | null = null
     let followUpPlanReceiptFailureDiagnostics: string | null = null
@@ -4736,7 +4791,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 rootModelFailureStage = "resumed_graph_keys"
                 expect(nodes.map(node => node?.key)).toEqual(["source", "summary", "large-source", "rejected"])
                 rootModelFailureStage = "resumed_graph_statuses"
-                expect(nodes.map(node => node?.status)).toEqual(["completed", "completed", "completed", "cancelled"])
+                expect(nodes.map(node => node?.status)).toEqual(["completed", "completed", "failed", "cancelled"])
                 rootModelFailureStage = "resumed_graph_readiness"
                 expect(nodes.map(node => node?.readiness)).toEqual(["terminal", "terminal", "terminal", "terminal"])
                 rootModelFailureStage = "large_source_projection"
@@ -4762,7 +4817,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 rootModelFailureStage = "wait_task_statuses"
                 expect(sourceWaitTask).toMatchObject({ status: "completed" })
                 expect(summaryWaitTask).toMatchObject({ status: "completed" })
-                expect(largeSourceWaitTask).toMatchObject({ status: "completed" })
+                expect(largeSourceWaitTask).toMatchObject({ status: "failed" })
                 expect(rejectedWaitTask).toMatchObject({ status: "cancelled" })
                 rootModelFailureStage = "source_wait_summary"
                 expect(record(record(sourceWaitTask?.result)?.structuredResult)?.summary).toBe("Read the fixture source")
@@ -4772,17 +4827,38 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 rootModelFailureStage = "resumed_graph_revision"
                 if (typeof revision !== "number" || !Number.isSafeInteger(revision)) throw new Error("Resumed current graph revision is invalid")
                 followUpExpectedRevision = revision
+                const turn = await pool!.query<{ rootTaskId: string | null }>(
+                  `SELECT "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+                  [owner.turnId, owner.sessionId, owner.userId],
+                )
+                const graphRootTaskId = turn.rows[0]?.rootTaskId
+                const largeSourceTaskId = nodes.find(node => node?.key === "large-source")?.taskId
+                if (!graphRootTaskId || typeof largeSourceTaskId !== "string") {
+                  throw new Error("Oversized source repair fixture lost its immutable target identity")
+                }
+                largeSourceRepairTarget.current = { graphRootTaskId, taskId: largeSourceTaskId }
                 rootModelFailureStage = "follow_up_plan_tool"
                 expect(request.tools.map(tool => record(tool)?.name)).toContain("agent.plan")
                 yield {
                   type: "tool_call_completed", callId: FOLLOW_UP_PLAN_CALL_ID, name: "agent.plan",
                   arguments: {
                     expectedRevision: followUpExpectedRevision,
-                    nodes: [{
-                      key: "verification", templateId: "analyst", goal: FOLLOW_UP_GOAL,
-                      successCriteria: ["Verify the completed summary evidence"], dependsOn: ["summary"],
-                      verification: ANALYST_VERIFICATION,
-                    }],
+                    nodes: [
+                      {
+                        key: "large-source-repair", templateId: "scout", goal: LARGE_SOURCE_REPAIR_GOAL,
+                        successCriteria: ["Return one evidence-bound candidate"], dependsOn: [],
+                        verification: SCOUT_VERIFICATION,
+                        repairOf: {
+                          graphRootTaskId, nodeKey: "large-source", taskId: largeSourceTaskId,
+                          criterionIds: ["candidate-count"],
+                        },
+                      },
+                      {
+                        key: "verification", templateId: "analyst", goal: FOLLOW_UP_GOAL,
+                        successCriteria: ["Verify the completed summary evidence"], dependsOn: ["summary"],
+                        verification: ANALYST_VERIFICATION,
+                      },
+                    ],
                   },
                 }
                 yield { type: "completed", finishReason: "tool_calls" }
@@ -4790,15 +4866,23 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               }
               if (modelRounds === 2) {
                 rootModelFailureStage = "follow_up_graph_keys"
-                expect(nodes.map(node => node?.key)).toEqual(["source", "summary", "large-source", "rejected", "verification"])
+                expect(nodes.map(node => node?.key)).toEqual(["source", "summary", "large-source", "rejected", "large-source-repair", "verification"])
                 rootModelFailureStage = "follow_up_graph_statuses"
-                expect(nodes.slice(0, 4).map(node => node?.status)).toEqual(["completed", "completed", "completed", "cancelled"])
+                expect(nodes.slice(0, 4).map(node => node?.status)).toEqual(["completed", "completed", "failed", "cancelled"])
                 rootModelFailureStage = "follow_up_graph_readiness"
                 expect(nodes.slice(0, 4).map(node => node?.readiness)).toEqual(["terminal", "terminal", "terminal", "terminal"])
+                expect(nodes.find(node => node?.key === "large-source-repair")).toMatchObject({
+                  status: "queued",
+                  repairOf: {
+                    graphRootTaskId: largeSourceRepairTarget.current?.graphRootTaskId,
+                    nodeKey: "large-source", taskId: largeSourceRepairTarget.current?.taskId,
+                    criterionIds: ["candidate-count"],
+                  },
+                })
                 rootModelFailureStage = "follow_up_plan_receipt_lookup"
                 let plannedTaskIds: string[]
                 try {
-                  plannedTaskIds = planTaskIds(request, FOLLOW_UP_PLAN_CALL_ID, 1)
+                  plannedTaskIds = planTaskIds(request, FOLLOW_UP_PLAN_CALL_ID, 2)
                 } catch (error: unknown) {
                   followUpPlanReceiptFailureDiagnostics = await collectPlanReceiptFailureDiagnostics(
                     pool!, owner.turnId, request, FOLLOW_UP_PLAN_CALL_ID, graph,
@@ -4807,8 +4891,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 }
                 rootModelFailureStage = "follow_up_graph_task_id"
                 try {
+                  expect(nodes.find(node => node?.key === "large-source-repair")).toMatchObject({
+                    key: "large-source-repair", taskId: plannedTaskIds[0],
+                  })
                   expect(nodes.find(node => node?.key === "verification")).toMatchObject({
-                    key: "verification", taskId: plannedTaskIds[0],
+                    key: "verification", taskId: plannedTaskIds[1],
                   })
                 } catch (error: unknown) {
                   followUpPlanReceiptFailureDiagnostics = await collectPlanReceiptFailureDiagnostics(
@@ -4836,27 +4923,60 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
               expect(graph?.kind).toBe("task_graph_current")
               rootModelFailureStage = "completed_graph_keys"
-              expect(nodes.map(node => node?.key)).toEqual(["source", "summary", "large-source", "rejected", "verification"])
+              expect(nodes.map(node => node?.key)).toEqual(["source", "summary", "large-source", "rejected", "large-source-repair", "verification"])
               try {
                 rootModelFailureStage = "completed_graph_statuses"
-                expect(nodes.map(node => node?.status)).toEqual(["completed", "completed", "completed", "cancelled", "completed"])
+                expect(nodes.map(node => node?.status)).toEqual(["completed", "completed", "failed", "cancelled", "completed", "completed"])
                 rootModelFailureStage = "completed_graph_readiness"
-                expect(nodes.map(node => node?.readiness)).toEqual(["terminal", "terminal", "terminal", "terminal", "terminal"])
+                expect(nodes.map(node => node?.readiness)).toEqual(["terminal", "terminal", "terminal", "terminal", "terminal", "terminal"])
               } catch (error: unknown) {
                 completedGraphStateFailureDiagnostics = boundedDiagnostic(
                   JSON.stringify(completedGraphStatusFailureProjection(graph)), 1_200,
                 )
                 throw error
               }
+              const repairTarget = largeSourceRepairTarget.current
+              if (!repairTarget) throw new Error("Completed graph lost the oversized source repair target identity")
+              const repairedSource = nodes.find(node => node?.key === "large-source")
+              const repairNode = nodes.find(node => node?.key === "large-source-repair")
+              expect(repairedSource).toMatchObject({ taskId: repairTarget.taskId, status: "failed" })
+              expect(repairNode).toMatchObject({
+                key: "large-source-repair", status: "completed",
+                repairOf: {
+                  graphRootTaskId: repairTarget.graphRootTaskId,
+                  nodeKey: "large-source", taskId: repairTarget.taskId,
+                  criterionIds: ["candidate-count"],
+                },
+                repairReceipt: {
+                  graphRootTaskId: repairTarget.graphRootTaskId,
+                  targetNodeKey: "large-source", targetTaskId: repairTarget.taskId,
+                  criterionIds: ["candidate-count"],
+                  repairNodeKey: "large-source-repair", repairTaskId: expect.any(String),
+                },
+              })
               followUpGraphReachedModel = true
               rootModelFailureStage = "completed_wait_outcome"
-              const waitOutcome = waitOutcomeFromRequest(request, 1)
+              const waitOutcome = waitOutcomeFromRequest(request, 2)
               const waitTasks = waitOutcome.tasks.map(record)
               expect(waitOutcome.status).toBe("ready")
               rootModelFailureStage = "completed_wait_status"
-              expect(waitTasks.map(task => task?.status)).toEqual(["completed"])
+              expect(waitTasks.map(task => task?.status)).toEqual(["completed", "completed"])
               rootModelFailureStage = "completed_wait_summary"
-              expect(record(record(waitTasks[0]?.result)?.structuredResult)?.summary).toBe(FOLLOW_UP_GOAL)
+              const taskIdForNode = (key: string) => nodes.find(node => node?.key === key)?.taskId
+              const completedTaskForNode = (key: string) => waitTasks.find(task => task?.taskId === taskIdForNode(key))
+              expect(record(record(completedTaskForNode("large-source-repair")?.result)?.structuredResult)?.summary)
+                .toBe(LARGE_SOURCE_REPAIR_GOAL)
+              expectPassedVerificationReport(
+                record(completedTaskForNode("large-source-repair")?.result)?.taskGraphVerificationReport,
+                "candidate-count",
+              )
+              expect(record(completedTaskForNode("large-source-repair")?.result)?.taskGraphRepairReceipt).toMatchObject({
+                graphRootTaskId: repairTarget.graphRootTaskId,
+                targetNodeKey: "large-source", targetTaskId: repairTarget.taskId,
+                criterionIds: ["candidate-count"], repairNodeKey: "large-source-repair",
+                repairTaskId: taskIdForNode("large-source-repair"),
+              })
+              expect(record(record(completedTaskForNode("verification")?.result)?.structuredResult)?.summary).toBe(FOLLOW_UP_GOAL)
               yield { type: "text_delta", text: FINAL_MARKER }
               yield { type: "completed", finishReason: "stop" }
               return
@@ -4945,7 +5065,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         async execute({ lease }) {
           let stage: ChildFixtureFailureStage = "parent_wait"
           try {
-            const minimumWaitCount = lease.goal === FOLLOW_UP_GOAL ? 2 : 1
+            const minimumWaitCount = lease.goal === FOLLOW_UP_GOAL || lease.goal === LARGE_SOURCE_REPAIR_GOAL ? 2 : 1
             await waitForSuspendedParent(pool!, owner.turnId, minimumWaitCount)
             if (lease.goal === "Summarize the fixture source") {
               const taskContext = record(lease.context)
@@ -4998,8 +5118,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               if (lease.goal === OVERSIZED_SOURCE_GOAL) {
                 stage = "oversized_result"
                 result.structuredResult = { ...(result.structuredResult as RecordValue), summary: "x".repeat(20 * 1024) }
+                oversizedStructuredInputBytes = Buffer.byteLength(JSON.stringify(result.structuredResult), "utf8")
+                expect(oversizedStructuredInputBytes).toBeGreaterThan(8 * 1024)
                 result.finalText = "oversized but otherwise valid structured result"
               }
+              await persistTaskGraphChildReadEvidence(pool!, lease)
               return { status: "completed", result }
             }
             stage = "unexpected_role"
@@ -5068,15 +5191,32 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
        WHERE "sessionId" = $1 AND "turnId" = $2 AND "parentTaskId" = $3 ORDER BY "goal"`,
       [owner.sessionId, owner.turnId, rootTaskId],
     )
-    expect(children.rows).toHaveLength(5)
+    expect(children.rows).toHaveLength(6)
     const childByGoal = new Map(children.rows.map(child => [child.goal, child] as const))
     expect(childByGoal.get("Read the fixture source")).toMatchObject({ status: "completed", role: "scout" })
     expect(record(childByGoal.get("Read the fixture source")?.result?.structuredResult)?.candidates).toMatchObject([{ jobId: "fixture-job-1" }])
+    expectPassedVerificationReport(record(childByGoal.get("Read the fixture source")?.result)?.taskGraphVerificationReport, "candidate-count")
     expect(childByGoal.get("Summarize the fixture source")).toMatchObject({ status: "completed", role: "analyst" })
     expect(record(childByGoal.get("Summarize the fixture source")?.result?.structuredResult)?.findings).toMatchObject([{ jobId: "fixture-job-1", score: 8 }])
+    expectPassedVerificationReport(record(childByGoal.get("Summarize the fixture source")?.result)?.taskGraphVerificationReport, "finding-count")
     expect(childByGoal.get(FOLLOW_UP_GOAL)).toMatchObject({ status: "completed", role: "analyst" })
-    expect(childByGoal.get(OVERSIZED_SOURCE_GOAL)).toMatchObject({ status: "completed", role: "scout" })
-    expect(Buffer.byteLength(JSON.stringify(childByGoal.get(OVERSIZED_SOURCE_GOAL)?.result ?? {}), "utf8")).toBeGreaterThan(16 * 1024)
+    expectPassedVerificationReport(record(childByGoal.get(FOLLOW_UP_GOAL)?.result)?.taskGraphVerificationReport, "finding-count")
+    expect(childByGoal.get(LARGE_SOURCE_REPAIR_GOAL)).toMatchObject({ status: "completed", role: "scout" })
+    expectPassedVerificationReport(record(childByGoal.get(LARGE_SOURCE_REPAIR_GOAL)?.result)?.taskGraphVerificationReport, "candidate-count")
+    const repairTarget = largeSourceRepairTarget.current
+    if (!repairTarget) throw new Error("Final assertions lost the oversized source repair target identity")
+    expect(record(childByGoal.get(LARGE_SOURCE_REPAIR_GOAL)?.result)?.taskGraphRepairReceipt).toMatchObject({
+      graphRootTaskId: repairTarget.graphRootTaskId,
+      targetNodeKey: "large-source", targetTaskId: repairTarget.taskId,
+      criterionIds: ["candidate-count"], repairNodeKey: "large-source-repair",
+      repairTaskId: childByGoal.get(LARGE_SOURCE_REPAIR_GOAL)?.id,
+    })
+    expect(childByGoal.get(OVERSIZED_SOURCE_GOAL)).toMatchObject({ status: "failed", role: "scout", failureReason: "task_graph_verification_unverified" })
+    expect(oversizedStructuredInputBytes).toBeGreaterThan(8 * 1024)
+    const oversizedStoredResult = record(childByGoal.get(OVERSIZED_SOURCE_GOAL)?.result)
+    expect(oversizedStoredResult?.structuredResult).toBeUndefined()
+    expect(Buffer.byteLength(JSON.stringify(oversizedStoredResult ?? {}), "utf8")).toBeLessThan(8 * 1024)
+    expectUnverifiedVerificationReport(oversizedStoredResult?.taskGraphVerificationReport, "candidate-count")
     expect(childByGoal.get(REJECTED_DEPENDENT_GOAL)).toMatchObject({
       status: "cancelled", failureReason: "Prerequisite results could not be safely materialized.",
     })
@@ -5100,7 +5240,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
        WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' ORDER BY "createdAt"`,
       [owner.sessionId],
     )
-    expect(childDispatches.rows).toHaveLength(4)
+    expect(childDispatches.rows).toHaveLength(5)
     expect(childDispatches.rows.map(row => row.payload.taskId)).toEqual(expect.arrayContaining(
       children.rows.filter(child => child.status === "completed").map(child => child.id),
     ))
@@ -5134,7 +5274,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(wait.rows).toHaveLength(2)
     expect(wait.rows.every(row => row.status === "ready" && row.suspendedAt instanceof Date && row.consumedAt instanceof Date)).toBe(true)
     // The first all-mode wait targets four tasks; terminal cancellations count as matched.
-    expect(wait.rows.map(row => row.matchedTaskIds.length)).toEqual([4, 1])
+    expect(wait.rows.map(row => row.matchedTaskIds.length)).toEqual([4, 2])
     for (const row of wait.rows) {
       const wakeEvents = await pool!.query<{ count: string }>(
         `SELECT COUNT(*)::text AS "count" FROM "agent_events" WHERE "sessionId" = $1 AND "idempotencyKey" = $2`,
@@ -6738,6 +6878,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const rootRuntime = await canonical.createCanonicalTurnRuntime(pool!, {
       workerId: value.ownerId, productionFlags: flags,
       taskGraphCommandPort: commandPortModule.createPgTaskGraphCommandPort(pool!),
+      taskGraphTemplates: { ...TASK_GRAPH_TEMPLATES },
       authorizeUsage: async () => ({ settle: async () => undefined }),
       modelRuntimeFactory: () => {
         const execution = ++rootExecution
@@ -7183,6 +7324,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const runtimeResult = await canonical.createCanonicalTurnRuntime(pool!, {
       workerId: value.ownerId, productionFlags: flags,
       taskGraphCommandPort: commandPortModule.createPgTaskGraphCommandPort(pool!),
+      taskGraphTemplates: { ...TASK_GRAPH_TEMPLATES },
       authorizeUsage: async () => ({ settle: async () => undefined }),
       stateLoader: async (statePool, lease, now, loaderOptions) => {
         fixtureInvocationCounters.startupStage = "state_loading"
