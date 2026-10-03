@@ -33,10 +33,11 @@ import { checkTaskGraphTerminalVerification, TASK_GRAPH_VERIFICATION_BLOCKER } f
 import { executionOwnerFence } from "../execution-owner.js"
 import { PgCoordinationStore } from "../mailbox/store.js"
 import { TASK_GRAPH_TEMPLATES, taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
-import { ROLE_RESULT_SCHEMA } from "./role-results.js"
-import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./task-graph-command-port.js"
+import { ROLE_RESULT_SCHEMA, RoleResultValidationError, validateRoleResult, type StructuredRoleResult } from "./role-results.js"
+import { parseTaskGraphVerificationReport, TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./task-graph-command-port.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
-import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-pg-verification.js"
+import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "./task-graph-pg-verification.js"
+import { projectValidatedRoleResult } from "./task-graph-result-projection.js"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
 import { defaultSubagentPolicy, type SubagentLease, type SubagentTaskRecord } from "./types.js"
@@ -571,6 +572,78 @@ function diagnosticJsonRecord(value: unknown): RecordValue | null {
   if (typeof value === "string") { try { return record(JSON.parse(value) as unknown) } catch { return null } }
   return record(value)
 }
+
+const ROLE_RESULT_DIAGNOSTIC_CODES = new Set(["invalid_shape", "missing_id", "missing_evidence", "invalid_score"])
+const VERIFICATION_DIAGNOSTIC_STATUSES = new Set(["passed", "failed", "unverified"])
+
+async function collectCanonicalDiscoveryScoutResultDiagnostic(pool: Pool, owner: Fixture): Promise<RecordValue> {
+  const result = await pool.query<{ status: string; result: unknown }>(
+    `SELECT task."status", task."result"
+     FROM "sub_agent_tasks" AS task
+     JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+     JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+     WHERE task."sessionId" = $1 AND task."turnId" = $2 AND session."userId" = $3 AND turn."userId" = $3
+       AND task."rootTaskId" = turn."rootTaskId" AND task."parentTaskId" = turn."rootTaskId"
+       AND task."role" = 'scout'
+     ORDER BY task."createdAt" ASC LIMIT 2`,
+    [owner.sessionId, owner.turnId, owner.userId],
+  )
+  const row = result.rows.length === 1 ? result.rows[0] : undefined
+  const envelope = diagnosticJsonRecord(row?.result)
+  const keys = envelope ? Object.keys(envelope).sort().join(",") : ""
+  const baseKeys = "finalItemId,finalText,status,stepCount,structuredResult,toolCallCount"
+  const typedKeys = [...baseKeys.split(","), "taskGraphVerificationReport"].sort().join(",")
+  const envelopeShape = keys === typedKeys ? "typed_with_report" : keys === baseKeys ? "base_without_report" : envelope ? "other" : "missing"
+  const envelopeStatus = diagnosticEnum(envelope?.status, new Set(["completed", "failed", "waiting"]))
+    ?? (envelope && Object.hasOwn(envelope, "status") ? "other" : "missing")
+  let validated: StructuredRoleResult | null = null
+  let roleResultValidity = "not_checked"
+  let roleResultValidationCode = "not_checked"
+  if (envelope && Object.hasOwn(envelope, "structuredResult")) {
+    roleResultValidity = "invalid"
+    roleResultValidationCode = "other"
+    try {
+      validated = validateRoleResult(envelope.structuredResult, "scout")
+      roleResultValidity = "valid"
+      roleResultValidationCode = "none"
+    } catch (error: unknown) {
+      const code = error instanceof RoleResultValidationError ? error.code : "other"
+      roleResultValidationCode = ROLE_RESULT_DIAGNOSTIC_CODES.has(code) ? code : "other"
+    }
+  }
+  const report = parseTaskGraphVerificationReport(envelope?.taskGraphVerificationReport, ["candidate-count"])
+  const rawReport = diagnosticJsonRecord(envelope?.taskGraphVerificationReport)
+  let resultDigestMatch = "not_checked"
+  if (validated && report) {
+    try { resultDigestMatch = report.resultDigest === taskGraphResultDigest(validated) ? "match" : "mismatch" }
+    catch { resultDigestMatch = "error" }
+  }
+  const projectionAvailability = validated
+    ? projectValidatedRoleResult(validated).availability === "available" ? "available" : "unavailable"
+    : "not_checked"
+  const taskStatus = diagnosticEnum(row?.status, TASK_DIAGNOSTIC_STATUSES) ?? (row ? "other" : "missing")
+  const reportStatus = diagnosticEnum(rawReport?.status, VERIFICATION_DIAGNOSTIC_STATUSES)
+    ?? (rawReport && Object.hasOwn(rawReport, "status") ? "other" : "missing")
+  return {
+    scopedScoutRows: result.rows.length === 0 ? "none" : result.rows.length === 1 ? "one" : "multiple",
+    taskStatus,
+    envelopeShape,
+    envelopeStatus,
+    envelopeCountersValid: Number.isSafeInteger(envelope?.stepCount) && Number(envelope?.stepCount) >= 0
+      && Number.isSafeInteger(envelope?.toolCallCount) && Number(envelope?.toolCallCount) >= 0,
+    envelopeFinalItemIdKind: envelope && Object.hasOwn(envelope, "finalItemId")
+      ? envelope.finalItemId === null ? "null" : typeof envelope.finalItemId === "string" ? "string" : "other"
+      : "missing",
+    envelopeFinalTextIsString: typeof envelope?.finalText === "string",
+    roleResultValidity,
+    roleResultValidationCode,
+    verificationReportValid: Boolean(report),
+    verificationReportStatus: reportStatus,
+    resultDigestMatch,
+    projectionAvailability,
+  }
+}
+
 function diagnosticHasTruncation(value: unknown, depth = 0, seen = new Set<object>()): boolean {
   if (depth > 32 || value === "[TRUNCATED]" || typeof value === "string" && value.includes("...[TRUNCATED]")) return true
   if (!value || typeof value !== "object") return false
@@ -7454,6 +7527,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         rootStage: discoveryRootStage,
         rootModelFailure: discoveryRootModelFailure ?? "not_captured",
         analystScheduleFailure: discoveryAnalystScheduleFailure ?? { errorName: "none", errorCode: "none" },
+        scoutResultValidation: await collectCanonicalDiscoveryScoutResultDiagnostic(pool!, discoveryOwner),
         analystPlan,
         analystWait,
         childStage: discoveryChildStage,
