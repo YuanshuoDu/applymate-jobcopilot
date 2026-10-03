@@ -7,9 +7,15 @@ import type { TaskGraphReadScope, TaskGraphScheduleInput } from "./task-graph-co
 import type { PgSubagentPool } from "./types.js"
 import { canonicalTaskGraphJson, taskGraphItemId, taskGraphProposalKey } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
+const ANALYST_VERIFICATION = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
+  role: "analyst",
+  criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }],
+} as const
 
 function dedicatedDisposableUrl(): string | null {
   const required = process.env.AGENT_RUNTIME_PG_TEST_REQUIRED === "true"
@@ -95,6 +101,7 @@ function scheduleInput(value: Fixture): TaskGraphScheduleInput {
         templateId: "analyst",
         goal: `Complete graph task ${index + 1}`,
         successCriteria: [`Task ${index + 1} completed`],
+        verification: ANALYST_VERIFICATION,
         dependsOn: index === 0 ? [] : [`task-${index}`],
       })),
     },
