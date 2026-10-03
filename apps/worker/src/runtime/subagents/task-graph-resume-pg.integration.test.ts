@@ -42,6 +42,12 @@ import { taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const PLAN_CALL_ID = "p3-resume-plan"
 const WAIT_CALL_ID = "p3-resume-wait"
+const DISCOVERY_RESTART_WAIT_CALL_ID = "p3-process-restart-discovery-wait-call"
+const DISCOVERY_RESTART_ANALYST_PLAN_CALL_ID = "p3-process-restart-discovery-analyst-plan"
+const DISCOVERY_RESTART_ANALYST_WAIT_CALL_ID = "p3-process-restart-discovery-analyst-wait"
+const DISCOVERY_RESTART_DIAGNOSTIC_CALL_IDS = new Set([
+  DISCOVERY_RESTART_WAIT_CALL_ID, DISCOVERY_RESTART_ANALYST_PLAN_CALL_ID, DISCOVERY_RESTART_ANALYST_WAIT_CALL_ID,
+])
 const FOLLOW_UP_PLAN_CALL_ID = "p3-resume-follow-up-plan"
 const FOLLOW_UP_WAIT_CALL_ID = "p3-resume-follow-up-wait"
 const RESTART_FOLLOW_UP_GOAL = "Verify the restored TaskGraph summary after restart"
@@ -292,6 +298,12 @@ const TURN_DIAGNOSTIC_STATUSES = new Set([
   "completed", "failed", "interrupted", "cancelled",
 ])
 const ITEM_DIAGNOSTIC_STATUSES = new Set(["started", "completed", "failed", "cancelled"])
+const STEP_DIAGNOSTIC_STATUSES = new Set([
+  "queued", "running", "completed", "failed", "interrupted", "waiting_for_tool", "waiting_for_approval", "waiting_for_user",
+])
+const ROOT_FAILURE_EVENT_TYPES = new Set(["turn.failed", "step.completed", "final.rejected", "task.failed"])
+const TOOL_ITEM_TYPES = new Set(["tool_call", "tool_result"])
+const TOOL_RESULT_DIAGNOSTIC_STATUSES = new Set(["accepted", "duplicate", "waiting", "ready", "timed_out", "interrupted", "closed"])
 const WAIT_DIAGNOSTIC_STATUSES = new Set(["waiting", "ready", "timed_out", "consumed", "failed", "cancelled", "interrupted", "closed"])
 const TOOL_DIAGNOSTIC_NAMES = new Set(["agent.plan", "agent.wait", "jobs.search"])
 const ERROR_DIAGNOSTIC_CODES = new Set([
@@ -299,6 +311,7 @@ const ERROR_DIAGNOSTIC_CODES = new Set([
   "budget_exhausted", "no_progress", "evidence_missing", "evidence_conflict", "business_precondition_failed",
   "tool_execution_failed", "tool_not_found", "schema_error", "capability_denied", "policy_denied",
   "policy_version_unknown", "timeout", "cancelled", "tool_result_replay_uncertain", "tool_recovery_aborted",
+  "durable_wait_receipt_invalid", "turn_execution_failed", "model_error",
   "task_graph_scope_unavailable", "task_graph_continuation_budget_required", "task_graph_proposal_too_large",
   "task_graph_sensitive_key_rejected", "task_graph_state_missing", "task_graph_receipt_invalid",
   "task_graph_schedule_failed", "task_graph_dispatch_conflict", "task_graph_dependency_blocked",
@@ -401,6 +414,27 @@ function diagnosticErrorCode(value: unknown): string | null {
   if (typeof value !== "string") return null
   if (ERROR_DIAGNOSTIC_CODES.has(value)) return value
   return /^task_graph_[a-z0-9_]{1,80}$/.test(value) ? "task_graph_other" : "other"
+}
+
+function diagnosticErrorClass(value: unknown): string | null {
+  if (typeof value !== "string" || value.length === 0) return null
+  if (/^[0-9A-Z]{5}$/.test(value)) return "database"
+  const code = diagnosticErrorCode(value)
+  if (!code) return null
+  if (code === "invalid_output") return "invalid_output"
+  if (code === "schema_error") return "tool_schema"
+  if (code === "durable_wait_receipt_invalid") return "wait_receipt"
+  if (code === "tool_result_replay_uncertain" || code === "tool_recovery_aborted") return "tool_replay"
+  if (code === "business_precondition_failed") return "completion_gate"
+  if (code.startsWith("task_graph_") || code === "revision_mismatch" || code === "task_graph_revision_mismatch") return "task_graph"
+  if (code === "turn_execution_failed" || code === "model_error") return "execution"
+  return "other"
+}
+
+function diagnosticFixtureCallId(value: unknown): string | null {
+  return typeof value === "string" && DISCOVERY_RESTART_DIAGNOSTIC_CALL_IDS.has(value)
+    ? boundedDiagnostic(value, 128)
+    : null
 }
 
 function diagnosticEnumList(value: unknown, allowed: ReadonlySet<string>, maxItems = 8): string[] {
@@ -735,6 +769,7 @@ function compactTurnProgressDiagnostics(progress: string, maxCharacters = 1_600)
 
   const turn = record(parsed.turn)
   const tool = record(parsed.waitToolResult)
+  const rootFailure = record(parsed.rootFailure)
   const waitLineage = record(parsed.waitLineage)
   const targetRows = record(waitLineage?.targetRows)
   const targetMismatchCounts = record(targetRows?.mismatchCounts)
@@ -754,6 +789,9 @@ function compactTurnProgressDiagnostics(progress: string, maxCharacters = 1_600)
   const closestReceiptNodeKeys = diagnosticEnumList(waitLineage?.closestReceiptNodeKeys, TASK_GRAPH_DIAGNOSTIC_NODE_KEYS)
   const tasks = Array.isArray(parsed.tasks) ? parsed.tasks.map(record).filter((item): item is RecordValue => item !== null) : []
   const waits = Array.isArray(parsed.waits) ? parsed.waits.map(record).filter((item): item is RecordValue => item !== null) : []
+  const rootFailureEvents = Array.isArray(rootFailure?.events) ? rootFailure.events.map(record).filter((item): item is RecordValue => item !== null) : []
+  const rootSteps = Array.isArray(parsed.rootSteps) ? parsed.rootSteps.map(record).filter((item): item is RecordValue => item !== null) : []
+  const rootToolItems = Array.isArray(parsed.rootToolItems) ? parsed.rootToolItems.map(record).filter((item): item is RecordValue => item !== null) : []
   const snapshot = {
     turn: turn ? {
       status: diagnosticEnum(turn.status, TURN_DIAGNOSTIC_STATUSES),
@@ -773,6 +811,48 @@ function compactTurnProgressDiagnostics(progress: string, maxCharacters = 1_600)
         ? record(tool.truncated)?.truncatedTaskResultCount
         : null,
     } : null,
+    rootFailure: rootFailure ? {
+      taskFound: rootFailure.taskFound === true,
+      reasonPresent: rootFailure.reasonPresent === true,
+      reasonCode: diagnosticErrorCode(rootFailure.reasonCode),
+      reasonClass: diagnosticErrorClass(rootFailure.reasonCode),
+      events: rootFailureEvents.slice(0, 8).map(event => ({
+        eventType: diagnosticEnum(event.eventType, ROOT_FAILURE_EVENT_TYPES),
+        status: diagnosticEnum(event.status, new Set(["completed", "failed", "interrupted"])),
+        errorCode: diagnosticErrorCode(event.errorCode),
+        errorClass: diagnosticErrorClass(event.errorCode),
+      })),
+    } : null,
+    rootSteps: rootSteps.slice(0, 16).map(step => ({
+      ordinal: diagnosticBoundedCount(step.ordinal),
+      status: diagnosticEnum(step.status, STEP_DIAGNOSTIC_STATUSES),
+      errorCode: diagnosticErrorCode(step.errorCode),
+      errorClass: diagnosticErrorClass(step.errorCode),
+    })),
+    rootToolItems: rootToolItems.slice(0, 12).flatMap(item => {
+      const callId = diagnosticFixtureCallId(item.callId)
+      if (!callId) return []
+      const input = record(item.input)
+      const output = record(item.output)
+      return [{
+        callId,
+        type: diagnosticEnum(item.type, TOOL_ITEM_TYPES),
+        status: diagnosticEnum(item.status, ITEM_DIAGNOSTIC_STATUSES),
+        toolName: diagnosticEnum(item.toolName, TOOL_DIAGNOSTIC_NAMES),
+        toolStatus: diagnosticEnum(item.toolStatus, ITEM_DIAGNOSTIC_STATUSES),
+        errorCode: diagnosticErrorCode(item.errorCode),
+        errorClass: diagnosticErrorClass(item.errorCode),
+        inputTaskCount: diagnosticBoundedCount(Array.isArray(input?.taskIds) ? input.taskIds.length : null),
+        inputNodeCount: diagnosticBoundedCount(Array.isArray(input?.nodes) ? input.nodes.length : null),
+        outputStatus: diagnosticEnum(output?.status, TOOL_RESULT_DIAGNOSTIC_STATUSES),
+        outputWaitIdPresent: typeof output?.waitId === "string",
+        outputTaskCount: diagnosticBoundedCount(Array.isArray(output?.tasks) ? output.tasks.length : null),
+        outputMatchedTaskCount: diagnosticBoundedCount(Array.isArray(output?.matchedTaskIds) ? output.matchedTaskIds.length : null),
+        outputNodeCount: diagnosticBoundedCount(Array.isArray(output?.nodes) ? output.nodes.length : null),
+        outputNodeTaskIdCount: diagnosticBoundedCount(Array.isArray(output?.nodes)
+          ? output.nodes.filter(node => typeof record(node)?.taskId === "string").length : null),
+      }]
+    }),
     executionFailures: executionFailures.slice(0, 4).map(failure => ({
       eventType: diagnosticEnum(failure.eventType, new Set(["step.completed", "turn.failed"])),
       status: diagnosticEnum(failure.status, new Set(["failed", "interrupted"])),
@@ -2587,7 +2667,7 @@ async function turnProgressDiagnostics(
   const turn = turnResult.rows[0]
   if (!turn) return JSON.stringify({ turnId, missing: true })
 
-  const [toolResultItem, tasks, waits, events, dispatches, lifecycleFailures] = await Promise.all([
+  const [toolResultItem, tasks, waits, events, dispatches, lifecycleFailures, rootSteps, rootFailureEvents, rootToolItems] = await Promise.all([
     diagnosticToolCallId
       ? pool.query<{ status: string; content: unknown }>(`SELECT "status", "content" FROM "agent_items"
         WHERE "turnId" = $1 AND "type" = 'tool_result' AND "content"->>'toolCallId' = $2
@@ -2619,6 +2699,26 @@ async function turnProgressDiagnostics(
         FROM "agent_events" WHERE "turnId" = $1 AND "type" = 'tool_call.failed' AND "payload"->>'toolCallId' = ANY($2::text[])
         ORDER BY "sequence" DESC LIMIT 4`, [turnId, diagnosticToolCallIds])
       : Promise.resolve(null),
+    turn.rootTaskId
+      ? pool.query<{ ordinal: number; status: string; errorCode: string | null }>(`SELECT "ordinal", "status", "errorCode"
+          FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+          ORDER BY "ordinal" ASC, "attempt" ASC LIMIT 16`, [turn.sessionId, turnId, turn.rootTaskId])
+      : Promise.resolve({ rows: [] }),
+    turn.rootTaskId
+      ? pool.query<{ type: string; status: string | null; errorCode: string | null }>(`SELECT "type",
+          "payload"->>'status' AS "status", COALESCE("payload"->>'errorCode', "payload"->>'code') AS "errorCode"
+        FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
+          AND ("taskId" = $3 OR "taskId" IS NULL)
+          AND ("type" IN ('turn.failed', 'final.rejected', 'task.failed')
+            OR ("type" = 'step.completed' AND "payload"->>'status' IN ('failed', 'interrupted')))
+        ORDER BY "sequence" DESC LIMIT 8`, [turn.sessionId, turnId, turn.rootTaskId])
+      : Promise.resolve({ rows: [] }),
+    turn.rootTaskId && diagnosticToolCallIds.length > 0
+      ? pool.query<{ type: string; status: string; content: unknown }>(`SELECT "type", "status", "content"
+          FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+            AND "type" IN ('tool_call', 'tool_result') AND "content"->>'toolCallId' = ANY($4::text[])
+          ORDER BY "createdAt" ASC LIMIT 12`, [turn.sessionId, turnId, turn.rootTaskId, diagnosticToolCallIds])
+      : Promise.resolve({ rows: [] }),
   ])
   const resultItem = toolResultItem?.rows[0]
   const resultContent = record(resultItem?.content)
@@ -2671,9 +2771,55 @@ async function turnProgressDiagnostics(
   })
   const waitLineage = await initialWaitLineageDiagnostics(pool, turn, diagnosticToolCallId)
   const recentEvents = events.rows.map(({ diagnosticStatus: _status, diagnosticErrorCode: _errorCode, ...event }) => event)
+  const rootTask = tasks.rows.find(task => task.id === turn.rootTaskId)
+  const diagnosticRootToolItems = rootToolItems.rows.flatMap(item => {
+    const content = record(item.content)
+    const callId = diagnosticFixtureCallId(content?.toolCallId)
+    if (!callId) return []
+    const input = record(content?.input)
+    const output = record(content?.output)
+    return [{
+      callId,
+      type: diagnosticEnum(item.type, TOOL_ITEM_TYPES),
+      status: diagnosticEnum(item.status, ITEM_DIAGNOSTIC_STATUSES),
+      toolName: diagnosticEnum(content?.toolName, TOOL_DIAGNOSTIC_NAMES)
+        ?? (callId === DISCOVERY_RESTART_ANALYST_PLAN_CALL_ID ? "agent.plan" : "agent.wait"),
+      toolStatus: diagnosticEnum(content?.status, ITEM_DIAGNOSTIC_STATUSES),
+      errorCode: diagnosticErrorCode(content?.errorCode),
+      errorClass: diagnosticErrorClass(content?.errorCode),
+      inputTaskCount: diagnosticBoundedCount(Array.isArray(input?.taskIds) ? input.taskIds.length : null),
+      inputNodeCount: diagnosticBoundedCount(Array.isArray(input?.nodes) ? input.nodes.length : null),
+      outputStatus: diagnosticEnum(output?.status, TOOL_RESULT_DIAGNOSTIC_STATUSES),
+      outputWaitIdPresent: typeof output?.waitId === "string",
+      outputTaskCount: diagnosticBoundedCount(Array.isArray(output?.tasks) ? output.tasks.length : null),
+      outputMatchedTaskCount: diagnosticBoundedCount(Array.isArray(output?.matchedTaskIds) ? output.matchedTaskIds.length : null),
+      outputNodeCount: diagnosticBoundedCount(Array.isArray(output?.nodes) ? output.nodes.length : null),
+      outputNodeTaskIdCount: diagnosticBoundedCount(Array.isArray(output?.nodes)
+        ? output.nodes.filter(node => typeof record(node)?.taskId === "string").length : null),
+    }]
+  })
   return JSON.stringify({
     turn, waitToolResult, waitLineage, tasks: tasks.rows, waits: waits.rows, recentEvents,
     diagnosticToolFailures, executionFailures, recentOutbox: dispatches.rows,
+    rootFailure: {
+      taskFound: Boolean(rootTask),
+      reasonPresent: typeof rootTask?.failureReason === "string",
+      reasonCode: diagnosticErrorCode(rootTask?.failureReason),
+      reasonClass: diagnosticErrorClass(rootTask?.failureReason),
+      events: rootFailureEvents.rows.map(event => ({
+        eventType: diagnosticEnum(event.type, ROOT_FAILURE_EVENT_TYPES),
+        status: diagnosticEnum(event.status, new Set(["completed", "failed", "interrupted"])),
+        errorCode: diagnosticErrorCode(event.errorCode),
+        errorClass: diagnosticErrorClass(event.errorCode),
+      })),
+    },
+    rootSteps: rootSteps.rows.map(step => ({
+      ordinal: diagnosticBoundedCount(step.ordinal),
+      status: diagnosticEnum(step.status, STEP_DIAGNOSTIC_STATUSES),
+      errorCode: diagnosticErrorCode(step.errorCode),
+      errorClass: diagnosticErrorClass(step.errorCode),
+    })),
+    rootToolItems: diagnosticRootToolItems,
   })
 }
 
@@ -2801,6 +2947,44 @@ describe("compact TaskGraph wait failure diagnostics", () => {
     expect(projected).toMatchObject({
       waitLineage: { taskIdsMatchCurrentGraph: false, requestedTaskIdsPresentInCurrentGraph: true },
     })
+  })
+
+  it("projects root failure, steps, and exact restart tool items without leaking content", () => {
+    const privateText = "private-root-prompt-or-task-id"
+    const projected = JSON.parse(compactTurnProgressDiagnostics(JSON.stringify({
+      rootFailure: {
+        taskFound: true, reasonPresent: true, reasonCode: "invalid_output", privateFailureReason: privateText,
+        events: [{ eventType: "turn.failed", status: null, errorCode: "invalid_output", message: privateText }],
+      },
+      rootSteps: [
+        { ordinal: 4, status: "completed", errorCode: null, privatePrompt: privateText },
+        { ordinal: 5, status: "failed", errorCode: "invalid_output", errorMessage: privateText },
+      ],
+      rootToolItems: [
+        { callId: DISCOVERY_RESTART_WAIT_CALL_ID, type: "tool_result", status: "completed", toolName: "agent.wait", toolStatus: "completed", output: { status: "ready", waitId: privateText, matchedTaskIds: [privateText], tasks: [{ taskId: privateText }] } },
+        { callId: DISCOVERY_RESTART_ANALYST_PLAN_CALL_ID, type: "tool_result", status: "completed", toolName: "agent.plan", toolStatus: "completed", output: { status: "accepted", nodes: [{ taskId: privateText }] } },
+        { callId: DISCOVERY_RESTART_ANALYST_WAIT_CALL_ID, type: "tool_call", status: "completed", toolName: "agent.wait", toolStatus: "completed", input: { taskIds: [privateText], goal: privateText } },
+        { callId: "untrusted-private-call-id", type: "tool_result", status: "completed", toolName: "agent.wait", output: { status: "ready" } },
+      ],
+    }), 4_000)) as RecordValue
+
+    expect(projected).toMatchObject({
+      rootFailure: {
+        taskFound: true, reasonPresent: true, reasonCode: "invalid_output", reasonClass: "invalid_output",
+        events: [{ eventType: "turn.failed", errorCode: "invalid_output", errorClass: "invalid_output" }],
+      },
+      rootSteps: [
+        { ordinal: 4, status: "completed", errorCode: null, errorClass: null },
+        { ordinal: 5, status: "failed", errorCode: "invalid_output", errorClass: "invalid_output" },
+      ],
+      rootToolItems: [
+        { callId: DISCOVERY_RESTART_WAIT_CALL_ID, type: "tool_result", status: "completed", toolName: "agent.wait", outputStatus: "ready", outputWaitIdPresent: true, outputMatchedTaskCount: 1, outputTaskCount: 1 },
+        { callId: DISCOVERY_RESTART_ANALYST_PLAN_CALL_ID, type: "tool_result", status: "completed", toolName: "agent.plan", outputStatus: "accepted", outputNodeCount: 1, outputNodeTaskIdCount: 1 },
+        { callId: DISCOVERY_RESTART_ANALYST_WAIT_CALL_ID, type: "tool_call", status: "completed", toolName: "agent.wait", inputTaskCount: 1 },
+      ],
+    })
+    expect(JSON.stringify(projected)).not.toContain(privateText)
+    expect(JSON.stringify(projected)).not.toContain("untrusted-private-call-id")
   })
 
   it("selects the newest exact plan receipt when tool-use IDs repeat", () => {
@@ -6189,7 +6373,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
 
       workerTwo = startTaskGraphRestartWorker("resume-discovery", { ...value, jobId })
       await waitForProcessLine(workerTwo, "P3_DISCOVERY_SECOND_WORKER_READY ", 45_000)
-      await waitForTurnStatus(pool!, value.turnId, "completed", 90_000)
+      await waitForTurnStatus(pool!, value.turnId, "completed", 90_000, DISCOVERY_RESTART_WAIT_CALL_ID, [
+        DISCOVERY_RESTART_ANALYST_PLAN_CALL_ID, DISCOVERY_RESTART_ANALYST_WAIT_CALL_ID,
+      ])
 
       const root = await pool!.query<{ id: string; status: string; result: unknown }>(
         `SELECT "id", "status", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "role" = 'orchestrator'`,
