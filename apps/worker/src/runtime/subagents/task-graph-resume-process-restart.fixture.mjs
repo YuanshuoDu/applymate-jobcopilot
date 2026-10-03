@@ -1384,7 +1384,7 @@ async function runSecondWorker() {
           stage = "dependency_context"
           const items = Array.isArray(record(record(lease.context)?.taskGraphDependencyResults)?.items)
             ? record(record(lease.context)?.taskGraphDependencyResults).items.map(record) : []
-          if (items[0]?.dependencyKey !== "source" || items[0]?.taskStatus !== "completed" || !isExpectedSourceProjection(items[0]?.result)) {
+          if (items[0]?.dependencyKey !== "source" || items[0]?.taskStatus !== "completed" || !isExpectedSourceProjection(items[0]?.result, ids.jobId)) {
             throw new Error("p3_dependency_context_not_restored")
           }
           say("P3_SOURCE_PROOF_UNLOCKED_DEPENDENT")
