@@ -235,6 +235,20 @@ function boundedErrorText(error: unknown, maxCharacters = 1_000): string {
   return boundedDiagnostic(value, maxCharacters)
 }
 
+function childFixtureErrorSummary(error: unknown): string {
+  const fields = record(error)
+  const candidateName = error instanceof Error ? error.name : typeof fields?.name === "string" ? fields.name : "UnknownError"
+  const name = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(candidateName) ? candidateName : "UnknownError"
+  const candidateMessage = error instanceof Error ? error.message : typeof fields?.message === "string" ? fields.message : String(error)
+  const message = candidateMessage
+    .replace(/(?:postgres(?:ql)?|redis):\/\/[^\s"'`]+/gi, "<connection-url>")
+    .replace(/\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b/g, "<email>")
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, "<id>")
+    .replace(/(?:[A-Za-z]:\\|\/(?:Users|home|tmp)\/)[^\s"'`]+/g, "<path>")
+    .replace(/\b(password|secret|token|authorization|cookie)\s*[:=]\s*\S+/gi, "$1=<redacted>")
+  return boundedDiagnostic(`${name}: ${message}`, 300)
+}
+
 function safeFailurePreflightErrorClass(error: unknown): FailurePreflightErrorClass {
   const fields = record(error)
   const code = fields?.code
@@ -1303,6 +1317,8 @@ type FixtureTurnLimits = { readonly maxSteps: number; readonly maxToolCalls: num
 const DEFAULT_FIXTURE_TURN_LIMITS: FixtureTurnLimits = { maxSteps: 8, maxToolCalls: 8 }
 // The discovery fixtures execute root planning/replanning and child turns under the same root-scoped ceiling.
 const DISCOVERY_FIXTURE_TURN_LIMITS: FixtureTurnLimits = { maxSteps: 16, maxToolCalls: 8 }
+// The main TaskGraph fixture needs 10 steps: five root rounds and five child evidence steps; retain bounded headroom.
+const TASK_GRAPH_FIXTURE_TURN_LIMITS: FixtureTurnLimits = { maxSteps: 12, maxToolCalls: 12 }
 
 async function seed(
   pool: Pool,
@@ -5095,6 +5111,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let completedGraphStateFailureDiagnostics: string | null = null
     let rootModelFailureStage: RootModelFailureStage = "not_started"
     let childFixtureFailureStage: ChildFixtureFailureStage | null = null
+    let childFixtureFailureSummary: string | null = null
     let rootWaitHandoffFailure: string | null = null
     const runtime = await createCanonicalTurnRuntime(pool!, {
       workerId: owner.ownerId,
@@ -5465,13 +5482,21 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             stage = "unexpected_role"
             throw new Error(`Unexpected TaskGraph child role: ${lease.role}`)
           } catch (error: unknown) {
-            childFixtureFailureStage ??= stage
+            if (childFixtureFailureStage === null) {
+              childFixtureFailureStage = stage
+              childFixtureFailureSummary = childFixtureErrorSummary(error)
+            }
             throw error
           }
         },
       },
     })
 
+    const budgetUpdate = await pool!.query(`UPDATE "agent_turns" SET "budgetSnapshot" = $2::jsonb
+      WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4`, [
+      owner.turnId, JSON.stringify({ limits: TASK_GRAPH_FIXTURE_TURN_LIMITS }), owner.sessionId, owner.userId,
+    ])
+    if (budgetUpdate.rowCount !== 1) throw new Error("Main TaskGraph fixture could not apply its test-specific turn budget")
     await enqueueTurn(pool!, bootstrap.turns.queue, {
       turnId: owner.turnId, sessionId: owner.sessionId, ownerId: owner.ownerId,
     })
@@ -5489,7 +5514,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         ? [{ label: "completedGraphStateEvidence", value: "captured", safeValue: completedGraphStateFailureDiagnostics }]
         : []
       const childFailureDiagnostic: FailureDiagnosticField[] = childFixtureFailureStage
-        ? [{ label: `childFixtureFailureAt_${childFixtureFailureStage}`, value: "captured" }]
+        ? [
+          { label: `childFixtureFailureAt_${childFixtureFailureStage}`, value: "captured" },
+          { label: "childFixtureError", value: "captured", safeValue: childFixtureFailureSummary ?? "<not captured>" },
+        ]
         : []
       const handoffSuffix = rootWaitHandoffFailure
         ? `; waitHandoffState=${JSON.stringify(waitHandoffFailureProjection(rootWaitHandoffFailure))}`
