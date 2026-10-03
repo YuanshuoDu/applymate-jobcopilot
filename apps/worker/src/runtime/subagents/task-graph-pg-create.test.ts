@@ -13,6 +13,10 @@ const analystVerification = {
   schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
   criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }],
 } as const
+const scoutVerification = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+  criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }],
+} as const
 
 function plannedNode(node: Omit<TaskGraphNodeProposal, "verification">): TaskGraphNodeProposal {
   return { ...node, verification: analystVerification }
@@ -36,7 +40,14 @@ describe("createGraphTasks", () => {
       if (sql.includes('JOIN "agent_turns" AS turn')) return { rows: [{
         id: "source-1", status: "completed", role: "scout",
         expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
-        result: { status: "completed", stepCount: 2, toolCallCount: 1, finalItemId: "item-source", finalText: "Found one job", structuredResult: scoutResult },
+        result: {
+          status: "completed", stepCount: 2, toolCallCount: 1, finalItemId: "item-source", finalText: "Found one job", structuredResult: scoutResult,
+          taskGraphVerificationReport: {
+            verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
+            criteria: [{ criterionId: "candidate-count", status: "passed", reasonCode: "criteria_met" }],
+            evidenceDigest: "a".repeat(64), resultDigest: taskGraphResultDigest(scoutResult),
+          },
+        },
         userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
       }], rowCount: 1 }
       if (sql.startsWith('INSERT INTO "sub_agent_tasks"')) {
@@ -60,7 +71,7 @@ describe("createGraphTasks", () => {
       } },
     }
     const current: TaskGraphState = {
-      revision: 1, nodes: [{ key: "source", templateId: "scout", goal: "Find source", successCriteria: ["done"], dependsOn: [], depth: 1, status: "completed" }], appliedEvents: [],
+      revision: 1, nodes: [{ key: "source", templateId: "scout", goal: "Find source", successCriteria: ["done"], dependsOn: [], depth: 1, status: "completed", verificationDisposition: "typed", verification: scoutVerification }], appliedEvents: [],
     }
 
     const receipt = await createGraphTasks(client, input, { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 4, maxFanOut: 1, maxAttempts: 2 } } }, current, new Map([["source", "source-1"]]))
@@ -78,6 +89,144 @@ describe("createGraphTasks", () => {
     }])
     expect(JSON.stringify(dependencyEvidence)).not.toContain("job-evidence")
     expect(query.mock.calls.find(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"'))).toBeDefined()
+  })
+
+  it("rejects a plan transitively dependent on a completed legacy-unverified source", async () => {
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes('SELECT "id", "rootTaskId", "path"')) return { rows: [{
+        id: "root-1", rootTaskId: "root-1", path: "/root-1", depth: 0, status: "running", allowedActions: [],
+        modelProfileSnapshot: {}, budgetSnapshot: {}, toolPolicySnapshot: {},
+      }], rowCount: 1 }
+      if (sql.includes("COUNT(*)::int")) return { rows: [{ count: 0 }], rowCount: 1 }
+      if (sql.startsWith('INSERT INTO "sub_agent_tasks"')) return { rows: [{ id: "child-2" }], rowCount: 1 }
+      if (sql.startsWith('SELECT task.*, session."userId"')) return { rows: [taskRow()], rowCount: 1 }
+      if (sql.includes('SET "status" = \'waiting\'')) return { rows: [], rowCount: 1 }
+      return { rows: [], rowCount: 1 }
+    })
+    const client = { query } as unknown as Pick<pg.PoolClient, "query">
+    const input: TaskGraphScheduleInput = {
+      scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", stepId: "step", turnLeaseOwner: "turn", turnLeaseVersion: 1, parentLeaseOwner: "parent", parentAttemptCount: 1 },
+      proposal: { expectedRevision: 1, nodes: [
+        plannedNode({ key: "after-next", templateId: "analyst", goal: "Continue again", successCriteria: ["done"], dependsOn: ["next"] }),
+        plannedNode({ key: "next", templateId: "analyst", goal: "Continue", successCriteria: ["done"], dependsOn: ["source"] }),
+      ] },
+      templates: { analyst: { role: "analyst", taskType: "research", allowedActions: [] } },
+    }
+    const current: TaskGraphState = {
+      revision: 1, nodes: [{ key: "source", templateId: "scout", goal: "Find source", successCriteria: ["done"], dependsOn: [], depth: 1, status: "completed", verificationDisposition: "legacy_unverified" }], appliedEvents: [],
+    }
+
+    await expect(createGraphTasks(client, input, { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 4, maxFanOut: 2, maxAttempts: 2 } } }, current, new Map([["source", "source-1"]])))
+      .rejects.toThrow("task_graph_dependency_unverified")
+
+    expect(query.mock.calls.some(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
+    expect(query.mock.calls.some(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"'))).toBe(false)
+  })
+
+  it("rejects a proposal depending on a completed typed node tainted by a legacy source", async () => {
+    const query = vi.fn(async (_sql: string) => ({ rows: [], rowCount: 1 }))
+    const client = { query } as unknown as Pick<pg.PoolClient, "query">
+    const input: TaskGraphScheduleInput = {
+      scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", stepId: "step", turnLeaseOwner: "turn", turnLeaseVersion: 1, parentLeaseOwner: "parent", parentAttemptCount: 1 },
+      proposal: { expectedRevision: 2, nodes: [plannedNode({ key: "follow-up", templateId: "analyst", goal: "Continue", successCriteria: ["done"], dependsOn: ["typed-intermediary"] })] },
+      templates: { analyst: { role: "analyst", taskType: "research", allowedActions: [] } },
+    }
+    const current: TaskGraphState = {
+      revision: 2, nodes: [
+        { key: "legacy-source", templateId: "scout", goal: "Find source", successCriteria: ["done"], dependsOn: [], depth: 1, status: "completed", verificationDisposition: "legacy_unverified" },
+        { key: "typed-intermediary", templateId: "analyst", goal: "Analyze source", successCriteria: ["done"], dependsOn: ["legacy-source"], depth: 2, status: "completed", verificationDisposition: "typed", verification: analystVerification },
+      ], appliedEvents: [],
+    }
+
+    await expect(createGraphTasks(client, input, { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 4, maxFanOut: 1, maxAttempts: 2 } } }, current,
+      new Map([["legacy-source", "source-1"], ["typed-intermediary", "intermediary-1"]])))
+      .rejects.toThrow("task_graph_dependency_unverified")
+
+    expect(query.mock.calls.some(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
+    expect(query.mock.calls.some(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"'))).toBe(false)
+  })
+
+  it("allows a typed follow-up across a specialized boundary after a tainted typed node", async () => {
+    const artifactRef = {
+      artifactId: "artifact-1", version: 1,
+      contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: `sha256:${"b".repeat(64)}`,
+    }
+    const writerResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef }
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes('SELECT "id", "rootTaskId", "path"')) return { rows: [{
+        id: "root-1", rootTaskId: "root-1", path: "/root-1", depth: 0, status: "running", allowedActions: [],
+        modelProfileSnapshot: {}, budgetSnapshot: {}, toolPolicySnapshot: {},
+      }], rowCount: 1 }
+      if (sql.includes("COUNT(*)::int")) return { rows: [{ count: 0 }], rowCount: 1 }
+      if (sql.includes('task."expectedOutputSchema"')) return { rows: [{
+        id: "writer-1", status: "completed", role: "writer", failureReason: null,
+        expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "writer" },
+        result: { status: "completed", stepCount: 1, toolCallCount: 1, finalItemId: "item-writer", finalText: "Draft saved", structuredResult: writerResult },
+        userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
+      }], rowCount: 1 }
+      if (sql.startsWith('INSERT INTO "sub_agent_tasks"')) return { rows: [{ id: "follow-up-1" }], rowCount: 1 }
+      if (sql.startsWith('SELECT task.*, session."userId"')) return { rows: [{ ...taskRow(), id: "follow-up-1" }], rowCount: 1 }
+      if (sql.startsWith('INSERT INTO "agent_outbox"')) return { rows: [], rowCount: 1 }
+      return { rows: [], rowCount: 1 }
+    })
+    const client = { query } as unknown as Pick<pg.PoolClient, "query">
+    const input: TaskGraphScheduleInput = {
+      scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", stepId: "step", turnLeaseOwner: "turn", turnLeaseVersion: 1, parentLeaseOwner: "parent", parentAttemptCount: 1 },
+      proposal: { expectedRevision: 3, nodes: [plannedNode({ key: "follow-up", templateId: "analyst", goal: "Continue from the reviewed draft", successCriteria: ["done"], dependsOn: ["specialized-boundary"] })] },
+      templates: { analyst: { role: "analyst", taskType: "research", allowedActions: [] } },
+    }
+    const current: TaskGraphState = {
+      revision: 3, nodes: [
+        { key: "legacy-source", templateId: "scout", goal: "Find source", successCriteria: ["done"], dependsOn: [], depth: 1, status: "completed", verificationDisposition: "legacy_unverified" },
+        { key: "typed-intermediary", templateId: "analyst", goal: "Analyze source", successCriteria: ["done"], dependsOn: ["legacy-source"], depth: 2, status: "completed", verificationDisposition: "typed", verification: analystVerification },
+        { key: "specialized-boundary", templateId: "cover_letter_writer", goal: "Save draft", successCriteria: ["Persist draft"], dependsOn: ["typed-intermediary"], depth: 3, status: "completed", verificationDisposition: "specialized" },
+      ], appliedEvents: [],
+    }
+
+    const receipt = await createGraphTasks(client, input, { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 4, maxFanOut: 1, maxAttempts: 2 } } }, current,
+      new Map([["legacy-source", "source-1"], ["typed-intermediary", "intermediary-1"], ["specialized-boundary", "writer-1"]]))
+
+    expect(receipt.created).toMatchObject([{ key: "follow-up", taskId: "follow-up-1", status: "queued" }])
+    expect(receipt.readyTaskIds).toEqual(["follow-up-1"])
+  })
+
+  it("rejects a typed completed source when its persisted passed report is missing", async () => {
+    const scoutResult = {
+      schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+      candidates: [{ jobId: "job-1", source: "greenhouse", url: null, evidenceIds: ["job-evidence"] }],
+      evidence: [{ id: "job-evidence", kind: "job", ref: "job-1", source: "greenhouse" }], summary: "Found one job",
+    }
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes('SELECT "id", "rootTaskId", "path"')) return { rows: [{
+        id: "root-1", rootTaskId: "root-1", path: "/root-1", depth: 0, status: "running", allowedActions: [],
+        modelProfileSnapshot: {}, budgetSnapshot: {}, toolPolicySnapshot: {},
+      }], rowCount: 1 }
+      if (sql.includes("COUNT(*)::int")) return { rows: [{ count: 0 }], rowCount: 1 }
+      if (sql.includes('JOIN "agent_turns" AS turn')) return { rows: [{
+        id: "source-1", status: "completed", role: "scout", expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
+        result: { status: "completed", stepCount: 1, toolCallCount: 1, finalItemId: "item-source", finalText: "Found one job", structuredResult: scoutResult },
+        userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
+      }], rowCount: 1 }
+      if (sql.startsWith('INSERT INTO "sub_agent_tasks"')) return { rows: [{ id: "child-2" }], rowCount: 1 }
+      if (sql.startsWith('SELECT task.*, session."userId"')) return { rows: [taskRow()], rowCount: 1 }
+      if (sql.includes('SET "status" = \'waiting\'')) return { rows: [], rowCount: 1 }
+      return { rows: [], rowCount: 1 }
+    })
+    const client = { query } as unknown as Pick<pg.PoolClient, "query">
+    const input: TaskGraphScheduleInput = {
+      scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", stepId: "step", turnLeaseOwner: "turn", turnLeaseVersion: 1, parentLeaseOwner: "parent", parentAttemptCount: 1 },
+      proposal: { expectedRevision: 1, nodes: [plannedNode({ key: "next", templateId: "analyst", goal: "Continue", successCriteria: ["done"], dependsOn: ["source"] })] },
+      templates: { analyst: { role: "analyst", taskType: "research", allowedActions: [] } },
+    }
+    const current: TaskGraphState = {
+      revision: 1, nodes: [{ key: "source", templateId: "scout", goal: "Find source", successCriteria: ["done"], dependsOn: [], depth: 1, status: "completed", verificationDisposition: "typed", verification: scoutVerification }], appliedEvents: [],
+    }
+
+    await expect(createGraphTasks(client, input, { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 4, maxFanOut: 1, maxAttempts: 2 } } }, current, new Map([["source", "source-1"]])))
+      .rejects.toThrow("task_graph_dependency_result_invalid")
+
+    expect(query.mock.calls.some(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
+    expect(query.mock.calls.some(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"'))).toBe(false)
   })
 
   it("allows a new bounded plan after an earlier child completed", async () => {

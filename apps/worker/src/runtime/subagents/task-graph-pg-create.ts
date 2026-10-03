@@ -51,27 +51,54 @@ export async function createGraphTasks(client: Queryable, input: TaskGraphSchedu
   const appended = appendTaskGraphProposal(current, input.proposal, options)
   if (!appended.ok) throw Object.assign(new Error(appended.error.message), { code: appended.error.code })
   const existingIds = new Map(priorTaskIds)
+  const previewTaskIds = new Map(existingIds)
+  input.proposal.nodes.forEach((node, index) => previewTaskIds.set(node.key, `subagent-${String(index).padStart(36, "0")}`))
+  const snapshot = taskGraphSnapshot(appended.state, previewTaskIds)
+  const dispositions = new Map(snapshot.nodes.map(node => [node.key, node.verificationDisposition] as const))
+  const completedLegacyDependencies = new Set(current.nodes.filter(node => node.status === "completed"
+    && dispositions.get(node.key) === "legacy_unverified").map(node => node.key))
+  const unverifiedAncestors = new Set(completedLegacyDependencies)
+  let propagated = true
+  while (propagated) {
+    propagated = false
+    for (const node of [...current.nodes, ...input.proposal.nodes]) if (dispositions.get(node.key) === "typed" && !unverifiedAncestors.has(node.key)
+      && node.dependsOn.some(key => unverifiedAncestors.has(key))) {
+      unverifiedAncestors.add(node.key)
+      propagated = true
+    }
+  }
+  if (input.proposal.nodes.some(node => unverifiedAncestors.has(node.key))) {
+    throw new Error("task_graph_dependency_unverified")
+  }
   const statuses = new Map(current.nodes.map(node => [node.key, node.status] as const))
   const logicalStatuses = new Map(statuses)
   for (const key of current.repairSatisfiedNodeKeys ?? []) logicalStatuses.set(key, "completed")
   const dependencies = new Map([...current.nodes, ...input.proposal.nodes].map(node => [node.key, node] as const))
-  const previewStatuses = new Map(statuses), previewTaskIds = new Map(existingIds)
+  const preflightStatuses = new Map(statuses)
   input.proposal.nodes.forEach((node, index) => {
-    const status = node.dependsOn.every(key => logicalStatuses.get(key) === "completed") ? "queued" : "waiting"
-    previewStatuses.set(node.key, status); logicalStatuses.set(node.key, status)
-    previewTaskIds.set(node.key, `subagent-${String(index).padStart(36, "0")}`)
+    const status = node.dependsOn.every(key => isPreflightDependency(key, logicalStatuses, dispositions, current.repairSatisfiedNodeKeys)) ? "queued" : "waiting"
+    preflightStatuses.set(node.key, status); logicalStatuses.set(node.key, status)
   })
-  taskGraphSnapshot({ ...appended.state, nodes: appended.state.nodes.map(node => ({ ...node, status: previewStatuses.get(node.key)! })) }, previewTaskIds)
   await validateRepairTargets(client, input, current, priorTaskIds)
-  const readyDependencyKeys = [...new Set(input.proposal.nodes.flatMap(node => previewStatuses.get(node.key) === "queued" ? node.dependsOn : []))]
-  const completedDependencies = new Map((await loadTaskGraphDependencyResults(client, input.scope, readyDependencyKeys, taskGraphSnapshot(current, priorTaskIds).nodes)).map(item => [item.key, item] as const))
+  const readyDependencyKeys = [...new Set(input.proposal.nodes.flatMap(node => preflightStatuses.get(node.key) === "queued" ? node.dependsOn : []))]
+  const completedDependencies = new Map((await loadTaskGraphDependencyResults(client, input.scope, readyDependencyKeys, snapshot.nodes)).map(item => [item.key, item] as const))
+  const satisfiedDependencies = new Set<string>()
+  for (const [key, dependency] of completedDependencies) {
+    if (current.repairSatisfiedNodeKeys?.includes(key)) {
+      if (dependency.repairComposite === true) satisfiedDependencies.add(key)
+    } else if (dependency.status === "completed" && !dependency.failureReason
+      && dependency.verificationDisposition !== "legacy_unverified") satisfiedDependencies.add(key)
+  }
   const taskIds = new Map(existingIds)
   const created: Array<{ key: string; taskId: string; status: "queued" | "waiting" }> = []
   const readyTaskIds: string[] = []
+  logicalStatuses.clear()
+  for (const [key, status] of statuses) logicalStatuses.set(key, status)
+  for (const key of satisfiedDependencies) logicalStatuses.set(key, "completed")
   for (const node of input.proposal.nodes) {
     if (node.dependsOn.some(key => hasFailedAncestor(key, dependencies, logicalStatuses, new Set()))) throw new Error("task_graph_dependency_blocked")
     const template = input.templates[node.templateId]!
-    const dependenciesDone = node.dependsOn.every(key => logicalStatuses.get(key) === "completed")
+    const dependenciesDone = node.dependsOn.every(key => satisfiedDependencies.has(key))
     const status = dependenciesDone ? "queued" : "waiting"
     const childPolicy = inheritSubagentPolicy(policy, template.maxAttempts === undefined ? {} : { maxAttempts: template.maxAttempts })
     const context = status === "queued" && node.dependsOn.length > 0
@@ -95,8 +122,8 @@ export async function createGraphTasks(client: Queryable, input: TaskGraphSchedu
       readyTaskIds.push(child.id)
     }
     taskIds.set(node.key, child.id)
-    statuses.set(node.key, status)
     logicalStatuses.set(node.key, status)
+    statuses.set(node.key, status)
     created.push({ key: node.key, taskId: child.id, status })
   }
   const state = {
@@ -104,6 +131,16 @@ export async function createGraphTasks(client: Queryable, input: TaskGraphSchedu
     nodes: appended.state.nodes.map(node => ({ ...node, status: statuses.get(node.key)! })),
   }
   return { state, snapshot: taskGraphSnapshot(state, taskIds), taskIds, created, readyTaskIds }
+}
+
+function isPreflightDependency(
+  key: string,
+  statuses: ReadonlyMap<string, string>,
+  dispositions: ReadonlyMap<string, TaskGraphSnapshot["nodes"][number]["verificationDisposition"]>,
+  repairSatisfied?: readonly string[],
+): boolean {
+  return repairSatisfied?.includes(key) === true
+    || statuses.get(key) === "completed" && dispositions.get(key) !== "legacy_unverified"
 }
 
 async function validateRepairTargets(client: Queryable, input: TaskGraphScheduleInput, current: TaskGraphState, priorTaskIds: ReadonlyMap<string, string>): Promise<void> {

@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from "vitest"
+import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import type pg from "pg"
-import { prepareGraphTransition } from "./task-graph-pg-lifecycle.js"
+import { prepareGraphTransition, reconcileGraphDependents } from "./task-graph-pg-lifecycle.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "./task-graph-snapshot.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 
-function fakeGraphClient(status: string, options: { proposalPayloads?: unknown[]; snapshot?: unknown; missingItem?: boolean } = {}) {
+function fakeGraphClient(status: string, options: { proposalPayloads?: unknown[]; snapshot?: unknown; missingItem?: boolean; taskStatuses?: Record<string, string> } = {}) {
   const snapshot = options.snapshot ?? { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{
     key: "child", templateId: "analyst", goal: "Inspect", successCriteria: ["done"], dependsOn: [], depth: 1, taskId: "child-1",
   }] }
@@ -19,7 +21,7 @@ function fakeGraphClient(status: string, options: { proposalPayloads?: unknown[]
       }], rowCount: 1 }
       if (sql.includes('SELECT task."id", task."status"')) {
         const ids = params?.[0] as string[]
-        return { rows: ids.map(id => ({ id, status, role: "analyst", failureReason: null, result: null })), rowCount: ids.length }
+        return { rows: ids.map(id => ({ id, status: options.taskStatuses?.[id] ?? status, role: "analyst", failureReason: null, result: null })), rowCount: ids.length }
       }
       if (sql.includes('SELECT event."payload"')) return { rows: [], rowCount: 0 }
       return { rows: [], rowCount: 0 }
@@ -96,5 +98,127 @@ describe("prepareGraphTransition", () => {
       taskId: "legacy-child", sessionId: "session-1", type: "task.started",
     })).resolves.toBeNull()
     expect(client.query.mock.calls.some(([sql]) => sql.includes('SELECT item."id"'))).toBe(false)
+  })
+
+  it("blocks start and retry through a completed typed intermediary with a legacy-unverified ancestor", async () => {
+    const verification = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
+      criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }],
+    }
+    const snapshot = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
+      { key: "source", templateId: "analyst", goal: "Analyze", successCriteria: ["done"], dependsOn: [], depth: 1, taskId: "source-1", verificationDisposition: "legacy_unverified" },
+      { key: "intermediary", templateId: "analyst", goal: "Verify", successCriteria: ["done"], dependsOn: ["source"], depth: 2, taskId: "intermediary-1", verificationDisposition: "typed", verification },
+      { key: "child", templateId: "analyst", goal: "Continue", successCriteria: ["done"], dependsOn: ["intermediary"], depth: 3, taskId: "child-1", verificationDisposition: "typed", verification },
+    ] }
+    const client = fakeGraphClient("queued", { snapshot, taskStatuses: { "source-1": "completed", "intermediary-1": "completed", "child-1": "queued" } })
+    const transition = await prepareGraphTransition(client as unknown as Pick<pg.PoolClient, "query">, {
+      taskId: "child-1", sessionId: "session-1", type: "task.started",
+    })
+    const retryClient = fakeGraphClient("running", { snapshot, taskStatuses: { "source-1": "completed", "intermediary-1": "completed", "child-1": "running" } })
+    const retryTransition = await prepareGraphTransition(retryClient as unknown as Pick<pg.PoolClient, "query">, {
+      taskId: "child-1", sessionId: "session-1", type: "task.retrying",
+    })
+
+    expect(transition).toEqual({ blocked: true })
+    expect(retryTransition).toEqual({ blocked: true })
+    expect(client.query.mock.calls.every(([sql]) => sql.trimStart().startsWith("SELECT"))).toBe(true)
+  })
+})
+
+describe("reconcileGraphDependents", () => {
+  it.each([
+    ["legacy-unverified completion", "legacy_unverified", { status: "completed", stepCount: 1, toolCallCount: 1, finalItemId: "item-source", finalText: "done", structuredResult: { schemaVersion: "agent-harness.v2.role-result.v1", role: "analyst", status: "completed", findings: [], evidence: [], summary: "done" } }, "waiting", "waiting", false],
+    ["typed completion without verifier proof", "typed", { status: "completed", stepCount: 1, toolCallCount: 1, finalItemId: "item-source", finalText: "done", structuredResult: { schemaVersion: "agent-harness.v2.role-result.v1", role: "analyst", status: "completed", findings: [], evidence: [], summary: "done" } }, "waiting", "waiting", false],
+    ["legacy-unverified queued dependent", "legacy_unverified", { status: "completed", stepCount: 1, toolCallCount: 1, finalItemId: "item-source", finalText: "done", structuredResult: { schemaVersion: "agent-harness.v2.role-result.v1", role: "analyst", status: "completed", findings: [], evidence: [], summary: "done" } }, "queued", "waiting", false],
+    ["legacy-unverified queued dependent and descendant", "legacy_unverified", { status: "completed", stepCount: 1, toolCallCount: 1, finalItemId: "item-source", finalText: "done", structuredResult: { schemaVersion: "agent-harness.v2.role-result.v1", role: "analyst", status: "completed", findings: [], evidence: [], summary: "done" } }, "queued", "queued", false],
+    ["completed typed intermediary with a legacy ancestor", "legacy_unverified", { status: "completed", stepCount: 1, toolCallCount: 1, finalItemId: "item-source", finalText: "done", structuredResult: { schemaVersion: "agent-harness.v2.role-result.v1", role: "analyst", status: "completed", findings: [], evidence: [], summary: "done" } }, "queued", "queued", true],
+  ] as const)("cancels the dependent and its descendant after %s", async (_label, disposition, sourceResult, dependentStatus, descendantStatus, throughIntermediary) => {
+    const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" }
+    const sourceVerification = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
+      criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }],
+    }
+    const source = {
+      key: "source", templateId: "analyst", goal: "Analyze", successCriteria: ["done"], dependsOn: [], depth: 1, taskId: "source-1",
+      verificationDisposition: disposition, ...(disposition === "typed" ? { verification: sourceVerification } : {}),
+    }
+    const intermediary = {
+      key: "intermediary", templateId: "analyst", goal: "Verify", successCriteria: ["done"], dependsOn: ["source"], depth: 2,
+      taskId: "intermediary-1", verificationDisposition: "typed", verification: sourceVerification,
+    }
+    const parentKey = throughIntermediary ? "intermediary" : "source"
+    const dependentDepth = throughIntermediary ? 3 : 2
+    const snapshot = {
+      schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
+      nodes: [source, ...(throughIntermediary ? [intermediary] : []), {
+        key: "dependent", templateId: "analyst", goal: "Continue", successCriteria: ["done"], dependsOn: [parentKey], depth: dependentDepth,
+        taskId: "dependent-1", verificationDisposition: "typed", verification: sourceVerification,
+      }, {
+        key: "descendant", templateId: "analyst", goal: "Continue again", successCriteria: ["done"], dependsOn: ["dependent"], depth: dependentDepth + 1,
+        taskId: "descendant-1", verificationDisposition: "typed", verification: sourceVerification,
+      }],
+    }
+    const rowsById = new Map<string, { id: string; status: string; role: string; failureReason: string | null; result: unknown; expectedOutputSchema: string; context: unknown; sessionId: string; turnId: string; rootTaskId: string; parentTaskId: string; userId: string }>([
+      ["source-1", { id: "source-1", status: "completed", role: "analyst", failureReason: null, result: sourceResult, expectedOutputSchema: "agent-harness.v2.role-result.v1", context: {}, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId, userId: scope.userId }],
+      ["intermediary-1", { id: "intermediary-1", status: throughIntermediary ? "completed" : "waiting", role: "analyst", failureReason: null, result: null, expectedOutputSchema: "agent-harness.v2.role-result.v1", context: {}, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId, userId: scope.userId }],
+      ["dependent-1", { id: "dependent-1", status: dependentStatus, role: "analyst", failureReason: null, result: null, expectedOutputSchema: "agent-harness.v2.role-result.v1", context: {}, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId, userId: scope.userId }],
+      ["descendant-1", { id: "descendant-1", status: descendantStatus, role: "analyst", failureReason: null, result: null, expectedOutputSchema: "agent-harness.v2.role-result.v1", context: {}, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId, userId: scope.userId }],
+    ])
+    let revision = 2
+    const itemId = taskGraphItemId("root-1")
+    const item = { schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: itemId, sessionId: scope.sessionId, turnId: scope.turnId, stepId: null, taskId: scope.rootTaskId, type: "task_graph", status: "streaming", phase: null, revision, content: snapshot, startedAt: "2026-09-01T00:00:00.000Z", completedAt: null, createdAt: "2026-09-01T00:00:00.000Z", updatedAt: "2026-09-01T00:00:00.000Z" }
+    const proposalPayload = {
+      kind: "proposal", fingerprint: "fingerprint", revision,
+      receipt: { status: "accepted", revision, nodes: snapshot.nodes.map(node => ({
+        key: node.key, taskId: node.taskId,
+        status: node.key === "source" || node.key === "dependent" && dependentStatus === "queued" ? "queued" : "waiting",
+      })), readyTaskIds: ["source-1", ...(dependentStatus === "queued" ? ["dependent-1"] : [])] },
+      item, content: snapshot,
+    }
+    const events: Array<{ type: string; payload: unknown }> = [{ type: "item.delta", payload: proposalPayload }]
+    let sequence = 0
+    const query = vi.fn(async (sql: string, values?: unknown[]) => {
+      if (sql.includes('SELECT task."turnId"')) return { rows: [{ turnId: scope.turnId, rootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId, attemptCount: 0, userId: scope.userId }], rowCount: 1 }
+      if (sql.includes('SELECT event."payload"')) return { rows: [{ payload: proposalPayload }], rowCount: 1 }
+      if (sql.includes('SELECT item."id"')) return { rows: [{ id: itemId, revision, content: snapshot, createdAt: new Date("2026-09-01T00:00:00.000Z") }], rowCount: 1 }
+      if (sql.includes('SELECT task."id", task."status"')) {
+        const ids = values?.[0] as string[]
+        return { rows: ids.map(id => rowsById.get(id)).filter(Boolean), rowCount: ids.length }
+      }
+      if (sql.includes('SELECT event."type"')) return { rows: events, rowCount: events.length }
+      if (sql.includes('UPDATE "sub_agent_tasks" SET "status" = \'cancelled\'')) {
+        const row = rowsById.get(String(values?.[0]))!
+        row.status = "cancelled"
+        row.failureReason = sql.includes('"failureReason" = $6') ? String(values?.[5]) : "Prerequisite results could not be safely materialized."
+        return { rows: [], rowCount: 1 }
+      }
+      if (sql.includes('UPDATE "agent_items" AS item')) {
+        revision = Number(values?.[5])
+        return { rows: [{ stepId: null, status: "streaming", phase: null, startedAt: new Date("2026-09-01T00:00:00.000Z"), completedAt: null, createdAt: new Date("2026-09-01T00:00:00.000Z") }], rowCount: 1 }
+      }
+      if (sql.includes('UPDATE "agent_sessions" AS session')) return { rows: [{ eventSequence: String(++sequence) }], rowCount: 1 }
+      if (sql.includes('INSERT INTO "agent_events"')) {
+        events.push({ type: String(values?.[6]), payload: JSON.parse(String(values?.[10])) as unknown })
+        return { rows: [], rowCount: 1 }
+      }
+      if (sql.includes('INSERT INTO "agent_outbox"') || sql.includes('DELETE FROM "agent_outbox"')) return { rows: [], rowCount: 1 }
+      return { rows: [], rowCount: 0 }
+    })
+
+    await reconcileGraphDependents({ query } as unknown as Pick<pg.PoolClient, "query">, scope, new Date("2026-09-02T00:00:00.000Z"))
+
+    expect(rowsById.get("dependent-1")?.status).toBe("cancelled")
+    expect(rowsById.get("dependent-1")?.failureReason).toBe(disposition === "legacy_unverified" ? "A prerequisite task was not verified." : "Prerequisite results could not be safely materialized.")
+    expect(rowsById.get("descendant-1")?.status).toBe("cancelled")
+    expect(events.filter(event => (event.payload as { kind?: unknown }).kind === "lifecycle")).toHaveLength(2)
+    expect(query.mock.calls.some(([sql]) => sql.includes('SET "context"'))).toBe(false)
+    expect(query.mock.calls.some(([sql]) => sql.includes('INSERT INTO "agent_outbox"'))).toBe(true)
+    expect(query.mock.calls.some(([sql, params]) => sql.startsWith('DELETE FROM "agent_outbox"') && params?.[1] === "subagent-dispatch:dependent-1")).toBe(true)
+    if (dependentStatus === "queued") {
+      expect(query.mock.calls.some(([sql, params]) => sql.includes('AND "status" = $8') && params?.[0] === "dependent-1" && params?.[7] === dependentStatus)).toBe(true)
+    }
+    if (descendantStatus === "queued") {
+      expect(query.mock.calls.some(([sql, params]) => sql.includes('AND "status" = $8') && params?.[0] === "descendant-1" && params?.[7] === descendantStatus)).toBe(true)
+    }
   })
 })
