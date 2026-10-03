@@ -40,7 +40,7 @@ import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
 import { defaultSubagentPolicy, type SubagentTaskRecord } from "./types.js"
 import { drainTaskGraphStopOutbox, TASK_GRAPH_STOP_OUTBOX_TOPIC } from "./task-graph-stop-outbox.js"
-import { taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
+import { parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const PLAN_CALL_ID = "p3-resume-plan"
@@ -367,6 +367,9 @@ const FAILURE_PREFLIGHT_TARGET_KEYS = ["prerequisite", "dependent"] as const
 const TASK_GRAPH_DIAGNOSTIC_PROPOSAL_NODE_KEYS = new Set(["source", "summary", "verification"])
 const TASK_DIAGNOSTIC_STATUSES = new Set([
   "queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed",
+])
+const STEP_DIAGNOSTIC_STATUSES = new Set([
+  "queued", "running", "completed", "failed", "interrupted", "waiting_for_tool", "waiting_for_approval", "waiting_for_user",
 ])
 const PROCESS_FIXTURE_TURN_STATUSES = new Set([...TURN_DIAGNOSTIC_STATUSES, "none", "other"])
 const PROCESS_FIXTURE_TASK_STATUSES = new Set([...TASK_DIAGNOSTIC_STATUSES, "none", "other"])
@@ -1519,10 +1522,23 @@ async function prepareSelectedJobReviewAfterRestart(
     userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
     rootTaskId: trace.rootTaskId, parentTaskId: trace.rootTaskId,
   }
+  const graphRow = await pool.query<{ content: unknown }>(
+    `SELECT item."content" FROM "agent_items" AS item
+     JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+     JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
+     WHERE item."id" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4
+       AND item."type" = 'task_graph' AND turn."userId" = $5 AND session."userId" = $5`,
+    [taskGraphItemId(trace.rootTaskId), value.sessionId, value.turnId, trace.rootTaskId, value.userId],
+  )
+  const graph = parseTaskGraphSnapshot(graphRow.rows[0]?.content)
+  const writerNode = graph.nodes.find(node => node.taskId === completedWriter.id)
+  if (!writerNode) throw new Error("Completed selected-job Writer has no persisted TaskGraph verifier metadata")
   const reviewerContext = materializeTaskGraphDependencyContext(
     { selectedJobPreparation: { jobId: trace.jobId } }, dependencyScope, ["writer"], [{
       ...dependencyScope, key: "writer", taskId: completedWriter.id, status: completedWriter.status,
       role: completedWriter.role, expectedOutputSchema: completedWriter.expectedOutputSchema, result: completedWriter.result,
+      verificationDisposition: writerNode.verificationDisposition, verification: writerNode.verification,
+      repairOf: writerNode.repairOf,
     }],
   )
   const createReviewer = (goal: string) => trace.store.create({
@@ -2756,7 +2772,13 @@ async function waitForTurnStatus(
   throw new Error(`TaskGraph root turn did not reach ${wanted}; progress=${compactTurnProgressDiagnostics(progress, 900)}`)
 }
 
-async function waitForPersistedTaskWait(pool: Pool, turnId: string, idempotencyKey: string, timeoutMs = 20_000): Promise<{ id: string }> {
+async function waitForPersistedTaskWait(
+  pool: Pool,
+  turnId: string,
+  idempotencyKey: string,
+  timeoutMs = 20_000,
+  diagnosticToolCallId?: string,
+): Promise<{ id: string }> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const result = await pool.query<{ id: string; status: string; suspendedAt: Date | null }>(
@@ -2768,7 +2790,78 @@ async function waitForPersistedTaskWait(pool: Pool, turnId: string, idempotencyK
     if (row?.status === "ready") throw new Error("Follow-up child completed before its durable parent wait suspended")
     await new Promise(resolve => setTimeout(resolve, 20))
   }
-  throw new Error("Follow-up parent wait was not durably suspended")
+  const diagnostics = diagnosticToolCallId
+    ? `; state=${await persistedWaitTimeoutDiagnostics(pool, turnId, idempotencyKey, diagnosticToolCallId)}`
+    : ""
+  throw new Error(`Follow-up parent wait was not durably suspended${diagnostics}`)
+}
+
+async function persistedWaitTimeoutDiagnostics(
+  pool: Pool,
+  turnId: string,
+  idempotencyKey: string,
+  toolCallId: string,
+): Promise<string> {
+  try {
+    const [turn, wait, tools, events, tasks, steps] = await Promise.all([
+      pool.query<{ status: string; rootTaskId: string | null; revision: number; leaseOwnerId: string | null; error: string | null }>(
+        `SELECT "status", "rootTaskId", "revision", "leaseOwnerId", "error" FROM "agent_turns" WHERE "id" = $1 LIMIT 1`, [turnId],
+      ),
+      pool.query<{ id: string; status: string; suspendedAt: Date | null; resolvedAt: Date | null; consumedAt: Date | null; targetTaskIds: unknown; matchedTaskIds: unknown }>(
+        `SELECT "id", "status", "suspendedAt", "resolvedAt", "consumedAt", "targetTaskIds", "matchedTaskIds"
+         FROM "agent_wait_conditions" WHERE "turnId" = $1 AND "idempotencyKey" = $2 LIMIT 1`, [turnId, idempotencyKey],
+      ),
+      pool.query<{ id: string; type: string; status: string; errorCode: string | null }>(
+        `SELECT "id", "type", "status", "content"->>'errorCode' AS "errorCode" FROM "agent_items"
+         WHERE "turnId" = $1 AND "type" IN ('tool_call', 'tool_result') AND "content"->>'toolCallId' = $2
+         ORDER BY "createdAt" DESC LIMIT 4`, [turnId, toolCallId],
+      ),
+      pool.query<{ type: string; status: string | null; errorCode: string | null }>(
+        `SELECT "type", "payload"->>'status' AS "status", "payload"->>'errorCode' AS "errorCode"
+         FROM "agent_events" WHERE "turnId" = $1 AND "payload"->>'toolCallId' = $2
+         ORDER BY "sequence" DESC LIMIT 4`, [turnId, toolCallId],
+      ),
+      pool.query<{ id: string; status: string; attemptCount: number; failureReason: string | null }>(
+        `SELECT "id", "status", "attemptCount", "failureReason" FROM "sub_agent_tasks"
+         WHERE "turnId" = $1 ORDER BY "createdAt" DESC LIMIT 6`, [turnId],
+      ),
+      pool.query<{ id: string; taskId: string | null; ordinal: number; attempt: number; status: string; errorCode: string | null }>(
+        `SELECT "id", "taskId", "ordinal", "attempt", "status", "errorCode" FROM "agent_steps"
+         WHERE "turnId" = $1 ORDER BY "ordinal" DESC, "attempt" DESC LIMIT 4`, [turnId],
+      ),
+    ])
+    const turnRow = turn.rows[0]
+    const waitRow = wait.rows[0]
+    return boundedDiagnostic(JSON.stringify({
+      turn: turnRow ? {
+        id: turnId.slice(-12), status: diagnosticEnum(turnRow.status, TURN_DIAGNOSTIC_STATUSES),
+        rootTask: turnRow.rootTaskId?.slice(-12) ?? null, revision: turnRow.revision,
+        leaseOwnerPresent: turnRow.leaseOwnerId !== null, errorCode: diagnosticErrorCode(turnRow.error),
+      } : { id: turnId.slice(-12), missing: true },
+      wait: waitRow ? {
+        id: waitRow.id.slice(-12), status: diagnosticEnum(waitRow.status, WAIT_DIAGNOSTIC_STATUSES),
+        suspended: waitRow.suspendedAt !== null, resolved: waitRow.resolvedAt !== null, consumed: waitRow.consumedAt !== null,
+        targetCount: diagnosticCount(waitRow.targetTaskIds), matchedCount: diagnosticCount(waitRow.matchedTaskIds),
+      } : { found: false },
+      tools: tools.rows.map(item => ({
+        id: item.id.slice(-12), type: item.type, status: diagnosticEnum(item.status, ITEM_DIAGNOSTIC_STATUSES),
+        errorCode: diagnosticErrorCode(item.errorCode),
+      })),
+      events: events.rows.map(event => ({
+        type: event.type, status: diagnosticEnum(event.status, ITEM_DIAGNOSTIC_STATUSES), errorCode: diagnosticErrorCode(event.errorCode),
+      })),
+      tasks: tasks.rows.map(task => ({
+        id: task.id.slice(-12), status: diagnosticEnum(task.status, TASK_DIAGNOSTIC_STATUSES),
+        attempts: task.attemptCount, failureCode: diagnosticErrorCode(task.failureReason),
+      })),
+      steps: steps.rows.map(step => ({
+        id: step.id.slice(-12), task: step.taskId?.slice(-12) ?? null, ordinal: step.ordinal, attempt: step.attempt,
+        status: diagnosticEnum(step.status, STEP_DIAGNOSTIC_STATUSES), errorCode: diagnosticErrorCode(step.errorCode),
+      })),
+    }), 2_200)
+  } catch {
+    return JSON.stringify({ available: false })
+  }
 }
 
 async function restartFollowUpWaitDiagnostics(
@@ -3947,7 +4040,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           jobs = await queue.getJobs(["completed", "failed", "waiting", "delayed", "paused", "waiting-children", "active"])
         })
         for (const job of jobs) {
-          if ([owner, failureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner, discoveryFailureOwner, discoveryRestartOwner].some(current => job.data?.turnId === current.turnId || job.data?.sessionId === current.sessionId)) {
+          if ([owner, failureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner, discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, leaseRecoveryOwner].some(current => job.data?.turnId === current.turnId || job.data?.sessionId === current.sessionId)) {
             await attempt("remove " + label + " job " + job.id, () => job.remove())
           }
         }
@@ -7118,16 +7211,22 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       subagents: {
         execute: async () => { throw new Error("Lease recovery fixture must not auto-execute child tasks") },
         intervalMs: 10,
-        queueFactory: () => ({
-          queue: { add: async () => undefined, close: async () => undefined },
-          worker: { pause: async () => undefined, close: async () => undefined },
-          close: async () => undefined,
-        }) as never,
+        queueFactory: () => {
+          const queue = { add: async () => undefined, close: async () => undefined }
+          const worker = { pause: async () => undefined, close: async () => undefined }
+          return {
+            queue,
+            worker,
+            close: async () => { await worker.close(); await queue.close() },
+          } as never
+        },
         recoveryFactory: () => ({ close: async () => undefined }) as never,
       },
     })
     await turnQueue.enqueueTurn(pool!, bootstrap.turns.queue, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
-    const persistedWait = await waitForPersistedTaskWait(pool!, value.turnId, initialWaitKey)
+    const persistedWait = await waitForPersistedTaskWait(
+      pool!, value.turnId, initialWaitKey, 20_000, `p3-lease-recovery-initial-wait:${value.turnId}`,
+    )
     const root = await pool!.query<{ rootTaskId: string | null }>(
       `SELECT "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
       [value.turnId, value.sessionId, value.userId],
