@@ -17,7 +17,7 @@ export function durableLifecycleSink(store: TurnEngineStore, owner: ExecutionOwn
     async append(event: ToolLifecycleEvent): Promise<void> {
       const digest = createHash("sha256").update(JSON.stringify(event.payload)).digest("hex").slice(0, 24)
       await store.appendEvent({
-        owner, id: `tool-lifecycle:${event.item.toolCallId}:${event.phase}:${digest}`, itemId: null, type: event.eventType,
+        owner, id: `tool-lifecycle:${owner.kind}:${owner.taskId}:${event.item.toolCallId}:${event.phase}:${digest}`, itemId: null, type: event.eventType,
         correlationId: event.item.toolCallId, causationId: null,
         idempotencyKey: `${owner.kind}:${owner.taskId}:tool-lifecycle:${event.item.toolCallId}:${event.phase}:${digest}`,
         payload: toRepositoryJson(event.payload),

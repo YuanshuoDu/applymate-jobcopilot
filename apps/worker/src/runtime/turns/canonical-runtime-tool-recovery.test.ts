@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { describe, expect, it, vi } from "vitest"
 
 import { assertCanonicalCoordinationSurface, classifyToolCallRecovery, durableLifecycleSink } from "./canonical-runtime-tool-recovery.js"
@@ -5,6 +6,41 @@ import type { PersistedToolCallRecovery } from "./turn-engine-types.js"
 
 const pending: PersistedToolCallRecovery = {
   call: { id: "call-1", name: "jobs.search", arguments: { location: "Dublin" } }, toolVersion: "1", stepId: "step-0", callItem: { id: "item-1", revision: 0 },
+}
+
+const lifecyclePayload = { toolCallId: "call-shared", toolName: "jobs.search", toolVersion: "1", status: "started" }
+
+type LifecycleRecord = { owner: { sessionId: string }; id: string; idempotencyKey: string }
+type LifecycleOutbox = { id: string; idempotencyKey: string; eventId: string }
+
+function lifecycleEvent(payload = lifecyclePayload): never {
+  return { phase: "started", eventType: "tool_call.started", item: { toolCallId: "call-shared" }, payload } as never
+}
+
+function lifecycleOwner(taskId: string): never {
+  return { kind: "task", taskId, sessionId: "session-shared", turnId: "turn-shared" } as never
+}
+
+function lifecyclePersistence() {
+  const events = new Map<string, LifecycleRecord>()
+  const outbox = new Map<string, LifecycleOutbox>()
+  const appendEvent = vi.fn(async (input: LifecycleRecord) => {
+    const idempotencyScope = `${input.owner.sessionId}:${input.idempotencyKey}`
+    const existing = [...events.values()].find(row => `${row.owner.sessionId}:${row.idempotencyKey}` === idempotencyScope)
+    if (existing) {
+      outbox.set(`agent-outbox-${existing.id}`, { id: `agent-outbox-${existing.id}`, idempotencyKey: `agent-event:${existing.id}`, eventId: existing.id })
+      return { id: existing.id }
+    }
+    if (events.has(input.id)) throw new Error(`duplicate event id ${input.id}`)
+    events.set(input.id, input)
+    outbox.set(`agent-outbox-${input.id}`, { id: `agent-outbox-${input.id}`, idempotencyKey: `agent-event:${input.id}`, eventId: input.id })
+    return { id: input.id }
+  })
+  return { store: { appendEvent } as never, appendEvent, events, outbox }
+}
+
+function lifecycleDigest(): string {
+  return createHash("sha256").update(JSON.stringify(lifecyclePayload)).digest("hex").slice(0, 24)
 }
 
 describe("canonical runtime tool recovery", () => {
@@ -47,10 +83,36 @@ describe("canonical runtime tool recovery", () => {
     expect(() => assertCanonicalCoordinationSurface({ list: () => [{ name: "agent.spawn" }] }, [])).toThrow("canonical_coordination_tools_unconfigured")
   })
 
-  it("persists a deterministic durable lifecycle event", async () => {
-    const appendEvent = vi.fn(async (input: { id: string }) => ({ id: input.id }))
-    const sink = durableLifecycleSink({ appendEvent } as never, { kind: "turn", taskId: "root-1" } as never)
-    await sink.append({ phase: "started", eventType: "tool_call.started", item: { toolCallId: "call-1" } as never, payload: { toolCallId: "call-1", toolName: "jobs.search", toolVersion: "1", status: "started" } })
-    expect(appendEvent).toHaveBeenCalledWith(expect.objectContaining({ type: "tool_call.started", correlationId: "call-1", idempotencyKey: expect.stringContaining("tool-lifecycle:call-1:started:") }))
+  it("persists distinct lifecycle event and outbox IDs for distinct task owners", async () => {
+    const persistence = lifecyclePersistence()
+    await durableLifecycleSink(persistence.store, lifecycleOwner("task-a")).append(lifecycleEvent())
+    await durableLifecycleSink(persistence.store, lifecycleOwner("task-b")).append(lifecycleEvent())
+
+    const digest = lifecycleDigest()
+    const eventIds = [
+      `tool-lifecycle:task:task-a:call-shared:started:${digest}`,
+      `tool-lifecycle:task:task-b:call-shared:started:${digest}`,
+    ]
+    expect([...persistence.events.keys()]).toEqual(eventIds)
+    expect([...persistence.events.values()].map(row => row.idempotencyKey)).toEqual([
+      `task:task-a:tool-lifecycle:call-shared:started:${digest}`,
+      `task:task-b:tool-lifecycle:call-shared:started:${digest}`,
+    ])
+    expect([...persistence.outbox.values()]).toEqual(eventIds.map(id => ({ id: `agent-outbox-${id}`, idempotencyKey: `agent-event:${id}`, eventId: id })))
+  })
+
+  it("replays the same owner's lifecycle event with a deterministic ID and one persisted row", async () => {
+    const persistence = lifecyclePersistence()
+    const sink = durableLifecycleSink(persistence.store, lifecycleOwner("task-a"))
+    await sink.append(lifecycleEvent())
+    await sink.append(lifecycleEvent())
+
+    const digest = lifecycleDigest()
+    const expectedId = `tool-lifecycle:task:task-a:call-shared:started:${digest}`
+    expect(persistence.appendEvent.mock.calls.map(([input]) => input.id)).toEqual([expectedId, expectedId])
+    expect(persistence.events.size).toBe(1)
+    expect(persistence.events.get(expectedId)?.idempotencyKey).toBe(`task:task-a:tool-lifecycle:call-shared:started:${digest}`)
+    expect(persistence.outbox.size).toBe(1)
+    expect(persistence.outbox.get(`agent-outbox-${expectedId}`)).toEqual({ id: `agent-outbox-${expectedId}`, idempotencyKey: `agent-event:${expectedId}`, eventId: expectedId })
   })
 })
