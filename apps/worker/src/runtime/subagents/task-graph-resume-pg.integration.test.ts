@@ -9077,7 +9077,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const lease = await claimTurnLease(pool!, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
       const { createPgRootTaskStore } = await import("./root-task-store.js")
       const rootTasks = createPgRootTaskStore(pool!)
-      const root = await rootTasks.ensure({ lease, goal: "Drain a running child after root failure" })
+      const root = await rootTasks.ensure({
+        lease, goal: "Drain a running child after root failure",
+        allowedActions: TASK_GRAPH_TEMPLATES.analyst.allowedActions,
+      })
       const stepId = `p3-running-drain-step-${value.suffix}`
       await pool!.query(`INSERT INTO "agent_steps"
         ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
