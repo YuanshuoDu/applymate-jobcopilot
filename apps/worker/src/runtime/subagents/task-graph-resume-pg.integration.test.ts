@@ -6864,12 +6864,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       if (!artifactReviewTrace || !redis) throw new Error("Selected-job review fixture was not prepared for Worker 2")
       await reviewSelectedJobThroughRestartedWorker(pool!, artifactOwner, artifactReviewTrace, workerOne!, workerTwo!)
 
-      const preFinalChildResult = await pool!.query<{ status: string; role: string; result: RecordValue | null; context: RecordValue | null }>(
-        "SELECT \"status\", \"role\", \"result\", \"context\" FROM \"sub_agent_tasks\" WHERE \"id\" = $1 AND \"sessionId\" = $2 AND \"turnId\" = $3 AND \"rootTaskId\" = $4 AND \"parentTaskId\" = $4",
+      const preFinalChildResult = await pool!.query<{ status: string; role: string; goal: string; result: RecordValue | null; context: RecordValue | null }>(
+        "SELECT \"status\", \"role\", \"goal\", \"result\", \"context\" FROM \"sub_agent_tasks\" WHERE \"id\" = $1 AND \"sessionId\" = $2 AND \"turnId\" = $3 AND \"rootTaskId\" = $4 AND \"parentTaskId\" = $4",
         [preFinalFollowUpId, restartOwner.sessionId, restartOwner.turnId, rootTaskId],
       )
-      expect(preFinalChildResult.rows[0]).toMatchObject({ status: "completed", role: "analyst" })
-      expect(JSON.stringify(preFinalChildResult.rows[0]?.result)).toContain(RESTART_FOLLOW_UP_GOAL)
+      expect(preFinalChildResult.rows[0]).toMatchObject({ status: "completed", role: "analyst", goal: RESTART_FOLLOW_UP_GOAL })
       const preFinalContext = record(record(preFinalChildResult.rows[0]?.context)?.taskGraphDependencyResults)
       const preFinalDependencies = Array.isArray(preFinalContext?.items) ? preFinalContext.items.map(record) : []
       expect(preFinalDependencies[0]).toMatchObject({ dependencyKey: "summary", role: "analyst", taskStatus: "completed" })
@@ -6891,6 +6890,21 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(preFinalEvents.rows.some(event => event.taskId === preFinalFollowUpId
         && record(event.payload)?.kind === "lifecycle"
         && record(record(event.payload)?.event)?.type === "task.completed")).toBe(true)
+      const assertTypedWaitTaskProjection = (result: unknown, taskId: string, criterionId: string) => {
+        const outcome = record(record(result)?.outcome)
+        const targetTaskIds = Array.isArray(outcome?.targetTaskIds) ? outcome.targetTaskIds : []
+        const tasks = Array.isArray(outcome?.tasks) ? outcome.tasks.map(record) : []
+        const task = tasks.find(candidate => candidate?.taskId === taskId)
+        expect(targetTaskIds).toContain(taskId)
+        expect(task).toMatchObject({ taskId, status: "completed", result: { truncated: true } })
+        expectPassedVerificationReport(task?.verificationReport, criterionId)
+      }
+      const assertFollowUpWaitProjection = (result: unknown, taskId: string) => {
+        assertTypedWaitTaskProjection(result, taskId, "finding-count")
+        const outcome = record(record(result)?.outcome)
+        expect(JSON.stringify(outcome)).not.toContain(RESTART_FOLLOW_UP_GOAL)
+      }
+
       const preFinalWaits = await pool!.query<{ status: string; consumedAt: Date | null; targetTaskIds: unknown; result: unknown }>(
         "SELECT \"status\", \"consumedAt\", \"targetTaskIds\", \"result\" FROM \"agent_wait_conditions\" WHERE \"turnId\" = $1 AND \"parentTaskId\" = $2",
         [restartOwner.turnId, rootTaskId],
@@ -6900,7 +6914,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         return ids.includes(preFinalFollowUpId)
       })
       expect(preFinalFollowUpWait).toMatchObject({ status: "ready", consumedAt: expect.any(Date) })
-      expect(JSON.stringify(preFinalFollowUpWait?.result)).toContain(RESTART_FOLLOW_UP_GOAL)
+      assertFollowUpWaitProjection(preFinalFollowUpWait?.result, String(preFinalFollowUpId))
 
       workerTwo.stdin?.write("finalize-parent\n")
       await waitForProcessLine(workerTwo, "P3_FOLLOW_UP_GRAPH_OK ")
@@ -6940,7 +6954,15 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(resumedWaits.rows).toHaveLength(2)
       const originalWaitAfterResume = resumedWaits.rows.find(row => row.id === waitsBefore.rows[0]?.id)
       expect(originalWaitAfterResume).toMatchObject({ status: "ready", consumedAt: expect.any(Date) })
-      expect(JSON.stringify(originalWaitAfterResume?.result)).toContain("p3-process-restart-source-result")
+      const originalSourceTaskId = graphAfterNodes.find(node => node?.key === "source")?.taskId
+      const originalSummaryTaskId = graphAfterNodes.find(node => node?.key === "summary")?.taskId
+      if (typeof originalSourceTaskId !== "string" || typeof originalSummaryTaskId !== "string") {
+        throw new Error("Restarted original wait lost its source or summary task identity")
+      }
+      assertTypedWaitTaskProjection(originalWaitAfterResume?.result, originalSourceTaskId, "candidate-count")
+      assertTypedWaitTaskProjection(originalWaitAfterResume?.result, originalSummaryTaskId, "finding-count")
+      const originalWaitOutcome = record(record(originalWaitAfterResume?.result)?.outcome)
+      expect(JSON.stringify(originalWaitOutcome)).not.toContain("p3-process-restart-source-result")
       const followUpTaskId = graphAfterNodes[2]?.taskId
       expect(typeof followUpTaskId).toBe("string")
       const targetIds = (value: unknown): string[] => {
@@ -6953,7 +6975,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const followUpWait = resumedWaits.rows.find(row => targetIds(row.targetTaskIds).includes(String(followUpTaskId)))
       expect(followUpWait).toMatchObject({ status: "ready", consumedAt: expect.any(Date) })
       expect(followUpWait?.id).not.toBe(originalWaitAfterResume?.id)
-      expect(JSON.stringify(followUpWait?.result)).toContain(RESTART_FOLLOW_UP_GOAL)
+      assertFollowUpWaitProjection(followUpWait?.result, String(followUpTaskId))
       const childrenAfterResume = await pool!.query<{ id: string; goal: string; status: string; result: RecordValue | null; context: RecordValue | null; role: string }>(
         "SELECT \"id\", \"goal\", \"status\", \"result\", \"context\", \"role\" FROM \"sub_agent_tasks\" WHERE \"turnId\" = $1 AND \"parentTaskId\" = $2 ORDER BY \"goal\"",
         [restartOwner.turnId, rootTaskId],
@@ -7003,10 +7025,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         expect(publicLedgerJson).not.toContain(secret)
       }
       expect(parsePlanLedger(publicLedgerJson)).toEqual(persistedLedger)
-      expect(JSON.stringify(childrenAfterResume.rows[0]?.result)).toContain("p3-process-restart-source-result")
       const followUpChild = childrenAfterResume.rows.find(row => row.id === followUpTaskId)
       expect(followUpChild).toMatchObject({ goal: RESTART_FOLLOW_UP_GOAL, status: "completed", role: "analyst" })
-      expect(JSON.stringify(followUpChild?.result)).toContain(RESTART_FOLLOW_UP_GOAL)
       const followUpDependency = record(record(followUpChild?.context)?.taskGraphDependencyResults)
       const followUpDependencyItems = Array.isArray(followUpDependency?.items) ? followUpDependency.items.map(record) : []
       expect(followUpDependencyItems[0]).toMatchObject({
