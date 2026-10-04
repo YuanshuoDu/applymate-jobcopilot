@@ -3573,6 +3573,7 @@ async function processRestartFailureDiagnostic(
     parentModelFailureGuard: processRestartGuardMarker(workerOutput),
     childOutcome,
     childException,
+    childRuntimeScope: processChildRuntimeScopeDiagnostics(workerOutput),
     restartVerifierEvidence: processRestartVerifierEvidenceDiagnostics(workerOutput),
     taskGraph,
     waitResults: { initial: initialWait, followUp: followUpWait },
@@ -3604,6 +3605,10 @@ const PROCESS_RESTART_VERIFIER_EVIDENCE_MARKER_LIMIT = 4
 const PROCESS_RESTART_VERIFIER_EVIDENCE_MAX_BYTES = 8_192
 const PROCESS_RESTART_VERIFIER_EVIDENCE_ARRAY_LIMIT = 5
 const PROCESS_RESTART_VERIFIER_EVIDENCE_COUNT_LIMIT = 99
+const PROCESS_CHILD_RUNTIME_SCOPE_PREFIX = "P3_CHILD_RUNTIME_SCOPE "
+const PROCESS_CHILD_RUNTIME_SCOPE_PHASES = new Set(["dispatch", "model", "search_result"])
+const PROCESS_CHILD_RUNTIME_SCOPE_MARKER_LIMIT = 12
+const PROCESS_CHILD_RUNTIME_SCOPE_MAX_BYTES = 2_048
 
 function boundedRestartEvidenceCount(value: unknown): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
@@ -3682,6 +3687,39 @@ function processRestartVerifierEvidenceDiagnostics(output: readonly string[]): R
   const markerLimitReached = latest.length > PROCESS_RESTART_VERIFIER_EVIDENCE_MARKER_LIMIT
   const markers = latest.slice(0, PROCESS_RESTART_VERIFIER_EVIDENCE_MARKER_LIMIT).reverse()
     .map(projectRestartVerifierEvidenceMarker)
+  return { markerCount: markers.length, markerLimitReached, markers }
+}
+
+function projectChildRuntimeScopeMarker(line: string): RecordValue {
+  if (line.length > PROCESS_CHILD_RUNTIME_SCOPE_MAX_BYTES) return { diagnosticUnavailable: true }
+  const raw = diagnosticJsonRecord(line.slice(PROCESS_CHILD_RUNTIME_SCOPE_PREFIX.length))
+  if (!raw) return { diagnosticUnavailable: true }
+  const phase = diagnosticEnum(raw.phase, PROCESS_CHILD_RUNTIME_SCOPE_PHASES)
+  if (!phase) return { diagnosticUnavailable: true }
+  const nullableBoolean = (key: string): boolean | null => typeof raw[key] === "boolean" ? raw[key] as boolean : null
+  const nullableCount = (key: string): number | null => raw[key] === null ? null : diagnosticBoundedCount(raw[key])
+  return {
+    phase,
+    sessionMatchesFixture: nullableBoolean("sessionMatchesFixture"),
+    turnMatchesFixture: nullableBoolean("turnMatchesFixture"),
+    userMatchesFixture: nullableBoolean("userMatchesFixture"),
+    taskUserMatchesFixture: nullableBoolean("taskUserMatchesFixture"),
+    modelTaskMatchesLease: nullableBoolean("modelTaskMatchesLease"),
+    matchingToolResultCount: nullableCount("matchingToolResultCount"),
+    resultJsonParsed: nullableBoolean("resultJsonParsed"),
+    expectedJobPresent: nullableBoolean("expectedJobPresent"),
+    returnedJobCount: nullableCount("returnedJobCount"),
+  }
+}
+
+function processChildRuntimeScopeDiagnostics(output: readonly string[]): RecordValue {
+  const latest: string[] = []
+  for (let index = output.length - 1; index >= 0 && latest.length <= PROCESS_CHILD_RUNTIME_SCOPE_MARKER_LIMIT; index -= 1) {
+    const line = output[index]
+    if (line?.startsWith(PROCESS_CHILD_RUNTIME_SCOPE_PREFIX)) latest.push(line)
+  }
+  const markerLimitReached = latest.length > PROCESS_CHILD_RUNTIME_SCOPE_MARKER_LIMIT
+  const markers = latest.slice(0, PROCESS_CHILD_RUNTIME_SCOPE_MARKER_LIMIT).reverse().map(projectChildRuntimeScopeMarker)
   return { markerCount: markers.length, markerLimitReached, markers }
 }
 
@@ -4069,6 +4107,41 @@ describe("compact TaskGraph wait failure diagnostics", () => {
     expect(exception).toEqual({ role: "analyst", stage: "execute_child", errorName: "TypeError", failureCode: "other" })
     expect(knownFailure).toEqual({ role: "analyst", stage: "execute_child", errorName: "Error", failureCode: "child_resume_unavailable" })
     expect(JSON.stringify({ outcome, exception, knownFailure })).not.toContain("private")
+  })
+
+  it("projects child runtime scope markers to bounded booleans and counts", () => {
+    const projected = processChildRuntimeScopeDiagnostics([
+      `${PROCESS_CHILD_RUNTIME_SCOPE_PREFIX}${JSON.stringify({
+        phase: "dispatch", sessionMatchesFixture: true, turnMatchesFixture: true, userMatchesFixture: true,
+        taskUserMatchesFixture: null, modelTaskMatchesLease: null, matchingToolResultCount: null,
+        resultJsonParsed: null, expectedJobPresent: null, returnedJobCount: null, rawTaskId: "private-task-id",
+      })}`,
+      `${PROCESS_CHILD_RUNTIME_SCOPE_PREFIX}${JSON.stringify({
+        phase: "search_result", sessionMatchesFixture: true, turnMatchesFixture: true, userMatchesFixture: true,
+        taskUserMatchesFixture: true, modelTaskMatchesLease: false, matchingToolResultCount: 1,
+        resultJsonParsed: true, expectedJobPresent: false, returnedJobCount: 1, error: "private database error",
+      })}`,
+      `${PROCESS_CHILD_RUNTIME_SCOPE_PREFIX}${JSON.stringify({
+        phase: "unknown-private-phase", matchingToolResultCount: 10_001, returnedJobCount: "private",
+      })}`,
+    ])
+
+    expect(projected).toEqual({
+      markerCount: 3, markerLimitReached: false, markers: [
+        {
+          phase: "dispatch", sessionMatchesFixture: true, turnMatchesFixture: true, userMatchesFixture: true,
+          taskUserMatchesFixture: null, modelTaskMatchesLease: null, matchingToolResultCount: null,
+          resultJsonParsed: null, expectedJobPresent: null, returnedJobCount: null,
+        },
+        {
+          phase: "search_result", sessionMatchesFixture: true, turnMatchesFixture: true, userMatchesFixture: true,
+          taskUserMatchesFixture: true, modelTaskMatchesLease: false, matchingToolResultCount: 1,
+          resultJsonParsed: true, expectedJobPresent: false, returnedJobCount: 1,
+        },
+        { diagnosticUnavailable: true },
+      ],
+    })
+    expect(JSON.stringify(projected)).not.toContain("private")
   })
 
   it("selects the latest TaskGraph observation from a multi-step model request", () => {
@@ -8025,6 +8098,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           childTasks: diagnosticDiscoveryTasks(tasks.rows),
           verifierEvidence,
           restartVerifierEvidence: processRestartVerifierEvidenceDiagnostics(workerTwo?.output ?? []),
+          childRuntimeScope: processChildRuntimeScopeDiagnostics(workerTwo?.output ?? []),
           waitStatuses,
           waitTargetCounts: waits.rows.map(wait => diagnosticBoundedCount(wait.targetCount)),
           runtimeState,
@@ -8741,7 +8815,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(children.rows.map(child => [child.role, child.status])).toEqual([["analyst", "cancelled"], ["scout", "failed"]])
     expect(children.rows.find(child => child.role === "scout")?.failureReason).toBe("task_graph_verification_unverified")
     expectUnverifiedVerificationReport(record(children.rows.find(child => child.role === "scout")?.result)?.taskGraphVerificationReport, "candidate-count")
-    expect(children.rows.find(child => child.role === "analyst")?.failureReason).toContain("prerequisite")
+    expect(children.rows.find(child => child.role === "analyst")?.failureReason).toBe("Root task failed.")
     const dependentDispatches = await pool!.query(
       `SELECT "id" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch'
        AND "idempotencyKey" = $2`, [value.sessionId, `subagent-dispatch:${children.rows.find(child => child.role === "analyst")?.id}`],
@@ -8946,11 +9020,25 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expectedLookupCount: 0,
       resolvedLookupCount: 0,
       structuredResultEmitted: false,
+      sessionMatchesFixture: null as boolean | null,
+      turnMatchesFixture: null as boolean | null,
+      userMatchesFixture: null as boolean | null,
+      taskUserMatchesFixture: null as boolean | null,
+      modelTaskMatchesLease: null as boolean | null,
+      matchingToolResultCount: null as number | null,
+      resultJsonParsed: null as boolean | null,
+      expectedJobPresent: null as boolean | null,
+      returnedJobCount: null as number | null,
     }
+    const childLeaseByTaskId = new Map<string, SubagentLease>()
     const childExecutor = createProductionChildExecutor({
       pool: pool!, authorizeUsage: async () => ({ settle: async () => undefined }),
       modelRuntimeFactory: ({ task }) => {
         let round = 0
+        const leasedTask = childLeaseByTaskId.get(task.id)
+        if (task.goal === "Find at least two owner jobs") {
+          initialScoutReadDiagnostic.taskUserMatchesFixture = task.userId === value.userId
+        }
         const jobIds = task.goal === "Find at least two owner jobs"
           ? [firstJobId]
           : [firstJobId, secondJobId]
@@ -8961,6 +9049,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           id: "p3-verifier-repair-" + task.role + "-child-fixture", profile,
           async *stream(request) {
             round += 1
+            if (task.goal === "Find at least two owner jobs") {
+              initialScoutReadDiagnostic.modelTaskMatchesLease = leasedTask && typeof request.metadata.taskId === "string"
+                ? request.metadata.taskId === leasedTask.id
+                : null
+            }
             if (round === 1) {
               expect(request.tools.map(tool => record(tool)?.name)).toContain("jobs.get")
               for (const [index, callId] of callIds.entries()) {
@@ -8976,13 +9069,21 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               ? `p3-verifier-repair-initial-wait:${value.turnId}`
               : `p3-verifier-repair-wait:${value.turnId}`
             await waitForPersistedTaskWait(pool!, value.turnId, waitKey)
+            const matchingToolResults = request.messages.flatMap(message => message.content)
+              .filter(part => part.type === "tool_result" && callIds.includes(part.toolUseId))
+            const parsedResults = callIds.map(callId => record(latestToolResult(request, callId)))
+            if (task.goal === "Find at least two owner jobs") {
+              initialScoutReadDiagnostic.matchingToolResultCount = matchingToolResults.length
+              initialScoutReadDiagnostic.resultJsonParsed = parsedResults.every(result => result !== null)
+              initialScoutReadDiagnostic.returnedJobCount = parsedResults.filter(result => record(result?.job) !== null).length
+            }
             const selected = jobIds.map((expectedJobId, index) => {
-              const result = record(latestToolResult(request, callIds[index]!))
-              const job = record(result?.job)
+              const job = record(parsedResults[index]?.job)
               return job?.id === expectedJobId ? job : null
             }).filter((job): job is RecordValue => job !== null)
             if (task.goal === "Find at least two owner jobs") {
               initialScoutReadDiagnostic.resolvedLookupCount = selected.length
+              initialScoutReadDiagnostic.expectedJobPresent = selected.length === jobIds.length
             }
             if (selected.length !== jobIds.length || task.role !== "scout" && task.role !== "analyst") {
               throw new Error("repair fixture could not resolve its exact owner-scoped job reads")
@@ -9024,27 +9125,38 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       turnQueueFactory: createTurnQueue, turnRecoveryIntervalMs: 100,
       waitResolver: { intervalMs: 10, batchSize: 10, ownerId: `p3-verifier-repair-wait-resolver-${value.suffix}` },
       subagents: { execute: async ({ lease }) => {
-        if (lease.goal === "Recheck after new owner evidence is available") {
-          const dependent = await pool!.query<{ id: string; status: string }>(`SELECT "id", "status" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "goal" = $3`, [value.turnId, value.sessionId, "Score only after Scout proof"])
-          expect(dependent.rows).toHaveLength(1)
-          expect(dependent.rows[0]?.status).toBe("waiting")
-          const dispatch = await pool!.query(`SELECT "id" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2`, [value.sessionId, `subagent-dispatch:${dependent.rows[0]!.id}`])
-          expect(dispatch.rowCount).toBe(0)
+        const isInitialScout = lease.goal === "Find at least two owner jobs"
+        if (isInitialScout) {
+          initialScoutReadDiagnostic.sessionMatchesFixture = lease.sessionId === value.sessionId
+          initialScoutReadDiagnostic.turnMatchesFixture = lease.turnId === value.turnId
+          initialScoutReadDiagnostic.userMatchesFixture = lease.userId === value.userId
+          childLeaseByTaskId.set(lease.id, lease)
         }
-        if (lease.goal === "Score only after Scout proof") {
-          const repair = await pool!.query<{ id: string; status: string; result: unknown }>(`SELECT "id", "status", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "goal" = $3`, [value.turnId, value.sessionId, "Recheck after new owner evidence is available"])
-          const repairResult = record(repair.rows[0]?.result)
-          expect(repair.rows[0]?.status).toBe("completed")
-          expectPassedVerificationReport(repairResult?.taskGraphVerificationReport, "candidate-count")
-          expect(record(repairResult?.taskGraphRepairReceipt)).toMatchObject({ targetNodeKey: "scout", criterionIds: ["candidate-count"], repairNodeKey: "scout-repair", repairTaskId: repair.rows[0]?.id })
-          const dispatch = await pool!.query<{ id: string }>(`SELECT "id" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2`, [value.sessionId, `subagent-dispatch:${lease.id}`])
-          expect(dispatch.rows).toHaveLength(1)
+        try {
+          if (lease.goal === "Recheck after new owner evidence is available") {
+            const dependent = await pool!.query<{ id: string; status: string }>(`SELECT "id", "status" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "goal" = $3`, [value.turnId, value.sessionId, "Score only after Scout proof"])
+            expect(dependent.rows).toHaveLength(1)
+            expect(dependent.rows[0]?.status).toBe("waiting")
+            const dispatch = await pool!.query(`SELECT "id" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2`, [value.sessionId, `subagent-dispatch:${dependent.rows[0]!.id}`])
+            expect(dispatch.rowCount).toBe(0)
+          }
+          if (lease.goal === "Score only after Scout proof") {
+            const repair = await pool!.query<{ id: string; status: string; result: unknown }>(`SELECT "id", "status", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "goal" = $3`, [value.turnId, value.sessionId, "Recheck after new owner evidence is available"])
+            const repairResult = record(repair.rows[0]?.result)
+            expect(repair.rows[0]?.status).toBe("completed")
+            expectPassedVerificationReport(repairResult?.taskGraphVerificationReport, "candidate-count")
+            expect(record(repairResult?.taskGraphRepairReceipt)).toMatchObject({ targetNodeKey: "scout", criterionIds: ["candidate-count"], repairNodeKey: "scout-repair", repairTaskId: repair.rows[0]?.id })
+            const dispatch = await pool!.query<{ id: string }>(`SELECT "id" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2`, [value.sessionId, `subagent-dispatch:${lease.id}`])
+            expect(dispatch.rows).toHaveLength(1)
+          }
+          if (hardExecutorFailure && lease.goal === "Find at least two owner jobs") {
+            await waitForSuspendedParent(pool!, value.turnId)
+            return { status: "failed", failureReason: "Fixture hard child failure", retryDisposition: "terminal" }
+          }
+          return await childExecutor({ lease })
+        } finally {
+          if (isInitialScout) childLeaseByTaskId.delete(lease.id)
         }
-        if (hardExecutorFailure && lease.goal === "Find at least two owner jobs") {
-          await waitForSuspendedParent(pool!, value.turnId)
-          return { status: "failed", failureReason: "Fixture hard child failure", retryDisposition: "terminal" }
-        }
-        return childExecutor({ lease })
       }, intervalMs: 10 },
     })
     await enqueueTurn(pool!, bootstrap.turns.queue, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })

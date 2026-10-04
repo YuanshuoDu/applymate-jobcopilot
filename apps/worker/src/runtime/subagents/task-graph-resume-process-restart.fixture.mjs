@@ -282,14 +282,50 @@ const SOURCE_PROJECTION_AVAILABILITY = new Set(["available", "unavailable"])
 const SOURCE_PROJECTION_ROLES = new Set(["scout", "analyst"])
 const SOURCE_PROJECTION_STATUSES = new Set(["completed", "partial"])
 const DIAGNOSTIC_COUNT_LIMIT = 99
+const CHILD_RUNTIME_SCOPE_DIAGNOSTIC_LIMIT = 12
 const RESTART_JOB_SOURCE_ENUMS = new Set(["greenhouse", "lever", "workday", "smartrecruiters", "personio", "jobs.read"])
 const RESTART_RESULT_STATUSES = new Set(["completed", "partial", "failed"])
+let childRuntimeScopeDiagnosticCount = 0
 function diagnosticEnum(value, allowlist) {
   if (value === null || value === undefined) return "missing"
   return typeof value === "string" && allowlist.has(value) ? value : "other"
 }
 function diagnosticCount(value) {
   return Number.isSafeInteger(value) && value >= 0 ? Math.min(value, DIAGNOSTIC_COUNT_LIMIT) : null
+}
+function fixtureScopeMatch(value, expected) {
+  return typeof value === "string" && typeof expected === "string" ? value === expected : null
+}
+function emitChildRuntimeScopeDiagnostic(input) {
+  if (childRuntimeScopeDiagnosticCount >= CHILD_RUNTIME_SCOPE_DIAGNOSTIC_LIMIT) return
+  childRuntimeScopeDiagnosticCount++
+  say("P3_CHILD_RUNTIME_SCOPE " + JSON.stringify({
+    phase: input.phase,
+    sessionMatchesFixture: fixtureScopeMatch(input.sessionId, ids.sessionId),
+    turnMatchesFixture: fixtureScopeMatch(input.turnId, ids.turnId),
+    userMatchesFixture: fixtureScopeMatch(input.userId, ids.userId),
+    taskUserMatchesFixture: fixtureScopeMatch(input.taskUserId, ids.userId),
+    modelTaskMatchesLease: fixtureScopeMatch(input.modelTaskId, input.leaseTaskId),
+    matchingToolResultCount: diagnosticCount(input.matchingToolResultCount),
+    resultJsonParsed: typeof input.resultJsonParsed === "boolean" ? input.resultJsonParsed : null,
+    expectedJobPresent: typeof input.expectedJobPresent === "boolean" ? input.expectedJobPresent : null,
+    returnedJobCount: diagnosticCount(input.returnedJobCount),
+  }))
+}
+function toolResultDiagnostics(request, callId) {
+  const messages = Array.isArray(request?.messages) ? request.messages : []
+  let count = 0, latestContent = null
+  for (const message of messages) {
+    const content = Array.isArray(message?.content) ? message.content : []
+    for (const part of content) {
+      if (part?.type !== "tool_result" || part.toolUseId !== callId) continue
+      count++
+      latestContent = typeof part.content === "string" ? part.content : null
+    }
+  }
+  if (latestContent === null) return { count: diagnosticCount(count), parsed: false }
+  try { JSON.parse(latestContent); return { count: diagnosticCount(count), parsed: true } }
+  catch { return { count: diagnosticCount(count), parsed: false } }
 }
 async function processRestartVerifierDiagnostic(lease, outcome) {
   const childResult = record(outcome?.result), structured = record(childResult?.structuredResult)
@@ -1393,6 +1429,8 @@ async function runSecondWorker() {
   const executeChild = createProductionChildExecutor({
     pool, authorizeUsage: async () => ({ settle: async () => undefined }),
     modelRuntimeFactory({ task }) {
+      emitChildRuntimeScopeDiagnostic({ phase: "model", sessionId: task.sessionId, turnId: task.turnId,
+        userId: task.userId, taskUserId: task.userId, leaseTaskId: task.id })
       let rounds = 0
       const callId = `p3-process-restart-read:${task.id}:${task.attemptCount}`
       return { id: `p3-process-restart-${task.role}-model`, profile: modelProfile(), async *stream(request) {
@@ -1404,6 +1442,12 @@ async function runSecondWorker() {
         }
         const search = record(latestToolResult(request, callId)), jobs = Array.isArray(search?.jobs) ? search.jobs.map(record) : []
         const job = jobs.find(item => item?.id === ids.jobId)
+        const toolResult = toolResultDiagnostics(request, callId)
+        emitChildRuntimeScopeDiagnostic({ phase: "search_result", sessionId: task.sessionId, turnId: task.turnId,
+          userId: task.userId, taskUserId: task.userId, leaseTaskId: task.id,
+          modelTaskId: record(request?.metadata)?.taskId, matchingToolResultCount: toolResult.count,
+          resultJsonParsed: toolResult.parsed, expectedJobPresent: Boolean(job),
+          returnedJobCount: Array.isArray(search?.jobs) ? jobs.length : null })
         if (!job || !["scout", "analyst"].includes(task.role)) throw new Error("p3_restart_child_search_receipt_missing")
         const evidence = [{ id: `read:job:${ids.jobId}`, kind: "job", ref: ids.jobId, source: job.source ?? "greenhouse" }]
         const summary = task.goal === sourceGoal ? resultMarker : task.goal === dependentGoal ? dependentGoal : followUpGoal
@@ -1449,6 +1493,8 @@ async function runSecondWorker() {
       const role = lease.role === "scout" || lease.role === "analyst" ? lease.role : "other"
       let stage = "dispatch_context"
       try {
+        emitChildRuntimeScopeDiagnostic({ phase: "dispatch", sessionId: lease.sessionId,
+          turnId: lease.turnId, userId: lease.userId })
         const dependencyResults = record(record(lease.context)?.taskGraphDependencyResults)
         const dependencyItems = Array.isArray(dependencyResults?.items) ? dependencyResults.items.map(record) : []
         say("P3_CHILD_LEASE " + JSON.stringify({
