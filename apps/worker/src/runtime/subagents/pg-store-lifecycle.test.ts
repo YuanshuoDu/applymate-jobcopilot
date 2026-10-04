@@ -364,7 +364,7 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
         return persistedRootStatus === "failed" ? { rows: [{ ...root, status: persistedRootStatus }] } : { rows: [] }
       }
       if (sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3') && params?.[0] === root.id) {
-        persistedRootStatus = String(params[2])
+        persistedRootStatus = String(params?.[2])
         return { rowCount: 1 }
       }
       return {}
