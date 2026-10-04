@@ -2877,6 +2877,57 @@ async function checkTerminalTaskGraph(pool: Pool, lease: TurnLease, rootTaskId: 
 type ProcessFixtureChild = ChildProcess & { output: string[]; errors: string[] }
 const processRestartFixturePath = fileURLToPath(new URL("./task-graph-resume-process-restart.fixture.mjs", import.meta.url))
 const processRestartWorkerCwd = fileURLToPath(new URL("../../../", import.meta.url))
+const DISCOVERY_TURN_WORKER_MARKER = "P3_DISCOVERY_TURN_WORKER "
+const DISCOVERY_TURN_WORKER_NAMES = new Set(["worker2", "worker3"])
+const DISCOVERY_TURN_WORKER_EVENTS = new Set(["observer_attached", "active", "completed", "failed"])
+const DISCOVERY_TURN_WORKER_KEYS = new Set([
+  "worker", "event", "isRunning", "isPaused", "stalledInterval", "lockDuration", "concurrency",
+  "activeRegistryCount", "generation",
+])
+
+function boundedWorkerDiagnosticNumber(value: unknown, minimum: number, maximum: number): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= minimum && value <= maximum
+    ? value : null
+}
+
+function processDiscoveryTurnWorkerDiagnostics(
+  workerTwo: ProcessFixtureChild | null | undefined,
+  workerThree: ProcessFixtureChild | null | undefined,
+): RecordValue[] {
+  const projected: RecordValue[] = []
+  for (const [child, expectedWorker] of [[workerTwo, "worker2"], [workerThree, "worker3"]] as const) {
+    if (!child) continue
+    let childCount = 0
+    for (const line of child.output) {
+      if (!line.startsWith(DISCOVERY_TURN_WORKER_MARKER)) continue
+      if (childCount >= 8 || projected.length >= 16) break
+      try {
+        const source = record(JSON.parse(line.slice(DISCOVERY_TURN_WORKER_MARKER.length)) as unknown)
+        if (!source || Object.keys(source).length !== DISCOVERY_TURN_WORKER_KEYS.size
+          || Object.keys(source).some(key => !DISCOVERY_TURN_WORKER_KEYS.has(key))) continue
+        const worker = diagnosticEnum(source.worker, DISCOVERY_TURN_WORKER_NAMES)
+        const event = diagnosticEnum(source.event, DISCOVERY_TURN_WORKER_EVENTS)
+        if (worker !== expectedWorker || !event) continue
+        const nullableBoolean = (value: unknown): boolean | null => typeof value === "boolean" ? value : null
+        projected.push({
+          worker,
+          event,
+          isRunning: nullableBoolean(source.isRunning),
+          isPaused: nullableBoolean(source.isPaused),
+          stalledInterval: boundedWorkerDiagnosticNumber(source.stalledInterval, 1, 300_000),
+          lockDuration: boundedWorkerDiagnosticNumber(source.lockDuration, 1, 300_000),
+          concurrency: boundedWorkerDiagnosticNumber(source.concurrency, 1, 64),
+          activeRegistryCount: boundedWorkerDiagnosticNumber(source.activeRegistryCount, 0, 64),
+          generation: boundedWorkerDiagnosticNumber(source.generation, 0, 100_000),
+        })
+        childCount += 1
+      } catch {
+        // Malformed fixture diagnostics are omitted and cannot affect the test flow.
+      }
+    }
+  }
+  return projected
+}
 
 function startTaskGraphRestartWorker(
   mode: "park-parent" | "resume-parent" | "park-discovery" | "resume-discovery" | "worker2-input-guard-self-test",
@@ -8477,6 +8528,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           verifierEvidence,
           restartVerifierEvidence: processRestartVerifierEvidenceDiagnostics(processOutputs),
           childRuntimeScope: processChildRuntimeScopeDiagnostics(processOutputs),
+          turnWorkerEvents: processDiscoveryTurnWorkerDiagnostics(workerTwo, workerThree),
           waitStatuses,
           waitTargetCounts: waits.rows.map(wait => diagnosticBoundedCount(wait.targetCount)),
           runtimeState,
@@ -8628,12 +8680,56 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         "p3-process-restart-discovery-worker-" + pid,
         "p3-process-restart-discovery-wait-resolver-" + pid,
       ]))
+      const queueProducerByOwner = new Map<string, string>()
+      queueOwnerPids.forEach((pid, index) => {
+        const workerNumber = index + 1
+        queueProducerByOwner.set("p3-process-restart-discovery-worker-" + pid, `worker${workerNumber}_dispatcher`)
+        queueProducerByOwner.set("p3-process-restart-discovery-wait-resolver-" + pid, `worker${workerNumber}_wait_resolver`)
+      })
       const turnQueue = new Queue(TURN_QUEUE_NAME, { connection: redis!, skipVersionCheck: true })
       try {
         await turnQueue.waitUntilReady()
         const states = ["active", "waiting", "delayed", "paused", "waiting-children", "prioritized", "failed", "completed"] as const
         const liveStates = new Set<string>(["active", "waiting", "delayed", "paused", "waiting-children", "prioritized"])
         const convergenceDeadline = Math.min(Date.now() + 150_000, restartCaseStartedAt + 230_000)
+        const queueTimeoutDiagnostics = async () => {
+          try {
+            const jobs = await turnQueue.getJobs([...states], 0, -1, false)
+            const rows: RecordValue[] = []
+            let matchingCount = 0
+            for (const job of jobs) {
+              const payload = record(job.data)
+              if (payload?.turnId !== value.turnId || payload.sessionId !== value.sessionId
+                || typeof payload.ownerId !== "string" || !expectedQueueOwners.has(payload.ownerId)) continue
+              matchingCount += 1
+              if (rows.length >= 3) continue
+              const state = diagnosticEnum(await job.getState(), new Set(states)) ?? "other"
+              const suffix = typeof job.id === "string" ? /-(0|[1-9][0-9]*)$/.exec(job.id)?.[1] : undefined
+              const parsedGeneration = suffix === undefined ? null : Number(suffix)
+              const generation = parsedGeneration !== null && Number.isSafeInteger(parsedGeneration)
+                && parsedGeneration >= 0 && parsedGeneration <= 100_000 ? parsedGeneration : null
+              let lockPttlMs: number | null = null
+              if (typeof job.id === "string") {
+                try {
+                  const pttl = await redis!.pttl(turnQueue.toKey(job.id) + ":lock")
+                  if (pttl === -2 || pttl === -1 || Number.isSafeInteger(pttl) && pttl >= 0 && pttl <= 30_000) lockPttlMs = pttl
+                } catch {
+                  // Keep the state row if Redis cannot provide a bounded lock TTL.
+                }
+              }
+              rows.push({
+                state,
+                generation,
+                dispatchProducer: queueProducerByOwner.get(payload.ownerId) ?? "other",
+                lockPttlMs,
+              })
+            }
+            return { matchingCount: Math.min(matchingCount, 100), matchingCountTruncated: matchingCount > 100,
+              rows, rowsTruncated: matchingCount > rows.length }
+          } catch {
+            return { unavailable: true }
+          }
+        }
         while (true) {
           const matchingStateCounts = new Map<string, number>()
           let liveDeliveryCount = 0
@@ -8652,9 +8748,15 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           }
           if (liveDeliveryCount === 0) break
           if (Date.now() >= convergenceDeadline) {
+            const [queueRows, turnWorkerEvents] = await Promise.all([
+              queueTimeoutDiagnostics(),
+              Promise.resolve(processDiscoveryTurnWorkerDiagnostics(workerTwo, workerThree)),
+            ])
             throw new Error("Turn queue did not converge before the lock and stalled-job deadline: " + JSON.stringify({
               liveDeliveryCount,
               matchingStateCounts: [...matchingStateCounts.entries()].sort(([left], [right]) => left.localeCompare(right)),
+              queueRows,
+              turnWorkerEvents,
             }))
           }
           await new Promise(resolve => setTimeout(resolve, 1_000))
@@ -10654,7 +10756,57 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         status: result.status, result: result.result, failureReason: result.failureReason,
         retryDisposition: result.retryDisposition, mailboxMessageIds: result.mailboxMessageIds, now: new Date(),
       })
-      expect(finished).toBe("completed")
+      if (finished !== "completed") {
+        let itemCounts: RecordValue | null = null
+        let toolErrorCodes: string[] = []
+        try {
+          const [counts, toolErrors] = await Promise.all([
+            pool!.query<{ toolCallCount: number; toolResultCount: number; itemCount: number }>(
+              `SELECT COUNT(*) FILTER (WHERE "type" = 'tool_call')::int AS "toolCallCount",
+                      COUNT(*) FILTER (WHERE "type" = 'tool_result')::int AS "toolResultCount",
+                      COUNT(*)::int AS "itemCount" FROM "agent_items"
+               WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+                 AND "type" IN ('tool_call', 'tool_result')`,
+              [value.sessionId, value.turnId, taskId],
+            ),
+            pool!.query<{ errorCode: string }>(
+              `SELECT DISTINCT "content"->>'errorCode' AS "errorCode" FROM "agent_items"
+               WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+                 AND "type" = 'tool_result' AND "content"->>'errorCode' IS NOT NULL LIMIT 8`,
+              [value.sessionId, value.turnId, taskId],
+            ),
+          ])
+          itemCounts = {
+            toolCalls: diagnosticBoundedCount(counts.rows[0]?.toolCallCount),
+            toolResults: diagnosticBoundedCount(counts.rows[0]?.toolResultCount),
+            total: diagnosticBoundedCount(counts.rows[0]?.itemCount),
+          }
+          toolErrorCodes = [...new Set(toolErrors.rows.map(row =>
+            diagnosticEnum(row.errorCode, CHILD_OUTCOME_FAILURE_CODES) ?? "other"))].slice(0, 8)
+        } catch {
+          itemCounts = { unavailable: true }
+          toolErrorCodes = []
+        }
+        const childResult = record(result) ?? {}
+        const failureReasonClass = typeof childResult.failureReason === "string"
+          ? diagnosticEnum(childResult.failureReason, CHILD_OUTCOME_FAILURE_CODES) ?? "other" : null
+        const attemptBudgetExhausted = Number.isSafeInteger(claimedChild.attemptCount)
+          && Number.isSafeInteger(claimedChild.maxAttempts)
+          ? claimedChild.attemptCount >= claimedChild.maxAttempts : null
+        const failureDiagnostic = {
+          finished: diagnosticEnum(finished, new Set(["retrying", "failed", "waiting", "waiting_for_user", "interrupted"])) ?? "other",
+          childStatus: diagnosticEnum(childResult.status, CHILD_OUTCOME_STATUSES) ?? "other",
+          retryDisposition: diagnosticEnum(childResult.retryDisposition, CHILD_OUTCOME_RETRY_DISPOSITIONS),
+          failureReasonClass,
+          toolErrorCodes,
+          attemptBudgetExhausted,
+          itemCounts,
+        }
+        expect(finished, "Lease recovery child finish diagnostics=" + boundedDiagnostic(JSON.stringify(failureDiagnostic), 1_200))
+          .toBe("completed")
+      } else {
+        expect(finished).toBe("completed")
+      }
     }
 
     await executeAndFinishChild(repairTaskId, "p3-lease-recovery-repair-child-" + value.suffix)

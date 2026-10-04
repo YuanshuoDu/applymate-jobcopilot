@@ -1657,6 +1657,50 @@ async function runDiscoverySecondWorker() {
       say("P3_DISCOVERY_CHILD_SETTLED " + lease.id + " " + lease.role + " " + outcome.status)
       return outcome
     } } })
+  const turnWorker = bootstrap.turns?.worker
+  const workerLabel = ids.checkpointAfterWaitConsume === true ? "worker2" : "worker3"
+  let turnWorkerDiagnosticCount = 0
+  const boundedWorkerNumber = (value, maximum) => Number.isSafeInteger(value) && value >= 1 && value <= maximum ? value : null
+  const generationForJob = job => {
+    const match = typeof job?.id === "string" ? /-(0|[1-9][0-9]*)$/.exec(job.id) : null
+    if (!match) return null
+    const generation = Number(match[1])
+    return Number.isSafeInteger(generation) && generation >= 0 && generation <= 100_000 ? generation : null
+  }
+  const observeTurnWorker = (event, job = null) => {
+    try {
+      if (turnWorkerDiagnosticCount >= 8) return
+      if (event !== "observer_attached") {
+        const payload = record(job.data)
+        if (payload?.turnId !== ids.turnId || payload.sessionId !== ids.sessionId) return
+      }
+      const workerState = turnWorker
+      const opts = record(workerState?.opts) ?? {}
+      const registrySize = bootstrap.turns?.active?.size
+      const generation = job ? generationForJob(job) : null
+      const marker = {
+        worker: workerLabel,
+        event,
+        isRunning: typeof workerState?.isRunning === "function" ? (() => { try { const value = workerState.isRunning(); return typeof value === "boolean" ? value : null } catch { return null } })() : null,
+        isPaused: typeof workerState?.isPaused === "function" ? (() => { try { const value = workerState.isPaused(); return typeof value === "boolean" ? value : null } catch { return null } })() : null,
+        stalledInterval: boundedWorkerNumber(opts.stalledInterval, 300_000),
+        lockDuration: boundedWorkerNumber(opts.lockDuration, 300_000),
+        concurrency: boundedWorkerNumber(opts.concurrency, 64),
+        activeRegistryCount: typeof registrySize === "number" && Number.isSafeInteger(registrySize) && registrySize >= 0 && registrySize <= 64 ? registrySize : null,
+        generation,
+      }
+      say("P3_DISCOVERY_TURN_WORKER " + JSON.stringify(marker))
+      turnWorkerDiagnosticCount += 1
+    } catch {
+      // Diagnostics must never affect Turn processing.
+    }
+  }
+  if (turnWorker && typeof turnWorker.on === "function") {
+    observeTurnWorker("observer_attached")
+    turnWorker.on("active", job => observeTurnWorker("active", job))
+    turnWorker.on("completed", job => observeTurnWorker("completed", job))
+    turnWorker.on("failed", job => observeTurnWorker("failed", job))
+  }
   say("P3_DISCOVERY_SECOND_WORKER_READY " + ownerId)
   await waitForStop()
 }
