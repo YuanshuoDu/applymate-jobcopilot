@@ -1,5 +1,6 @@
-export const PLAN_LEDGER_SCHEMA_VERSION = 'agent-harness.v2.plan-ledger'
+import { parsePersistedTaskGraphNode, validTaskGraphResultEnvelopeKeys } from './plan-ledger-task-graph-metadata.js'
 
+export const PLAN_LEDGER_SCHEMA_VERSION = 'agent-harness.v2.plan-ledger'
 export const TASK_GRAPH_SCHEMA_VERSION = 'agent-harness.v2.task-graph', TASK_GRAPH_MAX_IDENTIFIER_LENGTH = 128
 const RESULT_VERSION = 'agent-harness.v2.subagent.result'
 const MAX_NODES = 8, MAX_ID = TASK_GRAPH_MAX_IDENTIFIER_LENGTH, MAX_LEDGER_BYTES = 16_000
@@ -103,7 +104,7 @@ export function projectTaskEvidencePreview(row: unknown): PlanLedgerEvidencePrev
     if (row.structuredEvidencePreview !== undefined) return parseEvidencePreview(row.structuredEvidencePreview, row.role)
     if (bytes(row.result) > 24 * 1024) return null
     const envelope = parseJsonRecord(row.result)
-    if (!envelope || !exact(envelope, ['status', 'stepCount', 'toolCallCount', 'finalItemId', 'finalText', 'structuredResult'])
+    if (!envelope || !validTaskGraphResultEnvelopeKeys(envelope)
       || envelope.status !== 'completed' || !smallInteger(envelope.stepCount, 10_000) || !smallInteger(envelope.toolCallCount, 10_000)
       || (envelope.finalItemId !== null && !identifier(envelope.finalItemId)) || typeof envelope.finalText !== 'string'
       || envelope.finalText.length > 8_192) return null
@@ -111,7 +112,7 @@ export function projectTaskEvidencePreview(row: unknown): PlanLedgerEvidencePrev
     const role = row.role
     const listKey = role === 'scout' ? 'candidates' : 'findings'
     if (!result || !exact(result, ['schemaVersion', 'role', 'status', listKey, 'evidence', 'summary'])
-      || result.schemaVersion !== RESULT_VERSION || result.role !== role || !['completed', 'partial'].includes(String(result.status))
+      || result.schemaVersion !== RESULT_VERSION || result.role !== role || (result.status !== 'completed' && result.status !== 'partial')
       || typeof result.summary !== 'string' || result.summary.length > 8_192 || !dense(result[listKey], 50) || !dense(result.evidence, 50)) return null
     const evidenceById = new Map<string, { kind: typeof KINDS[number]; source: string; ref: string }>()
     for (const raw of result.evidence) {
@@ -163,27 +164,27 @@ function parseEvidencePreview(value: unknown, role: unknown): PlanLedgerEvidence
 }
 
 function safePreview(value: unknown): value is PlanLedgerEvidencePreview | null { return value === null || (record(value) && parseEvidencePreview(value, value.role) !== null) }
-
 export function parseTaskGraphSnapshot(value: unknown): TaskGraphSnapshot | null {
   try {
+    if (typeof value === 'string' && bytes(value) > MAX_SNAPSHOT_BYTES) return null
     const content = typeof value === 'string' ? JSON.parse(value) as unknown : value
-    if (!record(content) || !exact(content, ['schemaVersion', 'nodes']) || content.schemaVersion !== TASK_GRAPH_SCHEMA_VERSION || !strictDense(content.nodes, MAX_NODES)) return null
+    if (!record(content) || !exact(content, ['schemaVersion', 'nodes']) || content.schemaVersion !== TASK_GRAPH_SCHEMA_VERSION
+      || !strictDense(content.nodes, MAX_NODES) || bytes(content) > MAX_SNAPSHOT_BYTES) return null
     const nodes: TaskGraphSnapshotNode[] = [], keys = new Set<string>(), ids = new Set<string>()
     for (const raw of content.nodes) {
-      if (!record(raw) || !exact(raw, ['key', 'templateId', 'goal', 'successCriteria', 'dependsOn', 'depth', 'taskId'])
-        || !text(raw.key, TASK_GRAPH_MAX_IDENTIFIER_LENGTH) || !text(raw.templateId, TASK_GRAPH_MAX_IDENTIFIER_LENGTH)
-        || !text(raw.goal, MAX_GOAL_LENGTH) || !text(raw.taskId, TASK_GRAPH_MAX_IDENTIFIER_LENGTH)
-        || !strictDense(raw.successCriteria, MAX_SUCCESS_CRITERIA) || raw.successCriteria.length === 0
-        || !raw.successCriteria.every(item => text(item, MAX_CRITERION_LENGTH))
-        || !strictDense(raw.dependsOn, MAX_DEPENDENCIES) || !raw.dependsOn.every(item => text(item, TASK_GRAPH_MAX_IDENTIFIER_LENGTH))
-        || new Set(raw.dependsOn).size !== raw.dependsOn.length || !Number.isSafeInteger(raw.depth)
-        || Number(raw.depth) < 1 || Number(raw.depth) > MAX_DEPTH || keys.has(raw.key) || ids.has(raw.taskId)) return null
-      keys.add(raw.key as string); ids.add(raw.taskId as string)
-      nodes.push({ key: raw.key as string, templateId: raw.templateId as string, goal: raw.goal as string,
-        successCriteria: [...raw.successCriteria] as string[], dependsOn: [...raw.dependsOn] as string[], depth: Number(raw.depth), taskId: raw.taskId as string })
+      const node = parsePersistedTaskGraphNode(raw)
+      if (!node || !text(node.key, TASK_GRAPH_MAX_IDENTIFIER_LENGTH) || !text(node.templateId, TASK_GRAPH_MAX_IDENTIFIER_LENGTH)
+        || !text(node.goal, MAX_GOAL_LENGTH) || !text(node.taskId, TASK_GRAPH_MAX_IDENTIFIER_LENGTH)
+        || !strictDense(node.successCriteria, MAX_SUCCESS_CRITERIA) || node.successCriteria.length === 0
+        || !node.successCriteria.every(item => text(item, MAX_CRITERION_LENGTH))
+        || !strictDense(node.dependsOn, MAX_DEPENDENCIES) || !node.dependsOn.every(item => text(item, TASK_GRAPH_MAX_IDENTIFIER_LENGTH))
+        || new Set(node.dependsOn).size !== node.dependsOn.length || !Number.isSafeInteger(node.depth)
+        || Number(node.depth) < 1 || Number(node.depth) > MAX_DEPTH || keys.has(node.key) || ids.has(node.taskId)) return null
+      keys.add(node.key); ids.add(node.taskId)
+      nodes.push({ ...node, successCriteria: [...node.successCriteria], dependsOn: [...node.dependsOn], depth: Number(node.depth) })
     }
     if (nodes.some(node => node.dependsOn.some(key => !keys.has(key))) || !acyclic(nodes)) return null
-    return bytes({ schemaVersion: TASK_GRAPH_SCHEMA_VERSION, nodes }) <= MAX_SNAPSHOT_BYTES ? { nodes } : null
+    return { nodes }
   } catch { return null }
 }
 
@@ -218,7 +219,7 @@ function acyclic(nodes: readonly { key: string; dependsOn: readonly string[] }[]
 
 function taskStatus(value: unknown): PlanLedgerStatus | null { return value === 'passed' ? 'completed' : isStatus(value) ? value : null }
 function isStatus(value: unknown): value is PlanLedgerStatus { return typeof value === 'string' && (STATUSES as readonly string[]).includes(value) }
-function isReadiness(value: unknown): value is PlanLedgerReadiness { return ['ready', 'waiting_for_dependencies', 'blocked_dependency', 'active', 'terminal', 'unavailable'].includes(String(value)) }
+function isReadiness(value: unknown): value is PlanLedgerReadiness { return typeof value === 'string' && ['ready', 'waiting_for_dependencies', 'blocked_dependency', 'active', 'terminal', 'unavailable'].includes(value) }
 function identifier(value: unknown): value is string { return text(value, MAX_ID) && value.trim() === value }
 function text(value: unknown, max: number): value is string { return typeof value === 'string' && value.trim().length > 0 && value.length <= max }
 function record(value: unknown): value is Record<string, unknown> {
