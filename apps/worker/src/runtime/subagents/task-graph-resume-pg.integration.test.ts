@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto"
 import { rm, writeFile } from "node:fs/promises"
 import { spawn, type ChildProcess } from "node:child_process"
 import { fileURLToPath } from "node:url"
-import { Queue } from "bullmq"
+import { Queue, QueueEvents } from "bullmq"
 import { Pool, type PoolClient } from "pg"
 import { Redis } from "ioredis"
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest"
@@ -8427,8 +8427,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   it("restores interactive discovery across a real Worker restart and replays its child dispatch once", async () => {
     const restartCaseStartedAt = Date.now()
     if (interactiveDiscoveryTraceArtifactPath) await rm(interactiveDiscoveryTraceArtifactPath, { force: true })
-    const [{ TURN_QUEUE_NAME }, subagentQueue] = await Promise.all([
-      import("../turns/turn-queue.js"), import("../../queue/subagent-queue.js"),
+    const [{ TURN_QUEUE_NAME }, subagentQueue, turnDispatch] = await Promise.all([
+      import("../turns/turn-queue.js"), import("../../queue/subagent-queue.js"), import("../turns/recovery-scanner.js"),
     ])
     turnQueueName = TURN_QUEUE_NAME
     childQueueName = subagentQueue.SUBAGENT_QUEUE_NAME
@@ -8436,10 +8436,129 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const jobId = fixtureJobId(value.suffix)
     // BullMQ marks current active jobs as stalled candidates; a later eligible pass reclaims those whose locks expired. Pin the supported minimum interval so natural recovery fits the unchanged deadline.
     const restartWorkerEnv = { BULLMQ_STALLED_INTERVAL_MS: "30000" }
+    const queueStates = ["active", "waiting", "delayed", "paused", "waiting-children", "prioritized", "failed", "completed"] as const
+    const stalledQueueEvents: RecordValue[] = []
+    const restartQueueSnapshots: RecordValue[] = []
+    const orphanGenerationJobIds = new Set<string>()
+    const observedWorkerByJobId = new Map<string, string>()
+    let stalledQueueEventsTruncated = false
+    let checkpointQueue: Queue | undefined
+    let queueEvents: QueueEvents | undefined
+    const workerOwnerId = (pid: number) => `p3-process-restart-discovery-worker-${pid}`
+    const resolverOwnerId = (pid: number) => `p3-process-restart-discovery-wait-resolver-${pid}`
+    // turnJobId appends "-<generation>"; removing the helper-generated zero keeps every generation for this Turn.
+    const turnJobPrefix = turnDispatch.turnJobId(value.turnId, 0).slice(0, -1)
+    const queueGeneration = (id: string): number | null => {
+      const suffix = /-(0|[1-9][0-9]*)$/.exec(id)?.[1]
+      if (suffix === undefined) return null
+      const generation = Number(suffix)
+      return Number.isSafeInteger(generation) && generation >= 0 && generation <= 100_000 ? generation : null
+    }
+    const queueRecoveryFailureDiagnostics = () => ({
+      snapshots: restartQueueSnapshots.slice(0, 2),
+      stalledEvents: stalledQueueEvents.slice(0, 16),
+      stalledEventsTruncated: stalledQueueEventsTruncated,
+    })
+    const captureRestartQueueSnapshot = async (
+      checkpoint: "after_worker2_sigkill" | "after_worker3_ready",
+      ownerLabels: ReadonlyMap<string, string>,
+    ): Promise<RecordValue> => {
+      const observedAt = new Date().toISOString()
+      try {
+        if (!checkpointQueue) return { checkpoint, observedAt, unavailable: true }
+        const outboxAttempt = await pool!.query<{ attemptCount: number; publishedAt: Date | null }>(
+          `SELECT "attemptCount", "publishedAt" FROM "agent_outbox"
+           WHERE "aggregateId" = $1 AND "topic" = $2 AND "idempotencyKey" = $3 LIMIT 1`,
+          [value.sessionId, turnDispatch.TURN_DISPATCH_TOPIC, turnDispatch.turnDispatchKey(value.turnId)],
+        )
+        const candidateJobIds = new Set<string>()
+        let candidatesTruncated = false
+        const addCandidate = (jobId: string) => {
+          if (!jobId.startsWith(turnJobPrefix) || candidateJobIds.has(jobId)) return
+          if (candidateJobIds.size >= 16) {
+            candidatesTruncated = true
+            return
+          }
+          candidateJobIds.add(jobId)
+        }
+        for (const generation of [0, 2, 4, 6]) addCandidate(turnDispatch.turnJobId(value.turnId, generation))
+        const attemptCount = boundedWorkerDiagnosticNumber(outboxAttempt.rows[0]?.attemptCount, 0, 100_000)
+        if (attemptCount !== null) {
+          for (const generation of [attemptCount - 1, attemptCount, attemptCount + 1]) {
+            if (generation >= 0 && generation <= 100_000) addCandidate(turnDispatch.turnJobId(value.turnId, generation))
+          }
+        }
+        for (const jobId of orphanGenerationJobIds) addCandidate(jobId)
+        for (const jobId of observedWorkerByJobId.keys()) addCandidate(jobId)
+        for (const event of stalledQueueEvents) {
+          if (typeof event.jobId === "string") addCandidate(event.jobId)
+        }
+        for (const generation of [1, 3, 5]) addCandidate(turnDispatch.turnJobId(value.turnId, generation))
+        const rows: RecordValue[] = []
+        for (const jobId of candidateJobIds) {
+          let lockPttlMs: number | null = null
+          try {
+            const pttl = await redis!.pttl(checkpointQueue.toKey(jobId) + ":lock")
+            if (pttl === -2 || pttl === -1 || Number.isSafeInteger(pttl) && pttl >= 0 && pttl <= 30_000) lockPttlMs = pttl
+          } catch {
+            // Preserve the queue lookup when Redis cannot provide a bounded lock TTL.
+          }
+          const job = await checkpointQueue.getJob(jobId)
+          if (!job) {
+            rows.push({ jobId, generation: queueGeneration(jobId), worker: "no_queue_job", state: "missing", lockPttlMs, attemptsMade: null })
+            continue
+          }
+          const payload = record(job.data)
+          const ownerId = payload?.ownerId
+          if (checkpoint === "after_worker2_sigkill" && observedWorkerByJobId.get(jobId) === "worker2_active_observed"
+            && payload?.turnId === value.turnId && payload.sessionId === value.sessionId) {
+            orphanGenerationJobIds.add(jobId)
+          }
+          const state = diagnosticEnum(await job.getState(), new Set<string>(queueStates)) ?? "other"
+          rows.push({
+            jobId,
+            generation: queueGeneration(jobId),
+            worker: observedWorkerByJobId.get(jobId)
+              ?? (typeof ownerId === "string" ? ownerLabels.get(ownerId) ?? "unmapped_owner" : "missing_owner"),
+            state,
+            lockPttlMs,
+            attemptsMade: diagnosticBoundedCount(job.attemptsMade),
+          })
+        }
+        return {
+          checkpoint,
+          observedAt,
+          dispatchOutboxPresent: outboxAttempt.rows.length === 1,
+          dispatchAttemptCount: attemptCount,
+          dispatchPublishedAt: outboxAttempt.rows[0]?.publishedAt instanceof Date
+            ? outboxAttempt.rows[0].publishedAt.toISOString() : null,
+          candidateCount: candidateJobIds.size,
+          candidatesTruncated,
+          rows,
+        }
+      } catch {
+        return { checkpoint, observedAt, unavailable: true }
+      }
+    }
     let workerOne: ProcessFixtureChild | undefined
     let workerTwo: ProcessFixtureChild | undefined
     let workerThree: ProcessFixtureChild | undefined
     try {
+      checkpointQueue = new Queue(TURN_QUEUE_NAME, { connection: redis!, skipVersionCheck: true })
+      queueEvents = new QueueEvents(TURN_QUEUE_NAME, { connection: redis!.duplicate(), skipVersionCheck: true })
+      queueEvents.on("stalled", ({ jobId: stalledJobId }) => {
+        if (typeof stalledJobId !== "string" || !stalledJobId.startsWith(turnJobPrefix)) return
+        if (stalledQueueEvents.length >= 16) {
+          stalledQueueEventsTruncated = true
+          return
+        }
+        stalledQueueEvents.push({
+          at: new Date().toISOString(),
+          jobId: stalledJobId,
+          generation: queueGeneration(stalledJobId),
+        })
+      })
+      await Promise.all([checkpointQueue.waitUntilReady(), queueEvents.waitUntilReady()])
       await pool!.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4`, [
         value.turnId,
         JSON.stringify({ goal: "Find and rank a software engineering role in Dublin", intent: { kind: "interactive_discovery_shortlist", version: 1 } }),
@@ -8587,6 +8706,23 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(workerTwo.kill("SIGKILL")).toBe(true)
       await secondExit
       expect(workerTwo.signalCode).toBe("SIGKILL")
+      const killedWorkerTwoOwnerId = workerOwnerId(workerTwo.pid!)
+      const killedWorkerTwoResolverOwnerId = resolverOwnerId(workerTwo.pid!)
+      const afterWorkerTwoOwnerLabels = new Map([
+        [workerOwnerId(workerOne.pid!), "worker1_dispatcher"],
+        [resolverOwnerId(workerOne.pid!), "worker1_wait_resolver"],
+        [killedWorkerTwoOwnerId, "worker2_dispatcher"],
+        [killedWorkerTwoResolverOwnerId, "worker2_wait_resolver"],
+      ])
+      for (const event of processDiscoveryTurnWorkerDiagnostics(workerTwo, undefined)) {
+        if (event.event !== "active" || typeof event.generation !== "number") continue
+        const observedJobId = turnDispatch.turnJobId(value.turnId, event.generation)
+        observedWorkerByJobId.set(observedJobId, "worker2_active_observed")
+      }
+      restartQueueSnapshots.push(await captureRestartQueueSnapshot(
+        "after_worker2_sigkill",
+        afterWorkerTwoOwnerLabels,
+      ))
       const expiredCheckpointLease = await pool!.query(
         `UPDATE "agent_turns" SET "leaseExpiresAt" = clock_timestamp() - INTERVAL '1 second', "updatedAt" = CURRENT_TIMESTAMP
          WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "status" = 'in_progress'
@@ -8598,6 +8734,23 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
 
       workerThree = startTaskGraphRestartWorker("resume-discovery", { ...value, jobId }, restartWorkerEnv)
       await waitForProcessLine(workerThree, "P3_DISCOVERY_SECOND_WORKER_READY ", 45_000)
+      const workerThreeOwnerId = workerOwnerId(workerThree.pid!)
+      const workerThreeResolverOwnerId = resolverOwnerId(workerThree.pid!)
+      for (const event of processDiscoveryTurnWorkerDiagnostics(workerTwo, workerThree)) {
+        if (event.event !== "active" || typeof event.generation !== "number") continue
+        observedWorkerByJobId.set(turnDispatch.turnJobId(value.turnId, event.generation), `${event.worker}_active_observed`)
+      }
+      restartQueueSnapshots.push(await captureRestartQueueSnapshot(
+        "after_worker3_ready",
+        new Map([
+          [workerOwnerId(workerOne.pid!), "worker1_dispatcher"],
+          [resolverOwnerId(workerOne.pid!), "worker1_wait_resolver"],
+          [killedWorkerTwoOwnerId, "worker2_dispatcher"],
+          [killedWorkerTwoResolverOwnerId, "worker2_wait_resolver"],
+          [workerThreeOwnerId, "worker3_dispatcher"],
+          [workerThreeResolverOwnerId, "worker3_wait_resolver"],
+        ]),
+      ))
       const collectRestartDiscoveryDiagnostics = async () => {
         const processOutputs = [...(workerTwo?.output ?? []), ...(workerThree?.output ?? [])]
         const tasks = await pool!.query<DiscoveryVerifierTask & { failureReason: string | null; result: unknown }>(
@@ -8660,6 +8813,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           waitTargetCounts: waits.rows.map(wait => diagnosticBoundedCount(wait.targetCount)),
           runtimeState,
           analystPlan,
+          queueRecovery: queueRecoveryFailureDiagnostics(),
         }
       }
       try {
@@ -8884,6 +9038,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               matchingStateCounts: [...matchingStateCounts.entries()].sort(([left], [right]) => left.localeCompare(right)),
               queueRows,
               turnWorkerEvents,
+              queueRecovery: queueRecoveryFailureDiagnostics(),
             }))
           }
           await new Promise(resolve => setTimeout(resolve, 1_000))
@@ -9028,6 +9183,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         }), "utf8")
       }
     } finally {
+      if (queueEvents) await queueEvents.close().catch(() => undefined)
+      if (checkpointQueue) await checkpointQueue.close().catch(() => undefined)
       if (workerOne && !processFixtureExited(workerOne)) await killProcessFixture(workerOne)
       if (workerTwo && !processFixtureExited(workerTwo)) await killProcessFixture(workerTwo)
       if (workerThree) await stopProcessFixture(workerThree)
