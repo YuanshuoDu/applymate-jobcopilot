@@ -17,17 +17,21 @@ function row(overrides: Record<string, unknown> = {}) {
   }
 }
 
-function fakePool(existing: Record<string, unknown> | null = null, updateCount = 1, sessionStatus = "running", sessionUserId = "user-1") {
+function fakePool(existing: Record<string, unknown> | null = null, updateCount = 1, sessionStatus = "running", sessionUserId = "user-1", turnRootTaskId: string | null = "root-turn-1") {
   const calls: string[] = []
   const client = {
     query: vi.fn(async (sql: string, values?: unknown[]) => {
       calls.push(sql)
       if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
       if (sql.includes('FROM "agent_sessions"')) return sessionStatus === "missing" || ["aborted", "archived"].includes(sessionStatus) || sessionUserId !== "user-1" ? { rows: [], rowCount: 0 } : { rows: [{ id: "session-1" }], rowCount: 1 }
-      if (sql.includes('FROM "agent_turns"') && sql.includes('"rootTaskId"')) return { rows: [{ rootTaskId: existing?.id ? "root-turn-1" : null }], rowCount: 1 }
+      if (sql.includes('SELECT "rootTaskId" FROM "agent_turns"')) return { rows: [{ rootTaskId: existing?.id ? "root-turn-1" : null }], rowCount: 1 }
+      if (sql.includes('SELECT "id", "rootTaskId" FROM "agent_turns"')) return turnRootTaskId === values?.[5]
+        ? { rows: [{ id: "turn-1", rootTaskId: turnRootTaskId }], rowCount: 1 }
+        : { rows: [], rowCount: 0 }
       if (sql.includes("INSERT INTO \"sub_agent_tasks\"")) return { rows: [], rowCount: 1 }
       if (sql.includes('UPDATE "agent_turns"')) return { rows: [], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [existing ?? row()], rowCount: 1 }
+      if (sql.includes('SELECT "id" FROM "agent_turns"') && sql.includes('"rootTaskId" = $5')) return turnRootTaskId === values?.[4] ? { rows: [{ id: "turn-1" }], rowCount: 1 } : { rows: [], rowCount: 0 }
       if (sql.includes('SELECT "id" FROM "agent_turns"')) return { rows: [{ id: "turn-1" }], rowCount: 1 }
       if (sql.includes('UPDATE "sub_agent_tasks"')) return { rows: [], rowCount: updateCount }
       return { rows: [], rowCount: 1 }
@@ -112,6 +116,33 @@ describe("createPgRootTaskStore", () => {
     expect(serialized).toBe(JSON.stringify({ status: "completed", stepCount: 1, toolCallCount: 0, finalItemId: null, waitId: null }))
   })
 
+  it.each(["completed", "failed"] as const)("settles a %s result only for the exact linked root", async status => {
+    const fake = fakePool(null, 1, "running", "user-1", "root-turn-1")
+    const result = status === "completed"
+      ? { status, stepCount: 1, toolCallCount: 0 }
+      : { status, errorCode: "turn_failed", stepCount: 1, toolCallCount: 0 }
+
+    await createPgRootTaskStore(fake.pool).finish({ lease, rootTaskId: "root-turn-1", result })
+
+    const turnLock = fake.client.query.mock.calls.find(([sql]) => sql.includes('SELECT "id", "rootTaskId" FROM "agent_turns"'))
+    expect(turnLock?.[0]).toContain('"rootTaskId" = $6')
+    expect(turnLock?.[1]).toEqual([lease.turnId, lease.sessionId, lease.userId, lease.ownerId, lease.leaseVersion, "root-turn-1"])
+    expect(fake.client.query.mock.calls.some(([sql]) => sql.includes('UPDATE "sub_agent_tasks" SET'))).toBe(true)
+  })
+
+  it.each([null, "root-turn-other"] as const)("rejects root settlement when the same Turn links to %s", async linkedRootTaskId => {
+    const fake = fakePool(null, 1, "running", "user-1", linkedRootTaskId)
+
+    await expect(createPgRootTaskStore(fake.pool).finish({
+      lease, rootTaskId: "root-turn-1", result: { status: "failed", errorCode: "turn_failed", stepCount: 1, toolCallCount: 0 },
+    })).rejects.toThrow("root_turn_fenced")
+
+    const sessionLock = fake.client.query.mock.calls.findIndex(([sql]) => sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE"))
+    const turnLock = fake.client.query.mock.calls.findIndex(([sql]) => sql.includes('SELECT "id", "rootTaskId" FROM "agent_turns"'))
+    expect(sessionLock).toBeGreaterThanOrEqual(0)
+    expect(sessionLock).toBeLessThan(turnLock)
+    expect(fake.client.query.mock.calls.some(([sql]) => sql.includes('UPDATE "sub_agent_tasks" SET'))).toBe(false)
+  })
   it("atomically persists only a bounded validated discovery shortlist under structuredResult", async () => {
     const fake = fakePool()
     const shortlist = { schemaVersion: 1 as const, status: "partial" as const, items: [{ jobId: "job-1", score: 8.5, evidenceIds: ["read:job:job-1"] }], failures: ["scout_result_partial" as const] }

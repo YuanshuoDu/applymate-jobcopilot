@@ -192,10 +192,10 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
       await transaction(pool, input.lease.userId, async (client) => {
         await lockOpenSession(client, input.lease)
         const ownedTurn = await client.query(
-           `SELECT "id" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3
-             AND "leaseOwnerId" = $4 AND "leaseVersion" = $5 AND "leaseExpiresAt" > CURRENT_TIMESTAMP
+           `SELECT "id", "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3
+             AND "leaseOwnerId" = $4 AND "leaseVersion" = $5 AND "rootTaskId" = $6 AND "leaseExpiresAt" > CURRENT_TIMESTAMP
              AND ${waitState ? `"status" IN ('in_progress', 'waiting_for_user')` : `"status" = 'in_progress'`} FOR UPDATE`,
-           [input.lease.turnId, input.lease.sessionId, input.lease.userId, input.lease.ownerId, input.lease.leaseVersion],
+           [input.lease.turnId, input.lease.sessionId, input.lease.userId, input.lease.ownerId, input.lease.leaseVersion, input.rootTaskId],
         )
         if (!ownedTurn.rows[0]) {
           const completedTurn = input.result.status === "completed" ? await client.query<Row>(`SELECT "id" FROM "agent_turns"
