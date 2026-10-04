@@ -5276,7 +5276,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await seed(pool, discoveryOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
     await seed(pool, discoveryFailureOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
     await seed(pool, discoveryRestartOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
-    await seed(pool, verificationRepairOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
+    // Repair flow uses four coordination calls and five exact job reads.
+    await seed(pool, verificationRepairOwner, "waiting_for_user", { ...DISCOVERY_FIXTURE_TURN_LIMITS, maxToolCalls: 10 })
     await seed(pool, leaseRecoveryOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
     await seed(pool, rootRecoveryScanOwner, "waiting_for_user")
   }, 15_000)
