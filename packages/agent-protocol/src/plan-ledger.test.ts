@@ -19,6 +19,29 @@ const graph = {
     { key: 'analyse', templateId: 'analyst', goal: 'Score the findings', successCriteria: ['Use the saved evidence'], dependsOn: ['scout'], depth: 2, taskId: 'child-analyst' },
   ],
 }
+
+function maximalAsciiSnapshot() {
+  const keys = Array.from({ length: 8 }, (_, index) => `${'k'.repeat(127)}${index}`)
+  return {
+    schemaVersion: TASK_GRAPH_SCHEMA_VERSION,
+    nodes: keys.map((key, index) => ({
+      key, templateId: 't'.repeat(128), goal: 'g'.repeat(1_200),
+      successCriteria: Array.from({ length: 8 }, () => 'c'.repeat(320)),
+      dependsOn: keys.slice(0, index), depth: index + 1, taskId: `${'x'.repeat(127)}${index}`,
+    })),
+  }
+}
+
+function snapshotAtUtf8ByteLimit() {
+  const snapshot = maximalAsciiSnapshot()
+  const first = snapshot.nodes[0]!
+  first.goal = '😀'.repeat(600)
+  first.successCriteria[0] = '😀'.repeat(160)
+  first.successCriteria[1] = '😀'.repeat(160)
+  first.successCriteria[2] = '😀'.repeat(160)
+  first.successCriteria[3] = '😀'.repeat(13) + 'c'.repeat(294)
+  return snapshot
+}
 const result = {
   status: 'completed', stepCount: 2, toolCallCount: 1, finalItemId: 'private-final-item', finalText: 'PRIVATE_RAW_MODEL_PROSE',
   structuredResult: {
@@ -58,8 +81,25 @@ describe('versioned Plan Ledger contract', () => {
   it('exposes the shared bounded TaskGraph parser for object and JSON payloads', () => {
     expect(parseTaskGraphSnapshot(graph)?.nodes).toHaveLength(2)
     expect(parseTaskGraphSnapshot(JSON.stringify(graph))?.nodes).toHaveLength(2)
-    expect(parseTaskGraphSnapshot(' '.repeat(40_001) + JSON.stringify(graph))).toBeNull()
+    expect(parseTaskGraphSnapshot(' '.repeat(40_001) + JSON.stringify(graph))?.nodes).toHaveLength(2)
     expect(parseTaskGraphSnapshot({ ...graph, schemaVersion: 'future' })).toBeNull()
+  })
+
+  it('enforces the canonical UTF-8 cap after parsing JSON transport', () => {
+    const atLimit = snapshotAtUtf8ByteLimit()
+    const encoded = JSON.stringify(atLimit)
+    expect(new TextEncoder().encode(encoded).byteLength).toBe(40_000)
+    expect(parseTaskGraphSnapshot(atLimit)?.nodes).toHaveLength(8)
+    expect(parseTaskGraphSnapshot(encoded.padEnd(45_000, ' '))?.nodes).toHaveLength(8)
+    const escaped = encoded.replaceAll('😀', '\\ud83d\\ude00')
+    expect(new TextEncoder().encode(escaped).byteLength).toBeGreaterThan(40_000)
+    expect(parseTaskGraphSnapshot(escaped)?.nodes).toHaveLength(8)
+
+    const overLimit = { ...atLimit, nodes: atLimit.nodes.map((node, index) => index === 1
+      ? { ...node, goal: `é${node.goal.slice(1)}` } : node) }
+    expect(new TextEncoder().encode(JSON.stringify(overLimit)).byteLength).toBe(40_001)
+    expect(parseTaskGraphSnapshot(overLimit)).toBeNull()
+    expect(parseTaskGraphSnapshot(JSON.stringify(overLimit))).toBeNull()
   })
 
   it('rejects sparse TaskGraph arrays and preserves legacy whitespace identifiers', () => {
@@ -252,6 +292,7 @@ describe('versioned Plan Ledger contract', () => {
     expect(new TextEncoder().encode(JSON.stringify(baseGraph)).byteLength).toBeLessThan(40_000)
     expect(new TextEncoder().encode(JSON.stringify(large)).byteLength).toBeGreaterThan(40_000)
     expect(parseTaskGraphSnapshot(large)).toBeNull()
+    expect(parseTaskGraphSnapshot(JSON.stringify(large))).toBeNull()
   })
 
   it('keeps the Plan Ledger projection strict about canonical TaskGraph identifiers', () => {

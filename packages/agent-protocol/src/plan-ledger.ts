@@ -166,7 +166,6 @@ function parseEvidencePreview(value: unknown, role: unknown): PlanLedgerEvidence
 function safePreview(value: unknown): value is PlanLedgerEvidencePreview | null { return value === null || (record(value) && parseEvidencePreview(value, value.role) !== null) }
 export function parseTaskGraphSnapshot(value: unknown): TaskGraphSnapshot | null {
   try {
-    if (typeof value === 'string' && bytes(value) > MAX_SNAPSHOT_BYTES) return null
     const content = typeof value === 'string' ? JSON.parse(value) as unknown : value
     if (!record(content) || !exact(content, ['schemaVersion', 'nodes']) || content.schemaVersion !== TASK_GRAPH_SCHEMA_VERSION
       || !strictDense(content.nodes, MAX_NODES) || bytes(content) > MAX_SNAPSHOT_BYTES) return null
