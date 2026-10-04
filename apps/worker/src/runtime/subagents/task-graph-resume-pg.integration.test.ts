@@ -8256,6 +8256,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     childQueueName = subagentQueue.SUBAGENT_QUEUE_NAME
     const value = discoveryRestartOwner
     const jobId = `p3-discovery-restart-job-${value.suffix}`
+    // BullMQ marks current active jobs as stalled candidates; a later eligible pass reclaims those whose locks expired. Pin the supported minimum interval so natural recovery fits the unchanged deadline.
+    const restartWorkerEnv = { BULLMQ_STALLED_INTERVAL_MS: "30000" }
     let workerOne: ProcessFixtureChild | undefined
     let workerTwo: ProcessFixtureChild | undefined
     let workerThree: ProcessFixtureChild | undefined
@@ -8270,7 +8272,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         jobId, value.userId,
       ])
 
-      workerOne = startTaskGraphRestartWorker("park-discovery", { ...value, jobId })
+      workerOne = startTaskGraphRestartWorker("park-discovery", { ...value, jobId }, restartWorkerEnv)
       await waitForProcessLine(workerOne, "P3_DISCOVERY_PARENT_SUSPENDED ", 45_000)
       const waitingTurn = await pool!.query<{ status: string; leaseVersion: number; rootTaskId: string | null }>(
         `SELECT "status", "leaseVersion", "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
@@ -8313,7 +8315,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       )
       expect(resetDispatch.rowCount).toBe(1)
 
-      workerTwo = startTaskGraphRestartWorker("resume-discovery", { ...value, jobId, checkpointAfterWaitConsume: true })
+      workerTwo = startTaskGraphRestartWorker("resume-discovery", { ...value, jobId, checkpointAfterWaitConsume: true }, restartWorkerEnv)
       await waitForProcessLine(workerTwo, "P3_DISCOVERY_SECOND_WORKER_READY ", 45_000)
       await waitForProcessLine(workerTwo, "P3_DISCOVERY_WAIT_OUTCOME_COMMITTED", 90_000)
       const checkpointOwnerId = `p3-process-restart-discovery-wait-resolver-${workerTwo.pid}`
@@ -8416,7 +8418,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       )
       expect(expiredCheckpointLease.rowCount).toBe(1)
 
-      workerThree = startTaskGraphRestartWorker("resume-discovery", { ...value, jobId })
+      workerThree = startTaskGraphRestartWorker("resume-discovery", { ...value, jobId }, restartWorkerEnv)
       await waitForProcessLine(workerThree, "P3_DISCOVERY_SECOND_WORKER_READY ", 45_000)
       const collectRestartDiscoveryDiagnostics = async () => {
         const processOutputs = [...(workerTwo?.output ?? []), ...(workerThree?.output ?? [])]
