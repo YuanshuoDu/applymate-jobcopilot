@@ -7156,7 +7156,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let primaryBodyFailure: Error | null = null
     try {
       if (!artifactOwnerSources || !redis) throw new Error("Selected-job fixture sources or Redis were not initialized")
-      const restartJobId = `p3-process-restart-job-${restartOwner.suffix}`
+      const restartJobId = fixtureJobId(restartOwner.suffix, 0)
       await pool!.query(`INSERT INTO "Job" ("id", "userId", "company", "role", "location", "status", "url", "description", "source", "updatedAt")
         VALUES ($1, $2, 'Restart Proof Fixture', 'Software Engineer', 'Dublin', 'saved', 'https://jobs.example.invalid/restart-proof', 'Persisted evidence for restart verification', 'greenhouse', CURRENT_TIMESTAMP)`, [
         restartJobId, restartOwner.userId,
