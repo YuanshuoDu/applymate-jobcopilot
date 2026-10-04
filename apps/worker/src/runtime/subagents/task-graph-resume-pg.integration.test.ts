@@ -9274,6 +9274,192 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     }
   }, 30_000)
 
+  it("cleans only persisted graph members when recovery finds the exact failed root Turn", async () => {
+    const seedValue = fixture()
+    const value = { ...seedValue, sessionId: `000-!root-failed-cleanup-${seedValue.suffix}` }
+    try {
+      await seed(pool!, value, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
+      await activateFixtureTurn(pool!, value)
+      const lease = await claimTurnLease(pool!, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
+      const { createPgRootTaskStore } = await import("./root-task-store.js")
+      const rootTasks = createPgRootTaskStore(pool!)
+      const root = await rootTasks.ensure({
+        lease, goal: "Cancel queued graph work after its Turn fails",
+        allowedActions: TASK_GRAPH_TEMPLATES.analyst.allowedActions,
+      })
+      const stepId = `p3-root-failed-cleanup-step-${value.suffix}`
+      await pool!.query(`INSERT INTO "agent_steps"
+        ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
+        VALUES ($1, $2, $3, $4, 0, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
+      [stepId, value.sessionId, value.turnId, root.id])
+      const graph = await createPgTaskGraphCommandPort(pool!).appendAndSchedule({
+        scope: {
+          userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+          rootTaskId: root.id, parentTaskId: root.id, stepId,
+          turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion,
+          parentLeaseOwner: lease.ownerId, parentAttemptCount: root.attemptCount,
+        },
+        proposal: { expectedRevision: 0, nodes: [
+          { key: "queued", templateId: "analyst", goal: "Cancel queued member", successCriteria: ["Wait for verified evidence"], dependsOn: [], verification: ANALYST_VERIFICATION },
+          { key: "waiting", templateId: "analyst", goal: "Cancel waiting member", successCriteria: ["Wait for its prerequisite"], dependsOn: ["queued"], verification: ANALYST_VERIFICATION },
+          { key: "running", templateId: "analyst", goal: "Fence running member", successCriteria: ["Do not commit after root failure"], dependsOn: [], verification: ANALYST_VERIFICATION },
+        ] },
+        templates: { ...TASK_GRAPH_TEMPLATES },
+      })
+      const taskIdFor = (key: string): string => {
+        const taskId = graph.nodes.find(node => node.key === key)?.taskId
+        if (!taskId) throw new Error(`Root-failed cleanup graph omitted ${key}`)
+        return taskId
+      }
+      const queuedId = taskIdFor("queued")
+      const waitingId = taskIdFor("waiting")
+      const runningId = taskIdFor("running")
+      const store = new PgSubagentTaskStore(pool!, 300_000)
+      const runningOwner = `p3-root-failed-cleanup-child-${value.suffix}`
+      const running = await store.claim({
+        taskId: runningId, sessionId: value.sessionId, ownerId: runningOwner,
+        policy: defaultSubagentPolicy(), now: new Date(),
+      })
+      if (!running?.leaseOwner) throw new Error("Root-failed cleanup graph child did not acquire its lease")
+
+      const nonmember = await store.create({
+        userId: value.userId, sessionId: value.sessionId, turnId: value.turnId, parentTaskId: root.id,
+        role: "analyst", taskType: "analysis", goal: "Keep a nonmember child outside graph cleanup",
+        policy: defaultSubagentPolicy(),
+      })
+      const nonmemberDispatchKey = `subagent-dispatch:${nonmember.id}`
+      await pool!.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
+        VALUES ($1, 'agent.subagent.dispatch', $2, $3, $4::jsonb)`,
+      [randomUUID(), value.sessionId, nonmemberDispatchKey, JSON.stringify({
+        taskId: nonmember.id, sessionId: value.sessionId, rootTaskId: root.id, ownerId: value.ownerId,
+      })])
+
+      const graphIds = [queuedId, waitingId, runningId]
+      const graphBefore = await pool!.query<{ id: string; status: string; attemptCount: number }>(
+        `SELECT "id", "status", "attemptCount" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "id" = ANY($2::text[])`,
+        [value.sessionId, graphIds],
+      )
+      const graphBeforeById = new Map(graphBefore.rows.map(row => [row.id, row] as const))
+      expect(graphBeforeById.get(queuedId)?.status).toBe("queued")
+      expect(graphBeforeById.get(waitingId)?.status).toBe("waiting")
+      expect(graphBeforeById.get(runningId)?.status).toBe("running")
+      const queuedDispatchKey = `subagent-dispatch:${queuedId}`
+      const queuedDispatch = await pool!.query(`SELECT 1 FROM "agent_outbox"
+        WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2 AND "publishedAt" IS NULL`,
+      [value.sessionId, queuedDispatchKey])
+      expect(queuedDispatch.rowCount).toBe(1)
+      const waitingDispatchKey = `subagent-dispatch:${waitingId}`
+      await pool!.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload", "publishedAt")
+        VALUES ($1, 'agent.subagent.dispatch', $2, $3, $4::jsonb, CURRENT_TIMESTAMP)`,
+      [randomUUID(), value.sessionId, waitingDispatchKey, JSON.stringify({
+        taskId: waitingId, sessionId: value.sessionId, rootTaskId: root.id, ownerId: value.ownerId,
+      })])
+      const waitingPublishedDispatchBefore = await pool!.query<{ id: string; publishedAt: Date | null }>(
+        `SELECT "id", "publishedAt" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2`,
+        [value.sessionId, waitingDispatchKey],
+      )
+      expect(waitingPublishedDispatchBefore.rows).toHaveLength(1)
+      expect(waitingPublishedDispatchBefore.rows[0]?.publishedAt).toEqual(expect.any(Date))
+      const runningDispatchKey = `subagent-dispatch:${runningId}`
+      const runningDispatchBefore = await pool!.query<{ id: string; publishedAt: Date | null }>(
+        `SELECT "id", "publishedAt" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2`,
+        [value.sessionId, runningDispatchKey],
+      )
+      expect(runningDispatchBefore.rows).toHaveLength(1)
+      expect(runningDispatchBefore.rows[0]?.publishedAt).toBeNull()
+      const nonmemberBefore = await pool!.query<{ task: RecordValue }>(
+        `SELECT to_jsonb(task) AS "task" FROM "sub_agent_tasks" AS task WHERE task."id" = $1 AND task."sessionId" = $2`,
+        [nonmember.id, value.sessionId],
+      )
+      expect(nonmemberBefore.rows).toHaveLength(1)
+
+      const failedAt = new Date()
+      await expect(releaseTurnLease(pool!, lease, "failed", failedAt)).resolves.toBe(true)
+      const liveRootBeforeRecovery = await pool!.query<{ status: string }>(`SELECT "status" FROM "sub_agent_tasks"
+        WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $1`,
+      [root.id, value.sessionId, value.turnId])
+      expect(liveRootBeforeRecovery.rows).toEqual([{ status: "running" }])
+      const failedTurnBeforeRecovery = await pool!.query<{ turn: RecordValue }>(`SELECT to_jsonb(turn) AS "turn" FROM "agent_turns" AS turn
+        WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND turn."rootTaskId" = $4`,
+      [value.turnId, value.sessionId, value.userId, root.id])
+      expect(failedTurnBeforeRecovery.rows[0]?.turn).toMatchObject({ status: "failed", rootTaskId: root.id })
+
+      const expiredRoot = await pool!.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = clock_timestamp() - INTERVAL '1 second'
+        WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $1 AND "status" = 'running'
+        RETURNING "id"`, [root.id, value.sessionId, value.turnId])
+      expect(expiredRoot.rows).toEqual([{ id: root.id }])
+      const candidateHead = await pool!.query<{ fixtureOwnsHead: boolean }>(`SELECT
+          (task."sessionId" = $1 AND task."id" = $2) AS "fixtureOwnsHead"
+        FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+        WHERE task."status" = 'running' AND (session."status" IN ('aborted', 'archived') OR ${RUNNABLE_SESSION})
+          AND (task."leaseExpiresAt" IS NULL OR task."leaseExpiresAt" <= clock_timestamp())
+          AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= clock_timestamp())
+          AND (${rootRecoveryEligibility})
+        ORDER BY task."sessionId", task."rootTaskId", task."id" LIMIT 1`, [value.sessionId, root.id])
+      expect(candidateHead.rows).toEqual([{ fixtureOwnsHead: true }])
+
+      const recovered = await store.recoverExpired({ now: new Date(), limit: 1 })
+      expect(recovered.map(task => ({ id: task.id, status: task.status }))).toEqual([{ id: root.id, status: "failed" }])
+      expect(recovered[0]?.failureReason).toBe("Linked Turn failed before root lease recovery.")
+      const graphAfter = await pool!.query<{ id: string; status: string; interruptRequestedAt: Date | null; leaseOwner: string | null }>(
+        `SELECT "id", "status", "interruptRequestedAt", "leaseOwner" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "id" = ANY($2::text[])`,
+        [value.sessionId, graphIds],
+      )
+      const graphAfterById = new Map(graphAfter.rows.map(row => [row.id, row] as const))
+      expect(graphAfterById.get(queuedId)).toMatchObject({ status: "cancelled" })
+      expect(graphAfterById.get(waitingId)).toMatchObject({ status: "cancelled" })
+      expect(graphAfterById.get(runningId)).toMatchObject({ status: "running", leaseOwner: runningOwner, interruptRequestedAt: expect.any(Date) })
+
+      for (const [key, taskId] of [["queued", queuedId], ["waiting", waitingId]] as const) {
+        const attemptCount = graphBeforeById.get(taskId)?.attemptCount
+        if (attemptCount === undefined) throw new Error(`Root-failed cleanup lost ${key} attempt count`)
+        const receipt = await pool!.query<{ type: string; payload: RecordValue }>(`SELECT "type", "payload" FROM "agent_events"
+          WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3 AND "taskId" = $4 AND "idempotencyKey" = $5`,
+        [value.sessionId, value.turnId, taskGraphItemId(root.id), taskId, taskGraphLifecycleKey(root.id, key, attemptCount, "task.cancelled")])
+        expect(receipt.rows).toHaveLength(1)
+        expect(receipt.rows[0]).toMatchObject({ type: "item.delta", payload: { kind: "lifecycle", event: { type: "task.cancelled", nodeKey: key } } })
+      }
+      const graphDispatches = await pool!.query<{ idempotencyKey: string }>(`SELECT "idempotencyKey" FROM "agent_outbox"
+        WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "publishedAt" IS NULL
+          AND "idempotencyKey" = ANY($2::text[])`,
+      [value.sessionId, [queuedId, waitingId].map(id => `subagent-dispatch:${id}`)])
+      expect(graphDispatches.rowCount).toBe(0)
+      const runningDispatchAfter = await pool!.query<{ id: string; publishedAt: Date | null }>(
+        `SELECT "id", "publishedAt" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2`,
+        [value.sessionId, runningDispatchKey],
+      )
+      expect(runningDispatchAfter.rows).toEqual(runningDispatchBefore.rows)
+      const waitingPublishedDispatchAfter = await pool!.query<{ id: string; publishedAt: Date | null }>(
+        `SELECT "id", "publishedAt" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2`,
+        [value.sessionId, waitingDispatchKey],
+      )
+      expect(waitingPublishedDispatchAfter.rows).toEqual(waitingPublishedDispatchBefore.rows)
+      const nonmemberAfter = await pool!.query<{ task: RecordValue }>(
+        `SELECT to_jsonb(task) AS "task" FROM "sub_agent_tasks" AS task WHERE task."id" = $1 AND task."sessionId" = $2`,
+        [nonmember.id, value.sessionId],
+      )
+      expect(nonmemberAfter.rows).toEqual(nonmemberBefore.rows)
+      const nonmemberDispatch = await pool!.query(`SELECT 1 FROM "agent_outbox"
+        WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2 AND "publishedAt" IS NULL`,
+      [value.sessionId, nonmemberDispatchKey])
+      expect(nonmemberDispatch.rowCount).toBe(1)
+      const runningInterruptionReceipt = await pool!.query(`SELECT 1 FROM "agent_events"
+        WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+          AND "payload"->'event'->>'type' = 'task.interrupted'`, [value.sessionId, value.turnId, runningId])
+      expect(runningInterruptionReceipt.rowCount).toBe(0)
+      const failedTurnAfterRecovery = await pool!.query<{ turn: RecordValue }>(`SELECT to_jsonb(turn) AS "turn" FROM "agent_turns" AS turn
+        WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND turn."rootTaskId" = $4`,
+      [value.turnId, value.sessionId, value.userId, root.id])
+      expect(failedTurnAfterRecovery.rows).toEqual(failedTurnBeforeRecovery.rows)
+    } finally {
+      try {
+        await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [value.sessionId])
+      } finally {
+        await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
+      }
+    }
+  }, 30_000)
+
   it("recovers an exhausted typed TaskGraph lease into a wait-consumable report and admits its exact repair", async () => {
     const [workerQueue, canonical, commandPortModule, turnQueue, turnState, selectedJobPreparation, rootTaskStoreModule] = await Promise.all([
       import("../../queue/production-bootstrap.js"),

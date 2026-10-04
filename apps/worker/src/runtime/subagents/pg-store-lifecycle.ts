@@ -1,4 +1,5 @@
 import type pg from "pg"
+import { settleRecoveredTaskGraph } from "./task-graph-pg-root-failure-cleanup.js"
 import { computeSubagentNextAttemptAt } from "./retry-policy.js"
 import { RUNNABLE_SESSION } from "../session-gate.js"
 import { deleteGraphDispatch, lockFailedRootTurn, persistGraphTransition, prepareGraphTransition, reconcileGraphDependents, rootRecoveryEligibility, taskGraphEventType, type GraphTransitionPreparation } from "./task-graph-pg-lifecycle.js"
@@ -239,12 +240,9 @@ async function recoverOne(client: pg.PoolClient, candidate: Candidate): Promise<
       AND ("nextAttemptAt" IS NULL OR "nextAttemptAt" <= clock_timestamp())`,
     [candidate.id, candidate.sessionId, status, nextAttemptAt, failureReason, terminal, checkedAt, candidate.userId, row.sessionStatus, resultUpdated, resultUpdated ? json(persistedResult, null, "subagent_task_result") : null])
   if (updated.rowCount !== 1) return null
-  if (graph) { await persistGraphTransition(client, graph, checkedAt, { stream: !closedSession, allowClosedSession: closedSession }); if (terminal) await reconcileGraphDependents(client, graph.scope, checkedAt, { stream: !closedSession, allowClosedSession: closedSession }) }
-  if (status === "queued") await resetDispatch(client, candidate.sessionId, candidate.id)
-  else await deleteGraphDispatch(client, candidate.sessionId, candidate.id)
+  await settleRecoveredTaskGraph(client, {
+    task: rowToTask(row), graph, status, terminal, closedSession, now: checkedAt,
+    canonicalFailedRoot: canonicalRoot && failedRootTurn && status === "failed",
+  })
   return { ...rowToTask(row), status, nextAttemptAt, leaseOwner: null, leaseExpiresAt: null, failureReason: failureReason ? String(failureReason) : null, ...(resultUpdated ? { result: persistedResult } : {}) }
-}
-async function resetDispatch(client: pg.PoolClient, sessionId: string, taskId: string): Promise<void> {
-  await client.query(`UPDATE "agent_outbox" SET "publishedAt" = NULL, "attemptCount" = "attemptCount" + 1, "lastError" = NULL
-    WHERE "topic" = 'agent.subagent.dispatch' AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [sessionId, `subagent-dispatch:${taskId}`])
 }

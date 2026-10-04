@@ -69,8 +69,9 @@ function rootRecoveryPool(turnStatus: string | "missing" | "mismatched", rootOve
     },
     content: snapshot,
   }
-  const tasks = new Map<string, Record<string, unknown>>(ids.map(id => [id, {
-    id, status: statuses.get(id), role: "analyst", failureReason: null, result: null,
+  const tasks = new Map<string, Record<string, unknown>>(ids.map((id, index) => [id, {
+    id, status: statuses.get(id), role: "analyst", attemptCount: index === 2 ? 1 : 0,
+    failureReason: null, result: null, interruptRequestedAt: null,
     userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: rootId, parentTaskId: rootId,
   }] as const))
   const dispatches = new Map<string, { publishedAt: Date | null }>(ids.map(id => [`subagent-dispatch:${id}`, {
@@ -97,8 +98,24 @@ function rootRecoveryPool(turnStatus: string | "missing" | "mismatched", rootOve
       return { rows: [{ status: turnStatus }], rowCount: 1 }
     }
     if (sql.startsWith("SELECT clock_timestamp()")) return { rows: [{ checkedAt: now }], rowCount: 1 }
-    if (sql.includes('SELECT task."turnId"')) return { rows: [{ turnId: "turn-1", rootTaskId: rootId, parentTaskId: null, attemptCount: 1, userId: "user-1" }], rowCount: 1 }
+    if (sql.includes('SELECT task."turnId"')) {
+      const taskId = String(values?.[0])
+      if (taskId === rootId) return { rows: [{ turnId: "turn-1", rootTaskId: rootId, parentTaskId: null, attemptCount: 1, userId: "user-1" }], rowCount: 1 }
+      if (tasks.has(taskId)) return { rows: [{ turnId: "turn-1", rootTaskId: rootId, parentTaskId: rootId, attemptCount: tasks.get(taskId)?.attemptCount, userId: "user-1" }], rowCount: 1 }
+      return { rows: [], rowCount: 0 }
+    }
     if (sql.includes('session."status" AS "sessionStatus"')) return { rows: [{ ...root, status: rootStatus, sessionStatus: "running" }], rowCount: 1 }
+    if (sql.includes('task."id" = ANY($1::text[])') && sql.includes("FOR UPDATE OF task")) {
+      const requested = values?.[0] as string[]
+      const rows = requested.flatMap(id => {
+        const task = tasks.get(id)
+        return task ? [{ id, status: statuses.get(id), attemptCount: task.attemptCount }] : []
+      })
+      return { rows, rowCount: rows.length }
+    }
+    if (sql.includes('task."taskType" = \'root\'') && sql.includes("FOR UPDATE OF task")) {
+      return rootStatus === "failed" ? { rows: [{ ...root, status: rootStatus }], rowCount: 1 } : { rows: [], rowCount: 0 }
+    }
     if (sql.includes("FOR UPDATE OF task")) return { rows: [{ ...root, status: rootStatus, sessionStatus: "running" }], rowCount: 1 }
     if (sql.includes('event."payload"->>\'kind\' = \'proposal\'')) return { rows: [{ payload: proposal }], rowCount: 1 }
     if (sql.includes('SELECT item."id"')) return { rows: [{ id: itemId, revision, content: snapshot, createdAt: now }], rowCount: 1 }
@@ -130,12 +147,14 @@ function rootRecoveryPool(turnStatus: string | "missing" | "mismatched", rootOve
     if (sql.startsWith('INSERT INTO "agent_outbox"')) return { rows: [], rowCount: 1 }
     if (sql.startsWith('UPDATE "sub_agent_tasks"')) {
       if (sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3') && values?.[0] === rootId) {
-        rootStatus = String(values?.[2]); return { rows: [], rowCount: 1 }
+        rootStatus = String(values?.[2])
+        root.status = rootStatus
+        return { rows: [], rowCount: 1 }
       }
       const id = ids.find(candidate => values?.includes(candidate))
       if (id) {
-        if (sql.includes('"interruptRequestedAt"')) tasks.get(id)!.interruptRequestedAt = values?.[5]
-        else if (sql.includes('"status"')) statuses.set(id, sql.includes("= 'cancelled'") || values?.includes("cancelled") ? "cancelled" : String(values?.[2]))
+        if (sql.includes('"interruptRequestedAt"')) tasks.get(id)!.interruptRequestedAt = values?.[6]
+        else if (sql.includes('"status"')) statuses.set(id, sql.includes("SET \"status\" = 'cancelled'") ? "cancelled" : String(values?.[2]))
       }
       return { rows: [], rowCount: 1 }
     }
@@ -334,12 +353,20 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
   it("fails a canonical root before its retry budget only after locking its exact failed Turn", async () => {
     const root = taskRow({ id: "root-turn-1", rootTaskId: "root-turn-1", parentTaskId: null, turnId: "turn-1",
       taskType: "root", role: "orchestrator", depth: 0, attemptCount: 1, maxAttempts: 5 })
-    const recovery = fakePool(sql => {
+    let persistedRootStatus = "running"
+    const recovery = fakePool((sql, params) => {
       if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1")) {
         return { rows: [{ id: root.id, sessionId: root.sessionId, rootTaskId: root.rootTaskId, userId: root.userId }] }
       }
       if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")) return { rows: [{ status: "failed" }] }
       if (sql.includes('session."status" AS "sessionStatus"')) return { rows: [{ ...root, sessionStatus: "running" }] }
+      if (sql.includes('task."taskType" = \'root\'') && sql.includes("FOR UPDATE OF task")) {
+        return persistedRootStatus === "failed" ? { rows: [{ ...root, status: persistedRootStatus }] } : { rows: [] }
+      }
+      if (sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3') && params?.[0] === root.id) {
+        persistedRootStatus = String(params[2])
+        return { rowCount: 1 }
+      }
       return {}
     })
 
@@ -366,6 +393,36 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
 
     expect(recovery.rootStatus).toBe("running")
     expect(recovery.calls.some(([sql]) => sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE"))).toBe(false)
+  })
+
+  it("cleans only persisted graph members when max-attempt recovery is authorized by the failed Turn", async () => {
+    const recovery = rootRecoveryPool("failed")
+
+    const recovered = await recoverExpired(recovery.pool, { now: new Date("2026-09-23T12:00:00Z"), limit: 10 })
+
+    expect(recovered).toMatchObject([{ id: "root-1", status: "failed" }])
+    expect(recovery.rootStatus).toBe("failed")
+    expect(Object.fromEntries(recovery.statuses)).toEqual({
+      "recovery-queued": "cancelled", "recovery-waiting": "cancelled", "recovery-running": "running",
+    })
+    expect(recovery.tasks.get("recovery-running")?.interruptRequestedAt).toBeDefined()
+    expect(recovery.lifecycleReceipts).toHaveLength(2)
+    expect(recovery.lifecycleReceipts.every(receipt => (receipt.event as Record<string, unknown>).type === "task.cancelled")).toBe(true)
+    expect(recovery.dispatches.has("subagent-dispatch:recovery-queued")).toBe(false)
+    expect(recovery.dispatches.has("subagent-dispatch:recovery-waiting")).toBe(false)
+    expect(recovery.dispatches.has("subagent-dispatch:recovery-running")).toBe(true)
+    expect(recovery.dispatches.has("subagent-dispatch:legacy-same-root")).toBe(true)
+
+    const sessionLock = recovery.calls.findIndex(([sql]) => sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE"))
+    const turnLock = recovery.calls.findIndex(([sql]) => sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE"))
+    const rootLock = recovery.calls.findIndex(([sql]) => sql.includes("FOR UPDATE OF task") && sql.includes('FROM "sub_agent_tasks"'))
+    const graphRead = recovery.calls.findIndex(([sql]) => sql.includes('FROM "agent_items"') || sql.includes('FROM "agent_events"'))
+    expect(sessionLock).toBeLessThan(turnLock)
+    expect(turnLock).toBeLessThan(rootLock)
+    expect(rootLock).toBeLessThan(graphRead)
+
+    await expect(recoverExpired(recovery.pool, { now: new Date("2026-09-23T12:00:01Z"), limit: 10 })).resolves.toEqual([])
+    expect(recovery.lifecycleReceipts).toHaveLength(2)
   })
 
   it.each(["leaseExpiresAt", "nextAttemptAt"] as const)(
