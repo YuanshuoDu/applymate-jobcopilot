@@ -35,6 +35,7 @@ import { executionOwnerFence } from "../execution-owner.js"
 import { PgCoordinationStore } from "../mailbox/store.js"
 import { TASK_GRAPH_TEMPLATES, taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
 import { ROLE_RESULT_SCHEMA, RoleResultValidationError, validateRoleResult, type StructuredRoleResult } from "./role-results.js"
+import { createObservedEvidenceIndex, parseAndBindStructuredResult, recordReadToolOutput } from "./child-evidence.js"
 import { parseTaskGraphVerificationReport, TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./task-graph-command-port.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "./task-graph-pg-verification.js"
@@ -43,7 +44,7 @@ import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
 import { defaultSubagentPolicy, type SubagentLease, type SubagentTaskRecord } from "./types.js"
 import { drainTaskGraphStopOutbox, TASK_GRAPH_STOP_OUTBOX_TOPIC } from "./task-graph-stop-outbox.js"
-import { taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
+import { parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 import { rootRecoveryEligibility } from "./task-graph-pg-lifecycle.js"
 import { RUNNABLE_SESSION } from "../session-gate.js"
 
@@ -2466,6 +2467,69 @@ function rowsForToolCall(value: unknown, callId: string): Record<string, unknown
   const row = value as Record<string, unknown>
   const matched = row.toolCallId === callId ? [row] : []
   return [...matched, ...Object.values(row).flatMap(child => rowsForToolCall(child, callId))]
+}
+
+function canonicalDiscoveryScoutResultDiagnostic(request: HarnessModelRequest, resultText: string, expectedJobId: string): RecordValue {
+  const callId = "p3-discovery-read-scout"
+  const rawSearchResult = latestToolResult(request, callId)
+  let latestSearchResultObserved = false
+  let latestSearchResultFailed = false
+  for (let messageIndex = request.messages.length - 1; messageIndex >= 0 && !latestSearchResultObserved; messageIndex -= 1) {
+    const content = request.messages[messageIndex]!.content
+    for (let partIndex = content.length - 1; partIndex >= 0; partIndex -= 1) {
+      const part = content[partIndex]!
+      if (part.type !== "tool_result" || part.toolUseId !== callId) continue
+      latestSearchResultObserved = true
+      latestSearchResultFailed = part.isError === true
+      break
+    }
+  }
+  const search = latestSearchResultFailed ? null : record(rawSearchResult)
+  const jobs = Array.isArray(search?.jobs) ? search.jobs.map(record) : []
+  const expectedJob = jobs.find(job => job?.id === expectedJobId)
+  const searchCallIds = new Set<string>()
+  for (const message of request.messages) for (const part of message.content) {
+    if (part.type === "tool_use" && part.name === "jobs.search") searchCallIds.add(part.id)
+  }
+  const observedSearchOutputs: unknown[] = []
+  let successfulSearchResultCount = 0
+  for (const message of request.messages) for (const part of message.content) {
+    if (part.type !== "tool_result" || !searchCallIds.has(part.toolUseId) || part.isError === true) continue
+    successfulSearchResultCount += 1
+    if (typeof part.content !== "string") continue
+    try { observedSearchOutputs.push(JSON.parse(part.content) as unknown) } catch { /* malformed evidence is omitted */ }
+  }
+  const boundedSearchOutputs = observedSearchOutputs.slice(-8)
+  const observedEvidence = createObservedEvidenceIndex()
+  for (const output of boundedSearchOutputs) recordReadToolOutput(observedEvidence, "jobs.search", output)
+  let resultShapeValid = false
+  let resultValidationCode = "other"
+  try {
+    validateRoleResult(JSON.parse(resultText) as unknown, "scout")
+    resultShapeValid = true
+    resultValidationCode = "none"
+  } catch (error: unknown) {
+    resultValidationCode = error instanceof RoleResultValidationError ? error.code : "other"
+  }
+  let requestEvidenceBindValid = false
+  try {
+    requestEvidenceBindValid = parseAndBindStructuredResult(resultText, "scout", observedEvidence) !== undefined
+  } catch {
+    requestEvidenceBindValid = false
+  }
+  return {
+    latestSearchResultObserved,
+    latestSearchResultParsed: rawSearchResult !== null && !latestSearchResultFailed,
+    latestSearchResultFailed,
+    expectedJobPresent: expectedJob !== undefined,
+    expectedJobSourceMatches: expectedJob?.source === "greenhouse",
+    returnedJobCount: Math.min(jobs.length, 20),
+    observedSearchResultCount: Math.min(successfulSearchResultCount, 8),
+    searchEvidenceTruncated: successfulSearchResultCount > 8,
+    resultShapeValid,
+    resultValidationCode,
+    requestEvidenceBindValid,
+  }
 }
 
 function latestToolResult(request: HarnessModelRequest, callId: string): unknown {
@@ -8183,6 +8247,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   }, 90_000)
 
   it("restores interactive discovery across a real Worker restart and replays its child dispatch once", async () => {
+    const restartCaseStartedAt = Date.now()
     if (interactiveDiscoveryTraceArtifactPath) await rm(interactiveDiscoveryTraceArtifactPath, { force: true })
     const [{ TURN_QUEUE_NAME }, subagentQueue] = await Promise.all([
       import("../turns/turn-queue.js"), import("../../queue/subagent-queue.js"),
@@ -8302,6 +8367,26 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         [value.sessionId, value.turnId, rootTaskId],
       )
       expect(checkpointChildren.rows).toEqual([{ id: source.rows[0]!.id, role: "scout", status: "completed" }])
+      const checkpointGraphItems = await pool!.query<{ id: string; revision: number; content: unknown }>(
+        `SELECT item."id", item."revision", item."content" FROM "agent_items" AS item
+         JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+         JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
+         WHERE item."id" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4
+           AND item."type" = 'task_graph' AND turn."rootTaskId" = $4
+           AND turn."userId" = $5 AND session."userId" = $5
+         ORDER BY item."revision" DESC, item."updatedAt" DESC LIMIT 1`,
+        [taskGraphItemId(rootTaskId!), value.sessionId, value.turnId, rootTaskId, value.userId],
+      )
+      expect(checkpointGraphItems.rows).toHaveLength(1)
+      const checkpointGraphItem = checkpointGraphItems.rows[0]!
+      expect(checkpointGraphItem.id).toBe(taskGraphItemId(rootTaskId!))
+      expect(Number.isSafeInteger(checkpointGraphItem.revision)).toBe(true)
+      expect(checkpointGraphItem.revision).toBeGreaterThan(0)
+      const checkpointGraph = parseTaskGraphSnapshot(checkpointGraphItem.content)
+      expect(checkpointGraph.nodes.map(node => ({ key: node.key, taskId: node.taskId, dependsOn: node.dependsOn }))).toEqual([
+        { key: "scout", taskId: source.rows[0]!.id, dependsOn: [] },
+      ])
+      const checkpointGraphRevision = checkpointGraphItem.revision
       expect(workerTwo.output.filter(line => line.startsWith(`P3_DISCOVERY_CHILD_SETTLED ${source.rows[0]!.id} scout completed`))).toHaveLength(1)
       expect(workerTwo.output.some(line => line.startsWith("P3_DISCOVERY_RESTORED_FINAL_GRAPH "))).toBe(false)
       const checkpointWaitItems = await pool!.query<{ type: string; content: unknown; count: number }>(
@@ -8503,8 +8588,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(record(initialWaitCall?.input)?.taskIds).toEqual([source.rows[0]!.id])
       const analystPlanCall = record(rootToolItem(DISCOVERY_RESTART_ANALYST_PLAN_CALL_ID, "tool_call")?.content)
       const analystPlanInput = record(analystPlanCall?.input)
-      expect(analystPlanInput?.expectedRevision).toBe(1)
+      expect(analystPlanInput?.expectedRevision).toBe(checkpointGraphRevision)
       expect(analystPlanInput?.nodes).toEqual([expect.objectContaining({ key: "analyst", dependsOn: ["scout"] })])
+      const analystPlanResult = record(rootToolItem(DISCOVERY_RESTART_ANALYST_PLAN_CALL_ID, "tool_result")?.content)
+      const analystPlanReceipt = record(analystPlanResult?.output)
+      expect(analystPlanReceipt).toMatchObject({ status: "accepted", revision: checkpointGraphRevision + 1 })
       const analystWaitCall = record(rootToolItem(DISCOVERY_RESTART_ANALYST_WAIT_CALL_ID, "tool_call")?.content)
       expect(record(analystWaitCall?.input)?.taskIds).toEqual([analyst!.id])
       expect(record(record(rootToolItem(DISCOVERY_RESTART_WAIT_CALL_ID, "tool_result")?.content)?.output)).toMatchObject({
@@ -8527,6 +8615,118 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         [value.sessionId, value.turnId, children.rows.map(child => child.id)],
       )
       expect(childCompletionEvents.rows).toEqual(children.rows.map(child => ({ taskId: child.id, count: 1 })).sort((a, b) => a.taskId.localeCompare(b.taskId)))
+
+      const queueOwnerPids = [workerOne.pid, workerTwo.pid, workerThree.pid]
+        .filter((pid): pid is number => typeof pid === "number" && Number.isSafeInteger(pid) && pid > 0)
+      if (queueOwnerPids.length !== 3) throw new Error("Restart fixture process identity unavailable for queue convergence")
+      const expectedQueueOwners = new Set(queueOwnerPids.flatMap(pid => [
+        "p3-process-restart-discovery-worker-" + pid,
+        "p3-process-restart-discovery-wait-resolver-" + pid,
+      ]))
+      const turnQueue = new Queue(TURN_QUEUE_NAME, { connection: redis!, skipVersionCheck: true })
+      try {
+        await turnQueue.waitUntilReady()
+        const states = ["active", "waiting", "delayed", "paused", "waiting-children", "prioritized", "failed", "completed"] as const
+        const liveStates = new Set<string>(["active", "waiting", "delayed", "paused", "waiting-children", "prioritized"])
+        const convergenceDeadline = Math.min(Date.now() + 150_000, restartCaseStartedAt + 230_000)
+        while (true) {
+          const matchingStateCounts = new Map<string, number>()
+          let liveDeliveryCount = 0
+          const jobs = await turnQueue.getJobs([...states], 0, -1, false)
+          for (const job of jobs) {
+            const payload = record(job.data)
+            if (payload?.turnId !== value.turnId) continue
+            if (payload.sessionId !== value.sessionId || typeof payload.ownerId !== "string"
+              || !expectedQueueOwners.has(payload.ownerId)) {
+              throw new Error("Turn queue delivery does not match the fixture session and dispatcher owners")
+            }
+            const state = await job.getState()
+            matchingStateCounts.set(state, (matchingStateCounts.get(state) ?? 0) + 1)
+            if (state === "failed") throw new Error("Turn queue contains a failed delivery for the completed fixture Turn")
+            if (liveStates.has(state)) liveDeliveryCount += 1
+          }
+          if (liveDeliveryCount === 0) break
+          if (Date.now() >= convergenceDeadline) {
+            throw new Error("Turn queue did not converge before the lock and stalled-job deadline: " + JSON.stringify({
+              liveDeliveryCount,
+              matchingStateCounts: [...matchingStateCounts.entries()].sort(([left], [right]) => left.localeCompare(right)),
+            }))
+          }
+          await new Promise(resolve => setTimeout(resolve, 1_000))
+        }
+      } finally {
+        await turnQueue.close().catch(() => undefined)
+      }
+
+      const convergedTerminalEvents = await pool!.query<{ type: string; count: number }>(
+        `SELECT "type", COUNT(*)::int AS "count" FROM "agent_events"
+         WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" IN ('turn.completed', 'turn.failed') GROUP BY "type"`,
+        [value.sessionId, value.turnId],
+      )
+      expect(convergedTerminalEvents.rows).toEqual([{ type: "turn.completed", count: 1 }])
+      const convergedRootToolItems = await pool!.query<{ type: string; toolCallId: string; count: number }>(
+        `SELECT "type", "content"->>'toolCallId' AS "toolCallId", COUNT(*)::int AS "count"
+         FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+           AND "type" IN ('tool_call', 'tool_result')
+         GROUP BY "type", "content"->>'toolCallId' ORDER BY "toolCallId", "type"`,
+        [value.sessionId, value.turnId, rootTaskId],
+      )
+      expect(convergedRootToolItems.rows).toHaveLength(8)
+      expect(convergedRootToolItems.rows.every(item => item.count === 1)).toBe(true)
+      const expectedConvergedRootItems = [
+        DISCOVERY_RESTART_WAIT_CALL_ID, DISCOVERY_RESTART_ANALYST_PLAN_CALL_ID,
+        DISCOVERY_RESTART_ANALYST_WAIT_CALL_ID, "p3-process-restart-discovery-plan",
+      ].flatMap(toolCallId => ["tool_call", "tool_result"].map(type => ({ toolCallId, type })))
+        .sort((left, right) => left.toolCallId.localeCompare(right.toolCallId) || left.type.localeCompare(right.type))
+      expect(convergedRootToolItems.rows.map(({ toolCallId, type }) => ({ toolCallId, type }))).toEqual(expectedConvergedRootItems)
+      const convergedChildren = await pool!.query<{ id: string; role: string; status: string }>(
+        `SELECT "id", "role", "status" FROM "sub_agent_tasks"
+         WHERE "turnId" = $1 AND "sessionId" = $2 AND "parentTaskId" = $3 ORDER BY "role", "id"`,
+        [value.turnId, value.sessionId, rootTaskId],
+      )
+      expect(convergedChildren.rows).toEqual([
+        { id: analyst!.id, role: "analyst", status: "completed" },
+        { id: source.rows[0]!.id, role: "scout", status: "completed" },
+      ])
+      const convergedDispatches = await pool!.query<{ idempotencyKey: string; publishedAt: Date | null }>(
+        `SELECT "idempotencyKey", "publishedAt" FROM "agent_outbox"
+         WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = ANY($2::text[])
+         ORDER BY "idempotencyKey"`,
+        [value.sessionId, convergedChildren.rows.map(child => "subagent-dispatch:" + child.id)],
+      )
+      expect(convergedDispatches.rows).toHaveLength(2)
+      expect(convergedDispatches.rows.every(dispatch => dispatch.publishedAt instanceof Date)).toBe(true)
+
+      const convergedSearchPairs = await pool!.query<{ taskId: string; callCount: number; resultCount: number }>(
+        `SELECT call."taskId", COUNT(DISTINCT call."id")::int AS "callCount",
+                COUNT(DISTINCT result."id")::int AS "resultCount"
+         FROM "agent_items" AS call
+         LEFT JOIN "agent_items" AS result
+           ON result."sessionId" = call."sessionId" AND result."turnId" = call."turnId"
+          AND result."taskId" = call."taskId" AND result."content"->>'toolCallId' = call."content"->>'toolCallId'
+          AND result."type" = 'tool_result'
+         WHERE call."sessionId" = $1 AND call."turnId" = $2 AND call."taskId" = ANY($3::text[])
+           AND call."type" = 'tool_call' AND call."content"->>'toolName' = 'jobs.search'
+         GROUP BY call."taskId" ORDER BY call."taskId"`,
+        [value.sessionId, value.turnId, convergedChildren.rows.map(child => child.id)],
+      )
+      expect(convergedSearchPairs.rows.map(row => row.taskId)).toEqual(convergedChildren.rows.map(child => child.id).sort())
+      expect(convergedSearchPairs.rows.every(row => row.callCount === 1 && row.resultCount === 1)).toBe(true)
+      const convergedChildCompletions = await pool!.query<{ taskId: string; count: number }>(
+        `SELECT "taskId", COUNT(*)::int AS "count" FROM "agent_events"
+         WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = ANY($3::text[])
+           AND "payload"->>'kind' = 'lifecycle' AND "payload"->'event'->>'type' = 'task.completed'
+         GROUP BY "taskId" ORDER BY "taskId"`,
+        [value.sessionId, value.turnId, convergedChildren.rows.map(child => child.id)],
+      )
+      expect(convergedChildCompletions.rows).toEqual(
+        convergedChildren.rows.map(child => ({ taskId: child.id, count: 1 })).sort((a, b) => a.taskId.localeCompare(b.taskId)),
+      )
+      expect(workerTwo.output.filter(line => line.startsWith("P3_DISCOVERY_CHILD_SETTLED " + source.rows[0]!.id + " scout completed"))).toHaveLength(1)
+      expect(workerThree.output.filter(line => line.startsWith("P3_DISCOVERY_CHILD_STARTED " + source.rows[0]!.id + " scout"))).toHaveLength(0)
+      expect(workerThree.output.filter(line => line.startsWith("P3_DISCOVERY_CHILD_STARTED " + analyst!.id + " analyst"))).toHaveLength(1)
+      expect(workerThree.output.filter(line => line.startsWith("P3_DISCOVERY_CHILD_SETTLED " + analyst!.id + " analyst completed"))).toHaveLength(1)
+      expect(workerThree.output.filter(line => line.startsWith("P3_DISCOVERY_RESTORED_FINAL_GRAPH "))).toHaveLength(1)
 
       if (interactiveDiscoveryTraceArtifactPath) {
         const graphRows = await pool!.query<TaskGraphItemRow>(
@@ -8642,6 +8842,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let discoveryJobsSearchCallEmitted = false
     let discoveryAnalystScheduleFailure: ReturnType<typeof discoveryScheduleFailureDiagnostic> | null = null
     const discoveryChildOutcomeProjections: RecordValue[] = []
+    const discoveryScoutResultProjections: RecordValue[] = []
     const discoveryCommandPort = commandPortModule.createPgTaskGraphCommandPort(pool!)
     const diagnosticDiscoveryCommandPort = {
       ...discoveryCommandPort,
@@ -8763,8 +8964,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             const result = task.role === "scout"
               ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [{ jobId, source: "fixture", url: null, evidenceIds: [evidence.id] }], evidence: [evidence], summary: "Found the fixture role" }
               : { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [{ jobId, score: 8.5, evidenceIds: [evidence.id] }], evidence: [evidence], summary: "Strong match" }
+            const resultText = JSON.stringify(result)
+            if (task.role === "scout" && discoveryScoutResultProjections.length < 4) {
+              discoveryScoutResultProjections.push(canonicalDiscoveryScoutResultDiagnostic(request, resultText, jobId))
+            }
             discoveryChildStage = "result_emitted"
-            yield { type: "text_delta", text: JSON.stringify(result) }
+            yield { type: "text_delta", text: resultText }
             yield { type: "completed", finishReason: "stop" }
           },
         }
@@ -8873,6 +9078,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         rootModelFailure: discoveryRootModelFailure ?? "not_captured",
         analystScheduleFailure: discoveryAnalystScheduleFailure ?? { errorName: "none", errorCode: "none" },
         scoutResultValidation: await collectCanonicalDiscoveryScoutResultDiagnostic(pool!, discoveryOwner),
+        scoutReadResultProbes: { count: discoveryScoutResultProjections.length, items: discoveryScoutResultProjections.slice(0, 4) },
         analystPlan,
         analystWait,
         childStage: discoveryChildStage,
@@ -8917,6 +9123,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
        WHERE "turnId" = $1 AND "sessionId" = $2 AND "role" = ANY($3::text[]) ORDER BY "role"`,
       [discoveryOwner.turnId, discoveryOwner.sessionId, ["analyst", "scout"]],
     )
+    expect(discoveryScoutResultProjections).not.toHaveLength(0)
+    expect(discoveryScoutResultProjections).toContainEqual(expect.objectContaining({
+      latestSearchResultObserved: true, latestSearchResultParsed: true, latestSearchResultFailed: false,
+      expectedJobPresent: true, expectedJobSourceMatches: true,
+      resultShapeValid: true, resultValidationCode: "none", requestEvidenceBindValid: true,
+    }))
     expect(children.rows.map(child => [child.role, child.status])).toEqual([["analyst", "completed"], ["scout", "completed"]])
     expect(children.rows.map(child => record(record(child.result)?.structuredResult)?.role)).toEqual(["analyst", "scout"])
     expectPassedVerificationReport(record(children.rows.find(child => child.role === "scout")?.result)?.taskGraphVerificationReport, "candidate-count")
