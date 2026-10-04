@@ -29,7 +29,7 @@ import { selectedJobArtifactCompletionGate, selectedJobArtifactCompletionGateWit
 import { selectedJobArtifactFinalizationGuard } from "../selected-job-finalization-guard.js"
 import { commitTurnTerminal } from "../turns/turn-engine-terminal-commit.js"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
-import { claimTurnLease, type TurnLease } from "../turns/lease.js"
+import { claimTurnLease, releaseTurnLease, type TurnLease } from "../turns/lease.js"
 import { checkTaskGraphTerminalVerification, TASK_GRAPH_VERIFICATION_BLOCKER } from "../turns/turn-execution-completion-gate.js"
 import { executionOwnerFence } from "../execution-owner.js"
 import { PgCoordinationStore } from "../mailbox/store.js"
@@ -44,6 +44,8 @@ import { PgSubagentTaskStore } from "./pg-store.js"
 import { defaultSubagentPolicy, type SubagentLease, type SubagentTaskRecord } from "./types.js"
 import { drainTaskGraphStopOutbox, TASK_GRAPH_STOP_OUTBOX_TOPIC } from "./task-graph-stop-outbox.js"
 import { taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
+import { rootRecoveryEligibility } from "./task-graph-pg-lifecycle.js"
+import { RUNNABLE_SESSION } from "../session-gate.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const PLAN_CALL_ID = "p3-resume-plan"
@@ -9065,6 +9067,124 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     if (!terminalGateLease || !rootTaskId) throw new Error("repair fixture lost its terminal-gate identity")
     expect(await checkTerminalTaskGraph(pool!, terminalGateLease, rootTaskId)).toEqual({ ok: true })
   }, 120_000)
+
+  it("drains a fenced running TaskGraph child after root failure without changing root or Turn", async () => {
+    const seedValue = fixture()
+    const value = { ...seedValue, sessionId: `000-0-root-running-drain-${seedValue.suffix}` }
+    try {
+      await seed(pool!, value, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
+      await activateFixtureTurn(pool!, value)
+      const lease = await claimTurnLease(pool!, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
+      const { createPgRootTaskStore } = await import("./root-task-store.js")
+      const rootTasks = createPgRootTaskStore(pool!)
+      const root = await rootTasks.ensure({ lease, goal: "Drain a running child after root failure" })
+      const stepId = `p3-running-drain-step-${value.suffix}`
+      await pool!.query(`INSERT INTO "agent_steps"
+        ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
+        VALUES ($1, $2, $3, $4, 0, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
+      [stepId, value.sessionId, value.turnId, root.id])
+      const graph = await createPgTaskGraphCommandPort(pool!).appendAndSchedule({
+        scope: {
+          userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+          rootTaskId: root.id, parentTaskId: root.id, stepId,
+          turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion,
+          parentLeaseOwner: lease.ownerId, parentAttemptCount: root.attemptCount,
+        },
+        proposal: { expectedRevision: 0, nodes: [{
+          key: "running", templateId: "analyst", goal: "Finish only while the root is active",
+          successCriteria: ["Do not commit a result after root failure"], dependsOn: [], verification: ANALYST_VERIFICATION,
+        }] },
+        templates: { ...TASK_GRAPH_TEMPLATES },
+      })
+      const childId = graph.nodes.find(node => node.key === "running")?.taskId
+      if (!childId) throw new Error("Running-drain TaskGraph fixture omitted its child")
+      const store = new PgSubagentTaskStore(pool!, 300_000)
+      const childOwner = `p3-running-drain-child-${value.suffix}`
+      const running = await store.claim({
+        taskId: childId, sessionId: value.sessionId, ownerId: childOwner,
+        policy: defaultSubagentPolicy(), now: new Date(),
+      })
+      if (!running?.leaseOwner) throw new Error("Running-drain graph child did not acquire its lease")
+
+      const failedAt = new Date()
+      await rootTasks.finish({
+        lease, rootTaskId: root.id,
+        result: { status: "failed", stepCount: 1, toolCallCount: 0, errorCode: "fixture_root_failed" },
+        now: failedAt,
+      })
+      await expect(releaseTurnLease(pool!, lease, "failed", failedAt)).resolves.toBe(true)
+      // Model the scoped cleanup marker; this case proves the late-result fence and lease-recovery drain, not atomic cleanup.
+      const marked = await pool!.query(`UPDATE "sub_agent_tasks" AS task
+        SET "interruptRequestedAt" = CURRENT_TIMESTAMP, "updatedAt" = CURRENT_TIMESTAMP
+        WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3
+          AND task."rootTaskId" = $4 AND task."parentTaskId" = $4 AND task."status" = 'running'
+          AND task."leaseOwner" = $5 AND task."attemptCount" = $6
+          AND EXISTS (SELECT 1 FROM "sub_agent_tasks" AS root JOIN "agent_turns" AS turn ON turn."id" = root."turnId"
+            WHERE root."id" = $4 AND root."sessionId" = $2 AND root."status" = 'failed'
+              AND turn."id" = $3 AND turn."sessionId" = $2 AND turn."userId" = $7
+              AND turn."rootTaskId" = root."id" AND turn."status" = 'failed')
+        RETURNING task."id"`, [
+        childId, value.sessionId, value.turnId, root.id, childOwner, running.attemptCount, value.userId,
+      ])
+      expect(marked.rows).toEqual([{ id: childId }])
+      await expect(store.finish({
+        taskId: childId, sessionId: value.sessionId, ownerId: childOwner, attemptCount: running.attemptCount,
+        status: "completed",
+        result: { status: "completed", finalText: "late result", finalItemId: null, stepCount: 1, toolCallCount: 1 },
+        now: new Date(),
+      })).resolves.toBeNull()
+      const fencedChild = await store.get(childId, value.sessionId)
+      expect(fencedChild).toMatchObject({ status: "running", leaseOwner: childOwner, result: null, interruptRequestedAt: expect.any(Date) })
+
+      const expired = await pool!.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = clock_timestamp() - INTERVAL '1 second'
+        WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4
+          AND "status" = 'running' AND "leaseOwner" = $5 AND "attemptCount" = $6 AND "interruptRequestedAt" IS NOT NULL
+        RETURNING "id"`, [childId, value.sessionId, value.turnId, root.id, childOwner, running.attemptCount])
+      expect(expired.rows).toEqual([{ id: childId }])
+      const candidateHead = await pool!.query<{ fixtureOwnsHead: boolean }>(`SELECT
+          (task."sessionId" = $1 AND task."id" = $2) AS "fixtureOwnsHead"
+        FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+        WHERE task."status" = 'running' AND (session."status" IN ('aborted', 'archived') OR ${RUNNABLE_SESSION})
+          AND (task."leaseExpiresAt" IS NULL OR task."leaseExpiresAt" <= clock_timestamp())
+          AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= clock_timestamp())
+          AND (${rootRecoveryEligibility})
+        ORDER BY task."sessionId", task."rootTaskId", task."id" LIMIT 1`, [value.sessionId, childId])
+      expect(candidateHead.rows).toEqual([{ fixtureOwnsHead: true }])
+      const rootAndTurn = () => pool!.query<{ root: RecordValue; turn: RecordValue }>(`SELECT to_jsonb(root) AS "root", to_jsonb(turn) AS "turn"
+        FROM "sub_agent_tasks" AS root JOIN "agent_turns" AS turn
+          ON turn."id" = root."turnId" AND turn."sessionId" = root."sessionId"
+        WHERE root."id" = $1 AND root."sessionId" = $2 AND root."turnId" = $3
+          AND root."rootTaskId" = root."id" AND turn."userId" = $4`,
+      [root.id, value.sessionId, value.turnId, value.userId])
+      const beforeRecovery = await rootAndTurn()
+      expect(beforeRecovery.rows).toHaveLength(1)
+      expect(beforeRecovery.rows[0]?.root).toMatchObject({ status: "failed", leaseOwner: null })
+      expect(beforeRecovery.rows[0]?.turn).toMatchObject({ status: "failed", rootTaskId: root.id, leaseOwnerId: null })
+
+      const recovered = await store.recoverExpired({ now: new Date(), limit: 1 })
+      expect(recovered.map(task => task.id)).toEqual([childId])
+      expect(recovered[0]).toMatchObject({ status: "interrupted", leaseOwner: null, leaseExpiresAt: null })
+      const drained = await store.get(childId, value.sessionId)
+      expect(drained).toMatchObject({ status: "interrupted", leaseOwner: null, leaseExpiresAt: null, result: null, interruptRequestedAt: expect.any(Date) })
+      const receiptKey = taskGraphLifecycleKey(root.id, "running", running.attemptCount, "task.interrupted")
+      const receipt = await pool!.query<{ type: string; payload: RecordValue }>(`SELECT "type", "payload" FROM "agent_events"
+        WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3 AND "taskId" = $4 AND "idempotencyKey" = $5`,
+      [value.sessionId, value.turnId, taskGraphItemId(root.id), childId, receiptKey])
+      expect(receipt.rows).toHaveLength(1)
+      expect(receipt.rows[0]).toMatchObject({ type: "item.delta", payload: { kind: "lifecycle", event: { type: "task.interrupted", nodeKey: "running" } } })
+      const dispatch = await pool!.query(`SELECT 1 FROM "agent_outbox"
+        WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2 AND "publishedAt" IS NULL`,
+      [value.sessionId, `subagent-dispatch:${childId}`])
+      expect(dispatch.rowCount).toBe(0)
+      expect((await rootAndTurn()).rows).toEqual(beforeRecovery.rows)
+    } finally {
+      try {
+        await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [value.sessionId])
+      } finally {
+        await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
+      }
+    }
+  }, 30_000)
 
   it("skips an expired copied root lease before the recovery limit while its Turn remains owned", async () => {
     const value = rootRecoveryScanOwner
