@@ -19,6 +19,19 @@ export type PreparedGraphTransition = Readonly<{
 }>
 export type GraphTransitionPreparation = PreparedGraphTransition | Readonly<{ blocked: true }> | null
 
+export const rootRecoveryEligibility = `(task."id" NOT LIKE 'root-%' OR session."status" IN ('aborted','archived') OR task."interruptRequestedAt" IS NOT NULL
+  OR (task."taskType" = 'root' AND task."id" = task."rootTaskId" AND task."parentTaskId" IS NULL AND task."turnId" IS NOT NULL
+    AND EXISTS (SELECT 1 FROM "agent_turns" turn WHERE turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+      AND turn."userId" = session."userId" AND turn."rootTaskId" = task."id" AND turn."status" = 'failed')))`
+export async function lockFailedRootTurn(client: Queryable, task: Record<string, unknown>): Promise<boolean> {
+  if (typeof task.id !== "string" || !task.id.startsWith("root-") || task.taskType !== "root"
+    || task.id !== task.rootTaskId || task.parentTaskId !== null || typeof task.turnId !== "string" || !task.turnId
+    || typeof task.sessionId !== "string" || typeof task.userId !== "string") return false
+  const result = await client.query(`SELECT "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2
+    AND "userId" = $3 AND "rootTaskId" = $4 FOR UPDATE`, [task.turnId, task.sessionId, task.userId, task.id])
+  return result.rows[0]?.status === "failed"
+}
+
 export function taskGraphEventType(status: string, retry: boolean): TaskGraphEventType | null {
   if (retry) return "task.retrying"
   switch (status) {
@@ -221,7 +234,7 @@ function isActiveGraphStatus(status: string): boolean {
     || status === "waiting_for_user" || status === "running"
 }
 
-async function deleteGraphDispatch(client: Queryable, sessionId: string, taskId: string): Promise<void> {
+export async function deleteGraphDispatch(client: Queryable, sessionId: string, taskId: string): Promise<void> {
   await client.query(`DELETE FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch'
     AND "aggregateId" = $1 AND "idempotencyKey" = $2 AND "publishedAt" IS NULL`,
   [sessionId, `subagent-dispatch:${taskId}`])

@@ -453,6 +453,16 @@ const ERROR_DIAGNOSTIC_CODES = new Set([
   "task_graph_revision_mismatch", "task_graph_verification_failed", "task_graph_verification_unverified",
   "revision_limit", "idempotency_conflict",
 ])
+const CHILD_OUTCOME_STATUSES = new Set(["completed", "failed", "waiting", "waiting_for_user"])
+const CHILD_OUTCOME_RETRY_DISPOSITIONS = new Set(["terminal", "retryable"])
+const CHILD_OUTCOME_FAILURE_CODES = new Set([
+  "final_unverified", "step_limit", "model_incomplete", "persistence_conflict", "invalid_output", "turn_execution_failed",
+  "budget_exhausted", "no_progress", "evidence_missing", "evidence_conflict", "business_precondition_failed",
+  "runtime_scope_error", "capability_denied", "idempotency_conflict", "timeout", "cancelled", "tool_execution_failed",
+  "policy_denied", "policy_requires_approval", "policy_requires_user_input", "policy_version_unknown",
+  "policy_rewrite_expands_permissions", "tool_not_found", "tool_version_mismatch", "duplicate_tool", "invalid_definition",
+  "schema_error", "tool_result_replay_uncertain", "tool_recovery_aborted", "invalid_structured_result",
+])
 const ROOT_FAILURE_SQLSTATE_CODES = new Set(["40P01", "40001", "55P03", "57014", "23505", "23503", "23502", "23514", "22P02", "42P01", "42703", "42501"])
 const FINAL_TERMINAL_REASONS = new Set([
   "goal_satisfied", "partial_result", "budget_exhausted", "no_progress", "unrecoverable_error", "final_unverified",
@@ -5229,6 +5239,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   const discoveryRestartOwner = fixture()
   const verificationRepairOwner = fixture()
   const leaseRecoveryOwner = fixture()
+  const rootRecoveryScanSeed = fixture()
+  const rootRecoveryScanOwner = {
+    ...rootRecoveryScanSeed,
+    sessionId: `000-root-recovery-scan-session-${rootRecoveryScanSeed.suffix}`,
+  }
   let artifactOwnerSources: SelectedJobFixtureSources | undefined
   let pool: Pool | undefined
   let redis: Redis | undefined
@@ -5263,6 +5278,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await seed(pool, discoveryRestartOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
     await seed(pool, verificationRepairOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
     await seed(pool, leaseRecoveryOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
+    await seed(pool, rootRecoveryScanOwner, "waiting_for_user")
   }, 15_000)
 
   afterEach(async () => {
@@ -5278,7 +5294,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       }
     }
     await attempt("bootstrap close", async () => { await bootstrap?.close() })
-    if (pool) for (const current of [owner, failureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner, discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, leaseRecoveryOwner]) {
+    if (pool) for (const current of [owner, failureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner, discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, leaseRecoveryOwner, rootRecoveryScanOwner]) {
       await attempt("delete outbox for " + current.sessionId, () => pool!.query(
         "DELETE FROM \"agent_outbox\" WHERE \"aggregateId\" = $1", [current.sessionId],
       ))
@@ -5306,7 +5322,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           jobs = await queue.getJobs(["completed", "failed", "waiting", "delayed", "paused", "waiting-children", "active"])
         })
         for (const job of jobs) {
-          if ([owner, failureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner, discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, leaseRecoveryOwner].some(current => job.data?.turnId === current.turnId || job.data?.sessionId === current.sessionId)) {
+          if ([owner, failureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner, discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, leaseRecoveryOwner, rootRecoveryScanOwner].some(current => job.data?.turnId === current.turnId || job.data?.sessionId === current.sessionId)) {
             await attempt("remove " + label + " job " + job.id, () => job.remove())
           }
         }
@@ -8150,6 +8166,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let discoveryJobsSearchAppeared = false
     let discoveryJobsSearchCallEmitted = false
     let discoveryAnalystScheduleFailure: ReturnType<typeof discoveryScheduleFailureDiagnostic> | null = null
+    const discoveryChildOutcomeProjections: RecordValue[] = []
     const discoveryCommandPort = commandPortModule.createPgTaskGraphCommandPort(pool!)
     const diagnosticDiscoveryCommandPort = {
       ...discoveryCommandPort,
@@ -8244,7 +8261,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         }
       },
     })
-    const childExecutor = createProductionChildExecutor({
+    const productionChildExecutor = createProductionChildExecutor({
       pool: pool!, authorizeUsage: async () => ({ settle: async () => undefined }),
       modelRuntimeFactory: ({ task }) => {
         let round = 0
@@ -8279,6 +8296,24 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         return adapter
       },
     })
+    const childExecutor: typeof productionChildExecutor = async input => {
+      const outcome = await productionChildExecutor(input)
+      const result = record(outcome.result)
+      const failureReasonCode = typeof outcome.failureReason !== "string"
+        ? "none"
+        : CHILD_OUTCOME_FAILURE_CODES.has(outcome.failureReason) ? outcome.failureReason : "other"
+      if (discoveryChildOutcomeProjections.length < 4) discoveryChildOutcomeProjections.push({
+        role: diagnosticEnum(input.lease.role, DISCOVERY_DIAGNOSTIC_ROLES) ?? "other",
+        status: diagnosticEnum(outcome.status, CHILD_OUTCOME_STATUSES) ?? "other",
+        retryDisposition: diagnosticEnum(outcome.retryDisposition, CHILD_OUTCOME_RETRY_DISPOSITIONS) ?? "none",
+        failureReasonCode,
+        resultPresent: outcome.result !== undefined && outcome.result !== null,
+        finalTextString: typeof result?.finalText === "string",
+        structuredResultPresent: result !== null && Object.hasOwn(result, "structuredResult"),
+        finalItemIdString: typeof result?.finalItemId === "string",
+      })
+      return outcome
+    }
     bootstrap = await workerQueue.createProductionWorkerBootstrap({
       pool: pool!, runtime: rootRuntime, ownerId: discoveryOwner.ownerId,
       turnQueueFactory: createTurnQueue, turnRecoveryIntervalMs: 100,
@@ -8366,6 +8401,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         analystPlan,
         analystWait,
         childStage: discoveryChildStage,
+        childExecutionOutcomes: {
+          count: discoveryChildOutcomeProjections.length,
+          items: discoveryChildOutcomeProjections.slice(0, 4),
+        },
         jobsSearchAppeared: discoveryJobsSearchAppeared || searchCalls > 0,
         jobsSearchCallEmitted: discoveryJobsSearchCallEmitted || searchCalls > 0,
         jobsSearchResultPersisted: searchResults > 0,
@@ -8841,32 +8880,76 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         return { adapter, registry: {} as never, candidates: [] }
       },
     })
+    const initialScoutReadDiagnostic = {
+      expectedLookupCount: 0,
+      resolvedLookupCount: 0,
+      structuredResultEmitted: false,
+    }
     const childExecutor = createProductionChildExecutor({
       pool: pool!, authorizeUsage: async () => ({ settle: async () => undefined }),
       modelRuntimeFactory: ({ task }) => {
         let round = 0
-        const callId = `p3-verifier-repair-read:${task.id}:${task.attemptCount}`
+        const jobIds = task.goal === "Find at least two owner jobs"
+          ? [firstJobId]
+          : [firstJobId, secondJobId]
+        const callIds = jobIds.map((_, index) =>
+          "p3-verifier-repair-read:" + value.sessionId + ":" + value.turnId + ":" + task.id + ":" + task.attemptCount + ":" + index)
+        if (task.goal === "Find at least two owner jobs") initialScoutReadDiagnostic.expectedLookupCount = jobIds.length
         const adapter: ModelAdapter = {
-          id: `p3-verifier-repair-${task.role}-child-fixture`, profile,
+          id: "p3-verifier-repair-" + task.role + "-child-fixture", profile,
           async *stream(request) {
             round += 1
             if (round === 1) {
-              expect(request.tools.map(tool => record(tool)?.name)).toContain("jobs.search")
-              yield { type: "tool_call_completed", callId, name: "jobs.search", arguments: { target: "Software Engineer", location: "Dublin", limit: 10 } }
+              expect(request.tools.map(tool => record(tool)?.name)).toContain("jobs.get")
+              for (const [index, callId] of callIds.entries()) {
+                yield {
+                  type: "tool_call_completed", callId, name: "jobs.get",
+                  arguments: { jobId: jobIds[index] },
+                }
+              }
               yield { type: "completed", finishReason: "tool_calls" }
               return
             }
             const waitKey = task.goal === "Find at least two owner jobs"
-              ? `p3-verifier-repair-initial-wait:${value.turnId}` : `p3-verifier-repair-wait:${value.turnId}`
+              ? "p3-verifier-repair-initial-wait:" + value.turnId
+              : "p3-verifier-repair-wait:" + value.turnId
             await waitForPersistedTaskWait(pool!, value.turnId, waitKey)
-            const search = record(latestToolResult(request, callId))
-            const jobs = Array.isArray(search?.jobs) ? search.jobs.map(record).filter((job): job is RecordValue => job !== null) : []
-            const selected = jobs.filter(job => [firstJobId, secondJobId].includes(String(job.id)))
-            if (!selected.length || task.role !== "scout" && task.role !== "analyst") throw new Error("repair fixture child has no canonical job receipt")
-            const evidence = selected.map(job => ({ id: `read:job:${String(job.id)}`, kind: "job", ref: String(job.id), source: typeof job.source === "string" ? job.source : "greenhouse" }))
+            const selected = jobIds.map((expectedJobId, index) => {
+              const result = record(latestToolResult(request, callIds[index]!))
+              const job = record(result?.job)
+              return job?.id === expectedJobId ? job : null
+            }).filter((job): job is RecordValue => job !== null)
+            if (task.goal === "Find at least two owner jobs") {
+              initialScoutReadDiagnostic.resolvedLookupCount = selected.length
+            }
+            if (selected.length !== jobIds.length || task.role !== "scout" && task.role !== "analyst") {
+              throw new Error("repair fixture could not resolve its exact owner-scoped job reads")
+            }
+            const evidence = selected.map(job => {
+              const jobId = String(job.id)
+              return {
+                id: "read:job:" + jobId,
+                kind: "job",
+                ref: jobId,
+                source: typeof job.source === "string" ? job.source : "greenhouse",
+              }
+            })
             const structuredResult = task.role === "scout"
-              ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: selected.map(job => ({ jobId: String(job.id), source: "fixture", url: null, evidenceIds: [`read:job:${String(job.id)}`] })), evidence, summary: "Returned canonical owner-job evidence" }
-              : { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: selected.map((job, index) => ({ jobId: String(job.id), score: 8 + index / 10, evidenceIds: [`read:job:${String(job.id)}`] })), evidence, summary: "Scored canonical owner-job evidence" }
+              ? {
+                schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+                candidates: selected.map((job, index) => ({
+                  jobId: String(job.id), source: "fixture", url: null, evidenceIds: [evidence[index]!.id],
+                })),
+                evidence, summary: "Returned canonical owner-job evidence",
+              }
+              : {
+                schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
+                findings: selected.map((job, index) => ({
+                  jobId: String(job.id), score: 8 + index / 10, evidenceIds: [evidence[index]!.id],
+                })),
+                evidence, summary: "Scored canonical owner-job evidence",
+              }
+            if (task.goal === "Find at least two owner jobs") initialScoutReadDiagnostic.structuredResultEmitted = true
             yield { type: "text_delta", text: JSON.stringify(structuredResult) }
             yield { type: "completed", finishReason: "stop" }
           },
@@ -8908,6 +8991,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       let waitResults: RecordValue = { available: false }
       let rootFailure: RecordValue = { available: false }
       let verification: RecordValue = { available: false }
+      let scoutResultDiagnostic: RecordValue = { available: false }
       try {
         const [initialWait, repairWait] = await Promise.all([
           waitToolResultDiagnostic(pool!, value.turnId, "p3-verifier-repair-initial-wait"),
@@ -8919,6 +9003,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           repairCycleVerificationDiagnostic(pool!, value.turnId),
         ])
         rootFailure = failure
+        try { scoutResultDiagnostic = await collectCanonicalDiscoveryScoutResultDiagnostic(pool!, value) } catch { /* keep the fixed unavailable projection */ }
         verification = verdict
         progress = await turnProgressDiagnostics(
           pool!, value.turnId, "p3-verifier-repair-initial-wait", ["p3-verifier-repair-wait"],
@@ -8942,6 +9027,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         { label: "waitToolResults", value: "", safeValue: JSON.stringify(waitResults) },
         { label: "rootFailureEvidence", value: "", safeValue: JSON.stringify(rootFailure) },
         { label: "taskGraphVerdictEvidence", value: "", safeValue: JSON.stringify(verification) },
+        { label: "scoutResultProjection", value: "", safeValue: JSON.stringify(scoutResultDiagnostic) },
+        { label: "fixtureScoutRead", value: "", safeValue: JSON.stringify(initialScoutReadDiagnostic) },
       ], progress))
     }
 
@@ -8977,6 +9064,91 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     if (!terminalGateLease || !rootTaskId) throw new Error("repair fixture lost its terminal-gate identity")
     expect(await checkTerminalTaskGraph(pool!, terminalGateLease, rootTaskId)).toEqual({ ok: true })
   }, 120_000)
+
+  it("skips an expired copied root lease before the recovery limit while its Turn remains owned", async () => {
+    const value = rootRecoveryScanOwner
+    try {
+      await activateFixtureTurn(pool!, value)
+      const lease = await claimTurnLease(pool!, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
+      const { createPgRootTaskStore } = await import("./root-task-store.js")
+      const root = await createPgRootTaskStore(pool!).ensure({ lease, goal: "Keep the live Turn resumable" })
+      expect(root.id).toBe(`root-${value.turnId}`)
+
+      const store = new PgSubagentTaskStore(pool!)
+      const child = await store.create({
+        userId: value.userId,
+        sessionId: value.sessionId,
+        turnId: value.turnId,
+        parentTaskId: root.id,
+        role: "analyst",
+        taskType: "analysis",
+        goal: "Recover the expired ordinary child lease",
+        policy: defaultSubagentPolicy(),
+      })
+      const childOwner = `p3-root-recovery-scan-child-${value.suffix}`
+      const claimedChild = await store.claim({
+        taskId: child.id, sessionId: value.sessionId, ownerId: childOwner,
+        policy: defaultSubagentPolicy(), now: new Date(),
+      })
+      expect(claimedChild).toMatchObject({ id: child.id, status: "running", attemptCount: 1 })
+
+      const [expiredRoot, expiredChild] = await Promise.all([
+        pool!.query<{ id: string; leaseExpiresAt: Date }>(`UPDATE "sub_agent_tasks"
+          SET "leaseExpiresAt" = clock_timestamp() - INTERVAL '2 seconds', "updatedAt" = CURRENT_TIMESTAMP
+          WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $1 AND "status" = 'running'
+          RETURNING "id", "leaseExpiresAt"`, [root.id, value.sessionId, value.turnId]),
+        pool!.query<{ id: string; attemptCount: number; maxAttempts: number }>(`UPDATE "sub_agent_tasks"
+          SET "leaseExpiresAt" = clock_timestamp() - INTERVAL '1 second', "updatedAt" = CURRENT_TIMESTAMP
+          WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4 AND "status" = 'running'
+            AND "attemptCount" < "maxAttempts"
+          RETURNING "id", "attemptCount", "maxAttempts"`, [child.id, value.sessionId, value.turnId, root.id]),
+      ])
+      expect(expiredRoot.rows).toHaveLength(1)
+      expect(expiredChild.rows).toHaveLength(1)
+      expect(expiredChild.rows[0]?.attemptCount).toBeLessThan(expiredChild.rows[0]!.maxAttempts)
+
+      // Assert the live root owns the head of the global pre-filter candidate order; expose no other session or task IDs.
+      const candidateHead = await pool!.query<{ fixtureOwnsHead: boolean }>(`SELECT
+          (task."sessionId" = $1 AND task."id" = $2) AS "fixtureOwnsHead"
+        FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+        WHERE task."status" = 'running'
+          AND (session."status" IN ('aborted', 'archived') OR session."status" NOT IN ('aborted', 'archived'))
+          AND (task."leaseExpiresAt" IS NULL OR task."leaseExpiresAt" <= clock_timestamp())
+          AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= clock_timestamp())
+        ORDER BY task."sessionId", task."rootTaskId", task."id" LIMIT 1`, [value.sessionId, root.id])
+      expect(candidateHead.rows).toEqual([{ fixtureOwnsHead: true }])
+
+      const recovered = await store.recoverExpired({ now: new Date(), limit: 1 })
+      expect(recovered.map(task => task.id)).toEqual([child.id])
+      expect(recovered[0]).toMatchObject({ id: child.id, status: "queued", leaseOwner: null, leaseExpiresAt: null })
+
+      const rootAfter = await pool!.query<{ status: string; leaseOwner: string | null; leaseExpiresAt: Date | null; failureReason: string | null }>(
+        `SELECT "status", "leaseOwner", "leaseExpiresAt", "failureReason" FROM "sub_agent_tasks"
+         WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $1`,
+        [root.id, value.sessionId, value.turnId],
+      )
+      expect(rootAfter.rows).toHaveLength(1)
+      expect(rootAfter.rows[0]).toMatchObject({ status: "running", leaseOwner: value.ownerId, failureReason: null })
+      expect(rootAfter.rows[0]!.leaseExpiresAt!.getTime()).toBeLessThan(Date.now())
+
+      const turnAfter = await pool!.query<{ status: string; rootTaskId: string | null; leaseOwnerId: string | null; leaseVersion: number; leaseExpiresAt: Date | null }>(
+        `SELECT "status", "rootTaskId", "leaseOwnerId", "leaseVersion", "leaseExpiresAt" FROM "agent_turns"
+         WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`, [value.turnId, value.sessionId, value.userId],
+      )
+      expect(turnAfter.rows).toHaveLength(1)
+      expect(turnAfter.rows[0]).toMatchObject({
+        status: "in_progress", rootTaskId: root.id, leaseOwnerId: lease.ownerId, leaseVersion: lease.leaseVersion,
+      })
+      expect(turnAfter.rows[0]!.leaseExpiresAt!.getTime()).toBe(lease.leaseExpiresAt.getTime())
+      expect(turnAfter.rows[0]!.leaseExpiresAt!.getTime()).toBeGreaterThan(Date.now())
+    } finally {
+      try {
+        await pool!.query("DELETE FROM \"agent_outbox\" WHERE \"aggregateId\" = $1", [value.sessionId])
+      } finally {
+        await pool!.query("DELETE FROM \"User\" WHERE \"id\" = $1", [value.userId])
+      }
+    }
+  }, 30_000)
 
   it("recovers an exhausted typed TaskGraph lease into a wait-consumable report and admits its exact repair", async () => {
     const [workerQueue, canonical, commandPortModule, turnQueue, turnState, selectedJobPreparation, rootTaskStoreModule] = await Promise.all([

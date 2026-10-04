@@ -1,7 +1,7 @@
 import type pg from "pg"
 import { computeSubagentNextAttemptAt } from "./retry-policy.js"
 import { RUNNABLE_SESSION } from "../session-gate.js"
-import { persistGraphTransition, prepareGraphTransition, reconcileGraphDependents, taskGraphEventType, type GraphTransitionPreparation } from "./task-graph-pg-lifecycle.js"
+import { deleteGraphDispatch, lockFailedRootTurn, persistGraphTransition, prepareGraphTransition, reconcileGraphDependents, rootRecoveryEligibility, taskGraphEventType, type GraphTransitionPreparation } from "./task-graph-pg-lifecycle.js"
 import { TASK_GRAPH_VERIFIER_VERSION, verifyTaskGraphNodeEvidence, type TaskGraphVerificationReport } from "./task-graph-pg-verification.js"
 import { parseTaskGraphRepairReceipt, parseTaskGraphVerificationReport, taskGraphVerificationReportMatchesStatus } from "./task-graph-command-port.js"
 import type { StoredTaskGraphNode } from "./task-graph-snapshot.js"
@@ -146,7 +146,7 @@ async function interruptMatching(pool: PgSubagentPool, selector: Selector, now: 
       if (result.rowCount !== 1) continue
       changed++
       if (!running) {
-        await removePendingDispatch(client, selector.sessionId, raw.id)
+        await deleteGraphDispatch(client, selector.sessionId, raw.id)
         if (graph) {
           await persistGraphTransition(client, graph, now)
           await reconcileGraphDependents(client, graph.scope, now)
@@ -175,6 +175,7 @@ export async function recoverExpired(pool: PgSubagentPool, input: { now: Date; l
       WHERE task."status" = 'running' AND (session."status" IN ('aborted', 'archived') OR ${RUNNABLE_SESSION})
         AND (task."leaseExpiresAt" IS NULL OR task."leaseExpiresAt" <= clock_timestamp())
         AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= clock_timestamp())
+        AND (${rootRecoveryEligibility})
       ORDER BY task."sessionId", task."rootTaskId", task."id" LIMIT $1`, [input.limit])
     const recovered: SubagentTaskRecord[] = []
     for (const candidate of candidates.rows as Candidate[]) {
@@ -200,25 +201,28 @@ async function recoverOne(client: pg.PoolClient, candidate: Candidate): Promise<
   const attemptCount = Number(old.attemptCount)
   const closedSession = old.sessionStatus === "aborted" || old.sessionStatus === "archived"
   const interrupted = closedSession || old.interruptRequestedAt !== null
-  const terminal = interrupted || attemptCount >= Number(old.maxAttempts)
+  const canonicalRoot = typeof old.id === "string" && old.id.startsWith("root-")
+  const failedRootTurn = canonicalRoot && !interrupted ? await lockFailedRootTurn(client, old) : false
+  if (canonicalRoot && !interrupted && !failedRootTurn) return null
+  const terminal = interrupted || failedRootTurn || attemptCount >= Number(old.maxAttempts)
   const status = terminal ? interrupted ? "interrupted" : "failed" : "queued"
-  let failureReason = status === "failed" ? "Worker lease expired after maximum attempts." : old.failureReason ?? null
-  const eventType = status === "interrupted" ? "task.interrupted" : status === "failed" ? "task.failed" : "task.retrying"
+  let failureReason = status === "failed" ? failedRootTurn ? "Linked Turn failed before root lease recovery." : "Worker lease expired after maximum attempts." : old.failureReason ?? null
   let graph = await prepareGraphTransition(client, {
-    taskId: candidate.id, sessionId: candidate.sessionId, type: eventType,
-    attemptCount, ...(eventType === "task.failed" ? { failureReason: String(failureReason) } : {}),
+    taskId: candidate.id, sessionId: candidate.sessionId,
+    type: status === "interrupted" ? "task.interrupted" : status === "failed" ? "task.failed" : "task.retrying",
+    attemptCount, ...(status === "failed" ? { failureReason: String(failureReason) } : {}),
   })
   if (graph && "blocked" in graph) return null
   const locked = await client.query(`${sql} FOR UPDATE OF task`, [candidate.id, candidate.sessionId, candidate.userId])
   const row = locked.rows[0] as Record<string, unknown> | undefined
-  if (!row || Number(row.attemptCount) !== attemptCount) return null
+  if (!row || Number(row.attemptCount) !== attemptCount || (canonicalRoot && (row.taskType !== old.taskType || row.id !== old.id || row.rootTaskId !== old.rootTaskId
+      || row.parentTaskId !== old.parentTaskId || row.turnId !== old.turnId))) return null
   const leaseClock = await client.query<{ checkedAt: Date }>(`SELECT clock_timestamp() AS "checkedAt"`)
   const checkedAt = leaseClock.rows[0]?.checkedAt
   if (!checkedAt) return null
-  const lockedSessionClosed = row.sessionStatus === "aborted" || row.sessionStatus === "archived"
   const lockedExpiry = dateValue(row.leaseExpiresAt)
   const lockedRetryAt = dateValue(row.nextAttemptAt)
-  if ((!lockedSessionClosed && lockedExpiry && lockedExpiry > checkedAt) || (lockedRetryAt && lockedRetryAt > checkedAt)) return null
+  if ((!closedSession && lockedExpiry && lockedExpiry > checkedAt) || (lockedRetryAt && lockedRetryAt > checkedAt)) return null
   let persistedResult: unknown, resultUpdated = false
   if (status === "failed" && graph && !("blocked" in graph) && graph.snapshot.nodes.some(node => node.taskId === candidate.id && node.verificationDisposition === "typed" && node.verification)) {
     const finish = await prepareTaskGraphFinish(client, { taskId: candidate.id, sessionId: candidate.sessionId, attemptCount, status, retry: false, failureReason: String(failureReason), result: row.result ?? null }); if (finish.graph && "blocked" in finish.graph) return null
@@ -233,16 +237,12 @@ async function recoverOne(client: pg.PoolClient, candidate: Candidate): Promise<
         WHERE session."id" = "sub_agent_tasks"."sessionId" AND session."userId" = $8 AND session."status" = $9::text)
       AND ($9::text IN ('aborted', 'archived') OR "leaseExpiresAt" IS NULL OR "leaseExpiresAt" <= clock_timestamp())
       AND ("nextAttemptAt" IS NULL OR "nextAttemptAt" <= clock_timestamp())`,
-  [candidate.id, candidate.sessionId, status, nextAttemptAt, failureReason, terminal, checkedAt, candidate.userId, row.sessionStatus, resultUpdated, resultUpdated ? json(persistedResult, null, "subagent_task_result") : null])
+    [candidate.id, candidate.sessionId, status, nextAttemptAt, failureReason, terminal, checkedAt, candidate.userId, row.sessionStatus, resultUpdated, resultUpdated ? json(persistedResult, null, "subagent_task_result") : null])
   if (updated.rowCount !== 1) return null
   if (graph) { await persistGraphTransition(client, graph, checkedAt, { stream: !closedSession, allowClosedSession: closedSession }); if (terminal) await reconcileGraphDependents(client, graph.scope, checkedAt, { stream: !closedSession, allowClosedSession: closedSession }) }
   if (status === "queued") await resetDispatch(client, candidate.sessionId, candidate.id)
-  else await removePendingDispatch(client, candidate.sessionId, candidate.id)
+  else await deleteGraphDispatch(client, candidate.sessionId, candidate.id)
   return { ...rowToTask(row), status, nextAttemptAt, leaseOwner: null, leaseExpiresAt: null, failureReason: failureReason ? String(failureReason) : null, ...(resultUpdated ? { result: persistedResult } : {}) }
-}
-async function removePendingDispatch(client: pg.PoolClient, sessionId: string, taskId: string): Promise<void> {
-  await client.query(`DELETE FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch' AND "aggregateId" = $1
-    AND "idempotencyKey" = $2 AND "publishedAt" IS NULL`, [sessionId, `subagent-dispatch:${taskId}`])
 }
 async function resetDispatch(client: pg.PoolClient, sessionId: string, taskId: string): Promise<void> {
   await client.query(`UPDATE "agent_outbox" SET "publishedAt" = NULL, "attemptCount" = "attemptCount" + 1, "lastError" = NULL
