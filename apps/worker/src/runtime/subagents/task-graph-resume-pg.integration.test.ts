@@ -816,19 +816,79 @@ function diagnosticJsonRecord(value: unknown): RecordValue | null {
 const ROLE_RESULT_DIAGNOSTIC_CODES = new Set(["invalid_shape", "missing_id", "missing_evidence", "invalid_score"])
 const VERIFICATION_DIAGNOSTIC_STATUSES = new Set(["passed", "failed", "unverified"])
 
-async function collectCanonicalDiscoveryScoutResultDiagnostic(pool: Pool, owner: Fixture): Promise<RecordValue> {
-  const result = await pool.query<{ status: string; result: unknown }>(
-    `SELECT task."status", task."result"
+async function collectCanonicalDiscoveryScoutResultDiagnostic(
+  pool: Pool,
+  owner: Fixture,
+  expectedJobIds: readonly string[] = [],
+): Promise<RecordValue> {
+  const result = await pool.query<{ id: string; status: string; result: unknown }>(
+    `SELECT task."id", task."status", task."result"
      FROM "sub_agent_tasks" AS task
      JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
      JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
      WHERE task."sessionId" = $1 AND task."turnId" = $2 AND session."userId" = $3 AND turn."userId" = $3
        AND task."rootTaskId" = turn."rootTaskId" AND task."parentTaskId" = turn."rootTaskId"
        AND task."role" = 'scout'
-     ORDER BY task."createdAt" ASC LIMIT 2`,
+      ORDER BY task."createdAt" ASC LIMIT 8`,
     [owner.sessionId, owner.turnId, owner.userId],
   )
   const row = result.rows.length === 1 ? result.rows[0] : undefined
+  const scoutRowDiagnostics = result.rows.slice(0, 8).map(task => {
+    const taskEnvelope = diagnosticJsonRecord(task.result)
+    const structured = record(taskEnvelope?.structuredResult)
+    const candidateValues = Array.isArray(structured?.candidates) ? structured.candidates.map(record) : null
+    const candidateIds = candidateValues?.flatMap(candidate => typeof candidate?.jobId === "string" ? [candidate.jobId] : []) ?? []
+    const evidence = Array.isArray(structured?.evidence) ? structured.evidence.map(record) : []
+    const hasRedactionMarker = (value: string) => /\[REDACTED(?:_(?:PHONE|EMAIL))?\]/i.test(value)
+    return {
+      status: diagnosticEnum(task.status, TASK_DIAGNOSTIC_STATUSES) ?? "other",
+      targetJobMatch: expectedJobIds.length === 0 ? "not_checked"
+        : candidateValues === null ? "unknown"
+          : candidateIds.some(id => expectedJobIds.includes(id)) ? "present" : "absent",
+      candidateIdRedactionMarker: candidateIds.some(hasRedactionMarker),
+      evidenceIdRedactionMarker: evidence.some(item => [item?.id, item?.ref]
+        .some(value => typeof value === "string" && hasRedactionMarker(value))),
+    }
+  })
+  const searchResult = await pool.query<{
+    callCount: number; resultCount: number; inlineResultCount: number; returnedJobCount: number;
+    targetJobPresent: boolean | null; returnedJobIdRedactionMarker: boolean | null
+  }>(
+    `SELECT COUNT(DISTINCT call."id")::int AS "callCount",
+       COUNT(DISTINCT result."id")::int AS "resultCount",
+       COUNT(DISTINCT result."id") FILTER (WHERE result."status" = 'completed'
+         AND result."content"->>'errorCode' IS NULL
+         AND jsonb_typeof(result."content"->'output'->'jobs') = 'array')::int AS "inlineResultCount",
+       COUNT(DISTINCT job.value->>'id') FILTER (WHERE jsonb_typeof(job.value->'id') = 'string')::int AS "returnedJobCount",
+       CASE WHEN COUNT(DISTINCT result."id") FILTER (WHERE result."status" = 'completed'
+         AND result."content"->>'errorCode' IS NULL
+         AND jsonb_typeof(result."content"->'output'->'jobs') = 'array') > 0
+         THEN COALESCE(bool_or(job.value->>'id' = ANY($4::text[])), false) ELSE NULL END AS "targetJobPresent",
+       CASE WHEN COUNT(DISTINCT result."id") FILTER (WHERE result."status" = 'completed'
+         AND result."content"->>'errorCode' IS NULL
+         AND jsonb_typeof(result."content"->'output'->'jobs') = 'array') > 0
+         THEN COALESCE(bool_or(position('[REDACTED]' in COALESCE(job.value->>'id', '')) > 0
+           OR position('[REDACTED_PHONE]' in COALESCE(job.value->>'id', '')) > 0
+           OR position('[REDACTED_EMAIL]' in COALESCE(job.value->>'id', '')) > 0), false) ELSE NULL END AS "returnedJobIdRedactionMarker"
+     FROM "sub_agent_tasks" AS task
+     JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+     JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+     LEFT JOIN "agent_items" AS call ON call."sessionId" = task."sessionId" AND call."turnId" = task."turnId"
+       AND call."taskId" = task."id" AND call."type" = 'tool_call'
+       AND call."content"->>'toolName' = 'jobs.search'
+     LEFT JOIN "agent_items" AS result ON result."sessionId" = call."sessionId" AND result."turnId" = call."turnId"
+       AND result."taskId" = call."taskId" AND result."type" = 'tool_result'
+       AND result."content"->>'toolCallId' = call."content"->>'toolCallId'
+     LEFT JOIN LATERAL jsonb_array_elements(CASE
+       WHEN result."status" = 'completed' AND result."content"->>'errorCode' IS NULL
+         AND jsonb_typeof(result."content"->'output'->'jobs') = 'array'
+       THEN result."content"->'output'->'jobs' ELSE '[]'::jsonb END) AS job(value) ON true
+     WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3
+       AND session."userId" = $5 AND turn."userId" = $5 AND task."rootTaskId" = turn."rootTaskId"
+       AND task."parentTaskId" = turn."rootTaskId" AND task."role" = 'scout'`,
+    [result.rows.map(task => task.id), owner.sessionId, owner.turnId, [...expectedJobIds], owner.userId],
+  )
+  const search = searchResult.rows[0]
   const envelope = diagnosticJsonRecord(row?.result)
   const keys = envelope ? Object.keys(envelope).sort().join(",") : ""
   const baseKeys = "finalItemId,finalText,status,stepCount,structuredResult,toolCallCount"
@@ -866,6 +926,14 @@ async function collectCanonicalDiscoveryScoutResultDiagnostic(pool: Pool, owner:
     ?? (rawReport && Object.hasOwn(rawReport, "status") ? "other" : "missing")
   return {
     scopedScoutRows: result.rows.length === 0 ? "none" : result.rows.length === 1 ? "one" : "multiple",
+    scopedScoutRowCount: diagnosticBoundedCount(result.rows.length),
+    scopedScoutRowDiagnostics: scoutRowDiagnostics,
+    jobsSearchCallCount: diagnosticBoundedCount(search?.callCount),
+    jobsSearchResultCount: diagnosticBoundedCount(search?.resultCount),
+    jobsSearchInlineResultCount: diagnosticBoundedCount(search?.inlineResultCount),
+    jobsSearchReturnedJobCount: diagnosticBoundedCount(search?.returnedJobCount),
+    jobsSearchTargetJobPresent: search?.targetJobPresent ?? null,
+    jobsSearchReturnedIdRedactionMarker: search?.returnedJobIdRedactionMarker ?? null,
     taskStatus,
     envelopeShape,
     envelopeStatus,
@@ -1738,6 +1806,17 @@ function fixture(): Fixture {
   }
 }
 
+function fixtureJobId(suffix: string, slot = 0): string {
+  const randomHexTail = suffix.replaceAll("-", "").slice(-12)
+  if (!/^[a-f0-9]{12}$/i.test(randomHexTail)) throw new Error("TaskGraph fixture UUID suffix is invalid")
+  const decimalTail = ((BigInt(`0x${randomHexTail}`) + BigInt(slot)) % 1_000_000_000_000n)
+    .toString()
+    .padStart(12, "0")
+  // Keep the fixed numeric prefix phone-like for generic redaction while the
+  // fixture UUID tail makes the Job primary key unique across test runs.
+  return `48273164-2059-4873-8942-${decimalTail}`
+}
+
 type FixtureTurnLimits = { readonly maxSteps: number; readonly maxToolCalls: number }
 
 const DEFAULT_FIXTURE_TURN_LIMITS: FixtureTurnLimits = { maxSteps: 8, maxToolCalls: 8 }
@@ -2523,7 +2602,12 @@ function canonicalDiscoveryScoutResultDiagnostic(request: HarnessModelRequest, r
     latestSearchResultFailed,
     expectedJobPresent: expectedJob !== undefined,
     expectedJobSourceMatches: expectedJob?.source === "greenhouse",
+    jobsSearchCallCount: Math.min(searchCallIds.size, 8),
+    jobsSearchCallCountTruncated: searchCallIds.size > 8,
     returnedJobCount: Math.min(jobs.length, 20),
+    returnedJobIdRedactionMarker: rawSearchResult === null || latestSearchResultFailed
+      ? null
+      : jobs.some(job => typeof job?.id === "string" && /\[REDACTED(?:_(?:PHONE|EMAIL))?\]/i.test(job.id)),
     observedSearchResultCount: Math.min(successfulSearchResultCount, 8),
     searchEvidenceTruncated: successfulSearchResultCount > 8,
     resultShapeValid,
@@ -3742,6 +3826,49 @@ async function waitToolResultDiagnostic(pool: Pool, turnId: string, toolCallId: 
         return taskResult?.truncated === true || taskResult?.$truncated === true
       }).length)
       : null,
+  }
+}
+
+async function scopedWaitToolResultDiagnostic(pool: Pool, owner: Fixture, toolCallId: string): Promise<RecordValue> {
+  const result = await pool.query<{
+    itemStatus: string; outputStatus: string | null; targetCount: number | null; matchedCount: number | null;
+    targetIdsRedacted: boolean | null; taskIdsRedacted: boolean | null
+  }>(
+    `SELECT item."status" AS "itemStatus", item."content"->'output'->>'status' AS "outputStatus",
+       CASE WHEN jsonb_typeof(item."content"->'output'->'taskIds') = 'array'
+         THEN jsonb_array_length(item."content"->'output'->'taskIds') ELSE NULL END AS "targetCount",
+       CASE WHEN jsonb_typeof(item."content"->'output'->'matchedTaskIds') = 'array'
+         THEN jsonb_array_length(item."content"->'output'->'matchedTaskIds') ELSE NULL END AS "matchedCount",
+       CASE WHEN jsonb_typeof(item."content"->'output'->'taskIds') = 'array' THEN COALESCE((
+         SELECT bool_or(position('[REDACTED]' in COALESCE(target.value #>> '{}', '')) > 0
+           OR position('[REDACTED_PHONE]' in COALESCE(target.value #>> '{}', '')) > 0
+           OR position('[REDACTED_EMAIL]' in COALESCE(target.value #>> '{}', '')) > 0)
+         FROM jsonb_array_elements(item."content"->'output'->'taskIds') AS target(value)
+       ), false) ELSE NULL END AS "targetIdsRedacted",
+       CASE WHEN jsonb_typeof(item."content"->'output'->'tasks') = 'array' THEN COALESCE((
+         SELECT bool_or(position('[REDACTED]' in COALESCE(task.value->>'taskId', '')) > 0
+           OR position('[REDACTED_PHONE]' in COALESCE(task.value->>'taskId', '')) > 0
+           OR position('[REDACTED_EMAIL]' in COALESCE(task.value->>'taskId', '')) > 0)
+         FROM jsonb_array_elements(item."content"->'output'->'tasks') AS task(value)
+       ), false) ELSE NULL END AS "taskIdsRedacted"
+     FROM "agent_items" AS item
+     JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+     JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = turn."userId"
+     WHERE item."sessionId" = $1 AND item."turnId" = $2 AND session."userId" = $3 AND turn."userId" = $3
+       AND turn."rootTaskId" IS NOT NULL AND item."taskId" = turn."rootTaskId"
+       AND item."type" = 'tool_result' AND item."content"->>'toolCallId' = $4
+     ORDER BY item."createdAt" DESC LIMIT 1`,
+    [owner.sessionId, owner.turnId, owner.userId, toolCallId],
+  )
+  const row = result.rows[0]
+  return {
+    resultPresent: Boolean(row),
+    resultStatus: row ? diagnosticEnum(row.itemStatus, ITEM_DIAGNOSTIC_STATUSES) ?? "other" : "missing",
+    outputStatus: diagnosticEnum(row?.outputStatus, PROCESS_FIXTURE_WAIT_OUTPUT_STATUSES) ?? (row?.outputStatus == null ? "missing" : "other"),
+    targetTaskCount: diagnosticBoundedCount(row?.targetCount),
+    matchedTaskCount: diagnosticBoundedCount(row?.matchedCount),
+    targetIdsRedacted: row?.targetIdsRedacted ?? null,
+    taskIdsRedacted: row?.taskIdsRedacted ?? null,
   }
 }
 
@@ -8306,7 +8433,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     turnQueueName = TURN_QUEUE_NAME
     childQueueName = subagentQueue.SUBAGENT_QUEUE_NAME
     const value = discoveryRestartOwner
-    const jobId = `p3-discovery-restart-job-${value.suffix}`
+    const jobId = fixtureJobId(value.suffix)
     // BullMQ marks current active jobs as stalled candidates; a later eligible pass reclaims those whose locks expired. Pin the supported minimum interval so natural recovery fits the unchanged deadline.
     const restartWorkerEnv = { BULLMQ_STALLED_INTERVAL_MS: "30000" }
     let workerOne: ProcessFixtureChild | undefined
@@ -8920,7 +9047,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     childQueueName = subagentQueue.SUBAGENT_QUEUE_NAME
     await activateFixtureTurn(pool!, discoveryOwner)
 
-    const jobId = `p3-discovery-job-${discoveryOwner.suffix}`
+    const jobId = fixtureJobId(discoveryOwner.suffix)
     await pool!.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4`, [
       discoveryOwner.turnId,
       JSON.stringify({ goal: "Find a strong software engineering role in Dublin", intent: { kind: "interactive_discovery_shortlist", version: 1 } }),
@@ -9184,7 +9311,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         rootStage: discoveryRootStage,
         rootModelFailure: discoveryRootModelFailure ?? "not_captured",
         analystScheduleFailure: discoveryAnalystScheduleFailure ?? { errorName: "none", errorCode: "none" },
-        scoutResultValidation: await collectCanonicalDiscoveryScoutResultDiagnostic(pool!, discoveryOwner),
+        scoutResultValidation: await collectCanonicalDiscoveryScoutResultDiagnostic(pool!, discoveryOwner, [jobId]),
         scoutReadResultProbes: { count: discoveryScoutResultProjections.length, items: discoveryScoutResultProjections.slice(0, 4) },
         analystPlan,
         analystWait,
@@ -9276,7 +9403,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4`, [
       value.turnId, JSON.stringify({ limits: { maxSteps: INTERACTIVE_FAILURE_MAX_STEPS, maxToolCalls: 8 } }), value.sessionId, value.userId,
     ])
-    const jobId = `p3-discovery-failure-job-${value.suffix}`
+    const jobId = fixtureJobId(value.suffix)
     await pool!.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4`, [
       value.turnId,
       JSON.stringify({ goal: "Find and rank an engineering role in Dublin", intent: { kind: "interactive_discovery_shortlist", version: 1 } }),
@@ -9633,8 +9760,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     turnQueueName = TURN_QUEUE_NAME
     childQueueName = subagentQueue.SUBAGENT_QUEUE_NAME
     await activateFixtureTurn(pool!, value)
-    const firstJobId = `p3-verifier-repair-first-${value.suffix}`
-    const secondJobId = `p3-verifier-repair-second-${value.suffix}`
+    const firstJobId = fixtureJobId(value.suffix)
+    const secondJobId = fixtureJobId(value.suffix, 1)
     await pool!.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4`, [
       value.turnId, JSON.stringify({ goal: "Find and verify engineering roles" }), value.sessionId, value.userId,
     ])
@@ -9952,8 +10079,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       let scoutResultDiagnostic: RecordValue = { available: false }
       try {
         const [initialWait, repairWait] = await Promise.all([
-          waitToolResultDiagnostic(pool!, value.turnId, initialWaitCallId),
-          waitToolResultDiagnostic(pool!, value.turnId, repairWaitCallId),
+          scopedWaitToolResultDiagnostic(pool!, value, initialWaitCallId),
+          scopedWaitToolResultDiagnostic(pool!, value, repairWaitCallId),
         ])
         waitResults = { initial: initialWait, repair: repairWait }
         const [failure, verdict] = await Promise.all([
@@ -9961,7 +10088,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           repairCycleVerificationDiagnostic(pool!, value.turnId),
         ])
         rootFailure = failure
-        try { scoutResultDiagnostic = await collectCanonicalDiscoveryScoutResultDiagnostic(pool!, value) } catch { /* keep the fixed unavailable projection */ }
+        try { scoutResultDiagnostic = await collectCanonicalDiscoveryScoutResultDiagnostic(pool!, value, [firstJobId, secondJobId]) } catch { /* keep the fixed unavailable projection */ }
         verification = verdict
         progress = await turnProgressDiagnostics(
           pool!, value.turnId, initialWaitCallId, [repairWaitCallId],
@@ -10431,7 +10558,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const sourceGoal = "Read the fixture source before lease recovery"
     const dependentGoal = "Analyze only after the exact late repair receipt"
     const repairGoal = "Repair the exact unverified candidate count"
-    const jobId = "p3-lease-recovery-job-" + value.suffix
+    const jobId = fixtureJobId(value.suffix)
     turnQueueName = turnQueue.TURN_QUEUE_NAME
     await activateFixtureTurn(pool!, value)
     await pool!.query(

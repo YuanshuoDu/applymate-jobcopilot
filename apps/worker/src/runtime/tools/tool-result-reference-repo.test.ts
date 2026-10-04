@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto"
 import { describe, expect, it } from "vitest"
-import { canonicalJson } from "@jobcopilot/shared"
+import { canonicalJson, redactSensitiveValue } from "@jobcopilot/shared"
 
 import type { SubagentLease } from "../subagents/types.js"
 import type { TurnLease } from "../turns/lease.js"
 import { MAX_TOOL_RESULT_BYTES } from "./tool-result-reference-types.js"
-import { createToolResultReferenceRepository, ToolResultRepositoryError } from "./tool-result-reference-repo.js"
+import { createToolResultReferenceRepository, isVerifiedToolResultChunk, ToolResultRepositoryError } from "./tool-result-reference-repo.js"
 
 const now = new Date("2026-09-08T03:00:00.000Z")
 const turn: TurnLease = {
@@ -35,6 +35,7 @@ function fakePool(options: {
   stepAttempt?: number
   sessionStatus?: string
   sessionUserId?: string
+  sourceToolNames?: string[]
 } = {}) {
   let stored: StoredRow | undefined = options.historical
   const queries: Array<{ text: string; values: readonly unknown[] }> = []
@@ -43,6 +44,11 @@ function fakePool(options: {
     async query<T = unknown>(text: string, values: readonly unknown[] = []) {
       queries.push({ text, values })
       if (text === "BEGIN" || text === "COMMIT" || text === "ROLLBACK" || text.includes("set_config")) return { rows: [], rowCount: 0 } as { rows: T[]; rowCount: number }
+      if (text.includes('FROM "agent_items" AS item')) {
+        const scoped = values[0] === "session-1" && values[5] === "user-1"
+        const rows = scoped ? (options.sourceToolNames ?? ["test.tool"]).slice(0, 2).map(toolName => ({ toolName })) : []
+        return { rows, rowCount: rows.length } as { rows: T[]; rowCount: number }
+      }
       if (text.includes('FROM "agent_sessions"')) {
         const allowed = values[0] === "session-1" && values[1] === (options.sessionUserId ?? "user-1")
           && !["aborted", "archived"].includes(options.sessionStatus ?? "running")
@@ -82,6 +88,25 @@ function fakePool(options: {
   return { pool: { connect: async () => client }, queries, get stored() { return stored } }
 }
 
+const JOB_ID = "00000000-0000-4000-8000-000000000001"
+const NESTED_ID = "00000000-0000-4000-8000-000000000002"
+
+function largeSearchOutput() {
+  return { jobs: [{ id: JOB_ID, title: "Engineer", description: `Contact private@example.com or +353 85 123 4567 ${"x".repeat(9_000)}`, metadata: { id: NESTED_ID } }], page: 1, hasMore: false }
+}
+
+function largeGetOutput() {
+  return { job: { id: JOB_ID, title: "Engineer", contact: "private@example.com +353 85 123 4567", description: "x".repeat(9_000), company: { id: NESTED_ID } } }
+}
+
+function largeWaitOutput() {
+  const taskId = "subagent-00000000-0000-4000-8000-000000000004"
+  return {
+    waitId: "wait-00000000-0000-4000-8000-000000000003", status: "ready", taskIds: [taskId], deadlineAt: "2099-01-01T00:00:00.000Z",
+    matchedTaskIds: [taskId], tasks: [{ taskId, status: "completed", role: "analyst", result: { details: `private@example.com +353 85 123 4567 ${"x".repeat(9_000)}`, nested: { id: NESTED_ID } }, failureReason: null }],
+  }
+}
+
 describe("tool result reference repository", () => {
   it("redacts and idempotently stores one fenced result per step and call", async () => {
     const fake = fakePool()
@@ -92,8 +117,75 @@ describe("tool result reference repository", () => {
     expect(first.id).toBe(second.id)
     expect(first.sanitizedJson).toEqual({ answer: "[REDACTED]", password: "[REDACTED]" })
     expect(fake.queries.some(query => query.text.includes("set_config('app.user_id'"))).toBe(true)
+    const sourceQuery = fake.queries.find(query => query.text.includes('FROM "agent_items" AS item'))
+    expect(sourceQuery?.values).toEqual(["session-1", "turn-current", "root-current", "step-1", "call-1", "user-1"])
+    expect(sourceQuery?.text).toContain('item."content"->>\'toolCallId\' = $5')
     await expect(repository.put(rootOwner, { stepId: "step-1", toolCallId: "call-1", value: "x".repeat(MAX_TOOL_RESULT_BYTES + 1), now }))
       .rejects.toMatchObject({ code: "tool_result_too_large" })
+  })
+
+  it("returns an exact generic-redacted legacy row for the same source call only", async () => {
+    const input = { jobs: [{ id: JOB_ID, title: "Engineer", description: "Contact private@example.com", metadata: { id: NESTED_ID } }], page: 1, hasMore: false }
+    const legacyJson = redactSensitiveValue(input)
+    const historical: StoredRow = { ...row("tool-result-legacy", "root-current", legacyJson), toolCallId: "legacy-call" }
+    const fake = fakePool({ historical, sourceToolNames: ["jobs.search"] })
+    const repository = createToolResultReferenceRepository(fake.pool as never)
+
+    const retried = await repository.put(rootOwner, { stepId: "step-1", toolCallId: "legacy-call", value: input, now })
+
+    expect(retried.id).toBe(historical["id"])
+    expect(retried.sanitizedJson).toEqual(legacyJson)
+    expect(retried.sha256).toBe(historical["sha256"])
+    expect(canonicalJson(legacyJson)).not.toContain(JOB_ID)
+    await expect(repository.put(rootOwner, { stepId: "step-1", toolCallId: "legacy-call", value: { ...input, page: 2 }, now }))
+      .rejects.toMatchObject({ code: "tool_result_conflict" })
+  })
+
+  it.each([{ sourceToolNames: [] as string[] }, { sourceToolNames: ["jobs.search", "jobs.get"] }])("requires one canonical tool_call source, got %j", async ({ sourceToolNames }) => {
+    const fake = fakePool({ sourceToolNames })
+    const repository = createToolResultReferenceRepository(fake.pool as never)
+    await expect(repository.put(rootOwner, { stepId: "step-1", toolCallId: "unbound-call", value: { id: JOB_ID }, now }))
+      .rejects.toMatchObject({ code: "tool_result_fence_rejected" })
+    expect(fake.queries.some(query => query.text.includes('INSERT INTO "agent_tool_result_references"'))).toBe(false)
+  })
+
+  it.each([
+    ["agent.wait", largeWaitOutput()],
+    ["jobs.search", largeSearchOutput()],
+    ["jobs.get", largeGetOutput()],
+  ] as const)("source-sanitizes and reads every %s durable chunk to verified EOF", async (toolName, value) => {
+    const fake = fakePool({ sourceToolNames: [toolName] })
+    const repository = createToolResultReferenceRepository(fake.pool as never)
+    const stored = await repository.put(rootOwner, { stepId: "step-1", toolCallId: `call-${toolName}`, value, now })
+    const encoded = canonicalJson(stored.sanitizedJson)
+    expect(stored.byteCount).toBeGreaterThan(8 * 1024)
+    expect(stored.byteCount).toBe(Buffer.byteLength(encoded, "utf8"))
+    expect(stored.sha256).toBe(createHash("sha256").update(encoded, "utf8").digest("hex"))
+
+    const chunks: string[] = []
+    let cursor: string | undefined
+    let result: Awaited<ReturnType<typeof repository.read>> = null
+    for (let index = 0; index < 10; index += 1) {
+      result = await repository.read(rootOwner, { referenceId: stored.id, ...(cursor === undefined ? {} : { cursor }) }, `reader-${toolName}`)
+      expect(result).not.toBeNull()
+      expect(isVerifiedToolResultChunk(result, rootOwner, `reader-${toolName}`)).toBe(true)
+      chunks.push(result!.chunk)
+      if (result!.nextCursor === null) break
+      cursor = result!.nextCursor
+    }
+    expect(result?.nextCursor).toBeNull()
+    expect(chunks.join("")).toBe(encoded)
+    expect(Buffer.byteLength(chunks.join(""), "utf8")).toBe(stored.byteCount)
+    expect(createHash("sha256").update(chunks.join(""), "utf8").digest("hex")).toBe(stored.sha256)
+    expect(isVerifiedToolResultChunk(result, { ...rootOwner, taskId: "other-root" }, `reader-${toolName}`)).toBe(false)
+
+    const serialized = JSON.stringify(JSON.parse(chunks.join("")))
+    expect(serialized).not.toContain("private@example.com")
+    expect(serialized).not.toContain("+353 85 123 4567")
+    expect(serialized).toContain("[REDACTED_PHONE]")
+    if (toolName === "jobs.search" || toolName === "jobs.get") expect(serialized).toContain(JOB_ID)
+    if (toolName === "agent.wait") expect(serialized).toContain("subagent-00000000-0000-4000-8000-000000000004")
+    expect(serialized).not.toContain(NESTED_ID)
   })
 
   it.each(["aborted", "archived"])("rejects a %s session before any tool result write", async sessionStatus => {
@@ -139,6 +231,8 @@ describe("tool result reference repository", () => {
     const result = await repository.read(rootOwner, { referenceId: "ref-old" })
     expect(result).toMatchObject({ ref: "ref-old", chunk: canonicalJson(value), nextCursor: null })
     expect(fake.queries.some(query => query.text.includes('ref."sessionId" = $3'))).toBe(true)
+    const sourceQuery = fake.queries.find(query => query.text.includes('FROM "agent_items" AS item'))
+    expect(sourceQuery?.values).toEqual(["session-1", "turn-old", "root-old", "step-old", "call-old", "user-1"])
   })
 
   it("keeps the root history read tenant-scoped and trusts the database lease clock", async () => {
