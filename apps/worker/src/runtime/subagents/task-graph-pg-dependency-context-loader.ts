@@ -137,9 +137,23 @@ function canonicalResultEvidenceIds(value: ScoutResult | AnalystResult): string[
 
 function parseFailedOriginalResult(value: Row | null, node: Node, report: NonNullable<ReturnType<typeof parseTaskGraphVerificationReport>>, role: StructuredRole): StructuredRoleResult | undefined {
   if (!value) return undefined
+  const reportOnly = "taskGraphVerificationReport"
+  const reportWithNullWorkerResult = "taskGraphVerificationReport,workerResult"
+  const keys = Object.keys(value).sort().join(",")
+  if (keys === reportOnly || keys === reportWithNullWorkerResult) {
+    const storedReport = parseTaskGraphVerificationReport(value.taskGraphVerificationReport, node.verification?.criteria.map(item => item.id) ?? [])
+    if (!hasExactPlainDataKeys(value, keys) || (keys === reportWithNullWorkerResult && value.workerResult !== null)
+      || node.verificationDisposition !== "typed" || !node.verification || node.verification.role !== role
+      || !storedReport || storedReport.status !== "unverified" || storedReport.reasonCode !== "result_invalid"
+      || storedReport.evidenceDigest !== null || storedReport.resultDigest !== null
+      || !taskGraphVerificationReportMatchesStatus(report, "failed")
+      || !taskGraphVerificationReportMatchesStatus(storedReport, "failed")) {
+      throw new Error("task_graph_dependency_repair_original_invalid")
+    }
+    return undefined
+  }
   const without = ["finalItemId", "finalText", "status", "stepCount", "taskGraphVerificationReport", "toolCallCount"].sort().join(",")
   const withResult = [...BASE.split(","), "taskGraphVerificationReport"].sort().join(",")
-  const keys = Object.keys(value).sort().join(",")
   if ((keys !== without && keys !== withResult) || value.status !== "completed" || !taskGraphVerificationReportMatchesStatus(report, "failed")
     || !parseTaskGraphVerificationReport(value.taskGraphVerificationReport, node.verification?.criteria.map(item => item.id) ?? [])) {
     throw new Error("task_graph_dependency_repair_original_invalid")
@@ -148,6 +162,16 @@ function parseFailedOriginalResult(value: Row | null, node: Node, report: NonNul
   const result = validateRoleResult(value.structuredResult, role)
   if (report.resultDigest !== taskGraphResultDigest(result)) throw new Error("task_graph_dependency_repair_original_digest_invalid")
   return result
+}
+
+function hasExactPlainDataKeys(value: Row, expected: string): boolean {
+  try {
+    const keys = Reflect.ownKeys(value)
+    if (Object.getPrototypeOf(value) !== Object.prototype || keys.some(key => typeof key !== "string")
+      || keys.sort().join(",") !== expected) return false
+    return Object.values(Object.getOwnPropertyDescriptors(value))
+      .every(descriptor => descriptor.enumerable === true && Object.hasOwn(descriptor, "value"))
+  } catch { return false }
 }
 
 function parseCompletedRepairResult(value: Row | null, node: Node, report: ReturnType<typeof parseTaskGraphVerificationReport>): unknown {

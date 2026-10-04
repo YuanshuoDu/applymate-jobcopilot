@@ -7512,7 +7512,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 type: "tool_call_completed", callId: FAILURE_WAIT_CALL_ID, name: "agent.wait",
                 arguments: {
                   idempotencyKey: `p3-task-graph-failure-wait:${failureOwner.turnId}`,
-                  taskIds: planTaskIds(request, FAILURE_PLAN_CALL_ID, 1), mode: "all", timeoutMs: 20_000,
+                  taskIds: [planTaskIds(request, FAILURE_PLAN_CALL_ID, 2)[0]!], mode: "all", timeoutMs: 20_000,
                 },
               }
               yield { type: "completed", finishReason: "tool_calls" }
@@ -8580,9 +8580,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             }
             if (execution === 1 && round === 2) {
               interactiveFailureRootPlanStage = "initial_wait"
-              const taskIds = planTaskIds(request, "p3-discovery-failure-plan")
+              const taskIds = planTaskIds(request, "p3-discovery-failure-plan", 2)
               yield { type: "tool_call_completed", callId: "p3-discovery-failure-wait", name: "agent.wait", arguments: {
-                idempotencyKey: `p3-discovery-failure-wait:${value.turnId}`, taskIds, mode: "all", timeoutMs: 20_000,
+                idempotencyKey: `p3-discovery-failure-wait:${value.turnId}`, taskIds: [taskIds[0]!], mode: "all", timeoutMs: 20_000,
               } }
               yield { type: "completed", finishReason: "tool_calls" }
               return
@@ -8604,15 +8604,15 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 })
                 interactiveFailureRootPlanStage = "graph_status"
                 const graphStates = nodes.map(node => `${String(node?.key)}:${String(node?.status)}`).sort()
-                expect(graphStates, interactiveFailureDiagnostic()).toEqual(["analyst:cancelled", "scout:failed"])
-                const outcome = waitOutcomeFromRequest(request, 2)
+                expect(graphStates, interactiveFailureDiagnostic()).toEqual(["analyst:waiting", "scout:failed"])
+                const outcome = waitOutcomeFromRequest(request, 1)
                 interactiveFailureRootPlanStage = "hydrated_wait"
                 interactiveFailureHydratedWaitStatus = diagnosticEnum(outcome.status, WAIT_DIAGNOSTIC_STATUSES)
                 interactiveFailureHydratedWaitCount = diagnosticBoundedCount(outcome.tasks.length)
                 expect(outcome.status, interactiveFailureDiagnostic()).toBe("ready")
                 const tasks = outcome.tasks.map(record)
                 const taskStates = tasks.map(task => `${String(task?.role)}:${String(task?.status)}`).sort()
-                expect(taskStates).toEqual(["analyst:cancelled", "scout:failed"])
+                expect(taskStates).toEqual(["scout:failed"])
                 const failedScout = tasks.find(task => task?.role === "scout")
                 expect(typeof failedScout?.failureReason).toBe("string")
                 expect(String(failedScout?.failureReason).length).toBeGreaterThan(0)
@@ -8804,6 +8804,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       role: "scout",
       criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 2 } }],
     } as const
+    const initialPlanCallId = `p3-verifier-repair-initial-plan:${value.turnId}`
+    const initialWaitCallId = `p3-verifier-repair-initial-wait:${value.turnId}`
+    const repairPlanCallId = `p3-verifier-repair-plan:${value.turnId}`
+    const repairWaitCallId = `p3-verifier-repair-wait:${value.turnId}`
     let initialPlanSent = false
     let initialWaitSent = false
     let optimisticFinalAttempted = false
@@ -8833,7 +8837,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             const dependent = nodes.find(node => node?.key === "analyst")
             if (!initialPlanSent) {
               initialPlanSent = true
-              yield { type: "tool_call_completed", callId: "p3-verifier-repair-initial-plan", name: "agent.plan", arguments: {
+              yield { type: "tool_call_completed", callId: initialPlanCallId, name: "agent.plan", arguments: {
                 expectedRevision: 0,
                 nodes: [
                   { key: "scout", templateId: "scout", goal: "Find at least two owner jobs", successCriteria: ["Return two evidence-bound candidates"], dependsOn: [], verification: scoutVerification },
@@ -8845,8 +8849,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             }
             if (initialPlanSent && !initialWaitSent) {
               initialWaitSent = true
-              initialPlanTaskIds = planTaskIds(request, "p3-verifier-repair-initial-plan", 2)
-              yield { type: "tool_call_completed", callId: "p3-verifier-repair-initial-wait", name: "agent.wait", arguments: {
+              initialPlanTaskIds = planTaskIds(request, initialPlanCallId, 2)
+              yield { type: "tool_call_completed", callId: initialWaitCallId, name: "agent.wait", arguments: {
                 idempotencyKey: `p3-verifier-repair-initial-wait:${value.turnId}`, taskIds: [initialPlanTaskIds[0]!], mode: "all", timeoutMs: 30_000,
               } }
               yield { type: "completed", finishReason: "tool_calls" }
@@ -8854,10 +8858,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             }
             if (repairPlanSent && !repairWaitSent) {
               repairWaitSent = true
-              const repairTaskIds = planTaskIds(request, "p3-verifier-repair-plan", 1)
+              const repairTaskIds = planTaskIds(request, repairPlanCallId, 1)
               if (!initialPlanTaskIds?.[1]) throw new Error("repair fixture lost the original dependent task ID")
               const taskIds = [...repairTaskIds, initialPlanTaskIds[1]]
-              yield { type: "tool_call_completed", callId: "p3-verifier-repair-wait", name: "agent.wait", arguments: {
+              yield { type: "tool_call_completed", callId: repairWaitCallId, name: "agent.wait", arguments: {
                 idempotencyKey: `p3-verifier-repair-wait:${value.turnId}`, taskIds, mode: "all", timeoutMs: 30_000,
               } }
               yield { type: "completed", finishReason: "tool_calls" }
@@ -8912,7 +8916,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                   expect(String(record(failedReportBeforeRepair)?.evidenceDigest)).toMatch(/^[a-f0-9]{64}$/)
                 }
                 repairPlanSent = true
-                yield { type: "tool_call_completed", callId: "p3-verifier-repair-plan", name: "agent.plan", arguments: {
+                yield { type: "tool_call_completed", callId: repairPlanCallId, name: "agent.plan", arguments: {
                   expectedRevision: graph.revision,
                   nodes: [{ key: "scout-repair", templateId: "scout", goal: "Recheck after new owner evidence is available", successCriteria: ["Return two evidence-bound candidates"], dependsOn: [], verification: scoutVerification,
                     repairOf: { graphRootTaskId, nodeKey: "scout", taskId: scout.taskId, criterionIds: ["candidate-count"] } }],
@@ -8969,8 +8973,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               return
             }
             const waitKey = task.goal === "Find at least two owner jobs"
-              ? "p3-verifier-repair-initial-wait:" + value.turnId
-              : "p3-verifier-repair-wait:" + value.turnId
+              ? `p3-verifier-repair-initial-wait:${value.turnId}`
+              : `p3-verifier-repair-wait:${value.turnId}`
             await waitForPersistedTaskWait(pool!, value.turnId, waitKey)
             const selected = jobIds.map((expectedJobId, index) => {
               const result = record(latestToolResult(request, callIds[index]!))
@@ -9037,6 +9041,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           expect(dispatch.rows).toHaveLength(1)
         }
         if (hardExecutorFailure && lease.goal === "Find at least two owner jobs") {
+          await waitForSuspendedParent(pool!, value.turnId)
           return { status: "failed", failureReason: "Fixture hard child failure", retryDisposition: "terminal" }
         }
         return childExecutor({ lease })
@@ -9045,7 +9050,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await enqueueTurn(pool!, bootstrap.turns.queue, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
     try {
       await waitForTurnStatus(
-        pool!, value.turnId, "completed", 90_000, "p3-verifier-repair-initial-wait", ["p3-verifier-repair-wait"],
+        pool!, value.turnId, "completed", 90_000, initialWaitCallId, [repairWaitCallId],
       )
     } catch (error) {
       let progress = JSON.stringify({ available: false })
@@ -9055,8 +9060,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       let scoutResultDiagnostic: RecordValue = { available: false }
       try {
         const [initialWait, repairWait] = await Promise.all([
-          waitToolResultDiagnostic(pool!, value.turnId, "p3-verifier-repair-initial-wait"),
-          waitToolResultDiagnostic(pool!, value.turnId, "p3-verifier-repair-wait"),
+          waitToolResultDiagnostic(pool!, value.turnId, initialWaitCallId),
+          waitToolResultDiagnostic(pool!, value.turnId, repairWaitCallId),
         ])
         waitResults = { initial: initialWait, repair: repairWait }
         const [failure, verdict] = await Promise.all([
@@ -9067,7 +9072,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         try { scoutResultDiagnostic = await collectCanonicalDiscoveryScoutResultDiagnostic(pool!, value) } catch { /* keep the fixed unavailable projection */ }
         verification = verdict
         progress = await turnProgressDiagnostics(
-          pool!, value.turnId, "p3-verifier-repair-initial-wait", ["p3-verifier-repair-wait"],
+          pool!, value.turnId, initialWaitCallId, [repairWaitCallId],
         )
       } catch {
         // Keep only the fixed failure class if durable wait diagnostics are unavailable.
