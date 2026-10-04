@@ -143,7 +143,7 @@ describe("reconcileGraphDependents", () => {
     expect(client.query.mock.calls.every(([sql]) => sql.trimStart().startsWith("SELECT"))).toBe(true)
   })
 
-  it.each(["waiting", "queued"] as const)("cancels a %s dependent after an unverified typed prerequisite failure", async dependentStatus => {
+  it.each(["waiting", "queued"] as const)("holds a %s dependent for same-Turn repair after an unverified typed prerequisite", async dependentStatus => {
     const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" }
     const verification = {
       schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
@@ -209,10 +209,10 @@ describe("reconcileGraphDependents", () => {
 
     await reconcileGraphDependents(client as unknown as Pick<pg.PoolClient, "query">, scope, new Date("2026-09-02T00:00:00.000Z"))
 
-    expect(tasks.get("dependent-1")?.status).toBe("cancelled")
-    expect(events).toContainEqual(expect.objectContaining({ type: "item.delta", payload: expect.objectContaining({ kind: "lifecycle", event: expect.objectContaining({ type: "task.cancelled", nodeKey: "dependent" }) }) }))
-    expect(client.query.mock.calls.some(([sql, params]) => sql.startsWith('DELETE FROM "agent_outbox"') && params?.[1] === "subagent-dispatch:dependent-1")).toBe(true)
-    expect(client.query.mock.calls.some(([sql, params]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = \'cancelled\'') && params?.[0] === "dependent-1" && params?.[7] === dependentStatus)).toBe(true)
+    expect(tasks.get("dependent-1")?.status).toBe(dependentStatus)
+    expect(events).not.toContainEqual(expect.objectContaining({ type: "item.delta", payload: expect.objectContaining({ kind: "lifecycle", event: expect.objectContaining({ type: "task.cancelled", nodeKey: "dependent" }) }) }))
+    expect(client.query.mock.calls.some(([sql, params]) => sql.startsWith('DELETE FROM "agent_outbox"') && params?.[1] === "subagent-dispatch:dependent-1")).toBe(false)
+    expect(client.query.mock.calls.some(([sql, params]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = \'cancelled\'') && params?.[0] === "dependent-1" && params?.[7] === dependentStatus)).toBe(false)
   })
 
   it.each([

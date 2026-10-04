@@ -1,4 +1,5 @@
 import type { SubagentTaskRecord, SubagentTaskStatus } from "./types.js"
+import type { TurnLease } from "../turns/lease.js"
 import type { Queryable } from "./pg-store-persistence.js"
 import { deleteGraphDispatch, persistGraphTransition, prepareGraphTransition, reconcileGraphDependents, type PreparedGraphTransition } from "./task-graph-pg-lifecycle.js"
 import { hasPersistedTaskGraphMembership, loadTaskGraph, type GraphIdentityScope } from "./task-graph-pg-state.js"
@@ -7,6 +8,9 @@ type PgSubagentClient = Queryable
 type FailedRootIdentity = Pick<SubagentTaskRecord, "id" | "userId" | "sessionId" | "turnId" | "rootTaskId" | "parentTaskId" | "taskType">
 type LockedChild = Readonly<{ id: string; status: SubagentTaskStatus; attemptCount: number }>
 type RecoveredStatus = "queued" | "failed" | "interrupted"
+export type RootFailureCleanupAuthority =
+  | Readonly<{ kind: "persisted-root-result-failed"; lease: Pick<TurnLease, "ownerId" | "leaseVersion"> }>
+  | Readonly<{ kind: "terminal-failed-turn-recovery" }>
 
 export async function settleRecoveredTaskGraph(
   client: PgSubagentClient,
@@ -15,7 +19,7 @@ export async function settleRecoveredTaskGraph(
     terminal: boolean; closedSession: boolean; now: Date; canonicalFailedRoot: boolean
   },
 ): Promise<void> {
-  if (input.canonicalFailedRoot) await cleanupFailedRootTaskGraph(client, input.task, input.now)
+  if (input.canonicalFailedRoot) await cleanupFailedRootTaskGraph(client, input.task, { kind: "terminal-failed-turn-recovery" }, input.now)
   else if (input.graph) {
     const options = { stream: !input.closedSession, allowClosedSession: input.closedSession }
     await persistGraphTransition(client, input.graph, input.now, options)
@@ -25,10 +29,11 @@ export async function settleRecoveredTaskGraph(
   else await deleteGraphDispatch(client, input.task.sessionId, input.task.id)
 }
 
-/** Cleanup is authorized only after the exact canonical root and its linked Turn have failed. */
+/** Cleanup requires either a live owned Turn after root.failed persists or terminal-failed Turn recovery. */
 export async function cleanupFailedRootTaskGraph(
   client: PgSubagentClient,
   root: FailedRootIdentity,
+  authority: RootFailureCleanupAuthority,
   now: Date,
 ): Promise<void> {
   if (![root.id, root.userId, root.sessionId, root.turnId, root.rootTaskId].every(nonEmpty)
@@ -41,12 +46,21 @@ export async function cleanupFailedRootTaskGraph(
   if (!sessionRow || sessionRow.userId !== root.userId) throw new Error("task_graph_session_fenced")
   if (sessionRow.status === "aborted" || sessionRow.status === "archived") return
 
-  const turn = await client.query(`SELECT turn."id", turn."sessionId", turn."userId", turn."rootTaskId", turn."status"
-    FROM "agent_turns" AS turn WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3
-      AND turn."rootTaskId" = $4 FOR UPDATE`, [root.turnId, root.sessionId, root.userId, root.id])
+  const turn = authority.kind === "persisted-root-result-failed"
+    ? await client.query(`SELECT turn."id", turn."sessionId", turn."userId", turn."rootTaskId", turn."status"
+        FROM "agent_turns" AS turn WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3
+          AND turn."rootTaskId" = $4 AND turn."status" = 'in_progress'
+          AND turn."leaseOwnerId" = $5 AND turn."leaseVersion" = $6
+          AND turn."leaseExpiresAt" > clock_timestamp() FOR UPDATE`,
+      [root.turnId, root.sessionId, root.userId, root.id, authority.lease.ownerId, authority.lease.leaseVersion])
+    : await client.query(`SELECT turn."id", turn."sessionId", turn."userId", turn."rootTaskId", turn."status"
+        FROM "agent_turns" AS turn WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3
+          AND turn."rootTaskId" = $4 FOR UPDATE`,
+      [root.turnId, root.sessionId, root.userId, root.id])
   const turnRow = turn.rows[0] as Record<string, unknown> | undefined
   if (!turnRow) throw new Error("task_graph_turn_fenced")
-  if (turnRow.status !== "failed") return
+  if (authority.kind === "persisted-root-result-failed" && turnRow.status !== "in_progress") throw new Error("task_graph_turn_fenced")
+  if (authority.kind === "terminal-failed-turn-recovery" && turnRow.status !== "failed") return
 
   const rootTask = await client.query(`SELECT task."id", task."sessionId", task."turnId", task."rootTaskId",
       task."parentTaskId", task."taskType", task."status", session."userId"

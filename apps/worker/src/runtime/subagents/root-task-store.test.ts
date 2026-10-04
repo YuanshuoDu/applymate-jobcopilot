@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest"
+import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 
 import { createPgRootTaskStore } from "./root-task-store.js"
+import { TASK_GRAPH_ITEM_TYPE, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "./task-graph-snapshot.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 3,
@@ -19,21 +21,28 @@ function row(overrides: Record<string, unknown> = {}) {
 
 function fakePool(existing: Record<string, unknown> | null = null, updateCount = 1, sessionStatus = "running", sessionUserId = "user-1", turnRootTaskId: string | null = "root-turn-1") {
   const calls: string[] = []
+  let rootStatus = String(existing?.status ?? row().status)
   const client = {
     query: vi.fn(async (sql: string, values?: unknown[]) => {
       calls.push(sql)
       if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
-      if (sql.includes('FROM "agent_sessions"')) return sessionStatus === "missing" || ["aborted", "archived"].includes(sessionStatus) || sessionUserId !== "user-1" ? { rows: [], rowCount: 0 } : { rows: [{ id: "session-1" }], rowCount: 1 }
+      if (sql.includes('FROM "agent_sessions"')) return sessionStatus === "missing" || ["aborted", "archived"].includes(sessionStatus) || sessionUserId !== "user-1" ? { rows: [], rowCount: 0 } : { rows: [{ id: "session-1", userId: sessionUserId, status: sessionStatus }], rowCount: 1 }
+      if (sql.includes('FROM "agent_turns" AS turn')) return turnRootTaskId === values?.[3]
+        ? { rows: [{ id: "turn-1", sessionId: "session-1", userId: "user-1", rootTaskId: turnRootTaskId, status: "in_progress", leaseOwnerId: "worker-1", leaseVersion: 3 }], rowCount: 1 }
+        : { rows: [], rowCount: 0 }
       if (sql.includes('SELECT "rootTaskId" FROM "agent_turns"')) return { rows: [{ rootTaskId: existing?.id ? "root-turn-1" : null }], rowCount: 1 }
       if (sql.includes('SELECT "id", "rootTaskId" FROM "agent_turns"')) return turnRootTaskId === values?.[5]
         ? { rows: [{ id: "turn-1", rootTaskId: turnRootTaskId }], rowCount: 1 }
         : { rows: [], rowCount: 0 }
       if (sql.includes("INSERT INTO \"sub_agent_tasks\"")) return { rows: [], rowCount: 1 }
       if (sql.includes('UPDATE "agent_turns"')) return { rows: [], rowCount: 1 }
-      if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [existing ?? row()], rowCount: 1 }
+      if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ ...(existing ?? row()), status: rootStatus }], rowCount: 1 }
       if (sql.includes('SELECT "id" FROM "agent_turns"') && sql.includes('"rootTaskId" = $5')) return turnRootTaskId === values?.[4] ? { rows: [{ id: "turn-1" }], rowCount: 1 } : { rows: [], rowCount: 0 }
       if (sql.includes('SELECT "id" FROM "agent_turns"')) return { rows: [{ id: "turn-1" }], rowCount: 1 }
-      if (sql.includes('UPDATE "sub_agent_tasks"')) return { rows: [], rowCount: updateCount }
+      if (sql.includes('UPDATE "sub_agent_tasks"')) {
+        if (values?.[4] === "root-turn-1") rootStatus = String(values[0])
+        return { rows: [], rowCount: updateCount }
+      }
       return { rows: [], rowCount: 1 }
     }),
     release: vi.fn(),
@@ -72,6 +81,111 @@ function terminalPool(root: Record<string, unknown> | null) {
     release: vi.fn(),
   }
   return { pool: { connect: vi.fn(async () => client) } as never, calls, client }
+}
+
+function graphTerminalPool(hasProposal = true) {
+  const ids = ["queued-child", "retrying-child", "waiting-child", "waiting-user-child", "running-child"]
+  const statuses = new Map(ids.map((id, index) => [id, ["queued", "retrying", "waiting", "waiting_for_user", "running"][index]!] as const))
+  const nodes = ids.map((taskId, index) => ({
+    key: `node-${index + 1}`, templateId: "analyst", goal: `Inspect ${taskId}`, successCriteria: ["Find evidence"],
+    dependsOn: [], depth: 1, taskId,
+  }))
+  const snapshot = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes }
+  const itemId = taskGraphItemId("root-turn-1")
+  const createdAt = new Date("2026-09-07T00:00:00.000Z")
+  const proposal = {
+    kind: "proposal", fingerprint: "f".repeat(64), revision: 1,
+    receipt: {
+      status: "accepted", revision: 1,
+      nodes: nodes.map((node, index) => ({ key: node.key, taskId: node.taskId, status: index === 2 || index === 3 ? "waiting" : "queued" })),
+      readyTaskIds: [ids[0], ids[1], ids[4]],
+    },
+    item: {
+      schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: itemId, sessionId: "session-1", turnId: "turn-1", stepId: null,
+      taskId: "root-turn-1", type: TASK_GRAPH_ITEM_TYPE, status: "streaming", phase: null, revision: 1,
+      content: snapshot, startedAt: createdAt.toISOString(), completedAt: null,
+      createdAt: createdAt.toISOString(), updatedAt: createdAt.toISOString(),
+    },
+    content: snapshot,
+  }
+  const tasks = new Map<string, Record<string, unknown>>([
+    ...ids.map((id, index) => [id, {
+      id, status: statuses.get(id), role: "analyst", failureReason: null, result: null,
+      sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-turn-1", parentTaskId: "root-turn-1", userId: "user-1",
+    }] as const),
+    ["same-root-legacy", {
+      id: "same-root-legacy", status: "queued", role: "analyst", failureReason: null, result: null,
+      sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-turn-1", parentTaskId: "root-turn-1", userId: "user-1",
+    }],
+  ])
+  const dispatches = new Map<string, { publishedAt: Date | null }>([
+    ...ids.map(id => [`subagent-dispatch:${id}`, { publishedAt: id === "waiting-user-child" ? createdAt : null }] as const),
+    ["subagent-dispatch:same-root-legacy", { publishedAt: null }],
+  ])
+  const calls: Array<[string, unknown[]?]> = []
+  const lifecycleReceipts: Array<Record<string, unknown>> = []
+  let revision = 1
+  let eventSequence = 0
+  const rootTask = row({ status: "running", leaseOwner: "worker-1" })
+  const client = { query: vi.fn(async (sql: string, values?: unknown[]) => {
+    calls.push([sql, values])
+    if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+    if (sql.startsWith("SELECT") && sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1 }
+    if (sql.includes('SELECT turn."id"') && sql.includes('FROM "agent_turns" AS turn')) return { rows: [{ id: "turn-1", sessionId: "session-1", userId: "user-1", rootTaskId: "root-turn-1", status: "in_progress", leaseOwnerId: "worker-1", leaseVersion: 3 }], rowCount: 1 }
+    if (sql.startsWith("SELECT") && sql.includes('FROM "agent_turns"')) return { rows: [{ id: "turn-1", rootTaskId: "root-turn-1" }], rowCount: 1 }
+    if (sql.includes('event."payload"->>\'kind\' = \'proposal\'')) return { rows: hasProposal ? [{ payload: proposal }] : [], rowCount: hasProposal ? 1 : 0 }
+    if (sql.includes('SELECT item."id"')) return { rows: hasProposal ? [{ id: itemId, revision, content: snapshot, createdAt }] : [], rowCount: hasProposal ? 1 : 0 }
+    if (sql.includes('SELECT task."turnId"')) return { rows: [{
+      turnId: "turn-1", rootTaskId: "root-turn-1", parentTaskId: "root-turn-1", attemptCount: 1, userId: "user-1",
+    }], rowCount: 1 }
+    if (sql.includes('SELECT task."id", task."status", task."attemptCount"') && sql.includes("FOR UPDATE OF task")) {
+      const requested = values?.[0] as string[]
+      return { rows: requested.flatMap(id => {
+        const task = tasks.get(id)
+        return task ? [{ id, status: statuses.get(id) ?? task.status, attemptCount: 1 }] : []
+      }), rowCount: requested.length }
+    }
+    if (sql.includes('SELECT task."id", task."status", task."role", task."failureReason"')) {
+      const requested = values?.[0] as string[]
+      return { rows: requested.flatMap(id => { const task = tasks.get(id); return task ? [{ ...task, status: statuses.get(id) ?? task.status }] : [] }), rowCount: requested.length }
+    }
+    if (sql.includes('SELECT event."type", event."payload"')) {
+      return {
+        rows: [{ type: "item.delta", payload: proposal }, ...lifecycleReceipts.map(payload => ({ type: "item.delta", payload }))],
+        rowCount: lifecycleReceipts.length + 1,
+      }
+    }
+    if (sql.startsWith('UPDATE "agent_items"')) {
+      revision = Number(values?.[5])
+      return { rows: [{ stepId: null, status: "streaming", phase: null, startedAt: createdAt, completedAt: null, createdAt }], rowCount: 1 }
+    }
+    if (sql.includes('UPDATE "agent_sessions" AS session') && sql.includes('RETURNING "eventSequence"')) {
+      eventSequence += 1
+      return { rows: [{ eventSequence: String(eventSequence) }], rowCount: 1 }
+    }
+    if (sql.includes('INSERT INTO "agent_events"')) {
+      lifecycleReceipts.push(JSON.parse(String(values?.[10])) as Record<string, unknown>)
+      return { rows: [], rowCount: 1 }
+    }
+    if (sql.startsWith('DELETE FROM "agent_outbox"')) {
+      const key = String(values?.[1])
+      if (dispatches.get(key)?.publishedAt === null) dispatches.delete(key)
+      return { rows: [], rowCount: 1 }
+    }
+    if (sql.startsWith('INSERT INTO "agent_outbox"')) return { rows: [], rowCount: 1 }
+    if (sql.startsWith('UPDATE "sub_agent_tasks"')) {
+      if (sql.includes('WHERE "id" = $5') && values?.[4] === "root-turn-1") { rootTask.status = String(values[0]); return { rows: [], rowCount: 1 } }
+      const id = [...tasks.keys()].find(candidate => values?.includes(candidate))
+      if (id && tasks.has(id)) {
+        if (sql.includes('"interruptRequestedAt"')) tasks.get(id)!.interruptRequestedAt = values?.[6]
+        else if (sql.includes('"status"')) statuses.set(id, sql.includes("= 'cancelled'") || values?.includes("cancelled") ? "cancelled" : String(values?.[2]))
+        return { rows: [], rowCount: 1 }
+      }
+    }
+    if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [rootTask], rowCount: 1 }
+    return { rows: [], rowCount: 1 }
+  }), release: vi.fn() }
+  return { pool: { connect: vi.fn().mockResolvedValue(client) } as never, calls, statuses, tasks, dispatches, lifecycleReceipts, rootTask }
 }
 
 describe("createPgRootTaskStore", () => {
@@ -143,6 +257,75 @@ describe("createPgRootTaskStore", () => {
     expect(sessionLock).toBeLessThan(turnLock)
     expect(fake.client.query.mock.calls.some(([sql]) => sql.includes('UPDATE "sub_agent_tasks" SET'))).toBe(false)
   })
+  it("cancels only active persisted graph members when a root fails", async () => {
+    const fake = graphTerminalPool()
+    await createPgRootTaskStore(fake.pool).finish({
+      lease, rootTaskId: "root-turn-1", result: { status: "failed", errorCode: "turn_failed", stepCount: 2, toolCallCount: 1 },
+    })
+
+    expect(fake.rootTask.status).toBe("failed")
+    expect(Object.fromEntries(fake.statuses)).toEqual({
+      "queued-child": "cancelled", "retrying-child": "cancelled", "waiting-child": "cancelled",
+      "waiting-user-child": "cancelled", "running-child": "running",
+    })
+    expect(fake.lifecycleReceipts.map(receipt => (receipt.event as Record<string, unknown>).nodeKey).sort())
+      .toEqual(["node-1", "node-2", "node-3", "node-4"])
+    expect(fake.lifecycleReceipts.every(receipt => (receipt.event as Record<string, unknown>).type === "task.cancelled")).toBe(true)
+    expect(fake.tasks.get("running-child")?.interruptRequestedAt).toBeDefined()
+    expect(fake.dispatches.has("subagent-dispatch:queued-child")).toBe(false)
+    expect(fake.dispatches.has("subagent-dispatch:retrying-child")).toBe(false)
+    expect(fake.dispatches.has("subagent-dispatch:waiting-child")).toBe(false)
+    expect(fake.dispatches.has("subagent-dispatch:waiting-user-child")).toBe(true)
+    expect(fake.dispatches.has("subagent-dispatch:same-root-legacy")).toBe(true)
+
+    const sessionLock = fake.calls.findIndex(([sql]) => sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE"))
+    const turnLock = fake.calls.findIndex(([sql]) => sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE"))
+    const rootLock = fake.calls.findIndex(([sql, values]) => sql.includes('UPDATE "sub_agent_tasks"') && values?.[4] === "root-turn-1")
+    const graphRead = fake.calls.findIndex(([sql]) => sql.includes('FROM "agent_items"') || sql.includes('FROM "agent_events"'))
+    expect(sessionLock).toBeGreaterThanOrEqual(0)
+    expect(sessionLock).toBeLessThan(turnLock)
+    expect(turnLock).toBeLessThan(rootLock)
+    expect(rootLock).toBeLessThan(graphRead)
+    expect(fake.calls.filter(([sql]) => sql === "BEGIN")).toHaveLength(1)
+    expect(fake.calls.filter(([sql]) => sql === "COMMIT")).toHaveLength(1)
+  })
+
+  it("does not authorize TaskGraph cleanup when failed root persistence is rejected", async () => {
+    const fake = fakePool(null, 0)
+    await expect(createPgRootTaskStore(fake.pool).finish({
+      lease, rootTaskId: "root-turn-1", result: { status: "failed", errorCode: "turn_failed", stepCount: 1, toolCallCount: 0 },
+    })).rejects.toThrow("root_task_fenced")
+    expect(fake.calls.some(sql => sql.includes('FROM "agent_items"'))).toBe(false)
+    expect(fake.calls.some(sql => sql.includes("task.cancelled"))).toBe(false)
+    expect(fake.calls).toContain("ROLLBACK")
+  })
+
+  it("leaves same-root descendants alone when no durable TaskGraph proposal exists", async () => {
+    const fake = graphTerminalPool(false)
+    await createPgRootTaskStore(fake.pool).finish({
+      lease, rootTaskId: "root-turn-1", result: { status: "failed", errorCode: "turn_failed", stepCount: 2, toolCallCount: 1 },
+    })
+
+    expect(fake.rootTask.status).toBe("failed")
+    expect(Object.fromEntries(fake.statuses)).toEqual({
+      "queued-child": "queued", "retrying-child": "retrying", "waiting-child": "waiting",
+      "waiting-user-child": "waiting_for_user", "running-child": "running",
+    })
+    expect(fake.lifecycleReceipts).toHaveLength(0)
+    expect(fake.dispatches.size).toBe(6)
+  })
+
+  it("does not clean graph children for a wait or successful root settlement", async () => {
+    for (const result of [
+      { status: "waiting_for_dependency" as const, stepCount: 1, toolCallCount: 0, waitId: "wait-1" },
+      { status: "completed" as const, stepCount: 1, toolCallCount: 0 },
+    ]) {
+      const fake = fakePool()
+      await createPgRootTaskStore(fake.pool).finish({ lease, rootTaskId: "root-turn-1", result })
+      expect(fake.calls.some(sql => sql.includes("task.cancelled") || sql.includes("'cancelled'"))).toBe(false)
+    }
+  })
+
   it("atomically persists only a bounded validated discovery shortlist under structuredResult", async () => {
     const fake = fakePool()
     const shortlist = { schemaVersion: 1 as const, status: "partial" as const, items: [{ jobId: "job-1", score: 8.5, evidenceIds: ["read:job:job-1"] }], failures: ["scout_result_partial" as const] }

@@ -20,12 +20,8 @@ export function resolveTaskGraphRepairDependencies(snapshot: TaskGraphSnapshot, 
     const report = node.verificationDisposition === "typed" ? parseTaskGraphVerificationReport(isPlainRecord(result) ? result.taskGraphVerificationReport : undefined, ids) : undefined
     const evidenceBound = typeof report?.evidenceDigest === "string" && /^[a-f0-9]{64}$/.test(report.evidenceDigest)
     const unresolvedCriteria = report?.criteria.filter(item => item.status !== "passed").map(item => item.criterionId) ?? []
-    const explicitRepair = report?.status === "unverified" && report.evidenceDigest === null && snapshot.nodes.some(repair => {
-      const relation = repair.repairOf
-      return relation?.graphRootTaskId === rootTaskId && relation.nodeKey === node.key && relation.taskId === node.taskId
-        && relation.criterionIds.every(id => unresolvedCriteria.includes(id))
-    })
-    if (task?.status === "failed" && report && (evidenceBound || explicitRepair)
+    const recoverableGap = evidenceBound || (report?.status === "unverified" && report.evidenceDigest === null)
+    if (task?.status === "failed" && report && recoverableGap
       && taskGraphVerificationReportMatchesStatus(report, task.status) && task.failureReason === `task_graph_verification_${report.status}`) {
       if (unresolvedCriteria.length) { unresolved.set(node.key, new Set(unresolvedCriteria)); coverage.set(node.key, new Map()) }
     }

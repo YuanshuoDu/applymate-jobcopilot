@@ -1,14 +1,19 @@
 import { describe, expect, it, vi } from "vitest"
 import type { Queryable } from "./pg-store-persistence.js"
-import { cleanupFailedRootTaskGraph, settleRecoveredTaskGraph } from "./task-graph-pg-root-failure-cleanup.js"
+import { cleanupFailedRootTaskGraph, settleRecoveredTaskGraph, type RootFailureCleanupAuthority } from "./task-graph-pg-root-failure-cleanup.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "./task-graph-snapshot.js"
 import type { SubagentTaskRecord } from "./types.js"
 
 const identity = { id: "root-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: null, taskType: "root" } as const
 const now = new Date("2026-10-04T12:00:00.000Z")
+const recoveryAuthority = { kind: "terminal-failed-turn-recovery" } as const
+const liveFailureAuthority: RootFailureCleanupAuthority = {
+  kind: "persisted-root-result-failed", lease: { ownerId: "worker-1", leaseVersion: 3 },
+}
 
 function fixture(options: {
-  turnStatus?: string; sessionStatus?: string; sessionUserId?: string; rootStatus?: string
+  turnStatus?: string; turnOwnerId?: string; turnLeaseVersion?: number; turnLeaseValid?: boolean
+  sessionStatus?: string; sessionUserId?: string; rootStatus?: string
   noGraph?: boolean; missingProposal?: boolean; malformedProposal?: boolean; missingChildId?: string; foreignChildId?: string
 } = {}) {
   const snapshot = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
@@ -35,9 +40,18 @@ function fixture(options: {
       return { rows: [{ userId: options.sessionUserId ?? identity.userId, status: options.sessionStatus ?? "running" }], rowCount: 1 }
     }
     if (sql.includes('FROM "agent_turns" AS turn WHERE')) {
-      return options.turnStatus === "missing" ? { rows: [], rowCount: 0 } : { rows: [{
-        id: identity.turnId, sessionId: identity.sessionId, userId: identity.userId, rootTaskId: identity.id, status: options.turnStatus ?? "failed",
-      }], rowCount: 1 }
+      const liveFailure = sql.includes(`turn."status" = 'in_progress'`)
+      const status = liveFailure ? "in_progress" : options.turnStatus ?? "failed"
+      const authorized = options.turnStatus !== "missing" && (options.turnStatus ?? "failed") === status
+        && (!liveFailure || (
+          (options.turnOwnerId ?? "worker-1") === params?.[4]
+          && (options.turnLeaseVersion ?? 3) === params?.[5]
+          && options.turnLeaseValid !== false
+        ))
+      return authorized ? { rows: [{
+        id: identity.turnId, sessionId: identity.sessionId, userId: identity.userId, rootTaskId: identity.id,
+        status, leaseOwnerId: options.turnOwnerId ?? "worker-1", leaseVersion: options.turnLeaseVersion ?? 3,
+      }], rowCount: 1 } : { rows: [], rowCount: 0 }
     }
     if (sql.includes('task."taskType" = \'root\'')) {
       return options.rootStatus === "missing" ? { rows: [], rowCount: 0 } : { rows: [{
@@ -105,7 +119,7 @@ function node(key: string, taskId: string) {
 describe("cleanupFailedRootTaskGraph", () => {
   it("cancels only active snapshot members, receipts nonrunning cancellations, and marks a running member without releasing its lease", async () => {
     const fake = fixture()
-    await cleanupFailedRootTaskGraph(fake.client, identity, now)
+    await cleanupFailedRootTaskGraph(fake.client, identity, recoveryAuthority, now)
 
     expect(fake.rows.get("wait-1")).toMatchObject({ status: "cancelled", failureReason: "Root task failed.", leaseOwner: null, leaseExpiresAt: null })
     expect(fake.rows.get("queue-1")?.status).toBe("cancelled")
@@ -134,8 +148,8 @@ describe("cleanupFailedRootTaskGraph", () => {
 
   it("is idempotent across repeated cleanup", async () => {
     const fake = fixture()
-    await cleanupFailedRootTaskGraph(fake.client, identity, now)
-    await cleanupFailedRootTaskGraph(fake.client, identity, new Date("2026-10-04T12:05:00.000Z"))
+    await cleanupFailedRootTaskGraph(fake.client, identity, recoveryAuthority, now)
+    await cleanupFailedRootTaskGraph(fake.client, identity, recoveryAuthority, new Date("2026-10-04T12:05:00.000Z"))
 
     expect(fake.events.filter(event => (event.payload as { kind?: string }).kind === "lifecycle")).toHaveLength(2)
     expect(fake.calls.filter(call => call.sql.startsWith('DELETE FROM "agent_outbox"'))).toHaveLength(2)
@@ -144,7 +158,7 @@ describe("cleanupFailedRootTaskGraph", () => {
 
   it.each(["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"])("defers cleanup while the exact linked Turn is %s", async turnStatus => {
     const fake = fixture({ turnStatus })
-    await expect(cleanupFailedRootTaskGraph(fake.client, identity, now)).resolves.toBeUndefined()
+    await expect(cleanupFailedRootTaskGraph(fake.client, identity, recoveryAuthority, now)).resolves.toBeUndefined()
     expect(fake.calls.some(call => call.sql.includes('SELECT item."id"'))).toBe(false)
     expect(fake.calls.some(call => call.sql.includes('UPDATE "sub_agent_tasks"'))).toBe(false)
     expect(fake.events).toHaveLength(0)
@@ -154,24 +168,47 @@ describe("cleanupFailedRootTaskGraph", () => {
     expect(turnGuard?.params).toEqual([identity.turnId, identity.sessionId, identity.userId, identity.id])
   })
 
+  it("requires an exact live owned lease for explicit root-result failure cleanup", async () => {
+    const live = fixture({ turnStatus: "in_progress" })
+    await cleanupFailedRootTaskGraph(live.client, identity, liveFailureAuthority, now)
+    const turnGuard = live.calls.find(call => call.sql.includes('FROM "agent_turns" AS turn WHERE'))
+    expect(turnGuard?.sql).toContain(`turn."status" = 'in_progress'`)
+    expect(turnGuard?.sql).toContain('turn."leaseOwnerId" = $5 AND turn."leaseVersion" = $6')
+    expect(turnGuard?.sql).toContain('turn."leaseExpiresAt" > clock_timestamp()')
+    expect(turnGuard?.params).toEqual([identity.turnId, identity.sessionId, identity.userId, identity.id, "worker-1", 3])
+
+    for (const options of [
+      { turnStatus: "in_progress", turnOwnerId: "other-worker" },
+      { turnStatus: "in_progress", turnLeaseVersion: 4 },
+      { turnStatus: "in_progress", turnLeaseValid: false },
+      { turnStatus: "failed" },
+    ]) {
+      const unauthorized = fixture(options)
+      await expect(cleanupFailedRootTaskGraph(unauthorized.client, identity, liveFailureAuthority, now))
+        .rejects.toThrow("task_graph_turn_fenced")
+      expect(unauthorized.calls.some(call => call.sql.includes('SELECT item."id"'))).toBe(false)
+      expect(unauthorized.calls.some(call => !call.sql.trimStart().startsWith("SELECT"))).toBe(false)
+    }
+  })
+
   it("requires a valid canonical root and exact persisted lineage", async () => {
     const malformed = { ...identity, rootTaskId: "foreign-root" }
     const malformedFake = fixture()
-    await expect(cleanupFailedRootTaskGraph(malformedFake.client, malformed, now)).rejects.toThrow("task_graph_failed_root_scope_invalid")
+    await expect(cleanupFailedRootTaskGraph(malformedFake.client, malformed, recoveryAuthority, now)).rejects.toThrow("task_graph_failed_root_scope_invalid")
     expect(malformedFake.calls).toHaveLength(0)
 
     const missingTurn = fixture({ turnStatus: "missing" })
-    await expect(cleanupFailedRootTaskGraph(missingTurn.client, identity, now)).rejects.toThrow("task_graph_turn_fenced")
+    await expect(cleanupFailedRootTaskGraph(missingTurn.client, identity, recoveryAuthority, now)).rejects.toThrow("task_graph_turn_fenced")
     expect(missingTurn.calls.some(call => call.sql.includes('SELECT item."id"'))).toBe(false)
 
     const nonfailedRoot = fixture({ rootStatus: "missing" })
-    await expect(cleanupFailedRootTaskGraph(nonfailedRoot.client, identity, now)).rejects.toThrow("task_graph_failed_root_fenced")
+    await expect(cleanupFailedRootTaskGraph(nonfailedRoot.client, identity, recoveryAuthority, now)).rejects.toThrow("task_graph_failed_root_fenced")
     expect(nonfailedRoot.calls.some(call => call.sql.includes('SELECT item."id"'))).toBe(false)
   })
 
   it("does nothing when the failed root has no persisted graph proposal", async () => {
     const fake = fixture({ noGraph: true })
-    await expect(cleanupFailedRootTaskGraph(fake.client, identity, now)).resolves.toBeUndefined()
+    await expect(cleanupFailedRootTaskGraph(fake.client, identity, recoveryAuthority, now)).resolves.toBeUndefined()
     expect(fake.calls.some(call => call.sql.includes('task."id" = ANY($1::text[])'))).toBe(false)
     expect(fake.calls.some(call => call.sql.includes('UPDATE "sub_agent_tasks"'))).toBe(false)
     expect(fake.events).toHaveLength(0)
@@ -198,7 +235,7 @@ describe("cleanupFailedRootTaskGraph", () => {
 
   it.each(["aborted", "archived"])("skips a %s session before graph reads", async sessionStatus => {
     const fake = fixture({ sessionStatus })
-    await expect(cleanupFailedRootTaskGraph(fake.client, identity, now)).resolves.toBeUndefined()
+    await expect(cleanupFailedRootTaskGraph(fake.client, identity, recoveryAuthority, now)).resolves.toBeUndefined()
     expect(fake.calls.some(call => call.sql.includes('FROM "agent_turns" AS turn WHERE'))).toBe(false)
     expect(fake.calls.some(call => call.sql.includes('SELECT item."id"'))).toBe(false)
     expect(fake.calls.some(call => call.sql.includes('UPDATE "sub_agent_tasks"'))).toBe(false)
@@ -207,7 +244,7 @@ describe("cleanupFailedRootTaskGraph", () => {
   it("fails closed without writes when a snapshot member is missing or foreign", async () => {
     for (const options of [{ missingChildId: "wait-1" }, { foreignChildId: "run-1" }]) {
       const fake = fixture(options)
-      await expect(cleanupFailedRootTaskGraph(fake.client, identity, now)).rejects.toThrow("task_graph_failed_root_child_scope_invalid")
+      await expect(cleanupFailedRootTaskGraph(fake.client, identity, recoveryAuthority, now)).rejects.toThrow("task_graph_failed_root_child_scope_invalid")
       expect(fake.calls.some(call => !call.sql.trimStart().startsWith("SELECT"))).toBe(false)
       expect(fake.rows.get("wait-1")?.status).toBe("waiting")
       const childGuard = fake.calls.find(call => call.sql.includes('task."attemptCount"') && call.sql.includes("FOR UPDATE OF task"))
@@ -218,7 +255,7 @@ describe("cleanupFailedRootTaskGraph", () => {
 
   it.each(["missingProposal", "malformedProposal"] as const)("fails closed without writes for %s membership", async membershipState => {
     const fake = fixture({ [membershipState]: true })
-    await expect(cleanupFailedRootTaskGraph(fake.client, identity, now)).rejects.toThrow(
+    await expect(cleanupFailedRootTaskGraph(fake.client, identity, recoveryAuthority, now)).rejects.toThrow(
       membershipState === "missingProposal" ? "task_graph_failed_root_membership_invalid" : "task_graph_receipt_invalid",
     )
     expect(fake.calls.filter(call => !call.sql.trimStart().startsWith("SELECT"))).toEqual([])
@@ -227,7 +264,7 @@ describe("cleanupFailedRootTaskGraph", () => {
 
   it("rejects a foreign session identity before locking a Turn", async () => {
     const fake = fixture({ sessionUserId: "other-user" })
-    await expect(cleanupFailedRootTaskGraph(fake.client, identity, now)).rejects.toThrow("task_graph_session_fenced")
+    await expect(cleanupFailedRootTaskGraph(fake.client, identity, recoveryAuthority, now)).rejects.toThrow("task_graph_session_fenced")
     expect(fake.calls.some(call => call.sql.includes('FROM "agent_turns" AS turn WHERE'))).toBe(false)
     expect(fake.calls.some(call => !call.sql.trimStart().startsWith("SELECT"))).toBe(false)
   })

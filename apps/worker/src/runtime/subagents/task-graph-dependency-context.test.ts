@@ -95,6 +95,16 @@ function repairSnapshot(includeRepair = false) {
   })
 }
 
+function legacySnapshot() {
+  return parseTaskGraphSnapshot({
+    schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
+    nodes: [{
+      key: "target", templateId: "scout", goal: "Find candidates", successCriteria: ["Find candidates"],
+      dependsOn: [], depth: 1, taskId: "target-task", verificationDisposition: "legacy_unverified",
+    }],
+  })
+}
+
 function targetTask(report: unknown, failureReason: string): GraphTaskRow {
   return {
     id: "target-task", status: "failed", role: "scout", failureReason,
@@ -235,14 +245,63 @@ describe("TaskGraph dependency result context", () => {
     })])).toThrow("task_graph_dependency_result_invalid")
   })
 
-  it("blocks synthetic operational failures without an evidence-bound verifier report", () => {
+  it("keeps a hard executor failure pending before its first repair is planned", () => {
     const report = verificationReport({
       status: "unverified", reasonCode: "result_invalid", criterionStatus: "unverified", criterionReasonCode: "result_invalid",
       evidenceDigest: null, resultDigest: null,
     })
     const tasks = new Map([["target-task", targetTask(report, "task_graph_verification_unverified")]])
 
-    expect(resolveTaskGraphRepairDependencies(repairSnapshot(), tasks, "root-1")).toEqual({ satisfied: [], pending: [] })
+    expect(resolveTaskGraphRepairDependencies(repairSnapshot(), tasks, "root-1")).toEqual({ satisfied: [], pending: ["target"] })
+  })
+
+  it("keeps a completed-but-unverified result pending before its first repair is planned", () => {
+    const report = verificationReport({
+      status: "unverified", reasonCode: "result_invalid", criterionStatus: "unverified", criterionReasonCode: "result_invalid",
+      evidenceDigest: null, resultDigest: null,
+    })
+    const task = {
+      ...targetTask(report, "task_graph_verification_unverified"),
+      result: {
+        status: "completed", stepCount: 2, toolCallCount: 1, finalItemId: "item-final", finalText: "",
+        taskGraphVerificationReport: report,
+      },
+    }
+
+    expect(resolveTaskGraphRepairDependencies(repairSnapshot(), new Map([[task.id, task]]), "root-1"))
+      .toEqual({ satisfied: [], pending: ["target"] })
+  })
+
+  it("does not hold a malformed or mismatched unverified report open", () => {
+    const report = verificationReport({
+      status: "unverified", reasonCode: "result_invalid", criterionStatus: "unverified", criterionReasonCode: "result_invalid",
+      evidenceDigest: null, resultDigest: null,
+    })
+    const malformed = { ...report, criteria: [{ criterionId: "other", status: "unverified", reasonCode: "result_invalid" }] }
+    const mismatched = targetTask(report, "provider_timeout")
+
+    expect(resolveTaskGraphRepairDependencies(repairSnapshot(), new Map([["target-task", targetTask(malformed, "task_graph_verification_unverified")]]), "root-1"))
+      .toEqual({ satisfied: [], pending: [] })
+    expect(resolveTaskGraphRepairDependencies(repairSnapshot(), new Map([[mismatched.id, mismatched]]), "root-1"))
+      .toEqual({ satisfied: [], pending: [] })
+  })
+
+  it("does not turn legacy or unsupported proof into a repairable typed verdict", () => {
+    const unavailable = verificationReport({
+      status: "unverified", reasonCode: "result_invalid", criterionStatus: "unverified", criterionReasonCode: "result_invalid",
+      evidenceDigest: null, resultDigest: null,
+    })
+    const unsupported = {
+      ...unavailable,
+      reasonCode: "unsupported_verification_template",
+      criteria: [{ criterionId: "candidate-count", status: "unverified", reasonCode: "unsupported_verification_template" }],
+    }
+    const task = targetTask(unavailable, "task_graph_verification_unverified")
+
+    expect(resolveTaskGraphRepairDependencies(legacySnapshot(), new Map([[task.id, task]]), "root-1"))
+      .toEqual({ satisfied: [], pending: [] })
+    expect(resolveTaskGraphRepairDependencies(repairSnapshot(), new Map([[task.id, targetTask(unsupported, "task_graph_verification_unverified")]]), "root-1"))
+      .toEqual({ satisfied: [], pending: [] })
   })
 
   it("keeps a null-digest operational failure pending when the snapshot explicitly plans its repair", () => {
@@ -326,5 +385,31 @@ describe("TaskGraph dependency result context", () => {
     ])
 
     expect(resolveTaskGraphRepairDependencies(repairSnapshot(true), tasks, "root-1")).toEqual({ satisfied: ["target"], pending: [] })
+  })
+
+  it("requires the exact criterion receipt before resolving a null-digest gap", () => {
+    const failedReport = verificationReport({
+      status: "unverified", reasonCode: "result_invalid", criterionStatus: "unverified", criterionReasonCode: "result_invalid",
+      evidenceDigest: null, resultDigest: null,
+    })
+    const passedReport = verificationReport({
+      status: "passed", reasonCode: "criteria_met", criterionStatus: "passed", criterionReasonCode: "criteria_met",
+      evidenceDigest: "e".repeat(64), resultDigest: "f".repeat(64),
+    })
+    const wrongCriterionReceipt = {
+      schemaVersion: TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION, graphRootTaskId: "root-1", targetNodeKey: "target",
+      targetTaskId: "target-task", criterionIds: ["finding-count"], repairNodeKey: "repair", repairTaskId: "repair-task",
+      verifierVersion: TASK_GRAPH_VERIFIER_VERSION, evidenceDigest: passedReport.evidenceDigest,
+    }
+    const tasks = new Map<string, GraphTaskRow>([
+      ["target-task", targetTask(failedReport, "task_graph_verification_unverified")],
+      ["repair-task", {
+        id: "repair-task", status: "completed", role: "scout", failureReason: null,
+        result: { taskGraphVerificationReport: passedReport, taskGraphRepairReceipt: wrongCriterionReceipt },
+      }],
+    ])
+
+    expect(resolveTaskGraphRepairDependencies(repairSnapshot(true), tasks, "root-1"))
+      .toEqual({ satisfied: [], pending: ["target"] })
   })
 })

@@ -292,7 +292,10 @@ describe("PgSubagentTaskStore", () => {
     const update = fake.calls.find(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))
     expect(update?.[1]?.[2]).toBe("failed")
     expect(update?.[1]?.[4]).toBe(failureReason)
-    expect((fake.taskResults.get(fake.childId) as Record<string, unknown>).taskGraphVerificationReport).toMatchObject({ status: verificationStatus })
+    expect((fake.taskResults.get(fake.childId) as Record<string, unknown>).taskGraphVerificationReport).toMatchObject({
+      status: verificationStatus,
+      ...(verificationStatus === "unverified" ? { reasonCode: "canonical_evidence_missing", evidenceDigest: null, resultDigest: null } : {}),
+    })
     if (verificationStatus === "failed") expect((fake.taskResults.get(fake.childId) as Record<string, unknown>).structuredResult).toEqual(validAnalystResult())
     else expect((fake.taskResults.get(fake.childId) as Record<string, unknown>).structuredResult).toBeUndefined()
     expect(fake.lifecycleEvents.some(event => JSON.stringify(event.payload).includes('"type":"task.completed"'))).toBe(false)
@@ -313,7 +316,7 @@ describe("PgSubagentTaskStore", () => {
     expect((fake.taskResults.get(fake.childId) as Record<string, unknown>).structuredResult).toBeUndefined()
   })
 
-  it("does not verify a failed executor result and records unresolved criteria only on terminal failure", async () => {
+  it("keeps a hard executor failure distinct as unavailable unverified proof", async () => {
     const fake = fakeGraphFinishPool()
     setVerifierResult("passed")
     const store = new PgSubagentTaskStore(fake.pool)
@@ -323,7 +326,8 @@ describe("PgSubagentTaskStore", () => {
 
     expect(verifyEvidenceMock).not.toHaveBeenCalled()
     expect((fake.taskResults.get(fake.childId) as Record<string, unknown>).taskGraphVerificationReport)
-      .toMatchObject({ status: "unverified", reasonCode: "result_invalid", criteria: [{ criterionId: "finding-count", status: "unverified" }] })
+      .toMatchObject({ status: "unverified", reasonCode: "result_invalid", evidenceDigest: null, resultDigest: null,
+        criteria: [{ criterionId: "finding-count", status: "unverified", reasonCode: "result_invalid" }] })
     expect((fake.taskResults.get(fake.childId) as Record<string, unknown>).structuredResult).toBeUndefined()
     const taskUpdate = fake.calls.find(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))
     expect(taskUpdate?.[1]?.[4]).toBe("task_graph_verification_unverified")
