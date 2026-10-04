@@ -140,7 +140,7 @@ function chooseFailure(outcome: Outcome, index: number, value: string, allowance
 }
 function makeOutcome(waitId: string, status: string, targetIds: string[], matchedIds: string[], states: readonly TaskState[], waitMode: "any" | "all"): PreparedOutcome | null {
   if (!waitId || waitId.trim() !== waitId || waitId.length > MAX_ID_LENGTH || !waitStatus(status) || targetIds.length === 0 || targetIds.length > MAX_TARGETS
-    || new Set(targetIds).size !== targetIds.length || matchedIds.some(id => !targetIds.includes(id)) || (status === "ready" && matchedIds.length === 0)) return null
+    || new Set(targetIds).size !== targetIds.length || matchedIds.some(id => !targetIds.includes(id)) || (status === "ready" && (matchedIds.length === 0 || waitMode === "all" && matchedIds.length !== targetIds.length))) return null
   const seen = new Set<string>(); const tasks: OutcomeTask[] = []
   for (const state of states) {
     if (!targetIds.includes(state.taskId) || seen.has(state.taskId) || !taskStatus(state.status)) return null
@@ -175,7 +175,8 @@ function projection(wait: Row, prepared: PreparedOutcome): Projection {
 function generatedOutcome(wait: Row, targets: readonly Row[], snapshot: TaskGraphSnapshot | null, rootTaskId: string): PreparedOutcome | null {
   const waitId = safeText(wait.id); const status = waitStatus(wait.status); const currentMode = waitMode(wait.mode)
   const targetIds = boundedIds(wait.targetTaskIds); const matchedIds = boundedIds(wait.matchedTaskIds, true)
-  if (!status || !currentMode || !targetIds || !matchedIds || matchedIds.some(id => !targetIds.includes(id))) return null
+  if (!status || !currentMode || !targetIds || !matchedIds || matchedIds.some(id => !targetIds.includes(id))) { if (wait.status === "ready") throw new Error("wait_consume_outcome_invalid"); return null }
+  if (status === "ready" && (matchedIds.length === 0 || currentMode === "all" && matchedIds.length !== targetIds.length)) throw new Error("wait_consume_outcome_invalid")
   const byId = new Map(targets.map(target => [safeText(target.id), target]))
   const states: TaskState[] = targetIds.map(taskId => {
     const target = byId.get(taskId), status = taskStatus(target?.status ?? "unknown") ?? "unknown", result = resultInfo(target?.result ?? null)
@@ -194,9 +195,9 @@ function generatedOutcome(wait: Row, targets: readonly Row[], snapshot: TaskGrap
 }
 function storedOutcome(wait: Row, snapshot: TaskGraphSnapshot | null, rootTaskId: string): PreparedOutcome | null {
   const raw = record(object(wait.result).outcome), waitId = safeText(wait.id), status = raw ? waitStatus(raw.status) : null, currentMode = waitMode(wait.mode)
-  const expectedIds = boundedIds(wait.targetTaskIds), targetIds = raw ? boundedIds(raw.targetTaskIds) : null, matchedIds = raw ? boundedIds(raw.matchedTaskIds, true) : null
-  if (!raw || raw.waitId !== waitId || !status || status !== waitStatus(wait.status) || !currentMode || !expectedIds || !targetIds || !matchedIds
-    || targetIds.length !== expectedIds.length || targetIds.some((id, index) => id !== expectedIds[index]) || matchedIds.some(id => !targetIds.includes(id))
+  const expectedIds = boundedIds(wait.targetTaskIds), expectedMatchedIds = boundedIds(wait.matchedTaskIds, true), targetIds = raw ? boundedIds(raw.targetTaskIds) : null, matchedIds = raw ? boundedIds(raw.matchedTaskIds, true) : null
+  if (!raw || raw.waitId !== waitId || !status || status !== waitStatus(wait.status) || !currentMode || !expectedIds || !expectedMatchedIds || !targetIds || !matchedIds
+    || targetIds.length !== expectedIds.length || targetIds.some((id, index) => id !== expectedIds[index]) || matchedIds.length !== expectedMatchedIds.length || matchedIds.some((id, index) => id !== expectedMatchedIds[index]) || matchedIds.some(id => !targetIds.includes(id))
     || (status === "ready" && matchedIds.length === 0) || !Array.isArray(raw.tasks)) return null
   const seen = new Set<string>(); const states: TaskState[] = []
   for (const value of raw.tasks) {

@@ -1,4 +1,4 @@
-import { CoordinationError, type CoordinationRuntimeOptions, type CoordinationTaskView } from "./coordination-types.js"
+import { CoordinationError, type CoordinationRuntimeOptions, type CoordinationTaskView, type DurableWaitPort } from "./coordination-types.js"
 import { TERMINAL_TASK_STATUSES } from "./coordination-followup.js"
 import { validatedStructuredResult } from "./coordination-result-aggregate.js"
 import { lifecycleTarget, visibleTask } from "./coordination-visibility.js"
@@ -95,6 +95,34 @@ export function managerError(error: unknown): CoordinationError {
   return new CoordinationError(`coordination_${code}`, error instanceof Error ? error.message : "Subagent manager operation failed")
 }
 
+type DurableWaitErrorCode = "wait_invalid" | "wait_scope_error" | "wait_conflict" | "wait_not_found"
+const DURABLE_WAIT_ERROR_MESSAGES: Readonly<Record<DurableWaitErrorCode, string>> = {
+  wait_invalid: "Durable wait request is invalid",
+  wait_scope_error: "Durable wait scope is unavailable",
+  wait_conflict: "Durable wait request conflicts with an existing request",
+  wait_not_found: "Durable wait is unavailable",
+}
+function durableWaitErrorCode(error: unknown): DurableWaitErrorCode | null {
+  if (!error || typeof error !== "object") return null
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(error, "code")
+    const code = descriptor && "value" in descriptor ? descriptor.value : null
+    return typeof code === "string" && Object.hasOwn(DURABLE_WAIT_ERROR_MESSAGES, code) ? code as DurableWaitErrorCode : null
+  } catch { return null }
+}
+export function toolSafeDurableWaitPort(port: DurableWaitPort): DurableWaitPort {
+  return {
+    ...port,
+    async wait(input) {
+      try { return await port.wait(input) }
+      catch (error: unknown) {
+        const code = durableWaitErrorCode(error)
+        if (code) throw new CoordinationError(code, DURABLE_WAIT_ERROR_MESSAGES[code])
+        throw new Error("Durable wait operation failed")
+      }
+    },
+  }
+}
 export async function activity(context: ToolExecutionContext, options: CoordinationExecutorOptions, operation: string, taskId: string | null, data: Record<string, unknown>, operationKey?: string): Promise<void> {
   const key = `${operationKey ?? context.toolCallId ?? `${context.sessionId}:${context.turnId}:${context.stepId}`}:${operation}`
   await options.store.appendActivity({ userId: context.scope.userId, sessionId: context.sessionId, turnId: context.turnId, stepId: context.stepId, taskId, operation, status: "completed", idempotencyKey: key, data })

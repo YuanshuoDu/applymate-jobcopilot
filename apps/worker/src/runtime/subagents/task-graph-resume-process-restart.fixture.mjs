@@ -1,6 +1,7 @@
 import { Worker } from "bullmq"
 import { Pool } from "pg"
 import { createCanonicalTurnRuntime } from "../canonical-turn-runtime.ts"
+import { loadCanonicalTurnState } from "../canonical-turn-state.ts"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.ts"
 import { ROLE_RESULT_SCHEMA } from "./role-results.ts"
 import { createProductionChildExecutor } from "./production-child-runtime.ts"
@@ -1332,9 +1333,22 @@ async function startRuntime(workerOwnerId, resume) {
   })
 }
 async function startDiscoveryRuntime(workerOwnerId, resume) {
+  let waitOutcomeCheckpointUsed = false
+  const stateLoader = resume && mode === "resume-discovery" && ids.checkpointAfterWaitConsume === true
+    ? async (statePool, lease, now, loaderOptions) => {
+      const state = await loadCanonicalTurnState(statePool, lease, now, loaderOptions)
+      if (!waitOutcomeCheckpointUsed && lease.turnId === ids.turnId && loaderOptions?.consumeWaitOutcomes === true) {
+        waitOutcomeCheckpointUsed = true
+        say("P3_DISCOVERY_WAIT_OUTCOME_COMMITTED")
+        await waitForCommand("continue-after-wait-outcome-commit")
+      }
+      return state
+    }
+    : undefined
   return createCanonicalTurnRuntime(pool, {
     workerId: workerOwnerId, productionFlags: flags(), taskGraphCommandPort: createPgTaskGraphCommandPort(pool),
     taskGraphTemplates: TASK_GRAPH_TEMPLATES, authorizeUsage: async () => ({ settle: async () => undefined }),
+    ...(stateLoader ? { stateLoader } : {}),
     modelRuntimeFactory() {
       let modelRounds = 0
       const adapter = {

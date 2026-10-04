@@ -41,6 +41,7 @@ import { runTurnBoundaryCompactionPreflight, runTurnBoundaryContextCompaction } 
 import { createCanonicalRootToolGuards, failInteractiveDiscoveryUnavailable, interactiveDiscoveryCompletionGate, withInteractiveDiscoveryFinalResponse } from "./interactive-discovery-runtime.js"
 import { INTERACTIVE_DISCOVERY_TEMPLATES, rootTaskAllowedActions, rootToolSurface, terminalInteractiveDiscoveryShortlist, type InteractiveDiscoveryShortlistProjection } from "./interactive-discovery-contract.js"
 import type { SubagentTaskRecord } from "./subagents/types.js"
+import { toolSafeDurableWaitPort } from "./tools/coordination-executor-support.js"
 export { durableLifecycleSink } from "./turns/canonical-runtime-tool-recovery.js"
 export type { UsageAuthorization } from "./canonical-turn-runtime-model.js"
 export type CanonicalTurnRuntimeOptions = {
@@ -77,9 +78,7 @@ export type CanonicalTurnRuntimeOptions = {
   readonly sessionProjection?: CanonicalSessionProjection
   readonly now?: () => Date
 }
-function record(value: unknown): Record<string, unknown> {
-  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
-}
+function record(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {} }
 export async function createCanonicalTurnRuntime(pool: pg.Pool, options: CanonicalTurnRuntimeOptions): Promise<{
   execute: TurnExecutor
   manager: AgentTreeManager
@@ -149,7 +148,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const coordination = coordinationEnabled ? {
       manager,
       store: new PgCoordinationStore(pool),
-      wait: createPgDurableWaitPort(pool),
+      wait: toolSafeDurableWaitPort(createPgDurableWaitPort(pool)),
     } : undefined
     const toolRuntime = options.toolRuntimeFactory?.({ pool, policy: selectedPolicy, manager, state }) ?? createWorkerToolRuntime(pool, { sink: sinkProxy, resolveOwner }, selectedPolicy, coordination)
     let taskGraphParentAttemptCount: number | null = null; registerTaskGraphPlanningTool(toolRuntime.registry, taskGraphPlanningEnabled, { commandPort: options.taskGraphCommandPort, templates: turnTaskGraphTemplates, turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: () => taskGraphParentAttemptCount })

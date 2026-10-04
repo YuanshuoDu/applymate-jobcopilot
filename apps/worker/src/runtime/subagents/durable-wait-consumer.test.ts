@@ -21,11 +21,11 @@ function outputOf(content: unknown): OutcomeOutput {
   return output as OutcomeOutput
 }
 
-function fixture(input: { waitStatus?: string; mode?: "any" | "all"; matchedTaskIds?: string[]; consumed?: boolean; corruptConsumed?: boolean; missingConsumedOutcome?: boolean; storedReport?: unknown; storedReceipt?: unknown; snapshot?: unknown; targetStatus?: string; targetStatuses?: string[]; targetResults?: unknown[]; targetFailureReasons?: Array<string | null>; targetRole?: string; foreign?: boolean; failUpdate?: boolean; large?: boolean; targetCount?: number; malformed?: boolean; sessionStatus?: string; sessionSource?: string; closeBeforeUpdate?: boolean } = {}) {
+function fixture(input: { waitStatus?: string; mode?: "any" | "all"; matchedTaskIds?: string[]; archivedMatchedTaskIds?: string[]; consumed?: boolean; corruptConsumed?: boolean; missingConsumedOutcome?: boolean; storedReport?: unknown; storedReceipt?: unknown; snapshot?: unknown; targetStatus?: string; targetStatuses?: string[]; targetResults?: unknown[]; targetFailureReasons?: Array<string | null>; targetRole?: string; foreign?: boolean; failUpdate?: boolean; large?: boolean; targetCount?: number; malformed?: boolean; sessionStatus?: string; sessionSource?: string; closeBeforeUpdate?: boolean } = {}) {
   const targetIds = Array.from({ length: input.targetCount ?? 1 }, (_, index) => `child-${index + 1}`)
   const mode = input.mode ?? "all"
   const matchedTaskIds = input.matchedTaskIds ?? targetIds
-  const outcome = { waitId: input.corruptConsumed ? "wait-other" : "wait-1", status: "ready", targetTaskIds: targetIds, matchedTaskIds, tasks: targetIds.map((taskId, index) => ({ taskId, status: input.targetStatuses?.[index] ?? "completed", result: null, failureReason: null, ...(input.storedReport ? { verificationReport: input.storedReport } : {}), ...(input.storedReceipt ? { repairReceipt: input.storedReceipt } : {}) })) }
+  const outcome = { waitId: input.corruptConsumed ? "wait-other" : "wait-1", status: "ready", targetTaskIds: targetIds, matchedTaskIds: input.archivedMatchedTaskIds ?? matchedTaskIds, tasks: targetIds.map((taskId, index) => ({ taskId, status: input.targetStatuses?.[index] ?? "completed", result: null, failureReason: null, ...(input.storedReport ? { verificationReport: input.storedReport } : {}), ...(input.storedReceipt ? { repairReceipt: input.storedReceipt } : {}) })) }
   const result: Record<string, unknown> = input.consumed ? { request: { mode }, ...(input.missingConsumedOutcome ? {} : { outcome }) } : { request: { mode } }
   const wait: Record<string, unknown> = { id: "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "root-1", stepId: "step-1", targetTaskIds: targetIds, mode, status: input.waitStatus ?? "ready", matchedTaskIds, result, suspendedAt: now, consumedAt: input.consumed ? now : null }
   const state: { wait: Record<string, unknown>; consumedAt: Date | null; result: Record<string, unknown>; updates: number; sessionStatus: string; sessionSource: string } = { wait, consumedAt: input.consumed ? now : null, result, updates: 0, sessionStatus: input.sessionStatus ?? "running", sessionSource: input.sessionSource ?? "automation" }
@@ -91,10 +91,12 @@ describe("durable wait outcome consumer", () => {
     const fake = fixture({ mode: "any", targetCount: 2, matchedTaskIds: ["child-1"], targetStatuses: ["completed", "queued"], targetResults: [{ current: "completed-result" }, { stale: "prior-attempt-result" }], targetFailureReasons: [null, "prior-attempt-error"] })
     const projections = await consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now })
     const output = outputOf(projections[0]!.content)
+    expect(output.matchedTaskIds).toEqual(["child-1"])
     expect(output.tasks).toMatchObject([
       { taskId: "child-1", status: "completed", result: { current: "completed-result" } },
       { taskId: "child-2", status: "queued", result: null, failureReason: null },
     ])
+    expect(fake.state.wait.matchedTaskIds).toEqual(["child-1"])
     expect(JSON.stringify(output)).not.toContain("prior-attempt-result")
     expect(JSON.stringify(output)).not.toContain("prior-attempt-error")
   })
@@ -222,6 +224,30 @@ describe("durable wait outcome consumer", () => {
     await expect(consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now })).rejects.toThrow("wait_consume_outcome_invalid")
     expect(fake.state.updates).toBe(0)
     expect(fake.state.consumedAt).toBe(now)
+  })
+
+  it("rejects a consumed archive whose matched tasks conflict with the durable wait row", async () => {
+    const fake = fixture({ consumed: true, mode: "any", targetCount: 2, matchedTaskIds: ["child-1"], archivedMatchedTaskIds: ["child-2"] })
+    await expect(consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now })).rejects.toThrow("wait_consume_outcome_invalid")
+  })
+
+  it("rejects a consumed ready-all archive with only a subset of targets matched", async () => {
+    const fake = fixture({ consumed: true, mode: "all", targetCount: 2, matchedTaskIds: ["child-1"] })
+    await expect(consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now })).rejects.toThrow("wait_consume_outcome_invalid")
+  })
+
+  it("fails closed for a fresh ready-all wait with incomplete canonical matches", async () => {
+    const fake = fixture({ mode: "all", targetCount: 2, matchedTaskIds: ["child-1"] })
+    await expect(consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now })).rejects.toThrow("wait_consume_outcome_invalid")
+    expect(fake.state.updates).toBe(0)
+  })
+
+  it.each([
+    { archivedMatchedTaskIds: ["child-1", "child-1"] },
+    { archivedMatchedTaskIds: ["foreign-task"] },
+  ])("rejects a consumed archive with duplicated or foreign matched ids", async ({ archivedMatchedTaskIds }) => {
+    const fake = fixture({ consumed: true, targetCount: 2, matchedTaskIds: ["child-1"], archivedMatchedTaskIds })
+    await expect(consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now })).rejects.toThrow("wait_consume_outcome_invalid")
   })
 
   it("fails closed for stale ownership and foreign lineage", async () => {
