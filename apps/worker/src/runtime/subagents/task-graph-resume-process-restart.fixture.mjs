@@ -1392,8 +1392,31 @@ async function startDiscoveryRuntime(workerOwnerId, resume) {
             yield { type: "completed", finishReason: "tool_calls" }; return
           }
           if (typeof analyst.taskId !== "string") throw new Error("p3_discovery_analyst_task_missing")
-          waitOutcomeFromRequest(request, outcome => outcome.status === "ready"
-            && outcome.tasks.some(task => record(task)?.taskId === analyst.taskId && record(task)?.status === "completed"))
+          const originalAnalystWait = record(latestToolResult(request, discoveryAnalystWaitCallId))
+          const analystWaitId = originalAnalystWait?.waitId
+          if (originalAnalystWait?.status !== "waiting" || typeof analystWaitId !== "string"
+            || !Array.isArray(originalAnalystWait.taskIds) || originalAnalystWait.taskIds.length !== 1
+            || originalAnalystWait.taskIds[0] !== analyst.taskId
+            || !Array.isArray(originalAnalystWait.matchedTaskIds) || originalAnalystWait.matchedTaskIds.length !== 0) {
+            throw new Error("p3_discovery_analyst_wait_receipt_invalid")
+          }
+          const analystWaitProjection = request.messages.flatMap(message => message.content).find(part =>
+            part.type === "tool_result" && part.toolUseId === "wait:" + analystWaitId)
+          let analystWaitOutcome = null
+          if (typeof analystWaitProjection?.content === "string") {
+            try { analystWaitOutcome = record(JSON.parse(analystWaitProjection.content)) } catch { /* Invalid archive stays absent. */ }
+          }
+          const archivedAnalystTasks = Array.isArray(analystWaitOutcome?.tasks) ? analystWaitOutcome.tasks.map(record) : []
+          if (analystWaitOutcome?.waitId !== analystWaitId || analystWaitOutcome.status !== "ready"
+            || !Array.isArray(analystWaitOutcome.targetTaskIds) || analystWaitOutcome.targetTaskIds.length !== 1
+            || analystWaitOutcome.targetTaskIds[0] !== analyst.taskId
+            || !Array.isArray(analystWaitOutcome.matchedTaskIds) || analystWaitOutcome.matchedTaskIds.length !== 1
+            || analystWaitOutcome.matchedTaskIds[0] !== analyst.taskId || archivedAnalystTasks.length !== 1
+            || archivedAnalystTasks[0]?.taskId !== analyst.taskId || archivedAnalystTasks[0]?.role !== "analyst"
+            || archivedAnalystTasks[0]?.status !== "completed") {
+            throw new Error("p3_durable_wait_result_missing")
+          }
+          assertPassedVerificationReport(archivedAnalystTasks[0]?.verificationReport, "finding-count")
           if (nodes.length !== 2 || nodes.some(item => item?.status !== "completed")) throw new Error("p3_discovery_final_graph_incomplete")
           say("P3_DISCOVERY_RESTORED_FINAL_GRAPH " + JSON.stringify({ revision: graph.revision, nodeCount: nodes.length }))
           yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: discoveryFinalMarker }) }

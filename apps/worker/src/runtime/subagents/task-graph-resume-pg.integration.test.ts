@@ -8554,12 +8554,15 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(record(record(firstWait!.result)?.outcome)).toMatchObject({
         waitId: checkpointWait.id, status: "ready", targetTaskIds: [source.rows[0]!.id], matchedTaskIds: [source.rows[0]!.id],
       })
-      expect(record(record(analystWait!.result)?.outcome)).toMatchObject({
+      const analystOutcome = record(record(analystWait!.result)?.outcome)
+      expect(analystOutcome).toMatchObject({
         waitId: analystWait!.id, status: "ready", targetTaskIds: [analyst!.id], matchedTaskIds: [analyst!.id],
       })
+      const analystOutcomeTasks = Array.isArray(analystOutcome?.tasks) ? analystOutcome.tasks.map(record) : []
+      expect(analystOutcomeTasks).toHaveLength(1)
+      expect(analystOutcomeTasks[0]).toMatchObject({ taskId: analyst!.id, role: "analyst", status: "completed" })
       expectPassedVerificationReport(
-        (Array.isArray(record(record(analystWait!.result)?.outcome)?.tasks)
-          ? record(record(analystWait!.result)?.outcome)?.tasks as unknown[] : []).map(record)[0]?.verificationReport,
+        analystOutcomeTasks[0]?.verificationReport,
         "finding-count",
       )
       const turn = await pool!.query<{ status: string; finalResponse: string | null; leaseVersion: number }>(
@@ -8599,7 +8602,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         status: "waiting", waitId: checkpointWait.id, taskIds: [source.rows[0]!.id], matchedTaskIds: [],
       })
       expect(record(record(rootToolItem(DISCOVERY_RESTART_ANALYST_WAIT_CALL_ID, "tool_result")?.content)?.output)).toMatchObject({
-        status: "ready", targetTaskIds: [analyst!.id], matchedTaskIds: [analyst!.id],
+        status: "waiting", waitId: analystWait!.id, taskIds: [analyst!.id], matchedTaskIds: [],
       })
       const terminalEvents = await pool!.query<{ type: string; count: number }>(
         `SELECT "type", COUNT(*)::int AS "count" FROM "agent_events"
@@ -9214,6 +9217,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let interactiveFailureSearchResultObject: boolean | null = null
     let interactiveFailureReturnedJobCount: number | null = null
     let interactiveFailureExpectedJobReturned: boolean | null = null
+    let interactiveFailureReturnedJobIdHasRedactionMarker: boolean | null = null
     let interactiveFailureDependentRows: number | null = null
     let interactiveFailureDependentStatus: string | null = null
     let interactiveFailureDependentDispatchCount: number | null = null
@@ -9241,6 +9245,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       searchResultObject: interactiveFailureSearchResultObject,
       returnedJobCount: interactiveFailureReturnedJobCount,
       expectedJobReturned: interactiveFailureExpectedJobReturned,
+      returnedJobIdHasRedactionMarker: interactiveFailureReturnedJobIdHasRedactionMarker,
       dependentRows: interactiveFailureDependentRows,
       dependentStatus: interactiveFailureDependentStatus,
       dependentDispatchCount: interactiveFailureDependentDispatchCount,
@@ -9360,6 +9365,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             if (lease) {
               interactiveFailureReturnedJobCount = diagnosticBoundedCount(observedJobIds.length)
               interactiveFailureExpectedJobReturned = observedJobIds.includes(jobId)
+              interactiveFailureReturnedJobIdHasRedactionMarker = observedJobIds.some(id => /\[REDACTED(?:_(?:PHONE|EMAIL))?\]/i.test(id))
             }
             expect(observedJobIds).toContain(jobId)
             if (lease) interactiveFailureChildStage = "parent_wait"
