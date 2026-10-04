@@ -8251,7 +8251,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       workerTwo = startTaskGraphRestartWorker("resume-discovery", { ...value, jobId, checkpointAfterWaitConsume: true })
       await waitForProcessLine(workerTwo, "P3_DISCOVERY_SECOND_WORKER_READY ", 45_000)
       await waitForProcessLine(workerTwo, "P3_DISCOVERY_WAIT_OUTCOME_COMMITTED", 90_000)
-      const checkpointOwnerId = `p3-process-restart-discovery-worker-${workerTwo.pid}`
+      const checkpointOwnerId = `p3-process-restart-discovery-wait-resolver-${workerTwo.pid}`
       const checkpointTurn = await pool!.query<{
         status: string; rootTaskId: string | null; leaseOwnerId: string | null; leaseVersion: number; leaseExpiresAt: Date | null
       }>(`SELECT "status", "rootTaskId", "leaseOwnerId", "leaseVersion", "leaseExpiresAt"
