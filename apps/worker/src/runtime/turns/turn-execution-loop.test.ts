@@ -617,6 +617,50 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.events.some(event => event.type === "turn.completed")).toBe(false)
   })
 
+  it("replans in the same root loop after a TaskGraph evidence denial", async () => {
+    let checks = 0
+    const gate = vi.fn(async () => ++checks === 1
+      ? ({ ok: false as const, blocker: "task_graph_verification_unverified", feedback: "scout:candidate-present" })
+      : ({ ok: true as const }))
+    const root = fixture(identity("turn", "root-1"), undefined, [], gate)
+    const snapshots: TurnExecutionOptions["snapshot"][] = []
+    const build = root.options.contextBuilder.build
+    root.options.contextBuilder.build = async request => { snapshots.push(request.snapshot); return build(request) }
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "completed", stepCount: 3 })
+    expect(root.requests).toHaveLength(3)
+    expect(snapshots[2]?.system.at(-1)?.content).toContain("scout:candidate-present")
+    expect(root.events.some(event => event.type === "final.rejected")).toBe(true)
+    expect(root.events.some(event => event.type === "turn.completed")).toBe(true)
+    expect(root.stepStatuses).toEqual(["completed", "completed", "completed"])
+  })
+
+  it("does not turn repeated proof denials into success after the root step budget is exhausted", async () => {
+    const gate = vi.fn(async () => ({ ok: false as const, blocker: "task_graph_verification_unverified", feedback: "scout:candidate-present" }))
+    const root = fixture(identity("turn", "root-1"), undefined, [], gate)
+    root.options = { ...root.options, budget: { maxSteps: 2 } }
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "failed", errorCode: "budget_exhausted", stepCount: 2 })
+    expect(root.requests).toHaveLength(2)
+    expect(root.events.some(event => event.type === "turn.completed")).toBe(false)
+  })
+
+  it("recovers inside the loop when atomic TaskGraph finalization loses a race", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    let denyOnce = true
+    const persist = root.options.store.recordFinalResponse!
+    root.options.store.recordFinalResponse = async input => {
+      if (input.terminal && denyOnce) { denyOnce = false; throw Object.assign(new Error("race"), { name: "TaskGraphVerificationRecovery", blocker: "task_graph_verification_unverified", feedback: "scout:candidate-present" }) }
+      return persist(input)
+    }
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "completed", stepCount: 3 })
+    expect(root.requests).toHaveLength(3)
+    expect(root.events.some(event => event.type === "final.rejected" && event.id.includes("task-graph-race"))).toBe(true)
+    expect(root.events.some(event => event.type === "turn.failed")).toBe(false)
+    expect(root.events.some(event => event.type === "turn.completed")).toBe(true)
+  })
+
   it("fails closed when the completion gate throws", async () => {
     const gate = vi.fn(async () => { throw new Error("database unavailable") })
     const root = fixture(identity("turn", "root-1"), undefined, [], gate)

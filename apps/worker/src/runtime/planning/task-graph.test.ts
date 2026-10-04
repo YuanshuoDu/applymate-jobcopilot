@@ -12,12 +12,22 @@ import {
   type TaskGraphState,
   type TaskGraphValidationOptions,
 } from "./task-graph.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "./task-graph-verification.js"
 
 const options: TaskGraphValidationOptions = {
   registeredTemplateIds: new Set(["scout", "analyst", "writer"]), maxNodes: 8, maxDepth: 4,
 }
 function node(key: string, overrides: Partial<TaskGraphNodeProposal> = {}): TaskGraphNodeProposal {
-  return { key, templateId: "scout", goal: `Research ${key}`, successCriteria: [`Evidence for ${key}`], dependsOn: [], ...overrides }
+  const templateId = overrides.templateId ?? "scout"
+  const role = templateId === "analyst" ? "analyst" : "scout"
+  const defaultVerification: TaskGraphNodeProposal["verification"] = templateId === "writer" ? undefined : {
+    schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role,
+    criteria: [{ id: "minimum-results", check: { kind: role === "scout" ? "candidate_count_gte" : "finding_count_gte", minimum: 1 } }],
+  }
+  return {
+    key, templateId, goal: `Research ${key}`, successCriteria: [`Evidence for ${key}`], dependsOn: [],
+    ...(defaultVerification ? { verification: defaultVerification } : {}), ...overrides,
+  }
 }
 function append(state: TaskGraphState, nodes: readonly TaskGraphNodeProposal[], limits = options): TaskGraphState {
   const result = appendTaskGraphProposal(state, { expectedRevision: state.revision, nodes }, limits)
@@ -55,9 +65,92 @@ describe("TaskGraph planning kernel", () => {
     const state = createInitialTaskGraphState()
     expect(validateTaskGraphProposal({ expectedRevision: 0, nodes: [node("a")], extra: true }, state, options)).toMatchObject({ ok: false, error: { code: "invalid_shape" } })
     expect(validateTaskGraphProposal({ expectedRevision: 0, nodes: [{ ...node("a"), extra: true }] }, state, options)).toMatchObject({ ok: false, error: { code: "invalid_shape" } })
+    const proposalWithServerMetadata: TaskGraphNodeProposal = {
+      ...node("server-metadata"),
+      // @ts-expect-error verificationDisposition is runtime-owned and excluded from model proposals
+      verificationDisposition: "legacy_unverified",
+    }
+    expect(validateTaskGraphProposal({ expectedRevision: 0, nodes: [proposalWithServerMetadata] }, state, options))
+      .toMatchObject({ ok: false, error: { code: "invalid_shape" } })
     expect(validateTaskGraphProposal({ expectedRevision: 0, nodes: [node("a", { successCriteria: [] })] }, state, options)).toMatchObject({ ok: false, error: { code: "invalid_shape" } })
     expect(validateTaskGraphProposal({ expectedRevision: 0, nodes: [node("a", { templateId: "unregistered" })] }, state, options)).toMatchObject({ ok: false, error: { code: "unknown_template" } })
     expect(event(state, "toString", "a", "prototype-event")).toMatchObject({ ok: false, error: { code: "invalid_shape" } })
+  })
+
+  it("requires typed verification for Scout and Analyst while preserving writer-specific gates", () => {
+    const state = createInitialTaskGraphState()
+    const scout = node("scout")
+    const { verification: _scoutVerification, ...scoutWithoutVerification } = scout
+    expect(validateTaskGraphProposal({ expectedRevision: 0, nodes: [scoutWithoutVerification] }, state, options))
+      .toMatchObject({ ok: false, error: { code: "verification_required", path: "nodes[0].verification" } })
+
+    const analyst = node("analyst", { templateId: "analyst" })
+    const { verification: _analystVerification, ...analystWithoutVerification } = analyst
+    expect(validateTaskGraphProposal({ expectedRevision: 0, nodes: [analystWithoutVerification] }, state, options))
+      .toMatchObject({ ok: false, error: { code: "verification_required" } })
+    const acceptedAnalyst = validateTaskGraphProposal({ expectedRevision: 0, nodes: [analyst] }, state, options)
+    expect(acceptedAnalyst).toMatchObject({ ok: true, addedNodes: [{ verification: analyst.verification }] })
+    expect(validateTaskGraphProposal({ expectedRevision: 0, nodes: [node("writer", { templateId: "writer" })] }, state, options))
+      .toMatchObject({ ok: true, addedNodes: [{ templateId: "writer" }] })
+    expect(validateTaskGraphProposal({ expectedRevision: 0, nodes: [node("mismatch", {
+      templateId: "scout", verification: { ...analyst.verification!, role: "analyst" },
+    })] }, state, options)).toMatchObject({ ok: false, error: { code: "verification_invalid" } })
+  })
+
+  it("accepts only exact typed repairs of prior same-role criteria without a dependency edge", () => {
+    const targetVerification = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+      criteria: [
+        { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+        { id: "candidate-evidence", check: { kind: "all_candidates_have_evidence", minimumItems: 1 } },
+      ],
+    } as const
+    const target = node("target", { verification: targetVerification })
+    const state: TaskGraphState = {
+      revision: 1, nodes: [{ ...target, depth: 1, status: "completed", taskId: "task-target", verificationDisposition: "typed" }], appliedEvents: [],
+    }
+    const repairOf = { graphRootTaskId: "root-task", nodeKey: "target", taskId: "task-target", criterionIds: ["candidate-count"] }
+    const repair = node("repair", { verification: { ...targetVerification, criteria: [targetVerification.criteria[0]] }, repairOf })
+    expect(validateTaskGraphProposal({ expectedRevision: 1, nodes: [repair] }, state, options))
+      .toMatchObject({ ok: true, proposal: { nodes: [{ repairOf }] } })
+
+    const invalidNodes = [
+      node("missing-target", { verification: repair.verification, repairOf: { ...repairOf, nodeKey: "missing" } }),
+      node("stale-target", { verification: repair.verification, repairOf: { ...repairOf, taskId: "stale-task" } }),
+      node("wrong-criteria", { verification: repair.verification, repairOf: { ...repairOf, criterionIds: ["missing"] } }),
+      node("wrong-check", { verification: { ...repair.verification!, criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 2 } }] }, repairOf }),
+      node("extra-criteria", { verification: targetVerification, repairOf }),
+      node("target-edge", { verification: repair.verification, repairOf, dependsOn: ["target"] }),
+      node("wrong-role", { templateId: "analyst", verification: {
+        schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
+        criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }],
+      }, repairOf }),
+    ]
+    for (const invalid of invalidNodes) {
+      expect(validateTaskGraphProposal({ expectedRevision: 1, nodes: [invalid] }, state, options))
+        .toMatchObject({ ok: false, error: { code: "repair_invalid" } })
+    }
+    const legacyState = { ...state, nodes: state.nodes.map(item => ({ ...item, verificationDisposition: "legacy_unverified" as const })) }
+    expect(validateTaskGraphProposal({ expectedRevision: 1, nodes: [repair] }, legacyState, options))
+      .toMatchObject({ ok: false, error: { code: "repair_invalid" } })
+    const specializedState = { ...state, nodes: state.nodes.map(item => ({ ...item, verificationDisposition: "specialized" as const })) }
+    expect(validateTaskGraphProposal({ expectedRevision: 1, nodes: [repair] }, specializedState, options))
+      .toMatchObject({ ok: false, error: { code: "repair_invalid" } })
+    expect(validateTaskGraphProposal({ expectedRevision: 0, nodes: [target, repair] }, createInitialTaskGraphState(), options))
+      .toMatchObject({ ok: false, error: { code: "repair_invalid" } })
+  })
+
+  it("requires exact non-empty repairOf shape and unique criterion IDs", () => {
+    const state = createInitialTaskGraphState()
+    for (const repairOf of [
+      { graphRootTaskId: " ", nodeKey: "target", taskId: "task-target", criterionIds: ["criterion"] },
+      { graphRootTaskId: "root-task", nodeKey: "target", taskId: "task-target", criterionIds: ["criterion", "criterion"] },
+      { graphRootTaskId: "root-task", nodeKey: "target", taskId: "task-target", criterionIds: [] },
+      { graphRootTaskId: "root-task", nodeKey: "target", taskId: "task-target", criterionIds: ["criterion"], extra: true },
+    ]) {
+      expect(validateTaskGraphProposal({ expectedRevision: 0, nodes: [node("repair", { repairOf })] }, state, options))
+        .toMatchObject({ ok: false, error: { code: "invalid_shape", path: "nodes[0].repairOf" } })
+    }
   })
 
   it("rejects duplicate keys, missing dependencies, cycles, and caller bounds", () => {
@@ -182,6 +275,27 @@ describe("TaskGraph planning kernel", () => {
     const failedDependency = withNodeStatus(waiting, "root", "failed")
     expect(deriveTaskGraphReadModel(failedDependency).find(item => item.key === "child")?.readiness).toBe("blocked_dependency")
     expect(event(failedDependency, "task.queued", "child", "queue-after-failure")).toMatchObject({ ok: false, error: { code: "blocked_dependency" } })
+  })
+
+  it("keeps repaired prerequisites failed while allowing only receipt-derived readiness", () => {
+    const graph = append(createInitialTaskGraphState(), [node("root"), node("child", { dependsOn: ["root"] })])
+    const waiting = withNodeStatus(graph, "child", "waiting")
+    const state: TaskGraphState = { ...withNodeStatus(waiting, "root", "failed"), repairSatisfiedNodeKeys: ["root"] }
+    expect(state.nodes[0]?.status).toBe("failed")
+    expect(deriveTaskGraphReadModel(state).find(item => item.key === "child")?.readiness).toBe("ready")
+    const queued = event(state, "task.queued", "child", "queue-after-repair")
+    expect(queued).toMatchObject({ ok: true })
+    if (!queued.ok) throw new Error(queued.error.message)
+    expect(queued.state.nodes[0]?.status).toBe("failed")
+    expect(queued.state.repairSatisfiedNodeKeys).toEqual(["root"])
+  })
+
+  it("keeps unresolved typed failures waiting instead of terminally blocking repair", () => {
+    const graph = append(createInitialTaskGraphState(), [node("root"), node("child", { dependsOn: ["root"] })])
+    const waiting = withNodeStatus(graph, "child", "waiting")
+    const state: TaskGraphState = { ...withNodeStatus(waiting, "root", "failed"), repairPendingNodeKeys: ["root"] }
+    expect(deriveTaskGraphReadModel(state).find(item => item.key === "child")?.readiness).toBe("waiting_for_dependencies")
+    expect(event(state, "task.queued", "child", "queue-before-repair")).toMatchObject({ ok: false, error: { code: "dependencies_incomplete" } })
   })
 
   it("records retrying tasks as queued, matching the durable Worker status", () => {

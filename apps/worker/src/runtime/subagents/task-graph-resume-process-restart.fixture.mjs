@@ -8,6 +8,8 @@ import { hashArtifactContent } from "./artifact-adapters.ts"
 import { writerArtifactReferenceFromTaskContext } from "./task-graph-dependency-context.ts"
 import { parseSubagentJobPayload } from "./types.ts"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.ts"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.ts"
+import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-pg-verification.ts"
 import { parsePlanLedger, projectPlanLedger } from "@jobcopilot/agent-protocol"
 
 const [, , mode, rawIds] = process.argv, ids = JSON.parse(rawIds)
@@ -21,6 +23,8 @@ const discoveryAnalystPlanCallId = "p3-process-restart-discovery-analyst-plan"
 const discoveryAnalystWaitCallId = "p3-process-restart-discovery-analyst-wait"
 const discoveryFinalMarker = "p3-process-restart-discovery-shortlist-ready"
 const TASK_GRAPH_KEY_ALLOWLIST = new Set(["source", "summary", followUpKey])
+const CHILD_FAILURE_DIAGNOSTIC_CODES = new Set(["invalid_structured_result", "model_incomplete", "invalid_output", "tool_execution_failed", "timeout", "cancelled", "step_limit", "budget_exhausted", "no_progress", "evidence_missing", "evidence_conflict", "final_unverified", "child_turn_missing", "child_resume_unavailable", "child_resume_evidence_unavailable", "selected_job_sources_unavailable", "selected_job_context_unavailable", "subagent_role_unknown"])
+const CHILD_EXCEPTION_DIAGNOSTIC_NAMES = new Set(["Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "AbortError", "TimeoutError"])
 const TURN_STATUS_ALLOWLIST = new Set(["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user", "completed", "interrupted", "failed", "cancelled"])
 const STEP_STATUS_ALLOWLIST = new Set(["completed", "failed", "interrupted", "waiting_for_tool", "waiting_for_approval", "waiting_for_user"])
 const ROOT_TASK_STATUS_ALLOWLIST = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
@@ -34,6 +38,11 @@ const STEP_ERROR_CLASS_BY_CODE = new Map([
   ["wait_invalid", "wait_handoff_state"], ["wait_scope_error", "wait_handoff_state"], ["lease_lost", "turn_lease_state"],
   ["tool_execution_failed", "generic_tool_execution_failed"], ["business_precondition_failed", "business_precondition_failed"],
   ["invalid_output", "turn_output_invalid"], ["budget_exhausted", "turn_budget_exhausted"],
+])
+const RESTORED_GRAPH_GUARD_MARKERS = new Set([
+  "snapshot_not_restored", "source_node_not_restored", "summary_node_not_restored", "other_node_not_restored",
+  "wait_result_missing", "source_verification_not_restored", "summary_verification_not_restored",
+  "source_projection_missing", "other",
 ])
 const resultMarker = "p3-process-restart-source-result", finalMarker = "p3-process-restart-parent-resumed-after-follow-up"
 const planCallId = "p3-process-restart-plan", waitCallId = "p3-process-restart-wait"
@@ -56,9 +65,54 @@ function onStdinData(chunk) {
 }
 process.stdin.on("data", onStdinData)
 function say(value) { process.stdout.write(value + "\n") }
-function boundedFailureText(error) {
-  const detail = error instanceof Error ? error.stack ?? `${error.name}: ${error.message}` : String(error)
-  return detail.replace(/\s+/g, " ").slice(0, 1200)
+function restoredGraphGuardMarker(error) {
+  const message = error instanceof Error ? error.message : ""
+  let marker = "other"
+  if (message === "p3_task_graph_revision_or_snapshot_not_restored") marker = "snapshot_not_restored"
+  else if (message.startsWith("p3_task_graph_node_not_restored:")) {
+    const key = message.slice("p3_task_graph_node_not_restored:".length)
+    marker = key === "source" ? "source_node_not_restored"
+      : key === "summary" ? "summary_node_not_restored" : "other_node_not_restored"
+  } else if (message === "p3_durable_wait_result_missing") marker = "wait_result_missing"
+  else if (message === "p3_typed_verification_report_not_restored:candidate-count") marker = "source_verification_not_restored"
+  else if (message === "p3_typed_verification_report_not_restored:finding-count") marker = "summary_verification_not_restored"
+  else if (message.startsWith("p3_restored_graph_source_projection_missing:")) marker = "source_projection_missing"
+  return RESTORED_GRAPH_GUARD_MARKERS.has(marker) ? marker : "other"
+}
+function safeFailureCategory(error) {
+  const code = record(error)?.code
+  if (typeof code === "string") {
+    const category = STEP_ERROR_CLASS_BY_CODE.get(code.toLowerCase())
+    if (category) return category
+  }
+  if (error instanceof Error && error.message === "p3_persisted_plan_ledger_projection_invalid") {
+    return "plan_ledger_projection_invalid"
+  }
+  if (error instanceof Error && error.name === "CoordinationError") return "coordination_scope_error"
+  if (error instanceof Error && error.name === "AssertionError") return "task_graph_failure"
+  return "other"
+}
+function assertSafeFailureCategoryProjection() {
+  const known = safeFailureCategory(new Error("p3_persisted_plan_ledger_projection_invalid"))
+  const unknown = safeFailureCategory(new Error("p3_persisted_plan_ledger_projection_invalid:private-detail"))
+  if (known !== "plan_ledger_projection_invalid" || unknown !== "other") {
+    throw new Error("p3_failure_category_projection_self_test_failed")
+  }
+}
+function captureModelStreamFailure(model, onFailure) {
+  return {
+    ...model,
+    stream(request) {
+      return (async function* () {
+        try {
+          for await (const event of model.stream(request)) yield event
+        } catch (error) {
+          onFailure(error)
+          throw error
+        }
+      })()
+    },
+  }
 }
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)) }
 function waitForCommand(command) {
@@ -216,24 +270,145 @@ function stringArray(value) {
   }
   return Array.isArray(parsed) && parsed.every(item => typeof item === "string") ? parsed : null
 }
-function isExpectedSourceProjection(value) {
+function isExpectedSourceProjection(value, jobId = "fixture-job-restart") {
   const projection = record(value), candidates = Array.isArray(projection?.candidates) ? projection.candidates.map(record) : [], candidate = candidates[0]
   return projection?.schemaVersion === "agent-harness.v2.task-graph.result-projection" && projection.trust === "untrusted"
     && projection.availability === "available" && projection.role === "scout" && projection.status === "completed"
     && projection.candidateCount === 1 && projection.evidenceCount === 1 && candidates.length === 1
-    && candidate?.jobId === "fixture-job-restart" && candidate.source === "other"
+    && candidate?.jobId === jobId && candidate.source === "other"
     && Array.isArray(candidate.evidenceKinds) && candidate.evidenceKinds.length === 1 && candidate.evidenceKinds[0] === "job"
 }
 const SOURCE_PROJECTION_AVAILABILITY = new Set(["available", "unavailable"])
 const SOURCE_PROJECTION_ROLES = new Set(["scout", "analyst"])
 const SOURCE_PROJECTION_STATUSES = new Set(["completed", "partial"])
 const DIAGNOSTIC_COUNT_LIMIT = 99
+const CHILD_RUNTIME_SCOPE_DIAGNOSTIC_LIMIT = 12
+const RESTART_JOB_SOURCE_ENUMS = new Set(["greenhouse", "lever", "workday", "smartrecruiters", "personio", "jobs.read"])
+const RESTART_RESULT_STATUSES = new Set(["completed", "partial", "failed"])
+let childRuntimeScopeDiagnosticCount = 0
 function diagnosticEnum(value, allowlist) {
   if (value === null || value === undefined) return "missing"
   return typeof value === "string" && allowlist.has(value) ? value : "other"
 }
 function diagnosticCount(value) {
   return Number.isSafeInteger(value) && value >= 0 ? Math.min(value, DIAGNOSTIC_COUNT_LIMIT) : null
+}
+function fixtureScopeMatch(value, expected) {
+  return typeof value === "string" && typeof expected === "string" ? value === expected : null
+}
+function emitChildRuntimeScopeDiagnostic(input) {
+  if (childRuntimeScopeDiagnosticCount >= CHILD_RUNTIME_SCOPE_DIAGNOSTIC_LIMIT) return
+  childRuntimeScopeDiagnosticCount++
+  say("P3_CHILD_RUNTIME_SCOPE " + JSON.stringify({
+    phase: input.phase,
+    sessionMatchesFixture: fixtureScopeMatch(input.sessionId, ids.sessionId),
+    turnMatchesFixture: fixtureScopeMatch(input.turnId, ids.turnId),
+    userMatchesFixture: fixtureScopeMatch(input.userId, ids.userId),
+    taskUserMatchesFixture: fixtureScopeMatch(input.taskUserId, ids.userId),
+    modelTaskMatchesLease: fixtureScopeMatch(input.modelTaskId, input.leaseTaskId),
+    matchingToolResultCount: diagnosticCount(input.matchingToolResultCount),
+    resultJsonParsed: typeof input.resultJsonParsed === "boolean" ? input.resultJsonParsed : null,
+    expectedJobPresent: typeof input.expectedJobPresent === "boolean" ? input.expectedJobPresent : null,
+    returnedJobCount: diagnosticCount(input.returnedJobCount),
+  }))
+}
+function toolResultDiagnostics(request, callId) {
+  const messages = Array.isArray(request?.messages) ? request.messages : []
+  let count = 0, latestContent = null
+  for (const message of messages) {
+    const content = Array.isArray(message?.content) ? message.content : []
+    for (const part of content) {
+      if (part?.type !== "tool_result" || part.toolUseId !== callId) continue
+      count++
+      latestContent = typeof part.content === "string" ? part.content : null
+    }
+  }
+  if (latestContent === null) return { count: diagnosticCount(count), parsed: false }
+  try { JSON.parse(latestContent); return { count: diagnosticCount(count), parsed: true } }
+  catch { return { count: diagnosticCount(count), parsed: false } }
+}
+async function processRestartVerifierDiagnostic(lease, outcome) {
+  const childResult = record(outcome?.result), structured = record(childResult?.structuredResult)
+  const evidence = Array.isArray(structured?.evidence) ? structured.evidence.map(record).filter(Boolean) : []
+  const jobEvidence = evidence.filter(item => item.kind === "job")
+  const firstEvidence = jobEvidence[0]
+  const evidenceSource = typeof firstEvidence?.source === "string" ? firstEvidence.source : null
+  const rows = await pool.query(`SELECT result."status" AS "itemStatus", call."content"->>'status' AS "callStatus",
+      result."content"->>'errorCode' AS "errorCode", jsonb_typeof(result."content"->'output'->'jobs') AS "jobsType",
+      CASE WHEN jsonb_typeof(result."content"->'output'->'jobs') = 'array'
+        THEN LEAST(jsonb_array_length(result."content"->'output'->'jobs'), ${DIAGNOSTIC_COUNT_LIMIT})::int ELSE NULL END AS "jobCount",
+      COALESCE(jsonb_typeof(result."content"->'output'->'jobs') = 'array' AND stats."jobsValidShape", false) AS "jobsValidShape",
+      LEAST(COALESCE(stats."matchingJobCount", 0), ${DIAGNOSTIC_COUNT_LIMIT})::int AS "matchingJobCount",
+      COALESCE(stats."matchingJobSources", ARRAY[]::text[]) AS "matchingJobSources",
+      CASE WHEN $6::text IS NULL THEN NULL ELSE stats."evidenceSourceMatches" END AS "evidenceSourceMatches"
+    FROM "agent_items" AS result
+    JOIN "agent_steps" AS resultStep ON resultStep."id" = result."stepId" AND resultStep."sessionId" = result."sessionId"
+      AND resultStep."turnId" = result."turnId" AND resultStep."taskId" = result."taskId"
+    JOIN "agent_items" AS call ON call."stepId" = result."stepId" AND call."sessionId" = result."sessionId"
+      AND call."turnId" = result."turnId" AND call."taskId" = result."taskId" AND call."type" = 'tool_call'
+      AND call."content"->>'toolCallId' = result."content"->>'toolCallId'
+    JOIN "agent_steps" AS callStep ON callStep."id" = call."stepId" AND callStep."sessionId" = call."sessionId"
+      AND callStep."turnId" = call."turnId" AND callStep."taskId" = call."taskId"
+    LEFT JOIN LATERAL (
+      SELECT
+        count(*) FILTER (WHERE entry.job->>'id' = $5)::int AS "matchingJobCount",
+        COALESCE(bool_and(
+          jsonb_typeof(entry.job) = 'object' AND jsonb_typeof(entry.job->'id') = 'string'
+          AND length(entry.job->>'id') > 0 AND btrim(entry.job->>'id') = entry.job->>'id'
+        ) AND count(DISTINCT entry.job->>'id') = count(*), true) AS "jobsValidShape",
+        array_agg(DISTINCT CASE
+          WHEN entry.job->'source' IS NULL OR jsonb_typeof(entry.job->'source') = 'null' THEN 'jobs.read'
+          WHEN jsonb_typeof(entry.job->'source') = 'string' AND length(entry.job->>'source') BETWEEN 1 AND 256
+            AND btrim(entry.job->>'source') = entry.job->>'source'
+            THEN CASE WHEN entry.job->>'source' = ANY(ARRAY['greenhouse','lever','workday','smartrecruiters','personio','jobs.read'])
+              THEN entry.job->>'source' ELSE 'other' END
+          ELSE 'invalid'
+        END) FILTER (WHERE entry.job->>'id' = $5) AS "matchingJobSources",
+        COALESCE(bool_and(CASE
+          WHEN entry.job->'source' IS NULL OR jsonb_typeof(entry.job->'source') = 'null' THEN 'jobs.read' = $6::text
+          WHEN jsonb_typeof(entry.job->'source') = 'string' AND length(entry.job->>'source') BETWEEN 1 AND 256
+            AND btrim(entry.job->>'source') = entry.job->>'source' THEN entry.job->>'source' = $6::text
+          ELSE false
+        END) FILTER (WHERE entry.job->>'id' = $5), false) AS "evidenceSourceMatches"
+      FROM jsonb_array_elements(CASE WHEN jsonb_typeof(result."content"->'output'->'jobs') = 'array'
+        THEN result."content"->'output'->'jobs' ELSE '[]'::jsonb END) AS entry(job)
+    ) AS stats ON true
+    WHERE result."taskId" = $1 AND result."sessionId" = $2 AND result."turnId" = $3 AND resultStep."attempt" = $4
+      AND callStep."attempt" = $4 AND result."type" = 'tool_result' AND call."content"->>'toolName' = 'jobs.search'
+    ORDER BY resultStep."ordinal" ASC, result."createdAt" ASC, result."id" ASC LIMIT 9`,
+  [lease.id, lease.sessionId, lease.turnId, lease.attemptCount, ids.jobId, evidenceSource])
+  const persistedReads = rows.rows.slice(0, 8).map(raw => ({
+    itemStatus: diagnosticEnum(raw.itemStatus, ITEM_LIFECYCLE_STATUS_ALLOWLIST),
+    callStatus: diagnosticEnum(raw.callStatus, TOOL_CALL_STATUS_ALLOWLIST),
+    hasErrorCode: typeof raw.errorCode === "string" && raw.errorCode.length > 0,
+    jobsType: diagnosticEnum(raw.jobsType, new Set(["array"])),
+    jobCount: diagnosticCount(raw.jobCount),
+    jobsValidShape: raw.jobsValidShape === true,
+    matchingJobCount: diagnosticCount(raw.matchingJobCount),
+    matchingJobSources: Array.isArray(raw.matchingJobSources)
+      ? [...new Set(raw.matchingJobSources.map(value => diagnosticEnum(value, RESTART_JOB_SOURCE_ENUMS)))].slice(0, 5) : [],
+    evidenceSourceMatches: typeof raw.evidenceSourceMatches === "boolean" ? raw.evidenceSourceMatches : null,
+  }))
+  const claims = Array.isArray(structured?.candidates) ? structured.candidates.map(record).filter(Boolean)
+    : Array.isArray(structured?.findings) ? structured.findings.map(record).filter(Boolean) : []
+  say("P3_RESTART_VERIFIER_EVIDENCE_DIAGNOSTIC " + JSON.stringify({
+    role: lease.role === "scout" || lease.role === "analyst" ? lease.role : "other",
+    attempt: diagnosticCount(lease.attemptCount),
+    childStatus: diagnosticEnum(outcome?.status, RESTART_RESULT_STATUSES),
+    resultStatus: diagnosticEnum(childResult?.status, RESTART_RESULT_STATUSES),
+    structuredResultStatus: diagnosticEnum(structured?.status, RESTART_RESULT_STATUSES),
+    claimCount: diagnosticCount(claims.length),
+    claimJobIdMatches: claims.slice(0, 5).map(item => item.jobId === ids.jobId),
+    structuredEvidenceCount: diagnosticCount(evidence.length),
+    jobEvidenceCount: diagnosticCount(jobEvidence.length),
+    jobEvidence: jobEvidence.slice(0, 5).map(item => ({
+      refMatchesRequestedJob: item.ref === ids.jobId,
+      source: diagnosticEnum(item.source, RESTART_JOB_SOURCE_ENUMS),
+    })),
+    persistedSearchOutputCount: diagnosticCount(rows.rows.length),
+    persistedSearchOutputLimitReached: rows.rows.length > 8,
+    persistedReads,
+  }))
 }
 function sourceProjectionDiagnostic(value) {
   if (value === null || value === undefined) return { category: "absent" }
@@ -594,11 +769,15 @@ function waitOutcomeFromRequest(request, predicate) {
   const outcome = waitOutcomesFromRequest(request).find(predicate ?? (() => true))
   if (!outcome) throw new Error("p3_durable_wait_result_missing"); return outcome
 }
-function structuredResult(role, summary) {
-  const evidence = [{ id: "p3-process-restart-evidence", kind: "job", ref: "fixture-job-restart", source: "fixture" }]
-  const data = role === "scout" ? { schemaVersion: ROLE_RESULT_SCHEMA, role, status: "completed", candidates: [{ jobId: "fixture-job-restart", source: "fixture", url: null, evidenceIds: [evidence[0].id] }], evidence, summary }
-    : { schemaVersion: ROLE_RESULT_SCHEMA, role, status: "completed", findings: [{ jobId: "fixture-job-restart", score: 8, evidenceIds: [evidence[0].id] }], evidence, summary }
-  return { status: "completed", stepCount: 2, toolCallCount: 1, finalItemId: "p3-process-restart-final", finalText: summary, structuredResult: data }
+function assertPassedVerificationReport(value, criterionId) {
+  const report = record(value), criteria = Array.isArray(report?.criteria) ? report.criteria.map(record) : []
+  const criterion = criteria.find(item => item?.criterionId === criterionId)
+  if (report?.verifierVersion !== TASK_GRAPH_VERIFIER_VERSION || report.status !== "passed" || report.reasonCode !== "criteria_met"
+    || !/^[a-f0-9]{64}$/.test(report.evidenceDigest ?? "") || criteria.length !== 1
+    || criterion?.status !== "passed" || criterion.reasonCode !== "criteria_met") {
+    throw new Error("p3_typed_verification_report_not_restored:" + criterionId)
+  }
+  return report
 }
 function modelProfile() {
   return { provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true,
@@ -815,8 +994,15 @@ function assertRestoredGraph(request) {
   }
   waitOutcomeFromRequest(request, outcome => outcome.status === "ready" && outcome.tasks.length === expected.length
     && outcome.tasks.every(task => record(task)?.status === "completed"))
+  assertPassedVerificationReport(byKey.get("source")?.verificationReport, "candidate-count")
+  assertPassedVerificationReport(byKey.get("summary")?.verificationReport, "finding-count")
+  const wait = waitOutcomeFromRequest(request, outcome => outcome.status === "ready" && outcome.tasks.length === expected.length)
+  for (const task of wait.tasks.map(record)) {
+    const criterionId = task?.role === "scout" ? "candidate-count" : task?.role === "analyst" ? "finding-count" : ""
+    assertPassedVerificationReport(task?.verificationReport, criterionId)
+  }
   const sourceNode = byKey.get("source")
-  if (!sourceNode || !isExpectedSourceProjection(sourceNode.resultProjection)) {
+  if (!sourceNode || !isExpectedSourceProjection(sourceNode.resultProjection, ids.jobId)) {
     throw new Error("p3_restored_graph_source_projection_missing:" + JSON.stringify(sourceProjectionDiagnostic(sourceNode?.resultProjection)))
   }
   say("P3_RESTORED_GRAPH_OK " + JSON.stringify({ revision: graph.revision, nodeCount: nodes.length }))
@@ -838,8 +1024,13 @@ function assertFollowUpGraph(request) {
   const followUp = byKey.get(followUpKey)
   if (!followUp || followUp.goal !== followUpGoal || followUp.dependsOn?.length !== 1 || followUp.dependsOn[0] !== "summary"
     || followUp.status !== "completed" || followUp.readiness !== "terminal") throw new Error("p3_follow_up_graph_node_not_completed")
-  waitOutcomeFromRequest(request, outcome => outcome.status === "ready" && outcome.tasks.length === 1
-    && record(outcome.tasks[0])?.taskId === followUp.taskId && record(outcome.tasks[0])?.status === "completed" && JSON.stringify(outcome).includes(followUpGoal))
+  const wait = waitOutcomeFromRequest(request, outcome => outcome.status === "ready" && outcome.tasks.length === 1
+    && record(outcome.tasks[0])?.taskId === followUp.taskId && record(outcome.tasks[0])?.status === "completed")
+  const waitedFollowUp = record(wait.tasks[0])
+  if (JSON.stringify(wait).includes(followUpGoal) || record(waitedFollowUp?.result)?.truncated !== true) {
+    throw new Error("p3_follow_up_wait_redaction_invalid")
+  }
+  assertPassedVerificationReport(waitedFollowUp?.verificationReport, "finding-count")
   return { revision: graph.revision, taskId: followUp.taskId }
 }
 async function waitForParentSuspended(ownerId, timeoutMs = 20_000) {
@@ -1064,7 +1255,15 @@ async function projectPersistedPlanLedger() {
   return ledger
 }
 function toolCall(callId, name, args) { return { type: "tool_call_completed", callId, name, arguments: args } }
-function node(key, templateId, goal, successCriteria, dependsOn) { return { key, templateId, goal, successCriteria, dependsOn } }
+const fixtureVerifications = {
+  scout: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }] },
+  analyst: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }] },
+}
+function node(key, templateId, goal, successCriteria, dependsOn) {
+  const verification = fixtureVerifications[templateId]
+  if (!verification) throw new Error("p3_fixture_verification_template_unsupported")
+  return { key, templateId, goal, successCriteria, dependsOn, verification }
+}
 function waitArgs(key, taskIds) { return { idempotencyKey: key + ":" + ids.turnId, taskIds, mode: "all", timeoutMs: 30_000 } }
 async function startRuntime(workerOwnerId, resume) {
   return createCanonicalTurnRuntime(pool, {
@@ -1121,7 +1320,8 @@ async function startRuntime(workerOwnerId, resume) {
               say("P3_FOLLOW_UP_GRAPH_OK " + JSON.stringify(state))
               yield { type: "text_delta", text: finalMarker }; yield { type: "completed", finishReason: "stop" }; return
             } catch (error) {
-              say("P3_PARENT_MODEL_FAILURE " + boundedFailureText(error))
+              say("P3_PARENT_MODEL_FAILURE_CLASS " + safeFailureCategory(error))
+              say("P3_PARENT_MODEL_FAILURE_GUARD " + restoredGraphGuardMarker(error))
               throw error
             }
           }
@@ -1137,7 +1337,7 @@ async function startDiscoveryRuntime(workerOwnerId, resume) {
     taskGraphTemplates: TASK_GRAPH_TEMPLATES, authorizeUsage: async () => ({ settle: async () => undefined }),
     modelRuntimeFactory() {
       let modelRounds = 0
-      return { adapter: {
+      const adapter = {
         id: resume ? "p3-process-restart-discovery-resume-model" : "p3-process-restart-discovery-plan-model", profile: modelProfile(),
         async *stream(request) {
           modelRounds++
@@ -1185,7 +1385,13 @@ async function startDiscoveryRuntime(workerOwnerId, resume) {
           yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: discoveryFinalMarker }) }
           yield { type: "completed", finishReason: "stop" }; return
         },
-      }, registry: {}, candidates: [] }
+      }
+      return {
+        adapter: captureModelStreamFailure(adapter, error => {
+          if (resume) say("P3_DISCOVERY_PARENT_MODEL_FAILURE " + safeFailureCategory(error))
+        }),
+        registry: {}, candidates: [],
+      }
     },
   })
 }
@@ -1219,44 +1425,137 @@ async function runFirstWorker() {
 async function runSecondWorker() {
   assertNoPrivateArtifactFixtureData(ids)
   const ownerId = "p3-process-restart-worker-" + process.pid, runtime = await startRuntime(ownerId, true)
+  const { createProductionChildExecutor } = await import("./production-child-runtime.ts")
+  const executeChild = createProductionChildExecutor({
+    pool, authorizeUsage: async () => ({ settle: async () => undefined }),
+    modelRuntimeFactory({ task }) {
+      emitChildRuntimeScopeDiagnostic({ phase: "model", sessionId: task.sessionId, turnId: task.turnId,
+        userId: task.userId, taskUserId: task.userId, leaseTaskId: task.id })
+      let rounds = 0
+      const callId = `p3-process-restart-read:${task.id}:${task.attemptCount}`
+      return { id: `p3-process-restart-${task.role}-model`, profile: modelProfile(), async *stream(request) {
+        rounds++
+        if (rounds === 1) {
+          if (!request.tools.some(tool => record(tool)?.name === "jobs.search")) throw new Error("p3_restart_child_search_tool_missing")
+          yield toolCall(callId, "jobs.search", { target: "Software Engineer", location: "Dublin", limit: 10 })
+          yield { type: "completed", finishReason: "tool_calls" }; return
+        }
+        const search = record(latestToolResult(request, callId)), jobs = Array.isArray(search?.jobs) ? search.jobs.map(record) : []
+        const job = jobs.find(item => item?.id === ids.jobId)
+        const toolResult = toolResultDiagnostics(request, callId)
+        emitChildRuntimeScopeDiagnostic({ phase: "search_result", sessionId: task.sessionId, turnId: task.turnId,
+          userId: task.userId, taskUserId: task.userId, leaseTaskId: task.id,
+          modelTaskId: record(request?.metadata)?.taskId, matchingToolResultCount: toolResult.count,
+          resultJsonParsed: toolResult.parsed, expectedJobPresent: Boolean(job),
+          returnedJobCount: Array.isArray(search?.jobs) ? jobs.length : null })
+        if (!job || !["scout", "analyst"].includes(task.role)) throw new Error("p3_restart_child_search_receipt_missing")
+        const evidence = [{ id: `read:job:${ids.jobId}`, kind: "job", ref: ids.jobId, source: job.source ?? "greenhouse" }]
+        const summary = task.goal === sourceGoal ? resultMarker : task.goal === dependentGoal ? dependentGoal : followUpGoal
+        const result = task.role === "scout"
+          ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [{ jobId: ids.jobId, source: "fixture", url: null, evidenceIds: [evidence[0].id] }], evidence, summary }
+          : { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [{ jobId: ids.jobId, score: 8, evidenceIds: [evidence[0].id] }], evidence, summary }
+        if (task.goal === followUpGoal) await waitForCommand("complete-follow-up-child")
+        yield { type: "text_delta", text: JSON.stringify(result) }
+        yield { type: "completed", finishReason: "stop" }
+      } }
+    },
+  })
+  async function executeRestartChild(lease) {
+    const role = lease.role === "scout" || lease.role === "analyst" ? lease.role : "other"
+    try {
+      const outcome = await executeChild({ lease }), result = record(outcome.result), rawFailure = outcome.failureReason
+      if (role === "scout" || role === "analyst") {
+        try { await processRestartVerifierDiagnostic(lease, outcome) }
+        catch { say("P3_RESTART_VERIFIER_EVIDENCE_DIAGNOSTIC " + JSON.stringify({ role, diagnosticUnavailable: true })) }
+      }
+      say("P3_CHILD_OUTCOME " + JSON.stringify({
+        role, status: outcome.status === "completed" || outcome.status === "failed" ? outcome.status : "other",
+        failureCode: typeof rawFailure === "string" && CHILD_FAILURE_DIAGNOSTIC_CODES.has(rawFailure) ? rawFailure : rawFailure ? "other" : "none",
+        hasResult: outcome.result !== undefined && outcome.result !== null,
+        resultStatus: result?.status === "completed" || result?.status === "failed" ? result.status : result ? "other" : "missing",
+        hasStructuredResult: Boolean(result && Object.hasOwn(result, "structuredResult")),
+      }))
+      return outcome
+    } catch (error) {
+      const row = record(error), rawCode = typeof row?.code === "string" ? row.code : error instanceof Error ? error.message : ""
+      const failureCode = CHILD_FAILURE_DIAGNOSTIC_CODES.has(rawCode) ? rawCode
+        : rawCode === "40P01" ? "database_deadlock" : rawCode === "40001" ? "database_serialization"
+          : rawCode.startsWith("p3_") ? "fixture_error" : "other"
+      const errorName = error instanceof Error && CHILD_EXCEPTION_DIAGNOSTIC_NAMES.has(error.name) ? error.name : "other"
+      say("P3_CHILD_EXCEPTION " + JSON.stringify({ role, stage: "execute_child", errorName, failureCode }))
+      throw error
+    }
+  }
   const { createProductionWorkerBootstrap } = await import("../../queue/production-bootstrap.ts")
   bootstrap = await createProductionWorkerBootstrap({ pool, runtime, ownerId, turnRecoveryIntervalMs: 10,
     waitResolver: { intervalMs: 10, ownerId: "p3-process-restart-wait-resolver-" + process.pid },
     subagents: { intervalMs: 10, async execute({ lease }) {
-      const dependencyResults = record(record(lease.context)?.taskGraphDependencyResults)
-      const dependencyItems = Array.isArray(dependencyResults?.items) ? dependencyResults.items.map(record) : []
-      say("P3_CHILD_LEASE " + JSON.stringify({
-        taskId: lease.id,
-        goal: lease.goal,
-        role: lease.role,
-        dependencies: dependencyItems.map(item => ({
-          dependencyKey: item?.dependencyKey,
-          taskStatus: item?.taskStatus,
-          hasSourceResult: (JSON.stringify(item?.result) ?? "").includes(resultMarker),
-        })),
-      }))
-      if (lease.goal === sourceGoal && lease.role === "scout") return { status: "completed", result: structuredResult("scout", resultMarker) }
-      if (lease.goal === dependentGoal && lease.role === "analyst") {
-        const items = Array.isArray(record(record(lease.context)?.taskGraphDependencyResults)?.items)
-          ? record(record(lease.context)?.taskGraphDependencyResults).items.map(record) : []
-        if (items[0]?.dependencyKey !== "source" || items[0]?.taskStatus !== "completed" || !isExpectedSourceProjection(items[0]?.result)) {
-          throw new Error("p3_dependency_context_not_restored")
-        }
-        say("P3_DEPENDENCY_CONTEXT_OK"); return { status: "completed", result: structuredResult("analyst", dependentGoal) }
+      const role = lease.role === "scout" || lease.role === "analyst" ? lease.role : "other"
+      let stage = "dispatch_context"
+      try {
+        emitChildRuntimeScopeDiagnostic({ phase: "dispatch", sessionId: lease.sessionId,
+          turnId: lease.turnId, userId: lease.userId })
+        const dependencyResults = record(record(lease.context)?.taskGraphDependencyResults)
+        const dependencyItems = Array.isArray(dependencyResults?.items) ? dependencyResults.items.map(record) : []
+        say("P3_CHILD_LEASE " + JSON.stringify({
+          taskId: lease.id,
+          goal: lease.goal,
+          role: lease.role,
+          dependencies: dependencyItems.map(item => ({
+            dependencyKey: item?.dependencyKey,
+            taskStatus: item?.taskStatus,
+            hasSourceResult: (JSON.stringify(item?.result) ?? "").includes(resultMarker),
+          })),
+        }))
+        if (lease.goal === sourceGoal && lease.role === "scout") {
+          stage = "source_wait_state"
+          const dependent = await pool.query(`SELECT task."id", task."status" FROM "sub_agent_tasks" task WHERE task."turnId" = $1 AND task."goal" = $2`, [ids.turnId, dependentGoal])
+          if (dependent.rows.length !== 1 || dependent.rows[0].status !== "waiting") throw new Error("p3_dependent_not_waiting_before_source_proof")
+          stage = "source_dispatch_state"
+          const dispatch = await pool.query(`SELECT 1 FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${dependent.rows[0].id}`])
+          if (dispatch.rowCount !== 0) throw new Error("p3_dependent_dispatched_before_source_proof")
+          say("P3_DEPENDENT_WAITING_BEFORE_SOURCE_PROOF")
+        } else if (lease.goal === dependentGoal && lease.role === "analyst") {
+          stage = "source_lookup"
+          const source = await pool.query(`SELECT task."id", task."status", task."result" FROM "sub_agent_tasks" task WHERE task."turnId" = $1 AND task."goal" = $2`, [ids.turnId, sourceGoal])
+          const sourceResult = record(source.rows[0]?.result), report = record(sourceResult?.taskGraphVerificationReport)
+          stage = "source_verification"
+          assertPassedVerificationReport(report, "candidate-count")
+          stage = "source_completion"
+          if (source.rows.length !== 1 || source.rows[0].status !== "completed") throw new Error("p3_source_not_complete_before_dependent_dispatch")
+          stage = "dependent_dispatch"
+          const dispatch = await pool.query(`SELECT "id" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${lease.id}`])
+          if (dispatch.rows.length !== 1) throw new Error("p3_dependent_dispatch_missing_after_source_proof")
+          stage = "dependency_context"
+          const items = Array.isArray(record(record(lease.context)?.taskGraphDependencyResults)?.items)
+            ? record(record(lease.context)?.taskGraphDependencyResults).items.map(record) : []
+          if (items[0]?.dependencyKey !== "source" || items[0]?.taskStatus !== "completed" || !isExpectedSourceProjection(items[0]?.result, ids.jobId)) {
+            throw new Error("p3_dependency_context_not_restored")
+          }
+          say("P3_SOURCE_PROOF_UNLOCKED_DEPENDENT")
+          say("P3_DEPENDENCY_CONTEXT_OK")
+        } else if (lease.goal === followUpGoal && lease.role === "analyst") {
+          stage = "follow_up_context"
+          const items = Array.isArray(record(record(lease.context)?.taskGraphDependencyResults)?.items)
+            ? record(record(lease.context)?.taskGraphDependencyResults).items.map(record) : []
+          const projection = record(items[0]?.result), findings = Array.isArray(projection?.findings) ? projection.findings.map(record) : []
+          if (items[0]?.dependencyKey !== "summary" || items[0]?.taskStatus !== "completed"
+            || projection?.role !== "analyst" || projection?.availability !== "available"
+            || !findings.some(finding => finding?.jobId === ids.jobId && finding.score === 8)) {
+            throw new Error("p3_follow_up_dependency_context_missing")
+          }
+          say("P3_FOLLOW_UP_DEPENDENCY_CONTEXT_OK")
+        } else throw new Error("p3_unexpected_child:" + lease.goal)
+      } catch (error) {
+        const row = record(error), rawCode = typeof row?.code === "string" ? row.code : error instanceof Error ? error.message : ""
+        const failureCode = CHILD_FAILURE_DIAGNOSTIC_CODES.has(rawCode) ? rawCode
+          : rawCode === "40P01" ? "database_deadlock" : rawCode === "40001" ? "database_serialization"
+          : rawCode.startsWith("p3_") ? "fixture_error" : "other"
+        const errorName = error instanceof Error && CHILD_EXCEPTION_DIAGNOSTIC_NAMES.has(error.name) ? error.name : "other"
+        say("P3_CHILD_EXCEPTION " + JSON.stringify({ role, stage, errorName, failureCode }))
+        throw error
       }
-      if (lease.goal === followUpGoal && lease.role === "analyst") {
-        const items = Array.isArray(record(record(lease.context)?.taskGraphDependencyResults)?.items)
-          ? record(record(lease.context)?.taskGraphDependencyResults).items.map(record) : []
-        const projection = record(items[0]?.result), findings = Array.isArray(projection?.findings) ? projection.findings.map(record) : []
-        if (items[0]?.dependencyKey !== "summary" || items[0]?.taskStatus !== "completed"
-          || projection?.role !== "analyst" || projection?.availability !== "available"
-          || !findings.some(finding => finding?.jobId === "fixture-job-restart" && finding.score === 8)) {
-          throw new Error("p3_follow_up_dependency_context_missing")
-        }
-        say("P3_FOLLOW_UP_DEPENDENCY_CONTEXT_OK"); await waitForCommand("complete-follow-up-child")
-        return { status: "completed", result: structuredResult("analyst", followUpGoal) }
-      }
-      throw new Error("p3_unexpected_child:" + lease.goal)
+      return executeRestartChild(lease)
     } } })
   await startSelectedJobQueueWorker(runtime)
   say("P3_SECOND_WORKER_READY " + ownerId); await waitForStop()
@@ -1313,6 +1612,11 @@ async function runDiscoverySecondWorker() {
     subagents: { intervalMs: 10, async execute({ lease }) {
       say("P3_DISCOVERY_CHILD_STARTED " + lease.id + " " + lease.role)
       const outcome = await executeChild({ lease })
+      try { await processRestartVerifierDiagnostic(lease, outcome) }
+      catch { say("P3_RESTART_VERIFIER_EVIDENCE_DIAGNOSTIC " + JSON.stringify({
+        role: lease.role === "scout" || lease.role === "analyst" ? lease.role : "other",
+        diagnosticUnavailable: true,
+      })) }
       say("P3_DISCOVERY_CHILD_SETTLED " + lease.id + " " + lease.role + " " + outcome.status)
       return outcome
     } } })
@@ -1324,6 +1628,7 @@ try {
   assertLatestToolResultSelection()
   assertPersistedGraphComparator()
   assertInitialPlanToolPair()
+  assertSafeFailureCategoryProjection()
   assertSourceProjectionDiagnostic()
   if (mode === "self-test") say("P3_FIXTURE_SELF_TEST_OK")
   else if (mode === "worker2-input-guard-self-test") {

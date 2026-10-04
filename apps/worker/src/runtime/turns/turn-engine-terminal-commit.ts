@@ -5,6 +5,7 @@ import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import { matchesAgentOutboxIdentity, type AgentOutboxIdentity } from "../outbox-identity.js"
 import { toRepositoryJson, type AtomicTurnCompletionInput, type AtomicTurnCompletionResult, type TurnEngineEvent, type TurnEngineEventInput } from "./turn-engine-types.js"
 import type { TurnEngineCompletionGateResult } from "./turn-execution-types.js"
+import { TASK_GRAPH_VERIFICATION_BLOCKER } from "./turn-execution-completion-gate.js"
 
 type Pool = Pick<pg.Pool, "connect">
 type Client = pg.PoolClient
@@ -162,6 +163,9 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
     if (!committed && finalizationGuard) {
       const decision = await finalizationGuard(client)
       if (!decision || typeof decision !== "object" || decision.ok !== true) {
+        if (decision && decision.blocker === TASK_GRAPH_VERIFICATION_BLOCKER && typeof decision.feedback === "string" && decision.feedback.length <= 512) {
+          throw Object.assign(new Error(decision.blocker), { name: "TaskGraphVerificationRecovery", blocker: decision.blocker, feedback: decision.feedback })
+        }
         throw conflict(`selected-job finalization${decision && "blocker" in decision ? ` ${decision.blocker}` : ""}`)
       }
     }

@@ -3,11 +3,11 @@ import type pg from "pg"
 import { isTerminalSubagentStatus, type AtomicSubagentSpawnInput, type AtomicSubagentSpawnResult, type PgSubagentPool,
   type SubagentExecutionResult, type SubagentRetryDisposition, type SubagentStore, type SubagentTaskRecord, type SubagentTaskSpec, type SubagentPolicy } from "./types.js"
 import { computeSubagentNextAttemptAt } from "./retry-policy.js"
-import { persistGraphTransition, prepareGraphTransition, reconcileGraphDependents, taskGraphEventType } from "./task-graph-pg-lifecycle.js"
+import { persistGraphTransition, prepareGraphTransition, reconcileGraphDependents } from "./task-graph-pg-lifecycle.js"
 import { RUNNABLE_SESSION } from "../session-gate.js"
 import { createSubagentTask, lockSubagentSession, readSubagentTask } from "./pg-store-create.js"
 import { dateValue, json, rowToTask, SELECT_TASK, spawnKey, transaction, uniqueMessageIds } from "./pg-store-persistence.js"
-import { interruptSubtree as interruptStoreSubtree, interruptTree as interruptStoreTree, interruptTurn as interruptStoreTurn, recoverExpired as recoverStoreExpired } from "./pg-store-lifecycle.js"
+import { interruptSubtree as interruptStoreSubtree, interruptTree as interruptStoreTree, interruptTurn as interruptStoreTurn, prepareTaskGraphFinish, recoverExpired as recoverStoreExpired } from "./pg-store-lifecycle.js"
 export class PgSubagentTaskStore implements SubagentStore {
   constructor(private readonly pool: PgSubagentPool, private readonly leaseMs = 60_000) {}
   private async leaseTimeAfterLock(client: pg.PoolClient, input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number }): Promise<Date | null> {
@@ -21,7 +21,6 @@ export class PgSubagentTaskStore implements SubagentStore {
     finally { client.release() }
   }
   async create(input: SubagentTaskSpec & { policy: SubagentPolicy }): Promise<SubagentTaskRecord> { return transaction(this.pool, client => createSubagentTask(client, input)) }
-
   async createWithSpawn(input: AtomicSubagentSpawnInput): Promise<AtomicSubagentSpawnResult> {
     try {
       return await transaction(this.pool, async client => {
@@ -76,7 +75,6 @@ export class PgSubagentTaskStore implements SubagentStore {
       return readSubagentTask(client, input.taskId, input.sessionId)
     })
   }
-
   async heartbeat(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; now: Date }): Promise<"renewed" | "interrupted" | "lost"> {
     return transaction(this.pool, async (client) => {
       const session = await client.query(`SELECT "status" FROM "agent_sessions" WHERE "id" = $1 FOR UPDATE`, [input.sessionId])
@@ -105,7 +103,6 @@ export class PgSubagentTaskStore implements SubagentStore {
       return state.rows[0]?.interruptRequestedAt && state.rows[0]?.turnStatus === "interrupted" ? "interrupted" : "lost"
     })
   }
-
   async finish(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; status: SubagentExecutionResult["status"]; result?: unknown; failureReason?: string; retryDisposition?: SubagentRetryDisposition; mailboxMessageIds?: readonly string[]; now: Date }): Promise<"completed" | "retrying" | "failed" | "waiting" | "waiting_for_user" | "interrupted" | null> {
     const mailboxMessageIds = uniqueMessageIds(input.mailboxMessageIds)
     try {
@@ -129,14 +126,17 @@ export class PgSubagentTaskStore implements SubagentStore {
           || row.status !== "running" || row.leaseOwner !== input.ownerId || Number(row.attemptCount) !== input.attemptCount) return null
         const interrupted = row.interruptRequestedAt !== null && row.interruptRequestedAt !== undefined
         const retry = input.status === "failed" && !interrupted && input.retryDisposition !== "terminal" && Number(row.attemptCount) < Number(row.maxAttempts)
-        const status = interrupted ? "interrupted" : retry ? "queued" : input.status
-        const terminal = isTerminalSubagentStatus(status)
-        const graphType = taskGraphEventType(status, retry)
-        const graph = graphType ? await prepareGraphTransition(client, {
-          taskId: input.taskId, sessionId: input.sessionId, type: graphType,
-          attemptCount: input.attemptCount, failureReason: input.failureReason,
-        }) : null
+        let status = interrupted ? "interrupted" : retry ? "queued" : input.status
+        let result = input.result
+        let failureReason = input.failureReason
+        const finish = await prepareTaskGraphFinish(client, {
+          taskId: input.taskId, sessionId: input.sessionId, attemptCount: input.attemptCount,
+          status, retry, failureReason, result,
+        })
+        status = finish.status; result = finish.result; failureReason = finish.failureReason
+        const graph = finish.graph
         if (graph && "blocked" in graph) return null
+        const terminal = isTerminalSubagentStatus(status)
         const lockedTask = await client.query(`${taskSql} FOR UPDATE OF task`, [input.taskId, input.sessionId, input.ownerId, input.attemptCount])
         const lockedRow = lockedTask.rows[0] as Record<string, unknown> | undefined
         if (!lockedRow || lockedRow.status !== "running" || lockedRow.leaseOwner !== input.ownerId
@@ -160,11 +160,11 @@ export class PgSubagentTaskStore implements SubagentStore {
                 AND turn."id" = "sub_agent_tasks"."turnId" AND turn."sessionId" = "sub_agent_tasks"."sessionId"
                 AND turn."rootTaskId" = root."id" AND (turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled')
                   OR (turn."status" = 'interrupted' AND "sub_agent_tasks"."interruptRequestedAt" IS NOT NULL)))`,
-        [input.taskId, input.sessionId, status, json(input.result, null), input.failureReason ?? null, terminal, finishAt, input.ownerId, input.attemptCount, nextAttemptAt])
+        [input.taskId, input.sessionId, status, json(result, null), failureReason ?? null, terminal, finishAt, input.ownerId, input.attemptCount, nextAttemptAt])
         if (updated.rowCount !== 1) throw new FinishFenceSignal()
         if (graph) {
           await persistGraphTransition(client, graph, finishAt)
-          if (terminal) await reconcileGraphDependents(client, graph.scope, finishAt)
+          if (terminal && finish.reconcileDependents !== false) await reconcileGraphDependents(client, graph.scope, finishAt)
         }
         if (interrupted) await client.query(`DELETE FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch' AND "aggregateId" = $1 AND "idempotencyKey" = $2 AND "publishedAt" IS NULL`,
           [input.sessionId, `subagent-dispatch:${input.taskId}`])

@@ -1,28 +1,21 @@
 import { Buffer } from "node:buffer"
 import type { StepContextSnapshot } from "./context/step-context-builder.js"
-import type {
-  TaskGraphAnalystProjectionItem,
-  TaskGraphArtifactProjectionReference,
-  TaskGraphCurrentNode,
-  TaskGraphCommandPort,
-  TaskGraphCurrentState,
-  TaskGraphProjectionEvidenceKind,
-  TaskGraphProjectionSource,
-  TaskGraphReadScope,
-  TaskGraphResultProjection,
-  TaskGraphScoutProjectionItem,
+import {
+  parseTaskGraphRepairOf, parseTaskGraphRepairReceipt, parseTaskGraphVerificationCriterionIds, parseTaskGraphVerificationReport,
+  TASK_GRAPH_RESULT_PROJECTION_SCHEMA,
+  type TaskGraphAnalystProjectionItem, type TaskGraphArtifactProjectionReference, type TaskGraphCurrentNode,
+  type TaskGraphCommandPort, type TaskGraphCurrentState, type TaskGraphProjectionEvidenceKind, type TaskGraphProjectionSource,
+  type TaskGraphReadScope, type TaskGraphResultProjection, type TaskGraphScoutProjectionItem,
 } from "./subagents/task-graph-command-port.js"
-import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./subagents/task-graph-command-port.js"
+import { type TaskGraphRepairOf } from "./planning/task-graph.js"
 import type { TurnLease } from "./turns/lease.js"
 import type { SubagentTaskRecord } from "./subagents/types.js"
-
 const SELECTED_JOB_ROOT_TOOLS = new Set(["agent.plan", "agent.wait", "agent.list", "list_subagents"])
 
 export function isSelectedJobRootTool(definition: unknown): boolean {
   const name = record(definition)?.name
   return typeof name === "string" && SELECTED_JOB_ROOT_TOOLS.has(name)
 }
-
 export function selectedJobToolAllowed(name: string): boolean {
   return SELECTED_JOB_ROOT_TOOLS.has(name)
 }
@@ -47,6 +40,7 @@ const MAX_RESULT_PROJECTION_BYTES = 2 * 1024
 const MAX_RESULT_PROJECTION_TOTAL_BYTES = 16 * 1024
 const MAX_RESULT_PROJECTION_ITEMS = 3
 const MAX_RESULT_PROJECTION_TOTAL_ITEMS = 24
+const MAX_VERIFICATION_CONTEXT_BYTES = 32 * 1024
 const STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
 const READINESS = new Set(["ready", "waiting_for_dependencies", "blocked_dependency", "active", "terminal"])
 const PROJECTION_SOURCES = new Set(["greenhouse", "lever", "workday", "smartrecruiters", "personio", "other"])
@@ -62,18 +56,15 @@ const UNAVAILABLE_PROJECTION: TaskGraphResultProjection = {
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null
 }
-
 function text(value: unknown, maxLength: number, path: string, clip = false): string {
   if (typeof value !== "string" || !value.trim()) throw new Error("task_graph_current_state_invalid")
   if (value.length > maxLength && !clip) throw new Error(`task_graph_current_state_invalid:${path}`)
   return value.slice(0, maxLength)
 }
-
 function stringList(value: unknown, maxItems: number, maxLength: number, path: string): string[] {
   if (!Array.isArray(value) || value.length > maxItems) throw new Error(`task_graph_current_state_invalid:${path}`)
   return value.map((item, index) => text(item, maxLength, `${path}[${index}]`))
 }
-
 function projection(value: unknown): TaskGraphResultProjection {
   const row = record(value)
   if (!row || row.schemaVersion !== TASK_GRAPH_RESULT_PROJECTION_SCHEMA || row.trust !== "untrusted") return UNAVAILABLE_PROJECTION
@@ -175,7 +166,6 @@ function exactKeys(value: Record<string, unknown>, expected: string): boolean {
   const keys = Reflect.ownKeys(value)
   return keys.every((key): key is string => typeof key === "string") && keys.sort().join(",") === expected
 }
-
 function projectionItems(value: TaskGraphResultProjection): number {
   if (value.availability !== "available") return 0
   if (value.role === "scout") return value.candidates.length
@@ -190,13 +180,23 @@ function projectionBytes(value: TaskGraphResultProjection): number {
 function node(value: unknown): TaskGraphCurrentNode {
   const row = record(value)
   if (!row || typeof row.status !== "string" || !STATUSES.has(row.status) || typeof row.readiness !== "string" || !READINESS.has(row.readiness)) throw new Error("task_graph_current_state_invalid:node")
+  const hasIds = Object.hasOwn(row, "verificationCriterionIds"), hasReport = Object.hasOwn(row, "verificationReport")
+  const verificationCriterionIds = hasIds ? parseTaskGraphVerificationCriterionIds(row.verificationCriterionIds) : undefined
+  const verificationReport = hasReport && verificationCriterionIds ? parseTaskGraphVerificationReport(row.verificationReport, verificationCriterionIds) : undefined
+  const hasRelation = Object.hasOwn(row, "repairOf"), repairOf = hasRelation ? parseTaskGraphRepairOf(row.repairOf) : undefined
+  const hasReceipt = Object.hasOwn(row, "repairReceipt")
+  const key = text(row.key, 128, "key"), taskId = text(row.taskId, 128, "taskId")
+  const repairReceipt = hasReceipt ? parseTaskGraphRepairReceipt(row.repairReceipt, { repairOf, repairNodeKey: key, repairTaskId: taskId, report: verificationReport }) : undefined
+  if (hasIds && !verificationCriterionIds || hasReport && !verificationReport || hasRelation && !repairOf || hasReceipt && !repairReceipt) throw new Error("task_graph_current_state_invalid:verification")
   return {
-    key: text(row.key, 128, "key"), templateId: text(row.templateId, 128, "templateId"),
+    key, templateId: text(row.templateId, 128, "templateId"),
     goal: text(row.goal, 1200, "goal", true), successCriteria: stringList(row.successCriteria, 8, 320, "successCriteria"),
-    dependsOn: stringList(row.dependsOn, MAX_NODES, 128, "dependsOn"), taskId: text(row.taskId, 128, "taskId"),
+    dependsOn: stringList(row.dependsOn, MAX_NODES, 128, "dependsOn"), taskId,
     status: row.status as TaskGraphCurrentNode["status"], readiness: row.readiness as TaskGraphCurrentNode["readiness"],
     resultSummary: null,
     resultProjection: projection(row.resultProjection),
+    ...(verificationCriterionIds ? { verificationCriterionIds } : {}), ...(verificationReport ? { verificationReport } : {}),
+    ...(repairOf ? { repairOf } : {}), ...(repairReceipt ? { repairReceipt } : {}),
     failureReason: null,
   }
 }
@@ -207,10 +207,13 @@ export function mergeTaskGraphCurrentObservation(snapshot: StepContextSnapshot, 
   if (!state || !Number.isSafeInteger(state.revision) || Number(state.revision) < 0 || !Array.isArray(state.nodes) || state.nodes.length > MAX_NODES) throw new Error("task_graph_current_state_invalid")
   let projectedBytes = 0
   let projectedItems = 0
+  let verificationBytes = 0
   const nodes = state.nodes.map(value => {
     const item = node(value)
     const bytes = projectionBytes(item.resultProjection!)
     const count = projectionItems(item.resultProjection!)
+    verificationBytes += Buffer.byteLength(JSON.stringify({ verificationCriterionIds: item.verificationCriterionIds, verificationReport: item.verificationReport, repairOf: item.repairOf, repairReceipt: item.repairReceipt }), "utf8")
+    if (verificationBytes > MAX_VERIFICATION_CONTEXT_BYTES) throw new Error("task_graph_current_verification_too_large")
     if (projectedBytes + bytes > MAX_RESULT_PROJECTION_TOTAL_BYTES
       || projectedItems + count > MAX_RESULT_PROJECTION_TOTAL_ITEMS) {
       return { ...item, resultProjection: UNAVAILABLE_PROJECTION }

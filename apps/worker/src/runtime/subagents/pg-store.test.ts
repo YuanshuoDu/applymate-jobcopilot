@@ -1,9 +1,23 @@
 import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
+import { deriveTaskGraphReadModel } from "../planning/task-graph.js"
 
 import { PgSubagentTaskStore } from "./pg-store.js"
 import { normalizeSubagentPolicy, SubagentLimitError, type SubagentPolicy } from "./types.js"
-import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "./task-graph-snapshot.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { TASK_GRAPH_SNAPSHOT_VERSION, parseTaskGraphSnapshot, taskGraphItemId } from "./task-graph-snapshot.js"
+import { resolveTaskGraphRepairDependencies } from "./task-graph-dependency-context.js"
+import { loadTaskGraph } from "./task-graph-pg-state.js"
+import type { GraphTaskRow } from "./task-graph-pg-state.js"
+import { loadScopedTaskGraphDependencyContext } from "./task-graph-pg-dependency-context-loader.js"
+import { ROLE_RESULT_SCHEMA } from "./role-results.js"
+
+const { verifyEvidenceMock, resultDigestMock } = vi.hoisted(() => ({ verifyEvidenceMock: vi.fn(), resultDigestMock: vi.fn(() => "d".repeat(64)) }))
+vi.mock("./task-graph-pg-verification.js", () => ({
+  TASK_GRAPH_VERIFIER_VERSION: "agent-harness.v2.task-graph-verifier.v1",
+  verifyTaskGraphNodeEvidence: verifyEvidenceMock,
+  taskGraphResultDigest: resultDigestMock,
+}))
 
 const now = new Date("2026-09-03T00:00:00.000Z")
 const policy: SubagentPolicy = normalizeSubagentPolicy({ maxConcurrency: 2, maxAttempts: 2 })
@@ -92,7 +106,368 @@ function fakeInterruptedTurnPool(options: { missingGraphItem?: boolean } = {}) {
   return { ...fake, statuses, lifecycleEvents, pendingDispatches, revision: () => revision }
 }
 
+const analystContract = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
+  role: "analyst" as const,
+  criteria: [{ id: "finding-count", check: { kind: "finding_count_gte" as const, minimum: 1 } }],
+}
+function validAnalystResult() {
+  return { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
+    findings: [{ jobId: "job-1", score: 8, evidenceIds: ["read:job:job-1"] }],
+    evidence: [{ id: "read:job:job-1", kind: "job", ref: "job-1", source: "greenhouse" }], summary: "One verified finding." }
+}
+
+function fakeGraphFinishPool(options: {
+  legacy?: boolean; includeDependent?: boolean; repair?: boolean; plannedRepair?: boolean; priorReceipt?: boolean; fenceTaskUpdate?: boolean;
+  targetReport?: Record<string, unknown> | null;
+} = {}) {
+  const childId = options.repair ? "repair-1" : "child-1"
+  const nodes = [
+    ...(options.repair ? [{ key: "target", templateId: "analyst", goal: "Find", successCriteria: ["Find one"], dependsOn: [], depth: 1, taskId: "target-1", verificationDisposition: "typed", verification: analystContract }] : []),
+    ...(options.priorReceipt ? [{ key: "prior-repair", templateId: "analyst", goal: "Repair prior finding", successCriteria: ["Find one"], dependsOn: [], depth: 2, taskId: "prior-repair-1", verificationDisposition: "typed", verification: analystContract, repairOf: { graphRootTaskId: "root-1", nodeKey: "target", taskId: "target-1", criterionIds: ["finding-count"] } }] : []),
+    {
+      key: options.repair ? "repair" : "child", templateId: "analyst", goal: "Inspect", successCriteria: ["Find one"],
+      dependsOn: [], depth: options.priorReceipt ? 3 : options.repair ? 2 : 1, taskId: childId,
+      ...(options.legacy ? { verificationDisposition: "legacy_unverified" } : { verificationDisposition: "typed", verification: analystContract }),
+      ...(options.repair ? { repairOf: { graphRootTaskId: "root-1", nodeKey: "target", taskId: "target-1", criterionIds: ["finding-count"] } } : {}),
+    },
+    ...(options.plannedRepair ? [{ key: "child-repair", templateId: "analyst", goal: "Repair the inspected result", successCriteria: ["Find one"],
+      dependsOn: [], depth: 2, taskId: "repair-child-1", verificationDisposition: "typed", verification: analystContract,
+      repairOf: { graphRootTaskId: "root-1", nodeKey: "child", taskId: "child-1", criterionIds: ["finding-count"] } }] : []),
+    ...(options.includeDependent || options.repair ? [{ key: "dependent", templateId: "analyst", goal: "Continue", successCriteria: ["Continue"], dependsOn: [options.repair ? "target" : "child"], depth: 2, taskId: "dependent-1", verificationDisposition: "typed", verification: analystContract }] : []),
+  ]
+  const snapshot = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes })
+  const statuses = new Map<string, string>([
+    ...(options.repair ? [["target-1", "failed"] as const] : []),
+    ...(options.priorReceipt ? [["prior-repair-1", "completed"] as const] : []),
+    [childId, "running"],
+    ...(options.plannedRepair ? [["repair-child-1", "queued"] as const] : []),
+    ...(options.includeDependent || options.repair ? [["dependent-1", options.priorReceipt ? "queued" : "waiting"] as const] : []),
+  ])
+  const targetReport = options.targetReport ?? {
+    verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status: "failed", reasonCode: "criterion_not_met",
+    criteria: [{ criterionId: "finding-count", status: "failed", reasonCode: "criterion_not_met" }], evidenceDigest: "b".repeat(64), resultDigest: "d".repeat(64),
+  }
+  const previousReport = { verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status: "passed", reasonCode: "criteria_met", criteria: [{ criterionId: "finding-count", status: "passed", reasonCode: "criteria_met" }], evidenceDigest: "c".repeat(64), resultDigest: "d".repeat(64) }
+  const previousReceipt = { schemaVersion: "agent-harness.v2.task-graph-repair-receipt.v1", graphRootTaskId: "root-1", targetNodeKey: "target", targetTaskId: "target-1", criterionIds: ["finding-count"], repairNodeKey: "prior-repair", repairTaskId: "prior-repair-1", verifierVersion: "agent-harness.v2.task-graph-verifier.v1", evidenceDigest: previousReport.evidenceDigest }
+  const taskResults = new Map<string, unknown>([
+    ...(options.repair ? [["target-1", { status: "completed", finalText: "Findings", finalItemId: null, stepCount: 0, toolCallCount: 0,
+      structuredResult: validAnalystResult(), taskGraphVerificationReport: targetReport }] as const] : []),
+    ...(options.priorReceipt ? [["prior-repair-1", { taskGraphVerificationReport: previousReport, taskGraphRepairReceipt: previousReceipt }] as const] : []),
+  ])
+  const failureReasons = new Map<string, string | null>([
+    ...(options.repair ? [["target-1", targetReport.reasonCode === "repair_target_unresolved" ? "task_graph_repair_target_unresolved" : targetReport.status === "failed" ? "task_graph_verification_failed" : "task_graph_verification_unverified"] as const] : []),
+  ])
+  const lifecycleEvents: Array<{ type: string; payload: unknown }> = []
+  const order: string[] = []
+  let revision = 1
+  let sequence = 0
+  const proposal = { kind: "proposal", receipt: {
+    revision: 1,
+    nodes: snapshot.nodes.map(node => ({ key: node.key, taskId: node.taskId, status: node.dependsOn.length ? "waiting" : "queued" })),
+    readyTaskIds: snapshot.nodes.filter(node => node.dependsOn.length === 0).map(node => node.taskId),
+  } }
+  const fake = fakePool((sql, params) => {
+    const taskId = String(params?.[0] ?? childId)
+    if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1 }
+    if (sql.startsWith("SELECT task.*, session.")) return { rows: [taskRow({
+      id: childId, userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
+      role: "analyst", taskType: "research", status: "running", leaseOwner: "worker-1", attemptCount: 1, maxAttempts: 2,
+      leaseExpiresAt: new Date(now.getTime() + 60_000), interruptRequestedAt: null,
+    })], rowCount: 1 }
+    if (sql.includes('SELECT task."turnId"')) return { rows: [{ turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", attemptCount: taskId === childId ? 1 : 0, userId: "user-1" }], rowCount: 1 }
+    if (sql.includes("event.\"payload\"->>'kind' = 'proposal'")) return { rows: [{ payload: proposal }], rowCount: 1 }
+    if (sql.includes('SELECT item."id"')) return { rows: [{ id: taskGraphItemId("root-1"), revision, content: snapshot, createdAt: now }], rowCount: 1 }
+    if (sql.includes('task."expectedOutputSchema"') && sql.includes('task."context"')) return {
+      rows: (params?.[0] as string[]).map(id => ({ id, status: statuses.get(id), role: "analyst", failureReason: failureReasons.get(id) ?? null,
+        expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" }, result: taskResults.get(id) ?? null, context: {},
+        sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", userId: "user-1" })),
+      rowCount: (params?.[0] as string[]).length,
+    }
+    if (sql.includes('SELECT task."id", task."status", task."role", task."failureReason"')) return {
+      rows: snapshot.nodes.map(node => ({ id: node.taskId, status: statuses.get(node.taskId), role: "analyst", failureReason: failureReasons.get(node.taskId) ?? null, result: taskResults.get(node.taskId) ?? null })),
+      rowCount: snapshot.nodes.length,
+    }
+    if (sql.includes('SELECT event."type", event."payload"')) return { rows: lifecycleEvents, rowCount: lifecycleEvents.length }
+    if (sql.startsWith('SELECT target."id"')) return options.repair ? { rows: [{
+      id: "target-1", status: "failed", failureReason: failureReasons.get("target-1"), result: taskResults.get("target-1"), rootTaskId: "root-1", parentTaskId: "root-1",
+    }], rowCount: 1 } : { rows: [], rowCount: 0 }
+    if (sql.startsWith('SELECT prior."id"')) return { rows: (params?.[0] as string[]).map(id => ({ id, status: statuses.get(id), result: taskResults.get(id), failureReason: null })), rowCount: (params?.[0] as string[]).length }
+    if (sql.includes("FOR UPDATE OF task")) return statuses.get(childId) === "running" ? { rows: [taskRow({
+      id: childId, userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
+      role: "analyst", status: "running", leaseOwner: "worker-1", attemptCount: 1, leaseExpiresAt: new Date(now.getTime() + 60_000),
+    })], rowCount: 1 } : { rows: [], rowCount: 0 }
+    if (sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3')) {
+      order.push("task-update")
+      if (options.fenceTaskUpdate) return { rowCount: 0 }
+      statuses.set(taskId, String(params?.[2]))
+      taskResults.set(taskId, JSON.parse(String(params?.[3])) as unknown)
+      failureReasons.set(taskId, params?.[4] === null || params?.[4] === undefined ? null : String(params[4]))
+      return { rowCount: 1 }
+    }
+    if (sql.startsWith('UPDATE "sub_agent_tasks" SET "context" = $6::jsonb')) { statuses.set(taskId, "queued"); return { rowCount: 1 } }
+    if (sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = \'cancelled\'')) {
+      statuses.set(taskId, "cancelled")
+      failureReasons.set(taskId, "A prerequisite task did not complete.")
+      return { rowCount: 1 }
+    }
+    if (sql.startsWith('UPDATE "agent_items"')) {
+      revision = Number(params?.[5])
+      return { rows: [{ stepId: null, status: "streaming", phase: null, startedAt: now, completedAt: null, createdAt: now }], rowCount: 1 }
+    }
+    if (sql.includes('UPDATE "agent_sessions" AS session') && sql.includes('RETURNING "eventSequence"')) return { rows: [{ eventSequence: ++sequence }], rowCount: 1 }
+    if (sql.startsWith('INSERT INTO "agent_events"')) {
+      lifecycleEvents.push({ type: String(params?.[6]), payload: JSON.parse(String(params?.[10])) as unknown })
+      return { rowCount: 1 }
+    }
+    if (sql.startsWith('INSERT INTO "agent_outbox"')) return { rowCount: 1 }
+    return {}
+  })
+  return { ...fake, statuses, taskResults, failureReasons, lifecycleEvents, order, childId, snapshot }
+}
+
 describe("PgSubagentTaskStore", () => {
+  const candidateResult = {
+    status: "completed", finalText: "Done", finalItemId: null, stepCount: 0, toolCallCount: 0,
+    structuredResult: { ...validAnalystResult(), verificationReport: { forged: true } },
+    taskGraphVerificationReport: { forged: true }, taskGraphRepairReceipt: { forged: true },
+  }
+
+  function setVerifierResult(status: "passed" | "failed" | "unverified") {
+    verifyEvidenceMock.mockClear()
+    const reasonCode = status === "passed" ? "criteria_met" : status === "failed" ? "criterion_not_met" : "canonical_evidence_missing"
+    const report = {
+      verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status, reasonCode,
+      criteria: [{ criterionId: "finding-count", status, reasonCode }],
+      evidenceDigest: status === "unverified" ? null : "a".repeat(64),
+      resultDigest: status === "unverified" ? null : "d".repeat(64),
+    }
+    verifyEvidenceMock.mockResolvedValue({
+      verified: status === "passed", report, evaluation: report,
+      ...(status !== "unverified" ? { structuredResult: validAnalystResult() } : {}),
+    } as never)
+  }
+
+  it("persists only a server-verified typed result and report before completing the graph node", async () => {
+    const fake = fakeGraphFinishPool()
+    setVerifierResult("passed")
+    verifyEvidenceMock.mockImplementationOnce(async (...args: unknown[]) => {
+      fake.order.push("verify")
+      return (verifyEvidenceMock.getMockImplementation() as (...input: unknown[]) => unknown)(...args)
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.finish({ taskId: fake.childId, sessionId: "session-1", ownerId: "worker-1", attemptCount: 1,
+      status: "completed", result: candidateResult, now })).resolves.toBe("completed")
+
+    expect(fake.statuses.get(fake.childId)).toBe("completed")
+    const stored = fake.taskResults.get(fake.childId) as Record<string, unknown>
+    expect(stored.taskGraphVerificationReport).toMatchObject({ status: "passed", evidenceDigest: "a".repeat(64) })
+    expect(stored.structuredResult).toEqual(validAnalystResult())
+    expect(stored).not.toHaveProperty("taskGraphRepairReceipt.forged")
+    expect(JSON.stringify(stored)).not.toContain("forged")
+    expect(verifyEvidenceMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", taskId: fake.childId, attemptCount: 1 },
+      node: expect.objectContaining({ verificationDisposition: "typed" }),
+      structuredResult: expect.objectContaining({ role: "analyst" }),
+    }))
+    expect(fake.order.indexOf("verify")).toBeLessThan(fake.order.indexOf("task-update"))
+  })
+
+  it.each([
+    ["failed", "task_graph_verification_failed"],
+    ["unverified", "task_graph_verification_unverified"],
+  ] as const)("terminalizes a %s verification without releasing dependents", async (verificationStatus, failureReason) => {
+    const fake = fakeGraphFinishPool({ includeDependent: true, plannedRepair: true })
+    setVerifierResult(verificationStatus)
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.finish({ taskId: fake.childId, sessionId: "session-1", ownerId: "worker-1", attemptCount: 1,
+      status: "completed", result: candidateResult, now })).resolves.toBe("failed")
+
+    expect(fake.statuses.get(fake.childId)).toBe("failed")
+    expect(fake.statuses.get("dependent-1")).toBe("waiting")
+    expect(fake.statuses.get("repair-child-1")).toBe("queued")
+    expect(fake.calls.some(([sql]) => sql.includes("'agent.subagent.dispatch'"))).toBe(false)
+    const update = fake.calls.find(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))
+    expect(update?.[1]?.[2]).toBe("failed")
+    expect(update?.[1]?.[4]).toBe(failureReason)
+    expect((fake.taskResults.get(fake.childId) as Record<string, unknown>).taskGraphVerificationReport).toMatchObject({
+      status: verificationStatus,
+      ...(verificationStatus === "unverified" ? { reasonCode: "canonical_evidence_missing", evidenceDigest: null, resultDigest: null } : {}),
+    })
+    if (verificationStatus === "failed") expect((fake.taskResults.get(fake.childId) as Record<string, unknown>).structuredResult).toEqual(validAnalystResult())
+    else expect((fake.taskResults.get(fake.childId) as Record<string, unknown>).structuredResult).toBeUndefined()
+    expect(fake.lifecycleEvents.some(event => JSON.stringify(event.payload).includes('"type":"task.completed"'))).toBe(false)
+  })
+
+  it("fails legacy-unverified nodes with a server report even if a mocked verifier claims pass", async () => {
+    const fake = fakeGraphFinishPool({ legacy: true })
+    setVerifierResult("passed")
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.finish({ taskId: fake.childId, sessionId: "session-1", ownerId: "worker-1", attemptCount: 1,
+      status: "completed", result: candidateResult, now })).resolves.toBe("failed")
+
+    expect(verifyEvidenceMock).not.toHaveBeenCalled()
+    expect(fake.statuses.get(fake.childId)).toBe("failed")
+    expect((fake.taskResults.get(fake.childId) as Record<string, unknown>).taskGraphVerificationReport)
+      .toMatchObject({ status: "unverified", reasonCode: "contract_invalid", criteria: [] })
+    expect((fake.taskResults.get(fake.childId) as Record<string, unknown>).structuredResult).toBeUndefined()
+  })
+
+  it("keeps a hard executor failure distinct as unavailable unverified proof", async () => {
+    const fake = fakeGraphFinishPool()
+    setVerifierResult("passed")
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.finish({ taskId: fake.childId, sessionId: "session-1", ownerId: "worker-1", attemptCount: 1,
+      status: "failed", retryDisposition: "terminal", failureReason: "private executor detail", result: candidateResult, now })).resolves.toBe("failed")
+
+    expect(verifyEvidenceMock).not.toHaveBeenCalled()
+    expect((fake.taskResults.get(fake.childId) as Record<string, unknown>).taskGraphVerificationReport)
+      .toMatchObject({ status: "unverified", reasonCode: "result_invalid", evidenceDigest: null, resultDigest: null,
+        criteria: [{ criterionId: "finding-count", status: "unverified", reasonCode: "result_invalid" }] })
+    expect((fake.taskResults.get(fake.childId) as Record<string, unknown>).structuredResult).toBeUndefined()
+    const taskUpdate = fake.calls.find(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))
+    expect(taskUpdate?.[1]?.[4]).toBe("task_graph_verification_unverified")
+    expect(JSON.stringify(fake.lifecycleEvents)).not.toContain("private executor detail")
+  })
+
+  it("does not write a final verification report while a failed child is retrying", async () => {
+    const fake = fakeGraphFinishPool()
+    setVerifierResult("passed")
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.finish({ taskId: fake.childId, sessionId: "session-1", ownerId: "worker-1", attemptCount: 1,
+      status: "failed", retryDisposition: "retryable", result: candidateResult, now })).resolves.toBe("retrying")
+
+    expect(verifyEvidenceMock).not.toHaveBeenCalled()
+    const stored = fake.taskResults.get(fake.childId) as Record<string, unknown>
+    expect(stored.taskGraphVerificationReport).toBeUndefined()
+    expect(stored.taskGraphRepairReceipt).toBeUndefined()
+    expect(JSON.stringify(stored)).not.toContain("forged")
+  })
+
+  it("strips reserved verifier fields from non-TaskGraph worker results", async () => {
+    const fake = fakePool(sql => sql.startsWith("SELECT task.*, session.") ? { rows: [taskRow({
+      status: "running", leaseOwner: "worker-1", attemptCount: 1, leaseExpiresAt: new Date(now.getTime() + 60_000),
+    })], rowCount: 1 } : sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3') ? { rowCount: 1 } : {})
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.finish({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1,
+      status: "completed", result: candidateResult, now })).resolves.toBe("completed")
+
+    const update = fake.calls.find(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))
+    const stored = JSON.parse(String(update?.[1]?.[3])) as Record<string, unknown>
+    expect(stored.taskGraphVerificationReport).toBeUndefined()
+    expect(stored.taskGraphRepairReceipt).toBeUndefined()
+    expect(JSON.stringify(stored)).not.toContain("verificationReport")
+  })
+
+  it("rolls back a verification pass if the conditional task write loses its lease fence", async () => {
+    const fake = fakeGraphFinishPool({ fenceTaskUpdate: true })
+    setVerifierResult("passed")
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.finish({ taskId: fake.childId, sessionId: "session-1", ownerId: "worker-1", attemptCount: 1,
+      status: "completed", result: candidateResult, now })).resolves.toBeNull()
+
+    expect(fake.calls.map(([sql]) => sql)).toContain("ROLLBACK")
+    expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "agent_items"'))).toBe(false)
+    expect(fake.calls.some(([sql]) => sql.startsWith('INSERT INTO "agent_events"'))).toBe(false)
+    expect(fake.statuses.get(fake.childId)).toBe("running")
+  })
+
+  it("stores a repair receipt only for the exact unresolved same-scope target criteria", async () => {
+    const fake = fakeGraphFinishPool({ repair: true })
+    setVerifierResult("passed")
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.finish({ taskId: fake.childId, sessionId: "session-1", ownerId: "worker-1", attemptCount: 1,
+      status: "completed", result: candidateResult, now })).resolves.toBe("completed")
+
+    const result = fake.taskResults.get(fake.childId) as Record<string, unknown>
+    expect(result.taskGraphRepairReceipt).toEqual({
+      schemaVersion: "agent-harness.v2.task-graph-repair-receipt.v1", graphRootTaskId: "root-1",
+      targetNodeKey: "target", targetTaskId: "target-1", criterionIds: ["finding-count"],
+      repairNodeKey: "repair", repairTaskId: "repair-1", verifierVersion: "agent-harness.v2.task-graph-verifier.v1", evidenceDigest: "a".repeat(64),
+    })
+    expect(fake.statuses.get("target-1")).toBe("failed")
+    expect((fake.taskResults.get("target-1") as Record<string, unknown>).taskGraphVerificationReport).toMatchObject({ status: "failed" })
+    const taskRows = new Map(fake.snapshot.nodes.map(node => [node.taskId, {
+      id: node.taskId, status: fake.statuses.get(node.taskId) as GraphTaskRow["status"], role: "analyst",
+      failureReason: fake.failureReasons.get(node.taskId) ?? null, result: fake.taskResults.get(node.taskId) ?? null,
+    } satisfies GraphTaskRow] as const))
+    expect(resolveTaskGraphRepairDependencies(fake.snapshot, taskRows, "root-1")).toEqual({ satisfied: ["target"], pending: [] })
+    const queryable = fake.client as unknown as Pick<pg.PoolClient, "query">
+    const loaded = await loadTaskGraph(queryable, { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" })
+    expect(loaded.state?.repairSatisfiedNodeKeys).toContain("target")
+    const waitingState = { ...loaded.state!, nodes: loaded.state!.nodes.map(node => node.key === "dependent" ? { ...node, status: "waiting" as const } : node) }
+    expect(deriveTaskGraphReadModel(waitingState).find(node => node.key === "dependent")?.readiness).toBe("ready")
+    fake.statuses.set("dependent-1", "waiting")
+    await expect(loadScopedTaskGraphDependencyContext(queryable,
+      { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" },
+      "dependent-1", ["target"], fake.snapshot.nodes)).resolves.toMatchObject({ dependencies: [{ repairComposite: true, status: "completed" }] })
+    fake.statuses.set("dependent-1", "queued")
+    expect(fake.statuses.get("dependent-1")).toBe("queued")
+    expect(fake.calls.some(([sql]) => sql.includes("'agent.subagent.dispatch'"))).toBe(true)
+  })
+
+  it("rejects a repair when its requested target criterion is already passed", async () => {
+    const targetReport = {
+      verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status: "failed", reasonCode: "criterion_not_met",
+      criteria: [{ criterionId: "finding-count", status: "passed", reasonCode: "criteria_met" }], evidenceDigest: "b".repeat(64), resultDigest: "d".repeat(64),
+    }
+    const fake = fakeGraphFinishPool({ repair: true, targetReport })
+    setVerifierResult("passed")
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.finish({ taskId: fake.childId, sessionId: "session-1", ownerId: "worker-1", attemptCount: 1,
+      status: "completed", result: candidateResult, now })).resolves.toBe("failed")
+
+    expect(fake.statuses.get(fake.childId)).toBe("failed")
+    expect((fake.taskResults.get(fake.childId) as Record<string, unknown>).taskGraphRepairReceipt).toBeUndefined()
+    expect(fake.calls.some(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"') && sql.includes("'agent.subagent.dispatch'"))).toBe(false)
+  })
+
+  it("rejects a repair when the target verification report is malformed", async () => {
+    const targetReport = {
+      verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status: "failed", reasonCode: "criteria_met",
+      criteria: [{ criterionId: "finding-count", status: "failed", reasonCode: "criterion_not_met" }], evidenceDigest: "invalid", resultDigest: "d".repeat(64),
+    }
+    const fake = fakeGraphFinishPool({ repair: true, targetReport })
+    setVerifierResult("passed")
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.finish({ taskId: fake.childId, sessionId: "session-1", ownerId: "worker-1", attemptCount: 1,
+      status: "completed", result: candidateResult, now })).resolves.toBe("failed")
+
+    expect(fake.statuses.get(fake.childId)).toBe("failed")
+    const result = fake.taskResults.get(fake.childId) as Record<string, unknown>
+    expect(result.taskGraphRepairReceipt).toBeUndefined()
+    expect(result.taskGraphVerificationReport).toMatchObject({
+      status: "unverified", reasonCode: "repair_target_unresolved", evidenceDigest: null,
+      criteria: [{ criterionId: "finding-count", status: "passed", reasonCode: "criteria_met" }],
+    })
+    const update = fake.calls.find(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))
+    expect(update?.[1]?.[4]).toBe("task_graph_repair_target_unresolved")
+  })
+
+  it("rejects a repair when a prior committed receipt already resolved the same criterion", async () => {
+    const fake = fakeGraphFinishPool({ repair: true, priorReceipt: true })
+    setVerifierResult("passed")
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.finish({ taskId: fake.childId, sessionId: "session-1", ownerId: "worker-1", attemptCount: 1,
+      status: "completed", result: candidateResult, now })).resolves.toBe("failed")
+
+    expect(fake.statuses.get(fake.childId)).toBe("failed")
+    expect((fake.taskResults.get(fake.childId) as Record<string, unknown>).taskGraphRepairReceipt).toBeUndefined()
+    expect(fake.calls.some(([sql]) => sql.startsWith('SELECT prior."id"'))).toBe(true)
+    expect(fake.calls.some(([sql]) => sql.includes("'agent.subagent.dispatch'"))).toBe(false)
+  })
+
   it("creates a root task under a locked session and persists an inherited policy", async () => {
     const fake = fakePool(sql => {
       if (sql.includes('FROM "sub_agent_tasks" task')) return { rows: [taskRow()], rowCount: 1 }
@@ -666,7 +1041,7 @@ describe("PgSubagentTaskStore", () => {
     expect(events.filter(value => value.kind === "lifecycle").map(value => value.event?.type)).toEqual(["task.interrupted", "task.cancelled"])
     expect(fake.revision()).toBe(4)
     expect(fake.pendingDispatches.has("subagent-dispatch:child-1")).toBe(false)
-    const deletion = fake.calls.find(([sql]) => sql.startsWith('DELETE FROM "agent_outbox"'))
+    const deletion = fake.calls.find(([sql, params]) => sql.startsWith('DELETE FROM "agent_outbox"') && params?.[1] === "subagent-dispatch:child-1")
     expect(deletion?.[0]).toContain('"topic" = \'agent.subagent.dispatch\'')
     expect(deletion?.[0]).toContain('"publishedAt" IS NULL')
     expect(deletion?.[1]).toEqual(["session-1", "subagent-dispatch:child-1"])

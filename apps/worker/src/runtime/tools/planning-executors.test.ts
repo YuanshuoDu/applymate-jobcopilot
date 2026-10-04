@@ -2,11 +2,18 @@ import { describe, expect, it, vi } from "vitest"
 import { ToolRegistry } from "./registry.js"
 import type { ToolExecutionContext } from "./types.js"
 import { createTaskGraphPlanningTool } from "./planning-executors.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import type { TaskGraphCommandPort, TaskGraphScheduleReceipt, TaskGraphTaskTemplate } from "../subagents/task-graph-command-port.js"
 
 const proposal = {
   expectedRevision: 0,
-  nodes: [{ key: "research", templateId: "scout", goal: "Find matching roles", successCriteria: ["Return relevant roles"], dependsOn: [] }],
+  nodes: [{
+    key: "research", templateId: "scout", goal: "Find matching roles", successCriteria: ["Return relevant roles"], dependsOn: [],
+    verification: {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+      criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }],
+    },
+  }],
 } as const
 
 const receipt: TaskGraphScheduleReceipt = {
@@ -56,6 +63,81 @@ describe("agent.plan tool executor", () => {
     expect(commandPort.appendAndSchedule).not.toHaveBeenCalled()
   })
 
+  it("requires the role-bound typed contract and treats successCriteria prose as explanatory", () => {
+    expect(() => setup({ scout: { role: "analyst", taskType: "analysis", allowedActions: ["persona.retrieve"] } }))
+      .toThrow("task_graph_verification_template_role_mismatch")
+    const { tool } = setup({
+      scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
+      analyst: { role: "analyst", taskType: "analysis", allowedActions: ["persona.retrieve"] },
+    })
+    const registry = new ToolRegistry([tool])
+    const { verification: _verification, ...withoutVerification } = proposal.nodes[0]
+    expect(registry.validateArguments("agent.plan", { ...proposal, nodes: [{
+      ...withoutVerification, successCriteria: ["Everything is verified and proven"],
+    }] }, "1")).toEqual(expect.any(String))
+    expect(registry.validateArguments("agent.plan", { ...proposal, nodes: [{
+      ...proposal.nodes[0], verification: { ...proposal.nodes[0].verification, role: "analyst" },
+    }] }, "1")).toEqual(expect.any(String))
+    expect(registry.validateArguments("agent.plan", { ...proposal, nodes: [{
+      ...proposal.nodes[0], verification: { ...proposal.nodes[0].verification, criteria: [{
+        id: "bad-check", check: { kind: "finding_count_gte", minimum: 1 },
+      }] },
+    }] }, "1")).toEqual(expect.any(String))
+    expect(registry.validateArguments("agent.plan", {
+      ...proposal,
+      nodes: [{ ...proposal.nodes[0], templateId: "analyst", verification: {
+        schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
+        criteria: [{ id: "reported-score", check: { kind: "reported_score_gte", minimumScore: 7, minimumFindings: 1, aggregation: "any" } }],
+      } }],
+    }, "1")).toBe(true)
+    expect(tool.description).toContain("successCriteria prose is explanatory and never proof")
+    expect(tool.description).toContain("reported_score_gte checks an Analyst-reported number, not its correctness")
+  })
+
+  it("exposes and forwards the bounded repair relation only for typed roles", async () => {
+    const { tool, getReceived } = setup({
+      scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
+      analyst: { role: "analyst", taskType: "analysis", allowedActions: ["persona.retrieve"] },
+      cover_letter_writer: { role: "writer", taskType: "cover_letter", allowedActions: ["cover_letter.write"] },
+    })
+    const registry = new ToolRegistry([tool])
+    const repairOf = { graphRootTaskId: "runtime-root", nodeKey: "target", taskId: "target-task", criterionIds: ["candidate-count"] }
+    const input = { ...proposal, nodes: [{ ...proposal.nodes[0], repairOf }] }
+    expect(registry.validateArguments("agent.plan", input, "1")).toBe(true)
+    expect(JSON.stringify(tool.inputSchema)).toContain("graphRootTaskId")
+    expect(tool.description).toContain("repeats exactly those criteria and checks")
+    expect(tool.description).toContain("must not add the target to dependsOn")
+    await expect(tool.execute(context(), input)).resolves.toEqual(receipt)
+    expect(getReceived()?.proposal.nodes[0]?.repairOf).toEqual(repairOf)
+
+    const writer = {
+      ...proposal,
+      nodes: [{ key: "writer", templateId: "cover_letter_writer", goal: "Draft", successCriteria: ["Save draft"], dependsOn: [], repairOf }],
+    }
+    expect(registry.validateArguments("agent.plan", writer, "1")).toEqual(expect.any(String))
+  })
+
+  it("keeps Writer and Reviewer on specialized gates without generic verification fields", async () => {
+    const { tool, commandPort, getReceived } = setup({
+      scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
+      cover_letter_writer: { role: "writer", taskType: "cover_letter", allowedActions: ["cover_letter.write"] },
+      cover_letter_reviewer: { role: "reviewer", taskType: "review", allowedActions: ["cover_letter.review"] },
+    })
+    const registry = new ToolRegistry([tool])
+    for (const templateId of ["cover_letter_writer", "cover_letter_reviewer"]) {
+      const specialized = { ...proposal, nodes: [{
+        key: templateId, templateId, goal: "Use the specialized gate", successCriteria: ["Persist the expected artifact"], dependsOn: [],
+      }] }
+      expect(registry.validateArguments("agent.plan", specialized, "1")).toBe(true)
+      await tool.execute(context(), specialized)
+      expect(commandPort.appendAndSchedule).toHaveBeenCalledTimes(templateId === "cover_letter_writer" ? 1 : 2)
+      expect(getReceived()?.proposal.nodes[0]).not.toHaveProperty("verification")
+    }
+    expect(registry.validateArguments("agent.plan", { ...proposal, nodes: [{
+      ...proposal.nodes[0], templateId: "cover_letter_writer", verification: proposal.nodes[0].verification,
+    }] }, "1")).toEqual(expect.any(String))
+  })
+
   it("rejects contact and credential text in keys before scheduling", async () => {
     const sensitiveKeys = [
       "candidate@example.com",
@@ -95,6 +177,8 @@ describe("agent.plan tool executor", () => {
     expect(schema).toContain('"const":"analyst"')
     expect(schema).toContain('"const":"scout"')
     expect(schema).not.toContain('"const":"unregistered"')
+    expect((JSON.parse(schema) as { properties?: Record<string, unknown> }).properties).not.toHaveProperty("role")
+    expect(schema).toContain('"role":{"const":"analyst"')
     expect(tool.description).toContain('- "analyst": role "analyst"; allowed actions: "persona.retrieve", "resume.get_base"')
     expect(tool.description).toContain('- "scout": role "scout"; allowed actions: "jobs.search"')
     expect(tool.description).not.toContain("unregistered")
@@ -106,15 +190,24 @@ describe("agent.plan tool executor", () => {
     }, "1")).toEqual(expect.any(String))
     expect(registry.validateArguments("agent.plan", {
       ...proposal,
-      nodes: [{ ...proposal.nodes[0], templateId: "analyst" }],
+      nodes: [{ ...proposal.nodes[0], templateId: "analyst", verification: {
+        schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
+        criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }],
+      } }],
     }, "1")).toBe(true)
     for (const field of [
-      "taskId", "role", "taskType", "actions", "allowedActions", "permissions", "userId", "sessionId", "turnId",
+      "taskType", "actions", "allowedActions", "permissions", "userId", "sessionId", "turnId",
       "rootTaskId", "parentTaskId", "turnLeaseOwner", "turnLeaseVersion", "parentLeaseOwner", "parentAttemptCount",
       "remainingTurnSteps",
     ]) {
       expect(schema).not.toContain(`"${field}"`)
     }
+    const nodeVariants = (JSON.parse(schema) as {
+      properties?: { nodes?: { items?: { anyOf?: Array<{ properties?: Record<string, unknown> }>; properties?: Record<string, unknown> } } }
+    }).properties?.nodes?.items
+    const variants = nodeVariants?.anyOf ?? (nodeVariants ? [nodeVariants] : [])
+    expect(variants.length).toBeGreaterThan(0)
+    for (const variant of variants) expect(variant.properties).not.toHaveProperty("taskId")
   })
 
   it("accepts the maximum bounded proposal and rejects every over-limit field", () => {
@@ -124,6 +217,7 @@ describe("agent.plan tool executor", () => {
       key: String(index).padEnd(128, "k"), templateId: "scout", goal: "g".repeat(1200),
       successCriteria: Array.from({ length: 8 }, () => "c".repeat(320)),
       dependsOn: Array.from({ length: 8 }, (_, dep) => String(dep).padEnd(128, "d")),
+      verification: proposal.nodes[0].verification,
     })
     const bounded = { expectedRevision: Number.MAX_SAFE_INTEGER, nodes: Array.from({ length: 8 }, (_, index) => maxNode(index)) }
     expect(registry.validateArguments("agent.plan", bounded, "1")).toBe(true)
@@ -150,6 +244,7 @@ describe("agent.plan tool executor", () => {
         key: `node-${index}`.padEnd(128, "k"), templateId: "scout", goal: "g".repeat(1200),
         successCriteria: Array.from({ length: 8 }, () => "c".repeat(320)),
         dependsOn: Array.from({ length: 8 }, (_, dependency) => `dep-${dependency}`.padEnd(128, "d")),
+        verification: proposal.nodes[0].verification,
       })),
     }
     expect(new ToolRegistry([tool]).validateArguments("agent.plan", input, "1")).toBe(true)
