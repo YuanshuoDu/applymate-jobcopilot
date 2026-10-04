@@ -1152,17 +1152,45 @@ describe("createCanonicalTurnRuntime", () => {
     expect(sourceDigestLoader).toHaveBeenCalledWith(lease.userId, "job-1")
   })
 
-  it("keeps the optional terminal guard absent for an ordinary Turn", async () => {
-    let ordinaryTerminalGuard: Parameters<TurnEngineStoreFactory>[1] | "not-created" = "not-created"
+  it("rechecks durable graph verification atomically even when planning is disabled", async () => {
+    const roots = rootStore()
+    const terminalGuards: Array<Parameters<TurnEngineStoreFactory>[1]> = []
     const ordinaryStoreFactory: TurnEngineStoreFactory = (_pool, guard) => {
-      ordinaryTerminalGuard = guard
+      terminalGuards.push(guard)
       return store()
     }
-    const fixture = setup({ turnEngineStoreFactory: ordinaryStoreFactory })
+    const fixture = setup({ rootTaskStore: roots, turnEngineStoreFactory: ordinaryStoreFactory })
 
     await expect((await fixture.runtime).execute({ lease, signal: new AbortController().signal }))
       .resolves.toMatchObject({ status: "completed" })
-    expect(ordinaryTerminalGuard).toBeUndefined()
+    expect(terminalGuards[0]).toEqual(expect.any(Function))
+    const guard = terminalGuards[0]
+    if (typeof guard !== "function") throw new Error("terminal guard was not created")
+    const client = { query: vi.fn(async () => ({ rows: [], rowCount: 0 })) } as never
+    await expect(guard(client)).resolves.toEqual({ ok: true })
+    expect(roots.checkCompletion).toHaveBeenNthCalledWith(1, expect.objectContaining({ taskGraphVerification: true }))
+    expect(roots.checkCompletion).toHaveBeenNthCalledWith(2, expect.objectContaining({ taskGraphVerification: true, client }))
+  })
+
+  it("keeps selected-job finalization composed after the durable graph guard", async () => {
+    const roots = rootStore()
+    const planningTools = tools(true)
+    const terminalGuards: Array<Parameters<TurnEngineStoreFactory>[1]> = []
+    const fixture = setup({
+      productionFlags: resolveProductionAgentFlags({ ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1" }),
+      taskGraphCommandPort: { appendAndSchedule: vi.fn(async () => ({ status: "accepted", revision: 1, nodes: [], readyTaskIds: [] })), readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })) },
+      rootTaskStore: roots, selectedJobPreparationLoader: async () => ({ jobId: "job-1" }),
+      stateLoader: async () => ({ ...selectedJobState(), toolPolicySnapshot: {} }),
+      toolRuntimeFactory: () => ({ ...planningTools, registry: { ...planningTools.registry, register: vi.fn() } }),
+      turnEngineStoreFactory: (_pool: Parameters<TurnEngineStoreFactory>[0], guard: Parameters<TurnEngineStoreFactory>[1]) => { terminalGuards.push(guard); return store() },
+    })
+    await (await fixture.runtime).execute({ lease, signal: new AbortController().signal })
+    const guard = terminalGuards[0]
+    if (typeof guard !== "function") throw new Error("selected-job terminal guard was not created")
+    const client = { query: vi.fn(async () => ({ rows: [], rowCount: 0 })) } as never
+
+    await expect(guard(client)).resolves.toMatchObject({ ok: false, blocker: "selected_job_draft_review_required" })
+    expect(roots.checkCompletion).toHaveBeenLastCalledWith(expect.objectContaining({ taskGraphVerification: true, client }))
   })
 
   it("keeps selected-job completion behind the pending-child check", async () => {

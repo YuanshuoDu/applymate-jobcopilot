@@ -16,7 +16,10 @@ describe("loadScopedTaskGraphDependencyContext", () => {
       scope,
       "child-1",
       ["first", "second"],
-      [{ key: "first", taskId: "dependency-1" }, { key: "second", taskId: "dependency-2" }],
+      [
+        { key: "first", taskId: "dependency-1", templateId: "scout", goal: "find jobs", successCriteria: ["done"], dependsOn: [], depth: 1 },
+        { key: "second", taskId: "dependency-2", templateId: "analyst", goal: "score jobs", successCriteria: ["done"], dependsOn: [], depth: 1 },
+      ],
     )
 
     expect(loaded).toEqual({

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { describe, expect, it, vi } from "vitest"
 
 import { executeTools, recoverPersistedToolCalls } from "./turn-execution-tools.js"
@@ -76,6 +77,45 @@ describe("executeTools persisted replay", () => {
       store: {},
     } as unknown as TurnExecutionOptions
     return { options, executeTool, writer: new TurnExecutionEventWriter(options) }
+  }
+
+  const resumedCall = { id: "model-call-9", name: "jobs.search", arguments: { query: "Dublin" } }
+  const resumedOutput = { jobs: [{ id: "job-1" }] }
+
+  function childResumeReplayFixture(overrides: { id?: string; content?: Record<string, unknown>; attemptCount?: number } = {}) {
+    const executeTool = vi.fn()
+    const createdItems: Array<Record<string, unknown>> = []
+    const updates: Array<Record<string, unknown>> = []
+    const events: Array<{ type: string; payload: unknown }> = []
+    const options = {
+      identity: { kind: "task", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "child-1", rootTaskId: "root-1", ownerId: "worker-2", attemptCount: overrides.attemptCount ?? 3, leaseExpiresAt: new Date("2026-09-10T00:00:00.000Z") },
+      scope: { userId: "user-1" },
+      snapshot: {
+        system: [], profile: [], steerHistory: [], businessRefs: [],
+        toolObservations: [{ id: overrides.id ?? "child-resume:source-result-1", content: {
+          toolCallId: resumedCall.id, toolName: resumedCall.name, input: resumedCall.arguments, status: "completed", output: resumedOutput, errorCode: null,
+          ...overrides.content,
+        } }],
+      },
+      executeTool,
+      idFactory: (prefix: string) => `${prefix}:attempt:${overrides.attemptCount ?? 3}`,
+      signal: new AbortController().signal,
+      store: {
+        createItem: async (input: Record<string, unknown>) => { createdItems.push(input); return { id: String(input.itemId), revision: 0 } },
+        updateItem: async (input: Record<string, unknown>) => { updates.push(input); return { id: String(input.itemId), revision: Number(input.expectedRevision) + 1 } },
+        appendEvent: async (input: { type: string; payload: unknown }) => { events.push(input); return { id: `event-${events.length}` } },
+      },
+    } as unknown as TurnExecutionOptions
+    return { options, executeTool, createdItems, updates, events, writer: new TurnExecutionEventWriter(options) }
+  }
+
+  async function replayChildResume(fixture: ReturnType<typeof childResumeReplayFixture>, modelCall = resumedCall, stepId = "step-attempt-3", onCallPersisted = vi.fn()) {
+    return executeTools(
+      fixture.options, fixture.writer, { id: stepId, ordinal: 0 },
+      { text: "", reasoningSummary: "", toolCalls: [modelCall], provider: "fixture", model: "fixture-model", finishReason: "tool_calls", usage: null, continuation: null },
+      fixture.options.snapshot, new Set(), fixture.options.signal!,
+      () => new Date("2026-09-09T00:00:00.000Z"), undefined, onCallPersisted,
+    )
   }
 
   async function replay(fixture: ReturnType<typeof replayFixture>, modelCall = call) {
@@ -229,6 +269,74 @@ describe("executeTools persisted replay", () => {
 
     expect(result.wait).toBeNull()
     expect(result.snapshot).toBe(fixture.options.snapshot)
+    expect(fixture.executeTool).not.toHaveBeenCalled()
+  })
+
+  it("persists an attempt-scoped receipt and exact resume link without re-executing the tool", async () => {
+    const fixture = childResumeReplayFixture()
+    const onCallPersisted = vi.fn()
+
+    const result = await replayChildResume(fixture, resumedCall, "step-attempt-3", onCallPersisted)
+
+    const replayToolCallId = String((fixture.createdItems[0]?.content as Record<string, unknown>).toolCallId)
+    const expectedId = `task-graph-replay-v1:${createHash("sha256").update(JSON.stringify(["step-attempt-3", resumedCall.id])).digest("hex")}`
+    expect(replayToolCallId).toBe(expectedId)
+    expect(replayToolCallId).not.toBe(resumedCall.id)
+    expect(fixture.createdItems.map(item => [item.type, item.stepId])).toEqual([["tool_call", "step-attempt-3"], ["tool_result", "step-attempt-3"]])
+    expect(fixture.createdItems.map(item => (item.content as Record<string, unknown>).toolCallId)).toEqual([expectedId, expectedId])
+    expect(fixture.updates.map(item => [item.status, item.content])).toEqual([
+      ["completed", { toolCallId: expectedId, toolName: resumedCall.name, toolVersion: "1", status: "completed", errorCode: null, input: resumedCall.arguments }],
+      ["completed", { toolCallId: expectedId, output: resumedOutput, errorCode: null }],
+    ])
+    const started = fixture.events.find(event => event.type === "tool_call.started")
+    const terminal = fixture.events.find(event => event.type === "tool_call.completed")
+    const expectedSource = { toolCallId: resumedCall.id, resultItemId: "source-result-1" }
+    expect((started?.payload as Record<string, unknown>).replaySource).toEqual(expectedSource)
+    expect((terminal?.payload as Record<string, unknown>).replaySource).toEqual(expectedSource)
+    expect(fixture.executeTool).not.toHaveBeenCalled()
+    expect(onCallPersisted).toHaveBeenCalledTimes(1)
+    expect(result.wait).toBeNull()
+  })
+
+  it("persists the exact failed result code without exception prose", async () => {
+    const fixture = childResumeReplayFixture({ content: { status: "failed", errorCode: "tool_execution_failed" } })
+
+    await replayChildResume(fixture)
+
+    expect(fixture.events.find(event => event.type === "tool_call.failed")?.payload).toMatchObject({ status: "failed", errorCode: "tool_execution_failed" })
+    expect(fixture.updates[0]?.content).toMatchObject({ status: "failed", errorCode: "tool_execution_failed" })
+    expect(JSON.stringify(fixture.createdItems.concat(fixture.updates))).not.toContain("Error:")
+    expect(fixture.executeTool).not.toHaveBeenCalled()
+  })
+
+  it("rejects exception prose instead of persisting it as a result error", async () => {
+    const fixture = childResumeReplayFixture({ content: { status: "failed", errorCode: "Error: refresh token expired" } })
+
+    await expect(replayChildResume(fixture)).rejects.toMatchObject({ code: "invalid_output" })
+
+    expect(fixture.createdItems).toHaveLength(0)
+    expect(fixture.events).toHaveLength(0)
+    expect(fixture.executeTool).not.toHaveBeenCalled()
+  })
+
+  it("rejects a mismatched resumed input without persisting or executing it", async () => {
+    const fixture = childResumeReplayFixture()
+    const mismatchedCall = { ...resumedCall, arguments: { query: "Amsterdam" } }
+
+    await expect(replayChildResume(fixture, mismatchedCall)).rejects.toMatchObject({ code: "invalid_output" })
+
+    expect(fixture.createdItems).toHaveLength(0)
+    expect(fixture.events).toHaveLength(0)
+    expect(fixture.executeTool).not.toHaveBeenCalled()
+  })
+
+  it.each(["child-resume:", "child-resume", "child-resume: "])("rejects malformed child-resume ID %s", async id => {
+    const fixture = childResumeReplayFixture({ id })
+
+    await expect(replayChildResume(fixture)).rejects.toMatchObject({ code: "invalid_output" })
+
+    expect(fixture.createdItems).toHaveLength(0)
+    expect(fixture.events).toHaveLength(0)
     expect(fixture.executeTool).not.toHaveBeenCalled()
   })
 

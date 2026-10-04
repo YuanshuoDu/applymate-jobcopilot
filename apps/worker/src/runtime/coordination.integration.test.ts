@@ -17,6 +17,7 @@ import { consumeDurableWaitOutcomes } from "./subagents/durable-wait-consumer.js
 import { reconcileDurableWaits } from "./subagents/durable-wait-resolver.js"
 import { suspendAndReleaseWait } from "./subagents/durable-wait-handoff.js"
 import { createPgRootTaskStore } from "./subagents/root-task-store.js"
+import { taskGraphItemId } from "./subagents/task-graph-snapshot.js"
 import type {
   AtomicSubagentSpawnInput,
   AtomicSubagentSpawnResult,
@@ -172,6 +173,11 @@ class IntegrationPg {
     this.calls.push(sql)
     const trimmed = sql.trim()
     if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(trimmed) || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+    if (sql.includes('SELECT item."content" FROM "agent_items" AS item JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId" JOIN "agent_sessions" AS session ON session."id" = item."sessionId"')
+      && sql.includes('WHERE item."id" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4 AND item."type" =')
+      && sql.includes("'task_graph' AND turn.\"userId\" = $5 AND session.\"userId\" = $5")
+      && values[0] === taskGraphItemId(this.state.turn.rootTaskId) && values[1] === SESSION_ID && values[2] === TURN_ID
+      && values[3] === this.state.turn.rootTaskId && values[4] === USER_ID) return { rows: [], rowCount: 0 }
     if (sql.includes("SELECT session.\"userId\"") && sql.includes("FROM \"agent_sessions\" AS session") && sql.includes("FOR UPDATE")) return this.sessionRow()
     if (sql.includes("WHERE turn.\"status\" IN ('waiting_for_dependency', 'in_progress')")) return this.state.turn.status === "waiting_for_dependency" || this.state.turn.status === "in_progress" ? { rows: [this.turnRow()], rowCount: 1 } : { rows: [], rowCount: 0 }
     if (sql.includes('SELECT dispatch."id", dispatch."aggregateId", dispatch."payload", dispatch."attemptCount"') && sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes('JOIN "agent_sessions" AS session') && sql.includes('session."id" = dispatch."aggregateId"')) {

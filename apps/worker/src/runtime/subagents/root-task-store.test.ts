@@ -37,7 +37,7 @@ function fakePool(existing: Record<string, unknown> | null = null, updateCount =
   return { pool: { connect: vi.fn(async () => client) } as never, calls, client }
 }
 
-function completionPool(descendants: Array<Record<string, unknown>>, owned = true) {
+function completionPool(descendants: Array<Record<string, unknown>>, owned = true, hasTaskGraphProposal = false) {
   const calls: string[] = []
   const client = {
     query: vi.fn(async (sql: string) => {
@@ -46,11 +46,14 @@ function completionPool(descendants: Array<Record<string, unknown>>, owned = tru
       if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1" }], rowCount: 1 }
       if (sql.includes('SELECT "id", "rootTaskId" FROM "agent_turns"')) return owned ? { rows: [{ id: "turn-1", rootTaskId: "root-turn-1" }], rowCount: 1 } : { rows: [], rowCount: 0 }
       if (sql.includes('SELECT task."id", task."status"')) return { rows: descendants, rowCount: descendants.length }
+      if (sql.includes('SELECT 1 FROM "agent_events" AS event') && sql.includes("'proposal'")) {
+        return hasTaskGraphProposal ? { rows: [{}], rowCount: 1 } : { rows: [], rowCount: 0 }
+      }
       return { rows: [], rowCount: 1 }
     }),
     release: vi.fn(),
   }
-  return { pool: { connect: vi.fn(async () => client) } as never, calls }
+  return { pool: { connect: vi.fn(async () => client) } as never, calls, client }
 }
 
 function terminalPool(root: Record<string, unknown> | null) {
@@ -259,6 +262,47 @@ describe("createPgRootTaskStore", () => {
   it("allows completion when every descendant is terminal", async () => {
     const fake = completionPool(["completed", "failed", "interrupted", "cancelled", "closed"].map((status, index) => ({ id: `child-${index}`, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-turn-1", userId: lease.userId, status })))
     await expect(createPgRootTaskStore(fake.pool).checkCompletion!({ lease, rootTaskId: "root-turn-1" })).resolves.toEqual({ ok: true })
+  })
+
+  it("checks durable graph proof on the caller transaction without opening a nested transaction", async () => {
+    const fake = completionPool([])
+    const store = createPgRootTaskStore(fake.pool)
+    await expect(store.checkCompletion!({ lease, rootTaskId: "root-turn-1", taskGraphVerification: true, client: fake.client as never })).resolves.toEqual({ ok: true })
+    expect(fake.calls).not.toContain("BEGIN")
+    expect(fake.calls).not.toContain("COMMIT")
+    expect(fake.client.query.mock.calls.some(([sql]) => sql.includes('FROM "agent_items" AS item'))).toBe(true)
+    expect(fake.client.query.mock.calls.some(([sql]) => sql.includes("payload"))).toBe(true)
+  })
+
+  it("surfaces the recoverable TaskGraph blocker before a pending descendant blocker", async () => {
+    const fake = completionPool([{
+      id: "child-1", sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-turn-1", userId: lease.userId, status: "waiting",
+    }], true, true)
+    const store = createPgRootTaskStore(fake.pool)
+
+    await expect(store.checkCompletion!({ lease, rootTaskId: "root-turn-1", taskGraphVerification: true, client: fake.client as never }))
+      .resolves.toMatchObject({ ok: false, blocker: "task_graph_verification_unverified" })
+    expect(fake.calls.some(sql => sql.includes("'proposal'"))).toBe(true)
+  })
+
+  it("keeps the generic pending-descendant blocker when TaskGraph verification has no graph to block", async () => {
+    const fake = completionPool([{
+      id: "child-1", sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-turn-1", userId: lease.userId, status: "waiting",
+    }])
+    const store = createPgRootTaskStore(fake.pool)
+
+    await expect(store.checkCompletion!({ lease, rootTaskId: "root-turn-1", taskGraphVerification: true, client: fake.client as never }))
+      .resolves.toMatchObject({ ok: false, blocker: "child_tasks_pending" })
+  })
+
+  it.each(["queued", "retrying", "running", "waiting_for_user"])("keeps the child blocker ahead of TaskGraph recovery for %s descendants", async (status) => {
+    const fake = completionPool([{
+      id: "child-1", sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: "root-turn-1", userId: lease.userId, status,
+    }], true, true)
+    const store = createPgRootTaskStore(fake.pool)
+
+    await expect(store.checkCompletion!({ lease, rootTaskId: "root-turn-1", taskGraphVerification: true, client: fake.client as never }))
+      .resolves.toMatchObject({ ok: false, blocker: "child_tasks_pending" })
   })
 
   it("fails closed for a stale owner or foreign descendant row", async () => {

@@ -6,13 +6,14 @@ import type { PgSubagentPool, SubagentTaskRecord, SubagentTaskStatus } from "./t
 import { rootTaskStatusFromTurnResult } from "./root-task-status.js"
 import { parseInteractiveDiscoveryShortlist, type InteractiveDiscoveryShortlistProjection } from "../interactive-discovery-contract.js"
 import { parseTerminalRootResult, type RootTaskTerminalReconciliation } from "./root-task-terminal-result.js"
+import { checkTaskGraphTerminalVerification } from "../turns/turn-execution-completion-gate.js"
 
 export type RootTaskReconciliation = RootTaskTerminalReconciliation
 export type RootTaskFinishMetadata = Readonly<{ interactiveDiscoveryShortlist: InteractiveDiscoveryShortlistProjection }>
 export type RootTaskStore = {
   ensure(input: { lease: TurnLease; goal: string; modelProfileSnapshot?: unknown; toolPolicySnapshot?: unknown; budgetSnapshot?: unknown; allowedActions?: readonly string[]; now?: Date }): Promise<SubagentTaskRecord>
   reconcileTerminal?(input: { lease: TurnLease; now?: Date }): Promise<RootTaskReconciliation | null>
-  checkCompletion?(input: { lease: TurnLease; rootTaskId: string; now?: Date }): Promise<TurnEngineCompletionGateResult>
+  checkCompletion?(input: { lease: TurnLease; rootTaskId: string; now?: Date; taskGraphVerification?: boolean; client?: pg.PoolClient }): Promise<TurnEngineCompletionGateResult>
   finish(input: { lease: TurnLease; rootTaskId: string; result: TurnEngineResult; metadata?: RootTaskFinishMetadata; now?: Date }): Promise<void>
 }
 type Row = Record<string, unknown>
@@ -31,7 +32,9 @@ function containsSecret(value: unknown): boolean {
   return Object.entries(value).some(([key, child]) => /api.?key|secret|password|(?:access|refresh).?token|authorization/i.test(key) || containsSecret(child))
 }
 function record(value: unknown): Record<string, unknown> {
-  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
+  let parsed = value
+  if (typeof parsed === "string") { try { parsed = JSON.parse(parsed) as unknown } catch { return {} } }
+  return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {}
 }
 function date(value: unknown): Date | null {
   if (!value) return null
@@ -78,7 +81,6 @@ const SELECT_ROOT = `SELECT task.*, session."userId" AS "userId"
   WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3`
 
 const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "interrupted", "cancelled", "closed"])
-
 function completionBlocker(rows: readonly Row[]): TurnEngineCompletionGateResult {
   const pending = rows.filter(row => !TERMINAL_TASK_STATUSES.has(String(row.status)))
   if (pending.length === 0) return { ok: true }
@@ -142,7 +144,8 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
     },
     async checkCompletion(input): Promise<TurnEngineCompletionGateResult> {
       const now = input.now ?? new Date()
-      return transaction(pool, input.lease.userId, async (client) => {
+      const work = async (client: pg.PoolClient): Promise<TurnEngineCompletionGateResult> => {
+        await client.query("SELECT set_config($1, $2, true)", ["app.user_id", input.lease.userId])
         await lockOpenSession(client, input.lease)
         const turn = await client.query<Row>(
           `SELECT "id", "rootTaskId" FROM "agent_turns"
@@ -161,8 +164,14 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
           [input.lease.sessionId, input.lease.turnId, input.rootTaskId, input.lease.userId],
         )
         for (const row of descendants.rows) if (String(row.sessionId) !== input.lease.sessionId || String(row.turnId) !== input.lease.turnId || String(row.rootTaskId) !== input.rootTaskId || String(row.userId) !== input.lease.userId) throw new Error("root_task_fenced")
-        return completionBlocker(descendants.rows)
-      })
+        const children = completionBlocker(descendants.rows)
+        if (input.taskGraphVerification && (children.ok || descendants.rows.every(row => row.status === "waiting"))) {
+          const graph = await checkTaskGraphTerminalVerification(client, input.lease, input.rootTaskId)
+          if (!graph.ok) return graph
+        }
+        return children
+      }
+      return input.client ? work(input.client) : transaction(pool, input.lease.userId, work)
     },
     async finish(input): Promise<void> {
       const now = input.now ?? new Date()

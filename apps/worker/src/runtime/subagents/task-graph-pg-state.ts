@@ -1,9 +1,10 @@
 import type pg from "pg"
 import { redactSensitiveText } from "@jobcopilot/shared"
 import { deriveTaskGraphReadModel, type TaskGraphEvent } from "../planning/task-graph.js"
-import type { TaskGraphCurrentNode, TaskGraphCurrentState, TaskGraphReadScope } from "./task-graph-command-port.js"
+import { parseTaskGraphRepairReceipt, parseTaskGraphVerificationReport, taskGraphVerificationReportMatchesStatus, type TaskGraphCurrentNode, type TaskGraphCurrentState, type TaskGraphReadScope } from "./task-graph-command-port.js"
 import { parseTaskGraphSnapshot, taskGraphItemId, taskGraphState, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { parsePersistedTaskGraphReceipt } from "./task-graph-pg-event-validation.js"
+import { resolveTaskGraphRepairDependencies } from "./task-graph-dependency-context.js"
 import {
   projectTaskGraphResult,
   taskGraphResultProjectionBytes,
@@ -20,6 +21,7 @@ export type GraphParent = Record<string, unknown>
 export type GraphItem = Readonly<{ id: string; revision: number; content: unknown; createdAt: unknown }>
 export type GraphTaskRow = Readonly<{ id: string; status: SubagentTaskStatus; role: string; failureReason: string | null; result: unknown }>
 export type LoadedGraph = Readonly<{
+  rootTaskId: string
   snapshot: TaskGraphSnapshot | null
   item: GraphItem | null
   state: ReturnType<typeof taskGraphState> | null
@@ -97,7 +99,7 @@ export async function loadTaskGraph(client: Queryable, scope: GraphIdentityScope
     WHERE item."id" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4
       AND item."type" = 'task_graph' AND turn."userId" = $5 AND session."userId" = $5${forUpdate ? " FOR UPDATE OF item" : ""}`,
   [taskGraphItemId(scope.parentTaskId), scope.sessionId, scope.turnId, scope.parentTaskId, scope.userId])
-  if (!item.rows[0]) return { item: null, snapshot: null, state: null, tasks: new Map() }
+  if (!item.rows[0]) return { rootTaskId: scope.rootTaskId, item: null, snapshot: null, state: null, tasks: new Map() }
   const stored = item.rows[0] as Record<string, unknown>
   const snapshot = parseTaskGraphSnapshot(stored.content)
   const revision = Number(stored.revision)
@@ -128,8 +130,10 @@ export async function loadTaskGraph(client: Queryable, scope: GraphIdentityScope
     const event = parsePersistedTaskGraphReceipt(row.type, row.payload, { id: String(stored.id), revision }, snapshot, scope)
     if (event) appliedEvents.push(event)
   }
-  const state = taskGraphState(snapshot, revision, new Map([...tasks].map(([id, task]) => [id, { status: task.status, failureReason: task.failureReason }])), appliedEvents)
-  return { item: { id: String(stored.id), revision, content: stored.content, createdAt: stored.createdAt }, snapshot, state, tasks }
+  const baseState = taskGraphState(snapshot, revision, new Map([...tasks].map(([id, task]) => [id, { status: task.status, failureReason: task.failureReason }])), appliedEvents)
+  const repairs = resolveTaskGraphRepairDependencies(snapshot, tasks, scope.rootTaskId)
+  const state = { ...baseState, repairSatisfiedNodeKeys: repairs.satisfied, repairPendingNodeKeys: repairs.pending }
+  return { rootTaskId: scope.rootTaskId, item: { id: String(stored.id), revision, content: stored.content, createdAt: stored.createdAt }, snapshot, state, tasks }
 }
 
 /** Uses the durable proposal receipt to distinguish graph children from legacy tasks sharing a root. */
@@ -169,7 +173,25 @@ export function currentTaskGraph(loaded: LoadedGraph): TaskGraphCurrentState {
   let projectionItems = 0
   const nodes: TaskGraphCurrentNode[] = read.map(node => {
     const task = taskByKey.get(node.key)!
-    const proposedProjection = projectTaskGraphResult(task.role, task.status, task.result)
+    const stored = loaded.snapshot!.nodes.find(candidate => candidate.key === node.key)!
+    const verificationCriterionIds = stored.verificationDisposition === "typed" && stored.verification
+      ? stored.verification.criteria.map(criterion => criterion.id) : undefined
+    const taskResult = parseObject(task.result)
+    const hasReport = Boolean(taskResult && Object.hasOwn(taskResult, "taskGraphVerificationReport"))
+    const verificationReport = verificationCriterionIds
+      ? parseTaskGraphVerificationReport(taskResult?.taskGraphVerificationReport, verificationCriterionIds) : undefined
+    const repairOf = stored.repairOf?.graphRootTaskId === loaded.rootTaskId ? stored.repairOf : undefined
+    const hasReceipt = Boolean(taskResult && Object.hasOwn(taskResult, "taskGraphRepairReceipt"))
+    const repairReceipt = parseTaskGraphRepairReceipt(taskResult?.taskGraphRepairReceipt, {
+      repairOf, repairNodeKey: stored.key, repairTaskId: stored.taskId, report: verificationReport,
+    })
+    if (hasReport && (!verificationReport || !taskGraphVerificationReportMatchesStatus(verificationReport, task.status)
+      || verificationReport.reasonCode === "repair_target_unresolved" && !repairOf)
+      || stored.verificationDisposition === "typed" && (task.status === "completed" || task.status === "failed") && !verificationReport
+      || hasReceipt && !repairReceipt
+      || stored.repairOf && task.status === "completed" && verificationReport?.status === "passed" && !repairReceipt) throw new Error("task_graph_verification_report_invalid")
+    const projectionSource = taskGraphProjectionSource(task.result, taskResult, Boolean(verificationReport), Boolean(repairReceipt))
+    const proposedProjection = projectTaskGraphResult(task.role, task.status, projectionSource)
     const bytes = taskGraphResultProjectionBytes(proposedProjection)
     const items = taskGraphResultProjectionItemCount(proposedProjection)
     const projectionFits = projectionBytes + bytes <= TASK_GRAPH_RESULT_PROJECTION_TOTAL_BYTE_LIMIT
@@ -181,13 +203,31 @@ export function currentTaskGraph(loaded: LoadedGraph): TaskGraphCurrentState {
     }
     return {
       key: node.key, templateId: node.templateId, goal: node.goal, successCriteria: node.successCriteria,
-      dependsOn: node.dependsOn, taskId: loaded.snapshot!.nodes.find(stored => stored.key === node.key)!.taskId,
+      dependsOn: node.dependsOn, taskId: stored.taskId,
       status: task.status, readiness: node.readiness, resultSummary: resultSummary(task.result),
       resultProjection,
+      ...(verificationCriterionIds ? { verificationCriterionIds } : {}),
+      ...(verificationReport ? { verificationReport } : {}),
+      ...(repairOf ? { repairOf } : {}), ...(repairReceipt ? { repairReceipt } : {}),
       failureReason: safeText(task.failureReason, 500),
     }
   })
   return { revision: loaded.state.revision, nodes }
+}
+
+function taskGraphProjectionSource(
+  original: unknown,
+  result: Record<string, unknown> | null,
+  hasValidatedReport: boolean,
+  hasValidatedReceipt: boolean,
+): unknown {
+  if (!result || (!hasValidatedReport && !hasValidatedReceipt)) return original
+  const copy = Object.create(Object.getPrototypeOf(result)) as Record<PropertyKey, unknown>
+  for (const key of Reflect.ownKeys(result)) {
+    if ((hasValidatedReport && key === "taskGraphVerificationReport") || (hasValidatedReceipt && key === "taskGraphRepairReceipt")) continue
+    Object.defineProperty(copy, key, Object.getOwnPropertyDescriptor(result, key)!)
+  }
+  return copy
 }
 
 function resultSummary(value: unknown): string | null {

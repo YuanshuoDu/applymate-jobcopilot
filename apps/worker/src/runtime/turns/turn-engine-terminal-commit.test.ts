@@ -308,6 +308,16 @@ describe("atomic Turn terminal commit", () => {
     expect(fake.calls.some(({ sql }) => sql === "ROLLBACK")).toBe(true)
   })
 
+  it("surfaces a TaskGraph race denial as a same-Turn recovery receipt", async () => {
+    const fake = makePool()
+    const guard = vi.fn(async () => ({ ok: false as const, blocker: "task_graph_verification_unverified", feedback: "TaskGraph criteria remain unresolved." }))
+    await expect(commitTurnTerminal(fake.pool, input, guard)).rejects.toMatchObject({
+      name: "TaskGraphVerificationRecovery", blocker: "task_graph_verification_unverified", feedback: "TaskGraph criteria remain unresolved.",
+    })
+    expect(fake.calls.some(({ sql }) => /INSERT INTO "agent_(items|events|outbox)"|UPDATE "(sub_agent_tasks|agent_turns)"/.test(sql))).toBe(false)
+    expect(fake.calls.some(({ sql }) => sql === "ROLLBACK")).toBe(true)
+  })
+
   it("does not let another user's session follow-up gate or cross the owner fence", async () => {
     const otherSession = makePool([{ id: "foreign-input", sessionId: "session-other", userId: "user-other", turnId: "turn-other" }])
     await expect(commitTurnTerminal(otherSession.pool, input)).resolves.toMatchObject({ status: "completed", finalItemId: input.finalItemId })

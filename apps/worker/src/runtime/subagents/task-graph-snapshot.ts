@@ -1,11 +1,18 @@
 import { createHash } from "node:crypto"
-import { TASK_GRAPH_LIMITS, type TaskGraphEvent, type TaskGraphNodeProposal, type TaskGraphState } from "../planning/task-graph.js"
+import { isValidTaskGraphRepairRelation, TASK_GRAPH_LIMITS, type TaskGraphEvent, type TaskGraphNodeProposal, type TaskGraphRepairOf, type TaskGraphState, type TaskGraphVerificationDisposition } from "../planning/task-graph.js"
+import { taskGraphVerificationRole, validateTaskGraphVerificationContract, type TaskGraphVerificationContract } from "../planning/task-graph-verification.js"
 import type { SubagentTaskStatus } from "./types.js"
 
 export const TASK_GRAPH_ITEM_TYPE = "task_graph"
 export const TASK_GRAPH_SNAPSHOT_VERSION = "agent-harness.v2.task-graph"
 
-export type StoredTaskGraphNode = TaskGraphNodeProposal & Readonly<{ depth: number; taskId: string }>
+export type { TaskGraphVerificationDisposition } from "../planning/task-graph.js"
+export type StoredTaskGraphNode = TaskGraphNodeProposal & Readonly<{
+  depth: number
+  taskId: string
+  verification?: TaskGraphVerificationContract
+  verificationDisposition?: TaskGraphVerificationDisposition
+}>
 export type TaskGraphSnapshot = Readonly<{
   schemaVersion: typeof TASK_GRAPH_SNAPSHOT_VERSION
   nodes: readonly StoredTaskGraphNode[]
@@ -21,6 +28,11 @@ const MAX_CRITERIA = TASK_GRAPH_LIMITS.maxSuccessCriteria
 const MAX_CRITERION_LENGTH = TASK_GRAPH_LIMITS.maxCriterionLength
 const MAX_DEPENDENCIES = TASK_GRAPH_LIMITS.maxDependencies
 const MAX_TASK_ID_LENGTH = TASK_GRAPH_LIMITS.maxKeyLength
+const LEGACY_NODE_KEYS = "dependsOn,depth,goal,key,successCriteria,taskId,templateId"
+const NODE_KEYS_WITH_DISPOSITION = `${LEGACY_NODE_KEYS},verificationDisposition`
+const NODE_KEYS_WITH_VERIFICATION = `${LEGACY_NODE_KEYS},verification,verificationDisposition`
+const NODE_KEYS_WITH_REPAIR = "dependsOn,depth,goal,key,repairOf,successCriteria,taskId,templateId,verification,verificationDisposition"
+const SPECIALIZED_TEMPLATE_IDS = new Set(["cover_letter_writer", "cover_letter_reviewer"])
 
 const TASK_STATUSES = new Set<SubagentTaskStatus>([
   "queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed",
@@ -54,6 +66,13 @@ function stringList(value: unknown, maxItems: number, maxLength: number, allowEm
   }
   return true
 }
+function parsedRepairOf(value: unknown): TaskGraphRepairOf | undefined {
+  const row = object(value)
+  if (!row || !exactKeys(row, "criterionIds,graphRootTaskId,nodeKey,taskId")
+    || !text(row.graphRootTaskId, MAX_KEY_LENGTH) || !text(row.nodeKey, MAX_KEY_LENGTH) || !text(row.taskId, MAX_TASK_ID_LENGTH)
+    || !stringList(row.criterionIds, MAX_CRITERIA, 64, false) || new Set(row.criterionIds).size !== row.criterionIds.length) return undefined
+  return { graphRootTaskId: row.graphRootTaskId, nodeKey: row.nodeKey, taskId: row.taskId, criterionIds: [...row.criterionIds] }
+}
 
 export function parseTaskGraphSnapshot(value: unknown): TaskGraphSnapshot {
   const row = object(value)
@@ -64,18 +83,50 @@ export function parseTaskGraphSnapshot(value: unknown): TaskGraphSnapshot {
   const nodes: StoredTaskGraphNode[] = []
   for (const value of row.nodes) {
     const node = object(value)
-    if (!node || !exactKeys(node, "dependsOn,depth,goal,key,successCriteria,taskId,templateId")
+    const oldShape = node !== null && exactKeys(node, LEGACY_NODE_KEYS)
+    const dispositionShape = node !== null && exactKeys(node, NODE_KEYS_WITH_DISPOSITION)
+    const verificationShape = node !== null && exactKeys(node, NODE_KEYS_WITH_VERIFICATION)
+    const repairShape = node !== null && exactKeys(node, NODE_KEYS_WITH_REPAIR)
+    if (!node || (!oldShape && !dispositionShape && !verificationShape && !repairShape)
       || !text(node.key, MAX_KEY_LENGTH) || !text(node.templateId, MAX_TEMPLATE_ID_LENGTH)
       || !text(node.goal, MAX_GOAL_LENGTH) || !text(node.taskId, MAX_TASK_ID_LENGTH)
       || !stringList(node.successCriteria, MAX_CRITERIA, MAX_CRITERION_LENGTH, false)
       || !stringList(node.dependsOn, MAX_DEPENDENCIES, MAX_KEY_LENGTH, true)
       || !Number.isSafeInteger(node.depth) || Number(node.depth) < 1 || Number(node.depth) > MAX_DEPTH) throw new Error("task_graph_snapshot_invalid")
+    const hasVerification = Object.hasOwn(node, "verification")
+    const hasRepair = Object.hasOwn(node, "repairOf")
+    const hasDisposition = dispositionShape || verificationShape || repairShape
+    const declaredDisposition = hasDisposition ? node.verificationDisposition : undefined
+    const verificationDisposition = hasDisposition ? declaredDisposition : (hasVerification ? "typed" : "legacy_unverified")
+    if (verificationDisposition !== "typed" && verificationDisposition !== "legacy_unverified" && verificationDisposition !== "specialized") {
+      throw new Error("task_graph_snapshot_invalid")
+    }
+    let verification: TaskGraphVerificationContract | undefined
+    if (verificationDisposition === "typed") {
+      const parsed = validateTaskGraphVerificationContract(node.verification, node.templateId)
+      if (!hasVerification || !parsed.ok) throw new Error("task_graph_snapshot_verification_invalid")
+      verification = parsed.contract
+    } else if (verificationDisposition === "specialized") {
+      if (hasVerification || !SPECIALIZED_TEMPLATE_IDS.has(node.templateId)) throw new Error("task_graph_snapshot_verification_disposition_invalid")
+    } else if (hasVerification) {
+      throw new Error("task_graph_snapshot_verification_disposition_invalid")
+    }
+    const repairOf = hasRepair ? parsedRepairOf(node.repairOf) : undefined
+    if (hasRepair && !repairOf) throw new Error("task_graph_snapshot_repair_invalid")
     if (keys.has(node.key) || ids.has(node.taskId)) throw new Error("task_graph_snapshot_duplicate")
     keys.add(node.key); ids.add(node.taskId)
     nodes.push({
       key: node.key, templateId: node.templateId, goal: node.goal, successCriteria: node.successCriteria,
-      dependsOn: node.dependsOn, depth: Number(node.depth), taskId: node.taskId,
+      dependsOn: node.dependsOn, depth: Number(node.depth), taskId: node.taskId, verificationDisposition,
+      ...(verification ? { verification } : {}),
+      ...(repairOf ? { repairOf } : {}),
     })
+  }
+  const positions = new Map(nodes.map((node, index) => [node.key, index] as const))
+  for (const [index, node] of nodes.entries()) if (node.repairOf) {
+    const targetIndex = positions.get(node.repairOf.nodeKey)
+    const target = targetIndex === undefined ? undefined : nodes[targetIndex]
+    if (targetIndex === undefined || targetIndex >= index || !target || !isValidTaskGraphRepairRelation(node, target)) throw new Error("task_graph_snapshot_repair_invalid")
   }
   const indegree = new Map<string, number>(nodes.map(node => [node.key, 0] as const))
   const children = new Map(nodes.map(node => [node.key, [] as string[]] as const))
@@ -111,7 +162,13 @@ export function taskGraphSnapshot(state: TaskGraphState, taskIds: ReadonlyMap<st
       const taskId = taskIds.get(node.key)
       if (!taskId) throw new Error("task_graph_task_id_missing")
       const { status: _status, failureReason: _failureReason, ...stored } = node
-      return { ...stored, taskId }
+      const existingDisposition = node.verificationDisposition
+      const role = taskGraphVerificationRole(node.templateId)
+      if (!role && !SPECIALIZED_TEMPLATE_IDS.has(node.templateId) && existingDisposition !== "legacy_unverified") {
+        throw new Error("task_graph_snapshot_template_unsupported")
+      }
+      const verificationDisposition = existingDisposition ?? (node.verification ? "typed" : role ? "legacy_unverified" : "specialized")
+      return { ...stored, taskId, verificationDisposition }
     }),
   }
   return parseTaskGraphSnapshot(snapshot)
@@ -145,8 +202,8 @@ export function taskGraphState(
   if (!Number.isSafeInteger(revision) || revision < 1) throw new Error("task_graph_revision_invalid")
   return {
     revision,
-    nodes: snapshot.nodes.map(({ taskId, ...node }) => {
-      const current = statuses.get(taskId)
+    nodes: snapshot.nodes.map(node => {
+      const current = statuses.get(node.taskId)
       if (!current || !TASK_STATUSES.has(current.status)) throw new Error("task_graph_task_missing")
       return { ...node, status: current.status, ...(current.failureReason ? { failureReason: current.failureReason } : {}) }
     }),

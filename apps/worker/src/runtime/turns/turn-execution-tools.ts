@@ -1,8 +1,9 @@
+import { createHash } from "node:crypto"
 import type { ModelStepResult } from "./turn-engine-model.js"
 import { findToolResultObservation, stableJson } from "./turn-engine-replay.js"
 import { toRepositoryJson, TurnEngineError, type TurnEngineResult, type TurnEngineStep, type ToolCallRecovery } from "./turn-engine-types.js"
 import { executeToolWithItems, persistRecoveredToolCall, TurnExecutionEventWriter } from "./turn-execution-events.js"
-import type { TurnExecutionOptions } from "./turn-execution-types.js"
+import { executionId, type TurnExecutionOptions } from "./turn-execution-types.js"
 import { assertExecutionAlive } from "./turn-engine-helpers.js"
 import type { StepContext } from "../context/step-context-builder.js"
 import type { SteeringMarkerPayload } from "../context/steering-marker.js"
@@ -10,6 +11,57 @@ import { isDurableWaitId } from "../tools/redaction.js"
 
 type MarkerState = { readonly active: readonly SteeringMarkerPayload[] } | undefined
 type ToolOutcome = { readonly wait: TurnEngineResult | null; readonly snapshot: TurnExecutionOptions["snapshot"]; readonly steeringMarkerState: MarkerState }
+const CHILD_RESUME_ID_PREFIX = "child-resume:"
+const REPLAY_TOOL_CALL_ID_PREFIX = "task-graph-replay-v1:"
+
+function childResumeSourceId(id: string): string | null {
+  if (!id.startsWith("child-resume")) return null
+  if (!id.startsWith(CHILD_RESUME_ID_PREFIX)) throw new TurnEngineError("invalid_output", "Child resume receipt ID is invalid")
+  const sourceId = id.slice(CHILD_RESUME_ID_PREFIX.length)
+  if (!sourceId || sourceId.trim() !== sourceId) throw new TurnEngineError("invalid_output", "Child resume receipt ID is invalid")
+  return sourceId
+}
+
+function replayCallId(stepId: string, modelCallId: string): string {
+  return `${REPLAY_TOOL_CALL_ID_PREFIX}${createHash("sha256").update(JSON.stringify([stepId, modelCallId])).digest("hex")}`
+}
+
+function replayItemId(options: TurnExecutionOptions, step: TurnEngineStep, type: "call" | "result", toolCallId: string): string {
+  const scoped = executionId(options.identity, `item:tool-${type}:${step.id}:${toolCallId}`)
+  return options.idFactory?.(scoped) ?? scoped
+}
+
+async function persistChildResumeReplay(
+  options: TurnExecutionOptions, writer: TurnExecutionEventWriter, step: TurnEngineStep, call: ModelStepResult["toolCalls"][number],
+  source: Record<string, unknown>, sourceResultItemId: string, now: () => Date, onCallPersisted: () => void,
+): Promise<void> {
+  if (source.status !== "completed" && source.status !== "failed") throw new TurnEngineError("invalid_output", "Child resume result status is invalid")
+  const errorCode = source.errorCode
+  if ((source.status === "completed" && errorCode !== null) || (source.status === "failed" && (typeof errorCode !== "string" || !/^[A-Za-z0-9_.:-]{1,128}$/.test(errorCode)))) throw new TurnEngineError("invalid_output", "Child resume result error is invalid")
+  if (!Object.prototype.hasOwnProperty.call(source, "input") || !Object.prototype.hasOwnProperty.call(source, "output")) throw new TurnEngineError("invalid_output", "Child resume result content is incomplete")
+  const toolCallId = replayCallId(step.id, call.id)
+  const toolVersion = "1"
+  const replaySource = { toolCallId: call.id, resultItemId: sourceResultItemId }
+  const input = toRepositoryJson(source.input)
+  const output = toRepositoryJson(source.output)
+  const callItem = await writer.startItem({
+    id: replayItemId(options, step, "call", toolCallId), stepId: step.id, type: "tool_call", phase: null,
+    content: { toolCallId, toolName: call.name, toolVersion, input }, now: now(),
+  })
+  onCallPersisted()
+  await writer.append("tool_call.started", toolCallId, callItem.id, {
+    toolCallId, toolName: call.name, toolVersion, taskId: options.identity.taskId, replaySource,
+  }, `tool-started:${toolCallId}`)
+  await writer.completeItem(callItem, { toolCallId, toolName: call.name, toolVersion, status: source.status, errorCode, input }, now(), `tool-call-completed:${toolCallId}`)
+  await writer.append(source.status === "completed" ? "tool_call.completed" : "tool_call.failed", toolCallId, callItem.id, {
+    toolCallId, toolName: call.name, toolVersion, status: source.status, errorCode, taskId: options.identity.taskId, replaySource,
+  }, `tool-finished:${toolCallId}`)
+  const resultContent = { toolCallId, output, errorCode }
+  const resultItem = await writer.startItem({
+    id: replayItemId(options, step, "result", toolCallId), stepId: step.id, type: "tool_result", phase: null, content: resultContent, now: now(),
+  })
+  await writer.completeItem(resultItem, resultContent, now(), `tool-result-completed:${toolCallId}`)
+}
 
 export function hasFreshSteering(context: StepContext, consumedInputIds: readonly string[]): boolean {
   if (context.steeringMarkerControl && (context.steeringMarkerControl.activeInputIds.length > 0 || context.steeringMarkerControl.newlyObservedInputIds.length > 0)) return true
@@ -40,13 +92,28 @@ export async function executeTools(
     assertExecutionAlive(options, signal)
     if (seen.has(call.id)) throw new TurnEngineError("invalid_output", `Tool call ${call.id} was repeated in the Turn`)
     seen.add(call.id)
+    const replayEntries = snapshot.toolObservations.filter(observation => {
+      if (!observation.content || typeof observation.content !== "object" || Array.isArray(observation.content)) return false
+      return (observation.content as Record<string, unknown>).toolCallId === call.id
+    })
+    const replayEntry = replayEntries[0]
+    const matchingResumeEntries = replayEntries.filter(observation => observation.id.startsWith("child-resume"))
+    if (matchingResumeEntries.length > 0 && (matchingResumeEntries.length !== 1 || replayEntries.length !== 1)) throw new TurnEngineError("invalid_output", "Child resume receipt is ambiguous")
+    const sourceResultItemId = replayEntry ? childResumeSourceId(replayEntry.id) : null
     const replayed = findToolResultObservation(snapshot, call.id)
     if (replayed) {
       if (replayed.toolName !== call.name || stableJson(replayed.input) !== stableJson(call.arguments)) throw new TurnEngineError("invalid_output", `Tool call ${call.id} does not match its persisted replay record`)
+      if (sourceResultItemId) {
+        if (!replayEntry || !replayEntry.content || typeof replayEntry.content !== "object" || Array.isArray(replayEntry.content)) {
+          throw new TurnEngineError("invalid_output", "Child resume receipt is invalid")
+        }
+        await persistChildResumeReplay(options, writer, step, call, replayEntry.content as Record<string, unknown>, sourceResultItemId, now, onToolCallPersisted)
+      }
       const wait = dependencyWaitReceipt(replayed.status === "completed" ? replayed.output : null)
       if (wait && !hasResolvedWaitOutcome(snapshot, wait.waitId, replayed.input)) return { wait: { status: "waiting_for_dependency", waitId: wait.waitId, stepCount: 0, toolCallCount: 0 }, snapshot, steeringMarkerState: markerState }
       continue
     }
+    if (sourceResultItemId) throw new TurnEngineError("invalid_output", "Child resume receipt is invalid")
     const result = await executeToolWithItems(options, writer, step, call, now, onToolCallPersisted)
     assertExecutionAlive(options, signal)
     if (result.status === "failed" && result.errorCode === "policy_requires_approval") return { wait: { status: "waiting_for_approval", stepCount: 0, toolCallCount: 0, errorCode: result.errorCode }, snapshot, steeringMarkerState: markerState }

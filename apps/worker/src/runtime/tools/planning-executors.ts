@@ -1,7 +1,8 @@
-import { Type, type Static, type TSchema } from "@sinclair/typebox"
+import { Type, type TSchema } from "@sinclair/typebox"
 import { schemaVersion } from "@jobcopilot/agent-protocol"
 import { redactSensitiveText } from "@jobcopilot/shared"
 import { TASK_GRAPH_LIMITS, type TaskGraphProposal } from "../planning/task-graph.js"
+import { TASK_GRAPH_VERIFICATION_LIMITS, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, taskGraphVerificationRole, type TaskGraphVerificationRole } from "../planning/task-graph-verification.js"
 import type {
   TaskGraphCommandPort,
   TaskGraphExecutionScope,
@@ -11,26 +12,77 @@ import type {
 
 import { ToolExecutionError, type RuntimeToolDefinition, type ToolExecutionContext } from "./types.js"
 
-function proposalNodeSchema<T extends TSchema>(templateIdSchema: T) {
+function verificationCheckSchema(role: TaskGraphVerificationRole): TSchema {
+  const evidence = Type.Object({ kind: Type.Literal("evidence_count_gte"), minimum: Type.Integer({ minimum: 1, maximum: TASK_GRAPH_VERIFICATION_LIMITS.maxItems }) }, { additionalProperties: false })
+  const roleChecks: TSchema[] = role === "scout"
+    ? [
+      Type.Object({ kind: Type.Literal("candidate_count_gte"), minimum: Type.Integer({ minimum: 1, maximum: TASK_GRAPH_VERIFICATION_LIMITS.maxItems }) }, { additionalProperties: false }),
+      Type.Object({ kind: Type.Literal("all_candidates_have_evidence"), minimumItems: Type.Integer({ minimum: 1, maximum: TASK_GRAPH_VERIFICATION_LIMITS.maxItems }) }, { additionalProperties: false }),
+    ]
+    : [
+      Type.Object({ kind: Type.Literal("finding_count_gte"), minimum: Type.Integer({ minimum: 1, maximum: TASK_GRAPH_VERIFICATION_LIMITS.maxItems }) }, { additionalProperties: false }),
+      Type.Object({ kind: Type.Literal("all_findings_have_evidence"), minimumItems: Type.Integer({ minimum: 1, maximum: TASK_GRAPH_VERIFICATION_LIMITS.maxItems }) }, { additionalProperties: false }),
+      Type.Object({
+        kind: Type.Literal("reported_score_gte"), minimumScore: Type.Number({ minimum: 0, maximum: TASK_GRAPH_VERIFICATION_LIMITS.maxScore }),
+        minimumFindings: Type.Integer({ minimum: 1, maximum: TASK_GRAPH_VERIFICATION_LIMITS.maxItems }),
+        aggregation: Type.Union([Type.Literal("any"), Type.Literal("all")]),
+      }, { additionalProperties: false }),
+    ]
+  return Type.Union([evidence, ...roleChecks] as [TSchema, ...TSchema[]])
+}
+
+function verificationSchema(role: TaskGraphVerificationRole): TSchema {
   return Type.Object({
+    schemaVersion: Type.Literal(TASK_GRAPH_VERIFICATION_SCHEMA_VERSION),
+    role: Type.Literal(role),
+    criteria: Type.Array(Type.Object({
+      id: Type.String({ minLength: 1, maxLength: TASK_GRAPH_VERIFICATION_LIMITS.maxCriterionIdLength, pattern: "^[a-z][a-z0-9._-]{0,63}$" }),
+      check: verificationCheckSchema(role),
+    }, { additionalProperties: false }), { minItems: 1, maxItems: TASK_GRAPH_VERIFICATION_LIMITS.maxCriteria }),
+  }, { additionalProperties: false })
+}
+
+function repairOfSchema(): TSchema {
+  return Type.Object({
+    graphRootTaskId: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
+    nodeKey: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
+    taskId: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
+    criterionIds: Type.Array(Type.String({ minLength: 1, maxLength: TASK_GRAPH_VERIFICATION_LIMITS.maxCriterionIdLength, pattern: "^[a-z][a-z0-9._-]{0,63}$" }), { minItems: 1, maxItems: TASK_GRAPH_LIMITS.maxSuccessCriteria }),
+  }, { additionalProperties: false })
+}
+
+function proposalNodeSchema<T extends TSchema>(templateIdSchema: T, role?: TaskGraphVerificationRole, genericVerification = false) {
+  const properties = {
     key: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
     templateId: templateIdSchema,
     goal: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxGoalLength }),
     successCriteria: Type.Array(Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxCriterionLength }), { minItems: 1, maxItems: TASK_GRAPH_LIMITS.maxSuccessCriteria }),
     dependsOn: Type.Array(Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }), { maxItems: TASK_GRAPH_LIMITS.maxDependencies }),
-  }, { additionalProperties: false })
+  }
+  if (role) Object.assign(properties, { verification: verificationSchema(role) })
+  else if (genericVerification) Object.assign(properties, {
+    verification: Type.Optional(Type.Union([verificationSchema("scout"), verificationSchema("analyst")])),
+  })
+  if (role || genericVerification) Object.assign(properties, { repairOf: Type.Optional(repairOfSchema()) })
+  return Type.Object(properties, { additionalProperties: false })
 }
 
-function proposalInputSchema<T extends TSchema>(templateIdSchema: T) {
+function proposalInputSchema<T extends TSchema>(templateIdSchema: T, templates?: readonly (readonly [string, TaskGraphTaskTemplate])[]) {
+  const nodeSchemas: TSchema[] = templates ? templates.map(([templateId, template]) => {
+    const role = taskGraphVerificationRole(templateId)
+    if (role && template.role !== role) throw new Error("task_graph_verification_template_role_mismatch")
+    return proposalNodeSchema(Type.Literal(templateId), role)
+  }) : [proposalNodeSchema(templateIdSchema, undefined, true)]
+  const nodeSchema = nodeSchemas.length === 1 ? nodeSchemas[0]! : Type.Union(nodeSchemas as [TSchema, ...TSchema[]])
   return Type.Object({
     expectedRevision: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
-    nodes: Type.Array(proposalNodeSchema(templateIdSchema), { minItems: 1, maxItems: TASK_GRAPH_LIMITS.maxNodes }),
+    nodes: Type.Array(nodeSchema, { minItems: 1, maxItems: TASK_GRAPH_LIMITS.maxNodes }),
   }, { additionalProperties: false })
 }
 
 export const TaskGraphProposalInputSchema = proposalInputSchema(Type.String({ minLength: 1, maxLength: 128 }))
 
-export type TaskGraphProposalInput = Static<typeof TaskGraphProposalInputSchema>
+export type TaskGraphProposalInput = TaskGraphProposal
 
 export type PlanningExecutorOptions = Readonly<{
   commandPort: TaskGraphCommandPort
@@ -136,6 +188,8 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
           nodes: input.nodes.map(node => ({
             key: node.key, templateId: node.templateId, goal: node.goal,
             successCriteria: [...node.successCriteria], dependsOn: [...node.dependsOn],
+            ...(node.verification ? { verification: node.verification } : {}),
+            ...(node.repairOf ? { repairOf: { ...node.repairOf, criterionIds: [...node.repairOf.criterionIds] } } : {}),
           })),
         },
         templates: options.templates,
@@ -150,9 +204,9 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
     schemaVersion,
     name: "agent.plan",
     version: "1",
-    description: `For non-trivial goals, call agent.plan before executing child work, using registered templates, clear success criteria, and dependencies. Wait for children, inspect their evidence, then replan with agent.plan or complete the goal. This appends and durably schedules ready tasks.\nRegistered templates:\n${templateCatalog}`,
+    description: `For non-trivial goals, call agent.plan before executing child work. Scout and Analyst nodes must include verification {schemaVersion:"${TASK_GRAPH_VERIFICATION_SCHEMA_VERSION}",role,criteria:[{id,check}]}; IDs are stable lowercase identifiers. Allowed checks: candidate_count_gte, finding_count_gte, evidence_count_gte, all_candidates_have_evidence, all_findings_have_evidence, reported_score_gte. Use only checks allowed for that role. A repair uses repairOf={graphRootTaskId,nodeKey,taskId,criterionIds} for a prior typed same-template node, repeats exactly those criteria and checks, and must not add the target to dependsOn; this relation does not pass the target or alter its verdict. successCriteria prose is explanatory and never proof. reported_score_gte checks an Analyst-reported number, not its correctness. Writer and Reviewer nodes use their specialized gates and omit verification and repairOf. Wait for children, inspect their evidence, then replan or complete the goal.\nRegistered templates:\n${templateCatalog}`,
     capabilities: ["coordination"],
-    inputSchema: proposalInputSchema(templateIdSchema),
+    inputSchema: proposalInputSchema(templateIdSchema, templates),
     outputSchema: ReceiptSchema,
     risk: "internal_write",
     domain: "coordination",

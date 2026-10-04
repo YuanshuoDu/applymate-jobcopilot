@@ -1,5 +1,4 @@
 import type { ModelContinuation } from "@jobcopilot/agent-model"
-
 import { signalWasInterrupted } from "../interrupt/registry.js"
 import { BudgetExceededError, createTurnBudgetLedger, type TurnBudgetLimits } from "../budget.js"
 import { finalizeTurn, serializeFinalResponse } from "../finalizer.js"
@@ -7,10 +6,10 @@ import { NoProgressError, createProgressDetector } from "../progress.js"
 import { snapshotEvidence, verifyCandidateFinal } from "../verifier.js"
 import { buildModelRequest } from "./turn-engine-messages.js"
 import { runModelStep, type ModelStepResult } from "./turn-engine-model.js"
-import { TurnEngineError, toRepositoryJson, type TurnEngineResult, type TurnEngineStep } from "./turn-engine-types.js"
+import { TurnEngineError, toRepositoryJson, type AtomicTurnCompletionResult, type TurnEngineResult, type TurnEngineStep } from "./turn-engine-types.js"
 import { publishCommentary, publishFinalResponse, publishReasoningSummary, TurnExecutionEventWriter } from "./turn-execution-events.js"
 import { executionId, type TurnExecutionOptions } from "./turn-execution-types.js"
-import { assertCompletionAllowed } from "./turn-execution-completion-gate.js"
+import { assertCompletionAllowed, taskGraphGateRecovery } from "./turn-execution-completion-gate.js"
 import { assertExecutionAlive, assertModelAllowance, canEmitTurnCompleted, canPersistFinalResponse, makeExecutionId, resumedBudgetLimits, totalTurnUsage, turnErrorCode, updateExecutionStep, withRemainingTurnStepBudget } from "./turn-engine-helpers.js"
 import { STEERING_MARKER_EVENT_TYPE } from "../context/steering-marker.js"
 import { buildCognitiveActionAgenda } from "./cognitive-action-agenda.js"
@@ -18,6 +17,8 @@ import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE, cognitiveAgen
 import { executeTools, hasFreshSteering, recoverPersistedToolCalls, rememberSteeringMarkers } from "./turn-execution-tools.js"
 
 const DEFAULT_MAX_STEPS = 32
+
+function taskGraphRecoverySnapshot(snapshot: TurnExecutionOptions["snapshot"], stepId: string, feedback: string): TurnExecutionOptions["snapshot"] { return { ...snapshot, system: [...snapshot.system, { id: `task-graph-recovery:${stepId}`, content: `Durable TaskGraph verification blocked completion: ${feedback} Replan or repair the affected criteria, then verify again.` }] } }
 
 export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promise<TurnEngineResult> {
   const signal = options.signal ?? new AbortController().signal
@@ -159,7 +160,8 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           )
           throw new TurnEngineError(verification.code, verification.blocker)
         }
-        await assertCompletionAllowed(options, writer, step, signal, now)
+        const gateRecovery = await assertCompletionAllowed(options, writer, step, signal, now)
+        if (gateRecovery) { snapshot = taskGraphRecoverySnapshot(snapshot, step.id, gateRecovery.feedback); continuation = undefined; continue }
         const finalResponse = finalizeTurn({
           goal: options.goal, verification, terminalReason: "goal_satisfied", response: output.text,
           usage: totalTurnUsage(options.resume?.usage, budget.usage()), stepCount: steps, toolCallCount: toolCalls,
@@ -167,14 +169,18 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         if (canPersistFinalResponse(options)) {
           if (!options.store.recordFinalResponse) throw new TurnEngineError("persistence_conflict", "Atomic Turn completion is unavailable")
           const finalItemId = options.idFactory?.(executionId(options.identity, `item:final:${step.id}`)) ?? executionId(options.identity, `item:final:${step.id}`)
-          const terminal = await options.store.recordFinalResponse({
-            identity: options.identity, response: serializeFinalResponse(finalResponse), now: now(),
-            terminal: {
-              stepId: step.id, finalItemId,
-              finalContent: toRepositoryJson({ text: finalResponse.response, final: toRepositoryJson(finalResponse) }),
-              stepCount: steps, toolCallCount: toolCalls, usage: finalResponse.usage,
-            },
-          })
+          let terminal: void | AtomicTurnCompletionResult
+          try {
+            terminal = await options.store.recordFinalResponse({
+              identity: options.identity, response: serializeFinalResponse(finalResponse), now: now(),
+              terminal: { stepId: step.id, finalItemId, finalContent: toRepositoryJson({ text: finalResponse.response, final: toRepositoryJson(finalResponse) }), stepCount: steps, toolCallCount: toolCalls, usage: finalResponse.usage },
+            })
+          } catch (error: unknown) {
+            const recovery = taskGraphGateRecovery(error)
+            if (!recovery) throw error
+            await writer.append("final.rejected", step.id, null, { code: "business_precondition_failed", blocker: "task_graph_verification_unverified", feedback: recovery.feedback, taskId: options.identity.taskId }, `final-rejected:${step.id}:task-graph-race`)
+            snapshot = taskGraphRecoverySnapshot(snapshot, step.id, recovery.feedback); continuation = undefined; continue
+          }
           if (!terminal) throw new TurnEngineError("persistence_conflict", "Atomic Turn completion returned no receipt")
           for (const event of terminal.events) await Promise.resolve(options.subscribe?.(event)).catch(() => undefined)
           return { status: "completed", stepCount: steps, toolCallCount: toolCalls, finalItemId: terminal.finalItemId, finalText: output.text }
