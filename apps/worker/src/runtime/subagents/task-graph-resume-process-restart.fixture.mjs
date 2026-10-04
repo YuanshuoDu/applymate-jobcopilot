@@ -1,3 +1,4 @@
+import { errorMonitor } from "node:events"
 import { Worker } from "bullmq"
 import { Pool } from "pg"
 import { createCanonicalTurnRuntime } from "../canonical-turn-runtime.ts"
@@ -26,6 +27,8 @@ const discoveryFinalMarker = "p3-process-restart-discovery-shortlist-ready"
 const TASK_GRAPH_KEY_ALLOWLIST = new Set(["source", "summary", followUpKey])
 const CHILD_FAILURE_DIAGNOSTIC_CODES = new Set(["invalid_structured_result", "model_incomplete", "invalid_output", "tool_execution_failed", "timeout", "cancelled", "step_limit", "budget_exhausted", "no_progress", "evidence_missing", "evidence_conflict", "final_unverified", "child_turn_missing", "child_resume_unavailable", "child_resume_evidence_unavailable", "selected_job_sources_unavailable", "selected_job_context_unavailable", "subagent_role_unknown"])
 const CHILD_EXCEPTION_DIAGNOSTIC_NAMES = new Set(["Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "AbortError", "TimeoutError"])
+const TURN_WORKER_ERROR_DIAGNOSTIC_NAMES = new Set(["Error", "TypeError", "RangeError", "ReferenceError", "AbortError", "TimeoutError", "ConnectionError", "MaxRetriesPerRequestError", "ReplyError"])
+const TURN_WORKER_ERROR_DIAGNOSTIC_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "EAI_AGAIN", "ECONNABORTED", "NR_CLOSED"])
 const TURN_STATUS_ALLOWLIST = new Set(["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user", "completed", "interrupted", "failed", "cancelled"])
 const STEP_STATUS_ALLOWLIST = new Set(["completed", "failed", "interrupted", "waiting_for_tool", "waiting_for_approval", "waiting_for_user"])
 const ROOT_TASK_STATUS_ALLOWLIST = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
@@ -1661,23 +1664,37 @@ async function runDiscoverySecondWorker() {
   const workerLabel = ids.checkpointAfterWaitConsume === true ? "worker2" : "worker3"
   let turnWorkerDiagnosticCount = 0
   const boundedWorkerNumber = (value, maximum) => Number.isSafeInteger(value) && value >= 1 && value <= maximum ? value : null
+  const { turnJobId } = await import("../turns/recovery-scanner.ts")
+  const turnJobPrefix = turnJobId(ids.turnId, 0).slice(0, -1)
   const generationForJob = job => {
     const match = typeof job?.id === "string" ? /-(0|[1-9][0-9]*)$/.exec(job.id) : null
     if (!match) return null
     const generation = Number(match[1])
     return Number.isSafeInteger(generation) && generation >= 0 && generation <= 100_000 ? generation : null
   }
-  const observeTurnWorker = (event, job = null) => {
+  const observeTurnWorker = (event, source = null) => {
     try {
-      if (turnWorkerDiagnosticCount >= 8) return
-      if (event !== "observer_attached") {
-        const payload = record(job.data)
+      if (turnWorkerDiagnosticCount >= 16) return
+      let generation = null
+      let errorName = null
+      let errorCode = null
+      if (event === "stalled") {
+        if (typeof source !== "string" || !source.startsWith(turnJobPrefix)) return
+        generation = generationForJob({ id: source })
+        if (generation === null) return
+      } else if (event === "error") {
+        const name = source instanceof Error ? source.name : null
+        errorName = TURN_WORKER_ERROR_DIAGNOSTIC_NAMES.has(name) ? name : "other"
+        const code = record(source)?.code
+        errorCode = typeof code === "string" && TURN_WORKER_ERROR_DIAGNOSTIC_CODES.has(code) ? code : "other"
+      } else if (event !== "observer_attached") {
+        const payload = record(source?.data)
         if (payload?.turnId !== ids.turnId || payload.sessionId !== ids.sessionId) return
+        generation = generationForJob(source)
       }
       const workerState = turnWorker
       const opts = record(workerState?.opts) ?? {}
       const registrySize = bootstrap.turns?.active?.size
-      const generation = job ? generationForJob(job) : null
       const marker = {
         worker: workerLabel,
         event,
@@ -1688,6 +1705,8 @@ async function runDiscoverySecondWorker() {
         concurrency: boundedWorkerNumber(opts.concurrency, 64),
         activeRegistryCount: typeof registrySize === "number" && Number.isSafeInteger(registrySize) && registrySize >= 0 && registrySize <= 64 ? registrySize : null,
         generation,
+        errorName,
+        errorCode,
       }
       say("P3_DISCOVERY_TURN_WORKER " + JSON.stringify(marker))
       turnWorkerDiagnosticCount += 1
@@ -1700,6 +1719,11 @@ async function runDiscoverySecondWorker() {
     turnWorker.on("active", job => observeTurnWorker("active", job))
     turnWorker.on("completed", job => observeTurnWorker("completed", job))
     turnWorker.on("failed", job => observeTurnWorker("failed", job))
+    // Observe Worker errors without adding a consuming listener or changing BullMQ's default error handling.
+    turnWorker.on(errorMonitor, error => observeTurnWorker("error", error))
+    turnWorker.on("stalled", (jobId, previousState) => {
+      if (previousState === "active") observeTurnWorker("stalled", jobId)
+    })
   }
   say("P3_DISCOVERY_SECOND_WORKER_READY " + ownerId)
   await waitForStop()

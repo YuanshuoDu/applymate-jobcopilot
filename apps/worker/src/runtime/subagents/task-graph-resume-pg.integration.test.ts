@@ -2963,10 +2963,12 @@ const processRestartFixturePath = fileURLToPath(new URL("./task-graph-resume-pro
 const processRestartWorkerCwd = fileURLToPath(new URL("../../../", import.meta.url))
 const DISCOVERY_TURN_WORKER_MARKER = "P3_DISCOVERY_TURN_WORKER "
 const DISCOVERY_TURN_WORKER_NAMES = new Set(["worker2", "worker3"])
-const DISCOVERY_TURN_WORKER_EVENTS = new Set(["observer_attached", "active", "completed", "failed"])
+const DISCOVERY_TURN_WORKER_EVENTS = new Set(["observer_attached", "active", "completed", "failed", "error", "stalled"])
+const DISCOVERY_TURN_WORKER_ERROR_NAMES = new Set(["Error", "TypeError", "RangeError", "ReferenceError", "AbortError", "TimeoutError", "ConnectionError", "MaxRetriesPerRequestError", "ReplyError", "other"])
+const DISCOVERY_TURN_WORKER_ERROR_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "EAI_AGAIN", "ECONNABORTED", "NR_CLOSED", "other"])
 const DISCOVERY_TURN_WORKER_KEYS = new Set([
   "worker", "event", "isRunning", "isPaused", "stalledInterval", "lockDuration", "concurrency",
-  "activeRegistryCount", "generation",
+  "activeRegistryCount", "generation", "errorName", "errorCode",
 ])
 
 function boundedWorkerDiagnosticNumber(value: unknown, minimum: number, maximum: number): number | null {
@@ -2984,7 +2986,7 @@ function processDiscoveryTurnWorkerDiagnostics(
     let childCount = 0
     for (const line of child.output) {
       if (!line.startsWith(DISCOVERY_TURN_WORKER_MARKER)) continue
-      if (childCount >= 8 || projected.length >= 16) break
+      if (childCount >= 16 || projected.length >= 32) break
       try {
         const source = record(JSON.parse(line.slice(DISCOVERY_TURN_WORKER_MARKER.length)) as unknown)
         if (!source || Object.keys(source).length !== DISCOVERY_TURN_WORKER_KEYS.size
@@ -2992,6 +2994,9 @@ function processDiscoveryTurnWorkerDiagnostics(
         const worker = diagnosticEnum(source.worker, DISCOVERY_TURN_WORKER_NAMES)
         const event = diagnosticEnum(source.event, DISCOVERY_TURN_WORKER_EVENTS)
         if (worker !== expectedWorker || !event) continue
+        const errorName = source.errorName === null ? null : diagnosticEnum(source.errorName, DISCOVERY_TURN_WORKER_ERROR_NAMES)
+        const errorCode = source.errorCode === null ? null : diagnosticEnum(source.errorCode, DISCOVERY_TURN_WORKER_ERROR_CODES)
+        if (event === "error" ? !errorName || !errorCode : errorName !== null || errorCode !== null) continue
         const nullableBoolean = (value: unknown): boolean | null => typeof value === "boolean" ? value : null
         projected.push({
           worker,
@@ -3003,6 +3008,8 @@ function processDiscoveryTurnWorkerDiagnostics(
           concurrency: boundedWorkerDiagnosticNumber(source.concurrency, 1, 64),
           activeRegistryCount: boundedWorkerDiagnosticNumber(source.activeRegistryCount, 0, 64),
           generation: boundedWorkerDiagnosticNumber(source.generation, 0, 100_000),
+          errorName,
+          errorCode,
         })
         childCount += 1
       } catch {
@@ -8444,6 +8451,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let stalledQueueEventsTruncated = false
     let checkpointQueue: Queue | undefined
     let queueEvents: QueueEvents | undefined
+    let stalledMidpointDueAt: number | null = null
+    let stalledMidpointSnapshot: RecordValue | null = null
     const workerOwnerId = (pid: number) => `p3-process-restart-discovery-worker-${pid}`
     const resolverOwnerId = (pid: number) => `p3-process-restart-discovery-wait-resolver-${pid}`
     // turnJobId appends "-<generation>"; removing the helper-generated zero keeps every generation for this Turn.
@@ -8456,8 +8465,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     }
     const queueRecoveryFailureDiagnostics = () => ({
       snapshots: restartQueueSnapshots.slice(0, 2),
-      stalledEvents: stalledQueueEvents.slice(0, 16),
+      stalledEvents: stalledQueueEvents.slice(0, 16).map(event => ({
+        at: event.at,
+        generation: event.generation,
+      })),
       stalledEventsTruncated: stalledQueueEventsTruncated,
+      stalledMidpoint: stalledMidpointSnapshot,
     })
     const captureRestartQueueSnapshot = async (
       checkpoint: "after_worker2_sigkill" | "after_worker3_ready",
@@ -8505,7 +8518,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           }
           const job = await checkpointQueue.getJob(jobId)
           if (!job) {
-            rows.push({ jobId, generation: queueGeneration(jobId), worker: "no_queue_job", state: "missing", lockPttlMs, attemptsMade: null })
+            rows.push({ generation: queueGeneration(jobId), worker: "no_queue_job", state: "missing", lockPttlMs, attemptsMade: null })
             continue
           }
           const payload = record(job.data)
@@ -8516,7 +8529,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           }
           const state = diagnosticEnum(await job.getState(), new Set<string>(queueStates)) ?? "other"
           rows.push({
-            jobId,
             generation: queueGeneration(jobId),
             worker: observedWorkerByJobId.get(jobId)
               ?? (typeof ownerId === "string" ? ownerLabels.get(ownerId) ?? "unmapped_owner" : "missing_owner"),
@@ -8740,7 +8752,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         if (event.event !== "active" || typeof event.generation !== "number") continue
         observedWorkerByJobId.set(turnDispatch.turnJobId(value.turnId, event.generation), `${event.worker}_active_observed`)
       }
-      restartQueueSnapshots.push(await captureRestartQueueSnapshot(
+      const afterWorkerThreeReadySnapshot = await captureRestartQueueSnapshot(
         "after_worker3_ready",
         new Map([
           [workerOwnerId(workerOne.pid!), "worker1_dispatcher"],
@@ -8750,7 +8762,22 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           [workerThreeOwnerId, "worker3_dispatcher"],
           [workerThreeResolverOwnerId, "worker3_wait_resolver"],
         ]),
-      ))
+      )
+      restartQueueSnapshots.push(afterWorkerThreeReadySnapshot)
+      const workerThreeOptions = processDiscoveryTurnWorkerDiagnostics(workerTwo, workerThree)
+        .find(event => event.worker === "worker3" && event.event === "observer_attached")
+      const afterWorkerThreeRows = Array.isArray(afterWorkerThreeReadySnapshot.rows)
+        ? afterWorkerThreeReadySnapshot.rows.map(record).filter((row): row is RecordValue => row !== null)
+        : []
+      const generationTwoReadyRow = afterWorkerThreeRows.find(row => row.generation === 2)
+      const generationTwoReadyLockPttl = generationTwoReadyRow?.lockPttlMs
+      const workerLockDurationMs = boundedWorkerDiagnosticNumber(workerThreeOptions?.lockDuration, 1, 300_000) ?? 30_000
+      const workerStalledIntervalMs = boundedWorkerDiagnosticNumber(workerThreeOptions?.stalledInterval, 1, 300_000) ?? 30_000
+      const generationTwoRemainingLockMs = typeof generationTwoReadyLockPttl === "number" && generationTwoReadyLockPttl >= 0
+        ? generationTwoReadyLockPttl
+        : generationTwoReadyLockPttl === -2 ? 0 : workerLockDurationMs
+      // Observe after the sampled lock expires and one complete stalled-check interval can pass.
+      stalledMidpointDueAt = Date.now() + generationTwoRemainingLockMs + workerStalledIntervalMs + 1_000
       const collectRestartDiscoveryDiagnostics = async () => {
         const processOutputs = [...(workerTwo?.output ?? []), ...(workerThree?.output ?? [])]
         const tasks = await pool!.query<DiscoveryVerifierTask & { failureReason: string | null; result: unknown }>(
@@ -9011,6 +9038,56 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             return { unavailable: true }
           }
         }
+        const captureStalledMidpointSnapshot = async (): Promise<RecordValue> => {
+          const observedAt = new Date().toISOString()
+          try {
+            const generationTwoJobId = turnDispatch.turnJobId(value.turnId, 2)
+            const stalledKey = turnQueue.toKey("stalled")
+            const stalledCheckKey = turnQueue.toKey("stalled-check")
+            const [candidateSetSize, generationTwoCandidate, stalledCheckExists, stalledCheckPttl, jobs,
+              generationTwoJob, generationTwoLockPttl] = await Promise.all([
+              redis!.scard(stalledKey),
+              redis!.sismember(stalledKey, generationTwoJobId),
+              redis!.exists(stalledCheckKey),
+              redis!.pttl(stalledCheckKey),
+              turnQueue.getJobs([...states], 0, -1, false),
+              turnQueue.getJob(generationTwoJobId),
+              redis!.pttl(turnQueue.toKey(generationTwoJobId) + ":lock"),
+            ])
+            const stateCounts = new Map<string, number>()
+            let matchingCount = 0
+            for (const job of jobs) {
+              const payload = record(job.data)
+              if (payload?.turnId !== value.turnId || payload.sessionId !== value.sessionId
+                || typeof payload.ownerId !== "string" || !expectedQueueOwners.has(payload.ownerId)) continue
+              matchingCount += 1
+              const state = diagnosticEnum(await job.getState(), new Set<string>(states)) ?? "other"
+              stateCounts.set(state, (stateCounts.get(state) ?? 0) + 1)
+            }
+            const generationTwoState = generationTwoJob
+              ? diagnosticEnum(await generationTwoJob.getState(), new Set<string>(states)) ?? "other"
+              : "missing"
+            const boundedPttl = (pttl: number) => pttl === -2 || pttl === -1
+              || Number.isSafeInteger(pttl) && pttl >= 0 && pttl <= 300_000 ? pttl : null
+            return {
+              checkpoint: "after_generation2_lock_expiry_and_stalled_interval",
+              observedAt,
+              matchingCount: Math.min(matchingCount, 100),
+              matchingCountTruncated: matchingCount > 100,
+              matchingStateCounts: [...stateCounts.entries()].sort(([left], [right]) => left.localeCompare(right)),
+              generationTwoState,
+              generationTwoLockPttlMs: boundedPttl(generationTwoLockPttl),
+              stalledCandidateSetSize: Number.isSafeInteger(candidateSetSize) && candidateSetSize >= 0
+                ? Math.min(candidateSetSize, 10_000) : null,
+              stalledCandidateSetTruncated: Number.isSafeInteger(candidateSetSize) && candidateSetSize > 10_000,
+              generationTwoInStalledCandidateSet: generationTwoCandidate === 1,
+              stalledCheckKeyPresent: stalledCheckExists === 1,
+              stalledCheckKeyPttlMs: boundedPttl(stalledCheckPttl),
+            }
+          } catch {
+            return { checkpoint: "after_generation2_lock_expiry_and_stalled_interval", observedAt, unavailable: true }
+          }
+        }
         while (true) {
           const matchingStateCounts = new Map<string, number>()
           let liveDeliveryCount = 0
@@ -9026,6 +9103,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             matchingStateCounts.set(state, (matchingStateCounts.get(state) ?? 0) + 1)
             if (state === "failed") throw new Error("Turn queue contains a failed delivery for the completed fixture Turn")
             if (liveStates.has(state)) liveDeliveryCount += 1
+          }
+          if (liveDeliveryCount > 0 && stalledMidpointSnapshot === null && stalledMidpointDueAt !== null
+            && Date.now() >= stalledMidpointDueAt) {
+            stalledMidpointSnapshot = await captureStalledMidpointSnapshot()
           }
           if (liveDeliveryCount === 0) break
           if (Date.now() >= convergenceDeadline) {
