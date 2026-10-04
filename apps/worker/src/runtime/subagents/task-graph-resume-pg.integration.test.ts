@@ -8619,6 +8619,25 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let interactiveFailureGraphStatuses: Array<{ key: "scout" | "analyst"; status: string }> = []
     let interactiveFailureHydratedWaitStatus: string | null = null
     let interactiveFailureHydratedWaitCount: number | null = null
+    let interactiveFailureChildExecutorCalls = 0
+    let interactiveFailureForeignChildDeliveryCount = 0
+    let interactiveFailureChildModelFactoryCalls = 0
+    let interactiveFailureChildModelTaskMatchesLease: boolean | null = null
+    let interactiveFailureChildLeaseUserMatchesFixture: boolean | null = null
+    let interactiveFailureChildLeaseSessionMatchesFixture: boolean | null = null
+    let interactiveFailureChildLeaseTurnMatchesFixture: boolean | null = null
+    let interactiveFailureChildRoleIsScout: boolean | null = null
+    let interactiveFailureChildStatusIsRunning: boolean | null = null
+    let interactiveFailureChildGoalMatchesFixture: boolean | null = null
+    let interactiveFailureChildStreamRounds = 0
+    let interactiveFailureChildStage: "not_called" | "executor_entered" | "model_factory" | "search_call" | "search_result" | "parent_wait" | "parent_wait_persisted" | "dependent_read" | "dependent_waiting" | "dependent_dispatch_checked" | "proof_held" = "not_called"
+    let interactiveFailureSearchResultObject: boolean | null = null
+    let interactiveFailureReturnedJobCount: number | null = null
+    let interactiveFailureExpectedJobReturned: boolean | null = null
+    let interactiveFailureDependentRows: number | null = null
+    let interactiveFailureDependentStatus: string | null = null
+    let interactiveFailureDependentDispatchCount: number | null = null
+    const childLeaseByTaskId = new Map<string, SubagentLease>()
     const interactiveFailureDiagnostic = () => JSON.stringify({
       intentRestored: interactiveFailureIntentRestored,
       rootPlanStage: interactiveFailureRootPlanStage,
@@ -8627,6 +8646,24 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       graphStatuses: interactiveFailureGraphStatuses,
       hydratedWaitStatus: interactiveFailureHydratedWaitStatus,
       hydratedWaitCount: interactiveFailureHydratedWaitCount,
+      childExecutorCalls: diagnosticBoundedCount(interactiveFailureChildExecutorCalls),
+      foreignChildDeliveryCount: diagnosticBoundedCount(interactiveFailureForeignChildDeliveryCount),
+      childModelFactoryCalls: diagnosticBoundedCount(interactiveFailureChildModelFactoryCalls),
+      childModelTaskMatchesLease: interactiveFailureChildModelTaskMatchesLease,
+      childLeaseUserMatchesFixture: interactiveFailureChildLeaseUserMatchesFixture,
+      childLeaseSessionMatchesFixture: interactiveFailureChildLeaseSessionMatchesFixture,
+      childLeaseTurnMatchesFixture: interactiveFailureChildLeaseTurnMatchesFixture,
+      childRoleIsScout: interactiveFailureChildRoleIsScout,
+      childStatusIsRunning: interactiveFailureChildStatusIsRunning,
+      childGoalMatchesFixture: interactiveFailureChildGoalMatchesFixture,
+      childStreamRounds: diagnosticBoundedCount(interactiveFailureChildStreamRounds),
+      childStage: interactiveFailureChildStage,
+      searchResultObject: interactiveFailureSearchResultObject,
+      returnedJobCount: interactiveFailureReturnedJobCount,
+      expectedJobReturned: interactiveFailureExpectedJobReturned,
+      dependentRows: interactiveFailureDependentRows,
+      dependentStatus: interactiveFailureDependentStatus,
+      dependentDispatchCount: interactiveFailureDependentDispatchCount,
     })
     const rootRuntime = await canonical.createCanonicalTurnRuntime(pool!, {
       workerId: value.ownerId, productionFlags: flags,
@@ -8708,36 +8745,69 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const childExecutor = createProductionChildExecutor({
       pool: pool!, authorizeUsage: async () => ({ settle: async () => undefined }),
       modelRuntimeFactory: ({ task }) => {
+        const lease = childLeaseByTaskId.get(task.id)
+        if (lease) {
+          interactiveFailureChildModelFactoryCalls = Math.min(12, interactiveFailureChildModelFactoryCalls + 1)
+          interactiveFailureChildStage = "model_factory"
+          interactiveFailureChildModelTaskMatchesLease = lease.id === task.id
+          interactiveFailureChildRoleIsScout = task.role === "scout"
+          interactiveFailureChildStatusIsRunning = task.status === "running"
+          interactiveFailureChildGoalMatchesFixture = task.goal === "Find matching fixture roles"
+        }
         if (task.role !== "scout") throw new Error(`Dependent discovery role executed unexpectedly: ${task.role}`)
         let round = 0
         const adapter: ModelAdapter = {
           id: "p3-interactive-discovery-invalid-scout-fixture", profile,
           async *stream(request) {
             round += 1
+            if (lease) interactiveFailureChildStreamRounds = Math.min(12, interactiveFailureChildStreamRounds + 1)
             if (round === 1) {
+              if (lease) interactiveFailureChildStage = "search_call"
               expect(request.tools.map(tool => record(tool)?.name)).toContain("jobs.search")
               yield { type: "tool_call_completed", callId: "p3-discovery-failure-read", name: "jobs.search", arguments: { target: "Software Engineer", location: "Dublin", limit: 10 } }
               yield { type: "completed", finishReason: "tool_calls" }
               return
             }
-            const searchResult = record(latestToolResult(request, "p3-discovery-failure-read"))
+            const rawSearchResult = latestToolResult(request, "p3-discovery-failure-read")
+            const searchResult = record(rawSearchResult)
+            if (lease) {
+              interactiveFailureChildStage = "search_result"
+              interactiveFailureSearchResultObject = searchResult !== null
+            }
             const observedJobIds = Array.isArray(searchResult?.jobs)
               ? searchResult.jobs.map(record).flatMap(job => typeof job?.id === "string" ? [job.id] : [])
               : []
+            if (lease) {
+              interactiveFailureReturnedJobCount = diagnosticBoundedCount(observedJobIds.length)
+              interactiveFailureExpectedJobReturned = observedJobIds.includes(jobId)
+            }
             expect(observedJobIds).toContain(jobId)
+            if (lease) interactiveFailureChildStage = "parent_wait"
             await waitForPersistedTaskWait(pool!, value.turnId, `p3-discovery-failure-wait:${value.turnId}`)
+            if (lease) interactiveFailureChildStage = "parent_wait_persisted"
+            if (lease) interactiveFailureChildStage = "dependent_read"
             const dependent = await pool!.query<{ id: string; status: string }>(
               `SELECT "id", "status" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "role" = 'analyst'`,
               [value.turnId, value.sessionId],
             )
+            if (lease) {
+              interactiveFailureDependentRows = diagnosticBoundedCount(dependent.rows.length)
+              interactiveFailureDependentStatus = diagnosticEnum(dependent.rows[0]?.status, TASK_DIAGNOSTIC_STATUSES)
+            }
             expect(dependent.rows).toHaveLength(1)
             expect(dependent.rows[0]?.status).toBe("waiting")
+            if (lease) interactiveFailureChildStage = "dependent_waiting"
             const dependentDispatch = await pool!.query(
               `SELECT "id" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $2`,
               [value.sessionId, `subagent-dispatch:${dependent.rows[0]!.id}`],
             )
+            if (lease) interactiveFailureDependentDispatchCount = diagnosticBoundedCount(dependentDispatch.rowCount ?? 0)
             expect(dependentDispatch.rowCount).toBe(0)
-            dependentWasWaitingBeforeProof = true
+            if (lease) interactiveFailureChildStage = "dependent_dispatch_checked"
+            if (lease) {
+              dependentWasWaitingBeforeProof = true
+              interactiveFailureChildStage = "proof_held"
+            }
             // This schema-valid result cites a job/evidence pair absent from canonical tool receipts.
             const forgedId = "read:job:unobserved-fabricated-job"
             yield { type: "text_delta", text: JSON.stringify({
@@ -8752,11 +8822,31 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         return adapter
       },
     })
+    const executeChildWithDiagnostics: typeof childExecutor = async input => {
+      const isFixtureLease = input.lease.userId === value.userId
+        && input.lease.sessionId === value.sessionId
+        && input.lease.turnId === value.turnId
+      if (isFixtureLease) {
+        interactiveFailureChildExecutorCalls = Math.min(12, interactiveFailureChildExecutorCalls + 1)
+        interactiveFailureChildStage = "executor_entered"
+        interactiveFailureChildLeaseUserMatchesFixture = true
+        interactiveFailureChildLeaseSessionMatchesFixture = true
+        interactiveFailureChildLeaseTurnMatchesFixture = true
+        childLeaseByTaskId.set(input.lease.id, input.lease)
+      } else {
+        interactiveFailureForeignChildDeliveryCount = Math.min(12, interactiveFailureForeignChildDeliveryCount + 1)
+      }
+      try {
+        return await childExecutor(input)
+      } finally {
+        if (isFixtureLease) childLeaseByTaskId.delete(input.lease.id)
+      }
+    }
     bootstrap = await workerQueue.createProductionWorkerBootstrap({
       pool: pool!, runtime: rootRuntime, ownerId: value.ownerId,
       turnQueueFactory: createTurnQueue, turnRecoveryIntervalMs: 100,
       waitResolver: { intervalMs: 10, batchSize: 10, ownerId: `p3-discovery-failure-wait-resolver-${value.suffix}` },
-      subagents: { execute: childExecutor, intervalMs: 10 },
+      subagents: { execute: executeChildWithDiagnostics, intervalMs: 10 },
     })
 
     await enqueueTurn(pool!, bootstrap.turns.queue, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
