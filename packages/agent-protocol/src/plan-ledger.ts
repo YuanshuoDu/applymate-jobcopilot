@@ -3,7 +3,7 @@ import { parsePersistedTaskGraphNode, validTaskGraphResultEnvelopeKeys } from '.
 export const PLAN_LEDGER_SCHEMA_VERSION = 'agent-harness.v2.plan-ledger'
 export const TASK_GRAPH_SCHEMA_VERSION = 'agent-harness.v2.task-graph', TASK_GRAPH_MAX_IDENTIFIER_LENGTH = 128
 const RESULT_VERSION = 'agent-harness.v2.subagent.result'
-const MAX_NODES = 8, MAX_ID = TASK_GRAPH_MAX_IDENTIFIER_LENGTH, MAX_LEDGER_BYTES = 16_000
+const MAX_NODES = 8, MAX_ID = TASK_GRAPH_MAX_IDENTIFIER_LENGTH, MAX_PRIVATE_RESULT_ID = 256, MAX_LEDGER_BYTES = 16_000
 const MAX_DEPTH = 8, MAX_SNAPSHOT_BYTES = 40_000, MAX_SUCCESS_CRITERIA = 8, MAX_DEPENDENCIES = 8, MAX_GOAL_LENGTH = 1_200, MAX_CRITERION_LENGTH = 320
 const STATUSES = ['queued', 'running', 'retrying', 'waiting', 'waiting_for_user', 'completed', 'failed', 'interrupted', 'cancelled', 'closed'] as const
 const TERMINAL = new Set(['completed', 'failed', 'interrupted', 'cancelled', 'closed'])
@@ -106,7 +106,7 @@ export function projectTaskEvidencePreview(row: unknown): PlanLedgerEvidencePrev
     const envelope = parseJsonRecord(row.result)
     if (!envelope || !validTaskGraphResultEnvelopeKeys(envelope)
       || envelope.status !== 'completed' || !smallInteger(envelope.stepCount, 10_000) || !smallInteger(envelope.toolCallCount, 10_000)
-      || (envelope.finalItemId !== null && !identifier(envelope.finalItemId)) || typeof envelope.finalText !== 'string'
+      || (envelope.finalItemId !== null && !privateResultIdentifier(envelope.finalItemId)) || typeof envelope.finalText !== 'string'
       || envelope.finalText.length > 8_192) return null
     const result = record(envelope.structuredResult) ? envelope.structuredResult : null
     const role = row.role
@@ -220,6 +220,7 @@ function taskStatus(value: unknown): PlanLedgerStatus | null { return value === 
 function isStatus(value: unknown): value is PlanLedgerStatus { return typeof value === 'string' && (STATUSES as readonly string[]).includes(value) }
 function isReadiness(value: unknown): value is PlanLedgerReadiness { return typeof value === 'string' && ['ready', 'waiting_for_dependencies', 'blocked_dependency', 'active', 'terminal', 'unavailable'].includes(value) }
 function identifier(value: unknown): value is string { return text(value, MAX_ID) && value.trim() === value }
+function privateResultIdentifier(value: unknown): value is string { return text(value, MAX_PRIVATE_RESULT_ID) && value.trim() === value }
 function text(value: unknown, max: number): value is string { return typeof value === 'string' && value.trim().length > 0 && value.length <= max }
 function record(value: unknown): value is Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false

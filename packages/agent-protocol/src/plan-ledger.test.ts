@@ -77,6 +77,13 @@ function projection() {
   return projectPlanLedger({ sessionId, revision: 4, rootTaskId, graph, tasks: rows })
 }
 
+function workerFinalItemId(taskId: string): string {
+  const executionId = (prefix: string) => `task:${taskId}:${prefix}`
+  const attemptId = (id: string) => `${id}:attempt:1`
+  const stepId = attemptId(executionId('step:1'))
+  return attemptId(executionId(`item:final:${stepId}`))
+}
+
 describe('versioned Plan Ledger contract', () => {
   it('exposes the shared bounded TaskGraph parser for object and JSON payloads', () => {
     expect(parseTaskGraphSnapshot(graph)?.nodes).toHaveLength(2)
@@ -238,6 +245,54 @@ describe('versioned Plan Ledger contract', () => {
     })
     expect(preview).toMatchObject({ role: 'scout', itemCount: 1, evidence: [{ kind: 'job', source: 'greenhouse', reference: null }] })
     expect(JSON.stringify(preview)).not.toMatch(/verification|repairReceipt|candidate-count|evidenceDigest/)
+  })
+
+  it('accepts Worker-generated final item IDs up to 256 without widening graph IDs', () => {
+    const taskId = `subagent-${'0'.repeat(36)}`
+    const jobId = 'private-job-77'
+    const cases = [
+      {
+        role: 'scout' as const, criterionId: 'candidate-count',
+        structuredResult: {
+          schemaVersion: 'agent-harness.v2.subagent.result', role: 'scout', status: 'completed',
+          candidates: [{ jobId, source: 'fixture', url: null, evidenceIds: ['private-evidence-1'] }],
+          evidence: [{ id: 'private-evidence-1', kind: 'job', ref: jobId, source: 'greenhouse' }], summary: 'one candidate',
+        },
+      },
+      {
+        role: 'analyst' as const, criterionId: 'finding-count',
+        structuredResult: {
+          schemaVersion: 'agent-harness.v2.subagent.result', role: 'analyst', status: 'completed',
+          findings: [{ jobId, score: 8, evidenceIds: ['private-evidence-1'] }],
+          evidence: [{ id: 'private-evidence-1', kind: 'job', ref: jobId, source: 'greenhouse' }], summary: 'one finding',
+        },
+      },
+    ]
+    for (const item of cases) {
+      const finalItemId = workerFinalItemId(taskId)
+      expect(finalItemId).toHaveLength(139)
+      const result = {
+        status: 'completed', stepCount: 2, toolCallCount: 1, finalItemId,
+        finalText: JSON.stringify(item.structuredResult), structuredResult: item.structuredResult,
+        taskGraphVerificationReport: {
+          verifierVersion: 'agent-harness.v2.task-graph-verifier.v1', status: 'passed', reasonCode: 'criteria_met',
+          criteria: [{ criterionId: item.criterionId, status: 'passed', reasonCode: 'criteria_met' }],
+          evidenceDigest: 'a'.repeat(64), resultDigest: 'b'.repeat(64),
+        },
+      }
+      const project = (value: unknown) => projectTaskEvidencePreview({ status: 'completed', role: item.role, result: { ...result, finalItemId: value } })
+      const preview = project(finalItemId)
+      expect(preview).toMatchObject({ role: item.role, itemCount: 1 })
+      expect(JSON.stringify(preview)).not.toContain(finalItemId)
+      expect(preview && 'finalItemId' in preview).toBe(false)
+      const maxLengthPreview = project('x'.repeat(256))
+      expect(maxLengthPreview).not.toBeNull()
+      expect(JSON.stringify(maxLengthPreview)).not.toContain('x'.repeat(256))
+      for (const malformed of ['', '   ', ' x ', 'x'.repeat(257), 123]) expect(project(malformed)).toBeNull()
+    }
+    expect(parseTaskGraphSnapshot({
+      ...graph, nodes: graph.nodes.map((node, index) => index === 0 ? { ...node, taskId: 'x'.repeat(129) } : node),
+    })).toBeNull()
   })
 
   it('counts accepted verifier metadata against the raw result size cap before discarding it', () => {
