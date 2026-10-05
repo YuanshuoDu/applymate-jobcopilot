@@ -34,8 +34,7 @@ function object(value: unknown): Row {
   return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Row : {}
 }
 function ids(value: unknown): string[] | null {
-  const candidate = parsed(value)
-  return Array.isArray(candidate) && candidate.every((entry): entry is string => typeof entry === "string" && entry.length > 0) ? candidate : null
+  return Array.isArray(value) && value.every((entry): entry is string => typeof entry === "string" && entry.length > 0) ? value : null
 }
 function date(value: unknown): Date | null { if (value === null || value === undefined) return null; const parsed = value instanceof Date ? value : new Date(String(value)); return Number.isFinite(parsed.getTime()) ? parsed : null }
 function fence(input: DurableWaitConsumerInput): void {

@@ -254,9 +254,13 @@ describe("durable wait outcome consumer", () => {
     { waitTargetTaskIds: ["child-1", 7] },
     { waitTargetTaskIds: ["child-1", ""] },
     { waitTargetTaskIds: "child-1" },
+    { waitTargetTaskIds: JSON.stringify(["child-1"]) },
     { waitMatchedTaskIds: ["child-1", "child-1"] },
+    { waitMatchedTaskIds: JSON.stringify(["child-1"]) },
     { archivedTargetTaskIds: ["child-1", "child-1"] },
+    { archivedTargetTaskIds: JSON.stringify(["child-1"]) },
     { archivedMatchedTaskIds: ["child-1", null] },
+    { archivedMatchedTaskIds: JSON.stringify(["child-1"]) },
   ])("fails closed for malformed consumed target or matched ID arrays", async input => {
     const fake = fixture({ consumed: true, ...input })
     await expect(consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now })).rejects.toThrow("wait_consume_outcome_invalid")
