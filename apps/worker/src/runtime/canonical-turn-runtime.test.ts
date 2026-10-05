@@ -11,6 +11,7 @@ import type { CanonicalTurnState, CanonicalTurnStateLoadOptions } from "./canoni
 import type { TurnEngineEvent, TurnEngineStore } from "./turns/turn-engine-types.js"
 import { createCanonicalTurnRuntime, type CanonicalTurnRuntimeOptions } from "./canonical-turn-runtime.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA, type TaskGraphCommandPort, type TaskGraphCurrentState, type TaskGraphReadScope, type TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
+import { projectSelectedJobMemory } from "./context/selected-job-memory.js"
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
 import { TurnEngine } from "./turns/turn-engine.js"
 import { createPgRootTaskStore } from "./subagents/root-task-store.js"
@@ -336,9 +337,24 @@ describe("createCanonicalTurnRuntime", () => {
     }))
   })
 
-  it("keeps ordinary Turns on the existing model path when no selected-job intent is present", async () => {
+  it("keeps selected-job snapshot memory out of ordinary Turn model requests", async () => {
+    const requests: HarnessModelRequest[] = []
+    const memory = projectSelectedJobMemory({
+      jobId: "job-secret", sourceTurnId: lease.turnId, sourceRootTaskId: "root-1", throughSequence: "1",
+      graph: { revision: 1, nodes: [{ key: "research", templateId: "scout", taskId: "child-1", goal: "private", successCriteria: [], dependsOn: [], status: "completed", readiness: "terminal", resultSummary: null, failureReason: null, resultProjection: { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available", role: "scout", status: "completed", candidateCount: 1, evidenceCount: 1, candidates: [{ jobId: "job-secret", source: "lever", evidenceKinds: ["job"] }] } }] },
+    })
+    if (!memory) throw new Error("selected-job memory fixture should be valid")
     const fixture = setup({
       selectedJobPreparationLoader: async () => undefined,
+      stateLoader: async () => state({ selectedJobMemories: [memory] }),
+      modelRuntimeFactory: async () => ({ adapter: {
+        ...model(() => []),
+        async *stream(request: HarnessModelRequest) {
+          requests.push(request)
+          if (requests.length === 1) { yield { type: "tool_call_completed", callId: "call-1", name: "jobs.search", arguments: { location: "Dublin" } }; yield { type: "completed", finishReason: "tool_calls" } }
+          else { yield { type: "text_delta", text: "done" }; yield { type: "completed", finishReason: "stop" } }
+        },
+      }, registry: {} as never, candidates: [] }),
       taskGraphCommandPort: {
         appendAndSchedule: vi.fn(async () => ({ status: "accepted", revision: 1, nodes: [], readyTaskIds: [] })),
         readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
@@ -346,7 +362,9 @@ describe("createCanonicalTurnRuntime", () => {
     })
 
     await expect((await fixture.runtime).execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "completed" })
-    expect(fixture.getModelCalls()).toBe(2)
+    expect(requests).toHaveLength(2)
+    expect(JSON.stringify(requests.map(request => request.messages))).not.toContain("selected_job_memory")
+    expect(JSON.stringify(requests.map(request => request.messages))).not.toContain("job-secret")
     expect(fixture.tool.execute).toHaveBeenCalledOnce()
   })
 
@@ -571,6 +589,11 @@ describe("createCanonicalTurnRuntime", () => {
         failureReason: null,
       }],
     }
+    const selectedJobMemories = ["job-41", "job-42"].map(jobId => {
+      const memory = projectSelectedJobMemory({ jobId, sourceTurnId: lease.turnId, sourceRootTaskId: "root-1", throughSequence: "7", graph: currentPlan })
+      if (!memory) throw new Error("selected-job memory fixture should be valid")
+      return memory
+    })
     const readCurrent = vi.fn(async (): Promise<TaskGraphCurrentState> => currentPlan)
     const taskGraphCommandPort: TaskGraphCommandPort = {
       appendAndSchedule: async () => ({ status: "accepted", revision: 1, nodes: [], readyTaskIds: [] }),
@@ -578,6 +601,7 @@ describe("createCanonicalTurnRuntime", () => {
     }
     const resumedState: CanonicalTurnState = {
       ...state(),
+      selectedJobMemories,
       toolPolicySnapshot: {},
       resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 0n, consumedInputIds: [], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
       pendingToolCalls: [{
@@ -631,6 +655,11 @@ describe("createCanonicalTurnRuntime", () => {
     await runtime.execute({ lease, signal: new AbortController().signal })
 
     const modelMessages = JSON.stringify(requests[0]?.messages)
+    const memoryObservation = modelSnapshots[0]?.toolObservations.find(item => item.id === "selected-job-memory")
+    expect(JSON.stringify(requests[0]?.messages)).toContain("selected_job_memory")
+    expect(memoryObservation?.content).toMatchObject({ kind: "selected_job_memory", informationalOnly: true, nodes: [{ role: "scout", result: { availability: "available", role: "scout", status: "completed", source: "greenhouse", evidenceKinds: ["job"] } }] })
+    expect(JSON.stringify(memoryObservation)).not.toContain("job-41")
+    expect(JSON.stringify(memoryObservation)).not.toContain("job-42")
     expect(modelMessages).not.toContain(privateSentinel)
     expect(modelMessages).not.toContain(reconciledSentinel)
     expect(modelMessages).not.toContain("jobs.get")

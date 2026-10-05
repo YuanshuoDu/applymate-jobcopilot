@@ -38,6 +38,7 @@ import { selectedJobArtifactCompletionGateWithWitness } from "./selected-job-com
 import { selectedJobArtifactFinalizationGuard } from "./selected-job-finalization-guard.js"
 import { createAgentArtifactRepository, findCurrentDraftHeadWithClient, findReviewReceiptWithClient, type AgentArtifactDraftHead, type AgentArtifactDraftHeadScope } from "../db/agent-artifact-repo.js"
 import { runTurnBoundaryCompactionPreflight, runTurnBoundaryContextCompaction } from "./context/turn-boundary-compaction-preflight.js"
+import { injectSelectedJobMemory } from "./context/selected-job-memory.js"
 import { createCanonicalRootToolGuards, failInteractiveDiscoveryUnavailable, interactiveDiscoveryCompletionGate, withInteractiveDiscoveryFinalResponse } from "./interactive-discovery-runtime.js"
 import { INTERACTIVE_DISCOVERY_TEMPLATES, rootTaskAllowedActions, rootToolSurface, terminalInteractiveDiscoveryShortlist, type InteractiveDiscoveryShortlistProjection } from "./interactive-discovery-contract.js"
 import type { SubagentTaskRecord } from "./subagents/types.js"
@@ -200,7 +201,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const contextBuilder: TurnEngineOptions["contextBuilder"] = {
       build: request => baseContextBuilder.build({
         ...request,
-        snapshot: selectedJobMode ? selectedJobSnapshot(request.snapshot) : request.snapshot,
+        snapshot: selectedJobMode ? injectSelectedJobMemory({ snapshot: selectedJobSnapshot(request.snapshot), records: state.selectedJobMemories ?? [], jobId: selectedJobPreparation?.jobId, turnId: lease.turnId, rootTaskId: root.id }) : request.snapshot,
         taskId: root.id,
       }),
     }

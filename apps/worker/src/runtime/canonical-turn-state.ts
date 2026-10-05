@@ -26,6 +26,7 @@ export type CanonicalTurnState = {
   readonly intent?: CanonicalTurnIntent
   /** Loaded Turns always provide this; optional for existing injected stateLoader fixtures. */
   readonly contextSnapshotPinned?: boolean
+  readonly selectedJobMemories?: readonly import("./context/selected-job-memory.js").SelectedJobMemoryRecord[]
   readonly snapshot: StepContextSnapshot
   readonly steeringMarkers?: SteeringMarkerState
   readonly pendingToolCalls?: readonly PersistedToolCallRecovery[]
@@ -49,11 +50,10 @@ function json(value: unknown): RepositoryJsonValue {
   return null
 }
 
-function snapshotFromContent(value: unknown, throughSequence: unknown, scope: TenantScope, sessionId: string): StepContextSnapshot {
+function snapshotFromContent(value: unknown, throughSequence: unknown, scope: TenantScope, sessionId: string): { snapshot: StepContextSnapshot; selectedJobMemories: readonly import("./context/selected-job-memory.js").SelectedJobMemoryRecord[] } {
   const content = parseSnapshotContent(value)
-  if (content.ownerId !== scope.userId || content.sessionId !== sessionId) throw new Error("context_snapshot_scope_mismatch")
-  if (content.throughSequence !== String(throughSequence)) throw new Error("context_snapshot_sequence_mismatch")
-  return stepContextSnapshotFromContent(content)
+  if (content.ownerId !== scope.userId || content.sessionId !== sessionId) throw new Error("context_snapshot_scope_mismatch"); if (content.throughSequence !== String(throughSequence)) throw new Error("context_snapshot_sequence_mismatch")
+  return { snapshot: stepContextSnapshotFromContent(content), selectedJobMemories: content.compaction?.state.selectedJobMemories ?? [] }
 }
 
 function eventPayload(value: unknown): Row { const payload = object(value); return object(payload.payload ?? payload) }
@@ -163,13 +163,14 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
       [lease.turnId, lease.sessionId, lease.userId],
     )
     let snapshot: StepContextSnapshot = { system: [{ id: "canonical-runtime", content: "Use only scoped, policy-approved tools and continue until the stated goal is verifiably complete." }], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }
+    let selectedJobMemories: readonly import("./context/selected-job-memory.js").SelectedJobMemoryRecord[] = []
     let snapshotThroughSequence: bigint | null = null
     if (turn.contextSnapshotId) {
       const contextResult = await client.query<Row>(`SELECT snapshot."content", snapshot."throughSequence" FROM "agent_context_snapshots" AS snapshot
         JOIN "agent_sessions" AS session ON session."id" = snapshot."sessionId"
         WHERE snapshot."id" = $1 AND snapshot."sessionId" = $2 AND session."userId" = $3`, [turn.contextSnapshotId, lease.sessionId, lease.userId])
       if (!contextResult.rows[0]) throw new Error("context_snapshot_missing")
-      snapshot = snapshotFromContent(contextResult.rows[0].content, contextResult.rows[0].throughSequence, scope, lease.sessionId)
+      ;({ snapshot, selectedJobMemories } = snapshotFromContent(contextResult.rows[0].content, contextResult.rows[0].throughSequence, scope, lease.sessionId))
       snapshotThroughSequence = BigInt(String(contextResult.rows[0].throughSequence))
     } else {
       const contextResult = await client.query<Row>(`SELECT snapshot."content", snapshot."throughSequence" FROM "agent_context_snapshots" AS snapshot
@@ -177,7 +178,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
         WHERE snapshot."sessionId" = $1 AND session."userId" = $2
         ORDER BY snapshot."throughSequence" DESC, snapshot."version" DESC LIMIT 1`, [lease.sessionId, lease.userId])
       if (contextResult.rows[0]) {
-        snapshot = snapshotFromContent(contextResult.rows[0].content, contextResult.rows[0].throughSequence, scope, lease.sessionId)
+        ;({ snapshot, selectedJobMemories } = snapshotFromContent(contextResult.rows[0].content, contextResult.rows[0].throughSequence, scope, lease.sessionId))
         snapshotThroughSequence = BigInt(String(contextResult.rows[0].throughSequence))
       }
     }
@@ -237,7 +238,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
       ...(intent ? { intent } : {}),
       contextSnapshotPinned: turn.contextSnapshotId !== null && turn.contextSnapshotId !== undefined,
       steeringMarkers, ...(restoredAgenda ? { cognitiveAgendaReceipt: restoredAgenda } : {}), ...(restored.pending.length ? { pendingToolCalls: restored.pending } : {}), ...(rootTaskId ? { rootTaskId } : {}),
-      ...(rootInput.rows[0] ? { rootInputId: rootInput.rows[0].id } : {}), snapshot, ...(resume ? { resume } : {}),
+      ...(rootInput.rows[0] ? { rootInputId: rootInput.rows[0].id } : {}), ...(selectedJobMemories.length ? { selectedJobMemories } : {}), snapshot, ...(resume ? { resume } : {}),
     }
     await client.query("COMMIT")
     committed = true

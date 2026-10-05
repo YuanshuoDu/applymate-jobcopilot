@@ -1,9 +1,15 @@
-import { describe, expect, it, vi } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
+import type { TaskGraphCommandPort } from "../subagents/task-graph-command-port.js"
+import { createPgTaskGraphCommandPort } from "../subagents/pg-task-graph-command-port.js"
 import type { CompactionPgClient, CompactionPgPool } from "./context-compaction-pg-store.js"
 import { createPgCompactionSource } from "./context-compaction-pg-source.js"
 import { sha256Hex } from "./context-compaction-canonical.js"
+
+vi.mock("../subagents/pg-task-graph-command-port.js", () => ({ createPgTaskGraphCommandPort: vi.fn() }))
+
+beforeEach(() => vi.mocked(createPgTaskGraphCommandPort).mockReset())
 
 const owner: TurnExecutionOwnerFence = {
   kind: "turn", userId: "user-a", sessionId: "session-a", turnId: "turn-a", taskId: "root-a", rootTaskId: "root-a",
@@ -30,16 +36,18 @@ const priorContent = {
   },
 }
 
-function fakePool(options: { readonly contextSnapshotId?: string | null } = {}) {
+function fakePool(options: { readonly contextSnapshotId?: string | null; readonly selectedJobPreparation?: unknown } = {}) {
   const calls: Array<{ sql: string; values: unknown[] }> = []
   const query = vi.fn(async (sql: string, values: unknown[] = []) => {
     calls.push({ sql, values })
     if (sql.includes('FROM "agent_sessions" AS session')) return { rows: [{ id: owner.sessionId }], rowCount: 1 }
-    if (sql.includes('FROM "agent_turns" AS turn')) return { rows: [{ id: owner.turnId, contextSnapshotId: options.contextSnapshotId ?? null }], rowCount: 1 }
+    if (sql.includes('FROM "agent_turns" AS turn')) return { rows: [{ id: owner.turnId, contextSnapshotId: options.contextSnapshotId ?? null,
+      input: options.selectedJobPreparation ? { selectedJobPreparation: options.selectedJobPreparation } : {}, rootTaskId: owner.rootTaskId }], rowCount: 1 }
     if (sql.includes('FROM "agent_sessions" WHERE')) return { rows: [{ goal: "Find a role" }], rowCount: 1 }
     if (sql.includes('FROM "agent_context_snapshots"')) return { rows: [{ id: "snapshot-7", sessionId: owner.sessionId, throughSequence: "7", version: 2, content: priorContent, checksum: "checksum" }], rowCount: 1 }
     if (sql.includes('FROM "agent_approvals"')) return { rows: [{ id: "approval-1", status: "approved", scopeHash: "scope", answersHash: "answers" }], rowCount: 1 }
     if (sql.includes('FROM "agent_artifact_version"')) return { rows: [{ id: "artifact-v2", type: "resume", hash: "hash-v2" }], rowCount: 1 }
+    if (sql.includes('FROM "sub_agent_tasks" AS task')) return { rows: [{ attemptCount: 3 }], rowCount: 1 }
     if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ id: "task-open", status: "running", failureReason: null }], rowCount: 1 }
     if (sql.includes('FROM "agent_inputs"')) return { rows: [
       { id: "input-old", targetTurnId: "turn-old", acceptedSequence: "4", content: { text: "old input" } },
@@ -58,7 +66,7 @@ function fakePool(options: { readonly contextSnapshotId?: string | null } = {}) 
   })
   const client = { query, release: vi.fn() } as unknown as CompactionPgClient
   const pool = { connect: vi.fn(async () => client) } as unknown as CompactionPgPool
-  return { pool, calls, query }
+  return { pool, calls, query, client }
 }
 
 describe("PostgreSQL context compaction source", () => {
@@ -104,5 +112,84 @@ describe("PostgreSQL context compaction source", () => {
     const fake = fakePool({ contextSnapshotId: "explicit-snapshot" })
     await expect(createPgCompactionSource(fake.pool).load({ scope: { userId: owner.userId }, owner })).resolves.toBeNull()
     expect(fake.calls.some(call => call.sql.includes('FROM "agent_items"'))).toBe(false)
+  })
+
+  it("reads the selected-job graph through the same lease-fenced transaction and persists only its typed projection", async () => {
+    const fake = fakePool({ selectedJobPreparation: { jobId: "job-a" } })
+    const graph = { revision: 2, nodes: [
+      { key: "scout-key", taskId: "scout-task", templateId: "scout", status: "completed", readiness: "terminal", goal: "private narrative",
+        successCriteria: ["private"], dependsOn: [], resultSummary: "private summary", failureReason: null, resultProjection: {
+          schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted", availability: "available",
+          role: "scout", status: "completed", candidateCount: 2, evidenceCount: 1,
+          candidates: [{ jobId: "job-a", source: "greenhouse", evidenceKinds: ["job"] }, { jobId: "job-b", source: "lever", evidenceKinds: ["resume"] }],
+        } },
+    ] }
+    const readCurrentWithClient = vi.fn(async (_client: unknown, _scope: unknown) => graph)
+    const taskGraph = { readCurrent: vi.fn(), readCurrentWithClient } as never
+    const source = await createPgCompactionSource(fake.pool, taskGraph).load({ scope: { userId: owner.userId }, owner })
+    expect(createPgTaskGraphCommandPort).not.toHaveBeenCalled()
+    expect(readCurrentWithClient).toHaveBeenCalledOnce()
+    expect(readCurrentWithClient.mock.calls[0]?.[0]).toBe(fake.client)
+    expect(readCurrentWithClient.mock.calls[0]?.[1]).toMatchObject({
+      userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId, parentTaskId: owner.rootTaskId,
+      turnLeaseOwner: owner.ownerId, turnLeaseVersion: owner.leaseVersion, parentLeaseOwner: owner.ownerId, parentAttemptCount: 3,
+    })
+    expect(source?.state.selectedJobMemories?.[0]).toMatchObject({
+      jobId: "job-a", sourceTurnId: owner.turnId, sourceRootTaskId: owner.rootTaskId, graphRevision: 2,
+      nodes: [{ role: "scout", result: { source: "greenhouse", evidenceKinds: ["job"] } }],
+    })
+    const serialized = JSON.stringify(source?.state.selectedJobMemories)
+    expect(serialized).not.toContain("job-b")
+    expect(serialized).not.toContain("private narrative")
+    expect(serialized).not.toContain("scout-task")
+    expect(fake.calls.at(-1)?.sql).toBe("COMMIT")
+  })
+  it("uses the production TaskGraph adapter by default and persists memory from its scoped read", async () => {
+    const fake = fakePool({ selectedJobPreparation: { jobId: "job-a" } })
+    const graph = { revision: 2, nodes: [
+      { key: "scout-key", taskId: "scout-task", templateId: "scout", status: "completed", readiness: "terminal", goal: "private narrative",
+        successCriteria: ["private"], dependsOn: [], resultSummary: "private summary", failureReason: null, resultProjection: {
+          schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted", availability: "available",
+          role: "scout", status: "completed", candidateCount: 1, evidenceCount: 1,
+          candidates: [{ jobId: "job-a", source: "greenhouse", evidenceKinds: ["job"] }],
+        } },
+    ] }
+    const readCurrentWithClient = vi.fn(async (_client: unknown, _scope: unknown) => graph)
+    const commandPort = { readCurrentWithClient } as unknown as TaskGraphCommandPort
+    vi.mocked(createPgTaskGraphCommandPort).mockReturnValue(commandPort)
+
+    const source = await createPgCompactionSource(fake.pool).load({ scope: { userId: owner.userId }, owner })
+
+    expect(createPgTaskGraphCommandPort).toHaveBeenCalledOnce()
+    expect(createPgTaskGraphCommandPort).toHaveBeenCalledWith(fake.pool)
+    expect(readCurrentWithClient).toHaveBeenCalledOnce()
+    expect(readCurrentWithClient.mock.calls[0]?.[0]).toBe(fake.client)
+    expect(readCurrentWithClient.mock.calls[0]?.[1]).toMatchObject({
+      userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId, parentTaskId: owner.rootTaskId,
+      turnLeaseOwner: owner.ownerId, turnLeaseVersion: owner.leaseVersion, parentLeaseOwner: owner.ownerId, parentAttemptCount: 3,
+    })
+    expect(source?.state.selectedJobMemories?.[0]).toMatchObject({
+      jobId: "job-a", sourceTurnId: owner.turnId, sourceRootTaskId: owner.rootTaskId, graphRevision: 2,
+      nodes: [{ role: "scout", result: { source: "greenhouse", evidenceKinds: ["job"] } }],
+    })
+    expect(JSON.stringify(source?.state.selectedJobMemories)).not.toContain("private narrative")
+    expect(fake.calls.at(-1)?.sql).toBe("COMMIT")
+  })
+  it("does not read or persist selected-job memory for a malformed server selector", async () => {
+    const fake = fakePool({ selectedJobPreparation: { jobId: "job-a", authority: "extra" } })
+    const readCurrentWithClient = vi.fn()
+    const source = await createPgCompactionSource(fake.pool, { readCurrentWithClient } as never).load({ scope: { userId: owner.userId }, owner })
+    expect(readCurrentWithClient).not.toHaveBeenCalled()
+    expect(source?.state.selectedJobMemories).toEqual([])
+  })
+
+  it("omits selected-job memory when the default lease-fenced TaskGraph read is rejected", async () => {
+    const fake = fakePool({ selectedJobPreparation: { jobId: "job-a" } })
+    const readCurrentWithClient = vi.fn(async () => { throw new Error("task_graph_turn_fenced") })
+    vi.mocked(createPgTaskGraphCommandPort).mockReturnValue({ readCurrentWithClient } as never)
+    const source = await createPgCompactionSource(fake.pool).load({ scope: { userId: owner.userId }, owner })
+    expect(createPgTaskGraphCommandPort).toHaveBeenCalledWith(fake.pool)
+    expect(readCurrentWithClient).toHaveBeenCalledOnce()
+    expect(source?.state.selectedJobMemories).toEqual([])
   })
 })

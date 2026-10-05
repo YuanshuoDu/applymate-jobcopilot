@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest"
 
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
 import { sha256Hex } from "./context/context-compaction-canonical.js"
+import { projectSelectedJobMemory } from "./context/selected-job-memory.js"
 import { contextToModelMessages } from "./turns/turn-engine-messages.js"
 import { STEERING_MARKER_EVENT_TYPE, steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "./context/steering-marker.js"
 import { buildCognitiveActionAgenda } from "./turns/cognitive-action-agenda.js"
@@ -68,14 +69,19 @@ function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unk
 }
 
 describe("loadCanonicalTurnState", () => {
-  it("hydrates durable compaction state from the persisted snapshot after a Worker restart", async () => {
+  it("hydrates typed selected-job memory separately from generic context after a Worker restart", async () => {
+    const memory = projectSelectedJobMemory({
+      jobId: "selected-job-secret", sourceTurnId: "turn-1", sourceRootTaskId: "root-1", throughSequence: "7",
+      graph: { revision: 1, nodes: [{ key: "scout", templateId: "scout", goal: "private narrative", successCriteria: ["private criterion"], dependsOn: [], taskId: "private-child", status: "completed", readiness: "terminal", resultSummary: "private result", failureReason: "private failure", resultProjection: { schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted", availability: "unavailable" } }] },
+    })
+    if (!memory) throw new Error("selected-job memory fixture should be valid")
     const state = {
       ownerId: "user-1", sessionId: "session-1", throughSequence: "7", goal: "Search Dublin roles", userConstraints: ["Dublin only"],
       approvals: [{ id: "approval-1", status: "pending" }],
       answers: [{ id: "answer-1", question: "Work authorization?", answer: "Confirmed" }],
       artifacts: [{ id: "artifact-1", type: "resume", hash: "sha256:artifact" }],
       openTasks: [{ taskId: "task-1", status: "running", blocker: null }], doNotRepeat: ["repeat rejection"],
-      facts: [{ factId: "fact-1", key: "target_role", source: "persona_fact:fact-1" }],
+      facts: [{ factId: "fact-1", key: "target_role", source: "persona_fact:fact-1" }], selectedJobMemories: [memory],
     }
     const summary = "Only a short narrative summary"
     const measurement = { beforeInputTokens: 100, afterInputTokens: 40, reductionTokens: 60, reductionRatio: 0.6 }
@@ -94,6 +100,9 @@ describe("loadCanonicalTurnState", () => {
     })
 
     const restored = await loadCanonicalTurnState(fake, lease)
+    expect(restored.selectedJobMemories).toEqual([memory])
+    expect(JSON.stringify(restored.snapshot.toolObservations)).not.toContain("selected-job-memory")
+    expect(JSON.stringify(restored.snapshot.toolObservations)).not.toContain("selected-job-secret")
     expect(restored.snapshot.toolObservations).toEqual([expect.objectContaining({
       id: "snapshot-working-state:session-1:7",
       content: expect.objectContaining({
@@ -124,6 +133,24 @@ describe("loadCanonicalTurnState", () => {
     expect(requestText).toContain("context_snapshot_working_state")
     expect(requestText).toContain("Search Dublin roles")
     expect(requestText).toContain("UNTRUSTED_DATA")
+    expect(requestText).not.toContain("selected_job_memory")
+    expect(requestText).not.toContain("selected-job-secret")
+
+    for (const field of ["ownerId", "sessionId"] as const) {
+      const foreignValue = field === "ownerId" ? "user-foreign" : "session-foreign"
+      const foreignState = { ...state, [field]: foreignValue }
+      const foreignCompaction = {
+        ...compaction,
+        state: foreignState,
+        digest: sha256Hex({ state: foreignState, summary, measurement, sourceItemIds, itemId }),
+      }
+      const foreignSnapshot = { ...snapshot, [field]: foreignValue, compaction: foreignCompaction }
+      const foreign = pool({
+        turn: { input: { goal: "Continue search" }, rootTaskId: null, contextSnapshotId: "snapshot-1", modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+        snapshots: [{ id: "snapshot-1", throughSequence: "7", version: 1, content: foreignSnapshot }],
+      })
+      await expect(loadCanonicalTurnState(foreign, lease)).rejects.toThrow("context_snapshot_scope_mismatch")
+    }
   })
 
   it("fails closed when a loaded snapshot cursor disagrees with its database cursor", async () => {

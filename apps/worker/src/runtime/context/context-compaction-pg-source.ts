@@ -4,6 +4,9 @@ import { parseSnapshotContent } from "./context-snapshot-canonical.js"
 import { canonicalJson, sha256Hex, type CanonicalJsonValue } from "./context-compaction-canonical.js"
 import type { CompactionAnswer, CompactionArtifact, CompactionFact, CompactionInputItem, CompactionOpenTask, CompactionSource, CompactionState } from "./context-compaction-types.js"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
+import type { TaskGraphCommandPort, TaskGraphCurrentState, TaskGraphReadScope } from "../subagents/task-graph-command-port.js"
+import { createPgTaskGraphCommandPort } from "../subagents/pg-task-graph-command-port.js"
+import { projectSelectedJobMemory, mergeSelectedJobMemories, parseSelectedJobMemories } from "./selected-job-memory.js"
 import {
   assertCompactionScope, isRecord, latestCompactionSnapshot, withCompactionOwner,
   type CompactionPgClient, type CompactionPgPool, type CompactionPgRow,
@@ -32,6 +35,13 @@ function previousNarrativeSummary(content: unknown): string | null {
 }
 function strings(value: unknown): string[] { return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0) : [] }
 function records<T>(value: unknown): T[] { return Array.isArray(value) ? value.filter(isRecord) as T[] : [] }
+function selectedJobId(value: unknown): string | undefined {
+  const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
+  if (!isRecord(parsed) || !isRecord(parsed.selectedJobPreparation)) return undefined
+  const selection = parsed.selectedJobPreparation
+  return Object.keys(selection).length === 1 && typeof selection.jobId === "string" && selection.jobId.trim() === selection.jobId
+    && selection.jobId.length > 0 && selection.jobId.length <= 256 ? selection.jobId : undefined
+}
 function answerValue(input: InputRow): CompactionAnswer {
   const value = input.content
   const answer = typeof value === "string" ? value : isRecord(value) && typeof value.answer === "string" ? value.answer
@@ -46,7 +56,7 @@ function mergeById<T extends { readonly id: string }>(previous: readonly T[], cu
 function stateFrom(input: {
   readonly userId: string; readonly sessionId: string; readonly goal: string; readonly cursor: bigint; readonly previous: StoredCompactionState | null
   readonly snapshotContent: unknown; readonly approvals: readonly CompactionPgRow[]; readonly artifacts: readonly CompactionPgRow[]
-  readonly tasks: readonly CompactionPgRow[]; readonly inputs: readonly InputRow[]
+  readonly tasks: readonly CompactionPgRow[]; readonly inputs: readonly InputRow[]; readonly selectedJobMemories: readonly import("./selected-job-memory.js").SelectedJobMemoryRecord[]
 }): CompactionState {
   const content = isRecord(input.snapshotContent) ? input.snapshotContent : {}
   const oldFacts = records<CompactionFact>(content.facts)
@@ -66,9 +76,29 @@ function stateFrom(input: {
     userConstraints: strings(content.userConstraints), approvals: [...mergedApprovals.values()].sort((a, b) => a.id.localeCompare(b.id)), answers: [...answers.values()].sort((a, b) => a.id.localeCompare(b.id)),
     artifacts: mergedArtifacts, openTasks: tasks.sort((a, b) => a.taskId.localeCompare(b.taskId)),
     doNotRepeat: [...new Set([...strings(input.previous?.doNotRepeat), ...failedAttempts])].sort(), facts,
+    selectedJobMemories: [...input.selectedJobMemories],
   }
 }
-async function readState(client: CompactionPgClient, owner: TurnExecutionOwnerFence) {
+async function currentSelectedJobMemory(client: CompactionPgClient, owner: TurnExecutionOwnerFence, turn: CompactionPgRow,
+  commandPort: TaskGraphCommandPort | undefined, throughSequence: bigint): Promise<import("./selected-job-memory.js").SelectedJobMemoryRecord | undefined> {
+  const jobId = selectedJobId(turn.input)
+  if (!jobId || !commandPort?.readCurrentWithClient || turn.rootTaskId !== owner.rootTaskId || owner.rootTaskId !== owner.taskId) return undefined
+  const parent = await client.query<{ attemptCount: number | string }>(`SELECT task."attemptCount" FROM "sub_agent_tasks" AS task
+    JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+    WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $1
+      AND task."status" = 'running' AND task."leaseOwner" = $4 AND task."interruptRequestedAt" IS NULL
+      AND session."userId" = $5 FOR UPDATE OF task`, [owner.rootTaskId, owner.sessionId, owner.turnId, owner.ownerId, owner.userId])
+  const attemptCount = Number(parent.rows[0]?.attemptCount)
+  if (!Number.isSafeInteger(attemptCount) || attemptCount < 1) return undefined
+  const scope: TaskGraphReadScope = {
+    userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId, parentTaskId: owner.rootTaskId,
+    turnLeaseOwner: owner.ownerId, turnLeaseVersion: owner.leaseVersion, parentLeaseOwner: owner.ownerId, parentAttemptCount: attemptCount,
+  }
+  let graph: TaskGraphCurrentState
+  try { graph = await commandPort.readCurrentWithClient(client as unknown as import("pg").PoolClient, scope) } catch { return undefined }
+  return projectSelectedJobMemory({ jobId, sourceTurnId: owner.turnId, sourceRootTaskId: owner.rootTaskId, throughSequence: throughSequence.toString(), graph }) ?? undefined
+}
+async function readState(client: CompactionPgClient, owner: TurnExecutionOwnerFence, turn: CompactionPgRow, commandPort?: TaskGraphCommandPort) {
   const session = await client.query<CompactionPgRow>(`SELECT "goal" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2`, [owner.sessionId, owner.userId])
   if (!session.rows[0]) return null
   const latest = await latestCompactionSnapshot(client, owner.sessionId)
@@ -98,15 +128,19 @@ async function readState(client: CompactionPgClient, owner: TurnExecutionOwnerFe
     ...inputRows.rows.filter(row => sequence(row.acceptedSequence) > cursor).map(row => ({ id: `input:${row.id}`, sessionId: owner.sessionId, turnId: row.targetTurnId ?? owner.turnId, sequence: sequence(row.acceptedSequence), type: "user_input", status: "completed", content: row.content })),
   ].sort((left, right) => left.sequence < right.sequence ? -1 : left.sequence > right.sequence ? 1 : left.id.localeCompare(right.id))
   const throughSequence = items.reduce((max, item) => item.sequence > max ? item.sequence : max, cursor)
+  const currentMemory = await currentSelectedJobMemory(client, owner, turn, commandPort, throughSequence)
+  const priorMemories = parseSelectedJobMemories(prior?.selectedJobMemories, true) ?? []
+  const selectedJobMemories = mergeSelectedJobMemories(priorMemories, currentMemory ? [currentMemory] : [])
   const state = stateFrom({ userId: owner.userId, sessionId: owner.sessionId, goal: String(session.rows[0].goal), cursor: throughSequence, previous: prior, snapshotContent: content,
-    approvals: approvalRows.rows, artifacts: artifactRows.rows, tasks: taskRows.rows, inputs: inputRows.rows })
+    approvals: approvalRows.rows, artifacts: artifactRows.rows, tasks: taskRows.rows, inputs: inputRows.rows, selectedJobMemories })
   return { state, items }
 }
 
-export function createPgCompactionSource(pool: CompactionPgPool): CompactionSourcePort {
+export function createPgCompactionSource(pool: CompactionPgPool, taskGraphCommandPort?: TaskGraphCommandPort): CompactionSourcePort {
+  const currentTaskGraph = taskGraphCommandPort ?? createPgTaskGraphCommandPort(pool)
   return { async load(input): Promise<CompactionSource | null> {
     assertCompactionScope(input.scope, input.owner, input.owner.sessionId, input.owner.turnId)
     return withCompactionOwner(pool, input.scope, input.owner, (client, turn) =>
-      turn.contextSnapshotId === null ? readState(client, input.owner) : Promise.resolve(null))
+      turn.contextSnapshotId === null ? readState(client, input.owner, turn, currentTaskGraph) : Promise.resolve(null))
   } }
 }

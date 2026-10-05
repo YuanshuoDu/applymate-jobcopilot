@@ -5,18 +5,24 @@ import { completeCompactionItem, createCompactionStartedItem } from "./context-c
 import type { CompactionSnapshotDraft, CompactionSource } from "./context-compaction-types.js"
 import type { CompactionPgClient, CompactionPgPool, CompactionPgRow } from "./context-compaction-pg-store.js"
 import { createPgContextSnapshotCompactionPort } from "./context-snapshot-compaction-pg.js"
+import { parseSnapshotContent } from "./context-snapshot-canonical.js"
+import { projectSelectedJobMemory } from "./selected-job-memory.js"
 
 const owner: TurnExecutionOwnerFence = {
   kind: "turn", userId: "user-a", sessionId: "session-a", turnId: "turn-a", taskId: "root-a", rootTaskId: "root-a",
   ownerId: "worker-a", leaseVersion: 4, leaseExpiresAt: new Date(Date.now() + 60_000),
 }
 const scope = { userId: owner.userId }
+const selectedJobMemory = projectSelectedJobMemory({
+  jobId: "job-a", sourceTurnId: owner.turnId, sourceRootTaskId: owner.rootTaskId, throughSequence: "7",
+  graph: { revision: 1, nodes: [{ templateId: "analyst", status: "completed", readiness: "terminal" }] },
+})!
 const source: CompactionSource = {
-  state: { ownerId: owner.userId, sessionId: owner.sessionId, throughSequence: 7n, goal: "Find a role", userConstraints: ["EU"], approvals: [], answers: [], artifacts: [], openTasks: [], doNotRepeat: [], facts: [] },
+  state: { ownerId: owner.userId, sessionId: owner.sessionId, throughSequence: 7n, goal: "Find a role", userConstraints: ["EU"], approvals: [], answers: [], artifacts: [], openTasks: [], doNotRepeat: [], facts: [], selectedJobMemories: [selectedJobMemory] },
   items: [{ id: "item-1", sessionId: owner.sessionId, turnId: owner.turnId, sequence: 7n, type: "agent_message", status: "completed", content: "Useful context" }],
 }
 const started = createCompactionStartedItem({ sessionId: owner.sessionId, turnId: owner.turnId, throughSequence: 7n, source, reason: "manual", id: "compaction-1" })
-const report = { preserved: true, preservedFields: ["goal", "approvals", "answers", "artifact_hashes", "open_tasks", "do_not_repeat"] as const, missingFields: [], changedFields: [], beforeDigest: "before", afterDigest: "after" }
+const report = { preserved: true, preservedFields: ["goal", "approvals", "answers", "artifact_hashes", "open_tasks", "do_not_repeat", "selected_job_memories"] as const, missingFields: [], changedFields: [], beforeDigest: "before", afterDigest: "after" }
 const completed = completeCompactionItem(started, { summary: "Short summary", measurement: { beforeInputTokens: 100, afterInputTokens: 40, reductionTokens: 60, reductionRatio: 0.6 }, report })
 const draft: CompactionSnapshotDraft = { scope, turnId: owner.turnId, state: source.state, narrativeSummary: "Short summary", tokenMeasurement: { beforeInputTokens: 100, afterInputTokens: 40, reductionTokens: 60, reductionRatio: 0.6 }, sourceItemIds: ["item-1"], reason: "manual" }
 
@@ -93,6 +99,8 @@ describe("PostgreSQL context snapshot compaction publisher", () => {
     expect(first).toEqual({ id: `context-compaction:${owner.sessionId}:7`, sessionId: owner.sessionId, throughSequence: 7n, version: 1 })
     expect(second).toEqual(first)
     expect(fake.state.snapshots).toHaveLength(1)
+    const content = fake.state.snapshots[0]?.content
+    expect(parseSnapshotContent(content).compaction?.state?.selectedJobMemories).toEqual([selectedJobMemory])
     expect(fake.state.items[started.id]).toMatchObject({ status: "completed", revision: 1 })
     expect(Object.values(fake.state.events).map(event => event.type)).toEqual(["item.started", "item.completed"])
     expect(Object.keys(fake.state.outbox)).toEqual([`agent-event:${started.id}:started`, `agent-event:${started.id}:completed`])
