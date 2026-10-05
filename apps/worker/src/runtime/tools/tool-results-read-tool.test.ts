@@ -15,7 +15,7 @@ const owner = {
 } satisfies ExecutionOwner
 
 const context: ToolExecutionContext = {
-  scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "step-1", taskId: "root-1",
+  scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "step-1", taskId: "root-1", toolCallId: "read-call-1",
   signal: new AbortController().signal, capabilities: ["read"], reportProgress: vi.fn(async () => undefined),
 }
 
@@ -34,7 +34,7 @@ describe("tool_results.read", () => {
 
     expect(result).toMatchObject({ ref: "ref-1", nextCursor: null })
     expect(resolveOwner).toHaveBeenCalledWith(context)
-    expect(repo.read).toHaveBeenCalledWith(owner, { referenceId: "ref-1" })
+    expect(repo.read).toHaveBeenCalledWith(owner, { referenceId: "ref-1" }, "read-call-1")
     expect(tool.name).toBe("tool_results.read")
     expect(tool.domain).toBe("coordination")
   })

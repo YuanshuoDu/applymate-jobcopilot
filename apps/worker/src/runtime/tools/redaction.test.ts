@@ -16,6 +16,29 @@ const spawnReceipt = {
   replay: false,
 } as const
 
+const durableWaitId = "wait-12345678-1234-4234-9234-123456789012"
+const durableWaitTaskId = "subagent-12345678-1234-4234-9234-123456789012"
+
+function durableWaitOutput() {
+  return {
+    waitId: durableWaitId,
+    status: "ready",
+    taskIds: [durableWaitTaskId],
+    deadlineAt: "2026-10-04T12:00:00.000Z",
+    matchedTaskIds: [durableWaitTaskId],
+    tasks: [{
+      taskId: durableWaitTaskId,
+      status: "completed",
+      role: "scout",
+      result: {
+        description: "Contact candidate@example.com at 202-555-0199",
+        privateNotes: { content: "private candidate details" },
+      },
+      failureReason: null,
+    }],
+  }
+}
+
 describe("tool lifecycle redaction", () => {
   it("uses the shared TaskGraph limits for plan receipts", () => {
     const node = (index: number, key: string) => ({
@@ -41,27 +64,44 @@ describe("tool lifecycle redaction", () => {
     })).toThrow("task_graph_receipt_invalid")
   })
 
-  it("preserves only a canonical generated durable wait ID", () => {
-    const waitId = "wait-12345678-1234-4234-9234-123456789012"
-    const output = { waitId, status: "ready", detail: "Contact candidate@example.com at 202-555-0199" }
+  it("preserves canonical wait IDs while redacting private text in the same receipt", () => {
+    const output = durableWaitOutput()
 
     expect(prepareLifecycleValue(output).safe).not.toEqual(output)
     expect(prepareDurableWaitOutput(output).safe).toEqual({
-      waitId,
+      waitId: durableWaitId,
       status: "ready",
-      detail: "Contact [REDACTED_EMAIL] at [REDACTED_PHONE]",
+      taskIds: [durableWaitTaskId],
+      deadlineAt: "2026-10-04T12:00:00.000Z",
+      matchedTaskIds: [durableWaitTaskId],
+      tasks: [{
+        taskId: durableWaitTaskId,
+        status: "completed",
+        role: "scout",
+        result: {
+          description: "Contact [REDACTED_EMAIL] at [REDACTED_PHONE]",
+          privateNotes: { content: "[REDACTED]" },
+        },
+        failureReason: null,
+      }],
     })
   })
 
-  it("redacts malformed wait IDs and rejects accessor-shaped wait receipts", () => {
-    expect(prepareDurableWaitOutput({ waitId: "wait-123", status: "ready" }).safe).toEqual({
-      waitId: "[REDACTED]",
-      status: "ready",
-    })
+  it("rejects malformed, incomplete, and accessor-shaped durable wait receipts", () => {
+    expect(() => prepareDurableWaitOutput({
+      ...durableWaitOutput(),
+      waitId: "wait-123",
+    })).toThrow("durable_wait_receipt_invalid")
+    expect(() => prepareDurableWaitOutput({ waitId: durableWaitId, status: "ready" })).toThrow("durable_wait_receipt_invalid")
+    expect(() => prepareDurableWaitOutput({
+      ...durableWaitOutput(),
+      injected: "candidate@example.com",
+    })).toThrow("durable_wait_receipt_invalid")
 
-    const accessorReceipt = Object.defineProperty({ status: "ready" }, "waitId", {
+    const accessorReceipt = durableWaitOutput()
+    Object.defineProperty(accessorReceipt, "waitId", {
       enumerable: true,
-      get: () => "wait-12345678-1234-4234-9234-123456789012",
+      get: () => durableWaitId,
     })
     expect(() => prepareDurableWaitOutput(accessorReceipt)).toThrow("durable_wait_receipt_invalid")
   })

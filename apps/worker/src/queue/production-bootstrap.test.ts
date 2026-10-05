@@ -286,6 +286,14 @@ function durableCompositionPool(input: {
 
       if (sql.includes('FROM "agent_items" AS item LEFT JOIN')) return response<T>([])
       if (sql.includes('FROM "agent_items" WHERE')) return response<T>([])
+      if (
+        sql.includes('UPDATE "agent_inputs"') &&
+        sql.includes("SET \"status\" = 'cancelled', \"cancelledAt\" = $4") &&
+        sql.includes('"targetTurnId" = $3') &&
+        sql.includes("\"delivery\" = 'follow_up'") &&
+        sql.includes("\"status\" IN ('accepted', 'queued', 'consumed')") &&
+        sql.includes('"cancelledAt" IS NULL')
+      ) return response<T>([], 0)
       if (sql.includes('FROM "agent_inputs"')) return response<T>([])
       if (sql.includes('FROM "agent_context_snapshots"')) return response<T>([])
 
@@ -760,8 +768,8 @@ describe("production Worker bootstrap", () => {
 
   it("composes root TurnEngine coordination with two leased child executions and wait closure", async () => {
     const now = new Date("2026-09-01T00:00:00.000Z")
-    const childA: SubagentTaskRecord = { id: "child_fixture_a", userId: "user_fixture", sessionId: "session_fixture", turnId: "turn_fixture", rootTaskId: "root_fixture", parentTaskId: "root_fixture", path: "/root_fixture/child_fixture_a", depth: 1, role: "scout", taskType: "research", status: "queued", goal: "Find scout evidence", constraints: [], successCriteria: [], allowedActions: ["fixture.read"], context: { privateMarker: "child-a-private-marker" }, expectedOutputSchema: null, result: null, failureReason: null, attemptCount: 0, maxAttempts: 3, nextAttemptAt: null, leaseOwner: null, leaseExpiresAt: null, interruptRequestedAt: null, budgetSnapshot: { limits: { maxSteps: 4 }, subagentPolicy: { maxAttempts: 3 } }, toolPolicySnapshot: { capabilities: ["read"] } }
-    const childB: SubagentTaskRecord = { ...childA, id: "child_fixture_b", path: "/root_fixture/child_fixture_b", role: "analyst", goal: "Find analyst evidence", context: { privateMarker: "child-b-private-marker" } }
+    const childA: SubagentTaskRecord = { id: "subagent-aaaaaaaa-bbbb-4ccc-8ddd-facefeedfeaa", userId: "user_fixture", sessionId: "session_fixture", turnId: "turn_fixture", rootTaskId: "root_fixture", parentTaskId: "root_fixture", path: "/root_fixture/subagent-aaaaaaaa-bbbb-4ccc-8ddd-facefeedfeaa", depth: 1, role: "scout", taskType: "research", status: "queued", goal: "Find scout evidence", constraints: [], successCriteria: [], allowedActions: ["fixture.read"], context: { privateMarker: "child-a-private-marker" }, expectedOutputSchema: null, result: null, failureReason: null, attemptCount: 0, maxAttempts: 3, nextAttemptAt: null, leaseOwner: null, leaseExpiresAt: null, interruptRequestedAt: null, budgetSnapshot: { limits: { maxSteps: 4 }, subagentPolicy: { maxAttempts: 3 } }, toolPolicySnapshot: { capabilities: ["read"] } }
+    const childB: SubagentTaskRecord = { ...childA, id: "subagent-bbbbbbbb-cccc-4ddd-9eee-beefbeefbeeb", path: "/root_fixture/subagent-bbbbbbbb-cccc-4ddd-9eee-beefbeefbeeb", role: "analyst", goal: "Find analyst evidence", context: { privateMarker: "child-b-private-marker" } }
     const childBySpawnKey = new Map([["spawn_fixture_a", childA], ["spawn_fixture_b", childB]])
     const rootTask: SubagentTaskRecord = { ...childA, id: "root_fixture", parentTaskId: null, path: "/root_fixture", depth: 0, role: "orchestrator", taskType: "turn", status: "running" }
     const tasks = new Map<string, SubagentTaskRecord>()
@@ -818,7 +826,7 @@ describe("production Worker bootstrap", () => {
     const childOwners: ExecutionOwnerFence[] = []
     const childToolRuntimeFactory = vi.fn(({ task, lease, owner }: { task: SubagentTaskRecord; lease: SubagentLease; owner: ExecutionOwnerFence }) => {
       childOwners.push(owner)
-      expect(task.id).toMatch(/^child_fixture_[ab]$/)
+      expect([childA.id, childB.id]).toContain(task.id)
       expect(lease.id).toBe(task.id)
       expect(owner).toMatchObject({ userId: "user_fixture", sessionId: "session_fixture", turnId: "turn_fixture", taskId: task.id, rootTaskId: "root_fixture", ownerId: `queue_${task.id.slice(-1)}`, attemptCount: 1 })
       return {

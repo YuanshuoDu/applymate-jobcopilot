@@ -2,6 +2,8 @@ import { createHash } from "node:crypto"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import { canonicalJson, redactSensitiveText, redactSensitiveValue } from "@jobcopilot/shared"
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
+import { redactDurableWaitOutput } from "./durable-wait-output-redaction.js"
+import { MAX_TOOL_RESULT_BYTES, MAX_TOOL_RESULT_READ_BYTES, type ToolResultChunk } from "./tool-result-reference-types.js"
 export const DEFAULT_MAX_LIFECYCLE_BYTES = 8 * 1024
 
 export interface ToolResultReference {
@@ -51,6 +53,7 @@ const SPAWN_RECEIPT_FIELDS = ["taskId", "rootTaskId", "parentTaskId", "path", "d
 const SPAWN_STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
 const MAX_SUBAGENT_DEPTH = 8
 const DURABLE_WAIT_ID = /^wait-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+const TOOL_RESULT_REF = /^tool-result-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 
 export function isDurableWaitId(value: unknown): value is string {
   return typeof value === "string" && DURABLE_WAIT_ID.test(value)
@@ -136,24 +139,36 @@ export function prepareSubagentSpawnReceipt(
   return prepareSafeValue({ taskId, rootTaskId, parentTaskId, path, depth, status, replay })
 }
 
-/** Preserves only a durable wait ID in an otherwise generically redacted result. */
+/** Validates and redacts a durable wait result before computing its canonical receipt. */
 export function prepareDurableWaitOutput(value: unknown): PreparedLifecycleValue {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return prepareLifecycleValue(value)
-  const prototype = Object.getPrototypeOf(value)
-  const waitId = Object.getOwnPropertyDescriptor(value, "waitId")
-  if (waitId && ((prototype !== Object.prototype && prototype !== null) || !waitId.enumerable || !("value" in waitId))) {
-    throw invalidWaitReceipt()
-  }
+  return prepareSafeValue(redactDurableWaitOutput(value))
+}
 
-  const prepared = prepareLifecycleValue(value)
-  if (prepared.safe === null || typeof prepared.safe !== "object" || Array.isArray(prepared.safe)) {
-    if (waitId) throw invalidWaitReceipt()
-    return prepared
+export function prepareVerifiedToolResultChunk(value: ToolResultChunk): PreparedLifecycleValue | null {
+  const fields = ["ref", "sha256", "byteCount", "chunk", "nextCursor"] as const
+  try {
+    if (Object.getPrototypeOf(value) !== Object.prototype || !Object.isFrozen(value)
+      || Reflect.ownKeys(value).length !== fields.length) return null
+    for (const field of fields) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, field)
+      if (!descriptor?.enumerable || !("value" in descriptor)) return null
+    }
+    if (!TOOL_RESULT_REF.test(value.ref) || !/^[0-9a-f]{64}$/.test(value.sha256)
+      || !Number.isSafeInteger(value.byteCount) || value.byteCount < 0 || value.byteCount > MAX_TOOL_RESULT_BYTES
+      || typeof value.chunk !== "string" || Buffer.byteLength(value.chunk, "utf8") > MAX_TOOL_RESULT_READ_BYTES
+      || Buffer.from(value.chunk, "utf8").toString("utf8") !== value.chunk
+      || (value.nextCursor !== null && (!/^(0|[1-9]\d*)$/.test(value.nextCursor) || Number(value.nextCursor) > value.byteCount))) return null
+    if (Buffer.byteLength(JSON.stringify(value), "utf8") > MAX_TOOL_RESULT_READ_BYTES) return null
+    return prepareSafeValue({
+      ref: value.ref,
+      sha256: value.sha256,
+      byteCount: value.byteCount,
+      chunk: value.chunk,
+      nextCursor: value.nextCursor,
+    })
+  } catch {
+    return null
   }
-  const safeWaitId = waitId && isDurableWaitId(waitId.value) ? waitId.value : "[REDACTED]"
-  if (prepared.safe.status === "waiting" && safeWaitId === "[REDACTED]") throw invalidWaitReceipt()
-  if (!waitId) return prepared
-  return prepareSafeValue({ ...prepared.safe, waitId: safeWaitId })
 }
 
 export function sanitizeLifecyclePreview(value: unknown, maxBytes = DEFAULT_MAX_LIFECYCLE_BYTES): RepositoryJsonValue {
@@ -175,7 +190,7 @@ export async function sanitizeForLifecycle(
   return sanitizeLifecyclePreview(value, maxBytes)
 }
 
-function prepareSafeValue(safe: RepositoryJsonValue): PreparedLifecycleValue {
+export function prepareSafeValue(safe: RepositoryJsonValue): PreparedLifecycleValue {
   const encoded = canonicalJson(safe)
   return {
     safe,
@@ -225,10 +240,6 @@ function isGeneratedTaskId(value: unknown, turnId: string): value is string {
 
 function invalidSpawnReceipt(): Error {
   return new Error("subagent_spawn_receipt_invalid")
-}
-
-function invalidWaitReceipt(): Error {
-  return new Error("durable_wait_receipt_invalid")
 }
 
 function invalidPlanReceipt(): Error {

@@ -43,7 +43,7 @@ export function createToolResultsReadTool(
     execute: async (context, input) => {
       try {
         const owner = resolveOwner(context)
-        const result = await repository.read(owner, input)
+        const result = await repository.read(owner, input, context.toolCallId)
         if (!result) throw new ToolExecutionError("tool_result_not_found", "Tool result is unavailable")
         return result
       } catch (error) {

@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest"
 vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnect: vi.fn() })) }))
 vi.mock("./selected-job-preparation.js", () => ({ loadSelectedJobPreparation: vi.fn(async () => undefined) }))
 
+import { redactSensitiveValue } from "@jobcopilot/shared"
 import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
 import type pg from "pg"
 import type { StepContext } from "./context/step-context-builder.js"
@@ -25,6 +26,7 @@ const lease = {
 }
 type TurnEngineStoreFactory = NonNullable<CanonicalTurnRuntimeOptions["turnEngineStoreFactory"]>
 const recoveredPlanHash = `sha256:${"a".repeat(64)}`
+const canonicalJobId = "00000000-0000-4000-8000-000000000001"
 type RuntimeEvent = { id?: string; type: string; payload: unknown; correlationId?: string; idempotencyKey?: string; owner?: unknown }
 
 function state(overrides: Partial<CanonicalTurnState> = {}): CanonicalTurnState {
@@ -121,7 +123,7 @@ function realPgBoundary() {
     }),
     release: vi.fn(),
   }
-  const jobs = [{ id: "job-1", company: "Example", role: "Engineer", location: "Dublin", status: "open", score: 8, url: "https://jobs.example/1", source: "fixture", salary: null, description: "Role contact candidate@example.test with key sk-secretvalue123", keywords: null, createdAt: new Date("2026-09-07T00:00:00.000Z"), updatedAt: new Date("2026-09-07T00:00:00.000Z") }]
+  const jobs = [{ id: canonicalJobId, company: "Example", role: "Engineer", location: "Dublin", status: "open", score: 8, url: "https://jobs.example/1", source: "fixture", salary: null, description: "Role contact candidate@example.test with key sk-secretvalue123", keywords: null, createdAt: new Date("2026-09-07T00:00:00.000Z"), updatedAt: new Date("2026-09-07T00:00:00.000Z") }]
   const pool = {
     connect: vi.fn(async () => client),
     query: vi.fn(async (sql: string) => sql.includes('FROM "Job"') ? { rows: jobs, rowCount: 1 } : { rows: [], rowCount: 0 }),
@@ -1271,6 +1273,7 @@ describe("createCanonicalTurnRuntime", () => {
     const pg = realPgBoundary()
     const roots = rootStore()
     const requests: HarnessModelRequest[] = []
+    expect(redactSensitiveValue(canonicalJobId)).toBe("[REDACTED_PHONE]")
     const events: Array<{ type: string; payload: unknown }> = []
     let modelCalls = 0
     const modelRuntime = await createCanonicalTurnRuntime(pg.pool, {
@@ -1296,10 +1299,10 @@ describe("createCanonicalTurnRuntime", () => {
     const result = await modelRuntime.execute({ lease, signal: new AbortController().signal })
     expect(result).toMatchObject({ status: "completed" })
     expect(modelCalls).toBe(2)
-    expect(requests[1]?.messages.some(message => JSON.stringify(message).includes("job-1"))).toBe(true)
+    expect(requests[1]?.messages.some(message => JSON.stringify(message).includes(canonicalJobId))).toBe(true)
     expect(JSON.stringify(requests[1]?.messages)).not.toContain("candidate@example.test")
     expect(JSON.stringify(requests[1]?.messages)).not.toContain("sk-secretvalue123")
-    expect(events.some(event => event.type === "tool_call.completed" && JSON.stringify(event.payload).includes("job-1"))).toBe(true)
+    expect(events.some(event => event.type === "tool_call.completed" && JSON.stringify(event.payload).includes(canonicalJobId))).toBe(true)
     expect(JSON.stringify(events)).not.toContain("candidate@example.test")
     expect(JSON.stringify(events)).not.toContain("sk-secretvalue123")
     expect(pg.pool.query).toHaveBeenCalledWith(expect.stringContaining('FROM "Job"'), expect.any(Array))

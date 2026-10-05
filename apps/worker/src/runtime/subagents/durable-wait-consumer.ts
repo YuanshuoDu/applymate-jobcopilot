@@ -4,6 +4,7 @@ import type pg from "pg"
 import type { TurnLease } from "../turns/lease.js"
 import { parseTaskGraphRepairReceipt, parseTaskGraphVerificationReport, taskGraphVerificationReportMatchesStatus, type TaskGraphRepairReceipt, type TaskGraphVerificationReport } from "./task-graph-command-port.js"
 import { parseTaskGraphSnapshot, taskGraphItemId, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
+import { isTerminalSubagentStatus } from "./types.js"
 type Queryable = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
 type Projection = { readonly id: string; readonly content: RepositoryJsonValue }
@@ -13,13 +14,14 @@ const MAX_TARGETS = 8
 const MAX_ID_LENGTH = 256
 const MAX_SUMMARY_BYTES = 1_000
 const MAX_FAILURE_BYTES = 500
+const NON_TERMINAL_TASK_STATUSES: ReadonlySet<string> = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user"])
 const FORBIDDEN_RESULT_KEYS = new Set([
   "id", "userid", "sessionid", "turnid", "stepid", "taskid", "parenttaskid", "roottaskid", "ownerid", "lease",
   "leaseownerid", "leaseversion", "idempotencykey", "capabilities", "permissions", "allowedcapabilities", "budgetlimit", "maxbudget", "taskgraphverificationreport", "taskgraphrepairreceipt",
 ])
 type ResultInfo = { readonly value: RepositoryJsonValue; readonly bytes: number | null; readonly summary: string; readonly hasValue: boolean }
 type TaskState = { readonly taskId: string; readonly status: string; readonly role: string | null; readonly result: ResultInfo; readonly failureReason: string | null; readonly verificationReport?: TaskGraphVerificationReport; readonly repairReceipt?: TaskGraphRepairReceipt }
-type OutcomeTask = { taskId: string; status: string; role?: string; result: RepositoryJsonValue; failureReason: string | null; verificationReport?: TaskGraphVerificationReport; repairReceipt?: TaskGraphRepairReceipt }
+type OutcomeTask = { taskId: string; status: string; role: string | null; result: RepositoryJsonValue; failureReason: string | null; verificationReport?: TaskGraphVerificationReport; repairReceipt?: TaskGraphRepairReceipt }
 type Outcome = { waitId: string; status: string; matchedTaskIds: string[]; targetTaskIds: string[]; tasks: OutcomeTask[] }
 type PreparedOutcome = { readonly value: Outcome; readonly taskIds: string[]; readonly mode: "any" | "all" }
 type Detail = { readonly kind: "result"; readonly index: number; readonly info: ResultInfo } | { readonly kind: "failure"; readonly index: number; readonly value: string }
@@ -33,9 +35,8 @@ function object(value: unknown): Row {
   const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return {} } })() : value
   return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Row : {}
 }
-function ids(value: unknown): string[] {
-  const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return [] } })() : value
-  return Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === "string" && entry.length > 0) : []
+function ids(value: unknown): string[] | null {
+  return Array.isArray(value) && value.every((entry): entry is string => typeof entry === "string" && entry.length > 0) ? value : null
 }
 function date(value: unknown): Date | null { if (value === null || value === undefined) return null; const parsed = value instanceof Date ? value : new Date(String(value)); return Number.isFinite(parsed.getTime()) ? parsed : null }
 function fence(input: DurableWaitConsumerInput): void {
@@ -86,11 +87,11 @@ function resultInfo(value: unknown): ResultInfo {
 function failure(value: unknown): string | null { if (value === null || value === undefined) return null; try { return utf8Prefix(redactSensitiveText(String(value)), MAX_FAILURE_BYTES) } catch { return null } }
 function waitMode(value: unknown): "any" | "all" | null { return value === "any" || value === "all" ? value : null }
 function waitStatus(value: unknown): "ready" | "timed_out" | null { return value === "ready" || value === "timed_out" ? value : null }
-function taskStatus(value: unknown): string | null { const result = safeText(value); return result.length > 0 && result.length <= MAX_ID_LENGTH ? result : null }
+function taskStatus(value: unknown): string | null { return typeof value === "string" && value.length <= MAX_ID_LENGTH && (isTerminalSubagentStatus(value) || NON_TERMINAL_TASK_STATUSES.has(value)) ? value : null }
 function taskRole(value: unknown): string | null { return typeof value === "string" && value.trim().length > 0 && value.length <= MAX_ID_LENGTH ? value : null }
 function boundedIds(value: unknown, allowEmpty = false): string[] | null {
   const values = ids(value)
-  if ((!allowEmpty && values.length === 0) || values.length > MAX_TARGETS || new Set(values).size !== values.length
+  if (!values || (!allowEmpty && values.length === 0) || values.length > MAX_TARGETS || new Set(values).size !== values.length
     || values.some(id => id.trim() !== id || id.length > MAX_ID_LENGTH)) return null
   return [...values].sort()
 }
@@ -140,11 +141,11 @@ function chooseFailure(outcome: Outcome, index: number, value: string, allowance
 }
 function makeOutcome(waitId: string, status: string, targetIds: string[], matchedIds: string[], states: readonly TaskState[], waitMode: "any" | "all"): PreparedOutcome | null {
   if (!waitId || waitId.trim() !== waitId || waitId.length > MAX_ID_LENGTH || !waitStatus(status) || targetIds.length === 0 || targetIds.length > MAX_TARGETS
-    || new Set(targetIds).size !== targetIds.length || matchedIds.some(id => !targetIds.includes(id)) || (status === "ready" && matchedIds.length === 0)) return null
+    || new Set(targetIds).size !== targetIds.length || matchedIds.some(id => !targetIds.includes(id)) || (status === "ready" && (matchedIds.length === 0 || waitMode === "all" && matchedIds.length !== targetIds.length))) return null
   const seen = new Set<string>(); const tasks: OutcomeTask[] = []
   for (const state of states) {
     if (!targetIds.includes(state.taskId) || seen.has(state.taskId) || !taskStatus(state.status)) return null
-    seen.add(state.taskId); tasks.push({ taskId: state.taskId, status: state.status, ...(state.role ? { role: state.role } : {}), result: state.status === "completed" ? (state.verificationReport ? { truncated: true } : minimalResult(state.result)) : null, failureReason: null, ...(state.verificationReport ? { verificationReport: state.verificationReport } : {}), ...(state.repairReceipt ? { repairReceipt: state.repairReceipt } : {}) })
+    seen.add(state.taskId); tasks.push({ taskId: state.taskId, status: state.status, role: state.role, result: state.status === "completed" ? (state.verificationReport ? { truncated: true } : minimalResult(state.result)) : null, failureReason: null, ...(state.verificationReport ? { verificationReport: state.verificationReport } : {}), ...(state.repairReceipt ? { repairReceipt: state.repairReceipt } : {}) })
   }
   let outcome: Outcome = { waitId, status, matchedTaskIds: matchedIds, targetTaskIds: targetIds, tasks }
   let size = outcomeBytes(outcome)
@@ -175,7 +176,8 @@ function projection(wait: Row, prepared: PreparedOutcome): Projection {
 function generatedOutcome(wait: Row, targets: readonly Row[], snapshot: TaskGraphSnapshot | null, rootTaskId: string): PreparedOutcome | null {
   const waitId = safeText(wait.id); const status = waitStatus(wait.status); const currentMode = waitMode(wait.mode)
   const targetIds = boundedIds(wait.targetTaskIds); const matchedIds = boundedIds(wait.matchedTaskIds, true)
-  if (!status || !currentMode || !targetIds || !matchedIds || matchedIds.some(id => !targetIds.includes(id))) return null
+  if (!status || !currentMode || !targetIds || !matchedIds || matchedIds.some(id => !targetIds.includes(id))) { if (wait.status === "ready") throw new Error("wait_consume_outcome_invalid"); return null }
+  if (status === "ready" && (matchedIds.length === 0 || currentMode === "all" && matchedIds.length !== targetIds.length)) throw new Error("wait_consume_outcome_invalid")
   const byId = new Map(targets.map(target => [safeText(target.id), target]))
   const states: TaskState[] = targetIds.map(taskId => {
     const target = byId.get(taskId), status = taskStatus(target?.status ?? "unknown") ?? "unknown", result = resultInfo(target?.result ?? null)
@@ -192,19 +194,19 @@ function generatedOutcome(wait: Row, targets: readonly Row[], snapshot: TaskGrap
   })
   return states.every(state => state.role !== null) ? makeOutcome(waitId, status, targetIds, matchedIds, states, currentMode) : null
 }
-function storedOutcome(wait: Row, snapshot: TaskGraphSnapshot | null, rootTaskId: string): PreparedOutcome | null {
+function storedOutcome(wait: Row, snapshot: TaskGraphSnapshot | null, rootTaskId: string, targets: readonly Row[]): PreparedOutcome | null {
   const raw = record(object(wait.result).outcome), waitId = safeText(wait.id), status = raw ? waitStatus(raw.status) : null, currentMode = waitMode(wait.mode)
-  const expectedIds = boundedIds(wait.targetTaskIds), targetIds = raw ? boundedIds(raw.targetTaskIds) : null, matchedIds = raw ? boundedIds(raw.matchedTaskIds, true) : null
-  if (!raw || raw.waitId !== waitId || !status || status !== waitStatus(wait.status) || !currentMode || !expectedIds || !targetIds || !matchedIds
-    || targetIds.length !== expectedIds.length || targetIds.some((id, index) => id !== expectedIds[index]) || matchedIds.some(id => !targetIds.includes(id))
+  const expectedIds = boundedIds(wait.targetTaskIds), expectedMatchedIds = boundedIds(wait.matchedTaskIds, true), targetIds = raw ? boundedIds(raw.targetTaskIds) : null, matchedIds = raw ? boundedIds(raw.matchedTaskIds, true) : null
+  if (!raw || raw.waitId !== waitId || !status || status !== waitStatus(wait.status) || !currentMode || !expectedIds || !expectedMatchedIds || !targetIds || !matchedIds
+    || targetIds.length !== expectedIds.length || targetIds.some((id, index) => id !== expectedIds[index]) || matchedIds.length !== expectedMatchedIds.length || matchedIds.some((id, index) => id !== expectedMatchedIds[index]) || matchedIds.some(id => !targetIds.includes(id))
     || (status === "ready" && matchedIds.length === 0) || !Array.isArray(raw.tasks)) return null
-  const seen = new Set<string>(); const states: TaskState[] = []
+  const seen = new Set<string>(), states: TaskState[] = [], targetById = new Map<string, Row>(targets.map(target => [safeText(target.id), target]))
   for (const value of raw.tasks) {
-    const task = record(value); if (!task || typeof task.taskId !== "string" || !targetIds.includes(task.taskId) || seen.has(task.taskId)) return null
-    const childStatus = taskStatus(task.status); if (!childStatus) return null
+    const task = record(value); if (!task || typeof task.taskId !== "string" || !targetIds.includes(task.taskId) || seen.has(task.taskId)) return null; const authoritative = targetById.get(task.taskId); if (!authoritative) return null
+    const childStatus = taskStatus(task.status), rowStatus = taskStatus(authoritative.status); if (!childStatus || matchedIds.includes(task.taskId) && (childStatus !== rowStatus || !isTerminalSubagentStatus(rowStatus ?? ""))) return null
     seen.add(task.taskId)
-    const role = Object.prototype.hasOwnProperty.call(task, "role") ? taskRole(task.role) : null
-    if (Object.prototype.hasOwnProperty.call(task, "role") && !role) return null
+    const hasRole = Object.prototype.hasOwnProperty.call(task, "role"), role = hasRole ? taskRole(task.role) : null, rowRole = taskRole(authoritative.role)
+    if (hasRole && (!role || !rowRole || role !== rowRole)) return null
     const node = snapshot?.nodes.find(candidate => candidate.taskId === task.taskId)
     const criterionIds = node?.verificationDisposition === "typed" && node.verification ? node.verification.criteria.map(item => item.id) : undefined
     const hasReport = Object.prototype.hasOwnProperty.call(task, "verificationReport"), verificationReport = hasReport && criterionIds ? parseTaskGraphVerificationReport(task.verificationReport, criterionIds) : undefined
@@ -231,13 +233,13 @@ export async function consumeDurableWaitOutcomes(input: DurableWaitConsumerInput
     if (!parent || String(parent.id) !== input.turn.rootTaskId || String(parent.rootTaskId ?? parent.id) !== input.turn.rootTaskId) continue
     const step = (await input.client.query<Row>(`SELECT "id", "taskId", "attempt", "status" FROM "agent_steps" WHERE "id" = $1 AND "turnId" = $2 AND "sessionId" = $3 AND ("taskId" = $4 OR "taskId" IS NULL) FOR SHARE`, [wait.stepId, input.lease.turnId, input.lease.sessionId, input.turn.rootTaskId])).rows[0]
     if (!step || String(step.status) !== "waiting_for_tool" || Number(step.attempt) !== 1) continue
-    const snapshot = await graphSnapshot(input, String(parent.id)), prior = wait.consumedAt ? storedOutcome(wait, snapshot, input.turn.rootTaskId) : null
+    const targetIds = boundedIds(wait.targetTaskIds)
+    if (!targetIds || !boundedIds(wait.matchedTaskIds, true)?.every(id => targetIds.includes(id))) throw new Error("wait_consume_outcome_invalid")
+    const targets = await input.client.query<Row>(`SELECT task."id", task."rootTaskId", task."turnId", task."sessionId", task."role", task."status", task."result", task."failureReason", session."userId" AS "userId" FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId" WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3 AND session."userId" = $4 AND task."rootTaskId" = $5 AND session."status" NOT IN ('aborted', 'archived')`, [targetIds, input.lease.sessionId, input.lease.turnId, input.lease.userId, input.turn.rootTaskId])
+    if (targets.rows.length !== targetIds.length || targets.rows.some(target => !targetIds.includes(String(target.id)) || String(target.rootTaskId ?? target.id) !== input.turn.rootTaskId || String(target.id) === input.turn.rootTaskId)) { if (wait.consumedAt) throw new Error("wait_consume_outcome_invalid"); continue }
+    const snapshot = await graphSnapshot(input, String(parent.id)), prior = wait.consumedAt ? storedOutcome(wait, snapshot, input.turn.rootTaskId, targets.rows) : null
     if (wait.consumedAt && !prior) throw new Error("wait_consume_outcome_invalid")
     if (prior) { projections.push(projection(wait, prior)); continue }
-    const targetIds = ids(wait.targetTaskIds)
-    if (targetIds.length === 0 || targetIds.length > MAX_TARGETS) continue
-    const targets = await input.client.query<Row>(`SELECT task."id", task."rootTaskId", task."turnId", task."sessionId", task."role", task."status", task."result", task."failureReason", session."userId" AS "userId" FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId" WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3 AND session."userId" = $4 AND session."status" NOT IN ('aborted', 'archived')`, [targetIds, input.lease.sessionId, input.lease.turnId, input.lease.userId])
-    if (targets.rows.length !== targetIds.length || targets.rows.some(target => String(target.rootTaskId ?? target.id) !== input.turn.rootTaskId || String(target.id) === input.turn.rootTaskId)) continue
     const value = generatedOutcome(wait, targets.rows, snapshot, input.turn.rootTaskId)
     if (!value) continue
     const persisted = encoded(value.value); if (!persisted || persisted.bytes > MAX_OUTCOME_BYTES) continue

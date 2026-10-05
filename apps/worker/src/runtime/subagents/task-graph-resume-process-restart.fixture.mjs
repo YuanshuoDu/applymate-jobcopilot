@@ -1,6 +1,8 @@
+import { errorMonitor } from "node:events"
 import { Worker } from "bullmq"
 import { Pool } from "pg"
 import { createCanonicalTurnRuntime } from "../canonical-turn-runtime.ts"
+import { loadCanonicalTurnState } from "../canonical-turn-state.ts"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.ts"
 import { ROLE_RESULT_SCHEMA } from "./role-results.ts"
 import { createProductionChildExecutor } from "./production-child-runtime.ts"
@@ -25,6 +27,8 @@ const discoveryFinalMarker = "p3-process-restart-discovery-shortlist-ready"
 const TASK_GRAPH_KEY_ALLOWLIST = new Set(["source", "summary", followUpKey])
 const CHILD_FAILURE_DIAGNOSTIC_CODES = new Set(["invalid_structured_result", "model_incomplete", "invalid_output", "tool_execution_failed", "timeout", "cancelled", "step_limit", "budget_exhausted", "no_progress", "evidence_missing", "evidence_conflict", "final_unverified", "child_turn_missing", "child_resume_unavailable", "child_resume_evidence_unavailable", "selected_job_sources_unavailable", "selected_job_context_unavailable", "subagent_role_unknown"])
 const CHILD_EXCEPTION_DIAGNOSTIC_NAMES = new Set(["Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "AbortError", "TimeoutError"])
+const TURN_WORKER_ERROR_DIAGNOSTIC_NAMES = new Set(["Error", "TypeError", "RangeError", "ReferenceError", "AbortError", "TimeoutError", "ConnectionError", "MaxRetriesPerRequestError", "ReplyError"])
+const TURN_WORKER_ERROR_DIAGNOSTIC_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "EAI_AGAIN", "ECONNABORTED", "NR_CLOSED"])
 const TURN_STATUS_ALLOWLIST = new Set(["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user", "completed", "interrupted", "failed", "cancelled"])
 const STEP_STATUS_ALLOWLIST = new Set(["completed", "failed", "interrupted", "waiting_for_tool", "waiting_for_approval", "waiting_for_user"])
 const ROOT_TASK_STATUS_ALLOWLIST = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
@@ -1332,9 +1336,22 @@ async function startRuntime(workerOwnerId, resume) {
   })
 }
 async function startDiscoveryRuntime(workerOwnerId, resume) {
+  let waitOutcomeCheckpointUsed = false
+  const stateLoader = resume && mode === "resume-discovery" && ids.checkpointAfterWaitConsume === true
+    ? async (statePool, lease, now, loaderOptions) => {
+      const state = await loadCanonicalTurnState(statePool, lease, now, loaderOptions)
+      if (!waitOutcomeCheckpointUsed && lease.turnId === ids.turnId && loaderOptions?.consumeWaitOutcomes === true) {
+        waitOutcomeCheckpointUsed = true
+        say("P3_DISCOVERY_WAIT_OUTCOME_COMMITTED")
+        await waitForCommand("continue-after-wait-outcome-commit")
+      }
+      return state
+    }
+    : undefined
   return createCanonicalTurnRuntime(pool, {
     workerId: workerOwnerId, productionFlags: flags(), taskGraphCommandPort: createPgTaskGraphCommandPort(pool),
     taskGraphTemplates: TASK_GRAPH_TEMPLATES, authorizeUsage: async () => ({ settle: async () => undefined }),
+    ...(stateLoader ? { stateLoader } : {}),
     modelRuntimeFactory() {
       let modelRounds = 0
       const adapter = {
@@ -1378,8 +1395,31 @@ async function startDiscoveryRuntime(workerOwnerId, resume) {
             yield { type: "completed", finishReason: "tool_calls" }; return
           }
           if (typeof analyst.taskId !== "string") throw new Error("p3_discovery_analyst_task_missing")
-          waitOutcomeFromRequest(request, outcome => outcome.status === "ready"
-            && outcome.tasks.some(task => record(task)?.taskId === analyst.taskId && record(task)?.status === "completed"))
+          const originalAnalystWait = record(latestToolResult(request, discoveryAnalystWaitCallId))
+          const analystWaitId = originalAnalystWait?.waitId
+          if (originalAnalystWait?.status !== "waiting" || typeof analystWaitId !== "string"
+            || !Array.isArray(originalAnalystWait.taskIds) || originalAnalystWait.taskIds.length !== 1
+            || originalAnalystWait.taskIds[0] !== analyst.taskId
+            || !Array.isArray(originalAnalystWait.matchedTaskIds) || originalAnalystWait.matchedTaskIds.length !== 0) {
+            throw new Error("p3_discovery_analyst_wait_receipt_invalid")
+          }
+          const analystWaitProjection = request.messages.flatMap(message => message.content).find(part =>
+            part.type === "tool_result" && part.toolUseId === "wait:" + analystWaitId)
+          let analystWaitOutcome = null
+          if (typeof analystWaitProjection?.content === "string") {
+            try { analystWaitOutcome = record(JSON.parse(analystWaitProjection.content)) } catch { /* Invalid archive stays absent. */ }
+          }
+          const archivedAnalystTasks = Array.isArray(analystWaitOutcome?.tasks) ? analystWaitOutcome.tasks.map(record) : []
+          if (analystWaitOutcome?.waitId !== analystWaitId || analystWaitOutcome.status !== "ready"
+            || !Array.isArray(analystWaitOutcome.targetTaskIds) || analystWaitOutcome.targetTaskIds.length !== 1
+            || analystWaitOutcome.targetTaskIds[0] !== analyst.taskId
+            || !Array.isArray(analystWaitOutcome.matchedTaskIds) || analystWaitOutcome.matchedTaskIds.length !== 1
+            || analystWaitOutcome.matchedTaskIds[0] !== analyst.taskId || archivedAnalystTasks.length !== 1
+            || archivedAnalystTasks[0]?.taskId !== analyst.taskId || archivedAnalystTasks[0]?.role !== "analyst"
+            || archivedAnalystTasks[0]?.status !== "completed") {
+            throw new Error("p3_durable_wait_result_missing")
+          }
+          assertPassedVerificationReport(archivedAnalystTasks[0]?.verificationReport, "finding-count")
           if (nodes.length !== 2 || nodes.some(item => item?.status !== "completed")) throw new Error("p3_discovery_final_graph_incomplete")
           say("P3_DISCOVERY_RESTORED_FINAL_GRAPH " + JSON.stringify({ revision: graph.revision, nodeCount: nodes.length }))
           yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: discoveryFinalMarker }) }
@@ -1620,6 +1660,71 @@ async function runDiscoverySecondWorker() {
       say("P3_DISCOVERY_CHILD_SETTLED " + lease.id + " " + lease.role + " " + outcome.status)
       return outcome
     } } })
+  const turnWorker = bootstrap.turns?.worker
+  const workerLabel = ids.checkpointAfterWaitConsume === true ? "worker2" : "worker3"
+  let turnWorkerDiagnosticCount = 0
+  const boundedWorkerNumber = (value, maximum) => Number.isSafeInteger(value) && value >= 1 && value <= maximum ? value : null
+  const { turnJobId } = await import("../turns/recovery-scanner.ts")
+  const turnJobPrefix = turnJobId(ids.turnId, 0).slice(0, -1)
+  const generationForJob = job => {
+    const match = typeof job?.id === "string" ? /-(0|[1-9][0-9]*)$/.exec(job.id) : null
+    if (!match) return null
+    const generation = Number(match[1])
+    return Number.isSafeInteger(generation) && generation >= 0 && generation <= 100_000 ? generation : null
+  }
+  const observeTurnWorker = (event, source = null) => {
+    try {
+      if (turnWorkerDiagnosticCount >= 16) return
+      let generation = null
+      let errorName = null
+      let errorCode = null
+      if (event === "stalled") {
+        if (typeof source !== "string" || !source.startsWith(turnJobPrefix)) return
+        generation = generationForJob({ id: source })
+        if (generation === null) return
+      } else if (event === "error") {
+        const name = source instanceof Error ? source.name : null
+        errorName = TURN_WORKER_ERROR_DIAGNOSTIC_NAMES.has(name) ? name : "other"
+        const code = record(source)?.code
+        errorCode = typeof code === "string" && TURN_WORKER_ERROR_DIAGNOSTIC_CODES.has(code) ? code : "other"
+      } else if (event !== "observer_attached") {
+        const payload = record(source?.data)
+        if (payload?.turnId !== ids.turnId || payload.sessionId !== ids.sessionId) return
+        generation = generationForJob(source)
+      }
+      const workerState = turnWorker
+      const opts = record(workerState?.opts) ?? {}
+      const registrySize = bootstrap.turns?.active?.size
+      const marker = {
+        worker: workerLabel,
+        event,
+        isRunning: typeof workerState?.isRunning === "function" ? (() => { try { const value = workerState.isRunning(); return typeof value === "boolean" ? value : null } catch { return null } })() : null,
+        isPaused: typeof workerState?.isPaused === "function" ? (() => { try { const value = workerState.isPaused(); return typeof value === "boolean" ? value : null } catch { return null } })() : null,
+        stalledInterval: boundedWorkerNumber(opts.stalledInterval, 300_000),
+        lockDuration: boundedWorkerNumber(opts.lockDuration, 300_000),
+        concurrency: boundedWorkerNumber(opts.concurrency, 64),
+        activeRegistryCount: typeof registrySize === "number" && Number.isSafeInteger(registrySize) && registrySize >= 0 && registrySize <= 64 ? registrySize : null,
+        generation,
+        errorName,
+        errorCode,
+      }
+      say("P3_DISCOVERY_TURN_WORKER " + JSON.stringify(marker))
+      turnWorkerDiagnosticCount += 1
+    } catch {
+      // Diagnostics must never affect Turn processing.
+    }
+  }
+  if (turnWorker && typeof turnWorker.on === "function") {
+    observeTurnWorker("observer_attached")
+    turnWorker.on("active", job => observeTurnWorker("active", job))
+    turnWorker.on("completed", job => observeTurnWorker("completed", job))
+    turnWorker.on("failed", job => observeTurnWorker("failed", job))
+    // Observe Worker errors without adding a consuming listener or changing BullMQ's default error handling.
+    turnWorker.on(errorMonitor, error => observeTurnWorker("error", error))
+    turnWorker.on("stalled", (jobId, previousState) => {
+      if (previousState === "active") observeTurnWorker("stalled", jobId)
+    })
+  }
   say("P3_DISCOVERY_SECOND_WORKER_READY " + ownerId)
   await waitForStop()
 }

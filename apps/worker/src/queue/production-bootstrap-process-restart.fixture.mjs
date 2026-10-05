@@ -7,6 +7,7 @@ const [, , mode, rawIds] = process.argv
 const ids = JSON.parse(rawIds)
 const resultMarker = "durable-child-result-after-process-restart"
 const finalMarker = "parent-resumed-from-durable-child-result"
+const duplicateRedeliveryJobId = "00000000-0000-4000-8000-000000000547"
 const pool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 5 })
 let bootstrap
 let wakeupConsumer
@@ -596,7 +597,7 @@ async function makeDuplicateRedeliveryWorker() {
   let modelCalls = 0
   let deliveryCount = 0
   const readCallId = "duplicate-read:" + ids.suffix
-  const readJobId = "duplicate-job:" + ids.suffix
+  const readJobId = duplicateRedeliveryJobId
   await startFixtureProductionRuntime({
     workerId: `duplicate-redelivery-worker-${process.pid}`,
     productionFlags: {
@@ -654,6 +655,7 @@ function stableJson(value) {
 }
 
 async function requireDuplicateRedeliveryEvidence(request, { readCallId, readJobId }) {
+  const readJobDescription = `recruiter-${ids.suffix}@example.com +353 87 123 4567`
   const requestParts = request.messages.flatMap(message => Array.isArray(message.content)
     ? message.content.map(part => ({ message, part })) : [])
   const toolUses = requestParts.filter(entry => entry.part?.type === "tool_use" && entry.part.id === readCallId)
@@ -678,13 +680,15 @@ async function requireDuplicateRedeliveryEvidence(request, { readCallId, readJob
     [ids.sessionId, ids.turnId, readCallId],
     ),
     pool.query(
-      `SELECT "id", "company", "role", "location", "status", "score", "url", "source", "salary", "description", "keywords"
+      `SELECT "id", "userId", "company", "role", "location", "status", "score", "url", "source", "salary", "description", "keywords"
        FROM "Job" WHERE "id" = $1 AND "userId" = $2`,
       [readJobId, ids.userId],
     ),
   ])
   if (persisted.rows.length !== 2) throw new Error("duplicate_redelivery_read_result_not_persisted_once")
-  if (ownedJob.rows.length !== 1 || stableJson(resultOutput?.jobs?.[0]) !== stableJson(ownedJob.rows[0])) {
+  if (ownedJob.rows.length !== 1 || ownedJob.rows[0].id !== readJobId || ownedJob.rows[0].userId !== ids.userId
+    || ownedJob.rows[0].description !== readJobDescription || resultOutput?.jobs?.length !== 1
+    || resultOutput.jobs[0]?.id !== ownedJob.rows[0].id) {
     throw new Error("duplicate_redelivery_search_result_not_owned_job_row")
   }
   const started = persisted.rows.find(row => row.type === "tool_call.started")?.payload
@@ -694,10 +698,11 @@ async function requireDuplicateRedeliveryEvidence(request, { readCallId, readJob
     || completed?.toolName !== "jobs.search" || completed?.toolCallId !== readCallId
     || completed?.status !== "completed" || completed?.errorCode !== null
     || stableJson(completed?.output) !== stableJson(resultOutput)
-    || resultOutput?.jobs?.length !== 1 || resultOutput.jobs[0]?.id !== readJobId
+    || resultOutput.jobs[0]?.id !== readJobId
     || resultOutput.jobs[0]?.company !== `Fixture Employer ${ids.suffix}`
     || resultOutput.jobs[0]?.role !== "Fixture Engineer"
-    || resultOutput.jobs[0]?.description !== `Persisted read evidence ${ids.suffix}`
+    || resultOutput.jobs[0]?.description !== "[REDACTED_EMAIL] [REDACTED_PHONE]"
+    || JSON.stringify(resultOutput).includes(readJobDescription)
     || resultOutput.page !== 1 || resultOutput.hasMore !== false) {
     throw new Error("duplicate_redelivery_persisted_read_result_invalid")
   }

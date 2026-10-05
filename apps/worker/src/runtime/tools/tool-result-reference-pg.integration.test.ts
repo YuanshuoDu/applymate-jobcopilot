@@ -92,6 +92,14 @@ async function seedOwner(pool: PgPool, value: OwnerFixture): Promise<void> {
   ])
 }
 
+async function seedToolCall(pool: PgPool, owner: OwnerFixture, toolCallId: string): Promise<void> {
+  await pool.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "content", "updatedAt")
+    VALUES ($1, $2, $3, $4, $5, 'tool_call', 'started', $6::jsonb, CURRENT_TIMESTAMP)`, [
+    `p1-tool-call-${randomUUID()}`, owner.sessionId, owner.turnId, owner.stepId, owner.rootTaskId,
+    JSON.stringify({ toolCallId, toolName: "notes.read" }),
+  ])
+}
+
 async function setRuntimeRole(client: PoolClient): Promise<void> {
   await client.query(`SET ROLE "${RUNTIME_ROLE}"`)
 }
@@ -133,7 +141,7 @@ describeWithPostgres("PostgreSQL private tool-result persistence (P1 slice)", ()
       END IF;
     END $$`)
     await adminPool.query(`ALTER ROLE ${RUNTIME_ROLE} NOLOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS`)
-    await adminPool.query(`GRANT SELECT ON "agent_sessions", "agent_turns", "agent_steps", "sub_agent_tasks" TO ${RUNTIME_ROLE}`)
+    await adminPool.query(`GRANT SELECT ON "agent_sessions", "agent_turns", "agent_steps", "agent_items", "sub_agent_tasks" TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT UPDATE ("id") ON "agent_sessions", "agent_turns", "agent_steps", "sub_agent_tasks" TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT SELECT, INSERT ON "agent_tool_result_references" TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT UPDATE ("id") ON "agent_tool_result_references" TO ${RUNTIME_ROLE}`)
@@ -186,6 +194,7 @@ describeWithPostgres("PostgreSQL private tool-result persistence (P1 slice)", ()
       toolCallId: `call-${randomUUID()}`,
       value: { private: "owner A durable tool result", nested: { status: "complete" } },
     }
+    await seedToolCall(writerPool!, ownerA, input.toolCallId)
     const stored = await writer!.put(ownerA.owner, input)
     resultId = stored.id
     await writerPool!.end()

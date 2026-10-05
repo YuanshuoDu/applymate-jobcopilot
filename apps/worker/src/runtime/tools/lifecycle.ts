@@ -6,7 +6,9 @@ import {
 
 import type { ExecutionOwner } from "../execution-owner.js"
 import { MAX_TOOL_RESULT_BYTES, type ToolResultReferenceRepository } from "./tool-result-reference-types.js"
-import { prepareDurableWaitOutput, prepareLifecycleValue, prepareSubagentSpawnReceipt, prepareTaskGraphPlanReceipt, sanitizeLifecyclePreview, type ToolResultReferenceStore } from "./redaction.js"
+import { prepareDurableWaitOutput, prepareLifecycleValue, prepareSafeValue, prepareSubagentSpawnReceipt, prepareTaskGraphPlanReceipt, prepareVerifiedToolResultChunk, sanitizeLifecyclePreview, type ToolResultReferenceStore } from "./redaction.js"
+import { redactJobReadOutput } from "./job-read-output-redaction.js"
+import { isVerifiedToolResultChunk } from "./tool-result-reference-repo.js"
 import { ToolExecutionError, type ToolLifecyclePayload } from "./types.js"
 
 export type ToolLifecyclePhase = "started" | "progress" | "completed" | "failed" | "cancelled"
@@ -158,6 +160,15 @@ export class ToolLifecycle {
       } catch {
         throw new ToolExecutionError("durable_wait_receipt_invalid", "Durable wait receipt is invalid")
       }
+    } else if (call.toolName === "jobs.search" || call.toolName === "jobs.get") {
+      prepared = prepareSafeValue(redactJobReadOutput(call.toolName, output))
+    } else if (call.toolName === "tool_results.read") {
+      let owner: ExecutionOwner | undefined
+      try { owner = this.options.resolveOwner?.({ ...call, toolCallId: call.id }) } catch { owner = undefined }
+      const verified = owner && isVerifiedToolResultChunk(output, owner, call.id)
+        ? prepareVerifiedToolResultChunk(output)
+        : null
+      prepared = verified ?? prepareLifecycleValue(output)
     } else {
       prepared = prepareLifecycleValue(output)
     }
