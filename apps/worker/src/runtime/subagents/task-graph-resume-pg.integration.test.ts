@@ -5757,6 +5757,7 @@ describe("TaskGraph fixture lease guard unit", () => {
 })
 
 describeWithServices("production TaskGraph lifecycle and root resume (disposable PostgreSQL + Redis)", () => {
+  const priorStalledIntervalMs = process.env.BULLMQ_STALLED_INTERVAL_MS
   const owner = fixture()
   const failureOwner = fixture()
   const stopOwner = fixture()
@@ -5783,6 +5784,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   let selectedJobQueueName: string | undefined
 
   beforeAll(async () => {
+    // Keep in-process fixture Workers aligned with restart subprocesses. A closed Worker can leave its queue-wide
+    // stalled-check lock alive, so a 120-second parent interval can defer a 30-second subprocess recovery scan.
+    process.env.BULLMQ_STALLED_INTERVAL_MS = "30000"
     pool = new Pool({ connectionString: databaseUrl!, max: 6 })
     redis = new Redis(redisUrl!, {
       maxRetriesPerRequest: null,
@@ -5865,6 +5869,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     if (redis && redis.status !== "end") await attempt("Redis connection close", async () => {
       try { await redis!.quit() } catch (error: unknown) { redis!.disconnect(); throw error }
     })
+    if (priorStalledIntervalMs === undefined) delete process.env.BULLMQ_STALLED_INTERVAL_MS
+    else process.env.BULLMQ_STALLED_INTERVAL_MS = priorStalledIntervalMs
     vi.doUnmock("../../redis.js")
     if (cleanupFailures.length > 0) throw new Error("TaskGraph integration cleanup failed:\n" + cleanupFailures.join("\n"))
   })
