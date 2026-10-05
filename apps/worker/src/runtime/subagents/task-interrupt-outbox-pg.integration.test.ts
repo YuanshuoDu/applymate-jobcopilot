@@ -40,6 +40,7 @@ ids.item = taskGraphItemId(ids.root)
 
 describeWithPostgres("durable child task interruption on disposable PostgreSQL", () => {
   const pool = new Pool({ connectionString: databaseUrl!, max: 4 })
+  let disconnectWebDb: (() => Promise<void>) | null = null
   beforeAll(async () => {
     await pool.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`, [ids.user, `${ids.user}@example.invalid`])
     await pool.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
@@ -68,18 +69,10 @@ describeWithPostgres("durable child task interruption on disposable PostgreSQL",
     await pool.query(`UPDATE "agent_sessions" SET "eventSequence" = 1 WHERE "id" = $1`, [ids.session])
     await pool.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload")
       VALUES ($1, $2, $3, $4, $5, 1, 'item.started', 'orchestrator', $3, $6, $7::jsonb)`, [randomUUID(), ids.session, ids.turn, ids.item, ids.root, taskGraphProposalKey(ids.root, 0), JSON.stringify(proposal)])
-    const clientMessageId = "integration-interrupt-1"
-    const eventPayload = { intentId: ids.intent, taskId: ids.target, status: "accepted" }
-    await pool.query(`UPDATE "agent_sessions" SET "eventSequence" = 2 WHERE "id" = $1`, [ids.session])
-    await pool.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload")
-      VALUES ($1, $2, $3, $4, 2, 'task.interrupt.accepted', 'user', $3, $5, $6::jsonb)`,
-    [randomUUID(), ids.session, ids.turn, ids.target, `agent-task-interrupt-accepted:${ids.session}:${clientMessageId}`, JSON.stringify(eventPayload)])
-    await pool.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
-      VALUES ($1, $2, $3, $4, $5::jsonb)`, [randomUUID(), TASK_INTERRUPT_OUTBOX_TOPIC, ids.session,
-      `agent-task-interrupt:${ids.session}:${clientMessageId}`, JSON.stringify({ sessionId: ids.session, turnId: ids.turn, taskId: ids.target, intentId: ids.intent })])
   })
 
   afterAll(async () => {
+    if (disconnectWebDb) await disconnectWebDb().catch(() => undefined)
     await pool.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [ids.session]).catch(() => undefined)
     await pool.query(`DELETE FROM "agent_events" WHERE "sessionId" = $1`, [ids.session]).catch(() => undefined)
     await pool.query(`DELETE FROM "agent_items" WHERE "sessionId" = $1`, [ids.session]).catch(() => undefined)
@@ -88,19 +81,66 @@ describeWithPostgres("durable child task interruption on disposable PostgreSQL",
     await pool.query(`DELETE FROM "agent_sessions" WHERE "id" = $1`, [ids.session]).catch(() => undefined)
     await pool.query(`DELETE FROM "User" WHERE "id" = $1`, [ids.user]).catch(() => undefined)
     await pool.end()
+    vi.unstubAllEnvs()
   })
 
-  it("drains a durable accepted intent for only the selected subtree", async () => {
+  it("persists and replays the Web command before draining only the selected subtree", async () => {
+    const clientMessageId = "integration-interrupt-1"
+    vi.stubEnv("DATABASE_URL", databaseUrl!)
+    // @ts-expect-error The Worker Vitest alias resolves the allowlisted Web database module at runtime.
+    const { db } = await import("@/lib/db")
+    // @ts-expect-error The Worker Vitest alias resolves the allowlisted Web interrupt service at runtime.
+    const { TaskInterruptService } = await import("@/lib/agent/control-plane/commands/task-interrupt-service")
+    disconnectWebDb = () => db.$disconnect()
+    const service = new TaskInterruptService(db)
+    const command = { sessionId: ids.session, taskId: ids.target, userId: ids.user, clientMessageId }
+    const eventKey = `agent-task-interrupt-accepted:${ids.session}:${clientMessageId}`
+    const intentKey = `agent-task-interrupt:${ids.session}:${clientMessageId}`
+
+    await expect(service.interrupt({ ...command, userId: `foreign-${ids.suffix}` })).rejects.toMatchObject({
+      code: "task_interrupt_target_not_found", status: 404,
+    })
+    const rejectedWrites = await pool.query(`SELECT
+      (SELECT "eventSequence" FROM "agent_sessions" WHERE "id" = $1) AS "eventSequence",
+      (SELECT COUNT(*)::int FROM "agent_events" WHERE "sessionId" = $1 AND "idempotencyKey" = $2) AS "events",
+      (SELECT COUNT(*)::int FROM "agent_outbox" WHERE "aggregateId" = $1 AND "idempotencyKey" = $3) AS "intents"`,
+    [ids.session, eventKey, intentKey])
+    expect(String(rejectedWrites.rows[0]?.eventSequence)).toBe("1")
+    expect(rejectedWrites.rows[0]).toMatchObject({ events: 0, intents: 0 })
+
+    const acceptedCommand = await service.interrupt(command)
+    ids.intent = acceptedCommand.intentId
+    expect(acceptedCommand).toMatchObject({ taskId: ids.target, turnId: ids.turn, disposition: "accepted", sequence: "2" })
+    const persisted = await pool.query(`SELECT
+      (SELECT COUNT(*)::int FROM "agent_events" WHERE "sessionId" = $1 AND "taskId" = $2 AND "type" = 'task.interrupt.accepted' AND "idempotencyKey" = $3) AS "events",
+      (SELECT "aggregateId" FROM "agent_outbox" WHERE "idempotencyKey" = $4 AND "topic" = $5) AS "aggregateId",
+      (SELECT "payload" FROM "agent_outbox" WHERE "idempotencyKey" = $4 AND "topic" = $5) AS "payload"`,
+    [ids.session, ids.target, eventKey, intentKey, TASK_INTERRUPT_OUTBOX_TOPIC])
+    expect(persisted.rows[0]).toMatchObject({ events: 1, aggregateId: ids.session,
+      payload: { sessionId: ids.session, turnId: ids.turn, taskId: ids.target, intentId: acceptedCommand.intentId } })
+
+    await expect(service.interrupt(command)).resolves.toEqual({ ...acceptedCommand, disposition: "duplicate" })
+    await expect(service.interrupt({ ...command, taskId: ids.sibling })).rejects.toMatchObject({
+      code: "task_interrupt_idempotency_conflict", status: 409,
+    })
+    const replayWrites = await pool.query(`SELECT
+      (SELECT "eventSequence" FROM "agent_sessions" WHERE "id" = $1) AS "eventSequence",
+      (SELECT COUNT(*)::int FROM "agent_events" WHERE "sessionId" = $1 AND "idempotencyKey" = $2) AS "events",
+      (SELECT COUNT(*)::int FROM "agent_outbox" WHERE "aggregateId" = $1 AND "idempotencyKey" = $3) AS "intents"`,
+    [ids.session, eventKey, intentKey])
+    expect(String(replayWrites.rows[0]?.eventSequence)).toBe("2")
+    expect(replayWrites.rows[0]).toMatchObject({ events: 1, intents: 1 })
+
     const outbox = await pool.query(`SELECT "aggregateId", "topic", "idempotencyKey" FROM "agent_outbox"
       WHERE "topic" = $1 AND "aggregateId" = $2 AND "idempotencyKey" = $3`,
-    [TASK_INTERRUPT_OUTBOX_TOPIC, ids.session, `agent-task-interrupt:${ids.session}:integration-interrupt-1`])
+    [TASK_INTERRUPT_OUTBOX_TOPIC, ids.session, intentKey])
     expect(outbox.rows).toEqual([{ aggregateId: ids.session, topic: TASK_INTERRUPT_OUTBOX_TOPIC,
-      idempotencyKey: `agent-task-interrupt:${ids.session}:integration-interrupt-1` }])
-    const accepted = await pool.query(`SELECT "sequence", "type", "payload" FROM "agent_events"
-      WHERE "sessionId" = $1 AND "taskId" = $2 AND "type" = 'task.interrupt.accepted'`, [ids.session, ids.target])
-    expect(accepted.rows).toHaveLength(1)
-    expect(String(accepted.rows[0]?.sequence)).toBe("2")
-    expect(accepted.rows[0]).toMatchObject({ type: "task.interrupt.accepted", payload: { taskId: ids.target, status: "accepted" } })
+      idempotencyKey: intentKey }])
+    const acceptedEvent = await pool.query(`SELECT "sequence", "type", "payload" FROM "agent_events"
+      WHERE "sessionId" = $1 AND "taskId" = $2 AND "type" = 'task.interrupt.accepted' AND "idempotencyKey" = $3`, [ids.session, ids.target, eventKey])
+    expect(acceptedEvent.rows).toHaveLength(1)
+    expect(String(acceptedEvent.rows[0]?.sequence)).toBe("2")
+    expect(acceptedEvent.rows[0]).toMatchObject({ type: "task.interrupt.accepted", payload: { intentId: ids.intent, taskId: ids.target, status: "accepted" } })
 
     const manager = { signalTaskSubtree: vi.fn() } as unknown as AgentTreeManager
     await expect(drainTaskInterruptOutbox(pool as unknown as PgSubagentPool, manager)).resolves.toBe(1)
