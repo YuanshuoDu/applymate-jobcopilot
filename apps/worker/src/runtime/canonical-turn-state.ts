@@ -49,11 +49,11 @@ function json(value: unknown): RepositoryJsonValue {
   return null
 }
 
-function snapshotFromContent(value: unknown, throughSequence: unknown, scope: TenantScope, sessionId: string): StepContextSnapshot {
+function snapshotFromContent(value: unknown, throughSequence: unknown, scope: TenantScope, sessionId: string): { snapshot: StepContextSnapshot; hasCompaction: boolean } {
   const content = parseSnapshotContent(value)
   if (content.ownerId !== scope.userId || content.sessionId !== sessionId) throw new Error("context_snapshot_scope_mismatch")
   if (content.throughSequence !== String(throughSequence)) throw new Error("context_snapshot_sequence_mismatch")
-  return stepContextSnapshotFromContent(content)
+  return { snapshot: stepContextSnapshotFromContent(content), hasCompaction: content.compaction !== undefined }
 }
 
 function eventPayload(value: unknown): Row { const payload = object(value); return object(payload.payload ?? payload) }
@@ -164,12 +164,13 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     )
     let snapshot: StepContextSnapshot = { system: [{ id: "canonical-runtime", content: "Use only scoped, policy-approved tools and continue until the stated goal is verifiably complete." }], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }
     let snapshotThroughSequence: bigint | null = null
+    let hasCompaction = false
     if (turn.contextSnapshotId) {
       const contextResult = await client.query<Row>(`SELECT snapshot."content", snapshot."throughSequence" FROM "agent_context_snapshots" AS snapshot
         JOIN "agent_sessions" AS session ON session."id" = snapshot."sessionId"
         WHERE snapshot."id" = $1 AND snapshot."sessionId" = $2 AND session."userId" = $3`, [turn.contextSnapshotId, lease.sessionId, lease.userId])
       if (!contextResult.rows[0]) throw new Error("context_snapshot_missing")
-      snapshot = snapshotFromContent(contextResult.rows[0].content, contextResult.rows[0].throughSequence, scope, lease.sessionId)
+      const hydratedSnapshot = snapshotFromContent(contextResult.rows[0].content, contextResult.rows[0].throughSequence, scope, lease.sessionId); snapshot = hydratedSnapshot.snapshot; hasCompaction = hydratedSnapshot.hasCompaction
       snapshotThroughSequence = BigInt(String(contextResult.rows[0].throughSequence))
     } else {
       const contextResult = await client.query<Row>(`SELECT snapshot."content", snapshot."throughSequence" FROM "agent_context_snapshots" AS snapshot
@@ -177,7 +178,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
         WHERE snapshot."sessionId" = $1 AND session."userId" = $2
         ORDER BY snapshot."throughSequence" DESC, snapshot."version" DESC LIMIT 1`, [lease.sessionId, lease.userId])
       if (contextResult.rows[0]) {
-        snapshot = snapshotFromContent(contextResult.rows[0].content, contextResult.rows[0].throughSequence, scope, lease.sessionId)
+        const hydratedSnapshot = snapshotFromContent(contextResult.rows[0].content, contextResult.rows[0].throughSequence, scope, lease.sessionId); snapshot = hydratedSnapshot.snapshot; hasCompaction = hydratedSnapshot.hasCompaction
         snapshotThroughSequence = BigInt(String(contextResult.rows[0].throughSequence))
       }
     }
@@ -206,7 +207,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     const seenHistory = new Set(snapshot.steerHistory.map(item => item.id))
     snapshot = {
       ...snapshot,
-      goal: { id: `turn-goal:${lease.turnId}`, content: goal },
+      goal: hasCompaction ? snapshot.goal : { id: `turn-goal:${lease.turnId}`, content: goal },
       steerHistory: [...snapshot.steerHistory, ...history.filter(item => !seenHistory.has(item.id)).map(({ sequence: _sequence, ...item }) => item), ...questionHistory],
       toolObservations: [...snapshot.toolObservations, ...restoredNew, ...consumedWaits.filter(item => !seenWithRestored.has(item.id))],
     }

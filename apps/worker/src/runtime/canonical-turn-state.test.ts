@@ -8,6 +8,7 @@ import { buildCognitiveActionAgenda } from "./turns/cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE } from "./turns/cognitive-agenda-receipt.js"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 import { StepContextBuilder } from "./context/step-context-builder.js"
+import type { StepContextSnapshot } from "./context/step-context-builder.js"
 import type { InputClaimStore, InputClaimTransaction } from "./context/input-claim-store.js"
 import { buildModelRequest } from "./turns/turn-engine-messages.js"
 
@@ -67,6 +68,25 @@ function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unk
   return { connect: vi.fn(async () => client), client } as unknown as Pick<import("pg").Pool, "connect"> & { client: typeof client }
 }
 
+async function capturedRequestText(snapshot: StepContextSnapshot): Promise<string> {
+  const claimStore: InputClaimStore = {
+    scope: { userId: "user-1" },
+    async withTransaction<T>(work: (transaction: InputClaimTransaction) => Promise<T>): Promise<T> {
+      return work({
+        getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }),
+        claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }),
+        persistCheckpoint: async () => undefined,
+      })
+    },
+  }
+  const step = await new StepContextBuilder(claimStore).build({
+    scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "step-1", snapshot, now: new Date(0),
+  })
+  const model = { profile: { provider: "test", model: "test-model", nativeTools: false, structuredOutput: false, streaming: false, continuationCursor: false } } as unknown as ModelAdapter
+  const request = buildModelRequest({ context: step, model, tools: [], sessionId: "session-1", turnId: "turn-1", stepId: "step-1", userId: "user-1", taskId: "root-1", signal: new AbortController().signal })
+  return request.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+}
+
 describe("loadCanonicalTurnState", () => {
   it("hydrates durable compaction state from the persisted snapshot after a Worker restart", async () => {
     const state = {
@@ -105,25 +125,43 @@ describe("loadCanonicalTurnState", () => {
       }),
     })])
     expect(restored.snapshot.toolObservations[0]?.id).not.toContain("narrative")
-    const claimStore: InputClaimStore = {
-      scope: { userId: "user-1" },
-      async withTransaction<T>(work: (transaction: InputClaimTransaction) => Promise<T>): Promise<T> {
-        return work({
-          getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }),
-          claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }),
-          persistCheckpoint: async () => undefined,
-        })
-      },
-    }
-    const step = await new StepContextBuilder(claimStore).build({
-      scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "step-1", snapshot: restored.snapshot, now: new Date(0),
-    })
-    const model = { profile: { provider: "test", model: "test-model", nativeTools: false, structuredOutput: false, streaming: false, continuationCursor: false } } as unknown as ModelAdapter
-    const request = buildModelRequest({ context: step, model, tools: [], sessionId: "session-1", turnId: "turn-1", stepId: "step-1", userId: "user-1", taskId: "root-1", signal: new AbortController().signal })
-    const requestText = request.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    expect(restored.snapshot.goal?.content).toBe("Search Dublin roles")
+    const requestText = await capturedRequestText(restored.snapshot)
     expect(requestText).toContain("context_snapshot_working_state")
     expect(requestText).toContain("Search Dublin roles")
+    expect(requestText).not.toContain("Continue search")
     expect(requestText).toContain("UNTRUSTED_DATA")
+  })
+
+  it("preserves the fail-closed goal for an oversized compaction snapshot through canonical resume", async () => {
+    const state = {
+      ownerId: "user-1", sessionId: "session-1", throughSequence: "7", goal: "Compaction-only target", userConstraints: [],
+      approvals: [], answers: Array.from({ length: 20 }, (_, index) => ({ id: `answer-${String(index).padStart(2, "0")}`, question: "Question", answer: "x".repeat(1000) })),
+      artifacts: [], openTasks: [], doNotRepeat: [], facts: [],
+    }
+    const summary = "Oversized canonical state"
+    const measurement = { beforeInputTokens: 100, afterInputTokens: 40, reductionTokens: 60, reductionRatio: 0.6 }
+    const sourceItemIds = ["item-1"]
+    const itemId = "compaction-large"
+    const compaction = { itemId, digest: sha256Hex({ state, summary, measurement, sourceItemIds, itemId }), state, narrativeSummary: summary, tokenMeasurement: measurement, sourceItemIds }
+    const snapshot = {
+      schemaVersion: "agent-harness.context.v1", ownerId: "user-1", sessionId: "session-1", throughSequence: "7", goal: "Stale top-level goal",
+      userConstraints: [], confirmedDecisions: [], completedWork: [], openWork: [], pendingApprovals: [], artifacts: [], facts: [], failedAttempts: [],
+      references: [], consumedInputIds: [], context: { system: [], profile: [], steerHistory: [], toolObservations: [] },
+      tokenAccounting: { profiles: [], totalInputTokens: 0, totalOutputTokens: 0, totalCostUsd: 0 }, compaction,
+    }
+    const fake = pool({
+      turn: { input: { goal: "Original turn goal" }, rootTaskId: null, contextSnapshotId: "snapshot-1", modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      snapshots: [{ id: "snapshot-1", throughSequence: "7", version: 1, content: snapshot }],
+    })
+
+    const restored = await loadCanonicalTurnState(fake, lease)
+    const unavailableGoal = "Durable context snapshot unavailable (projection limit exceeded)."
+    expect(restored.snapshot.goal?.content).toBe(unavailableGoal)
+    const requestText = await capturedRequestText(restored.snapshot)
+    expect(requestText).toContain(unavailableGoal)
+    expect(requestText).not.toContain("Original turn goal")
+    expect(requestText).not.toContain("Compaction-only target")
   })
 
   it("fails closed when a loaded snapshot cursor disagrees with its database cursor", async () => {
@@ -419,7 +457,7 @@ describe("loadCanonicalTurnState", () => {
     }
     const latestContent = { ...pinnedContent, throughSequence: "8", context: { ...pinnedContent.context, steerHistory: [{ id: "latest-history", content: "Newer summary" }] } }
     const fake = pool({
-      turn: { input: { goal: "Continue" }, rootTaskId: null, contextSnapshotId: "snapshot-pinned", modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      turn: { input: { goal: "Legacy input goal" }, rootTaskId: null, contextSnapshotId: "snapshot-pinned", modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
       inputs: [
         { id: "before-cursor", targetTurnId: "old-turn", content: [{ type: "text", text: "Summarized already" }], acceptedSequence: "3" },
         { id: "after-cursor", targetTurnId: "old-turn", content: [{ type: "text", text: "Keep this" }], acceptedSequence: "5" },
@@ -432,6 +470,7 @@ describe("loadCanonicalTurnState", () => {
 
     const value = await loadCanonicalTurnState(fake, lease)
     expect(value.contextSnapshotPinned).toBe(true)
+    expect(value.snapshot.goal).toEqual({ id: "turn-goal:turn-1", content: "Legacy input goal" })
     expect(value.snapshot.steerHistory).toEqual([
       { id: "pinned-history", content: "Pinned summary" },
       { id: "history:user:after-cursor", content: { role: "user", text: "Keep this" } },
