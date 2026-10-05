@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { projectSupervisorTree, taskInterruptStatus, taskIsInterruptible, type SupervisorTaskSummary, type SupervisorTurnSummary } from './task-tree-projection'
+import { projectSelectedTaskInterrupt, projectSupervisorTree, taskInterruptStatus, taskIsInterruptible, type SupervisorTaskSummary, type SupervisorTurnSummary } from './task-tree-projection'
 import type { TimelineItem } from './timeline-reducer'
 import type { TaskTreeNode } from './types'
 
@@ -26,9 +26,16 @@ describe('projectSupervisorTree', () => {
     const accepted = item({ id: 'interrupt-accepted', taskId: selected.id, type: 'unknown', content: {
       eventType: 'task.interrupt.accepted', payload: { taskId: selected.id, intentId: 'intent-1' },
     }, sequence: '11', createdAt: '2026-09-07T10:02:00.000Z' })
+    const second = task('child-2', { rootTaskId: 'root-1', parentTaskId: 'root-1', status: 'running' })
+    const secondAccepted = item({ id: 'interrupt-accepted-2', taskId: second.id, type: 'unknown', content: {
+      eventType: 'task.interrupt.accepted', payload: { taskId: second.id, intentId: 'internal-2' },
+    }, sequence: '12', createdAt: '2026-09-07T10:02:01.000Z' })
     expect(taskIsInterruptible(selected, activeTurn, null)).toBe(true)
     expect(taskInterruptStatus(selected, [accepted])).toBe('accepted')
     expect(taskIsInterruptible(selected, activeTurn, 'accepted')).toBe(false)
+    expect(taskInterruptStatus(second, [accepted, secondAccepted])).toBe('accepted')
+    expect(projectSelectedTaskInterrupt([selected, second], [activeTurn], { id: `task:${second.id}`, kind: 'task', label: 'second', status: 'running' }, [accepted, secondAccepted]))
+      .toMatchObject({ status: 'accepted', eligible: false })
     expect(taskInterruptStatus(task(selected.id, { ...selected, status: 'interrupted' }), [])).toBe('interrupted')
 
     const failed = item({ id: 'interrupt-failed', taskId: selected.id, type: 'unknown', content: {

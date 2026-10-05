@@ -29,9 +29,13 @@ function fakePool(handler?: (sql: string, params?: unknown[]) => { rows?: unknow
     if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE") && !result.rows?.length) {
       return { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1, ...result }
     }
+    if (sql.startsWith('UPDATE "sub_agent_tasks"') && sql.includes("RETURNING to_char") && result.rowCount !== 0) {
+      return { rows: [{ interruptRequestedAt: "2026-09-23T12:00:00.000" }], rowCount: 1 }
+    }
+    if (sql.includes('UPDATE "agent_sessions"') && sql.includes('"eventSequence"')) return { rows: [{ eventSequence: "1" }], rowCount: 1 }
     if (sql.includes('SELECT task."id", task."status", task."attemptCount"') && !result.rows?.length) {
       const count = sql.includes('task."turnId" = $2') ? 2 : 3
-      return { rows: Array.from({ length: count }, (_, index) => ({ id: `task-${index + 1}`, status: index === 0 ? "running" : "waiting", attemptCount: 1 })), rowCount: count, ...result }
+      return { rows: Array.from({ length: count }, (_, index) => ({ id: `task-${index + 1}`, status: index === 0 ? "running" : "waiting", attemptCount: 1, turnId: "turn-1" })), rowCount: count, ...result }
     }
     if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1") && !result.rows?.length) {
       return { rows: [{ id: "task-1", sessionId: "session-1", rootTaskId: "task-1", userId: "user-1" }], rowCount: 1, ...result }
@@ -242,6 +246,79 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
     expect(calls.some(([sql]) => sql.includes('SELECT item."id"') || sql.includes('event."payload"'))).toBe(false)
     expect(calls.some(([sql]) => sql.includes('INSERT INTO "agent_events"'))).toBe(false)
     expect(calls.some(([sql]) => sql.includes('"agent_outbox"'))).toBe(false)
+  })
+
+  it("emits one stable accepted event and event-outbox intent per updated internal subtree task", async () => {
+    const tasks = ["child-a", "child-b", "skipped-child"].map(id => ({ id, status: "running", attemptCount: 1, turnId: "turn-1" }))
+    const markers = new Map<string, string>()
+    const eventKeys = new Set<string>()
+    const events: Array<{ taskId: string; type: string; idempotencyKey: string; payload: Record<string, unknown> }> = []
+    const outbox: Array<Record<string, unknown>> = []
+    let sequence = 0
+    const client = { query: vi.fn(async (sql: string, params?: unknown[]) => {
+      if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1 }
+      if (sql.includes('SELECT task."id", task."status", task."attemptCount"')) return { rows: tasks, rowCount: tasks.length }
+      if (sql.startsWith('UPDATE "sub_agent_tasks"')) {
+        const id = String(params?.[0])
+        if (id === "skipped-child") return { rows: [], rowCount: 0 }
+        const marker = markers.get(id) ?? (params?.[2] as Date).toISOString().replace(/Z$/, "")
+        markers.set(id, marker)
+        return { rows: [{ interruptRequestedAt: marker }], rowCount: 1 }
+      }
+      if (sql.includes('FROM "agent_events"') && sql.includes('"idempotencyKey" = $2')) {
+        const idempotencyKey = String(params?.[1])
+        return { rows: eventKeys.has(idempotencyKey) ? [{ id: "existing-event" }] : [], rowCount: eventKeys.has(idempotencyKey) ? 1 : 0 }
+      }
+      if (sql.includes('UPDATE "agent_sessions"') && sql.includes('"eventSequence"')) return { rows: [{ eventSequence: String(++sequence) }], rowCount: 1 }
+      if (sql.includes('INSERT INTO "agent_events"')) {
+        const idempotencyKey = String(params?.[7])
+        events.push({ taskId: String(params?.[3]), type: String(params?.[5]), idempotencyKey, payload: JSON.parse(String(params?.[8])) as Record<string, unknown> })
+        eventKeys.add(idempotencyKey)
+        return { rows: [], rowCount: 1 }
+      }
+      if (sql.includes("'agent.session.event'")) { outbox.push(JSON.parse(String(params?.[3])) as Record<string, unknown>); return { rows: [], rowCount: 1 } }
+      return { rows: [], rowCount: 1 }
+    }), release: vi.fn() }
+    const pool = { connect: vi.fn().mockResolvedValue(client) } as unknown as PgSubagentPool
+    const input = { sessionId: "session-1", rootTaskId: "root-1", targetPath: "/root-1/child", now: new Date("2026-09-27T12:00:00.000Z") }
+
+    await expect(interruptSubtree(pool, input)).resolves.toBe(2)
+    const firstKeys = events.map(event => event.idempotencyKey)
+    await expect(interruptSubtree(pool, { ...input, now: new Date("2026-09-27T12:01:00.000Z") })).resolves.toBe(2)
+
+    expect(events).toHaveLength(2)
+    expect(events.map(event => event.taskId).sort()).toEqual(["child-a", "child-b"])
+    expect(events.map(event => event.type)).toEqual(["task.interrupt.accepted", "task.interrupt.accepted"])
+    expect(events.every(event => event.payload.status === "accepted" && String(event.payload.intentId).startsWith("internal-"))).toBe(true)
+    expect(firstKeys).toEqual(events.map(event => event.idempotencyKey))
+    expect(outbox).toHaveLength(2)
+    expect(outbox.map(event => event.taskId).sort()).toEqual(["child-a", "child-b"])
+    expect(outbox.every(event => event.type === "task.interrupt.accepted" && event.actor === "system" && event.itemId === null)).toBe(true)
+    expect(sequence).toBe(2)
+  })
+
+  it("keeps an internal interrupt for a legacy task without a turn and skips its unrepresentable event", async () => {
+    const now = new Date("2026-09-27T12:02:00.000Z")
+    const calls: Array<[string, unknown[]?]> = []
+    let requestedAt: Date | null = null
+    const client = { query: vi.fn(async (sql: string, params?: unknown[]) => {
+      calls.push([sql, params])
+      if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1 }
+      if (sql.includes('SELECT task."id", task."status", task."attemptCount"')) return { rows: [{ id: "legacy-child", status: "running", attemptCount: 1, turnId: null }], rowCount: 1 }
+      if (sql.startsWith('UPDATE "sub_agent_tasks"')) {
+        requestedAt = params?.[2] as Date
+        return { rows: [{ interruptRequestedAt: "2026-09-27T12:02:00.000" }], rowCount: 1 }
+      }
+      return { rows: [], rowCount: 1 }
+    }), release: vi.fn() }
+    const pool = { connect: vi.fn().mockResolvedValue(client) } as unknown as PgSubagentPool
+
+    await expect(interruptSubtree(pool, { sessionId: "session-1", rootTaskId: "root-1", targetPath: "/root-1/legacy-child", now })).resolves.toBe(1)
+
+    expect(requestedAt).toEqual(now)
+    expect(calls.some(([sql]) => sql === "COMMIT")).toBe(true)
+    expect(calls.some(([sql]) => sql.includes('INSERT INTO "agent_events"'))).toBe(false)
+    expect(calls.some(([sql]) => sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
   })
 
   it("scopes bulk interruptions and applies row changes after the session lock", async () => {

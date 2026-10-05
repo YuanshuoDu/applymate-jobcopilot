@@ -1,11 +1,10 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 
 import type { AgentTreeManager } from "./manager.js"
 import { transaction, type Queryable } from "./pg-store-persistence.js"
 import { hasPersistedTaskGraphMembership, type GraphIdentityScope } from "./task-graph-pg-state.js"
 import { persistGraphTransition, prepareGraphTransition, reconcileGraphDependents } from "./task-graph-pg-lifecycle.js"
 import type { PgSubagentPool } from "./types.js"
-
 export const TASK_INTERRUPT_OUTBOX_TOPIC = "agent.subagent.task-interrupt"
 const ACTIVE = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user"])
 const ACTIVE_TURN = new Set(["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"])
@@ -29,18 +28,18 @@ export function parseTaskInterruptIntent(value: unknown): TaskInterruptIntent | 
   if (!row || Object.keys(row).sort().join(",") !== "intentId,sessionId,taskId,turnId" || [row.sessionId, row.turnId, row.taskId, row.intentId].some(value => typeof value !== "string" || !value.trim() || value.length > 128)) return null
   return { sessionId: row.sessionId as string, turnId: row.turnId as string, taskId: row.taskId as string, intentId: row.intentId as string }
 }
-function key(intent: TaskInterruptIntent, taskId: string, outcome: "interrupted" | "failed"): string { return `agent-task-interrupt:${intent.intentId}:${taskId}:${outcome}` }
-async function appendOutcome(client: Queryable, userId: string, intent: TaskInterruptIntent, taskId: string, outcome: "interrupted" | "failed", failureCode = "target_unavailable"): Promise<void> {
-  const type = outcome === "failed" ? "task.interrupt.failed" : "task.interrupted", idempotencyKey = key(intent, taskId, outcome)
+type TaskInterruptOutcome = "accepted" | "interrupted" | "failed"
+function key(intent: TaskInterruptIntent, taskId: string, outcome: TaskInterruptOutcome): string { return `agent-task-interrupt:${intent.intentId}:${taskId}:${outcome}` }
+async function appendOutcome(client: Queryable, userId: string, intent: TaskInterruptIntent, taskId: string, outcome: TaskInterruptOutcome, failureCode = "target_unavailable"): Promise<void> {
+  const type = outcome === "accepted" ? "task.interrupt.accepted" : outcome === "failed" ? "task.interrupt.failed" : "task.interrupted", idempotencyKey = key(intent, taskId, outcome)
   const prior = await client.query(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "idempotencyKey" = $2`, [intent.sessionId, idempotencyKey])
   if (prior.rows[0]) return
   const sequence = await client.query(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1
     WHERE "id" = $1 AND "userId" = $2 RETURNING "eventSequence"`, [intent.sessionId, userId])
   const eventSequence = sequence.rows[0]?.eventSequence; if (eventSequence === undefined) throw new Error("task_interrupt_event_session_missing")
   const eventId = randomUUID()
-  const payload = outcome === "failed"
-    ? { intentId: intent.intentId, taskId, status: "failed", code: failureCode }
-    : { intentId: intent.intentId, taskId, status: "interrupted" }
+  const payload = outcome === "failed" ? { intentId: intent.intentId, taskId, status: "failed", code: failureCode }
+    : { intentId: intent.intentId, taskId, status: outcome }
   const eventPayload = { eventId, sessionId: intent.sessionId, turnId: intent.turnId, itemId: null, taskId,
     sequence: String(eventSequence), type, actor: "system", correlationId: intent.intentId, causationId: null, idempotencyKey, payload }
   await client.query(`INSERT INTO "agent_events" (
@@ -51,6 +50,10 @@ async function appendOutcome(client: Queryable, userId: string, intent: TaskInte
     "id", "topic", "aggregateId", "idempotencyKey", "payload")
     VALUES ($1, 'agent.session.event', $2, $3, $4::jsonb)`,
   [randomUUID(), intent.sessionId, `agent-event:${eventId}`, JSON.stringify(eventPayload)])
+}
+export async function appendInternalAcceptedInterrupt(client: Queryable, userId: string, input: Readonly<{ sessionId: string; turnId: string; taskId: string; interruptRequestedAt: string }>): Promise<void> {
+  const intentId = `internal-${createHash("sha256").update(`${input.sessionId}\0${input.taskId}\0${input.interruptRequestedAt}`).digest("hex")}`
+  await appendOutcome(client, userId, { ...input, intentId }, input.taskId, "accepted")
 }
 async function rejectIntent(client: Queryable, intent: TaskInterruptIntent, userId: string, failureCode?: string): Promise<boolean> {
   await setUserScope(client, userId)
@@ -162,7 +165,6 @@ async function applyIntent(client: Queryable, intent: TaskInterruptIntent, userI
   }
   return { rootTaskId: lineage.target.rootTaskId, taskIds: activeIds }
 }
-
 async function processRow(pool: PgSubagentPool, id: string, manager: AgentTreeManager): Promise<boolean> {
   try {
     const outcome = await transaction(pool, async client => {
@@ -190,7 +192,6 @@ async function processRow(pool: PgSubagentPool, id: string, manager: AgentTreeMa
     return recordProcessingFailure(pool, id).catch(() => false)
   }
 }
-
 async function reconcileCompleted(pool: PgSubagentPool): Promise<void> {
   await transaction(pool, async client => {
     const intents = await client.query(`SELECT command."payload" FROM "agent_outbox" command
@@ -225,7 +226,6 @@ async function reconcileCompleted(pool: PgSubagentPool): Promise<void> {
     }
   })
 }
-
 export async function drainTaskInterruptOutbox(pool: PgSubagentPool, manager: AgentTreeManager): Promise<number> {
   const rows = await transaction(pool, client => client.query<{ id: string }>(`SELECT "id" FROM "agent_outbox"
     WHERE "topic" = $1 AND "publishedAt" IS NULL ORDER BY "createdAt", "id" LIMIT $2 FOR UPDATE SKIP LOCKED`, [TASK_INTERRUPT_OUTBOX_TOPIC, BATCH_SIZE]))
@@ -234,7 +234,6 @@ export async function drainTaskInterruptOutbox(pool: PgSubagentPool, manager: Ag
   await reconcileCompleted(pool)
   return processed
 }
-
 export function startTaskInterruptOutboxConsumer(pool: PgSubagentPool, manager: AgentTreeManager, options: StartOptions = {}) {
   const pollMs = options.pollMs ?? Number(process.env.AGENT_TASK_INTERRUPT_OUTBOX_POLL_MS ?? POLL_MS)
   let closed = false, inFlight: Promise<void> | null = null
