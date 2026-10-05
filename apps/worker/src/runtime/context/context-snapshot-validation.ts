@@ -6,6 +6,7 @@ import {
   type ContextSnapshotTokenProfile,
 } from "./context-snapshot-types.js"
 import { canonicalJson } from "./context-snapshot-json.js"
+import { validateSnapshotCompaction } from "./context-snapshot-working-state.js"
 
 function record(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new ContextSnapshotError("store_conflict", "Snapshot content must be an object")
@@ -189,6 +190,7 @@ function validateContent(content: Record<string, unknown>): void {
   }
   validateContext(record(content.context))
   validateAccounting(content.tokenAccounting, "tokenAccounting")
+  validateSnapshotCompaction(content.compaction, String(content.ownerId), String(content.sessionId), String(content.throughSequence))
 }
 
 export function validateSnapshotContent(value: unknown): ContextSnapshotContent {

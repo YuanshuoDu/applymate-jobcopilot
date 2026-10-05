@@ -3,6 +3,7 @@ import type { TenantScope, RepositoryJsonValue } from "@jobcopilot/agent-protoco
 
 import { parseSnapshotContent } from "./context/context-snapshot-canonical.js"
 import type { StepContextSnapshot } from "./context/step-context-builder.js"
+import { stepContextSnapshotFromContent } from "./context/context-snapshot-working-state.js"
 import type { TurnLease } from "./turns/lease.js"
 import type { TurnResumeState } from "./turns/turn-engine-types.js"
 import type { PersistedToolCallRecovery } from "./turns/turn-engine-types.js"
@@ -48,17 +49,11 @@ function json(value: unknown): RepositoryJsonValue {
   return null
 }
 
-function snapshotFromContent(value: unknown, scope: TenantScope, sessionId: string): StepContextSnapshot {
+function snapshotFromContent(value: unknown, throughSequence: unknown, scope: TenantScope, sessionId: string): StepContextSnapshot {
   const content = parseSnapshotContent(value)
   if (content.ownerId !== scope.userId || content.sessionId !== sessionId) throw new Error("context_snapshot_scope_mismatch")
-  return {
-    system: content.context.system,
-    profile: content.context.profile,
-    goal: content.context.goal,
-    steerHistory: content.context.steerHistory,
-    businessRefs: content.references.map(({ source: _source, verified: _verified, ...reference }) => reference),
-    toolObservations: content.context.toolObservations,
-  }
+  if (content.throughSequence !== String(throughSequence)) throw new Error("context_snapshot_sequence_mismatch")
+  return stepContextSnapshotFromContent(content)
 }
 
 function eventPayload(value: unknown): Row { const payload = object(value); return object(payload.payload ?? payload) }
@@ -174,16 +169,16 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
         JOIN "agent_sessions" AS session ON session."id" = snapshot."sessionId"
         WHERE snapshot."id" = $1 AND snapshot."sessionId" = $2 AND session."userId" = $3`, [turn.contextSnapshotId, lease.sessionId, lease.userId])
       if (!contextResult.rows[0]) throw new Error("context_snapshot_missing")
-      snapshot = snapshotFromContent(contextResult.rows[0].content, scope, lease.sessionId)
-      snapshotThroughSequence = BigInt(String(contextResult.rows[0].throughSequence ?? object(contextResult.rows[0].content).throughSequence ?? 0))
+      snapshot = snapshotFromContent(contextResult.rows[0].content, contextResult.rows[0].throughSequence, scope, lease.sessionId)
+      snapshotThroughSequence = BigInt(String(contextResult.rows[0].throughSequence))
     } else {
       const contextResult = await client.query<Row>(`SELECT snapshot."content", snapshot."throughSequence" FROM "agent_context_snapshots" AS snapshot
         JOIN "agent_sessions" AS session ON session."id" = snapshot."sessionId"
         WHERE snapshot."sessionId" = $1 AND session."userId" = $2
         ORDER BY snapshot."throughSequence" DESC, snapshot."version" DESC LIMIT 1`, [lease.sessionId, lease.userId])
       if (contextResult.rows[0]) {
-        snapshot = snapshotFromContent(contextResult.rows[0].content, scope, lease.sessionId)
-        snapshotThroughSequence = BigInt(String(contextResult.rows[0].throughSequence ?? object(contextResult.rows[0].content).throughSequence ?? 0))
+        snapshot = snapshotFromContent(contextResult.rows[0].content, contextResult.rows[0].throughSequence, scope, lease.sessionId)
+        snapshotThroughSequence = BigInt(String(contextResult.rows[0].throughSequence))
       }
     }
     const goal = turnGoal(turn.input)

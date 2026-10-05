@@ -1,5 +1,6 @@
 import type { InputContentPart, TenantScope } from "@jobcopilot/agent-protocol"
 import type pg from "pg"
+import { createPgContextOwnerFence as createPgContextOwnerFenceImpl } from "./step-context-owner-fence.js"
 import { InputClaimStoreError, type InputClaimStore, type InputClaimTransaction, type StoredAgentInput, type TurnExecutionFence } from "./input-claim-store.js"
 import { appendNewObservedSteeringMarkers, buildObservedSteeringMarker, type SteeringMarkerContext } from "./steering-marker-store.js"
 import type { SteeringMarkerPayload } from "./steering-marker.js"
@@ -82,33 +83,8 @@ const defaultOwnerFence: ContextOwnerFence = {
   },
 }
 
-const referenceTables: Record<BusinessReferenceResource, { table: string; ownerColumn: string }> = { job: { table: '"Job"', ownerColumn: '"userId"' }, gmail_message: { table: '"gmail_messages"', ownerColumn: '"user_id"' }, resume: { table: '"Resume"', ownerColumn: '"userId"' }, resume_version: { table: '"ResumeVersion"', ownerColumn: '"userId"' }, persona_fact: { table: '"persona_facts"', ownerColumn: '"userId"' }, persona_evidence_chunk: { table: '"persona_evidence_chunks"', ownerColumn: '"userId"' } }
-
 export function createPgContextOwnerFence(pool: Pick<pg.Pool, "connect">): ContextOwnerFence {
-  async function owned(id: string, userId: string, resource: BusinessReferenceResource): Promise<void> {
-    const client = await pool.connect()
-    try {
-      const table = referenceTables[resource]
-      const result = await client.query(`SELECT "id" FROM ${table.table} WHERE "id" = $1 AND ${table.ownerColumn} = $2`, [id, userId])
-      if (!result.rows[0]) throw new ContextOwnershipError("reference_owner_mismatch", `Reference ${id} is outside the tenant scope`)
-    } finally { client.release() }
-  }
-  return {
-    assertReferenceOwned: async (reference, scope) => {
-      const resource = reference.resource ?? (reference.kind === "job" || reference.kind === "jd" ? "job" : reference.kind === "email" ? "gmail_message" : undefined)
-      if (!resource) throw new ContextOwnershipError("reference_owner_unknown", `Reference ${reference.id} has no verifiable resource type`)
-      await owned(reference.id, scope.userId, resource)
-    },
-    assertAttachmentOwned: async (reference, scope) => {
-      const client = await pool.connect()
-      try {
-        const result = await client.query<{ id: string; name: string }>('SELECT "id", "name" FROM "Resume" WHERE "id" = $1 AND "userId" = $2', [reference.attachmentId, scope.userId])
-        const row = result.rows[0]
-        if (!row) throw new ContextOwnershipError("reference_owner_mismatch", `Attachment ${reference.attachmentId} is outside the tenant scope`)
-        return { attachmentId: row.id, filename: row.name }
-      } finally { client.release() }
-    },
-  }
+  return createPgContextOwnerFenceImpl(pool, (code, message) => new ContextOwnershipError(code, message))
 }
 
 const layerOrder: readonly ContextLayer[] = ["system", "profile", "goal", "steer_history", "business", "tool_observation", "pending_input"]
@@ -237,7 +213,7 @@ export class StepContextBuilder {
     if (request.snapshot.goal) blocks.push(block("goal", "data", "external_untrusted", "turn_goal", `goal:${request.snapshot.goal.id}`, request.snapshot.goal.content))
     for (const entry of request.snapshot.steerHistory) blocks.push(block("steer_history", "data", "external_untrusted", "steer_history", `history:${entry.id}`, entry.content))
     for (const reference of [...request.snapshot.businessRefs].sort((left, right) => left.kind.localeCompare(right.kind) || left.id.localeCompare(right.id))) blocks.push(block("business", "data", referenceTrust(reference.kind), "business_reference", `business:${reference.kind}:${reference.id}`, referenceContent(reference)))
-    for (const observation of request.snapshot.toolObservations) blocks.push(block("tool_observation", "data", "external_untrusted", "tool_or_subagent", `observation:${observation.id}`, observation.content))
+    for (const observation of request.snapshot.toolObservations) blocks.push(block("tool_observation", "data", "external_untrusted", observation.id.startsWith("snapshot-working-state:") ? "context_snapshot_working_state" : "tool_or_subagent", `observation:${observation.id}`, observation.content))
     for (const input of contextInputs) blocks.push(...(await pendingInputBlocks(input, this.ownerFence, request.scope, block, message => new ContextOwnershipError("reference_owner_mismatch", message))).filter(item => input.id !== request.rootInputId || isAttachmentBlock(item)))
     const ordered = blocks.sort((left, right) => layerOrder.indexOf(left.layer) - layerOrder.indexOf(right.layer))
     const result = {
