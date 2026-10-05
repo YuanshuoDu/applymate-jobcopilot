@@ -91,8 +91,11 @@ const MAX_QUESTION_CHARS = 500
 const MAX_OPTION_LABEL_CHARS = 120
 const MAX_OPTION_VALUE_CHARS = 120
 const MAX_ACTION_FIELD_CHARS = 100
-const MAX_RETRY_FIX_FIELDS = 20
 const MAX_NESTED_VALUE_CHARS = 2_000
+const MAX_RETRY_THROTTLE_MS = 60_000
+// Keep this aligned with the default used by the Analyst stage.
+const DEFAULT_RETRY_THROTTLE_MS = 300
+const RETRYABLE_MODEL_FIX_STAGES = new Set(['scout', 'analyst'])
 
 function parseDecision(raw: unknown): unknown {
   if (typeof raw !== 'string' || raw.length > MAX_DECISION_RESPONSE_CHARS) return null
@@ -135,7 +138,33 @@ function isBoundedJsonValue(value: unknown, depth = 0): boolean {
   )
 }
 
-function validateDecision(value: unknown, autonomous: boolean): OrchestratorDecision | null {
+function isValidRetryFix(
+  value: unknown,
+  stage: string,
+  currentThrottleMs: number | undefined,
+): value is Record<string, unknown> & { throttleMs: number } {
+  if (!RETRYABLE_MODEL_FIX_STAGES.has(stage) || !isRecord(value)) return false
+
+  const keys = Reflect.ownKeys(value)
+  if (keys.length !== 1 || keys[0] !== 'throttleMs' || !hasOwn(value, 'throttleMs')) return false
+
+  const current = currentThrottleMs ?? DEFAULT_RETRY_THROTTLE_MS
+  const requested = value.throttleMs
+  return Number.isInteger(current)
+    && current >= 0
+    && current <= MAX_RETRY_THROTTLE_MS
+    && typeof requested === 'number'
+    && Number.isInteger(requested)
+    && requested >= current
+    && requested <= MAX_RETRY_THROTTLE_MS
+}
+
+function validateDecision(
+  value: unknown,
+  autonomous: boolean,
+  stage: string,
+  currentThrottleMs: number | undefined,
+): OrchestratorDecision | null {
   if (!isRecord(value)) return null
   if (!['proceed', 'retry', 'ask_user', 'abort'].includes(value.decision as string)) return null
   if (!boundedString(value.thinking, MAX_THINKING_CHARS)) return null
@@ -147,17 +176,9 @@ function validateDecision(value: unknown, autonomous: boolean): OrchestratorDeci
     case 'abort':
       return { decision: value.decision, thinking }
     case 'retry': {
-      if (!isRecord(value.retry_fix)) return null
-      const entries = Object.entries(value.retry_fix)
-      if (entries.length === 0 || entries.length > MAX_RETRY_FIX_FIELDS) return null
-      if (!entries.every(([key, item]) =>
-        key.length > 0 && key.length <= MAX_ACTION_FIELD_CHARS && isBoundedJsonValue(item),
-      )) return null
-      let serialized: string
-      try { serialized = JSON.stringify(value.retry_fix) }
-      catch { return null }
-      if (typeof serialized !== 'string' || serialized.length > MAX_NESTED_VALUE_CHARS) return null
-      return { decision: 'retry', thinking, retry_fix: value.retry_fix }
+      const retryFix = value.retry_fix
+      if (!isValidRetryFix(retryFix, stage, currentThrottleMs)) return null
+      return { decision: 'retry', thinking, retry_fix: retryFix }
     }
     case 'ask_user': {
       if (autonomous) return null
@@ -320,7 +341,9 @@ Autonomous mode: ${this.autonomous}
 Decide what to do next. Rules:
 - Only ask_user if something truly needs human judgment (e.g., all jobs skipped, major config conflict)
 - In autonomous mode: NEVER ask_user, always proceed or retry with sensible defaults
-- retry only if there's a concrete fix to apply (e.g., model switch, param change)
+- retry only on Scout or Analyst, the stages with bounded retry paths
+- retry_fix must contain exactly one key: throttleMs, an integer from the current runtime value (default 300ms) through 60000ms
+- a retry may slow the run but must never change consent, automation mode, search criteria, model, or any other user setting
 - abort only if pipeline literally cannot continue (0 jobs + 0 from any source)
 - proceed in all other cases
 
@@ -330,13 +353,13 @@ Respond ONLY in valid JSON (no markdown):
   "thinking": "<one sentence why>",
   "ask_question": "<question for user, only if ask_user>",
   "ask_options": [{"label":"...", "value":"..."}],
-  "retry_fix": {"field": "value"}
+  "retry_fix": {"throttleMs": 600}
 }`
 
     let decision: OrchestratorDecision | null = null
     try {
       const r = await modelChat([{ role: 'user', content: prompt }], this.ctx.aiConfig, 400)
-      decision = validateDecision(parseDecision(r.text), this.autonomous)
+      decision = validateDecision(parseDecision(r.text), this.autonomous, stage, this.ctx.agentCfg.throttleMs)
     } catch {
       throw new OrchestratorDecisionError()
     }
@@ -399,14 +422,29 @@ Respond ONLY in valid JSON (no markdown):
         'too_many_scoring_failures':  { model: 'claude-sonnet-5' },
       }
       const resolved = named[fix]
-      if (resolved) { this.applyFix(resolved, stage) }
+      if (resolved) {
+        const changes = applyAgentConfigPatch(this.ctx.agentCfg, agentConfigPatchFrom(resolved))
+        if (changes.length > 0) {
+          this.emit('orchestrator_fix', {
+            stage, fix: changes.join(', '),
+            message: `🔧 Orchestrator repair [${stage}]: ${changes.join(', ')}`,
+          })
+          this.history.push(`[Fix/${stage}] ${changes.join(', ')}`)
+        }
+      }
       else {
         this.emit('orchestrator_fix', { stage, fix, message: `🔧 Orchestrator Problem detected [${stage}]: ${fix}, Try again…` })
         this.history.push(`[Fix/${stage}] ${fix}`)
       }
       return
     }
-    const changes = applyAgentConfigPatch(this.ctx.agentCfg, agentConfigPatchFrom(fix))
+    if (!isValidRetryFix(fix, stage, this.ctx.agentCfg.throttleMs)) {
+      throw new OrchestratorDecisionError()
+    }
+    const changes = applyAgentConfigPatch(
+      this.ctx.agentCfg,
+      agentConfigPatchFrom({ throttleMs: fix.throttleMs }),
+    )
     if (changes.length > 0) {
       this.emit('orchestrator_fix', {
         stage, fix: changes.join(', '),
