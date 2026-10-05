@@ -259,6 +259,12 @@ describe("durable wait outcome consumer", () => {
     expect(fake.state.updates).toBe(0)
   })
 
+  it("rejects an unknown status in a consumed non-matched any snapshot", async () => {
+    const fake = fixture({ consumed: true, mode: "any", targetCount: 2, matchedTaskIds: ["child-1"], archivedTargetStatuses: ["completed", "unknown"], targetStatuses: ["completed", "completed"] })
+    await expect(consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now })).rejects.toThrow("wait_consume_outcome_invalid")
+    expect(fake.state.updates).toBe(0)
+  })
+
   it("rejects a consumed ready-all archive with only a subset of targets matched", async () => {
     const fake = fixture({ consumed: true, mode: "all", targetCount: 2, matchedTaskIds: ["child-1"] })
     await expect(consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now })).rejects.toThrow("wait_consume_outcome_invalid")

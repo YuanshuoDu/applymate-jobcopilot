@@ -14,6 +14,7 @@ const MAX_TARGETS = 8
 const MAX_ID_LENGTH = 256
 const MAX_SUMMARY_BYTES = 1_000
 const MAX_FAILURE_BYTES = 500
+const NON_TERMINAL_TASK_STATUSES: ReadonlySet<string> = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user"])
 const FORBIDDEN_RESULT_KEYS = new Set([
   "id", "userid", "sessionid", "turnid", "stepid", "taskid", "parenttaskid", "roottaskid", "ownerid", "lease",
   "leaseownerid", "leaseversion", "idempotencykey", "capabilities", "permissions", "allowedcapabilities", "budgetlimit", "maxbudget", "taskgraphverificationreport", "taskgraphrepairreceipt",
@@ -86,7 +87,7 @@ function resultInfo(value: unknown): ResultInfo {
 function failure(value: unknown): string | null { if (value === null || value === undefined) return null; try { return utf8Prefix(redactSensitiveText(String(value)), MAX_FAILURE_BYTES) } catch { return null } }
 function waitMode(value: unknown): "any" | "all" | null { return value === "any" || value === "all" ? value : null }
 function waitStatus(value: unknown): "ready" | "timed_out" | null { return value === "ready" || value === "timed_out" ? value : null }
-function taskStatus(value: unknown): string | null { const result = safeText(value); return result.length > 0 && result.length <= MAX_ID_LENGTH ? result : null }
+function taskStatus(value: unknown): string | null { return typeof value === "string" && value.length <= MAX_ID_LENGTH && (isTerminalSubagentStatus(value) || NON_TERMINAL_TASK_STATUSES.has(value)) ? value : null }
 function taskRole(value: unknown): string | null { return typeof value === "string" && value.trim().length > 0 && value.length <= MAX_ID_LENGTH ? value : null }
 function boundedIds(value: unknown, allowEmpty = false): string[] | null {
   const values = ids(value)
