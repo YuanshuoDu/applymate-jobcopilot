@@ -1,9 +1,13 @@
 import { describe, expect, it } from "vitest"
+import type { TenantScope } from "@jobcopilot/agent-protocol"
+import type { ModelAdapter } from "@jobcopilot/agent-model"
 import { isSelectedJobRootTool, loadTaskGraphCurrentObservation, mergeTaskGraphCurrentObservation, selectedJobSnapshot, selectedJobToolAllowed } from "./canonical-turn-task-graph-context.js"
 import type { TaskGraphCommandPort } from "./subagents/task-graph-command-port.js"
 import type { TaskGraphCurrentState } from "./subagents/task-graph-command-port.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "./subagents/task-graph-command-port.js"
-import type { StepContextSnapshot } from "./context/step-context-builder.js"
+import { StepContextBuilder, type StepContextSnapshot } from "./context/step-context-builder.js"
+import type { InputClaimStore, InputClaimTransaction } from "./context/input-claim-store.js"
+import { buildModelRequest } from "./turns/turn-engine-messages.js"
 import type { TurnLease } from "./turns/lease.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "./subagents/task-graph-pg-verification.js"
 import { TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION } from "./subagents/task-graph-command-port.js"
@@ -37,6 +41,29 @@ function snapshot(): StepContextSnapshot {
   }
 }
 
+function emptyInputStore(): InputClaimStore {
+  const scope: TenantScope = { userId: "user-1" }
+  return {
+    scope,
+    async withTransaction<T>(work: (transaction: InputClaimTransaction) => Promise<T>): Promise<T> {
+      return work({
+        getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }),
+        claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }),
+        persistCheckpoint: async () => undefined,
+      })
+    },
+  }
+}
+
+async function selectedJobModelRequest(value: StepContextSnapshot) {
+  const scope: TenantScope = { userId: "user-1" }
+  const context = await new StepContextBuilder(emptyInputStore()).build({
+    scope, sessionId: "session-1", turnId: "turn-1", stepId: "step-1", snapshot: selectedJobSnapshot(value), now: new Date(0),
+  })
+  const model = { profile: { provider: "test", model: "test-model", nativeTools: false, structuredOutput: false, streaming: false, continuationCursor: false } } as unknown as ModelAdapter
+  return buildModelRequest({ context, model, tools: [], sessionId: "session-1", turnId: "turn-1", stepId: "step-1", userId: "user-1", taskId: "root-1", signal: new AbortController().signal })
+}
+
 describe("TaskGraph turn observation", () => {
   it("keeps selected-job root observations scoped to coordination and the current graph", () => {
     const original = {
@@ -50,6 +77,39 @@ describe("TaskGraph turn observation", () => {
     expect(selectedJobSnapshot(original).toolObservations.map(item => item.id)).toEqual(["wait-result:wait-1", "task-graph-current"])
     expect(isSelectedJobRootTool({ name: "agent.plan" })).toBe(true)
     expect(selectedJobToolAllowed("jobs.search")).toBe(false)
+  })
+
+  it("keeps durable session memory out of the selected-job captured model request", async () => {
+    const original = {
+      ...snapshot(),
+      toolObservations: [
+        { id: "snapshot-working-state:session-1:7", content: {
+          kind: "durable_context_snapshot", status: "available", authority: "informational_only",
+          provenance: { ownerId: "user-1", sessionId: "session-1", throughSequence: "7" },
+          answers: [{ id: "answer-secret", answer: "work authorization answer" }], artifacts: [{ id: "resume-secret", hash: "private resume hash" }],
+        } },
+        { id: "snapshot-working-state:session-2:9", content: {
+          kind: "durable_context_snapshot", status: "available", authority: "informational_only",
+          provenance: { ownerId: "user-2", sessionId: "session-2", throughSequence: "9" },
+          goal: "foreign job context",
+        } },
+        { id: "snapshot-working-state:session-1:invalid", content: { kind: "durable_context_snapshot", status: "unavailable" } },
+        { id: "wait-result:wait-1", content: { toolName: "agent.wait", output: { status: "ready" } } },
+        { id: "task-graph-current", content: { kind: "task_graph_current", revision: 1, nodes: [] } },
+      ],
+    }
+
+    const filtered = selectedJobSnapshot(original)
+    expect(filtered.toolObservations.map(item => item.id)).toEqual(["wait-result:wait-1", "task-graph-current"])
+    const request = await selectedJobModelRequest(original)
+    const text = request.messages.flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+
+    expect(text).toContain("task_graph_current")
+    expect(text).not.toContain("context_snapshot_working_state")
+    expect(text).not.toContain("answer-secret")
+    expect(text).not.toContain("private resume hash")
+    expect(text).not.toContain("foreign job context")
   })
 
   it("refreshes the old graph observation while preserving other observations and live outcomes", () => {

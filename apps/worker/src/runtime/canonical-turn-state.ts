@@ -3,6 +3,7 @@ import type { TenantScope, RepositoryJsonValue } from "@jobcopilot/agent-protoco
 
 import { parseSnapshotContent } from "./context/context-snapshot-canonical.js"
 import type { StepContextSnapshot } from "./context/step-context-builder.js"
+import { stepContextSnapshotFromContent } from "./context/context-snapshot-working-state.js"
 import type { TurnLease } from "./turns/lease.js"
 import type { TurnResumeState } from "./turns/turn-engine-types.js"
 import type { PersistedToolCallRecovery } from "./turns/turn-engine-types.js"
@@ -51,14 +52,7 @@ function json(value: unknown): RepositoryJsonValue {
 function snapshotFromContent(value: unknown, scope: TenantScope, sessionId: string): StepContextSnapshot {
   const content = parseSnapshotContent(value)
   if (content.ownerId !== scope.userId || content.sessionId !== sessionId) throw new Error("context_snapshot_scope_mismatch")
-  return {
-    system: content.context.system,
-    profile: content.context.profile,
-    goal: content.context.goal,
-    steerHistory: content.context.steerHistory,
-    businessRefs: content.references.map(({ source: _source, verified: _verified, ...reference }) => reference),
-    toolObservations: content.context.toolObservations,
-  }
+  return stepContextSnapshotFromContent(content)
 }
 
 function eventPayload(value: unknown): Row { const payload = object(value); return object(payload.payload ?? payload) }
