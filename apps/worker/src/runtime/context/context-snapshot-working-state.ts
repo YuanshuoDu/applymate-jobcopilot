@@ -6,6 +6,7 @@ import { canonicalJson as snapshotCanonicalJson } from "./context-snapshot-json.
 import { ContextSnapshotError, type ContextSnapshotCompaction, type ContextSnapshotContent } from "./context-snapshot-types.js"
 
 const MAX_MODEL_MEMORY_CHARACTERS = 16_000
+const UNAVAILABLE_MODEL_GOAL = "Durable context snapshot unavailable (projection limit exceeded)."
 
 type RecordValue = Record<string, unknown>
 
@@ -194,13 +195,24 @@ function workingState(content: ContextSnapshotContent): ContextSeedBlock | undef
   }
 }
 
+function projectionUnavailable(memory: ContextSeedBlock | undefined): boolean {
+  if (!memory?.content || typeof memory.content !== "object" || Array.isArray(memory.content)) return false
+  const value = memory.content as RecordValue
+  return value.kind === "durable_context_snapshot"
+    && value.status === "unavailable"
+    && value.reason === "projection_limit_exceeded"
+}
+
 export function stepContextSnapshotFromContent(content: ContextSnapshotContent): StepContextSnapshot {
   const memory = workingState(content)
   return {
     system: content.context.system,
     profile: content.context.profile,
     goal: content.compaction
-      ? { id: content.context.goal?.id ?? "snapshot-goal", content: content.compaction.state.goal }
+      ? {
+        id: content.context.goal?.id ?? "snapshot-goal",
+        content: projectionUnavailable(memory) ? UNAVAILABLE_MODEL_GOAL : content.compaction.state.goal,
+      }
       : content.context.goal ?? { id: "snapshot-goal", content: content.goal },
     steerHistory: content.context.steerHistory,
     businessRefs: content.references.map(({ source: _source, verified: _verified, ...reference }) => reference),

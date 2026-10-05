@@ -159,9 +159,11 @@ describe("durable context snapshot working state", () => {
       id: `answer-${index.toString().padStart(2, "0")}`, question: "Question", answer: "x".repeat(1000), answerHash: `hash-${index}`,
     }))
     const compacted = content({ compaction: extension(state({ answers })) })
-    const projected = stepContextSnapshotFromContent(compacted).toolObservations.find(item => item.id.startsWith("snapshot-working-state:"))?.content as Record<string, unknown>
+    const snapshot = stepContextSnapshotFromContent(compacted)
+    const projected = snapshot.toolObservations.find(item => item.id.startsWith("snapshot-working-state:"))?.content as Record<string, unknown>
     expect(projected).toMatchObject({ status: "unavailable", reason: "projection_limit_exceeded", authority: "informational_only" })
     expect(projected).not.toHaveProperty("answers")
+    expect(snapshot.goal?.content).toBe("Durable context snapshot unavailable (projection limit exceeded).")
   })
 
   it("keeps large valid persisted state loadable and marks only its model projection unavailable", () => {
@@ -173,5 +175,16 @@ describe("durable context snapshot working state", () => {
     const projected = stepContextSnapshotFromContent(compacted).toolObservations.find(item => item.id.startsWith("snapshot-working-state:"))?.content as Record<string, unknown>
     expect(projected).toMatchObject({ status: "unavailable", reason: "projection_limit_exceeded", authority: "informational_only" })
     expect(projected).not.toHaveProperty("answers")
+  })
+
+  it("preserves the ordinary legacy goal when a legacy memory projection is over budget", () => {
+    const legacy = content({
+      compaction: undefined,
+      failedAttempts: [{ taskId: "task-failed", reason: "x".repeat(17_000), doNotRepeat: ["retrying the rejected path"], sequence: "3" }],
+    })
+    const snapshot = stepContextSnapshotFromContent(legacy)
+    expect(snapshot.goal).toEqual({ id: "snapshot-goal", content: "Legacy goal" })
+    expect(snapshot.toolObservations.find(item => item.id.startsWith("snapshot-working-state:"))?.content)
+      .toMatchObject({ status: "unavailable", reason: "projection_limit_exceeded" })
   })
 })
