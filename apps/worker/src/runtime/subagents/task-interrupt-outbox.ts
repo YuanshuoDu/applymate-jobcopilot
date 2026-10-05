@@ -21,17 +21,13 @@ function record(value: unknown): Record<string, unknown> | null {
   const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
   return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null
 }
-
 export function parseTaskInterruptIntent(value: unknown): TaskInterruptIntent | null {
   const row = record(value)
   if (!row || Object.keys(row).sort().join(",") !== "intentId,sessionId,taskId,turnId"
     || [row.sessionId, row.turnId, row.taskId, row.intentId].some(value => typeof value !== "string" || !value.trim() || value.length > 128)) return null
   return { sessionId: row.sessionId as string, turnId: row.turnId as string, taskId: row.taskId as string, intentId: row.intentId as string }
 }
-
-function key(intent: TaskInterruptIntent, taskId: string, outcome: "interrupted" | "failed"): string {
-  return `agent-task-interrupt:${intent.intentId}:${taskId}:${outcome}`
-}
+function key(intent: TaskInterruptIntent, taskId: string, outcome: "interrupted" | "failed"): string { return `agent-task-interrupt:${intent.intentId}:${taskId}:${outcome}` }
 async function appendOutcome(client: Queryable, userId: string, intent: TaskInterruptIntent, taskId: string, outcome: "interrupted" | "failed"): Promise<void> {
   const type = outcome === "failed" ? "task.interrupt.failed" : "task.interrupted"
   const idempotencyKey = key(intent, taskId, outcome)
@@ -63,7 +59,8 @@ async function rejectIntent(client: Queryable, intent: TaskInterruptIntent, user
     [intent.turnId, intent.sessionId, userId])
   if (turn.rows[0]) await appendOutcome(client, userId, intent, intent.taskId, "failed")
 }
-
+const publishIntent = (client: Queryable, id: string) =>
+  client.query(`UPDATE "agent_outbox" SET "publishedAt" = CURRENT_TIMESTAMP, "attemptCount" = "attemptCount" + 1, "lastError" = NULL WHERE "id" = $1 AND "topic" = $2 AND "publishedAt" IS NULL`, [id, TASK_INTERRUPT_OUTBOX_TOPIC])
 function validLineage(chain: readonly TaskRow[], taskId: string, rootTaskId: string): boolean {
   const rows = [...chain].sort((left, right) => left.depth - right.depth)
   let path = ""
@@ -113,7 +110,6 @@ async function selectSubtree(client: Queryable, intent: TaskInterruptIntent, tar
   [intent.taskId, intent.sessionId, intent.turnId, target.rootTaskId])
   return selected.rows as TaskRow[]
 }
-
 async function deleteDispatch(client: Queryable, sessionId: string, taskId: string): Promise<void> {
   await client.query(`DELETE FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch' AND "aggregateId" = $1
     AND "idempotencyKey" = $2 AND "publishedAt" IS NULL`, [sessionId, `subagent-dispatch:${taskId}`])
@@ -163,15 +159,19 @@ async function processRow(pool: PgSubagentPool, id: string, manager: AgentTreeMa
       if (!intent || row.aggregateId !== intent.sessionId) throw new Error("task_interrupt_outbox_scope_invalid")
       const session = await client.query(`SELECT "id", "userId", "status" FROM "agent_sessions" WHERE "id" = $1 FOR UPDATE`, [intent.sessionId])
       const owner = session.rows[0] as Record<string, unknown> | undefined
-      if (!owner || typeof owner.userId !== "string" || owner.status === "aborted" || owner.status === "archived") throw new Error("task_interrupt_session_unavailable")
+      if (!owner || typeof owner.userId !== "string") throw new Error("task_interrupt_session_unavailable")
+      if (owner.status === "aborted" || owner.status === "archived") {
+        await rejectIntent(client, intent, owner.userId)
+        await publishIntent(client, id)
+        return { processed: true as const, signal: null }
+      }
       await client.query(`SELECT set_config('app.user_id', $1, true)`, [owner.userId])
       const accepted = await client.query(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
         AND "taskId" = $3 AND "type" = 'task.interrupt.accepted' AND "actor" = 'user'
         AND "payload"->>'intentId' = $4 FOR UPDATE`, [intent.sessionId, intent.turnId, intent.taskId, intent.intentId])
       const applied = accepted.rows[0] ? await applyIntent(client, intent, owner.userId)
         : (await rejectIntent(client, intent, owner.userId), null)
-      await client.query(`UPDATE "agent_outbox" SET "publishedAt" = CURRENT_TIMESTAMP, "attemptCount" = "attemptCount" + 1, "lastError" = NULL
-        WHERE "id" = $1 AND "topic" = $2 AND "publishedAt" IS NULL`, [id, TASK_INTERRUPT_OUTBOX_TOPIC])
+      await publishIntent(client, id)
       return { processed: true as const, signal: applied?.taskIds.length ? { sessionId: intent.sessionId, ...applied } : null }
     })
     if (outcome.signal?.rootTaskId) manager.signalTaskSubtree(outcome.signal.sessionId, outcome.signal.rootTaskId, outcome.signal.taskIds)

@@ -158,6 +158,22 @@ describeWithPostgres("durable child task interruption on disposable PostgreSQL",
     expect(graph.rows[0]?.revision).toBe(2)
     expect(receipt.rows[0]?.payload).toMatchObject({ kind: "lifecycle", event: { type: "task.interrupted", nodeKey: "selected" } })
 
+    const closedClientMessageId = "integration-interrupt-closed-session"
+    const closedAccepted = await service.interrupt({ ...command, taskId: ids.sibling, clientMessageId: closedClientMessageId })
+    expect(closedAccepted.disposition).toBe("accepted")
+    await pool.query(`UPDATE "agent_sessions" SET "status" = 'aborted' WHERE "id" = $1`, [ids.session])
+    const tasksBeforeClosedDrain = await pool.query(`SELECT "id", "status", "interruptRequestedAt" FROM "sub_agent_tasks" WHERE "sessionId" = $1 ORDER BY "id"`, [ids.session])
+    await expect(drainTaskInterruptOutbox(pool as unknown as PgSubagentPool, manager)).resolves.toBe(1)
+    const closedIntentKey = `agent-task-interrupt:${ids.session}:${closedClientMessageId}`
+    const closedIntent = await pool.query(`SELECT "publishedAt" FROM "agent_outbox" WHERE "idempotencyKey" = $1`, [closedIntentKey])
+    const failedOutcome = await pool.query(`SELECT "type", "payload" FROM "agent_events" WHERE "sessionId" = $1 AND "taskId" = $2 AND "idempotencyKey" = $3`,
+      [ids.session, ids.sibling, `agent-task-interrupt:${closedAccepted.intentId}:${ids.sibling}:failed`])
+    const tasksAfterClosedDrain = await pool.query(`SELECT "id", "status", "interruptRequestedAt" FROM "sub_agent_tasks" WHERE "sessionId" = $1 ORDER BY "id"`, [ids.session])
+    expect(closedIntent.rows[0]?.publishedAt).toBeTruthy()
+    expect(failedOutcome.rows).toEqual([{ type: "task.interrupt.failed", payload: { intentId: closedAccepted.intentId, taskId: ids.sibling, status: "failed", code: "target_unavailable" } }])
+    expect(tasksAfterClosedDrain.rows).toEqual(tasksBeforeClosedDrain.rows)
+    expect(manager.signalTaskSubtree).toHaveBeenCalledTimes(1)
+
     await pool.query(`UPDATE "sub_agent_tasks" SET "status" = 'interrupted', "leaseOwner" = NULL,
       "leaseExpiresAt" = NULL, "completedAt" = CURRENT_TIMESTAMP WHERE "id" = $1`, [ids.descendant])
     for (let index = 0; index < 25; index++) {
