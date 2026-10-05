@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { projectSupervisorTree, type SupervisorTaskSummary, type SupervisorTurnSummary } from './task-tree-projection'
+import { projectSupervisorTree, taskInterruptStatus, taskIsInterruptible, type SupervisorTaskSummary, type SupervisorTurnSummary } from './task-tree-projection'
 import type { TimelineItem } from './timeline-reducer'
 import type { TaskTreeNode } from './types'
 
@@ -20,6 +20,26 @@ const task = (id: string, overrides: Partial<SupervisorTaskSummary> = {}): Super
 })
 
 describe('projectSupervisorTree', () => {
+  it('enables interruption only for active non-root children and projects durable outcomes', () => {
+    const selected = task('child-1', { rootTaskId: 'root-1', parentTaskId: 'root-1', status: 'running' })
+    const activeTurn = turn({ status: 'in_progress' })
+    const accepted = item({ id: 'interrupt-accepted', taskId: selected.id, type: 'unknown', content: {
+      eventType: 'task.interrupt.accepted', payload: { taskId: selected.id, intentId: 'intent-1' },
+    }, sequence: '11', createdAt: '2026-09-07T10:02:00.000Z' })
+    expect(taskIsInterruptible(selected, activeTurn, null)).toBe(true)
+    expect(taskInterruptStatus(selected, [accepted])).toBe('accepted')
+    expect(taskIsInterruptible(selected, activeTurn, 'accepted')).toBe(false)
+    expect(taskInterruptStatus(task(selected.id, { ...selected, status: 'interrupted' }), [])).toBe('interrupted')
+
+    const failed = item({ id: 'interrupt-failed', taskId: selected.id, type: 'unknown', content: {
+      eventType: 'task.interrupt.failed', payload: { taskId: selected.id, code: 'target_unavailable' },
+    }, sequence: '12', createdAt: '2026-09-07T10:01:00.000Z' })
+    expect(taskInterruptStatus(selected, [failed])).toBe('failed')
+    expect(taskInterruptStatus(selected, [accepted, failed])).toBe('failed')
+    expect(taskIsInterruptible(task('root-1', { rootTaskId: 'root-1', status: 'running' }), activeTurn, null)).toBe(false)
+    expect(taskIsInterruptible(selected, turn({ status: 'completed' }), null)).toBe(false)
+  })
+
   it('uses the authoritative active step status and localizes fallback labels', () => {
     const nodes = projectSupervisorTree({
       turns: [turn({ status: 'waiting_for_user', activeStepId: 'step-1', goal: '' })],

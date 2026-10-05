@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server"
 import { describe, expect, it, vi } from "vitest"
 
 import { translate } from "@/lib/i18n"
-import { TaskTreePanel, flattenTaskTree } from "./TaskTreePanel"
+import { TaskInterruptControl, TaskTreePanel, flattenTaskTree } from "./TaskTreePanel"
 import type { TaskTreeNode } from "./types"
 
 const nodes: TaskTreeNode[] = [{ id: "turn-1", kind: "turn", label: "Find Berlin roles", status: "running", itemId: "item-turn", children: [{ id: "step-1", kind: "step", label: "Scout jobs", status: "completed", itemId: "item-step", children: [{ id: "tool-1", kind: "tool", label: "jobs.search", status: "completed", itemId: "item-tool" }] }] }]
@@ -29,5 +29,29 @@ describe("TaskTreePanel", () => {
     const html = renderToStaticMarkup(<TaskTreePanel nodes={nodes} selectedId="turn-1" onSelect={onSelect} />)
     expect(html).toContain('aria-current="true"')
     expect(onSelect).not.toHaveBeenCalled()
+  })
+
+  it("renders an accessible subtree confirmation and a nonterminal accepted status", () => {
+    const control = (status: "accepted" | "interrupted" | "failed" | null, eligible = true) => <TaskInterruptControl
+      sessionId="session-1" taskId="child-1" taskLabel="Research roles" eligible={eligible} status={status} onAccepted={vi.fn()}
+    />
+    const ready = renderToStaticMarkup(control(null))
+    expect(ready).toContain("Interrupt task and descendants")
+    expect(ready).toContain('role="alertdialog"')
+    expect(ready).toContain('aria-describedby="task-interrupt-scope"')
+    expect(ready).toContain("Research roles and all descendants?")
+    expect(ready).toContain("parent and sibling tasks will continue")
+
+    const accepted = renderToStaticMarkup(control("accepted", false))
+    expect(accepted).toContain('role="status"')
+    expect(accepted).toContain("Interrupt request accepted")
+    expect(accepted).not.toContain("Task interrupted.")
+    expect(accepted).not.toContain("Interrupt task and descendants")
+    const failed = renderToStaticMarkup(control("failed"))
+    expect(failed).toContain('role="alert"')
+    expect(failed).toContain("Interrupt task and descendants")
+    const interrupted = renderToStaticMarkup(control("interrupted", false))
+    expect(interrupted).toContain("Task interrupted.")
+    expect(interrupted).not.toContain("Interrupt task and descendants")
   })
 })
