@@ -9,6 +9,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest"
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const RESULT_MARKER = "durable-child-result-after-process-restart"
 const FINAL_MARKER = "parent-resumed-from-durable-child-result"
+const DUPLICATE_REDELIVERY_JOB_ID = "00000000-0000-4000-8000-000000000547"
 
 function dedicatedDatabaseUrl(): string | null {
   const value = process.env.AGENT_RUNTIME_PG_TEST_URL
@@ -1066,13 +1067,14 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     ids.suffix = suffix
     ids.sessionId = `duplicate-redelivery-session-${suffix}`
     const readCallId = `duplicate-read:${suffix}`
-    const readJobId = `duplicate-job:${suffix}`
+    const readJobId = DUPLICATE_REDELIVERY_JOB_ID
+    const readJobDescription = `recruiter-${suffix}@example.com +353 87 123 4567`
     fixtureSessionIds.add(ids.sessionId)
     fixtureJobIds.add(readJobId)
     await pool!.query(
       `INSERT INTO "Job" ("id", "userId", "company", "role", "description", "updatedAt")
        VALUES ($1, $2, $3, 'Fixture Engineer', $4, CURRENT_TIMESTAMP)`,
-      [readJobId, ids.userId, `Fixture Employer ${suffix}`, `Persisted read evidence ${suffix}`],
+      [readJobId, ids.userId, `Fixture Employer ${suffix}`, readJobDescription],
     )
     await pool!.query(
       `INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
@@ -1143,7 +1145,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
             id: readJobId,
             company: `Fixture Employer ${suffix}`,
             role: "Fixture Engineer",
-            description: `Persisted read evidence ${suffix}`,
+            description: "[REDACTED_EMAIL] [REDACTED_PHONE]",
           })],
           page: 1,
           hasMore: false,
