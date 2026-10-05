@@ -620,16 +620,22 @@ describe("owner-agnostic turn execution loop", () => {
   it("replans in the same root loop after a TaskGraph evidence denial", async () => {
     let checks = 0
     const gate = vi.fn(async () => ++checks === 1
-      ? ({ ok: false as const, blocker: "task_graph_verification_unverified", feedback: "scout:candidate-present" })
+      ? ({ ok: false as const, blocker: "task_graph_verification_unverified", feedback: "node=scout criterion=candidate-present status=unverified reasonCode=canonical_evidence_missing repair=missing" })
       : ({ ok: true as const }))
     const root = fixture(identity("turn", "root-1"), undefined, [], gate)
     const snapshots: TurnExecutionOptions["snapshot"][] = []
     const build = root.options.contextBuilder.build
-    root.options.contextBuilder.build = async request => { snapshots.push(request.snapshot); return build(request) }
+    root.options.contextBuilder.build = async request => {
+      snapshots.push(request.snapshot)
+      const context = await build(request)
+      const systemBlocks = request.snapshot.system.map(seed => ({ id: `system:${seed.id}`, layer: "system" as const, role: "instruction" as const, trust: "system" as const, source: "harness", content: seed.content as StepContext["blocks"][number]["content"] }))
+      return { ...context, blocks: [...systemBlocks, ...context.blocks] }
+    }
     const result = await runTurnExecutionLoop(root.options)
     expect(result).toMatchObject({ status: "completed", stepCount: 3 })
     expect(root.requests).toHaveLength(3)
-    expect(snapshots[2]?.system.at(-1)?.content).toContain("scout:candidate-present")
+    expect(snapshots[2]?.system.at(-1)?.content).toContain("node=scout criterion=candidate-present status=unverified reasonCode=canonical_evidence_missing repair=missing")
+    expect(root.requests[2]?.messages.some(message => message.role === "system" && JSON.stringify(message.content).includes("node=scout criterion=candidate-present status=unverified reasonCode=canonical_evidence_missing repair=missing"))).toBe(true)
     expect(root.events.some(event => event.type === "final.rejected")).toBe(true)
     expect(root.events.some(event => event.type === "turn.completed")).toBe(true)
     expect(root.stepStatuses).toEqual(["completed", "completed", "completed"])
