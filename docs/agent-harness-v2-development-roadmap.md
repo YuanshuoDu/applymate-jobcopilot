@@ -1220,6 +1220,13 @@ draft
 | AH2-053 | safe DB cleanup inventory | 052 | [#485](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/485) | [#489](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/489) | implementation done; production DROP gates pending |
 | AH2-054 | GA checklist evidence reconciliation | 048–053 | [#490](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/490) | this PR | in review |
 
+### Post-AH2 follow-up mapping
+
+| Follow-up issue | PR |
+|---|---|
+| [#560](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/560) — durable context hydration | [#563](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/563) |
+| [#561](https://github.com/YuanshuoDu/applymate-jobcopilot/issues/561) — selected-job memory projection | [#562](https://github.com/YuanshuoDu/applymate-jobcopilot/pull/562) |
+
 ---
 
 ## 16. Definition of Ready

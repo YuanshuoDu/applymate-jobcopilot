@@ -199,7 +199,9 @@ export function stepContextSnapshotFromContent(content: ContextSnapshotContent):
   return {
     system: content.context.system,
     profile: content.context.profile,
-    goal: content.context.goal ?? { id: "snapshot-goal", content: content.goal },
+    goal: content.compaction
+      ? { id: content.context.goal?.id ?? "snapshot-goal", content: content.compaction.state.goal }
+      : content.context.goal ?? { id: "snapshot-goal", content: content.goal },
     steerHistory: content.context.steerHistory,
     businessRefs: content.references.map(({ source: _source, verified: _verified, ...reference }) => reference),
     toolObservations: [...content.context.toolObservations, ...(memory ? [memory] : [])],

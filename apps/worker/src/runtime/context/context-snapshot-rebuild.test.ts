@@ -83,6 +83,7 @@ describe("context snapshot Step rebuild", () => {
     const requestText = request.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
     expect(requestText).toContain("context_snapshot_working_state")
     expect(requestText).toContain("Current compacted goal")
+    expect(requestText).not.toContain("Rebuild this step")
     expect(requestText).toContain("UNTRUSTED_DATA")
     expect(requestText).toContain('"evidenceBodiesIncluded":false')
   })
