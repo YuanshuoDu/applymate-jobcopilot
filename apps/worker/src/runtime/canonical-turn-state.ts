@@ -49,9 +49,10 @@ function json(value: unknown): RepositoryJsonValue {
   return null
 }
 
-function snapshotFromContent(value: unknown, scope: TenantScope, sessionId: string): StepContextSnapshot {
+function snapshotFromContent(value: unknown, throughSequence: unknown, scope: TenantScope, sessionId: string): StepContextSnapshot {
   const content = parseSnapshotContent(value)
   if (content.ownerId !== scope.userId || content.sessionId !== sessionId) throw new Error("context_snapshot_scope_mismatch")
+  if (content.throughSequence !== String(throughSequence)) throw new Error("context_snapshot_sequence_mismatch")
   return stepContextSnapshotFromContent(content)
 }
 
@@ -168,16 +169,16 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
         JOIN "agent_sessions" AS session ON session."id" = snapshot."sessionId"
         WHERE snapshot."id" = $1 AND snapshot."sessionId" = $2 AND session."userId" = $3`, [turn.contextSnapshotId, lease.sessionId, lease.userId])
       if (!contextResult.rows[0]) throw new Error("context_snapshot_missing")
-      snapshot = snapshotFromContent(contextResult.rows[0].content, scope, lease.sessionId)
-      snapshotThroughSequence = BigInt(String(contextResult.rows[0].throughSequence ?? object(contextResult.rows[0].content).throughSequence ?? 0))
+      snapshot = snapshotFromContent(contextResult.rows[0].content, contextResult.rows[0].throughSequence, scope, lease.sessionId)
+      snapshotThroughSequence = BigInt(String(contextResult.rows[0].throughSequence))
     } else {
       const contextResult = await client.query<Row>(`SELECT snapshot."content", snapshot."throughSequence" FROM "agent_context_snapshots" AS snapshot
         JOIN "agent_sessions" AS session ON session."id" = snapshot."sessionId"
         WHERE snapshot."sessionId" = $1 AND session."userId" = $2
         ORDER BY snapshot."throughSequence" DESC, snapshot."version" DESC LIMIT 1`, [lease.sessionId, lease.userId])
       if (contextResult.rows[0]) {
-        snapshot = snapshotFromContent(contextResult.rows[0].content, scope, lease.sessionId)
-        snapshotThroughSequence = BigInt(String(contextResult.rows[0].throughSequence ?? object(contextResult.rows[0].content).throughSequence ?? 0))
+        snapshot = snapshotFromContent(contextResult.rows[0].content, contextResult.rows[0].throughSequence, scope, lease.sessionId)
+        snapshotThroughSequence = BigInt(String(contextResult.rows[0].throughSequence))
       }
     }
     const goal = turnGoal(turn.input)

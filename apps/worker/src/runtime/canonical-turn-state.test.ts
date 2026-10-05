@@ -126,6 +126,22 @@ describe("loadCanonicalTurnState", () => {
     expect(requestText).toContain("UNTRUSTED_DATA")
   })
 
+  it("fails closed when a loaded snapshot cursor disagrees with its database cursor", async () => {
+    const content = {
+      schemaVersion: "agent-harness.context.v1", ownerId: "user-1", sessionId: "session-1", throughSequence: "7", goal: "Continue",
+      userConstraints: [], confirmedDecisions: [], completedWork: [], openWork: [], pendingApprovals: [], artifacts: [], facts: [], failedAttempts: [],
+      references: [], consumedInputIds: [], context: { system: [], profile: [], steerHistory: [], toolObservations: [] },
+      tokenAccounting: { profiles: [], totalInputTokens: 0, totalOutputTokens: 0, totalCostUsd: 0 },
+    }
+    for (const pinned of [true, false]) {
+      const fake = pool({
+        turn: { input: { goal: "Continue" }, rootTaskId: null, contextSnapshotId: pinned ? "snapshot-1" : null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+        snapshots: [{ id: "snapshot-1", throughSequence: "6", version: 1, content }],
+      })
+      await expect(loadCanonicalTurnState(fake, lease)).rejects.toThrow("context_snapshot_sequence_mismatch")
+    }
+  })
+
   it("restores only the exact server-owned interactive-discovery intent", async () => {
     const exact = pool({ turn: { input: { goal: "Find jobs", intent: { kind: "interactive_discovery_shortlist", version: 1 } }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} } })
     await expect(loadCanonicalTurnState(exact, lease)).resolves.toMatchObject({
