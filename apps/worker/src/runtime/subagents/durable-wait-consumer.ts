@@ -33,9 +33,9 @@ function object(value: unknown): Row {
   const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return {} } })() : value
   return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Row : {}
 }
-function ids(value: unknown): string[] {
-  const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return [] } })() : value
-  return Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === "string" && entry.length > 0) : []
+function ids(value: unknown): string[] | null {
+  const candidate = parsed(value)
+  return Array.isArray(candidate) && candidate.every((entry): entry is string => typeof entry === "string" && entry.length > 0) ? candidate : null
 }
 function date(value: unknown): Date | null { if (value === null || value === undefined) return null; const parsed = value instanceof Date ? value : new Date(String(value)); return Number.isFinite(parsed.getTime()) ? parsed : null }
 function fence(input: DurableWaitConsumerInput): void {
@@ -90,7 +90,7 @@ function taskStatus(value: unknown): string | null { const result = safeText(val
 function taskRole(value: unknown): string | null { return typeof value === "string" && value.trim().length > 0 && value.length <= MAX_ID_LENGTH ? value : null }
 function boundedIds(value: unknown, allowEmpty = false): string[] | null {
   const values = ids(value)
-  if ((!allowEmpty && values.length === 0) || values.length > MAX_TARGETS || new Set(values).size !== values.length
+  if (!values || (!allowEmpty && values.length === 0) || values.length > MAX_TARGETS || new Set(values).size !== values.length
     || values.some(id => id.trim() !== id || id.length > MAX_ID_LENGTH)) return null
   return [...values].sort()
 }
@@ -232,13 +232,13 @@ export async function consumeDurableWaitOutcomes(input: DurableWaitConsumerInput
     if (!parent || String(parent.id) !== input.turn.rootTaskId || String(parent.rootTaskId ?? parent.id) !== input.turn.rootTaskId) continue
     const step = (await input.client.query<Row>(`SELECT "id", "taskId", "attempt", "status" FROM "agent_steps" WHERE "id" = $1 AND "turnId" = $2 AND "sessionId" = $3 AND ("taskId" = $4 OR "taskId" IS NULL) FOR SHARE`, [wait.stepId, input.lease.turnId, input.lease.sessionId, input.turn.rootTaskId])).rows[0]
     if (!step || String(step.status) !== "waiting_for_tool" || Number(step.attempt) !== 1) continue
+    const targetIds = boundedIds(wait.targetTaskIds)
+    if (!targetIds || !boundedIds(wait.matchedTaskIds, true)?.every(id => targetIds.includes(id))) throw new Error("wait_consume_outcome_invalid")
+    const targets = await input.client.query<Row>(`SELECT task."id", task."rootTaskId", task."turnId", task."sessionId", task."role", task."status", task."result", task."failureReason", session."userId" AS "userId" FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId" WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3 AND session."userId" = $4 AND task."rootTaskId" = $5 AND session."status" NOT IN ('aborted', 'archived')`, [targetIds, input.lease.sessionId, input.lease.turnId, input.lease.userId, input.turn.rootTaskId])
+    if (targets.rows.length !== targetIds.length || targets.rows.some(target => !targetIds.includes(String(target.id)) || String(target.rootTaskId ?? target.id) !== input.turn.rootTaskId || String(target.id) === input.turn.rootTaskId)) { if (wait.consumedAt) throw new Error("wait_consume_outcome_invalid"); continue }
     const snapshot = await graphSnapshot(input, String(parent.id)), prior = wait.consumedAt ? storedOutcome(wait, snapshot, input.turn.rootTaskId) : null
     if (wait.consumedAt && !prior) throw new Error("wait_consume_outcome_invalid")
     if (prior) { projections.push(projection(wait, prior)); continue }
-    const targetIds = ids(wait.targetTaskIds)
-    if (targetIds.length === 0 || targetIds.length > MAX_TARGETS) continue
-    const targets = await input.client.query<Row>(`SELECT task."id", task."rootTaskId", task."turnId", task."sessionId", task."role", task."status", task."result", task."failureReason", session."userId" AS "userId" FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId" WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3 AND session."userId" = $4 AND session."status" NOT IN ('aborted', 'archived')`, [targetIds, input.lease.sessionId, input.lease.turnId, input.lease.userId])
-    if (targets.rows.length !== targetIds.length || targets.rows.some(target => String(target.rootTaskId ?? target.id) !== input.turn.rootTaskId || String(target.id) === input.turn.rootTaskId)) continue
     const value = generatedOutcome(wait, targets.rows, snapshot, input.turn.rootTaskId)
     if (!value) continue
     const persisted = encoded(value.value); if (!persisted || persisted.bytes > MAX_OUTCOME_BYTES) continue

@@ -21,6 +21,7 @@ import type { ProductionWorkerBootstrap, createProductionWorkerBootstrap } from 
 import { createAgentArtifactRepository, findCurrentDraftHeadWithClient, findReviewReceiptWithClient, type AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
 import { createArtifactToolStore } from "../tools/artifact-tools.js"
 import { createPgDurableWaitPort } from "./durable-wait-store.js"
+import { consumeDurableWaitOutcomes } from "./durable-wait-consumer.js"
 import { childContextSnapshot, createChildContextBuilder } from "./child-context.js"
 import { hashArtifactContent } from "./artifact-adapters.js"
 import { loadSelectedJobArtifactContext, readSelectedJobSourceDigestWithClient, resolveCoverLetterBase } from "./selected-job-artifact-context.js"
@@ -5874,6 +5875,70 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     vi.doUnmock("../../redis.js")
     if (cleanupFailures.length > 0) throw new Error("TaskGraph integration cleanup failed:\n" + cleanupFailures.join("\n"))
   })
+
+  it("rejects a consumed wait archive whose target belongs to another session", async () => {
+    const value = fixture(), foreign = fixture(), tasks = new PgSubagentTaskStore(pool!, 300_000)
+    const createRoot = async (owner: Fixture, goal: string) => {
+      const root = await tasks.create({ userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
+        role: "supervisor", taskType: "task_graph", goal, allowedActions: [], expectedOutputSchema: {},
+        toolPolicySnapshot: {}, budgetSnapshot: {}, policy: defaultSubagentPolicy() })
+      const linked = await pool!.query(`UPDATE "agent_turns" SET "rootTaskId" = $2
+        WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4 AND "status" = 'waiting_for_user'`,
+      [owner.turnId, root.id, owner.sessionId, owner.userId])
+      if (linked.rowCount !== 1) throw new Error("Wait replay fixture root could not be linked")
+      return root
+    }
+    try {
+      await seed(pool!, value, "waiting_for_user")
+      await seed(pool!, foreign, "waiting_for_user")
+      const root = await createRoot(value, "Wait archive owner root")
+      const foreignRoot = await createRoot(foreign, "Foreign wait archive root")
+      const target = await tasks.create({ userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+        parentTaskId: root.id, role: "scout", taskType: "research", goal: "Wait archive target",
+        allowedActions: [], policy: defaultSubagentPolicy() })
+      const foreignTarget = await tasks.create({ userId: foreign.userId, sessionId: foreign.sessionId, turnId: foreign.turnId,
+        parentTaskId: foreignRoot.id, role: "scout", taskType: "research", goal: "Foreign wait archive target",
+        allowedActions: [], policy: defaultSubagentPolicy() })
+      await activateFixtureTurn(pool!, value)
+      const lease = await claimTurnLease(pool!, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
+      const stepId = `p3-wait-archive-replay-step-${value.suffix}`
+      await pool!.query(`INSERT INTO "agent_steps"
+        ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
+        VALUES ($1, $2, $3, $4, 1, 1, 'waiting_for_tool', 0, '[]'::jsonb, '{}'::jsonb)`,
+      [stepId, value.sessionId, value.turnId, root.id])
+      const waitStore = createPgDurableWaitPort(pool!)
+      const wait = await waitStore.wait({ userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+        stepId, taskId: root.id, rootTaskId: root.id, targetTaskIds: [target.id], mode: "all", timeoutMs: 60_000,
+        idempotencyKey: `p3-wait-archive-replay:${value.suffix}` })
+      await pool!.query(`UPDATE "sub_agent_tasks" SET "status" = 'completed', "result" = '{"safe":true}'::jsonb,
+        "completedAt" = CURRENT_TIMESTAMP WHERE "id" = $1 AND "sessionId" = $2`, [target.id, value.sessionId])
+      expect((await waitStore.resolve({ userId: value.userId, sessionId: value.sessionId, waitId: wait.waitId }))?.status).toBe("ready")
+      await pool!.query(`UPDATE "agent_wait_conditions" SET "suspendedAt" = CURRENT_TIMESTAMP WHERE "id" = $1`, [wait.waitId])
+      const turn = (await pool!.query(`SELECT * FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`, [value.turnId, value.sessionId])).rows[0]
+      const client = await pool!.connect()
+      try {
+        await expect(consumeDurableWaitOutcomes({ client, lease, turn, now: new Date() })).resolves.toHaveLength(1)
+      } finally { client.release() }
+
+      const foreignIds = JSON.stringify([foreignTarget.id])
+      const foreignOutcome = JSON.stringify({ waitId: wait.waitId, status: "ready", targetTaskIds: [foreignTarget.id],
+        matchedTaskIds: [foreignTarget.id], tasks: [{ taskId: foreignTarget.id, status: "completed", role: "scout", result: null, failureReason: null }] })
+      await pool!.query(`UPDATE "agent_wait_conditions" SET "targetTaskIds" = $1::jsonb, "matchedTaskIds" = $1::jsonb,
+        "result" = jsonb_set(COALESCE("result", '{}'::jsonb), '{outcome}', $2::jsonb, true)
+        WHERE "id" = $3 AND "userId" = $4 AND "sessionId" = $5 AND "turnId" = $6`,
+      [foreignIds, foreignOutcome, wait.waitId, value.userId, value.sessionId, value.turnId])
+      const replayClient = await pool!.connect()
+      try {
+        await expect(consumeDurableWaitOutcomes({ client: replayClient, lease, turn, now: new Date() }))
+          .rejects.toThrow("wait_consume_outcome_invalid")
+      } finally { replayClient.release() }
+    } finally {
+      for (const current of [value, foreign]) {
+        await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [current.sessionId])
+        await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [current.userId])
+      }
+    }
+  }, 30_000)
 
   it.each([
     ["selected Job source edit", "job"],
