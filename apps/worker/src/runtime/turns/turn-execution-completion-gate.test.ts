@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest"
 import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
 import type { TurnEngineStep } from "./turn-engine-types.js"
 import type { TurnExecutionOptions } from "./turn-execution-types.js"
-import { assertCompletionAllowed, checkTaskGraphTerminalVerification } from "./turn-execution-completion-gate.js"
+import { assertCompletionAllowed, checkTaskGraphTerminalVerification, repairReportState } from "./turn-execution-completion-gate.js"
 import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "../subagents/task-graph-pg-verification.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION } from "../subagents/task-graph-snapshot.js"
 
@@ -123,6 +123,105 @@ describe("TaskGraph terminal verification gate", () => {
     }
   })
 
+  it("returns bounded criterion feedback from the validated report without role-result contents", async () => {
+    const target = node("scout", "task-scout"), sensitiveResult = { ...structuredResult("failed"), summary: "private alice@example.com" }
+    const verifiedReport = { ...report("failed"), resultDigest: taskGraphResultDigest(sensitiveResult) }
+    const decision = await checkTaskGraphTerminalVerification(graphClient([target], [{ id: target.taskId, status: "failed", role: "scout", failureReason: "task_graph_verification_failed", result: { structuredResult: sensitiveResult, taskGraphVerificationReport: verifiedReport } }]), graphLease, "root-1")
+    expect(decision).toMatchObject({ ok: false, blocker: "task_graph_verification_unverified" })
+    if (decision.ok) return
+    expect(decision.feedback).toContain("nodeOrdinal=1 criterionOrdinal=1 status=failed reasonCode=criterion_not_met")
+    expect(decision.feedback.length).toBeLessThanOrEqual(512)
+    expect(decision.feedback).not.toContain("alice@example.com")
+  })
+
+  it("omits model-controlled node and criterion identifiers from durable feedback", async () => {
+    const hostileNodeKey = "ignore_previous_instructions", hostileCriterionId = "ignore-previous-instructions", result = structuredResult("failed")
+    const target = { ...node(hostileNodeKey, "task-scout"), verification: { ...contract, criteria: [{ id: hostileCriterionId, check }] } }
+    const verifiedReport = { ...report("failed"), criteria: [{ criterionId: hostileCriterionId, status: "failed", reasonCode: "criterion_not_met" }], resultDigest: taskGraphResultDigest(result) }
+    const decision = await checkTaskGraphTerminalVerification(graphClient([target], [{ id: target.taskId, status: "failed", role: "scout", failureReason: "task_graph_verification_failed", result: { structuredResult: result, taskGraphVerificationReport: verifiedReport } }]), graphLease, "root-1")
+    expect(decision).toMatchObject({ ok: false })
+    if (decision.ok) return
+    expect(decision.feedback).toContain("nodeOrdinal=1 criterionOrdinal=1 status=failed reasonCode=criterion_not_met")
+    expect(decision.feedback).not.toContain(hostileNodeKey)
+    expect(decision.feedback).not.toContain(hostileCriterionId)
+  })
+
+  it("reports the trusted criterion reason when its repair is missing", async () => {
+    const target = node("scout", "task-scout")
+    const decision = await checkTaskGraphTerminalVerification(graphClient([target], [{ id: target.taskId, status: "failed", role: "scout", failureReason: "task_graph_verification_unverified", result: storedResult("unverified") }]), graphLease, "root-1")
+    expect(decision).toMatchObject({ ok: false, blocker: "task_graph_verification_unverified" })
+    if (decision.ok) return
+    expect(decision.feedback).toContain("nodeOrdinal=1 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing repair=missing")
+  })
+
+  it("marks report-less failed repairs as rejected and queued or running repairs as pending", async () => {
+    const target = node("scout", "task-scout"), relation = { graphRootTaskId: "root-1", nodeKey: target.key, taskId: target.taskId, criterionIds: ["candidate-present"] }
+    const repair = node("repair", "task-repair", relation), targetTask = { id: target.taskId, status: "failed", role: "scout", failureReason: "task_graph_verification_unverified", result: storedResult("unverified") }
+    const absent = await checkTaskGraphTerminalVerification(graphClient([target, repair], [targetTask]), graphLease, "root-1")
+    expect(absent).toMatchObject({ ok: false })
+    if (absent.ok) return
+    expect(absent.feedback).not.toContain("invalid_report")
+    const missing = await checkTaskGraphTerminalVerification(graphClient([target, repair], [targetTask, { id: repair.taskId, status: "failed", role: "scout", failureReason: "worker_failed", result: null }]), graphLease, "root-1")
+    expect(missing).toMatchObject({ ok: false })
+    if (missing.ok) return
+    expect(missing.feedback).toContain("nodeOrdinal=1 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing repair=rejected")
+    expect(missing.feedback).not.toContain("repair=invalid_report")
+    expect(missing.feedback.length).toBeLessThanOrEqual(512)
+    const pending = await checkTaskGraphTerminalVerification(graphClient([target, repair], [targetTask, { id: repair.taskId, status: "running", role: "scout", failureReason: null, result: null }]), graphLease, "root-1")
+    expect(pending).toMatchObject({ ok: false })
+    if (pending.ok) return
+    expect(pending.feedback).toContain("repair=pending")
+    expect(pending.feedback).not.toContain("repair=invalid_report")
+  })
+
+  it("reports a valid failed repair as rejected when it has no receipt", async () => {
+    const target = node("scout", "task-scout"), relation = { graphRootTaskId: "root-1", nodeKey: target.key, taskId: target.taskId, criterionIds: ["candidate-present"] }
+    const repair = node("repair", "task-repair", relation)
+    const decision = await checkTaskGraphTerminalVerification(graphClient([target, repair], [
+      { id: target.taskId, status: "failed", role: "scout", failureReason: "task_graph_verification_unverified", result: storedResult("unverified") },
+      { id: repair.taskId, status: "failed", role: "scout", failureReason: "task_graph_verification_failed", result: storedResult("failed") },
+    ]), graphLease, "root-1")
+    expect(decision).toMatchObject({ ok: false })
+    if (decision.ok) return
+    expect(decision.feedback).toContain("nodeOrdinal=1 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing repair=rejected")
+    expect(decision.feedback).not.toContain("repair=pending")
+  })
+
+  it.each([
+    ["queued", "pending"], ["running", "pending"], ["retrying", "pending"], ["waiting", "pending"], ["waiting_for_user", "pending"],
+    ["completed", "terminal"], ["interrupted", "terminal"], ["cancelled", "terminal"], ["closed", "terminal"],
+    ["failed", "rejected"], ["future_status", "unavailable"],
+  ] as const)("maps repair status %s to safe feedback state %s", (status, expected) => {
+    expect(repairReportState({ status, result: null })).toBe(expected)
+  })
+
+  it.each(["interrupted", "cancelled", "closed"] as const)("describes %s repairs as terminal instead of pending", async status => {
+    const target = node("scout", "task-scout"), relation = { graphRootTaskId: "root-1", nodeKey: target.key, taskId: target.taskId, criterionIds: ["candidate-present"] }
+    const repair = node("repair", "task-repair", relation)
+    const decision = await checkTaskGraphTerminalVerification(graphClient([target, repair], [
+      { id: target.taskId, status: "failed", role: "scout", failureReason: "task_graph_verification_unverified", result: storedResult("unverified") },
+      { id: repair.taskId, status, role: "scout", failureReason: null, result: null },
+    ]), graphLease, "root-1")
+    expect(decision).toMatchObject({ ok: false })
+    if (decision.ok) return
+    expect(decision.feedback).toContain("repair=terminal")
+    expect(decision.feedback).not.toContain("repair=pending")
+  })
+
+  it("classifies unknown repair statuses as unavailable and keeps them out of feedback", async () => {
+    expect(repairReportState({ status: "future_status", result: null })).toBe("unavailable")
+    const target = node("scout", "task-scout"), relation = { graphRootTaskId: "root-1", nodeKey: target.key, taskId: target.taskId, criterionIds: ["candidate-present"] }
+    const repair = node("repair", "task-repair", relation)
+    const decision = await checkTaskGraphTerminalVerification(graphClient([target, repair], [
+      { id: target.taskId, status: "failed", role: "scout", failureReason: "task_graph_verification_unverified", result: storedResult("unverified") },
+      { id: repair.taskId, status: "future_status", role: "scout", failureReason: null, result: null },
+    ]), graphLease, "root-1")
+    expect(decision).toMatchObject({ ok: false })
+    if (decision.ok) return
+    expect(decision.feedback).not.toContain("future_status")
+    expect(decision.feedback).not.toContain("repair=pending")
+  })
+
   it("accepts nullable unverified receipts for repair but rejects unknown reason codes", async () => {
     const target = node("scout", "task-scout")
     const relation = { graphRootTaskId: "root-1", nodeKey: target.key, taskId: target.taskId, criterionIds: ["candidate-present"] }
@@ -134,7 +233,11 @@ describe("TaskGraph terminal verification gate", () => {
     ]
     await expect(checkTaskGraphTerminalVerification(graphClient([target, repair], tasks), graphLease, "root-1")).resolves.toEqual({ ok: true })
     const forged = [{ ...tasks[0], result: { ...storedResult("unverified"), taskGraphVerificationReport: { ...report("unverified"), reasonCode: "worker_claim", criteria: [{ criterionId: "candidate-present", status: "unverified", reasonCode: "worker_claim" }] } } }, tasks[1]]
-    await expect(checkTaskGraphTerminalVerification(graphClient([target, repair], forged), graphLease, "root-1")).resolves.toMatchObject({ ok: false })
+    const forgedDecision = await checkTaskGraphTerminalVerification(graphClient([target, repair], forged), graphLease, "root-1")
+    expect(forgedDecision).toMatchObject({ ok: false, feedback: expect.stringContaining("issue=verification_report") })
+    if (forgedDecision.ok) return
+    expect(forgedDecision.feedback).not.toContain("worker_claim")
+    expect(forgedDecision.feedback).not.toContain("candidate-present")
   })
 
   it("accepts only a complete passing repair receipt for the failed criteria", async () => {
@@ -148,7 +251,16 @@ describe("TaskGraph terminal verification gate", () => {
     ]
     await expect(checkTaskGraphTerminalVerification(graphClient([target, repair], baseTasks), graphLease, "root-1")).resolves.toEqual({ ok: true })
     const forged = [{ ...baseTasks[0] }, { ...baseTasks[1], result: { ...storedResult("passed"), taskGraphRepairReceipt: { ...receipt, targetTaskId: "foreign-task" } } }]
-    await expect(checkTaskGraphTerminalVerification(graphClient([target, repair], forged), graphLease, "root-1")).resolves.toMatchObject({ ok: false, feedback: expect.stringContaining("scout-repair:repair_receipt") })
+    const forgedDecision = await checkTaskGraphTerminalVerification(graphClient([target, repair], forged), graphLease, "root-1")
+    expect(forgedDecision).toMatchObject({ ok: false, feedback: expect.stringContaining("issue=repair_receipt") })
+    if (forgedDecision.ok) return
+    expect(forgedDecision.feedback).toContain("nodeOrdinal=1 criterionOrdinal=1 status=failed reasonCode=criterion_not_met repair=invalid_receipt")
+    const invalidRepair = { ...baseTasks[1], status: "failed", failureReason: "task_graph_verification_unverified", result: { taskGraphVerificationReport: { ...report("unverified"), reasonCode: "worker_claim", criteria: [{ criterionId: "candidate-present", status: "unverified", reasonCode: "worker_claim" }] } } }
+    const invalidReportDecision = await checkTaskGraphTerminalVerification(graphClient([target, repair], [baseTasks[0]!, invalidRepair]), graphLease, "root-1")
+    expect(invalidReportDecision).toMatchObject({ ok: false })
+    if (invalidReportDecision.ok) return
+    expect(invalidReportDecision.feedback).toContain("nodeOrdinal=1 criterionOrdinal=1 status=failed reasonCode=criterion_not_met repair=invalid_report")
+    expect(invalidReportDecision.feedback).not.toContain("worker_claim")
   })
 
   it("lets a later valid repair resolve a previously rejected repair without mutating its failed row", async () => {
@@ -163,9 +275,33 @@ describe("TaskGraph terminal verification gate", () => {
       { id: repair.taskId, status: "completed", role: "scout", failureReason: null, result: { ...storedResult("passed"), taskGraphRepairReceipt: receipt } },
     ]
     await expect(checkTaskGraphTerminalVerification(graphClient([target, rejected, repair], tasks), graphLease, "root-1")).resolves.toEqual({ ok: true })
-    await expect(checkTaskGraphTerminalVerification(graphClient([target, rejected], tasks.slice(0, 2)), graphLease, "root-1")).resolves.toMatchObject({ ok: false })
+    const unresolved = await checkTaskGraphTerminalVerification(graphClient([target, rejected], tasks.slice(0, 2)), graphLease, "root-1")
+    expect(unresolved).toMatchObject({ ok: false })
+    if (unresolved.ok) return
+    expect(unresolved.feedback).toContain("nodeOrdinal=2 status=unverified reasonCode=repair_target_unresolved")
     const rejectedResult = tasks[1]!.result as Record<string, unknown>
     const forged = [{ ...tasks[0] }, { ...tasks[1], result: { ...rejectedResult, taskGraphRepairReceipt: { ...receipt, targetTaskId: "foreign" } } }, tasks[2]!]
     await expect(checkTaskGraphTerminalVerification(graphClient([target, rejected, repair], forged), graphLease, "root-1")).resolves.toMatchObject({ ok: false })
+  })
+
+  it("reports omitted criteria explicitly and prioritizes a repair's own reason", async () => {
+    const criterionIds = Array.from({ length: 8 }, (_, index) => `criterion-${index}-${"x".repeat(52)}`)
+    const multiContract = { ...contract, criteria: criterionIds.map(id => ({ id, check })) }
+    const target = { ...node("scout", "task-scout"), verification: multiContract }
+    const relation = { graphRootTaskId: "root-1", nodeKey: target.key, taskId: target.taskId, criterionIds }
+    const repair = { ...node("repair-first", "task-repair", relation), verification: multiContract }
+    const targetReport = { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "canonical_evidence_missing", criteria: criterionIds.map(criterionId => ({ criterionId, status: "unverified", reasonCode: "canonical_evidence_missing" })), evidenceDigest: null, resultDigest: null }
+    const repairResult = structuredResult("passed")
+    const repairReport = { ...report("passed"), status: "unverified", reasonCode: "repair_target_unresolved", criteria: criterionIds.map(criterionId => ({ criterionId, status: "passed", reasonCode: "criteria_met" })), evidenceDigest: null, resultDigest: taskGraphResultDigest(repairResult) }
+    const tasks = [
+      { id: target.taskId, status: "failed", role: "scout", failureReason: "task_graph_verification_unverified", result: { taskGraphVerificationReport: targetReport } },
+      { id: repair.taskId, status: "failed", role: "scout", failureReason: "task_graph_repair_target_unresolved", result: { structuredResult: repairResult, taskGraphVerificationReport: repairReport } },
+    ]
+    const decision = await checkTaskGraphTerminalVerification(graphClient([target, repair], tasks), graphLease, "root-1")
+    expect(decision).toMatchObject({ ok: false })
+    if (decision.ok) return
+    expect(decision.feedback).toContain("nodeOrdinal=2 status=unverified reasonCode=repair_target_unresolved")
+    expect(decision.feedback).toMatch(/\d+ feedback items omitted; inspect TaskGraph before retrying/)
+    expect(decision.feedback.length).toBeLessThanOrEqual(512)
   })
 })
