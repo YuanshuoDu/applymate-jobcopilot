@@ -1,4 +1,12 @@
 import type { TenantScope } from "@jobcopilot/agent-protocol"
+import type {
+  CompactionAnswer,
+  CompactionApproval,
+  CompactionArtifact,
+  CompactionFact,
+  CompactionOpenTask,
+  CompactionTokenMeasurement,
+} from "./context-compaction-types.js"
 
 import type {
   BusinessReference,
@@ -95,6 +103,30 @@ export type ContextSnapshotContextSeeds = {
   readonly toolObservations: readonly ContextSeedBlock[]
 }
 
+/** JSON-persisted form of compaction state; bigint sequence is stored as decimal text. */
+export type ContextSnapshotCompactionState = {
+  readonly ownerId: string
+  readonly sessionId: string
+  readonly throughSequence: string
+  readonly goal: string
+  readonly userConstraints: readonly string[]
+  readonly approvals: readonly CompactionApproval[]
+  readonly answers: readonly CompactionAnswer[]
+  readonly artifacts: readonly CompactionArtifact[]
+  readonly openTasks: readonly CompactionOpenTask[]
+  readonly doNotRepeat: readonly string[]
+  readonly facts: readonly CompactionFact[]
+}
+
+export type ContextSnapshotCompaction = {
+  readonly itemId: string
+  readonly digest: string
+  readonly state: ContextSnapshotCompactionState
+  readonly narrativeSummary: string
+  readonly tokenMeasurement: CompactionTokenMeasurement
+  readonly sourceItemIds: readonly string[]
+}
+
 export type ContextSnapshotSourceData = {
   readonly goal: string
   readonly userConstraints: readonly string[]
@@ -129,6 +161,8 @@ export type ContextSnapshotContent = {
   readonly consumedInputIds: readonly string[]
   readonly context: ContextSnapshotContextSeeds
   readonly tokenAccounting: ContextSnapshotTokenAccounting
+  /** Optional additive metadata written by durable context compaction. */
+  readonly compaction?: ContextSnapshotCompaction
 }
 
 export type AgentContextSnapshot = {

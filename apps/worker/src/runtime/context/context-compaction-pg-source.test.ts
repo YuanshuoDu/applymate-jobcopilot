@@ -3,17 +3,31 @@ import { describe, expect, it, vi } from "vitest"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import type { CompactionPgClient, CompactionPgPool } from "./context-compaction-pg-store.js"
 import { createPgCompactionSource } from "./context-compaction-pg-source.js"
+import { sha256Hex } from "./context-compaction-canonical.js"
 
 const owner: TurnExecutionOwnerFence = {
   kind: "turn", userId: "user-a", sessionId: "session-a", turnId: "turn-a", taskId: "root-a", rootTaskId: "root-a",
   ownerId: "worker-a", leaseVersion: 4, leaseExpiresAt: new Date(Date.now() + 60_000),
 }
+const priorState = {
+  ownerId: owner.userId, sessionId: owner.sessionId, throughSequence: "7", goal: "Find a role", userConstraints: ["EU"],
+  approvals: [{ id: "approval-1", status: "pending" }], answers: [{ id: "answer-1", question: "Permit", answer: "yes" }],
+  artifacts: [{ id: "artifact-v1", type: "resume", hash: "hash-v1" }], openTasks: [], doNotRepeat: ["old failed path"],
+  facts: [{ factId: "fact-1", key: "role", source: "user" }],
+}
+const priorSummary = "prior summary"
+const priorTokenMeasurement = { beforeInputTokens: 100, afterInputTokens: 40, reductionTokens: 60, reductionRatio: 0.6 }
+const priorSourceItemIds = ["item-prior"]
+const priorItemId = "old-compaction"
 const priorContent = {
   schemaVersion: "agent-harness.context.v1", ownerId: owner.userId, sessionId: owner.sessionId, throughSequence: "7", goal: "Find a role",
   userConstraints: ["EU"], confirmedDecisions: [], completedWork: [], openWork: [], pendingApprovals: [], artifacts: [{ id: "artifact-v1", type: "resume", hash: "hash-v1" }],
   facts: [{ factId: "fact-1", key: "role", source: "user" }], failedAttempts: [{ taskId: "task-old", reason: "failed", doNotRepeat: ["old failed path"] }], references: [], consumedInputIds: [],
   context: { system: [], profile: [], steerHistory: [], toolObservations: [] }, tokenAccounting: { profiles: [], totalInputTokens: 0, totalOutputTokens: 0, totalCostUsd: 0 },
-  compaction: { itemId: "old-compaction", digest: "old-digest", state: { ownerId: owner.userId, sessionId: owner.sessionId, throughSequence: "7", goal: "Find a role", userConstraints: ["EU"], approvals: [{ id: "approval-1", status: "pending" }], answers: [{ id: "answer-1", question: "Permit", answer: "yes" }], artifacts: [{ id: "artifact-v1", type: "resume", hash: "hash-v1" }], openTasks: [], doNotRepeat: ["old failed path"], facts: [{ factId: "fact-1", key: "role", source: "user" }] }, narrativeSummary: "prior summary" },
+  compaction: {
+    itemId: priorItemId, digest: sha256Hex({ state: priorState, summary: priorSummary, measurement: priorTokenMeasurement, sourceItemIds: priorSourceItemIds, itemId: priorItemId }),
+    state: priorState, narrativeSummary: priorSummary, tokenMeasurement: priorTokenMeasurement, sourceItemIds: priorSourceItemIds,
+  },
 }
 
 function fakePool(options: { readonly contextSnapshotId?: string | null } = {}) {

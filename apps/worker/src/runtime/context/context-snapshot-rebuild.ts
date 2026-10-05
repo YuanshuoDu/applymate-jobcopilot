@@ -13,13 +13,13 @@ import {
   type BusinessReference,
   type ContextOwnerFence,
   type StepContext,
-  type StepContextSnapshot,
 } from "./step-context-builder.js"
 import {
   ContextSnapshotError,
   type AgentContextSnapshot,
   type RebuildStepRequest,
 } from "./context-snapshot-types.js"
+import { stepContextSnapshotFromContent } from "./context-snapshot-working-state.js"
 
 function nonEmpty(value: string, field: string): string {
   if (typeof value !== "string" || value.trim().length === 0) throw new ContextSnapshotError("invalid_input", `${field} must be non-empty`)
@@ -87,18 +87,6 @@ function verifiedOwnerFence(snapshot: AgentContextSnapshot, scope: TenantScope):
   }
 }
 
-function rebuildSnapshot(snapshot: AgentContextSnapshot): StepContextSnapshot {
-  const content = snapshot.content
-  return {
-    system: content.context.system,
-    profile: content.context.profile,
-    goal: content.context.goal ?? { id: "snapshot-goal", content: content.goal },
-    steerHistory: content.context.steerHistory,
-    businessRefs: content.references,
-    toolObservations: content.context.toolObservations,
-  }
-}
-
 export async function rebuildStepFromSnapshot(snapshot: AgentContextSnapshot, request: RebuildStepRequest): Promise<StepContext> {
   assertSnapshotIntegrity(snapshot)
   nonEmpty(request.scope.userId, "scope.userId")
@@ -116,7 +104,7 @@ export async function rebuildStepFromSnapshot(snapshot: AgentContextSnapshot, re
     sessionId: snapshot.sessionId,
     turnId: request.turnId,
     stepId: request.stepId,
-    snapshot: rebuildSnapshot(snapshot),
+    snapshot: stepContextSnapshotFromContent(snapshot.content),
     mode: "rebuild",
     now: new Date(0),
   })

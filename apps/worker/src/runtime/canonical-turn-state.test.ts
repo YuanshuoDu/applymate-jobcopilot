@@ -1,10 +1,15 @@
 import { describe, expect, it, vi } from "vitest"
 
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
+import { sha256Hex } from "./context/context-compaction-canonical.js"
 import { contextToModelMessages } from "./turns/turn-engine-messages.js"
 import { STEERING_MARKER_EVENT_TYPE, steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "./context/steering-marker.js"
 import { buildCognitiveActionAgenda } from "./turns/cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE } from "./turns/cognitive-agenda-receipt.js"
+import type { ModelAdapter } from "@jobcopilot/agent-model"
+import { StepContextBuilder } from "./context/step-context-builder.js"
+import type { InputClaimStore, InputClaimTransaction } from "./context/input-claim-store.js"
+import { buildModelRequest } from "./turns/turn-engine-messages.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 1,
@@ -63,6 +68,80 @@ function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unk
 }
 
 describe("loadCanonicalTurnState", () => {
+  it("hydrates durable compaction state from the persisted snapshot after a Worker restart", async () => {
+    const state = {
+      ownerId: "user-1", sessionId: "session-1", throughSequence: "7", goal: "Search Dublin roles", userConstraints: ["Dublin only"],
+      approvals: [{ id: "approval-1", status: "pending" }],
+      answers: [{ id: "answer-1", question: "Work authorization?", answer: "Confirmed" }],
+      artifacts: [{ id: "artifact-1", type: "resume", hash: "sha256:artifact" }],
+      openTasks: [{ taskId: "task-1", status: "running", blocker: null }], doNotRepeat: ["repeat rejection"],
+      facts: [{ factId: "fact-1", key: "target_role", source: "persona_fact:fact-1" }],
+    }
+    const summary = "Only a short narrative summary"
+    const measurement = { beforeInputTokens: 100, afterInputTokens: 40, reductionTokens: 60, reductionRatio: 0.6 }
+    const sourceItemIds = ["item-1"]
+    const itemId = "compaction-1"
+    const compaction = { itemId, digest: sha256Hex({ state, summary, measurement, sourceItemIds, itemId }), state, narrativeSummary: summary, tokenMeasurement: measurement, sourceItemIds }
+    const snapshot = {
+      schemaVersion: "agent-harness.context.v1", ownerId: "user-1", sessionId: "session-1", throughSequence: "7", goal: "Stale goal",
+      userConstraints: ["stale constraint"], confirmedDecisions: [], completedWork: [], openWork: [], pendingApprovals: [], artifacts: [], facts: [], failedAttempts: [],
+      references: [], consumedInputIds: [], context: { system: [], profile: [], steerHistory: [], toolObservations: [] },
+      tokenAccounting: { profiles: [], totalInputTokens: 0, totalOutputTokens: 0, totalCostUsd: 0 }, compaction,
+    }
+    const fake = pool({
+      turn: { input: { goal: "Continue search" }, rootTaskId: null, contextSnapshotId: "snapshot-1", modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      snapshots: [{ id: "snapshot-1", throughSequence: "7", version: 1, content: snapshot }],
+    })
+
+    const restored = await loadCanonicalTurnState(fake, lease)
+    expect(restored.snapshot.toolObservations).toEqual([expect.objectContaining({
+      id: "snapshot-working-state:session-1:7",
+      content: expect.objectContaining({
+        status: "available", authority: "informational_only", goal: "Search Dublin roles", userConstraints: ["Dublin only"],
+        openWork: [{ taskId: "task-1", status: "running", blocker: null }],
+        approvalState: expect.objectContaining({
+          source: "compaction_state", entries: [{ id: "approval-1", status: "pending" }], freshness: "compaction_state", grantsActionAuthority: false,
+        }),
+      }),
+    })])
+    expect(restored.snapshot.toolObservations[0]?.id).not.toContain("narrative")
+    const claimStore: InputClaimStore = {
+      scope: { userId: "user-1" },
+      async withTransaction<T>(work: (transaction: InputClaimTransaction) => Promise<T>): Promise<T> {
+        return work({
+          getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }),
+          claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }),
+          persistCheckpoint: async () => undefined,
+        })
+      },
+    }
+    const step = await new StepContextBuilder(claimStore).build({
+      scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "step-1", snapshot: restored.snapshot, now: new Date(0),
+    })
+    const model = { profile: { provider: "test", model: "test-model", nativeTools: false, structuredOutput: false, streaming: false, continuationCursor: false } } as unknown as ModelAdapter
+    const request = buildModelRequest({ context: step, model, tools: [], sessionId: "session-1", turnId: "turn-1", stepId: "step-1", userId: "user-1", taskId: "root-1", signal: new AbortController().signal })
+    const requestText = request.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    expect(requestText).toContain("context_snapshot_working_state")
+    expect(requestText).toContain("Search Dublin roles")
+    expect(requestText).toContain("UNTRUSTED_DATA")
+  })
+
+  it("fails closed when a loaded snapshot cursor disagrees with its database cursor", async () => {
+    const content = {
+      schemaVersion: "agent-harness.context.v1", ownerId: "user-1", sessionId: "session-1", throughSequence: "7", goal: "Continue",
+      userConstraints: [], confirmedDecisions: [], completedWork: [], openWork: [], pendingApprovals: [], artifacts: [], facts: [], failedAttempts: [],
+      references: [], consumedInputIds: [], context: { system: [], profile: [], steerHistory: [], toolObservations: [] },
+      tokenAccounting: { profiles: [], totalInputTokens: 0, totalOutputTokens: 0, totalCostUsd: 0 },
+    }
+    for (const pinned of [true, false]) {
+      const fake = pool({
+        turn: { input: { goal: "Continue" }, rootTaskId: null, contextSnapshotId: pinned ? "snapshot-1" : null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+        snapshots: [{ id: "snapshot-1", throughSequence: "6", version: 1, content }],
+      })
+      await expect(loadCanonicalTurnState(fake, lease)).rejects.toThrow("context_snapshot_sequence_mismatch")
+    }
+  })
+
   it("restores only the exact server-owned interactive-discovery intent", async () => {
     const exact = pool({ turn: { input: { goal: "Find jobs", intent: { kind: "interactive_discovery_shortlist", version: 1 } }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} } })
     await expect(loadCanonicalTurnState(exact, lease)).resolves.toMatchObject({
