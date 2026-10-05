@@ -46,13 +46,18 @@ function object(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null
 }
 
-async function lockOwnedLiveSession(tx: CommandTransaction, command: TaskInterruptCommand): Promise<void> {
-  const rows = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
-    SELECT "id" FROM "agent_sessions"
+function missingOwnedSession(): TaskInterruptError {
+  return new TaskInterruptError("task_interrupt_target_not_found", 404, "The selected task is unavailable")
+}
+
+async function lockOwnedSession(tx: CommandTransaction, command: TaskInterruptCommand): Promise<string> {
+  const rows = await tx.$queryRaw<Array<{ id: string; status: string }>>(Prisma.sql`
+    SELECT "id", "status" FROM "agent_sessions"
     WHERE "id" = ${command.sessionId} AND "userId" = ${command.userId}
-      AND "status" NOT IN ('aborted', 'archived') FOR UPDATE
+    FOR UPDATE
   `)
-  if (!rows[0]) throw new TaskInterruptError("task_interrupt_target_not_found", 404, "The selected task is unavailable")
+  if (!rows[0]) throw missingOwnedSession()
+  return rows[0].status
 }
 
 async function resolveTaskLineage(tx: CommandTransaction, command: TaskInterruptCommand): Promise<{ identity: TaskIdentity; turnId: string }> {
@@ -122,7 +127,7 @@ export class TaskInterruptService {
     const outboxKey = taskInterruptOutboxKey(command.sessionId, command.clientMessageId)
     const eventKey = taskInterruptAcceptedEventKey(command.sessionId, command.clientMessageId)
     return this.db.$transaction(async tx => {
-      await lockOwnedLiveSession(tx, command)
+      const sessionStatus = await lockOwnedSession(tx, command)
       const existing = await tx.agentOutbox.findUnique({
         where: { idempotencyKey: outboxKey },
         select: { aggregateId: true, payload: true },
@@ -139,6 +144,8 @@ export class TaskInterruptService {
         if (!event) throw new TaskInterruptError("task_interrupt_replay_unavailable", 409, "The original interrupt result is unavailable")
         return { intentId: saved.intentId, taskId: command.taskId, turnId: saved.turnId, disposition: "duplicate", sequence: String(event.sequence) }
       }
+
+      if (sessionStatus === "aborted" || sessionStatus === "archived") throw missingOwnedSession()
 
       const { turnId } = await resolveTaskLineage(tx, command)
       const intentId = randomUUID()

@@ -3,14 +3,13 @@ import { randomUUID } from "node:crypto"
 import type { AgentTreeManager } from "./manager.js"
 import { transaction, type Queryable } from "./pg-store-persistence.js"
 import { hasPersistedTaskGraphMembership, type GraphIdentityScope } from "./task-graph-pg-state.js"
-import { persistGraphTransition, prepareGraphTransition } from "./task-graph-pg-lifecycle.js"
+import { persistGraphTransition, prepareGraphTransition, reconcileGraphDependents } from "./task-graph-pg-lifecycle.js"
 import type { PgSubagentPool } from "./types.js"
 
 export const TASK_INTERRUPT_OUTBOX_TOPIC = "agent.subagent.task-interrupt"
 const ACTIVE = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user"])
 const ACTIVE_TURN = new Set(["queued", "in_progress", "waiting_for_dependency", "waiting_for_approval", "waiting_for_user"])
-const BATCH_SIZE = 20
-const POLL_MS = 1_000
+const BATCH_SIZE = 20, POLL_MS = 1_000
 
 export type TaskInterruptIntent = Readonly<{ sessionId: string; turnId: string; taskId: string; intentId: string }>
 type OutboxRow = Readonly<{ id: string; aggregateId: string; payload: unknown; publishedAt: Date | string | null }>
@@ -142,7 +141,7 @@ async function applyIntent(client: Queryable, intent: TaskInterruptIntent, userI
     if (updated.rowCount !== 1) continue
     if (running) { activeIds.push(row.id); continue }
     await deleteDispatch(client, intent.sessionId, row.id)
-    if (graph && !("blocked" in graph)) await persistGraphTransition(client, graph, new Date(), { stream: true })
+    if (graph && !("blocked" in graph)) { await persistGraphTransition(client, graph, new Date(), { stream: true }); await reconcileGraphDependents(client, graph.scope, new Date(), { stream: true }) }
     await appendOutcome(client, userId, intent, row.id, "interrupted")
   }
   return { rootTaskId: lineage.target.rootTaskId, taskIds: activeIds }

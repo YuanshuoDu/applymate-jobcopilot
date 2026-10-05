@@ -27,7 +27,7 @@ function disposableUrl(): string | null {
 const databaseUrl = disposableUrl()
 const describeWithPostgres = databaseUrl ? describe : describe.skip
 const ids = {
-  suffix: randomUUID(), user: "", session: "", turn: "", root: "", target: "", descendant: "", sibling: "", item: "", intent: randomUUID(),
+  suffix: randomUUID(), user: "", session: "", turn: "", root: "", target: "", descendant: "", sibling: "", dependent: "", item: "", intent: randomUUID(),
 }
 ids.user = `task-int-user-${ids.suffix}`
 ids.session = `task-int-session-${ids.suffix}`
@@ -36,6 +36,7 @@ ids.root = `task-int-root-${ids.suffix}`
 ids.target = `task-int-target-${ids.suffix}`
 ids.descendant = `task-int-descendant-${ids.suffix}`
 ids.sibling = `task-int-sibling-${ids.suffix}`
+ids.dependent = `task-int-dependent-${ids.suffix}`
 ids.item = taskGraphItemId(ids.root)
 
 describeWithPostgres("durable child task interruption on disposable PostgreSQL", () => {
@@ -54,10 +55,12 @@ describeWithPostgres("durable child task interruption on disposable PostgreSQL",
     await pool.query(insertTask, [ids.target, ids.session, ids.turn, ids.root, ids.root, `/${ids.root}/${ids.target}`, 1, "analyst", "research", "queued", "selected task", 0, null, null])
     await pool.query(insertTask, [ids.descendant, ids.session, ids.turn, ids.root, ids.target, `/${ids.root}/${ids.target}/${ids.descendant}`, 2, "scout", "research", "running", "descendant task", 1, "child-worker", new Date(Date.now() + 60_000)])
     await pool.query(insertTask, [ids.sibling, ids.session, ids.turn, ids.root, ids.root, `/${ids.root}/${ids.sibling}`, 1, "analyst", "research", "queued", "sibling task", 0, null, null])
+    await pool.query(insertTask, [ids.dependent, ids.session, ids.turn, ids.root, ids.root, `/${ids.root}/${ids.dependent}`, 1, "analyst", "research", "waiting", "dependent task", 0, null, null])
 
     const snapshot = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
       { key: "selected", templateId: "analyst", goal: "selected task", successCriteria: ["complete"], dependsOn: [], depth: 1, taskId: ids.target },
       { key: "sibling", templateId: "analyst", goal: "sibling task", successCriteria: ["complete"], dependsOn: [], depth: 1, taskId: ids.sibling },
+      { key: "dependent", templateId: "analyst", goal: "dependent task", successCriteria: ["complete"], dependsOn: ["selected"], depth: 2, taskId: ids.dependent },
     ] }
     const item = { schemaVersion, id: ids.item, sessionId: ids.session, turnId: ids.turn, stepId: null, taskId: ids.root,
       type: TASK_GRAPH_ITEM_TYPE, status: "streaming", phase: null, revision: 1, content: snapshot, startedAt: new Date().toISOString(), completedAt: null,
@@ -65,7 +68,7 @@ describeWithPostgres("durable child task interruption on disposable PostgreSQL",
     await pool.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "taskId", "type", "status", "revision", "content", "startedAt", "updatedAt")
       VALUES ($1, $2, $3, $4, $5, 'streaming', 1, $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, [ids.item, ids.session, ids.turn, ids.root, TASK_GRAPH_ITEM_TYPE, JSON.stringify(snapshot)])
     const proposal = { kind: "proposal", fingerprint: "a".repeat(64), revision: 1,
-      receipt: { status: "accepted", revision: 1, nodes: [{ key: "selected", taskId: ids.target, status: "queued" }, { key: "sibling", taskId: ids.sibling, status: "queued" }], readyTaskIds: [ids.target, ids.sibling] }, item }
+      receipt: { status: "accepted", revision: 1, nodes: [{ key: "selected", taskId: ids.target, status: "queued" }, { key: "sibling", taskId: ids.sibling, status: "queued" }, { key: "dependent", taskId: ids.dependent, status: "waiting" }], readyTaskIds: [ids.target, ids.sibling] }, item }
     await pool.query(`UPDATE "agent_sessions" SET "eventSequence" = 1 WHERE "id" = $1`, [ids.session])
     await pool.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload")
       VALUES ($1, $2, $3, $4, $5, 1, 'item.started', 'orchestrator', $3, $6, $7::jsonb)`, [randomUUID(), ids.session, ids.turn, ids.item, ids.root, taskGraphProposalKey(ids.root, 0), JSON.stringify(proposal)])
@@ -151,12 +154,16 @@ describeWithPostgres("durable child task interruption on disposable PostgreSQL",
     expect(byId.get(ids.descendant)?.interruptRequestedAt).toBeTruthy()
     expect(byId.get(ids.root)).toMatchObject({ status: "running", interruptRequestedAt: null })
     expect(byId.get(ids.sibling)).toMatchObject({ status: "queued", interruptRequestedAt: null })
+    expect(byId.get(ids.dependent)?.status).toBe("cancelled")
     expect(manager.signalTaskSubtree).toHaveBeenCalledWith(ids.session, ids.root, [ids.descendant])
 
     const graph = await pool.query(`SELECT "revision" FROM "agent_items" WHERE "id" = $1`, [ids.item])
-    const receipt = await pool.query(`SELECT "payload" FROM "agent_events" WHERE "sessionId" = $1 AND "type" = 'item.delta' AND "itemId" = $2`, [ids.session, ids.item])
-    expect(graph.rows[0]?.revision).toBe(2)
-    expect(receipt.rows[0]?.payload).toMatchObject({ kind: "lifecycle", event: { type: "task.interrupted", nodeKey: "selected" } })
+    const receipts = await pool.query(`SELECT "payload" FROM "agent_events" WHERE "sessionId" = $1 AND "type" = 'item.delta' AND "itemId" = $2 ORDER BY "sequence"`, [ids.session, ids.item])
+    expect(graph.rows[0]?.revision).toBe(3)
+    expect(receipts.rows.map(row => row.payload)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "lifecycle", event: expect.objectContaining({ type: "task.interrupted", nodeKey: "selected" }) }),
+      expect.objectContaining({ kind: "lifecycle", event: expect.objectContaining({ type: "task.cancelled", nodeKey: "dependent" }) }),
+    ]))
 
     const closedClientMessageId = "integration-interrupt-closed-session"
     const closedAccepted = await service.interrupt({ ...command, taskId: ids.sibling, clientMessageId: closedClientMessageId })

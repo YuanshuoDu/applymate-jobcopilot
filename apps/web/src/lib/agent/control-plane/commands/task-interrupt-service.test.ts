@@ -22,10 +22,10 @@ const chain = [
   { id: "task-child", sessionId: "session-1", turnId: "turn-1", rootTaskId: "task-root", parentTaskId: "task-root", path: "/task-root/task-child", depth: 1 },
 ]
 
-function harness(options: { sessionExists?: boolean; existing?: unknown; task?: typeof identity; lineage?: typeof chain } = {}) {
+function harness(options: { sessionExists?: boolean; sessionStatus?: string; existing?: unknown; task?: typeof identity; lineage?: typeof chain } = {}) {
   const tx = {
     $queryRaw: vi.fn()
-      .mockResolvedValueOnce(options.sessionExists === false ? [] : [{ id: "session-1" }])
+      .mockResolvedValueOnce(options.sessionExists === false ? [] : [{ id: "session-1", status: options.sessionStatus ?? "active" }])
       .mockResolvedValueOnce([options.task ?? identity])
       .mockResolvedValueOnce(options.lineage ?? chain),
     agentOutbox: { findUnique: vi.fn().mockResolvedValue(options.existing ?? null) },
@@ -81,5 +81,37 @@ describe("TaskInterruptService", () => {
     const collision = harness({ existing })
     await expect(collision.service.interrupt({ ...command, taskId: "other-child" })).rejects.toMatchObject({ code: "task_interrupt_idempotency_conflict", status: 409 })
     expect(collision.tx.agentEvent.findFirst).not.toHaveBeenCalled()
+  })
+
+  it.each(["aborted", "archived"] as const)("replays an accepted command after the owned session is %s without resolving tasks", async sessionStatus => {
+    const existing = { aggregateId: "session-1", payload: { intentId: "intent-old", taskId: "task-child", turnId: "turn-1" } }
+    const replay = harness({ sessionStatus, existing })
+    await expect(replay.service.interrupt(command)).resolves.toEqual({
+      intentId: "intent-old", taskId: "task-child", turnId: "turn-1", disposition: "duplicate", sequence: "9",
+    })
+    expect(replay.tx.$queryRaw).toHaveBeenCalledOnce()
+    expect(replay.tx.agentEvent.findFirst).toHaveBeenCalledOnce()
+    expect(mocks.append).not.toHaveBeenCalled()
+    expect(mocks.enqueue).not.toHaveBeenCalled()
+  })
+
+  it.each(["aborted", "archived"] as const)("keeps key collision and rejects new commands when the owned session is %s", async sessionStatus => {
+    const existing = { aggregateId: "session-1", payload: { intentId: "intent-old", taskId: "task-child", turnId: "turn-1" } }
+    const collision = harness({ sessionStatus, existing })
+    await expect(collision.service.interrupt({ ...command, taskId: "other-child" })).rejects.toMatchObject({
+      code: "task_interrupt_idempotency_conflict", status: 409,
+    })
+    expect(collision.tx.$queryRaw).toHaveBeenCalledOnce()
+    expect(collision.tx.agentEvent.findFirst).not.toHaveBeenCalled()
+    expect(mocks.append).not.toHaveBeenCalled()
+    expect(mocks.enqueue).not.toHaveBeenCalled()
+
+    const fresh = harness({ sessionStatus })
+    await expect(fresh.service.interrupt({ ...command, clientMessageId: "client-new" })).rejects.toMatchObject({
+      code: "task_interrupt_target_not_found", status: 404,
+    })
+    expect(fresh.tx.$queryRaw).toHaveBeenCalledOnce()
+    expect(mocks.append).not.toHaveBeenCalled()
+    expect(mocks.enqueue).not.toHaveBeenCalled()
   })
 })
