@@ -4,6 +4,7 @@ import type pg from "pg"
 import type { TurnLease } from "../turns/lease.js"
 import { parseTaskGraphRepairReceipt, parseTaskGraphVerificationReport, taskGraphVerificationReportMatchesStatus, type TaskGraphRepairReceipt, type TaskGraphVerificationReport } from "./task-graph-command-port.js"
 import { parseTaskGraphSnapshot, taskGraphItemId, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
+import { isTerminalSubagentStatus } from "./types.js"
 type Queryable = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
 type Projection = { readonly id: string; readonly content: RepositoryJsonValue }
@@ -19,7 +20,7 @@ const FORBIDDEN_RESULT_KEYS = new Set([
 ])
 type ResultInfo = { readonly value: RepositoryJsonValue; readonly bytes: number | null; readonly summary: string; readonly hasValue: boolean }
 type TaskState = { readonly taskId: string; readonly status: string; readonly role: string | null; readonly result: ResultInfo; readonly failureReason: string | null; readonly verificationReport?: TaskGraphVerificationReport; readonly repairReceipt?: TaskGraphRepairReceipt }
-type OutcomeTask = { taskId: string; status: string; role?: string; result: RepositoryJsonValue; failureReason: string | null; verificationReport?: TaskGraphVerificationReport; repairReceipt?: TaskGraphRepairReceipt }
+type OutcomeTask = { taskId: string; status: string; role: string | null; result: RepositoryJsonValue; failureReason: string | null; verificationReport?: TaskGraphVerificationReport; repairReceipt?: TaskGraphRepairReceipt }
 type Outcome = { waitId: string; status: string; matchedTaskIds: string[]; targetTaskIds: string[]; tasks: OutcomeTask[] }
 type PreparedOutcome = { readonly value: Outcome; readonly taskIds: string[]; readonly mode: "any" | "all" }
 type Detail = { readonly kind: "result"; readonly index: number; readonly info: ResultInfo } | { readonly kind: "failure"; readonly index: number; readonly value: string }
@@ -143,7 +144,7 @@ function makeOutcome(waitId: string, status: string, targetIds: string[], matche
   const seen = new Set<string>(); const tasks: OutcomeTask[] = []
   for (const state of states) {
     if (!targetIds.includes(state.taskId) || seen.has(state.taskId) || !taskStatus(state.status)) return null
-    seen.add(state.taskId); tasks.push({ taskId: state.taskId, status: state.status, ...(state.role ? { role: state.role } : {}), result: state.status === "completed" ? (state.verificationReport ? { truncated: true } : minimalResult(state.result)) : null, failureReason: null, ...(state.verificationReport ? { verificationReport: state.verificationReport } : {}), ...(state.repairReceipt ? { repairReceipt: state.repairReceipt } : {}) })
+    seen.add(state.taskId); tasks.push({ taskId: state.taskId, status: state.status, role: state.role, result: state.status === "completed" ? (state.verificationReport ? { truncated: true } : minimalResult(state.result)) : null, failureReason: null, ...(state.verificationReport ? { verificationReport: state.verificationReport } : {}), ...(state.repairReceipt ? { repairReceipt: state.repairReceipt } : {}) })
   }
   let outcome: Outcome = { waitId, status, matchedTaskIds: matchedIds, targetTaskIds: targetIds, tasks }
   let size = outcomeBytes(outcome)
@@ -192,19 +193,19 @@ function generatedOutcome(wait: Row, targets: readonly Row[], snapshot: TaskGrap
   })
   return states.every(state => state.role !== null) ? makeOutcome(waitId, status, targetIds, matchedIds, states, currentMode) : null
 }
-function storedOutcome(wait: Row, snapshot: TaskGraphSnapshot | null, rootTaskId: string): PreparedOutcome | null {
+function storedOutcome(wait: Row, snapshot: TaskGraphSnapshot | null, rootTaskId: string, targets: readonly Row[]): PreparedOutcome | null {
   const raw = record(object(wait.result).outcome), waitId = safeText(wait.id), status = raw ? waitStatus(raw.status) : null, currentMode = waitMode(wait.mode)
   const expectedIds = boundedIds(wait.targetTaskIds), expectedMatchedIds = boundedIds(wait.matchedTaskIds, true), targetIds = raw ? boundedIds(raw.targetTaskIds) : null, matchedIds = raw ? boundedIds(raw.matchedTaskIds, true) : null
   if (!raw || raw.waitId !== waitId || !status || status !== waitStatus(wait.status) || !currentMode || !expectedIds || !expectedMatchedIds || !targetIds || !matchedIds
     || targetIds.length !== expectedIds.length || targetIds.some((id, index) => id !== expectedIds[index]) || matchedIds.length !== expectedMatchedIds.length || matchedIds.some((id, index) => id !== expectedMatchedIds[index]) || matchedIds.some(id => !targetIds.includes(id))
     || (status === "ready" && matchedIds.length === 0) || !Array.isArray(raw.tasks)) return null
-  const seen = new Set<string>(); const states: TaskState[] = []
+  const seen = new Set<string>(), states: TaskState[] = [], targetById = new Map<string, Row>(targets.map(target => [safeText(target.id), target]))
   for (const value of raw.tasks) {
-    const task = record(value); if (!task || typeof task.taskId !== "string" || !targetIds.includes(task.taskId) || seen.has(task.taskId)) return null
-    const childStatus = taskStatus(task.status); if (!childStatus) return null
+    const task = record(value); if (!task || typeof task.taskId !== "string" || !targetIds.includes(task.taskId) || seen.has(task.taskId)) return null; const authoritative = targetById.get(task.taskId); if (!authoritative) return null
+    const childStatus = taskStatus(task.status), rowStatus = taskStatus(authoritative.status); if (!childStatus || matchedIds.includes(task.taskId) && (childStatus !== rowStatus || !isTerminalSubagentStatus(rowStatus ?? ""))) return null
     seen.add(task.taskId)
-    const role = Object.prototype.hasOwnProperty.call(task, "role") ? taskRole(task.role) : null
-    if (Object.prototype.hasOwnProperty.call(task, "role") && !role) return null
+    const hasRole = Object.prototype.hasOwnProperty.call(task, "role"), role = hasRole ? taskRole(task.role) : null, rowRole = taskRole(authoritative.role)
+    if (hasRole && (!role || !rowRole || role !== rowRole)) return null
     const node = snapshot?.nodes.find(candidate => candidate.taskId === task.taskId)
     const criterionIds = node?.verificationDisposition === "typed" && node.verification ? node.verification.criteria.map(item => item.id) : undefined
     const hasReport = Object.prototype.hasOwnProperty.call(task, "verificationReport"), verificationReport = hasReport && criterionIds ? parseTaskGraphVerificationReport(task.verificationReport, criterionIds) : undefined
@@ -235,7 +236,7 @@ export async function consumeDurableWaitOutcomes(input: DurableWaitConsumerInput
     if (!targetIds || !boundedIds(wait.matchedTaskIds, true)?.every(id => targetIds.includes(id))) throw new Error("wait_consume_outcome_invalid")
     const targets = await input.client.query<Row>(`SELECT task."id", task."rootTaskId", task."turnId", task."sessionId", task."role", task."status", task."result", task."failureReason", session."userId" AS "userId" FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId" WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3 AND session."userId" = $4 AND task."rootTaskId" = $5 AND session."status" NOT IN ('aborted', 'archived')`, [targetIds, input.lease.sessionId, input.lease.turnId, input.lease.userId, input.turn.rootTaskId])
     if (targets.rows.length !== targetIds.length || targets.rows.some(target => !targetIds.includes(String(target.id)) || String(target.rootTaskId ?? target.id) !== input.turn.rootTaskId || String(target.id) === input.turn.rootTaskId)) { if (wait.consumedAt) throw new Error("wait_consume_outcome_invalid"); continue }
-    const snapshot = await graphSnapshot(input, String(parent.id)), prior = wait.consumedAt ? storedOutcome(wait, snapshot, input.turn.rootTaskId) : null
+    const snapshot = await graphSnapshot(input, String(parent.id)), prior = wait.consumedAt ? storedOutcome(wait, snapshot, input.turn.rootTaskId, targets.rows) : null
     if (wait.consumedAt && !prior) throw new Error("wait_consume_outcome_invalid")
     if (prior) { projections.push(projection(wait, prior)); continue }
     const value = generatedOutcome(wait, targets.rows, snapshot, input.turn.rootTaskId)
