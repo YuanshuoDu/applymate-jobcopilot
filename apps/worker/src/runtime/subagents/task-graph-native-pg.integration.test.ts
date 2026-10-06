@@ -146,19 +146,18 @@ describePg("native TaskGraph PostgreSQL command durability", () => {
     const foreignId = `native-foreign-source-${suffix}`
     await pool!.query(`INSERT INTO "agent_turns"
       ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot",
-       "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
-      VALUES ($1, $2, $3, 'in_progress', 'user', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
-        $4, CURRENT_TIMESTAMP + INTERVAL '5 minutes', CURRENT_TIMESTAMP, 1, CURRENT_TIMESTAMP)`,
-    [ids.foreignTurn, ids.session, ids.user, `native-foreign-turn-owner-${suffix}`])
+       "startedAt", "completedAt", "updatedAt")
+      VALUES ($1, $2, $3, 'completed', 'user', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
+        CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, [ids.foreignTurn, ids.session, ids.user])
     await pool!.query(`INSERT INTO "sub_agent_tasks"
       ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
        "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot",
-       "budgetSnapshot", "attemptCount", "maxAttempts", "leaseOwner", "leaseExpiresAt", "updatedAt")
-      VALUES ($1, $2, $3, NULL, NULL, '/root', 0, 'orchestrator', 'root', 'running', 'foreign root',
+       "budgetSnapshot", "attemptCount", "maxAttempts", "startedAt", "completedAt", "updatedAt")
+      VALUES ($1, $2, $3, NULL, NULL, '/root', 0, 'orchestrator', 'root', 'completed', 'foreign root',
         '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
         '{"subagentPolicy":{"maxConcurrency":64,"maxDepth":8,"maxFanOut":64,"maxAttempts":2}}'::jsonb,
-        1, 2, $4, CURRENT_TIMESTAMP + INTERVAL '5 minutes', CURRENT_TIMESTAMP)`,
-    [ids.foreignRoot, ids.session, ids.foreignTurn, `native-foreign-task-owner-${suffix}`])
+        1, 2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+    [ids.foreignRoot, ids.session, ids.foreignTurn])
     await pool!.query(`UPDATE "sub_agent_tasks" SET "rootTaskId" = $1 WHERE "id" = $1`, [ids.foreignRoot])
     await pool!.query(`UPDATE "agent_turns" SET "rootTaskId" = $1 WHERE "id" = $2`, [ids.foreignRoot, ids.foreignTurn])
     await pool!.query(`INSERT INTO "sub_agent_tasks"
