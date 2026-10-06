@@ -188,7 +188,7 @@ async function readTargetEvidence(
     })
   }
   const artifacts = await client.query(`SELECT version."id", version."artifactId", version."version", version."artifactType", version."contentHash", version."sourceDigest", version."content"
-    FROM "agent_artifact_versions" AS version
+    FROM "agent_artifact_version" AS version
     JOIN "agent_sessions" AS session ON session."id" = version."sessionId" AND session."userId" = version."userId"
     JOIN "agent_turns" AS turn ON turn."id" = $3 AND turn."sessionId" = version."sessionId" AND turn."userId" = version."userId"
     JOIN "sub_agent_tasks" AS owner ON owner."id" = version."taskId" AND owner."sessionId" = version."sessionId"
