@@ -73,17 +73,9 @@ export async function loadNativeVerificationOwnedState(
       AND turn."rootTaskId" = $1 AND session."userId" = $4 AND turn."userId" = $4`,
   [scope.rootTaskId, scope.sessionId, scope.turnId, scope.userId])
   if (rootTurn.rows.length !== 1) throw new Error("native_verification_root_scope_invalid")
-  const root = rootTurn.rows[0] as Row, input = record(root.input)
-  const nestedInput = record(input?.input)
-  const canonicalInput = nestedInput && Object.keys(nestedInput).length > 0 ? nestedInput : input
-  const turnGoal = canonicalTurnGoal(root.input)
-  const rootGoal = typeof root.goal === "string" && root.goal.trim() ? root.goal.trim() : null
-  const goal = turnGoal.value
-  const turnGoalConflict = !turnGoal.valid || !goal || !rootGoal || goal !== rootGoal
-  const turnCriteria = criteriaField(canonicalInput, "successCriteria")
-  const rootCriteria = criteriaField(root, "successCriteria")
-  const criteriaValid = turnCriteria.valid && rootCriteria.valid
-  const criteria = criteriaValid ? mergeCriteria(turnCriteria.value, rootCriteria.value, goal) : []
+  const root = rootTurn.rows[0] as Row
+  const objective = objectiveState(root.input, { goal: root.goal, successCriteria: root.successCriteria })
+  const { goal, turnGoalConflict, criteria, criteriaValid } = objective
   let turnInputDigest: string | null = null
   try { turnInputDigest = digestNativeVerificationValue(root.input) } catch { /* unavailable input is carried as a failed binding */ }
 
@@ -153,6 +145,33 @@ function mergeCriteria(turnCriteria: readonly string[], rootCriteria: readonly s
   const merged = [...new Set([...turnCriteria, ...rootCriteria])]
   if (merged.length > MAX_CRITERIA) return []
   return merged.length ? merged : goal ? [goal] : []
+}
+
+export type NativeVerificationObjective = Readonly<{ goal: string; criteria: readonly string[] }>
+
+/** Shared exact objective derivation. Missing root means rootTaskStore.ensure's fresh-root goal/empty-criteria convention. */
+export function deriveNativeVerificationObjective(
+  turnInput: unknown, root?: Readonly<{ goal: unknown; successCriteria: unknown }>,
+): NativeVerificationObjective | null {
+  const objective = objectiveState(turnInput, root)
+  return objective.goal && !objective.turnGoalConflict && objective.criteriaValid
+    ? { goal: objective.goal, criteria: objective.criteria } : null
+}
+
+function objectiveState(turnInput: unknown, root?: Readonly<{ goal: unknown; successCriteria: unknown }>): {
+  goal: string | null; turnGoalConflict: boolean; criteria: readonly string[]; criteriaValid: boolean
+} {
+  const envelope = record(turnInput), nested = record(envelope?.input)
+  const canonicalInput = nested && Object.keys(nested).length > 0 ? nested : envelope
+  const parsedGoal = canonicalTurnGoal(turnInput), goal = parsedGoal.value
+  const rootGoal = root ? typeof root.goal === "string" && root.goal.trim() ? root.goal.trim() : null : goal
+  const turnCriteria = criteriaField(canonicalInput, "successCriteria")
+  const rootCriteria = root ? criteriaField(root, "successCriteria") : { value: [], valid: true }
+  const turnGoalConflict = !parsedGoal.valid || !goal || !rootGoal || goal !== rootGoal
+  const listsValid = turnCriteria.valid && rootCriteria.valid
+  const criteria = listsValid ? mergeCriteria(turnCriteria.value, rootCriteria.value, goal) : []
+  return { goal, turnGoalConflict, criteria, criteriaValid: listsValid && criteria.length > 0
+    && criteria.every(item => Buffer.byteLength(item, "utf8") <= MAX_CRITERION_BYTES) }
 }
 
 /** A predecessor leaves the active frontier only when an owned followup still proves its exact source. */
