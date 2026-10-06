@@ -124,6 +124,23 @@ describe("TaskGraph turn observation", () => {
     expect(encoded).not.toContain("private.example")
   })
 
+  it("restores pinned root criteria after snapshot serialization as untrusted model context", async () => {
+    const criteria = ["Find roles across the full requested EU market", "Include evidence for each shortlisted role"]
+    const merged = mergeTaskGraphCurrentObservation(snapshot(), { ...state, rootSuccessCriteria: criteria })
+    const reloaded = JSON.parse(JSON.stringify(merged)) as StepContextSnapshot
+    const observation = reloaded.toolObservations.find(item => item.id === "task-graph-current")?.content as Record<string, unknown>
+    const request = await selectedJobModelRequest(reloaded)
+    const modelText = request.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+
+    expect(observation).toMatchObject({ kind: "task_graph_current", rootSuccessCriteria: criteria })
+    expect(reloaded.system).toEqual([])
+    expect(modelText).toContain("Find roles across the full requested EU market")
+    expect(modelText).toContain("Include evidence for each shortlisted role")
+    expect(() => mergeTaskGraphCurrentObservation(snapshot(), { ...state, rootSuccessCriteria: ["x".repeat(2_001)] })).toThrow(
+      "task_graph_current_state_invalid:rootSuccessCriteria",
+    )
+  })
+
   it("preserves safe native operation and structural result receipts in the current graph", () => {
     const native = { operationKind: "spawn" as const, operationId: "operation-1", requestFingerprint: "f".repeat(64), callerTaskId: "root-1", role: "scout", taskType: "research", contextDigest: "c".repeat(64) }
     const nativeResult = { schemaVersion: "agent-harness.v2.task-graph.native-result.v1" as const, role: "scout", taskStatus: "completed" as const, disposition: "opaque" as const, resultDigest: "d".repeat(64) }

@@ -163,6 +163,37 @@ describe("agent.plan tool executor", () => {
     expect(getReceived()?.proposal.nodes[0]?.key).toBe(key)
   })
 
+  it("accepts bounded optional root requirements without replacing the proposal or human goal input", async () => {
+    const { tool, getReceived } = setup()
+    const input = { ...proposal, rootSuccessCriteria: ["  Include evidence for each role  ", "Include evidence for each role", "Keep the full search scope"] }
+    const registry = new ToolRegistry([tool])
+    expect(registry.validateArguments("agent.plan", proposal, "1")).toBe(true)
+    expect(registry.validateArguments("agent.plan", input, "1")).toBe(true)
+    expect(tool.description).toContain("complete original human objective as a separate mandatory root criterion")
+    expect(tool.description).toContain("untrusted acceptance requirements")
+
+    await tool.execute(context(), input)
+
+    expect(getReceived()?.rootSuccessCriteria).toEqual(["Include evidence for each role", "Keep the full search scope"])
+    expect(getReceived()?.proposal).toEqual(proposal)
+  })
+
+  it("rejects malformed or UTF-8 oversized root criteria before reaching the command port", async () => {
+    const { tool, commandPort } = setup()
+    const registry = new ToolRegistry([tool])
+    for (const list of [[], Array.from({ length: 5 }, () => "criterion")]) {
+      expect(registry.validateArguments("agent.plan", { ...proposal, rootSuccessCriteria: list }, "1")).not.toBe(true)
+    }
+    for (const item of ["  ", "x".repeat(513), "💼".repeat(129)]) {
+      const input = { ...proposal, rootSuccessCriteria: [item] }
+      expect(registry.validateArguments("agent.plan", input, "1")).toBe(true)
+      await expect(tool.execute(context(), input)).rejects.toMatchObject({ code: "task_graph_root_criteria_invalid" })
+    }
+    const exactUnicodeBoundary = { ...proposal, rootSuccessCriteria: ["💼".repeat(128)] }
+    await expect(tool.execute(context(), exactUnicodeBoundary)).resolves.toEqual(receipt)
+    expect(commandPort.appendAndSchedule).toHaveBeenCalledTimes(1)
+  })
+
   it("publishes only registered template IDs and their allowed catalog details", () => {
     const { tool } = setup({
       analyst: {
@@ -267,6 +298,7 @@ describe("agent.plan tool executor", () => {
         parentLeaseOwner: "server-worker", parentAttemptCount: 1,
       },
     })
+    expect(getReceived()).not.toHaveProperty("rootSuccessCriteria")
     expect(Object.keys(proposal)).toEqual(["expectedRevision", "nodes"])
   })
 

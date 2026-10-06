@@ -6,9 +6,10 @@ import { transaction, type Queryable } from "./pg-store-persistence.js"
 import { lockTaskGraphScope, loadTaskGraph, currentTaskGraph } from "./task-graph-pg-state.js"
 import { createGraphTasks } from "./task-graph-pg-create.js"
 import { writePlanReceipt } from "./task-graph-pg-events.js"
-import { taskGraphFingerprint, taskGraphItemId, taskGraphProposalKey } from "./task-graph-snapshot.js"
+import { parseTaskGraphSnapshot, taskGraphFingerprint, taskGraphItemId, taskGraphProposalKey } from "./task-graph-snapshot.js"
 import { normalizeNativeCommand } from "./task-graph-native-request.js"
 import { appendNativeGraphCommand, findNativeCommandReplay } from "./task-graph-native-pg.js"
+import { normalizeRootPlanCriteria, parsePersistedRootCriteria, resolveRootPlanCriteria } from "./root-plan-criteria.js"
 
 const MAX_REVISION = 2_147_483_646
 type Row = Record<string, unknown>
@@ -16,14 +17,20 @@ type Row = Record<string, unknown>
 export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCommandPort {
   return {
     async appendAndSchedule(input: TaskGraphScheduleInput): Promise<TaskGraphScheduleReceipt> {
+      const rootSuccessCriteria = normalizeRootPlanCriteria(input.rootSuccessCriteria)
+      if (rootSuccessCriteria === null) throw new TaskGraphCommandError("root_success_criteria_invalid", "Additional root criteria are invalid")
       return transaction(pool, async client => {
         await client.query(`SELECT set_config('app.user_id', $1, true)`, [input.scope.userId])
         const parent = await lockTaskGraphScope(client, input.scope, true)
         const loaded = await loadTaskGraph(client, input.scope)
-        const current = loaded.state
+        const current = loaded.snapshot?.rootSuccessCriteria && loaded.state
+          ? { ...loaded.state, rootSuccessCriteria: loaded.snapshot.rootSuccessCriteria }
+          : loaded.state
         const revision = current?.revision ?? 0
         const key = taskGraphProposalKey(input.scope.parentTaskId, input.proposal.expectedRevision)
-        const fingerprint = taskGraphFingerprint(input.proposal)
+        const fingerprint = rootSuccessCriteria === undefined
+          ? taskGraphFingerprint(input.proposal)
+          : taskGraphFingerprint({ proposal: input.proposal, rootSuccessCriteria })
         const replay = await findPlanReplay(client, input, key, fingerprint, taskGraphItemId(input.scope.parentTaskId))
         if (replay) return replay
         if (!loaded.item && await hasPersistedPlanReceipt(client, input.scope)) {
@@ -31,12 +38,20 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
         }
         if (input.proposal.expectedRevision !== revision) throw new TaskGraphCommandError("revision_mismatch", "TaskGraph revision is stale", revision)
         if (revision >= MAX_REVISION) throw new TaskGraphCommandError("revision_limit", "TaskGraph revision limit reached", revision)
+        let pinnedCriteria = loaded.snapshot?.rootSuccessCriteria
+        if (rootSuccessCriteria !== undefined || pinnedCriteria !== undefined) {
+          const resolved = resolveRootPlanCriteria(parent.goal, pinnedCriteria ?? [], rootSuccessCriteria ?? pinnedCriteria!.slice(1))
+          if (resolved.status === "invalid") throw new TaskGraphCommandError("root_success_criteria_invalid", "The owned root objective or criteria are invalid")
+          if (resolved.status === "conflict") throw new TaskGraphCommandError("root_success_criteria_conflict", "The root acceptance criteria are already pinned")
+          pinnedCriteria = resolved.criteria
+        }
         const created = await createGraphTasks(client, input, parent, current ?? { revision: 0, nodes: [], appliedEvents: [] }, new Map(loaded.snapshot?.nodes.map(node => [node.key, node.taskId]) ?? []))
+        const snapshot = pinnedCriteria ? parseTaskGraphSnapshot({ ...created.snapshot, rootSuccessCriteria: pinnedCriteria }) : created.snapshot
         const receipt: TaskGraphScheduleReceipt = {
           status: "accepted", revision: created.state.revision, nodes: created.created, readyTaskIds: created.readyTaskIds,
         }
         await writePlanReceipt(client, {
-          scope: input.scope, state: created.state, snapshot: created.snapshot, expectedRevision: revision,
+          scope: input.scope, state: created.state, snapshot, expectedRevision: revision,
           now: new Date(), idempotencyKey: key, fingerprint, receipt,
         })
         return receipt
@@ -57,7 +72,10 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
           throw new TaskGraphCommandError("task_graph_state_missing", "Persisted TaskGraph state is unavailable")
         }
         currentTaskGraph(loaded)
-        return appendNativeGraphCommand(client, input, command, parent, loaded)
+        const preservingLoadedPin = loaded.snapshot?.rootSuccessCriteria && loaded.state
+          ? { ...loaded, state: { ...loaded.state, rootSuccessCriteria: loaded.snapshot.rootSuccessCriteria } }
+          : loaded
+        return appendNativeGraphCommand(client, input, command, parent, preservingLoadedPin)
       })
     },
     async readCurrent(scope: TaskGraphReadScope): Promise<TaskGraphCurrentState> {
@@ -69,12 +87,20 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
 
 async function readCurrentWithClient(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope): Promise<TaskGraphCurrentState> {
   await client.query(`SELECT set_config('app.user_id', $1, true)`, [scope.userId])
-  await lockTaskGraphScope(client, scope)
+  const parent = await lockTaskGraphScope(client, scope)
   const loaded = await loadTaskGraph(client, scope, false)
   if (!loaded.item && await hasPersistedPlanReceipt(client, scope)) {
     throw new TaskGraphCommandError("task_graph_state_missing", "Persisted TaskGraph state is unavailable")
   }
-  return currentTaskGraph(loaded)
+  const state = currentTaskGraph(loaded)
+  const criteria = parsePersistedRootCriteria(parent.successCriteria)
+  if (!criteria) throw new TaskGraphCommandError("root_success_criteria_invalid", "Persisted root criteria are invalid")
+  const pinned = loaded.snapshot?.rootSuccessCriteria
+  if (pinned && (typeof parent.goal !== "string" || parent.goal.trim() !== pinned[0])) {
+    throw new TaskGraphCommandError("root_success_criteria_invalid", "Persisted root criteria do not match the owned objective")
+  }
+  if (pinned) return { ...state, rootSuccessCriteria: pinned }
+  return criteria.length ? { ...state, rootSuccessCriteria: criteria } : state
 }
 
 async function hasPersistedPlanReceipt(client: Queryable, scope: TaskGraphReadScope): Promise<boolean> {

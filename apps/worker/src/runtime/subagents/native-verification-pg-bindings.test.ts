@@ -2,14 +2,15 @@ import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import type { TaskGraphReadScope } from "./task-graph-command-port.js"
 import { loadNativeVerificationOwnedState } from "./native-verification-pg-bindings.js"
+import { TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 
 const scope: TaskGraphReadScope = {
   userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
   turnLeaseOwner: "turn-lease", turnLeaseVersion: 1, parentLeaseOwner: "parent-lease", parentAttemptCount: 1,
 }
 
-function client(input: unknown, successCriteria: unknown = []): Pick<pg.PoolClient, "query"> {
-  const query = vi.fn(async (..._args: unknown[]) => ({ rows: [{ goal: "Original objective", successCriteria, input }] }))
+function client(input: unknown, successCriteria: unknown = [], goal = "Original objective"): Pick<pg.PoolClient, "query"> {
+  const query = vi.fn(async (..._args: unknown[]) => ({ rows: [{ goal, successCriteria, input }] }))
   return { query } as unknown as Pick<pg.PoolClient, "query">
 }
 
@@ -32,6 +33,37 @@ describe("native verification owned goal and criteria binding", () => {
     expect(loaded.criteria).toEqual(["Original objective"])
     expect(loaded.criteriaValid).toBe(true)
     expect(loaded.turnGoalConflict).toBe(false)
+  })
+
+  it("binds the whole canonical goal with human criteria and the checklist pinned in its owned snapshot", async () => {
+    const goal = "Find software roles across every requested European market and prepare a shortlist"
+    const checklist = "Include source-backed evidence for each shortlisted role"
+    const loaded = await loadNativeVerificationOwnedState(client({ input: {
+      goal, content: goal, successCriteria: ["Retain the user's explicit salary range"],
+    } }, [], goal), scope, { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [], rootSuccessCriteria: [goal, checklist] })
+
+    expect(loaded.goal).toBe(goal)
+    expect(loaded.criteria).toEqual([goal, "Retain the user's explicit salary range", checklist])
+    expect(loaded.criteriaValid).toBe(true)
+    expect(loaded.turnGoalConflict).toBe(false)
+  })
+
+  it("fails closed rather than falling back when a pinned snapshot omits or changes the canonical goal", async () => {
+    const goal = "Preserve the entire human objective"
+    for (const rootSuccessCriteria of [["Only the first subgoal"], ["Changed goal", "Additional check"]]) {
+      const loaded = await loadNativeVerificationOwnedState(client({ input: { goal, content: goal } }), scope, {
+        schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [], rootSuccessCriteria,
+      })
+      expect(loaded.goal).toBe(goal)
+      expect(loaded.criteria).toEqual([])
+      expect(loaded.criteriaValid).toBe(false)
+    }
+  })
+
+  it("rejects structurally invalid pinned snapshot criteria", async () => {
+    await expect(loadNativeVerificationOwnedState(client({ input: { goal: "Original objective" } }), scope, {
+      schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [], rootSuccessCriteria: ["Original objective", "Original objective"],
+    })).rejects.toThrow("task_graph_snapshot_root_criteria_invalid")
   })
 
   it("still rejects an explicit goal beyond the frozen native objective bound", async () => {

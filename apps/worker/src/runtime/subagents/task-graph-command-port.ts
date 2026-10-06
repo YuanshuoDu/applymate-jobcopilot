@@ -143,11 +143,7 @@ export type TaskGraphScheduleReceipt = Readonly<{
   readyTaskIds: readonly string[]
 }>
 
-export type TaskGraphScheduleInput = Readonly<{
-  scope: TaskGraphExecutionScope
-  proposal: TaskGraphProposal
-  templates: Readonly<Record<string, TaskGraphTaskTemplate>>
-}>
+export type TaskGraphScheduleInput = Readonly<{ scope: TaskGraphExecutionScope; proposal: TaskGraphProposal; templates: Readonly<Record<string, TaskGraphTaskTemplate>>; rootSuccessCriteria?: readonly string[] }>
 
 /** Ownership fence for reads; it is never populated from model-controlled input. */
 export type TaskGraphReadScope = Omit<TaskGraphExecutionScope, "stepId">
@@ -230,10 +226,7 @@ export type TaskGraphCurrentNode = Readonly<{
   nativeResult?: TaskGraphNativeResultReceipt
   failureReason: string | null
 }>
-export type TaskGraphCurrentState = Readonly<{
-  revision: number
-  nodes: readonly TaskGraphCurrentNode[]
-}>
+export type TaskGraphCurrentState = Readonly<{ revision: number; nodes: readonly TaskGraphCurrentNode[]; rootSuccessCriteria?: readonly string[] }>
 export class TaskGraphCommandError extends Error {
   constructor(readonly code: string, message: string, readonly currentRevision?: number) {
     super(message)

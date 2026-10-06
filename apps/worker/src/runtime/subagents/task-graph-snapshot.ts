@@ -3,6 +3,7 @@ import { isValidTaskGraphRepairRelation, TASK_GRAPH_LIMITS, type TaskGraphEvent,
 import { taskGraphVerificationRole, validateTaskGraphVerificationContract, type TaskGraphVerificationContract } from "../planning/task-graph-verification.js"
 import type { SubagentTaskStatus } from "./types.js"
 import { parseTaskGraphNativeDelegation, TASK_GRAPH_NATIVE_TEMPLATE_ID } from "./task-graph-native-state.js"
+import { parsePinnedRootCriteria } from "./root-plan-criteria.js"
 
 export const TASK_GRAPH_ITEM_TYPE = "task_graph"
 export const TASK_GRAPH_SNAPSHOT_VERSION = "agent-harness.v2.task-graph"
@@ -17,6 +18,7 @@ export type StoredTaskGraphNode = TaskGraphNodeProposal & Readonly<{
 export type TaskGraphSnapshot = Readonly<{
   schemaVersion: typeof TASK_GRAPH_SNAPSHOT_VERSION
   nodes: readonly StoredTaskGraphNode[]
+  rootSuccessCriteria?: readonly string[]
 }>
 
 const MAX_NODES = TASK_GRAPH_LIMITS.maxNodes
@@ -78,8 +80,11 @@ function parsedRepairOf(value: unknown): TaskGraphRepairOf | undefined {
 
 export function parseTaskGraphSnapshot(value: unknown): TaskGraphSnapshot {
   const row = object(value)
-  if (!row || !exactKeys(row, "nodes,schemaVersion") || row.schemaVersion !== TASK_GRAPH_SNAPSHOT_VERSION
+  const pinnedShape = row !== null && exactKeys(row, "nodes,rootSuccessCriteria,schemaVersion")
+  if (!row || (!pinnedShape && !exactKeys(row, "nodes,schemaVersion")) || row.schemaVersion !== TASK_GRAPH_SNAPSHOT_VERSION
     || !Array.isArray(row.nodes) || row.nodes.length > MAX_NODES) throw new Error("task_graph_snapshot_invalid")
+  const rootSuccessCriteria = pinnedShape ? parsePinnedRootCriteria(row.rootSuccessCriteria) : undefined
+  if (pinnedShape && (!rootSuccessCriteria?.length)) throw new Error("task_graph_snapshot_root_criteria_invalid")
   const keys = new Set<string>()
   const ids = new Set<string>()
   const nodes: StoredTaskGraphNode[] = []
@@ -156,12 +161,12 @@ export function parseTaskGraphSnapshot(value: unknown): TaskGraphSnapshot {
     }
   }
   if (visited !== nodes.length) throw new Error("task_graph_snapshot_cycle_invalid")
-  const snapshot: TaskGraphSnapshot = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes }
+  const snapshot: TaskGraphSnapshot = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes, ...(rootSuccessCriteria ? { rootSuccessCriteria } : {}) }
   assertTaskGraphSnapshotSize(snapshot)
   return snapshot
 }
 
-export function taskGraphSnapshot(state: TaskGraphState, taskIds: ReadonlyMap<string, string>): TaskGraphSnapshot {
+export function taskGraphSnapshot(state: TaskGraphState & Readonly<{ rootSuccessCriteria?: readonly string[] }>, taskIds: ReadonlyMap<string, string>, rootSuccessCriteria = state.rootSuccessCriteria): TaskGraphSnapshot {
   const snapshot = {
     schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
     nodes: state.nodes.map(node => {
@@ -175,7 +180,7 @@ export function taskGraphSnapshot(state: TaskGraphState, taskIds: ReadonlyMap<st
       }
       const verificationDisposition = existingDisposition ?? (node.verification ? "typed" : role ? "legacy_unverified" : "specialized")
       return { ...stored, taskId, verificationDisposition }
-    }),
+    }), ...(rootSuccessCriteria ? { rootSuccessCriteria } : {}),
   }
   return parseTaskGraphSnapshot(snapshot)
 }

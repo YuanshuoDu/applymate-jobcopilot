@@ -9,6 +9,7 @@ import type {
   TaskGraphScheduleReceipt,
   TaskGraphTaskTemplate,
 } from "../subagents/task-graph-command-port.js"
+import { normalizeRootPlanCriteria } from "../subagents/root-plan-criteria.js"
 
 import { ToolExecutionError, type RuntimeToolDefinition, type ToolExecutionContext } from "./types.js"
 
@@ -77,12 +78,13 @@ function proposalInputSchema<T extends TSchema>(templateIdSchema: T, templates?:
   return Type.Object({
     expectedRevision: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
     nodes: Type.Array(nodeSchema, { minItems: 1, maxItems: TASK_GRAPH_LIMITS.maxNodes }),
+    rootSuccessCriteria: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 4 })),
   }, { additionalProperties: false })
 }
 
 export const TaskGraphProposalInputSchema = proposalInputSchema(Type.String({ minLength: 1, maxLength: 128 }))
 
-export type TaskGraphProposalInput = TaskGraphProposal
+export type TaskGraphProposalInput = TaskGraphProposal & Readonly<{ rootSuccessCriteria?: readonly string[] }>
 
 export type PlanningExecutorOptions = Readonly<{
   commandPort: TaskGraphCommandPort
@@ -172,6 +174,11 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
       throw new ToolExecutionError(code, "The Turn needs two remaining steps to supervise a TaskGraph plan", { code, requiredSteps: MIN_CONTINUATION_STEPS })
     }
     const input = value as TaskGraphProposalInput
+    const rootSuccessCriteria = normalizeRootPlanCriteria(input.rootSuccessCriteria)
+    if (rootSuccessCriteria === null) {
+      const code = "task_graph_root_criteria_invalid"
+      throw new ToolExecutionError(code, "Additional root acceptance criteria must be one to four bounded, non-empty statements", { code })
+    }
     const encoded = JSON.stringify(input)
     if (!encoded || Buffer.byteLength(encoded, "utf8") > MAX_PROPOSAL_BYTES) {
       throw new ToolExecutionError("task_graph_proposal_too_large", "TaskGraph proposal exceeds the bounded request size", { code: "task_graph_proposal_too_large", maxBytes: MAX_PROPOSAL_BYTES })
@@ -192,6 +199,7 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
             ...(node.repairOf ? { repairOf: { ...node.repairOf, criterionIds: [...node.repairOf.criterionIds] } } : {}),
           })),
         },
+        ...(rootSuccessCriteria ? { rootSuccessCriteria } : {}),
         templates: options.templates,
       })
       return receipt
@@ -204,7 +212,7 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
     schemaVersion,
     name: "agent.plan",
     version: "1",
-    description: `For non-trivial goals, call agent.plan before executing child work. Scout and Analyst nodes must include verification {schemaVersion:"${TASK_GRAPH_VERIFICATION_SCHEMA_VERSION}",role,criteria:[{id,check}]}; IDs are stable lowercase identifiers. Allowed checks: candidate_count_gte, finding_count_gte, evidence_count_gte, all_candidates_have_evidence, all_findings_have_evidence, reported_score_gte. Use only checks allowed for that role. A repair uses repairOf={graphRootTaskId,nodeKey,taskId,criterionIds} for a prior typed same-template node, repeats exactly those criteria and checks, and must not add the target to dependsOn; this relation does not pass the target or alter its verdict. successCriteria prose is explanatory and never proof. reported_score_gte checks an Analyst-reported number, not its correctness. Writer and Reviewer nodes use their specialized gates and omit verification and repairOf. Wait for children, inspect their evidence, then replan or complete the goal.\nRegistered templates:\n${templateCatalog}`,
+    description: `For non-trivial goals, call agent.plan before executing child work. Optional rootSuccessCriteria adds up to four bounded, untrusted acceptance requirements; the server always keeps the complete original human objective as a separate mandatory root criterion. Omitting this field preserves current plan behavior. This context is explanatory only and never proof, permission, or completion authority. Scout and Analyst nodes must include verification {schemaVersion:"${TASK_GRAPH_VERIFICATION_SCHEMA_VERSION}",role,criteria:[{id,check}]}; IDs are stable lowercase identifiers. Allowed checks: candidate_count_gte, finding_count_gte, evidence_count_gte, all_candidates_have_evidence, all_findings_have_evidence, reported_score_gte. Use only checks allowed for that role. A repair uses repairOf={graphRootTaskId,nodeKey,taskId,criterionIds} for a prior typed same-template node, repeats exactly those criteria and checks, and must not add the target to dependsOn; this relation does not pass the target or alter its verdict. successCriteria prose is explanatory and never proof. reported_score_gte checks an Analyst-reported number, not its correctness. Writer and Reviewer nodes use their specialized gates and omit verification and repairOf. Wait for children, inspect their evidence, then replan or complete the goal.\nRegistered templates:\n${templateCatalog}`,
     capabilities: ["coordination"],
     inputSchema: proposalInputSchema(templateIdSchema, templates),
     outputSchema: ReceiptSchema,
