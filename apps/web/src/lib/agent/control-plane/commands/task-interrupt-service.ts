@@ -4,6 +4,7 @@ import { Prisma, type PrismaClient } from "@prisma/client"
 import { appendAgentEventWithOutboxInTransaction } from "../../session/fact-store"
 import type { CommandTransaction } from "./transaction"
 import {
+  TASK_INTERRUPT_OUTBOX_TOPIC,
   enqueueTaskInterruptIntent,
   taskInterruptAcceptedEventKey,
   taskInterruptOutboxKey,
@@ -118,6 +119,43 @@ function replayResult(value: unknown, taskId: string): { intentId: string; turnI
     : null
 }
 
+async function pendingResult(
+  tx: CommandTransaction,
+  command: TaskInterruptCommand,
+  turnId: string,
+): Promise<{ intentId: string; taskId: string; turnId: string; disposition: "duplicate"; sequence: string } | null> {
+  const pending = await tx.agentOutbox.findFirst({
+    where: {
+      aggregateId: command.sessionId,
+      topic: TASK_INTERRUPT_OUTBOX_TOPIC,
+      publishedAt: null,
+      payload: { path: ["taskId"], equals: command.taskId },
+    },
+    orderBy: { createdAt: "asc" },
+    select: { aggregateId: true, payload: true },
+  })
+  if (!pending) return null
+
+  const saved = replayResult(pending.payload, command.taskId)
+  const payload = object(pending.payload)
+  if (pending.aggregateId !== command.sessionId || payload?.sessionId !== command.sessionId || !saved || saved.turnId !== turnId) {
+    throw new TaskInterruptError("task_interrupt_replay_unavailable", 409, "The original interrupt result is unavailable")
+  }
+  const event = await tx.agentEvent.findFirst({
+    where: {
+      sessionId: command.sessionId,
+      taskId: command.taskId,
+      turnId,
+      type: "task.interrupt.accepted",
+      actor: "user",
+      payload: { path: ["intentId"], equals: saved.intentId },
+    },
+    select: { sequence: true },
+  })
+  if (!event) throw new TaskInterruptError("task_interrupt_replay_unavailable", 409, "The original interrupt result is unavailable")
+  return { intentId: saved.intentId, taskId: command.taskId, turnId, disposition: "duplicate", sequence: String(event.sequence) }
+}
+
 export class TaskInterruptService {
   constructor(private readonly db: PrismaClient) {}
 
@@ -148,6 +186,9 @@ export class TaskInterruptService {
       if (sessionStatus === "aborted" || sessionStatus === "archived") throw missingOwnedSession()
 
       const { turnId } = await resolveTaskLineage(tx, command)
+      const pending = await pendingResult(tx, command, turnId)
+      if (pending) return pending
+
       const intentId = randomUUID()
       const event = await appendAgentEventWithOutboxInTransaction(tx, {
         sessionId: command.sessionId, turnId, taskId: command.taskId, itemId: null,
