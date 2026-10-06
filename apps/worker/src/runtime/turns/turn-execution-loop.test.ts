@@ -8,7 +8,7 @@ import type { InputClaimStore, InputClaimTransaction, StepCheckpoint, StoredAgen
 import { mergeTaskGraphCurrentObservation } from "../canonical-turn-task-graph-context.js"
 import { runTurnExecutionLoop } from "./turn-execution-loop.js"
 import type { TurnEngineEvent, TurnEngineItem, TurnEngineStore, TurnEngineToolResult } from "./turn-engine-types.js"
-import type { TurnExecutionIdentity, TurnExecutionOptions, TurnExecutionStore } from "./turn-execution-types.js"
+import { NATIVE_SEMANTIC_NO_PROGRESS, RESET_NATIVE_SEMANTIC_PROGRESS, type TurnExecutionIdentity, type TurnExecutionOptions, type TurnExecutionStore } from "./turn-execution-types.js"
 import { steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "../context/steering-marker.js"
 import { COGNITIVE_AGENDA_EVENT_TYPE } from "./cognitive-agenda-receipt.js"
 import { BudgetExceededError } from "../budget.js"
@@ -733,6 +733,81 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.stepStatuses).toEqual(["completed", "completed", "completed"])
   })
 
+  it("finalizes the third unchanged semantic rejection before the fixed no-progress failure", async () => {
+    const candidate = "unchanged candidate"
+    let rejects = 0
+    const gate: NonNullable<TurnExecutionOptions["completionGate"]> = async () => {
+      rejects += 1
+      return { ok: false, blocker: "task_graph_verification_unverified", feedback: "criterion=current-evidence status=failed reason=evidence_missing",
+        ...(rejects === 3 ? { [NATIVE_SEMANTIC_NO_PROGRESS]: true as const } : {}) }
+    }
+    const root = fixture(identity("turn", "root-1"), undefined, [], gate)
+    root.options = { ...root.options, snapshot: { ...root.options.snapshot, businessRefs: [{ id: "owned-source", kind: "job", ownerId: "user-1" }] }, model: {
+      ...root.options.model,
+      async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+        root.requests.push(request)
+        yield { type: "text_delta", text: candidate }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    } }
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "failed", errorCode: "no_progress", stepCount: 3 })
+    expect(root.requests).toHaveLength(3)
+    expect(root.stepStatuses).toEqual(["completed", "completed", "completed"])
+    expect(new Set(root.events.filter(event => event.type === "step.completed").map(event => event.id)).size).toBe(3)
+    expect(root.events.some(event => event.type === "turn.completed")).toBe(false)
+    const diagnostic = root.events.find(event => event.type === "turn.no_progress")?.payload
+    expect(diagnostic).toMatchObject({ reasonCode: "repeated_signature", signature: "native_semantic_rejection", stateFingerprint: "root_candidate" })
+    expect(JSON.stringify(diagnostic)).not.toContain(candidate)
+    expect(JSON.stringify(root.finalResponses)).not.toContain(candidate)
+  })
+
+  it("keeps progress across a persistent active marker and resets once for a newly claimed input", async () => {
+    let rejects = 0, resets = 0, builds = 0
+    const completionGate: NonNullable<TurnExecutionOptions["completionGate"]> = async () => {
+      rejects += 1
+      return { ok: false, blocker: "task_graph_verification_unverified", feedback: "criterion=current status=failed reason=evidence_missing",
+        ...(rejects === 3 ? { [NATIVE_SEMANTIC_NO_PROGRESS]: true as const } : {}) }
+    }
+    completionGate[RESET_NATIVE_SEMANTIC_PROGRESS] = () => { resets += 1; rejects = 0 }
+    const root = fixture(identity("turn", "root-1"), undefined, [], completionGate)
+    const build = root.options.contextBuilder.build
+    root.options = {
+      ...root.options,
+      snapshot: { ...root.options.snapshot, businessRefs: [{ id: "owned-source", kind: "job", ownerId: "user-1" }] },
+      resume: { nextOrdinal: 0, stepCount: 0, toolCallCount: 0, inputThroughSequence: 0n, consumedInputIds: ["marker-old"], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
+      contextBuilder: { build: async request => {
+        const context = await build(request)
+        builds += 1
+        const hasNewInput = builds >= 3
+        return {
+          ...context,
+          consumedInputIds: hasNewInput ? ["marker-old", "marker-new"] : ["marker-old"],
+          steeringMarkerControl: {
+            activeInputIds: hasNewInput ? ["marker-old", "marker-new"] : ["marker-old"],
+            newlyObservedInputIds: builds === 3 ? ["marker-new"] : [],
+            newlyObservedMarkers: [],
+          },
+        }
+      } },
+      model: {
+        ...root.options.model,
+        async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+          root.requests.push(request)
+          yield { type: "text_delta", text: "unchanged candidate" }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      },
+    }
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "failed", errorCode: "no_progress", stepCount: 5 })
+    expect(root.requests).toHaveLength(5)
+    expect(root.stepStatuses).toEqual(["completed", "completed", "completed", "completed", "completed"])
+    expect(resets).toBe(1)
+    expect(root.events.find(event => event.type === "turn.no_progress")?.payload).toMatchObject({ reasonCode: "repeated_signature" })
+  })
+
   it("does not turn repeated proof denials into success after the root step budget is exhausted", async () => {
     const gate = vi.fn(async () => ({ ok: false as const, blocker: "task_graph_verification_unverified", feedback: "scout:candidate-present" }))
     const root = fixture(identity("turn", "root-1"), undefined, [], gate)
@@ -766,8 +841,12 @@ describe("owner-agnostic turn execution loop", () => {
     const contextBuilder = new StepContextBuilder(inputStore)
     let modelCalls = 0
     const baseModel = root.options.model
+    const ordering: string[] = []
+    const completionGate: NonNullable<TurnExecutionOptions["completionGate"]> = async () => ({ ok: true })
+    completionGate[RESET_NATIVE_SEMANTIC_PROGRESS] = () => { ordering.push("reset") }
     root.options = {
       ...root.options,
+      completionGate,
       store: {
         ...turnStore,
         startStep: async input => {
@@ -787,6 +866,7 @@ describe("owner-agnostic turn execution loop", () => {
         async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
           root.requests.push(request)
           modelCalls += 1
+          ordering.push(`model-${modelCalls}`)
           if (modelCalls === 1) {
             yield { type: "tool_call_completed", callId: "call:root-1", name: "jobs.search", arguments: { location: "Dublin" } }
             yield { type: "completed", finishReason: "tool_calls" }
@@ -825,6 +905,7 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.events.some(event => event.type === "turn.failed")).toBe(false)
     expect(root.notifications.filter(type => type === "turn.completed")).toHaveLength(1)
     expect(root.stepStatuses).toEqual(["completed", "completed", "completed"])
+    expect(ordering).toEqual(["model-1", "model-2", "reset", "model-3"])
   })
 
   it("fails closed when the completion gate throws", async () => {

@@ -5,8 +5,9 @@ import { digestNativeVerificationValue } from "./subagents/native-verification-c
 import type { NativeVerificationEnsureResult, NativeVerificationPort, NativeVerificationRootGoalWitness } from "./subagents/native-verification-port.js"
 import type { TaskGraphExecutionScope, TaskGraphReadScope } from "./subagents/task-graph-command-port.js"
 import type { DurableWaitPort } from "./tools/coordination-types.js"
+import { NATIVE_SEMANTIC_NO_PROGRESS, RESET_NATIVE_SEMANTIC_PROGRESS } from "./turns/turn-execution-types.js"
 import type { TurnEngineTerminalGuard } from "./turns/turn-engine-terminal-commit.js"
-import { createCanonicalNativeVerificationRuntime, createCanonicalTurnTerminalGuard, type NativeVerificationRuntime } from "./canonical-turn-native-verification-runtime.js"
+import { createCanonicalNativeVerificationRuntime, createCanonicalRootCompletionGate, createCanonicalTurnTerminalGuard, type NativeVerificationRuntime } from "./canonical-turn-native-verification-runtime.js"
 
 const candidate = "A current root answer with verified evidence."
 const scope: TaskGraphExecutionScope = {
@@ -37,6 +38,12 @@ function runtimeFactory(readTerminalProof: NativeVerificationRuntime["readTermin
     readRecoverableGoal: vi.fn(async () => null),
   }
   return { port, factory: vi.fn(() => ({ port, readTerminalProof })) }
+}
+function rootSemanticFailure(controlTaskId = "private-control-id"): NativeVerificationEnsureResult {
+  return { status: "failed", controlTaskIds: [controlTaskId], pendingControlTaskIds: [], pendingTaskIds: [], feedback: [{
+    controlTaskId, targetTaskId: "root-1", disposition: "failed",
+    criteria: [{ criterionId: "current-evidence", disposition: "failed", reasonCode: "evidence_missing", evidenceReferenceIds: [] }],
+  }] }
 }
 
 describe("canonical native verification runtime composition", () => {
@@ -69,6 +76,59 @@ describe("canonical native verification runtime composition", () => {
     expect(query).toHaveBeenCalledWith(expect.stringContaining('"targetTurnId" = $3'), ["session-1", "user-1", "turn-1"])
     expect(query.mock.invocationCallOrder[0]).toBeLessThan(readTerminalProof.mock.invocationCallOrder[0]!)
     expect(readTerminalProof).toHaveBeenCalledWith(client, { scope: readScope, candidateText: candidate, witness })
+  })
+
+  it("wires the private progress reset hook only onto the root completion gate", () => {
+    const reset = vi.fn()
+    const gate = createCanonicalRootCompletionGate({
+      enabled: true, nativeVerification: { checkCompletion: async () => null, accepted: () => false, resetSemanticProgress: reset },
+      onCandidateStart: vi.fn(), checkChildren: () => undefined, selectedJobMode: false,
+    })
+    expect(gate).toBeDefined()
+    gate?.[RESET_NATIVE_SEMANTIC_PROGRESS]?.()
+    expect(reset).toHaveBeenCalledOnce()
+  })
+
+  it("signals the third distinct strict root rejection while keeping its key private", async () => {
+    const port: NativeVerificationPort = {
+      ensureChildren: vi.fn(async () => ({ status: "passed" as const, controlTaskIds: [], pendingControlTaskIds: [], pendingTaskIds: [], feedback: [] })),
+      ensureRootGoal: vi.fn(async () => rootSemanticFailure()), readRecoverableGoal: vi.fn(async () => null),
+    }
+    const factory = vi.fn(() => ({ port, readTerminalProof: vi.fn(async () => true) }))
+    const runtime = createCanonicalNativeVerificationRuntime({ pool: {} as pg.Pool, factory, coordination: coordination(), durableWaitPort: waitPort, enabled: true })
+    const first = await runtime.checkCompletion("step-1", candidate)
+    const replay = await runtime.checkCompletion("step-1", candidate)
+    const second = await runtime.checkCompletion("step-2", candidate)
+    const third = await runtime.checkCompletion("step-3", candidate)
+    expect(first && !first.ok ? first[NATIVE_SEMANTIC_NO_PROGRESS] : undefined).toBeUndefined()
+    expect(replay && !replay.ok ? replay[NATIVE_SEMANTIC_NO_PROGRESS] : undefined).toBeUndefined()
+    expect(second && !second.ok ? second[NATIVE_SEMANTIC_NO_PROGRESS] : undefined).toBeUndefined()
+    if (!third || third.ok) throw new Error("expected a rejected root verification decision")
+    expect(third[NATIVE_SEMANTIC_NO_PROGRESS]).toBe(true)
+    expect(third.feedback).toContain("criterion=current-evidence status=failed reason=evidence_missing")
+    expect(JSON.stringify(third)).not.toContain("private-control-id")
+    expect(JSON.stringify(third)).not.toContain(digestNativeVerificationValue(candidate))
+  })
+
+  it("resets after a nonsemantic root result and when the owned binding changes", async () => {
+    const failures = [rootSemanticFailure("control-a"), rootSemanticFailure("control-a"),
+      { status: "uncertain" as const, controlTaskIds: ["control-a"], pendingControlTaskIds: [], pendingTaskIds: [], feedback: [] },
+      rootSemanticFailure("control-a"), rootSemanticFailure("control-a"), rootSemanticFailure("control-a"),
+      rootSemanticFailure("control-b"), rootSemanticFailure("control-b"), rootSemanticFailure("control-b")]
+    let index = 0
+    const port: NativeVerificationPort = {
+      ensureChildren: vi.fn(async () => ({ status: "passed" as const, controlTaskIds: [], pendingControlTaskIds: [], pendingTaskIds: [], feedback: [] })),
+      ensureRootGoal: vi.fn(async () => failures[index++] ?? rootSemanticFailure()), readRecoverableGoal: vi.fn(async () => null),
+    }
+    const runtime = createCanonicalNativeVerificationRuntime({ pool: {} as pg.Pool, factory: () => ({ port, readTerminalProof: vi.fn(async () => true) }),
+      coordination: coordination(), durableWaitPort: waitPort, enabled: true })
+    const results = []
+    for (let step = 1; step <= 9; step += 1) results.push(await runtime.checkCompletion(`step-${step}`, candidate))
+    expect(results.slice(0, 5).every(result => !result || result.ok || result[NATIVE_SEMANTIC_NO_PROGRESS] === undefined)).toBe(true)
+    expect(results[5] && !results[5].ok ? results[5][NATIVE_SEMANTIC_NO_PROGRESS] : undefined).toBe(true)
+    expect(results[6] && !results[6].ok ? results[6][NATIVE_SEMANTIC_NO_PROGRESS] : undefined).toBeUndefined()
+    expect(results[7] && !results[7].ok ? results[7][NATIVE_SEMANTIC_NO_PROGRESS] : undefined).toBeUndefined()
+    expect(results[8] && !results[8].ok ? results[8][NATIVE_SEMANTIC_NO_PROGRESS] : undefined).toBe(true)
   })
 
   it("denies a changed terminal candidate before querying native proof", async () => {

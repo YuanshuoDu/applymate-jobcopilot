@@ -1,6 +1,6 @@
 import type { TurnUsage } from "../budget.js"
 import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
-import { executionId, type TurnExecutionOptions } from "./turn-execution-types.js"
+import { NATIVE_SEMANTIC_NO_PROGRESS, RESET_NATIVE_SEMANTIC_PROGRESS, executionId, type TurnExecutionOptions } from "./turn-execution-types.js"
 import { assertCompletionAllowed, taskGraphGateRecovery } from "./turn-execution-completion-gate.js"
 import { canEmitTurnCompleted, canPersistFinalResponse, totalTurnUsage, updateExecutionStep } from "./turn-engine-helpers.js"
 import { finalizeTurn, serializeFinalResponse } from "../finalizer.js"
@@ -9,6 +9,7 @@ import { TurnEngineError, toRepositoryJson, type AtomicTurnCompletionResult, typ
 import type { ModelStepResult } from "./turn-engine-model.js"
 import { publishFinalResponse } from "./turn-execution-events.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
+import { nativeSemanticNoProgressError } from "../native-semantic-progress.js"
 
 export type FinalCandidateOutcome =
   | Readonly<{ kind: "replan"; feedback: string }>
@@ -42,6 +43,7 @@ export async function completeTurnCandidate(input: Readonly<{
   const verification = verifyCandidateFinal({ goal: options.goal, candidate: { text: output.text, finishReason: output.finishReason },
     evidence: snapshotEvidence(snapshot), expectedEvidence: options.expectedEvidence, businessChecks: options.businessChecks })
   if (!verification.ok) {
+    options.completionGate?.[RESET_NATIVE_SEMANTIC_PROGRESS]?.()
     await writer.append("final.rejected", step.id, null, { code: verification.code, blocker: verification.blocker, feedback: verification.feedback, taskId: options.identity.taskId }, `final-rejected:${step.id}`)
     throw new TurnEngineError(verification.code, verification.blocker)
   }
@@ -56,6 +58,7 @@ export async function completeTurnCandidate(input: Readonly<{
   }
   if (gate && "feedback" in gate) {
     await finishStep(options, writer, step, output, now, input.onStepClosed)
+    if (gate[NATIVE_SEMANTIC_NO_PROGRESS] === true) throw nativeSemanticNoProgressError()
     return { kind: "replan", feedback: gate.feedback }
   }
   await finishStep(options, writer, step, output, now, input.onStepClosed)

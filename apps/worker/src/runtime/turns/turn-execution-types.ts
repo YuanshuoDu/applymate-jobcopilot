@@ -21,11 +21,14 @@ import type {
 import type { SteeringMarkerContext } from "../context/steering-marker-store.js"
 import type { SteeringMarkerPayload } from "../context/steering-marker.js"
 
+export const NATIVE_SEMANTIC_NO_PROGRESS: unique symbol = Symbol("native-semantic-no-progress")
+export const RESET_NATIVE_SEMANTIC_PROGRESS: unique symbol = Symbol("reset-native-semantic-progress")
+
 export type TurnEngineCompletionGateResult =
   | { readonly ok: true }
-  | { readonly ok: false; readonly blocker: string; readonly feedback: string; readonly waitId?: string }
+  | { readonly ok: false; readonly blocker: string; readonly feedback: string; readonly waitId?: string; readonly [NATIVE_SEMANTIC_NO_PROGRESS]?: true }
 
-export type TurnEngineCompletionGate = (input: {
+export type TurnEngineCompletionGate = ((input: {
   readonly identity: TurnExecutionIdentity
   readonly scope: TenantScope
   readonly rootTaskId: string
@@ -34,7 +37,9 @@ export type TurnEngineCompletionGate = (input: {
   readonly candidateText: string
   readonly signal: AbortSignal
   readonly now: Date
-}) => Promise<TurnEngineCompletionGateResult> | TurnEngineCompletionGateResult
+}) => Promise<TurnEngineCompletionGateResult> | TurnEngineCompletionGateResult) & {
+  [RESET_NATIVE_SEMANTIC_PROGRESS]?: () => void
+}
 
 export type TurnExecutionStepBudget = { readonly remainingTurnSteps?: number }
 

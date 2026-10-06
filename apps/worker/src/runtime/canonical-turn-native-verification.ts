@@ -3,7 +3,7 @@ import { digestNativeVerificationValue, type NativeVerificationDisposition, type
 import type { NativeVerificationEnsureResult, NativeVerificationFeedback, NativeVerificationPort, NativeVerificationRootGoalWitness } from "./subagents/native-verification-port.js"
 import type { TaskGraphExecutionScope } from "./subagents/task-graph-command-port.js"
 import type { DurableWaitResult } from "./tools/coordination-types.js"
-import type { TurnEngineCompletionGateResult } from "./turns/turn-execution-types.js"
+import { NATIVE_SEMANTIC_NO_PROGRESS, type TurnEngineCompletionGateResult } from "./turns/turn-execution-types.js"
 
 const HASH = /^[a-f0-9]{64}$/
 const REASONS: readonly NativeVerificationReasonCode[] = ["meets_criterion", "does_not_meet_criterion", "evidence_missing", "evidence_conflict", "ambiguous", "unsupported_claim"]
@@ -11,7 +11,7 @@ const DISPOSITIONS: readonly NativeVerificationDisposition[] = ["passed", "faile
 export type NativeVerificationDecision =
   | Readonly<{ kind: "passed"; witness: NativeVerificationRootGoalWitness }>
   | Readonly<{ kind: "pending"; waitId: string }>
-  | Readonly<{ kind: "blocked"; feedback: string }>
+  | Readonly<{ kind: "blocked"; feedback: string; semanticRejectionControlTaskId?: string }>
 export type NativeVerificationWaiter = (scope: TaskGraphExecutionScope, targetTaskIds: readonly string[]) => Promise<DurableWaitResult>
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -86,6 +86,18 @@ export function nativeVerificationFeedbackText(status: string, value: readonly N
   return output.slice(0, 512)
 }
 
+function matchingFailedRootControl(result: NativeVerificationEnsureResult, rootTaskId: string): string | undefined {
+  const matching = result.feedback.filter(report => report.targetTaskId === rootTaskId)
+  if (matching.length !== 1) return undefined
+  const report = matching[0]
+  return report.disposition === "failed" && result.controlTaskIds.includes(report.controlTaskId)
+    && report.criteria.some(item => item.disposition === "failed") ? report.controlTaskId : undefined
+}
+function semanticReplanFeedback(feedback: string): string {
+  const instruction = " Revise the candidate or obtain new current owned evidence before retrying."
+  return `${feedback.slice(0, 512 - instruction.length)}${instruction}`
+}
+
 /** Runs child proof before root-candidate proof and durably waits on producer-owned controls. */
 export async function verifyNativeRootCandidate(input: Readonly<{
   port: NativeVerificationPort
@@ -112,7 +124,12 @@ export async function verifyNativeRootCandidate(input: Readonly<{
       if (waited.status !== "ready") return { kind: "blocked", feedback: `Root-goal verification wait ended as ${waited.status}.` }
       continue
     }
-    if (goal.status !== "passed" || !goal.rootGoalWitness) return { kind: "blocked", feedback: nativeVerificationFeedbackText(goal.status, goal.feedback) }
+    if (goal.status !== "passed" || !goal.rootGoalWitness) {
+      const semanticRejectionControlTaskId = goal.status === "failed" ? matchingFailedRootControl(goal, input.scope.rootTaskId) : undefined
+      const feedback = nativeVerificationFeedbackText(goal.status, goal.feedback)
+      return { kind: "blocked", feedback: semanticRejectionControlTaskId ? semanticReplanFeedback(feedback) : feedback,
+        ...(semanticRejectionControlTaskId ? { semanticRejectionControlTaskId } : {}) }
+    }
     return { kind: "passed", witness: goal.rootGoalWitness }
   }
   return { kind: "blocked", feedback: "Independent native verification remained pending after immediate wake; resume through the durable wait." }
@@ -126,6 +143,7 @@ export async function nativeVerificationCompletionGate(input: Readonly<{
   hasNativeTasks(): Promise<boolean>
   checkReceipt(): Promise<TurnEngineCompletionGateResult | null>
   wait: NativeVerificationWaiter
+  observeRootSemanticRejection?(controlTaskId: string): boolean
   accept(witness: NativeVerificationRootGoalWitness, candidateText: string): void
 }>): Promise<TurnEngineCompletionGateResult | null> {
   const receipt = await input.checkReceipt()
@@ -134,7 +152,13 @@ export async function nativeVerificationCompletionGate(input: Readonly<{
   if (!input.port) return { ok: false, blocker: "task_graph_verification_unverified", feedback: "Native TaskGraph work has no independent verification runtime." }
   const scope = typeof input.scope === "function" ? input.scope() : input.scope
   const result = await verifyNativeRootCandidate({ port: input.port, scope, candidateText: input.candidateText, wait: input.wait })
-  if (result.kind === "blocked") return { ok: false, blocker: "task_graph_verification_unverified", feedback: result.feedback }
+  if (result.kind === "blocked") {
+    const stop = result.semanticRejectionControlTaskId
+      ? input.observeRootSemanticRejection?.(result.semanticRejectionControlTaskId) === true
+      : false
+    return { ok: false, blocker: "task_graph_verification_unverified", feedback: result.feedback,
+      ...(stop ? { [NATIVE_SEMANTIC_NO_PROGRESS]: true as const } : {}) }
+  }
   if (result.kind === "pending") return { ok: false, blocker: "native_verification_pending", feedback: "Independent native verification is waiting on durable child work.", waitId: result.waitId }
   input.accept(result.witness, input.candidateText)
   return null
