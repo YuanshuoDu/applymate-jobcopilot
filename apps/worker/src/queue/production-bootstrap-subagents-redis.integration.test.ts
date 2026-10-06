@@ -147,6 +147,10 @@ function createSqlFixture(input: { tasks: Map<string, SubagentTaskRecord>; rootT
       if (sql.includes('SELECT session."id", session."status", session."userId"')) {
         return values[0] === input.sessionId ? { rows: [{ id: input.sessionId, userId: input.userId, status: "running" }], rowCount: 1 } : none
       }
+      if (sql.includes('SELECT "id", "turnId" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2')) {
+        const task = input.tasks.get(String(values[0]))
+        return task?.sessionId === values[1] ? { rows: [{ id: task.id, turnId: task.turnId }], rowCount: 1 } : none
+      }
       if (sql.includes('SELECT dispatch."id", dispatch."aggregateId"') && sql.includes('ORDER BY dispatch."createdAt"')) {
         const rows = outbox.filter(row => row.topic === values[0] && row.publishedAt === null).map(row => ({ id: row.id, aggregateId: row.aggregateId, payload: row.payload, attemptCount: row.attemptCount }))
         return { rows, rowCount: rows.length }
@@ -237,6 +241,20 @@ function createSqlFixture(input: { tasks: Map<string, SubagentTaskRecord>; rootT
   }
   return { pool: { async connect() { return client } }, turn, wait, outbox, events }
 }
+
+describe("child queue SQL fixture", () => {
+  it("returns a task turn only for the matching session", async () => {
+    const ids = { sessionId: "fixture-session", turnId: "fixture-turn", userId: "fixture-user" }
+    const { store, tasks } = createTaskStore()
+    const task = await store.create({ ...ids, role: "analyst", taskType: "research", goal: "fixture", policy: { maxConcurrency: 1, maxDepth: 1, maxFanOut: 1, maxAttempts: 1 } })
+    const fixture = createSqlFixture({ tasks, rootTaskId: task.id, childTaskId: task.id, ...ids })
+    const client = await fixture.pool.connect()
+    const sql = 'SELECT "id", "turnId" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2'
+
+    await expect(client.query(sql, [task.id, ids.sessionId])).resolves.toEqual({ rows: [{ id: task.id, turnId: ids.turnId }], rowCount: 1 })
+    await expect(client.query(sql, [task.id, "foreign-session"])).resolves.toEqual({ rows: [], rowCount: 0 })
+  })
+})
 
 async function waitForCompletedJob<T>(queue: Queue<T>, id: string, timeoutMs = 10_000): Promise<Job<T>> {
   const deadline = Date.now() + timeoutMs
