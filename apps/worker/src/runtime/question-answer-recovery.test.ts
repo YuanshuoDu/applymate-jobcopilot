@@ -100,6 +100,17 @@ describe("recoverAnsweredQuestionHistory", () => {
     }))).rejects.toThrow("question_recovery_step_missing")
   })
 
+  it("accepts only the broker's user-scoped null-task answer event for a root-owned question", async () => {
+    const rootQuestion = item({ taskId: "root-1", stepId: "step-1" })
+    const start = { ...events()[0]!, taskId: "root-1" }
+    await expect(recoverAnsweredQuestionHistory(client([rootQuestion], [start, events()[1]!]), input()))
+      .resolves.toHaveLength(2)
+    await expect(recoverAnsweredQuestionHistory(client([rootQuestion], [start, { ...events()[1]!, taskId: "foreign-root" }]), input()))
+      .rejects.toThrow("question_recovery_event_scope_invalid")
+    await expect(recoverAnsweredQuestionHistory(client([rootQuestion], [start, { ...events()[1]!, actor: "system" }]), input()))
+      .rejects.toThrow("question_recovery_event_scope_invalid")
+  })
+
   it("attaches a turn-scoped null-task wait only to the unique matching root-task call and step", async () => {
     const directQuestion = item({ stepId: "step-1" })
     const matchingCall = { id: "call-item", stepId: "step-1", taskId: "root-1", type: "tool_call", content: { toolCallId: "call-1" } }

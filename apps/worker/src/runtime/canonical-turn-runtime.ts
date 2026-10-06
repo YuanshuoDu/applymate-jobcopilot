@@ -34,7 +34,7 @@ import { createCanonicalPolicy } from "./policy/canonical-policy.js"
 import { noopCanonicalExecutionProjection, type CanonicalExecutionProjection } from "./canonical-execution-projection.js"
 import { noopCanonicalSessionProjection, type CanonicalSessionProjection } from "./canonical-session-projection.js"
 import type { ProductionAgentFlags } from "./production-agent-flags.js"
-import { assertCanonicalCoordinationSurface, classifyToolCallRecovery, durableLifecycleSink, isResumableRootResult } from "./turns/canonical-runtime-tool-recovery.js"
+import { assertCanonicalCoordinationSurface, assertCanonicalQuestionStore, assertCanonicalQuestionSurface, classifyToolCallRecovery, durableLifecycleSink, isNativeQuestionWaitEnabled, isResumableRootResult } from "./turns/canonical-runtime-tool-recovery.js"
 import { defaultAuthorization, modelWithUsage, type UsageAuthorizer } from "./canonical-turn-runtime-model.js"
 import { selectedJobArtifactCompletionGateWithWitness } from "./selected-job-completion-gate.js"
 import { selectedJobArtifactFinalizationGuard } from "./selected-job-finalization-guard.js"
@@ -51,7 +51,7 @@ export type CanonicalTurnRuntimeOptions = {
   readonly workerId: string
   /** One server-owned activation contract for production route capabilities. */ readonly productionFlags?: ProductionAgentFlags
   readonly consumeWaitOutcomes?: boolean
-  /** Server-derived production gate; user policy cannot enable coordination. */ readonly coordinationEnabled?: boolean
+  /** Server-derived production gate; user policy cannot enable coordination. */ readonly coordinationEnabled?: boolean; /** Explicit trusted adapter seam for the native question wait contract. */ readonly nativeQuestionWaitEnabled?: boolean
   readonly stateLoader?: (pool: Pick<pg.Pool, "connect">, lease: TurnLease, now?: Date, options?: CanonicalTurnStateLoadOptions) => Promise<CanonicalTurnState>
   /** Test seam for the server-owned Turn input selector; production uses the lease-fenced database loader. */ readonly selectedJobPreparationLoader?: (pool: Pick<pg.Pool, "connect">, lease: TurnLease, now: Date) => Promise<SelectedJobPreparation | undefined>
   /** Test seam for the persisted artifact-head read; production uses the artifact repository. */ readonly selectedJobArtifactHeadReader?: (scope: AgentArtifactDraftHeadScope) => Promise<AgentArtifactDraftHead | null>
@@ -134,11 +134,12 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const interactiveDiscoveryMode = state.intent?.kind === INTERACTIVE_DISCOVERY_INTENT.kind && state.intent.version === INTERACTIVE_DISCOVERY_INTENT.version && !selectedJobMode
     const turnTaskGraphTemplates = interactiveDiscoveryMode ? INTERACTIVE_DISCOVERY_TEMPLATES : taskGraphTemplates
     if (interactiveDiscoveryMode && !taskGraphPlanningEnabled && !signal.aborted) return failInteractiveDiscoveryUnavailable({ lease, state, rootTasks, executionProjection, sessionProjection, now })
+    const turnCoordination = createCanonicalTurnCoordination({ enabled: taskGraphPlanningEnabled, commandPort: options.taskGraphCommandPort, lease })
+    const nativeQuestionWaitEnabled = isNativeQuestionWaitEnabled({ coordination: coordinationEnabled, nativeRoot: turnCoordination.nativeOptions.enabled, requested: options.nativeQuestionWaitEnabled, customAdapters: !!options.turnEngineStoreFactory || !!options.toolRuntimeFactory })
     const selectedPolicy = createCanonicalPolicy(state.toolPolicySnapshot, coordinationEnabled, taskGraphPlanningEnabled); const configuredCapabilities = capabilities(state.toolPolicySnapshot).filter(capability => capability !== "canManageChildren")
     const toolCapabilities = [...new Set([...configuredCapabilities, ...(coordinationEnabled ? ["coordination", "canManageChildren"] : [])])]
     let lifecycleSink: ToolLifecycleSink | null = null; let lifecycleOwner: ExecutionOwner | null = null
     let taskGraphParentAttemptCount: number | null = null
-    const turnCoordination = createCanonicalTurnCoordination({ enabled: taskGraphPlanningEnabled, commandPort: options.taskGraphCommandPort, lease })
     const durableWaitPort = createPgDurableWaitPort(pool)
     const sinkProxy: ToolLifecycleSink = { append: async (event) => {
       if (!lifecycleSink) throw new Error("root_task_not_bound")
@@ -153,10 +154,12 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       store: new PgCoordinationStore(pool),
       wait: toolSafeDurableWaitPort(durableWaitPort),
       nativeCoordination: turnCoordination.nativeOptions,
+      askUserEnabled: nativeQuestionWaitEnabled,
     } : undefined
     const toolRuntime = options.toolRuntimeFactory?.({ pool, policy: selectedPolicy, manager, state }) ?? createWorkerToolRuntime(pool, { sink: sinkProxy, resolveOwner }, selectedPolicy, coordination)
     registerTaskGraphPlanningTool(toolRuntime.registry, taskGraphPlanningEnabled, { commandPort: options.taskGraphCommandPort, templates: turnTaskGraphTemplates, turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: () => taskGraphParentAttemptCount })
     if (coordinationEnabled) assertCanonicalCoordinationSurface(toolRuntime.registry, toolCapabilities)
+    if (nativeQuestionWaitEnabled) assertCanonicalQuestionSurface(toolRuntime.registry, toolCapabilities)
     const rootTools = rootToolSurface(toolRuntime.registry.list(toolCapabilities), selectedJobMode, interactiveDiscoveryMode, isSelectedJobRootTool)
     const allowedActions = rootTaskAllowedActions(rootTools, turnTaskGraphTemplates, taskGraphPlanningEnabled)
     const root = await rootTasks.ensure({ lease, goal: state.goal, modelProfileSnapshot: state.modelProfileSnapshot, toolPolicySnapshot: state.toolPolicySnapshot, budgetSnapshot: state.budgetSnapshot, allowedActions, now: now() })
@@ -180,6 +183,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       }) : undefined,
     })
     const baseTurnStore = options.turnEngineStoreFactory?.(pool, terminalGuard) ?? createPgTurnEngineStore(pool, terminalGuard)
+    assertCanonicalQuestionStore(baseTurnStore, nativeQuestionWaitEnabled)
     let acceptedDiscoveryShortlist: InteractiveDiscoveryShortlistProjection | undefined
     let discoveryFailureCode: "discovery_runtime_unavailable" | "discovery_runtime_failed" = "discovery_runtime_failed"
     const turnStore = interactiveDiscoveryMode ? withInteractiveDiscoveryFinalResponse(baseTurnStore, () => acceptedDiscoveryShortlist) : baseTurnStore

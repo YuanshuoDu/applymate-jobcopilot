@@ -9,7 +9,7 @@ export type InteractiveDiscoveryShortlistProjection = Readonly<{
 }>
 
 export const INTERACTIVE_DISCOVERY_ROOT_TOOLS = Object.freeze([
-  "agent.plan", "agent.wait", "agent.list", "list_subagents",
+  "agent.plan", "agent.wait", "agent.list", "list_subagents", "agent.ask_user",
 ] as const)
 export const INTERACTIVE_DISCOVERY_TEMPLATES = Object.freeze({ scout: TASK_GRAPH_TEMPLATES.scout, analyst: TASK_GRAPH_TEMPLATES.analyst })
 

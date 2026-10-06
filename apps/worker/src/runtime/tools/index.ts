@@ -17,6 +17,7 @@ import { createGmailTools } from "./gmail-tools.js"
 import type { GmailToolOptions } from "./gmail-types.js"
 import { createWriteTools, type WriteToolOptions } from "./write-tools.js"
 import type { RuntimeToolDefinition } from "./types.js"
+import { createAskUserTool } from "./ask-user.js"
 
 export * from "./lifecycle.js"
 export * from "./read-data-source.js"
@@ -37,6 +38,7 @@ export * from "./gmail-types.js"
 export * from "./artifact-tools.js"
 export * from "./application-submit-tool.js"
 export * from "./write-tools.js"
+export * from "./ask-user.js"
 export * from "./tool-result-reference-repo.js"
 export * from "./tool-result-reference-types.js"
 export * from "./tool-results-read-tool.js"
@@ -47,6 +49,7 @@ export type WorkerCoordinationOptions = {
   readonly store?: CoordinationStore
   readonly wait?: DurableWaitPort
   readonly nativeCoordination?: NativeCoordinationRuntimeOptions
+  readonly askUserEnabled?: boolean
 }
 
 export type WorkerGmailOptions = GmailToolOptions
@@ -76,6 +79,7 @@ export function createWorkerToolRuntime(
       nativeCoordination: coordination.nativeCoordination,
     }
     definitions.push(...createCoordinationTools(options))
+    if (coordination.askUserEnabled) definitions.push(createAskUserTool() as RuntimeToolDefinition)
   }
   if (gmail) definitions.push(...createGmailTools(gmail))
   if (artifacts) definitions.push(...createArtifactTools(artifacts.store))

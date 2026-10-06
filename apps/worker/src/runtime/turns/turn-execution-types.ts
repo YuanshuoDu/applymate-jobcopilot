@@ -52,6 +52,10 @@ export type TurnExecutionStore = {
   startStep(input: StoreInput<"startStep">): Promise<TurnEngineStep>
   updateStep(input: StoreInput<"updateStep">): Promise<void>
   waitForUser?(input: StoreInput<"waitForUser">): Promise<void>
+  stageQuestionUsage?(input: StoreInput<"stageQuestionUsage">): Promise<void>
+  cancelPausedQuestion?(input: StoreInput<"cancelPausedQuestion">): ReturnType<NonNullable<TurnEngineStore["cancelPausedQuestion"]>>
+  waitForQuestion?(input: StoreInput<"waitForQuestion">): ReturnType<NonNullable<TurnEngineStore["waitForQuestion"]>>
+  readPendingQuestion?(input: StoreInput<"readPendingQuestion">): ReturnType<NonNullable<TurnEngineStore["readPendingQuestion"]>>
   createItem(input: StoreInput<"createItem">): Promise<TurnEngineItem>
   updateItem(input: StoreInput<"updateItem">): Promise<TurnEngineItem>
   appendEvent(input: StoreInput<"appendEvent">): Promise<{ id: string }>
