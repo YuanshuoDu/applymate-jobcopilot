@@ -15,6 +15,7 @@ import {
 import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.js"
 import type { NativeVerificationRootGoalWitness, NativeVerificationTerminalProofReader } from "./native-verification-port.js"
 import type { TaskGraphReadScope } from "./task-graph-command-port.js"
+import { appendNativeQuestionSelfAttestations } from "./native-verification-question-evidence.js"
 
 type Queryable = Pick<pg.PoolClient, "query">
 export type NativeVerificationControlProof = Readonly<{
@@ -154,7 +155,8 @@ export const readNativeVerificationTerminalProofWithClient: NativeVerificationTe
     ...(item.task.control.target.kind === "root_goal" ? { candidateDigest: item.task.control.target.candidateDigest,
       childBindingSetDigest: item.task.control.target.childBindingSetDigest } : {}),
   })), candidateDigest, childBindingSetDigest)
-  const content = buildNativeRootPacketContent({ state, candidateText, childBindingSetDigest, history: rootHistory })
+  const baseContent = buildNativeRootPacketContent({ state, candidateText, childBindingSetDigest, history: rootHistory })
+  const content = baseContent && await appendNativeQuestionSelfAttestations(client, scope, baseContent)
   if (!content) return false
   return nativeVerificationControlContentMatches(proof.task.packet, content)
 }

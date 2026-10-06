@@ -4,7 +4,7 @@ import {
   NATIVE_VERIFICATION_PACKET_SCHEMA_V2, NATIVE_VERIFICATION_PACKET_V2_MAX_BYTES,
   NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND,
   canonicalNativeVerificationJson, digestNativeVerificationValue,
-  isNativeVerificationJsonArray,
+  isNativeVerificationJsonArray, isNativeVerificationUserSelfAttestationReference,
   parseNativeVerificationControl,
   type NativeVerificationControl, type NativeVerificationEvidence, type NativeVerificationPacket,
 } from "./native-verification-contract.js"
@@ -72,11 +72,13 @@ function parseEvidence(value: unknown, targetReferenceId: string, schemaVersion:
   const evidence = value.map(item => {
     const row = exact(item, ["referenceId", "kind", "summary"])
     const selfAttestation = row?.kind === NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND
+    const privateReference = isNativeVerificationUserSelfAttestationReference(row?.referenceId)
     const maxSummaryBytes = selfAttestation && schemaVersion === NATIVE_VERIFICATION_PACKET_SCHEMA_V2
       ? NATIVE_VERIFICATION_PACKET_V2_MAX_BYTES : MAX_EVIDENCE_SUMMARY_BYTES
     if (!row || typeof row.referenceId !== "string" || !ID.test(row.referenceId) || seen.has(row.referenceId)
       || typeof row.kind !== "string" || !/^[a-z][a-z0-9_]{0,39}$/.test(row.kind)
-      || (selfAttestation && schemaVersion !== NATIVE_VERIFICATION_PACKET_SCHEMA_V2) || !text(row.summary, maxSummaryBytes)) return null
+      || (selfAttestation && (schemaVersion !== NATIVE_VERIFICATION_PACKET_SCHEMA_V2 || !privateReference))
+      || (privateReference && !selfAttestation) || !text(row.summary, maxSummaryBytes)) return null
     seen.add(row.referenceId)
     return { referenceId: row.referenceId, kind: row.kind, summary: row.summary }
   })

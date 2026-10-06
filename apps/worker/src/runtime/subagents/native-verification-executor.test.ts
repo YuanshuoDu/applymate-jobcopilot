@@ -86,13 +86,14 @@ describe("native verification dispatch classification", () => {
     const answer = "I prefer Dublin roles."
     const candidateText = "The response addresses the user's stated preference."
     const target = { kind: "root_goal" as const, candidateDigest: digestNativeVerificationValue(candidateText), referenceId: "candidate", candidateText }
-    const answerReference = "user-answer:8a71"
+    const answerReference = `user-self-attestation:${"8a".repeat(32)}`
     const packet: NativeVerificationPacket = {
       schemaVersion: NATIVE_VERIFICATION_PACKET_SCHEMA_V2, controlOperationId: "verify-op", controlTaskId: base.lease.id,
       goal: "Respond to the user's stated job-location preference.",
       criteria: [{ criterionId: "criterion-1", requirement: "The answer reflects what the user stated." }],
       target, evidence: [{ referenceId: answerReference, kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND,
-        summary: JSON.stringify({ question: "Which location do you prefer?", answer }) }],
+        summary: JSON.stringify({ kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND, stage: "user_input",
+          question: "Which location do you prefer?", options: [], answer }) }],
     }
     const control: NativeVerificationControl = {
       schemaVersion: NATIVE_VERIFICATION_CONTROL_SCHEMA, controlOperationId: packet.controlOperationId, controlTaskId: packet.controlTaskId,

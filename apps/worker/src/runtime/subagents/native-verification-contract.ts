@@ -6,6 +6,7 @@ export const NATIVE_VERIFICATION_PACKET_SCHEMA = "agent-harness.v2.native-verifi
 export const NATIVE_VERIFICATION_PACKET_SCHEMA_V2 = "agent-harness.v2.native-verifier-packet.v2" as const
 export const NATIVE_VERIFICATION_PACKET_V2_MAX_BYTES = 256 * 1024
 export const NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND = "user_self_attestation" as const
+export const NATIVE_VERIFICATION_USER_SELF_ATTESTATION_REFERENCE_PREFIX = "user-self-attestation:" as const
 export const NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA = "agent-harness.v2.native-verifier-model-report.v1" as const
 export const NATIVE_VERIFICATION_REPORT_SCHEMA = "agent-harness.v2.native-verifier-report.v1" as const
 export const NATIVE_VERIFICATION_PACKET_CONTEXT_KEY = "nativeVerificationPacket" as const
@@ -109,6 +110,9 @@ function exact(value: unknown, keys: readonly string[]): Record<string, unknown>
 
 function id(value: unknown): value is string { return typeof value === "string" && ID.test(value) }
 function digest(value: unknown): value is string { return typeof value === "string" && DIGEST.test(value) }
+export function isNativeVerificationUserSelfAttestationReference(value: unknown): value is string {
+  return typeof value === "string" && /^user-self-attestation:[a-f0-9]{64}$/.test(value)
+}
 function attempt(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) > 0 }
 
 function parseTarget(value: unknown): NativeVerificationTargetBinding | null {

@@ -33,6 +33,7 @@ function control(packet: NativeVerificationPacket = basePacket): NativeVerificat
 const rootTarget: Extract<NativeVerificationPacket["target"], { kind: "root_goal" }> = {
   kind: "root_goal", candidateDigest: digestNativeVerificationValue("delivery"), referenceId: "candidate", candidateText: "delivery",
 }
+const selfReference = `user-self-attestation:${"a".repeat(64)}`
 function rootPacket(
   evidence: NativeVerificationPacket["evidence"],
   schemaVersion: NativeVerificationPacket["schemaVersion"] = NATIVE_VERIFICATION_PACKET_SCHEMA,
@@ -101,7 +102,7 @@ describe("native verification packet", () => {
   it("keeps v1 root and child packets unchanged and reserves user statements for root v2", () => {
     const legacyRoot = rootPacket([{ referenceId: "root-fact", kind: "tool_result", summary: "Owned facts." }])
     expect(parseNativeVerificationPacket(createNativeVerificationContext(legacyRoot), rootControl(legacyRoot))).toEqual(legacyRoot)
-    const statement = { referenceId: "answer:abc", kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND, summary: "User stated a preference." }
+    const statement = { referenceId: selfReference, kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND, summary: "User stated a preference." }
     const v1WithStatement = rootPacket([statement])
     expect(parseNativeVerificationPacket(createNativeVerificationContext(v1WithStatement), rootControl(v1WithStatement))).toBeNull()
     const v2Root = rootPacket([statement], NATIVE_VERIFICATION_PACKET_SCHEMA_V2)
@@ -110,12 +111,22 @@ describe("native verification packet", () => {
     expect(parseNativeVerificationPacket(createNativeVerificationContext(v2WithoutStatement), rootControl(v2WithoutStatement))).toBeNull()
     const v2Child = { ...basePacket, schemaVersion: NATIVE_VERIFICATION_PACKET_SCHEMA_V2, evidence: [statement] }
     expect(parseNativeVerificationPacket(createNativeVerificationContext(v2Child), control(v2Child))).toBeNull()
+    expect(parseNativeVerificationPacket(createNativeVerificationContext(rootPacket([
+      { ...statement, referenceId: "user-self-attestation:short" },
+    ], NATIVE_VERIFICATION_PACKET_SCHEMA_V2)), rootControl(rootPacket([
+      { ...statement, referenceId: "user-self-attestation:short" },
+    ], NATIVE_VERIFICATION_PACKET_SCHEMA_V2)))).toBeNull()
+    expect(parseNativeVerificationPacket(createNativeVerificationContext(rootPacket([
+      { ...statement, kind: "tool_result" },
+    ], NATIVE_VERIFICATION_PACKET_SCHEMA_V2)), rootControl(rootPacket([
+      { ...statement, kind: "tool_result" },
+    ], NATIVE_VERIFICATION_PACKET_SCHEMA_V2)))).toBeNull()
   })
 
   it("preserves complete multibyte and escaped user statements under the v2 canonical bound", () => {
     const answer = "🙂".repeat(10_000) + "\u0000".repeat(10_000)
     const summary = JSON.stringify({ question: "What is your preference?", answer })
-    const packet = rootPacket([{ referenceId: "answer:abc", kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND, summary }], NATIVE_VERIFICATION_PACKET_SCHEMA_V2)
+    const packet = rootPacket([{ referenceId: selfReference, kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND, summary }], NATIVE_VERIFICATION_PACKET_SCHEMA_V2)
     const encoded = canonicalNativeVerificationJson(packet)
     expect(Buffer.byteLength(summary, "utf8")).toBeGreaterThan(8 * 1024)
     expect(Buffer.byteLength(encoded, "utf8")).toBeLessThanOrEqual(256 * 1024)
@@ -125,27 +136,27 @@ describe("native verification packet", () => {
 
   it("keeps ordinary v2 evidence at 8 KiB and rejects oversized answer summaries or aggregate packets", () => {
     const oversizedOrdinary = rootPacket([
-      { referenceId: "answer:abc", kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND, summary: "complete answer" },
+      { referenceId: selfReference, kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND, summary: "complete answer" },
       { referenceId: "root-fact", kind: "tool_result", summary: "x".repeat(8 * 1024 + 1) },
     ], NATIVE_VERIFICATION_PACKET_SCHEMA_V2)
     expect(parseNativeVerificationPacket(createNativeVerificationContext(oversizedOrdinary), rootControl(oversizedOrdinary))).toBeNull()
     const oversizedAnswer = rootPacket([
-      { referenceId: "answer:abc", kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND, summary: "x".repeat(256 * 1024 + 1) },
+      { referenceId: selfReference, kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND, summary: "x".repeat(256 * 1024 + 1) },
     ], NATIVE_VERIFICATION_PACKET_SCHEMA_V2)
     expect(parseNativeVerificationPacket(createNativeVerificationContext(oversizedAnswer), rootControl(rootPacket([
-      { referenceId: "answer:abc", kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND, summary: "complete answer" },
+      { referenceId: selfReference, kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND, summary: "complete answer" },
     ], NATIVE_VERIFICATION_PACKET_SCHEMA_V2)))).toBeNull()
-    const aggregate = rootPacket(["answer:one", "answer:two"].map(referenceId => ({
-      referenceId, kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND, summary: "x".repeat(128 * 1024),
+    const aggregate = rootPacket(["a", "b"].map(digest => ({ referenceId: `user-self-attestation:${digest.repeat(64)}`,
+      kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND, summary: "x".repeat(128 * 1024),
     })), NATIVE_VERIFICATION_PACKET_SCHEMA_V2)
     const aggregateBinding = rootControl(rootPacket([
-      { referenceId: "answer:one", kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND, summary: "complete answer" },
+      { referenceId: `user-self-attestation:${"a".repeat(64)}`, kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND, summary: "complete answer" },
     ], NATIVE_VERIFICATION_PACKET_SCHEMA_V2))
     expect(Buffer.byteLength(JSON.stringify(aggregate), "utf8")).toBeGreaterThan(256 * 1024)
     expect(() => canonicalNativeVerificationJson(aggregate)).toThrow("native_verification_value_too_large")
     expect(parseNativeVerificationPacket(createNativeVerificationContext(aggregate), aggregateBinding)).toBeNull()
     const tooMany = rootPacket(Array.from({ length: 33 }, (_, index) => ({
-      referenceId: `answer:${index}`, kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND, summary: "complete answer",
+      referenceId: `user-self-attestation:${String(index).padStart(64, "0")}`, kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND, summary: "complete answer",
     })), NATIVE_VERIFICATION_PACKET_SCHEMA_V2)
     expect(parseNativeVerificationPacket(createNativeVerificationContext(tooMany), rootControl(tooMany))).toBeNull()
   })
