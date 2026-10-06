@@ -11,6 +11,7 @@ import {
   type CompactionArtifact,
 } from "./context-compaction-types.js"
 import { canonicalJson, sha256Hex } from "./context-compaction-canonical.js"
+import { mergeSelectedJobMemories, parseSelectedJobMemories } from "./selected-job-memory.js"
 
 const DEFAULT_NARRATIVE_INPUT_CHARACTERS = 24_000
 
@@ -98,6 +99,8 @@ function normalizeState(input: CompactionState): CompactionState {
   if (typeof throughSequence !== "bigint" || throughSequence < 0n) throw new CompactionError("invalid_source", "state.throughSequence must be non-negative bigint")
   const normalizedFacts = facts(value.facts)
   if (new Set(normalizedFacts.map((fact) => fact.factId)).size !== normalizedFacts.length) throw new CompactionError("invalid_source", "facts contains duplicate ids")
+  const selectedJobMemories = parseSelectedJobMemories(value.selectedJobMemories, true)
+  if (!selectedJobMemories) throw new CompactionError("invalid_source", "state.selectedJobMemories is invalid")
   return {
     ownerId: text(value.ownerId, "state.ownerId"),
     sessionId: text(value.sessionId, "state.sessionId"),
@@ -110,6 +113,7 @@ function normalizeState(input: CompactionState): CompactionState {
     openTasks: openTasks(value.openTasks),
     doNotRepeat: strings(value.doNotRepeat, "state.doNotRepeat"),
     facts: normalizedFacts,
+    selectedJobMemories,
   }
 }
 
@@ -159,6 +163,8 @@ export function compactionStateCanonicalJson(state: CompactionState): string {
 }
 
 export function cloneCompactionState(state: CompactionState): CompactionState {
+  const selectedJobMemories = parseSelectedJobMemories(state.selectedJobMemories ?? [], true)
+  if (!selectedJobMemories) throw new CompactionError("invalid_source", "state.selectedJobMemories is invalid")
   return {
     ownerId: state.ownerId,
     sessionId: state.sessionId,
@@ -171,5 +177,6 @@ export function cloneCompactionState(state: CompactionState): CompactionState {
     openTasks: state.openTasks.map(task => ({ ...task })),
     doNotRepeat: [...state.doNotRepeat],
     facts: state.facts.map(fact => ({ ...fact })),
+    selectedJobMemories: mergeSelectedJobMemories([], selectedJobMemories),
   }
 }

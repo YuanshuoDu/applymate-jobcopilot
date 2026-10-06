@@ -12,6 +12,7 @@ import type { TurnEngineEvent, TurnEngineStore } from "./turns/turn-engine-types
 import { createCanonicalTurnRuntime, type CanonicalTurnRuntimeOptions } from "./canonical-turn-runtime.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA, type TaskGraphCommandPort, type TaskGraphCurrentState, type TaskGraphNativeCommandInput, type TaskGraphReadScope, type TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
+import { projectSelectedJobMemory } from "./context/selected-job-memory.js"
 import { TurnEngine } from "./turns/turn-engine.js"
 import { createPgRootTaskStore } from "./subagents/root-task-store.js"
 import { reclaimExpiredTurns } from "./turns/recovery-scanner.js"
@@ -440,6 +441,7 @@ describe("createCanonicalTurnRuntime", () => {
 
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed" })
     expect(runner).toHaveBeenCalledOnce()
+    expect(runner).toHaveBeenCalledWith(expect.objectContaining({ taskGraphCommandPort: graph }))
     expect(loadOptions).toEqual([{ consumeWaitOutcomes: true }, { consumeWaitOutcomes: false }])
     expect(graph.readCurrent).toHaveBeenCalledTimes(3)
     expect(observedSnapshots[0]?.goal).toEqual(initial.snapshot.goal)
@@ -866,6 +868,81 @@ describe("createCanonicalTurnRuntime", () => {
       .toContain('"cover_letter_writer"')
     expect(selectedPlanTool && typeof selectedPlanTool === "object" && "description" in selectedPlanTool ? selectedPlanTool.description : "")
       .toContain('"artifact.version.read"')
+  })
+
+  it("injects only the compacted selected-job memory after filtering into the next captured model request", async () => {
+    const graph = {
+      revision: 4,
+      nodes: [{
+        key: "analyst-key", taskId: "analyst-task", templateId: "analyst", goal: "Analyze selected job", successCriteria: [], dependsOn: [],
+        status: "completed", readiness: "terminal", resultSummary: null, failureReason: null,
+        resultProjection: {
+          schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available",
+          role: "analyst", status: "completed", findingCount: 1, evidenceCount: 1,
+          findings: [{ jobId: "job-1", score: 8, evidenceKinds: ["job"] }],
+        },
+      }],
+    }
+    const selectedMemory = projectSelectedJobMemory({ jobId: "job-1", sourceTurnId: lease.turnId, sourceRootTaskId: "root-1", throughSequence: "19", graph })!
+    const otherJobMemory = projectSelectedJobMemory({ jobId: "job-other", sourceTurnId: lease.turnId, sourceRootTaskId: "root-1", throughSequence: "19", graph })!
+    const currentGraph = graph as unknown as TaskGraphCurrentState
+    const commandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 4, nodes: [], readyTaskIds: [] })),
+      readCurrent: vi.fn(async () => currentGraph),
+    }
+    const requests: HarnessModelRequest[] = []
+    const flags = resolveProductionAgentFlags({ ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1" })
+    const planningTools = tools(true)
+    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+      workerId: "worker-1", productionFlags: flags, coordinationEnabled: true, taskGraphCommandPort: commandPort,
+      selectedJobPreparationLoader: async () => ({ jobId: "job-1" }),
+      stateLoader: async () => ({
+        ...selectedJobState(), toolPolicySnapshot: {}, selectedJobMemories: [selectedMemory, otherJobMemory],
+        snapshot: { ...selectedJobState().snapshot, toolObservations: [{ id: "unrelated-search", content: { toolName: "jobs.search", output: "must be filtered" } }] },
+      }),
+      rootTaskStore: rootStore() as never, toolRuntimeFactory: () => ({ ...planningTools, registry: { ...planningTools.registry, register: vi.fn() } }) as never,
+      turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
+      modelRuntimeFactory: async () => ({ adapter: {
+        ...model(() => []),
+        async *stream(request: HarnessModelRequest) { requests.push(request); yield { type: "text_delta", text: "done" }; yield { type: "completed", finishReason: "stop" } },
+      }, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+
+    await runtime.execute({ lease, signal: new AbortController().signal })
+    const requestText = requests[0]?.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n") ?? ""
+    expect(requestText).toContain("selected_job_memory")
+    expect(requestText).toContain('"score":8')
+    expect(requestText).not.toContain("job-other")
+    expect(requestText).not.toContain("must be filtered")
+  })
+
+  it("does not inject selected-job memory into an ordinary Turn model request", async () => {
+    const jobId = "ordinary-job-559"
+    const selectedMemory = projectSelectedJobMemory({ jobId, sourceTurnId: lease.turnId, sourceRootTaskId: "root-1", throughSequence: "19", graph: {
+      revision: 4, nodes: [{ key: "analyst-key", taskId: "analyst-task", templateId: "analyst", status: "completed", readiness: "terminal",
+        resultProjection: { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available", role: "analyst",
+          status: "completed", findingCount: 1, evidenceCount: 1, findings: [{ jobId, score: 8.75, evidenceKinds: ["job"] }] } }],
+    } })!
+    const requests: HarnessModelRequest[] = []
+    const ordinaryTools = tools()
+    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+      workerId: "worker-1", stateLoader: async () => ({ ...state(), selectedJobMemories: [selectedMemory] }),
+      rootTaskStore: rootStore() as never, toolRuntimeFactory: () => ordinaryTools as never,
+      turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
+      modelRuntimeFactory: async () => ({ adapter: {
+        ...model(() => []),
+        async *stream(request: HarnessModelRequest) { requests.push(request); yield { type: "text_delta", text: "done" }; yield { type: "completed", finishReason: "stop" } },
+      }, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+
+    await runtime.execute({ lease, signal: new AbortController().signal })
+    expect(requests).toHaveLength(1)
+    const requestText = JSON.stringify(requests[0]?.messages)
+    expect(requestText).not.toContain("selected_job_memory")
+    expect(requestText).not.toContain(JSON.stringify(selectedMemory))
+    expect(requestText).not.toContain(jobId)
   })
 
   it("fails closed before provider invocation when the scoped current graph read fails", async () => {

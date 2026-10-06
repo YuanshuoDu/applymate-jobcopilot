@@ -5,6 +5,7 @@ import { loadWorkerAiConfig, type AiConfig } from "@jobcopilot/shared/llm"
 import { createHarnessModelRuntime, type HarnessModelRuntime } from "./harness-model.js"
 import { createPgContextOwnerFence, StepContextBuilder } from "./context/step-context-builder.js"
 import { createPgInputClaimStore } from "./context/input-claim-store.js"
+import { injectSelectedJobMemory } from "./context/selected-job-memory.js"
 import { createWorkerToolRuntime, type ToolLifecycleSink, type ToolRouter } from "./tools/index.js"
 import { registerTaskGraphPlanningTool } from "./tools/planning-executors.js"
 import type { TaskGraphCommandPort, TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
@@ -38,7 +39,7 @@ import { defaultAuthorization, modelWithUsage, type UsageAuthorizer } from "./ca
 import { selectedJobArtifactCompletionGateWithWitness } from "./selected-job-completion-gate.js"
 import { selectedJobArtifactFinalizationGuard } from "./selected-job-finalization-guard.js"
 import { createAgentArtifactRepository, findCurrentDraftHeadWithClient, findReviewReceiptWithClient, type AgentArtifactDraftHead, type AgentArtifactDraftHeadScope } from "../db/agent-artifact-repo.js"
-import { runTurnBoundaryCompactionPreflight, runTurnBoundaryContextCompaction } from "./context/turn-boundary-compaction-preflight.js"
+import { runTurnBoundaryContextCompaction } from "./context/turn-boundary-compaction-preflight.js"
 import { createCanonicalRootToolGuards, failInteractiveDiscoveryUnavailable, interactiveDiscoveryCompletionGate, withInteractiveDiscoveryFinalResponse } from "./interactive-discovery-runtime.js"
 import { INTERACTIVE_DISCOVERY_TEMPLATES, rootTaskAllowedActions, rootToolSurface, terminalInteractiveDiscoveryShortlist, type InteractiveDiscoveryShortlistProjection } from "./interactive-discovery-contract.js"
 import type { SubagentTaskRecord } from "./subagents/types.js"
@@ -194,7 +195,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       state, selectedJobMode, taskGraphPlanningEnabled, ...nativeRootContext, refreshTaskGraph: turnCoordination.refresh,
       preflight: {
         enabled: productionFlags?.turnBoundaryCompactionEnabled === true, signal,
-        compact: () => (options.turnBoundaryCompactionRunner ?? runTurnBoundaryContextCompaction)({ pool, scope: state.scope, owner, lease, model, signal }),
+        compact: () => (options.turnBoundaryCompactionRunner ?? runTurnBoundaryContextCompaction)({ pool, scope: state.scope, owner, lease, taskGraphCommandPort: options.taskGraphCommandPort, model, signal }),
         reload: () => options.stateLoader?.(pool, lease, now(), { consumeWaitOutcomes: false }) ?? loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes: false }),
       },
     })
@@ -208,7 +209,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const contextBuilder: TurnEngineOptions["contextBuilder"] = {
       build: request => baseContextBuilder.build({
         ...request,
-        snapshot: selectedJobMode ? selectedJobSnapshot(request.snapshot) : request.snapshot,
+        snapshot: selectedJobMode ? injectSelectedJobMemory({ snapshot: selectedJobSnapshot(request.snapshot), records: state.selectedJobMemories ?? [], jobId: selectedJobPreparation?.jobId, turnId: lease.turnId, rootTaskId: root.id }) : request.snapshot,
         taskId: root.id,
       }),
     }

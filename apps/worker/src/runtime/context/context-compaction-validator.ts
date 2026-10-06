@@ -1,7 +1,8 @@
 import { CompactionError, type CompactionInvariantField, type CompactionInvariantReport, type CompactionState } from "./context-compaction-types.js"
 import { canonicalJson, sha256Hex } from "./context-compaction-canonical.js"
+import { parseSelectedJobMemories } from "./selected-job-memory.js"
 
-const requiredFields: readonly CompactionInvariantField[] = ["goal", "approvals", "answers", "artifact_hashes", "open_tasks", "do_not_repeat"]
+const requiredFields: readonly CompactionInvariantField[] = ["goal", "approvals", "answers", "artifact_hashes", "open_tasks", "do_not_repeat", "selected_job_memories"]
 
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null
@@ -12,6 +13,8 @@ function projection(value: unknown): { readonly value: Record<string, unknown> |
   if (!input) return { value: null, missing: ["state"] }
   const missing: string[] = []
   for (const field of ["goal", "approvals", "answers", "artifacts", "openTasks", "doNotRepeat"] as const) if (!(field in input)) missing.push(field)
+  const selectedJobMemories = parseSelectedJobMemories(input.selectedJobMemories, true)
+  if (!selectedJobMemories) missing.push("selectedJobMemories")
   if (missing.length > 0) return { value: input, missing }
   const artifacts = Array.isArray(input.artifacts) ? input.artifacts.map((entry) => {
     const item = record(entry)
@@ -25,6 +28,7 @@ function projection(value: unknown): { readonly value: Record<string, unknown> |
       artifact_hashes: artifacts,
       open_tasks: input.openTasks,
       do_not_repeat: input.doNotRepeat,
+      selected_job_memories: selectedJobMemories,
     },
     missing,
   }
@@ -42,7 +46,7 @@ export function compareCompactionInvariants(before: unknown, after: unknown): Co
   const changedFields: CompactionInvariantField[] = []
   const preservedFields: CompactionInvariantField[] = []
   if (left.value && right.value) {
-    const pairs: readonly [CompactionInvariantField, string][] = [["goal", "goal"], ["approvals", "approvals"], ["answers", "answers"], ["artifact_hashes", "artifact_hashes"], ["open_tasks", "open_tasks"], ["do_not_repeat", "do_not_repeat"]]
+    const pairs: readonly [CompactionInvariantField, string][] = [["goal", "goal"], ["approvals", "approvals"], ["answers", "answers"], ["artifact_hashes", "artifact_hashes"], ["open_tasks", "open_tasks"], ["do_not_repeat", "do_not_repeat"], ["selected_job_memories", "selected_job_memories"]]
     for (const [field, key] of pairs) {
       if (left.value[key] === undefined) missingFields.push(`before.${key}`)
       else if (right.value[key] === undefined) missingFields.push(`after.${key}`)
