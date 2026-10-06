@@ -211,7 +211,6 @@ export type TaskGraphResultProjection =
     reviewStatus: "passed" | "needs_revision" | "rejected" | "stale"
     reviewHash: string
   }>
-
 export type TaskGraphCurrentNode = Readonly<{
   key: string
   templateId: string
@@ -231,19 +230,16 @@ export type TaskGraphCurrentNode = Readonly<{
   nativeResult?: TaskGraphNativeResultReceipt
   failureReason: string | null
 }>
-
 export type TaskGraphCurrentState = Readonly<{
   revision: number
   nodes: readonly TaskGraphCurrentNode[]
 }>
-
 export class TaskGraphCommandError extends Error {
   constructor(readonly code: string, message: string, readonly currentRevision?: number) {
     super(message)
     this.name = "TaskGraphCommandError"
   }
 }
-
 export type TaskGraphCommandPort = Readonly<{
   appendAndSchedule(input: TaskGraphScheduleInput): Promise<TaskGraphScheduleReceipt>
   /** Native root coordination is optional for legacy ports; production callers must fail closed if absent. */
