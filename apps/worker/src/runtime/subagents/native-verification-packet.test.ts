@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest"
+import { Buffer } from "node:buffer"
 
 import {
   NATIVE_VERIFICATION_CONTROL_SCHEMA, NATIVE_VERIFICATION_PACKET_SCHEMA,
@@ -7,11 +8,15 @@ import {
 import { createNativeVerificationContext, parseNativeVerificationPacket } from "./native-verification-packet.js"
 
 const persistedResult = { status: "completed", finalText: "The target's output" }
+const childTarget: Extract<NativeVerificationPacket["target"], { kind: "child" }> = {
+  kind: "child", taskId: "target-task", attempt: 3, resultDigest: digestNativeVerificationValue(persistedResult),
+  referenceId: "target-result", resultText: canonicalNativeVerificationJson(persistedResult),
+}
 const basePacket: NativeVerificationPacket = {
   schemaVersion: NATIVE_VERIFICATION_PACKET_SCHEMA,
   controlOperationId: "verify-op", controlTaskId: "verify-task", goal: "Produce the requested result",
   criteria: [{ criterionId: "criterion-1", requirement: "The result satisfies the request" }],
-  target: { kind: "child", taskId: "target-task", attempt: 3, resultDigest: digestNativeVerificationValue(persistedResult), referenceId: "target-result", resultText: canonicalNativeVerificationJson(persistedResult) },
+  target: childTarget,
   evidence: [{ referenceId: "fact-1", kind: "tool_result", summary: "Owned result confirms the requested value." }],
 }
 function control(packet: NativeVerificationPacket = basePacket): NativeVerificationControl {
@@ -34,9 +39,9 @@ describe("native verification packet", () => {
   it.each([
     ["ordinary context fields", { ...createNativeVerificationContext(basePacket), query: "private persona" }],
     ["wrong criterion ID", createNativeVerificationContext({ ...basePacket, criteria: [{ ...basePacket.criteria[0], criterionId: "other" }] })],
-    ["foreign result task", createNativeVerificationContext({ ...basePacket, target: { ...basePacket.target, taskId: "foreign-task" } })],
-    ["foreign target digest", createNativeVerificationContext({ ...basePacket, target: { ...basePacket.target, resultDigest: "c".repeat(64) } })],
-    ["unrelated child result text", createNativeVerificationContext({ ...basePacket, target: { ...basePacket.target, resultText: canonicalNativeVerificationJson({ finalText: "unrelated" }) } })],
+    ["foreign result task", createNativeVerificationContext({ ...basePacket, target: { ...childTarget, taskId: "foreign-task" } })],
+    ["foreign target digest", createNativeVerificationContext({ ...basePacket, target: { ...childTarget, resultDigest: "c".repeat(64) } })],
+    ["unrelated child result text", createNativeVerificationContext({ ...basePacket, target: { ...childTarget, resultText: canonicalNativeVerificationJson({ finalText: "unrelated" }) } })],
     ["foreign evidence reference", createNativeVerificationContext({ ...basePacket, evidence: [{ ...basePacket.evidence[0], referenceId: "target-result" }] })],
     ["wrong packet hash", createNativeVerificationContext({ ...basePacket, goal: "changed after freezing" })],
   ])("rejects %s", (_name, context) => expect(parseNativeVerificationPacket(context, control())).toBeNull())
@@ -57,5 +62,21 @@ describe("native verification packet", () => {
     const changed = { ...rootPacket, target: { ...rootTarget, candidateText: "foreign delivery" } }
     const rebound = { ...rootControl, evidencePacketDigest: digestNativeVerificationValue(changed) }
     expect(parseNativeVerificationPacket(createNativeVerificationContext(changed), rebound)).toBeNull()
+  })
+
+  it("accepts evidence summaries through 8 KiB and rejects larger summaries without clipping", () => {
+    const bounded: NativeVerificationPacket = { ...basePacket, evidence: [{ referenceId: "fact-1", kind: "tool_result", summary: "x".repeat(8 * 1024) }] }
+    expect(parseNativeVerificationPacket(createNativeVerificationContext(bounded), control(bounded))).toEqual(bounded)
+    const oversized: NativeVerificationPacket = { ...basePacket, evidence: [{ referenceId: "fact-1", kind: "tool_result", summary: "x".repeat(8 * 1024 + 1) }] }
+    expect(parseNativeVerificationPacket(createNativeVerificationContext(oversized), control(oversized))).toBeNull()
+  })
+
+  it("retains the 32 KiB aggregate packet cap when several bounded evidence summaries are present", () => {
+    const packet: NativeVerificationPacket = {
+      ...basePacket,
+      evidence: ["fact-1", "fact-2", "fact-3", "fact-4"].map(referenceId => ({ referenceId, kind: "tool_result" as const, summary: "x".repeat(8_100) })),
+    }
+    expect(Buffer.byteLength(canonicalNativeVerificationJson(packet), "utf8")).toBeGreaterThan(32 * 1024)
+    expect(parseNativeVerificationPacket(createNativeVerificationContext(packet), control(packet))).toBeNull()
   })
 })
