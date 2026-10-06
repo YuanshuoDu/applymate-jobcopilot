@@ -116,9 +116,32 @@ async function seed(): Promise<void> {
       'The owned job description says Harbor 9 is open.', 'fixture', CURRENT_TIMESTAMP)`, [ids.unrelatedJob, ids.user])
 }
 
-function reportFor(packet: NonNullable<ReturnType<typeof parseNativeVerificationPacket>>, ownedJobId = ids.job) {
+type JudgeDiagnostic = Readonly<{
+  targetKind: "child" | "root_goal"
+  goalMatch: boolean
+  criteriaMatch: boolean
+  candidatePositive: boolean
+  candidateNegative: boolean
+  structuredEnvelope: boolean
+  structuredFindingMatch: boolean
+  citedEvidenceMatch: boolean
+  toolResultCount: number
+  ownedReceiptToolStatus: boolean
+  exactJobIdMatch: boolean
+  descriptionMatch: boolean
+  passed: boolean
+}>
+
+function reportFor(
+  packet: NonNullable<ReturnType<typeof parseNativeVerificationPacket>>,
+  ownedJobId = ids.job,
+  recordDiagnostic?: (value: JudgeDiagnostic) => void,
+) {
   const targetText = packet.target.kind === "child" ? packet.target.resultText : packet.target.candidateText
   const requirements = packet.criteria.map(item => item.requirement)
+  const goalMatch = [childGoal, followupChildGoal, unrelatedChildGoal, goal].includes(packet.goal)
+  const criteriaMatch = (packet.goal === unrelatedChildGoal && requirements.length === 1 && requirements[0] === unrelatedChildCriteria[0])
+    || (packet.goal !== unrelatedChildGoal && requirements.length === 1 && requirements[0] === turnCriteria[0])
   const expectedFact = packet.goal === childGoal && requirements.length === 1 && requirements[0] === turnCriteria[0]
     ? { phrase: "Fact 42 is present", jobId: ownedJobId, candidatePositive: "fact 42 is present", candidateNegative: "fact 42 is absent" }
     : packet.goal === followupChildGoal && requirements.length === 1 && requirements[0] === turnCriteria[0]
@@ -130,8 +153,18 @@ function reportFor(packet: NonNullable<ReturnType<typeof parseNativeVerification
         : null
   let sourceReference: string | undefined
   let hasOwnedFact = false
+  let structuredEnvelope = false
+  let structuredFindingMatch = false
+  let citedEvidenceMatch = false
+  let toolResultCount = 0
+  let ownedReceiptToolStatus = false
+  let exactJobIdMatch = false
+  let descriptionMatch = false
   if (expectedFact && packet.target.kind === "child") {
-    let analystCitesOwnedFact = false
+    let structured: {
+      findings?: Array<{ jobId?: unknown; evidenceIds?: unknown }>
+      evidence?: Array<{ id?: unknown; kind?: unknown; ref?: unknown }>
+    } | undefined
     try {
       const result = JSON.parse(targetText) as {
         structuredResult?: {
@@ -140,20 +173,26 @@ function reportFor(packet: NonNullable<ReturnType<typeof parseNativeVerification
         }
       }
       // Only the persisted, validated analyst envelope binds facts to source IDs.
-      const structured = result.structuredResult
+      structured = result.structuredResult
+      structuredEnvelope = Boolean(structured && Array.isArray(structured.findings) && Array.isArray(structured.evidence))
       const finding = structured?.findings?.find(item => item.jobId === expectedFact.jobId && Array.isArray(item.evidenceIds))
+      structuredFindingMatch = Boolean(finding)
       const evidenceIds = new Set(Array.isArray(finding?.evidenceIds) ? finding.evidenceIds.filter((id): id is string => typeof id === "string") : [])
-      analystCitesOwnedFact = Boolean(structured?.evidence?.some(item => item.kind === "job"
+      citedEvidenceMatch = Boolean(structured?.evidence?.some(item => item.kind === "job"
         && item.ref === expectedFact.jobId && typeof item.id === "string" && evidenceIds.has(item.id)))
     } catch { /* current child result may use a bounded non-JSON final text */ }
-    if (!analystCitesOwnedFact) return failedReport(packet)
     for (const item of packet.evidence) {
       if (item.kind !== "tool_result") continue
+      toolResultCount = Math.min(20, toolResultCount + 1)
       try {
         const row = JSON.parse(item.summary) as { tool?: unknown; status?: unknown; output?: { jobs?: Array<{ id?: unknown; description?: unknown }> } }
-        const matchingJob = row.output?.jobs?.find(job => job.id === expectedFact.jobId
-          && typeof job.description === "string" && job.description.toLowerCase().includes(expectedFact.phrase.toLowerCase()))
-        if (row.tool === "jobs.search" && row.status === "completed" && matchingJob) {
+        const matchingJob = row.output?.jobs?.find(job => job.id === expectedFact.jobId)
+        exactJobIdMatch ||= Boolean(matchingJob)
+        ownedReceiptToolStatus ||= row.tool === "jobs.search" && row.status === "completed"
+        const receiptDescriptionMatch = typeof matchingJob?.description === "string"
+          && matchingJob.description.toLowerCase().includes(expectedFact.phrase.toLowerCase())
+        descriptionMatch ||= receiptDescriptionMatch
+        if (row.tool === "jobs.search" && row.status === "completed" && receiptDescriptionMatch) {
           hasOwnedFact = true
           sourceReference = item.referenceId
           break
@@ -189,8 +228,16 @@ function reportFor(packet: NonNullable<ReturnType<typeof parseNativeVerification
     }
   }
   const candidate = targetText.toLowerCase()
+  const candidatePositive = Boolean(expectedFact && candidate.includes(expectedFact.candidatePositive))
+  const candidateNegative = Boolean(expectedFact && candidate.includes(expectedFact.candidateNegative))
   const passed = Boolean(expectedFact && (hasOwnedFact || hasCurrentOwnedFact)
-    && candidate.includes(expectedFact.candidatePositive) && !candidate.includes(expectedFact.candidateNegative))
+    && candidatePositive && !candidateNegative
+    && (packet.target.kind !== "child" || (structuredEnvelope && structuredFindingMatch && citedEvidenceMatch)))
+  recordDiagnostic?.({
+    targetKind: packet.target.kind, goalMatch, criteriaMatch, candidatePositive, candidateNegative,
+    structuredEnvelope, structuredFindingMatch, citedEvidenceMatch, toolResultCount,
+    ownedReceiptToolStatus, exactJobIdMatch, descriptionMatch, passed,
+  })
   return verificationReport(packet, passed, sourceReference)
 }
 
@@ -555,6 +602,7 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
       call: number; rejectedControlFound: boolean; systemMessages: number
       sameTurnPrefix: boolean; resumePrefix: boolean; targetMatch: boolean; failedCriterion: boolean; exactFeedbackRoles: string[]
     }>> = []
+    const canonicalJudgeDiagnostics: JudgeDiagnostic[] = []
     let acceptedCandidateReady!: () => void
     let releaseAcceptedCandidate!: () => void
     const acceptedCandidateEntered = new Promise<void>(resolve => { acceptedCandidateReady = resolve })
@@ -665,7 +713,10 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
             const control = parseNativeVerificationControl(task.expectedOutputSchema)
             const packet = control && parseNativeVerificationPacket(task.context, control)
             if (!control || control.controlTaskId !== task.id || !packet) throw new Error("canonical control was not server-bound")
-            yield { type: "text_delta", text: JSON.stringify(reportFor(packet, canonical.jobId)) }
+            yield { type: "text_delta", text: JSON.stringify(reportFor(packet, canonical.jobId, diagnostic => {
+              canonicalJudgeDiagnostics.push(diagnostic)
+              if (canonicalJudgeDiagnostics.length > 8) canonicalJudgeDiagnostics.shift()
+            })) }
             yield { type: "completed", finishReason: "stop" }
             return
           }
@@ -756,7 +807,7 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
            WHERE turn."id" = $1 AND turn."sessionId" = $2 GROUP BY turn."status"`,
           [canonical.turnId, canonical.sessionId, digestNativeVerificationValue(rejectedCandidate)]).then(result => {
           const state = result.rows[0] ?? null
-          throw new Error(`canonical root did not replan to the accepted candidate; modelStreams=${rootModelStreams}; requestTrace=${JSON.stringify(rootRequestDiagnostics)}; persistedState=${JSON.stringify(state)}`)
+          throw new Error(`canonical root did not replan to the accepted candidate; modelStreams=${rootModelStreams}; requestTrace=${JSON.stringify(rootRequestDiagnostics)}; judgeTrace=${JSON.stringify(canonicalJudgeDiagnostics)}; persistedState=${JSON.stringify(state)}`)
         })
       })])
       await bootstrap.subagents.queue.worker.pause(true)
