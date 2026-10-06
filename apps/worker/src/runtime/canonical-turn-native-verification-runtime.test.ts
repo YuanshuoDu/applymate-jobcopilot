@@ -51,7 +51,8 @@ describe("canonical native verification runtime composition", () => {
 
   it("runs the native gate and validates exact persisted bytes with the terminal transaction client", async () => {
     const current = coordination()
-    const client = { query: vi.fn() } as unknown as Pick<PoolClient, "query">
+    const query = vi.fn(async (_sql: unknown, _params: unknown) => ({ rows: [{ hasPendingSteer: false }] }))
+    const client = { query } as unknown as Pick<PoolClient, "query">
     const readTerminalProof = vi.fn(async () => true)
     const { port, factory } = runtimeFactory(readTerminalProof)
     const runtime = createCanonicalNativeVerificationRuntime({
@@ -65,6 +66,8 @@ describe("canonical native verification runtime composition", () => {
     expect(runtime.accepted()).toBe(true)
     const terminal = { finalContent: { text: candidate, final: { response: candidate } }, response: JSON.stringify({ response: candidate }) }
     await expect(runtime.checkTerminal(client, terminal)).resolves.toEqual({ nativeVerificationPassed: true })
+    expect(query).toHaveBeenCalledWith(expect.stringContaining('"targetTurnId" = $3'), ["session-1", "user-1", "turn-1"])
+    expect(query.mock.invocationCallOrder[0]).toBeLessThan(readTerminalProof.mock.invocationCallOrder[0]!)
     expect(readTerminalProof).toHaveBeenCalledWith(client, { scope: readScope, candidateText: candidate, witness })
   })
 
@@ -78,9 +81,55 @@ describe("canonical native verification runtime composition", () => {
 
     const changed = "A changed final answer."
     const terminal = { finalContent: { text: changed, final: { response: changed } }, response: JSON.stringify({ response: changed }) }
-    const result = await runtime.checkTerminal({ query: vi.fn() } as unknown as Pick<PoolClient, "query">, terminal)
+    const result = await runtime.checkTerminal({ query: vi.fn(async () => ({ rows: [{ hasPendingSteer: false }] })) } as unknown as Pick<PoolClient, "query">, terminal)
 
     expect(result.denial).toMatchObject({ ok: false, blocker: "task_graph_verification_unverified" })
+    expect(readTerminalProof).not.toHaveBeenCalled()
+  })
+
+  it("blocks terminal proof when an owned Turn has accepted steering input", async () => {
+    const query = vi.fn(async (_sql: unknown, _params: unknown) => ({ rows: [{ hasPendingSteer: true }] }))
+    const client = { query } as unknown as Pick<PoolClient, "query">
+    const readTerminalProof = vi.fn(async () => true)
+    const { factory } = runtimeFactory(readTerminalProof)
+    const runtime = createCanonicalNativeVerificationRuntime({
+      pool: {} as pg.Pool, factory, coordination: coordination(), durableWaitPort: waitPort, enabled: true,
+    })
+    await runtime.checkCompletion("step-1", candidate)
+
+    const result = await runtime.checkTerminal(client, terminalInput)
+
+    expect(result).toMatchObject({
+      nativeVerificationPassed: false,
+      denial: {
+        ok: false, blocker: "task_graph_verification_unverified",
+        feedback: expect.stringContaining("new steering instruction"),
+      },
+    })
+    expect(query).toHaveBeenCalledOnce()
+    const sql = String(query.mock.calls[0]?.[0])
+    expect(sql).toContain('"sessionId" = $1 AND "userId" = $2 AND "targetTurnId" = $3')
+    expect(sql).toContain('"delivery" = \'steer\' AND "status" IN (\'accepted\', \'queued\')')
+    expect(sql).toContain('"consumedByStepId" IS NULL AND "consumedAt" IS NULL AND "cancelledAt" IS NULL')
+    expect(sql).not.toContain('"content"')
+    expect(readTerminalProof).not.toHaveBeenCalled()
+  })
+
+  it("treats malformed pending-steer query results as pending and propagates query failures", async () => {
+    const readTerminalProof = vi.fn(async () => true)
+    const { factory } = runtimeFactory(readTerminalProof)
+    const runtime = createCanonicalNativeVerificationRuntime({
+      pool: {} as pg.Pool, factory, coordination: coordination(), durableWaitPort: waitPort, enabled: true,
+    })
+    await runtime.checkCompletion("step-1", candidate)
+
+    const malformed = { query: vi.fn(async () => ({ rows: [{ hasPendingSteer: "false" }] })) } as unknown as Pick<PoolClient, "query">
+    await expect(runtime.checkTerminal(malformed, terminalInput)).resolves.toMatchObject({
+      nativeVerificationPassed: false,
+      denial: { ok: false, blocker: "task_graph_verification_unverified" },
+    })
+    const unavailable = { query: vi.fn(async () => { throw new Error("database unavailable") }) } as unknown as Pick<PoolClient, "query">
+    await expect(runtime.checkTerminal(unavailable, terminalInput)).rejects.toThrow("database unavailable")
     expect(readTerminalProof).not.toHaveBeenCalled()
   })
 
@@ -97,8 +146,11 @@ describe("canonical native verification runtime composition", () => {
     })
 
     await expect(runtime.checkCompletion("step-1", candidate)).resolves.toBeNull()
+    const query = vi.fn()
+    await expect(runtime.checkTerminal({ query } as unknown as Pick<PoolClient, "query">, terminalInput)).resolves.toEqual({ nativeVerificationPassed: false })
     expect(current.checkNativeGraphCompletion).toHaveBeenCalledOnce()
     expect(current.hasNativeTasks).not.toHaveBeenCalled()
+    expect(query).not.toHaveBeenCalled()
   })
 
   it("preserves an existing root-graph denial after a valid native proof", async () => {

@@ -759,6 +759,74 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.events.some(event => event.type === "turn.completed")).toBe(true)
   })
 
+  it("replans with a steer accepted during native finalization instead of publishing the old answer", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const inputStore = new LateSteerInputClaimStore()
+    const turnStore = root.options.store
+    const contextBuilder = new StepContextBuilder(inputStore)
+    let modelCalls = 0
+    const baseModel = root.options.model
+    root.options = {
+      ...root.options,
+      store: {
+        ...turnStore,
+        startStep: async input => {
+          inputStore.startStep(input.stepId, input.inputThroughSequence, input.consumedInputIds)
+          return turnStore.startStep(input)
+        },
+      },
+      contextBuilder: {
+        build: async request => contextBuilder.build({
+          scope: request.scope, sessionId: request.identity.sessionId, turnId: request.identity.turnId,
+          stepId: request.stepId, snapshot: request.snapshot, taskId: request.taskId, now: request.now,
+          steeringMarkerState: request.steeringMarkerState,
+        }),
+      },
+      model: {
+        ...baseModel,
+        async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+          root.requests.push(request)
+          modelCalls += 1
+          if (modelCalls === 1) {
+            yield { type: "tool_call_completed", callId: "call:root-1", name: "jobs.search", arguments: { location: "Dublin" } }
+            yield { type: "completed", finishReason: "tool_calls" }
+            return
+          }
+          yield { type: "text_delta", text: modelCalls === 2 ? "stale answer before the new steering" : "fresh answer for senior engineering roles in Dublin" }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      },
+    }
+    let steerAcceptedDuringTerminal = false
+    const persist = root.options.store.recordFinalResponse!
+    root.options.store.recordFinalResponse = async input => {
+      if (input.terminal && !steerAcceptedDuringTerminal) {
+        steerAcceptedDuringTerminal = true
+        inputStore.acceptSteer()
+        throw Object.assign(new Error("new steering arrived during native verification"), {
+          name: "TaskGraphVerificationRecovery", blocker: "task_graph_verification_unverified",
+          feedback: "A new steering instruction arrived during verification. Re-read current input and prepare a fresh answer.",
+        })
+      }
+      return persist(input)
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "completed", stepCount: 3, finalText: "fresh answer for senior engineering roles in Dublin" })
+    expect(root.requests).toHaveLength(3)
+    expect(JSON.stringify(root.requests[1]?.messages)).not.toContain(lateSteerText)
+    expect(JSON.stringify(root.requests[2]?.messages)).toContain(lateSteerText)
+    expect(inputStore.inputs).toMatchObject([{ status: "consumed", consumedByStepId: "turn:turn-1:step:2" }])
+    expect(root.finalResponses).toHaveLength(1)
+    expect(root.finalResponses[0]).toContain("fresh answer for senior engineering roles in Dublin")
+    expect(root.finalResponses[0]).not.toContain("stale answer before the new steering")
+    expect(root.events.some(event => event.type === "final.rejected")).toBe(true)
+    expect(root.events.some(event => event.type === "turn.failed")).toBe(false)
+    expect(root.notifications.filter(type => type === "turn.completed")).toHaveLength(1)
+    expect(root.stepStatuses).toEqual(["completed", "completed", "completed"])
+  })
+
   it("fails closed when the completion gate throws", async () => {
     const gate = vi.fn(async () => { throw new Error("database unavailable") })
     const root = fixture(identity("turn", "root-1"), undefined, [], gate)

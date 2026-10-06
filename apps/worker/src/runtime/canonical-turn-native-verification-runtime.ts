@@ -40,6 +40,20 @@ export type NativeVerificationTerminalCheck = Readonly<{
   denial?: TurnEngineCompletionGateResult
 }>
 
+async function hasPendingSteerOrInvalidResult(client: Pick<PoolClient, "query">, scope: TaskGraphReadScope): Promise<boolean> {
+  const result = await client.query<{ hasPendingSteer: unknown }>(`SELECT EXISTS (
+    SELECT 1 FROM "agent_inputs"
+    WHERE "sessionId" = $1 AND "userId" = $2 AND "targetTurnId" = $3
+      AND "delivery" = 'steer' AND "status" IN ('accepted', 'queued')
+      AND "consumedByStepId" IS NULL AND "consumedAt" IS NULL AND "cancelledAt" IS NULL
+  ) AS "hasPendingSteer"`, [scope.sessionId, scope.userId, scope.turnId])
+  const rows: unknown = result?.rows
+  if (!Array.isArray(rows) || rows.length !== 1) return true
+  const row = rows[0]
+  if (!row || typeof row !== "object" || Array.isArray(row) || Object.keys(row).length !== 1 || !Object.hasOwn(row, "hasPendingSteer")) return true
+  return (row as Record<string, unknown>).hasPendingSteer !== false
+}
+
 /** Preserves the selected-job artifact gate as a server-owned sibling completion path. */
 export function createCanonicalSelectedJobCompletion(input: Readonly<{
   pool: pg.Pool
@@ -190,6 +204,10 @@ export function createCanonicalNativeVerificationRuntime(input: Readonly<{
     },
     async checkTerminal(client, terminal) {
       if (!acceptedWitness) return { nativeVerificationPassed: false }
+      if (await hasPendingSteerOrInvalidResult(client, input.coordination.readScope())) return {
+        nativeVerificationPassed: false,
+        denial: { ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: "A new steering instruction arrived during verification. Re-read current input and prepare a fresh answer." },
+      }
       const candidateText = persistedFinalCandidate(terminal.finalContent, terminal.response)
       if (!candidateText || candidateText !== acceptedCandidate) return {
         nativeVerificationPassed: false,
