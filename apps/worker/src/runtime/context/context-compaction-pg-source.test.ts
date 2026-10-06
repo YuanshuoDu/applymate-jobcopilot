@@ -30,16 +30,18 @@ const priorContent = {
   },
 }
 
-function fakePool(options: { readonly contextSnapshotId?: string | null } = {}) {
+function fakePool(options: { readonly contextSnapshotId?: string | null; readonly selectedJobPreparation?: { readonly jobId: string } } = {}) {
   const calls: Array<{ sql: string; values: unknown[] }> = []
   const query = vi.fn(async (sql: string, values: unknown[] = []) => {
     calls.push({ sql, values })
     if (sql.includes('FROM "agent_sessions" AS session')) return { rows: [{ id: owner.sessionId }], rowCount: 1 }
-    if (sql.includes('FROM "agent_turns" AS turn')) return { rows: [{ id: owner.turnId, contextSnapshotId: options.contextSnapshotId ?? null }], rowCount: 1 }
+    if (sql.includes('FROM "agent_turns" AS turn')) return { rows: [{ id: owner.turnId, contextSnapshotId: options.contextSnapshotId ?? null,
+      input: options.selectedJobPreparation ? { selectedJobPreparation: options.selectedJobPreparation } : {}, rootTaskId: owner.rootTaskId }], rowCount: 1 }
     if (sql.includes('FROM "agent_sessions" WHERE')) return { rows: [{ goal: "Find a role" }], rowCount: 1 }
     if (sql.includes('FROM "agent_context_snapshots"')) return { rows: [{ id: "snapshot-7", sessionId: owner.sessionId, throughSequence: "7", version: 2, content: priorContent, checksum: "checksum" }], rowCount: 1 }
     if (sql.includes('FROM "agent_approvals"')) return { rows: [{ id: "approval-1", status: "approved", scopeHash: "scope", answersHash: "answers" }], rowCount: 1 }
     if (sql.includes('FROM "agent_artifact_version"')) return { rows: [{ id: "artifact-v2", type: "resume", hash: "hash-v2" }], rowCount: 1 }
+    if (sql.includes('FROM "sub_agent_tasks" AS task')) return { rows: [{ attemptCount: 3 }], rowCount: 1 }
     if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ id: "task-open", status: "running", failureReason: null }], rowCount: 1 }
     if (sql.includes('FROM "agent_inputs"')) return { rows: [
       { id: "input-old", targetTurnId: "turn-old", acceptedSequence: "4", content: { text: "old input" } },
@@ -58,7 +60,7 @@ function fakePool(options: { readonly contextSnapshotId?: string | null } = {}) 
   })
   const client = { query, release: vi.fn() } as unknown as CompactionPgClient
   const pool = { connect: vi.fn(async () => client) } as unknown as CompactionPgPool
-  return { pool, calls, query }
+  return { pool, calls, query, client }
 }
 
 describe("PostgreSQL context compaction source", () => {
@@ -76,6 +78,8 @@ describe("PostgreSQL context compaction source", () => {
       artifacts: expect.arrayContaining([{ id: "artifact-v1", type: "resume", hash: "hash-v1" }, { id: "artifact-v2", type: "resume", hash: "hash-v2" }]),
       openTasks: [{ taskId: "task-open", status: "running", blocker: null }], doNotRepeat: ["old failed path"], facts: [{ factId: "fact-1", key: "role", source: "user" }],
     })
+    expect(source?.state.selectedJobMemories).toEqual([])
+    expect(fake.calls.some(call => call.sql.includes('FROM "sub_agent_tasks" AS task'))).toBe(false)
     expect(source?.items).toEqual([
       { id: "context-compaction-summary:snapshot-7", sessionId: owner.sessionId, turnId: owner.turnId, sequence: 7n, type: "compaction_summary", status: "completed", content: "prior summary" },
       { id: "input:input-new", sessionId: owner.sessionId, turnId: owner.turnId, sequence: 8n, type: "user_input", status: "completed", content: { text: "new input" } },
@@ -104,5 +108,50 @@ describe("PostgreSQL context compaction source", () => {
     const fake = fakePool({ contextSnapshotId: "explicit-snapshot" })
     await expect(createPgCompactionSource(fake.pool).load({ scope: { userId: owner.userId }, owner })).resolves.toBeNull()
     expect(fake.calls.some(call => call.sql.includes('FROM "agent_items"'))).toBe(false)
+  })
+
+  it("reads the selected-job graph through the lease-fenced transaction and stores only its typed projection", async () => {
+    const fake = fakePool({ selectedJobPreparation: { jobId: "job-a" } })
+    const graph = { revision: 2, nodes: [{
+      key: "scout-key", taskId: "scout-task", templateId: "scout", status: "completed", readiness: "terminal", goal: "private narrative",
+      successCriteria: ["private criteria"], dependsOn: [], resultSummary: "private summary", failureReason: null, resultProjection: {
+        schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted", availability: "available",
+        role: "scout", status: "completed", candidateCount: 2, evidenceCount: 1,
+        candidates: [{ jobId: "job-a", source: "greenhouse", evidenceKinds: ["job"] }, { jobId: "job-b", source: "lever", evidenceKinds: ["resume"] }],
+      },
+    }] }
+    const readCurrentWithClient = vi.fn(async (_client: unknown, _scope: unknown) => graph)
+    const taskGraph = { readCurrent: vi.fn(), readCurrentWithClient } as never
+    const source = await createPgCompactionSource(fake.pool, taskGraph).load({ scope: { userId: owner.userId }, owner })
+
+    expect(readCurrentWithClient).toHaveBeenCalledOnce()
+    expect(readCurrentWithClient.mock.calls[0]?.[0]).toBe(fake.client)
+    expect(readCurrentWithClient.mock.calls[0]?.[1]).toMatchObject({
+      userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId, parentTaskId: owner.rootTaskId,
+      turnLeaseOwner: owner.ownerId, turnLeaseVersion: owner.leaseVersion, parentLeaseOwner: owner.ownerId, parentAttemptCount: 3,
+    })
+    expect(source?.state.selectedJobMemories?.[0]).toMatchObject({
+      jobId: "job-a", sourceTurnId: owner.turnId, sourceRootTaskId: owner.rootTaskId, graphRevision: 2,
+      nodes: [{ role: "scout", result: { source: "greenhouse", evidenceKinds: ["job"] } }],
+    })
+    const serialized = JSON.stringify(source?.state.selectedJobMemories)
+    expect(serialized).not.toContain("job-b")
+    expect(serialized).not.toContain("private narrative")
+    expect(serialized).not.toContain("scout-task")
+    expect(fake.calls.at(-1)?.sql).toBe("COMMIT")
+  })
+
+  it("rejects source loading and rolls back when the selected-job graph read fails", async () => {
+    const fake = fakePool({ selectedJobPreparation: { jobId: "job-a" } })
+    const graphError = new Error("task graph query failed")
+    const readCurrentWithClient = vi.fn().mockRejectedValue(graphError)
+    const taskGraph = { readCurrent: vi.fn(), readCurrentWithClient } as never
+
+    await expect(createPgCompactionSource(fake.pool, taskGraph).load({ scope: { userId: owner.userId }, owner }))
+      .rejects.toBe(graphError)
+
+    expect(readCurrentWithClient).toHaveBeenCalledOnce()
+    expect(fake.calls.at(-1)?.sql).toBe("ROLLBACK")
+    expect(fake.calls.some(call => call.sql === "COMMIT")).toBe(false)
   })
 })

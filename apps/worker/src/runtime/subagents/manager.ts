@@ -13,9 +13,8 @@ import {
 } from "./types.js"
 import { isSubagentRetryDue } from "./retry-policy.js"
 import { isTaskPathWithin, normalizeTaskPath, policyFromTask } from "./manager-task-scope.js"
-import { finishInterrupted, type SubagentRunOutcome } from "./manager-run-outcome.js"
+import { runClaimedSubagent, type SubagentRunOutcome } from "./manager-run-outcome.js"
 import { isSessionPauseRequestedError } from "../session-gate.js"
-
 export type { SubagentRunOutcome } from "./manager-run-outcome.js"
 
 export interface SubagentClock {
@@ -112,32 +111,7 @@ export class AgentTreeManager {
     }
     if (!lease) return { taskId: payload.taskId, status: "skipped", reason: "not_available" }
     const active = this.active.get(payload.taskId)!
-    try {
-      let result: SubagentExecutionResult
-      try {
-        result = await Promise.race([execute({ lease }), active.lost.then(error => { throw error })])
-      } catch (error: unknown) {
-        if (isSessionPauseRequestedError(error)) {
-          const released = await this.store.release?.({ taskId: payload.taskId, sessionId: payload.sessionId, ownerId: payload.ownerId, attemptCount: lease.attemptCount, now: this.now() }).catch(() => false)
-          return { taskId: payload.taskId, status: released ? "retrying" : "skipped", reason: "session_pause_requested" }
-        }
-        if (error instanceof SubagentLeaseError) {
-          if (!active.interrupted) return { taskId: payload.taskId, status: "lease_lost", reason: error.message }
-          return await finishInterrupted(this.store, payload, lease, error, this.now())
-        }
-        result = { status: "failed", failureReason: error instanceof Error ? error.message : "Subagent execution failed" }
-      }
-      const status = await this.store.finish({
-        taskId: payload.taskId, sessionId: payload.sessionId, ownerId: payload.ownerId,
-        attemptCount: lease.attemptCount,
-        status: result.status, result: result.result, failureReason: result.failureReason, retryDisposition: result.retryDisposition, now: this.now(),
-        ...(result.status === "completed" ? { mailboxMessageIds: result.mailboxMessageIds } : {}),
-      })
-      if (!status) return { taskId: payload.taskId, status: "lease_lost", reason: "Subagent lease was fenced" }
-      return { taskId: payload.taskId, status }
-    } finally {
-      this.dispose(payload.taskId, active)
-    }
+    return runClaimedSubagent(this.store, payload, lease, active, execute, () => this.now(), () => this.dispose(payload.taskId, active))
   }
 
   async heartbeat(taskId: string, now = this.now()): Promise<boolean> {
@@ -195,6 +169,16 @@ export class AgentTreeManager {
     return count
   }
 
+  /** Signals only active leases whose IDs were selected by the durable task-interrupt transaction. */
+  signalTaskSubtree(sessionId: string, rootTaskId: string, taskIds: readonly string[]): void {
+    const selected = new Set(taskIds)
+    for (const active of this.active.values()) {
+      if (active.lease.sessionId === sessionId && active.lease.rootTaskId === rootTaskId && selected.has(active.lease.id)) {
+        this.signalLoss(active, true, new SubagentLeaseError("lost", "Subagent task subtree was interrupted"))
+      }
+    }
+  }
+
   /** Stop active children and release their leases before Worker resources close. */
   async shutdown(): Promise<void> {
     const active = [...this.active.values()]
@@ -242,5 +226,4 @@ export class AgentTreeManager {
     active.controller.abort(error)
     active.resolveLost(error)
   }
-
 }
