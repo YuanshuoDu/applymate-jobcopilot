@@ -16,10 +16,17 @@ export async function lockSubagentSession(client: Queryable, input: { sessionId:
   if (!session.rows[0] || sessionStatus === "aborted" || sessionStatus === "archived") throw new Error("Session is unavailable")
 }
 
+export class SubagentTurnUnavailableError extends Error {
+  constructor() {
+    super("Subagent Turn is unavailable")
+    this.name = "SubagentTurnUnavailableError"
+  }
+}
+
 export async function lockSubagentTurn(client: Queryable, input: { sessionId: string; userId: string; turnId: string }): Promise<void> {
   const turn = await client.query(`SELECT "id" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3
     AND "status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled') FOR UPDATE`, [input.turnId, input.sessionId, input.userId])
-  if (!turn.rows[0]) throw new Error("Subagent Turn is unavailable")
+  if (!turn.rows[0]) throw new SubagentTurnUnavailableError()
 }
 
 export async function lockSubagentTurnForWork(client: Queryable, input: { sessionId: string; userId: string; turnId: string }): Promise<void> {
