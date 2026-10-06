@@ -710,6 +710,52 @@ describe("AgentCommandService", () => {
     expect(fake.state.outbox).toHaveLength(0)
   })
 
+  it("rejects replacement goals over 2,000 UTF-8 bytes before opening a transaction", async () => {
+    const oversizedContent: Array<Array<{ type: "text"; text: string }>> = [
+      [{ type: "text", text: "x".repeat(2_001) }],
+      [{ type: "text", text: "你".repeat(667) }],
+      [{ type: "text", text: "x".repeat(1_000) }, { type: "text", text: "y".repeat(1_000) }],
+    ]
+
+    for (const [index, content] of oversizedContent.entries()) {
+      const fake = makeDb({ sessionStatus: "running", activeSource: "user" })
+      await expect(new AgentCommandService(fake.db).replaceObjective({
+        ...replacementCommand("replace_oversized_" + index, "turn_1"),
+        content,
+      })).rejects.toMatchObject({ code: "invalid_command", status: 422 })
+      expect(fake.state.transactionCount).toBe(0)
+      expect(fake.tx.agentTurn.updateMany).not.toHaveBeenCalled()
+      expect(fake.tx.agentTurn.create).not.toHaveBeenCalled()
+      expect(fake.state.inputs).toHaveLength(0)
+      expect(fake.state.outbox).toHaveLength(0)
+    }
+  })
+
+  it("accepts exactly 2,000 UTF-8 bytes and persists that replacement goal", async () => {
+    const fake = makeDb({ sessionStatus: "running", activeSource: "user" })
+    const goal = "x".repeat(2_000)
+    const result = await new AgentCommandService(fake.db).replaceObjective({
+      ...replacementCommand("replace_exact_boundary", "turn_1"),
+      content: [{ type: "text", text: goal }],
+    })
+
+    const successor = fake.state.turns.find((turn) => turn.id === result.turnId)
+    expect(successor?.input).toMatchObject({ goal })
+  })
+
+  it("keeps the ordinary message text limit independent from replacement objectives", async () => {
+    const fake = makeDb()
+    const text = "x".repeat(20_000)
+    const result = await new AgentCommandService(fake.db).message({
+      ...startCommand("ordinary_long_message"),
+      delivery: "follow_up",
+      content: [{ type: "text", text }],
+    })
+
+    expect(result.disposition).toBe("started")
+    expect(fake.state.turns[0]?.input).toMatchObject({ goal: text })
+  })
+
   it("rejects automation and blank-text calls before opening a transaction", async () => {
     const fake = makeDb({ sessionStatus: "running", activeSource: "user" })
     const service = new AgentCommandService(fake.db)

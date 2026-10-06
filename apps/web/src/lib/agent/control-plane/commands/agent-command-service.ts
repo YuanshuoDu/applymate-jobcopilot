@@ -96,8 +96,9 @@ export class AgentCommandService {
       throw invalidCommand("Objective replacement requires the current Turn ID and revision")
     }
     assertContent(command.content)
-    if (!command.content.some((part) => part.type === "text" && part.text.trim().length > 0)) {
-      throw invalidCommand("Objective replacement requires nonblank human text")
+    const goal = command.content.filter((part) => part.type === "text").map((part) => part.text).join("\n").trim()
+    if (!goal || new TextEncoder().encode(goal).byteLength > 2_000) {
+      throw invalidCommand("Replacement objective must contain 1 to 2,000 UTF-8 bytes")
     }
     return this.retryUnique(() => this.replaceObjectiveOnce(command))
   }
