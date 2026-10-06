@@ -141,6 +141,89 @@ describe('versioned Plan Ledger contract', () => {
     expect(JSON.stringify(parseTaskGraphSnapshot(repaired))).not.toMatch(/verification|repairOf|candidate-count/)
   })
 
+  it('accepts actual native spawn and followup snapshots, including empty criteria, without projecting metadata', () => {
+    const metadata = {
+      schemaVersion: 'agent-harness.v2.task-graph.native-delegation.v1', operationKind: 'spawn',
+      operationId: 'native-spawn-1', requestFingerprint: 'a'.repeat(64), callerTaskId: rootTaskId,
+      role: 'auditor', taskType: 'audit', contextDigest: 'b'.repeat(64), contextBytes: 12,
+    }
+    const source = {
+      taskId: 'source-task', rootTaskId, parentTaskId: rootTaskId, turnId: 'turn-1',
+      role: 'auditor', taskType: 'audit', status: 'failed', attemptCount: 1,
+      resultDigest: 'd'.repeat(64), graphNodeKey: null, origin: 'native_legacy',
+    }
+    const nativeGraph = {
+      schemaVersion: TASK_GRAPH_SCHEMA_VERSION,
+      nodes: [
+        { key: 'native-spawn', templateId: 'native', goal: 'Audit the source', successCriteria: [], dependsOn: [], depth: 1,
+          taskId: 'native-child-1', verificationDisposition: 'legacy_unverified', nativeDelegation: metadata },
+        { key: 'native-followup', templateId: 'native', goal: 'Refine the audit', successCriteria: [], dependsOn: [], depth: 1,
+          taskId: 'native-child-2', verificationDisposition: 'legacy_unverified',
+          nativeDelegation: { ...metadata, operationKind: 'followup', operationId: 'native-followup-1', source } },
+      ],
+    }
+
+    const parsed = parseTaskGraphSnapshot(nativeGraph)
+    expect(parsed?.nodes.map(node => [node.key, node.successCriteria])).toEqual([['native-spawn', []], ['native-followup', []]])
+    expect(JSON.stringify(parsed)).not.toMatch(/nativeDelegation|contextDigest|requestFingerprint|source-task|resultDigest/)
+
+    const ledger = projectPlanLedger({ sessionId, revision: 7, rootTaskId, graph: nativeGraph, tasks: [
+      { id: rootTaskId, sessionId, status: 'running', goal: 'Native coordination plan' },
+      { id: 'native-child-1', sessionId, status: 'completed', role: 'auditor', goal: 'Audit completed', hasResult: true, result: 'PRIVATE_NATIVE_RESULT' },
+      { id: 'native-child-2', sessionId, status: 'failed', role: 'auditor', goal: 'Followup failed', hasResult: true, result: 'PRIVATE_FOLLOWUP_RESULT' },
+    ] })
+    expect(ledger?.nodes.map(node => [node.key, node.status, node.readiness])).toEqual([
+      ['native-spawn', 'completed', 'terminal'], ['native-followup', 'failed', 'terminal'],
+    ])
+    const serialized = JSON.stringify(ledger)
+    expect(serialized).not.toMatch(/nativeDelegation|native-operation|resultDigest|contextDigest|PRIVATE_NATIVE|PRIVATE_FOLLOWUP|passed/)
+  })
+
+  it('allows empty criteria only for strict native nodes and rejects malformed native declarations', () => {
+    const nativeMetadata = {
+      schemaVersion: 'agent-harness.v2.task-graph.native-delegation.v1', operationKind: 'spawn',
+      operationId: 'native-operation', requestFingerprint: 'a'.repeat(64), callerTaskId: rootTaskId,
+      role: 'auditor', taskType: 'audit', contextDigest: 'b'.repeat(64), contextBytes: 0,
+    }
+    const native = {
+      key: 'native-node', templateId: 'native', goal: 'Audit', successCriteria: [], dependsOn: [], depth: 1,
+      taskId: 'native-task', verificationDisposition: 'legacy_unverified', nativeDelegation: nativeMetadata,
+    }
+    expect(parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SCHEMA_VERSION, nodes: [native] })).not.toBeNull()
+    for (const malformed of [
+      { ...native, nativeDelegation: undefined },
+      { ...native, nativeDelegation: { ...nativeMetadata, privateContext: { secret: true } } },
+      { ...native, nativeDelegation: { ...nativeMetadata, authority: 'approved' } },
+      { ...native, nativeDelegation: { ...nativeMetadata, operationKind: 'followup' } },
+      { ...native, templateId: 'scout' },
+      { ...native, verificationDisposition: 'typed', verification },
+      { ...graph.nodes[0]!, successCriteria: [] },
+      { ...graph.nodes[0]!, successCriteria: [], verificationDisposition: 'legacy_unverified' },
+    ]) expect(parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SCHEMA_VERSION, nodes: [malformed] })).toBeNull()
+  })
+
+  it('applies Worker native field bounds only to strict native nodes', () => {
+    const nativeMetadata = {
+      schemaVersion: 'agent-harness.v2.task-graph.native-delegation.v1', operationKind: 'spawn',
+      operationId: 'native-operation', requestFingerprint: 'a'.repeat(64), callerTaskId: rootTaskId,
+      role: 'auditor', taskType: 'audit', contextDigest: 'b'.repeat(64), contextBytes: 0,
+    }
+    const native = {
+      key: 'native-node', templateId: 'native', goal: 'g'.repeat(4_000),
+      successCriteria: Array.from({ length: 32 }, () => 'c'.repeat(1_000)), dependsOn: [], depth: 1,
+      taskId: 'native-task', verificationDisposition: 'legacy_unverified', nativeDelegation: nativeMetadata,
+    }
+    const snapshot = { schemaVersion: TASK_GRAPH_SCHEMA_VERSION, nodes: [native] }
+    expect(new TextEncoder().encode(JSON.stringify(snapshot)).byteLength).toBeLessThan(40_000)
+    expect(parseTaskGraphSnapshot(snapshot)?.nodes[0]?.successCriteria).toHaveLength(32)
+    expect(parseTaskGraphSnapshot({ ...snapshot, nodes: [{ ...native, goal: 'g'.repeat(4_001) }] })).toBeNull()
+    expect(parseTaskGraphSnapshot({ ...snapshot, nodes: [{ ...native, successCriteria: [...native.successCriteria, 'extra'] }] })).toBeNull()
+    expect(parseTaskGraphSnapshot({ ...snapshot, nodes: [{ ...native, successCriteria: ['c'.repeat(1_001)] }] })).toBeNull()
+
+    const ordinary = { ...graph.nodes[0]!, goal: 'g'.repeat(1_201), successCriteria: Array.from({ length: 9 }, () => 'c'.repeat(321)) }
+    expect(parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SCHEMA_VERSION, nodes: [ordinary] })).toBeNull()
+  })
+
   it('keeps the entire projected DTO free of graph and result metadata while retaining safe previews', () => {
     const scoutVerification = {
       schemaVersion: 'agent-harness.v2.task-graph-verification.v1', role: 'scout',

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import type { TimelineItem } from './timeline-reducer'
 import type { SupervisorTaskSummary } from './task-tree-projection'
-import { projectCurrentTaskGraph } from './task-graph-plan'
+import { parseTaskGraphSnapshot, projectCurrentTaskGraph } from './task-graph-plan'
 
 const sessionId = 'session-1'
 const schemaVersion = 'agent-harness.v2.task-graph'
@@ -27,6 +27,59 @@ function task(overrides: Partial<SupervisorTaskSummary> = {}): SupervisorTaskSum
 }
 
 describe('TaskGraph plan projection', () => {
+  it('projects persisted native spawn and followup nodes using owned task states only', () => {
+    const metadata = {
+      schemaVersion: 'agent-harness.v2.task-graph.native-delegation.v1', operationKind: 'spawn',
+      operationId: 'native-spawn-1', requestFingerprint: 'a'.repeat(64), callerTaskId: 'root-task',
+      role: 'auditor', taskType: 'audit', contextDigest: 'b'.repeat(64), contextBytes: 10,
+    }
+    const source = {
+      taskId: 'legacy-source', rootTaskId: 'root-task', parentTaskId: null, turnId: 'turn-1',
+      role: 'auditor', taskType: 'audit', status: 'failed', attemptCount: 1,
+      resultDigest: 'd'.repeat(64), graphNodeKey: null, origin: 'native_legacy',
+    }
+    const nativeContent = {
+      schemaVersion,
+      nodes: [
+        { key: 'native-spawn', templateId: 'native', goal: 'Snapshot spawn goal', successCriteria: [], dependsOn: [], depth: 1,
+          taskId: 'native-child-1', verificationDisposition: 'legacy_unverified', nativeDelegation: metadata },
+        { key: 'native-followup', templateId: 'native', goal: 'Snapshot followup goal', successCriteria: [], dependsOn: [], depth: 1,
+          taskId: 'native-child-2', verificationDisposition: 'legacy_unverified',
+          nativeDelegation: { ...metadata, operationKind: 'followup', operationId: 'native-followup-1', source } },
+      ],
+    }
+    const privateResult = {
+      nativeVerificationReport: { status: 'passed', narrative: 'PRIVATE_VERIFIER_NARRATIVE' },
+      packet: { targetBody: 'PRIVATE_TARGET_BODY' },
+    }
+    for (const node of nativeContent.nodes) {
+      Object.freeze(node.successCriteria)
+      Object.freeze(node.dependsOn)
+      if ('source' in node.nativeDelegation) Object.freeze(node.nativeDelegation.source)
+      Object.freeze(node.nativeDelegation)
+      Object.freeze(node)
+    }
+    Object.freeze(nativeContent.nodes)
+    Object.freeze(nativeContent)
+    const graphItems = [graphItem(nativeContent)]
+    const ownedTasks = [
+      task({ id: 'root-task', role: 'orchestrator', taskType: 'root', status: 'running', goal: 'Native plan goal' }),
+      { ...task({ id: 'native-child-1', role: 'auditor', taskType: 'audit', status: 'completed', goal: 'Owned completed task', hasResult: true }), result: privateResult } as unknown as SupervisorTaskSummary,
+      { ...task({ id: 'native-child-2', role: 'auditor', taskType: 'audit', status: 'failed', goal: 'Owned failed task', hasResult: true }), result: privateResult } as unknown as SupervisorTaskSummary,
+      task({ id: 'native-child-1', sessionId: 'session-2', status: 'passed', goal: 'CROSS_SESSION_SECRET' }),
+    ]
+    expect(parseTaskGraphSnapshot(nativeContent)).not.toBeNull()
+    expect(projectCurrentTaskGraph(graphItems, ownedTasks, sessionId)).not.toBeNull()
+    const projection = projectCurrentTaskGraph(graphItems, ownedTasks, sessionId)
+
+    expect(projection?.nodes.map(node => [node.key, node.goal, node.status, node.readiness])).toEqual([
+      ['native-spawn', 'Owned completed task', 'completed', 'terminal'],
+      ['native-followup', 'Owned failed task', 'failed', 'terminal'],
+    ])
+    const serialized = JSON.stringify(projection)
+    expect(serialized).not.toMatch(/nativeDelegation|native-followup-1|contextDigest|requestFingerprint|resultDigest|PRIVATE_|CROSS_SESSION_SECRET|passed/)
+  })
+
   it('normalizes a legacy passed dependency to completed before deriving dependent readiness', () => {
     const projection = projectCurrentTaskGraph([graphItem({
       schemaVersion,

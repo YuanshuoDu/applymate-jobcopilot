@@ -1,4 +1,5 @@
 import type { TaskGraphSnapshotNode } from "./plan-ledger.js"
+import { isStrictNativeTaskGraphNode } from "./plan-ledger-native-metadata.js"
 
 const BASE_KEYS = "dependsOn,depth,goal,key,successCriteria,taskId,templateId"
 const DISPOSITION_KEYS = BASE_KEYS + ",verificationDisposition"
@@ -84,7 +85,11 @@ function repairOf(value: unknown): boolean {
 export function parsePersistedTaskGraphNode(value: unknown): TaskGraphSnapshotNode | null {
   try {
     if (!record(value)) return null
-    const shape = exact(value, BASE_KEYS) ? "base"
+    const nativeDeclared = Object.hasOwn(value, "nativeDelegation") || value.templateId === "native"
+    const native = isStrictNativeTaskGraphNode(value)
+    if (nativeDeclared && !native) return null
+    const shape = native ? "native"
+      : exact(value, BASE_KEYS) ? "base"
       : exact(value, DISPOSITION_KEYS) ? "disposition"
         : exact(value, VERIFICATION_KEYS) ? "verification"
           : exact(value, REPAIR_KEYS) ? "repair" : null

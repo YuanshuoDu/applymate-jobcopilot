@@ -27,6 +27,40 @@ const tasks: SupervisorTaskSummary[] = [{
 }]
 
 describe('TaskGraphPlanPanel', () => {
+  it('renders the latest native graph from owned task state without exposing private metadata or implying pass', () => {
+    const metadata = {
+      schemaVersion: 'agent-harness.v2.task-graph.native-delegation.v1', operationKind: 'spawn',
+      operationId: 'native-operation-1', requestFingerprint: 'a'.repeat(64), callerTaskId: 'root-task',
+      role: 'auditor', taskType: 'audit', contextDigest: 'b'.repeat(64), contextBytes: 12,
+    }
+    const source = {
+      taskId: 'legacy-source', rootTaskId: 'root-task', parentTaskId: null, turnId: 'turn-1',
+      role: 'auditor', taskType: 'audit', status: 'failed', attemptCount: 1,
+      resultDigest: 'd'.repeat(64), graphNodeKey: null, origin: 'native_legacy',
+    }
+    const nativeItem = item({ schemaVersion: 'agent-harness.v2.task-graph', nodes: [
+      { key: 'native-spawn', templateId: 'native', goal: 'PRIVATE_SNAPSHOT_GOAL', successCriteria: [], dependsOn: [], depth: 1,
+        taskId: 'native-child-1', verificationDisposition: 'legacy_unverified', nativeDelegation: metadata },
+      { key: 'native-followup', templateId: 'native', goal: 'PRIVATE_FOLLOWUP_GOAL', successCriteria: [], dependsOn: [], depth: 1,
+        taskId: 'native-child-2', verificationDisposition: 'legacy_unverified',
+        nativeDelegation: { ...metadata, operationKind: 'followup', operationId: 'native-operation-2', source } },
+    ] }, '2026-09-23T12:00:00.000Z', 7)
+    const ownedTasks: SupervisorTaskSummary[] = [
+      { ...tasks[0]!, goal: 'Native plan' },
+      { ...tasks[1]!, id: 'native-child-1', role: 'auditor', taskType: 'audit', goal: 'Completed native work', status: 'completed', hasResult: true },
+      { ...tasks[1]!, id: 'native-child-2', role: 'auditor', taskType: 'audit', goal: 'Failed native followup', status: 'failed', hasResult: true },
+    ]
+    const html = renderToStaticMarkup(<TaskGraphPlanPanel sessionId="session-1" items={[nativeItem]} tasks={ownedTasks} />)
+
+    expect(html).toContain('aria-label="Current plan"')
+    expect(html).toContain('Completed native work')
+    expect(html).toContain('Failed native followup')
+    expect(html).toContain('Completed')
+    expect(html).toContain('Failed')
+    expect(html).not.toMatch(/nativeDelegation|native-operation|requestFingerprint|contextDigest|resultDigest|PRIVATE_/)
+    expect(html).not.toMatch(/Passed|Semantic pass/i)
+  })
+
   it('rejects a valid but stale Plan Ledger from another session', () => {
     const foreignItems = [item({ schemaVersion: 'agent-harness.v2.task-graph', nodes: [
       { key: 'foreign', templateId: 'scout', goal: 'CROSS_SESSION_LEDGER_SECRET', successCriteria: ['criterion'], dependsOn: [], depth: 1, taskId: 'foreign-task' },

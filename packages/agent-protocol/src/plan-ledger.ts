@@ -1,4 +1,5 @@
 import { parsePersistedTaskGraphNode, validTaskGraphResultEnvelopeKeys } from './plan-ledger-task-graph-metadata.js'
+import { isStrictNativeTaskGraphNode } from './plan-ledger-native-metadata.js'
 
 export const PLAN_LEDGER_SCHEMA_VERSION = 'agent-harness.v2.plan-ledger'
 export const TASK_GRAPH_SCHEMA_VERSION = 'agent-harness.v2.task-graph', TASK_GRAPH_MAX_IDENTIFIER_LENGTH = 128
@@ -171,16 +172,21 @@ export function parseTaskGraphSnapshot(value: unknown): TaskGraphSnapshot | null
       || !strictDense(content.nodes, MAX_NODES) || bytes(content) > MAX_SNAPSHOT_BYTES) return null
     const nodes: TaskGraphSnapshotNode[] = [], keys = new Set<string>(), ids = new Set<string>()
     for (const raw of content.nodes) {
+      const native = isStrictNativeTaskGraphNode(raw)
       const node = parsePersistedTaskGraphNode(raw)
+      const goalLength = native ? 4_000 : MAX_GOAL_LENGTH
+      const criteriaCount = native ? 32 : MAX_SUCCESS_CRITERIA
+      const criterionLength = native ? 1_000 : MAX_CRITERION_LENGTH
       if (!node || !text(node.key, TASK_GRAPH_MAX_IDENTIFIER_LENGTH) || !text(node.templateId, TASK_GRAPH_MAX_IDENTIFIER_LENGTH)
-        || !text(node.goal, MAX_GOAL_LENGTH) || !text(node.taskId, TASK_GRAPH_MAX_IDENTIFIER_LENGTH)
-        || !strictDense(node.successCriteria, MAX_SUCCESS_CRITERIA) || node.successCriteria.length === 0
-        || !node.successCriteria.every(item => text(item, MAX_CRITERION_LENGTH))
+        || !text(node.goal, goalLength) || !text(node.taskId, TASK_GRAPH_MAX_IDENTIFIER_LENGTH)
+        || !strictDense(node.successCriteria, criteriaCount) || node.successCriteria.length === 0 && !native
+        || !node.successCriteria.every(item => text(item, criterionLength))
         || !strictDense(node.dependsOn, MAX_DEPENDENCIES) || !node.dependsOn.every(item => text(item, TASK_GRAPH_MAX_IDENTIFIER_LENGTH))
         || new Set(node.dependsOn).size !== node.dependsOn.length || !Number.isSafeInteger(node.depth)
         || Number(node.depth) < 1 || Number(node.depth) > MAX_DEPTH || keys.has(node.key) || ids.has(node.taskId)) return null
       keys.add(node.key); ids.add(node.taskId)
-      nodes.push({ ...node, successCriteria: [...node.successCriteria], dependsOn: [...node.dependsOn], depth: Number(node.depth) })
+      const projected = { ...node, successCriteria: [...node.successCriteria], dependsOn: [...node.dependsOn], depth: Number(node.depth) }
+      nodes.push(projected)
     }
     if (nodes.some(node => node.dependsOn.some(key => !keys.has(key))) || !acyclic(nodes)) return null
     return { nodes }
