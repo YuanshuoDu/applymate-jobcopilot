@@ -424,6 +424,7 @@ describe("createCanonicalTurnRuntime", () => {
 
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed" })
     expect(runner).toHaveBeenCalledOnce()
+    expect(runner).toHaveBeenCalledWith(expect.objectContaining({ taskGraphCommandPort: graph }))
     expect(loadOptions).toEqual([{ consumeWaitOutcomes: true }, { consumeWaitOutcomes: false }])
     expect(graph.readCurrent).toHaveBeenCalledTimes(3)
     expect(observedSnapshots[0]?.goal).toEqual(initial.snapshot.goal)

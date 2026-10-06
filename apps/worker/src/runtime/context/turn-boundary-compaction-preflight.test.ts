@@ -4,6 +4,7 @@ import type { CompactionSource } from "./context-compaction-types.js"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import type { TurnLease } from "../turns/lease.js"
 import type { CanonicalTurnState } from "../canonical-turn-state.js"
+import { projectSelectedJobMemory } from "./selected-job-memory.js"
 
 const source: CompactionSource = {
   state: {
@@ -20,6 +21,7 @@ const itemThresholdSource: CompactionSource = {
   })),
 }
 const loadSource = vi.fn(async () => source)
+const compactionSourceCalls: unknown[][] = []
 const publishedItemIds: string[] = []
 const startedItemIds: string[] = []
 const compactionPort = {
@@ -32,11 +34,13 @@ const compactionPort = {
   recordFailed: vi.fn(async () => undefined),
 }
 
-vi.mock("./context-compaction-pg-source.js", () => ({ createPgCompactionSource: () => ({ load: loadSource }) }))
+vi.mock("./context-compaction-pg-source.js", () => ({ createPgCompactionSource: (...args: unknown[]) => {
+  compactionSourceCalls.push(args)
+  return { load: loadSource }
+} }))
 vi.mock("./context-snapshot-compaction-pg.js", () => ({ createPgContextSnapshotCompactionPort: () => compactionPort }))
 
 import { runTurnBoundaryCompactionPreflight, runTurnBoundaryContextCompaction } from "./turn-boundary-compaction-preflight.js"
-import { createPgCompactionSource } from "./context-compaction-pg-source.js"
 import { createPgContextSnapshotCompactionPort } from "./context-snapshot-compaction-pg.js"
 
 const lease: TurnLease = {
@@ -55,6 +59,16 @@ function state(overrides: Partial<CanonicalTurnState> = {}): CanonicalTurnState 
     },
     ...overrides,
   }
+}
+
+const selectedJobMemory = projectSelectedJobMemory({
+  jobId: "job-1", sourceTurnId: "turn-1", sourceRootTaskId: "root-1", throughSequence: "100",
+  graph: { revision: 2, nodes: [{ key: "scout-key", taskId: "scout-task", templateId: "scout", status: "completed", readiness: "terminal" }] },
+})
+if (!selectedJobMemory) throw new Error("Invalid selected-job memory fixture")
+const itemThresholdSourceWithMemory: CompactionSource = {
+  ...itemThresholdSource,
+  state: { ...itemThresholdSource.state, selectedJobMemories: [selectedJobMemory] },
 }
 
 function model(
@@ -116,31 +130,42 @@ describe("turn-boundary context compaction preflight", () => {
   it("evaluates thresholds at the turn boundary and compacts at the item-count threshold", async () => {
     loadSource.mockClear(); compactionPort.publishAtomically.mockClear(); compactionPort.recordFailed.mockClear()
     compactionPort.recordStarted.mockClear(); compactionPort.loadLatest.mockClear()
-    loadSource.mockReset().mockResolvedValue(itemThresholdSource)
+    loadSource.mockReset().mockResolvedValueOnce(itemThresholdSource).mockResolvedValueOnce(itemThresholdSourceWithMemory)
+    compactionSourceCalls.length = 0
     publishedItemIds.length = 0; startedItemIds.length = 0
     const requests: HarnessModelRequest[] = []
+    const pool = { connect: vi.fn() }
+    const taskGraphCommandPort = { readCurrent: vi.fn(), readCurrentWithClient: vi.fn() }
     const result = await runTurnBoundaryContextCompaction({
-      pool: { connect: vi.fn() }, scope: { userId: "user-1" }, owner, lease, model: model(undefined, requests), signal: new AbortController().signal,
+      pool, scope: { userId: "user-1" }, owner, lease, taskGraphCommandPort: taskGraphCommandPort as never,
+      model: model(undefined, requests), signal: new AbortController().signal,
     })
     expect(result).toMatchObject({ status: "compacted", trigger: { reason: "item_count" } })
     expect(loadSource).toHaveBeenCalledWith({ scope: { userId: "user-1" }, owner })
+    expect(compactionSourceCalls).toEqual([[pool], [pool, taskGraphCommandPort]])
     expect(requests).toHaveLength(1)
     expect(compactionPort.recordStarted).toHaveBeenCalledOnce()
     expect(compactionPort.publishAtomically).toHaveBeenCalledOnce()
     expect(publishedItemIds).toEqual(["context-compaction:turn-1:2:100"])
-    expect(createPgCompactionSource).toBeDefined()
+    expect(compactionPort.publishAtomically).toHaveBeenCalledWith(expect.objectContaining({
+      draft: expect.objectContaining({ state: expect.objectContaining({ selectedJobMemories: [selectedJobMemory] }) }),
+    }))
     expect(createPgContextSnapshotCompactionPort).toBeDefined()
   })
 
   it("does not summarize or publish nonempty history below both thresholds", async () => {
     loadSource.mockReset().mockResolvedValue(source)
+    compactionSourceCalls.length = 0
     compactionPort.loadLatest.mockClear(); compactionPort.recordStarted.mockClear()
     compactionPort.publishAtomically.mockClear(); compactionPort.recordFailed.mockClear()
     publishedItemIds.length = 0; startedItemIds.length = 0
     const requests: HarnessModelRequest[] = []
+    const pool = { connect: vi.fn() }
+    const taskGraphCommandPort = { readCurrent: vi.fn(), readCurrentWithClient: vi.fn() }
 
     const result = await runTurnBoundaryContextCompaction({
-      pool: { connect: vi.fn() }, scope: { userId: "user-1" }, owner, lease, model: model(undefined, requests), signal: new AbortController().signal,
+      pool, scope: { userId: "user-1" }, owner, lease, taskGraphCommandPort: taskGraphCommandPort as never,
+      model: model(undefined, requests), signal: new AbortController().signal,
     })
 
     expect(result.status).toBe("skipped")
@@ -152,6 +177,9 @@ describe("turn-boundary context compaction preflight", () => {
     expect(compactionPort.recordFailed).not.toHaveBeenCalled()
     expect(startedItemIds).toEqual([])
     expect(publishedItemIds).toEqual([])
+    expect(compactionSourceCalls).toEqual([[pool]])
+    expect(taskGraphCommandPort.readCurrent).not.toHaveBeenCalled()
+    expect(taskGraphCommandPort.readCurrentWithClient).not.toHaveBeenCalled()
   })
 
   it("retries a failed item under a new lease while keeping IDs stable within each lease", async () => {

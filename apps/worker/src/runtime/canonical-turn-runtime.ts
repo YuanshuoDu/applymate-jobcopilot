@@ -186,7 +186,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       enabled: productionFlags?.turnBoundaryCompactionEnabled === true,
       state,
       signal,
-      compact: () => (options.turnBoundaryCompactionRunner ?? runTurnBoundaryContextCompaction)({ pool, scope: state.scope, owner, lease, model, signal }),
+      compact: () => (options.turnBoundaryCompactionRunner ?? runTurnBoundaryContextCompaction)({ pool, scope: state.scope, owner, lease, taskGraphCommandPort: options.taskGraphCommandPort, model, signal }),
       reload: () => options.stateLoader?.(pool, lease, now(), { consumeWaitOutcomes: false })
         ?? loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes: false }),
     })
