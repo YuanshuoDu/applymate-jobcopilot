@@ -93,13 +93,13 @@ async function seed(): Promise<void> {
     VALUES ($1, $2, $3, $4, $4, '/root/native-child', 1, 'analyst', 'research', 'completed', $5,
       '[]'::jsonb, $6::jsonb, '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, $7::jsonb, '{}'::jsonb, '{}'::jsonb,
       '{}'::jsonb, 1, 2, CURRENT_TIMESTAMP)`, [ids.child, ids.session, ids.turn, ids.root, goal, JSON.stringify(criteria), JSON.stringify(childResult)])
-  await pool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "taskId", "type", "status", "revision", "content")
-    VALUES ($1, $2, $3, $4, 'task_graph', 'completed', 1, $5::jsonb)`, [taskGraphItemId(ids.root), ids.session, ids.turn, ids.root, JSON.stringify(snapshot)])
+  await pool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "taskId", "type", "status", "revision", "content", "updatedAt")
+    VALUES ($1, $2, $3, $4, 'task_graph', 'completed', 1, $5::jsonb, CURRENT_TIMESTAMP)`, [taskGraphItemId(ids.root), ids.session, ids.turn, ids.root, JSON.stringify(snapshot)])
   await pool!.query(`INSERT INTO "agent_steps"
     ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
     VALUES ($1, $2, $3, $4, 1, 1, 'completed', 0, '[]'::jsonb, '{}'::jsonb)`, [ids.childStep, ids.session, ids.turn, ids.child])
-  await pool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "revision", "content")
-    VALUES ($1, $2, $3, $4, $5, 'tool_result', 'completed', 1, $6::jsonb)`, [ids.toolItem, ids.session, ids.turn, ids.childStep, ids.child,
+  await pool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "revision", "content", "updatedAt")
+    VALUES ($1, $2, $3, $4, $5, 'tool_result', 'completed', 1, $6::jsonb, CURRENT_TIMESTAMP)`, [ids.toolItem, ids.session, ids.turn, ids.childStep, ids.child,
     JSON.stringify({ toolCallId: "lookup-576", toolName: "source.lookup", status: "completed", output: toolOutput })])
 }
 
