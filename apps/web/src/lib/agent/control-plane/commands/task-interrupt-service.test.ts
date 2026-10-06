@@ -22,13 +22,16 @@ const chain = [
   { id: "task-child", sessionId: "session-1", turnId: "turn-1", rootTaskId: "task-root", parentTaskId: "task-root", path: "/task-root/task-child", depth: 1 },
 ]
 
-function harness(options: { sessionExists?: boolean; sessionStatus?: string; existing?: unknown; task?: typeof identity; lineage?: typeof chain } = {}) {
+function harness(options: { sessionExists?: boolean; sessionStatus?: string; existing?: unknown; pending?: unknown; task?: typeof identity; lineage?: typeof chain } = {}) {
   const tx = {
     $queryRaw: vi.fn()
       .mockResolvedValueOnce(options.sessionExists === false ? [] : [{ id: "session-1", status: options.sessionStatus ?? "active" }])
       .mockResolvedValueOnce([options.task ?? identity])
       .mockResolvedValueOnce(options.lineage ?? chain),
-    agentOutbox: { findUnique: vi.fn().mockResolvedValue(options.existing ?? null) },
+    agentOutbox: {
+      findUnique: vi.fn().mockResolvedValue(options.existing ?? null),
+      findFirst: vi.fn().mockResolvedValue(options.pending ?? null),
+    },
     agentEvent: { findFirst: vi.fn().mockResolvedValue({ sequence: BigInt(9) }) },
   }
   const db = { $transaction: vi.fn((work: (value: typeof tx) => unknown) => work(tx)) }
@@ -81,6 +84,39 @@ describe("TaskInterruptService", () => {
     const collision = harness({ existing })
     await expect(collision.service.interrupt({ ...command, taskId: "other-child" })).rejects.toMatchObject({ code: "task_interrupt_idempotency_conflict", status: 409 })
     expect(collision.tx.agentEvent.findFirst).not.toHaveBeenCalled()
+  })
+
+  it("reuses the accepted result while a different-key intent for the same task is pending", async () => {
+    const pending = {
+      aggregateId: "session-1",
+      payload: { sessionId: "session-1", turnId: "turn-1", taskId: "task-child", intentId: "intent-first" },
+    }
+    const { tx, service } = harness({ pending })
+    await expect(service.interrupt({ ...command, clientMessageId: "client-2" })).resolves.toEqual({
+      intentId: "intent-first", taskId: "task-child", turnId: "turn-1", disposition: "duplicate", sequence: "9",
+    })
+    expect(tx.agentOutbox.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ aggregateId: "session-1", publishedAt: null, topic: "agent.subagent.task-interrupt" }),
+    }))
+    expect(tx.agentEvent.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ taskId: "task-child", turnId: "turn-1", type: "task.interrupt.accepted" }),
+    }))
+    expect(mocks.append).not.toHaveBeenCalled()
+    expect(mocks.enqueue).not.toHaveBeenCalled()
+  })
+
+  it("does not accept another intent when a pending outbox row has no matching accepted fact", async () => {
+    const pending = {
+      aggregateId: "session-1",
+      payload: { sessionId: "session-1", turnId: "turn-1", taskId: "task-child", intentId: "intent-first" },
+    }
+    const { tx, service } = harness({ pending })
+    tx.agentEvent.findFirst.mockResolvedValueOnce(null)
+    await expect(service.interrupt({ ...command, clientMessageId: "client-2" })).rejects.toMatchObject({
+      code: "task_interrupt_replay_unavailable", status: 409, message: "The original interrupt result is unavailable",
+    })
+    expect(mocks.append).not.toHaveBeenCalled()
+    expect(mocks.enqueue).not.toHaveBeenCalled()
   })
 
   it.each(["aborted", "archived"] as const)("replays an accepted command after the owned session is %s without resolving tasks", async sessionStatus => {
