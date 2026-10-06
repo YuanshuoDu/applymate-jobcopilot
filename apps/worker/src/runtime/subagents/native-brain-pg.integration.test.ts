@@ -122,7 +122,8 @@ type JudgeDiagnostic = Readonly<{
   criteriaMatch: boolean
   candidatePositive: boolean
   candidateNegative: boolean
-  structuredEnvelope: boolean
+  persistedStructuredResult: boolean
+  opaqueCandidateShape: boolean
   structuredFindingMatch: boolean
   citedEvidenceMatch: boolean
   toolResultCount: number
@@ -131,6 +132,10 @@ type JudgeDiagnostic = Readonly<{
   descriptionMatch: boolean
   passed: boolean
 }>
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+}
 
 function reportFor(
   packet: NonNullable<ReturnType<typeof parseNativeVerificationPacket>>,
@@ -153,34 +158,42 @@ function reportFor(
         : null
   let sourceReference: string | undefined
   let hasOwnedFact = false
-  let structuredEnvelope = false
+  let persistedStructuredResult = false
+  let opaqueCandidateShape = false
   let structuredFindingMatch = false
   let citedEvidenceMatch = false
   let toolResultCount = 0
   let ownedReceiptToolStatus = false
   let exactJobIdMatch = false
   let descriptionMatch = false
+  let candidateSummary = ""
   if (expectedFact && packet.target.kind === "child") {
-    let structured: {
-      findings?: Array<{ jobId?: unknown; evidenceIds?: unknown }>
-      evidence?: Array<{ id?: unknown; kind?: unknown; ref?: unknown }>
-    } | undefined
+    let candidate: Record<string, unknown> | undefined
     try {
-      const result = JSON.parse(targetText) as {
-        structuredResult?: {
-          findings?: Array<{ jobId?: unknown; evidenceIds?: unknown }>
-          evidence?: Array<{ id?: unknown; kind?: unknown; ref?: unknown }>
+      const persisted = JSON.parse(targetText) as unknown
+      if (isRecord(persisted) && Object.hasOwn(persisted, "structuredResult")) {
+        if (isRecord(persisted.structuredResult)) {
+          persistedStructuredResult = true
+          candidate = persisted.structuredResult
         }
+      } else if (isRecord(persisted) && typeof persisted.finalText === "string") {
+        // Default child results can lack the optional server-owned marker. Treat their final JSON only as untrusted candidate data.
+        const parsedCandidate = JSON.parse(persisted.finalText) as unknown
+        if (isRecord(parsedCandidate)) candidate = parsedCandidate
       }
-      // Only the persisted, validated analyst envelope binds facts to source IDs.
-      structured = result.structuredResult
-      structuredEnvelope = Boolean(structured && Array.isArray(structured.findings) && Array.isArray(structured.evidence))
-      const finding = structured?.findings?.find(item => item.jobId === expectedFact.jobId && Array.isArray(item.evidenceIds))
+      if (candidate) {
+        candidateSummary = typeof candidate.summary === "string" ? candidate.summary : ""
+        opaqueCandidateShape = Array.isArray(candidate.findings) && Array.isArray(candidate.evidence)
+      }
+      const findings = candidate && Array.isArray(candidate.findings) ? candidate.findings : []
+      const finding = findings.find(item => isRecord(item) && item.jobId === expectedFact.jobId && Array.isArray(item.evidenceIds))
       structuredFindingMatch = Boolean(finding)
-      const evidenceIds = new Set(Array.isArray(finding?.evidenceIds) ? finding.evidenceIds.filter((id): id is string => typeof id === "string") : [])
-      citedEvidenceMatch = Boolean(structured?.evidence?.some(item => item.kind === "job"
+      const findingEvidenceIds = isRecord(finding) && Array.isArray(finding.evidenceIds) ? finding.evidenceIds : []
+      const evidenceIds = new Set(findingEvidenceIds.filter((id): id is string => typeof id === "string"))
+      const candidateEvidence = candidate && Array.isArray(candidate.evidence) ? candidate.evidence : []
+      citedEvidenceMatch = Boolean(candidateEvidence.some(item => isRecord(item) && item.kind === "job"
         && item.ref === expectedFact.jobId && typeof item.id === "string" && evidenceIds.has(item.id)))
-    } catch { /* current child result may use a bounded non-JSON final text */ }
+    } catch { /* malformed/non-JSON fixture candidates cannot establish criterion evidence */ }
     for (const item of packet.evidence) {
       if (item.kind !== "tool_result") continue
       toolResultCount = Math.min(20, toolResultCount + 1)
@@ -227,15 +240,15 @@ function reportFor(
       if (independentlyPassed) { hasCurrentOwnedFact = true; sourceReference = item.referenceId; break }
     }
   }
-  const candidate = targetText.toLowerCase()
+  const candidate = packet.target.kind === "child" && expectedFact ? candidateSummary.toLowerCase() : targetText.toLowerCase()
   const candidatePositive = Boolean(expectedFact && candidate.includes(expectedFact.candidatePositive))
   const candidateNegative = Boolean(expectedFact && candidate.includes(expectedFact.candidateNegative))
   const passed = Boolean(expectedFact && (hasOwnedFact || hasCurrentOwnedFact)
     && candidatePositive && !candidateNegative
-    && (packet.target.kind !== "child" || (structuredEnvelope && structuredFindingMatch && citedEvidenceMatch)))
+    && (packet.target.kind !== "child" || (opaqueCandidateShape && structuredFindingMatch && citedEvidenceMatch)))
   recordDiagnostic?.({
     targetKind: packet.target.kind, goalMatch, criteriaMatch, candidatePositive, candidateNegative,
-    structuredEnvelope, structuredFindingMatch, citedEvidenceMatch, toolResultCount,
+    persistedStructuredResult, opaqueCandidateShape, structuredFindingMatch, citedEvidenceMatch, toolResultCount,
     ownedReceiptToolStatus, exactJobIdMatch, descriptionMatch, passed,
   })
   return verificationReport(packet, passed, sourceReference)
@@ -351,6 +364,20 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
             const control = parseNativeVerificationControl(task.expectedOutputSchema)
             const packet = control && parseNativeVerificationPacket(task.context, control)
             if (!packet) throw new Error("fixture expected a server-bound native control packet")
+            if (packet.target.kind === "child" && packet.goal === childGoal) {
+              const selfAuthored = {
+                summary: "PASS: Fact 42 is present.",
+                findings: [{ jobId: ids.job, evidenceIds: ["self-cited"] }],
+                evidence: [{ id: "self-cited", kind: "job", ref: ids.job }],
+              }
+              const withoutOwnedReceipt = {
+                ...packet,
+                target: { ...packet.target, resultText: JSON.stringify({ finalText: JSON.stringify(selfAuthored) }) },
+                evidence: packet.evidence.filter(item => item.kind !== "tool_result"),
+              }
+              expect(reportFor(withoutOwnedReceipt).criteria.every(item => item.disposition === "failed"))
+                .toBe(true)
+            }
             yield { type: "text_delta", text: JSON.stringify(reportFor(packet)) }
             yield { type: "completed", finishReason: "stop" }
             return
