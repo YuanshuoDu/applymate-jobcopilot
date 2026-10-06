@@ -644,6 +644,69 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
     }>> = []
     const canonicalJudgeDiagnostics: JudgeDiagnostic[] = []
     let failedChildTaskId: string | undefined
+    let originalChildTaskId: string | undefined
+    let latestWait: { readonly taskId: string; readonly callId: string } | undefined
+    let waitSequence = 0
+    let lastWaitDisposition: string | null = null
+    const childRecoveryDiagnostics: Array<Readonly<{
+      phase: "original" | "replacement"; status: string; attemptCount: number; maxAttempts: number
+      invalidStructuredResult: boolean; waitDisposition: string | null; action: "wait" | "followup" | "candidate"
+    }>> = []
+    const nextWait = (taskId: string, phase: string) => {
+      const callId = `canonical-wait-${phase}:${canonicalSuffix}:${++waitSequence}`
+      latestWait = { taskId, callId }
+      return { callId, arguments: { idempotencyKey: callId, taskIds: [taskId], mode: "all" as const, timeoutMs: 30_000 } }
+    }
+    const noteRecovery = (phase: "original" | "replacement", task: { status: string; attemptCount: number; maxAttempts: number; failureReason: string | null }, action: "wait" | "followup" | "candidate") => {
+      childRecoveryDiagnostics.push({ phase, status: task.status, attemptCount: task.attemptCount, maxAttempts: task.maxAttempts,
+        invalidStructuredResult: task.failureReason === "invalid_structured_result", waitDisposition: lastWaitDisposition, action })
+      if (childRecoveryDiagnostics.length > 8) childRecoveryDiagnostics.shift()
+    }
+    const readWaitDisposition = async (rootTaskId: string, callId: string, taskId: string): Promise<string | null> => {
+      const result = await pool!.query<{ output: unknown }>(`SELECT result."content"->'output' AS "output" FROM "agent_items" AS result
+        JOIN "agent_items" AS call ON call."sessionId" = result."sessionId" AND call."turnId" = result."turnId"
+          AND call."taskId" = result."taskId" AND call."stepId" = result."stepId" AND call."type" = 'tool_call'
+        WHERE result."sessionId" = $1 AND result."turnId" = $2 AND result."taskId" = $3 AND result."type" = 'tool_result'
+          AND result."status" = 'completed' AND result."content"->>'toolCallId' = $4
+          AND result."content"->'errorCode' = 'null'::jsonb
+          AND call."status" = 'completed' AND call."content"->>'toolCallId' = $4
+          AND call."content"->>'toolName' = 'agent.wait' AND call."content"->>'toolVersion' = '1'
+          AND call."content"->>'status' = 'completed' AND call."content"->'errorCode' = 'null'::jsonb
+          AND call."content"->'input'->>'idempotencyKey' = $4
+          AND call."content"->'input'->'taskIds' = jsonb_build_array($5::text) AND call."content"->'input'->>'mode' = 'all'
+        LIMIT 2`, [canonical.sessionId, canonical.turnId, rootTaskId, callId, taskId])
+      if (result.rows.length !== 1) return null
+      const output = result.rows[0]?.output
+      if (!isRecord(output) || typeof output.waitId !== "string"
+        || !["waiting", "ready", "timed_out"].includes(String(output.status))) return null
+      const wait = await pool!.query<{ status: string }>(`SELECT "status" FROM "agent_wait_conditions"
+        WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "turnId" = $4 AND "parentTaskId" = $5
+          AND "idempotencyKey" = $6 AND "mode" = 'all' AND "targetTaskIds" = $7::jsonb
+        LIMIT 2`, [output.waitId, canonical.userId, canonical.sessionId, canonical.turnId, rootTaskId, callId, JSON.stringify([taskId])])
+      return wait.rows.length === 1 ? wait.rows[0]!.status : null
+    }
+    const readChildRecoveryDiagnostics = async () => {
+      const taskIds = [...new Set([originalChildTaskId, failedChildTaskId].filter((id): id is string => typeof id === "string"))]
+      if (taskIds.length === 0) return []
+      const rootTaskId = (await pool!.query<{ rootTaskId: string | null }>(
+        `SELECT "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`, [canonical.turnId, canonical.sessionId])).rows[0]?.rootTaskId
+      if (!rootTaskId) return []
+      const result = await pool!.query<{
+        phase: string; status: string; attemptCount: number; maxAttempts: number; invalidStructuredResult: boolean
+        dispatchPresent: boolean; dispatchPublished: boolean; dispatchAttempts: number | null; dispatchHasError: boolean
+      }>(`SELECT CASE WHEN task."id" = $4 THEN 'original' ELSE 'replacement' END AS "phase",
+          task."status", task."attemptCount", task."maxAttempts",
+          task."failureReason" = 'invalid_structured_result' AS "invalidStructuredResult",
+          dispatch."id" IS NOT NULL AS "dispatchPresent", dispatch."publishedAt" IS NOT NULL AS "dispatchPublished",
+          dispatch."attemptCount" AS "dispatchAttempts", dispatch."lastError" IS NOT NULL AS "dispatchHasError"
+        FROM "sub_agent_tasks" AS task
+        LEFT JOIN "agent_outbox" AS dispatch ON dispatch."aggregateId" = task."sessionId"
+          AND dispatch."topic" = 'agent.subagent.dispatch' AND dispatch."idempotencyKey" = 'subagent-dispatch:' || task."id"
+        WHERE task."id" = ANY($5::text[]) AND task."sessionId" = $1 AND task."turnId" = $2 AND task."rootTaskId" = $3
+        ORDER BY task."createdAt" LIMIT 2`, [canonical.sessionId, canonical.turnId, rootTaskId, originalChildTaskId ?? null, taskIds])
+      return result.rows
+    }
+    const activeChildStatus = (status: string) => status === "queued" || status === "retrying" || status === "running"
     let queuePauseGate: Queue<SubagentJobPayload, unknown, string> | undefined
     let acceptedCandidateReady!: () => void
     let releaseAcceptedCandidate!: () => void
@@ -678,54 +741,83 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
             `SELECT "id" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2 AND "parentTaskId" = $3
               AND "role" = 'analyst' AND "taskType" = 'research' AND "goal" = $4 ORDER BY "createdAt" LIMIT 1`,
             [canonical.sessionId, canonical.turnId, root, childGoal])).rows[0]?.id, value => typeof value === "string")
-          yield { type: "tool_call_completed", callId: `canonical-wait-target:${canonicalSuffix}`, name: "agent.wait", arguments: {
-            idempotencyKey: `canonical-wait-target:${canonicalSuffix}`, taskIds: [targetId], mode: "all", timeoutMs: 30_000,
-          } }
+          originalChildTaskId = targetId
+          const wait = nextWait(targetId, "target")
+          yield { type: "tool_call_completed", callId: wait.callId, name: "agent.wait", arguments: wait.arguments }
           yield { type: "completed", finishReason: "tool_calls" }
           return
         }
-        if (call === 3) {
-          expect(toolNames).toContain("agent.followup")
-          const failedChild = await waitForDatabase("terminally failed canonical child", async () => (await pool!.query<{
-            id: string; status: string; attemptCount: number; maxAttempts: number; failureReason: string | null
-          }>(`SELECT "id", "status", "attemptCount", "maxAttempts", "failureReason" FROM "sub_agent_tasks"
-            WHERE "sessionId" = $1 AND "turnId" = $2 AND "role" = 'analyst' AND "taskType" = 'research' AND "goal" = $3
-            ORDER BY "createdAt" LIMIT 1`, [canonical.sessionId, canonical.turnId, childGoal])).rows[0],
-          value => value?.status === "failed")
-          if (!failedChild) throw new Error("canonical spawned child was not persisted")
-          expect(failedChild.attemptCount).toBe(failedChild.maxAttempts)
-          expect(failedChild.failureReason).toBe("invalid_structured_result")
-          failedChildTaskId = failedChild.id
+        const rootTaskId = request.metadata.taskId
+        if (typeof rootTaskId !== "string" || !rootTaskId) throw new Error("canonical root request omitted its task binding")
+        if (!failedChildTaskId) {
+          if (!originalChildTaskId) throw new Error("canonical root did not bind the spawned source task")
+          const original = (await pool!.query<{ id: string; status: string; attemptCount: number; maxAttempts: number; failureReason: string | null }>(
+            `SELECT "id", "status", "attemptCount", "maxAttempts", "failureReason" FROM "sub_agent_tasks"
+             WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4`,
+            [originalChildTaskId, canonical.sessionId, canonical.turnId, rootTaskId])).rows[0]
+          if (!original) throw new Error("canonical spawned source task lost its Turn binding")
+          lastWaitDisposition = latestWait?.taskId === original.id
+            ? await readWaitDisposition(rootTaskId, latestWait.callId, original.id) : null
+          if (activeChildStatus(original.status)) {
+            if (lastWaitDisposition !== "timed_out") throw new Error("canonical active child resumed without a timed-out wait receipt")
+            noteRecovery("original", original, "wait")
+            expect(toolNames).toContain("agent.wait")
+            const wait = nextWait(original.id, "target-retry")
+            yield { type: "tool_call_completed", callId: wait.callId, name: "agent.wait", arguments: wait.arguments }
+            yield { type: "completed", finishReason: "tool_calls" }
+            return
+          }
+          if (original.status !== "failed") throw new Error(`canonical source child ended as ${original.status}`)
+          expect(lastWaitDisposition === "ready" || lastWaitDisposition === "timed_out").toBe(true)
+          expect(original.attemptCount).toBe(original.maxAttempts)
+          expect(original.failureReason).toBe("invalid_structured_result")
+          failedChildTaskId = original.id
+          noteRecovery("original", original, "followup")
           const requestText = request.messages.flatMap(message => message.content)
             .flatMap(part => part.type === "text" ? [part.text] : [])
           const graphObservation = requestText.find(value => value.includes('"kind":"task_graph_current"'))
           if (!graphObservation) throw new Error("canonical recovery request omitted current task graph observation")
-          expect(graphObservation).toContain(failedChild.id)
+          expect(graphObservation).toContain(original.id)
           expect(graphObservation).toContain('"status":"failed"')
           expect(graphObservation).toContain('"taskStatus":"failed"')
+          expect(toolNames).toContain("agent.followup")
           yield { type: "tool_call_completed", callId: `canonical-followup:${canonicalSuffix}`, name: "agent.followup", arguments: {
-            idempotencyKey: `canonical-followup:${canonicalSuffix}`, taskId: failedChild.id,
+            idempotencyKey: `canonical-followup:${canonicalSuffix}`, taskId: original.id,
             goal: followupChildGoal, successCriteria: turnCriteria, context: { fixture: "recover-terminal-child-failure" },
           } }
+          latestWait = undefined
           yield { type: "completed", finishReason: "tool_calls" }
           return
         }
-        if (call === 4) {
+        const replacement = (await pool!.query<{ id: string; status: string; attemptCount: number; maxAttempts: number; failureReason: string | null }>(
+          `SELECT "id", "status", "attemptCount", "maxAttempts", "failureReason" FROM "sub_agent_tasks"
+           WHERE "sessionId" = $1 AND "turnId" = $2 AND "rootTaskId" = $3 AND "role" = 'analyst'
+             AND "taskType" = 'research' AND "goal" = $4 AND "context"->'provenance'->>'sourceTaskId' = $5
+           ORDER BY "createdAt" DESC LIMIT 1`, [canonical.sessionId, canonical.turnId, rootTaskId, followupChildGoal, failedChildTaskId])).rows[0]
+        if (!replacement) throw new Error("canonical follow-up child was not persisted for the failed source")
+        lastWaitDisposition = latestWait?.taskId === replacement.id
+          ? await readWaitDisposition(rootTaskId, latestWait.callId, replacement.id) : null
+        if (activeChildStatus(replacement.status)) {
+          if (latestWait?.taskId === replacement.id && lastWaitDisposition !== "timed_out") {
+            throw new Error("canonical active replacement resumed without a timed-out wait receipt")
+          }
+          noteRecovery("replacement", replacement, "wait")
           expect(toolNames).toContain("agent.wait")
-          if (!failedChildTaskId) throw new Error("canonical recovery omitted the failed source task")
-          const replacement = await waitForDatabase("canonical replacement child", async () => (await pool!.query<{ id: string }>(
-            `SELECT "id" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2 AND "role" = 'analyst'
-              AND "taskType" = 'research' AND "goal" = $3 AND "context"->'provenance'->>'sourceTaskId' = $4
-            ORDER BY "createdAt" DESC LIMIT 1`, [canonical.sessionId, canonical.turnId, followupChildGoal, failedChildTaskId])).rows[0],
-          value => typeof value?.id === "string")
-          if (!replacement) throw new Error("canonical follow-up child was not persisted")
-          yield { type: "tool_call_completed", callId: `canonical-wait-replacement:${canonicalSuffix}`, name: "agent.wait", arguments: {
-            idempotencyKey: `canonical-wait-replacement:${canonicalSuffix}`, taskIds: [replacement.id], mode: "all", timeoutMs: 30_000,
-          } }
+          const wait = nextWait(replacement.id, "replacement")
+          yield { type: "tool_call_completed", callId: wait.callId, name: "agent.wait", arguments: wait.arguments }
           yield { type: "completed", finishReason: "tool_calls" }
           return
         }
-        if (call >= 5) {
+        if (replacement.status !== "completed") throw new Error(`canonical replacement child ended as ${replacement.status}`)
+        noteRecovery("replacement", replacement, "candidate")
+        const requestText = request.messages.flatMap(message => message.content)
+          .flatMap(part => part.type === "text" ? [part.text] : [])
+        const graphObservation = requestText.find(value => value.includes('"kind":"task_graph_current"'))
+        if (!graphObservation) throw new Error("canonical replacement request omitted current task graph observation")
+        expect(graphObservation).toContain(replacement.id)
+        expect(graphObservation).toContain('"status":"completed"')
+        expect(graphObservation).toContain('"taskStatus":"completed"')
+        {
           const rejectedCandidateDigest = digestNativeVerificationValue(rejectedCandidate)
           const rejectedControl = await pool!.query<{ id: string }>(`SELECT "id" FROM "sub_agent_tasks"
             WHERE "sessionId" = $1 AND "turnId" = $2 AND "role" = 'auditor' AND "taskType" = 'native_verification'
@@ -872,7 +964,8 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
       value => value?.turnStatus === "waiting_for_dependency" && value.childStatus === "queued" && value.waitStatus === "waiting")
       await bootstrap.subagents.queue.worker.resume()
       await Promise.race([acceptedCandidateEntered, delay(90_000).then(() => {
-        return pool!.query<{ turnStatus: string | null; rootControls: number; failedReports: number; rejectedControls: number; rejectedFailedReports: number }>(
+        return Promise.all([
+          pool!.query<{ turnStatus: string | null; rootControls: number; failedReports: number; rejectedControls: number; rejectedFailedReports: number }>(
           `SELECT turn."status" AS "turnStatus",
              COUNT(*) FILTER (WHERE task."expectedOutputSchema"->'target'->>'kind' = 'root_goal')::int AS "rootControls",
              COUNT(*) FILTER (WHERE task."result"->'nativeVerificationReport'->>'disposition' = 'failed')::int AS "failedReports",
@@ -885,9 +978,11 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
              ON task."sessionId" = turn."sessionId" AND task."turnId" = turn."id"
              AND task."role" = 'auditor' AND task."taskType" = 'native_verification'
            WHERE turn."id" = $1 AND turn."sessionId" = $2 GROUP BY turn."status"`,
-          [canonical.turnId, canonical.sessionId, digestNativeVerificationValue(rejectedCandidate)]).then(result => {
-          const state = result.rows[0] ?? null
-          throw new Error(`canonical root did not replan to the accepted candidate; modelStreams=${rootModelStreams}; requestTrace=${JSON.stringify(rootRequestDiagnostics)}; judgeTrace=${JSON.stringify(canonicalJudgeDiagnostics)}; persistedState=${JSON.stringify(state)}`)
+          [canonical.turnId, canonical.sessionId, digestNativeVerificationValue(rejectedCandidate)]),
+          readChildRecoveryDiagnostics(),
+        ]).then(([stateResult, childState]) => {
+          const state = stateResult.rows[0] ?? null
+          throw new Error(`canonical root did not replan to the accepted candidate; modelStreams=${rootModelStreams}; requestTrace=${JSON.stringify(rootRequestDiagnostics)}; judgeTrace=${JSON.stringify(canonicalJudgeDiagnostics)}; persistedState=${JSON.stringify(state)}; childRecovery=${JSON.stringify({ lastWaitDisposition, transitions: childRecoveryDiagnostics, children: childState })}`)
         })
       })])
       const { SUBAGENT_QUEUE_NAME } = await import("../../queue/subagent-queue.js")
