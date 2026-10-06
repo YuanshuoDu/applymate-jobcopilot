@@ -132,6 +132,7 @@ type JudgeDiagnostic = Readonly<{
   ownedReceiptToolStatus: boolean
   exactJobIdMatch: boolean
   descriptionMatch: boolean
+  failedPredecessorHistoryRetained: boolean
   passed: boolean
 }>
 
@@ -143,6 +144,7 @@ function reportFor(
   packet: NonNullable<ReturnType<typeof parseNativeVerificationPacket>>,
   ownedJobId = ids.job,
   recordDiagnostic?: (value: JudgeDiagnostic) => void,
+  expectedFailedChildTaskId?: string,
 ) {
   const targetText = packet.target.kind === "child" ? packet.target.resultText : packet.target.candidateText
   const requirements = packet.criteria.map(item => item.requirement)
@@ -168,6 +170,7 @@ function reportFor(
   let ownedReceiptToolStatus = false
   let exactJobIdMatch = false
   let descriptionMatch = false
+  let failedPredecessorHistoryRetained = false
   let candidateSummary = ""
   if (expectedFact && packet.target.kind === "child") {
     let candidate: Record<string, unknown> | undefined
@@ -217,6 +220,14 @@ function reportFor(
   }
   let hasCurrentOwnedFact = false
   if (expectedFact && packet.target.kind === "root_goal") {
+    if (expectedFailedChildTaskId) failedPredecessorHistoryRetained = packet.evidence.some(item => {
+      if (item.kind !== "graph_history") return false
+      try {
+        const row = JSON.parse(item.summary) as { taskId?: unknown; status?: unknown; failureReason?: unknown; activeNative?: unknown }
+        return row.taskId === expectedFailedChildTaskId && row.status === "failed"
+          && row.failureReason === "invalid_structured_result" && row.activeNative === false
+      } catch { return false }
+    })
     const activeNodes = packet.evidence.flatMap(item => {
       if (item.kind !== "graph_history") return []
       try {
@@ -251,7 +262,7 @@ function reportFor(
   recordDiagnostic?.({
     targetKind: packet.target.kind, goalMatch, criteriaMatch, candidatePositive, candidateNegative,
     persistedStructuredResult, opaqueCandidateShape, structuredFindingMatch, citedEvidenceMatch, toolResultCount,
-    ownedReceiptToolStatus, exactJobIdMatch, descriptionMatch, passed,
+    ownedReceiptToolStatus, exactJobIdMatch, descriptionMatch, failedPredecessorHistoryRetained, passed,
   })
   return verificationReport(packet, passed, sourceReference)
 }
@@ -632,6 +643,7 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
       sameTurnPrefix: boolean; resumePrefix: boolean; targetMatch: boolean; failedCriterion: boolean; exactFeedbackRoles: string[]
     }>> = []
     const canonicalJudgeDiagnostics: JudgeDiagnostic[] = []
+    let failedChildTaskId: string | undefined
     let queuePauseGate: Queue<SubagentJobPayload, unknown, string> | undefined
     let acceptedCandidateReady!: () => void
     let releaseAcceptedCandidate!: () => void
@@ -673,14 +685,47 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
           return
         }
         if (call === 3) {
-          expect(toolNames).toContain("jobs.search")
-          yield { type: "tool_call_completed", callId: `canonical-search:${canonicalSuffix}`, name: "jobs.search", arguments: {
-            target: "Fact 42", location: "Dublin", limit: 10,
+          expect(toolNames).toContain("agent.followup")
+          const failedChild = await waitForDatabase("terminally failed canonical child", async () => (await pool!.query<{
+            id: string; status: string; attemptCount: number; maxAttempts: number; failureReason: string | null
+          }>(`SELECT "id", "status", "attemptCount", "maxAttempts", "failureReason" FROM "sub_agent_tasks"
+            WHERE "sessionId" = $1 AND "turnId" = $2 AND "role" = 'analyst' AND "taskType" = 'research' AND "goal" = $3
+            ORDER BY "createdAt" LIMIT 1`, [canonical.sessionId, canonical.turnId, childGoal])).rows[0],
+          value => value?.status === "failed")
+          if (!failedChild) throw new Error("canonical spawned child was not persisted")
+          expect(failedChild.attemptCount).toBe(failedChild.maxAttempts)
+          expect(failedChild.failureReason).toBe("invalid_structured_result")
+          failedChildTaskId = failedChild.id
+          const requestText = request.messages.flatMap(message => message.content)
+            .flatMap(part => part.type === "text" ? [part.text] : [])
+          const graphObservation = requestText.find(value => value.includes('"kind":"task_graph_current"'))
+          if (!graphObservation) throw new Error("canonical recovery request omitted current task graph observation")
+          expect(graphObservation).toContain(failedChild.id)
+          expect(graphObservation).toContain('"status":"failed"')
+          expect(graphObservation).toContain('"taskStatus":"failed"')
+          yield { type: "tool_call_completed", callId: `canonical-followup:${canonicalSuffix}`, name: "agent.followup", arguments: {
+            idempotencyKey: `canonical-followup:${canonicalSuffix}`, taskId: failedChild.id,
+            goal: followupChildGoal, successCriteria: turnCriteria, context: { fixture: "recover-terminal-child-failure" },
           } }
           yield { type: "completed", finishReason: "tool_calls" }
           return
         }
-        if (call >= 4) {
+        if (call === 4) {
+          expect(toolNames).toContain("agent.wait")
+          if (!failedChildTaskId) throw new Error("canonical recovery omitted the failed source task")
+          const replacement = await waitForDatabase("canonical replacement child", async () => (await pool!.query<{ id: string }>(
+            `SELECT "id" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2 AND "role" = 'analyst'
+              AND "taskType" = 'research' AND "goal" = $3 AND "context"->'provenance'->>'sourceTaskId' = $4
+            ORDER BY "createdAt" DESC LIMIT 1`, [canonical.sessionId, canonical.turnId, followupChildGoal, failedChildTaskId])).rows[0],
+          value => typeof value?.id === "string")
+          if (!replacement) throw new Error("canonical follow-up child was not persisted")
+          yield { type: "tool_call_completed", callId: `canonical-wait-replacement:${canonicalSuffix}`, name: "agent.wait", arguments: {
+            idempotencyKey: `canonical-wait-replacement:${canonicalSuffix}`, taskIds: [replacement.id], mode: "all", timeoutMs: 30_000,
+          } }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        if (call >= 5) {
           const rejectedCandidateDigest = digestNativeVerificationValue(rejectedCandidate)
           const rejectedControl = await pool!.query<{ id: string }>(`SELECT "id" FROM "sub_agent_tasks"
             WHERE "sessionId" = $1 AND "turnId" = $2 AND "role" = 'auditor' AND "taskType" = 'native_verification'
@@ -732,7 +777,7 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
       },
     }
 
-    const childModelRuntimeFactory = ({ task }: { task: { id: string; role: string; taskType: string; goal: string; expectedOutputSchema: unknown; context: unknown } }): ModelAdapter => {
+    const childModelRuntimeFactory = ({ task }: { task: { id: string; role: string; taskType: string; goal: string; attemptCount: number; expectedOutputSchema: unknown; context: unknown } }): ModelAdapter => {
       let targetRounds = 0
       return {
         id: `native-canonical-${task.role}-${task.taskType}`, profile,
@@ -746,17 +791,22 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
             yield { type: "text_delta", text: JSON.stringify(reportFor(packet, canonical.jobId, diagnostic => {
               canonicalJudgeDiagnostics.push(diagnostic)
               if (canonicalJudgeDiagnostics.length > 8) canonicalJudgeDiagnostics.shift()
-            })) }
+            }, failedChildTaskId)) }
             yield { type: "completed", finishReason: "stop" }
             return
           }
           targetRounds += 1
           if (targetRounds === 1) {
             expect(request.tools.map(tool => (tool as { name?: unknown }).name)).toContain("jobs.search")
-            yield { type: "tool_call_completed", callId: `canonical-search:${task.id}`, name: "jobs.search", arguments: {
+            yield { type: "tool_call_completed", callId: `canonical-search:${task.id}:${task.attemptCount}`, name: "jobs.search", arguments: {
               target: "Fact 42", location: "Dublin", limit: 10,
             } }
             yield { type: "completed", finishReason: "tool_calls" }
+            return
+          }
+          if (task.goal === childGoal) {
+            yield { type: "text_delta", text: "This is not a valid structured analyst result." }
+            yield { type: "completed", finishReason: "stop" }
             return
           }
           const evidenceId = `evidence:${task.id}:job`
@@ -895,18 +945,24 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
         WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'turn.completed'`, [canonical.sessionId, canonical.turnId])
       expect(completedEvents.rows[0]?.count).toBe(1)
 
-      const taskRows = await pool!.query<{ id: string; role: string; taskType: string; goal: string; status: string; attemptCount: number; result: Record<string, unknown> | null; expectedOutputSchema: unknown }>(
-        `SELECT "id", "role", "taskType", "goal", "status", "attemptCount", "result", "expectedOutputSchema"
+      const taskRows = await pool!.query<{ id: string; role: string; taskType: string; goal: string; status: string; attemptCount: number; maxAttempts: number; failureReason: string | null; sourceTaskId: string | null; result: Record<string, unknown> | null; expectedOutputSchema: unknown }>(
+        `SELECT "id", "role", "taskType", "goal", "status", "attemptCount", "maxAttempts", "failureReason",
+          "context"->'provenance'->>'sourceTaskId' AS "sourceTaskId", "result", "expectedOutputSchema"
          FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "createdAt", "id"`, [canonical.sessionId, canonical.turnId])
       const target = taskRows.rows.find(row => row.role === "analyst" && row.goal === childGoal)
-      expect(target).toMatchObject({ status: "completed", attemptCount: 1 })
-      expect(JSON.stringify(target?.result)).toContain("Fact 42 is present")
+      const replacement = taskRows.rows.find(row => row.role === "analyst" && row.goal === followupChildGoal && row.sourceTaskId === target?.id)
+      expect(target).toMatchObject({ status: "failed", failureReason: "invalid_structured_result" })
+      expect(target?.attemptCount).toBe(target?.maxAttempts)
+      expect(target?.attemptCount).toBe(3)
+      expect(failedChildTaskId).toBe(target?.id)
+      expect(replacement).toMatchObject({ status: "completed", attemptCount: 1, sourceTaskId: target?.id })
+      expect(JSON.stringify(replacement?.result)).toContain("Fact 42 is present")
       const reports = taskRows.rows.filter(row => row.role === "auditor" && row.taskType === "native_verification").map(row => {
         const control = parseNativeVerificationControl(row.expectedOutputSchema)
         const result = row.result && typeof row.result === "object" ? row.result.nativeVerificationReport as Record<string, unknown> | undefined : undefined
         return { id: row.id, status: row.status, control, report: result }
       })
-      const passedChild = reports.find(row => row.control?.target.kind === "child" && row.control.target.taskId === target?.id)
+      const passedChild = reports.find(row => row.control?.target.kind === "child" && row.control.target.taskId === replacement?.id)
       const failedRejectedRoot = reports.find(row => row.control?.target.kind === "root_goal" && row.control.target.candidateDigest === digestNativeVerificationValue(rejectedCandidate))
       const passedAcceptedRoot = reports.find(row => row.control?.target.kind === "root_goal" && row.control.target.candidateDigest === digestNativeVerificationValue(acceptedCandidate))
       if (!passedChild || !failedRejectedRoot || !passedAcceptedRoot) throw new Error("canonical child/rejected-root/accepted-root controls were not all persisted")
@@ -914,6 +970,7 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
       expect(failedRejectedRoot.report).toMatchObject({ disposition: "failed", controlTaskId: failedRejectedRoot.id })
       expect(passedAcceptedRoot.report).toMatchObject({ disposition: "passed", controlTaskId: passedAcceptedRoot.id })
       expect(reports.every(row => row.status === "completed")).toBe(true)
+      expect(canonicalJudgeDiagnostics.some(row => row.targetKind === "root_goal" && row.failedPredecessorHistoryRetained)).toBe(true)
 
       const usage = await pool!.query<{ inputTokens: string | number; outputTokens: string | number; estimatedCostUsd: string | number }>(
         `SELECT COALESCE(SUM("inputTokens"), 0) AS "inputTokens", COALESCE(SUM("outputTokens"), 0) AS "outputTokens",
