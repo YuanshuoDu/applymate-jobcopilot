@@ -11,6 +11,7 @@ import type { TurnEngineStore } from "../runtime/turns/turn-engine-types.js"
 import type { RuntimeToolDefinition } from "../runtime/tools/types.js"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 import { lockAndAdmitSubagentDispatch, PAUSE_DEFERRED_MARKER, repairDeferredSubagentDispatches } from "./subagent-pause-dispatch.js"
+import { repairStaleSubagentDispatches } from "./subagent-dispatch-recovery.js"
 
 const RUN_REDIS_INTEGRATION = process.env.RUN_AGENT_TURN_REDIS_INTEGRATION === "1"
 
@@ -238,6 +239,21 @@ function createSqlFixture(input: { tasks: Map<string, SubagentTaskRecord>; rootT
         })
         return candidate ? { rows: [{ id: session.id, userId: session.userId }], rowCount: 1 } : none
       }
+      if (sql.includes('SELECT session."id"') && sql.includes('FROM "agent_sessions" AS session')
+        && sql.includes('dispatch."publishedAt" < task."updatedAt"')
+        && sql.includes('ORDER BY session."updatedAt"')) {
+        const candidate = [...input.tasks.values()].some(task => {
+          const root = input.tasks.get(task.rootTaskId), startedAt = Reflect.get(task, "startedAt"), updatedAt = Reflect.get(task, "updatedAt")
+          const dispatch = outbox.find(row => row.topic === values[0] && row.aggregateId === session.id
+            && row.idempotencyKey === `subagent-dispatch:${task.id}`)
+          return task.sessionId === session.id && ["queued", "retrying"].includes(task.status) && startedAt != null
+            && task.leaseOwner == null && task.leaseExpiresAt == null && task.interruptRequestedAt == null
+            && task.attemptCount < task.maxAttempts && root && !["completed", "failed", "interrupted", "cancelled", "closed"].includes(root.status)
+            && !["completed", "failed", "interrupted", "cancelled", "closed"].includes(turn.status)
+            && dispatch?.publishedAt != null && updatedAt instanceof Date && dispatch.publishedAt < updatedAt
+        })
+        return candidate ? { rows: [{ id: session.id }], rowCount: 1 } : none
+      }
       if (sql.includes('SELECT task."id" AS "taskId"') && sql.includes('dispatch."id" AS "dispatchId"')) {
         const candidate = [...input.tasks.values()].find(task => task.sessionId === values[0] && task.status === "queued"
           && taskNeverStarted(task) && task.leaseOwner == null && task.leaseExpiresAt == null && task.interruptRequestedAt == null
@@ -314,6 +330,15 @@ function createSqlFixture(input: { tasks: Map<string, SubagentTaskRecord>; rootT
 }
 
 describe("child queue SQL fixture", () => {
+  it("returns no session from stale-dispatch recovery when no expired stale dispatch exists", async () => {
+    const ids = { sessionId: "fixture-session", turnId: "fixture-turn", userId: "fixture-user" }
+    const { store, tasks } = createTaskStore()
+    const root = await store.create({ ...ids, role: "planner", taskType: "root", goal: "fixture root", policy: { maxConcurrency: 1, maxDepth: 1, maxFanOut: 1, maxAttempts: 1 } })
+    const fixture = createSqlFixture({ tasks, rootTaskId: root.id, childTaskId: root.id, ...ids })
+
+    await expect(repairStaleSubagentDispatches(fixture.pool as never, "recovery-owner")).resolves.toBe(0)
+  })
+
   it("returns a task turn only for the matching session", async () => {
     const ids = { sessionId: "fixture-session", turnId: "fixture-turn", userId: "fixture-user" }
     const { store, tasks } = createTaskStore()
