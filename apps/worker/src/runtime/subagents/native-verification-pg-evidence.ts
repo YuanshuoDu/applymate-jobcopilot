@@ -161,7 +161,7 @@ async function readTargetEvidence(
   const task = target.task, scope = state.scope
   const result = await client.query(`SELECT item."id", item."revision", item."content", step."attempt", call_item."id" AS "callItemId",
       call_item."revision" AS "callRevision",
-      call_item."content" AS "callContent", COUNT(call_item."id") OVER (PARTITION BY item."id") AS "callMatches"
+      call_item."content" AS "callContent", COUNT(call_item."id") OVER (PARTITION BY item."id") AS "callMatches", COUNT(*) OVER (PARTITION BY item."stepId", item."content"->>'toolCallId') AS "resultMatches"
     FROM "agent_items" AS item JOIN "agent_steps" AS step ON step."id" = item."stepId"
       AND step."sessionId" = item."sessionId" AND step."turnId" = item."turnId" AND step."taskId" = item."taskId"
     LEFT JOIN "agent_items" AS call_item ON call_item."sessionId" = item."sessionId" AND call_item."turnId" = item."turnId"
@@ -180,7 +180,7 @@ async function readTargetEvidence(
   for (const raw of result.rows) {
     const row = raw as Row, content = record(row.content), call = record(row.callContent)
     if (typeof row.id !== "string" || !Number.isSafeInteger(row.revision) || !content || !call
-      || Number(row.callMatches) !== 1 || typeof row.callItemId !== "string" || !Number.isSafeInteger(row.callRevision)
+      || Number(row.callMatches) !== 1 || Number(row.resultMatches) !== 1 || typeof row.callItemId !== "string" || !Number.isSafeInteger(row.callRevision)
       || typeof content.toolCallId !== "string" || call.toolCallId !== content.toolCallId
       || typeof call.toolName !== "string" || typeof call.status !== "string"
       || !Object.hasOwn(content, "output") || containsSecretField(content.output)) return null

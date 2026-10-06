@@ -28,7 +28,7 @@ describe("native verification private evidence", () => {
       criteria: objective.successCriteria, criteriaValid: true, nativeSourcesValid: true, turnGoalConflict: false, turnInputDigest: "f".repeat(64) } as NativeVerificationOwnedState
     const currentToolResult = { id: "result-1", revision: 1, attempt: 1,
       content: { toolCallId: "call-1", output: { fact: "persisted fact 42" } },
-      callItemId: "call-item-1", callRevision: 1, callMatches: 1,
+      callItemId: "call-item-1", callRevision: 1, callMatches: 1, resultMatches: 1,
       callContent: { toolCallId: "call-1", toolName: "lookup", status: "completed", input: { query: "private argument sentinel" } } }
     const clientWithFact = { query: vi.fn().mockResolvedValueOnce({ rows: [currentToolResult] })
       .mockResolvedValueOnce({ rows: [] }) } as unknown as Pick<pg.PoolClient, "query">
@@ -44,6 +44,7 @@ describe("native verification private evidence", () => {
     expect(evidenceQuery).toContain('call_item."sessionId" = item."sessionId" AND call_item."turnId" = item."turnId"')
     expect(evidenceQuery).toContain('call_item."taskId" = item."taskId" AND call_item."stepId" = item."stepId"')
     expect(evidenceQuery).toContain('call_item."content"->>\'toolCallId\' = item."content"->>\'toolCallId\'')
+    expect(evidenceQuery).toContain('COUNT(*) OVER (PARTITION BY item."stepId", item."content"->>\'toolCallId\') AS "resultMatches"')
 
     const clientWithoutFact = { query: vi.fn().mockResolvedValueOnce({ rows: [{ ...currentToolResult,
       id: "result-missing-output", content: { toolCallId: "call-1" } }] }) } as unknown as Pick<pg.PoolClient, "query">
@@ -55,6 +56,9 @@ describe("native verification private evidence", () => {
     const mismatchedCall = { query: vi.fn().mockResolvedValueOnce({ rows: [{ ...currentToolResult,
       callContent: { ...currentToolResult.callContent, toolCallId: "other-call" } }] }) } as unknown as Pick<pg.PoolClient, "query">
     await expect(buildNativeChildPacketContent(mismatchedCall, state, target)).resolves.toBeNull()
+    const duplicateResult = { query: vi.fn().mockResolvedValueOnce({ rows: [currentToolResult,
+      { ...currentToolResult, id: "result-duplicate", resultMatches: 2 }, { ...currentToolResult, resultMatches: 2 }] }) } as unknown as Pick<pg.PoolClient, "query">
+    await expect(buildNativeChildPacketContent(duplicateResult, state, target)).resolves.toBeNull()
 
     const packet = { schemaVersion: NATIVE_VERIFICATION_PACKET_SCHEMA, controlOperationId: "operation-1", controlTaskId: "control-1",
       goal: content!.goal, criteria: content!.criteria, target: content!.target, evidence: content!.evidence } as NativeVerificationPacket
@@ -89,7 +93,7 @@ describe("native verification private evidence", () => {
     const artifactHash = hashArtifactContent(artifactContent)
     const artifactRow = { id: "version-1", artifactId: "artifact-1", version: 1, artifactType: "cover_letter",
       contentHash: artifactHash, sourceDigest: `sha256:${"a".repeat(64)}`, content: artifactContent }
-    const toolResult = { id: "item-1", revision: 1, attempt: 1, callItemId: "call-item-1", callRevision: 1, callMatches: 1,
+    const toolResult = { id: "item-1", revision: 1, attempt: 1, callItemId: "call-item-1", callRevision: 1, callMatches: 1, resultMatches: 1,
       content: { toolCallId: "call-1", output: { artifactId: "artifact-1" } },
       callContent: { toolCallId: "call-1", toolName: "cover_letter.draft", status: "completed" } }
     const client = { query: vi.fn().mockResolvedValueOnce({ rows: [toolResult] })

@@ -9,12 +9,13 @@ import { attachNativeVerificationReport } from "./native-verification-report.js"
 import { readNativeVerificationTerminalProofWithClient } from "./native-verification-pg-readback.js"
 import { ensureNativeVerificationControl } from "./native-verification-pg-request.js"
 import { buildNativeChildPacketContent, type NativeVerificationPacketContent } from "./native-verification-pg-evidence.js"
-import { nativeVerificationBindingDigest } from "./native-verification-pg-bindings.js"
+import { loadNativeVerificationOwnedState, nativeVerificationBindingDigest, nativeVerificationTarget } from "./native-verification-pg-bindings.js"
 import { nativeVerificationHistory } from "./native-verification-pg-readback.js"
 import { createPgNativeVerificationPort } from "./pg-native-verification-port.js"
 import { transaction } from "./pg-store-persistence.js"
 import { TASK_GRAPH_NATIVE_METADATA_VERSION } from "./task-graph-native-state.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION, parseTaskGraphSnapshot, taskGraphItemId } from "./task-graph-snapshot.js"
+import { loadTaskGraph } from "./task-graph-pg-state.js"
 import type { TaskGraphExecutionScope } from "./task-graph-command-port.js"
 import type { PgSubagentPool } from "./types.js"
 
@@ -39,7 +40,7 @@ const suffix = randomUUID(), ids = {
   user: `native-verify-user-${suffix}`, session: `native-verify-session-${suffix}`, turn: `native-verify-turn-${suffix}`,
   root: `native-verify-root-${suffix}`, rootStep: `native-verify-root-step-${suffix}`, child: `native-verify-child-${suffix}`,
   childStep: `native-verify-child-step-${suffix}`, toolCallItem: `native-verify-tool-call-${suffix}`,
-  toolItem: `native-verify-tool-item-${suffix}`,
+  toolItem: `native-verify-tool-item-${suffix}`, duplicateToolItem: `native-verify-duplicate-tool-item-${suffix}`,
   turnOwner: `native-verify-turn-owner-${suffix}`, taskOwner: `native-verify-task-owner-${suffix}`,
 }
 const goal = "Find and verify the persisted source facts"
@@ -243,5 +244,26 @@ describePg("native verification PostgreSQL producer and readback", () => {
     await mutateResult({ toolCallId: "lookup-576", output: toolOutput, errorCode: null })
     await mutateCall({ ...originalCall, toolCallId: "mismatched-call" })
     await expectStaleEvidenceRejected()
+    await mutateCall(originalCall)
+    await pool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "revision", "content", "updatedAt")
+      VALUES ($1, $2, $3, $4, $5, 'tool_result', 'completed', 1, $6::jsonb, CURRENT_TIMESTAMP)`,
+    [ids.duplicateToolItem, ids.session, ids.turn, ids.childStep, ids.child, JSON.stringify({ toolCallId: "lookup-576", output: toolOutput, errorCode: null })])
+    await expectStaleEvidenceRejected()
+
+    const sourceClient = await pool!.connect()
+    try {
+      await sourceClient.query("BEGIN")
+      await sourceClient.query(`SELECT set_config('app.user_id', $1, true)`, [ids.user])
+      const graph = await loadTaskGraph(sourceClient, scope, false)
+      const state = await loadNativeVerificationOwnedState(sourceClient, scope, graph.snapshot, false)
+      const node = state.snapshot?.nodes.find(value => value.taskId === ids.child)
+      const target = node ? nativeVerificationTarget(state, node) : null
+      expect(target).not.toBeNull()
+      await expect(target ? buildNativeChildPacketContent(sourceClient, state, target) : Promise.resolve(null)).resolves.toBeNull()
+      await sourceClient.query("ROLLBACK")
+    } catch (error) {
+      await sourceClient.query("ROLLBACK").catch(() => undefined)
+      throw error
+    } finally { sourceClient.release() }
   }, 60_000)
 })
