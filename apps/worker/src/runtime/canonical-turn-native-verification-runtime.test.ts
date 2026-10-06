@@ -42,7 +42,7 @@ function runtimeFactory(readTerminalProof: NativeVerificationRuntime["readTermin
 function rootSemanticFailure(controlTaskId = "private-control-id"): NativeVerificationEnsureResult {
   return { status: "failed", controlTaskIds: [controlTaskId], pendingControlTaskIds: [], pendingTaskIds: [], feedback: [{
     controlTaskId, targetTaskId: "root-1", disposition: "failed",
-    criteria: [{ criterionId: "current-evidence", disposition: "failed", reasonCode: "evidence_missing", evidenceReferenceIds: [] }],
+    criteria: [{ criterionId: "current-evidence", disposition: "failed", reasonCode: "does_not_meet_criterion", evidenceReferenceIds: [] }],
   }] }
 }
 
@@ -105,7 +105,7 @@ describe("canonical native verification runtime composition", () => {
     expect(second && !second.ok ? second[NATIVE_SEMANTIC_NO_PROGRESS] : undefined).toBeUndefined()
     if (!third || third.ok) throw new Error("expected a rejected root verification decision")
     expect(third[NATIVE_SEMANTIC_NO_PROGRESS]).toBe(true)
-    expect(third.feedback).toContain("criterion=current-evidence status=failed reason=evidence_missing")
+    expect(third.feedback).toContain("criterion=current-evidence status=failed reason=does_not_meet_criterion")
     expect(JSON.stringify(third)).not.toContain("private-control-id")
     expect(JSON.stringify(third)).not.toContain(digestNativeVerificationValue(candidate))
   })
@@ -129,6 +129,87 @@ describe("canonical native verification runtime composition", () => {
     expect(results[6] && !results[6].ok ? results[6][NATIVE_SEMANTIC_NO_PROGRESS] : undefined).toBeUndefined()
     expect(results[7] && !results[7].ok ? results[7][NATIVE_SEMANTIC_NO_PROGRESS] : undefined).toBeUndefined()
     expect(results[8] && !results[8].ok ? results[8][NATIVE_SEMANTIC_NO_PROGRESS] : undefined).toBe(true)
+  })
+
+  it.each([
+    "pending", "pass", "uncertain", "unavailable", "malformed", "child", "receipt", "exception",
+  ] as const)("resets two consecutive root rejects across a real runtime %s outcome", async outcome => {
+    type Stage = typeof outcome | "reject"
+    let stage: Stage = "reject"
+    const childrenPassed: NativeVerificationEnsureResult = {
+      status: "passed", controlTaskIds: [], pendingControlTaskIds: [], pendingTaskIds: [], feedback: [],
+    }
+    const childFailure: NativeVerificationEnsureResult = {
+      status: "failed", controlTaskIds: ["child-control"], pendingControlTaskIds: [], pendingTaskIds: [], feedback: [{
+        controlTaskId: "child-control", targetTaskId: "child-1", disposition: "failed",
+        criteria: [{ criterionId: "child-evidence", disposition: "failed", reasonCode: "does_not_meet_criterion", evidenceReferenceIds: [] }],
+      }],
+    }
+    const pendingChildren: NativeVerificationEnsureResult = {
+      status: "pending", controlTaskIds: ["child-control"], pendingControlTaskIds: ["child-control"],
+      pendingTaskIds: ["child-1"], feedback: [],
+    }
+    const malformedRoot = {
+      status: "failed", controlTaskIds: ["control-a"], pendingControlTaskIds: [], pendingTaskIds: [], feedback: [{
+        controlTaskId: "control-a", targetTaskId: "root-1", disposition: "failed",
+        criteria: [{ criterionId: "bad-reason", disposition: "failed", reasonCode: "not_a_reason", evidenceReferenceIds: [] }],
+      }],
+    } as unknown as NativeVerificationEnsureResult
+    const port: NativeVerificationPort = {
+      ensureChildren: vi.fn(async (): Promise<NativeVerificationEnsureResult> => {
+        if (stage === "pending") return pendingChildren
+        if (stage === "child") return childFailure
+        return childrenPassed
+      }),
+      ensureRootGoal: vi.fn(async (): Promise<NativeVerificationEnsureResult> => {
+        if (stage === "pass") return {
+          status: "passed", controlTaskIds: [witness.controlTaskId], pendingControlTaskIds: [], pendingTaskIds: [], feedback: [],
+          rootGoalWitness: witness,
+        }
+        if (stage === "uncertain") return { status: "uncertain", controlTaskIds: ["control-a"], pendingControlTaskIds: [], pendingTaskIds: [], feedback: [] }
+        if (stage === "unavailable") return { status: "unavailable", controlTaskIds: ["control-a"], pendingControlTaskIds: [], pendingTaskIds: [], feedback: [] }
+        if (stage === "malformed") return malformedRoot
+        if (stage === "exception") throw new Error("fixture verifier unavailable")
+        return rootSemanticFailure("control-a")
+      }),
+      readRecoverableGoal: vi.fn(async () => null),
+    }
+    const current = {
+      ...coordination(),
+      checkNativeGraphCompletion: vi.fn(async () => stage === "receipt"
+        ? { ok: false as const, blocker: "task_graph_verification_unverified", feedback: "receipt missing" }
+        : null),
+    }
+    const matrixWaitPort: DurableWaitPort = { wait: vi.fn(async () => ({
+      waitId: "matrix-wait", status: "waiting" as const, deadlineAt: "2099-01-01T00:00:00.000Z", matchedTaskIds: [],
+    })) }
+    const runtime = createCanonicalNativeVerificationRuntime({
+      pool: {} as pg.Pool, factory: () => ({ port, readTerminalProof: vi.fn(async () => true) }),
+      coordination: current, durableWaitPort: matrixWaitPort, enabled: true,
+    })
+    let step = 0
+    const check = () => runtime.checkCompletion(`matrix-${outcome}-${++step}`, candidate)
+    const stopped = (result: Awaited<ReturnType<typeof check>>) =>
+      Boolean(result && !result.ok && result[NATIVE_SEMANTIC_NO_PROGRESS] === true)
+
+    expect(stopped(await check())).toBe(false)
+    expect(stopped(await check())).toBe(false)
+    stage = outcome
+    if (outcome === "exception") {
+      await expect(check()).rejects.toThrow("fixture verifier unavailable")
+    } else {
+      const result = await check()
+      const blocker = result && !result.ok ? result.blocker : null
+      expect(blocker).toBe(outcome === "pass" ? null : outcome === "pending" ? "native_verification_pending" : "task_graph_verification_unverified")
+      expect(stopped(result)).toBe(false)
+    }
+    expect(runtime.accepted()).toBe(outcome === "pass")
+    stage = "reject"
+    expect(stopped(await check())).toBe(false)
+    expect(stopped(await check())).toBe(false)
+    expect(stopped(await check())).toBe(true)
+    if (outcome === "pending") expect(matrixWaitPort.wait).toHaveBeenCalledOnce()
+    if (outcome === "receipt") expect(port.ensureChildren).toHaveBeenCalledTimes(5)
   })
 
   it("denies a changed terminal candidate before querying native proof", async () => {
