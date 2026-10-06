@@ -1,9 +1,10 @@
 'use client'
 
-import React, { type Dispatch, type MutableRefObject, type SetStateAction } from 'react'
+import React, { useRef, useState, type Dispatch, type MutableRefObject, type SetStateAction } from 'react'
 import { useToast } from '@/components/ui'
 import { useI18n } from '@/lib/i18n'
 import { AgentComposer, type ComposerAttachment, type ComposerJob, type ComposerResume } from './AgentComposer'
+import { AgentObjectiveContextForm } from './AgentObjectiveContextForm'
 import { attachmentComposerContext, jobComposerContext, resumeComposerContext } from './AgentUnifiedStream.helpers'
 import { sendAgentTurnMessage, useAgentTurnComposerContext } from './agent-turn-commands'
 import type { AgentTranscriptEvent } from './session-view-model'
@@ -45,6 +46,19 @@ export function AgentUnifiedStreamComposer({
   const { t } = useI18n()
   const toast = useToast()
   const turnComposer = useAgentTurnComposerContext()
+  const [objectiveFormOpen, setObjectiveFormOpen] = useState(false)
+  const [objectivePending, setObjectivePending] = useState(false)
+  const admissionOwnerRef = useRef<'message' | 'objective' | null>(null)
+
+  function acquireObjectiveAdmission() {
+    if (chatLoading || admissionOwnerRef.current) return false
+    admissionOwnerRef.current = 'objective'
+    return true
+  }
+
+  function releaseObjectiveAdmission() {
+    if (admissionOwnerRef.current === 'objective') admissionOwnerRef.current = null
+  }
 
   function appendComposerContext(text: string) {
     setChatInput(current => current.trim() ? `${current.trim()}\n\n${text}` : text)
@@ -68,7 +82,7 @@ export function AgentUnifiedStreamComposer({
   }
 
   async function sendChat(text: string) {
-    if (!text.trim() || chatLoading) return
+    if (!text.trim() || chatLoading || admissionOwnerRef.current === 'objective') return
     const draftText = text.trim()
     const draftFiles = attachedFiles
     const outgoing = [draftText, attachmentComposerContext(attachedFiles)].filter(Boolean).join('\n\n')
@@ -77,6 +91,8 @@ export function AgentUnifiedStreamComposer({
       setAttachedFiles([])
       return
     }
+    if (admissionOwnerRef.current) return
+    admissionOwnerRef.current = 'message'
     setChatInput('')
     setAttachedFiles([])
     setChatLoading(true)
@@ -121,6 +137,7 @@ export function AgentUnifiedStreamComposer({
         chatRequestRef.current = null
         setChatLoading(false)
       }
+      if (admissionOwnerRef.current === 'message') admissionOwnerRef.current = null
     }
   }
 
@@ -138,25 +155,44 @@ export function AgentUnifiedStreamComposer({
   ]
 
   return (
-    <AgentComposer
-      waitingForAnswer={waitingForAnswer}
-      chips={chips}
-      chatInput={chatInput}
-      chatLoading={chatLoading}
-      addMenuOpen={addMenuOpen}
-      attachedFiles={attachedFiles}
-      composerJobs={composerJobs}
-      composerResumes={composerResumes}
-      inputRef={inputRef}
-      fileInputRef={fileInputRef}
-      onChatInputChange={setChatInput}
-      onAddMenuOpenChange={setAddMenuOpen}
-      onSendChat={sendChat}
-      onRemoveAttachedFile={id => setAttachedFiles(current => current.filter(file => file.id !== id))}
-      onAddSelectedFiles={addSelectedFiles}
-      onAddJobContext={job => appendComposerContext(jobComposerContext(job))}
-      onAddResumeContext={resume => appendComposerContext(resumeComposerContext(resume))}
-      onAppendComposerContext={appendComposerContext}
-    />
+    <>
+      {!turnComposer && !objectiveFormOpen && (
+        <button type="button" data-testid="open-objective-context-form" disabled={chatLoading} onClick={() => setObjectiveFormOpen(true)} style={{ marginBottom: 7, minHeight: 30, padding: '0 10px', border: '1px solid var(--border)', borderRadius: 7, background: 'transparent', color: 'var(--text)', cursor: chatLoading ? 'wait' : 'pointer', font: 'inherit' }}>
+          Start with an objective and context
+        </button>
+      )}
+      {!turnComposer && objectiveFormOpen && (
+        <AgentObjectiveContextForm
+          onClose={() => setObjectiveFormOpen(false)}
+          onSessionRecorded={(sessionId, goal, subtitle) => {
+            shouldFollowScrollRef.current = true
+            onSessionRecorded(sessionId, goal, subtitle)
+          }}
+          acquireAdmission={acquireObjectiveAdmission}
+          releaseAdmission={releaseObjectiveAdmission}
+          onBusyChange={setObjectivePending}
+        />
+      )}
+      <AgentComposer
+        waitingForAnswer={waitingForAnswer}
+        chips={chips}
+        chatInput={chatInput}
+        chatLoading={chatLoading || objectivePending}
+        addMenuOpen={addMenuOpen}
+        attachedFiles={attachedFiles}
+        composerJobs={composerJobs}
+        composerResumes={composerResumes}
+        inputRef={inputRef}
+        fileInputRef={fileInputRef}
+        onChatInputChange={setChatInput}
+        onAddMenuOpenChange={setAddMenuOpen}
+        onSendChat={sendChat}
+        onRemoveAttachedFile={id => setAttachedFiles(current => current.filter(file => file.id !== id))}
+        onAddSelectedFiles={addSelectedFiles}
+        onAddJobContext={job => appendComposerContext(jobComposerContext(job))}
+        onAddResumeContext={resume => appendComposerContext(resumeComposerContext(resume))}
+        onAppendComposerContext={appendComposerContext}
+      />
+    </>
   )
 }
