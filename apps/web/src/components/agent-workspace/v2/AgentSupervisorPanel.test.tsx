@@ -6,8 +6,11 @@ vi.mock('@/lib/hooks', () => ({ useApi: () => ({ data: null, loading: false, err
 
 import { translate } from '@/lib/i18n'
 import { AgentSupervisorPanel, EvidenceSummary, projectSelectedEvidence } from './AgentSupervisorPanel'
+import { projectSelectedTaskInterrupt } from './task-tree-projection'
+import { TaskInterruptControl } from './TaskTreePanel'
 import type { AgentTimelineSnapshot } from './use-agent-timeline'
 import type { TimelineItem } from './timeline-reducer'
+import type { TaskTreeNode } from './types'
 
 function item(overrides: Partial<TimelineItem> = {}): TimelineItem {
   return {
@@ -20,6 +23,25 @@ function item(overrides: Partial<TimelineItem> = {}): TimelineItem {
 const t = (key: string) => translate('en', key)
 
 describe('AgentSupervisorPanel selected evidence', () => {
+  it('projects an eligible selected child into the accessible interrupt action', () => {
+    const task = {
+      id: 'child-1', sessionId: 'session-1', turnId: 'turn-1', rootTaskId: 'root-1', parentTaskId: 'root-1',
+      role: 'researcher', taskType: 'research', status: 'running', goal: 'Research roles', hasResult: false,
+    }
+    const turn = {
+      id: 'turn-1', sessionId: 'session-1', source: 'message', goal: 'Find roles', status: 'in_progress', revision: 1,
+      activeStepId: null, finalItemId: null, createdAt: '2026-09-16T00:00:00.000Z', updatedAt: '2026-09-16T00:00:00.000Z', completedAt: null,
+    }
+    const node: TaskTreeNode = { id: 'task:child-1', kind: 'task', label: 'Research roles', status: 'running' }
+    const projected = projectSelectedTaskInterrupt([task], [turn], node, [])
+    expect(projected).toMatchObject({ task: { id: 'child-1' }, status: null, eligible: true })
+
+    const html = renderToStaticMarkup(<TaskInterruptControl sessionId="session-1" taskId={projected!.task.id} taskLabel={node.label} eligible={projected!.eligible} status={projected!.status} onAccepted={vi.fn()} />)
+    expect(html).toContain('Interrupt task and descendants')
+    expect(html).toContain('Research roles and all descendants?')
+    expect(html).toContain('role="alertdialog"')
+  })
+
   it('keeps the supervisor hidden when no session is selected', () => {
     const timeline = {
       sessionId: null,

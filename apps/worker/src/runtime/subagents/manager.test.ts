@@ -5,6 +5,7 @@ import {
   type SubagentExecutionResult,
   type SubagentJobPayload,
   type SubagentPolicy,
+  type SubagentLease,
   type SubagentStore,
   type SubagentTaskRecord,
   type SubagentTaskSpec,
@@ -321,6 +322,35 @@ describe("AgentTreeManager", () => {
     await expect(siblingRun).resolves.toMatchObject({ status: "completed" })
     expect(manager.activeCount(target.sessionId)).toBe(0)
     await expect(manager.interruptSubtree(root.sessionId, root.id, root.path)).resolves.toBe(1)
+  })
+
+  it("signals only the exact task ids selected by a durable interrupt", async () => {
+    const store = new MemoryStore()
+    const manager = new AgentTreeManager(store, { clock: new FakeClock() })
+    const root = await manager.spawn(spec())
+    const target = await manager.spawn(spec({ parentTaskId: root.id }))
+    const descendant = await manager.spawn(spec({ parentTaskId: target.id }))
+    const sibling = await manager.spawn(spec({ parentTaskId: root.id }))
+    const waitForInterrupt = ({ lease }: { lease: SubagentLease }) => new Promise<SubagentExecutionResult>(resolve => {
+      lease.signal.addEventListener("abort", () => resolve({ status: "failed" }), { once: true })
+    })
+    const targetRun = manager.run(payload(target), waitForInterrupt)
+    const descendantRun = manager.run(payload(descendant), waitForInterrupt)
+    let finishSibling!: (result: SubagentExecutionResult) => void
+    const siblingRun = manager.run(payload(sibling), async () => new Promise(resolve => { finishSibling = resolve }))
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    const requestedAt = new Date()
+    for (const task of [target, descendant]) store.records.set(task.id, { ...store.records.get(task.id)!, interruptRequestedAt: requestedAt })
+    manager.signalTaskSubtree(target.sessionId, root.id, [target.id, descendant.id])
+    await expect(targetRun).resolves.toMatchObject({ status: "interrupted" })
+    await expect(descendantRun).resolves.toMatchObject({ status: "interrupted" })
+    expect(store.records.get(target.id)?.status).toBe("interrupted")
+    expect(store.records.get(descendant.id)?.status).toBe("interrupted")
+    expect(store.records.get(sibling.id)?.status).toBe("running")
+    expect(manager.activeCount(target.sessionId)).toBe(1)
+    finishSibling({ status: "completed" })
+    await expect(siblingRun).resolves.toMatchObject({ status: "completed" })
   })
 
   it("interrupts active work when its parent Turn loses ownership", async () => {

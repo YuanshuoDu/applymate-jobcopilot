@@ -1,4 +1,5 @@
 import type pg from "pg"
+import { appendInternalAcceptedInterrupt } from "./task-interrupt-outbox.js"
 import { settleRecoveredTaskGraph } from "./task-graph-pg-root-failure-cleanup.js"
 import { computeSubagentNextAttemptAt } from "./retry-policy.js"
 import { RUNNABLE_SESSION } from "../session-gate.js"
@@ -9,7 +10,7 @@ import type { StoredTaskGraphNode } from "./task-graph-snapshot.js"
 import { dateValue, json, rowToTask, transaction } from "./pg-store-persistence.js"
 import type { PgSubagentPool, SubagentTaskRecord } from "./types.js"
 type Selector = Readonly<{ sessionId: string; userId?: string; turnId?: string; rootTaskId?: string; targetPath?: string }>
-type Candidate = Record<string, unknown> & Readonly<{ id: string; status: string; attemptCount: number; sessionId: string; userId: string }>
+type Candidate = Record<string, unknown> & Readonly<{ id: string; status: string; attemptCount: number; sessionId: string; userId: string; turnId: string | null }>
 export async function prepareTaskGraphFinish(client: pg.PoolClient, input: { taskId: string; sessionId: string; attemptCount: number; status: string; retry: boolean; failureReason?: string; result: unknown }): Promise<{ graph: GraphTransitionPreparation; status: string; failureReason?: string; result: unknown; reconcileDependents?: boolean }> {
   const safeInputResult = stripTaskGraphMetadata(input.result)
   const graphType = taskGraphEventType(input.status, input.retry)
@@ -124,7 +125,7 @@ async function interruptMatching(pool: PgSubagentPool, selector: Selector, now: 
     const userId = String(sessionRow.userId)
     await client.query(`SELECT set_config('app.user_id', $1, true)`, [userId])
     const { sql, values } = selectorWhere(selector)
-    const selected = await client.query(`SELECT task."id", task."status", task."attemptCount" FROM "sub_agent_tasks" AS task
+    const selected = await client.query(`SELECT task."id", task."status", task."attemptCount", task."turnId" FROM "sub_agent_tasks" AS task
       JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
       WHERE ${sql} AND session."userId" = $${values.length + 1}
         AND task."status" IN ('queued', 'running', 'retrying', 'waiting', 'waiting_for_user')
@@ -138,14 +139,15 @@ async function interruptMatching(pool: PgSubagentPool, selector: Selector, now: 
       if (graph && "blocked" in graph) continue
       const update = running
         ? `UPDATE "sub_agent_tasks" SET "interruptRequestedAt" = COALESCE("interruptRequestedAt", $3), "updatedAt" = $3
-            WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running'`
+            WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running' RETURNING to_char("interruptRequestedAt", 'YYYY-MM-DD"T"HH24:MI:SS.MS') AS "interruptRequestedAt"`
         : `UPDATE "sub_agent_tasks" SET "interruptRequestedAt" = COALESCE("interruptRequestedAt", $3), "status" = 'interrupted',
             "nextAttemptAt" = NULL, "completedAt" = $3, "updatedAt" = $3
-            WHERE "id" = $1 AND "sessionId" = $2 AND "status" = $4`
+            WHERE "id" = $1 AND "sessionId" = $2 AND "status" = $4 RETURNING to_char("interruptRequestedAt", 'YYYY-MM-DD"T"HH24:MI:SS.MS') AS "interruptRequestedAt"`
       const params = running ? [raw.id, selector.sessionId, now] : [raw.id, selector.sessionId, now, raw.status]
-      const result = await client.query(update, params)
+      const result = await client.query<{ interruptRequestedAt: string }>(update, params)
       if (result.rowCount !== 1) continue
       changed++
+      if (selector.targetPath && typeof raw.turnId === "string" && raw.turnId) await appendInternalAcceptedInterrupt(client, userId, { sessionId: selector.sessionId, turnId: raw.turnId, taskId: raw.id, interruptRequestedAt: result.rows[0]!.interruptRequestedAt })
       if (!running) {
         await deleteGraphDispatch(client, selector.sessionId, raw.id)
         if (graph) {

@@ -14,7 +14,6 @@ import {
 import { isSubagentRetryDue } from "./retry-policy.js"
 import { isTaskPathWithin, normalizeTaskPath, policyFromTask } from "./manager-task-scope.js"
 import { finishInterrupted, type SubagentRunOutcome } from "./manager-run-outcome.js"
-
 export type { SubagentRunOutcome } from "./manager-run-outcome.js"
 
 export interface SubagentClock {
@@ -189,6 +188,16 @@ export class AgentTreeManager {
     return count
   }
 
+  /** Signals only active leases whose IDs were selected by the durable task-interrupt transaction. */
+  signalTaskSubtree(sessionId: string, rootTaskId: string, taskIds: readonly string[]): void {
+    const selected = new Set(taskIds)
+    for (const active of this.active.values()) {
+      if (active.lease.sessionId === sessionId && active.lease.rootTaskId === rootTaskId && selected.has(active.lease.id)) {
+        this.signalLoss(active, true, new SubagentLeaseError("lost", "Subagent task subtree was interrupted"))
+      }
+    }
+  }
+
   /** Stop active children and release their leases before Worker resources close. */
   async shutdown(): Promise<void> {
     const active = [...this.active.values()]
@@ -236,5 +245,4 @@ export class AgentTreeManager {
     active.controller.abort(error)
     active.resolveLost(error)
   }
-
 }
