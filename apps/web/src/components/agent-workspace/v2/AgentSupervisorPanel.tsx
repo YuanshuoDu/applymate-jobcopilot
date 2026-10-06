@@ -18,12 +18,13 @@ import { EvidenceSummary, statusLabel } from './agent-supervisor-evidence'
 import { SelectedJobPreparationCard } from './SelectedJobPreparationCard'
 import { SelectedJobDraftArtifact } from './SelectedJobDraftArtifact'
 import { latestWriterArtifact } from './draft-artifact-projection'
+import { includeCurrentQuestionTurn } from './question-turn-lookup'
 
 export { EvidenceSummary, projectSelectedEvidence } from './agent-supervisor-evidence'
 export type { SelectedEvidenceProjection } from './agent-supervisor-evidence'
 
 interface PageInfo { hasMore?: boolean; nextCursor?: string | null }
-interface TurnsResponse { turns?: SupervisorTurnSummary[]; page?: PageInfo }
+interface TurnsResponse { turns?: SupervisorTurnSummary[]; page?: PageInfo; projection?: unknown }
 interface TasksResponse { tasks?: SupervisorTaskSummary[]; planLedger?: unknown; discoveryShortlist?: unknown; page?: PageInfo }
 
 export interface AgentSupervisorPanelProps {
@@ -65,6 +66,7 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
   }, [sessionId])
 
   const turns = useMemo(() => (sessionId ? [...(turnsQuery.data?.turns ?? []), ...extraTurns].filter(turn => turn.sessionId === sessionId) : []), [sessionId, turnsQuery.data, extraTurns])
+  const questionTurns = useMemo(() => includeCurrentQuestionTurn(turns, sessionId, turnsQuery.data?.projection), [sessionId, turns, turnsQuery.data?.projection])
   const restoredSelectedJobId = sessionId ? selectedJobIdForTurn(turns, sessionId, selectedPreparationTurnId) : null
   const tasks = useMemo(() => (sessionId ? [...(tasksQuery.data?.tasks ?? []), ...extraTasks].filter(task => task.sessionId === sessionId) : []), [sessionId, tasksQuery.data, extraTasks])
   const planTasks = useMemo(() => sessionId ? [
@@ -200,7 +202,7 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
       {loading && <p aria-live="polite" style={messageStyle}>{t('agent.loadingTasks')}</p>}
       {error && <p role="alert" style={{ ...messageStyle, color: 'var(--c-danger)' }}>{t('agent.supervisorUnavailable')}</p>}
       <AgentApprovalLedgerCard ledger={timeline.approvalLedger} sessionId={sessionId} turns={turns} onAccepted={refetchSupervisorRecords} selectionKey={selectedId ?? ''} />
-      <AgentQuestionInputCard sessionId={sessionId} items={timeline.items} turns={turns} onAccepted={refetchSupervisorRecords} selectionKey={selectedId ?? ''} />
+      <AgentQuestionInputCard sessionId={sessionId} items={timeline.items} turns={questionTurns} onAccepted={refetchSupervisorRecords} selectionKey={selectedId ?? ''} />
       <SelectedJobPreparationCard sessionId={sessionId} restoredJobId={restoredSelectedJobId} onAccepted={handlePreparationAccepted} />
       <TaskGraphPlanPanel sessionId={sessionId} items={timeline.items} tasks={planTasks} ledger={graphTasksQuery.data?.planLedger} discoveryShortlist={graphTasksQuery.data?.discoveryShortlist} selectedPreparationTurnId={selectedPreparationTurnId} />
       <SelectedJobDraftArtifact sessionId={sessionId} artifactRef={draftArtifactRef} />
