@@ -147,8 +147,6 @@ describe("native verification packet", () => {
     const tooMany = rootPacket(Array.from({ length: 33 }, (_, index) => ({
       referenceId: `answer:${index}`, kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND, summary: "complete answer",
     })), NATIVE_VERIFICATION_PACKET_SCHEMA_V2)
-    expect(parseNativeVerificationPacket(createNativeVerificationContext(tooMany), rootControl(rootPacket([
-      { referenceId: "answer:abc", kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND, summary: "complete answer" },
-    ], NATIVE_VERIFICATION_PACKET_SCHEMA_V2)))).toBeNull()
+    expect(parseNativeVerificationPacket(createNativeVerificationContext(tooMany), rootControl(tooMany))).toBeNull()
   })
 })

@@ -128,13 +128,14 @@ describe("native verification dispatch classification", () => {
       },
       readRootLimits: async () => undefined,
     }
+    const persistedItems: unknown[] = [], persistedEvents: unknown[] = [], persistedResponses: string[] = []
     const store: TurnExecutionStore = {
       startStep: async ({ stepId, ordinal }) => ({ id: stepId, ordinal }),
       updateStep: async () => undefined,
-      createItem: async ({ itemId }) => ({ id: itemId, revision: 0 }),
-      updateItem: async ({ itemId, expectedRevision }) => ({ id: itemId, revision: expectedRevision + 1 }),
-      appendEvent: async ({ id }) => ({ id }),
-      recordFinalResponse: async () => undefined,
+      createItem: async input => { persistedItems.push(input); return { id: input.itemId, revision: 0 } },
+      updateItem: async input => { persistedItems.push(input); return { id: input.itemId, revision: input.expectedRevision + 1 } },
+      appendEvent: async input => { persistedEvents.push(input); return { id: input.id } },
+      recordFinalResponse: async input => { persistedResponses.push(input.response) },
     }
     const authorizeUsage = vi.fn(async () => ({ settle: async () => undefined }))
     const result = await dispatchNativeVerificationTask({
@@ -157,6 +158,12 @@ describe("native verification dispatch classification", () => {
     expect(authorizeUsage).toHaveBeenCalledTimes(1)
     expect(JSON.stringify(result)).not.toContain(answer)
     expect(JSON.stringify(result)).not.toContain(NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND)
+    const persisted = JSON.stringify({ items: persistedItems, events: persistedEvents, responses: persistedResponses })
+    expect(persistedItems.length).toBeGreaterThan(0)
+    expect(persistedEvents.length).toBeGreaterThan(0)
+    expect(persisted).toContain("private_output_captured")
+    expect(persisted).not.toContain(answer)
+    expect(persisted).not.toContain(NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND)
     expect(JSON.stringify(packet)).toContain(answer)
     expect(canonicalNativeVerificationJson(packet)).toContain(answer)
   })
