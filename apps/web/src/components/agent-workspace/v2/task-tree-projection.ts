@@ -52,6 +52,32 @@ export interface SupervisorTreeLabels {
 }
 
 const DEFAULT_LABELS: SupervisorTreeLabels = { task: 'Task', step: 'Step', tool: 'Tool' }
+const ACTIVE_TASK_STATUSES = new Set(['queued', 'running', 'retrying', 'waiting', 'waiting_for_user'])
+const ACTIVE_TURN_STATUSES = new Set(['queued', 'in_progress', 'waiting_for_dependency', 'waiting_for_approval', 'waiting_for_user'])
+export type TaskInterruptStatus = 'accepted' | 'interrupted' | 'failed'
+
+/** Projects interruption status from task rows and durable timeline events. */
+export function taskInterruptStatus(task: SupervisorTaskSummary, items: readonly TimelineItem[]): TaskInterruptStatus | null {
+  if (task.status === 'interrupted') return 'interrupted'
+  const event = items.filter(item => item.taskId === task.id && item.type === 'unknown'
+    && ['task.interrupt.accepted', 'task.interrupt.failed'].includes(String(record(item.content).eventType)))
+    .sort(compareInterruptEvents).at(-1)
+  const type = record(event?.content).eventType
+  return type === 'task.interrupt.accepted' ? 'accepted' : type === 'task.interrupt.failed' ? 'failed' : null
+}
+
+export function taskIsInterruptible(task: SupervisorTaskSummary, turn: SupervisorTurnSummary | undefined, status: TaskInterruptStatus | null): boolean {
+  return Boolean(turn && task.rootTaskId && task.id !== task.rootTaskId && task.parentTaskId
+    && ACTIVE_TASK_STATUSES.has(task.status) && ACTIVE_TURN_STATUSES.has(turn.status)
+    && status !== 'accepted' && status !== 'interrupted')
+}
+
+export function projectSelectedTaskInterrupt(tasks: readonly SupervisorTaskSummary[], turns: readonly SupervisorTurnSummary[], selectedNode: TaskTreeNode | undefined, items: readonly TimelineItem[]) {
+  const task = selectedNode?.kind === 'task' ? tasks.find(candidate => `task:${candidate.id}` === selectedNode.id) : undefined
+  if (!task) return null
+  const status = taskInterruptStatus(task, items)
+  return { task, status, eligible: taskIsInterruptible(task, turns.find(turn => turn.id === task.turnId), status) }
+}
 
 /** Projects authoritative turns plus timeline evidence into a read-only tree. */
 export function projectSupervisorTree({ turns, items, tasks = [], labels = DEFAULT_LABELS }: SupervisorTreeInput): TaskTreeNode[] {
@@ -190,6 +216,13 @@ function toolCallId(item: TimelineItem): string | null {
   return typeof value === 'string' && value.trim() ? value : null
 }
 function latestItem(items: readonly TimelineItem[]): TimelineItem | undefined { return [...items].sort(compareCreated).at(-1) }
+function compareInterruptEvents(left: TimelineItem, right: TimelineItem): number {
+  if (left.sequence && right.sequence && /^(0|[1-9]\d*)$/.test(left.sequence) && /^(0|[1-9]\d*)$/.test(right.sequence)) {
+    const a = BigInt(left.sequence), b = BigInt(right.sequence)
+    if (a !== b) return a < b ? -1 : 1
+  }
+  return compareCreated(left, right)
+}
 function compareGroups(left: readonly TimelineItem[], right: readonly TimelineItem[]): number {
   const leftItem = left[0]
   const rightItem = right[0]

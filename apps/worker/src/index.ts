@@ -9,6 +9,7 @@ import { workerHarnessFeatureHealth } from "./admin/harness-health.js";
 import { startSubagentMailboxOutboxConsumer } from "./runtime/mailbox/outbox-consumer.js";
 import { startAgentEventOutboxConsumer } from "./runtime/events/outbox-consumer.js";
 import { startTaskGraphStopOutboxConsumer } from "./runtime/subagents/task-graph-stop-outbox.js";
+import { startTaskInterruptOutboxConsumer } from "./runtime/subagents/task-interrupt-outbox.js";
 import { startAgentWakeupConsumer } from "./runtime/wakeup/consumer.js";
 import { resolveProductionAgentFlags } from "./runtime/production-agent-flags.js";
 import { createCanonicalExecutionProjection } from "./runtime/canonical-execution-projection.js";
@@ -103,11 +104,13 @@ async function main() {
   let agentMailboxOutboxConsumer: ReturnType<typeof startSubagentMailboxOutboxConsumer> | undefined;
   let agentEventOutboxConsumer: ReturnType<typeof startAgentEventOutboxConsumer> | undefined;
   let agentTaskGraphStopOutboxConsumer: ReturnType<typeof startTaskGraphStopOutboxConsumer> | undefined;
+  let agentTaskInterruptOutboxConsumer: ReturnType<typeof startTaskInterruptOutboxConsumer> | undefined;
   let automationScheduler: ReturnType<typeof startAutomationScheduler> | undefined;
   let adminServer: ClosableHttpServer | undefined;
   const postBootstrapFence = createPostBootstrapStartupFence(() => [
     () => scoutWorker.close(),
     () => applyWorker.close(),
+    () => agentTaskInterruptOutboxConsumer?.close(),
     () => closeAgentRunResources(),
     async () => { await canonicalBootstrap?.close(); },
     () => closeDeadLetterResources(),
@@ -156,6 +159,8 @@ async function main() {
     console.log("[worker] Agent session event outbox consumer started");
     agentTaskGraphStopOutboxConsumer = startTaskGraphStopOutboxConsumer(pool);
     console.log("[worker] Agent TaskGraph stop outbox consumer started");
+    agentTaskInterruptOutboxConsumer = startTaskInterruptOutboxConsumer(pool, canonicalBootstrap.runtime.manager);
+    console.log("[worker] Agent child-task interrupt outbox consumer started");
 
     const workerControls = {
       "apply-tasks": bindWorkerControl(applyQueue, applyWorker),
