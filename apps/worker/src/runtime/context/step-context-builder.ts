@@ -5,7 +5,7 @@ import { InputClaimStoreError, type InputClaimStore, type InputClaimTransaction,
 import { appendNewObservedSteeringMarkers, buildObservedSteeringMarker, type SteeringMarkerContext } from "./steering-marker-store.js"
 import type { SteeringMarkerPayload } from "./steering-marker.js"
 import { activeMarkerInputIds, assertHydratedSteeringInputs, mergeSteeringInputs } from "./steering-marker-hydration.js"
-import { checkpointWithInputs, pendingInputBlocks } from "./step-context-support.js"
+import { checkpointWithInputs, pendingInputBlocks, rootInputTextMatchesGoal } from "./step-context-support.js"
 export type JsonValue = null | boolean | number | string | JsonValue[] | { readonly [key: string]: JsonValue }
 export type ContextTrust = "system" | "user_confirmed" | "internal_record" | "external_untrusted"
 export type ContextLayer = "system" | "profile" | "goal" | "steer_history" | "business" | "tool_observation" | "pending_input"
@@ -214,7 +214,11 @@ export class StepContextBuilder {
     for (const entry of request.snapshot.steerHistory) blocks.push(block("steer_history", "data", "external_untrusted", "steer_history", `history:${entry.id}`, entry.content))
     for (const reference of [...request.snapshot.businessRefs].sort((left, right) => left.kind.localeCompare(right.kind) || left.id.localeCompare(right.id))) blocks.push(block("business", "data", referenceTrust(reference.kind), "business_reference", `business:${reference.kind}:${reference.id}`, referenceContent(reference)))
     for (const observation of request.snapshot.toolObservations) blocks.push(block("tool_observation", "data", "external_untrusted", observation.id.startsWith("snapshot-working-state:") ? "context_snapshot_working_state" : "tool_or_subagent", `observation:${observation.id}`, observation.content))
-    for (const input of contextInputs) blocks.push(...(await pendingInputBlocks(input, this.ownerFence, request.scope, block, message => new ContextOwnershipError("reference_owner_mismatch", message))).filter(item => input.id !== request.rootInputId || isAttachmentBlock(item)))
+    for (const input of contextInputs) {
+      const duplicateRootText = rootInputTextMatchesGoal(input, request.rootInputId, request.snapshot.goal?.content)
+      const pending = await pendingInputBlocks(input, this.ownerFence, request.scope, block, message => new ContextOwnershipError("reference_owner_mismatch", message))
+      blocks.push(...pending.filter(item => !duplicateRootText || isAttachmentBlock(item)))
+    }
     const ordered = blocks.sort((left, right) => layerOrder.indexOf(left.layer) - layerOrder.indexOf(right.layer))
     const result = {
       schemaVersion: "agent-harness.v2" as const, sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId,

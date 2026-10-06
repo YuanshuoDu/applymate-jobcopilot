@@ -3,7 +3,7 @@ import type { InputContentPart, TenantScope } from "@jobcopilot/agent-protocol"
 
 import type { ContextBlock, ContextOwnerFence } from "./step-context-builder.js"
 import type { StepCheckpoint, StoredAgentInput } from "./input-claim-store.js"
-import { checkpointWithInputs, pendingInputBlocks } from "./step-context-support.js"
+import { checkpointWithInputs, pendingInputBlocks, rootInputTextMatchesGoal } from "./step-context-support.js"
 
 const now = new Date("2026-09-01T00:00:00.000Z")
 const scope: TenantScope = { userId: "user-1" }
@@ -15,6 +15,20 @@ const ownerFence: ContextOwnerFence = { assertReferenceOwned: async () => undefi
 const createBlock = (layer: ContextBlock["layer"], role: ContextBlock["role"], trust: ContextBlock["trust"], source: string, id: string, content: unknown): ContextBlock => ({ id, layer, role, trust, source, content: content as ContextBlock["content"] })
 
 describe("step context support", () => {
+  it("deduplicates only the complete ordered root text joined and trimmed to the exact goal", () => {
+    const makeInput = (id: string, texts: readonly string[]) => input(id, 1n, texts.map(text => ({ type: "text" as const, text })))
+    expect(rootInputTextMatchesGoal(makeInput("root", ["Find roles", "in Dublin"]), "root", "Find roles\nin Dublin")).toBe(true)
+    expect(rootInputTextMatchesGoal(makeInput("root", [" Find roles ", "in Dublin "]), "root", "Find roles \nin Dublin")).toBe(true)
+    expect(rootInputTextMatchesGoal(makeInput("root", ["Find roles"]), "root", "Find roles in Dublin")).toBe(false)
+    expect(rootInputTextMatchesGoal(makeInput("root", ["Find roles in Dublin"]), "root", "Find roles")).toBe(false)
+    expect(rootInputTextMatchesGoal(makeInput("root", ["Find", "roles"]), "root", "Find roles")).toBe(false)
+    expect(rootInputTextMatchesGoal(makeInput("root", ["Cafe\u0301 roles"]), "root", "Café roles")).toBe(false)
+    expect(rootInputTextMatchesGoal(makeInput("root", ["Find  roles"]), "root", "Find roles")).toBe(false)
+    expect(rootInputTextMatchesGoal(makeInput("other", ["Find roles"]), "root", "Find roles")).toBe(false)
+    expect(rootInputTextMatchesGoal(makeInput("root", ["Find roles"]), "root", undefined)).toBe(false)
+    expect(rootInputTextMatchesGoal(makeInput("root", ["Find roles"]), "root", { text: "Find roles" })).toBe(false)
+  })
+
   it("builds bounded pending text and attachment blocks", async () => {
     const blocks = await pendingInputBlocks(input("input-1", 2n, [{ type: "text", text: "Dublin" }, { type: "attachment_ref", attachmentId: "resume-1", mediaType: "application/pdf" }]), ownerFence, scope, createBlock)
     expect(blocks).toHaveLength(2)
