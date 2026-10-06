@@ -9,7 +9,7 @@ const input = {
   policy: normalizeSubagentPolicy({ maxConcurrency: 2 }), now: new Date("2026-10-06T10:00:00Z"),
 }
 
-function poolFixture(options: { pause?: boolean; rootInterrupted?: boolean } = {}) {
+function poolFixture(options: { pause?: boolean; rootInterrupted?: boolean; turnUnavailable?: boolean } = {}) {
   const calls: string[] = []
   const task = { id: "child-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
     path: "/root-1/child-1", depth: 1, role: "analyst", taskType: "test", status: "running", goal: "inspect", constraints: [],
@@ -22,7 +22,9 @@ function poolFixture(options: { pause?: boolean; rootInterrupted?: boolean } = {
       if (sql.includes('FROM "agent_sessions" AS session') && sql.includes("FOR UPDATE")) return { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1 }
       if (sql.includes('SELECT set_config')) return { rows: [], rowCount: 1 }
       if (sql.includes('SELECT "turnId", "rootTaskId"')) return { rows: [{ turnId: "turn-1", rootTaskId: "root-1" }], rowCount: 1 }
-      if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "turn-1" }], rowCount: 1 }
+      if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")) return options.turnUnavailable
+        ? { rows: [], rowCount: 0 }
+        : { rows: [{ id: "turn-1" }], rowCount: 1 }
       if (sql.includes('SELECT "id", "turnId", "status", "interruptRequestedAt"')) return { rows: [{ id: "root-1", turnId: "turn-1", status: "running", interruptRequestedAt: options.rootInterrupted ? new Date() : null }], rowCount: 1 }
       if (sql.includes('SELECT "id", "turnId", "rootTaskId", "status", "interruptRequestedAt"')) return { rows: [{ id: "child-1", turnId: "turn-1", rootTaskId: "root-1", status: "queued", interruptRequestedAt: null }], rowCount: 1 }
       if (sql.includes('SELECT session."id" FROM "agent_sessions"')) return options.pause ? { rows: [], rowCount: 0 } : { rows: [{ id: "session-1" }], rowCount: 1 }
@@ -60,6 +62,14 @@ describe("atomic child claim pause fence", () => {
     await expect(claimSubagentTask(fake.pool, input, 60_000)).rejects.toBeInstanceOf(SessionPauseRequestedError)
     expect(fake.calls.some(sql => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
     expect(fake.calls.at(-1)).toBe("ROLLBACK")
+  })
+
+  it("returns the existing non-admission result for an unavailable Turn before claim writes", async () => {
+    const fake = poolFixture({ turnUnavailable: true })
+    await expect(claimSubagentTask(fake.pool, input, 60_000)).resolves.toBeNull()
+    expect(fake.calls.some(sql => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
+    expect(fake.calls.some(sql => sql.includes("COUNT(*)::int"))).toBe(false)
+    expect(fake.calls.at(-1)).toBe("COMMIT")
   })
 
   it("does not claim a child after the locked root has been interrupted", async () => {
