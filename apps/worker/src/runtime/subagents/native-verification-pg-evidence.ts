@@ -159,9 +159,14 @@ async function readTargetEvidence(
   client: Queryable, state: NativeVerificationOwnedState, target: NativeVerificationTarget,
 ): Promise<readonly NativeVerificationEvidence[] | null> {
   const task = target.task, scope = state.scope
-  const result = await client.query(`SELECT item."id", item."revision", item."content", step."attempt"
+  const result = await client.query(`SELECT item."id", item."revision", item."content", step."attempt", call_item."id" AS "callItemId",
+      call_item."revision" AS "callRevision",
+      call_item."content" AS "callContent", COUNT(call_item."id") OVER (PARTITION BY item."id") AS "callMatches"
     FROM "agent_items" AS item JOIN "agent_steps" AS step ON step."id" = item."stepId"
       AND step."sessionId" = item."sessionId" AND step."turnId" = item."turnId" AND step."taskId" = item."taskId"
+    LEFT JOIN "agent_items" AS call_item ON call_item."sessionId" = item."sessionId" AND call_item."turnId" = item."turnId"
+      AND call_item."taskId" = item."taskId" AND call_item."stepId" = item."stepId" AND call_item."type" = 'tool_call'
+      AND call_item."content"->>'toolCallId' = item."content"->>'toolCallId'
     JOIN "sub_agent_tasks" AS owner ON owner."id" = item."taskId" AND owner."sessionId" = item."sessionId" AND owner."turnId" = item."turnId"
     JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
     JOIN "agent_sessions" AS session ON session."id" = item."sessionId"
@@ -173,14 +178,22 @@ async function readTargetEvidence(
   if (result.rows.length > MAX_TOOL_FACTS) return null
   const evidence: NativeVerificationEvidence[] = []
   for (const raw of result.rows) {
-    const row = raw as Row, content = record(row.content)
-    if (typeof row.id !== "string" || !Number.isSafeInteger(row.revision) || !content
-      || typeof content.toolName !== "string" || typeof content.status !== "string"
+    const row = raw as Row, content = record(row.content), call = record(row.callContent)
+    if (typeof row.id !== "string" || !Number.isSafeInteger(row.revision) || !content || !call
+      || Number(row.callMatches) !== 1 || typeof row.callItemId !== "string" || !Number.isSafeInteger(row.callRevision)
+      || typeof content.toolCallId !== "string" || call.toolCallId !== content.toolCallId
+      || typeof call.toolName !== "string" || typeof call.status !== "string"
       || !Object.hasOwn(content, "output") || containsSecretField(content.output)) return null
-    let outputDigest: string
+    let outputDigest: string, callDigest: string
     let output: unknown
-    try { outputDigest = digestNativeVerificationValue(content.output); output = JSON.parse(canonicalNativeVerificationJson(content.output)) as unknown } catch { return null }
-    const toolSummary = JSON.stringify({ itemId: row.id, revision: row.revision, attempt: row.attempt, tool: content.toolName, status: content.status, outputDigest, output })
+    try {
+      outputDigest = digestNativeVerificationValue(content.output)
+      callDigest = digestNativeVerificationValue(call)
+      output = JSON.parse(canonicalNativeVerificationJson(content.output)) as unknown
+    } catch { return null }
+    const toolSummary = JSON.stringify({ itemId: row.id, revision: row.revision, attempt: row.attempt,
+      callItemId: row.callItemId, callRevision: row.callRevision, toolCallId: content.toolCallId,
+      callDigest, tool: call.toolName, status: call.status, outputDigest, output })
     if (Buffer.byteLength(toolSummary, "utf8") > MAX_SUMMARY_BYTES) return null
     evidence.push({
       referenceId: evidenceRef("tool", row.id), kind: "tool_result",

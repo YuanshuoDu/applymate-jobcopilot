@@ -1,13 +1,14 @@
 import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import { hashArtifactContent } from "./artifact-adapters.js"
-import { canonicalNativeVerificationJson, digestNativeVerificationValue } from "./native-verification-contract.js"
+import { NATIVE_VERIFICATION_PACKET_SCHEMA, canonicalNativeVerificationJson, digestNativeVerificationValue, type NativeVerificationPacket } from "./native-verification-contract.js"
 import type { StoredTaskGraphNode } from "./task-graph-snapshot.js"
 import type { NativeVerificationOwnedState, NativeVerificationTarget } from "./native-verification-pg-bindings.js"
 import {
   buildNativeChildPacketContent, buildNativeRootPacketContent, nativeVerificationRootPacketHistory,
   type NativeVerificationHistoryEntry,
 } from "./native-verification-pg-evidence.js"
+import { nativeVerificationControlContentMatches } from "./native-verification-pg-request.js"
 
 const scope = {
   userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
@@ -25,17 +26,54 @@ describe("native verification private evidence", () => {
       criteria: objective.successCriteria, resultText: canonicalNativeVerificationJson(task.result), resultDigest: digestNativeVerificationValue(task.result) }
     const state = { scope, snapshot: null, tasks: new Map([[task.id, task]]), sourceTasks: new Map(), goal: objective.goal,
       criteria: objective.successCriteria, criteriaValid: true, nativeSourcesValid: true, turnGoalConflict: false, turnInputDigest: "f".repeat(64) } as NativeVerificationOwnedState
-    const clientWithFact = { query: vi.fn().mockResolvedValueOnce({ rows: [{ id: "item-1", revision: 1, attempt: 1,
-      content: { toolName: "lookup", status: "completed", toolCallId: "call-1", output: { fact: "persisted fact 42" } } }] })
+    const currentToolResult = { id: "result-1", revision: 1, attempt: 1,
+      content: { toolCallId: "call-1", output: { fact: "persisted fact 42" } },
+      callItemId: "call-item-1", callRevision: 1, callMatches: 1,
+      callContent: { toolCallId: "call-1", toolName: "lookup", status: "completed", input: { query: "private argument sentinel" } } }
+    const clientWithFact = { query: vi.fn().mockResolvedValueOnce({ rows: [currentToolResult] })
       .mockResolvedValueOnce({ rows: [] }) } as unknown as Pick<pg.PoolClient, "query">
     const content = await buildNativeChildPacketContent(clientWithFact, state, target)
     expect(content?.evidence[0]?.summary).toContain("persisted fact 42")
+    expect(content?.evidence[0]?.summary).toContain('"callItemId":"call-item-1"')
+    expect(content?.evidence[0]?.summary).toContain('"toolCallId":"call-1"')
+    expect(content?.evidence[0]?.summary).not.toContain("private argument sentinel")
     expect(content?.target.kind).toBe("child")
     if (content?.target.kind === "child") expect(content.target.resultText).toContain("persisted result")
+    const evidenceQuery = String(vi.mocked(clientWithFact.query).mock.calls[0]?.[0])
+    expect(evidenceQuery).toContain('LEFT JOIN "agent_items" AS call_item')
+    expect(evidenceQuery).toContain('call_item."sessionId" = item."sessionId" AND call_item."turnId" = item."turnId"')
+    expect(evidenceQuery).toContain('call_item."taskId" = item."taskId" AND call_item."stepId" = item."stepId"')
+    expect(evidenceQuery).toContain('call_item."content"->>\'toolCallId\' = item."content"->>\'toolCallId\'')
 
-    const clientWithoutFact = { query: vi.fn().mockResolvedValueOnce({ rows: [{ id: "item-2", revision: 1, attempt: 1,
-      content: { toolName: "lookup", status: "completed", toolCallId: "call-2" } }] }) } as unknown as Pick<pg.PoolClient, "query">
+    const clientWithoutFact = { query: vi.fn().mockResolvedValueOnce({ rows: [{ ...currentToolResult,
+      id: "result-missing-output", content: { toolCallId: "call-1" } }] }) } as unknown as Pick<pg.PoolClient, "query">
     await expect(buildNativeChildPacketContent(clientWithoutFact, state, target)).resolves.toBeNull()
+
+    const missingCall = { query: vi.fn().mockResolvedValueOnce({ rows: [{ ...currentToolResult,
+      id: "result-unpaired", callMatches: 0, callItemId: null, callContent: null }] }) } as unknown as Pick<pg.PoolClient, "query">
+    await expect(buildNativeChildPacketContent(missingCall, state, target)).resolves.toBeNull()
+    const mismatchedCall = { query: vi.fn().mockResolvedValueOnce({ rows: [{ ...currentToolResult,
+      callContent: { ...currentToolResult.callContent, toolCallId: "other-call" } }] }) } as unknown as Pick<pg.PoolClient, "query">
+    await expect(buildNativeChildPacketContent(mismatchedCall, state, target)).resolves.toBeNull()
+
+    const packet = { schemaVersion: NATIVE_VERIFICATION_PACKET_SCHEMA, controlOperationId: "operation-1", controlTaskId: "control-1",
+      goal: content!.goal, criteria: content!.criteria, target: content!.target, evidence: content!.evidence } as NativeVerificationPacket
+    const buildVariant = async (callContent: Record<string, unknown>, output: unknown) => {
+      const queryMock = { query: vi.fn().mockResolvedValueOnce({ rows: [{ ...currentToolResult,
+        content: { toolCallId: "call-1", output }, callContent }] }).mockResolvedValueOnce({ rows: [] }) }
+      const client = queryMock as unknown as Pick<pg.PoolClient, "query">
+      return buildNativeChildPacketContent(client, state, target)
+    }
+    for (const [callContent, output] of [
+      [{ ...currentToolResult.callContent, toolName: "other-tool" }, currentToolResult.content.output],
+      [{ ...currentToolResult.callContent, status: "failed" }, currentToolResult.content.output],
+      [{ ...currentToolResult.callContent, input: { query: "different private argument" } }, currentToolResult.content.output],
+      [currentToolResult.callContent, { fact: "changed source fact" }],
+    ] as const) {
+      const changed = await buildVariant(callContent, output)
+      expect(changed).not.toBeNull()
+      expect(nativeVerificationControlContentMatches(packet, changed!)).toBe(false)
+    }
   })
 
   it("reads the schema-mapped owned artifact version and rejects content that fails its hash", async () => {
@@ -51,8 +89,10 @@ describe("native verification private evidence", () => {
     const artifactHash = hashArtifactContent(artifactContent)
     const artifactRow = { id: "version-1", artifactId: "artifact-1", version: 1, artifactType: "cover_letter",
       contentHash: artifactHash, sourceDigest: `sha256:${"a".repeat(64)}`, content: artifactContent }
-    const client = { query: vi.fn().mockResolvedValueOnce({ rows: [{ id: "item-1", revision: 1, attempt: 1,
-      content: { toolName: "cover_letter.draft", status: "completed", toolCallId: "call-1", output: { artifactId: "artifact-1" } } }] })
+    const toolResult = { id: "item-1", revision: 1, attempt: 1, callItemId: "call-item-1", callRevision: 1, callMatches: 1,
+      content: { toolCallId: "call-1", output: { artifactId: "artifact-1" } },
+      callContent: { toolCallId: "call-1", toolName: "cover_letter.draft", status: "completed" } }
+    const client = { query: vi.fn().mockResolvedValueOnce({ rows: [toolResult] })
       .mockResolvedValueOnce({ rows: [artifactRow] }) } as unknown as Pick<pg.PoolClient, "query">
 
     const packet = await buildNativeChildPacketContent(client, state, target)
@@ -66,7 +106,7 @@ describe("native verification private evidence", () => {
     expect(String(artifactQuery?.[0])).toContain('step."attempt" = $6')
     expect(artifactQuery?.[1]).toEqual([task.id, scope.sessionId, scope.turnId, scope.rootTaskId, scope.userId, target.attempt, 9])
 
-    const invalidHashClient = { query: vi.fn().mockResolvedValueOnce({ rows: [] })
+    const invalidHashClient = { query: vi.fn().mockResolvedValueOnce({ rows: [toolResult] })
       .mockResolvedValueOnce({ rows: [{ ...artifactRow, contentHash: `sha256:${"0".repeat(64)}` }] }) } as unknown as Pick<pg.PoolClient, "query">
     await expect(buildNativeChildPacketContent(invalidHashClient, state, target)).resolves.toBeNull()
   })

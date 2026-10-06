@@ -38,7 +38,8 @@ const databaseUrl = disposableUrl(), describePg = databaseUrl ? describe : descr
 const suffix = randomUUID(), ids = {
   user: `native-verify-user-${suffix}`, session: `native-verify-session-${suffix}`, turn: `native-verify-turn-${suffix}`,
   root: `native-verify-root-${suffix}`, rootStep: `native-verify-root-step-${suffix}`, child: `native-verify-child-${suffix}`,
-  childStep: `native-verify-child-step-${suffix}`, toolItem: `native-verify-tool-item-${suffix}`,
+  childStep: `native-verify-child-step-${suffix}`, toolCallItem: `native-verify-tool-call-${suffix}`,
+  toolItem: `native-verify-tool-item-${suffix}`,
   turnOwner: `native-verify-turn-owner-${suffix}`, taskOwner: `native-verify-task-owner-${suffix}`,
 }
 const goal = "Find and verify the persisted source facts"
@@ -99,8 +100,11 @@ async function seed(): Promise<void> {
     ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
     VALUES ($1, $2, $3, $4, 2, 1, 'completed', 0, '[]'::jsonb, '{}'::jsonb)`, [ids.childStep, ids.session, ids.turn, ids.child])
   await pool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "revision", "content", "updatedAt")
+    VALUES ($1, $2, $3, $4, $5, 'tool_call', 'completed', 1, $6::jsonb, CURRENT_TIMESTAMP)`, [ids.toolCallItem, ids.session, ids.turn, ids.childStep, ids.child,
+    JSON.stringify({ toolCallId: "lookup-576", toolName: "source.lookup", toolVersion: "1", status: "completed", input: { query: "fact 42" } })])
+  await pool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "revision", "content", "updatedAt")
     VALUES ($1, $2, $3, $4, $5, 'tool_result', 'completed', 1, $6::jsonb, CURRENT_TIMESTAMP)`, [ids.toolItem, ids.session, ids.turn, ids.childStep, ids.child,
-    JSON.stringify({ toolCallId: "lookup-576", toolName: "source.lookup", status: "completed", output: toolOutput })])
+    JSON.stringify({ toolCallId: "lookup-576", output: toolOutput, errorCode: null })])
 }
 
 async function completeControls(taskIds: readonly string[]): Promise<void> {
@@ -185,28 +189,59 @@ describePg("native verification PostgreSQL producer and readback", () => {
     const recovered = await port.readRecoverableGoal(scope)
     expect(recovered).toMatchObject({ status: "passed", candidateText })
     if (!recovered || recovered.status !== "passed" || !recovered.witness) throw new Error("native_verification_candidate_not_recovered")
+    const witness = recovered.witness
     const client: PoolClient = await pool!.connect()
+    let proofTransactionOpen = false
     try {
       await client.query("BEGIN")
+      proofTransactionOpen = true
       await client.query(`SELECT set_config('app.user_id', $1, true)`, [ids.user])
       const accepted = await readNativeVerificationTerminalProofWithClient(client, {
-        scope, candidateText, witness: recovered.witness,
+        scope, candidateText, witness,
       })
-      expect(accepted).toBe(true)
       await client.query("ROLLBACK")
-    } finally { client.release() }
+      proofTransactionOpen = false
+      expect(accepted).toBe(true)
+    } finally {
+      if (proofTransactionOpen) await client.query("ROLLBACK").catch(() => undefined)
+      client.release()
+    }
 
-    await pool!.query(`UPDATE "agent_items" SET "revision" = "revision" + 1, "content" = $2::jsonb WHERE "id" = $1`,
-      [ids.toolItem, JSON.stringify({ toolCallId: "lookup-576", toolName: "source.lookup", status: "completed", output: { facts: ["changed after review"] } })])
-    const afterEvidenceMutation: PoolClient = await pool!.connect()
-    try {
-      await afterEvidenceMutation.query("BEGIN")
-      await afterEvidenceMutation.query(`SELECT set_config('app.user_id', $1, true)`, [ids.user])
-      const accepted = await readNativeVerificationTerminalProofWithClient(afterEvidenceMutation, {
-        scope, candidateText, witness: recovered.witness,
-      })
-      expect(accepted).toBe(false)
-      await afterEvidenceMutation.query("ROLLBACK")
-    } finally { afterEvidenceMutation.release() }
+    const expectStaleEvidenceRejected = async () => {
+      const client: PoolClient = await pool!.connect()
+      let transactionOpen = false
+      try {
+        await client.query("BEGIN")
+        transactionOpen = true
+        await client.query(`SELECT set_config('app.user_id', $1, true)`, [ids.user])
+        const accepted = await readNativeVerificationTerminalProofWithClient(client, { scope, candidateText, witness })
+        await client.query("ROLLBACK")
+        transactionOpen = false
+        expect(accepted).toBe(false)
+      } finally {
+        if (transactionOpen) await client.query("ROLLBACK").catch(() => undefined)
+        client.release()
+      }
+    }
+    const originalCall = { toolCallId: "lookup-576", toolName: "source.lookup", toolVersion: "1", status: "completed", input: { query: "fact 42" } }
+    const mutateCall = async (content: unknown) => pool!.query(`UPDATE "agent_items" SET "revision" = "revision" + 1, "content" = $2::jsonb WHERE "id" = $1`,
+      [ids.toolCallItem, JSON.stringify(content)])
+    const mutateResult = async (content: unknown) => pool!.query(`UPDATE "agent_items" SET "revision" = "revision" + 1, "content" = $2::jsonb WHERE "id" = $1`,
+      [ids.toolItem, JSON.stringify(content)])
+
+    await mutateCall({ ...originalCall, toolName: "source.other" })
+    await expectStaleEvidenceRejected()
+    await mutateCall(originalCall)
+    await mutateCall({ ...originalCall, status: "failed" })
+    await expectStaleEvidenceRejected()
+    await mutateCall(originalCall)
+    await mutateCall({ ...originalCall, input: { query: "changed after review" } })
+    await expectStaleEvidenceRejected()
+    await mutateCall(originalCall)
+    await mutateResult({ toolCallId: "lookup-576", output: { facts: ["changed after review"] }, errorCode: null })
+    await expectStaleEvidenceRejected()
+    await mutateResult({ toolCallId: "lookup-576", output: toolOutput, errorCode: null })
+    await mutateCall({ ...originalCall, toolCallId: "mismatched-call" })
+    await expectStaleEvidenceRejected()
   }, 60_000)
 })

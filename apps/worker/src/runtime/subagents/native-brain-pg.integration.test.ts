@@ -353,8 +353,13 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
       .toEqual({ status: "completed", failureReason: null })
     expect(initialTask.rows[0]?.attemptCount).toBe(1)
     expect(JSON.stringify(initialTask.rows[0]?.result)).toContain("Fact 42 is absent")
-    const targetToolRows = await pool!.query<{ count: number }>(`SELECT COUNT(*)::int AS "count" FROM "agent_items"
-      WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "type" = 'tool_result' AND "content"->>'toolName' = 'jobs.search'`,
+    const targetToolRows = await pool!.query<{ count: number }>(`SELECT COUNT(*)::int AS "count" FROM "agent_items" AS result
+      JOIN "agent_items" AS call_item ON call_item."sessionId" = result."sessionId" AND call_item."turnId" = result."turnId"
+        AND call_item."taskId" = result."taskId" AND call_item."stepId" = result."stepId"
+        AND call_item."content"->>'toolCallId' = result."content"->>'toolCallId'
+      WHERE result."sessionId" = $1 AND result."turnId" = $2 AND result."taskId" = $3 AND result."type" = 'tool_result'
+        AND call_item."type" = 'tool_call' AND call_item."content"->>'toolName' = 'jobs.search'
+        AND call_item."content"->>'status' = 'completed' AND call_item."content"->'input'->>'target' = 'Fact 42'`,
     [ids.session, ids.turn, spawned.child.taskId])
     expect(targetToolRows.rows[0]?.count).toBe(1)
 
