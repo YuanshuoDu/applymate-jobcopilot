@@ -140,13 +140,11 @@ function criteriaField(row: Row | null, key: string): Readonly<{ value: readonly
   const parsed = criterionList(row[key])
   return parsed ? { value: parsed, valid: true } : { value: [], valid: false }
 }
-
 function mergeCriteria(turnCriteria: readonly string[], rootCriteria: readonly string[], goal: string | null): readonly string[] {
   const merged = [...new Set([...turnCriteria, ...rootCriteria])]
   if (merged.length > MAX_CRITERIA) return []
   return merged.length ? merged : goal ? [goal] : []
 }
-
 export type NativeVerificationObjective = Readonly<{ goal: string; criteria: readonly string[] }>
 
 /** Shared exact objective derivation. Missing root means rootTaskStore.ensure's fresh-root goal/empty-criteria convention. */
