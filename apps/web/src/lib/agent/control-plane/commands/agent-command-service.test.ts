@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest"
 import type { PrismaClient } from "@prisma/client"
 
 import { AgentCommandService } from "./agent-command-service"
+import { ObjectiveStartCommandService } from "./objective-start"
 
 type Row = Record<string, unknown>
 
@@ -266,7 +267,99 @@ function replacementCommand(clientMessageId: string, expectedTurnId: string, exp
   }
 }
 
+function objectiveStartCommand(clientMessageId: string, source: "user" | "automation" = "user") {
+  return {
+    sessionId: "session_1", userId: "user_1", clientMessageId, source,
+    objective: "  Find senior backend roles in Dublin  ",
+    content: [{ type: "text" as const, text: "\nReference: preserve this context exactly.\n" }],
+  }
+}
+
 describe("AgentCommandService", () => {
+  it("starts a fresh root with a separate exact objective and preserved context", async () => {
+    const fake = makeDb({ sessionStatus: "running" })
+    const longContext = "x".repeat(20_000)
+    const result = await new ObjectiveStartCommandService(fake.db).start({
+      ...objectiveStartCommand("objective_start_1"), content: [{ type: "text", text: longContext }],
+    })
+
+    expect(result).toMatchObject({ disposition: "started", turnId: fake.state.active?.id })
+    expect(fake.state.active?.input).toMatchObject({
+      goal: "Find senior backend roles in Dublin",
+      content: [{ type: "text", text: longContext }],
+    })
+    expect(fake.state.inputs[0]).toMatchObject({
+      targetTurnId: result.turnId,
+      delivery: "follow_up",
+      content: [{ type: "text", text: longContext }],
+    })
+    expect(fake.state.events.map((event) => event.type)).toEqual(["turn.started", "input.accepted"])
+    expect(fake.state.outbox.filter((entry) => entry.topic === "agent.turn.dispatch")).toHaveLength(1)
+    expect(fake.state.turns).toHaveLength(1)
+  })
+
+  it("replays the original fresh root before checking later Session state or active Turns", async () => {
+    const fake = makeDb({ sessionStatus: "running" })
+    const service = new ObjectiveStartCommandService(fake.db)
+    const first = await service.start(objectiveStartCommand("objective_start_replay"))
+    fake.state.setSessionStatus("archived")
+    const readsBeforeReplay = fake.tx.agentTurn.findFirst.mock.calls.length
+    const replay = await service.start(objectiveStartCommand("objective_start_replay"))
+
+    expect(replay).toMatchObject({
+      disposition: "duplicate", originalDisposition: "started", inputId: first.inputId, turnId: first.turnId,
+    })
+    expect(fake.tx.agentTurn.findFirst).toHaveBeenCalledTimes(readsBeforeReplay)
+    expect(fake.state.turns).toHaveLength(1)
+    expect(fake.state.inputs).toHaveLength(1)
+    expect(fake.state.outbox.filter((entry) => entry.topic === "agent.turn.dispatch")).toHaveLength(1)
+  })
+
+  it("rejects paused, closed, and active fresh admissions without writes", async () => {
+    for (const status of ["paused", "completed", "aborted", "archived"]) {
+      const fake = makeDb({ sessionStatus: status })
+      await expect(new ObjectiveStartCommandService(fake.db).start(objectiveStartCommand(`status_${status}`)))
+        .rejects.toMatchObject({ code: "objective_start_state_conflict", status: 409 })
+      expect(fake.state.turns).toHaveLength(0)
+      expect(fake.state.inputs).toHaveLength(0)
+      expect(fake.state.outbox).toHaveLength(0)
+    }
+
+    const active = makeDb({ sessionStatus: "running", activeSource: "user" })
+    await expect(new ObjectiveStartCommandService(active.db).start(objectiveStartCommand("active_root")))
+      .rejects.toMatchObject({ code: "retry_active_conflict", status: 409 })
+    expect(active.state.turns).toHaveLength(1)
+    expect(active.state.inputs).toHaveLength(0)
+    expect(active.state.outbox).toHaveLength(0)
+
+    const foreign = makeDb({ sessionStatus: "running", sessionOwnerId: "user_2" })
+    await expect(new ObjectiveStartCommandService(foreign.db).start(objectiveStartCommand("foreign_session")))
+      .rejects.toMatchObject({ code: "agent_session_not_found", status: 404 })
+    expect(foreign.state.turns).toHaveLength(0)
+    expect(foreign.state.inputs).toHaveLength(0)
+    expect(foreign.state.outbox).toHaveLength(0)
+  })
+
+  it("serializes concurrent same-key objective starts and rolls failed dispatch back", async () => {
+    const concurrent = makeDb({ sessionStatus: "running" })
+    const service = new ObjectiveStartCommandService(concurrent.db)
+    const command = objectiveStartCommand("objective_start_race")
+    const [first, second] = await Promise.all([service.start(command), service.start(command)])
+    expect(new Set([first.turnId, second.turnId])).toHaveLength(1)
+    expect([first.disposition, second.disposition].sort()).toEqual(["duplicate", "started"])
+    expect(concurrent.state.inputs).toHaveLength(1)
+    expect(concurrent.state.outbox.filter((entry) => entry.topic === "agent.turn.dispatch")).toHaveLength(1)
+
+    const failing = makeDb({ sessionStatus: "running", failDispatchOutbox: true })
+    await expect(new ObjectiveStartCommandService(failing.db).start(objectiveStartCommand("objective_start_rollback")))
+      .rejects.toThrow("outbox unavailable")
+    expect(failing.state.rollbacks).toBe(1)
+    expect(failing.state.turns).toHaveLength(0)
+    expect(failing.state.inputs).toHaveLength(0)
+    expect(failing.state.events).toHaveLength(0)
+    expect(failing.state.outbox).toHaveLength(0)
+  })
+
   it("serializes concurrent starts to one active root Turn", async () => {
     const fake = makeDb()
     const service = new AgentCommandService(fake.db)
