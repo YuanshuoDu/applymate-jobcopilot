@@ -8,7 +8,7 @@ const source = { state: { ownerId: "user-a", sessionId: "session-a", throughSequ
 describe("compaction lifecycle Items", () => {
   it("creates bounded visible started and completed states", () => {
     const started = createCompactionStartedItem({ sessionId: "session-a", turnId: "turn-a", throughSequence: 1n, source, reason: "manual" }, () => "item-1")
-    const completed = completeCompactionItem(started, { summary: "x".repeat(500), measurement: { beforeInputTokens: 100, afterInputTokens: 20, reductionTokens: 80, reductionRatio: 0.8 }, report: { preserved: true, preservedFields: ["goal", "approvals", "answers", "artifact_hashes", "open_tasks", "do_not_repeat"], missingFields: [], changedFields: [], beforeDigest: "a", afterDigest: "a" } })
+    const completed = completeCompactionItem(started, { summary: "x".repeat(500), measurement: { beforeInputTokens: 100, afterInputTokens: 20, reductionTokens: 80, reductionRatio: 0.8 }, report: { preserved: true, preservedFields: ["goal", "approvals", "answers", "artifact_hashes", "open_tasks", "do_not_repeat", "selected_job_memories"], missingFields: [], changedFields: [], beforeDigest: "a", afterDigest: "a" } })
     expect(started).toMatchObject({ id: "item-1", type: "context_compaction", status: "started" })
     expect(completed.status).toBe("completed")
     expect(completed.data.summaryPreview?.length).toBeLessThanOrEqual(280)

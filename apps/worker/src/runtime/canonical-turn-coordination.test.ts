@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest"
 import type { TaskGraphCommandPort, TaskGraphCurrentState } from "./subagents/task-graph-command-port.js"
 import type { TurnLease } from "./turns/lease.js"
 import { createCanonicalTurnCoordination } from "./canonical-turn-coordination.js"
+import { SessionPauseRequestedError } from "./session-gate.js"
 import { NATIVE_COORDINATION_RECEIPT_SCHEMA } from "./tools/task-graph-coordination-bridge.js"
 
 const lease = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", ownerId: "worker-1", leaseVersion: 4 } as TurnLease
@@ -41,6 +42,12 @@ describe("canonical Turn native coordination", () => {
     })
     expect(refreshed.toolObservations.find(item => item.id === "task-graph-current")?.content).toMatchObject({ kind: "task_graph_current", revision: 3 })
     await expect(current.coordination.checkNativeGraphCompletion()).resolves.toBeNull()
+    expect(current.coordination.executionScope("step-3")).toEqual({
+      userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", stepId: "step-3",
+      turnLeaseOwner: "worker-1", turnLeaseVersion: 4, parentLeaseOwner: "worker-1", parentAttemptCount: 2,
+    })
+    await expect(current.coordination.hasNativeTasks()).resolves.toBe(true)
+    expect(current.readCurrent).toHaveBeenCalledTimes(2)
   })
 
   it("keeps a recovered native receipt as a completion requirement when the graph is absent", async () => {
@@ -49,6 +56,20 @@ describe("canonical Turn native coordination", () => {
     await expect(current.coordination.checkNativeGraphCompletion()).resolves.toMatchObject({
       ok: false, blocker: "task_graph_verification_unverified", feedback: expect.stringContaining("Native coordination"),
     })
+  })
+
+  it("rethrows typed session pauses instead of converting them into native feedback", async () => {
+    const pause = new SessionPauseRequestedError()
+    const current = makeCoordination(vi.fn(async () => { throw pause }))
+    await expect(current.coordination.refresh(snapshot as never)).rejects.toBe(pause)
+    await expect(current.coordination.checkNativeGraphCompletion()).rejects.toBe(pause)
+  })
+
+  it("rethrows PostgreSQL TaskGraph ownership fences instead of ordinary completion feedback", async () => {
+    const fence = new Error("task_graph_turn_fenced")
+    const current = makeCoordination(vi.fn(async () => { throw fence }))
+    await expect(current.coordination.refresh(snapshot as never)).rejects.toBe(fence)
+    await expect(current.coordination.checkNativeGraphCompletion()).rejects.toBe(fence)
   })
 
   it("fails immediate refresh closed when the native receipt has no graph witness", async () => {

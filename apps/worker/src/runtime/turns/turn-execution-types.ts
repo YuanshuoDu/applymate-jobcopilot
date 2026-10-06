@@ -23,13 +23,15 @@ import type { SteeringMarkerPayload } from "../context/steering-marker.js"
 
 export type TurnEngineCompletionGateResult =
   | { readonly ok: true }
-  | { readonly ok: false; readonly blocker: string; readonly feedback: string }
+  | { readonly ok: false; readonly blocker: string; readonly feedback: string; readonly waitId?: string }
 
 export type TurnEngineCompletionGate = (input: {
   readonly identity: TurnExecutionIdentity
   readonly scope: TenantScope
   readonly rootTaskId: string
   readonly stepId: string
+  /** Exact candidate text that passed the ordinary evidence checks and would be persisted. */
+  readonly candidateText: string
   readonly signal: AbortSignal
   readonly now: Date
 }) => Promise<TurnEngineCompletionGateResult> | TurnEngineCompletionGateResult
@@ -104,6 +106,8 @@ export type TurnExecutionOptions = {
   /** Allows a root or child adapter to classify a lost owner without coupling the loop to a lease type. */
   readonly isOwnershipLost?: (error: unknown, signal: AbortSignal) => boolean
   readonly completionGate?: TurnEngineCompletionGate
+  /** Server-restored exact candidate; it is never added to a model request. */
+  readonly recoveredFinalCandidate?: string
   /** Canonical replay state used only for server-side marker hydration. */
   readonly steeringMarkerState?: { readonly active: readonly SteeringMarkerPayload[] }
   /** Re-read durable TaskGraph state before continuing after an inline-ready agent.wait. */

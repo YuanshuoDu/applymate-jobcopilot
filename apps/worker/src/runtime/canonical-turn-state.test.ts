@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest"
 
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
 import { sha256Hex } from "./context/context-compaction-canonical.js"
+import { projectSelectedJobMemory } from "./context/selected-job-memory.js"
 import { contextToModelMessages } from "./turns/turn-engine-messages.js"
 import { STEERING_MARKER_EVENT_TYPE, steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "./context/steering-marker.js"
 import { buildCognitiveActionAgenda } from "./turns/cognitive-action-agenda.js"
@@ -69,6 +70,8 @@ function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unk
 
 describe("loadCanonicalTurnState", () => {
   it("hydrates durable compaction state from the persisted snapshot after a Worker restart", async () => {
+    const selectedJobMemories = [projectSelectedJobMemory({ jobId: "job-1", sourceTurnId: "turn-1", sourceRootTaskId: "root-1", throughSequence: "7",
+      graph: { revision: 1, nodes: [{ templateId: "analyst", status: "completed", readiness: "terminal" }] } })!]
     const state = {
       ownerId: "user-1", sessionId: "session-1", throughSequence: "7", goal: "Search Dublin roles", userConstraints: ["Dublin only"],
       approvals: [{ id: "approval-1", status: "pending" }],
@@ -76,6 +79,7 @@ describe("loadCanonicalTurnState", () => {
       artifacts: [{ id: "artifact-1", type: "resume", hash: "sha256:artifact" }],
       openTasks: [{ taskId: "task-1", status: "running", blocker: null }], doNotRepeat: ["repeat rejection"],
       facts: [{ factId: "fact-1", key: "target_role", source: "persona_fact:fact-1" }],
+      selectedJobMemories,
     }
     const summary = "Only a short narrative summary"
     const measurement = { beforeInputTokens: 100, afterInputTokens: 40, reductionTokens: 60, reductionRatio: 0.6 }
@@ -94,6 +98,7 @@ describe("loadCanonicalTurnState", () => {
     })
 
     const restored = await loadCanonicalTurnState(fake, lease)
+    expect(restored.selectedJobMemories).toEqual(selectedJobMemories)
     expect(restored.snapshot.toolObservations).toEqual([expect.objectContaining({
       id: "snapshot-working-state:session-1:7",
       content: expect.objectContaining({
@@ -105,6 +110,7 @@ describe("loadCanonicalTurnState", () => {
       }),
     })])
     expect(restored.snapshot.toolObservations[0]?.id).not.toContain("narrative")
+    expect(JSON.stringify(restored.snapshot.toolObservations)).not.toContain("selected_job_memory")
     const claimStore: InputClaimStore = {
       scope: { userId: "user-1" },
       async withTransaction<T>(work: (transaction: InputClaimTransaction) => Promise<T>): Promise<T> {
