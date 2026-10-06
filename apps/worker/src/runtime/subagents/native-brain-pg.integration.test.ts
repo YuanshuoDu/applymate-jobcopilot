@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 import { Pool } from "pg"
 import { Redis } from "ioredis"
+import { Queue } from "bullmq"
 import { ModelAdapterRegistry, type HarnessModelRequest, type ModelAdapter, type ModelStreamEvent } from "@jobcopilot/agent-model"
 import type { WorkerUsageAuthorizationInput } from "../../queue/ai-usage-bridge.js"
 import {
@@ -12,6 +13,7 @@ import {
 } from "./native-verification-contract.js"
 import { parseNativeVerificationPacket } from "./native-verification-packet.js"
 import type { TaskGraphExecutionScope } from "./task-graph-command-port.js"
+import type { SubagentJobPayload } from "./types.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 
@@ -630,6 +632,7 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
       sameTurnPrefix: boolean; resumePrefix: boolean; targetMatch: boolean; failedCriterion: boolean; exactFeedbackRoles: string[]
     }>> = []
     const canonicalJudgeDiagnostics: JudgeDiagnostic[] = []
+    let queuePauseGate: Queue<SubagentJobPayload, unknown, string> | undefined
     let acceptedCandidateReady!: () => void
     let releaseAcceptedCandidate!: () => void
     const acceptedCandidateEntered = new Promise<void>(resolve => { acceptedCandidateReady = resolve })
@@ -837,7 +840,12 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
           throw new Error(`canonical root did not replan to the accepted candidate; modelStreams=${rootModelStreams}; requestTrace=${JSON.stringify(rootRequestDiagnostics)}; judgeTrace=${JSON.stringify(canonicalJudgeDiagnostics)}; persistedState=${JSON.stringify(state)}`)
         })
       })])
-      await bootstrap.subagents.queue.worker.pause(true)
+      const { SUBAGENT_QUEUE_NAME } = await import("../../queue/subagent-queue.js")
+      queuePauseGate = new Queue<SubagentJobPayload, unknown, string>(SUBAGENT_QUEUE_NAME, {
+        connection: redis!, skipVersionCheck: true,
+      })
+      await queuePauseGate.pause()
+      expect(await queuePauseGate.isPaused()).toBe(true)
       releaseAcceptedCandidate()
 
       const pendingRootControl = await waitForDatabase("durable accepted root-goal wait", async () => {
@@ -861,6 +869,13 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
       const rootStreamsAtCandidate = rootModelStreams
       await bootstrap.close()
       bootstrap = await makeStack(2)
+      if (!bootstrap.subagents) throw new Error("recreated bootstrap omitted its actual child queue")
+      const recreatedQueue = bootstrap.subagents.queue.queue as unknown as Queue<SubagentJobPayload, unknown, string>
+      expect(await recreatedQueue.isPaused()).toBe(true)
+      await recreatedQueue.resume()
+      expect(await recreatedQueue.isPaused()).toBe(false)
+      await queuePauseGate.close()
+      queuePauseGate = undefined
       await waitForDatabase("canonical terminal Turn", async () => (await pool!.query<{ status: string; finalResponse: string | null }>(
         `SELECT "status", "finalResponse" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`,
         [canonical.turnId, canonical.sessionId])).rows[0], value => value?.status === "completed" && typeof value.finalResponse === "string")
@@ -934,6 +949,11 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
       expect(publicText).not.toContain(NATIVE_VERIFICATION_PACKET_CONTEXT_KEY)
       expect(publicText).not.toContain(NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA)
     } finally {
+      releaseAcceptedCandidate()
+      if (queuePauseGate) {
+        await queuePauseGate.resume().catch(() => undefined)
+        await queuePauseGate.close().catch(() => undefined)
+      }
       await bootstrap?.close().catch(() => undefined)
       await closePool().catch(() => undefined)
       if (previousDatabaseUrl === undefined) delete process.env.DATABASE_URL
