@@ -41,6 +41,13 @@ export interface MessageCommand extends CommandIdentity {
   selectedJobPreparation?: SelectedJobPreparationScope
 }
 
+/** User-only action that atomically interrupts one objective and starts its successor. */
+export interface ReplaceObjectiveCommand extends CommandIdentity {
+  content: InputContentPart[]
+  expectedTurnId: string
+  expectedRevision: number
+}
+
 export interface SteerCommand extends CommandIdentity {
   content: InputContentPart[]
   expectedTurnId: string | null

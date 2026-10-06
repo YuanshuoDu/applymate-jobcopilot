@@ -1,3 +1,4 @@
+import { Prisma } from "@prisma/client"
 import type { PrismaClient } from "@prisma/client"
 import {
   AgentSessionControlCommandSchema, schemaVersion, SessionControlEventPayloadSchema,
@@ -17,6 +18,21 @@ export type AgentSessionControlResult = Readonly<{
   sessionId: string; turnId: string; action: AgentSessionControlAction; status: "pausing" | "resuming"
   disposition: "requested" | "duplicate"; sequence: string
 }>
+
+/** Locks an owned Session and returns its lifecycle state for atomic objective replacement. */
+export async function lockOwnedSessionForObjectiveReplacement(
+  tx: CommandTransaction,
+  sessionId: string,
+  userId: string,
+): Promise<string> {
+  const rows = await tx.$queryRaw<Array<{ id: string; status: string }>>(Prisma.sql`
+    SELECT "id", "status" FROM "agent_sessions"
+    WHERE "id" = ${sessionId} AND "userId" = ${userId}
+    FOR UPDATE
+  `)
+  if (!rows[0]) throw sessionNotFound(sessionId)
+  return rows[0].status
+}
 
 type ExistingControlEvent = { readonly type: string; readonly sequence: bigint | number | string; readonly payload: unknown }
 

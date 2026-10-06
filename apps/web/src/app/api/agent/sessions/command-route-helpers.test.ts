@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest"
 
-import { MAX_COMMAND_BODY_BYTES, parseForkBody, parseInterruptBody, parseMessageBody, parseRetryBody } from "./command-route-helpers"
+import { schemaVersion } from "@jobcopilot/agent-protocol"
+
+import { MAX_COMMAND_BODY_BYTES, parseForkBody, parseInterruptBody, parseMessageBody, parseReplaceObjectiveBody, parseRetryBody } from "./command-route-helpers"
 
 function request(body: unknown, headers: HeadersInit = {}) {
   return new Request("http://localhost/api/agent/sessions/session_1/messages", {
@@ -83,6 +85,55 @@ describe("agent command route boundaries", () => {
     expect(forbidden).toBeInstanceOf(Response)
     await expect((forbidden as Response).json()).resolves.toMatchObject({ error: { code: "invalid_command" } })
     expect(parseRetryBody({ clientMessageId: "retry_4", schemaVersion: "agent-harness.v0" }, request({}))).toBeInstanceOf(Response)
+  })
+
+  it("requires a strict objective replacement identity, current Turn revision, and human text", async () => {
+    const body = {
+      schemaVersion,
+      clientMessageId: "replace_1",
+      expectedTurnId: "turn_1",
+      expectedRevision: 4,
+      content: [{ type: "text", text: "Replace the Berlin search with senior backend roles in Dublin." }],
+    }
+    expect(parseReplaceObjectiveBody(body, request(body))).toEqual({
+      clientMessageId: "replace_1",
+      expectedTurnId: "turn_1",
+      expectedRevision: 4,
+      content: body.content,
+    })
+    expect(parseReplaceObjectiveBody(body, request(body, { "idempotency-key": "replace_1" }))).toMatchObject({ clientMessageId: "replace_1" })
+
+    const invalidBodies = [
+      { ...body, schemaVersion: "agent-harness.v0" },
+      { ...body, clientMessageId: undefined },
+      { ...body, expectedTurnId: null },
+      { ...body, expectedRevision: -1 },
+      { ...body, expectedRevision: Number.MAX_SAFE_INTEGER + 1 },
+      { ...body, content: [{ type: "attachment_ref", attachmentId: "resume_1", mediaType: "application/pdf" }] },
+      { ...body, content: [{ type: "text", text: "  " }] },
+      { ...body, source: "automation" },
+      { ...body, criteria: ["client authority"] },
+      { ...body, policy: { allowSubmit: true } },
+      { ...body, selectedJobPreparation: { jobId: "job_1" } },
+    ]
+    for (const invalidBody of invalidBodies) {
+      const parsed = parseReplaceObjectiveBody(invalidBody, request(invalidBody))
+      expect(parsed).toBeInstanceOf(Response)
+      await expect((parsed as Response).json()).resolves.toMatchObject({ error: { code: "invalid_command" } })
+    }
+    expect(parseReplaceObjectiveBody(body, request(body, { "idempotency-key": "different" }))).toBeInstanceOf(Response)
+  })
+
+  it("enforces existing content bounds for objective replacement", async () => {
+    const parsed = parseReplaceObjectiveBody({
+      schemaVersion,
+      clientMessageId: "replace_large",
+      expectedTurnId: "turn_1",
+      expectedRevision: 0,
+      content: [{ type: "text", text: "x".repeat(20_001) }],
+    }, request({}))
+    expect(parsed).toBeInstanceOf(Response)
+    await expect((parsed as Response).json()).resolves.toMatchObject({ error: { code: "invalid_command" } })
   })
 
 })

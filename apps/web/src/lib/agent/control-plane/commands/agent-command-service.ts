@@ -1,5 +1,7 @@
+import { randomUUID } from "node:crypto"
+
 import type { PrismaClient } from "@prisma/client"
-import { AgentCommandError, activeTurnChanged, automationCannotSteerUserTurn, isUniqueViolation, retryActiveConflict, retryTargetChanged, retryTargetInvalid, turnWaitRequiresDedicatedAction } from "./errors"
+import { AgentCommandError, activeTurnChanged, automationCannotSteerUserTurn, invalidCommand, isUniqueViolation, objectiveReplacementStateConflict, retryActiveConflict, retryTargetChanged, retryTargetInvalid, turnWaitRequiresDedicatedAction } from "./errors"
 import { assertContent, dispositionFromEvent } from "./command-content"
 import { cancelExecutionInTransaction, interruptActiveTurn, type CancelExecutionCommand } from "./execution-cancellation"
 import { isRetryableTurnStatus, parsePersistedRetryContent } from "./retry-input"
@@ -13,6 +15,7 @@ import {
   fallbackDisposition,
   type CommandTransaction,
 } from "./transaction"
+import { lockOwnedSessionForObjectiveReplacement } from "./session-control"
 import type {
   CommandDisposition,
   CommandResult,
@@ -20,6 +23,7 @@ import type {
   InterruptResult,
   MessageCommand,
   RetryCommand,
+  ReplaceObjectiveCommand,
   StartCommand,
   SteerCommand,
 } from "./types"
@@ -83,6 +87,19 @@ export class AgentCommandService {
   async message(command: MessageCommand): Promise<CommandResult> {
     assertContent(command.content)
     return this.retryUnique(() => this.messageOnce(command))
+  }
+
+  async replaceObjective(command: ReplaceObjectiveCommand): Promise<CommandResult> {
+    if (command.source !== "user") throw invalidCommand("Only a user can replace a Turn objective")
+    if (typeof command.expectedTurnId !== "string" || !command.expectedTurnId.trim() || command.expectedTurnId.length > 256
+      || !Number.isSafeInteger(command.expectedRevision) || command.expectedRevision < 0) {
+      throw invalidCommand("Objective replacement requires the current Turn ID and revision")
+    }
+    assertContent(command.content)
+    if (!command.content.some((part) => part.type === "text" && part.text.trim().length > 0)) {
+      throw invalidCommand("Objective replacement requires nonblank human text")
+    }
+    return this.retryUnique(() => this.replaceObjectiveOnce(command))
   }
 
   async steer(command: SteerCommand): Promise<CommandResult> {
@@ -169,6 +186,35 @@ export class AgentCommandService {
       await assertExpectedTurn(command.expectedTurnId, command.expectedRevision, active)
       if (!active) throw activeTurnChanged(command.expectedTurnId, null)
       return interruptActiveTurn(tx, command, active)
+    })
+  }
+
+  private replaceObjectiveOnce(command: ReplaceObjectiveCommand): Promise<CommandResult> {
+    return this.db.$transaction(async (tx) => {
+      const sessionStatus = await lockOwnedSessionForObjectiveReplacement(tx, command.sessionId, command.userId)
+      const existing = await findExistingCommand(tx, command.sessionId, command.clientMessageId)
+      if (existing) return duplicateCommandResult(tx, command, existing, "follow_up")
+      if (sessionStatus !== "running") throw objectiveReplacementStateConflict(sessionStatus)
+
+      const active = await findActiveTurn(tx, command.sessionId, command.userId)
+      await assertExpectedTurn(command.expectedTurnId, command.expectedRevision, active)
+      if (!active) throw activeTurnChanged(command.expectedTurnId, null)
+
+      const interruptCommand: InterruptCommand = {
+        sessionId: command.sessionId,
+        userId: command.userId,
+        clientMessageId: randomUUID(),
+        source: "user",
+        expectedTurnId: active.id,
+        expectedRevision: active.revision,
+      }
+      await interruptActiveTurn(tx, interruptCommand, active)
+
+      const successor = await createRootTurn(tx, command, command.content)
+      const accepted = await acceptInputFacts(
+        tx, command, command.content, successor, "follow_up", "started", true,
+      )
+      return { ...accepted, disposition: "started" }
     })
   }
 

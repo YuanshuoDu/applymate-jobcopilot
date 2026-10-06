@@ -14,6 +14,7 @@ export type {
   ForkCommand,
   ForkResult,
   MessageCommand,
+  ReplaceObjectiveCommand,
   RetryCommand,
   StartCommand,
   SteerCommand,

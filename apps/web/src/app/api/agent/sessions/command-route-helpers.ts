@@ -35,6 +35,13 @@ export type ParsedRetryCommand = {
   expectedRevision: number | null
 }
 
+export type ParsedReplaceObjectiveCommand = {
+  clientMessageId: string
+  expectedTurnId: string
+  expectedRevision: number
+  content: InputContentPart[]
+}
+
 type RecordBody = Record<string, unknown>
 
 function isRecord(value: unknown): value is RecordBody {
@@ -183,6 +190,26 @@ export function parseRetryBody(body: unknown, request: Request): ParsedRetryComm
   const expectedRevision = optionalRevision(body.expectedRevision)
   if (!clientMessageId || expectedRevision === undefined) return invalid("Invalid retry command payload")
   return { clientMessageId, expectedRevision }
+}
+
+export function parseReplaceObjectiveBody(body: unknown, request: Request): ParsedReplaceObjectiveCommand | NextResponse {
+  if (!isRecord(body) || !isAllowedKeys(body, ["schemaVersion", "clientMessageId", "expectedTurnId", "expectedRevision", "content"])) {
+    return invalid("Unsupported or forbidden objective replacement field")
+  }
+  const clientMessageId = stringValue(body.clientMessageId)
+  const headerId = stringValue(request.headers.get("idempotency-key"))
+  const expectedTurnId = stringValue(body.expectedTurnId)
+  const expectedRevision = optionalRevision(body.expectedRevision)
+  const content = parseContent(body.content)
+  if (
+    body.schemaVersion !== schemaVersion || !clientMessageId ||
+    (request.headers.has("idempotency-key") && headerId !== clientMessageId) ||
+    !expectedTurnId || expectedRevision === undefined || expectedRevision === null ||
+    !content || !content.some((part) => part.type === "text")
+  ) {
+    return invalid("Invalid objective replacement command payload")
+  }
+  return { clientMessageId, expectedTurnId, expectedRevision, content }
 }
 
 export async function verifyAttachmentOwnership(
