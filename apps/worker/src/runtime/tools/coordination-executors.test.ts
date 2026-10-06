@@ -30,6 +30,7 @@ import type {
 import { ToolSchemaValidator } from "./schema-validator.js"
 import type { ToolExecutionContext } from "./types.js"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
+import { NATIVE_VERIFICATION_REPORT_SCHEMA } from "../subagents/native-verification-contract.js"
 import { SessionPauseRequestedError } from "../session-gate.js"
 import type { TaskGraphCommandPort, TaskGraphNativeCommandInput, TaskGraphNativeCommandReceipt } from "../subagents/task-graph-command-port.js"
 
@@ -41,6 +42,17 @@ const baseTask: CoordinationTaskView = {
 
 function makeTask(overrides: Partial<CoordinationTaskView> = {}): CoordinationTaskView {
   return { ...baseTask, ...overrides }
+}
+
+function nativeVerificationReport() {
+  return {
+    schemaVersion: NATIVE_VERIFICATION_REPORT_SCHEMA,
+    controlOperationId: "verify-operation-1", controlTaskId: "control-task-1", controlAttempt: 1,
+    owner: { userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "root-1", parentTaskId: "root-1" },
+    target: { kind: "root_goal", candidateDigest: "a".repeat(64), childBindingSetDigest: "b".repeat(64) },
+    goalDigest: "c".repeat(64), criteriaDigest: "d".repeat(64), evidencePacketDigest: "e".repeat(64), disposition: "passed",
+    criteria: [{ criterionId: "criterion-1", disposition: "passed", reasonCode: "meets_criterion", evidenceReferenceIds: ["target-ref"] }],
+  }
 }
 
 class MemoryCoordinationStore implements CoordinationStore {
@@ -369,6 +381,31 @@ describe("coordination executors", () => {
     expect(JSON.stringify(followupContext)).not.toContain("toolPolicy")
   })
 
+  it("uses projected verifier feedback in follow-up context", async () => {
+    const runtime = makeRuntime()
+    const source = makeTask({
+      id: "control-task-1", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/control-task-1", depth: 1,
+      role: "auditor", taskType: "native_verification", status: "completed", result: { nativeVerificationReport: nativeVerificationReport() },
+    })
+    runtime.store.tasks.set(source.id, source)
+
+    await executeFollowup(context({ taskId: "root-1", rootTaskId: "root-1" }), {
+      idempotencyKey: "followup-from-control", taskId: source.id, goal: "Continue from the feedback",
+    }, runtime.options)
+
+    const spawn = runtime.manager.spawn as unknown as ReturnType<typeof vi.fn>
+    const followupContext = spawn.mock.calls[0]?.[0].context as Record<string, unknown>
+    const provenance = followupContext.provenance as Record<string, unknown>
+    expect(provenance.priorResult).toEqual({
+      nativeVerificationFeedback: {
+        disposition: "passed",
+        criteria: [{ criterionId: "criterion-1", disposition: "passed", reasonCode: "meets_criterion", evidenceReferenceIds: ["target-ref"] }],
+      },
+    })
+    expect(JSON.stringify(followupContext)).not.toContain("nativeVerificationReport")
+    expect(JSON.stringify(followupContext)).not.toContain("controlOperationId")
+  })
+
   it("keeps a follow-up replay durable and rejects reuse across sources", async () => {
     const runtime = makeRuntime()
     const source = makeTask({ id: "source", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/source", depth: 1, role: "scout", taskType: "research", status: "failed", attemptCount: 3 })
@@ -540,6 +577,30 @@ describe("coordination executors", () => {
     expect(result.tasks[0]).not.toHaveProperty("userId")
     expect(Buffer.byteLength(result.tasks[1]!.failureReason ?? "", "utf8")).toBeLessThanOrEqual(500)
     expect(runtime.store.activities).toContain("wait_subagents")
+  })
+
+  it("projects the same verifier feedback for agent.list and immediate agent.wait", async () => {
+    const runtime = makeRuntime()
+    const control = makeTask({
+      id: "control-task-1", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/control-task-1", depth: 1,
+      role: "auditor", taskType: "native_verification", status: "completed", result: { nativeVerificationReport: nativeVerificationReport() },
+    })
+    runtime.store.tasks.set(control.id, control)
+    const expected = {
+      nativeVerificationFeedback: {
+        disposition: "passed",
+        criteria: [{ criterionId: "criterion-1", disposition: "passed", reasonCode: "meets_criterion", evidenceReferenceIds: ["target-ref"] }],
+      },
+    }
+
+    const listed = await executeListSubagents(context({ taskId: "root-1", rootTaskId: "root-1" }), { includeTerminal: true }, runtime.options)
+    expect(listed.tasks.find(task => task.taskId === control.id)).toMatchObject({ status: "completed", result: expected })
+    const waited = await executeWaitSubagents(context({ taskId: "root-1", rootTaskId: "root-1" }), {
+      idempotencyKey: "wait-native-control", taskIds: [control.id], mode: "all", timeoutMs: 5000,
+    }, runtime.options)
+    expect(waited.tasks[0]).toMatchObject({ status: "completed", result: expected })
+    expect(JSON.stringify({ listed, waited })).not.toContain("controlOperationId")
+    expect(JSON.stringify({ listed, waited })).not.toContain("candidateDigest")
   })
 
   it("returns a bounded Scout/Analyst aggregate and preserves legacy results", async () => {
