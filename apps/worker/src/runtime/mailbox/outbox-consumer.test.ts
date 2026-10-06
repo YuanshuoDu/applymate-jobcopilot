@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest"
 import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 
 import { drainSubagentMailboxOutbox, startSubagentMailboxOutboxConsumer } from "./outbox-consumer.js"
-import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "../subagents/task-graph-snapshot.js"
+import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId, taskGraphProposalKey } from "../subagents/task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "../subagents/task-graph-pg-verification.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
@@ -115,6 +115,7 @@ class FakeClient {
   dispatch: DispatchRow | null
   readonly graphLifecycleEvents: unknown[] = []
   graphEventOutboxCount = 0
+  private graphRevision = 1
   private rollbackState: { outbox: OutboxRow[]; mailbox: MailboxRow[]; task: TaskRow; dispatch: DispatchRow | null } | null = null
 
   constructor(private readonly options: FakeOptions = {}, outboxRows: readonly OutboxRow[] = [makeOutbox()]) {
@@ -193,7 +194,7 @@ class FakeClient {
     }
     if (this.options.taskGraphNodes && sql.startsWith('SELECT item."id"')) {
       return { rows: [{
-        id: taskGraphItemId("root-1"), revision: 1,
+        id: taskGraphItemId("root-1"), revision: this.graphRevision,
         content: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: this.options.taskGraphNodes },
         createdAt: new Date("2026-09-14T09:59:00.000Z"),
       } as T], rowCount: 1 }
@@ -205,12 +206,11 @@ class FakeClient {
       })
       return { rows: rows as T[], rowCount: rows.length }
     }
-    if (this.options.taskGraphNodes && sql.startsWith('SELECT event."type", event."payload"')) return { rows: [], rowCount: 0 }
-    if (this.options.taskGraphNodes && sql.startsWith('SELECT event."payload"')) {
+    if (this.options.taskGraphNodes && sql.includes("event.\"payload\"->>'kind' IN ('proposal', 'native_command')")) {
       const nodes = this.options.taskGraphNodes
       const created = nodes.map(node => ({ key: node.key, taskId: node.taskId, status: node.dependsOn.length ? "waiting" : "queued" }))
-      return { rows: [{ payload: {
-        kind: "proposal", fingerprint: "fixture-proposal", revision: 1,
+      const payload = {
+        kind: "proposal", fingerprint: "f".repeat(64), revision: 1,
         receipt: { status: "accepted", revision: 1, nodes: created, readyTaskIds: created.filter(node => node.status === "queued").map(node => node.taskId) },
         item: {
           schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: taskGraphItemId("root-1"), sessionId: "session-1",
@@ -219,13 +219,43 @@ class FakeClient {
           startedAt: "2026-09-14T09:59:00.000Z", completedAt: null,
           createdAt: "2026-09-14T09:59:00.000Z", updatedAt: "2026-09-14T09:59:00.000Z",
         },
-      } } as T], rowCount: 1 }
+        content: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes },
+      }
+      return { rows: [{
+        type: "item.started", itemId: taskGraphItemId("root-1"), taskId: "root-1",
+        idempotencyKey: taskGraphProposalKey("root-1", 0), payload,
+      } as T], rowCount: 1 }
     }
-    if (sql.startsWith('UPDATE "agent_items" AS item')) return { rows: [{
-      stepId: null, status: "streaming", phase: null,
-      startedAt: new Date("2026-09-14T09:59:00.000Z"), completedAt: null,
-      createdAt: new Date("2026-09-14T09:59:00.000Z"),
-    } as T], rowCount: 1 }
+    if (this.options.taskGraphNodes && sql.startsWith('SELECT event."type", event."itemId"')) {
+      const nodes = this.options.taskGraphNodes
+      const created = nodes.map(node => ({ key: node.key, taskId: node.taskId, status: node.dependsOn.length ? "waiting" : "queued" }))
+      const payload = {
+        kind: "proposal", fingerprint: "f".repeat(64), revision: 1,
+        receipt: { status: "accepted", revision: 1, nodes: created, readyTaskIds: created.filter(node => node.status === "queued").map(node => node.taskId) },
+        item: {
+          schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: taskGraphItemId("root-1"), sessionId: "session-1",
+          turnId: "turn-1", stepId: null, taskId: "root-1", type: "task_graph", status: "streaming", phase: null,
+          revision: 1, content: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes },
+          startedAt: "2026-09-14T09:59:00.000Z", completedAt: null,
+          createdAt: "2026-09-14T09:59:00.000Z", updatedAt: "2026-09-14T09:59:00.000Z",
+        },
+        content: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes },
+      }
+      const proposal = { type: "item.started", itemId: taskGraphItemId("root-1"), taskId: "root-1", idempotencyKey: taskGraphProposalKey("root-1", 0), payload }
+      const lifecycle = this.graphLifecycleEvents.map(value => {
+        const event = (value as { event?: { idempotencyKey?: string } }).event
+        return { type: "item.delta", itemId: taskGraphItemId("root-1"), taskId: "root-1", idempotencyKey: event?.idempotencyKey, payload: value }
+      })
+      return { rows: [proposal, ...lifecycle] as T[], rowCount: 1 + lifecycle.length }
+    }
+    if (sql.startsWith('UPDATE "agent_items" AS item')) {
+      this.graphRevision = Number(values[5])
+      return { rows: [{
+        stepId: null, status: "streaming", phase: null,
+        startedAt: new Date("2026-09-14T09:59:00.000Z"), completedAt: null,
+        createdAt: new Date("2026-09-14T09:59:00.000Z"),
+      } as T], rowCount: 1 }
+    }
     if (sql.startsWith('UPDATE "agent_sessions" AS session')) return { rows: [{ eventSequence: "11" } as T], rowCount: 1 }
     if (sql.startsWith('INSERT INTO "agent_events"')) {
       this.graphLifecycleEvents.push(JSON.parse(String(values[10])))

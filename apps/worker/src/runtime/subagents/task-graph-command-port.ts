@@ -3,6 +3,18 @@ import type { TaskGraphProposal, TaskGraphReadiness, TaskGraphRepairOf } from ".
 import type { TaskGraphVerificationReasonCode } from "../planning/task-graph-verification.js"
 import type { SubagentTaskStatus } from "./types.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-pg-verification.js"
+import type { TaskGraphNativeCommandInput, TaskGraphNativeCommandReceipt, TaskGraphNativeNodeView, TaskGraphNativeResultReceipt } from "./task-graph-native-command.js"
+export type {
+  TaskGraphNativeChildReceipt,
+  TaskGraphNativeCommandInput,
+  TaskGraphNativeCommandReceipt,
+  TaskGraphNativeFollowupRequest,
+  TaskGraphNativeNodeView,
+  TaskGraphNativeRequest,
+  TaskGraphNativeResultReceipt,
+  TaskGraphNativeSourceProvenance,
+  TaskGraphNativeSpawnRequest,
+} from "./task-graph-native-command.js"
 
 export const TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION = "agent-harness.v2.task-graph-repair-receipt.v1" as const
 const VERIFICATION_REASONS = new Set<TaskGraphVerificationReasonCode>([
@@ -199,7 +211,6 @@ export type TaskGraphResultProjection =
     reviewStatus: "passed" | "needs_revision" | "rejected" | "stale"
     reviewHash: string
   }>
-
 export type TaskGraphCurrentNode = Readonly<{
   key: string
   templateId: string
@@ -215,23 +226,24 @@ export type TaskGraphCurrentNode = Readonly<{
   verificationReport?: TaskGraphVerificationReport
   repairOf?: TaskGraphRepairOf
   repairReceipt?: TaskGraphRepairReceipt
+  native?: TaskGraphNativeNodeView
+  nativeResult?: TaskGraphNativeResultReceipt
   failureReason: string | null
 }>
-
 export type TaskGraphCurrentState = Readonly<{
   revision: number
   nodes: readonly TaskGraphCurrentNode[]
 }>
-
 export class TaskGraphCommandError extends Error {
   constructor(readonly code: string, message: string, readonly currentRevision?: number) {
     super(message)
     this.name = "TaskGraphCommandError"
   }
 }
-
 export type TaskGraphCommandPort = Readonly<{
   appendAndSchedule(input: TaskGraphScheduleInput): Promise<TaskGraphScheduleReceipt>
+  /** Native root coordination is optional for legacy ports; production callers must fail closed if absent. */
+  appendNativeCoordination?(input: TaskGraphNativeCommandInput): Promise<TaskGraphNativeCommandReceipt>
   readCurrent(scope: TaskGraphReadScope): Promise<TaskGraphCurrentState>
   /** Reads current graph state using a caller-owned transaction and client. */
   readCurrentWithClient?(client: PoolClient, scope: TaskGraphReadScope): Promise<TaskGraphCurrentState>

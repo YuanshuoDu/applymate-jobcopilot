@@ -1,12 +1,13 @@
 import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
+import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { deriveTaskGraphReadModel } from "../planning/task-graph.js"
 
 import { PgSubagentTaskStore } from "./pg-store.js"
 import { normalizeSubagentPolicy, PAUSE_DEFERRED_MARKER, SubagentLimitError, type SubagentPolicy } from "./types.js"
 import { SessionPauseRequestedError } from "../session-gate.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
-import { TASK_GRAPH_SNAPSHOT_VERSION, parseTaskGraphSnapshot, taskGraphItemId } from "./task-graph-snapshot.js"
+import { TASK_GRAPH_SNAPSHOT_VERSION, parseTaskGraphSnapshot, taskGraphItemId, taskGraphProposalKey } from "./task-graph-snapshot.js"
 import { resolveTaskGraphRepairDependencies } from "./task-graph-dependency-context.js"
 import { loadTaskGraph } from "./task-graph-pg-state.js"
 import type { GraphTaskRow } from "./task-graph-pg-state.js"
@@ -22,6 +23,36 @@ vi.mock("./task-graph-pg-verification.js", () => ({
 
 const now = new Date("2026-09-03T00:00:00.000Z")
 const policy: SubagentPolicy = normalizeSubagentPolicy({ maxConcurrency: 2, maxAttempts: 2 })
+
+function taskGraphProposalEventRow(snapshot: unknown, revision: number) {
+  const graph = snapshot as { nodes: readonly { key: string; taskId: string; dependsOn: readonly string[] }[] }
+  const itemId = taskGraphItemId("root-1")
+  const payload = {
+    kind: "proposal", fingerprint: "f".repeat(64), revision,
+    receipt: {
+      status: "accepted", revision,
+      nodes: graph.nodes.map(node => ({ key: node.key, taskId: node.taskId, status: node.dependsOn.length ? "waiting" : "queued" })),
+      readyTaskIds: graph.nodes.filter(node => node.dependsOn.length === 0).map(node => node.taskId),
+    },
+    item: {
+      schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: itemId, sessionId: "session-1", turnId: "turn-1",
+      stepId: null, taskId: "root-1", type: "task_graph", status: "streaming", phase: null, revision, content: snapshot,
+    },
+    content: snapshot,
+  }
+  return {
+    type: revision === 1 ? "item.started" : "item.delta", itemId, taskId: "root-1",
+    idempotencyKey: taskGraphProposalKey("root-1", revision - 1), payload,
+  }
+}
+
+function taskGraphLifecycleEventRow(payload: unknown) {
+  const envelope = payload as { event?: { idempotencyKey?: string } }
+  return {
+    type: "item.delta", itemId: taskGraphItemId("root-1"), taskId: "root-1",
+    idempotencyKey: envelope.event?.idempotencyKey, payload,
+  }
+}
 
 function taskRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -134,6 +165,7 @@ function fakeInterruptedTurnPool(options: { missingGraphItem?: boolean } = {}) {
     { key: "child", templateId: "analyst", goal: "Inspect", successCriteria: ["done"], dependsOn: [], depth: 1, taskId: "child-1" },
     { key: "dependent", templateId: "analyst", goal: "Continue", successCriteria: ["done"], dependsOn: ["child"], depth: 2, taskId: "dependent-1" },
   ] }
+  const proposalRow = taskGraphProposalEventRow(snapshot, 1)
   let revision = 2
   let sequence = 0
   const fake = fakePool((sql, params) => {
@@ -142,16 +174,14 @@ function fakeInterruptedTurnPool(options: { missingGraphItem?: boolean } = {}) {
     if (sql.includes('SELECT task."interruptRequestedAt"')) return { rows: [{ interruptRequestedAt: now, turnStatus: "interrupted" }], rowCount: 1 }
     if (sql.startsWith("UPDATE \"sub_agent_tasks\"") && sql.includes('SET "leaseExpiresAt" = LEAST')) return { rowCount: 0 }
     if (sql.includes('SELECT task."turnId"')) return { rows: [{ turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", attemptCount: taskId === "child-1" ? 1 : 0, userId: "user-1" }], rowCount: 1 }
-    if (sql.includes("event.\"payload\"->>'kind' = 'proposal'")) return { rows: [{ payload: { kind: "proposal", receipt: {
-      revision: 1,
-      nodes: snapshot.nodes.map(node => ({ key: node.key, taskId: node.taskId, status: node.dependsOn.length ? "waiting" : "queued" })),
-      readyTaskIds: snapshot.nodes.filter(node => node.dependsOn.length === 0).map(node => node.taskId),
-    } } }], rowCount: 1 }
+    if (sql.includes("event.\"payload\"->>'kind' IN ('proposal', 'native_command')")) return { rows: [proposalRow], rowCount: 1 }
     if (sql.includes('SELECT item."id"')) return options.missingGraphItem
       ? { rows: [], rowCount: 0 }
       : { rows: [{ id: taskGraphItemId("root-1"), revision, content: snapshot, createdAt: now }], rowCount: 1 }
     if (sql.includes('SELECT task."id", task."status"')) return { rows: (params?.[0] as string[]).map(id => ({ id, status: statuses.get(id), role: "analyst", failureReason: null, result: null })), rowCount: 2 }
-    if (sql.includes('SELECT event."payload"')) return { rows: lifecycleEvents.map(payload => ({ payload })), rowCount: lifecycleEvents.length }
+    if (sql.startsWith('SELECT event."type", event."itemId"')) return {
+      rows: [proposalRow, ...lifecycleEvents.map(taskGraphLifecycleEventRow)], rowCount: lifecycleEvents.length + 1,
+    }
     if (sql.startsWith("SELECT task.*, session.")) return { rows: [taskRow({ id: taskId, status: statuses.get(taskId), userId: "user-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", leaseOwner: "worker-1", attemptCount: 1, leaseExpiresAt: new Date(now.getTime() + 60_000), interruptRequestedAt: now })], rowCount: 1 }
     if (sql.startsWith('UPDATE "sub_agent_tasks"') && sql.includes('SET "status" = $3')) { statuses.set(taskId, String(params?.[2])); return { rowCount: 1 } }
     if (sql.startsWith('UPDATE "sub_agent_tasks"') && sql.includes("SET \"status\" = 'cancelled'")) { statuses.set(taskId, "cancelled"); return { rowCount: 1 } }
@@ -221,11 +251,7 @@ function fakeGraphFinishPool(options: {
   const order: string[] = []
   let revision = 1
   let sequence = 0
-  const proposal = { kind: "proposal", receipt: {
-    revision: 1,
-    nodes: snapshot.nodes.map(node => ({ key: node.key, taskId: node.taskId, status: node.dependsOn.length ? "waiting" : "queued" })),
-    readyTaskIds: snapshot.nodes.filter(node => node.dependsOn.length === 0).map(node => node.taskId),
-  } }
+  const proposalRow = taskGraphProposalEventRow(snapshot, 1)
   const fake = fakePool((sql, params) => {
     const taskId = String(params?.[0] ?? childId)
     if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1 }
@@ -235,7 +261,7 @@ function fakeGraphFinishPool(options: {
       leaseExpiresAt: new Date(now.getTime() + 60_000), interruptRequestedAt: null,
     })], rowCount: 1 }
     if (sql.includes('SELECT task."turnId"')) return { rows: [{ turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", attemptCount: taskId === childId ? 1 : 0, userId: "user-1" }], rowCount: 1 }
-    if (sql.includes("event.\"payload\"->>'kind' = 'proposal'")) return { rows: [{ payload: proposal }], rowCount: 1 }
+    if (sql.includes("event.\"payload\"->>'kind' IN ('proposal', 'native_command')")) return { rows: [proposalRow], rowCount: 1 }
     if (sql.includes('SELECT item."id"')) return { rows: [{ id: taskGraphItemId("root-1"), revision, content: snapshot, createdAt: now }], rowCount: 1 }
     if (sql.includes('task."expectedOutputSchema"') && sql.includes('task."context"')) return {
       rows: (params?.[0] as string[]).map(id => ({ id, status: statuses.get(id), role: "analyst", failureReason: failureReasons.get(id) ?? null,
@@ -243,11 +269,16 @@ function fakeGraphFinishPool(options: {
         sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", userId: "user-1" })),
       rowCount: (params?.[0] as string[]).length,
     }
-    if (sql.includes('SELECT task."id", task."status", task."role", task."failureReason"')) return {
-      rows: snapshot.nodes.map(node => ({ id: node.taskId, status: statuses.get(node.taskId), role: "analyst", failureReason: failureReasons.get(node.taskId) ?? null, result: taskResults.get(node.taskId) ?? null })),
+    if (sql.includes('SELECT task."id", task."status", task."role"')) return {
+      rows: snapshot.nodes.map(node => ({ id: node.taskId, status: statuses.get(node.taskId), role: "analyst", taskType: "research",
+        expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst" },
+        failureReason: failureReasons.get(node.taskId) ?? null, result: taskResults.get(node.taskId) ?? null })),
       rowCount: snapshot.nodes.length,
     }
-    if (sql.includes('SELECT event."type", event."payload"')) return { rows: lifecycleEvents, rowCount: lifecycleEvents.length }
+    if (sql.startsWith('SELECT event."type", event."itemId"')) return {
+      rows: [proposalRow, ...lifecycleEvents.map(value => taskGraphLifecycleEventRow(value.payload))],
+      rowCount: lifecycleEvents.length + 1,
+    }
     if (sql.startsWith('SELECT target."id"')) return options.repair ? { rows: [{
       id: "target-1", status: "failed", failureReason: failureReasons.get("target-1"), result: taskResults.get("target-1"), rootTaskId: "root-1", parentTaskId: "root-1",
     }], rowCount: 1 } : { rows: [], rowCount: 0 }
@@ -648,12 +679,13 @@ describe("PgSubagentTaskStore", () => {
     ["missing item", "task_graph_state_missing"],
     ["corrupt snapshot", "task_graph_snapshot_invalid"],
   ] as const)("rolls back a graph child claim before task or outbox writes when its graph %s is unavailable", async (failure, error) => {
-    const proposal = { kind: "proposal", receipt: {
-      revision: 1, nodes: [{ key: "child", taskId: "child-1", status: "queued" }], readyTaskIds: ["child-1"],
-    } }
+    const snapshot = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{
+      key: "child", templateId: "analyst", goal: "Inspect", successCriteria: ["done"], dependsOn: [], depth: 1, taskId: "child-1",
+    }] }
+    const proposalRow = taskGraphProposalEventRow(snapshot, 1)
     const fake = fakePool(sql => {
       if (sql.includes('SELECT task."turnId"')) return { rows: [{ turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", attemptCount: 0, userId: "user-1" }], rowCount: 1 }
-      if (sql.includes("event.\"payload\"->>'kind' = 'proposal'")) return { rows: [{ payload: proposal }], rowCount: 1 }
+      if (sql.includes("event.\"payload\"->>'kind' IN ('proposal', 'native_command')")) return { rows: [proposalRow], rowCount: 1 }
       if (sql.includes('SELECT item."id"')) return failure === "missing item"
         ? { rows: [], rowCount: 0 }
         : { rows: [{ id: taskGraphItemId("root-1"), revision: 1, content: { schemaVersion: "invalid", nodes: [] }, createdAt: now }], rowCount: 1 }
@@ -670,16 +702,17 @@ describe("PgSubagentTaskStore", () => {
   })
 
   it("keeps a same-root task on the legacy claim path when valid proposal receipts do not include its ID", async () => {
-    const proposal = { kind: "proposal", receipt: {
-      revision: 1, nodes: [{ key: "graph-child", taskId: "graph-child", status: "queued" }], readyTaskIds: ["graph-child"],
-    } }
+    const snapshot = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{
+      key: "graph-child", templateId: "analyst", goal: "Inspect", successCriteria: ["done"], dependsOn: [], depth: 1, taskId: "graph-child",
+    }] }
+    const proposalRow = taskGraphProposalEventRow(snapshot, 1)
     const claimed = taskRow({
       id: "legacy-child", userId: "user-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
       status: "running", leaseOwner: "worker-1", attemptCount: 1, leaseExpiresAt: new Date(now.getTime() + 60_000),
     })
     const fake = fakePool(sql => {
       if (sql.includes('SELECT task."turnId"')) return { rows: [{ turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", attemptCount: 0, userId: "user-1" }], rowCount: 1 }
-      if (sql.includes("event.\"payload\"->>'kind' = 'proposal'")) return { rows: [{ payload: proposal }], rowCount: 1 }
+      if (sql.includes("event.\"payload\"->>'kind' IN ('proposal', 'native_command')")) return { rows: [proposalRow], rowCount: 1 }
       if (sql.startsWith('UPDATE "sub_agent_tasks"')) return { rows: [], rowCount: 1 }
       if (sql.startsWith('SELECT task.*, session."userId" AS "userId"')) return { rows: [claimed], rowCount: 1 }
       return {}
@@ -1131,7 +1164,7 @@ describe("PgSubagentTaskStore", () => {
 
     expect(fake.statuses.get("child-1")).toBe("running")
     expect(fake.statuses.get("dependent-1")).toBe("waiting")
-    expect(fake.calls.some(([sql]) => sql.includes("event.\"payload\"->>'kind' = 'proposal'"))).toBe(true)
+    expect(fake.calls.some(([sql]) => sql.includes("event.\"payload\"->>'kind' IN ('proposal', 'native_command')"))).toBe(true)
     expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
     expect(fake.calls.some(([sql]) => sql.includes('INSERT INTO "agent_events"'))).toBe(false)
     expect(fake.calls.some(([sql]) => sql.includes('"agent_outbox"'))).toBe(false)

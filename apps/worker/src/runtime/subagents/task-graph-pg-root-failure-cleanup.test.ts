@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest"
+import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import type { Queryable } from "./pg-store-persistence.js"
 import { cleanupFailedRootTaskGraph, settleRecoveredTaskGraph, type RootFailureCleanupAuthority } from "./task-graph-pg-root-failure-cleanup.js"
-import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "./task-graph-snapshot.js"
+import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId, taskGraphProposalKey } from "./task-graph-snapshot.js"
 import type { SubagentTaskRecord } from "./types.js"
 
 const identity = { id: "root-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: null, taskType: "root" } as const
@@ -29,9 +30,13 @@ function fixture(options: {
   let sequence = 0
   const itemId = taskGraphItemId(identity.id)
   const proposalPayload = {
-    kind: "proposal", fingerprint: "fingerprint", revision,
-    receipt: { revision, nodes: snapshot.nodes.map((item, index) => ({ key: item.key, taskId: item.taskId, status: index === 1 ? "queued" : "waiting" })), readyTaskIds: ["queue-1"] },
+    kind: "proposal", fingerprint: "f".repeat(64), revision,
+    receipt: { status: "accepted", revision, nodes: snapshot.nodes.map((item, index) => ({ key: item.key, taskId: item.taskId, status: index === 1 ? "queued" : "waiting" })), readyTaskIds: ["queue-1"] },
+    item: { schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: itemId, sessionId: identity.sessionId, turnId: identity.turnId,
+      stepId: null, taskId: identity.id, type: "task_graph", status: "streaming", phase: null, revision, content: snapshot },
+    content: snapshot,
   }
+  const proposalRow = { type: "item.delta", itemId, taskId: identity.id, idempotencyKey: taskGraphProposalKey(identity.id, revision - 1), payload: proposalPayload }
   const events: Array<{ type: string; payload: unknown }> = []
   const calls: Array<{ sql: string; params?: unknown[] }> = []
   const query = vi.fn(async (sql: string, params?: unknown[]) => {
@@ -61,10 +66,10 @@ function fixture(options: {
     if (sql.includes('SELECT item."id"')) return options.noGraph ? { rows: [], rowCount: 0 } : { rows: [{
       id: itemId, revision, content: snapshot, createdAt: new Date("2026-10-04T11:00:00.000Z"),
     }], rowCount: 1 }
-    if (sql.includes('event."payload"->>\'kind\' = \'proposal\'')) {
+    if (sql.includes("event.\"payload\"->>'kind' IN ('proposal', 'native_command')")) {
       if (options.noGraph || options.missingProposal) return { rows: [], rowCount: 0 }
       const payload = options.malformedProposal ? { kind: "proposal", receipt: { revision: 2, nodes: "invalid", readyTaskIds: [] } } : proposalPayload
-      return { rows: [{ payload }], rowCount: 1 }
+      return { rows: [{ ...proposalRow, payload }], rowCount: 1 }
     }
     if (sql.includes('SELECT task."id", task."status", task."role"')) {
       const ids = params?.[0] as string[]
@@ -72,7 +77,14 @@ function fixture(options: {
         id: row!.id, status: row!.status, role: "analyst", failureReason: row!.failureReason, result: null,
       })), rowCount: ids.length }
     }
-    if (sql.includes('SELECT event."type", event."payload"')) return { rows: events, rowCount: events.length }
+    if (sql.includes('SELECT event."type", event."itemId"')) return {
+      rows: [
+        ...(!options.noGraph && !options.missingProposal ? [{ ...proposalRow, payload: options.malformedProposal
+          ? { kind: "proposal", receipt: { revision: 2, nodes: "invalid", readyTaskIds: [] } } : proposalPayload }] : []),
+        ...events.map(event => ({ type: event.type, itemId, taskId: identity.id,
+          idempotencyKey: (event.payload as { event?: { idempotencyKey?: string } }).event?.idempotencyKey, payload: event.payload })),
+      ], rowCount: (!options.noGraph && !options.missingProposal ? 1 : 0) + events.length,
+    }
     if (sql.includes('SELECT task."id", task."status", task."attemptCount"') && sql.includes("FOR UPDATE OF task")) {
       const ids = params?.[0] as string[]
       const found = ids.map(id => id === options.missingChildId || id === options.foreignChildId ? undefined : rows.get(id)).filter(Boolean)

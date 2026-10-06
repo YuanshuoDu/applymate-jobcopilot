@@ -7,6 +7,7 @@ import { ToolRegistry } from "./registry.js"
 import { InMemoryToolResultReferenceStore } from "./redaction.js"
 import { ToolRouter } from "./router.js"
 import { ToolExecutionError, type RuntimeToolDefinition } from "./types.js"
+import { SessionPauseRequestedError } from "../session-gate.js"
 
 const context = { scope: { userId: "user-a" }, sessionId: "session-a", turnId: "turn-a", stepId: "step-a" }
 
@@ -135,6 +136,16 @@ describe("ToolRouter", () => {
     )
     await expect(router.execute(context, { id: "submit-1", toolName: "application.submit", toolVersion: "1", input: { jobId: "job-1" } })).resolves.toMatchObject({ status: "failed", errorCode: "policy_denied" })
     expect(execute).not.toHaveBeenCalled()
+  })
+
+  it("settles the started lifecycle before rethrowing the typed session pause", async () => {
+    const pause = new SessionPauseRequestedError()
+    const { router, sink } = makeRouter(async () => { throw pause })
+
+    await expect(router.execute(context, request)).rejects.toBe(pause)
+
+    expect(sink.events.map(event => event.phase)).toEqual(["started", "failed"])
+    expect(sink.events.at(-1)?.payload).toMatchObject({ errorCode: "session_pause_requested", output: { message: "Session work is fenced by a durable pause request" } })
   })
 
   it("executes only the safe input produced by a policy rewrite", async () => {

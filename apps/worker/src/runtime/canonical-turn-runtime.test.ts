@@ -10,7 +10,7 @@ import type { StepContext } from "./context/step-context-builder.js"
 import type { CanonicalTurnState, CanonicalTurnStateLoadOptions } from "./canonical-turn-state.js"
 import type { TurnEngineEvent, TurnEngineStore } from "./turns/turn-engine-types.js"
 import { createCanonicalTurnRuntime, type CanonicalTurnRuntimeOptions } from "./canonical-turn-runtime.js"
-import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA, type TaskGraphCommandPort, type TaskGraphCurrentState, type TaskGraphReadScope, type TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
+import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA, type TaskGraphCommandPort, type TaskGraphCurrentState, type TaskGraphNativeCommandInput, type TaskGraphReadScope, type TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
 import { projectSelectedJobMemory } from "./context/selected-job-memory.js"
 import { TurnEngine } from "./turns/turn-engine.js"
@@ -20,6 +20,10 @@ import { runTurnJob } from "./turns/turn-queue.js"
 import type { TurnLease } from "./turns/lease.js"
 import { InterruptRequestedError } from "./interrupt/registry.js"
 import { resolveProductionAgentFlags, type ProductionAgentFlags } from "./production-agent-flags.js"
+import { nativeCoordinationReceipts } from "./canonical-turn-native-graph-context.js"
+import { digestNativeVerificationValue } from "./subagents/native-verification-contract.js"
+import type { NativeVerificationEnsureResult, NativeVerificationPort } from "./subagents/native-verification-port.js"
+import type { NativeVerificationRuntime } from "./canonical-turn-native-verification-runtime.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 2,
@@ -74,6 +78,19 @@ function model(script: () => ModelStreamEvent[]): ModelAdapter {
 
 function rootStore() {
   return { ensure: vi.fn(async () => ({ id: "root-1", attemptCount: 1 } as never)), checkCompletion: vi.fn(async () => ({ ok: true as const })), finish: vi.fn(async () => undefined) }
+}
+
+function nativeVerificationRuntime(childStatus: "passed" | "failed" = "passed"): NativeVerificationRuntime {
+  const port: NativeVerificationPort = {
+    ensureChildren: async (): Promise<NativeVerificationEnsureResult> => ({ status: childStatus, controlTaskIds: [], pendingControlTaskIds: [], pendingTaskIds: [], feedback: [] }),
+    ensureRootGoal: async ({ candidateText }): Promise<NativeVerificationEnsureResult> => ({ status: "passed", controlTaskIds: ["control-1"], pendingControlTaskIds: [], pendingTaskIds: [], feedback: [], rootGoalWitness: {
+      controlTaskId: "control-1", controlOperationId: "operation-1", currentControlAttempt: 1,
+      candidateDigest: digestNativeVerificationValue(candidateText), childBindingSetDigest: "a".repeat(64), goalDigest: "b".repeat(64),
+      criteriaDigest: "c".repeat(64), evidencePacketDigest: "d".repeat(64), reportDigest: "e".repeat(64),
+    } }),
+    readRecoverableGoal: async () => null,
+  }
+  return { port, readTerminalProof: async () => true }
 }
 
 function waitBoundary() {
@@ -551,6 +568,133 @@ describe("createCanonicalTurnRuntime", () => {
     expect(observation).not.toContain("Jane Doe")
     expect(observation).not.toContain("private.example")
     expect(modelContext?.blocks.find(block => block.id === "task-graph-current")?.trust).toBe("external_untrusted")
+  })
+
+  it("keeps the native receipt graph gate on planner roots without a root-store graph checker", async () => {
+    const digest = "c".repeat(64)
+    const child = { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/child-1", depth: 1, role: "scout", taskType: "research", status: "queued" as const }
+    const nativeCoordination = {
+      schemaVersion: "agent-harness.v2.native-coordination-receipt.v1", operationKind: "spawn", status: "accepted", replay: false,
+      operationId: "native-op-1", requestFingerprint: digest, graphRevision: 2, nodeKey: "node-1", dispatchDisposition: "pending",
+      rootTaskId: "root-1", child,
+    }
+    const currentNode = {
+      key: "node-1", templateId: "native:scout", goal: "Inspect", successCriteria: [], dependsOn: [], taskId: child.taskId,
+      status: "queued" as const, readiness: "ready" as const, resultSummary: null, failureReason: null,
+      native: { operationKind: "spawn" as const, operationId: "native-op-1", requestFingerprint: digest, callerTaskId: "root-1", role: "scout", taskType: "research", contextDigest: digest },
+    }
+    let reads = 0
+    const readCurrent = vi.fn(async (): Promise<TaskGraphCurrentState> => ++reads === 2
+      ? { revision: 2, nodes: [currentNode] }
+      : { revision: reads, nodes: [] })
+    const commandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 0, nodes: [], readyTaskIds: [] })),
+      appendNativeCoordination: vi.fn(async () => ({ status: "accepted" as const, replay: false, operationId: "native-op-1", requestFingerprint: digest, graphRevision: 2, nodeKey: "node-1", dispatchDisposition: "pending" as const, child })),
+      readCurrent,
+    }
+    const roots = { ensure: vi.fn(async () => ({ id: "root-1", attemptCount: 1 } as never)), finish: vi.fn(async () => undefined) }
+    const events: RuntimeEvent[] = [], runtimeTools = tools(true), definitions = [...runtimeTools.registry.list()]
+    const route = vi.fn(async (_context: unknown, call: { id: string; toolName: string; toolVersion: string }) => ({
+      ...call, status: "completed" as const, output: { ...child, replay: false, nativeCoordination }, errorCode: null,
+    }))
+    let modelCalls = 0
+    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+      workerId: "worker-1", productionFlags: resolveProductionAgentFlags({
+        ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+      }),
+      taskGraphCommandPort: commandPort, taskGraphTemplates: { scout: { role: "scout", taskType: "research", allowedActions: ["jobs.search"] } },
+      stateLoader: async () => ({ ...state(), toolPolicySnapshot: {} }), rootTaskStore: roots as never,
+      nativeVerificationFactory: () => nativeVerificationRuntime("failed"),
+      turnEngineStoreFactory: () => store(events), contextBuilderFactory: () => contextBuilder(),
+      toolRuntimeFactory: () => ({ ...runtimeTools,
+        registry: { ...runtimeTools.registry, list: () => definitions, register: (definition: { name: string; version: string }) => definitions.push(definition) },
+        router: { execute: route },
+      }) as never,
+      modelRuntimeFactory: async () => ({ adapter: model(() => ++modelCalls === 1
+        ? [{ type: "tool_call_completed", callId: "spawn-call", name: "agent.spawn", arguments: { role: "scout", taskType: "research", goal: "Inspect" } }, { type: "completed", finishReason: "tool_calls" }]
+        : [{ type: "text_delta", text: "done" }, { type: "completed", finishReason: "stop" }]), registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+
+    const result = await runtime.execute({ lease, signal: new AbortController().signal })
+
+    expect(readCurrent.mock.calls.length).toBeGreaterThanOrEqual(3)
+    expect(events.some(event => event.type === "final.rejected" && JSON.stringify(event.payload).includes("task_graph_verification_unverified"))).toBe(true)
+    expect(result.status).toBe("failed")
+    expect(roots.finish).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ status: "failed" }) }))
+  })
+
+  it("routes planner-root delegation through the default production tool runtime with its bound root attempt", async () => {
+    const digest = "d".repeat(64)
+    const rootTaskId = "root-turn-1"
+    const childTaskId = "subagent-11111111-1111-4111-8111-111111111111"
+    const child = { taskId: childTaskId, rootTaskId, parentTaskId: rootTaskId, path: `/${rootTaskId}/${childTaskId}`, depth: 1, role: "scout", taskType: "research", status: "queued" as const }
+    const currentNode = {
+      key: "native-node-1", templateId: "native:scout", goal: "Inspect", successCriteria: [], dependsOn: [], taskId: child.taskId,
+      status: "queued" as const, readiness: "ready" as const, resultSummary: null, failureReason: null,
+      native: { operationKind: "spawn" as const, operationId: "native-op-default", requestFingerprint: digest, callerTaskId: rootTaskId, role: "scout", taskType: "research", contextDigest: digest },
+    }
+    const graph: TaskGraphCurrentState = { revision: 2, nodes: [currentNode] }
+    const nativeInputs: TaskGraphNativeCommandInput[] = []
+    let graphReads = 0
+    const commandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
+      appendNativeCoordination: vi.fn(async input => {
+        nativeInputs.push(input)
+        return { status: "accepted" as const, replay: false, operationId: "native-op-default", requestFingerprint: digest, graphRevision: 2, nodeKey: "native-node-1", dispatchDisposition: "pending" as const, child }
+      }),
+      readCurrent: vi.fn(async () => ++graphReads === 1 ? { revision: 0, nodes: [] } : graph),
+    }
+    const rootRow = {
+      id: rootTaskId, userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId, parentTaskId: null,
+      path: `/${rootTaskId}`, depth: 0, role: "orchestrator", taskType: "root", status: "running", goal: "Find jobs", context: {},
+      attemptCount: 7, maxAttempts: 1, leaseOwner: "worker-1", leaseExpiresAt: lease.leaseExpiresAt, interruptRequestedAt: null, result: null, failureReason: null,
+    }
+    const client = {
+      query: vi.fn(async (sql: string) => {
+        if (sql.includes('UPDATE "agent_sessions"')) return { rows: [{ eventSequence: "1" }], rowCount: 1 }
+        if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [rootRow], rowCount: 1 }
+        if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1" }], rowCount: 1 }
+        return { rows: [], rowCount: 1 }
+      }),
+      release: vi.fn(),
+    }
+    const pool = { connect: vi.fn(async () => client), query: vi.fn(async () => ({ rows: [], rowCount: 0 })) }
+    const roots = { ensure: vi.fn(async () => ({ id: rootTaskId, attemptCount: 7 } as never)), checkCompletion: vi.fn(async () => ({ ok: true as const })), finish: vi.fn(async () => undefined) }
+    const events: RuntimeEvent[] = []
+    const modelSnapshots: CanonicalTurnState["snapshot"][] = []
+    let modelCalls = 0
+    const runtime = await createCanonicalTurnRuntime(pool as never, {
+      workerId: "worker-1", productionFlags: resolveProductionAgentFlags({
+        ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+      }),
+      taskGraphCommandPort: commandPort, taskGraphTemplates: { scout: { role: "scout", taskType: "research", allowedActions: ["jobs.search"] } },
+      stateLoader: async () => ({ ...state(), toolPolicySnapshot: {} }), rootTaskStore: roots as never,
+      nativeVerificationFactory: () => nativeVerificationRuntime(),
+      turnEngineStoreFactory: () => store(events), contextBuilderFactory: () => ({
+        build: async request => { modelSnapshots.push(request.snapshot); return contextBuilder().build(request) },
+      }),
+      modelRuntimeFactory: async () => ({ adapter: model(() => ++modelCalls === 1
+        ? [{ type: "tool_call_completed", callId: "spawn-call-default", name: "agent.spawn", arguments: { role: "scout", taskType: "research", goal: "Inspect" } }, { type: "completed", finishReason: "tool_calls" }]
+        : [{ type: "text_delta", text: "done" }, { type: "completed", finishReason: "stop" }]), registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+
+    const result = await runtime.execute({ lease, signal: new AbortController().signal })
+
+    expect(result.status).toBe("completed")
+    expect(commandPort.appendNativeCoordination).toHaveBeenCalledOnce()
+    expect(nativeInputs[0]?.scope).toMatchObject({
+      userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId, parentTaskId: rootTaskId,
+      turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId, parentAttemptCount: 7,
+    })
+    expect(nativeInputs[0]?.request).toMatchObject({ kind: "spawn", role: "scout", taskType: "research", goal: "Inspect" })
+    const persisted = events.find(event => event.type === "tool_call.completed" && JSON.stringify(event.payload).includes("nativeCoordination"))
+    expect(persisted).toBeDefined()
+    expect(graphReads).toBeGreaterThanOrEqual(3)
+    const refreshed = modelSnapshots[1]
+    expect(refreshed?.toolObservations.find(item => item.id === "task-graph-current")?.content).toMatchObject({ kind: "task_graph_current", revision: 2 })
+    expect(nativeCoordinationReceipts(refreshed!)).toMatchObject([{ operationId: "native-op-default", requestFingerprint: digest, rootTaskId, child: { taskId: childTaskId } }])
   })
 
   it("filters restored and reconciled generic reads from selected-job resume context while preserving TaskGraph results", async () => {
@@ -1246,7 +1390,8 @@ describe("createCanonicalTurnRuntime", () => {
     const guard = terminalGuards[0]
     if (typeof guard !== "function") throw new Error("terminal guard was not created")
     const client = { query: vi.fn(async () => ({ rows: [], rowCount: 0 })) } as never
-    await expect(guard(client)).resolves.toEqual({ ok: true })
+    const terminal = { stepId: "step-1", finalItemId: "final-1", finalContent: null, stepCount: 1, toolCallCount: 0, usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }, response: "{}" } as never
+    await expect(guard(client, terminal)).resolves.toEqual({ ok: true })
     expect(roots.checkCompletion).toHaveBeenNthCalledWith(1, expect.objectContaining({ taskGraphVerification: true }))
     expect(roots.checkCompletion).toHaveBeenNthCalledWith(2, expect.objectContaining({ taskGraphVerification: true, client }))
   })
@@ -1267,8 +1412,9 @@ describe("createCanonicalTurnRuntime", () => {
     const guard = terminalGuards[0]
     if (typeof guard !== "function") throw new Error("selected-job terminal guard was not created")
     const client = { query: vi.fn(async () => ({ rows: [], rowCount: 0 })) } as never
+    const terminal = { stepId: "step-1", finalItemId: "final-1", finalContent: null, stepCount: 1, toolCallCount: 0, usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }, response: "{}" } as never
 
-    await expect(guard(client)).resolves.toMatchObject({ ok: false, blocker: "selected_job_draft_review_required" })
+    await expect(guard(client, terminal)).resolves.toMatchObject({ ok: false, blocker: "selected_job_draft_review_required" })
     expect(roots.checkCompletion).toHaveBeenLastCalledWith(expect.objectContaining({ taskGraphVerification: true, client }))
   })
 

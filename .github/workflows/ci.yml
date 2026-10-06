@@ -124,6 +124,29 @@ jobs:
           test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
           test -n "$AGENT_RUNTIME_PG_TEST_URL"
           pnpm --filter @jobcopilot/worker exec vitest run src/runtime/subagents/pg-task-graph-command-port.integration.test.ts
+      - name: Verify native delegation, independent verification, and terminal proof on disposable PostgreSQL/Redis
+        env:
+          CI: "true"
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+          RUN_AGENT_TURN_REDIS_INTEGRATION: "1"
+          AGENT_TURN_REDIS_TEST_URL: redis://127.0.0.1:6379/15
+          AGENT_TURN_REDIS_TEST_DISPOSABLE: "true"
+          REDIS_URL: redis://127.0.0.1:6379/15
+        run: |
+          test "$CI" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          test "$AGENT_TURN_REDIS_TEST_URL" = "redis://127.0.0.1:6379/15"
+          test "$AGENT_TURN_REDIS_TEST_DISPOSABLE" = "true"
+          test "$REDIS_URL" = "$AGENT_TURN_REDIS_TEST_URL"
+          test "$RUN_AGENT_TURN_REDIS_INTEGRATION" = "1"
+          pnpm --filter @jobcopilot/worker exec vitest run --no-file-parallelism \
+            src/runtime/subagents/task-graph-native-pg.integration.test.ts \
+            src/runtime/subagents/native-verification-pg.integration.test.ts \
+            src/runtime/subagents/native-brain-pg.integration.test.ts
       - name: Verify interactive discovery Stop recovery without subagent execution
         env:
           CI: "true"

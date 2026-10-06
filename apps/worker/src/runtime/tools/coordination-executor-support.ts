@@ -2,6 +2,7 @@ import { CoordinationError, type CoordinationRuntimeOptions, type CoordinationTa
 import { TERMINAL_TASK_STATUSES } from "./coordination-followup.js"
 import { validatedStructuredResult } from "./coordination-result-aggregate.js"
 import { lifecycleTarget, visibleTask } from "./coordination-visibility.js"
+import { projectNativeVerificationResult } from "./native-verification-feedback-projection.js"
 import { sanitizeLifecyclePreview } from "./redaction.js"
 import type { ToolExecutionContext } from "./types.js"
 
@@ -73,7 +74,7 @@ export function waitTaskOutput(task: CoordinationTaskView) {
 
 export function waitResult(value: unknown): ReturnType<typeof sanitizeLifecyclePreview> | null {
   if (value === undefined || value === null) return null
-  try { return stripForeignResultKeys(sanitizeLifecyclePreview(value, WAIT_RESULT_MAX_BYTES)) }
+  try { return stripForeignResultKeys(sanitizeLifecyclePreview(projectNativeVerificationResult(value), WAIT_RESULT_MAX_BYTES)) }
   catch { return { $truncated: true, summary: "Task result was omitted because it could not be safely encoded" } }
 }
 

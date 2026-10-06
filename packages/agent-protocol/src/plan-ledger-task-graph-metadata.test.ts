@@ -17,6 +17,16 @@ const report = {
 const result = {
   status: "completed", stepCount: 2, toolCallCount: 1, finalItemId: null, finalText: "private", structuredResult: {},
 }
+const nativeSource = {
+  taskId: "source-task", rootTaskId: "root-task", parentTaskId: "root-task", turnId: "turn-1",
+  role: "auditor", taskType: "audit", status: "failed", attemptCount: 1,
+  resultDigest: "d".repeat(64), graphNodeKey: "native-prior", origin: "task_graph",
+}
+const nativeDelegation = {
+  schemaVersion: "agent-harness.v2.task-graph.native-delegation.v1", operationKind: "spawn",
+  operationId: "native-operation", requestFingerprint: "a".repeat(64), callerTaskId: "root-task",
+  role: "auditor", taskType: "audit", contextDigest: "b".repeat(64), contextBytes: 0,
+}
 
 describe("Plan Ledger persisted TaskGraph metadata", () => {
   it("projects typed, repaired, legacy, and specialized shapes without metadata", () => {
@@ -33,6 +43,40 @@ describe("Plan Ledger persisted TaskGraph metadata", () => {
     expect(repaired).not.toHaveProperty("repairOf")
     expect(legacy).toEqual(base)
     expect(specialized).toMatchObject({ templateId: "cover_letter_writer" })
+  })
+
+  it("projects valid persisted native spawn and followup metadata without exposing provenance", () => {
+    const spawn = {
+      ...base, templateId: "native", successCriteria: [], verificationDisposition: "legacy_unverified", nativeDelegation,
+    }
+    const followup = {
+      ...spawn, key: "native-followup", taskId: "task-followup",
+      nativeDelegation: { ...nativeDelegation, operationKind: "followup", source: nativeSource },
+    }
+
+    for (const node of [spawn, followup]) {
+      expect(parsePersistedTaskGraphNode(node)).toEqual({
+        key: node.key, templateId: "native", goal: node.goal, successCriteria: [], dependsOn: [], depth: 1, taskId: node.taskId,
+      })
+      expect(JSON.stringify(parsePersistedTaskGraphNode(node))).not.toMatch(/nativeDelegation|source-task|requestFingerprint/)
+    }
+  })
+
+  it("fails closed for native declarations that are missing, mixed, or contain unknown metadata", () => {
+    const node = { ...base, templateId: "native", successCriteria: [], verificationDisposition: "legacy_unverified", nativeDelegation }
+    const invalid = [
+      { ...node, nativeDelegation: undefined },
+      { ...node, verificationDisposition: "typed", verification },
+      { ...node, repairOf: { taskId: "task", nodeKey: "node", graphRootTaskId: "root", criterionIds: ["candidate-count"] } },
+      { ...node, nativeDelegation: { ...nativeDelegation, authority: "approved" } },
+      { ...node, nativeDelegation: { ...nativeDelegation, operationKind: "followup" } },
+      { ...node, nativeDelegation: { ...nativeDelegation, operationKind: "followup", source: { ...nativeSource, rawResult: "private" } } },
+      { ...node, nativeDelegation: { ...nativeDelegation, operationKind: "followup", source: { ...nativeSource, role: "executor" } } },
+      { ...node, nativeDelegation: { ...nativeDelegation, source: nativeSource } },
+      { ...node, templateId: "scout" },
+      { ...base, templateId: "native", successCriteria: [] },
+    ]
+    for (const candidate of invalid) expect(parsePersistedTaskGraphNode(candidate)).toBeNull()
   })
 
   it("rejects unknown persisted shapes and malformed typed or repair metadata", () => {

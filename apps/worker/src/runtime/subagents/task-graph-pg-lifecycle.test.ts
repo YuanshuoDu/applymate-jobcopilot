@@ -2,29 +2,60 @@ import { describe, expect, it, vi } from "vitest"
 import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import type pg from "pg"
 import { prepareGraphTransition, reconcileGraphDependents } from "./task-graph-pg-lifecycle.js"
-import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "./task-graph-snapshot.js"
+import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId, taskGraphProposalKey } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-pg-verification.js"
 
-function fakeGraphClient(status: string, options: { proposalPayloads?: unknown[]; snapshot?: unknown; missingItem?: boolean; taskStatuses?: Record<string, string> } = {}) {
+function proposalPayload(snapshot: unknown, revision: number, receiptNodes?: readonly Record<string, unknown>[]) {
+  const graph = snapshot as { nodes: readonly { key: string; taskId: string; dependsOn: readonly string[] }[] }
+  const nodes = receiptNodes ?? graph.nodes.map(node => ({
+    key: node.key, taskId: node.taskId, status: node.dependsOn.length ? "waiting" : "queued",
+  }))
+  const itemId = taskGraphItemId("root-1")
+  const item = {
+    schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: itemId, sessionId: "session-1", turnId: "turn-1",
+    stepId: null, taskId: "root-1", type: "task_graph", status: "streaming", phase: null, revision, content: snapshot,
+  }
+  return {
+    kind: "proposal", fingerprint: "a".repeat(64), revision,
+    receipt: { status: "accepted", revision, nodes, readyTaskIds: nodes.filter(node => node.status === "queued").map(node => node.taskId) },
+    item, content: snapshot,
+  }
+}
+
+function proposalEventRow(payload: unknown) {
+  const value = payload as { revision: number }
+  const itemId = taskGraphItemId("root-1")
+  return {
+    type: value.revision === 1 ? "item.started" : "item.delta", itemId, taskId: "root-1",
+    idempotencyKey: taskGraphProposalKey("root-1", value.revision - 1), payload,
+  }
+}
+
+function fakeGraphClient(status: string, options: { proposalPayloads?: unknown[]; snapshot?: unknown; revision?: number; missingItem?: boolean; taskStatuses?: Record<string, string> } = {}) {
   const snapshot = options.snapshot ?? { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{
     key: "child", templateId: "analyst", goal: "Inspect", successCriteria: ["done"], dependsOn: [], depth: 1, taskId: "child-1",
   }] }
-  const proposalPayloads = options.proposalPayloads ?? [{ kind: "proposal", receipt: {
-    revision: 2, nodes: [{ key: "child", taskId: "child-1", status: "queued" }], readyTaskIds: ["child-1"],
-  } }]
+  const snapshotRow = snapshot as { schemaVersion?: unknown; nodes?: unknown }
+  const receiptSnapshot = snapshotRow.schemaVersion === TASK_GRAPH_SNAPSHOT_VERSION && Array.isArray(snapshotRow.nodes) && snapshotRow.nodes.length > 0
+    ? snapshot : { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{
+      key: "child", templateId: "analyst", goal: "Inspect", successCriteria: ["done"], dependsOn: [], depth: 1, taskId: "child-1",
+    }] }
+  const revision = options.revision ?? 2
+  const proposalPayloads = options.proposalPayloads ?? [proposalPayload(receiptSnapshot, revision)]
+  const proposalRows = proposalPayloads.map(proposalEventRow)
   const client = {
     query: vi.fn(async (sql: string, params?: unknown[]) => {
       if (sql.includes('SELECT task."turnId"')) return { rows: [{ turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", userId: "user-1" }], rowCount: 1 }
-      if (sql.includes("event.\"payload\"->>'kind' = 'proposal'")) return { rows: proposalPayloads.map(payload => ({ payload })), rowCount: proposalPayloads.length }
+      if (sql.includes("event.\"payload\"->>'kind' IN ('proposal', 'native_command')")) return { rows: proposalRows, rowCount: proposalRows.length }
+      if (sql.includes('SELECT event."type", event."itemId"')) return { rows: proposalRows, rowCount: proposalRows.length }
       if (sql.includes('SELECT item."id"')) return options.missingItem ? { rows: [], rowCount: 0 } : { rows: [{
-        id: taskGraphItemId("root-1"), revision: 2, content: snapshot, createdAt: new Date("2026-09-01T00:00:00.000Z"),
+        id: taskGraphItemId("root-1"), revision, content: snapshot, createdAt: new Date("2026-09-01T00:00:00.000Z"),
       }], rowCount: 1 }
       if (sql.includes('SELECT task."id", task."status"')) {
         const ids = params?.[0] as string[]
         return { rows: ids.map(id => ({ id, status: options.taskStatuses?.[id] ?? status, role: "analyst", failureReason: null, result: null })), rowCount: ids.length }
       }
-      if (sql.includes('SELECT event."payload"')) return { rows: [], rowCount: 0 }
       return { rows: [], rowCount: 0 }
     }),
   }
@@ -62,7 +93,7 @@ describe("prepareGraphTransition", () => {
     await expect(prepareGraphTransition(client as unknown as Pick<pg.PoolClient, "query">, {
       taskId: "child-1", sessionId: "session-1", type: "task.started",
     })).rejects.toThrow("task_graph_state_missing")
-    const membership = client.query.mock.calls.find(([sql]) => sql.includes("event.\"payload\"->>'kind' = 'proposal'"))
+    const membership = client.query.mock.calls.find(([sql]) => sql.includes("event.\"payload\"->>'kind' IN ('proposal', 'native_command')"))
     expect(membership?.[0]).toContain('event."sessionId" = $1 AND event."turnId" = $2 AND event."itemId" = $3 AND event."taskId" = $4')
     expect(membership?.[0]).toContain('session."userId" = $5 AND turn."userId" = $5')
     expect(membership?.[1]).toEqual(["session-1", "turn-1", taskGraphItemId("root-1"), "root-1", "user-1"])
@@ -77,7 +108,10 @@ describe("prepareGraphTransition", () => {
   })
 
   it("fails closed when a persisted graph child is absent from a valid snapshot", async () => {
-    const client = fakeGraphClient("queued", { snapshot: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{
+    const previousSnapshot = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{
+      key: "child", templateId: "analyst", goal: "Inspect", successCriteria: ["done"], dependsOn: [], depth: 1, taskId: "child-1",
+    }] }
+    const client = fakeGraphClient("queued", { revision: 3, proposalPayloads: [proposalPayload(previousSnapshot, 2)], snapshot: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{
       key: "other", templateId: "analyst", goal: "Inspect", successCriteria: ["done"], dependsOn: [], depth: 1, taskId: "other-child",
     }] } })
     await expect(prepareGraphTransition(client as unknown as Pick<pg.PoolClient, "query">, {
@@ -133,9 +167,9 @@ describe("reconcileGraphDependents", () => {
       { key: "source", templateId: "cover_letter_writer", goal: "Write", successCriteria: ["done"], dependsOn: [], depth: 1, taskId: "source-1", verificationDisposition: "specialized" },
       { key: "child", templateId: "cover_letter_writer", goal: "Review", successCriteria: ["done"], dependsOn: ["source"], depth: 2, taskId: "child-1", verificationDisposition: "specialized" },
     ] }
-    const proposalPayloads = [{ kind: "proposal", receipt: {
-      revision: 2, nodes: [{ key: "source", taskId: "source-1", status: "queued" }, { key: "child", taskId: "child-1", status: "waiting" }], readyTaskIds: ["source-1"],
-    } }]
+    const proposalPayloads = [proposalPayload(snapshot, 2, [
+      { key: "source", taskId: "source-1", status: "queued" }, { key: "child", taskId: "child-1", status: "waiting" },
+    ])]
     const client = fakeGraphClient("queued", { snapshot, proposalPayloads, taskStatuses: { "source-1": "completed", "child-1": "queued" } })
 
     await expect(reconcileGraphDependents(client as unknown as Pick<pg.PoolClient, "query">, scope, new Date("2026-09-02T00:00:00.000Z"))).resolves.toBeUndefined()
@@ -163,14 +197,11 @@ describe("reconcileGraphDependents", () => {
       ["dependent-1", { id: "dependent-1", status: dependentStatus, role: "analyst", failureReason: null, result: null, turnId: scope.turnId, rootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId, userId: scope.userId, attemptCount: 0 }],
     ])
     const itemId = taskGraphItemId(scope.rootTaskId)
-    const proposalPayload = { kind: "proposal", fingerprint: "fixture-proposal", revision: 2, receipt: {
-      status: "accepted", revision: 2,
-      nodes: [
-        { key: "prerequisite", taskId: "prerequisite-1", status: "queued" },
-        { key: "dependent", taskId: "dependent-1", status: dependentStatus },
-      ],
-      readyTaskIds: ["prerequisite-1", ...(dependentStatus === "queued" ? ["dependent-1"] : [])],
-    } }
+    const proposal = proposalPayload(snapshot, 2, [
+      { key: "prerequisite", taskId: "prerequisite-1", status: "queued" },
+      { key: "dependent", taskId: "dependent-1", status: dependentStatus },
+    ])
+    const proposalRow = proposalEventRow(proposal)
     const events: Array<{ type: string; payload: unknown }> = []
     let revision = 2
     const client = {
@@ -179,7 +210,12 @@ describe("reconcileGraphDependents", () => {
           const row = tasks.get(String(values?.[0]))
           return { rows: row ? [{ turnId: row.turnId, rootTaskId: row.rootTaskId, parentTaskId: row.parentTaskId, attemptCount: row.attemptCount, userId: row.userId }] : [], rowCount: row ? 1 : 0 }
         }
-        if (sql.includes("event.\"payload\"->>'kind' = 'proposal'")) return { rows: [{ payload: proposalPayload }], rowCount: 1 }
+        if (sql.includes("event.\"payload\"->>'kind' IN ('proposal', 'native_command')")) return { rows: [proposalRow], rowCount: 1 }
+        if (sql.includes('SELECT event."type", event."itemId"')) return { rows: [proposalRow, ...events.map(event => ({
+          type: event.type, itemId, taskId: scope.parentTaskId,
+          idempotencyKey: (event.payload as { event?: { idempotencyKey?: string } }).event?.idempotencyKey,
+          payload: event.payload,
+        }))], rowCount: 1 + events.length }
         if (sql.includes('SELECT item."id"')) return { rows: [{
           id: itemId, revision, content: snapshot, createdAt: new Date("2026-09-01T00:00:00.000Z"),
         }], rowCount: 1 }
@@ -187,7 +223,6 @@ describe("reconcileGraphDependents", () => {
           const ids = values?.[0] as string[]
           return { rows: ids.map(id => tasks.get(id)).filter(Boolean), rowCount: ids.length }
         }
-        if (sql.includes('SELECT event."type", event."payload"')) return { rows: events, rowCount: events.length }
         if (sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = \'cancelled\'')) {
           const row = tasks.get(String(values?.[0]))
           if (row) row.status = "cancelled"
@@ -256,25 +291,22 @@ describe("reconcileGraphDependents", () => {
     let revision = 2
     const itemId = taskGraphItemId("root-1")
     const item = { schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: itemId, sessionId: scope.sessionId, turnId: scope.turnId, stepId: null, taskId: scope.rootTaskId, type: "task_graph", status: "streaming", phase: null, revision, content: snapshot, startedAt: "2026-09-01T00:00:00.000Z", completedAt: null, createdAt: "2026-09-01T00:00:00.000Z", updatedAt: "2026-09-01T00:00:00.000Z" }
-    const proposalPayload = {
-      kind: "proposal", fingerprint: "fingerprint", revision,
-      receipt: { status: "accepted", revision, nodes: snapshot.nodes.map(node => ({
-        key: node.key, taskId: node.taskId,
-        status: node.key === "source" || node.key === "dependent" && dependentStatus === "queued" ? "queued" : "waiting",
-      })), readyTaskIds: ["source-1", ...(dependentStatus === "queued" ? ["dependent-1"] : [])] },
-      item, content: snapshot,
-    }
-    const events: Array<{ type: string; payload: unknown }> = [{ type: "item.delta", payload: proposalPayload }]
+    const proposal = proposalPayload(snapshot, revision, snapshot.nodes.map(node => ({
+      key: node.key, taskId: node.taskId,
+      status: node.key === "source" || node.key === "dependent" && dependentStatus === "queued" ? "queued" : "waiting",
+    })))
+    const proposalRow = proposalEventRow(proposal)
+    const events: Array<{ type: string; itemId: string; taskId: string; idempotencyKey: string; payload: unknown }> = [proposalRow]
     let sequence = 0
     const query = vi.fn(async (sql: string, values?: unknown[]) => {
       if (sql.includes('SELECT task."turnId"')) return { rows: [{ turnId: scope.turnId, rootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId, attemptCount: 0, userId: scope.userId }], rowCount: 1 }
-      if (sql.includes('SELECT event."payload"')) return { rows: [{ payload: proposalPayload }], rowCount: 1 }
+      if (sql.includes("event.\"payload\"->>'kind' IN ('proposal', 'native_command')")) return { rows: [proposalRow], rowCount: 1 }
       if (sql.includes('SELECT item."id"')) return { rows: [{ id: itemId, revision, content: snapshot, createdAt: new Date("2026-09-01T00:00:00.000Z") }], rowCount: 1 }
       if (sql.includes('SELECT task."id", task."status"')) {
         const ids = values?.[0] as string[]
         return { rows: ids.map(id => rowsById.get(id)).filter(Boolean), rowCount: ids.length }
       }
-      if (sql.includes('SELECT event."type"')) return { rows: events, rowCount: events.length }
+      if (sql.includes('SELECT event."type", event."itemId"')) return { rows: events, rowCount: events.length }
       if (sql.includes('UPDATE "sub_agent_tasks" SET "status" = \'cancelled\'')) {
         const row = rowsById.get(String(values?.[0]))!
         row.status = "cancelled"
@@ -287,7 +319,8 @@ describe("reconcileGraphDependents", () => {
       }
       if (sql.includes('UPDATE "agent_sessions" AS session')) return { rows: [{ eventSequence: String(++sequence) }], rowCount: 1 }
       if (sql.includes('INSERT INTO "agent_events"')) {
-        events.push({ type: String(values?.[6]), payload: JSON.parse(String(values?.[10])) as unknown })
+        const payload = JSON.parse(String(values?.[10])) as { event?: { idempotencyKey?: string } }
+        events.push({ type: String(values?.[6]), itemId, taskId: scope.parentTaskId, idempotencyKey: payload.event?.idempotencyKey ?? "", payload })
         return { rows: [], rowCount: 1 }
       }
       if (sql.includes('INSERT INTO "agent_outbox"') || sql.includes('DELETE FROM "agent_outbox"')) return { rows: [], rowCount: 1 }

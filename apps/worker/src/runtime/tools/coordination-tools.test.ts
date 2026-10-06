@@ -169,13 +169,10 @@ describe("coordination tool definitions", () => {
     expect(registry.validateArguments("wait_subagents", { idempotencyKey: "wait-1", taskIds: ["task-1"], mode: "any", timeoutMs: 30_001 })).not.toBe(true)
   })
 
-  it("validates every required idempotency key and strict object shape", () => {
+  it("allows server-derived root invocation keys while enforcing explicit keys on other writes", () => {
     const validator = new ToolSchemaValidator()
     const definitions = createCoordinationTools(options)
     const invalidInputs: Record<string, Record<string, unknown>> = {
-      spawn_subagent: { role: "scout", taskType: "inspect", goal: "Inspect" },
-      "agent.spawn": { role: "scout", taskType: "inspect", goal: "Inspect" },
-      "agent.followup": { taskId: "task-1", goal: "Continue" },
       send_message: { taskId: "task-1", kind: "result", payload: {} },
       "agent.send": { taskId: "task-1", kind: "result", payload: {} },
       wait_subagents: { taskIds: ["task-1"], mode: "all", timeoutMs: 1000 },
@@ -188,7 +185,10 @@ describe("coordination tool definitions", () => {
       "agent.close": {},
     }
     for (const definition of definitions) {
-      expect(() => validator.validate(definition.inputSchema, invalidInputs[definition.name], `${definition.name} input`)).toThrow(/schema validation/)
+      const invalid = invalidInputs[definition.name]
+      if (invalid) expect(() => validator.validate(definition.inputSchema, invalid, `${definition.name} input`)).toThrow(/schema validation/)
     }
+    expect(() => validator.validate(definitions.find(item => item.name === "agent.spawn")!.inputSchema, { role: "scout", taskType: "inspect", goal: "Inspect" }, "agent.spawn input")).not.toThrow()
+    expect(() => validator.validate(definitions.find(item => item.name === "agent.followup")!.inputSchema, { taskId: "task-1", goal: "Continue" }, "agent.followup input")).not.toThrow()
   })
 })

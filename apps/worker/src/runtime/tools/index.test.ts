@@ -4,6 +4,7 @@ import { createWorkerToolRuntime } from "./index.js"
 import { InMemoryToolLifecycleSink } from "./lifecycle.js"
 import type { ExecutionOwner } from "../execution-owner.js"
 import type { CoordinationStore, DurableWaitPort } from "./coordination-types.js"
+import type { TaskGraphCommandPort } from "../subagents/task-graph-command-port.js"
 
 const owner: ExecutionOwner = {
   kind: "turn", taskId: "root-1", lease: {
@@ -75,6 +76,31 @@ describe("worker tool runtime entry point", () => {
     const definition = runtime.registry.resolve("wait_subagents", "1")
     await definition.execute({ scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "step-1", signal: new AbortController().signal, capabilities: ["canManageChildren"], reportProgress: async () => undefined }, { idempotencyKey: "wait-1", taskIds: ["child-1"], mode: "any", timeoutMs: 1000 })
     expect(wait.wait).toHaveBeenCalledWith(expect.objectContaining({ userId: "user-1", targetTaskIds: ["child-1"], idempotencyKey: "wait-1" }))
+  })
+
+  it("forwards the planner-owned native command bridge into registered root spawn tools", async () => {
+    const appendNativeCoordination = vi.fn(async (_input: Parameters<NonNullable<TaskGraphCommandPort["appendNativeCoordination"]>>[0]) => ({
+      status: "accepted" as const, replay: false, operationId: "operation-1", requestFingerprint: "a".repeat(64),
+      graphRevision: 1, nodeKey: "node-1", dispatchDisposition: "pending" as const,
+      child: { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/child-1", depth: 1, role: "scout", taskType: "inspect", status: "queued" as const },
+    }))
+    const commandPort = { appendAndSchedule: vi.fn(), appendNativeCoordination, readCurrent: vi.fn() } as unknown as TaskGraphCommandPort
+    const root = { id: "root-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: null, path: "/root-1", depth: 0, role: "orchestrator", taskType: "root", status: "running", goal: "Goal", attemptCount: 1, maxAttempts: 1, leaseOwner: "worker-1", leaseExpiresAt: null, interruptRequestedAt: null }
+    const store = { getTask: vi.fn(async () => root), appendActivity: vi.fn(async () => undefined) } as unknown as CoordinationStore
+    const runtime = createWorkerToolRuntime(
+      {} as never, { sink: new InMemoryToolLifecycleSink(), resolveOwner: () => owner }, undefined,
+      { manager: {} as never, store, nativeCoordination: { enabled: true, commandPort, turnLeaseOwner: "worker-1", turnLeaseVersion: 1, parentLeaseOwner: "worker-1", parentAttemptCount: () => 1 } },
+    )
+    const definition = runtime.registry.resolve("agent.spawn", "1")
+    const output = await definition.execute({
+      scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "step-1", toolCallId: "call-1",
+      taskId: "root-1", rootTaskId: "root-1", actorRole: "orchestrator", signal: new AbortController().signal,
+      capabilities: ["canManageChildren"], reportProgress: async () => undefined,
+    }, { role: "scout", taskType: "inspect", goal: "Find evidence" })
+
+    expect(appendNativeCoordination).toHaveBeenCalledOnce()
+    expect(appendNativeCoordination.mock.calls[0]?.[0]).toMatchObject({ request: { kind: "spawn", idempotencyKey: expect.stringMatching(/^native:/) } })
+    expect(output).toMatchObject({ taskId: "child-1", nativeCoordination: { operationId: "operation-1" } })
   })
 
 })

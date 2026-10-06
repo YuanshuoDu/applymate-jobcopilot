@@ -1,5 +1,6 @@
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import { redactSensitiveValue } from "@jobcopilot/shared"
+import { projectNativeVerificationResult } from "./native-verification-feedback-projection.js"
 
 const WAIT_ID = /^wait-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const TASK_ID = /^subagent-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
@@ -36,7 +37,14 @@ export function redactDurableWaitOutput(value: unknown): RepositoryJsonValue {
         || (task.failureReason !== null && typeof task.failureReason !== "string")) throw invalidReceipt()
     })
 
-    const redacted = redactSensitiveValue(copied)
+    const projected = {
+      ...receipt,
+      tasks: taskRows.map(value => {
+        const task = value as Record<string, RepositoryJsonValue>
+        return { ...task, result: projectNativeVerificationResult(task.result) }
+      }),
+    }
+    const redacted = redactSensitiveValue(projected)
     const safe = asRecord(redacted)
     const safeRows = readArray(safe.tasks, 1, MAX_WAIT_TARGETS).map((row, index) => {
       const safeTask = asRecord(row)

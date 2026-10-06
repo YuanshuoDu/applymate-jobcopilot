@@ -38,9 +38,9 @@ describe("assertCompletionAllowed", () => {
     const writer = gateWriter()
     const signal = new AbortController().signal
 
-    await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, signal, () => nowValue)).resolves.toBeUndefined()
+    await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, signal, () => nowValue, "candidate")).resolves.toBeUndefined()
 
-    expect(completionGate).toHaveBeenCalledWith({ identity, scope: { userId: identity.userId }, rootTaskId: identity.rootTaskId, stepId: step.id, signal, now: nowValue })
+    expect(completionGate).toHaveBeenCalledWith({ identity, scope: { userId: identity.userId }, rootTaskId: identity.rootTaskId, stepId: step.id, candidateText: "candidate", signal, now: nowValue })
     expect(writer.append).not.toHaveBeenCalled()
   })
 
@@ -48,7 +48,7 @@ describe("assertCompletionAllowed", () => {
     const completionGate = vi.fn(async () => ({ ok: false as const, blocker: "child_tasks_pending", feedback: "Child work is still running" }))
     const writer = gateWriter()
 
-    await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, new AbortController().signal, () => nowValue))
+    await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, new AbortController().signal, () => nowValue, "candidate"))
       .rejects.toMatchObject({ code: "business_precondition_failed", message: "child_tasks_pending" })
 
     expect(writer.append).toHaveBeenCalledWith(
@@ -62,7 +62,7 @@ describe("assertCompletionAllowed", () => {
     const completionGate = vi.fn(async () => ({ ok: "yes" } as unknown as Awaited<ReturnType<NonNullable<TurnExecutionOptions["completionGate"]>>>))
     const writer = gateWriter()
 
-    await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, new AbortController().signal, () => nowValue))
+    await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, new AbortController().signal, () => nowValue, "candidate"))
       .rejects.toMatchObject({ code: "invalid_output", message: "Completion gate returned an invalid decision" })
     expect(writer.append).not.toHaveBeenCalled()
   })
@@ -71,7 +71,7 @@ describe("assertCompletionAllowed", () => {
     const completionGate = vi.fn(async () => { throw new Error("store unavailable") })
     const writer = gateWriter()
 
-    await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, new AbortController().signal, () => nowValue))
+    await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, new AbortController().signal, () => nowValue, "candidate"))
       .rejects.toMatchObject({ name: "TurnEngineError", code: "invalid_output", message: "Completion gate failed closed" })
     expect(writer.append).not.toHaveBeenCalled()
   })
@@ -110,6 +110,21 @@ function graphClient(nodes: unknown[], tasks: Array<Record<string, unknown>>) {
 }
 
 describe("TaskGraph terminal verification gate", () => {
+  it("denies terminal completion when a native command receipt remains but the owned graph row is missing", async () => {
+    const queries: string[] = []
+    const client = { query: vi.fn(async (sql: string) => {
+      queries.push(sql)
+      if (sql.includes('FROM "agent_items" AS item')) return { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "agent_events" AS event')) return { rows: [{ id: "native-command-event" }], rowCount: 1 }
+      throw new Error(`Unexpected graph query: ${sql}`)
+    }) } as never
+
+    await expect(checkTaskGraphTerminalVerification(client, graphLease, "root-1"))
+      .resolves.toMatchObject({ ok: false, blocker: "task_graph_verification_unverified" })
+
+    expect(queries[1]).toContain("IN ('proposal', 'native_command')")
+  })
+
   it("fails closed for legacy-unverified and missing durable reports", async () => {
     const legacy = node("legacy", "task-legacy") as Record<string, unknown>
     delete legacy.verification; legacy.verificationDisposition = "legacy_unverified"

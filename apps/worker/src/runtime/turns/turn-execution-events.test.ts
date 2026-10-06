@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest"
+import { Type } from "@sinclair/typebox"
 
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
@@ -9,6 +10,11 @@ import { restoreToolCallState } from "./persisted-tool-call-state.js"
 import { findToolObservation, stableJson } from "./turn-engine-replay.js"
 import { executeTools } from "./turn-execution-tools.js"
 import { SessionPauseRequestedError } from "../session-gate.js"
+import { createToolRouterExecutor } from "./turn-engine-helpers.js"
+import { InMemoryToolLifecycleSink, ToolLifecycle } from "../tools/lifecycle.js"
+import { ToolRegistry } from "../tools/registry.js"
+import { InMemoryToolResultReferenceStore } from "../tools/redaction.js"
+import { ToolRouter } from "../tools/router.js"
 
 function identity(kind: TurnExecutionIdentity["kind"], taskId: string): TurnExecutionIdentity {
   const common = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId, rootTaskId: "root-1", ownerId: "worker-1", leaseExpiresAt: new Date("2026-09-08T03:00:00.000Z") }
@@ -78,6 +84,31 @@ describe("TurnExecutionEventWriter", () => {
       id: "call-1", name: "agent.spawn", arguments: { idempotencyKey: "spawn-1" },
     }, () => new Date())).rejects.toBe(pause)
 
+    expect(events.map(event => event.type)).toContain("tool_call.started")
+    expect(events.map(event => event.type)).toContain("tool_call.failed")
+  })
+
+  it("settles Router lifecycle and canonical events before yielding a typed pause", async () => {
+    const events: Array<{ id: string; type: string; itemId: string | null; identity: TurnExecutionIdentity }> = []
+    const pause = new SessionPauseRequestedError()
+    const lifecycleSink = new InMemoryToolLifecycleSink()
+    const registry = new ToolRegistry([{
+      schemaVersion: "agent-harness.v2", name: "test.pause", version: "1", description: "pause boundary fixture",
+      capabilities: ["read"], domain: "jobs", inputSchema: Type.Object({ query: Type.String() }, { additionalProperties: false }),
+      outputSchema: Type.Object({ result: Type.String() }, { additionalProperties: false }), risk: "read", idempotency: "read_only", timeoutMs: 100,
+      requiredCapabilities: [], execute: async () => { throw pause },
+    }])
+    const router = new ToolRouter(registry, new ToolLifecycle({ sink: lifecycleSink, references: new InMemoryToolResultReferenceStore() }))
+    const executionOptions: TurnExecutionOptions = {
+      ...options(identity("turn", "root-1"), events), capabilities: ["read"], executeTool: createToolRouterExecutor(router),
+    }
+    const writer = new TurnExecutionEventWriter(executionOptions)
+
+    await expect(executeToolWithItems(executionOptions, writer, { id: "step-1", ordinal: 0 }, {
+      id: "pause-call", name: "test.pause", arguments: { query: "fenced" },
+    }, () => new Date())).rejects.toBe(pause)
+
+    expect(lifecycleSink.events.map(event => event.phase)).toEqual(["started", "failed"])
     expect(events.map(event => event.type)).toContain("tool_call.started")
     expect(events.map(event => event.type)).toContain("tool_call.failed")
   })
