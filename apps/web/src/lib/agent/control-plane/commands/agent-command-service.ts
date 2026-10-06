@@ -36,7 +36,7 @@ function activeTurnHasIntent(input: unknown, expected: NonNullable<StartCommand[
     (intent as Record<string, unknown>).version === expected.version)
 }
 
-async function duplicateCommandResult(
+export async function duplicateCommandResult(
   tx: CommandTransaction,
   command: { sessionId: string; clientMessageId: string },
   existing: { id: string; targetTurnId: string | null; delivery: string; acceptedSequence: bigint },

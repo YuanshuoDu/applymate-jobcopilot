@@ -1,4 +1,5 @@
 export { AgentCommandService } from "./agent-command-service"
+export { ObjectiveStartCommandService } from "./objective-start"
 export { AgentForkService } from "./agent-fork-service"
 export { AgentSessionControlService } from "./session-control"
 export type { AgentSessionControlInput, AgentSessionControlResult } from "./session-control"
@@ -14,6 +15,8 @@ export type {
   ForkCommand,
   ForkResult,
   MessageCommand,
+  ObjectiveStartCommand,
+  ObjectiveStartResult,
   ReplaceObjectiveCommand,
   RetryCommand,
   StartCommand,
