@@ -13,6 +13,7 @@ import { writerArtifactReferenceFromTaskContext } from "./task-graph-dependency-
 import { createObservedEvidenceIndex, hydrateObservedEvidence, parseAndBindStructuredResult, recordReadToolOutput } from "./child-evidence.js"
 import { createChildPrivateArtifactDispatcher, createPrivateArtifactSafeStore, selectedJobId, type PrivateArtifactToolContext } from "./child-private-artifact.js"
 import { createSelectedJobReadRouter, hasSelectedJobReadContext, isSelectedJobReadTool, redactSelectedEvidenceResult, selectedJobToolAllowed, withSelectedJobInputRedaction } from "./selected-job-artifact-context.js"
+import { dispatchNativeVerificationTask } from "./native-verification-executor.js"
 import type { AgentArtifactTaskFence } from "../../db/agent-artifact-repo.js"
 import type { ChildResumeLoader } from "./child-resume.js"
 import { SubagentLeaseError, type SubagentExecutionResult, type SubagentLease, type SubagentTaskRecord } from "./types.js"
@@ -144,8 +145,8 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
   return async ({ lease }) => {
     if (!lease.turnId) return { status: "failed", failureReason: "child_turn_missing" }
     const owner = executionOwnerFence({ kind: "task", lease })
-    const selectedJob = selectedJobId(lease)
-    const selectedEvidenceTask = Boolean(selectedJob && (lease.role === "scout" || lease.role === "analyst"))
+    const verifier = await dispatchNativeVerificationTask({ lease, owner, store: options.store, treeBudget: options.treeBudget, authorizeUsage: options.authorizeUsage, resolveModel: () => options.modelRuntimeFactory?.({ task: lease }) ?? defaultModel(lease), now: options.now }); if (verifier) return verifier
+    const selectedJob = selectedJobId(lease), selectedEvidenceTask = Boolean(selectedJob && (lease.role === "scout" || lease.role === "analyst"))
     let reviewerArtifactRef: ArtifactVersionReference | undefined
     if ((lease.role === "writer" || lease.role === "reviewer") && !selectedJob) {
       return { status: "failed", failureReason: "selected_job_context_unavailable", retryDisposition: "terminal" }
@@ -160,9 +161,8 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
     const definitions = visibleDefinitions(lease, runtime.definitions, selectedJob)
     const policy = getSubagentRolePolicy(lease.role)
     if (!policy) return { status: "failed", failureReason: "subagent_role_unknown" }
+    let snapshot = childContextSnapshot(lease, runtime.serverContext), resume: TurnResumeState | undefined
     const observedEvidence = createObservedEvidenceIndex()
-    let snapshot = childContextSnapshot(lease, runtime.serverContext)
-    let resume: TurnResumeState | undefined
     if (options.resumeLoader && lease.attemptCount > 1) {
       try {
         const restored = await options.resumeLoader(lease)
