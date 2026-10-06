@@ -12,6 +12,7 @@ import type { RuntimeToolDefinition } from "../runtime/tools/types.js"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 import { lockAndAdmitSubagentDispatch, PAUSE_DEFERRED_MARKER, repairDeferredSubagentDispatches } from "./subagent-pause-dispatch.js"
 import { repairStaleSubagentDispatches } from "./subagent-dispatch-recovery.js"
+import { reconcileDurableWaits } from "../runtime/subagents/durable-wait-resolver.js"
 
 const RUN_REDIS_INTEGRATION = process.env.RUN_AGENT_TURN_REDIS_INTEGRATION === "1"
 
@@ -224,7 +225,7 @@ function createSqlFixture(input: { tasks: Map<string, SubagentTaskRecord>; rootT
 
       if (sql.includes('SELECT turn."id", turn."userId", turn."sessionId", turn."rootTaskId"')) {
         return ["waiting_for_dependency", "in_progress"].includes(turn.status)
-          ? { rows: [{ ...turn }], rowCount: 1 }
+          ? { rows: [{ ...turn, sessionStatus: session.status }], rowCount: 1 }
           : none
       }
       if (sql.includes('FROM "agent_wait_conditions"') && sql.includes('ORDER BY "createdAt"')) {
@@ -356,6 +357,27 @@ function createSqlFixture(input: { tasks: Map<string, SubagentTaskRecord>; rootT
 }
 
 describe("child queue SQL fixture", () => {
+  it("resolves a completed child into the durable parent wake and dispatch", async () => {
+    const ids = { sessionId: "wait-session", turnId: "wait-turn", userId: "wait-user" }
+    const { store, tasks } = createTaskStore()
+    const root = await store.create({ ...ids, role: "planner", taskType: "root", goal: "fixture root", policy: { maxConcurrency: 1, maxDepth: 1, maxFanOut: 1, maxAttempts: 1 } })
+    root.status = "running"
+    const child = await store.create({ ...ids, parentTaskId: root.id, role: "analyst", taskType: "research", goal: "fixture child", policy: { maxConcurrency: 1, maxDepth: 1, maxFanOut: 1, maxAttempts: 1 } })
+    child.status = "completed"
+    const fixture = createSqlFixture({ tasks, rootTaskId: root.id, childTaskId: child.id, ...ids })
+
+    await expect(reconcileDurableWaits(fixture.pool as never, { ownerId: "fixture-wait-resolver" })).resolves.toEqual({ scanned: 1, resolved: 1, woken: 1 })
+    expect(fixture.wait).toMatchObject({ status: "ready", matchedTaskIds: [child.id] })
+    expect(fixture.turn).toMatchObject({ status: "queued", leaseOwnerId: null })
+    expect(fixture.events).toHaveLength(1)
+    expect(fixture.outbox.filter(row => row.topic === "agent.turn.dispatch")).toHaveLength(1)
+    expect(fixture.outbox.find(row => row.topic === "agent.turn.dispatch")).toMatchObject({
+      aggregateId: ids.sessionId,
+      idempotencyKey: `turn-dispatch:${ids.turnId}`,
+      payload: { turnId: ids.turnId, sessionId: ids.sessionId, ownerId: "fixture-wait-resolver" },
+    })
+  })
+
   it("returns no session from stale-dispatch recovery when no expired stale dispatch exists", async () => {
     const ids = { sessionId: "fixture-session", turnId: "fixture-turn", userId: "fixture-user" }
     const { store, tasks } = createTaskStore()
