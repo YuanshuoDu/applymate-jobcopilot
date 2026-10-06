@@ -85,6 +85,10 @@ describeWithPostgres("Turn dispatch and claim lock order on disposable PostgreSQ
         "startedAt" timestamptz, "createdAt" timestamptz NOT NULL DEFAULT now(),
         "updatedAt" timestamptz NOT NULL DEFAULT now()
       )`)
+      await client.query(`CREATE TABLE "agent_events" (
+        "id" text PRIMARY KEY, "sessionId" text NOT NULL, "turnId" text NOT NULL,
+        "sequence" bigint NOT NULL, "type" text NOT NULL
+      )`)
       await client.query(`CREATE TABLE "agent_outbox" (
         "id" text PRIMARY KEY, "topic" text NOT NULL, "aggregateId" text NOT NULL,
         "idempotencyKey" text NOT NULL UNIQUE, "payload" jsonb NOT NULL,
