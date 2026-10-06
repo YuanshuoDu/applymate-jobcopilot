@@ -12,6 +12,7 @@ import type { TurnExecutionIdentity, TurnExecutionOptions, TurnExecutionStore } 
 import { steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "../context/steering-marker.js"
 import { COGNITIVE_AGENDA_EVENT_TYPE } from "./cognitive-agenda-receipt.js"
 import { BudgetExceededError } from "../budget.js"
+import { SessionPauseRequestedError } from "../session-gate.js"
 import { ToolExecutionError, type ToolExecutionContext } from "../tools/types.js"
 import { createTaskGraphPlanningTool } from "../tools/planning-executors.js"
 import type { TaskGraphCommandPort, TaskGraphCurrentState, TaskGraphScheduleReceipt } from "../subagents/task-graph-command-port.js"
@@ -164,6 +165,40 @@ function addSteeringInput(root: Fixture, alreadyConsumed = false): void {
 }
 
 describe("owner-agnostic turn execution loop", () => {
+  it("rethrows a pause rejected by startStep without terminalizing or invoking the model", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const pause = new SessionPauseRequestedError()
+    const store = root.options.store
+    root.options = { ...root.options, store: { ...store, startStep: async () => { throw pause } } }
+
+    await expect(runTurnExecutionLoop(root.options)).rejects.toBe(pause)
+
+    expect(root.requests).toHaveLength(0)
+    expect(root.events.some(event => event.type === "turn.failed")).toBe(false)
+  })
+
+  it("preserves the same Turn when a durable pause fence rejects step admission", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const pause = new SessionPauseRequestedError()
+    const store = root.options.store
+    root.options = {
+      ...root.options,
+      store: {
+        ...store,
+        appendEvent: async input => {
+          if (input.type === "step.started") throw pause
+          return store.appendEvent(input)
+        },
+      },
+    }
+
+    await expect(runTurnExecutionLoop(root.options)).rejects.toBe(pause)
+
+    expect(root.requests).toHaveLength(0)
+    expect(root.stepStatuses).toEqual(["interrupted"])
+    expect(root.events.some(event => event.type === "turn.failed")).toBe(false)
+  })
+
   it("finishes the Turn once after atomic terminal commit without a same-Turn follow-up step", async () => {
     const root = fixture(identity("turn", "root-1"))
 

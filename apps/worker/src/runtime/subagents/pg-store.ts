@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto"
 import type pg from "pg"
-import { isTerminalSubagentStatus, type AtomicSubagentSpawnInput, type AtomicSubagentSpawnResult, type PgSubagentPool,
+import { isTerminalSubagentStatus, PAUSE_DEFERRED_MARKER, type AtomicSubagentSpawnInput, type AtomicSubagentSpawnResult, type PgSubagentPool,
   type SubagentExecutionResult, type SubagentRetryDisposition, type SubagentStore, type SubagentTaskRecord, type SubagentTaskSpec, type SubagentPolicy } from "./types.js"
 import { computeSubagentNextAttemptAt } from "./retry-policy.js"
 import { persistGraphTransition, prepareGraphTransition, reconcileGraphDependents } from "./task-graph-pg-lifecycle.js"
-import { RUNNABLE_SESSION } from "../session-gate.js"
-import { createSubagentTask, lockSubagentSession, readSubagentTask } from "./pg-store-create.js"
+import { assertSessionWorkAdmission, RUNNABLE_SESSION } from "../session-gate.js"
+import { createSubagentTask, lockSubagentSession, lockSubagentTurn, readSubagentTask } from "./pg-store-create.js"
+import { claimSubagentTask } from "./pg-store-claim.js"
 import { dateValue, json, rowToTask, SELECT_TASK, spawnKey, transaction, uniqueMessageIds } from "./pg-store-persistence.js"
 import { interruptSubtree as interruptStoreSubtree, interruptTree as interruptStoreTree, interruptTurn as interruptStoreTurn, prepareTaskGraphFinish, recoverExpired as recoverStoreExpired } from "./pg-store-lifecycle.js"
 export class PgSubagentTaskStore implements SubagentStore {
@@ -26,6 +27,7 @@ export class PgSubagentTaskStore implements SubagentStore {
       return await transaction(this.pool, async client => {
         await client.query(`SELECT set_config('app.user_id', $1, true)`, [input.userId])
         await lockSubagentSession(client, input)
+        if (input.turnId) await lockSubagentTurn(client, { sessionId: input.sessionId, userId: input.userId, turnId: input.turnId })
         const key = spawnKey(input.sessionId, input.spawnIdempotencyKey)
         const existing = await client.query(`SELECT "payload" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.spawn' AND "aggregateId" = $1 AND "idempotencyKey" = $2 FOR UPDATE`, [input.sessionId, key])
         if (existing.rows[0]) {
@@ -34,6 +36,8 @@ export class PgSubagentTaskStore implements SubagentStore {
           if (!taskId) throw new Error("Spawn idempotency record is invalid")
           return { task: await readSubagentTask(client, taskId, input.sessionId), duplicate: true }
         }
+        if (input.turnId) await assertSessionWorkAdmission(client, { userId: input.userId, sessionId: input.sessionId, turnId: input.turnId })
+        else if (input.parentTaskId) throw new Error("Subagent child requires an owning Turn")
         const task = await createSubagentTask(client, input, true)
         const operation = await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload") VALUES ($1, 'agent.subagent.spawn', $2, $3, $4::jsonb) ON CONFLICT ("idempotencyKey") DO NOTHING`,
           [`spawn-operation-${randomUUID()}`, input.sessionId, key, JSON.stringify({ taskId: task.id })])
@@ -48,32 +52,7 @@ export class PgSubagentTaskStore implements SubagentStore {
     }
   }
   async claim(input: { taskId: string; sessionId: string; ownerId: string; policy: SubagentPolicy; now: Date }): Promise<SubagentTaskRecord | null> {
-    return transaction(this.pool, async (client) => {
-      const session = await client.query<{ id: string; userId: string; status: string }>(`SELECT session."id", session."userId", session."status" FROM "agent_sessions" AS session WHERE session."id" = $1 AND ${RUNNABLE_SESSION} FOR UPDATE`, [input.sessionId])
-      const sessionRow = session.rows[0]
-      const sessionStatus = String(sessionRow?.status ?? "")
-      if (!sessionRow || sessionStatus === "aborted" || sessionStatus === "archived") return null
-      await client.query(`SELECT set_config('app.user_id', $1, true)`, [sessionRow.userId])
-      const running = await client.query(`SELECT COUNT(*)::int AS "count" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "status" = 'running' AND "leaseExpiresAt" > clock_timestamp()`, [input.sessionId])
-      if (Number(running.rows[0]?.count ?? 0) >= input.policy.maxConcurrency) return null
-      const graph = await prepareGraphTransition(client, { taskId: input.taskId, sessionId: input.sessionId, type: "task.started" })
-      if (graph && "blocked" in graph) return null
-      const updated = await client.query(`UPDATE "sub_agent_tasks"
-        SET "status" = 'running', "leaseOwner" = $3, "leaseExpiresAt" = clock_timestamp() + ($4 * INTERVAL '1 millisecond'), "attemptCount" = "attemptCount" + 1, "startedAt" = COALESCE("startedAt", clock_timestamp()), "updatedAt" = clock_timestamp()
-        WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'queued' AND "interruptRequestedAt" IS NULL
-          AND "attemptCount" < "maxAttempts" AND ("leaseOwner" IS NULL OR "leaseExpiresAt" <= clock_timestamp())
-          AND ("nextAttemptAt" IS NULL OR "nextAttemptAt" <= clock_timestamp())
-          AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "sub_agent_tasks"."sessionId" AND ${RUNNABLE_SESSION})
-          AND EXISTS (SELECT 1 FROM "sub_agent_tasks" AS root JOIN "agent_turns" AS turn ON turn."id" = root."turnId"
-            WHERE root."id" = "sub_agent_tasks"."rootTaskId" AND root."sessionId" = "sub_agent_tasks"."sessionId"
-              AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
-              AND turn."id" = "sub_agent_tasks"."turnId" AND turn."sessionId" = "sub_agent_tasks"."sessionId"
-              AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled'))`,
-      [input.taskId, input.sessionId, input.ownerId, this.leaseMs])
-      if (updated.rowCount !== 1) return null
-      if (graph) await persistGraphTransition(client, graph, input.now)
-      return readSubagentTask(client, input.taskId, input.sessionId)
-    })
+    return claimSubagentTask(this.pool, input, this.leaseMs)
   }
   async heartbeat(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; now: Date }): Promise<"renewed" | "interrupted" | "lost"> {
     return transaction(this.pool, async (client) => {
@@ -169,9 +148,11 @@ export class PgSubagentTaskStore implements SubagentStore {
         if (interrupted) await client.query(`DELETE FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch' AND "aggregateId" = $1 AND "idempotencyKey" = $2 AND "publishedAt" IS NULL`,
           [input.sessionId, `subagent-dispatch:${input.taskId}`])
         if (retry) {
-          await client.query(`UPDATE "agent_outbox" SET "publishedAt" = NULL, "attemptCount" = "attemptCount" + 1, "lastError" = NULL
+          await client.query(`UPDATE "agent_outbox" SET "publishedAt" = NULL, "attemptCount" = "attemptCount" + 1,
+            "payload" = CASE WHEN "lastError" = $3 THEN jsonb_set("payload", '{ownerId}', to_jsonb($4::text), true) ELSE "payload" END,
+            "lastError" = CASE WHEN "lastError" = $3 THEN "lastError" ELSE NULL END
             WHERE "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $1 AND "aggregateId" = $2`,
-          [`subagent-dispatch:${input.taskId}`, input.sessionId])
+          [`subagent-dispatch:${input.taskId}`, input.sessionId, PAUSE_DEFERRED_MARKER, `retry-${randomUUID()}`])
         }
         if (status === "completed" && mailboxMessageIds.length > 0) {
           await client.query(`UPDATE "agent_mailbox_messages" AS message
@@ -211,9 +192,11 @@ export class PgSubagentTaskStore implements SubagentStore {
       [input.taskId, input.sessionId, input.ownerId, input.attemptCount, releasedAt])
       if (updated.rowCount !== 1) return false
       if (graph) await persistGraphTransition(client, graph, releasedAt)
-      await client.query(`UPDATE "agent_outbox" SET "publishedAt" = NULL, "attemptCount" = "attemptCount" + 1, "lastError" = NULL
+      await client.query(`UPDATE "agent_outbox" SET "publishedAt" = NULL, "attemptCount" = "attemptCount" + 1,
+        "payload" = CASE WHEN "lastError" = $3 THEN jsonb_set("payload", '{ownerId}', to_jsonb($4::text), true) ELSE "payload" END,
+        "lastError" = CASE WHEN "lastError" = $3 THEN "lastError" ELSE NULL END
         WHERE "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $1 AND "aggregateId" = $2`,
-      [`subagent-dispatch:${input.taskId}`, input.sessionId])
+      [`subagent-dispatch:${input.taskId}`, input.sessionId, PAUSE_DEFERRED_MARKER, `release-${randomUUID()}`])
       return true
     })
   }

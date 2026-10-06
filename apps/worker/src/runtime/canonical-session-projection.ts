@@ -75,7 +75,13 @@ const CURRENT_AUTOMATION_TURN = `EXISTS (
     )
 )`
 
-const PROJECTABLE_SESSION_STATUSES = "'queued', 'running', 'paused', 'waiting_for_dependency', 'waiting_for_approval', 'waiting_for_user'"
+const PAUSE_FREE_PROJECTION = `session."status" IN ('queued', 'running') AND NOT EXISTS (
+  SELECT 1 FROM "agent_events" AS pause_request WHERE pause_request."sessionId" = session."id" AND pause_request."turnId" = $3
+    AND pause_request."type" = 'session.pause_requested' AND pause_request."actor" = 'user'
+    AND NOT EXISTS (SELECT 1 FROM "agent_events" AS resumed WHERE resumed."sessionId" = pause_request."sessionId"
+      AND resumed."turnId" = pause_request."turnId" AND resumed."type" = 'session.resume_requested' AND resumed."actor" = 'user'
+      AND resumed."sequence" > pause_request."sequence")
+)`
 
 async function startSession(client: ProjectionClient, input: CanonicalSessionIdentity): Promise<void> {
   await lockOpenSession(client, input)
@@ -83,7 +89,7 @@ async function startSession(client: ProjectionClient, input: CanonicalSessionIde
     `UPDATE "agent_sessions" AS session
      SET "status" = 'running', "completedAt" = NULL, "updatedAt" = CURRENT_TIMESTAMP
      WHERE session."id" = $2 AND session."userId" = $1
-       AND session."status" NOT IN ('aborted', 'archived')
+       AND ${PAUSE_FREE_PROJECTION}
        AND ${AUTOMATION_SESSION}
        AND ${CURRENT_AUTOMATION_TURN}`,
     [input.userId, input.sessionId, input.turnId],
@@ -118,7 +124,7 @@ async function finishSession(
          "completedAt" = CASE WHEN $4 IN ('completed', 'failed') THEN CURRENT_TIMESTAMP ELSE NULL END,
          "updatedAt" = CURRENT_TIMESTAMP
      WHERE session."id" = $2 AND session."userId" = $1
-       AND session."status" IN (${PROJECTABLE_SESSION_STATUSES})
+       AND ${PAUSE_FREE_PROJECTION}
        AND ${AUTOMATION_SESSION}
        AND ${CURRENT_AUTOMATION_TURN}`,
     [input.userId, input.sessionId, input.turnId, status, memorySummary],

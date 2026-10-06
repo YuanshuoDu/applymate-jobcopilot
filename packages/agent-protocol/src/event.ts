@@ -5,6 +5,11 @@ export const AgentEventTypeSchema = Type.Union([
   Type.Literal('turn.started'),
   Type.Literal('turn.wakeup'),
   Type.Literal('turn.resumed'),
+  Type.Literal('session.pause_requested'),
+  Type.Literal('session.resume_requested'),
+  Type.Literal('session.resumed'),
+  Type.Literal('session.paused'),
+  Type.Literal('session.pause_blocked'),
   Type.Literal('turn.completed'),
   Type.Literal('turn.failed'),
   Type.Literal('step.started'),
@@ -62,7 +67,15 @@ export const KnownAgentEventEnvelopeSchema = Type.Object({
   createdAt: TimestampSchema,
 }, { $id: 'agent.event.known', additionalProperties: false })
 
+/** Bounded server-authored payload for session pause/resume request events. */
+export const SessionControlEventPayloadSchema = Type.Object({
+  turnId: IdSchema,
+  expectedRevision: Type.Integer({ minimum: 0, maximum: 2_147_483_647 }),
+  requestedAt: TimestampSchema,
+}, { $id: 'agent.session.control.event-payload', additionalProperties: false })
+
 export type AgentEventType = Static<typeof AgentEventTypeSchema>
+export type SessionControlEventPayload = Static<typeof SessionControlEventPayloadSchema>
 type AgentEventEnvelopeBase = Static<typeof AgentEventEnvelopeSchema>
 type KnownAgentEventEnvelopeBase = Static<typeof KnownAgentEventEnvelopeSchema>
 export type AgentEventEnvelope<TPayload = unknown> = Omit<AgentEventEnvelopeBase, 'payload'> & { payload: TPayload }

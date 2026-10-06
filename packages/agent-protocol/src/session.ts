@@ -4,6 +4,8 @@ import { IdSchema, NonEmptyTextSchema, NullableIdSchema, SchemaVersionSchema, Ti
 export const SessionStatusSchema = Type.Union([
   Type.Literal('idle'),
   Type.Literal('running'),
+  Type.Literal('pausing'),
+  Type.Literal('resuming'),
   Type.Literal('waiting_for_user'),
   Type.Literal('paused'),
   Type.Literal('completed'),

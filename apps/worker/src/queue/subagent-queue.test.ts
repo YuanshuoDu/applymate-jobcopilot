@@ -9,9 +9,9 @@ import type { SubagentJobPayload } from "../runtime/subagents/types.js"
 
 const payload: SubagentJobPayload = { taskId: "task-1", sessionId: "session-1", rootTaskId: "root-1", ownerId: "worker-1" }
 
-type DispatchOptions = { sessionStatus?: string | null; aggregateId?: string; payload?: unknown; sessionMissing?: boolean; sessionMissingAfterScan?: boolean; outboxMissingAfterScan?: boolean; attemptCount?: number; task?: DispatchTaskOptions }
+type DispatchOptions = { sessionStatus?: string | null; aggregateId?: string; payload?: unknown; sessionMissing?: boolean; sessionMissingAfterScan?: boolean; outboxMissingAfterScan?: boolean; activePause?: boolean; attemptCount?: number; task?: DispatchTaskOptions }
 
-type DispatchTaskOptions = { exists?: boolean; status?: string; sessionId?: string; rootTaskId?: string; rootId?: string; rootSessionId?: string; rootTurnId?: string; rootStatus?: string | null; turnId?: string; turnRowId?: string; turnSessionId?: string; turnUserId?: string; turnStatus?: string | null; leaseOwner?: string | null; leaseExpiresAt?: Date | null; interruptRequestedAt?: Date | string | null; attemptCount?: number; maxAttempts?: number; nextAttemptAt?: Date | null; retryDue?: boolean }
+type DispatchTaskOptions = { exists?: boolean; status?: string; sessionId?: string; rootTaskId?: string; rootId?: string; rootSessionId?: string; rootTurnId?: string; rootStatus?: string | null; turnId?: string | null; turnRowId?: string; turnSessionId?: string; turnUserId?: string; turnStatus?: string | null; leaseOwner?: string | null; leaseExpiresAt?: Date | null; interruptRequestedAt?: Date | string | null; attemptCount?: number; maxAttempts?: number; nextAttemptAt?: Date | null; retryDue?: boolean }
 
 function dispatchTaskRow(options: DispatchTaskOptions = {}): Record<string, unknown> {
   return {
@@ -37,6 +37,18 @@ function fakePool(markError?: Error, options: DispatchOptions = {}) {
         scanCompleted = true
         return { rows: [outbox], rowCount: 1 }
       }
+      if (sql.includes("pause_request")) {
+        const status = options.sessionStatus === undefined ? "running" : options.sessionStatus
+        return options.activePause || status !== "running" ? { rows: [], rowCount: 0 } : { rows: [{ id: outbox.aggregateId }], rowCount: 1 }
+      }
+      if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")) {
+        const task = options.task
+        const turnId = task?.turnId ?? "turn-1"
+        const turnStatus = task && Object.hasOwn(task, "turnStatus") ? task.turnStatus : "in_progress"
+        const valid = task?.turnSessionId !== "other-session" && task?.turnUserId !== "other-user"
+          && turnStatus !== null && !["completed", "failed", "interrupted", "cancelled"].includes(String(turnStatus))
+        return valid ? { rows: [{ id: turnId }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      }
       if (sql.includes('SELECT session."id"') && sql.includes('FROM "agent_sessions" AS session')) {
         const status = options.sessionStatus === undefined ? "running" : options.sessionStatus
         const resetQuery = sql.includes('session."status" NOT IN')
@@ -44,15 +56,33 @@ function fakePool(markError?: Error, options: DispatchOptions = {}) {
         const unavailable = status === "aborted" || status === "archived"
         return missing || (resetQuery && unavailable) ? { rows: [], rowCount: 0 } : { rows: [{ id: outbox.aggregateId, status, userId: "user-1" }], rowCount: 1 }
       }
+      if (sql.includes('SELECT "id", "turnId" FROM "sub_agent_tasks"')) {
+        if (options.task?.exists === false) return { rows: [], rowCount: 0 }
+        const turnId = options.task && Object.hasOwn(options.task, "turnId") ? options.task.turnId : "turn-1"
+        return { rows: [{ id: "task-1", turnId }], rowCount: 1 }
+      }
       if (sql.includes('SELECT dispatch."id"') && sql.includes('FROM "agent_outbox" AS dispatch')) {
         return options.outboxMissingAfterScan ? { rows: [], rowCount: 0 } : { rows: [outbox], rowCount: 1 }
       }
       if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes('WHERE task."id"')) {
         return options.task?.exists === false ? { rows: [], rowCount: 0 } : { rows: [dispatchTaskRow(options.task)], rowCount: 1 }
       }
-      if (markError && sql.includes('SET "publishedAt" = CURRENT_TIMESTAMP')) throw markError
       if (sql.includes('"lastError" = $2') && sql.includes('"publishedAt" = CURRENT_TIMESTAMP')) {
-        outbox.lastError = String(params?.[1]); outbox.publishedAt = new Date()
+        outbox.lastError = String(params?.[1])
+        outbox.publishedAt = new Date()
+        return { rows: [], rowCount: 1 }
+      }
+      if (markError && sql.includes('SET "publishedAt" = CURRENT_TIMESTAMP')) throw markError
+      if (sql.includes('"publishedAt" = CURRENT_TIMESTAMP') && sql.includes('CASE WHEN "lastError" = $4')) {
+        outbox.attemptCount += 1
+        if (outbox.lastError !== "deferred:session_pause_requested") outbox.lastError = null
+        outbox.publishedAt = new Date()
+        return { rows: [], rowCount: 1 }
+      }
+      if (sql.includes("jsonb_set(") && sql.includes('SET "attemptCount" = "attemptCount" + 1')) {
+        outbox.attemptCount += 1
+        if (outbox.lastError === "deferred:session_pause_requested") outbox.payload = { ...payload, ownerId: String(params?.[2]) }
+        else outbox.lastError = String(params?.[1])
         return { rows: [], rowCount: 1 }
       }
       return { rows: [], rowCount: 1 }
@@ -95,6 +125,14 @@ function repairPool(options: RepairOptions = {}) {
         const rows = candidate && eligibleCandidate(candidate) && (options.respectExisting === false || !exists) ? [candidate] : []
         return { rows, rowCount: rows.length }
       }
+      if (sql.includes('SELECT "id", "turnId" FROM "sub_agent_tasks"')) {
+        return candidate ? { rows: [{ id: candidate.id, turnId: "turn-1" }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      }
+      if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")) {
+        const terminalTurn = ["completed", "failed", "interrupted", "cancelled"].includes(candidate?.turnStatus ?? "")
+        return candidate && !terminalTurn ? { rows: [{ id: "turn-1" }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      }
+      if (sql.includes("pause_request")) return { rows: [{ id: "session-1" }], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes('WHERE task."id"')) {
         const rows = candidate && eligibleCandidate(candidate) ? [dispatchTaskRow({ ...candidate, sessionId: candidate.sessionId, rootTaskId: candidate.rootTaskId })] : []
         return { rows, rowCount: rows.length }
@@ -147,6 +185,9 @@ function recoveredDispatchPool() {
       if (sql.includes('dispatch."id" IS NULL') && sql.includes("LIMIT $2 FOR UPDATE SKIP LOCKED")) return { rows: [{ id: "session-1" }], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("FOR UPDATE OF task SKIP LOCKED")) return { rows: [], rowCount: 0 }
       if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("FOR UPDATE OF task")) return { rows: [dispatchTaskRow()], rowCount: 1 }
+      if (sql.includes('SELECT "id", "turnId" FROM "sub_agent_tasks"')) return { rows: [{ id: "task-1", turnId: "turn-1" }], rowCount: 1 }
+      if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "turn-1" }], rowCount: 1 }
+      if (sql.includes("pause_request")) return { rows: [{ id: "session-1" }], rowCount: 1 }
       if (sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes("ORDER BY dispatch.")) {
         return outbox.publishedAt === null ? { rows: [{ id: outbox.id, aggregateId: outbox.aggregateId, payload: outbox.payload, attemptCount: outbox.attemptCount }], rowCount: 1 } : { rows: [], rowCount: 0 }
       }
@@ -253,11 +294,19 @@ describe("Subagent queue", () => {
     expect(queue.add).not.toHaveBeenCalled()
   })
 
-  it.each(["running", "paused", "waiting_for_user"] as const)("queues an open %s session", async sessionStatus => {
-    const fake = fakePool(undefined, { sessionStatus })
+  it("queues an open running session", async () => {
+    const fake = fakePool()
     const queue = { add: vi.fn().mockResolvedValue(undefined) }
     await expect(dispatchPendingSubagentOutbox(fake.pool, queue)).resolves.toBe(1)
     expect(queue.add).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([["paused", false], ["waiting_for_user", false], ["running", true]] as const)("leaves a %s session with pause admission denied unpublished", async (sessionStatus, activePause) => {
+    const fake = fakePool(undefined, { sessionStatus, activePause })
+    const queue = { add: vi.fn() }
+    await expect(dispatchPendingSubagentOutbox(fake.pool, queue)).resolves.toBe(0)
+    expect(queue.add).not.toHaveBeenCalled()
+    expect(fake.outbox).toMatchObject({ publishedAt: null, attemptCount: 0, lastError: null })
   })
 
   it("leaves a future retry unpublished until its durable due time", async () => {
@@ -318,9 +367,9 @@ describe("Subagent queue", () => {
     const fake = fakePool()
     const queue = { add: vi.fn().mockRejectedValue(new Error("redis unavailable")) }
     await expect(dispatchPendingSubagentOutbox(fake.pool, queue)).rejects.toThrow("redis unavailable")
-    const mark = fake.calls.find(([sql]) => sql.includes('SET "attemptCount" = "attemptCount" + 1'))
-    expect(mark?.[0]).toContain('"publishedAt" = CASE WHEN $3 THEN CURRENT_TIMESTAMP ELSE "publishedAt" END')
-    expect(mark?.[1]).toEqual(["outbox-1", "queue_add_failed", false])
+    const mark = fake.calls.find(([sql]) => sql.includes("jsonb_set(") && sql.includes('SET "attemptCount" = "attemptCount" + 1'))
+    expect(mark?.[0]).toContain('"publishedAt" = CASE WHEN $5 THEN CURRENT_TIMESTAMP ELSE "publishedAt" END')
+    expect(mark?.[1]).toMatchObject(["outbox-1", "queue_add_failed", expect.any(String), "deferred:session_pause_requested", false])
   })
 
   it("fails closed when enqueue succeeds but publication bookkeeping is uncertain", async () => {

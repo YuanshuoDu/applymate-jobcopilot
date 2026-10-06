@@ -27,7 +27,7 @@ function fakePool(rows: unknown[] = [row], sessionStatus = "running", sessionUse
         return ["missing", "aborted", "archived"].includes(sessionStatus) ? { rows: [], rowCount: 0 } : { rows: [{ userId: sessionUserId }], rowCount: 1 }
       }
       if (sql.includes('SELECT session."id" FROM "agent_sessions"')) {
-        return ["missing", "aborted", "archived"].includes(sessionStatus) ? { rows: [], rowCount: 0 } : { rows: [{ id: "session_1" }], rowCount: 1 }
+        return sessionStatus === "running" ? { rows: [{ id: "session_1" }], rowCount: 1 } : { rows: [], rowCount: 0 }
       }
       if (sql.includes('UPDATE "agent_turns"') && ["missing", "aborted", "archived"].includes(sessionStatus)) return { rows: [], rowCount: 0 }
       if (sql.includes('UPDATE "agent_turns"') && sessionUserId !== "user_1") return { rows: [], rowCount: 0 }
@@ -71,12 +71,27 @@ describe("database Turn lease", () => {
     expect(fake.calls.some(([sql]) => sql === "ROLLBACK")).toBe(true)
   })
 
-  it.each(["running", "paused", "waiting_for_user"])("claims a Turn when its ordinary session is %s", async (sessionStatus) => {
-    const fake = fakePool([row], sessionStatus)
+  it("claims a Turn when its session is running", async () => {
+    const fake = fakePool([row], "running")
 
     await expect(claimTurnLease(fake.pool, payload, now)).resolves.toMatchObject({ turnId: payload.turnId, sessionId: payload.sessionId, userId: row.userId })
     const sql = fake.calls.find(([text]) => text.includes('UPDATE "agent_turns"'))?.[0] ?? ""
     expect(sql).not.toContain('session."source"')
+  })
+
+  it.each(["queued", "paused", "waiting_for_user", "waiting_for_approval", "waiting_for_dependency", "pausing", "resuming"])("does not claim a Turn while its session is %s", async (sessionStatus) => {
+    const fake = fakePool([row], sessionStatus)
+
+    await expect(claimTurnLease(fake.pool, payload, now)).rejects.toMatchObject({ code: "lease_not_available" })
+    expect(fake.calls.some(([sql]) => sql.includes('UPDATE "agent_turns"'))).toBe(false)
+  })
+
+  it.each(["pausing", "resuming"])("does not claim a Turn while Session control is %s", async sessionStatus => {
+    const fake = fakePool([row], sessionStatus)
+    await expect(claimTurnLease(fake.pool, payload, now)).rejects.toMatchObject({ code: "lease_not_available" })
+    expect(fake.calls.some(([sql]) => sql.includes('UPDATE "agent_turns"'))).toBe(false)
+    const gateIndex = fake.calls.findIndex(([sql]) => sql.includes("pause_request"))
+    expect(fake.calls.findIndex(([sql]) => sql.includes('SELECT session."userId"'))).toBeLessThan(gateIndex)
   })
 
   it("keeps in-flight lease cleanup on the open-session fence", async () => {
@@ -105,6 +120,7 @@ describe("database Turn lease", () => {
           return { rows: [row], rowCount: 1 }
         }
         if (sql.includes('SELECT session."userId"')) return { rows: [{ userId: "user_1" }], rowCount: 1 }
+        if (sql.includes('SELECT session."id" FROM "agent_sessions"')) return { rows: [{ id: "session_1" }], rowCount: 1 }
         return { rows: [], rowCount: 1 }
       }),
       release: vi.fn(),

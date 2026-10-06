@@ -13,7 +13,8 @@ import {
 } from "./types.js"
 import { isSubagentRetryDue } from "./retry-policy.js"
 import { isTaskPathWithin, normalizeTaskPath, policyFromTask } from "./manager-task-scope.js"
-import { finishInterrupted, type SubagentRunOutcome } from "./manager-run-outcome.js"
+import { runClaimedSubagent, type SubagentRunOutcome } from "./manager-run-outcome.js"
+import { isSessionPauseRequestedError } from "../session-gate.js"
 export type { SubagentRunOutcome } from "./manager-run-outcome.js"
 
 export interface SubagentClock {
@@ -104,33 +105,13 @@ export class AgentTreeManager {
   async run(payload: SubagentJobPayload, execute: (input: { lease: SubagentLease }) => Promise<SubagentExecutionResult>): Promise<SubagentRunOutcome> {
     let lease: SubagentLease | null
     try { lease = await this.claim(payload) } catch (error: unknown) {
+      if (isSessionPauseRequestedError(error)) return { taskId: payload.taskId, status: "skipped", reason: "session_pause_requested" }
       if (error instanceof SubagentLeaseError) return { taskId: payload.taskId, status: "lease_lost", reason: error.message }
       throw error
     }
     if (!lease) return { taskId: payload.taskId, status: "skipped", reason: "not_available" }
     const active = this.active.get(payload.taskId)!
-    try {
-      let result: SubagentExecutionResult
-      try {
-        result = await Promise.race([execute({ lease }), active.lost.then(error => { throw error })])
-      } catch (error: unknown) {
-        if (error instanceof SubagentLeaseError) {
-          if (!active.interrupted) return { taskId: payload.taskId, status: "lease_lost", reason: error.message }
-          return await finishInterrupted(this.store, payload, lease, error, this.now())
-        }
-        result = { status: "failed", failureReason: error instanceof Error ? error.message : "Subagent execution failed" }
-      }
-      const status = await this.store.finish({
-        taskId: payload.taskId, sessionId: payload.sessionId, ownerId: payload.ownerId,
-        attemptCount: lease.attemptCount,
-        status: result.status, result: result.result, failureReason: result.failureReason, retryDisposition: result.retryDisposition, now: this.now(),
-        ...(result.status === "completed" ? { mailboxMessageIds: result.mailboxMessageIds } : {}),
-      })
-      if (!status) return { taskId: payload.taskId, status: "lease_lost", reason: "Subagent lease was fenced" }
-      return { taskId: payload.taskId, status }
-    } finally {
-      this.dispose(payload.taskId, active)
-    }
+    return runClaimedSubagent(this.store, payload, lease, active, execute, () => this.now(), () => this.dispose(payload.taskId, active))
   }
 
   async heartbeat(taskId: string, now = this.now()): Promise<boolean> {

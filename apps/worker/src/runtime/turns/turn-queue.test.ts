@@ -7,6 +7,7 @@ import type { TurnLease } from "./lease.js"
 import { RootAbortControllerRegistry } from "../interrupt/registry.js"
 import { COGNITIVE_AGENDA_RESUME_FENCE_INVALID } from "./dlq.js"
 import { TurnLeaseError } from "./lease.js"
+import { SessionPauseRequestedError } from "../session-gate.js"
 
 const lease: TurnLease = {
   turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1", userId: "user_1", leaseVersion: 1,
@@ -102,6 +103,20 @@ describe("Turn queue processor", () => {
     expect(execute).toHaveBeenCalledWith(expect.objectContaining({ lease, signal: expect.any(AbortSignal) }))
     expect(registry.size).toBe(0)
     expect(fake.calls.some((sql) => sql.includes('SET "status" = $5'))).toBe(true)
+  })
+
+  it("requeues a pause-fenced execution without consuming a queue retry or writing a dead letter", async () => {
+    const fake = pool()
+    const execute = vi.fn(async () => { throw new SessionPauseRequestedError() })
+
+    const result = await runTurnJob(
+      { data: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptsMade: 4 },
+      { pool: fake.pool, execute },
+    )
+
+    expect(result).toEqual({ status: "requeued", reasonCode: "session_pause_requested" })
+    expect(fake.calls.some(sql => sql.includes("agent.turn.dlq"))).toBe(false)
+    expect(fake.calls.some(sql => sql.includes('SET "status" = \'queued\''))).toBe(true)
   })
 
   it("releases the turn after canonical runtime persists a user wait", async () => {

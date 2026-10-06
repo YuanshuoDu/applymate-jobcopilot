@@ -8,6 +8,7 @@ import type { TurnExecutionIdentity, TurnExecutionOptions, TurnExecutionStore } 
 import { restoreToolCallState } from "./persisted-tool-call-state.js"
 import { findToolObservation, stableJson } from "./turn-engine-replay.js"
 import { executeTools } from "./turn-execution-tools.js"
+import { SessionPauseRequestedError } from "../session-gate.js"
 
 function identity(kind: TurnExecutionIdentity["kind"], taskId: string): TurnExecutionIdentity {
   const common = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId, rootTaskId: "root-1", ownerId: "worker-1", leaseExpiresAt: new Date("2026-09-08T03:00:00.000Z") }
@@ -31,6 +32,56 @@ function options(owner: TurnExecutionIdentity, events: Array<{ id: string; type:
 }
 
 describe("TurnExecutionEventWriter", () => {
+  it("closes a tool item whose started event is denied by the pause fence without executing it", async () => {
+    const events: Array<{ id: string; type: string; itemId: string | null; identity: TurnExecutionIdentity }> = []
+    const base = options(identity("turn", "root-1"), events)
+    const pause = new SessionPauseRequestedError()
+    const itemStatuses: string[] = []
+    const executeTool = vi.fn()
+    const executionOptions: TurnExecutionOptions = {
+      ...base,
+      executeTool,
+      store: {
+        ...base.store,
+        appendEvent: async input => {
+          if (input.type === "tool_call.started") throw pause
+          events.push({ id: input.id, type: input.type, itemId: input.itemId, identity: input.identity })
+          return { id: input.id }
+        },
+        updateItem: async ({ itemId, expectedRevision, status }) => {
+          itemStatuses.push(status)
+          return { id: itemId, revision: expectedRevision + 1 }
+        },
+      },
+    }
+    const writer = new TurnExecutionEventWriter(executionOptions)
+
+    await expect(executeToolWithItems(executionOptions, writer, { id: "step-1", ordinal: 0 }, {
+      id: "call-1", name: "agent.spawn", arguments: { idempotencyKey: "spawn-1" },
+    }, () => new Date())).rejects.toBe(pause)
+
+    expect(executeTool).not.toHaveBeenCalled()
+    expect(events.some(event => event.type === "tool_call.started")).toBe(false)
+    expect(itemStatuses).toEqual(["interrupted"])
+  })
+
+  it("settles a started tool call before propagating a pause denial from its durable side effect", async () => {
+    const events: Array<{ id: string; type: string; itemId: string | null; identity: TurnExecutionIdentity }> = []
+    const pause = new SessionPauseRequestedError()
+    const executionOptions: TurnExecutionOptions = {
+      ...options(identity("turn", "root-1"), events),
+      executeTool: async () => { throw pause },
+    }
+    const writer = new TurnExecutionEventWriter(executionOptions)
+
+    await expect(executeToolWithItems(executionOptions, writer, { id: "step-1", ordinal: 0 }, {
+      id: "call-1", name: "agent.spawn", arguments: { idempotencyKey: "spawn-1" },
+    }, () => new Date())).rejects.toBe(pause)
+
+    expect(events.map(event => event.type)).toContain("tool_call.started")
+    expect(events.map(event => event.type)).toContain("tool_call.failed")
+  })
+
   it("passes the logical item id to the owner store and preserves causation", async () => {
     const events: Array<{ id: string; type: string; itemId: string | null; identity: TurnExecutionIdentity }> = []
     const writer = new TurnExecutionEventWriter(options(identity("turn", "root-1"), events))

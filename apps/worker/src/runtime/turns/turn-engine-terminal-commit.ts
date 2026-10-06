@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto"
 import type pg from "pg"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
+import { assertSessionWorkAdmission } from "../session-gate.js"
 import { matchesAgentOutboxIdentity, type AgentOutboxIdentity } from "../outbox-identity.js"
 import { toRepositoryJson, type AtomicTurnCompletionInput, type AtomicTurnCompletionResult, type TurnEngineEvent, type TurnEngineEventInput } from "./turn-engine-types.js"
 import type { TurnEngineCompletionGateResult } from "./turn-execution-types.js"
@@ -141,7 +142,7 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
     [owner.turnId, owner.sessionId, owner.userId, owner.ownerId, owner.leaseVersion, owner.taskId])
     const turnRow = turn.rows[0]
     if (!turnRow) throw conflict(`turn ${owner.turnId}`)
-    const root = await client.query<Row>(`SELECT "id", "status", "leaseOwner", "attemptCount", "result" FROM "sub_agent_tasks"
+    const root = await client.query<Row>(`SELECT "id", "status", "leaseOwner", "attemptCount", "result", "interruptRequestedAt" FROM "sub_agent_tasks"
       WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $1 FOR UPDATE`, [owner.taskId, owner.sessionId, owner.turnId])
     const task = root.rows[0]
     if (!task) throw conflict(`root task ${owner.taskId}`)
@@ -152,6 +153,10 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
     const committed = turnRow.status === "completed"
     if (committed && (turnRow.finalResponse !== input.response || task.status !== "completed" || task.leaseOwner !== null || Number(task.attemptCount) !== 1 || !sameJson(task.result, result))) throw conflict(`terminal receipt ${owner.turnId}`)
     if (!committed && (turnRow.status !== "in_progress" || task.status !== "running" || task.leaseOwner !== owner.ownerId || Number(task.attemptCount) !== 1)) throw conflict(`root task ${owner.taskId} fence`)
+    if (!committed) {
+      await assertSessionWorkAdmission(client, { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId })
+      if (task.interruptRequestedAt != null) throw conflict(`root task ${owner.taskId} interrupted`)
+    }
     let pendingFollowUp: Row | undefined
     if (!committed) pendingFollowUp = (await client.query<Row>(`SELECT "id", "targetTurnId", "clientMessageId", "content" FROM "agent_inputs"
       WHERE "sessionId" = $1 AND "userId" = $2 AND "targetTurnId" IS NOT NULL AND "delivery" = 'follow_up'

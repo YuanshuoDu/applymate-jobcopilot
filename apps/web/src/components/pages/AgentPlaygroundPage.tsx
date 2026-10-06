@@ -11,6 +11,7 @@ import { AgentPlaygroundWorkspace } from './AgentPlaygroundWorkspace'
 import { useAgentPlaygroundActions } from './useAgentPlaygroundActions'
 import { useAgentPlaygroundRun } from './useAgentPlaygroundRun'
 import { AgentSupervisorPanel } from '@/components/agent-workspace/v2/AgentSupervisorPanel'
+import { AgentSessionPauseResumeControl, parseAgentSessionControlStatus, postAgentSessionControl, useAgentSessionControlRefresh, type AgentSessionControlAction, type AgentSessionControlCommand } from '@/components/agent-workspace/v2/AgentSessionPauseResumeControl'
 import { sessionHeaderSubtitle, type AgentSessionsResponse } from '@/components/agent-workspace/session-view-model'
 import type { LogEntry, QuestionOption } from '@/components/agent-workspace/live-run-types'
 import type { SubmissionPolicySettings } from '@/components/agent-workspace/automation-policy'
@@ -57,6 +58,9 @@ export function AgentPlaygroundPage({ seedApplicationReviewQueue = false }: { se
   const selectedSessionId = sessionId
   const timeline = useAgentTimeline(selectedSessionId)
   const { activeTurn, refetch: refetchTurnState } = useAgentSessionState(sessionId)
+  const { data: controlSessionData, refetch: refetchControlSession } = useApi<{ session?: { status?: unknown } }>(selectedSessionId ? `/api/agent/sessions/${encodeURIComponent(selectedSessionId)}` : '', { cache: false, enabled: Boolean(selectedSessionId) })
+  const controlStatus = parseAgentSessionControlStatus(controlSessionData?.session?.status)
+  useAgentSessionControlRefresh(selectedSessionId, controlStatus, refetchControlSession, refetchTurnState)
   const turnComposer = useAgentTurnComposer(sessionId, activeTurn, refetchTurnState)
   const [conversationTitle, setConversationTitle] = useState<string | null>(null)
   const [conversationSubtitle, setConversationSubtitle] = useState<string | null>(null)
@@ -88,6 +92,9 @@ export function AgentPlaygroundPage({ seedApplicationReviewQueue = false }: { se
     // Refresh the command projection so Stop and steer controls do not lag it.
     refetchTurnState()
   }, [refetchTurnState, selectedSessionId, timeline.lifecycleRevision])
+  useEffect(() => {
+    if (selectedSessionId && timeline.lastEventId) void refetchControlSession()
+  }, [refetchControlSession, selectedSessionId, timeline.lastEventId])
 
   const { handleAnswerQuestion, handleAnswerOrchestrator, handleApplied } = useAgentPlaygroundActions({
     toast,
@@ -128,6 +135,12 @@ export function AgentPlaygroundPage({ seedApplicationReviewQueue = false }: { se
     selectSession(sessionId)
     setActiveRunPolicy(policy)
   }, [selectSession])
+  const sendSessionControl = useCallback(async (action: AgentSessionControlAction, command: AgentSessionControlCommand) => {
+    if (!selectedSessionId) throw new Error('No session is selected')
+    await postAgentSessionControl(selectedSessionId, action, command)
+    refetchTurnState()
+    await refetchControlSession()
+  }, [refetchControlSession, refetchTurnState, selectedSessionId])
 
   const restoreLastSession = useCallback((data: AgentSessionsResponse) => {
     if (initialSessionRestoredRef.current) return
@@ -194,33 +207,36 @@ export function AgentPlaygroundPage({ seedApplicationReviewQueue = false }: { se
           }}
           t={t}
         />
-        <AgentTurnComposerProvider value={turnComposer}>
-          <AgentUnifiedStream
-            log={runLog}
-            running={isRunning}
-            summary={runSummary}
-            applyQueue={applyQueue}
-            waitingQuestion={visibleWaitingQuestion}
-            savedCount={savedCount}
-            pendingCount={pendingCount}
-            autonomousMode={autonomousMode}
-            resetVersion={chatResetVersion}
-            resumeSessionId={sessionId}
-            timeline={timeline}
-            conversationTitle={conversationTitle}
-            conversationSubtitle={conversationSubtitle}
-            onAnswerQuestion={handleAnswerQuestion}
-            onAnswerOrchestrator={handleAnswerOrchestrator}
-            onApplied={handleApplied}
-            onSessionRecorded={(recordedSessionId, goal, subtitle) => {
-              setSessionId(recordedSessionId)
-              if (goal) setConversationTitle(goal)
-              if (subtitle) setConversationSubtitle(subtitle)
-              void fetch(`/api/agent/sessions/${encodeURIComponent(recordedSessionId)}`, { method: 'PATCH' }).catch(() => undefined)
-              setSessionsRefreshVersion(v => v + 1)
-            }}
-          />
-        </AgentTurnComposerProvider>
+        <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+          <AgentSessionPauseResumeControl sessionId={selectedSessionId ?? ''} sessionStatus={controlStatus} activeTurn={activeTurn} onPause={command => sendSessionControl('pause', command)} onResume={command => sendSessionControl('resume', command)} />
+          <AgentTurnComposerProvider value={turnComposer}>
+            <AgentUnifiedStream
+              log={runLog}
+              running={isRunning}
+              summary={runSummary}
+              applyQueue={applyQueue}
+              waitingQuestion={visibleWaitingQuestion}
+              savedCount={savedCount}
+              pendingCount={pendingCount}
+              autonomousMode={autonomousMode}
+              resetVersion={chatResetVersion}
+              resumeSessionId={sessionId}
+              timeline={timeline}
+              conversationTitle={conversationTitle}
+              conversationSubtitle={conversationSubtitle}
+              onAnswerQuestion={handleAnswerQuestion}
+              onAnswerOrchestrator={handleAnswerOrchestrator}
+              onApplied={handleApplied}
+              onSessionRecorded={(recordedSessionId, goal, subtitle) => {
+                setSessionId(recordedSessionId)
+                if (goal) setConversationTitle(goal)
+                if (subtitle) setConversationSubtitle(subtitle)
+                void fetch(`/api/agent/sessions/${encodeURIComponent(recordedSessionId)}`, { method: 'PATCH' }).catch(() => undefined)
+                setSessionsRefreshVersion(v => v + 1)
+              }}
+            />
+          </AgentTurnComposerProvider>
+        </div>
         <AgentSupervisorPanel sessionId={selectedSessionId} timeline={timeline} />
     </AgentPlaygroundWorkspace>
   )

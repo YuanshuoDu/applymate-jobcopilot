@@ -7,6 +7,7 @@ import { toRepositoryJson, type TurnEngineEventInput, type TurnEngineItem, type 
 import { STEERING_MARKER_EVENT_TYPE, parseSteeringMarkerPayload, type SteeringMarkerPayload } from "../context/steering-marker.js"
 import { matchesAgentOutboxIdentity, type AgentOutboxIdentity, type AgentOutboxPayload } from "../outbox-identity.js"
 import { commitTurnTerminal, type TurnEngineTerminalGuard } from "./turn-engine-terminal-commit.js"
+import { assertSessionWorkAdmission } from "../session-gate.js"
 type TurnEnginePool = Pick<pg.Pool, "connect">; type QueryClient = Pick<pg.PoolClient, "query" | "release">; type Row = Record<string, unknown>
 const OPEN_SESSION = `"status" NOT IN ('aborted', 'archived')`
 function json(value: RepositoryJsonValue): string { return JSON.stringify(value) }
@@ -65,7 +66,6 @@ async function assertCurrentStepLineage(client: QueryClient, owner: ExecutionOwn
   [stepId, owner.sessionId, owner.turnId, owner.taskId, attempt])
   if (!result.rows[0]) throw conflict(`step ${stepId} lineage`)
 }
-
 async function assertCurrentItemLineage(client: QueryClient, owner: ExecutionOwnerFence, itemId: string): Promise<void> {
   const attempt = owner.kind === "task" ? owner.attemptCount : 1
   const result = await client.query<Row>(`SELECT item."id" FROM "agent_items" AS item
@@ -96,6 +96,7 @@ async function appendEventBatch(pool: TurnEnginePool, inputs: readonly TurnEngin
   return tenantTransaction(pool, owner.userId, async client => {
     if (!await lockOpenSession(client, owner)) throw conflict(`session ${owner.sessionId}`)
     if (!await lockOwnedTurn(client, owner, true)) throw conflict(`turn ${owner.turnId}`)
+    if (inputs.some(input => ["step.started", "tool_call.started", "model.started"].includes(input.type))) await assertSessionWorkAdmission(client, owner)
     const result: { id: string }[] = []; let previousId: string | null = null
     for (const input of inputs) {
       if (input.itemId) await assertCurrentItemLineage(client, owner, input.itemId)
@@ -128,7 +129,6 @@ async function appendEventBatch(pool: TurnEnginePool, inputs: readonly TurnEngin
     return result
   })
 }
-
 export function createPgTurnEngineStore(pool: TurnEnginePool, terminalGuard?: TurnEngineTerminalGuard): TurnEngineStore {
   return {
     async startStep(input): Promise<TurnEngineStep> {
@@ -144,6 +144,7 @@ export function createPgTurnEngineStore(pool: TurnEnginePool, terminalGuard?: Tu
           ? await client.query<Row>(`SELECT turn."id" FROM "agent_turns" AS turn ${fence.joins} WHERE turn."id" = $5 AND turn."sessionId" = $6 AND ${fence.where} FOR UPDATE`, [...fence.values, input.owner.turnId, input.owner.sessionId])
           : await client.query<Row>(`SELECT turn."id" FROM "agent_turns" AS turn ${fence.joins} WHERE turn."id" = $3 AND turn."sessionId" = $2 AND ${fence.where} FOR UPDATE`, fence.values as unknown[])
         if (!owned.rows[0]) throw conflict(`step ${input.stepId}`)
+        await assertSessionWorkAdmission(client, input.owner)
         const existing = await client.query<Row>(`SELECT "id", "ordinal", "taskId", "attempt", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot"
           FROM "agent_steps" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 FOR UPDATE`, [input.stepId, input.owner.sessionId, input.owner.turnId])
         if (existing.rows[0]) {

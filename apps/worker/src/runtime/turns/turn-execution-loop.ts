@@ -1,10 +1,12 @@
 import type { ModelContinuation } from "@jobcopilot/agent-model"
 import { signalWasInterrupted } from "../interrupt/registry.js"
+import { isSessionPauseRequestedError } from "../session-gate.js"
 import { BudgetExceededError, createTurnBudgetLedger, type TurnBudgetLimits } from "../budget.js"
 import { finalizeTurn, serializeFinalResponse } from "../finalizer.js"
 import { NoProgressError, createProgressDetector } from "../progress.js"
 import { snapshotEvidence, verifyCandidateFinal } from "../verifier.js"
 import { buildModelRequest } from "./turn-engine-messages.js"
+import { runAdmittedModelStep } from "./admitted-model-step.js"
 import { runModelStep, type ModelStepResult } from "./turn-engine-model.js"
 import { TurnEngineError, toRepositoryJson, type AtomicTurnCompletionResult, type TurnEngineResult, type TurnEngineStep } from "./turn-engine-types.js"
 import { publishCommentary, publishFinalResponse, publishReasoningSummary, TurnExecutionEventWriter } from "./turn-execution-events.js"
@@ -15,11 +17,8 @@ import { STEERING_MARKER_EVENT_TYPE } from "../context/steering-marker.js"
 import { buildCognitiveActionAgenda } from "./cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE, cognitiveAgendaReceiptIdempotencyKey } from "./cognitive-agenda-receipt.js"
 import { executeTools, hasFreshSteering, recoverPersistedToolCalls, rememberSteeringMarkers } from "./turn-execution-tools.js"
-
 const DEFAULT_MAX_STEPS = 32
-
 function taskGraphRecoverySnapshot(snapshot: TurnExecutionOptions["snapshot"], stepId: string, feedback: string): TurnExecutionOptions["snapshot"] { return { ...snapshot, system: [...snapshot.system, { id: `task-graph-recovery:${stepId}`, content: `Durable TaskGraph verification blocked completion: ${feedback} Replan or repair the affected criteria, then verify again.` }] } }
-
 export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promise<TurnEngineResult> {
   const signal = options.signal ?? new AbortController().signal
   const now = options.now ?? (() => new Date())
@@ -36,7 +35,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
   let continuation: ModelContinuation | undefined
   let steeringMarkerState = options.steeringMarkerState
   const seenCallIds = new Set<string>()
-  let lastStep: TurnEngineStep | null = null
+  let lastStep: TurnEngineStep | null = null, closedSteps = new Set<string>()
   try {
     await writer.append(
       "turn.started", options.identity.turnId, null,
@@ -56,12 +55,9 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         modelProfileSnapshot: toRepositoryJson(options.model.profile), now: now(),
       })
       lastStep = step
-      await writer.append(
-        "step.started", step.id, null, { stepId: step.id, ordinal: step.ordinal, taskId: options.identity.taskId },
-        `step-started:${step.id}`,
-      )
       let stepOutput: ModelStepResult | null = null
       try {
+        await writer.append("step.started", step.id, null, { stepId: step.id, ordinal: step.ordinal, taskId: options.identity.taskId }, `step-started:${step.id}`)
         const context = await options.contextBuilder.build({
           scope: options.scope, identity: options.identity, stepId: step.id, snapshot,
           rootInputId: ordinal === 0 ? options.rootInputId : undefined, now: now(),
@@ -94,7 +90,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         })
           assertModelAllowance(budget.snapshot())
         const reservation = budget.reserveModel()
-        const output = await runModelStep(options.model, request, options.validateToolArguments)
+        const output = await runAdmittedModelStep({ writer, stepId: step.id, taskId: options.identity.taskId, provider: request.provider, model: request.model, invoke: () => runModelStep(options.model, request, options.validateToolArguments), onStartDenied: () => reservation.settle({ inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }) })
         stepOutput = output; reservation.settle(output.usage ?? { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }); continuation = output.continuation ?? undefined
         await writer.append(
           "model.usage", step.id, null,
@@ -133,6 +129,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
             { stepId: step.id, status: wait?.status ?? "completed", toolCallCount: output.toolCalls.length, taskId: options.identity.taskId },
             `step-completed:${step.id}`,
           )
+          closedSteps.add(step.id)
           if (wait) {
             if (wait.status === "waiting_for_user") await options.store.waitForUser?.({ identity: options.identity, now: now() })
             return { ...wait, stepCount: steps, toolCallCount: toolCalls }
@@ -148,6 +145,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           "step.completed", step.id, null, { stepId: step.id, status: "completed", taskId: options.identity.taskId },
           `step-completed:${step.id}`,
         )
+        closedSteps.add(step.id)
         const verification = verifyCandidateFinal({
           goal: options.goal, candidate: { text: output.text, finishReason: output.finishReason },
           evidence: snapshotEvidence(snapshot), expectedEvidence: options.expectedEvidence, businessChecks: options.businessChecks,
@@ -195,7 +193,8 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         }
         return { status: "completed", stepCount: steps, toolCallCount: toolCalls, finalItemId: finalItem.id, finalText: output.text }
       } catch (error: unknown) {
-        const status = signalWasInterrupted(signal) ? "interrupted" : "failed"
+        if (closedSteps.has(step.id) && isSessionPauseRequestedError(error)) throw error
+        const status = signalWasInterrupted(signal) || isSessionPauseRequestedError(error) ? "interrupted" : "failed"
         await updateExecutionStep(options, {
           stepId: step.id, status, finishReason: stepOutput?.finishReason ?? null, errorCode: turnErrorCode(error),
           inputTokens: stepOutput?.usage?.inputTokens ?? 0, outputTokens: stepOutput?.usage?.outputTokens ?? 0,
@@ -204,7 +203,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         await writer.append(
           "step.completed", step.id, null,
           { stepId: step.id, status, errorCode: turnErrorCode(error), taskId: options.identity.taskId },
-          `step-failed:${step.id}`,
+          `step-${status === "interrupted" ? "interrupted" : "failed"}:${step.id}`,
         ).catch(() => undefined)
         throw error
       }
@@ -219,6 +218,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
       ).catch(() => undefined)
       return { status: "interrupted", stepCount: steps, toolCallCount: toolCalls, errorCode: code }
     }
+    if (isSessionPauseRequestedError(error)) throw error
     if (signal.aborted) throw error
     const code = turnErrorCode(error)
     if (error instanceof NoProgressError) await writer.append("turn.no_progress", options.identity.turnId, null, { reasonCode: error.reasonCode, signature: error.observation.signature, stateFingerprint: error.observation.stateFingerprint, taskId: options.identity.taskId }, "turn-no-progress").catch(() => undefined)
