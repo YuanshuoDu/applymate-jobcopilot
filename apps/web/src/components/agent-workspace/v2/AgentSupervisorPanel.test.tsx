@@ -1,8 +1,11 @@
 import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-vi.mock('@/lib/hooks', () => ({ useApi: () => ({ data: null, loading: false, error: null, refetch: () => undefined }) }))
+const apiState = vi.hoisted(() => ({ turnsData: null as unknown }))
+vi.mock('@/lib/hooks', () => ({ useApi: (url: string) => ({ data: url.includes('/turns?') ? apiState.turnsData : null, loading: false, error: null, refetch: () => undefined }) }))
+vi.mock('./SelectedJobPreparationCard', () => ({ SelectedJobPreparationCard: () => null }))
+vi.mock('./SelectedJobDraftArtifact', () => ({ SelectedJobDraftArtifact: () => null }))
 
 import { translate } from '@/lib/i18n'
 import { AgentSupervisorPanel, EvidenceSummary, projectSelectedEvidence } from './AgentSupervisorPanel'
@@ -21,6 +24,8 @@ function item(overrides: Partial<TimelineItem> = {}): TimelineItem {
 }
 
 const t = (key: string) => translate('en', key)
+
+beforeEach(() => { apiState.turnsData = null })
 
 describe('AgentSupervisorPanel selected evidence', () => {
   it('projects an eligible selected child into the accessible interrupt action', () => {
@@ -57,6 +62,33 @@ describe('AgentSupervisorPanel selected evidence', () => {
     } satisfies AgentTimelineSnapshot
 
     expect(renderToStaticMarkup(<AgentSupervisorPanel sessionId={null} timeline={timeline} />)).toBe('')
+  })
+
+  it('feeds a scoped active Turn projection to question lookup without adding it to the tree', () => {
+    const pageTurns = Array.from({ length: 100 }, (_, index) => ({
+      id: `turn-${index}`, sessionId: 'session-1', source: 'user', goal: `Goal ${index}`, status: 'completed', revision: 1,
+      activeStepId: null, finalItemId: null, createdAt: '', updatedAt: '', completedAt: null,
+    }))
+    apiState.turnsData = {
+      turns: pageTurns,
+      projection: { activeTurnId: 'turn-current', activeTurn: { id: 'turn-current', status: 'waiting_for_user', revision: 14, goal: 'PROJECTION_PRIVATE_GOAL' } },
+    }
+    const question = item({ type: 'question', status: 'started', turnId: 'turn-current', content: {
+      waitKind: 'question', questionId: 'question-current', stage: 'profile', question: 'Choose an option?',
+      options: [{ value: 'yes', label: 'Yes' }], pending: true, answerAvailable: false,
+    } })
+    const timeline = {
+      sessionId: 'session-1', items: [question], lastEventId: null, lifecycleRevision: 0, cognitiveAgenda: null, cognitiveAgendas: [],
+      approvalLedger: { sessionId: 'session-1', approvals: [], pending: [], pendingActions: [], currentPending: null, pendingCount: 0 },
+      connection: 'connected', restoring: false, error: null,
+    } satisfies AgentTimelineSnapshot
+
+    const html = renderToStaticMarkup(<AgentSupervisorPanel sessionId="session-1" timeline={timeline} />)
+    const optionButton = html.match(/<button[^>]*>Yes<\/button>/)?.[0]
+    expect(optionButton).toBeDefined()
+    expect(optionButton).not.toContain('disabled=""')
+    expect(html).not.toContain(translate('en', 'agent.question.turnUnavailable'))
+    expect(html).not.toContain('PROJECTION_PRIVATE_GOAL')
   })
 
   it('projects bounded audit metadata and renders only safe references', () => {
