@@ -29,6 +29,7 @@ const databaseUrl = disposableUrl(), describePg = databaseUrl ? describe : descr
 const suffix = randomUUID(), ids = {
   user: `native-command-user-${suffix}`, session: `native-command-session-${suffix}`,
   turn: `native-command-turn-${suffix}`, root: `native-command-root-${suffix}`,
+  foreignTurn: `native-command-foreign-turn-${suffix}`, foreignRoot: `native-command-foreign-root-${suffix}`,
   step: `native-command-step-${suffix}`, turnOwner: `native-turn-owner-${suffix}`,
   taskOwner: `native-task-owner-${suffix}`,
 }
@@ -143,11 +144,36 @@ describePg("native TaskGraph PostgreSQL command durability", () => {
     expect(child.rows[0]?.allowedActions).toEqual(["jobs.search"])
 
     const foreignId = `native-foreign-source-${suffix}`
+    await pool!.query(`INSERT INTO "agent_turns"
+      ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot",
+       "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
+      VALUES ($1, $2, $3, 'in_progress', 'user', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
+        $4, CURRENT_TIMESTAMP + INTERVAL '5 minutes', CURRENT_TIMESTAMP, 1, CURRENT_TIMESTAMP)`,
+    [ids.foreignTurn, ids.session, ids.user, `native-foreign-turn-owner-${suffix}`])
+    await pool!.query(`INSERT INTO "sub_agent_tasks"
+      ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
+       "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot",
+       "budgetSnapshot", "attemptCount", "maxAttempts", "leaseOwner", "leaseExpiresAt", "updatedAt")
+      VALUES ($1, $2, $3, NULL, NULL, '/root', 0, 'orchestrator', 'root', 'running', 'foreign root',
+        '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
+        '{"subagentPolicy":{"maxConcurrency":64,"maxDepth":8,"maxFanOut":64,"maxAttempts":2}}'::jsonb,
+        1, 2, $4, CURRENT_TIMESTAMP + INTERVAL '5 minutes', CURRENT_TIMESTAMP)`,
+    [ids.foreignRoot, ids.session, ids.foreignTurn, `native-foreign-task-owner-${suffix}`])
+    await pool!.query(`UPDATE "sub_agent_tasks" SET "rootTaskId" = $1 WHERE "id" = $1`, [ids.foreignRoot])
+    await pool!.query(`UPDATE "agent_turns" SET "rootTaskId" = $1 WHERE "id" = $2`, [ids.foreignRoot, ids.foreignTurn])
     await pool!.query(`INSERT INTO "sub_agent_tasks"
       ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
        "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "updatedAt")
-      VALUES ($1, $2, $3, 'other-root', $4, '/other/source', 1, 'auditor', 'audit', 'completed', 'source', '[]'::jsonb, '[]'::jsonb,
-        '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 0, 2, CURRENT_TIMESTAMP)`, [foreignId, ids.session, ids.turn, ids.root])
+      VALUES ($1, $2, $3, $4, $4, '/root/source', 1, 'auditor', 'audit', 'completed', 'source', '[]'::jsonb, '[]'::jsonb,
+        '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{"subagentPolicy":{"maxDepth":8,"maxFanOut":64,"maxAttempts":2}}'::jsonb, 0, 2, CURRENT_TIMESTAMP)`,
+    [foreignId, ids.session, ids.foreignTurn, ids.foreignRoot])
+    const foreignLineage = await pool!.query<{ sourceTaskId: string; sourceRootTaskId: string; rootTaskId: string; sourceTurnId: string; rootTurnId: string }>(
+      `SELECT source."id" AS "sourceTaskId", source."rootTaskId" AS "sourceRootTaskId", root."id" AS "rootTaskId",
+        source."turnId" AS "sourceTurnId", root."turnId" AS "rootTurnId"
+       FROM "sub_agent_tasks" AS source JOIN "sub_agent_tasks" AS root
+         ON root."id" = source."rootTaskId" AND root."sessionId" = source."sessionId"
+       WHERE source."id" = $1`, [foreignId])
+    expect(foreignLineage.rows[0]).toEqual({ sourceTaskId: foreignId, sourceRootTaskId: ids.foreignRoot, rootTaskId: ids.foreignRoot, sourceTurnId: ids.foreignTurn, rootTurnId: ids.foreignTurn })
     await expect(command().appendNativeCoordination!({
       scope, request: { kind: "followup", idempotencyKey: "followup-foreign", sourceTaskId: foreignId, goal: "Must not cross root" },
     })).rejects.toMatchObject({ code: "native_source_unavailable" })
