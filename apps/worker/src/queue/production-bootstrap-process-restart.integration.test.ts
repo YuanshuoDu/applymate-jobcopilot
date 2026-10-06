@@ -237,8 +237,129 @@ type CheckpointResumeDiagnostics = {
   checkpointKind: CheckpointKind
   waitId: string
   toolCallId: string
+  wakeupIdempotencyKey?: string
   turnJobKey: (turnId: string, generation?: number) => string
 }
+
+type QuestionWakeupOutboxRow = { topic: string; aggregateId: string; payload: unknown }
+type QuestionWakeupEventRow = { sessionId: string; turnId: string; itemId: string | null; type: string; payload: unknown }
+type QuestionWaitDiagnosticRow = {
+  sessionId: string
+  turnId: string
+  type: string
+  status: string
+  answerAvailable: string | null
+  waitKind: string | null
+  waitId: string | null
+  toolCallId: string | null
+}
+
+function jsonRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
+}
+
+function questionWakeupLineage(
+  expected: {
+    sessionId: string; turnId: string; itemId: string; waitId: string; toolCallId: string
+    turnStatus: string | null; turnRevision: number | null; waitItem: QuestionWaitDiagnosticRow | null
+  },
+  outboxes: readonly QuestionWakeupOutboxRow[],
+  event: QuestionWakeupEventRow | null,
+) {
+  const outbox = outboxes[0]
+  const envelope = jsonRecord(outbox?.payload)
+  const outboxPayload = jsonRecord(envelope.payload)
+  const eventPayload = jsonRecord(event?.payload)
+  const waitItem = expected.waitItem
+  return {
+    outboxFound: outboxes.length > 0,
+    outboxUnique: outboxes.length === 1,
+    outboxTopicMatch: outbox?.topic === "agent.turn.wakeup",
+    outboxAggregateSessionMatch: outbox?.aggregateId === expected.sessionId,
+    eventFound: event !== null,
+    outboxScope: {
+      session: envelope.sessionId === expected.sessionId,
+      turn: envelope.turnId === expected.turnId,
+      item: envelope.itemId === expected.itemId,
+      type: envelope.type === "turn.wakeup",
+    },
+    eventScope: {
+      session: event?.sessionId === expected.sessionId,
+      turn: event?.turnId === expected.turnId,
+      item: event?.itemId === expected.itemId,
+      type: event?.type === "turn.wakeup",
+    },
+    eventMatchesOutboxScope: {
+      session: event?.sessionId === envelope.sessionId,
+      turn: event?.turnId === envelope.turnId,
+      item: event?.itemId === envelope.itemId,
+      type: event?.type === envelope.type,
+    },
+    waitItemScope: {
+      found: waitItem !== null,
+      session: waitItem?.sessionId === expected.sessionId,
+      turn: waitItem?.turnId === expected.turnId,
+      type: waitItem?.type === "question",
+    },
+    eventPayloadMatchesOutbox: {
+      waitKind: eventPayload.waitKind === outboxPayload.waitKind,
+      waitId: eventPayload.waitId === outboxPayload.waitId,
+      itemId: eventPayload.itemId === outboxPayload.itemId,
+      turnId: eventPayload.turnId === outboxPayload.turnId,
+      toolCallId: eventPayload.toolCallId === outboxPayload.toolCallId,
+      status: eventPayload.status === outboxPayload.status,
+      nextTurnRevision: eventPayload.nextTurnRevision === outboxPayload.nextTurnRevision,
+    },
+    outboxPayloadMatchesWait: {
+      waitKind: outboxPayload.waitKind === "question" && waitItem?.waitKind === "question" && waitItem.type === "question",
+      waitId: outboxPayload.waitId === expected.waitId && waitItem?.waitId === expected.waitId,
+      itemId: outboxPayload.itemId === expected.itemId && waitItem !== null,
+      turnId: outboxPayload.turnId === expected.turnId && waitItem?.turnId === expected.turnId,
+      toolCallId: outboxPayload.toolCallId === expected.toolCallId && waitItem?.toolCallId === expected.toolCallId,
+      status: outboxPayload.status === "answered" && expected.turnStatus === "waiting_for_user"
+        && waitItem?.status === "completed" && waitItem.answerAvailable === "true",
+      nextTurnRevision: expected.turnRevision !== null && outboxPayload.nextTurnRevision === expected.turnRevision,
+    },
+  }
+}
+
+describe("question wakeup timeout diagnostic", () => {
+  it("reports only bounded lineage matches and exposes individual payload mismatches", () => {
+    const expected = {
+      sessionId: "private-session", turnId: "private-turn", itemId: "private-item", waitId: "private-wait",
+      toolCallId: "private-tool-call", turnStatus: "waiting_for_user", turnRevision: 8,
+      waitItem: { sessionId: "private-session", turnId: "private-turn", type: "question", status: "completed", answerAvailable: "true", waitKind: "question", waitId: "private-wait", toolCallId: "private-tool-call" },
+    }
+    const privateAnswer = "private-answer-content"
+    const payload = {
+      waitKind: "question", waitId: "private-wait", itemId: "private-item", turnId: "private-turn",
+      toolCallId: "private-tool-call", status: "answered", nextTurnRevision: 8, answer: privateAnswer,
+    }
+    const outbox = [{ topic: "agent.turn.wakeup", aggregateId: "private-session", payload: {
+      eventId: "private-event", sessionId: "private-session", turnId: "private-turn", itemId: "private-item",
+      type: "turn.wakeup", idempotencyKey: "private-event-key", payload,
+    } }]
+    const event = {
+      sessionId: "private-session", turnId: "private-turn", itemId: "private-item", type: "turn.wakeup", payload,
+    }
+
+    const matching = questionWakeupLineage(expected, outbox, event)
+    expect(matching.outboxFound).toBe(true)
+    expect(matching.eventFound).toBe(true)
+    expect(Object.values(matching.eventPayloadMatchesOutbox).every(Boolean)).toBe(true)
+    expect(Object.values(matching.outboxPayloadMatchesWait).every(Boolean)).toBe(true)
+
+    const mismatched = questionWakeupLineage(expected, [{
+      ...outbox[0]!, payload: { ...outbox[0]!.payload, payload: { ...payload, toolCallId: "different" } },
+    }], event)
+    expect(mismatched.eventPayloadMatchesOutbox.toolCallId).toBe(false)
+    expect(mismatched.outboxPayloadMatchesWait.toolCallId).toBe(false)
+    const wrongScope = questionWakeupLineage(expected, outbox, { ...event, sessionId: "foreign-session" })
+    expect(wrongScope.eventScope.session).toBe(false)
+    expect(JSON.stringify([matching, mismatched, wrongScope])).not.toContain("private-")
+    expect(JSON.stringify([matching, mismatched, wrongScope])).not.toContain(privateAnswer)
+  })
+})
 
 // These diagnostic tokens come from TurnEngineError, turnErrorCode/DLQ, and
 // the persisted status/finish-reason enums; unknown values are never echoed.
@@ -276,6 +397,7 @@ const SAFE_DIAGNOSTIC_EVENT_TYPES = new Set([
   "approval.requested", "approval.resolved", "approval.consumed", "approval.expired",
   "question.answered", "question.cancelled", "external_action.reserved",
 ])
+const SAFE_DIAGNOSTIC_ITEM_TYPES = new Set(["question", "approval_request", "tool_call", "tool_result"])
 
 function safeDiagnosticCode(value: unknown): string | null {
   if (typeof value !== "string" || value.length === 0) return null
@@ -286,10 +408,19 @@ function safeDiagnosticEventType(value: unknown): string {
   return typeof value === "string" && SAFE_DIAGNOSTIC_EVENT_TYPES.has(value) ? value : "other"
 }
 
+function safeDiagnosticItemType(value: unknown): string {
+  return typeof value === "string" && SAFE_DIAGNOSTIC_ITEM_TYPES.has(value) ? value : "other"
+}
+
 async function checkpointResumeDiagnostics(input: CheckpointResumeDiagnostics): Promise<string> {
   const waitItemId = `agent-wait:${input.checkpointKind}:${input.waitId}`
-  const [turn, root, steps, toolItems, waitItem, events, wakeupOutbox, dispatch] = await Promise.all([
-    input.pool.query(`SELECT "status", "revision", "leaseOwnerId" IS NOT NULL AS "hasLease",
+  const questionWakeupOutboxQuery = input.checkpointKind === "question" && input.wakeupIdempotencyKey
+    ? input.pool.query<QuestionWakeupOutboxRow>(`SELECT "topic", "aggregateId", "payload"
+      FROM "agent_outbox" WHERE "payload"->>'idempotencyKey' = $1
+      ORDER BY "createdAt" DESC LIMIT 2`, [input.wakeupIdempotencyKey])
+    : Promise.resolve({ rows: [] as QuestionWakeupOutboxRow[] })
+  const [turn, root, steps, toolItems, waitItem, events, wakeupOutbox, dispatch, questionWakeupOutboxes] = await Promise.all([
+    input.pool.query<{ status: string; revision: number; hasLease: boolean; leaseVersion: number; leaseActive: boolean; rootTaskId: string | null }>(`SELECT "status", "revision", "leaseOwnerId" IS NOT NULL AS "hasLease",
         "leaseVersion", "leaseExpiresAt" > NOW() AS "leaseActive", "rootTaskId"
       FROM "agent_turns" WHERE "id" = $1`, [input.turnId]),
     input.pool.query(`SELECT task."status", task."leaseOwner" IS NOT NULL AS "hasLease",
@@ -302,8 +433,9 @@ async function checkpointResumeDiagnostics(input: CheckpointResumeDiagnostics): 
         "content"->>'status' AS "contentStatus", "content"->>'errorCode' AS "errorCode"
       FROM "agent_items" WHERE "turnId" = $1 AND "content"->>'toolCallId' = $2
         AND "type" IN ('tool_call', 'tool_result') ORDER BY "id"`, [input.turnId, input.toolCallId]),
-    input.pool.query(`SELECT "type", "status", "content"->>'answerAvailable' AS "answerAvailable"
-      FROM "agent_items" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`, [waitItemId, input.sessionId, input.turnId]),
+    input.pool.query<QuestionWaitDiagnosticRow>(`SELECT "sessionId", "turnId", "type", "status", "content"->>'answerAvailable' AS "answerAvailable",
+        "content"->>'waitKind' AS "waitKind", "content"->>'questionId' AS "waitId", "content"->>'toolCallId' AS "toolCallId"
+      FROM "agent_items" WHERE "id" = $1`, [waitItemId]),
     input.pool.query(`SELECT "sequence", "type", "payload"->>'reasonCode' AS "reasonCode",
         "payload"->>'reason_code' AS "reasonCodeSnake", "payload"->>'errorCode' AS "errorCode",
         "payload"->>'error_code' AS "errorCodeSnake"
@@ -314,7 +446,24 @@ async function checkpointResumeDiagnostics(input: CheckpointResumeDiagnostics): 
         AND "payload"->>'turnId' = $2 ORDER BY "createdAt" DESC LIMIT 4`, [input.sessionId, input.turnId]),
     input.pool.query(`SELECT "attemptCount", "publishedAt" IS NOT NULL AS "published", "lastError" IS NOT NULL AS "hasError"
       FROM "agent_outbox" WHERE "topic" = 'agent.turn.dispatch' AND "idempotencyKey" = $1`, [`turn-dispatch:${input.turnId}`]),
+    questionWakeupOutboxQuery,
   ])
+  const candidateWakeupEnvelope = jsonRecord(questionWakeupOutboxes.rows[0]?.payload)
+  const candidateWakeupEventId = typeof candidateWakeupEnvelope.eventId === "string" ? candidateWakeupEnvelope.eventId : null
+  const questionWakeupEvent = candidateWakeupEventId
+    ? await input.pool.query<QuestionWakeupEventRow>(`SELECT "sessionId", "turnId", "itemId", "type", "payload"
+        FROM "agent_events" WHERE "id" = $1`, [candidateWakeupEventId])
+    : { rows: [] as QuestionWakeupEventRow[] }
+  const questionWakeup = input.checkpointKind === "question" ? questionWakeupLineage({
+    sessionId: input.sessionId,
+    turnId: input.turnId,
+    itemId: waitItemId,
+    waitId: input.waitId,
+    toolCallId: input.toolCallId,
+    turnStatus: turn.rows[0]?.status ?? null,
+    turnRevision: Number.isSafeInteger(turn.rows[0]?.revision) ? turn.rows[0]!.revision : null,
+    waitItem: waitItem.rows[0] ?? null,
+  }, questionWakeupOutboxes.rows, questionWakeupEvent.rows[0] ?? null) : null
   const attemptCount = Number(dispatch.rows[0]?.attemptCount ?? 0)
   const recentGenerations = [Math.max(0, attemptCount - 1), attemptCount, attemptCount + 1]
   const generations = [...new Set([0, 1, 2, ...recentGenerations])]
@@ -337,19 +486,30 @@ async function checkpointResumeDiagnostics(input: CheckpointResumeDiagnostics): 
   ])
   const safeCode = (camel: unknown, snake?: unknown) => safeDiagnosticCode(camel) ?? safeDiagnosticCode(snake)
   const snapshot = {
-    turn: turn.rows[0] ?? null,
-    root: root.rows[0] ?? null,
-    steps: steps.rows.map(row => ({ ...row, errorCode: safeDiagnosticCode(row.errorCode), finishReason: safeDiagnosticCode(row.finishReason) })),
+    turn: turn.rows[0] ? {
+      status: safeDiagnosticCode(turn.rows[0].status),
+      revision: turn.rows[0].revision,
+      hasLease: turn.rows[0].hasLease,
+      leaseVersion: turn.rows[0].leaseVersion,
+      leaseActive: turn.rows[0].leaseActive,
+      hasRootTask: typeof turn.rows[0].rootTaskId === "string" && turn.rows[0].rootTaskId.length > 0,
+    } : null,
+    root: root.rows[0] ? {
+      status: safeDiagnosticCode(root.rows[0].status),
+      hasLease: root.rows[0].hasLease,
+      leaseActive: root.rows[0].leaseActive,
+    } : null,
+    steps: steps.rows.map(row => ({ ...row, status: safeDiagnosticCode(row.status), errorCode: safeDiagnosticCode(row.errorCode), finishReason: safeDiagnosticCode(row.finishReason) })),
     toolItems: toolItems.rows.map(row => ({
-      type: row.type,
-      status: row.status,
-      stepId: row.stepId,
+      type: safeDiagnosticItemType(row.type),
+      status: safeDiagnosticCode(row.status),
+      hasStep: typeof row.stepId === "string" && row.stepId.length > 0,
       contentStatus: safeDiagnosticCode(row.contentStatus),
       errorCode: safeDiagnosticCode(row.errorCode),
     })),
     waitItem: waitItem.rows[0] ? {
-      type: waitItem.rows[0].type,
-      status: waitItem.rows[0].status,
+      type: safeDiagnosticItemType(waitItem.rows[0].type),
+      status: safeDiagnosticCode(waitItem.rows[0].status),
       answerAvailable: waitItem.rows[0].answerAvailable === "true",
     } : null,
     events: events.rows.map(row => ({
@@ -363,6 +523,7 @@ async function checkpointResumeDiagnostics(input: CheckpointResumeDiagnostics): 
       published: row.published,
       lastError: safeDiagnosticCode(row.lastError),
     })),
+    ...(questionWakeup ? { questionWakeup } : {}),
     dispatch: dispatch.rows[0] ?? null,
     jobs: jobGenerations,
     queue: queueCounts,
@@ -387,13 +548,14 @@ async function checkpointResumeDiagnostics(input: CheckpointResumeDiagnostics): 
     steps: snapshot.steps.slice(0, 3),
     events: snapshot.events.slice(0, 4),
     wakeupOutbox: snapshot.wakeupOutbox.slice(0, 2),
+    ...(questionWakeup ? { questionWakeup } : {}),
     dispatch: snapshot.dispatch,
     jobs: snapshot.jobs.slice(0, 3),
     queue: snapshot.queue,
   })
   if (compact.length <= 1_400) return compact
 
-  const tinyFallback = JSON.stringify({ diagnosticTruncated: true })
+  const tinyFallback = JSON.stringify({ diagnosticTruncated: true, ...(questionWakeup ? { questionWakeup } : {}) })
   return tinyFallback.length <= 1_400 ? tinyFallback : "{}"
 }
 
@@ -977,6 +1139,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     await waitForCheckpointResume(workerTwo, kind, 60_000, {
       pool: pool!, queue: turnQueue!, turnId: checkpointIds.turnId, sessionId: checkpointIds.sessionId,
       checkpointKind: kind, waitId: checkpointIds.checkpointWaitId!, toolCallId: checkpointIds.readCallId!, turnJobKey: turnJobKey!,
+      wakeupIdempotencyKey: kind === "question" ? `agent-wait-command:checkpoint-command:${suffix}:wakeup` : undefined,
     })
     await waitForTurnStatus(pool!, checkpointIds.turnId, "completed", 60_000, workerTwo)
     const finalState = await pool!.query<{
