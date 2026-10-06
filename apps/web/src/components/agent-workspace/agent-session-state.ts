@@ -15,6 +15,7 @@ export interface ActiveTurnDto {
   id: string
   status: ActiveTurnStatus
   revision: number
+  goal?: string
 }
 
 export interface AgentTurnsResponse {
@@ -48,7 +49,8 @@ export function parseActiveTurn(value: unknown): ActiveTurnDto | null {
   const revision = row.revision
   if (!id || typeof status !== 'string' || !ACTIVE_TURN_STATUSES.has(status as ActiveTurnStatus)) return null
   if (typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 0) return null
-  return { id, status: status as ActiveTurnStatus, revision }
+  const goal = typeof row.goal === 'string' && row.goal.trim() ? row.goal : undefined
+  return { id, status: status as ActiveTurnStatus, revision, ...(goal ? { goal } : {}) }
 }
 
 export function parseAgentTurnsResponse(value: unknown): AgentSessionState {
@@ -61,9 +63,15 @@ export function parseAgentTurnsResponse(value: unknown): AgentSessionState {
   const listedTurn = activeTurnId
     ? turns.map(parseActiveTurn).find((turn) => turn?.id === activeTurnId) ?? null
     : null
-  const activeTurn = projectionTurn?.id === activeTurnId || !activeTurnId
-    ? projectionTurn
-    : listedTurn
+  const projectionMatches = projectionTurn?.id === activeTurnId
+  const projectedActiveTurn = !activeTurnId || projection?.activeTurn === null
+    ? null
+    : projectionMatches ? projectionTurn : listedTurn ? { id: listedTurn.id, status: listedTurn.status, revision: listedTurn.revision } : null
+  const activeTurn = activeTurnId && projectedActiveTurn
+    ? projectionMatches && !projectedActiveTurn.goal && listedTurn?.goal
+      ? { ...projectedActiveTurn, goal: listedTurn.goal }
+      : projectedActiveTurn
+    : null
   return {
     activeTurn,
     queuedInputCount: typeof projection?.queuedInputCount === 'number' && Number.isSafeInteger(projection.queuedInputCount) && projection.queuedInputCount >= 0
