@@ -1,4 +1,4 @@
-import { projectPlanLedger, TASK_GRAPH_SCHEMA_VERSION, type PlanLedger, type PlanLedgerEvidencePreview, type PlanLedgerReadiness, type PlanLedgerStatus } from '@jobcopilot/agent-protocol'
+import { projectPlanLedger, type PlanLedger, type PlanLedgerEvidencePreview, type PlanLedgerReadiness, type PlanLedgerStatus } from '@jobcopilot/agent-protocol'
 import type { TimelineItem } from './timeline-reducer'
 import type { SupervisorTaskSummary } from './task-tree-projection'
 import { latestTaskGraphItem } from './task-graph-plan-query'
@@ -26,7 +26,7 @@ export function projectCurrentTaskGraph(
     sessionId,
     revision: item.revision,
     rootTaskId: item.taskId,
-    graph: { schemaVersion: TASK_GRAPH_SCHEMA_VERSION, nodes: snapshot.nodes },
+    graph: item.content,
     tasks: scopedTasks.filter(task => taskIds.has(task.id)),
   })
 }

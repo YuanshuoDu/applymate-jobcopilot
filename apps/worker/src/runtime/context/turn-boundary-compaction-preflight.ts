@@ -7,10 +7,12 @@ import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import type { TurnLease } from "../turns/lease.js"
 import type { StepContextSnapshot } from "./step-context-builder.js"
 import { ContextCompactor } from "./context-compactor.js"
-import { DEFAULT_COMPACTION_POLICY } from "./context-compaction-trigger.js"
+import { DEFAULT_COMPACTION_POLICY, evaluateCompactionTrigger } from "./context-compaction-trigger.js"
 import type { CompactionResult, CompactionSource, NarrativeSummarizer } from "./context-compaction-types.js"
+import { collectCompactionState } from "./context-compaction-collector.js"
 import { createPgCompactionSource } from "./context-compaction-pg-source.js"
 import { createPgContextSnapshotCompactionPort } from "./context-snapshot-compaction-pg.js"
+import type { TaskGraphCommandPort } from "../subagents/task-graph-command-port.js"
 
 export type TurnBoundaryState = {
   readonly goal: string
@@ -64,12 +66,27 @@ export async function runTurnBoundaryContextCompaction(input: {
   readonly scope: TenantScope
   readonly owner: TurnExecutionOwnerFence
   readonly lease: TurnLease
+  readonly taskGraphCommandPort?: TaskGraphCommandPort
   /** This is the same usage-authorized Harness adapter used by TurnEngine. */
   readonly model: ModelAdapter
   readonly signal: AbortSignal
 }): Promise<CompactionResult | { readonly status: "skipped" }> {
   const source = await createPgCompactionSource(input.pool).load({ scope: input.scope, owner: input.owner })
   if (!source || !source.items.some(item => item.type !== "compaction_summary")) return { status: "skipped" }
+  const collection = collectCompactionState(source)
+  const trigger = evaluateCompactionTrigger({
+    inputTokens: collection.beforeInputTokens,
+    itemCount: collection.sourceItemIds.length,
+    atTurnBoundary: false,
+    requested: false,
+  }, DEFAULT_COMPACTION_POLICY)
+  if (!trigger.shouldCompact || !trigger.reason) return { status: "skipped", trigger, item: null }
+
+  // Selected-job graph reads happen only when the existing thresholds require compaction.
+  const compactionSource = input.taskGraphCommandPort
+    ? await createPgCompactionSource(input.pool, input.taskGraphCommandPort).load({ scope: input.scope, owner: input.owner })
+    : source
+  if (!compactionSource || !compactionSource.items.some(item => item.type !== "compaction_summary")) return { status: "skipped" }
   const compactor = new ContextCompactor(
     createPgContextSnapshotCompactionPort(input.pool, input.owner),
     narrativeSummarizer(input.model, input.lease, input.owner, input.signal),
@@ -77,12 +94,12 @@ export async function runTurnBoundaryContextCompaction(input: {
   return compactor.compact({
     scope: input.scope,
     turnId: input.lease.turnId,
-    source,
+    source: compactionSource,
     policy: DEFAULT_COMPACTION_POLICY,
     // This preflight runs at the boundary; the boundary itself is not a trigger.
     atTurnBoundary: false,
     requested: false,
-    itemId: `context-compaction:${input.lease.turnId}:${input.lease.leaseVersion}:${source.state.throughSequence}`,
+    itemId: `context-compaction:${input.lease.turnId}:${input.lease.leaseVersion}:${compactionSource.state.throughSequence}`,
   })
 }
 
