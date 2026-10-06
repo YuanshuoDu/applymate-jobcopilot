@@ -12,7 +12,7 @@ import {
   parseNativeVerificationControl,
 } from "./native-verification-contract.js"
 import { parseNativeVerificationPacket } from "./native-verification-packet.js"
-import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { parseTaskGraphSnapshot } from "./task-graph-snapshot.js"
 import type { TaskGraphExecutionScope } from "./task-graph-command-port.js"
 import type { SubagentJobPayload } from "./types.js"
 
@@ -733,14 +733,11 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
         yield emitUsage()
         const toolNames = request.tools.map(tool => (tool as { name?: unknown }).name)
         if (call === 1) {
-          expect(toolNames).toContain("agent.plan")
-          yield { type: "tool_call_completed", callId: `canonical-plan:${canonicalSuffix}`, name: "agent.plan", arguments: {
-            expectedRevision: 0,
-            nodes: [{ key: "fact-analysis", templateId: "analyst", goal: childGoal,
-              successCriteria: turnCriteria, dependsOn: [], verification: {
-                schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
-                criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }],
-              } }],
+          expect(toolNames).toContain("agent.spawn")
+          yield { type: "tool_call_completed", callId: `canonical-spawn:${canonicalSuffix}`, name: "agent.spawn", arguments: {
+            idempotencyKey: `canonical-spawn:${canonicalSuffix}`, role: "analyst", taskType: "research",
+            goal: childGoal, constraints: ["Inspect the owned job description only."], successCriteria: childCriteria,
+            allowedActions: ["jobs.search"], context: { fixture: "canonical-native-recovery" },
           } }
           yield { type: "completed", finishReason: "tool_calls" }
           return
@@ -752,7 +749,7 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
           value => typeof value === "string")
           const targetId = await waitForDatabase("canonical spawned target", async () => (await pool!.query<{ id: string }>(
             `SELECT "id" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2 AND "parentTaskId" = $3
-              AND "role" = 'analyst' AND "taskType" = 'job_analysis' AND "goal" = $4 ORDER BY "createdAt" LIMIT 1`,
+              AND "role" = 'analyst' AND "taskType" = 'research' AND "goal" = $4 ORDER BY "createdAt" LIMIT 1`,
             [canonical.sessionId, canonical.turnId, root, childGoal])).rows[0]?.id, value => typeof value === "string")
           originalChildTaskId = targetId
           const wait = nextWait(targetId, "target")
@@ -805,7 +802,7 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
         const replacement = (await pool!.query<{ id: string; status: string; attemptCount: number; maxAttempts: number; failureReason: string | null }>(
           `SELECT "id", "status", "attemptCount", "maxAttempts", "failureReason" FROM "sub_agent_tasks"
            WHERE "sessionId" = $1 AND "turnId" = $2 AND "rootTaskId" = $3 AND "role" = 'analyst'
-              AND "taskType" = 'job_analysis' AND "goal" = $4 AND "context"->'provenance'->>'sourceTaskId' = $5
+              AND "taskType" = 'research' AND "goal" = $4 AND "context"->'provenance'->>'sourceTaskId' = $5
            ORDER BY "createdAt" DESC LIMIT 1`, [canonical.sessionId, canonical.turnId, rootTaskId, followupChildGoal, failedChildTaskId])).rows[0]
         if (!replacement) throw new Error("canonical follow-up child was not persisted for the failed source")
         lastWaitDisposition = latestWait?.taskId === replacement.id
@@ -1057,14 +1054,13 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
         WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'turn.completed'`, [canonical.sessionId, canonical.turnId])
       expect(completedEvents.rows[0]?.count).toBe(1)
 
-      const taskRows = await pool!.query<{ id: string; role: string; taskType: string; goal: string; status: string; attemptCount: number; maxAttempts: number; failureReason: string | null; sourceTaskId: string | null; result: Record<string, unknown> | null; expectedOutputSchema: unknown }>(
+      const taskRows = await pool!.query<{ id: string; role: string; taskType: string; goal: string; status: string; attemptCount: number; maxAttempts: number; failureReason: string | null; sourceTaskId: string | null; result: Record<string, unknown> | null; context: unknown; expectedOutputSchema: unknown }>(
         `SELECT "id", "role", "taskType", "goal", "status", "attemptCount", "maxAttempts", "failureReason",
-          "context"->'provenance'->>'sourceTaskId' AS "sourceTaskId", "result", "expectedOutputSchema"
+          "context"->'provenance'->>'sourceTaskId' AS "sourceTaskId", "result", "context", "expectedOutputSchema"
          FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "createdAt", "id"`, [canonical.sessionId, canonical.turnId])
       const target = taskRows.rows.find(row => row.role === "analyst" && row.goal === childGoal)
       const replacement = taskRows.rows.find(row => row.role === "analyst" && row.goal === followupChildGoal && row.sourceTaskId === target?.id)
-      expect(target).toMatchObject({ status: "failed", failureReason: "turn_execution_failed" })
-      expect(target?.expectedOutputSchema).toEqual(TASK_GRAPH_TEMPLATES.analyst.expectedOutputSchema)
+      expect(target).toMatchObject({ role: "analyst", taskType: "research", status: "failed", failureReason: "turn_execution_failed" })
       expect(target?.attemptCount).toBe(target?.maxAttempts)
       expect(target?.attemptCount).toBe(3)
       expect(targetChildModelRequests).toBe(6)
@@ -1072,8 +1068,28 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
       expect(targetChildSearchCalls).toBe(3)
       expect(targetChildProviderFailures).toBe(3)
       expect(failedChildTaskId).toBe(target?.id)
-      expect(replacement).toMatchObject({ status: "completed", attemptCount: 1, sourceTaskId: target?.id })
-      expect(replacement?.expectedOutputSchema).toEqual(TASK_GRAPH_TEMPLATES.analyst.expectedOutputSchema)
+      expect(replacement).toMatchObject({ role: "analyst", taskType: "research", status: "completed", attemptCount: 1, sourceTaskId: target?.id })
+      expect(replacement?.expectedOutputSchema).toEqual(target?.expectedOutputSchema)
+      expect(replacement?.context).toMatchObject({
+        sourceContext: { fixture: "canonical-native-recovery" },
+        provenance: {
+          kind: "agent.followup", sourceTaskId: target?.id, sourceStatus: "failed", sourceAttemptCount: 3,
+          source: { taskId: target?.id, rootTaskId, role: "analyst", taskType: "research", status: "failed", attemptCount: 3, origin: "task_graph" },
+        },
+      })
+      const graphRows = await pool!.query<{ content: unknown }>(`SELECT "content" FROM "agent_items"
+        WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'task_graph' ORDER BY "revision" DESC LIMIT 1`,
+      [canonical.sessionId, canonical.turnId])
+      const graph = parseTaskGraphSnapshot(graphRows.rows[0]?.content)
+      const originalNode = graph.nodes.find(node => node.taskId === target?.id)
+      const replacementNode = graph.nodes.find(node => node.taskId === replacement?.id)
+      expect(originalNode).toMatchObject({ templateId: "native", nativeDelegation: {
+        operationKind: "spawn", callerTaskId: rootTaskId, role: "analyst", taskType: "research",
+      } })
+      expect(replacementNode).toMatchObject({ templateId: "native", nativeDelegation: {
+        operationKind: "followup", callerTaskId: rootTaskId, role: "analyst", taskType: "research",
+        source: { taskId: target?.id, rootTaskId, role: "analyst", taskType: "research", status: "failed", attemptCount: 3, origin: "task_graph" },
+      } })
       expect(JSON.stringify(replacement?.result)).toContain("Fact 42 is present")
       const reports = taskRows.rows.filter(row => row.role === "auditor" && row.taskType === "native_verification").map(row => {
         const control = parseNativeVerificationControl(row.expectedOutputSchema)
