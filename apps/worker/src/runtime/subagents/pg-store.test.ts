@@ -3,7 +3,7 @@ import type pg from "pg"
 import { deriveTaskGraphReadModel } from "../planning/task-graph.js"
 
 import { PgSubagentTaskStore } from "./pg-store.js"
-import { normalizeSubagentPolicy, SubagentLimitError, type SubagentPolicy } from "./types.js"
+import { normalizeSubagentPolicy, PAUSE_DEFERRED_MARKER, SubagentLimitError, type SubagentPolicy } from "./types.js"
 import { SessionPauseRequestedError } from "../session-gate.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION, parseTaskGraphSnapshot, taskGraphItemId } from "./task-graph-snapshot.js"
@@ -799,11 +799,13 @@ describe("PgSubagentTaskStore", () => {
     const dispatchReset = fake.calls.find(([sql]) => sql.startsWith('UPDATE "agent_outbox"'))
     expect(dispatchReset?.[0]).toContain('"publishedAt" = NULL')
     expect(dispatchReset?.[0]).toContain('"attemptCount" = "attemptCount" + 1')
-    expect(dispatchReset?.[0]).toContain('"lastError" = NULL')
+    expect(dispatchReset?.[0]).toContain('"lastError" = CASE WHEN "lastError" = $3 THEN "lastError" ELSE NULL END')
+    expect(dispatchReset?.[0]).toContain("jsonb_set(\"payload\", '{ownerId}'")
     expect(dispatchReset?.[0]).toContain('"topic" = \'agent.subagent.dispatch\'')
     expect(dispatchReset?.[0]).toContain('"idempotencyKey" = $1')
     expect(dispatchReset?.[0]).toContain('"aggregateId" = $2')
-    expect(dispatchReset?.[1]).toEqual(["subagent-dispatch:task-1", "session-1"])
+    expect(dispatchReset?.[1]?.slice(0, 3)).toEqual(["subagent-dispatch:task-1", "session-1", PAUSE_DEFERRED_MARKER])
+    expect(dispatchReset?.[1]?.[3]).toMatch(/^retry-/)
     expect(fake.calls.indexOf(dispatchReset!)).toBeGreaterThan(fake.calls.indexOf(update!))
   })
 
@@ -1024,7 +1026,10 @@ describe("PgSubagentTaskStore", () => {
     expect(updates[1]?.[0]).toContain('"topic" = \'agent.subagent.dispatch\'')
     expect(updates[1]?.[0]).toContain('"idempotencyKey" = $1')
     expect(updates[1]?.[0]).toContain('"aggregateId" = $2')
-    expect(updates[1]?.[1]).toEqual(["subagent-dispatch:task-1", "session-1"])
+    expect(updates[1]?.[0]).toContain('"lastError" = CASE WHEN "lastError" = $3 THEN "lastError" ELSE NULL END')
+    expect(updates[1]?.[0]).toContain("jsonb_set(\"payload\", '{ownerId}'")
+    expect(updates[1]?.[1]?.slice(0, 3)).toEqual(["subagent-dispatch:task-1", "session-1", PAUSE_DEFERRED_MARKER])
+    expect(updates[1]?.[1]?.[3]).toMatch(/^release-/)
   })
 
   it("does not release or redispatch a lease that expires while waiting for its task lock", async () => {

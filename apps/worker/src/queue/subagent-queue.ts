@@ -6,6 +6,7 @@ import { redisConnection } from "../redis.js"
 import { workerPollingOptions } from "./worker-polling-options.js"
 import { repairStaleSubagentDispatches } from "./subagent-dispatch-recovery.js"
 import { dispatchTaskInvalidReason, lockDispatchTask, lockPendingDispatch, markDispatchTerminal } from "./subagent-dispatch-eligibility.js"
+import { lockAndAdmitSubagentDispatch, markPauseAwareDispatchError, PAUSE_DEFERRED_MARKER, persistSubagentDispatch, repairDeferredSubagentDispatches, runSubagentQueueJob } from "./subagent-pause-dispatch.js"
 import { AgentTreeManager } from "../runtime/subagents/manager.js"
 import { parseSubagentJobPayload, type PgSubagentPool, type SubagentExecutionResult, type SubagentJobPayload, type SubagentLease } from "../runtime/subagents/types.js"
 import { OPEN_SESSION, RUNNABLE_SESSION } from "../runtime/session-gate.js"
@@ -13,6 +14,7 @@ export const SUBAGENT_QUEUE_NAME = "agent-subagents"
 export const SUBAGENT_DISPATCH_TOPIC = "agent.subagent.dispatch"
 export const SUBAGENT_DISPATCH_POLL_MS = 30_000
 export const SUBAGENT_MAX_BATCH = 50
+export { persistSubagentDispatch }
 export type SubagentQueueLike = { add(name: string, payload: SubagentJobPayload, options?: { jobId?: string; attempts?: number; delay?: number }): Promise<unknown>; close?(): Promise<void> }
 /** Queue boundary preserves the complete runtime outcome for manager.run to persist. */
 export type SubagentExecutor = (input: { lease: SubagentLease }) => Promise<SubagentExecutionResult>
@@ -37,23 +39,6 @@ async function lockRunnableDispatchSession(client: Pick<pg.PoolClient, "query">,
 }
 async function lockOpenDispatchSession(client: Pick<pg.PoolClient, "query">, sessionId: string): Promise<{ id: string } | undefined> {
   const result = await client.query<{ id: string }>(`SELECT session."id" FROM "agent_sessions" AS session WHERE session."id" = $1 AND ${OPEN_SESSION} FOR UPDATE`, [sessionId]); return result.rows[0]
-}
-export async function persistSubagentDispatch(pool: PgSubagentPool, payload: SubagentJobPayload, resetPublished = false): Promise<void> {
-  await transaction(pool, async client => {
-    const sessionFence = resetPublished ? RUNNABLE_SESSION : OPEN_SESSION
-    if (resetPublished) {
-      const session = await client.query<{ id: string }>(`SELECT session."id" FROM "agent_sessions" AS session
-        WHERE session."id" = $1 AND ${sessionFence} FOR UPDATE`, [payload.sessionId])
-      if (!session.rows[0]) return
-    }
-    const conflict = resetPublished
-      ? `ON CONFLICT ("idempotencyKey") DO UPDATE SET "payload" = EXCLUDED."payload", "publishedAt" = NULL, "lastError" = NULL, "attemptCount" = "agent_outbox"."attemptCount" + 1
-         WHERE "agent_outbox"."aggregateId" = EXCLUDED."aggregateId"`
-      : `ON CONFLICT ("idempotencyKey") DO NOTHING`
-    await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload") SELECT $1, $2, $3, $4, $5::jsonb
-      WHERE EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = $3 AND ${sessionFence}) ${conflict}`,
-    [randomUUID(), SUBAGENT_DISPATCH_TOPIC, payload.sessionId, subagentDispatchKey(payload.taskId), JSON.stringify(payload)])
-  })
 }
 /** Repairs runnable task rows that lost their durable dispatch intent. */
 export async function repairMissingSubagentDispatches(pool: PgSubagentPool, ownerId: string, limit = SUBAGENT_MAX_BATCH): Promise<number> {
@@ -154,6 +139,19 @@ export async function dispatchPendingSubagentOutbox(pool: PgSubagentPool, queue:
           if (malformed) await markDispatchTerminal(client, malformed.id, "schema_invalid_payload")
           return false
         }
+        const binding = await client.query<{ id: string; turnId: string | null }>(`SELECT "id", "turnId" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`, [scannedPayload.taskId, row.aggregateId])
+        if (!binding.rows[0]) {
+          const missing = await lockPendingDispatch(client, { ...row, topic: SUBAGENT_DISPATCH_TOPIC })
+          if (missing) await markDispatchTerminal(client, missing.id, "task_missing")
+          return false
+        }
+        const turnId = binding.rows[0].turnId
+        if (!turnId) {
+          const missing = await lockPendingDispatch(client, { ...row, topic: SUBAGENT_DISPATCH_TOPIC })
+          if (missing) await markDispatchTerminal(client, missing.id, "task_turn_missing")
+          return false
+        }
+        if (!await lockAndAdmitSubagentDispatch(client, { sessionId: session.id, userId: session.userId, turnId })) return false
         const task = await lockDispatchTask(client, { taskId: scannedPayload.taskId, sessionId: row.aggregateId, userId: session.userId })
         const locked = await lockPendingDispatch(client, { ...row, topic: SUBAGENT_DISPATCH_TOPIC })
         if (!locked) return false
@@ -181,15 +179,16 @@ export async function dispatchPendingSubagentOutbox(pool: PgSubagentPool, queue:
           throw error
         }
         await client.query(`UPDATE "agent_outbox" SET "publishedAt" = CURRENT_TIMESTAMP,
-          "attemptCount" = "attemptCount" + 1, "lastError" = NULL
+          "attemptCount" = "attemptCount" + 1,
+          "lastError" = CASE WHEN "lastError" = $4 THEN "lastError" ELSE NULL END
           WHERE "id" = $1 AND "aggregateId" = $2 AND "topic" = $3 AND "publishedAt" IS NULL`,
-        [locked.id, locked.aggregateId, SUBAGENT_DISPATCH_TOPIC])
+        [locked.id, locked.aggregateId, SUBAGENT_DISPATCH_TOPIC, PAUSE_DEFERRED_MARKER])
         return true
       })
       if (!published) continue
     } catch (error: unknown) {
       if (queueAddFailed) {
-        await markDispatchError(pool, row.id, "queue_add_failed").catch(() => undefined)
+        await markPauseAwareDispatchError(pool, row.id, "queue_add_failed", false).catch(() => undefined)
         throw queueAddFailure ?? error
       }
       // Delivery is at-least-once; reuse generation/job ID for idempotent retry.
@@ -200,21 +199,15 @@ export async function dispatchPendingSubagentOutbox(pool: PgSubagentPool, queue:
   }
   return dispatched
 }
-async function markDispatchError(pool: PgSubagentPool, id: string, error: string, terminal = false): Promise<void> {
-  const client = await pool.connect()
-  try { await client.query(`UPDATE "agent_outbox" SET "attemptCount" = "attemptCount" + 1,
-    "lastError" = $2, "publishedAt" = CASE WHEN $3 THEN CURRENT_TIMESTAMP ELSE "publishedAt" END
-    WHERE "id" = $1 AND "publishedAt" IS NULL`, [id, error, terminal]) }
-  finally { client.release() }
-}
 export async function recoverSubagentQueue(pool: PgSubagentPool, queue: SubagentQueueLike, manager: AgentTreeManager, limit = SUBAGENT_MAX_BATCH): Promise<{ reclaimed: number; terminal: number; repaired: number; dispatched: number }> {
   const report = await manager.recover(limit)
   for (const task of report.rows) {
     if (task.status !== "queued") continue
     await persistSubagentDispatch(pool, { taskId: task.id, sessionId: task.sessionId, rootTaskId: task.rootTaskId, ownerId: `recovery-${randomUUID()}` }, true)
   }
-  const staleRepaired = await repairStaleSubagentDispatches(pool, `recovery-${randomUUID()}`, limit)
-  const repaired = staleRepaired + await repairMissingSubagentDispatches(pool, `recovery-${randomUUID()}`, limit)
+  const repaired = await repairStaleSubagentDispatches(pool, `recovery-${randomUUID()}`, limit)
+    + await repairMissingSubagentDispatches(pool, `recovery-${randomUUID()}`, limit)
+    + await repairDeferredSubagentDispatches(pool, `recovery-${randomUUID()}`, limit)
   const dispatched = await dispatchPendingSubagentOutbox(pool, queue, limit)
   return { reclaimed: report.reclaimed, terminal: report.terminal, repaired, dispatched }
 }
@@ -244,7 +237,7 @@ export function createSubagentQueue(options: { manager: AgentTreeManager; execut
   const queue = options.queue ?? new Queue<SubagentJobPayload>(SUBAGENT_QUEUE_NAME, { connection: redisConnection, skipVersionCheck: true })
   const worker = new Worker<SubagentJobPayload>(SUBAGENT_QUEUE_NAME, async (job: Pick<Job<SubagentJobPayload>, "data">) => {
     const payload = parseSubagentJobPayload(job.data); if (!payload) throw new TypeError("Invalid Subagent queue payload")
-    const outcome = await options.manager.run(payload, options.execute); if (outcome.status === "lease_lost") throw new Error(outcome.reason ?? "Subagent lease was lost"); return outcome
+    return runSubagentQueueJob(getPool(), options.manager, options.execute, payload)
   }, { connection: redisConnection, skipVersionCheck: true, ...workerPollingOptions(), concurrency: 8 })
   return { queue, worker, async close() { await worker.close(); await queue.close?.() } }
 }

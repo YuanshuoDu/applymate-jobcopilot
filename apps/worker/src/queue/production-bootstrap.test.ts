@@ -241,10 +241,23 @@ function durableCompositionPool(input: {
       if (statement === "BEGIN" || statement === "COMMIT" || statement === "ROLLBACK" || sql.includes("set_config")) return response<T>([], 1)
 
       if (sql.includes('SELECT session."userId"')) {
-        return response<T>(state.session.status === "running" ? [{ userId: state.session.userId }] : [], state.session.status === "running" ? 1 : 0)
+        const owned = String(params[0]) === state.session.id && String(params[1]) === state.turn.id
+          && state.turn.sessionId === state.session.id && state.turn.userId === state.session.userId
+          && !["aborted", "archived"].includes(state.session.status)
+        return response<T>(owned ? [{ userId: state.session.userId }] : [], owned ? 1 : 0)
       }
       if (sql.includes('SELECT session."id" FROM "agent_sessions"')) {
-        return response<T>(state.session.status === "running" ? [{ id: state.session.id }] : [], state.session.status === "running" ? 1 : 0)
+        const admission = sql.includes('pause_request."type" = \'session.pause_requested\'')
+        const owned = String(params[0]) === state.session.id
+          && (params[1] === undefined || String(params[1]) === state.session.userId)
+          && (!admission || String(params[2]) === state.turn.id && state.turn.sessionId === state.session.id && state.turn.userId === state.session.userId)
+        const paused = admission && state.events.some(pause => pause.type === "session.pause_requested"
+          && pause.sessionId === state.session.id && pause.turnId === state.turn.id
+          && !state.events.some(resume => resume.type === "session.resume_requested"
+            && resume.sessionId === pause.sessionId && resume.turnId === pause.turnId
+            && BigInt(String(resume.sequence)) > BigInt(String(pause.sequence))))
+        const admitted = owned && (admission ? state.session.status === "running" && !paused : !["aborted", "archived"].includes(state.session.status))
+        return response<T>(admitted ? [{ id: state.session.id }] : [], admitted ? 1 : 0)
       }
       if (sql.includes('SELECT "id", "sessionId", "userId", "status", "leaseOwnerId"') && sql.includes('FROM "agent_turns" WHERE "id" = $1') && sql.includes("FOR UPDATE")) {
         const queryNow = params[5] instanceof Date ? params[5] : new Date(String(params[5]))
@@ -305,6 +318,13 @@ function durableCompositionPool(input: {
         return response<T>(String(params[0]) === input.root.id ? [rootRow()] : [])
       }
 
+      if (sql.includes('SELECT turn."id", turn."userId", turn."sessionId", turn."rootTaskId", turn."status", turn."leaseOwnerId"')
+        && sql.includes('session."status" AS "sessionStatus"') && sql.includes('JOIN "agent_turns" AS turn')) {
+        const active = ["in_progress", "waiting_for_dependency"].includes(state.turn.status)
+          && state.turn.sessionId === state.session.id && state.turn.userId === state.session.userId
+          && !["aborted", "archived"].includes(state.session.status) && state.turn.rootTaskId !== null
+        return response<T>(active ? [{ ...turnRow(), sessionStatus: state.session.status }] : [], active ? 1 : 0)
+      }
       if (sql.includes('JOIN "agent_turns" AS turn')) {
         const active = ["in_progress", "waiting_for_dependency"].includes(state.turn.status)
         return response<T>(active ? [turnRow()] : [], active ? 1 : 0)

@@ -2,15 +2,17 @@ import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import { SessionPauseRequestedError } from "../session-gate.js"
 import { claimSubagentTask } from "./pg-store-claim.js"
-import { normalizeSubagentPolicy } from "./types.js"
+import { PAUSE_DEFERRED_MARKER, normalizeSubagentPolicy, type SubagentJobPayload } from "./types.js"
 
 const input = {
   taskId: "child-1", sessionId: "session-1", ownerId: "worker-1", rootTaskId: "root-1",
   policy: normalizeSubagentPolicy({ maxConcurrency: 2 }), now: new Date("2026-10-06T10:00:00Z"),
 }
 
-function poolFixture(options: { pause?: boolean; rootInterrupted?: boolean; turnUnavailable?: boolean } = {}) {
+type DeferredFence = { lastError: string | null; payload?: unknown }
+function poolFixture(options: { pause?: boolean; rootInterrupted?: boolean; turnUnavailable?: boolean; outbox?: DeferredFence } = {}) {
   const calls: string[] = []
+  const outbox = options.outbox ? { ...options.outbox, payload: options.outbox.payload ?? { taskId: "child-1", sessionId: "session-1", rootTaskId: "root-1", ownerId: "worker-1" } } : null
   const task = { id: "child-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
     path: "/root-1/child-1", depth: 1, role: "analyst", taskType: "test", status: "running", goal: "inspect", constraints: [],
     successCriteria: [], allowedActions: [], context: {}, expectedOutputSchema: {}, attemptCount: 1, maxAttempts: 3,
@@ -28,15 +30,17 @@ function poolFixture(options: { pause?: boolean; rootInterrupted?: boolean; turn
       if (sql.includes('SELECT "id", "turnId", "status", "interruptRequestedAt"')) return { rows: [{ id: "root-1", turnId: "turn-1", status: "running", interruptRequestedAt: options.rootInterrupted ? new Date() : null }], rowCount: 1 }
       if (sql.includes('SELECT "id", "turnId", "rootTaskId", "status", "interruptRequestedAt"')) return { rows: [{ id: "child-1", turnId: "turn-1", rootTaskId: "root-1", status: "queued", interruptRequestedAt: null }], rowCount: 1 }
       if (sql.includes('SELECT session."id" FROM "agent_sessions"')) return options.pause ? { rows: [], rowCount: 0 } : { rows: [{ id: "session-1" }], rowCount: 1 }
+      if (sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes("FOR UPDATE")) return outbox ? { rows: [{ id: "dispatch-1", payload: outbox.payload, lastError: outbox.lastError }], rowCount: 1 } : { rows: [], rowCount: 0 }
       if (sql.includes("COUNT(*)::int")) return { rows: [{ count: 0 }], rowCount: 1 }
       if (sql.includes('SELECT task."turnId", task."rootTaskId"')) return { rows: [{ turnId: "turn-1", rootTaskId: "root-1", parentTaskId: null, attemptCount: 0, userId: "user-1" }], rowCount: 1 }
       if (sql.startsWith('UPDATE "sub_agent_tasks"')) return { rows: [], rowCount: 1 }
+      if (sql.startsWith('UPDATE "agent_outbox" SET "lastError" = NULL')) { if (outbox) outbox.lastError = null; return { rows: [], rowCount: 1 } }
       if (sql.startsWith("SELECT task.*")) return { rows: [task], rowCount: 1 }
       return { rows: [], rowCount: 0 }
     }),
     release: vi.fn(),
   }
-  return { pool: { connect: vi.fn().mockResolvedValue(client) } as unknown as Pick<pg.Pool, "connect">, calls, client }
+  return { pool: { connect: vi.fn().mockResolvedValue(client) } as unknown as Pick<pg.Pool, "connect">, calls, client, outbox }
 }
 
 describe("atomic child claim pause fence", () => {
@@ -76,5 +80,32 @@ describe("atomic child claim pause fence", () => {
     const fake = poolFixture({ rootInterrupted: true })
     await expect(claimSubagentTask(fake.pool, input, 60_000)).resolves.toBeNull()
     expect(fake.calls.some(sql => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
+  })
+
+  it("rejects a stale deferred delivery owner atomically before spending an attempt", async () => {
+    const payload: SubagentJobPayload = { taskId: "child-1", sessionId: "session-1", rootTaskId: "root-1", ownerId: "new-generation-owner" }
+    const fake = poolFixture({ outbox: { lastError: PAUSE_DEFERRED_MARKER, payload } })
+    await expect(claimSubagentTask(fake.pool, input, 60_000)).resolves.toBeNull()
+    expect(fake.calls.some(sql => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
+    const task = fake.calls.findIndex(sql => sql.includes('SELECT "id", "turnId", "rootTaskId", "status", "interruptRequestedAt"'))
+    const fence = fake.calls.findIndex(sql => sql.includes('FROM "agent_outbox" AS dispatch'))
+    expect(fence).toBeGreaterThan(task)
+    expect(fake.calls.at(-1)).toBe("COMMIT")
+  })
+
+  it("allows the current deferred owner and retains its fence across the claim", async () => {
+    const fake = poolFixture({ outbox: { lastError: PAUSE_DEFERRED_MARKER } })
+    await expect(claimSubagentTask(fake.pool, input, 60_000)).resolves.toMatchObject({ id: "child-1", attemptCount: 1 })
+    expect(fake.outbox?.lastError).toBe(PAUSE_DEFERRED_MARKER)
+    const fence = fake.calls.findIndex(sql => sql.includes('FROM "agent_outbox" AS dispatch'))
+    const claim = fake.calls.findIndex(sql => sql.startsWith('UPDATE "sub_agent_tasks"'))
+    expect(fence).toBeLessThan(claim)
+    expect(fake.calls.some(sql => sql.startsWith('UPDATE "agent_outbox" SET "lastError" = NULL'))).toBe(false)
+  })
+
+  it("preserves ordinary outbox and direct-claim owner compatibility", async () => {
+    const fake = poolFixture({ outbox: { lastError: "queue_add_failed", payload: { taskId: "child-1", sessionId: "session-1", rootTaskId: "root-1", ownerId: "normal-outbox-owner" } } })
+    await expect(claimSubagentTask(fake.pool, input, 60_000)).resolves.toMatchObject({ id: "child-1" })
+    expect(fake.calls.some(sql => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(true)
   })
 })

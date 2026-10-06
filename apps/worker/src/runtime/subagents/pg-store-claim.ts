@@ -2,7 +2,7 @@ import { RUNNABLE_SESSION, assertSessionWorkAdmission } from "../session-gate.js
 import { lockSubagentTurnForWork, readSubagentTask, SubagentTurnUnavailableError } from "./pg-store-create.js"
 import { transaction } from "./pg-store-persistence.js"
 import { persistGraphTransition, prepareGraphTransition } from "./task-graph-pg-lifecycle.js"
-import type { PgSubagentPool, SubagentPolicy, SubagentTaskRecord } from "./types.js"
+import { PAUSE_DEFERRED_MARKER, parseSubagentJobPayload, type PgSubagentPool, type SubagentPolicy, type SubagentTaskRecord } from "./types.js"
 
 type ClaimInput = { taskId: string; sessionId: string; ownerId: string; rootTaskId?: string; policy: SubagentPolicy; now: Date }
 
@@ -27,6 +27,8 @@ export async function claimSubagentTask(pool: PgSubagentPool, input: ClaimInput,
       throw error
     }
 
+    await assertSessionWorkAdmission(client, { userId, sessionId: input.sessionId, turnId })
+
     const root = await client.query(`SELECT "id", "turnId", "status", "interruptRequestedAt" FROM "sub_agent_tasks"
       WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 FOR UPDATE`, [rootTaskId, input.sessionId, turnId])
     const rootRow = root.rows[0] as Record<string, unknown> | undefined
@@ -38,7 +40,15 @@ export async function claimSubagentTask(pool: PgSubagentPool, input: ClaimInput,
     if (!taskRow || taskRow.turnId !== turnId || taskRow.rootTaskId !== rootTaskId
       || taskRow.status !== "queued" || taskRow.interruptRequestedAt != null) return null
 
-    await assertSessionWorkAdmission(client, { userId, sessionId: input.sessionId, turnId })
+    const dispatch = await client.query<{ id: string; payload: unknown; lastError: string | null }>(`SELECT dispatch."id", dispatch."payload", dispatch."lastError"
+      FROM "agent_outbox" AS dispatch WHERE dispatch."topic" = 'agent.subagent.dispatch'
+        AND dispatch."aggregateId" = $1 AND dispatch."idempotencyKey" = 'subagent-dispatch:' || $2 FOR UPDATE`, [input.sessionId, input.taskId])
+    const deferred = dispatch.rows[0]
+    if (deferred?.lastError === PAUSE_DEFERRED_MARKER) {
+      const payload = parseSubagentJobPayload(deferred.payload)
+      if (!payload || payload.taskId !== input.taskId || payload.sessionId !== input.sessionId
+        || payload.rootTaskId !== rootTaskId || payload.ownerId !== input.ownerId) return null
+    }
     const running = await client.query(`SELECT COUNT(*)::int AS "count" FROM "sub_agent_tasks"
       WHERE "sessionId" = $1 AND "status" = 'running' AND "leaseExpiresAt" > clock_timestamp()`, [input.sessionId])
     if (Number(running.rows[0]?.count ?? 0) >= input.policy.maxConcurrency) return null
