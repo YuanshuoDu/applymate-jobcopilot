@@ -37,6 +37,35 @@ describe("native verification private evidence", () => {
     await expect(buildNativeChildPacketContent(clientWithoutFact, state, target)).resolves.toBeNull()
   })
 
+  it("fails closed when child, graph, or legacy source results contain secret-key fields", async () => {
+    const secretResult = { nested: { accessToken: "private-token" } }
+    const child = { id: "child-secret", parentTaskId: "root-1", rootTaskId: "root-1", turnId: "turn-1", role: "analyst", taskType: "research",
+      status: "completed", attemptCount: 1, result: secretResult, failureReason: null, goal: objective.goal,
+      successCriteria: objective.successCriteria, expectedOutputSchema: {}, context: {}, outputArtifactIds: [] }
+    const childNode = { key: "child", taskId: child.id, goal: objective.goal, successCriteria: objective.successCriteria, dependsOn: [], depth: 1 }
+    const childState = { scope, snapshot: null, tasks: new Map([[child.id, child]]), sourceTasks: new Map(), goal: objective.goal,
+      criteria: objective.successCriteria, criteriaValid: true, nativeSourcesValid: true, turnGoalConflict: false, turnInputDigest: "f".repeat(64) } as NativeVerificationOwnedState
+    const target: NativeVerificationTarget = { node: childNode as unknown as StoredTaskGraphNode, task: child, attempt: 1, goal: objective.goal,
+      criteria: objective.successCriteria, resultText: canonicalNativeVerificationJson(secretResult), resultDigest: digestNativeVerificationValue(secretResult) }
+    const unusedClient = { query: vi.fn() } as unknown as Pick<pg.PoolClient, "query">
+    await expect(buildNativeChildPacketContent(unusedClient, childState, target)).resolves.toBeNull()
+
+    const graphLeaf = { key: "leaf", taskId: "leaf-secret", goal: "Resolve the case", successCriteria: ["Identify cause"], dependsOn: [], depth: 1 }
+    const cleanTask = { ...child, id: "leaf-secret", result: { conclusion: "clean" }, goal: graphLeaf.goal, successCriteria: graphLeaf.successCriteria }
+    const graphSecret = { ...cleanTask, result: { nested: { apiKey: "private-key" } } }
+    const rootState = { scope, snapshot: { nodes: [graphLeaf] }, tasks: new Map([[graphSecret.id, graphSecret]]), sourceTasks: new Map(),
+      goal: "Original user goal", criteria: ["Satisfy original user goal"], criteriaValid: true, nativeSourcesValid: true,
+      turnGoalConflict: false, turnInputDigest: "a".repeat(64) } as unknown as NativeVerificationOwnedState
+    const buildRoot = (state: NativeVerificationOwnedState) => buildNativeRootPacketContent({ state, candidateText: "candidate",
+      childBindingSetDigest: "b".repeat(64), history: [] })
+    expect(buildRoot(rootState)).toBeNull()
+
+    const legacy = { ...cleanTask, id: "legacy-secret", parentTaskId: "ancestor-1", goal: "Earlier failed research",
+      successCriteria: ["Preserve original evidence"], status: "failed", result: JSON.stringify(secretResult), failureReason: "earlier failure" }
+    const legacyState = { ...rootState, tasks: new Map([[cleanTask.id, cleanTask]]), sourceTasks: new Map([[legacy.id, legacy]]) }
+    expect(buildRoot(legacyState)).toBeNull()
+  })
+
   it("places actual leaf results, failed history and out-of-graph legacy source material in root evidence", () => {
     const leaf = { key: "leaf", taskId: "leaf-1", goal: "Resolve the case", successCriteria: ["Identify cause"], dependsOn: [], depth: 1 }
     const leafTask = { id: "leaf-1", parentTaskId: "root-1", rootTaskId: "root-1", turnId: "turn-1", role: "analyst", taskType: "casework",

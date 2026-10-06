@@ -61,6 +61,7 @@ export function nativeVerificationRootPacketHistory(
 export async function buildNativeChildPacketContent(
   client: Queryable, state: NativeVerificationOwnedState, target: NativeVerificationTarget,
 ): Promise<NativeVerificationPacketContent | null> {
+  if (containsSecretField(target.task.result)) return null
   const evidence = await readTargetEvidence(client, state, target)
   if (!evidence) return null
   const referenceId = evidenceRef("target", `${target.task.id}:${target.attempt}`)
@@ -92,6 +93,7 @@ export function buildNativeRootPacketContent(input: Readonly<{
   for (const node of nodes) {
     const task = state.tasks.get(node.taskId)
     if (!task) return null
+    if (task.result !== null && containsSecretField(task.result)) return null
     let resultDigest: string | null = null
     try { if (task.result !== null) resultDigest = digestNativeVerificationValue(task.result) } catch { return null }
     const safeFailure = task.failureReason === null ? null : redactSensitiveText(task.failureReason)
@@ -113,6 +115,7 @@ export function buildNativeRootPacketContent(input: Readonly<{
   }
   for (const task of state.sourceTasks.values()) {
     if (nodes.some(node => node.taskId === task.id)) continue
+    if (task.result !== null && containsSecretField(task.result)) return null
     let resultDigest: string | null = null
     try { if (task.result !== null) resultDigest = digestNativeVerificationValue(task.result) } catch { return null }
     let result: unknown = null
@@ -219,6 +222,13 @@ async function readTargetEvidence(
 }
 
 function containsSecretField(value: unknown): boolean {
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value) as unknown
+      if (parsed !== value) return containsSecretField(parsed)
+    } catch { /* ordinary persisted string */ }
+    return false
+  }
   if (Array.isArray(value)) return value.some(containsSecretField)
   if (!value || typeof value !== "object") return false
   return Object.entries(value).some(([key, child]) => SECRET_KEY.test(key) || containsSecretField(child))
