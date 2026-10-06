@@ -5,6 +5,7 @@ export const SUBAGENT_HEARTBEAT_INTERVAL_MS = 20_000
 export const SUBAGENT_MAX_DEPTH = 8
 export const SUBAGENT_MAX_FAN_OUT = 8
 export const SUBAGENT_DEFAULT_MAX_ATTEMPTS = 3
+export const PAUSE_DEFERRED_MARKER = "deferred:session_pause_requested"
 
 export type SubagentTaskStatus =
   | "queued"

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto"
 import type pg from "pg"
-import { isTerminalSubagentStatus, type AtomicSubagentSpawnInput, type AtomicSubagentSpawnResult, type PgSubagentPool,
+import { isTerminalSubagentStatus, PAUSE_DEFERRED_MARKER, type AtomicSubagentSpawnInput, type AtomicSubagentSpawnResult, type PgSubagentPool,
   type SubagentExecutionResult, type SubagentRetryDisposition, type SubagentStore, type SubagentTaskRecord, type SubagentTaskSpec, type SubagentPolicy } from "./types.js"
 import { computeSubagentNextAttemptAt } from "./retry-policy.js"
 import { persistGraphTransition, prepareGraphTransition, reconcileGraphDependents } from "./task-graph-pg-lifecycle.js"
@@ -148,9 +148,11 @@ export class PgSubagentTaskStore implements SubagentStore {
         if (interrupted) await client.query(`DELETE FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch' AND "aggregateId" = $1 AND "idempotencyKey" = $2 AND "publishedAt" IS NULL`,
           [input.sessionId, `subagent-dispatch:${input.taskId}`])
         if (retry) {
-          await client.query(`UPDATE "agent_outbox" SET "publishedAt" = NULL, "attemptCount" = "attemptCount" + 1, "lastError" = NULL
+          await client.query(`UPDATE "agent_outbox" SET "publishedAt" = NULL, "attemptCount" = "attemptCount" + 1,
+            "payload" = CASE WHEN "lastError" = $3 THEN jsonb_set("payload", '{ownerId}', to_jsonb($4::text), true) ELSE "payload" END,
+            "lastError" = CASE WHEN "lastError" = $3 THEN "lastError" ELSE NULL END
             WHERE "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $1 AND "aggregateId" = $2`,
-          [`subagent-dispatch:${input.taskId}`, input.sessionId])
+          [`subagent-dispatch:${input.taskId}`, input.sessionId, PAUSE_DEFERRED_MARKER, `retry-${randomUUID()}`])
         }
         if (status === "completed" && mailboxMessageIds.length > 0) {
           await client.query(`UPDATE "agent_mailbox_messages" AS message
@@ -190,9 +192,11 @@ export class PgSubagentTaskStore implements SubagentStore {
       [input.taskId, input.sessionId, input.ownerId, input.attemptCount, releasedAt])
       if (updated.rowCount !== 1) return false
       if (graph) await persistGraphTransition(client, graph, releasedAt)
-      await client.query(`UPDATE "agent_outbox" SET "publishedAt" = NULL, "attemptCount" = "attemptCount" + 1, "lastError" = NULL
+      await client.query(`UPDATE "agent_outbox" SET "publishedAt" = NULL, "attemptCount" = "attemptCount" + 1,
+        "payload" = CASE WHEN "lastError" = $3 THEN jsonb_set("payload", '{ownerId}', to_jsonb($4::text), true) ELSE "payload" END,
+        "lastError" = CASE WHEN "lastError" = $3 THEN "lastError" ELSE NULL END
         WHERE "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $1 AND "aggregateId" = $2`,
-      [`subagent-dispatch:${input.taskId}`, input.sessionId])
+      [`subagent-dispatch:${input.taskId}`, input.sessionId, PAUSE_DEFERRED_MARKER, `release-${randomUUID()}`])
       return true
     })
   }
