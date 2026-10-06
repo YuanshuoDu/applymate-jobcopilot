@@ -92,6 +92,21 @@ describe("parseTaskGraphSnapshot", () => {
     })
   })
 
+  it("round-trips the optional pinned root checklist while preserving legacy snapshots", () => {
+    const legacy = parseTaskGraphSnapshot(snapshotWithNodes([storedNode("legacy")]));
+    expect(legacy).not.toHaveProperty("rootSuccessCriteria");
+    const pinned = parseTaskGraphSnapshot({ ...snapshotWithNodes([storedNode("pinned")]), rootSuccessCriteria: ["Whole human objective", "Include evidence"] });
+    expect(parseTaskGraphSnapshot(canonicalTaskGraphJson(pinned))).toEqual(pinned);
+    const state = { ...taskGraphState(pinned, 1, new Map([["task-pinned", { status: "queued", failureReason: null }]]), []), rootSuccessCriteria: pinned.rootSuccessCriteria }
+    expect(taskGraphSnapshot(state, new Map([ ["pinned", "task-pinned"] ]))).toEqual(pinned);
+    const maximumPin = ["g".repeat(2_000), ...Array.from({ length: 4 }, (_, index) => `${index}${"x".repeat(511)}`)]
+    expect(parseTaskGraphSnapshot({ ...snapshotWithNodes([storedNode("maximum")]), rootSuccessCriteria: maximumPin }).rootSuccessCriteria).toEqual(maximumPin);
+    for (const rootSuccessCriteria of [[], null, ["Whole human objective", "Whole human objective"], ["x".repeat(2_001)],
+      ["Whole human objective", "x".repeat(513)], ["Whole human objective", ...Array.from({ length: 6 }, (_, index) => `extra ${index}`)]]) {
+      expect(() => parseTaskGraphSnapshot({ ...snapshotWithNodes([storedNode("invalid")]), rootSuccessCriteria })).toThrow();
+    }
+  })
+
   it("preserves normalized typed contracts in canonical snapshots and identifies old nodes as legacy", () => {
     const typed = parseTaskGraphSnapshot(snapshotWithNodes([{
       ...storedNode("typed"), templateId: "analyst", verification: analystVerification, verificationDisposition: "typed",

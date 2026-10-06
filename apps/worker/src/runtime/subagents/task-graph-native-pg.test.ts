@@ -1,11 +1,18 @@
 import { describe, expect, it, vi } from "vitest"
 
+const nativeAppendMocks = vi.hoisted(() => ({
+  createChild: vi.fn(), enqueue: vi.fn(), writeSnapshot: vi.fn(), appendReceipt: vi.fn(),
+}))
+vi.mock("./pg-store-create.js", () => ({ createSubagentTask: nativeAppendMocks.createChild }))
+vi.mock("./task-graph-pg-create.js", () => ({ enqueueGraphTask: nativeAppendMocks.enqueue }))
+vi.mock("./task-graph-pg-events.js", () => ({ writeTaskGraphSnapshot: nativeAppendMocks.writeSnapshot, appendTaskGraphReceipt: nativeAppendMocks.appendReceipt }))
+
 import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
-import { findNativeCommandReplay } from "./task-graph-native-pg.js"
+import { appendNativeGraphCommand, findNativeCommandReplay } from "./task-graph-native-pg.js"
 import type { TaskGraphNativeCommandInput, TaskGraphNativeCommandReceipt, TaskGraphNativeSourceProvenance } from "./task-graph-native-command.js"
 import { normalizeNativeCommand } from "./task-graph-native-request.js"
 import { TASK_GRAPH_NATIVE_METADATA_VERSION } from "./task-graph-native-state.js"
-import { taskGraphItemId, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
+import { taskGraphItemId, TASK_GRAPH_SNAPSHOT_VERSION, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import type { Queryable } from "./pg-store-persistence.js"
 
 const scope: TaskGraphNativeCommandInput["scope"] = {
@@ -60,6 +67,46 @@ function queryFor(event: unknown): { client: Queryable; query: ReturnType<typeof
 }
 
 describe("durable native TaskGraph replay", () => {
+  it.each(["spawn", "followup"] as const)("preserves a pinned root checklist during native %s snapshot writes", async kind => {
+    vi.clearAllMocks()
+    const pinned = ["Whole original objective", "Include evidence"]
+    const sourceRow = {
+      id: "source-1", rootTaskId: scope.rootTaskId, parentTaskId: scope.rootTaskId, turnId: scope.turnId,
+      role: "auditor", taskType: "audit", status: "completed", attemptCount: 0, result: {}, context: {},
+      expectedOutputSchema: {}, allowedActions: ["jobs.search"], budgetSnapshot: {},
+    }
+    const child = {
+      id: "child-2", rootTaskId: scope.rootTaskId, parentTaskId: scope.rootTaskId, path: "/root-1/child-2",
+      depth: 1, role: kind === "spawn" ? "scout" : "auditor", taskType: kind === "spawn" ? "research" : "audit",
+      status: "queued", budgetSnapshot: {}, allowedActions: [],
+    }
+    nativeAppendMocks.createChild.mockResolvedValue(child)
+    nativeAppendMocks.enqueue.mockResolvedValue(undefined)
+    nativeAppendMocks.writeSnapshot.mockResolvedValue({ itemId: taskGraphItemId(scope.rootTaskId), revision: 2 })
+    nativeAppendMocks.appendReceipt.mockResolvedValue("event-2")
+    const query = vi.fn(async (sql: string) => sql.includes("FROM \"sub_agent_tasks\" AS task JOIN")
+      ? { rows: [sourceRow], rowCount: 1 } : { rows: [], rowCount: 1 })
+    const client = { query } as unknown as Queryable
+    const request = kind === "spawn"
+      ? { kind, idempotencyKey: "native-spawn-pin", role: "scout" as const, taskType: "research", goal: "Find roles" }
+      : { kind, idempotencyKey: "native-followup-pin", sourceTaskId: "source-1", goal: "Refine the audit" }
+    const input = { scope, request } as TaskGraphNativeCommandInput
+    const command = normalizeNativeCommand(input)
+    const loaded = {
+      rootTaskId: scope.rootTaskId, item: { id: taskGraphItemId(scope.rootTaskId), revision: 1, content: null, createdAt: new Date() },
+      snapshot: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [], rootSuccessCriteria: pinned } as TaskGraphSnapshot,
+      state: { revision: 1, nodes: [], appliedEvents: [] }, tasks: new Map(),
+    }
+
+    await appendNativeGraphCommand(client, input, command, { budgetSnapshot: {}, allowedActions: [] }, loaded)
+
+    const written = nativeAppendMocks.writeSnapshot.mock.calls[0]?.[2] as TaskGraphSnapshot | undefined
+    expect(written?.rootSuccessCriteria).toEqual(pinned)
+    expect(nativeAppendMocks.appendReceipt.mock.calls[0]?.[1]).toMatchObject({
+      payload: { kind: "native_command", content: { rootSuccessCriteria: pinned } },
+    })
+  })
+
   it("returns the original spawn receipt without depending on later graph revisions", async () => {
     const input: TaskGraphNativeCommandInput = {
       scope, request: { kind: "spawn", idempotencyKey: "native-1", role: "scout", taskType: "research", goal: "Find jobs" },

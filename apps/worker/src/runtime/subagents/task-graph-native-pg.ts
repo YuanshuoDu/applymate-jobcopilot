@@ -104,7 +104,7 @@ export async function appendNativeGraphCommand(
   const taskIds = new Map(loaded.snapshot?.nodes.map(node => [node.key, node.taskId] as const) ?? [])
   taskIds.set(key, child.id)
   const state = { ...appended.state, nodes: appended.state.nodes.map(node => node.key === key ? { ...node, status: child.status } : node) }
-  const snapshot = taskGraphSnapshot(state, taskIds)
+  const snapshot = taskGraphSnapshot(state, taskIds, loaded.snapshot?.rootSuccessCriteria)
   const itemId = taskGraphItemId(input.scope.parentTaskId)
   const receipt: TaskGraphNativeCommandReceipt = {
     status: "accepted", replay: false, operationId: command.operationId,

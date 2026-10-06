@@ -82,8 +82,9 @@ export async function loadNativeVerificationOwnedState(
   const turnGoalConflict = !turnGoal.valid || !goal || !rootGoal || goal !== rootGoal
   const turnCriteria = criteriaField(canonicalInput, "successCriteria")
   const rootCriteria = criteriaField(root, "successCriteria")
-  const criteriaValid = turnCriteria.valid && rootCriteria.valid
-  const criteria = criteriaValid ? mergeCriteria(turnCriteria.value, rootCriteria.value, goal) : []
+  const pinnedCriteria = snapshot?.rootSuccessCriteria
+  const criteriaValid = turnCriteria.valid && rootCriteria.valid && (pinnedCriteria === undefined || (goal !== null && pinnedCriteria[0] === goal))
+  const criteria = criteriaValid ? mergeCriteria(turnCriteria.value, rootCriteria.value, goal, pinnedCriteria) : []
   let turnInputDigest: string | null = null
   try { turnInputDigest = digestNativeVerificationValue(root.input) } catch { /* unavailable input is carried as a failed binding */ }
 
@@ -149,8 +150,8 @@ function criteriaField(row: Row | null, key: string): Readonly<{ value: readonly
   return parsed ? { value: parsed, valid: true } : { value: [], valid: false }
 }
 
-function mergeCriteria(turnCriteria: readonly string[], rootCriteria: readonly string[], goal: string | null): readonly string[] {
-  const merged = [...new Set([...turnCriteria, ...rootCriteria])]
+function mergeCriteria(turnCriteria: readonly string[], rootCriteria: readonly string[], goal: string | null, pinned?: readonly string[]): readonly string[] {
+  const merged = [...new Set(pinned && goal ? [goal, ...turnCriteria, ...rootCriteria, ...pinned.slice(1)] : [...turnCriteria, ...rootCriteria])]
   if (merged.length > MAX_CRITERIA) return []
   return merged.length ? merged : goal ? [goal] : []
 }
