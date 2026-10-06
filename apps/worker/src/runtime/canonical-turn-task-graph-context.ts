@@ -10,6 +10,7 @@ import {
 import { type TaskGraphRepairOf } from "./planning/task-graph.js"
 import type { TurnLease } from "./turns/lease.js"
 import type { SubagentTaskRecord } from "./subagents/types.js"
+import { nativeGraphNodeFields } from "./canonical-turn-native-graph-context.js"
 const SELECTED_JOB_ROOT_TOOLS = new Set(["agent.plan", "agent.wait", "agent.list", "list_subagents"])
 
 export function isSelectedJobRootTool(definition: unknown): boolean {
@@ -19,7 +20,6 @@ export function isSelectedJobRootTool(definition: unknown): boolean {
 export function selectedJobToolAllowed(name: string): boolean {
   return SELECTED_JOB_ROOT_TOOLS.has(name)
 }
-
 /** Restrict selected-job root context to coordination tools and the current graph observation. */
 export function selectedJobSnapshot(snapshot: StepContextSnapshot): StepContextSnapshot {
   return {
@@ -196,7 +196,7 @@ function node(value: unknown): TaskGraphCurrentNode {
     resultSummary: null,
     resultProjection: projection(row.resultProjection),
     ...(verificationCriterionIds ? { verificationCriterionIds } : {}), ...(verificationReport ? { verificationReport } : {}),
-    ...(repairOf ? { repairOf } : {}), ...(repairReceipt ? { repairReceipt } : {}),
+    ...(repairOf ? { repairOf } : {}), ...(repairReceipt ? { repairReceipt } : {}), ...nativeGraphNodeFields(row),
     failureReason: null,
   }
 }
