@@ -199,6 +199,63 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.events.some(event => event.type === "turn.failed")).toBe(false)
   })
 
+  it("rethrows the same typed pause from the actual completion-gate boundary", async () => {
+    const pause = new SessionPauseRequestedError()
+    const gate = vi.fn(async () => { throw pause })
+    const root = fixture(identity("turn", "root-1"), undefined, [], gate)
+
+    await expect(runTurnExecutionLoop(root.options)).rejects.toBe(pause)
+
+    expect(gate).toHaveBeenCalledTimes(1)
+    expect(root.stepStatuses).toEqual(["completed", "interrupted"])
+    expect(root.events.some(event => event.type === "turn.failed")).toBe(false)
+  })
+
+  it("completes an exact recovered candidate without another provider call or double-counting resumed usage", async () => {
+    const root = fixture(identity("turn", "root-1"), undefined, [{ id: "resume-observation", content: { toolCallId: "resume-evidence", status: "completed" } }])
+    const resume = {
+      nextOrdinal: 1, stepCount: 1, toolCallCount: 0, inputThroughSequence: 0n, consumedInputIds: [],
+      usage: { inputTokens: 17, outputTokens: 9, estimatedCostUsd: 0.23 },
+    }
+    root.options = { ...root.options, resume, expectedEvidence: ["resume-evidence"], recoveredFinalCandidate: "done:root-1" }
+
+    const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "completed", stepCount: 2, finalText: "done:root-1" })
+    expect(root.requests).toHaveLength(0)
+    const saved = JSON.parse(root.finalResponses[0]!.slice("root-1:".length)) as { usage: unknown }
+    expect(saved.usage).toEqual(resume.usage)
+  })
+
+  it("replaces a recovered candidate when fresh steering arrives before the resumed step", async () => {
+    const root = fixture(identity("turn", "root-1"), undefined, [{ id: "evidence", content: { toolCallId: "fresh-evidence", toolName: "jobs.search", status: "completed", errorCode: null, input: {}, output: { jobs: [] } } }])
+    addSteeringInput(root)
+    const model = root.options.model
+    const completionGate = vi.fn(async () => ({ ok: true as const }))
+    root.options = {
+      ...root.options,
+      expectedEvidence: ["fresh-evidence"],
+      recoveredFinalCandidate: "stale answer from before steering",
+      completionGate,
+      model: {
+        ...model,
+        async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+          root.requests.push(request)
+          yield { type: "text_delta", text: "fresh answer for senior Dublin roles" }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "completed", finalText: "fresh answer for senior Dublin roles" })
+    expect(root.requests).toHaveLength(1)
+    expect(JSON.stringify(root.requests[0]?.messages)).toContain("Change the target to senior roles")
+    expect(root.finalResponses[0]).toContain("fresh answer for senior Dublin roles")
+    expect(root.finalResponses[0]).not.toContain("stale answer from before steering")
+    expect(completionGate).toHaveBeenCalledWith(expect.objectContaining({ candidateText: "fresh answer for senior Dublin roles" }))
+  })
+
   it("finishes the Turn once after atomic terminal commit without a same-Turn follow-up step", async () => {
     const root = fixture(identity("turn", "root-1"))
 
