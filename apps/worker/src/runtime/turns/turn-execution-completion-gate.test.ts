@@ -110,6 +110,21 @@ function graphClient(nodes: unknown[], tasks: Array<Record<string, unknown>>) {
 }
 
 describe("TaskGraph terminal verification gate", () => {
+  it("denies terminal completion when a native command receipt remains but the owned graph row is missing", async () => {
+    const queries: string[] = []
+    const client = { query: vi.fn(async (sql: string) => {
+      queries.push(sql)
+      if (sql.includes('FROM "agent_items" AS item')) return { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "agent_events" AS event')) return { rows: [{ id: "native-command-event" }], rowCount: 1 }
+      throw new Error(`Unexpected graph query: ${sql}`)
+    }) } as never
+
+    await expect(checkTaskGraphTerminalVerification(client, graphLease, "root-1"))
+      .resolves.toMatchObject({ ok: false, blocker: "task_graph_verification_unverified" })
+
+    expect(queries[1]).toContain("IN ('proposal', 'native_command')")
+  })
+
   it("fails closed for legacy-unverified and missing durable reports", async () => {
     const legacy = node("legacy", "task-legacy") as Record<string, unknown>
     delete legacy.verification; legacy.verificationDisposition = "legacy_unverified"

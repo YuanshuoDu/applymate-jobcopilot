@@ -30,6 +30,8 @@ import type {
 import { ToolSchemaValidator } from "./schema-validator.js"
 import type { ToolExecutionContext } from "./types.js"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
+import { SessionPauseRequestedError } from "../session-gate.js"
+import type { TaskGraphCommandPort, TaskGraphNativeCommandInput, TaskGraphNativeCommandReceipt } from "../subagents/task-graph-command-port.js"
 
 const baseTask: CoordinationTaskView = {
   id: "root-1", userId: "user-a", sessionId: "session-a", turnId: "turn-a", rootTaskId: "root-1", parentTaskId: null,
@@ -139,6 +141,107 @@ describe("coordination executors", () => {
     expect((runtime.manager.spawn as unknown as ReturnType<typeof vi.fn>)).toHaveBeenCalledOnce()
     expect(runtime.store.spawnOperations.get("session-a:spawn-1")).toBe("child-1")
     expect(runtime.store.activities).toContain("spawn_subagent")
+  })
+
+  it("routes planner-root spawn aliases through the native command with stable replay identity", async () => {
+    const runtime = makeRuntime()
+    const calls: TaskGraphNativeCommandInput[] = []
+    const raw: TaskGraphNativeCommandReceipt = {
+      status: "accepted", replay: false, operationId: "op-1", requestFingerprint: "a".repeat(64), graphRevision: 1,
+      nodeKey: "node-1", dispatchDisposition: "pending",
+      child: { taskId: "native-child", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/native-child", depth: 1, role: "scout", taskType: "inspect", status: "queued" },
+    }
+    const commandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 0, nodes: [], readyTaskIds: [] })),
+      readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
+      appendNativeCoordination: vi.fn(async input => {
+        calls.push(input)
+        return calls.length === 1 ? raw : { ...raw, status: "duplicate" as const, replay: true }
+      }),
+    }
+    const options = { ...runtime.options, nativeCoordination: {
+      enabled: true, commandPort, turnLeaseOwner: "worker-1", turnLeaseVersion: 3,
+      parentLeaseOwner: "worker-1", parentAttemptCount: () => 2,
+    } }
+    const rootContext = context({ taskId: "root-1", rootTaskId: "root-1", actorRole: "orchestrator", delegateOutputSchemaMarker: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" } })
+    const replayLookup = vi.spyOn(runtime.store, "getSpawnReplay")
+    const input: SpawnSubagentInput = {
+      role: "scout", taskType: "inspect", goal: "Inspect evidence", constraints: ["EU only"],
+      successCriteria: ["Cite sources"], allowedActions: ["jobs.search"], context: { region: "Berlin" },
+    }
+
+    const first = await executeSpawn(rootContext, input, options)
+    const replay = await executeSpawn(rootContext, input, options)
+
+    expect(calls).toHaveLength(2)
+    expect(calls[0]?.request).toMatchObject({ kind: "spawn", role: "scout", taskType: "inspect", goal: input.goal, constraints: input.constraints, successCriteria: input.successCriteria, allowedActions: input.allowedActions, context: input.context })
+    expect(calls[0]?.request.idempotencyKey).toMatch(/^native:[a-f0-9]{64}$/)
+    expect(calls[1]?.request.idempotencyKey).toBe(calls[0]?.request.idempotencyKey)
+    expect(calls[0]?.outputSchemaMarker).toEqual({ schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" })
+    expect(first).toMatchObject({ taskId: "native-child", replay: false, nativeCoordination: { operationId: "op-1", graphRevision: 1 } })
+    expect(replay).toMatchObject({ taskId: "native-child", replay: true, nativeCoordination: { status: "duplicate" } })
+    expect(runtime.manager.spawn).not.toHaveBeenCalled()
+    expect(replayLookup).not.toHaveBeenCalled()
+  })
+
+  it("routes planner-root followup while preserving source and request fields without forwarding the root schema", async () => {
+    const runtime = makeRuntime()
+    const received: TaskGraphNativeCommandInput[] = []
+    const source = { taskId: "source", rootTaskId: "root-1", parentTaskId: "root-1", turnId: "turn-a", role: "reviewer", taskType: "review", status: "cancelled" as const, attemptCount: 0, resultDigest: "b".repeat(64), graphNodeKey: null, origin: "native_legacy" as const }
+    const commandPort: TaskGraphCommandPort = {
+      appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 0, nodes: [], readyTaskIds: [] })),
+      readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
+      appendNativeCoordination: vi.fn(async input => {
+        received.push(input)
+        const replay = received.length > 1
+        return { status: replay ? "duplicate" as const : "accepted" as const, replay, operationId: "followup-op", requestFingerprint: "b".repeat(64), graphRevision: 1,
+          nodeKey: "followup-node", dispatchDisposition: "not_ready" as const,
+          child: { taskId: "followup-child", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/followup-child", depth: 1, role: "reviewer", taskType: "review", status: "waiting" as const }, source }
+      }),
+    }
+    const options = { ...runtime.options, nativeCoordination: { enabled: true, commandPort, turnLeaseOwner: "worker-1", turnLeaseVersion: 3, parentLeaseOwner: "worker-1", parentAttemptCount: () => 2 } }
+    const input: FollowupInput = { taskId: source.taskId, idempotencyKey: "followup-key", goal: "Recheck", constraints: ["Read only"], successCriteria: ["Explain"], context: { note: "caller" } }
+    const lookup = vi.spyOn(runtime.store, "getTask")
+    const root = context({ taskId: "root-1", rootTaskId: "root-1", actorRole: "orchestrator", delegateOutputSchemaMarker: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" } })
+    const result = await executeFollowup(root, input, options)
+    const replay = await executeFollowup(root, input, options)
+
+    expect(received[0]?.request).toMatchObject({ kind: "followup", sourceTaskId: source.taskId, goal: input.goal, constraints: input.constraints, successCriteria: input.successCriteria, context: input.context })
+    expect(received[1]?.request).toMatchObject({ kind: "followup", idempotencyKey: received[0]?.request.idempotencyKey, sourceTaskId: source.taskId })
+    expect(received[0]).not.toHaveProperty("outputSchemaMarker")
+    expect(result).toMatchObject({ taskId: "followup-child", sourceTaskId: source.taskId, status: "waiting", replay: false })
+    expect(replay).toMatchObject({ taskId: "followup-child", sourceTaskId: source.taskId, status: "waiting", replay: true })
+    expect(lookup).not.toHaveBeenCalled()
+    expect(runtime.manager.spawn).not.toHaveBeenCalled()
+  })
+
+  it("fails closed on missing native support and preserves session pause through the executor boundary", async () => {
+    const runtime = makeRuntime()
+    const rootContext = context({ taskId: "root-1", rootTaskId: "root-1", actorRole: "orchestrator" })
+    const missing = { ...runtime.options, nativeCoordination: { enabled: true, turnLeaseOwner: "worker-1", turnLeaseVersion: 3, parentLeaseOwner: "worker-1", parentAttemptCount: () => 2 } }
+    await expect(executeSpawn(rootContext, { role: "scout", taskType: "inspect", goal: "Inspect" }, missing))
+      .rejects.toMatchObject({ code: "coordination_task_graph_native_coordination_unavailable" })
+    expect(runtime.manager.spawn).not.toHaveBeenCalled()
+
+    const pause = new SessionPauseRequestedError()
+    const commandPort = { appendAndSchedule: vi.fn(), appendNativeCoordination: vi.fn(async () => { throw pause }), readCurrent: vi.fn() } as never
+    const paused = { ...runtime.options, nativeCoordination: { enabled: true, commandPort, turnLeaseOwner: "worker-1", turnLeaseVersion: 3, parentLeaseOwner: "worker-1", parentAttemptCount: () => 2 } }
+    await expect(executeSpawn(rootContext, { role: "scout", taskType: "inspect", goal: "Inspect" }, paused)).rejects.toBe(pause)
+    expect(runtime.manager.spawn).not.toHaveBeenCalled()
+  })
+
+  it("keeps child-origin spawn on the existing manager path when native root coordination is enabled", async () => {
+    const runtime = makeRuntime()
+    const parent = makeTask({ id: "child-parent", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/child-parent", depth: 1, role: "scout", taskType: "inspect", status: "running" })
+    runtime.store.tasks.set(parent.id, parent)
+    const commandPort = { appendAndSchedule: vi.fn(), appendNativeCoordination: vi.fn(), readCurrent: vi.fn() } as never
+    const options = { ...runtime.options, nativeCoordination: { enabled: true, commandPort, turnLeaseOwner: "worker-1", turnLeaseVersion: 3, parentLeaseOwner: "worker-1", parentAttemptCount: () => 2 } }
+
+    const result = await executeSpawn(context({ taskId: parent.id, rootTaskId: "root-1", actorRole: "subagent" }), { idempotencyKey: "child-spawn", role: "analyst", taskType: "review", goal: "Review" }, options)
+
+    expect(result.parentTaskId).toBe(parent.id)
+    expect(runtime.manager.spawn).toHaveBeenCalledOnce()
+    expect((commandPort as TaskGraphCommandPort).appendNativeCoordination).not.toHaveBeenCalled()
   })
 
   it("uses the production atomic spawn seam without a second spawn transaction", async () => {
