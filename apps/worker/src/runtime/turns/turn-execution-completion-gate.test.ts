@@ -38,9 +38,9 @@ describe("assertCompletionAllowed", () => {
     const writer = gateWriter()
     const signal = new AbortController().signal
 
-    await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, signal, () => nowValue)).resolves.toBeUndefined()
+    await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, signal, () => nowValue, "candidate")).resolves.toBeUndefined()
 
-    expect(completionGate).toHaveBeenCalledWith({ identity, scope: { userId: identity.userId }, rootTaskId: identity.rootTaskId, stepId: step.id, signal, now: nowValue })
+    expect(completionGate).toHaveBeenCalledWith({ identity, scope: { userId: identity.userId }, rootTaskId: identity.rootTaskId, stepId: step.id, candidateText: "candidate", signal, now: nowValue })
     expect(writer.append).not.toHaveBeenCalled()
   })
 
@@ -48,7 +48,7 @@ describe("assertCompletionAllowed", () => {
     const completionGate = vi.fn(async () => ({ ok: false as const, blocker: "child_tasks_pending", feedback: "Child work is still running" }))
     const writer = gateWriter()
 
-    await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, new AbortController().signal, () => nowValue))
+    await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, new AbortController().signal, () => nowValue, "candidate"))
       .rejects.toMatchObject({ code: "business_precondition_failed", message: "child_tasks_pending" })
 
     expect(writer.append).toHaveBeenCalledWith(
@@ -62,7 +62,7 @@ describe("assertCompletionAllowed", () => {
     const completionGate = vi.fn(async () => ({ ok: "yes" } as unknown as Awaited<ReturnType<NonNullable<TurnExecutionOptions["completionGate"]>>>))
     const writer = gateWriter()
 
-    await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, new AbortController().signal, () => nowValue))
+    await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, new AbortController().signal, () => nowValue, "candidate"))
       .rejects.toMatchObject({ code: "invalid_output", message: "Completion gate returned an invalid decision" })
     expect(writer.append).not.toHaveBeenCalled()
   })
@@ -71,7 +71,7 @@ describe("assertCompletionAllowed", () => {
     const completionGate = vi.fn(async () => { throw new Error("store unavailable") })
     const writer = gateWriter()
 
-    await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, new AbortController().signal, () => nowValue))
+    await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, new AbortController().signal, () => nowValue, "candidate"))
       .rejects.toMatchObject({ name: "TurnEngineError", code: "invalid_output", message: "Completion gate failed closed" })
     expect(writer.append).not.toHaveBeenCalled()
   })

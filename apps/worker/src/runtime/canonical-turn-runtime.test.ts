@@ -20,6 +20,9 @@ import type { TurnLease } from "./turns/lease.js"
 import { InterruptRequestedError } from "./interrupt/registry.js"
 import { resolveProductionAgentFlags, type ProductionAgentFlags } from "./production-agent-flags.js"
 import { nativeCoordinationReceipts } from "./canonical-turn-native-graph-context.js"
+import { digestNativeVerificationValue } from "./subagents/native-verification-contract.js"
+import type { NativeVerificationEnsureResult, NativeVerificationPort } from "./subagents/native-verification-port.js"
+import type { NativeVerificationRuntime } from "./canonical-turn-native-verification-runtime.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 2,
@@ -74,6 +77,19 @@ function model(script: () => ModelStreamEvent[]): ModelAdapter {
 
 function rootStore() {
   return { ensure: vi.fn(async () => ({ id: "root-1", attemptCount: 1 } as never)), checkCompletion: vi.fn(async () => ({ ok: true as const })), finish: vi.fn(async () => undefined) }
+}
+
+function nativeVerificationRuntime(childStatus: "passed" | "failed" = "passed"): NativeVerificationRuntime {
+  const port: NativeVerificationPort = {
+    ensureChildren: async (): Promise<NativeVerificationEnsureResult> => ({ status: childStatus, controlTaskIds: [], pendingControlTaskIds: [], pendingTaskIds: [], feedback: [] }),
+    ensureRootGoal: async ({ candidateText }): Promise<NativeVerificationEnsureResult> => ({ status: "passed", controlTaskIds: ["control-1"], pendingControlTaskIds: [], pendingTaskIds: [], feedback: [], rootGoalWitness: {
+      controlTaskId: "control-1", controlOperationId: "operation-1", currentControlAttempt: 1,
+      candidateDigest: digestNativeVerificationValue(candidateText), childBindingSetDigest: "a".repeat(64), goalDigest: "b".repeat(64),
+      criteriaDigest: "c".repeat(64), evidencePacketDigest: "d".repeat(64), reportDigest: "e".repeat(64),
+    } }),
+    readRecoverableGoal: async () => null,
+  }
+  return { port, readTerminalProof: async () => true }
 }
 
 function waitBoundary() {
@@ -586,6 +602,7 @@ describe("createCanonicalTurnRuntime", () => {
       }),
       taskGraphCommandPort: commandPort, taskGraphTemplates: { scout: { role: "scout", taskType: "research", allowedActions: ["jobs.search"] } },
       stateLoader: async () => ({ ...state(), toolPolicySnapshot: {} }), rootTaskStore: roots as never,
+      nativeVerificationFactory: () => nativeVerificationRuntime("failed"),
       turnEngineStoreFactory: () => store(events), contextBuilderFactory: () => contextBuilder(),
       toolRuntimeFactory: () => ({ ...runtimeTools,
         registry: { ...runtimeTools.registry, list: () => definitions, register: (definition: { name: string; version: string }) => definitions.push(definition) },
@@ -651,6 +668,7 @@ describe("createCanonicalTurnRuntime", () => {
       }),
       taskGraphCommandPort: commandPort, taskGraphTemplates: { scout: { role: "scout", taskType: "research", allowedActions: ["jobs.search"] } },
       stateLoader: async () => ({ ...state(), toolPolicySnapshot: {} }), rootTaskStore: roots as never,
+      nativeVerificationFactory: () => nativeVerificationRuntime(),
       turnEngineStoreFactory: () => store(events), contextBuilderFactory: () => ({
         build: async request => { modelSnapshots.push(request.snapshot); return contextBuilder().build(request) },
       }),
@@ -1295,7 +1313,8 @@ describe("createCanonicalTurnRuntime", () => {
     const guard = terminalGuards[0]
     if (typeof guard !== "function") throw new Error("terminal guard was not created")
     const client = { query: vi.fn(async () => ({ rows: [], rowCount: 0 })) } as never
-    await expect(guard(client)).resolves.toEqual({ ok: true })
+    const terminal = { stepId: "step-1", finalItemId: "final-1", finalContent: null, stepCount: 1, toolCallCount: 0, usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }, response: "{}" } as never
+    await expect(guard(client, terminal)).resolves.toEqual({ ok: true })
     expect(roots.checkCompletion).toHaveBeenNthCalledWith(1, expect.objectContaining({ taskGraphVerification: true }))
     expect(roots.checkCompletion).toHaveBeenNthCalledWith(2, expect.objectContaining({ taskGraphVerification: true, client }))
   })
@@ -1316,8 +1335,9 @@ describe("createCanonicalTurnRuntime", () => {
     const guard = terminalGuards[0]
     if (typeof guard !== "function") throw new Error("selected-job terminal guard was not created")
     const client = { query: vi.fn(async () => ({ rows: [], rowCount: 0 })) } as never
+    const terminal = { stepId: "step-1", finalItemId: "final-1", finalContent: null, stepCount: 1, toolCallCount: 0, usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }, response: "{}" } as never
 
-    await expect(guard(client)).resolves.toMatchObject({ ok: false, blocker: "selected_job_draft_review_required" })
+    await expect(guard(client, terminal)).resolves.toMatchObject({ ok: false, blocker: "selected_job_draft_review_required" })
     expect(roots.checkCompletion).toHaveBeenLastCalledWith(expect.objectContaining({ taskGraphVerification: true, client }))
   })
 
