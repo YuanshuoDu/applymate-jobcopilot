@@ -82,7 +82,7 @@ async function seed(): Promise<void> {
      "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
     VALUES ($1, $2, $3, 'in_progress', 'user', $4::jsonb, $5::jsonb, '{}'::jsonb, $6::jsonb,
       $7, CURRENT_TIMESTAMP + INTERVAL '10 minutes', CURRENT_TIMESTAMP, 1, CURRENT_TIMESTAMP)`, [
-    ids.turn, ids.session, ids.user, JSON.stringify({ goal, successCriteria: turnCriteria }),
+    ids.turn, ids.session, ids.user, JSON.stringify({ goal, content: [{ type: "text", text: goal }], successCriteria: turnCriteria }),
     JSON.stringify({ provider: "fixture", model: "native-brain-deterministic" }),
     JSON.stringify({ limits: { maxSteps: 64, maxToolCalls: 32 }, subagentPolicy: { maxConcurrency: 8, maxDepth: 8, maxFanOut: 64, maxAttempts: 3 } }),
     ids.turnOwner,
@@ -222,7 +222,7 @@ async function seedCanonicalFixture(value: CanonicalFixture): Promise<void> {
   await pool!.query(`INSERT INTO "agent_turns"
     ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "updatedAt")
     VALUES ($1, $2, $3, 'queued', 'user', $4::jsonb, $5::jsonb, '{}'::jsonb, $6::jsonb, CURRENT_TIMESTAMP)`, [
-    value.turnId, value.sessionId, value.userId, JSON.stringify({ goal, successCriteria: turnCriteria }),
+    value.turnId, value.sessionId, value.userId, JSON.stringify({ goal, content: [{ type: "text", text: goal }], successCriteria: turnCriteria }),
     JSON.stringify({ provider: "fixture", model: "native-brain-deterministic" }),
     JSON.stringify({ limits: { maxSteps: 32, maxToolCalls: 12 }, subagentPolicy: { maxConcurrency: 8, maxDepth: 8, maxFanOut: 64, maxAttempts: 3 } }),
   ])
@@ -530,6 +530,10 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
       } }
     }
     let rootModelStreams = 0
+    const rootRequestDiagnostics: Array<Readonly<{
+      call: number; rejectedControlFound: boolean; systemMessages: number
+      sameTurnPrefix: boolean; resumePrefix: boolean; targetMatch: boolean; failedCriterion: boolean; exactFeedbackRoles: string[]
+    }>> = []
     let acceptedCandidateReady!: () => void
     let releaseAcceptedCandidate!: () => void
     const acceptedCandidateEntered = new Promise<void>(resolve => { acceptedCandidateReady = resolve })
@@ -578,23 +582,45 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
           return
         }
         if (call >= 4) {
+          const rejectedCandidateDigest = digestNativeVerificationValue(rejectedCandidate)
           const rejectedControl = await pool!.query<{ id: string }>(`SELECT "id" FROM "sub_agent_tasks"
             WHERE "sessionId" = $1 AND "turnId" = $2 AND "role" = 'auditor' AND "taskType" = 'native_verification'
               AND "expectedOutputSchema"->'target'->>'kind' = 'root_goal'
               AND "expectedOutputSchema"->'target'->>'candidateDigest' = $3
               AND "result"->'nativeVerificationReport'->>'disposition' = 'failed' LIMIT 1`,
-          [canonical.sessionId, canonical.turnId, digestNativeVerificationValue(rejectedCandidate)])
+          [canonical.sessionId, canonical.turnId, rejectedCandidateDigest])
+          const systemText = request.messages.filter(message => message.role === "system")
+            .flatMap(message => message.content)
+            .flatMap(part => part.type === "text" ? [part.text] : [])
+          const allMessagesByRole = new Map<string, string[]>()
+          for (const message of request.messages) {
+            const text = message.content.flatMap(part => part.type === "text" ? [part.text] : [])
+            allMessagesByRole.set(message.role, [...(allMessagesByRole.get(message.role) ?? []), ...text])
+          }
+          const sameTurnPrefix = "Durable TaskGraph verification blocked completion:"
+          const resumePrefix = "Independent review did not accept the previous root candidate."
+          const hasVerifiedFeedback = (values: readonly string[]) => values.some(value =>
+            (value.includes(sameTurnPrefix) || value.includes(resumePrefix))
+              && value.includes(`target=${request.metadata.taskId}`)
+              && value.includes("criterion=criterion-1 status=failed reason=does_not_meet_criterion"))
+          const diagnostic = {
+            call, rejectedControlFound: rejectedControl.rows.length > 0,
+            systemMessages: request.messages.filter(message => message.role === "system").length,
+            sameTurnPrefix: systemText.some(value => value.includes(sameTurnPrefix)),
+            resumePrefix: systemText.some(value => value.includes(resumePrefix)),
+            targetMatch: systemText.some(value => value.includes(`target=${request.metadata.taskId}`)),
+            failedCriterion: systemText.some(value => value.includes("criterion=criterion-1 status=failed reason=does_not_meet_criterion")),
+            exactFeedbackRoles: [...allMessagesByRole].filter(([, values]) => hasVerifiedFeedback(values)).map(([role]) => role),
+          }
+          rootRequestDiagnostics.push(diagnostic)
+          if (rootRequestDiagnostics.length > 8) rootRequestDiagnostics.shift()
           if (rejectedControl.rows.length === 0) {
             yield { type: "text_delta", text: rejectedCandidate }
             yield { type: "completed", finishReason: "stop" }
             return
           }
-          const failedFeedback = request.messages.filter(message => message.role === "system")
-            .flatMap(message => message.content)
-            .flatMap(part => part.type === "text" ? [part.text] : [])
-            .find(value => value.includes("Durable TaskGraph verification blocked completion:")
-              && value.includes(`target=${request.metadata.taskId}`)
-              && value.includes("criterion=criterion-1 status=failed reason=does_not_meet_criterion"))
+          const failedFeedback = systemText
+            .find(value => hasVerifiedFeedback([value]))
           expect(failedFeedback).toBeDefined()
           expect(failedFeedback?.length).toBeLessThanOrEqual(800)
           acceptedCandidateReady()
@@ -694,7 +720,23 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
       value => value?.turnStatus === "waiting_for_dependency" && value.childStatus === "queued" && value.waitStatus === "waiting")
       await bootstrap.subagents.queue.worker.resume()
       await Promise.race([acceptedCandidateEntered, delay(90_000).then(() => {
-        throw new Error(`canonical root did not replan to the accepted candidate; modelStreams=${rootModelStreams}`)
+        return pool!.query<{ turnStatus: string | null; rootControls: number; failedReports: number; rejectedControls: number; rejectedFailedReports: number }>(
+          `SELECT turn."status" AS "turnStatus",
+             COUNT(*) FILTER (WHERE task."expectedOutputSchema"->'target'->>'kind' = 'root_goal')::int AS "rootControls",
+             COUNT(*) FILTER (WHERE task."result"->'nativeVerificationReport'->>'disposition' = 'failed')::int AS "failedReports",
+             COUNT(*) FILTER (WHERE task."expectedOutputSchema"->'target'->>'kind' = 'root_goal'
+               AND task."expectedOutputSchema"->'target'->>'candidateDigest' = $3)::int AS "rejectedControls",
+             COUNT(*) FILTER (WHERE task."expectedOutputSchema"->'target'->>'kind' = 'root_goal'
+               AND task."expectedOutputSchema"->'target'->>'candidateDigest' = $3
+               AND task."result"->'nativeVerificationReport'->>'disposition' = 'failed')::int AS "rejectedFailedReports"
+           FROM "agent_turns" AS turn LEFT JOIN "sub_agent_tasks" AS task
+             ON task."sessionId" = turn."sessionId" AND task."turnId" = turn."id"
+             AND task."role" = 'auditor' AND task."taskType" = 'native_verification'
+           WHERE turn."id" = $1 AND turn."sessionId" = $2 GROUP BY turn."status"`,
+          [canonical.turnId, canonical.sessionId, digestNativeVerificationValue(rejectedCandidate)]).then(result => {
+          const state = result.rows[0] ?? null
+          throw new Error(`canonical root did not replan to the accepted candidate; modelStreams=${rootModelStreams}; requestTrace=${JSON.stringify(rootRequestDiagnostics)}; persistedState=${JSON.stringify(state)}`)
+        })
       })])
       await bootstrap.subagents.queue.worker.pause(true)
       releaseAcceptedCandidate()
