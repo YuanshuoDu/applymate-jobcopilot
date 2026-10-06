@@ -276,8 +276,13 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
     })
 
     const initialChild = await executeTask(spawned.child.taskId)
-    expect(initialChild.status).toBe("completed")
-    const initialTask = await pool!.query<{ attemptCount: number; result: unknown }>(`SELECT "attemptCount", "result" FROM "sub_agent_tasks" WHERE "id" = $1`, [spawned.child.taskId])
+    const initialTask = await pool!.query<{ attemptCount: number; result: unknown; failureReason: string | null }>(
+      `SELECT "attemptCount", "result", "failureReason" FROM "sub_agent_tasks" WHERE "id" = $1`, [spawned.child.taskId])
+    const failureReason = initialTask.rows[0]?.failureReason
+    const boundedFailureReason = typeof failureReason === "string" ? failureReason.slice(0, 240) : failureReason
+    expect({ status: initialChild.status, failureReason: boundedFailureReason },
+      `Initial native child did not complete; persisted failureReason=${JSON.stringify(boundedFailureReason)}`)
+      .toEqual({ status: "completed", failureReason: null })
     expect(initialTask.rows[0]?.attemptCount).toBe(1)
     expect(JSON.stringify(initialTask.rows[0]?.result)).toContain("does not contain")
     const targetToolRows = await pool!.query<{ count: number }>(`SELECT COUNT(*)::int AS "count" FROM "agent_items"
