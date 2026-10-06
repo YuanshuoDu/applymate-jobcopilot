@@ -5,6 +5,7 @@ import { loadWorkerAiConfig, type AiConfig } from "@jobcopilot/shared/llm"
 import { createHarnessModelRuntime, type HarnessModelRuntime } from "./harness-model.js"
 import { createPgContextOwnerFence, StepContextBuilder } from "./context/step-context-builder.js"
 import { createPgInputClaimStore } from "./context/input-claim-store.js"
+import { injectSelectedJobMemory } from "./context/selected-job-memory.js"
 import { createWorkerToolRuntime, type ToolLifecycleSink, type ToolRouter } from "./tools/index.js"
 import { registerTaskGraphPlanningTool } from "./tools/planning-executors.js"
 import type { TaskGraphCommandPort, TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
@@ -185,7 +186,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       enabled: productionFlags?.turnBoundaryCompactionEnabled === true,
       state,
       signal,
-      compact: () => (options.turnBoundaryCompactionRunner ?? runTurnBoundaryContextCompaction)({ pool, scope: state.scope, owner, lease, model, signal }),
+      compact: () => (options.turnBoundaryCompactionRunner ?? runTurnBoundaryContextCompaction)({ pool, scope: state.scope, owner, lease, taskGraphCommandPort: options.taskGraphCommandPort, model, signal }),
       reload: () => options.stateLoader?.(pool, lease, now(), { consumeWaitOutcomes: false })
         ?? loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes: false }),
     })
@@ -200,7 +201,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const contextBuilder: TurnEngineOptions["contextBuilder"] = {
       build: request => baseContextBuilder.build({
         ...request,
-        snapshot: selectedJobMode ? selectedJobSnapshot(request.snapshot) : request.snapshot,
+        snapshot: selectedJobMode ? injectSelectedJobMemory({ snapshot: selectedJobSnapshot(request.snapshot), records: state.selectedJobMemories ?? [], jobId: selectedJobPreparation?.jobId, turnId: lease.turnId, rootTaskId: root.id }) : request.snapshot,
         taskId: root.id,
       }),
     }
