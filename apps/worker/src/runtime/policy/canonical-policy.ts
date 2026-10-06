@@ -3,7 +3,7 @@ import { PolicyEngine, type PolicySnapshot } from "@jobcopilot/agent-policy"
 const COORDINATION_WRITE_TOOL_NAMES = [
   "spawn_subagent", "agent.spawn", "agent.followup",
   "send_message", "agent.send", "wait_subagents", "agent.wait",
-  "interrupt_subagent", "agent.interrupt", "close_subagent", "agent.close",
+  "interrupt_subagent", "agent.interrupt", "close_subagent", "agent.close", "agent.ask_user",
 ]
 const COORDINATION_READ_TOOL_NAMES = ["list_subagents", "agent.list"]
 

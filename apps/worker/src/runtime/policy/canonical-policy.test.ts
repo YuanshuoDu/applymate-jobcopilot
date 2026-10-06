@@ -6,7 +6,7 @@ import { createCanonicalPolicy } from "./canonical-policy.js"
 const coordinationWriteToolNames = [
   "spawn_subagent", "agent.spawn", "agent.followup",
   "send_message", "agent.send", "wait_subagents", "agent.wait",
-  "interrupt_subagent", "agent.interrupt", "close_subagent", "agent.close",
+  "interrupt_subagent", "agent.interrupt", "close_subagent", "agent.close", "agent.ask_user",
 ] as const
 const coordinationReadToolNames = ["list_subagents", "agent.list"] as const
 const planningTool: PolicyToolDescriptor = {

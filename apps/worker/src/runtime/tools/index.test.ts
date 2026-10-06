@@ -61,6 +61,23 @@ describe("worker tool runtime entry point", () => {
     ])
   })
 
+  it("registers ask-user only when the trusted runtime explicitly exposes its native wait store", () => {
+    const coordination = { manager: {} as never, store: {} as unknown as CoordinationStore, wait: {} as unknown as DurableWaitPort }
+    const disabled = createWorkerToolRuntime(
+      {} as never, { sink: new InMemoryToolLifecycleSink(), resolveOwner: () => owner }, undefined, coordination,
+    )
+    expect(() => disabled.registry.resolve("agent.ask_user", "1")).toThrow("not registered")
+
+    const enabled = createWorkerToolRuntime(
+      {} as never, { sink: new InMemoryToolLifecycleSink(), resolveOwner: () => owner }, undefined,
+      { ...coordination, askUserEnabled: true },
+    )
+    const tool = enabled.registry.resolve("agent.ask_user", "1")
+    expect(tool).toMatchObject({ risk: "internal_write", domain: "coordination", idempotency: "idempotent", requiredCapabilities: ["canManageChildren"] })
+    expect(enabled.registry.validateArguments("agent.ask_user", { question: "Where?", choices: [] })).toBe(true)
+    expect(enabled.registry.validateArguments("agent.ask_user", { question: "Where?", turnId: "model-id" })).not.toBe(true)
+  })
+
   it("passes the supplied durable wait port to the wait tool", async () => {
     const wait = { wait: vi.fn(async () => ({ waitId: "wait-1", status: "ready" as const, deadlineAt: "2026-09-09T12:00:00.000Z", matchedTaskIds: ["child-1"] })) } as unknown as DurableWaitPort
     const store = {

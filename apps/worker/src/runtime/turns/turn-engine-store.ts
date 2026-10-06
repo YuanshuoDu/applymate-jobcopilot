@@ -7,9 +7,9 @@ import { toRepositoryJson, type TurnEngineEventInput, type TurnEngineItem, type 
 import { STEERING_MARKER_EVENT_TYPE, parseSteeringMarkerPayload, type SteeringMarkerPayload } from "../context/steering-marker.js"
 import { matchesAgentOutboxIdentity, type AgentOutboxIdentity, type AgentOutboxPayload } from "../outbox-identity.js"
 import { commitTurnTerminal, type TurnEngineTerminalGuard } from "./turn-engine-terminal-commit.js"
-import { assertSessionWorkAdmission } from "../session-gate.js"
+import { assertSessionWorkAdmission, OPEN_SESSION } from "../session-gate.js"
+import { attachTurnQuestionStore } from "./turn-question-store-factory.js"
 type TurnEnginePool = Pick<pg.Pool, "connect">; type QueryClient = Pick<pg.PoolClient, "query" | "release">; type Row = Record<string, unknown>
-const OPEN_SESSION = `"status" NOT IN ('aborted', 'archived')`
 function json(value: RepositoryJsonValue): string { return JSON.stringify(value) }
 function conflict(resource: string): Error {
   const error = new Error(`TurnEngine persistence conflict: ${resource}`)
@@ -54,8 +54,8 @@ async function lockOwnedTurn(client: QueryClient, owner: ExecutionOwnerFence, al
   return Boolean(result.rows[0])
 }
 async function lockOpenSession(client: QueryClient, owner: ExecutionOwnerFence): Promise<boolean> {
-  const result = await client.query<Row>(`SELECT "id" FROM "agent_sessions"
-    WHERE "id" = $1 AND "userId" = $2 AND ${OPEN_SESSION} FOR UPDATE`, [owner.sessionId, owner.userId])
+  const result = await client.query<Row>(`SELECT session."id" FROM "agent_sessions" AS session
+    WHERE session."id" = $1 AND session."userId" = $2 AND ${OPEN_SESSION} FOR UPDATE`, [owner.sessionId, owner.userId])
   return Boolean(result.rows[0])
 }
 async function assertCurrentStepLineage(client: QueryClient, owner: ExecutionOwnerFence, stepId: string | null): Promise<void> {
@@ -130,7 +130,7 @@ async function appendEventBatch(pool: TurnEnginePool, inputs: readonly TurnEngin
   })
 }
 export function createPgTurnEngineStore(pool: TurnEnginePool, terminalGuard?: TurnEngineTerminalGuard): TurnEngineStore {
-  return {
+  return attachTurnQuestionStore({
     async startStep(input): Promise<TurnEngineStep> {
       const actualAttempt = input.owner.kind === "task" ? input.owner.attemptCount : 1
       if (input.attempt !== actualAttempt) throw conflict(`step ${input.stepId} attempt`)
@@ -246,5 +246,5 @@ export function createPgTurnEngineStore(pool: TurnEnginePool, terminalGuard?: Tu
         if (result.rowCount !== 1) throw conflict(`final response for turn ${input.owner.turnId}`)
       })
     },
-  }
+  }, pool)
 }
