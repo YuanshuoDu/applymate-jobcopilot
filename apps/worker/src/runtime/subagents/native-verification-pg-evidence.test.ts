@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
+import { hashArtifactContent } from "./artifact-adapters.js"
 import { canonicalNativeVerificationJson, digestNativeVerificationValue } from "./native-verification-contract.js"
 import type { StoredTaskGraphNode } from "./task-graph-snapshot.js"
 import type { NativeVerificationOwnedState, NativeVerificationTarget } from "./native-verification-pg-bindings.js"
@@ -35,6 +36,39 @@ describe("native verification private evidence", () => {
     const clientWithoutFact = { query: vi.fn().mockResolvedValueOnce({ rows: [{ id: "item-2", revision: 1, attempt: 1,
       content: { toolName: "lookup", status: "completed", toolCallId: "call-2" } }] }) } as unknown as Pick<pg.PoolClient, "query">
     await expect(buildNativeChildPacketContent(clientWithoutFact, state, target)).resolves.toBeNull()
+  })
+
+  it("reads the schema-mapped owned artifact version and rejects content that fails its hash", async () => {
+    const task = { id: "child-artifact", parentTaskId: "root-1", rootTaskId: "root-1", turnId: "turn-1", role: "analyst", taskType: "research",
+      status: "completed", attemptCount: 1, result: { claim: "artifact-backed result" }, failureReason: null, goal: objective.goal,
+      successCriteria: objective.successCriteria, expectedOutputSchema: {}, context: {}, outputArtifactIds: [] }
+    const node = { key: "child", taskId: task.id, goal: objective.goal, successCriteria: objective.successCriteria, dependsOn: [], depth: 1 }
+    const target: NativeVerificationTarget = { node: node as unknown as StoredTaskGraphNode, task, attempt: 1, goal: objective.goal,
+      criteria: objective.successCriteria, resultText: canonicalNativeVerificationJson(task.result), resultDigest: digestNativeVerificationValue(task.result) }
+    const state = { scope, snapshot: null, tasks: new Map([[task.id, task]]), sourceTasks: new Map(), goal: objective.goal,
+      criteria: objective.successCriteria, criteriaValid: true, nativeSourcesValid: true, turnGoalConflict: false, turnInputDigest: "f".repeat(64) } as NativeVerificationOwnedState
+    const artifactContent = { body: "Persisted draft content reviewed independently" }
+    const artifactHash = hashArtifactContent(artifactContent)
+    const artifactRow = { id: "version-1", artifactId: "artifact-1", version: 1, artifactType: "cover_letter",
+      contentHash: artifactHash, sourceDigest: `sha256:${"a".repeat(64)}`, content: artifactContent }
+    const client = { query: vi.fn().mockResolvedValueOnce({ rows: [{ id: "item-1", revision: 1, attempt: 1,
+      content: { toolName: "cover_letter.draft", status: "completed", toolCallId: "call-1", output: { artifactId: "artifact-1" } } }] })
+      .mockResolvedValueOnce({ rows: [artifactRow] }) } as unknown as Pick<pg.PoolClient, "query">
+
+    const packet = await buildNativeChildPacketContent(client, state, target)
+    const artifactEvidence = packet?.evidence.find(item => item.kind === "artifact_version")
+    expect(artifactEvidence?.summary).toContain("Persisted draft content reviewed independently")
+    expect(artifactEvidence?.summary).toContain(artifactHash)
+    const artifactQuery = vi.mocked(client.query).mock.calls[1]
+    expect(String(artifactQuery?.[0])).toContain('FROM "agent_artifact_version" AS version')
+    expect(String(artifactQuery?.[0])).not.toContain('FROM "agent_artifact_versions"')
+    expect(String(artifactQuery?.[0])).toContain('owner."rootTaskId" = $4 AND owner."parentTaskId" = $4')
+    expect(String(artifactQuery?.[0])).toContain('step."attempt" = $6')
+    expect(artifactQuery?.[1]).toEqual([task.id, scope.sessionId, scope.turnId, scope.rootTaskId, scope.userId, target.attempt, 9])
+
+    const invalidHashClient = { query: vi.fn().mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ ...artifactRow, contentHash: `sha256:${"0".repeat(64)}` }] }) } as unknown as Pick<pg.PoolClient, "query">
+    await expect(buildNativeChildPacketContent(invalidHashClient, state, target)).resolves.toBeNull()
   })
 
   it("fails closed when child, graph, or legacy source results contain secret-key fields", async () => {
