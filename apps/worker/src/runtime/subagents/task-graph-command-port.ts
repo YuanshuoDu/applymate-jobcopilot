@@ -3,13 +3,15 @@ import type { TaskGraphProposal, TaskGraphReadiness, TaskGraphRepairOf } from ".
 import type { TaskGraphVerificationReasonCode } from "../planning/task-graph-verification.js"
 import type { SubagentTaskStatus } from "./types.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-pg-verification.js"
-import type { TaskGraphNativeCommandInput, TaskGraphNativeCommandReceipt } from "./task-graph-native-command.js"
+import type { TaskGraphNativeCommandInput, TaskGraphNativeCommandReceipt, TaskGraphNativeNodeView, TaskGraphNativeResultReceipt } from "./task-graph-native-command.js"
 export type {
   TaskGraphNativeChildReceipt,
   TaskGraphNativeCommandInput,
   TaskGraphNativeCommandReceipt,
   TaskGraphNativeFollowupRequest,
+  TaskGraphNativeNodeView,
   TaskGraphNativeRequest,
+  TaskGraphNativeResultReceipt,
   TaskGraphNativeSourceProvenance,
   TaskGraphNativeSpawnRequest,
 } from "./task-graph-native-command.js"
@@ -225,6 +227,8 @@ export type TaskGraphCurrentNode = Readonly<{
   verificationReport?: TaskGraphVerificationReport
   repairOf?: TaskGraphRepairOf
   repairReceipt?: TaskGraphRepairReceipt
+  native?: TaskGraphNativeNodeView
+  nativeResult?: TaskGraphNativeResultReceipt
   failureReason: string | null
 }>
 

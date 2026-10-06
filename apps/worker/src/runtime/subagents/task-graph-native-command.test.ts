@@ -6,7 +6,10 @@ import type {
   TaskGraphNativeCommandInput,
   TaskGraphNativeCommandReceipt,
   TaskGraphNativeFollowupRequest,
+  TaskGraphNativeNodeView,
+  TaskGraphNativeResultReceipt,
   TaskGraphNativeSpawnRequest,
+  TaskGraphCurrentNode,
 } from "./task-graph-command-port.js"
 
 describe("native TaskGraph port contract", () => {
@@ -33,10 +36,26 @@ describe("native TaskGraph port contract", () => {
       taskId: "child", rootTaskId: "root", parentTaskId: "root", path: "/root/child", depth: 1,
       role: "auditor", taskType: "audit", status: "waiting",
     } satisfies TaskGraphNativeChildReceipt
+    const marker = { schemaVersion: "agent-harness.v2.subagent.result", role: "scout" } satisfies NonNullable<TaskGraphNativeCommandInput["outputSchemaMarker"]>
+    const node: TaskGraphNativeNodeView = {
+      operationKind: "followup", operationId: "op-1", requestFingerprint: "f".repeat(64), callerTaskId: "root",
+      role: "auditor", taskType: "audit", contextDigest: "c".repeat(64),
+      source: { taskId: "source", rootTaskId: "root", parentTaskId: "root", turnId: "turn", role: "auditor", taskType: "audit", status: "completed", attemptCount: 1, resultDigest: "d".repeat(64), graphNodeKey: "source-node", origin: "task_graph" },
+    }
+    const result: TaskGraphNativeResultReceipt = {
+      schemaVersion: "agent-harness.v2.task-graph.native-result.v1", role: "auditor", taskStatus: "completed",
+      disposition: "opaque", resultDigest: "d".repeat(64),
+    }
 
     expect(spawn.allowedActions).toEqual(["read"])
     expect(followup.sourceTaskId).toBe("source-task")
     expect(child.status).toBe("waiting")
+    expect(marker.role).toBe("scout")
+    expect(node.source?.taskId).toBe("source")
+    expect(result.taskStatus).toBe("completed")
+    expectTypeOf<TaskGraphNativeCommandInput["outputSchemaMarker"]>().toEqualTypeOf<Readonly<{ schemaVersion: "agent-harness.v2.subagent.result"; role: "scout" | "analyst" }> | undefined>()
+    expectTypeOf<TaskGraphCurrentNode["native"]>().toEqualTypeOf<TaskGraphNativeNodeView | undefined>()
+    expectTypeOf<TaskGraphCurrentNode["nativeResult"]>().toEqualTypeOf<TaskGraphNativeResultReceipt | undefined>()
     expectTypeOf<TaskGraphNativeChildReceipt["status"]>().toEqualTypeOf<"queued" | "waiting">()
     expectTypeOf<Extract<TaskGraphNativeChildReceipt["status"], "paused">>().toEqualTypeOf<never>()
     expectTypeOf<TaskGraphNativeCommandReceipt["status"]>().toEqualTypeOf<"accepted" | "duplicate">()

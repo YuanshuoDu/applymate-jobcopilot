@@ -1,5 +1,6 @@
 import type { TaskGraphExecutionScope } from "./task-graph-command-port.js"
 import type { SubagentTaskStatus } from "./types.js"
+import type { ROLE_RESULT_SCHEMA } from "./role-results.js"
 
 /** Normalized public native coordination inputs. The key is command-scoped, not revision-scoped. */
 export type TaskGraphNativeSpawnRequest = Readonly<{
@@ -27,6 +28,8 @@ export type TaskGraphNativeRequest = TaskGraphNativeSpawnRequest | TaskGraphNati
 export type TaskGraphNativeCommandInput = Readonly<{
   scope: TaskGraphExecutionScope
   request: TaskGraphNativeRequest
+  /** Runtime-owned structured-result contract, never accepted from model input. */
+  outputSchemaMarker?: Readonly<{ schemaVersion: typeof ROLE_RESULT_SCHEMA; role: "scout" | "analyst" }>
 }>
 
 /** Server-read follow-up provenance, frozen in the operation receipt and child context. */
@@ -67,4 +70,25 @@ export type TaskGraphNativeCommandReceipt = Readonly<{
   dispatchDisposition: "pending" | "not_ready"
   child: TaskGraphNativeChildReceipt
   source?: TaskGraphNativeSourceProvenance
+}>
+
+/** Safe read-model view; execution context and full caller constraints stay on the scoped child task. */
+export type TaskGraphNativeNodeView = Readonly<{
+  operationKind: "spawn" | "followup"
+  operationId: string
+  requestFingerprint: string
+  callerTaskId: string
+  role: string
+  taskType: string
+  contextDigest: string
+  source?: TaskGraphNativeSourceProvenance
+}>
+
+/** Structural provenance only; never an assertion of semantic success or artifact approval. */
+export type TaskGraphNativeResultReceipt = Readonly<{
+  schemaVersion: "agent-harness.v2.task-graph.native-result.v1"
+  role: string
+  taskStatus: SubagentTaskStatus
+  disposition: "structured" | "opaque" | "missing"
+  resultDigest: string | null
 }>
