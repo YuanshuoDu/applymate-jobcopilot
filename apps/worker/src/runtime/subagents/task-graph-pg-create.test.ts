@@ -22,6 +22,39 @@ function plannedNode(node: Omit<TaskGraphNodeProposal, "verification">): TaskGra
   return { ...node, verification: analystVerification }
 }
 
+function ownedTurnScopeRow(sql: string, values?: unknown[]) {
+  if (sql.startsWith('SELECT "rootTaskId", "turnId" FROM "sub_agent_tasks"')) {
+    return values?.[0] === "root-1" && values?.[1] === "session-1"
+      ? { rows: [{ rootTaskId: "root-1", turnId: "turn-1" }], rowCount: 1 }
+      : { rows: [], rowCount: 0 }
+  }
+  if (sql.startsWith('SELECT root."id", root."turnId"') && sql.includes("FOR UPDATE")) {
+    return values?.[0] === "root-1" && values?.[1] === "session-1"
+      ? { rows: [{ id: "root-1", turnId: "turn-1", status: "running", interruptRequestedAt: null }], rowCount: 1 }
+      : { rows: [], rowCount: 0 }
+  }
+  if (sql.startsWith('SELECT "id", "rootTaskId", "path", "depth"') && sql.includes("FOR UPDATE")) {
+    return values?.[0] === "root-1" && values?.[1] === "session-1"
+      ? { rows: [{
+        id: "root-1", rootTaskId: "root-1", path: "/root-1", depth: 0, status: "running",
+        allowedActions: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"],
+        modelProfileSnapshot: {}, budgetSnapshot: {}, toolPolicySnapshot: {},
+      }], rowCount: 1 }
+      : { rows: [], rowCount: 0 }
+  }
+  if (sql.startsWith('SELECT "id" FROM "agent_turns"') && sql.includes("FOR UPDATE")) {
+    return values?.[0] === "turn-1" && values?.[1] === "session-1" && values?.[2] === "user-1"
+      ? { rows: [{ id: "turn-1" }], rowCount: 1 }
+      : { rows: [], rowCount: 0 }
+  }
+  if (sql.startsWith('SELECT session."id" FROM "agent_sessions"')) {
+    return values?.[0] === "session-1" && values?.[1] === "user-1" && values?.[2] === "turn-1"
+      ? { rows: [{ id: "session-1" }], rowCount: 1 }
+      : { rows: [], rowCount: 0 }
+  }
+  return undefined
+}
+
 describe("createGraphTasks", () => {
   it("persists scoped completed direct prerequisite evidence before dispatching a ready child", async () => {
     const scoutResult = {
@@ -31,6 +64,8 @@ describe("createGraphTasks", () => {
     }
     let createdContext: unknown
     const query = vi.fn(async (sql: string, values?: unknown[]) => {
+      const admission = ownedTurnScopeRow(sql, values)
+      if (admission) return admission
       if (sql.includes('SELECT "id", "rootTaskId", "path"')) return { rows: [{
         id: "root-1", rootTaskId: "root-1", path: "/root-1", depth: 0, status: "running",
         allowedActions: ["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"],
@@ -89,6 +124,12 @@ describe("createGraphTasks", () => {
     }])
     expect(JSON.stringify(dependencyEvidence)).not.toContain("job-evidence")
     expect(query.mock.calls.find(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"'))).toBeDefined()
+    const turnLock = query.mock.calls.findIndex(([sql]) => sql.startsWith('SELECT "id" FROM "agent_turns"') && sql.includes("FOR UPDATE"))
+    const admissionCheck = query.mock.calls.findIndex(([sql]) => sql.startsWith('SELECT session."id" FROM "agent_sessions"'))
+    const taskInsert = query.mock.calls.findIndex(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))
+    expect(turnLock).toBeGreaterThanOrEqual(0)
+    expect(turnLock).toBeLessThan(admissionCheck)
+    expect(admissionCheck).toBeLessThan(taskInsert)
   })
 
   it("rejects a plan transitively dependent on a completed legacy-unverified source", async () => {
@@ -152,7 +193,9 @@ describe("createGraphTasks", () => {
       contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: `sha256:${"b".repeat(64)}`,
     }
     const writerResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "writer", status: "completed", artifactRef }
-    const query = vi.fn(async (sql: string) => {
+    const query = vi.fn(async (sql: string, values?: unknown[]) => {
+      const admission = ownedTurnScopeRow(sql, values)
+      if (admission) return admission
       if (sql.includes('SELECT "id", "rootTaskId", "path"')) return { rows: [{
         id: "root-1", rootTaskId: "root-1", path: "/root-1", depth: 0, status: "running", allowedActions: [],
         modelProfileSnapshot: {}, budgetSnapshot: {}, toolPolicySnapshot: {},
@@ -232,6 +275,8 @@ describe("createGraphTasks", () => {
   it("allows a new bounded plan after an earlier child completed", async () => {
     const calls: Array<{ sql: string; values?: unknown[] }> = []
     const query = vi.fn(async (sql: string, values?: unknown[]) => {
+      const admission = ownedTurnScopeRow(sql, values)
+      if (admission) return admission
       calls.push({ sql, values })
       if (sql.includes('SELECT "id", "rootTaskId", "path"')) return { rows: [{
         id: "root-1", rootTaskId: "root-1", path: "/root-1", depth: 0, status: "running", allowedActions: [],
@@ -418,7 +463,9 @@ describe("createGraphTasks", () => {
   })
 
   it("round-trips a maximum valid proposal through the persisted snapshot parser", async () => {
-    const query = vi.fn(async (sql: string) => {
+    const query = vi.fn(async (sql: string, values?: unknown[]) => {
+      const admission = ownedTurnScopeRow(sql, values)
+      if (admission) return admission
       if (sql.includes('SELECT "id", "rootTaskId", "path"')) return { rows: [{
         id: "root-1", rootTaskId: "root-1", path: "/root-1", depth: 0, status: "running", allowedActions: [],
         modelProfileSnapshot: {}, budgetSnapshot: {}, toolPolicySnapshot: {},
@@ -548,7 +595,9 @@ function repairFixture(options: RepairFixtureOptions = {}) {
       { criterionId: "finding-count", status: "failed", reasonCode: "criterion_not_met" }, { criterionId: "evidence-count", status: "passed", reasonCode: "criteria_met" },
     ], evidenceDigest: "a".repeat(64), resultDigest: taskGraphResultDigest(targetStructured) },
   }
-  const query = vi.fn(async (sql: string, _values?: unknown[]) => {
+  const query = vi.fn(async (sql: string, values?: unknown[]) => {
+    const admission = ownedTurnScopeRow(sql, values)
+    if (admission) return admission
     if (sql.includes('SELECT item."content"')) return { rows: [{ content: snapshot }], rowCount: 1 }
     if (sql.includes("ANY($1::text[])")) return options.scheduleDependent
       ? { rows: [

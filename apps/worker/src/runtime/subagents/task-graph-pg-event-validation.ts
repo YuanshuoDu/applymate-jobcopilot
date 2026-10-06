@@ -1,13 +1,15 @@
 import { createHash } from "node:crypto"
 import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
+import { parsePersistedTaskGraphNativeReceipt } from "./task-graph-native-command.js"
 import type { TaskGraphEvent } from "../planning/task-graph.js"
 import {
   canonicalTaskGraphJson, parseTaskGraphEvent, parseTaskGraphSnapshot, taskGraphItemId,
   TASK_GRAPH_ITEM_TYPE, type TaskGraphSnapshot,
 } from "./task-graph-snapshot.js"
 
-type ReceiptScope = Readonly<{ sessionId: string; turnId: string; parentTaskId: string }>
+type ReceiptScope = Readonly<{ sessionId: string; turnId: string; rootTaskId: string; parentTaskId: string }>
 type LoadedItem = Readonly<{ id: string; revision: number }>
+type PersistedEvent = Readonly<{ itemId: unknown; taskId: unknown; idempotencyKey: unknown; type?: unknown }>
 type Row = Record<string, unknown>
 type VerificationScope = Readonly<{ userId: string; sessionId: string; turnId: string; rootTaskId: string; parentTaskId: string; taskId: string; attemptCount: number }>
 export type TaskGraphReplaySource = Readonly<{ toolCallId: string; resultItemId: string }>
@@ -48,8 +50,7 @@ function validateProposal(payload: Row, loaded: LoadedItem, current: TaskGraphSn
   if (!text(payload.fingerprint) || !revision(payload.revision) || payload.revision > loaded.revision
     || !receipt || receipt.revision !== payload.revision
     || (receipt.status !== "accepted" && receipt.status !== "duplicate")
-    || !Array.isArray(receipt.nodes) || receipt.nodes.length === 0 || !Array.isArray(receipt.readyTaskIds)
-    || !("content" in payload)) {
+    || !Array.isArray(receipt.nodes) || receipt.nodes.length === 0 || !Array.isArray(receipt.readyTaskIds)) {
     throw new Error("task_graph_receipt_invalid")
   }
   const content = receiptItem(payload.item, payload.revision, payload.content, loaded, current, scope)
@@ -77,11 +78,21 @@ function validateProposal(payload: Row, loaded: LoadedItem, current: TaskGraphSn
 
 /** Rejects unknown persisted envelopes before lifecycle state can be reconstructed. */
 export function parsePersistedTaskGraphReceipt(eventType: unknown, value: unknown, loaded: LoadedItem,
-  current: TaskGraphSnapshot, scope: ReceiptScope): TaskGraphEvent | null {
+  current: TaskGraphSnapshot, scope: ReceiptScope, identity?: PersistedEvent): TaskGraphEvent | null {
   const payload = object(value)
   if (!payload) throw new Error("task_graph_event_envelope_invalid")
-  if (eventType === "item.delta" && payload.kind === "proposal") {
+  if ((eventType === "item.started" || eventType === "item.delta") && payload.kind === "native_command") {
+    if (!identity) throw new Error("task_graph_native_receipt_invalid")
+    parsePersistedTaskGraphNativeReceipt(payload, { ...identity, type: eventType }, loaded, current, scope)
+    return null
+  }
+  if ((eventType === "item.started" || eventType === "item.delta") && payload.kind === "proposal") {
+    if (eventType === "item.delta" && !Object.hasOwn(payload, "content")) throw new Error("task_graph_receipt_invalid")
     validateProposal(payload, loaded, current, scope)
+    const expectedRevision = Number(object(payload.receipt)?.revision) - 1
+    if (identity && (identity.itemId !== taskGraphItemId(scope.parentTaskId) || identity.taskId !== scope.parentTaskId
+      || identity.idempotencyKey !== `${taskGraphItemId(scope.parentTaskId)}:proposal:${expectedRevision}`
+      || eventType !== (payload.revision === 1 ? "item.started" : "item.delta"))) throw new Error("task_graph_receipt_invalid")
     return null
   }
   if ((eventType !== "item.delta" && eventType !== "task_graph.lifecycle") || payload.kind !== "lifecycle") {

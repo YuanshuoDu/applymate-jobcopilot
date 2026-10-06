@@ -4,7 +4,7 @@ import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { parsePersistedTaskGraphReceipt } from "./task-graph-pg-event-validation.js"
 import { TASK_GRAPH_ITEM_TYPE, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 
-const scope = { sessionId: "session-1", turnId: "turn-1", parentTaskId: "root-1" }
+const scope = { sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" }
 const snapshot: TaskGraphSnapshot = {
   schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
   nodes: [{ key: "child", templateId: "analyst", goal: "Inspect source", successCriteria: ["Evidence captured"], dependsOn: [], depth: 1, taskId: "child-1" }],
@@ -46,6 +46,15 @@ describe("persisted TaskGraph event envelopes", () => {
 
   it("accepts a valid persisted proposal receipt without applying it as a lifecycle event", () => {
     expect(parsePersistedTaskGraphReceipt("item.delta", proposal(), loaded, snapshot, scope)).toBeNull()
+  })
+
+  it("accepts the legacy first item.started proposal without top-level content but requires delta content", () => {
+    const { content: _content, ...first } = proposal({
+      revision: 1, receipt: { status: "accepted", revision: 1, nodes: [{ key: "child", taskId: "child-1", status: "queued" }], readyTaskIds: ["child-1"] },
+      item: graphItem(1),
+    })
+    expect(parsePersistedTaskGraphReceipt("item.started", first, loaded, snapshot, scope)).toBeNull()
+    expect(() => parsePersistedTaskGraphReceipt("item.delta", first, loaded, snapshot, scope)).toThrow("task_graph_receipt_invalid")
   })
 
   it("accepts a valid task_graph.lifecycle envelope and rejects proposal kinds on that event type", () => {
