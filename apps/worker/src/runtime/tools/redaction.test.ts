@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
+import { NATIVE_VERIFICATION_REPORT_SCHEMA } from "../subagents/native-verification-contract.js"
 import { InMemoryToolResultReferenceStore, prepareDurableWaitOutput, prepareLifecycleValue, prepareSubagentSpawnReceipt, prepareTaskGraphPlanReceipt, sanitizeForLifecycle } from "./redaction.js"
 import { nativeCoordinationOutput } from "./task-graph-coordination-bridge.js"
 import type { TaskGraphNativeCommandReceipt } from "../subagents/task-graph-command-port.js"
@@ -104,6 +105,31 @@ describe("tool lifecycle redaction", () => {
         failureReason: null,
       }],
     })
+  })
+
+  it("applies the native feedback projection in prepareDurableWaitOutput", () => {
+    const output = durableWaitOutput()
+    Object.assign(output.tasks[0]!.result, { nativeVerificationReport: {
+      schemaVersion: NATIVE_VERIFICATION_REPORT_SCHEMA,
+      controlOperationId: "verify-op",
+      controlTaskId: durableWaitTaskId,
+      controlAttempt: 1,
+      owner: { userId: "user-1", sessionId: "session-1", turnId, rootTaskId, parentTaskId: null },
+      target: { kind: "root_goal", candidateDigest: "a".repeat(64), childBindingSetDigest: "b".repeat(64) },
+      goalDigest: "c".repeat(64), criteriaDigest: "d".repeat(64), evidencePacketDigest: "e".repeat(64), disposition: "passed",
+      criteria: [{ criterionId: "criterion-1", disposition: "passed", reasonCode: "meets_criterion", evidenceReferenceIds: ["target-ref"] }],
+    } })
+
+    const safe = prepareDurableWaitOutput(output).safe as Record<string, unknown>
+    const tasks = safe.tasks as Array<Record<string, unknown>>
+    expect(tasks[0]?.result).toMatchObject({
+      nativeVerificationFeedback: {
+        disposition: "passed",
+        criteria: [{ criterionId: "criterion-1", disposition: "passed", reasonCode: "meets_criterion", evidenceReferenceIds: ["target-ref"] }],
+      },
+    })
+    expect(JSON.stringify(safe)).not.toContain("nativeVerificationReport")
+    expect(JSON.stringify(safe)).not.toContain("evidencePacketDigest")
   })
 
   it("rejects malformed, incomplete, and accessor-shaped durable wait receipts", () => {
