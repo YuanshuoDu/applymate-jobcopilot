@@ -39,6 +39,39 @@ function writerTask(turnId: string, rootTaskId: string, artifactId: string) {
 }
 
 describe('TaskGraph query projection', () => {
+  it('selects the latest persisted native item.delta graph and includes its real child task IDs', () => {
+    const metadata = {
+      schemaVersion: 'agent-harness.v2.task-graph.native-delegation.v1', operationKind: 'spawn',
+      operationId: 'native-operation-1', requestFingerprint: 'a'.repeat(64), callerTaskId: 'root-task',
+      role: 'auditor', taskType: 'audit', contextDigest: 'b'.repeat(64), contextBytes: 12,
+    }
+    const spawn = {
+      key: 'native-spawn', templateId: 'native', goal: 'Inspect the application', successCriteria: [], dependsOn: [],
+      depth: 1, taskId: 'native-child-1', verificationDisposition: 'legacy_unverified', nativeDelegation: metadata,
+    }
+    const source = {
+      taskId: 'native-child-1', rootTaskId: 'root-task', parentTaskId: 'root-task', turnId: 'turn-1',
+      role: 'auditor', taskType: 'audit', status: 'failed', attemptCount: 1,
+      resultDigest: 'd'.repeat(64), graphNodeKey: 'native-spawn', origin: 'task_graph',
+    }
+    const followup = {
+      key: 'native-followup', templateId: 'native', goal: 'Retry the inspection', successCriteria: [], dependsOn: [],
+      depth: 1, taskId: 'native-child-2', verificationDisposition: 'legacy_unverified',
+      nativeDelegation: { ...metadata, operationKind: 'followup', operationId: 'native-operation-2', source },
+    }
+    const started = graphItem([spawn], '2026-09-23T12:00:00.000Z', 'session-1', 'native-graph')
+    const delta = { ...graphItem([spawn, followup], '2026-09-23T12:01:00.000Z', 'session-1', 'native-graph'), revision: 2 }
+    const events = [started, delta]
+
+    expect(selectedTaskGraphIdentity(events, 'session-1')).toEqual({
+      sessionId: 'session-1', graphItemId: 'native-graph', turnId: 'turn-1', rootTaskId: 'root-task', revision: 2,
+    })
+    expect(selectCurrentTaskGraphTaskIds(events, 'session-1')).toEqual(['root-task', 'native-child-1', 'native-child-2'])
+    expect(buildTaskGraphTaskLookupUrl('session-1', events)).toBe(
+      '/api/agent/sessions/session-1/tasks?taskId=root-task&taskId=native-child-1&taskId=native-child-2&graphItemId=native-graph&graphTurnId=turn-1&rootTaskId=root-task&graphRevision=2',
+    )
+  })
+
   it('restores only the selected job on the matching preparation Turn and session', () => {
     const turns = [
       { id: 'prepare-a', sessionId: 'session-a', selectedJobId: 'job-a' },
