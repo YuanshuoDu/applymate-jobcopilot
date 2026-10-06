@@ -1,11 +1,12 @@
 import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
+import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { drainTaskGraphStopOutbox, startTaskGraphStopOutboxConsumer, TASK_GRAPH_STOP_OUTBOX_TOPIC } from "./task-graph-stop-outbox.js"
-import { taskGraphLifecycleKey, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
+import { taskGraphItemId, taskGraphLifecycleKey, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import type { PgSubagentPool } from "./types.js"
 
 type NodeFixture = { key: string; taskId: string; dependsOn: string[]; status: string; attemptCount: number; interruptRequestedAt: Date | null }
-type EventFixture = { payload: unknown }
+type EventFixture = { type?: string; itemId?: string | null; taskId?: string | null; idempotencyKey?: string | null; payload: unknown }
 type DispatchFixture = { id: string; aggregateId: string; topic: string; idempotencyKey: string; publishedAt: Date | null }
 
 class FakeStopPool {
@@ -54,17 +55,16 @@ class FakeStopPool {
       rows = [{ "set_config": "user-1" }]
     } else if (sql.includes('SELECT item."id", item."revision", item."content"')) {
       rows = [{
-        id: "task-graph-item", revision: 4 + this.events.length - this.initialLifecycleCount,
-        content: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: this.nodes.map(node => ({
-          key: node.key, templateId: "analyst", goal: `Inspect ${node.key}`, successCriteria: ["done"],
-          dependsOn: node.dependsOn, depth: node.dependsOn.length + 1, taskId: node.taskId,
-        })) },
+        id: taskGraphItemId("root-1"), revision: 4 + this.events.length - this.initialLifecycleCount,
+        content: this.snapshot(),
         createdAt: new Date("2026-09-25T00:00:00.000Z"),
       }]
-    } else if (sql.includes('SELECT task."id", task."status", task."role", task."failureReason", task."result"')) {
-      rows = this.nodes.map(node => ({ id: node.taskId, status: node.status, failureReason: null, result: null }))
+    } else if (sql.includes('SELECT task."id", task."status", task."role", task."taskType", task."expectedOutputSchema"')) {
+      rows = this.nodes.map(node => ({ id: node.taskId, status: node.status, role: "analyst", taskType: "research", expectedOutputSchema: {}, failureReason: null, result: null }))
+    } else if (sql.includes('SELECT event."type", event."itemId", event."taskId", event."idempotencyKey", event."payload"')) {
+      rows = this.events.map(event => this.persistedEvent(event))
     } else if (sql.includes('SELECT event."payload"')) {
-      rows = this.events
+      rows = this.events.map(event => ({ payload: event.payload }))
     } else if (sql.includes('SELECT task."id", task."status", task."attemptCount", task."interruptRequestedAt"')) {
       const node = this.nodes.find(candidate => candidate.taskId === values[0])
       rows = node ? [{ id: node.taskId, status: node.status, attemptCount: node.attemptCount, interruptRequestedAt: node.interruptRequestedAt }] : []
@@ -79,8 +79,10 @@ class FakeStopPool {
       rows = [{ eventSequence: this.eventSequence }]
       rowCount = 1
     } else if (sql.includes('INSERT INTO "agent_events"')) {
-      const payload = JSON.parse(String(values[10])) as unknown
-      this.events.push({ payload })
+      this.events.push({
+        itemId: values[3] == null ? null : String(values[3]), taskId: values[4] == null ? null : String(values[4]),
+        type: String(values[6]), idempotencyKey: String(values[9]), payload: JSON.parse(String(values[10])) as unknown,
+      })
       rowCount = 1
     } else if (sql.includes('INSERT INTO "agent_outbox"')) {
       rowCount = 1
@@ -108,6 +110,37 @@ class FakeStopPool {
     }
     if (sql.includes("FOR UPDATE") || sql.includes("SELECT")) rowCount = rows.length
     return { rows: rows as T[], rowCount }
+  }
+
+  private snapshot() {
+    return { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: this.nodes.map(node => ({
+      key: node.key, templateId: "analyst", goal: `Inspect ${node.key}`, successCriteria: ["done"],
+      dependsOn: node.dependsOn, depth: node.dependsOn.length + 1, taskId: node.taskId,
+      verificationDisposition: "legacy_unverified",
+    })) }
+  }
+
+  private persistedEvent(event: EventFixture) {
+    const payload = event.payload && typeof event.payload === "object" && !Array.isArray(event.payload)
+      ? event.payload as Record<string, unknown> : {}
+    const lifecycle = payload.kind === "lifecycle" && payload.event && typeof payload.event === "object" && !Array.isArray(payload.event)
+      ? payload.event as Record<string, unknown> : null
+    if (!lifecycle || Object.hasOwn(payload, "item")) return event
+    const revision = Number(lifecycle.expectedRevision) + 1
+    const itemId = taskGraphItemId("root-1")
+    return {
+      type: event.type ?? "item.delta", itemId: event.itemId ?? itemId, taskId: event.taskId ?? "root-1",
+      idempotencyKey: event.idempotencyKey ?? String(lifecycle.idempotencyKey),
+      payload: {
+        ...payload, revision,
+        item: {
+          schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: itemId, sessionId: "session-1", turnId: "turn-1",
+          stepId: "step-1", taskId: "root-1", type: "task_graph", status: "streaming", phase: null,
+          revision, content: this.snapshot(), startedAt: "2026-09-25T00:00:00.000Z", completedAt: null,
+          createdAt: "2026-09-25T00:00:00.000Z", updatedAt: "2026-09-25T00:00:00.000Z",
+        },
+      },
+    }
   }
 
 }
