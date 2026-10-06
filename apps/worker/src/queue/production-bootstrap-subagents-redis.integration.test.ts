@@ -147,6 +147,18 @@ function createSqlFixture(input: { tasks: Map<string, SubagentTaskRecord>; rootT
   }
   const outbox: FixtureOutbox[] = []
   const events: Array<Record<string, unknown>> = []
+  const terminalTaskStatuses = new Set(["completed", "failed", "interrupted", "cancelled", "closed"])
+  const terminalTurnStatuses = new Set(["completed", "failed", "interrupted", "cancelled"])
+  const missingDispatchTasks = (sessionIds: readonly string[] = [session.id]) => [...input.tasks.values()].filter(task => {
+    const root = input.tasks.get(task.rootTaskId)
+    const due = task.nextAttemptAt == null || task.nextAttemptAt <= new Date()
+    const hasDispatch = outbox.some(row => row.topic === "agent.subagent.dispatch" && row.idempotencyKey === `subagent-dispatch:${task.id}`)
+    return sessionIds.includes(task.sessionId) && task.sessionId === session.id && task.turnId === turn.id
+      && task.userId === session.userId && ["queued", "retrying"].includes(task.status)
+      && task.interruptRequestedAt === null && task.attemptCount < task.maxAttempts && due && !hasDispatch
+      && root?.sessionId === task.sessionId && root.turnId === task.turnId && !terminalTaskStatuses.has(root.status)
+      && !terminalTurnStatuses.has(turn.status) && session.status === "running" && pauseAdmitted()
+  })
 
   const client = {
     async query(sql: string, values: unknown[] = []) {
@@ -192,6 +204,20 @@ function createSqlFixture(input: { tasks: Map<string, SubagentTaskRecord>; rootT
         const row = outbox.find(candidate => candidate.id === values[0] && candidate.aggregateId === values[1] && candidate.topic === values[2] && candidate.publishedAt === null)
         if (row) { row.publishedAt = new Date(); row.attemptCount += 1; return { rows: [], rowCount: 1 } }
         return none
+      }
+      if (sql.includes('SELECT session."id"') && sql.includes('FROM "agent_sessions" AS session')
+        && sql.includes('LEFT JOIN "agent_outbox" AS dispatch') && sql.includes('dispatch."id" IS NULL')
+        && sql.includes('ORDER BY session."updatedAt"')) {
+        const rows = missingDispatchTasks().length > 0 ? [{ id: session.id }] : []
+        return { rows, rowCount: rows.length }
+      }
+      if (sql.includes('SELECT task."id", task."sessionId", task."rootTaskId"')
+        && sql.includes('LEFT JOIN "agent_outbox" AS dispatch') && sql.includes('session."id" = ANY($1::text[])')
+        && sql.includes('LIMIT $3 FOR UPDATE OF task SKIP LOCKED')) {
+        const rows = missingDispatchTasks((values[0] as string[]).map(String)).slice(0, Number(values[2])).map(task => ({
+          id: task.id, sessionId: task.sessionId, rootTaskId: task.rootTaskId,
+        }))
+        return { rows, rowCount: rows.length }
       }
       if (sql.includes('SELECT session."id"') && sql.includes('FROM "agent_sessions" AS session')
         && !sql.includes('ORDER BY session."updatedAt"') && !sql.includes("NOT EXISTS")) return none
@@ -337,6 +363,28 @@ describe("child queue SQL fixture", () => {
     const fixture = createSqlFixture({ tasks, rootTaskId: root.id, childTaskId: root.id, ...ids })
 
     await expect(repairStaleSubagentDispatches(fixture.pool as never, "recovery-owner")).resolves.toBe(0)
+  })
+
+  it("creates one durable intent for a missing dispatch and finds no candidate on replay", async () => {
+    const ids = { sessionId: "missing-dispatch-session", turnId: "missing-dispatch-turn", userId: "missing-dispatch-user" }
+    const { store, tasks } = createTaskStore()
+    const root = await store.create({ ...ids, role: "planner", taskType: "root", goal: "fixture root", policy: { maxConcurrency: 1, maxDepth: 1, maxFanOut: 1, maxAttempts: 1 } })
+    root.status = "running"
+    const child = await store.create({ ...ids, parentTaskId: root.id, role: "analyst", taskType: "research", goal: "fixture child", policy: { maxConcurrency: 1, maxDepth: 1, maxFanOut: 1, maxAttempts: 2 } })
+    const fixture = createSqlFixture({ tasks, rootTaskId: root.id, childTaskId: child.id, ...ids })
+    vi.doMock("../redis.js", () => ({ redisConnection: {}, redisCommandConnection: {}, closeSharedRedisConnections: async () => undefined }))
+    const { repairMissingSubagentDispatches } = await import("./subagent-queue.js")
+    vi.doUnmock("../redis.js")
+
+    await expect(repairMissingSubagentDispatches(fixture.pool as never, "missing-recovery-owner")).resolves.toBe(1)
+    expect(fixture.outbox).toHaveLength(1)
+    expect(fixture.outbox[0]).toMatchObject({
+      topic: "agent.subagent.dispatch", aggregateId: ids.sessionId, idempotencyKey: `subagent-dispatch:${child.id}`,
+      publishedAt: null, payload: { taskId: child.id, sessionId: ids.sessionId, rootTaskId: root.id, ownerId: "missing-recovery-owner" },
+    })
+    await expect(repairMissingSubagentDispatches(fixture.pool as never, "missing-recovery-owner")).resolves.toBe(0)
+    expect(fixture.outbox).toHaveLength(1)
+    vi.resetModules()
   })
 
   it("returns a task turn only for the matching session", async () => {
@@ -537,6 +585,7 @@ describeWithRedis("production child scheduling and wait wakeup (real Redis/BullM
     })
     await probeRedis.connect()
     await probeRedis.ping()
+    vi.resetModules()
     vi.doMock("../redis.js", () => ({
       redisConnection: probeRedis,
       redisCommandConnection: probeRedis,
