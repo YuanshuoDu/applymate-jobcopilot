@@ -172,9 +172,10 @@ export function AgentObjectiveContextForm({
         <p style={{ margin: '4px 0 0', color: 'var(--muted)', fontSize: 12 }}>This starts a fresh task. It does not change an existing run.</p>
       </div>
       <label htmlFor="agent-task-objective">Task objective</label>
-      <p style={{ margin: '-4px 0 0', color: 'var(--muted)', fontSize: 12 }}>Write a short objective; add detailed references below.</p>
+      <p style={{ margin: '-4px 0 0', color: 'var(--muted)', fontSize: 12 }}>State the outcomes required to complete this task.</p>
       <textarea id="agent-task-objective" data-testid="objective-context-objective" rows={2} value={objective} disabled={pending || accepted || Boolean(error?.conflict)} onChange={event => { setObjective(event.target.value); invalidateObjectiveStartIdentity(memory.current); setError(null) }} style={fieldStyle} />
       <label htmlFor="agent-task-background">Supporting context (optional)</label>
+      <p style={{ margin: '-4px 0 0', color: 'var(--muted)', fontSize: 12 }}>Add reference material and details that support the objective.</p>
       <textarea id="agent-task-background" data-testid="objective-context-background" rows={5} value={background} disabled={pending || accepted || Boolean(error?.conflict)} onChange={event => { setBackground(event.target.value); invalidateObjectiveStartIdentity(memory.current); setError(null) }} style={fieldStyle} />
       <div aria-live="polite" style={{ color: 'var(--muted)', fontSize: 11 }}>{background.length}/20,000 characters</div>
       {error && <div role={error.conflict ? 'alert' : 'status'} data-testid="objective-context-error" style={{ color: error.conflict ? '#b91c1c' : 'var(--muted)' }}>{error.message}{error.conflict ? ' Your draft is preserved. Close this form to stop here.' : ''}</div>}
