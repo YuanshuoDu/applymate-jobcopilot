@@ -8,6 +8,7 @@ import { STEERING_MARKER_EVENT_TYPE, steeringMarkerIdempotencyKey, type Steering
 import { buildCognitiveActionAgenda } from "./turns/cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE } from "./turns/cognitive-agenda-receipt.js"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
+import type { InputContentPart } from "@jobcopilot/agent-protocol/input"
 import { StepContextBuilder } from "./context/step-context-builder.js"
 import type { InputClaimStore, InputClaimTransaction } from "./context/input-claim-store.js"
 import { buildModelRequest } from "./turns/turn-engine-messages.js"
@@ -75,11 +76,11 @@ function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unk
   return { connect: vi.fn(async () => client), client } as unknown as Pick<import("pg").Pool, "connect"> & { client: typeof client }
 }
 
-function nativeHistoryControl() {
+function nativeHistoryControl(goal = "Find jobs", requirement = "Use verified job facts") {
   const taskId = "private-control-task", turnId = "history-turn", rootTaskId = "history-root"
   const packet: NativeVerificationPacket = {
-    schemaVersion: NATIVE_VERIFICATION_PACKET_SCHEMA, controlOperationId: "private-operation", controlTaskId: taskId, goal: "Find jobs",
-    criteria: [{ criterionId: "criterion-1", requirement: "Use verified job facts" }],
+    schemaVersion: NATIVE_VERIFICATION_PACKET_SCHEMA, controlOperationId: "private-operation", controlTaskId: taskId, goal,
+    criteria: [{ criterionId: "criterion-1", requirement }],
     target: { kind: "root_goal", candidateDigest: digestNativeVerificationValue("PRIVATE_CANDIDATE"), referenceId: "private-candidate-ref", candidateText: "PRIVATE_CANDIDATE" },
     evidence: [{ referenceId: "private-evidence-ref", kind: "artifact", summary: "PRIVATE_PACKET_SUMMARY" }],
   }
@@ -103,6 +104,7 @@ function nativeHistoryControl() {
 describe("loadCanonicalTurnState", () => {
   it("rehydrates exact-goal historical verifier advice on reload and sends it as untrusted request data", async () => {
     const control = nativeHistoryControl()
+    const content: InputContentPart[] = [{ type: "text", text: "Find jobs" }]
     const ordinary = { id: "history:user:prior-note", content: { role: "user", text: "Keep ordinary history" } }
     const stale = { id: "native-verification-advisory:0", content: { type: "historical_native_verification_advisory", goal: "Old goal" } }
     const snapshot = {
@@ -112,8 +114,9 @@ describe("loadCanonicalTurnState", () => {
       tokenAccounting: { profiles: [], totalInputTokens: 0, totalOutputTokens: 0, totalCostUsd: 0 },
     }
     const options = {
-      turn: { input: { goal: "Find jobs", successCriteria: ["Use verified job facts"] }, rootTaskId: null, contextSnapshotId: "snapshot-1", modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      turn: { input: { goal: "Find jobs", content, clientMessageId: "command-1" }, rootTaskId: "current-root", contextSnapshotId: "snapshot-1", modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
       snapshots: [{ id: "snapshot-1", throughSequence: "4", version: 1, content: snapshot }],
+      nativeRoots: [{ goal: "Find jobs", successCriteria: ["Use verified job facts"] }],
       historyTurns: [{ id: "history-turn", rootTaskId: "history-root", createdAt: new Date("2026-10-06T09:00:00.000Z") }], nativeControls: [control],
     }
     const first = await loadCanonicalTurnState(pool(options), lease)
@@ -143,10 +146,22 @@ describe("loadCanonicalTurnState", () => {
     expect(requestText).not.toMatch(/PRIVATE_CANDIDATE|PRIVATE_PACKET_SUMMARY|private-control-task|evidencePacketDigest|controlOperationId/)
 
     const changed = await loadCanonicalTurnState(pool({
-      ...options, turn: { ...options.turn, input: { goal: "Different goal", successCriteria: ["Use verified job facts"] } },
+      ...options, turn: { ...options.turn, input: { goal: "Different goal", content: [{ type: "text", text: "Different goal" }], clientMessageId: "command-2" } },
       snapshots: [{ id: "snapshot-1", throughSequence: "4", version: 3, content: persisted }],
     }), lease)
     expect(changed.snapshot.steerHistory.filter(item => item.id.startsWith("native-verification-advisory:"))).toEqual([])
+
+    const fresh = await loadCanonicalTurnState(pool({
+      ...options,
+      turn: { ...options.turn, rootTaskId: null, input: { goal: "Find jobs", content, clientMessageId: "command-3" } },
+      nativeRoots: [], nativeControls: [nativeHistoryControl("Find jobs", "Find jobs")],
+    }), lease)
+    expect(fresh.snapshot.steerHistory).toEqual([
+      ordinary,
+      expect.objectContaining({ id: "native-verification-advisory:0", content: expect.objectContaining({
+        goal: "Find jobs", criterionId: "criterion-1", requirement: "Find jobs", disposition: "failed",
+      }) }),
+    ])
   })
 
   it("hydrates durable compaction state from the persisted snapshot after a Worker restart", async () => {

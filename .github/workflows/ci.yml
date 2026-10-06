@@ -146,6 +146,7 @@ jobs:
           pnpm --filter @jobcopilot/worker exec vitest run --no-file-parallelism \
             src/runtime/subagents/task-graph-native-pg.integration.test.ts \
             src/runtime/subagents/native-verification-pg.integration.test.ts \
+            src/runtime/subagents/native-verification-history-pg.integration.test.ts \
             src/runtime/subagents/native-brain-pg.integration.test.ts
       - name: Verify interactive discovery Stop recovery without subagent execution
         env:
