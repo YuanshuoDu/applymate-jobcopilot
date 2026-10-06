@@ -1,6 +1,9 @@
-import { describe, expect, it, vi } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
+
+const sessionControlRecovery = vi.hoisted(() => ({ run: vi.fn() }))
 
 vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnect: vi.fn() })) }))
+vi.mock("../session-control/pause-recovery.js", () => ({ reconcilePendingSessionControls: sessionControlRecovery.run }))
 
 import { dispatchPendingTurnOutbox, persistTurnDispatch, reclaimExpiredTurns, repairLegacyTurnDispatchAggregates, recoverTurnQueue, turnJobId } from "./recovery-scanner.js"
 import { markTurnDispatchClaimed } from "./turn-queue.js"
@@ -49,6 +52,30 @@ function pool(rows: unknown[] = [], sessionStatus: string | null = "running", qu
 }
 
 describe("Turn recovery scanner", () => {
+  beforeEach(() => {
+    sessionControlRecovery.run.mockReset().mockResolvedValue({ scanned: 0, reconciled: 0, failed: 0 })
+  })
+
+  it("includes pause and resume reconciliation in each root recovery pass", async () => {
+    const fake = pool()
+
+    await expect(recoverTurnQueue(fake.pool, { add: vi.fn() }, "owner_1")).resolves.toMatchObject({ reclaimed: 1 })
+
+    expect(sessionControlRecovery.run).toHaveBeenCalledWith(fake.pool)
+  })
+
+  it("keeps normal turn recovery running when session-control scan fails", async () => {
+    const fake = pool()
+    const error = new Error("pause scan unavailable")
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    sessionControlRecovery.run.mockReset().mockRejectedValueOnce(error)
+
+    await expect(recoverTurnQueue(fake.pool, { add: vi.fn() }, "owner_1")).resolves.toMatchObject({ reclaimed: 1 })
+
+    expect(log).toHaveBeenCalledWith("[turn-recovery] session control scan failed:", error)
+    log.mockRestore()
+  })
+
   it("rejects an invalid dispatch batch size before touching the database", async () => {
     const fake = pool()
     await expect(dispatchPendingTurnOutbox(fake.pool, { add: vi.fn() }, 0)).rejects.toThrow("Turn dispatch limit must be positive")

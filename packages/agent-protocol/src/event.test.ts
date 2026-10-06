@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { AgentEventEnvelopeSchema, KnownAgentEventEnvelopeSchema, isKnownAgentEventType } from './event.js'
+import { AgentEventEnvelopeSchema, KnownAgentEventEnvelopeSchema, SessionControlEventPayloadSchema, isKnownAgentEventType } from './event.js'
 import { validate } from './validation.js'
 
 const base = {
@@ -28,11 +28,23 @@ describe('AgentEvent envelopes', () => {
     expect(isKnownAgentEventType('policy.decision')).toBe(true)
     expect(isKnownAgentEventType('approval.consumed')).toBe(true)
     expect(isKnownAgentEventType('external_action.reserved')).toBe(true)
+    expect(isKnownAgentEventType('session.pause_requested')).toBe(true)
+    expect(isKnownAgentEventType('session.resume_requested')).toBe(true)
+    expect(isKnownAgentEventType('session.resumed')).toBe(true)
+    expect(isKnownAgentEventType('session.paused')).toBe(true)
+    expect(isKnownAgentEventType('session.pause_blocked')).toBe(true)
     expect(isKnownAgentEventType('future.event.v3')).toBe(false)
   })
 
   it('rejects invalid sequence and actor values', () => {
     expect(validate(AgentEventEnvelopeSchema, { ...base, type: 'item.started', sequence: -1 })).toBe(false)
     expect(validate(AgentEventEnvelopeSchema, { ...base, type: 'item.started', actor: 'operator' })).toBe(false)
+  })
+
+  it('validates bounded pause and resume request payloads', () => {
+    const payload = { turnId: 'turn-1', expectedRevision: 3, requestedAt: '2026-10-06T00:00:00.000Z' }
+    expect(validate(SessionControlEventPayloadSchema, payload)).toBe(true)
+    expect(validate(SessionControlEventPayloadSchema, { ...payload, note: 'free-form' })).toBe(false)
+    expect(validate(SessionControlEventPayloadSchema, { ...payload, expectedRevision: 2_147_483_648 })).toBe(false)
   })
 })

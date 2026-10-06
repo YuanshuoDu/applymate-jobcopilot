@@ -1,6 +1,7 @@
 import type pg from "pg"
 
-import { OPEN_SESSION, RUNNABLE_SESSION } from "../session-gate.js"
+import { OPEN_SESSION, RUNNABLE_SESSION, assertSessionWorkAdmission, isSessionPauseRequestedError } from "../session-gate.js"
+import { ClaimSessionUnavailable, lockClaimSession } from "./lease-claim-session.js"
 
 /** Normal owner window. A scanner reclaims the Turn after this expires. */
 export const TURN_LEASE_WINDOW_MS = 60_000
@@ -79,25 +80,6 @@ async function lockOpenSession(client: pg.PoolClient, sessionId: string, userId:
   if (!result.rows[0] && result.rowCount !== 1) throw new LeaseUnavailable("Turn session is no longer open")
 }
 
-async function lockClaimSession(client: pg.PoolClient, payload: TurnJobPayload): Promise<string | null> {
-  const result = await client.query<{ userId: string }>(
-    `SELECT session."userId"
-     FROM "agent_sessions" AS session
-     WHERE session."id" = $1 AND ${RUNNABLE_SESSION}
-       AND EXISTS (
-         SELECT 1 FROM "agent_turns" AS turn
-         WHERE turn."id" = $2 AND turn."sessionId" = session."id" AND turn."userId" = session."userId"
-       )
-     FOR UPDATE`,
-    [payload.sessionId, payload.turnId],
-  )
-  const row = result.rows[0]
-  if ((!row && result.rowCount !== 1) || (row && result.rowCount !== undefined && result.rowCount !== 1)) {
-    throw new LeaseUnavailable("Turn session is no longer open")
-  }
-  return row?.userId ?? null
-}
-
 async function withOpenLease<T>(pool: LeasePool, current: TurnLease, fallback: T, work: (client: pg.PoolClient) => Promise<T>): Promise<T> {
   try {
     return await transaction(pool, current.userId, async client => { await lockOpenSession(client, current.sessionId, current.userId); return work(client) })
@@ -119,7 +101,10 @@ export async function claimTurnLease(
   try {
     return await transaction(pool, null, async (client) => {
       const userId = await lockClaimSession(client, payload)
-      if (userId) await client.query("SELECT set_config('app.user_id', $1, true)", [userId])
+      if (userId) {
+        await client.query("SELECT set_config('app.user_id', $1, true)", [userId])
+        await assertSessionWorkAdmission(client, { userId, sessionId: payload.sessionId, turnId: payload.turnId })
+      }
       const result = await client.query<LeaseRow>(
       `UPDATE "agent_turns"
        SET "status" = 'in_progress',
@@ -148,7 +133,7 @@ export async function claimTurnLease(
       return lease(row)
     })
   } catch (error: unknown) {
-    if (error instanceof LeaseUnavailable) throw new TurnLeaseError("lease_not_available", error.message)
+    if (error instanceof LeaseUnavailable || error instanceof ClaimSessionUnavailable || isSessionPauseRequestedError(error)) throw new TurnLeaseError("lease_not_available", error.message)
     throw error
   }
 }

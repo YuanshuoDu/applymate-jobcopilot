@@ -14,6 +14,7 @@ import {
 import { isSubagentRetryDue } from "./retry-policy.js"
 import { isTaskPathWithin, normalizeTaskPath, policyFromTask } from "./manager-task-scope.js"
 import { finishInterrupted, type SubagentRunOutcome } from "./manager-run-outcome.js"
+import { isSessionPauseRequestedError } from "../session-gate.js"
 
 export type { SubagentRunOutcome } from "./manager-run-outcome.js"
 
@@ -105,6 +106,7 @@ export class AgentTreeManager {
   async run(payload: SubagentJobPayload, execute: (input: { lease: SubagentLease }) => Promise<SubagentExecutionResult>): Promise<SubagentRunOutcome> {
     let lease: SubagentLease | null
     try { lease = await this.claim(payload) } catch (error: unknown) {
+      if (isSessionPauseRequestedError(error)) return { taskId: payload.taskId, status: "skipped", reason: "session_pause_requested" }
       if (error instanceof SubagentLeaseError) return { taskId: payload.taskId, status: "lease_lost", reason: error.message }
       throw error
     }
@@ -115,6 +117,10 @@ export class AgentTreeManager {
       try {
         result = await Promise.race([execute({ lease }), active.lost.then(error => { throw error })])
       } catch (error: unknown) {
+        if (isSessionPauseRequestedError(error)) {
+          const released = await this.store.release?.({ taskId: payload.taskId, sessionId: payload.sessionId, ownerId: payload.ownerId, attemptCount: lease.attemptCount, now: this.now() }).catch(() => false)
+          return { taskId: payload.taskId, status: released ? "retrying" : "skipped", reason: "session_pause_requested" }
+        }
         if (error instanceof SubagentLeaseError) {
           if (!active.interrupted) return { taskId: payload.taskId, status: "lease_lost", reason: error.message }
           return await finishInterrupted(this.store, payload, lease, error, this.now())

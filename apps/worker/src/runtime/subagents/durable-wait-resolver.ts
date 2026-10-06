@@ -131,6 +131,7 @@ async function reconcileWait(client: Queryable, wait: Row, turn: Row, now: Date,
   const finalStatus = waitStatus === "waiting" ? resolvedStatus : waitStatus
   if (!changed && finalStatus === "waiting") return "ignored"
   if (wait.suspendedAt === null || wait.suspendedAt === undefined || String(turn.status) !== "waiting_for_dependency") return changed ? "resolved" : "ignored"
+  if (String(turn.sessionStatus) !== "running") return changed ? "resolved" : "ignored"
   if (turn.leaseOwnerId !== null && turn.leaseOwnerId !== undefined) return changed ? "resolved" : "ignored"
   const queued = await client.query(
     `UPDATE "agent_turns" SET "status" = 'queued', "leaseOwnerId" = NULL,
@@ -152,7 +153,7 @@ export async function reconcileDurableWaits(pool: LeasePool, options: DurableWai
   const batchSize = validBatch(options.batchSize ?? DEFAULT_BATCH_SIZE); const now = options.now ?? new Date(); const ownerId = options.ownerId ?? "wait-resolver"
   return transaction(pool, async client => {
     const turns = await client.query<Row>(
-      `SELECT turn."id", turn."userId", turn."sessionId", turn."rootTaskId", turn."status", turn."leaseOwnerId"
+      `SELECT turn."id", turn."userId", turn."sessionId", turn."rootTaskId", turn."status", turn."leaseOwnerId", session."status" AS "sessionStatus"
        FROM "agent_sessions" AS session
        JOIN "agent_turns" AS turn ON turn."sessionId" = session."id" AND turn."userId" = session."userId"
        WHERE turn."status" IN ('waiting_for_dependency', 'in_progress') AND turn."rootTaskId" IS NOT NULL

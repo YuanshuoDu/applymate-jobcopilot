@@ -3,6 +3,7 @@ import type pg from "pg"
 
 import { createPgTurnEngineStore } from "./turn-engine-store.js"
 import { steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "../context/steering-marker.js"
+import { SessionPauseRequestedError, SESSION_WORK_ADMISSION } from "../session-gate.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "owner-1", userId: "user-1", leaseVersion: 3,
@@ -35,11 +36,13 @@ function turnStartBudgetFixture(input: {
   readonly budgetSnapshot: unknown
   readonly usage?: Record<string, unknown>
   readonly existingStep?: boolean
+  readonly pauseAdmissionDenied?: boolean
 }) {
   const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
   const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
     calls.push({ sql, values })
     if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 1 }
+    if (sql.includes(SESSION_WORK_ADMISSION)) return input.pauseAdmissionDenied ? { rows: [], rowCount: 0 } : { rows: [{ id: owner.sessionId }], rowCount: 1 }
     if (sql.includes('SELECT root_task."budgetSnapshot"')) return { rows: [{ budgetSnapshot: input.budgetSnapshot }], rowCount: 1 }
     if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: owner.sessionId }], rowCount: 1 }
     if (sql.includes('SELECT turn."id"')) return { rows: [{ id: owner.turnId }], rowCount: 1 }
@@ -57,6 +60,53 @@ function turnStartBudgetFixture(input: {
 }
 
 describe("PostgreSQL TurnEngine store", () => {
+  it("linearizes tool start against pause on the locked Session before writing its started event", async () => {
+    const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
+    const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+      calls.push({ sql, values })
+      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
+      if (sql.includes("SESSION_WORK_ADMISSION") || sql.includes(SESSION_WORK_ADMISSION)) return { rows: [{ id: owner.sessionId }], rowCount: 1 }
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: owner.sessionId }], rowCount: 1 }
+      if (sql.includes('SELECT turn."id"')) return { rows: [{ id: owner.turnId }], rowCount: 1 }
+      if (sql.includes('FROM "agent_events"') && sql.includes('"idempotencyKey" = $2')) return { rows: [], rowCount: 0 }
+      if (sql.includes('UPDATE "agent_sessions" SET "eventSequence"')) return { rows: [{ eventSequence: "1" }], rowCount: 1 }
+      if (sql.includes('INSERT INTO "agent_events"')) return { rows: [], rowCount: 1 }
+      if (sql.includes('INSERT INTO "agent_outbox"')) return { rows: [], rowCount: 1 }
+      return { rows: [], rowCount: 1 }
+    }), release: vi.fn() }
+    const store = createPgTurnEngineStore({ connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">)
+
+    await store.appendEvent({ owner, id: "tool-start-event", itemId: null, type: "tool_call.started", correlationId: "call-1", causationId: null,
+      idempotencyKey: "tool-start:call-1", payload: { toolCallId: "call-1" } })
+
+    const sessionLock = calls.findIndex(call => call.sql.includes('FROM "agent_sessions"') && call.sql.includes("FOR UPDATE"))
+    const turnLock = calls.findIndex(call => call.sql.includes('SELECT turn."id"'))
+    const admission = calls.findIndex(call => call.sql.includes(SESSION_WORK_ADMISSION))
+    const eventWrite = calls.findIndex(call => call.sql.includes('INSERT INTO "agent_events"'))
+    expect(sessionLock).toBeLessThan(turnLock)
+    expect(turnLock).toBeLessThan(admission)
+    expect(admission).toBeLessThan(eventWrite)
+    expect(calls[admission]?.values).toEqual([owner.sessionId, owner.userId, owner.turnId])
+  })
+
+  it("denies a tool-start event when pause won the Session lock first", async () => {
+    const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
+    const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+      calls.push({ sql, values })
+      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
+      if (sql.includes(SESSION_WORK_ADMISSION)) return { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: owner.sessionId }], rowCount: 1 }
+      if (sql.includes('SELECT turn."id"')) return { rows: [{ id: owner.turnId }], rowCount: 1 }
+      return { rows: [], rowCount: 1 }
+    }), release: vi.fn() }
+    const store = createPgTurnEngineStore({ connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">)
+
+    await expect(store.appendEvent({ owner, id: "tool-start-event", itemId: null, type: "tool_call.started", correlationId: "call-1", causationId: null,
+      idempotencyKey: "tool-start:call-1", payload: { toolCallId: "call-1" } })).rejects.toBeInstanceOf(SessionPauseRequestedError)
+    expect(calls.some(call => call.sql.includes('INSERT INTO "agent_events"'))).toBe(false)
+    expect(calls.some(call => call.sql === "ROLLBACK")).toBe(true)
+  })
+
   it("fences new Steps and Items with the active lease and current time", async () => {
     const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
     const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
@@ -77,7 +127,7 @@ describe("PostgreSQL TurnEngine store", () => {
     const createItem = calls.find(({ sql }) => sql.includes('INSERT INTO "agent_items"'))
     expect(createItem?.sql).toContain('AND ($4::text IS NULL OR EXISTS (SELECT 1 FROM "agent_steps" AS owner_step')
     expect(createItem?.sql).toContain('WHERE owner_step."id" = $4::text')
-    const sessionLocks = calls.filter(({ sql }) => sql.includes('FROM "agent_sessions"'))
+    const sessionLocks = calls.filter(({ sql }) => sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE"))
     expect(sessionLocks).toHaveLength(2)
     expect(sessionLocks.every(({ sql }) => sql.includes('"status" NOT IN (\'aborted\', \'archived\')') && sql.includes("FOR UPDATE"))).toBe(true)
     const firstTurnLock = calls.findIndex(({ sql }) => sql.includes('SELECT turn."id"'))
@@ -151,6 +201,20 @@ describe("PostgreSQL TurnEngine store", () => {
     expect(calls.some(({ sql }) => sql.includes('COUNT(*)::bigint AS "used"') || sql.includes("SUM(usage_row."))).toBe(false)
     expect(calls.some(({ sql }) => sql.includes('INSERT INTO "agent_steps"'))).toBe(false)
     expect(calls.some(({ sql }) => sql === "COMMIT")).toBe(true)
+  })
+
+  it("does not replay an existing Step through a durable pause admission fence", async () => {
+    const { calls, pool } = turnStartBudgetFixture({ budgetSnapshot: {}, existingStep: true, pauseAdmissionDenied: true })
+    const store = createPgTurnEngineStore(pool)
+
+    await expect(store.startStep({ owner, stepId: "replayed-step", ordinal: 0, attempt: 1, inputThroughSequence: 0n, consumedInputIds: [], modelProfileSnapshot: {}, now }))
+      .rejects.toBeInstanceOf(SessionPauseRequestedError)
+
+    const admission = calls.findIndex(({ sql }) => sql.includes(SESSION_WORK_ADMISSION))
+    expect(admission).toBeGreaterThan(-1)
+    expect(calls.some(({ sql }) => sql.includes('SELECT "id", "ordinal", "taskId"'))).toBe(false)
+    expect(calls.some(({ sql }) => sql === "COMMIT")).toBe(false)
+    expect(calls.some(({ sql }) => sql === "ROLLBACK")).toBe(true)
   })
 
   it("persists Step usage updates without rechecking the root budget", async () => {

@@ -3,6 +3,7 @@ import type pg from "pg"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 
 import { commitTurnTerminal } from "./turn-engine-terminal-commit.js"
+import { SessionPauseRequestedError } from "../session-gate.js"
 
 const now = new Date("2026-09-25T10:00:00.000Z")
 const owner = {
@@ -18,7 +19,7 @@ const input = {
 type Row = Record<string, unknown>
 type Call = { sql: string; values?: readonly unknown[] }
 
-function makePool(pending: readonly Row[] = [], currentTurnInput?: unknown) {
+function makePool(pending: readonly Row[] = [], currentTurnInput?: unknown, options: { pause?: boolean } = {}) {
   const calls: Call[] = []
   const events = new Map<string, Row>()
   const outboxes = new Map<string, Row>()
@@ -32,12 +33,13 @@ function makePool(pending: readonly Row[] = [], currentTurnInput?: unknown) {
   }))
   let sequence = 10n
   let turn: Row = { id: owner.turnId, status: "in_progress", finalResponse: null, source: "user", ...(currentTurnInput === undefined ? {} : { input: currentTurnInput }) }
-  let root: Row = { id: owner.taskId, status: "running", leaseOwner: owner.ownerId, attemptCount: 1, result: null }
+  let root: Row = { id: owner.taskId, status: "running", leaseOwner: owner.ownerId, attemptCount: 1, result: null, interruptRequestedAt: null }
   const client = {
     query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
       calls.push({ sql, values })
       if (/^BEGIN(?: ISOLATION LEVEL READ COMMITTED)?$/.test(sql) || ["COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 0 }
       if (sql.includes('SELECT "eventSequence" FROM "agent_sessions"')) return { rows: [{ eventSequence: sequence }], rowCount: 1 }
+      if (sql.includes('SELECT session."id" FROM "agent_sessions" AS session')) return options.pause ? { rows: [], rowCount: 0 } : { rows: [{ id: owner.sessionId }], rowCount: 1 }
       if (sql.includes('FROM "agent_sessions"')) return { rows: values?.[0] === owner.sessionId && values?.[1] === owner.userId ? [{ id: owner.sessionId }] : [], rowCount: 1 }
       if (sql.includes('FROM "agent_turns" AS turn')) {
         if (values?.[0] !== owner.turnId || values[1] !== owner.sessionId || values[2] !== owner.userId || values[5] !== owner.taskId) return { rows: [], rowCount: 0 }
@@ -306,6 +308,16 @@ describe("atomic Turn terminal commit", () => {
     expect(fake.events.size).toBe(0)
     expect(fake.outboxes.size).toBe(0)
     expect(fake.calls.some(({ sql }) => sql === "ROLLBACK")).toBe(true)
+  })
+
+  it("does not terminalize a Turn after durable pause admission is denied", async () => {
+    const fake = makePool([], undefined, { pause: true })
+
+    await expect(commitTurnTerminal(fake.pool, input)).rejects.toBeInstanceOf(SessionPauseRequestedError)
+    expect(fake.calls.some(({ sql }) => /INSERT INTO "agent_(items|events|outbox)"|UPDATE "(sub_agent_tasks|agent_turns)"/.test(sql))).toBe(false)
+    expect(fake.calls.some(({ sql }) => sql === "ROLLBACK")).toBe(true)
+    expect(fake.state.turn.status).toBe("in_progress")
+    expect(fake.state.root.status).toBe("running")
   })
 
   it("surfaces a TaskGraph race denial as a same-Turn recovery receipt", async () => {

@@ -6,7 +6,7 @@ const now = new Date("2026-09-09T12:00:00.000Z")
 const SESSION_FENCE = 'session."status" NOT IN (\'aborted\', \'archived\')'
 
 function fixture(input: { turnStatus?: string; waitStatus?: string; suspended?: boolean; deadline?: Date; targetStatus?: string; targetUser?: string; consumed?: boolean; turnCount?: number; sessionStatus?: string; sessionSource?: string; closeBeforeWake?: boolean; closeBeforeOutbox?: boolean }) {
-  const turn = { id: "turn-1", userId: "user-1", sessionId: "session-1", rootTaskId: "root-1", status: input.turnStatus ?? "in_progress", leaseOwnerId: null }
+  const turn = { id: "turn-1", userId: "user-1", sessionId: "session-1", rootTaskId: "root-1", status: input.turnStatus ?? "in_progress", leaseOwnerId: null, sessionStatus: input.sessionStatus ?? "running" }
   const wait = { id: "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "root-1", stepId: "step-1", targetTaskIds: ["child-1"], mode: "any", status: input.waitStatus ?? "waiting", deadlineAt: input.deadline ?? new Date("2026-09-09T13:00:00.000Z"), suspendedAt: input.suspended ? now : null, consumedAt: input.consumed ? now : null, matchedTaskIds: [] }
   const secondTurn = { ...turn, id: "turn-2", rootTaskId: "root-2", sessionId: "session-2", userId: "user-2" }
   const secondWait = { ...wait, id: "wait-2", turnId: "turn-2", parentTaskId: "root-2", stepId: "step-2", userId: "user-2", sessionId: "session-2", targetTaskIds: ["child-2"] }
@@ -108,6 +108,17 @@ describe("durable wait resolver", () => {
     expect(fake.state.eventWrites).toBe(1)
     expect(fake.state.eventOutboxWrites).toBe(1)
     expect(fake.state.outboxWrites).toBe(1)
+  })
+
+  it("keeps a resolved wait durable while paused and leaves Turn dispatch for explicit resume", async () => {
+    const fake = fixture({ suspended: true, turnStatus: "waiting_for_dependency", sessionStatus: "paused" })
+    await expect(reconcileDurableWaits(fake.pool as never, { now, ownerId: "resolver-1" })).resolves.toEqual({ scanned: 1, resolved: 1, woken: 0 })
+    expect(fake.state.waits[0].status).toBe("ready")
+    expect(fake.state.waits[0].consumedAt).toBeNull()
+    expect(fake.state.turns[0].status).toBe("waiting_for_dependency")
+    expect(fake.state.turnUpdates).toBe(0)
+    expect(fake.state.eventWrites).toBe(0)
+    expect(fake.state.outboxWrites).toBe(0)
   })
 
   it("times out a waiting condition without claiming an in-progress lease", async () => {

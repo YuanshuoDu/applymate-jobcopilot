@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { activeTurnChanged, automationCannotSteerUserTurn, executionChanged, sessionNotFound, turnWaitRequiresDedicatedAction } from "./errors"
+import { activeTurnChanged, automationCannotSteerUserTurn, executionChanged, sessionControlIdempotencyConflict, sessionControlStateConflict, sessionNotFound, turnWaitRequiresDedicatedAction } from "./errors"
 
 describe("Agent command errors", () => {
   it("exposes HTTP-safe typed details", () => {
@@ -17,5 +17,7 @@ describe("Agent command errors", () => {
     })
     expect(executionChanged("execution_1")).toMatchObject({ code: "execution_changed", status: 409, details: { executionId: "execution_1" } })
     expect(sessionNotFound("session_1").status).toBe(404)
+    expect(sessionControlStateConflict("resume", "running")).toMatchObject({ code: "session_control_state_conflict", status: 409, details: { action: "resume", status: "running" } })
+    expect(sessionControlIdempotencyConflict()).toMatchObject({ code: "session_control_idempotency_conflict", status: 409 })
   })
 })

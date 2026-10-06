@@ -5,6 +5,7 @@ import type { LeasePool } from "./lease.js"
 import { TURN_DISPATCH_MAX_BATCH, type TurnDispatchQueue } from "./recovery-scanner-common.js"
 import { ensureQueuedTurnDispatches } from "./recovery-scanner-queue-repair.js"
 import { dispatchPendingTurnOutbox } from "./recovery-scanner-delivery.js"
+import { reconcilePendingSessionControls } from "../session-control/pause-recovery.js"
 import {
   persistTurnDispatch,
   reclaimExpiredTurns,
@@ -36,6 +37,9 @@ export async function recoverTurnQueue(
   ownerId = `recovery-${randomUUID()}`,
   now = new Date(),
 ): Promise<RecoveryReport> {
+  await reconcilePendingSessionControls(pool).catch((error: unknown) => {
+    console.error("[turn-recovery] session control scan failed:", error)
+  })
   const legacyRepaired = await repairLegacyTurnDispatchAggregates(pool, TURN_DISPATCH_MAX_BATCH)
   const reclaimed = await reclaimExpiredTurns(pool, now, TURN_DISPATCH_MAX_BATCH)
   for (const turn of reclaimed) {

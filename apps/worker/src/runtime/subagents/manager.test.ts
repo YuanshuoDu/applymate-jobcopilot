@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 
 import { AgentTreeManager, type SubagentClock } from "./manager.js"
+import { SessionPauseRequestedError } from "../session-gate.js"
 import {
   type SubagentExecutionResult,
   type SubagentJobPayload,
@@ -23,6 +24,8 @@ class MemoryStore implements SubagentStore {
   readonly finishMailboxMessageIds: Array<readonly string[] | undefined> = []
   readonly finishRetryDispositions: Array<SubagentExecutionResult["retryDisposition"]> = []
   heartbeatResult: "renewed" | "interrupted" | "lost" | null = null
+  claimError: unknown = null
+  readonly releaseCalls: Array<{ taskId: string; attemptCount: number }> = []
   private nextId = 1
 
   async create(input: SubagentTaskSpec & { policy: SubagentPolicy }): Promise<SubagentTaskRecord> {
@@ -46,6 +49,7 @@ class MemoryStore implements SubagentStore {
   async get(taskId: string): Promise<SubagentTaskRecord | null> { return this.records.get(taskId) ?? null }
 
   async claim(input: { taskId: string; sessionId: string; ownerId: string; policy: SubagentPolicy; now: Date }): Promise<SubagentTaskRecord | null> {
+    if (this.claimError) throw this.claimError
     const task = this.records.get(input.taskId)
     const running = [...this.records.values()].filter(row => row.sessionId === input.sessionId && row.status === "running").length
     if (!task || task.sessionId !== input.sessionId || task.status !== "queued" || running >= input.policy.maxConcurrency) return null
@@ -91,6 +95,7 @@ class MemoryStore implements SubagentStore {
   }
 
   async release(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; now: Date }): Promise<boolean> {
+    this.releaseCalls.push({ taskId: input.taskId, attemptCount: input.attemptCount })
     const task = this.records.get(input.taskId)
     if (!task || task.sessionId !== input.sessionId || task.leaseOwner !== input.ownerId || task.attemptCount !== input.attemptCount || task.interruptRequestedAt || task.status !== "running") return false
     this.records.set(task.id, { ...task, status: "queued", leaseOwner: null, leaseExpiresAt: null })
@@ -175,6 +180,30 @@ describe("AgentTreeManager", () => {
 
     await expect(manager.run(payload(task), async () => ({ status: "completed" }))).resolves.toMatchObject({ status: "skipped", reason: "not_available" })
     expect(store.records.get(task.id)?.status).toBe("queued")
+    expect(manager.activeCount(task.sessionId)).toBe(0)
+  })
+
+  it("treats pause denial at child claim as skipped without consuming an attempt", async () => {
+    const store = new MemoryStore()
+    const manager = new AgentTreeManager(store, { clock: new FakeClock() })
+    const task = await manager.spawn(spec())
+    store.claimError = new SessionPauseRequestedError()
+
+    await expect(manager.run(payload(task), async () => ({ status: "completed" }))).resolves.toMatchObject({ status: "skipped", reason: "session_pause_requested" })
+    expect(store.records.get(task.id)).toMatchObject({ status: "queued", attemptCount: 0 })
+    expect(store.finishCalls).toEqual([])
+    expect(manager.activeCount(task.sessionId)).toBe(0)
+  })
+
+  it("releases a claimed child on pause instead of terminalizing the attempt", async () => {
+    const store = new MemoryStore()
+    const manager = new AgentTreeManager(store, { clock: new FakeClock() })
+    const task = await manager.spawn(spec())
+
+    await expect(manager.run(payload(task), async () => { throw new SessionPauseRequestedError() })).resolves.toMatchObject({ status: "retrying", reason: "session_pause_requested" })
+    expect(store.releaseCalls).toEqual([{ taskId: task.id, attemptCount: 1 }])
+    expect(store.finishCalls).toEqual([])
+    expect(store.records.get(task.id)).toMatchObject({ status: "queued", attemptCount: 1, leaseOwner: null })
     expect(manager.activeCount(task.sessionId)).toBe(0)
   })
 

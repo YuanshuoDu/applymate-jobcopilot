@@ -23,4 +23,9 @@ describe('AgentSession schema', () => {
     expect(validate(AgentSessionSchema, { ...session, status: 'working' })).toBe(false)
     expect(validate(AgentSessionSchema, { ...session, unexpected: true })).toBe(false)
   })
+
+  it('accepts pending pause and resume transition statuses', () => {
+    expect(validate(AgentSessionSchema, { ...session, status: 'pausing' })).toBe(true)
+    expect(validate(AgentSessionSchema, { ...session, status: 'resuming' })).toBe(true)
+  })
 })

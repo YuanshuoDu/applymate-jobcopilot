@@ -7,6 +7,7 @@ import { toRepositoryJson, type TurnEngineItemPhase, type TurnEngineItemStatus, 
 import { executionId, executionKey, type ExecutionItemHandle, type TurnExecutionOptions } from "./turn-execution-types.js"
 import type { TurnEngineStep, TurnEngineToolCall, TurnEngineToolResult, ToolCallRecovery } from "./turn-engine-types.js"
 import { STEERING_MARKER_EVENT_TYPE } from "../context/steering-marker.js"
+import { isSessionPauseRequestedError } from "../session-gate.js"
 
 type BatchAppendEntryBase = { correlationId: string; itemId: string | null; payload: unknown; key: string }
 export type BatchAppendEntry =
@@ -108,8 +109,14 @@ export async function executeToolWithItems(
     content: { toolCallId: call.id, toolName: call.name, toolVersion: "1", input: toRepositoryJson(call.arguments) }, now: now(),
   })
   onCallItemPersisted?.()
-  await writer.append("tool_call.started", call.id, callItem.id, { toolCallId: call.id, toolName: call.name, taskId: options.identity.taskId }, `tool-started:${call.id}`)
+  try { await writer.append("tool_call.started", call.id, callItem.id, { toolCallId: call.id, toolName: call.name, taskId: options.identity.taskId }, `tool-started:${call.id}`) }
+  catch (error: unknown) {
+    if (!isSessionPauseRequestedError(error)) throw error
+    await writer.updateItem(callItem, "interrupted", { toolCallId: call.id, toolName: call.name, status: "interrupted", errorCode: "session_pause_requested" }, now(), "tool-start-denied")
+    throw error
+  }
   let result: TurnEngineToolResult
+  let pauseError: unknown
   try {
     result = await options.executeTool({
       scope: options.scope, sessionId: options.identity.sessionId, turnId: options.identity.turnId, stepId: step.id,
@@ -119,7 +126,10 @@ export async function executeToolWithItems(
     })
   } catch (error: unknown) {
     if (signalWasInterrupted(options.signal ?? new AbortController().signal)) throw error
-    result = { id: call.id, toolName: call.name, toolVersion: "1", status: "failed", errorCode: "tool_execution_failed" }
+    if (isSessionPauseRequestedError(error)) {
+      pauseError = error
+      result = { id: call.id, toolName: call.name, toolVersion: "1", status: "failed", errorCode: "session_pause_requested" }
+    } else result = { id: call.id, toolName: call.name, toolVersion: "1", status: "failed", errorCode: "tool_execution_failed" }
   }
   await writer.completeItem(callItem, {
     toolCallId: call.id, toolName: call.name, toolVersion: result.toolVersion,
@@ -135,6 +145,7 @@ export async function executeToolWithItems(
     content: { toolCallId: call.id, output: toRepositoryJson(result.output ?? null), errorCode: result.errorCode }, now: now(),
   })
   await writer.completeItem(resultItem, { toolCallId: call.id, output: toRepositoryJson(result.output ?? null), errorCode: result.errorCode }, now(), `tool-result-completed:${call.id}`)
+  if (pauseError) throw pauseError
   return result
 }
 

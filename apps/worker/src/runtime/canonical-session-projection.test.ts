@@ -15,6 +15,7 @@ function fakePool(options: { rowCount?: number | null; failOnUpdate?: boolean; s
         const open = !["missing", "aborted", "archived"].includes(options.sessionStatus ?? "running") && (options.sessionUserId ?? "user-1") === "user-1"
         return open ? { rows: [{ id: "session-1" }], rowCount: 1 } : { rows: [], rowCount: 0 }
       }
+      if (sql.startsWith("UPDATE") && options.sessionStatus && !["queued", "running"].includes(options.sessionStatus)) return { rows: [], rowCount: 0 }
       return { rows: [], rowCount: options.rowCount ?? 1 }
     }),
     release: vi.fn(),
@@ -46,6 +47,8 @@ describe("canonical automation session projection", () => {
       expect(call.sql).toContain('session."userId" = $1')
       expect(call.sql).toContain('automation_session."status" NOT IN (\'aborted\', \'archived\')')
       expect(call.sql).toContain('automation_session."source" = \'automation\'')
+      expect(call.sql).toContain(`session."status" IN ('queued', 'running')`)
+      expect(call.sql).toContain(`pause_request."type" = 'session.pause_requested'`)
       expect(call.sql).toContain('turn."id" = $3')
       expect(call.sql).toContain('turn."sessionId" = $2')
       expect(call.sql).toContain('turn."userId" = $1')
@@ -62,7 +65,7 @@ describe("canonical automation session projection", () => {
 
     const call = update(fake)
     expect(call.sql).toContain('SET "status" = \'running\', "completedAt" = NULL')
-    expect(call.sql).toContain('session."status" NOT IN (\'aborted\', \'archived\')')
+    expect(call.sql).toContain(`session."status" IN ('queued', 'running')`)
     expect(call.sql).toContain('automation_session."source" = \'automation\'')
     expect(call.params).toEqual(["user-1", "session-1", "turn-1"])
   })
@@ -92,8 +95,8 @@ describe("canonical automation session projection", () => {
     await projection.finish({ ...identity, result: { status: "completed" } })
 
     const updates = fake.calls.filter(call => call.sql.startsWith("UPDATE"))
-    expect(updates[0]?.sql).toContain('session."status" NOT IN (\'aborted\', \'archived\')')
-    expect(updates[1]?.sql).toContain(`session."status" IN ('queued', 'running', 'paused', 'waiting_for_dependency', 'waiting_for_approval', 'waiting_for_user')`)
+    expect(updates[0]?.sql).toContain(`session."status" IN ('queued', 'running')`)
+    expect(updates[1]?.sql).toContain(`session."status" IN ('queued', 'running')`)
     expect(updates[1]?.sql).not.toContain("'cancelled'")
     expect(fake.client.release).toHaveBeenCalledTimes(2)
   })
@@ -139,6 +142,19 @@ describe("canonical automation session projection", () => {
     await createCanonicalSessionProjection(fake.pool).start(identity)
     expect(fake.calls.findIndex(call => call.sql.includes('SELECT "id" FROM "agent_sessions"'))).toBeLessThan(fake.calls.findIndex(call => call.sql.startsWith("UPDATE")))
     expect(fake.calls.find(call => call.sql.includes('SELECT "id" FROM "agent_sessions"'))?.sql).toContain("FOR UPDATE")
+  })
+
+  it.each(["pausing", "paused", "resuming", "waiting_for_user"])("does not let a late projection overwrite Session status %s", async sessionStatus => {
+    const fake = fakePool({ sessionStatus })
+    const projection = createCanonicalSessionProjection(fake.pool)
+
+    await projection.start(identity)
+    await projection.finish({ ...identity, result: { status: "completed" } })
+
+    const updates = fake.calls.filter(call => call.sql.startsWith("UPDATE"))
+    expect(updates).toHaveLength(2)
+    expect(updates.every(call => call.sql.includes(`session."status" IN ('queued', 'running')`))).toBe(true)
+    expect(updates.every(call => call.sql.includes(`pause_request."turnId" = $3`))).toBe(true)
   })
 
   it.each(["missing", "aborted", "archived"])("fails closed for a %s session before mutation", async (sessionStatus) => {

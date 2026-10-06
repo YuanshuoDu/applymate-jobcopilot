@@ -28,6 +28,8 @@ import {
 } from "./recovery-scanner.js"
 import { linkAbortSignals } from "../interrupt/bridge.js"
 import { RootAbortController, signalWasInterrupted, type RootAbortControllerRegistry } from "../interrupt/registry.js"
+import { isSessionPauseRequestedError } from "../session-gate.js"
+import { releaseTurnLeaseForPause } from "./pause-lease-release.js"
 import { interruptPollInterval, safePersistedInterrupt, startInterruptProbe, TURN_INTERRUPT_POLL_INTERVAL_MS } from "./turn-interrupt-probe.js"
 import { attachTurnDispatchStateProbe } from "./recovery-scanner-common.js"
 
@@ -165,6 +167,10 @@ export async function runTurnJob(
     if (!released) throw new TurnLeaseError("lease_lost", "Turn lease was fenced before completion")
     return result
   } catch (error: unknown) {
+    if (isSessionPauseRequestedError(error)) {
+      await releaseTurnLeaseForPause(options.pool, heartbeat.currentLease, options.now?.() ?? new Date()).catch(() => undefined)
+      return { status: "requeued", reasonCode: "session_pause_requested" }
+    }
     if (root?.stopped || signalWasInterrupted(linked.signal)) {
       await releaseTurnLease(options.pool, heartbeat.currentLease, "interrupted", options.now?.() ?? new Date()).catch(() => undefined)
       return { status: "interrupted", summary: "Turn stopped by a persisted interrupt" }

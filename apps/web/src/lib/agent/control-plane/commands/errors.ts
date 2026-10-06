@@ -15,6 +15,8 @@ export type AgentCommandErrorCode =
   | "retry_target_changed"
   | "retry_input_invalid"
   | "turn_intent_mismatch"
+  | "session_control_state_conflict"
+  | "session_control_idempotency_conflict"
 
 export class AgentCommandError extends Error {
   readonly status: 404 | 409 | 422
@@ -122,6 +124,14 @@ export function retryTargetChanged(turnId: string, expectedRevision: number, act
 
 export function retryInputInvalid(turnId: string): AgentCommandError {
   return new AgentCommandError("retry_input_invalid", "The retry target has no valid persisted user input", 409, { turnId })
+}
+
+export function sessionControlStateConflict(action: "pause" | "resume", status: string): AgentCommandError {
+  return new AgentCommandError("session_control_state_conflict", `Cannot ${action} a session in state ${status}`, 409, { action, status })
+}
+
+export function sessionControlIdempotencyConflict(): AgentCommandError {
+  return new AgentCommandError("session_control_idempotency_conflict", "The idempotency key was already used for a different session control command", 409)
 }
 
 export function isUniqueViolation(error: unknown): boolean {
