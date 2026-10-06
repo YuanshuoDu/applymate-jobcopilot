@@ -10,6 +10,7 @@ import {
 const MAX_PACKET_BYTES = 32 * 1024
 const MAX_GOAL_BYTES = 4 * 1024
 const MAX_TARGET_BYTES = 16 * 1024
+const MAX_EVIDENCE_SUMMARY_BYTES = 8 * 1024
 const MAX_CRITERIA = 32
 const MAX_EVIDENCE = 32
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
@@ -69,7 +70,7 @@ function parseEvidence(value: unknown, targetReferenceId: string): readonly Nati
   const evidence = value.map(item => {
     const row = exact(item, ["referenceId", "kind", "summary"])
     if (!row || typeof row.referenceId !== "string" || !ID.test(row.referenceId) || seen.has(row.referenceId)
-      || typeof row.kind !== "string" || !/^[a-z][a-z0-9_]{0,39}$/.test(row.kind) || !text(row.summary, 1_000)) return null
+      || typeof row.kind !== "string" || !/^[a-z][a-z0-9_]{0,39}$/.test(row.kind) || !text(row.summary, MAX_EVIDENCE_SUMMARY_BYTES)) return null
     seen.add(row.referenceId)
     return { referenceId: row.referenceId, kind: row.kind, summary: row.summary }
   })
