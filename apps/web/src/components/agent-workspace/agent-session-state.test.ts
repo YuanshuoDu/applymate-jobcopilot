@@ -26,12 +26,42 @@ describe('agent session URL and active Turn DTO', () => {
       turns: [{ id: 'turn_1', status: 'in_progress', revision: 3 }],
       projection: {
         activeTurnId: 'turn_1',
-        activeTurn: { id: 'turn_1', status: 'in_progress', revision: 3 },
+        activeTurn: { id: 'turn_1', status: 'in_progress', revision: 3, goal: 'Current objective' },
         queuedInputCount: 2,
       },
     })).toEqual({
-      activeTurn: { id: 'turn_1', status: 'in_progress', revision: 3 },
+      activeTurn: { id: 'turn_1', status: 'in_progress', revision: 3, goal: 'Current objective' },
       queuedInputCount: 2,
     })
+  })
+
+  it('keeps active controls for older projections without a goal', () => {
+    expect(parseAgentTurnsResponse({
+      projection: { activeTurnId: 'turn_1', activeTurn: { id: 'turn_1', status: 'in_progress', revision: 4 } },
+    })).toEqual({ activeTurn: { id: 'turn_1', status: 'in_progress', revision: 4 }, queuedInputCount: 0 })
+    expect(parseActiveTurn({ id: 'turn_1', status: 'in_progress', revision: 4, goal: { private: 'not text' } }))
+      .toEqual({ id: 'turn_1', status: 'in_progress', revision: 4 })
+  })
+
+  it('uses a matching listed Turn only when the active projection lacks its goal', () => {
+    expect(parseAgentTurnsResponse({
+      turns: [{ id: 'turn_1', status: 'in_progress', revision: 4, goal: 'Canonical objective' }],
+      projection: { activeTurnId: 'turn_1', activeTurn: { id: 'turn_1', status: 'in_progress', revision: 4 } },
+    }).activeTurn).toEqual({ id: 'turn_1', status: 'in_progress', revision: 4, goal: 'Canonical objective' })
+  })
+
+  it('clears the objective when the active projection is absent or refers to a different Turn', () => {
+    const oldTurn = { id: 'turn_old', status: 'in_progress', revision: 4, goal: 'Old objective' }
+    expect(parseAgentTurnsResponse({ turns: [oldTurn], projection: { activeTurnId: null, activeTurn: null } }).activeTurn).toBeNull()
+    expect(parseAgentTurnsResponse({ turns: [oldTurn], projection: { activeTurnId: 'turn_old', activeTurn: null } }).activeTurn).toBeNull()
+    expect(parseAgentTurnsResponse({ turns: [oldTurn], projection: { activeTurnId: 'turn_old' } }).activeTurn)
+      .toEqual({ id: 'turn_old', status: 'in_progress', revision: 4 })
+    expect(parseAgentTurnsResponse({
+      turns: [oldTurn],
+      projection: { activeTurnId: 'turn_new', activeTurn: oldTurn },
+    }).activeTurn).toBeNull()
+    expect(parseAgentTurnsResponse({
+      projection: { activeTurn: oldTurn },
+    }).activeTurn).toBeNull()
   })
 })
