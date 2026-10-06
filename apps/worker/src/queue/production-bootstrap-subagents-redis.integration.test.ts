@@ -10,6 +10,7 @@ import type { TreeBudgetReservation, TreeBudgetReservationStore } from "../runti
 import type { TurnEngineStore } from "../runtime/turns/turn-engine-types.js"
 import type { RuntimeToolDefinition } from "../runtime/tools/types.js"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
+import { lockAndAdmitSubagentDispatch, PAUSE_DEFERRED_MARKER, repairDeferredSubagentDispatches } from "./subagent-pause-dispatch.js"
 
 const RUN_REDIS_INTEGRATION = process.env.RUN_AGENT_TURN_REDIS_INTEGRATION === "1"
 
@@ -47,6 +48,7 @@ type FixtureOutbox = {
   payload: Record<string, unknown>
   publishedAt: Date | null
   attemptCount: number
+  lastError?: string | null
 }
 
 type FixtureWait = {
@@ -64,6 +66,8 @@ type FixtureWait = {
   consumedAt: Date | null
   matchedTaskIds: string[]
 }
+
+function taskNeverStarted(task: SubagentTaskRecord): boolean { return Reflect.get(task, "startedAt") == null }
 
 function createTaskStore(): { store: SubagentStore; tasks: Map<string, SubagentTaskRecord> } {
   const tasks = new Map<string, SubagentTaskRecord>()
@@ -130,7 +134,11 @@ function createTaskStore(): { store: SubagentStore; tasks: Map<string, SubagentT
 }
 
 function createSqlFixture(input: { tasks: Map<string, SubagentTaskRecord>; rootTaskId: string; childTaskId: string; sessionId: string; turnId: string; userId: string }) {
-  const turn = { id: input.turnId, sessionId: input.sessionId, userId: input.userId, rootTaskId: input.rootTaskId, status: "waiting_for_dependency", leaseOwnerId: null, eventSequence: 40 }
+  const turn: { id: string; sessionId: string; userId: string; rootTaskId: string; status: string; leaseOwnerId: string | null; eventSequence: number } = { id: input.turnId, sessionId: input.sessionId, userId: input.userId, rootTaskId: input.rootTaskId, status: "waiting_for_dependency", leaseOwnerId: null, eventSequence: 40 }
+  const session: { id: string; userId: string; status: string } = { id: input.sessionId, userId: input.userId, status: "running" }
+  let pauseSequence: number | null = null
+  let resumeSequence = 0
+  const pauseAdmitted = () => pauseSequence === null || resumeSequence > pauseSequence
   const wait: FixtureWait = {
     id: `redis-wait-${randomUUID()}`, userId: input.userId, sessionId: input.sessionId, turnId: input.turnId,
     parentTaskId: input.rootTaskId, stepId: `redis-step-${randomUUID()}`, targetTaskIds: [input.childTaskId],
@@ -145,7 +153,16 @@ function createSqlFixture(input: { tasks: Map<string, SubagentTaskRecord>; rootT
       if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
 
       if (sql.includes('SELECT session."id", session."status", session."userId"')) {
-        return values[0] === input.sessionId ? { rows: [{ id: input.sessionId, userId: input.userId, status: "running" }], rowCount: 1 } : none
+        return values[0] === session.id ? { rows: [{ ...session }], rowCount: 1 } : none
+      }
+      if (sql.includes('SELECT session."id" FROM "agent_sessions" AS session') && sql.includes("NOT EXISTS")) {
+        const admitted = values[0] === session.id && values[1] === session.userId && session.status === "running" && pauseAdmitted()
+        return admitted ? { rows: [{ id: session.id }], rowCount: 1 } : none
+      }
+      if (sql.includes('SELECT "id" FROM "agent_turns"') && sql.includes('"status" NOT IN') && sql.includes("FOR UPDATE")) {
+        const terminal = ["completed", "failed", "interrupted", "cancelled", "closed"].includes(turn.status)
+        return values[0] === turn.id && values[1] === turn.sessionId && values[2] === turn.userId && !terminal
+          ? { rows: [{ id: turn.id }], rowCount: 1 } : none
       }
       if (sql.includes('SELECT "id", "turnId" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2')) {
         const task = input.tasks.get(String(values[0]))
@@ -175,7 +192,8 @@ function createSqlFixture(input: { tasks: Map<string, SubagentTaskRecord>; rootT
         if (row) { row.publishedAt = new Date(); row.attemptCount += 1; return { rows: [], rowCount: 1 } }
         return none
       }
-      if (sql.includes('SELECT session."id"') && sql.includes('FROM "agent_sessions" AS session')) return none
+      if (sql.includes('SELECT session."id"') && sql.includes('FROM "agent_sessions" AS session')
+        && !sql.includes('ORDER BY session."updatedAt"') && !sql.includes("NOT EXISTS")) return none
 
       if (sql.includes('SELECT turn."id", turn."userId", turn."sessionId", turn."rootTaskId"')) {
         return ["waiting_for_dependency", "in_progress"].includes(turn.status)
@@ -186,9 +204,61 @@ function createSqlFixture(input: { tasks: Map<string, SubagentTaskRecord>; rootT
         const active = wait.status === "waiting" || wait.status === "ready" || wait.status === "timed_out"
         return active && wait.consumedAt === null ? { rows: [{ ...wait }], rowCount: 1 } : none
       }
-      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes('WHERE task."id" = $1 AND task."sessionId"')) {
+      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes('WHERE task."id" = $1 AND task."sessionId"')
+        && !sql.includes('task."rootTaskId" = $4 FOR UPDATE') && !sql.includes('SELECT task."id", task."sessionId", task."rootTaskId", task."turnId", task."status", task."startedAt"')) {
         const task = input.tasks.get(String(values[0]))
         return task ? { rows: [{ id: task.id, rootTaskId: task.rootTaskId, turnId: task.turnId, sessionId: task.sessionId, userId: task.userId }], rowCount: 1 } : none
+      }
+      if (sql.includes('SELECT root."id", root."status", root."interruptRequestedAt"') && sql.includes('FROM "sub_agent_tasks" AS root')) {
+        const root = input.tasks.get(String(values[0]))
+        return root && root.sessionId === values[1] && root.turnId === values[2]
+          ? { rows: [{ id: root.id, status: root.status, interruptRequestedAt: root.interruptRequestedAt }], rowCount: 1 } : none
+      }
+      if (sql.includes('SELECT task."id", task."sessionId", task."rootTaskId", task."turnId", task."status", task."startedAt"')
+        && sql.includes('task."rootTaskId" = $4 FOR UPDATE')) {
+        const task = input.tasks.get(String(values[0]))
+        return task && task.sessionId === values[1] && task.turnId === values[2] && task.rootTaskId === values[3]
+          ? { rows: [{ id: task.id, sessionId: task.sessionId, rootTaskId: task.rootTaskId, turnId: task.turnId, status: task.status,
+            startedAt: Reflect.get(task, "startedAt") ?? null, attemptCount: task.attemptCount, maxAttempts: task.maxAttempts, leaseOwner: task.leaseOwner,
+            leaseExpiresAt: task.leaseExpiresAt, interruptRequestedAt: task.interruptRequestedAt }], rowCount: 1 } : none
+      }
+      if (sql.includes('SELECT dispatch."id", dispatch."payload", dispatch."lastError"') && sql.includes('WHERE dispatch."id" = $1')) {
+        const row = outbox.find(candidate => candidate.id === values[0] && candidate.aggregateId === values[1] && candidate.topic === values[2]
+          && candidate.lastError === values[3] && candidate.publishedAt !== null)
+        return row ? { rows: [{ id: row.id, payload: row.payload, lastError: row.lastError }], rowCount: 1 } : none
+      }
+      if (sql.includes('SELECT session."id", session."userId" FROM "agent_sessions" AS session') && sql.includes('ORDER BY session."updatedAt"')) {
+        const candidate = [...input.tasks.values()].some(task => {
+          const root = input.tasks.get(task.rootTaskId)
+          return task.sessionId === session.id && task.status === "queued" && taskNeverStarted(task) && task.leaseOwner == null
+            && task.leaseExpiresAt == null && task.interruptRequestedAt == null && task.attemptCount < task.maxAttempts
+            && root && root.status !== "completed" && root.status !== "failed" && root.interruptRequestedAt == null
+            && turn.status !== "completed" && turn.status !== "failed" && pauseAdmitted()
+            && outbox.some(row => row.idempotencyKey === `subagent-dispatch:${task.id}` && row.lastError === PAUSE_DEFERRED_MARKER && row.publishedAt !== null)
+        })
+        return candidate ? { rows: [{ id: session.id, userId: session.userId }], rowCount: 1 } : none
+      }
+      if (sql.includes('SELECT task."id" AS "taskId"') && sql.includes('dispatch."id" AS "dispatchId"')) {
+        const candidate = [...input.tasks.values()].find(task => task.sessionId === values[0] && task.status === "queued"
+          && taskNeverStarted(task) && task.leaseOwner == null && task.leaseExpiresAt == null && task.interruptRequestedAt == null
+          && task.attemptCount < task.maxAttempts && pauseAdmitted())
+        const dispatch = candidate && outbox.find(row => row.idempotencyKey === `subagent-dispatch:${candidate.id}`
+          && row.topic === values[1] && row.lastError === values[2] && row.publishedAt !== null)
+        return candidate && dispatch ? { rows: [{ taskId: candidate.id, sessionId: candidate.sessionId, rootTaskId: candidate.rootTaskId,
+          userId: session.userId, dispatchId: dispatch.id, payload: dispatch.payload }], rowCount: 1 } : none
+      }
+      if (sql.includes('UPDATE "agent_outbox" SET "payload" = $1::jsonb, "publishedAt" = NULL')) {
+        const row = outbox.find(candidate => candidate.id === values[1] && candidate.aggregateId === values[2] && candidate.topic === values[3]
+          && candidate.lastError === values[4] && candidate.publishedAt !== null)
+        if (!row) return none
+        const child = input.tasks.get(String(values[5])), root = input.tasks.get(String(values[6]))
+        const eligible = child && root && child.sessionId === values[2] && child.rootTaskId === values[6] && child.status === "queued"
+          && taskNeverStarted(child) && child.leaseOwner == null && child.leaseExpiresAt == null && child.interruptRequestedAt == null
+          && child.attemptCount < child.maxAttempts && root.interruptRequestedAt == null && !["completed", "failed", "interrupted", "cancelled", "closed"].includes(root.status)
+          && !["completed", "failed", "interrupted", "cancelled", "closed"].includes(turn.status) && session.status === "running" && pauseAdmitted()
+        if (!eligible) return none
+        row.payload = JSON.parse(String(values[0])) as Record<string, unknown>; row.publishedAt = null; row.attemptCount += 1
+        return { rows: [], rowCount: 1 }
       }
       if (sql.includes('FROM "agent_steps"')) {
         return values[0] === wait.stepId ? { rows: [{ id: wait.stepId, taskId: input.rootTaskId, attempt: 1, status: "waiting_for_tool" }], rowCount: 1 } : none
@@ -232,14 +302,15 @@ function createSqlFixture(input: { tasks: Map<string, SubagentTaskRecord>; rootT
         }
         const existing = outbox.find(row => row.idempotencyKey === idempotencyKey)
         if (existing) { existing.payload = payload; existing.publishedAt = null; existing.attemptCount += 1 }
-        else outbox.push({ id, topic, aggregateId, idempotencyKey, payload, publishedAt: null, attemptCount: 0 })
+        else outbox.push({ id, topic, aggregateId, idempotencyKey, payload, publishedAt: null, attemptCount: 0, lastError: null })
         return { rows: [], rowCount: 1 }
       }
       throw new Error(`Unexpected SQL in child queue Redis integration fixture: ${sql.slice(0, 180)}`)
     },
     release() {},
   }
-  return { pool: { async connect() { return client } }, turn, wait, outbox, events }
+  return { pool: { async connect() { return client } }, turn, session, wait, outbox, events,
+    setPauseRequested(value: boolean) { if (value) pauseSequence = turn.eventSequence + 1; else resumeSequence = turn.eventSequence + 2 } }
 }
 
 describe("child queue SQL fixture", () => {
@@ -254,6 +325,58 @@ describe("child queue SQL fixture", () => {
     await expect(client.query(sql, [task.id, ids.sessionId])).resolves.toEqual({ rows: [{ id: task.id, turnId: ids.turnId }], rowCount: 1 })
     await expect(client.query(sql, [task.id, "foreign-session"])).resolves.toEqual({ rows: [], rowCount: 0 })
     await expect(client.query(sql, ["missing-task", ids.sessionId])).resolves.toEqual({ rows: [], rowCount: 0 })
+  })
+
+  it("locks only the owned nonterminal turn and applies the running-session pause fence", async () => {
+    const ids = { sessionId: "fixture-session", turnId: "fixture-turn", userId: "fixture-user" }
+    const { store, tasks } = createTaskStore()
+    const task = await store.create({ ...ids, role: "planner", taskType: "root", goal: "fixture", policy: { maxConcurrency: 1, maxDepth: 1, maxFanOut: 1, maxAttempts: 1 } })
+    const fixture = createSqlFixture({ tasks, rootTaskId: task.id, childTaskId: task.id, ...ids })
+    const client = await fixture.pool.connect()
+    expect(await lockAndAdmitSubagentDispatch(client as never, ids)).toBe(true)
+    expect(await lockAndAdmitSubagentDispatch(client as never, { ...ids, userId: "foreign-user" })).toBe(false)
+    expect(await lockAndAdmitSubagentDispatch(client as never, { ...ids, sessionId: "foreign-session" })).toBe(false)
+    fixture.setPauseRequested(true)
+    expect(await lockAndAdmitSubagentDispatch(client as never, ids)).toBe(false)
+    fixture.setPauseRequested(false)
+    fixture.turn.status = "completed"
+    expect(await lockAndAdmitSubagentDispatch(client as never, ids)).toBe(false)
+  })
+
+  it("requeues only the owned deferred child after the full session/turn/root/task fence", async () => {
+    const ids = { sessionId: "fixture-session", turnId: "fixture-turn", userId: "fixture-user" }
+    const { store, tasks } = createTaskStore()
+    const root = await store.create({ ...ids, role: "planner", taskType: "root", goal: "fixture root", policy: { maxConcurrency: 1, maxDepth: 1, maxFanOut: 1, maxAttempts: 1 } })
+    root.status = "running"
+    const child = await store.create({ ...ids, parentTaskId: root.id, role: "analyst", taskType: "research", goal: "fixture child", policy: { maxConcurrency: 1, maxDepth: 1, maxFanOut: 1, maxAttempts: 2 } })
+    const fixture = createSqlFixture({ tasks, rootTaskId: root.id, childTaskId: child.id, ...ids })
+    const payload: SubagentJobPayload = { taskId: child.id, sessionId: ids.sessionId, rootTaskId: root.id, ownerId: "old-owner" }
+    fixture.outbox.push({ id: "deferred-dispatch", topic: "agent.subagent.dispatch", aggregateId: ids.sessionId,
+      idempotencyKey: `subagent-dispatch:${child.id}`, payload, publishedAt: new Date(), attemptCount: 1, lastError: PAUSE_DEFERRED_MARKER })
+    expect(await repairDeferredSubagentDispatches(fixture.pool as never, "resumed-owner")).toBe(1)
+    expect(fixture.outbox[0]).toMatchObject({ publishedAt: null, attemptCount: 2, payload: { taskId: child.id, rootTaskId: root.id } })
+    expect(fixture.outbox[0]?.payload.ownerId).toMatch(/^resumed-owner-/)
+  })
+
+  it("does not requeue deferred children for foreign owners, pause, terminal roots, or exhausted leases", async () => {
+    const run = async (mutate: (fixture: ReturnType<typeof createSqlFixture>, root: SubagentTaskRecord, child: SubagentTaskRecord) => void) => {
+      const ids = { sessionId: `fixture-session-${randomUUID()}`, turnId: `fixture-turn-${randomUUID()}`, userId: `fixture-user-${randomUUID()}` }
+      const { store, tasks } = createTaskStore()
+      const root = await store.create({ ...ids, role: "planner", taskType: "root", goal: "fixture root", policy: { maxConcurrency: 1, maxDepth: 1, maxFanOut: 1, maxAttempts: 1 } })
+      root.status = "running"
+      const child = await store.create({ ...ids, parentTaskId: root.id, role: "analyst", taskType: "research", goal: "fixture child", policy: { maxConcurrency: 1, maxDepth: 1, maxFanOut: 1, maxAttempts: 2 } })
+      const fixture = createSqlFixture({ tasks, rootTaskId: root.id, childTaskId: child.id, ...ids })
+      fixture.outbox.push({ id: "deferred-dispatch", topic: "agent.subagent.dispatch", aggregateId: ids.sessionId,
+        idempotencyKey: `subagent-dispatch:${child.id}`, payload: { taskId: child.id, sessionId: ids.sessionId, rootTaskId: root.id, ownerId: "old-owner" },
+        publishedAt: new Date(), attemptCount: 1, lastError: PAUSE_DEFERRED_MARKER })
+      mutate(fixture, root, child)
+      expect(await repairDeferredSubagentDispatches(fixture.pool as never, "resumed-owner")).toBe(0)
+      expect(fixture.outbox[0]?.publishedAt).not.toBeNull()
+    }
+    await run(fixture => fixture.setPauseRequested(true))
+    await run((_fixture, root) => { root.status = "failed" })
+    await run((_fixture, _root, child) => { child.attemptCount = child.maxAttempts })
+    await run((fixture, _root, child) => { child.sessionId = `${fixture.session.id}-foreign` })
   })
 })
 
