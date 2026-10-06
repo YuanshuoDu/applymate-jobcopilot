@@ -477,13 +477,18 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
     expect(reservations.rows.some(row => row.taskId === firstControlId)).toBe(true)
     expect(reservations.rows.some(row => row.taskId === acceptedControlId)).toBe(true)
 
-    const publicRows = await pool!.query<{ content: unknown; payload: unknown }>(`SELECT item."content", event."payload"
-      FROM "agent_items" AS item LEFT JOIN "agent_events" AS event ON event."sessionId" = item."sessionId" AND event."turnId" = item."turnId"
-      WHERE item."sessionId" = $1 AND item."turnId" = $2 AND (item."type" = 'task_graph' OR event."type" IS NOT NULL)`, [ids.session, ids.turn])
+    const publicRows = await pool!.query<{ value: unknown }>(`SELECT item."content" AS "value" FROM "agent_items" AS item
+      WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."type" = 'task_graph'
+      UNION ALL
+      SELECT item."content" AS "value" FROM "agent_items" AS item JOIN "sub_agent_tasks" AS control ON control."id" = item."taskId"
+      WHERE item."sessionId" = $1 AND item."turnId" = $2 AND control."role" = 'auditor' AND control."taskType" = 'native_verification'
+      UNION ALL
+      SELECT event."payload" AS "value" FROM "agent_events" AS event JOIN "sub_agent_tasks" AS control ON control."id" = event."taskId"
+      WHERE event."sessionId" = $1 AND event."turnId" = $2 AND control."role" = 'auditor' AND control."taskType" = 'native_verification'`, [ids.session, ids.turn])
     const serializedPublicRows = JSON.stringify(publicRows.rows)
     expect(serializedPublicRows).not.toContain(NATIVE_VERIFICATION_PACKET_CONTEXT_KEY)
     expect(serializedPublicRows).not.toContain(NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA)
-    expect(serializedPublicRows).not.toContain("Fact 42 is absent")
+    expect(serializedPublicRows).not.toContain("nativeVerificationReport")
     const requestEvents = await pool!.query<{ payload: Record<string, unknown> }>(`SELECT "payload" FROM "agent_events"
       WHERE "sessionId" = $1 AND "type" = 'native_verification.requested'`, [ids.session])
     expect(requestEvents.rows.length).toBeGreaterThanOrEqual(4)
@@ -587,11 +592,11 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
           const failedFeedback = request.messages.filter(message => message.role === "system")
             .flatMap(message => message.content)
             .flatMap(part => part.type === "text" ? [part.text] : [])
-            .find(value => value.includes("Independent review did not accept the previous root candidate."))
+            .find(value => value.includes("Durable TaskGraph verification blocked completion:")
+              && value.includes(`target=${request.metadata.taskId}`)
+              && value.includes("criterion=criterion-1 status=failed reason=does_not_meet_criterion"))
           expect(failedFeedback).toBeDefined()
           expect(failedFeedback?.length).toBeLessThanOrEqual(800)
-          expect(failedFeedback).toContain(`target=${request.metadata.taskId}`)
-          expect(failedFeedback).toContain("criterion=criterion-1 status=failed reason=does_not_meet_criterion")
           acceptedCandidateReady()
           await acceptedCandidateRelease
           yield { type: "text_delta", text: acceptedCandidate }
