@@ -149,7 +149,7 @@ function createSqlFixture(input: { tasks: Map<string, SubagentTaskRecord>; rootT
       }
       if (sql.includes('SELECT "id", "turnId" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2')) {
         const task = input.tasks.get(String(values[0]))
-        return task?.sessionId === values[1] ? { rows: [{ id: task.id, turnId: task.turnId }], rowCount: 1 } : none
+        return task && task.sessionId === values[1] ? { rows: [{ id: task.id, turnId: task.turnId }], rowCount: 1 } : none
       }
       if (sql.includes('SELECT dispatch."id", dispatch."aggregateId"') && sql.includes('ORDER BY dispatch."createdAt"')) {
         const rows = outbox.filter(row => row.topic === values[0] && row.publishedAt === null).map(row => ({ id: row.id, aggregateId: row.aggregateId, payload: row.payload, attemptCount: row.attemptCount }))
@@ -253,6 +253,7 @@ describe("child queue SQL fixture", () => {
 
     await expect(client.query(sql, [task.id, ids.sessionId])).resolves.toEqual({ rows: [{ id: task.id, turnId: ids.turnId }], rowCount: 1 })
     await expect(client.query(sql, [task.id, "foreign-session"])).resolves.toEqual({ rows: [], rowCount: 0 })
+    await expect(client.query(sql, ["missing-task", ids.sessionId])).resolves.toEqual({ rows: [], rowCount: 0 })
   })
 })
 
