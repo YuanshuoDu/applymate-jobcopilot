@@ -116,33 +116,42 @@ async function seed(): Promise<void> {
       'The owned job description says Harbor 9 is open.', 'fixture', CURRENT_TIMESTAMP)`, [ids.unrelatedJob, ids.user])
 }
 
-function reportFor(packet: NonNullable<ReturnType<typeof parseNativeVerificationPacket>>) {
+function reportFor(packet: NonNullable<ReturnType<typeof parseNativeVerificationPacket>>, ownedJobId = ids.job) {
   const targetText = packet.target.kind === "child" ? packet.target.resultText : packet.target.candidateText
   const requirements = packet.criteria.map(item => item.requirement)
   const expectedFact = packet.goal === childGoal && requirements.length === 1 && requirements[0] === turnCriteria[0]
-    ? { phrase: "Fact 42 is present", jobId: ids.job, candidatePositive: "fact 42 is present", candidateNegative: "fact 42 is absent" }
+    ? { phrase: "Fact 42 is present", jobId: ownedJobId, candidatePositive: "fact 42 is present", candidateNegative: "fact 42 is absent" }
     : packet.goal === followupChildGoal && requirements.length === 1 && requirements[0] === turnCriteria[0]
-      ? { phrase: "Fact 42 is present", jobId: ids.job, candidatePositive: "fact 42 is present", candidateNegative: "fact 42 is absent" }
+      ? { phrase: "Fact 42 is present", jobId: ownedJobId, candidatePositive: "fact 42 is present", candidateNegative: "fact 42 is absent" }
       : packet.goal === unrelatedChildGoal && requirements.length === 1 && requirements[0] === unrelatedChildCriteria[0]
       ? { phrase: "Harbor 9 is open", jobId: ids.unrelatedJob, candidatePositive: "harbor 9 is open", candidateNegative: "harbor 9 is closed" }
       : packet.goal === goal && requirements.length === 1 && requirements[0] === turnCriteria[0]
-        ? { phrase: "Fact 42 is present", jobId: ids.job, candidatePositive: "fact 42 is present", candidateNegative: "fact 42 is absent" }
+        ? { phrase: "Fact 42 is present", jobId: ownedJobId, candidatePositive: "fact 42 is present", candidateNegative: "fact 42 is absent" }
         : null
   let sourceReference: string | undefined
   let hasOwnedFact = false
   if (expectedFact && packet.target.kind === "child") {
-    let targetJobIds = new Set<string>([expectedFact.jobId])
+    let analystCitesOwnedFact = false
     try {
-      const result = JSON.parse(targetText) as { findings?: Array<{ jobId?: unknown }>; evidence?: Array<{ ref?: unknown }> }
-      for (const value of [...(result.findings ?? []).map(item => item.jobId), ...(result.evidence ?? []).map(item => item.ref)]) {
-        if (typeof value === "string" && value.trim() && value.length <= 256) targetJobIds.add(value)
+      const result = JSON.parse(targetText) as {
+        structuredResult?: {
+          findings?: Array<{ jobId?: unknown; evidenceIds?: unknown }>
+          evidence?: Array<{ id?: unknown; kind?: unknown; ref?: unknown }>
+        }
       }
+      // Only the persisted, validated analyst envelope binds facts to source IDs.
+      const structured = result.structuredResult
+      const finding = structured?.findings?.find(item => item.jobId === expectedFact.jobId && Array.isArray(item.evidenceIds))
+      const evidenceIds = new Set(Array.isArray(finding?.evidenceIds) ? finding.evidenceIds.filter((id): id is string => typeof id === "string") : [])
+      analystCitesOwnedFact = Boolean(structured?.evidence?.some(item => item.kind === "job"
+        && item.ref === expectedFact.jobId && typeof item.id === "string" && evidenceIds.has(item.id)))
     } catch { /* current child result may use a bounded non-JSON final text */ }
+    if (!analystCitesOwnedFact) return failedReport(packet)
     for (const item of packet.evidence) {
       if (item.kind !== "tool_result") continue
       try {
         const row = JSON.parse(item.summary) as { tool?: unknown; status?: unknown; output?: { jobs?: Array<{ id?: unknown; description?: unknown }> } }
-        const matchingJob = row.output?.jobs?.find(job => typeof job.id === "string" && targetJobIds.has(job.id)
+        const matchingJob = row.output?.jobs?.find(job => job.id === expectedFact.jobId
           && typeof job.description === "string" && job.description.toLowerCase().includes(expectedFact.phrase.toLowerCase()))
         if (row.tool === "jobs.search" && row.status === "completed" && matchingJob) {
           hasOwnedFact = true
@@ -182,6 +191,18 @@ function reportFor(packet: NonNullable<ReturnType<typeof parseNativeVerification
   const candidate = targetText.toLowerCase()
   const passed = Boolean(expectedFact && (hasOwnedFact || hasCurrentOwnedFact)
     && candidate.includes(expectedFact.candidatePositive) && !candidate.includes(expectedFact.candidateNegative))
+  return verificationReport(packet, passed, sourceReference)
+}
+
+function failedReport(packet: NonNullable<ReturnType<typeof parseNativeVerificationPacket>>) {
+  return verificationReport(packet, false)
+}
+
+function verificationReport(
+  packet: NonNullable<ReturnType<typeof parseNativeVerificationPacket>>,
+  passed: boolean,
+  sourceReference?: string,
+) {
   return {
     schemaVersion: NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA,
     criteria: packet.criteria.map(criterion => ({
@@ -644,7 +665,7 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
             const control = parseNativeVerificationControl(task.expectedOutputSchema)
             const packet = control && parseNativeVerificationPacket(task.context, control)
             if (!control || control.controlTaskId !== task.id || !packet) throw new Error("canonical control was not server-bound")
-            yield { type: "text_delta", text: JSON.stringify(reportFor(packet)) }
+            yield { type: "text_delta", text: JSON.stringify(reportFor(packet, canonical.jobId)) }
             yield { type: "completed", finishReason: "stop" }
             return
           }
