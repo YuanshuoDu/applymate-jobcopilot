@@ -376,7 +376,7 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
     await adminPool.query(`GRANT SELECT ON "agent_sessions", "agent_turns", "sub_agent_tasks" TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT UPDATE ("status", "leaseOwner", "leaseExpiresAt", "attemptCount", "startedAt", "updatedAt", "result", "failureReason", "nextAttemptAt", "completedAt") ON "sub_agent_tasks" TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT SELECT ON "agent_outbox" TO ${RUNTIME_ROLE}`)
-    await adminPool.query(`GRANT UPDATE ("publishedAt", "attemptCount", "lastError") ON "agent_outbox" TO ${RUNTIME_ROLE}`)
+    await adminPool.query(`GRANT UPDATE ("publishedAt", "attemptCount", "lastError", "payload") ON "agent_outbox" TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT UPDATE ("eventSequence") ON "agent_sessions" TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT SELECT, INSERT, UPDATE ON "agent_steps", "agent_items", "agent_events", "agent_tree_budget_reservations" TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT SELECT, INSERT, UPDATE ON ai_usage_events, ai_budgets TO ${RUNTIME_ROLE}`)
