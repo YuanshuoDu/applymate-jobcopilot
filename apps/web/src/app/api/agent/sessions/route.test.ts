@@ -50,7 +50,7 @@ describe("agent sessions API", () => {
     mocks.findFirst.mockResolvedValue(null)
   })
 
-  it("lists recent sessions for the authenticated user", async () => {
+  it("lists sessions and limits stale cleanup to legacy chats without canonical Turns", async () => {
     const rows = [
       {
         id: "session_1",
@@ -117,15 +117,23 @@ describe("agent sessions API", () => {
       orderBy: { lastViewedAt: "desc" },
       select: { id: true },
     })
-    expect(mocks.updateMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: expect.objectContaining({
+    expect(mocks.updateMany).toHaveBeenCalledWith({
+      where: {
         userId: "user_1",
         source: "chat",
         status: "running",
+        updatedAt: { lt: expect.any(Date) },
         approvals: { none: { status: "pending" } },
-      }),
-      data: expect.objectContaining({ status: "completed", completedAt: expect.any(Date) }),
-    }))
+        tasks: { none: { status: { in: ["queued", "running", "retrying", "waiting_for_user"] } } },
+        turns: { none: {} },
+      },
+      data: { status: "completed", completedAt: expect.any(Date) },
+    })
+    const cleanup = mocks.updateMany.mock.calls[0]?.[0] as unknown as {
+      where: { updatedAt: { lt: Date } }
+      data: { completedAt: Date }
+    }
+    expect(cleanup.where.updatedAt.lt.getTime()).toBe(cleanup.data.completedAt.getTime() - 30 * 60 * 1000)
   })
 
   it("returns the last viewed owned session even when a different conversation updated more recently", async () => {

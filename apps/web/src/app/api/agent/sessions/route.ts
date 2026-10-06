@@ -44,6 +44,7 @@ export async function GET(req: NextRequest) {
       updatedAt: { lt: new Date(completedAt.getTime() - STALE_CHAT_SESSION_MS) },
       approvals: { none: { status: "pending" } },
       tasks: { none: { status: { in: ["queued", "running", "retrying", "waiting_for_user"] } } },
+      turns: { none: {} },
     },
     data: { status: "completed", completedAt },
   })
