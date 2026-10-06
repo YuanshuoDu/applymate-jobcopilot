@@ -22,6 +22,29 @@ describe("native verification owned goal and criteria binding", () => {
     expect(loaded.turnGoalConflict).toBe(false)
   })
 
+  it("accepts the canonical human command goal with validated typed input parts", async () => {
+    const loaded = await loadNativeVerificationOwnedState(client({ input: {
+      goal: "Original objective",
+      content: [{ type: "text", text: "Explicit goal supersedes this message." }, { type: "attachment_ref", attachmentId: "resume-1", mediaType: "application/pdf" }],
+    } }), scope, null)
+    expect(loaded.goal).toBe("Original objective")
+    expect(loaded.criteria).toEqual(["Original objective"])
+    expect(loaded.criteriaValid).toBe(true)
+    expect(loaded.turnGoalConflict).toBe(false)
+  })
+
+  it("fails closed for malformed, unsupported, or sparse typed input parts", async () => {
+    const sparse: unknown[] = []
+    sparse[1] = { type: "text", text: "Original objective" }
+    for (const content of [[], [{ type: "text", text: "" }], [{ type: "image", url: "https://example.invalid" }],
+      [{ type: "text", text: "Original objective", extra: true }], sparse]) {
+      const loaded = await loadNativeVerificationOwnedState(client({ input: { goal: "Original objective", content } }), scope, null)
+      expect(loaded.goal).toBeNull()
+      expect(loaded.turnGoalConflict).toBe(true)
+      expect(loaded.criteriaValid).toBe(false)
+    }
+  })
+
   it("rejects malformed or oversized explicit criteria without truncating them", async () => {
     for (const criteria of [[1], Array.from({ length: 33 }, (_, index) => `criterion ${index}`)]) {
       const loaded = await loadNativeVerificationOwnedState(client({ input: { goal: "Original objective" } }, criteria), scope, null)

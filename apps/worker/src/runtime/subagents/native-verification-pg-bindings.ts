@@ -1,5 +1,7 @@
 import type pg from "pg"
 import { Buffer } from "node:buffer"
+import { Value } from "@sinclair/typebox/value"
+import { InputContentPartSchema } from "@jobcopilot/agent-protocol"
 import { digestNativeVerificationValue, canonicalNativeVerificationJson } from "./native-verification-contract.js"
 import { parseTaskGraphSnapshot, type StoredTaskGraphNode, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import type { TaskGraphNativeSourceProvenance, TaskGraphReadScope } from "./task-graph-command-port.js"
@@ -47,6 +49,10 @@ function record(value: unknown): Row | null {
 }
 function cleanText(value: unknown, maxBytes: number): value is string {
   return typeof value === "string" && value.trim() === value && value.length > 0 && Buffer.byteLength(value, "utf8") <= maxBytes
+}
+function validInputContentParts(value: unknown): value is unknown[] {
+  return Array.isArray(value) && value.length > 0 && Reflect.ownKeys(value).length === value.length + 1
+    && value.every((part, index) => Object.hasOwn(value, index) && Value.Check(InputContentPartSchema, part))
 }
 function criterionList(value: unknown): string[] | null {
   if (!Array.isArray(value) || value.length > MAX_CRITERIA || Reflect.ownKeys(value).length !== value.length + 1) return null
@@ -129,9 +135,11 @@ function canonicalTurnGoal(value: unknown): Readonly<{ value: string | null; val
   const hasGoal = Object.hasOwn(source, "goal"), hasContent = Object.hasOwn(source, "content")
   const goal = source.goal, content = source.content
   if (hasGoal && (typeof goal !== "string" || !goal.trim() || !cleanText(goal.trim(), MAX_GOAL_BYTES))) return { value: null, valid: false }
-  if (hasContent && (typeof content !== "string" || !content.trim() || !cleanText(content.trim(), MAX_GOAL_BYTES))) return { value: null, valid: false }
-  if (hasGoal && hasContent && (goal as string).trim() !== (content as string).trim()) return { value: null, valid: false }
-  const selected = hasGoal ? goal : hasContent ? content : undefined
+  if (hasContent && (typeof content === "string"
+    ? !content.trim() || !cleanText(content.trim(), MAX_GOAL_BYTES)
+    : !validInputContentParts(content))) return { value: null, valid: false }
+  if (hasGoal && typeof content === "string" && (goal as string).trim() !== content.trim()) return { value: null, valid: false }
+  const selected = hasGoal ? goal : typeof content === "string" ? content : undefined
   return typeof selected === "string" ? { value: selected.trim(), valid: true } : { value: null, valid: false }
 }
 
