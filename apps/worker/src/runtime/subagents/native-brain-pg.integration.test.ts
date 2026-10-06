@@ -649,6 +649,10 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
     let latestWait: { readonly taskId: string; readonly callId: string } | undefined
     let waitSequence = 0
     let lastWaitDisposition: string | null = null
+    let targetChildModelRequests = 0
+    let targetChildRequestsWithSearch = 0
+    let targetChildSearchCalls = 0
+    let targetChildMalformedFinals = 0
     const childRecoveryDiagnostics: Array<Readonly<{
       phase: "original" | "replacement"; status: string; attemptCount: number; maxAttempts: number
       invalidStructuredResult: boolean; waitDisposition: string | null; action: "wait" | "followup" | "candidate"
@@ -693,11 +697,12 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
         `SELECT "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`, [canonical.turnId, canonical.sessionId])).rows[0]?.rootTaskId
       if (!rootTaskId) return []
       const result = await pool!.query<{
-        phase: string; status: string; attemptCount: number; maxAttempts: number; invalidStructuredResult: boolean
+        phase: string; status: string; attemptCount: number; maxAttempts: number; invalidStructuredResult: boolean; failureReason: string | null
         dispatchPresent: boolean; dispatchPublished: boolean; dispatchAttempts: number | null; dispatchHasError: boolean
       }>(`SELECT CASE WHEN task."id" = $4 THEN 'original' ELSE 'replacement' END AS "phase",
           task."status", task."attemptCount", task."maxAttempts",
           task."failureReason" = 'invalid_structured_result' AS "invalidStructuredResult",
+          task."failureReason" AS "failureReason",
           dispatch."id" IS NOT NULL AS "dispatchPresent", dispatch."publishedAt" IS NOT NULL AS "dispatchPublished",
           dispatch."attemptCount" AS "dispatchAttempts", dispatch."lastError" IS NOT NULL AS "dispatchHasError"
         FROM "sub_agent_tasks" AS task
@@ -705,7 +710,14 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
           AND dispatch."topic" = 'agent.subagent.dispatch' AND dispatch."idempotencyKey" = 'subagent-dispatch:' || task."id"
         WHERE task."id" = ANY($5::text[]) AND task."sessionId" = $1 AND task."turnId" = $2 AND task."rootTaskId" = $3
         ORDER BY task."createdAt" LIMIT 2`, [canonical.sessionId, canonical.turnId, rootTaskId, originalChildTaskId ?? null, taskIds])
-      return result.rows
+      return result.rows.map(({ failureReason, ...row }) => ({
+        ...row,
+        failureCategory: failureReason === null ? "none"
+          : failureReason === "invalid_structured_result" || failureReason === "budget_exhausted" || failureReason === "invalid_output"
+            ? failureReason
+            : failureReason.toLowerCase().includes("jobs.search") && failureReason.toLowerCase().includes("expected")
+              ? "fixture_search_assertion" : "other",
+      }))
     }
     const activeChildStatus = (status: string) => status === "queued" || status === "retrying" || status === "running"
     let queuePauseGate: Queue<SubagentJobPayload, unknown, string> | undefined
@@ -892,9 +904,14 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
             yield { type: "completed", finishReason: "stop" }
             return
           }
+          if (task.role === "analyst" && task.goal === childGoal) {
+            targetChildModelRequests += 1
+            if (request.tools.some(tool => (tool as { name?: unknown }).name === "jobs.search")) targetChildRequestsWithSearch += 1
+          }
           targetRounds += 1
           if (targetRounds === 1) {
             expect(request.tools.map(tool => (tool as { name?: unknown }).name)).toContain("jobs.search")
+            if (task.role === "analyst" && task.goal === childGoal) targetChildSearchCalls += 1
             yield { type: "tool_call_completed", callId: `canonical-search:${task.id}:${task.attemptCount}`, name: "jobs.search", arguments: {
               target: "Fact 42", location: "Dublin", limit: 10,
             } }
@@ -902,6 +919,7 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
             return
           }
           if (task.goal === childGoal) {
+            targetChildMalformedFinals += 1
             yield { type: "text_delta", text: "This is not a valid structured analyst result." }
             yield { type: "completed", finishReason: "stop" }
             return
@@ -987,7 +1005,7 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
           readChildRecoveryDiagnostics(),
         ]).then(([stateResult, childState]) => {
           const state = stateResult.rows[0] ?? null
-          throw new Error(`canonical root did not replan to the accepted candidate; modelStreams=${rootModelStreams}; requestTrace=${JSON.stringify(rootRequestDiagnostics)}; judgeTrace=${JSON.stringify(canonicalJudgeDiagnostics)}; persistedState=${JSON.stringify(state)}; childRecovery=${JSON.stringify({ lastWaitDisposition, transitions: childRecoveryDiagnostics, children: childState })}`)
+          throw new Error(`canonical root did not replan to the accepted candidate; modelStreams=${rootModelStreams}; requestTrace=${JSON.stringify(rootRequestDiagnostics)}; judgeTrace=${JSON.stringify(canonicalJudgeDiagnostics)}; persistedState=${JSON.stringify(state)}; childFixture=${JSON.stringify({ modelRequests: targetChildModelRequests, requestsWithSearch: targetChildRequestsWithSearch, searchCalls: targetChildSearchCalls, malformedFinals: targetChildMalformedFinals })}; childRecovery=${JSON.stringify({ lastWaitDisposition, transitions: childRecoveryDiagnostics, children: childState })}`)
         })
       })])
       const { SUBAGENT_QUEUE_NAME } = await import("../../queue/subagent-queue.js")
