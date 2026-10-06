@@ -177,7 +177,8 @@ async function remainingFanout(client: QueryableClient, scope: TaskGraphExecutio
 }
 
 async function bindAndDispatch(client: QueryableClient, scope: TaskGraphExecutionScope, created: SubagentTaskRecord, control: NativeVerificationControl, packet: NativeVerificationPacket): Promise<void> {
-  const updated = await client.query(`UPDATE "sub_agent_tasks" AS task SET "expectedOutputSchema" = $6::jsonb, "context" = $7::jsonb, "updatedAt" = CURRENT_TIMESTAMP
+  const updated = await client.query(`UPDATE "sub_agent_tasks" AS task SET "allowedActions" = '[]'::jsonb,
+      "expectedOutputSchema" = $6::jsonb, "context" = $7::jsonb, "updatedAt" = CURRENT_TIMESTAMP
     WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4 AND task."parentTaskId" = $4
       AND task."role" = 'auditor' AND task."taskType" = 'native_verification' AND task."status" = 'queued' AND task."attemptCount" = 0
       AND task."result" IS NULL AND task."expectedOutputSchema" = '{}'::jsonb AND task."context" = '{}'::jsonb
