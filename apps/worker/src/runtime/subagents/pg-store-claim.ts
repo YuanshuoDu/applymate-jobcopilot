@@ -1,5 +1,5 @@
 import { RUNNABLE_SESSION, assertSessionWorkAdmission } from "../session-gate.js"
-import { lockSubagentTurnForWork, readSubagentTask } from "./pg-store-create.js"
+import { lockSubagentTurnForWork, readSubagentTask, SubagentTurnUnavailableError } from "./pg-store-create.js"
 import { transaction } from "./pg-store-persistence.js"
 import { persistGraphTransition, prepareGraphTransition } from "./task-graph-pg-lifecycle.js"
 import type { PgSubagentPool, SubagentPolicy, SubagentTaskRecord } from "./types.js"
@@ -20,7 +20,12 @@ export async function claimSubagentTask(pool: PgSubagentPool, input: ClaimInput,
     const turnId = binding.rows[0]?.turnId
     const rootTaskId = binding.rows[0]?.rootTaskId
     if (typeof turnId !== "string" || !turnId || typeof rootTaskId !== "string" || (input.rootTaskId && rootTaskId !== input.rootTaskId)) return null
-    await lockSubagentTurnForWork(client, { sessionId: input.sessionId, userId, turnId })
+    try {
+      await lockSubagentTurnForWork(client, { sessionId: input.sessionId, userId, turnId })
+    } catch (error: unknown) {
+      if (error instanceof SubagentTurnUnavailableError) return null
+      throw error
+    }
 
     const root = await client.query(`SELECT "id", "turnId", "status", "interruptRequestedAt" FROM "sub_agent_tasks"
       WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 FOR UPDATE`, [rootTaskId, input.sessionId, turnId])
