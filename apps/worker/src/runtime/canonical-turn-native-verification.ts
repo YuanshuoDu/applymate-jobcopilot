@@ -78,12 +78,37 @@ function ensureResult(value: unknown, candidateText: string, isRoot: boolean): N
     pendingControlTaskIds: [...pendingControlTaskIds], pendingTaskIds: [...pendingTaskIds], feedback: reports,
     ...(parsedWitness ? { rootGoalWitness: parsedWitness } : {}) }
 }
-export function nativeVerificationFeedbackText(status: string, value: readonly NativeVerificationFeedback[] = []): string {
-  const parts = value.flatMap(report => report.criteria.filter(item => item.disposition !== "passed").map(item =>
+type RepairReason = Exclude<NativeVerificationReasonCode, "meets_criterion">
+const REPAIR_ORDER: readonly RepairReason[] = ["evidence_missing", "evidence_conflict", "does_not_meet_criterion", "unsupported_claim", "ambiguous"]
+const REPAIR_ACTION: Readonly<Record<RepairReason, string>> = {
+  evidence_missing: "gather current owned evidence",
+  evidence_conflict: "reconcile current owned sources and resolve contradictions",
+  does_not_meet_criterion: "revise the answer against the criterion",
+  unsupported_claim: "remove the claim or support it with current owned evidence",
+  ambiguous: "resolve ambiguity from evidence; identify missing user facts and seek clarification when available, otherwise state uncertainty",
+}
+const VALID_REASON_DISPOSITIONS: Readonly<Record<NativeVerificationDisposition, readonly NativeVerificationReasonCode[]>> = {
+  passed: ["meets_criterion"],
+  failed: ["does_not_meet_criterion", "evidence_conflict", "unsupported_claim"],
+  uncertain: ["evidence_missing", "evidence_conflict", "unsupported_claim", "ambiguous"],
+}
+export function nativeVerificationFeedbackText(status: string, value: unknown = [], replanFallback = false): string {
+  const parsed = parseNativeVerificationFeedback(value)
+  const safeStatus = ["passed", "failed", "uncertain", "pending", "unavailable"].includes(status) ? status : "unavailable"
+  let output = `Independent native verification is ${safeStatus}.`
+  if (!parsed) return output
+  if (parsed.some(report => report.criteria.some(item => !VALID_REASON_DISPOSITIONS[item.disposition].includes(item.reasonCode)))) return output
+  const rows = parsed.flatMap(report => report.criteria.filter(item => item.disposition !== "passed").map(item =>
     `target=${report.targetTaskId} criterion=${item.criterionId} status=${item.disposition} reason=${item.reasonCode}`))
-  let output = `Independent native verification is ${status}.`
-  for (const part of parts) { if (`${output} ${part}`.length > 512) break; output += ` ${part}` }
-  return output.slice(0, 512)
+  const reasons = new Set(parsed.flatMap(report => report.criteria.filter(item => item.disposition !== "passed").map(item => item.reasonCode)))
+  const actions = REPAIR_ORDER.filter(reason => reasons.has(reason)).map(reason => `${reason}: ${REPAIR_ACTION[reason]}.`)
+  const actionBlock = actions.length ? ` Actions: ${actions.join(" ")}` : ""
+  if (actions.length) {
+    if (output.length + actionBlock.length > 512) return output
+    output += actionBlock
+  } else if (replanFallback) output += " Replan against verified criteria using current owned evidence."
+  for (const row of rows) if (output.length + row.length + 1 <= 512) output += ` ${row}`
+  return output
 }
 
 function matchingFailedRootControl(result: NativeVerificationEnsureResult, rootTaskId: string): string | undefined {
@@ -93,11 +118,6 @@ function matchingFailedRootControl(result: NativeVerificationEnsureResult, rootT
   return report.disposition === "failed" && result.controlTaskIds.includes(report.controlTaskId)
     && report.criteria.some(item => item.disposition === "failed") ? report.controlTaskId : undefined
 }
-function semanticReplanFeedback(feedback: string): string {
-  const instruction = " Revise the candidate or obtain new current owned evidence before retrying."
-  return `${feedback.slice(0, 512 - instruction.length)}${instruction}`
-}
-
 /** Runs child proof before root-candidate proof and durably waits on producer-owned controls. */
 export async function verifyNativeRootCandidate(input: Readonly<{
   port: NativeVerificationPort
@@ -126,8 +146,8 @@ export async function verifyNativeRootCandidate(input: Readonly<{
     }
     if (goal.status !== "passed" || !goal.rootGoalWitness) {
       const semanticRejectionControlTaskId = goal.status === "failed" ? matchingFailedRootControl(goal, input.scope.rootTaskId) : undefined
-      const feedback = nativeVerificationFeedbackText(goal.status, goal.feedback)
-      return { kind: "blocked", feedback: semanticRejectionControlTaskId ? semanticReplanFeedback(feedback) : feedback,
+      const feedback = nativeVerificationFeedbackText(goal.status, goal.feedback, Boolean(semanticRejectionControlTaskId))
+      return { kind: "blocked", feedback,
         ...(semanticRejectionControlTaskId ? { semanticRejectionControlTaskId } : {}) }
     }
     return { kind: "passed", witness: goal.rootGoalWitness }

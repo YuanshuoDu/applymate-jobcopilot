@@ -3,6 +3,7 @@ import { digestNativeVerificationValue } from "./subagents/native-verification-c
 import type { NativeVerificationPort } from "./subagents/native-verification-port.js"
 import type { TaskGraphReadScope } from "./subagents/task-graph-command-port.js"
 import { readNativeVerificationRecovery } from "./canonical-turn-native-verification-recovery.js"
+import { nativeVerificationFeedbackText } from "./canonical-turn-native-verification.js"
 
 const scope: TaskGraphReadScope = {
   userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
@@ -26,12 +27,15 @@ describe("readNativeVerificationRecovery", () => {
   })
 
   it("turns failed report criteria into bounded planner feedback without exposing evidence text", async () => {
-    const result = await readNativeVerificationRecovery({ port: port({ controlTaskId: "goal-review-1", candidateText: null, status: "failed", feedback: {
+    const feedback = {
       controlTaskId: "goal-review-1", targetTaskId: "root-1", disposition: "failed", criteria: [{
         criterionId: "criterion-1", disposition: "failed", reasonCode: "does_not_meet_criterion", evidenceReferenceIds: ["ref-safe"],
       }],
-    } }), scope })
+    }
+    const result = await readNativeVerificationRecovery({ port: port({ controlTaskId: "goal-review-1", candidateText: null, status: "failed", feedback }), scope })
     expect(result.feedback).toContain("criterion=criterion-1")
+    expect(result.feedback).toContain("does_not_meet_criterion: revise the answer against the criterion.")
+    expect(result.feedback).toBe(nativeVerificationFeedbackText("failed", [feedback]))
     expect(result.feedback).not.toContain("ref-safe")
     expect(result.feedback?.length).toBeLessThanOrEqual(512)
   })
