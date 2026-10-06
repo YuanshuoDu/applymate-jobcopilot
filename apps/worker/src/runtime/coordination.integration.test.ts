@@ -178,8 +178,29 @@ class IntegrationPg {
       && sql.includes("'task_graph' AND turn.\"userId\" = $5 AND session.\"userId\" = $5")
       && values[0] === taskGraphItemId(this.state.turn.rootTaskId) && values[1] === SESSION_ID && values[2] === TURN_ID
       && values[3] === this.state.turn.rootTaskId && values[4] === USER_ID) return { rows: [], rowCount: 0 }
-    if (sql.includes("SELECT session.\"userId\"") && sql.includes("FROM \"agent_sessions\" AS session") && sql.includes("FOR UPDATE")) return this.sessionRow()
-    if (sql.includes("WHERE turn.\"status\" IN ('waiting_for_dependency', 'in_progress')")) return this.state.turn.status === "waiting_for_dependency" || this.state.turn.status === "in_progress" ? { rows: [this.turnRow()], rowCount: 1 } : { rows: [], rowCount: 0 }
+    if (sql.includes('SELECT session."userId"') && sql.includes('FROM "agent_sessions" AS session') && sql.includes("FOR UPDATE")) {
+      const scopeMatches = String(values[0]) === SESSION_ID && String(values[1]) === this.state.turn.id
+        && this.state.turn.sessionId === SESSION_ID && this.state.turn.userId === USER_ID
+        && !["aborted", "archived"].includes(this.state.sessionStatus)
+      return scopeMatches ? { rows: [{ userId: USER_ID }], rowCount: 1 } : { rows: [], rowCount: 0 }
+    }
+    if (sql.includes('SELECT session."id" FROM "agent_sessions" AS session')
+      && sql.includes('pause_request."type" = \'session.pause_requested\'')) {
+      const scopeMatches = String(values[0]) === SESSION_ID && String(values[1]) === USER_ID && String(values[2]) === TURN_ID
+        && this.state.turn.sessionId === SESSION_ID && this.state.turn.userId === USER_ID && this.state.turn.id === TURN_ID
+      const paused = this.events.some(pause => pause.sessionId === SESSION_ID && pause.turnId === TURN_ID
+        && pause.type === "session.pause_requested" && !this.events.some(resume => resume.sessionId === pause.sessionId
+          && resume.turnId === pause.turnId && resume.type === "session.resume_requested"
+          && BigInt(resume.sequence) > BigInt(pause.sequence)))
+      const admitted = scopeMatches && this.state.sessionStatus === "running" && !paused
+      return admitted ? { rows: [{ id: SESSION_ID }], rowCount: 1 } : { rows: [], rowCount: 0 }
+    }
+    if (sql.includes("WHERE turn.\"status\" IN ('waiting_for_dependency', 'in_progress')")) {
+      const eligible = ["waiting_for_dependency", "in_progress"].includes(this.state.turn.status)
+        && this.state.turn.sessionId === SESSION_ID && this.state.turn.userId === USER_ID
+        && !["aborted", "archived"].includes(this.state.sessionStatus) && Boolean(this.state.turn.rootTaskId)
+      return eligible ? { rows: [{ ...this.turnRow(), sessionStatus: this.state.sessionStatus }], rowCount: 1 } : { rows: [], rowCount: 0 }
+    }
     if (sql.includes('SELECT dispatch."id", dispatch."aggregateId", dispatch."payload", dispatch."attemptCount"') && sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes('JOIN "agent_sessions" AS session') && sql.includes('session."id" = dispatch."aggregateId"')) {
       const rows = this.state.sessionStatus === "running" ? this.outbox.filter(row => row.aggregateId === SESSION_ID && row.topic === "agent.turn.dispatch" && row.publishedAt === null).map(row => ({ id: row.id, aggregateId: SESSION_ID, payload: row.payload, attemptCount: row.attemptCount })) : []
       return { rows, rowCount: rows.length }
