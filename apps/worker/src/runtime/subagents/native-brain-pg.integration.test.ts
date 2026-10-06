@@ -280,8 +280,26 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
       `SELECT "attemptCount", "result", "failureReason" FROM "sub_agent_tasks" WHERE "id" = $1`, [spawned.child.taskId])
     const failureReason = initialTask.rows[0]?.failureReason
     const boundedFailureReason = typeof failureReason === "string" ? failureReason.slice(0, 240) : failureReason
+    const [failureSteps, failureItems, failureEvents] = await Promise.all([
+      pool!.query<{ ordinal: number; attempt: number; status: string; finishReason: string | null; errorCode: string | null }>(
+        `SELECT "ordinal", "attempt", "status", "finishReason", "errorCode" FROM "agent_steps"
+         WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 ORDER BY "ordinal" DESC LIMIT 4`,
+        [ids.session, ids.turn, spawned.child.taskId]),
+      pool!.query<{ type: string; phase: string | null; toolName: string | null; status: string | null; errorCode: string | null }>(
+        `SELECT "type", "phase", "content"->>'toolName' AS "toolName", "content"->>'status' AS "status", "content"->>'errorCode' AS "errorCode"
+         FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+         ORDER BY "createdAt" DESC LIMIT 8`, [ids.session, ids.turn, spawned.child.taskId]),
+      pool!.query<{ type: string; status: string | null; errorCode: string | null; code: string | null }>(
+        `SELECT "type", "payload"->>'status' AS "status", "payload"->>'errorCode' AS "errorCode", "payload"->>'code' AS "code"
+         FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+         ORDER BY "sequence" DESC LIMIT 8`, [ids.session, ids.turn, spawned.child.taskId]),
+    ])
+    const failureDiagnostics = JSON.stringify({
+      steps: failureSteps.rows.map(row => ({ ...row, ordinal: Number(row.ordinal), attempt: Number(row.attempt) })),
+      items: failureItems.rows, events: failureEvents.rows,
+    }).slice(0, 1_200)
     expect({ status: initialChild.status, failureReason: boundedFailureReason },
-      `Initial native child did not complete; persisted failureReason=${JSON.stringify(boundedFailureReason)}`)
+      `Initial native child did not complete; persisted failureReason=${JSON.stringify(boundedFailureReason)}; records=${failureDiagnostics}`)
       .toEqual({ status: "completed", failureReason: null })
     expect(initialTask.rows[0]?.attemptCount).toBe(1)
     expect(JSON.stringify(initialTask.rows[0]?.result)).toContain("does not contain")
