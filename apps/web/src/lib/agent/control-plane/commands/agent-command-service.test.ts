@@ -16,6 +16,7 @@ function makeDb(options: {
   sessionStatus?: string
   sessionOwnerId?: string
   failOutbox?: boolean
+  failDispatchOutbox?: boolean
   executionStatus?: string
   sessionSource?: string
   activeSource?: string
@@ -31,6 +32,7 @@ function makeDb(options: {
   let active: (Row & { revision: number }) | null = options.activeSource
     ? { id: options.activeTurnId ?? "turn_1", source: options.activeSource, status: options.activeStatus ?? "in_progress", revision: 0, input: options.activeInput, rootTaskId: options.activeRootTaskId ?? null }
     : null
+  let turns: (Row & { revision: number })[] = active ? [active] : []
   let execution: { id: string; sessionId: string; status: string } | null = options.executionStatus
     ? { id: "execution_1", sessionId: "session_1", status: options.executionStatus }
     : null
@@ -49,10 +51,13 @@ function makeDb(options: {
       rawQueries.push(query)
       const strings = (query as { strings?: readonly string[] }).strings ?? []
       const sql = strings.join(" ")
-      if (sql.includes("SELECT")) {
+      if (sql.includes('FROM "agent_sessions"')) {
         const openFence = sql.includes('"status" NOT IN')
         const available = sessionExists && sessionOwnerId === ownerId && (!openFence || !["aborted", "archived"].includes(sessionStatus))
-        return available ? [{ id: "session_1" }] : []
+        return available ? [{ id: "session_1", status: sessionStatus }] : []
+      }
+      if (sql.includes("SELECT")) {
+        return [{ id: "session_1" }]
       }
       sequence += BigInt(1)
       return [{ eventSequence: sequence }]
@@ -97,12 +102,15 @@ function makeDb(options: {
       create: vi.fn(async (args: unknown) => {
         const data = (args as { data: Row }).data
         active = { id: String(data.id), source: data.source, status: "queued", revision: 0, input: data.input }
+        turns.push(active)
         return { id: active.id }
       }),
       updateMany: vi.fn(async (args: unknown) => {
         const where = whereOf(args)
         if (!active || where.id !== active.id || where.revision !== active.revision) return { count: 0 }
-        active = { ...active, status: "interrupted", revision: active.revision + 1 }
+        const interrupted: Row & { revision: number } = { ...active, status: "interrupted", revision: active.revision + 1 }
+        active = interrupted
+        turns = turns.map((turn) => turn.id === interrupted.id ? interrupted : turn)
         return { count: 1 }
       }),
     },
@@ -158,7 +166,7 @@ function makeDb(options: {
     },
     agentOutbox: {
       create: vi.fn(async (args: unknown) => {
-        if (options.failOutbox) throw new Error("outbox unavailable")
+        if (options.failOutbox || options.failDispatchOutbox) throw new Error("outbox unavailable")
         const data = (args as { data: Row }).data
         outbox.push(data)
         return data
@@ -177,6 +185,7 @@ function makeDb(options: {
     const run = transactionQueue.then(async () => {
       const before = {
         active,
+        turns: turns.map((turn) => ({ ...turn })),
         execution,
         sessionStatus,
         sequence,
@@ -190,6 +199,7 @@ function makeDb(options: {
       } catch (error: unknown) {
         rollbacks += 1
         active = before.active
+        turns = before.turns
         execution = before.execution
         sessionStatus = before.sessionStatus
         sequence = before.sequence
@@ -210,11 +220,21 @@ function makeDb(options: {
     tx,
     state: {
       rawQueries,
+      get transactionCount() { return transaction.mock.calls.length },
       get rollbacks() { return rollbacks },
       get active() { return active },
-      setActive(value: (Row & { revision: number }) | null) { active = value },
+      setActive(value: (Row & { revision: number }) | null) {
+        active = value
+        if (value) {
+          const index = turns.findIndex((turn) => turn.id === value.id)
+          if (index < 0) turns.push(value)
+          else turns[index] = value
+        }
+      },
+      get turns() { return turns },
       get execution() { return execution },
       get sessionStatus() { return sessionStatus },
+      setSessionStatus(value: string) { sessionStatus = value },
       get inputs() { return inputs },
       get items() { return items },
       get events() { return events },
@@ -235,6 +255,15 @@ function retryTarget(status = "failed", input: unknown = { goal: "Find backend r
 
 function retryCommand(clientMessageId: string, expectedRevision: number | null = 4) {
   return { sessionId: "session_1", userId: "user_1", clientMessageId, source: "user" as const, targetTurnId: "turn_failed", expectedRevision }
+}
+
+function replacementCommand(clientMessageId: string, expectedTurnId: string, expectedRevision = 0, source: "user" | "automation" = "user") {
+  return {
+    ...startCommand(clientMessageId, source),
+    content: [{ type: "text" as const, text: "Find senior backend roles in Dublin" }],
+    expectedTurnId,
+    expectedRevision,
+  }
 }
 
 describe("AgentCommandService", () => {
@@ -522,6 +551,247 @@ describe("AgentCommandService", () => {
       }],
       skipDuplicates: true,
     })
+  })
+
+  it("replaces an objective atomically while retaining the old Turn input and dispatching a fresh goal", async () => {
+    const fake = makeDb({ sessionStatus: "running" })
+    const service = new AgentCommandService(fake.db)
+    const started = await service.start(startCommand("client_original"))
+    const queuedFollowUp = await service.message({
+      ...startCommand("client_queued_before_replace"),
+      delivery: "follow_up",
+      expectedTurnId: started.turnId,
+      expectedRevision: 0,
+    })
+    const originalTurn = fake.state.turns.find((turn) => turn.id === started.turnId)
+    const originalInput = structuredClone(originalTurn?.input)
+    const transactionsBefore = fake.state.transactionCount
+
+    const result = await service.replaceObjective(replacementCommand("client_replace", started.turnId))
+
+    const oldTurn = fake.state.turns.find((turn) => turn.id === started.turnId)
+    const successor = fake.state.turns.find((turn) => turn.id === result.turnId)
+    expect(result).toMatchObject({ disposition: "started", turnId: successor?.id })
+    expect(result.turnId).not.toBe(started.turnId)
+    expect(oldTurn).toMatchObject({ status: "interrupted", revision: 1 })
+    expect(oldTurn?.input).toEqual(originalInput)
+    expect(successor).toMatchObject({
+      source: "user",
+      status: "queued",
+      input: {
+        goal: "Find senior backend roles in Dublin",
+        content: [{ type: "text", text: "Find senior backend roles in Dublin" }],
+      },
+    })
+    expect(fake.state.inputs.find((input) => input.clientMessageId === "client_replace")).toMatchObject({
+      targetTurnId: result.turnId,
+      delivery: "follow_up",
+      status: "accepted",
+    })
+    expect(fake.state.inputs.find((input) => input.id === queuedFollowUp.inputId)).toMatchObject({
+      status: "cancelled",
+      cancelledAt: expect.any(Date),
+    })
+    const internalInterrupt = fake.state.inputs.find((input) => {
+      const text = (input.content as Array<{ text?: string }> | undefined)?.[0]?.text
+      return input.targetTurnId === started.turnId && text === "Interrupt requested"
+    })
+    expect(internalInterrupt?.clientMessageId).not.toBe("client_replace")
+    expect(fake.state.outbox.filter((entry) => entry.topic === "agent.turn.dispatch")).toHaveLength(2)
+    expect(fake.state.transactionCount - transactionsBefore).toBe(1)
+
+    const locked = fake.tx.$queryRaw.mock.calls.findIndex((call) => {
+      const sql = ((call[0] as { strings?: readonly string[] }).strings ?? []).join(" ")
+      return sql.includes('SELECT "id", "status" FROM "agent_sessions"')
+    })
+    const duplicateLookup = fake.tx.agentInput.findFirst.mock.invocationCallOrder.at(-1) ?? 0
+    const turnFence = fake.tx.agentTurn.updateMany.mock.invocationCallOrder[0] ?? 0
+    expect(fake.tx.$queryRaw.mock.invocationCallOrder[locked]).toBeLessThan(duplicateLookup)
+    expect(duplicateLookup).toBeLessThan(turnFence)
+  })
+
+  it.each(["paused", "archived"])(
+    "replays a duplicate replacement while the Session is %s without new writes or an active-Turn check",
+    async (sessionStatus) => {
+      const fake = makeDb({ sessionStatus: "running" })
+      const service = new AgentCommandService(fake.db)
+      const started = await service.start(startCommand("client_duplicate_start"))
+      const command = replacementCommand("client_replace_duplicate", started.turnId)
+      const first = await service.replaceObjective(command)
+      const turnLookups = fake.tx.agentTurn.findFirst.mock.calls.length
+      const writes = {
+        turnUpdates: fake.tx.agentTurn.updateMany.mock.calls.length,
+        turnCreates: fake.tx.agentTurn.create.mock.calls.length,
+        inputCreates: fake.tx.agentInput.create.mock.calls.length,
+        itemCreates: fake.tx.agentItem.create.mock.calls.length,
+        eventCreates: fake.tx.agentEvent.create.mock.calls.length,
+        outboxCreates: fake.tx.agentOutbox.create.mock.calls.length,
+        outboxCreateMany: fake.tx.agentOutbox.createMany.mock.calls.length,
+        inputCount: fake.state.inputs.length,
+        itemCount: fake.state.items.length,
+        eventCount: fake.state.events.length,
+        outboxCount: fake.state.outbox.length,
+      }
+      fake.state.setSessionStatus(sessionStatus)
+
+      const duplicate = await service.replaceObjective(command)
+
+      expect(duplicate).toMatchObject({
+        disposition: "duplicate",
+        originalDisposition: "started",
+        turnId: first.turnId,
+        inputId: first.inputId,
+        sequence: first.sequence,
+      })
+      expect(fake.tx.agentTurn.findFirst).toHaveBeenCalledTimes(turnLookups)
+      expect(fake.tx.agentTurn.updateMany).toHaveBeenCalledTimes(writes.turnUpdates)
+      expect(fake.tx.agentTurn.create).toHaveBeenCalledTimes(writes.turnCreates)
+      expect(fake.tx.agentInput.create).toHaveBeenCalledTimes(writes.inputCreates)
+      expect(fake.tx.agentItem.create).toHaveBeenCalledTimes(writes.itemCreates)
+      expect(fake.tx.agentEvent.create).toHaveBeenCalledTimes(writes.eventCreates)
+      expect(fake.tx.agentOutbox.create).toHaveBeenCalledTimes(writes.outboxCreates)
+      expect(fake.tx.agentOutbox.createMany).toHaveBeenCalledTimes(writes.outboxCreateMany)
+      expect(fake.state.inputs).toHaveLength(writes.inputCount)
+      expect(fake.state.items).toHaveLength(writes.itemCount)
+      expect(fake.state.events).toHaveLength(writes.eventCount)
+      expect(fake.state.outbox).toHaveLength(writes.outboxCount)
+    },
+  )
+
+  it.each(["paused", "pausing", "resuming", "completed", "aborted", "archived"])(
+    "rejects objective replacement in a %s Session before Turn writes",
+    async (sessionStatus) => {
+      const fake = makeDb({ sessionStatus, activeSource: "user" })
+      await expect(new AgentCommandService(fake.db).replaceObjective(replacementCommand(`replace_${sessionStatus}`, "turn_1")))
+        .rejects.toMatchObject({ code: "objective_replacement_state_conflict", status: 409, details: { status: sessionStatus } })
+      expect(fake.state.rollbacks).toBe(1)
+      expect(fake.tx.agentTurn.findFirst).not.toHaveBeenCalled()
+      expect(fake.tx.agentTurn.updateMany).not.toHaveBeenCalled()
+      expect(fake.tx.agentTurn.create).not.toHaveBeenCalled()
+      expect(fake.tx.agentItem.create).not.toHaveBeenCalled()
+      expect(fake.state.inputs).toHaveLength(0)
+      expect(fake.state.events).toHaveLength(0)
+      expect(fake.state.outbox).toHaveLength(0)
+    },
+  )
+
+  it("rejects a missing or foreign Session before objective replacement writes", async () => {
+    for (const options of [{ sessionExists: false }, { sessionOwnerId: "user_2" }]) {
+      const fake = makeDb({ ...options, sessionStatus: "running", activeSource: "user" })
+      await expect(new AgentCommandService(fake.db).replaceObjective(replacementCommand("replace_foreign", "turn_1")))
+        .rejects.toMatchObject({ code: "agent_session_not_found", status: 404 })
+      expect(fake.tx.agentInput.findFirst).not.toHaveBeenCalled()
+      expect(fake.tx.agentTurn.updateMany).not.toHaveBeenCalled()
+      expect(fake.tx.agentTurn.create).not.toHaveBeenCalled()
+      expect(fake.state.inputs).toHaveLength(0)
+    }
+  })
+
+  it.each([
+    ["stale Turn", "turn_other", 0],
+    ["stale revision", "turn_1", 1],
+  ])("rejects a %s without interrupting or creating a successor", async (_label, expectedTurnId, expectedRevision) => {
+    const fake = makeDb({ sessionStatus: "running", activeSource: "user" })
+    await expect(new AgentCommandService(fake.db).replaceObjective(
+      replacementCommand("replace_stale", String(expectedTurnId), Number(expectedRevision)),
+    )).rejects.toMatchObject({ code: "active_turn_changed", status: 409 })
+    expect(fake.state.rollbacks).toBe(1)
+    expect(fake.state.active).toMatchObject({ id: "turn_1", status: "in_progress", revision: 0 })
+    expect(fake.tx.agentTurn.updateMany).not.toHaveBeenCalled()
+    expect(fake.tx.agentTurn.create).not.toHaveBeenCalled()
+    expect(fake.state.inputs).toHaveLength(0)
+  })
+
+  it("rejects replacement without an active Turn instead of silently starting a new one", async () => {
+    const fake = makeDb({ sessionStatus: "running" })
+    await expect(new AgentCommandService(fake.db).replaceObjective(replacementCommand("replace_absent", "turn_1")))
+      .rejects.toMatchObject({ code: "active_turn_changed", status: 409 })
+    expect(fake.tx.agentTurn.create).not.toHaveBeenCalled()
+    expect(fake.state.outbox).toHaveLength(0)
+  })
+
+  it("rejects replacement goals over 2,000 UTF-8 bytes before opening a transaction", async () => {
+    const oversizedContent: Array<Array<{ type: "text"; text: string }>> = [
+      [{ type: "text", text: "x".repeat(2_001) }],
+      [{ type: "text", text: "你".repeat(667) }],
+      [{ type: "text", text: "x".repeat(1_000) }, { type: "text", text: "y".repeat(1_000) }],
+    ]
+
+    for (const [index, content] of oversizedContent.entries()) {
+      const fake = makeDb({ sessionStatus: "running", activeSource: "user" })
+      await expect(new AgentCommandService(fake.db).replaceObjective({
+        ...replacementCommand("replace_oversized_" + index, "turn_1"),
+        content,
+      })).rejects.toMatchObject({ code: "invalid_command", status: 422 })
+      expect(fake.state.transactionCount).toBe(0)
+      expect(fake.tx.agentTurn.updateMany).not.toHaveBeenCalled()
+      expect(fake.tx.agentTurn.create).not.toHaveBeenCalled()
+      expect(fake.state.inputs).toHaveLength(0)
+      expect(fake.state.outbox).toHaveLength(0)
+    }
+  })
+
+  it("accepts exactly 2,000 UTF-8 bytes and persists that replacement goal", async () => {
+    const fake = makeDb({ sessionStatus: "running", activeSource: "user" })
+    const goal = "x".repeat(2_000)
+    const result = await new AgentCommandService(fake.db).replaceObjective({
+      ...replacementCommand("replace_exact_boundary", "turn_1"),
+      content: [{ type: "text", text: goal }],
+    })
+
+    const successor = fake.state.turns.find((turn) => turn.id === result.turnId)
+    expect(successor?.input).toMatchObject({ goal })
+  })
+
+  it("keeps the ordinary message text limit independent from replacement objectives", async () => {
+    const fake = makeDb()
+    const text = "x".repeat(20_000)
+    const result = await new AgentCommandService(fake.db).message({
+      ...startCommand("ordinary_long_message"),
+      delivery: "follow_up",
+      content: [{ type: "text", text }],
+    })
+
+    expect(result.disposition).toBe("started")
+    expect(fake.state.turns[0]?.input).toMatchObject({ goal: text })
+  })
+
+  it("rejects automation and blank-text calls before opening a transaction", async () => {
+    const fake = makeDb({ sessionStatus: "running", activeSource: "user" })
+    const service = new AgentCommandService(fake.db)
+    await expect(service.replaceObjective(replacementCommand("replace_automation", "turn_1", 0, "automation")))
+      .rejects.toMatchObject({ code: "invalid_command", status: 422 })
+    await expect(service.replaceObjective({
+      ...replacementCommand("replace_blank", "turn_1"),
+      content: [{ type: "text", text: "   " }],
+    })).rejects.toMatchObject({ code: "invalid_command", status: 422 })
+    await expect(service.replaceObjective({
+      ...replacementCommand("replace_missing_turn", "turn_1"),
+      expectedTurnId: "",
+    })).rejects.toMatchObject({ code: "invalid_command", status: 422 })
+    await expect(service.replaceObjective({
+      ...replacementCommand("replace_bad_revision", "turn_1"),
+      expectedRevision: -1,
+    })).rejects.toMatchObject({ code: "invalid_command", status: 422 })
+    expect(fake.state.rawQueries).toHaveLength(0)
+    expect(fake.state.rollbacks).toBe(0)
+  })
+
+  it("rolls back the interruption when successor dispatch admission fails", async () => {
+    const originalInput = { goal: "Original objective", content: [{ type: "text", text: "Original objective" }] }
+    const fake = makeDb({ sessionStatus: "running", activeSource: "user", activeInput: originalInput, failDispatchOutbox: true })
+
+    await expect(new AgentCommandService(fake.db).replaceObjective(replacementCommand("replace_rollback", "turn_1")))
+      .rejects.toThrow("outbox unavailable")
+
+    expect(fake.state.rollbacks).toBe(1)
+    expect(fake.state.turns).toHaveLength(1)
+    expect(fake.state.turns[0]).toMatchObject({ id: "turn_1", status: "in_progress", revision: 0, input: originalInput })
+    expect(fake.state.active).toMatchObject({ id: "turn_1", status: "in_progress", revision: 0, input: originalInput })
+    expect(fake.state.inputs).toHaveLength(0)
+    expect(fake.state.items).toHaveLength(0)
+    expect(fake.state.events).toHaveLength(0)
+    expect(fake.state.outbox).toHaveLength(0)
   })
 
   it("uses the open session fence before command admission", async () => {

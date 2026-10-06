@@ -3,7 +3,8 @@ import type { PrismaClient } from "@prisma/client"
 
 vi.mock("@prisma/client", () => ({ Prisma: { sql: (strings: TemplateStringsArray, ...values: unknown[]) => ({ strings, values }) } }))
 
-import { AgentSessionControlService } from "./session-control"
+import { AgentSessionControlService, lockOwnedSessionForObjectiveReplacement } from "./session-control"
+import type { CommandTransaction } from "./transaction"
 
 const command = {
   sessionId: "session_1", userId: "user_1", clientMessageId: "control_1", action: "pause" as const,
@@ -11,6 +12,26 @@ const command = {
 }
 const activeTurn = { id: "turn_1", source: "user", status: "in_progress", revision: 3 }
 const requestedAt = "2026-10-06T12:00:00.000Z"
+
+describe("Objective replacement Session lock", () => {
+  it("locks the owned Session and returns its actual lifecycle status", async () => {
+    const queryRaw = vi.fn(async (_query: unknown) => [{ id: "session_1", status: "paused" }])
+    const status = await lockOwnedSessionForObjectiveReplacement(
+      { $queryRaw: queryRaw } as unknown as CommandTransaction,
+      "session_1",
+      "user_1",
+    )
+
+    expect(status).toBe("paused")
+    const query = queryRaw.mock.calls[0]?.[0] as unknown as { strings?: readonly string[] }
+    const sql = query.strings?.join(" ") ?? ""
+    expect(sql).toContain('SELECT "id", "status" FROM "agent_sessions"')
+    expect(sql).toContain('"id" =')
+    expect(sql).toContain('"userId" =')
+    expect(sql).toContain("FOR UPDATE")
+    expect(sql).not.toContain('"status" NOT IN')
+  })
+})
 
 function fixture(options: { status?: string; turn?: typeof activeTurn | null; existing?: unknown; owned?: boolean } = {}) {
   let status = options.status ?? "running"

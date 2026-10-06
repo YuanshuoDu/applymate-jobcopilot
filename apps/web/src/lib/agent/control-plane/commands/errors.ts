@@ -17,6 +17,7 @@ export type AgentCommandErrorCode =
   | "turn_intent_mismatch"
   | "session_control_state_conflict"
   | "session_control_idempotency_conflict"
+  | "objective_replacement_state_conflict"
 
 export class AgentCommandError extends Error {
   readonly status: 404 | 409 | 422
@@ -132,6 +133,15 @@ export function sessionControlStateConflict(action: "pause" | "resume", status: 
 
 export function sessionControlIdempotencyConflict(): AgentCommandError {
   return new AgentCommandError("session_control_idempotency_conflict", "The idempotency key was already used for a different session control command", 409)
+}
+
+export function objectiveReplacementStateConflict(status: string): AgentCommandError {
+  return new AgentCommandError(
+    "objective_replacement_state_conflict",
+    "The Session must be running to replace its objective",
+    409,
+    { status },
+  )
 }
 
 export function isUniqueViolation(error: unknown): boolean {
