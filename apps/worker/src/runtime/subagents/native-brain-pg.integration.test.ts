@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 import { Pool } from "pg"
 import { Redis } from "ioredis"
-import type { ModelAdapter } from "@jobcopilot/agent-model"
+import { ModelAdapterRegistry, type HarnessModelRequest, type ModelAdapter, type ModelStreamEvent } from "@jobcopilot/agent-model"
 import type { WorkerUsageAuthorizationInput } from "../../queue/ai-usage-bridge.js"
 import {
   NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA,
@@ -131,11 +131,18 @@ function reportFor(packet: NonNullable<ReturnType<typeof parseNativeVerification
   let sourceReference: string | undefined
   let hasOwnedFact = false
   if (expectedFact && packet.target.kind === "child") {
+    let targetJobIds = new Set<string>([expectedFact.jobId])
+    try {
+      const result = JSON.parse(targetText) as { findings?: Array<{ jobId?: unknown }>; evidence?: Array<{ ref?: unknown }> }
+      for (const value of [...(result.findings ?? []).map(item => item.jobId), ...(result.evidence ?? []).map(item => item.ref)]) {
+        if (typeof value === "string" && value.trim() && value.length <= 256) targetJobIds.add(value)
+      }
+    } catch { /* current child result may use a bounded non-JSON final text */ }
     for (const item of packet.evidence) {
       if (item.kind !== "tool_result") continue
       try {
         const row = JSON.parse(item.summary) as { tool?: unknown; status?: unknown; output?: { jobs?: Array<{ id?: unknown; description?: unknown }> } }
-        const matchingJob = row.output?.jobs?.find(job => job.id === expectedFact.jobId
+        const matchingJob = row.output?.jobs?.find(job => typeof job.id === "string" && targetJobIds.has(job.id)
           && typeof job.description === "string" && job.description.toLowerCase().includes(expectedFact.phrase.toLowerCase()))
         if (row.tool === "jobs.search" && row.status === "completed" && matchingJob) {
           hasOwnedFact = true
@@ -150,14 +157,16 @@ function reportFor(packet: NonNullable<ReturnType<typeof parseNativeVerification
     const activeNodes = packet.evidence.flatMap(item => {
       if (item.kind !== "graph_history") return []
       try {
-        const row = JSON.parse(item.summary) as { activeNative?: unknown; taskId?: unknown; criteria?: unknown; persistedResult?: { summary?: unknown } }
+        const row = JSON.parse(item.summary) as { activeNative?: unknown; taskId?: unknown; status?: unknown; criteria?: unknown; persistedResult?: { summary?: unknown; finalText?: unknown; structuredResult?: { summary?: unknown } } }
         return row.activeNative === true && typeof row.taskId === "string" ? [{ item, row }] : []
       } catch { return [] }
     })
     for (const { item, row } of activeNodes) {
-      if (!Array.isArray(row.criteria) || !row.criteria.includes(turnCriteria[0])
-        || typeof row.persistedResult?.summary !== "string"
-        || !row.persistedResult.summary.toLowerCase().includes(expectedFact.phrase.toLowerCase())) continue
+      const persistedSummary = typeof row.persistedResult?.summary === "string" ? row.persistedResult.summary
+        : typeof row.persistedResult?.structuredResult?.summary === "string" ? row.persistedResult.structuredResult.summary
+          : typeof row.persistedResult?.finalText === "string" ? row.persistedResult.finalText : ""
+      if (!Array.isArray(row.criteria) || !row.criteria.includes(turnCriteria[0]) || row.status !== "completed"
+        || !persistedSummary.toLowerCase().includes(expectedFact.phrase.toLowerCase())) continue
       const independentlyPassed = packet.evidence.some(evidence => {
         if (evidence.kind !== "review_history") return false
         try {
@@ -183,6 +192,47 @@ function reportFor(packet: NonNullable<ReturnType<typeof parseNativeVerification
     })),
   }
 }
+
+type CanonicalFixture = Readonly<{ userId: string; sessionId: string; turnId: string; ownerId: string; jobId: string }>
+
+function waitForDatabase<T>(label: string, load: () => Promise<T>, ready: (value: T) => boolean, timeoutMs = 90_000): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const started = Date.now()
+    const poll = async (): Promise<void> => {
+      try {
+        const value = await load()
+        if (ready(value)) { resolve(value); return }
+        if (Date.now() - started >= timeoutMs) {
+          reject(new Error(`${label} timed out; last=${JSON.stringify(value).slice(0, 1_200)}`))
+          return
+        }
+        setTimeout(() => { void poll() }, 50)
+      } catch (error: unknown) {
+        reject(error)
+      }
+    }
+    void poll()
+  })
+}
+
+async function seedCanonicalFixture(value: CanonicalFixture): Promise<void> {
+  await pool!.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`, [value.userId, `${value.userId}@example.invalid`])
+  await pool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+    VALUES ($1, $2, $3, 'running', 'test', CURRENT_TIMESTAMP)`, [value.sessionId, value.userId, goal])
+  await pool!.query(`INSERT INTO "agent_turns"
+    ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "updatedAt")
+    VALUES ($1, $2, $3, 'queued', 'user', $4::jsonb, $5::jsonb, '{}'::jsonb, $6::jsonb, CURRENT_TIMESTAMP)`, [
+    value.turnId, value.sessionId, value.userId, JSON.stringify({ goal, successCriteria: turnCriteria }),
+    JSON.stringify({ provider: "fixture", model: "native-brain-deterministic" }),
+    JSON.stringify({ limits: { maxSteps: 32, maxToolCalls: 12 }, subagentPolicy: { maxConcurrency: 8, maxDepth: 8, maxFanOut: 64, maxAttempts: 3 } }),
+  ])
+  await pool!.query(`INSERT INTO "Job"
+    ("id", "userId", "company", "role", "location", "status", "url", "description", "source", "updatedAt")
+    VALUES ($1, $2, 'Canonical Fact Fixture GmbH', 'Research Engineer Fact 42', 'Dublin', 'saved', 'https://jobs.example.invalid/canonical-fact-42',
+      'The owned job description says Fact 42 is present.', 'fixture', CURRENT_TIMESTAMP)`, [value.jobId, value.userId])
+}
+
+function delay(ms: number): Promise<void> { return new Promise(resolve => setTimeout(resolve, ms)) }
 
 describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
   beforeAll(async () => {
@@ -254,7 +304,7 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
             evidence: [{ id: evidenceId, kind: "job", ref: unrelated ? ids.unrelatedJob : ids.job, source: "fixture" }],
             summary: unrelated ? "The saved Harbor Fixture job confirms Harbor 9 is open."
               : positive ? "Fact 42 is present in the saved job description."
-                : "The saved job does not contain the requested fact.",
+                : "The owned job description says Fact 42 is absent.",
           }
           yield { type: "text_delta", text: JSON.stringify(result) }
           yield { type: "completed", finishReason: "stop" }
@@ -268,7 +318,7 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
     }
     const executor = createProductionChildExecutor({
       pool: pool!, authorizeUsage, modelRuntimeFactory,
-      mailboxReader: (async (input: { taskId: string }) => { mailboxReads.push(input.taskId); return [] }) as never,
+      mailboxReader: { listPendingMessages: async input => { mailboxReads.push(input.toTaskId); return [] } },
     })
     const manager = new AgentTreeManager(new PgSubagentTaskStore(pool!))
     const executeTask = async (taskId: string) => runSubagentQueueJob(pool as never, manager, executor, {
@@ -302,7 +352,7 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
       `Initial native child did not complete; persisted failureReason=${JSON.stringify(boundedFailureReason)}; records=${failureDiagnostics}`)
       .toEqual({ status: "completed", failureReason: null })
     expect(initialTask.rows[0]?.attemptCount).toBe(1)
-    expect(JSON.stringify(initialTask.rows[0]?.result)).toContain("does not contain")
+    expect(JSON.stringify(initialTask.rows[0]?.result)).toContain("Fact 42 is absent")
     const targetToolRows = await pool!.query<{ count: number }>(`SELECT COUNT(*)::int AS "count" FROM "agent_items"
       WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "type" = 'tool_result' AND "content"->>'toolName' = 'jobs.search'`,
     [ids.session, ids.turn, spawned.child.taskId])
@@ -437,4 +487,308 @@ describeWithServices("native brain PostgreSQL + Redis acceptance", () => {
     expect(digestNativeVerificationValue(acceptedCandidate)).toMatch(/^[a-f0-9]{64}$/)
     await manager.shutdown()
   }, 120_000)
+
+  it("runs the default canonical brain through BullMQ wait, verifier restart, and exact atomic final publication", async () => {
+    const canonicalSuffix = randomUUID()
+    const canonical: CanonicalFixture = {
+      userId: `native-canonical-user-${canonicalSuffix}`, sessionId: `native-canonical-session-${canonicalSuffix}`,
+      turnId: `native-canonical-turn-${canonicalSuffix}`, ownerId: `native-canonical-worker-${canonicalSuffix}`,
+      jobId: fixtureJobId(),
+    }
+    await seedCanonicalFixture(canonical)
+
+    const previousDatabaseUrl = process.env.DATABASE_URL
+    process.env.DATABASE_URL = databaseUrl!
+    const [
+      { createCanonicalTurnRuntime }, { createPgTaskGraphCommandPort }, { TASK_GRAPH_TEMPLATES },
+      { createProductionWorkerBootstrap }, { createProductionChildExecutor }, { enqueueTurn },
+      { closePool }, { persistedFinalCandidate },
+    ] = await Promise.all([
+      import("../canonical-turn-runtime.js"), import("./pg-task-graph-command-port.js"), import("./task-graph-templates.js"),
+      import("../../queue/production-bootstrap.js"), import("./production-child-runtime.js"), import("../turns/turn-queue.js"),
+      import("../../db/apply-results.js"), import("../turns/turn-execution-final-candidate.js"),
+    ])
+
+    const acceptedCandidate = "Fact 42 is present in the owned job description."
+    const rejectedCandidate = "The owned job description says Fact 42 is absent."
+    const usageAuthorizations: WorkerUsageAuthorizationInput[] = []
+    const usageSettlements: Array<{ inputTokens: number; outputTokens: number; estimatedCostUsd: number }> = []
+    const authorizeUsage = async (input: WorkerUsageAuthorizationInput) => {
+      usageAuthorizations.push(input)
+      return { settle: async (settlement: { inputTokens: number; outputTokens: number; estimatedCostUsd: number }) => {
+        usageSettlements.push(settlement)
+      } }
+    }
+    let rootModelStreams = 0
+    let acceptedCandidateReady!: () => void
+    let releaseAcceptedCandidate!: () => void
+    const acceptedCandidateEntered = new Promise<void>(resolve => { acceptedCandidateReady = resolve })
+    const acceptedCandidateRelease = new Promise<void>(resolve => { releaseAcceptedCandidate = resolve })
+    const emitUsage = (): ModelStreamEvent => ({
+      type: "usage", inputTokens: 11, outputTokens: 5, estimatedCostUsd: 0.003,
+      provider: "fixture", model: "native-brain-deterministic",
+    })
+    const rootAdapter: ModelAdapter = {
+      id: `native-canonical-root-${canonicalSuffix}`, profile,
+      async *stream(request: HarnessModelRequest) {
+        rootModelStreams += 1
+        const call = rootModelStreams
+        yield emitUsage()
+        const toolNames = request.tools.map(tool => (tool as { name?: unknown }).name)
+        if (call === 1) {
+          expect(toolNames).toContain("agent.spawn")
+          yield { type: "tool_call_completed", callId: `canonical-spawn:${canonicalSuffix}`, name: "agent.spawn", arguments: {
+            idempotencyKey: `canonical-spawn:${canonicalSuffix}`, role: "analyst", taskType: "research",
+            goal: childGoal, successCriteria: turnCriteria, allowedActions: ["jobs.search"], context: { fixture: "canonical-default-path" },
+          } }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        if (call === 2) {
+          expect(toolNames).toContain("agent.wait")
+          const root = await waitForDatabase("canonical root task", async () => (await pool!.query<{ rootTaskId: string | null }>(
+            `SELECT "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`, [canonical.turnId, canonical.sessionId])).rows[0]?.rootTaskId,
+          value => typeof value === "string")
+          const targetId = await waitForDatabase("canonical spawned target", async () => (await pool!.query<{ id: string }>(
+            `SELECT "id" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2 AND "parentTaskId" = $3
+              AND "role" = 'analyst' AND "taskType" = 'research' AND "goal" = $4 ORDER BY "createdAt" LIMIT 1`,
+            [canonical.sessionId, canonical.turnId, root, childGoal])).rows[0]?.id, value => typeof value === "string")
+          yield { type: "tool_call_completed", callId: `canonical-wait-target:${canonicalSuffix}`, name: "agent.wait", arguments: {
+            idempotencyKey: `canonical-wait-target:${canonicalSuffix}`, taskIds: [targetId], mode: "all", timeoutMs: 30_000,
+          } }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        if (call === 3) {
+          expect(toolNames).toContain("jobs.search")
+          yield { type: "tool_call_completed", callId: `canonical-search:${canonicalSuffix}`, name: "jobs.search", arguments: {
+            target: "Fact 42", location: "Dublin", limit: 10,
+          } }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        if (call >= 4) {
+          const rejectedControl = await pool!.query<{ id: string }>(`SELECT "id" FROM "sub_agent_tasks"
+            WHERE "sessionId" = $1 AND "turnId" = $2 AND "role" = 'auditor' AND "taskType" = 'native_verification'
+              AND "expectedOutputSchema"->'target'->>'kind' = 'root_goal'
+              AND "expectedOutputSchema"->'target'->>'candidateDigest' = $3
+              AND "result"->'nativeVerificationReport'->>'disposition' = 'failed' LIMIT 1`,
+          [canonical.sessionId, canonical.turnId, digestNativeVerificationValue(rejectedCandidate)])
+          if (rejectedControl.rows.length === 0) {
+            yield { type: "text_delta", text: rejectedCandidate }
+            yield { type: "completed", finishReason: "stop" }
+            return
+          }
+          const failedFeedback = request.messages.filter(message => message.role === "system")
+            .flatMap(message => message.content)
+            .flatMap(part => part.type === "text" ? [part.text] : [])
+            .find(value => value.includes("Independent review did not accept the previous root candidate."))
+          expect(failedFeedback).toBeDefined()
+          expect(failedFeedback?.length).toBeLessThanOrEqual(800)
+          expect(failedFeedback).toContain(`target=${request.metadata.taskId}`)
+          expect(failedFeedback).toContain("criterion=criterion-1 status=failed reason=does_not_meet_criterion")
+          acceptedCandidateReady()
+          await acceptedCandidateRelease
+          yield { type: "text_delta", text: acceptedCandidate }
+          yield { type: "completed", finishReason: "stop" }
+          return
+        }
+        throw new Error(`unexpected canonical root model call ${call}`)
+      },
+    }
+
+    const childModelRuntimeFactory = ({ task }: { task: { id: string; role: string; taskType: string; goal: string; expectedOutputSchema: unknown; context: unknown } }): ModelAdapter => {
+      let targetRounds = 0
+      return {
+        id: `native-canonical-${task.role}-${task.taskType}`, profile,
+        async *stream(request: HarnessModelRequest) {
+          yield emitUsage()
+          if (task.role === "auditor" && task.taskType === "native_verification") {
+            expect(request.tools).toHaveLength(0)
+            const control = parseNativeVerificationControl(task.expectedOutputSchema)
+            const packet = control && parseNativeVerificationPacket(task.context, control)
+            if (!control || control.controlTaskId !== task.id || !packet) throw new Error("canonical control was not server-bound")
+            yield { type: "text_delta", text: JSON.stringify(reportFor(packet)) }
+            yield { type: "completed", finishReason: "stop" }
+            return
+          }
+          targetRounds += 1
+          if (targetRounds === 1) {
+            expect(request.tools.map(tool => (tool as { name?: unknown }).name)).toContain("jobs.search")
+            yield { type: "tool_call_completed", callId: `canonical-search:${task.id}`, name: "jobs.search", arguments: {
+              target: "Fact 42", location: "Dublin", limit: 10,
+            } }
+            yield { type: "completed", finishReason: "tool_calls" }
+            return
+          }
+          const evidenceId = `evidence:${task.id}:job`
+          const structured = {
+            schemaVersion: "agent-harness.v2.subagent.result", role: "analyst", status: "completed",
+            findings: [{ jobId: canonical.jobId, score: 8, evidenceIds: [evidenceId] }],
+            evidence: [{ id: evidenceId, kind: "job", ref: canonical.jobId, source: "fixture" }],
+            summary: "Fact 42 is present in the owned job description.",
+          }
+          yield { type: "text_delta", text: JSON.stringify(structured) }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      }
+    }
+
+    const childExecutor = createProductionChildExecutor({ pool: pool!, authorizeUsage, modelRuntimeFactory: childModelRuntimeFactory })
+    const makeStack = async (generation: number) => {
+      const runtime = await createCanonicalTurnRuntime(pool!, {
+        workerId: `${canonical.ownerId}-${generation}`,
+        productionFlags: {
+          taskGraphPlanningEnabled: true, childExecutionEnabled: true, coordinationEnabled: true,
+          consumeWaitOutcomes: true, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false,
+        },
+        taskGraphCommandPort: createPgTaskGraphCommandPort(pool!),
+        taskGraphTemplates: TASK_GRAPH_TEMPLATES,
+        authorizeUsage,
+        modelRuntimeFactory: () => ({
+          adapter: rootAdapter,
+          registry: new ModelAdapterRegistry().register(rootAdapter),
+          candidates: [{ target: { provider: profile.provider, model: profile.model },
+            requirement: { nativeTools: true, structuredOutput: true, streaming: true }, reason: "Deterministic native-brain PG acceptance" }],
+        }),
+      })
+      try {
+        const bootstrap = await createProductionWorkerBootstrap({
+          pool: pool!, runtime, ownerId: `${canonical.ownerId}-${generation}`,
+          turnRecoveryIntervalMs: 50,
+          waitResolver: { intervalMs: 50, batchSize: 20, ownerId: `${canonical.ownerId}-wait-${generation}` },
+          subagents: { execute: childExecutor, intervalMs: 50 },
+        })
+        return bootstrap
+      } catch (error: unknown) {
+        await runtime.close().catch(() => undefined)
+        throw error
+      }
+    }
+
+    let bootstrap: Awaited<ReturnType<typeof makeStack>> | undefined
+    try {
+      bootstrap = await makeStack(1)
+      if (!bootstrap.subagents) throw new Error("canonical default bootstrap omitted its actual child queue")
+      await bootstrap.subagents.queue.worker.pause(true)
+      await enqueueTurn(pool!, bootstrap.turns.queue, { turnId: canonical.turnId, sessionId: canonical.sessionId, ownerId: `${canonical.ownerId}-1` })
+      await waitForDatabase("durable target child wait", async () => (await pool!.query<{
+        turnStatus: string; childStatus: string; waitStatus: string; taskId: string
+      }>(`SELECT turn."status" AS "turnStatus", child."status" AS "childStatus", wait."status" AS "waitStatus", child."id" AS "taskId"
+        FROM "sub_agent_tasks" AS child JOIN "agent_turns" AS turn ON turn."id" = child."turnId" AND turn."sessionId" = child."sessionId"
+        JOIN "agent_wait_conditions" AS wait ON wait."sessionId" = child."sessionId" AND wait."turnId" = child."turnId"
+          AND wait."parentTaskId" = child."parentTaskId" AND wait."status" = 'waiting'
+          AND wait."targetTaskIds" @> jsonb_build_array(child."id")
+        WHERE child."sessionId" = $1 AND child."turnId" = $2 AND child."role" = 'analyst' AND child."goal" = $3
+        ORDER BY child."createdAt" LIMIT 1`, [canonical.sessionId, canonical.turnId, childGoal])).rows[0],
+      value => value?.turnStatus === "waiting_for_dependency" && value.childStatus === "queued" && value.waitStatus === "waiting")
+      await bootstrap.subagents.queue.worker.resume()
+      await Promise.race([acceptedCandidateEntered, delay(90_000).then(() => {
+        throw new Error(`canonical root did not replan to the accepted candidate; modelStreams=${rootModelStreams}`)
+      })])
+      await bootstrap.subagents.queue.worker.pause(true)
+      releaseAcceptedCandidate()
+
+      const pendingRootControl = await waitForDatabase("durable accepted root-goal wait", async () => {
+        const turn = (await pool!.query<{ status: string; rootTaskId: string | null }>(
+          `SELECT "status", "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`,
+          [canonical.turnId, canonical.sessionId])).rows[0]
+        const controls = await pool!.query<{ id: string; status: string; expectedOutputSchema: unknown }>(
+          `SELECT "id", "status", "expectedOutputSchema" FROM "sub_agent_tasks"
+           WHERE "sessionId" = $1 AND "turnId" = $2 AND "role" = 'auditor' AND "taskType" = 'native_verification'
+           ORDER BY "createdAt", "id"`, [canonical.sessionId, canonical.turnId])
+        const accepted = controls.rows.find(row => {
+          const control = parseNativeVerificationControl(row.expectedOutputSchema)
+          return control?.target.kind === "root_goal" && control.target.candidateDigest === digestNativeVerificationValue(acceptedCandidate)
+        })
+        const wait = accepted && await pool!.query<{ status: string }>(
+          `SELECT "status" FROM "agent_wait_conditions" WHERE "sessionId" = $1 AND "turnId" = $2
+            AND "status" = 'waiting' AND "targetTaskIds" @> jsonb_build_array($3::text) ORDER BY "createdAt" DESC LIMIT 1`,
+          [canonical.sessionId, canonical.turnId, accepted.id])
+        return { turnStatus: turn?.status, control: accepted && { id: accepted.id, status: accepted.status }, wait: wait?.rows[0]?.status }
+      }, value => value.turnStatus === "waiting_for_dependency" && value.control?.status === "queued" && value.wait === "waiting")
+      const rootStreamsAtCandidate = rootModelStreams
+      await bootstrap.close()
+      bootstrap = await makeStack(2)
+      await waitForDatabase("canonical terminal Turn", async () => (await pool!.query<{ status: string; finalResponse: string | null }>(
+        `SELECT "status", "finalResponse" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`,
+        [canonical.turnId, canonical.sessionId])).rows[0], value => value?.status === "completed" && typeof value.finalResponse === "string")
+      expect(rootModelStreams).toBe(rootStreamsAtCandidate)
+
+      const turn = await pool!.query<{ status: string; finalResponse: string | null; rootTaskId: string | null }>(
+        `SELECT "status", "finalResponse", "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`,
+        [canonical.turnId, canonical.sessionId])
+      const rootTaskId = turn.rows[0]?.rootTaskId
+      const finalItem = await pool!.query<{ content: unknown }>(
+        `SELECT "content" FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+          AND "type" = 'agent_message' AND "phase" = 'final_answer' AND "status" = 'completed' ORDER BY "createdAt" DESC LIMIT 1`,
+        [canonical.sessionId, canonical.turnId, rootTaskId])
+      expect(turn.rows[0]?.status).toBe("completed")
+      expect(persistedFinalCandidate(finalItem.rows[0]?.content, turn.rows[0]?.finalResponse)).toBe(acceptedCandidate)
+      const completedEvents = await pool!.query<{ count: number }>(`SELECT COUNT(*)::int AS "count" FROM "agent_events"
+        WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'turn.completed'`, [canonical.sessionId, canonical.turnId])
+      expect(completedEvents.rows[0]?.count).toBe(1)
+
+      const taskRows = await pool!.query<{ id: string; role: string; taskType: string; goal: string; status: string; attemptCount: number; result: Record<string, unknown> | null; expectedOutputSchema: unknown }>(
+        `SELECT "id", "role", "taskType", "goal", "status", "attemptCount", "result", "expectedOutputSchema"
+         FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "createdAt", "id"`, [canonical.sessionId, canonical.turnId])
+      const target = taskRows.rows.find(row => row.role === "analyst" && row.goal === childGoal)
+      expect(target).toMatchObject({ status: "completed", attemptCount: 1 })
+      expect(JSON.stringify(target?.result)).toContain("Fact 42 is present")
+      const reports = taskRows.rows.filter(row => row.role === "auditor" && row.taskType === "native_verification").map(row => {
+        const control = parseNativeVerificationControl(row.expectedOutputSchema)
+        const result = row.result && typeof row.result === "object" ? row.result.nativeVerificationReport as Record<string, unknown> | undefined : undefined
+        return { id: row.id, status: row.status, control, report: result }
+      })
+      const passedChild = reports.find(row => row.control?.target.kind === "child" && row.control.target.taskId === target?.id)
+      const failedRejectedRoot = reports.find(row => row.control?.target.kind === "root_goal" && row.control.target.candidateDigest === digestNativeVerificationValue(rejectedCandidate))
+      const passedAcceptedRoot = reports.find(row => row.control?.target.kind === "root_goal" && row.control.target.candidateDigest === digestNativeVerificationValue(acceptedCandidate))
+      if (!passedChild || !failedRejectedRoot || !passedAcceptedRoot) throw new Error("canonical child/rejected-root/accepted-root controls were not all persisted")
+      expect(passedChild.report).toMatchObject({ disposition: "passed", controlTaskId: passedChild.id })
+      expect(failedRejectedRoot.report).toMatchObject({ disposition: "failed", controlTaskId: failedRejectedRoot.id })
+      expect(passedAcceptedRoot.report).toMatchObject({ disposition: "passed", controlTaskId: passedAcceptedRoot.id })
+      expect(reports.every(row => row.status === "completed")).toBe(true)
+
+      const usage = await pool!.query<{ inputTokens: string | number; outputTokens: string | number; estimatedCostUsd: string | number }>(
+        `SELECT COALESCE(SUM("inputTokens"), 0) AS "inputTokens", COALESCE(SUM("outputTokens"), 0) AS "outputTokens",
+          COALESCE(SUM("estimatedCostUsd"), 0) AS "estimatedCostUsd" FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2`,
+        [canonical.sessionId, canonical.turnId])
+      expect(Number(usage.rows[0]?.inputTokens)).toBeGreaterThan(0)
+      expect(Number(usage.rows[0]?.outputTokens)).toBeGreaterThan(0)
+      expect(Number(usage.rows[0]?.estimatedCostUsd)).toBeGreaterThan(0)
+      expect(usageAuthorizations.length).toBeGreaterThanOrEqual(6)
+      expect(usageSettlements).toHaveLength(usageAuthorizations.length)
+      const settledInputTokens = usageSettlements.reduce((sum, item) => sum + item.inputTokens, 0)
+      const settledOutputTokens = usageSettlements.reduce((sum, item) => sum + item.outputTokens, 0)
+      const settledCost = usageSettlements.reduce((sum, item) => sum + item.estimatedCostUsd, 0)
+      expect(settledInputTokens).toBeGreaterThan(0)
+      expect(settledOutputTokens).toBeGreaterThan(0)
+      expect(Number(usage.rows[0]?.inputTokens)).toBe(settledInputTokens)
+      expect(Number(usage.rows[0]?.outputTokens)).toBe(settledOutputTokens)
+      expect(Number(usage.rows[0]?.estimatedCostUsd)).toBeCloseTo(settledCost, 6)
+      const reservations = await pool!.query<{ status: string; taskId: string }>(
+        `SELECT "status", "taskId" FROM "agent_tree_budget_reservations" WHERE "sessionId" = $1 AND "turnId" = $2`,
+        [canonical.sessionId, canonical.turnId])
+      expect(reservations.rows.length).toBeGreaterThanOrEqual(3)
+      expect(reservations.rows.every(row => row.status === "consumed")).toBe(true)
+      expect(reservations.rows.some(row => row.taskId === passedChild?.control?.controlTaskId)).toBe(true)
+      expect(reservations.rows.some(row => row.taskId === passedAcceptedRoot?.id)).toBe(true)
+
+      const [items, events, turnInput] = await Promise.all([
+        pool!.query<{ content: unknown }>(`SELECT "content" FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2`, [canonical.sessionId, canonical.turnId]),
+        pool!.query<{ payload: unknown }>(`SELECT "payload" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2`, [canonical.sessionId, canonical.turnId]),
+        pool!.query<{ input: unknown }>(`SELECT "input" FROM "agent_turns" WHERE "id" = $1`, [canonical.turnId]),
+      ])
+      const publicText = JSON.stringify({ items: items.rows, events: events.rows, input: turnInput.rows[0]?.input })
+      expect(publicText).not.toContain(NATIVE_VERIFICATION_PACKET_CONTEXT_KEY)
+      expect(publicText).not.toContain(NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA)
+    } finally {
+      await bootstrap?.close().catch(() => undefined)
+      await closePool().catch(() => undefined)
+      if (previousDatabaseUrl === undefined) delete process.env.DATABASE_URL
+      else process.env.DATABASE_URL = previousDatabaseUrl
+      await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [canonical.sessionId]).catch(() => undefined)
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [canonical.userId]).catch(() => undefined)
+    }
+  }, 180_000)
 })
