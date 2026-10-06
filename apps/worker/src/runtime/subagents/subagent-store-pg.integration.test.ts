@@ -435,6 +435,11 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
     expect(await ownerAStore.get(treeA!.taskId, treeAOther!.sessionId)).toBeNull()
     await expect(ownerAStore.claim({ taskId: treeA!.taskId, sessionId: treeAOther!.sessionId, ownerId: "wrong-session-worker", policy, now: new Date() })).resolves.toBeNull()
     await expect(ownerAStore.claim({ taskId: fenceTree!.mismatchTurnTaskId!, sessionId: fenceTree!.sessionId, ownerId: "wrong-turn-worker", policy, now: new Date() })).resolves.toBeNull()
+    const mismatchedTurn = await adminPool!.query<{ status: string; attemptCount: number; leaseOwner: string | null; leaseExpiresAt: Date | null }>(
+      `SELECT "status", "attemptCount", "leaseOwner", "leaseExpiresAt" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`,
+      [fenceTree!.mismatchTurnTaskId, fenceTree!.sessionId],
+    )
+    expect(mismatchedTurn.rows[0]).toMatchObject({ status: "queued", attemptCount: 0, leaseOwner: null, leaseExpiresAt: null })
     await expect(ownerBStore.get(fenceTree!.taskId, fenceTree!.sessionId)).resolves.toBeNull()
     await expect(ownerBStore.claim({ taskId: fenceTree!.taskId, sessionId: fenceTree!.sessionId, ownerId: "foreign-owner-worker", policy, now: new Date() })).resolves.toBeNull()
 
