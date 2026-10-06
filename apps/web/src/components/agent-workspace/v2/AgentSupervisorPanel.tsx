@@ -5,12 +5,12 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useApi } from '@/lib/hooks'
 import { useI18n } from '@/lib/i18n'
 
-import { flattenTaskTree, TaskTreePanel } from './TaskTreePanel'
+import { flattenTaskTree, taskInterruptEventVersion, TaskInterruptControl, TaskTreePanel } from './TaskTreePanel'
 import { AgentTurnRetryControl } from './AgentTurnRetryControl'
 import { CognitiveAgendaCard, type CognitiveAgendaTaskLabel } from './cognitive-agenda-card'
 import { AgentApprovalLedgerCard } from './AgentApprovalLedgerCard'
 import { AgentQuestionInputCard } from './AgentQuestionInputCard'
-import { projectSupervisorTree, type SupervisorTaskSummary, type SupervisorTurnSummary } from './task-tree-projection'
+import { projectSelectedTaskInterrupt, projectSupervisorTree, type SupervisorTaskSummary, type SupervisorTurnSummary } from './task-tree-projection'
 import { TaskGraphPlanPanel } from './TaskGraphPlanPanel'
 import { buildTaskGraphTaskLookupUrl, selectedJobIdForTurn, selectedJobPreparationTurnId, selectedTaskGraphIdentity } from './task-graph-plan-query'
 import type { AgentTimelineSnapshot } from './use-agent-timeline'
@@ -139,6 +139,8 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
     root: !task.parentTaskId,
   }])), [tasks])
   const selectedNode = useMemo(() => flattenTaskTree(nodes).find(node => node.id === selectedId), [nodes, selectedId])
+  const selectedTaskInterrupt = projectSelectedTaskInterrupt(tasks, turns, selectedNode, timeline.items)
+  const selectedTaskInterruptVersion = selectedTaskInterrupt ? taskInterruptEventVersion(timeline.items, selectedTaskInterrupt.task.id) : null
   const selectedTurn = useMemo(() => selectedNode?.kind === 'turn' && selectedNode.id.startsWith('turn:')
     ? turns.find(turn => `turn:${turn.id}` === selectedNode.id) ?? null
     : null, [selectedNode, turns])
@@ -223,6 +225,7 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
             turn={selectedTurn}
             onAccepted={refetchSupervisorRecords}
           />
+          {selectedTaskInterrupt && <TaskInterruptControl sessionId={sessionId} taskId={selectedTaskInterrupt.task.id} taskLabel={selectedNode.label} eligible={selectedTaskInterrupt.eligible} status={selectedTaskInterrupt.status} statusVersion={selectedTaskInterruptVersion} onAccepted={refetchSupervisorRecords} />}
         </section>
       )}
     </aside>
