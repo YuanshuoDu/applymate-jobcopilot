@@ -1,6 +1,6 @@
 import { TurnEngineError, type TurnEngineStep } from "./turn-engine-types.js"
 import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
-import type { TurnExecutionOptions } from "./turn-execution-types.js"
+import { NATIVE_SEMANTIC_NO_PROGRESS, type TurnExecutionOptions } from "./turn-execution-types.js"
 import type pg from "pg"
 import type { TurnLease } from "./lease.js"
 import { isSessionPauseRequestedError } from "../session-gate.js"
@@ -159,7 +159,7 @@ export async function checkTaskGraphTerminalVerification(client: pg.PoolClient, 
   } catch { return deny() }
 }
 
-export async function assertCompletionAllowed(options: CompletionGateOptions, writer: CompletionGateWriter, step: TurnEngineStep, signal: AbortSignal, now: () => Date, candidateText: string): Promise<{ feedback: string } | { waitId: string } | undefined> {
+export async function assertCompletionAllowed(options: CompletionGateOptions, writer: CompletionGateWriter, step: TurnEngineStep, signal: AbortSignal, now: () => Date, candidateText: string): Promise<{ feedback: string; readonly [NATIVE_SEMANTIC_NO_PROGRESS]?: true } | { waitId: string } | undefined> {
   if (!options.completionGate) return undefined
   let decision: Awaited<ReturnType<NonNullable<TurnExecutionOptions["completionGate"]>>>
   try {
@@ -169,7 +169,14 @@ export async function assertCompletionAllowed(options: CompletionGateOptions, wr
     throw new TurnEngineError("invalid_output", "Completion gate failed closed")
   }
   if (!decision || typeof decision !== "object" || typeof decision.ok !== "boolean") throw new TurnEngineError("invalid_output", "Completion gate returned an invalid decision")
-  if (decision.ok) return undefined
+  if (decision.ok) {
+    if (Object.hasOwn(decision, NATIVE_SEMANTIC_NO_PROGRESS)) throw new TurnEngineError("invalid_output", "Completion gate returned an invalid semantic progress signal")
+    return undefined
+  }
+  const stopForSemanticNoProgress = decision[NATIVE_SEMANTIC_NO_PROGRESS]
+  if (stopForSemanticNoProgress !== undefined && (stopForSemanticNoProgress !== true || decision.blocker !== TASK_GRAPH_VERIFICATION_BLOCKER)) {
+    throw new TurnEngineError("invalid_output", "Completion gate returned an invalid semantic progress signal")
+  }
   if (typeof decision.blocker !== "string" || typeof decision.feedback !== "string" || decision.blocker.length === 0 || decision.blocker.length > 256 || decision.feedback.length > 512) {
     throw new TurnEngineError("invalid_output", "Completion gate returned an invalid blocker")
   }
@@ -181,7 +188,9 @@ export async function assertCompletionAllowed(options: CompletionGateOptions, wr
   }
   if (decision.blocker === NATIVE_VERIFICATION_PENDING_BLOCKER) throw new TurnEngineError("invalid_output", "Completion gate omitted a durable wait receipt")
   await writer.append("final.rejected", step.id, null, { code: "business_precondition_failed", blocker: decision.blocker, feedback: decision.feedback, taskId: options.identity.taskId }, `final-rejected:${step.id}`)
-  if (decision.blocker === TASK_GRAPH_VERIFICATION_BLOCKER) return { feedback: decision.feedback }
+  if (decision.blocker === TASK_GRAPH_VERIFICATION_BLOCKER) return {
+    feedback: decision.feedback, ...(stopForSemanticNoProgress ? { [NATIVE_SEMANTIC_NO_PROGRESS]: true as const } : {}),
+  }
   throw new TurnEngineError("business_precondition_failed", decision.blocker)
 }
 

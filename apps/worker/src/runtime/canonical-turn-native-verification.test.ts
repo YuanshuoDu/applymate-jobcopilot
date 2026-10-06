@@ -3,6 +3,7 @@ import { digestNativeVerificationValue } from "./subagents/native-verification-c
 import type { NativeVerificationPort } from "./subagents/native-verification-port.js"
 import type { TaskGraphExecutionScope } from "./subagents/task-graph-command-port.js"
 import type { DurableWaitResult } from "./tools/coordination-types.js"
+import { NATIVE_SEMANTIC_NO_PROGRESS } from "./turns/turn-execution-types.js"
 import { nativeVerificationCompletionGate, verifyNativeRootCandidate } from "./canonical-turn-native-verification.js"
 
 const scope: TaskGraphExecutionScope = {
@@ -18,6 +19,14 @@ function rootPassed(text = candidateText) {
     candidateDigest: digestNativeVerificationValue(text), childBindingSetDigest: sha, goalDigest: sha,
     criteriaDigest: sha, evidencePacketDigest: sha, reportDigest: sha,
   } }
+}
+function rootFailed(input: Readonly<{ controlTaskId?: string; targetTaskId?: string; disposition?: "failed" | "uncertain"; criterionDisposition?: "failed" | "uncertain" }> = {}) {
+  const controlTaskId = input.controlTaskId ?? "owned-root-control"
+  return {
+    status: "failed" as const, controlTaskIds: [controlTaskId], pendingControlTaskIds: [], pendingTaskIds: [],
+    feedback: [{ controlTaskId, targetTaskId: input.targetTaskId ?? "root-1", disposition: input.disposition ?? "failed",
+      criteria: [{ criterionId: "owned-evidence", disposition: input.criterionDisposition ?? "failed", reasonCode: "evidence_missing" as const, evidenceReferenceIds: [] }] }],
+  }
 }
 const waitResult: DurableWaitResult = { waitId: "wait-1", status: "waiting", deadlineAt: "2099-01-01T00:00:00.000Z", matchedTaskIds: [] }
 
@@ -113,5 +122,41 @@ describe("nativeVerificationCompletionGate", () => {
       wait: vi.fn(), accept: vi.fn(),
     })).resolves.toEqual(receipt)
     expect(port.ensureChildren).not.toHaveBeenCalled()
+  })
+
+  it("signals only one strictly parsed failed root criterion tied to an owned root control", async () => {
+    const port: NativeVerificationPort = {
+      ensureChildren: vi.fn(async () => passed), ensureRootGoal: vi.fn(async () => rootFailed()), readRecoverableGoal: vi.fn(async () => null),
+    }
+    const observe = vi.fn(() => true)
+    const result = await nativeVerificationCompletionGate({ candidateText, scope, port, hasNativeTasks: async () => true,
+      checkReceipt: async () => null, wait: vi.fn(), accept: vi.fn(), observeRootSemanticRejection: observe })
+    if (!result || result.ok) throw new Error("expected a rejected native verification decision")
+    expect(result[NATIVE_SEMANTIC_NO_PROGRESS]).toBe(true)
+    expect(result.feedback).toContain("criterion=owned-evidence status=failed reason=evidence_missing")
+    expect(result.feedback).toContain("Revise the candidate or obtain new current owned evidence")
+    expect(JSON.stringify(result)).not.toContain("owned-root-control")
+    expect(observe).toHaveBeenCalledWith("owned-root-control")
+  })
+
+  it("does not count foreign, duplicate, uncertain, or control-unowned root feedback", async () => {
+    const valid = rootFailed().feedback[0]!
+    const cases = [
+      { ...rootFailed({ targetTaskId: "child-1" }), controlTaskIds: ["owned-root-control"] },
+      { ...rootFailed(), feedback: [valid, valid] },
+      rootFailed({ disposition: "uncertain" }),
+      rootFailed({ criterionDisposition: "uncertain" }),
+      { ...rootFailed(), controlTaskIds: ["different-owned-control"] },
+    ]
+    for (const result of cases) {
+      const port: NativeVerificationPort = {
+        ensureChildren: vi.fn(async () => passed), ensureRootGoal: vi.fn(async () => result), readRecoverableGoal: vi.fn(async () => null),
+      }
+      const observe = vi.fn(() => true)
+      const decision = await nativeVerificationCompletionGate({ candidateText, scope, port, hasNativeTasks: async () => true,
+        checkReceipt: async () => null, wait: vi.fn(), accept: vi.fn(), observeRootSemanticRejection: observe })
+      expect(decision && !decision.ok ? decision[NATIVE_SEMANTIC_NO_PROGRESS] : undefined).toBeUndefined()
+      expect(observe).not.toHaveBeenCalled()
+    }
   })
 })
