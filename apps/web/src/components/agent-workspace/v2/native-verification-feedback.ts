@@ -17,6 +17,10 @@ const REASONS: readonly FeedbackReason[] = ['meets_criterion', 'does_not_meet_cr
 const WAIT_STATUSES = ['waiting', 'ready', 'timed_out', 'interrupted', 'closed'] as const
 const SUBAGENT_RESULT_FIELDS = ['finalItemId', 'finalText', FEEDBACK_KEY, 'status', 'stepCount', 'structuredResult', 'toolCallCount'] as const
 const SUBAGENT_RESULT_SCHEMA = 'agent-harness.v2.subagent.result'
+const ROLE_FIELDS = { scout: ['schemaVersion', 'role', 'status', 'candidates', 'evidence', 'summary'], analyst: ['schemaVersion', 'role', 'status', 'findings', 'evidence', 'summary'], writer: ['schemaVersion', 'role', 'status', 'artifactRef'], reviewer: ['schemaVersion', 'role', 'status', 'artifactRef', 'reviewStatus', 'reviewHash'] } as const
+const EVIDENCE_FIELDS = ['id', 'kind', 'ref', 'source'] as const, CANDIDATE_FIELDS = ['jobId', 'source', 'url', 'evidenceIds'] as const, FINDING_FIELDS = ['jobId', 'score', 'evidenceIds'] as const, ARTIFACT_FIELDS = ['artifactId', 'version', 'contentHash', 'sourceDigest'] as const
+const EVIDENCE_KINDS = new Set<unknown>(['job', 'persona', 'resume', 'source']), REVIEW_STATUSES = ['passed', 'needs_revision', 'rejected', 'stale'] as const
+const SHA256 = /^sha256:[a-f0-9]{64}$/
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 
 type Slot = { readonly found: false } | { readonly found: true; readonly value: unknown }
@@ -104,11 +108,59 @@ function isCanonicalCompletedSubagentResult(value: Record<string, unknown>): boo
     || !Number.isSafeInteger(envelope.toolCallCount) || Number(envelope.toolCallCount) < 0
     || (envelope.finalItemId !== null && typeof envelope.finalItemId !== 'string')
     || typeof envelope.finalText !== 'string') return false
-  const structuredResult = record(envelope.structuredResult)
-  if (!structuredResult) return false
-  const schemaVersion = own(structuredResult, 'schemaVersion')
-  return schemaVersion.found && schemaVersion.value === SUBAGENT_RESULT_SCHEMA
+  return isRoleResult(envelope.structuredResult)
 }
+
+function isRoleResult(value: unknown): boolean {
+  const root = record(value); if (!root) return false
+  const schema = own(root, 'schemaVersion'), role = own(root, 'role')
+  if (!schema.found || schema.value !== SUBAGENT_RESULT_SCHEMA || !role.found) return false
+  return role.value === 'scout' || role.value === 'analyst' ? isListRoleResult(root, role.value)
+    : role.value === 'writer' || role.value === 'reviewer' ? isArtifactRoleResult(root, role.value) : false
+}
+function isListRoleResult(value: Record<string, unknown>, role: 'scout' | 'analyst'): boolean {
+  const result = exactRecord(value, ROLE_FIELDS[role])
+  if (!result || result.schemaVersion !== SUBAGENT_RESULT_SCHEMA || result.role !== role || (result.status !== 'completed' && result.status !== 'partial') || typeof result.summary !== 'string') return false
+  const evidence = parseRoleEvidence(result.evidence)
+  return Boolean(evidence && isRoleItemsValid(role, result[role === 'scout' ? 'candidates' : 'findings'], evidence))
+}
+function parseRoleEvidence(value: unknown): Record<string, unknown>[] | null {
+  if (!denseArray(value, Number.MAX_SAFE_INTEGER, 0)) return null
+  const rows: Record<string, unknown>[] = [], ids = new Set<string>()
+  for (const raw of value) {
+    const row = exactRecord(raw, EVIDENCE_FIELDS)
+    if (!row || !nonEmpty(row.id) || !nonEmpty(row.ref) || !nonEmpty(row.source)
+      || !EVIDENCE_KINDS.has(row.kind) || ids.has(row.id)) return null
+    ids.add(row.id); rows.push(row)
+  }
+  return rows
+}
+function isRoleItemsValid(role: 'scout' | 'analyst', value: unknown, evidence: readonly Record<string, unknown>[]): boolean {
+  if (!denseArray(value, Number.MAX_SAFE_INTEGER, 0)) return false
+  for (const raw of value) {
+    const item = exactRecord(raw, role === 'scout' ? CANDIDATE_FIELDS : FINDING_FIELDS)
+    if (!item || !nonEmpty(item.jobId) || (role === 'scout'
+      ? !nonEmpty(item.source) || (item.url !== null && !nonEmpty(item.url))
+      : typeof item.score !== 'number' || !Number.isFinite(item.score) || item.score < 0 || item.score > 10)) return false
+    const ids = item.evidenceIds
+    if (!denseArray(ids, Number.MAX_SAFE_INTEGER) || !ids.every(nonEmpty)
+      || !ids.every(id => evidence.some(row => row.id === id))
+      || !ids.some(id => evidence.some(row => row.id === id && row.kind === 'job' && row.ref === item.jobId))) return false
+  }
+  return true
+}
+function isArtifactRoleResult(value: Record<string, unknown>, role: 'writer' | 'reviewer'): boolean {
+  const result = exactRecord(value, ROLE_FIELDS[role])
+  const artifact = result && exactRecord(result.artifactRef, ARTIFACT_FIELDS)
+  if (!result || !artifact || result.schemaVersion !== SUBAGENT_RESULT_SCHEMA || result.role !== role || result.status !== 'completed'
+    || typeof artifact.artifactId !== 'string' || !IDENTIFIER.test(artifact.artifactId)
+    || !Number.isSafeInteger(artifact.version) || Number(artifact.version) < 1
+    || typeof artifact.contentHash !== 'string' || !SHA256.test(artifact.contentHash)
+    || typeof artifact.sourceDigest !== 'string' || !SHA256.test(artifact.sourceDigest)) return false
+  return role === 'writer' || (REVIEW_STATUSES as readonly unknown[]).includes(result.reviewStatus)
+    && typeof result.reviewHash === 'string' && SHA256.test(result.reviewHash)
+}
+function nonEmpty(value: unknown): value is string { return typeof value === 'string' && value.trim().length > 0 }
 
 function parseFeedback(value: unknown): FeedbackGroup | null {
   const feedback = exactRecord(value, FEEDBACK_FIELDS)

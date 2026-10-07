@@ -36,7 +36,7 @@ describe('HarnessItem renderers', () => {
     const feedback = { disposition: 'failed', criteria: [{ criterionId: 'criterion-1', disposition: 'failed', reasonCode: 'does_not_meet_criterion', evidenceReferenceIds: ['private-reference'] }] }
     const output = { result: {
       status: 'completed', stepCount: 2, toolCallCount: 1, finalItemId: 'private-item', finalText: 'private final text',
-      structuredResult: { schemaVersion: 'agent-harness.v2.subagent.result', role: 'analyst', findings: [], evidence: [] },
+      structuredResult: { schemaVersion: 'agent-harness.v2.subagent.result', role: 'analyst', status: 'completed', findings: [], evidence: [], summary: 'no findings' },
       nativeVerificationFeedback: feedback,
     } }
     const html = renderToStaticMarkup(<I18nProvider><HarnessItem item={item({ type: 'tool_result', status: 'completed', content: { toolName: 'agent.followup', outputSummary: 'clipped summary', output } })} /></I18nProvider>)

@@ -13,7 +13,7 @@ function feedback(overrides: Record<string, unknown> = {}) {
 function canonicalEnvelope(feedbackValue: unknown = feedback(), overrides: Record<string, unknown> = {}) {
   return {
     status: 'completed', stepCount: 2, toolCallCount: 1, finalItemId: 'private-item', finalText: 'private text',
-    structuredResult: { schemaVersion: 'agent-harness.v2.subagent.result', role: 'analyst', findings: [], evidence: [] },
+    structuredResult: { schemaVersion: 'agent-harness.v2.subagent.result', role: 'analyst', status: 'completed', findings: [], evidence: [], summary: 'one finding' },
     nativeVerificationFeedback: feedbackValue,
     ...overrides,
   }
@@ -44,6 +44,29 @@ describe('native verification feedback projection', () => {
     ]
     for (const result of invalid) expect(viewOf({ result })).toEqual({ state: 'unavailable' })
     expect(viewOf({ result: canonicalEnvelope() })).toMatchObject({ state: 'available' })
+  })
+
+  it('validates the role-specific Worker result before accepting nested feedback', () => {
+    const schemaVersion = 'agent-harness.v2.subagent.result'
+    const artifactRef = { artifactId: 'artifact-1', version: 2, contentHash: `sha256:${'a'.repeat(64)}`, sourceDigest: `sha256:${'b'.repeat(64)}` }
+    const validResults = [
+      { schemaVersion, role: 'scout', status: 'completed', candidates: [{ jobId: 'job-1', source: 'greenhouse', url: null, evidenceIds: ['ev-job-1'] }], evidence: [{ id: 'ev-job-1', kind: 'job', ref: 'job-1', source: 'greenhouse' }], summary: 'one candidate' },
+      { schemaVersion, role: 'writer', status: 'completed', artifactRef },
+      { schemaVersion, role: 'reviewer', status: 'completed', artifactRef, reviewStatus: 'passed', reviewHash: `sha256:${'c'.repeat(64)}` },
+    ]
+    for (const structuredResult of validResults) expect(viewOf({ result: canonicalEnvelope(feedback(), { structuredResult }) }).state).toBe('available')
+
+    const invalidResults = [
+      { schemaVersion, status: 'completed', findings: [], evidence: [], summary: 'missing role' },
+      { schemaVersion, role: 'analyst', status: 'completed', evidence: [], summary: 'missing findings' },
+      { schemaVersion, role: 'analyst', status: 'completed', candidates: [], evidence: [], summary: 'wrong role payload' },
+      { schemaVersion, role: 'analyst', status: 'completed', findings: [{ jobId: 'job-1', score: 11, evidenceIds: ['ev-job-1'] }], evidence: [{ id: 'ev-job-1', kind: 'job', ref: 'job-1', source: 'greenhouse' }], summary: 'invalid score' },
+      { schemaVersion, role: 'scout', status: 'completed', candidates: [{ jobId: 'job-1', source: 'greenhouse', url: null, evidenceIds: ['ev-job-1'] }], evidence: [{ id: 'ev-job-1', kind: 'job', ref: 'job-other', source: 'greenhouse' }], summary: 'unmatched job evidence' },
+      { schemaVersion, role: 'writer', status: 'completed', artifactRef: { ...artifactRef, contentHash: 'unbound' } },
+      { schemaVersion, role: 'reviewer', status: 'completed', artifactRef, reviewStatus: 'passed', reviewHash: 'unbound' },
+      { schemaVersion, role: 'reviewer', status: 'completed', artifactRef, reviewStatus: 'unknown', reviewHash: `sha256:${'c'.repeat(64)}` },
+    ]
+    for (const structuredResult of invalidResults) expect(viewOf({ result: canonicalEnvelope(feedback(), { structuredResult }) })).toEqual({ state: 'unavailable' })
   })
 
   it('accepts passed feedback after public reference filtering leaves no references', () => {
