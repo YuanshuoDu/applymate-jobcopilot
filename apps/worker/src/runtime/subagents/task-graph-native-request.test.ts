@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import type { TaskGraphNativeCommandInput } from "./task-graph-native-command.js"
+import type { TaskGraphNativeCommandInput } from "./task-graph-command-port.js"
 import { normalizeNativeCommand } from "./task-graph-native-request.js"
 
 const scope: TaskGraphNativeCommandInput["scope"] = {
@@ -45,6 +45,60 @@ describe("native TaskGraph request normalization", () => {
     }
     expect(normalizeNativeCommand(base).requestFingerprint)
       .not.toBe(normalizeNativeCommand(changed).requestFingerprint)
+  })
+
+  it("fingerprints explicit unstarted replacement mode and revision while keeping legacy follow-up shape unchanged", () => {
+    const legacy = normalizeNativeCommand({
+      scope, request: { kind: "followup", idempotencyKey: "replace-source", sourceTaskId: "source", goal: "Continue" },
+    })
+    const replacementInput = {
+      scope,
+      request: {
+        kind: "followup" as const, idempotencyKey: "replace-source", sourceTaskId: "source", goal: "Continue",
+        mode: "replace_unstarted" as const, expectedRevision: 0,
+      },
+    }
+    const replacement = normalizeNativeCommand(replacementInput)
+    const staleRevision = normalizeNativeCommand({
+      ...replacementInput, request: { ...replacementInput.request, expectedRevision: 1 },
+    })
+
+    expect(legacy.request).not.toHaveProperty("mode")
+    expect(legacy.request).not.toHaveProperty("expectedRevision")
+    expect(replacement.request).toMatchObject({ mode: "replace_unstarted", expectedRevision: 0 })
+    expect(replacement.operationId).toBe(legacy.operationId)
+    expect(replacement.eventIdempotencyKey).toBe(legacy.eventIdempotencyKey)
+    expect(replacement.requestFingerprint).not.toBe(legacy.requestFingerprint)
+    expect(staleRevision.requestFingerprint).not.toBe(replacement.requestFingerprint)
+  })
+
+  it.each([
+    { mode: "replace_unstarted" },
+    { expectedRevision: 0 },
+    { mode: "replace_unstarted", expectedRevision: -1 },
+    { mode: "replace_unstarted", expectedRevision: 2_147_483_645 },
+    { mode: "other", expectedRevision: 0 },
+    { mode: "replace_unstarted", expectedRevision: 0, constraints: ["untrusted override"] },
+    { mode: "replace_unstarted", expectedRevision: 0, successCriteria: ["untrusted override"] },
+  ])("rejects malformed native replacement discriminators %#", replacement => {
+    const input = {
+      scope,
+      request: { kind: "followup" as const, idempotencyKey: "replace-invalid", sourceTaskId: "source", goal: "Continue", ...replacement },
+    }
+    expect(() => normalizeNativeCommand(input as unknown as TaskGraphNativeCommandInput))
+      .toThrow("task_graph_native_input_invalid")
+  })
+
+  it("does not normalize caller-supplied replacement ownership or policy fields", () => {
+    const input = {
+      scope,
+      request: {
+        kind: "followup" as const, idempotencyKey: "replace-forged", sourceTaskId: "source", goal: "Continue",
+        mode: "replace_unstarted" as const, expectedRevision: 0, rootTaskId: "forged-root",
+      },
+    }
+    expect(() => normalizeNativeCommand(input as unknown as TaskGraphNativeCommandInput))
+      .toThrow("task_graph_native_input_invalid")
   })
 
   it("rejects unsupported marker contracts and non-JSON caller context instead of silently dropping fields", () => {

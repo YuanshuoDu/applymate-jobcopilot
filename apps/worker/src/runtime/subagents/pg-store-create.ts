@@ -38,6 +38,7 @@ export async function createSubagentTask(
   client: Queryable,
   input: SubagentTaskSpec & { policy: SubagentPolicy },
   sessionLocked = false,
+  options: { preserveEmptyAllowedActions?: boolean } = {},
 ): Promise<SubagentTaskRecord> {
   if (!sessionLocked) await lockSubagentSession(client, input)
   if (input.turnId) await lockSubagentTurnForWork(client, { sessionId: input.sessionId, userId: input.userId, turnId: input.turnId })
@@ -82,7 +83,7 @@ export async function createSubagentTask(
   const parentActions = parentRow ? actionList(parentRow.allowedActions) : []
   const requestedActions = actionList(input.allowedActions)
   if (parentRow && requestedActions.some(action => !parentActions.includes(action))) throw new Error("Child allowed actions exceed parent policy")
-  const allowedActions = parentRow && requestedActions.length === 0 ? parentActions : requestedActions
+  const allowedActions = parentRow && requestedActions.length === 0 && !options.preserveEmptyAllowedActions ? parentActions : requestedActions
   const result = await client.query(`${INSERT_TASK} RETURNING "id"`, [
     id, input.sessionId, input.turnId ?? null, rootTaskId, input.parentTaskId ?? null, path, depth,
     input.role, input.taskType, input.goal, json(input.constraints, []), json(input.successCriteria, []),
