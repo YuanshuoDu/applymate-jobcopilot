@@ -831,7 +831,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     expect(keep).toEqual({ decision: "keep", revision: 1, reconciledInputCount: 1 })
     const receipts = await adminPool!.query<{ id: string; type: string; payload: unknown }>(`SELECT "id", "type", "payload" FROM "agent_events"
       WHERE "sessionId" = $1 AND "type" = $2 ORDER BY "sequence"`, [value.sessionId, STEERING_RECONCILIATION_EVENT_TYPE])
-    expect(receipts).toHaveLength(2)
+    expect(receipts.rows).toHaveLength(2)
     expect((receipts.rows[1]!.payload as { steerInputIds?: string[] }).steerInputIds).toEqual([value.secondSteerInputId])
     expect((await adminPool!.query(`SELECT "id" FROM "agent_outbox" WHERE "idempotencyKey" = ANY($1::text[])`, [
       receipts.rows.map(row => `agent-event:${row.id}`),
