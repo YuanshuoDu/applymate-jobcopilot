@@ -1,8 +1,13 @@
 import { describe, expect, it, vi } from "vitest"
 
+const bullMqMocks = vi.hoisted(() => ({ queueConstructor: vi.fn(), workerConstructor: vi.fn() }))
+vi.mock("bullmq", async importOriginal => {
+  const actual = await importOriginal<typeof import("bullmq")>()
+  return { ...actual, Queue: bullMqMocks.queueConstructor, Worker: bullMqMocks.workerConstructor }
+})
 vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnect: vi.fn() })) }))
 
-import { markTurnDispatchClaimed, runTurnJob, TurnExecutionRegistry, type TurnExecutionResult } from "./turn-queue.js"
+import { createTurnQueue, markTurnDispatchClaimed, runTurnJob, TurnExecutionRegistry, type TurnExecutionResult } from "./turn-queue.js"
 import type { TurnLease } from "./lease.js"
 import { RootAbortControllerRegistry } from "../interrupt/registry.js"
 import { COGNITIVE_AGENDA_RESUME_FENCE_INVALID } from "./dlq.js"
@@ -13,6 +18,36 @@ const lease: TurnLease = {
   turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1", userId: "user_1", leaseVersion: 1,
   leaseStartedAt: new Date("2026-09-01T00:00:00.000Z"), leaseExpiresAt: new Date("2026-09-01T00:01:00.000Z"),
 }
+
+describe("Turn queue worker polling", () => {
+  it("uses the canonical Turn fallback while preserving a valid explicit override", async () => {
+    const priorStalledInterval = process.env.BULLMQ_STALLED_INTERVAL_MS
+    const priorDrainDelay = process.env.BULLMQ_DRAIN_DELAY_SECONDS
+    bullMqMocks.queueConstructor.mockImplementation(() => ({
+      add: vi.fn(), getJob: vi.fn().mockResolvedValue(undefined), close: vi.fn(),
+    }))
+    bullMqMocks.workerConstructor.mockImplementation(() => ({ close: vi.fn() }))
+    try {
+      delete process.env.BULLMQ_STALLED_INTERVAL_MS
+      delete process.env.BULLMQ_DRAIN_DELAY_SECONDS
+      const defaultTurn = createTurnQueue({ pool: {} as never, execute: vi.fn() })
+      expect(bullMqMocks.workerConstructor.mock.calls.at(-1)?.[2]).toMatchObject({ drainDelay: 10, stalledInterval: 30_000 })
+      await defaultTurn.close()
+
+      process.env.BULLMQ_STALLED_INTERVAL_MS = "180000"
+      const overriddenTurn = createTurnQueue({ pool: {} as never, execute: vi.fn() })
+      expect(bullMqMocks.workerConstructor.mock.calls.at(-1)?.[2]).toMatchObject({ drainDelay: 10, stalledInterval: 180_000 })
+      await overriddenTurn.close()
+    } finally {
+      if (priorStalledInterval === undefined) delete process.env.BULLMQ_STALLED_INTERVAL_MS
+      else process.env.BULLMQ_STALLED_INTERVAL_MS = priorStalledInterval
+      if (priorDrainDelay === undefined) delete process.env.BULLMQ_DRAIN_DELAY_SECONDS
+      else process.env.BULLMQ_DRAIN_DELAY_SECONDS = priorDrainDelay
+      bullMqMocks.queueConstructor.mockReset()
+      bullMqMocks.workerConstructor.mockReset()
+    }
+  })
+})
 
 function pool() {
   const calls: string[] = []
