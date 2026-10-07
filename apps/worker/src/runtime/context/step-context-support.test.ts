@@ -3,7 +3,7 @@ import type { InputContentPart, TenantScope } from "@jobcopilot/agent-protocol"
 
 import type { ContextBlock, ContextOwnerFence } from "./step-context-builder.js"
 import type { StepCheckpoint, StoredAgentInput } from "./input-claim-store.js"
-import { checkpointWithInputs, pendingInputBlocks, rootInputTextMatchesGoal } from "./step-context-support.js"
+import { checkpointWithInputs, mergeRootContextInput, pendingInputBlocks, rootInputTextMatchesGoal } from "./step-context-support.js"
 
 const now = new Date("2026-09-01T00:00:00.000Z")
 const scope: TenantScope = { userId: "user-1" }
@@ -34,6 +34,13 @@ describe("step context support", () => {
     expect(blocks).toHaveLength(2)
     expect(blocks[0]?.content).toMatchObject({ inputId: "input-1", text: "Dublin" })
     expect(blocks[1]?.content).toMatchObject({ attachmentId: "resume-1", filename: "safe.pdf" })
+  })
+
+  it("deduplicates the read-only root by input ID and renders in sequence order", () => {
+    const root = input("root", 4n, [{ type: "text", text: "reference" }])
+    const other = input("other", 5n, [{ type: "text", text: "later steering" }])
+    expect(mergeRootContextInput([other, root], { ...root, content: [{ type: "text", text: "reloaded reference" }] })).toEqual([{ ...root, content: [{ type: "text", text: "reloaded reference" }] }, other])
+    expect(mergeRootContextInput([other], null)).toEqual([other])
   })
 
   it("retains the cursor while adding only new checkpoint IDs in sequence order", () => {
