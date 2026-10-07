@@ -15,7 +15,7 @@ import {
 import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.js"
 import type { NativeVerificationRootGoalWitness, NativeVerificationTerminalProofReader } from "./native-verification-port.js"
 import type { TaskGraphReadScope } from "./task-graph-command-port.js"
-import { appendNativeQuestionSelfAttestations } from "./native-verification-question-evidence.js"
+import { appendNativeUserSelfAttestations } from "./native-verification-user-evidence.js"
 
 type Queryable = Pick<pg.PoolClient, "query">
 export type NativeVerificationControlProof = Readonly<{
@@ -122,7 +122,7 @@ function sameWitness(left: NativeVerificationRootGoalWitness, right: NativeVerif
 
 /** Terminal proof reader: uses the caller's client and rechecks the candidate and all owned bindings. */
 export const readNativeVerificationTerminalProofWithClient: NativeVerificationTerminalProofReader = async (client, input) => {
-  const { scope, candidateText, witness } = input
+  const { scope, candidateText, witness, stepId } = input
   if (scope.parentTaskId !== scope.rootTaskId || typeof candidateText !== "string" || candidateText.trim().length === 0
     || Buffer.byteLength(candidateText, "utf8") > 16 * 1024) return false
   let candidateDigest: string
@@ -156,7 +156,8 @@ export const readNativeVerificationTerminalProofWithClient: NativeVerificationTe
       childBindingSetDigest: item.task.control.target.childBindingSetDigest } : {}),
   })), candidateDigest, childBindingSetDigest)
   const baseContent = buildNativeRootPacketContent({ state, candidateText, childBindingSetDigest, history: rootHistory })
-  const content = baseContent && await appendNativeQuestionSelfAttestations(client, scope, baseContent)
+  const content = baseContent && await appendNativeUserSelfAttestations(client, scope, baseContent,
+    stepId === undefined ? { kind: "exact" } : { kind: "exact", stepId })
   if (!content) return false
   return nativeVerificationControlContentMatches(proof.task.packet, content)
 }

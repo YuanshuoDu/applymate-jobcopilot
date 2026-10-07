@@ -21,7 +21,7 @@ const witness: NativeVerificationRootGoalWitness = {
   criteriaDigest: "c".repeat(64), evidencePacketDigest: "d".repeat(64), reportDigest: "e".repeat(64),
 }
 const waitPort: DurableWaitPort = { wait: vi.fn(async () => { throw new Error("unexpected wait") }) }
-const terminalInput = { finalContent: { text: candidate }, response: candidate } as unknown as Parameters<TurnEngineTerminalGuard>[1]
+const terminalInput = { stepId: "step-1", finalContent: { text: candidate }, response: candidate } as unknown as Parameters<TurnEngineTerminalGuard>[1]
 
 function coordination() {
   return {
@@ -71,11 +71,24 @@ describe("canonical native verification runtime composition", () => {
     expect(port.ensureChildren).toHaveBeenCalledOnce()
     expect(port.ensureRootGoal).toHaveBeenCalledWith({ scope, candidateText: candidate })
     expect(runtime.accepted()).toBe(true)
-    const terminal = { finalContent: { text: candidate, final: { response: candidate } }, response: JSON.stringify({ response: candidate }) }
+    const terminal = { stepId: "step-terminal", finalContent: { text: candidate, final: { response: candidate } }, response: JSON.stringify({ response: candidate }) }
     await expect(runtime.checkTerminal(client, terminal)).resolves.toEqual({ nativeVerificationPassed: true })
     expect(query).toHaveBeenCalledWith(expect.stringContaining('"targetTurnId" = $3'), ["session-1", "user-1", "turn-1"])
     expect(query.mock.invocationCallOrder[0]).toBeLessThan(readTerminalProof.mock.invocationCallOrder[0]!)
-    expect(readTerminalProof).toHaveBeenCalledWith(client, { scope: readScope, candidateText: candidate, witness })
+    expect(readTerminalProof).toHaveBeenCalledWith(client, { scope: readScope, candidateText: candidate, witness, stepId: "step-terminal" })
+  })
+
+  it("keeps legacy terminal calls on exact-no-step selection instead of guessing the latest Step", async () => {
+    const readTerminalProof = vi.fn(async () => true), { factory } = runtimeFactory(readTerminalProof)
+    const runtime = createCanonicalNativeVerificationRuntime({ pool: {} as pg.Pool, factory,
+      coordination: coordination(), durableWaitPort: waitPort, enabled: true })
+    await runtime.checkCompletion("step-current", candidate)
+    const client = { query: vi.fn(async () => ({ rows: [{ hasPendingSteer: false }] })) } as unknown as Pick<PoolClient, "query">
+
+    await expect(runtime.checkTerminal(client, { finalContent: { text: candidate, final: { response: candidate } },
+      response: JSON.stringify({ response: candidate }) })).resolves.toEqual({ nativeVerificationPassed: true })
+
+    expect(readTerminalProof).toHaveBeenCalledWith(client, { scope: readScope, candidateText: candidate, witness, stepId: undefined })
   })
 
   it("wires the private progress reset hook only onto the root completion gate", () => {
