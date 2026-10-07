@@ -1,11 +1,11 @@
 import type { InputContentPart, TenantScope } from "@jobcopilot/agent-protocol"
 import type pg from "pg"
 import { createPgContextOwnerFence as createPgContextOwnerFenceImpl } from "./step-context-owner-fence.js"
-import { InputClaimStoreError, type InputClaimStore, type InputClaimTransaction, type StoredAgentInput, type TurnExecutionFence } from "./input-claim-store.js"
+import { InputClaimStoreError, type InputClaimStore, type InputClaimTransaction, type TurnExecutionFence } from "./input-claim-store.js"
 import { appendNewObservedSteeringMarkers, buildObservedSteeringMarker, type SteeringMarkerContext } from "./steering-marker-store.js"
 import type { SteeringMarkerPayload } from "./steering-marker.js"
 import { activeMarkerInputIds, assertHydratedSteeringInputs, mergeSteeringInputs } from "./steering-marker-hydration.js"
-import { checkpointWithInputs, pendingInputBlocks } from "./step-context-support.js"
+import { checkpointWithInputs, ensureTurnInputs as ensureTurnInputsImpl, mergeRootContextInput, pendingInputBlocks, rootInputTextMatchesGoal, safeTaskGraphRevision } from "./step-context-support.js"
 export type JsonValue = null | boolean | number | string | JsonValue[] | { readonly [key: string]: JsonValue }
 export type ContextTrust = "system" | "user_confirmed" | "internal_record" | "external_untrusted"
 export type ContextLayer = "system" | "profile" | "goal" | "steer_history" | "business" | "tool_observation" | "pending_input"
@@ -73,10 +73,6 @@ export class ContextOwnershipError extends Error {
     super(message)
     this.name = "ContextOwnershipError"
   }
-}
-
-function safeTaskGraphRevision(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined
 }
 
 const defaultOwnerFence: ContextOwnerFence = {
@@ -148,6 +144,7 @@ export type StepContextRequest = {
   readonly stepId: string
   readonly snapshot: StepContextSnapshot
   readonly rootInputId?: string
+  readonly rootContextInputId?: string
   readonly mode?: "new" | "retry" | "rebuild"
   readonly rebuild?: boolean
   readonly lease?: TurnExecutionFence
@@ -155,12 +152,6 @@ export type StepContextRequest = {
   readonly taskId?: string
   readonly steeringMarkerContext?: SteeringMarkerContext
   readonly steeringMarkerState?: { readonly active: readonly SteeringMarkerPayload[] }
-}
-
-function ensureTurnInputs(inputs: readonly StoredAgentInput[], request: StepContextRequest): void {
-  for (const input of inputs) if (input.sessionId !== request.sessionId || input.targetTurnId !== request.turnId || input.userId !== request.scope.userId || !["steer", "follow_up"].includes(input.delivery)) {
-    throw new ContextOwnershipError("reference_owner_mismatch", `AgentInput ${input.id} is outside the tenant Turn`)
-  }
 }
 
 export class StepContextBuilder {
@@ -172,6 +163,7 @@ export class StepContextBuilder {
 
   async build(request: StepContextRequest): Promise<StepContext> {
     id(request.sessionId, "sessionId"); id(request.turnId, "turnId"); id(request.stepId, "stepId")
+    if (request.rootContextInputId !== undefined) id(request.rootContextInputId, "rootContextInputId")
     if (request.scope.userId !== this.store.scope.userId) throw new ContextOwnershipError("reference_owner_mismatch", "Builder scope does not match the claim store tenant")
     return this.store.withTransaction(async (transaction) => this.buildInTransaction(transaction, request))
   }
@@ -183,7 +175,7 @@ export class StepContextBuilder {
       sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId, checkpoint: persisted,
       mode, lease: request.lease, now: request.now ?? this.clock(), rootInputId: request.rootInputId,
     })
-    ensureTurnInputs(claimed.inputs, request)
+    ensureTurnInputsImpl(claimed.inputs, request, inputId => new ContextOwnershipError("reference_owner_mismatch", `AgentInput ${inputId} is outside the tenant Turn`))
     const activeIds = activeMarkerInputIds(request.steeringMarkerState?.active, request.rootInputId, request.steeringMarkerState?.active.length ? {
       sessionId: request.sessionId, turnId: request.turnId, taskId: request.taskId ?? "",
       ...(request.steeringMarkerContext ? {
@@ -197,7 +189,14 @@ export class StepContextBuilder {
     const hydrated = activeIds.length > 0 ? [...await loader!({ sessionId: request.sessionId, turnId: request.turnId, inputIds: activeIds, lease: request.lease })] : []
     assertHydratedSteeringInputs(activeIds, hydrated)
     const contextInputs = mergeSteeringInputs(claimed.inputs, hydrated)
-    ensureTurnInputs(contextInputs, request)
+    ensureTurnInputsImpl(contextInputs, request, inputId => new ContextOwnershipError("reference_owner_mismatch", `AgentInput ${inputId} is outside the tenant Turn`))
+    const readRoot = transaction.loadRootInputContext
+    if (request.rootContextInputId && !readRoot) throw new InputClaimStoreError("store_conflict", "Durable root context reader is unavailable")
+    const rootContextInput = request.rootContextInputId
+      ? await readRoot!({ sessionId: request.sessionId, turnId: request.turnId, inputId: request.rootContextInputId, lease: request.lease })
+      : null
+    if (rootContextInput) ensureTurnInputsImpl([rootContextInput], request, inputId => new ContextOwnershipError("reference_owner_mismatch", `AgentInput ${inputId} is outside the tenant Turn`))
+    const renderInputs = mergeRootContextInput(contextInputs, rootContextInput)
     const sequences = new Map<bigint, string>()
     for (const input of claimed.inputs) {
       const previous = sequences.get(input.acceptedSequence)
@@ -220,7 +219,11 @@ export class StepContextBuilder {
     for (const entry of request.snapshot.steerHistory) blocks.push(block("steer_history", "data", "external_untrusted", "steer_history", `history:${entry.id}`, entry.content))
     for (const reference of [...request.snapshot.businessRefs].sort((left, right) => left.kind.localeCompare(right.kind) || left.id.localeCompare(right.id))) blocks.push(block("business", "data", referenceTrust(reference.kind), "business_reference", `business:${reference.kind}:${reference.id}`, referenceContent(reference)))
     for (const observation of request.snapshot.toolObservations) blocks.push(block("tool_observation", "data", "external_untrusted", observation.id.startsWith("snapshot-working-state:") ? "context_snapshot_working_state" : "tool_or_subagent", `observation:${observation.id}`, observation.content))
-    for (const input of contextInputs) blocks.push(...(await pendingInputBlocks(input, this.ownerFence, request.scope, block, message => new ContextOwnershipError("reference_owner_mismatch", message))).filter(item => input.id !== request.rootInputId || isAttachmentBlock(item)))
+    for (const input of renderInputs) {
+      const duplicateRootText = rootInputTextMatchesGoal(input, request.rootContextInputId ?? request.rootInputId, request.snapshot.goal?.content)
+      const pending = await pendingInputBlocks(input, this.ownerFence, request.scope, block, message => new ContextOwnershipError("reference_owner_mismatch", message))
+      blocks.push(...pending.filter(item => !duplicateRootText || isAttachmentBlock(item)))
+    }
     const ordered = blocks.sort((left, right) => layerOrder.indexOf(left.layer) - layerOrder.indexOf(right.layer))
     const result = {
       schemaVersion: "agent-harness.v2" as const, sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId,

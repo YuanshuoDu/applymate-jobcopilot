@@ -77,6 +77,12 @@ function choose(nextAction: CognitiveAction, blocker: CognitiveAgendaBlocker | n
   return { nextAction, blockedBy: { kind: blocker, ids: ids.ids } }
 }
 
+export function excludeUnconsumedRootReferenceFromAgenda(context: StepContext, inputId?: string): StepContext {
+  if (!inputId || context.consumedInputIds.includes(inputId)) return context
+  const blocks = context.blocks.filter(block => !(block.layer === "pending_input" && plain(block.content) && block.content.inputId === inputId))
+  return blocks.length === context.blocks.length ? context : { ...context, blocks }
+}
+
 export function buildCognitiveActionAgenda(context: StepContext, input: AgendaInput = {}): CognitiveActionAgenda {
   const pending: unknown[] = [], approvals: unknown[] = [], waits: unknown[] = [], unresolved: unknown[] = []
   for (const block of context.blocks) {
