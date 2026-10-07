@@ -15,6 +15,8 @@ const CRITERION_FIELDS = ['criterionId', 'disposition', 'evidenceReferenceIds', 
 const DISPOSITIONS: readonly FeedbackDisposition[] = ['passed', 'failed', 'uncertain']
 const REASONS: readonly FeedbackReason[] = ['meets_criterion', 'does_not_meet_criterion', 'evidence_missing', 'evidence_conflict', 'ambiguous', 'unsupported_claim']
 const WAIT_STATUSES = ['waiting', 'ready', 'timed_out', 'interrupted', 'closed'] as const
+const SUBAGENT_RESULT_FIELDS = ['finalItemId', 'finalText', FEEDBACK_KEY, 'status', 'stepCount', 'structuredResult', 'toolCallCount'] as const
+const SUBAGENT_RESULT_SCHEMA = 'agent-harness.v2.subagent.result'
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 
 type Slot = { readonly found: false } | { readonly found: true; readonly value: unknown }
@@ -54,7 +56,7 @@ function extract(value: unknown): FeedbackView {
   if (!root) return { state: 'none' }
   const result = own(root, 'result')
   if (result.found) {
-    const nested = extractDirectResult(result.value)
+    const nested = extractNestedSubagentResult(result.value)
     if (nested.state !== 'none') return nested
   }
   const status = own(root, 'status')
@@ -83,6 +85,29 @@ function extractDirectResult(value: unknown): FeedbackView {
   if (!direct.found) return { state: 'none' }
   const parsed = parseFeedback(direct.value)
   return parsed ? available([parsed]) : { state: 'unavailable' }
+}
+
+function extractNestedSubagentResult(value: unknown): FeedbackView {
+  const root = record(value)
+  if (!root) return { state: 'none' }
+  const direct = own(root, FEEDBACK_KEY)
+  const report = own(root, PRIVATE_REPORT_KEY)
+  if (!direct.found && !report.found) return { state: 'none' }
+  if (report.found || !isCanonicalCompletedSubagentResult(root)) return { state: 'unavailable' }
+  return extractDirectResult(root)
+}
+
+function isCanonicalCompletedSubagentResult(value: Record<string, unknown>): boolean {
+  const envelope = exactRecord(value, SUBAGENT_RESULT_FIELDS)
+  if (!envelope || envelope.status !== 'completed'
+    || !Number.isSafeInteger(envelope.stepCount) || Number(envelope.stepCount) < 0
+    || !Number.isSafeInteger(envelope.toolCallCount) || Number(envelope.toolCallCount) < 0
+    || (envelope.finalItemId !== null && typeof envelope.finalItemId !== 'string')
+    || typeof envelope.finalText !== 'string') return false
+  const structuredResult = record(envelope.structuredResult)
+  if (!structuredResult) return false
+  const schemaVersion = own(structuredResult, 'schemaVersion')
+  return schemaVersion.found && schemaVersion.value === SUBAGENT_RESULT_SCHEMA
 }
 
 function parseFeedback(value: unknown): FeedbackGroup | null {

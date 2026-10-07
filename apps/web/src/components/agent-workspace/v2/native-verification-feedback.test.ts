@@ -10,6 +10,15 @@ function feedback(overrides: Record<string, unknown> = {}) {
   return { disposition: 'passed', criteria: [criterion()], ...overrides }
 }
 
+function canonicalEnvelope(feedbackValue: unknown = feedback(), overrides: Record<string, unknown> = {}) {
+  return {
+    status: 'completed', stepCount: 2, toolCallCount: 1, finalItemId: 'private-item', finalText: 'private text',
+    structuredResult: { schemaVersion: 'agent-harness.v2.subagent.result', role: 'analyst', findings: [], evidence: [] },
+    nativeVerificationFeedback: feedbackValue,
+    ...overrides,
+  }
+}
+
 function viewOf(value: unknown) { return extractNativeVerificationFeedback(value) }
 
 describe('native verification feedback projection', () => {
@@ -21,8 +30,20 @@ describe('native verification feedback projection', () => {
       structuredResult: { schemaVersion: 'agent-harness.v2.subagent.result', role: 'analyst', findings: [], evidence: [] },
       nativeVerificationFeedback: feedback(),
     })).toEqual(expected)
-    expect(viewOf({ result: { nativeVerificationFeedback: feedback() } })).toEqual(expected)
+    expect(viewOf({ result: canonicalEnvelope() })).toEqual(expected)
     expect(viewOf(feedback())).toEqual({ state: 'none' })
+  })
+
+  it('marks nested feedback unavailable unless it is in a canonical completed subagent envelope', () => {
+    const invalid = [
+      canonicalEnvelope(feedback(), { structuredResult: { role: 'analyst', findings: [], evidence: [] } }),
+      canonicalEnvelope(feedback(), { structuredResult: { schemaVersion: 'agent-harness.v1.subagent.result' } }),
+      canonicalEnvelope(feedback(), { status: 'running' }),
+      canonicalEnvelope(feedback(), { stepCount: '2' }),
+      canonicalEnvelope(feedback(), { extraEnvelopeField: 'not canonical' }),
+    ]
+    for (const result of invalid) expect(viewOf({ result })).toEqual({ state: 'unavailable' })
+    expect(viewOf({ result: canonicalEnvelope() })).toMatchObject({ state: 'available' })
   })
 
   it('accepts passed feedback after public reference filtering leaves no references', () => {
