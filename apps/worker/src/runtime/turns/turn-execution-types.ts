@@ -61,6 +61,7 @@ export type TurnExecutionContextBuilder = {
     stepId: string
     snapshot: StepContextSnapshot
     rootInputId?: string
+    rootContextInputId?: string
     taskId?: string
     now: Date
     steeringMarkerContext?: SteeringMarkerContext
@@ -86,6 +87,8 @@ export type TurnExecutionOptions = {
   readonly tools: readonly unknown[]
   readonly executeTool: TurnEngineToolExecutor
   readonly rootInputId?: string
+  /** Read-only durable root context; never participates in claim/checkpoint state. */
+  readonly rootContextInputId?: string
   readonly actorRole?: PolicyRole
   readonly capabilities?: readonly string[]
   readonly validateToolArguments?: (toolName: string, input: unknown) => boolean | string

@@ -5,7 +5,7 @@ import { InputClaimStoreError, type InputClaimStore, type InputClaimTransaction,
 import { appendNewObservedSteeringMarkers, buildObservedSteeringMarker, type SteeringMarkerContext } from "./steering-marker-store.js"
 import type { SteeringMarkerPayload } from "./steering-marker.js"
 import { activeMarkerInputIds, assertHydratedSteeringInputs, mergeSteeringInputs } from "./steering-marker-hydration.js"
-import { checkpointWithInputs, pendingInputBlocks, rootInputTextMatchesGoal } from "./step-context-support.js"
+import { checkpointWithInputs, mergeRootContextInput, pendingInputBlocks, rootInputTextMatchesGoal } from "./step-context-support.js"
 export type JsonValue = null | boolean | number | string | JsonValue[] | { readonly [key: string]: JsonValue }
 export type ContextTrust = "system" | "user_confirmed" | "internal_record" | "external_untrusted"
 export type ContextLayer = "system" | "profile" | "goal" | "steer_history" | "business" | "tool_observation" | "pending_input"
@@ -142,6 +142,7 @@ export type StepContextRequest = {
   readonly stepId: string
   readonly snapshot: StepContextSnapshot
   readonly rootInputId?: string
+  readonly rootContextInputId?: string
   readonly mode?: "new" | "retry" | "rebuild"
   readonly rebuild?: boolean
   readonly lease?: TurnExecutionFence
@@ -166,6 +167,7 @@ export class StepContextBuilder {
 
   async build(request: StepContextRequest): Promise<StepContext> {
     id(request.sessionId, "sessionId"); id(request.turnId, "turnId"); id(request.stepId, "stepId")
+    if (request.rootContextInputId !== undefined) id(request.rootContextInputId, "rootContextInputId")
     if (request.scope.userId !== this.store.scope.userId) throw new ContextOwnershipError("reference_owner_mismatch", "Builder scope does not match the claim store tenant")
     return this.store.withTransaction(async (transaction) => this.buildInTransaction(transaction, request))
   }
@@ -192,6 +194,13 @@ export class StepContextBuilder {
     assertHydratedSteeringInputs(activeIds, hydrated)
     const contextInputs = mergeSteeringInputs(claimed.inputs, hydrated)
     ensureTurnInputs(contextInputs, request)
+    const readRoot = transaction.loadRootInputContext
+    if (request.rootContextInputId && !readRoot) throw new InputClaimStoreError("store_conflict", "Durable root context reader is unavailable")
+    const rootContextInput = request.rootContextInputId
+      ? await readRoot!({ sessionId: request.sessionId, turnId: request.turnId, inputId: request.rootContextInputId, lease: request.lease })
+      : null
+    if (rootContextInput) ensureTurnInputs([rootContextInput], request)
+    const renderInputs = mergeRootContextInput(contextInputs, rootContextInput)
     const sequences = new Map<bigint, string>()
     for (const input of claimed.inputs) {
       const previous = sequences.get(input.acceptedSequence)
@@ -214,8 +223,8 @@ export class StepContextBuilder {
     for (const entry of request.snapshot.steerHistory) blocks.push(block("steer_history", "data", "external_untrusted", "steer_history", `history:${entry.id}`, entry.content))
     for (const reference of [...request.snapshot.businessRefs].sort((left, right) => left.kind.localeCompare(right.kind) || left.id.localeCompare(right.id))) blocks.push(block("business", "data", referenceTrust(reference.kind), "business_reference", `business:${reference.kind}:${reference.id}`, referenceContent(reference)))
     for (const observation of request.snapshot.toolObservations) blocks.push(block("tool_observation", "data", "external_untrusted", observation.id.startsWith("snapshot-working-state:") ? "context_snapshot_working_state" : "tool_or_subagent", `observation:${observation.id}`, observation.content))
-    for (const input of contextInputs) {
-      const duplicateRootText = rootInputTextMatchesGoal(input, request.rootInputId, request.snapshot.goal?.content)
+    for (const input of renderInputs) {
+      const duplicateRootText = rootInputTextMatchesGoal(input, request.rootContextInputId ?? request.rootInputId, request.snapshot.goal?.content)
       const pending = await pendingInputBlocks(input, this.ownerFence, request.scope, block, message => new ContextOwnershipError("reference_owner_mismatch", message))
       blocks.push(...pending.filter(item => !duplicateRootText || isAttachmentBlock(item)))
     }

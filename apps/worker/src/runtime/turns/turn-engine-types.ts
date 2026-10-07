@@ -149,6 +149,7 @@ export type TurnEngineOptions = {
       stepId: string
       snapshot: StepContextSnapshot
       rootInputId?: string
+      rootContextInputId?: string
       taskId?: string
       mode?: "new" | "retry" | "rebuild"
       lease?: { ownerId: string; leaseVersion: number; now: Date }

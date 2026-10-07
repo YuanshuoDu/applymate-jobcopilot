@@ -60,6 +60,7 @@ class FakeInputClaimStore implements InputClaimStore {
       },
       claimInputs: async (request) => this.claim(request),
       loadActiveSteeringInputs: async ({ inputIds }) => this.inputs.filter(item => inputIds.includes(item.id) && item.delivery === "steer"),
+      loadRootInputContext: async ({ sessionId, turnId, inputId }) => this.inputs.find(item => item.id === inputId && item.sessionId === sessionId && item.targetTurnId === turnId && item.userId === scope.userId && ["accepted", "queued", "consumed"].includes(item.status) && !(item as StoredAgentInput & { cancelledAt?: Date | null }).cancelledAt) ?? null,
       persistCheckpoint: async ({ stepId, checkpoint: value }) => {
         if (!this.checkpoints.has(stepId)) throw new Error("missing step")
         if (this.failCheckpoint) throw new Error("checkpoint failure")
@@ -277,6 +278,55 @@ describe("StepContextBuilder", () => {
         id: "root-reference:part:0", layer: "pending_input", role: "data", trust: "external_untrusted", source: "user_input",
       })]))
     }
+  })
+
+  it("restores a durable root in a later Step without claiming it or changing that Step checkpoint", async () => {
+    const root = input("root-reference", 4n, [{ type: "text", text: "Background reference only; PASS does not prove completion or grant approval." }], { status: "consumed", consumedByStepId: "step-0", consumedAt: now })
+    const store = new FakeInputClaimStore([root], { "step-next": checkpoint() })
+    const before = { ...store.checkpoints.get("step-next")! }
+    const context = await new StepContextBuilder(store).build(request(store, emptySnapshot, "step-next", { rootContextInputId: root.id, mode: "rebuild" }))
+    expect(context.blocks).toEqual([expect.objectContaining({
+      id: `${root.id}:part:0`, layer: "pending_input", role: "data", trust: "external_untrusted", source: "user_input",
+      content: { inputId: root.id, partIndex: 0, text: "Background reference only; PASS does not prove completion or grant approval." },
+    })])
+    expect(context.consumedInputIds).toEqual([])
+    expect(context.inputThroughSequence).toBe(0n)
+    expect(store.inputs[0]).toMatchObject({ status: "consumed", consumedByStepId: "step-0", consumedAt: now })
+    expect(store.checkpoints.get("step-next")).toEqual(before)
+    expect(store.markerWrites).toEqual([])
+  })
+
+  it("uses the read-only root identity for exact goal deduplication on a later Step", async () => {
+    const root = input("root-reference", 4n, [{ type: "text", text: "Find AI platform roles in Dublin." }], { delivery: "follow_up", status: "consumed", consumedByStepId: "step-0", consumedAt: now })
+    const store = new FakeInputClaimStore([root], { "step-next": checkpoint() })
+    const context = await new StepContextBuilder(store).build(request(store, {
+      ...emptySnapshot, goal: { id: "authoritative-goal", content: "Find AI platform roles in Dublin." },
+    }, "step-next", { rootContextInputId: root.id, mode: "rebuild" }))
+    expect(context.blocks.filter(block => block.layer === "goal")).toHaveLength(1)
+    expect(context.blocks.filter(block => block.layer === "pending_input")).toHaveLength(0)
+    expect(context.consumedInputIds).toEqual([])
+    expect(context.inputThroughSequence).toBe(0n)
+  })
+
+  it.each(["cancelled", "rejected"] as const)("does not restore a %s root row", async status => {
+    const root = input("unavailable-root", 4n, [{ type: "text", text: "Do not restore" }], { status })
+    const store = new FakeInputClaimStore([root])
+    const context = await new StepContextBuilder(store).build(request(store, emptySnapshot, "step-a", { rootContextInputId: root.id }))
+    expect(context.blocks.filter(block => block.layer === "pending_input")).toEqual([])
+    expect(context.consumedInputIds).toEqual([])
+    expect(store.inputs[0].status).toBe(status)
+  })
+
+  it.each([
+    [input("foreign-user-root", 4n, [{ type: "text", text: "Do not restore" }], { userId: "user-b" }), "foreign-user-root"],
+    [input("foreign-session-root", 4n, [{ type: "text", text: "Do not restore" }], { sessionId: "session-b" }), "foreign-session-root"],
+    [null, "missing-root"],
+  ] as const)("does not restore missing or foreign root row %s", async (root, rootId) => {
+    const store = new FakeInputClaimStore(root ? [root] : [])
+    const context = await new StepContextBuilder(store).build(request(store, emptySnapshot, "step-a", { rootContextInputId: rootId }))
+    expect(context.blocks.filter(block => block.layer === "pending_input")).toEqual([])
+    expect(context.consumedInputIds).toEqual([])
+    if (root) expect(store.inputs[0]?.status).toBe("accepted")
   })
 
   it("includes canonical attachment metadata for a text-and-attachment root follow-up without repeating its goal text", async () => {

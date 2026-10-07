@@ -17,6 +17,12 @@ export function rootInputTextMatchesGoal(input: StoredAgentInput, rootInputId: s
   return input.content.filter(part => part.type === "text").map(part => part.text).join("\n").trim() === goal
 }
 
+export function mergeRootContextInput(inputs: readonly StoredAgentInput[], root: StoredAgentInput | null): StoredAgentInput[] {
+  const byId = new Map(inputs.map(input => [input.id, input]))
+  if (root) byId.set(root.id, root)
+  return [...byId.values()].sort((left, right) => left.acceptedSequence < right.acceptedSequence ? -1 : left.acceptedSequence > right.acceptedSequence ? 1 : left.id.localeCompare(right.id))
+}
+
 export function pendingInputBlocks(input: StoredAgentInput, ownerFence: ContextOwnerFence, scope: TenantScope, createBlock: BlockFactory, attachmentError?: AttachmentError): Promise<ContextBlock[]> {
   return Promise.all(input.content.map(async (part, partIndex) => {
     if (part.type === "attachment_ref") {
