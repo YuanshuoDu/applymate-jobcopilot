@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool as PgPool, type PoolClient } from "pg"
+import { waitForNativeVerification } from "../canonical-turn-native-verification-wait.js"
 import {
   canonicalNativeVerificationJson, digestNativeVerificationValue, parseNativeVerificationControl,
 } from "./native-verification-contract.js"
@@ -13,6 +14,7 @@ import { loadNativeVerificationOwnedState, nativeVerificationBindingDigest, nati
 import { nativeVerificationHistory } from "./native-verification-pg-readback.js"
 import { createPgNativeVerificationPort } from "./pg-native-verification-port.js"
 import { transaction } from "./pg-store-persistence.js"
+import { createPgDurableWaitPort } from "./durable-wait-store.js"
 import { TASK_GRAPH_NATIVE_METADATA_VERSION } from "./task-graph-native-state.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION, parseTaskGraphSnapshot, taskGraphItemId } from "./task-graph-snapshot.js"
 import { loadTaskGraph } from "./task-graph-pg-state.js"
@@ -266,4 +268,62 @@ describePg("native verification PostgreSQL producer and readback", () => {
       throw error
     } finally { sourceClient.release() }
   }, 60_000)
+
+  it("persists and replays an overflow-key native wait with valid long owned identities", async () => {
+    const sizedId = (prefix: string, length: number) => {
+      const stem = `${prefix}-${randomUUID()}`
+      if (stem.length > length) throw new Error("native_verification_wait_fixture_id_invalid")
+      return stem + "x".repeat(length - stem.length)
+    }
+    const long = {
+      session: sizedId("native-wait-session", 100), turn: sizedId("native-wait-turn", 100),
+      root: sizedId("native-wait-root", 120), step: sizedId("native-wait-step", 120), target: sizedId("native-wait-target", 120),
+    }
+    await pool!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+      VALUES ($1, $2, 'Long native wait fixture', 'running', 'test', CURRENT_TIMESTAMP)`, [long.session, ids.user])
+    await pool!.query(`INSERT INTO "agent_turns"
+      ("id", "sessionId", "userId", "rootTaskId", "status", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot",
+       "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
+      VALUES ($1, $2, $3, NULL, 'in_progress', 'user', $4::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
+        $5, CURRENT_TIMESTAMP + INTERVAL '5 minutes', CURRENT_TIMESTAMP, 1, CURRENT_TIMESTAMP)`,
+    [long.turn, long.session, ids.user, JSON.stringify({ goal: "Long native wait objective" }), ids.turnOwner])
+    await pool!.query(`INSERT INTO "sub_agent_tasks"
+      ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
+       "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot",
+       "budgetSnapshot", "attemptCount", "maxAttempts", "leaseOwner", "leaseExpiresAt", "updatedAt")
+      VALUES ($1, $2, $3, NULL, NULL, '/root', 0, 'orchestrator', 'root', 'running', 'Long native wait objective',
+        '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
+        '{"subagentPolicy":{"maxConcurrency":8,"maxDepth":8,"maxFanOut":8,"maxAttempts":2}}'::jsonb,
+        1, 2, $4, CURRENT_TIMESTAMP + INTERVAL '5 minutes', CURRENT_TIMESTAMP)`, [long.root, long.session, long.turn, ids.taskOwner])
+    await pool!.query(`UPDATE "sub_agent_tasks" SET "rootTaskId" = $1 WHERE "id" = $1`, [long.root])
+    await pool!.query(`UPDATE "agent_turns" SET "rootTaskId" = $1 WHERE "id" = $2`, [long.root, long.turn])
+    await pool!.query(`INSERT INTO "sub_agent_tasks"
+      ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
+       "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot",
+       "budgetSnapshot", "attemptCount", "maxAttempts", "updatedAt")
+      VALUES ($1, $2, $3, $4, $4, '/root/native-wait-target', 1, 'analyst', 'research', 'queued', 'Wait target',
+        '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 1, 2, CURRENT_TIMESTAMP)`,
+    [long.target, long.session, long.turn, long.root])
+    await pool!.query(`INSERT INTO "agent_steps"
+      ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
+      VALUES ($1, $2, $3, $4, 0, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`, [long.step, long.session, long.turn, long.root])
+
+    const longScope: TaskGraphExecutionScope = {
+      ...scope, sessionId: long.session, turnId: long.turn, rootTaskId: long.root, parentTaskId: long.root, stepId: long.step,
+    }
+    const port = createPgDurableWaitPort(pool!)
+    const first = await waitForNativeVerification({ port, scope: longScope, targetTaskIds: [long.target] })
+    const replay = await waitForNativeVerification({
+      port, scope: { ...longScope, turnLeaseOwner: "rotated-owner", turnLeaseVersion: 2 }, targetTaskIds: [long.target, long.target],
+    })
+    expect(first.status).toBe("waiting")
+    expect(replay).toMatchObject({ waitId: first.waitId, status: "waiting" })
+    const persisted = await pool!.query<{ count: number; identityBytes: number; isVersioned: boolean }>(
+      `SELECT COUNT(*)::int AS "count", MAX(octet_length("idempotencyKey"))::int AS "identityBytes",
+        BOOL_AND("idempotencyKey" LIKE 'native-verification:v2:%') AS "isVersioned"
+       FROM "agent_wait_conditions" WHERE "sessionId" = $1 AND "turnId" = $2 AND "parentTaskId" = $3`,
+      [long.session, long.turn, long.root])
+    expect(persisted.rows[0]).toEqual({ count: 1, identityBytes: expect.any(Number), isVersioned: true })
+    expect(persisted.rows[0]!.identityBytes).toBeLessThanOrEqual(256)
+  }, 30_000)
 })
