@@ -433,30 +433,20 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
     expect(privateReceipt).not.toContain(originalReference[0]!.referenceId)
 
     await seedStep(supersedingStepId, 11, "10")
-    const replaySnapshot = async () => {
+    const persistedStepSnapshot = async (stepId: string) => {
       const result = await adminPool!.query<{ step: unknown; stepCount: number; receiptCount: number; receipts: unknown }>(
         `SELECT to_jsonb(step) AS "step", (SELECT COUNT(*)::int FROM "agent_steps" AS observed WHERE observed."turnId" = step."turnId") AS "stepCount",
           (SELECT COUNT(*)::int FROM "agent_native_semantic_rejections" AS exact WHERE exact."turnId" = step."turnId" AND exact."stepId" = step."id") AS "receiptCount",
           (SELECT COALESCE(jsonb_agg(to_jsonb(rejection)), '[]'::jsonb) FROM "agent_native_semantic_rejections" AS rejection
             WHERE rejection."turnId" = step."turnId") AS "receipts"
          FROM "agent_steps" AS step WHERE step."id" = $1`,
-        [evidenceStepId])
-      if (!result.rows[0]) throw new Error("native_semantic_replay_step_missing")
+        [stepId])
+      if (!result.rows[0]) throw new Error("native_semantic_fixture_step_missing")
       return result.rows[0]
     }
-    const beforeReplay = await replaySnapshot()
+    const beforeReplay = await persistedStepSnapshot(evidenceStepId)
     await expect(complete(receiptInput)).resolves.toMatchObject({ inputThroughSequence: 10n, distinctStepCount: 1 })
-    expect(await replaySnapshot()).toEqual(beforeReplay)
-
-    await expect(complete({ ...receiptInput, stepId: supersedingStepId })).rejects.toThrow()
-    const rejectedStep = await adminPool!.query<{ status: string; finishReason: string | null; errorCode: string | null;
-      inputTokens: number; outputTokens: number; estimatedCostUsd: number; receipts: number }>(
-      `SELECT step."status", step."finishReason", step."errorCode", step."inputTokens", step."outputTokens",
-        step."estimatedCostUsd"::double precision AS "estimatedCostUsd",
-        (SELECT COUNT(*)::int FROM "agent_native_semantic_rejections" AS rejection WHERE rejection."stepId" = step."id") AS "receipts"
-       FROM "agent_steps" AS step WHERE step."id" = $1`, [supersedingStepId])
-    expect(rejectedStep.rows[0]).toEqual({ status: "streaming", finishReason: null, errorCode: null,
-      inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, receipts: 0 })
+    expect(await persistedStepSnapshot(evidenceStepId)).toEqual(beforeReplay)
 
     await seedStep(newEpochStepId, 12, "11", [newSteeringId])
     await adminPool!.query(`INSERT INTO "agent_inputs"
@@ -464,6 +454,12 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
        "consumedByStepId", "consumedAt", "cancelledAt")
       VALUES ($1, $2, $3, $4, $5, 'steer', 'consumed', $6::jsonb, 11, $7, CURRENT_TIMESTAMP, NULL)`,
     [newSteeringId, sessionId, turnId, userId, `native-semantic-steer-next-${suffix}`, JSON.stringify([{ type: "text", text: nextSteering }]), newEpochStepId])
+    const beforeStaleAttempt = await persistedStepSnapshot(newEpochStepId)
+    expect(beforeStaleAttempt.step).toMatchObject({ status: "streaming" })
+    expect(beforeStaleAttempt.receiptCount).toBe(0)
+    await expect(complete({ ...receiptInput, stepId: newEpochStepId })).rejects.toThrow()
+    expect(await persistedStepSnapshot(newEpochStepId)).toEqual(beforeStaleAttempt)
+
     const newIdentity = await ensureRejectedCandidate(candidateA, newEpochStepId)
     expect(newIdentity.candidateDigest).toBe(identity.candidateDigest)
     expect(newIdentity.controlOperationId).not.toBe(identity.controlOperationId)
