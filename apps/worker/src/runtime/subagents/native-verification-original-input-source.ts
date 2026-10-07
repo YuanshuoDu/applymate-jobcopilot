@@ -100,8 +100,7 @@ export async function readNativeOriginalInputBinding(
   const envelope = record(turn.rows[0]?.input), nested = record(envelope?.input)
   const canonicalInput = nested && Object.keys(nested).length > 0 ? nested : envelope
   const hasClientMessageId = canonicalInput !== null && Object.hasOwn(canonicalInput, "clientMessageId")
-  const hasContent = canonicalInput !== null && Object.hasOwn(canonicalInput, "content")
-  if (!hasClientMessageId && !hasContent) return { kind: "legacy" }
+  if (!hasClientMessageId) return { kind: "legacy" }
   const turnInput = parseNativeSteeringTurnInput(turn.rows[0]?.input)
   if (!turnInput) return null
   const matches = await client.query<Row>(`SELECT "id", "sessionId", "userId", "targetTurnId", "clientMessageId", "delivery", "status", "content",

@@ -73,8 +73,17 @@ describe("native verifier original input source", () => {
     expect(db.calls).toHaveLength(1)
   })
 
+  it("preserves legacy inputs with content but no explicit original client identity", async () => {
+    const db = client({ goal: "Legacy goal", content: [{ type: "text", text: "Legacy goal" }], successCriteria: ["Must remain compatible"] }, [])
+    await expect(readNativeOriginalInputBinding(db, scope)).resolves.toEqual({ kind: "legacy" })
+    expect(db.calls).toHaveLength(1)
+  })
+
   it.each([
     ["partial Turn envelope", { goal: "Goal", clientMessageId: "root-message" }, [row()]],
+    ["null client identity", { goal: "Goal", content: originalText, clientMessageId: null }, [row()]],
+    ["empty client identity", { goal: "Goal", content: originalText, clientMessageId: "" }, [row()]],
+    ["non-string client identity", { goal: "Goal", content: originalText, clientMessageId: 123 }, [row()]],
     ["missing owned row", { goal: "Goal", content: originalText, clientMessageId: "root-message" }, []],
     ["ambiguous rows", { goal: "Goal", content: originalText, clientMessageId: "root-message" }, [row(), row({ id: "duplicate" })]],
     ["foreign input owner", { goal: "Goal", content: originalText, clientMessageId: "root-message" }, [row({ userId: "other-user" })]],
