@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest"
 import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
 
 import { createUsageAwareModelAdapter } from "./usage-aware-model.js"
+import { ContextEstimateExceededError } from "./model-request-admission.js"
+import type { WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
 import type { ExecutionOwnerFence } from "../execution-owner.js"
 import type { TreeBudgetReservation, TreeBudgetReservationStore } from "../subagents/tree-budget-types.js"
 
@@ -41,6 +43,10 @@ function adapter(events: readonly ModelStreamEvent[] = [{ type: "usage", inputTo
   return { id: "fixture", profile, async *stream(_input) { yield* events } }
 }
 
+function rejectingAdapter(error: unknown): ModelAdapter {
+  return { id: "fixture-rejecting", profile, async *stream() { throw error } }
+}
+
 describe("usage-aware model owner seam", () => {
   it("sends a child owner envelope and consumes one shared tree step", async () => {
     const fixture = store()
@@ -76,6 +82,40 @@ describe("usage-aware model owner seam", () => {
       authorize: vi.fn(async () => ({ settle: vi.fn(async () => { throw new Error("account_settlement_unknown") }) })),
     })
     await expect((async () => { for await (const _event of model.stream(request)) return undefined })()).rejects.toThrow("account_settlement_unknown")
+    expect(fixture.statuses).toEqual([])
+  })
+
+  it("releases a child reservation after a known zero-usage local context rejection", async () => {
+    const fixture = store(), settlements: unknown[] = []
+    const settle = vi.fn(async (value: WorkerUsageSettlementInput) => { settlements.push(value) })
+    const model = createUsageAwareModelAdapter(rejectingAdapter(new ContextEstimateExceededError({
+      provider: profile.provider, model: profile.model, guaranteedNoProviderAttempt: true,
+    })), { owner, treeBudget: fixture.store, authorize: vi.fn(async () => ({ settle })) })
+    await expect((async () => { for await (const _event of model.stream(request)) return undefined })())
+      .rejects.toMatchObject({ code: "context_estimate_exceeded", guaranteedNoProviderAttempt: true })
+    expect(settlements).toEqual([{ status: "error", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0,
+      errorCode: "context_estimate_exceeded" }])
+    expect(fixture.statuses).toEqual(["released"])
+  })
+
+  it("consumes the reservation when a local rejection follows an earlier route attempt", async () => {
+    const fixture = store()
+    const model = createUsageAwareModelAdapter(rejectingAdapter(new ContextEstimateExceededError({
+      provider: profile.provider, model: profile.model, guaranteedNoProviderAttempt: false,
+    })), { owner, treeBudget: fixture.store, authorize: vi.fn(async () => ({ settle: vi.fn(async () => undefined) })) })
+    await expect((async () => { for await (const _event of model.stream(request)) return undefined })())
+      .rejects.toMatchObject({ code: "context_estimate_exceeded", guaranteedNoProviderAttempt: false })
+    expect(fixture.statuses).toEqual(["consumed"])
+  })
+
+  it("keeps a local rejection reservation active when zero-usage settlement is unknown", async () => {
+    const fixture = store()
+    const model = createUsageAwareModelAdapter(rejectingAdapter(new ContextEstimateExceededError({
+      provider: profile.provider, model: profile.model, guaranteedNoProviderAttempt: true,
+    })), { owner, treeBudget: fixture.store,
+      authorize: vi.fn(async () => ({ settle: vi.fn(async () => { throw new Error("account settlement unknown") }) })) })
+    await expect((async () => { for await (const _event of model.stream(request)) return undefined })())
+      .rejects.toMatchObject({ code: "context_estimate_exceeded", guaranteedNoProviderAttempt: true })
     expect(fixture.statuses).toEqual([])
   })
 })

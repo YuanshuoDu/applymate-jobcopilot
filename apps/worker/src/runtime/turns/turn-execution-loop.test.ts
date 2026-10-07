@@ -1,12 +1,13 @@
 import { describe, expect, it, vi } from "vitest"
 
 import type { TenantScope } from "@jobcopilot/agent-protocol"
-import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
+import { AgentModelError, type HarnessModelRequest, type ModelAdapter, type ModelStreamEvent } from "@jobcopilot/agent-model"
 import type { PolicyEngine } from "@jobcopilot/agent-policy"
 import { StepContextBuilder, type StepContext } from "../context/step-context-builder.js"
 import type { InputClaimStore, InputClaimTransaction, StepCheckpoint, StoredAgentInput } from "../context/input-claim-store.js"
 import { mergeTaskGraphCurrentObservation } from "../canonical-turn-task-graph-context.js"
 import { runTurnExecutionLoop } from "./turn-execution-loop.js"
+import { createHarnessModelRuntime } from "../harness-model.js"
 import type { TurnEngineEvent, TurnEngineItem, TurnEngineStore, TurnEngineToolResult } from "./turn-engine-types.js"
 import { NATIVE_SEMANTIC_NO_PROGRESS, RESET_NATIVE_SEMANTIC_PROGRESS, type TurnExecutionIdentity, type TurnExecutionOptions, type TurnExecutionStore } from "./turn-execution-types.js"
 import { steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "../context/steering-marker.js"
@@ -16,6 +17,9 @@ import { SessionPauseRequestedError } from "../session-gate.js"
 import { ToolExecutionError, type ToolExecutionContext } from "../tools/types.js"
 import { createTaskGraphPlanningTool } from "../tools/planning-executors.js"
 import type { TaskGraphCommandPort, TaskGraphCurrentState, TaskGraphScheduleReceipt } from "../subagents/task-graph-command-port.js"
+import { createUsageAwareModelAdapter } from "./usage-aware-model.js"
+import type { HarnessRequestAdmissionDiagnostic } from "../harness-model-admission.js"
+import type { WorkerUsageAuthorization, WorkerUsageAuthorizationInput, WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
 
 const profile = {
   provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false,
@@ -96,6 +100,23 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
     ...(completionGate ? { completionGate } : {}),
   }
   return { options, events, notifications, items, finalResponses, stepTasks, stepAttempts, stepStatuses, stepInputs, requests }
+}
+
+function replaceHarnessRoute(
+  runtime: ReturnType<typeof createHarnessModelRuntime>,
+  provider: string,
+  model: string,
+  maxContextTokens: number,
+  stream: ModelAdapter["stream"],
+): void {
+  const existing = runtime.registry.list().find(adapter => adapter.profile.provider === provider && adapter.profile.model === model)
+  if (!existing) throw new Error(`Missing fixture route ${provider}/${model}`)
+  runtime.registry.unregister(existing.id)
+  runtime.registry.register({
+    id: existing.id,
+    profile: { ...existing.profile, maxContextTokens, maxOutputTokens: 4_096, defaultMaxOutputTokens: 256 },
+    stream,
+  })
 }
 
 class LateSteerInputClaimStore implements InputClaimStore {
@@ -224,6 +245,150 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.requests).toHaveLength(0)
     const saved = JSON.parse(root.finalResponses[0]!.slice("root-1:".length)) as { usage: unknown }
     expect(saved.usage).toEqual(resume.usage)
+  })
+
+  it("fails once when the full resumed Turn request outgrows every route after an earlier provider attempt", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const diagnostics: HarnessRequestAdmissionDiagnostic[] = []
+    const selections: string[] = []
+    const requestCaptures: HarnessModelRequest[] = []
+    const routeErrors: unknown[] = []
+    const primaryRequests: HarnessModelRequest[] = []
+    const settlements: WorkerUsageSettlementInput[] = []
+    const authorizations: WorkerUsageAuthorizationInput[] = []
+    const runtime = createHarnessModelRuntime({
+      primary: { provider: "minimax", model: "MiniMax-M3", apiKey: "fixture-minimax" },
+      fallbacks: [{ provider: "anthropic", model: "claude-sonnet-5", apiKey: "fixture-anthropic" }],
+      allowEnvironmentFallbacks: false,
+      maxReroutes: 1,
+      onRequestAdmission: diagnostic => diagnostics.push(diagnostic),
+      onSelectionEvent: event => selections.push(event.type),
+    })
+    let primaryCalls = 0
+    let fallbackCalls = 0
+    replaceHarnessRoute(runtime, "minimax", "MiniMax-M3", 100_000, async function* (request) {
+      primaryRequests.push(request)
+      primaryCalls += 1
+      if (primaryCalls === 1) {
+        yield { type: "tool_call_completed", callId: "call:large-search", name: "jobs.search", arguments: { location: "Dublin" } }
+        yield { type: "usage", inputTokens: 41, outputTokens: 13, estimatedCostUsd: 0.037 }
+        yield { type: "completed", finishReason: "tool_calls" }
+        return
+      }
+      throw new AgentModelError({
+        code: "provider_error", message: "fixture provider rejected the second request",
+        provider: request.provider, model: request.model, retryable: true, recoverable: true,
+      })
+    })
+    replaceHarnessRoute(runtime, "anthropic", "claude-sonnet-5", 4_096, async function* () {
+      fallbackCalls += 1
+      throw new Error("oversized fallback must not reach its provider adapter")
+    })
+
+    const capturedRouter: ModelAdapter = {
+      ...runtime.adapter,
+      async *stream(request) {
+        requestCaptures.push(request)
+        try { yield* runtime.adapter.stream(request) }
+        catch (error: unknown) { routeErrors.push(error); throw error }
+      },
+    }
+    const authorize = async (input: WorkerUsageAuthorizationInput): Promise<WorkerUsageAuthorization> => {
+      authorizations.push(input)
+      return { settle: async settlement => { settlements.push(settlement) } }
+    }
+    const model = createUsageAwareModelAdapter(capturedRouter, { owner: root.options.identity, authorize })
+    const goal = "Find senior software engineering roles in Dublin while preserving the original candidate constraints."
+    const goalBlock: StepContext["blocks"][number] = {
+      id: "goal:original", layer: "goal", role: "data", trust: "external_untrusted", source: "turn_goal", content: goal,
+    }
+    const baseBuilder = root.options.contextBuilder
+    const searchOutput = `Dublin role result with the original search detail. `.repeat(2_000)
+    const tools = [{
+      name: "jobs.search", version: "1", description: "Search public job postings.",
+      inputSchema: { type: "object", properties: { location: { type: "string" } }, required: ["location"], additionalProperties: false },
+    }]
+    const outputSchema = {
+      type: "object", properties: { summary: { type: "string" }, sourceCount: { type: "integer" } },
+      required: ["summary", "sourceCount"], additionalProperties: false,
+    }
+    const resumedUsage = { inputTokens: 7, outputTokens: 3, estimatedCostUsd: 0.011 }
+    root.options = {
+      ...root.options,
+      goal,
+      snapshot: { ...root.options.snapshot, goal: { id: "original", content: goal } },
+      contextBuilder: {
+        build: async request => {
+          const context = await baseBuilder.build(request)
+          return {
+            ...context,
+            blocks: [goalBlock, ...context.blocks],
+            canonicalJson: JSON.stringify({ goal, context: context.canonicalJson }),
+          }
+        },
+      },
+      model,
+      tools,
+      outputSchema,
+      executeTool: async ({ call }) => ({
+        id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed",
+        output: { summary: searchOutput }, errorCode: null,
+      }),
+      resume: {
+        nextOrdinal: 0, stepCount: 0, toolCallCount: 0, inputThroughSequence: 0n, consumedInputIds: [], usage: resumedUsage,
+      },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "failed", errorCode: "context_estimate_exceeded", stepCount: 2, toolCallCount: 1 })
+    expect(primaryCalls).toBe(2)
+    expect(fallbackCalls).toBe(0)
+    expect(requestCaptures).toHaveLength(2)
+    expect(primaryRequests).toHaveLength(2)
+    expect(routeErrors).toHaveLength(1)
+    expect(routeErrors[0]).toMatchObject({
+      code: "context_estimate_exceeded", provider: "anthropic", model: "claude-sonnet-5", guaranteedNoProviderAttempt: false,
+    })
+    expect(selections).toContain("model.rerouted")
+    expect(diagnostics).toHaveLength(3)
+    expect(diagnostics.map(item => [item.provider, item.status, item.withinWindow])).toEqual([
+      ["minimax", "known", true], ["minimax", "known", true], ["anthropic", "known", false],
+    ])
+
+    const finalRequest = requestCaptures[1]!
+    expect(finalRequest.messages).toEqual(expect.arrayContaining([
+      { role: "user", content: expect.arrayContaining([expect.objectContaining({ type: "text", text: expect.stringContaining(goal) })]) },
+      { role: "tool", content: expect.arrayContaining([expect.objectContaining({ type: "tool_result", content: expect.stringContaining(searchOutput) })]) },
+    ]))
+    expect(finalRequest.tools).toEqual(tools)
+    expect(finalRequest.outputSchema).toEqual(outputSchema)
+    expect(finalRequest.toolChoice).toBe("auto")
+
+    expect(authorizations).toHaveLength(2)
+    expect(settlements).toEqual([
+      { status: "success", inputTokens: 41, outputTokens: 13, estimatedCostUsd: 0.037 },
+      { status: "error", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, errorCode: "context_estimate_exceeded" },
+    ])
+    expect(root.stepStatuses).toEqual(["completed", "failed"])
+    expect(root.finalResponses).toHaveLength(1)
+    const finalResponse = JSON.parse(root.finalResponses[0]!.slice("root-1:".length)) as {
+      completed: boolean; blocker: string; usage: { inputTokens: number; outputTokens: number; estimatedCostUsd: number }
+    }
+    expect(finalResponse).toMatchObject({
+      completed: false,
+      blocker: expect.stringMatching(/Approximate.*retained prompt\/tool context.*required content was not removed/),
+      usage: { inputTokens: 48, outputTokens: 16, estimatedCostUsd: 0.048 },
+    })
+    const persistedFailure = root.events.find(event => event.type === "turn.failed" && event.payload !== undefined)
+    expect(persistedFailure?.payload).toMatchObject({
+      errorCode: "context_estimate_exceeded", final: { completed: false, usage: finalResponse.usage },
+    })
+    const modelUsageEvents = root.events.filter(event => event.type === "model.usage" && event.payload !== undefined)
+    expect(modelUsageEvents).toHaveLength(1)
+    expect(modelUsageEvents[0]?.payload).toMatchObject({ usage: { inputTokens: 41, outputTokens: 13, estimatedCostUsd: 0.037 } })
+    expect(root.events.some(event => event.type === "model.failed" && event.payload !== undefined)).toBe(true)
+    expect(root.events.filter(event => event.type === "turn.failed" && event.payload !== undefined)).toHaveLength(1)
   })
 
   it("replaces a recovered candidate when fresh steering arrives before the resumed step", async () => {

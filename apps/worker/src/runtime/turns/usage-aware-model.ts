@@ -3,6 +3,7 @@ import type { ModelAdapter, ModelResponse, ModelStreamEvent } from "@jobcopilot/
 import type { WorkerUsageAuthorizationInput, WorkerUsageAuthorization, WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
 import type { ExecutionOwnerFence } from "../execution-owner.js"
 import type { TreeBudgetReservation, TreeBudgetReservationStore } from "../subagents/tree-budget-types.js"
+import { ContextEstimateExceededError } from "./model-request-admission.js"
 
 export type UsageAwareModelOptions = {
   readonly owner: ExecutionOwnerFence
@@ -95,7 +96,9 @@ async function runAuthorized<T>(
     // An unknown account settlement keeps the reserved row active. That
     // blocks a free retry while a later reconciliation can settle it safely.
     if (!accountSettlementUnknown) {
-      if (providerAttempted) await settleTree("consumed").catch(() => undefined)
+      const providerAttemptedForReservation = error instanceof ContextEstimateExceededError
+        ? !error.guaranteedNoProviderAttempt : providerAttempted
+      if (providerAttemptedForReservation) await settleTree("consumed").catch(() => undefined)
       else await settleTree("released").catch(() => undefined)
     }
     throw error

@@ -16,11 +16,12 @@ const lease: TurnLease = {
 
 function pool() {
   const calls: string[] = []
+  const queries: Array<[string, unknown[] | undefined]> = []
   const client = {
-    query: vi.fn(async (sql: string) => { calls.push(sql); return { rows: [{ ...lease, id: lease.turnId, leaseOwnerId: lease.ownerId }], rowCount: 1 } }),
+    query: vi.fn(async (sql: string, params?: unknown[]) => { calls.push(sql); queries.push([sql, params]); return { rows: [{ ...lease, id: lease.turnId, leaseOwnerId: lease.ownerId }], rowCount: 1 } }),
     release: vi.fn(),
   }
-  return { pool: { connect: vi.fn().mockResolvedValue(client) }, calls }
+  return { pool: { connect: vi.fn().mockResolvedValue(client) }, calls, queries }
 }
 
 function interruptedAfterHeartbeatPool() {
@@ -103,6 +104,22 @@ describe("Turn queue processor", () => {
     expect(execute).toHaveBeenCalledWith(expect.objectContaining({ lease, signal: expect.any(AbortSignal) }))
     expect(registry.size).toBe(0)
     expect(fake.calls.some((sql) => sql.includes('SET "status" = $5'))).toBe(true)
+  })
+
+  it("releases a resolved context-admission failure as failed without requeueing or retrying", async () => {
+    const fake = pool()
+    const execute = vi.fn().mockResolvedValue({ status: "failed", errorCode: "context_estimate_exceeded" })
+
+    await expect(runTurnJob(
+      { data: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptsMade: 0 },
+      { pool: fake.pool, execute },
+    )).resolves.toEqual({ status: "failed", errorCode: "context_estimate_exceeded" })
+
+    expect(execute).toHaveBeenCalledTimes(1)
+    const release = fake.queries.find(([sql]) => sql.includes('SET "status" = $5'))
+    expect(release?.[1]?.[4]).toBe("failed")
+    expect(fake.queries.some(([sql, params]) => sql.includes('SET "status" = $5') && params?.[4] === "queued")).toBe(false)
+    expect(fake.calls.some(sql => sql.includes("agent.turn.dlq"))).toBe(false)
   })
 
   it("requeues a pause-fenced execution without consuming a queue retry or writing a dead letter", async () => {
