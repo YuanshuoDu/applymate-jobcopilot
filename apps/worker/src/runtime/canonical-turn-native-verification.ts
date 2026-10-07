@@ -85,28 +85,37 @@ const REPAIR_ACTION: Readonly<Record<RepairReason, string>> = {
   evidence_conflict: "reconcile current owned sources and resolve contradictions",
   does_not_meet_criterion: "revise the answer against the criterion",
   unsupported_claim: "remove the claim or support it with current owned evidence",
-  ambiguous: "resolve ambiguity from evidence; identify missing user facts and seek clarification when available, otherwise state uncertainty",
+  ambiguous: "Resolve ambiguity from available evidence and seek user clarification when user-dependent, otherwise keep the uncertainty explicit.",
 }
 const VALID_REASON_DISPOSITIONS: Readonly<Record<NativeVerificationDisposition, readonly NativeVerificationReasonCode[]>> = {
   passed: ["meets_criterion"],
   failed: ["does_not_meet_criterion", "evidence_conflict", "unsupported_claim"],
   uncertain: ["evidence_missing", "evidence_conflict", "unsupported_claim", "ambiguous"],
 }
-export function nativeVerificationFeedbackText(status: string, value: unknown = [], replanFallback = false): string {
+const GENERIC_REPAIR_GUIDANCE = "Revise the candidate or obtain new current owned evidence before retrying."
+const VERIFICATION_STATUSES = ["passed", "failed", "uncertain", "pending", "unavailable"] as const
+export function nativeVerificationFeedbackText(status: string, value: unknown = []): string {
   const parsed = parseNativeVerificationFeedback(value)
-  const safeStatus = ["passed", "failed", "uncertain", "pending", "unavailable"].includes(status) ? status : "unavailable"
+  const knownStatus = (VERIFICATION_STATUSES as readonly string[]).includes(status)
+  const safeStatus = knownStatus ? status : "unavailable"
   let output = `Independent native verification is ${safeStatus}.`
-  if (!parsed) return output
+  if (!parsed || !knownStatus || safeStatus === "pending" || safeStatus === "unavailable") return output
   if (parsed.some(report => report.criteria.some(item => !VALID_REASON_DISPOSITIONS[item.disposition].includes(item.reasonCode)))) return output
+  const hasNonPassedCriterion = parsed.some(report => report.criteria.some(item => item.disposition !== "passed"))
+  if (safeStatus === "passed" && (hasNonPassedCriterion || parsed.some(report => report.disposition !== "passed"))) return output
+  if (parsed.some(report => report.disposition === "passed" && report.criteria.some(item => item.disposition !== "passed"))) return output
   const rows = parsed.flatMap(report => report.criteria.filter(item => item.disposition !== "passed").map(item =>
     `target=${report.targetTaskId} criterion=${item.criterionId} status=${item.disposition} reason=${item.reasonCode}`))
   const reasons = new Set(parsed.flatMap(report => report.criteria.filter(item => item.disposition !== "passed").map(item => item.reasonCode)))
-  const actions = REPAIR_ORDER.filter(reason => reasons.has(reason)).map(reason => `${reason}: ${REPAIR_ACTION[reason]}.`)
+  const actions = REPAIR_ORDER.filter(reason => reasons.has(reason)).map(reason => {
+    const action = REPAIR_ACTION[reason]
+    return `${reason}: ${action}${action.endsWith(".") ? "" : "."}`
+  })
   const actionBlock = actions.length ? ` Actions: ${actions.join(" ")}` : ""
   if (actions.length) {
     if (output.length + actionBlock.length > 512) return output
     output += actionBlock
-  } else if (replanFallback) output += " Replan against verified criteria using current owned evidence."
+  } else if (safeStatus === "failed" && rows.length > 0) output += ` ${GENERIC_REPAIR_GUIDANCE}`
   for (const row of rows) if (output.length + row.length + 1 <= 512) output += ` ${row}`
   return output
 }
@@ -146,7 +155,7 @@ export async function verifyNativeRootCandidate(input: Readonly<{
     }
     if (goal.status !== "passed" || !goal.rootGoalWitness) {
       const semanticRejectionControlTaskId = goal.status === "failed" ? matchingFailedRootControl(goal, input.scope.rootTaskId) : undefined
-      const feedback = nativeVerificationFeedbackText(goal.status, goal.feedback, Boolean(semanticRejectionControlTaskId))
+      const feedback = nativeVerificationFeedbackText(goal.status, goal.feedback)
       return { kind: "blocked", feedback,
         ...(semanticRejectionControlTaskId ? { semanticRejectionControlTaskId } : {}) }
     }

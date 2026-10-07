@@ -27,6 +27,12 @@ export interface StartCommand extends CommandIdentity {
   intent?: ServerAgentTurnIntent
 }
 
+/** User-only fresh root whose immutable goal is separate from its reference content. */
+export interface ObjectiveStartCommand extends CommandIdentity {
+  objective: string
+  content: InputContentPart[]
+}
+
 /** Server-owned intent metadata persisted with the root Turn input envelope. */
 export interface ServerAgentTurnIntent {
   kind: "interactive_discovery_shortlist"
@@ -73,6 +79,14 @@ export interface CommandResult {
   inputId: string
   turnId: string
   disposition: CommandDisposition
+  originalDisposition?: Exclude<CommandDisposition, "duplicate">
+  sequence: string
+}
+
+export interface ObjectiveStartResult {
+  inputId: string
+  turnId: string
+  disposition: "started" | "duplicate"
   originalDisposition?: Exclude<CommandDisposition, "duplicate">
   sequence: string
 }

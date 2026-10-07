@@ -21,13 +21,20 @@ function rootPassed(text = candidateText) {
     criteriaDigest: sha, evidencePacketDigest: sha, reportDigest: sha,
   } }
 }
-function rootFailed(input: Readonly<{ controlTaskId?: string; targetTaskId?: string; disposition?: "failed" | "uncertain" }> = {}) {
+function rootFailed(input: Readonly<{
+  controlTaskId?: string
+  targetTaskId?: string
+  disposition?: "failed" | "uncertain"
+  criterionDisposition?: "failed" | "uncertain"
+}> = {}) {
   const controlTaskId = input.controlTaskId ?? "owned-root-control"
   const disposition = input.disposition ?? "failed"
+  const criterionDisposition = input.criterionDisposition ?? disposition
   return {
     status: disposition, controlTaskIds: [controlTaskId], pendingControlTaskIds: [], pendingTaskIds: [],
     feedback: [{ controlTaskId, targetTaskId: input.targetTaskId ?? "root-1", disposition,
-      criteria: [{ criterionId: "owned-evidence", disposition, reasonCode: disposition === "failed" ? "does_not_meet_criterion" as const : "evidence_missing" as const, evidenceReferenceIds: [] }] }],
+      criteria: [{ criterionId: "owned-evidence", disposition: criterionDisposition,
+        reasonCode: criterionDisposition === "failed" ? "does_not_meet_criterion" as const : "evidence_missing" as const, evidenceReferenceIds: [] }] }],
   }
 }
 const waitResult: DurableWaitResult = { waitId: "wait-1", status: "waiting", deadlineAt: "2099-01-01T00:00:00.000Z", matchedTaskIds: [] }
@@ -71,7 +78,7 @@ describe("nativeVerificationFeedbackText", () => {
       "evidence_conflict: reconcile current owned sources and resolve contradictions.",
       "does_not_meet_criterion: revise the answer against the criterion.",
       "unsupported_claim: remove the claim or support it with current owned evidence.",
-      "ambiguous: resolve ambiguity from evidence; identify missing user facts and seek clarification when available, otherwise state uncertainty."]
+      "ambiguous: Resolve ambiguity from available evidence and seek user clarification when user-dependent, otherwise keep the uncertainty explicit."]
     let prior = -1
     for (const action of actions) {
       const position = output.indexOf(action)
@@ -83,21 +90,52 @@ describe("nativeVerificationFeedbackText", () => {
     expect(output.length).toBeLessThanOrEqual(512)
   })
 
-  it("omits passed and malformed reasons while retaining only the existing bounded generic fallback", () => {
+  it("omits passed actions and malformed pairings and gates the generic fallback", () => {
     const passedFeedback = [{ controlTaskId: "review-1", targetTaskId: "root-1", disposition: "passed",
       criteria: [{ criterionId: "criterion-1", disposition: "passed", reasonCode: "meets_criterion", evidenceReferenceIds: [] }] }]
     expect(nativeVerificationFeedbackText("passed", passedFeedback)).not.toContain("Actions:")
     expect(nativeVerificationFeedbackText("passed", passedFeedback)).not.toContain("criterion=")
+    const passedWithFailedRow = nativeVerificationFeedbackText("passed", [criterionFeedback({ reasonCode: "evidence_conflict", disposition: "failed" })])
+    expect(passedWithFailedRow).toBe("Independent native verification is passed.")
+
     const malformed = [{ controlTaskId: "review-1", targetTaskId: "root-1", disposition: "failed",
       criteria: [{ criterionId: "criterion-1", disposition: "failed", reasonCode: "invented", evidenceReferenceIds: [] }] }]
-    expect(nativeVerificationFeedbackText("failed", malformed, true)).toBe("Independent native verification is failed.")
-    expect(nativeVerificationFeedbackText("failed", [criterionFeedback({ reasonCode: "evidence_missing", disposition: "failed" })], true))
-      .toBe("Independent native verification is failed.")
-    expect(nativeVerificationFeedbackText("uncertain", [criterionFeedback({ reasonCode: "does_not_meet_criterion", disposition: "uncertain" })], true))
-      .toBe("Independent native verification is uncertain.")
-    const fallback = nativeVerificationFeedbackText("failed", [], true)
-    expect(fallback).toContain("Replan against verified criteria using current owned evidence.")
-    expect(fallback.length).toBeLessThanOrEqual(512)
+    expect(nativeVerificationFeedbackText("failed", malformed)).toBe("Independent native verification is failed.")
+    for (const [status, report] of [
+      ["failed", criterionFeedback({ reasonCode: "evidence_missing", disposition: "failed" })],
+      ["uncertain", criterionFeedback({ reasonCode: "does_not_meet_criterion", disposition: "uncertain" })],
+      ["failed", criterionFeedback({ reasonCode: "meets_criterion", disposition: "failed" })],
+    ] as const) {
+      expect(nativeVerificationFeedbackText(status, [report])).toBe(`Independent native verification is ${status}.`)
+    }
+
+    const action = nativeVerificationFeedbackText("failed", [criterionFeedback({ reasonCode: "evidence_conflict", disposition: "failed" })])
+    expect(action).toContain("evidence_conflict: reconcile current owned sources and resolve contradictions.")
+    expect(action).not.toContain("Replan against verified criteria using current owned evidence.")
+    const uncertainAction = nativeVerificationFeedbackText("uncertain", [criterionFeedback({ reasonCode: "ambiguous", disposition: "uncertain" })])
+    expect(uncertainAction).toContain("ambiguous:")
+    expect(uncertainAction).not.toContain("..")
+    expect(uncertainAction).not.toContain("Replan against verified criteria using current owned evidence.")
+
+    const noRows = nativeVerificationFeedbackText("failed", [])
+    const unavailable = nativeVerificationFeedbackText("unavailable", [])
+    expect(noRows).toBe("Independent native verification is failed.")
+    expect(unavailable).toBe("Independent native verification is unavailable.")
+    for (const status of ["pending", "unavailable"] as const) {
+      expect(nativeVerificationFeedbackText(status, [criterionFeedback({ reasonCode: "evidence_missing", disposition: "uncertain" })]))
+        .toBe(`Independent native verification is ${status}.`)
+    }
+  })
+
+  it("normalizes unknown and oversized statuses without exceeding the feedback bound", () => {
+    const maximal = criterionFeedback({ reasonCode: "evidence_conflict", disposition: "failed",
+      targetTaskId: "t".repeat(128), criterionId: "c".repeat(128) })
+    for (const status of ["unexpected-status", "x".repeat(4096)]) {
+      const output = nativeVerificationFeedbackText(status, [maximal])
+      expect(output).toBe("Independent native verification is unavailable.")
+      expect(output.length).toBeLessThanOrEqual(512)
+      expect(output).not.toContain(status)
+    }
   })
 
   it("preserves maximal complete criterion rows and skips rows that cannot fit without blocking later short rows", () => {
@@ -106,6 +144,7 @@ describe("nativeVerificationFeedbackText", () => {
     const maximalOutput = nativeVerificationFeedbackText("uncertain", [maximal])
     const maximalRow = `target=${longTarget} criterion=${longCriterion} status=uncertain reason=evidence_missing`
     expect(maximalOutput).toContain(maximalRow)
+    expect(maximalOutput.indexOf("Actions:")).toBeLessThan(maximalOutput.indexOf(maximalRow))
     expect(maximalOutput.length).toBeLessThanOrEqual(512)
 
     const crowded = [maximal,
@@ -223,6 +262,7 @@ describe("nativeVerificationCompletionGate", () => {
     expect(result[NATIVE_SEMANTIC_NO_PROGRESS]).toBe(true)
     expect(result.feedback).toContain("criterion=owned-evidence status=failed reason=does_not_meet_criterion")
     expect(result.feedback).toContain("does_not_meet_criterion: revise the answer against the criterion.")
+    expect(result.feedback).not.toContain("Replan against verified criteria using current owned evidence.")
     expect(JSON.stringify(result)).not.toContain("owned-root-control")
     expect(observe).toHaveBeenCalledWith("owned-root-control")
   })
@@ -233,6 +273,7 @@ describe("nativeVerificationCompletionGate", () => {
       { ...rootFailed({ targetTaskId: "child-1" }), controlTaskIds: ["owned-root-control"] },
       { ...rootFailed(), feedback: [valid, valid] },
       rootFailed({ disposition: "uncertain" }),
+      rootFailed({ criterionDisposition: "uncertain" }),
       { ...rootFailed(), controlTaskIds: ["different-owned-control"] },
     ]
     for (const result of cases) {
