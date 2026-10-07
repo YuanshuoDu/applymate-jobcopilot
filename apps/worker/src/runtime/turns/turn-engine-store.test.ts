@@ -60,6 +60,32 @@ function turnStartBudgetFixture(input: {
 }
 
 describe("PostgreSQL TurnEngine store", () => {
+  it("keeps flag-off mode resolution in the owner-scoped transaction without probing the new ledger", async () => {
+    const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
+    const client = {
+      query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+        calls.push({ sql, values })
+        if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: owner.sessionId }], rowCount: 1 }
+        if (sql.includes('SELECT turn."id"')) return { rows: [{ id: owner.turnId }], rowCount: 1 }
+        if (sql.includes("to_jsonb(turn)")) return { rows: [{ mode: null }], rowCount: 1 }
+        return { rows: [], rowCount: 1 }
+      }),
+      release: vi.fn(),
+    }
+    const store = createPgTurnEngineStore({ connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">)
+    const resolveMode = store.resolveNativeSemanticProgressMode
+    expect(resolveMode).toBeTypeOf("function")
+    await expect(resolveMode!({ owner, requestedEnabled: false, now })).resolves.toBe("legacy_v1")
+    expect(calls.map(call => call.sql)).toEqual([
+      "BEGIN", "SELECT set_config($1, $2, true)",
+      expect.stringContaining('FROM "agent_sessions"'), expect.stringContaining('SELECT turn."id"'),
+      expect.stringContaining("to_jsonb(turn)"), "COMMIT",
+    ])
+    expect(calls[1]?.values).toEqual(["app.user_id", owner.userId])
+    expect(calls.some(call => call.sql.includes("agent_native_semantic_rejections") || call.sql.includes("information_schema"))).toBe(false)
+    expect(client.release).toHaveBeenCalledOnce()
+  })
+
   it("linearizes tool start against pause on the locked Session before writing its started event", async () => {
     const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
     const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {

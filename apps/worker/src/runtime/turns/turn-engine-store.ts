@@ -1,15 +1,15 @@
-import type pg from "pg"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import type { ExecutionOwnerFence } from "../execution-owner.js"
-import { ownerFenceSql } from "./turn-engine-owner-sql.js"
+import { assertCurrentItemLineage, assertCurrentStepLineage, lockTurnEngineOpenSession as lockOpenSession, lockTurnEngineOwnedTurn as lockOwnedTurn, ownerFenceSql, turnEngineTenantTransaction as tenantTransaction, type TurnEnginePool, type TurnEngineQueryClient as QueryClient, type TurnEngineRow as Row } from "./turn-engine-owner-sql.js"
 import { enforceRootStepAndUsageBudgets, enforceRootToolCallBudget } from "./turn-engine-root-budget.js"
 import { toRepositoryJson, type TurnEngineEventInput, type TurnEngineItem, type TurnEngineStore, type TurnEngineStep } from "./turn-engine-types.js"
 import { STEERING_MARKER_EVENT_TYPE, parseSteeringMarkerPayload, type SteeringMarkerPayload } from "../context/steering-marker.js"
 import { matchesAgentOutboxIdentity, type AgentOutboxIdentity, type AgentOutboxPayload } from "../outbox-identity.js"
 import { commitTurnTerminal, type TurnEngineTerminalGuard } from "./turn-engine-terminal-commit.js"
 import { assertSessionWorkAdmission } from "../session-gate.js"
-type TurnEnginePool = Pick<pg.Pool, "connect">; type QueryClient = Pick<pg.PoolClient, "query" | "release">; type Row = Record<string, unknown>
-const OPEN_SESSION = `"status" NOT IN ('aborted', 'archived')`
+import { resolveNativeSemanticProgressModeWithClient } from "./native-semantic-mode-store.js"
+import { completeNativeSemanticRejectionStepWithClient } from "./native-semantic-rejection-completion.js"
+import { nativeSemanticSchemaConflict, readNativeSemanticRejectionsWithClient } from "./native-semantic-rejection-ledger.js"
 function json(value: RepositoryJsonValue): string { return JSON.stringify(value) }
 function conflict(resource: string): Error {
   const error = new Error(`TurnEngine persistence conflict: ${resource}`)
@@ -25,19 +25,6 @@ function sameEventPayload(type: unknown, left: unknown, right: unknown): boolean
   const leftMarker = parseSteeringMarkerPayload(left), rightMarker = parseSteeringMarkerPayload(right)
   return leftMarker !== null && rightMarker !== null && markerIdentity(leftMarker) === markerIdentity(rightMarker)
 }
-async function tenantTransaction<T>(pool: TurnEnginePool, userId: string, work: (client: QueryClient) => Promise<T>): Promise<T> {
-  const client = await pool.connect(); let committed = false
-  try {
-    await client.query("BEGIN")
-    await client.query("SELECT set_config($1, $2, true)", ["app.user_id", userId])
-    const result = await work(client)
-    await client.query("COMMIT"); committed = true
-    return result
-  } catch (error: unknown) {
-    if (!committed) await client.query("ROLLBACK").catch(() => undefined)
-    throw error
-  } finally { client.release() }
-}
 function ownedTurn(owner: ExecutionOwnerFence, base: number, turnIdParameter: number, sessionParameter: number, allowWaiting = false): { sql: string; values: unknown[] } {
   const fence = ownerFenceSql(owner, base, allowWaiting)
   return {
@@ -45,36 +32,6 @@ function ownedTurn(owner: ExecutionOwnerFence, base: number, turnIdParameter: nu
       WHERE turn."id" = $${turnIdParameter} AND turn."sessionId" = $${sessionParameter} AND ${fence.where}`,
     values: [...fence.values],
   }
-}
-async function lockOwnedTurn(client: QueryClient, owner: ExecutionOwnerFence, allowWaiting = false): Promise<boolean> {
-  const fence = ownerFenceSql(owner, 1, allowWaiting)
-  const result = owner.kind === "turn"
-    ? await client.query<Row>(`SELECT turn."id" FROM "agent_turns" AS turn ${fence.joins} WHERE turn."id" = $5 AND turn."sessionId" = $6 AND ${fence.where} FOR UPDATE`, [...fence.values, owner.turnId, owner.sessionId])
-    : await client.query<Row>(`SELECT turn."id" FROM "agent_turns" AS turn ${fence.joins} WHERE turn."id" = $3 AND turn."sessionId" = $2 AND ${fence.where} FOR UPDATE`, fence.values as unknown[])
-  return Boolean(result.rows[0])
-}
-async function lockOpenSession(client: QueryClient, owner: ExecutionOwnerFence): Promise<boolean> {
-  const result = await client.query<Row>(`SELECT "id" FROM "agent_sessions"
-    WHERE "id" = $1 AND "userId" = $2 AND ${OPEN_SESSION} FOR UPDATE`, [owner.sessionId, owner.userId])
-  return Boolean(result.rows[0])
-}
-async function assertCurrentStepLineage(client: QueryClient, owner: ExecutionOwnerFence, stepId: string | null): Promise<void> {
-  if (!stepId) return
-  const attempt = owner.kind === "task" ? owner.attemptCount : 1
-  const result = await client.query<Row>(`SELECT "id" FROM "agent_steps"
-    WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 AND "attempt" = $5`,
-  [stepId, owner.sessionId, owner.turnId, owner.taskId, attempt])
-  if (!result.rows[0]) throw conflict(`step ${stepId} lineage`)
-}
-async function assertCurrentItemLineage(client: QueryClient, owner: ExecutionOwnerFence, itemId: string): Promise<void> {
-  const attempt = owner.kind === "task" ? owner.attemptCount : 1
-  const result = await client.query<Row>(`SELECT item."id" FROM "agent_items" AS item
-    WHERE item."id" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4
-      AND (item."stepId" IS NULL OR EXISTS (SELECT 1 FROM "agent_steps" AS owner_step
-        WHERE owner_step."id" = item."stepId" AND owner_step."sessionId" = item."sessionId"
-          AND owner_step."turnId" = item."turnId" AND owner_step."taskId" = item."taskId" AND owner_step."attempt" = $5))`,
-  [itemId, owner.sessionId, owner.turnId, owner.taskId, attempt])
-  if (!result.rows[0]) throw conflict(`item ${itemId} lineage`)
 }
 function eventOutboxPayload(input: { readonly owner: ExecutionOwnerFence; readonly itemId: string | null; readonly type: string; readonly correlationId: string; readonly causationId: string | null; readonly idempotencyKey: string; readonly eventId: string; readonly sequence: string; readonly actor: string; readonly payload: RepositoryJsonValue }): AgentOutboxPayload {
   return { eventId: input.eventId, sessionId: input.owner.sessionId, turnId: input.owner.turnId, taskId: input.owner.taskId, itemId: input.itemId, sequence: input.sequence, type: input.type, actor: input.actor, correlationId: input.correlationId, causationId: input.causationId, idempotencyKey: input.idempotencyKey, payload: input.payload }
@@ -131,6 +88,18 @@ async function appendEventBatch(pool: TurnEnginePool, inputs: readonly TurnEngin
 }
 export function createPgTurnEngineStore(pool: TurnEnginePool, terminalGuard?: TurnEngineTerminalGuard): TurnEngineStore {
   return {
+    async resolveNativeSemanticProgressMode(input) {
+      try { return await tenantTransaction(pool, input.owner.userId, client => resolveNativeSemanticProgressModeWithClient(client, input)) }
+      catch (error: unknown) { return nativeSemanticSchemaConflict(error) }
+    },
+    async readNativeSemanticRejections(input) {
+      try { return await tenantTransaction(pool, input.owner.userId, client => readNativeSemanticRejectionsWithClient(client, input)) }
+      catch (error: unknown) { return nativeSemanticSchemaConflict(error) }
+    },
+    async completeNativeSemanticRejectionStep(input) {
+      try { return await tenantTransaction(pool, input.owner.userId, client => completeNativeSemanticRejectionStepWithClient(client, input)) }
+      catch (error: unknown) { return nativeSemanticSchemaConflict(error) }
+    },
     async startStep(input): Promise<TurnEngineStep> {
       const actualAttempt = input.owner.kind === "task" ? input.owner.attemptCount : 1
       if (input.attempt !== actualAttempt) throw conflict(`step ${input.stepId} attempt`)

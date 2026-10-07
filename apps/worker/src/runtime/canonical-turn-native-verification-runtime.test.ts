@@ -10,6 +10,8 @@ import type { TurnEngineTerminalGuard } from "./turns/turn-engine-terminal-commi
 import { createCanonicalNativeVerificationRuntime, createCanonicalRootCompletionGate, createCanonicalTurnTerminalGuard, type NativeVerificationRuntime } from "./canonical-turn-native-verification-runtime.js"
 
 const candidate = "A current root answer with verified evidence."
+const owner = { kind: "turn" as const, taskId: "root-1", rootTaskId: "root-1", userId: "user-1", sessionId: "session-1",
+  turnId: "turn-1", ownerId: "worker-1", leaseVersion: 2, leaseExpiresAt: new Date(1) }
 const scope: TaskGraphExecutionScope = {
   userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
   turnLeaseOwner: "worker-1", turnLeaseVersion: 2, parentLeaseOwner: "worker-1", parentAttemptCount: 3, stepId: "step-1",
@@ -44,6 +46,10 @@ function rootSemanticFailure(controlTaskId = "private-control-id"): NativeVerifi
     controlTaskId, targetTaskId: "root-1", disposition: "failed",
     criteria: [{ criterionId: "current-evidence", disposition: "failed", reasonCode: "does_not_meet_criterion", evidenceReferenceIds: [] }],
   }] }
+}
+function configureLegacyProgress(runtime: ReturnType<typeof createCanonicalNativeVerificationRuntime>) {
+  runtime.configureSemanticProgress({ mode: "legacy_v1", store: {}, owner })
+  return runtime
 }
 
 describe("canonical native verification runtime composition", () => {
@@ -95,7 +101,7 @@ describe("canonical native verification runtime composition", () => {
       ensureRootGoal: vi.fn(async () => rootSemanticFailure()), readRecoverableGoal: vi.fn(async () => null),
     }
     const factory = vi.fn(() => ({ port, readTerminalProof: vi.fn(async () => true) }))
-    const runtime = createCanonicalNativeVerificationRuntime({ pool: {} as pg.Pool, factory, coordination: coordination(), durableWaitPort: waitPort, enabled: true })
+    const runtime = configureLegacyProgress(createCanonicalNativeVerificationRuntime({ pool: {} as pg.Pool, factory, coordination: coordination(), durableWaitPort: waitPort, enabled: true }))
     const first = await runtime.checkCompletion("step-1", candidate)
     const replay = await runtime.checkCompletion("step-1", candidate)
     const second = await runtime.checkCompletion("step-2", candidate)
@@ -120,8 +126,8 @@ describe("canonical native verification runtime composition", () => {
       ensureChildren: vi.fn(async () => ({ status: "passed" as const, controlTaskIds: [], pendingControlTaskIds: [], pendingTaskIds: [], feedback: [] })),
       ensureRootGoal: vi.fn(async () => failures[index++] ?? rootSemanticFailure()), readRecoverableGoal: vi.fn(async () => null),
     }
-    const runtime = createCanonicalNativeVerificationRuntime({ pool: {} as pg.Pool, factory: () => ({ port, readTerminalProof: vi.fn(async () => true) }),
-      coordination: coordination(), durableWaitPort: waitPort, enabled: true })
+    const runtime = configureLegacyProgress(createCanonicalNativeVerificationRuntime({ pool: {} as pg.Pool, factory: () => ({ port, readTerminalProof: vi.fn(async () => true) }),
+      coordination: coordination(), durableWaitPort: waitPort, enabled: true }))
     const results = []
     for (let step = 1; step <= 9; step += 1) results.push(await runtime.checkCompletion(`step-${step}`, candidate))
     expect(results.slice(0, 5).every(result => !result || result.ok || result[NATIVE_SEMANTIC_NO_PROGRESS] === undefined)).toBe(true)
@@ -183,10 +189,10 @@ describe("canonical native verification runtime composition", () => {
     const matrixWaitPort: DurableWaitPort = { wait: vi.fn(async () => ({
       waitId: "matrix-wait", status: "waiting" as const, deadlineAt: "2099-01-01T00:00:00.000Z", matchedTaskIds: [],
     })) }
-    const runtime = createCanonicalNativeVerificationRuntime({
+    const runtime = configureLegacyProgress(createCanonicalNativeVerificationRuntime({
       pool: {} as pg.Pool, factory: () => ({ port, readTerminalProof: vi.fn(async () => true) }),
       coordination: current, durableWaitPort: matrixWaitPort, enabled: true,
-    })
+    }))
     let step = 0
     const check = () => runtime.checkCompletion(`matrix-${outcome}-${++step}`, candidate)
     const stopped = (result: Awaited<ReturnType<typeof check>>) =>

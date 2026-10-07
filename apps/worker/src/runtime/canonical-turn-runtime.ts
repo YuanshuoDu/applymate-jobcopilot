@@ -45,6 +45,7 @@ import { INTERACTIVE_DISCOVERY_TEMPLATES, rootTaskAllowedActions, rootToolSurfac
 import type { SubagentTaskRecord } from "./subagents/types.js"
 import { toolSafeDurableWaitPort } from "./tools/coordination-executor-support.js"
 import { createCanonicalNativeVerificationRuntime, createCanonicalRootCompletionGate, createCanonicalSelectedJobCompletion, createCanonicalTurnTerminalGuard, loadNativeVerificationRootContext, prepareNativeVerificationRootContext, type NativeVerificationRuntime } from "./canonical-turn-native-verification-runtime.js"
+import { resolveNativeSemanticProgressMode } from "./canonical-turn-native-semantic-rejection.js"
 export { durableLifecycleSink } from "./turns/canonical-runtime-tool-recovery.js"
 export type { UsageAuthorization } from "./canonical-turn-runtime-model.js"
 export type CanonicalTurnRuntimeOptions = {
@@ -185,6 +186,8 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
     const turnStore = interactiveDiscoveryMode ? withInteractiveDiscoveryFinalResponse(baseTurnStore, () => acceptedDiscoveryShortlist) : baseTurnStore
     const owner = executionOwnerFence({ kind: "turn", taskId: root.id, lease })
     if (owner.kind !== "turn") throw new Error("turn_owner_fence_invalid")
+    const nativeSemanticProgressMode = await resolveNativeSemanticProgressMode({ store: turnStore, owner, requestedEnabled: productionFlags?.nativeSemanticProgressMemoryEnabled === true && taskGraphPlanningEnabled, now: now() })
+    nativeVerification.configureSemanticProgress({ mode: nativeSemanticProgressMode, store: turnStore, owner })
     lifecycleOwner = { kind: "turn", taskId: root.id, lease }
     lifecycleSink = options.lifecycleSinkFactory?.({ lease, store: turnStore, owner }) ?? durableLifecycleSink(turnStore, owner)
     const config = options.modelRuntimeFactory ? undefined : await loadWorkerAiConfig(lease.userId)
@@ -220,6 +223,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       rootInputId: state.rootInputId, rootTaskId: root.id, taskId: root.id,
       actorRole, capabilities: toolCapabilities,
       signal,
+      nativeSemanticProgressMode,
       budget: limits(state.budgetSnapshot), resume: state.resume, now, publishReasoningSummary: false,
       steeringMarkerState: { active: state.steeringMarkers?.active ?? [] }, ...(taskGraphPlanningEnabled ? { refreshTaskGraphAfterReadyWait: turnCoordination.refresh, refreshTaskGraphAfterPlan: turnCoordination.refresh } : {}),
       ...(nativeRecovery.candidateText !== undefined ? { recoveredFinalCandidate: nativeRecovery.candidateText } : {}),

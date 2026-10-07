@@ -3,7 +3,9 @@ import { digestNativeVerificationValue, type NativeVerificationDisposition, type
 import type { NativeVerificationEnsureResult, NativeVerificationFeedback, NativeVerificationPort, NativeVerificationRootGoalWitness } from "./subagents/native-verification-port.js"
 import type { TaskGraphExecutionScope } from "./subagents/task-graph-command-port.js"
 import type { DurableWaitResult } from "./tools/coordination-types.js"
-import { NATIVE_SEMANTIC_NO_PROGRESS, type TurnEngineCompletionGateResult } from "./turns/turn-execution-types.js"
+import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, type TurnEngineCompletionGateResult } from "./turns/turn-execution-types.js"
+import { parseNativeSemanticRejectionIdentity, type NativeSemanticRejectionIdentity } from "./turns/native-semantic-rejection-ledger.js"
+import { TurnEngineError } from "./turns/turn-engine-types.js"
 
 const HASH = /^[a-f0-9]{64}$/
 const REASONS: readonly NativeVerificationReasonCode[] = ["meets_criterion", "does_not_meet_criterion", "evidence_missing", "evidence_conflict", "ambiguous", "unsupported_claim"]
@@ -143,7 +145,7 @@ export async function nativeVerificationCompletionGate(input: Readonly<{
   hasNativeTasks(): Promise<boolean>
   checkReceipt(): Promise<TurnEngineCompletionGateResult | null>
   wait: NativeVerificationWaiter
-  observeRootSemanticRejection?(controlTaskId: string): boolean
+  observeRootSemanticRejection?(input: Readonly<{ scope: TaskGraphExecutionScope; candidateText: string; controlTaskId: string }>): boolean | NativeSemanticRejectionIdentity | Promise<boolean | NativeSemanticRejectionIdentity>
   accept(witness: NativeVerificationRootGoalWitness, candidateText: string): void
 }>): Promise<TurnEngineCompletionGateResult | null> {
   const receipt = await input.checkReceipt()
@@ -153,11 +155,14 @@ export async function nativeVerificationCompletionGate(input: Readonly<{
   const scope = typeof input.scope === "function" ? input.scope() : input.scope
   const result = await verifyNativeRootCandidate({ port: input.port, scope, candidateText: input.candidateText, wait: input.wait })
   if (result.kind === "blocked") {
-    const stop = result.semanticRejectionControlTaskId
-      ? input.observeRootSemanticRejection?.(result.semanticRejectionControlTaskId) === true
-      : false
+    const observed = result.semanticRejectionControlTaskId ? await input.observeRootSemanticRejection?.({ scope,
+      candidateText: input.candidateText, controlTaskId: result.semanticRejectionControlTaskId }) : undefined
+    const identity = observed === undefined || typeof observed === "boolean" ? undefined : parseNativeSemanticRejectionIdentity(observed)
+    if (observed !== undefined && typeof observed !== "boolean" && !identity) throw new TurnEngineError("persistence_conflict", "Native semantic rejection identity is invalid")
+    const stop = observed === true
     return { ok: false, blocker: "task_graph_verification_unverified", feedback: result.feedback,
-      ...(stop ? { [NATIVE_SEMANTIC_NO_PROGRESS]: true as const } : {}) }
+      ...(stop ? { [NATIVE_SEMANTIC_NO_PROGRESS]: true as const } : {}),
+      ...(identity ? { [NATIVE_SEMANTIC_REJECTION]: identity } : {}) }
   }
   if (result.kind === "pending") return { ok: false, blocker: "native_verification_pending", feedback: "Independent native verification is waiting on durable child work.", waitId: result.waitId }
   input.accept(result.witness, input.candidateText)

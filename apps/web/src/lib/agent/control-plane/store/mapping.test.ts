@@ -12,6 +12,13 @@ describe("web repository mapping", () => {
     expect(mapEvent({ id: "e", sessionId: "s", turnId: "t", itemId: null, taskId: null, sequence: BigInt(1), type: "item.started", actor: "orchestrator", correlationId: "c", causationId: null, idempotencyKey: "k", payload: { ok: true }, createdAt: date })).toMatchObject({ sequence: BigInt(1), createdAt: date.toISOString() })
   })
 
+  it("does not expose internal semantic mode fields from Prisma rows", () => {
+    const row = { id: "t", sessionId: "s", userId: "u", source: "user", status: "queued", revision: 0,
+      createdAt: date, updatedAt: date, nativeSemanticProgressMode: "durable_v1" }
+    const projected = mapTurn(row as Parameters<typeof mapTurn>[0])
+    expect(projected).not.toHaveProperty("nativeSemanticProgressMode")
+  })
+
   it("fails closed for malformed JSON projections", () => {
     expect(() => mapItem({ id: "i", sessionId: "s", turnId: "t", stepId: null, taskId: null, type: "agent_message", status: "started", phase: null, revision: 0, content: new Date(), startedAt: null, completedAt: null, createdAt: date, updatedAt: date })).toThrow("invalid JSON")
   })
