@@ -1,6 +1,5 @@
 export type FeedbackDisposition = 'passed' | 'failed' | 'uncertain'
 export type FeedbackReason = 'meets_criterion' | 'does_not_meet_criterion' | 'evidence_missing' | 'evidence_conflict' | 'ambiguous' | 'unsupported_claim'
-
 export type FeedbackCheck = Readonly<{ disposition: FeedbackDisposition; reason: FeedbackReason }>
 export type FeedbackGroup = Readonly<{ checks: readonly FeedbackCheck[] }>
 export type FeedbackView =
@@ -20,16 +19,17 @@ const SUBAGENT_RESULT_SCHEMA = 'agent-harness.v2.subagent.result'
 const ROLE_FIELDS = { scout: ['schemaVersion', 'role', 'status', 'candidates', 'evidence', 'summary'], analyst: ['schemaVersion', 'role', 'status', 'findings', 'evidence', 'summary'], writer: ['schemaVersion', 'role', 'status', 'artifactRef'], reviewer: ['schemaVersion', 'role', 'status', 'artifactRef', 'reviewStatus', 'reviewHash'] } as const
 const EVIDENCE_FIELDS = ['id', 'kind', 'ref', 'source'] as const, CANDIDATE_FIELDS = ['jobId', 'source', 'url', 'evidenceIds'] as const, FINDING_FIELDS = ['jobId', 'score', 'evidenceIds'] as const, ARTIFACT_FIELDS = ['artifactId', 'version', 'contentHash', 'sourceDigest'] as const
 const EVIDENCE_KINDS = new Set<unknown>(['job', 'persona', 'resume', 'source']), REVIEW_STATUSES = ['passed', 'needs_revision', 'rejected', 'stale'] as const
+// Bound total role-array traversal regardless of the input path.
+const ROLE_RESULT_ARRAY_ENTRY_LIMIT = 4_096
 const SHA256 = /^sha256:[a-f0-9]{64}$/
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
-
 type Slot = { readonly found: false } | { readonly found: true; readonly value: unknown }
+type RoleResultArrayBudget = { remaining: number }
 
 /** Reads only the public feedback slot, never server verification receipts. */
 export function extractNativeVerificationFeedback(value: unknown): FeedbackView {
   try { return extract(value) } catch { return { state: 'unavailable' } }
 }
-
 /** Removes only recognized feedback/proof fields before the generic JSON row renders. */
 export function safeNativeFeedbackOutput(value: unknown): unknown {
   try {
@@ -52,7 +52,6 @@ export function safeNativeFeedbackOutput(value: unknown): unknown {
     return { ...copy, tasks: safeTasks }
   } catch { return '[unavailable]' }
 }
-
 function extract(value: unknown): FeedbackView {
   const direct = extractDirectResult(value)
   if (direct.state !== 'none') return direct
@@ -67,7 +66,6 @@ function extract(value: unknown): FeedbackView {
   const tasks = own(root, 'tasks')
   if (!status.found || !isWaitStatus(status.value) || !tasks.found) return { state: 'none' }
   if (!denseArray(tasks.value, 8, 0)) return { state: 'unavailable' }
-
   const groups: FeedbackGroup[] = []
   for (const task of tasks.value) {
     const taskRecord = record(task)
@@ -80,7 +78,6 @@ function extract(value: unknown): FeedbackView {
   }
   return groups.length ? available(groups) : { state: 'none' }
 }
-
 function extractDirectResult(value: unknown): FeedbackView {
   const root = record(value)
   if (!root) return { state: 'none' }
@@ -90,7 +87,6 @@ function extractDirectResult(value: unknown): FeedbackView {
   const parsed = parseFeedback(direct.value)
   return parsed ? available([parsed]) : { state: 'unavailable' }
 }
-
 function extractNestedSubagentResult(value: unknown): FeedbackView {
   const root = record(value)
   if (!root) return { state: 'none' }
@@ -100,7 +96,6 @@ function extractNestedSubagentResult(value: unknown): FeedbackView {
   if (report.found || !isCanonicalCompletedSubagentResult(root)) return { state: 'unavailable' }
   return extractDirectResult(root)
 }
-
 function isCanonicalCompletedSubagentResult(value: Record<string, unknown>): boolean {
   const envelope = exactRecord(value, SUBAGENT_RESULT_FIELDS)
   if (!envelope || envelope.status !== 'completed'
@@ -110,7 +105,6 @@ function isCanonicalCompletedSubagentResult(value: Record<string, unknown>): boo
     || typeof envelope.finalText !== 'string') return false
   return isRoleResult(envelope.structuredResult)
 }
-
 function isRoleResult(value: unknown): boolean {
   const root = record(value); if (!root) return false
   const schema = own(root, 'schemaVersion'), role = own(root, 'role')
@@ -121,32 +115,44 @@ function isRoleResult(value: unknown): boolean {
 function isListRoleResult(value: Record<string, unknown>, role: 'scout' | 'analyst'): boolean {
   const result = exactRecord(value, ROLE_FIELDS[role])
   if (!result || result.schemaVersion !== SUBAGENT_RESULT_SCHEMA || result.role !== role || (result.status !== 'completed' && result.status !== 'partial') || typeof result.summary !== 'string') return false
-  const evidence = parseRoleEvidence(result.evidence)
-  return Boolean(evidence && isRoleItemsValid(role, result[role === 'scout' ? 'candidates' : 'findings'], evidence))
+  const budget = { remaining: ROLE_RESULT_ARRAY_ENTRY_LIMIT }
+  const evidence = parseRoleEvidence(result.evidence, budget)
+  return Boolean(evidence && isRoleItemsValid(role, result[role === 'scout' ? 'candidates' : 'findings'], evidence, budget))
 }
-function parseRoleEvidence(value: unknown): Record<string, unknown>[] | null {
-  if (!denseArray(value, Number.MAX_SAFE_INTEGER, 0)) return null
-  const rows: Record<string, unknown>[] = [], ids = new Set<string>()
+function parseRoleEvidence(value: unknown, budget: RoleResultArrayBudget): Map<string, Record<string, unknown>> | null {
+  if (!roleResultArray(value, budget, 0)) return null
+  const rows = new Map<string, Record<string, unknown>>()
   for (const raw of value) {
     const row = exactRecord(raw, EVIDENCE_FIELDS)
     if (!row || !nonEmpty(row.id) || !nonEmpty(row.ref) || !nonEmpty(row.source)
-      || !EVIDENCE_KINDS.has(row.kind) || ids.has(row.id)) return null
-    ids.add(row.id); rows.push(row)
+      || !EVIDENCE_KINDS.has(row.kind) || rows.has(row.id)) return null
+    rows.set(row.id, row)
   }
   return rows
 }
-function isRoleItemsValid(role: 'scout' | 'analyst', value: unknown, evidence: readonly Record<string, unknown>[]): boolean {
-  if (!denseArray(value, Number.MAX_SAFE_INTEGER, 0)) return false
+function isRoleItemsValid(role: 'scout' | 'analyst', value: unknown, evidence: ReadonlyMap<string, Record<string, unknown>>, budget: RoleResultArrayBudget): boolean {
+  if (!roleResultArray(value, budget, 0)) return false
   for (const raw of value) {
     const item = exactRecord(raw, role === 'scout' ? CANDIDATE_FIELDS : FINDING_FIELDS)
     if (!item || !nonEmpty(item.jobId) || (role === 'scout'
       ? !nonEmpty(item.source) || (item.url !== null && !nonEmpty(item.url))
       : typeof item.score !== 'number' || !Number.isFinite(item.score) || item.score < 0 || item.score > 10)) return false
     const ids = item.evidenceIds
-    if (!denseArray(ids, Number.MAX_SAFE_INTEGER) || !ids.every(nonEmpty)
-      || !ids.every(id => evidence.some(row => row.id === id))
-      || !ids.some(id => evidence.some(row => row.id === id && row.kind === 'job' && row.ref === item.jobId))) return false
+    if (!roleResultArray(ids, budget)) return false
+    let hasMatchingJobEvidence = false
+    for (const id of ids) {
+      if (!nonEmpty(id)) return false
+      const row = evidence.get(id)
+      if (!row) return false
+      if (row.kind === 'job' && row.ref === item.jobId) hasMatchingJobEvidence = true
+    }
+    if (!hasMatchingJobEvidence) return false
   }
+  return true
+}
+function roleResultArray(value: unknown, budget: RoleResultArrayBudget, minLength = 1): value is unknown[] {
+  if (!denseArray(value, ROLE_RESULT_ARRAY_ENTRY_LIMIT, minLength) || value.length > budget.remaining) return false
+  budget.remaining -= value.length
   return true
 }
 function isArtifactRoleResult(value: Record<string, unknown>, role: 'writer' | 'reviewer'): boolean {
@@ -181,7 +187,6 @@ function parseFeedback(value: unknown): FeedbackGroup | null {
     : checks.some(check => check.disposition === 'uncertain') ? 'uncertain' : 'passed'
   return aggregate === feedback.disposition ? { checks } : null
 }
-
 function available(groups: readonly FeedbackGroup[]): FeedbackView { return { state: 'available', groups } }
 function isDisposition(value: unknown): value is FeedbackDisposition { return typeof value === 'string' && DISPOSITIONS.includes(value as FeedbackDisposition) }
 function isReason(value: unknown): value is FeedbackReason { return typeof value === 'string' && REASONS.includes(value as FeedbackReason) }
@@ -196,7 +201,6 @@ function record(value: unknown): Record<string, unknown> | null {
       ? value as Record<string, unknown> : null
   } catch { return null }
 }
-
 function exactRecord(value: unknown, fields: readonly string[]): Record<string, unknown> | null {
   const parsed = record(value)
   if (!parsed) return null
@@ -206,14 +210,12 @@ function exactRecord(value: unknown, fields: readonly string[]): Record<string, 
     return keys.every(key => { const descriptor = Object.getOwnPropertyDescriptor(parsed, key); return Boolean(descriptor?.enumerable && 'value' in descriptor) }) ? parsed : null
   } catch { return null }
 }
-
 function own(value: Record<string, unknown>, key: string): Slot {
   const descriptor = Object.getOwnPropertyDescriptor(value, key)
   if (!descriptor) return { found: false }
   if (!descriptor.enumerable || !('value' in descriptor)) throw new Error('feedback_slot_invalid')
   return { found: true, value: descriptor.value }
 }
-
 function denseArray(value: unknown, maxLength: number, minLength = 1): value is unknown[] {
   if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype || value.length < minLength || value.length > maxLength
     || Object.getOwnPropertySymbols(value).length) return false
@@ -225,7 +227,6 @@ function denseArray(value: unknown, maxLength: number, minLength = 1): value is 
   }
   return true
 }
-
 function copyWithout(value: Record<string, unknown>, excluded: readonly string[]): Record<string, unknown> {
   const copy: Record<string, unknown> = {}
   for (const key of Object.getOwnPropertyNames(value)) {
@@ -235,13 +236,11 @@ function copyWithout(value: Record<string, unknown>, excluded: readonly string[]
   }
   return copy
 }
-
 function copyWith(value: Record<string, unknown>, key: string, replacement: unknown): Record<string, unknown> {
   const copy = copyWithout(value, [])
   copy[key] = replacement
   return copy
 }
-
 function stripDirectResult(value: unknown): unknown {
   const result = record(value)
   if (!result) return value

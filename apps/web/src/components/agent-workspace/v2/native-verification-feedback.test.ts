@@ -51,6 +51,7 @@ describe('native verification feedback projection', () => {
     const artifactRef = { artifactId: 'artifact-1', version: 2, contentHash: `sha256:${'a'.repeat(64)}`, sourceDigest: `sha256:${'b'.repeat(64)}` }
     const validResults = [
       { schemaVersion, role: 'scout', status: 'completed', candidates: [{ jobId: 'job-1', source: 'greenhouse', url: null, evidenceIds: ['ev-job-1'] }], evidence: [{ id: 'ev-job-1', kind: 'job', ref: 'job-1', source: 'greenhouse' }], summary: 'one candidate' },
+      { schemaVersion, role: 'analyst', status: 'partial', findings: [{ jobId: 'job-1', score: 8, evidenceIds: ['ev-job-1'] }], evidence: [{ id: 'ev-job-1', kind: 'job', ref: 'job-1', source: 'greenhouse' }], summary: 'one finding' },
       { schemaVersion, role: 'writer', status: 'completed', artifactRef },
       { schemaVersion, role: 'reviewer', status: 'completed', artifactRef, reviewStatus: 'passed', reviewHash: `sha256:${'c'.repeat(64)}` },
     ]
@@ -62,11 +63,35 @@ describe('native verification feedback projection', () => {
       { schemaVersion, role: 'analyst', status: 'completed', candidates: [], evidence: [], summary: 'wrong role payload' },
       { schemaVersion, role: 'analyst', status: 'completed', findings: [{ jobId: 'job-1', score: 11, evidenceIds: ['ev-job-1'] }], evidence: [{ id: 'ev-job-1', kind: 'job', ref: 'job-1', source: 'greenhouse' }], summary: 'invalid score' },
       { schemaVersion, role: 'scout', status: 'completed', candidates: [{ jobId: 'job-1', source: 'greenhouse', url: null, evidenceIds: ['ev-job-1'] }], evidence: [{ id: 'ev-job-1', kind: 'job', ref: 'job-other', source: 'greenhouse' }], summary: 'unmatched job evidence' },
+      { schemaVersion, role: 'scout', status: 'completed', candidates: Array.from({ length: 4_097 }, () => ({ jobId: 'job-1', source: 'greenhouse', url: null, evidenceIds: ['ev-job-1'] })), evidence: [{ id: 'ev-job-1', kind: 'job', ref: 'job-1', source: 'greenhouse' }], summary: 'too many candidates' },
+      { schemaVersion, role: 'analyst', status: 'completed', findings: [], evidence: Array.from({ length: 4_097 }, (_, index) => ({ id: `ev-${index}`, kind: 'job', ref: 'job-1', source: 'greenhouse' })), summary: 'too much evidence' },
+      { schemaVersion, role: 'scout', status: 'completed', candidates: [{ jobId: 'job-1', source: 'greenhouse', url: null, evidenceIds: Array.from({ length: 4_097 }, () => 'ev-job-1') }], evidence: [{ id: 'ev-job-1', kind: 'job', ref: 'job-1', source: 'greenhouse' }], summary: 'too many evidence references' },
+      { schemaVersion, role: 'scout', status: 'completed', candidates: Array.from({ length: 2_048 }, () => ({ jobId: 'job-1', source: 'greenhouse', url: null, evidenceIds: ['ev-job-1'] })), evidence: [{ id: 'ev-job-1', kind: 'job', ref: 'job-1', source: 'greenhouse' }], summary: 'too many aggregate array entries' },
       { schemaVersion, role: 'writer', status: 'completed', artifactRef: { ...artifactRef, contentHash: 'unbound' } },
       { schemaVersion, role: 'reviewer', status: 'completed', artifactRef, reviewStatus: 'passed', reviewHash: 'unbound' },
       { schemaVersion, role: 'reviewer', status: 'completed', artifactRef, reviewStatus: 'unknown', reviewHash: `sha256:${'c'.repeat(64)}` },
     ]
     for (const structuredResult of invalidResults) expect(viewOf({ result: canonicalEnvelope(feedback(), { structuredResult }) })).toEqual({ state: 'unavailable' })
+  })
+
+  it('accepts the exact role-result array budget and fails closed on sparse or mismatched evidence references', () => {
+    const schemaVersion = 'agent-harness.v2.subagent.result'
+    const evidence = Array.from({ length: 4_094 }, (_, index) => index === 0
+      ? { id: 'ev-job-1', kind: 'job', ref: 'job-1', source: 'greenhouse' }
+      : { id: `ev-${index}`, kind: 'persona', ref: `fact-${index}`, source: 'persona' })
+    const atBudget = {
+      schemaVersion, role: 'scout', status: 'completed',
+      candidates: [{ jobId: 'job-1', source: 'greenhouse', url: null, evidenceIds: ['ev-job-1'] }], evidence, summary: 'budget boundary',
+    }
+    expect(viewOf({ result: canonicalEnvelope(feedback(), { structuredResult: atBudget }) }).state).toBe('available')
+
+    const sparseCandidates = new Array(1)
+    const matchingEvidence = [{ id: 'ev-job-1', kind: 'job', ref: 'job-1', source: 'greenhouse' }]
+    const malformed = [
+      { schemaVersion, role: 'scout', status: 'completed', candidates: sparseCandidates, evidence: matchingEvidence, summary: 'sparse candidates' },
+      { schemaVersion, role: 'scout', status: 'completed', candidates: [{ jobId: 'job-1', source: 'greenhouse', url: null, evidenceIds: ['ev-job-1'] }], evidence: [{ ...matchingEvidence[0], id: 'EV-job-1' }], summary: 'case-mismatched evidence id' },
+    ]
+    for (const structuredResult of malformed) expect(viewOf({ result: canonicalEnvelope(feedback(), { structuredResult }) })).toEqual({ state: 'unavailable' })
   })
 
   it('accepts passed feedback after public reference filtering leaves no references', () => {
