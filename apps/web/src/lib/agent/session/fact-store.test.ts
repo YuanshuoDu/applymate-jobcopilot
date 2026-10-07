@@ -172,6 +172,29 @@ describe("agent fact store", () => {
     expect(eventPayload.note).toBe("Call [REDACTED_PHONE] or [REDACTED_EMAIL]")
   })
 
+  it("persists the server-typed task interrupt references in its event and outbox payload", async () => {
+    const { db, tx } = mockDb()
+    const sessionId = "70463535-1444-4bba-ae3b-b80578d2dd0b"
+    const turnId = "70463535-1444-4bba-ae3b-b80578d2dd0c"
+    const taskId = "task-70463535-1444-4bba-ae3b-b80578d2dd0a"
+    const intentId = "70463535-1444-4bba-ae3b-b80578d2dd0e"
+    const taskInput = {
+      sessionId, turnId, itemId: null, taskId, type: "task.interrupt.accepted", actor: "user",
+      correlationId: turnId, causationId: null,
+      idempotencyKey: `agent-task-interrupt-accepted:${sessionId}:interrupt_1`,
+      payload: { intentId, taskId, status: "accepted" }, outboxTopic: "agent.session.event",
+    } satisfies Parameters<typeof appendAgentEventWithOutbox>[1]
+
+    await appendAgentEventWithOutbox(db, taskInput)
+
+    const eventInput = tx.agentEvent.create.mock.calls[0]?.[0].data
+    const outbox = tx.agentOutbox.create.mock.calls[0]?.[0].data.payload as Record<string, unknown>
+    expect(eventInput).toMatchObject({ sessionId, turnId, itemId: null, taskId, type: "task.interrupt.accepted",
+      actor: "user", correlationId: turnId, causationId: null, payload: { intentId, taskId, status: "accepted" } })
+    expect(outbox).toMatchObject({ sessionId, turnId, itemId: null, taskId, type: "task.interrupt.accepted",
+      actor: "user", correlationId: turnId, causationId: null, payload: { intentId, taskId, status: "accepted" } })
+  })
+
   it("updates an Item only when the expected revision is current", async () => {
     const { db, tx } = mockDb()
 
