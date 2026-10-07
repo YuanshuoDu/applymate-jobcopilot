@@ -91,6 +91,18 @@ describe("native verification question source", () => {
     expect(fixture.query).toHaveBeenCalled()
   })
 
+  it("labels prior-turn evidence as an earlier user statement without changing current-turn evidence", async () => {
+    const source = answeredSource(), fixture = clientFor(source)
+    const current = await readNativeVerificationQuestionSource(fixture.client, identity, 16)
+    const earlier = await readNativeVerificationQuestionSource(fixture.client, identity, 16, { turnRelation: "earlier_turn" })
+    expect(JSON.parse(current![0]!.summary)).not.toHaveProperty("turnRelation")
+    expect(JSON.parse(earlier![0]!.summary)).toMatchObject({
+      kind: "user_self_attestation", statementSource: "user_statement", turnRelation: "earlier_turn",
+      stage: "user_input", question, options, answer: "Cork is my preference; café & <research> 🙂",
+    })
+    expect(earlier![0]!.referenceId).not.toBe(current![0]!.referenceId)
+  })
+
   it("returns an empty result for a source identity outside the owned session", async () => {
     const source = answeredSource(), fixture = clientFor(source)
     await expect(readNativeVerificationQuestionSource(fixture.client, { ...identity, sessionId: "other-session" }, 16))

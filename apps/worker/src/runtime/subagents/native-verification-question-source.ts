@@ -168,6 +168,7 @@ function validEvents(lineage: QuestionAnswerLineage, identity: NativeVerificatio
 
 export async function readNativeVerificationQuestionSource(
   client: Client, identity: NativeVerificationQuestionIdentity, maxQuestions: number,
+  context?: { readonly turnRelation: "earlier_turn" },
 ): Promise<readonly NativeVerificationEvidence[] | null> {
   if (!Number.isSafeInteger(maxQuestions) || maxQuestions < 1 || maxQuestions > 64) return null
   const lineages = await answeredLineage(client, identity, maxQuestions)
@@ -181,9 +182,11 @@ export async function readNativeVerificationQuestionSource(
       const binding = { owner: { userId: lineage.item.userId, sessionId: lineage.item.sessionId,
         turnId: lineage.item.turnId, taskId: lineage.item.taskId },
         item: { id: lineage.item.id, revision: lineage.item.revision, status: lineage.item.status, content: lineage.item.content },
-        step: source.step, startedEvent: lineage.startedEvent, answeredEvent: lineage.answeredEvent, call: source.call, result: source.result }
+        step: source.step, startedEvent: lineage.startedEvent, answeredEvent: lineage.answeredEvent, call: source.call, result: source.result,
+        ...(context ? { context: { statementSource: "user_statement", turnRelation: context.turnRelation } } : {}) }
       const referenceId = NATIVE_VERIFICATION_USER_SELF_ATTESTATION_REFERENCE_PREFIX + digestNativeVerificationValue(binding)
-      const summary = canonicalNativeVerificationJson({ kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND, stage: "user_input",
+      const summary = canonicalNativeVerificationJson({ kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND,
+        ...(context ? { statementSource: "user_statement", turnRelation: context.turnRelation } : {}), stage: "user_input",
         question: lineage.content.question, options: lineage.content.options, answer: lineage.content.answer })
       if (Buffer.byteLength(summary, "utf8") > NATIVE_VERIFICATION_PACKET_V2_MAX_BYTES) return null
       evidence.push({ referenceId, kind: NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND, summary })

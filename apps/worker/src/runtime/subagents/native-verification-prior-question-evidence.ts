@@ -61,7 +61,7 @@ export async function appendNativePriorQuestionSelfAttestations(
     if (!validId(row.id) || !validId(row.rootTaskId) || !validDate(row.createdAt) || row.createdAt >= current.createdAt) continue
     const source = await readNativeVerificationQuestionSource(client, {
       userId: current.identity.userId, sessionId: current.identity.sessionId, turnId: row.id, rootTaskId: row.rootTaskId,
-    }, MAX_QUESTIONS_PER_ROOT)
+    }, MAX_QUESTIONS_PER_ROOT, { turnRelation: "earlier_turn" })
     if (!source || source.length === 0) continue
     for (const pair of [...source].reverse()) {
       if (selected.length >= MAX_PRIOR_PAIRS || content.evidence.length + selected.length >= MAX_PACKET_EVIDENCE) break

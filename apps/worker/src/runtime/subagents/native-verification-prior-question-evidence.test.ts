@@ -154,9 +154,13 @@ describe("native prior question evidence", () => {
     expect(result?.criteria).toEqual(content.criteria)
     expect(result?.evidence[0]).toEqual(content.evidence[0])
     expect(result?.evidence[1]).toMatchObject({ kind: "user_self_attestation", summary: canonicalNativeVerificationJson({
-      kind: "user_self_attestation", stage: "user_input", question, options: choices, answer: "Cork is my preference; café & <research> 🙂",
+      kind: "user_self_attestation", statementSource: "user_statement", turnRelation: "earlier_turn",
+      stage: "user_input", question, options: choices, answer: "Cork is my preference; café & <research> 🙂",
     }) })
     expect(result?.evidence[1]?.referenceId).toMatch(/^user-self-attestation:[a-f0-9]{64}$/)
+    expect(JSON.parse(result!.evidence[1]!.summary)).toMatchObject({
+      kind: "user_self_attestation", statementSource: "user_statement", turnRelation: "earlier_turn", stage: "user_input",
+    })
     expect(attestedAnswers(result!)).toEqual(["Cork is my preference; café & <research> 🙂"])
   })
 
