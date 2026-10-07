@@ -22,37 +22,43 @@ function ownerRow(patch: Row = {}): Row {
 }
 function stepRow(patch: Row = {}): Row {
   return { id: "step-current", taskId: scope.rootTaskId, ordinal: 2, attempt: 1, status: "streaming",
-    inputThroughSequence: "9", consumedInputIds: ["root-input", "input-1"], ...patch }
+    inputThroughSequence: "9", consumedInputIds: [], ...patch }
 }
 function inputRow(patch: Row = {}): Row {
   return { id: "input-1", userId: scope.userId, sessionId: scope.sessionId, targetTurnId: scope.turnId,
     delivery: "steer", status: "consumed", content: [{ type: "text", text: "Use Dublin 🌍" }], acceptedSequence: "8",
     consumedByStepId: "step-origin", consumedAt: at, cancelledAt: null, ...patch }
 }
+function originalInputRow(patch: Row = {}): Row {
+  return { id: "root-input", userId: scope.userId, sessionId: scope.sessionId, targetTurnId: scope.turnId,
+    clientMessageId: "root-message", delivery: "follow_up", status: "consumed",
+    content: [{ type: "text", text: "Find jobs" }], acceptedSequence: "1", consumedByStepId: "step-origin",
+    consumedAt: at, cancelledAt: null, ...patch }
+}
+
 function sourceStep(patch: Row = {}): Row {
   return { id: "step-origin", taskId: scope.rootTaskId, ordinal: 1, attempt: 1, status: "completed",
     inputThroughSequence: "8", consumedInputIds: ["root-input", "input-1"], ...patch }
 }
 
 function fixture(options: {
-  owner?: Row; rootInputMessageId?: unknown; rootInputs?: Row[]; exactStep?: Row | null; latestSteps?: Row[]; sources?: Row[]; sourceSteps?: Row[]
+  owner?: Row; rootInputMessageId?: unknown; rootTurnInput?: Row; rootInputs?: Row[]; exactStep?: Row | null; latestSteps?: Row[]; sources?: Row[]; sourceSteps?: Row[]
   superseded?: boolean
 } = {}) {
   const calls: { sql: string; values: unknown[] }[] = []
+  const clientMessageId = options.rootInputMessageId === undefined ? (options.rootTurnInput?.clientMessageId ?? "root-message") : options.rootInputMessageId
+  const turnInput = options.rootTurnInput ?? { goal: "Find jobs", content: [{ type: "text", text: "Find jobs" }], clientMessageId }
   const query = vi.fn(async (sql: string, values: unknown[] = []) => {
     calls.push({ sql, values })
     if (sql.includes('FROM "agent_turns" AS turn')) return { rows: [ownerRow(options.owner)], rowCount: 1 }
-    if (sql.includes('FROM "agent_turns"') && sql.includes("->> 'clientMessageId'")) {
-      const clientMessageId = options.rootInputMessageId === undefined ? "root-message" : options.rootInputMessageId
-      const rows = typeof clientMessageId === "string" ? [{ clientMessageId }] : []
-      return { rows, rowCount: rows.length }
-    }
+    if (sql.includes('SELECT "input" FROM "agent_turns"')) return { rows: [{ input: turnInput }], rowCount: 1 }
     if (sql.includes('FROM "agent_inputs"') && sql.includes('"clientMessageId" = $4')) {
-      const rows = options.rootInputs ?? [{ id: "root-input", clientMessageId: "root-message" }]
+      const rows = options.rootInputs ?? [originalInputRow({ clientMessageId })]
       return { rows, rowCount: rows.length }
     }
     if (sql.includes('FROM "agent_inputs"') && sql.includes('"delivery" = \'steer\'')) {
-      return { rows: options.sources ?? [inputRow()], rowCount: (options.sources ?? [inputRow()]).length }
+      const rows = (options.sources ?? [inputRow()]).filter(row => row.id !== values[4])
+      return { rows, rowCount: rows.length }
     }
     if (sql.includes('FROM "agent_steps" AS step')) {
       const rows = options.superseded ? [] : [options.exactStep ?? stepRow()]
@@ -75,10 +81,10 @@ const exact = (stepId = "step-current"): NativeSteeringCheckpointSelection => ({
 
 describe("native verification consumed steering source", () => {
   it("rederives complete chronological text and stable source references across later candidate Steps", async () => {
-    const second = inputRow({ id: "input-2", acceptedSequence: "9", content: [{ type: "text", text: "Preserve all context." }] })
+    const second = inputRow({ id: "input-2", acceptedSequence: "9", consumedByStepId: "step-current", content: [{ type: "text", text: "Preserve all context." }] })
     const later = stepRow({ id: "step-later", ordinal: 4, inputThroughSequence: "11", consumedInputIds: [] })
-    const sourceSteps = [sourceStep({ inputThroughSequence: "9", consumedInputIds: ["root-input", "input-1", "input-2"] })]
-    const first = fixture({ exactStep: stepRow({ consumedInputIds: [] }), sources: [inputRow(), second], sourceSteps })
+    const sourceSteps = [sourceStep(), stepRow({ id: "step-current", status: "completed", inputThroughSequence: "9", consumedInputIds: ["input-2"] })]
+    const first = fixture({ exactStep: stepRow({ consumedInputIds: ["input-2"] }), sources: [inputRow(), second], sourceSteps })
     const laterFixture = fixture({ exactStep: later, sources: [inputRow(), second], sourceSteps })
     const before = await readNativeVerificationSteeringSource(first.client, scope, exact())
     const after = await readNativeVerificationSteeringSource(laterFixture.client, scope, exact("step-later"))
@@ -126,9 +132,10 @@ describe("native verification consumed steering source", () => {
   })
 
   it("excludes the exact Turn input by clientMessageId and fails closed when that identity is missing", async () => {
-    const steer = inputRow({ id: "first-real-steer", acceptedSequence: "2" })
-    const valid = fixture({ sources: [steer], sourceSteps: [sourceStep({ inputThroughSequence: "2",
-      consumedInputIds: ["root-input", "first-real-steer"] })] })
+    const steer = inputRow({ id: "first-real-steer", acceptedSequence: "2", consumedByStepId: "step-current" })
+    const valid = fixture({ exactStep: stepRow({ ordinal: 0, consumedInputIds: ["root-input", "first-real-steer"] }),
+      rootInputs: [originalInputRow({ consumedByStepId: "step-current" })], sources: [steer],
+      sourceSteps: [stepRow({ ordinal: 0, inputThroughSequence: "2", consumedInputIds: ["root-input", "first-real-steer"] })] })
     await expect(readNativeVerificationSteeringSource(valid.client, scope, exact())).resolves.toHaveLength(1)
     expect(valid.calls.find(call => call.sql.includes('"clientMessageId" = $4'))?.values[3]).toBe("root-message")
 
@@ -136,14 +143,86 @@ describe("native verification consumed steering source", () => {
     await expect(readNativeVerificationSteeringSource(missing.client, scope, exact())).resolves.toBeNull()
     const malformed = fixture({ rootInputMessageId: 7, sources: [steer] })
     await expect(readNativeVerificationSteeringSource(malformed.client, scope, exact())).resolves.toBeNull()
-    expect(malformed.calls.find(call => call.sql.includes("->> 'clientMessageId'"))?.sql).toContain("jsonb_typeof")
-    const noSteer = fixture({ rootInputMessageId: null, rootInputs: [], sources: [] })
+    expect(malformed.calls.some(call => call.sql.includes('SELECT "input" FROM "agent_turns"'))).toBe(true)
+  })
+
+  it("matches only steers claimed by the selected Step while keeping prior steering evidence", async () => {
+    const current = inputRow({ id: "step-steer", consumedByStepId: "step-current" })
+    const exactStep = stepRow({ consumedInputIds: ["step-steer"] })
+    const sourceSteps = [sourceStep(), stepRow({ consumedInputIds: ["step-steer"] })]
+    const valid = fixture({ exactStep, sources: [inputRow(), current], sourceSteps })
+    await expect(readNativeVerificationSteeringSource(valid.client, scope, exact())).resolves.toHaveLength(2)
+    const omitted = fixture({ exactStep: stepRow({ consumedInputIds: [] }), sources: [current], sourceSteps })
+    await expect(readNativeVerificationSteeringSource(omitted.client, scope, exact())).resolves.toBeNull()
+    const later = fixture({ exactStep: stepRow({ id: "step-later", ordinal: 4, consumedInputIds: [] }),
+      sources: [inputRow(), current], sourceSteps })
+    await expect(readNativeVerificationSteeringSource(later.client, scope, exact("step-later"))).resolves.toHaveLength(2)
+  })
+
+  it("fails closed when a selected Step claims steering beyond its input cursor", async () => {
+    const late = inputRow({ id: "late-steer", acceptedSequence: "10", consumedByStepId: "step-current" })
+    const value = fixture({ exactStep: stepRow({ inputThroughSequence: "9", consumedInputIds: ["late-steer"] }),
+      sources: [late], sourceSteps: [stepRow({ inputThroughSequence: "10", consumedInputIds: ["late-steer"] })] })
+    await expect(readNativeVerificationSteeringSource(value.client, scope, exact())).resolves.toBeNull()
+    const query = value.calls.find(call => call.sql.includes("'steer'"))
+    expect(query?.sql).toContain('"consumedByStepId" = $6')
+    expect(query?.values[5]).toBe("step-current")
+  })
+
+  it("accepts a valid empty checkpoint when there is no original input or consumed steering", async () => {
+    const noSteer = fixture({ rootInputMessageId: null, rootInputs: [], sources: [], exactStep: stepRow({ consumedInputIds: [] }) })
     await expect(readNativeVerificationSteeringSource(noSteer.client, scope, exact())).resolves.toEqual([])
+    expect(noSteer.calls.some(call => call.sql.includes('FROM "agent_steps" AS step'))).toBe(true)
+  })
+
+  const checkpointReconciliationCases: [string, Parameters<typeof fixture>[0]][] = [
+    ["unresolved original input referenced by checkpoint", {
+      rootInputMessageId: "missing-root-message", rootInputs: [], sources: [],
+      exactStep: stepRow({ consumedInputIds: ["root-input"] }),
+    }],
+    ["resolved original input missing from checkpoint", {
+      rootInputs: [originalInputRow({ consumedByStepId: "step-current" })], exactStep: stepRow({ consumedInputIds: [] }), sources: [],
+    }],
+    ["returned steering source missing from checkpoint", {
+      sources: [inputRow({ consumedByStepId: "step-current" })], exactStep: stepRow({ consumedInputIds: ["root-input"] }),
+      sourceSteps: [stepRow({ consumedInputIds: ["input-1"] })],
+    }],
+    ["missing steering source row referenced by checkpoint", {
+      sources: [], exactStep: stepRow({ consumedInputIds: ["root-input", "input-1"] }),
+    }],
+    ["extra unresolved checkpoint input", {
+      exactStep: stepRow({ consumedInputIds: ["root-input", "input-1", "unresolved-input"] }),
+    }],
+  ]
+  it.each(checkpointReconciliationCases)("rejects checkpoint input IDs that do not reconcile: %s", async (_label, options) => {
+    const value = fixture(options)
+    await expect(readNativeVerificationSteeringSource(value.client, scope, exact())).resolves.toBeNull()
+  })
+
+  it("applies checkpoint input reconciliation to the latest recovery Step", async () => {
+    const latest = fixture({ sources: [], latestSteps: [stepRow({ consumedInputIds: ["unresolved-input"] })] })
+    await expect(readNativeVerificationSteeringSource(latest.client, scope, { kind: "latest" })).resolves.toBeNull()
+  })
+
+  it("fails closed when the matching original input has malformed content or steer delivery", async () => {
+    const steer = inputRow()
+    const mismatched = fixture({ rootInputs: [originalInputRow({ content: [{ type: "text", text: "different ask" }] })], sources: [steer] })
+    await expect(readNativeVerificationSteeringSource(mismatched.client, scope, exact())).resolves.toBeNull()
+
+    const steerShaped = originalInputRow({ delivery: "steer" })
+    const misclassified = fixture({ rootInputs: [steerShaped], sources: [steerShaped] })
+    await expect(readNativeVerificationSteeringSource(misclassified.client, scope, exact())).resolves.toBeNull()
+    expect(misclassified.calls.find(call => call.sql.includes("= 'steer'"))?.values[4]).toBeNull()
+
+    const malformedTurn = fixture({ rootTurnInput: { goal: "Find jobs", content: "not an array", clientMessageId: "root-message" }, sources: [steer] })
+    await expect(readNativeVerificationSteeringSource(malformedTurn.client, scope, exact())).resolves.toBeNull()
+    const explicitGoal = fixture({ rootTurnInput: { goal: "explicit goal", content: [{ type: "text", text: "Find jobs" }], clientMessageId: "root-message" }, sources: [steer] })
+    await expect(readNativeVerificationSteeringSource(explicitGoal.client, scope, exact())).resolves.toHaveLength(1)
   })
 
   it("uses exact BIGINT comparisons and permits multibyte IDs within the database character bound", async () => {
     const inputId = "输入".repeat(100), sourceStepId = "步骤".repeat(120)
-    const current = stepRow({ consumedInputIds: ["root-input", inputId], inputThroughSequence: "9007199254740994" })
+    const current = stepRow({ consumedInputIds: [], inputThroughSequence: "9007199254740994" })
     const input = inputRow({ id: inputId, acceptedSequence: "9007199254740993", consumedByStepId: sourceStepId })
     const origin = sourceStep({ id: sourceStepId, inputThroughSequence: "9007199254740993", consumedInputIds: ["root-input", inputId] })
     const value = fixture({ exactStep: current, sources: [input], sourceSteps: [origin] })

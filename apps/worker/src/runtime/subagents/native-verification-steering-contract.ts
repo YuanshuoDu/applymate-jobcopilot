@@ -12,6 +12,24 @@ export const NATIVE_VERIFICATION_USER_STEERING_MAX_SOURCE_BYTES = 16 * 1024
 export const NATIVE_VERIFICATION_USER_STEERING_MAX_TOTAL_BYTES = 64 * 1024
 export const NATIVE_VERIFICATION_USER_STEERING_MAX_PARTS = 32
 
+export function nativeSteeringCheckpointInputIdsMatch(
+  checkpointIds: readonly string[], originalInputId: string | null, steeringInputIds: readonly string[],
+): boolean {
+  const expected = new Set(steeringInputIds)
+  if (originalInputId) expected.add(originalInputId)
+  return checkpointIds.length === expected.size && checkpointIds.every(inputId => expected.has(inputId))
+}
+
+export function parseNativeSteeringTurnInput(value: unknown): Readonly<{ clientMessageId: string; content: readonly unknown[] }> | null {
+  const envelope = object(value), nested = object(envelope?.input)
+  const turnInput = nested && Object.keys(nested).length > 0 ? nested : envelope
+  const content = turnInput?.content
+  const messageId = turnInput?.clientMessageId
+  if (!turnInput || typeof messageId !== "string" || !messageId.trim() || messageId.length > 256
+    || !Array.isArray(content) || content.length < 1) return null
+  return { clientMessageId: messageId, content }
+}
+
 export type NativeUserSteeringTextPart = Readonly<{ type: "text"; text: string }>
 export type NativeUserSteeringSummary = Readonly<{
   schemaVersion: typeof NATIVE_VERIFICATION_USER_STEERING_SCHEMA

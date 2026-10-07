@@ -14,6 +14,8 @@ import {
   NATIVE_VERIFICATION_USER_STEERING_MAX_TOTAL_BYTES,
   NATIVE_VERIFICATION_USER_STEERING_SCHEMA,
   NATIVE_VERIFICATION_USER_STEERING_STAGE,
+  nativeSteeringCheckpointInputIdsMatch,
+  parseNativeSteeringTurnInput,
   parseNativeUserSteeringContent,
 } from "./native-verification-steering-contract.js"
 
@@ -29,15 +31,12 @@ export type NativeSteeringCheckpointSelection =
   | Readonly<{ kind: "exact"; stepId?: string }>
   | Readonly<{ kind: "latest" }>
 
-type Step = Readonly<{
-  id: string; taskId: string; ordinal: number; attempt: number; status: string
-  inputThroughSequence: bigint; consumedInputIds: readonly string[]
-}>
-type Source = Readonly<{
-  id: string; userId: string; sessionId: string; targetTurnId: string; delivery: string; status: string
-  content: unknown; acceptedSequence: bigint; consumedByStepId: string | null
-  consumedAt: Date | null; cancelledAt: Date | null
-}>
+type Step = Readonly<{ id: string; taskId: string; ordinal: number; attempt: number; status: string;
+  inputThroughSequence: bigint; consumedInputIds: readonly string[] }>
+type Source = Readonly<{ id: string; userId: string; sessionId: string; targetTurnId: string;
+  delivery: string; status: string; content: unknown; acceptedSequence: bigint; consumedByStepId: string | null;
+  consumedAt: Date | null; cancelledAt: Date | null }>
+type OriginalInputBinding = Readonly<{ id: string; consumedByStepId: string; acceptedSequence: bigint }>
 
 function record(value: unknown): Row | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null
@@ -114,17 +113,25 @@ async function currentOwner(client: Client, scope: TaskGraphReadScope): Promise<
     && Number(row.attemptCount) === scope.parentAttemptCount && row.interruptRequestedAt === null && row.rootLeaseLive === true
 }
 
-async function rootInputId(client: Client, scope: TaskGraphReadScope): Promise<string | null> {
-  const turn = await client.query<Row>(`SELECT "input" ->> 'clientMessageId' AS "clientMessageId" FROM "agent_turns"
-    WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "rootTaskId" = $4
-      AND jsonb_typeof("input" -> 'clientMessageId') = 'string'`,
-  [scope.turnId, scope.sessionId, scope.userId, scope.rootTaskId])
-  const messageId = turn.rows.length === 1 ? turn.rows[0]?.clientMessageId : null
-  if (!id(messageId)) return null
-  const matches = await client.query<Row>(`SELECT "id" FROM "agent_inputs"
+async function rootInputId(client: Client, scope: TaskGraphReadScope): Promise<OriginalInputBinding | null> {
+  const turn = await client.query<Row>(`SELECT "input" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "rootTaskId" = $4`,
+    [scope.turnId, scope.sessionId, scope.userId, scope.rootTaskId])
+  const turnInput = turn.rows.length === 1 ? parseNativeSteeringTurnInput(turn.rows[0]?.input) : null
+  if (!turnInput) return null
+  const matches = await client.query<Row>(`SELECT "id", "sessionId", "userId", "targetTurnId", "clientMessageId", "delivery", "status", "content",
+      "acceptedSequence", "consumedByStepId", "consumedAt", "cancelledAt" FROM "agent_inputs"
     WHERE "sessionId" = $1 AND "userId" = $2 AND "targetTurnId" = $3 AND "clientMessageId" = $4 LIMIT 2`,
-  [scope.sessionId, scope.userId, scope.turnId, messageId])
-  return matches.rows.length === 1 && id(matches.rows[0]?.id) ? matches.rows[0].id as string : null
+    [scope.sessionId, scope.userId, scope.turnId, turnInput.clientMessageId])
+  if (matches.rows.length !== 1) return null
+  const input = record(matches.rows[0])
+  const consumedByStepId = input?.consumedByStepId
+  const acceptedSequence = sequence(input?.acceptedSequence)
+  if (!input || !id(input.id) || input.sessionId !== scope.sessionId || input.userId !== scope.userId
+    || input.targetTurnId !== scope.turnId || input.clientMessageId !== turnInput.clientMessageId || input.delivery !== "follow_up"
+    || input.status !== "consumed" || acceptedSequence === null || !id(consumedByStepId)
+    || !date(input.consumedAt) || input.cancelledAt !== null || !Array.isArray(input.content) || input.content.length < 1) return null
+  try { return canonicalNativeVerificationJson(input.content) === canonicalNativeVerificationJson(turnInput.content)
+    ? { id: input.id, consumedByStepId, acceptedSequence } : null } catch { return null }
 }
 
 async function selectStep(client: Client, scope: TaskGraphReadScope, selection: NativeSteeringCheckpointSelection): Promise<Step | null> {
@@ -153,14 +160,14 @@ async function selectStep(client: Client, scope: TaskGraphReadScope, selection: 
   return second && compareStep(selected, second) === 0 ? null : selected
 }
 
-async function steeringRows(client: Client, scope: TaskGraphReadScope, cutoff: bigint | null, originalId: string | null): Promise<Source[] | null> {
+async function steeringRows(client: Client, scope: TaskGraphReadScope, cutoff: bigint | null, originalId: string | null, currentStepId?: string): Promise<Source[] | null> {
   const result = await client.query<Row>(`SELECT "id", "userId", "sessionId", "targetTurnId", "delivery", "status", "content",
       "acceptedSequence", "consumedByStepId", "consumedAt", "cancelledAt" FROM "agent_inputs"
     WHERE "sessionId" = $1 AND "userId" = $2 AND "targetTurnId" = $3 AND "delivery" = 'steer'
-      AND ($4::bigint IS NULL OR "acceptedSequence" <= $4::bigint) AND ($5::text IS NULL OR "id" <> $5)
+      AND ($4::bigint IS NULL OR "acceptedSequence" <= $4::bigint OR "consumedByStepId" = $6) AND ($5::text IS NULL OR "id" <> $5)
       AND ("status" = 'consumed' OR "consumedByStepId" IS NOT NULL OR "consumedAt" IS NOT NULL)
-    ORDER BY "acceptedSequence" ASC, "id" ASC LIMIT $6`,
-  [scope.sessionId, scope.userId, scope.turnId, cutoff?.toString() ?? null, originalId, NATIVE_VERIFICATION_USER_STEERING_MAX_INPUTS + 1])
+    ORDER BY "acceptedSequence" ASC, "id" ASC LIMIT $7`,
+  [scope.sessionId, scope.userId, scope.turnId, cutoff?.toString() ?? null, originalId, currentStepId ?? null, NATIVE_VERIFICATION_USER_STEERING_MAX_INPUTS + 1])
   if (result.rows.length > NATIVE_VERIFICATION_USER_STEERING_MAX_INPUTS) return null
   const parsed = result.rows.map(source)
   return parsed.some(item => item === null) ? null : parsed as Source[]
@@ -208,7 +215,7 @@ export async function readNativeVerificationSteeringSource(
     || scope.parentTaskId !== scope.rootTaskId || !Number.isSafeInteger(scope.turnLeaseVersion) || scope.turnLeaseVersion < 1
     || !Number.isSafeInteger(scope.parentAttemptCount) || scope.parentAttemptCount < 1) return null
   if (!await currentOwner(client, scope)) return null
-  const originalId = await rootInputId(client, scope)
+  const original = await rootInputId(client, scope), originalId = original?.id ?? null
   if (selection.kind === "exact" && selection.stepId === undefined) {
     const found = await steeringRows(client, scope, null, originalId)
     return found?.length === 0 ? [] : null
@@ -217,9 +224,12 @@ export async function readNativeVerificationSteeringSource(
   const usable = selection.kind === "latest" ? RECOVERY_STEP_STATUS : USABLE_STEP_STATUS
   if (!checkpoint || checkpoint.taskId !== scope.rootTaskId || checkpoint.attempt !== scope.parentAttemptCount
     || !usable.has(checkpoint.status)) return null
-  const inputs = await steeringRows(client, scope, checkpoint.inputThroughSequence, originalId)
-  if (!inputs) return null
+  const inputs = await steeringRows(client, scope, checkpoint.inputThroughSequence, originalId, checkpoint.id)
+  if (!inputs || (original?.consumedByStepId === checkpoint.id && original.acceptedSequence > checkpoint.inputThroughSequence)) return null
   if (originalId === null && inputs.length > 0) return null
+  const currentStepInputs = inputs.filter(input => input.consumedByStepId === checkpoint.id).map(input => input.id)
+  const currentStepOriginalId = original?.consumedByStepId === checkpoint.id ? original.id : null
+  if (!nativeSteeringCheckpointInputIdsMatch(checkpoint.consumedInputIds, currentStepOriginalId, currentStepInputs)) return null
   if (inputs.some(input => input.acceptedSequence > checkpoint.inputThroughSequence)) return null
   const sourceStepMap = await sourceSteps(client, scope, inputs)
   if (!sourceStepMap) return null

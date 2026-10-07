@@ -4,6 +4,8 @@ import {
   NATIVE_VERIFICATION_USER_STEERING_SCHEMA,
   NATIVE_VERIFICATION_USER_STEERING_STAGE,
   isNativeSteeringEvidence,
+  nativeSteeringCheckpointInputIdsMatch,
+  parseNativeSteeringTurnInput,
 } from "./native-verification-steering-contract.js"
 
 const referenceId = `user-self-attestation:${"a".repeat(64)}`
@@ -12,6 +14,24 @@ const summary = { schemaVersion: NATIVE_VERIFICATION_USER_STEERING_SCHEMA, stage
 const evidence = { referenceId, kind: "user_self_attestation", summary: canonicalNativeVerificationJson(summary) }
 
 describe("native user steering evidence contract", () => {
+  it("requires checkpoint input IDs to equal the original input plus steering IDs claimed by that Step", () => {
+    expect(nativeSteeringCheckpointInputIdsMatch(["root-input", "steer-1"], "root-input", ["steer-1"])).toBe(true)
+    expect(nativeSteeringCheckpointInputIdsMatch([], null, [])).toBe(true)
+    expect(nativeSteeringCheckpointInputIdsMatch(["root-input"], "root-input", ["steer-1"])).toBe(false)
+    expect(nativeSteeringCheckpointInputIdsMatch(["root-input", "steer-1", "extra"], "root-input", ["steer-1"])).toBe(false)
+    expect(nativeSteeringCheckpointInputIdsMatch(["steer-1"], null, ["steer-1"])).toBe(true)
+  })
+
+  it("binds the root message identity to input content without deriving the explicit goal", () => {
+    const content = [{ type: "text", text: "Find jobs" }]
+    expect(parseNativeSteeringTurnInput({ clientMessageId: "root-1", content, goal: "Explicit goal" }))
+      .toEqual({ clientMessageId: "root-1", content })
+    expect(parseNativeSteeringTurnInput({ input: { clientMessageId: "nested", content, goal: "Nested goal" } }))
+      .toEqual({ clientMessageId: "nested", content })
+    expect(parseNativeSteeringTurnInput({ clientMessageId: " ", content, goal: "Find jobs" })).toBeNull()
+    expect(parseNativeSteeringTurnInput({ clientMessageId: "root-1", content: "not-an-array", goal: "Find jobs" })).toBeNull()
+  })
+
   it("recognizes only complete canonical user-steering summaries in the private reference family", () => {
     expect(isNativeSteeringEvidence(evidence)).toBe(true)
     expect(isNativeSteeringEvidence({ ...evidence, referenceId: "user-self-attestation:bad" })).toBe(false)
