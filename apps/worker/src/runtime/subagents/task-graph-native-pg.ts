@@ -77,9 +77,8 @@ export async function appendNativeGraphCommand(
     parentTaskId: input.scope.parentTaskId, role, taskType, goal: operation.goal,
     constraints: operation.constraints, successCriteria: operation.successCriteria,
     allowedActions, context, expectedOutputSchema, policy,
-  }, true)
+  }, true, { preserveEmptyAllowedActions: Boolean(source) })
   if (child.status === "queued") await enqueueGraphTask(client, input.scope.sessionId, child)
-  if (source) await persistFollowupActions(client, input, child.id, allowedActions)
   const graphState: TaskGraphState = loaded.state ?? { revision: 0, nodes: [], appliedEvents: [] }
   const dependencyKeys = enriched.verifiedNodeKey ? [enriched.verifiedNodeKey] : []
   const key = `native-${command.operationId.slice("native-".length)}`
@@ -190,13 +189,6 @@ function followupContext(callerContext: unknown, source: Source): unknown {
       priorResult: waitResult(source.result), source: source.provenance,
     },
   }
-}
-
-async function persistFollowupActions(client: Queryable, input: TaskGraphNativeCommandInput, taskId: string, actions: readonly string[]): Promise<void> {
-  const updated = await client.query(`UPDATE "sub_agent_tasks" SET "allowedActions" = $6::jsonb
-    WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4 AND "parentTaskId" = $5`,
-  [taskId, input.scope.sessionId, input.scope.turnId, input.scope.rootTaskId, input.scope.parentTaskId, json(actions, [], "native_allowed_actions")])
-  if (updated.rowCount !== 1) throw new Error("native_followup_policy_persist_failed")
 }
 
 function taskActions(value: unknown): string[] {

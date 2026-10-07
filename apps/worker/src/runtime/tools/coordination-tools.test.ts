@@ -169,6 +169,28 @@ describe("coordination tool definitions", () => {
     expect(registry.validateArguments("wait_subagents", { idempotencyKey: "wait-1", taskIds: ["task-1"], mode: "any", timeoutMs: 30_001 })).not.toBe(true)
   })
 
+  it("requires the explicit unstarted-replacement mode and bounded revision as a pair", () => {
+    const registry = new ToolRegistry(createCoordinationTools(options))
+    const legacy = { idempotencyKey: "followup-legacy", taskId: "task-1", goal: "Continue" }
+    const replacement = { ...legacy, idempotencyKey: "followup-replace", mode: "replace_unstarted", expectedRevision: 0 }
+
+    expect(registry.validateArguments("agent.followup", legacy)).toBe(true)
+    expect(registry.validateArguments("agent.followup", { ...replacement, expectedRevision: 2_147_483_644 })).toBe(true)
+    expect(registry.validateArguments("agent.followup", { ...legacy, mode: "replace_unstarted" })).not.toBe(true)
+    expect(registry.validateArguments("agent.followup", { ...legacy, expectedRevision: 0 })).not.toBe(true)
+    for (const expectedRevision of [-1, 1.5, 2_147_483_645, null]) {
+      expect(registry.validateArguments("agent.followup", { ...replacement, expectedRevision })).not.toBe(true)
+    }
+    expect(registry.validateArguments("agent.followup", { ...replacement, mode: null })).not.toBe(true)
+    expect(registry.validateArguments("agent.followup", { ...replacement, mode: "replace_any" })).not.toBe(true)
+    for (const authorityField of ["ownerId", "rootTaskId", "parentTaskId", "expectedOutputSchema"]) {
+      expect(registry.validateArguments("agent.followup", { ...replacement, [authorityField]: "forged" })).not.toBe(true)
+    }
+    expect(registry.validateArguments("agent.followup", { ...replacement, constraints: ["caller-controlled"] })).not.toBe(true)
+    expect(registry.validateArguments("agent.followup", { ...replacement, successCriteria: ["caller-controlled"] })).not.toBe(true)
+    expect(registry.list().map(tool => tool.name).filter(name => name.includes("replace"))).toEqual([])
+  })
+
   it("allows server-derived root invocation keys while enforcing explicit keys on other writes", () => {
     const validator = new ToolSchemaValidator()
     const definitions = createCoordinationTools(options)
