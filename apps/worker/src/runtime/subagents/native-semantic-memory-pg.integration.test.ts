@@ -222,8 +222,8 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
     await expect(finish(stepIds[0]!, identityA)).resolves.toMatchObject({ distinctStepCount: 1 })
     await expect(finish(stepIds[0]!, identityA, { ...usage, inputTokens: 42 })).rejects.toThrow()
 
-    await seedStep(stepIds[2]!, 3, "0")
     await expect(finish(stepIds[1]!, identityA)).resolves.toMatchObject({ distinctStepCount: 2 })
+    await seedStep(stepIds[2]!, 3, "0")
     const reconstructedAfterTwo = createPgTurnEngineStore({
       async connect() { const client = await runtimePool!.connect(); await client.query(`SET ROLE "${runtimeRole}"`); return client },
     } as unknown as Pick<Pool, "connect">)

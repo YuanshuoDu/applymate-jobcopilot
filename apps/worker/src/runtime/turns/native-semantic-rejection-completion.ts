@@ -41,9 +41,7 @@ function identityMatches(actual: NativeSemanticRejectionIdentity | null, expecte
     && actual.controlOperationId === expected.controlOperationId && actual.controlAttempt === expected.controlAttempt
     && actual.controlReportDigest === expected.controlReportDigest
 }
-async function currentFailedProof(client: TurnEngineQueryClient, input: CompletionInput): Promise<NativeSemanticRejectionIdentity | null> {
-  const { owner, identity } = input
-  if (owner.kind !== "turn") return null
+async function lockCurrentOwnedRoot(client: TurnEngineQueryClient, owner: Extract<ExecutionOwnerFence, { kind: "turn" }>): Promise<TaskGraphReadScope | null> {
   const root = await client.query<TurnEngineRow>(`SELECT task."attemptCount", task."status" FROM "sub_agent_tasks" AS task
     JOIN "agent_sessions" AS session ON session."id" = task."sessionId" AND session."userId" = $5
     WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $1 AND task."leaseOwner" = $4
@@ -51,9 +49,12 @@ async function currentFailedProof(client: TurnEngineQueryClient, input: Completi
   [owner.taskId, owner.sessionId, owner.turnId, owner.ownerId, owner.userId])
   const attempt = Number(root.rows[0]?.attemptCount)
   if (!Number.isSafeInteger(attempt) || attempt < 1) return null
-  const scope: TaskGraphReadScope = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
+  return { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
     rootTaskId: owner.taskId, parentTaskId: owner.taskId, turnLeaseOwner: owner.ownerId, turnLeaseVersion: owner.leaseVersion,
     parentLeaseOwner: owner.ownerId, parentAttemptCount: attempt }
+}
+async function currentFailedProof(client: TurnEngineQueryClient, input: CompletionInput, scope: TaskGraphReadScope): Promise<NativeSemanticRejectionIdentity | null> {
+  const { identity } = input
   const graph = await loadTaskGraph(client, scope, true), state = await loadNativeVerificationOwnedState(client, scope, graph.snapshot, true)
   const controls = await readNativeVerificationControlTasks(client, scope)
   const matches = controls.filter(control => control.taskId === identity.controlTaskId)
@@ -88,8 +89,17 @@ export async function completeNativeSemanticRejectionStepWithClient(client: Turn
   const mode = await client.query<TurnEngineRow>(`SELECT to_jsonb(turn)->>'native_semantic_progress_mode' AS mode
     FROM "agent_turns" AS turn WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3`, [owner.turnId, owner.sessionId, owner.userId])
   if (mode.rows[0]?.mode !== "durable_v1") throw conflict("durable mode is not pinned")
-  const current = await currentFailedProof(client, input)
-  if (!identityMatches(current, identity)) throw conflict("current failed root proof does not match")
+  const rootScope = await lockCurrentOwnedRoot(client, owner)
+  if (!rootScope) throw conflict("current root owner fence")
+  const observedResult = await client.query<TurnEngineRow>(`SELECT "id", "taskId", "attempt", "status" FROM "agent_steps"
+    WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`, [input.stepId, owner.sessionId, owner.turnId])
+  const observed = observedResult.rows[0], replayCandidate = observed?.status === "completed", streamingCandidate = observed?.status === "streaming"
+  if (!observed || observed.taskId !== owner.taskId || Number(observed.attempt) !== 1) throw conflict(`step ${input.stepId} lineage`)
+  if (!replayCandidate && !streamingCandidate) throw conflict(`step ${input.stepId} status`)
+  if (streamingCandidate) {
+    const current = await currentFailedProof(client, input, rootScope)
+    if (!identityMatches(current, identity)) throw conflict("current failed root proof does not match")
+  }
   const result = await client.query<TurnEngineRow>(`SELECT "id", "taskId", "attempt", "status", "finishReason", "errorCode", "inputTokens", "outputTokens", "estimatedCostUsd", "inputThroughSequence"
     FROM "agent_steps" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 FOR UPDATE`, [input.stepId, owner.sessionId, owner.turnId])
   const step = result.rows[0]
@@ -102,7 +112,7 @@ export async function completeNativeSemanticRejectionStepWithClient(client: Turn
       const prior = await client.query<TurnEngineRow>(`SELECT * FROM "agent_native_semantic_rejections" WHERE "turnId" = $1 AND "stepId" = $2`, [owner.turnId, input.stepId])
       if (!prior.rows[0] || !sameReceipt(prior.rows[0], input, checkpoint)) throw conflict(`step ${input.stepId} receipt replay`)
     } else {
-      if (step.status !== "streaming" || step.finishReason !== null || step.errorCode !== null
+      if (replayCandidate || step.status !== "streaming" || step.finishReason !== null || step.errorCode !== null
         || Number(step.inputTokens ?? 0) !== 0 || Number(step.outputTokens ?? 0) !== 0 || Number(step.estimatedCostUsd ?? 0) !== 0) {
         throw conflict(`step ${input.stepId} status`)
       }
