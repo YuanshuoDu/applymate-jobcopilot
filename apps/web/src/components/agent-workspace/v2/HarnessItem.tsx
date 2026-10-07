@@ -92,10 +92,13 @@ export function ToolLifecycleCard({ item, t, lang = 'en' }: { item: TimelineItem
   const toolName = stringValue(data.toolName) ?? stringValue(data.name) ?? (item.type === 'tool_result' ? translate('agent.toolResult') : translate('agent.toolCall'))
   const output = data.outputSummary ?? data.output ?? data.result ?? data.errorCode
   const feedbackSource = data.output ?? data.result
-  const feedback = item.type === 'tool_result' && item.status === 'completed'
-    ? extractNativeVerificationFeedback(feedbackSource) : { state: 'none' as const }
+  const parsedFeedback = item.type === 'tool_result' ? extractNativeVerificationFeedback(feedbackSource) : { state: 'none' as const }
+  const feedback = item.status === 'completed' ? parsedFeedback : { state: 'none' as const }
   const feedbackOutput = feedback.state === 'available' ? safeNativeFeedbackOutput(feedbackSource) : undefined
-  const ordinaryOutput = feedback.state === 'none' ? output : undefined
+  const pendingOutput = item.type === 'tool_result' && item.status !== 'completed' && parsedFeedback.state !== 'none'
+    ? parsedFeedback.state === 'available' ? safeNativeFeedbackOutput(feedbackSource) : undefined
+    : output
+  const ordinaryOutput = feedback.state === 'none' ? pendingOutput : undefined
   const displayOutput = feedback.state === 'available' ? feedbackOutput : ordinaryOutput
   return (
     <div data-tool-lifecycle="true" data-tool-status={item.status} style={{ border: '1px solid var(--border)', borderRadius: 7, padding: '9px 10px', display: 'grid', gap: 6 }}>

@@ -123,6 +123,21 @@ describe('HarnessItem renderers', () => {
     }
   })
 
+  it('keeps unfinished recognized feedback out of generic output without hiding its ordinary siblings', () => {
+    const validHtml = renderToStaticMarkup(<I18nProvider><HarnessItem item={item({ type: 'tool_result', status: 'running', content: { output: {
+      summary: 'ordinary sibling', nativeVerificationFeedback: { disposition: 'passed', criteria: [{ criterionId: 'criterion-1', disposition: 'passed', reasonCode: 'meets_criterion', evidenceReferenceIds: ['private-reference'] }] },
+    } } })} /></I18nProvider>)
+    expect(validHtml).toContain('ordinary sibling')
+    expect(validHtml).not.toContain('private-reference')
+    expect(validHtml).not.toContain('data-native-verification-feedback')
+
+    const privateHtml = renderToStaticMarkup(<I18nProvider><HarnessItem item={item({ type: 'tool_result', status: 'failed', content: {
+      outputSummary: 'PRIVATE_REPORT_MARKER', output: { nativeVerificationReport: { privateReceipt: 'PRIVATE_REPORT_MARKER' } },
+    } })} /></I18nProvider>)
+    expect(privateHtml).not.toContain('PRIVATE_REPORT_MARKER')
+    expect(privateHtml).not.toContain('data-native-verification-feedback')
+  })
+
   it('uses a redaction and unknown-part fallback without serializing the raw payload', () => {
     const html = renderToStaticMarkup(<I18nProvider><HarnessItem item={item({ type: 'unknown', content: { future: '<script>secret</script>' } })} /></I18nProvider>)
     expect(html).toContain('Unknown agent item')
