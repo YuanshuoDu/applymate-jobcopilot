@@ -92,7 +92,7 @@ async function seed(): Promise<void> {
      "budgetSnapshot", "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "revision", "updatedAt")
     VALUES ($1, $2, $3, NULL, 'in_progress', 'user', $4::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
       $5, CURRENT_TIMESTAMP + INTERVAL '5 minutes', CURRENT_TIMESTAMP, 1, 1, CURRENT_TIMESTAMP)`,
-  [ids.turn, ids.session, ids.user, JSON.stringify({ goal, content: [{ type: "text", text: goal }], clientMessageId: ids.rootClientMessage }), ids.turnOwner])
+  [ids.turn, ids.session, ids.user, JSON.stringify({ input: { goal, content: [{ type: "text", text: goal }], clientMessageId: ids.rootClientMessage } }), ids.turnOwner])
   await pool!.query(`INSERT INTO "sub_agent_tasks"
     ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
      "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot",
@@ -252,6 +252,9 @@ describePg("native steering proof PostgreSQL identity and checkpoint", () => {
     await expect(port.readRecoverableGoal(readScope)).resolves.toMatchObject({ status: "passed", controlTaskId: secondControlId, candidateText })
     await expect(terminalAccepted(ids.thirdStep, currentWitness)).resolves.toBe(true)
     await expect(terminalAccepted(ids.firstStep, currentWitness)).resolves.toBe(false)
+    await pool!.query(`UPDATE "agent_inputs" SET "consumedByStepId" = $2 WHERE "id" = $1`, [ids.rootInput, ids.thirdStep])
+    await expect(port.ensureRootGoal({ scope: executionScope(ids.thirdStep), candidateText })).resolves.toMatchObject({ status: "unavailable" })
+    await pool!.query(`UPDATE "agent_inputs" SET "consumedByStepId" = $2 WHERE "id" = $1`, [ids.rootInput, ids.firstStep])
     await pool!.query(`UPDATE "agent_inputs" SET "clientMessageId" = $2 WHERE "id" = $1`, [ids.rootInput, `orphan-${suffix}`])
     await expect(port.ensureRootGoal({ scope: executionScope(ids.thirdStep), candidateText })).resolves.toMatchObject({ status: "unavailable" })
   }, 60_000)

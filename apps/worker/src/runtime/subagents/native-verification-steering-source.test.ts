@@ -37,7 +37,7 @@ function originalInputRow(patch: Row = {}): Row {
 }
 
 function sourceStep(patch: Row = {}): Row {
-  return { id: "step-origin", taskId: scope.rootTaskId, ordinal: 1, attempt: 1, status: "completed",
+  return { id: "step-origin", taskId: scope.rootTaskId, ordinal: 0, attempt: 1, status: "completed",
     inputThroughSequence: "8", consumedInputIds: ["root-input", "input-1"], ...patch }
 }
 
@@ -144,6 +144,8 @@ describe("native verification consumed steering source", () => {
     const malformed = fixture({ rootInputMessageId: 7, sources: [steer] })
     await expect(readNativeVerificationSteeringSource(malformed.client, scope, exact())).resolves.toBeNull()
     expect(malformed.calls.some(call => call.sql.includes('SELECT "input" FROM "agent_turns"'))).toBe(true)
+    const malformedConsumer = fixture({ rootInputs: [originalInputRow({ consumedByStepId: null })], sources: [steer] })
+    await expect(readNativeVerificationSteeringSource(malformedConsumer.client, scope, exact())).resolves.toBeNull()
   })
 
   it("matches only steers claimed by the selected Step while keeping prior steering evidence", async () => {
@@ -157,6 +159,26 @@ describe("native verification consumed steering source", () => {
     const later = fixture({ exactStep: stepRow({ id: "step-later", ordinal: 4, consumedInputIds: [] }),
       sources: [inputRow(), current], sourceSteps })
     await expect(readNativeVerificationSteeringSource(later.client, scope, exact("step-later"))).resolves.toHaveLength(2)
+  })
+
+  it("binds the original follow-up to its owned ordinal-zero checkpoint across later Steps", async () => {
+    const later = stepRow({ id: "step-later", ordinal: 3, inputThroughSequence: "9", consumedInputIds: [] })
+    await expect(readNativeVerificationSteeringSource(fixture({ exactStep: later }).client, scope, exact("step-later")))
+      .resolves.toHaveLength(1)
+
+    const invalidOriginalSteps = [
+      sourceStep({ taskId: "child-1" }),
+      sourceStep({ ordinal: 1 }),
+      sourceStep({ attempt: 2 }),
+      sourceStep({ consumedInputIds: ["input-1"] }),
+      sourceStep({ inputThroughSequence: "0" }),
+    ]
+    for (const invalidStep of invalidOriginalSteps) {
+      const invalid = fixture({ exactStep: later, sourceSteps: [invalidStep] })
+      await expect(readNativeVerificationSteeringSource(invalid.client, scope, exact("step-later"))).resolves.toBeNull()
+    }
+    const missing = fixture({ exactStep: later, sourceSteps: [] })
+    await expect(readNativeVerificationSteeringSource(missing.client, scope, exact("step-later"))).resolves.toBeNull()
   })
 
   it("fails closed when a selected Step claims steering beyond its input cursor", async () => {
@@ -225,7 +247,7 @@ describe("native verification consumed steering source", () => {
     const current = stepRow({ consumedInputIds: [], inputThroughSequence: "9007199254740994" })
     const input = inputRow({ id: inputId, acceptedSequence: "9007199254740993", consumedByStepId: sourceStepId })
     const origin = sourceStep({ id: sourceStepId, inputThroughSequence: "9007199254740993", consumedInputIds: ["root-input", inputId] })
-    const value = fixture({ exactStep: current, sources: [input], sourceSteps: [origin] })
+    const value = fixture({ exactStep: current, sources: [input], rootInputs: [originalInputRow({ consumedByStepId: sourceStepId })], sourceSteps: [origin] })
     const evidence = await readNativeVerificationSteeringSource(value.client, scope, exact())
     expect(evidence).toHaveLength(1)
     expect(value.calls.find(call => call.sql.includes('"delivery" = \'steer\''))?.values[3]).toBe("9007199254740994")
@@ -265,9 +287,10 @@ describe("native verification consumed steering source", () => {
     const large = fixture({ sources: [inputRow({ content: [{ type: "text", text: "x".repeat(16 * 1024) }] })] })
     await expect(readNativeVerificationSteeringSource(large.client, scope, exact())).resolves.toBeNull()
 
-    const inputs = Array.from({ length: 5 }, (_unused, index) => inputRow({ id: `input-${index}`, acceptedSequence: String(index + 1), consumedByStepId: `step-${index}`, content: [{ type: "text", text: "x".repeat(14 * 1024) }] }))
-    const steps = inputs.map((item, index) => sourceStep({ id: `step-${index}`, ordinal: index, inputThroughSequence: String(index + 1), consumedInputIds: ["root-input", String(item.id)] }))
-    const aggregate = fixture({ exactStep: stepRow({ ordinal: 8, inputThroughSequence: "9", consumedInputIds: ["root-input", ...inputs.map(item => String(item.id))] }), sources: inputs, sourceSteps: steps })
+    const inputs = Array.from({ length: 5 }, (_unused, index) => inputRow({ id: `input-${index}`, acceptedSequence: String(index + 2), consumedByStepId: `step-${index}`, content: [{ type: "text", text: "x".repeat(14 * 1024) }] }))
+    const steps = [sourceStep({ inputThroughSequence: "1", consumedInputIds: ["root-input"] }),
+      ...inputs.map((item, index) => sourceStep({ id: `step-${index}`, ordinal: index + 1, inputThroughSequence: String(index + 2), consumedInputIds: [String(item.id)] }))]
+    const aggregate = fixture({ exactStep: stepRow({ ordinal: 8, inputThroughSequence: "9", consumedInputIds: [] }), sources: inputs, sourceSteps: steps })
     await expect(readNativeVerificationSteeringSource(aggregate.client, scope, exact())).resolves.toBeNull()
   })
 

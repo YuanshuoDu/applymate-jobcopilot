@@ -26,18 +26,13 @@ const MAX_STEP_INPUTS = 256
 const USABLE_STEP_STATUS = new Set(["streaming", "completed"])
 const RECOVERY_STEP_STATUS = new Set(["streaming", "waiting_for_tool", "waiting_for_approval", "waiting_for_user", "completed", "failed", "interrupted"])
 const SOURCE_STEP_STATUS = new Set(["streaming", "waiting_for_tool", "waiting_for_approval", "waiting_for_user", "completed", "failed", "interrupted"])
-
 export type NativeSteeringCheckpointSelection =
   | Readonly<{ kind: "exact"; stepId?: string }>
   | Readonly<{ kind: "latest" }>
-
-type Step = Readonly<{ id: string; taskId: string; ordinal: number; attempt: number; status: string;
-  inputThroughSequence: bigint; consumedInputIds: readonly string[] }>
-type Source = Readonly<{ id: string; userId: string; sessionId: string; targetTurnId: string;
-  delivery: string; status: string; content: unknown; acceptedSequence: bigint; consumedByStepId: string | null;
+type Step = Readonly<{ id: string; taskId: string; ordinal: number; attempt: number; status: string; inputThroughSequence: bigint; consumedInputIds: readonly string[] }>
+type Source = Readonly<{ id: string; userId: string; sessionId: string; targetTurnId: string; delivery: string; status: string; content: unknown; acceptedSequence: bigint; consumedByStepId: string | null;
   consumedAt: Date | null; cancelledAt: Date | null }>
 type OriginalInputBinding = Readonly<{ id: string; consumedByStepId: string; acceptedSequence: bigint }>
-
 function record(value: unknown): Row | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null
   const prototype = Object.getPrototypeOf(value)
@@ -173,9 +168,10 @@ async function steeringRows(client: Client, scope: TaskGraphReadScope, cutoff: b
   return parsed.some(item => item === null) ? null : parsed as Source[]
 }
 
-async function sourceSteps(client: Client, scope: TaskGraphReadScope, inputs: readonly Source[]): Promise<Map<string, Step> | null> {
+async function sourceSteps(client: Client, scope: TaskGraphReadScope, inputs: readonly Source[], original: OriginalInputBinding | null, checkpoint: Step): Promise<Map<string, Step> | null> {
   const stepIds = [...new Set(inputs.map(input => input.consumedByStepId).filter((value): value is string => value !== null))]
   if (stepIds.length !== new Set(inputs.map(input => input.consumedByStepId)).size) return null
+  if (original && !stepIds.includes(original.consumedByStepId)) stepIds.push(original.consumedByStepId)
   const result = stepIds.length === 0 ? { rows: [] as Row[] } : await client.query<Row>(`SELECT "id", "taskId", "ordinal", "attempt", "status",
       "inputThroughSequence", "consumedInputIds" FROM "agent_steps"
     WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = ANY($4::text[])`,
@@ -184,6 +180,10 @@ async function sourceSteps(client: Client, scope: TaskGraphReadScope, inputs: re
   const values = result.rows.map(step)
   if (values.some(item => item === null || item.taskId !== scope.rootTaskId)) return null
   const map = new Map((values as Step[]).map(item => [item.id, item]))
+  const originalStep = original ? map.get(original.consumedByStepId) : null
+  if (original && (!originalStep || originalStep.ordinal !== 0 || originalStep.attempt !== checkpoint.attempt || !SOURCE_STEP_STATUS.has(originalStep.status)
+    || !originalStep.consumedInputIds.includes(original.id) || original.acceptedSequence > originalStep.inputThroughSequence
+    || originalStep.inputThroughSequence > checkpoint.inputThroughSequence || (checkpoint.ordinal === 0 && originalStep.id !== checkpoint.id))) return null
   return map.size === stepIds.length ? map : null
 }
 
@@ -225,13 +225,13 @@ export async function readNativeVerificationSteeringSource(
   if (!checkpoint || checkpoint.taskId !== scope.rootTaskId || checkpoint.attempt !== scope.parentAttemptCount
     || !usable.has(checkpoint.status)) return null
   const inputs = await steeringRows(client, scope, checkpoint.inputThroughSequence, originalId, checkpoint.id)
-  if (!inputs || (original?.consumedByStepId === checkpoint.id && original.acceptedSequence > checkpoint.inputThroughSequence)) return null
+  if (!inputs || (original && original.acceptedSequence > checkpoint.inputThroughSequence)) return null
   if (originalId === null && inputs.length > 0) return null
   const currentStepInputs = inputs.filter(input => input.consumedByStepId === checkpoint.id).map(input => input.id)
   const currentStepOriginalId = original?.consumedByStepId === checkpoint.id ? original.id : null
   if (!nativeSteeringCheckpointInputIdsMatch(checkpoint.consumedInputIds, currentStepOriginalId, currentStepInputs)) return null
   if (inputs.some(input => input.acceptedSequence > checkpoint.inputThroughSequence)) return null
-  const sourceStepMap = await sourceSteps(client, scope, inputs)
+  const sourceStepMap = await sourceSteps(client, scope, inputs, original, checkpoint)
   if (!sourceStepMap) return null
   let totalBytes = 0
   const result: NativeVerificationEvidence[] = []
