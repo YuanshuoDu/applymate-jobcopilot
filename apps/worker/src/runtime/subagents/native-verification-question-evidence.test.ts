@@ -74,18 +74,20 @@ function lineage(index = 1, answer = "dublin", patch: {
 }
 
 function mockClient(rows: readonly ReturnType<typeof lineage>[], options: {
-  unrelatedCalls?: number; unrelatedSteps?: number; linkedCallOverflow?: boolean; queryError?: Error
+  unrelatedCalls?: number; unrelatedSteps?: number; linkedCallOverflow?: boolean; queryError?: Error; ownerLive?: boolean
+  currentOwnerId?: string; currentLeaseVersion?: number; currentLeaseExpiresAt?: Date
 } = {}) {
   const calls = rows.map(row => row.call), results = rows.map(row => row.result).filter((row): row is Row => row !== null), steps = rows.map(row => row.step)
   const questions = rows.map(row => row.item)
   const events = rows.flatMap(row => [row.start, row.answered])
   const query = vi.fn(async (sql: string, values?: readonly unknown[]) => {
     if (options.queryError) throw options.queryError
-    if (sql.includes('FROM "agent_turns" AS turn')) {
-      const owner = rows[0]?.owner
-      return { rows: owner ? [{ leaseOwnerId: owner.ownerId, leaseVersion: owner.leaseVersion,
-        leaseExpiresAt: owner.leaseExpiresAt, leaseLive: owner.leaseExpiresAt instanceof Date
-          && owner.leaseExpiresAt.getTime() > new Date("2026-10-06T12:00:00.000Z").getTime() }] : [] }
+    if (sql.includes('FROM "agent_turns" AS turn') && sql.includes('"leaseOwnerId"')) {
+      const leaseExpiresAt = options.currentLeaseExpiresAt ?? new Date("2026-10-06T12:01:00.000Z")
+      return { rows: [{ leaseOwnerId: options.currentOwnerId ?? scope.turnLeaseOwner,
+        leaseVersion: options.currentLeaseVersion ?? scope.turnLeaseVersion, leaseExpiresAt,
+        createdAt: new Date("2026-10-06T11:59:00.000Z"), leaseLive: options.ownerLive !== false
+          && leaseExpiresAt.getTime() > new Date("2026-10-06T12:00:00.000Z").getTime() }] }
     }
     if (sql.includes('FROM "agent_steps"') && sql.includes('= ANY($4::text[])')) {
       return { rows: steps.filter(row => Array.isArray(values?.[3]) && values[3].includes(row.id)) }
@@ -160,7 +162,7 @@ describe("native question self-attestation evidence", () => {
   it("returns unchanged content when no eligible answer exists and rejects child or foreign-root projections", async () => {
     const content = packet()
     const none = await appendNativeQuestionSelfAttestations(mockClient([]).client, scope, content)
-    expect(none).toBe(content)
+    expect(none).toEqual(content)
     const empty = mockClient([])
     expect(await appendNativeQuestionSelfAttestations(empty.client, { ...scope, parentTaskId: "other-root" }, content)).toBeNull()
     expect(empty.query).not.toHaveBeenCalled()
@@ -173,10 +175,22 @@ describe("native question self-attestation evidence", () => {
   it("does not let unrelated root tool calls consume the bound for an answer-free packet", async () => {
     const content = packet()
     const f = mockClient([], { unrelatedCalls: 65, unrelatedSteps: 65 })
-    expect(await appendNativeQuestionSelfAttestations(f.client, scope, content)).toBe(content)
+    expect(await appendNativeQuestionSelfAttestations(f.client, scope, content)).toEqual(content)
     expect(f.query.mock.calls.some(([sql]) => sql.includes("FROM \"agent_items\"") && sql.includes("'tool_call'")
       && !sql.includes("ask_call") && !sql.includes("= ANY"))).toBe(false)
     expect(f.query.mock.calls.some(([sql]) => sql.includes('FROM "agent_steps"') && !sql.includes("= ANY") && !sql.includes('FOR SHARE'))).toBe(false)
+  })
+
+  it("keeps the current live-owner fence and propagates unexpected query failures", async () => {
+    const source = lineage()
+    expect(await appendNativeQuestionSelfAttestations(mockClient([source], { ownerLive: false }).client, scope, packet())).toBeNull()
+    expect(await appendNativeQuestionSelfAttestations(mockClient([source], { currentOwnerId: "other-worker" }).client, scope, packet())).toBeNull()
+    expect(await appendNativeQuestionSelfAttestations(mockClient([source], { currentLeaseVersion: scope.turnLeaseVersion - 1 }).client, scope, packet())).toBeNull()
+    expect(await appendNativeQuestionSelfAttestations(mockClient([source], { currentLeaseExpiresAt: new Date("2020-01-01T00:00:00Z") }).client, scope, packet())).toBeNull()
+
+    const failure = Object.assign(new Error("database unavailable"), { code: "XX000" })
+    await expect(appendNativeQuestionSelfAttestations(mockClient([source], { queryError: failure }).client, scope, packet()))
+      .rejects.toBe(failure)
   })
 
   it("fails closed when linked tool-call rows exceed the bounded lineage scan", async () => {
@@ -188,7 +202,7 @@ describe("native question self-attestation evidence", () => {
     for (const taskId of ["child-task", null]) {
       const content = packet()
       expect(await appendNativeQuestionSelfAttestations(mockClient([lineage(1, "dublin", { item: { taskId } })]).client,
-        scope, content)).toBe(content)
+        scope, content)).toEqual(content)
     }
   })
 
@@ -204,8 +218,6 @@ describe("native question self-attestation evidence", () => {
     ["foreign answer task", { answered: { taskId: "other-root" } }],
     ["wrong answer sequence", { answered: { sequence: "3" } }],
     ["wrong start idempotency key", { start: { idempotencyKey: "foreign-start" } }],
-    ["stale turn lease", { owner: { leaseVersion: 2 } }],
-    ["expired turn lease", { owner: { leaseExpiresAt: new Date("2020-01-01T00:00:00.000Z") } }],
     ["wrong step attempt", { step: { attempt: 2 } }],
     ["step not waiting for user", { step: { status: "completed" } }],
     ["step without durable usage", { step: { finishReason: null } }],
