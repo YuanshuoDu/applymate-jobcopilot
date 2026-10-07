@@ -83,6 +83,32 @@ describe("PostgreSQL AgentInput claim store", () => {
     expect(fake.calls.map((call) => call.text)).toContain("COMMIT")
   })
 
+  it.each(["steer", "follow_up"] as const)("reads a %s root input through the leased tenant Turn without changing claim state", async delivery => {
+    for (const status of ["accepted", "queued", "consumed"] as const) {
+      const lifecycle = status === "consumed" ? { consumedByStepId: "step-a", consumedAt: createdAt } : { consumedByStepId: null, consumedAt: null }
+      const fake = makeClient({ activeRow: row({ id: "root-1", delivery, status, ...lifecycle }) })
+      const result = await createPgInputClaimStore(fake.pool, scope).withTransaction(async tx => tx.loadRootInputContext?.({
+        sessionId: "session-a", turnId: "turn-a", inputId: "root-1", lease: { ownerId: "worker-a", leaseVersion: 3, now: createdAt },
+      }))
+      const read = fake.calls.find(call => call.text.includes('FROM "agent_inputs"') && call.text.includes("FOR SHARE"))
+      expect(result).toMatchObject({ id: "root-1", delivery, status })
+      expect(read?.values).toEqual(["session-a", "turn-a", "user-a", "root-1"])
+      expect(read?.text).toContain('"id" = $4 AND "sessionId" = $1 AND "targetTurnId" = $2 AND "userId" = $3')
+      expect(read?.text).toContain('"cancelledAt" IS NULL')
+      expect(read?.text).toContain("FOR SHARE")
+      expect(fake.calls.filter(call => /^(UPDATE|INSERT|DELETE) /.test(call.text))).toEqual([])
+      expect(fake.calls.map(call => call.text)).toContain("COMMIT")
+    }
+  })
+
+  it("fails closed before input lookup when the current Turn lease is not owned", async () => {
+    const fake = makeClient({ leaseValid: false })
+    await expect(createPgInputClaimStore(fake.pool, scope).withTransaction(async tx => tx.loadRootInputContext?.({
+      sessionId: "session-a", turnId: "turn-a", inputId: "root-1", lease: { ownerId: "stale-worker", leaseVersion: 2, now: createdAt },
+    }))).rejects.toMatchObject({ code: "owner_conflict" })
+    expect(fake.calls.some(call => call.text.includes('FROM "agent_inputs"') && call.text.includes("FOR SHARE"))).toBe(false)
+  })
+
   it("rolls back claimed input and marker when the marker outbox fails", async () => {
     const fake = makeClient({ failOn: 'INSERT INTO "agent_outbox"' })
     const store = createPgInputClaimStore(fake.pool, scope)

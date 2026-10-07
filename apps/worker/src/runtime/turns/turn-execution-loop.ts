@@ -76,6 +76,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         const context = await options.contextBuilder.build({
           scope: options.scope, identity: options.identity, stepId: step.id, snapshot,
           rootInputId: ordinal === 0 ? options.rootInputId : undefined, now: now(),
+          rootContextInputId: options.rootContextInputId,
           taskId: options.identity.taskId,
           steeringMarkerState,
         })
@@ -85,10 +86,20 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         if (newlyObservedMarkers.length > 0) steeringMarkerState = rememberSteeringMarkers(steeringMarkerState, newlyObservedMarkers)
         inputThroughSequence = context.inputThroughSequence
         consumedInputIds = context.consumedInputIds
+        // The model sees the durable root background, but later agenda receipts must not turn it into actionable pending input.
+        const readOnlyRootInputId = ordinal > 0 && options.rootContextInputId && !context.consumedInputIds.includes(options.rootContextInputId)
+          ? options.rootContextInputId : undefined
+        const agendaContext = readOnlyRootInputId ? {
+          ...context,
+          blocks: context.blocks.filter(block => {
+            const content = block.content
+            return block.layer !== "pending_input" || content === null || typeof content !== "object" || Array.isArray(content) || content.inputId !== readOnlyRootInputId
+          }),
+        } : context
         const receipt = buildCognitiveAgendaReceipt({
           sessionId: options.identity.sessionId, turnId: options.identity.turnId, taskId: options.identity.taskId, stepId: step.id,
           inputThroughSequence, consumedInputIds,
-          agenda: buildCognitiveActionAgenda(context, { freshSteering }),
+          agenda: buildCognitiveActionAgenda(agendaContext, { freshSteering }),
         })
         const receiptKey = cognitiveAgendaReceiptIdempotencyKey(step.id)
         if (!receipt || !receiptKey) throw new TurnEngineError("invalid_output", "Cognitive agenda receipt could not be built")
