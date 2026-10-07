@@ -32,12 +32,21 @@ function agendaEvent(sequence = "20", patch: Record<string, unknown> = {}, fence
   return { id: `agenda-${sequence}`, type: COGNITIVE_AGENDA_EVENT_TYPE, actor: "system", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null, sequence, payload: { ...value, ...patch } }
 }
 
-function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unknown>[]; items?: Record<string, unknown>[]; questionItems?: Record<string, unknown>[]; inputs?: Record<string, unknown>[]; events?: Record<string, unknown>[]; questionEvents?: Record<string, unknown>[]; snapshots?: Record<string, unknown>[] }) {
+function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unknown>[]; items?: Record<string, unknown>[]; questionItems?: Record<string, unknown>[]; inputs?: Record<string, unknown>[]; events?: Record<string, unknown>[]; questionEvents?: Record<string, unknown>[]; snapshots?: Record<string, unknown>[]; priorTurns?: Record<string, unknown>[]; priorQuestions?: Record<string, unknown>[]; priorCalls?: Record<string, unknown>[]; priorSteps?: Record<string, unknown>[]; priorQuestionEvents?: Record<string, unknown>[] }) {
   const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+    if (sql.includes('SELECT active_turn."createdAt"')) return { rows: [{ createdAt: new Date("2026-10-07T00:00:00.000Z") }], rowCount: 1 }
+    if (sql.includes('SELECT prior."id"')) return { rows: rows.priorTurns ?? [], rowCount: rows.priorTurns?.length ?? 0 }
+    if (sql.includes('FROM "agent_items" AS question')) return { rows: rows.priorQuestions ?? [], rowCount: rows.priorQuestions?.length ?? 0 }
+    if (sql.includes('FROM "agent_items" AS call')) return { rows: rows.priorCalls ?? [], rowCount: rows.priorCalls?.length ?? 0 }
+    if (sql.includes('FROM "agent_steps" AS step')) return { rows: rows.priorSteps ?? [], rowCount: rows.priorSteps?.length ?? 0 }
+    if (sql.includes('FROM "agent_items" AS item') && values?.[1] === "prior-turn") return { rows: rows.priorQuestions ?? [], rowCount: rows.priorQuestions?.length ?? 0 }
     if (sql.includes('"input"') && sql.includes('FROM "agent_turns"')) return { rows: rows.turn ? [{ id: "turn-1", sessionId: "session-1", userId: "user-1", status: "in_progress", leaseOwnerId: lease.ownerId, leaseVersion: lease.leaseVersion, leaseExpiresAt: lease.leaseExpiresAt, ...rows.turn }] : [], rowCount: rows.turn ? 1 : 0 }
     if (sql.includes('MAX("ordinal")')) return { rows: [{ maxOrdinal: Math.max(...(rows.steps ?? []).map(step => Number(step.ordinal ?? -1)), -1) }], rowCount: 1 }
     if (sql.includes('FROM "agent_steps"')) return { rows: (rows.steps ?? []).filter(step => step.taskId === undefined || step.taskId === null || step.taskId === values?.[2]), rowCount: rows.steps?.length ?? 0 }
-    if (sql.includes('FROM "agent_events"') && sql.includes('event."itemId" = ANY')) return { rows: rows.questionEvents ?? [], rowCount: rows.questionEvents?.length ?? 0 }
+    if (sql.includes('FROM "agent_events"') && sql.includes('event."itemId" = ANY')) {
+      const result = values?.[1] === "prior-turn" ? rows.priorQuestionEvents ?? [] : rows.questionEvents ?? []
+      return { rows: result, rowCount: result.length }
+    }
     if (sql.includes('FROM "agent_events"')) return { rows: (rows.events ?? []).filter(event => event.taskId === undefined || event.taskId === null || event.taskId === values?.[2]), rowCount: rows.events?.length ?? 0 }
     if (sql.includes('FROM "agent_items"')) {
       if (sql.includes('item."type" = \'question\'')) return { rows: rows.questionItems ?? [], rowCount: rows.questionItems?.length ?? 0 }
@@ -189,6 +198,69 @@ describe("loadCanonicalTurnState", () => {
     expect(questionQuery).toContain('(item."taskId" IS NULL OR item."taskId" = $4)')
     expect(eventQuery).toContain('(event."taskId" IS NULL OR event."taskId" = $4)')
     expect(eventQuery).toContain("'question.answered'")
+  })
+
+  it("restores a complete earlier root answer after compaction as untrusted model history without replacing the current goal", async () => {
+    const answer = "I prefer Dublin roles — escaped \"detail\" stays intact."
+    const priorTurn = { id: "prior-turn", sessionId: "session-1", userId: "user-1", rootTaskId: "prior-root",
+      status: "completed", createdAt: new Date("2026-09-20T00:00:00.000Z") }
+    const priorQuestion = { id: "prior-question", revision: 1, userId: "user-1", turnUserId: "user-1", sessionId: "session-1",
+      turnId: "prior-turn", taskId: "prior-root", stepId: "prior-step", type: "question", status: "completed",
+      content: { stage: "user_input", waitKind: "question", questionId: "prior-wait", toolCallId: "prior-call",
+        question: "Which location should I prioritize?", options: [{ label: "Dublin", value: "dublin" }], answer, answerAvailable: true } }
+    const priorCall = { id: "prior-call-item", stepId: "prior-step", taskId: "prior-root", type: "tool_call", status: "completed",
+      content: { toolCallId: "prior-call", toolName: "agent.ask_user", toolVersion: "1", status: "completed", errorCode: null } }
+    const priorEvents = [
+      { id: "prior-start", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "prior-turn", taskId: "prior-root",
+        itemId: "prior-question", actor: "orchestrator", sequence: "10", type: "item.started", correlationId: "prior-question", causationId: "prior-wait",
+        payload: { itemId: "prior-question", waitKind: "question", toolCallId: "prior-call" } },
+      { id: "prior-answer", userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "prior-turn", taskId: null,
+        itemId: "prior-question", actor: "user", sequence: "11", type: "question.answered", correlationId: "prior-wait", causationId: "prior-question",
+        payload: { waitKind: "question", waitId: "prior-wait", itemId: "prior-question", turnId: "prior-turn", toolCallId: "prior-call", status: "answered" } },
+    ]
+    const compactedHistory = [{ id: "compacted-history", content: { role: "user", text: "Earlier narrative summary" } }]
+    const snapshot = {
+      schemaVersion: "agent-harness.context.v1", ownerId: "user-1", sessionId: "session-1", throughSequence: "7", goal: "Old objective",
+      userConstraints: [], confirmedDecisions: [], completedWork: [], openWork: [], pendingApprovals: [], artifacts: [], facts: [], failedAttempts: [],
+      references: [], consumedInputIds: [], context: { system: [], profile: [], steerHistory: compactedHistory, toolObservations: [] },
+      tokenAccounting: { profiles: [], totalInputTokens: 0, totalOutputTokens: 0, totalCostUsd: 0 },
+    }
+    const fake = pool({
+      turn: { input: { goal: "Find roles matching my current profile" }, rootTaskId: "root-current", contextSnapshotId: "snapshot-pinned",
+        modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      snapshots: [{ id: "snapshot-pinned", throughSequence: "7", version: 1, content: snapshot }],
+      priorTurns: [priorTurn], priorQuestions: [priorQuestion], priorCalls: [priorCall], priorSteps: [{ id: "prior-step", taskId: "prior-root" }],
+      priorQuestionEvents: priorEvents,
+    })
+
+    const restored = await loadCanonicalTurnState(fake, lease)
+
+    expect(restored.goal).toBe("Find roles matching my current profile")
+    expect(restored.snapshot.goal).toEqual({ id: "turn-goal:turn-1", content: "Find roles matching my current profile" })
+    expect(restored.snapshot.steerHistory).toEqual([
+      ...compactedHistory,
+      { id: "agent-question:prior-question:question", content: { role: "assistant", type: "question", question: "Which location should I prioritize?", options: [{ label: "Dublin", value: "dublin" }] } },
+      { id: "agent-question:prior-question:answer", content: { role: "user", type: "answer", questionId: "prior-wait", text: answer } },
+    ])
+    const claimStore: InputClaimStore = {
+      scope: { userId: "user-1" },
+      async withTransaction<T>(work: (transaction: InputClaimTransaction) => Promise<T>): Promise<T> {
+        return work({ getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }),
+          claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }), persistCheckpoint: async () => undefined })
+      },
+    }
+    const stepContext = await new StepContextBuilder(claimStore).build({
+      scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "step-current", snapshot: restored.snapshot, now: new Date(0),
+    })
+    const model = { profile: { provider: "test", model: "test-model", nativeTools: false, structuredOutput: false, streaming: false, continuationCursor: false } } as unknown as ModelAdapter
+    const request = buildModelRequest({ context: stepContext, model, tools: [], sessionId: "session-1", turnId: "turn-1",
+      stepId: "step-current", userId: "user-1", taskId: "root-current", signal: new AbortController().signal })
+    const prompt = request.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    expect(prompt).toContain("trust=UNTRUSTED_DATA")
+    expect(prompt).toContain("Which location should I prioritize?")
+    expect(prompt).toContain("I prefer Dublin roles — escaped")
+    expect(prompt).toContain("stays intact.")
+    expect(prompt.match(/I prefer Dublin roles/g)).toHaveLength(1)
   })
 
   it("keeps canonical model history unchanged when no persisted answer event matches", async () => {
@@ -471,6 +543,8 @@ describe("loadCanonicalTurnState", () => {
   it("projects a consumed wait outcome into the next root context", async () => {
     const wait: { id: string; userId: string; sessionId: string; turnId: string; parentTaskId: string; stepId: string; targetTaskIds: string[]; mode: string; status: string; matchedTaskIds: string[]; result: Record<string, unknown>; suspendedAt: Date; consumedAt: Date | null } = { id: "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "root-1", stepId: "step-1", targetTaskIds: ["child-1"], mode: "all", status: "ready", matchedTaskIds: ["child-1"], result: { request: { mode: "all" } }, suspendedAt: new Date("2026-09-09T00:00:00.000Z"), consumedAt: null }
     const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+      if (sql.includes('SELECT active_turn."createdAt"')) return { rows: [{ createdAt: new Date("2026-10-07T00:00:00.000Z") }], rowCount: 1 }
+      if (sql.includes('SELECT prior."id"')) return { rows: [], rowCount: 0 }
       if (sql.includes('"input"') && sql.includes('FROM "agent_turns"')) return { rows: [{ id: "turn-1", sessionId: "session-1", userId: "user-1", status: "in_progress", leaseOwnerId: lease.ownerId, leaseVersion: lease.leaseVersion, leaseExpiresAt: lease.leaseExpiresAt, input: { goal: "Continue" }, rootTaskId: "root-1", contextSnapshotId: null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} }], rowCount: 1 }
       if (sql.includes('FROM "agent_wait_conditions"')) return { rows: [wait], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks"') && sql.includes("ANY($1::text[])")) return { rows: [{ id: "child-1", rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1", userId: "user-1", role: "worker", status: "completed", result: { summary: "done" }, failureReason: null }], rowCount: 1 }

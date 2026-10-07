@@ -1,6 +1,7 @@
 import type pg from "pg"
 import type { ContextHistoryEntry } from "./context/step-context-builder.js"
 import { recoverAnsweredQuestionLineage, type RecoveryInput } from "./question-answer-recovery-lineage.js"
+import { recoverPriorRootQuestionHistory } from "./question-answer-prior-history.js"
 
 type RecoveryClient = Pick<pg.PoolClient, "query">
 
@@ -10,5 +11,7 @@ export async function recoverAnsweredQuestionHistory(
   input: RecoveryInput,
 ): Promise<ContextHistoryEntry[]> {
   const lineage = await recoverAnsweredQuestionLineage(client, input)
-  return lineage.flatMap(item => item.entries)
+  const current = lineage.flatMap(item => item.entries)
+  const prior = await recoverPriorRootQuestionHistory(client, { ...input, existingHistory: [...input.existingHistory, ...current] })
+  return [...prior, ...current]
 }
