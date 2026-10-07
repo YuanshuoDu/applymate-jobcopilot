@@ -150,6 +150,7 @@ export type TurnEngineOptions = {
       stepId: string
       snapshot: StepContextSnapshot
       rootInputId?: string
+      rootContextInputId?: string
       taskId?: string
       mode?: "new" | "retry" | "rebuild"
       lease?: { ownerId: string; leaseVersion: number; now: Date }
@@ -188,7 +189,7 @@ export type TurnEngineOptions = {
   /** Server-classified restart repair for persisted tool calls, applied before another model request. */
   readonly toolCallRecovery?: readonly ToolCallRecovery[]
   readonly steeringMarkerState?: { readonly active: readonly SteeringMarkerPayload[] }
-} & Pick<TurnExecutionOptions, "refreshTaskGraphAfterReadyWait" | "refreshTaskGraphAfterPlan" | "recoveredFinalCandidate" | "nativeSemanticProgressMode">
+} & Pick<TurnExecutionOptions, "refreshTaskGraphBeforeStep" | "refreshTaskGraphAfterReadyWait" | "refreshTaskGraphAfterPlan" | "recoveredFinalCandidate" | "nativeSemanticProgressMode">
 
 export type TurnResumeState = {
   readonly nextOrdinal: number

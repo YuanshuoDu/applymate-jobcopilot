@@ -12,6 +12,7 @@ import type {
 const DEFAULT_BASE_URL = "https://api.anthropic.com"
 const DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 const TOOL_NAME_PATTERN = /^[A-Za-z0-9_-]{1,64}$/
+export const ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS = 1_024
 
 type AnthropicMessage = {
   role: "user" | "assistant"
@@ -42,7 +43,7 @@ export function buildAnthropicRequest(
 
   const body: Record<string, unknown> = {
     model: config.model,
-    max_tokens: request.maxOutputTokens ?? 1_024,
+    max_tokens: request.maxOutputTokens ?? ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS,
     messages,
     stream: true,
   }

@@ -14,20 +14,30 @@ import type { StepContext } from "../context/step-context-builder.js"
 
 const scope: CognitiveAgendaReceiptScope = { sessionId: "session-1", turnId: "turn-1", taskId: "task-1", stepId: "turn:turn-1:step:0" }
 
-function context(): StepContext {
+function context(taskGraphRevision?: number): StepContext {
   return {
     schemaVersion: "agent-harness.v2", sessionId: scope.sessionId, turnId: scope.turnId, stepId: scope.stepId,
     inputThroughSequence: 1n, consumedInputIds: [], canonicalJson: "{}", blocks: [{ id: "goal-1", layer: "goal", role: "data", trust: "external_untrusted", source: "turn_goal", content: { revision: 2, objective: "secret objective" } }],
+    ...(taskGraphRevision === undefined ? {} : { taskGraphRevision }),
   }
 }
 
-function receipt(): CognitiveAgendaReceipt {
-  const value = buildCognitiveAgendaReceipt({ ...scope, agenda: buildCognitiveActionAgenda(context()) })
+function receipt(taskGraphRevision?: number): CognitiveAgendaReceipt {
+  const value = buildCognitiveAgendaReceipt({ ...scope, agenda: buildCognitiveActionAgenda(context(taskGraphRevision)) })
   if (!value) throw new Error("fixture receipt should be valid")
   return value
 }
 
 describe("cognitive agenda receipt", () => {
+  it("round-trips plan revision zero but keeps goal revisions positive", () => {
+    const value = receipt(0)
+    expect(value).toMatchObject({ goalRevision: null, planRevision: 0 })
+    expect(parseCognitiveAgendaReceipt(value, scope)).toEqual(value)
+    expect(parseCognitiveAgendaReceipt({ ...value, goalRevision: 0 }, scope)).toBeNull()
+    expect(parseCognitiveAgendaReceipt({ ...value, planRevision: -1 }, scope)).toBeNull()
+    expect(parseCognitiveAgendaReceipt({ ...value, planRevision: 1.5 }, scope)).toBeNull()
+  })
+
   it("builds a deterministic server-owned receipt and stable step key", () => {
     const first = receipt(), second = buildCognitiveAgendaReceipt({ ...scope, agenda: buildCognitiveActionAgenda(context()) })
     expect(second).toEqual(first)

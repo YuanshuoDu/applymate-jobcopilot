@@ -75,6 +75,7 @@ export type TurnExecutionContextBuilder = {
     stepId: string
     snapshot: StepContextSnapshot
     rootInputId?: string
+    rootContextInputId?: string
     taskId?: string
     now: Date
     steeringMarkerContext?: SteeringMarkerContext
@@ -100,6 +101,8 @@ export type TurnExecutionOptions = {
   readonly tools: readonly unknown[]
   readonly executeTool: TurnEngineToolExecutor
   readonly rootInputId?: string
+  /** Read-only durable root context; never participates in claim/checkpoint state. */
+  readonly rootContextInputId?: string
   readonly actorRole?: PolicyRole
   readonly capabilities?: readonly string[]
   readonly validateToolArguments?: (toolName: string, input: unknown) => boolean | string
@@ -125,6 +128,8 @@ export type TurnExecutionOptions = {
   readonly recoveredFinalCandidate?: string
   /** Canonical replay state used only for server-side marker hydration. */
   readonly steeringMarkerState?: { readonly active: readonly SteeringMarkerPayload[] }
+  /** Refresh the owner-scoped TaskGraph before building each planning-enabled Root Step. */
+  readonly refreshTaskGraphBeforeStep?: (snapshot: StepContextSnapshot) => Promise<StepContextSnapshot>
   /** Re-read durable TaskGraph state before continuing after an inline-ready agent.wait. */
   readonly refreshTaskGraphAfterReadyWait?: (snapshot: StepContextSnapshot) => Promise<StepContextSnapshot>
   /** Re-read durable TaskGraph state after an accepted agent.plan receipt. */

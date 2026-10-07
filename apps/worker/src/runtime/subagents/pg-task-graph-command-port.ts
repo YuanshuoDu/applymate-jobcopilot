@@ -9,6 +9,7 @@ import { writePlanReceipt } from "./task-graph-pg-events.js"
 import { taskGraphFingerprint, taskGraphItemId, taskGraphProposalKey } from "./task-graph-snapshot.js"
 import { normalizeNativeCommand } from "./task-graph-native-request.js"
 import { appendNativeGraphCommand, findNativeCommandReplay } from "./task-graph-native-pg.js"
+import { replaceUnstartedNativeFollowup } from "./task-graph-native-pending-replacement.js"
 
 const MAX_REVISION = 2_147_483_646
 type Row = Record<string, unknown>
@@ -57,6 +58,9 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
           throw new TaskGraphCommandError("task_graph_state_missing", "Persisted TaskGraph state is unavailable")
         }
         currentTaskGraph(loaded)
+        if (command.request.kind === "followup" && "mode" in command.request && command.request.mode === "replace_unstarted") {
+          return replaceUnstartedNativeFollowup(client, input, command, parent, loaded)
+        }
         return appendNativeGraphCommand(client, input, command, parent, loaded)
       })
     },

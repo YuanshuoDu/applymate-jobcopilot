@@ -23,14 +23,25 @@ describe("native verification owned goal and criteria binding", () => {
   })
 
   it("accepts the canonical human command goal with validated typed input parts", async () => {
+    const longReference = `Reference context, not a goal. ${"Supporting background details. ".repeat(450)}`
     const loaded = await loadNativeVerificationOwnedState(client({ input: {
       goal: "Original objective",
-      content: [{ type: "text", text: "Explicit goal supersedes this message." }, { type: "attachment_ref", attachmentId: "resume-1", mediaType: "application/pdf" }],
+      content: [{ type: "text", text: longReference }, { type: "attachment_ref", attachmentId: "resume-1", mediaType: "application/pdf" }],
     } }), scope, null)
     expect(loaded.goal).toBe("Original objective")
     expect(loaded.criteria).toEqual(["Original objective"])
     expect(loaded.criteriaValid).toBe(true)
     expect(loaded.turnGoalConflict).toBe(false)
+  })
+
+  it("still rejects an explicit goal beyond the frozen native objective bound", async () => {
+    const oversizedGoal = "x".repeat(4_097)
+    const loaded = await loadNativeVerificationOwnedState(client({ input: {
+      goal: oversizedGoal, content: [{ type: "text", text: "Background remains separate." }],
+    } }), scope, null)
+    expect(loaded.goal).toBeNull()
+    expect(loaded.turnGoalConflict).toBe(true)
+    expect(loaded.criteriaValid).toBe(false)
   })
 
   it("fails closed for malformed, unsupported, or sparse typed input parts", async () => {

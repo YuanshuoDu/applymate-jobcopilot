@@ -177,17 +177,21 @@ describe("agent timeline query API", () => {
   it("returns the latest legal agenda only on the first page and redacts its payload", async () => {
     mocks.agendaFindMany.mockResolvedValueOnce([
       agendaRow(BigInt(9), { payload: agendaPayload({ unexpected: "reject this" }) }),
-      agendaRow(BigInt(8), { payload: agendaPayload({ signals: { ...agendaPayload().signals, approvals: { count: 1, ids: ["sk-secret12345"] } } }) }),
+      agendaRow(BigInt(8), { payload: agendaPayload({
+        goalRevision: 3, planRevision: 0,
+        signals: { ...agendaPayload().signals, approvals: { count: 1, ids: ["sk-secret12345"] } },
+      }) }),
     ])
     const { GET } = await import("./route")
 
     const response = await GET(request("?limit=1") as never, params)
     const body = await response.json()
 
-    expect(body.agenda).toMatchObject({ id: "agenda_8", sequence: "8", type: "cognitive.agenda", payload: { signals: { approvals: { count: 1, ids: ["[REDACTED]"] } } } })
+    expect(body.agenda).toMatchObject({ id: "agenda_8", sequence: "8", type: "cognitive.agenda", payload: {
+      goalRevision: 3, planRevision: 0, signals: { approvals: { count: 1, ids: ["[REDACTED]"] } },
+    } })
     expect(body.agenda.payload).not.toHaveProperty("resumeFence")
-    expect(body.agenda.payload).not.toHaveProperty("goalRevision")
-    expect(body.agenda.payload).not.toHaveProperty("planRevision")
+    expect(JSON.stringify(body.agenda.payload)).not.toContain("input_1")
     expect(body.agendas.map((entry: { id: string }) => entry.id)).toEqual(["agenda_8"])
     expect(mocks.agendaFindMany).toHaveBeenCalledWith({
       where: { sessionId: "session_1", type: "cognitive.agenda" }, orderBy: { sequence: "desc" }, take: 64,
