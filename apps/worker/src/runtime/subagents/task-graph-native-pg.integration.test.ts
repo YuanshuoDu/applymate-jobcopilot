@@ -38,7 +38,6 @@ const suffix = randomUUID(), ids = {
   turn: `native-command-turn-${suffix}`, root: `native-command-root-${suffix}`,
   foreignTurn: `native-command-foreign-turn-${suffix}`, foreignRoot: `native-command-foreign-root-${suffix}`,
   step: `native-command-step-${suffix}`, turnOwner: `native-turn-owner-${suffix}`,
-  taskOwner: `native-task-owner-${suffix}`,
 }
 const commandRole = `replacement_command_${suffix.replaceAll("-", "")}`
 const claimRole = `replacement_claim_test_${suffix.replaceAll("-", "")}`
@@ -48,7 +47,7 @@ const claimApplicationName = `repl_claim_${suffix}`
 const scope: TaskGraphNativeCommandInput["scope"] = {
   userId: ids.user, sessionId: ids.session, turnId: ids.turn, rootTaskId: ids.root, parentTaskId: ids.root,
   stepId: ids.step, turnLeaseOwner: ids.turnOwner, turnLeaseVersion: 1,
-  parentLeaseOwner: ids.taskOwner, parentAttemptCount: 1,
+  parentLeaseOwner: ids.turnOwner, parentAttemptCount: 1,
 }
 let pool: PgPool | undefined
 let commandBasePool: PgPool | undefined
@@ -186,7 +185,7 @@ async function seed(): Promise<void> {
     VALUES ($1, $2, $3, NULL, NULL, '/root', 0, 'orchestrator', 'root', 'running', 'native command integration',
       '[]'::jsonb, '[]'::jsonb, '["jobs.search","jobs.get"]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
       '{"subagentPolicy":{"maxConcurrency":64,"maxDepth":8,"maxFanOut":64,"maxAttempts":2}}'::jsonb,
-      1, 2, $4, CURRENT_TIMESTAMP + INTERVAL '5 minutes', CURRENT_TIMESTAMP)`, [ids.root, ids.session, ids.turn, ids.taskOwner])
+      1, 2, $4, CURRENT_TIMESTAMP + INTERVAL '5 minutes', CURRENT_TIMESTAMP)`, [ids.root, ids.session, ids.turn, ids.turnOwner])
   await pool!.query(`UPDATE "sub_agent_tasks" SET "rootTaskId" = $1 WHERE "id" = $1`, [ids.root])
   await pool!.query(`UPDATE "agent_turns" SET "rootTaskId" = $1 WHERE "id" = $2`, [ids.root, ids.turn])
   await pool!.query(`INSERT INTO "agent_steps"

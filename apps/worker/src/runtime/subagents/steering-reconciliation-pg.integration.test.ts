@@ -36,6 +36,7 @@ const databaseUrl = disposableUrl(), describePg = databaseUrl ? describe : descr
 const suffix = randomUUID(), ids = {
   user: `steering-reconcile-user-${suffix}`, session: `steering-reconcile-session-${suffix}`,
   turn: `steering-reconcile-turn-${suffix}`, root: `steering-reconcile-root-${suffix}`,
+  graphChild: `steering-reconcile-graph-child-${suffix}`,
   turnOwner: `steering-reconcile-turn-owner-${suffix}`, taskOwner: `steering-reconcile-task-owner-${suffix}`,
   originStep: `steering-reconcile-origin-${suffix}`, keepStep: `steering-reconcile-keep-${suffix}`,
   consumeStep: `steering-reconcile-consume-${suffix}`, currentStep: `steering-reconcile-current-${suffix}`,
@@ -57,8 +58,8 @@ const hydrationScope = { userId: ids.user, sessionId: ids.session, turnId: ids.t
 const context = (stepId: string, cursor: bigint, consumedInputIds: readonly string[]): StepContext => ({ schemaVersion: "agent-harness.v2",
   sessionId: ids.session, turnId: ids.turn, stepId, inputThroughSequence: cursor, consumedInputIds, canonicalJson: "{}", blocks: [] })
 const baseGraph = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [] })
-const revisedGraph = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{ key: "continued-work", templateId: "general_researcher",
-  goal: "Continue the user-requested research", successCriteria: ["Record findings"], dependsOn: [], depth: 1, taskId: ids.root,
+const revisedGraph = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{ key: "continued-work", templateId: "analyst",
+  goal: "Continue the user-requested research", successCriteria: ["Record findings"], dependsOn: [], depth: 1, taskId: ids.graphChild,
   verificationDisposition: "legacy_unverified" }] })
 let adminPool: Pool | undefined
 let runtimePool: Pool | undefined
@@ -122,6 +123,16 @@ async function waitForBlockedBy(applicationName: string, blockerPid: number): Pr
     await new Promise(resolve => setTimeout(resolve, 10))
   }
   throw new Error(`PostgreSQL did not report ${applicationName} blocked by backend ${blockerPid}`)
+}
+async function waitForAnyLockWait(applicationName: string): Promise<void> {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    const blocked = (await adminPool!.query<{ blocked: boolean }>(`SELECT EXISTS (
+      SELECT 1 FROM pg_stat_activity AS waiter WHERE waiter.application_name = $1 AND waiter.wait_event_type = 'Lock'
+        AND cardinality(pg_blocking_pids(waiter.pid)) > 0) AS blocked`, [applicationName])).rows[0]?.blocked
+    if (blocked) return
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  throw new Error(`PostgreSQL did not report ${applicationName} waiting on a lock`)
 }
 async function acceptSteer(client: PoolClient, id: string, messageId: string, text: string): Promise<number> {
   // Mirrors the Web producer's accepted item/event/input facts; this fixture does not call its HTTP service.
@@ -222,6 +233,11 @@ async function seedBase(): Promise<void> {
       '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 1, 2, $4, $5, CURRENT_TIMESTAMP)`,
   [ids.root, ids.session, ids.turn, ids.taskOwner, future])
   await adminPool!.query(`UPDATE "sub_agent_tasks" SET "rootTaskId" = $1 WHERE "id" = $1`, [ids.root])
+  await adminPool!.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
+    "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "updatedAt")
+    VALUES ($1, $2, $3, $4, $4, '/root/continued-work', 1, 'analyst', 'job_analysis', 'queued', 'Continue the user-requested research',
+      '[]'::jsonb, '["Record findings"]'::jsonb, '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 0, 2, CURRENT_TIMESTAMP)`,
+  [ids.graphChild, ids.session, ids.turn, ids.root])
   await adminPool!.query(`UPDATE "agent_turns" SET "rootTaskId" = $1 WHERE "id" = $2`, [ids.root, ids.turn])
   await seedStep(ids.originStep, 0, "completed", 1, [ids.originalInput])
   await seedStep(ids.keepStep, 1, "streaming", 2, [ids.firstSteer])
@@ -434,15 +450,16 @@ describePg("durable steering reconciliation PostgreSQL acceptance", () => {
       FROM "agent_items" AS graph WHERE graph."id" = $3`, [ids.session, ids.root, taskGraphItemId(ids.root)])).rows).toEqual(beforeDispatch.rows)
 
     await adminPool!.query(`UPDATE "agent_steps" SET "status" = 'completed', "completedAt" = CURRENT_TIMESTAMP WHERE "id" = $1`, [postDecisionScope.stepId])
-    await adminPool!.query(`UPDATE "agent_inputs" SET "status" = 'consumed', "consumedByStepId" = $2, "consumedAt" = CURRENT_TIMESTAMP WHERE "id" = $1`, [afterDecisionSteer, afterKeepSteer])
     const afterKeepAccepted = Number(afterKeepSequence.acceptedSequence)
     await seedStep(afterKeepSteer, 6, "streaming", afterKeepAccepted,
       [ids.originalInput, ids.firstSteer, ids.laterSteer, priorSteer, afterDecisionSteer])
-    await insertEvent({ id: `${afterKeepSteer}-agenda`, sequence: afterKeepAccepted + 1, type: "cognitive.agenda", actor: "orchestrator", itemId: null,
+    await adminPool!.query(`UPDATE "agent_inputs" SET "status" = 'consumed', "consumedByStepId" = $2, "consumedAt" = CURRENT_TIMESTAMP WHERE "id" = $1`, [afterDecisionSteer, afterKeepSteer])
+    const afterKeepEventSequence = Number((await adminPool!.query<{ eventSequence: string }>(`SELECT "eventSequence"::text AS "eventSequence" FROM "agent_sessions" WHERE "id" = $1`, [ids.session])).rows[0]?.eventSequence)
+    await insertEvent({ id: `${afterKeepSteer}-agenda`, sequence: afterKeepEventSequence + 1, type: "cognitive.agenda", actor: "orchestrator", itemId: null,
       taskId: ids.root, correlationId: afterKeepSteer, idempotencyKey: `cognitive.agenda:${afterKeepSteer}`,
       payload: agenda(afterKeepSteer, BigInt(afterKeepAccepted), 2) })
-    await seedToolCall(afterKeepSteer, afterKeepCall, "agent.reconcile", { decision: "keep", expectedRevision: 2 }, afterKeepAccepted + 2)
-    await adminPool!.query(`UPDATE "agent_sessions" SET "eventSequence" = $2 WHERE "id" = $1`, [ids.session, afterKeepAccepted + 2])
+    await seedToolCall(afterKeepSteer, afterKeepCall, "agent.reconcile", { decision: "keep", expectedRevision: 2 }, afterKeepEventSequence + 2)
+    await adminPool!.query(`UPDATE "agent_sessions" SET "eventSequence" = $2 WHERE "id" = $1`, [ids.session, afterKeepEventSequence + 2])
     await expect(commandPort.reconcileSteering!(operation(afterKeepSteer, afterKeepCall, "keep", 2))).resolves.toEqual({
       decision: "keep", revision: 2, reconciledInputCount: 1,
     })
@@ -453,10 +470,10 @@ describePg("durable steering reconciliation PostgreSQL acceptance", () => {
     await insertEvent({ id: `${lastStep}-agenda`, sequence: staleCursor + 1, type: "cognitive.agenda", actor: "orchestrator", itemId: null,
       taskId: ids.root, correlationId: lastStep, idempotencyKey: `cognitive.agenda:${lastStep}`, payload: agenda(lastStep, BigInt(staleCursor), 2) })
     await seedToolCall(lastStep, lastCall, "agent.reconcile", { decision: "keep", expectedRevision: 2 }, staleCursor + 2)
-    const reviseProposal = { expectedRevision: 2, nodes: [{ key: `race-revise-${suffix}`, templateId: "general_researcher",
+    const reviseProposal = { expectedRevision: 2, nodes: [{ key: `race-revise-${suffix}`, templateId: "analyst",
       goal: "Continue the original research", successCriteria: ["Record findings"], dependsOn: [] }] }
     const reviseInput = { scope: { ...scope, stepId: lastStep }, proposal: reviseProposal,
-      templates: { general_researcher: { role: "researcher", taskType: "research", allowedActions: [] } } }
+      templates: { analyst: { role: "analyst", taskType: "job_analysis", allowedActions: [] } } }
     await seedToolCall(lastStep, lastPlanCall, "agent.plan", reviseProposal, staleCursor + 3)
     await adminPool!.query(`UPDATE "agent_sessions" SET "eventSequence" = $2 WHERE "id" = $1`, [ids.session, staleCursor + 3])
     const beforeStaleDecision = await adminPool!.query(`SELECT graph."revision", graph."content",
@@ -473,7 +490,7 @@ describePg("durable steering reconciliation PostgreSQL acceptance", () => {
       const staleRevise = planCommandPort.appendAndScheduleWithReconciliation!(reviseInput,
         operation(lastStep, lastPlanCall, "revise", 2))
       await waitForBlockedBy(decisionApplicationName, acceptancePid)
-      await waitForBlockedBy(`steer_plan_${suffix}`, acceptancePid)
+      await waitForAnyLockWait(`steer_plan_${suffix}`)
       const acceptedSequence = await acceptSteer(acceptanceClient, lastSteer, `${lastSteer}-message`, "A steer arriving during keep")
       await acceptanceClient.query("COMMIT")
       acceptanceOpen = false
