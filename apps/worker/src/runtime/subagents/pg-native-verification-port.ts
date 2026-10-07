@@ -19,6 +19,7 @@ import type {
   NativeVerificationRecoverableGoal, NativeVerificationRootGoalWitness,
 } from "./native-verification-port.js"
 import type { NativeVerificationTargetBinding } from "./native-verification-contract.js"
+import { appendNativeUserSelfAttestations } from "./native-verification-user-evidence.js"
 import type { TaskGraphExecutionScope, TaskGraphReadScope } from "./task-graph-command-port.js"
 import type { LoadedGraph } from "./task-graph-pg-state.js"
 import type { PgSubagentPool } from "./types.js"
@@ -56,7 +57,10 @@ export function createPgNativeVerificationPort(pool: PgSubagentPool): NativeVeri
         const candidateDigest = digestNativeVerificationValue(input.candidateText)
         const childBindingSetDigest = nativeVerificationBindingDigest(locked.state, history)
         const packetHistory = nativeVerificationRootPacketHistory(history, historyTargets(proofs), candidateDigest, childBindingSetDigest)
-        const content = buildNativeRootPacketContent({ state: locked.state, candidateText: input.candidateText, childBindingSetDigest, history: packetHistory })
+        const baseContent = buildNativeRootPacketContent({ state: locked.state, candidateText: input.candidateText, childBindingSetDigest, history: packetHistory })
+        if (!baseContent) return combine(children, "unavailable", [])
+        const content = await appendNativeUserSelfAttestations(client, input.scope, baseContent,
+          { kind: "exact", stepId: input.scope.stepId })
         if (!content) return combine(children, "unavailable", [])
         const target: NativeVerificationTargetBinding = { kind: "root_goal", candidateDigest, childBindingSetDigest }
         const control = await ensureNativeVerificationControl(client, { scope: input.scope, parent: locked.parent, target, content })
@@ -86,8 +90,9 @@ export function createPgNativeVerificationPort(pool: PgSubagentPool): NativeVeri
         const target = root.task.packet.target
         if (target.kind !== "root_goal" || target.candidateDigest !== root.task.control.target.candidateDigest
           || digestNativeVerificationValue(target.candidateText) !== target.candidateDigest) return null
-        const content = buildNativeRootPacketContent({ state: locked.state, candidateText: target.candidateText,
+        const baseContent = buildNativeRootPacketContent({ state: locked.state, candidateText: target.candidateText,
           childBindingSetDigest: bindingDigest, history: nativeVerificationRootPacketHistory(history, historyTargets(proofs), target.candidateDigest, bindingDigest) })
+        const content = baseContent && await appendNativeUserSelfAttestations(client, scope, baseContent, { kind: "latest" })
         if (!content || !nativeVerificationControlPacketMatches(root.task, content)) return null
         if (root.disposition === "pending") return { controlTaskId: root.task.taskId, candidateText: target.candidateText,
           status: "pending", feedback: null }
@@ -104,7 +109,9 @@ export function createPgNativeVerificationPort(pool: PgSubagentPool): NativeVeri
       return transaction(pool, async client => {
         await client.query(`SELECT set_config('app.user_id', $1, true)`, [input.scope.userId])
         const locked = await lockAndLoad(client, input.scope, true)
-        return readNativeVerificationFailedRootRejectionWithClient(client, { ...input, graph: locked.graph, state: locked.state })
+        return readNativeVerificationFailedRootRejectionWithClient(client, {
+          ...input, stepId: input.scope.stepId, graph: locked.graph, state: locked.state,
+        })
       })
     },
   }

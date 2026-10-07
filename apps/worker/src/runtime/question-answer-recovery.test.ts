@@ -25,6 +25,8 @@ function events(startPatch: Record<string, unknown> = {}, answerPatch: Record<st
 function client(itemRows: Record<string, unknown>[] = [item()], eventRows: Record<string, unknown>[] = events(), queryLog: string[] = []) {
   const value = { query: async (sql: string) => {
     queryLog.push(sql)
+    if (sql.includes('SELECT active_turn."createdAt"')) return { rows: [{ createdAt: new Date("2026-10-07T00:00:00.000Z") }] }
+    if (sql.includes('SELECT prior."id"')) return { rows: [] }
     return { rows: sql.includes('FROM "agent_items"') ? itemRows : eventRows }
   } }
   return value as never
@@ -98,6 +100,17 @@ describe("recoverAnsweredQuestionHistory", () => {
     await expect(recoverAnsweredQuestionHistory(client(), input({
       toolItems: [{ id: "call-item", stepId: "other-step", taskId: "root-1", type: "tool_call", content: { toolCallId: "call-1" } }],
     }))).rejects.toThrow("question_recovery_step_missing")
+  })
+
+  it("accepts only the broker's user-scoped null-task answer event for a root-owned question", async () => {
+    const rootQuestion = item({ taskId: "root-1", stepId: "step-1" })
+    const start = { ...events()[0]!, taskId: "root-1" }
+    await expect(recoverAnsweredQuestionHistory(client([rootQuestion], [start, events()[1]!]), input()))
+      .resolves.toHaveLength(2)
+    await expect(recoverAnsweredQuestionHistory(client([rootQuestion], [start, { ...events()[1]!, taskId: "foreign-root" }]), input()))
+      .rejects.toThrow("question_recovery_event_scope_invalid")
+    await expect(recoverAnsweredQuestionHistory(client([rootQuestion], [start, { ...events()[1]!, actor: "system" }]), input()))
+      .rejects.toThrow("question_recovery_event_scope_invalid")
   })
 
   it("attaches a turn-scoped null-task wait only to the unique matching root-task call and step", async () => {

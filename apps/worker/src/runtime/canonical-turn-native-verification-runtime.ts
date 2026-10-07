@@ -180,7 +180,7 @@ export function createCanonicalNativeVerificationRuntime(input: Readonly<{
   recover(): Promise<NativeVerificationRecovery>
   checkCompletion(stepId: string, candidateText: string): Promise<TurnEngineCompletionGateResult | null>
   resetSemanticProgress(): void
-  checkTerminal(client: Pick<PoolClient, "query">, terminal: Readonly<{ finalContent: unknown; response: unknown }>): Promise<NativeVerificationTerminalCheck>
+  checkTerminal(client: Pick<PoolClient, "query">, terminal: Readonly<{ stepId?: string; finalContent: unknown; response: unknown }>): Promise<NativeVerificationTerminalCheck>
   accepted(): boolean
 }> {
   const runtime = input.factory?.(input.pool) ?? {
@@ -237,7 +237,7 @@ export function createCanonicalNativeVerificationRuntime(input: Readonly<{
         denial: { ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: "Current native proof does not match the final content being persisted." },
       }
       const nativeVerificationPassed = await runtime.readTerminalProof(client, {
-        scope: input.coordination.readScope(), candidateText, witness: acceptedWitness,
+        scope: input.coordination.readScope(), candidateText, witness: acceptedWitness, stepId: terminal.stepId,
       })
       return nativeVerificationPassed ? { nativeVerificationPassed: true } : {
         nativeVerificationPassed: false,

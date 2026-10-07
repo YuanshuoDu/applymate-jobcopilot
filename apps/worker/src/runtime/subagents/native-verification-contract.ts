@@ -3,6 +3,10 @@ import { Buffer } from "node:buffer"
 
 export const NATIVE_VERIFICATION_CONTROL_SCHEMA = "agent-harness.v2.native-verifier-control.v1" as const
 export const NATIVE_VERIFICATION_PACKET_SCHEMA = "agent-harness.v2.native-verifier-packet.v1" as const
+export const NATIVE_VERIFICATION_PACKET_SCHEMA_V2 = "agent-harness.v2.native-verifier-packet.v2" as const
+export const NATIVE_VERIFICATION_PACKET_V2_MAX_BYTES = 256 * 1024
+export const NATIVE_VERIFICATION_USER_SELF_ATTESTATION_KIND = "user_self_attestation" as const
+export const NATIVE_VERIFICATION_USER_SELF_ATTESTATION_REFERENCE_PREFIX = "user-self-attestation:" as const
 export const NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA = "agent-harness.v2.native-verifier-model-report.v1" as const
 export const NATIVE_VERIFICATION_REPORT_SCHEMA = "agent-harness.v2.native-verifier-report.v1" as const
 export const NATIVE_VERIFICATION_PACKET_CONTEXT_KEY = "nativeVerificationPacket" as const
@@ -36,7 +40,7 @@ export type NativeVerificationPacketTarget =
   | { readonly kind: "child"; readonly taskId: string; readonly attempt: number; readonly resultDigest: string; readonly referenceId: string; readonly resultText: string }
   | { readonly kind: "root_goal"; readonly candidateDigest: string; readonly referenceId: string; readonly candidateText: string }
 export type NativeVerificationPacket = {
-  readonly schemaVersion: typeof NATIVE_VERIFICATION_PACKET_SCHEMA
+  readonly schemaVersion: typeof NATIVE_VERIFICATION_PACKET_SCHEMA | typeof NATIVE_VERIFICATION_PACKET_SCHEMA_V2
   readonly controlOperationId: string
   readonly controlTaskId: string
   readonly goal: string
@@ -73,7 +77,7 @@ export type NativeVerificationReport = {
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 const DIGEST = /^[a-f0-9]{64}$/
-const MAX_CANONICAL_BYTES = 256 * 1024
+const MAX_CANONICAL_BYTES = NATIVE_VERIFICATION_PACKET_V2_MAX_BYTES
 const MAX_CANONICAL_NODES = 10_000
 const MAX_CANONICAL_DEPTH = 64
 
@@ -106,6 +110,9 @@ function exact(value: unknown, keys: readonly string[]): Record<string, unknown>
 
 function id(value: unknown): value is string { return typeof value === "string" && ID.test(value) }
 function digest(value: unknown): value is string { return typeof value === "string" && DIGEST.test(value) }
+export function isNativeVerificationUserSelfAttestationReference(value: unknown): value is string {
+  return typeof value === "string" && /^user-self-attestation:[a-f0-9]{64}$/.test(value)
+}
 function attempt(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) > 0 }
 
 function parseTarget(value: unknown): NativeVerificationTargetBinding | null {

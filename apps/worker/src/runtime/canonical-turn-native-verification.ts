@@ -87,7 +87,7 @@ const REPAIR_ACTION: Readonly<Record<RepairReason, string>> = {
   evidence_conflict: "reconcile current owned sources and resolve contradictions",
   does_not_meet_criterion: "revise the answer against the criterion",
   unsupported_claim: "remove the claim or support it with current owned evidence",
-  ambiguous: "Resolve ambiguity from available evidence and seek user clarification when user-dependent, otherwise keep the uncertainty explicit.",
+  ambiguous: "Resolve ambiguity from current owned evidence; identify missing user facts and seek clarification when available, otherwise state uncertainty.",
 }
 const VALID_REASON_DISPOSITIONS: Readonly<Record<NativeVerificationDisposition, readonly NativeVerificationReasonCode[]>> = {
   passed: ["meets_criterion"],
@@ -96,7 +96,7 @@ const VALID_REASON_DISPOSITIONS: Readonly<Record<NativeVerificationDisposition, 
 }
 const GENERIC_REPAIR_GUIDANCE = "Revise the candidate or obtain new current owned evidence before retrying."
 const VERIFICATION_STATUSES = ["passed", "failed", "uncertain", "pending", "unavailable"] as const
-export function nativeVerificationFeedbackText(status: string, value: unknown = []): string {
+export function nativeVerificationFeedbackText(status: string, value: unknown = [], replanFallback = false): string {
   const parsed = parseNativeVerificationFeedback(value)
   const knownStatus = (VERIFICATION_STATUSES as readonly string[]).includes(status)
   const safeStatus = knownStatus ? status : "unavailable"
@@ -117,7 +117,8 @@ export function nativeVerificationFeedbackText(status: string, value: unknown = 
   if (actions.length) {
     if (output.length + actionBlock.length > 512) return output
     output += actionBlock
-  } else if (safeStatus === "failed" && rows.length > 0) output += ` ${GENERIC_REPAIR_GUIDANCE}`
+  } else if (replanFallback) output += " Replan against verified criteria using current owned evidence."
+  else if (safeStatus === "failed" && rows.length > 0) output += ` ${GENERIC_REPAIR_GUIDANCE}`
   for (const row of rows) if (output.length + row.length + 1 <= 512) output += ` ${row}`
   return output
 }
@@ -157,7 +158,7 @@ export async function verifyNativeRootCandidate(input: Readonly<{
     }
     if (goal.status !== "passed" || !goal.rootGoalWitness) {
       const semanticRejectionControlTaskId = goal.status === "failed" ? matchingFailedRootControl(goal, input.scope.rootTaskId) : undefined
-      const feedback = nativeVerificationFeedbackText(goal.status, goal.feedback)
+      const feedback = nativeVerificationFeedbackText(goal.status, goal.feedback, Boolean(semanticRejectionControlTaskId))
       return { kind: "blocked", feedback,
         ...(semanticRejectionControlTaskId ? { semanticRejectionControlTaskId } : {}) }
     }

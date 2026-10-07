@@ -57,7 +57,9 @@ describe("atomic native semantic rejection completion", () => {
   it("revalidates the persisted candidate proof before atomically completing the Step and writing its private receipt", async () => {
     const mock = client()
     await expect(completeNativeSemanticRejectionStepWithClient(mock.client, input)).resolves.toEqual({ inputThroughSequence: 8n, distinctStepCount: 1 })
-    expect(readers.proof).toHaveBeenCalledWith(mock.client, expect.objectContaining({ candidateText: packetText, controlTaskId: identity.controlTaskId }))
+    expect(readers.proof).toHaveBeenCalledWith(mock.client, expect.objectContaining({
+      candidateText: packetText, controlTaskId: identity.controlTaskId, stepId: input.stepId,
+    }))
     const updateIndex = mock.calls.findIndex(call => call.sql.startsWith('UPDATE "agent_steps"'))
     const insertIndex = mock.calls.findIndex(call => call.sql.startsWith('INSERT INTO "agent_native_semantic_rejections"'))
     expect(updateIndex).toBeGreaterThanOrEqual(0)

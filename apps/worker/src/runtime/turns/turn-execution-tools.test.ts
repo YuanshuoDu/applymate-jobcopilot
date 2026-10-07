@@ -47,6 +47,18 @@ describe("recoverPersistedToolCalls", () => {
     expect(JSON.stringify(fixture.updates)).toContain("tool_result_replay_uncertain")
     expect(fixture.events.some(event => event.type === "tool_call.failed" && JSON.stringify(event.payload).includes("tool_result_replay_uncertain"))).toBe(true)
   })
+
+  it("does not replay a confirmed pre-intent paused ask call after the root wait store returns none", async () => {
+    const ask: ToolCallRecovery = { ...pending, call: { id: "ask-old", name: "agent.ask_user", arguments: { question: "Old question?" } } }
+    const execute = vi.fn()
+    const fixture = execution(ask, execute)
+    fixture.options = { ...fixture.options, store: { ...fixture.options.store, readPendingQuestion: async () => ({ status: "none" }) } }
+
+    await expect(recoverPersistedToolCalls(fixture.options, fixture.writer, () => new Date())).resolves.toEqual([])
+    expect(execute).not.toHaveBeenCalled()
+    expect(fixture.updates).toEqual([])
+    expect(fixture.events).toEqual([])
+  })
 })
 
 describe("executeTools persisted replay", () => {

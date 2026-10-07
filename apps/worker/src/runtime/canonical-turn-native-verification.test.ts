@@ -78,7 +78,7 @@ describe("nativeVerificationFeedbackText", () => {
       "evidence_conflict: reconcile current owned sources and resolve contradictions.",
       "does_not_meet_criterion: revise the answer against the criterion.",
       "unsupported_claim: remove the claim or support it with current owned evidence.",
-      "ambiguous: Resolve ambiguity from available evidence and seek user clarification when user-dependent, otherwise keep the uncertainty explicit."]
+      "ambiguous: Resolve ambiguity from current owned evidence; identify missing user facts and seek clarification when available, otherwise state uncertainty."]
     let prior = -1
     for (const action of actions) {
       const position = output.indexOf(action)
@@ -136,6 +136,16 @@ describe("nativeVerificationFeedbackText", () => {
       expect(output.length).toBeLessThanOrEqual(512)
       expect(output).not.toContain(status)
     }
+    expect(nativeVerificationFeedbackText("failed", [{ controlTaskId: "review-1", targetTaskId: "root-1", disposition: "failed",
+      criteria: [{ criterionId: "criterion-1", disposition: "failed", reasonCode: "invented", evidenceReferenceIds: [] }] }], true))
+      .toBe("Independent native verification is failed.")
+    expect(nativeVerificationFeedbackText("failed", [criterionFeedback({ reasonCode: "evidence_missing", disposition: "failed" })], true))
+      .toBe("Independent native verification is failed.")
+    expect(nativeVerificationFeedbackText("uncertain", [criterionFeedback({ reasonCode: "does_not_meet_criterion", disposition: "uncertain" })], true))
+      .toBe("Independent native verification is uncertain.")
+    const fallback = nativeVerificationFeedbackText("failed", [], true)
+    expect(fallback).toContain("Replan against verified criteria using current owned evidence.")
+    expect(fallback.length).toBeLessThanOrEqual(512)
   })
 
   it("preserves maximal complete criterion rows and skips rows that cannot fit without blocking later short rows", () => {

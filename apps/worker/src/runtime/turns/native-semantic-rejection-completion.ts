@@ -59,7 +59,9 @@ async function currentFailedProof(client: TurnEngineQueryClient, input: Completi
   const matches = controls.filter(control => control.taskId === identity.controlTaskId)
   if (matches.length !== 1 || matches[0]!.packet.target.kind !== "root_goal") return null
   const candidateText = matches[0]!.packet.target.candidateText
-  return readNativeVerificationFailedRootRejectionWithClient(client, { scope, graph, state, candidateText, controlTaskId: identity.controlTaskId })
+  return readNativeVerificationFailedRootRejectionWithClient(client, {
+    scope, graph, state, candidateText, controlTaskId: identity.controlTaskId, stepId: input.stepId,
+  })
 }
 async function matchingSteps(client: TurnEngineQueryClient, input: CompletionInput, checkpoint: bigint): Promise<string[]> {
   const owner = input.owner, id = input.identity

@@ -13,6 +13,7 @@ import { steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "../con
 import { COGNITIVE_AGENDA_EVENT_TYPE } from "./cognitive-agenda-receipt.js"
 import { BudgetExceededError } from "../budget.js"
 import { SessionPauseRequestedError } from "../session-gate.js"
+import { classifyTurnFailure } from "./dlq.js"
 import { ToolExecutionError, type ToolExecutionContext } from "../tools/types.js"
 import { createTaskGraphPlanningTool } from "../tools/planning-executors.js"
 import type { TaskGraphCommandPort, TaskGraphCurrentState, TaskGraphScheduleReceipt } from "../subagents/task-graph-command-port.js"
@@ -98,6 +99,36 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
   return { options, events, notifications, items, finalResponses, stepTasks, stepAttempts, stepStatuses, stepInputs, requests }
 }
 
+function nativeQuestionFixture(recovery: unknown = { status: "none" }, callId = "ask-1") {
+  const root = fixture(identity("turn", "root-1")), timeline: string[] = []
+  const baseStore = root.options.store
+  const usage = { inputTokens: 10, outputTokens: 4, estimatedCostUsd: 0.02 }
+  const intent = { schemaVersion: "agent-harness.v2.ask-user-intent.v1", kind: "user_question", stage: "user_input", question: "Which city?", options: [] }
+  const waitForQuestion = vi.fn(async (input: { toolCallId: string }) => ({ status: "waiting_for_user" as const, disposition: "created" as const, waitId: "question-1", itemId: "agent-wait:question:question-1", turnId: "turn-1", toolCallId: input.toolCallId, nextTurnRevision: 2 }))
+  const stageQuestionUsage = vi.fn(async () => { timeline.push("stage") })
+  const cancelPausedQuestion = vi.fn(async () => "cancelled" as const)
+  const readPendingQuestion = vi.fn(async () => recovery as never)
+  const model: ModelAdapter = { id: "fixture-model", profile, async *stream(request: HarnessModelRequest) {
+    root.requests.push(request)
+    yield { type: "tool_call_completed", callId, name: "agent.ask_user", arguments: { question: "Which city?" } }
+    yield { type: "usage", ...usage }
+    yield { type: "completed", finishReason: "tool_calls" }
+  } }
+  root.options = {
+    ...root.options, model, tools: [{ name: "agent.ask_user", version: "1" }],
+    store: { ...baseStore,
+      appendEvent: async input => {
+        const suffix = input.itemId?.includes(":item:tool-result:") ? ":result" : input.itemId?.includes(":item:tool-call:") ? ":call" : ""
+        timeline.push(`${input.type}${suffix}`)
+        return baseStore.appendEvent(input)
+      },
+      stageQuestionUsage, cancelPausedQuestion, waitForQuestion: async input => { timeline.push("wait"); return waitForQuestion(input) }, readPendingQuestion,
+    },
+    executeTool: async ({ call }) => ({ id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed", output: intent, errorCode: null }),
+  }
+  return { ...root, timeline, usage, waitForQuestion, stageQuestionUsage, cancelPausedQuestion, readPendingQuestion }
+}
+
 class LateSteerInputClaimStore implements InputClaimStore {
   readonly scope: TenantScope = { userId: "user-1" }
   readonly inputs: StoredAgentInput[] = []
@@ -165,6 +196,159 @@ function addSteeringInput(root: Fixture, alreadyConsumed = false): void {
 }
 
 describe("owner-agnostic turn execution loop", () => {
+  it("stages real model usage and commits the root question after its completed tool receipt", async () => {
+    const root = nativeQuestionFixture()
+    const result = await runTurnExecutionLoop(root.options)
+    const ordered = ["tool_call.started:call", "stage", "item.completed:call", "tool_call.completed:call", "item.completed:result", "wait"]
+    const positions = ordered.map(name => root.timeline.indexOf(name))
+
+    expect(result).toMatchObject({ status: "waiting_for_user", waitId: "question-1", stepCount: 1, toolCallCount: 1 })
+    expect(positions.every(position => position >= 0)).toBe(true)
+    expect(positions).toEqual([...positions].sort((a, b) => a - b))
+    expect(root.stageQuestionUsage).toHaveBeenCalledWith(expect.objectContaining({ finishReason: "tool_calls", usage: root.usage, toolCallId: "ask-1" }))
+    expect(root.waitForQuestion).toHaveBeenCalledWith(expect.objectContaining({ toolCallId: "ask-1" }))
+    expect(root.stepStatuses).toEqual([])
+    expect(root.events.some(event => event.type === "step.completed" || event.type === "turn.completed")).toBe(false)
+    expect(root.finalResponses).toHaveLength(0)
+  })
+
+  it("commits a recovered prepared question before another provider call", async () => {
+    const root = nativeQuestionFixture({ status: "prepared", stepId: "old-step", toolCallId: "old-call", waitId: "question-old", itemId: "agent-wait:question:question-old" })
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "waiting_for_user", waitId: "question-1", stepCount: 0, toolCallCount: 0 })
+    expect(root.requests).toHaveLength(0)
+    expect(root.waitForQuestion).toHaveBeenCalledWith(expect.objectContaining({ stepId: "old-step", toolCallId: "old-call" }))
+    expect(root.stageQuestionUsage).not.toHaveBeenCalled()
+    expect(root.events.some(event => event.type === "turn.completed" || event.type === "turn.failed")).toBe(false)
+  })
+
+  it("leaves a prepared step open and sends uncertain question commits through the queue retry classification", async () => {
+    const root = nativeQuestionFixture()
+    root.waitForQuestion.mockRejectedValueOnce(new Error("temporary database failure"))
+    const error = await runTurnExecutionLoop(root.options).then(() => null, reason => reason as unknown)
+
+    expect(error).toMatchObject({ code: "prepared_question_wait_retry_required" })
+    expect(classifyTurnFailure(error, 0)).toEqual({ disposition: "retry", reasonCode: "execution_failed" })
+    expect(root.stepStatuses).toEqual([])
+    expect(root.events.some(event => event.type === "step.completed" || event.type === "turn.failed" || event.type === "turn.completed")).toBe(false)
+    expect(root.finalResponses).toHaveLength(0)
+  })
+
+  it("halts at a committed unanswered question and continues after answer history is loaded", async () => {
+    const waiting = nativeQuestionFixture({ status: "waiting", stepId: "old-step", toolCallId: "old-call", waitId: "question-old", itemId: "agent-wait:question:question-old", turnId: "turn-1" })
+    await expect(runTurnExecutionLoop(waiting.options)).resolves.toMatchObject({ status: "waiting_for_user", waitId: "question-old" })
+    expect(waiting.requests).toHaveLength(0)
+    expect(waiting.waitForQuestion).not.toHaveBeenCalled()
+
+    const answered = nativeQuestionFixture({ status: "answered", stepId: "old-step", toolCallId: "old-call", waitId: "question-old", itemId: "agent-wait:question:question-old", turnId: "turn-1" })
+    answered.options = {
+      ...answered.options,
+      expectedEvidence: ["question-answer"],
+      snapshot: { ...answered.options.snapshot, toolObservations: [{ id: "question-answer:question-old", content: { toolCallId: "question-answer", status: "completed", questionId: "question-old", answer: "Berlin" } }] },
+      model: { id: "answer-aware", profile, async *stream(request: HarnessModelRequest) {
+        answered.requests.push(request)
+        yield { type: "text_delta", text: "Thanks, I will use Berlin." }
+        yield { type: "completed", finishReason: "stop" }
+      } },
+    }
+    await expect(runTurnExecutionLoop(answered.options)).resolves.toMatchObject({ status: "completed" })
+    expect(answered.requests).toHaveLength(1)
+    expect(JSON.stringify(answered.requests[0]?.messages)).toContain("Berlin")
+    expect(answered.waitForQuestion).not.toHaveBeenCalled()
+  })
+
+  it("lets a resumed Turn replace only a confirmed pre-intent paused ask call", async () => {
+    const root = nativeQuestionFixture({ status: "none" }, "ask-2")
+    const execute = vi.fn(root.options.executeTool)
+    root.options = {
+      ...root.options, executeTool: execute,
+      toolCallRecovery: [{ action: "replay", call: { id: "ask-1", name: "agent.ask_user", arguments: { question: "Old question?" } }, toolVersion: "1", stepId: "old-step", callItem: { id: "old-call-item", revision: 2 } }],
+    }
+
+    await expect(runTurnExecutionLoop(root.options)).resolves.toMatchObject({ status: "waiting_for_user", waitId: "question-1" })
+    expect(execute).toHaveBeenCalledTimes(1)
+    expect(execute.mock.calls[0]?.[0].call.id).toBe("ask-2")
+    expect(root.waitForQuestion).toHaveBeenCalledWith(expect.objectContaining({ toolCallId: "ask-2" }))
+  })
+
+  it("atomically finalizes actual usage when pause denies the question before staging", async () => {
+    const root = nativeQuestionFixture(), pause = new SessionPauseRequestedError()
+    const base = root.options.store
+    root.options = {
+      ...root.options,
+      store: {
+        ...base,
+        appendEvent: async input => {
+          if (input.type === "tool_call.started") throw pause
+          return base.appendEvent(input)
+        },
+      },
+    }
+
+    await expect(runTurnExecutionLoop(root.options)).rejects.toBe(pause)
+    expect(root.cancelPausedQuestion).toHaveBeenCalledWith(expect.objectContaining({ stepId: "turn:turn-1:step:0", toolCallId: "ask-1", usage: root.usage, finishReason: "tool_calls" }))
+    expect(root.stageQuestionUsage).not.toHaveBeenCalled()
+    expect(root.waitForQuestion).not.toHaveBeenCalled()
+    expect(root.stepStatuses).toEqual([])
+    expect(root.events.some(event => event.type === "turn.failed" || event.type === "turn.completed")).toBe(false)
+  })
+
+  it("cancels a pause before the call row is created", async () => {
+    const root = nativeQuestionFixture(), pause = new SessionPauseRequestedError()
+    const base = root.options.store
+    root.options = {
+      ...root.options,
+      store: { ...base, createItem: async input => {
+        if (input.type === "tool_call") throw pause
+        return base.createItem(input)
+      } },
+    }
+
+    await expect(runTurnExecutionLoop(root.options)).rejects.toBe(pause)
+    expect(root.cancelPausedQuestion).toHaveBeenCalledTimes(1)
+    expect(root.cancelPausedQuestion).toHaveBeenCalledWith(expect.objectContaining({ usage: root.usage, callArguments: { question: "Which city?" } }))
+    expect(root.stageQuestionUsage).not.toHaveBeenCalled()
+    expect(root.waitForQuestion).not.toHaveBeenCalled()
+  })
+
+  it("cancels a typed pause raised by usage staging with the streamed absolute usage", async () => {
+    const root = nativeQuestionFixture(), pause = new SessionPauseRequestedError()
+    root.stageQuestionUsage.mockRejectedValueOnce(pause)
+
+    await expect(runTurnExecutionLoop(root.options)).rejects.toBe(pause)
+    expect(root.stageQuestionUsage).toHaveBeenCalledTimes(1)
+    expect(root.cancelPausedQuestion).toHaveBeenCalledWith(expect.objectContaining({ usage: root.usage, finishReason: "tool_calls" }))
+    expect(root.waitForQuestion).not.toHaveBeenCalled()
+    expect(root.events.some(event => event.type === "turn.failed" || event.type === "turn.completed")).toBe(false)
+  })
+
+  it("cancels a tool interruption before any question receipt is written", async () => {
+    const root = nativeQuestionFixture(), pause = new SessionPauseRequestedError()
+    root.options = { ...root.options, executeTool: async () => { throw pause } }
+    await expect(runTurnExecutionLoop(root.options)).rejects.toBe(pause)
+    expect(root.cancelPausedQuestion).toHaveBeenCalledWith(expect.objectContaining({ toolCallId: "ask-1", usage: root.usage }))
+    expect(root.waitForQuestion).not.toHaveBeenCalled()
+    expect(root.events.some(event => event.type === "item.completed" && event.itemId?.includes("tool-result"))).toBe(false)
+    expect(root.events.some(event => event.type === "turn.failed" || event.type === "turn.completed")).toBe(false)
+  })
+
+  it("preserves a complete intent when pause lands after the durable receipt", async () => {
+    const root = nativeQuestionFixture(), controller = new AbortController(), pause = new SessionPauseRequestedError()
+    root.options = { ...root.options, signal: controller.signal, signalError: () => pause,
+      executeTool: async ({ call }) => { controller.abort(); return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, output: {
+        schemaVersion: "agent-harness.v2.ask-user-intent.v1", kind: "user_question", stage: "user_input", question: "Which city?", options: [],
+      }, errorCode: null } },
+      store: { ...root.options.store, cancelPausedQuestion: async () => "prepared" as const },
+    }
+    const result = await runTurnExecutionLoop(root.options).then(() => null, error => error as unknown)
+    expect(result).toMatchObject({ code: "prepared_question_wait_retry_required" })
+    expect(root.waitForQuestion).not.toHaveBeenCalled()
+    expect(root.stepStatuses).toEqual([])
+    expect(root.events.some(event => event.type === "item.completed" && event.itemId?.includes("tool-result"))).toBe(true)
+    expect(root.events.some(event => event.type === "turn.failed" || event.type === "turn.completed")).toBe(false)
+  })
+
   it("rethrows a pause rejected by startStep without terminalizing or invoking the model", async () => {
     const root = fixture(identity("turn", "root-1"))
     const pause = new SessionPauseRequestedError()

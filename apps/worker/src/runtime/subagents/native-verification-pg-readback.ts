@@ -16,6 +16,7 @@ import { currentTaskGraph, loadTaskGraph, type LoadedGraph } from "./task-graph-
 import type { NativeSemanticRejectionIdentity } from "../turns/native-semantic-rejection-ledger.js"
 import type { NativeVerificationRootGoalWitness, NativeVerificationTerminalProofReader } from "./native-verification-port.js"
 import type { TaskGraphReadScope } from "./task-graph-command-port.js"
+import { appendNativeUserSelfAttestations } from "./native-verification-user-evidence.js"
 
 type Queryable = Pick<pg.PoolClient, "query">
 export type NativeVerificationControlProof = Readonly<{
@@ -32,8 +33,9 @@ export async function readNativeVerificationFailedRootRejectionWithClient(client
   state: NativeVerificationOwnedState
   candidateText: string
   controlTaskId: string
+  stepId: string
 }>): Promise<NativeSemanticRejectionIdentity | null> {
-  const { scope, graph, state, candidateText, controlTaskId } = input
+  const { scope, graph, state, candidateText, controlTaskId, stepId } = input
   if (scope.parentTaskId !== scope.rootTaskId || !candidateText.trim() || Buffer.byteLength(candidateText, "utf8") > 16 * 1024
     || !state.criteriaValid || state.turnGoalConflict || !state.goal || !state.nativeSourcesValid || !nativeVerificationTypedCriteriaReady(graph)) return null
   const proofs = await readNativeVerificationControlProofs(client, scope)
@@ -48,7 +50,8 @@ export async function readNativeVerificationFailedRootRejectionWithClient(client
     || proof.task.status !== "completed" || proof.task.failureReason !== null || !proof.reportDigest || proof.task.attemptCount < 1) return null
   const content = buildNativeRootPacketContent({ state, candidateText, childBindingSetDigest,
     history: nativeVerificationRootPacketHistory(history, historyTargets(proofs), candidateDigest, childBindingSetDigest) })
-  if (!content || !nativeVerificationControlContentMatches(proof.task.packet, content)) return null
+  const withUserEvidence = content ? await appendNativeUserSelfAttestations(client, scope, content, { kind: "exact", stepId }) : null
+  if (!withUserEvidence || !nativeVerificationControlContentMatches(proof.task.packet, withUserEvidence)) return null
   return { candidateDigest, controlTaskId: proof.task.taskId, controlOperationId: proof.task.control.controlOperationId,
     controlAttempt: proof.task.attemptCount, controlReportDigest: proof.reportDigest }
 }
@@ -181,7 +184,7 @@ function sameWitness(left: NativeVerificationRootGoalWitness, right: NativeVerif
 
 /** Terminal proof reader: uses the caller's client and rechecks the candidate and all owned bindings. */
 export const readNativeVerificationTerminalProofWithClient: NativeVerificationTerminalProofReader = async (client, input) => {
-  const { scope, candidateText, witness } = input
+  const { scope, candidateText, witness, stepId } = input
   if (scope.parentTaskId !== scope.rootTaskId || typeof candidateText !== "string" || candidateText.trim().length === 0
     || Buffer.byteLength(candidateText, "utf8") > 16 * 1024) return false
   let candidateDigest: string
@@ -214,7 +217,9 @@ export const readNativeVerificationTerminalProofWithClient: NativeVerificationTe
     ...(item.task.control.target.kind === "root_goal" ? { candidateDigest: item.task.control.target.candidateDigest,
       childBindingSetDigest: item.task.control.target.childBindingSetDigest } : {}),
   })), candidateDigest, childBindingSetDigest)
-  const content = buildNativeRootPacketContent({ state, candidateText, childBindingSetDigest, history: rootHistory })
+  const baseContent = buildNativeRootPacketContent({ state, candidateText, childBindingSetDigest, history: rootHistory })
+  const content = baseContent && await appendNativeUserSelfAttestations(client, scope, baseContent,
+    stepId === undefined ? { kind: "exact" } : { kind: "exact", stepId })
   if (!content) return false
   return nativeVerificationControlContentMatches(proof.task.packet, content)
 }

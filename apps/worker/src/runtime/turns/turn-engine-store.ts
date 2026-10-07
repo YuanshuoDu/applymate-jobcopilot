@@ -10,6 +10,7 @@ import { assertSessionWorkAdmission } from "../session-gate.js"
 import { resolveNativeSemanticProgressModeWithClient } from "./native-semantic-mode-store.js"
 import { completeNativeSemanticRejectionStepWithClient } from "./native-semantic-rejection-completion.js"
 import { nativeSemanticSchemaConflict, readNativeSemanticRejectionsWithClient } from "./native-semantic-rejection-ledger.js"
+import { attachTurnQuestionStore } from "./turn-question-store-factory.js"
 function json(value: RepositoryJsonValue): string { return JSON.stringify(value) }
 function conflict(resource: string): Error {
   const error = new Error(`TurnEngine persistence conflict: ${resource}`)
@@ -87,7 +88,7 @@ async function appendEventBatch(pool: TurnEnginePool, inputs: readonly TurnEngin
   })
 }
 export function createPgTurnEngineStore(pool: TurnEnginePool, terminalGuard?: TurnEngineTerminalGuard): TurnEngineStore {
-  return {
+  return attachTurnQuestionStore({
     async resolveNativeSemanticProgressMode(input) {
       try { return await tenantTransaction(pool, input.owner.userId, client => resolveNativeSemanticProgressModeWithClient(client, input)) }
       catch (error: unknown) { return nativeSemanticSchemaConflict(error) }
@@ -215,5 +216,5 @@ export function createPgTurnEngineStore(pool: TurnEnginePool, terminalGuard?: Tu
         if (result.rowCount !== 1) throw conflict(`final response for turn ${input.owner.turnId}`)
       })
     },
-  }
+  }, pool)
 }

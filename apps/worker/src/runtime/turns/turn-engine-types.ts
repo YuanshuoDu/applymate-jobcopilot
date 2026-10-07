@@ -10,6 +10,7 @@ import type { TurnEngineCompletionGate, TurnExecutionOptions, TurnExecutionStepB
 import type { SteeringMarkerContext } from "../context/steering-marker-store.js"
 import type { SteeringMarkerPayload } from "../context/steering-marker.js"
 import type { ToolCallRecovery, TurnEngineToolResult } from "./turn-engine-tool-types.js"
+import type { TurnQuestionStore } from "./turn-question-contract.js"
 
 export type TurnEngineItemType = "agent_message" | "reasoning_summary" | "tool_call" | "tool_result" | "question" | "error"
 export type TurnEngineItemPhase = "commentary" | "final_answer" | null
@@ -116,7 +117,7 @@ export type TurnEngineStore = {
     now: Date
     terminal?: AtomicTurnCompletionInput
   }): Promise<void | AtomicTurnCompletionResult>
-} & import("./native-semantic-rejection-ledger.js").NativeSemanticProgressStore
+} & import("./native-semantic-rejection-ledger.js").NativeSemanticProgressStore & Partial<TurnQuestionStore>
 
 export type TurnEngineToolExecutor = (input: {
   scope: TenantScope
