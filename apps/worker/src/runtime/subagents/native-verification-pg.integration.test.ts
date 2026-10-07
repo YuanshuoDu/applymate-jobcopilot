@@ -418,6 +418,7 @@ describePg("native verification PostgreSQL producer and readback", () => {
     expect(privateSummaries).toContainEqual({ kind: "user_self_attestation", stage: "user_input",
       question: answeredQuestion.question, options: [], answer: answeredQuestion.answer })
     expect(privateSummaries).toContainEqual({ kind: "user_self_attestation", stage: "user_input",
+      statementSource: "user_statement", turnRelation: "earlier_turn",
       question: priorQuestion.question, options: [], answer: priorQuestion.answer })
     const privateReferenceIds = attestation.map(item => item.referenceId)
     if (!rootControl || !rootPacket || privateReferenceIds.some(value => !value)) throw new Error("native_answer_evidence_packet_unavailable")
