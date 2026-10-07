@@ -221,6 +221,7 @@ async function seedAnsweredQuestion(overrides: QuestionSeedOverrides = {}): Prom
   const answeredEventId = `${eventPrefix}-answered-event-${suffix}`
   const answerPayload = { waitKind: "question", waitId, itemId, turnId: seed.turnId,
     toolCallId, status: "answered", nextTurnRevision: 3, answerAvailable: true }
+  const answerKey = "question-answer:" + seed.turnId + ":" + waitId
   const eventRows = [
     { id: `${eventPrefix}-step-event-${suffix}`, itemId: null, taskId: seed.rootTaskId, sequence: firstSequence + 1, type: "step.completed",
       actor: "orchestrator", correlationId: seed.stepId, causationId: previousRootEvent.rows[0]?.id ?? null,
@@ -230,10 +231,10 @@ async function seedAnsweredQuestion(overrides: QuestionSeedOverrides = {}): Prom
       actor: "orchestrator", correlationId: itemId, causationId: waitId, key: `agent-wait:${itemId}:started`,
       payload: { itemId, waitKind: "question", questionId: waitId, toolCallId }, topic: "agent.events" },
     { id: answeredEventId, itemId, taskId: null, sequence: firstSequence + 3, type: "question.answered",
-      actor: "user", correlationId: waitId, causationId: itemId, key: `question-answer:${suffix}`, payload: answerPayload, topic: "agent.session.event" },
+      actor: "user", correlationId: waitId, causationId: itemId, key: answerKey, payload: answerPayload, topic: "agent.session.event" },
     { id: `${eventPrefix}-wakeup-event-${suffix}`, itemId, taskId: null, sequence: firstSequence + 4, type: "turn.wakeup",
       actor: "user", correlationId: seed.turnId, causationId: answeredEventId,
-      key: `question-answer:${suffix}:wakeup`, payload: answerPayload, topic: "agent.turn.wakeup" },
+      key: answerKey + ":wakeup", payload: answerPayload, topic: "agent.turn.wakeup" },
   ]
   for (const event of eventRows) {
     const envelope = { eventId: event.id, sessionId: ids.session, turnId: seed.turnId, itemId: event.itemId,

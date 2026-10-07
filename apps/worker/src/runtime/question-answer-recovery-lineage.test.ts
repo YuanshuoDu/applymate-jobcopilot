@@ -35,11 +35,21 @@ function events(questionItem = item(), startSequence = "10", answerSequence = "1
 }
 
 function client(itemRows: Row[] = [item()], eventRows: Row[] = events(), rootOnly = false) {
-  const value = { query: vi.fn(async (sql: string) => ({ rows: sql.includes('FROM "agent_items"')
-    ? rootOnly ? itemRows.filter(row => row.taskId === rootTaskId) : itemRows : eventRows })) }
+  const value = { query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
+    const exactOwnedCurrentTurnQuery = sql.includes('SELECT active_turn."createdAt" FROM "agent_turns" AS active_turn')
+      && sql.includes('JOIN "agent_sessions" AS session ON session."id" = active_turn."sessionId" AND session."userId" = $2')
+      && sql.includes('WHERE active_turn."id" = $1 AND active_turn."sessionId" = $3 AND active_turn."userId" = $2')
+    if (exactOwnedCurrentTurnQuery) {
+      const owned = values[0] === lease.turnId && values[1] === lease.userId && values[2] === lease.sessionId
+      const rows = owned ? [{ createdAt: new Date("2026-10-07T00:00:00.000Z") }] : []
+      return { rows, rowCount: rows.length }
+    }
+    if (sql.includes('SELECT prior."id", prior."createdAt", root."id" AS "rootTaskId"')) return { rows: [], rowCount: 0 }
+    return { rows: sql.includes('FROM "agent_items"')
+      ? rootOnly ? itemRows.filter(row => row.taskId === rootTaskId) : itemRows : eventRows }
+  }) }
   return value as unknown as Pick<pg.PoolClient, "query"> & { readonly query: typeof value.query }
 }
-
 function input(patch: Partial<RecoveryInput> = {}): RecoveryInput {
   return {
     lease, rootTaskId, steps: [{ id: "step-1", taskId: rootTaskId }],
