@@ -11,6 +11,7 @@ import {
   executeWaitSubagents,
 } from "./coordination-executors.js"
 import { createCoordinationTools } from "./coordination-tools.js"
+import { createCanonicalRootToolGuards } from "../interactive-discovery-runtime.js"
 import type {
   CloseSubagentInput,
   FollowupInput,
@@ -274,6 +275,40 @@ describe("coordination executors", () => {
       .rejects.toMatchObject({ code: "coordination_native_replacement_unavailable" })
     expect(appendNativeCoordination).not.toHaveBeenCalled()
     expect(runtime.manager.spawn).not.toHaveBeenCalled()
+    expect(runtime.store.activities).toHaveLength(0)
+  })
+
+  it("blocks a selected-job root replacement call before routing or appending", async () => {
+    const runtime = makeRuntime()
+    const appendNativeCoordination = vi.fn()
+    const commandPort = { appendNativeCoordination } as unknown as TaskGraphCommandPort
+    const options = { ...runtime.options, nativeCoordination: {
+      enabled: true, commandPort, turnLeaseOwner: "worker-1", turnLeaseVersion: 3,
+      parentLeaseOwner: "worker-1", parentAttemptCount: () => 2,
+    } }
+    const selectedJobRoot = context({ taskId: "root-1", rootTaskId: "root-1", actorRole: "orchestrator" })
+    const input: FollowupInput = {
+      taskId: "source", idempotencyKey: "selected-job-replace", goal: "Continue", mode: "replace_unstarted", expectedRevision: 1,
+    }
+    const routeTool = vi.fn(async () => {
+      await executeFollowup(selectedJobRoot, input, options)
+      return { id: "call-selected-job-replace", toolName: "agent.followup", toolVersion: "1", status: "completed" as const }
+    })
+    const validateArguments = vi.fn(() => true)
+    const guards = createCanonicalRootToolGuards({
+      interactiveDiscoveryMode: false, selectedJobMode: true, routeTool: routeTool as never, validateArguments,
+    })
+    const request = { call: { id: "call-selected-job-replace", toolName: "agent.followup", toolVersion: "1", input } } as never
+
+    await expect(guards.executeTool(request)).resolves.toMatchObject({
+      status: "failed", errorCode: "selected_job_root_tool_disabled",
+    })
+    expect(guards.validateToolArguments("agent.followup", input)).toBe("selected_job_root_tool_disabled")
+    expect(routeTool).not.toHaveBeenCalled()
+    expect(validateArguments).not.toHaveBeenCalled()
+    expect(appendNativeCoordination).not.toHaveBeenCalled()
+    expect(runtime.manager.spawn).not.toHaveBeenCalled()
+    expect(runtime.store.spawnOperations.size).toBe(0)
     expect(runtime.store.activities).toHaveLength(0)
   })
 

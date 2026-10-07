@@ -10,6 +10,8 @@ vi.mock("./task-graph-native-pg.js", () => nativeAppend)
 import type { PoolClient } from "pg"
 import type { TaskGraphNativeCommandInput, TaskGraphNativeCommandReceipt } from "./task-graph-command-port.js"
 import { normalizeNativeCommand, nativeContextMetrics } from "./task-graph-native-request.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { NATIVE_VERIFICATION_CONTROL_SCHEMA } from "./native-verification-contract.js"
 import { TASK_GRAPH_NATIVE_METADATA_VERSION } from "./task-graph-native-state.js"
 import { replaceUnstartedNativeFollowup } from "./task-graph-native-pending-replacement.js"
 import type { GraphParent, LoadedGraph } from "./task-graph-pg-state.js"
@@ -56,12 +58,15 @@ const receipt: TaskGraphNativeCommandReceipt = {
     role: "scout", taskType: "research", status: "queued" },
 }
 
-function client(flags = { hasChildren: false, hasSuccessor: false, hasSteps: false, hasItems: false, hasExecutionEvents: false }) {
+function client(
+  flags = { hasChildren: false, hasSuccessor: false, hasSteps: false, hasItems: false, hasExecutionEvents: false },
+  source = sourceRow,
+) {
   const calls: string[] = []
   type QueryResult = { rows: unknown[]; rowCount: number }
   const query = vi.fn(async (sql: string, _values?: readonly unknown[]): Promise<QueryResult> => {
     calls.push(sql)
-    if (sql.includes("SELECT task.\"id\"")) return { rows: [sourceRow], rowCount: 1 }
+    if (sql.includes("SELECT task.\"id\"")) return { rows: [source], rowCount: 1 }
     if (sql.includes("AS \"hasChildren\"")) return { rows: [flags], rowCount: 1 }
     if (sql.startsWith("UPDATE \"sub_agent_tasks\"")) return { rows: [], rowCount: 1 }
     throw new Error("unexpected query")
@@ -99,6 +104,28 @@ describe("native pending replacement transaction helper", () => {
       sourceTaskId: "source", constraints: ["read only"], successCriteria: ["Preserve criteria"], context: { note: "new attempt" } })
   })
 
+  it("rejects a typed planner node before querying or mutating its source", async () => {
+    const typedNode = {
+      key: node.key, templateId: "scout", taskId: node.taskId, depth: node.depth, goal: node.goal,
+      successCriteria: node.successCriteria, dependsOn: [], verificationDisposition: "typed" as const,
+      verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout" as const,
+        criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte" as const, minimum: 1 } }] },
+    }
+    const candidate = {
+      ...loaded, snapshot: { ...loaded.snapshot!, nodes: [typedNode] },
+      state: { ...loaded.state!, nodes: [{ key: typedNode.key, taskId: typedNode.taskId, status: "queued" }] },
+    } as unknown as LoadedGraph
+    const db = client()
+
+    await expect(replaceUnstartedNativeFollowup(db, input, normalizeNativeCommand(input), parent, candidate))
+      .rejects.toMatchObject({ code: "native_replacement_source_invalid" })
+
+    expect(db.query).not.toHaveBeenCalled()
+    expect(lifecycle.prepareGraphTransition).not.toHaveBeenCalled()
+    expect(lifecycle.persistGraphTransition).not.toHaveBeenCalled()
+    expect(nativeAppend.appendNativeGraphCommand).not.toHaveBeenCalled()
+  })
+
   it.each([
     ["running node", { ...loaded, state: { ...loaded.state!, nodes: [{ key: "source-node", taskId: "source", status: "running" }] } }],
     ["node with dependents", { ...loaded, snapshot: { ...loaded.snapshot!, nodes: [node, { ...node, key: "dependent", taskId: "dependent", dependsOn: ["source-node"] }] } }],
@@ -109,6 +136,32 @@ describe("native pending replacement transaction helper", () => {
       .rejects.toMatchObject({ code: "native_replacement_source_invalid" })
     expect(db.query).not.toHaveBeenCalled()
     expect(lifecycle.prepareGraphTransition).not.toHaveBeenCalled()
+    expect(nativeAppend.appendNativeGraphCommand).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {
+      label: "reserved verifier task",
+      source: { ...sourceRow, role: "auditor", taskType: "native_verification" },
+      metadata: { role: "auditor", taskType: "native_verification" },
+    },
+    {
+      label: "reserved verifier control schema",
+      source: { ...sourceRow, expectedOutputSchema: { schemaVersion: NATIVE_VERIFICATION_CONTROL_SCHEMA } },
+      metadata: {},
+    },
+  ])("rejects $label before source mutation or append", async ({ source, metadata }) => {
+    const reservedNode = { ...node, nativeDelegation: { ...node.nativeDelegation, ...metadata } }
+    const candidate = { ...loaded, snapshot: { ...loaded.snapshot!, nodes: [reservedNode] } } as LoadedGraph
+    const db = client(undefined, source)
+
+    await expect(replaceUnstartedNativeFollowup(db, input, normalizeNativeCommand(input), parent, candidate))
+      .rejects.toMatchObject({ code: "native_replacement_source_invalid" })
+
+    expect(db.query).toHaveBeenCalledOnce()
+    expect(db.calls.some(sql => sql.startsWith("UPDATE \"sub_agent_tasks\""))).toBe(false)
+    expect(lifecycle.prepareGraphTransition).not.toHaveBeenCalled()
+    expect(lifecycle.persistGraphTransition).not.toHaveBeenCalled()
     expect(nativeAppend.appendNativeGraphCommand).not.toHaveBeenCalled()
   })
 
