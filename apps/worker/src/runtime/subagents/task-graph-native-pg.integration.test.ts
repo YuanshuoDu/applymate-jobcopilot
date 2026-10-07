@@ -9,7 +9,7 @@ import type { TaskGraphNativeCommandInput, TaskGraphNativeCommandReceipt } from 
 import type { PgSubagentPool } from "./types.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
 import { defaultSubagentPolicy } from "./types.js"
-import { taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
+import { parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
@@ -378,8 +378,12 @@ describePg("native TaskGraph PostgreSQL command durability", () => {
     } as TaskGraphNativeCommandInput)).rejects.toMatchObject({ code: "idempotency_conflict" })
     overflowCandidateId = accepted.child.taskId
     const graph = await port.readCurrent(scope)
-    expect(graph.nodes.find(node => node.taskId === sourceA.child.taskId)).toMatchObject({ status: "cancelled", verificationDisposition: "legacy_unverified" })
-    expect(graph.nodes.find(node => node.taskId === accepted.child.taskId)).toMatchObject({ status: "queued", verificationDisposition: "legacy_unverified", nativeResult: { disposition: "missing" } })
+    expect(graph.nodes.find(node => node.taskId === sourceA.child.taskId)).toMatchObject({ status: "cancelled" })
+    expect(graph.nodes.find(node => node.taskId === accepted.child.taskId)).toMatchObject({ status: "queued", nativeResult: { disposition: "missing" } })
+    const persistedGraphRow = await pool!.query<{ content: unknown }>(`SELECT "content" FROM "agent_items" WHERE "id" = $1`, [taskGraphItemId(ids.root)])
+    const persistedGraph = parseTaskGraphSnapshot(persistedGraphRow.rows[0]?.content)
+    expect(persistedGraph.nodes.find(node => node.taskId === sourceA.child.taskId)?.verificationDisposition).toBe("legacy_unverified")
+    expect(persistedGraph.nodes.find(node => node.taskId === accepted.child.taskId)?.verificationDisposition).toBe("legacy_unverified")
     expect(graph.nodes.find(node => node.taskId === accepted.child.taskId)?.native?.source?.taskId).toBe(sourceA.child.taskId)
     const inherited = await pool!.query("SELECT source.\"goal\" AS \"sourceGoal\", source.\"role\" AS \"sourceRole\", source.\"taskType\" AS \"sourceTaskType\", source.\"constraints\" AS \"sourceConstraints\", source.\"successCriteria\" AS \"sourceCriteria\", source.\"allowedActions\" AS \"sourceActions\", source.\"expectedOutputSchema\" AS \"sourceSchema\", source.\"budgetSnapshot\" AS \"sourcePolicy\", replacement.\"goal\" AS \"replacementGoal\", replacement.\"role\" AS \"replacementRole\", replacement.\"taskType\" AS \"replacementTaskType\", replacement.\"constraints\" AS \"replacementConstraints\", replacement.\"successCriteria\" AS \"replacementCriteria\", replacement.\"allowedActions\" AS \"replacementActions\", replacement.\"expectedOutputSchema\" AS \"replacementSchema\", replacement.\"budgetSnapshot\" AS \"replacementPolicy\", replacement.\"status\" AS \"replacementStatus\" FROM \"sub_agent_tasks\" AS source JOIN \"sub_agent_tasks\" AS replacement ON replacement.\"context\"->'provenance'->>'sourceTaskId' = source.\"id\" WHERE source.\"id\" = $1 AND replacement.\"id\" = $2", [sourceA.child.taskId, accepted.child.taskId])
     expect(inherited.rows[0]).toMatchObject({ sourceGoal: "Inspect replace-first-" + suffix, sourceRole: "auditor", sourceTaskType: "audit",
