@@ -28,7 +28,7 @@ function fixture(input: { waitStatus?: string; mode?: "any" | "all"; matchedTask
   const outcome = { waitId: input.corruptConsumed ? "wait-other" : "wait-1", status: "ready", targetTaskIds: input.archivedTargetTaskIds ?? targetIds, matchedTaskIds: input.archivedMatchedTaskIds ?? matchedTaskIds, tasks: targetIds.map((taskId, index) => ({ taskId, status: input.archivedTargetStatuses?.[index] ?? input.targetStatuses?.[index] ?? "completed", ...(input.archivedTargetRole !== undefined ? { role: input.archivedTargetRole } : {}), result: null, failureReason: null, ...(input.storedReport ? { verificationReport: input.storedReport } : {}), ...(input.storedReceipt ? { repairReceipt: input.storedReceipt } : {}) })) }
   const result: Record<string, unknown> = input.consumed ? { request: { mode }, ...(input.missingConsumedOutcome ? {} : { outcome }) } : { request: { mode } }
   const wait: Record<string, unknown> = { id: "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "root-1", stepId: "step-1", targetTaskIds: input.waitTargetTaskIds ?? targetIds, mode, status: input.waitStatus ?? "ready", matchedTaskIds: input.waitMatchedTaskIds ?? matchedTaskIds, result, suspendedAt: now, consumedAt: input.consumed ? now : null }
-  const state: { wait: Record<string, unknown>; consumedAt: Date | null; result: Record<string, unknown>; updates: number; sessionStatus: string; sessionSource: string } = { wait, consumedAt: input.consumed ? now : null, result, updates: 0, sessionStatus: input.sessionStatus ?? "running", sessionSource: input.sessionSource ?? "automation" }
+  const state: { wait: Record<string, unknown>; consumedAt: Date | null; result: Record<string, unknown>; updates: number; sessionStatus: string; sessionSource: string; targetStatuses: string[] | null } = { wait, consumedAt: input.consumed ? now : null, result, updates: 0, sessionStatus: input.sessionStatus ?? "running", sessionSource: input.sessionSource ?? "automation", targetStatuses: input.targetStatuses ? [...input.targetStatuses] : null }
   const calls: string[] = []
   const client = {
     query: async (sql: string, values: readonly unknown[] = []) => {
@@ -41,7 +41,7 @@ function fixture(input: { waitStatus?: string; mode?: "any" | "all"; matchedTask
         return { rows: [state.wait], rowCount: 1 }
       }
       if (sql.includes('FROM "sub_agent_tasks"') && sql.includes("ANY($1::text[])")) return { rows: input.foreign ? [] : targetIds.map((id, index) => {
-        const status = input.targetStatuses?.[index] ?? input.targetStatus ?? "completed"
+        const status = state.targetStatuses?.[index] ?? input.targetStatus ?? "completed"
         const defaultResult = input.malformed ? (() => { const value: Record<string, unknown> = { bigint: BigInt(1) }; value.circular = value; return value })() : { safe: input.large ? "x".repeat(10_000) : true, secret: "hide-me" }
         return { id, rootTaskId: input.targetRootTaskId ?? "root-1", turnId: "turn-1", sessionId: "session-1", userId: "user-1", role: input.targetRole ?? "scout", status, result: input.targetResults?.[index] ?? defaultResult, failureReason: input.targetFailureReasons?.[index] ?? (status === "failed" ? "provider failed" : null) }
       }), rowCount: input.foreign ? 0 : targetIds.length }
@@ -183,6 +183,37 @@ describe("durable wait outcome consumer", () => {
     const projections = await consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now })
     expect(projections[0]?.content).toMatchObject({ output: { status: "timed_out", tasks: [{ status: "failed", failureReason: "provider failed" }] } })
     expect(JSON.stringify(projections)).not.toContain("hide-me")
+  })
+
+  it("persists and replays an interrupted wait without rewriting live child statuses", async () => {
+    const fake = fixture({ waitStatus: "interrupted", matchedTaskIds: [], targetCount: 2, targetStatuses: ["running", "queued"] })
+    const first = (await consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now }))[0]
+    const firstOutput = outputOf(first!.content)
+    expect(firstOutput).toMatchObject({ status: "interrupted", matchedTaskIds: [], tasks: [
+      { taskId: "child-1", status: "running", result: null, failureReason: null },
+      { taskId: "child-2", status: "queued", result: null, failureReason: null },
+    ] })
+    fake.state.targetStatuses = ["completed", "failed"]
+    const replay = (await consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now }))[0]
+    expect(outputOf(replay!.content)).toEqual(firstOutput)
+    expect(fake.state.targetStatuses).toEqual(["completed", "failed"])
+    expect(fake.state.wait.status).toBe("interrupted")
+    expect(fake.state.updates).toBe(1)
+  })
+
+  it("replays an interrupted all wait with a partial terminal match after another child finishes", async () => {
+    const fake = fixture({ waitStatus: "interrupted", mode: "all", matchedTaskIds: ["child-1"], targetCount: 2, targetStatuses: ["completed", "running"] })
+    const first = (await consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now }))[0]
+    const firstOutput = outputOf(first!.content)
+    expect(firstOutput).toMatchObject({ status: "interrupted", matchedTaskIds: ["child-1"], tasks: [
+      { taskId: "child-1", status: "completed" },
+      { taskId: "child-2", status: "running", result: null },
+    ] })
+    fake.state.targetStatuses = ["completed", "failed"]
+    const replay = (await consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now }))[0]
+    expect(outputOf(replay!.content)).toEqual(firstOutput)
+    expect(fake.state.targetStatuses).toEqual(["completed", "failed"])
+    expect(fake.state.updates).toBe(1)
   })
 
   it("bounds a large child result in the durable projection", async () => {
