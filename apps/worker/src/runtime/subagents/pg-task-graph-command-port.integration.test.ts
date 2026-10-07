@@ -545,7 +545,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
         WHERE role.rolname = current_user AND relation.oid = ANY(ARRAY[
           'public."agent_sessions"'::regclass, 'public."agent_turns"'::regclass, 'public."sub_agent_tasks"'::regclass,
           'public."agent_steps"'::regclass, 'public."agent_items"'::regclass, 'public."agent_events"'::regclass,
-          'public."agent_outbox"'::regclass
+          'public."agent_outbox"'::regclass, 'public."agent_inputs"'::regclass
         ]) ORDER BY relation.relname`)
       expect(roleState.rows).toEqual([...TENANT_TABLES].sort().map(tableName => ({
         tenantScope: owner.userId, roleName, isSuperuser: false, bypassesRls: false, tableName, ownsTable: false,
@@ -811,8 +811,16 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       input: { decision: "keep", expectedRevision: 1 }, sequence: keepCallSequence,
     })
 
-    await expect(reopened.appendAndScheduleWithReconciliation!(input, planOperation)).rejects.toThrow("steering_reconciliation_cursor_invalid")
+    await expect(reopened.appendAndScheduleWithReconciliation!(input, planOperation)).resolves.toEqual({ ...accepted, status: "duplicate" })
     expect(await graphRows(adminPool!, value)).toEqual(acceptedCounts)
+    const receiptsAfterReplay = await adminPool!.query(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "type" = $2`, [
+      value.sessionId, STEERING_RECONCILIATION_EVENT_TYPE,
+    ])
+    expect(receiptsAfterReplay.rows).toHaveLength(1)
+    expect((await adminPool!.query(`SELECT "status", "consumedByStepId" FROM "agent_inputs" WHERE "id" = $1`, [value.secondSteerInputId])).rows)
+      .toEqual([{ status: "consumed", consumedByStepId: value.keepStepId }])
+    await expect(transaction(restrictedTransactionPool(commandPool!, roleName, value.userId), client =>
+      assertNoUnresolvedSteering(client, readScope(value)))).rejects.toThrow("steering_reconciliation_pending")
     const rawRootPlan = { ...input, scope: { ...input.scope, stepId: value.keepStepId }, proposal: { ...input.proposal, expectedRevision: 1 } }
     await expect(reopened.appendAndSchedule(rawRootPlan)).rejects.toThrow("steering_reconciliation_pending")
     expect(await graphRows(adminPool!, value)).toEqual(acceptedCounts)
