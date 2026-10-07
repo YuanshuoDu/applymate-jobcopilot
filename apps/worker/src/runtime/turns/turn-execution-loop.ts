@@ -45,7 +45,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
   let recoveredCandidate = options.recoveredFinalCandidate
   let steeringMarkerState = options.steeringMarkerState
   const seenCallIds = new Set<string>()
-  let lastStep: TurnEngineStep | null = null, closedSteps = new Set<string>()
+  let lastStep: TurnEngineStep | null = null, closedSteps = new Set<string>(), receiptClosedSteps = new Set<string>()
   try {
     await writer.append(
       "turn.started", options.identity.turnId, null,
@@ -153,10 +153,14 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           continue
         }
         const outcome = await completeTurnCandidate({ options, writer, step, output, snapshot, stepCount: steps, toolCallCount: toolCalls,
-          usage: budget.usage(), signal, now, onStepClosed: () => closedSteps.add(step.id) })
+          usage: budget.usage(), signal, now, onStepClosed: kind => {
+            closedSteps.add(step.id)
+            if (kind === "native_semantic_receipt") receiptClosedSteps.add(step.id)
+          } })
         if (outcome.kind === "wait" || outcome.kind === "completed") return outcome.result
         snapshot = taskGraphRecoverySnapshot(snapshot, step.id, outcome.feedback); continuation = undefined; continue
       } catch (error: unknown) {
+        if (receiptClosedSteps.has(step.id)) throw error
         if (closedSteps.has(step.id) && (isSessionPauseRequestedError(error) || error instanceof NoProgressError)) throw error
         const status = signalWasInterrupted(signal) || isSessionPauseRequestedError(error) ? "interrupted" : "failed"
         await updateExecutionStep(options, {
