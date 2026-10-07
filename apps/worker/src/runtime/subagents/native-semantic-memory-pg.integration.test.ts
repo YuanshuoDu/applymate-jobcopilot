@@ -433,7 +433,30 @@ describePg("native semantic rejection PostgreSQL acceptance", () => {
     expect(privateReceipt).not.toContain(originalReference[0]!.referenceId)
 
     await seedStep(supersedingStepId, 11, "10")
-    await expect(complete(receiptInput)).rejects.toThrow()
+    const replaySnapshot = async () => {
+      const result = await adminPool!.query<{ step: unknown; stepCount: number; receiptCount: number; receipts: unknown }>(
+        `SELECT to_jsonb(step) AS "step", (SELECT COUNT(*)::int FROM "agent_steps" AS observed WHERE observed."turnId" = step."turnId") AS "stepCount",
+          (SELECT COUNT(*)::int FROM "agent_native_semantic_rejections" AS exact WHERE exact."turnId" = step."turnId" AND exact."stepId" = step."id") AS "receiptCount",
+          (SELECT COALESCE(jsonb_agg(to_jsonb(rejection)), '[]'::jsonb) FROM "agent_native_semantic_rejections" AS rejection
+            WHERE rejection."turnId" = step."turnId") AS "receipts"
+         FROM "agent_steps" AS step WHERE step."id" = $1`,
+        [evidenceStepId])
+      if (!result.rows[0]) throw new Error("native_semantic_replay_step_missing")
+      return result.rows[0]
+    }
+    const beforeReplay = await replaySnapshot()
+    await expect(complete(receiptInput)).resolves.toMatchObject({ inputThroughSequence: 10n, distinctStepCount: 1 })
+    expect(await replaySnapshot()).toEqual(beforeReplay)
+
+    await expect(complete({ ...receiptInput, stepId: supersedingStepId })).rejects.toThrow()
+    const rejectedStep = await adminPool!.query<{ status: string; finishReason: string | null; errorCode: string | null;
+      inputTokens: number; outputTokens: number; estimatedCostUsd: number; receipts: number }>(
+      `SELECT step."status", step."finishReason", step."errorCode", step."inputTokens", step."outputTokens",
+        step."estimatedCostUsd"::double precision AS "estimatedCostUsd",
+        (SELECT COUNT(*)::int FROM "agent_native_semantic_rejections" AS rejection WHERE rejection."stepId" = step."id") AS "receipts"
+       FROM "agent_steps" AS step WHERE step."id" = $1`, [supersedingStepId])
+    expect(rejectedStep.rows[0]).toEqual({ status: "streaming", finishReason: null, errorCode: null,
+      inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, receipts: 0 })
 
     await seedStep(newEpochStepId, 12, "11", [newSteeringId])
     await adminPool!.query(`INSERT INTO "agent_inputs"
