@@ -6,7 +6,6 @@ import { canonicalJson as snapshotCanonicalJson } from "./context-snapshot-json.
 import { ContextSnapshotError, type ContextSnapshotCompaction, type ContextSnapshotContent } from "./context-snapshot-types.js"
 
 const MAX_MODEL_MEMORY_CHARACTERS = 16_000
-const UNAVAILABLE_MODEL_GOAL = "Durable context snapshot unavailable (projection limit exceeded)."
 
 type RecordValue = Record<string, unknown>
 
@@ -184,9 +183,21 @@ function workingState(content: ContextSnapshotContent): ContextSeedBlock | undef
     factValuesIncluded: false,
     evidenceBodiesIncluded: false,
   }
-  if (withinMemoryBound(value)) return { id: `snapshot-working-state:${content.sessionId}:${content.throughSequence}`, content: value }
+  const id = `snapshot-working-state:${content.sessionId}:${content.throughSequence}`
+  if (withinMemoryBound(value)) return { id, content: value }
+  const omittedCount = content.completedWork.length
+  if (omittedCount > 0) {
+    const { completedWork: _completedWork, ...legacySnapshotFields } = value.legacySnapshotFields
+    const partial = {
+      ...value,
+      status: "partial",
+      legacySnapshotFields,
+      omissions: [{ field: "legacySnapshotFields.completedWork", count: omittedCount }],
+    }
+    if (withinMemoryBound(partial)) return { id, content: partial }
+  }
   return {
-    id: `snapshot-working-state:${content.sessionId}:${content.throughSequence}`,
+    id,
     content: {
       kind: "durable_context_snapshot", status: "unavailable", reason: "projection_limit_exceeded", authority: "informational_only",
       provenance: { ownerId: content.ownerId, sessionId: content.sessionId, throughSequence: content.throughSequence,
@@ -195,25 +206,16 @@ function workingState(content: ContextSnapshotContent): ContextSeedBlock | undef
   }
 }
 
-function projectionUnavailable(memory: ContextSeedBlock | undefined): boolean {
-  if (!memory?.content || typeof memory.content !== "object" || Array.isArray(memory.content)) return false
-  const value = memory.content as RecordValue
-  return value.kind === "durable_context_snapshot"
-    && value.status === "unavailable"
-    && value.reason === "projection_limit_exceeded"
-}
-
 export function stepContextSnapshotFromContent(content: ContextSnapshotContent): StepContextSnapshot {
+  const goal = content.compaction
+    ? { id: content.context.goal?.id ?? "snapshot-goal", content: content.compaction.state.goal }
+    : content.context.goal ?? { id: "snapshot-goal", content: content.goal }
+  if (!withinMemoryBound(goal.content)) throw new ContextSnapshotError("store_conflict", "Selected model goal exceeds the projection limit")
   const memory = workingState(content)
   return {
     system: content.context.system,
     profile: content.context.profile,
-    goal: content.compaction
-      ? {
-        id: content.context.goal?.id ?? "snapshot-goal",
-        content: projectionUnavailable(memory) ? UNAVAILABLE_MODEL_GOAL : content.compaction.state.goal,
-      }
-      : content.context.goal ?? { id: "snapshot-goal", content: content.goal },
+    goal,
     steerHistory: content.context.steerHistory,
     businessRefs: content.references.map(({ source: _source, verified: _verified, ...reference }) => reference),
     toolObservations: [...content.context.toolObservations, ...(memory ? [memory] : [])],
