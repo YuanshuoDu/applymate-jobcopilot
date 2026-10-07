@@ -54,6 +54,50 @@ describe("pg-store task creation helpers", () => {
     ]))
   })
 
+  it("can preserve an explicit action intersection, including an empty one, in the inserted task", async () => {
+    for (const actions of [[], ["jobs.search"]]) {
+      const parent = {
+        id: "parent-1", rootTaskId: "root-1", path: "/root-1", depth: 0, status: "running",
+        allowedActions: ["jobs.search", "jobs.get"], modelProfileSnapshot: {}, budgetSnapshot: {}, toolPolicySnapshot: {},
+      }
+      let insertedActions: unknown
+      const client = {
+        query: vi.fn(async (sql: string, params?: unknown[]) => {
+          if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "turn-1" }], rowCount: 1 }
+          if (sql.includes('SELECT session."id" FROM "agent_sessions"')) return { rows: [{ id: "session-1" }], rowCount: 1 }
+          if (sql.includes('SELECT "rootTaskId", "turnId"')) return { rows: [{ rootTaskId: "root-1", turnId: "turn-1" }], rowCount: 1 }
+          if (sql.includes('FROM "sub_agent_tasks" AS root')) return { rows: [{ id: "root-1", turnId: "turn-1", status: "running", interruptRequestedAt: null }], rowCount: 1 }
+          if (sql.includes('FROM "sub_agent_tasks"') && sql.includes("FOR UPDATE")) return { rows: [parent], rowCount: 1 }
+          if (sql.includes("COUNT(*)")) return { rows: [{ count: 0 }], rowCount: 1 }
+          if (sql.startsWith('INSERT INTO "sub_agent_tasks"')) {
+            insertedActions = JSON.parse(String(params?.[12])) as unknown
+            return { rows: [{ id: "child-1" }], rowCount: 1 }
+          }
+          if (sql.includes('FROM "sub_agent_tasks" task')) return {
+            rows: [{
+              id: "child-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
+              parentTaskId: "parent-1", path: "/root-1/child-1", depth: 1, role: "analyst", taskType: "research",
+              status: "queued", goal: "inspect", constraints: [], successCriteria: [], allowedActions: insertedActions,
+              context: {}, expectedOutputSchema: {}, result: null, failureReason: null, attemptCount: 0, maxAttempts: 3,
+              nextAttemptAt: null, leaseOwner: null, leaseExpiresAt: null, interruptRequestedAt: null,
+              modelProfileSnapshot: {}, budgetSnapshot: {}, toolPolicySnapshot: {},
+            }], rowCount: 1,
+          }
+          return { rows: [], rowCount: 0 }
+        }),
+      } as unknown as Queryable
+
+      const child = await createSubagentTask(client, {
+        userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "parent-1",
+        role: "analyst", taskType: "research", goal: "inspect", allowedActions: actions,
+        policy: normalizeSubagentPolicy(),
+      }, true, { preserveEmptyAllowedActions: true })
+
+      expect(insertedActions).toEqual(actions)
+      expect(child.allowedActions).toEqual(actions)
+    }
+  })
+
   it("rejects child creation when the locked root has an interrupt request", async () => {
     const calls: string[] = []
     const client = {

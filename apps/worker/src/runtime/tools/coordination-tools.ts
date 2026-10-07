@@ -48,7 +48,7 @@ export const SpawnSubagentInputSchema = Type.Object({
 }, { additionalProperties: false })
 export type SpawnSubagentInput = Static<typeof SpawnSubagentInputSchema>
 
-export const FollowupInputSchema = Type.Object({
+const LegacyFollowupInputSchema = Type.Object({
   idempotencyKey: Type.Optional(KeySchema),
   taskId: IdSchema,
   goal: TextSchema,
@@ -56,6 +56,12 @@ export const FollowupInputSchema = Type.Object({
   successCriteria: Type.Optional(StringListSchema),
   context: Type.Optional(Type.Unknown()),
 }, { additionalProperties: false })
+const ReplaceUnstartedFollowupInputSchema = Type.Object({
+  idempotencyKey: Type.Optional(KeySchema), taskId: IdSchema, goal: TextSchema,
+  context: Type.Optional(Type.Unknown()), mode: Type.Literal("replace_unstarted"),
+  expectedRevision: Type.Integer({ minimum: 0, maximum: 2_147_483_644 }),
+}, { additionalProperties: false })
+export const FollowupInputSchema = Type.Union([LegacyFollowupInputSchema, ReplaceUnstartedFollowupInputSchema])
 export type FollowupInput = Static<typeof FollowupInputSchema>
 
 export const SendMessageInputSchema = Type.Object({
@@ -159,7 +165,7 @@ export function createCoordinationTools(options: CoordinationExecutorOptions): R
       execute: spawnExecutor,
     },
     {
-      ...metadata("agent.followup", "Create a durable follow-up task from a terminal task result", "internal_write", "requires_key"),
+      ...metadata("agent.followup", "Create a follow-up from a terminal result, or on a general native root replace an unstarted leaf with mode=replace_unstarted and its current graph expectedRevision; replacement inherits source criteria and policy", "internal_write", "requires_key"),
       inputSchema: FollowupInputSchema, outputSchema: FollowupOutputSchema,
       execute: (context, input) => executeFollowup(context, input as FollowupInput, options),
     },

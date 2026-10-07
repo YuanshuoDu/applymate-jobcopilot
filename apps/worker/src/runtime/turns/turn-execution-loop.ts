@@ -72,6 +72,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
       let questionIntentCallId: string | null = null
       try {
         await writer.append("step.started", step.id, null, { stepId: step.id, ordinal: step.ordinal, taskId: options.identity.taskId }, `step-started:${step.id}`)
+        if (options.identity.kind === "turn" && options.refreshTaskGraphBeforeStep) snapshot = await options.refreshTaskGraphBeforeStep(snapshot)
         const context = await options.contextBuilder.build({
           scope: options.scope, identity: options.identity, stepId: step.id, snapshot,
           rootInputId: ordinal === 0 ? options.rootInputId : undefined, now: now(),
@@ -100,7 +101,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           context, model: options.model, tools: options.tools,
           sessionId: options.identity.sessionId, turnId: options.identity.turnId, stepId: step.id,
           taskId: options.identity.taskId, userId: options.identity.userId, signal, continuation,
-          freshSteering,
+          freshSteering: options.identity.kind === "turn" && freshSteering,
           outputSchema: options.outputSchema,
         })
         if (freshSteering) recoveredCandidate = undefined

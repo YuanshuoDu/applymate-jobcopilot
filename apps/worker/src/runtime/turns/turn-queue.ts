@@ -240,7 +240,8 @@ export function createTurnQueue(options: {
       isInterrupted: options.isInterrupted ?? (lease => safePersistedInterrupt(options.pool, lease)),
       interruptSubagents: options.interruptSubagents,
     }),
-    { connection: redisConnection, concurrency: 1, skipVersionCheck: true, ...workerPollingOptions() },
+    // Queue-wide stalled recovery needs two passes; the Turn fallback targets about 60 seconds.
+    { connection: redisConnection, concurrency: 1, skipVersionCheck: true, ...workerPollingOptions(process.env, 30_000) },
   )
   return {
     queue, worker, active,

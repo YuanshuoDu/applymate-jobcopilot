@@ -3,18 +3,17 @@ import type { TaskGraphProposal, TaskGraphReadiness, TaskGraphRepairOf } from ".
 import type { TaskGraphVerificationReasonCode } from "../planning/task-graph-verification.js"
 import type { SubagentTaskStatus } from "./types.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-pg-verification.js"
-import type { TaskGraphNativeCommandInput, TaskGraphNativeCommandReceipt, TaskGraphNativeNodeView, TaskGraphNativeResultReceipt } from "./task-graph-native-command.js"
+import type { TaskGraphNativeCommandReceipt, TaskGraphNativeNodeView, TaskGraphNativeResultReceipt } from "./task-graph-native-command.js"
+import type { TaskGraphNativeCommandInput } from "./task-graph-native-request.js"
 export type {
   TaskGraphNativeChildReceipt,
-  TaskGraphNativeCommandInput,
   TaskGraphNativeCommandReceipt,
-  TaskGraphNativeFollowupRequest,
   TaskGraphNativeNodeView,
-  TaskGraphNativeRequest,
   TaskGraphNativeResultReceipt,
   TaskGraphNativeSourceProvenance,
   TaskGraphNativeSpawnRequest,
 } from "./task-graph-native-command.js"
+export type { TaskGraphNativeCommandInput, TaskGraphNativeFollowupRequest, TaskGraphNativeRequest, TaskGraphNativeReplacementRequest } from "./task-graph-native-request.js"
 
 export const TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION = "agent-harness.v2.task-graph-repair-receipt.v1" as const
 const VERIFICATION_REASONS = new Set<TaskGraphVerificationReasonCode>([
