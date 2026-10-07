@@ -62,8 +62,11 @@ function safeStepId(value: unknown): value is string {
   if (safeId(value)) return !value.startsWith("sha256:")
   return typeof value === "string" && /^(?:turn|task):/.test(value) && value.trim() === value && value.length <= MAX_STEP_ID_LENGTH && Buffer.byteLength(value, "utf8") <= MAX_STEP_ID_LENGTH && !/[\u0000-\u001f\u007f]/.test(value)
 }
-function safeRevision(value: unknown): value is number {
+function safeGoalRevision(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 1
+}
+function safePlanRevision(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
 }
 function safeSequence(value: unknown): value is string {
   if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value)) return false
@@ -93,7 +96,7 @@ function validSignal(value: unknown): value is SignalSet {
 function validAgenda(value: unknown): value is CognitiveActionAgenda {
   if (!plain(value) || !exact(value, ["schemaVersion", "externalDataPolicy", "nextAction", "blockedBy", "goalRevision", "planRevision", "signals"]) || value.schemaVersion !== "agent-harness.cognitive-action-agenda.v1" || value.externalDataPolicy !== EXTERNAL_DATA_POLICY || !member(COGNITIVE_ACTION_VALUES, value.nextAction)) return false
   if (!plain(value.blockedBy) || !exact(value.blockedBy, BLOCKER_KEYS) || (value.blockedBy.kind !== null && !member(COGNITIVE_AGENDA_BLOCKER_VALUES, value.blockedBy.kind)) || !Array.isArray(value.blockedBy.ids) || !value.blockedBy.ids.every(safeId) || value.blockedBy.ids.length > MAX_ITEMS || value.blockedBy.kind === null && value.blockedBy.ids.length > 0 || !validSignal({ count: value.blockedBy.ids.length, ids: value.blockedBy.ids })) return false
-  if (value.goalRevision !== null && !safeRevision(value.goalRevision) || value.planRevision !== null && !safeRevision(value.planRevision)) return false
+  if (value.goalRevision !== null && !safeGoalRevision(value.goalRevision) || value.planRevision !== null && !safePlanRevision(value.planRevision)) return false
   const signals = value.signals
   if (!plain(signals) || !exact(signals, ["pendingInputs", "approvals", "activeWaits", "unresolved", "completionVerification", "steering"]) || !validSignal(signals.pendingInputs) || !validSignal(signals.approvals) || !validSignal(signals.activeWaits) || !validSignal(signals.unresolved) || !validSignal(signals.completionVerification)) return false
   const steering = signals.steering

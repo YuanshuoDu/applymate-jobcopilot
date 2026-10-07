@@ -115,6 +115,7 @@ describe("TaskGraph turn observation", () => {
   it("refreshes the old graph observation while preserving other observations and live outcomes", () => {
     const result = mergeTaskGraphCurrentObservation(snapshot(), state)
 
+    expect(result.taskGraphRevision).toBe(3)
     expect(result.toolObservations).toEqual([
       { id: "existing", content: { kept: true } },
       { id: "task-graph-current", content: { kind: "task_graph_current", revision: 3, nodes: [{ ...state.nodes[0]!, resultSummary: null, failureReason: null }] } },
@@ -122,6 +123,13 @@ describe("TaskGraph turn observation", () => {
     const encoded = JSON.stringify(result.toolObservations.at(-1)?.content)
     expect(encoded).not.toContain("Alice Example")
     expect(encoded).not.toContain("private.example")
+  })
+
+  it("replaces stale revision metadata from the typed read, including graph revision zero", () => {
+    const result = mergeTaskGraphCurrentObservation({ ...snapshot(), taskGraphRevision: 8 }, { revision: 0, nodes: [] })
+
+    expect(result.taskGraphRevision).toBe(0)
+    expect(result.toolObservations.at(-1)?.content).toEqual({ kind: "task_graph_current", revision: 0, nodes: [] })
   })
 
   it("preserves safe native operation and structural result receipts in the current graph", () => {
