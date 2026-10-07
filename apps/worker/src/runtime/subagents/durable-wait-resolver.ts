@@ -37,6 +37,11 @@ function validBatch(value: number): number {
   return value
 }
 function terminal(value: unknown): boolean { return TERMINAL_TASK_STATUSES.has(String(value)) }
+function checkpointSequence(value: unknown): string {
+  if (typeof value === "bigint" && value >= 0n) return value.toString()
+  if (typeof value === "string" && /^(0|[1-9]\d*)$/.test(value)) return value
+  throw new Error("wait_checkpoint_invalid")
+}
 
 async function transaction<T>(pool: LeasePool, work: (client: Queryable) => Promise<T>): Promise<T> {
   const client = await pool.connect(); let committed = false
@@ -97,7 +102,7 @@ async function reconcileWait(client: Queryable, wait: Row, turn: Row, now: Date,
   )).rows[0]
   if (!parent || String(parent.rootTaskId ?? parent.id) !== rootTaskId || String(parent.id) !== rootTaskId) return "ignored"
   const step = (await client.query<Row>(
-    `SELECT "id", "taskId", "attempt", "status" FROM "agent_steps"
+    `SELECT "id", "taskId", "attempt", "status", "inputThroughSequence" FROM "agent_steps"
      WHERE "id" = $1 AND "turnId" = $2 AND "sessionId" = $3
        AND ("taskId" = $4 OR "taskId" IS NULL) FOR SHARE`,
     [wait.stepId, turn.id, turn.sessionId, rootTaskId],
@@ -116,7 +121,19 @@ async function reconcileWait(client: Queryable, wait: Row, turn: Row, now: Date,
   const waitStatus = String(wait.status)
   const deadline = date(wait.deadlineAt)
   const matched = targets.rows.filter(target => terminal(target.status)).map(target => String(target.id)).sort()
-  const resolvedStatus = deadline && now >= deadline ? "timed_out" : String(wait.mode) === "any" && matched.length > 0 ? "ready" : String(wait.mode) === "all" && matched.length === targetIds.length ? "ready" : "waiting"
+  let resolvedStatus = deadline && now >= deadline ? "timed_out" : String(wait.mode) === "any" && matched.length > 0 ? "ready" : String(wait.mode) === "all" && matched.length === targetIds.length ? "ready" : "waiting"
+  if (resolvedStatus === "waiting" && waitStatus === "waiting" && wait.suspendedAt !== null && wait.suspendedAt !== undefined
+    && String(turn.status) === "waiting_for_dependency" && String(turn.sessionStatus) === "running" && (turn.leaseOwnerId === null || turn.leaseOwnerId === undefined)) {
+    const steer = await client.query<{ pending: boolean }>(
+      `SELECT EXISTS (SELECT 1 FROM "agent_inputs" AS input
+       WHERE input."userId" = $1 AND input."sessionId" = $2 AND input."targetTurnId" = $3
+         AND input."delivery" = 'steer' AND input."status" IN ('accepted', 'queued')
+         AND input."consumedByStepId" IS NULL AND input."consumedAt" IS NULL AND input."cancelledAt" IS NULL
+         AND input."acceptedSequence" > $4::bigint) AS "pending"`,
+      [turn.userId, turn.sessionId, turn.id, checkpointSequence(step.inputThroughSequence)],
+    )
+    if (steer.rows[0]?.pending === true) resolvedStatus = "interrupted"
+  }
   let changed = false
   if (waitStatus === "waiting" && resolvedStatus !== "waiting") {
     const updated = await client.query(

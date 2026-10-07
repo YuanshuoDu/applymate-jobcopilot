@@ -86,7 +86,7 @@ function resultInfo(value: unknown): ResultInfo {
 }
 function failure(value: unknown): string | null { if (value === null || value === undefined) return null; try { return utf8Prefix(redactSensitiveText(String(value)), MAX_FAILURE_BYTES) } catch { return null } }
 function waitMode(value: unknown): "any" | "all" | null { return value === "any" || value === "all" ? value : null }
-function waitStatus(value: unknown): "ready" | "timed_out" | null { return value === "ready" || value === "timed_out" ? value : null }
+function waitStatus(value: unknown): "ready" | "timed_out" | "interrupted" | null { return value === "ready" || value === "timed_out" || value === "interrupted" ? value : null }
 function taskStatus(value: unknown): string | null { return typeof value === "string" && value.length <= MAX_ID_LENGTH && (isTerminalSubagentStatus(value) || NON_TERMINAL_TASK_STATUSES.has(value)) ? value : null }
 function taskRole(value: unknown): string | null { return typeof value === "string" && value.trim().length > 0 && value.length <= MAX_ID_LENGTH ? value : null }
 function boundedIds(value: unknown, allowEmpty = false): string[] | null {
@@ -141,7 +141,8 @@ function chooseFailure(outcome: Outcome, index: number, value: string, allowance
 }
 function makeOutcome(waitId: string, status: string, targetIds: string[], matchedIds: string[], states: readonly TaskState[], waitMode: "any" | "all"): PreparedOutcome | null {
   if (!waitId || waitId.trim() !== waitId || waitId.length > MAX_ID_LENGTH || !waitStatus(status) || targetIds.length === 0 || targetIds.length > MAX_TARGETS
-    || new Set(targetIds).size !== targetIds.length || matchedIds.some(id => !targetIds.includes(id)) || (status === "ready" && (matchedIds.length === 0 || waitMode === "all" && matchedIds.length !== targetIds.length))) return null
+    || new Set(targetIds).size !== targetIds.length || matchedIds.some(id => !targetIds.includes(id)) || (status === "ready" && (matchedIds.length === 0 || waitMode === "all" && matchedIds.length !== targetIds.length))
+    || (status === "interrupted" && (waitMode === "any" ? matchedIds.length > 0 : matchedIds.length === targetIds.length))) return null
   const seen = new Set<string>(); const tasks: OutcomeTask[] = []
   for (const state of states) {
     if (!targetIds.includes(state.taskId) || seen.has(state.taskId) || !taskStatus(state.status)) return null
@@ -222,11 +223,10 @@ function storedOutcome(wait: Row, snapshot: TaskGraphSnapshot | null, rootTaskId
   }
   return seen.size === targetIds.length ? makeOutcome(waitId, status, targetIds, matchedIds, states, currentMode) : null
 }
-/** Consumes ready waits once while the newly claimed parent Turn is locked. */
 export async function consumeDurableWaitOutcomes(input: DurableWaitConsumerInput): Promise<readonly Projection[]> {
   fence(input)
   if (typeof input.turn.rootTaskId !== "string" || input.turn.rootTaskId.length === 0) return []
-  const waits = await input.client.query<Row>(`SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "targetTaskIds", "mode", "status", "matchedTaskIds", "result", "suspendedAt", "consumedAt" FROM "agent_wait_conditions" WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "parentTaskId" = $4 AND "status" IN ('ready', 'timed_out') AND "suspendedAt" IS NOT NULL AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_wait_conditions"."sessionId" AND session."status" NOT IN ('aborted', 'archived')) ORDER BY "resolvedAt" ASC NULLS LAST, "id" ASC FOR UPDATE`, [input.lease.userId, input.lease.sessionId, input.lease.turnId, input.turn.rootTaskId])
+  const waits = await input.client.query<Row>(`SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "targetTaskIds", "mode", "status", "matchedTaskIds", "result", "suspendedAt", "consumedAt" FROM "agent_wait_conditions" WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "parentTaskId" = $4 AND "status" IN ('ready', 'timed_out', 'interrupted') AND "suspendedAt" IS NOT NULL AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_wait_conditions"."sessionId" AND session."status" NOT IN ('aborted', 'archived')) ORDER BY "resolvedAt" ASC NULLS LAST, "id" ASC FOR UPDATE`, [input.lease.userId, input.lease.sessionId, input.lease.turnId, input.turn.rootTaskId])
   const projections: Projection[] = []
   for (const wait of waits.rows) {
     const parent = (await input.client.query<Row>(`SELECT task."id", task."rootTaskId", task."turnId", task."sessionId", session."userId" AS "userId" FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId" WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND session."userId" = $4 AND session."status" NOT IN ('aborted', 'archived') FOR SHARE`, [wait.parentTaskId, input.lease.sessionId, input.lease.turnId, input.lease.userId])).rows[0]

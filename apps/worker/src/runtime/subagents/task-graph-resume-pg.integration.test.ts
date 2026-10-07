@@ -22,6 +22,7 @@ import { createAgentArtifactRepository, findCurrentDraftHeadWithClient, findRevi
 import { createArtifactToolStore } from "../tools/artifact-tools.js"
 import { createPgDurableWaitPort } from "./durable-wait-store.js"
 import { consumeDurableWaitOutcomes } from "./durable-wait-consumer.js"
+import { reconcileDurableWaits } from "./durable-wait-resolver.js"
 import { childContextSnapshot, createChildContextBuilder } from "./child-context.js"
 import { hashArtifactContent } from "./artifact-adapters.js"
 import { loadSelectedJobArtifactContext, readSelectedJobSourceDigestWithClient, resolveCoverLetterBase } from "./selected-job-artifact-context.js"
@@ -31,6 +32,9 @@ import { selectedJobArtifactFinalizationGuard } from "../selected-job-finalizati
 import { commitTurnTerminal } from "../turns/turn-engine-terminal-commit.js"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
 import { claimTurnLease, releaseTurnLease, type TurnLease } from "../turns/lease.js"
+import { loadCanonicalTurnState } from "../canonical-turn-state.js"
+import { createPgInputClaimStore } from "../context/input-claim-store.js"
+import { createPgContextOwnerFence, StepContextBuilder } from "../context/step-context-builder.js"
 import { checkTaskGraphTerminalVerification, TASK_GRAPH_VERIFICATION_BLOCKER } from "../turns/turn-execution-completion-gate.js"
 import { executionOwnerFence } from "../execution-owner.js"
 import { PgCoordinationStore } from "../mailbox/store.js"
@@ -1859,6 +1863,109 @@ async function activateFixtureTurn(pool: Pool, value: Fixture): Promise<void> {
     value.turnId, value.sessionId, value.userId,
   ])
   if (activated.rowCount !== 1) throw new Error("TaskGraph fixture turn was not parked before activation")
+}
+
+async function seedRootFollowup(pool: Pick<Pool, "connect">, value: Fixture, lease: TurnLease): Promise<{ id: string; sequence: string }> {
+  const client = await pool.connect()
+  try {
+    await client.query("BEGIN")
+    await client.query("SELECT set_config('app.user_id', $1, true)", [value.userId])
+    const session = await client.query(`SELECT session."id" FROM "agent_sessions" AS session
+      WHERE session."id" = $1 AND session."userId" = $2 AND session."status" = 'running' FOR UPDATE`, [value.sessionId, value.userId])
+    const turn = await client.query(`SELECT turn."id" FROM "agent_turns" AS turn
+      WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND turn."status" = 'in_progress'
+        AND turn."leaseOwnerId" = $4 AND turn."leaseVersion" = $5 AND turn."leaseExpiresAt" > CURRENT_TIMESTAMP FOR UPDATE`,
+    [value.turnId, value.sessionId, value.userId, lease.ownerId, lease.leaseVersion])
+    if (!session.rows[0] || !turn.rows[0]) throw new Error("Original root input fixture lost its live Turn owner")
+    const next = await client.query<{ eventSequence: string | bigint }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1
+      WHERE "id" = $1 AND "userId" = $2 RETURNING "eventSequence"`, [value.sessionId, value.userId])
+    const sequence = next.rows[0]?.eventSequence
+    if (sequence === undefined) throw new Error("Original root input fixture could not allocate an accepted sequence")
+    const id = "p3-steer-wait-root-input-" + value.suffix
+    await client.query(`INSERT INTO "agent_inputs"
+      ("id", "sessionId", "targetTurnId", "userId", "clientMessageId", "delivery", "status", "content", "acceptedSequence")
+      VALUES ($1, $2, $3, $4, $5, 'follow_up', 'accepted', $6::jsonb, $7::bigint)`,
+    [id, value.sessionId, value.turnId, value.userId, "p3-steer-wait-root:" + value.suffix,
+      JSON.stringify([{ type: "text", text: "Research and summarize the fixture source" }]), String(sequence)])
+    await client.query("COMMIT")
+    return { id, sequence: String(sequence) }
+  } catch (error: unknown) {
+    await client.query("ROLLBACK").catch(() => undefined)
+    throw error
+  } finally { client.release() }
+}
+async function prepareSuspendedSteerWait(pool: Pool, value: Fixture) {
+  await seed(pool, value, "waiting_for_user")
+  const tasks = new PgSubagentTaskStore(pool, 300_000)
+  const root = await tasks.create({ userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+    role: "supervisor", taskType: "task_graph", goal: "Research and summarize the fixture source",
+    allowedActions: [], expectedOutputSchema: {}, toolPolicySnapshot: {}, budgetSnapshot: {}, policy: defaultSubagentPolicy() })
+  const linked = await pool.query(`UPDATE "agent_turns" SET "rootTaskId" = $2
+    WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4 AND "status" = 'waiting_for_user' AND "rootTaskId" IS NULL`,
+  [value.turnId, root.id, value.sessionId, value.userId])
+  if (linked.rowCount !== 1) throw new Error("Steer-wait fixture root could not be linked")
+  await activateFixtureTurn(pool, value)
+  const lease = await claimTurnLease(pool, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
+  const rootLease = await tasks.claim({ taskId: root.id, sessionId: value.sessionId, ownerId: value.ownerId,
+    policy: defaultSubagentPolicy(), now: new Date() })
+  if (!rootLease?.leaseOwner) throw new Error("Steer-wait fixture root did not acquire a live lease")
+  const child = await tasks.create({ userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+    parentTaskId: root.id, role: "scout", taskType: "research", goal: "Remain live while the root is steered",
+    allowedActions: [], expectedOutputSchema: {}, policy: defaultSubagentPolicy() })
+  const stepId = `p3-steer-wait-step-${value.suffix}`
+  const engine = createPgTurnEngineStore(pool), owner = executionOwnerFence({ kind: "turn", taskId: root.id, lease })
+  await engine.startStep({ owner, stepId, ordinal: 0, attempt: 1, inputThroughSequence: 0n,
+    consumedInputIds: [], modelProfileSnapshot: { provider: "fixture", model: "fixture-model" }, now: new Date() })
+  const rootInput = await seedRootFollowup(pool, value, lease)
+  const contextNow = new Date()
+  const originalContext = await new StepContextBuilder(createPgInputClaimStore(pool, { userId: value.userId }), createPgContextOwnerFence(pool)).build({
+    scope: { userId: value.userId }, sessionId: value.sessionId, turnId: value.turnId, stepId,
+    snapshot: { system: [], profile: [], goal: { id: "turn-goal:" + value.turnId, content: "Research and summarize the fixture source" }, steerHistory: [], businessRefs: [], toolObservations: [] },
+    rootInputId: rootInput.id, taskId: root.id,
+    lease: { ownerId: lease.ownerId, leaseVersion: lease.leaseVersion, now: contextNow }, now: contextNow,
+  })
+  if (originalContext.inputThroughSequence !== BigInt(rootInput.sequence) || !originalContext.consumedInputIds.includes(rootInput.id)) {
+    throw new Error("Steer-wait fixture did not durably checkpoint its original root input")
+  }
+  await engine.updateStep({ owner, stepId, status: "waiting_for_tool", finishReason: "tool_calls", errorCode: null,
+    inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.01, now: new Date() })
+  const waitStore = createPgDurableWaitPort(pool)
+  const wait = await waitStore.wait({ userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+    stepId, taskId: root.id, rootTaskId: root.id, targetTaskIds: [child.id], mode: "all", timeoutMs: 60_000,
+    idempotencyKey: `p3-steer-wait:${value.suffix}` })
+  await waitStore.suspendAndRelease({ lease, waitId: wait.waitId, now: new Date() })
+  return { root, child, lease, rootInput, stepId, wait }
+}
+
+async function seedAcceptedSteer(pool: Pick<Pool, "connect">, value: Fixture, text: string): Promise<{ id: string; sequence: string }> {
+  const client = await pool.connect()
+  try {
+    await client.query("BEGIN")
+    await client.query("SELECT set_config('app.user_id', $1, true)", [value.userId])
+    const session = await client.query(`SELECT session."id" FROM "agent_sessions" AS session
+      WHERE session."id" = $1 AND session."userId" = $2 AND session."status" = 'running' FOR UPDATE`, [value.sessionId, value.userId])
+    const turn = await client.query(`SELECT turn."id" FROM "agent_turns" AS turn
+      WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3
+        AND turn."rootTaskId" IS NOT NULL AND turn."status" = 'waiting_for_dependency' AND turn."leaseOwnerId" IS NULL FOR UPDATE`,
+    [value.turnId, value.sessionId, value.userId])
+    if (!session.rows[0] || !turn.rows[0]) throw new Error("Steer input fixture no longer owns a suspended root Turn")
+    // Seed only the canonical accepted AgentInput row here; this is not a Web-route integration test.
+    const next = await client.query<{ eventSequence: string | bigint }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1
+      WHERE "id" = $1 AND "userId" = $2 RETURNING "eventSequence"`, [value.sessionId, value.userId])
+    const sequence = next.rows[0]?.eventSequence
+    if (sequence === undefined) throw new Error("Steer input fixture could not allocate an accepted sequence")
+    const id = `p3-steer-wait-input-${value.suffix}`
+    await client.query(`INSERT INTO "agent_inputs"
+      ("id", "sessionId", "targetTurnId", "userId", "clientMessageId", "delivery", "status", "content", "acceptedSequence")
+      VALUES ($1, $2, $3, $4, $5, 'steer', 'accepted', $6::jsonb, $7::bigint)`,
+    [id, value.sessionId, value.turnId, value.userId, `p3-steer-wait:${value.suffix}`,
+      JSON.stringify([{ type: "text", text }]), String(sequence)])
+    await client.query("COMMIT")
+    return { id, sequence: String(sequence) }
+  } catch (error: unknown) {
+    await client.query("ROLLBACK").catch(() => undefined)
+    throw error
+  } finally { client.release() }
 }
 
 type SelectedJobFixtureSources = { readonly jobId: string; readonly otherJobId: string; readonly resumeId: string }
@@ -11558,4 +11665,146 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(unrelatedAggregateById.get(unrelatedOutboxIds[0]!)).toBe(stopOwner.sessionId)
     expect(unrelatedAggregateById.get(unrelatedOutboxIds[1]!)).toBe(owner.sessionId)
   }, 30_000)
+
+  it("wakes the same root on accepted steering, then consumes it on the next ordinary step", async () => {
+    const value = fixture(), steerText = `Use the latest EU market evidence ${value.suffix}`
+    try {
+      const prepared = await prepareSuspendedSteerWait(pool!, value)
+      const accepted = await seedAcceptedSteer(pool!, value, steerText)
+      expect(BigInt(accepted.sequence)).toBeGreaterThan(0n)
+      const firstScan = await reconcileDurableWaits(pool!, { ownerId: `p3-steer-resolver-${value.suffix}` })
+      expect(firstScan.scanned).toBeGreaterThan(0)
+      const resumed = await pool!.query<{ status: string; rootTaskId: string | null }>(
+        `SELECT turn."status", turn."rootTaskId" FROM "agent_turns" AS turn
+         WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3`,
+        [value.turnId, value.sessionId, value.userId],
+      )
+      expect(resumed.rows[0]).toEqual({ status: "queued", rootTaskId: prepared.root.id })
+      const waitState = await pool!.query<{ status: string; matchedTaskIds: string[] }>(
+        `SELECT "status", "matchedTaskIds" FROM "agent_wait_conditions"
+         WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`, [prepared.wait.waitId, value.sessionId, value.turnId],
+      )
+      expect(waitState.rows[0]).toMatchObject({ status: "interrupted", matchedTaskIds: [] })
+      const childState = await pool!.query<{ status: string }>(
+        `SELECT "status" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`,
+        [prepared.child.id, value.sessionId, value.turnId],
+      )
+      expect(childState.rows[0]?.status).toBe("queued")
+      const resumedEvents = await pool!.query(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
+        AND "type" = 'turn.resumed' AND "idempotencyKey" = $3`,
+      [value.sessionId, value.turnId, `agent-wait:${prepared.wait.waitId}:resumed`])
+      const dispatches = await pool!.query(`SELECT "id" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.turn.dispatch'
+        AND "idempotencyKey" = $2`, [value.sessionId, `turn-dispatch:${value.turnId}`])
+      expect(resumedEvents.rowCount).toBe(1)
+      expect(dispatches.rowCount).toBe(1)
+      await reconcileDurableWaits(pool!, { ownerId: `p3-steer-resolver-replay-${value.suffix}` })
+      expect((await pool!.query(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
+        AND "type" = 'turn.resumed' AND "idempotencyKey" = $3`,
+      [value.sessionId, value.turnId, `agent-wait:${prepared.wait.waitId}:resumed`])).rowCount).toBe(1)
+
+      const lease = await claimTurnLease(pool!, { turnId: value.turnId, sessionId: value.sessionId, ownerId: `${value.ownerId}-resumed` })
+      const state = await loadCanonicalTurnState(pool!, lease, new Date(), { consumeWaitOutcomes: true })
+      const observationId = `wait-result:${prepared.wait.waitId}`
+      const observation = state.snapshot.toolObservations.find(item => item.id === observationId)
+      expect(observation?.content).toMatchObject({
+        toolCallId: `wait:${prepared.wait.waitId}`, toolName: "agent.wait", status: "completed",
+        output: { status: "interrupted", matchedTaskIds: [], tasks: [{ taskId: prepared.child.id, status: "queued" }] },
+      })
+      expect(JSON.stringify(observation?.content)).not.toContain(steerText)
+      expect(state.goal).toBe("Research and summarize the fixture source")
+      expect(state.rootInputId).toBe(prepared.rootInput.id)
+      expect(state.resume?.inputThroughSequence).toBe(BigInt(prepared.rootInput.sequence))
+      expect(BigInt(accepted.sequence)).toBeGreaterThan(BigInt(prepared.rootInput.sequence))
+      expect(state.resume?.consumedInputIds).toContain(prepared.rootInput.id)
+      expect(state.resume?.usage).toMatchObject({ inputTokens: 17, outputTokens: 5, estimatedCostUsd: 0.01 })
+      const originalStep = await pool!.query<{ status: string; inputThroughSequence: string; consumedInputIds: unknown; inputTokens: number; outputTokens: number }>(
+        `SELECT "status", "inputThroughSequence", "consumedInputIds", "inputTokens", "outputTokens" FROM "agent_steps"
+         WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`, [prepared.stepId, value.sessionId, value.turnId],
+      )
+      expect(originalStep.rows[0]).toMatchObject({ status: "waiting_for_tool", inputThroughSequence: prepared.rootInput.sequence, consumedInputIds: [prepared.rootInput.id], inputTokens: 17, outputTokens: 5 })
+      const firstConsumption = await pool!.query<{ consumedAt: Date | null; result: unknown }>("SELECT \"consumedAt\", \"result\" FROM \"agent_wait_conditions\" WHERE \"id\" = $1", [prepared.wait.waitId])
+      const firstConsumedAt = firstConsumption.rows[0]?.consumedAt
+      const firstWaitResult = firstConsumption.rows[0]?.result
+      expect(firstConsumption.rows[0]?.consumedAt).toBeInstanceOf(Date)
+      const replay = await loadCanonicalTurnState(pool!, lease, new Date(), { consumeWaitOutcomes: true })
+      expect(replay.snapshot.toolObservations.find(item => item.id === observationId)?.content).toEqual(observation?.content)
+      const replayedWait = await pool!.query<{ consumedAt: Date | null; result: unknown }>(`SELECT "consumedAt", "result" FROM "agent_wait_conditions" WHERE "id" = $1`, [prepared.wait.waitId])
+      expect(replayedWait.rows[0]?.consumedAt).toEqual(firstConsumedAt)
+      expect(replayedWait.rows[0]?.result).toEqual(firstWaitResult)
+
+      const nextStepId = `p3-steer-wait-resume-step-${value.suffix}`, now = new Date()
+      const owner = executionOwnerFence({ kind: "turn", taskId: prepared.root.id, lease })
+      await createPgTurnEngineStore(pool!).startStep({ owner, stepId: nextStepId, ordinal: state.resume?.nextOrdinal ?? 1,
+        attempt: 1, inputThroughSequence: state.resume?.inputThroughSequence ?? 0n,
+        consumedInputIds: state.resume?.consumedInputIds ?? [], modelProfileSnapshot: state.modelProfileSnapshot, now })
+      const context = await new StepContextBuilder(createPgInputClaimStore(pool!, state.scope), createPgContextOwnerFence(pool!)).build({
+        scope: state.scope, sessionId: value.sessionId, turnId: value.turnId, stepId: nextStepId, snapshot: state.snapshot,
+        rootInputId: state.rootInputId, taskId: prepared.root.id,
+        lease: { ownerId: lease.ownerId, leaseVersion: lease.leaseVersion, now }, now,
+      })
+      expect(context.blocks).toContainEqual(expect.objectContaining({
+        layer: "pending_input", trust: "external_untrusted", source: "user_input",
+        content: { inputId: accepted.id, partIndex: 0, text: steerText },
+      }))
+      const inputState = await pool!.query<{ status: string; consumedByStepId: string | null; acceptedSequence: string }>(
+        `SELECT "status", "consumedByStepId", "acceptedSequence" FROM "agent_inputs" WHERE "id" = $1 AND "sessionId" = $2 AND "targetTurnId" = $3 AND "userId" = $4`,
+        [accepted.id, value.sessionId, value.turnId, value.userId],
+      )
+      expect(inputState.rows[0]).toMatchObject({ status: "consumed", consumedByStepId: nextStepId, acceptedSequence: accepted.sequence })
+      const immutable = await pool!.query<{ input: RecordValue; goal: string; allowedActions: string[] }>(
+        `SELECT turn."input", task."goal", task."allowedActions" FROM "agent_turns" AS turn
+         JOIN "sub_agent_tasks" AS task ON task."id" = turn."rootTaskId" AND task."sessionId" = turn."sessionId"
+         WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3`, [value.turnId, value.sessionId, value.userId],
+      )
+      expect(immutable.rows[0]).toMatchObject({ input: { goal: "Research and summarize the fixture source" }, goal: "Research and summarize the fixture source", allowedActions: [] })
+      expect((await pool!.query<{ status: string }>(`SELECT "status" FROM "sub_agent_tasks" WHERE "id" = $1`, [prepared.child.id])).rows[0]?.status).toBe("queued")
+    } finally {
+      await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [value.sessionId])
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
+    }
+  }, 45_000)
+
+  it("serializes accepted steering after the resolver session lock and wakes on the next scan", async () => {
+    const value = fixture(), barrier = sessionLockBarrierPool(pool!), inputBarrier = sessionLockBarrierPool(pool!)
+    let scan: Promise<unknown> | undefined, acceptance: Promise<unknown> | undefined
+    try {
+      const prepared = await prepareSuspendedSteerWait(pool!, value)
+      scan = reconcileDurableWaits(barrier.pool, { ownerId: `p3-steer-race-resolver-${value.suffix}` })
+      void scan.catch(() => undefined)
+      const resolverPid = await withinIntegrationDeadline(barrier.connected, "Resolver did not connect for the steering race")
+      expect(await withinIntegrationDeadline(barrier.sessionLockReturned, "Resolver did not lock the Session before the Turn")).toBe(resolverPid)
+      acceptance = seedAcceptedSteer(inputBarrier.pool, value, `A later ordinary step should consume ${value.suffix}`)
+      void acceptance.catch(() => undefined)
+      const inputPid = await withinIntegrationDeadline(inputBarrier.connected, "Steer acceptor did not connect")
+      expect(inputPid).not.toBe(resolverPid)
+      await waitForSessionTupleBlock(pool!, resolverPid, inputPid)
+      barrier.release()
+      await expect(withinIntegrationDeadline(scan, "Resolver did not settle after the input waited on its Session lock", 10_000))
+        .resolves.toMatchObject({ scanned: expect.any(Number), woken: expect.any(Number) })
+      await withinIntegrationDeadline(inputBarrier.sessionLockReturned, "Steer acceptor did not acquire the Session after resolver commit")
+      inputBarrier.release()
+      await acceptance
+      const beforeRetry = await pool!.query<{ turnStatus: string; waitStatus: string; childStatus: string }>(
+        `SELECT turn."status" AS "turnStatus", wait."status" AS "waitStatus", child."status" AS "childStatus"
+         FROM "agent_turns" AS turn JOIN "agent_wait_conditions" AS wait ON wait."turnId" = turn."id" AND wait."sessionId" = turn."sessionId"
+         JOIN "sub_agent_tasks" AS child ON EXISTS (SELECT 1 FROM jsonb_array_elements_text(wait."targetTaskIds") AS target(task_id) WHERE target.task_id = child."id") AND child."turnId" = turn."id" AND child."sessionId" = turn."sessionId"
+         WHERE turn."id" = $1 AND wait."id" = $2`, [value.turnId, prepared.wait.waitId],
+      )
+      expect(beforeRetry.rows[0]).toEqual({ turnStatus: "waiting_for_dependency", waitStatus: "waiting", childStatus: "queued" })
+      await reconcileDurableWaits(pool!, { ownerId: `p3-steer-race-retry-${value.suffix}` })
+      const afterRetry = await pool!.query<{ turnStatus: string; waitStatus: string; childStatus: string }>(
+        `SELECT turn."status" AS "turnStatus", wait."status" AS "waitStatus", child."status" AS "childStatus"
+         FROM "agent_turns" AS turn JOIN "agent_wait_conditions" AS wait ON wait."turnId" = turn."id" AND wait."sessionId" = turn."sessionId"
+         JOIN "sub_agent_tasks" AS child ON EXISTS (SELECT 1 FROM jsonb_array_elements_text(wait."targetTaskIds") AS target(task_id) WHERE target.task_id = child."id") AND child."turnId" = turn."id" AND child."sessionId" = turn."sessionId"
+         WHERE turn."id" = $1 AND wait."id" = $2`, [value.turnId, prepared.wait.waitId],
+      )
+      expect(afterRetry.rows[0]).toEqual({ turnStatus: "queued", waitStatus: "interrupted", childStatus: "queued" })
+    } finally {
+      barrier.release(); inputBarrier.release()
+      if (scan) await Promise.allSettled([scan])
+      if (acceptance) await Promise.allSettled([acceptance])
+      await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [value.sessionId])
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [value.userId])
+    }
+  }, 45_000)
 })
