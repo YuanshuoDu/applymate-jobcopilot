@@ -1,4 +1,7 @@
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
+import { knownAgentEventPayloadFields, type AgentEventRoutingContext } from "./agent-event-routing"
+
+export type { AgentEventRoutingContext } from "./agent-event-routing"
 
 const SENSITIVE_KEY = /(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|password|secret|private[_-]?key|credential|token|nonce|email|phone|address|linkedin|github|resume|cv|raw[_-]?(?:content|text|data)|content|value|question|answer|draft|sensitive|confirmed[_-]?answers|\bname\b)/i
 const SENSITIVE_TOKEN = /\bBearer\s+[a-z0-9._~+/=-]{8,}/gi
@@ -15,15 +18,8 @@ const CUID_ID = /^c[a-z0-9]{23,31}$/i
 const SECRET_ID = /^(?:bearer\b|sk[-_]|xox[baprs]-|gh[pousr]_|github_pat_|ghs_|glpat-|AIza|ya29\.|secret[_:-]|password[_:-]|api[_-]?key[_:-]|token[_:-])|(?:password|secret|token|api[_-]?key)=/i
 const STABLE_ID_COMPONENT = /(^|[:._-])([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{32,64})(?=$|[:._-])/gi
 
-type WaitKind = "approval" | "question"
-type RoutingTuple = {
-  sessionId: string; turnId: string; itemId: string | null; taskId: string | null
-  actor: string; correlationId: string; causationId: string | null; outboxTopic: string
-}
+type RoutingTuple = AgentEventRoutingContext
 type JsonRecord = Record<string, unknown>
-
-/** Trusted only when supplied by a server writer or recovered from a complete canonical event envelope. */
-export type AgentEventRoutingContext = RoutingTuple
 
 function record(value: unknown): JsonRecord | null {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return null
@@ -58,6 +54,10 @@ function safeWaitIdempotencyKey(type: string, value: unknown, route: RoutingTupl
   if (type === "item.started") {
     const item = route.itemId?.match(/^agent-wait:(question|approval):(.+)$/)
     return Boolean(item && safeMetadataId(item[2]!) && value === `agent-wait:${route.itemId}:started`)
+  }
+  if (type === "task.interrupt.accepted") {
+    const prefix = `agent-task-interrupt-accepted:${route.sessionId}:`
+    return value.startsWith(prefix) && safeMetadataId(value.slice(prefix.length))
   }
   const prefix = "agent-wait-command:"
   if (!value.startsWith(prefix)) return false
@@ -94,52 +94,7 @@ function fullEnvelope(type: string, value: unknown): { row: JsonRecord; routing:
   const outboxTopic = type === "turn.wakeup" ? "agent.turn.wakeup" : "agent.session.event"
   const routing = { sessionId: row.sessionId, turnId: row.turnId, itemId: row.itemId, taskId: row.taskId,
     actor: row.actor, correlationId: row.correlationId, causationId: row.causationId, outboxTopic }
-  return validRouting(routing) && waitPayloadFields(type, row.payload as JsonRecord, routing) ? { row, routing } : null
-}
-
-function waitKind(value: unknown): value is WaitKind { return value === "approval" || value === "question" }
-function answerFlagMatches(payload: JsonRecord, kind: WaitKind): boolean {
-  return payload.answerAvailable === undefined || payload.answerAvailable === "[REDACTED]"
-    || payload.answerAvailable === (kind === "question")
-}
-
-function waitPayloadFields(type: string, payload: JsonRecord, route: RoutingTuple): string[] | null {
-  if (type === "approval.resolved" && payload.waitKind === undefined) {
-    const approvalId = payload.approvalId
-    const action = payload.action
-    return opaqueId(approvalId) && approvalId === route.correlationId && route.itemId === null
-      && route.outboxTopic === "agent.session.event" && (route.actor === "user" || route.actor === "system")
-      && typeof action === "string" && /^[a-z][a-z0-9_]{0,63}$/i.test(action)
-      && Number.isSafeInteger(payload.revision) && (payload.revision as number) >= 0 ? ["approvalId"] : null
-  }
-  const kind = payload.waitKind
-  const idKey = kind === "question" ? "questionId" : "approvalId"
-  const waitId = type === "item.started" ? payload[idKey] : payload.waitId
-  if (!waitKind(kind) || !opaqueId(waitId)) return null
-  const itemId = `agent-wait:${kind}:${waitId}`
-  const toolCallId = payload.toolCallId
-  if (!nullableId(toolCallId) || route.itemId !== itemId || payload.itemId !== itemId) return null
-  if (payload.sessionId !== undefined && payload.sessionId !== route.sessionId) return null
-  if (type === "item.started") {
-    return route.actor === "orchestrator" && route.outboxTopic === "agent.session.event"
-      && route.correlationId === itemId && route.causationId === waitId ? ["itemId", idKey, "toolCallId"] : null
-  }
-  if (type === "question.answered" || type === "approval.resolved") {
-    if ((type === "question.answered" && kind !== "question") || (type === "approval.resolved" && kind !== "approval")) return null
-    const statusValid = kind === "question" ? payload.status === "answered"
-      : payload.status === "approved" || payload.status === "rejected"
-    return route.actor === "user" && route.outboxTopic === "agent.session.event"
-      && route.correlationId === waitId && route.causationId === itemId && payload.turnId === route.turnId
-      && statusValid && Number.isSafeInteger(payload.nextTurnRevision) && (payload.nextTurnRevision as number) >= 1
-      && answerFlagMatches(payload, kind)
-      ? ["sessionId", "waitId", "itemId", "turnId", "toolCallId"] : null
-  }
-  if (type !== "turn.wakeup" || route.actor !== "user" || route.outboxTopic !== "agent.turn.wakeup"
-    || route.correlationId !== route.turnId || !opaqueId(route.causationId) || payload.turnId !== route.turnId
-    || (kind === "question" ? payload.status !== "answered" : payload.status !== "approved" && payload.status !== "rejected")
-    || !Number.isSafeInteger(payload.nextTurnRevision) || (payload.nextTurnRevision as number) < 1
-    || !answerFlagMatches(payload, kind)) return null
-  return ["sessionId", "waitId", "itemId", "turnId", "toolCallId"]
+  return validRouting(routing) && knownAgentEventPayloadFields(type, row.payload as JsonRecord, routing, opaqueId) ? { row, routing } : null
 }
 
 function preserveFields(safe: unknown, raw: JsonRecord, fields: readonly string[]): RepositoryJsonValue {
@@ -157,7 +112,7 @@ function preserveFields(safe: unknown, raw: JsonRecord, fields: readonly string[
 function redactWaitRouting(type: string, raw: unknown, safe: RepositoryJsonValue, route: RoutingTuple): RepositoryJsonValue {
   const payload = record(raw)
   if (!payload) return safe
-  const fields = waitPayloadFields(type, payload, route)
+  const fields = knownAgentEventPayloadFields(type, payload, route, opaqueId)
   const preserved = fields ? preserveFields(safe, payload, fields) : safe
   if (fields && type === "question.answered" && payload.answerAvailable === true) {
     const output = record(preserved)
