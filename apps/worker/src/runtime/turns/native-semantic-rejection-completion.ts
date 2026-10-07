@@ -97,7 +97,7 @@ export async function completeNativeSemanticRejectionStepWithClient(client: Turn
   try {
     if (step.status === "completed") {
       if (!sameStep(step, input, checkpoint) || !await samePersistedCost(client, step, input)) throw conflict(`step ${input.stepId} replay`)
-      const prior = await client.query<TurnEngineRow>(`SELECT * FROM "agent_native_semantic_rejections" WHERE "turnId" = $1 AND "stepId" = $2 FOR UPDATE`, [owner.turnId, input.stepId])
+      const prior = await client.query<TurnEngineRow>(`SELECT * FROM "agent_native_semantic_rejections" WHERE "turnId" = $1 AND "stepId" = $2`, [owner.turnId, input.stepId])
       if (!prior.rows[0] || !sameReceipt(prior.rows[0], input, checkpoint)) throw conflict(`step ${input.stepId} receipt replay`)
     } else {
       if (step.status !== "streaming" || step.finishReason !== null || step.errorCode !== null

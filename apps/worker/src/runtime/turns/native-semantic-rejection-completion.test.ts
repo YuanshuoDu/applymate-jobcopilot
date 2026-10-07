@@ -87,6 +87,8 @@ describe("atomic native semantic rejection completion", () => {
     const mock = client({ stepStatus: "completed", receipt })
     await expect(completeNativeSemanticRejectionStepWithClient(mock.client, input)).resolves.toEqual({ inputThroughSequence: 8n, distinctStepCount: 1 })
     expect(mock.calls.some(call => call.sql.startsWith('UPDATE "agent_steps"') || call.sql.startsWith('INSERT INTO "agent_native_semantic_rejections"'))).toBe(false)
+    const receiptRead = mock.calls.find(call => call.sql.startsWith('SELECT * FROM "agent_native_semantic_rejections"'))
+    expect(receiptRead?.sql).not.toMatch(/\bFOR\s+UPDATE\b/i)
   })
 
   it("delegates numeric(12,8) half-boundary comparison to PostgreSQL", async () => {
