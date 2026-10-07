@@ -2,10 +2,12 @@
 
 import React from 'react'
 import { redactSensitiveValue } from '@jobcopilot/shared/agent-redaction'
-import { useI18n } from '@/lib/i18n'
+import { useI18n, type Lang } from '@/lib/i18n'
 import type { TimelineItem } from './timeline-reducer'
 import { contentParts, itemText, type HarnessContentPart, type SuggestedActionCommand } from './harness-item-types'
 import { HarnessMarkdown } from './HarnessMarkdown'
+import { NativeVerificationFeedbackCard } from './NativeVerificationFeedbackCard'
+import { extractNativeVerificationFeedback, safeNativeFeedbackOutput } from './native-verification-feedback'
 
 export interface HarnessItemProps {
   item: TimelineItem
@@ -20,7 +22,7 @@ export interface PlanStep {
 }
 
 export function HarnessItem({ item, highlightedFinal = false, onSuggestedAction }: HarnessItemProps) {
-  const { t } = useI18n()
+  const { t, lang } = useI18n()
   const final = item.phase === 'final_answer'
   const accent = final ? 'var(--c-success)' : item.type === 'reasoning_summary' ? '#7c3aed' : 'var(--primary)'
   const title = itemTitle(item.type, t)
@@ -44,7 +46,7 @@ export function HarnessItem({ item, highlightedFinal = false, onSuggestedAction 
         <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>{title}</span>
         {final && <span data-agent-final-label="true" style={{ marginLeft: 'auto', color: accent, fontSize: 10, fontWeight: 700 }}>{t('agent.finalAnswer')}</span>}
       </div>
-      {renderItemBody(item, t, onSuggestedAction)}
+      {renderItemBody(item, t, lang, onSuggestedAction)}
       <div style={{ marginTop: 11, paddingTop: 8, borderTop: '1px solid var(--border)', color: 'var(--text-muted)', fontSize: 10 }}>
         {t('agent.itemStatus')}: {itemStatusLabel(item.status, t)}
       </div>
@@ -64,9 +66,9 @@ export function reducePlanSteps(value: unknown): PlanStep[] {
   }).filter((step): step is PlanStep => step !== null)
 }
 
-function renderItemBody(item: TimelineItem, t: (key: string) => string, onSuggestedAction?: HarnessItemProps['onSuggestedAction']) {
+function renderItemBody(item: TimelineItem, t: (key: string) => string, lang: Lang, onSuggestedAction?: HarnessItemProps['onSuggestedAction']) {
   if (item.type === 'plan') return <PlanBody item={item} t={t} />
-  if (item.type === 'tool_call' || item.type === 'tool_result') return <ToolLifecycleCard item={item} t={t} />
+  if (item.type === 'tool_call' || item.type === 'tool_result') return <ToolLifecycleCard item={item} t={t} lang={lang} />
   if (item.type === 'reasoning_summary') {
     return <details><summary style={{ cursor: 'pointer', color: '#7c3aed', fontSize: 12 }}>{t('agent.reasoningSummary')}</summary><div style={{ marginTop: 8 }}><HarnessMarkdown markdown={itemText(item) || t('agent.noReasoningSummary')} /></div></details>
   }
@@ -84,16 +86,23 @@ function PlanBody({ item, t }: { item: TimelineItem; t: (key: string) => string 
   )
 }
 
-export function ToolLifecycleCard({ item, t }: { item: TimelineItem; t?: (key: string) => string }) {
+export function ToolLifecycleCard({ item, t, lang = 'en' }: { item: TimelineItem; t?: (key: string) => string; lang?: Lang }) {
   const translate = t ?? ((key: string) => key)
   const data = isRecord(item.content) ? item.content : {}
   const toolName = stringValue(data.toolName) ?? stringValue(data.name) ?? (item.type === 'tool_result' ? translate('agent.toolResult') : translate('agent.toolCall'))
   const output = data.outputSummary ?? data.output ?? data.result ?? data.errorCode
+  const feedbackSource = data.output ?? data.result
+  const feedback = item.type === 'tool_result' && item.status === 'completed'
+    ? extractNativeVerificationFeedback(feedbackSource) : { state: 'none' as const }
+  const feedbackOutput = feedback.state === 'available' ? safeNativeFeedbackOutput(feedbackSource) : undefined
+  const ordinaryOutput = feedback.state === 'none' ? output : undefined
+  const displayOutput = feedback.state === 'available' ? feedbackOutput : ordinaryOutput
   return (
     <div data-tool-lifecycle="true" data-tool-status={item.status} style={{ border: '1px solid var(--border)', borderRadius: 7, padding: '9px 10px', display: 'grid', gap: 6 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, fontSize: 11 }}><strong>{toolName}</strong><span style={{ color: item.status === 'failed' ? 'var(--c-danger)' : item.status === 'completed' ? 'var(--c-success)' : 'var(--primary)' }}>{toolStatus(item.status, translate)}</span></div>
       {data.input !== undefined && <ValueRow label={translate('agent.toolInput')} value={data.input} />}
-      {output !== undefined && <ValueRow label={item.status === 'failed' ? translate('agent.toolError') : translate('agent.toolOutput')} value={output} />}
+      {displayOutput !== undefined && <ValueRow label={item.status === 'failed' ? translate('agent.toolError') : translate('agent.toolOutput')} value={displayOutput} />}
+      <NativeVerificationFeedbackCard view={feedback} lang={lang} />
     </div>
   )
 }
