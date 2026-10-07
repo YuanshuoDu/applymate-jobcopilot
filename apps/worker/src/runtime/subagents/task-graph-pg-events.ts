@@ -31,7 +31,7 @@ export async function writeTaskGraphSnapshot(client: Queryable, scope: GraphEven
 
 export async function appendTaskGraphReceipt(client: Queryable, input: {
   scope: GraphEventScope
-  itemId: string
+  itemId: string | null
   type: string
   idempotencyKey: string
   payload: unknown

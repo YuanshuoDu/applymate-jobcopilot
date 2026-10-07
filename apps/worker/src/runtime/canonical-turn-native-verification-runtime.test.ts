@@ -5,6 +5,8 @@ import { digestNativeVerificationValue } from "./subagents/native-verification-c
 import type { NativeVerificationEnsureResult, NativeVerificationPort, NativeVerificationRootGoalWitness } from "./subagents/native-verification-port.js"
 import type { TaskGraphExecutionScope, TaskGraphReadScope } from "./subagents/task-graph-command-port.js"
 import type { DurableWaitPort } from "./tools/coordination-types.js"
+import { buildCognitiveActionAgenda } from "./turns/cognitive-action-agenda.js"
+import { buildCognitiveAgendaReceipt } from "./turns/cognitive-agenda-receipt.js"
 import { NATIVE_SEMANTIC_NO_PROGRESS, RESET_NATIVE_SEMANTIC_PROGRESS } from "./turns/turn-execution-types.js"
 import type { TurnEngineTerminalGuard } from "./turns/turn-engine-terminal-commit.js"
 import { createCanonicalNativeVerificationRuntime, createCanonicalRootCompletionGate, createCanonicalTurnTerminalGuard, type NativeVerificationRuntime } from "./canonical-turn-native-verification-runtime.js"
@@ -28,7 +30,7 @@ const terminalInput = { stepId: "step-1", finalContent: { text: candidate }, res
 function coordination() {
   return {
     readScope: () => readScope,
-    executionScope: (stepId: string) => ({ ...scope, stepId }),
+    executionScope: vi.fn((stepId: string) => ({ ...scope, stepId })),
     hasNativeTasks: vi.fn(async () => true),
     checkNativeGraphCompletion: vi.fn(async () => null),
   }
@@ -52,10 +54,94 @@ function configureLegacyProgress(runtime: ReturnType<typeof createCanonicalNativ
   return runtime
 }
 
+function steeringLedgerPool(pendingSteer = false, planningRoot = true): pg.Pool {
+  const step = (stepId: string, ordinal: number, status: string, consumedInputIds: string[]) => ({
+    id: stepId, taskId: "root-1", ordinal, attempt: ordinal === 0 ? 1 : 3, status,
+    inputThroughSequence: pendingSteer ? "2" : "0", consumedInputIds,
+  })
+  const agenda = (stepId: string) => {
+    const context = { schemaVersion: "agent-harness.v2" as const, sessionId: scope.sessionId, turnId: scope.turnId, stepId,
+      inputThroughSequence: 2n, consumedInputIds: [], blocks: [], canonicalJson: "", taskGraphRevision: 0 }
+    return buildCognitiveAgendaReceipt({ sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.rootTaskId, stepId,
+      inputThroughSequence: 2n, consumedInputIds: [], agenda: buildCognitiveActionAgenda(context, { freshSteering: false }) })
+  }
+  const query = vi.fn(async (sql: string, params: readonly unknown[] = []) => {
+    if (["BEGIN ISOLATION LEVEL READ COMMITTED", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+    if (!planningRoot && (sql.includes('SELECT turn."input" FROM "agent_turns"') || sql.includes("cognitive.agenda"))) {
+      throw new Error("nonplanning Root must not require planner-only ledger context")
+    }
+    if (sql.includes('SELECT "id" FROM "agent_sessions"')) return { rows: [{ id: scope.sessionId }], rowCount: 1 }
+    if (sql.includes('SELECT session."id" FROM "agent_sessions"')) return { rows: [{ id: scope.sessionId }], rowCount: 1 }
+    if (sql.includes('SELECT "id" FROM "agent_turns"')) return { rows: [{ id: scope.turnId }], rowCount: 1 }
+    if (sql.includes('SELECT turn."input" FROM "agent_turns"')) return { rows: [{ input: pendingSteer ? { clientMessageId: "original-message" } : {} }], rowCount: 1 }
+    if (sql.includes('SELECT task."allowedActions" FROM "sub_agent_tasks"')) return { rows: [{ allowedActions: planningRoot ? ["agent.plan"] : ["jobs.search"] }], rowCount: 1 }
+    if (sql.includes('SELECT task.*, session."userId" AS "userId" FROM "sub_agent_tasks"')) return { rows: [{ id: scope.rootTaskId, allowedActions: planningRoot ? ["agent.plan"] : ["jobs.search"] }], rowCount: 1 }
+    if (sql.includes('SELECT task.* FROM "sub_agent_tasks"')) return { rows: [{ id: scope.rootTaskId, userId: scope.userId }], rowCount: 1 }
+    if (sql.includes("WITH wall_clock AS MATERIALIZED")) return { rows: [{ turnLeaseValid: true, parentLeaseValid: true }], rowCount: 1 }
+    if (sql.includes('SELECT "id" FROM "agent_steps"')) return { rows: [{ id: params[0] }], rowCount: 1 }
+    if (sql.includes('SELECT "id" FROM "agent_steps" WHERE "id" = $1 AND "turnId"')) return { rows: [{ id: params[0] }], rowCount: 1 }
+    if (sql.includes('SELECT "id", "clientMessageId", "delivery"') && sql.includes('FROM "agent_inputs" WHERE')) {
+      const rows = pendingSteer ? [
+        { id: "root-input", clientMessageId: "original-message", delivery: "follow_up", status: "consumed", acceptedSequence: "1", consumedByStepId: "step-0", consumedAt: new Date(), cancelledAt: null },
+        { id: "steer-1", clientMessageId: "steer-message", delivery: "steer", status: "consumed", acceptedSequence: "2", consumedByStepId: "step-0", consumedAt: new Date(), cancelledAt: null },
+      ] : []
+      return { rows, rowCount: rows.length }
+    }
+    if (sql.includes('SELECT input."id"') && sql.includes('LEFT JOIN "agent_events"')) {
+      const event = { id: "steer-1", clientMessageId: "steer-message", delivery: "steer", status: "consumed", acceptedSequence: "2", consumedByStepId: "step-0", consumedAt: new Date(), cancelledAt: null,
+        acceptedType: "input.accepted", acceptedActor: "user", acceptedTaskId: null, acceptedCorrelationId: scope.turnId, acceptedItemId: "accepted-item", acceptedEventSequence: "2",
+        acceptedPayload: { clientMessageId: "steer-message", delivery: "steer", disposition: "accepted", inputId: "steer-1", source: "user" },
+        acceptedItemType: "user_message", acceptedItemTaskId: null, acceptedItemStatus: "completed",
+        acceptedItemContent: { clientMessageId: "steer-message", disposition: "accepted", parts: [{ type: "text", text: "Change the target to Dublin roles." }], source: "user" } }
+      const rows = pendingSteer ? [event] : []
+      return { rows, rowCount: rows.length }
+    }
+    if (sql.includes('SELECT "id", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds"')
+      && sql.includes('"id" = ANY($4::text[])')) return { rows: pendingSteer ? [step("step-0", 0, "completed", ["steer-1"])] : [], rowCount: pendingSteer ? 1 : 0 }
+    if (sql.includes('SELECT item."revision" FROM "agent_items" AS item')) return { rows: [], rowCount: 0 }
+    if (sql.includes('FROM "agent_events" AS event WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."type" = $3')) return { rows: [], rowCount: 0 }
+    if (sql.includes('SELECT "id", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds"')
+      && sql.includes('WHERE "id" = $1 AND "sessionId" = $2')) return { rows: [step(String(params[0]), 1, "streaming", [])], rowCount: 1 }
+    if (sql.includes('SELECT event."actor", event."itemId", event."taskId", event."correlationId", event."payload"') && sql.includes("cognitive.agenda")) {
+      return { rows: [{ actor: "orchestrator", itemId: null, taskId: scope.rootTaskId, correlationId: params[3], payload: agenda(String(params[3])) }], rowCount: 1 }
+    }
+    throw new Error(`Unexpected steering-ledger query: ${sql}`)
+  })
+  const client = { query, release: vi.fn() }
+  return { connect: vi.fn(async () => client) } as unknown as pg.Pool
+}
+
 describe("canonical native verification runtime composition", () => {
+  it("returns exact pending-steering feedback before native verification when the owned Root has unresolved input", async () => {
+    const { port, factory } = runtimeFactory(vi.fn(async () => true))
+    const current = coordination()
+    const runtime = createCanonicalNativeVerificationRuntime({
+      pool: steeringLedgerPool(true), factory, coordination: current, durableWaitPort: waitPort, enabled: true,
+    })
+
+    await expect(runtime.checkCompletion("step-next", candidate)).resolves.toEqual({
+      ok: false, blocker: "steering_reconciliation_pending",
+      feedback: "Accepted user steering must be reconciled against the current TaskGraph before completion. Review current input and plan, then use agent.reconcile to keep the current revision or agent.plan to revise it.",
+    })
+    expect(current.executionScope).toHaveBeenCalledWith("step-next")
+    expect(port.ensureChildren).not.toHaveBeenCalled()
+    expect(port.ensureRootGoal).not.toHaveBeenCalled()
+  })
+
+  it("does not send an unserviceable steering blocker to a nonplanning Root", async () => {
+    const { port, factory } = runtimeFactory(vi.fn(async () => true))
+    const runtime = createCanonicalNativeVerificationRuntime({
+      pool: steeringLedgerPool(true, false), factory, coordination: coordination(), durableWaitPort: waitPort, enabled: true,
+    })
+
+    await expect(runtime.checkCompletion("step-next", candidate)).resolves.toBeNull()
+    expect(port.ensureChildren).toHaveBeenCalledOnce()
+    expect(port.ensureRootGoal).toHaveBeenCalledOnce()
+  })
+
   it("uses the PostgreSQL verifier by default", () => {
     const created = createCanonicalNativeVerificationRuntime({
-      pool: {} as pg.Pool, coordination: coordination(), durableWaitPort: waitPort, enabled: true,
+      pool: steeringLedgerPool(), coordination: coordination(), durableWaitPort: waitPort, enabled: true,
     })
     expect(created.port).toBeDefined()
     expect(typeof created.port.ensureChildren).toBe("function")
@@ -69,7 +155,7 @@ describe("canonical native verification runtime composition", () => {
     const readTerminalProof = vi.fn(async () => true)
     const { port, factory } = runtimeFactory(readTerminalProof)
     const runtime = createCanonicalNativeVerificationRuntime({
-      pool: {} as pg.Pool, factory, coordination: current, durableWaitPort: waitPort, enabled: true,
+      pool: steeringLedgerPool(), factory, coordination: current, durableWaitPort: waitPort, enabled: true,
     })
 
     await expect(runtime.checkCompletion("step-1", candidate)).resolves.toBeNull()
@@ -86,7 +172,7 @@ describe("canonical native verification runtime composition", () => {
 
   it("keeps legacy terminal calls on exact-no-step selection instead of guessing the latest Step", async () => {
     const readTerminalProof = vi.fn(async () => true), { factory } = runtimeFactory(readTerminalProof)
-    const runtime = createCanonicalNativeVerificationRuntime({ pool: {} as pg.Pool, factory,
+    const runtime = createCanonicalNativeVerificationRuntime({ pool: steeringLedgerPool(), factory,
       coordination: coordination(), durableWaitPort: waitPort, enabled: true })
     await runtime.checkCompletion("step-current", candidate)
     const client = { query: vi.fn(async () => ({ rows: [{ hasPendingSteer: false }] })) } as unknown as Pick<PoolClient, "query">
@@ -114,7 +200,7 @@ describe("canonical native verification runtime composition", () => {
       ensureRootGoal: vi.fn(async () => rootSemanticFailure()), readRecoverableGoal: vi.fn(async () => null),
     }
     const factory = vi.fn(() => ({ port, readTerminalProof: vi.fn(async () => true) }))
-    const runtime = configureLegacyProgress(createCanonicalNativeVerificationRuntime({ pool: {} as pg.Pool, factory, coordination: coordination(), durableWaitPort: waitPort, enabled: true }))
+    const runtime = configureLegacyProgress(createCanonicalNativeVerificationRuntime({ pool: steeringLedgerPool(), factory, coordination: coordination(), durableWaitPort: waitPort, enabled: true }))
     const first = await runtime.checkCompletion("step-1", candidate)
     const replay = await runtime.checkCompletion("step-1", candidate)
     const second = await runtime.checkCompletion("step-2", candidate)
@@ -139,7 +225,7 @@ describe("canonical native verification runtime composition", () => {
       ensureChildren: vi.fn(async () => ({ status: "passed" as const, controlTaskIds: [], pendingControlTaskIds: [], pendingTaskIds: [], feedback: [] })),
       ensureRootGoal: vi.fn(async () => failures[index++] ?? rootSemanticFailure()), readRecoverableGoal: vi.fn(async () => null),
     }
-    const runtime = configureLegacyProgress(createCanonicalNativeVerificationRuntime({ pool: {} as pg.Pool, factory: () => ({ port, readTerminalProof: vi.fn(async () => true) }),
+    const runtime = configureLegacyProgress(createCanonicalNativeVerificationRuntime({ pool: steeringLedgerPool(), factory: () => ({ port, readTerminalProof: vi.fn(async () => true) }),
       coordination: coordination(), durableWaitPort: waitPort, enabled: true }))
     const results = []
     for (let step = 1; step <= 9; step += 1) results.push(await runtime.checkCompletion(`step-${step}`, candidate))
@@ -203,7 +289,7 @@ describe("canonical native verification runtime composition", () => {
       waitId: "matrix-wait", status: "waiting" as const, deadlineAt: "2099-01-01T00:00:00.000Z", matchedTaskIds: [],
     })) }
     const runtime = configureLegacyProgress(createCanonicalNativeVerificationRuntime({
-      pool: {} as pg.Pool, factory: () => ({ port, readTerminalProof: vi.fn(async () => true) }),
+      pool: steeringLedgerPool(), factory: () => ({ port, readTerminalProof: vi.fn(async () => true) }),
       coordination: current, durableWaitPort: matrixWaitPort, enabled: true,
     }))
     let step = 0
@@ -248,7 +334,7 @@ describe("canonical native verification runtime composition", () => {
       ensureRootGoal: vi.fn(async () => rootSemanticFailure()), readRecoverableGoal: vi.fn(async () => null),
     }
     const factory = vi.fn(() => ({ port, readTerminalProof: vi.fn(async () => true) }))
-    const runtime = configureLegacyProgress(createCanonicalNativeVerificationRuntime({ pool: {} as pg.Pool, factory, coordination: coordination(), durableWaitPort: waitPort, enabled: true }))
+    const runtime = configureLegacyProgress(createCanonicalNativeVerificationRuntime({ pool: steeringLedgerPool(), factory, coordination: coordination(), durableWaitPort: waitPort, enabled: true }))
     const first = await runtime.checkCompletion("step-1", candidate)
     const replay = await runtime.checkCompletion("step-1", candidate)
     const second = await runtime.checkCompletion("step-2", candidate)
@@ -273,7 +359,7 @@ describe("canonical native verification runtime composition", () => {
       ensureChildren: vi.fn(async () => ({ status: "passed" as const, controlTaskIds: [], pendingControlTaskIds: [], pendingTaskIds: [], feedback: [] })),
       ensureRootGoal: vi.fn(async () => failures[index++] ?? rootSemanticFailure()), readRecoverableGoal: vi.fn(async () => null),
     }
-    const runtime = configureLegacyProgress(createCanonicalNativeVerificationRuntime({ pool: {} as pg.Pool, factory: () => ({ port, readTerminalProof: vi.fn(async () => true) }),
+    const runtime = configureLegacyProgress(createCanonicalNativeVerificationRuntime({ pool: steeringLedgerPool(), factory: () => ({ port, readTerminalProof: vi.fn(async () => true) }),
       coordination: coordination(), durableWaitPort: waitPort, enabled: true }))
     const results = []
     for (let step = 1; step <= 9; step += 1) results.push(await runtime.checkCompletion(`step-${step}`, candidate))
@@ -337,7 +423,7 @@ describe("canonical native verification runtime composition", () => {
       waitId: "matrix-wait", status: "waiting" as const, deadlineAt: "2099-01-01T00:00:00.000Z", matchedTaskIds: [],
     })) }
     const runtime = configureLegacyProgress(createCanonicalNativeVerificationRuntime({
-      pool: {} as pg.Pool, factory: () => ({ port, readTerminalProof: vi.fn(async () => true) }),
+      pool: steeringLedgerPool(), factory: () => ({ port, readTerminalProof: vi.fn(async () => true) }),
       coordination: current, durableWaitPort: matrixWaitPort, enabled: true,
     }))
     let step = 0
@@ -369,7 +455,7 @@ describe("canonical native verification runtime composition", () => {
     const readTerminalProof = vi.fn(async () => true)
     const { factory } = runtimeFactory(readTerminalProof)
     const runtime = createCanonicalNativeVerificationRuntime({
-      pool: {} as pg.Pool, factory, coordination: coordination(), durableWaitPort: waitPort, enabled: true,
+      pool: steeringLedgerPool(), factory, coordination: coordination(), durableWaitPort: waitPort, enabled: true,
     })
     await runtime.checkCompletion("step-1", candidate)
 
@@ -387,7 +473,7 @@ describe("canonical native verification runtime composition", () => {
     const readTerminalProof = vi.fn(async () => true)
     const { factory } = runtimeFactory(readTerminalProof)
     const runtime = createCanonicalNativeVerificationRuntime({
-      pool: {} as pg.Pool, factory, coordination: coordination(), durableWaitPort: waitPort, enabled: true,
+      pool: steeringLedgerPool(), factory, coordination: coordination(), durableWaitPort: waitPort, enabled: true,
     })
     await runtime.checkCompletion("step-1", candidate)
 
@@ -413,7 +499,7 @@ describe("canonical native verification runtime composition", () => {
     const readTerminalProof = vi.fn(async () => true)
     const { factory } = runtimeFactory(readTerminalProof)
     const runtime = createCanonicalNativeVerificationRuntime({
-      pool: {} as pg.Pool, factory, coordination: coordination(), durableWaitPort: waitPort, enabled: true,
+      pool: steeringLedgerPool(), factory, coordination: coordination(), durableWaitPort: waitPort, enabled: true,
     })
     await runtime.checkCompletion("step-1", candidate)
 
@@ -436,7 +522,7 @@ describe("canonical native verification runtime composition", () => {
     }
     const { factory } = runtimeFactory(vi.fn(async () => true))
     const runtime = createCanonicalNativeVerificationRuntime({
-      pool: {} as pg.Pool, factory, coordination: current, durableWaitPort: waitPort, enabled: false,
+      pool: steeringLedgerPool(), factory, coordination: current, durableWaitPort: waitPort, enabled: false,
     })
 
     await expect(runtime.checkCompletion("step-1", candidate)).resolves.toBeNull()

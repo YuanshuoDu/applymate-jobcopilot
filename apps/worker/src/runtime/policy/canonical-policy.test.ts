@@ -46,9 +46,10 @@ describe("canonical root policy", () => {
     expect(createCanonicalPolicy({}, true).evaluate(context(writeTool))).toMatchObject({ outcome: "deny" })
   })
 
-  it("allows planning only when both server gates are enabled", () => {
+  it("allows planning and steering keep only when both server gates are enabled", () => {
     const policy = createCanonicalPolicy({}, true, true)
     expect(policy.evaluate(context(planningTool, ["coordination", "canManageChildren"]))).toMatchObject({ outcome: "allow", reasonCode: "server_task_graph_planning_gate" })
+    expect(policy.evaluate(context({ ...planningTool, name: "agent.reconcile" }, ["coordination", "canManageChildren"]))).toMatchObject({ outcome: "allow", reasonCode: "server_task_graph_planning_gate" })
     for (const policyWithoutBothGates of [createCanonicalPolicy({}, false, true), createCanonicalPolicy({}, true, false)]) {
       expect(policyWithoutBothGates.evaluate(context(planningTool, ["coordination", "canManageChildren"]))).toMatchObject({ outcome: "deny" })
     }

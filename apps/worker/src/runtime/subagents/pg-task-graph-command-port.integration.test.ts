@@ -8,7 +8,13 @@ import type { PgSubagentPool } from "./types.js"
 import { canonicalTaskGraphJson, taskGraphItemId, taskGraphProposalKey } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { assertNoUnresolvedSteering } from "./steering-reconciliation-ledger.js"
+import { transaction } from "./pg-store-persistence.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
+import { buildCognitiveActionAgenda } from "../turns/cognitive-action-agenda.js"
+import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE } from "../turns/cognitive-agenda-receipt.js"
+import type { StepContext } from "../context/step-context-builder.js"
+import { steeringReconciliationIdempotencyKey, STEERING_RECONCILIATION_EVENT_TYPE } from "./steering-reconciliation-contract.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const ANALYST_VERIFICATION = {
@@ -57,10 +63,22 @@ type Fixture = {
   readonly foreignItemId: string
   readonly foreignEventId: string
   readonly foreignOutboxId: string
+  readonly foreignInputId: string
   readonly sessionId: string
   readonly turnId: string
   readonly rootTaskId: string
   readonly stepId: string
+  readonly originStepId: string
+  readonly keepStepId: string
+  readonly laterStepId: string
+  readonly originalInputId: string
+  readonly originalClientMessageId: string
+  readonly firstSteerInputId: string
+  readonly firstSteerClientMessageId: string
+  readonly secondSteerInputId: string
+  readonly secondSteerClientMessageId: string
+  readonly planCallId: string
+  readonly keepCallId: string
   readonly turnLeaseOwner: string
   readonly parentLeaseOwner: string
 }
@@ -77,10 +95,22 @@ function fixture(): Fixture {
     foreignItemId: `p3-task-graph-foreign-item-${suffix}`,
     foreignEventId: `p3-task-graph-foreign-event-${suffix}`,
     foreignOutboxId: `p3-task-graph-foreign-outbox-${suffix}`,
+    foreignInputId: `p3-task-graph-foreign-input-${suffix}`,
     sessionId: `p3-task-graph-session-${suffix}`,
     turnId: `p3-task-graph-turn-${suffix}`,
     rootTaskId: `p3-task-graph-root-${suffix}`,
     stepId: `p3-task-graph-step-${suffix}`,
+    originStepId: `p3-task-graph-origin-step-${suffix}`,
+    keepStepId: `p3-task-graph-keep-step-${suffix}`,
+    laterStepId: `p3-task-graph-later-step-${suffix}`,
+    originalInputId: `p3-task-graph-original-input-${suffix}`,
+    originalClientMessageId: `p3-task-graph-original-client-${suffix}`,
+    firstSteerInputId: `p3-task-graph-first-steer-${suffix}`,
+    firstSteerClientMessageId: `p3-task-graph-first-steer-client-${suffix}`,
+    secondSteerInputId: `p3-task-graph-second-steer-${suffix}`,
+    secondSteerClientMessageId: `p3-task-graph-second-steer-client-${suffix}`,
+    planCallId: `p3-task-graph-plan-call-${suffix}`,
+    keepCallId: `p3-task-graph-keep-call-${suffix}`,
     turnLeaseOwner: `p3-turn-owner-${suffix}`,
     parentLeaseOwner: `p3-parent-owner-${suffix}`,
   }
@@ -185,6 +215,10 @@ async function seed(pool: PgPool, value: Fixture): Promise<void> {
     VALUES ($1, 'task_graph.fixture', $2, $3, '{}'::jsonb)`, [
     value.foreignOutboxId, value.foreignSessionId, value.foreignOutboxId,
   ])
+  await pool.query(`INSERT INTO "agent_inputs" ("id", "sessionId", "targetTurnId", "userId", "clientMessageId", "delivery", "status", "content", "acceptedSequence")
+    VALUES ($1, $2, $3, $4, $5, 'steer', 'accepted', '[]'::jsonb, 1)`, [
+    value.foreignInputId, value.foreignSessionId, value.foreignTurnId, value.foreignUserId, `${value.foreignInputId}-client`,
+  ])
 }
 
 async function graphRows(pool: PgPool, value: Fixture): Promise<Record<string, unknown>> {
@@ -206,7 +240,118 @@ function readScope(value: Fixture): TaskGraphReadScope {
   }
 }
 
-const TENANT_TABLES = ["agent_sessions", "agent_turns", "sub_agent_tasks", "agent_steps", "agent_items", "agent_events", "agent_outbox"] as const
+async function nextEventSequence(pool: PgPool, value: Fixture): Promise<bigint> {
+  const result = await pool.query<{ eventSequence: string | bigint }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1
+    WHERE "id" = $1 RETURNING "eventSequence"`, [value.sessionId])
+  const sequence = result.rows[0]?.eventSequence
+  if (sequence === undefined) throw new Error("TaskGraph reconciliation fixture could not allocate an event sequence")
+  return BigInt(sequence)
+}
+
+async function insertReconciliationEvent(pool: PgPool, value: Fixture, event: {
+  readonly id: string; readonly sequence: bigint; readonly type: string; readonly actor: string
+  readonly itemId: string | null; readonly taskId: string | null; readonly correlationId: string
+  readonly idempotencyKey: string; readonly payload: unknown; readonly causationId?: string | null
+}): Promise<void> {
+  await pool.query(`INSERT INTO "agent_events"
+    ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload")
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb)`, [
+    event.id, value.sessionId, value.turnId, event.itemId, event.taskId, event.sequence.toString(), event.type, event.actor,
+    event.correlationId, event.causationId ?? null, event.idempotencyKey, JSON.stringify(event.payload),
+  ])
+}
+
+async function seedReconciliationStep(pool: PgPool, value: Fixture, step: {
+  readonly id: string; readonly ordinal: number; readonly status: "streaming" | "completed"
+  readonly cursor: bigint; readonly consumedInputIds: readonly string[]
+}): Promise<void> {
+  await pool.query(`INSERT INTO "agent_steps"
+    ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
+    VALUES ($1, $2, $3, $4, $5, 1, $6, $7, $8::jsonb, '{}'::jsonb)`, [
+    step.id, value.sessionId, value.turnId, value.rootTaskId, step.ordinal, step.status, step.cursor.toString(), JSON.stringify(step.consumedInputIds),
+  ])
+}
+
+async function seedReconciliationInput(pool: PgPool, value: Fixture, input: {
+  readonly id: string; readonly clientMessageId: string; readonly delivery: "follow_up" | "steer"
+  readonly sequence: bigint; readonly consumedByStepId: string; readonly text: string; readonly disposition: string
+}): Promise<void> {
+  const content = { parts: [{ type: "text", text: input.text }], clientMessageId: input.clientMessageId, source: "user", disposition: input.disposition }
+  const itemId = `${input.id}-message`
+  await pool.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "content", "createdAt", "updatedAt")
+    VALUES ($1, $2, $3, NULL, NULL, 'user_message', 'completed', $4::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, [
+    itemId, value.sessionId, value.turnId, JSON.stringify(content),
+  ])
+  await pool.query(`INSERT INTO "agent_inputs"
+    ("id", "sessionId", "targetTurnId", "userId", "clientMessageId", "delivery", "status", "content", "acceptedSequence", "consumedByStepId", "consumedAt")
+    VALUES ($1, $2, $3, $4, $5, $6, 'consumed', $7::jsonb, $8, $9, CURRENT_TIMESTAMP)`, [
+    input.id, value.sessionId, value.turnId, value.userId, input.clientMessageId, input.delivery,
+    JSON.stringify([{ type: "text", text: input.text }]), input.sequence.toString(), input.consumedByStepId,
+  ])
+  await insertReconciliationEvent(pool, value, {
+    id: `${input.id}-accepted`, sequence: input.sequence, type: "input.accepted", actor: "user", itemId, taskId: null,
+    correlationId: value.turnId, idempotencyKey: `input.accepted:${input.clientMessageId}`,
+    payload: { inputId: input.id, clientMessageId: input.clientMessageId, delivery: input.delivery, source: "user", disposition: input.disposition },
+  })
+}
+
+async function seedAcceptedReconciliationSteer(pool: PgPool, value: Fixture, input: {
+  readonly id: string; readonly clientMessageId: string; readonly sequence: bigint; readonly text: string
+}): Promise<void> {
+  const disposition = "steered", itemId = `${input.id}-message`
+  const content = { parts: [{ type: "text", text: input.text }], clientMessageId: input.clientMessageId, source: "user", disposition }
+  await pool.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "content", "createdAt", "updatedAt")
+    VALUES ($1, $2, $3, NULL, NULL, 'user_message', 'completed', $4::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, [
+    itemId, value.sessionId, value.turnId, JSON.stringify(content),
+  ])
+  await pool.query(`INSERT INTO "agent_inputs" ("id", "sessionId", "targetTurnId", "userId", "clientMessageId", "delivery", "status", "content", "acceptedSequence")
+    VALUES ($1, $2, $3, $4, $5, 'steer', 'accepted', $6::jsonb, $7)`, [
+    input.id, value.sessionId, value.turnId, value.userId, input.clientMessageId,
+    JSON.stringify([{ type: "text", text: input.text }]), input.sequence.toString(),
+  ])
+  await insertReconciliationEvent(pool, value, {
+    id: `${input.id}-accepted`, sequence: input.sequence, type: "input.accepted", actor: "user", itemId, taskId: null,
+    correlationId: value.turnId, idempotencyKey: `input.accepted:${input.clientMessageId}`,
+    payload: { inputId: input.id, clientMessageId: input.clientMessageId, delivery: "steer", source: "user", disposition },
+  })
+}
+
+async function seedReconciliationAgenda(pool: PgPool, value: Fixture, step: {
+  readonly id: string; readonly sequence: bigint; readonly cursor: bigint; readonly planRevision: number
+  readonly consumedInputIds: readonly string[]
+}): Promise<void> {
+  const context: StepContext = { schemaVersion: "agent-harness.v2", sessionId: value.sessionId, turnId: value.turnId,
+    stepId: step.id, inputThroughSequence: step.cursor, consumedInputIds: step.consumedInputIds, blocks: [], canonicalJson: "{}",
+    taskGraphRevision: step.planRevision }
+  const receipt = buildCognitiveAgendaReceipt({ sessionId: value.sessionId, turnId: value.turnId, taskId: value.rootTaskId,
+    stepId: step.id, inputThroughSequence: step.cursor, consumedInputIds: step.consumedInputIds,
+    agenda: buildCognitiveActionAgenda(context) })
+  if (!receipt) throw new Error("TaskGraph reconciliation fixture agenda was invalid")
+  await insertReconciliationEvent(pool, value, {
+    id: `${step.id}-agenda`, sequence: step.sequence, type: COGNITIVE_AGENDA_EVENT_TYPE, actor: "orchestrator",
+    itemId: null, taskId: value.rootTaskId, correlationId: step.id, idempotencyKey: `cognitive.agenda:${step.id}`, payload: receipt,
+  })
+}
+
+async function seedReconciliationToolCall(pool: PgPool, value: Fixture, call: {
+  readonly id: string; readonly stepId: string; readonly toolName: "agent.plan" | "agent.reconcile"
+  readonly input: unknown; readonly sequence: bigint
+}): Promise<void> {
+  const itemId = `${call.id}-item`
+  const content = { toolCallId: call.id, toolName: call.toolName, toolVersion: "1", input: call.input }
+  await pool.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "content", "startedAt", "createdAt", "updatedAt")
+    VALUES ($1, $2, $3, $4, $5, 'tool_call', 'started', $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, [
+    itemId, value.sessionId, value.turnId, call.stepId, value.rootTaskId, JSON.stringify(content),
+  ])
+  await insertReconciliationEvent(pool, value, {
+    id: `${call.id}-started`, sequence: call.sequence, type: "tool_call.started", actor: "orchestrator", itemId,
+    taskId: value.rootTaskId, correlationId: call.id, idempotencyKey: `turn:${value.turnId}:event:tool-started:${call.id}`,
+    // Root Turn lifecycle receipts intentionally omit toolVersion from this event; it remains on the item.
+    payload: { toolCallId: call.id, toolName: call.toolName, taskId: value.rootTaskId },
+  })
+}
+
+const TENANT_TABLES = ["agent_sessions", "agent_turns", "sub_agent_tasks", "agent_steps", "agent_items", "agent_events", "agent_outbox", "agent_inputs"] as const
 const TENANT_POLICIES: ReadonlyArray<readonly [string, string, string]> = [
   ["agent_sessions", "session", `"userId" = public.app_current_user_id()`],
   ["agent_turns", "turn", `"userId" = public.app_current_user_id() AND EXISTS (
@@ -221,6 +366,8 @@ const TENANT_POLICIES: ReadonlyArray<readonly [string, string, string]> = [
     SELECT 1 FROM public."agent_sessions" AS session WHERE session."id" = "sessionId" AND session."userId" = public.app_current_user_id())`],
   ["agent_outbox", "outbox", `EXISTS (
     SELECT 1 FROM public."agent_sessions" AS session WHERE session."id" = "aggregateId" AND session."userId" = public.app_current_user_id())`],
+  ["agent_inputs", "input", `"userId" = public.app_current_user_id() AND EXISTS (
+    SELECT 1 FROM public."agent_sessions" AS session WHERE session."id" = "sessionId" AND session."userId" = public.app_current_user_id())`],
 ]
 
 type SetupState = {
@@ -235,7 +382,7 @@ async function installTaskGraphTenantRls(pool: PgPool, policyPrefix: string, set
     FROM pg_class AS relation WHERE relation.oid = ANY(ARRAY[
       'public."agent_sessions"'::regclass, 'public."agent_turns"'::regclass, 'public."sub_agent_tasks"'::regclass,
       'public."agent_steps"'::regclass, 'public."agent_items"'::regclass, 'public."agent_events"'::regclass,
-      'public."agent_outbox"'::regclass
+      'public."agent_outbox"'::regclass, 'public."agent_inputs"'::regclass
     ])`)
   for (const table of TENANT_TABLES) {
     const row = prior.rows.find(candidate => candidate.tableName === table)
@@ -322,7 +469,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     await adminPool.query(`GRANT USAGE ON SCHEMA public TO "${roleName}"`)
     await installTaskGraphTenantRls(adminPool, policyPrefix, setup)
     await adminPool.query(`GRANT EXECUTE ON FUNCTION public.app_current_user_id() TO "${roleName}"`)
-    await adminPool.query(`GRANT SELECT ON "agent_sessions", "agent_turns", "sub_agent_tasks", "agent_steps", "agent_items", "agent_events", "agent_outbox" TO "${roleName}"`)
+    await adminPool.query(`GRANT SELECT ON "agent_sessions", "agent_turns", "sub_agent_tasks", "agent_steps", "agent_items", "agent_events", "agent_outbox", "agent_inputs" TO "${roleName}"`)
     await adminPool.query(`GRANT UPDATE ("id") ON "agent_turns" TO "${roleName}"`)
     await adminPool.query(`GRANT UPDATE ("id") ON "agent_steps" TO "${roleName}"`)
     await adminPool.query(`GRANT UPDATE ("eventSequence") ON "agent_sessions" TO "${roleName}"`)
@@ -427,6 +574,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
         { table: "agent_items", id: owner.foreignItemId },
         { table: "agent_events", id: owner.foreignEventId },
         { table: "agent_outbox", id: owner.foreignOutboxId },
+        { table: "agent_inputs", id: owner.foreignInputId },
       ]
       for (const { table, id } of foreignRows) {
         const seeded = await adminPool!.query(`SELECT "id" FROM public."${table}" WHERE "id" = $1`, [id])
@@ -523,6 +671,164 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     )
     expect(planEvents.rows).toHaveLength(1)
     expect(beforeReplay.item).toEqual([{ id: taskGraphItemId(owner.rootTaskId), revision: 1 }])
+  }, 60_000)
+
+  it("replays a no-steer revise before ledger preparation and leaves later accepted steer unresolved", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    await seed(adminPool!, value)
+    await adminPool!.query(`UPDATE "sub_agent_tasks" SET "allowedActions" = '["agent.plan"]'::jsonb WHERE "id" = $1`, [value.rootTaskId])
+    await adminPool!.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1`, [value.turnId, JSON.stringify({
+      input: { goal: "Find roles", clientMessageId: value.originalClientMessageId },
+    })])
+
+    await seedReconciliationStep(adminPool!, value, {
+      id: value.originStepId, ordinal: 0, status: "completed", cursor: 1n, consumedInputIds: [value.originalInputId],
+    })
+    const originalSequence = await nextEventSequence(adminPool!, value)
+    await seedReconciliationInput(adminPool!, value, {
+      id: value.originalInputId, clientMessageId: value.originalClientMessageId, delivery: "follow_up",
+      sequence: originalSequence, consumedByStepId: value.originStepId, text: "Complete original user task reference", disposition: "submitted",
+    })
+    await adminPool!.query(`UPDATE "agent_steps" SET "inputThroughSequence" = $2, "consumedInputIds" = $3::jsonb WHERE "id" = $1`, [
+      value.stepId, originalSequence.toString(), JSON.stringify([value.originalInputId]),
+    ])
+    const agendaSequence = await nextEventSequence(adminPool!, value)
+    await seedReconciliationAgenda(adminPool!, value, {
+      id: value.stepId, sequence: agendaSequence, cursor: originalSequence, planRevision: 0, consumedInputIds: [value.originalInputId],
+    })
+    const callSequence = await nextEventSequence(adminPool!, value)
+    const input = scheduleInput(value)
+    const operation = { scope: input.scope, decision: "revise" as const, expectedRevision: 0, callId: value.planCallId, rootInputId: value.originalInputId }
+    await seedReconciliationToolCall(adminPool!, value, {
+      id: value.planCallId, stepId: value.stepId, toolName: "agent.plan", input: input.proposal, sequence: callSequence,
+    })
+
+    const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
+    const accepted = await command.appendAndScheduleWithReconciliation!(input, operation)
+    expect(accepted).toMatchObject({ status: "accepted", revision: 1 })
+    const graphAfterCommit = await graphRows(adminPool!, value)
+    expect((await adminPool!.query(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "type" = $2`, [
+      value.sessionId, STEERING_RECONCILIATION_EVENT_TYPE,
+    ])).rows).toEqual([])
+
+    const laterSequence = await nextEventSequence(adminPool!, value)
+    await seedAcceptedReconciliationSteer(adminPool!, value, {
+      id: value.secondSteerInputId, clientMessageId: value.secondSteerClientMessageId,
+      sequence: laterSequence, text: "Keep the newly accepted requirement pending",
+    })
+    await expect(command.appendAndScheduleWithReconciliation!(input, operation)).resolves.toEqual({ ...accepted, status: "duplicate" })
+    expect(await graphRows(adminPool!, value)).toEqual(graphAfterCommit)
+    expect((await adminPool!.query(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "type" = $2`, [
+      value.sessionId, STEERING_RECONCILIATION_EVENT_TYPE,
+    ])).rows).toEqual([])
+    expect((await adminPool!.query(`SELECT "status", "consumedByStepId" FROM "agent_inputs" WHERE "id" = $1`, [value.secondSteerInputId])).rows)
+      .toEqual([{ status: "accepted", consumedByStepId: null }])
+    await expect(transaction(restrictedTransactionPool(commandPool!, roleName, value.userId), client =>
+      assertNoUnresolvedSteering(client, readScope(value)))).rejects.toThrow("steering_reconciliation_pending")
+  }, 60_000)
+
+  it("commits planner revise and keep receipts atomically, replaying only before a later Step consumes fresh steer", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    await seed(adminPool!, value)
+    await adminPool!.query(`UPDATE "sub_agent_tasks" SET "allowedActions" = '["agent.plan"]'::jsonb WHERE "id" = $1`, [value.rootTaskId])
+    await adminPool!.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1`, [value.turnId, JSON.stringify({
+      input: { goal: "Find roles", clientMessageId: value.originalClientMessageId },
+    })])
+
+    await seedReconciliationStep(adminPool!, value, {
+      id: value.originStepId, ordinal: 0, status: "completed", cursor: 1n, consumedInputIds: [value.originalInputId],
+    })
+    const originalSequence = await nextEventSequence(adminPool!, value)
+    expect(originalSequence).toBe(1n)
+    await seedReconciliationInput(adminPool!, value, {
+      id: value.originalInputId, clientMessageId: value.originalClientMessageId, delivery: "follow_up",
+      sequence: originalSequence, consumedByStepId: value.originStepId, text: "Complete original user task reference", disposition: "submitted",
+    })
+    const firstSteerSequence = await nextEventSequence(adminPool!, value)
+    await adminPool!.query(`UPDATE "agent_steps" SET "inputThroughSequence" = $2, "consumedInputIds" = $3::jsonb WHERE "id" = $1`, [
+      value.stepId, firstSteerSequence.toString(), JSON.stringify([value.originalInputId, value.firstSteerInputId]),
+    ])
+    await seedReconciliationInput(adminPool!, value, {
+      id: value.firstSteerInputId, clientMessageId: value.firstSteerClientMessageId, delivery: "steer",
+      sequence: firstSteerSequence, consumedByStepId: value.stepId, text: "Please also compare remote roles", disposition: "steered",
+    })
+    const planAgendaSequence = await nextEventSequence(adminPool!, value)
+    await seedReconciliationAgenda(adminPool!, value, {
+      id: value.stepId, sequence: planAgendaSequence, cursor: firstSteerSequence, planRevision: 0,
+      consumedInputIds: [value.originalInputId, value.firstSteerInputId],
+    })
+    const planCallSequence = await nextEventSequence(adminPool!, value)
+    const input = scheduleInput(value)
+    const planOperation = {
+      scope: input.scope, decision: "revise" as const, expectedRevision: 0, callId: value.planCallId, rootInputId: value.originalInputId,
+    }
+    await seedReconciliationToolCall(adminPool!, value, {
+      id: value.planCallId, stepId: value.stepId, toolName: "agent.plan", input: input.proposal, sequence: planCallSequence,
+    })
+
+    const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
+    const accepted = await command.appendAndScheduleWithReconciliation!(input, planOperation)
+    expect(accepted).toMatchObject({ status: "accepted", revision: 1 })
+    const firstReceipt = await adminPool!.query<{ id: string; payload: unknown }>(`SELECT "id", "payload" FROM "agent_events"
+      WHERE "sessionId" = $1 AND "type" = $2 ORDER BY "sequence"`, [value.sessionId, STEERING_RECONCILIATION_EVENT_TYPE])
+    expect(firstReceipt.rows).toHaveLength(1)
+    const receiptPayload = firstReceipt.rows[0]!.payload as { steerInputIds?: string[] }
+    expect(receiptPayload.steerInputIds).toEqual([value.firstSteerInputId])
+    expect(JSON.stringify(receiptPayload)).not.toContain("Please also compare remote roles")
+    expect((await adminPool!.query(`SELECT "id" FROM "agent_outbox" WHERE "idempotencyKey" = $1`, [
+      `agent-event:${firstReceipt.rows[0]!.id}`,
+    ])).rows).toEqual([])
+    const acceptedCounts = await graphRows(adminPool!, value)
+
+    await commandPool!.end()
+    commandPool = new PgPool({ connectionString: databaseUrl!, max: 1 })
+    const reopened = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool, roleName, value.userId))
+    await expect(reopened.appendAndScheduleWithReconciliation!(input, planOperation)).resolves.toEqual({ ...accepted, status: "duplicate" })
+    expect(await graphRows(adminPool!, value)).toEqual(acceptedCounts)
+    expect((await adminPool!.query(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "type" = $2`, [
+      value.sessionId, STEERING_RECONCILIATION_EVENT_TYPE,
+    ])).rows).toHaveLength(1)
+
+    const secondSteerSequence = await nextEventSequence(adminPool!, value)
+    await seedReconciliationStep(adminPool!, value, {
+      id: value.keepStepId, ordinal: 2, status: "streaming", cursor: secondSteerSequence,
+      consumedInputIds: [value.originalInputId, value.firstSteerInputId, value.secondSteerInputId],
+    })
+    await seedReconciliationInput(adminPool!, value, {
+      id: value.secondSteerInputId, clientMessageId: value.secondSteerClientMessageId, delivery: "steer",
+      sequence: secondSteerSequence, consumedByStepId: value.keepStepId, text: "Keep the plan and retain this requirement", disposition: "steered",
+    })
+    const keepAgendaSequence = await nextEventSequence(adminPool!, value)
+    await seedReconciliationAgenda(adminPool!, value, {
+      id: value.keepStepId, sequence: keepAgendaSequence, cursor: secondSteerSequence, planRevision: 1,
+      consumedInputIds: [value.originalInputId, value.firstSteerInputId, value.secondSteerInputId],
+    })
+    const keepCallSequence = await nextEventSequence(adminPool!, value)
+    await seedReconciliationToolCall(adminPool!, value, {
+      id: value.keepCallId, stepId: value.keepStepId, toolName: "agent.reconcile",
+      input: { decision: "keep", expectedRevision: 1 }, sequence: keepCallSequence,
+    })
+
+    await expect(reopened.appendAndScheduleWithReconciliation!(input, planOperation)).rejects.toThrow("steering_reconciliation_cursor_invalid")
+    expect(await graphRows(adminPool!, value)).toEqual(acceptedCounts)
+    const rawRootPlan = { ...input, scope: { ...input.scope, stepId: value.keepStepId }, proposal: { ...input.proposal, expectedRevision: 1 } }
+    await expect(reopened.appendAndSchedule(rawRootPlan)).rejects.toThrow("steering_reconciliation_pending")
+    expect(await graphRows(adminPool!, value)).toEqual(acceptedCounts)
+    const keep = await reopened.reconcileSteering!({
+      scope: { ...input.scope, stepId: value.keepStepId }, decision: "keep", expectedRevision: 1,
+      callId: value.keepCallId, rootInputId: value.originalInputId,
+    })
+    expect(keep).toEqual({ decision: "keep", revision: 1, reconciledInputCount: 1 })
+    const receipts = await adminPool!.query<{ id: string; type: string; payload: unknown }>(`SELECT "id", "type", "payload" FROM "agent_events"
+      WHERE "sessionId" = $1 AND "type" = $2 ORDER BY "sequence"`, [value.sessionId, STEERING_RECONCILIATION_EVENT_TYPE])
+    expect(receipts).toHaveLength(2)
+    expect((receipts.rows[1]!.payload as { steerInputIds?: string[] }).steerInputIds).toEqual([value.secondSteerInputId])
+    expect((await adminPool!.query(`SELECT "id" FROM "agent_outbox" WHERE "idempotencyKey" = ANY($1::text[])`, [
+      receipts.rows.map(row => `agent-event:${row.id}`),
+    ])).rows).toEqual([])
+    expect((await reopened.readCurrent(readScope(value))).revision).toBe(1)
   }, 60_000)
 
   it("recovers an expired TaskGraph child lease across fresh Worker stores without losing or duplicating receipts", async () => {

@@ -15,6 +15,11 @@ import { loadScopedTaskGraphDependencyContext } from "./task-graph-pg-dependency
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 
 const { verifyEvidenceMock, resultDigestMock } = vi.hoisted(() => ({ verifyEvidenceMock: vi.fn(), resultDigestMock: vi.fn(() => "d".repeat(64)) }))
+const { assertNoUnresolvedSteeringMock } = vi.hoisted(() => ({ assertNoUnresolvedSteeringMock: vi.fn() }))
+vi.mock("./steering-reconciliation-ledger.js", async importOriginal => ({
+  ...await importOriginal<typeof import("./steering-reconciliation-ledger.js")>(),
+  assertNoUnresolvedSteering: assertNoUnresolvedSteeringMock,
+}))
 vi.mock("./task-graph-pg-verification.js", () => ({
   TASK_GRAPH_VERIFIER_VERSION: "agent-harness.v2.task-graph-verifier.v1",
   verifyTaskGraphNodeEvidence: verifyEvidenceMock,
@@ -602,6 +607,30 @@ describe("PgSubagentTaskStore", () => {
     expect(taskInsert).toContain('"maxAttempts", "updatedAt")')
     expect(taskInsert).toContain("$19, CURRENT_TIMESTAMP)")
     expect(fake.calls.map(([sql]) => sql)).toContain("COMMIT")
+  })
+
+  it("blocks fallback Root create and atomic spawn before task or outbox writes when steering is unresolved", async () => {
+    const pending = new Error("steering_reconciliation_pending")
+    for (const mode of ["create", "createWithSpawn"] as const) {
+      const fake = fakePool(sql => {
+        if (sql.includes('SELECT root."allowedActions"')) return { rows: [{ allowedActions: ["agent.plan"], rootLeaseOwner: "worker-1", rootAttemptCount: 1, turnLeaseOwner: "worker-1", turnLeaseVersion: 3 }], rowCount: 1 }
+        if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1 }
+        return {}
+      })
+      assertNoUnresolvedSteeringMock.mockReset().mockRejectedValueOnce(pending)
+      const store = new PgSubagentTaskStore(fake.pool)
+      const spec = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "root-1",
+        role: "scout" as const, taskType: "test", goal: "inspect", policy }
+      const action = mode === "create" ? store.create(spec) : store.createWithSpawn({ ...spec, spawnIdempotencyKey: "spawn-pending" })
+      await expect(action).rejects.toThrow("steering_reconciliation_pending")
+      expect(assertNoUnresolvedSteeringMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
+        turnLeaseOwner: "worker-1", turnLeaseVersion: 3, parentLeaseOwner: "worker-1", parentAttemptCount: 1,
+      }))
+      expect(fake.calls.some(([sql]) => sql.startsWith('INSERT INTO "sub_agent_tasks"'))).toBe(false)
+      expect(fake.calls.some(([sql]) => sql.startsWith('INSERT INTO "agent_outbox"'))).toBe(false)
+      expect(fake.calls.map(([sql]) => sql)).toContain("ROLLBACK")
+    }
   })
 
   it("replays an existing spawn key before parent fan-out validation", async () => {

@@ -18,8 +18,8 @@ import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE, cognitiveAgen
 import { executeTools, hasFreshSteering, recoverPersistedToolCalls, rememberSteeringMarkers } from "./turn-execution-tools.js"
 import { completeTurnCandidate } from "./turn-execution-final-candidate.js"
 import { isPreparedQuestionRetryError, nativeQuestionCallId, PreparedQuestionRetryError, recoverPendingNativeQuestion } from "./turn-execution-question.js"
+import { completionRecoverySnapshot } from "./turn-execution-completion-gate.js"
 const DEFAULT_MAX_STEPS = 32
-function taskGraphRecoverySnapshot(snapshot: TurnExecutionOptions["snapshot"], stepId: string, feedback: string): TurnExecutionOptions["snapshot"] { return { ...snapshot, system: [...snapshot.system, { id: `task-graph-recovery:${stepId}`, content: `Durable TaskGraph verification blocked completion: ${feedback} Replan or repair the affected criteria, then verify again.` }] } }
 function hasNewlyAcceptedInput(context: StepContext, previouslyConsumedIds: readonly string[]): boolean {
   const previous = new Set(previouslyConsumedIds)
   if (context.consumedInputIds.some(id => !previous.has(id))) return true
@@ -173,7 +173,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
             if (kind === "native_semantic_receipt") receiptClosedSteps.add(step.id)
           } })
         if (outcome.kind === "wait" || outcome.kind === "completed") return outcome.result
-        snapshot = taskGraphRecoverySnapshot(snapshot, step.id, outcome.feedback); continuation = undefined; continue
+        snapshot = completionRecoverySnapshot(snapshot, step.id, outcome.feedback); continuation = undefined; continue
       } catch (error: unknown) {
         if (receiptClosedSteps.has(step.id)) throw error
         if (isPreparedQuestionRetryError(error)) throw error

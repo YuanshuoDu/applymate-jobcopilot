@@ -5,9 +5,10 @@ import type { TurnLease } from "../turns/lease.js"
 import type { PgSubagentPool, SubagentTaskRecord, SubagentTaskStatus } from "./types.js"
 import { rootTaskStatusFromTurnResult } from "./root-task-status.js"
 import { parseInteractiveDiscoveryShortlist, type InteractiveDiscoveryShortlistProjection } from "../interactive-discovery-contract.js"
-import { parseTerminalRootResult, type RootTaskTerminalReconciliation } from "./root-task-terminal-result.js"
+import { parseRootTaskFinishMetadata, parseTerminalRootResult, type RootTaskTerminalReconciliation } from "./root-task-terminal-result.js"
 import { cleanupFailedRootTaskGraph } from "./task-graph-pg-root-failure-cleanup.js"
 import { checkTaskGraphTerminalVerification } from "../turns/turn-execution-completion-gate.js"
+import { assertPlanningRootCanFinish } from "./pg-store-create.js"
 export type RootTaskReconciliation = RootTaskTerminalReconciliation
 export type RootTaskFinishMetadata = Readonly<{ interactiveDiscoveryShortlist: InteractiveDiscoveryShortlistProjection }>
 export type RootTaskStore = {
@@ -172,14 +173,7 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
     async finish(input): Promise<void> {
       const now = input.now ?? new Date()
       const next = rootTaskStatusFromTurnResult(input.result)
-      const discoveryShortlist = input.metadata ? parseInteractiveDiscoveryShortlist(input.metadata.interactiveDiscoveryShortlist) : undefined
-      if (input.metadata && !discoveryShortlist) throw new Error("root_terminal_discovery_shortlist_invalid")
-      if (discoveryShortlist && (input.result.status === "waiting_for_dependency" || input.result.status === "waiting_for_approval" || input.result.status === "waiting_for_user"
-        || (input.result.status === "completed" && discoveryShortlist.status === "failed")
-        || ((input.result.status === "failed" || input.result.status === "interrupted") && discoveryShortlist.status !== "failed"
-          && !(discoveryShortlist.status === "partial" && discoveryShortlist.failures.includes("discovery_runtime_failed"))))) {
-        throw new Error("root_terminal_discovery_status_mismatch")
-      }
+      const discoveryShortlist = parseRootTaskFinishMetadata(input.metadata, input.result.status)
       // A user wait transitions the Turn before this root settlement runs.
       // Keep every other result fenced to the active in-progress state.
       const waitState = input.result.status === "waiting_for_user"
@@ -211,6 +205,7 @@ export function createPgRootTaskStore(pool: PgSubagentPool): RootTaskStore {
             || (discoveryShortlist && JSON.stringify(savedShortlist) !== JSON.stringify(discoveryShortlist))) throw new Error("root_task_terminal_receipt_conflict")
           return
         }
+        if (input.result.status === "completed") await assertPlanningRootCanFinish(client, input.lease, input.rootTaskId)
         const updated = await client.query(
           `UPDATE "sub_agent_tasks" SET "status" = $1, "result" = $2::jsonb,
            "failureReason" = $3, "leaseOwner" = NULL, "leaseExpiresAt" = NULL,

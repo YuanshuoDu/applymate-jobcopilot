@@ -23,7 +23,7 @@ const FALLBACK_POLICY: PolicySnapshot = {
     },
     {
       id: "canonical-root-task-graph-plan",
-      roles: ["orchestrator"], tools: ["agent.plan"], risks: ["internal_write"], domains: ["coordination"], requiredCapabilities: ["coordination", "canManageChildren"],
+      roles: ["orchestrator"], tools: ["agent.plan", "agent.reconcile"], risks: ["internal_write"], domains: ["coordination"], requiredCapabilities: ["coordination", "canManageChildren"],
       outcome: "allow", reasonCode: "server_task_graph_planning_gate", reason: "The server enabled scoped task graph planning",
     },
     {

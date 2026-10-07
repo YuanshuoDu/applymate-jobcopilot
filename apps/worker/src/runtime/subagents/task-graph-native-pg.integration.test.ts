@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { Pool as PgPool } from "pg"
+import { Pool as PgPool, type PoolClient } from "pg"
 
 import { SessionPauseRequestedError } from "../session-gate.js"
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
@@ -11,6 +11,11 @@ import { PgSubagentTaskStore } from "./pg-store.js"
 import { defaultSubagentPolicy } from "./types.js"
 import { parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
+import { buildCognitiveActionAgenda } from "../turns/cognitive-action-agenda.js"
+import { buildCognitiveAgendaReceipt, cognitiveAgendaReceiptIdempotencyKey, COGNITIVE_AGENDA_EVENT_TYPE } from "../turns/cognitive-agenda-receipt.js"
+import type { StepContext } from "../context/step-context-builder.js"
+import { commitTurnTerminal } from "../turns/turn-engine-terminal-commit.js"
+import { checkTaskGraphTerminalVerification } from "../turns/turn-execution-completion-gate.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 function disposableUrl(): string | null {
@@ -254,6 +259,100 @@ describePg("native TaskGraph PostgreSQL command durability", () => {
     expect(rows.rows.every(row => String(row.idempotencyKey).includes(":native:") && !String(row.idempotencyKey).includes(":spawn:"))).toBe(true)
     expect(await pool!.query(`SELECT "id" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch' AND "aggregateId" = $1`, [ids.session]))
       .toMatchObject({ rows: expect.arrayContaining([expect.any(Object), expect.any(Object)]) })
+  }, 60_000)
+
+  it("blocks native Root dispatch when a newly accepted steer is unresolved", async () => {
+    const originalInputId = `native-original-input-${suffix}`, steerId = `native-pending-steer-${suffix}`
+    const originalClientMessageId = `native-root-message-${suffix}`, steerClientMessageId = `native-steer-message-${suffix}`
+    const originalActions = ["jobs.search", "jobs.get"]
+    const graph = await pool!.query<{ revision: number }>(`SELECT "revision" FROM "agent_items" WHERE "id" = $1`, [taskGraphItemId(ids.root)])
+    const revision = Number(graph.rows[0]?.revision ?? 0)
+    const context: StepContext = { schemaVersion: "agent-harness.v2", sessionId: ids.session, turnId: ids.turn, stepId: ids.step,
+      inputThroughSequence: 0n, consumedInputIds: [], taskGraphRevision: revision, canonicalJson: "{}", blocks: [] }
+    const agenda = buildCognitiveAgendaReceipt({ sessionId: ids.session, turnId: ids.turn, taskId: ids.root, stepId: ids.step,
+      inputThroughSequence: 0n, consumedInputIds: [], agenda: buildCognitiveActionAgenda(context) })
+    const agendaKey = cognitiveAgendaReceiptIdempotencyKey(ids.step)
+    if (!agenda || !agendaKey) throw new Error("pending-steering agenda fixture is invalid")
+    const acceptedEventId = `native-steer-accepted-${suffix}`, stepCompletedEventId = `native-step-completed-${suffix}`
+    try {
+      await pool!.query(`UPDATE "sub_agent_tasks" SET "allowedActions" = $2::jsonb WHERE "id" = $1`, [ids.root, JSON.stringify(["agent.plan", ...originalActions])])
+      await pool!.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1`, [ids.turn, JSON.stringify({ clientMessageId: originalClientMessageId })])
+      const terminalLease = { turnId: ids.turn, sessionId: ids.session, ownerId: ids.turnOwner, userId: ids.user,
+        leaseVersion: 1, leaseStartedAt: new Date(), leaseExpiresAt: new Date(Date.now() + 60_000) }
+      const passingGraphGuard = async (client: PoolClient) => checkTaskGraphTerminalVerification(client, terminalLease, ids.root, true)
+      const witnessClient = await pool!.connect()
+      try {
+        await witnessClient.query("BEGIN")
+        await witnessClient.query("SELECT set_config('app.user_id', $1, true)", [ids.user])
+        // This confirms the persisted graph gate accepts its trusted server-side native-pass input;
+        // this fixture does not run a model verifier or claim a provider-generated proof.
+        expect(await passingGraphGuard(witnessClient)).toEqual({ ok: true })
+        await witnessClient.query("ROLLBACK")
+      } finally {
+        await witnessClient.query("ROLLBACK").catch(() => undefined)
+        witnessClient.release()
+      }
+      await pool!.query(`INSERT INTO "agent_inputs" ("id", "sessionId", "targetTurnId", "userId", "clientMessageId", "delivery", "status", "content", "acceptedSequence", "consumedByStepId", "consumedAt")
+        VALUES ($1, $2, $3, $4, $5, 'follow_up', 'consumed', $6::jsonb, 0, $10, CURRENT_TIMESTAMP), ($7, $2, $3, $4, $8, 'steer', 'accepted', $9::jsonb, 0, NULL, NULL)`,
+      [originalInputId, ids.session, ids.turn, ids.user, originalClientMessageId, JSON.stringify([{ type: "text", text: "Original request" }]),
+        steerId, steerClientMessageId, JSON.stringify([{ type: "text", text: "Please also compare contract roles" }]), ids.step])
+      const acceptedSequence = (await pool!.query<{ eventSequence: string | bigint }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1
+        WHERE "id" = $1 RETURNING "eventSequence"`, [ids.session])).rows[0]?.eventSequence
+      if (acceptedSequence === undefined) throw new Error("could not allocate accepted steer sequence")
+      await pool!.query(`UPDATE "agent_inputs" SET "acceptedSequence" = $2 WHERE "id" = $1`, [steerId, acceptedSequence])
+      await pool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "content", "startedAt", "completedAt", "updatedAt")
+        VALUES ($1, $2, $3, NULL, NULL, 'user_message', 'completed', $4::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+      [acceptedEventId, ids.session, ids.turn, JSON.stringify({ parts: [{ type: "text", text: "Please also compare contract roles" }],
+        clientMessageId: steerClientMessageId, source: "user", disposition: "steered" })])
+      await pool!.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload")
+        VALUES ($1, $2, $3, $4, NULL, $5, 'input.accepted', 'user', $3, $6, $7::jsonb)`,
+      [acceptedEventId, ids.session, ids.turn, acceptedEventId, acceptedSequence, `input.accepted:${steerId}`,
+        JSON.stringify({ inputId: steerId, clientMessageId: steerClientMessageId, delivery: "steer", source: "user", disposition: "steered" })])
+      const agendaSequence = (await pool!.query<{ eventSequence: string | bigint }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1
+        WHERE "id" = $1 RETURNING "eventSequence"`, [ids.session])).rows[0]?.eventSequence
+      if (agendaSequence === undefined) throw new Error("could not allocate agenda sequence")
+      await pool!.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload")
+        VALUES ($1, $2, $3, NULL, $4, $5, $6, 'orchestrator', $7, $8, $9::jsonb)`,
+      [`native-agenda-event-${suffix}`, ids.session, ids.turn, ids.root, agendaSequence, COGNITIVE_AGENDA_EVENT_TYPE, ids.step, agendaKey, JSON.stringify(agenda)])
+      const before = await pool!.query<{ children: number; dispatches: number; nativeEvents: number }>(`SELECT
+        (SELECT COUNT(*)::int FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "parentTaskId" = $2) AS children,
+        (SELECT COUNT(*)::int FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch') AS dispatches,
+        (SELECT COUNT(*)::int FROM "agent_events" WHERE "sessionId" = $1 AND "payload"->>'kind' = 'native_command') AS "nativeEvents",
+        (SELECT COUNT(*)::int FROM "agent_items" WHERE "id" = $3) AS "finalItems",
+        (SELECT COUNT(*)::int FROM "agent_events" WHERE "sessionId" = $1 AND "type" = 'turn.completed') AS "completedEvents",
+        (SELECT "status" FROM "agent_turns" WHERE "id" = $4) AS "turnStatus"`, [ids.session, ids.root, `native-final-${suffix}`, ids.turn])
+      await expect(command().appendNativeCoordination!(spawn("pending-steer-" + suffix))).rejects.toThrow("steering_reconciliation_pending")
+      await pool!.query(`UPDATE "agent_steps" SET "status" = 'completed', "completedAt" = CURRENT_TIMESTAMP WHERE "id" = $1`, [ids.step])
+      const stepSequence = (await pool!.query<{ eventSequence: string | bigint }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1
+        WHERE "id" = $1 RETURNING "eventSequence"`, [ids.session])).rows[0]?.eventSequence
+      if (stepSequence === undefined) throw new Error("could not allocate step completion sequence")
+      await pool!.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload")
+        VALUES ($1, $2, $3, NULL, $4, $5, 'step.completed', 'orchestrator', $6, $7, $8::jsonb)`,
+      [stepCompletedEventId, ids.session, ids.turn, ids.root, stepSequence, ids.step, `turn:${ids.turn}:event:step-completed:${ids.step}`,
+        JSON.stringify({ stepId: ids.step, status: "completed", toolCallCount: 0, taskId: ids.root })])
+      await expect(commitTurnTerminal(pool as unknown as Pick<PgPool, "connect">, {
+        owner: { kind: "turn", userId: ids.user, sessionId: ids.session, turnId: ids.turn, taskId: ids.root, rootTaskId: ids.root,
+          ownerId: ids.turnOwner, leaseVersion: 1, leaseExpiresAt: new Date(Date.now() + 60_000) },
+        response: "Should not commit", now: new Date(), stepId: ids.step, finalItemId: `native-final-${suffix}`,
+        finalContent: { parts: [{ type: "text", text: "Should not commit" }] }, stepCount: 1, toolCallCount: 0,
+        usage: { inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0 },
+      }, passingGraphGuard)).rejects.toThrow("steering_reconciliation_pending")
+      const after = await pool!.query(`SELECT
+        (SELECT COUNT(*)::int FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "parentTaskId" = $2) AS children,
+        (SELECT COUNT(*)::int FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch') AS dispatches,
+        (SELECT COUNT(*)::int FROM "agent_events" WHERE "sessionId" = $1 AND "payload"->>'kind' = 'native_command') AS "nativeEvents",
+        (SELECT COUNT(*)::int FROM "agent_items" WHERE "id" = $3) AS "finalItems",
+        (SELECT COUNT(*)::int FROM "agent_events" WHERE "sessionId" = $1 AND "type" = 'turn.completed') AS "completedEvents",
+        (SELECT "status" FROM "agent_turns" WHERE "id" = $4) AS "turnStatus"`, [ids.session, ids.root, `native-final-${suffix}`, ids.turn])
+      expect(after.rows).toEqual(before.rows)
+    } finally {
+      await pool!.query(`DELETE FROM "agent_events" WHERE "sessionId" = $1 AND "id" = ANY($2::text[])`, [ids.session, [acceptedEventId, `native-agenda-event-${suffix}`, stepCompletedEventId]])
+      await pool!.query(`DELETE FROM "agent_items" WHERE "id" = $1`, [acceptedEventId])
+      await pool!.query(`DELETE FROM "agent_inputs" WHERE "id" = ANY($1::text[])`, [[originalInputId, steerId]])
+      await pool!.query(`UPDATE "agent_turns" SET "input" = '{}'::jsonb WHERE "id" = $1`, [ids.turn])
+      await pool!.query(`UPDATE "agent_steps" SET "status" = 'streaming', "completedAt" = NULL WHERE "id" = $1`, [ids.step])
+      await pool!.query(`UPDATE "sub_agent_tasks" SET "allowedActions" = $2::jsonb WHERE "id" = $1`, [ids.root, JSON.stringify(originalActions)])
+    }
   }, 60_000)
 
   it("uses terminal same-root follow-up provenance, rejects foreign and malformed sources, and honors pause fences", async () => {
