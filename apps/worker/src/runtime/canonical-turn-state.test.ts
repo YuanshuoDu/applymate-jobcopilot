@@ -36,6 +36,10 @@ function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unk
   const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
     if (sql.includes('SELECT active_turn."createdAt"')) return { rows: [{ createdAt: new Date("2026-10-07T00:00:00.000Z") }], rowCount: 1 }
     if (sql.includes('SELECT prior."id"')) return { rows: rows.priorTurns ?? [], rowCount: rows.priorTurns?.length ?? 0 }
+    if (sql.includes('SELECT "id" FROM "agent_turns"') && sql.includes('"rootTaskId"')) {
+      const owned = rows.turn && rows.turn.rootTaskId === values?.[3]
+      return { rows: owned ? [{ id: "turn-1" }] : [], rowCount: owned ? 1 : 0 }
+    }
     if (sql.includes('FROM "agent_items" AS question')) return { rows: rows.priorQuestions ?? [], rowCount: rows.priorQuestions?.length ?? 0 }
     if (sql.includes('FROM "agent_items" AS call')) return { rows: rows.priorCalls ?? [], rowCount: rows.priorCalls?.length ?? 0 }
     if (sql.includes('FROM "agent_steps" AS step')) return { rows: rows.priorSteps ?? [], rowCount: rows.priorSteps?.length ?? 0 }
@@ -43,6 +47,7 @@ function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unk
     if (sql.includes('"input"') && sql.includes('FROM "agent_turns"')) return { rows: rows.turn ? [{ id: "turn-1", sessionId: "session-1", userId: "user-1", status: "in_progress", leaseOwnerId: lease.ownerId, leaseVersion: lease.leaseVersion, leaseExpiresAt: lease.leaseExpiresAt, ...rows.turn }] : [], rowCount: rows.turn ? 1 : 0 }
     if (sql.includes('MAX("ordinal")')) return { rows: [{ maxOrdinal: Math.max(...(rows.steps ?? []).map(step => Number(step.ordinal ?? -1)), -1) }], rowCount: 1 }
     if (sql.includes('FROM "agent_steps"')) return { rows: (rows.steps ?? []).filter(step => step.taskId === undefined || step.taskId === null || step.taskId === values?.[2]), rowCount: rows.steps?.length ?? 0 }
+    if (sql.includes('FROM "agent_events"') && sql.includes('"idempotencyKey" = ANY')) return { rows: [], rowCount: 0 }
     if (sql.includes('FROM "agent_events"') && sql.includes('event."itemId" = ANY')) {
       const result = values?.[1] === "prior-turn" ? rows.priorQuestionEvents ?? [] : rows.questionEvents ?? []
       return { rows: result, rowCount: result.length }
@@ -192,12 +197,16 @@ describe("loadCanonicalTurnState", () => {
       { id: "agent-question:question-item:question", content: { role: "assistant", type: "question", question: "Continue?", options: [{ label: "Yes", value: "yes" }] } },
       { id: "agent-question:question-item:answer", content: { role: "user", type: "answer", questionId: "question-1", text: "yes" } },
     ])
+    expect(value.snapshot.planningClarifications).toEqual([])
     const [questionQuery, eventQuery] = fake.client.query.mock.calls.filter(([sql]) => typeof sql === "string" && (sql.includes('item."type" = \'question\'') || sql.includes('event."itemId" = ANY'))).map(([sql]) => sql)
     expect(questionQuery).toContain('session."userId" = $3')
     expect(questionQuery).toContain('turn."userId" = $3')
     expect(questionQuery).toContain('(item."taskId" IS NULL OR item."taskId" = $4)')
     expect(eventQuery).toContain('(event."taskId" IS NULL OR event."taskId" = $4)')
     expect(eventQuery).toContain("'question.answered'")
+    const orderedToolItemsQuery = fake.client.query.mock.calls.find(([sql]) => typeof sql === "string" && sql.includes("'tool_call', 'tool_result'"))?.[0]
+    expect(orderedToolItemsQuery).toContain('ORDER BY "createdAt" ASC, "id" ASC')
+    expect(value.snapshot).not.toHaveProperty("planningClarificationHistoryPair")
   })
 
   it("restores a complete earlier root answer after compaction as untrusted model history without replacing the current goal", async () => {

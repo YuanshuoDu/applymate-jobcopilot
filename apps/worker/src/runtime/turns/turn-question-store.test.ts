@@ -4,6 +4,12 @@ import { SessionPauseRequestedError, OPEN_SESSION, SESSION_WORK_ADMISSION } from
 import { TurnQuestionStoreError, type TurnQuestionIntentEnvelope } from "./turn-question-contract.js"
 import { createPgTurnQuestionStore } from "./turn-question-store.js"
 import { questionId, questionItemId, type TurnQuestionPool } from "./turn-question-store-guards.js"
+import { appendTurnQuestionPlanningObservation, prepareTurnQuestionPlanningObservation } from "./turn-question-planning-store.js"
+import { readTurnQuestionPlanningWait } from "./turn-question-planning-history.js"
+import type { TurnQuestionPlanningReceipt } from "./turn-question-planning-contract.js"
+
+vi.mock("./turn-question-planning-store.js", () => ({ prepareTurnQuestionPlanningObservation: vi.fn(), appendTurnQuestionPlanningObservation: vi.fn() }))
+vi.mock("./turn-question-planning-history.js", () => ({ readTurnQuestionPlanningWait: vi.fn() }))
 
 const now = new Date("2026-10-06T10:00:00.000Z")
 const owner: TurnExecutionOwnerFence = {
@@ -47,6 +53,9 @@ type FixtureOptions = {
 }
 
 function fixture(options: FixtureOptions = {}): Fixture {
+  vi.mocked(prepareTurnQuestionPlanningObservation).mockReset().mockResolvedValue(null)
+  vi.mocked(appendTurnQuestionPlanningObservation).mockReset().mockResolvedValue(undefined)
+  vi.mocked(readTurnQuestionPlanningWait).mockReset().mockResolvedValue(null)
   const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
   let sequence = 0
   let stepStatus = options.stepStatus ?? "streaming"
@@ -66,6 +75,7 @@ function fixture(options: FixtureOptions = {}): Fixture {
       if (sql.includes(SESSION_WORK_ADMISSION)) return options.pauseAdmission ? { rows: [], rowCount: 0 } : { rows: [{ id: owner.sessionId }], rowCount: 1 }
       if (sql.includes('SELECT session."id" FROM "agent_sessions" AS session')) return { rows: [{ id: owner.sessionId }], rowCount: 1 }
       if (sql.includes('SELECT turn."id"')) return { rows: [{ id: owner.turnId, status: options.turnStatus ?? "in_progress", revision: 7 }], rowCount: 1 }
+      if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ allowedActions: [], leaseOwner: owner.ownerId, attemptCount: 1 }], rowCount: 1 }
       if (sql.includes('FROM "agent_items" AS callItem')) return { rows: [{
         stepId, ordinal: 1, stepStatus, stepErrorCode, finishReason: stepFinishReason, inputTokens: stepInputTokens, outputTokens: stepOutputTokens,
         estimatedCostUsd: stepCost, callItemId: "call-item-1", resultCount: options.hasResult === false ? 0 : 1,
@@ -171,8 +181,45 @@ describe("PostgreSQL native question store", () => {
     const f = fixture({ turnStatus: "waiting_for_user", stepStatus: "waiting_for_user", itemStatus: "started",
       itemContent: { waitKind: "question", questionId: id, toolCallId, stage: "user_input", question: intent.question, options: intent.options, answer: null, answerAvailable: false } })
     await expect(f.store.waitForQuestion({ owner, stepId, toolCallId, now })).resolves.toMatchObject({ status: "waiting_for_user", disposition: "replayed", nextTurnRevision: 7 })
+    expect(readTurnQuestionPlanningWait).toHaveBeenCalledWith(f.client, { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId },
+      { stepId, toolCallId, waitId: id, questionItemId: questionItemId(id) })
     expect(f.calls.some(call => call.sql.includes('INSERT INTO "agent_items"') || call.sql.includes('UPDATE "agent_turns"')
       || call.sql.includes('INSERT INTO "agent_events"') || call.sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
+  })
+
+  it("appends a prepared planning observation only after the wait and lifecycle events are written", async () => {
+    const f = fixture()
+    const waitId = questionId(owner, stepId, toolCallId)
+    const prepared: TurnQuestionPlanningReceipt = { schemaVersion: "agent-harness.v2.plan-clarification.v1", sessionId: owner.sessionId,
+      turnId: owner.turnId, rootTaskId: owner.rootTaskId, stepId, toolCallId, waitId, questionItemId: questionItemId(waitId),
+      observedPlanRevision: null, graphRevisionAtAsk: 0, pendingSteers: [], inputCheckpoint: { throughSequence: "0", consumedInputIds: [] } }
+    vi.mocked(prepareTurnQuestionPlanningObservation).mockResolvedValue(prepared)
+    vi.mocked(appendTurnQuestionPlanningObservation).mockImplementation(async () => { f.calls.push({ sql: "planning clarification receipt", values: [] }) })
+    await f.store.waitForQuestion({ owner, stepId, toolCallId, now })
+    const questionInsert = f.calls.findIndex(call => call.sql.includes('INSERT INTO "agent_items"'))
+    const turnWait = f.calls.findIndex(call => call.sql.includes('UPDATE "agent_turns" SET "status"'))
+    const itemStarted = f.calls.findIndex(call => call.values?.[6] === "item.started")
+    const observation = f.calls.findIndex(call => call.sql === "planning clarification receipt")
+    expect(vi.mocked(prepareTurnQuestionPlanningObservation).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(appendTurnQuestionPlanningObservation).mock.invocationCallOrder[0]!)
+    expect(observation).toBeGreaterThan(Math.max(questionInsert, turnWait, itemStarted))
+    expect(appendTurnQuestionPlanningObservation).toHaveBeenCalledWith(f.client, prepared, owner.userId)
+  })
+
+  it("rolls the complete question wait back when appending its planning observation fails", async () => {
+    const f = fixture()
+    const waitId = questionId(owner, stepId, toolCallId)
+    const prepared: TurnQuestionPlanningReceipt = { schemaVersion: "agent-harness.v2.plan-clarification.v1", sessionId: owner.sessionId,
+      turnId: owner.turnId, rootTaskId: owner.rootTaskId, stepId, toolCallId, waitId, questionItemId: questionItemId(waitId),
+      observedPlanRevision: null, graphRevisionAtAsk: 0, pendingSteers: [], inputCheckpoint: { throughSequence: "0", consumedInputIds: [] } }
+    const error = new Error("planning observation append failed")
+    vi.mocked(prepareTurnQuestionPlanningObservation).mockResolvedValue(prepared)
+    vi.mocked(appendTurnQuestionPlanningObservation).mockRejectedValue(error)
+    await expect(f.store.waitForQuestion({ owner, stepId, toolCallId, now })).rejects.toBe(error)
+    expect(f.calls.some(call => call.sql.includes('INSERT INTO "agent_items"'))).toBe(true)
+    expect(f.calls.some(call => call.sql.includes('UPDATE "agent_steps" SET "status"'))).toBe(true)
+    expect(f.calls.some(call => call.sql.includes('UPDATE "agent_turns" SET "status"'))).toBe(true)
+    expect(f.calls.filter(call => call.sql === "ROLLBACK")).toHaveLength(1)
+    expect(f.calls.filter(call => call.sql === "COMMIT")).toHaveLength(0)
   })
 
   it.each([

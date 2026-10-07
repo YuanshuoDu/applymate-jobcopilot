@@ -58,6 +58,13 @@ describe("V2 transcript projector", () => {
     })).toThrow("private_native_verification_event_not_projectable")
   })
 
+  it("rejects direct transcript projection of private planning receipts", () => {
+    expect(() => projectV2EventToTranscript({
+      ...baseEvent, type: "agent.plan.clarification", itemId: null,
+      payload: { pendingSteers: [{ id: "private-steer-id" }], rationale: "private clarification receipt" },
+    })).toThrow("private_native_verification_event_not_projectable")
+  })
+
   it.each(goldenCases)("keeps $flow golden transcript semantics stable", ({ flow, legacy }) => {
     const projected = projectV2EventToTranscript({
       ...baseEvent,
@@ -98,7 +105,7 @@ describe("V2 transcript projector", () => {
     expect(tx.$queryRaw).toHaveBeenCalledTimes(2)
   })
 
-  it("omits private native verification receipts during transcript rebuild", async () => {
+  it("omits private verification and planning receipts during transcript rebuild", async () => {
     const privateEvent = {
       ...baseEvent, id: "private-event", itemId: null, taskId: "private-control-task",
       type: "native_verification.requested",
@@ -108,10 +115,15 @@ describe("V2 transcript projector", () => {
       ...baseEvent, id: "ordinary-event",
       payload: { legacy: { type: "job_results", speaker: "Analyst", title: "Jobs", body: "N26", data: { jobs: 1 } } },
     }
+    const clarificationEvent = {
+      ...baseEvent, id: "private-clarification-event", itemId: null,
+      type: "agent.plan.clarification",
+      payload: { pendingSteerIds: ["private-steer-id"], rationale: "private clarification receipt" },
+    }
     const transcriptCreate = vi.fn(async ({ data }: { data: Record<string, unknown> }) => ({ data }))
     const tx = {
       $queryRaw: vi.fn().mockResolvedValue([{ id: "session_1" }]),
-      agentEvent: { findMany: vi.fn().mockResolvedValue([privateEvent, ordinaryEvent]) },
+      agentEvent: { findMany: vi.fn().mockResolvedValue([privateEvent, clarificationEvent, ordinaryEvent]) },
       agentTranscriptEvent: {
         findMany: vi.fn().mockResolvedValue([]),
         create: transcriptCreate,
@@ -124,6 +136,8 @@ describe("V2 transcript projector", () => {
     expect(transcriptCreate).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ body: "N26" }),
     }))
-    expect(JSON.stringify(transcriptCreate.mock.calls)).not.toContain("private-")
+    expect(JSON.stringify(transcriptCreate.mock.calls)).not.toContain("private-event")
+    expect(JSON.stringify(transcriptCreate.mock.calls)).not.toContain("private-clarification-event")
+    expect(JSON.stringify(transcriptCreate.mock.calls)).not.toContain("private-steer-id")
   })
 })

@@ -44,6 +44,12 @@ function client(itemRows: Row[] = [item()], eventRows: Row[] = events(), rootOnl
       const rows = owned ? [{ createdAt: new Date("2026-10-07T00:00:00.000Z") }] : []
       return { rows, rowCount: rows.length }
     }
+    if (sql.includes('SELECT "id" FROM "agent_turns"') && sql.includes('"rootTaskId" = $4')) {
+      const owned = values[0] === lease.turnId && values[1] === lease.sessionId && values[2] === lease.userId && values[3] === rootTaskId
+      const rows = owned ? [{ id: lease.turnId }] : []
+      return { rows, rowCount: rows.length }
+    }
+    if (sql.includes('event."idempotencyKey" = ANY($2::text[])')) return { rows: [] }
     if (sql.includes('SELECT prior."id", prior."createdAt", root."id" AS "rootTaskId"')) return { rows: [], rowCount: 0 }
     return { rows: sql.includes('FROM "agent_items"')
       ? rootOnly ? itemRows.filter(row => row.taskId === rootTaskId) : itemRows : eventRows }

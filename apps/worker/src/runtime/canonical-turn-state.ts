@@ -12,7 +12,8 @@ import { consumeDurableWaitOutcomes } from "./subagents/durable-wait-consumer.js
 import { restoreCanonicalSteeringMarkers, priorConversation, type SteeringMarkerState } from "./canonical-steering-markers.js"
 import { STEERING_MARKER_EVENT_TYPE } from "./context/steering-marker.js"
 import { COGNITIVE_AGENDA_EVENT_TYPE, parseCognitiveAgendaReceipt, type CognitiveAgendaReceipt } from "./turns/cognitive-agenda-receipt.js"
-import { recoverAnsweredQuestionHistory } from "./question-answer-recovery.js"
+import { recoverAnsweredQuestionContext } from "./question-answer-recovery.js"
+import { mergeCanonicalTurnQuestionContext } from "./canonical-turn-question-context.js"
 
 export type CanonicalTurnState = {
   readonly scope: TenantScope
@@ -127,7 +128,7 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     )
     const itemsResult = await client.query<Row>(
       `SELECT "id", "stepId", "taskId", "type", "status", "revision", "content" FROM "agent_items" WHERE "turnId" = $1 AND "sessionId" = $2
-       AND ("taskId" IS NULL OR "taskId" = $3) AND "type" IN ('tool_call', 'tool_result') ORDER BY "createdAt" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId],
+       AND ("taskId" IS NULL OR "taskId" = $3) AND "type" IN ('tool_call', 'tool_result') ORDER BY "createdAt" ASC, "id" ASC`, [lease.turnId, lease.sessionId, turn.rootTaskId],
     )
     const eventsResult = await client.query<Row>(
       `SELECT event."id", event."type", event."actor", event_session."userId" AS "userId", event."sessionId", event."turnId", event."taskId", event."sequence", event."payload"
@@ -200,12 +201,12 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
         if (right.sequence === null) return -1
         return left.sequence < right.sequence ? -1 : left.sequence > right.sequence ? 1 : left.id.localeCompare(right.id)
       })
-    const questionHistory = await recoverAnsweredQuestionHistory(client, { lease, rootTaskId, steps: stepsResult.rows, toolItems: itemsResult.rows, existingHistory: snapshot.steerHistory })
-    const seenHistory = new Set(snapshot.steerHistory.map(item => item.id))
+    const recoveredQuestions = await recoverAnsweredQuestionContext(client, { lease, rootTaskId, steps: stepsResult.rows,
+      toolItems: itemsResult.rows, existingHistory: snapshot.steerHistory, maxQuestions: 64 })
+    snapshot = mergeCanonicalTurnQuestionContext({ snapshot, priorHistory: history, recovered: recoveredQuestions })
     snapshot = {
       ...snapshot,
       goal: { id: `turn-goal:${lease.turnId}`, content: goal },
-      steerHistory: [...snapshot.steerHistory, ...history.filter(item => !seenHistory.has(item.id)).map(({ sequence: _sequence, ...item }) => item), ...questionHistory],
       toolObservations: [...snapshot.toolObservations, ...restoredNew, ...consumedWaits.filter(item => !seenWithRestored.has(item.id))],
     }
     const steps = stepsResult.rows

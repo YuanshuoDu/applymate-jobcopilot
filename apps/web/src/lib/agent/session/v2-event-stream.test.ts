@@ -113,7 +113,7 @@ describe("V2 agent event stream", () => {
     })
     const visible = {
       id: "ordinary-event", sessionId: "session_1", turnId: "turn_1", itemId: "ordinary-item",
-      taskId: "ordinary-task", sequence: BigInt(5), type: "item.completed", actor: "orchestrator",
+      taskId: "ordinary-task", sequence: BigInt(6), type: "item.completed", actor: "orchestrator",
       correlationId: "ordinary-correlation", causationId: null, idempotencyKey: "ordinary-idempotency",
       payload: { text: "ordinary event remains visible" },
     }
@@ -128,7 +128,12 @@ describe("V2 agent event stream", () => {
             privateEvent(BigInt(2), "native_verification.requested", "request"),
             privateEvent(BigInt(3), "native_verification.future.v1", "future"),
           ]
-        : calls === 2 ? [privateEvent(BigInt(4), "agent.plan.reconciliation", "reconciliation")] : [visible]
+        : calls === 2
+          ? [
+              privateEvent(BigInt(4), "agent.plan.reconciliation", "reconciliation"),
+              { ...privateEvent(BigInt(5), "agent.plan.clarification", "clarification"), itemId: null },
+            ]
+          : [visible]
     })
     const pubsub = eventRedis()
     const stream = createV2EventStream(database as never, {
@@ -149,13 +154,14 @@ describe("V2 agent event stream", () => {
       expect(text).toContain("ordinary-task")
       expect(text).not.toContain("native_verification.")
       expect(text).not.toContain("agent.plan.reconciliation")
+      expect(text).not.toContain("agent.plan.clarification")
       expect(text).not.toContain(marker)
       expect(text).not.toContain("private-event-")
       expect(text).not.toContain("private-item-")
       expect(text).not.toContain("private-task-")
       expect(text).not.toContain("private-step-")
       expect(text).not.toContain("private-idempotency-")
-      expect(cursors).toEqual([BigInt(0), BigInt(3), BigInt(4)])
+      expect(cursors).toEqual([BigInt(0), BigInt(3), BigInt(5)])
     } finally {
       controller.abort()
       await reader.cancel()
@@ -180,6 +186,9 @@ describe("V2 agent event stream", () => {
     const privateReconciliationEnvelope = {
       ...privateEnvelope, id: "private-reconciliation-event", type: "agent.plan.reconciliation",
     }
+    const privateClarificationEnvelope = {
+      ...privateEnvelope, id: "private-clarification-event", type: "agent.plan.clarification",
+    }
     const visibleEnvelope = {
       schemaVersion: "agent-harness.v2", id: "ordinary-delta-event", sessionId: "session_1",
       turnId: "turn_1", itemId: "ordinary-item", taskId: "ordinary-task", type: "item.snapshot",
@@ -192,8 +201,8 @@ describe("V2 agent event stream", () => {
     const disconnect = vi.fn()
     const connection: AgentStreamRedis = {
       xread: vi.fn()
-        .mockResolvedValueOnce([["agent:session:session_1:deltas", [entry("1-0", privateEnvelope), entry("2-0", privateReconciliationEnvelope)]]])
-        .mockResolvedValueOnce([["agent:session:session_1:deltas", [entry("3-0", visibleEnvelope)]]])
+        .mockResolvedValueOnce([["agent:session:session_1:deltas", [entry("1-0", privateEnvelope), entry("2-0", privateReconciliationEnvelope), entry("3-0", privateClarificationEnvelope)]]])
+        .mockResolvedValueOnce([["agent:session:session_1:deltas", [entry("4-0", visibleEnvelope)]]])
         .mockImplementation(() => new Promise(resolve => {
           if (controller.signal.aborted) return resolve(null)
           controller.signal.addEventListener("abort", () => resolve(null), { once: true })
@@ -208,12 +217,14 @@ describe("V2 agent event stream", () => {
     try {
       const text = new TextDecoder().decode((await reader.read()).value)
       expect(text).toContain("event: item.snapshot")
-      expect(text).toContain('"streamId":"3-0"')
+      expect(text).toContain('"streamId":"4-0"')
       expect(text).toContain("ordinary transient event remains visible")
       expect(text).not.toContain("native_verification.")
       expect(text).not.toContain("agent.plan.reconciliation")
+      expect(text).not.toContain("agent.plan.clarification")
       expect(text).not.toContain(marker)
       expect(text).not.toContain("private-delta-event")
+      expect(text).not.toContain("private-clarification-event")
       expect(text).not.toContain("private-item")
       expect(text).not.toContain("private-task")
       expect(text).not.toContain("private-step")
@@ -222,7 +233,7 @@ describe("V2 agent event stream", () => {
         1, "COUNT", "64", "BLOCK", "1", "STREAMS", "agent:session:session_1:deltas", "$",
       )
       expect(connection.xread).toHaveBeenNthCalledWith(
-        2, "COUNT", "64", "BLOCK", "1", "STREAMS", "agent:session:session_1:deltas", "2-0",
+        2, "COUNT", "64", "BLOCK", "1", "STREAMS", "agent:session:session_1:deltas", "3-0",
       )
     } finally {
       controller.abort()
