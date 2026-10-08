@@ -4,6 +4,7 @@ import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 
 import { commitTurnTerminal } from "./turn-engine-terminal-commit.js"
 import { SessionPauseRequestedError } from "../session-gate.js"
+import { tagTaskGraphRepairRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
 
 const { assertNoUnresolvedSteeringMock } = vi.hoisted(() => ({ assertNoUnresolvedSteeringMock: vi.fn() }))
 vi.mock("../subagents/steering-reconciliation-ledger.js", async importOriginal => ({
@@ -344,11 +345,23 @@ describe("atomic Turn terminal commit", () => {
 
   it("surfaces a TaskGraph race denial as a same-Turn recovery receipt", async () => {
     const fake = makePool()
-    const guard = vi.fn(async () => ({ ok: false as const, blocker: "task_graph_verification_unverified", feedback: "TaskGraph criteria remain unresolved." }))
-    await expect(commitTurnTerminal(fake.pool, input, guard)).rejects.toMatchObject({
-      name: "TaskGraphVerificationRecovery", blocker: "task_graph_verification_unverified", feedback: "TaskGraph criteria remain unresolved.",
+    const feedback = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing. issue=verification_report nodeOrdinal=2 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing"
+    const decision = { ok: false as const, blocker: "task_graph_verification_unverified", feedback }
+    Object.defineProperty(decision, TASK_GRAPH_RECOVERY_REVISION, { value: 41 })
+    const guard = vi.fn(async () => decision)
+    let recoveryError: unknown
+    try { await commitTurnTerminal(fake.pool, input, guard) } catch (error: unknown) { recoveryError = error }
+    expect(recoveryError).toMatchObject({
+      name: "TaskGraphVerificationRecovery", blocker: "task_graph_verification_unverified", feedback,
     })
+    expect(recoveryError && typeof recoveryError === "object" ? Reflect.get(recoveryError, "recoveryFeedback") : undefined)
+      .toBe(tagTaskGraphRepairRecovery(feedback, 41))
+    expect(JSON.stringify(recoveryError)).not.toContain("task-graph-repair-recovery.v1:")
+    expect(JSON.stringify(recoveryError)).not.toContain("graphRevision")
     expect(fake.calls.some(({ sql }) => /INSERT INTO "agent_(items|events|outbox)"|UPDATE "(sub_agent_tasks|agent_turns)"/.test(sql))).toBe(false)
+    expect(fake.items.size).toBe(0)
+    expect(fake.events.size).toBe(0)
+    expect(fake.outboxes.size).toBe(0)
     expect(fake.calls.some(({ sql }) => sql === "ROLLBACK")).toBe(true)
   })
 
