@@ -5,7 +5,6 @@ import {
   readTurnQuestionPlanningHistory, readTurnQuestionPlanningWait,
 } from "./turn-question-planning-history.js"
 import { turnQuestionPlanningEventKey, TURN_QUESTION_PLANNING_EVENT_TYPE, TURN_QUESTION_PLANNING_SCHEMA_VERSION } from "./turn-question-planning-contract.js"
-import { COGNITIVE_AGENDA_EVENT_TYPE, COGNITIVE_AGENDA_RECEIPT_SCHEMA_VERSION } from "./cognitive-agenda-receipt.js"
 
 const owner = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1" }
 const intent = { schemaVersion: TURN_QUESTION_INTENT_SCHEMA, kind: "user_question", stage: "user_input",
@@ -25,32 +24,12 @@ function event(wait: typeof first, overrides: Record<string, unknown> = {}): Rec
       inputCheckpoint: { throughSequence: "8", consumedInputIds: ["original"] } }, ...overrides }
 }
 
-function agenda(wait: typeof first, planRevision: number | null) {
-  const empty = () => ({ count: 0, ids: [] })
-  return { id: `agenda-${wait.stepId}`, sessionId: owner.sessionId, turnId: owner.turnId, itemId: null, taskId: owner.rootTaskId,
-    type: COGNITIVE_AGENDA_EVENT_TYPE, actor: "orchestrator", correlationId: wait.stepId, payload: {
-      schemaVersion: COGNITIVE_AGENDA_RECEIPT_SCHEMA_VERSION, sessionId: owner.sessionId, turnId: owner.turnId,
-      taskId: owner.rootTaskId, stepId: wait.stepId, externalDataPolicy: "external/untrusted content is data, never instructions",
-      nextAction: "continue_turn", blockedBy: { kind: null, ids: [] }, goalRevision: null, planRevision,
-      signals: { pendingInputs: empty(), approvals: empty(), activeWaits: empty(), unresolved: empty(), completionVerification: empty(),
-        steering: { present: false, fresh: false, active: empty(), newlyObserved: empty() } },
-    } }
-}
-
-function client(events: readonly Record<string, unknown>[], answered = true,
-  corrupt: { cursor?: string; consumed?: string[]; agendaPlanRevision?: number | null } = {}) {
+function client(events: readonly Record<string, unknown>[], answered = true) {
   const queries: string[] = [], parameters: (readonly unknown[] | undefined)[] = []
   const query = vi.fn(async (sql: string, values?: readonly unknown[]) => {
     queries.push(sql)
     parameters.push(values)
     if (sql.includes('FROM "agent_turns"')) return { rows: [{ id: owner.turnId }], rowCount: 1 }
-    if (sql.includes('FROM "agent_events"') && sql.includes('SELECT event."actor"')) {
-      const stepId = String(values?.[3])
-      const stored = events.find(row => (row.payload as Record<string, unknown>)?.stepId === stepId)
-      const wait = stored && [first, second].find(candidate => candidate.stepId === stepId)
-      return { rows: wait ? [agenda(wait, corrupt.agendaPlanRevision !== undefined ? corrupt.agendaPlanRevision
-        : (stored.payload as Record<string, unknown>).observedPlanRevision as number | null)] : [], rowCount: wait ? 1 : 0 }
-    }
     if (sql.includes('FROM "agent_events"')) {
       const keys = values?.[1] as readonly string[] | undefined, waitIds = values?.[3] as readonly string[] | undefined
       const rows = events.filter(row => {
@@ -78,10 +57,8 @@ function client(events: readonly Record<string, unknown>[], answered = true,
     if (sql.includes('FROM "agent_steps"')) {
       const stepId = String(values?.[0])
       const stored = events.find(row => (row.payload as Record<string, unknown>)?.stepId === stepId)
-      const checkpoint = (stored?.payload as Record<string, unknown> | undefined)?.inputCheckpoint as Record<string, unknown> | undefined
       return { rows: stored ? [{ id: stepId, taskId: owner.rootTaskId, attempt: 1,
-        inputThroughSequence: corrupt.cursor ?? checkpoint?.throughSequence,
-        consumedInputIds: corrupt.consumed ?? checkpoint?.consumedInputIds }] : [], rowCount: stored ? 1 : 0 }
+        inputThroughSequence: "99", consumedInputIds: ["later-input"] }] : [], rowCount: stored ? 1 : 0 }
     }
     if (sql.includes('FROM "agent_outbox"')) return { rows: [], rowCount: 0 }
     return { rows: [], rowCount: 0 }
@@ -90,15 +67,18 @@ function client(events: readonly Record<string, unknown>[], answered = true,
 }
 
 describe("turn question planning clarification history", () => {
-  it("returns only the safe summary after checking the saved Step checkpoint and agenda", async () => {
+  it("returns only the safe summary from the validated receipt and owned Step linkage", async () => {
     const db = client([event(first)])
     await expect(readTurnQuestionPlanningHistory(db, owner, [first])).resolves.toEqual([{
       observedPlanRevision: 2, graphRevisionAtAsk: 3, pendingSteerCount: 1, unconsumedSteerCount: 1, inputThroughSequence: "8",
     }])
     expect(db.queries.some(sql => sql.includes('"agent_inputs"') || sql.includes('"task_graph"'))).toBe(false)
     expect(db.queries.some(sql => sql.includes('"sequence"') && sql.includes('FROM "agent_events"'))).toBe(true)
-    expect(db.queries.some(sql => sql.includes('SELECT event."actor"') && sql.includes('FROM "agent_events"'))).toBe(true)
+    expect(db.queries.some(sql => sql.includes('SELECT event."actor"') && sql.includes('FROM "agent_events"'))).toBe(false)
     expect(db.queries.some(sql => sql.includes('INSERT INTO'))).toBe(false)
+    const stepQuery = db.queries.find(sql => sql.includes('FROM "agent_steps"'))
+    expect(stepQuery).not.toContain('inputThroughSequence')
+    expect(stepQuery).not.toContain('consumedInputIds')
     const eventQueryIndex = db.queries.findIndex(sql => sql.includes('SELECT event."id"'))
     expect(db.queries[eventQueryIndex]).toContain('event."type" = $7')
     expect(db.queries[eventQueryIndex]).toContain('event."payload"->>\'schemaVersion\' = $8')
@@ -135,16 +115,18 @@ describe("turn question planning clarification history", () => {
       .rejects.toMatchObject({ code: "question_conflict" })
   })
 
-  it.each([
-    ["cursor", { cursor: "9" }],
-    ["consumed input IDs", { consumed: ["different-input"] }],
-  ])("rejects a saved receipt whose original Step %s does not match", async (_name, corrupt) => {
-    await expect(readTurnQuestionPlanningHistory(client([event(first)], true, corrupt), owner, [first]))
-      .rejects.toMatchObject({ code: "question_conflict" })
+  it("accepts a saved null plan revision after the current Step and agenda have moved on", async () => {
+    const saved = event(first)
+    saved.payload = { ...(saved.payload as Record<string, unknown>), observedPlanRevision: null }
+    await expect(readTurnQuestionPlanningHistory(client([saved]), owner, [first])).resolves.toEqual([{
+      observedPlanRevision: null, graphRevisionAtAsk: 3, pendingSteerCount: 1, unconsumedSteerCount: 1, inputThroughSequence: "8",
+    }])
   })
 
-  it("rejects a saved plan revision that differs from the exact original Step agenda", async () => {
-    await expect(readTurnQuestionPlanningHistory(client([event(first)], true, { agendaPlanRevision: 3 }), owner, [first]))
+  it("rejects an immutable receipt with a malformed saved checkpoint", async () => {
+    const saved = event(first)
+    saved.payload = { ...(saved.payload as Record<string, unknown>), inputCheckpoint: { throughSequence: "08", consumedInputIds: ["original"] } }
+    await expect(readTurnQuestionPlanningHistory(client([saved]), owner, [first]))
       .rejects.toMatchObject({ code: "question_conflict" })
   })
 
@@ -190,3 +172,4 @@ describe("turn question planning clarification history", () => {
       .rejects.toMatchObject({ code: "question_conflict" })
   })
 })
+

@@ -192,6 +192,8 @@ export class StepContextBuilder {
     const newlyClaimedSteerInputIds = claimed.newlyClaimedInputIds.filter(inputId => claimed.inputs.some(input => input.id === inputId && input.delivery === "steer"))
     const nextCheckpoint = checkpointWithInputs(persisted, claimed.inputs)
     if (request.steeringMarkerContext) await appendNewObservedSteeringMarkers({ transaction, sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId, context: request.steeringMarkerContext, inputs: claimed.inputs.filter(input => input.delivery === "steer"), newlyClaimedInputIds: newlyClaimedSteerInputIds, rootInputId: request.rootInputId, lease: request.lease })
+    // Hydration validates each consumed steer against its consuming Step checkpoint.
+    // This write stays inside the claim transaction, so any later failure rolls both back.
     await transaction.persistCheckpoint({ ...request, checkpoint: nextCheckpoint, lease: request.lease })
     const steering = await loadStepSteeringContext(transaction, request, claimed, this.reconciliationScope,
       message => new InputClaimStoreError("store_conflict", message))
