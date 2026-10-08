@@ -18,7 +18,8 @@ if (!record) throw new Error("history fixture record was not projected")
 
 type FixtureOptions = Readonly<{
   stepAttempt?: number; currentJobId?: string; startSequence?: string; terminalSequence?: string
-  sourceRows?: readonly Record<string, unknown>[]; graphRevision?: number; graphContent?: unknown; graphError?: Error
+  terminalEventCount?: number; sourceRows?: readonly Record<string, unknown>[]
+  graphRevision?: number; graphContent?: unknown; graphError?: Error
 }>
 
 function fixture(options: FixtureOptions = {}) {
@@ -34,7 +35,8 @@ function fixture(options: FixtureOptions = {}) {
     turnId: sourceTurnId, taskId: sourceRootTaskId, itemId: "final-old", sequence: options.terminalSequence ?? "80",
     type: "turn.completed", actor: "orchestrator", correlationId: "step-old",
     idempotencyKey: `turn:${sourceTurnId}:event:turn-completed`,
-    payload: { turnId: sourceTurnId, taskId: sourceRootTaskId, finalItemId: "final-old" }, eventCount: 1,
+    payload: { turnId: sourceTurnId, taskId: sourceRootTaskId, finalItemId: "final-old" },
+    eventCount: options.terminalEventCount ?? 1,
   }
   const client = {
     async query(sql: string, values?: readonly unknown[]) {
@@ -58,7 +60,7 @@ function fixture(options: FixtureOptions = {}) {
         input: { selectedJobPreparation: { jobId: options.currentJobId ?? selectedJobId } },
       }] }
       if (sql.includes("event.\"type\" = 'turn.started'")) return { rows: [{ sequence: options.startSequence ?? "200" }] }
-      if (sql.includes("WITH expected AS")) return { rows: [terminal] }
+      if (sql.includes("WITH expected AS")) return { rows: (options.terminalEventCount ?? 1) === 1 ? [terminal] : [] }
       if (sql.includes("FROM unnest($1::text[], $2::text[])")) return { rows: options.sourceRows ? [...options.sourceRows] : [validSource] }
       if (sql.includes('FROM "agent_items" AS item')) {
         if (options.graphError) throw options.graphError
@@ -101,6 +103,17 @@ describe("selected-job history PostgreSQL store", () => {
 
     await expect(test.store.load(test.input)).rejects.toThrow("selected_job_history_current_step_fenced")
     expect(test.queries.some(query => query.sql.includes("FROM unnest"))).toBe(false)
+  })
+
+  it("fails closed for ambiguous terminal events after PostgreSQL aggregates their count", async () => {
+    const test = fixture({ terminalEventCount: 2 })
+
+    await expect(test.store.load(test.input)).resolves.toEqual([])
+    const query = test.queries.find(value => value.sql.includes("WITH expected AS"))?.sql
+    expect(query).toContain('COUNT(*) AS "eventCount"')
+    expect(query).toContain('MIN(event."id") AS "eventId"')
+    expect(query).toContain('counts."eventCount" = 1')
+    expect(query).not.toContain("COUNT(*) OVER")
   })
 
   it("skips same-Turn and other-job retained records before acquiring a database connection", async () => {
@@ -149,3 +162,4 @@ describe("selected-job history PostgreSQL store", () => {
     expect(test.queries.some(query => query.sql === "ROLLBACK")).toBe(true)
   })
 })
+

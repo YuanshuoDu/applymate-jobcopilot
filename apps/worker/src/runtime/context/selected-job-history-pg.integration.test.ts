@@ -29,6 +29,7 @@ const ids = {
   currentStep: `job-history-current-step-${suffix}`, sourceTurn: `job-history-source-turn-${suffix}`,
   sourceRoot: `job-history-source-root-${suffix}`, child: `job-history-source-child-${suffix}`,
   finalItem: `job-history-final-item-${suffix}`, terminalEvent: `job-history-terminal-${suffix}`,
+  duplicateTerminalEvent: `job-history-duplicate-terminal-${suffix}`,
   currentStartEvent: `job-history-current-start-${suffix}`,
 }
 const jobId = `job-${suffix}`
@@ -126,6 +127,14 @@ describePg("selected-job history PostgreSQL source revalidation", () => {
     await expect(store.load(input)).resolves.toEqual([])
     await pool!.query(`UPDATE "agent_events" SET "sequence" = 3 WHERE "id" = $1`, [ids.terminalEvent])
 
+    await pool!.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload")
+      VALUES ($1, $2, $3, $4, $5, 4, 'turn.completed', 'orchestrator', 'source-step-duplicate', NULL, $6, $7::jsonb)`,
+    [ids.duplicateTerminalEvent, ids.session, ids.sourceTurn, ids.finalItem, ids.sourceRoot,
+      `turn:${ids.sourceTurn}:event:turn-completed:duplicate`,
+      JSON.stringify({ turnId: ids.sourceTurn, taskId: ids.sourceRoot, finalItemId: ids.finalItem })])
+    await expect(store.load(input)).resolves.toEqual([])
+    await pool!.query(`DELETE FROM "agent_events" WHERE "id" = $1`, [ids.duplicateTerminalEvent])
+
     await pool!.query(`DELETE FROM "agent_events" WHERE "id" = $1`, [ids.terminalEvent])
     await pool!.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload")
       VALUES ($1, $2, $3, $4, $5, 3, 'turn.completed', 'orchestrator', 'source-step', $6, $7::jsonb)`,
@@ -137,3 +146,4 @@ describePg("selected-job history PostgreSQL source revalidation", () => {
     expect(sequenceAfter.rows).toEqual(sequenceBefore.rows)
   })
 })
+

@@ -165,26 +165,22 @@ async function terminalEvents(client: Client, input: SelectedJobHistoryLoadInput
   if (!unique.length) return new Map()
   const result = await client.query<Row>(`WITH expected AS (
       SELECT * FROM unnest($1::text[], $2::text[]) AS source("turnId", "rootTaskId")
-    ), matched AS (
-      SELECT event."turnId", event."taskId", event."itemId", event."sequence", event."type", event."actor",
-        event."correlationId", event."idempotencyKey", event."payload"
+    ), counts AS (
+      SELECT event."turnId", event."taskId", COUNT(*) AS "eventCount", MIN(event."id") AS "eventId"
       FROM expected JOIN "agent_events" AS event ON event."turnId" = expected."turnId"
         AND event."taskId" = expected."rootTaskId" AND event."sessionId" = $3
       JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
       JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
       WHERE turn."userId" = $4 AND session."userId" = $4
         AND event."type" IN ('turn.completed', 'turn.failed', 'turn.interrupted')
+      GROUP BY event."turnId", event."taskId"
     )
-    SELECT matched.*, COUNT(*) OVER (PARTITION BY matched."turnId", matched."taskId") AS "eventCount"
-    FROM matched`,
+    SELECT event."turnId", event."taskId", event."itemId", event."sequence", event."type", event."actor",
+      event."correlationId", event."idempotencyKey", event."payload", counts."eventCount"
+    FROM counts JOIN "agent_events" AS event ON event."id" = counts."eventId" AND counts."eventCount" = 1`,
   [unique.map(row => row.turnId), unique.map(row => row.rootTaskId), input.lease.sessionId, input.lease.userId])
-  const grouped = new Map<string, Row[]>()
-  for (const row of result.rows) {
-    const key = pair(String(row.turnId), String(row.taskId))
-    grouped.set(key, [...(grouped.get(key) ?? []), row])
-  }
-  return new Map([...grouped].filter(([, events]) => events.length === 1 && Number(events[0]?.eventCount) === 1)
-    .map(([key, events]) => [key, events[0]!]))
+  return new Map(result.rows.filter(row => Number(row.eventCount) === 1)
+    .map(row => [pair(String(row.turnId), String(row.taskId)), row]))
 }
 
 function terminalSequence(row: Row | undefined, source: SourceRow, currentStart: bigint, record: SelectedJobMemoryRecord): bigint | undefined {
@@ -244,3 +240,4 @@ export function createPgSelectedJobHistoryStore(pool: Pool) {
     },
   }
 }
+
