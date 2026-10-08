@@ -9,6 +9,7 @@ import {
   type ModelRouteCandidate,
   type ModelSelectionEvent,
 } from "@jobcopilot/agent-model"
+import { markHarnessRoutedAdapter, runHarnessPreProviderHooks } from "./canonical-turn-runtime-model.js"
 import { createAnthropicAdapter } from "@jobcopilot/agent-model/adapters/anthropic"
 import { createMiniMaxM3Adapter, type MiniMaxAdapterOptions } from "@jobcopilot/agent-model/adapters/minimax"
 import { createOpenAiCompatibleAdapter, type OpenAiCompatibleAdapterOptions } from "@jobcopilot/agent-model/adapters/openai-compatible"
@@ -83,11 +84,11 @@ export function createHarnessModelRuntime(options: HarnessModelRuntimeOptions = 
   }
 
   const primary = registry.resolve(candidates[0].target, candidates[0].requirement)
-  const adapter: ModelAdapter = {
+  const adapter = markHarnessRoutedAdapter({
     id: `harness-router:${primary.profile.provider}:${primary.profile.model}`,
     profile: primary.profile,
     stream: (request) => routeStream(request, registry, candidates, credentialSources, options),
-  }
+  })
   return { adapter, registry, candidates }
 }
 
@@ -99,12 +100,14 @@ async function* routeStream(
   options: HarnessModelRuntimeOptions,
 ): AsyncIterable<ModelStreamEvent> {
   let anyCandidateStreamInvoked = false
+  let preProviderHookFailed = false
   const result = await executeWithModelFallback(registry, candidates, async (candidate, attempt) => {
     const adaptedRequest = requestForAdapter(request, candidate)
     preflightHarnessModelRequest(adaptedRequest, candidate.profile, {
       guaranteedNoProviderAttempt: !anyCandidateStreamInvoked,
       onRequestAdmission: options.onRequestAdmission,
     })
+    await runHarnessPreProviderHooks(adaptedRequest, candidate.profile, () => { preProviderHookFailed = true })
     const events: ModelStreamEvent[] = []
     anyCandidateStreamInvoked = true
     for await (const event of candidate.stream(adaptedRequest)) events.push(event)
@@ -112,10 +115,15 @@ async function* routeStream(
     return { value: normalized, usage: usage(normalized) }
   }, {
     maxReroutes: options.maxReroutes,
-    irreversibleActionStarted: options.irreversibleActionStarted,
+    irreversibleActionStarted: () => preProviderHookFailed || irreversibleActionStarted(options.irreversibleActionStarted),
     onEvent: options.onSelectionEvent,
   })
   yield* result.value
+}
+
+function irreversibleActionStarted(value: HarnessModelRuntimeOptions["irreversibleActionStarted"]): boolean {
+  if (typeof value !== "function") return value === true
+  try { return value() } catch { return true }
 }
 
 function createAdapter(config: AiConfig, options: HarnessModelRuntimeOptions): ModelAdapter {
