@@ -19,4 +19,3 @@ export async function appendCanonicalRootTaskHistory(input: Readonly<{
     ? { ...input.snapshot, toolObservations: [...observations, block] }
     : { ...input.snapshot, toolObservations: observations }
 }
-

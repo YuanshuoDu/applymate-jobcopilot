@@ -84,4 +84,3 @@ describe("root task history projection", () => {
     expect(projectRootTaskHistory([{ ...first, unexpected: "proof" } as unknown as ValidatedRootTaskHistoryOutcome])).toBeUndefined()
   })
 })
-

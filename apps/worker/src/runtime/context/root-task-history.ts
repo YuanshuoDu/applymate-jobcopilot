@@ -162,4 +162,3 @@ export function projectRootTaskHistory(
   if (candidates.some(value => value === null)) return undefined
   return projectCandidates(candidates as Candidate[])
 }
-

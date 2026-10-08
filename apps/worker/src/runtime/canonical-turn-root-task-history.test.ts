@@ -53,4 +53,3 @@ describe("canonical Root task history context", () => {
     await expect(appendCanonicalRootTaskHistory({ snapshot, reader, request })).rejects.toThrow("root_task_history_scope_invalid")
   })
 })
-
