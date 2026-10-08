@@ -104,10 +104,11 @@ export function applyCompletionRecovery(snapshot: StepContextSnapshot, stepId: s
 
 export function retireStaleTaskGraphRepair(snapshot: StepContextSnapshot, trustedGraphRevision: number): StepContextSnapshot {
   const currentId = `${SEED_PREFIX}${trustedGraphRevision}`
-  let latestCurrent = -1, latestNative = -1
+  let latestCurrent = -1, latestNative = -1, latestUnversioned = -1
   snapshot.system.forEach((seed, index) => {
     if (seed.id === currentId) latestCurrent = index
     if (seed.id === `${SEED_PREFIX}native`) latestNative = index
+    if (seed.id === `${SEED_PREFIX}unversioned` && seed.content === GENERIC_FEEDBACK) latestUnversioned = index
   })
   return {
     ...snapshot,
@@ -116,6 +117,7 @@ export function retireStaleTaskGraphRepair(snapshot: StepContextSnapshot, truste
       if (!seed.id.startsWith(SEED_PREFIX)) return true
       const suffix = seed.id.slice(SEED_PREFIX.length)
       if (suffix === "native") return index === latestNative
+      if (suffix === "unversioned") return seed.content === GENERIC_FEEDBACK && index === latestUnversioned
       const revision = suffix === String(trustedGraphRevision) && validRevision(Number(suffix)) ? Number(suffix) : null
       return revision !== null && revision === trustedGraphRevision && index === latestCurrent
     }),

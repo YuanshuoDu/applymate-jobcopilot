@@ -60,15 +60,23 @@ describe("completion recovery context", () => {
 
   it("retires only known stale or legacy recovery seeds after a trusted refresh", () => {
     const current = applyCompletionRecovery(base, "step-current", tagTaskGraphRepairRecovery(feedback, 8))
+    const generic = applyCompletionRecovery(base, "step-generic", tagTaskGraphRepairRecovery(feedback, null)).system[0]!
     const snapshot = { ...current, system: [...current.system,
       { id: "completion-recovery:task-graph:7", content: "stale ordinals" },
-      { id: "completion-recovery:task-graph:unversioned", content: "generic repair" },
+      { id: "completion-recovery:task-graph:unversioned", content: "arbitrary nodeOrdinal=99 private-criterion" },
+      generic,
+      generic,
       { id: "completion-recovery:old-step", content: `Durable TaskGraph verification blocked completion: ${feedback}` },
       { id: "policy:task-graph-note", content: "Durable TaskGraph verification blocked completion: keep me" },
       { id: "steering-reconciliation:turn-1", content: STEERING_RECONCILIATION_FEEDBACK },
     ] }
     const refreshed = retireStaleTaskGraphRepair(snapshot, 9)
-    expect(refreshed.system.map(seed => seed.id)).toEqual(["policy:task-graph-note", "steering-reconciliation:turn-1"])
+    const genericSeeds = refreshed.system.filter(seed => seed.id === "completion-recovery:task-graph:unversioned")
+    expect(refreshed.system.map(seed => seed.id)).toEqual([generic.id, "policy:task-graph-note", "steering-reconciliation:turn-1"])
+    expect(genericSeeds).toEqual([generic])
+    expect(genericSeeds[0]?.content).not.toContain("nodeOrdinal=")
+    expect(genericSeeds[0]?.content).not.toContain("criterionOrdinal=")
+    expect(genericSeeds[0]?.content).not.toContain("private-criterion")
     const duplicateCurrent = retireStaleTaskGraphRepair({ ...base, system: [
       { id: "completion-recovery:task-graph:8", content: "earlier guidance" },
       { id: "completion-recovery:task-graph:8", content: "latest guidance" },
