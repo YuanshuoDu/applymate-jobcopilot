@@ -31,7 +31,8 @@ function accepted(row: ReturnType<typeof input>, patch: Record<string, unknown> 
     acceptedPayload: { inputId: row.id, clientMessageId: row.clientMessageId, delivery: row.delivery, source: "user", disposition: "steered" }, ...patch }
 }
 function fixture(options: { steerStatus?: string; steerConsumer?: string | null; source?: string; actor?: string; checkpointIds?: string[];
-  cursor?: string; rootHint?: string | null; badItem?: boolean; badCorrelation?: boolean; laterDecision?: boolean; freshSteer?: boolean } = {}) {
+  cursor?: string; rootHint?: string | null; badItem?: boolean; badCorrelation?: boolean; laterDecision?: boolean; freshSteer?: boolean;
+  goalOnlyWithoutOriginal?: boolean } = {}) {
   const currentScope = options.laterDecision ? { ...scope, stepId: "later-step" } : scope
   const root = input("original-input", "steer", "consumed", "1", "origin-step")
   root.clientMessageId = "root-client-message"
@@ -73,9 +74,15 @@ function fixture(options: { steerStatus?: string; steerConsumer?: string | null;
     if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")) return { rows: [{ id: scope.turnId }], rowCount: 1 }
     if (sql.includes('FROM "sub_agent_tasks" AS task')) return { rows: [{ id: scope.rootTaskId }], rowCount: 1 }
     if (sql.includes("WITH wall_clock")) return { rows: [{ turnLeaseValid: true, parentLeaseValid: true }], rowCount: 1 }
-    if (sql.includes('SELECT turn."input"')) return { rows: [{ input: { goal: "Find jobs", clientMessageId: "root-client-message" } }], rowCount: 1 }
-    if (sql.includes('FROM "agent_inputs"') && sql.includes('ORDER BY "acceptedSequence", "id"')) return { rows: [root, steer, ...(options.freshSteer ? [freshSteer] : [])], rowCount: options.freshSteer ? 3 : 2 }
-    if (sql.includes('FROM "agent_inputs" AS input')) return { rows: [originalEvent, event, ...(options.freshSteer ? [freshEvent] : [])], rowCount: options.freshSteer ? 3 : 2 }
+    if (sql.includes('SELECT turn."input"')) return { rows: [{ input: options.goalOnlyWithoutOriginal ? { goal: "Find jobs" } : { goal: "Find jobs", clientMessageId: "root-client-message" } }], rowCount: 1 }
+    if (sql.includes('FROM "agent_inputs"') && sql.includes('ORDER BY "acceptedSequence", "id"')) {
+      const inputs = options.goalOnlyWithoutOriginal ? [steer] : [root, steer]
+      return { rows: [...inputs, ...(options.freshSteer ? [freshSteer] : [])], rowCount: inputs.length + (options.freshSteer ? 1 : 0) }
+    }
+    if (sql.includes('FROM "agent_inputs" AS input')) {
+      const events = options.goalOnlyWithoutOriginal ? [event] : [originalEvent, event]
+      return { rows: [...events, ...(options.freshSteer ? [freshEvent] : [])], rowCount: events.length + (options.freshSteer ? 1 : 0) }
+    }
     if (sql.includes('FROM "agent_steps"') && sql.includes('ANY($4::text[])')) {
       if (!sql.includes('"consumedInputIds"') && (values?.[3] as string[] | undefined)?.includes(historicStep.id)) return { rows: [historicStep], rowCount: 1 }
       return { rows: [sourceStep], rowCount: 1 }
@@ -102,6 +109,15 @@ describe("durable steering reconciliation reader", () => {
     expect(state.decisionInputThroughSequence).toBe(20n)
     expect(state.agendaPlanRevision).toBe(1)
     expect(f.calls.some(call => call.sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
+  })
+
+  it("keeps the first steer pending when a goal-only Turn has no original input and the caller hint points at that steer", async () => {
+    const pending = fixture({ goalOnlyWithoutOriginal: true, rootHint: "steer-1", steerStatus: "accepted", steerConsumer: null })
+    const unboundScope = { ...scope, rootInputId: pending.rootHint }
+    const state = await readSteeringReconciliationState(pending.client, unboundScope)
+    expect(state.originalInputId).toBeNull()
+    expect(state.unresolvedInputs).toEqual([{ id: "steer-1", acceptedSequence: 10n, status: "accepted", consumedByStepId: null, consumingOrdinal: null }])
+    await expect(assertNoUnresolvedSteering(pending.client, unboundScope)).rejects.toThrow("steering_reconciliation_pending")
   })
 
   it("does not treat queued follow-ups or correctly attributed non-user steering as obligations", async () => {
