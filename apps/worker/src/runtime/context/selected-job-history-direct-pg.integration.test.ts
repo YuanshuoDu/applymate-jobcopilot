@@ -204,7 +204,7 @@ describePg("direct selected-job history PostgreSQL source validation", () => {
     const input: DirectSelectedJobHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
       rootAttemptCount: 2, stepId: currentStepId, jobId, now: new Date() }
     const newest = interruptedSource, next = failedSource
-    await pool!.query(`UPDATE "agent_events" SET "actor" = 'scout' WHERE "id" = $1`, [`direct-history-terminal-${newest.turnId}`])
+    await pool!.query(`UPDATE "agent_events" SET "actor" = 'system' WHERE "id" = $1`, [`direct-history-terminal-${newest.turnId}`])
     let history = await createPgDirectSelectedJobHistoryStore(pool!).load(input)
     expect(history.some(item => item.sourceTurnId === newest.turnId)).toBe(false)
 
