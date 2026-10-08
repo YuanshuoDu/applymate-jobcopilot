@@ -7,7 +7,6 @@ import {
   type TurnQuestionPlanningReadOwner, type TurnQuestionPlanningSummary,
   type TurnQuestionPlanningReceipt, type TurnQuestionPlanningWaitRef,
 } from "./turn-question-planning-contract.js"
-import { COGNITIVE_AGENDA_EVENT_TYPE, parseCognitiveAgendaReceipt } from "./cognitive-agenda-receipt.js"
 import { steeringReconciliationId, steeringReconciliationSequence } from "../subagents/steering-reconciliation-contract.js"
 
 type Queryable = Pick<pg.PoolClient, "query">
@@ -78,7 +77,7 @@ async function validateQuestionLineage(client: TurnQuestionQueryClient, owner: T
   const unanswered = item.status === "started" && content.answerAvailable === false && content.answer === null
   const closed = (item.status === "failed" || item.status === "interrupted") && content.answerAvailable === false && content.answer === null
   if (answeredOnly ? !answered : !answered && !unanswered && !closed) throw questionConflict(`planning clarification answer ${wait.waitId}`)
-  const step = await client.query<Row>(`SELECT step."id", step."taskId", step."attempt", step."inputThroughSequence", step."consumedInputIds"
+  const step = await client.query<Row>(`SELECT step."id", step."taskId", step."attempt"
     FROM "agent_steps" AS step JOIN "agent_sessions" AS session
     ON session."id" = step."sessionId" AND session."userId" = $5
     JOIN "agent_turns" AS turn ON turn."id" = step."turnId" AND turn."sessionId" = step."sessionId"
@@ -86,35 +85,11 @@ async function validateQuestionLineage(client: TurnQuestionQueryClient, owner: T
     WHERE step."id" = $1 AND step."sessionId" = $2 AND step."turnId" = $3 AND step."taskId" = $4`,
   [wait.stepId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.userId])
   const stepRow = step.rows[0]
-  const cursor = steeringReconciliationSequence(stepRow?.inputThroughSequence)
-  const consumed = objectArray(stepRow?.consumedInputIds)
-  if (step.rows.length !== 1 || !stepRow || stepRow.taskId !== owner.rootTaskId || !Number.isSafeInteger(Number(stepRow.attempt))
-    || Number(stepRow.attempt) < 1 || cursor === null || cursor.toString() !== receipt.inputCheckpoint.throughSequence
-    || !consumed || JSON.stringify(consumed) !== JSON.stringify(receipt.inputCheckpoint.consumedInputIds)) {
-    throw questionConflict(`planning clarification checkpoint ${wait.stepId}`)
+  const attempt = Number(stepRow?.attempt)
+  if (step.rows.length !== 1 || !stepRow || stepRow.id !== wait.stepId || stepRow.taskId !== owner.rootTaskId
+    || !Number.isSafeInteger(attempt) || attempt < 1) {
+    throw questionConflict(`planning clarification step ${wait.stepId}`)
   }
-  const agenda = await client.query<Row>(`SELECT event."actor", event."itemId", event."taskId", event."correlationId", event."payload"
-    FROM "agent_events" AS event JOIN "agent_sessions" AS session ON session."id" = event."sessionId" AND session."userId" = $6
-    JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
-      AND turn."userId" = $6 AND turn."rootTaskId" = $7
-    WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."type" = $5
-      AND event."taskId" = $3 AND event."correlationId" = $4 AND event."itemId" IS NULL
-    ORDER BY event."sequence" DESC LIMIT 2`, [owner.sessionId, owner.turnId, owner.rootTaskId, wait.stepId, COGNITIVE_AGENDA_EVENT_TYPE, owner.userId, owner.rootTaskId])
-  const agendaRow = agenda.rows[0]
-  const parsedAgenda = agendaRow && ["subagent", "orchestrator"].includes(String(agendaRow.actor)) && agendaRow.itemId === null
-    && agendaRow.taskId === owner.rootTaskId && agendaRow.correlationId === wait.stepId
-    ? parseCognitiveAgendaReceipt(agendaRow.payload, { sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.rootTaskId, stepId: wait.stepId }) : null
-  if (agenda.rows.length !== 1 || !parsedAgenda || parsedAgenda.planRevision !== receipt.observedPlanRevision) {
-    throw questionConflict(`planning clarification agenda ${wait.stepId}`)
-  }
-}
-
-function objectArray(value: unknown): string[] | null {
-  let parsed = value
-  if (typeof parsed === "string") { try { parsed = JSON.parse(parsed) as unknown } catch { return null } }
-  if (!Array.isArray(parsed) || parsed.length > 256 || !parsed.every(steeringReconciliationId)
-    || new Set(parsed).size !== parsed.length) return null
-  return parsed as string[]
 }
 
 async function readOne(client: Queryable, owner: TurnQuestionPlanningReadOwner, wait: TurnQuestionPlanningWaitRef,
@@ -164,3 +139,4 @@ export async function readTurnQuestionPlanningHistory(client: Queryable, owner: 
   }
   return summaries
 }
+

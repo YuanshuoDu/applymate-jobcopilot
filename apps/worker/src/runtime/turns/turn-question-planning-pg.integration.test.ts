@@ -491,16 +491,17 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
     }
   })
 
-  it("atomically saves one private planning receipt and replays the original capture after later graph and steering changes", async () => {
+  it("replays the saved receipt after Step checkpoint and agenda changes or disappear", async () => {
     const fixture = await seedFixture(admin!, { name: "plan at wait", pendingSteering: true })
     const store = createQuestionStore(`clarification_wait_${fixture.turnId}`)
     await stageAndCompleteQuestion(runtimePool(writer!, `clarification_prepare_${fixture.turnId}`), fixture)
+    await admin!.query(`UPDATE "agent_events" SET "payload" = jsonb_set("payload", '{planRevision}', 'null'::jsonb) WHERE "id" = $1`, [fixture.agendaEventId])
     const first = await store.waitForQuestion({ owner: fixture.owner, stepId: fixture.stepId, toolCallId: fixture.callId, now: new Date() })
     const row = await planningEvent(admin!, fixture, first.waitId)
     expect(first).toMatchObject({ status: "waiting_for_user", disposition: "created" })
     expect(row.payload).toMatchObject({ schemaVersion: "agent-harness.v2.plan-clarification.v1", sessionId: fixture.sessionId,
       turnId: fixture.turnId, rootTaskId: fixture.rootTaskId, stepId: fixture.stepId, toolCallId: fixture.callId,
-      waitId: first.waitId, questionItemId: first.itemId, observedPlanRevision: 1, graphRevisionAtAsk: 1,
+      waitId: first.waitId, questionItemId: first.itemId, observedPlanRevision: null, graphRevisionAtAsk: 1,
       inputCheckpoint: { throughSequence: fixture.inputCursor.toString(), consumedInputIds: fixture.consumedInputIds },
     })
     expect(row.payload.pendingSteers).toEqual(expect.arrayContaining([
@@ -515,9 +516,15 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
     const outbox = await admin!.query(`SELECT "id" FROM "agent_outbox" WHERE "idempotencyKey" = $1`, [`agent-event:${row.id}`])
     expect(outbox.rows).toHaveLength(0)
 
-    await acceptSteer(fixture, `clarification_later_steer_${fixture.turnId}`, `planning-later-steer-${fixture.turnId}`)
+    const laterSteerId = `planning-later-steer-${fixture.turnId}`
+    const laterSteerSequence = await acceptSteer(fixture, `clarification_later_steer_${fixture.turnId}`, laterSteerId)
+    await admin!.query(`UPDATE "agent_inputs" SET "status" = 'consumed', "consumedByStepId" = $2, "consumedAt" = CURRENT_TIMESTAMP WHERE "id" = $1`,
+      [laterSteerId, fixture.stepId])
+    await admin!.query(`UPDATE "agent_steps" SET "inputThroughSequence" = $2, "consumedInputIds" = $3::jsonb WHERE "id" = $1`,
+      [fixture.stepId, laterSteerSequence, JSON.stringify([...fixture.consumedInputIds, laterSteerId])])
     await admin!.query(`UPDATE "agent_items" SET "revision" = 2, "content" = $2::jsonb WHERE "id" = $1`,
       [fixture.graphItemId, JSON.stringify({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{ key: "later-graph-revision" }] })])
+    await admin!.query(`UPDATE "agent_events" SET "payload" = jsonb_set("payload", '{planRevision}', '99'::jsonb) WHERE "id" = $1`, [fixture.agendaEventId])
     const beforeReplay = await admin!.query<{ sequence: string; eventCount: string }>(`SELECT session."eventSequence" AS "sequence",
       (SELECT COUNT(*)::text FROM "agent_events" WHERE "sessionId" = session."id") AS "eventCount"
       FROM "agent_sessions" AS session WHERE session."id" = $1`, [fixture.sessionId])
@@ -530,9 +537,12 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
     expect(afterReplay.rows).toEqual(beforeReplay.rows)
     await expect(withRuntimeTransaction(runtimePool(writer!, `clarification_read_${fixture.turnId}`), fixture.userId,
       client => readTurnQuestionPlanningWait(client, readOwner(fixture), waitRef(fixture, first.waitId)))).resolves.toMatchObject({
-      observedPlanRevision: 1, graphRevisionAtAsk: 1, pendingSteerCount: 2, unconsumedSteerCount: 1,
+      observedPlanRevision: null, graphRevisionAtAsk: 1, pendingSteerCount: 2, unconsumedSteerCount: 1,
       inputThroughSequence: fixture.inputCursor.toString(),
     })
+    await admin!.query(`DELETE FROM "agent_events" WHERE "id" = $1`, [fixture.agendaEventId])
+    const replayAfterAgendaRemoval = await rebuiltStore.waitForQuestion({ owner: fixture.owner, stepId: fixture.stepId, toolCallId: fixture.callId, now: new Date() })
+    expect(replayAfterAgendaRemoval).toMatchObject({ status: "waiting_for_user", disposition: "replayed", waitId: first.waitId, itemId: first.itemId })
     const foreignFixture = await seedFixture(admin!, { name: "foreign tenant reader" })
     await expect(withRuntimeTransaction(runtimePool(writer!, `clarification_foreign_${fixture.turnId}`), foreignFixture.userId,
       client => readTurnQuestionPlanningWait(client, { ...readOwner(fixture), userId: foreignFixture.userId }, waitRef(fixture, first.waitId))))
@@ -542,32 +552,25 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
       [fixture.sessionId, [fixture.consumedSteerId, fixture.acceptedSteerId, `planning-later-steer-${fixture.turnId}`]])
     expect(statuses.rows.find(input => input.id === fixture.consumedSteerId)).toMatchObject({ status: "consumed", consumedByStepId: fixture.stepId })
     expect(statuses.rows.find(input => input.id === fixture.acceptedSteerId)).toMatchObject({ status: "accepted", consumedByStepId: null })
-    expect(statuses.rows.find(input => input.id === `planning-later-steer-${fixture.turnId}`)).toMatchObject({ status: "accepted", consumedByStepId: null })
+    expect(statuses.rows.find(input => input.id === laterSteerId)).toMatchObject({ status: "consumed", consumedByStepId: fixture.stepId })
     const gates = await admin!.query<{ reconciliations: number; dispatches: number }>(`SELECT
       (SELECT COUNT(*)::int FROM "agent_events" WHERE "sessionId" = $1 AND "type" = 'agent.plan.reconciliation') AS "reconciliations",
       (SELECT COUNT(*)::int FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch') AS "dispatches"`, [fixture.sessionId])
     expect(gates.rows[0]).toEqual({ reconciliations: 0, dispatches: 0 })
   })
 
-  it("rejects saved checkpoint, agenda, malformed, foreign, and duplicate receipt mismatches, while missing legacy receipts replay without backfill", async () => {
+  it("rejects malformed, foreign, and duplicate saved receipts, while missing legacy receipts replay without backfill", async () => {
     const fixture = await seedFixture(admin!, { name: "strict saved receipt" })
     const pool = runtimePool(writer!, `clarification_validate_${fixture.turnId}`)
     const store = createPgTurnQuestionStore(pool)
     await stageAndCompleteQuestion(pool, fixture)
     const wait = await store.waitForQuestion({ owner: fixture.owner, stepId: fixture.stepId, toolCallId: fixture.callId, now: new Date() })
     const ref = waitRef(fixture, wait.waitId)
-    const savedStep = await admin!.query<{ inputThroughSequence: string; consumedInputIds: string[] }>(`SELECT "inputThroughSequence", "consumedInputIds" FROM "agent_steps" WHERE "id" = $1`, [fixture.stepId])
-    const savedAgenda = await admin!.query<{ payload: Record<string, unknown> }>(`SELECT "payload" FROM "agent_events" WHERE "id" = $1`, [fixture.agendaEventId])
     const savedReceipt = await planningEvent(admin!, fixture, wait.waitId)
 
-    await admin!.query(`UPDATE "agent_steps" SET "inputThroughSequence" = "inputThroughSequence" + 1 WHERE "id" = $1`, [fixture.stepId])
+    await admin!.query(`UPDATE "agent_events" SET "payload" = jsonb_set("payload", '{inputCheckpoint,throughSequence}', '"08"'::jsonb) WHERE "id" = $1`, [savedReceipt.id])
     await expect(withRuntimeTransaction(pool, fixture.userId, client => readTurnQuestionPlanningWait(client, readOwner(fixture), ref))).rejects.toThrow()
-    await admin!.query(`UPDATE "agent_steps" SET "inputThroughSequence" = $2, "consumedInputIds" = $3::jsonb WHERE "id" = $1`,
-      [fixture.stepId, savedStep.rows[0]!.inputThroughSequence, JSON.stringify(savedStep.rows[0]!.consumedInputIds)])
-
-    await admin!.query(`UPDATE "agent_events" SET "payload" = jsonb_set("payload", '{planRevision}', '99'::jsonb) WHERE "id" = $1`, [fixture.agendaEventId])
-    await expect(withRuntimeTransaction(pool, fixture.userId, client => readTurnQuestionPlanningWait(client, readOwner(fixture), ref))).rejects.toThrow()
-    await admin!.query(`UPDATE "agent_events" SET "payload" = $2::jsonb WHERE "id" = $1`, [fixture.agendaEventId, JSON.stringify(savedAgenda.rows[0]!.payload)])
+    await admin!.query(`UPDATE "agent_events" SET "payload" = $2::jsonb WHERE "id" = $1`, [savedReceipt.id, JSON.stringify(savedReceipt.payload)])
 
     await admin!.query(`UPDATE "agent_events" SET "payload" = jsonb_set("payload", '{unexpected}', '"private-corruption"'::jsonb) WHERE "id" = $1`, [savedReceipt.id])
     await expect(withRuntimeTransaction(pool, fixture.userId, client => readTurnQuestionPlanningWait(client, readOwner(fixture), ref))).rejects.toThrow()
@@ -833,3 +836,4 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
     expect(after.rows).toHaveLength(0)
   })
 })
+
