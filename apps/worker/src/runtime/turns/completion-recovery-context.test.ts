@@ -32,6 +32,32 @@ describe("completion recovery context", () => {
     expect(latest.system.some(seed => seed.id === "policy:task-graph-note")).toBe(true)
   })
 
+  it("replaces repair guidance after consecutive denials at the same trusted revision", () => {
+    const unrelatedSeeds = [
+      { id: "steering-reconciliation:turn-1", content: STEERING_RECONCILIATION_FEEDBACK },
+      { id: "policy:task-graph-note", content: "Preserve this unrelated policy seed." },
+    ]
+    const businessRefs = [{ id: "owned-job", kind: "job" as const, ownerId: "user-1", summary: "Dublin role" }]
+    const toolObservations = [{ id: "tool-result:evidence-1", content: { status: "completed", output: { evidenceId: "evidence-1" } } }]
+    const snapshot: StepContextSnapshot = { ...base, system: unrelatedSeeds, businessRefs, toolObservations }
+    const first = applyCompletionRecovery(snapshot, "step-1", tagTaskGraphRepairRecovery(feedback, 12))
+    const firstRepair = first.system.find(seed => seed.id === "completion-recovery:task-graph:12")
+    expect(firstRepair?.content).toContain("nodeOrdinal=2 criterionOrdinal=1")
+
+    const latestFeedback = `${feedbackLead} issue=repair_criterion nodeOrdinal=3 criterionOrdinal=2 status=unverified reasonCode=canonical_evidence_ambiguous repair=invalid_report`
+    const latest = applyCompletionRecovery(first, "step-2", tagTaskGraphRepairRecovery(latestFeedback, 12))
+    const currentRepairs = latest.system.filter(seed => seed.id.startsWith("completion-recovery:task-graph:"))
+    expect(currentRepairs).toEqual([{
+      id: "completion-recovery:task-graph:12",
+      content: `Durable TaskGraph verification blocked completion at graph revision 12: ${latestFeedback} These ordinals apply only to this graph revision. Replan or repair the affected criteria, then verify again.`,
+    }])
+    expect(currentRepairs[0]?.content).not.toContain("nodeOrdinal=2")
+    expect(currentRepairs[0]?.content).not.toContain("reasonCode=canonical_evidence_missing")
+    expect(latest.system.filter(seed => !seed.id.startsWith("completion-recovery:task-graph:"))).toEqual(unrelatedSeeds)
+    expect(latest.businessRefs).toBe(businessRefs)
+    expect(latest.toolObservations).toBe(toolObservations)
+  })
+
   it("fails closed for malformed, invalid, and unstamped feedback without echoing it", () => {
     const malformed = "agent-harness.v2.task-graph-repair-recovery.v1:{\"feedback\":\"private instruction\",\"graphRevision\":9}"
     const cases = [
