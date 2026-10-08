@@ -20,6 +20,7 @@ import type { TaskGraphCommandPort, TaskGraphCurrentState, TaskGraphScheduleRece
 import { createUsageAwareModelAdapter } from "./usage-aware-model.js"
 import type { HarnessRequestAdmissionDiagnostic } from "../harness-model-admission.js"
 import type { WorkerUsageAuthorization, WorkerUsageAuthorizationInput, WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
+import { createReadOnlyTools, type ReadToolDataSource } from "../tools/read-tools.js"
 
 const profile = {
   provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false,
@@ -419,6 +420,119 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.finalResponses[0]).toContain("fresh answer for senior Dublin roles")
     expect(root.finalResponses[0]).not.toContain("stale answer from before steering")
     expect(completionGate).toHaveBeenCalledWith(expect.objectContaining({ candidateText: "fresh answer for senior Dublin roles" }))
+  })
+
+  it("retries a failed root read with its failure in context and verifies only the successful retry evidence", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const failedCallId = "root-read-failed"
+    const retryCallId = "root-read-retry"
+    const jobRecord = (id: string, company: string) => ({
+      id, company, role: "Software Engineer", location: "Dublin", status: "saved", score: 8,
+      url: `https://jobs.example.invalid/${id}`, source: "greenhouse", salary: "€70k-€90k",
+      description: "Build reliable software for European customers.", keywords: "TypeScript, Node.js",
+    })
+    let readCount = 0
+    const source: ReadToolDataSource = {
+      searchJobs: async () => ({ jobs: [], page: 1, hasMore: false }),
+      getJob: async (_userId, jobId) => {
+        readCount += 1
+        if (readCount === 1) throw new ToolExecutionError("upstream_unavailable", "Job source is temporarily unavailable", { job: jobRecord("job-failed", "Stale Source") })
+        return jobId === "job-fresh" ? jobRecord("job-fresh", "Fresh Source") : null
+      },
+      retrievePersona: async () => ({ facts: [] }),
+      getBaseResume: async () => ({ resume: null }),
+      getApplicationState: async () => ({ job: null, task: null, approvals: [] }),
+    }
+    const jobReadTool = createReadOnlyTools(source).find(tool => tool.name === "jobs.get")
+    if (!jobReadTool) throw new Error("jobs.get read tool is unavailable")
+    const completionGate = vi.fn(async () => ({ ok: true as const }))
+    let modelCalls = 0
+    const baseModel = root.options.model
+    root.options = {
+      ...root.options,
+      tools: [jobReadTool],
+      expectedEvidence: ["read:job:job-fresh"],
+      completionGate,
+      validateToolArguments: (toolName, input) => {
+        if (toolName !== "jobs.get" || !input || typeof input !== "object" || Array.isArray(input)) return "Only the allowlisted jobs.get read is available"
+        return typeof (input as Record<string, unknown>).jobId === "string" ? true : "jobs.get requires a job ID"
+      },
+      model: {
+        ...baseModel,
+        async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+          root.requests.push(request)
+          modelCalls += 1
+          if (modelCalls === 1) {
+            yield { type: "tool_call_completed", callId: failedCallId, name: "jobs.get", arguments: { jobId: "job-stale" } }
+            yield { type: "completed", finishReason: "tool_calls" }
+            return
+          }
+          if (modelCalls === 2) {
+            yield { type: "tool_call_completed", callId: retryCallId, name: "jobs.get", arguments: { jobId: "job-fresh" } }
+            yield { type: "completed", finishReason: "tool_calls" }
+            return
+          }
+          yield { type: "text_delta", text: "Found the Fresh Source role using the successful retry." }
+          yield { type: "completed", finishReason: "stop" }
+        },
+      },
+      executeTool: async input => {
+        const context: ToolExecutionContext = {
+          scope: input.scope, sessionId: input.sessionId, turnId: input.turnId, stepId: input.stepId,
+          toolCallId: input.call.id, taskId: input.taskId, rootTaskId: input.rootTaskId,
+          actorRole: input.actorRole, remainingTurnSteps: input.remainingTurnSteps,
+          signal: input.signal, capabilities: input.capabilities ?? [], reportProgress: async () => undefined,
+        }
+        try {
+          const output = await jobReadTool.execute(context, input.call.input as { jobId: string })
+          return { id: input.call.id, toolName: input.call.toolName, toolVersion: input.call.toolVersion, status: "completed", output, errorCode: null }
+        } catch (error: unknown) {
+          return {
+            id: input.call.id, toolName: input.call.toolName, toolVersion: input.call.toolVersion, status: "failed",
+            ...(error instanceof ToolExecutionError && error.safeOutput !== undefined ? { output: error.safeOutput } : {}),
+            errorCode: error instanceof ToolExecutionError ? error.code : "tool_execution_failed",
+          }
+        }
+      },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "completed", stepCount: 3, toolCallCount: 2, finalText: "Found the Fresh Source role using the successful retry." })
+    expect(root.requests).toHaveLength(3)
+    expect(root.requests[0]?.tools).toEqual([expect.objectContaining({ name: "jobs.get", risk: "read", capabilities: ["read"] })])
+    const retryContext = JSON.stringify(root.requests[1]?.messages)
+    expect(retryContext).toContain(`"toolUseId":"${failedCallId}"`)
+    expect(retryContext).toContain('"isError":true')
+    expect(retryContext).toContain("job-failed")
+    const finalContext = JSON.stringify(root.requests[2]?.messages)
+    expect(finalContext).toContain(`"toolUseId":"${failedCallId}"`)
+    expect(finalContext).toContain(`"toolUseId":"${retryCallId}"`)
+    expect(finalContext).toContain("job-fresh")
+
+    const failedEvent = root.events.find(event => event.type === "tool_call.failed" && (event.payload as Record<string, unknown> | undefined)?.toolCallId === failedCallId)
+    const retryEvent = root.events.find(event => event.type === "tool_call.completed" && (event.payload as Record<string, unknown> | undefined)?.toolCallId === retryCallId)
+    expect(failedEvent?.payload).toMatchObject({ toolCallId: failedCallId, status: "failed", errorCode: "upstream_unavailable" })
+    expect(root.events.indexOf(retryEvent!)).toBeGreaterThan(root.events.indexOf(failedEvent!))
+    const failedResultEvent = root.events.find(event => {
+      if (event.type !== "item.completed" || !event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) return false
+      const content = (event.payload as Record<string, unknown>).content
+      return Boolean(content && typeof content === "object" && !Array.isArray(content)
+        && (content as Record<string, unknown>).toolCallId === failedCallId
+        && Object.prototype.hasOwnProperty.call(content, "output"))
+    })
+    expect(failedResultEvent?.payload).toMatchObject({
+      status: "completed",
+      content: { toolCallId: failedCallId, errorCode: "upstream_unavailable", output: { job: { id: "job-failed" } } },
+    })
+
+    expect(completionGate).toHaveBeenCalledOnce()
+    expect(completionGate).toHaveBeenCalledWith(expect.objectContaining({ rootTaskId: "root-1", candidateText: "Found the Fresh Source role using the successful retry." }))
+    const finalResponse = JSON.parse(root.finalResponses[0]!.slice("root-1:".length)) as { evidenceRefs: string[] }
+    expect(finalResponse.evidenceRefs).toContain("read:job:job-fresh")
+    expect(finalResponse.evidenceRefs).not.toContain(failedCallId)
+    expect(finalResponse.evidenceRefs).not.toContain("read:job:job-failed")
+    expect(root.events.some(event => event.type === "turn.completed")).toBe(true)
   })
 
   it("finishes the Turn once after atomic terminal commit without a same-Turn follow-up step", async () => {

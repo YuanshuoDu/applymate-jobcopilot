@@ -6,6 +6,10 @@ function observation(toolName: string, output: unknown, callId = toolName): { id
   return { id: `tool-result:${callId}`, content: { toolCallId: callId, toolName, input: {}, status: "completed", output, errorCode: null } }
 }
 
+function failedObservation(toolName: string, output: unknown, callId: string): { id: string; content: Record<string, unknown> } {
+  return { id: `tool-result:${callId}`, content: { toolCallId: callId, toolName, input: {}, status: "failed", output, errorCode: "tool_execution_failed" } }
+}
+
 function snapshot(observations: readonly { id: string; content: Record<string, unknown> }[]) {
   return { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: observations }
 }
@@ -27,10 +31,12 @@ describe("candidate final verifier", () => {
       { id: "read:resume:resume-1", status: "verified" },
     ]))
     expect(evidence.some(entry => entry.id === "read:job:job-3" || entry.id === "read:job:job-4")).toBe(false)
+    expect(evidence).toContainEqual({ id: "jobs.search", status: "verified" })
+    expect(evidence).toContainEqual({ id: "jobs.get", status: "verified" })
     expect(verifyCandidateFinal({ goal: "Find a role", candidate: { text: "Done", finishReason: "stop", evidenceRefs: ["read:job:job-1"] }, evidence })).toMatchObject({ ok: true })
   })
 
-  it("fails closed for malformed, cyclic, oversized, and foreign shaped read output while retaining call evidence", () => {
+  it("retains successful invocation evidence when read output is malformed", () => {
     const cyclic: Record<string, unknown> = { jobs: [{ id: "cyclic-job" }] }
     cyclic.self = cyclic
     const cases: readonly [string, unknown][] = [
@@ -41,9 +47,62 @@ describe("candidate final verifier", () => {
     ]
     for (const [name, output] of cases) {
       const evidence = snapshotEvidence(snapshot([observation("jobs.search", output, `call-${name}`)]))
-      expect(evidence).toContainEqual({ id: `call-${name}`, status: "verified" })
+      expect(evidence).toEqual([{ id: `call-${name}`, status: "verified" }])
       expect(evidence.some(entry => entry.id.startsWith("read:"))).toBe(false)
     }
+  })
+
+  it("leaves failed invocation IDs unresolved and rejects a lone failed tool call", () => {
+    const failed = failedObservation("jobs.search", { jobs: [{ id: "job-from-failed-call" }] }, "failed-call")
+    const evidence = snapshotEvidence(snapshot([failed]))
+
+    expect(evidence).toEqual([])
+    expect(failed.content.output).toEqual({ jobs: [{ id: "job-from-failed-call" }] })
+    expect(verifyCandidateFinal({
+      goal: "Find a role",
+      candidate: { text: "Done", finishReason: "stop", evidenceRefs: ["failed-call"] },
+      evidence,
+    })).toMatchObject({ ok: false, code: "evidence_missing" })
+    expect(verifyCandidateFinal({
+      goal: "Find a role",
+      candidate: { text: "Done", finishReason: "stop" },
+      evidence,
+    })).toMatchObject({ ok: false, code: "evidence_missing" })
+  })
+
+  it("counts a successful retry only through its validated read result", () => {
+    const failed = failedObservation("jobs.search", { jobs: [{ id: "stale-job" }] }, "failed-call")
+    const retry = observation("jobs.search", { jobs: [{ id: "retried-job" }] }, "retry-call")
+    const evidence = snapshotEvidence(snapshot([failed, retry]))
+
+    expect(evidence).toEqual([
+      { id: "retry-call", status: "verified" },
+      { id: "read:job:retried-job", status: "verified" },
+    ])
+    expect(verifyCandidateFinal({
+      goal: "Find a role",
+      candidate: { text: "Done", finishReason: "stop", evidenceRefs: ["failed-call"] },
+      evidence,
+    })).toMatchObject({ ok: false, code: "evidence_missing" })
+    expect(verifyCandidateFinal({
+      goal: "Find a role",
+      candidate: { text: "Found a role", finishReason: "stop", evidenceRefs: ["read:job:retried-job"] },
+      evidence,
+    })).toMatchObject({ ok: true })
+  })
+
+  it("omits non-completed IDs but retains completed IDs when read projection is ineligible", () => {
+    const failed = failedObservation("jobs.search", { jobs: [{ id: "failed-job" }] }, "failed-call")
+    const completedWithError = observation("jobs.search", { jobs: [{ id: "errored-job" }] }, "completed-error-call")
+    completedWithError.content.errorCode = "provider_error"
+    const unsupported = observation("application.get_state", { job: { id: "state-job" } }, "unsupported-call")
+    const evidence = snapshotEvidence(snapshot([failed, completedWithError, unsupported]))
+
+    expect(evidence).toEqual([
+      { id: "completed-error-call", status: "verified" },
+      { id: "unsupported-call", status: "verified" },
+    ])
+    expect(evidence.some(entry => entry.id.startsWith("read:"))).toBe(false)
   })
 
   it("rejects a plausible final with no evidence", () => {
