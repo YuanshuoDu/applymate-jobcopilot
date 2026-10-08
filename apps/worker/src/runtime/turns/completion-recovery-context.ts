@@ -1,4 +1,6 @@
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
+import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
+import { TASK_GRAPH_VERIFICATION_LIMITS, type TaskGraphVerificationReasonCode } from "../planning/task-graph-verification.js"
 import { STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
 
 type TaskGraphRepairRecovery = Readonly<{ feedback: string; graphRevision: number | null }>
@@ -8,7 +10,7 @@ const TAG = "agent-harness.v2.task-graph-repair-recovery.v1:"
 const SEED_PREFIX = "completion-recovery:task-graph:"
 const LEGACY_TEXT_PREFIX = "Durable TaskGraph verification blocked completion:"
 const VERSIONED_TEXT_PREFIX = "Durable TaskGraph verification blocked completion at graph revision "
-const FEEDBACK_PREFIX = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph."
+const TASK_GRAPH_FEEDBACK = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing."
 const GENERIC_FEEDBACK = "Durable TaskGraph verification was denied, but no validated graph revision is available. Inspect the refreshed current TaskGraph; no node or criterion ordinal from this denial is actionable."
 const NATIVE_STATUS = /^Independent native verification is (failed|uncertain|pending|unavailable)\./
 const NATIVE_ACTIONS = [
@@ -28,9 +30,53 @@ const NATIVE_FIXED = new Set([
 const GENERIC_NATIVE_REPAIR = "Revise the candidate or obtain new current owned evidence before retrying."
 const MAX_FEEDBACK = 512
 const MAX_ENVELOPE = 2_048
+type GateFeedbackCode = "legacy_unverified" | "verification_report" | "repair_receipt" | "repair_criterion"
+type RepairFeedbackState = "missing" | "pending" | "terminal" | "unavailable" | "missing_receipt" | "rejected" | "invalid_receipt" | "invalid_report"
+const GATE_FEEDBACK_CODES = { legacy_unverified: true, verification_report: true, repair_receipt: true, repair_criterion: true } satisfies Record<GateFeedbackCode, true>
+const TASK_GRAPH_REASON_CODES = {
+  criteria_met: true, criterion_not_met: true, reported_score_below_minimum: true, contract_invalid: true,
+  projection_invalid: true, role_mismatch: true, canonical_evidence_missing: true, canonical_evidence_invalid: true,
+  canonical_evidence_ambiguous: true, result_invalid: true, result_ambiguous: true, result_evidence_unbound: true,
+  repair_target_unresolved: true,
+} satisfies Record<TaskGraphVerificationReasonCode, true>
+const REPAIR_FEEDBACK_STATES = {
+  missing: true, pending: true, terminal: true, unavailable: true, missing_receipt: true, rejected: true,
+  invalid_receipt: true, invalid_report: true,
+} satisfies Record<RepairFeedbackState, true>
+const TASK_GRAPH_DETAIL = new RegExp(`^ nodeOrdinal=([1-9][0-9]*)(?: criterionOrdinal=([1-9][0-9]*))? status=(?:failed|unverified) reasonCode=(?:${Object.keys(TASK_GRAPH_REASON_CODES).join("|")})(?: repair=(?:${Object.keys(REPAIR_FEEDBACK_STATES).join("|")}))?`)
+const TASK_GRAPH_ISSUE = new RegExp(`^ issue=(?:${Object.keys(GATE_FEEDBACK_CODES).join("|")})`)
+const TASK_GRAPH_OMISSION = /^ \(([1-9][0-9]*) feedback items omitted; inspect TaskGraph before retrying\.\)$/
+const MAX_TASK_GRAPH_FEEDBACK_ITEMS = TASK_GRAPH_LIMITS.maxNodes * TASK_GRAPH_VERIFICATION_LIMITS.maxCriteria * 2 + 1
 
 function validRevision(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+}
+
+function validTaskGraphOrdinal(value: string, maximum: number): boolean {
+  const ordinal = Number(value)
+  return Number.isSafeInteger(ordinal) && ordinal >= 1 && ordinal <= maximum
+}
+
+function validTaskGraphFeedback(feedback: string): boolean {
+  if (!feedback.startsWith(TASK_GRAPH_FEEDBACK)) return false
+  let rest = feedback.slice(TASK_GRAPH_FEEDBACK.length), issueCount = 0, detailCount = 0
+  const issue = TASK_GRAPH_ISSUE.exec(rest)
+  if (issue) { issueCount = 1; rest = rest.slice(issue[0].length) }
+  for (;;) {
+    const detail = TASK_GRAPH_DETAIL.exec(rest)
+    if (!detail) break
+    if (!validTaskGraphOrdinal(detail[1]!, TASK_GRAPH_LIMITS.maxNodes)
+      || (detail[2] !== undefined && !validTaskGraphOrdinal(detail[2], TASK_GRAPH_VERIFICATION_LIMITS.maxCriteria))) return false
+    detailCount += 1
+    rest = rest.slice(detail[0].length)
+  }
+  const presentCount = issueCount + detailCount
+  if (presentCount + (rest ? 1 : 0) > MAX_TASK_GRAPH_FEEDBACK_ITEMS) return false
+  if (!rest) return true
+  const omission = TASK_GRAPH_OMISSION.exec(rest)
+  if (!omission || presentCount === 0) return false
+  const omittedCount = Number(omission[1])
+  return Number.isSafeInteger(omittedCount) && presentCount + omittedCount <= MAX_TASK_GRAPH_FEEDBACK_ITEMS
 }
 
 function taskGraphSeed(seed: StepContextSnapshot["system"][number]): boolean {
@@ -63,7 +109,7 @@ function decodeRecovery(value: string): TaskGraphRepairRecovery | null {
     const record = parsed as Record<string, unknown>
     if (Object.keys(record).sort().join(",") !== "feedback,graphRevision" || typeof record.feedback !== "string" || record.feedback.length > MAX_FEEDBACK) return null
     if (record.graphRevision !== null && !validRevision(record.graphRevision)) return null
-    if (record.feedback.startsWith(FEEDBACK_PREFIX)) return { feedback: record.feedback, graphRevision: record.graphRevision }
+    if (validTaskGraphFeedback(record.feedback)) return { feedback: record.feedback, graphRevision: record.graphRevision }
     const native = record.graphRevision === null ? safeNativeFeedback(record.feedback) : null
     return native ? { feedback: native, graphRevision: null } : null
   } catch {
