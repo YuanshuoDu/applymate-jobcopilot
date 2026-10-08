@@ -22,7 +22,7 @@ describe("no-progress detector", () => {
     const checkpointInputId = "checkpoint-input-private-675-9f6c"
     const privateSnapshot = {
       ...snapshot,
-      businessRefs: [{ id: checkpointInputId, kind: "job", ownerId: "user-1" }],
+      businessRefs: [{ id: checkpointInputId, kind: "job" as const, ownerId: "user-1" }],
       toolObservations: [{
         id: "tool-observation-private-675",
         content: {
