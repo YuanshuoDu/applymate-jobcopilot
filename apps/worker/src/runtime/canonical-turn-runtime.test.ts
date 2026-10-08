@@ -6,9 +6,12 @@ const selectedJobHistory = vi.hoisted(() => ({ load: vi.fn(async (..._args: unkn
 vi.mock("./context/selected-job-history-store.js", () => ({ createPgSelectedJobHistoryStore: () => selectedJobHistory }))
 const selectedJobDirectHistory = vi.hoisted(() => ({ load: vi.fn(async (..._args: unknown[]) => [] as unknown[]) }))
 vi.mock("./context/selected-job-history-direct-store.js", () => ({ createPgDirectSelectedJobHistoryStore: () => selectedJobDirectHistory }))
+const rootTaskHistory = vi.hoisted(() => ({ load: vi.fn(async (..._args: unknown[]) => [] as unknown[]) }))
+vi.mock("./context/root-task-history-direct-store.js", () => ({ createPgDirectRootTaskHistoryStore: () => rootTaskHistory }))
 beforeEach(() => {
   selectedJobHistory.load.mockReset().mockImplementation(async () => [])
   selectedJobDirectHistory.load.mockReset().mockImplementation(async () => [])
+  rootTaskHistory.load.mockReset().mockImplementation(async () => [])
 })
 
 import { redactSensitiveValue } from "@jobcopilot/shared"
@@ -602,6 +605,9 @@ describe("createCanonicalTurnRuntime", () => {
     const names = requests[0]?.tools.flatMap(tool => tool && typeof tool === "object" && "name" in tool && typeof tool.name === "string" ? [tool.name] : []) ?? []
     expect(names).toContain("agent.plan")
     expect(readCurrent).toHaveBeenCalledTimes(2)
+    expect(rootTaskHistory.load).toHaveBeenCalledWith(expect.objectContaining({
+      lease, rootTaskId: "root-1", rootAttemptCount: 1, stepId: expect.any(String), now: expect.any(Date),
+    }))
     expect(modelSnapshots[0]?.toolObservations).toContainEqual({
       id: "task-graph-current",
       content: {

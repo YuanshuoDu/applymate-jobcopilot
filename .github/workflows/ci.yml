@@ -150,6 +150,19 @@ jobs:
           test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
           pnpm --filter @jobcopilot/worker exec vitest run --no-file-parallelism \
             src/runtime/context/selected-job-history-direct-pg.integration.test.ts
+      - name: Verify ordinary Root task history on disposable PostgreSQL
+        env:
+          CI: "true"
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+        run: |
+          test "$CI" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          pnpm --filter @jobcopilot/worker exec vitest run --no-file-parallelism \
+            src/runtime/context/root-task-history-direct-pg.integration.test.ts
       - name: Verify native delegation, independent proof, and durable questions/planning clarifications on disposable PostgreSQL/Redis
         env:
           CI: "true"

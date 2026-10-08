@@ -7,12 +7,14 @@ import { createPgContextOwnerFence, StepContextBuilder } from "./context/step-co
 import type { HydrationScope } from "./context/steering-reconciliation-context.js"
 import { injectSelectedJobMemory, type SelectedJobMemoryRecord } from "./context/selected-job-memory.js"
 import { createPgDirectSelectedJobHistoryStore } from "./context/selected-job-history-direct-store.js"
+import { createPgDirectRootTaskHistoryStore } from "./context/root-task-history-direct-store.js"
 import { selectedJobSnapshot } from "./canonical-turn-task-graph-context.js"
 import type { StepContextSnapshot } from "./context/step-context-builder.js"
 import {
   appendCanonicalSelectedJobHistory, appendCanonicalSelectedJobHistoryOutcomes,
   type DirectSelectedJobHistoryReader, type SelectedJobHistoryReader,
 } from "./canonical-turn-selected-job-history.js"
+import { appendCanonicalRootTaskHistory, type DirectRootTaskHistoryReader } from "./canonical-turn-root-task-history.js"
 
 type ContextBuilder = TurnEngineOptions["contextBuilder"]
 type BaseBuilder = Pick<ContextBuilder, "build">
@@ -33,6 +35,7 @@ type Input = Readonly<{
   selectedJobDirectHistoryReader?: DirectSelectedJobHistoryReader
   /** Explicit adapter for callers that still supply compaction-captured records. Production uses the direct source reader. */
   selectedJobHistoryReader?: SelectedJobHistoryReader
+  rootTaskHistoryDirectReader?: DirectRootTaskHistoryReader
 }>
 
 export function canonicalSteeringHydrationScope(input: Pick<Input, "planningEnabled" | "scope" | "lease" | "rootTaskId" | "rootAttemptCount" | "rootInputId">): HydrationScope | undefined {
@@ -57,6 +60,9 @@ export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder 
   const directHistoryReader = input.selectedJobMode
     ? input.selectedJobDirectHistoryReader ?? (input.selectedJobHistoryReader ? undefined : createPgDirectSelectedJobHistoryStore(input.pool))
     : undefined
+  const rootTaskHistoryReader = input.planningEnabled && !input.selectedJobMode
+    ? input.rootTaskHistoryDirectReader ?? createPgDirectRootTaskHistoryStore(input.pool)
+    : undefined
   return {
     build: async request => {
       let snapshot: StepContextSnapshot = request.snapshot
@@ -73,6 +79,10 @@ export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder 
           records: input.selectedJobMemories ?? [], now: request.now ?? new Date(),
         })
       }
+      if (rootTaskHistoryReader) snapshot = await appendCanonicalRootTaskHistory({
+        snapshot, reader: rootTaskHistoryReader,
+        request: { lease: input.lease, rootTaskId: input.rootTaskId, rootAttemptCount: input.rootAttemptCount, stepId: request.stepId, now: request.now ?? new Date() },
+      })
       return base.build({ ...request, snapshot, taskId: input.rootTaskId })
     },
   }
