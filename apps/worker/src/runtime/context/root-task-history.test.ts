@@ -56,6 +56,44 @@ describe("root task history projection", () => {
     expect(JSON.stringify(projected)).not.toContain("evidenceDigest")
   })
 
+  it("preserves the allowlisted unresolved repair reason when all criteria passed", () => {
+    const unresolved = node({
+      verificationReport: {
+        verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "repair_target_unresolved",
+        criteria: [{ criterionId: "criterion-a", status: "passed", reasonCode: "criteria_met" }],
+        evidenceDigest: null, resultDigest: "e".repeat(64),
+      },
+    })
+    const projected = projectRootTaskHistory([outcome("unresolved-repair", 5n, [unresolved])])
+    expect(projected?.content).toMatchObject({
+      informationalOnly: true, advisoryOnly: true, notCurrentEvidence: true,
+      turns: [{ nodes: [{ status: "failed", negativeReasonHints: ["repair_target_unresolved"] }] }],
+    })
+    expect(JSON.stringify(projected)).not.toContain("resultDigest")
+  })
+
+  it("omits arbitrary report-level reasons and mismatched report status", () => {
+    const unresolvedReport = {
+      verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified" as const, reasonCode: "repair_target_unresolved" as const,
+      criteria: [{ criterionId: "criterion-a", status: "passed" as const, reasonCode: "criteria_met" as const }],
+      evidenceDigest: null, resultDigest: "f".repeat(64),
+    }
+    const arbitrary = node({
+      verificationReport: { ...unresolvedReport, reasonCode: "projection_invalid" },
+    })
+    const mismatched = node({ status: "completed", verificationReport: unresolvedReport })
+    const projected = projectRootTaskHistory([outcome("arbitrary", 6n, [arbitrary]), outcome("mismatch", 7n, [mismatched])])
+    const serialized = JSON.stringify(projected)
+    expect(serialized).not.toContain("repair_target_unresolved")
+    expect(serialized).not.toContain("projection_invalid")
+    expect(projected?.content).toMatchObject({
+      turns: [
+        { nodes: [{ status: "completed" }] },
+        { nodes: [{ status: "failed" }] },
+      ],
+    })
+  })
+
   it("uses deterministic newest-first history and enforces Turn and node caps", () => {
     const nodes = Array.from({ length: 4 }, (_, index) => node({ key: "n" + index, templateId: index === 0 ? "analyst" : "unknown-private-template" }))
     const projected = projectRootTaskHistory([

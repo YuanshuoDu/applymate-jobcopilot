@@ -68,10 +68,15 @@ function safeReasonHints(node: Row): readonly TaskGraphVerificationReasonCode[] 
   if (!ids) return undefined
   const report = parseTaskGraphVerificationReport(node.verificationReport, ids)
   if (!report || !taskGraphVerificationReportMatchesStatus(report, String(node.status)) || report.status === "passed") return undefined
-  const hints = [...new Set(report.criteria
+  const criterionHints = report.criteria
     .filter(criterion => criterion.status === "failed" || criterion.status === "unverified")
     .map(criterion => criterion.reasonCode)
-    .filter(code => NEGATIVE_REASON_CODES.has(code)))].sort(compare).slice(0, MAX_REASON_HINTS)
+    .filter(code => NEGATIVE_REASON_CODES.has(code))
+  const unresolvedRepairHint = report.status === "unverified"
+    && report.reasonCode === "repair_target_unresolved"
+    && report.criteria.every(criterion => criterion.status === "passed")
+    ? [report.reasonCode] : []
+  const hints = [...new Set([...criterionHints, ...unresolvedRepairHint])].sort(compare).slice(0, MAX_REASON_HINTS)
   return hints.length ? hints : undefined
 }
 function projectNode(value: unknown): SafeNode | null {
