@@ -27,6 +27,7 @@ const identity: TurnExecutionOptions["identity"] = {
 }
 const step: TurnEngineStep = { id: "step-1", ordinal: 0 }
 const nowValue = new Date("2026-09-24T12:00:00.000Z")
+const taskGraphFeedbackLead = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. Replan or repair affected criteria before completing."
 
 function gateOptions(completionGate: NonNullable<TurnExecutionOptions["completionGate"]>): GateOptions {
   return { identity, scope: { userId: identity.userId }, completionGate }
@@ -42,7 +43,7 @@ describe("assertCompletionAllowed", () => {
     expect(completionRecoverySnapshot(snapshot, "step-2", STEERING_RECONCILIATION_FEEDBACK).system[0]?.content)
       .toContain("Review the current user instructions")
     expect(completionRecoverySnapshot(snapshot, "step-3", tagTaskGraphRepairRecovery(
-      "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. nodeOrdinal=1 status=failed reasonCode=evidence_missing", 0,
+      `${taskGraphFeedbackLead} issue=verification_report nodeOrdinal=1 criterionOrdinal=1 status=failed reasonCode=criterion_not_met`, 0,
     )).system[0]?.content)
       .toContain("Replan or repair the affected criteria, then verify again.")
   })
