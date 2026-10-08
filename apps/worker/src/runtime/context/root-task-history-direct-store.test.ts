@@ -32,6 +32,8 @@ function candidate(index: number, terminalSequence = String(index * 2 + 2), stat
   if (status === "completed") return {
     ...common, terminalTurnId: turnId, terminalTaskId: rootTaskId, terminalItemId: `final-${index}`,
     terminalSequence, terminalType: "turn.completed", terminalActor: "orchestrator", terminalCorrelationId: `step-${index}`,
+    terminalStepId: `step-${index}`, terminalStepSessionId: "session-1",
+    terminalStepTurnId: turnId, terminalStepTaskId: rootTaskId,
     terminalIdempotencyKey: `turn:${turnId}:event:turn-completed`,
     terminalPayload: { turnId, taskId: rootTaskId, finalItemId: `final-${index}` }, terminalEventCount: 1,
   }
@@ -170,6 +172,29 @@ describe("direct Root-task history PostgreSQL store", () => {
 
     await expect(test.store.load(test.input)).resolves.toEqual([])
     expect(test.queries.filter(query => query.sql.includes('FROM "agent_items" AS item'))).toHaveLength(0)
+  })
+
+  it("requires a completed receipt correlation target in the same session, Turn, and Root task", async () => {
+    const valid = candidate(12)
+    const missingStep = { ...candidate(13), terminalStepId: null }
+    const otherTurn = { ...candidate(14), terminalStepTurnId: "turn-elsewhere" }
+    const otherRoot = { ...candidate(15), terminalStepTaskId: "root-elsewhere" }
+    const otherSession = { ...candidate(16), terminalStepSessionId: "session-elsewhere" }
+    const test = fixture({ candidates: [valid, missingStep, otherTurn, otherRoot, otherSession] })
+
+    const outcomes = await test.store.load(test.input)
+
+    expect(outcomes.map(value => value.sourceTurnId)).toEqual(["turn-source-12"])
+    const graphReads = test.queries.filter(query => query.sql.includes('FROM "agent_items" AS item'))
+    expect(graphReads).toHaveLength(1)
+    expect(graphReads[0]?.values?.[2]).toBe("turn-source-12")
+    const scan = test.queries.find(query => query.sql.includes("WITH terminal_window AS MATERIALIZED"))
+    expect(scan?.sql).toContain('FROM "agent_steps" AS step')
+    expect(scan?.sql).toContain('step."id" = terminal."correlationId"')
+    expect(scan?.sql).toContain('step."sessionId" = roots."sessionId"')
+    expect(scan?.sql).toContain('step."turnId" = roots."turnId"')
+    expect(scan?.sql).toContain('step."taskId" = roots."rootTaskId"')
+    expect(scan?.sql).toContain('terminal_step."id" = terminal."correlationId"')
   })
 
   it("rejects a nonterminal source Turn before loading its terminal Root graph", async () => {

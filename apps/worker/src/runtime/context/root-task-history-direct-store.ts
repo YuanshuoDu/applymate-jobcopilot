@@ -65,7 +65,9 @@ function validTerminal(row: Row, turnId: string, rootTaskId: string, status: str
   const prefix = `turn:${turnId}:event:`
   if (status === "completed") {
     return row.terminalType === "turn.completed" && text(payload.finalItemId) && row.terminalItemId === payload.finalItemId
-      && text(row.terminalCorrelationId) && row.terminalIdempotencyKey === `${prefix}turn-completed` ? value : undefined
+      && text(row.terminalCorrelationId) && row.terminalStepId === row.terminalCorrelationId
+      && row.terminalStepSessionId === row.sessionId && row.terminalStepTurnId === turnId
+      && row.terminalStepTaskId === rootTaskId && row.terminalIdempotencyKey === `${prefix}turn-completed` ? value : undefined
   }
   if (status === "failed") {
     return row.terminalType === "turn.failed" && text(payload.errorCode)
@@ -123,7 +125,9 @@ async function candidates(client: Client, input: RootTaskHistoryFenceInput, fenc
       terminal."turnId" AS "terminalTurnId", terminal."taskId" AS "terminalTaskId", terminal."itemId" AS "terminalItemId",
       terminal."sequence" AS "terminalSequence", terminal."type" AS "terminalType", terminal."actor" AS "terminalActor",
       terminal."correlationId" AS "terminalCorrelationId", terminal."idempotencyKey" AS "terminalIdempotencyKey",
-      terminal."payload" AS "terminalPayload", terminal."terminalEventCount"
+      terminal."payload" AS "terminalPayload", terminal."terminalEventCount",
+      terminal_step."id" AS "terminalStepId", terminal_step."sessionId" AS "terminalStepSessionId",
+      terminal_step."turnId" AS "terminalStepTurnId", terminal_step."taskId" AS "terminalStepTaskId"
     FROM roots
     JOIN LATERAL (
       SELECT event."turnId", event."taskId", event."itemId", event."sequence", event."type", event."actor",
@@ -133,6 +137,16 @@ async function candidates(client: Client, input: RootTaskHistoryFenceInput, fenc
       ORDER BY event."sequence" DESC LIMIT 1
     ) AS terminal ON true
     LEFT JOIN LATERAL (
+      SELECT step."id", step."sessionId", step."turnId", step."taskId"
+      FROM "agent_steps" AS step
+      WHERE terminal."type" = 'turn.completed'
+        AND step."id" = terminal."correlationId"
+        AND step."sessionId" = roots."sessionId"
+        AND step."turnId" = roots."turnId"
+        AND step."taskId" = roots."rootTaskId"
+      LIMIT 1
+    ) AS terminal_step ON true
+    LEFT JOIN LATERAL (
       SELECT event."turnId", event."taskId", event."itemId", event."sequence", event."type", event."actor",
         event."correlationId", event."idempotencyKey", event."payload", COUNT(*) OVER () AS "startEventCount"
       FROM "agent_events" AS event WHERE event."sessionId" = roots."sessionId" AND event."turnId" = roots."turnId"
@@ -140,6 +154,7 @@ async function candidates(client: Client, input: RootTaskHistoryFenceInput, fenc
       ORDER BY event."sequence" DESC LIMIT 1
     ) AS started ON true
     WHERE terminal."sequence" < $4::bigint
+      AND (terminal."type" <> 'turn.completed' OR terminal_step."id" = terminal."correlationId")
     ORDER BY terminal."sequence" DESC, roots."turnId" DESC`,
   [input.lease.sessionId, input.lease.userId, input.lease.turnId, String(fence.currentStartSequence), SCAN_LIMIT])
   const output: Candidate[] = [], seen = new Set<string>()

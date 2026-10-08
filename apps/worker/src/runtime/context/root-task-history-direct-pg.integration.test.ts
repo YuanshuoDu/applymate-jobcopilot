@@ -25,6 +25,7 @@ type Source = Readonly<{
   turnId: string; rootTaskId: string; childId: string; finalItemId: string; sessionId: string; userId: string
   goal: string; criteria: readonly string[]; input: unknown; startSequence: number
   status?: "completed" | "failed" | "interrupted"; rootStatus?: "completed" | "failed" | "interrupted"
+  correlationTargetId?: string
 }>
 
 const databaseUrl = disposableUrl(), describePg = databaseUrl ? describe : describe.skip, suffix = randomUUID()
@@ -54,6 +55,10 @@ const selectedJob: Source = { turnId: `root-history-selected-job-${suffix}`, roo
 const otherSession: Source = { turnId: `root-history-other-session-turn-${suffix}`, rootTaskId: `root-history-other-session-root-${suffix}`,
   childId: `root-history-other-session-child-${suffix}`, finalItemId: `root-history-other-session-final-${suffix}`,
   sessionId: otherSessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 1 }
+const foreignScopeCorrelation: Source = { turnId: `root-history-foreign-step-turn-${suffix}`, rootTaskId: `root-history-foreign-step-root-${suffix}`,
+  childId: `root-history-foreign-step-child-${suffix}`, finalItemId: `root-history-foreign-step-final-${suffix}`,
+  sessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 13,
+  correlationTargetId: `source-step-${otherSession.turnId}` }
 const otherUser: Source = { turnId: `root-history-other-user-turn-${suffix}`, rootTaskId: `root-history-other-user-root-${suffix}`,
   childId: `root-history-other-user-child-${suffix}`, finalItemId: `root-history-other-user-final-${suffix}`,
   sessionId: foreignSessionId, userId: otherUserId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 1 }
@@ -102,7 +107,13 @@ async function insertSource(source: Source): Promise<void> {
   const terminalSequence = source.startSequence + 1
   const terminalType = status === "completed" ? "turn.completed" : status === "failed" ? "turn.failed" : "turn.interrupted"
   const terminalItemId = status === "completed" ? source.finalItemId : null
-  const correlationId = status === "completed" ? `source-step-${source.turnId}` : source.turnId
+  const sourceStepId = `source-step-${source.turnId}`
+  if (status === "completed") {
+    await pool!.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
+      VALUES ($1, $2, $3, $4, 1, 1, 'completed', 0, '[]'::jsonb, '{}'::jsonb)`,
+    [sourceStepId, source.sessionId, source.turnId, source.rootTaskId])
+  }
+  const correlationId = status === "completed" ? (source.correlationTargetId ?? sourceStepId) : source.turnId
   const errorCode = status === "failed" ? "task_failed" : status === "interrupted" ? "interrupted" : undefined
   const terminalKey = status === "completed" ? `turn:${source.turnId}:event:turn-completed`
     : status === "failed" ? `turn:${source.turnId}:event:turn-failed:${errorCode}` : `turn:${source.turnId}:event:turn-interrupted`
@@ -133,6 +144,7 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     await insertSource(changedCriteria)
     await insertSource(selectedJob)
     await insertSource(otherSession)
+    await insertSource(foreignScopeCorrelation)
     await insertSource(otherUser)
     await insertSource(future)
     await insertSource(inconsistentTerminal)
@@ -172,7 +184,8 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     expect(history.map(item => item.sourceRootTaskId)).toEqual([matching[1]!.rootTaskId, matching[0]!.rootTaskId])
     expect(history.map(item => item.terminalSequence)).toEqual([4n, 2n])
     expect(history.every(item => item.taskGraph.nodes.length === 1)).toBe(true)
+    expect(history.some(item => item.sourceTurnId === matching[0]!.turnId)).toBe(true)
     expect(history.some(item => [mismatched.turnId, changedCriteria.turnId, selectedJob.turnId,
-      otherSession.turnId, otherUser.turnId, future.turnId, inconsistentTerminal.turnId].includes(item.sourceTurnId))).toBe(false)
+      otherSession.turnId, foreignScopeCorrelation.turnId, otherUser.turnId, future.turnId, inconsistentTerminal.turnId].includes(item.sourceTurnId))).toBe(false)
   })
 })
