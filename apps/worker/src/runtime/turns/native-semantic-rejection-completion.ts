@@ -60,6 +60,18 @@ async function lockCurrentOwnedRoot(client: TurnEngineQueryClient, owner: Extrac
 async function assertCurrentRootLease(client: TurnEngineQueryClient, owner: Extract<ExecutionOwnerFence, { kind: "turn" }>, attempt: number): Promise<void> {
   if (await currentOwnedRootAttempt(client, owner, "clock_timestamp()", false) !== attempt) throw conflict("current root lease expired before completion")
 }
+async function assertCurrentTurnLease(client: TurnEngineQueryClient, owner: Extract<ExecutionOwnerFence, { kind: "turn" }>): Promise<void> {
+  const result = await client.query<TurnEngineRow>(`SELECT turn."id" FROM "agent_turns" AS turn
+    WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3
+      AND turn."leaseOwnerId" = $4 AND turn."leaseVersion" = $5
+      AND turn."leaseExpiresAt" > clock_timestamp() AND turn."status" = 'in_progress'
+      AND EXISTS (SELECT 1 FROM "sub_agent_tasks" AS owner_task
+        WHERE owner_task."id" = $6 AND owner_task."sessionId" = turn."sessionId"
+          AND owner_task."turnId" = turn."id" AND owner_task."rootTaskId" = owner_task."id"
+          AND owner_task."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed'))`,
+  [owner.turnId, owner.sessionId, owner.userId, owner.ownerId, owner.leaseVersion, owner.taskId])
+  if (!result.rows[0]) throw conflict("current Turn lease expired before completion")
+}
 async function currentFailedProof(client: TurnEngineQueryClient, input: CompletionInput, scope: TaskGraphReadScope): Promise<NativeSemanticRejectionIdentity | null> {
   const { identity } = input
   const graph = await loadTaskGraph(client, scope, true), state = await loadNativeVerificationOwnedState(client, scope, graph.snapshot, true)
@@ -111,6 +123,7 @@ export async function completeNativeSemanticRejectionStepWithClient(client: Turn
     FROM "agent_steps" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 FOR UPDATE`, [input.stepId, owner.sessionId, owner.turnId])
   const step = result.rows[0]
   if (!step || step.taskId !== owner.taskId || Number(step.attempt) !== 1) throw conflict(`step ${input.stepId} lineage`)
+  await assertCurrentTurnLease(client, owner)
   await assertCurrentRootLease(client, owner, rootScope.parentAttemptCount)
   let checkpoint: bigint
   try { checkpoint = nativeSemanticCheckpoint(step.inputThroughSequence) } catch { throw conflict("step checkpoint") }
@@ -131,12 +144,13 @@ export async function completeNativeSemanticRejectionStepWithClient(client: Turn
           AND root_fence."rootTaskId" = root_fence."id" AND root_fence."leaseOwner" = $12
           AND root_fence."status" = 'running' AND root_fence."interruptRequestedAt" IS NULL
           AND root_fence."leaseExpiresAt" > clock_timestamp())`
+      const turnLeaseFence = `turn."leaseExpiresAt" > clock_timestamp()`
       const saved = await client.query(`UPDATE "agent_steps" AS step SET "status" = 'completed', "finishReason" = $1, "errorCode" = NULL,
         "inputTokens" = $2, "outputTokens" = $3, "estimatedCostUsd" = $4, "completedAt" = $5
         FROM "agent_turns" AS turn WHERE step."id" = $6 AND step."sessionId" = $7 AND step."turnId" = $8
           AND step."taskId" = $9 AND step."attempt" = 1 AND step."status" = 'streaming'
           AND step."inputThroughSequence" = $10 AND turn."id" = step."turnId" AND turn."sessionId" = step."sessionId"
-          AND ${fence.where} AND ${rootLeaseFence}`,
+          AND ${fence.where} AND ${rootLeaseFence} AND ${turnLeaseFence}`,
       [input.finishReason, input.inputTokens, input.outputTokens, input.estimatedCostUsd, input.now, input.stepId, owner.sessionId, owner.turnId, owner.taskId, checkpoint.toString(), ...fence.values])
       if (saved.rowCount !== 1) throw conflict(`step ${input.stepId} completion fence`)
       const inserted = await client.query(`INSERT INTO "agent_native_semantic_rejections"
@@ -147,7 +161,10 @@ export async function completeNativeSemanticRejectionStepWithClient(client: Turn
       if (inserted.rowCount !== 1) throw conflict(`step ${input.stepId} receipt already exists`)
     }
     const steps = await matchingSteps(client, input, checkpoint)
-    if (step.status === "completed") await assertCurrentRootLease(client, owner, rootScope.parentAttemptCount)
+    if (step.status === "completed") {
+      await assertCurrentRootLease(client, owner, rootScope.parentAttemptCount)
+      await assertCurrentTurnLease(client, owner)
+    }
     return { inputThroughSequence: checkpoint, distinctStepCount: steps.length }
   } catch (error: unknown) { return nativeSemanticSchemaConflict(error) }
 }
