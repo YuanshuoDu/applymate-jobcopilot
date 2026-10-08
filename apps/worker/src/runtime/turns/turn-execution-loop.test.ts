@@ -18,6 +18,7 @@ import { classifyTurnFailure } from "./dlq.js"
 import { ToolExecutionError, type ToolExecutionContext } from "../tools/types.js"
 import { createTaskGraphPlanningTool } from "../tools/planning-executors.js"
 import type { TaskGraphCommandPort, TaskGraphCurrentState, TaskGraphScheduleReceipt } from "../subagents/task-graph-command-port.js"
+import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-pg-verification.js"
 import { createUsageAwareModelAdapter } from "./usage-aware-model.js"
 import type { HarnessRequestAdmissionDiagnostic } from "../harness-model-admission.js"
 import type { WorkerUsageAuthorization, WorkerUsageAuthorizationInput, WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
@@ -1773,10 +1774,24 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.events.some(event => event.type === "turn.failed")).toBe(true)
   })
 
-  it("retires revision-bound denial guidance before the request after an accepted graph plan", async () => {
-    const root = fixture(identity("turn", "root-1"))
+  it("retires old denial guidance on an accepted plan and stops unchanged repeats after observing its revision", async () => {
+    const root = fixture(identity("turn", "root-1"), undefined, [{ id: "seed-search", content: {
+      toolCallId: "seed-search", toolName: "jobs.search", input: { location: "Dublin" }, status: "completed",
+      output: { jobs: [{ id: "job-1" }] }, errorCode: null,
+    } }]), inputStore = new LateSteerInputClaimStore()
     const feedback = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. nodeOrdinal=2 criterionOrdinal=1 status=failed reasonCode=evidence_missing"
-    let graph: TaskGraphCurrentState = { revision: 5, nodes: [] }, calls = 0, denials = 0
+    const humanHistory = "The user clarified that Dublin remains the preferred location for senior engineering roles."
+    const verifiedNode: TaskGraphCurrentState["nodes"][number] = {
+      key: "research", templateId: "scout", goal: "Find roles", successCriteria: ["Return verified links"], dependsOn: [],
+      taskId: "child-research", status: "completed", readiness: "terminal", resultSummary: null, failureReason: null,
+      verificationCriterionIds: ["candidate-count"], verificationReport: {
+        verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met",
+        criteria: [{ criterionId: "candidate-count", status: "failed", reasonCode: "criterion_not_met" }],
+        evidenceDigest: "a".repeat(64), resultDigest: "e".repeat(64),
+      },
+    }
+    let graph: TaskGraphCurrentState = { revision: 5, nodes: [verifiedNode] }, calls = 0, denials = 0, contextBuilds = 0
+    const builtRevisions: Array<number | undefined> = [], dispatchedCalls: string[] = []
     const completionGate: NonNullable<TurnExecutionOptions["completionGate"]> = async () => {
       denials += 1
       if (denials > 1) return { ok: true }
@@ -1784,50 +1799,88 @@ describe("owner-agnostic turn execution loop", () => {
       Object.defineProperty(decision, TASK_GRAPH_RECOVERY_REVISION, { value: 5, enumerable: true })
       return decision
     }
-    const baseBuild = root.options.contextBuilder.build
+    const turnStore = root.options.store, baseBuilder = new StepContextBuilder(inputStore)
     const baseModel = root.options.model
+    const beforeStep = vi.fn(async snapshot => mergeTaskGraphCurrentObservation(snapshot, graph))
+    const afterPlan = vi.fn(async snapshot => {
+      graph = { revision: 6, nodes: [verifiedNode] }
+      return mergeTaskGraphCurrentObservation(snapshot, graph)
+    })
     root.options = {
       ...root.options,
       completionGate,
-      snapshot: { ...root.options.snapshot, businessRefs: [{ id: "owned-source", kind: "job", ownerId: "user-1" }] },
-      tools: [{ name: "agent.plan", version: "1" }],
-      refreshTaskGraphBeforeStep: async snapshot => mergeTaskGraphCurrentObservation(snapshot, graph),
-      refreshTaskGraphAfterPlan: async snapshot => {
-        graph = { revision: 6, nodes: [] }
-        return mergeTaskGraphCurrentObservation(snapshot, graph)
+      snapshot: {
+        ...root.options.snapshot,
+        steerHistory: [{ id: "human-clarification", content: humanHistory }],
       },
+      tools: [{ name: "agent.plan", version: "1" }, { name: "jobs.search", version: "1" }],
+      refreshTaskGraphBeforeStep: beforeStep,
+      refreshTaskGraphAfterPlan: afterPlan,
+      store: { ...turnStore, startStep: async input => {
+        inputStore.startStep(input.stepId, input.inputThroughSequence, input.consumedInputIds)
+        return turnStore.startStep(input)
+      } },
       contextBuilder: { build: async request => {
-        const context = await baseBuild(request)
-        const system = request.snapshot.system.map(seed => ({ id: `system:${seed.id}`, layer: "system" as const,
-          role: "instruction" as const, trust: "system" as const, source: "harness", content: seed.content as StepContext["blocks"][number]["content"] }))
-        return { ...context, blocks: [...system, ...context.blocks] }
+        const context = await baseBuilder.build({
+          scope: request.scope, sessionId: request.identity.sessionId, turnId: request.identity.turnId,
+          stepId: request.stepId, snapshot: request.snapshot, taskId: request.taskId, now: request.now,
+          steeringMarkerState: request.steeringMarkerState,
+        })
+        builtRevisions.push(context.taskGraphRevision)
+        if (++contextBuilds === 1) inputStore.acceptSteer()
+        return context
       } },
       model: { ...baseModel, async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
         root.requests.push(request)
         calls += 1
+        if (calls === 1) {
+          yield { type: "text_delta", text: "candidate-before-replan" }
+          yield { type: "completed", finishReason: "stop" }
+          return
+        }
         if (calls === 2) {
           yield { type: "tool_call_completed", callId: "plan-call", name: "agent.plan", arguments: { expectedRevision: 5, nodes: [] } }
           yield { type: "completed", finishReason: "tool_calls" }
           return
         }
-        yield { type: "text_delta", text: `candidate:${calls}` }
-        yield { type: "completed", finishReason: "stop" }
+        yield { type: "tool_call_completed", callId: `search-call-${calls}`, name: "jobs.search", arguments: { location: "Dublin" } }
+        yield { type: "completed", finishReason: "tool_calls" }
       } },
-      executeTool: async ({ call }) => ({ id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed",
-        output: { status: "accepted", revision: 6 }, errorCode: null }),
+      executeTool: async ({ call }) => {
+        dispatchedCalls.push(call.toolName)
+        return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed",
+          output: call.toolName === "agent.plan" ? { status: "accepted", revision: 6 } : { job: "job-1" }, errorCode: null }
+      },
     }
 
     const result = await runTurnExecutionLoop(root.options)
+    expect(result).toMatchObject({ status: "failed", errorCode: "no_progress", stepCount: 5, toolCallCount: 3 })
     const second = JSON.stringify(root.requests[1]?.messages).replaceAll("\\\"", "\"")
     const third = JSON.stringify(root.requests[2]?.messages).replaceAll("\\\"", "\"")
-    expect(result).toMatchObject({ status: "completed", stepCount: 3 })
+    const last = JSON.stringify(root.requests[4]?.messages).replaceAll("\\\"", "\"")
+    const rejection = root.events.find(event => event.type === "final.rejected")?.payload
+    const noProgress = root.events.find(event => event.type === "turn.no_progress")?.payload
+
+    expect(root.requests).toHaveLength(5)
+    expect(builtRevisions).toEqual([5, 5, 6, 6, 6])
+    expect(beforeStep).toHaveBeenCalledTimes(5)
+    expect(afterPlan).toHaveBeenCalledOnce()
+    expect(dispatchedCalls).toEqual(["agent.plan", "jobs.search", "jobs.search"])
+    expect(second).toContain(lateSteerText)
     expect(second).toContain("at graph revision 5")
     expect(second).toContain("nodeOrdinal=2")
     expect(third).toContain('"revision":6')
     expect(third).not.toContain("at graph revision 5")
     expect(third).not.toContain("nodeOrdinal=2")
-    expect(root.events.find(event => event.type === "final.rejected")?.payload).toMatchObject({ feedback })
-    expect(JSON.stringify(root.events.find(event => event.type === "final.rejected")?.payload)).not.toContain("task-graph-repair-recovery.v1")
+    expect(third).toContain(humanHistory)
+    expect(third).toContain('"verificationReport"')
+    expect(third).toContain("a".repeat(64))
+    expect(last).not.toContain("at graph revision 5")
+    expect(last).not.toContain("nodeOrdinal=2")
+    expect(rejection).toMatchObject({ feedback })
+    expect(JSON.stringify(rejection)).not.toContain("task-graph-repair-recovery.v1")
+    expect(JSON.stringify(noProgress)).not.toContain("task-graph-repair-recovery.v1")
+    expect(JSON.stringify(root.finalResponses)).not.toContain("task-graph-repair-recovery.v1")
   })
 
 
