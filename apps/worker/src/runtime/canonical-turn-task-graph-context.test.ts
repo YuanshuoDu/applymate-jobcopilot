@@ -138,6 +138,18 @@ describe("TaskGraph turn observation", () => {
     expect(result.toolObservations.at(-1)?.content).toEqual({ kind: "task_graph_current", revision: 0, nodes: [] })
   })
 
+  it("retires stale ordinal recovery after a trusted refresh and keeps unrelated seeds", () => {
+    const input = { ...snapshot(), system: [
+      { id: "completion-recovery:task-graph:4", content: "old ordinal repair" },
+      { id: "completion-recovery:task-graph:5", content: "current ordinal repair" },
+      { id: "completion-recovery:task-graph:unversioned", content: "generic repair" },
+      { id: "completion-recovery:old-step", content: "Durable TaskGraph verification blocked completion: legacy" },
+      { id: "policy:task-graph", content: "Durable TaskGraph verification blocked completion: policy" },
+    ] }
+    const result = mergeTaskGraphCurrentObservation(input, { revision: 5, nodes: [] })
+    expect(result.system.map(seed => seed.id)).toEqual(["completion-recovery:task-graph:5", "policy:task-graph"])
+  })
+
   it("preserves safe native operation and structural result receipts in the current graph", () => {
     const native = { operationKind: "spawn" as const, operationId: "operation-1", requestFingerprint: "f".repeat(64), callerTaskId: "root-1", role: "scout", taskType: "research", contextDigest: "c".repeat(64) }
     const nativeResult = { schemaVersion: "agent-harness.v2.task-graph.native-result.v1" as const, role: "scout", taskStatus: "completed" as const, disposition: "opaque" as const, resultDigest: "d".repeat(64) }
