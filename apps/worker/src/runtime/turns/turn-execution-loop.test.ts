@@ -24,7 +24,7 @@ import type { HarnessRequestAdmissionDiagnostic } from "../harness-model-admissi
 import type { WorkerUsageAuthorization, WorkerUsageAuthorizationInput, WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
 import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
 import { steeringReconciliationRecoveryError } from "./turn-execution-completion-gate.js"
-import { TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
+import { tagTaskGraphRepairRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
 
 const profile = {
   provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false,
@@ -1596,20 +1596,54 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.events.some(event => event.type === "turn.completed")).toBe(false)
   })
 
-  it("recovers inside the loop when atomic TaskGraph finalization loses a race", async () => {
+  it.each([
+    { label: "validated revision", recoveryFeedback: tagTaskGraphRepairRecovery(`${taskGraphFeedbackLead} issue=verification_report nodeOrdinal=1 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing repair=missing`, 23), expectedRevision: 23 },
+    { label: "missing revision", recoveryFeedback: tagTaskGraphRepairRecovery(`${taskGraphFeedbackLead} issue=verification_report nodeOrdinal=1 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing repair=missing`, null), expectedRevision: null },
+    { label: "invalid revision", recoveryFeedback: tagTaskGraphRepairRecovery(`${taskGraphFeedbackLead} issue=verification_report nodeOrdinal=1 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing repair=missing`, null).replace('"graphRevision":null', '"graphRevision":-1'), expectedRevision: null },
+  ])("recovers inside the loop when atomic TaskGraph finalization loses a race with a $label", async ({ recoveryFeedback, expectedRevision }) => {
     const root = fixture(identity("turn", "root-1"))
+    const feedback = `${taskGraphFeedbackLead} issue=verification_report nodeOrdinal=1 criterionOrdinal=1 status=unverified reasonCode=canonical_evidence_missing repair=missing`
     let denyOnce = true
     const persist = root.options.store.recordFinalResponse!
     root.options.store.recordFinalResponse = async input => {
-      if (input.terminal && denyOnce) { denyOnce = false; throw Object.assign(new Error("race"), { name: "TaskGraphVerificationRecovery", blocker: "task_graph_verification_unverified", feedback: "scout:candidate-present" }) }
+      if (input.terminal && denyOnce) {
+        denyOnce = false
+        const recovery = Object.assign(new Error("race"), { name: "TaskGraphVerificationRecovery", blocker: "task_graph_verification_unverified", feedback })
+        Object.defineProperty(recovery, "recoveryFeedback", { value: recoveryFeedback })
+        throw recovery
+      }
       return persist(input)
     }
+    const build = root.options.contextBuilder.build
+    root.options.contextBuilder.build = async request => {
+      const context = await build(request)
+      const system = request.snapshot.system.map(seed => ({ id: `system:${seed.id}`, layer: "system" as const,
+        role: "instruction" as const, trust: "system" as const, source: "harness", content: seed.content as StepContext["blocks"][number]["content"] }))
+      return { ...context, blocks: [...system, ...context.blocks] }
+    }
+
     const result = await runTurnExecutionLoop(root.options)
+
     expect(result).toMatchObject({ status: "completed", stepCount: 3 })
     expect(root.requests).toHaveLength(3)
-    expect(root.events.some(event => event.type === "final.rejected" && event.id.includes("task-graph-race"))).toBe(true)
+    const nextRequest = JSON.stringify(root.requests[2]?.messages)
+    if (expectedRevision === null) {
+      expect(nextRequest).toContain("no validated graph revision is available")
+      expect(nextRequest).toContain("no node or criterion ordinal from this denial is actionable")
+      expect(nextRequest).not.toContain("nodeOrdinal=1")
+    } else {
+      expect(nextRequest).toContain(`at graph revision ${expectedRevision}:`)
+      expect(nextRequest).toContain("These ordinals apply only to this graph revision.")
+      expect(nextRequest).toContain("nodeOrdinal=1 criterionOrdinal=1")
+    }
+    const rejection = root.events.find(event => event.type === "final.rejected" && event.id.includes("task-graph-race"))
+    expect(rejection?.payload).toEqual({ code: "business_precondition_failed", blocker: "task_graph_verification_unverified", feedback, taskId: "root-1" })
+    expect(JSON.stringify(rejection)).not.toContain("task-graph-repair-recovery.v1:")
+    expect(JSON.stringify(rejection)).not.toContain("graphRevision")
     expect(root.events.some(event => event.type === "turn.failed")).toBe(false)
+    expect(root.events.some(event => event.type === "turn.no_progress")).toBe(false)
     expect(root.events.some(event => event.type === "turn.completed")).toBe(true)
+    expect(root.stepStatuses).toEqual(["completed", "completed", "completed"])
   })
 
   it("recovers from the atomic unresolved-steering race and asks a fresh model step", async () => {
