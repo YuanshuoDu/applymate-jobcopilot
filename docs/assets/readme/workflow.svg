@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="450" viewBox="0 0 1000 450" role="img" aria-labelledby="title description">
+  <title id="title">The ApplyMate application loop</title>
+  <desc id="description">Discover and match roles, prepare materials and approve each job, then apply through supported ATS workflows and track replies. Login, MFA, CAPTCHA, and missing answers pause for the candidate.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1220"/>
+      <stop offset="1" stop-color="#101e2f"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#818cf8"/>
+      <stop offset="1" stop-color="#2dd4bf"/>
+    </linearGradient>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+      <path d="M1 1 6 4 1 7" fill="none" stroke="#70c9ce" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+  <rect width="1000" height="450" rx="24" fill="url(#background)"/>
+  <rect x=".5" y=".5" width="999" height="449" rx="24" fill="none" stroke="#26364a"/>
+  <g font-family="Segoe UI, Arial, sans-serif">
+    <text x="36" y="45" fill="#73c8cd" font-size="13" font-weight="600" letter-spacing="2.5">THE APPLICATION LOOP</text>
+    <text x="36" y="84" fill="#f5f7fa" font-size="29" font-weight="600">One connected journey. You stay in control.</text>
+    <rect x="36" y="112" width="928" height="2" rx="1" fill="url(#accent)" opacity=".65"/>
+    <rect x="36" y="140" width="284" height="210" rx="16" fill="#142033" stroke="#2c3c52"/>
+    <rect x="358" y="140" width="284" height="210" rx="16" fill="#142033" stroke="#498c95"/>
+    <rect x="680" y="140" width="284" height="210" rx="16" fill="#142033" stroke="#2c3c52"/>
+    <path d="M328 245H350" stroke="#70c9ce" stroke-width="2" marker-end="url(#arrow)"/>
+    <path d="M650 245H672" stroke="#70c9ce" stroke-width="2" marker-end="url(#arrow)"/>
+    <circle cx="72" cy="180" r="18" fill="#25344c"/>
+    <text x="72" y="185" fill="#b6bfff" font-size="14" font-weight="600" text-anchor="middle">01</text>
+    <circle cx="394" cy="180" r="18" fill="#203e48"/>
+    <text x="394" y="185" fill="#7cddd2" font-size="14" font-weight="600" text-anchor="middle">02</text>
+    <circle cx="716" cy="180" r="18" fill="#203e48"/>
+    <text x="716" y="185" fill="#7cddd2" font-size="14" font-weight="600" text-anchor="middle">03</text>
+    <g fill="#f5f7fa" font-size="22" font-weight="600">
+      <text x="56" y="228">Discover &amp; match</text>
+      <text x="378" y="228">Prepare &amp; approve</text>
+      <text x="700" y="228">Apply &amp; track</text>
+    </g>
+    <g fill="#bec9d9" font-size="16">
+      <text x="56" y="261">Search roles. Compare your fit.</text>
+      <text x="56" y="287">Build a focused shortlist.</text>
+      <text x="378" y="261">Tailor your resume and letter.</text>
+      <text x="378" y="287">Review the pack for each job.</text>
+      <text x="700" y="261">Use supported ATS workflows.</text>
+      <text x="700" y="287">Follow replies in Gmail.</text>
+    </g>
+    <text x="56" y="324" fill="#a7b7d6" font-size="12" font-weight="600" letter-spacing="1">PROFILE-BASED MATCHING</text>
+    <text x="378" y="324" fill="#7cddd2" font-size="12" font-weight="600" letter-spacing="1">YOUR APPROVAL, EACH JOB</text>
+    <text x="700" y="324" fill="#a7b7d6" font-size="12" font-weight="600" letter-spacing="1">ASSISTED OR QUEUE-BACKED</text>
+    <rect x="36" y="375" width="928" height="43" rx="10" fill="#102831" stroke="#234752"/>
+    <g fill="none" stroke="#7cddd2" stroke-width="2" stroke-linecap="round">
+      <path d="M58 389V404M65 389V404"/>
+    </g>
+    <text x="82" y="402" fill="#c6e2e2" font-size="16">Login, MFA, CAPTCHA, or a missing answer? The workflow pauses for you.</text>
+  </g>
+</svg>
