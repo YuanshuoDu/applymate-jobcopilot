@@ -4,7 +4,12 @@ vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnec
 vi.mock("./selected-job-preparation.js", () => ({ loadSelectedJobPreparation: vi.fn(async () => undefined) }))
 const selectedJobHistory = vi.hoisted(() => ({ load: vi.fn(async (..._args: unknown[]) => [] as unknown[]) }))
 vi.mock("./context/selected-job-history-store.js", () => ({ createPgSelectedJobHistoryStore: () => selectedJobHistory }))
-beforeEach(() => { selectedJobHistory.load.mockReset().mockImplementation(async () => []) })
+const selectedJobDirectHistory = vi.hoisted(() => ({ load: vi.fn(async (..._args: unknown[]) => [] as unknown[]) }))
+vi.mock("./context/selected-job-history-direct-store.js", () => ({ createPgDirectSelectedJobHistoryStore: () => selectedJobDirectHistory }))
+beforeEach(() => {
+  selectedJobHistory.load.mockReset().mockImplementation(async () => [])
+  selectedJobDirectHistory.load.mockReset().mockImplementation(async () => [])
+})
 
 import { redactSensitiveValue } from "@jobcopilot/shared"
 import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
@@ -17,6 +22,7 @@ import { createCanonicalTurnRuntime, type CanonicalTurnRuntimeOptions } from "./
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA, type TaskGraphCommandPort, type TaskGraphCurrentState, type TaskGraphNativeCommandInput, type TaskGraphReadScope, type TaskGraphScheduleInput, type TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
 import { projectSelectedJobMemory } from "./context/selected-job-memory.js"
+import type { ValidatedSelectedJobHistoryOutcome } from "./context/selected-job-history.js"
 import { TurnEngine } from "./turns/turn-engine.js"
 import { createPgRootTaskStore } from "./subagents/root-task-store.js"
 import { reclaimExpiredTurns } from "./turns/recovery-scanner.js"
@@ -1121,11 +1127,11 @@ describe("createCanonicalTurnRuntime", () => {
       .toContain('"artifact.version.read"')
   })
 
-  it("injects selected-job memory and prior same-job history after filtering into the next captured model request", async () => {
+  it("recalls prior same-job outcomes without compaction records into the next captured model request", async () => {
     const graph = {
       revision: 4,
       nodes: [{
-        key: "analyst-key", taskId: "analyst-task", templateId: "analyst", goal: "Analyze selected job", successCriteria: [], dependsOn: [],
+        key: "analyst-key", taskId: "analyst-task", templateId: "analyst", goal: "CURRENT_GRAPH_RUNTIME_SENTINEL", successCriteria: [], dependsOn: [],
         status: "completed", readiness: "terminal", resultSummary: null, failureReason: null,
         resultProjection: {
           schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available",
@@ -1134,12 +1140,13 @@ describe("createCanonicalTurnRuntime", () => {
         },
       }],
     }
-    const selectedMemory = projectSelectedJobMemory({ jobId: "job-1", sourceTurnId: lease.turnId, sourceRootTaskId: "root-1", throughSequence: "19", graph })!
-    const otherJobMemory = projectSelectedJobMemory({ jobId: "job-other", sourceTurnId: lease.turnId, sourceRootTaskId: "root-1", throughSequence: "19", graph })!
     const priorGraph = { ...graph, nodes: graph.nodes.map(node => ({ ...node, resultProjection: {
       ...node.resultProjection, findings: [{ jobId: "job-1", score: 6.5, evidenceKinds: ["job"] }],
     } })) }
     const priorHistory = projectSelectedJobMemory({ jobId: "job-1", sourceTurnId: "private-prior-turn", sourceRootTaskId: "private-prior-root", throughSequence: "9", graph: priorGraph })!
+    const outcome: ValidatedSelectedJobHistoryOutcome = {
+      jobId: "job-1", sourceTurnId: "private-prior-turn", sourceRootTaskId: "private-prior-root", terminalSequence: 29n, nodes: priorHistory.nodes,
+    }
     const currentGraph = graph as unknown as TaskGraphCurrentState
     const commandPort: TaskGraphCommandPort = {
       appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 4, nodes: [], readyTaskIds: [] })),
@@ -1148,22 +1155,27 @@ describe("createCanonicalTurnRuntime", () => {
     const requests: HarnessModelRequest[] = []
     const events: RuntimeEvent[] = []
     let eventTypesAtHistoryRead: string[] = []
-    selectedJobHistory.load.mockReset()
-    selectedJobHistory.load.mockImplementation(async () => {
+    selectedJobDirectHistory.load.mockReset()
+    selectedJobDirectHistory.load.mockImplementation(async () => {
       eventTypesAtHistoryRead = events.map(event => event.type)
-      return [{ record: priorHistory, terminalSequence: 29n }]
+      return [outcome]
     })
     const flags = resolveProductionAgentFlags({ ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1" })
+    const compactionRunner = vi.fn(async () => ({ status: "compacted" }))
     const planningTools = tools(true)
     const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
       workerId: "worker-1", productionFlags: flags, coordinationEnabled: true, taskGraphCommandPort: commandPort,
       selectedJobPreparationLoader: async () => ({ jobId: "job-1" }),
       stateLoader: async () => ({
-        ...selectedJobState(), toolPolicySnapshot: {}, selectedJobMemories: [selectedMemory, otherJobMemory],
-        snapshot: { ...selectedJobState().snapshot, toolObservations: [{ id: "unrelated-search", content: { toolName: "jobs.search", output: "must be filtered" } }] },
+        ...selectedJobState(), toolPolicySnapshot: {}, selectedJobMemories: [],
+        snapshot: { ...selectedJobState().snapshot, toolObservations: [
+          { id: "task-graph-current", content: { kind: "task_graph_current", revision: graph.revision, nodes: graph.nodes } },
+          { id: "unrelated-search", content: { toolName: "jobs.search", output: "must be filtered" } },
+        ] },
       }),
       rootTaskStore: rootStore() as never, toolRuntimeFactory: () => ({ ...planningTools, registry: { ...planningTools.registry, register: vi.fn() } }) as never,
       turnEngineStoreFactory: () => store(events), contextBuilderFactory: () => contextBuilder(),
+      turnBoundaryCompactionRunner: compactionRunner,
       modelRuntimeFactory: async () => ({ adapter: {
         ...model(() => []),
         async *stream(request: HarnessModelRequest) { requests.push(request); yield { type: "text_delta", text: "done" }; yield { type: "completed", finishReason: "stop" } },
@@ -1173,20 +1185,91 @@ describe("createCanonicalTurnRuntime", () => {
 
     await runtime.execute({ lease, signal: new AbortController().signal })
     const requestText = requests[0]?.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n") ?? ""
-    expect(requestText).toContain("selected_job_memory")
-    expect(requestText).toContain('"score":8')
     expect(requestText).toContain("selected_job_history")
     expect(requestText).toContain('"score":6.5')
+    expect(requestText).toContain("CURRENT_GRAPH_RUNTIME_SENTINEL")
+    expect(requestText).not.toContain("selected_job_memory")
     expect(eventTypesAtHistoryRead).toContain("turn.started")
     expect(eventTypesAtHistoryRead).toContain("step.started")
     expect(eventTypesAtHistoryRead.indexOf("turn.started")).toBeLessThan(eventTypesAtHistoryRead.indexOf("step.started"))
-    const loadedStepId = (selectedJobHistory.load.mock.calls[0]?.[0] as { stepId?: unknown } | undefined)?.stepId
+    const loadedStepId = (selectedJobDirectHistory.load.mock.calls[0]?.[0] as { stepId?: unknown } | undefined)?.stepId
     const startedStep = events.find(event => event.type === "step.started")
     expect(loadedStepId).toBe((startedStep?.payload as { stepId?: unknown } | undefined)?.stepId)
+    expect(selectedJobDirectHistory.load).toHaveBeenCalledTimes(1)
+    expect(selectedJobDirectHistory.load.mock.calls[0]?.[0]).not.toHaveProperty("records")
+    expect(selectedJobHistory.load).not.toHaveBeenCalled()
+    expect(compactionRunner).not.toHaveBeenCalled()
+    expect(flags.turnBoundaryCompactionEnabled).toBe(false)
     expect(requestText).not.toContain("private-prior-turn")
     expect(requestText).not.toContain("private-prior-root")
-    expect(requestText).not.toContain("job-other")
     expect(requestText).not.toContain("must be filtered")
+  })
+
+  it("keeps valid same-Turn selected-job memory with direct prior history in the captured request", async () => {
+    const graph = {
+      revision: 4,
+      nodes: [{
+        key: "analyst-key", taskId: "analyst-task", templateId: "analyst", goal: "CURRENT_GRAPH_WITH_MEMORY", successCriteria: [], dependsOn: [],
+        status: "completed", readiness: "terminal", resultSummary: null, failureReason: null,
+        resultProjection: {
+          schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available",
+          role: "analyst", status: "completed", findingCount: 1, evidenceCount: 1,
+          findings: [{ jobId: "job-1", score: 8, evidenceKinds: ["job"] }],
+        },
+      }],
+    }
+    const sameTurnMemory = projectSelectedJobMemory({ jobId: "job-1", sourceTurnId: lease.turnId, sourceRootTaskId: "root-1", throughSequence: "19", graph })!
+    const otherJobGraph = { ...graph, nodes: graph.nodes.map(node => ({ ...node, resultProjection: {
+      ...node.resultProjection, findings: [{ jobId: "other-job-559", score: 9, evidenceKinds: ["job"] }],
+    } })) }
+    const otherJobMemory = projectSelectedJobMemory({ jobId: "other-job-559", sourceTurnId: lease.turnId, sourceRootTaskId: "root-1", throughSequence: "20", graph: otherJobGraph })!
+    const priorGraph = { ...graph, nodes: graph.nodes.map(node => ({ ...node, resultProjection: {
+      ...node.resultProjection, findings: [{ jobId: "job-1", score: 6.5, evidenceKinds: ["job"] }],
+    } })) }
+    const priorHistory = projectSelectedJobMemory({ jobId: "job-1", sourceTurnId: "private-prior-turn", sourceRootTaskId: "private-prior-root", throughSequence: "9", graph: priorGraph })!
+    const outcome: ValidatedSelectedJobHistoryOutcome = {
+      jobId: "job-1", sourceTurnId: "private-prior-turn", sourceRootTaskId: "private-prior-root", terminalSequence: 29n, nodes: priorHistory.nodes,
+    }
+    const requests: HarnessModelRequest[] = []
+    selectedJobDirectHistory.load.mockReset().mockImplementation(async () => [outcome])
+    const flags = resolveProductionAgentFlags({ ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1" })
+    const planningTools = tools(true)
+    const runtime = await createCanonicalTurnRuntime({ connect: vi.fn() } as never, {
+      workerId: "worker-1", productionFlags: flags, coordinationEnabled: true,
+      taskGraphCommandPort: {
+        appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 4, nodes: [], readyTaskIds: [] })),
+        readCurrent: vi.fn(async () => graph as unknown as TaskGraphCurrentState),
+      },
+      selectedJobPreparationLoader: async () => ({ jobId: "job-1" }),
+      stateLoader: async () => ({
+        ...selectedJobState(), toolPolicySnapshot: {}, selectedJobMemories: [sameTurnMemory, otherJobMemory],
+        snapshot: { ...selectedJobState().snapshot, toolObservations: [
+          { id: "task-graph-current", content: { kind: "task_graph_current", revision: graph.revision, nodes: graph.nodes } },
+        ] },
+      }),
+      rootTaskStore: rootStore() as never,
+      toolRuntimeFactory: () => ({ ...planningTools, registry: { ...planningTools.registry, register: vi.fn() } }) as never,
+      turnEngineStoreFactory: () => store(), contextBuilderFactory: () => contextBuilder(),
+      modelRuntimeFactory: async () => ({ adapter: {
+        ...model(() => []),
+        async *stream(request: HarnessModelRequest) { requests.push(request); yield { type: "text_delta", text: "done" }; yield { type: "completed", finishReason: "stop" } },
+      }, registry: {} as never, candidates: [] }),
+      authorizeUsage: async () => ({ settle: async () => undefined }),
+    })
+
+    await runtime.execute({ lease, signal: new AbortController().signal })
+    const requestText = requests[0]?.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n") ?? ""
+    expect(requestText).toContain("selected_job_history")
+    expect(requestText).toContain("selected_job_memory")
+    expect(requestText).toContain('"score":6.5')
+    expect(requestText).toContain('"score":8')
+    expect(requestText).toContain("CURRENT_GRAPH_WITH_MEMORY")
+    expect(requestText).not.toContain("other-job-559")
+    expect(requestText).not.toContain("private-prior-turn")
+    expect(requestText).not.toContain("private-prior-root")
+    expect(selectedJobDirectHistory.load).toHaveBeenCalledTimes(1)
+    expect(selectedJobDirectHistory.load.mock.calls[0]?.[0]).not.toHaveProperty("records")
+    expect(selectedJobHistory.load).not.toHaveBeenCalled()
   })
 
   it("does not inject selected-job memory into an ordinary Turn model request", async () => {
@@ -1211,6 +1294,7 @@ describe("createCanonicalTurnRuntime", () => {
 
     await runtime.execute({ lease, signal: new AbortController().signal })
     expect(requests).toHaveLength(1)
+    expect(selectedJobDirectHistory.load).not.toHaveBeenCalled()
     const requestText = JSON.stringify(requests[0]?.messages)
     expect(requestText).not.toContain("selected_job_memory")
     expect(requestText).not.toContain(JSON.stringify(selectedMemory))

@@ -6,10 +6,13 @@ import type { InputClaimStore } from "./context/input-claim-store.js"
 import { createPgContextOwnerFence, StepContextBuilder } from "./context/step-context-builder.js"
 import type { HydrationScope } from "./context/steering-reconciliation-context.js"
 import { injectSelectedJobMemory, type SelectedJobMemoryRecord } from "./context/selected-job-memory.js"
-import { createPgSelectedJobHistoryStore } from "./context/selected-job-history-store.js"
+import { createPgDirectSelectedJobHistoryStore } from "./context/selected-job-history-direct-store.js"
 import { selectedJobSnapshot } from "./canonical-turn-task-graph-context.js"
 import type { StepContextSnapshot } from "./context/step-context-builder.js"
-import { appendCanonicalSelectedJobHistory, type SelectedJobHistoryReader } from "./canonical-turn-selected-job-history.js"
+import {
+  appendCanonicalSelectedJobHistory, appendCanonicalSelectedJobHistoryOutcomes,
+  type DirectSelectedJobHistoryReader, type SelectedJobHistoryReader,
+} from "./canonical-turn-selected-job-history.js"
 
 type ContextBuilder = TurnEngineOptions["contextBuilder"]
 type BaseBuilder = Pick<ContextBuilder, "build">
@@ -27,6 +30,8 @@ type Input = Readonly<{
   selectedJobMode: boolean
   selectedJobMemories?: readonly SelectedJobMemoryRecord[]
   selectedJobId?: string
+  selectedJobDirectHistoryReader?: DirectSelectedJobHistoryReader
+  /** Explicit adapter for callers that still supply compaction-captured records. Production uses the direct source reader. */
   selectedJobHistoryReader?: SelectedJobHistoryReader
 }>
 
@@ -49,16 +54,21 @@ export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder 
     undefined,
     reconciliationScope,
   )
-  const historyReader = input.selectedJobMode
-    ? input.selectedJobHistoryReader ?? createPgSelectedJobHistoryStore(input.pool)
+  const directHistoryReader = input.selectedJobMode
+    ? input.selectedJobDirectHistoryReader ?? (input.selectedJobHistoryReader ? undefined : createPgDirectSelectedJobHistoryStore(input.pool))
     : undefined
   return {
     build: async request => {
       let snapshot: StepContextSnapshot = request.snapshot
       if (input.selectedJobMode) {
         snapshot = injectSelectedJobMemory({ snapshot: selectedJobSnapshot(request.snapshot), records: input.selectedJobMemories ?? [], jobId: input.selectedJobId, turnId: input.lease.turnId, rootTaskId: input.rootTaskId })
-        if (historyReader) snapshot = await appendCanonicalSelectedJobHistory({
-          snapshot, reader: historyReader, lease: input.lease, rootTaskId: input.rootTaskId,
+        if (directHistoryReader) snapshot = await appendCanonicalSelectedJobHistoryOutcomes({
+          snapshot, reader: directHistoryReader, lease: input.lease, rootTaskId: input.rootTaskId,
+          rootAttemptCount: input.rootAttemptCount, stepId: request.stepId, jobId: input.selectedJobId,
+          now: request.now ?? new Date(),
+        })
+        else if (input.selectedJobHistoryReader) snapshot = await appendCanonicalSelectedJobHistory({
+          snapshot, reader: input.selectedJobHistoryReader, lease: input.lease, rootTaskId: input.rootTaskId,
           rootAttemptCount: input.rootAttemptCount, stepId: request.stepId, jobId: input.selectedJobId,
           records: input.selectedJobMemories ?? [], now: request.now ?? new Date(),
         })
