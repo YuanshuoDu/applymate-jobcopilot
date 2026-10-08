@@ -1883,5 +1883,39 @@ describe("owner-agnostic turn execution loop", () => {
     expect(JSON.stringify(root.finalResponses)).not.toContain("task-graph-repair-recovery.v1")
   })
 
+  it("shows fixed generic recovery on the next request when the denial revision is unknown", async () => {
+    const feedback = "TaskGraph required evidence is missing, invalid, failed, or unresolved; node and criterion fields are 1-based ordinals in the current TaskGraph. nodeOrdinal=99 criterionOrdinal=private-criterion status=failed reasonCode=evidence_missing"
+    let checks = 0
+    const completionGate: NonNullable<TurnExecutionOptions["completionGate"]> = async () => ++checks === 1
+      ? ({ ok: false, blocker: "task_graph_verification_unverified", feedback })
+      : ({ ok: true })
+    const root = fixture(identity("turn", "root-1"), undefined, [], completionGate)
+    const baseBuilder = root.options.contextBuilder
+    root.options = {
+      ...root.options,
+      refreshTaskGraphBeforeStep: async snapshot => mergeTaskGraphCurrentObservation(snapshot, { revision: 4, nodes: [] }),
+      contextBuilder: { build: async request => {
+        const context = await baseBuilder.build(request)
+        const system = request.snapshot.system.map(seed => ({ id: `system:${seed.id}`, layer: "system" as const,
+          role: "instruction" as const, trust: "system" as const, source: "harness", content: seed.content as StepContext["blocks"][number]["content"] }))
+        return { ...context, blocks: [...system, ...context.blocks] }
+      } },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+    const nextRequest = JSON.stringify(root.requests[2]?.messages).replaceAll("\\", "")
+    const rejection = root.events.find(event => event.type === "final.rejected")?.payload
+
+    expect(result.status).toBe("completed")
+    expect(root.requests).toHaveLength(3)
+    expect(nextRequest).toContain("no validated graph revision is available")
+    expect(nextRequest).toContain('"revision":4')
+    expect(nextRequest).not.toContain("nodeOrdinal=")
+    expect(nextRequest).not.toContain("criterionOrdinal=")
+    expect(nextRequest).not.toContain("private-criterion")
+    expect(nextRequest).not.toContain("task-graph-repair-recovery.v1")
+    expect(rejection).toMatchObject({ feedback })
+  })
+
 
 })
