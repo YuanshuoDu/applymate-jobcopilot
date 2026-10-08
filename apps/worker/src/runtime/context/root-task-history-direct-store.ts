@@ -105,12 +105,12 @@ async function candidates(client: Client, input: RootTaskHistoryFenceInput, fenc
       SELECT turn."id" AS "turnId", turn."sessionId", turn."userId", turn."rootTaskId", turn."status" AS "turnStatus", turn."input",
         task."id" AS "taskId", task."turnId" AS "taskTurnId", task."rootTaskId" AS "taskRootTaskId", task."parentTaskId",
         task."role" AS "taskRole", task."taskType", task."status" AS "taskStatus", task."goal", task."successCriteria"
-      FROM terminal_window AS window
-      JOIN "agent_turns" AS turn ON turn."id" = window."turnId" AND turn."sessionId" = window."sessionId"
+      FROM terminal_window AS terminal_event
+      JOIN "agent_turns" AS turn ON turn."id" = terminal_event."turnId" AND turn."sessionId" = terminal_event."sessionId"
       JOIN "agent_sessions" AS session ON session."id" = turn."sessionId" AND session."userId" = $2
       JOIN "sub_agent_tasks" AS task ON task."id" = turn."rootTaskId" AND task."sessionId" = turn."sessionId"
         AND task."turnId" = turn."id" AND task."rootTaskId" = task."id"
-      WHERE turn."userId" = $2 AND turn."id" <> $3 AND window."taskId" = turn."rootTaskId"
+      WHERE turn."userId" = $2 AND turn."id" <> $3 AND terminal_event."taskId" = turn."rootTaskId"
         AND turn."status" IN ('completed', 'failed', 'interrupted')
         AND task."status" IN ('completed', 'failed', 'interrupted')
         AND task."parentTaskId" IS NULL AND task."role" = 'orchestrator' AND task."taskType" = 'root'
